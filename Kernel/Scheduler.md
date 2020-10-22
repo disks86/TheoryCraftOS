@@ -1,0 +1,14 @@
+# Scheduler
+ The scheduler is really two schedulers a trusted scheduler and an untrusted scheduler. Each of these schedulers has a high performance queue and an efficiency queue. Physical cores are assigned to the high performance and efficiency queues of each scheduler at OS startup. It is recommended that cores that share a cache be grouped together when possible. A system must have cores assigned to at least one queue in either scheduler. If a thread is requested for a queue that doesn't have cores assigned then it should first look at the other queue under the same scheduler and execute there if cores are assigned. If no cores are available in either queue on the same scheduler than the queue of the requested type should be used on the other scheduler. Finally if the queue of the same type on the other scheduler does not have cores assigned then the other queue on that scheduler may be used.
+
+## Untrusted Scheduler
+The untrusted scheduler is a preemptive multistasking scheduler like is found in most modern operating systems. This is more most user code should run as it is not possible for rogue code to use all of the CPU time. There are of course performance penalties associated with context switching but the user should be allowed to decide whether or not to run an application as untrusted or trusted.
+
+## Trusted Scheduler
+The trusted scheduler is a cooperative scheduler like some real time operating systems and older general purpose operating systems have. In this scenario the program must yield back to the operating system. This avoids the cost of context switching including invalidating CPU cache in the middle of operations. This scheduler is also simpler and easier to get correct because more of the burden is placed on the end user application. Ultimately the user should be allowed to decide whether or not to run an application as untrusted or trusted.
+
+## Efficiency Queue
+The efficiency queue is intended to be used for low priority tasks such as background jobs to fetch email or sync files. These operations don't require fast cores so using low power cores for this queue will make the system more efficient. There is technically nothing special about this queue but it is intended to be used for low power cores. It is also possible to assign under-performing cores to this queue so that the best cores are used for high-priority tasks.
+
+## High Performance Queue
+The high performance queue is intended to be used for high priority tasks such as rendering as 3D scene, transcoding video, compiling code, etc. These operations require high performance cores because they translate into real work taking more or less time depending on the performance. There is technically nothing special about this queue but it is intended to be used for high performance cores. It is also possible to assign cores which clock higher if the target platform allows independant clock frequencies.
