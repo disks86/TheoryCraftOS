@@ -1,5 +1,5 @@
 # Allocator
-The allocator is really two allocators. The lowest level is a memory pool allocator wich the higher level allocator being an object allocator.
+The allocator is really two allocators. The lowest level is a memory pool allocator which the higher level allocator being an object allocator.
 
 ## Memory Pool Allocator
 The memory pool allocator allocates memory in blocks which are multiples of the size of a cache line on the target platform. For example this may be 128 bytes. This allocator may be used directly if needed however the intention is for other componeents to use the object allocator. The memory pool does not initialize or otherwise alter the contents of memory when allocating. 
