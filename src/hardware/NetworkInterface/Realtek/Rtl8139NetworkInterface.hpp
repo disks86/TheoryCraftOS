@@ -1,0 +1,62 @@
+#pragma once
+#include "Allocators/IAllocator.hpp"
+#include "hardware/Bus/Pci/IPciBus.hpp"
+#include "hardware/NetworkInterface/INetworkInterface.hpp"
+#include "uefi.hpp"
+
+namespace hardware {
+
+// The Realtek RTL8139 Fast Ethernet chip (QEMU's `rtl8139`). One receive ring
+// buffer the chip fills with back-to-back frames, and four transmit slots used
+// in turn. Programmed through the memory-mapped copy of its registers (BAR 1),
+// polled. The chip only does 32-bit DMA, so its buffers must be below 4 GiB.
+class Rtl8139NetworkInterface final : public INetworkInterface {
+ public:
+  static constexpr uint32_t kReceiveRingSize = 8192;
+  static constexpr uint32_t kTransmitSlots = 4;
+  static constexpr uint32_t kTransmitBufferSize = 2048;
+
+  Rtl8139NetworkInterface(const IPciBus& pci, const PciDeviceInfo& device, allocators::IAllocator& allocator,
+                          efi::SystemTable* st)
+      : pci_(pci), device_(device), allocator_(allocator), st_(st) {}
+
+  static bool supports(uint16_t vendor_id, uint16_t device_id) {
+    return vendor_id == 0x10EC && device_id == 0x8139;
+  }
+
+  const char* name() const override { return "Realtek RTL8139"; }
+  bool initialize() override;
+  void shutdown() override;
+
+  MacAddress mac_address() const override { return mac_; }
+  bool link_up() const override;
+  bool transmit(const uint8_t* frame, uint32_t length) override;
+  bool receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) override;
+  NetworkStatistics statistics() const override { return stats_; }
+
+ private:
+  uint8_t read8(uint32_t reg) const;
+  uint16_t read16(uint32_t reg) const;
+  uint32_t read32(uint32_t reg) const;
+  void write8(uint32_t reg, uint8_t value) const;
+  void write16(uint32_t reg, uint16_t value) const;
+  void write32(uint32_t reg, uint32_t value) const;
+
+  const IPciBus& pci_;
+  PciDeviceInfo device_;
+  allocators::IAllocator& allocator_;
+  efi::SystemTable* st_;
+
+  uint64_t registers_ = 0;
+  uint8_t* receive_ring_ = nullptr;   // ring plus slack so a frame can run past the end
+  uint8_t* transmit_buffers_ = nullptr;
+  uint32_t receive_offset_ = 0;       // where the next frame starts in the ring
+  uint32_t transmit_next_ = 0;        // slot to use next
+  bool transmit_used_[kTransmitSlots] = {};
+  MacAddress mac_{};
+  bool owns_device_ = false;
+  bool started_ = false;
+  NetworkStatistics stats_;
+};
+
+}  // namespace hardware

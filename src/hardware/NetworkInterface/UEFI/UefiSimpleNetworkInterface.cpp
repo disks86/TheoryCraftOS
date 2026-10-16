@@ -1,0 +1,70 @@
+#include "hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.hpp"
+
+namespace hardware {
+
+bool UefiSimpleNetworkInterface::initialize() {
+  efi::SimpleNetworkMode* mode = snp_->mode;
+  if (mode->hw_address_size != 6) return false;  // not Ethernet
+
+  if (mode->state == static_cast<uint32_t>(efi::SimpleNetworkState::Stopped) && snp_->start(snp_) != efi::kSuccess)
+    return false;
+  if (mode->state != static_cast<uint32_t>(efi::SimpleNetworkState::Initialized)) {
+    if (snp_->initialize(snp_, 0, 0) != efi::kSuccess) return false;
+    we_initialized_ = true;
+  }
+  // Our unicast address plus broadcast, where the NIC allows choosing.
+  const uint32_t wanted = (efi::kReceiveFilterUnicast | efi::kReceiveFilterBroadcast) & mode->receive_filter_mask;
+  snp_->receive_filters(snp_, wanted, 0, 0, 0, nullptr);
+
+  for (int i = 0; i < 6; ++i) mac_.bytes[i] = mode->current_address[i];
+  started_ = true;
+  return true;
+}
+
+void UefiSimpleNetworkInterface::shutdown() {
+  if (started_ && we_initialized_) snp_->shutdown(snp_);  // leave the NIC as we found it
+  started_ = false;
+  we_initialized_ = false;
+}
+
+bool UefiSimpleNetworkInterface::link_up() const {
+  const efi::SimpleNetworkMode* mode = snp_->mode;
+  return started_ && (!mode->media_present_supported || mode->media_present);
+}
+
+bool UefiSimpleNetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+  if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
+    ++stats_.send_failures;
+    return false;
+  }
+  const uint32_t padded = length < kEthernetMinFrame ? kEthernetMinFrame : length;
+  __builtin_memset(staging_, 0, padded);
+  __builtin_memcpy(staging_, frame, length);
+  // Header size 0: the buffer already holds a complete Ethernet frame.
+  if (snp_->transmit(snp_, 0, padded, staging_, nullptr, nullptr, nullptr) != efi::kSuccess) {
+    ++stats_.send_failures;
+    return false;
+  }
+  // Wait (briefly) until the firmware hands the buffer back, so staging_ can be reused.
+  for (int i = 0; i < 1000; ++i) {
+    uint32_t interrupts = 0;
+    void* recycled = nullptr;
+    if (snp_->get_status(snp_, &interrupts, &recycled) == efi::kSuccess && recycled) break;
+    st_->boot_services->stall(1000);
+  }
+  ++stats_.frames_sent;
+  return true;
+}
+
+bool UefiSimpleNetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+  if (!started_ || !buffer || !length) return false;
+  uint8_t frame[kEthernetMaxFrame + 64];
+  efi::Uintn size = sizeof(frame), header = 0;
+  if (snp_->receive(snp_, &header, &size, frame, nullptr, nullptr, nullptr) != efi::kSuccess) return false;
+  __builtin_memcpy(buffer, frame, size < capacity ? size : capacity);
+  *length = static_cast<uint32_t>(size);
+  ++stats_.frames_received;
+  return true;
+}
+
+}  // namespace hardware

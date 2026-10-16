@@ -1,0 +1,81 @@
+#pragma once
+#include "Allocators/IAllocator.hpp"
+#include "hardware/Bus/Pci/IPciBus.hpp"
+#include "hardware/NetworkInterface/INetworkInterface.hpp"
+#include "uefi.hpp"
+
+namespace hardware {
+
+// The Intel 8254x "e1000" Gigabit Ethernet family (82540EM, 82544GC, 82545EM:
+// the NIC QEMU emulates as `e1000`). Programmed through its memory-mapped
+// registers with legacy descriptor rings, polled, interrupts off. Newer parts
+// (e1000e/82574, igb) differ enough to need their own drivers.
+class E1000NetworkInterface final : public INetworkInterface {
+ public:
+  // The receive ring is deep because the card drops frames it has no buffer for:
+  // a burst arriving faster than we poll must fit.
+  static constexpr uint32_t kReceiveDescriptors = 256;
+  static constexpr uint32_t kTransmitDescriptors = 64;
+  static constexpr uint32_t kBufferSize = 2048;
+
+  E1000NetworkInterface(const IPciBus& pci, const PciDeviceInfo& device, allocators::IAllocator& allocator,
+                        efi::SystemTable* st)
+      : pci_(pci), device_(device), allocator_(allocator), st_(st) {}
+
+  // Whether this is a device the driver knows how to run.
+  static bool supports(uint16_t vendor_id, uint16_t device_id) {
+    return vendor_id == 0x8086 && (device_id == 0x100E || device_id == 0x100C || device_id == 0x100F);
+  }
+
+  const char* name() const override { return "Intel e1000"; }
+  bool initialize() override;
+  void shutdown() override;
+
+  MacAddress mac_address() const override { return mac_; }
+  bool link_up() const override;
+  bool transmit(const uint8_t* frame, uint32_t length) override;
+  bool receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) override;
+  NetworkStatistics statistics() const override { return stats_; }
+
+ private:
+  struct ReceiveDescriptor {
+    uint64_t address;
+    uint16_t length;
+    uint16_t checksum;
+    uint8_t status;
+    uint8_t errors;
+    uint16_t special;
+  };
+  struct TransmitDescriptor {
+    uint64_t address;
+    uint16_t length;
+    uint8_t checksum_offset;
+    uint8_t command;
+    uint8_t status;
+    uint8_t checksum_start;
+    uint16_t special;
+  };
+
+  uint32_t read(uint32_t reg) const;
+  void write(uint32_t reg, uint32_t value) const;
+  uint8_t* rx_buffer(uint32_t i) const { return buffers_ + i * kBufferSize; }
+  uint8_t* tx_buffer(uint32_t i) const { return buffers_ + (kReceiveDescriptors + i) * kBufferSize; }
+
+  const IPciBus& pci_;
+  PciDeviceInfo device_;
+  allocators::IAllocator& allocator_;
+  efi::SystemTable* st_;
+
+  uint64_t registers_ = 0;
+  ReceiveDescriptor* rx_ring_ = nullptr;
+  TransmitDescriptor* tx_ring_ = nullptr;
+  uint8_t* buffers_ = nullptr;  // receive buffers, then transmit buffers
+  uint32_t rx_next_ = 0;        // next receive descriptor to inspect
+  uint32_t tx_next_ = 0;        // next transmit descriptor to fill
+  MacAddress mac_{};
+  bool owns_device_ = false;
+  bool started_ = false;
+  NetworkStatistics stats_;
+};
+
+}  // namespace hardware

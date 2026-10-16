@@ -241,6 +241,58 @@ struct PciIo {
 constexpr Guid kPciIoGuid = {
     0x4cf5b200, 0x68b8, 0x4ca5, {0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a}};
 
+// EFI_SIMPLE_NETWORK_PROTOCOL: the firmware's own network driver for a NIC.
+enum class SimpleNetworkState : uint32_t { Stopped, Started, Initialized };
+
+struct SimpleNetworkMode {
+  uint32_t state;
+  uint32_t hw_address_size;
+  uint32_t media_header_size;
+  uint32_t max_packet_size;
+  uint32_t nv_ram_size;
+  uint32_t nv_ram_access_size;
+  uint32_t receive_filter_mask;
+  uint32_t receive_filter_setting;
+  uint32_t max_mcast_filter_count;
+  uint32_t mcast_filter_count;
+  uint8_t mcast_filter[16][32];
+  uint8_t current_address[32];
+  uint8_t broadcast_address[32];
+  uint8_t permanent_address[32];
+  uint32_t if_type;
+  uint8_t mac_address_changeable;
+  uint8_t multiple_tx_supported;
+  uint8_t media_present_supported;
+  uint8_t media_present;
+};
+
+constexpr uint32_t kReceiveFilterUnicast = 0x01, kReceiveFilterBroadcast = 0x04;
+
+struct SimpleNetwork {
+  uint64_t revision;
+  Status (*start)(SimpleNetwork*);
+  Status (*stop)(SimpleNetwork*);
+  Status (*initialize)(SimpleNetwork*, Uintn extra_rx_buffer, Uintn extra_tx_buffer);
+  Status (*reset)(SimpleNetwork*, uint8_t extended_verification);
+  Status (*shutdown)(SimpleNetwork*);
+  Status (*receive_filters)(SimpleNetwork*, uint32_t enable, uint32_t disable, uint8_t reset_mcast_filter,
+                            Uintn mcast_filter_count, void* mcast_filter);
+  void* station_address;
+  void* statistics;
+  void* mcast_ip_to_mac;
+  void* nv_data;
+  Status (*get_status)(SimpleNetwork*, uint32_t* interrupt_status, void** tx_buffer);
+  Status (*transmit)(SimpleNetwork*, Uintn header_size, Uintn buffer_size, void* buffer, void* source_address,
+                     void* destination_address, uint16_t* protocol);
+  Status (*receive)(SimpleNetwork*, Uintn* header_size, Uintn* buffer_size, void* buffer, void* source_address,
+                    void* destination_address, uint16_t* protocol);
+  void* wait_for_packet;
+  SimpleNetworkMode* mode;
+};
+
+constexpr Guid kSimpleNetworkGuid = {
+    0xA19832B9, 0xAC25, 0x11D3, {0x9A, 0x2D, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D}};
+
 // EFI_MP_SERVICES_PROTOCOL: enumerate processors and run code on them.
 // Procedures run on application processors and must not call firmware.
 using ApProcedure = void (*)(void* argument);

@@ -59,6 +59,12 @@ add_executable(BOOTX64
   src/NpuDemo.cpp
   src/ContainerDemo.cpp
   src/UtilityDemo.cpp
+  src/NetworkDemo.cpp
+  src/hardware/NetworkInterface/SystemNetworkInterfaces.cpp
+  src/hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
+  src/hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
+  src/hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
+  src/hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp
   src/ConcurrentDemo.cpp
   src/hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp

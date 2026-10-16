@@ -21,8 +21,14 @@ class VirtioPciDevice final : public IHardware {
       : pci_(pci), device_(device), allocator_(allocator), st_(st) {}
 
   const char* name() const override { return "virtio PCI device"; }
-  // Takes the device from the firmware, resets it and negotiates features
-  // (only VIRTIO_F_VERSION_1). Queues are set up after this, then start().
+  // Device feature bits 0-31 to ask for in addition to VIRTIO_F_VERSION_1 (which
+  // is always required). Call before initialize(); read the outcome from
+  // accepted_features() afterwards.
+  void request_features(uint32_t low_bits) { requested_features_ = low_bits; }
+  uint32_t accepted_features() const { return accepted_features_; }
+
+  // Takes the device from the firmware, resets it and negotiates features.
+  // Queues are set up after this, then start().
   bool initialize() override;
   void shutdown() override;
 
@@ -61,6 +67,8 @@ class VirtioPciDevice final : public IHardware {
   Region common_, notify_, device_config_;
   uint32_t notify_multiplier_ = 0;
   uint16_t queue_notify_offset_[8] = {};
+  uint32_t requested_features_ = 0;
+  uint32_t accepted_features_ = 0;
   bool owns_device_ = false;
 };
 

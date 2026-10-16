@@ -36,8 +36,9 @@ void Virtqueue::release(allocators::IAllocator& allocator) {
   size_ = 0;
 }
 
-void Virtqueue::post(uint16_t index, void* data, uint32_t length) {
-  descriptors_[index] = {reinterpret_cast<uint64_t>(data), length, kDescriptorWrite, 0};
+void Virtqueue::post(uint16_t index, void* data, uint32_t length, bool device_writes) {
+  descriptors_[index] = {reinterpret_cast<uint64_t>(data), length,
+                         static_cast<uint16_t>(device_writes ? kDescriptorWrite : 0), 0};
   volatile Available* avail = available_;
   avail->ring[avail->index % size_] = index;
   __atomic_thread_fence(__ATOMIC_RELEASE);  // the entry must be visible before the index moves

@@ -71,6 +71,12 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
     white-balance gains, gamma table); `Intel/` has IPU6/IPU7 classes that match the PCI device and still use
     that path until a native driver exists; `SystemImageSignalProcessor` picks one. QEMU has no ISP
     hardware, so only the software path runs there. `src/IspDemo` draws a synthetic frame through it.
+  - `hardware/NetworkInterface/`: `INetworkInterface` (MAC, link state, transmit/receive of raw Ethernet
+    frames, statistics; polled) with native drivers - `Virtio/` (virtio-net, modern interface), `Intel/` (e1000
+    family: 82540EM/82544GC/82545EM) and `Realtek/` (RTL8139) - and `UEFI/`, a fallback that borrows the
+    firmware's driver (UEFI Simple Network Protocol) for any other NIC. `SystemNetworkInterfaces` finds every
+    NIC and picks the driver. `src/NetworkDemo` sends ARP requests to QEMU's user-mode gateway at boot.
+    Not covered natively: e1000e/igb, pcnet, ne2k, vmxnet3 (the firmware fallback handles those in QEMU).
   - `hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup).
   - `hardware/RandomAccessMemory/`: `IRandomAccessMemory` (implemented by `UefiRandomAccessMemory`).
   - `hardware/NeuralProcessingUnit/`: `INeuralProcessingUnit` (int8 and float matrix products, activations,

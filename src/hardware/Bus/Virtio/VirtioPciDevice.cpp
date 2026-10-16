@@ -95,8 +95,10 @@ bool VirtioPciDevice::initialize() {
   // Only VIRTIO_F_VERSION_1 (feature bit 32) is wanted; refuse legacy-only devices.
   set_common32(kFeatureSelect, 1);
   if (!(common32(kFeature) & kFeatureVersion1)) return false;
+  set_common32(kFeatureSelect, 0);
+  accepted_features_ = common32(kFeature) & requested_features_;  // only what both sides have
   set_common32(kDriverFeatureSelect, 0);
-  set_common32(kDriverFeature, 0);
+  set_common32(kDriverFeature, accepted_features_);
   set_common32(kDriverFeatureSelect, 1);
   set_common32(kDriverFeature, kFeatureVersion1);
 

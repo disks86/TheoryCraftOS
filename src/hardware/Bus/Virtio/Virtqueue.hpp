@@ -4,9 +4,10 @@
 
 namespace hardware {
 
-// A split virtqueue (virtio 1.x, section 2.7) whose buffers are all written by
-// the device (like the input event queue). Each buffer keeps its descriptor
-// index, so the caller recycles a buffer by posting the same index again.
+// A split virtqueue (virtio 1.x, section 2.7) carrying single-descriptor
+// buffers, either written by the device (input events, received frames) or read
+// by it (frames to send). Each buffer keeps its descriptor index, so the caller
+// recycles a buffer by posting the same index again.
 class Virtqueue {
  public:
   bool init(allocators::IAllocator& allocator, uint16_t size);
@@ -17,8 +18,9 @@ class Virtqueue {
   uint64_t available_address() const { return reinterpret_cast<uint64_t>(available_); }
   uint64_t used_address() const { return reinterpret_cast<uint64_t>(used_); }
 
-  // Offers `length` bytes at `data` to the device as descriptor `index`.
-  void post(uint16_t index, void* data, uint32_t length);
+  // Offers `length` bytes at `data` to the device as descriptor `index`: for the
+  // device to fill in (the default) or, with device_writes false, to read.
+  void post(uint16_t index, void* data, uint32_t length, bool device_writes = true);
   // The next buffer the device finished: its descriptor index and bytes written.
   bool take_used(uint16_t* index, uint32_t* length);
 

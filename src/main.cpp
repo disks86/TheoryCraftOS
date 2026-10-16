@@ -7,9 +7,11 @@
 #include "hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
+#include "hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
 #include "hardware/SystemHardware.hpp"
 #include "ConcurrentDemo.hpp"
 #include "ContainerDemo.hpp"
+#include "NetworkDemo.hpp"
 #include "NpuDemo.hpp"
 #include "UtilityDemo.hpp"
 #include "IspDemo.hpp"
@@ -258,6 +260,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::puts("Concurrent containers:\n");
   if (!run_concurrent_demo(allocator, shared_allocator, cpu, scheduler)) console::puts("concurrent self-check failed\n");
 
+  // Network interfaces: native drivers where we have them, the firmware's driver otherwise.
+  hardware::SystemNetworkInterfaces network(pci, allocator, st);
+  network.initialize();
+  console::puts("Network: ");
+  console::put_dec(network.count());
+  console::puts(" interfaces\n");
+  for (uint32_t i = 0; i < network.count(); ++i) run_network_probe(*network.at(i), st);
+
   // Image signal processor: a hardware one if the machine has a known ISP,
   // otherwise the software pipeline. The demo needs a screen to draw on.
   hardware::SystemImageSignalProcessor system_isp(pci);
@@ -292,6 +302,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   kernel_main(st, input);
   cpu.enable_interrupts();
   input.shutdown();
+  network.shutdown();
   usb.shutdown();  // resets the USB controllers and returns them to the firmware
 
   allocator.deallocate(allocator.allocate(1));  // exercise the pool once
