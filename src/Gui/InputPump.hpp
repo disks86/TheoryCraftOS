@@ -34,6 +34,7 @@ class InputPump {
       : window_(window), keyboard_(keyboard), mouse_(mouse) {
     x_ = static_cast<int32_t>(window.bounds().width / 2);
     y_ = static_cast<int32_t>(window.bounds().height / 2);
+    window_.mouse_move(x_, y_);  // the cursor starts in the middle, not at the corner
   }
 
   // Delivers everything the devices have right now; returns how many events there were.

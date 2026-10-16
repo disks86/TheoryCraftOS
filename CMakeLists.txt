@@ -223,6 +223,8 @@ find_file(OVMF_VARS NAMES OVMF_VARS.4m.fd OVMF_VARS_4M.fd OVMF_VARS.fd
 if(QEMU AND OVMF_CODE AND OVMF_VARS)
   set(QEMU_COMMON
     ${QEMU} -machine q35 -smp 4 -m 256M -net none
+    # An absolute pointer for the desktop (no click-to-grab; relative PS/2 grabbing is unreliable under Wayland).
+    -device virtio-tablet-pci
     -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
     -drive if=pflash,format=raw,file=${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     -drive format=raw,file=fat:rw:${ESP_DIR}
@@ -239,7 +241,7 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
   add_custom_target(run COMMAND ${QEMU_COMMON}
     DEPENDS esp vars USES_TERMINAL)
   # Same, with a virtio-gpu 3D device: QEMU renders through the host's OpenGL (virgl).
-  add_custom_target(run-gl COMMAND ${QEMU_COMMON} -vga none -device virtio-gpu-gl-pci -display gtk,gl=on
+  add_custom_target(run-gl COMMAND ${QEMU_COMMON} -vga none -device virtio-gpu-gl-pci -display gtk,gl=on,show-cursor=off
     DEPENDS esp vars USES_TERMINAL)
   # Starts the gdbstub on :1234 (-s) without halting; use with TCOS_DEBUG_WAIT.
   add_custom_target(debug COMMAND ${QEMU_COMMON} -s

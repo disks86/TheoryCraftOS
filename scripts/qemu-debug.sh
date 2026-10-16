@@ -28,12 +28,12 @@ CMAKE=$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$BUILD/CMakeCache.txt")
 [ -n "${NO_BUILD:-}" ] || rm -f "$BUILD/debugcon.log"
 # QEMU_GPU: std (default, Bochs VGA), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).
 case ${QEMU_GPU:-std} in
-  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on" ;;
-  virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk" ;;
-  std) GPU_ARGS=""; DISPLAY_ARGS="gtk" ;;
+  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,show-cursor=off" ;;
+  virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk,show-cursor=off" ;;
+  std) GPU_ARGS=""; DISPLAY_ARGS="gtk,show-cursor=off" ;;
   *) echo "unknown QEMU_GPU=$QEMU_GPU (std, virtio, gl)" >&2; exit 2 ;;
 esac
-exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 256M -net none $GPU_ARGS -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \
+exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 256M -net none $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \
   -drive if=pflash,format=raw,readonly=on,file="$(sed -n 's/^OVMF_CODE:FILEPATH=//p' "$BUILD/CMakeCache.txt")" \
   -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
   -drive format=raw,file=fat:rw:"$BUILD/esp" \

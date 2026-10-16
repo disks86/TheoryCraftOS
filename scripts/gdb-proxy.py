@@ -59,7 +59,10 @@ def start_qemu(build):
     log = os.path.join(build, "debugcon.log")
     cmd = [
         "qemu-system-x86_64", "-machine", "q35", "-smp", os.environ.get("QEMU_SMP", "4"), "-m", "256M", "-net", "none",
-        "-display", os.environ.get("QEMU_DISPLAY", "gtk"),
+        # The tablet gives the desktop an absolute pointer: no click-to-grab, and the host pointer maps
+        # straight onto the guest's (relative PS/2 grabbing is unreliable under Wayland).
+        "-device", "virtio-tablet-pci",
+        "-display", os.environ.get("QEMU_DISPLAY", "gtk,show-cursor=off"),
         "-gdb", f"tcp:127.0.0.1:{PORT}", "-S",
         "-drive", f"if=pflash,format=raw,readonly=on,file={cache(build, 'OVMF_CODE')}",
         "-drive", f"if=pflash,format=raw,file={vars_fd}",
