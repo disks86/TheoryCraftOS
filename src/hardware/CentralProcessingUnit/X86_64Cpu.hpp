@@ -23,6 +23,7 @@ class X86_64Cpu : public ICentralProcessingUnit {
   void breakpoint() const override;
   void disable_interrupts() const override;
   void enable_interrupts() const override;
+  uint64_t timestamp_counter() const override;
 
   uint32_t core_count() const override { return cores_; }
   uint32_t current_core() const override;

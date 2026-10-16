@@ -26,3 +26,10 @@ tcos_disable_interrupts:
 tcos_enable_interrupts:
     sti
     ret
+
+.global tcos_rdtsc
+tcos_rdtsc:
+    rdtsc
+    shl     rdx, 32
+    or      rax, rdx
+    ret

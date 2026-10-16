@@ -1,0 +1,61 @@
+#include "Network/NetworkStackSet.hpp"
+
+namespace network {
+
+bool NetworkStackSet::add(hardware::INetworkInterface& nic) {
+  UniquePointer<NetworkStack> stack = UniquePointer<NetworkStack>::make(allocator_, nic, clock_, allocator_);
+  if (!stack || !stack->initialize()) return false;
+  return stacks_.push_back(util::move(stack));
+}
+
+void NetworkStackSet::poll() {
+  for (UniquePointer<NetworkStack>& stack : stacks_) stack->poll();
+}
+
+void NetworkStackSet::start_dhcp() {
+  for (UniquePointer<NetworkStack>& stack : stacks_) stack->start_dhcp();
+}
+
+uint32_t NetworkStackSet::wait_for_addresses(uint32_t timeout_ms) {
+  const uint64_t deadline = clock_.now_ms() + timeout_ms;
+  for (;;) {
+    poll();
+    uint32_t have = 0, giving_up = 0;
+    for (UniquePointer<NetworkStack>& stack : stacks_) {
+      if (stack->configuration().configured()) ++have;
+      else if (stack->dhcp().state() == DhcpState::Failed) ++giving_up;  // will not get one: stop waiting for it
+    }
+    if (have + giving_up == stacks_.count() || clock_.now_ms() >= deadline) return have;
+  }
+}
+
+bool NetworkStackSet::resolve(const char* name, uint32_t timeout_ms, Ipv4Address* address, uint32_t* interface_index) {
+  // One query per usable interface, all in flight together.
+  List<SharedPointer<IDnsQuery>> queries(allocator_);
+  List<uint32_t> owners(allocator_);
+  for (uint32_t i = 0; i < stacks_.count(); ++i) {
+    NetworkStack& stack = *stacks_[i];
+    if (!stack.configuration().configured() || stack.configuration().dns.is_unspecified()) continue;
+    SharedPointer<IDnsQuery> query = stack.dns().query(name);
+    if (!query) return false;  // not a valid name (the same for every interface) or out of memory
+    if (!queries.push_back(query) || !owners.push_back(i)) return false;
+  }
+
+  const uint64_t deadline = clock_.now_ms() + timeout_ms;
+  for (;;) {
+    bool pending = false;
+    for (uint64_t q = 0; q < queries.count(); ++q) {
+      const DnsStatus status = queries[q]->status();
+      if (status == DnsStatus::Resolved) {
+        if (address) *address = queries[q]->address();
+        if (interface_index) *interface_index = owners[q];
+        return true;
+      }
+      pending |= status == DnsStatus::Pending;
+    }
+    if (!pending || clock_.now_ms() >= deadline) return false;
+    poll();
+  }
+}
+
+}  // namespace network

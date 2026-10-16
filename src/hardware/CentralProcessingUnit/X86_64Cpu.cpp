@@ -8,6 +8,7 @@ void tcos_pause();
 void tcos_breakpoint();
 void tcos_disable_interrupts();
 void tcos_enable_interrupts();
+uint64_t tcos_rdtsc();
 }
 
 namespace hardware {
@@ -17,6 +18,7 @@ void X86_64Cpu::pause() const { tcos_pause(); }
 void X86_64Cpu::breakpoint() const { tcos_breakpoint(); }
 void X86_64Cpu::disable_interrupts() const { tcos_disable_interrupts(); }
 void X86_64Cpu::enable_interrupts() const { tcos_enable_interrupts(); }
+uint64_t X86_64Cpu::timestamp_counter() const { return tcos_rdtsc(); }
 
 bool X86_64Cpu::initialize() {
   // Brand string: leaves 0x80000002-4 hold 48 ASCII bytes.

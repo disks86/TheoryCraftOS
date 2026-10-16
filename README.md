@@ -20,6 +20,19 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   pointer to a base class safely owns a derived object even without a virtual destructor), `Optional<T>`,
   `Variant<Ts...>` (visit, get, emplace) and the small `Move.hpp` helpers. Header-only; no weak pointers.
   `src/UtilityDemo` checks them at boot, with a shared pointer copied concurrently on every core.
+- `src/Network/`: an IPv4 stack over any `INetworkInterface`, single-threaded and polled (`INetworkStack::poll()`).
+  `NetworkStack` does Ethernet framing, ARP (cache + queue of packets awaiting resolution), IPv4 and ICMP echo;
+  it owns a `UdpManager`/`UdpSocket` (`IUdpSocket`), a `TcpManager`/`TcpSocket` (`ITcpSocket`: RFC 793 state
+  machine, RFC 6298 retransmission timer, fast retransmit, flow control, zero-window probing, listen/accept) and
+  a `DhcpClient` (`IDhcpClient`: discover/offer/request/ack, renewal at T1, rediscovery on expiry) and a
+  `DnsResolver` (`IDnsResolver`/`IDnsQuery`: A records over UDP with retries, TCP fallback on truncation, CNAME
+  chains, TTL cache incl. negative answers, ID/port randomization; `INetworkStack::resolve()` blocks). `IIpLayer`
+  is what the transports need from IP. Not supported: IPv6/AAAA, fragmentation, congestion control, SACK, window
+  scaling, DNSSEC/EDNS. Time comes from `hardware/Clock` (`IClock`, `TscClock` calibrated against the firmware timer; the CPU
+  interface gained `timestamp_counter()`). `NetworkStackSet` runs one `NetworkStack` per network interface: DHCP is
+  started on all of them at once (a silent network doesn't delay the others), and `resolve()` asks every configured
+  interface's DNS server and takes the first answer. `src/NetworkStackDemo` reports each interface's lease, pings
+  its gateway, resolves names through it, talks UDP/TCP to the host and serves HTTP on port 8080 on every interface.
 - `src/Synchronization/`: `SpinLock`/`ScopedLock` (spin with the CPU interface's `pause()`), `Synchronized<T>`
   (any type behind a lock; `with()` for one locked operation, `access()` for a lock-holding handle that can
   be iterated) and `AtomicSharedPointer<T>`. `Allocators/ThreadSafeAllocator` serializes any allocator.

@@ -11,7 +11,10 @@
 #include "hardware/SystemHardware.hpp"
 #include "ConcurrentDemo.hpp"
 #include "ContainerDemo.hpp"
+#include "Network/NetworkStackSet.hpp"
 #include "NetworkDemo.hpp"
+#include "NetworkStackDemo.hpp"
+#include "hardware/Clock/TscClock.hpp"
 #include "NpuDemo.hpp"
 #include "UtilityDemo.hpp"
 #include "IspDemo.hpp"
@@ -85,7 +88,7 @@ static void print_mouse(const hardware::MouseEvent& m) {
 
 // Shows keyboard and mouse events until 'q' is pressed. With no keyboard at all
 // it falls back to the firmware's console input.
-static void kernel_main(efi::SystemTable* st, hardware::SystemInput& input) {
+static void kernel_main(efi::SystemTable* st, hardware::SystemInput& input, NetworkStackDemo* net) {
   console::puts("Hello from TheoryCraftOS!\n");
   console::puts("Firmware revision: ");
   console::put_hex(st->hdr.revision);
@@ -108,6 +111,7 @@ static void kernel_main(efi::SystemTable* st, hardware::SystemInput& input) {
     }
     hardware::MouseEvent mouse;
     while (input.mouse().poll(&mouse)) print_mouse(mouse);
+    if (net) net->service();  // keeps the network stack (and its TCP server) running
     st->boot_services->stall(5000);
   }
 }
@@ -268,6 +272,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::puts(" interfaces\n");
   for (uint32_t i = 0; i < network.count(); ++i) run_network_probe(*network.at(i), st);
 
+  // The network stack proper: IPv4 (ARP, ICMP), UDP, TCP, DHCP and DNS - one stack per
+  // network interface, timed by a clock calibrated against the firmware's timer.
+  hardware::TscClock clock(cpu, st);
+  network::NetworkStackSet stacks(clock, shared_allocator);
+  UniquePointer<NetworkStackDemo> stack_demo;
+  if (network.count() > 0 && clock.initialize()) {
+    for (uint32_t i = 0; i < network.count(); ++i)
+      if (!stacks.add(*network.at(i))) console::puts("could not start a network stack\n");
+    if (stacks.count() > 0) {
+      console::puts("Network stacks (");
+      console::put_dec(stacks.count());
+      console::puts(" interfaces):\n");
+      stack_demo = UniquePointer<NetworkStackDemo>::make(shared_allocator, stacks, shared_allocator);
+      if (stack_demo && !stack_demo->start()) console::puts("  network stack self-check incomplete\n");
+    }
+  }
+
   // Image signal processor: a hardware one if the machine has a known ISP,
   // otherwise the software pipeline. The demo needs a screen to draw on.
   hardware::SystemImageSignalProcessor system_isp(pci);
@@ -299,7 +320,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // The firmware polls PS/2 from its timer interrupt and would steal our bytes.
   cpu.disable_interrupts();
-  kernel_main(st, input);
+  kernel_main(st, input, stack_demo.get());
+  stack_demo.reset();  // the stacks go before the NICs underneath them
+  stacks.clear();
   cpu.enable_interrupts();
   input.shutdown();
   network.shutdown();

@@ -35,6 +35,9 @@ class ICentralProcessingUnit : public IHardware {
   // firmware's timer-driven drivers (e.g. its PS/2 polling) stop running.
   virtual void disable_interrupts() const = 0;
   virtual void enable_interrupts() const = 0;
+  // A free-running counter of CPU cycles, for timing. Its rate is unspecified (see
+  // IClock for turning it into time); it may differ between cores on odd hardware.
+  virtual uint64_t timestamp_counter() const = 0;
 
  protected:
   constexpr ICentralProcessingUnit() = default;

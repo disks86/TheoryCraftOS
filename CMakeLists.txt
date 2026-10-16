@@ -60,6 +60,18 @@ add_executable(BOOTX64
   src/ContainerDemo.cpp
   src/UtilityDemo.cpp
   src/NetworkDemo.cpp
+  src/NetworkStackDemo.cpp
+  src/Network/Checksum.cpp
+  src/Network/NetworkStack.cpp
+  src/Network/NetworkStackSet.cpp
+  src/Network/Udp/UdpSocket.cpp
+  src/Network/Udp/UdpManager.cpp
+  src/Network/Tcp/TcpSocket.cpp
+  src/Network/Tcp/TcpManager.cpp
+  src/Network/Dhcp/DhcpClient.cpp
+  src/Network/Dns/DnsMessage.cpp
+  src/Network/Dns/DnsResolver.cpp
+  src/hardware/Clock/TscClock.cpp
   src/hardware/NetworkInterface/SystemNetworkInterfaces.cpp
   src/hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
   src/hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp

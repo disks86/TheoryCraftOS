@@ -1,0 +1,78 @@
+#pragma once
+#include <stdint.h>
+
+// Types and byte-order helpers shared by the network stack. Everything on the
+// wire is big-endian; the helpers read and write it byte by byte, so they work
+// on unaligned buffers and on any host.
+namespace network {
+
+inline uint16_t load16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
+inline uint32_t load32(const uint8_t* p) {
+  return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3];
+}
+inline void store16(uint8_t* p, uint16_t v) {
+  p[0] = static_cast<uint8_t>(v >> 8);
+  p[1] = static_cast<uint8_t>(v);
+}
+inline void store32(uint8_t* p, uint32_t v) {
+  p[0] = static_cast<uint8_t>(v >> 24);
+  p[1] = static_cast<uint8_t>(v >> 16);
+  p[2] = static_cast<uint8_t>(v >> 8);
+  p[3] = static_cast<uint8_t>(v);
+}
+
+struct Ipv4Address {
+  uint8_t octets[4];
+
+  static constexpr Ipv4Address make(uint8_t a, uint8_t b, uint8_t c, uint8_t d) { return {{a, b, c, d}}; }
+  static Ipv4Address from_value(uint32_t v) {
+    Ipv4Address a;
+    store32(a.octets, v);
+    return a;
+  }
+  static Ipv4Address read(const uint8_t* p) { return {{p[0], p[1], p[2], p[3]}}; }
+  void write(uint8_t* p) const {
+    for (int i = 0; i < 4; ++i) p[i] = octets[i];
+  }
+
+  uint32_t value() const { return load32(octets); }  // a.b.c.d as one integer, a in the top byte
+  bool operator==(const Ipv4Address& o) const { return value() == o.value(); }
+  bool operator!=(const Ipv4Address& o) const { return !(*this == o); }
+  bool is_unspecified() const { return value() == 0; }
+  bool is_limited_broadcast() const { return value() == 0xFFFFFFFF; }
+  bool is_multicast() const { return (octets[0] & 0xF0) == 0xE0; }
+  bool in_subnet(const Ipv4Address& network_address, const Ipv4Address& mask) const {
+    return (value() & mask.value()) == (network_address.value() & mask.value());
+  }
+  // The "all hosts on this subnet" address.
+  static Ipv4Address subnet_broadcast(const Ipv4Address& address, const Ipv4Address& mask) {
+    return from_value(address.value() | ~mask.value());
+  }
+};
+
+constexpr Ipv4Address kAnyAddress = Ipv4Address::make(0, 0, 0, 0);
+constexpr Ipv4Address kBroadcastAddress = Ipv4Address::make(255, 255, 255, 255);
+
+// What a host needs to know to talk IP: its own address, the subnet it is on,
+// the router to use for everything else, and a DNS server.
+struct IpConfiguration {
+  Ipv4Address address = kAnyAddress;
+  Ipv4Address netmask = kAnyAddress;
+  Ipv4Address gateway = kAnyAddress;
+  Ipv4Address dns = kAnyAddress;
+
+  bool configured() const { return !address.is_unspecified(); }
+};
+
+constexpr uint16_t kEtherTypeIpv4 = 0x0800;
+constexpr uint16_t kEtherTypeArp = 0x0806;
+
+constexpr uint8_t kProtocolIcmp = 1;
+constexpr uint8_t kProtocolTcp = 6;
+constexpr uint8_t kProtocolUdp = 17;
+
+constexpr uint32_t kIpv4HeaderSize = 20;
+constexpr uint32_t kMtu = 1500;
+constexpr uint32_t kMaxIpPayload = kMtu - kIpv4HeaderSize;  // no fragmentation is supported
+
+}  // namespace network
