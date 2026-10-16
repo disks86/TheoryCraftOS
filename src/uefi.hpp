@@ -165,6 +165,46 @@ struct LoadedImage {
 constexpr Guid kLoadedImageGuid = {
     0x5B1B31A1, 0x9562, 0x11d2, {0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}};
 
+// EFI_GRAPHICS_OUTPUT_PROTOCOL: the firmware's linear framebuffer.
+enum class PixelFormat : uint32_t {
+  RedGreenBlueReserved8Bit,  // memory order R, G, B, x
+  BlueGreenRedReserved8Bit,  // memory order B, G, R, x
+  BitMask,
+  BltOnly,  // no directly addressable framebuffer
+};
+
+struct PixelBitmask {
+  uint32_t red, green, blue, reserved;
+};
+
+struct GraphicsModeInfo {
+  uint32_t version;
+  uint32_t horizontal_resolution;
+  uint32_t vertical_resolution;
+  PixelFormat pixel_format;
+  PixelBitmask pixel_information;
+  uint32_t pixels_per_scan_line;
+};
+
+struct GraphicsMode {
+  uint32_t max_mode;
+  uint32_t mode;
+  GraphicsModeInfo* info;
+  Uintn size_of_info;
+  uint64_t frame_buffer_base;
+  Uintn frame_buffer_size;
+};
+
+struct GraphicsOutput {
+  Status (*query_mode)(GraphicsOutput*, uint32_t mode, Uintn* size_of_info, GraphicsModeInfo** info);
+  Status (*set_mode)(GraphicsOutput*, uint32_t mode);
+  void* blt;
+  GraphicsMode* mode;
+};
+
+constexpr Guid kGraphicsOutputGuid = {
+    0x9042a9de, 0x23dc, 0x4a38, {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
+
 // EFI_MP_SERVICES_PROTOCOL: enumerate processors and run code on them.
 // Procedures run on application processors and must not call firmware.
 using ApProcedure = void (*)(void* argument);

@@ -18,6 +18,7 @@ set(TCOS_DEBUG_WAIT_SECS 0 CACHE STRING
 add_executable(BOOTX64
   src/main.cpp
   src/console.cpp
+  src/GraphicsConsole.cpp
   src/Allocators/Allocator.cpp
   src/CPUScheduler/Scheduler.cpp
   src/runtime.cpp
@@ -32,6 +33,12 @@ add_executable(BOOTX64
   src/hardware/IoPort.cpp
   src/hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
   src/hardware/TextConsole.cpp
+  src/hardware/Pci/PciBus.cpp
+  src/hardware/GraphicsProcessingUnit/Font8x16.cpp
+  src/hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
+  src/hardware/GraphicsProcessingUnit/SystemGpu.cpp
+  src/hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
+  src/hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/hardware/x86_64/port.S
 )
 

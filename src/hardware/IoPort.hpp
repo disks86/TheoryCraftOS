@@ -16,6 +16,10 @@ class IoPort final : public IHardware {
   uint16_t port() const { return port_; }
   uint8_t read8() const;
   void write8(uint8_t value) const;
+  uint16_t read16() const;
+  void write16(uint16_t value) const;
+  uint32_t read32() const;
+  void write32(uint32_t value) const;
 
  private:
   uint16_t port_;

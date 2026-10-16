@@ -21,9 +21,15 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
     Bulldozer, Piledriver, Zen ... Zen 5), `Hygon/`, `Zhaoxin/`, and `QEMU/` (the generic qemu64 model).
     The generation is chosen at boot from CPUID vendor and family/model/stepping, via the rule table in
     each vendor's `*Generations.cpp`; this covers every x86-64 model in `qemu-system-x86_64 -cpu help`.
-  - `hardware/RandomAccessMemory/`, `GraphicsProcessingUnit/`, `NeuralProcessingUnit/`: interfaces
-    (`IRandomAccessMemory`, `IGraphicsProcessingUnit`, `INeuralProcessingUnit`); only RAM has an
-    implementation so far (`UefiRandomAccessMemory`).
+  - `hardware/GraphicsProcessingUnit/`: `IGraphicsProcessingUnit` (mode setting, 2D drawing, text rendering),
+    `FramebufferGpu` (software drawing + 8x16 font on a linear framebuffer), `SystemGpu` (finds the PCI display
+    device and picks a class). Vendor folders: `QEMU/` (std VGA with real mode setting through the Bochs VBE
+    registers), `Intel/`, `AMD/`, `NVIDIA/` (identify the device but still use the firmware framebuffer until
+    native drivers exist), and `UEFI/` (`UefiGopGpu`, the fallback for any other display). `src/GraphicsConsole`
+    is a scrolling text console that only uses the GPU interface.
+  - `hardware/Pci/`: `PciBus` (config-space access and enumeration via ports 0xCF8/0xCFC).
+  - `hardware/RandomAccessMemory/`, `NeuralProcessingUnit/`: `IRandomAccessMemory` (implemented by
+    `UefiRandomAccessMemory`) and `INeuralProcessingUnit` (no implementation yet).
   - `hardware/SystemHardware.hpp`: aliases `SystemCpu` / `SystemRam` to the classes for this architecture.
   - `hardware/x86_64/port.S`: port I/O assembly for `IoPort`; `asm.hpp` is private to `hardware/`.
 

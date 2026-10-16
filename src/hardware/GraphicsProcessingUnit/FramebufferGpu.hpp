@@ -1,0 +1,41 @@
+#pragma once
+#include "hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+
+namespace hardware {
+
+// Software drawing and text rendering on a linear 32-bit framebuffer. Concrete
+// GPUs implement mode enumeration/switching and call set_framebuffer() whenever
+// the visible buffer changes.
+class FramebufferGpu : public IGraphicsProcessingUnit {
+ public:
+  uint32_t width() const override { return width_; }
+  uint32_t height() const override { return height_; }
+
+  void put_pixel(uint32_t x, uint32_t y, uint32_t color) override;
+  void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) override;
+  void copy_rect(uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, uint32_t w,
+                 uint32_t h) override;
+  void clear(uint32_t color) override { fill_rect(0, 0, width_, height_, color); }
+
+  uint32_t glyph_width() const override;
+  uint32_t glyph_height() const override;
+  void draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg) override;
+  void draw_text(uint32_t x, uint32_t y, const char* text, uint32_t fg, uint32_t bg) override;
+
+ protected:
+  constexpr FramebufferGpu() = default;
+  ~FramebufferGpu() = default;
+
+  // bgr: memory order is B, G, R, x (the usual layout); otherwise R, G, B, x.
+  void set_framebuffer(void* base, uint32_t width, uint32_t height, uint32_t pitch_bytes, bool bgr);
+
+ private:
+  uint32_t native(uint32_t color) const;
+  uint32_t* row(uint32_t y) const;
+
+  uint8_t* base_ = nullptr;
+  uint32_t width_ = 0, height_ = 0, pitch_ = 0;
+  bool bgr_ = true;
+};
+
+}  // namespace hardware

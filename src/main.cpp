@@ -1,6 +1,7 @@
 #include "Allocators/Allocator.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
+#include "hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "hardware/SystemHardware.hpp"
 #include "uefi.hpp"
 
@@ -64,6 +65,31 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   for (int i = 0; i < TCOS_DEBUG_WAIT * 10 && !g_debugger_attached; ++i)
     st->boot_services->stall(100000);
 #endif
+
+  // Display first, so everything after it appears on screen. Falls back to the
+  // firmware text console if no GPU class can drive a framebuffer.
+  hardware::PciBus pci;
+  hardware::SystemGpu system_gpu(st, pci);
+  hardware::IGraphicsProcessingUnit* gpu = system_gpu.gpu();
+  if (gpu) {
+    // Mode setting demo: switch to 1024x768 if the GPU offers it. The screen is
+    // cleared by a mode change, so do it before anything is printed.
+    for (uint32_t i = 0; i < gpu->mode_count(); ++i) {
+      hardware::DisplayMode m;
+      if (gpu->mode_info(i, &m) && m.width == 1024 && m.height == 768 && gpu->set_mode(i)) break;
+    }
+    console::use_gpu(gpu);
+    console::puts("GPU: ");
+    console::puts(gpu->name());
+    console::puts("\n");
+    console::puts("Display: ");
+    console::put_hex(gpu->width());
+    console::puts(" x ");
+    console::put_hex(gpu->height());
+    console::puts(" (");
+    console::put_hex(gpu->mode_count());
+    console::puts(" modes)\n");
+  }
 
   // Bring-up order: CPU -> RAM -> allocator -> scheduler. Objects live on this
   // stack for the life of the OS; nothing needs static constructors.
