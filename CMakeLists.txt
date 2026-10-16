@@ -18,6 +18,7 @@ set(TCOS_DEBUG_WAIT_SECS 0 CACHE STRING
 add_executable(BOOTX64
   src/main.cpp
   src/console.cpp
+  src/Allocators/Allocator.cpp
   src/runtime.cpp
   src/hardware/CentralProcessingUnit/X86_64Cpu.cpp
   src/hardware/CentralProcessingUnit/X86_64Cpu.S

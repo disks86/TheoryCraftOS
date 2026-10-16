@@ -7,10 +7,14 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
 ## Layout
 
 - `src/main.cpp`, `console.*`, `uefi.hpp`, `runtime.cpp`: entry point, logging facade, UEFI types, compiler runtime stubs.
+- `src/Allocators/`: `IAllocator` and the default `Allocator`, a cache-line block pool
+  that gets its memory from an `IRandomAccessMemory` (`base()` / `usable_bytes()`).
 - `src/hardware/`: every class that touches hardware derives from `hardware::IHardware`
   (`name()`, `initialize()`, `shutdown()`): `IoPort`, `DebugConsole`, `TextConsole`, and the CPUs.
   - `hardware/CentralProcessingUnit/`: `ICentralProcessingUnit` and its implementations
     (`X86_64Cpu`, with its assembly in `X86_64Cpu.S`).
+  - `hardware/RandomAccessMemory/`, `GraphicsProcessingUnit/`, `NeuralProcessingUnit/`: interfaces
+    (`IRandomAccessMemory`, `IGraphicsProcessingUnit`, `INeuralProcessingUnit`); no implementations yet.
   - `hardware/x86_64/port.S`: port I/O assembly for `IoPort`; `asm.hpp` is private to `hardware/`.
 
 ## Requirements
