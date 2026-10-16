@@ -37,6 +37,7 @@ enum class StreamStatus : uint8_t {
   NoSpace,         // a fixed buffer, a size limit or the medium is full
   OutOfMemory,
   IoError,
+  Cancelled,       // an async operation was cancelled through its CancellationToken
 };
 
 const char* stream_status_name(StreamStatus status);

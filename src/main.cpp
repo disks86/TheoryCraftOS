@@ -30,6 +30,7 @@
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "StorageDemo.hpp"
 #include "FileSystemDemo.hpp"
+#include "AsyncDemo.hpp"
 #include "ThreadSafetyDemo.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "ConcurrentDemo.hpp"
@@ -316,7 +317,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::TscClock clock(cpu, st);
   network::NetworkStackSet stacks(clock, shared_allocator);
   UniquePointer<NetworkStackDemo> stack_demo;
-  if (network.count() > 0 && clock.initialize()) {
+  const bool clock_ok = clock.initialize();
+  if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
+  if (network.count() > 0 && clock_ok) {
     for (uint32_t i = 0; i < network.count(); ++i)
       if (!stacks.add(*network.at(i))) console::puts("could not start a network stack\n");
     if (stacks.count() > 0) {

@@ -21,11 +21,14 @@
 
 namespace stream {
 
-// Defaults for the parts of IStream most streams do not have: no reading, writing,
+// Defaults for the parts of a stream most streams do not have: no reading, writing,
 // seeking or timeouts (each reports NotSupported, or Closed once closed). A
 // stream overrides what it can do. `closed_` is the stream's own state: set it
-// in close() (and call check() at the top of every operation).
-class StreamBase : public IStream {
+// in close() (and call check() at the top of every operation). StreamBase is the
+// base for plain IStreams; AsyncStreamBase (IAsyncStream.hpp) for streams that
+// are also asynchronous.
+template <class Interface>
+class BasicStreamBase : public Interface {
  public:
   bool can_read() const override { return false; }
   bool can_write() const override { return false; }
@@ -51,8 +54,8 @@ class StreamBase : public IStream {
   StreamStatus set_write_timeout(uint32_t) override { return unsupported(); }
 
  protected:
-  constexpr StreamBase() = default;
-  ~StreamBase() = default;
+  constexpr BasicStreamBase() = default;
+  ~BasicStreamBase() = default;
 
   StreamStatus unsupported() const { return closed_ ? StreamStatus::Closed : StreamStatus::NotSupported; }
   // Closed if closed, else Ok.
@@ -75,5 +78,7 @@ class StreamBase : public IStream {
 
   bool closed_ = false;
 };
+
+using StreamBase = BasicStreamBase<IStream>;
 
 }  // namespace stream

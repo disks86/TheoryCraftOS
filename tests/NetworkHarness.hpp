@@ -26,6 +26,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <string>
 #include <vector>
 #include "Network/NetworkStack.hpp"
 
@@ -93,5 +94,27 @@ struct Lan {
     ca.address = Ipv4Address::make(10,0,0,1); ca.netmask = Ipv4Address::make(255,255,255,0); ca.gateway = Ipv4Address::make(10,0,0,254);
     cb.address = Ipv4Address::make(10,0,0,2); cb.netmask = ca.netmask; cb.gateway = ca.gateway;
     a.configure(ca); b.configure(cb); }
+};
+
+
+// A scripted TCP server on stack B. Its step() runs whenever stack A is idle (A's NIC has nothing to receive),
+// so a blocking or awaiting client makes the server progress. `app` is the script; `received` collects what arrived.
+struct Server {
+  Lan& lan;
+  std::function<void(Server&)> app;       // what the server does each time the client waits
+  SharedPointer<ITcpSocket> listener, conn;
+  std::string received;
+  bool running = false;
+  Server(Lan& l, uint16_t port) : lan(l) {
+    listener = lan.b.tcp_open(); assert(listener->listen(port));
+    auto previous = lan.nic_a.on_idle;
+    lan.nic_a.on_idle = [this, previous] { if (previous) previous(); if (running) return; running = true; step(); running = false; };
+  }
+  void step() {
+    if (!conn) conn = listener->accept();
+    if (conn) { uint8_t b[1024]; for (uint32_t n; (n = conn->receive(ByteView(b))) > 0;) received.append(reinterpret_cast<char*>(b), n); }
+    if (app) app(*this);
+  }
+  void send_all(const char* s) { ConstByteView v(reinterpret_cast<const uint8_t*>(s), strlen(s)); while (!v.empty()) { uint32_t k = conn->send(v); v = v.subview(k); if (!k) lan.step(); } }
 };
 

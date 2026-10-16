@@ -19,7 +19,7 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "FileSystem/IFileSystem.hpp"
-#include "Stream/StreamBase.hpp"
+#include "Stream/IAsyncStream.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace stream {
@@ -32,10 +32,10 @@ namespace stream {
 //
 // OpenMode maps onto C#'s FileMode: Read = Open+Read, ReadWrite = Open,
 // CreateOrOpen = OpenOrCreate, CreateTruncate = Create.
-class FileStream final : public StreamBase {
+class FileStream final : public AsyncStreamBase {
  public:
   static filesystem::Status open(allocators::IAllocator& allocator, filesystem::IFileSystem& fs, StringView path,
-                                 filesystem::OpenMode mode, UniquePointer<IStream>* result);
+                                 filesystem::OpenMode mode, UniquePointer<IAsyncStream>* result);
 
   // Over a file you already opened; `writable` says whether it may be written.
   FileStream(UniquePointer<filesystem::IFile> file, bool writable) : file_(static_cast<UniquePointer<filesystem::IFile>&&>(file)), writable_(writable) {}

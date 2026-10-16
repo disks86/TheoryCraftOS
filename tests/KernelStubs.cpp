@@ -20,6 +20,9 @@
 // friends can be compiled and tested on the development machine (single thread).
 #include "Kernel/Sync.hpp"
 #include "Kernel/Delay.hpp"
+#include "Kernel/Interrupts.hpp"
+#include <stdio.h>
+#include <stdlib.h>
 namespace kernel {
 bool running() { return false; }
 Thread* current_thread() { return nullptr; }
@@ -37,6 +40,7 @@ bool wake_one_locked(WaitList*) { return false; }
 uint32_t wake_all_locked(WaitList*) { return 0; }
 }
 }
+namespace kernel { [[noreturn]] void panic(const char* what, const Frame*) { fprintf(stderr, "PANIC: %s\n", what); abort(); } }
 namespace hardware { uint64_t read_tsc() { return 0; } uint64_t tsc_ticks_per_us() { return 1; } }
 
 #include <stdio.h>

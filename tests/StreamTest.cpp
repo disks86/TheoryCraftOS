@@ -23,6 +23,7 @@
 #include "NetworkHarness.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Stream/File/FileStream.hpp"
+#include "Stream/IAsyncStream.hpp"
 #include "Stream/Memory/MemoryStream.hpp"
 #include "Stream/StreamHelpers.hpp"
 #include "Stream/Tcp/TcpStream.hpp"
@@ -168,7 +169,7 @@ static void test_file() {
   TestAllocator a;
   {
     filesystem::RamFileSystem fs(a, 1000);
-    UniquePointer<IStream> f;
+    UniquePointer<IAsyncStream> f;
     CHECK(FileStream::open(a, fs, "/nope", filesystem::OpenMode::Read, &f) == filesystem::Status::NotFound && !f);
     CHECK(FileStream::open(a, fs, "/log.txt", filesystem::OpenMode::CreateOrOpen, &f) == filesystem::Status::Ok && f);
     CHECK(f->can_read() && f->can_write() && f->can_seek() && !f->can_timeout());
@@ -208,7 +209,7 @@ static void test_file() {
     CHECK(fs.remove("/log.txt") == filesystem::Status::Ok);
 
     // Read-only streams.
-    UniquePointer<IStream> w;
+    UniquePointer<IAsyncStream> w;
     CHECK(FileStream::open(a, fs, "/r", filesystem::OpenMode::CreateOrOpen, &w) == filesystem::Status::Ok);
     write_text(*w, "abc"); w.reset();
     CHECK(FileStream::open(a, fs, "/r", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok);
@@ -226,26 +227,6 @@ static void test_file() {
   CHECK(g_live == 0);
 }
 
-// ---- TCP: a real client stack talking to a scripted server on the other stack.
-struct Server {
-  Lan& lan;
-  std::function<void(Server&)> app;       // what the server does each time the client waits
-  SharedPointer<ITcpSocket> listener, conn;
-  std::string received;
-  bool running = false;
-  Server(Lan& l, uint16_t port) : lan(l) {
-    listener = lan.b.tcp_open(); assert(listener->listen(port));
-    auto previous = lan.nic_a.on_idle;
-    lan.nic_a.on_idle = [this, previous] { if (previous) previous(); if (running) return; running = true; step(); running = false; };
-  }
-  void step() {
-    if (!conn) conn = listener->accept();
-    if (conn) { uint8_t b[1024]; for (uint32_t n; (n = conn->receive(ByteView(b))) > 0;) received.append(reinterpret_cast<char*>(b), n); }
-    if (app) app(*this);
-  }
-  void send_all(const char* s) { ConstByteView v = bytes_of(s); while (!v.empty()) { uint32_t k = conn->send(v); v = v.subview(k); if (!k) lan.step(); } }
-};
-
 static void test_tcp() {
   const Ipv4Address server_ip = Ipv4Address::make(10, 0, 0, 2);
   {  // echo, bulk data, close
@@ -261,7 +242,7 @@ static void test_tcp() {
         echoed += k;
       }
     };
-    UniquePointer<IStream> c;
+    UniquePointer<IAsyncStream> c;
     CHECK_STATUS(TcpStream::connect(lan.a, lan.alloc, server_ip, 7, 5000, &c), StreamStatus::Ok);
     CHECK(c && c->can_read() && c->can_write() && !c->can_seek() && c->can_timeout());
     uint64_t len;
@@ -293,7 +274,7 @@ static void test_tcp() {
     server.app = [&](Server& s) {
       if (s.conn && !sent) { sent = true; s.send_all("bye"); s.conn->close(); }
     };
-    UniquePointer<IStream> c;
+    UniquePointer<IAsyncStream> c;
     CHECK_STATUS(TcpStream::connect(lan.a, lan.alloc, server_ip, 7, 5000, &c), StreamStatus::Ok);
     CHECK(drain(*c) == "bye");
     uint64_t n = 5; uint8_t b[4];
@@ -303,7 +284,7 @@ static void test_tcp() {
   {  // timeouts
     Lan lan; lan.configure_static();
     Server server(lan, 7);  // accepts, never says anything
-    UniquePointer<IStream> c;
+    UniquePointer<IAsyncStream> c;
     CHECK_STATUS(TcpStream::connect(lan.a, lan.alloc, server_ip, 7, 5000, &c), StreamStatus::Ok);
     CHECK_STATUS(c->set_read_timeout(50), StreamStatus::Ok);
     uint8_t b[4]; uint64_t n = 9;
@@ -313,13 +294,13 @@ static void test_tcp() {
     CHECK(waited >= 50 && waited < 1000);
     CHECK_STATUS(c->set_read_timeout(kInfiniteTimeout), StreamStatus::Ok);
     // Connecting to an address nobody answers for.
-    UniquePointer<IStream> none;
+    UniquePointer<IAsyncStream> none;
     CHECK_STATUS(TcpStream::connect(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 77), 7, 300, &none), StreamStatus::TimedOut);
     CHECK(!none);
   }
   {  // refused, and reset
     Lan lan; lan.configure_static();
-    UniquePointer<IStream> c;
+    UniquePointer<IAsyncStream> c;
     CHECK_STATUS(TcpStream::connect(lan.a, lan.alloc, server_ip, 99, 5000, &c), StreamStatus::ConnectionLost);  // nobody listens
     Server server(lan, 7);
     bool reset = false;
@@ -343,7 +324,7 @@ static void test_tcp() {
     CHECK_STATUS(server_side.read(ByteView(b), &n), StreamStatus::Ok); CHECK(n == 4 && !memcmp(b, "ping", 4));
     server_side.abort();
     CHECK(server_side.is_closed());
-    UniquePointer<IStream> c;
+    UniquePointer<IAsyncStream> c;
     CHECK_STATUS(TcpStream::connect(lan.a, lan.alloc, "no-such-host.invalid", 80, 200, &c), StreamStatus::HostNotFound);
     CHECK_STATUS(TcpStream::connect(lan.a, lan.alloc, "10.0.0.2", 80, 2000, &c), StreamStatus::Ok);  // a dotted quad needs no lookup
   }

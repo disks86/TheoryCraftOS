@@ -34,6 +34,7 @@ const char* stream_status_name(StreamStatus status) {
     case StreamStatus::NoSpace: return "no space";
     case StreamStatus::OutOfMemory: return "out of memory";
     case StreamStatus::IoError: return "I/O error";
+    case StreamStatus::Cancelled: return "cancelled";
   }
   return "unknown";
 }

@@ -48,11 +48,19 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   size-limitable in-memory filesystem, `Fat/` mounts FAT12/16/32 volumes (with long names) read-only from any
   `IStorageDevice` at a given first block. `src/FileSystemDemo` scans each device's partitions and mounts the FAT ones at
   boot (read only); `tests/FileSystemTest.cpp` covers both filesystems.
+- `src/Async/`: async/await on C++20 coroutines, shaped like C#'s `Task`. `Task<T>` is lazy and move-only; an `Executor`
+  runs tasks cooperatively on one thread (`spawn`, `block_on`, `run`), waiting tasks are polled each pass and the
+  executor sleeps when nothing is ready. Awaitables: `delay`, `yield_now`, `wait_until(pred[, timeout])`,
+  `current_executor`; plus `when_all`, `AsyncEvent`, `AsyncMutex` and `CancellationSource/Token`. No exceptions: a
+  coroutine frame that cannot be allocated makes the task invalid (`FailedResult<T>`, out of memory for stream results;
+  a `Task<void>` cannot report it, so check `valid()`). Frames come from `set_frame_allocator`. Avoid `co_await` inside
+  a larger `&&`/`||` condition: GCC 16 mis-evaluates it.
 - `src/Stream/`: `IStream`, modelled on C#'s `Stream` (`read`/`write`/`flush`/`close`, `can_seek` + `length`/`position`/`seek`/
   `set_length`, read/write timeouts), with `StreamStatus` results instead of exceptions. `Memory/MemoryStream` (growable,
   over a fixed buffer, or read-only over data), `File/FileStream` (over any `IFileSystem` file) and `Tcp/TcpStream`
-  (blocking over an `ITcpSocket`, polling the stack; `connect` by address or name). `StreamHelpers.hpp` has
-  `read_exactly`, `read_byte`, `write_text`, `copy_to`. `tests/StreamTest.cpp` runs TcpStream against a real second stack.
+  (over an `ITcpSocket`, blocking or async, with `TcpListener`; `connect`/`connect_async` by address or name). `StreamHelpers.hpp` has
+  `read_exactly`, `read_byte`, `write_text`, `copy_to`; `IAsyncStream` adds `read_async`/`write_async`/`flush_async`
+  (with cancellation) and `AsyncStreamHelpers.hpp` the awaitable versions. `src/AsyncDemo` self-checks it at boot. `tests/StreamTest.cpp` runs TcpStream against a real second stack.
 - `src/Hardware/StorageDevice/Partition/`: `scan_partitions` reads GPT (header and array CRC-32, backup copy fallback,
   protective MBR) or MBR (primaries plus the extended/logical chain), and treats a bare filesystem as having no table;
   `PartitionStorageDevice` is a range-checked window onto part of a device, so a filesystem mounts a partition like a

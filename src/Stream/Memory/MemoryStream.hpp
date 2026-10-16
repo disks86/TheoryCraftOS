@@ -18,7 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
-#include "Stream/StreamBase.hpp"
+#include "Stream/IAsyncStream.hpp"
 
 namespace stream {
 
@@ -32,7 +32,7 @@ namespace stream {
 // allocator cannot); past a fixed buffer's capacity it fails with NoSpace and
 // writes nothing. Seeking beyond the end is allowed; a write there zero-fills the
 // gap. contents() is the bytes written so far (valid until the next change).
-class MemoryStream final : public StreamBase {
+class MemoryStream final : public AsyncStreamBase {
  public:
   // Growable, owning; `initial_capacity` bytes are reserved up front.
   explicit MemoryStream(allocators::IAllocator& allocator, uint64_t initial_capacity = 0);

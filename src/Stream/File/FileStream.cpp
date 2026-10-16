@@ -36,12 +36,12 @@ StreamStatus from_file_status(filesystem::Status s) {
 }  // namespace
 
 filesystem::Status FileStream::open(allocators::IAllocator& allocator, filesystem::IFileSystem& fs, StringView path,
-                                    filesystem::OpenMode mode, UniquePointer<IStream>* result) {
+                                    filesystem::OpenMode mode, UniquePointer<IAsyncStream>* result) {
   UniquePointer<filesystem::IFile> file;
   const filesystem::Status s = fs.open_file(path, mode, &file);
   if (s != filesystem::Status::Ok) return s;
-  UniquePointer<IStream> opened =
-      UniquePointer<IStream>::make_as<FileStream>(allocator, util::move(file), mode != filesystem::OpenMode::Read);
+  UniquePointer<IAsyncStream> opened =
+      UniquePointer<IAsyncStream>::make_as<FileStream>(allocator, util::move(file), mode != filesystem::OpenMode::Read);
   if (!opened) return filesystem::Status::OutOfMemory;
   *result = util::move(opened);
   return filesystem::Status::Ok;

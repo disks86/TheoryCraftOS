@@ -19,40 +19,52 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Network/INetworkStack.hpp"
-#include "Stream/StreamBase.hpp"
+#include "Stream/IAsyncStream.hpp"
 #include "Utility/SharedPointer.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace stream {
 
 // A stream over a TCP connection, like C#'s NetworkStream: read and write only
-// (no seeking), blocking, with timeouts. The network stack is polled, so a read or
-// write waits by calling the stack's poll() until it can make progress - do not
-// use one from the thread that is the only one polling the stack.
+// (no seeking), with timeouts, usable two ways.
 //
-//   UniquePointer<IStream> conn;
-//   if (TcpStream::connect(stack, allocator, "example.com", 80, 5000, &conn) == StreamStatus::Ok) {
-//     write_text(*conn, "GET / HTTP/1.0\r\n\r\n");
-//     conn->flush();
-//     ... conn->read(buffer, &got) ... // got == 0 once the server has closed
+// Blocking (read/write/flush): waits by calling the network stack's poll() until
+// it can make progress - not for a thread that is the only one polling the stack.
+//
+// Async (read_async/write_async/flush_async, connect_async): suspends only the
+// calling task; the executor runs other tasks meanwhile. Each wait polls the stack
+// itself (cheap and idempotent), so nothing else needs to drive it.
+//
+//   UniquePointer<IAsyncStream> conn;
+//   if (co_await TcpStream::connect_async(stack, allocator, "example.com", 80, 5000, &conn) == StreamStatus::Ok) {
+//     co_await write_text_async(*conn, "GET / HTTP/1.0\r\n\r\n");
+//     co_await conn->flush_async();
+//     for (;;) { IoResult r = co_await conn->read_async(buffer); if (r.status != Ok || !r.count) break; ... }
 //   }
 //
-// read() returns Ok with 0 bytes when the peer has closed its side and all its
-// data was read, ConnectionLost if the connection was reset or timed out, and
-// TimedOut when nothing arrived within the read timeout (default 30 s). write()
-// returns once everything is queued for sending; flush() waits until the peer
-// acknowledged it all. close() ends our side gracefully (the stack finishes the
-// closing handshake); destroying the stream does the same without waiting.
-class TcpStream final : public StreamBase {
+// read returns Ok with 0 bytes when the peer has closed its side and all its data
+// was read, ConnectionLost if the connection was reset or timed out, and TimedOut
+// when nothing arrived within the read timeout (default 30 s). write returns once
+// everything is queued for sending; flush waits until the peer acknowledged it all.
+// close() ends our side gracefully (the stack finishes the closing handshake);
+// destroying the stream does the same without waiting.
+class TcpStream final : public AsyncStreamBase {
  public:
   static constexpr uint32_t kDefaultTimeoutMs = 30000;
 
   // Connects to `address`:`port`, waiting up to `timeout_ms` for the handshake.
   static StreamStatus connect(network::INetworkStack& stack, allocators::IAllocator& allocator, network::Ipv4Address address,
-                              uint16_t port, uint32_t timeout_ms, UniquePointer<IStream>* result);
+                              uint16_t port, uint32_t timeout_ms, UniquePointer<IAsyncStream>* result);
   // Resolves `host` (a name or dotted quad) first; the timeout covers each step.
   static StreamStatus connect(network::INetworkStack& stack, allocators::IAllocator& allocator, StringView host, uint16_t port,
-                              uint32_t timeout_ms, UniquePointer<IStream>* result);
+                              uint32_t timeout_ms, UniquePointer<IAsyncStream>* result);
+  // The same without blocking the thread. `result` must stay valid until the task completes.
+  static async::Task<StreamStatus> connect_async(network::INetworkStack& stack, allocators::IAllocator& allocator,
+                                                 network::Ipv4Address address, uint16_t port, uint32_t timeout_ms,
+                                                 UniquePointer<IAsyncStream>* result, async::CancellationToken token = {});
+  static async::Task<StreamStatus> connect_async(network::INetworkStack& stack, allocators::IAllocator& allocator, StringView host,
+                                                 uint16_t port, uint32_t timeout_ms, UniquePointer<IAsyncStream>* result,
+                                                 async::CancellationToken token = {});
 
   // Over an established socket, for example one returned by ITcpSocket::accept().
   TcpStream(network::INetworkStack& stack, SharedPointer<network::ITcpSocket> socket)
@@ -77,6 +89,11 @@ class TcpStream final : public StreamBase {
   network::Ipv4Address remote_address() const { return socket_ ? socket_->remote_address() : network::Ipv4Address{}; }
   uint16_t remote_port() const { return socket_ ? socket_->remote_port() : 0; }
 
+ protected:
+  async::Task<IoResult> on_read_async(ByteView buffer, async::CancellationToken token) override;
+  async::Task<StreamStatus> on_write_async(ConstByteView data, async::CancellationToken token) override;
+  async::Task<StreamStatus> on_flush_async(async::CancellationToken token) override;
+
  private:
   // One polling step; true once `deadline_ms` (an absolute time, or "never") has passed.
   bool wait_step(uint64_t deadline_ms);
@@ -86,6 +103,37 @@ class TcpStream final : public StreamBase {
   SharedPointer<network::ITcpSocket> socket_;
   uint32_t read_timeout_ms_ = kDefaultTimeoutMs;
   uint32_t write_timeout_ms_ = kDefaultTimeoutMs;
+};
+
+// Accepts incoming connections on a port as streams.
+//
+//   TcpListener listener(stack, allocator);
+//   listener.listen(8080);
+//   UniquePointer<IAsyncStream> client;
+//   while (co_await listener.accept_async(&client) == StreamStatus::Ok) executor.spawn(serve(move(client)));
+class TcpListener {
+ public:
+  TcpListener(network::INetworkStack& stack, allocators::IAllocator& allocator) : stack_(stack), allocator_(allocator) {}
+  ~TcpListener() { stop(); }
+  TcpListener(const TcpListener&) = delete;
+  TcpListener& operator=(const TcpListener&) = delete;
+
+  // Starts listening. False if the port is taken or memory ran out.
+  bool listen(uint16_t port);
+  void stop();
+  uint16_t port() const { return socket_ ? socket_->local_port() : 0; }
+
+  // Waits for a connection (up to `timeout_ms`; TimedOut) and wraps it in a stream.
+  StreamStatus accept(uint32_t timeout_ms, UniquePointer<IAsyncStream>* result);
+  async::Task<StreamStatus> accept_async(UniquePointer<IAsyncStream>* result, uint32_t timeout_ms = kInfiniteTimeout,
+                                         async::CancellationToken token = {});
+
+ private:
+  StreamStatus wrap(SharedPointer<network::ITcpSocket> accepted, UniquePointer<IAsyncStream>* result);
+
+  network::INetworkStack& stack_;
+  allocators::IAllocator& allocator_;
+  SharedPointer<network::ITcpSocket> socket_;
 };
 
 }  // namespace stream
