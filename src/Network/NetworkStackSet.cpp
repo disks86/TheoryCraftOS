@@ -71,7 +71,7 @@ uint32_t NetworkStackSet::wait_for_addresses(uint32_t timeout_ms) {
   }
 }
 
-bool NetworkStackSet::resolve(const char* name, uint32_t timeout_ms, Ipv4Address* address, uint32_t* interface_index) {
+bool NetworkStackSet::resolve(StringView name, uint32_t timeout_ms, Ipv4Address* address, uint32_t* interface_index) {
   // One query per usable interface, all in flight together.
   List<SharedPointer<IDnsQuery>> queries(allocator_);
   List<uint32_t> owners(allocator_);

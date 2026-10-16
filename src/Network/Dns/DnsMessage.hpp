@@ -21,6 +21,7 @@
 // a recursive A-record question and its answer. Private to Network/Dns/.
 #pragma once
 #include "Network/NetworkTypes.hpp"
+#include "Utility/StringView.hpp"
 
 namespace network::dns {
 
@@ -31,11 +32,11 @@ constexpr uint32_t kMaxTextName = 253;   // longest name as dotted text
 
 // Writes `name` (dotted text) as length-prefixed labels ending in a zero byte.
 // Returns the bytes written, or 0 if the name is invalid or does not fit.
-uint32_t encode_name(const char* name, ByteView out);
+uint32_t encode_name(StringView name, ByteView out);
 
 // A question: 12-byte header (recursion desired) and one A/IN question for
 // `name`. Returns the message length, 0 on error.
-uint32_t build_query(uint16_t id, const char* name, ByteView out);
+uint32_t build_query(uint16_t id, StringView name, ByteView out);
 
 enum class ParseResult : uint8_t {
   Answer,       // an A record was found: fields below are set
@@ -53,9 +54,9 @@ struct Answer {
 
 // Checks that `message` answers the question (id, `name`) and extracts the
 // address. CNAME chains and name compression are handled.
-ParseResult parse_response(ConstByteView message, uint16_t id, const char* name, Answer* answer);
+ParseResult parse_response(ConstByteView message, uint16_t id, StringView name, Answer* answer);
 
 // Case-insensitive comparison of two host names given as text (a trailing dot is ignored).
-bool names_equal(const char* a, const char* b);
+bool names_equal(StringView a, StringView b);
 
 }  // namespace network::dns

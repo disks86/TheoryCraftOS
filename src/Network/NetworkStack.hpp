@@ -58,7 +58,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void start_dhcp() override;
   const IDhcpClient& dhcp() const override { return *dhcp_; }
   bool wait_for_address(uint32_t timeout_ms) override;
-  bool resolve(const char* name, uint32_t timeout_ms, Ipv4Address* address) override;
+  bool resolve(StringView name, uint32_t timeout_ms, Ipv4Address* address) override;
   IDnsResolver& dns() override { return *resolver_; }
   bool ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_ms) override;
   SharedPointer<IUdpSocket> udp_open(uint16_t port) override;

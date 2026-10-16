@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+#include "Utility/StringView.hpp"
 #include "uefi.hpp"
 
 // Output goes to the QEMU debug console (port 0x402) and to the screen: the
@@ -28,7 +29,7 @@ void init(efi::SystemTable* st);
 // Routes screen output through `gpu` (clearing it). Call again after changing
 // the GPU's mode. nullptr returns to the firmware text console.
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu);
-void puts(const char* s);
+void puts(StringView text);  // a literal or any C string converts implicitly
 // Holds the console for several calls, so a line from one thread is not torn by
 // output from another. Nests; always release in reverse order (use Guard).
 void lock();

@@ -71,7 +71,7 @@ class NetworkStackSet {
   // Looks `name` up on every interface that has an address and a DNS server, all
   // at the same time, and returns the first answer found. *interface_index tells
   // which interface's network gave it. False if none resolved it in time.
-  bool resolve(const char* name, uint32_t timeout_ms, Ipv4Address* address, uint32_t* interface_index = nullptr);
+  bool resolve(StringView name, uint32_t timeout_ms, Ipv4Address* address, uint32_t* interface_index = nullptr);
 
  private:
   hardware::IClock& clock_;

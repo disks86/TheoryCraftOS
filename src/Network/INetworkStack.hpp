@@ -19,6 +19,7 @@
 #pragma once
 #include "Network/Dhcp/IDhcpClient.hpp"
 #include "Kernel/Sync.hpp"
+#include "Utility/StringView.hpp"
 #include "Network/Dns/IDnsResolver.hpp"
 #include "Network/NetworkTypes.hpp"
 #include "Network/Tcp/ITcpSocket.hpp"
@@ -56,7 +57,7 @@ class INetworkStack {
 
   // Looks up a host name (or accepts a dotted-quad address) and waits up to
   // `timeout_ms` for the answer. For lookups that do not block, use dns().
-  virtual bool resolve(const char* name, uint32_t timeout_ms, Ipv4Address* address) = 0;
+  virtual bool resolve(StringView name, uint32_t timeout_ms, Ipv4Address* address) = 0;
   virtual IDnsResolver& dns() = 0;
 
   // Sends an ICMP echo request ("ping") and waits for the reply. On success

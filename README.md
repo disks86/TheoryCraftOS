@@ -46,7 +46,7 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   (pointer + size: a non-owning, *checked* window - `operator[]`, `subview(Slice)`, `first/last/dropped`, `copy_from`,
   `cast<U>()`, and `try_*` forms that report failure instead), `ByteView`/`ConstByteView`, `ByteReader`/`ByteWriter`
   (bounds-checked, byte-order-aware parsing and building of packets and descriptors; the first failed access sets a
-  sticky error) and `allocate_view`/`release_view`. Anywhere code used to pass `T* data, uint32_t length` it passes one
+  sticky error) and `allocate_view`/`release_view`, and text: `StringView` (non-owning, checked; `substr`, `find`, `split_once`/`next_token`, `trimmed`, `starts_with`, case-insensitive compare, `parse_uint`, `copy_to`) and `String` (owned, allocator-backed, always NUL-terminated for `c_str()`, move-only; every operation that may need memory returns false on failure). The DNS/name APIs, `parse_ipv4` and `console::puts` take `StringView`. Anywhere code used to pass `T* data, uint32_t length` it passes one
   view: the network stack (every parser and builder), NIC/storage/USB-controller interfaces, descriptor and HID
   parsing, DMA rings and bounce buffers, NPU/ISP buffers, the framebuffer, ACPI/memory-map walking, and the containers'
   own storage (`List::operator[]` is now checked). A violation stops the OS with a message (`bounds_violation`);

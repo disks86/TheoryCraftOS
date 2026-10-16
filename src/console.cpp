@@ -80,9 +80,9 @@ void init(efi::SystemTable* st) {
 
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu) { g_graphics.attach(gpu); }
 
-void puts(const char* s) {
+void puts(StringView text) {
   Guard guard;
-  while (*s) putc(*s++);
+  for (char c : text) putc(c);
 }
 
 void put_hex(uint64_t v) {

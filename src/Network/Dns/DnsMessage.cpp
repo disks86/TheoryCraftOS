@@ -57,48 +57,36 @@ bool read_name(ConstByteView m, uint64_t offset, ArrayView<char> out, uint64_t* 
   }
 }
 
-// Copies a NUL-terminated name into a text buffer of known size; false if it does not fit.
-bool copy_name(ArrayView<char> to, const char* from) {
-  uint64_t n = 0;
-  while (from[n]) ++n;
-  if (n >= to.size()) return false;
-  to.first(n).copy_from(ArrayView<const char>(from, n));
-  to[n] = '\0';
-  return true;
-}
+// Copies a name into a text buffer of known size (with a NUL); false if it does not fit.
+bool copy_name(ArrayView<char> to, StringView from) { return from.copy_to(to); }
 }  // namespace
 
-bool names_equal(const char* a, const char* b) {
-  for (;; ++a, ++b) {
-    if (*a == '.' && a[1] == '\0') ++a;  // ignore one trailing dot
-    if (*b == '.' && b[1] == '\0') ++b;
-    if (lower(*a) != lower(*b)) return false;
-    if (*a == '\0') return true;
-  }
+bool names_equal(StringView a, StringView b) {
+  if (a.ends_with('.')) a = a.without_suffix(1);  // ignore one trailing dot
+  if (b.ends_with('.')) b = b.without_suffix(1);
+  return a.equals_ignore_case(b);
 }
 
-uint32_t encode_name(const char* name, ByteView out) {
-  if (!name || !*name) return 0;
-  uint64_t length = 0;
-  while (name[length]) ++length;
-  if (name[length - 1] == '.') --length;  // an absolute name: drop the trailing dot
-  if (length == 0 || length > kMaxTextName) return 0;
+uint32_t encode_name(StringView name, ByteView out) {
+  if (name.ends_with('.')) name = name.without_suffix(1);  // an absolute name: drop the trailing dot
+  if (name.empty() || name.size() > kMaxTextName) return 0;
 
   ByteWriter w(out);
-  uint64_t label_start = 0;
-  for (uint64_t i = 0; i <= length; ++i) {
-    if (i < length && name[i] != '.') continue;
-    const uint64_t label = i - label_start;
-    if (label == 0 || label > 63) return 0;  // empty label ("a..b") or too long
-    w.u8(static_cast<uint8_t>(label));
-    w.bytes(ConstByteView(reinterpret_cast<const uint8_t*>(name + label_start), label));
-    label_start = i + 1;
+  StringView rest = name, label;
+  while (true) {  // labels are what lies between the dots, last one included
+    const uint64_t dot = rest.find('.');
+    label = dot == StringView::npos ? rest : rest.first(dot);
+    if (label.empty() || label.size() > 63) return 0;  // empty label ("a..b") or too long
+    w.u8(static_cast<uint8_t>(label.size()));
+    w.bytes(label.bytes());
+    if (dot == StringView::npos) break;
+    rest = rest.without_prefix(dot + 1);
   }
   w.u8(0);
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-uint32_t build_query(uint16_t id, const char* name, ByteView out) {
+uint32_t build_query(uint16_t id, StringView name, ByteView out) {
   ByteWriter w(out);
   w.be16(id);
   w.be16(0x0100);  // standard query, recursion desired
@@ -117,7 +105,7 @@ uint32_t build_query(uint16_t id, const char* name, ByteView out) {
   return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-ParseResult parse_response(ConstByteView m, uint16_t id, const char* name, Answer* answer) {
+ParseResult parse_response(ConstByteView m, uint16_t id, StringView name, Answer* answer) {
   ByteReader in(m);
   const uint16_t wire_id = in.be16();
   const uint16_t flags = in.be16();
@@ -136,7 +124,7 @@ ParseResult parse_response(ConstByteView m, uint16_t id, const char* name, Answe
   in.seek(o);
   const uint16_t qtype = in.be16(), qclass = in.be16();
   if (!in.ok()) return ParseResult::Invalid;
-  if (!names_equal(qname.data(), name) || qtype != kTypeA || qclass != kClassIn) return ParseResult::Invalid;
+  if (!names_equal(StringView(qname.data()), name) || qtype != kTypeA || qclass != kClassIn) return ParseResult::Invalid;
   o = in.position();
 
   if (flags & 0x0200) return ParseResult::Truncated;
@@ -147,7 +135,7 @@ ParseResult parse_response(ConstByteView m, uint16_t id, const char* name, Answe
   // Follow the CNAME chain from the name asked for to an A record.
   char target_storage[kMaxName + 1];
   const ArrayView<char> target(target_storage);
-  if (!copy_name(target, qname.data())) return ParseResult::Invalid;
+  if (!copy_name(target, StringView(qname.data()))) return ParseResult::Invalid;
   uint32_t min_ttl = 0xFFFFFFFF;
   for (uint16_t i = 0; i < answers; ++i) {
     char owner_storage[kMaxName + 1];
@@ -158,7 +146,7 @@ ParseResult parse_response(ConstByteView m, uint16_t id, const char* name, Answe
     const uint16_t rdlength = in.be16();
     ConstByteView rdata = in.take(rdlength);  // the record data must lie inside the message
     if (!in.ok()) return ParseResult::Invalid;
-    if (klass == kClassIn && names_equal(owner_storage, target.data())) {
+    if (klass == kClassIn && names_equal(StringView(owner_storage), StringView(target.data()))) {
       if (type == kTypeA && rdlength == 4) {
         ByteReader address(rdata);
         answer->address = Ipv4Address::read(address);
@@ -170,7 +158,7 @@ ParseResult parse_response(ConstByteView m, uint16_t id, const char* name, Answe
         char next_storage[kMaxName + 1];
         // The target name may use compression pointers into the whole message, so it is read from there.
         if (!read_name(m, in.position() - rdlength, ArrayView<char>(next_storage), &unused)) return ParseResult::Invalid;
-        if (!copy_name(target, next_storage)) return ParseResult::Invalid;
+        if (!copy_name(target, StringView(next_storage))) return ParseResult::Invalid;
         if (ttl < min_ttl) min_ttl = ttl;
       }
     }

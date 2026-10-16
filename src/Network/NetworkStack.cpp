@@ -333,7 +333,7 @@ void NetworkStack::service_pending() {
 
 // ------------------------------------------------------------------ DNS
 
-bool NetworkStack::resolve(const char* name, uint32_t timeout_ms, Ipv4Address* address) {
+bool NetworkStack::resolve(StringView name, uint32_t timeout_ms, Ipv4Address* address) {
   SharedPointer<IDnsQuery> query = resolver_->query(name);
   if (!query) return false;
   const uint64_t deadline = now_ms() + timeout_ms;

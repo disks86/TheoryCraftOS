@@ -37,7 +37,7 @@ class DnsResolver final : public IDnsResolver {
   DnsResolver(INetworkStack& stack, allocators::IAllocator& allocator)
       : stack_(stack), allocator_(allocator), queries_(allocator), cache_(allocator) {}
 
-  SharedPointer<IDnsQuery> query(const char* name) override;
+  SharedPointer<IDnsQuery> query(StringView name) override;
   void clear_cache() override;
   uint32_t cache_size() const override;
 
@@ -55,8 +55,8 @@ class DnsResolver final : public IDnsResolver {
 
   void step(Query& query);
   void finish(Query& query, DnsStatus status);
-  void remember(const char* name, bool found, Ipv4Address address, uint32_t ttl_seconds);
-  const CacheEntry* lookup(const char* name);
+  void remember(StringView name, bool found, Ipv4Address address, uint32_t ttl_seconds);
+  const CacheEntry* lookup(StringView name);
   uint32_t random();
   SharedPointer<IUdpSocket> open_random_socket();
 

@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Network/NetworkTypes.hpp"
+#include "Utility/StringView.hpp"
 #include "Utility/SharedPointer.hpp"
 
 namespace network {
@@ -65,7 +66,7 @@ class IDnsResolver {
   // is cached or `name` is an address. Null if memory ran out or the name is
   // not a valid host name (longer than 253 characters, a label over 63, empty
   // labels, ...).
-  virtual SharedPointer<IDnsQuery> query(const char* name) = 0;
+  virtual SharedPointer<IDnsQuery> query(StringView name) = 0;
 
   // Throws away every cached result.
   virtual void clear_cache() = 0;
@@ -78,6 +79,6 @@ class IDnsResolver {
 };
 
 // Parses "a.b.c.d" into an address. False for anything else.
-bool parse_ipv4(const char* text, Ipv4Address* address);
+bool parse_ipv4(StringView text, Ipv4Address* address);
 
 }  // namespace network
