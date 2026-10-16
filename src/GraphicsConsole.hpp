@@ -30,6 +30,10 @@ class GraphicsConsole {
   bool attached() const { return gpu_ != nullptr; }
 
   void put(char c);
+  // Shows what has been put so far on GPUs that need telling.
+  void flush() {
+    if (gpu_) gpu_->present();
+  }
 
  private:
   void new_line();

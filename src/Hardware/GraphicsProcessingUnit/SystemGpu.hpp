@@ -21,6 +21,7 @@
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
+#include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
 
 namespace hardware {
 
@@ -32,17 +33,20 @@ constexpr unsigned long GpuMaxOf(unsigned long a, unsigned long b) { return a > 
 class SystemGpu {
  public:
   // Tries candidates in order and keeps the first whose initialize() succeeds.
-  SystemGpu(efi::SystemTable* st, const IPciBus& pci);
+  SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllocator& allocator);
 
   // The initialized GPU, or nullptr if no usable display was found.
   IGraphicsProcessingUnit* gpu() { return active_; }
+  // The active GPU as a virtio-gpu if it is one (the 3D path needs its command channel), else nullptr.
+  VirtioGpu* virtio_gpu() { return virtio_ ? static_cast<VirtioGpu*>(active_) : nullptr; }
 
  private:
   static constexpr unsigned long kSize =
-      GpuMaxOf(sizeof(UefiGopGpu), sizeof(QemuStdVgaGpu));
+      GpuMaxOf(GpuMaxOf(sizeof(UefiGopGpu), sizeof(QemuStdVgaGpu)), sizeof(VirtioGpu));
 
   alignas(16) unsigned char storage_[kSize];
   IGraphicsProcessingUnit* active_ = nullptr;
+  bool virtio_ = false;
 };
 
 }  // namespace hardware

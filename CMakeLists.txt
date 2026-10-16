@@ -144,6 +144,14 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/SystemGpu.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
+  src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp
+  src/Graphics/Graphics2D/Device/DeviceRenderer2D.cpp
+  src/Graphics/Graphics3D/BuiltinShaders.cpp
+  src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
+  src/Graphics/SystemGraphics.cpp
+  src/GraphicsDemo.cpp
+  src/Graphics/Graphics3D/Software/SoftwareDevice.cpp
   src/Hardware/x86_64/port.S
 )
 
@@ -209,6 +217,9 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
 
   # `cmake --build build --target run`
   add_custom_target(run COMMAND ${QEMU_COMMON}
+    DEPENDS esp vars USES_TERMINAL)
+  # Same, with a virtio-gpu 3D device: QEMU renders through the host's OpenGL (virgl).
+  add_custom_target(run-gl COMMAND ${QEMU_COMMON} -vga none -device virtio-gpu-gl-pci -display gtk,gl=on
     DEPENDS esp vars USES_TERMINAL)
   # Starts the gdbstub on :1234 (-s) without halting; use with TCOS_DEBUG_WAIT.
   add_custom_target(debug COMMAND ${QEMU_COMMON} -s

@@ -163,6 +163,30 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   - `Hardware/SystemHardware.hpp`: aliases `SystemCpu` / `SystemRam` to the classes for this architecture.
   - `Hardware/x86_64/port.S`: port I/O assembly for `IoPort`; `asm.hpp` is private to `Hardware/`.
 
+- `src/Graphics/`: 2D and 3D rendering above the GPU layer, loosely modelled on Vulkan. `GraphicsTypes.hpp` has the
+  shared pieces (`Vec`/`Mat4` with Vulkan conventions - +Y down, depth 0..1 - formats, `Surface`).
+  - `Graphics2D/`: `IRenderer2D` (clip, blend, pixels, lines, rectangles, circles, triangles, images, 8x16 text, `present`).
+    `Software/SoftwareRenderer2D` rasterizes on the CPU into a `Surface` and copies it to the display GPU; `Device/DeviceRenderer2D`
+    turns every shape into colored triangles and draws them in batches through any `IGraphicsDevice`, so on the virgl device
+    it is GPU-accelerated 2D (there are no textures yet: images cost one rectangle per run of equal pixels).
+  - `Graphics3D/`: `IGraphicsDevice` creates buffers, images, shader modules and graphics pipelines; `ICommandBuffer` records
+    render passes, pipeline/vertex/index binds, push constants, viewport/scissor and (indexed) draws; `submit()` runs them
+    and `present()` shows an image. Not SPIR-V (no compiler in the OS): a `ShaderModuleDesc` holds a native C++ function for
+    the software device and/or TGSI text for the GPU device; `BuiltinShaders` ships a colored-vertex program with both.
+    `Software/SoftwareDevice` is a scanline rasterizer (near-plane clipping, perspective-correct varyings, depth buffer,
+    culling, scissor, alpha blending). `Virgl/VirglDevice` drives the host's OpenGL through virtio-gpu's virgl protocol
+    (Gallium-style state objects, TGSI shaders, buffers pushed on `unmap()`, images read back on request).
+  - `SystemGraphics` picks the back ends: the virgl device if the display GPU is a virtio-gpu with a 3D engine and the
+    device passes a self-test, else the software device (`renderer_2d()` likewise). `src/GraphicsDemo` checks it at boot: 2D shapes,
+    a conventions check (orientation, culling, depth - identical on both devices) and a spinning depth-tested cube with
+    a readback check. `tests/GraphicsTest.cpp` covers the math, both 2D renderers and the software device on the host.
+  - `Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu` is the display driver for QEMU's virtio-gpu (`-device virtio-gpu-pci`):
+    the screen is a host resource backed by guest memory, `IGraphicsProcessingUnit::present()` copies the dirty rectangle over
+    (the console calls it after every output call), and with a `-gl` device (virglrenderer) it negotiates virgl, creates a 3D
+    context and exposes its command channel to `VirglDevice`. `FramebufferGpu` gained dirty-rectangle tracking and `blit()`.
+    Not covered: textures/samplers, SPIR-V, compute, real GPUs (Intel/AMD/NVIDIA classes still use the firmware framebuffer),
+    and virtio-gpu cursor/EDID/resize events.
+
 ## Requirements
 
 `cmake`, `ninja` (or make), `x86_64-w64-mingw32-gcc/g++` (mingw-w64),
@@ -177,7 +201,12 @@ calling convention - no gnu-efi or lld needed.
 cmake -S . -B build -G Ninja
 cmake --build build              # produces build/esp/EFI/BOOT/BOOTX64.EFI
 cmake --build build --target run # boot in QEMU (OS output on your terminal)
+cmake --build build --target run-gl # same with a virtio-gpu 3D device: QEMU renders through the host GPU (virgl)
 ```
+
+`run-gl` needs QEMU built with virglrenderer and a host OpenGL stack; the OS then reports `Graphics: virgl (virtio-gpu),
+accelerated`. `scripts/qemu-debug.sh` takes `QEMU_GPU=gl` (virgl), `virtio` (virtio-gpu, software rendering) or the default
+`std` (Bochs VGA, software rendering). Without a 3D engine everything falls back to the software renderers.
 
 ### Debugging in QEMU
 

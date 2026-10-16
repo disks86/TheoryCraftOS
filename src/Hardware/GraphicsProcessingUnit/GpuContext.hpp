@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "uefi.hpp"
 
@@ -28,6 +29,7 @@ struct GpuContext {
   efi::SystemTable* st;
   const IPciBus* pci;
   PciDeviceInfo device;
+  allocators::IAllocator* allocator;  // for GPUs that need DMA memory of their own
 };
 
 }  // namespace hardware

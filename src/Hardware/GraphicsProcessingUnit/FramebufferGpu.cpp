@@ -31,6 +31,26 @@ void FramebufferGpu::set_framebuffer(ByteView memory, uint32_t width, uint32_t h
   height_ = fits ? height : 0;
   pitch_ = pitch_bytes;
   bgr_ = bgr;
+  dirty_x0_ = dirty_y0_ = dirty_x1_ = dirty_y1_ = 0;
+}
+
+void FramebufferGpu::mark_dirty(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+  if (!w || !h) return;
+  if (dirty_x0_ >= dirty_x1_) {
+    dirty_x0_ = x, dirty_y0_ = y, dirty_x1_ = x + w, dirty_y1_ = y + h;
+    return;
+  }
+  if (x < dirty_x0_) dirty_x0_ = x;
+  if (y < dirty_y0_) dirty_y0_ = y;
+  if (x + w > dirty_x1_) dirty_x1_ = x + w;
+  if (y + h > dirty_y1_) dirty_y1_ = y + h;
+}
+
+bool FramebufferGpu::take_dirty(uint32_t* x, uint32_t* y, uint32_t* w, uint32_t* h) {
+  if (dirty_x0_ >= dirty_x1_ || memory_.empty()) return false;
+  *x = dirty_x0_, *y = dirty_y0_, *w = dirty_x1_ - dirty_x0_, *h = dirty_y1_ - dirty_y0_;
+  dirty_x0_ = dirty_y0_ = dirty_x1_ = dirty_y1_ = 0;
+  return true;
 }
 
 uint32_t FramebufferGpu::native(uint32_t color) const {
@@ -45,6 +65,7 @@ ArrayView<uint32_t> FramebufferGpu::row(uint32_t y) const {
 void FramebufferGpu::put_pixel(uint32_t x, uint32_t y, uint32_t color) {
   if (memory_.empty() || x >= width_ || y >= height_) return;
   row(y)[x] = native(color);
+  mark_dirty(x, y, 1, 1);
 }
 
 void FramebufferGpu::fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
@@ -53,6 +74,7 @@ void FramebufferGpu::fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, u
   if (h > height_ - y) h = height_ - y;
   const uint32_t value = native(color);
   for (uint32_t j = 0; j < h; ++j) row(y + j).subview(x, w).fill(value);
+  mark_dirty(x, y, w, h);
 }
 
 void FramebufferGpu::copy_rect(uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y,
@@ -63,11 +85,29 @@ void FramebufferGpu::copy_rect(uint32_t src_x, uint32_t src_y, uint32_t dst_x, u
   uint32_t max_h = height_ - (src_y > dst_y ? src_y : dst_y);
   if (w > max_w) w = max_w;
   if (h > max_h) h = max_h;
+  mark_dirty(dst_x, dst_y, w, h);
   // Walk rows in the direction that never overwrites unread source rows.
   for (uint32_t j = 0; j < h; ++j) {
     uint32_t r = dst_y > src_y ? h - 1 - j : j;
     row(dst_y + r).subview(dst_x, w).copy_from(row(src_y + r).subview(src_x, w));
   }
+}
+
+void FramebufferGpu::blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t* pixels,
+                          uint32_t pitch_pixels) {
+  if (memory_.empty() || x >= width_ || y >= height_) return;
+  if (w > width_ - x) w = width_ - x;
+  if (h > height_ - y) h = height_ - y;
+  for (uint32_t j = 0; j < h; ++j) {
+    const ArrayView<uint32_t> out = row(y + j).subview(x, w);
+    const uint32_t* in = pixels + uint64_t{j} * pitch_pixels;
+    if (bgr_) {
+      for (uint32_t i = 0; i < w; ++i) out[i] = in[i] & 0x00FFFFFF;
+    } else {
+      for (uint32_t i = 0; i < w; ++i) out[i] = native(in[i]);
+    }
+  }
+  mark_dirty(x, y, w, h);
 }
 
 uint32_t FramebufferGpu::glyph_width() const { return Font8x16::kWidth; }
@@ -83,6 +123,7 @@ void FramebufferGpu::draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint
     const ArrayView<uint32_t> pixels = row(y + j).subview(x, cols);
     for (uint32_t i = 0; i < cols; ++i) pixels[i] = (glyph[j] & (0x80 >> i)) ? fg_n : bg_n;
   }
+  mark_dirty(x, y, cols, rows);
 }
 
 void FramebufferGpu::draw_text(uint32_t x, uint32_t y, const char* text, uint32_t fg,

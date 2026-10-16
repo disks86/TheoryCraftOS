@@ -35,6 +35,8 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   void copy_rect(uint32_t src_x, uint32_t src_y, uint32_t dst_x, uint32_t dst_y, uint32_t w,
                  uint32_t h) override;
   void clear(uint32_t color) override { fill_rect(0, 0, width_, height_, color); }
+  void blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t* pixels,
+            uint32_t pitch_pixels) override;
 
   uint32_t glyph_width() const override;
   uint32_t glyph_height() const override;
@@ -48,15 +50,22 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   // bgr: memory order is B, G, R, x (the usual layout); otherwise R, G, B, x.
   // `memory` is the whole framebuffer; it must cover height * pitch_bytes bytes or no drawing happens.
   void set_framebuffer(ByteView memory, uint32_t width, uint32_t height, uint32_t pitch_bytes, bool bgr);
+  uint32_t pitch_bytes() const { return pitch_; }
+  // The rectangle drawn on since the last call (and clears it); false if nothing was. For GPUs
+  // whose screen lives in separate memory and needs the changes copied over.
+  bool take_dirty(uint32_t* x, uint32_t* y, uint32_t* w, uint32_t* h);
+  void mark_all_dirty() { mark_dirty(0, 0, width_, height_); }
 
  private:
   uint32_t native(uint32_t color) const;
+  void mark_dirty(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
   // Row y as a view of `width_` pixels (checked against the framebuffer memory).
   ArrayView<uint32_t> row(uint32_t y) const;
 
   ByteView memory_;
   uint32_t width_ = 0, height_ = 0, pitch_ = 0;
   bool bgr_ = true;
+  uint32_t dirty_x0_ = 0, dirty_y0_ = 0, dirty_x1_ = 0, dirty_y1_ = 0;  // empty when x0 >= x1
 };
 
 }  // namespace hardware

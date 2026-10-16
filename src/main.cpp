@@ -24,6 +24,8 @@
 #include "Hardware/Bus/SystemPciBus.hpp"
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
+#include "GraphicsDemo.hpp"
+#include "Graphics/SystemGraphics.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
@@ -196,7 +198,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // firmware text console if no GPU class can drive a framebuffer.
   hardware::SystemPciBus system_pci(st, shared_allocator);
   hardware::IPciBus& pci = system_pci.pci();
-  hardware::SystemGpu system_gpu(st, pci);
+  hardware::SystemGpu system_gpu(st, pci, shared_allocator);
   hardware::IGraphicsProcessingUnit* gpu = system_gpu.gpu();
   if (gpu) {
     // Mode setting demo: switch to 1024x768 if the GPU offers it. The screen is
@@ -352,6 +354,18 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::puts(isp.name());
   console::puts("\n");
   const bool isp_drawn = gpu && run_isp_demo(*gpu, isp, shared_allocator);
+
+  // 2D and 3D rendering: the GPU's 3D engine where we can drive it, the software renderer otherwise.
+  // The demo takes over the whole screen, so the console is attached afresh afterwards.
+  if (gpu) {
+    graphics::SystemGraphics system_graphics(system_gpu, shared_allocator);
+    const bool graphics_ok = run_graphics_demo(system_graphics, shared_allocator);
+    console::use_gpu(gpu);
+    console::puts("Graphics: ");
+    console::puts(system_graphics.device().info().name);
+    console::puts(system_graphics.accelerated() ? ", accelerated, demo " : ", software, demo ");
+    console::puts(graphics_ok ? "ok\n" : "FAILED\n");
+  }
 
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);

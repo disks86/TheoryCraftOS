@@ -26,5 +26,9 @@ double ln(double x);                       // x > 0
 double exp(double x);
 double pow(double base, double exponent);  // base > 0, else 0
 double tanh(double x);
+double sqrt(double x);                     // x >= 0, else 0
+double sin(double x);                      // radians
+double cos(double x);
+double tan(double x);
 
 }  // namespace fmath

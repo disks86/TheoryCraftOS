@@ -61,6 +61,7 @@ void lock() {
 
 void unlock() {
   if (--g_depth == 0) {
+    g_graphics.flush();  // a GPU with a separate screen copy needs the finished output pushed over
     g_owner = 0;
     g_lock.unlock();
   }

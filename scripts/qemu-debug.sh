@@ -26,7 +26,14 @@ BUILD=${BUILD_DIR:-$(for d in build cmake-build-debug; do [ -f "$d/CMakeCache.tx
 CMAKE=$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$BUILD/CMakeCache.txt")
 [ -n "${NO_BUILD:-}" ] || "$CMAKE" --build "$BUILD" --target esp vars
 [ -n "${NO_BUILD:-}" ] || rm -f "$BUILD/debugcon.log"
-exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 256M -net none -display ${QEMU_DISPLAY:-gtk} -s \
+# QEMU_GPU: std (default, Bochs VGA), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).
+case ${QEMU_GPU:-std} in
+  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on" ;;
+  virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk" ;;
+  std) GPU_ARGS=""; DISPLAY_ARGS="gtk" ;;
+  *) echo "unknown QEMU_GPU=$QEMU_GPU (std, virtio, gl)" >&2; exit 2 ;;
+esac
+exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 256M -net none $GPU_ARGS -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \
   -drive if=pflash,format=raw,readonly=on,file="$(sed -n 's/^OVMF_CODE:FILEPATH=//p' "$BUILD/CMakeCache.txt")" \
   -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
   -drive format=raw,file=fat:rw:"$BUILD/esp" \

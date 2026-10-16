@@ -80,4 +80,38 @@ double tanh(double x) {
   return (e2 - 1) / (e2 + 1);
 }
 
+double sqrt(double x) {
+  if (x <= 0) return 0;
+  DoubleBits b{x};
+  b.u = (b.u >> 1) + (uint64_t{1023} << 51);  // halve the exponent for a first guess
+  double g = b.d;
+  for (int i = 0; i < 6; ++i) g = 0.5 * (g + x / g);
+  return g;
+}
+
+// Reduces to [-pi, pi], then folds to [-pi/2, pi/2] and runs the Taylor series.
+double sin(double x) {
+  constexpr double kPi = 3.14159265358979323846;
+  constexpr double kTwoPi = 2 * kPi;
+  if (x > 1e9 || x < -1e9) return 0;
+  const double turns = x / kTwoPi;
+  x -= kTwoPi * static_cast<double>(static_cast<long long>(turns < 0 ? turns - 0.5 : turns + 0.5));
+  if (x > kPi / 2) x = kPi - x;
+  if (x < -kPi / 2) x = -kPi - x;
+  const double x2 = x * x;
+  double term = x, sum = x;
+  for (int n = 1; n < 10; ++n) {
+    term *= -x2 / ((2 * n) * (2 * n + 1));
+    sum += term;
+  }
+  return sum;
+}
+
+double cos(double x) { return sin(x + 1.57079632679489661923); }
+
+double tan(double x) {
+  const double c = cos(x);
+  return c == 0 ? 1e300 : sin(x) / c;
+}
+
 }  // namespace fmath

@@ -51,6 +51,16 @@ class IGraphicsProcessingUnit : public IHardware {
                          uint32_t w, uint32_t h) = 0;
   virtual void clear(uint32_t color) = 0;
 
+  // Copies a w x h block of 0xAARRGGBB pixels (rows `pitch_pixels` apart) to (x, y); alpha is ignored.
+  virtual void blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t* pixels,
+                    uint32_t pitch_pixels) {
+    for (uint32_t j = 0; j < h; ++j)
+      for (uint32_t i = 0; i < w; ++i) put_pixel(x + i, y + j, pixels[uint64_t{j} * pitch_pixels + i]);
+  }
+  // Makes everything drawn so far visible. Direct framebuffers show drawing at once; a GPU that
+  // keeps its screen in separate memory (virtio-gpu) copies the changes over here.
+  virtual void present() {}
+
   // --- Text rendering with a fixed-size font.
   virtual uint32_t glyph_width() const = 0;
   virtual uint32_t glyph_height() const = 0;
