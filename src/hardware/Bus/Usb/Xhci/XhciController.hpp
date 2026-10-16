@@ -43,6 +43,10 @@ class XhciController final : public IXhciController {
                           uint8_t interval) override;
   bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
                          uint16_t* length) override;
+  bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
+  bool bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
+                     uint32_t* transferred) override;
+  bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
 
  private:
   struct InterruptEndpoint {
@@ -57,8 +61,16 @@ class XhciController final : public IXhciController {
     uint16_t received = 0;
   };
 
+  struct BulkEndpoint {
+    bool active = false;
+    uint8_t address = 0;
+    uint8_t context_id = 0;
+    xhci::ProducerRing ring;
+  };
+
   struct Device {
     static constexpr uint32_t kMaxEndpoints = 4;
+    static constexpr uint32_t kMaxBulkEndpoints = 4;
     bool present = false;
     uint8_t slot = 0;
     uint32_t speed_id = 0;
@@ -72,6 +84,7 @@ class XhciController final : public IXhciController {
     uint8_t configuration = 0;   // value passed to SET_CONFIGURATION, 0 = none yet
     uint8_t context_entries = 1;  // highest endpoint context index in use
     InterruptEndpoint endpoints[kMaxEndpoints];
+    BulkEndpoint bulk[kMaxBulkEndpoints];
   };
 
   // Bring-up steps.

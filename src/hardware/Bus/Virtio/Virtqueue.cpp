@@ -3,6 +3,7 @@
 namespace hardware {
 
 namespace {
+constexpr uint16_t kDescriptorNext = 1;   // chained to the descriptor in `next`
 constexpr uint16_t kDescriptorWrite = 2;  // device writes this buffer
 }
 
@@ -42,6 +43,19 @@ void Virtqueue::post(uint16_t index, void* data, uint32_t length, bool device_wr
   volatile Available* avail = available_;
   avail->ring[avail->index % size_] = index;
   __atomic_thread_fence(__ATOMIC_RELEASE);  // the entry must be visible before the index moves
+  avail->index = avail->index + 1;
+}
+
+void Virtqueue::post_chain(uint16_t head, const Segment* segments, uint16_t count) {
+  for (uint16_t i = 0; i < count; ++i) {
+    uint16_t flags = segments[i].device_writes ? kDescriptorWrite : 0;
+    if (i + 1 < count) flags |= kDescriptorNext;
+    descriptors_[head + i] = {reinterpret_cast<uint64_t>(segments[i].data), segments[i].length, flags,
+                              static_cast<uint16_t>(head + i + 1)};
+  }
+  volatile Available* avail = available_;
+  avail->ring[avail->index % size_] = head;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
   avail->index = avail->index + 1;
 }
 

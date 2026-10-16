@@ -18,8 +18,12 @@ class ProducerRing {
 
   // Appends a TRB (the cycle bit is added) and returns its address.
   uint64_t push(uint64_t parameter, uint32_t status, uint32_t control);
+  // Address the next TRB will be written at (after wrapping if the ring is at its
+  // end), and the cycle state it will have: what Set TR Dequeue Pointer needs.
+  uint64_t next_address();
 
  private:
+  void wrap_if_needed();
   Trb* trbs_ = nullptr;
   uint32_t index_ = 0;
   uint32_t cycle_ = 1;

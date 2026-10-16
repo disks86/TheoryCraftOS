@@ -77,6 +77,16 @@ add_executable(BOOTX64
   src/hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
   src/hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
   src/hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp
+  src/StorageDemo.cpp
+  src/hardware/StorageDevice/StorageDeviceBase.cpp
+  src/hardware/StorageDevice/SystemStorageDevices.cpp
+  src/hardware/StorageDevice/Virtio/VirtioBlockDevice.cpp
+  src/hardware/StorageDevice/Virtio/VirtioScsiDevice.cpp
+  src/hardware/StorageDevice/NVMe/NvmeStorageDevice.cpp
+  src/hardware/StorageDevice/Ahci/AhciStorageDevice.cpp
+  src/hardware/StorageDevice/Ide/IdeStorageDevice.cpp
+  src/hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
+  src/hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
   src/ConcurrentDemo.cpp
   src/hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp

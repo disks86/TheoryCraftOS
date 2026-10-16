@@ -41,6 +41,20 @@ class IUsbHostController : public IHardware {
   virtual bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer,
                                  uint16_t capacity, uint16_t* length) = 0;
 
+  // --- Bulk endpoints (mass storage and the like).
+  // Configures a bulk endpoint of an enumerated device (IN when bit 7 of the
+  // address is set). Repeating the call for a running endpoint is a no-op.
+  virtual bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) = 0;
+  // Moves `length` bytes (at most 64 KiB, within one 64 KiB-aligned window of
+  // memory) and waits for the transfer to end. *transferred, if given, receives
+  // the bytes actually moved: a short IN transfer is a success. False on a
+  // timeout, a stall or any other error.
+  virtual bool bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
+                             uint32_t* transferred) = 0;
+  // Brings a stalled bulk endpoint back to life (the controller side of
+  // CLEAR_FEATURE(ENDPOINT_HALT), which the caller still sends).
+  virtual bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) = 0;
+
  protected:
   constexpr IUsbHostController() = default;
   ~IUsbHostController() = default;

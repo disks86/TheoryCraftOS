@@ -272,6 +272,10 @@ void XhciController::release_device(Device& d) {
     allocator_.deallocate(e.buffer);
     e = InterruptEndpoint{};
   }
+  for (BulkEndpoint& e : d.bulk) {
+    e.ring.release(allocator_);
+    e = BulkEndpoint{};
+  }
   allocator_.deallocate(d.output_context);
   allocator_.deallocate(d.input_context);
   d.control_ring.release(allocator_);
@@ -548,6 +552,90 @@ bool XhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, 
     if (length) *length = e.received;
     arm_endpoint(d, e);
     return true;
+  }
+  return false;
+}
+
+// ------------------------------------------------------------ bulk endpoints
+
+bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+  if (port >= ports_ || !devices_[port].present || !max_packet) return false;
+  Device& d = devices_[port];
+  BulkEndpoint* e = nullptr;
+  for (BulkEndpoint& candidate : d.bulk) {
+    if (candidate.active && candidate.address == endpoint_address) return true;  // already running
+    if (!candidate.active && !e) e = &candidate;
+  }
+  if (!e || !e->ring.init(allocator_)) return false;
+
+  const bool in = endpoint_address & 0x80;
+  const uint8_t dci = (endpoint_address & 0x0F) * 2 + (in ? 1 : 0);
+  e->address = endpoint_address;
+  e->context_id = dci;
+
+  const uint32_t context_bytes = 33 * context_size_;
+  __builtin_memset(d.input_context, 0, context_bytes);
+  if (dci > d.context_entries) d.context_entries = dci;
+  auto* control = reinterpret_cast<uint32_t*>(context_at(d.input_context, 0));
+  control[1] = (1u << 0) | (1u << dci);  // add: slot context and this endpoint
+  auto* slot = reinterpret_cast<uint32_t*>(context_at(d.input_context, 1));
+  __builtin_memcpy(slot, context_at(d.output_context, 0), 8 * sizeof(uint32_t));
+  slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
+
+  constexpr uint32_t kEndpointTypeBulkOut = 2, kEndpointTypeBulkIn = 6;
+  auto* ep = reinterpret_cast<uint32_t*>(context_at(d.input_context, dci + 1));
+  ep[0] = 0;
+  ep[1] = (3u << 1) | ((in ? kEndpointTypeBulkIn : kEndpointTypeBulkOut) << 3) | (uint32_t{max_packet} << 16);
+  const uint64_t ring = e->ring.address() | e->ring.cycle();
+  ep[2] = static_cast<uint32_t>(ring);
+  ep[3] = static_cast<uint32_t>(ring >> 32);
+  ep[4] = 4096;  // average TRB length
+
+  Trb completion;
+  if (!run_command(reinterpret_cast<uint64_t>(d.input_context),
+                   (kTrbConfigureEndpoint << 10) | (uint32_t{d.slot} << 24), &completion)) {
+    e->ring.release(allocator_);
+    return false;
+  }
+  e->active = true;
+  return true;
+}
+
+bool XhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
+                                   uint32_t* transferred) {
+  if (transferred) *transferred = 0;
+  if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
+  const uint64_t address = reinterpret_cast<uint64_t>(data);
+  if (length && (!data || (address & ~0xFFFFull) != ((address + length - 1) & ~0xFFFFull) || !dma_reachable(data)))
+    return false;
+  Device& d = devices_[port];
+  for (BulkEndpoint& e : d.bulk) {
+    if (!e.active || e.address != endpoint_address) continue;
+    const uint64_t trb = e.ring.push(address, length & 0x1FFFF,
+                                     (kTrbNormal << 10) | kTrbIoc | kTrbInterruptOnShortPacket);
+    ring_doorbell(d.slot, e.context_id);
+    Trb event;
+    if (!wait_event(kTrbTransferEvent, trb, &event, 5000)) return false;
+    const uint32_t code = completion_code(event.status);
+    const uint32_t residual = event.status & 0xFFFFFF;
+    if (transferred) *transferred = residual <= length ? length - residual : 0;
+    return code == kCompletionSuccess || code == kCompletionShortPacket;
+  }
+  return false;
+}
+
+bool XhciController::reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) {
+  if (port >= ports_ || !devices_[port].present) return false;
+  Device& d = devices_[port];
+  for (BulkEndpoint& e : d.bulk) {
+    if (!e.active || e.address != endpoint_address) continue;
+    Trb completion;
+    const uint32_t target = (uint32_t{e.context_id} << 16) | (uint32_t{d.slot} << 24);
+    if (!run_command(0, (kTrbResetEndpoint << 10) | target, &completion)) return false;
+    // The ring is abandoned where it stands: dequeue continues at the next free TRB.
+    const uint64_t next_trb = e.ring.next_address();  // may wrap, so ask for the cycle state afterwards
+    const uint64_t next = next_trb | e.ring.cycle();
+    return run_command(next, (kTrbSetTrDequeuePointer << 10) | target, &completion);
   }
   return false;
 }

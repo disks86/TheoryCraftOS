@@ -82,6 +82,8 @@ enum TrbType : uint32_t {
   kTrbAddressDevice = 11,
   kTrbConfigureEndpoint = 12,
   kTrbEvaluateContext = 13,
+  kTrbResetEndpoint = 14,
+  kTrbSetTrDequeuePointer = 16,
   kTrbNoop = 23,
   kTrbTransferEvent = 32,
   kTrbCommandCompletion = 33,

@@ -293,6 +293,31 @@ struct SimpleNetwork {
 constexpr Guid kSimpleNetworkGuid = {
     0xA19832B9, 0xAC25, 0x11D3, {0x9A, 0x2D, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D}};
 
+// EFI_BLOCK_IO_PROTOCOL: the firmware's driver for a disk (or a partition of one).
+struct BlockIoMedia {
+  uint32_t media_id;
+  uint8_t removable_media;
+  uint8_t media_present;
+  uint8_t logical_partition;
+  uint8_t read_only;
+  uint8_t write_caching;
+  uint32_t block_size;
+  uint32_t io_align;
+  uint64_t last_block;
+};
+
+struct BlockIo {
+  uint64_t revision;
+  BlockIoMedia* media;
+  Status (*reset)(BlockIo*, uint8_t extended_verification);
+  Status (*read_blocks)(BlockIo*, uint32_t media_id, uint64_t lba, Uintn buffer_size, void* buffer);
+  Status (*write_blocks)(BlockIo*, uint32_t media_id, uint64_t lba, Uintn buffer_size, void* buffer);
+  Status (*flush_blocks)(BlockIo*);
+};
+
+constexpr Guid kBlockIoGuid = {
+    0x964E5B21, 0x6459, 0x11D2, {0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}};
+
 // EFI_MP_SERVICES_PROTOCOL: enumerate processors and run code on them.
 // Procedures run on application processors and must not call firmware.
 using ApProcedure = void (*)(void* argument);

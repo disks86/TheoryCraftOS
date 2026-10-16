@@ -16,7 +16,22 @@ void ProducerRing::release(allocators::IAllocator& allocator) {
   trbs_ = nullptr;
 }
 
+uint64_t ProducerRing::next_address() {
+  wrap_if_needed();
+  return address() + uint64_t{index_} * sizeof(Trb);
+}
+
 uint64_t ProducerRing::push(uint64_t parameter, uint32_t status, uint32_t control) {
+  wrap_if_needed();
+  Trb* trb = &trbs_[index_++];
+  trb->parameter = parameter;
+  trb->status = status;
+  __atomic_thread_fence(__ATOMIC_RELEASE);  // the cycle bit makes the TRB visible: write it last
+  trb->control = (control & ~kTrbCycle) | cycle_;
+  return reinterpret_cast<uint64_t>(trb);
+}
+
+void ProducerRing::wrap_if_needed() {
   if (index_ == kRingTrbs - 1) {  // reached the Link TRB: hand it over and wrap
     Trb* link = &trbs_[index_];
     link->parameter = address();
@@ -26,12 +41,6 @@ uint64_t ProducerRing::push(uint64_t parameter, uint32_t status, uint32_t contro
     cycle_ ^= 1;
     index_ = 0;
   }
-  Trb* trb = &trbs_[index_++];
-  trb->parameter = parameter;
-  trb->status = status;
-  __atomic_thread_fence(__ATOMIC_RELEASE);  // the cycle bit makes the TRB visible: write it last
-  trb->control = (control & ~kTrbCycle) | cycle_;
-  return reinterpret_cast<uint64_t>(trb);
 }
 
 bool EventRing::init(allocators::IAllocator& allocator) {

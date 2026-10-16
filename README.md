@@ -33,6 +33,15 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   started on all of them at once (a silent network doesn't delay the others), and `resolve()` asks every configured
   interface's DNS server and takes the first answer. `src/NetworkStackDemo` reports each interface's lease, pings
   its gateway, resolves names through it, talks UDP/TCP to the host and serves HTTP on port 8080 on every interface.
+- `src/hardware/StorageDevice/`: block storage. `IStorageDevice` reads/writes/flushes whole logical blocks
+  (synchronous, any buffer alignment and size; `StorageDeviceBase` checks ranges and chunks big requests through a
+  DMA-able bounce buffer). Native drivers: `Virtio/` (virtio-blk, virtio-scsi), `NVMe/`, `Ahci/` (SATA disks and
+  ATAPI drives; `AhciController` is shared by the drives on its ports), `Ide/` (legacy parallel ATA/ATAPI, PIO),
+  `Usb/` (mass storage, Bulk-Only Transport, over the xHCI driver's new bulk endpoints), and `UEFI/` (firmware
+  Block I/O, for any controller the firmware drives). `SystemStorageDevices` finds them all (partitions are not
+  listed); `src/StorageDemo` reports each device, cross-checks reads and, only on a device whose first block begins
+  with `TCOS-SCRATCH`, tests write/flush/read-back. Not covered: floppy and SD/MMC (only through the firmware),
+  and the LSI/MegaRAID/MPT/PVSCSI SCSI adapters (only if the firmware has a driver for them - the stock OVMF does not).
 - `src/Synchronization/`: `SpinLock`/`ScopedLock` (spin with the CPU interface's `pause()`), `Synchronized<T>`
   (any type behind a lock; `with()` for one locked operation, `access()` for a lock-holding handle that can
   be iterated) and `AtomicSharedPointer<T>`. `Allocators/ThreadSafeAllocator` serializes any allocator.

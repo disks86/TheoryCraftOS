@@ -21,6 +21,14 @@ class Virtqueue {
   // Offers `length` bytes at `data` to the device as descriptor `index`: for the
   // device to fill in (the default) or, with device_writes false, to read.
   void post(uint16_t index, void* data, uint32_t length, bool device_writes = true);
+  // Offers several buffers as one request: `count` chained descriptors, numbered
+  // head .. head+count-1 (the caller keeps those free), in the order given.
+  struct Segment {
+    void* data;
+    uint32_t length;
+    bool device_writes;
+  };
+  void post_chain(uint16_t head, const Segment* segments, uint16_t count);
   // The next buffer the device finished: its descriptor index and bytes written.
   bool take_used(uint16_t* index, uint32_t* length);
 
