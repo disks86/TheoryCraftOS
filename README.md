@@ -148,3 +148,7 @@ press Debug. QEMU opens, the debugger is paused at reset; press Resume.
 Use the **QEMU** config to just run the OS. Set the debugger to GDB (the
 bundled one works). If the symbol path is wrong for your build directory,
 edit it in the configuration.
+
+## License
+
+GNU Affero General Public License v3.0 or later - see [LICENSE](LICENSE). Every source file carries the standard notice.
