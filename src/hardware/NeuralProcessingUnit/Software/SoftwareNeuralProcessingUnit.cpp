@@ -50,7 +50,7 @@ bool SoftwareNeuralProcessingUnit::matmul(const In* a, const In* b, Out* c, uint
   for (uint32_t i = 0; i + 1 < used; ++i) {
     const bool queued = scheduler_.submit(
         [](void* job) { multiply_rows<In, Out>(*static_cast<Job*>(job)); }, &jobs[i],
-        scheduling::Queue::HighPerformance);
+        scheduling::TaskQueue::HighPerformance);
     if (!queued) multiply_rows<In, Out>(jobs[i]);  // queue full: just do it here
   }
   multiply_rows<In, Out>(jobs[used - 1]);

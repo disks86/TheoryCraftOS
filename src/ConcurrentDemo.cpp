@@ -1,5 +1,4 @@
 #include "ConcurrentDemo.hpp"
-#include "Allocators/ThreadSafeAllocator.hpp"
 #include "ObjectContainer/Concurrent/ConcurrentDictionary.hpp"
 #include "ObjectContainer/Concurrent/ConcurrentList.hpp"
 #include "ObjectContainer/Concurrent/ConcurrentQueue.hpp"
@@ -41,15 +40,14 @@ void fill_task(void* context) {
 }
 }  // namespace
 
-bool run_concurrent_demo(allocators::Allocator& allocator, hardware::ICentralProcessingUnit& cpu,
-                         scheduling::ICPUScheduler& scheduler) {
+bool run_concurrent_demo(allocators::Allocator& allocator, allocators::IAllocator& shared,
+                         hardware::ICentralProcessingUnit& cpu, scheduling::ICPUScheduler& scheduler) {
   const uint64_t free_before = allocator.free_bytes();
   bool all_ok = true;
   {
-    allocators::ThreadSafeAllocator safe(allocator, cpu);
-    ConcurrentQueue<uint32_t> queue(safe, cpu);
-    ConcurrentDictionary<uint32_t, uint32_t> dictionary(safe, cpu);
-    ConcurrentList<uint32_t> list(safe, cpu);
+    ConcurrentQueue<uint32_t> queue(shared, cpu);
+    ConcurrentDictionary<uint32_t, uint32_t> dictionary(shared, cpu);
+    ConcurrentList<uint32_t> list(shared, cpu);
     dictionary.put(kCounterKey, 0);
 
     Shared shared{&queue, &dictionary, &list};

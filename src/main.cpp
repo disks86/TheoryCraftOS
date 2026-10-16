@@ -1,4 +1,5 @@
 #include "Allocators/Allocator.hpp"
+#include "Allocators/ThreadSafeAllocator.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
 #include "hardware/Bus/SystemPciBus.hpp"
@@ -130,9 +131,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     st->boot_services->stall(100000);
 #endif
 
-  // Display first, so everything after it appears on screen. Falls back to the
+  // Memory first: the PCI bus keeps its device list in it. (Nothing is lost by
+  // being quiet for a moment; log lines also go to the debug console.)
+  // Objects live on this stack for the life of the OS; nothing needs static constructors.
+  hardware::SystemRam ram(st);
+  if (!ram.initialize()) {
+    console::puts("RAM initialization failed\n");
+    return efi::kBufferTooSmall;
+  }
+  allocators::Allocator allocator(ram);
+  if (!allocator.initialize()) {
+    console::puts("Allocator initialization failed\n");
+    return efi::kBufferTooSmall;
+  }
+
+  // Then the display, so everything after it appears on screen. Falls back to the
   // firmware text console if no GPU class can drive a framebuffer.
-  hardware::SystemPciBus system_pci(st);
+  hardware::SystemPciBus system_pci(st, allocator);
   hardware::IPciBus& pci = system_pci.pci();
   hardware::SystemGpu system_gpu(st, pci);
   hardware::IGraphicsProcessingUnit* gpu = system_gpu.gpu();
@@ -161,28 +176,21 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::put_hex(pci.device_count());
   console::puts(" devices\n");
 
-  // Bring-up order: CPU -> RAM -> allocator -> scheduler. Objects live on this
-  // stack for the life of the OS; nothing needs static constructors.
+  // The CPU, then the scheduler.
   hardware::SystemCpu system_cpu(st);
   hardware::ICentralProcessingUnit& cpu = system_cpu.cpu();
   if (!cpu.initialize()) {
     console::puts("CPU initialization failed\n");
     return efi::kBufferTooSmall;
   }
-  hardware::SystemRam ram(st);
-  if (!ram.initialize()) {
-    console::puts("RAM initialization failed\n");
-    return efi::kBufferTooSmall;
-  }
-  allocators::Allocator allocator(ram);
-  if (!allocator.initialize()) {
-    console::puts("Allocator initialization failed\n");
-    return efi::kBufferTooSmall;
-  }
   console::puts("Containers:\n");
   if (!run_container_demo(allocator)) console::puts("container self-check failed\n");
 
-  scheduling::Scheduler scheduler(cpu, allocator);
+  // Everything that may run on several cores shares ONE thread-safe front for the
+  // allocator: the scheduler's queues grow through it, and so do the concurrent
+  // containers. (Two separate wrappers would use two locks and not exclude each other.)
+  allocators::ThreadSafeAllocator shared_allocator(allocator, cpu);
+  scheduling::Scheduler scheduler(cpu, shared_allocator);
 
   // USB comes after the allocator: the xHCI driver needs DMA-able memory.
   hardware::UsbBus usb(pci, allocator, st);
@@ -248,7 +256,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (!run_utility_demo(allocator, scheduler)) console::puts("utility self-check failed\n");
 
   console::puts("Concurrent containers:\n");
-  if (!run_concurrent_demo(allocator, cpu, scheduler)) console::puts("concurrent self-check failed\n");
+  if (!run_concurrent_demo(allocator, shared_allocator, cpu, scheduler)) console::puts("concurrent self-check failed\n");
 
   // Image signal processor: a hardware one if the machine has a known ISP,
   // otherwise the software pipeline. The demo needs a screen to draw on.

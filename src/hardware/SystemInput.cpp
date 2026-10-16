@@ -11,20 +11,17 @@ namespace hardware {
 
 template <class T, class... Args>
 T* SystemInput::make(Args&&... args) {
-  if (owned_count_ == kMaxDevices) return nullptr;
-  void* memory = allocator_.allocate(sizeof(T));
-  if (!memory) return nullptr;
-  T* device = new (memory) T(static_cast<Args&&>(args)...);
-  owned_[owned_count_++] = device;
-  return device;
+  UniquePointer<T> device = UniquePointer<T>::make(allocator_, static_cast<Args&&>(args)...);
+  if (!device) return nullptr;
+  T* raw = device.get();
+  if (!owned_.push_back(UniquePointer<IHardware>(util::move(device)))) return nullptr;  // freed on the way out
+  return raw;
 }
 
-// Destroys a device made by make(); only the most recent one may be released.
-void SystemInput::release(IHardware* device) {
-  device->shutdown();
-  allocator_.deallocate(device);
-  --owned_count_;
-  owned_[owned_count_] = nullptr;
+// Stops and destroys the device most recently made by make().
+void SystemInput::release_last() {
+  owned_[owned_.count() - 1]->shutdown();
+  owned_.remove_at(owned_.count() - 1);
 }
 
 void SystemInput::find_ps2() {
@@ -50,12 +47,12 @@ void SystemInput::find_usb() {
         if (iface.is_boot_keyboard()) {
           if (auto* k = make<UsbHidKeyboard>(*host, port, iface)) {
             if (k->initialize()) keyboards_.add(k);
-            else release(k);
+            else release_last();
           }
         } else if (auto* m = make<UsbHidMouse>(*host, port, iface)) {
           // Anything else HID: it is used if its report descriptor describes a pointer.
           if (m->initialize()) mice_.add(m);
-          else release(m);
+          else release_last();
         }
       }
     }
@@ -69,11 +66,11 @@ void SystemInput::find_virtio() {
     // The device announces what it is; try each class until one accepts it.
     if (auto* k = make<VirtioKeyboard>(pci_, d, allocator_, st_)) {
       if (k->initialize()) { keyboards_.add(k); continue; }
-      release(k);
+      release_last();
     }
     if (auto* m = make<VirtioMouse>(pci_, d, allocator_, st_)) {
       if (m->initialize()) mice_.add(m);
-      else release(m);
+      else release_last();
     }
   }
 }
@@ -85,7 +82,8 @@ void SystemInput::initialize() {
 }
 
 void SystemInput::shutdown() {
-  while (owned_count_) release(owned_[owned_count_ - 1]);
+  for (uint64_t i = owned_.count(); i > 0; --i) owned_[i - 1]->shutdown();  // newest first
+  owned_.clear();  // frees the devices
   ps2_keyboard_.shutdown();
   ps2_mouse_.shutdown();
 }

@@ -28,8 +28,9 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   `ConcurrentStack`, `ConcurrentQueue`, `ConcurrentPriorityQueue`): values are copied in and out, and nothing
   blocks. `src/ConcurrentDemo` fills them from tasks on every core at boot.
 - `src/CPUScheduler/`: `ICPUScheduler` and the default `Scheduler`, a cooperative run-to-completion
-  scheduler with high-performance and efficiency queues that spreads tasks over the cores the
-  `ICentralProcessingUnit` reports (tasks on other cores must not call firmware). Takes an `IAllocator` too.
+  scheduler with high-performance and efficiency queues (growable `Queue`s on an `IAllocator`, guarded by a
+  `SpinLock`) that spreads tasks over the cores the `ICentralProcessingUnit` reports (tasks on other cores
+  must not call firmware). Give it a `ThreadSafeAllocator`.
 - `src/hardware/`: every class that touches hardware derives from `hardware::IHardware`
   (`name()`, `initialize()`, `shutdown()`): `IoPort`, `DebugConsole`, `TextConsole`, and the CPUs.
   - `hardware/CentralProcessingUnit/`: `ICentralProcessingUnit` (instructions plus core count, core kinds,

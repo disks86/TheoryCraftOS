@@ -1,7 +1,9 @@
 // Everything about PCI that does not depend on how config space is reached:
 // scanning, BARs and capability lists. Concrete buses supply read32/write32.
 #pragma once
+#include "Allocators/IAllocator.hpp"
 #include "hardware/Bus/Pci/IPciBus.hpp"
+#include "ObjectContainer/List.hpp"
 
 namespace hardware {
 
@@ -9,13 +11,12 @@ namespace hardware {
 template <class Interface>
 class PciBusBase : public Interface {
  public:
-  static constexpr uint32_t kMaxDevices = 128;
-
-  uint32_t device_count() const override { return count_; }
+  uint32_t device_count() const override { return static_cast<uint32_t>(devices_.count()); }
 
   bool pci_device(uint32_t index, PciDeviceInfo* out) const override {
-    if (index >= count_ || !out) return false;
-    *out = devices_[index];
+    const PciDeviceInfo* d = devices_.get(index);
+    if (!d || !out) return false;
+    *out = *d;
     return true;
   }
 
@@ -41,12 +42,14 @@ class PciBusBase : public Interface {
   }
 
  protected:
-  constexpr PciBusBase() = default;
+  // The device list grows with the machine: servers can have many hundreds of
+  // functions. (If memory runs out mid-scan the list simply stops there.)
+  explicit PciBusBase(allocators::IAllocator& allocator) : devices_(allocator) {}
   ~PciBusBase() = default;
 
   // Probes every slot on buses first..last and records the functions present.
   void scan(uint32_t first_bus, uint32_t last_bus) {
-    count_ = 0;
+    devices_.clear();
     for (uint32_t bus = first_bus; bus <= last_bus; ++bus) {
       for (uint32_t device = 0; device < 32; ++device) {
         PciAddress first{static_cast<uint8_t>(bus), static_cast<uint8_t>(device), 0};
@@ -56,22 +59,22 @@ class PciBusBase : public Interface {
           PciAddress a{static_cast<uint8_t>(bus), static_cast<uint8_t>(device),
                        static_cast<uint8_t>(function)};
           uint32_t id = this->read32(a, 0);
-          if ((id & 0xFFFF) == 0xFFFF || count_ == kMaxDevices) continue;
+          if ((id & 0xFFFF) == 0xFFFF) continue;
           uint32_t cls = this->read32(a, 0x08);
-          devices_[count_++] = {a,
-                                static_cast<uint16_t>(id & 0xFFFF),
-                                static_cast<uint16_t>(id >> 16),
-                                static_cast<uint8_t>(cls >> 24),
-                                static_cast<uint8_t>(cls >> 16),
-                                static_cast<uint8_t>(cls >> 8)};
+          if (!devices_.push_back(PciDeviceInfo{a,
+                                                static_cast<uint16_t>(id & 0xFFFF),
+                                                static_cast<uint16_t>(id >> 16),
+                                                static_cast<uint8_t>(cls >> 24),
+                                                static_cast<uint8_t>(cls >> 16),
+                                                static_cast<uint8_t>(cls >> 8)}))
+            return;  // out of memory
         }
       }
     }
   }
 
  private:
-  PciDeviceInfo devices_[kMaxDevices] = {};
-  uint32_t count_ = 0;
+  List<PciDeviceInfo> devices_;
 };
 
 }  // namespace hardware

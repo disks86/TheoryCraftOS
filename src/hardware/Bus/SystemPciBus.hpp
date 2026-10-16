@@ -1,4 +1,5 @@
 #pragma once
+#include "Allocators/IAllocator.hpp"
 #include "hardware/Acpi/AcpiTables.hpp"
 #include "hardware/Bus/Pci/IPciBus.hpp"
 #include "hardware/Bus/Pci/LegacyPciBus.hpp"
@@ -13,7 +14,11 @@ constexpr unsigned long BusMaxOf(unsigned long a, unsigned long b) { return a > 
 // I/O ports. The bus is initialized (scanned) on return.
 class SystemPciBus {
  public:
-  explicit SystemPciBus(efi::SystemTable* st);
+  // The device list is allocated from `allocator`, which must outlive this object.
+  SystemPciBus(efi::SystemTable* st, allocators::IAllocator& allocator);
+  ~SystemPciBus();
+  SystemPciBus(const SystemPciBus&) = delete;
+  SystemPciBus& operator=(const SystemPciBus&) = delete;
 
   IPciBus& pci() { return *active_; }
   // Non-null only when the PCI Express (ECAM) bus is in use.

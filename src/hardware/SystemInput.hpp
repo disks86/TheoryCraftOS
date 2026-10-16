@@ -7,6 +7,8 @@
 #include "hardware/Keyboard/Ps2/Ps2Keyboard.hpp"
 #include "hardware/Mouse/CompositeMouse.hpp"
 #include "hardware/Mouse/Ps2/Ps2Mouse.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -20,10 +22,8 @@ namespace hardware {
 // firmware does not steal bytes from the PS/2 controller.
 class SystemInput {
  public:
-  static constexpr uint32_t kMaxDevices = 16;
-
   SystemInput(IPciBus& pci, IUsbBus& usb, allocators::IAllocator& allocator, efi::SystemTable* st)
-      : pci_(pci), usb_(usb), allocator_(allocator), st_(st) {}
+      : pci_(pci), usb_(usb), allocator_(allocator), st_(st), owned_(allocator) {}
 
   void initialize();
   // Stops every device and frees what initialize() allocated.
@@ -37,7 +37,7 @@ class SystemInput {
  private:
   template <class T, class... Args>
   T* make(Args&&... args);  // allocates and constructs a device; null if out of memory/slots
-  void release(IHardware* device);
+  void release_last();
 
   void find_ps2();
   void find_usb();
@@ -54,8 +54,7 @@ class SystemInput {
 
   CompositeKeyboard keyboards_;
   CompositeMouse mice_;
-  IHardware* owned_[kMaxDevices] = {};  // allocator-backed devices
-  uint32_t owned_count_ = 0;
+  List<UniquePointer<IHardware>> owned_;  // the allocator-backed devices, freed with the list
 };
 
 }  // namespace hardware

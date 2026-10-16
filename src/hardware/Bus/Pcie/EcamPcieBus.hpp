@@ -9,7 +9,8 @@ namespace hardware {
 // ACPI MCFG table provides. Only PCI segment 0 is used.
 class EcamPcieBus final : public PciBusBase<IPcieBus> {
  public:
-  explicit constexpr EcamPcieBus(const AcpiTables& acpi) : acpi_(acpi) {}
+  EcamPcieBus(const AcpiTables& acpi, allocators::IAllocator& allocator)
+      : PciBusBase(allocator), acpi_(acpi) {}
 
   const char* name() const override { return "PCI Express bus (ECAM)"; }
   bool initialize() override;  // false if firmware has no MCFG table

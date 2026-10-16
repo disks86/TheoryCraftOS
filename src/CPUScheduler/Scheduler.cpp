@@ -2,23 +2,16 @@
 
 namespace scheduling {
 
-void Scheduler::lock() const {
-  while (__atomic_test_and_set(&lock_, __ATOMIC_ACQUIRE)) cpu_.pause();
+Scheduler::Scheduler(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& allocator)
+    : cpu_(cpu), lock_(cpu), high_(allocator), efficiency_(allocator) {
+  high_.reserve(kInitialCapacity);  // best effort: the queues also grow on demand
+  efficiency_.reserve(kInitialCapacity);
 }
 
-void Scheduler::unlock() const { __atomic_clear(&lock_, __ATOMIC_RELEASE); }
-
-bool Scheduler::submit(TaskFunction fn, void* context, Queue queue) {
+bool Scheduler::submit(TaskFunction fn, void* context, TaskQueue queue) {
   if (!fn) return false;
-  Fifo& q = queue == Queue::HighPerformance ? high_ : efficiency_;
-  lock();
-  bool ok = q.count < kQueueCapacity;
-  if (ok) {
-    q.tasks[(q.head + q.count) % kQueueCapacity] = {fn, context};
-    ++q.count;
-  }
-  unlock();
-  return ok;
+  ScopedLock guard(lock_);
+  return (queue == TaskQueue::HighPerformance ? high_ : efficiency_).enqueue(Task{fn, context});
 }
 
 bool Scheduler::dispatch(const Task& task, hardware::CoreKind preferred) {
@@ -37,17 +30,13 @@ bool Scheduler::dispatch(const Task& task, hardware::CoreKind preferred) {
 }
 
 bool Scheduler::run_next() {
-  lock();
-  const bool high = high_.count != 0;
-  Fifo& q = high ? high_ : efficiency_;
-  if (!q.count) {
-    unlock();
-    return false;
+  Task task;
+  bool high;
+  {
+    ScopedLock guard(lock_);
+    high = !high_.empty();
+    if (!(high ? high_ : efficiency_).dequeue(&task)) return false;
   }
-  Task task = q.tasks[q.head];
-  q.head = (q.head + 1) % kQueueCapacity;
-  --q.count;
-  unlock();
 
   const hardware::CoreKind preferred =
       high ? hardware::CoreKind::Performance : hardware::CoreKind::Efficiency;
@@ -56,10 +45,8 @@ bool Scheduler::run_next() {
 }
 
 uint64_t Scheduler::pending() const {
-  lock();
-  uint64_t n = high_.count + efficiency_.count;
-  unlock();
-  return n;
+  ScopedLock guard(lock_);
+  return high_.count() + efficiency_.count();
 }
 
 bool Scheduler::any_core_busy() {

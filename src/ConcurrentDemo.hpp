@@ -4,8 +4,9 @@
 #include "hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 
 // Fills the Concurrent* containers from scheduler tasks running on every core at
-// once (through a ThreadSafeAllocator, since the default allocator is not safe to
-// share), then checks nothing was lost, duplicated or leaked. Logs one line per
-// check and returns true if all of them pass.
-bool run_concurrent_demo(allocators::Allocator& allocator, hardware::ICentralProcessingUnit& cpu,
-                         scheduling::ICPUScheduler& scheduler);
+// once, then checks nothing was lost, duplicated or leaked. `shared` must be the
+// thread-safe front of `allocator` that the rest of the system uses (the default
+// allocator is not safe to share between cores). Logs one line per check and
+// returns true if all of them pass.
+bool run_concurrent_demo(allocators::Allocator& allocator, allocators::IAllocator& shared,
+                         hardware::ICentralProcessingUnit& cpu, scheduling::ICPUScheduler& scheduler);

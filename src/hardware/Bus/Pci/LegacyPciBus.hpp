@@ -8,7 +8,7 @@ namespace hardware {
 // but only sees the first 256 bytes of each device's config space.
 class LegacyPciBus final : public PciBusBase<IPciBus> {
  public:
-  constexpr LegacyPciBus() = default;
+  explicit LegacyPciBus(allocators::IAllocator& allocator) : PciBusBase(allocator) {}
 
   const char* name() const override { return "PCI bus (I/O ports)"; }
   bool initialize() override;
