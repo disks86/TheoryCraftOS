@@ -49,7 +49,7 @@ void GraphicsConsole::put(char c) {
     return;
   }
   if (col_ == cols_) new_line();
-  gpu_->draw_char(col_ * gpu_->glyph_width(), row_ * gpu_->glyph_height(), c, kForeground,
+  gpu_->draw_char(col_ * gpu_->glyph_width(), row_ * gpu_->glyph_height(), c, foreground_,
                   kBackground);
   ++col_;
 }

@@ -29,6 +29,12 @@ void init(efi::SystemTable* st);
 // Routes screen output through `gpu` (clearing it). Call again after changing
 // the GPU's mode. nullptr returns to the firmware text console.
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu);
+// Color of the text that follows on a graphics screen (0x00RRGGBB, 0 = default); ignored by the
+// firmware text console and the debug console.
+void set_color(uint32_t rgb);
+// Turns the QEMU debug console (port 0x402) output on or off; the screen is unaffected. For
+// redrawing text the debug console has already seen.
+void set_debug_output(bool enabled);
 void puts(StringView text);  // a literal or any C string converts implicitly
 // Holds the console for several calls, so a line from one thread is not torn by
 // output from another. Nests; always release in reverse order (use Guard).

@@ -26,7 +26,9 @@
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Desktop/Desktop.hpp"
 #include "Gui/Controls/Menu.hpp"
+#include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/InputPump.hpp"
@@ -593,6 +595,52 @@ static void test_input_pump() {
   CHECK(a.live == 0);
 }
 
+static void test_desktop() {
+  TestAllocator a;
+  {
+    Screen screen(a, 640, 480);
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+    gui::Window& w = d.window();
+    gui::MenuButton& start = d.start_button();
+    CHECK(!d.shutdown_requested());
+    CHECK(d.step(0));  // first frame draws
+    CHECK(!d.step(500000));  // nothing changed
+    CHECK(d.step(1000000));  // the clock ticked
+    // The taskbar runs along the bottom and the Start button sits at its left end.
+    const Point o = start.window_origin();
+    CHECK(o.x == 4 && o.y == 480 - desktop::Desktop::kTaskbarHeight + 4);
+    CHECK(screen.px(300, 200) == gui::Theme().desktop);                 // desktop surface
+    // Click Start with the mouse: a menu opens upwards, above the taskbar.
+    mouse.absolute = true;
+    mouse.at(1000, 31000, 0);   // (about) the Start button
+    mouse.at(1000, 31000, hardware::mouse_button::kLeft);
+    mouse.at(1000, 31000, 0);
+    d.step(2000000);
+    CHECK(start.open() && w.popup() != nullptr);
+    const Rect2D menu = w.popup()->bounds();
+    CHECK(menu.y + static_cast<int32_t>(menu.height) <= o.y && menu.x == o.x && menu.width >= 180);
+    // Its only item shuts down: clicking elsewhere first just closes the menu.
+    mouse.at(20000, 10000, hardware::mouse_button::kLeft);
+    mouse.at(20000, 10000, 0);
+    d.step(3000000);
+    CHECK(!start.open() && !d.shutdown_requested());
+    // Keyboard: Tab to the Start button, Enter opens, Enter chooses Shut Down.
+    kb.push(key::kTab, true); kb.push(key::kTab, false);
+    d.step(4000000);
+    CHECK(w.focus() == &start);
+    kb.push(key::kEnter, true); kb.push(key::kEnter, false);
+    d.step(5000000);
+    CHECK(start.open());
+    kb.push(key::kDown, true); kb.push(key::kDown, false);
+    kb.push(key::kEnter, true); kb.push(key::kEnter, false);
+    d.step(6000000);
+    CHECK(d.shutdown_requested() && !start.open());
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_dock_layout();
   test_uniform_panel();
@@ -602,6 +650,7 @@ int main() {
   test_menu();
   test_rendering();
   test_input_pump();
+  test_desktop();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui: all checks passed\n");
   return 0;

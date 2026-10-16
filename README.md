@@ -1,8 +1,10 @@
 # TheoryCraftOS
 
 A minimal x86_64 UEFI operating system written in C++20 with a little
-assembly (`src/Hardware/x86_64/cpu.S`). It boots under OVMF in QEMU, prints to
-the UEFI console and the QEMU debug console (port 0x402, shown on your terminal), then shuts down on a key.
+assembly (`src/Hardware/x86_64/cpu.S`). It boots under OVMF in QEMU. The boot console lists each piece of
+hardware as it comes up (`[ ok ]`, `[info]`, `[warn]`, `[FAIL]`; also on the QEMU debug console, port 0x402, shown on your
+terminal), then opens the desktop: a taskbar with a Start menu whose *Shut Down* entry stops the services, flushes storage,
+releases the hardware and powers off. A boot with warnings or failures waits (up to 15 s) for a key before the desktop opens.
 
 ## Layout
 
@@ -202,6 +204,13 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   submenus, text selection/clipboard, scrolling lists, a mouse cursor sprite beyond the simple arrow, several windows.
   `src/GuiDemo` builds a window with all of it at boot and drives it with synthetic input (typing, choosing, menu items)
   while checking the results; `tests/GuiTest.cpp` covers layout, every control and the input pump on the host.
+
+- `src/BootLog.*` is the boot log (`bootlog::Entry(Level, "Subsystem").text(...).dec(...)`; counts warnings and failures; `replay()` redraws
+  the lines after a display mode change cleared the screen). `src/Desktop/` is the desktop shell built on the GUI toolkit: `Desktop`
+  (full-screen `Window`, `DesktopSurface`, a taskbar with a `MenuButton` Start button whose menu opens upwards, and an uptime clock);
+  `step()` delivers input and redraws when dirty, `shutdown_requested()` ends the loop in `main.cpp`, which then does the orderly
+  power-off. The boot-time self-checks and demos of every subsystem (containers, kernel, scheduler, NPU, network stack, storage,
+  filesystems, thread safety, ISP, graphics, GUI) are still there: configure with `-DTCOS_SELFTESTS=ON` to run them before the desktop.
 
 ## Requirements
 

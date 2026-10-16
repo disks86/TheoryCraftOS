@@ -150,6 +150,10 @@ add_executable(BOOTX64
   src/Graphics/Graphics3D/BuiltinShaders.cpp
   src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
   src/Graphics/SystemGraphics.cpp
+  src/BootLog.cpp
+  src/Desktop/Desktop.cpp
+  src/Desktop/DesktopSurface.cpp
+  src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
   src/GuiDemo.cpp
   src/Gui/Painter.cpp
@@ -176,6 +180,11 @@ target_compile_options(BOOTX64 PRIVATE
 )
 # Keep frame pointers so gdb backtraces work.
 target_compile_options(BOOTX64 PRIVATE -fno-omit-frame-pointer)
+
+option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
+if(TCOS_SELFTESTS)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_SELFTESTS)
+endif()
 
 if(TCOS_DEBUG_WAIT_SECS GREATER 0)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_DEBUG_WAIT=${TCOS_DEBUG_WAIT_SECS})

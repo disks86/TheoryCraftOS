@@ -28,7 +28,22 @@
 
 namespace gui {
 
+// What a MenuPopup reports back to whatever opened it (a MenuBar, a MenuButton).
 class MenuBar;
+struct MenuItem;
+
+class MenuHost {
+ public:
+  // Opens the neighbouring menu if the host has several (Left/Right keys); may do nothing.
+  virtual void switch_menu(int32_t direction) = 0;
+  // Runs the item and closes the menu.
+  virtual void activate(MenuItem* item) = 0;
+  virtual void close_menu() = 0;
+
+ protected:
+  constexpr MenuHost() = default;
+  ~MenuHost() = default;
+};
 
 struct MenuItem {
   explicit MenuItem(allocators::IAllocator& allocator) : text(allocator), shortcut(allocator) {}
@@ -68,7 +83,8 @@ class MenuPopup final : public Control {
  public:
   static constexpr int32_t kRowHeight = 20, kSeparatorHeight = 8;
 
-  MenuPopup(allocators::IAllocator& allocator, MenuBar& bar) : Control(allocator), bar_(bar) {}
+  MenuPopup(allocators::IAllocator& allocator, MenuHost& host) : Control(allocator), host_(host) {}
+  void set_min_width(int32_t width) { min_width_ = width; }
   void show(Menu* menu) { menu_ = menu; highlighted_ = -1; }
   void paint(Painter& painter) override;
   void on_mouse_move(const MouseArgs& args) override;
@@ -85,12 +101,13 @@ class MenuPopup final : public Control {
   void step(int32_t direction, int32_t from);
   void run(int32_t index);
 
-  MenuBar& bar_;
+  MenuHost& host_;
+  int32_t min_width_ = 100;
   Menu* menu_ = nullptr;
   int32_t highlighted_ = -1;
 };
 
-class MenuBar : public Control {
+class MenuBar : public Control, public MenuHost {
  public:
   explicit MenuBar(allocators::IAllocator& allocator) : Control(allocator), menus_(allocator), popup_(allocator, *this) {}
   ~MenuBar();
@@ -108,11 +125,11 @@ class MenuBar : public Control {
   void on_popup_closed(Control*) override { open_ = -1; invalidate(); }
 
   void open_menu(int32_t index);
-  void close_menu();
+  void close_menu() override;
   // Used by the popup: opens the neighbouring menu (wrapping around).
-  void switch_menu(int32_t direction);
+  void switch_menu(int32_t direction) override;
   // Used by the popup: runs the item and closes the menu.
-  void activate(MenuItem* item);
+  void activate(MenuItem* item) override;
 
  protected:
   Size default_size() const override { return {0, 22}; }

@@ -68,7 +68,7 @@ Size MenuPopup::default_size() const {
     if (s > shortcut) shortcut = s;
   }
   int32_t width = 26 + text + (shortcut ? 24 + shortcut : 0) + 14;
-  if (width < 100) width = 100;
+  if (width < min_width_) width = min_width_;
   return {width, height};
 }
 
@@ -131,7 +131,7 @@ void MenuPopup::on_mouse_move(const MouseArgs& args) {
 void MenuPopup::run(int32_t index) {
   if (index < 0) return;
   MenuItem* it = menu_->item(static_cast<uint32_t>(index));
-  if (it && it->enabled && !it->separator) bar_.activate(it);
+  if (it && it->enabled && !it->separator) host_.activate(it);
 }
 
 void MenuPopup::on_mouse_up(const MouseArgs& args) { run(item_at(args.y)); }
@@ -161,17 +161,17 @@ bool MenuPopup::on_key(const KeyArgs& args) {
       step(-1, highlighted_ < 0 ? 0 : highlighted_);
       break;
     case key::kLeft:
-      bar_.switch_menu(-1);
+      host_.switch_menu(-1);
       break;
     case key::kRight:
-      bar_.switch_menu(1);
+      host_.switch_menu(1);
       break;
     case key::kEnter:
     case key::kSpace:
       run(highlighted_);
       break;
     case key::kEscape:
-      bar_.close_menu();
+      host_.close_menu();
       break;
     default:
       break;

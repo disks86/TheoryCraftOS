@@ -30,6 +30,8 @@ class GraphicsConsole {
   bool attached() const { return gpu_ != nullptr; }
 
   void put(char c);
+  // Text color for what is put next (0x00RRGGBB); 0 restores the default.
+  void set_foreground(uint32_t color) { foreground_ = color ? color : kForeground; }
   // Shows what has been put so far on GPUs that need telling.
   void flush() {
     if (gpu_) gpu_->present();
@@ -42,5 +44,6 @@ class GraphicsConsole {
   static constexpr uint32_t kBackground = 0x101018;
 
   hardware::IGraphicsProcessingUnit* gpu_ = nullptr;
+  uint32_t foreground_ = kForeground;
   uint32_t cols_ = 0, rows_ = 0, col_ = 0, row_ = 0;
 };

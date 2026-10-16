@@ -28,6 +28,7 @@ namespace {
 hardware::DebugConsole g_debug;
 hardware::TextConsole g_text;
 GraphicsConsole g_graphics;
+bool g_debug_enabled = true;
 
 // Output from several threads must not tear: one lock, taken per call (and
 // held across a whole Guard block). Re-entrant for the thread that holds it; the
@@ -37,7 +38,7 @@ uint64_t g_owner = 0;  // the holder: its thread (or, before threads exist, 1 + 
 uint32_t g_depth = 0;
 
 void putc(char c) {
-  g_debug.put(c);
+  if (g_debug_enabled) g_debug.put(c);
   if (g_graphics.attached()) g_graphics.put(c);
   else g_text.put(c);
 }
@@ -80,6 +81,16 @@ void init(efi::SystemTable* st) {
 }
 
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu) { g_graphics.attach(gpu); }
+
+void set_debug_output(bool enabled) {
+  Guard guard;
+  g_debug_enabled = enabled;
+}
+
+void set_color(uint32_t rgb) {
+  Guard guard;
+  g_graphics.set_foreground(rgb);
+}
 
 void puts(StringView text) {
   Guard guard;
