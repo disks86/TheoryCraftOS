@@ -9,6 +9,8 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
 - `src/main.cpp`, `console.*`, `uefi.hpp`, `runtime.cpp`: entry point, logging facade, UEFI types, compiler runtime stubs.
 - `src/Allocators/`: `IAllocator` and the default `Allocator`, a cache-line block pool
   that gets its memory from an `IRandomAccessMemory` (`base()` / `usable_bytes()`).
+- `src/CPUScheduler/`: `ICPUScheduler` and the default `Scheduler`, a cooperative run-to-completion
+  scheduler with high-performance and efficiency queues that takes an `ICentralProcessingUnit`.
 - `src/hardware/`: every class that touches hardware derives from `hardware::IHardware`
   (`name()`, `initialize()`, `shutdown()`): `IoPort`, `DebugConsole`, `TextConsole`, and the CPUs.
   - `hardware/CentralProcessingUnit/`: `ICentralProcessingUnit` and its implementations
