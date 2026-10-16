@@ -4,7 +4,9 @@
 #include "hardware/Bus/SystemPciBus.hpp"
 #include "hardware/Bus/Usb/UsbBus.hpp"
 #include "hardware/GraphicsProcessingUnit/SystemGpu.hpp"
+#include "hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "hardware/SystemHardware.hpp"
+#include "IspDemo.hpp"
 #include "hardware/SystemInput.hpp"
 #include "hardware/Keyboard/KeyCodes.hpp"
 #include "uefi.hpp"
@@ -223,9 +225,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::put_hex(demo.cores_used);
   console::puts("\n");
 
+  // Image signal processor: a hardware one if the machine has a known ISP,
+  // otherwise the software pipeline. The demo needs a screen to draw on.
+  hardware::SystemImageSignalProcessor system_isp(pci);
+  hardware::IImageSignalProcessor& isp = system_isp.isp();
+  console::puts("ISP: ");
+  console::puts(isp.name());
+  console::puts("\n");
+  const bool isp_drawn = gpu && run_isp_demo(*gpu, isp, allocator);
+
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, allocator, st);
   input.initialize();
+  if (gpu) console::puts(isp_drawn ? "ISP demo drawn (top right)\n" : "ISP demo failed\n");
   console::puts("Input: ");
   console::put_dec(input.keyboards().count());
   console::puts(" keyboards, ");

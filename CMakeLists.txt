@@ -52,6 +52,10 @@ add_executable(BOOTX64
   src/hardware/Mouse/Usb/UsbHidMouse.cpp
   src/hardware/Mouse/Virtio/VirtioMouse.cpp
   src/hardware/SystemInput.cpp
+  src/hardware/ImageSignalProcessor/IspMath.cpp
+  src/hardware/ImageSignalProcessor/Software/SoftwareImageSignalProcessor.cpp
+  src/hardware/ImageSignalProcessor/SystemImageSignalProcessor.cpp
+  src/IspDemo.cpp
   src/hardware/Bus/Pci/LegacyPciBus.cpp
   src/hardware/Bus/Pcie/EcamPcieBus.cpp
   src/hardware/Bus/Pci/FirmwareDriverDetach.cpp

@@ -47,6 +47,11 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
     mouse and tablet). `hardware/SystemInput` finds all of them and exposes one keyboard and one mouse.
   - `hardware/Bus/Ps2/` (`I8042Controller`) and `hardware/Bus/Virtio/` (modern virtio-PCI transport,
     virtqueues, `VirtioInputDevice`); `Bus/Usb/Hid/` has the report-descriptor parser and interface finder.
+  - `hardware/ImageSignalProcessor/`: `IImageSignalProcessor` (raw Bayer frame -> RGB image, settings, frame
+    statistics) with `ImageTypes.hpp`. `Software/` is the CPU pipeline (bilinear demosaic, black level,
+    white-balance gains, gamma table); `Intel/` has IPU6/IPU7 classes that match the PCI device and still use
+    that path until a native driver exists; `SystemImageSignalProcessor` picks one. QEMU has no ISP
+    hardware, so only the software path runs there. `src/IspDemo` draws a synthetic frame through it.
   - `hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup).
   - `hardware/RandomAccessMemory/`, `NeuralProcessingUnit/`: `IRandomAccessMemory` (implemented by
     `UefiRandomAccessMemory`) and `INeuralProcessingUnit` (no implementation yet).
