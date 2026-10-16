@@ -57,6 +57,9 @@ add_executable(BOOTX64
   src/hardware/ImageSignalProcessor/SystemImageSignalProcessor.cpp
   src/IspDemo.cpp
   src/NpuDemo.cpp
+  src/ContainerDemo.cpp
+  src/UtilityDemo.cpp
+  src/ConcurrentDemo.cpp
   src/hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
   src/Math/FloatMath.cpp

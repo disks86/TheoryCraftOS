@@ -9,6 +9,24 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
 - `src/main.cpp`, `console.*`, `uefi.hpp`, `runtime.cpp`: entry point, logging facade, UEFI types, compiler runtime stubs.
 - `src/Allocators/`: `IAllocator` and the default `Allocator`, a cache-line block pool
   that gets its memory from an `IRandomAccessMemory` (`base()` / `usable_bytes()`).
+- `src/ObjectContainer/`: `IObjectContainer<T>` (count, clear, allocation-free iteration through a plain
+  `ObjectCursor`, plus range-for) and its implementations `List<T>` (growable array), `LinkedList<T>`
+  (doubly linked, erase while walking), `Dictionary<K, V>` (chained hash map; `Hashing.hpp` has the
+  default hash/equality policies, including C strings), `BinaryTree<T>` (self-balancing AVL search tree with
+  in-order iteration and pre/post-order visitors), `SortedDictionary<K, V>` (ordered map on the tree),
+  `Stack<T>`, `Queue<T>` (ring buffer) and `PriorityQueue<T>` (binary heap; `Comparison.hpp` has the ordering policy). Header-only templates; every allocation goes
+  through the `IAllocator` they are given. `src/ContainerDemo` checks them at boot.
+- `src/Utility/`: `UniquePointer<T>` and `SharedPointer<T>` (allocator-backed; atomic reference count; a
+  pointer to a base class safely owns a derived object even without a virtual destructor), `Optional<T>`,
+  `Variant<Ts...>` (visit, get, emplace) and the small `Move.hpp` helpers. Header-only; no weak pointers.
+  `src/UtilityDemo` checks them at boot, with a shared pointer copied concurrently on every core.
+- `src/Synchronization/`: `SpinLock`/`ScopedLock` (spin with the CPU interface's `pause()`), `Synchronized<T>`
+  (any type behind a lock; `with()` for one locked operation, `access()` for a lock-holding handle that can
+  be iterated) and `AtomicSharedPointer<T>`. `Allocators/ThreadSafeAllocator` serializes any allocator.
+  `ObjectContainer/Concurrent/` has a thread-safe version of every container (`ConcurrentList`,
+  `ConcurrentLinkedList`, `ConcurrentDictionary`, `ConcurrentBinaryTree`, `ConcurrentSortedDictionary`,
+  `ConcurrentStack`, `ConcurrentQueue`, `ConcurrentPriorityQueue`): values are copied in and out, and nothing
+  blocks. `src/ConcurrentDemo` fills them from tasks on every core at boot.
 - `src/CPUScheduler/`: `ICPUScheduler` and the default `Scheduler`, a cooperative run-to-completion
   scheduler with high-performance and efficiency queues that spreads tasks over the cores the
   `ICentralProcessingUnit` reports (tasks on other cores must not call firmware). Takes an `IAllocator` too.

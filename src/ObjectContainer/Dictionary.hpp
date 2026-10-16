@@ -1,0 +1,161 @@
+#pragma once
+#include "ObjectContainer/ContainerSupport.hpp"
+#include "ObjectContainer/Hashing.hpp"
+#include "ObjectContainer/IObjectContainer.hpp"
+
+// What a Dictionary holds and iterates over. The key cannot be changed in place.
+template <class K, class V>
+struct KeyValue {
+  const K key;
+  V value;
+  KeyValue(const K& k, const V& v) : key(k), value(v) {}
+};
+
+// A hash map from K to V with separate chaining: each entry is its own
+// allocation (so entries never move, and a pointer from find() stays valid until
+// that entry is removed), and the bucket table doubles when it gets 3/4 full.
+// If the table cannot grow for lack of memory the dictionary keeps working with
+// longer chains. Iteration visits every entry once, in no particular order.
+// V must be copy-constructible and copy-assignable. Every allocation goes
+// through the IAllocator given.
+template <class K, class V, class Hash = DefaultHash<K>, class Equal = DefaultEqual<K>>
+class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
+ public:
+  explicit Dictionary(allocators::IAllocator& allocator, Hash hash = Hash(), Equal equal = Equal())
+      : allocator_(allocator), hash_(hash), equal_(equal) {}
+  ~Dictionary() {
+    clear();
+    allocator_.deallocate(buckets_);
+  }
+
+  uint64_t count() const override { return size_; }
+
+  void clear() override {
+    for (uint64_t b = 0; b < bucket_count_; ++b) {
+      for (Node* n = buckets_[b]; n;) {
+        Node* following = n->next;
+        destroy(n);
+        n = following;
+      }
+      buckets_[b] = nullptr;
+    }
+    size_ = 0;
+  }
+
+  // Stores `value` under `key`, replacing any earlier value. False if memory ran out.
+  bool put(const K& key, const V& value) {
+    const uint64_t h = hash_(key);
+    if (Node* existing = locate(key, h)) {
+      existing->entry.value = value;
+      return true;
+    }
+    if (!buckets_ && !resize(kInitialBuckets)) return false;
+    if (size_ * 4 >= bucket_count_ * 3) resize(bucket_count_ * 2);  // best effort
+
+    void* memory = allocator_.allocate(sizeof(Node));
+    if (!memory) return false;
+    Node** slot = &buckets_[h & (bucket_count_ - 1)];
+    *slot = new (memory) Node{*slot, h, KeyValue<K, V>(key, value)};
+    ++size_;
+    return true;
+  }
+
+  // The value stored under `key`, or nullptr.
+  V* find(const K& key) {
+    Node* n = locate(key, hash_(key));
+    return n ? &n->entry.value : nullptr;
+  }
+  const V* find(const K& key) const {
+    const Node* n = locate(key, hash_(key));
+    return n ? &n->entry.value : nullptr;
+  }
+  bool contains(const K& key) const { return find(key) != nullptr; }
+
+  bool remove(const K& key) {
+    if (!buckets_) return false;
+    const uint64_t h = hash_(key);
+    for (Node** link = &buckets_[h & (bucket_count_ - 1)]; *link; link = &(*link)->next) {
+      if ((*link)->hash == h && equal_((*link)->entry.key, key)) {
+        Node* doomed = *link;
+        *link = doomed->next;
+        destroy(doomed);
+        --size_;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // --- IObjectContainer iteration: `index` is the bucket, `node` the entry.
+  bool first(ObjectCursor* cursor) const override { return scan(0, cursor); }
+  bool next(ObjectCursor* cursor) const override {
+    Node* following = static_cast<Node*>(cursor->node)->next;
+    if (following) {
+      cursor->node = following;
+      return true;
+    }
+    return scan(cursor->index + 1, cursor);
+  }
+  KeyValue<K, V>* element(const ObjectCursor& cursor) const override {
+    return &static_cast<Node*>(cursor.node)->entry;
+  }
+
+ private:
+  struct Node {
+    Node* next;
+    uint64_t hash;
+    KeyValue<K, V> entry;
+  };
+  static constexpr uint64_t kInitialBuckets = 16;  // always a power of two
+
+  Node* locate(const K& key, uint64_t h) const {
+    if (!buckets_) return nullptr;
+    for (Node* n = buckets_[h & (bucket_count_ - 1)]; n; n = n->next)
+      if (n->hash == h && equal_(n->entry.key, key)) return n;
+    return nullptr;
+  }
+
+  void destroy(Node* node) {
+    node->~Node();
+    allocator_.deallocate(node);
+  }
+
+  // Finds the first entry in bucket `from` or later.
+  bool scan(uint64_t from, ObjectCursor* cursor) const {
+    for (uint64_t b = from; b < bucket_count_; ++b) {
+      if (buckets_[b]) {
+        cursor->index = b;
+        cursor->node = buckets_[b];
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Moves to a table of `buckets` buckets, relinking the existing entries.
+  bool resize(uint64_t buckets) {
+    Node** fresh = container_support::allocate_array<Node*>(allocator_, buckets);
+    if (!fresh) return false;
+    for (uint64_t b = 0; b < buckets; ++b) fresh[b] = nullptr;
+    for (uint64_t b = 0; b < bucket_count_; ++b) {
+      for (Node* n = buckets_[b]; n;) {
+        Node* following = n->next;
+        Node** slot = &fresh[n->hash & (buckets - 1)];
+        n->next = *slot;
+        *slot = n;
+        n = following;
+      }
+    }
+    allocator_.deallocate(buckets_);
+    buckets_ = fresh;
+    bucket_count_ = buckets;
+    return true;
+  }
+
+  allocators::IAllocator& allocator_;
+  Hash hash_;
+  Equal equal_;
+  Node** buckets_ = nullptr;
+  uint64_t bucket_count_ = 0;
+  uint64_t size_ = 0;
+};

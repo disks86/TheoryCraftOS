@@ -7,7 +7,10 @@
 #include "hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
 #include "hardware/SystemHardware.hpp"
+#include "ConcurrentDemo.hpp"
+#include "ContainerDemo.hpp"
 #include "NpuDemo.hpp"
+#include "UtilityDemo.hpp"
 #include "IspDemo.hpp"
 #include "hardware/SystemInput.hpp"
 #include "hardware/Keyboard/KeyCodes.hpp"
@@ -176,6 +179,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::puts("Allocator initialization failed\n");
     return efi::kBufferTooSmall;
   }
+  console::puts("Containers:\n");
+  if (!run_container_demo(allocator)) console::puts("container self-check failed\n");
+
   scheduling::Scheduler scheduler(cpu, allocator);
 
   // USB comes after the allocator: the xHCI driver needs DMA-able memory.
@@ -237,6 +243,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::put_dec(npu.compute_units());
   console::puts(" compute units\n");
   if (!run_npu_demo(npu, allocator)) console::puts("NPU self-check failed\n");
+
+  console::puts("Smart pointers and value types:\n");
+  if (!run_utility_demo(allocator, scheduler)) console::puts("utility self-check failed\n");
+
+  console::puts("Concurrent containers:\n");
+  if (!run_concurrent_demo(allocator, cpu, scheduler)) console::puts("concurrent self-check failed\n");
 
   // Image signal processor: a hardware one if the machine has a known ISP,
   // otherwise the software pipeline. The demo needs a screen to draw on.
