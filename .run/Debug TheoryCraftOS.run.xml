@@ -1,0 +1,5 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Debug TheoryCraftOS" type="CLion_Remote" factoryName="GDB Remote Debug" remoteCommand="| $PROJECT_DIR$/scripts/gdb-proxy.py" symbolFile="$PROJECT_DIR$/cmake-build-debug/BOOTX64.efi" sysroot="">
+    <method v="2" />
+  </configuration>
+</component>

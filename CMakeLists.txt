@@ -11,14 +11,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Build with -DTCOS_DEBUG_WAIT_SECS=10 to make the OS pause at startup so a
-# debugger can attach before kernel_main runs (see README).
-set(_tcos_wait_default 0)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  set(_tcos_wait_default 10)  # Debug profiles (e.g. CLion's) wait for gdb by default
-endif()
-set(TCOS_DEBUG_WAIT_SECS ${_tcos_wait_default} CACHE STRING
-    "Seconds the OS waits at boot for a debugger (or g_debugger_attached=1); 0 disables")
+# Optional boot-time pause for debuggers that cannot use hardware breakpoints.
+set(TCOS_DEBUG_WAIT_SECS 0 CACHE STRING
+    "Seconds the OS pauses at boot (or until g_debugger_attached=1); 0 disables")
 
 add_executable(BOOTX64
   src/main.cpp
