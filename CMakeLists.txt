@@ -36,7 +36,10 @@ add_executable(BOOTX64
   src/hardware/Acpi/AcpiTables.cpp
   src/hardware/Bus/Pci/LegacyPciBus.cpp
   src/hardware/Bus/Pcie/EcamPcieBus.cpp
+  src/hardware/Bus/Pci/FirmwareDriverDetach.cpp
   src/hardware/Bus/Usb/UsbBus.cpp
+  src/hardware/Bus/Usb/Xhci/XhciController.cpp
+  src/hardware/Bus/Usb/Xhci/XhciRing.cpp
   src/hardware/Bus/SystemPciBus.cpp
   src/hardware/GraphicsProcessingUnit/Font8x16.cpp
   src/hardware/GraphicsProcessingUnit/FramebufferGpu.cpp

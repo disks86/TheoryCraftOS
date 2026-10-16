@@ -32,8 +32,12 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
       (I/O ports 0xCF8/0xCFC, 256-byte config space).
     - `Pcie/`: `IPcieBus` (adds the extended capability list) and `EcamPcieBus` (memory-mapped config space,
       located through the ACPI MCFG table).
-    - `Usb/`: `IUsbBus` and `UsbBus`, which finds host controllers on PCI (UHCI/OHCI/EHCI/xHCI), and reads the
-      root ports of xHCI controllers (device attached, speed). It does not enumerate or talk to devices yet.
+    - `Usb/`: `IUsbBus` and `UsbBus` (finds host controllers on PCI), `IUsbHostController` (one controller:
+      ports, enumerated device descriptors) and `UsbTypes.hpp`. `Usb/Xhci/` holds `IXhciController` and the
+      polling `XhciController` driver (firmware hand-off, reset, command/event rings, port reset, slot
+      enable, address device, control transfers) plus its ring and register helpers. At boot it enumerates
+      every device on the root ports and reads its device descriptor, then returns the controller to the
+      firmware. UHCI/OHCI/EHCI are identified only. No hubs, configuration or class drivers yet.
     - `SystemPciBus` picks PCIe/ECAM when firmware provides MCFG, else legacy PCI.
   - `hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup).
   - `hardware/RandomAccessMemory/`, `NeuralProcessingUnit/`: `IRandomAccessMemory` (implemented by

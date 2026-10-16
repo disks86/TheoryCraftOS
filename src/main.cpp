@@ -99,14 +99,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::put_hex(pci.device_count());
   console::puts(" devices\n");
 
-  hardware::UsbBus usb(pci);
-  usb.initialize();
-  console::puts("USB: ");
-  console::put_hex(usb.controller_count());
-  console::puts(" controllers, ");
-  console::put_hex(usb.device_count());
-  console::puts(" devices attached\n");
-
   // Bring-up order: CPU -> RAM -> allocator -> scheduler. Objects live on this
   // stack for the life of the OS; nothing needs static constructors.
   hardware::SystemCpu system_cpu(st);
@@ -126,6 +118,30 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     return efi::kBufferTooSmall;
   }
   scheduling::Scheduler scheduler(cpu, allocator);
+
+  // USB comes after the allocator: the xHCI driver needs DMA-able memory.
+  hardware::UsbBus usb(pci, allocator, st);
+  usb.initialize();
+  console::puts("USB: ");
+  console::put_hex(usb.controller_count());
+  console::puts(" controllers, ");
+  console::put_hex(usb.device_count());
+  console::puts(" devices\n");
+  for (uint32_t c = 0; c < usb.controller_count(); ++c) {
+    for (uint32_t p = 0; p < usb.port_count(c); ++p) {
+      hardware::UsbDeviceDescriptor d;
+      if (!usb.device_descriptor(c, p, &d)) continue;
+      console::puts("  port ");
+      console::put_hex(p);
+      console::puts(": device ");
+      console::put_hex(d.vendor_id);
+      console::puts(":");
+      console::put_hex(d.product_id);
+      console::puts(" class ");
+      console::put_hex(d.device_class);
+      console::puts("\n");
+    }
+  }
 
   console::puts(cpu.name());
   console::puts(": ");
@@ -151,6 +167,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::puts(", core mask: ");
   console::put_hex(demo.cores_used);
   console::puts("\n");
+
+  // Done with USB for now: hand the controllers back so the firmware's USB
+  // keyboard works for the prompt below.
+  usb.shutdown();
 
   kernel_main(st);
 

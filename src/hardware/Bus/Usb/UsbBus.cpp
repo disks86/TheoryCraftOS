@@ -1,4 +1,6 @@
 #include "hardware/Bus/Usb/UsbBus.hpp"
+#include <new>
+#include "hardware/Bus/Usb/Xhci/XhciController.hpp"
 
 namespace hardware {
 
@@ -13,17 +15,10 @@ UsbControllerKind kind_from_prog_if(uint8_t prog_if) {
     default:   return UsbControllerKind::Unknown;
   }
 }
-
-// xHCI register layout: capability registers at the BAR, operational registers
-// CAPLENGTH bytes later, port status/control registers 0x400 into those.
-constexpr uint32_t kXhciPortRegisterOffset = 0x400;
-constexpr uint32_t kXhciPortStride = 4;  // dwords per port
-constexpr uint32_t kPortConnected = 1u << 0;
 }  // namespace
 
 bool UsbBus::initialize() {
   controller_count_ = 0;
-  connected_ = 0;
   PciDeviceInfo d;
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassSerialBus || d.subclass != kPciSubclassUsb) continue;
@@ -31,21 +26,38 @@ bool UsbBus::initialize() {
     if (kind == UsbControllerKind::Unknown || controller_count_ == kMaxControllers) continue;
 
     Controller& c = controllers_[controller_count_++];
-    c = {kind, 0, nullptr};
+    c = {kind, nullptr};
     if (kind != UsbControllerKind::Xhci) continue;
 
-    const uint64_t bar = pci_.memory_bar(d.address, 0);
-    if (!bar) continue;
-    const auto* caps = reinterpret_cast<volatile uint8_t*>(bar);
-    const uint32_t cap_length = caps[0];
-    const uint32_t hcsparams1 = *reinterpret_cast<volatile uint32_t*>(bar + 4);
-    c.ports = hcsparams1 >> 24;  // MaxPorts
-    c.port_registers = reinterpret_cast<volatile uint32_t*>(bar + cap_length + kXhciPortRegisterOffset);
-
-    for (uint32_t p = 0; p < c.ports; ++p)
-      if (c.port_registers[p * kXhciPortStride] & kPortConnected) ++connected_;
+    void* memory = allocator_.allocate(sizeof(XhciController));
+    if (!memory) continue;
+    auto* xhci = new (memory) XhciController(pci_, d, allocator_, st_);
+    if (xhci->initialize()) {
+      c.host = xhci;
+    } else {
+      allocator_.deallocate(memory);  // initialize() already released its own memory
+    }
   }
   return true;
+}
+
+void UsbBus::shutdown() {
+  for (uint32_t i = 0; i < controller_count_; ++i) {
+    if (!controllers_[i].host) continue;
+    controllers_[i].host->shutdown();
+    allocator_.deallocate(controllers_[i].host);
+    controllers_[i].host = nullptr;
+  }
+  controller_count_ = 0;
+}
+
+uint32_t UsbBus::device_count() const {
+  uint32_t count = 0;
+  UsbDeviceDescriptor descriptor;
+  for (uint32_t c = 0; c < controller_count_; ++c)
+    for (uint32_t p = 0; p < port_count(c); ++p)
+      if (device_descriptor(c, p, &descriptor)) ++count;
+  return count;
 }
 
 UsbControllerKind UsbBus::controller_kind(uint32_t controller) const {
@@ -53,25 +65,18 @@ UsbControllerKind UsbBus::controller_kind(uint32_t controller) const {
 }
 
 uint32_t UsbBus::port_count(uint32_t controller) const {
-  return controller < controller_count_ ? controllers_[controller].ports : 0;
+  if (controller >= controller_count_ || !controllers_[controller].host) return 0;
+  return controllers_[controller].host->port_count();
 }
 
 bool UsbBus::port_info(uint32_t controller, uint32_t port, UsbPortInfo* out) const {
-  if (controller >= controller_count_ || !out) return false;
-  const Controller& c = controllers_[controller];
-  if (port >= c.ports || !c.port_registers) return false;
+  if (controller >= controller_count_ || !controllers_[controller].host) return false;
+  return controllers_[controller].host->port_info(port, out);
+}
 
-  const uint32_t status = c.port_registers[port * kXhciPortStride];
-  out->connected = status & kPortConnected;
-  switch ((status >> 10) & 0xF) {  // Port Speed ID (default protocol speed table)
-    case 1:  out->speed = UsbSpeed::Full; break;
-    case 2:  out->speed = UsbSpeed::Low; break;
-    case 3:  out->speed = UsbSpeed::High; break;
-    case 4:  out->speed = UsbSpeed::Super; break;
-    case 5:  out->speed = UsbSpeed::SuperPlus; break;
-    default: out->speed = UsbSpeed::Unknown; break;
-  }
-  return true;
+bool UsbBus::device_descriptor(uint32_t controller, uint32_t port, UsbDeviceDescriptor* out) const {
+  if (controller >= controller_count_ || !controllers_[controller].host) return false;
+  return controllers_[controller].host->device_descriptor(port, out);
 }
 
 }  // namespace hardware

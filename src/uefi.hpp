@@ -18,6 +18,8 @@ constexpr Status kNotReady = 0x8000000000000006;        // EFI_NOT_READY
 
 using Uintn = uint64_t;
 
+enum class LocateSearchType : uint32_t { AllHandles, ByRegisterNotify, ByProtocol };
+
 enum class AllocateType : uint32_t { AnyPages, MaxAddress, Address };
 
 // Memory types 1-10 are real RAM; 0 (reserved), 11+ (MMIO, PAL code,
@@ -116,13 +118,15 @@ struct BootServices {
   void* get_next_monotonic_count;
   Status (*stall)(uint64_t microseconds);
   Status (*set_watchdog_timer)(uint64_t timeout, uint64_t code, uint64_t size, Char16* data);
-  void* connect_controller;
-  void* disconnect_controller;
+  Status (*connect_controller)(Handle controller, Handle* driver_image, void* remaining_device_path,
+                               uint8_t recursive);
+  Status (*disconnect_controller)(Handle controller, Handle driver_image, Handle child);
   void* open_protocol;
   void* close_protocol;
   void* open_protocol_information;
   void* protocols_per_handle;
-  void* locate_handle_buffer;
+  Status (*locate_handle_buffer)(LocateSearchType, const Guid* protocol, void* key,
+                                 Uintn* handle_count, Handle** buffer);
   Status (*locate_protocol)(const Guid*, void* registration, void** iface);
 };
 
@@ -214,6 +218,28 @@ struct GraphicsOutput {
 
 constexpr Guid kGraphicsOutputGuid = {
     0x9042a9de, 0x23dc, 0x4a38, {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
+
+// EFI_PCI_IO_PROTOCOL: only enough to tell which PCI function a handle is.
+struct PciIo {
+  void* poll_mem;
+  void* poll_io;
+  void* mem_read;
+  void* mem_write;
+  void* io_read;
+  void* io_write;
+  void* pci_read;
+  void* pci_write;
+  void* copy_mem;
+  void* map;
+  void* unmap;
+  void* allocate_buffer;
+  void* free_buffer;
+  void* flush;
+  Status (*get_location)(PciIo*, Uintn* segment, Uintn* bus, Uintn* device, Uintn* function);
+};
+
+constexpr Guid kPciIoGuid = {
+    0x4cf5b200, 0x68b8, 0x4ca5, {0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a}};
 
 // EFI_MP_SERVICES_PROTOCOL: enumerate processors and run code on them.
 // Procedures run on application processors and must not call firmware.

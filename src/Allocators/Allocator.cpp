@@ -6,6 +6,8 @@ namespace allocators {
 struct alignas(Allocator::kBlockSize) Allocator::Header {
   static constexpr uint64_t kFree = 0x46524545'46524545;
   static constexpr uint64_t kUsed = 0x55534544'55534544;
+  // Sits just before an over-aligned pointer and leads back to the real block.
+  static constexpr uint64_t kAligned = 0x414C4947'414C4947;
 
   uint64_t magic;
   uint64_t blocks;  // run length including this header block
@@ -55,9 +57,29 @@ void* Allocator::allocate(uint64_t size) {
   return nullptr;
 }
 
+void* Allocator::allocate_aligned(uint64_t size, uint64_t alignment) {
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;
+  if (alignment <= kBlock) return allocate(size);  // blocks are already aligned
+  if (size > UINT64_MAX - alignment) return nullptr;
+
+  // Over-allocate, then place a marker block in front of the aligned address.
+  auto* raw = static_cast<uint8_t*>(allocate(size + alignment));
+  if (!raw) return nullptr;
+  uint64_t aligned = (reinterpret_cast<uint64_t>(raw) + alignment - 1) & ~(alignment - 1);
+  if (aligned == reinterpret_cast<uint64_t>(raw)) return raw;
+
+  // aligned >= raw + kBlock, so the marker block lies inside our own payload.
+  auto* marker = reinterpret_cast<Header*>(aligned - kBlock);
+  marker->magic = Header::kAligned;
+  marker->blocks = 0;
+  marker->next = reinterpret_cast<Header*>(raw - kBlock);  // the real header
+  return reinterpret_cast<void*>(aligned);
+}
+
 void Allocator::deallocate(void* ptr) {
   if (!ptr) return;
   auto* h = reinterpret_cast<Header*>(static_cast<uint8_t*>(ptr) - kBlock);
+  if (h->magic == Header::kAligned) h = h->next;  // over-aligned: free the real block
   if (h->magic != Header::kUsed) return;  // not ours, or a double free
 
   h->magic = Header::kFree;

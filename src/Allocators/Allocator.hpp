@@ -18,6 +18,7 @@ class Allocator final : public IAllocator {
   bool initialize();
 
   void* allocate(uint64_t size) override;
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override;
   void deallocate(void* ptr) override;
 
   uint64_t free_bytes() const;  // payload bytes still available (sum over runs)
