@@ -1,23 +1,24 @@
 #include "console.hpp"
-#include "arch/x86_64/cpu.hpp"
+#include "hardware/DebugConsole.hpp"
+#include "hardware/TextConsole.hpp"
 
 namespace {
-efi::SystemTable* g_st;
-constexpr uint16_t kDebugcon = 0x402;
+// constexpr-constructed: no static initializers run in this freestanding image.
+hardware::DebugConsole g_debug;
+hardware::TextConsole g_text;
 
 void putc(char c) {
-  tcos_outb(kDebugcon, static_cast<uint8_t>(c));
-  if (g_st && g_st->con_out) {
-    efi::Char16 buf[3] = {};
-    if (c == '\n') { buf[0] = u'\r'; buf[1] = u'\n'; }
-    else           { buf[0] = static_cast<efi::Char16>(c); }
-    g_st->con_out->output_string(g_st->con_out, buf);
-  }
+  g_debug.put(c);
+  g_text.put(c);
 }
 }  // namespace
 
 namespace console {
-void init(efi::SystemTable* st) { g_st = st; }
+void init(efi::SystemTable* st) {
+  g_debug.initialize();
+  g_text.bind(st);
+  g_text.initialize();
+}
 
 void puts(const char* s) {
   while (*s) putc(*s++);

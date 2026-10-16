@@ -1,8 +1,17 @@
 # TheoryCraftOS
 
 A minimal x86_64 UEFI operating system written in C++20 with a little
-assembly (`src/arch/x86_64/cpu.S`). It boots under OVMF in QEMU, prints to
+assembly (`src/hardware/x86_64/cpu.S`). It boots under OVMF in QEMU, prints to
 the UEFI console and the QEMU debug console (port 0x402, shown on your terminal), then shuts down on a key.
+
+## Layout
+
+- `src/main.cpp`, `console.*`, `uefi.hpp`, `runtime.cpp`: entry point, logging facade, UEFI types, compiler runtime stubs.
+- `src/hardware/`: every class that touches hardware derives from `hardware::IHardware`
+  (`name()`, `initialize()`, `shutdown()`): `IoPort`, `DebugConsole`, `TextConsole`, and the CPUs.
+  - `hardware/CentralProcessingUnit/`: `ICentralProcessingUnit` and its implementations
+    (`X86_64Cpu`, with its assembly in `X86_64Cpu.S`).
+  - `hardware/x86_64/port.S`: port I/O assembly for `IoPort`; `asm.hpp` is private to `hardware/`.
 
 ## Requirements
 

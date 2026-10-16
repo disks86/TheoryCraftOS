@@ -1,5 +1,5 @@
-#include "arch/x86_64/cpu.hpp"
 #include "console.hpp"
+#include "hardware/CentralProcessingUnit/X86_64Cpu.hpp"
 #include "uefi.hpp"
 
 // gdb: `set var g_debugger_attached = 1` releases the boot-time spin loop.
@@ -22,6 +22,8 @@ static void kernel_main(efi::SystemTable* st) {
 }
 
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
+  hardware::X86_64Cpu x86_cpu;
+  hardware::ICentralProcessingUnit& cpu = x86_cpu;
   console::init(st);
   st->boot_services->set_watchdog_timer(0, 0, 0, nullptr);  // no 5-minute reset
 
@@ -45,5 +47,5 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   kernel_main(st);
 
   st->runtime_services->reset_system(efi::ResetType::Shutdown, efi::kSuccess, 0, nullptr);
-  for (;;) tcos_halt();
+  for (;;) cpu.halt();
 }

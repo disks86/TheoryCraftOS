@@ -19,7 +19,11 @@ add_executable(BOOTX64
   src/main.cpp
   src/console.cpp
   src/runtime.cpp
-  src/arch/x86_64/cpu.S
+  src/hardware/CentralProcessingUnit/X86_64Cpu.cpp
+  src/hardware/CentralProcessingUnit/X86_64Cpu.S
+  src/hardware/IoPort.cpp
+  src/hardware/TextConsole.cpp
+  src/hardware/x86_64/port.S
 )
 
 target_include_directories(BOOTX64 PRIVATE src)
