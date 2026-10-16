@@ -8,11 +8,13 @@
 namespace efi {
 
 using Handle = void*;
+using Event = void*;
 using Status = uint64_t;
 using Char16 = char16_t;
 
 constexpr Status kSuccess = 0;
 constexpr Status kBufferTooSmall = 0x8000000000000005;  // EFI_BUFFER_TOO_SMALL
+constexpr Status kNotReady = 0x8000000000000006;        // EFI_NOT_READY
 
 using Uintn = uint64_t;
 
@@ -81,12 +83,12 @@ struct BootServices {
                            Uintn* descriptor_size, uint32_t* descriptor_version);
   Status (*allocate_pool)(MemoryType, Uintn size, void** buffer);
   Status (*free_pool)(void* buffer);
-  void* create_event;
+  Status (*create_event)(uint32_t type, Uintn tpl, void* notify, void* context, Event*);
   void* set_timer;
   void* wait_for_event;
   void* signal_event;
-  void* close_event;
-  void* check_event;
+  Status (*close_event)(Event);
+  Status (*check_event)(Event);
   void* install_protocol_interface;
   void* reinstall_protocol_interface;
   void* uninstall_protocol_interface;
@@ -104,6 +106,14 @@ struct BootServices {
   void* get_next_monotonic_count;
   Status (*stall)(uint64_t microseconds);
   Status (*set_watchdog_timer)(uint64_t timeout, uint64_t code, uint64_t size, Char16* data);
+  void* connect_controller;
+  void* disconnect_controller;
+  void* open_protocol;
+  void* close_protocol;
+  void* open_protocol_information;
+  void* protocols_per_handle;
+  void* locate_handle_buffer;
+  Status (*locate_protocol)(const Guid*, void* registration, void** iface);
 };
 
 enum class ResetType : uint32_t { Cold, Warm, Shutdown };
@@ -154,5 +164,32 @@ struct LoadedImage {
 
 constexpr Guid kLoadedImageGuid = {
     0x5B1B31A1, 0x9562, 0x11d2, {0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B}};
+
+// EFI_MP_SERVICES_PROTOCOL: enumerate processors and run code on them.
+// Procedures run on application processors and must not call firmware.
+using ApProcedure = void (*)(void* argument);
+
+struct ProcessorInformation {
+  uint64_t processor_id;
+  uint32_t status_flag;  // bit0 BSP, bit1 enabled, bit2 healthy
+  uint32_t package, core, thread;
+};
+constexpr uint32_t kProcessorEnabled = 1u << 1;
+constexpr uint32_t kProcessorHealthy = 1u << 2;
+
+struct MpServices {
+  Status (*get_number_of_processors)(MpServices*, Uintn* total, Uintn* enabled);
+  Status (*get_processor_info)(MpServices*, Uintn id, ProcessorInformation*);
+  Status (*startup_all_aps)(MpServices*, ApProcedure, uint8_t single_thread, Event wait,
+                            Uintn timeout_us, void* argument, Uintn** failed);
+  Status (*startup_this_ap)(MpServices*, ApProcedure, Uintn id, Event wait, Uintn timeout_us,
+                            void* argument, uint8_t* finished);
+  void* switch_bsp;
+  void* enable_disable_ap;
+  Status (*who_am_i)(MpServices*, Uintn* id);
+};
+
+constexpr Guid kMpServicesGuid = {
+    0x3fdda605, 0xa76e, 0x4f46, {0xad, 0x29, 0x12, 0xf4, 0x53, 0x1b, 0x3d, 0x08}};
 
 }  // namespace efi

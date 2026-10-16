@@ -42,7 +42,7 @@ def start_qemu(build):
         os.chmod(vars_fd, 0o644)
     log = os.path.join(build, "debugcon.log")
     cmd = [
-        "qemu-system-x86_64", "-machine", "q35", "-m", "256M", "-net", "none",
+        "qemu-system-x86_64", "-machine", "q35", "-smp", os.environ.get("QEMU_SMP", "4"), "-m", "256M", "-net", "none",
         "-display", os.environ.get("QEMU_DISPLAY", "gtk"),
         "-gdb", f"tcp:127.0.0.1:{PORT}", "-S",
         "-drive", f"if=pflash,format=raw,readonly=on,file={cache(build, 'OVMF_CODE')}",

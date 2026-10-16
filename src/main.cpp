@@ -17,7 +17,20 @@ static void log_size(const char* label, uint64_t bytes) {
   console::puts(" bytes\n");
 }
 
-static void hello_task(void*) { console::puts("Scheduler ran a task.\n"); }
+// Scheduler demo. Tasks may run on other cores, where firmware (and so the
+// console) is off limits, so they only touch memory; the boot core reports.
+struct DemoState {
+  hardware::ICentralProcessingUnit* cpu;
+  uint32_t done;
+  uint64_t cores_used;  // bit n set => core n ran a task
+};
+
+static void demo_task(void* context) {
+  auto* state = static_cast<DemoState*>(context);
+  for (volatile int i = 0; i < 2000000; i = i + 1) {}  // long enough for tasks to overlap
+  __atomic_fetch_or(&state->cores_used, 1ull << state->cpu->current_core(), __ATOMIC_SEQ_CST);
+  __atomic_fetch_add(&state->done, 1, __ATOMIC_SEQ_CST);
+}
 
 static void kernel_main(efi::SystemTable* st) {
   console::puts("Hello from TheoryCraftOS!\n");
@@ -54,8 +67,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Bring-up order: CPU -> RAM -> allocator -> scheduler. Objects live on this
   // stack for the life of the OS; nothing needs static constructors.
-  hardware::SystemCpu cpu;
-  cpu.initialize();
+  hardware::SystemCpu system_cpu(st);
+  hardware::ICentralProcessingUnit& cpu = system_cpu.cpu();
+  if (!cpu.initialize()) {
+    console::puts("CPU initialization failed\n");
+    return efi::kBufferTooSmall;
+  }
   hardware::SystemRam ram(st);
   if (!ram.initialize()) {
     console::puts("RAM initialization failed\n");
@@ -69,18 +86,35 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   scheduling::Scheduler scheduler(cpu, allocator);
 
   console::puts(cpu.name());
-  console::puts(" ready\n");
+  console::puts(": ");
+  console::puts(cpu.model());
+  console::puts("\n");
+  console::puts("Cores: ");
+  console::put_hex(cpu.core_count());
+  console::puts(" (");
+  uint32_t efficiency = 0;
+  for (uint32_t i = 0; i < cpu.core_count(); ++i)
+    efficiency += cpu.core_kind(i) == hardware::CoreKind::Efficiency;
+  console::put_hex(efficiency);
+  console::puts(" efficiency)\n");
   log_size("RAM total:  ", ram.total_bytes());
   log_size("RAM pool:   ", ram.usable_bytes());
   log_size("Allocator free: ", allocator.free_bytes());
 
-  scheduler.submit(hello_task, nullptr);
+  DemoState demo{&cpu, 0, 0};
+  for (int i = 0; i < 8; ++i) scheduler.submit(demo_task, &demo);
   scheduler.run();
+  console::puts("Scheduler finished tasks: ");
+  console::put_hex(demo.done);
+  console::puts(", core mask: ");
+  console::put_hex(demo.cores_used);
+  console::puts("\n");
 
   kernel_main(st);
 
   allocator.deallocate(allocator.allocate(1));  // exercise the pool once
   ram.shutdown();
+  cpu.shutdown();
 
   st->runtime_services->reset_system(efi::ResetType::Shutdown, efi::kSuccess, 0, nullptr);
   for (;;) cpu.halt();

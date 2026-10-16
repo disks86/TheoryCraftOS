@@ -22,6 +22,12 @@ add_executable(BOOTX64
   src/CPUScheduler/Scheduler.cpp
   src/runtime.cpp
   src/hardware/CentralProcessingUnit/X86_64Cpu.cpp
+  src/hardware/CentralProcessingUnit/Intel/IntelX64Cpu.cpp
+  src/hardware/CentralProcessingUnit/Intel/IntelGenerations.cpp
+  src/hardware/CentralProcessingUnit/AMD/AmdGenerations.cpp
+  src/hardware/CentralProcessingUnit/Hygon/HygonGenerations.cpp
+  src/hardware/CentralProcessingUnit/Zhaoxin/ZhaoxinGenerations.cpp
+  src/hardware/CentralProcessingUnit/SystemCpu.cpp
   src/hardware/CentralProcessingUnit/X86_64Cpu.S
   src/hardware/IoPort.cpp
   src/hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
@@ -76,7 +82,7 @@ find_file(OVMF_VARS NAMES OVMF_VARS.4m.fd OVMF_VARS_4M.fd OVMF_VARS.fd
 
 if(QEMU AND OVMF_CODE AND OVMF_VARS)
   set(QEMU_COMMON
-    ${QEMU} -machine q35 -m 256M -net none
+    ${QEMU} -machine q35 -smp 4 -m 256M -net none
     -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
     -drive if=pflash,format=raw,file=${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     -drive format=raw,file=fat:rw:${ESP_DIR}

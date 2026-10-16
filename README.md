@@ -10,11 +10,17 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
 - `src/Allocators/`: `IAllocator` and the default `Allocator`, a cache-line block pool
   that gets its memory from an `IRandomAccessMemory` (`base()` / `usable_bytes()`).
 - `src/CPUScheduler/`: `ICPUScheduler` and the default `Scheduler`, a cooperative run-to-completion
-  scheduler with high-performance and efficiency queues that takes an `ICentralProcessingUnit` and an `IAllocator`.
+  scheduler with high-performance and efficiency queues that spreads tasks over the cores the
+  `ICentralProcessingUnit` reports (tasks on other cores must not call firmware). Takes an `IAllocator` too.
 - `src/hardware/`: every class that touches hardware derives from `hardware::IHardware`
   (`name()`, `initialize()`, `shutdown()`): `IoPort`, `DebugConsole`, `TextConsole`, and the CPUs.
-  - `hardware/CentralProcessingUnit/`: `ICentralProcessingUnit` and its implementations
-    (`X86_64Cpu`, with its assembly in `X86_64Cpu.S`).
+  - `hardware/CentralProcessingUnit/`: `ICentralProcessingUnit` (instructions plus core count, core kinds,
+    start-on-core) and its implementations. `X86_64Cpu` (shared base: CPUID, multi-core via UEFI MP
+    services) and `SystemCpu` sit at the top. Each vendor has a subfolder holding its base class and one
+    small class per microarchitecture: `Intel/` (Conroe ... Diamond Rapids, Atom lines), `AMD/` (K8, K10,
+    Bulldozer, Piledriver, Zen ... Zen 5), `Hygon/`, `Zhaoxin/`, and `QEMU/` (the generic qemu64 model).
+    The generation is chosen at boot from CPUID vendor and family/model/stepping, via the rule table in
+    each vendor's `*Generations.cpp`; this covers every x86-64 model in `qemu-system-x86_64 -cpu help`.
   - `hardware/RandomAccessMemory/`, `GraphicsProcessingUnit/`, `NeuralProcessingUnit/`: interfaces
     (`IRandomAccessMemory`, `IGraphicsProcessingUnit`, `INeuralProcessingUnit`); only RAM has an
     implementation so far (`UefiRandomAccessMemory`).
