@@ -34,7 +34,7 @@ class TcpManager {
                                  uint16_t local_port, const TcpSegment& syn);
 
   // A TCP segment arrived in an IP packet (`segment` = TCP header and data).
-  void handle(Ipv4Address source, Ipv4Address destination, const uint8_t* segment, uint32_t length);
+  void handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment);
   // Runs timers, finishes accepted handshakes and forgets sockets that are done.
   void poll();
 

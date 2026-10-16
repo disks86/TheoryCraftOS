@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/RandomAccessMemory/UefiRandomAccessMemory.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -44,8 +45,16 @@ bool UefiRandomAccessMemory::initialize() {
 
   total_bytes_ = free_bytes_ = 0;
   uint64_t best_start = 0, best_pages = 0;
-  for (efi::Uintn off = 0; off + desc_size <= map_size; off += desc_size) {
-    auto* d = reinterpret_cast<efi::MemoryDescriptor*>(reinterpret_cast<uint8_t*>(map) + off);
+  // The firmware's descriptors are desc_size bytes apart (more than sizeof(MemoryDescriptor)
+  // on some firmware), so step through the map as bytes and take one entry at a time.
+  const ConstByteView map_bytes(reinterpret_cast<const uint8_t*>(map), map_size);
+  if (desc_size < sizeof(efi::MemoryDescriptor)) {
+    bs->free_pool(buffer);
+    return false;
+  }
+  for (uint64_t off = 0; off + desc_size <= map_bytes.size(); off += desc_size) {
+    const ConstByteView entry = map_bytes.subview(off, desc_size);
+    const auto* d = reinterpret_cast<const efi::MemoryDescriptor*>(entry.data());
     if (d->type < efi::kFirstRamType || d->type > efi::kLastRamType) continue;
     auto type = static_cast<efi::MemoryType>(d->type);
     total_bytes_ += d->number_of_pages * kPageSize;

@@ -17,11 +17,22 @@
  */
 
 #include "Hardware/Acpi/AcpiTables.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace hardware {
 
 namespace {
 bool same_guid(const efi::Guid& a, const efi::Guid& b) { return __builtin_memcmp(&a, &b, sizeof(a)) == 0; }
+
+// The table at a physical address as a view of exactly the length its header
+// claims. Firmware tables are trusted for their contents but not for a wild
+// length: a length below the header or above 16 MiB means the pointer is bad.
+ConstByteView table_at(uint64_t address) {
+  if (!address) return ConstByteView();
+  const auto* header = reinterpret_cast<const AcpiTableHeader*>(address);
+  if (header->length < sizeof(AcpiTableHeader) || header->length > (16u << 20)) return ConstByteView();
+  return ConstByteView(reinterpret_cast<const uint8_t*>(address), header->length);
+}
 
 struct Rsdp {
   char signature[8];
@@ -52,28 +63,22 @@ bool AcpiTables::initialize() {
   }
   if (!rsdp || __builtin_memcmp(rsdp->signature, "RSD PTR ", 8) != 0) return false;
 
-  if (rsdp->revision >= 2 && rsdp->xsdt_address) {
-    root_ = reinterpret_cast<const AcpiTableHeader*>(rsdp->xsdt_address);
-    wide_entries_ = true;
-  } else {
-    root_ = reinterpret_cast<const AcpiTableHeader*>(static_cast<uint64_t>(rsdp->rsdt_address));
-    wide_entries_ = false;
-  }
-  return root_ != nullptr;
+  wide_entries_ = rsdp->revision >= 2 && rsdp->xsdt_address;
+  const uint64_t address = wide_entries_ ? rsdp->xsdt_address : uint64_t{rsdp->rsdt_address};
+  root_ = table_at(address);
+  return !root_.empty();
 }
 
-const AcpiTableHeader* AcpiTables::find(const char (&signature)[5]) const {
-  if (!root_) return nullptr;
+ConstByteView AcpiTables::find(const char (&signature)[5]) const {
+  if (root_.size() < sizeof(AcpiTableHeader)) return ConstByteView();
   const uint32_t entry_size = wide_entries_ ? 8 : 4;
-  const uint32_t count = (root_->length - sizeof(AcpiTableHeader)) / entry_size;
-  const auto* entries = reinterpret_cast<const uint8_t*>(root_) + sizeof(AcpiTableHeader);
-  for (uint32_t i = 0; i < count; ++i) {
-    uint64_t address = 0;
-    __builtin_memcpy(&address, entries + i * entry_size, entry_size);  // entries are unaligned
-    auto* header = reinterpret_cast<const AcpiTableHeader*>(address);
-    if (header && __builtin_memcmp(header->signature, signature, 4) == 0) return header;
+  ByteReader entries(root_.dropped(sizeof(AcpiTableHeader)));  // the root table's list of table addresses
+  while (entries.remaining() >= entry_size) {
+    const uint64_t address = entry_size == 8 ? entries.le64() : entries.le32();
+    ConstByteView table = table_at(address);
+    if (table.size() >= 4 && __builtin_memcmp(table.data(), signature, 4) == 0) return table;
   }
-  return nullptr;
+  return ConstByteView();
 }
 
 }  // namespace hardware

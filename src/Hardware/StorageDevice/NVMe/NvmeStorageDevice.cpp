@@ -48,11 +48,11 @@ bool NvmeStorageDevice::disable_controller() {
 }
 
 bool NvmeStorageDevice::setup_queue(Queue* q, uint16_t id) {
-  q->submission = static_cast<Command*>(allocator_.allocate_aligned(kPage, kPage));
-  q->completion = static_cast<Completion*>(allocator_.allocate_aligned(kPage, kPage));
-  if (!q->submission || !q->completion) return false;
-  __builtin_memset(q->submission, 0, kPage);
-  __builtin_memset(q->completion, 0, kPage);
+  q->submission = allocate_view<Command>(allocator_, kPage / sizeof(Command), kPage);
+  q->completion = allocate_view<Completion>(allocator_, kPage / sizeof(Completion), kPage);
+  if (q->submission.empty() || q->completion.empty()) return false;
+  __builtin_memset(q->submission.data(), 0, q->submission.size_bytes());
+  __builtin_memset(q->completion.data(), 0, q->completion.size_bytes());
   q->tail = q->head = 0;
   q->phase = 1;
   q->id = id;
@@ -62,7 +62,7 @@ bool NvmeStorageDevice::setup_queue(Queue* q, uint16_t id) {
 bool NvmeStorageDevice::submit(Queue& q, Command& command, uint32_t* result) {
   const uint16_t id = next_command_id_++;
   command.cdw0 = (command.cdw0 & 0xFFFF) | (uint32_t{id} << 16);
-  __builtin_memcpy(&q.submission[q.tail], &command, sizeof(Command));
+  q.submission[q.tail] = command;  // the tail is always below kQueueEntries
   q.tail = (q.tail + 1) % kQueueEntries;
   __atomic_thread_fence(__ATOMIC_RELEASE);
   write32(kDoorbells + (2 * q.id) * doorbell_stride_, q.tail);
@@ -81,33 +81,35 @@ bool NvmeStorageDevice::submit(Queue& q, Command& command, uint32_t* result) {
 bool NvmeStorageDevice::identify() {
   Command cmd = {};
   cmd.cdw0 = kAdminIdentify;
-  cmd.prp1 = reinterpret_cast<uint64_t>(scratch_);
+  cmd.prp1 = reinterpret_cast<uint64_t>(scratch_.data());
 
   cmd.cdw10 = 1;  // the controller
   if (!submit(admin_, cmd)) return false;
-  copy_device_string(info_.serial, sizeof(info_.serial), scratch_ + 4, 20, false);
-  copy_device_string(info_.model, sizeof(info_.model), scratch_ + 24, 40, false);
+  copy_device_string(ArrayView<char>(info_.serial), ConstByteView(scratch_).subview(4, 20), false);
+  copy_device_string(ArrayView<char>(info_.model), ConstByteView(scratch_).subview(24, 40), false);
 
   // First active namespace (falls back to 1 on controllers without the list command).
   cmd = {};
   cmd.cdw0 = kAdminIdentify;
-  cmd.prp1 = reinterpret_cast<uint64_t>(scratch_);
+  cmd.prp1 = reinterpret_cast<uint64_t>(scratch_.data());
   cmd.cdw10 = 2;
-  __builtin_memset(scratch_, 0, kPage);
+  scratch_.first(kPage).fill(0);
   if (submit(admin_, cmd)) {
-    const uint32_t first = *reinterpret_cast<uint32_t*>(scratch_);
+    ByteReader list(scratch_);
+    const uint32_t first = list.le32();
     if (first) namespace_id_ = first;
   }
 
   cmd = {};
   cmd.cdw0 = kAdminIdentify;
   cmd.nsid = namespace_id_;
-  cmd.prp1 = reinterpret_cast<uint64_t>(scratch_);
+  cmd.prp1 = reinterpret_cast<uint64_t>(scratch_.data());
   cmd.cdw10 = 0;
   if (!submit(admin_, cmd)) return false;
-  info_.block_count = *reinterpret_cast<uint64_t*>(scratch_);
-  const uint8_t format = scratch_[26] & 0x0F;  // FLBAS: index of the LBA format in use
-  const uint8_t data_size_log2 = scratch_[128 + 4 * format + 2];
+  ByteReader ns(scratch_);
+  info_.block_count = ns.le64();                     // NSZE
+  const uint8_t format = scratch_[26] & 0x0F;        // FLBAS: index of the LBA format in use (0-15)
+  const uint8_t data_size_log2 = scratch_[128 + 4 * format + 2];  // LBAF[format].LBADS
   if (data_size_log2 < 9 || data_size_log2 > 12) return false;
   info_.block_size = 1u << data_size_log2;
   return info_.block_count > 0;
@@ -129,13 +131,13 @@ bool NvmeStorageDevice::initialize() {
   if (!(cap & (1ull << 37))) return false;                              // NVM command set
 
   if (!disable_controller()) return false;
-  scratch_ = static_cast<uint8_t*>(allocator_.allocate_aligned(2 * kPage, kPage));
-  if (!scratch_ || !setup_queue(&admin_, 0) || !setup_queue(&io_, 1)) return false;
-  __builtin_memset(scratch_, 0, 2 * kPage);
+  scratch_ = allocate_view<uint8_t>(allocator_, 2 * kPage, kPage);
+  if (scratch_.empty() || !setup_queue(&admin_, 0) || !setup_queue(&io_, 1)) return false;
+  scratch_.fill(0);
 
   write32(kAqa, ((kQueueEntries - 1) << 16) | (kQueueEntries - 1));
-  write64(kAsq, reinterpret_cast<uint64_t>(admin_.submission));
-  write64(kAcq, reinterpret_cast<uint64_t>(admin_.completion));
+  write64(kAsq, reinterpret_cast<uint64_t>(admin_.submission.data()));
+  write64(kAcq, reinterpret_cast<uint64_t>(admin_.completion.data()));
   // 4 KiB pages (MPS 0), NVM command set, round-robin arbitration, 64/16-byte entries.
   write32(kCc, kCcIoSqEntrySize | kCcIoCqEntrySize | kCcEnable);
   if (!wait_ready(true) || (read32(kCsts) & kCstsFatal)) return false;
@@ -143,13 +145,13 @@ bool NvmeStorageDevice::initialize() {
 
   Command cmd = {};
   cmd.cdw0 = kAdminCreateIoCq;
-  cmd.prp1 = reinterpret_cast<uint64_t>(io_.completion);
+  cmd.prp1 = reinterpret_cast<uint64_t>(io_.completion.data());
   cmd.cdw10 = ((kQueueEntries - 1) << 16) | 1;
   cmd.cdw11 = 1;  // physically contiguous, interrupts off
   if (!submit(admin_, cmd)) return false;
   cmd = {};
   cmd.cdw0 = kAdminCreateIoSq;
-  cmd.prp1 = reinterpret_cast<uint64_t>(io_.submission);
+  cmd.prp1 = reinterpret_cast<uint64_t>(io_.submission.data());
   cmd.cdw10 = ((kQueueEntries - 1) << 16) | 1;
   cmd.cdw11 = (1u << 16) | 1;  // completes on CQ 1, physically contiguous
   if (!submit(admin_, cmd)) return false;
@@ -161,14 +163,13 @@ bool NvmeStorageDevice::initialize() {
 void NvmeStorageDevice::shutdown() {
   if (registers_ && enabled_) disable_controller();  // the controller stops using our memory
   enabled_ = false;
-  allocator_.deallocate(admin_.submission);
-  allocator_.deallocate(admin_.completion);
-  allocator_.deallocate(io_.submission);
-  allocator_.deallocate(io_.completion);
-  allocator_.deallocate(scratch_);
+  release_view(allocator_, admin_.submission);
+  release_view(allocator_, admin_.completion);
+  release_view(allocator_, io_.submission);
+  release_view(allocator_, io_.completion);
+  release_view(allocator_, scratch_);
   admin_ = Queue{};
   io_ = Queue{};
-  scratch_ = nullptr;
   release_bounce();
   if (owns_device_) {
     owns_device_ = false;
@@ -176,22 +177,22 @@ void NvmeStorageDevice::shutdown() {
   }
 }
 
-bool NvmeStorageDevice::io(uint8_t opcode, uint64_t lba, uint32_t blocks, void* dma) {
+bool NvmeStorageDevice::io(uint8_t opcode, uint64_t lba, uint32_t blocks, ByteView dma) {
   Command cmd = {};
   cmd.cdw0 = opcode;
   cmd.nsid = namespace_id_;
   if (opcode != kIoFlush) {
-    const uint64_t bytes = uint64_t{blocks} * info_.block_size;
-    const uint64_t data = reinterpret_cast<uint64_t>(dma);
+    const uint64_t bytes = dma.size();
+    const uint64_t data = reinterpret_cast<uint64_t>(dma.data());
     cmd.prp1 = data;
     if (bytes > kPage) {
       if (bytes <= 2 * kPage) {
         cmd.prp2 = data + kPage;
       } else {  // a list of the remaining pages
-        uint64_t* list = reinterpret_cast<uint64_t*>(scratch_ + kPage);
+        const ArrayView<uint64_t> list = scratch_.subview(kPage).cast<uint64_t>();  // 512 entries
         const uint32_t pages = static_cast<uint32_t>((bytes + kPage - 1) / kPage);
-        for (uint32_t i = 1; i < pages; ++i) list[i - 1] = data + uint64_t{i} * kPage;
-        cmd.prp2 = reinterpret_cast<uint64_t>(list);
+        for (uint32_t i = 1; i < pages; ++i) list[i - 1] = data + uint64_t{i} * kPage;  // checked against the list page
+        cmd.prp2 = reinterpret_cast<uint64_t>(list.data());
       }
     }
     cmd.cdw10 = static_cast<uint32_t>(lba);
@@ -201,10 +202,10 @@ bool NvmeStorageDevice::io(uint8_t opcode, uint64_t lba, uint32_t blocks, void* 
   return submit(io_, cmd);
 }
 
-bool NvmeStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
+bool NvmeStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {
   return enabled_ && io(write ? kIoWrite : kIoRead, lba, blocks, dma);
 }
 
-bool NvmeStorageDevice::flush_cache() { return enabled_ && io(kIoFlush, 0, 0, nullptr); }
+bool NvmeStorageDevice::flush_cache() { return enabled_ && io(kIoFlush, 0, 0, ByteView()); }
 
 }  // namespace hardware

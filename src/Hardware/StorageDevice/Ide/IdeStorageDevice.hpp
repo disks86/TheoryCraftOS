@@ -78,7 +78,7 @@ class IdeStorageDevice final : public StorageDeviceBase {
   void shutdown() override;
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
+  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
   bool flush_cache() override;
 
  private:
@@ -89,8 +89,8 @@ class IdeStorageDevice final : public StorageDeviceBase {
   void select(uint8_t lba_high_bits) const;
   bool wait_not_busy(uint32_t timeout_ms);
   bool wait_data_ready();
-  bool identify(uint8_t command, uint16_t* data);
-  bool atapi_command(const uint8_t* cdb, void* data, uint32_t bytes);
+  bool identify(uint8_t command, ArrayView<uint16_t> data);
+  bool atapi_command(ConstByteView cdb, ByteView data);
 
   SharedPointer<IdeController> controller_;
   IdeController::Channel channel_;

@@ -30,13 +30,12 @@ class IUdpSocket {
 
   // Sends one datagram of at most 1472 bytes (what fits an Ethernet frame without
   // fragmentation). False if it cannot be sent right now.
-  virtual bool send_to(Ipv4Address address, uint16_t port, const uint8_t* data, uint32_t length) = 0;
+  virtual bool send_to(Ipv4Address address, uint16_t port, ConstByteView data) = 0;
 
-  // Takes the oldest queued datagram: copies up to `capacity` bytes (the rest of
+  // Takes the oldest queued datagram: copies as much as fits `buffer` (the rest of
   // a longer datagram is discarded) and reports the sender and the datagram's
   // full length. False if none is waiting.
-  virtual bool receive_from(uint8_t* buffer, uint32_t capacity, Ipv4Address* from_address, uint16_t* from_port,
-                            uint32_t* length) = 0;
+  virtual bool receive_from(ByteView buffer, Ipv4Address* from_address, uint16_t* from_port, uint32_t* length) = 0;
   // Datagrams waiting to be received.
   virtual uint32_t pending() const = 0;
 

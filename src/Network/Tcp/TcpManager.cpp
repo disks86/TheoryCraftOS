@@ -74,59 +74,68 @@ void TcpManager::detach_children(TcpSocket* listener) {
 }
 
 void TcpManager::send_reset(Ipv4Address to, uint16_t to_port, uint16_t from_port, const TcpSegment& cause) {
-  uint8_t packet[20];
-  store16(packet, from_port);
-  store16(packet + 2, to_port);
+  uint8_t storage[20];
+  ByteWriter out{ByteView(storage)};
   uint32_t sequence = 0, acknowledgement = 0;
   uint8_t flags = tcp_flags::kRst;
   if (cause.flags & tcp_flags::kAck) {
     sequence = cause.acknowledgement;  // RFC 793: the reset takes its number from the ACK it answers
   } else {
-    acknowledgement = cause.sequence + cause.length + ((cause.flags & tcp_flags::kSyn) ? 1 : 0) +
-                      ((cause.flags & tcp_flags::kFin) ? 1 : 0);
+    acknowledgement = cause.sequence + static_cast<uint32_t>(cause.data.size()) +
+                      ((cause.flags & tcp_flags::kSyn) ? 1 : 0) + ((cause.flags & tcp_flags::kFin) ? 1 : 0);
     flags |= tcp_flags::kAck;
   }
-  store32(packet + 4, sequence);
-  store32(packet + 8, acknowledgement);
-  packet[12] = 5 << 4;
-  packet[13] = flags;
-  store16(packet + 14, 0);
-  store16(packet + 16, 0);
-  store16(packet + 18, 0);
+  out.be16(from_port);
+  out.be16(to_port);
+  out.be32(sequence);
+  out.be32(acknowledgement);
+  out.u8(5 << 4);
+  out.u8(flags);
+  out.be16(0);  // window
+  out.be16(0);  // checksum, filled in below
+  out.be16(0);  // urgent pointer
+  if (!out.ok()) return;
   uint32_t sum = pseudo_header_sum(ip_.local_address(), to, kProtocolTcp, 20);
-  sum = checksum_add(sum, packet, 20);
-  store16(packet + 16, checksum_finish(sum));
-  ip_.send_ip(to, kProtocolTcp, packet, 20);
+  sum = checksum_add(sum, out.written());
+  out.patch_be16(16, checksum_finish(sum));
+  ip_.send_ip(to, kProtocolTcp, out.written());
 }
 
-void TcpManager::handle(Ipv4Address source, Ipv4Address destination, const uint8_t* segment, uint32_t length) {
-  if (length < 20) return;
-  const uint32_t header = (segment[12] >> 4) * 4u;
-  if (header < 20 || header > length) return;
-  const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint16_t>(length)),
-                                    segment, length);
+void TcpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment) {
+  ByteReader in(segment);
+  const uint16_t source_port = in.be16();
+  const uint16_t destination_port = in.be16();
+  TcpSegment s{};
+  s.sequence = in.be32();
+  s.acknowledgement = in.be32();
+  const uint8_t offset_and_reserved = in.u8();
+  s.flags = in.u8();
+  s.window = in.be16();
+  in.skip(4);  // checksum (verified below) and urgent pointer
+  if (!in.ok()) return;  // shorter than a TCP header
+  const uint32_t header = (offset_and_reserved >> 4) * 4u;
+  if (header < 20 || header > segment.size()) return;
+  const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolTcp, static_cast<uint16_t>(segment.size())),
+                                    segment);
   if (checksum_finish(sum) != 0) return;  // corrupted in transit
 
-  TcpSegment s{};
-  s.sequence = load32(segment + 4);
-  s.acknowledgement = load32(segment + 8);
-  s.flags = segment[13];
-  s.window = load16(segment + 14);
-  s.data = segment + header;
-  s.length = length - header;
-  for (uint32_t i = 20; i < header;) {  // options: only the maximum segment size matters
-    const uint8_t kind = segment[i];
+  // Options: only the maximum segment size matters. Each one is bounds-checked
+  // against the option area; a malformed list just ends the scan.
+  ByteReader options(segment.subview(20, header - 20));
+  while (options.ok() && !options.at_end()) {
+    const uint8_t kind = options.u8();
     if (kind == 0) break;
-    if (kind == 1) {
-      ++i;
-      continue;
+    if (kind == 1) continue;
+    const uint8_t length = options.u8();
+    if (!options.ok() || length < 2) break;
+    ConstByteView body = options.take(length - 2u);
+    if (!options.ok()) break;
+    if (kind == 2 && length == 4) {
+      ByteReader value(body);
+      s.mss = value.be16();
     }
-    if (i + 1 >= header || segment[i + 1] < 2 || i + segment[i + 1] > header) break;
-    if (kind == 2 && segment[i + 1] == 4) s.mss = load16(segment + i + 2);
-    i += segment[i + 1];
   }
-  const uint16_t source_port = load16(segment);
-  const uint16_t destination_port = load16(segment + 2);
+  s.data = segment.dropped(header);
 
   // An existing connection first, then a listener.
   for (SharedPointer<TcpSocket>& socket : sockets_) {

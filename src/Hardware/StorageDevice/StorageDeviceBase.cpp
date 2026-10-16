@@ -23,53 +23,57 @@ namespace hardware {
 bool StorageDeviceBase::prepare_bounce() {
   release_bounce();
   if (info_.block_size == 0 || info_.block_size > kBounceBytes) return false;
-  bounce_ = static_cast<uint8_t*>(allocator_.allocate_aligned(kBounceBytes, bounce_alignment_));
-  if (!bounce_) return false;
-  bounce_bytes_ = kBounceBytes;
-  return true;
+  bounce_ = allocate_view<uint8_t>(allocator_, kBounceBytes, bounce_alignment_);
+  return !bounce_.empty();
 }
 
-void StorageDeviceBase::release_bounce() {
-  allocator_.deallocate(bounce_);
-  bounce_ = nullptr;
-  bounce_bytes_ = 0;
-}
+void StorageDeviceBase::release_bounce() { release_view(allocator_, bounce_); }
 
-bool StorageDeviceBase::run(bool write, uint64_t lba, uint32_t count, uint8_t* buffer) {
-  if (!bounce_ || !buffer || count == 0 || lba >= info_.block_count || count > info_.block_count - lba) {
+// Moves a whole request through the bounce buffer in chunks. The caller's memory
+// is `into` (a read) or `from` (a write); every chunk is a checked slice of it.
+bool StorageDeviceBase::run(bool write, uint64_t lba, ByteView into, ConstByteView from) {
+  const uint64_t bytes = write ? from.size() : into.size();
+  if (bounce_.empty() || bytes == 0 || bytes % info_.block_size != 0) {
     ++stats_.errors;
     return false;
   }
+  uint64_t count = bytes / info_.block_size;
+  if (lba >= info_.block_count || count > info_.block_count - lba) {
+    ++stats_.errors;
+    return false;
+  }
+  uint64_t done = 0;  // bytes already moved
   while (count > 0) {
-    const uint32_t n = count < max_blocks() ? count : max_blocks();
-    const uint32_t bytes = n * info_.block_size;
-    if (write) __builtin_memcpy(bounce_, buffer, bytes);
-    if (!transfer(write, lba, n, bounce_)) {
+    const uint32_t n = count < max_blocks() ? static_cast<uint32_t>(count) : max_blocks();
+    const uint64_t chunk_bytes = uint64_t{n} * info_.block_size;
+    const ByteView dma = bounce_.first(chunk_bytes);
+    if (write) dma.copy_from(from.subview(done, chunk_bytes));
+    if (!transfer(write, lba, n, dma)) {
       ++stats_.errors;
       return false;
     }
-    if (!write) __builtin_memcpy(buffer, bounce_, bytes);
+    if (!write) into.subview(done, chunk_bytes).copy_from(dma);
     (write ? stats_.blocks_written : stats_.blocks_read) += n;
     lba += n;
     count -= n;
-    buffer += bytes;
+    done += chunk_bytes;
   }
   ++(write ? stats_.writes : stats_.reads);
   return true;
 }
 
-bool StorageDeviceBase::read(uint64_t lba, uint32_t count, void* buffer) {
+bool StorageDeviceBase::read(uint64_t lba, ByteView buffer) {
   kernel::ScopedMutex guard(mutex_);
-  return run(false, lba, count, static_cast<uint8_t*>(buffer));
+  return run(false, lba, buffer, ConstByteView());
 }
 
-bool StorageDeviceBase::write(uint64_t lba, uint32_t count, const void* buffer) {
+bool StorageDeviceBase::write(uint64_t lba, ConstByteView buffer) {
   kernel::ScopedMutex guard(mutex_);
   if (info_.read_only) {
     ++stats_.errors;
     return false;
   }
-  return run(true, lba, count, const_cast<uint8_t*>(static_cast<const uint8_t*>(buffer)));
+  return run(true, lba, ByteView(), buffer);
 }
 
 bool StorageDeviceBase::flush() {

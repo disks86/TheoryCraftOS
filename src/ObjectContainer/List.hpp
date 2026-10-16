@@ -19,6 +19,7 @@
 #pragma once
 #include "ObjectContainer/ContainerSupport.hpp"
 #include "ObjectContainer/IObjectContainer.hpp"
+#include "Utility/ArrayView.hpp"
 
 // A growable array: elements sit next to each other in one allocation, so
 // indexing is O(1) and appending is amortized O(1). Growth doubles the
@@ -32,30 +33,29 @@ class List final : public IObjectContainer<T> {
   explicit List(allocators::IAllocator& allocator) : allocator_(allocator) {}
   ~List() {
     clear();
-    allocator_.deallocate(data_);
+    allocator_.deallocate(storage_.data());
   }
 
   uint64_t count() const override { return size_; }
-  uint64_t capacity() const { return capacity_; }
+  uint64_t capacity() const { return storage_.size(); }
 
   // Destroys the elements; the memory is kept for reuse.
   void clear() override {
-    for (uint64_t i = 0; i < size_; ++i) data_[i].~T();
+    for (uint64_t i = 0; i < size_; ++i) storage_[i].~T();
     size_ = 0;
   }
 
   // Makes room for at least `capacity` elements. False if memory ran out.
   bool reserve(uint64_t capacity) {
-    if (capacity <= capacity_) return true;
+    if (capacity <= storage_.size()) return true;
     T* fresh = container_support::allocate_array<T>(allocator_, capacity);
     if (!fresh) return false;
     for (uint64_t i = 0; i < size_; ++i) {
-      new (&fresh[i]) T(container_support::move(data_[i]));
-      data_[i].~T();
+      new (&fresh[i]) T(container_support::move(storage_[i]));
+      storage_[i].~T();
     }
-    allocator_.deallocate(data_);
-    data_ = fresh;
-    capacity_ = capacity;
+    allocator_.deallocate(storage_.data());
+    storage_ = ArrayView<T>(fresh, capacity);
     return true;
   }
 
@@ -69,18 +69,28 @@ class List final : public IObjectContainer<T> {
   // Removes the element at `index`, shifting later elements down.
   bool remove_at(uint64_t index) {
     if (index >= size_) return false;
-    for (uint64_t i = index; i + 1 < size_; ++i) data_[i] = container_support::move(data_[i + 1]);
-    data_[size_ - 1].~T();
+    for (uint64_t i = index; i + 1 < size_; ++i) storage_[i] = container_support::move(storage_[i + 1]);
+    storage_[size_ - 1].~T();
     --size_;
     return true;
   }
 
   // Bounds-checked access; nullptr when out of range.
-  T* get(uint64_t index) { return index < size_ ? &data_[index] : nullptr; }
-  const T* get(uint64_t index) const { return index < size_ ? &data_[index] : nullptr; }
-  // Unchecked access: `index` must be below count().
-  T& operator[](uint64_t index) { return data_[index]; }
-  const T& operator[](uint64_t index) const { return data_[index]; }
+  T* get(uint64_t index) { return index < size_ ? &storage_[index] : nullptr; }
+  const T* get(uint64_t index) const { return index < size_ ? &storage_[index] : nullptr; }
+  // Checked access: an index at or above count() stops the OS (bounds_violation)
+  // rather than touch memory that holds no element. Use get() if it may be out of range.
+  T& operator[](uint64_t index) {
+    if (index >= size_) bounds_violation("List::operator[]", index, size_);
+    return storage_[index];
+  }
+  const T& operator[](uint64_t index) const {
+    if (index >= size_) bounds_violation("List::operator[]", index, size_);
+    return storage_[index];
+  }
+  // The elements as a view (valid until the list grows or shrinks).
+  ArrayView<T> view() { return storage_.first(size_); }
+  ArrayView<const T> view() const { return ArrayView<const T>(storage_).first(size_); }
 
   // --- IObjectContainer iteration: the cursor's `index` is the element's index.
   bool first(ObjectCursor* cursor) const override {
@@ -93,27 +103,26 @@ class List final : public IObjectContainer<T> {
     ++cursor->index;
     return true;
   }
-  T* element(const ObjectCursor& cursor) const override { return &data_[cursor.index]; }
+  T* element(const ObjectCursor& cursor) const override { return &storage_[cursor.index]; }
 
  private:
   template <class U>
   bool emplace_at(uint64_t index, U&& value) {
     if (index > size_) return false;
-    if (size_ == capacity_ && !reserve(capacity_ ? capacity_ * 2 : 8)) return false;
+    if (size_ == storage_.size() && !reserve(storage_.size() ? storage_.size() * 2 : 8)) return false;
     // Open a gap: the last element moves into raw memory, the rest assign upward.
     if (index < size_) {
-      new (&data_[size_]) T(container_support::move(data_[size_ - 1]));
-      for (uint64_t i = size_ - 1; i > index; --i) data_[i] = container_support::move(data_[i - 1]);
-      data_[index] = static_cast<U&&>(value);
+      new (&storage_[size_]) T(container_support::move(storage_[size_ - 1]));
+      for (uint64_t i = size_ - 1; i > index; --i) storage_[i] = container_support::move(storage_[i - 1]);
+      storage_[index] = static_cast<U&&>(value);
     } else {
-      new (&data_[index]) T(static_cast<U&&>(value));
+      new (&storage_[index]) T(static_cast<U&&>(value));
     }
     ++size_;
     return true;
   }
 
   allocators::IAllocator& allocator_;
-  T* data_ = nullptr;
+  ArrayView<T> storage_;  // the allocation (the first size_ elements are alive); every index is checked against it
   uint64_t size_ = 0;
-  uint64_t capacity_ = 0;
 };

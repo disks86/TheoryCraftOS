@@ -31,17 +31,6 @@ void put_ip(Ipv4Address a) {
 
 void line(const char* text) { console::puts(text); }
 
-bool equal(const uint8_t* a, const char* b, uint32_t n) {
-  for (uint32_t i = 0; i < n; ++i)
-    if (a[i] != static_cast<uint8_t>(b[i])) return false;
-  return true;
-}
-
-uint32_t length_of(const char* s) {
-  uint32_t n = 0;
-  while (s[n]) ++n;
-  return n;
-}
 
 constexpr uint32_t kHostTimeoutMs = 1500;
 }  // namespace
@@ -135,14 +124,14 @@ bool NetworkStackDemo::check_interface(uint32_t index) {
     uint8_t reply[128];
     uint32_t length = 0;
     bool answered = false;
-    if (udp && udp->send_to(c.gateway, kHostUdpEchoPort, reinterpret_cast<const uint8_t*>(kMessage), sizeof(kMessage) - 1)) {
+    if (udp && udp->send_to(c.gateway, kHostUdpEchoPort, text_bytes(kMessage))) {
       const uint64_t deadline = stack.now_ms() + kHostTimeoutMs;
       while (!answered && stack.now_ms() < deadline) {
         stacks_.poll();
-        answered = udp->receive_from(reply, sizeof(reply), nullptr, nullptr, &length);
+        answered = udp->receive_from(ByteView(reply), nullptr, nullptr, &length);
       }
     }
-    if (answered && length == sizeof(kMessage) - 1 && equal(reply, kMessage, length)) line("      UDP echo from host: ok\n");
+    if (answered && length <= sizeof(reply) && ConstByteView(reply).first(length).equals(text_bytes(kMessage))) line("      UDP echo from host: ok\n");
     else line("      UDP echo from host: no answer (no echo server on the host:7778 - optional)\n");
   }
 
@@ -158,11 +147,11 @@ bool NetworkStackDemo::check_interface(uint32_t index) {
     while (tried && !done && stack.now_ms() < deadline) {
       stacks_.poll();
       if (tcp->state() == TcpState::Closed) break;  // refused
-      if (tcp->is_connected() && !sent) sent = tcp->send(reinterpret_cast<const uint8_t*>(kMessage), sizeof(kMessage) - 1) > 0;
-      got += tcp->receive(reply + got, sizeof(reply) - got);
+      if (tcp->is_connected() && !sent) sent = tcp->send(text_bytes(kMessage)) > 0;
+      got += tcp->receive(ByteView(reply).dropped(got));
       done = got == sizeof(kMessage) - 1;
     }
-    if (done && equal(reply, kMessage, got)) line("      TCP echo from host: ok\n");
+    if (done && ConstByteView(reply).first(got).equals(text_bytes(kMessage))) line("      TCP echo from host: ok\n");
     else line("      TCP echo from host: no answer (no echo server on the host:7777 - optional)\n");
     if (tcp) tcp->close();
   }
@@ -195,9 +184,9 @@ void NetworkStackDemo::serve(Endpoint& endpoint) {
   for (uint64_t i = endpoint.connections.count(); i > 0; --i) {
     SharedPointer<ITcpSocket>& c = endpoint.connections[i - 1];
     uint8_t request[512];
-    const uint32_t n = c->receive(request, sizeof(request));  // we only need to know that a request arrived
+    const uint32_t n = c->receive(ByteView(request));  // we only need to know that a request arrived
     if (n) {
-      c->send(reinterpret_cast<const uint8_t*>(kResponse), length_of(kResponse));
+      c->send(text_bytes(kResponse));
       c->close();  // the FIN follows the response
     } else if (c->state() == TcpState::CloseWait && c->unsent_or_unacknowledged() == 0) {
       c->close();  // the client left without asking for anything

@@ -39,7 +39,7 @@ class VirtioBlockDevice final : public StorageDeviceBase {
   void shutdown() override;
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
+  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
   bool flush_cache() override;
 
  private:
@@ -48,7 +48,7 @@ class VirtioBlockDevice final : public StorageDeviceBase {
     uint32_t reserved;
     uint64_t sector;  // always in 512-byte units
   };
-  bool submit(uint32_t type, uint64_t sector, void* data, uint32_t length);
+  bool submit(uint32_t type, uint64_t sector, ByteView data);
   uint64_t read_config64(uint32_t offset) const;
 
   VirtioPciDevice transport_;

@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
@@ -52,8 +53,8 @@ class E1000NetworkInterface final : public INetworkInterface {
 
   MacAddress mac_address() const override { return mac_; }
   bool link_up() const override;
-  bool transmit(const uint8_t* frame, uint32_t length) override;
-  bool receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) override;
+  bool transmit(ConstByteView frame) override;
+  bool receive(ByteView buffer, uint32_t* length) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:
@@ -77,8 +78,8 @@ class E1000NetworkInterface final : public INetworkInterface {
 
   uint32_t read(uint32_t reg) const;
   void write(uint32_t reg, uint32_t value) const;
-  uint8_t* rx_buffer(uint32_t i) const { return buffers_ + i * kBufferSize; }
-  uint8_t* tx_buffer(uint32_t i) const { return buffers_ + (kReceiveDescriptors + i) * kBufferSize; }
+  ByteView rx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
+  ByteView tx_buffer(uint32_t i) const { return buffers_.subview(uint64_t{kReceiveDescriptors + i} * kBufferSize, kBufferSize); }
 
   const IPciBus& pci_;
   PciDeviceInfo device_;
@@ -86,9 +87,9 @@ class E1000NetworkInterface final : public INetworkInterface {
   efi::SystemTable* st_;
 
   uint64_t registers_ = 0;
-  ReceiveDescriptor* rx_ring_ = nullptr;
-  TransmitDescriptor* tx_ring_ = nullptr;
-  uint8_t* buffers_ = nullptr;  // receive buffers, then transmit buffers
+  ArrayView<ReceiveDescriptor> rx_ring_;
+  ArrayView<TransmitDescriptor> tx_ring_;
+  ByteView buffers_;  // receive buffers, then transmit buffers
   uint32_t rx_next_ = 0;        // next receive descriptor to inspect
   uint32_t tx_next_ = 0;        // next transmit descriptor to fill
   MacAddress mac_{};

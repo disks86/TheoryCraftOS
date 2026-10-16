@@ -27,12 +27,12 @@ namespace {
 template <class In, class Out, class Job>
 void multiply_rows(const Job& job) {
   for (uint32_t i = job.row_begin; i < job.row_end; ++i) {
-    Out* c_row = job.c + uint64_t{i} * job.n;
-    for (uint32_t j = 0; j < job.n; ++j) c_row[j] = 0;
-    const In* a_row = job.a + uint64_t{i} * job.k;
+    const ArrayView<Out> c_row = job.c.subview(uint64_t{i} * job.n, job.n);
+    c_row.fill(0);
+    const ArrayView<const In> a_row = job.a.subview(uint64_t{i} * job.k, job.k);
     for (uint32_t p = 0; p < job.k; ++p) {
       const Out a_ip = static_cast<Out>(a_row[p]);
-      const In* b_row = job.b + uint64_t{p} * job.n;
+      const ArrayView<const In> b_row = job.b.subview(uint64_t{p} * job.n, job.n);
       for (uint32_t j = 0; j < job.n; ++j) c_row[j] += a_ip * static_cast<Out>(b_row[j]);
     }
   }
@@ -42,9 +42,11 @@ float sigmoid(float x) { return static_cast<float>(1.0 / (1.0 + fmath::exp(-stat
 }  // namespace
 
 template <class In, class Out>
-bool SoftwareNeuralProcessingUnit::matmul(const In* a, const In* b, Out* c, uint32_t m, uint32_t n,
-                                          uint32_t k) {
-  if (!a || !b || !c || m == 0 || n == 0 || k == 0) return false;
+bool SoftwareNeuralProcessingUnit::matmul(ArrayView<const In> a, ArrayView<const In> b, ArrayView<Out> c,
+                                          uint32_t m, uint32_t n, uint32_t k) {
+  if (m == 0 || n == 0 || k == 0) return false;
+  // The views must hold the matrices the dimensions describe.
+  if (a.size() < uint64_t{m} * k || b.size() < uint64_t{k} * n || c.size() < uint64_t{m} * n) return false;
 
   uint32_t tasks = cpu_.core_count();
   if (tasks > kMaxTasks) tasks = kMaxTasks;
@@ -76,40 +78,39 @@ bool SoftwareNeuralProcessingUnit::matmul(const In* a, const In* b, Out* c, uint
   return true;
 }
 
-bool SoftwareNeuralProcessingUnit::matmul_i8(const int8_t* a, const int8_t* b, int32_t* c,
-                                             uint32_t m, uint32_t n, uint32_t k) {
+bool SoftwareNeuralProcessingUnit::matmul_i8(ArrayView<const int8_t> a, ArrayView<const int8_t> b,
+                                             ArrayView<int32_t> c, uint32_t m, uint32_t n, uint32_t k) {
   return matmul<int8_t, int32_t>(a, b, c, m, n, k);
 }
 
-bool SoftwareNeuralProcessingUnit::matmul_f32(const float* a, const float* b, float* c, uint32_t m,
-                                              uint32_t n, uint32_t k) {
+bool SoftwareNeuralProcessingUnit::matmul_f32(ArrayView<const float> a, ArrayView<const float> b, ArrayView<float> c,
+                                              uint32_t m, uint32_t n, uint32_t k) {
   return matmul<float, float>(a, b, c, m, n, k);
 }
 
-bool SoftwareNeuralProcessingUnit::activate(float* data, uint32_t count, NpuActivation kind) {
-  if (!data) return false;
-  for (uint32_t i = 0; i < count; ++i) {
+bool SoftwareNeuralProcessingUnit::activate(ArrayView<float> data, NpuActivation kind) {
+  for (float& x : data) {
     switch (kind) {
-      case NpuActivation::Relu:    data[i] = data[i] > 0 ? data[i] : 0; break;
-      case NpuActivation::Sigmoid: data[i] = sigmoid(data[i]); break;
-      case NpuActivation::Tanh:    data[i] = static_cast<float>(fmath::tanh(data[i])); break;
+      case NpuActivation::Relu:    x = x > 0 ? x : 0; break;
+      case NpuActivation::Sigmoid: x = sigmoid(x); break;
+      case NpuActivation::Tanh:    x = static_cast<float>(fmath::tanh(x)); break;
     }
   }
   return true;
 }
 
-bool SoftwareNeuralProcessingUnit::softmax(float* data, uint32_t count) {
-  if (!data || count == 0) return false;
+bool SoftwareNeuralProcessingUnit::softmax(ArrayView<float> data) {
+  if (data.empty()) return false;
   float largest = data[0];
-  for (uint32_t i = 1; i < count; ++i)
-    if (data[i] > largest) largest = data[i];
+  for (float x : data)
+    if (x > largest) largest = x;
   double sum = 0;
-  for (uint32_t i = 0; i < count; ++i) {
-    const double e = fmath::exp(static_cast<double>(data[i]) - largest);  // largest -> e^0, no overflow
-    data[i] = static_cast<float>(e);
+  for (float& x : data) {
+    const double e = fmath::exp(static_cast<double>(x) - largest);  // largest -> e^0, no overflow
+    x = static_cast<float>(e);
     sum += e;
   }
-  for (uint32_t i = 0; i < count; ++i) data[i] = static_cast<float>(data[i] / sum);
+  for (float& x : data) x = static_cast<float>(x / sum);
   return true;
 }
 

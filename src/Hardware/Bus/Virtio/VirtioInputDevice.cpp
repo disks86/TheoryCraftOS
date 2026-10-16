@@ -30,19 +30,17 @@ constexpr uint16_t kKeyA = 30;
 constexpr uint16_t kRelX = 0, kAbsX = 0, kAbsY = 1;
 }  // namespace
 
-uint8_t VirtioInputDevice::query(uint8_t select, uint8_t subselect, uint8_t* data,
-                                 uint8_t capacity) const {
+uint8_t VirtioInputDevice::query(uint8_t select, uint8_t subselect, ByteView data) const {
   transport_.write_config8(kCfgSelect, select);
   transport_.write_config8(kCfgSubselect, subselect);
-  uint8_t size = transport_.read_config8(kCfgSize);
-  if (size > capacity) size = capacity;
-  for (uint8_t i = 0; i < size; ++i) data[i] = transport_.read_config8(kCfgData + i);
-  return size;
+  const uint64_t size = transport_.read_config8(kCfgSize) < data.size() ? transport_.read_config8(kCfgSize) : data.size();
+  for (uint64_t i = 0; i < size; ++i) data[i] = transport_.read_config8(kCfgData + static_cast<uint32_t>(i));
+  return static_cast<uint8_t>(size);
 }
 
 bool VirtioInputDevice::supports(uint8_t type, uint16_t code) const {
   uint8_t bits[128];
-  const uint8_t size = query(kCfgEvBits, type, bits, sizeof(bits));
+  const uint8_t size = query(kCfgEvBits, type, ByteView(bits));
   return code / 8 < size && (bits[code / 8] & (1u << (code % 8)));
 }
 
@@ -66,7 +64,7 @@ bool VirtioInputDevice::initialize() {
   if (kind_ == VirtioInputKind::Tablet) {
     for (uint8_t axis = 0; axis < 2; ++axis) {
       uint8_t info[20];  // struct { u32 min, max, fuzz, flat, res; }
-      if (query(kCfgAbsInfo, axis, info, sizeof(info)) >= 8)
+      if (query(kCfgAbsInfo, axis, ByteView(info)) >= 8)
         abs_max_[axis] = info[4] | (info[5] << 8) | (info[6] << 16) | (uint32_t{info[7]} << 24);
     }
   }
@@ -77,8 +75,8 @@ bool VirtioInputDevice::initialize() {
     return false;
   }
   const uint16_t count = events_.size() < kEventBuffers ? events_.size() : kEventBuffers;
-  buffers_ = static_cast<VirtioInputEvent*>(allocator_.allocate_aligned(count * sizeof(VirtioInputEvent), 64));
-  if (!buffers_) {
+  buffers_ = allocate_view<VirtioInputEvent>(allocator_, count, 64);
+  if (buffers_.empty()) {
     shutdown();
     return false;
   }
@@ -100,6 +98,7 @@ bool VirtioInputDevice::next_event(VirtioInputEvent* out) {
   uint16_t id;
   uint32_t length;
   if (!events_.take_used(&id, &length)) return false;
+  if (!buffers_.in_range(id)) return false;  // an id that is not one of our buffers: the device is confused
   const volatile VirtioInputEvent& e = buffers_[id];
   *out = {e.type, e.code, e.value};
   events_.post(id, &buffers_[id], sizeof(VirtioInputEvent));  // recycle the buffer
@@ -111,8 +110,7 @@ void VirtioInputDevice::shutdown() {
   started_ = false;
   transport_.shutdown();  // resets the device first: it must stop writing to our queue
   events_.release(allocator_);
-  allocator_.deallocate(buffers_);
-  buffers_ = nullptr;
+  release_view(allocator_, buffers_);
 }
 
 }  // namespace hardware

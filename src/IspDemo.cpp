@@ -17,6 +17,7 @@
  */
 
 #include "IspDemo.hpp"
+#include "Utility/AllocatedView.hpp"
 
 namespace {
 using namespace hardware;
@@ -40,7 +41,7 @@ void scene(uint32_t x, uint32_t y, uint32_t rgb[3]) {
 // What a sensor under warm light records: the same scene with weak red and blue.
 constexpr uint32_t kSensorGain[3] = {55, 100, 70};  // percent
 
-void mosaic(uint16_t* raw) {
+void mosaic(ArrayView<uint16_t> raw) {
   const uint32_t max = (1u << kBitDepth) - 1;
   for (uint32_t y = 0; y < kHeight; ++y) {
     for (uint32_t x = 0; x < kWidth; ++x) {
@@ -54,7 +55,7 @@ void mosaic(uint16_t* raw) {
   }
 }
 
-void draw(IGraphicsProcessingUnit& gpu, const uint32_t* pixels, uint32_t left, uint32_t top) {
+void draw(IGraphicsProcessingUnit& gpu, ArrayView<const uint32_t> pixels, uint32_t left, uint32_t top) {
   for (uint32_t y = 0; y < kHeight; ++y)
     for (uint32_t x = 0; x < kWidth; ++x) gpu.put_pixel(left + x, top + y, pixels[y * kWidth + x]);
 }
@@ -65,13 +66,13 @@ bool run_isp_demo(IGraphicsProcessingUnit& gpu, IImageSignalProcessor& isp,
   constexpr uint32_t kMargin = 12, kLabel = 18;
   if (gpu.width() < kWidth + 2 * kMargin || gpu.height() < 2 * (kHeight + kLabel) + 2 * kMargin) return false;
 
-  auto* raw = static_cast<uint16_t*>(allocator.allocate(kWidth * kHeight * sizeof(uint16_t)));
-  auto* neutral = static_cast<uint32_t*>(allocator.allocate(kWidth * kHeight * sizeof(uint32_t)));
-  auto* balanced = static_cast<uint32_t*>(allocator.allocate(kWidth * kHeight * sizeof(uint32_t)));
-  bool ok = raw && neutral && balanced;
+  ArrayView<uint16_t> raw = allocate_view<uint16_t>(allocator, kWidth * kHeight);
+  ArrayView<uint32_t> neutral = allocate_view<uint32_t>(allocator, kWidth * kHeight);
+  ArrayView<uint32_t> balanced = allocate_view<uint32_t>(allocator, kWidth * kHeight);
+  bool ok = !raw.empty() && !neutral.empty() && !balanced.empty();
   if (ok) {
     mosaic(raw);
-    const RawFrame frame{raw, kWidth, kHeight, kWidth, kBitDepth, BayerPattern::Rggb};
+    const RawFrame frame{ArrayView<const uint16_t>(raw), kWidth, kHeight, kWidth, kBitDepth, BayerPattern::Rggb};
     ImageBuffer out_neutral{neutral, kWidth, kHeight, kWidth};
     ImageBuffer out_balanced{balanced, kWidth, kHeight, kWidth};
 
@@ -90,8 +91,8 @@ bool run_isp_demo(IGraphicsProcessingUnit& gpu, IImageSignalProcessor& isp,
       draw(gpu, balanced, left, second + kLabel);
     }
   }
-  allocator.deallocate(raw);
-  allocator.deallocate(neutral);
-  allocator.deallocate(balanced);
+  release_view(allocator, raw);
+  release_view(allocator, neutral);
+  release_view(allocator, balanced);
   return ok;
 }

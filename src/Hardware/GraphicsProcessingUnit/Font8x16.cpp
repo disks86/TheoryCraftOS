@@ -126,10 +126,10 @@ constexpr uint8_t kGlyphs[95][16] = {
 };
 }  // namespace
 
-const uint8_t* Font8x16::glyph(char c) {
+ConstByteView Font8x16::glyph(char c) {
   unsigned char u = static_cast<unsigned char>(c);
   if (u < 32 || u > 126) u = '?';
-  return kGlyphs[u - 32];
+  return ConstByteView(kGlyphs[u - 32], kHeight);
 }
 
 }  // namespace hardware

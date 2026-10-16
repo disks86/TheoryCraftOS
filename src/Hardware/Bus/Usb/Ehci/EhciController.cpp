@@ -116,16 +116,16 @@ bool EhciController::reset() {
 
 bool EhciController::setup_memory() {
   async_head_ = static_cast<Qh*>(allocator_.allocate_aligned(sizeof(Qh), 64));
-  pool_ = static_cast<Qtd*>(allocator_.allocate_aligned(sizeof(Qtd) * kPoolQtds, 64));
-  frame_list_ = static_cast<uint32_t*>(allocator_.allocate_aligned(kFrameListEntries * 4, 4096));
-  buffer_ = static_cast<uint8_t*>(allocator_.allocate_aligned(8192, 4096));
-  if (!async_head_ || !pool_ || !frame_list_ || !buffer_) return false;
-  if ((address_of(async_head_) | address_of(pool_) | address_of(frame_list_)) >> 32) return false;
-  if (!reachable(buffer_, 8192)) return false;
+  pool_ = allocate_view<Qtd>(allocator_, kPoolQtds, 64);
+  frame_list_ = allocate_view<uint32_t>(allocator_, kFrameListEntries, 4096);
+  buffer_ = allocate_view<uint8_t>(allocator_, 8192, 4096);
+  if (!async_head_ || pool_.empty() || frame_list_.empty() || buffer_.empty()) return false;
+  if ((address_of(async_head_) | address_of(pool_.data()) | address_of(frame_list_.data())) >> 32) return false;
+  if (!reachable(buffer_.data(), buffer_.size())) return false;
 
   __builtin_memset(async_head_, 0, sizeof(Qh));
-  __builtin_memset(pool_, 0, sizeof(Qtd) * kPoolQtds);
-  __builtin_memset(buffer_, 0, 8192);
+  __builtin_memset(pool_.data(), 0, pool_.size_bytes());
+  buffer_.fill(0);
   for (uint32_t i = 0; i < kFrameListEntries; ++i) frame_list_[i] = kLinkTerminate;
   // The list head: points to itself, marked as head of the reclamation list, never runs.
   async_head_->horizontal = low(address_of(async_head_)) | kLinkTypeQueueHead;
@@ -141,7 +141,7 @@ bool EhciController::start() {
   write32(op_ + kOpUsbIntr, 0);  // polled
   write32(op_ + kOpCtrlDsSegment, 0);
   write32(op_ + kOpUsbSts, 0x3F);
-  write32(op_ + kOpPeriodicListBase, low(address_of(frame_list_)));
+  write32(op_ + kOpPeriodicListBase, low(address_of(frame_list_.data())));
   write32(op_ + kOpAsyncListAddr, low(address_of(async_head_)));
   write32(op_ + kOpUsbCmd, kCmdRun | kCmdAsyncEnable | kCmdPeriodicEnable | kCmdInterruptThreshold8);
   if (!wait_for(op_ + kOpUsbSts, kStsHalted, 0, 1000)) return false;
@@ -158,13 +158,10 @@ void EhciController::shutdown() {
   running_ = false;
   for (Device& d : devices_) release_device(d);
   allocator_.deallocate(async_head_);
-  allocator_.deallocate(pool_);
-  allocator_.deallocate(frame_list_);
-  allocator_.deallocate(buffer_);
+  release_view(allocator_, pool_);
+  release_view(allocator_, frame_list_);
+  release_view(allocator_, buffer_);
   async_head_ = nullptr;
-  pool_ = nullptr;
-  frame_list_ = nullptr;
-  buffer_ = nullptr;
   periodic_first_ = nullptr;
 
   // Give the controller back: reset it (it still points at the memory just freed)
@@ -242,17 +239,18 @@ void EhciController::fill_qtd(Qtd* qtd, uint32_t pid, uint64_t data, uint32_t by
 
 // Runs `count` consecutive pool descriptors on a queue head and waits for them.
 // *remaining receives the bytes that were not transferred.
-bool EhciController::run(Qh* qh, Qtd* first, uint32_t count, uint32_t timeout_ms, uint32_t* remaining) {
-  for (uint32_t i = 0; i + 1 < count; ++i) first[i].next = low(address_of(&first[i + 1]));
+bool EhciController::run(Qh* qh, ArrayView<Qtd> descriptors, uint32_t timeout_ms, uint32_t* remaining) {
+  const uint64_t count = descriptors.size();
+  for (uint64_t i = 0; i + 1 < count; ++i) descriptors[i].next = low(address_of(&descriptors[i + 1]));
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   qh->overlay.alternate = kLinkTerminate;
-  qh->overlay.next = low(address_of(first));  // idle queue: the controller picks it up on its next visit
+  qh->overlay.next = low(address_of(descriptors.data()));  // idle queue: the controller picks it up on its next visit
 
   bool done = false, failed = false;
   for (uint32_t waited = 0; waited <= timeout_ms * 10 && !done && !failed; ++waited) {
     done = true;
-    for (uint32_t i = 0; i < count; ++i) {
-      const uint32_t token = reinterpret_cast<volatile Qtd*>(&first[i])->token;
+    for (Qtd& qtd : descriptors) {
+      const uint32_t token = reinterpret_cast<volatile Qtd*>(&qtd)->token;
       if (token & (kTokenHalted | kTokenErrors)) {
         failed = true;
         break;
@@ -266,7 +264,7 @@ bool EhciController::run(Qh* qh, Qtd* first, uint32_t count, uint32_t timeout_ms
     return false;
   }
   uint32_t left = 0;
-  for (uint32_t i = 0; i < count; ++i) left += (first[i].token >> 16) & 0x7FFF;
+  for (const Qtd& qtd : descriptors) left += (qtd.token >> 16) & 0x7FFF;
   if (remaining) *remaining = left;
   return true;
 }
@@ -311,7 +309,7 @@ void EhciController::release_device(Device& d) {
   for (Endpoint& e : d.endpoints) {
     free_queue_head(e.qh);
     allocator_.deallocate(e.qtd);
-    allocator_.deallocate(e.buffer);
+    release_view(allocator_, e.buffer);
     e = Endpoint{};
   }
   free_queue_head(d.control_qh);
@@ -327,24 +325,22 @@ void EhciController::release_device(Device& d) {
 bool EhciController::control(Device& d, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
                              uint16_t length, bool data_in) {
   if (!d.control_qh || length > 4096) return false;
-  uint8_t* setup = buffer_;
-  uint8_t* data = buffer_ + 4096;
-  setup[0] = request_type;
-  setup[1] = request;
-  setup[2] = static_cast<uint8_t>(value);
-  setup[3] = static_cast<uint8_t>(value >> 8);
-  setup[4] = static_cast<uint8_t>(index);
-  setup[5] = static_cast<uint8_t>(index >> 8);
-  setup[6] = static_cast<uint8_t>(length);
-  setup[7] = static_cast<uint8_t>(length >> 8);
-  if (data_in) __builtin_memset(data, 0, length);
+  const ByteView setup = buffer_.first(8);
+  const ByteView data = control_data();
+  ByteWriter packet(setup);
+  packet.u8(request_type);
+  packet.u8(request);
+  packet.le16(value);
+  packet.le16(index);
+  packet.le16(length);
+  if (data_in) data.first(length).fill(0);
 
   uint32_t n = 0;
-  fill_qtd(&pool_[n++], kTokenPidSetup, address_of(setup), 8, 0, false);
-  if (data_in) fill_qtd(&pool_[n++], kTokenPidIn, address_of(data), length, 1, false);
+  fill_qtd(&pool_[n++], kTokenPidSetup, address_of(setup.data()), 8, 0, false);
+  if (data_in) fill_qtd(&pool_[n++], kTokenPidIn, address_of(data.data()), length, 1, false);
   // The status stage runs opposite to the data: out after an IN data stage, in otherwise.
   fill_qtd(&pool_[n++], data_in ? kTokenPidOut : kTokenPidIn, 0, 0, 1, true);
-  return run(d.control_qh, pool_, n, kControlTimeoutMs, nullptr);
+  return run(d.control_qh, pool_.first(n), kControlTimeoutMs, nullptr);
 }
 
 bool EhciController::enumerate_port(uint32_t port) {
@@ -356,7 +352,7 @@ bool EhciController::enumerate_port(uint32_t port) {
 
   const uint8_t address = static_cast<uint8_t>(port + 1);
   if (!control(d, 0x80, 6, 0x0100, 0, sizeof(UsbDeviceDescriptor), true)) return release_device(d), false;
-  __builtin_memcpy(&d.descriptor, buffer_ + 4096, sizeof(UsbDeviceDescriptor));
+  bytes_of(d.descriptor).copy_from(control_data().first(sizeof(UsbDeviceDescriptor)));
   if (!control(d, 0x00, 5, address, 0, 0, false)) return release_device(d), false;
   delay_us(5000);  // the device needs a moment to adopt its address
   d.control_qh->characteristics = (d.control_qh->characteristics & ~0x7Fu) | address;
@@ -366,9 +362,9 @@ bool EhciController::enumerate_port(uint32_t port) {
   // Cache the first configuration for class drivers; a device without a readable
   // one is still enumerated, just not usable by them.
   if (control(d, 0x80, 6, 0x0200, 0, 9, true)) {
-    const uint16_t total = buffer_[4096 + 2] | (buffer_[4096 + 3] << 8);
+    const uint16_t total = control_data()[2] | (control_data()[3] << 8);
     if (total >= 9 && total <= sizeof(d.config) && control(d, 0x80, 6, 0x0200, 0, total, true)) {
-      __builtin_memcpy(d.config, buffer_ + 4096, total);
+      ByteView(d.config).copy_from(control_data().first(total));
       d.config_length = total;
     }
   }
@@ -383,12 +379,10 @@ bool EhciController::device_descriptor(uint32_t port, UsbDeviceDescriptor* out) 
   return true;
 }
 
-bool EhciController::configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity,
-                                              uint16_t* length) const {
-  if (port >= ports_ || !devices_[port].present || !devices_[port].config_length || !buffer) return false;
+bool EhciController::configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const {
+  if (port >= ports_ || !devices_[port].present || !devices_[port].config_length || buffer.empty()) return false;
   const Device& d = devices_[port];
-  const uint16_t n = d.config_length < capacity ? d.config_length : capacity;
-  __builtin_memcpy(buffer, d.config, n);
+  buffer.copy_from(ConstByteView(d.config).first(d.config_length).at_most(buffer.size()));  // as much as fits
   if (length) *length = d.config_length;
   return true;
 }
@@ -411,11 +405,11 @@ bool EhciController::control_out(uint32_t port, uint8_t request_type, uint8_t re
 }
 
 bool EhciController::control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
-                                uint16_t index, void* buffer, uint16_t length) {
+                                uint16_t index, ByteView buffer) {
   kernel::ScopedMutex lock_guard(lock_);
-  if (port >= ports_ || !devices_[port].present || !buffer || length > 4096) return false;
-  if (!control(devices_[port], request_type, request, value, index, length, true)) return false;
-  __builtin_memcpy(buffer, buffer_ + 4096, length);
+  if (port >= ports_ || !devices_[port].present || buffer.empty() || buffer.size() > 4096) return false;
+  if (!control(devices_[port], request_type, request, value, index, static_cast<uint16_t>(buffer.size()), true)) return false;
+  buffer.copy_from(control_data().first(buffer.size()));
   return true;
 }
 
@@ -440,12 +434,12 @@ bool EhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   if (!e) return false;
 
   e->qh = make_queue_head(d.address, endpoint_address & 0x0F, max_packet, false);
-  e->qtd = static_cast<Qtd*>(allocator_.allocate_aligned(sizeof(Qtd), 64));
-  e->buffer = static_cast<uint8_t*>(allocator_.allocate_aligned(max_packet < 64 ? 64 : max_packet, 64));
-  if (!e->qh || !e->qtd || !e->buffer || (address_of(e->qtd) >> 32) || !reachable(e->buffer, max_packet)) {
+  e->qtd = allocate_view<Qtd>(allocator_, 1, 64).data();
+  e->buffer = allocate_view<uint8_t>(allocator_, max_packet < 64 ? 64 : max_packet, 64);
+  if (!e->qh || !e->qtd || e->buffer.empty() || (address_of(e->qtd) >> 32) || !reachable(e->buffer.data(), max_packet)) {
     free_queue_head(e->qh);
     allocator_.deallocate(e->qtd);
-    allocator_.deallocate(e->buffer);
+    release_view(allocator_, e->buffer);
     *e = Endpoint{};
     return false;
   }
@@ -453,31 +447,30 @@ bool EhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   e->max_packet = max_packet;
   e->interrupt = true;
   e->qh->capabilities |= 0x01;  // start-split mask: micro-frame 0 of every frame
-  fill_qtd(e->qtd, kTokenPidIn, address_of(e->buffer), max_packet, 0, true);
+  fill_qtd(e->qtd, kTokenPidIn, address_of(e->buffer.data()), max_packet, 0, true);
   e->qh->overlay.next = low(address_of(e->qtd));  // armed before the head becomes visible
   link_periodic(e->qh);
   e->active = true;
   return true;
 }
 
-bool EhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
-                                       uint16_t* length) {
+bool EhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) {
   kernel::ScopedMutex lock_guard(lock_);
-  if (port >= ports_ || !devices_[port].present || !buffer) return false;
+  if (port >= ports_ || !devices_[port].present) return false;
   Endpoint* e = find_endpoint(devices_[port], endpoint_address);
   if (!e || !e->interrupt) return false;
   const uint32_t token = reinterpret_cast<volatile Qtd*>(e->qtd)->token;
   if (token & kTokenActive) return false;  // nothing arrived yet
   const bool failed = token & (kTokenHalted | kTokenErrors);
-  const uint32_t received = e->max_packet - ((token >> 16) & 0x7FFF);
+  const uint32_t remaining = (token >> 16) & 0x7FFF;
+  const uint32_t received = remaining <= e->max_packet ? e->max_packet - remaining : 0;  // the controller's word, kept in range
   if (!failed) {
-    const uint16_t n = received < capacity ? received : capacity;
-    __builtin_memcpy(buffer, e->buffer, n);
+    buffer.copy_from(ConstByteView(e->buffer).first(received).at_most(buffer.size()));  // as much as fits
     if (length) *length = static_cast<uint16_t>(received);
   } else {
     recover_queue_head(e->qh);
   }
-  fill_qtd(e->qtd, kTokenPidIn, address_of(e->buffer), e->max_packet, 0, true);
+  fill_qtd(e->qtd, kTokenPidIn, address_of(e->buffer.data()), e->max_packet, 0, true);
   e->qh->overlay.next = low(address_of(e->qtd));
   return !failed;
 }
@@ -501,16 +494,16 @@ bool EhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
   return false;
 }
 
-bool EhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                                   uint32_t* transferred) {
+bool EhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) {
   kernel::ScopedMutex lock_guard(lock_);
   if (transferred) *transferred = 0;
-  if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
+  const uint32_t length = static_cast<uint32_t>(data.size());
+  if (port >= ports_ || !devices_[port].present || data.size() > 0x10000) return false;
   Endpoint* e = find_endpoint(devices_[port], endpoint_address);
-  if (!e || e->interrupt || (length && (!data || !reachable(data, length)))) return false;
+  if (!e || e->interrupt || (length && !reachable(data.data(), length))) return false;
 
   const uint32_t pid = (endpoint_address & 0x80) ? kTokenPidIn : kTokenPidOut;
-  const uint64_t base = address_of(data);
+  const uint64_t base = address_of(data.data());
   uint32_t n = 0, offset = 0;
   do {
     const uint32_t chunk = length - offset < kChunkBytes ? length - offset : kChunkBytes;
@@ -519,8 +512,8 @@ bool EhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void
   } while (offset < length);
 
   uint32_t remaining = 0;
-  if (!run(e->qh, pool_, n, kBulkTimeoutMs, &remaining)) return false;
-  if (transferred) *transferred = length - remaining;
+  if (!run(e->qh, pool_.first(n), kBulkTimeoutMs, &remaining)) return false;
+  if (transferred) *transferred = remaining <= length ? length - remaining : 0;
   return true;
 }
 

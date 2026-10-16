@@ -26,37 +26,45 @@ char lower(char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) :
 // Reads a (possibly compressed) name at `offset` into dotted text. Sets *next to
 // the offset just past the name as it appears at `offset` (compression pointers
 // are not followed for that). False on malformed data.
-bool read_name(const uint8_t* m, uint32_t length, uint32_t offset, char* out, uint32_t capacity, uint32_t* next) {
-  uint32_t written = 0, jumps = 0;
+bool read_name(ConstByteView m, uint64_t offset, ArrayView<char> out, uint64_t* next) {
+  uint64_t written = 0, jumps = 0;
   bool jumped = false;
   for (;;) {
-    if (offset >= length) return false;
-    const uint8_t b = m[offset];
+    uint8_t b;
+    if (!m.try_get(offset, &b)) return false;
     if ((b & 0xC0) == 0xC0) {  // compression pointer: the name continues elsewhere
-      if (offset + 1 >= length) return false;
+      uint8_t low;
+      if (!m.try_get(offset + 1, &low)) return false;
       if (!jumped) *next = offset + 2;
       jumped = true;
-      offset = ((b & 0x3F) << 8) | m[offset + 1];
+      offset = (uint64_t{static_cast<uint8_t>(b & 0x3F)} << 8) | low;
       if (++jumps > 64) return false;  // a pointer loop
     } else if (b == 0) {
       if (!jumped) *next = offset + 1;
-      if (written >= capacity) return false;
+      if (written >= out.size()) return false;
       out[written] = '\0';
       return true;
     } else if (b & 0xC0) {
       return false;  // reserved label types
     } else {
-      if (offset + 1 + b > length) return false;
-      if (written + b + 2 > capacity) return false;
-      if (written) out[written++] = '.';
-      for (uint32_t i = 0; i < b; ++i) out[written++] = m[offset + 1 + i];
+      ConstByteView label;
+      if (!m.try_subview(offset + 1, b, &label)) return false;  // the label runs past the end
+      if (written + b + 2 > out.size()) return false;
+    if (written) out[written++] = '.';
+      for (uint8_t c : label) out[written++] = static_cast<char>(c);
       offset += 1 + b;
     }
   }
 }
 
-void copy_name(char* to, const char* from) {
-  while ((*to++ = *from++)) {}
+// Copies a NUL-terminated name into a text buffer of known size; false if it does not fit.
+bool copy_name(ArrayView<char> to, const char* from) {
+  uint64_t n = 0;
+  while (from[n]) ++n;
+  if (n >= to.size()) return false;
+  to.first(n).copy_from(ArrayView<const char>(from, n));
+  to[n] = '\0';
+  return true;
 }
 }  // namespace
 
@@ -69,55 +77,67 @@ bool names_equal(const char* a, const char* b) {
   }
 }
 
-uint32_t encode_name(const char* name, uint8_t* out, uint32_t capacity) {
+uint32_t encode_name(const char* name, ByteView out) {
   if (!name || !*name) return 0;
-  uint32_t length = 0, written = 0;
+  uint64_t length = 0;
   while (name[length]) ++length;
   if (name[length - 1] == '.') --length;  // an absolute name: drop the trailing dot
   if (length == 0 || length > kMaxTextName) return 0;
 
-  uint32_t label_start = 0;
-  for (uint32_t i = 0; i <= length; ++i) {
+  ByteWriter w(out);
+  uint64_t label_start = 0;
+  for (uint64_t i = 0; i <= length; ++i) {
     if (i < length && name[i] != '.') continue;
-    const uint32_t label = i - label_start;
+    const uint64_t label = i - label_start;
     if (label == 0 || label > 63) return 0;  // empty label ("a..b") or too long
-    if (written + 1 + label + 1 > capacity) return 0;
-    out[written++] = static_cast<uint8_t>(label);
-    for (uint32_t k = 0; k < label; ++k) out[written++] = static_cast<uint8_t>(name[label_start + k]);
+    w.u8(static_cast<uint8_t>(label));
+    w.bytes(ConstByteView(reinterpret_cast<const uint8_t*>(name + label_start), label));
     label_start = i + 1;
   }
-  out[written++] = 0;
-  return written;
+  w.u8(0);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-uint32_t build_query(uint16_t id, const char* name, uint8_t* out, uint32_t capacity) {
-  if (capacity < kHeaderSize + 5) return 0;
-  store16(out, id);
-  store16(out + 2, 0x0100);  // standard query, recursion desired
-  store16(out + 4, 1);       // one question
-  store16(out + 6, 0);
-  store16(out + 8, 0);
-  store16(out + 10, 0);
-  const uint32_t n = encode_name(name, out + kHeaderSize, capacity - kHeaderSize - 4);
+uint32_t build_query(uint16_t id, const char* name, ByteView out) {
+  ByteWriter w(out);
+  w.be16(id);
+  w.be16(0x0100);  // standard query, recursion desired
+  w.be16(1);       // one question
+  w.be16(0);
+  w.be16(0);
+  w.be16(0);
+  if (!w.ok()) return 0;
+  // Room for the name plus the four bytes (type, class) after it.
+  const uint64_t room = out.size() > kHeaderSize + 4 ? out.size() - kHeaderSize - 4 : 0;
+  const uint32_t n = encode_name(name, out.subview(kHeaderSize, room));
   if (!n) return 0;
-  store16(out + kHeaderSize + n, kTypeA);
-  store16(out + kHeaderSize + n + 2, kClassIn);
-  return kHeaderSize + n + 4;
+  w.reserve(n);  // the name is already in place
+  w.be16(kTypeA);
+  w.be16(kClassIn);
+  return w.ok() ? static_cast<uint32_t>(w.position()) : 0;
 }
 
-ParseResult parse_response(const uint8_t* m, uint32_t length, uint16_t id, const char* name, Answer* answer) {
-  if (length < kHeaderSize || load16(m) != id) return ParseResult::Invalid;
-  const uint16_t flags = load16(m + 2);
+ParseResult parse_response(ConstByteView m, uint16_t id, const char* name, Answer* answer) {
+  ByteReader in(m);
+  const uint16_t wire_id = in.be16();
+  const uint16_t flags = in.be16();
+  const uint16_t questions = in.be16();
+  const uint16_t answers = in.be16();
+  in.skip(4);  // authority and additional record counts
+  if (!in.ok() || wire_id != id) return ParseResult::Invalid;
   if (!(flags & 0x8000) || (flags & 0x7800)) return ParseResult::Invalid;  // not a response to a standard query
-  const uint16_t questions = load16(m + 4), answers = load16(m + 6);
   if (questions != 1) return ParseResult::Invalid;
 
   // The question must be the one we asked.
-  char qname[kMaxName + 1];
-  uint32_t o = kHeaderSize;
-  if (!read_name(m, length, o, qname, sizeof(qname), &o) || o + 4 > length) return ParseResult::Invalid;
-  if (!names_equal(qname, name) || load16(m + o) != kTypeA || load16(m + o + 2) != kClassIn) return ParseResult::Invalid;
-  o += 4;
+  char qname_storage[kMaxName + 1];
+  const ArrayView<char> qname(qname_storage);
+  uint64_t o = kHeaderSize;
+  if (!read_name(m, o, qname, &o)) return ParseResult::Invalid;
+  in.seek(o);
+  const uint16_t qtype = in.be16(), qclass = in.be16();
+  if (!in.ok()) return ParseResult::Invalid;
+  if (!names_equal(qname.data(), name) || qtype != kTypeA || qclass != kClassIn) return ParseResult::Invalid;
+  o = in.position();
 
   if (flags & 0x0200) return ParseResult::Truncated;
   const uint8_t rcode = flags & 0x0F;
@@ -125,32 +145,36 @@ ParseResult parse_response(const uint8_t* m, uint32_t length, uint16_t id, const
   if (rcode != 0) return ParseResult::ServerError;
 
   // Follow the CNAME chain from the name asked for to an A record.
-  char target[kMaxName + 1];
-  copy_name(target, qname);
+  char target_storage[kMaxName + 1];
+  const ArrayView<char> target(target_storage);
+  if (!copy_name(target, qname.data())) return ParseResult::Invalid;
   uint32_t min_ttl = 0xFFFFFFFF;
   for (uint16_t i = 0; i < answers; ++i) {
-    char owner[kMaxName + 1];
-    if (!read_name(m, length, o, owner, sizeof(owner), &o) || o + 10 > length) return ParseResult::Invalid;
-    const uint16_t type = load16(m + o), klass = load16(m + o + 2);
-    const uint32_t ttl = load32(m + o + 4);
-    const uint16_t rdlength = load16(m + o + 8);
-    o += 10;
-    if (o + rdlength > length) return ParseResult::Invalid;
-    if (klass == kClassIn && names_equal(owner, target)) {
+    char owner_storage[kMaxName + 1];
+    if (!read_name(m, o, ArrayView<char>(owner_storage), &o)) return ParseResult::Invalid;
+    in.seek(o);
+    const uint16_t type = in.be16(), klass = in.be16();
+    const uint32_t ttl = in.be32();
+    const uint16_t rdlength = in.be16();
+    ConstByteView rdata = in.take(rdlength);  // the record data must lie inside the message
+    if (!in.ok()) return ParseResult::Invalid;
+    if (klass == kClassIn && names_equal(owner_storage, target.data())) {
       if (type == kTypeA && rdlength == 4) {
-        answer->address = Ipv4Address::read(m + o);
+        ByteReader address(rdata);
+        answer->address = Ipv4Address::read(address);
         answer->ttl = ttl < min_ttl ? ttl : min_ttl;
         return ParseResult::Answer;
       }
       if (type == kTypeCname) {  // the name is an alias: from here on look for the target's records
-        uint32_t unused;
-        char next[kMaxName + 1];
-        if (!read_name(m, length, o, next, sizeof(next), &unused)) return ParseResult::Invalid;
-        copy_name(target, next);
+        uint64_t unused;
+        char next_storage[kMaxName + 1];
+        // The target name may use compression pointers into the whole message, so it is read from there.
+        if (!read_name(m, in.position() - rdlength, ArrayView<char>(next_storage), &unused)) return ParseResult::Invalid;
+        if (!copy_name(target, next_storage)) return ParseResult::Invalid;
         if (ttl < min_ttl) min_ttl = ttl;
       }
     }
-    o += rdlength;
+    o = in.position();
   }
   return ParseResult::NoAddress;
 }

@@ -21,18 +21,15 @@
 namespace hardware::xhci {
 
 bool ProducerRing::init(allocators::IAllocator& allocator) {
-  trbs_ = static_cast<Trb*>(allocator.allocate_aligned(kRingTrbs * sizeof(Trb), 4096));
-  if (!trbs_) return false;
-  __builtin_memset(trbs_, 0, kRingTrbs * sizeof(Trb));
+  trbs_ = allocate_view<Trb>(allocator, kRingTrbs, 4096);
+  if (trbs_.empty()) return false;
+  __builtin_memset(trbs_.data(), 0, trbs_.size_bytes());
   index_ = 0;
   cycle_ = 1;
   return true;
 }
 
-void ProducerRing::release(allocators::IAllocator& allocator) {
-  allocator.deallocate(trbs_);
-  trbs_ = nullptr;
-}
+void ProducerRing::release(allocators::IAllocator& allocator) { release_view(allocator, trbs_); }
 
 uint64_t ProducerRing::next_address() {
   wrap_if_needed();
@@ -62,26 +59,24 @@ void ProducerRing::wrap_if_needed() {
 }
 
 bool EventRing::init(allocators::IAllocator& allocator) {
-  trbs_ = static_cast<Trb*>(allocator.allocate_aligned(kRingTrbs * sizeof(Trb), 4096));
-  table_ = static_cast<SegmentEntry*>(allocator.allocate_aligned(sizeof(SegmentEntry), 64));
-  if (!trbs_ || !table_) {
+  trbs_ = allocate_view<Trb>(allocator, kRingTrbs, 4096);
+  table_ = allocate_view<SegmentEntry>(allocator, 1, 64);
+  if (trbs_.empty() || table_.empty()) {
     release(allocator);
     return false;
   }
-  __builtin_memset(trbs_, 0, kRingTrbs * sizeof(Trb));
-  table_->base = address();
-  table_->size = kRingTrbs;
-  table_->reserved = 0;
+  __builtin_memset(trbs_.data(), 0, trbs_.size_bytes());
+  table_[0].base = address();
+  table_[0].size = kRingTrbs;
+  table_[0].reserved = 0;
   index_ = 0;
   cycle_ = 1;
   return true;
 }
 
 void EventRing::release(allocators::IAllocator& allocator) {
-  allocator.deallocate(trbs_);
-  allocator.deallocate(table_);
-  trbs_ = nullptr;
-  table_ = nullptr;
+  release_view(allocator, trbs_);
+  release_view(allocator, table_);
 }
 
 bool EventRing::pop(Trb* out) {

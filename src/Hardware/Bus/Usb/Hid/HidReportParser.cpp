@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Bus/Usb/Hid/HidReportParser.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace hardware {
 
@@ -65,26 +66,28 @@ void assign(HidField& field, const State& s, uint32_t bit_offset, bool relative)
 }
 }  // namespace
 
-bool parse_hid_pointer(const uint8_t* d, uint16_t length, HidPointerLayout* out) {
-  if (!d || !out) return false;
+bool parse_hid_pointer(ConstByteView descriptor, HidPointerLayout* out) {
+  if (!out) return false;
   *out = HidPointerLayout{};
 
   State s;
   uint32_t bit_offset = 0;  // position within the report of the next Input field
-  for (uint16_t i = 0; i < length;) {
-    const uint8_t prefix = d[i];
-    if (prefix == 0xFE) {  // long item: skip it whole
-      if (i + 1 >= length) break;
-      i += 3 + d[i + 1];
+  ByteReader in(descriptor);
+  while (!in.at_end()) {
+    const uint8_t prefix = in.u8();
+    if (prefix == 0xFE) {  // long item: a size byte, a tag byte, then the data; skip it whole
+      const uint8_t long_size = in.u8();
+      in.skip(1 + long_size);
+      if (!in.ok()) break;
       continue;
     }
     const uint32_t size = (prefix & 3) == 3 ? 4 : (prefix & 3);
     const uint8_t type = (prefix >> 2) & 3;  // 0 main, 1 global, 2 local
     const uint8_t tag = prefix >> 4;
-    if (i + 1 + size > length) break;
+    ConstByteView item_data = in.take(size);
+    if (!in.ok()) break;  // the item runs past the end of the descriptor
     uint32_t data = 0;
-    for (uint32_t b = 0; b < size; ++b) data |= uint32_t{d[i + 1 + b]} << (8 * b);
-    i += 1 + size;
+    for (uint32_t b = 0; b < size; ++b) data |= uint32_t{item_data[b]} << (8 * b);
 
     if (type == 1) {  // global
       switch (tag) {
@@ -113,13 +116,14 @@ bool parse_hid_pointer(const uint8_t* d, uint16_t length, HidPointerLayout* out)
         // Reports with an ID carry it as a leading byte; only one ID is supported.
         const uint32_t base = s.report_id ? bit_offset + 8 : bit_offset;
         if (!constant && variable && s.report_size) {
+          const ArrayView<const uint16_t> usages(s.usages, s.usage_count);
           for (uint32_t n = 0; n < s.report_count; ++n) {
             uint16_t usage = 0;
             if (s.has_range) usage = s.usage_min + n;
-            else if (s.usage_count) usage = s.usages[n < s.usage_count ? n : s.usage_count - 1];
+            else if (!usages.empty()) usage = usages[n < usages.size() ? n : usages.size() - 1];
             const uint32_t at = base + n * s.report_size;
-            if (s.usage_page == kPageButton && usage >= 1 && usage <= 3) {
-              assign(out->buttons[usage - 1], s, at, false);
+            if (s.usage_page == kPageButton && usage >= 1 && usage <= out->buttons().size()) {
+              assign(out->buttons()[usage - 1], s, at, false);
             } else if (s.usage_page == kPageGenericDesktop) {
               if (usage == kUsageX) assign(out->x, s, at, relative);
               else if (usage == kUsageY) assign(out->y, s, at, relative);
@@ -137,11 +141,10 @@ bool parse_hid_pointer(const uint8_t* d, uint16_t length, HidPointerLayout* out)
   return out->valid;
 }
 
-int32_t hid_extract(const uint8_t* report, uint16_t report_length, const HidField& f,
-                    uint8_t report_id) {
+int32_t hid_extract(ConstByteView report, const HidField& f, uint8_t report_id) {
   if (!f.valid || f.bit_size == 0 || f.bit_size > 32) return 0;
-  if (report_id && (report_length == 0 || report[0] != report_id)) return 0;
-  if ((f.bit_offset + f.bit_size + 7) / 8 > report_length) return 0;
+  if (report_id && (report.empty() || report[0] != report_id)) return 0;
+  if ((f.bit_offset + f.bit_size + 7) / 8 > report.size()) return 0;
 
   uint64_t raw = 0;
   for (uint32_t b = 0; b < f.bit_size; ++b) {

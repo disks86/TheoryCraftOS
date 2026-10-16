@@ -18,21 +18,17 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ByteStream.hpp"
 
-// Types and byte-order helpers shared by the network stack. Everything on the
-// wire is big-endian; the helpers read and write it byte by byte, so they work
-// on unaligned buffers and on any host.
+// Types shared by the network stack. Everything on the wire is big-endian;
+// packets are read and written through ByteReader / ByteWriter, which check
+// every access against the packet's bounds.
 namespace network {
 
-inline uint16_t load16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
-inline uint32_t load32(const uint8_t* p) {
+inline uint32_t load32(const uint8_t (&p)[4]) {  // a fixed 4-byte array: always in bounds
   return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3];
 }
-inline void store16(uint8_t* p, uint16_t v) {
-  p[0] = static_cast<uint8_t>(v >> 8);
-  p[1] = static_cast<uint8_t>(v);
-}
-inline void store32(uint8_t* p, uint32_t v) {
+inline void store32(uint8_t (&p)[4], uint32_t v) {
   p[0] = static_cast<uint8_t>(v >> 24);
   p[1] = static_cast<uint8_t>(v >> 16);
   p[2] = static_cast<uint8_t>(v >> 8);
@@ -48,10 +44,13 @@ struct Ipv4Address {
     store32(a.octets, v);
     return a;
   }
-  static Ipv4Address read(const uint8_t* p) { return {{p[0], p[1], p[2], p[3]}}; }
-  void write(uint8_t* p) const {
-    for (int i = 0; i < 4; ++i) p[i] = octets[i];
+  // From / to a stream (all zero and the stream in error if there are too few bytes).
+  static Ipv4Address read(ByteReader& in) {
+    Ipv4Address a{};
+    in.read_into(ByteView(a.octets));
+    return a;
   }
+  void write(ByteWriter& out) const { out.bytes(ConstByteView(octets)); }
 
   uint32_t value() const { return load32(octets); }  // a.b.c.d as one integer, a in the top byte
   bool operator==(const Ipv4Address& o) const { return value() == o.value(); }

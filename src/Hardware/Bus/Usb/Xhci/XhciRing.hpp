@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Hardware/Bus/Usb/Xhci/XhciRegisters.hpp"
 
 namespace hardware::xhci {
@@ -31,7 +32,7 @@ class ProducerRing {
   bool init(allocators::IAllocator& allocator);
   void release(allocators::IAllocator& allocator);
 
-  uint64_t address() const { return reinterpret_cast<uint64_t>(trbs_); }
+  uint64_t address() const { return reinterpret_cast<uint64_t>(trbs_.data()); }
   uint32_t cycle() const { return cycle_; }
 
   // Appends a TRB (the cycle bit is added) and returns its address.
@@ -42,7 +43,7 @@ class ProducerRing {
 
  private:
   void wrap_if_needed();
-  Trb* trbs_ = nullptr;
+  ArrayView<Trb> trbs_;  // kRingTrbs entries; every index below is checked against it
   uint32_t index_ = 0;
   uint32_t cycle_ = 1;
 };
@@ -53,8 +54,8 @@ class EventRing {
   bool init(allocators::IAllocator& allocator);
   void release(allocators::IAllocator& allocator);
 
-  uint64_t address() const { return reinterpret_cast<uint64_t>(trbs_); }
-  uint64_t segment_table_address() const { return reinterpret_cast<uint64_t>(table_); }
+  uint64_t address() const { return reinterpret_cast<uint64_t>(trbs_.data()); }
+  uint64_t segment_table_address() const { return reinterpret_cast<uint64_t>(table_.data()); }
   // Address of the next TRB to consume (the event ring dequeue pointer).
   uint64_t dequeue_address() const { return address() + uint64_t{index_} * sizeof(Trb); }
 
@@ -67,8 +68,8 @@ class EventRing {
     uint32_t reserved;
   };
 
-  Trb* trbs_ = nullptr;
-  SegmentEntry* table_ = nullptr;
+  ArrayView<Trb> trbs_;
+  ArrayView<SegmentEntry> table_;  // one entry
   uint32_t index_ = 0;
   uint32_t cycle_ = 1;
 };

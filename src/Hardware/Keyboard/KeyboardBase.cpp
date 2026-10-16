@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Keyboard/KeyboardBase.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -26,7 +27,7 @@ void KeyboardBase::push(uint8_t usage, bool pressed) {
     modifiers_ = pressed ? (modifiers_ | bit) : (modifiers_ & ~bit);
   }
   if (count_ == kCapacity) return;  // drop on overflow
-  queue_[(head_ + count_) % kCapacity] = {usage, pressed};
+  ArrayView<KeyEvent>{queue_}[(head_ + count_) % kCapacity] = KeyEvent{usage, pressed};
   ++count_;
 }
 
@@ -34,7 +35,7 @@ bool KeyboardBase::poll(KeyEvent* out) {
   kernel::ScopedMutex guard(mutex_);
   if (count_ == 0) fetch();
   if (count_ == 0 || !out) return false;
-  *out = queue_[head_];
+  *out = ArrayView<KeyEvent>(queue_)[head_];
   head_ = (head_ + 1) % kCapacity;
   --count_;
   return true;

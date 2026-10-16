@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "Kernel/Sync.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -34,21 +35,22 @@ class StorageDeviceBase : public IStorageDevice {
 
   StorageInfo info() const override { return info_; }
   StorageStatistics statistics() const override { return stats_; }
-  bool read(uint64_t lba, uint32_t count, void* buffer) override;
-  bool write(uint64_t lba, uint32_t count, const void* buffer) override;
+  bool read(uint64_t lba, ByteView buffer) override;
+  bool write(uint64_t lba, ConstByteView buffer) override;
   bool flush() override;
 
  protected:
   StorageDeviceBase(allocators::IAllocator& allocator, efi::SystemTable* st) : allocator_(allocator), st_(st) {}
   ~StorageDeviceBase() { release_bounce(); }
 
-  // Moves `blocks` (at most max_blocks()) between the medium and `dma`.
-  virtual bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) = 0;
+  // Moves `blocks` (at most max_blocks()) between the medium and `dma`, which is
+  // exactly blocks * block_size bytes of page-aligned, device-reachable memory.
+  virtual bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) = 0;
   virtual bool flush_cache() { return true; }
 
   bool prepare_bounce();  // needs info_.block_size
   void release_bounce();
-  uint32_t max_blocks() const { return bounce_bytes_ / info_.block_size; }
+  uint32_t max_blocks() const { return static_cast<uint32_t>(bounce_.size() / info_.block_size); }
 
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;
@@ -57,11 +59,10 @@ class StorageDeviceBase : public IStorageDevice {
   StorageStatistics stats_;
 
  private:
-  bool run(bool write, uint64_t lba, uint32_t count, uint8_t* buffer);
+  bool run(bool write, uint64_t lba, ByteView into, ConstByteView from);
 
   kernel::Mutex mutex_;  // one request at a time per device
-  uint8_t* bounce_ = nullptr;
-  uint32_t bounce_bytes_ = 0;
+  ByteView bounce_;  // kBounceBytes of device-reachable memory
 };
 
 }  // namespace hardware

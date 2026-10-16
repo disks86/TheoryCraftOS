@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
@@ -49,8 +50,8 @@ class Rtl8139NetworkInterface final : public INetworkInterface {
 
   MacAddress mac_address() const override { return mac_; }
   bool link_up() const override;
-  bool transmit(const uint8_t* frame, uint32_t length) override;
-  bool receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) override;
+  bool transmit(ConstByteView frame) override;
+  bool receive(ByteView buffer, uint32_t* length) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:
@@ -67,8 +68,8 @@ class Rtl8139NetworkInterface final : public INetworkInterface {
   efi::SystemTable* st_;
 
   uint64_t registers_ = 0;
-  uint8_t* receive_ring_ = nullptr;   // ring plus slack so a frame can run past the end
-  uint8_t* transmit_buffers_ = nullptr;
+  ByteView receive_ring_;       // ring plus slack so a frame can run past the end
+  ByteView transmit_buffers_;
   uint32_t receive_offset_ = 0;       // where the next frame starts in the ring
   uint32_t transmit_next_ = 0;        // slot to use next
   bool transmit_used_[kTransmitSlots] = {};

@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -45,13 +46,15 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   ~FramebufferGpu() = default;
 
   // bgr: memory order is B, G, R, x (the usual layout); otherwise R, G, B, x.
-  void set_framebuffer(void* base, uint32_t width, uint32_t height, uint32_t pitch_bytes, bool bgr);
+  // `memory` is the whole framebuffer; it must cover height * pitch_bytes bytes or no drawing happens.
+  void set_framebuffer(ByteView memory, uint32_t width, uint32_t height, uint32_t pitch_bytes, bool bgr);
 
  private:
   uint32_t native(uint32_t color) const;
-  uint32_t* row(uint32_t y) const;
+  // Row y as a view of `width_` pixels (checked against the framebuffer memory).
+  ArrayView<uint32_t> row(uint32_t y) const;
 
-  uint8_t* base_ = nullptr;
+  ByteView memory_;
   uint32_t width_ = 0, height_ = 0, pitch_ = 0;
   bool bgr_ = true;
 };

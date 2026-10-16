@@ -20,6 +20,7 @@
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
 #include "ObjectContainer/List.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
@@ -45,30 +46,23 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
   void shutdown() override;
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
+  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
   bool flush_cache() override;
 
  private:
-  struct Cbw {
-    uint32_t signature, tag, data_length;
-    uint8_t flags, lun, cb_length;
-    uint8_t cb[16];
-  } __attribute__((packed));
-  struct Csw {
-    uint32_t signature, tag, residue;
-    uint8_t status;
-  } __attribute__((packed));
+  // Bulk-Only Transport wrappers (all fields little-endian), built and parsed with ByteWriter / ByteReader.
+  static constexpr uint32_t kCbwSize = 31, kCswSize = 13;
 
   enum class Result { Good, Failed, Error };  // command failed (sense available) / transport broke
-  Result command(const uint8_t* cdb, uint32_t cdb_length, void* data, uint32_t length, bool data_in);
-  bool run(const uint8_t* cdb, uint32_t cdb_length, void* data, uint32_t length, bool data_in);
+  Result command(ConstByteView cdb, ByteView data, bool data_in);
+  bool run(ConstByteView cdb, ByteView data, bool data_in);
   void recover();
 
   IUsbHostController& host_;
   uint32_t port_;
   uint8_t interface_, in_, out_;
   uint16_t in_max_packet_, out_max_packet_;
-  uint8_t* wire_ = nullptr;  // command and status wrappers, in a 64 KiB-aligned page
+  ByteView wire_;  // command and status wrappers, sense and identify data: one 64 KiB-aligned page
   uint32_t tag_ = 1;
   bool optical_ = false;
 };

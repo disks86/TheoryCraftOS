@@ -38,11 +38,11 @@ class INetworkInterface : public IHardware {
   // than kEthernetMinFrame are padded. False if the frame is empty or longer
   // than kEthernetMaxFrame, or there is no room in the transmit queue right now
   // (try again after receiving or a short wait).
-  virtual bool transmit(const uint8_t* frame, uint32_t length) = 0;
-  // Copies the oldest received frame into `buffer` (at most `capacity` bytes,
-  // the rest is dropped) and stores its full length in *length. False when no
+  virtual bool transmit(ConstByteView frame) = 0;
+  // Copies the oldest received frame into `buffer` (as much as fits, the rest is
+  // dropped) and stores its full length in *length. False when no
   // frame is waiting.
-  virtual bool receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) = 0;
+  virtual bool receive(ByteView buffer, uint32_t* length) = 0;
 
   virtual NetworkStatistics statistics() const = 0;
 

@@ -22,6 +22,7 @@
 #include "Hardware/Bus/Usb/Xhci/IXhciController.hpp"
 #include "Hardware/Bus/Usb/Xhci/XhciRing.hpp"
 #include "Kernel/Sync.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -51,20 +52,18 @@ class XhciController final : public IXhciController {
   uint32_t port_count() const override { return ports_; }
   bool port_info(uint32_t port, UsbPortInfo* out) const override;
   bool device_descriptor(uint32_t port, UsbDeviceDescriptor* out) const override;
-  bool configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity,
-                                uint16_t* length) const override;
+  bool configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const override;
   bool set_configuration(uint32_t port, uint8_t configuration) override;
   bool control_out(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
                    uint16_t index) override;
   bool control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
-                  uint16_t index, void* buffer, uint16_t length) override;
+                  uint16_t index,
+                  ByteView buffer) override;
   bool start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                           uint8_t interval) override;
-  bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
-                         uint16_t* length) override;
+  bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) override;
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
-  bool bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                     uint32_t* transferred) override;
+  bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
   bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
 
  private:
@@ -74,7 +73,7 @@ class XhciController final : public IXhciController {
     uint8_t context_id = 0;   // device context index used for doorbells
     uint16_t max_packet = 0;
     xhci::ProducerRing ring;
-    uint8_t* buffer = nullptr;
+    ByteView buffer;
     uint64_t pending_trb = 0;  // the TRB the controller is working on
     bool ready = false;        // a packet is waiting in buffer
     uint16_t received = 0;
@@ -94,8 +93,8 @@ class XhciController final : public IXhciController {
     uint8_t slot = 0;
     uint32_t speed_id = 0;
     uint16_t max_packet0 = 0;
-    uint8_t* output_context = nullptr;
-    uint8_t* input_context = nullptr;
+    ByteView output_context;  // 33 contexts each (input: control + slot + 31 endpoints)
+    ByteView input_context;
     xhci::ProducerRing control_ring;
     UsbDeviceDescriptor descriptor{};
     uint8_t config[256] = {};
@@ -133,7 +132,10 @@ class XhciController final : public IXhciController {
   uint64_t port_register(uint32_t port) const;
   bool wait_for(uint64_t address, uint32_t mask, uint32_t value, uint32_t timeout_ms);
   void delay_us(uint64_t us) const;
-  uint8_t* context_at(uint8_t* base, uint32_t index) const { return base + index * context_size_; }
+  // Context number `index` of a device or input context, as its 32-bit words (checked).
+  ArrayView<uint32_t> context_at(ByteView base, uint32_t index) const {
+    return base.subview(uint64_t{index} * context_size_, context_size_).cast<uint32_t>();
+  }
 
   const IPciBus& pci_;
   PciDeviceInfo device_;
@@ -150,7 +152,7 @@ class XhciController final : public IXhciController {
   uint8_t* scratchpad_pages_[32] = {};
   xhci::ProducerRing command_ring_;
   xhci::EventRing event_ring_;
-  uint8_t* buffer_ = nullptr;  // 4 KiB bounce buffer for control transfers
+  ByteView buffer_;  // 4 KiB bounce buffer for control transfers
   kernel::Mutex lock_;  // one thread in the controller at a time
   bool running_ = false;
   bool ac64_ = false;

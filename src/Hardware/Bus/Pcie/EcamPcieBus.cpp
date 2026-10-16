@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Bus/Pcie/EcamPcieBus.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace hardware {
 
@@ -31,17 +32,19 @@ constexpr uint32_t kMcfgHeaderSize = sizeof(AcpiTableHeader) + 8;  // 8 reserved
 }  // namespace
 
 bool EcamPcieBus::initialize() {
-  const AcpiTableHeader* mcfg = acpi_.find("MCFG");
-  if (!mcfg || mcfg->length < kMcfgHeaderSize + sizeof(McfgEntry)) return false;
+  const ConstByteView mcfg = acpi_.find("MCFG");
+  if (mcfg.size() < kMcfgHeaderSize + sizeof(McfgEntry)) return false;
 
-  const auto* entries = reinterpret_cast<const McfgEntry*>(
-      reinterpret_cast<const uint8_t*>(mcfg) + kMcfgHeaderSize);
-  const uint32_t count = (mcfg->length - kMcfgHeaderSize) / sizeof(McfgEntry);
-  for (uint32_t i = 0; i < count; ++i) {
-    if (entries[i].segment != 0) continue;
-    base_ = entries[i].base_address;
-    first_bus_ = entries[i].start_bus;
-    last_bus_ = entries[i].end_bus;
+  ByteReader table(mcfg.dropped(kMcfgHeaderSize));  // the allocation structures follow the header
+  while (table.remaining() >= sizeof(McfgEntry)) {
+    const uint64_t base_address = table.le64();
+    const uint16_t segment = table.le16();
+    const uint8_t start_bus = table.u8(), end_bus = table.u8();
+    table.skip(4);  // reserved
+    if (segment != 0) continue;
+    base_ = base_address;
+    first_bus_ = start_bus;
+    last_bus_ = end_bus;
     scan(first_bus_, last_bus_);
     return true;
   }

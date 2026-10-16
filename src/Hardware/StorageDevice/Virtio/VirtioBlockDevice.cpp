@@ -76,7 +76,7 @@ void VirtioBlockDevice::shutdown() {
   release_bounce();
 }
 
-bool VirtioBlockDevice::submit(uint32_t type, uint64_t sector, void* data, uint32_t length) {
+bool VirtioBlockDevice::submit(uint32_t type, uint64_t sector, ByteView data) {
   if (!started_) return false;
   request_->type = type;
   request_->reserved = 0;
@@ -85,7 +85,7 @@ bool VirtioBlockDevice::submit(uint32_t type, uint64_t sector, void* data, uint3
   Virtqueue::Segment chain[3];
   uint16_t n = 0;
   chain[n++] = {request_, sizeof(Request), false};
-  if (length) chain[n++] = {data, length, type == kTypeRead};
+  if (!data.empty()) chain[n++] = {data.data(), static_cast<uint32_t>(data.size()), type == kTypeRead};
   chain[n++] = {status_, 1, true};
   queue_.post_chain(0, chain, n);
   transport_.notify(0);
@@ -96,13 +96,13 @@ bool VirtioBlockDevice::submit(uint32_t type, uint64_t sector, void* data, uint3
   return *reinterpret_cast<volatile uint8_t*>(status_) == kStatusOk;
 }
 
-bool VirtioBlockDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
+bool VirtioBlockDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {
   const uint32_t scale = info_.block_size / kSectorBytes;
-  return submit(write ? kTypeWrite : kTypeRead, lba * scale, dma, blocks * info_.block_size);
+  return submit(write ? kTypeWrite : kTypeRead, lba * scale, dma);
 }
 
 bool VirtioBlockDevice::flush_cache() {
-  return !has_flush_ || submit(kTypeFlush, 0, nullptr, 0);
+  return !has_flush_ || submit(kTypeFlush, 0, ByteView());
 }
 
 }  // namespace hardware

@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Mouse/MouseBase.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -27,7 +28,7 @@ void MouseBase::push(const MouseEvent& event) {
     e.max_x = max_x();
     e.max_y = max_y();
   }
-  queue_[(head_ + count_) % kCapacity] = e;
+  ArrayView<MouseEvent>{queue_}[(head_ + count_) % kCapacity] = e;
   ++count_;
 }
 
@@ -35,7 +36,7 @@ bool MouseBase::poll(MouseEvent* out) {
   kernel::ScopedMutex guard(mutex_);
   if (count_ == 0) fetch();
   if (count_ == 0 || !out) return false;
-  *out = queue_[head_];
+  *out = ArrayView<MouseEvent>(queue_)[head_];
   head_ = (head_ + 1) % kCapacity;
   --count_;
   return true;

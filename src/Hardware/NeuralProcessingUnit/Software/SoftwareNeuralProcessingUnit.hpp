@@ -47,25 +47,25 @@ class SoftwareNeuralProcessingUnit : public INeuralProcessingUnit {
   uint32_t compute_units() const override { return cpu_.core_count(); }
   uint64_t memory_bytes() const override { return 0; }
 
-  bool matmul_i8(const int8_t* a, const int8_t* b, int32_t* c, uint32_t m, uint32_t n,
+  bool matmul_i8(ArrayView<const int8_t> a, ArrayView<const int8_t> b, ArrayView<int32_t> c, uint32_t m, uint32_t n,
                  uint32_t k) override;
-  bool matmul_f32(const float* a, const float* b, float* c, uint32_t m, uint32_t n,
+  bool matmul_f32(ArrayView<const float> a, ArrayView<const float> b, ArrayView<float> c, uint32_t m, uint32_t n,
                   uint32_t k) override;
-  bool activate(float* data, uint32_t count, NpuActivation kind) override;
-  bool softmax(float* data, uint32_t count) override;
+  bool activate(ArrayView<float> data, NpuActivation kind) override;
+  bool softmax(ArrayView<float> data) override;
 
  private:
   template <class In, class Out>
   struct MatmulJob {
-    const In* a;
-    const In* b;
-    Out* c;
+    ArrayView<const In> a;
+    ArrayView<const In> b;
+    ArrayView<Out> c;
     uint32_t n, k;
     uint32_t row_begin, row_end;
   };
 
   template <class In, class Out>
-  bool matmul(const In* a, const In* b, Out* c, uint32_t m, uint32_t n, uint32_t k);
+  bool matmul(ArrayView<const In> a, ArrayView<const In> b, ArrayView<Out> c, uint32_t m, uint32_t n, uint32_t k);
 
   ICentralProcessingUnit& cpu_;
   scheduling::ICPUScheduler& scheduler_;

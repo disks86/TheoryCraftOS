@@ -102,7 +102,7 @@ void IdeStorageDevice::discover(const SharedPointer<IdeController>& controller, 
   }
 }
 
-bool IdeStorageDevice::identify(uint8_t command, uint16_t* data) {
+bool IdeStorageDevice::identify(uint8_t command, ArrayView<uint16_t> data) {
   reg_write(kSectorCount, 0);
   reg_write(kLbaLow, 0);
   reg_write(kLbaMid, 0);
@@ -113,7 +113,7 @@ bool IdeStorageDevice::identify(uint8_t command, uint16_t* data) {
   if (!wait_not_busy(2000)) return false;
   if (!wait_data_ready()) return false;
   const IoPort port(channel_.command_base + kData);
-  for (int i = 0; i < 256; ++i) data[i] = port.read16();
+  for (uint16_t& word : data) word = port.read16();  // one block of 256 words
   return true;
 }
 
@@ -122,15 +122,17 @@ bool IdeStorageDevice::initialize() {
   select(0);
   if (reg_read(kStatus) == 0xFF) return false;  // floating bus: no controller channel
   // Signature after selection: ATAPI drives answer 0x14/0xEB.
-  uint16_t id[256];
+  uint16_t id_storage[256];
+  const ArrayView<uint16_t> id(id_storage);
   if (!identify(kIdentify, id)) {
     if (reg_read(kLbaMid) != 0x14 || reg_read(kLbaHigh) != 0xEB) return false;
     atapi_ = true;
     select(0);
     if (!identify(kIdentifyPacket, id)) return false;
   }
-  copy_device_string(info_.serial, sizeof(info_.serial), reinterpret_cast<uint8_t*>(id + 10), 20, true);
-  copy_device_string(info_.model, sizeof(info_.model), reinterpret_cast<uint8_t*>(id + 27), 40, true);
+  const ConstByteView id_bytes(reinterpret_cast<const uint8_t*>(id_storage), sizeof(id_storage));
+  copy_device_string(ArrayView<char>(info_.serial), id_bytes.subview(20, 20), true);  // words 10-19
+  copy_device_string(ArrayView<char>(info_.model), id_bytes.subview(54, 40), true);   // words 27-46
   info_.removable = id[0] & (1u << 7);
 
   if (atapi_) {
@@ -139,10 +141,11 @@ bool IdeStorageDevice::initialize() {
     info_.removable = true;
     uint8_t buffer[8];
     for (int attempt = 0; attempt < 3; ++attempt) {
-      uint8_t capacity[12] = {scsi::kReadCapacity10};
-      if (atapi_command(capacity, buffer, 8)) {
-        info_.block_count = uint64_t{scsi::be32(buffer)} + 1;
-        info_.block_size = scsi::be32(buffer + 4);
+      const uint8_t capacity[12] = {scsi::kReadCapacity10};
+      uint64_t last = 0;
+      if (atapi_command(ConstByteView(capacity), ByteView(buffer)) &&
+          scsi::parse_capacity10(ConstByteView(buffer), &last, &info_.block_size)) {
+        info_.block_count = last + 1;
         break;
       }
     }
@@ -162,7 +165,9 @@ void IdeStorageDevice::shutdown() {
   controller_->shutdown();
 }
 
-bool IdeStorageDevice::atapi_command(const uint8_t* cdb, void* data, uint32_t bytes) {
+bool IdeStorageDevice::atapi_command(ConstByteView cdb, ByteView data) {
+  if (cdb.size() != 12) return false;
+  const uint32_t bytes = static_cast<uint32_t>(data.size());
   select(0);
   if (!wait_not_busy(2000)) return false;
   reg_write(kFeatures, 0);  // PIO
@@ -172,39 +177,39 @@ bool IdeStorageDevice::atapi_command(const uint8_t* cdb, void* data, uint32_t by
   for (int i = 0; i < 4; ++i) status();
   if (!wait_data_ready()) return false;
   const IoPort port(channel_.command_base + kData);
-  for (int i = 0; i < 6; ++i) port.write16(static_cast<uint16_t>(cdb[2 * i] | (cdb[2 * i + 1] << 8)));
+  ByteReader packet(cdb);
+  for (int i = 0; i < 6; ++i) port.write16(packet.le16());
 
-  uint8_t* out = static_cast<uint8_t*>(data);
-  uint32_t left = bytes;
+  uint64_t written = 0;
   while (true) {
     if (!wait_not_busy(10000)) return false;
     const uint8_t s = status();
     if (s & (kStatusError | kStatusFault)) return false;
     if (!(s & kStatusDrq)) break;  // command finished
-    uint32_t chunk = reg_read(kLbaMid) | (uint32_t{reg_read(kLbaHigh)} << 8);
+    const uint32_t chunk = reg_read(kLbaMid) | (uint32_t{reg_read(kLbaHigh)} << 8);  // the drive's byte count
     for (uint32_t i = 0; i < chunk; i += 2) {
       const uint16_t w = port.read16();
-      if (left >= 2) {
-        out[0] = static_cast<uint8_t>(w);
-        out[1] = static_cast<uint8_t>(w >> 8);
-        out += 2;
-        left -= 2;
+      if (data.size() - written >= 2) {  // data beyond the buffer is read from the port and dropped
+        data[written] = static_cast<uint8_t>(w);
+        data[written + 1] = static_cast<uint8_t>(w >> 8);
+        written += 2;
       }
     }
   }
-  return left == 0;
+  return written == data.size();
 }
 
-bool IdeStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
+bool IdeStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {
   kernel::ScopedMutex guard(controller_->channel_mutex(channel_index_));
-  uint16_t* words = static_cast<uint16_t*>(dma);
   if (atapi_) {
     if (write) return false;
-    uint8_t cdb[12];
-    scsi::build_read_write(cdb, false, lba, blocks);
-    return atapi_command(cdb, dma, blocks * info_.block_size);
+    uint8_t cdb[16];
+    if (scsi::build_read_write(ByteView(cdb), false, lba, blocks) != 10) return false;  // a 12-byte packet holds READ(10) only
+    return atapi_command(ConstByteView(cdb).first(12), dma);
   }
   const IoPort port(channel_.command_base + kData);
+  ByteReader out_stream(dma);  // for writes: the words to send
+  uint64_t in_offset = 0;      // for reads: where the next word goes
   while (blocks > 0) {
     const uint32_t n = blocks < kPioSectorsPerCommand ? blocks : kPioSectorsPerCommand;
     if (!lba48_ && lba + n > 0x0FFFFFFF) return false;
@@ -223,8 +228,17 @@ bool IdeStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void*
     reg_write(kCommand, lba48_ ? (write ? kWriteSectorsExt : kReadSectorsExt) : (write ? kWriteSectors : kReadSectors));
     for (uint32_t s = 0; s < n; ++s) {
       if (!wait_data_ready()) return false;
-      if (write) for (int i = 0; i < 256; ++i) port.write16(*words++);
-      else for (int i = 0; i < 256; ++i) *words++ = port.read16();
+      if (write) {
+        for (int i = 0; i < 256; ++i) port.write16(out_stream.le16());
+        if (!out_stream.ok()) return false;
+      } else {
+        for (int i = 0; i < 256; ++i) {
+          const uint16_t w = port.read16();
+          dma[in_offset] = static_cast<uint8_t>(w);  // checked: the drive cannot make us write past the buffer
+          dma[in_offset + 1] = static_cast<uint8_t>(w >> 8);
+          in_offset += 2;
+        }
+      }
     }
     if (write && !wait_not_busy(5000)) return false;
     lba += n;

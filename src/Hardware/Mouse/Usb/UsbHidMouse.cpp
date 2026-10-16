@@ -42,10 +42,10 @@ HidPointerLayout boot_layout() {
   };
   l.x = field(1, 8);
   l.y = field(2, 8);
-  for (int b = 0; b < 3; ++b) {
-    l.buttons[b].valid = true;
-    l.buttons[b].bit_offset = b;
-    l.buttons[b].bit_size = 1;
+  for (uint64_t b = 0; b < l.buttons().size(); ++b) {
+    l.buttons()[b].valid = true;
+    l.buttons()[b].bit_offset = static_cast<uint32_t>(b);
+    l.buttons()[b].bit_size = 1;
   }
   return l;
 }
@@ -60,8 +60,8 @@ bool UsbHidMouse::initialize() {
                             ? interface_.report_descriptor_length : sizeof(descriptor);
   bool parsed = false;
   if (want && host_.control_in(port_, kClassInterfaceIn, kRequestGetDescriptor,
-                               uint16_t{kDescriptorReport} << 8, interface_.number, descriptor, want))
-    parsed = parse_hid_pointer(descriptor, want, &layout_);
+                               uint16_t{kDescriptorReport} << 8, interface_.number, ByteView(descriptor).first(want)))
+    parsed = parse_hid_pointer(ConstByteView(descriptor).first(want), &layout_);
   if (!parsed) {
     if (!interface_.is_boot_mouse()) return false;
     layout_ = boot_layout();
@@ -74,15 +74,16 @@ bool UsbHidMouse::initialize() {
 void UsbHidMouse::fetch() {
   uint8_t report[64];
   uint16_t length = 0;
-  while (host_.poll_interrupt_in(port_, interface_.endpoint_address, report, sizeof(report), &length)) {
+  while (host_.poll_interrupt_in(port_, interface_.endpoint_address, ByteView(report), &length)) {
     if (length > sizeof(report)) length = sizeof(report);
+    const ConstByteView received = ConstByteView(report).first(length);
     const uint8_t id = layout_.report_id;
     MouseEvent e{};
-    for (int b = 0; b < 3; ++b)
-      if (hid_extract(report, length, layout_.buttons[b], id)) e.buttons |= 1u << b;
+    for (uint64_t b = 0; b < layout_.buttons().size(); ++b)
+      if (hid_extract(received, layout_.buttons()[b], id)) e.buttons |= 1u << b;
 
-    const int32_t x = hid_extract(report, length, layout_.x, id);
-    const int32_t y = hid_extract(report, length, layout_.y, id);
+    const int32_t x = hid_extract(received, layout_.x, id);
+    const int32_t y = hid_extract(received, layout_.y, id);
     if (layout_.x.relative) {
       e.dx = x;
       e.dy = y;  // HID +y is down, like ours
@@ -92,7 +93,7 @@ void UsbHidMouse::fetch() {
       e.x = x < 0 ? 0 : static_cast<uint32_t>(x);
       e.y = y < 0 ? 0 : static_cast<uint32_t>(y);
     }
-    e.wheel = hid_extract(report, length, layout_.wheel, id);  // HID +wheel is away from the user
+    e.wheel = hid_extract(received, layout_.wheel, id);  // HID +wheel is away from the user
     push(e);
   }
 }

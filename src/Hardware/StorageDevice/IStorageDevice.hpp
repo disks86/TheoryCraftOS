@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/IHardware.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -51,10 +52,12 @@ class IStorageDevice : public IHardware {
   virtual StorageInfo info() const = 0;
   virtual StorageStatistics statistics() const = 0;
 
-  // Reads `count` blocks starting at `lba` into buffer (count * block_size bytes).
-  virtual bool read(uint64_t lba, uint32_t count, void* buffer) = 0;
-  // Writes `count` blocks; false for read-only media and on any device error.
-  virtual bool write(uint64_t lba, uint32_t count, const void* buffer) = 0;
+  // Reads buffer.size() / block_size blocks starting at `lba` into `buffer`. False
+  // if the size is not a whole number of blocks, the range is outside the device,
+  // or the device reports an error.
+  virtual bool read(uint64_t lba, ByteView buffer) = 0;
+  // Writes the blocks in `buffer`; false for read-only media and on any device error.
+  virtual bool write(uint64_t lba, ConstByteView buffer) = 0;
   // Forces the device's write cache to the medium.
   virtual bool flush() = 0;
 

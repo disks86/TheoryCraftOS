@@ -33,11 +33,11 @@ namespace hardware {
 class LegacyHostController : public IUsbHostController {
  public:
   bool device_descriptor(uint32_t port, UsbDeviceDescriptor* out) const override;
-  bool configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity, uint16_t* length) const override;
+  bool configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const override;
   bool set_configuration(uint32_t port, uint8_t configuration) override;
   bool control_out(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index) override;
   bool control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
-                  void* buffer, uint16_t length) override;
+                  ByteView buffer) override;
 
  protected:
   struct DeviceState {
@@ -58,10 +58,11 @@ class LegacyHostController : public IUsbHostController {
 
   // The device slot of a root port, or null if the port does not exist.
   virtual DeviceState* state(uint32_t port) const = 0;
-  // One control transfer on the device's default pipe. `data` (may be null when
-  // length is 0) is read from or written to by the transfer's data stage.
+  // One control transfer on the device's default pipe. With `data_in`, the data
+  // stage reads data.size() bytes (at most 4096) into `data`; otherwise there is no
+  // data stage and `data` is empty.
   virtual bool control_transfer(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
-                                void* data, uint16_t length, bool data_in) = 0;
+                                ByteView data, bool data_in) = 0;
   // Creates the default pipe at address 0 and the state's max_packet0.
   virtual bool open_control_pipe(uint32_t port) = 0;
   virtual void update_control_pipe(uint32_t port, uint8_t address, uint16_t max_packet) = 0;

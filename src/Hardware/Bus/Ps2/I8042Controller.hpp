@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "Hardware/IHardware.hpp"
 #include "Hardware/IoPort.hpp"
+#include "Utility/ArrayView.hpp"
 #include "Kernel/RawSpinLock.hpp"
 
 namespace hardware {
@@ -53,11 +54,11 @@ class I8042Controller final : public IHardware {
     uint8_t bytes[kCapacity] = {};
     uint32_t head = 0, count = 0;
     void push(uint8_t b) {
-      if (count < kCapacity) bytes[(head + count++) % kCapacity] = b;
+      if (count < kCapacity) ArrayView<uint8_t>{bytes}[(head + count++) % kCapacity] = b;
     }
     bool pop(uint8_t* out) {
       if (!count) return false;
-      *out = bytes[head];
+      *out = ArrayView<uint8_t>(bytes)[head];
       head = (head + 1) % kCapacity;
       --count;
       return true;

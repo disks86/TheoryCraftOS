@@ -55,10 +55,10 @@ void SystemInput::find_usb() {
     for (uint32_t port = 0; port < host->port_count(); ++port) {
       uint8_t config[256];
       uint16_t length = 0;
-      if (!host->configuration_descriptor(port, config, sizeof(config), &length)) continue;
+      if (!host->configuration_descriptor(port, ByteView(config), &length)) continue;  // length is the full size
 
       UsbHidInterface interfaces[4];
-      uint32_t count = find_hid_interfaces(config, length, interfaces, 4);
+      uint32_t count = find_hid_interfaces(ConstByteView(config).at_most(length), ArrayView<UsbHidInterface>(interfaces));
       if (count > 4) count = 4;
       for (uint32_t i = 0; i < count; ++i) {
         const UsbHidInterface& iface = interfaces[i];

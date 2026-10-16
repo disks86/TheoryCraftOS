@@ -50,14 +50,12 @@ uint32_t low32(const void* p) { return static_cast<uint32_t>(reinterpret_cast<ui
 bool below_4g(const void* p, uint64_t length) { return reinterpret_cast<uint64_t>(p) + length <= 0x100000000ull; }
 }  // namespace
 
-void* OhciController::low_allocate(uint64_t size, uint64_t alignment) {
-  void* p = allocator_.allocate_aligned(size, alignment);
-  if (p && !below_4g(p, size)) {
-    allocator_.deallocate(p);
-    return nullptr;
-  }
-  if (p) __builtin_memset(p, 0, size);
-  return p;
+template <class T>
+ArrayView<T> OhciController::low_allocate(uint64_t count, uint64_t alignment) {
+  ArrayView<T> memory = allocate_view<T>(allocator_, count, alignment);
+  if (!memory.empty() && !below_4g(memory.data(), memory.size_bytes())) release_view(allocator_, memory);  // out of the controller's reach
+  if (!memory.empty()) __builtin_memset(memory.data(), 0, memory.size_bytes());
+  return memory;
 }
 
 // ---------------------------------------------------------------- bring-up
@@ -84,13 +82,14 @@ bool OhciController::initialize() {
   for (int i = 0; i < 100 && (reg(kCommandStatus) & kCmdReset); ++i) delay_us(100);
   if (reg(kCommandStatus) & kCmdReset) return shutdown(), false;
 
-  hcca_ = static_cast<Hcca*>(low_allocate(sizeof(Hcca), 256));
-  control_head_ = static_cast<Ed*>(low_allocate(sizeof(Ed), 16));
-  bulk_head_ = static_cast<Ed*>(low_allocate(sizeof(Ed), 16));
-  pool_ = static_cast<Td*>(low_allocate(sizeof(Td) * kPoolTds, 16));
-  control_buffer_ = static_cast<uint8_t*>(low_allocate(8192, 4096));
-  bounce_ = static_cast<uint8_t*>(low_allocate(65536, 4096));
-  if (!hcca_ || !control_head_ || !bulk_head_ || !pool_ || !control_buffer_ || !bounce_) return shutdown(), false;
+  hcca_ = low_allocate<Hcca>(1, 256).data();
+  control_head_ = low_allocate<Ed>(1, 16).data();
+  bulk_head_ = low_allocate<Ed>(1, 16).data();
+  pool_ = low_allocate<Td>(kPoolTds, 16);
+  control_buffer_ = low_allocate<uint8_t>(8192, 4096);
+  bounce_ = low_allocate<uint8_t>(65536, 4096);
+  if (!hcca_ || !control_head_ || !bulk_head_ || pool_.empty() || control_buffer_.empty() || bounce_.empty())
+    return shutdown(), false;
   control_head_->flags = bulk_head_->flags = kEdSkip;  // anchors only, never run
 
   // The controller is suspended after the reset and must be operational within 2 ms.
@@ -132,13 +131,11 @@ void OhciController::shutdown() {
   allocator_.deallocate(hcca_);
   allocator_.deallocate(control_head_);
   allocator_.deallocate(bulk_head_);
-  allocator_.deallocate(pool_);
-  allocator_.deallocate(control_buffer_);
-  allocator_.deallocate(bounce_);
+  release_view(allocator_, pool_);
+  release_view(allocator_, control_buffer_);
+  release_view(allocator_, bounce_);
   hcca_ = nullptr;
   control_head_ = bulk_head_ = periodic_first_ = nullptr;
-  pool_ = nullptr;
-  control_buffer_ = bounce_ = nullptr;
 
   if (owns_controller_) {
     owns_controller_ = false;
@@ -178,9 +175,9 @@ bool OhciController::create_pipe(Device& d, Pipe& p, List list, uint8_t endpoint
   p.list = list;
   p.address = endpoint_address;
   p.max_packet = max_packet;
-  p.ed = static_cast<Ed*>(low_allocate(sizeof(Ed), 16));
-  p.spare[0] = static_cast<Td*>(low_allocate(sizeof(Td), 16));
-  p.spare[1] = static_cast<Td*>(low_allocate(sizeof(Td), 16));
+  p.ed = low_allocate<Ed>(1, 16).data();
+  p.spare[0] = low_allocate<Td>(1, 16).data();
+  p.spare[1] = low_allocate<Td>(1, 16).data();
   if (!p.ed || !p.spare[0] || !p.spare[1]) {
     free_pipe(p);
     return false;
@@ -243,15 +240,15 @@ void OhciController::free_pipe(Pipe& p) {
   allocator_.deallocate(p.ed);
   allocator_.deallocate(p.spare[0]);
   allocator_.deallocate(p.spare[1]);
-  allocator_.deallocate(p.buffer);
+  release_view(allocator_, p.buffer);
   p = Pipe{};
 }
 
-void OhciController::fill_td(Td* td, uint32_t direction, uint32_t toggle, uint32_t bytes, const void* buffer,
-                             bool round) {
+void OhciController::fill_td(Td* td, uint32_t direction, uint32_t toggle, ConstByteView buffer, bool round) {
+  const uint64_t bytes = buffer.size();
   td->flags = (round ? kTdRounding : 0) | (direction << 19) | kTdNoInterrupt | (toggle << 24) | kTdNotAccessed;
-  td->current_buffer = bytes ? low32(buffer) : 0;
-  td->buffer_end = bytes ? low32(buffer) + bytes - 1 : 0;
+  td->current_buffer = bytes ? low32(buffer.data()) : 0;
+  td->buffer_end = bytes ? low32(buffer.data()) + static_cast<uint32_t>(bytes) - 1 : 0;
   td->next = 0;
 }
 
@@ -327,31 +324,27 @@ void OhciController::close_device(uint32_t port) {
 }
 
 bool OhciController::control_transfer(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
-                                      uint16_t index, void* data, uint16_t length, bool data_in) {
+                                      uint16_t index, ByteView data, bool data_in) {
   Pipe& pipe = devices_[port].control;
-  if (!pipe.ed || length > 4096) return false;
-  uint8_t* setup = control_buffer_;
-  uint8_t* buffer = control_buffer_ + 64;
-  setup[0] = request_type;
-  setup[1] = request;
-  setup[2] = static_cast<uint8_t>(value);
-  setup[3] = static_cast<uint8_t>(value >> 8);
-  setup[4] = static_cast<uint8_t>(index);
-  setup[5] = static_cast<uint8_t>(index >> 8);
-  setup[6] = static_cast<uint8_t>(length);
-  setup[7] = static_cast<uint8_t>(length >> 8);
-  if (length) {
-    if (data_in) __builtin_memset(buffer, 0, length);
-    else if (data) __builtin_memcpy(buffer, data, length);
-  }
+  if (!pipe.ed || data.size() > 4096) return false;
+  const uint16_t length = static_cast<uint16_t>(data.size());
+  const ByteView setup = control_buffer_.first(8);
+  const ByteView buffer = control_buffer_.subview(64, 4096);  // device-reachable staging area for the data stage
+  ByteWriter packet(setup);
+  packet.u8(request_type);
+  packet.u8(request);
+  packet.le16(value);
+  packet.le16(index);
+  packet.le16(length);
+  if (data_in) buffer.first(length).fill(0);
 
   uint32_t n = 0;
-  fill_td(descriptor(pipe, n++), kDirSetup, kToggleData0, 8, setup, false);
-  if (length) fill_td(descriptor(pipe, n++), data_in ? kDirIn : kDirOut, kToggleData1, length, buffer, data_in);
-  fill_td(descriptor(pipe, n++), data_in ? kDirOut : kDirIn, kToggleData1, 0, nullptr, false);  // status stage
+  fill_td(descriptor(pipe, n++), kDirSetup, kToggleData0, setup, false);
+  if (length) fill_td(descriptor(pipe, n++), data_in ? kDirIn : kDirOut, kToggleData1, buffer.first(length), data_in);
+  fill_td(descriptor(pipe, n++), data_in ? kDirOut : kDirIn, kToggleData1, ConstByteView(), false);  // status stage
   commit(pipe, n);
   if (!wait(pipe, kControlTimeoutMs)) return false;
-  if (data_in && length && data) __builtin_memcpy(data, buffer, length);
+  if (data_in && length) data.copy_from(buffer.first(length));
   return true;
 }
 
@@ -376,26 +369,27 @@ bool OhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
   return false;
 }
 
-bool OhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                                   uint32_t* transferred) {
+bool OhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) {
   kernel::ScopedMutex lock_guard(lock_);
   if (transferred) *transferred = 0;
-  if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
+  if (port >= ports_ || !devices_[port].present || data.size() > 0x10000) return false;
   Pipe* pipe = find_pipe(devices_[port], endpoint_address);
-  if (!pipe || pipe->list != List::Bulk || (length && !data)) return false;
+  if (!pipe || pipe->list != List::Bulk) return false;
 
+  const uint64_t length = data.size();
   const bool in = endpoint_address & 0x80;
-  uint8_t* buffer = static_cast<uint8_t*>(data);
-  const bool bounced = length && !below_4g(data, length);
+  ByteView buffer = data;
+  const bool bounced = length && !below_4g(data.data(), length);
   if (bounced) {  // the controller cannot address this buffer
-    buffer = bounce_;
-    if (!in) __builtin_memcpy(bounce_, data, length);
+    buffer = bounce_.first(length);
+    if (!in) buffer.copy_from(data);
   }
 
-  uint32_t n = 0, offset = 0;
+  uint32_t n = 0;
+  uint64_t offset = 0;
   do {
-    const uint32_t chunk = length - offset < kMaxTdBytes ? length - offset : kMaxTdBytes;
-    fill_td(descriptor(*pipe, n++), in ? kDirIn : kDirOut, kToggleCarry, chunk, buffer + offset, in);
+    const uint64_t chunk = length - offset < kMaxTdBytes ? length - offset : kMaxTdBytes;
+    fill_td(descriptor(*pipe, n++), in ? kDirIn : kDirOut, kToggleCarry, buffer.subview(offset, chunk), in);
     offset += chunk;
   } while (offset < length);
   Td* tds[kPoolTds + 1];
@@ -405,9 +399,9 @@ bool OhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void
 
   uint32_t left = 0;
   for (uint32_t i = 0; i < n; ++i) left += remaining(tds[i]);
-  const uint32_t moved = left <= length ? length - left : 0;
-  if (bounced && in) __builtin_memcpy(data, bounce_, moved);
-  if (transferred) *transferred = moved;
+  const uint64_t moved = left <= length ? length - left : 0;
+  if (bounced && in) data.copy_from(ConstByteView(buffer).first(moved));
+  if (transferred) *transferred = static_cast<uint32_t>(moved);
   return true;
 }
 
@@ -430,13 +424,13 @@ bool OhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   for (Pipe& p : d.pipes) {
     if (p.active || p.ed) continue;
     if (!create_pipe(d, p, List::Interrupt, endpoint_address, max_packet)) return false;
-    p.buffer = static_cast<uint8_t*>(low_allocate(64, 16));
-    if (!p.buffer) {
+    p.buffer = low_allocate<uint8_t>(64, 16);
+    if (p.buffer.empty()) {
       free_pipe(p);
       return false;
     }
     p.armed = descriptor(p, 0);
-    fill_td(p.armed, kDirIn, kToggleCarry, max_packet, p.buffer, true);
+    fill_td(p.armed, kDirIn, kToggleCarry, p.buffer.first(max_packet), true);
     commit(p, 1);  // armed before the endpoint becomes visible
     link_pipe(p);
     p.active = true;
@@ -445,27 +439,26 @@ bool OhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   return false;
 }
 
-bool OhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
-                                       uint16_t* length) {
+bool OhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) {
   kernel::ScopedMutex lock_guard(lock_);
-  if (port >= ports_ || !devices_[port].present || !buffer) return false;
+  if (port >= ports_ || !devices_[port].present) return false;
   Pipe* pipe = find_pipe(devices_[port], endpoint_address);
   if (!pipe || pipe->list != List::Interrupt) return false;
   const uint32_t head = reinterpret_cast<volatile Ed*>(pipe->ed)->head;
   const bool halted = head & kHeadHalted;
   if (!halted && (head & ~0xFu) != pipe->ed->tail) return false;  // nothing arrived yet
 
-  const uint32_t received = pipe->max_packet - remaining(pipe->armed);
+  const uint32_t left = remaining(pipe->armed);
+  const uint32_t received = left <= pipe->max_packet ? pipe->max_packet - left : 0;  // the controller's word, kept in range
   if (!halted) {
-    const uint16_t n = received < capacity ? received : capacity;
-    __builtin_memcpy(buffer, pipe->buffer, n);
+    buffer.copy_from(ConstByteView(pipe->buffer).first(received).at_most(buffer.size()));  // as much as fits
     if (length) *length = static_cast<uint16_t>(received);
     pipe->dummy ^= 1;
   } else {
     recover(*pipe);
   }
   pipe->armed = descriptor(*pipe, 0);
-  fill_td(pipe->armed, kDirIn, kToggleCarry, pipe->max_packet, pipe->buffer, true);
+  fill_td(pipe->armed, kDirIn, kToggleCarry, pipe->buffer.first(pipe->max_packet), true);
   commit(*pipe, 1);
   return !halted;
 }

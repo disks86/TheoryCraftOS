@@ -33,8 +33,8 @@ constexpr Color kTiles[4][4] = {
 };
 
 bool valid(const RawFrame& f) {
-  return f.pixels && f.width >= 4 && f.height >= 4 && f.stride >= f.width && f.bit_depth >= 8 &&
-         f.bit_depth <= 16;
+  return f.width >= 4 && f.height >= 4 && f.stride >= f.width && f.bit_depth >= 8 && f.bit_depth <= 16 &&
+         f.pixels.size() >= uint64_t{f.height - 1} * f.stride + f.width;  // the view must hold the whole frame
 }
 
 class Frame {
@@ -50,7 +50,7 @@ class Frame {
     else if (x >= static_cast<int32_t>(f_.width)) x -= 2;
     if (y < 0) y += 2;
     else if (y >= static_cast<int32_t>(f_.height)) y -= 2;
-    return f_.pixels[static_cast<uint64_t>(y) * f_.stride + x];
+    return f_.pixels[static_cast<uint64_t>(y) * f_.stride + x];  // checked against the frame view
   }
 
  private:
@@ -83,20 +83,21 @@ Rgb demosaic(const Frame& f, int32_t x, int32_t y) {
 }  // namespace
 
 SoftwareImageSignalProcessor::SoftwareImageSignalProcessor() {
-  build_gamma_table(gamma_, kGammaEntries, settings_.gamma_x100);
+  build_gamma_table(ByteView(gamma_), settings_.gamma_x100);
 }
 
 bool SoftwareImageSignalProcessor::set_settings(const IspSettings& settings) {
   if (settings.gamma_x100 < 50 || settings.gamma_x100 > 500) return false;
   const bool gamma_changed = settings.gamma_x100 != settings_.gamma_x100;
   settings_ = settings;
-  if (gamma_changed) build_gamma_table(gamma_, kGammaEntries, settings_.gamma_x100);
+  if (gamma_changed) build_gamma_table(ByteView(gamma_), settings_.gamma_x100);
   return true;
 }
 
 bool SoftwareImageSignalProcessor::process(const RawFrame& in, ImageBuffer* out) {
-  if (!valid(in) || !out || !out->pixels || out->width < in.width || out->height < in.height ||
-      out->stride < in.width || in.width > max_dimension() || in.height > max_dimension())
+  if (!valid(in) || !out || out->width < in.width || out->height < in.height || out->stride < in.width ||
+      in.width > max_dimension() || in.height > max_dimension() ||
+      out->pixels.size() < uint64_t{in.height - 1} * out->stride + in.width)  // the output must hold every row written
     return false;
 
   const Frame frame(in);
@@ -109,11 +110,11 @@ bool SoftwareImageSignalProcessor::process(const RawFrame& in, ImageBuffer* out)
     value = value > black ? value - black : 0;
     uint64_t v = (uint64_t{value} * gain) >> 8;           // white balance
     if (v > range) v = range;
-    return gamma_[(v * to_table) >> 16];
+    return ByteView(gamma_)[(v * to_table) >> 16];  // checked against the table
   };
 
   for (uint32_t y = 0; y < in.height; ++y) {
-    uint32_t* row = out->pixels + uint64_t{y} * out->stride;
+    const ArrayView<uint32_t> row = out->pixels.subview(uint64_t{y} * out->stride, in.width);
     for (uint32_t x = 0; x < in.width; ++x) {
       const Rgb c = demosaic(frame, static_cast<int32_t>(x), static_cast<int32_t>(y));
       row[x] = (encode(c.r, settings_.gain_red) << 16) | (encode(c.g, settings_.gain_green) << 8) |

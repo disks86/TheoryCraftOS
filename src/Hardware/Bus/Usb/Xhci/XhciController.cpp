@@ -156,8 +156,8 @@ bool XhciController::setup_memory() {
   write32(op_ + kOpConfig, max_slots_);  // enable every slot the controller has
 
   dcbaa_ = static_cast<uint64_t*>(allocator_.allocate_aligned((max_slots_ + 1) * 8, 4096));
-  buffer_ = static_cast<uint8_t*>(allocator_.allocate_aligned(4096, 4096));
-  if (!dcbaa_ || !buffer_ || !dma_reachable(dcbaa_)) return false;
+  buffer_ = allocate_view<uint8_t>(allocator_, 4096, 4096);
+  if (!dcbaa_ || buffer_.empty() || !dma_reachable(dcbaa_)) return false;
   __builtin_memset(dcbaa_, 0, (max_slots_ + 1) * 8);
 
   if (scratchpad_count_) {  // the controller keeps private state in these pages
@@ -210,10 +210,9 @@ void XhciController::shutdown() {
   }
   allocator_.deallocate(scratchpad_table_);
   allocator_.deallocate(dcbaa_);
-  allocator_.deallocate(buffer_);
+  release_view(allocator_, buffer_);
   scratchpad_table_ = nullptr;
   dcbaa_ = nullptr;
-  buffer_ = nullptr;
 
   // Give the controller back: reset it (it still points at the memory we just
   // freed) and let the firmware's USB stack bind to it again.
@@ -289,17 +288,16 @@ void XhciController::release_device(Device& d) {
   }
   for (InterruptEndpoint& e : d.endpoints) {
     e.ring.release(allocator_);
-    allocator_.deallocate(e.buffer);
+    release_view(allocator_, e.buffer);
     e = InterruptEndpoint{};
   }
   for (BulkEndpoint& e : d.bulk) {
     e.ring.release(allocator_);
     e = BulkEndpoint{};
   }
-  allocator_.deallocate(d.output_context);
-  allocator_.deallocate(d.input_context);
+  release_view(allocator_, d.output_context);
+  release_view(allocator_, d.input_context);
   d.control_ring.release(allocator_);
-  d.output_context = d.input_context = nullptr;
   d.present = false;
   d.slot = 0;
   d.configuration = 0;
@@ -332,7 +330,7 @@ bool XhciController::enumerate_port(uint32_t port) {
     release_device(d);
     return false;
   }
-  __builtin_memcpy(&d.descriptor, buffer_, sizeof(UsbDeviceDescriptor));
+  bytes_of(d.descriptor).copy_from(buffer_.first(sizeof(UsbDeviceDescriptor)));
   d.present = true;
 
   // Cache the first configuration (interfaces/endpoints) for class drivers. A
@@ -340,7 +338,7 @@ bool XhciController::enumerate_port(uint32_t port) {
   if (transfer(d, 0x80, 6, 0x0200, 0, 9, true)) {
     uint16_t total = buffer_[2] | (buffer_[3] << 8);
     if (total >= 9 && total <= sizeof(d.config) && transfer(d, 0x80, 6, 0x0200, 0, total, true)) {
-      __builtin_memcpy(d.config, buffer_, total);
+      ByteView(d.config).copy_from(buffer_.first(total));
       d.config_length = total;
     }
   }
@@ -357,40 +355,40 @@ bool XhciController::address_device(uint32_t port, Device& d) {
   }
 
   const uint32_t context_bytes = 33 * context_size_;  // input control + slot + 31 endpoints
-  d.output_context = static_cast<uint8_t*>(allocator_.allocate_aligned(context_bytes, 4096));
-  d.input_context = static_cast<uint8_t*>(allocator_.allocate_aligned(context_bytes, 4096));
-  if (!d.output_context || !d.input_context || !d.control_ring.init(allocator_) ||
-      !dma_reachable(d.output_context) || !dma_reachable(d.input_context))
+  d.output_context = allocate_view<uint8_t>(allocator_, context_bytes, 4096);
+  d.input_context = allocate_view<uint8_t>(allocator_, context_bytes, 4096);
+  if (d.output_context.empty() || d.input_context.empty() || !d.control_ring.init(allocator_) ||
+      !dma_reachable(d.output_context.data()) || !dma_reachable(d.input_context.data()))
     return false;
-  __builtin_memset(d.output_context, 0, context_bytes);
-  __builtin_memset(d.input_context, 0, context_bytes);
-  dcbaa_[d.slot] = reinterpret_cast<uint64_t>(d.output_context);
+  d.output_context.fill(0);
+  d.input_context.fill(0);
+  dcbaa_[d.slot] = reinterpret_cast<uint64_t>(d.output_context.data());
 
   d.max_packet0 = default_max_packet(d.speed_id);
-  auto* control = reinterpret_cast<uint32_t*>(context_at(d.input_context, 0));
+  const ArrayView<uint32_t> control = context_at(d.input_context, 0);
   control[1] = (1u << 0) | (1u << 1);  // add flags: slot context and EP0
-  auto* slot = reinterpret_cast<uint32_t*>(context_at(d.input_context, 1));
+  const ArrayView<uint32_t> slot = context_at(d.input_context, 1);
   slot[0] = (d.speed_id << 20) | (1u << 27);  // one context entry (EP0)
   slot[1] = (port + 1) << 16;                 // root hub port numbers start at 1
-  auto* ep0 = reinterpret_cast<uint32_t*>(context_at(d.input_context, 2));
+  const ArrayView<uint32_t> ep0 = context_at(d.input_context, 2);
   ep0[1] = (3u << 1) | (4u << 3) | (uint32_t{d.max_packet0} << 16);  // CErr 3, control endpoint
   const uint64_t ring = d.control_ring.address() | d.control_ring.cycle();  // DCS
   ep0[2] = static_cast<uint32_t>(ring);
   ep0[3] = static_cast<uint32_t>(ring >> 32);
   ep0[4] = 8;  // average TRB length
 
-  return run_command(reinterpret_cast<uint64_t>(d.input_context),
+  return run_command(reinterpret_cast<uint64_t>(d.input_context.data()),
                      (kTrbAddressDevice << 10) | (uint32_t{d.slot} << 24), &completion);
 }
 
 bool XhciController::update_max_packet(Device& d, uint16_t max_packet) {
-  auto* control = reinterpret_cast<uint32_t*>(context_at(d.input_context, 0));
+  const ArrayView<uint32_t> control = context_at(d.input_context, 0);
   control[0] = 0;
   control[1] = 1u << 1;  // evaluate EP0 only
-  auto* ep0 = reinterpret_cast<uint32_t*>(context_at(d.input_context, 2));
+  const ArrayView<uint32_t> ep0 = context_at(d.input_context, 2);
   ep0[1] = (ep0[1] & 0xFFFF) | (uint32_t{max_packet} << 16);
   Trb completion;
-  if (!run_command(reinterpret_cast<uint64_t>(d.input_context),
+  if (!run_command(reinterpret_cast<uint64_t>(d.input_context.data()),
                    (kTrbEvaluateContext << 10) | (uint32_t{d.slot} << 24), &completion))
     return false;
   d.max_packet0 = max_packet;
@@ -401,7 +399,7 @@ bool XhciController::update_max_packet(Device& d, uint16_t max_packet) {
 // otherwise there is no data stage. (`length` is the wLength field.)
 bool XhciController::transfer(Device& d, uint8_t request_type, uint8_t request, uint16_t value,
                               uint16_t index, uint16_t length, bool data_in) {
-  if (data_in) __builtin_memset(buffer_, 0, length);
+  if (data_in) buffer_.first(length).fill(0);
   const uint64_t setup = uint64_t{request_type} | (uint64_t{request} << 8) | (uint64_t{value} << 16) |
                          (uint64_t{index} << 32) | (uint64_t{length} << 48);
   constexpr uint32_t kTransferTypeIn = 3u << 16;  // setup TRB TRT field; 0 = no data stage
@@ -409,7 +407,7 @@ bool XhciController::transfer(Device& d, uint8_t request_type, uint8_t request, 
   d.control_ring.push(setup, 8,
                       (kTrbSetupStage << 10) | kTrbImmediateData | (data_in ? kTransferTypeIn : 0));
   if (data_in)
-    d.control_ring.push(reinterpret_cast<uint64_t>(buffer_), length,
+    d.control_ring.push(reinterpret_cast<uint64_t>(buffer_.data()), length,
                         (kTrbDataStage << 10) | kTrbDirectionIn);
   // The status stage runs opposite to the data: host-to-device after an IN data
   // stage, device-to-host when there was no data stage.
@@ -425,12 +423,10 @@ bool XhciController::transfer(Device& d, uint8_t request_type, uint8_t request, 
 
 // ---------------------------------------------------------- class driver API
 
-bool XhciController::configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity,
-                                              uint16_t* length) const {
-  if (port >= ports_ || !devices_[port].present || !devices_[port].config_length || !buffer) return false;
+bool XhciController::configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const {
+  if (port >= ports_ || !devices_[port].present || !devices_[port].config_length || buffer.empty()) return false;
   const Device& d = devices_[port];
-  const uint16_t n = d.config_length < capacity ? d.config_length : capacity;
-  __builtin_memcpy(buffer, d.config, n);
+  buffer.copy_from(ConstByteView(d.config).first(d.config_length).at_most(buffer.size()));  // as much as fits
   if (length) *length = d.config_length;
   return true;
 }
@@ -453,17 +449,18 @@ bool XhciController::control_out(uint32_t port, uint8_t request_type, uint8_t re
 }
 
 bool XhciController::control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
-                                uint16_t index, void* buffer, uint16_t length) {
+                                uint16_t index, ByteView buffer) {
   kernel::ScopedMutex lock_guard(lock_);
-  if (port >= ports_ || !devices_[port].present || !buffer || length > 4096) return false;
-  if (!transfer(devices_[port], request_type, request, value, index, length, true)) return false;
-  __builtin_memcpy(buffer, buffer_, length);
+  if (port >= ports_ || !devices_[port].present || buffer.empty() || buffer.size() > 4096) return false;
+  if (!transfer(devices_[port], request_type, request, value, index, static_cast<uint16_t>(buffer.size()), true))
+    return false;
+  buffer.copy_from(buffer_.first(buffer.size()));
   return true;
 }
 
 void XhciController::arm_endpoint(Device& d, InterruptEndpoint& e) {
   e.ready = false;
-  e.pending_trb = e.ring.push(reinterpret_cast<uint64_t>(e.buffer), e.max_packet,
+  e.pending_trb = e.ring.push(reinterpret_cast<uint64_t>(e.buffer.data()), e.max_packet,
                               (kTrbNormal << 10) | kTrbIoc | kTrbInterruptOnShortPacket);
   ring_doorbell(d.slot, e.context_id);
 }
@@ -484,22 +481,21 @@ bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   e->address = endpoint_address;
   e->context_id = dci;
   e->max_packet = max_packet;
-  e->buffer = static_cast<uint8_t*>(allocator_.allocate_aligned(max_packet < 64 ? 64 : max_packet, 64));
-  if (!e->buffer || !e->ring.init(allocator_) || !dma_reachable(e->buffer)) {
+  e->buffer = allocate_view<uint8_t>(allocator_, max_packet < 64 ? 64 : max_packet, 64);
+  if (e->buffer.empty() || !e->ring.init(allocator_) || !dma_reachable(e->buffer.data())) {
     e->ring.release(allocator_);
-    allocator_.deallocate(e->buffer);
-    e->buffer = nullptr;
+    release_view(allocator_, e->buffer);
     return false;
   }
 
   // Configure Endpoint: the input slot context starts as a copy of the live one.
   const uint32_t context_bytes = 33 * context_size_;
-  __builtin_memset(d.input_context, 0, context_bytes);
+  d.input_context.fill(0);
   if (dci > d.context_entries) d.context_entries = dci;
-  auto* control = reinterpret_cast<uint32_t*>(context_at(d.input_context, 0));
+  const ArrayView<uint32_t> control = context_at(d.input_context, 0);
   control[1] = (1u << 0) | (1u << dci);  // add: slot context and this endpoint
-  auto* slot = reinterpret_cast<uint32_t*>(context_at(d.input_context, 1));
-  __builtin_memcpy(slot, context_at(d.output_context, 0), 8 * sizeof(uint32_t));
+  const ArrayView<uint32_t> slot = context_at(d.input_context, 1);
+  slot.copy_from(context_at(d.output_context, 0).first(8));
   slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
 
   // xHCI interval is 2^n * 125 us. Full/low speed bInterval counts 1 ms frames;
@@ -512,7 +508,7 @@ bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
     n = interval ? interval - 1 : 0;
     if (n > 15) n = 15;
   }
-  auto* ep = reinterpret_cast<uint32_t*>(context_at(d.input_context, dci + 1));
+  const ArrayView<uint32_t> ep = context_at(d.input_context, dci + 1);
   ep[0] = n << 16;
   ep[1] = (3u << 1) | (7u << 3) | (uint32_t{max_packet} << 16);  // CErr 3, interrupt IN
   const uint64_t ring = e->ring.address() | e->ring.cycle();
@@ -521,11 +517,10 @@ bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   ep[4] = (uint32_t{max_packet} << 16) | max_packet;  // max ESIT payload, average TRB length
 
   Trb completion;
-  if (!run_command(reinterpret_cast<uint64_t>(d.input_context),
+  if (!run_command(reinterpret_cast<uint64_t>(d.input_context.data()),
                    (kTrbConfigureEndpoint << 10) | (uint32_t{d.slot} << 24), &completion)) {
     e->ring.release(allocator_);
-    allocator_.deallocate(e->buffer);
-    e->buffer = nullptr;
+    release_view(allocator_, e->buffer);
     return false;
   }
   e->active = true;
@@ -563,17 +558,15 @@ void XhciController::pump_events() {
   if (any) write64(interrupter + kIrDequeue, event_ring_.dequeue_address() | kIrDequeueBusy);
 }
 
-bool XhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer,
-                                       uint16_t capacity, uint16_t* length) {
+bool XhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) {
   kernel::ScopedMutex lock_guard(lock_);
-  if (port >= ports_ || !devices_[port].present || !buffer) return false;
+  if (port >= ports_ || !devices_[port].present) return false;
   Device& d = devices_[port];
   pump_events();
   for (InterruptEndpoint& e : d.endpoints) {
     if (!e.active || e.address != endpoint_address) continue;
     if (!e.ready) return false;
-    const uint16_t n = e.received < capacity ? e.received : capacity;
-    __builtin_memcpy(buffer, e.buffer, n);
+    buffer.copy_from(ConstByteView(e.buffer).first(e.received).at_most(buffer.size()));  // as much as fits
     if (length) *length = e.received;
     arm_endpoint(d, e);
     return true;
@@ -600,16 +593,16 @@ bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
   e->context_id = dci;
 
   const uint32_t context_bytes = 33 * context_size_;
-  __builtin_memset(d.input_context, 0, context_bytes);
+  d.input_context.fill(0);
   if (dci > d.context_entries) d.context_entries = dci;
-  auto* control = reinterpret_cast<uint32_t*>(context_at(d.input_context, 0));
+  const ArrayView<uint32_t> control = context_at(d.input_context, 0);
   control[1] = (1u << 0) | (1u << dci);  // add: slot context and this endpoint
-  auto* slot = reinterpret_cast<uint32_t*>(context_at(d.input_context, 1));
-  __builtin_memcpy(slot, context_at(d.output_context, 0), 8 * sizeof(uint32_t));
+  const ArrayView<uint32_t> slot = context_at(d.input_context, 1);
+  slot.copy_from(context_at(d.output_context, 0).first(8));
   slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
 
   constexpr uint32_t kEndpointTypeBulkOut = 2, kEndpointTypeBulkIn = 6;
-  auto* ep = reinterpret_cast<uint32_t*>(context_at(d.input_context, dci + 1));
+  const ArrayView<uint32_t> ep = context_at(d.input_context, dci + 1);
   ep[0] = 0;
   ep[1] = (3u << 1) | ((in ? kEndpointTypeBulkIn : kEndpointTypeBulkOut) << 3) | (uint32_t{max_packet} << 16);
   const uint64_t ring = e->ring.address() | e->ring.cycle();
@@ -618,7 +611,7 @@ bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
   ep[4] = 4096;  // average TRB length
 
   Trb completion;
-  if (!run_command(reinterpret_cast<uint64_t>(d.input_context),
+  if (!run_command(reinterpret_cast<uint64_t>(d.input_context.data()),
                    (kTrbConfigureEndpoint << 10) | (uint32_t{d.slot} << 24), &completion)) {
     e->ring.release(allocator_);
     return false;
@@ -627,13 +620,13 @@ bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
   return true;
 }
 
-bool XhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                                   uint32_t* transferred) {
+bool XhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) {
   kernel::ScopedMutex lock_guard(lock_);
   if (transferred) *transferred = 0;
-  if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
-  const uint64_t address = reinterpret_cast<uint64_t>(data);
-  if (length && (!data || (address & ~0xFFFFull) != ((address + length - 1) & ~0xFFFFull) || !dma_reachable(data)))
+  const uint32_t length = static_cast<uint32_t>(data.size());
+  if (port >= ports_ || !devices_[port].present || data.size() > 0x10000) return false;
+  const uint64_t address = reinterpret_cast<uint64_t>(data.data());
+  if (length && ((address & ~0xFFFFull) != ((address + length - 1) & ~0xFFFFull) || !dma_reachable(data.data())))
     return false;
   Device& d = devices_[port];
   for (BulkEndpoint& e : d.bulk) {

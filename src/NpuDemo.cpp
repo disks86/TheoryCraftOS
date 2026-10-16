@@ -17,6 +17,7 @@
  */
 
 #include "NpuDemo.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "console.hpp"
 
 namespace {
@@ -37,13 +38,13 @@ void report(const char* what, bool ok) {
 
 bool run_npu_demo(hardware::INeuralProcessingUnit& npu, allocators::IAllocator& allocator) {
   const uint32_t cells = kSize * kSize;
-  auto* a8 = static_cast<int8_t*>(allocator.allocate(cells));
-  auto* b8 = static_cast<int8_t*>(allocator.allocate(cells));
-  auto* c32 = static_cast<int32_t*>(allocator.allocate(cells * sizeof(int32_t)));
-  auto* af = static_cast<float*>(allocator.allocate(cells * sizeof(float)));
-  auto* bf = static_cast<float*>(allocator.allocate(cells * sizeof(float)));
-  auto* cf = static_cast<float*>(allocator.allocate(cells * sizeof(float)));
-  bool all_ok = a8 && b8 && c32 && af && bf && cf;
+  ArrayView<int8_t> a8 = allocate_view<int8_t>(allocator, cells);
+  ArrayView<int8_t> b8 = allocate_view<int8_t>(allocator, cells);
+  ArrayView<int32_t> c32 = allocate_view<int32_t>(allocator, cells);
+  ArrayView<float> af = allocate_view<float>(allocator, cells);
+  ArrayView<float> bf = allocate_view<float>(allocator, cells);
+  ArrayView<float> cf = allocate_view<float>(allocator, cells);
+  bool all_ok = !a8.empty() && !b8.empty() && !c32.empty() && !af.empty() && !bf.empty() && !cf.empty();
 
   if (all_ok) {
     for (uint32_t i = 0; i < cells; ++i) {
@@ -80,7 +81,7 @@ bool run_npu_demo(hardware::INeuralProcessingUnit& npu, allocators::IAllocator& 
 
     // Softmax: probabilities that sum to 1, ordered like the inputs.
     float logits[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-    ok = npu.softmax(logits, 4);
+    ok = npu.softmax(ArrayView<float>(logits));
     float total = 0;
     for (float p : logits) total += p;
     ok = ok && total > 0.9999f && total < 1.0001f && logits[3] > logits[2] && logits[2] > logits[0];
@@ -88,11 +89,11 @@ bool run_npu_demo(hardware::INeuralProcessingUnit& npu, allocators::IAllocator& 
     all_ok &= ok;
   }
 
-  allocator.deallocate(a8);
-  allocator.deallocate(b8);
-  allocator.deallocate(c32);
-  allocator.deallocate(af);
-  allocator.deallocate(bf);
-  allocator.deallocate(cf);
+  release_view(allocator, a8);
+  release_view(allocator, b8);
+  release_view(allocator, c32);
+  release_view(allocator, af);
+  release_view(allocator, bf);
+  release_view(allocator, cf);
   return all_ok;
 }

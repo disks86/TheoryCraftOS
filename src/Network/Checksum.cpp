@@ -20,11 +20,12 @@
 
 namespace network {
 
-uint32_t checksum_add(uint32_t sum, const uint8_t* data, uint32_t length) {
+uint32_t checksum_add(uint32_t sum, ConstByteView data) {
   // 32-bit accumulator: the carries are folded back in by checksum_finish().
   // (Callers add at most a few hundred 16-bit words per call, so it cannot overflow.)
   uint64_t wide = sum;
-  uint32_t i = 0;
+  const uint64_t length = data.size();
+  uint64_t i = 0;
   for (; i + 1 < length; i += 2) wide += (uint32_t{data[i]} << 8) | data[i + 1];
   if (i < length) wide += uint32_t{data[i]} << 8;  // odd trailing byte is padded with zero
   while (wide >> 32) wide = (wide & 0xFFFFFFFF) + (wide >> 32);
@@ -39,12 +40,13 @@ uint16_t checksum_finish(uint32_t sum) {
 
 uint32_t pseudo_header_sum(Ipv4Address source, Ipv4Address destination, uint8_t protocol, uint16_t length) {
   uint8_t pseudo[12];
-  source.write(pseudo);
-  destination.write(pseudo + 4);
-  pseudo[8] = 0;
-  pseudo[9] = protocol;
-  store16(pseudo + 10, length);
-  return checksum_add(0, pseudo, sizeof(pseudo));
+  ByteWriter out{ByteView(pseudo)};
+  source.write(out);
+  destination.write(out);
+  out.u8(0);
+  out.u8(protocol);
+  out.be16(length);
+  return checksum_add(0, out.written());
 }
 
 }  // namespace network

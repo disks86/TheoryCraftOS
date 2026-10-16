@@ -37,8 +37,8 @@ class UefiSimpleNetworkInterface final : public INetworkInterface {
 
   MacAddress mac_address() const override { return mac_; }
   bool link_up() const override;
-  bool transmit(const uint8_t* frame, uint32_t length) override;
-  bool receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) override;
+  bool transmit(ConstByteView frame) override;
+  bool receive(ByteView buffer, uint32_t* length) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:

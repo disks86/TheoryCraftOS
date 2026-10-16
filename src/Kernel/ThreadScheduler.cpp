@@ -475,6 +475,10 @@ Thread* spawn(ThreadFunction fn, void* argument, const char* name, int32_t core,
 
 void yield() {
   if (!g.running) return;
+  // Giving up the core with interrupts masked means the caller holds a spinlock
+  // (or is in an interrupt-off section): another thread would then run inside
+  // that critical section. That is always a bug, so stop at once.
+  if (!irq_enabled()) panic("yield or blocking wait with interrupts disabled (a spinlock held?)", nullptr);
   __asm__ volatile("int %0" ::"i"(kVectorYield) : "memory");
 }
 

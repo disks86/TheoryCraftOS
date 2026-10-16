@@ -57,7 +57,7 @@ bool TcpSocket::connect(Ipv4Address address, uint16_t port) {
   prepare_to_connect(manager_.allocate_port(), manager_.next_initial_sequence());
   if (failed_) return false;
   enter(TcpState::SynSent);
-  send_segment(tcp_flags::kSyn, iss_, nullptr, 0, true);
+  send_segment(tcp_flags::kSyn, iss_, ConstByteView(), true);
   arm_timer();
   return true;
 }
@@ -87,20 +87,19 @@ SharedPointer<ITcpSocket> TcpSocket::accept() {
   return SharedPointer<ITcpSocket>(child);
 }
 
-uint32_t TcpSocket::send(const uint8_t* data, uint32_t length) {
+uint32_t TcpSocket::send(ConstByteView data) {
   StackLock guard(ip_);
   const bool can_send = state_ == TcpState::Established || state_ == TcpState::CloseWait ||
                         state_ == TcpState::SynSent || state_ == TcpState::SynReceived;
-  if (!can_send || close_requested_ || !data) return 0;
-  const uint32_t queued = send_buffer_.write(data, length);
+  if (!can_send || close_requested_) return 0;
+  const uint32_t queued = send_buffer_.write(data);
   output();
   return queued;
 }
 
-uint32_t TcpSocket::receive(uint8_t* buffer, uint32_t capacity) {
+uint32_t TcpSocket::receive(ByteView buffer) {
   StackLock guard(ip_);
-  if (!buffer) return 0;
-  const uint32_t n = receive_buffer_.read(buffer, capacity);
+  const uint32_t n = receive_buffer_.read(buffer);
   // The sender may be waiting on a closed window: tell it once there is room again.
   if (n && last_advertised_window_ < kOurMss && advertised_window() >= kOurMss &&
       (state_ == TcpState::Established || state_ == TcpState::FinWait1 || state_ == TcpState::FinWait2))
@@ -137,7 +136,7 @@ void TcpSocket::abort() {
     return;
   }
   if (state_ != TcpState::Closed && state_ != TcpState::SynSent && state_ != TcpState::TimeWait)
-    send_segment(tcp_flags::kRst | tcp_flags::kAck, snd_nxt_, nullptr, 0, false);
+    send_segment(tcp_flags::kRst | tcp_flags::kAck, snd_nxt_, ConstByteView(), false);
   if (listener_ && state_ == TcpState::SynReceived) {
     listener_->child_finished_handshake();
     listener_ = nullptr;
@@ -161,33 +160,33 @@ uint32_t TcpSocket::advertised_window() const {
   return w > 65535 ? 65535 : w;
 }
 
-void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, const uint8_t* data, uint32_t length, bool with_mss) {
-  uint8_t packet[kMaxIpPayload];
+void TcpSocket::send_segment(uint8_t flags, uint32_t sequence, ConstByteView data, bool with_mss) {
+  uint8_t storage[kMaxIpPayload];
+  ByteWriter out{ByteView(storage)};
   const uint32_t header = with_mss ? 24 : 20;
-  if (header + length > sizeof(packet)) return;
-
-  store16(packet, local_port_);
-  store16(packet + 2, remote_port_);
-  store32(packet + 4, sequence);
-  store32(packet + 8, (flags & tcp_flags::kAck) ? rcv_nxt_ : 0);
-  packet[12] = static_cast<uint8_t>((header / 4) << 4);
-  packet[13] = flags;
   last_advertised_window_ = advertised_window();
-  store16(packet + 14, static_cast<uint16_t>(last_advertised_window_));
-  store16(packet + 16, 0);  // checksum, filled in below
-  store16(packet + 18, 0);  // urgent pointer (unused)
-  if (with_mss) {           // option: kind 2, length 4, our maximum segment size
-    packet[20] = 2;
-    packet[21] = 4;
-    store16(packet + 22, kOurMss);
+  out.be16(local_port_);
+  out.be16(remote_port_);
+  out.be32(sequence);
+  out.be32((flags & tcp_flags::kAck) ? rcv_nxt_ : 0);
+  out.u8(static_cast<uint8_t>((header / 4) << 4));
+  out.u8(flags);
+  out.be16(static_cast<uint16_t>(last_advertised_window_));
+  out.be16(0);  // checksum, filled in below
+  out.be16(0);  // urgent pointer (unused)
+  if (with_mss) {  // option: kind 2, length 4, our maximum segment size
+    out.u8(2);
+    out.u8(4);
+    out.be16(kOurMss);
   }
-  for (uint32_t i = 0; i < length; ++i) packet[header + i] = data[i];
+  out.bytes(data);
+  if (!out.ok()) return;  // payload larger than a packet: cannot happen, the sender chunks to the MSS
 
-  const uint16_t total = static_cast<uint16_t>(header + length);
+  const uint16_t total = static_cast<uint16_t>(out.position());
   uint32_t sum = pseudo_header_sum(ip_.local_address(), remote_address_, kProtocolTcp, total);
-  sum = checksum_add(sum, packet, total);
-  store16(packet + 16, checksum_finish(sum));
-  ip_.send_ip(remote_address_, kProtocolTcp, packet, total);  // a lost segment is retransmitted
+  sum = checksum_add(sum, out.written());
+  out.patch_be16(16, checksum_finish(sum));
+  ip_.send_ip(remote_address_, kProtocolTcp, out.written());  // a lost segment is retransmitted
 }
 
 // Sends whatever the peer's window and our send buffer allow, then the FIN if
@@ -208,9 +207,10 @@ void TcpSocket::output() {
     if (n == 0) break;
 
     uint8_t chunk[kMaxIpPayload];
-    send_buffer_.peek(in_flight, chunk, n);
+    const ByteView payload = ByteView(chunk).first(n);  // n <= mss <= kMaxIpPayload by construction; checked here
+    send_buffer_.peek(in_flight, payload);
     const bool last = n == unsent;
-    send_segment(tcp_flags::kAck | (last ? tcp_flags::kPsh : 0), snd_nxt_, chunk, n, false);
+    send_segment(tcp_flags::kAck | (last ? tcp_flags::kPsh : 0), snd_nxt_, payload, false);
     if (!timing_) {  // time this segment (Karn: never a retransmission, see rollback)
       timing_ = true;
       timed_sequence_ = snd_nxt_ + n;
@@ -223,7 +223,7 @@ void TcpSocket::output() {
   // The FIN goes out once every queued byte has been sent.
   const uint32_t in_flight = snd_nxt_ - snd_una_;
   if (close_requested_ && !fin_sent_ && send_buffer_.size() == in_flight) {
-    send_segment(tcp_flags::kFin | tcp_flags::kAck, snd_nxt_, nullptr, 0, false);
+    send_segment(tcp_flags::kFin | tcp_flags::kAck, snd_nxt_, ConstByteView(), false);
     fin_sent_ = true;
     ++snd_nxt_;
     if (state_ == TcpState::Established) enter(TcpState::FinWait1);
@@ -278,7 +278,7 @@ void TcpSocket::accept_syn(TcpSocket* listener, Ipv4Address remote_address, uint
   snd_wl1_ = syn.sequence;
   snd_wl2_ = 0;
   enter(TcpState::SynReceived);
-  send_segment(tcp_flags::kSyn | tcp_flags::kAck, iss_, nullptr, 0, true);
+  send_segment(tcp_flags::kSyn | tcp_flags::kAck, iss_, ConstByteView(), true);
   arm_timer();
 }
 
@@ -289,7 +289,7 @@ void TcpSocket::on_segment(const TcpSegment& s) {
   if (state_ == TcpState::SynSent) {
     if (s.flags & kAck) {
       if (seq_le(s.acknowledgement, iss_) || seq_gt(s.acknowledgement, snd_nxt_)) {
-        if (!(s.flags & kRst)) send_segment(kRst, s.acknowledgement, nullptr, 0, false);
+        if (!(s.flags & kRst)) send_segment(kRst, s.acknowledgement, ConstByteView(), false);
         return;
       }
     }
@@ -313,7 +313,7 @@ void TcpSocket::on_segment(const TcpSegment& s) {
       output();
     } else {  // simultaneous open
       enter(TcpState::SynReceived);
-      send_segment(kSyn | kAck, iss_, nullptr, 0, true);
+      send_segment(kSyn | kAck, iss_, ConstByteView(), true);
     }
     return;
   }
@@ -325,7 +325,7 @@ void TcpSocket::on_segment(const TcpSegment& s) {
     return;
   }
   if (s.flags & kSyn) {  // a retransmitted SYN: answer again; anything else is ignored
-    if (state_ == TcpState::SynReceived && s.sequence == irs_) send_segment(kSyn | kAck, iss_, nullptr, 0, true);
+    if (state_ == TcpState::SynReceived && s.sequence == irs_) send_segment(kSyn | kAck, iss_, ConstByteView(), true);
     return;
   }
   if (!(s.flags & kAck)) return;
@@ -341,7 +341,7 @@ void TcpSocket::on_segment(const TcpSegment& s) {
       enter(TcpState::Established);
       established_event_ = true;
     } else {
-      send_segment(kRst, s.acknowledgement, nullptr, 0, false);
+      send_segment(kRst, s.acknowledgement, ConstByteView(), false);
       return;
     }
   }
@@ -387,7 +387,7 @@ void TcpSocket::process_ack(const TcpSegment& s) {
       else if (state_ == TcpState::Closing) enter(TcpState::TimeWait);
       else if (state_ == TcpState::LastAck) enter(TcpState::Closed);
     }
-  } else if (s.acknowledgement == snd_una_ && s.length == 0 && snd_una_ != snd_nxt_ && s.window == old_window &&
+  } else if (s.acknowledgement == snd_una_ && s.data.empty() && snd_una_ != snd_nxt_ && s.window == old_window &&
              !(s.flags & kFin)) {
     if (++duplicate_acks_ == 3) {  // fast retransmit: the receiver keeps asking for the same byte
       rollback_for_retransmission();
@@ -400,11 +400,11 @@ void TcpSocket::accept_data(const TcpSegment& s) {
   using namespace tcp_flags;
   const bool can_receive = state_ == TcpState::Established || state_ == TcpState::FinWait1 || state_ == TcpState::FinWait2;
   const bool fin = s.flags & kFin;
-  if (s.length == 0 && !fin) return;
+  if (s.data.empty() && !fin) return;
 
   if (!can_receive) {
     // A FIN or data we have already accepted, retransmitted: repeat the ACK.
-    if (fin || s.length) {
+    if (fin || !s.data.empty()) {
       send_ack();
       if (state_ == TcpState::TimeWait) time_wait_deadline_ = ip_.now_ms() + kTimeWaitMs;
     }
@@ -416,11 +416,11 @@ void TcpSocket::accept_data(const TcpSegment& s) {
   }
 
   uint32_t skip = rcv_nxt_ - s.sequence;  // bytes of this segment we already have
-  const uint32_t end_sequence = s.sequence + s.length;
-  if (skip > s.length) skip = s.length;
-  const uint8_t* data = s.data + skip;
-  const uint32_t length = s.length - skip;
-  const uint32_t stored = receive_buffer_.write(data, length);
+  const uint32_t end_sequence = s.sequence + static_cast<uint32_t>(s.data.size());
+  if (skip > s.data.size()) skip = static_cast<uint32_t>(s.data.size());
+  const ConstByteView fresh = s.data.dropped(skip);  // the part we do not have yet
+  const uint32_t length = static_cast<uint32_t>(fresh.size());
+  const uint32_t stored = receive_buffer_.write(fresh);
   rcv_nxt_ += stored;
 
   if (fin && stored == length && end_sequence == rcv_nxt_) {
@@ -463,15 +463,15 @@ void TcpSocket::on_timer(uint64_t now) {
 
   if (timer_deadline_ && now >= timer_deadline_) {
     if (++retries_ > kMaxRetries) {  // the peer is gone
-      send_segment(tcp_flags::kRst | tcp_flags::kAck, snd_nxt_, nullptr, 0, false);
+      send_segment(tcp_flags::kRst | tcp_flags::kAck, snd_nxt_, ConstByteView(), false);
       fail();
       return;
     }
     rto_ms_ = rto_ms_ * 2 > kMaxRtoMs ? kMaxRtoMs : rto_ms_ * 2;
     if (state_ == TcpState::SynSent) {
-      send_segment(tcp_flags::kSyn, iss_, nullptr, 0, true);
+      send_segment(tcp_flags::kSyn, iss_, ConstByteView(), true);
     } else if (state_ == TcpState::SynReceived) {
-      send_segment(tcp_flags::kSyn | tcp_flags::kAck, iss_, nullptr, 0, true);
+      send_segment(tcp_flags::kSyn | tcp_flags::kAck, iss_, ConstByteView(), true);
     } else {
       rollback_for_retransmission();
       output();
@@ -489,8 +489,8 @@ void TcpSocket::on_timer(uint64_t now) {
     persist_deadline_ = now + rto_ms_;
   } else if (now >= persist_deadline_) {
     uint8_t probe;
-    send_buffer_.peek(0, &probe, 1);
-    send_segment(tcp_flags::kAck, snd_nxt_, &probe, 1, false);
+    send_buffer_.peek(0, ByteView(&probe, 1));
+    send_segment(tcp_flags::kAck, snd_nxt_, ConstByteView(&probe, 1), false);
     ++snd_nxt_;
     arm_timer();
     persist_deadline_ = 0;

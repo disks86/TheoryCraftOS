@@ -42,6 +42,17 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   listed); `src/StorageDemo` reports each device, cross-checks reads and, only on a device whose first block begins
   with `TCOS-SCRATCH`, tests write/flush/read-back. Not covered: floppy and SD/MMC (only through the firmware),
   and the LSI/MegaRAID/MPT/PVSCSI SCSI adapters (only if the firmware has a driver for them - the stock OVMF does not).
+- `src/Utility/` bounds-safe memory: `Slice` (a start index and a length, overflow-safe, `fits_in(size)`), `ArrayView<T>`
+  (pointer + size: a non-owning, *checked* window - `operator[]`, `subview(Slice)`, `first/last/dropped`, `copy_from`,
+  `cast<U>()`, and `try_*` forms that report failure instead), `ByteView`/`ConstByteView`, `ByteReader`/`ByteWriter`
+  (bounds-checked, byte-order-aware parsing and building of packets and descriptors; the first failed access sets a
+  sticky error) and `allocate_view`/`release_view`. Anywhere code used to pass `T* data, uint32_t length` it passes one
+  view: the network stack (every parser and builder), NIC/storage/USB-controller interfaces, descriptor and HID
+  parsing, DMA rings and bounce buffers, NPU/ISP buffers, the framebuffer, ACPI/memory-map walking, and the containers'
+  own storage (`List::operator[]` is now checked). A violation stops the OS with a message (`bounds_violation`);
+  untrusted input goes through the non-aborting forms. `tests/run_host_tests.sh` builds the portable code for the host
+  with ASAN/UBSAN and runs unit tests plus fuzzing (thousands of mutated/truncated frames through the network stack,
+  random USB/HID/SCSI data through the parsers).
 - `src/Kernel/`: the preemptive multithreading core. `Interrupts` builds a GDT/IDT (256 assembly stubs saving the full
   register and x87/SSE state as a `Frame`), `Apic` drives each core's local APIC (calibrated timer tick, wake-up IPIs),
   `ThreadScheduler` (`kernel::start()`) turns the boot context into the main thread (pinned to the boot core), parks

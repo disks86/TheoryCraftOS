@@ -35,19 +35,17 @@ class UdpSocket final : public IUdpSocket {
       : ip_(ip), port_(port), queue_(allocator) {}
 
   uint16_t local_port() const override { return port_; }  // fixed at creation
-  bool send_to(Ipv4Address address, uint16_t port, const uint8_t* data, uint32_t length) override;
-  bool receive_from(uint8_t* buffer, uint32_t capacity, Ipv4Address* from_address, uint16_t* from_port,
-                    uint32_t* length) override;
+  bool send_to(Ipv4Address address, uint16_t port, ConstByteView data) override;
+  bool receive_from(ByteView buffer, Ipv4Address* from_address, uint16_t* from_port, uint32_t* length) override;
   uint32_t pending() const override;
   void close() override;
 
   // Like send_to() but with an explicit source address, which may be 0.0.0.0, and
   // optionally as a link-layer broadcast. DHCP uses it before it has an address.
-  bool send_from(Ipv4Address source, Ipv4Address address, uint16_t port, const uint8_t* data, uint32_t length,
-                 bool link_broadcast);
+  bool send_from(Ipv4Address source, Ipv4Address address, uint16_t port, ConstByteView data, bool link_broadcast);
 
   // The UDP manager hands arriving datagrams in here.
-  void deliver(Ipv4Address from_address, uint16_t from_port, const uint8_t* data, uint32_t length);
+  void deliver(Ipv4Address from_address, uint16_t from_port, ConstByteView data);
   bool closed() const { return closed_; }
 
  private:

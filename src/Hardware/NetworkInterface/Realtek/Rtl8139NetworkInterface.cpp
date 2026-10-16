@@ -71,20 +71,20 @@ bool Rtl8139NetworkInterface::initialize() {
   }
   for (uint32_t i = 0; i < 6; ++i) mac_.bytes[i] = read8(kIdr0 + i);
 
-  receive_ring_ = static_cast<uint8_t*>(allocator_.allocate_aligned(kReceiveRingSize + kRingSlack, 4096));
-  transmit_buffers_ = static_cast<uint8_t*>(allocator_.allocate_aligned(kTransmitSlots * kTransmitBufferSize, 4096));
-  if (!receive_ring_ || !transmit_buffers_ ||
-      reinterpret_cast<uint64_t>(receive_ring_) + kReceiveRingSize + kRingSlack > 0x100000000ull ||
-      reinterpret_cast<uint64_t>(transmit_buffers_) + kTransmitSlots * kTransmitBufferSize > 0x100000000ull) {
+  receive_ring_ = allocate_view<uint8_t>(allocator_, kReceiveRingSize + kRingSlack, 4096);
+  transmit_buffers_ = allocate_view<uint8_t>(allocator_, kTransmitSlots * kTransmitBufferSize, 4096);
+  if (receive_ring_.empty() || transmit_buffers_.empty() ||
+      reinterpret_cast<uint64_t>(receive_ring_.data()) + receive_ring_.size() > 0x100000000ull ||
+      reinterpret_cast<uint64_t>(transmit_buffers_.data()) + transmit_buffers_.size() > 0x100000000ull) {
     shutdown();  // out of memory, or the buffers are out of the chip's 32-bit reach
     return false;
   }
-  __builtin_memset(receive_ring_, 0, kReceiveRingSize + kRingSlack);
+  receive_ring_.fill(0);
   receive_offset_ = 0;
   transmit_next_ = 0;
   for (bool& used : transmit_used_) used = false;
 
-  write32(kRbStart, static_cast<uint32_t>(reinterpret_cast<uint64_t>(receive_ring_)));
+  write32(kRbStart, static_cast<uint32_t>(reinterpret_cast<uint64_t>(receive_ring_.data())));
   write16(kImr, 0);        // polled: no interrupts
   write16(kIsr, 0xFFFF);
   write8(kCmd, kCmdReceiveEnable | kCmdTransmitEnable);
@@ -97,10 +97,8 @@ bool Rtl8139NetworkInterface::initialize() {
 void Rtl8139NetworkInterface::shutdown() {
   started_ = false;
   if (registers_) write8(kCmd, kCmdReset);  // the chip stops DMAing into our buffers
-  allocator_.deallocate(receive_ring_);
-  allocator_.deallocate(transmit_buffers_);
-  receive_ring_ = nullptr;
-  transmit_buffers_ = nullptr;
+  release_view(allocator_, receive_ring_);
+  release_view(allocator_, transmit_buffers_);
   if (owns_device_) {
     owns_device_ = false;
     reattach_firmware_drivers(st_, device_.address);
@@ -109,9 +107,9 @@ void Rtl8139NetworkInterface::shutdown() {
 
 bool Rtl8139NetworkInterface::link_up() const { return started_ && !(read8(kMsr) & kMsrLinkInactive); }
 
-bool Rtl8139NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+bool Rtl8139NetworkInterface::transmit(ConstByteView frame) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
   }
@@ -121,12 +119,12 @@ bool Rtl8139NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
     ++stats_.send_failures;
     return false;
   }
-  const uint32_t padded = length < kEthernetMinFrame ? kEthernetMinFrame : length;
-  uint8_t* buffer = transmit_buffers_ + slot * kTransmitBufferSize;
-  __builtin_memset(buffer, 0, padded);
-  __builtin_memcpy(buffer, frame, length);
+  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
+  const ByteView buffer = transmit_buffers_.subview(uint64_t{slot} * kTransmitBufferSize, kTransmitBufferSize).first(padded);
+  buffer.fill(0);
+  buffer.copy_from(frame);
   __atomic_thread_fence(__ATOMIC_RELEASE);
-  write32(kTsad0 + 4 * slot, static_cast<uint32_t>(reinterpret_cast<uint64_t>(buffer)));
+  write32(kTsad0 + 4 * slot, static_cast<uint32_t>(reinterpret_cast<uint64_t>(buffer.data())));
   write32(kTsd0 + 4 * slot, padded);  // writing the length (with OWN clear) starts the transmission
   transmit_used_[slot] = true;
   transmit_next_ = (slot + 1) % kTransmitSlots;
@@ -134,17 +132,18 @@ bool Rtl8139NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
   return true;
 }
 
-bool Rtl8139NetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+bool Rtl8139NetworkInterface::receive(ByteView buffer, uint32_t* length) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !buffer || !length) return false;
+  if (!started_ || !length) return false;
   while (!(read8(kCmd) & kCmdBufferEmpty)) {
-    const uint8_t* packet = receive_ring_ + receive_offset_;
-    const uint16_t status = packet[0] | (packet[1] << 8);
-    const uint32_t size = packet[2] | (packet[3] << 8);  // includes the 4-byte CRC
+    // The chip writes a 4-byte header (status, size) in front of each frame; size is the chip's word.
+    const ConstByteView header = ConstByteView(receive_ring_).subview(receive_offset_, 4);
+    const uint16_t status = header[0] | (header[1] << 8);
+    const uint32_t size = header[2] | (header[3] << 8);  // includes the 4-byte CRC
     const bool usable = (status & kRxStatusOk) && size > 4 && size - 4 <= kEthernetMaxFrame + 4;
     if (usable) {
       const uint32_t frame = size - 4;
-      __builtin_memcpy(buffer, packet + 4, frame < capacity ? frame : capacity);
+      buffer.copy_from(ConstByteView(receive_ring_).subview(receive_offset_ + 4, frame).at_most(buffer.size()));  // as much as fits
       *length = frame;
       ++stats_.frames_received;
     } else {

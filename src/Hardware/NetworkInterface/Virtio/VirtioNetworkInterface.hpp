@@ -45,20 +45,20 @@ class VirtioNetworkInterface final : public INetworkInterface {
 
   MacAddress mac_address() const override { return mac_; }
   bool link_up() const override;
-  bool transmit(const uint8_t* frame, uint32_t length) override;
-  bool receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) override;
+  bool transmit(ConstByteView frame) override;
+  bool receive(ByteView buffer, uint32_t* length) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:
   static constexpr uint32_t kHeaderSize = 12;  // virtio_net_hdr with VERSION_1
-  uint8_t* rx_buffer(uint16_t i) const { return buffers_ + uint32_t{i} * kBufferSize; }
-  uint8_t* tx_buffer(uint16_t i) const { return buffers_ + (uint32_t{kBuffers} + i) * kBufferSize; }
+  ByteView rx_buffer(uint16_t i) const { return buffers_.subview(uint64_t{i} * kBufferSize, kBufferSize); }
+  ByteView tx_buffer(uint16_t i) const { return buffers_.subview((uint64_t{kBuffers} + i) * kBufferSize, kBufferSize); }
   void reclaim_transmitted();
 
   VirtioPciDevice transport_;
   allocators::IAllocator& allocator_;
   Virtqueue rx_, tx_;
-  uint8_t* buffers_ = nullptr;  // kBuffers receive buffers, then kBuffers transmit buffers
+  ByteView buffers_;  // kBuffers receive buffers, then kBuffers transmit buffers
   uint32_t tx_busy_ = 0;        // bit i set while transmit buffer i is owned by the device
   MacAddress mac_{};
   bool has_status_ = false;

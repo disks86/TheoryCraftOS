@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/Bus/Usb/UsbTypes.hpp"
+#include "Utility/ArrayView.hpp"
 #include "Hardware/IHardware.hpp"
 
 namespace hardware {
@@ -36,8 +37,7 @@ class IUsbHostController : public IHardware {
   virtual bool device_descriptor(uint32_t port, UsbDeviceDescriptor* out) const = 0;
   // The full configuration descriptor (configuration, interfaces, endpoints, class
   // descriptors) of the device on a root port, cached during enumeration.
-  virtual bool configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity,
-                                        uint16_t* length) const = 0;
+  virtual bool configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const = 0;
 
   // --- Device control (endpoint 0). `port` identifies an enumerated device.
   // Selects a configuration; repeating the call for the same value is a no-op.
@@ -47,7 +47,8 @@ class IUsbHostController : public IHardware {
                            uint16_t index) = 0;
   // Control transfer reading `length` bytes (at most 4096) into `buffer`.
   virtual bool control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
-                          uint16_t index, void* buffer, uint16_t length) = 0;
+                          uint16_t index,
+                  ByteView buffer) = 0;
 
   // --- Interrupt IN endpoints (HID reports and the like).
   // Configures the endpoint and starts receiving packets of up to max_packet
@@ -56,8 +57,7 @@ class IUsbHostController : public IHardware {
                                   uint8_t interval) = 0;
   // If a packet has arrived, copies it out (at most `capacity` bytes), re-arms
   // the endpoint and returns true. Never blocks.
-  virtual bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer,
-                                 uint16_t capacity, uint16_t* length) = 0;
+  virtual bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) = 0;
 
   // --- Bulk endpoints (mass storage and the like).
   // Configures a bulk endpoint of an enumerated device (IN when bit 7 of the
@@ -67,8 +67,7 @@ class IUsbHostController : public IHardware {
   // memory) and waits for the transfer to end. *transferred, if given, receives
   // the bytes actually moved: a short IN transfer is a success. False on a
   // timeout, a stall or any other error.
-  virtual bool bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                             uint32_t* transferred) = 0;
+  virtual bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) = 0;
   // Brings a stalled bulk endpoint back to life (the controller side of
   // CLEAR_FEATURE(ENDPOINT_HALT), which the caller still sends).
   virtual bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) = 0;

@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -26,7 +27,7 @@ namespace hardware {
 struct Font8x16 {
   static constexpr uint32_t kWidth = 8;
   static constexpr uint32_t kHeight = 16;
-  static const uint8_t* glyph(char c);
+  static ConstByteView glyph(char c);  // kHeight bytes
 };
 
 }  // namespace hardware

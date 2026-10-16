@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -67,11 +68,13 @@ uint8_t extended_usage(uint8_t code) {
 
 uint8_t usage_from_scan_code_set1(uint8_t code, bool extended) {
   if (extended) return extended_usage(code);
-  return code < sizeof(kSet1) ? kSet1[code] : 0;
+  uint8_t usage = 0;
+  ArrayView<const uint8_t>(kSet1).try_get(code, &usage);  // a code past the table is simply unmapped
+  return usage;
 }
 
 uint8_t usage_from_linux_key(uint16_t code) {
-  if (code < sizeof(kSet1)) return kSet1[code];  // codes 1-88 match set-1 make codes
+  if (code < sizeof(kSet1)) return ArrayView<const uint8_t>(kSet1)[code];  // codes 1-88 match set-1 make codes
   switch (code) {
     case 96:  return 0x58;  // keypad enter
     case 97:  return 0xE4;  // right control
@@ -98,7 +101,7 @@ uint8_t usage_from_linux_key(uint16_t code) {
 char key_to_ascii(uint8_t usage, uint8_t modifiers) {
   if (usage < kFirst || usage > kLast) return 0;
   const bool shift = modifiers & modifier::kShift;
-  return (shift ? kShifted : kPlain)[usage - kFirst];
+  return ArrayView<const char>(shift ? kShifted : kPlain)[usage - kFirst];  // checked: usage is in range, the tables hold kFirst..kLast
 }
 
 }  // namespace hardware

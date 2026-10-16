@@ -46,8 +46,8 @@ bool VirtioScsiController::initialize() {
     transport_.shutdown();
     return false;
   }
-  memory_ = static_cast<uint8_t*>(allocator_.allocate_aligned(4096, 4096));
-  if (!memory_ || !transport_.setup_queue(kControlQueue, &control_) || !transport_.setup_queue(kEventQueue, &event_) ||
+  memory_ = allocate_view<uint8_t>(allocator_, 4096, 4096);
+  if (memory_.empty() || !transport_.setup_queue(kControlQueue, &control_) || !transport_.setup_queue(kEventQueue, &event_) ||
       !transport_.setup_queue(kRequestQueue, &request_) || request_.size() < 4 || !transport_.start()) {
     shutdown();
     return false;
@@ -62,32 +62,32 @@ void VirtioScsiController::shutdown() {
   control_.release(allocator_);
   event_.release(allocator_);
   request_.release(allocator_);
-  allocator_.deallocate(memory_);
-  memory_ = nullptr;
+  release_view(allocator_, memory_);
 }
 
-VirtioScsiController::Result VirtioScsiController::command(uint32_t target, uint32_t lun, const uint8_t* cdb,
-                                                           uint32_t cdb_length, void* data, uint32_t length,
-                                                           bool device_writes) {
+VirtioScsiController::Result VirtioScsiController::command(uint32_t target, uint32_t lun, ConstByteView cdb,
+                                                           ByteView data, bool device_writes) {
   Result result;
-  if (!started_ || cdb_length > 32) return result;
+  if (!started_ || cdb.size() > 32) return result;
   kernel::ScopedMutex guard(mutex_);
-  RequestHeader* request = reinterpret_cast<RequestHeader*>(memory_);
-  ResponseHeader* response = reinterpret_cast<ResponseHeader*>(memory_ + 256);
-  __builtin_memset(request, 0, sizeof(RequestHeader));
-  __builtin_memset(response, 0xFF, sizeof(ResponseHeader));
+  // The request and response headers live in the controller's page, one after the other.
+  RequestHeader* request = reinterpret_cast<RequestHeader*>(&memory_[0]);
+  ResponseHeader* response = reinterpret_cast<ResponseHeader*>(&memory_[256]);
+  memory_.subview(0, sizeof(RequestHeader)).fill(0);
+  memory_.subview(256, sizeof(ResponseHeader)).fill(0xFF);
   request->lun[0] = 1;
   request->lun[1] = static_cast<uint8_t>(target);
   request->lun[2] = static_cast<uint8_t>(0x40 | (lun >> 8));
   request->lun[3] = static_cast<uint8_t>(lun);
-  __builtin_memcpy(request->cdb, cdb, cdb_length);
+  ByteView(request->cdb).copy_from(cdb);
 
   Virtqueue::Segment chain[4];
   uint16_t n = 0;
+  const uint32_t length = static_cast<uint32_t>(data.size());
   chain[n++] = {request, sizeof(RequestHeader), false};
-  if (length && !device_writes) chain[n++] = {data, length, false};
+  if (length && !device_writes) chain[n++] = {data.data(), length, false};
   chain[n++] = {response, sizeof(ResponseHeader), true};
-  if (length && device_writes) chain[n++] = {data, length, true};
+  if (length && device_writes) chain[n++] = {data.data(), length, true};
   request_.post_chain(0, chain, n);
   transport_.notify(kRequestQueue);
 
@@ -101,9 +101,9 @@ VirtioScsiController::Result VirtioScsiController::command(uint32_t target, uint
   return result;
 }
 
-bool VirtioScsiDevice::run(const uint8_t* cdb, uint32_t cdb_length, void* data, uint32_t length, bool device_writes) {
+bool VirtioScsiDevice::run(ConstByteView cdb, ByteView data, bool device_writes) {
   for (int attempt = 0; attempt < 4; ++attempt) {
-    const VirtioScsiController::Result r = controller_->command(target_, 0, cdb, cdb_length, data, length, device_writes);
+    const VirtioScsiController::Result r = controller_->command(target_, 0, cdb, data, device_writes);
     if (!r.delivered || r.response != 0) return false;
     if (r.status == scsi::kStatusGood) return true;
     if (r.status != scsi::kStatusCheckCondition) return false;  // busy, reservation conflict, ...
@@ -128,27 +128,27 @@ void VirtioScsiDevice::discover(const SharedPointer<VirtioScsiController>& contr
 
 bool VirtioScsiDevice::initialize() {
   alignas(16) uint8_t data[64] = {};
-  uint8_t inquiry[6] = {scsi::kInquiry, 0, 0, 0, 36, 0};
-  if (!run(inquiry, 6, data, 36, true)) return false;
-  const uint8_t type = data[0] & 0x1F;
-  if ((data[0] >> 5) != 0) return false;  // no logical unit here
-  if (type != scsi::kDeviceTypeDisk && type != scsi::kDeviceTypeOptical) return false;
-  optical_ = type == scsi::kDeviceTypeOptical;
+  const uint8_t inquiry[6] = {scsi::kInquiry, 0, 0, 0, 36, 0};
+  if (!run(ConstByteView(inquiry), ByteView(data).first(36), true)) return false;
+  scsi::InquiryInfo unit;
+  if (!scsi::parse_inquiry(ConstByteView(data), &unit) || !unit.present) return false;  // no logical unit here
+  if (unit.device_type != scsi::kDeviceTypeDisk && unit.device_type != scsi::kDeviceTypeOptical) return false;
+  optical_ = unit.device_type == scsi::kDeviceTypeOptical;
   info_.kind = optical_ ? StorageKind::Optical : StorageKind::Disk;
   info_.read_only = optical_;
-  info_.removable = data[1] & 0x80;
-  copy_device_string(info_.model, sizeof(info_.model), data + 8, 24, false);  // vendor + product, 8 + 16 bytes
+  info_.removable = unit.removable;
+  copy_device_string(ArrayView<char>(info_.model), unit.vendor_and_product, false);
 
-  uint8_t capacity10[10] = {scsi::kReadCapacity10};
-  if (!run(capacity10, 10, data, 8, true)) return false;  // also fails for an empty drive
-  uint64_t last = scsi::be32(data);
-  info_.block_size = scsi::be32(data + 4);
+  const uint8_t capacity10[10] = {scsi::kReadCapacity10};
+  uint64_t last = 0;
+  if (!run(ConstByteView(capacity10), ByteView(data).first(8), true) ||  // also fails for an empty drive
+      !scsi::parse_capacity10(ConstByteView(data), &last, &info_.block_size))
+    return false;
   if (last == 0xFFFFFFFF) {  // more than 2 TiB: needs READ CAPACITY(16)
-    uint8_t capacity16[16] = {scsi::kServiceActionIn16, scsi::kReadCapacity16Action, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0};
+    const uint8_t capacity16[16] = {scsi::kServiceActionIn16, scsi::kReadCapacity16Action, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0};
     uint8_t big[32] = {};
-    if (!run(capacity16, 16, big, 32, true)) return false;
-    last = scsi::be64(big);
-    info_.block_size = scsi::be32(big + 8);
+    if (!run(ConstByteView(capacity16), ByteView(big), true) || !scsi::parse_capacity16(ConstByteView(big), &last, &info_.block_size))
+      return false;
   }
   info_.block_count = last + 1;
   if (info_.block_size < 512 || info_.block_size > 4096) return false;
@@ -160,16 +160,16 @@ void VirtioScsiDevice::shutdown() {
   controller_->shutdown();
 }
 
-bool VirtioScsiDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
+bool VirtioScsiDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {
   uint8_t cdb[16];
-  const uint32_t length = scsi::build_read_write(cdb, write, lba, blocks);
-  return run(cdb, length, dma, blocks * info_.block_size, !write);
+  const uint32_t length = scsi::build_read_write(ByteView(cdb), write, lba, blocks);
+  return run(ConstByteView(cdb).first(length), dma, !write);
 }
 
 bool VirtioScsiDevice::flush_cache() {
   if (optical_) return true;
-  uint8_t cdb[10] = {scsi::kSynchronizeCache10};
-  return run(cdb, 10, nullptr, 0, false);
+  const uint8_t cdb[10] = {scsi::kSynchronizeCache10};
+  return run(ConstByteView(cdb), ByteView(), false);
 }
 
 }  // namespace hardware

@@ -136,7 +136,7 @@ void DnsResolver::remember(const char* name, bool found, Ipv4Address address, ui
   while (name[n]) ++n;
   if (n > 0 && name[n - 1] == '.') --n;
   if (n == 0 || n >= sizeof(entry.name)) return;
-  for (uint32_t i = 0; i < n; ++i) entry.name[i] = name[i];
+  ArrayView<char>(entry.name).first(n).copy_from(ArrayView<const char>(name, n));
   entry.found = found;
   entry.address = address;
   entry.expires_ms = stack_.now_ms() + uint64_t{ttl_seconds} * 1000;
@@ -161,7 +161,7 @@ SharedPointer<IDnsQuery> DnsResolver::query(const char* name) {
   uint8_t scratch[dns::kMaxName + 1];
   Ipv4Address literal;
   const bool is_address = parse_ipv4(name, &literal);
-  if (!is_address && !dns::encode_name(name, scratch, sizeof(scratch))) return SharedPointer<IDnsQuery>();  // not a valid host name
+  if (!is_address && !dns::encode_name(name, ByteView(scratch))) return SharedPointer<IDnsQuery>();  // not a valid host name
 
   SharedPointer<Query> q = SharedPointer<Query>::make(allocator_);
   if (!q) return SharedPointer<IDnsQuery>();
@@ -178,9 +178,10 @@ SharedPointer<IDnsQuery> DnsResolver::query(const char* name) {
     return SharedPointer<IDnsQuery>(q);
   }
 
-  uint32_t n = 0;
-  while (name[n] && n < sizeof(q->name) - 1) {
-    q->name[n] = name[n];
+  const ArrayView<char> stored_name(q->name);  // checked: a name too long for it is cut, never overrun
+  uint64_t n = 0;
+  while (name[n] && n < stored_name.size() - 1) {
+    stored_name[n] = name[n];
     ++n;
   }
   q->id = static_cast<uint16_t>(random());
@@ -205,7 +206,7 @@ void DnsResolver::step(Query& q) {
   }
   const uint64_t now = stack_.now_ms();
   uint8_t request[dns::kHeaderSize + dns::kMaxName + 4];
-  const uint32_t request_length = dns::build_query(q.id, q.name, request, sizeof(request));
+  const uint32_t request_length = dns::build_query(q.id, q.name, ByteView(request));
   if (!request_length) {
     finish(q, DnsStatus::Failed);
     return;
@@ -222,10 +223,10 @@ void DnsResolver::step(Query& q) {
     Ipv4Address from;
     uint16_t from_port = 0;
     uint32_t length = 0;
-    while (q.udp->receive_from(reply, sizeof(reply), &from, &from_port, &length)) {
+    while (q.udp->receive_from(ByteView(reply), &from, &from_port, &length)) {
       if (!(from == config.dns) || from_port != 53 || length > sizeof(reply)) continue;  // not from our server
       dns::Answer answer;
-      switch (dns::parse_response(reply, length, q.id, q.name, &answer)) {
+      switch (dns::parse_response(ConstByteView(reply).first(length), q.id, q.name, &answer)) {
         case dns::ParseResult::Answer:
           q.address_ = answer.address;
           q.ttl_ = answer.ttl;
@@ -256,7 +257,7 @@ void DnsResolver::step(Query& q) {
         finish(q, DnsStatus::Failed);
         return;
       }
-      q.udp->send_to(config.dns, 53, request, request_length);
+      q.udp->send_to(config.dns, 53, ConstByteView(request).first(request_length));
       q.next_ms = now + (1000u << q.attempts);  // 1 s, 2 s, 4 s
       ++q.attempts;
     }
@@ -269,24 +270,25 @@ void DnsResolver::step(Query& q) {
     return;
   }
   if (q.tcp->is_connected() && !q.tcp_sent) {
-    uint8_t framed[2 + sizeof(request)];
-    store16(framed, static_cast<uint16_t>(request_length));
-    for (uint32_t i = 0; i < request_length; ++i) framed[2 + i] = request[i];
-    if (q.tcp->send(framed, 2 + request_length) != 2 + request_length) {
+    uint8_t framed_storage[2 + sizeof(request)];
+    ByteWriter framed{ByteView(framed_storage)};
+    framed.be16(static_cast<uint16_t>(request_length));
+    framed.bytes(ConstByteView(request).first(request_length));
+    if (!framed.ok() || q.tcp->send(framed.written()) != framed.position()) {
       finish(q, DnsStatus::Failed);
       return;
     }
     q.tcp_sent = true;
   }
   if (q.tcp_sent) {
-    q.tcp_received += q.tcp->receive(q.tcp_buffer + q.tcp_received, sizeof(q.tcp_buffer) - q.tcp_received);
+    q.tcp_received += q.tcp->receive(ByteView(q.tcp_buffer).dropped(q.tcp_received));
     if (q.tcp_received >= 2) {
-      const uint32_t expected = load16(q.tcp_buffer);
+      const uint32_t expected = (uint32_t{q.tcp_buffer[0]} << 8) | q.tcp_buffer[1];  // the length prefix
       if (expected + 2 > sizeof(q.tcp_buffer)) {
         finish(q, DnsStatus::Failed);
       } else if (q.tcp_received >= expected + 2) {
         dns::Answer answer;
-        switch (dns::parse_response(q.tcp_buffer + 2, expected, q.id, q.name, &answer)) {
+        switch (dns::parse_response(ConstByteView(q.tcp_buffer).subview(2, expected), q.id, q.name, &answer)) {
           case dns::ParseResult::Answer:
             q.address_ = answer.address;
             q.ttl_ = answer.ttl;

@@ -18,6 +18,8 @@
 
 #pragma once
 #include "Hardware/Bus/Usb/Legacy/LegacyHostController.hpp"
+#include "Utility/AllocatedView.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace hardware {
 
@@ -48,17 +50,15 @@ class OhciController final : public LegacyHostController {
   uint32_t port_count() const override { return ports_; }
   bool port_info(uint32_t port, UsbPortInfo* out) const override;
   bool start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) override;
-  bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
-                         uint16_t* length) override;
+  bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) override;
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
-  bool bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                     uint32_t* transferred) override;
+  bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
   bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
 
  protected:
   DeviceState* state(uint32_t port) const override;
   bool control_transfer(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
-                        void* data, uint16_t length, bool data_in) override;
+                        ByteView data, bool data_in) override;
   bool open_control_pipe(uint32_t port) override;
   void update_control_pipe(uint32_t port, uint8_t address, uint16_t max_packet) override;
   void close_device(uint32_t port) override;
@@ -94,7 +94,7 @@ class OhciController final : public LegacyHostController {
     Ed* ed = nullptr;
     Td* spare[2] = {};
     Td* armed = nullptr;  // interrupt pipes: the descriptor of the outstanding transfer
-    uint8_t* buffer = nullptr;
+    ByteView buffer;
   };
   struct Device : DeviceState {
     static constexpr uint32_t kPipes = 6;
@@ -110,13 +110,14 @@ class OhciController final : public LegacyHostController {
   void set_port(uint32_t port, uint32_t value) const { set_reg(0x54 + 4 * port, value); }
   bool reset_port(uint32_t port, bool* low_speed);
 
-  void* low_allocate(uint64_t size, uint64_t alignment);
+  template <class T>
+  ArrayView<T> low_allocate(uint64_t count, uint64_t alignment);
   bool create_pipe(Device& d, Pipe& p, List list, uint8_t endpoint_address, uint16_t max_packet);
   void link_pipe(Pipe& p);
   void unlink_pipe(Pipe& p);
   void free_pipe(Pipe& p);
   Td* descriptor(Pipe& p, uint32_t index) { return index == 0 ? p.spare[p.dummy] : &pool_[index - 1]; }
-  void fill_td(Td* td, uint32_t direction, uint32_t toggle, uint32_t bytes, const void* buffer, bool round);
+  void fill_td(Td* td, uint32_t direction, uint32_t toggle, ConstByteView buffer, bool round);
   void commit(Pipe& p, uint32_t count);
   bool wait(Pipe& p, uint32_t timeout_ms);
   void recover(Pipe& p);
@@ -131,9 +132,9 @@ class OhciController final : public LegacyHostController {
   Hcca* hcca_ = nullptr;
   Ed* control_head_ = nullptr;  // list heads: skipped endpoints that only anchor the lists
   Ed* bulk_head_ = nullptr;
-  Td* pool_ = nullptr;
-  uint8_t* control_buffer_ = nullptr;  // setup packet at 0, data from 64
-  uint8_t* bounce_ = nullptr;          // 64 KiB below 4 GiB
+  ArrayView<Td> pool_;
+  ByteView control_buffer_;  // setup packet at 0, data from 64
+  ByteView bounce_;          // 64 KiB below 4 GiB
   Ed* periodic_first_ = nullptr;
   Device devices_[kMaxPorts];
 };

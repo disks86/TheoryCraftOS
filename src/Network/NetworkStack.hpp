@@ -68,9 +68,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   Ipv4Address local_address() const override { return config_.address; }
   uint32_t max_payload() const override { return kMaxIpPayload; }
   uint64_t now_ms() const override { return clock_.now_ms(); }
-  bool send_ip(Ipv4Address destination, uint8_t protocol, const uint8_t* payload, uint32_t length) override;
-  bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, const uint8_t* payload,
-                    uint32_t length, bool link_broadcast) override;
+  bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) override;
+  bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
+                    bool link_broadcast) override;
 
  private:
   struct ArpEntry {
@@ -89,11 +89,11 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void on_lease(const IpConfiguration& configuration) override;
   void on_lease_lost() override;
 
-  void handle_frame(const uint8_t* frame, uint32_t length);
-  void handle_arp(const uint8_t* arp, uint32_t length);
-  void handle_ipv4(const uint8_t* packet, uint32_t length);
-  void handle_icmp(Ipv4Address source, const uint8_t* icmp, uint32_t length);
-  bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, const uint8_t* payload, uint32_t length);
+  void handle_frame(ConstByteView frame);
+  void handle_arp(ConstByteView arp);
+  void handle_ipv4(ConstByteView packet);
+  void handle_icmp(Ipv4Address source, ConstByteView icmp);
+  bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload);
   void send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
   void learn(Ipv4Address address, const hardware::MacAddress& mac);
   void flush_pending(Ipv4Address resolved);

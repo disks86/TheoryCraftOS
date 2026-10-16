@@ -21,6 +21,7 @@
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Thread.hpp"
+#include "Utility/AllocatedView.hpp"
 
 using namespace kernel;
 
@@ -113,13 +114,15 @@ void print_main(void* argument) {
   PrintJob* job = static_cast<PrintJob*>(argument);
   job->gate->go.wait();
   for (uint32_t i = 0; i < 10; ++i) {
-    console::Guard guard;  // several calls, one line
-    console::puts("[T");
-    console::put_dec(job->id);
-    console::puts("] line ");
-    console::put_dec(i);
-    console::puts(" of ten\n");
-    if (i % 3 == 0) yield();
+    {
+      console::Guard guard;  // several calls, one line
+      console::puts("[T");
+      console::put_dec(job->id);
+      console::puts("] line ");
+      console::put_dec(i);
+      console::puts(" of ten\n");
+    }
+    if (i % 3 == 0) yield();  // invite a context switch between lines (never inside the guard)
   }
 }
 
@@ -145,13 +148,13 @@ constexpr uint32_t kReferenceBlocks = 256;
 struct StorageJob {
   hardware::IStorageDevice* device;
   StartGate* gate;
-  const uint8_t* reference;  // the first reference_blocks blocks
+  ConstByteView reference;  // the first reference_blocks blocks
   uint32_t reference_blocks;
   uint32_t block_size;
   uint32_t seed;
   uint32_t rounds;
   bool ok;
-  uint8_t* scratch;  // read buffer
+  ByteView scratch;  // read buffer
 };
 
 void storage_read_main(void* argument) {
@@ -162,8 +165,8 @@ void storage_read_main(void* argument) {
   for (uint32_t i = 0; i < job->rounds && job->ok; ++i) {
     const uint32_t count = 1 + next_random(&state) % 17;
     const uint32_t lba = next_random(&state) % (job->reference_blocks - count + 1);
-    if (!job->device->read(lba, count, job->scratch) ||
-        __builtin_memcmp(job->scratch, job->reference + uint64_t{lba} * job->block_size, uint64_t{count} * job->block_size) != 0)
+    const ByteView got = job->scratch.first(uint64_t{count} * job->block_size);
+    if (!job->device->read(lba, got) || !got.equals(job->reference.subview(uint64_t{lba} * job->block_size, got.size())))
       job->ok = false;
   }
 }
@@ -177,30 +180,29 @@ struct WriteJob {
   uint32_t block_size;
   uint32_t id;
   bool ok;
-  uint8_t* buffer;     // blocks * block_size, pattern
-  uint8_t* original;   // saved contents
-  uint8_t* readback;
+  ByteView memory;  // three regions of blocks * block_size bytes: pattern, saved original, read-back
 };
 
 void storage_write_main(void* argument) {
   WriteJob* job = static_cast<WriteJob*>(argument);
   job->gate->go.wait();
-  const uint32_t bytes = job->blocks * job->block_size;
-  job->ok = job->device->read(job->first_block, job->blocks, job->original);
+  const uint64_t bytes = uint64_t{job->blocks} * job->block_size;
+  const ByteView buffer = job->memory.subview(0, bytes), original = job->memory.subview(bytes, bytes),
+                 readback = job->memory.subview(2 * bytes, bytes);
+  job->ok = job->device->read(job->first_block, original);
   for (uint32_t round = 0; round < 5 && job->ok; ++round) {
-    for (uint32_t b = 0; b < bytes; ++b) job->buffer[b] = static_cast<uint8_t>(job->id * 41 + round * 7 + b);
-    job->ok = job->device->write(job->first_block, job->blocks, job->buffer) && job->device->flush() &&
-              job->device->read(job->first_block, job->blocks, job->readback) &&
-              __builtin_memcmp(job->buffer, job->readback, bytes) == 0;
+    for (uint64_t b = 0; b < bytes; ++b) buffer[b] = static_cast<uint8_t>(job->id * 41 + round * 7 + b);
+    job->ok = job->device->write(job->first_block, buffer) && job->device->flush() &&
+              job->device->read(job->first_block, readback) && buffer.equals(readback);
   }
-  job->ok = job->device->write(job->first_block, job->blocks, job->original) && job->ok;  // put it back
+  job->ok = job->device->write(job->first_block, original) && job->ok;  // put it back
 }
 
 bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocator& allocator) {
   if (storage.count() == 0) return true;
   constexpr uint32_t kReadersPerDevice = 3, kWriters = 4, kMaxDevices = 16;
   struct Reference {
-    uint8_t* data = nullptr;
+    ByteView data;
     uint32_t blocks = 0;
     bool valid = false;
   };
@@ -216,15 +218,15 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     const hardware::StorageInfo info = dev->info();
     uint32_t blocks = info.block_count < kReferenceBlocks ? static_cast<uint32_t>(info.block_count) : kReferenceBlocks;
     if (blocks < 32) continue;
-    references[d].data = static_cast<uint8_t*>(allocator.allocate(uint64_t{blocks} * info.block_size));
-    if (!references[d].data || !dev->read(0, blocks, references[d].data)) continue;
+    references[d].data = allocate_view<uint8_t>(allocator, uint64_t{blocks} * info.block_size);
+    if (references[d].data.empty() || !dev->read(0, references[d].data)) continue;
     references[d].blocks = blocks;
     references[d].valid = true;
     for (uint32_t r = 0; r < kReadersPerDevice; ++r) {
       StorageJob& job = jobs[job_count];
       job = {dev, &gate, references[d].data, blocks, info.block_size, 31 * (d + 1) + r, 120, false,
-             static_cast<uint8_t*>(allocator.allocate(uint64_t{17} * info.block_size))};
-      threads[job_count] = job.scratch ? spawn(storage_read_main, &job, "storage") : nullptr;
+             allocate_view<uint8_t>(allocator, uint64_t{17} * info.block_size)};
+      threads[job_count] = !job.scratch.empty() ? spawn(storage_read_main, &job, "storage") : nullptr;
       ++job_count;
     }
   }
@@ -238,15 +240,15 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
     hardware::IStorageDevice* dev = storage.at(d);
     const hardware::StorageInfo info = dev->info();
     if (info.read_only || !references[d].valid) continue;
-    if (__builtin_memcmp(references[d].data, "TCOS-SCRATCH", 12) != 0) continue;
+    if (!references[d].data.first(12).equals(text_bytes("TCOS-SCRATCH"))) continue;
     scratch_device = dev;
     const uint32_t region = 8;  // blocks per writer
     for (uint32_t w = 0; w < kWriters; ++w) {
       const uint32_t bytes = region * info.block_size;
-      uint8_t* memory = static_cast<uint8_t*>(allocator.allocate(uint64_t{bytes} * 3));
-      if (!memory) break;
+      ByteView memory = allocate_view<uint8_t>(allocator, uint64_t{bytes} * 3);
+      if (memory.empty()) break;
       writes[w] = {dev, &gate, info.block_count - uint64_t{kWriters} * region + uint64_t{w} * region, region, info.block_size, w, false,
-                   memory, memory + bytes, memory + 2 * bytes};
+                   memory};
       write_threads[w] = spawn(storage_write_main, &writes[w], "writer");
       ++writer_count;
     }
@@ -261,10 +263,10 @@ bool test_storage(hardware::SystemStorageDevices& storage, allocators::IAllocato
   for (uint32_t w = 0; w < writer_count; ++w) {
     writers_ok &= write_threads[w] && join(write_threads[w], 60000000);
     writers_ok &= writes[w].ok;
-    allocator.deallocate(writes[w].buffer);
+    release_view(allocator, writes[w].memory);
   }
-  for (uint32_t j = 0; j < job_count; ++j) allocator.deallocate(jobs[j].scratch);
-  for (uint32_t d = 0; d < devices; ++d) allocator.deallocate(references[d].data);
+  for (uint32_t j = 0; j < job_count; ++j) release_view(allocator, jobs[j].scratch);
+  for (uint32_t d = 0; d < devices; ++d) release_view(allocator, references[d].data);
 
   bool ok = true;
   {
@@ -309,17 +311,17 @@ void udp_main(void* argument) {
     uint8_t message[24];
     for (uint32_t b = 0; b < sizeof(message); ++b) message[b] = static_cast<uint8_t>(job->id * 16 + i + b);
     ++job->attempts;
-    if (!socket->send_to(gateway, kHostUdpEcho, message, sizeof(message))) continue;
+    if (!socket->send_to(gateway, kHostUdpEcho, ConstByteView(message))) continue;
     uint8_t reply[64];
     uint32_t length = 0;
     const uint64_t deadline = job->stack->now_ms() + 1000;
     bool got = false;
     while (!got && job->stack->now_ms() < deadline) {
-      got = socket->receive_from(reply, sizeof(reply), nullptr, nullptr, &length);
+      got = socket->receive_from(ByteView(reply), nullptr, nullptr, &length);
       if (!got) sleep_us(300);
     }
     if (got) {
-      if (length == sizeof(message) && __builtin_memcmp(reply, message, length) == 0) ++job->successes;
+      if (length == sizeof(message) && ConstByteView(reply).first(length).equals(ConstByteView(message))) ++job->successes;
       else job->ok = false;  // an answer that is not ours: crossed streams
     }
   }
@@ -360,12 +362,12 @@ void tcp_main(void* argument) {
   uint32_t got = 0;
   while (job->stack->now_ms() < deadline && got < sizeof(message)) {
     if (tcp->state() == network::TcpState::Closed) break;
-    if (tcp->is_connected() && !sent) sent = tcp->send(message, sizeof(message)) > 0;
-    got += tcp->receive(reply + got, sizeof(reply) - got);
+    if (tcp->is_connected() && !sent) sent = tcp->send(ConstByteView(message)) > 0;
+    got += tcp->receive(ByteView(reply).dropped(got));
     if (got < sizeof(message)) sleep_us(300);
   }
   if (got == sizeof(message)) {
-    if (__builtin_memcmp(reply, message, got) == 0) job->successes = 1;
+    if (ConstByteView(reply).first(got).equals(ConstByteView(message))) job->successes = 1;
     else job->ok = false;
   }
   tcp->close();

@@ -58,11 +58,11 @@ class DhcpClient final : public IDhcpClient {
   Ipv4Address server() const override { return server_; }
 
  private:
-  uint32_t build(uint8_t* message, uint8_t type, bool broadcast_reply) const;
+  void build(ByteWriter& out, uint8_t type, bool broadcast_reply) const;
   void begin_discovery();
   void send_discover();
   void send_request(bool renewing);
-  void handle(const uint8_t* message, uint32_t length);
+  void handle(ConstByteView message);
   void bind(const IpConfiguration& configuration, uint32_t lease_seconds, uint32_t t1_seconds);
   void schedule_retry();
 

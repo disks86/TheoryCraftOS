@@ -74,30 +74,30 @@ bool E1000NetworkInterface::initialize() {
   for (uint32_t i = 0; i < 128; ++i) write(kMulticastTable + 4 * i, 0);
 
   // Descriptor rings and the frame buffers (this family does 64-bit DMA).
-  rx_ring_ = static_cast<ReceiveDescriptor*>(allocator_.allocate_aligned(kReceiveDescriptors * sizeof(ReceiveDescriptor), 4096));
-  tx_ring_ = static_cast<TransmitDescriptor*>(allocator_.allocate_aligned(kTransmitDescriptors * sizeof(TransmitDescriptor), 4096));
-  buffers_ = static_cast<uint8_t*>(allocator_.allocate_aligned(uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096));
-  if (!rx_ring_ || !tx_ring_ || !buffers_) {
+  rx_ring_ = allocate_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
+  tx_ring_ = allocate_view<TransmitDescriptor>(allocator_, kTransmitDescriptors, 4096);
+  buffers_ = allocate_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096);
+  if (rx_ring_.empty() || tx_ring_.empty() || buffers_.empty()) {
     shutdown();
     return false;
   }
-  __builtin_memset(rx_ring_, 0, kReceiveDescriptors * sizeof(ReceiveDescriptor));
-  __builtin_memset(tx_ring_, 0, kTransmitDescriptors * sizeof(TransmitDescriptor));
-  for (uint32_t i = 0; i < kReceiveDescriptors; ++i) rx_ring_[i].address = reinterpret_cast<uint64_t>(rx_buffer(i));
+  __builtin_memset(rx_ring_.data(), 0, rx_ring_.size_bytes());
+  __builtin_memset(tx_ring_.data(), 0, tx_ring_.size_bytes());
+  for (uint32_t i = 0; i < kReceiveDescriptors; ++i) rx_ring_[i].address = reinterpret_cast<uint64_t>(rx_buffer(i).data());
   for (uint32_t i = 0; i < kTransmitDescriptors; ++i) {
-    tx_ring_[i].address = reinterpret_cast<uint64_t>(tx_buffer(i));
+    tx_ring_[i].address = reinterpret_cast<uint64_t>(tx_buffer(i).data());
     tx_ring_[i].status = kStatusDescriptorDone;  // free: the "device is done with it" state
   }
 
-  write(kRdbal, static_cast<uint32_t>(reinterpret_cast<uint64_t>(rx_ring_)));
-  write(kRdbah, static_cast<uint32_t>(reinterpret_cast<uint64_t>(rx_ring_) >> 32));
+  write(kRdbal, static_cast<uint32_t>(reinterpret_cast<uint64_t>(rx_ring_.data())));
+  write(kRdbah, static_cast<uint32_t>(reinterpret_cast<uint64_t>(rx_ring_.data()) >> 32));
   write(kRdlen, kReceiveDescriptors * sizeof(ReceiveDescriptor));
   write(kRdh, 0);
   write(kRdt, kReceiveDescriptors - 1);  // all but one descriptor belong to the card
   rx_next_ = 0;
 
-  write(kTdbal, static_cast<uint32_t>(reinterpret_cast<uint64_t>(tx_ring_)));
-  write(kTdbah, static_cast<uint32_t>(reinterpret_cast<uint64_t>(tx_ring_) >> 32));
+  write(kTdbal, static_cast<uint32_t>(reinterpret_cast<uint64_t>(tx_ring_.data())));
+  write(kTdbah, static_cast<uint32_t>(reinterpret_cast<uint64_t>(tx_ring_.data()) >> 32));
   write(kTdlen, kTransmitDescriptors * sizeof(TransmitDescriptor));
   write(kTdh, 0);
   write(kTdt, 0);
@@ -117,12 +117,9 @@ void E1000NetworkInterface::shutdown() {
     write(kTctl, 0);
     write(kCtrl, read(kCtrl) | kCtrlReset);  // the card stops using our memory
   }
-  allocator_.deallocate(rx_ring_);
-  allocator_.deallocate(tx_ring_);
-  allocator_.deallocate(buffers_);
-  rx_ring_ = nullptr;
-  tx_ring_ = nullptr;
-  buffers_ = nullptr;
+  release_view(allocator_, rx_ring_);
+  release_view(allocator_, tx_ring_);
+  release_view(allocator_, buffers_);
   if (owns_device_) {
     owns_device_ = false;
     reattach_firmware_drivers(st_, device_.address);
@@ -131,9 +128,9 @@ void E1000NetworkInterface::shutdown() {
 
 bool E1000NetworkInterface::link_up() const { return started_ && (read(kStatus) & kStatusLinkUp); }
 
-bool E1000NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+bool E1000NetworkInterface::transmit(ConstByteView frame) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
   }
@@ -142,10 +139,10 @@ bool E1000NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
     ++stats_.send_failures;
     return false;
   }
-  const uint32_t padded = length < kEthernetMinFrame ? kEthernetMinFrame : length;
-  uint8_t* buffer = tx_buffer(tx_next_);
-  __builtin_memset(buffer, 0, padded);
-  __builtin_memcpy(buffer, frame, length);
+  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
+  const ByteView buffer = tx_buffer(tx_next_).first(padded);
+  buffer.fill(0);
+  buffer.copy_from(frame);
   d.length = static_cast<uint16_t>(padded);
   d.status = 0;
   d.command = kCommandEndOfPacket | kCommandInsertCrc | kCommandReportStatus;
@@ -156,9 +153,9 @@ bool E1000NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
   return true;
 }
 
-bool E1000NetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+bool E1000NetworkInterface::receive(ByteView buffer, uint32_t* length) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !buffer || !length) return false;
+  if (!started_ || !length) return false;
   volatile ReceiveDescriptor& d = rx_ring_[rx_next_];
   if (!(d.status & kStatusDescriptorDone)) return false;
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -166,7 +163,7 @@ bool E1000NetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t
   const uint32_t frame = d.length;
   const bool usable = d.errors == 0 && frame > 0 && frame <= kBufferSize;
   if (usable) {
-    __builtin_memcpy(buffer, rx_buffer(rx_next_), frame < capacity ? frame : capacity);
+    buffer.copy_from(ConstByteView(rx_buffer(rx_next_)).first(frame).at_most(buffer.size()));  // as much as fits
     *length = frame;
     ++stats_.frames_received;
   } else {
@@ -175,7 +172,7 @@ bool E1000NetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t
   d.status = 0;  // give the descriptor back to the card
   write(kRdt, rx_next_);
   rx_next_ = (rx_next_ + 1) % kReceiveDescriptors;
-  return usable ? true : receive(buffer, capacity, length);  // skip a bad frame, look at the next
+  return usable ? true : receive(buffer, length);  // skip a bad frame, look at the next
 }
 
 }  // namespace hardware

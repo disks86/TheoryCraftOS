@@ -52,15 +52,16 @@ bool UefiSimpleNetworkInterface::link_up() const {
   return started_ && (!mode->media_present_supported || mode->media_present);
 }
 
-bool UefiSimpleNetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+bool UefiSimpleNetworkInterface::transmit(ConstByteView frame) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
   }
-  const uint32_t padded = length < kEthernetMinFrame ? kEthernetMinFrame : length;
-  __builtin_memset(staging_, 0, padded);
-  __builtin_memcpy(staging_, frame, length);
+  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
+  const ByteView staged = ByteView(staging_).first(padded);
+  staged.fill(0);
+  staged.copy_from(frame);
   // Header size 0: the buffer already holds a complete Ethernet frame.
   efi::Status sent = efi::kSuccess;
   kernel::firmware([&] { sent = snp_->transmit(snp_, 0, padded, staging_, nullptr, nullptr, nullptr); });
@@ -81,15 +82,16 @@ bool UefiSimpleNetworkInterface::transmit(const uint8_t* frame, uint32_t length)
   return true;
 }
 
-bool UefiSimpleNetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+bool UefiSimpleNetworkInterface::receive(ByteView buffer, uint32_t* length) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !buffer || !length) return false;
+  if (!started_ || !length) return false;
   uint8_t frame[kEthernetMaxFrame + 64];
   efi::Uintn size = sizeof(frame), header = 0;
   efi::Status received = efi::kSuccess;
   kernel::firmware([&] { received = snp_->receive(snp_, &header, &size, frame, nullptr, nullptr, nullptr); });
   if (received != efi::kSuccess) return false;
-  __builtin_memcpy(buffer, frame, size < capacity ? size : capacity);
+  if (size > sizeof(frame)) size = sizeof(frame);  // the firmware must not claim more than it was given room for
+  buffer.copy_from(ConstByteView(frame).first(size).at_most(buffer.size()));  // as much as fits
   *length = static_cast<uint32_t>(size);
   ++stats_.frames_received;
   return true;

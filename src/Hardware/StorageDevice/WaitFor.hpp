@@ -19,6 +19,8 @@
 #pragma once
 #include "Kernel/Delay.hpp"
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
+#include "Utility/ByteStream.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -40,13 +42,15 @@ bool wait_for(efi::SystemTable* st, uint32_t timeout_ms, F&& done) {
 
 // Copies a fixed-width, blank-padded device string (ATA, SCSI inquiry) into a
 // NUL-terminated buffer with trailing blanks removed. `swapped` undoes ATA's
-// byte-swapped 16-bit words.
-inline void copy_device_string(char* out, uint32_t capacity, const uint8_t* in, uint32_t length, bool swapped) {
-  uint32_t n = length < capacity - 1 ? length : capacity - 1;
-  for (uint32_t i = 0; i < n; ++i) out[i] = static_cast<char>(swapped ? in[i ^ 1] : in[i]);
+// byte-swapped 16-bit words (the input length must then be even).
+inline void copy_device_string(ArrayView<char> out, ConstByteView in, bool swapped) {
+  if (out.empty()) return;
+  uint64_t n = in.size() < out.size() - 1 ? in.size() : out.size() - 1;
+  if (swapped) n &= ~uint64_t{1};  // words
+  for (uint64_t i = 0; i < n; ++i) out[i] = static_cast<char>(swapped ? in[i ^ 1] : in[i]);
   while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == 0)) --n;
   out[n] = 0;
-  for (uint32_t i = 0; i < n; ++i)
+  for (uint64_t i = 0; i < n; ++i)
     if (static_cast<uint8_t>(out[i]) < 32 || static_cast<uint8_t>(out[i]) > 126) out[i] = '?';
 }
 

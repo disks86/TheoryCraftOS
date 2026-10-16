@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ByteStream.hpp"
 
 namespace hardware::scsi {
 
@@ -28,26 +29,64 @@ constexpr uint8_t kReadCapacity16Action = 0x10;
 constexpr uint8_t kDeviceTypeDisk = 0x00, kDeviceTypeOptical = 0x05;
 constexpr uint8_t kStatusGood = 0x00, kStatusCheckCondition = 0x02;
 
-// Fills `cdb` (zeroed first, at least 16 bytes) with a READ or WRITE of `blocks`
+// Fills `cdb` (at least 16 bytes, zeroed first) with a READ or WRITE of `blocks`
 // blocks at `lba`; returns the number of bytes the command occupies (10 or 16).
-inline uint32_t build_read_write(uint8_t* cdb, bool write, uint64_t lba, uint32_t blocks) {
-  for (int i = 0; i < 16; ++i) cdb[i] = 0;
+inline uint32_t build_read_write(ByteView cdb, bool write, uint64_t lba, uint32_t blocks) {
+  cdb.fill(0);
+  ByteWriter out(cdb);
   if (lba <= 0xFFFFFFFFull && blocks <= 0xFFFF) {
-    cdb[0] = write ? kWrite10 : kRead10;
-    for (int i = 0; i < 4; ++i) cdb[2 + i] = static_cast<uint8_t>(lba >> (24 - 8 * i));
-    cdb[7] = static_cast<uint8_t>(blocks >> 8);
-    cdb[8] = static_cast<uint8_t>(blocks);
+    out.u8(write ? kWrite10 : kRead10);
+    out.u8(0);
+    out.be32(static_cast<uint32_t>(lba));
+    out.u8(0);
+    out.be16(static_cast<uint16_t>(blocks));
     return 10;
   }
-  cdb[0] = write ? kWrite16 : kRead16;
-  for (int i = 0; i < 8; ++i) cdb[2 + i] = static_cast<uint8_t>(lba >> (56 - 8 * i));
-  for (int i = 0; i < 4; ++i) cdb[10 + i] = static_cast<uint8_t>(blocks >> (24 - 8 * i));
+  out.u8(write ? kWrite16 : kRead16);
+  out.u8(0);
+  out.be32(static_cast<uint32_t>(lba >> 32));
+  out.be32(static_cast<uint32_t>(lba));
+  out.be32(blocks);
   return 16;
 }
 
-inline uint32_t be32(const uint8_t* p) {
-  return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3];
+// READ CAPACITY(10) data: last block number and block size. False if short.
+inline bool parse_capacity10(ConstByteView data, uint64_t* last_block, uint32_t* block_size) {
+  ByteReader in(data);
+  *last_block = in.be32();
+  *block_size = in.be32();
+  return in.ok();
 }
-inline uint64_t be64(const uint8_t* p) { return (uint64_t{be32(p)} << 32) | be32(p + 4); }
+
+// READ CAPACITY(16) data (the first 12 bytes matter).
+inline bool parse_capacity16(ConstByteView data, uint64_t* last_block, uint32_t* block_size) {
+  ByteReader in(data);
+  const uint64_t high = in.be32();
+  *last_block = (high << 32) | in.be32();
+  *block_size = in.be32();
+  return in.ok();
+}
+
+// The standard INQUIRY data: what kind of device, removable or not, and the
+// vendor + product text (bytes 8..31).
+struct InquiryInfo {
+  bool present = false;        // a logical unit is connected
+  uint8_t device_type = 0;
+  bool removable = false;
+  ConstByteView vendor_and_product;
+};
+inline bool parse_inquiry(ConstByteView data, InquiryInfo* out) {
+  ByteReader in(data);
+  const uint8_t qualifier_and_type = in.u8();
+  const uint8_t flags = in.u8();
+  in.skip(6);
+  const ConstByteView text = in.take(24);
+  if (!in.ok()) return false;
+  out->present = (qualifier_and_type >> 5) == 0;
+  out->device_type = qualifier_and_type & 0x1F;
+  out->removable = flags & 0x80;
+  out->vendor_and_product = text;
+  return true;
+}
 
 }  // namespace hardware::scsi

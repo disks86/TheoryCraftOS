@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Utility/AllocatedView.hpp"
 
 namespace hardware {
 
@@ -32,9 +33,9 @@ class Virtqueue {
   void release(allocators::IAllocator& allocator);
 
   uint16_t size() const { return size_; }
-  uint64_t descriptor_address() const { return reinterpret_cast<uint64_t>(descriptors_); }
-  uint64_t available_address() const { return reinterpret_cast<uint64_t>(available_); }
-  uint64_t used_address() const { return reinterpret_cast<uint64_t>(used_); }
+  uint64_t descriptor_address() const { return reinterpret_cast<uint64_t>(descriptors_.data()); }
+  uint64_t available_address() const { return reinterpret_cast<uint64_t>(available_memory_.data()); }
+  uint64_t used_address() const { return reinterpret_cast<uint64_t>(used_memory_.data()); }
 
   // Offers `length` bytes at `data` to the device as descriptor `index`: for the
   // device to fill in (the default) or, with device_writes false, to read.
@@ -57,26 +58,28 @@ class Virtqueue {
     uint16_t flags;
     uint16_t next;
   };
-  struct Available {
-    uint16_t flags;
-    uint16_t index;
-    uint16_t ring[1];  // really `size` entries
-  };
   struct UsedElement {
     uint32_t id;
     uint32_t length;
   };
-  struct Used {
-    uint16_t flags;
-    uint16_t index;
-    UsedElement ring[1];  // really `size` entries
-  };
 
-  Descriptor* descriptors_ = nullptr;
-  Available* available_ = nullptr;
-  Used* used_ = nullptr;
+  // The three regions, one allocation each. Their headers (flags, index) are
+  // reached through the views below, so every ring slot access is bounds-checked
+  // - including the ones the device chooses (used-ring entries).
+  ArrayView<Descriptor> descriptors_;
+  ByteView available_memory_;  // flags, index, then `size` 16-bit slots, then used_event
+  ByteView used_memory_;       // flags, index, then `size` UsedElements, then avail_event
   uint16_t size_ = 0;
   uint16_t last_used_ = 0;
+
+  volatile uint16_t& available_index() const { return *reinterpret_cast<volatile uint16_t*>(&available_memory_[2]); }
+  volatile uint16_t& available_slot(uint16_t i) const {
+    return *reinterpret_cast<volatile uint16_t*>(&available_memory_[4 + 2 * uint64_t{i}]);
+  }
+  volatile uint16_t& used_index() const { return *reinterpret_cast<volatile uint16_t*>(&used_memory_[2]); }
+  volatile UsedElement& used_slot(uint16_t i) const {
+    return *reinterpret_cast<volatile UsedElement*>(&used_memory_[4 + 8 * uint64_t{i}]);
+  }
 };
 
 }  // namespace hardware

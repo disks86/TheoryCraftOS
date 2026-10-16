@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/SharedPointer.hpp"
@@ -48,8 +49,7 @@ class VirtioScsiController {
     uint8_t status = 0;      // SCSI status
   };
   // Runs one command at target:lun0 with an optional data stage in one direction.
-  Result command(uint32_t target, uint32_t lun, const uint8_t* cdb, uint32_t cdb_length, void* data,
-                 uint32_t length, bool device_writes);
+  Result command(uint32_t target, uint32_t lun, ConstByteView cdb, ByteView data, bool device_writes);
 
  private:
   struct RequestHeader {
@@ -70,7 +70,7 @@ class VirtioScsiController {
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;
   Virtqueue control_, event_, request_;
-  uint8_t* memory_ = nullptr;  // request and response headers
+  ByteView memory_;  // request and response headers
   uint32_t max_targets_ = 0;
   uint32_t cdb_size_ = 32;
   uint32_t sense_size_ = 96;
@@ -90,12 +90,12 @@ class VirtioScsiDevice final : public StorageDeviceBase {
   void shutdown() override;
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
+  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
   bool flush_cache() override;
 
  private:
   // Runs a command, retrying while the target reports a unit attention.
-  bool run(const uint8_t* cdb, uint32_t cdb_length, void* data, uint32_t length, bool device_writes);
+  bool run(ConstByteView cdb, ByteView data, bool device_writes);
 
   SharedPointer<VirtioScsiController> controller_;
   uint32_t target_;

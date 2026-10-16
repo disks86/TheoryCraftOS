@@ -64,7 +64,7 @@ bool QemuStdVgaGpu::initialize() {
     for (uint32_t i = 0; i < kModeCount; ++i) {
       if (kModes[i].width == w && kModes[i].height == h) {
         current_ = i;
-        set_framebuffer(framebuffer_, w, h, w * 4, true);
+        set_framebuffer(ByteView(framebuffer_, uint64_t{w} * h * 4), w, h, w * 4, true);
         return true;
       }
     }
@@ -90,7 +90,7 @@ bool QemuStdVgaGpu::set_mode(uint32_t index) {
   write_register(kIndexEnable, kEnabled | kLinearFramebuffer);
   if (read_register(kIndexXres) != m.width || read_register(kIndexYres) != m.height) return false;
   current_ = index;
-  set_framebuffer(framebuffer_, m.width, m.height, m.width * 4, true);
+  set_framebuffer(ByteView(framebuffer_, uint64_t{m.width} * m.height * 4), m.width, m.height, m.width * 4, true);
   return true;
 }
 

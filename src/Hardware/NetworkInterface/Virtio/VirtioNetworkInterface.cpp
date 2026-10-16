@@ -39,13 +39,13 @@ bool VirtioNetworkInterface::initialize() {
   if (accepted & kFeatureMac)
     for (uint32_t i = 0; i < 6; ++i) mac_.bytes[i] = transport_.read_config8(kConfigMac + i);
 
-  buffers_ = static_cast<uint8_t*>(allocator_.allocate_aligned(uint64_t{2 * kBuffers} * kBufferSize, 4096));
-  if (!buffers_ || !transport_.setup_queue(kReceiveQueue, &rx_) || !transport_.setup_queue(kTransmitQueue, &tx_) ||
+  buffers_ = allocate_view<uint8_t>(allocator_, uint64_t{2 * kBuffers} * kBufferSize, 4096);
+  if (buffers_.empty() || !transport_.setup_queue(kReceiveQueue, &rx_) || !transport_.setup_queue(kTransmitQueue, &tx_) ||
       rx_.size() < kBuffers || tx_.size() < kBuffers) {
     shutdown();
     return false;
   }
-  for (uint16_t i = 0; i < kBuffers; ++i) rx_.post(i, rx_buffer(i), kBufferSize);  // empty buffers for the device to fill
+  for (uint16_t i = 0; i < kBuffers; ++i) rx_.post(i, rx_buffer(i).data(), kBufferSize);  // empty buffers for the device to fill
   tx_busy_ = 0;
 
   if (!transport_.start()) {
@@ -62,8 +62,7 @@ void VirtioNetworkInterface::shutdown() {
   transport_.shutdown();  // reset first: the device must stop using our memory
   rx_.release(allocator_);
   tx_.release(allocator_);
-  allocator_.deallocate(buffers_);
-  buffers_ = nullptr;
+  release_view(allocator_, buffers_);
 }
 
 bool VirtioNetworkInterface::link_up() const {
@@ -77,12 +76,13 @@ bool VirtioNetworkInterface::link_up() const {
 void VirtioNetworkInterface::reclaim_transmitted() {
   uint16_t id;
   uint32_t length;
-  while (tx_.take_used(&id, &length)) tx_busy_ &= ~(1u << id);
+  while (tx_.take_used(&id, &length))
+    if (id < kBuffers) tx_busy_ &= ~(1u << id);  // the id comes from the device: ignore one that is not ours
 }
 
-bool VirtioNetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+bool VirtioNetworkInterface::transmit(ConstByteView frame) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
+  if (!started_ || frame.empty() || frame.size() > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
   }
@@ -94,33 +94,34 @@ bool VirtioNetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
     return false;
   }
 
-  const uint32_t padded = length < kEthernetMinFrame ? kEthernetMinFrame : length;
-  uint8_t* buffer = tx_buffer(slot);
-  __builtin_memset(buffer, 0, kHeaderSize + padded);  // zero header (no offloads) and padding
-  __builtin_memcpy(buffer + kHeaderSize, frame, length);
+  const uint32_t padded = frame.size() < kEthernetMinFrame ? kEthernetMinFrame : static_cast<uint32_t>(frame.size());
+  const ByteView buffer = tx_buffer(slot).first(kHeaderSize + padded);
+  buffer.fill(0);  // zero header (no offloads) and padding
+  buffer.subview(kHeaderSize).copy_from(frame);
   tx_busy_ |= 1u << slot;
-  tx_.post(slot, buffer, kHeaderSize + padded, /*device_writes=*/false);
+  tx_.post(slot, buffer.data(), static_cast<uint32_t>(buffer.size()), /*device_writes=*/false);
   transport_.notify(kTransmitQueue);
   ++stats_.frames_sent;
   return true;
 }
 
-bool VirtioNetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+bool VirtioNetworkInterface::receive(ByteView buffer, uint32_t* length) {
   kernel::ScopedMutex guard(mutex_);
-  if (!started_ || !buffer || !length) return false;
+  if (!started_ || !length) return false;
   uint16_t id;
   uint32_t written;
   while (rx_.take_used(&id, &written)) {
+    if (id >= kBuffers) continue;  // not one of our buffers: the device is confused, ignore the entry
     const bool usable = written > kHeaderSize && written <= kBufferSize;
     if (usable) {
       const uint32_t frame = written - kHeaderSize;
-      __builtin_memcpy(buffer, rx_buffer(id) + kHeaderSize, frame < capacity ? frame : capacity);
+      buffer.copy_from(ConstByteView(rx_buffer(id)).subview(kHeaderSize, frame).at_most(buffer.size()));  // as much as fits
       *length = frame;
       ++stats_.frames_received;
     } else {
       ++stats_.frames_dropped;
     }
-    rx_.post(id, rx_buffer(id), kBufferSize);  // hand the buffer back
+    rx_.post(id, rx_buffer(id).data(), kBufferSize);  // hand the buffer back
     transport_.notify(kReceiveQueue);
     if (usable) return true;
   }

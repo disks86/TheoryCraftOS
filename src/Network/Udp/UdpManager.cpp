@@ -43,18 +43,21 @@ SharedPointer<UdpSocket> UdpManager::open(uint16_t port) {
   return socket;
 }
 
-bool UdpManager::handle(Ipv4Address source, Ipv4Address destination, const uint8_t* segment, uint32_t length) {
-  if (length < 8) return false;
-  const uint16_t udp_length = load16(segment + 4);
-  if (udp_length < 8 || udp_length > length) return false;
-  if (load16(segment + 6) != 0) {  // a zero checksum means the sender did not compute one
-    const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolUdp, udp_length), segment, udp_length);
+bool UdpManager::handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment) {
+  ByteReader in(segment);
+  const uint16_t source_port = in.be16();
+  const uint16_t port = in.be16();
+  const uint16_t udp_length = in.be16();
+  const uint16_t wire_checksum = in.be16();
+  if (!in.ok() || udp_length < 8 || udp_length > segment.size()) return false;
+  const ConstByteView datagram = segment.first(udp_length);  // anything after it is padding
+  if (wire_checksum != 0) {  // a zero checksum means the sender did not compute one
+    const uint32_t sum = checksum_add(pseudo_header_sum(source, destination, kProtocolUdp, udp_length), datagram);
     if (checksum_finish(sum) != 0) return false;
   }
-  const uint16_t port = load16(segment + 2);
   for (SharedPointer<UdpSocket>& s : sockets_) {
     if (s->local_port() != port || s->closed()) continue;
-    s->deliver(source, load16(segment), segment + 8, udp_length - 8u);
+    s->deliver(source, source_port, datagram.dropped(8));
     return true;
   }
   return false;

@@ -45,8 +45,8 @@ const char* tcp_state_name(TcpState state);
 //   auto socket = stack.tcp_open();
 //   socket->connect(server, 80);
 //   while (socket->state() == TcpState::SynSent) stack.poll();
-//   socket->send(request, n);
-//   ... stack.poll(); socket->receive(buffer, capacity) ...
+//   socket->send(request);
+//   ... stack.poll(); socket->receive(buffer) ...
 //   socket->close();
 //
 // and server: listen(port), then accept() until it returns a socket.
@@ -67,9 +67,9 @@ class ITcpSocket {
 
   // Queues bytes for sending; returns how many fitted into the send buffer
   // (16 KiB), possibly fewer than asked for or 0. Resend the rest later.
-  virtual uint32_t send(const uint8_t* data, uint32_t length) = 0;
+  virtual uint32_t send(ConstByteView data) = 0;
   // Copies up to `capacity` received bytes out; returns how many (0 if none yet).
-  virtual uint32_t receive(uint8_t* buffer, uint32_t capacity) = 0;
+  virtual uint32_t receive(ByteView buffer) = 0;
   // Bytes received and waiting.
   virtual uint32_t available() const = 0;
   // Bytes accepted by send() that the peer has not acknowledged yet.

@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
+#include "Utility/AllocatedView.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/SharedPointer.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -74,21 +75,21 @@ class AhciStorageDevice final : public StorageDeviceBase {
   void shutdown() override;
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
+  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
   bool flush_cache() override;
 
  private:
   void release_resources();  // this drive only; the controller stays
   bool start_port();
   bool stop_port();
-  bool issue(const uint8_t* fis, uint32_t fis_dwords, const uint8_t* packet, bool write, void* data, uint32_t bytes);
+  bool issue(ConstByteView fis, ConstByteView packet, bool write, ByteView data);
   bool identify_ata();
   bool identify_atapi();
-  bool atapi_command(const uint8_t* cdb, void* data, uint32_t bytes);
+  bool atapi_command(ConstByteView cdb, ByteView data);
 
   SharedPointer<AhciController> controller_;
   uint32_t port_;
-  uint8_t* memory_ = nullptr;  // command list, received-FIS area and command table in one page
+  ByteView memory_;  // command list, received-FIS area and command table in one page
   bool atapi_ = false;
   bool lba48_ = true;
   bool started_ = false;

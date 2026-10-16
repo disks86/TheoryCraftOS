@@ -52,7 +52,7 @@ bool UefiGopGpu::initialize() {
 bool UefiGopGpu::apply_current_mode() {
   const efi::GraphicsMode* mode = gop_->mode;
   if (!usable(*mode->info) || mode->frame_buffer_base == 0) return false;
-  set_framebuffer(reinterpret_cast<void*>(mode->frame_buffer_base),
+  set_framebuffer(ByteView(reinterpret_cast<uint8_t*>(mode->frame_buffer_base), mode->frame_buffer_size),
                   mode->info->horizontal_resolution, mode->info->vertical_resolution,
                   mode->info->pixels_per_scan_line * 4,
                   mode->info->pixel_format == efi::PixelFormat::BlueGreenRedReserved8Bit);

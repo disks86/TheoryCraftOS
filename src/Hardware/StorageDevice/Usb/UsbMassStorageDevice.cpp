@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/StorageDevice/Usb/UsbMassStorageDevice.hpp"
+#include "Hardware/Bus/Usb/UsbDescriptors.hpp"
 #include "Hardware/StorageDevice/Scsi/ScsiCommands.hpp"
 #include "Hardware/StorageDevice/WaitFor.hpp"
 
@@ -26,10 +27,10 @@ namespace {
 constexpr uint32_t kCbwSignature = 0x43425355, kCswSignature = 0x53425355;  // "USBC", "USBS"
 constexpr uint8_t kClassMassStorage = 8, kSubclassScsi = 6, kProtocolBulkOnly = 0x50;
 constexpr uint8_t kRequestSense = 0x03;
-constexpr uint8_t kDescriptorConfiguration = 2, kDescriptorInterface = 4, kDescriptorEndpoint = 5;
 constexpr uint8_t kClassInterfaceIn = 0xA1, kClassInterfaceOut = 0x21, kGetMaxLun = 0xFE, kBulkReset = 0xFF;
 constexpr uint8_t kEndpointOut = 0x02;  // request type: standard, endpoint recipient
 constexpr uint8_t kClearFeature = 1, kFeatureEndpointHalt = 0;
+constexpr uint32_t kCbwOffset = 0, kCswOffset = 64, kSenseOffset = 128, kDataOffset = 256;  // inside wire_
 }  // namespace
 
 void UsbMassStorageDevice::discover(IUsbBus& usb, allocators::IAllocator& allocator, efi::SystemTable* st,
@@ -38,22 +39,24 @@ void UsbMassStorageDevice::discover(IUsbBus& usb, allocators::IAllocator& alloca
     IUsbHostController* host = usb.host_controller(c);
     if (!host) continue;
     for (uint32_t port = 0; port < host->port_count(); ++port) {
-      uint8_t config[256];
+      uint8_t storage[256];
       uint16_t length = 0;
-      if (!host->configuration_descriptor(port, config, sizeof(config), &length) || length < 9 ||
-          config[1] != kDescriptorConfiguration)
-        continue;
-      if (length > sizeof(config)) length = sizeof(config);
-      const uint8_t configuration_value = config[5];
+      if (!host->configuration_descriptor(port, ByteView(storage), &length)) continue;  // length is the full size
+      const ConstByteView config = ConstByteView(storage).at_most(length);
 
       // Walk the descriptors for a Bulk-Only mass-storage interface and its endpoints.
+      UsbDescriptorWalker walker(config);
+      ConstByteView descriptor;
+      UsbConfigurationInfo configuration;
+      if (!walker.next(&descriptor) || !parse_usb_configuration(descriptor, &configuration)) continue;
+
       bool in_interface = false;
       uint8_t number = 0, in_ep = 0, out_ep = 0;
       uint16_t in_size = 0, out_size = 0;
       auto finish = [&] {
         if (!in_interface || !in_ep || !out_ep) return;
         in_interface = false;
-        if (!host->set_configuration(port, configuration_value) || !host->start_bulk_endpoint(port, in_ep, in_size) ||
+        if (!host->set_configuration(port, configuration.value) || !host->start_bulk_endpoint(port, in_ep, in_size) ||
             !host->start_bulk_endpoint(port, out_ep, out_size))
           return;
         UniquePointer<UsbMassStorageDevice> device = UniquePointer<UsbMassStorageDevice>::make(
@@ -65,24 +68,22 @@ void UsbMassStorageDevice::discover(IUsbBus& usb, allocators::IAllocator& alloca
         }
         out.push_back(UniquePointer<IStorageDevice>(util::move(device)));
       };
-      for (uint16_t i = 0; i + 2 <= length && config[i] >= 2;) {
-        const uint8_t size = config[i], type = config[i + 1];
-        if (i + size > length) break;
-        if (type == kDescriptorInterface && size >= 9) {
+      while (walker.next(&descriptor)) {
+        UsbInterfaceInfo interface;
+        UsbEndpointInfo endpoint;
+        if (parse_usb_interface(descriptor, &interface)) {
           finish();  // the previous interface is complete
-          in_interface = config[i + 5] == kClassMassStorage && config[i + 6] == kSubclassScsi &&
-                         config[i + 7] == kProtocolBulkOnly && config[i + 3] == 0;
-          number = config[i + 2];
+          in_interface = interface.device_class == kClassMassStorage && interface.subclass == kSubclassScsi &&
+                         interface.protocol == kProtocolBulkOnly && interface.alternate_setting == 0;
+          number = interface.number;
           in_ep = out_ep = 0;
-        } else if (in_interface && type == kDescriptorEndpoint && size >= 7 && (config[i + 3] & 3) == 2) {
-          const uint16_t packet = (config[i + 4] | (config[i + 5] << 8)) & 0x7FF;
-          if (config[i + 2] & 0x80) {
-            if (!in_ep) in_ep = config[i + 2], in_size = packet;
+        } else if (in_interface && parse_usb_endpoint(descriptor, &endpoint) && endpoint.transfer_type() == 2) {
+          if (endpoint.is_in()) {
+            if (!in_ep) in_ep = endpoint.address, in_size = endpoint.max_packet;
           } else if (!out_ep) {
-            out_ep = config[i + 2], out_size = packet;
+            out_ep = endpoint.address, out_size = endpoint.max_packet;
           }
         }
-        i += size;
       }
       finish();
     }
@@ -98,60 +99,67 @@ void UsbMassStorageDevice::recover() {
   host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, out_);
 }
 
-UsbMassStorageDevice::Result UsbMassStorageDevice::command(const uint8_t* cdb, uint32_t cdb_length, void* data,
-                                                           uint32_t length, bool data_in) {
-  Cbw* cbw = reinterpret_cast<Cbw*>(wire_);
-  Csw* csw = reinterpret_cast<Csw*>(wire_ + 64);
-  __builtin_memset(cbw, 0, sizeof(Cbw));
+UsbMassStorageDevice::Result UsbMassStorageDevice::command(ConstByteView cdb, ByteView data, bool data_in) {
+  if (cdb.size() > 16) return Result::Error;
+  const ByteView cbw = wire_.subview(kCbwOffset, kCbwSize);
+  const ByteView csw = wire_.subview(kCswOffset, kCswSize);
   const uint32_t tag = tag_++;
-  cbw->signature = kCbwSignature;
-  cbw->tag = tag;
-  cbw->data_length = length;
-  cbw->flags = data_in ? 0x80 : 0;
-  cbw->lun = 0;
-  cbw->cb_length = static_cast<uint8_t>(cdb_length);
-  __builtin_memcpy(cbw->cb, cdb, cdb_length);
+  ByteWriter command_block(cbw);
+  command_block.le32(kCbwSignature);
+  command_block.le32(tag);
+  command_block.le32(static_cast<uint32_t>(data.size()));
+  command_block.u8(data_in ? 0x80 : 0);
+  command_block.u8(0);  // LUN
+  command_block.u8(static_cast<uint8_t>(cdb.size()));
+  command_block.bytes(cdb);
+  command_block.zeros(16 - cdb.size());  // the CDB field is always 16 bytes
+  if (!command_block.ok()) return Result::Error;
 
   uint32_t moved = 0;
-  if (!host_.bulk_transfer(port_, out_, cbw, sizeof(Cbw), &moved) || moved != sizeof(Cbw)) {
+  if (!host_.bulk_transfer(port_, out_, cbw, &moved) || moved != kCbwSize) {
     recover();
     return Result::Error;
   }
-  if (length) {
-    const bool ok = host_.bulk_transfer(port_, data_in ? in_ : out_, data, length, &moved);
-    if (!ok) {  // a stall here is normal when the command failed: clear it and read the status
-      host_.reset_bulk_endpoint(port_, data_in ? in_ : out_);
-      host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, data_in ? in_ : out_);
+  if (!data.empty()) {
+    const uint8_t endpoint = data_in ? in_ : out_;
+    if (!host_.bulk_transfer(port_, endpoint, data, &moved)) {  // a stall here is normal when the command failed: clear it and read the status
+      host_.reset_bulk_endpoint(port_, endpoint);
+      host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, endpoint);
     }
   }
-  __builtin_memset(csw, 0, sizeof(Csw));
-  if (!host_.bulk_transfer(port_, in_, csw, sizeof(Csw), &moved) || moved != sizeof(Csw)) {
+  csw.fill(0);
+  if (!host_.bulk_transfer(port_, in_, csw, &moved) || moved != kCswSize) {
     // One more try after un-stalling, as the specification asks.
     host_.reset_bulk_endpoint(port_, in_);
     host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, in_);
-    __builtin_memset(csw, 0, sizeof(Csw));
-    if (!host_.bulk_transfer(port_, in_, csw, sizeof(Csw), &moved) || moved != sizeof(Csw)) {
+    csw.fill(0);
+    if (!host_.bulk_transfer(port_, in_, csw, &moved) || moved != kCswSize) {
       recover();
       return Result::Error;
     }
   }
-  if (csw->signature != kCswSignature || csw->tag != tag || csw->status == 2) {
+  ByteReader status(csw);
+  const uint32_t signature = status.le32();
+  const uint32_t answered_tag = status.le32();
+  status.skip(4);  // residue
+  const uint8_t code = status.u8();
+  if (!status.ok() || signature != kCswSignature || answered_tag != tag || code == 2) {
     recover();
     return Result::Error;
   }
-  return csw->status == 0 ? Result::Good : Result::Failed;
+  return code == 0 ? Result::Good : Result::Failed;
 }
 
 // Runs a command; when it fails with CHECK CONDITION the sense data is fetched
 // (required to clear the condition) and the command is tried again a few times.
-bool UsbMassStorageDevice::run(const uint8_t* cdb, uint32_t cdb_length, void* data, uint32_t length, bool data_in) {
+bool UsbMassStorageDevice::run(ConstByteView cdb, ByteView data, bool data_in) {
   for (int attempt = 0; attempt < 4; ++attempt) {
-    const Result r = command(cdb, cdb_length, data, length, data_in);
+    const Result r = command(cdb, data, data_in);
     if (r == Result::Good) return true;
     if (r == Result::Error) return false;
-    uint8_t sense_cdb[6] = {kRequestSense, 0, 0, 0, 18, 0};
-    uint8_t* sense = wire_ + 128;
-    if (command(sense_cdb, 6, sense, 18, true) != Result::Good) return false;
+    const uint8_t sense_cdb[6] = {kRequestSense, 0, 0, 0, 18, 0};
+    const ByteView sense = wire_.subview(kSenseOffset, 18);
+    if (command(ConstByteView(sense_cdb), sense, true) != Result::Good) return false;
     const uint8_t key = sense[2] & 0x0F;
     if (key == 0x02) wait_for(st_, 50, [] { return false; });  // NOT READY: give it a moment
     else if (key != 0x06) return false;                          // anything but UNIT ATTENTION is final
@@ -161,35 +169,36 @@ bool UsbMassStorageDevice::run(const uint8_t* cdb, uint32_t cdb_length, void* da
 
 bool UsbMassStorageDevice::initialize() {
   bounce_alignment_ = 65536;  // a bulk transfer must not cross a 64 KiB boundary
-  wire_ = static_cast<uint8_t*>(allocator_.allocate_aligned(4096, 65536));
-  if (!wire_) return false;
-  __builtin_memset(wire_, 0, 4096);
+  wire_ = allocate_view<uint8_t>(allocator_, 4096, 65536);
+  if (wire_.empty()) return false;
+  wire_.fill(0);
 
   uint8_t max_lun = 0;
-  host_.control_in(port_, kClassInterfaceIn, kGetMaxLun, 0, interface_, &max_lun, 1);  // a stall means "one LUN"
+  host_.control_in(port_, kClassInterfaceIn, kGetMaxLun, 0, interface_, ByteView(&max_lun, 1));  // a stall means "one LUN"
 
-  uint8_t* data = wire_ + 256;
-  uint8_t inquiry[6] = {scsi::kInquiry, 0, 0, 0, 36, 0};
-  if (!run(inquiry, 6, data, 36, true)) return false;
-  const uint8_t type = data[0] & 0x1F;
-  if (type != scsi::kDeviceTypeDisk && type != scsi::kDeviceTypeOptical) return false;
-  optical_ = type == scsi::kDeviceTypeOptical;
+  const ByteView data = wire_.subview(kDataOffset, 64);
+  const uint8_t inquiry[6] = {scsi::kInquiry, 0, 0, 0, 36, 0};
+  if (!run(ConstByteView(inquiry), data.first(36), true)) return false;
+  scsi::InquiryInfo unit;
+  if (!scsi::parse_inquiry(data, &unit)) return false;
+  if (unit.device_type != scsi::kDeviceTypeDisk && unit.device_type != scsi::kDeviceTypeOptical) return false;
+  optical_ = unit.device_type == scsi::kDeviceTypeOptical;
   info_.kind = optical_ ? StorageKind::Optical : StorageKind::Disk;
   info_.read_only = optical_;
-  info_.removable = data[1] & 0x80;
-  copy_device_string(info_.model, sizeof(info_.model), data + 8, 24, false);
+  info_.removable = unit.removable;
+  copy_device_string(ArrayView<char>(info_.model), unit.vendor_and_product, false);
 
-  uint8_t ready[6] = {scsi::kTestUnitReady};
-  for (int i = 0; i < 10 && !run(ready, 6, nullptr, 0, false); ++i) {}
-  uint8_t capacity10[10] = {scsi::kReadCapacity10};
-  if (!run(capacity10, 10, data, 8, true)) return false;
-  uint64_t last = scsi::be32(data);
-  info_.block_size = scsi::be32(data + 4);
+  const uint8_t ready[6] = {scsi::kTestUnitReady};
+  for (int i = 0; i < 10 && !run(ConstByteView(ready), ByteView(), false); ++i) {}
+  const uint8_t capacity10[10] = {scsi::kReadCapacity10};
+  uint64_t last = 0;
+  if (!run(ConstByteView(capacity10), data.first(8), true) || !scsi::parse_capacity10(data, &last, &info_.block_size))
+    return false;
   if (last == 0xFFFFFFFF) {
-    uint8_t capacity16[16] = {scsi::kServiceActionIn16, scsi::kReadCapacity16Action, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0};
-    if (!run(capacity16, 16, data, 32, true)) return false;
-    last = scsi::be64(data);
-    info_.block_size = scsi::be32(data + 8);
+    const uint8_t capacity16[16] = {scsi::kServiceActionIn16, scsi::kReadCapacity16Action, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0};
+    if (!run(ConstByteView(capacity16), wire_.subview(kDataOffset, 32), true) ||
+        !scsi::parse_capacity16(wire_.subview(kDataOffset, 32), &last, &info_.block_size))
+      return false;
   }
   info_.block_count = last + 1;
   if (info_.block_size < 512 || info_.block_size > 4096) return false;
@@ -198,20 +207,19 @@ bool UsbMassStorageDevice::initialize() {
 
 void UsbMassStorageDevice::shutdown() {
   release_bounce();
-  allocator_.deallocate(wire_);
-  wire_ = nullptr;
+  release_view(allocator_, wire_);
 }
 
-bool UsbMassStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
+bool UsbMassStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {
   uint8_t cdb[16];
-  const uint32_t length = scsi::build_read_write(cdb, write, lba, blocks);
-  return run(cdb, length, dma, blocks * info_.block_size, !write);
+  const uint32_t length = scsi::build_read_write(ByteView(cdb), write, lba, blocks);
+  return run(ConstByteView(cdb).first(length), dma, !write);
 }
 
 bool UsbMassStorageDevice::flush_cache() {
   if (optical_) return true;
-  uint8_t cdb[10] = {scsi::kSynchronizeCache10};
-  return run(cdb, 10, nullptr, 0, false);
+  const uint8_t cdb[10] = {scsi::kSynchronizeCache10};
+  return run(ConstByteView(cdb), ByteView(), false);
 }
 
 }  // namespace hardware

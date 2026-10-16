@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/IHardware.hpp"
+#include "Utility/ArrayView.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -43,14 +44,16 @@ class AcpiTables final : public IHardware {
 
   const char* name() const override { return "ACPI tables"; }
   bool initialize() override;
-  void shutdown() override { root_ = nullptr; }
+  void shutdown() override { root_ = ConstByteView(); }
 
-  // The first table with this 4-character signature (e.g. "MCFG"), or nullptr.
-  const AcpiTableHeader* find(const char (&signature)[5]) const;
+  // The first table with this 4-character signature (e.g. "MCFG"), as exactly
+  // its bytes (header included, as long as the header says), or an empty view.
+  // The length comes from firmware memory, so it is sanity-checked.
+  ConstByteView find(const char (&signature)[5]) const;
 
  private:
   efi::SystemTable* st_;
-  const AcpiTableHeader* root_ = nullptr;  // XSDT or RSDT
+  ConstByteView root_;  // the XSDT or RSDT, header included
   bool wide_entries_ = false;              // XSDT: 8-byte pointers
 };
 

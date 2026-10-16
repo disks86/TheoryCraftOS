@@ -33,6 +33,7 @@ set(TCOS_DEBUG_WAIT_SECS 0 CACHE STRING
 
 add_executable(BOOTX64
   src/Kernel/Delay.cpp
+  src/Utility/Bounds.cpp
   src/Kernel/Interrupts.cpp
   src/Kernel/Interrupts.S
   src/Kernel/Apic.cpp

@@ -28,7 +28,7 @@ bool UefiBlockStorageDevice::initialize() {
   info_.block_count = m->last_block + 1;
   info_.read_only = m->read_only;
   info_.removable = m->removable_media;
-  __builtin_memcpy(info_.model, "firmware-driven block device", 29);
+  __builtin_memcpy(info_.model, "firmware-driven block device", 29);  // fits: model has 41 bytes
   return prepare_bounce();
 }
 
@@ -38,12 +38,12 @@ bool UefiBlockStorageDevice::flush_cache() {
   return s == efi::kSuccess;
 }
 
-bool UefiBlockStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
+bool UefiBlockStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {
   const uint64_t bytes = uint64_t{blocks} * info_.block_size;
   efi::Status s = efi::kSuccess;
   kernel::firmware([&] {
-    s = write ? io_->write_blocks(io_, io_->media->media_id, lba, bytes, dma)
-              : io_->read_blocks(io_, io_->media->media_id, lba, bytes, dma);
+    s = write ? io_->write_blocks(io_, io_->media->media_id, lba, bytes, dma.data())
+              : io_->read_blocks(io_, io_->media->media_id, lba, bytes, dma.data());
   });
   return s == efi::kSuccess;
 }

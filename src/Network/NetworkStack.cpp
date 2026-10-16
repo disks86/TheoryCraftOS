@@ -102,8 +102,8 @@ void NetworkStack::poll() {
   kernel::ScopedRecursiveMutex guard(mutex_);
   uint8_t frame[hardware::kEthernetMaxFrame + 64];
   uint32_t length = 0;
-  for (uint32_t i = 0; i < kFramesPerPoll && nic_.receive(frame, sizeof(frame), &length); ++i)
-    if (length <= sizeof(frame)) handle_frame(frame, length);
+  for (uint32_t i = 0; i < kFramesPerPoll && nic_.receive(ByteView(frame), &length); ++i)
+    if (length <= sizeof(frame)) handle_frame(ConstByteView(frame).first(length));
 
   dhcp_->poll();
   resolver_->poll();
@@ -112,17 +112,16 @@ void NetworkStack::poll() {
   udp_.reap();
 }
 
-void NetworkStack::handle_frame(const uint8_t* frame, uint32_t length) {
-  if (length < hardware::kEthernetHeaderSize) return;
-  hardware::MacAddress destination;
-  for (int i = 0; i < 6; ++i) destination.bytes[i] = frame[i];
+void NetworkStack::handle_frame(ConstByteView frame) {
+  ByteReader in(frame);
+  const hardware::MacAddress destination = hardware::MacAddress::read(in);
+  in.skip(6);  // the sender's address is not needed here
+  const uint16_t type = in.be16();
+  if (!in.ok()) return;  // shorter than an Ethernet header
   if (!destination.is_broadcast() && !(destination == nic_.mac_address())) return;  // not for us
 
-  const uint16_t type = load16(frame + 12);
-  const uint8_t* payload = frame + hardware::kEthernetHeaderSize;
-  const uint32_t payload_length = length - hardware::kEthernetHeaderSize;
-  if (type == kEtherTypeArp) handle_arp(payload, payload_length);
-  else if (type == kEtherTypeIpv4) handle_ipv4(payload, payload_length);
+  if (type == kEtherTypeArp) handle_arp(in.rest());
+  else if (type == kEtherTypeIpv4) handle_ipv4(in.rest());
 }
 
 void NetworkStack::learn(Ipv4Address address, const hardware::MacAddress& mac) {
@@ -130,15 +129,16 @@ void NetworkStack::learn(Ipv4Address address, const hardware::MacAddress& mac) {
   arp_.put(address.value(), ArpEntry{mac, now_ms() + kArpLifetimeMs});
 }
 
-void NetworkStack::handle_arp(const uint8_t* arp, uint32_t length) {
+void NetworkStack::handle_arp(ConstByteView arp) {
   // Ethernet / IPv4 ARP only: hardware type 1, protocol 0x0800, sizes 6 and 4.
-  if (length < kArpPacketSize || load16(arp) != 1 || load16(arp + 2) != kEtherTypeIpv4 || arp[4] != 6 || arp[5] != 4)
-    return;
-  const uint16_t operation = load16(arp + 6);
-  hardware::MacAddress sender_mac;
-  for (int i = 0; i < 6; ++i) sender_mac.bytes[i] = arp[8 + i];
-  const Ipv4Address sender_ip = Ipv4Address::read(arp + 14);
-  const Ipv4Address target_ip = Ipv4Address::read(arp + 24);
+  ByteReader in(arp);
+  if (in.be16() != 1 || in.be16() != kEtherTypeIpv4 || in.u8() != 6 || in.u8() != 4) return;
+  const uint16_t operation = in.be16();
+  const hardware::MacAddress sender_mac = hardware::MacAddress::read(in);
+  const Ipv4Address sender_ip = Ipv4Address::read(in);
+  in.skip(6);  // the target's hardware address
+  const Ipv4Address target_ip = Ipv4Address::read(in);
+  if (!in.ok()) return;  // truncated
 
   const bool for_us = config_.configured() && target_ip == config_.address;
   // Learn the sender if we were addressed or already know it (RFC 826): this
@@ -154,40 +154,56 @@ bool NetworkStack::accepts_destination(Ipv4Address destination) const {
          destination == Ipv4Address::subnet_broadcast(config_.address, config_.netmask);
 }
 
-void NetworkStack::handle_ipv4(const uint8_t* packet, uint32_t length) {
-  if (length < kIpv4HeaderSize || (packet[0] >> 4) != 4) return;
-  const uint32_t header = (packet[0] & 0x0F) * 4u;
-  const uint32_t total = load16(packet + 2);
-  if (header < kIpv4HeaderSize || header > total || total > length) return;  // Ethernet padding makes length > total
-  if (checksum_finish(checksum_add(0, packet, header)) != 0) return;
-  if (load16(packet + 6) & 0x3FFF) return;  // a fragment (more-fragments flag or an offset): unsupported
-  const Ipv4Address source = Ipv4Address::read(packet + 12);
-  const Ipv4Address destination = Ipv4Address::read(packet + 16);
+void NetworkStack::handle_ipv4(ConstByteView packet) {
+  ByteReader in(packet);
+  const uint8_t version_and_length = in.u8();
+  in.skip(1);  // type of service
+  const uint16_t total = in.be16();
+  in.skip(2);  // identification
+  const uint16_t flags_and_offset = in.be16();
+  in.skip(1);  // time to live
+  const uint8_t protocol = in.u8();
+  in.skip(2);  // header checksum (verified below over the whole header)
+  const Ipv4Address source = Ipv4Address::read(in);
+  const Ipv4Address destination = Ipv4Address::read(in);
+  if (!in.ok() || (version_and_length >> 4) != 4) return;
+
+  const uint32_t header = (version_and_length & 0x0F) * 4u;
+  if (header < kIpv4HeaderSize || header > total || total > packet.size()) return;  // Ethernet padding makes the frame longer than total
+  if (checksum_finish(checksum_add(0, packet.first(header))) != 0) return;
+  if (flags_and_offset & 0x3FFF) return;  // a fragment (more-fragments flag or an offset): unsupported
   if (!accepts_destination(destination)) return;
 
-  const uint8_t protocol = packet[9];
-  const uint8_t* payload = packet + header;
-  const uint32_t payload_length = total - header;
+  ConstByteView payload = packet.subview(header, total - header);
   if (protocol == kProtocolUdp) {
-    udp_.handle(source, destination, payload, payload_length);
+    udp_.handle(source, destination, payload);
   } else if (protocol == kProtocolTcp) {
-    if (config_.configured() && destination == config_.address) tcp_.handle(source, destination, payload, payload_length);
+    if (config_.configured() && destination == config_.address) tcp_.handle(source, destination, payload);
   } else if (protocol == kProtocolIcmp) {
-    if (config_.configured() && destination == config_.address) handle_icmp(source, payload, payload_length);
+    if (config_.configured() && destination == config_.address) handle_icmp(source, payload);
   }
 }
 
-void NetworkStack::handle_icmp(Ipv4Address source, const uint8_t* icmp, uint32_t length) {
-  if (length < 8 || checksum_finish(checksum_add(0, icmp, length)) != 0) return;
-  if (icmp[0] == kIcmpEchoRequest && icmp[1] == 0 && length <= kMaxIpPayload) {
+void NetworkStack::handle_icmp(Ipv4Address source, ConstByteView icmp) {
+  if (icmp.size() < 8 || checksum_finish(checksum_add(0, icmp)) != 0) return;
+  ByteReader in(icmp);
+  const uint8_t type = in.u8();
+  const uint8_t code = in.u8();
+  in.skip(2);  // checksum, verified above
+  const uint16_t identifier = in.be16();
+  const uint16_t sequence = in.be16();
+  if (type == kIcmpEchoRequest && code == 0 && icmp.size() <= kMaxIpPayload) {
     uint8_t reply[kMaxIpPayload];
-    for (uint32_t i = 0; i < length; ++i) reply[i] = icmp[i];
-    reply[0] = kIcmpEchoReply;
-    store16(reply + 2, 0);
-    store16(reply + 2, checksum_finish(checksum_add(0, reply, length)));
-    send_ip(source, kProtocolIcmp, reply, length);
-  } else if (icmp[0] == kIcmpEchoReply && ping_active_ && source == ping_target_ && load16(icmp + 4) == ping_id_ &&
-             load16(icmp + 6) == ping_sequence_) {
+    ByteWriter out{ByteView(reply)};
+    out.u8(kIcmpEchoReply);
+    out.u8(0);
+    out.be16(0);  // checksum, filled in below
+    out.bytes(icmp.dropped(4));  // identifier, sequence and the echoed data
+    if (!out.ok()) return;
+    out.patch_be16(2, checksum_finish(checksum_add(0, out.written())));
+    send_ip(source, kProtocolIcmp, out.written());
+  } else if (type == kIcmpEchoReply && ping_active_ && source == ping_target_ && identifier == ping_id_ &&
+             sequence == ping_sequence_) {
     ping_answered_ = true;
     ping_rtt_ms_ = now_ms() - ping_sent_ms_;
   }
@@ -195,66 +211,68 @@ void NetworkStack::handle_icmp(Ipv4Address source, const uint8_t* icmp, uint32_t
 
 // ------------------------------------------------------------------ sending
 
-bool NetworkStack::send_frame(const hardware::MacAddress& destination, uint16_t ether_type, const uint8_t* payload,
-                              uint32_t length) {
-  if (length > kMtu) return false;
+bool NetworkStack::send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload) {
+  if (payload.size() > kMtu) return false;
   uint8_t frame[hardware::kEthernetMaxFrame];
-  for (int i = 0; i < 6; ++i) {
-    frame[i] = destination.bytes[i];
-    frame[6 + i] = nic_.mac_address().bytes[i];
-  }
-  store16(frame + 12, ether_type);
-  for (uint32_t i = 0; i < length; ++i) frame[hardware::kEthernetHeaderSize + i] = payload[i];
-  return nic_.transmit(frame, hardware::kEthernetHeaderSize + length);
+  ByteWriter out{ByteView(frame)};
+  destination.write(out);
+  nic_.mac_address().write(out);
+  out.be16(ether_type);
+  out.bytes(payload);
+  if (!out.ok()) return false;
+  return nic_.transmit(out.written());
 }
 
 void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip) {
   uint8_t arp[kArpPacketSize];
-  store16(arp, 1);
-  store16(arp + 2, kEtherTypeIpv4);
-  arp[4] = 6;
-  arp[5] = 4;
-  store16(arp + 6, operation);
-  for (int i = 0; i < 6; ++i) {
-    arp[8 + i] = nic_.mac_address().bytes[i];
-    arp[18 + i] = operation == kArpRequest ? 0 : target_mac.bytes[i];
-  }
-  config_.address.write(arp + 14);
-  target_ip.write(arp + 24);
+  ByteWriter out{ByteView(arp)};
+  out.be16(1);  // Ethernet
+  out.be16(kEtherTypeIpv4);
+  out.u8(6);
+  out.u8(4);
+  out.be16(operation);
+  nic_.mac_address().write(out);
+  config_.address.write(out);
+  if (operation == kArpRequest) out.zeros(6);  // asking: the target's address is what we want to learn
+  else target_mac.write(out);
+  target_ip.write(out);
+  if (!out.ok()) return;
   const hardware::MacAddress to = operation == kArpRequest ? hardware::MacAddress{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}
                                                            : target_mac;
-  send_frame(to, kEtherTypeArp, arp, kArpPacketSize);
+  send_frame(to, kEtherTypeArp, out.written());
 }
 
-bool NetworkStack::send_ip(Ipv4Address destination, uint8_t protocol, const uint8_t* payload, uint32_t length) {
+bool NetworkStack::send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) {
   kernel::ScopedRecursiveMutex guard(mutex_);
   if (!config_.configured()) return false;
-  return send_ip_from(config_.address, destination, protocol, payload, length, false);
+  return send_ip_from(config_.address, destination, protocol, payload, false);
 }
 
-bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, const uint8_t* payload,
-                                uint32_t length, bool link_broadcast) {
+bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
+                                bool link_broadcast) {
   kernel::ScopedRecursiveMutex guard(mutex_);
-  if (length > kMaxIpPayload || (length && !payload)) return false;
+  if (payload.size() > kMaxIpPayload) return false;
 
-  uint8_t packet[kMtu];
-  packet[0] = 0x45;  // IPv4, 5 words of header
-  packet[1] = 0;
-  store16(packet + 2, static_cast<uint16_t>(kIpv4HeaderSize + length));
-  store16(packet + 4, ip_id_++);
-  store16(packet + 6, 0x4000);  // don't fragment
-  packet[8] = 64;               // TTL
-  packet[9] = protocol;
-  store16(packet + 10, 0);
-  source.write(packet + 12);
-  destination.write(packet + 16);
-  store16(packet + 10, checksum_finish(checksum_add(0, packet, kIpv4HeaderSize)));
-  for (uint32_t i = 0; i < length; ++i) packet[kIpv4HeaderSize + i] = payload[i];
-  const uint32_t total = kIpv4HeaderSize + length;
+  uint8_t packet_storage[kMtu];
+  ByteWriter out{ByteView(packet_storage)};
+  out.u8(0x45);  // IPv4, 5 words of header
+  out.u8(0);
+  out.be16(static_cast<uint16_t>(kIpv4HeaderSize + payload.size()));
+  out.be16(ip_id_++);
+  out.be16(0x4000);  // don't fragment
+  out.u8(64);        // TTL
+  out.u8(protocol);
+  out.be16(0);  // header checksum, filled in below
+  source.write(out);
+  destination.write(out);
+  out.patch_be16(10, checksum_finish(checksum_add(0, out.written())));  // so far: just the 20 header bytes
+  out.bytes(payload);
+  if (!out.ok()) return false;
+  const ConstByteView packet = out.written();
 
   const bool broadcast = link_broadcast || destination.is_limited_broadcast() ||
                          (config_.configured() && destination == Ipv4Address::subnet_broadcast(config_.address, config_.netmask));
-  if (broadcast) return send_frame(hardware::MacAddress{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}, kEtherTypeIpv4, packet, total);
+  if (broadcast) return send_frame(hardware::MacAddress{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}, kEtherTypeIpv4, packet);
 
   // On our subnet we talk to the destination directly, otherwise to the gateway.
   Ipv4Address next_hop = destination;
@@ -264,7 +282,7 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
   }
 
   ArpEntry* entry = arp_.find(next_hop.value());
-  if (entry && entry->expires_ms > now_ms()) return send_frame(entry->mac, kEtherTypeIpv4, packet, total);
+  if (entry && entry->expires_ms > now_ms()) return send_frame(entry->mac, kEtherTypeIpv4, packet);
 
   // Unknown (or stale) next hop: park the packet and ask who has it.
   if (pending_.count() >= kMaxPending) return false;
@@ -272,8 +290,8 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
   p.next_hop = next_hop;
   p.requests = 1;
   p.next_request_ms = now_ms() + kArpRetryMs;
-  p.length = static_cast<uint16_t>(total);
-  for (uint32_t i = 0; i < total; ++i) p.ip_packet[i] = packet[i];
+  p.length = static_cast<uint16_t>(packet.size());
+  if (!ByteView(p.ip_packet).copy_from(packet)) return false;
   if (!pending_.enqueue(p)) return false;
   send_arp(kArpRequest, hardware::MacAddress{}, next_hop);
   return true;
@@ -287,7 +305,7 @@ void NetworkStack::flush_pending(Ipv4Address resolved) {
   for (uint64_t n = pending_.count(); n > 0; --n) {
     PendingPacket p;
     if (!pending_.dequeue(&p)) break;
-    if (p.next_hop == resolved) send_frame(mac, kEtherTypeIpv4, p.ip_packet, p.length);
+    if (p.next_hop == resolved) send_frame(mac, kEtherTypeIpv4, ConstByteView(p.ip_packet).first(p.length));
     else pending_.enqueue(p);
   }
 }
@@ -300,7 +318,7 @@ void NetworkStack::service_pending() {
     if (!pending_.dequeue(&p)) break;
     ArpEntry* known = arp_.find(p.next_hop.value());
     if (known && known->expires_ms > now) {
-      send_frame(known->mac, kEtherTypeIpv4, p.ip_packet, p.length);
+      send_frame(known->mac, kEtherTypeIpv4, ConstByteView(p.ip_packet).first(p.length));
       continue;
     }
     if (now >= p.next_request_ms) {
@@ -333,14 +351,15 @@ bool NetworkStack::resolve(const char* name, uint32_t timeout_ms, Ipv4Address* a
 bool NetworkStack::ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_ms) {
   kernel::ScopedMutex one_at_a_time(ping_mutex_);
   if (!configuration().configured()) return false;
-  uint8_t request[8 + 32];
-  request[0] = kIcmpEchoRequest;
-  request[1] = 0;
-  store16(request + 2, 0);
-  store16(request + 4, ping_id_);
-  store16(request + 6, ++ping_sequence_);
-  for (uint32_t i = 0; i < 32; ++i) request[8 + i] = static_cast<uint8_t>('a' + i % 26);
-  store16(request + 2, checksum_finish(checksum_add(0, request, sizeof(request))));
+  uint8_t request_storage[8 + 32];
+  ByteWriter request{ByteView(request_storage)};
+  request.u8(kIcmpEchoRequest);
+  request.u8(0);
+  request.be16(0);  // checksum, filled in below
+  request.be16(ping_id_);
+  request.be16(++ping_sequence_);
+  for (uint32_t i = 0; i < 32; ++i) request.u8(static_cast<uint8_t>('a' + i % 26));
+  request.patch_be16(2, checksum_finish(checksum_add(0, request.written())));
 
   bool ok;
   uint64_t deadline;
@@ -351,7 +370,7 @@ bool NetworkStack::ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_
     ping_target_ = address;
     ping_sent_ms_ = now_ms();
     deadline = ping_sent_ms_ + timeout_ms;
-    ok = send_ip(address, kProtocolIcmp, request, sizeof(request));
+    ok = request.ok() && send_ip(address, kProtocolIcmp, request.written());
   }
   for (;;) {
     {

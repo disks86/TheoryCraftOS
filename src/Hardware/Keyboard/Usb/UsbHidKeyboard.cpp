@@ -25,8 +25,8 @@ constexpr uint8_t kRequestSetIdle = 0x0A;
 constexpr uint8_t kRequestSetProtocol = 0x0B;
 constexpr uint8_t kClassInterfaceOut = 0x21;  // host-to-device, class, interface
 
-bool contains(const uint8_t* keys, uint8_t usage) {
-  for (int i = 2; i < 8; ++i)
+bool contains(ConstByteView keys, uint8_t usage) {  // among the six key slots of a boot report
+  for (uint64_t i = 2; i < 8; ++i)
     if (keys[i] == usage) return true;
   return false;
 }
@@ -44,18 +44,20 @@ bool UsbHidKeyboard::initialize() {
 void UsbHidKeyboard::fetch() {
   uint8_t report[8];
   uint16_t length = 0;
-  while (host_.poll_interrupt_in(port_, interface_.endpoint_address, report, sizeof(report), &length)) {
+  while (host_.poll_interrupt_in(port_, interface_.endpoint_address, ByteView(report), &length)) {
     if (length < 8) continue;
+    const ConstByteView current(report);
+    const ConstByteView before(previous_);
 
     for (int bit = 0; bit < 8; ++bit) {  // modifier byte: one bit per modifier key
-      const bool now = report[0] & (1u << bit), before = previous_[0] & (1u << bit);
-      if (now != before) push(key::kLeftControl + bit, now);
+      const bool now = current[0] & (1u << bit), was = before[0] & (1u << bit);
+      if (now != was) push(key::kLeftControl + bit, now);
     }
     for (int i = 2; i < 8; ++i) {
-      if (report[i] > 3 && !contains(previous_, report[i])) push(report[i], true);   // 1-3 = rollover errors
-      if (previous_[i] > 3 && !contains(report, previous_[i])) push(previous_[i], false);
+      if (current[i] > 3 && !contains(before, current[i])) push(current[i], true);   // 1-3 = rollover errors
+      if (before[i] > 3 && !contains(current, before[i])) push(before[i], false);
     }
-    __builtin_memcpy(previous_, report, sizeof(previous_));
+    ByteView(previous_).copy_from(current);
   }
 }
 

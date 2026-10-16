@@ -34,7 +34,7 @@ class UdpManager {
 
   // A UDP datagram arrived in an IP packet: `segment` is the UDP header and data.
   // True if a socket took it.
-  bool handle(Ipv4Address source, Ipv4Address destination, const uint8_t* segment, uint32_t length);
+  bool handle(Ipv4Address source, Ipv4Address destination, ConstByteView segment);
 
   // Forgets sockets that were closed or that nobody holds any more.
   void reap();

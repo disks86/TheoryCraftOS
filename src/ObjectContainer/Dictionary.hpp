@@ -18,6 +18,7 @@
 
 #pragma once
 #include "ObjectContainer/ContainerSupport.hpp"
+#include "Utility/ArrayView.hpp"
 #include "ObjectContainer/Hashing.hpp"
 #include "ObjectContainer/IObjectContainer.hpp"
 
@@ -43,13 +44,13 @@ class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
       : allocator_(allocator), hash_(hash), equal_(equal) {}
   ~Dictionary() {
     clear();
-    allocator_.deallocate(buckets_);
+    allocator_.deallocate(buckets_.data());
   }
 
   uint64_t count() const override { return size_; }
 
   void clear() override {
-    for (uint64_t b = 0; b < bucket_count_; ++b) {
+    for (uint64_t b = 0; b < buckets_.size(); ++b) {
       for (Node* n = buckets_[b]; n;) {
         Node* following = n->next;
         destroy(n);
@@ -67,12 +68,12 @@ class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
       existing->entry.value = value;
       return true;
     }
-    if (!buckets_ && !resize(kInitialBuckets)) return false;
-    if (size_ * 4 >= bucket_count_ * 3) resize(bucket_count_ * 2);  // best effort
+    if (buckets_.empty() && !resize(kInitialBuckets)) return false;
+    if (size_ * 4 >= buckets_.size() * 3) resize(buckets_.size() * 2);  // best effort
 
     void* memory = allocator_.allocate(sizeof(Node));
     if (!memory) return false;
-    Node** slot = &buckets_[h & (bucket_count_ - 1)];
+    Node** slot = &buckets_[h & (buckets_.size() - 1)];
     *slot = new (memory) Node{*slot, h, KeyValue<K, V>(key, value)};
     ++size_;
     return true;
@@ -90,9 +91,9 @@ class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
   bool contains(const K& key) const { return find(key) != nullptr; }
 
   bool remove(const K& key) {
-    if (!buckets_) return false;
+    if (buckets_.empty()) return false;
     const uint64_t h = hash_(key);
-    for (Node** link = &buckets_[h & (bucket_count_ - 1)]; *link; link = &(*link)->next) {
+    for (Node** link = &buckets_[h & (buckets_.size() - 1)]; *link; link = &(*link)->next) {
       if ((*link)->hash == h && equal_((*link)->entry.key, key)) {
         Node* doomed = *link;
         *link = doomed->next;
@@ -127,8 +128,8 @@ class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
   static constexpr uint64_t kInitialBuckets = 16;  // always a power of two
 
   Node* locate(const K& key, uint64_t h) const {
-    if (!buckets_) return nullptr;
-    for (Node* n = buckets_[h & (bucket_count_ - 1)]; n; n = n->next)
+    if (buckets_.empty()) return nullptr;
+    for (Node* n = buckets_[h & (buckets_.size() - 1)]; n; n = n->next)
       if (n->hash == h && equal_(n->entry.key, key)) return n;
     return nullptr;
   }
@@ -140,7 +141,7 @@ class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
 
   // Finds the first entry in bucket `from` or later.
   bool scan(uint64_t from, ObjectCursor* cursor) const {
-    for (uint64_t b = from; b < bucket_count_; ++b) {
+    for (uint64_t b = from; b < buckets_.size(); ++b) {
       if (buckets_[b]) {
         cursor->index = b;
         cursor->node = buckets_[b];
@@ -152,10 +153,11 @@ class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
 
   // Moves to a table of `buckets` buckets, relinking the existing entries.
   bool resize(uint64_t buckets) {
-    Node** fresh = container_support::allocate_array<Node*>(allocator_, buckets);
-    if (!fresh) return false;
-    for (uint64_t b = 0; b < buckets; ++b) fresh[b] = nullptr;
-    for (uint64_t b = 0; b < bucket_count_; ++b) {
+    Node** fresh_memory = container_support::allocate_array<Node*>(allocator_, buckets);
+    if (!fresh_memory) return false;
+    const ArrayView<Node*> fresh(fresh_memory, buckets);
+    fresh.fill(nullptr);
+    for (uint64_t b = 0; b < buckets_.size(); ++b) {
       for (Node* n = buckets_[b]; n;) {
         Node* following = n->next;
         Node** slot = &fresh[n->hash & (buckets - 1)];
@@ -164,16 +166,14 @@ class Dictionary final : public IObjectContainer<KeyValue<K, V>> {
         n = following;
       }
     }
-    allocator_.deallocate(buckets_);
+    allocator_.deallocate(buckets_.data());
     buckets_ = fresh;
-    bucket_count_ = buckets;
     return true;
   }
 
   allocators::IAllocator& allocator_;
   Hash hash_;
   Equal equal_;
-  Node** buckets_ = nullptr;
-  uint64_t bucket_count_ = 0;
+  ArrayView<Node*> buckets_;  // the table; its size is the (power of two) bucket count
   uint64_t size_ = 0;
 };

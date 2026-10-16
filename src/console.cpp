@@ -30,10 +30,10 @@ hardware::TextConsole g_text;
 GraphicsConsole g_graphics;
 
 // Output from several threads must not tear: one lock, taken per call (and
-// held across a whole ScopedLock block). Re-entrant on the same core, which is
-// enough because interrupts are masked while it is held.
+// held across a whole Guard block). Re-entrant for the thread that holds it; the
+// holder runs with interrupts masked, so it is never descheduled while holding it.
 kernel::RawSpinLock g_lock;
-uint32_t g_owner = ~0u;
+uint64_t g_owner = 0;  // the holder: its thread (or, before threads exist, 1 + the core); 0 = free
 uint32_t g_depth = 0;
 
 void putc(char c) {
@@ -45,7 +45,8 @@ void putc(char c) {
 
 namespace console {
 void lock() {
-  const uint32_t me = kernel::current_core();
+  const kernel::Thread* thread = kernel::current_thread();
+  const uint64_t me = thread ? reinterpret_cast<uint64_t>(thread) : 1 + kernel::current_core();
   const uint64_t flags = kernel::irq_save();
   if (g_depth > 0 && g_owner == me) {  // nested on this core: we already hold it
     ++g_depth;
@@ -60,14 +61,14 @@ void lock() {
 
 void unlock() {
   if (--g_depth == 0) {
-    g_owner = ~0u;
+    g_owner = 0;
     g_lock.unlock();
   }
 }
 
 void break_lock() {  // for a panic: the holder may be the code that just crashed
   g_depth = 0;
-  g_owner = ~0u;
+  g_owner = 0;
   g_lock.reset();
 }
 

@@ -17,53 +17,49 @@
  */
 
 #include "Hardware/Bus/Usb/Hid/UsbHidInterface.hpp"
+#include "Hardware/Bus/Usb/UsbDescriptors.hpp"
 
 namespace hardware {
 
 namespace {
-constexpr uint8_t kTypeConfiguration = 2;
-constexpr uint8_t kTypeInterface = 4;
-constexpr uint8_t kTypeEndpoint = 5;
-constexpr uint8_t kTypeHid = 0x21;
 constexpr uint8_t kClassHid = 3;
 constexpr uint8_t kTransferInterrupt = 3;
 }  // namespace
 
-uint32_t find_hid_interfaces(const uint8_t* c, uint16_t length, UsbHidInterface* out,
-                             uint32_t capacity) {
-  if (!c || length < 9 || c[1] != kTypeConfiguration) return 0;
-  const uint8_t configuration_value = c[5];
+uint32_t find_hid_interfaces(ConstByteView configuration, ArrayView<UsbHidInterface> out) {
+  UsbDescriptorWalker walker(configuration);
+  ConstByteView descriptor;
+  UsbConfigurationInfo configuration_info;
+  if (!walker.next(&descriptor) || !parse_usb_configuration(descriptor, &configuration_info)) return 0;
 
   uint32_t found = 0;
   UsbHidInterface current{};
   bool in_hid = false;      // inside a HID interface (alternate setting 0)
   bool have_endpoint = false;
-  for (uint16_t i = 0; i + 2 <= length && c[i] >= 2;) {
-    const uint8_t size = c[i], type = c[i + 1];
-    if (i + size > length) break;
-
-    if (type == kTypeInterface && size >= 9) {
-      in_hid = c[i + 5] == kClassHid && c[i + 3] == 0;  // class, alternate setting
+  while (walker.next(&descriptor)) {
+    UsbInterfaceInfo interface;
+    UsbEndpointInfo endpoint;
+    if (usb_descriptor_type(descriptor) == kUsbDescriptorInterface && parse_usb_interface(descriptor, &interface)) {
+      in_hid = interface.device_class == kClassHid && interface.alternate_setting == 0;
       current = UsbHidInterface{};
-      current.configuration_value = configuration_value;
-      current.number = c[i + 2];
-      current.subclass = c[i + 6];
-      current.protocol = c[i + 7];
+      current.configuration_value = configuration_info.value;
+      current.number = interface.number;
+      current.subclass = interface.subclass;
+      current.protocol = interface.protocol;
       have_endpoint = false;
-    } else if (in_hid && type == kTypeHid && size >= 9) {
-      current.report_descriptor_length = c[i + 7] | (c[i + 8] << 8);  // first class descriptor
-    } else if (in_hid && type == kTypeEndpoint && size >= 7 && !have_endpoint) {
-      const bool interrupt_in = (c[i + 2] & 0x80) && (c[i + 3] & 3) == kTransferInterrupt;
-      if (interrupt_in) {
-        current.endpoint_address = c[i + 2];
-        current.max_packet = (c[i + 4] | (c[i + 5] << 8)) & 0x7FF;
-        current.interval = c[i + 6];
-        have_endpoint = true;
-        if (found < capacity) out[found] = current;
-        ++found;
-      }
+    } else if (in_hid && usb_descriptor_type(descriptor) == kUsbDescriptorHid && descriptor.size() >= 9) {
+      ByteReader hid(descriptor);
+      hid.skip(7);
+      current.report_descriptor_length = hid.le16();  // size of the first class descriptor (the report descriptor)
+    } else if (in_hid && !have_endpoint && parse_usb_endpoint(descriptor, &endpoint) && endpoint.is_in() &&
+               endpoint.transfer_type() == kTransferInterrupt) {
+      current.endpoint_address = endpoint.address;
+      current.max_packet = endpoint.max_packet;
+      current.interval = endpoint.interval;
+      have_endpoint = true;
+      if (found < out.size()) out[found] = current;
+      ++found;
     }
-    i += size;
   }
   return found;
 }

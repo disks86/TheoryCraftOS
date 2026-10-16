@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ByteStream.hpp"
 
 namespace hardware {
 
@@ -30,6 +31,14 @@ struct MacAddress {
     return true;
   }
   bool is_broadcast() const { return *this == MacAddress{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}; }
+
+  // Reads six bytes from a stream (all zero and the stream in error if short).
+  static MacAddress read(ByteReader& in) {
+    MacAddress mac{};
+    in.read_into(ByteView(mac.bytes));
+    return mac;
+  }
+  void write(ByteWriter& out) const { out.bytes(ConstByteView(bytes)); }
 };
 
 // Ethernet frame sizes, without the 4-byte checksum (CRC) the hardware adds.

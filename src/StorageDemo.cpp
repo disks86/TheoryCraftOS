@@ -18,6 +18,7 @@
 
 #include "StorageDemo.hpp"
 #include "console.hpp"
+#include "Utility/AllocatedView.hpp"
 
 using namespace hardware;
 
@@ -62,18 +63,19 @@ bool check_device(uint32_t index, IStorageDevice& dev, allocators::IAllocator& a
   console::puts(")\n");
 
   const uint32_t bs = info.block_size;
-  // Room for the first 130 blocks (more than one bounce chunk of 64 KiB for 512-byte blocks) twice.
+  // Room for the first 130 blocks (more than one bounce chunk of 64 KiB for 512-byte blocks) twice, plus one more.
   const uint32_t span = info.block_count < 130 ? static_cast<uint32_t>(info.block_count) : 130;
-  uint8_t* big = static_cast<uint8_t*>(allocator.allocate(uint64_t{span} * bs * 2 + bs));
-  if (!big) {
+  ArrayView<uint8_t> memory = allocate_view<uint8_t>(allocator, uint64_t{span} * bs * 2 + bs);
+  if (memory.empty()) {
     console::puts("      out of memory\n");
     return false;
   }
-  uint8_t* piecewise = big + uint64_t{span} * bs;
-  uint8_t* last = piecewise + uint64_t{span} * bs;
+  const ByteView big = memory.subview(0, uint64_t{span} * bs);
+  const ByteView piecewise = memory.subview(uint64_t{span} * bs, uint64_t{span} * bs);
+  const ByteView last = memory.subview(uint64_t{span} * bs * 2, bs);
   bool ok = true;
 
-  if (!dev.read(0, span, big)) {
+  if (!dev.read(0, big)) {
     console::puts("      read of the first blocks: FAILED\n");
     ok = false;
   } else {
@@ -87,48 +89,48 @@ bool check_device(uint32_t index, IStorageDevice& dev, allocators::IAllocator& a
     for (uint32_t b = 0; b < span && same;) {
       const uint32_t n = (b % 2) ? 7 : 1;
       const uint32_t take = n < span - b ? n : span - b;
-      same = dev.read(b, take, piecewise + uint64_t{b} * bs);
+      same = dev.read(b, piecewise.subview(uint64_t{b} * bs, uint64_t{take} * bs));
       b += take;
     }
-    same = same && __builtin_memcmp(big, piecewise, uint64_t{span} * bs) == 0;
+    same = same && big.equals(piecewise);
     console::puts(same ? "      read in pieces matches one big read: ok\n" : "      read in pieces: MISMATCH\n");
     ok &= same;
     uint32_t hash = 2166136261u;  // FNV-1a over the first 64 KiB, comparable with a host-side checksum
-    for (uint32_t i = 0; i < 65536 && i < uint64_t{span} * bs; ++i) hash = (hash ^ big[i]) * 16777619u;
+    for (uint8_t byte : big.at_most(65536)) hash = (hash ^ byte) * 16777619u;
     console::puts("      checksum of the first 64 KiB: ");
     console::put_hex(hash);
     console::puts("\n");
   }
 
   if (info.block_count > 1) {
-    const bool got = dev.read(info.block_count - 1, 1, last);
+    const bool got = dev.read(info.block_count - 1, last);
     console::puts(got ? "      last block: read ok\n" : "      last block: read FAILED\n");
     ok &= got;
     // Reading past the end must be refused rather than wander off.
-    const bool refused = !dev.read(info.block_count, 1, last);
+    const bool refused = !dev.read(info.block_count, last);
     console::puts(refused ? "      read past the end refused: ok\n" : "      read past the end: NOT REFUSED\n");
     ok &= refused;
 
-    if (!info.read_only && big[0] == 'T' && __builtin_memcmp(big, kScratchMarker, sizeof(kScratchMarker) - 1) == 0) {
-      uint8_t* saved = last;  // the original last block, restored at the end
-      uint8_t* pattern = static_cast<uint8_t*>(allocator.allocate(bs));
-      uint8_t* readback = static_cast<uint8_t*>(allocator.allocate(bs));
-      bool wrote = pattern && readback;
+    if (!info.read_only && big.size() >= sizeof(kScratchMarker) - 1 &&
+        big.first(sizeof(kScratchMarker) - 1).equals(text_bytes(kScratchMarker))) {
+      // `last` holds the original last block, restored at the end.
+      ArrayView<uint8_t> scratch = allocate_view<uint8_t>(allocator, uint64_t{bs} * 2);
+      bool wrote = !scratch.empty();
       if (wrote) {
+        const ByteView pattern = scratch.first(bs), readback = scratch.last(bs);
         for (uint32_t i = 0; i < bs; ++i) pattern[i] = static_cast<uint8_t>(i * 7 + 13);
-        wrote = dev.write(info.block_count - 1, 1, pattern) && dev.flush() &&
-                dev.read(info.block_count - 1, 1, readback) && __builtin_memcmp(pattern, readback, bs) == 0;
-        dev.write(info.block_count - 1, 1, saved);
+        wrote = dev.write(info.block_count - 1, pattern) && dev.flush() && dev.read(info.block_count - 1, readback) &&
+                pattern.equals(readback);
+        dev.write(info.block_count - 1, last);
         dev.flush();
       }
       console::puts(wrote ? "      write + flush + read back (scratch device): ok\n"
                           : "      write + flush + read back (scratch device): FAILED\n");
       ok &= wrote;
-      allocator.deallocate(pattern);
-      allocator.deallocate(readback);
+      release_view(allocator, scratch);
     }
   }
-  allocator.deallocate(big);
+  release_view(allocator, memory);
   return ok;
 }
 }  // namespace

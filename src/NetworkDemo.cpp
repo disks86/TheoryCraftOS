@@ -34,21 +34,39 @@ void put_mac(const hardware::MacAddress& mac) {
 }
 
 // An Ethernet frame carrying an ARP request: who has `target`? tell `sender`.
-uint32_t build_arp_request(uint8_t* frame, const hardware::MacAddress& mac, const uint8_t* sender,
-                           const uint8_t* target) {
-  uint8_t* p = frame;
-  for (int i = 0; i < 6; ++i) *p++ = 0xFF;                 // destination: broadcast
-  for (int i = 0; i < 6; ++i) *p++ = mac.bytes[i];         // source
-  *p++ = 0x08; *p++ = 0x06;                                // EtherType: ARP
-  *p++ = 0x00; *p++ = 0x01;                                // hardware type: Ethernet
-  *p++ = 0x08; *p++ = 0x00;                                // protocol type: IPv4
-  *p++ = 6; *p++ = 4;                                      // address sizes
-  *p++ = 0x00; *p++ = 0x01;                                // operation: request
-  for (int i = 0; i < 6; ++i) *p++ = mac.bytes[i];         // sender hardware address
-  for (int i = 0; i < 4; ++i) *p++ = sender[i];            // sender protocol address
-  for (int i = 0; i < 6; ++i) *p++ = 0;                    // target hardware address: unknown
-  for (int i = 0; i < 4; ++i) *p++ = target[i];            // target protocol address
-  return static_cast<uint32_t>(p - frame);                 // 42 bytes; the NIC pads to 60
+// Returns the frame (42 bytes; the NIC pads to 60).
+ConstByteView build_arp_request(ByteView storage, const hardware::MacAddress& mac, const uint8_t (&sender)[4],
+                                const uint8_t (&target)[4]) {
+  ByteWriter out(storage);
+  out.zeros(0);
+  for (int i = 0; i < 6; ++i) out.u8(0xFF);  // destination: broadcast
+  mac.write(out);                            // source
+  out.be16(0x0806);                          // EtherType: ARP
+  out.be16(1);                               // hardware type: Ethernet
+  out.be16(0x0800);                          // protocol type: IPv4
+  out.u8(6);                                 // address sizes
+  out.u8(4);
+  out.be16(1);                               // operation: request
+  mac.write(out);                            // sender hardware address
+  out.bytes(ConstByteView(sender));          // sender protocol address
+  out.zeros(6);                              // target hardware address: unknown
+  out.bytes(ConstByteView(target));          // target protocol address
+  return out.ok() ? ConstByteView(out.written()) : ConstByteView();
+}
+
+// Is this frame an ARP reply from `from_ip`? Fills in the sender's hardware address.
+bool is_arp_reply_from(ConstByteView frame, const uint8_t (&from_ip)[4], hardware::MacAddress* sender_mac) {
+  ByteReader in(frame);
+  in.skip(12);  // destination and source
+  if (in.be16() != 0x0806) return false;
+  in.skip(6);  // hardware type, protocol type, sizes
+  if (in.be16() != 2) return false;  // not a reply
+  const hardware::MacAddress mac = hardware::MacAddress::read(in);
+  uint8_t ip[4];
+  in.read_into(ByteView(ip));
+  if (!in.ok() || !ConstByteView(ip).equals(ConstByteView(from_ip))) return false;
+  *sender_mac = mac;
+  return true;
 }
 }  // namespace
 
@@ -59,21 +77,19 @@ bool run_network_probe(hardware::INetworkInterface& nic, efi::SystemTable* st) {
   put_mac(nic.mac_address());
   console::puts(nic.link_up() ? ", link up\n" : ", link DOWN\n");
 
-  uint8_t frame[hardware::kEthernetMaxFrame];
-  const uint32_t length = build_arp_request(frame, nic.mac_address(), kOurIp, kGatewayIp);
+  uint8_t frame_storage[hardware::kEthernetMaxFrame];
+  const ConstByteView frame = build_arp_request(ByteView(frame_storage), nic.mac_address(), kOurIp, kGatewayIp);
   bool answered = false;
-  if (nic.transmit(frame, length)) {
+  if (!frame.empty() && nic.transmit(frame)) {
     for (int ms = 0; ms < 2000 && !answered; ++ms) {
       uint8_t reply[hardware::kEthernetMaxFrame];
       uint32_t reply_length = 0;
-      while (nic.receive(reply, sizeof(reply), &reply_length)) {
-        // ARP reply from the gateway: EtherType 0x0806, operation 2, sender IP 10.0.2.2.
-        const bool arp_reply = reply_length >= 42 && reply[12] == 0x08 && reply[13] == 0x06 && reply[20] == 0x00 &&
-                               reply[21] == 0x02 && reply[28] == kGatewayIp[0] && reply[29] == kGatewayIp[1] &&
-                               reply[30] == kGatewayIp[2] && reply[31] == kGatewayIp[3];
-        if (!arp_reply) continue;  // other traffic (e.g. IPv6 chatter): keep looking
+      while (nic.receive(ByteView(reply), &reply_length)) {
+        if (reply_length > sizeof(reply)) continue;
+        // ARP reply from the gateway.
         hardware::MacAddress gateway;
-        for (int i = 0; i < 6; ++i) gateway.bytes[i] = reply[22 + i];
+        if (!is_arp_reply_from(ConstByteView(reply).first(reply_length), kGatewayIp, &gateway))
+          continue;  // other traffic (e.g. IPv6 chatter): keep looking
         console::puts("    ARP reply: 10.0.2.2 is at ");
         put_mac(gateway);
         console::puts("\n");
@@ -96,11 +112,13 @@ bool run_network_probe(hardware::INetworkInterface& nic, efi::SystemTable* st) {
   constexpr uint32_t kBurst = 300;
   uint32_t sent = 0, replies = 0;
   for (int ms = 0; ms < 3000 && replies < kBurst; ++ms) {
-    for (uint32_t batch = 0; batch < 16 && sent < kBurst && nic.transmit(frame, length); ++batch) ++sent;
+    for (uint32_t batch = 0; batch < 16 && sent < kBurst && nic.transmit(frame); ++batch) ++sent;
     uint8_t reply[hardware::kEthernetMaxFrame];
     uint32_t reply_length = 0;
-    while (nic.receive(reply, sizeof(reply), &reply_length))
-      if (reply_length >= 42 && reply[12] == 0x08 && reply[13] == 0x06 && reply[21] == 0x02) ++replies;
+    hardware::MacAddress ignored;
+    while (nic.receive(ByteView(reply), &reply_length))
+      if (reply_length <= sizeof(reply) && is_arp_reply_from(ConstByteView(reply).first(reply_length), kGatewayIp, &ignored))
+        ++replies;
     hardware::delay_us(1000);
   }
   console::puts("    burst: sent ");

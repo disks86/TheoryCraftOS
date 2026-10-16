@@ -39,11 +39,11 @@ class IIpLayer {
   // `destination`, via the gateway when it is off-link. False if the packet
   // cannot be sent now (not configured, too large, link-layer trouble); a packet
   // that is waiting for an ARP answer counts as sent.
-  virtual bool send_ip(Ipv4Address destination, uint8_t protocol, const uint8_t* payload, uint32_t length) = 0;
+  virtual bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) = 0;
   // The same with an explicit source address (0.0.0.0 is allowed), optionally as
   // a link-layer broadcast. DHCP needs this before it has an address.
-  virtual bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, const uint8_t* payload,
-                            uint32_t length, bool link_broadcast) = 0;
+  virtual bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
+                            bool link_broadcast) = 0;
 
  protected:
   IIpLayer() = default;

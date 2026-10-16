@@ -36,8 +36,7 @@ struct TcpSegment {
   uint32_t acknowledgement;
   uint8_t flags;
   uint16_t window;
-  const uint8_t* data;
-  uint32_t length;
+  ConstByteView data;  // the payload, a view into the received packet
   uint16_t mss;  // from the MSS option, 0 if absent
 };
 
@@ -70,8 +69,8 @@ class TcpSocket final : public ITcpSocket {
   bool connect(Ipv4Address address, uint16_t port) override;
   bool listen(uint16_t port) override;
   SharedPointer<ITcpSocket> accept() override;
-  uint32_t send(const uint8_t* data, uint32_t length) override;
-  uint32_t receive(uint8_t* buffer, uint32_t capacity) override;
+  uint32_t send(ConstByteView data) override;
+  uint32_t receive(ByteView buffer) override;
   uint32_t available() const override {
     StackLock guard(ip_);
     return receive_buffer_.size();
@@ -139,8 +138,8 @@ class TcpSocket final : public ITcpSocket {
   enum class Mode : uint8_t { Open, Closing };
 
   uint32_t advertised_window() const;
-  void send_segment(uint8_t flags, uint32_t sequence, const uint8_t* data, uint32_t length, bool with_mss);
-  void send_ack() { send_segment(tcp_flags::kAck, snd_nxt_, nullptr, 0, false); }
+  void send_segment(uint8_t flags, uint32_t sequence, ConstByteView data, bool with_mss);
+  void send_ack() { send_segment(tcp_flags::kAck, snd_nxt_, ConstByteView(), false); }
   void output();
   void process_ack(const TcpSegment& segment);
   void accept_data(const TcpSegment& segment);

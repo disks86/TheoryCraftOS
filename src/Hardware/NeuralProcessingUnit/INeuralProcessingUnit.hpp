@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
 #include "Hardware/IHardware.hpp"
 
 namespace hardware {
@@ -33,17 +34,19 @@ class INeuralProcessingUnit : public IHardware {
   virtual uint64_t memory_bytes() const = 0;   // dedicated on-device memory (0 = shares system RAM)
 
   // C[m x n] = A[m x k] * B[k x n]. Quantized inference: 8-bit inputs, 32-bit
-  // accumulators (no overflow for k up to 2^17).
-  virtual bool matmul_i8(const int8_t* a, const int8_t* b, int32_t* c, uint32_t m, uint32_t n,
-                         uint32_t k) = 0;
+  // accumulators (no overflow for k up to 2^17). Each matrix is a view that must
+  // hold at least its m*k, k*n or m*n elements; a smaller one is refused (false)
+  // instead of being overrun.
+  virtual bool matmul_i8(ArrayView<const int8_t> a, ArrayView<const int8_t> b, ArrayView<int32_t> c, uint32_t m,
+                         uint32_t n, uint32_t k) = 0;
   // The same in 32-bit floating point.
-  virtual bool matmul_f32(const float* a, const float* b, float* c, uint32_t m, uint32_t n,
-                          uint32_t k) = 0;
+  virtual bool matmul_f32(ArrayView<const float> a, ArrayView<const float> b, ArrayView<float> c, uint32_t m,
+                          uint32_t n, uint32_t k) = 0;
 
-  // Element-wise, in place.
-  virtual bool activate(float* data, uint32_t count, NpuActivation kind) = 0;
-  // Softmax over `count` values, in place (numerically stable).
-  virtual bool softmax(float* data, uint32_t count) = 0;
+  // Element-wise, in place, over the whole view.
+  virtual bool activate(ArrayView<float> data, NpuActivation kind) = 0;
+  // Softmax over the whole view, in place (numerically stable).
+  virtual bool softmax(ArrayView<float> data) = 0;
 
  protected:
   constexpr INeuralProcessingUnit() = default;

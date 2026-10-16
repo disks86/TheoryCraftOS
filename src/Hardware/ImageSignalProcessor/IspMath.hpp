@@ -19,6 +19,7 @@
 // Floating-point helpers for building lookup tables. The image has no libm.
 #pragma once
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -28,6 +29,6 @@ double isp_pow(double base, double exponent);
 
 // Fills table[0..entries-1] with round(255 * (i / (entries-1)) ^ (100 / gamma_x100)),
 // the encoding curve for a display gamma of gamma_x100 / 100.
-void build_gamma_table(uint8_t* table, uint32_t entries, uint16_t gamma_x100);
+void build_gamma_table(ByteView table, uint16_t gamma_x100);
 
 }  // namespace hardware

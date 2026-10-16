@@ -114,8 +114,8 @@ bool AhciStorageDevice::stop_port() {
 
 bool AhciStorageDevice::start_port() {
   if (!stop_port()) return false;
-  const uint64_t list = reinterpret_cast<uint64_t>(memory_) + kCommandListOffset;
-  const uint64_t fis = reinterpret_cast<uint64_t>(memory_) + kFisOffset;
+  const uint64_t list = reinterpret_cast<uint64_t>(memory_.subview(kCommandListOffset).data());
+  const uint64_t fis = reinterpret_cast<uint64_t>(memory_.subview(kFisOffset).data());
   if (!controller_->addresses_64_bit() && ((list | fis) >> 32)) return false;
   controller_->port_register(port_, kClb) = static_cast<uint32_t>(list);
   controller_->port_register(port_, kClbu) = static_cast<uint32_t>(list >> 32);
@@ -134,28 +134,27 @@ bool AhciStorageDevice::start_port() {
 
 // Runs one command through slot 0. `fis` is the host-to-device register FIS;
 // `packet` (12 bytes, may be null) turns it into an ATAPI command.
-bool AhciStorageDevice::issue(const uint8_t* fis, uint32_t fis_dwords, const uint8_t* packet, bool write, void* data,
-                              uint32_t bytes) {
-  if (!started_) return false;
-  uint8_t* table = memory_ + kTableOffset;
-  __builtin_memset(table, 0, kTablePrdtOffset + sizeof(PrdEntry));
-  __builtin_memcpy(table, fis, fis_dwords * 4);
-  if (packet) __builtin_memcpy(table + kTablePacketOffset, packet, 12);
+bool AhciStorageDevice::issue(ConstByteView fis, ConstByteView packet, bool write, ByteView data) {
+  if (!started_ || fis.size() > 64 || packet.size() > 16) return false;
+  const ByteView table = memory_.subview(kTableOffset, kTablePrdtOffset + sizeof(PrdEntry));
+  table.fill(0);
+  table.copy_from(fis);                                     // the command FIS fills the front of the table
+  table.subview(kTablePacketOffset, 16).copy_from(packet);  // ATAPI packet, if any
   uint32_t prdt = 0;
-  if (bytes) {
-    PrdEntry* prd = reinterpret_cast<PrdEntry*>(table + kTablePrdtOffset);
-    prd->low = static_cast<uint32_t>(reinterpret_cast<uint64_t>(data));
-    prd->high = static_cast<uint32_t>(reinterpret_cast<uint64_t>(data) >> 32);
-    prd->byte_count = bytes - 1;
+  if (!data.empty()) {
+    PrdEntry& prd = table.subview(kTablePrdtOffset, sizeof(PrdEntry)).cast<PrdEntry>()[0];
+    prd.low = static_cast<uint32_t>(reinterpret_cast<uint64_t>(data.data()));
+    prd.high = static_cast<uint32_t>(reinterpret_cast<uint64_t>(data.data()) >> 32);
+    prd.byte_count = static_cast<uint32_t>(data.size() - 1);
     prdt = 1;
   }
-  CommandHeader* header = reinterpret_cast<CommandHeader*>(memory_ + kCommandListOffset);
-  const uint64_t table_address = reinterpret_cast<uint64_t>(table);
-  header->flags = static_cast<uint16_t>(fis_dwords | (packet ? 1u << 5 : 0) | (write ? 1u << 6 : 0));
-  header->prdt_length = static_cast<uint16_t>(prdt);
-  header->bytes_transferred = 0;
-  header->table_low = static_cast<uint32_t>(table_address);
-  header->table_high = static_cast<uint32_t>(table_address >> 32);
+  CommandHeader& header = memory_.subview(kCommandListOffset, sizeof(CommandHeader)).cast<CommandHeader>()[0];
+  const uint64_t table_address = reinterpret_cast<uint64_t>(table.data());
+  header.flags = static_cast<uint16_t>((fis.size() / 4) | (!packet.empty() ? 1u << 5 : 0) | (write ? 1u << 6 : 0));
+  header.prdt_length = static_cast<uint16_t>(prdt);
+  header.bytes_transferred = 0;
+  header.table_low = static_cast<uint32_t>(table_address);
+  header.table_high = static_cast<uint32_t>(table_address >> 32);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
   controller_->port_register(port_, kIs) = 0xFFFFFFFF;
@@ -174,11 +173,12 @@ bool AhciStorageDevice::issue(const uint8_t* fis, uint32_t fis_dwords, const uin
 }
 
 bool AhciStorageDevice::identify_ata() {
-  uint8_t fis[20] = {0x27, 0x80, kIdentify};
-  uint16_t* id = reinterpret_cast<uint16_t*>(memory_ + 3072);  // IDENTIFY data, 512 bytes
-  if (!issue(fis, 5, nullptr, false, id, 512)) return false;
-  copy_device_string(info_.serial, sizeof(info_.serial), reinterpret_cast<uint8_t*>(id + 10), 20, true);
-  copy_device_string(info_.model, sizeof(info_.model), reinterpret_cast<uint8_t*>(id + 27), 40, true);
+  const uint8_t fis[20] = {0x27, 0x80, kIdentify};
+  const ByteView identify_data = memory_.subview(3072, 512);  // IDENTIFY DEVICE data, 256 words
+  if (!issue(ConstByteView(fis), ConstByteView(), false, identify_data)) return false;
+  const ArrayView<uint16_t> id = identify_data.cast<uint16_t>();
+  copy_device_string(ArrayView<char>(info_.serial), ConstByteView(identify_data).subview(20, 20), true);  // words 10-19
+  copy_device_string(ArrayView<char>(info_.model), ConstByteView(identify_data).subview(54, 40), true);   // words 27-46
   lba48_ = id[83] & (1u << 10);
   info_.block_count = lba48_ ? (uint64_t{id[103]} << 48) | (uint64_t{id[102]} << 32) | (uint64_t{id[101]} << 16) | id[100]
                              : (uint64_t{id[61]} << 16) | id[60];
@@ -191,27 +191,30 @@ bool AhciStorageDevice::identify_ata() {
   return info_.block_count > 0;
 }
 
-bool AhciStorageDevice::atapi_command(const uint8_t* cdb, void* data, uint32_t bytes) {
+bool AhciStorageDevice::atapi_command(ConstByteView cdb, ByteView data) {
   uint8_t fis[20] = {0x27, 0x80, kPacket, 1 /* DMA */};
   fis[7] = 0xA0;
   fis[5] = 0xFE;  // byte count limit, unused with DMA
   fis[6] = 0xFF;
-  return issue(fis, 5, cdb, false, data, bytes);
+  return issue(ConstByteView(fis), cdb, false, data);
 }
 
 bool AhciStorageDevice::identify_atapi() {
   info_.kind = StorageKind::Optical;
   info_.read_only = true;
   info_.removable = true;
-  uint8_t* buffer = memory_ + 3072;
-  uint8_t cdb[12] = {scsi::kInquiry, 0, 0, 0, 36};
-  if (!atapi_command(cdb, buffer, 36)) return false;
-  copy_device_string(info_.model, sizeof(info_.model), buffer + 8, 28, false);  // vendor and product
+  const ByteView buffer = memory_.subview(3072, 512);
+  const uint8_t inquiry[12] = {scsi::kInquiry, 0, 0, 0, 36};
+  if (!atapi_command(ConstByteView(inquiry), buffer.first(36))) return false;
+  scsi::InquiryInfo unit;
+  if (!scsi::parse_inquiry(buffer, &unit)) return false;
+  copy_device_string(ArrayView<char>(info_.model), unit.vendor_and_product, false);
   for (int attempt = 0; attempt < 3; ++attempt) {  // the first command after attaching may report a media change
-    uint8_t capacity[12] = {scsi::kReadCapacity10};
-    if (atapi_command(capacity, buffer, 8)) {
-      info_.block_count = uint64_t{scsi::be32(buffer)} + 1;
-      info_.block_size = scsi::be32(buffer + 4);
+    const uint8_t capacity[12] = {scsi::kReadCapacity10};
+    uint64_t last = 0;
+    if (atapi_command(ConstByteView(capacity), buffer.first(8)) &&
+        scsi::parse_capacity10(buffer, &last, &info_.block_size)) {
+      info_.block_count = last + 1;
       return info_.block_size >= 512 && info_.block_size <= 4096;
     }
   }
@@ -219,9 +222,9 @@ bool AhciStorageDevice::identify_atapi() {
 }
 
 bool AhciStorageDevice::initialize() {
-  memory_ = static_cast<uint8_t*>(allocator_.allocate_aligned(4096, 4096));
-  if (!memory_) return false;
-  __builtin_memset(memory_, 0, 4096);
+  memory_ = allocate_view<uint8_t>(allocator_, 4096, 4096);
+  if (memory_.empty()) return false;
+  memory_.fill(0);
   started_ = start_port();
   if (!started_) return false;
   if (!(atapi_ ? identify_atapi() : identify_ata())) return false;
@@ -234,21 +237,19 @@ void AhciStorageDevice::shutdown() {
 }
 
 void AhciStorageDevice::release_resources() {
-  if (memory_ && started_) stop_port();
+  if (!memory_.empty() && started_) stop_port();
   started_ = false;
   release_bounce();
-  allocator_.deallocate(memory_);
-  memory_ = nullptr;
+  release_view(allocator_, memory_);
 }
 
-bool AhciStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
-  const uint32_t bytes = blocks * info_.block_size;
+bool AhciStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {
   if (atapi_) {
     if (write) return false;
-    uint8_t cdb[12];
-    scsi::build_read_write(cdb, false, lba, blocks);
-    cdb[0] = scsi::kRead10;
-    return atapi_command(cdb, dma, bytes);
+    uint8_t cdb[16];
+    // A CD-ROM is read with READ(10) in a 12-byte packet; 16-byte commands do not fit.
+    if (scsi::build_read_write(ByteView(cdb), false, lba, blocks) != 10) return false;
+    return atapi_command(ConstByteView(cdb).first(12), dma);
   }
   uint8_t fis[20] = {0x27, 0x80};
   fis[2] = lba48_ ? (write ? kWriteDmaExt : kReadDmaExt) : (write ? kWriteDma : kReadDma);
@@ -265,14 +266,14 @@ bool AhciStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void
   }
   fis[12] = static_cast<uint8_t>(blocks);
   fis[13] = static_cast<uint8_t>(blocks >> 8);
-  return issue(fis, 5, nullptr, write, dma, bytes);
+  return issue(ConstByteView(fis), ConstByteView(), write, dma);
 }
 
 bool AhciStorageDevice::flush_cache() {
   if (atapi_) return true;
   uint8_t fis[20] = {0x27, 0x80, lba48_ ? kFlushCacheExt : kFlushCache};
   fis[7] = 0x40;
-  return issue(fis, 5, nullptr, false, nullptr, 0);
+  return issue(ConstByteView(fis), ConstByteView(), false, ByteView());
 }
 
 }  // namespace hardware

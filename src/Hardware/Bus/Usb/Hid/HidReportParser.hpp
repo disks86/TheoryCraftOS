@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -39,16 +40,17 @@ struct HidPointerLayout {
   bool valid = false;  // has at least X and Y
   uint8_t report_id = 0;  // 0 = reports carry no ID byte
   HidField x, y, wheel;
-  HidField buttons[3];  // left, right, middle
+  HidField button_storage[3];  // left, right, middle
+  ArrayView<HidField> buttons() { return ArrayView<HidField>(button_storage); }
+  ArrayView<const HidField> buttons() const { return ArrayView<const HidField>(button_storage); }
 };
 
 // Parses a HID report descriptor (USB HID 1.11, section 6.2.2). Items for other
 // usages are skipped over, so composite descriptors are fine.
-bool parse_hid_pointer(const uint8_t* descriptor, uint16_t length, HidPointerLayout* out);
+bool parse_hid_pointer(ConstByteView descriptor, HidPointerLayout* out);
 
 // Reads a field out of a report as a (sign-extended when signed) integer.
 // Returns 0 when the field is invalid or lies outside the report.
-int32_t hid_extract(const uint8_t* report, uint16_t report_length, const HidField& field,
-                    uint8_t report_id);
+int32_t hid_extract(ConstByteView report, const HidField& field, uint8_t report_id);
 
 }  // namespace hardware

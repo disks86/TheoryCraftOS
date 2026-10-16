@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -27,7 +28,7 @@ enum class BayerPattern : uint8_t { Rggb, Bggr, Grbg, Gbrg };
 // One frame of raw sensor data: a single sample per pixel, each behind a colour
 // filter of the Bayer pattern.
 struct RawFrame {
-  const uint16_t* pixels;
+  ArrayView<const uint16_t> pixels;  // at least (height - 1) * stride + width samples
   uint32_t width, height;
   uint32_t stride;      // samples per row (>= width)
   uint8_t bit_depth;    // significant bits per sample, 8-16
@@ -36,7 +37,7 @@ struct RawFrame {
 
 // A finished image, one 0x00RRGGBB pixel each.
 struct ImageBuffer {
-  uint32_t* pixels;
+  ArrayView<uint32_t> pixels;  // at least (height - 1) * stride + width pixels
   uint32_t width, height;
   uint32_t stride;  // pixels per row (>= width)
 };

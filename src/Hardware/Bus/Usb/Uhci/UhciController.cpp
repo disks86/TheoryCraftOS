@@ -46,14 +46,12 @@ bool below_4g(const void* p, uint64_t length) { return reinterpret_cast<uint64_t
 uint16_t UhciController::read16(uint16_t reg) const { return IoPort(io_ + reg).read16(); }
 void UhciController::write16(uint16_t reg, uint16_t value) const { IoPort(io_ + reg).write16(value); }
 
-void* UhciController::low_allocate(uint64_t size, uint64_t alignment) {
-  void* p = allocator_.allocate_aligned(size, alignment);
-  if (p && !below_4g(p, size)) {
-    allocator_.deallocate(p);
-    return nullptr;
-  }
-  if (p) __builtin_memset(p, 0, size);
-  return p;
+template <class T>
+ArrayView<T> UhciController::low_allocate(uint64_t count, uint64_t alignment) {
+  ArrayView<T> memory = allocate_view<T>(allocator_, count, alignment);
+  if (!memory.empty() && !below_4g(memory.data(), memory.size_bytes())) release_view(allocator_, memory);  // out of the controller's reach
+  if (!memory.empty()) __builtin_memset(memory.data(), 0, memory.size_bytes());
+  return memory;
 }
 
 // ---------------------------------------------------------------- bring-up
@@ -78,12 +76,12 @@ bool UhciController::initialize() {
   for (int i = 0; i < 100 && (read16(kCmd) & kCmdHostReset); ++i) delay_us(1000);
   if (read16(kCmd) & kCmdHostReset) return shutdown(), false;
 
-  frame_list_ = static_cast<uint32_t*>(low_allocate(4096, 4096));
+  frame_list_ = low_allocate<uint32_t>(1024, 4096);
   head_ = make_queue_head();
-  pool_ = static_cast<Td*>(low_allocate(sizeof(Td) * kPoolTds, 16));
-  control_buffer_ = static_cast<uint8_t*>(low_allocate(8192, 4096));
-  bounce_ = static_cast<uint8_t*>(low_allocate(65536, 4096));
-  if (!frame_list_ || !head_ || !pool_ || !control_buffer_ || !bounce_) return shutdown(), false;
+  pool_ = low_allocate<Td>(kPoolTds, 16);
+  control_buffer_ = low_allocate<uint8_t>(8192, 4096);
+  bounce_ = low_allocate<uint8_t>(65536, 4096);
+  if (frame_list_.empty() || !head_ || pool_.empty() || control_buffer_.empty() || bounce_.empty()) return shutdown(), false;
   head_->link = kTerminate;
   head_->element = kTerminate;
   for (uint32_t i = 0; i < 1024; ++i) frame_list_[i] = low32(head_) | kQueueHead;
@@ -91,7 +89,7 @@ bool UhciController::initialize() {
   write16(kIntr, 0);  // polled
   write16(kSts, 0x3F);
   write16(kFrNum, 0);
-  IoPort(io_ + kFrBase).write32(low32(frame_list_));
+  IoPort(io_ + kFrBase).write32(low32(frame_list_.data()));
   IoPort(io_ + kSofMod).write8(0x40);
   write16(kCmd, kCmdRun | kCmdConfigure | kCmdMaxPacket64);
   running_ = true;
@@ -123,16 +121,12 @@ void UhciController::shutdown() {
     for (Pipe& p : d.pipes) free_pipe(p);
     d = Device{};
   }
-  allocator_.deallocate(frame_list_);
+  release_view(allocator_, frame_list_);
   allocator_.deallocate(head_);
-  allocator_.deallocate(pool_);
-  allocator_.deallocate(control_buffer_);
-  allocator_.deallocate(bounce_);
-  frame_list_ = nullptr;
+  release_view(allocator_, pool_);
+  release_view(allocator_, control_buffer_);
+  release_view(allocator_, bounce_);
   head_ = nullptr;
-  pool_ = nullptr;
-  control_buffer_ = nullptr;
-  bounce_ = nullptr;
 
   if (owns_controller_) {
     owns_controller_ = false;
@@ -169,7 +163,8 @@ bool UhciController::reset_port(uint32_t port, bool* low_speed) {
 // ---------------------------------------------------------------- queue heads and descriptors
 
 UhciController::Qh* UhciController::make_queue_head() {
-  Qh* qh = static_cast<Qh*>(low_allocate(sizeof(Qh), 16));
+  ArrayView<Qh> memory = low_allocate<Qh>(1, 16);
+  Qh* qh = memory.data();
   if (qh) qh->link = qh->element = kTerminate;
   return qh;
 }
@@ -203,30 +198,32 @@ void UhciController::free_pipe(Pipe& p) {
     allocator_.deallocate(p.qh);
   }
   allocator_.deallocate(p.td);
-  allocator_.deallocate(p.buffer);
+  release_view(allocator_, p.buffer);
   p = Pipe{};
 }
 
 void UhciController::fill_td(Td* td, uint32_t pid, uint8_t device_address, uint8_t endpoint, uint32_t toggle,
-                             bool low_speed, uint32_t bytes, const void* buffer) {
+                             bool low_speed, ConstByteView buffer) {
+  const uint64_t bytes = buffer.size();  // at most 1280 (a USB 1.1 packet is far smaller)
   td->link = kTerminate;
   td->status = kTdActive | kTdErrorCount3 | (low_speed ? kTdLowSpeed : 0);
   td->token = pid | (uint32_t{device_address} << 8) | (uint32_t{endpoint} << 15) | (toggle << 19) |
-              ((bytes ? bytes - 1 : 0x7FF) << 21);
-  td->buffer = low32(buffer);
+              (static_cast<uint32_t>(bytes ? bytes - 1 : 0x7FF) << 21);
+  td->buffer = bytes ? low32(buffer.data()) : 0;
 }
 
 // Chains `count` descriptors depth-first onto a queue head and waits for all of them.
-bool UhciController::run(Pipe& pipe, Td* first, uint32_t count, uint32_t timeout_ms) {
-  for (uint32_t i = 0; i + 1 < count; ++i) first[i].link = low32(&first[i + 1]) | kDepthFirst;
+bool UhciController::run(Pipe& pipe, ArrayView<Td> descriptors, uint32_t timeout_ms) {
+  const uint64_t count = descriptors.size();
+  for (uint64_t i = 0; i + 1 < count; ++i) descriptors[i].link = low32(&descriptors[i + 1]) | kDepthFirst;
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  pipe.qh->element = low32(first);
+  pipe.qh->element = low32(descriptors.data());
 
   bool done = false, failed = false;
   for (uint32_t waited = 0; waited <= timeout_ms * 10 && !done && !failed; ++waited) {
     done = true;
-    for (uint32_t i = 0; i < count; ++i) {
-      const uint32_t status = reinterpret_cast<volatile Td*>(&first[i])->status;
+    for (Td& td : descriptors) {
+      const uint32_t status = reinterpret_cast<volatile Td*>(&td)->status;
       if (status & kTdErrors) {
         failed = true;
         break;
@@ -274,35 +271,32 @@ void UhciController::close_device(uint32_t port) {
 }
 
 bool UhciController::control_transfer(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
-                                      uint16_t index, void* data, uint16_t length, bool data_in) {
+                                      uint16_t index, ByteView data, bool data_in) {
   Device& d = devices_[port];
   Pipe& pipe = d.control;
-  if (!pipe.qh || length > 4096) return false;
-  uint8_t* setup = control_buffer_;
-  uint8_t* buffer = control_buffer_ + 64;
-  setup[0] = request_type;
-  setup[1] = request;
-  setup[2] = static_cast<uint8_t>(value);
-  setup[3] = static_cast<uint8_t>(value >> 8);
-  setup[4] = static_cast<uint8_t>(index);
-  setup[5] = static_cast<uint8_t>(index >> 8);
-  setup[6] = static_cast<uint8_t>(length);
-  setup[7] = static_cast<uint8_t>(length >> 8);
-  if (length) {
-    if (data_in) __builtin_memset(buffer, 0, length);
-    else if (data) __builtin_memcpy(buffer, data, length);
-  }
+  if (!pipe.qh || data.size() > 4096) return false;
+  const uint16_t length = static_cast<uint16_t>(data.size());
+  const ByteView setup = control_buffer_.first(8);
+  const ByteView buffer = control_buffer_.subview(64, 4096);  // device-reachable staging area for the data stage
+  ByteWriter packet(setup);
+  packet.u8(request_type);
+  packet.u8(request);
+  packet.le16(value);
+  packet.le16(index);
+  packet.le16(length);
+  if (data_in) buffer.first(length).fill(0);
 
+  // Setup, the data packets, then the status stage: at most 2 + 4096/8 descriptors.
   uint32_t n = 0, toggle = 1;
-  fill_td(&pool_[n++], kPidSetup, d.address, 0, 0, d.low_speed, 8, setup);
+  fill_td(&pool_[n++], kPidSetup, d.address, 0, 0, d.low_speed, setup);
   for (uint32_t offset = 0; offset < length; toggle ^= 1) {
     const uint32_t chunk = length - offset < pipe.max_packet ? length - offset : pipe.max_packet;
-    fill_td(&pool_[n++], data_in ? kPidIn : kPidOut, d.address, 0, toggle, d.low_speed, chunk, buffer + offset);
+    fill_td(&pool_[n++], data_in ? kPidIn : kPidOut, d.address, 0, toggle, d.low_speed, buffer.subview(offset, chunk));
     offset += chunk;
   }
-  fill_td(&pool_[n++], data_in ? kPidOut : kPidIn, d.address, 0, 1, d.low_speed, 0, nullptr);  // status stage
-  if (!run(pipe, pool_, n, kControlTimeoutMs)) return false;
-  if (data_in && length && data) __builtin_memcpy(data, buffer, length);
+  fill_td(&pool_[n++], data_in ? kPidOut : kPidIn, d.address, 0, 1, d.low_speed, ConstByteView());  // status stage
+  if (!run(pipe, pool_.first(n), kControlTimeoutMs)) return false;
+  if (data_in && length) data.copy_from(buffer.first(length));
   return true;
 }
 
@@ -331,37 +325,36 @@ bool UhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
   return false;
 }
 
-bool UhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                                   uint32_t* transferred) {
-  kernel::ScopedMutex lock_guard(lock_);
+bool UhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) {
   if (transferred) *transferred = 0;
-  if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
+  if (port >= ports_ || !devices_[port].present || data.size() > 0x10000) return false;
   Device& d = devices_[port];
   Pipe* pipe = find_pipe(d, endpoint_address);
-  if (!pipe || pipe->interrupt || (length && !data)) return false;
+  if (!pipe || pipe->interrupt) return false;
 
+  const uint64_t length = data.size();
   const bool in = endpoint_address & 0x80;
-  uint8_t* buffer = static_cast<uint8_t*>(data);
-  const bool bounced = length && !below_4g(data, length);
+  ByteView buffer = data;
+  const bool bounced = length && !below_4g(data.data(), length);
   if (bounced) {  // the controller cannot address this buffer
-    buffer = bounce_;
-    if (!in) __builtin_memcpy(bounce_, data, length);
+    buffer = bounce_.first(length);
+    if (!in) buffer.copy_from(data);
   }
 
-  uint32_t offset = 0, moved = 0;
+  uint64_t offset = 0, moved = 0;
   bool first = true;
   while (first || offset < length) {
     first = false;
     uint32_t n = 0, toggle = pipe->toggle;
-    const uint32_t batch_start = offset;
+    const uint64_t batch_start = offset;
     do {
-      const uint32_t chunk = length - offset < pipe->max_packet ? length - offset : pipe->max_packet;
-      fill_td(&pool_[n++], in ? kPidIn : kPidOut, d.address, endpoint_address & 0x0F, toggle, d.low_speed, chunk,
-              buffer + offset);
+      const uint64_t chunk = length - offset < pipe->max_packet ? length - offset : pipe->max_packet;
+      fill_td(&pool_[n++], in ? kPidIn : kPidOut, d.address, endpoint_address & 0x0F, toggle, d.low_speed,
+              buffer.subview(offset, chunk));
       toggle ^= 1;
       offset += chunk;
     } while (offset < length && n < kBatchTds);
-    if (!run(*pipe, pool_, n, kBulkTimeoutMs)) return false;
+    if (!run(*pipe, pool_.first(n), kBulkTimeoutMs)) return false;
     pipe->toggle = static_cast<uint8_t>(toggle);
     if (in) {
       for (uint32_t i = 0; i < n; ++i) moved += (pool_[i].status + 1) & 0x7FF;  // actual length field is n-1
@@ -369,8 +362,8 @@ bool UhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void
       moved += offset - batch_start;
     }
   }
-  if (bounced && in) __builtin_memcpy(data, bounce_, moved < length ? moved : length);
-  if (transferred) *transferred = moved;
+  if (bounced && in) data.copy_from(ConstByteView(buffer).first(moved < length ? moved : length));
+  if (transferred) *transferred = static_cast<uint32_t>(moved);
   return true;
 }
 
@@ -395,16 +388,17 @@ bool UhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
     if (p.active) continue;
     p = Pipe{};
     p.qh = make_queue_head();
-    p.td = static_cast<Td*>(low_allocate(sizeof(Td), 16));
-    p.buffer = static_cast<uint8_t*>(low_allocate(64, 16));
-    if (!p.qh || !p.td || !p.buffer) {
+    ArrayView<Td> td_memory = low_allocate<Td>(1, 16);
+    p.td = td_memory.data();
+    p.buffer = low_allocate<uint8_t>(64, 16);
+    if (!p.qh || !p.td || p.buffer.empty()) {
       free_pipe(p);
       return false;
     }
     p.address = endpoint_address;
     p.max_packet = max_packet;
     p.interrupt = true;
-    fill_td(p.td, kPidIn, d.address, endpoint_address & 0x0F, 0, d.low_speed, max_packet, p.buffer);
+    fill_td(p.td, kPidIn, d.address, endpoint_address & 0x0F, 0, d.low_speed, p.buffer.first(max_packet));
     p.qh->element = low32(p.td);  // armed before the queue head becomes visible
     link_queue_head(p.qh);
     p.active = true;
@@ -413,10 +407,9 @@ bool UhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   return false;
 }
 
-bool UhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
-                                       uint16_t* length) {
+bool UhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) {
   kernel::ScopedMutex lock_guard(lock_);
-  if (port >= ports_ || !devices_[port].present || !buffer) return false;
+  if (port >= ports_ || !devices_[port].present) return false;
   Device& d = devices_[port];
   Pipe* pipe = find_pipe(d, endpoint_address);
   if (!pipe || !pipe->interrupt) return false;
@@ -425,13 +418,12 @@ bool UhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, 
   const bool failed = status & kTdErrors;
   const uint32_t received = (status + 1) & 0x7FF;
   if (!failed) {
-    const uint16_t n = received < capacity ? received : capacity;
-    __builtin_memcpy(buffer, pipe->buffer, n);
+    buffer.copy_from(ConstByteView(pipe->buffer).first(received < pipe->max_packet ? received : pipe->max_packet).at_most(buffer.size()));
     if (length) *length = static_cast<uint16_t>(received);
     pipe->toggle ^= 1;
   }
-  fill_td(pipe->td, kPidIn, d.address, endpoint_address & 0x0F, pipe->toggle, d.low_speed, pipe->max_packet,
-          pipe->buffer);
+  fill_td(pipe->td, kPidIn, d.address, endpoint_address & 0x0F, pipe->toggle, d.low_speed,
+          pipe->buffer.first(pipe->max_packet));
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   pipe->qh->element = low32(pipe->td);
   return !failed;

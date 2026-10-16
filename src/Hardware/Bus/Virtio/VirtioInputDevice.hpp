@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
+#include "Utility/AllocatedView.hpp"
 
 namespace hardware {
 
@@ -55,14 +56,15 @@ class VirtioInputDevice final : public IHardware {
 
  private:
   // Reads one virtio_input_config entry into `data`; returns its size.
-  uint8_t query(uint8_t select, uint8_t subselect, uint8_t* data, uint8_t capacity) const;
+  // Reads a configuration record into `data` (as much as fits); returns the bytes read.
+  uint8_t query(uint8_t select, uint8_t subselect, ByteView data) const;
   bool supports(uint8_t subselect, uint16_t code) const;
   VirtioInputKind classify() const;
 
   VirtioPciDevice transport_;
   allocators::IAllocator& allocator_;
   Virtqueue events_;
-  VirtioInputEvent* buffers_ = nullptr;
+  ArrayView<VirtioInputEvent> buffers_;
   VirtioInputKind kind_ = VirtioInputKind::Unknown;
   uint32_t abs_max_[2] = {};
   bool started_ = false;

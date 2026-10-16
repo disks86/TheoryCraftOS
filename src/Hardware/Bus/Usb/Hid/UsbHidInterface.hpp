@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
 
 namespace hardware {
 
@@ -38,8 +39,7 @@ struct UsbHidInterface {
 };
 
 // Lists the HID interfaces (class 3) that have an interrupt-IN endpoint.
-// Returns how many were found (up to `capacity` are stored).
-uint32_t find_hid_interfaces(const uint8_t* configuration, uint16_t length, UsbHidInterface* out,
-                             uint32_t capacity);
+// Returns how many were found; up to out.size() are stored.
+uint32_t find_hid_interfaces(ConstByteView configuration, ArrayView<UsbHidInterface> out);
 
 }  // namespace hardware

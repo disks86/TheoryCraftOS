@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/StorageDevice/StorageDeviceBase.hpp"
+#include "Utility/AllocatedView.hpp"
 
 namespace hardware {
 
@@ -42,7 +43,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   void shutdown() override;
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
+  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
   bool flush_cache() override;
 
  private:
@@ -62,8 +63,8 @@ class NvmeStorageDevice final : public StorageDeviceBase {
     uint16_t status;  // bit 0 phase tag, bits 15:1 status
   };
   struct Queue {
-    Command* submission = nullptr;
-    Completion* completion = nullptr;
+    ArrayView<Command> submission;    // kQueueEntries entries (the rest of the page is unused)
+    ArrayView<Completion> completion;
     uint32_t tail = 0, head = 0;
     uint16_t phase = 1;
     uint16_t id = 0;
@@ -77,7 +78,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   bool disable_controller();
   bool setup_queue(Queue* q, uint16_t id);
   bool submit(Queue& q, Command& command, uint32_t* result = nullptr);
-  bool io(uint8_t opcode, uint64_t lba, uint32_t blocks, void* dma);
+  bool io(uint8_t opcode, uint64_t lba, uint32_t blocks, ByteView dma);
   bool identify();
 
   const IPciBus& pci_;
@@ -86,7 +87,7 @@ class NvmeStorageDevice final : public StorageDeviceBase {
   uint32_t doorbell_stride_ = 4;
   uint32_t timeout_ms_ = 5000;
   Queue admin_, io_;
-  uint8_t* scratch_ = nullptr;  // identify data (4 KiB) followed by the PRP list (4 KiB)
+  ByteView scratch_;  // identify data (4 KiB) followed by the PRP list (4 KiB)
   uint32_t namespace_id_ = 1;
   uint16_t next_command_id_ = 1;
   bool owns_device_ = false;

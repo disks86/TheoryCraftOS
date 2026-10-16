@@ -68,49 +68,55 @@ void DhcpClient::begin_discovery() {
 }
 
 // Fills in the fixed part and returns the offset where options start.
-uint32_t DhcpClient::build(uint8_t* m, uint8_t type, bool broadcast_reply) const {
-  for (uint32_t i = 0; i < 576; ++i) m[i] = 0;
-  m[0] = kBootRequest;
-  m[1] = 1;  // hardware type: Ethernet
-  m[2] = 6;  // hardware address length
-  store32(m + 4, xid_);
+void DhcpClient::build(ByteWriter& out, uint8_t type, bool broadcast_reply) const {
+  out.u8(kBootRequest);
+  out.u8(1);  // hardware type: Ethernet
+  out.u8(6);  // hardware address length
+  out.u8(0);  // hops
+  out.be32(xid_);
+  out.be16(0);  // seconds elapsed
   // Ask the server to answer by broadcast while we cannot receive unicast to an address we do not have yet.
-  store16(m + 10, broadcast_reply ? 0x8000 : 0);
-  for (int i = 0; i < 6; ++i) m[28 + i] = mac_.bytes[i];
-  store32(m + 236, kMagicCookie);
-  uint32_t o = kFixedSize;
-  m[o++] = kOptionMessageType; m[o++] = 1; m[o++] = type;
-  m[o++] = kOptionClientId; m[o++] = 7; m[o++] = 1;
-  for (int i = 0; i < 6; ++i) m[o++] = mac_.bytes[i];
-  m[o++] = kOptionParameterRequest; m[o++] = 5;
-  m[o++] = kOptionSubnetMask; m[o++] = kOptionRouter; m[o++] = kOptionDns; m[o++] = kOptionLeaseTime;
-  m[o++] = kOptionRenewalTime;
-  return o;
+  out.be16(broadcast_reply ? 0x8000 : 0);
+  out.zeros(16);  // ciaddr, yiaddr, siaddr, giaddr
+  mac_.write(out);
+  out.zeros(10 + 64 + 128);  // the rest of chaddr, then sname and file
+  out.be32(kMagicCookie);
+  out.u8(kOptionMessageType); out.u8(1); out.u8(type);
+  out.u8(kOptionClientId); out.u8(7); out.u8(1);
+  mac_.write(out);
+  out.u8(kOptionParameterRequest); out.u8(5);
+  out.u8(kOptionSubnetMask); out.u8(kOptionRouter); out.u8(kOptionDns); out.u8(kOptionLeaseTime);
+  out.u8(kOptionRenewalTime);
 }
 
 void DhcpClient::send_discover() {
   uint8_t message[576];
-  uint32_t o = build(message, kMessageDiscover, true);
-  message[o++] = kOptionEnd;
-  socket_->send_from(kAnyAddress, kBroadcastAddress, kServerPort, message, o < 300 ? 300 : o, true);
+  ByteWriter out{ByteView(message)};
+  build(out, kMessageDiscover, true);
+  out.u8(kOptionEnd);
+  if (out.position() < 300) out.zeros(300 - out.position());  // BOOTP servers expect at least 300 bytes
+  if (out.ok()) socket_->send_from(kAnyAddress, kBroadcastAddress, kServerPort, out.written(), true);
   schedule_retry();
 }
 
 void DhcpClient::send_request(bool renewing) {
   uint8_t message[576];
-  uint32_t o = build(message, kMessageRequest, !renewing);
+  ByteWriter out{ByteView(message)};
+  build(out, kMessageRequest, !renewing);
   if (renewing) {
-    lease_.address.write(message + 12);  // ciaddr: the address we are renewing
+    out.patch_bytes(12, ConstByteView(lease_.address.octets));  // ciaddr: the address we are renewing
   } else {
-    message[o++] = kOptionRequestedAddress; message[o++] = 4;
-    offered_.address.write(message + o); o += 4;
-    message[o++] = kOptionServerId; message[o++] = 4;
-    server_.write(message + o); o += 4;
+    out.u8(kOptionRequestedAddress); out.u8(4);
+    offered_.address.write(out);
+    out.u8(kOptionServerId); out.u8(4);
+    server_.write(out);
   }
-  message[o++] = kOptionEnd;
-  const uint32_t length = o < 300 ? 300 : o;
-  if (renewing) socket_->send_from(lease_.address, server_, kServerPort, message, length, false);
-  else socket_->send_from(kAnyAddress, kBroadcastAddress, kServerPort, message, length, true);
+  out.u8(kOptionEnd);
+  if (out.position() < 300) out.zeros(300 - out.position());
+  if (out.ok()) {
+    if (renewing) socket_->send_from(lease_.address, server_, kServerPort, out.written(), false);
+    else socket_->send_from(kAnyAddress, kBroadcastAddress, kServerPort, out.written(), true);
+  }
   schedule_retry();
 }
 
@@ -133,38 +139,45 @@ void DhcpClient::bind(const IpConfiguration& configuration, uint32_t lease_secon
   if (changed) listener_.on_lease(lease_);
 }
 
-void DhcpClient::handle(const uint8_t* m, uint32_t length) {
-  if (length < kFixedSize + 4 || m[0] != kBootReply || load32(m + 4) != xid_ || load32(m + 236) != kMagicCookie) return;
-  for (int i = 0; i < 6; ++i)
-    if (m[28 + i] != mac_.bytes[i]) return;  // meant for another client
+void DhcpClient::handle(ConstByteView message) {
+  if (message.size() < kFixedSize + 4) return;
+  ByteReader in(message);
+  const uint8_t op = in.u8();
+  in.skip(3);  // hardware type and length, hops
+  const uint32_t transaction = in.be32();
+  in.skip(8);  // seconds, flags, ciaddr
+  const Ipv4Address yiaddr = Ipv4Address::read(in);
+  in.skip(8);  // siaddr, giaddr
+  const hardware::MacAddress client = hardware::MacAddress::read(in);
+  in.skip(10 + 64 + 128);  // rest of chaddr, sname, file
+  const uint32_t cookie = in.be32();
+  if (!in.ok() || op != kBootReply || transaction != xid_ || cookie != kMagicCookie) return;
+  if (!(client == mac_)) return;  // meant for another client
 
   uint8_t type = 0;
   Ipv4Address mask = kAnyAddress, router = kAnyAddress, dns = kAnyAddress, server = kAnyAddress;
   uint32_t lease = 0, renewal = 0;
-  for (uint32_t i = kFixedSize; i < length;) {
-    const uint8_t code = m[i];
+  ByteReader options(in.rest());
+  while (options.ok() && !options.at_end()) {
+    const uint8_t code = options.u8();
     if (code == kOptionEnd) break;
-    if (code == kOptionPad) {
-      ++i;
-      continue;
-    }
-    if (i + 1 >= length || i + 2 + m[i + 1] > length) break;
-    const uint8_t size = m[i + 1];
-    const uint8_t* value = m + i + 2;
+    if (code == kOptionPad) continue;
+    const uint8_t size = options.u8();
+    const ConstByteView value = options.take(size);
+    if (!options.ok()) break;  // an option that runs past the end of the packet ends the scan
+    ByteReader field(value);
     switch (code) {
-      case kOptionMessageType:  if (size >= 1) type = value[0]; break;
-      case kOptionSubnetMask:   if (size >= 4) mask = Ipv4Address::read(value); break;
-      case kOptionRouter:       if (size >= 4) router = Ipv4Address::read(value); break;  // the first one
-      case kOptionDns:          if (size >= 4) dns = Ipv4Address::read(value); break;
-      case kOptionServerId:     if (size >= 4) server = Ipv4Address::read(value); break;
-      case kOptionLeaseTime:    if (size >= 4) lease = load32(value); break;
-      case kOptionRenewalTime:  if (size >= 4) renewal = load32(value); break;
+      case kOptionMessageType:  if (size >= 1) type = field.u8(); break;
+      case kOptionSubnetMask:   if (size >= 4) mask = Ipv4Address::read(field); break;
+      case kOptionRouter:       if (size >= 4) router = Ipv4Address::read(field); break;  // the first one
+      case kOptionDns:          if (size >= 4) dns = Ipv4Address::read(field); break;
+      case kOptionServerId:     if (size >= 4) server = Ipv4Address::read(field); break;
+      case kOptionLeaseTime:    if (size >= 4) lease = field.be32(); break;
+      case kOptionRenewalTime:  if (size >= 4) renewal = field.be32(); break;
       default: break;
     }
-    i += 2 + size;
   }
 
-  const Ipv4Address yiaddr = Ipv4Address::read(m + 16);
   if (state_ == DhcpState::Selecting && type == kMessageOffer) {
     offered_.address = yiaddr;
     offered_.netmask = mask;
@@ -194,8 +207,8 @@ void DhcpClient::poll() {
   if (state_ == DhcpState::Stopped) return;
   uint8_t message[576];
   uint32_t length;
-  while (socket_->receive_from(message, sizeof(message), nullptr, nullptr, &length))
-    if (length <= sizeof(message)) handle(message, length);
+  while (socket_->receive_from(ByteView(message), nullptr, nullptr, &length))
+    if (length <= sizeof(message)) handle(ConstByteView(message).first(length));
 
   const uint64_t now = ip_.now_ms();
   switch (state_) {

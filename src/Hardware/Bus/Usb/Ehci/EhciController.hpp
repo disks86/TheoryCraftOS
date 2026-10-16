@@ -22,6 +22,8 @@
 #include "Hardware/Bus/Usb/Ehci/EhciRegisters.hpp"
 #include "Hardware/Bus/Usb/IUsbHostController.hpp"
 #include "Kernel/Sync.hpp"
+#include "Utility/AllocatedView.hpp"
+#include "Utility/ByteStream.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -53,17 +55,15 @@ class EhciController final : public IUsbHostController {
   uint32_t port_count() const override { return ports_; }
   bool port_info(uint32_t port, UsbPortInfo* out) const override;
   bool device_descriptor(uint32_t port, UsbDeviceDescriptor* out) const override;
-  bool configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity, uint16_t* length) const override;
+  bool configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const override;
   bool set_configuration(uint32_t port, uint8_t configuration) override;
   bool control_out(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index) override;
   bool control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
-                  void* buffer, uint16_t length) override;
+                  ByteView buffer) override;
   bool start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) override;
-  bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
-                         uint16_t* length) override;
+  bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) override;
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
-  bool bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
-                     uint32_t* transferred) override;
+  bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
   bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
 
  private:
@@ -79,7 +79,7 @@ class EhciController final : public IUsbHostController {
     uint16_t max_packet = 0;
     ehci::Qh* qh = nullptr;
     ehci::Qtd* qtd = nullptr;  // interrupt endpoints: the one outstanding transfer
-    uint8_t* buffer = nullptr;
+    ByteView buffer;
   };
 
   struct Device {
@@ -112,7 +112,8 @@ class EhciController final : public IUsbHostController {
   void free_queue_head(ehci::Qh* qh);
   void recover_queue_head(ehci::Qh* qh);
   void fill_qtd(ehci::Qtd* qtd, uint32_t pid, uint64_t data, uint32_t bytes, uint32_t toggle, bool interrupt_on_complete);
-  bool run(ehci::Qh* qh, ehci::Qtd* first, uint32_t count, uint32_t timeout_ms, uint32_t* remaining);
+  bool run(ehci::Qh* qh, ArrayView<ehci::Qtd> descriptors, uint32_t timeout_ms, uint32_t* remaining);
+  ByteView control_data() const { return buffer_.subview(4096, 4096); }  // data stage area of control transfers
   bool control(Device& d, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, uint16_t length,
                bool data_in);
   Endpoint* find_endpoint(Device& d, uint8_t address);
@@ -134,10 +135,10 @@ class EhciController final : public IUsbHostController {
   bool running_ = false;
 
   ehci::Qh* async_head_ = nullptr;
-  ehci::Qtd* pool_ = nullptr;  // kPoolQtds descriptors for the one synchronous transfer in flight
-  uint32_t* frame_list_ = nullptr;
+  ArrayView<ehci::Qtd> pool_;  // kPoolQtds descriptors for the one synchronous transfer in flight
+  ArrayView<uint32_t> frame_list_;
   ehci::Qh* periodic_first_ = nullptr;
-  uint8_t* buffer_ = nullptr;  // control transfers: setup packet at 0, data from 64
+  ByteView buffer_;  // control transfers: setup packet at 0, data page from 4096
   Device devices_[kMaxPorts];
 };
 

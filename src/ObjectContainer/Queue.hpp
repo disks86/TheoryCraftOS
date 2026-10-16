@@ -18,6 +18,7 @@
 
 #pragma once
 #include "ObjectContainer/ContainerSupport.hpp"
+#include "Utility/ArrayView.hpp"
 #include "ObjectContainer/IObjectContainer.hpp"
 
 // First in, first out. A ring buffer: enqueue and dequeue are amortized O(1) and
@@ -32,7 +33,7 @@ class Queue final : public IObjectContainer<T> {
   explicit Queue(allocators::IAllocator& allocator) : allocator_(allocator) {}
   ~Queue() {
     clear();
-    allocator_.deallocate(data_);
+    allocator_.deallocate(storage_.data());
   }
 
   uint64_t count() const override { return size_; }
@@ -44,16 +45,15 @@ class Queue final : public IObjectContainer<T> {
   }
 
   bool reserve(uint64_t capacity) {
-    if (capacity <= capacity_) return true;
+    if (capacity <= storage_.size()) return true;
     T* fresh = container_support::allocate_array<T>(allocator_, capacity);
     if (!fresh) return false;
     for (uint64_t i = 0; i < size_; ++i) {  // unwrap into logical order
       new (&fresh[i]) T(container_support::move(*slot(i)));
       slot(i)->~T();
     }
-    allocator_.deallocate(data_);
-    data_ = fresh;
-    capacity_ = capacity;
+    allocator_.deallocate(storage_.data());
+    storage_ = ArrayView<T>(fresh, capacity);
     head_ = 0;
     return true;
   }
@@ -73,7 +73,7 @@ class Queue final : public IObjectContainer<T> {
     T* oldest = slot(0);
     if (out) *out = container_support::move(*oldest);
     oldest->~T();
-    head_ = (head_ + 1) % capacity_;
+    head_ = (head_ + 1) % storage_.size();
     --size_;
     return true;
   }
@@ -92,19 +92,19 @@ class Queue final : public IObjectContainer<T> {
   T* element(const ObjectCursor& cursor) const override { return slot(cursor.index); }
 
  private:
-  T* slot(uint64_t logical) const { return &data_[(head_ + logical) % capacity_]; }
+  // The slot `logical` places after the oldest element (wrapping); checked against the allocation.
+  T* slot(uint64_t logical) const { return &storage_[(head_ + logical) % storage_.size()]; }
 
   template <class U>
   bool emplace(U&& value) {
-    if (size_ == capacity_ && !reserve(capacity_ ? capacity_ * 2 : 8)) return false;
+    if (size_ == storage_.size() && !reserve(storage_.size() ? storage_.size() * 2 : 8)) return false;
     new (slot(size_)) T(static_cast<U&&>(value));
     ++size_;
     return true;
   }
 
   allocators::IAllocator& allocator_;
-  T* data_ = nullptr;
-  uint64_t capacity_ = 0;
-  uint64_t head_ = 0;  // index in data_ of the oldest element
+  ArrayView<T> storage_;  // the ring's allocation
+  uint64_t head_ = 0;     // index in storage_ of the oldest element
   uint64_t size_ = 0;
 };

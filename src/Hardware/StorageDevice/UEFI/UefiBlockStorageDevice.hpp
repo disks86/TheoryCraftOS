@@ -35,7 +35,7 @@ class UefiBlockStorageDevice final : public StorageDeviceBase {
   void shutdown() override { release_bounce(); }
 
  protected:
-  bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
+  bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) override;
   bool flush_cache() override;
 
  private:
