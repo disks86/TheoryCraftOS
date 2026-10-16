@@ -1,0 +1,56 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "Hardware/CentralProcessingUnit/AMD/AmdGenerations.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdBulldozerCpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdK10Cpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdK8Cpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdPiledriverCpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdZen2Cpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdZen3Cpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdZen4Cpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdZen5Cpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdZenCpu.hpp"
+#include "Hardware/CentralProcessingUnit/GenerationTable.hpp"
+
+namespace hardware {
+
+namespace {
+constexpr GenerationRule kRules[] = {
+    // Model 0x6B is QEMU's qemu64, which is not a K8: leave it to QemuX64Cpu.
+    rule<AmdK8Cpu>(0x0F, 0x00, 0x6A),
+    rule<AmdK10Cpu>(0x10, 0x00, 0xFF),
+    rule<AmdBulldozerCpu>(0x15, 0x00, 0x01),
+    rule<AmdPiledriverCpu>(0x15, 0x02, 0x02),
+    rule<AmdPiledriverCpu>(0x15, 0x10, 0x1F),
+    rule<AmdZenCpu>(0x17, 0x00, 0x2F),
+    rule<AmdZen2Cpu>(0x17, 0x30, 0xFF),
+    rule<AmdZen3Cpu>(0x19, 0x00, 0x0F),
+    rule<AmdZen4Cpu>(0x19, 0x10, 0x1F),
+    rule<AmdZen3Cpu>(0x19, 0x20, 0x5F),
+    rule<AmdZen4Cpu>(0x19, 0x60, 0xAF),
+    rule<AmdZen5Cpu>(0x1A, 0x00, 0xFF),
+};
+}  // namespace
+
+ICentralProcessingUnit* create_amd_generation(void* storage, efi::SystemTable* st,
+                                              const CpuSignature& sig) {
+  return match_generation(kRules, sig, storage, st);
+}
+
+}  // namespace hardware

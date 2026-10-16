@@ -17,7 +17,7 @@
  */
 
 #pragma once
-#include "hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
+#include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 
 // A mutual-exclusion lock for the cores of this machine. A waiting core spins,
 // calling the CPU's pause() between looks so it does not hammer the cache line

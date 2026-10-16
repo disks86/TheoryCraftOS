@@ -19,7 +19,7 @@
 #pragma once
 #include "Allocators/Allocator.hpp"
 #include "CPUScheduler/ICPUScheduler.hpp"
-#include "hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
+#include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 
 // Fills the Concurrent* containers from scheduler tasks running on every core at
 // once, then checks nothing was lost, duplicated or leaked. `shared` must be the

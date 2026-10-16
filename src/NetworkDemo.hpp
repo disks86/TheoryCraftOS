@@ -17,7 +17,7 @@
  */
 
 #pragma once
-#include "hardware/NetworkInterface/INetworkInterface.hpp"
+#include "Hardware/NetworkInterface/INetworkInterface.hpp"
 #include "uefi.hpp"
 
 // Sends an ARP "who has 10.0.2.2?" request out of the interface (the gateway

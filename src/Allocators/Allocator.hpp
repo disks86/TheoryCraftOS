@@ -18,7 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
-#include "hardware/RandomAccessMemory/IRandomAccessMemory.hpp"
+#include "Hardware/RandomAccessMemory/IRandomAccessMemory.hpp"
 
 namespace allocators {
 

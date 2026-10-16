@@ -17,7 +17,7 @@
  */
 
 #pragma once
-#include "hardware/StorageDevice/SystemStorageDevices.hpp"
+#include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 
 // Exercises every storage device: reports what it is and how big, reads its first
 // and last blocks, checks that one large read equals the same range read in

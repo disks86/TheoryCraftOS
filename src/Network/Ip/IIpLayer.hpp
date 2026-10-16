@@ -18,7 +18,7 @@
 
 #pragma once
 #include "Network/NetworkTypes.hpp"
-#include "hardware/NetworkInterface/NetworkTypes.hpp"
+#include "Hardware/NetworkInterface/NetworkTypes.hpp"
 
 namespace network {
 

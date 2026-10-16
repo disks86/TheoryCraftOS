@@ -21,7 +21,7 @@
 #include "CPUScheduler/ICPUScheduler.hpp"
 #include "ObjectContainer/Queue.hpp"
 #include "Synchronization/SpinLock.hpp"
-#include "hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
+#include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 
 namespace scheduling {
 

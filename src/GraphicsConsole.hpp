@@ -18,7 +18,7 @@
 
 #pragma once
 #include <stdint.h>
-#include "hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+#include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 
 // A scrolling text console drawn through an IGraphicsProcessingUnit. It only
 // uses the GPU interface (glyphs, fill and copy), so it works with every GPU

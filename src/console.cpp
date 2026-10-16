@@ -18,8 +18,8 @@
 
 #include "console.hpp"
 #include "GraphicsConsole.hpp"
-#include "hardware/DebugConsole.hpp"
-#include "hardware/TextConsole.hpp"
+#include "Hardware/DebugConsole.hpp"
+#include "Hardware/TextConsole.hpp"
 
 namespace {
 // constexpr-constructed: no static initializers run in this freestanding image.

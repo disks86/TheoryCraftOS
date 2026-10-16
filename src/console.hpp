@@ -18,7 +18,7 @@
 
 #pragma once
 #include <stdint.h>
-#include "hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+#include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "uefi.hpp"
 
 // Output goes to the QEMU debug console (port 0x402) and to the screen: the

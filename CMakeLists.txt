@@ -38,39 +38,39 @@ add_executable(BOOTX64
   src/Allocators/Allocator.cpp
   src/CPUScheduler/Scheduler.cpp
   src/runtime.cpp
-  src/hardware/CentralProcessingUnit/X86_64Cpu.cpp
-  src/hardware/CentralProcessingUnit/Intel/IntelX64Cpu.cpp
-  src/hardware/CentralProcessingUnit/Intel/IntelGenerations.cpp
-  src/hardware/CentralProcessingUnit/AMD/AmdGenerations.cpp
-  src/hardware/CentralProcessingUnit/Hygon/HygonGenerations.cpp
-  src/hardware/CentralProcessingUnit/Zhaoxin/ZhaoxinGenerations.cpp
-  src/hardware/CentralProcessingUnit/SystemCpu.cpp
-  src/hardware/CentralProcessingUnit/X86_64Cpu.S
-  src/hardware/IoPort.cpp
-  src/hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
-  src/hardware/TextConsole.cpp
-  src/hardware/Acpi/AcpiTables.cpp
-  src/hardware/Keyboard/KeyCodes.cpp
-  src/hardware/Keyboard/KeyboardBase.cpp
-  src/hardware/Keyboard/CompositeKeyboard.cpp
-  src/hardware/Keyboard/Ps2/Ps2Keyboard.cpp
-  src/hardware/Mouse/MouseBase.cpp
-  src/hardware/Mouse/CompositeMouse.cpp
-  src/hardware/Mouse/Ps2/Ps2Mouse.cpp
-  src/hardware/Bus/Ps2/I8042Controller.cpp
-  src/hardware/Bus/Usb/Hid/HidReportParser.cpp
-  src/hardware/Bus/Usb/Hid/UsbHidInterface.cpp
-  src/hardware/Bus/Virtio/Virtqueue.cpp
-  src/hardware/Bus/Virtio/VirtioPciDevice.cpp
-  src/hardware/Bus/Virtio/VirtioInputDevice.cpp
-  src/hardware/Keyboard/Usb/UsbHidKeyboard.cpp
-  src/hardware/Keyboard/Virtio/VirtioKeyboard.cpp
-  src/hardware/Mouse/Usb/UsbHidMouse.cpp
-  src/hardware/Mouse/Virtio/VirtioMouse.cpp
-  src/hardware/SystemInput.cpp
-  src/hardware/ImageSignalProcessor/IspMath.cpp
-  src/hardware/ImageSignalProcessor/Software/SoftwareImageSignalProcessor.cpp
-  src/hardware/ImageSignalProcessor/SystemImageSignalProcessor.cpp
+  src/Hardware/CentralProcessingUnit/X86_64Cpu.cpp
+  src/Hardware/CentralProcessingUnit/Intel/IntelX64Cpu.cpp
+  src/Hardware/CentralProcessingUnit/Intel/IntelGenerations.cpp
+  src/Hardware/CentralProcessingUnit/AMD/AmdGenerations.cpp
+  src/Hardware/CentralProcessingUnit/Hygon/HygonGenerations.cpp
+  src/Hardware/CentralProcessingUnit/Zhaoxin/ZhaoxinGenerations.cpp
+  src/Hardware/CentralProcessingUnit/SystemCpu.cpp
+  src/Hardware/CentralProcessingUnit/X86_64Cpu.S
+  src/Hardware/IoPort.cpp
+  src/Hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
+  src/Hardware/TextConsole.cpp
+  src/Hardware/Acpi/AcpiTables.cpp
+  src/Hardware/Keyboard/KeyCodes.cpp
+  src/Hardware/Keyboard/KeyboardBase.cpp
+  src/Hardware/Keyboard/CompositeKeyboard.cpp
+  src/Hardware/Keyboard/Ps2/Ps2Keyboard.cpp
+  src/Hardware/Mouse/MouseBase.cpp
+  src/Hardware/Mouse/CompositeMouse.cpp
+  src/Hardware/Mouse/Ps2/Ps2Mouse.cpp
+  src/Hardware/Bus/Ps2/I8042Controller.cpp
+  src/Hardware/Bus/Usb/Hid/HidReportParser.cpp
+  src/Hardware/Bus/Usb/Hid/UsbHidInterface.cpp
+  src/Hardware/Bus/Virtio/Virtqueue.cpp
+  src/Hardware/Bus/Virtio/VirtioPciDevice.cpp
+  src/Hardware/Bus/Virtio/VirtioInputDevice.cpp
+  src/Hardware/Keyboard/Usb/UsbHidKeyboard.cpp
+  src/Hardware/Keyboard/Virtio/VirtioKeyboard.cpp
+  src/Hardware/Mouse/Usb/UsbHidMouse.cpp
+  src/Hardware/Mouse/Virtio/VirtioMouse.cpp
+  src/Hardware/SystemInput.cpp
+  src/Hardware/ImageSignalProcessor/IspMath.cpp
+  src/Hardware/ImageSignalProcessor/Software/SoftwareImageSignalProcessor.cpp
+  src/Hardware/ImageSignalProcessor/SystemImageSignalProcessor.cpp
   src/IspDemo.cpp
   src/NpuDemo.cpp
   src/ContainerDemo.cpp
@@ -87,43 +87,43 @@ add_executable(BOOTX64
   src/Network/Dhcp/DhcpClient.cpp
   src/Network/Dns/DnsMessage.cpp
   src/Network/Dns/DnsResolver.cpp
-  src/hardware/Clock/TscClock.cpp
-  src/hardware/NetworkInterface/SystemNetworkInterfaces.cpp
-  src/hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
-  src/hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
-  src/hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
-  src/hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp
+  src/Hardware/Clock/TscClock.cpp
+  src/Hardware/NetworkInterface/SystemNetworkInterfaces.cpp
+  src/Hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
+  src/Hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
+  src/Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
+  src/Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp
   src/StorageDemo.cpp
-  src/hardware/StorageDevice/StorageDeviceBase.cpp
-  src/hardware/StorageDevice/SystemStorageDevices.cpp
-  src/hardware/StorageDevice/Virtio/VirtioBlockDevice.cpp
-  src/hardware/StorageDevice/Virtio/VirtioScsiDevice.cpp
-  src/hardware/StorageDevice/NVMe/NvmeStorageDevice.cpp
-  src/hardware/StorageDevice/Ahci/AhciStorageDevice.cpp
-  src/hardware/StorageDevice/Ide/IdeStorageDevice.cpp
-  src/hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
-  src/hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
+  src/Hardware/StorageDevice/StorageDeviceBase.cpp
+  src/Hardware/StorageDevice/SystemStorageDevices.cpp
+  src/Hardware/StorageDevice/Virtio/VirtioBlockDevice.cpp
+  src/Hardware/StorageDevice/Virtio/VirtioScsiDevice.cpp
+  src/Hardware/StorageDevice/NVMe/NvmeStorageDevice.cpp
+  src/Hardware/StorageDevice/Ahci/AhciStorageDevice.cpp
+  src/Hardware/StorageDevice/Ide/IdeStorageDevice.cpp
+  src/Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
+  src/Hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
   src/ConcurrentDemo.cpp
-  src/hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
-  src/hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
+  src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
+  src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
   src/Math/FloatMath.cpp
-  src/hardware/Bus/Pci/LegacyPciBus.cpp
-  src/hardware/Bus/Pcie/EcamPcieBus.cpp
-  src/hardware/Bus/Pci/FirmwareDriverDetach.cpp
-  src/hardware/Bus/Usb/UsbBus.cpp
-  src/hardware/Bus/Usb/Xhci/XhciController.cpp
-  src/hardware/Bus/Usb/Ehci/EhciController.cpp
-  src/hardware/Bus/Usb/Legacy/LegacyHostController.cpp
-  src/hardware/Bus/Usb/Uhci/UhciController.cpp
-  src/hardware/Bus/Usb/Ohci/OhciController.cpp
-  src/hardware/Bus/Usb/Xhci/XhciRing.cpp
-  src/hardware/Bus/SystemPciBus.cpp
-  src/hardware/GraphicsProcessingUnit/Font8x16.cpp
-  src/hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
-  src/hardware/GraphicsProcessingUnit/SystemGpu.cpp
-  src/hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
-  src/hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
-  src/hardware/x86_64/port.S
+  src/Hardware/Bus/Pci/LegacyPciBus.cpp
+  src/Hardware/Bus/Pcie/EcamPcieBus.cpp
+  src/Hardware/Bus/Pci/FirmwareDriverDetach.cpp
+  src/Hardware/Bus/Usb/UsbBus.cpp
+  src/Hardware/Bus/Usb/Xhci/XhciController.cpp
+  src/Hardware/Bus/Usb/Ehci/EhciController.cpp
+  src/Hardware/Bus/Usb/Legacy/LegacyHostController.cpp
+  src/Hardware/Bus/Usb/Uhci/UhciController.cpp
+  src/Hardware/Bus/Usb/Ohci/OhciController.cpp
+  src/Hardware/Bus/Usb/Xhci/XhciRing.cpp
+  src/Hardware/Bus/SystemPciBus.cpp
+  src/Hardware/GraphicsProcessingUnit/Font8x16.cpp
+  src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/SystemGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
+  src/Hardware/x86_64/port.S
 )
 
 target_include_directories(BOOTX64 PRIVATE src)

@@ -26,8 +26,8 @@
 #include "Network/Udp/UdpManager.hpp"
 #include "ObjectContainer/Dictionary.hpp"
 #include "ObjectContainer/Queue.hpp"
-#include "hardware/Clock/IClock.hpp"
-#include "hardware/NetworkInterface/INetworkInterface.hpp"
+#include "Hardware/Clock/IClock.hpp"
+#include "Hardware/NetworkInterface/INetworkInterface.hpp"
 
 namespace network {
 
