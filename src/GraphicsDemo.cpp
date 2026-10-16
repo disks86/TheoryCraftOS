@@ -35,6 +35,35 @@ const ColoredVertex kCubeVertices[8] = {
 const uint16_t kCubeIndices[36] = {0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4,
                                    3, 6, 2, 3, 7, 6, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5};
 
+// Draws known shapes with the device-backed 2D renderer on `device` and reads the image back
+// from wherever the device keeps it (host GPU memory on the virgl device).
+bool device_2d_check(IGraphicsDevice& device, allocators::IAllocator& allocator) {
+  constexpr uint32_t W = 64, H = 48;
+  DeviceRenderer2D r(device, allocator, {W, H});
+  ArrayView<uint32_t> px = allocate_view<uint32_t>(allocator, W * H);
+  bool ok = r.valid() && !px.empty();
+  if (ok) {
+    r.clear(rgb(16, 16, 16));
+    r.fill_rect({4, 4, 20, 10}, rgb(255, 0, 0));
+    r.fill_circle(40, 30, 8, rgb(255, 255, 255));
+    r.set_blend(BlendMode::Alpha);
+    r.fill_rect({8, 8, 4, 4}, 0x80FFFFFF);  // half-transparent white over the red
+    r.draw_text(2, 30, "Hi", rgb(0, 255, 0));
+    ok = r.read_pixels(px);
+  }
+  if (ok) {
+    const uint32_t mixed = px[9 * W + 9];
+    uint32_t green = 0;
+    for (uint32_t y = 30; y < 46; ++y)
+      for (uint32_t x = 2; x < 18; ++x) green += (px[y * W + x] & 0xFFFFFF) == 0x00FF00;
+    ok = (px[5 * W + 5] & 0xFFFFFF) == 0xFF0000 && (px[30 * W + 40] & 0xFFFFFF) == 0xFFFFFF &&
+         (px[2 * W + 2] & 0xFFFFFF) == 0x101010 && ((mixed >> 8) & 0xFF) >= 126 && ((mixed >> 8) & 0xFF) <= 130 &&
+         green > 10;
+  }
+  release_view(allocator, px);
+  return ok;
+}
+
 bool demo_2d(SystemGraphics& graphics) {
   IRenderer2D* renderer = graphics.renderer_2d();
   if (!renderer) return false;
@@ -194,6 +223,7 @@ bool run_graphics_demo(SystemGraphics& graphics, allocators::IAllocator& allocat
   if (!graphics.display()) return false;
   const bool ok_2d = demo_2d(graphics);
   uint64_t microseconds = 0;
+  const bool device_2d = device_2d_check(graphics.device(), allocator);
   const bool conventions = conventions_check(graphics.device(), allocator);
   const bool ok_3d = demo_3d(graphics, allocator, &microseconds);
 
@@ -204,6 +234,8 @@ bool run_graphics_demo(SystemGraphics& graphics, allocators::IAllocator& allocat
   console::puts(ok_2d ? "  2D renderer: ok (" : "  2D renderer: FAILED (");
   console::puts(graphics.renderer_2d() ? graphics.renderer_2d()->name() : "none");
   console::puts(graphics.renderer_2d() && graphics.renderer_2d()->accelerated() ? ", GPU)\n" : ", CPU)\n");
+  console::puts(device_2d ? "  2D on the 3D device (readback of shapes, alpha, text): ok\n"
+                          : "  2D on the 3D device (readback of shapes, alpha, text): FAILED\n");
   console::puts(conventions ? "  3D conventions (orientation, culling, depth): ok\n"
                             : "  3D conventions (orientation, culling, depth): FAILED\n");
   console::puts(ok_3d ? "  3D cube: ok, " : "  3D cube: FAILED, ");
@@ -213,5 +245,5 @@ bool run_graphics_demo(SystemGraphics& graphics, allocators::IAllocator& allocat
   } else {
     console::puts("no frames\n");
   }
-  return ok_2d && ok_3d && conventions;
+  return ok_2d && ok_3d && conventions && device_2d;
 }

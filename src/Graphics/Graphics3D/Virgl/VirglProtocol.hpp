@@ -82,7 +82,7 @@ constexpr uint32_t kShaderFragment = 1;
 constexpr uint32_t kPrimTriangles = 4;
 constexpr uint32_t kFuncLess = 1, kFuncLequal = 3, kFuncAlways = 7;
 constexpr uint32_t kBlendAdd = 0;
-constexpr uint32_t kBlendFactorOne = 1, kBlendFactorSrcAlpha = 3, kBlendFactorInvSrcAlpha = 0x12;
+constexpr uint32_t kBlendFactorOne = 1, kBlendFactorSrcAlpha = 3, kBlendFactorInvSrcAlpha = 0x13;
 constexpr uint32_t kClearDepth = 1u << 0, kClearColor0 = 1u << 2;
 constexpr uint32_t kFaceNone = 0, kFaceFront = 1, kFaceBack = 2;
 
