@@ -113,6 +113,11 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/Ide/IdeStorageDevice.cpp
   src/Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
   src/Hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
+  src/FileSystemDemo.cpp
+  src/Hardware/StorageDevice/Partition/PartitionScanner.cpp
+  src/FileSystem/FileSystemTypes.cpp
+  src/FileSystem/Ram/RamFileSystem.cpp
+  src/FileSystem/Fat/FatFileSystem.cpp
   src/ConcurrentDemo.cpp
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp

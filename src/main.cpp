@@ -29,6 +29,7 @@
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "StorageDemo.hpp"
+#include "FileSystemDemo.hpp"
 #include "ThreadSafetyDemo.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "ConcurrentDemo.hpp"
@@ -335,6 +336,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::put_dec(storage.count());
   console::puts(" devices\n");
   if (!run_storage_demo(storage, shared_allocator)) console::puts("  storage self-check incomplete\n");
+  if (!run_filesystem_demo(storage, shared_allocator)) console::puts("  filesystem self-check incomplete\n");
 
   console::puts("Thread safety (concurrent use of the shared subsystems):\n");
   if (!run_thread_safety_demo(storage, stacks, shared_allocator)) console::puts("  thread-safety self-check incomplete\n");

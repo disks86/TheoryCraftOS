@@ -42,6 +42,16 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   listed); `src/StorageDemo` reports each device, cross-checks reads and, only on a device whose first block begins
   with `TCOS-SCRATCH`, tests write/flush/read-back. Not covered: floppy and SD/MMC (only through the firmware),
   and the LSI/MegaRAID/MPT/PVSCSI SCSI adapters (only if the firmware has a driver for them - the stock OVMF does not).
+- `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
+  `remove`, `rename`) hands out `IFile` (offset-based read/write/resize) and `IDirectory` (entry iteration) handles;
+  every call returns a `Status` instead of throwing. `Path.hpp` holds the shared path rules. `Ram/` is a
+  size-limitable in-memory filesystem, `Fat/` mounts FAT12/16/32 volumes (with long names) read-only from any
+  `IStorageDevice` at a given first block. `src/FileSystemDemo` scans each device's partitions and mounts the FAT ones at
+  boot (read only); `tests/FileSystemTest.cpp` covers both filesystems.
+- `src/Hardware/StorageDevice/Partition/`: `scan_partitions` reads GPT (header and array CRC-32, backup copy fallback,
+  protective MBR) or MBR (primaries plus the extended/logical chain), and treats a bare filesystem as having no table;
+  `PartitionStorageDevice` is a range-checked window onto part of a device, so a filesystem mounts a partition like a
+  disk. `tests/PartitionTest.cpp` covers it.
 - `src/Utility/` bounds-safe memory: `Slice` (a start index and a length, overflow-safe, `fits_in(size)`), `ArrayView<T>`
   (pointer + size: a non-owning, *checked* window - `operator[]`, `subview(Slice)`, `first/last/dropped`, `copy_from`,
   `cast<U>()`, and `try_*` forms that report failure instead), `ByteView`/`ConstByteView`, `ByteReader`/`ByteWriter`
