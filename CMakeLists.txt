@@ -115,6 +115,10 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
   src/FileSystemDemo.cpp
   src/Hardware/StorageDevice/Partition/PartitionScanner.cpp
+  src/Stream/StreamStatus.cpp
+  src/Stream/Memory/MemoryStream.cpp
+  src/Stream/File/FileStream.cpp
+  src/Stream/Tcp/TcpStream.cpp
   src/FileSystem/FileSystemTypes.cpp
   src/FileSystem/Ram/RamFileSystem.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
