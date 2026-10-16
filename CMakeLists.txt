@@ -33,7 +33,11 @@ add_executable(BOOTX64
   src/hardware/IoPort.cpp
   src/hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
   src/hardware/TextConsole.cpp
-  src/hardware/Pci/PciBus.cpp
+  src/hardware/Acpi/AcpiTables.cpp
+  src/hardware/Bus/Pci/LegacyPciBus.cpp
+  src/hardware/Bus/Pcie/EcamPcieBus.cpp
+  src/hardware/Bus/Usb/UsbBus.cpp
+  src/hardware/Bus/SystemPciBus.cpp
   src/hardware/GraphicsProcessingUnit/Font8x16.cpp
   src/hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/hardware/GraphicsProcessingUnit/SystemGpu.cpp

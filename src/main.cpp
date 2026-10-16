@@ -1,6 +1,8 @@
 #include "Allocators/Allocator.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
+#include "hardware/Bus/SystemPciBus.hpp"
+#include "hardware/Bus/Usb/UsbBus.hpp"
 #include "hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "hardware/SystemHardware.hpp"
 #include "uefi.hpp"
@@ -68,7 +70,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Display first, so everything after it appears on screen. Falls back to the
   // firmware text console if no GPU class can drive a framebuffer.
-  hardware::PciBus pci;
+  hardware::SystemPciBus system_pci(st);
+  hardware::IPciBus& pci = system_pci.pci();
   hardware::SystemGpu system_gpu(st, pci);
   hardware::IGraphicsProcessingUnit* gpu = system_gpu.gpu();
   if (gpu) {
@@ -90,6 +93,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::put_hex(gpu->mode_count());
     console::puts(" modes)\n");
   }
+
+  console::puts(pci.name());
+  console::puts(": ");
+  console::put_hex(pci.device_count());
+  console::puts(" devices\n");
+
+  hardware::UsbBus usb(pci);
+  usb.initialize();
+  console::puts("USB: ");
+  console::put_hex(usb.controller_count());
+  console::puts(" controllers, ");
+  console::put_hex(usb.device_count());
+  console::puts(" devices attached\n");
 
   // Bring-up order: CPU -> RAM -> allocator -> scheduler. Objects live on this
   // stack for the life of the OS; nothing needs static constructors.

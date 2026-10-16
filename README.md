@@ -27,7 +27,15 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
     registers), `Intel/`, `AMD/`, `NVIDIA/` (identify the device but still use the firmware framebuffer until
     native drivers exist), and `UEFI/` (`UefiGopGpu`, the fallback for any other display). `src/GraphicsConsole`
     is a scrolling text console that only uses the GPU interface.
-  - `hardware/Pci/`: `PciBus` (config-space access and enumeration via ports 0xCF8/0xCFC).
+  - `hardware/Bus/`: `IBus` and one subfolder per bus type, each with an interface and implementations.
+    - `Pci/`: `IPciBus` (config access, BARs, capability list), `PciBusBase` (shared scanning), `LegacyPciBus`
+      (I/O ports 0xCF8/0xCFC, 256-byte config space).
+    - `Pcie/`: `IPcieBus` (adds the extended capability list) and `EcamPcieBus` (memory-mapped config space,
+      located through the ACPI MCFG table).
+    - `Usb/`: `IUsbBus` and `UsbBus`, which finds host controllers on PCI (UHCI/OHCI/EHCI/xHCI), and reads the
+      root ports of xHCI controllers (device attached, speed). It does not enumerate or talk to devices yet.
+    - `SystemPciBus` picks PCIe/ECAM when firmware provides MCFG, else legacy PCI.
+  - `hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup).
   - `hardware/RandomAccessMemory/`, `NeuralProcessingUnit/`: `IRandomAccessMemory` (implemented by
     `UefiRandomAccessMemory`) and `INeuralProcessingUnit` (no implementation yet).
   - `hardware/SystemHardware.hpp`: aliases `SystemCpu` / `SystemRam` to the classes for this architecture.

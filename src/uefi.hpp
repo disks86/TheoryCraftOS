@@ -44,6 +44,16 @@ struct Guid {
   uint8_t d[8];
 };
 
+struct ConfigurationTable {
+  Guid vendor_guid;
+  void* vendor_table;
+};
+
+constexpr Guid kAcpi20TableGuid = {
+    0x8868e871, 0xe4f1, 0x11d3, {0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}};
+constexpr Guid kAcpi10TableGuid = {
+    0xeb9d2d30, 0x2d88, 0x11d3, {0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}};
+
 struct TableHeader {
   uint64_t signature;
   uint32_t revision, header_size, crc32, reserved;
@@ -146,7 +156,7 @@ struct SystemTable {
   RuntimeServices* runtime_services;
   BootServices* boot_services;
   uint64_t number_of_table_entries;
-  void* configuration_table;
+  ConfigurationTable* configuration_table;
 };
 
 struct LoadedImage {

@@ -14,7 +14,7 @@ constexpr unsigned long GpuMaxOf(unsigned long a, unsigned long b) { return a > 
 class SystemGpu {
  public:
   // Tries candidates in order and keeps the first whose initialize() succeeds.
-  SystemGpu(efi::SystemTable* st, const PciBus& pci);
+  SystemGpu(efi::SystemTable* st, const IPciBus& pci);
 
   // The initialized GPU, or nullptr if no usable display was found.
   IGraphicsProcessingUnit* gpu() { return active_; }

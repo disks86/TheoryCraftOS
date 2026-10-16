@@ -11,19 +11,6 @@ static_assert(sizeof(IntelGpu) == sizeof(UefiGopGpu) && sizeof(AmdGpu) == sizeof
                   sizeof(NvidiaGpu) == sizeof(UefiGopGpu),
               "vendor GPU classes must fit SystemGpu's storage");
 
-struct Finder {
-  PciDeviceInfo device{};
-  bool found = false;
-};
-
-bool take_first_display(const PciDeviceInfo& d, void* context) {
-  auto* f = static_cast<Finder*>(context);
-  if (d.class_code != kPciClassDisplay) return true;
-  f->device = d;
-  f->found = true;
-  return false;
-}
-
 // Builds T in `storage`, returning it if it initializes; otherwise tears it down.
 template <class T>
 IGraphicsProcessingUnit* try_gpu(void* storage, const GpuContext& context) {
@@ -34,13 +21,15 @@ IGraphicsProcessingUnit* try_gpu(void* storage, const GpuContext& context) {
 }
 }  // namespace
 
-SystemGpu::SystemGpu(efi::SystemTable* st, const PciBus& pci) {
-  Finder finder;
-  pci.enumerate(take_first_display, &finder);
-  const GpuContext context{st, &pci, finder.device};
+SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci) {
+  // The first display-class device is assumed to be the primary one.
+  PciDeviceInfo d{};
+  bool found = false;
+  for (uint32_t i = 0; !found && pci.pci_device(i, &d); ++i) found = d.class_code == kPciClassDisplay;
+  if (!found) d = {};
+  const GpuContext context{st, &pci, d};
 
-  if (finder.found) {
-    const PciDeviceInfo& d = finder.device;
+  if (found) {
     if (d.vendor_id == QemuStdVgaGpu::kPciVendor && d.device_id == QemuStdVgaGpu::kPciDevice)
       active_ = try_gpu<QemuStdVgaGpu>(storage_, context);
     else if (d.vendor_id == IntelGpu::kPciVendor)

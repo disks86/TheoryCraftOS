@@ -1,5 +1,5 @@
 #pragma once
-#include "hardware/Pci/PciBus.hpp"
+#include "hardware/Bus/Pci/IPciBus.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -8,7 +8,7 @@ namespace hardware {
 // it was matched to (zeroed when no PCI display device was found).
 struct GpuContext {
   efi::SystemTable* st;
-  const PciBus* pci;
+  const IPciBus* pci;
   PciDeviceInfo device;
 };
 

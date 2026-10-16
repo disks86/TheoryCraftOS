@@ -27,7 +27,7 @@ class QemuStdVgaGpu final : public FramebufferGpu {
   uint16_t read_register(uint16_t index) const;
   void write_register(uint16_t index, uint16_t value) const;
 
-  const PciBus* pci_;
+  const IPciBus* pci_;
   PciDeviceInfo device_;
   uint8_t* framebuffer_ = nullptr;
   uint32_t current_ = 0;
