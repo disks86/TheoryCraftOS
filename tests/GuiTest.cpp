@@ -32,6 +32,10 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/InputPump.hpp"
+#include "Gui/MessageDialog.hpp"
+#include "Gui/Windows/Frame.hpp"
+#include "Gui/Windows/WindowManager.hpp"
+#include "Gui/Windows/WindowSwitcher.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
 
@@ -595,6 +599,324 @@ static void test_input_pump() {
   CHECK(a.live == 0);
 }
 
+
+// --- Window manager -------------------------------------------------------------
+
+struct Closed {
+  int count = 0;
+  Frame* last = nullptr;
+  static void fn(void* context, Control& sender) { auto* c = static_cast<Closed*>(context); ++c->count; c->last = static_cast<Frame*>(&sender); }
+  Handler handler() { return {&Closed::fn, this}; }
+};
+
+static Point at_part(Frame& f, Frame::Part part) {  // a point (window coordinates) in a button or the title bar
+  const Point o = f.window_origin();
+  if (part == Frame::Part::TitleBar) return {o.x + 20, o.y + Frame::kBorder + 4};
+  const Rect2D r = f.button_rect(part);
+  return {o.x + r.x + static_cast<int32_t>(r.width) / 2, o.y + r.y + static_cast<int32_t>(r.height) / 2};
+}
+
+static void test_windows() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    Frame fa(a), fb(a), fc(a);
+    fa.set_title("A"); fb.set_title("B"); fc.set_title("C");
+    fa.set_bounds({10, 10, 300, 200});
+    fb.set_bounds({100, 60, 300, 200});
+    fc.set_bounds({200, 110, 300, 200});
+    Closed closed;
+    fc.on_closed(closed.handler());
+    CHECK(mgr.add_window(&fa) && mgr.add_window(&fb) && mgr.add_window(&fc));
+    CHECK(!mgr.add_window(&fa));
+    w.layout();
+    CHECK(mgr.window_count() == 3 && mgr.active() == &fc && fc.active() && !fa.active() && !fb.active());
+    CHECK(mgr.stacking_index(&fa) == 0 && mgr.stacking_index(&fb) == 1 && mgr.stacking_index(&fc) == 2);
+
+    // Stacking: where windows overlap the top one is hit; clicking a lower window raises and activates it.
+    CHECK(w.hit_test(250, 150) == &fc);
+    CHECK(w.hit_test(120, 70) == &fb);
+    const Point on_a = at_part(fa, Frame::Part::TitleBar);
+    w.mouse_move(on_a.x, on_a.y);
+    w.mouse_button(on_a.x, on_a.y, MouseButton::Left, true);
+    w.mouse_button(on_a.x, on_a.y, MouseButton::Left, false);
+    CHECK(mgr.active() == &fa && mgr.stacking_index(&fa) == 2 && mgr.stacking_index(&fc) == 1);
+    CHECK(fa.active() && !fc.active());
+    // The creation order (for the taskbar) does not change.
+    CHECK(mgr.window_at(0) == &fa && mgr.window_at(1) == &fb && mgr.window_at(2) == &fc);
+    // Title bar colors: active vs inactive.
+    w.render();
+    CHECK(screen.px(fa.bounds().x + 8, fa.bounds().y + 8) == theme.title);
+    CHECK(screen.px(fc.bounds().x + 180, fc.bounds().y + 8) == theme.inactive_title);
+
+    // Minimize button: the window disappears, the next window below becomes active.
+    const Point min_a = at_part(fa, Frame::Part::Minimize);
+    click(w, min_a.x, min_a.y);
+    CHECK(fa.state() == Frame::State::Minimized && !fa.visible() && mgr.active() == &fc);
+    CHECK(w.hit_test(on_a.x, on_a.y) != &fa);
+    mgr.activate(&fa);  // what the switcher does: restores it
+    CHECK(fa.state() == Frame::State::Normal && fa.visible() && mgr.active() == &fa && mgr.stacking_index(&fa) == 2);
+
+    // Maximize and restore.
+    const Rect2D before = fa.bounds();
+    const Point max_a = at_part(fa, Frame::Part::Maximize);
+    click(w, max_a.x, max_a.y);
+    CHECK(fa.state() == Frame::State::Maximized && fa.bounds().x == 0 && fa.bounds().y == 0 && fa.bounds().width == 800 && fa.bounds().height == 600);
+    const Point restore_a = at_part(fa, Frame::Part::Maximize);
+    click(w, restore_a.x, restore_a.y);
+    CHECK(fa.state() == Frame::State::Normal && is(fa.bounds(), before.x, before.y, before.width, before.height));
+    // A maximized window that was minimized comes back maximized.
+    mgr.maximize(&fa);
+    mgr.minimize(&fa);
+    mgr.restore(&fa);
+    CHECK(fa.state() == Frame::State::Maximized);
+    mgr.maximize(&fa);
+
+    // Disabled buttons ignore clicks; the others still work.
+    fa.set_minimize_enabled(false);
+    fa.set_maximize_enabled(false);
+    fa.set_close_enabled(false);
+    click(w, min_a.x, min_a.y);
+    click(w, max_a.x, max_a.y);
+    const Point close_a = at_part(fa, Frame::Part::Close);
+    click(w, close_a.x, close_a.y);
+    CHECK(fa.state() == Frame::State::Normal && fa.manager() == &mgr && mgr.window_count() == 3);
+    fa.set_minimize_enabled(true);
+    fa.set_maximize_enabled(true);
+    fa.set_close_enabled(true);
+    // Disabled-button glyphs are drawn in the shadow color.
+    fa.set_maximize_enabled(false);
+    w.render();
+    const Rect2D mr = fa.button_rect(Frame::Part::Maximize);
+    bool grey = false;
+    for (uint32_t y = 0; y < mr.height; ++y)
+      for (uint32_t x = 0; x < mr.width; ++x) grey = grey || screen.px(fa.bounds().x + mr.x + x, fa.bounds().y + mr.y + y) == theme.shadow;
+    CHECK(grey);
+    fa.set_maximize_enabled(true);
+
+    // Dragging the title bar moves the window; it cannot be dragged out of reach.
+    const Rect2D start = fa.bounds();
+    const Point grab = at_part(fa, Frame::Part::TitleBar);
+    w.mouse_move(grab.x, grab.y);
+    w.mouse_button(grab.x, grab.y, MouseButton::Left, true);
+    w.mouse_move(grab.x + 50, grab.y + 40);
+    w.mouse_move(grab.x + 60, grab.y + 70);
+    w.mouse_button(grab.x + 60, grab.y + 70, MouseButton::Left, false);
+    CHECK(is(fa.bounds(), start.x + 60, start.y + 70, start.width, start.height));
+    const Point grab2 = at_part(fa, Frame::Part::TitleBar);
+    w.mouse_move(grab2.x, grab2.y);
+    w.mouse_button(grab2.x, grab2.y, MouseButton::Left, true);
+    w.mouse_move(grab2.x - 5000, grab2.y + 5000);
+    w.mouse_button(grab2.x - 5000, grab2.y + 5000, MouseButton::Left, false);
+    CHECK(fa.bounds().y == 600 - Frame::kBorder - Frame::kTitleHeight && fa.bounds().x + static_cast<int32_t>(fa.bounds().width) == 80);
+    fa.set_bounds({10, 10, 300, 200});
+
+    // Resizing: the bottom-right corner grows it, the top-left corner moves the origin; minimum size holds.
+    const Point corner = {fa.window_origin().x + 299, fa.window_origin().y + 199};
+    CHECK(fa.part_at(299, 199) == Frame::Part::BottomRight);
+    w.mouse_move(corner.x, corner.y);
+    w.mouse_button(corner.x, corner.y, MouseButton::Left, true);
+    w.mouse_move(corner.x + 100, corner.y + 50);
+    w.mouse_button(corner.x + 100, corner.y + 50, MouseButton::Left, false);
+    CHECK(is(fa.bounds(), 10, 10, 400, 250));
+    CHECK(fa.part_at(1, 1) == Frame::Part::TopLeft && fa.part_at(0, 100) == Frame::Part::Left && fa.part_at(200, 0) == Frame::Part::Top);
+    const Point tl = {fa.window_origin().x + 1, fa.window_origin().y + 1};
+    w.mouse_move(tl.x, tl.y);
+    w.mouse_button(tl.x, tl.y, MouseButton::Left, true);
+    w.mouse_move(tl.x + 5000, tl.y + 5000);
+    w.mouse_button(tl.x + 5000, tl.y + 5000, MouseButton::Left, false);
+    CHECK(fa.bounds().width == Frame::kMinWidth && fa.bounds().height == Frame::kMinHeight);
+    CHECK(fa.bounds().x + static_cast<int32_t>(fa.bounds().width) == 410 && fa.bounds().y + static_cast<int32_t>(fa.bounds().height) == 260);
+    fa.set_resizable(false);
+    CHECK(fa.part_at(fa.bounds().width - 1, fa.bounds().height - 1) != Frame::Part::BottomRight);
+    fa.set_resizable(true);
+    fa.set_bounds({10, 10, 300, 200});
+
+    // Close: removed from the manager, the handler runs, the next window below is active.
+    mgr.activate(&fc);
+    const Point close_c = at_part(fc, Frame::Part::Close);
+    click(w, close_c.x, close_c.y);
+    CHECK(closed.count == 1 && closed.last == &fc && fc.manager() == nullptr && mgr.window_count() == 2);
+    CHECK(mgr.active() == &fb || mgr.active() == &fa);
+    CHECK(mgr.add_window(&fc));  // a closed window can be opened again
+    mgr.remove_window(&fc);
+
+    // Children of a window are laid out inside its client area and receive input.
+    fb.set_bounds({450, 300, 300, 200});  // clear of the other windows
+    Button inner(a);
+    Counter clicks;
+    inner.set_dock(DockStyle::Top);
+    inner.set_size(0, 30);
+    inner.on_click(clicks.handler());
+    fb.add(&inner);
+    w.layout();
+    CHECK(inner.bounds().x == Frame::kBorder && inner.bounds().y == Frame::kBorder + Frame::kTitleHeight + 1 && inner.bounds().width == fb.bounds().width - 2 * Frame::kBorder);
+    click_center(w, inner);
+    CHECK(clicks.count == 1 && mgr.active() == &fb && w.focus() == &inner);  // clicking inside activates the window
+    // Tab stays inside the active window (and Window focus scope follows activation).
+    TextBox other(a);
+    other.set_dock(DockStyle::Top);
+    fa.add(&other);
+    w.layout();
+    press(w, key::kTab);
+    CHECK(w.focus() == &inner);
+    mgr.activate(&fa);
+    CHECK(w.focus() == &other);
+    mgr.activate(&fb);
+    CHECK(w.focus() == &inner);
+    mgr.remove_window(&fa);
+    mgr.remove_window(&fb);
+    CHECK(mgr.window_count() == 0 && mgr.active() == nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_modal_and_dialog() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    Frame doc(a);
+    doc.set_title("Document");
+    doc.set_bounds({50, 50, 300, 200});
+    Button save(a);
+    save.set_dock(DockStyle::Top);
+    save.set_size(0, 30);
+    Counter saves;
+    save.on_click(saves.handler());
+    doc.add(&save);
+    mgr.add_window(&doc);
+    w.layout();
+
+    MessageDialog dialog(a);
+    dialog.set_texts("Quit", "Really quit?", "Unsaved changes are lost.", "Quit", "Stay");
+    Closed result;
+    struct Answer { bool accepted = false; int calls = 0; static void fn(void* c, Control& s) { auto* x = static_cast<Answer*>(c); ++x->calls; x->accepted = static_cast<MessageDialog&>(s).accepted(); } } answer;
+    dialog.on_result({&Answer::fn, &answer});
+    CHECK(dialog.show(mgr) && dialog.showing() && dialog.modal() && mgr.has_modal());
+    w.layout();
+    // Centered horizontally; minimize and maximize are disabled, close is not.
+    CHECK(dialog.bounds().x == (800 - MessageDialog::kWidth) / 2 && !dialog.minimize_enabled() && !dialog.maximize_enabled() && dialog.close_enabled());
+    // The modal blocks the window under it: no input, no activation, no focus.
+    CHECK(!doc.enabled() && mgr.active() == &dialog && mgr.stacking_index(&dialog) == 1);
+    click_center(w, save);
+    CHECK(saves.count == 0 && mgr.active() == &dialog && mgr.stacking_index(&dialog) == 1);
+    const Point dpart = at_part(doc, Frame::Part::Close);
+    click(w, dpart.x, dpart.y);
+    CHECK(doc.manager() == &mgr);
+    // Disabled dialog buttons do nothing.
+    const Point dmin = at_part(dialog, Frame::Part::Minimize);
+    click(w, dmin.x, dmin.y);
+    CHECK(dialog.state() == Frame::State::Normal && dialog.visible());
+    // The default button has the focus; Tab walks only the dialog's buttons.
+    CHECK(w.focus() == &dialog.accept_button());
+    press(w, key::kTab);
+    CHECK(w.focus() == &dialog.decline_button());
+    press(w, key::kTab);
+    CHECK(w.focus() == &dialog.accept_button());
+    // Choosing "Stay" closes the dialog with accepted() false and re-enables the document.
+    click_center(w, dialog.decline_button());
+    CHECK(!dialog.showing() && answer.calls == 1 && !answer.accepted && !mgr.has_modal() && doc.enabled() && mgr.active() == &doc);
+    click_center(w, save);
+    CHECK(saves.count == 1);
+    // Reopen: the close button counts as "no", Escape too, Enter and the default button as "yes".
+    dialog.show(mgr);
+    w.layout();
+    const Point x = at_part(dialog, Frame::Part::Close);
+    click(w, x.x, x.y);
+    CHECK(!dialog.showing() && answer.calls == 2 && !answer.accepted);
+    dialog.show(mgr);
+    press(w, key::kEscape);
+    CHECK(!dialog.showing() && answer.calls == 3 && !answer.accepted);
+    dialog.show(mgr);
+    press(w, key::kEnter);
+    CHECK(!dialog.showing() && answer.calls == 4 && answer.accepted);
+    dialog.show(mgr);
+    w.layout();
+    click_center(w, dialog.accept_button());
+    CHECK(!dialog.showing() && answer.calls == 5 && answer.accepted);
+    // Showing it twice just activates it.
+    dialog.show(mgr);
+    CHECK(dialog.show(mgr) && mgr.window_count() == 2);
+    w.render();
+    CHECK(screen.px(dialog.bounds().x + 8, dialog.bounds().y + 8) == theme.title);   // active
+    CHECK(screen.px(doc.bounds().x + 8, doc.bounds().y + 8) == theme.inactive_title);  // blocked windows look inactive
+    mgr.remove_window(&dialog);
+    mgr.remove_window(&doc);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_switcher() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    Window& w = d.window();
+    WindowManager& mgr = d.windows();
+    WindowSwitcher& sw = d.switcher();
+    CHECK(sw.button_count() == 0);
+    Frame f1(a), f2(a), f3(a);
+    f1.set_title("One"); f2.set_title("Two"); f3.set_title("Three");
+    f1.set_bounds({20, 20, 300, 200}); f2.set_bounds({60, 60, 300, 200}); f3.set_bounds({100, 100, 300, 200});
+    mgr.add_window(&f1); mgr.add_window(&f2); mgr.add_window(&f3);
+    d.step(0);
+    CHECK(sw.button_count() == 3 && sw.frame_at(0) == &f1 && sw.frame_at(2) == &f3);
+    // The switcher fills the taskbar between Start and the clock; each button has a share of it.
+    CHECK(sw.bounds().x > d.start_button().bounds().x + static_cast<int32_t>(d.start_button().bounds().width));
+    CHECK(sw.bounds().x + static_cast<int32_t>(sw.bounds().width) <= static_cast<int32_t>(d.start_button().parent()->bounds().width));
+    const Rect2D b0 = sw.button_rect(0), b1 = sw.button_rect(1);
+    CHECK(b0.width == b1.width && b1.x > b0.x + static_cast<int32_t>(b0.width) - 1 && b0.width <= WindowSwitcher::kMaxButtonWidth);
+    auto press_button = [&](uint32_t i) {
+      const Point o = sw.window_origin();
+      const Rect2D r = sw.button_rect(i);
+      click(w, o.x + r.x + static_cast<int32_t>(r.width) / 2, o.y + r.y + static_cast<int32_t>(r.height) / 2);
+    };
+    // Clicking another window's button raises it; clicking the active one's button minimizes it;
+    // clicking a minimized one's button restores it.
+    CHECK(mgr.active() == &f3);
+    press_button(0);
+    CHECK(mgr.active() == &f1 && mgr.stacking_index(&f1) == 2);
+    press_button(0);
+    CHECK(f1.state() == Frame::State::Minimized && mgr.active() == &f3);
+    press_button(0);
+    CHECK(f1.state() == Frame::State::Normal && mgr.active() == &f1);
+    // Maximized windows fill the area above the taskbar, never the taskbar itself.
+    f2.maximize();
+    CHECK(f2.bounds().height + static_cast<uint32_t>(desktop::Desktop::kTaskbarHeight) == 600 && f2.bounds().width == 800);
+    // Dialogs are not on the taskbar, and the switcher is blocked while one is open.
+    d.ask_shut_down();
+    d.step(1);
+    CHECK(sw.button_count() == 3 && d.shutdown_dialog().showing());
+    const Frame* before = mgr.active();
+    press_button(0);
+    CHECK(mgr.active() == before);
+    d.shutdown_dialog().close();
+    CHECK(!d.shutdown_dialog().showing() && !d.shutdown_requested());
+    // The Start menu's About window is an ordinary window and appears on the taskbar once.
+    d.open_about();
+    d.open_about();
+    CHECK(sw.button_count() == 4 && d.about_window().manager() == &mgr);
+    d.about_window().minimize();
+    d.open_about();
+    CHECK(d.about_window().state() != Frame::State::Minimized && mgr.active() == &d.about_window());
+    d.step(2);
+    // Rendering the whole desktop with windows must not touch memory outside the screen (ASAN).
+    w.render();
+    mgr.remove_window(&f1); mgr.remove_window(&f2); mgr.remove_window(&f3); mgr.remove_window(&d.about_window());
+  }
+  CHECK(a.live == 0);
+}
+
 struct FakeClock {
   desktop::DateTime now;
   bool ok = true;
@@ -685,10 +1007,24 @@ static void test_desktop() {
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);
     d.step(5000000);
     CHECK(start.open());
-    kb.push(key::kDown, true); kb.push(key::kDown, false);
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);
     d.step(6000000);
-    CHECK(d.shutdown_requested() && !start.open());
+    // A modal confirmation opens first; nothing is shut down yet.
+    CHECK(!start.open() && d.shutdown_dialog().showing() && d.windows().has_modal() && !d.shutdown_requested());
+    CHECK(w.focus() == &d.shutdown_dialog().accept_button());
+    // Escape declines: the dialog goes away and the desktop keeps running.
+    kb.push(key::kEscape, true); kb.push(key::kEscape, false);
+    d.step(7000000);
+    CHECK(!d.shutdown_dialog().showing() && !d.shutdown_requested() && !d.windows().has_modal());
+    // Ask again and accept with Enter on the default button.
+    d.ask_shut_down();
+    d.step(8000000);
+    CHECK(d.shutdown_dialog().showing());
+    kb.push(key::kEnter, true); kb.push(key::kEnter, false);
+    d.step(9000000);
+    CHECK(d.shutdown_requested() && !d.shutdown_dialog().showing());
   }
   CHECK(a.live == 0);
 }
@@ -704,6 +1040,9 @@ int main() {
   test_input_pump();
   test_desktop();
   test_clock();
+  test_windows();
+  test_modal_and_dialog();
+  test_switcher();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui: all checks passed\n");
   return 0;

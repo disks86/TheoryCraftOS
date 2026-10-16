@@ -166,6 +166,10 @@ add_executable(BOOTX64
   src/Gui/Controls/TextBox.cpp
   src/Gui/Controls/DropDown.cpp
   src/Gui/Controls/Menu.cpp
+  src/Gui/Windows/Frame.cpp
+  src/Gui/Windows/WindowManager.cpp
+  src/Gui/Windows/WindowSwitcher.cpp
+  src/Gui/MessageDialog.cpp
   src/Graphics/Graphics3D/Software/SoftwareDevice.cpp
   src/Hardware/x86_64/port.S
 )

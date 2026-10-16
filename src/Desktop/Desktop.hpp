@@ -16,17 +16,23 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The desktop shell: a full-screen window with the desktop surface and a taskbar along the bottom
-// holding the Start button (its menu opens upwards) and a small clock. The Start menu has one entry
-// for now, "Shut Down", which only asks for a shutdown (shutdown_requested()): the boot code owns the
-// hardware and does the orderly power-off once run() returns.
+// The desktop shell: a full-screen root window holding the desktop surface - where the window manager
+// stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "About"
+// (an ordinary window) and "Shut Down...", which asks for confirmation in a modal dialog and then only
+// requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
+// power-off once the desktop loop returns.
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/InputPump.hpp"
+#include "Gui/MessageDialog.hpp"
 #include "Gui/Window.hpp"
+#include "Gui/Windows/Frame.hpp"
+#include "Gui/Windows/WindowManager.hpp"
+#include "Gui/Windows/WindowSwitcher.hpp"
 
 namespace desktop {
 
@@ -54,6 +60,14 @@ class Desktop {
 
   gui::Window& window() { return window_; }
   gui::MenuButton& start_button() { return start_; }
+  gui::WindowManager& windows() { return windows_; }
+  gui::WindowSwitcher& switcher() { return switcher_; }
+  gui::MessageDialog& shutdown_dialog() { return shutdown_dialog_; }
+  gui::Frame& about_window() { return about_; }
+  // Opens the About window, or brings it forward (restoring it if minimized).
+  void open_about();
+  // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
+  void ask_shut_down();
   StringView clock_text() const { return clock_.text(); }
   bool shutdown_requested() const { return shutdown_requested_; }
   void request_shutdown() { shutdown_requested_ = true; }
@@ -65,7 +79,9 @@ class Desktop {
   bool step(uint64_t uptime_us);
 
  private:
+  static void on_about(void* self, gui::Control&);
   static void on_shut_down(void* self, gui::Control&);
+  static void on_shutdown_answer(void* self, gui::Control&);
 
   gui::Theme theme_;
   gui::Window window_;
@@ -73,8 +89,14 @@ class Desktop {
   DesktopSurface surface_;
   gui::Panel taskbar_;
   gui::MenuButton start_;
+  gui::Panel gap_left_, gap_right_;
+  gui::WindowManager windows_;
+  gui::WindowSwitcher switcher_;
   gui::Panel tray_;
   gui::Label clock_;
+  gui::MessageDialog shutdown_dialog_;
+  gui::Frame about_;
+  gui::Label about_lines_[3];
   ClockSource clock_source_ = nullptr;
   void* clock_context_ = nullptr;
   uint64_t polled_second_ = ~0ull;  // the uptime second the source was last read in

@@ -212,6 +212,18 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   power-off. The boot-time self-checks and demos of every subsystem (containers, kernel, scheduler, NPU, network stack, storage,
   filesystems, thread safety, ISP, graphics, GUI) are still there: configure with `-DTCOS_SELFTESTS=ON` to run them before the desktop.
 
+- `src/Gui/Windows/`: a stacking window manager. `Frame` is a top-level window (bevelled border, title bar, minimize / maximize /
+  close buttons at the top right, a client area for ordinary controls; each button can be disabled and is then drawn greyed and
+  ignores clicks; the title bar drags, the borders and corners resize, Escape can close). `WindowManager` holds the frames in
+  stacking order (last = top): pressing the mouse anywhere on a window raises and activates it (through
+  `Control::on_descendant_pressed`), active windows have a lit title bar, minimize hides, maximize fills the area above the
+  taskbar and toggles back, close removes the window and runs its `on_closed` handler. Modal windows disable every other window
+  (disabled windows ignore input, look inactive and are skipped by Tab: `Control::effectively_enabled`) and stay on top; the active
+  window is the Tab scope (`Window::set_focus_scope`). `WindowSwitcher` is the taskbar's window list (dialogs are left out; the
+  active window's button is pressed in; clicking it minimizes, clicking another restores/raises that window). `Gui/MessageDialog` is a
+  modal two-button question (Enter = default button, Escape/close = no). The desktop's Start menu has *About* (an ordinary window) and
+  *Shut Down...*, which asks for confirmation in such a dialog.
+
 ## Requirements
 
 `cmake`, `ninja` (or make), `x86_64-w64-mingw32-gcc/g++` (mingw-w64),

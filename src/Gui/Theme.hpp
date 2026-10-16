@@ -36,6 +36,8 @@ struct Theme {
   uint32_t selection_text = 0xFFFFFFFF;
   uint32_t title = 0xFF000080;
   uint32_t title_text = 0xFFFFFFFF;
+  uint32_t inactive_title = 0xFF808080;
+  uint32_t inactive_title_text = 0xFFC0C0C0;
 };
 
 }  // namespace gui

@@ -29,9 +29,16 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       surface_(allocator),
       taskbar_(allocator),
       start_(allocator),
+      gap_left_(allocator),
+      gap_right_(allocator),
+      windows_(allocator),
+      switcher_(allocator, windows_),
       tray_(allocator),
-      clock_(allocator) {
-  // Taskbar: Start at the left, the clock in a sunken tray at the right.
+      clock_(allocator),
+      shutdown_dialog_(allocator),
+      about_(allocator),
+      about_lines_{Label(allocator), Label(allocator), Label(allocator)} {
+  // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
   taskbar_.set_dock(DockStyle::Bottom);
   taskbar_.set_size(0, kTaskbarHeight);
@@ -41,8 +48,17 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.set_dock(DockStyle::Left);
   start_.set_size(76, 0);
   start_.set_direction(MenuButton::Direction::Up);
-  start_.set_menu_min_width(180);
-  start_.menu().add_item("Shut Down", {&Desktop::on_shut_down, this});
+  start_.set_menu_min_width(200);
+  start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
+  start_.menu().add_separator();
+  start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
+
+  gap_left_.set_style(PanelStyle::Transparent);
+  gap_left_.set_dock(DockStyle::Left);
+  gap_left_.set_size(6, 0);
+  gap_right_.set_style(PanelStyle::Transparent);
+  gap_right_.set_dock(DockStyle::Right);
+  gap_right_.set_size(6, 0);
 
   tray_.set_style(PanelStyle::Sunken);
   tray_.set_dock(DockStyle::Right);
@@ -51,8 +67,34 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   clock_.set_text("--/--/---- --:-- --");
   tray_.add(&clock_);
 
+  switcher_.set_dock(DockStyle::Fill);
+
   taskbar_.add(&start_);
+  taskbar_.add(&gap_left_);
   taskbar_.add(&tray_);
+  taskbar_.add(&gap_right_);
+  taskbar_.add(&switcher_);  // Fill goes last
+
+  // The window manager fills the desktop surface: windows are stacked above the desktop, below the taskbar.
+  windows_.set_dock(DockStyle::Fill);
+  surface_.set_dock(DockStyle::Fill);
+  surface_.add(&windows_);
+
+  shutdown_dialog_.set_texts("Shut Down", "Shut down TheoryCraftOS now?", "Running services will be stopped.", "Shut Down", "Cancel");
+  shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
+
+  about_.set_title("About TheoryCraftOS");
+  about_.set_bounds({140, 90, 400, 170});
+  about_.set_padding(Insets::all(12));
+  about_.set_minimize_enabled(true);
+  static const char* const kAbout[3] = {"TheoryCraftOS", "A minimal UEFI x86_64 operating system.",
+                                        "Move, resize, minimize or maximize windows."};
+  for (int i = 0; i < 3; ++i) {
+    about_lines_[i].set_text(kAbout[i]);
+    about_lines_[i].set_dock(DockStyle::Top);
+    about_lines_[i].set_size(0, 22);
+    about_.add(&about_lines_[i]);
+  }
 
   // Docking order: the strip first, then what fills the rest.
   surface_.set_dock(DockStyle::Fill);
@@ -62,7 +104,20 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.layout();
 }
 
-void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->shutdown_requested_ = true; }
+void Desktop::open_about() {
+  if (about_.manager()) about_.activate();
+  else windows_.add_window(&about_);
+}
+
+void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
+
+void Desktop::on_about(void* self, Control&) { static_cast<Desktop*>(self)->open_about(); }
+void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->ask_shut_down(); }
+
+void Desktop::on_shutdown_answer(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  if (d->shutdown_dialog_.accepted()) d->shutdown_requested_ = true;
+}
 
 uint32_t format_date_time(const DateTime& t, char* out) {
   auto two = [&](uint32_t at, uint32_t v) {

@@ -103,7 +103,7 @@ void Window::deliver_move(Control* target, const Point& origin, int32_t x, int32
       hover_->on_mouse_enter();
     }
   }
-  if (target && target->enabled()) {
+  if (target && target->effectively_enabled()) {
     MouseArgs a;
     a.x = x - origin.x;
     a.y = y - origin.y;
@@ -141,7 +141,7 @@ void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed
       origin = (popup_ && captured_ == popup_) ? Point{popup_->bounds().x, popup_->bounds().y} : captured_->window_origin();
     }
     captured_ = nullptr;
-    if (target && target->enabled()) {
+    if (target && target->effectively_enabled()) {
       MouseArgs a;
       a.x = x - origin.x;
       a.y = y - origin.y;
@@ -159,7 +159,11 @@ void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed
     if (target && owner && is_inside(owner, target)) return;
     target = target_at(x, y, &origin);
   }
-  if (!target || !target->enabled()) return;
+  if (!target) return;
+  // Ancestors hear about the press first (a window manager raises the clicked window), even when
+  // the control itself is disabled - the manager decides.
+  for (Control* c = target; c && c->parent_ && c != popup_; c = c->parent_) c->parent_->on_descendant_pressed(c);
+  if (!target->effectively_enabled()) return;
   if (target->focusable()) set_focus(target);
   captured_ = target;
   MouseArgs a;
@@ -172,7 +176,7 @@ void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed
 void Window::mouse_wheel(int32_t x, int32_t y, int32_t delta) {
   Point origin;
   Control* target = target_at(x, y, &origin);
-  if (!target || !target->enabled()) return;
+  if (!target || !target->effectively_enabled()) return;
   MouseArgs a;
   a.x = x - origin.x;
   a.y = y - origin.y;
@@ -188,7 +192,7 @@ void Window::key(const KeyArgs& args) {
     return;
   }
   for (Control* c = focus_; c; c = c->parent_)
-    if (c->enabled() && c->on_key(args)) return;
+    if (c->effectively_enabled() && c->on_key(args)) return;
   if (args.usage == hardware::key::kTab) focus_next(!(args.modifiers & hardware::modifier::kShift));
 }
 
@@ -216,9 +220,17 @@ uint32_t Window::collect_focusable(Control* from, Control** out, uint32_t count,
   return count;
 }
 
+void Window::set_focus_scope(Control* scope) {
+  focus_scope_ = scope;
+  if (!scope || (focus_ && is_inside(scope, focus_))) return;
+  Control* order[64];
+  const uint32_t n = collect_focusable(scope, order, 0, 64);
+  set_focus(n ? order[0] : nullptr);
+}
+
 void Window::focus_next(bool forward) {
   Control* order[64];
-  const uint32_t n = collect_focusable(this, order, 0, 64);
+  const uint32_t n = collect_focusable(focus_scope_ ? focus_scope_ : this, order, 0, 64);
   if (n == 0) return;
   uint32_t at = n;  // "none" until found
   for (uint32_t i = 0; i < n; ++i)
@@ -259,6 +271,7 @@ void Window::close_popup() {
 }
 
 void Window::control_removed(Control* control) {
+  if (focus_scope_ && is_inside(control, focus_scope_)) focus_scope_ = nullptr;
   if (focus_ && is_inside(control, focus_)) set_focus(nullptr);
   if (hover_ && is_inside(control, hover_)) hover_ = nullptr;
   if (captured_ && is_inside(control, captured_)) captured_ = nullptr;

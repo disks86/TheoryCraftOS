@@ -81,6 +81,12 @@ class Control {
   void set_visible(bool v) { visible_ = v; invalidate(); }
   bool enabled() const { return enabled_; }
   void set_enabled(bool v) { enabled_ = v; invalidate(); }
+  // False if this control or any ancestor is disabled (a disabled window disables everything in it).
+  bool effectively_enabled() const {
+    for (const Control* c = this; c; c = c->parent_)
+      if (!c->enabled_) return false;
+    return true;
+  }
   bool hovered() const { return hovered_; }
   bool focused() const { return focused_; }
   virtual bool focusable() const { return false; }
@@ -101,6 +107,9 @@ class Control {
   // Return true if the key was used; otherwise it goes to the parent.
   virtual bool on_key(const KeyArgs&) { return false; }
   virtual void on_focus_changed(bool) {}
+  // Called on every ancestor when the mouse goes down on this control or one of its descendants
+  // (before the control itself gets the press): a window manager raises the window that was clicked.
+  virtual void on_descendant_pressed(Control* /*child_of_this*/) {}
   // Called on the owner of a popup (Window::open_popup) when the popup closes.
   virtual void on_popup_closed(Control*) {}
 
@@ -112,6 +121,8 @@ class Control {
   ~Control() = default;
 
   virtual Size default_size() const { return {0, 0}; }
+  // Moves `child` to the end of the child list: painted last (on top) and hit first.
+  bool move_child_to_front(Control* child);
   allocators::IAllocator& allocator() const { return allocator_; }
 
   Rect2D bounds_;

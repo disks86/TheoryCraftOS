@@ -94,6 +94,17 @@ bool Control::remove(Control* child) {
   return false;
 }
 
+bool Control::move_child_to_front(Control* child) {
+  for (uint64_t i = 0; i < children_.count(); ++i) {
+    if (children_[i] != child) continue;
+    for (uint64_t j = i; j + 1 < children_.count(); ++j) children_[j] = children_[j + 1];
+    children_[children_.count() - 1] = child;
+    invalidate();
+    return true;
+  }
+  return false;
+}
+
 Window* Control::window() const {
   for (const Control* c = this; c; c = c->parent_)
     if (c->window_) return c->window_;

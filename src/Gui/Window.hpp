@@ -59,6 +59,10 @@ class Window final : public Control {
   Control* focus() const { return focus_; }
   void set_focus(Control* control);
   void focus_next(bool forward);
+  // Restricts Tab/Shift+Tab (and the initial focus) to the controls inside `scope`, e.g. the active
+  // window; nullptr = the whole tree. If the focus is outside the new scope it moves to the first
+  // focusable control inside it (or to none).
+  void set_focus_scope(Control* scope);
 
   // --- One popup at a time, drawn above the tree and given input first. `owner` is told when it
   // closes. (x, y) is where its top left should go; it is moved to stay inside the window. The popup
@@ -81,6 +85,7 @@ class Window final : public Control {
   const Theme& theme_;
   String title_;
   Control* focus_ = nullptr;
+  Control* focus_scope_ = nullptr;
   Control* hover_ = nullptr;
   Control* captured_ = nullptr;
   Control* popup_ = nullptr;
