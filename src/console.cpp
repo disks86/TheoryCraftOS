@@ -34,4 +34,13 @@ void put_hex(uint64_t v) {
   for (int shift = 60; shift >= 0; shift -= 4)
     putc("0123456789abcdef"[(v >> shift) & 0xF]);
 }
+
+void put_dec(int64_t v) {
+  char digits[21];
+  int n = 0;
+  uint64_t magnitude = v < 0 ? 0 - static_cast<uint64_t>(v) : static_cast<uint64_t>(v);
+  do digits[n++] = static_cast<char>('0' + magnitude % 10); while (magnitude /= 10);
+  if (v < 0) putc('-');
+  while (n) putc(digits[--n]);
+}
 }  // namespace console

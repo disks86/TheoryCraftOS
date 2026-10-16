@@ -12,4 +12,5 @@ void init(efi::SystemTable* st);
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu);
 void puts(const char* s);
 void put_hex(uint64_t v);
+void put_dec(int64_t v);
 }  // namespace console

@@ -16,3 +16,13 @@ tcos_pause:
 tcos_breakpoint:
     int3
     ret
+
+.global tcos_disable_interrupts
+tcos_disable_interrupts:
+    cli
+    ret
+
+.global tcos_enable_interrupts
+tcos_enable_interrupts:
+    sti
+    ret

@@ -72,6 +72,7 @@ struct Trb {
 static_assert(sizeof(Trb) == 16);
 
 enum TrbType : uint32_t {
+  kTrbNormal = 1,
   kTrbSetupStage = 2,
   kTrbDataStage = 3,
   kTrbStatusStage = 4,
@@ -79,6 +80,7 @@ enum TrbType : uint32_t {
   kTrbEnableSlot = 9,
   kTrbDisableSlot = 10,
   kTrbAddressDevice = 11,
+  kTrbConfigureEndpoint = 12,
   kTrbEvaluateContext = 13,
   kTrbNoop = 23,
   kTrbTransferEvent = 32,
@@ -89,6 +91,7 @@ enum TrbType : uint32_t {
 constexpr uint32_t kTrbCycle = 1u << 0;
 constexpr uint32_t kTrbToggleCycle = 1u << 1;  // on Link TRBs
 constexpr uint32_t kTrbIoc = 1u << 5;
+constexpr uint32_t kTrbInterruptOnShortPacket = 1u << 2;
 constexpr uint32_t kTrbImmediateData = 1u << 6;
 constexpr uint32_t kTrbDirectionIn = 1u << 16;  // data/status stage direction
 

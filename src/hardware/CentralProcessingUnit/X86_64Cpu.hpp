@@ -21,6 +21,8 @@ class X86_64Cpu : public ICentralProcessingUnit {
   void halt() const override;
   void pause() const override;
   void breakpoint() const override;
+  void disable_interrupts() const override;
+  void enable_interrupts() const override;
 
   uint32_t core_count() const override { return cores_; }
   uint32_t current_core() const override;

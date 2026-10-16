@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include "hardware/Bus/IBus.hpp"
+#include "hardware/Bus/Usb/IUsbHostController.hpp"
 #include "hardware/Bus/Usb/UsbTypes.hpp"
 
 namespace hardware {
@@ -17,6 +18,8 @@ class IUsbBus : public IBus {
   virtual bool port_info(uint32_t controller, uint32_t port, UsbPortInfo* out) const = 0;
   // Device descriptor of the device enumerated on a root port; false if none.
   virtual bool device_descriptor(uint32_t controller, uint32_t port, UsbDeviceDescriptor* out) const = 0;
+  // The driver for a controller (to talk to its devices), or nullptr if it has none.
+  virtual IUsbHostController* host_controller(uint32_t controller) = 0;
 
  protected:
   constexpr IUsbBus() = default;

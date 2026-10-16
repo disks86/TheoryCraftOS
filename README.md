@@ -35,10 +35,18 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
     - `Usb/`: `IUsbBus` and `UsbBus` (finds host controllers on PCI), `IUsbHostController` (one controller:
       ports, enumerated device descriptors) and `UsbTypes.hpp`. `Usb/Xhci/` holds `IXhciController` and the
       polling `XhciController` driver (firmware hand-off, reset, command/event rings, port reset, slot
-      enable, address device, control transfers) plus its ring and register helpers. At boot it enumerates
-      every device on the root ports and reads its device descriptor, then returns the controller to the
-      firmware. UHCI/OHCI/EHCI are identified only. No hubs, configuration or class drivers yet.
+      enable, address device, control and interrupt-IN transfers, configuration) plus its ring and register helpers. At boot it enumerates
+      every device on the root ports and reads its descriptors; HID class drivers (keyboard, mouse, tablet)
+      build on it. UHCI/OHCI/EHCI are identified only, and hubs and other device classes are not handled.
     - `SystemPciBus` picks PCIe/ECAM when firmware provides MCFG, else legacy PCI.
+  - `hardware/Keyboard/`, `hardware/Mouse/`: `IKeyboard` (key press/release events as USB HID usages, polled)
+    and `IMouse` (relative movement or absolute position, wheel, buttons), with shared queue bases and
+    `Composite*` classes that merge several devices. One subfolder per transport QEMU offers:
+    `Ps2/` (i8042 keyboard with set-1 decoding, mouse with IntelliMouse wheel), `Usb/` (HID keyboard in boot
+    protocol; mouse and tablet through a HID report-descriptor parser) and `Virtio/` (virtio-input keyboard,
+    mouse and tablet). `hardware/SystemInput` finds all of them and exposes one keyboard and one mouse.
+  - `hardware/Bus/Ps2/` (`I8042Controller`) and `hardware/Bus/Virtio/` (modern virtio-PCI transport,
+    virtqueues, `VirtioInputDevice`); `Bus/Usb/Hid/` has the report-descriptor parser and interface finder.
   - `hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup).
   - `hardware/RandomAccessMemory/`, `NeuralProcessingUnit/`: `IRandomAccessMemory` (implemented by
     `UefiRandomAccessMemory`) and `INeuralProcessingUnit` (no implementation yet).

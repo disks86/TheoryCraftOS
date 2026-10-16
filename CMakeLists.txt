@@ -34,6 +34,24 @@ add_executable(BOOTX64
   src/hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
   src/hardware/TextConsole.cpp
   src/hardware/Acpi/AcpiTables.cpp
+  src/hardware/Keyboard/KeyCodes.cpp
+  src/hardware/Keyboard/KeyboardBase.cpp
+  src/hardware/Keyboard/CompositeKeyboard.cpp
+  src/hardware/Keyboard/Ps2/Ps2Keyboard.cpp
+  src/hardware/Mouse/MouseBase.cpp
+  src/hardware/Mouse/CompositeMouse.cpp
+  src/hardware/Mouse/Ps2/Ps2Mouse.cpp
+  src/hardware/Bus/Ps2/I8042Controller.cpp
+  src/hardware/Bus/Usb/Hid/HidReportParser.cpp
+  src/hardware/Bus/Usb/Hid/UsbHidInterface.cpp
+  src/hardware/Bus/Virtio/Virtqueue.cpp
+  src/hardware/Bus/Virtio/VirtioPciDevice.cpp
+  src/hardware/Bus/Virtio/VirtioInputDevice.cpp
+  src/hardware/Keyboard/Usb/UsbHidKeyboard.cpp
+  src/hardware/Keyboard/Virtio/VirtioKeyboard.cpp
+  src/hardware/Mouse/Usb/UsbHidMouse.cpp
+  src/hardware/Mouse/Virtio/VirtioMouse.cpp
+  src/hardware/SystemInput.cpp
   src/hardware/Bus/Pci/LegacyPciBus.cpp
   src/hardware/Bus/Pcie/EcamPcieBus.cpp
   src/hardware/Bus/Pci/FirmwareDriverDetach.cpp

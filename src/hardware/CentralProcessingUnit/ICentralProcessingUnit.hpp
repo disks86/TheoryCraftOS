@@ -31,6 +31,10 @@ class ICentralProcessingUnit : public IHardware {
   virtual void halt() const = 0;        // stop until the next interrupt
   virtual void pause() const = 0;       // spin-wait hint
   virtual void breakpoint() const = 0;  // trap into an attached debugger
+  // Masks / unmasks interrupts on the calling core. With interrupts masked the
+  // firmware's timer-driven drivers (e.g. its PS/2 polling) stop running.
+  virtual void disable_interrupts() const = 0;
+  virtual void enable_interrupts() const = 0;
 
  protected:
   constexpr ICentralProcessingUnit() = default;

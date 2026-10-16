@@ -32,9 +32,33 @@ class XhciController final : public IXhciController {
   uint32_t port_count() const override { return ports_; }
   bool port_info(uint32_t port, UsbPortInfo* out) const override;
   bool device_descriptor(uint32_t port, UsbDeviceDescriptor* out) const override;
+  bool configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity,
+                                uint16_t* length) const override;
+  bool set_configuration(uint32_t port, uint8_t configuration) override;
+  bool control_out(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
+                   uint16_t index) override;
+  bool control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
+                  uint16_t index, void* buffer, uint16_t length) override;
+  bool start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
+                          uint8_t interval) override;
+  bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
+                         uint16_t* length) override;
 
  private:
+  struct InterruptEndpoint {
+    bool active = false;
+    uint8_t address = 0;      // USB endpoint address (0x81 = endpoint 1 IN)
+    uint8_t context_id = 0;   // device context index used for doorbells
+    uint16_t max_packet = 0;
+    xhci::ProducerRing ring;
+    uint8_t* buffer = nullptr;
+    uint64_t pending_trb = 0;  // the TRB the controller is working on
+    bool ready = false;        // a packet is waiting in buffer
+    uint16_t received = 0;
+  };
+
   struct Device {
+    static constexpr uint32_t kMaxEndpoints = 4;
     bool present = false;
     uint8_t slot = 0;
     uint32_t speed_id = 0;
@@ -43,6 +67,11 @@ class XhciController final : public IXhciController {
     uint8_t* input_context = nullptr;
     xhci::ProducerRing control_ring;
     UsbDeviceDescriptor descriptor{};
+    uint8_t config[256] = {};
+    uint16_t config_length = 0;
+    uint8_t configuration = 0;   // value passed to SET_CONFIGURATION, 0 = none yet
+    uint8_t context_entries = 1;  // highest endpoint context index in use
+    InterruptEndpoint endpoints[kMaxEndpoints];
   };
 
   // Bring-up steps.
@@ -61,8 +90,11 @@ class XhciController final : public IXhciController {
   bool enumerate_port(uint32_t port);
   bool address_device(uint32_t port, Device& d);
   bool update_max_packet(Device& d, uint16_t max_packet);
-  bool control_in(Device& d, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
-                  uint16_t length);
+  bool transfer(Device& d, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
+                uint16_t length, bool data_in);
+  void handle_event(const xhci::Trb& event);
+  void pump_events();
+  void arm_endpoint(Device& d, InterruptEndpoint& e);
   void release_device(Device& d);
 
   bool dma_reachable(const void* p) const;

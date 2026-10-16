@@ -5,6 +5,8 @@
 #include "hardware/Bus/Usb/UsbBus.hpp"
 #include "hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "hardware/SystemHardware.hpp"
+#include "hardware/SystemInput.hpp"
+#include "hardware/Keyboard/KeyCodes.hpp"
 #include "uefi.hpp"
 
 // gdb: `set var g_debugger_attached = 1` releases the boot-time spin loop.
@@ -35,16 +37,69 @@ static void demo_task(void* context) {
   __atomic_fetch_add(&state->done, 1, __ATOMIC_SEQ_CST);
 }
 
-static void kernel_main(efi::SystemTable* st) {
+static void print_key(const hardware::KeyEvent& key, uint8_t modifiers) {
+  console::puts("KEY ");
+  console::put_hex(key.usage);
+  console::puts(key.pressed ? " down" : " up");
+  if (char c = hardware::key_to_ascii(key.usage, modifiers)) {
+    const char text[2] = {c, 0};
+    console::puts(" '");
+    console::puts(c == '\n' ? "\\n" : c == '\b' ? "\\b" : c == '\t' ? "\\t" : c == 0x1b ? "esc" : text);
+    console::puts("'");
+  }
+  console::puts("\n");
+}
+
+static void print_mouse(const hardware::MouseEvent& m) {
+  if (m.absolute) {
+    console::puts("TABLET x=");
+    console::put_dec(m.x);
+    console::puts("/");
+    console::put_dec(m.max_x);
+    console::puts(" y=");
+    console::put_dec(m.y);
+    console::puts("/");
+    console::put_dec(m.max_y);
+  } else {
+    console::puts("MOUSE dx=");
+    console::put_dec(m.dx);
+    console::puts(" dy=");
+    console::put_dec(m.dy);
+  }
+  console::puts(" wheel=");
+  console::put_dec(m.wheel);
+  console::puts(" buttons=");
+  console::put_dec(m.buttons);
+  console::puts("\n");
+}
+
+// Shows keyboard and mouse events until 'q' is pressed. With no keyboard at all
+// it falls back to the firmware's console input.
+static void kernel_main(efi::SystemTable* st, hardware::SystemInput& input) {
   console::puts("Hello from TheoryCraftOS!\n");
   console::puts("Firmware revision: ");
   console::put_hex(st->hdr.revision);
   console::puts("\n");
 
-  console::puts("Press any key to shut down.\n");
-  efi::InputKey key;
-  while (st->con_in->read_key_stroke(st->con_in, &key) != efi::kSuccess)
-    st->boot_services->stall(10000);
+  if (input.keyboards().count() == 0) {
+    console::puts("No keyboard found; press any key (firmware input) to shut down.\n");
+    efi::InputKey key;
+    while (st->con_in->read_key_stroke(st->con_in, &key) != efi::kSuccess)
+      st->boot_services->stall(10000);
+    return;
+  }
+
+  console::puts("INPUT READY: type, move the mouse; press q to shut down.\n");
+  for (;;) {
+    hardware::KeyEvent key;
+    while (input.keyboard().poll(&key)) {
+      print_key(key, input.keyboard().modifiers());
+      if (key.pressed && key.usage == hardware::key::kA + ('q' - 'a')) return;
+    }
+    hardware::MouseEvent mouse;
+    while (input.mouse().poll(&mouse)) print_mouse(mouse);
+    st->boot_services->stall(5000);
+  }
 }
 
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
@@ -168,11 +223,31 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::put_hex(demo.cores_used);
   console::puts("\n");
 
-  // Done with USB for now: hand the controllers back so the firmware's USB
-  // keyboard works for the prompt below.
-  usb.shutdown();
+  // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
+  hardware::SystemInput input(pci, usb, allocator, st);
+  input.initialize();
+  console::puts("Input: ");
+  console::put_dec(input.keyboards().count());
+  console::puts(" keyboards, ");
+  console::put_dec(input.mice().count());
+  console::puts(" mice\n");
+  for (uint32_t i = 0; i < input.keyboards().count(); ++i) {
+    console::puts("  ");
+    console::puts(input.keyboards().at(i)->name());
+    console::puts("\n");
+  }
+  for (uint32_t i = 0; i < input.mice().count(); ++i) {
+    console::puts("  ");
+    console::puts(input.mice().at(i)->name());
+    console::puts("\n");
+  }
 
-  kernel_main(st);
+  // The firmware polls PS/2 from its timer interrupt and would steal our bytes.
+  cpu.disable_interrupts();
+  kernel_main(st, input);
+  cpu.enable_interrupts();
+  input.shutdown();
+  usb.shutdown();  // resets the USB controllers and returns them to the firmware
 
   allocator.deallocate(allocator.allocate(1));  // exercise the pool once
   ram.shutdown();

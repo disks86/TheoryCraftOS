@@ -216,7 +216,7 @@ bool XhciController::wait_event(uint32_t type, uint64_t pointer, Trb* out, uint3
         *out = event;
         return true;
       }
-      // Anything else (e.g. port status changes) is dropped: ports are polled.
+      handle_event(event);  // interrupt-endpoint data that arrived while we waited
     }
     delay_us(100);
   }
@@ -267,12 +267,20 @@ void XhciController::release_device(Device& d) {
     run_command(0, (kTrbDisableSlot << 10) | (uint32_t{d.slot} << 24), &completion);
     dcbaa_[d.slot] = 0;
   }
+  for (InterruptEndpoint& e : d.endpoints) {
+    e.ring.release(allocator_);
+    allocator_.deallocate(e.buffer);
+    e = InterruptEndpoint{};
+  }
   allocator_.deallocate(d.output_context);
   allocator_.deallocate(d.input_context);
   d.control_ring.release(allocator_);
   d.output_context = d.input_context = nullptr;
   d.present = false;
   d.slot = 0;
+  d.configuration = 0;
+  d.context_entries = 1;
+  d.config_length = 0;
 }
 
 bool XhciController::enumerate_port(uint32_t port) {
@@ -285,7 +293,7 @@ bool XhciController::enumerate_port(uint32_t port) {
   }
 
   // The first 8 bytes of the device descriptor tell the real EP0 packet size.
-  if (!control_in(d, 0x80, 6, 0x0100, 0, 8)) {
+  if (!transfer(d, 0x80, 6, 0x0100, 0, 8, true)) {
     release_device(d);
     return false;
   }
@@ -296,12 +304,22 @@ bool XhciController::enumerate_port(uint32_t port) {
     return false;
   }
 
-  if (!control_in(d, 0x80, 6, 0x0100, 0, sizeof(UsbDeviceDescriptor))) {
+  if (!transfer(d, 0x80, 6, 0x0100, 0, sizeof(UsbDeviceDescriptor), true)) {
     release_device(d);
     return false;
   }
   __builtin_memcpy(&d.descriptor, buffer_, sizeof(UsbDeviceDescriptor));
   d.present = true;
+
+  // Cache the first configuration (interfaces/endpoints) for class drivers. A
+  // device without a readable one is still enumerated, just not usable by them.
+  if (transfer(d, 0x80, 6, 0x0200, 0, 9, true)) {
+    uint16_t total = buffer_[2] | (buffer_[3] << 8);
+    if (total >= 9 && total <= sizeof(d.config) && transfer(d, 0x80, 6, 0x0200, 0, total, true)) {
+      __builtin_memcpy(d.config, buffer_, total);
+      d.config_length = total;
+    }
+  }
   return true;
 }
 
@@ -355,24 +373,183 @@ bool XhciController::update_max_packet(Device& d, uint16_t max_packet) {
   return true;
 }
 
-// Device-to-host control transfer on endpoint 0; the data lands in buffer_.
-bool XhciController::control_in(Device& d, uint8_t request_type, uint8_t request, uint16_t value,
-                                uint16_t index, uint16_t length) {
-  __builtin_memset(buffer_, 0, length);
+// Control transfer on endpoint 0. With data_in the data lands in buffer_;
+// otherwise there is no data stage. (`length` is the wLength field.)
+bool XhciController::transfer(Device& d, uint8_t request_type, uint8_t request, uint16_t value,
+                              uint16_t index, uint16_t length, bool data_in) {
+  if (data_in) __builtin_memset(buffer_, 0, length);
   const uint64_t setup = uint64_t{request_type} | (uint64_t{request} << 8) | (uint64_t{value} << 16) |
                          (uint64_t{index} << 32) | (uint64_t{length} << 48);
-  constexpr uint32_t kTransferTypeIn = 3u << 16;  // setup TRB TRT field
+  constexpr uint32_t kTransferTypeIn = 3u << 16;  // setup TRB TRT field; 0 = no data stage
 
-  d.control_ring.push(setup, 8, (kTrbSetupStage << 10) | kTrbImmediateData | kTransferTypeIn);
-  d.control_ring.push(reinterpret_cast<uint64_t>(buffer_), length, (kTrbDataStage << 10) | kTrbDirectionIn);
-  const uint64_t status_trb =
-      d.control_ring.push(0, 0, (kTrbStatusStage << 10) | kTrbIoc);  // status stage runs host-to-device
+  d.control_ring.push(setup, 8,
+                      (kTrbSetupStage << 10) | kTrbImmediateData | (data_in ? kTransferTypeIn : 0));
+  if (data_in)
+    d.control_ring.push(reinterpret_cast<uint64_t>(buffer_), length,
+                        (kTrbDataStage << 10) | kTrbDirectionIn);
+  // The status stage runs opposite to the data: host-to-device after an IN data
+  // stage, device-to-host when there was no data stage.
+  const uint64_t status_trb = d.control_ring.push(
+      0, 0, (kTrbStatusStage << 10) | kTrbIoc | (data_in ? 0 : kTrbDirectionIn));
   ring_doorbell(d.slot, 1);  // endpoint context index 1 = EP0
 
   Trb event;
   if (!wait_event(kTrbTransferEvent, status_trb, &event, kRingTimeoutMs)) return false;
   const uint32_t code = completion_code(event.status);
   return code == kCompletionSuccess || code == kCompletionShortPacket;
+}
+
+// ---------------------------------------------------------- class driver API
+
+bool XhciController::configuration_descriptor(uint32_t port, uint8_t* buffer, uint16_t capacity,
+                                              uint16_t* length) const {
+  if (port >= ports_ || !devices_[port].present || !devices_[port].config_length || !buffer) return false;
+  const Device& d = devices_[port];
+  const uint16_t n = d.config_length < capacity ? d.config_length : capacity;
+  __builtin_memcpy(buffer, d.config, n);
+  if (length) *length = d.config_length;
+  return true;
+}
+
+bool XhciController::set_configuration(uint32_t port, uint8_t configuration) {
+  if (port >= ports_ || !devices_[port].present) return false;
+  Device& d = devices_[port];
+  if (d.configuration == configuration) return true;
+  if (!transfer(d, 0x00, 9, configuration, 0, 0, false)) return false;
+  d.configuration = configuration;
+  return true;
+}
+
+bool XhciController::control_out(uint32_t port, uint8_t request_type, uint8_t request,
+                                 uint16_t value, uint16_t index) {
+  if (port >= ports_ || !devices_[port].present) return false;
+  return transfer(devices_[port], request_type, request, value, index, 0, false);
+}
+
+bool XhciController::control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
+                                uint16_t index, void* buffer, uint16_t length) {
+  if (port >= ports_ || !devices_[port].present || !buffer || length > 4096) return false;
+  if (!transfer(devices_[port], request_type, request, value, index, length, true)) return false;
+  __builtin_memcpy(buffer, buffer_, length);
+  return true;
+}
+
+void XhciController::arm_endpoint(Device& d, InterruptEndpoint& e) {
+  e.ready = false;
+  e.pending_trb = e.ring.push(reinterpret_cast<uint64_t>(e.buffer), e.max_packet,
+                              (kTrbNormal << 10) | kTrbIoc | kTrbInterruptOnShortPacket);
+  ring_doorbell(d.slot, e.context_id);
+}
+
+bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
+                                        uint8_t interval) {
+  if (port >= ports_ || !devices_[port].present || !(endpoint_address & 0x80)) return false;
+  Device& d = devices_[port];
+  InterruptEndpoint* e = nullptr;
+  for (InterruptEndpoint& candidate : d.endpoints) {
+    if (candidate.active && candidate.address == endpoint_address) return true;  // already running
+    if (!candidate.active && !e) e = &candidate;
+  }
+  if (!e) return false;
+
+  const uint8_t dci = (endpoint_address & 0x0F) * 2 + 1;  // IN endpoints are odd
+  e->address = endpoint_address;
+  e->context_id = dci;
+  e->max_packet = max_packet;
+  e->buffer = static_cast<uint8_t*>(allocator_.allocate_aligned(max_packet < 64 ? 64 : max_packet, 64));
+  if (!e->buffer || !e->ring.init(allocator_) || !dma_reachable(e->buffer)) {
+    e->ring.release(allocator_);
+    allocator_.deallocate(e->buffer);
+    e->buffer = nullptr;
+    return false;
+  }
+
+  // Configure Endpoint: the input slot context starts as a copy of the live one.
+  const uint32_t context_bytes = 33 * context_size_;
+  __builtin_memset(d.input_context, 0, context_bytes);
+  if (dci > d.context_entries) d.context_entries = dci;
+  auto* control = reinterpret_cast<uint32_t*>(context_at(d.input_context, 0));
+  control[1] = (1u << 0) | (1u << dci);  // add: slot context and this endpoint
+  auto* slot = reinterpret_cast<uint32_t*>(context_at(d.input_context, 1));
+  __builtin_memcpy(slot, context_at(d.output_context, 0), 8 * sizeof(uint32_t));
+  slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
+
+  // xHCI interval is 2^n * 125 us. Full/low speed bInterval counts 1 ms frames;
+  // high/super speed bInterval is already an exponent plus one.
+  uint32_t n;
+  if (d.speed_id <= 2) {
+    n = 3;
+    while (n < 10 && (1u << (n - 3)) < interval) ++n;
+  } else {
+    n = interval ? interval - 1 : 0;
+    if (n > 15) n = 15;
+  }
+  auto* ep = reinterpret_cast<uint32_t*>(context_at(d.input_context, dci + 1));
+  ep[0] = n << 16;
+  ep[1] = (3u << 1) | (7u << 3) | (uint32_t{max_packet} << 16);  // CErr 3, interrupt IN
+  const uint64_t ring = e->ring.address() | e->ring.cycle();
+  ep[2] = static_cast<uint32_t>(ring);
+  ep[3] = static_cast<uint32_t>(ring >> 32);
+  ep[4] = (uint32_t{max_packet} << 16) | max_packet;  // max ESIT payload, average TRB length
+
+  Trb completion;
+  if (!run_command(reinterpret_cast<uint64_t>(d.input_context),
+                   (kTrbConfigureEndpoint << 10) | (uint32_t{d.slot} << 24), &completion)) {
+    e->ring.release(allocator_);
+    allocator_.deallocate(e->buffer);
+    e->buffer = nullptr;
+    return false;
+  }
+  e->active = true;
+  arm_endpoint(d, *e);
+  return true;
+}
+
+void XhciController::handle_event(const Trb& event) {
+  if (trb_type(event.control) != kTrbTransferEvent) return;  // port changes etc.: ports are polled
+  const uint32_t slot = event.control >> 24;
+  const uint32_t endpoint_id = (event.control >> 16) & 0x1F;
+  for (Device& d : devices_) {
+    if (!d.slot || d.slot != slot) continue;
+    for (InterruptEndpoint& e : d.endpoints) {
+      if (!e.active || e.context_id != endpoint_id || e.pending_trb != event.parameter) continue;
+      const uint32_t code = completion_code(event.status);
+      if (code == kCompletionSuccess || code == kCompletionShortPacket) {
+        const uint32_t residual = event.status & 0xFFFFFF;
+        e.received = residual < e.max_packet ? e.max_packet - residual : 0;
+        e.ready = true;
+      }
+      return;
+    }
+  }
+}
+
+void XhciController::pump_events() {
+  const uint64_t interrupter = runtime_ + kRtInterrupter0;
+  Trb event;
+  bool any = false;
+  while (event_ring_.pop(&event)) {
+    handle_event(event);
+    any = true;
+  }
+  if (any) write64(interrupter + kIrDequeue, event_ring_.dequeue_address() | kIrDequeueBusy);
+}
+
+bool XhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer,
+                                       uint16_t capacity, uint16_t* length) {
+  if (port >= ports_ || !devices_[port].present || !buffer) return false;
+  Device& d = devices_[port];
+  pump_events();
+  for (InterruptEndpoint& e : d.endpoints) {
+    if (!e.active || e.address != endpoint_address) continue;
+    if (!e.ready) return false;
+    const uint16_t n = e.received < capacity ? e.received : capacity;
+    __builtin_memcpy(buffer, e.buffer, n);
+    if (length) *length = e.received;
+    arm_endpoint(d, e);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace hardware

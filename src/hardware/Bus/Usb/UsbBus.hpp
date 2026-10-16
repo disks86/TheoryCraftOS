@@ -28,6 +28,9 @@ class UsbBus final : public IUsbBus {
   uint32_t port_count(uint32_t controller) const override;
   bool port_info(uint32_t controller, uint32_t port, UsbPortInfo* out) const override;
   bool device_descriptor(uint32_t controller, uint32_t port, UsbDeviceDescriptor* out) const override;
+  IUsbHostController* host_controller(uint32_t controller) override {
+    return controller < controller_count_ ? controllers_[controller].host : nullptr;
+  }
 
  private:
   struct Controller {
