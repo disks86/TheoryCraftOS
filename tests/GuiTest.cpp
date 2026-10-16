@@ -595,6 +595,58 @@ static void test_input_pump() {
   CHECK(a.live == 0);
 }
 
+struct FakeClock {
+  desktop::DateTime now;
+  bool ok = true;
+  int reads = 0;
+  static bool read(void* context, desktop::DateTime* out) {
+    auto* c = static_cast<FakeClock*>(context);
+    ++c->reads;
+    if (c->ok) *out = c->now;
+    return c->ok;
+  }
+};
+
+static void test_clock() {
+  char text[24];
+  auto fmt = [&](uint16_t y, uint8_t mo, uint8_t d, uint8_t h, uint8_t mi) {
+    desktop::DateTime t; t.year = y; t.month = mo; t.day = d; t.hour = h; t.minute = mi;
+    return desktop::format_date_time(t, text) == 19 && text[19] == 0;
+  };
+  CHECK(fmt(2026, 10, 16, 18, 5) && strcmp(text, "10/16/2026 06:05 PM") == 0);
+  CHECK(fmt(2026, 1, 2, 0, 0) && strcmp(text, "01/02/2026 12:00 AM") == 0);   // midnight
+  CHECK(fmt(2026, 1, 2, 12, 30) && strcmp(text, "01/02/2026 12:30 PM") == 0);  // noon
+  CHECK(fmt(2026, 12, 31, 23, 59) && strcmp(text, "12/31/2026 11:59 PM") == 0);
+  CHECK(fmt(2026, 6, 9, 11, 7) && strcmp(text, "06/09/2026 11:07 AM") == 0);
+  CHECK(fmt(1999, 3, 4, 1, 9) && strcmp(text, "03/04/1999 01:09 AM") == 0);
+
+  TestAllocator a;
+  {
+    Screen screen(a, 640, 480);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    CHECK(d.clock_text().equals("--/--/---- --:-- --"));
+    FakeClock clock;
+    clock.now.year = 2026; clock.now.month = 10; clock.now.day = 16; clock.now.hour = 18; clock.now.minute = 5;
+    d.set_clock_source(FakeClock::read, &clock);
+    d.step(0);
+    CHECK(d.clock_text().equals("10/16/2026 06:05 PM") && clock.reads == 1);
+    d.step(500000);                       // same second: the source is not read again
+    CHECK(clock.reads == 1);
+    clock.now.minute = 6;
+    d.step(1000000);                      // next second: read, minute changed
+    CHECK(clock.reads == 2 && d.clock_text().equals("10/16/2026 06:06 PM"));
+    clock.ok = false;                     // a failing source shows placeholders
+    d.step(2000000);
+    CHECK(d.clock_text().equals("--/--/---- --:-- --"));
+    clock.ok = true; clock.now.hour = 0; clock.now.minute = 0; clock.now.day = 17;
+    d.step(3000000);
+    CHECK(d.clock_text().equals("10/17/2026 12:00 AM"));
+    // The text fits the tray: drawn without clipping the last character (the label is 19 glyphs wide).
+    CHECK(d.window().hit_test(640 - 8, 480 - 10) != nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_desktop() {
   TestAllocator a;
   {
@@ -607,7 +659,7 @@ static void test_desktop() {
     CHECK(!d.shutdown_requested());
     CHECK(d.step(0));  // first frame draws
     CHECK(!d.step(500000));  // nothing changed
-    CHECK(d.step(1000000));  // the clock ticked
+    CHECK(!d.step(1000000));  // no clock source: nothing to refresh
     // The taskbar runs along the bottom and the Start button sits at its left end.
     const Point o = start.window_origin();
     CHECK(o.x == 4 && o.y == 480 - desktop::Desktop::kTaskbarHeight + 4);
@@ -651,6 +703,7 @@ int main() {
   test_rendering();
   test_input_pump();
   test_desktop();
+  test_clock();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui: all checks passed\n");
   return 0;

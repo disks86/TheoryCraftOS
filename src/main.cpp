@@ -17,6 +17,7 @@
  */
 
 #include "Kernel/Delay.hpp"
+#include "Kernel/Firmware.hpp"
 #include "Allocators/Allocator.hpp"
 #include "Allocators/ThreadSafeAllocator.hpp"
 #include "CPUScheduler/Scheduler.hpp"
@@ -98,6 +99,22 @@ static void wait_for_key(efi::SystemTable* st, hardware::SystemInput& input, uin
     }
     hardware::delay_us(10000);
   }
+}
+
+// The taskbar clock: the firmware's real-time clock, whose fields are local time (QEMU: -rtc base=localtime).
+static bool read_local_time(void* context, desktop::DateTime* out) {
+  auto* st = static_cast<efi::SystemTable*>(context);
+  efi::Time t{};
+  efi::Status status = efi::kSuccess;
+  kernel::firmware([&] { status = st->runtime_services->get_time(&t, nullptr); });
+  if (status != efi::kSuccess || t.month < 1 || t.month > 12 || t.day < 1 || t.day > 31 || t.hour > 23 || t.minute > 59)
+    return false;
+  out->year = t.year;
+  out->month = t.month;
+  out->day = t.day;
+  out->hour = t.hour;
+  out->minute = t.minute;
+  return true;
 }
 
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
@@ -359,6 +376,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (renderer) {
     desktop::Desktop desktop(shared_allocator, *renderer, input.keyboards().count() ? &input.keyboard() : nullptr,
                              input.mice().count() ? &input.mouse() : nullptr);
+    desktop.set_clock_source(read_local_time, st);
     while (!desktop.shutdown_requested()) {
       desktop.step(hardware::uptime_us());
       hardware::delay_us(4000);

@@ -58,7 +58,7 @@ def start_qemu(build):
         os.chmod(vars_fd, 0o644)
     log = os.path.join(build, "debugcon.log")
     cmd = [
-        "qemu-system-x86_64", "-machine", "q35", "-smp", os.environ.get("QEMU_SMP", "4"), "-m", "256M", "-net", "none",
+        "qemu-system-x86_64", "-machine", "q35", "-smp", os.environ.get("QEMU_SMP", "4"), "-m", "256M", "-net", "none", "-rtc", "base=localtime",
         # The tablet gives the desktop an absolute pointer: no click-to-grab, and the host pointer maps
         # straight onto the guest's (relative PS/2 grabbing is unreliable under Wayland).
         "-device", "virtio-tablet-pci",

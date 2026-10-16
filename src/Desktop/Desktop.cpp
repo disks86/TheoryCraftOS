@@ -46,9 +46,9 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
 
   tray_.set_style(PanelStyle::Sunken);
   tray_.set_dock(DockStyle::Right);
-  tray_.set_size(110, 0);
+  tray_.set_size(180, 0);
   clock_.set_dock(DockStyle::Fill);
-  clock_.set_text("Up 00:00:00");
+  clock_.set_text("--/--/---- --:-- --");
   tray_.add(&clock_);
 
   taskbar_.add(&start_);
@@ -64,21 +64,48 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
 
 void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->shutdown_requested_ = true; }
 
+uint32_t format_date_time(const DateTime& t, char* out) {
+  auto two = [&](uint32_t at, uint32_t v) {
+    out[at] = static_cast<char>('0' + (v / 10) % 10);
+    out[at + 1] = static_cast<char>('0' + v % 10);
+  };
+  uint32_t hour12 = t.hour % 12;
+  if (hour12 == 0) hour12 = 12;
+  two(0, t.month);
+  out[2] = '/';
+  two(3, t.day);
+  out[5] = '/';
+  two(6, t.year / 100);
+  two(8, t.year % 100);
+  out[10] = ' ';
+  two(11, hour12);
+  out[13] = ':';
+  two(14, t.minute);
+  out[16] = ' ';
+  out[17] = t.hour < 12 ? 'A' : 'P';
+  out[18] = 'M';
+  out[19] = 0;
+  return 19;
+}
+
 bool Desktop::step(uint64_t uptime_us) {
   input_.pump();
-  const uint64_t seconds = uptime_us / 1000000;
-  if (seconds != shown_seconds_) {
-    shown_seconds_ = seconds;
-    // "Up HH:MM:SS"
-    char text[16] = {'U', 'p', ' ', 0, 0, ':', 0, 0, ':', 0, 0, 0};
-    const uint64_t h = (seconds / 3600) % 100, m = (seconds / 60) % 60, sec = seconds % 60;
-    text[3] = static_cast<char>('0' + h / 10);
-    text[4] = static_cast<char>('0' + h % 10);
-    text[6] = static_cast<char>('0' + m / 10);
-    text[7] = static_cast<char>('0' + m % 10);
-    text[9] = static_cast<char>('0' + sec / 10);
-    text[10] = static_cast<char>('0' + sec % 10);
-    clock_.set_text(StringView(text, 11));
+  const uint64_t second = uptime_us / 1000000;
+  if (second != polled_second_) {
+    polled_second_ = second;
+    DateTime now;
+    const bool ok = clock_source_ && clock_source_(clock_context_, &now);
+    // The label only changes when the minute does; ~0 stands for "no time".
+    const uint64_t packed = ok ? ((((uint64_t{now.year} * 13 + now.month) * 32 + now.day) * 24 + now.hour) * 60 + now.minute) : ~0ull - 1;
+    if (packed != shown_) {
+      shown_ = packed;
+      char text[24];
+      if (ok) {
+        clock_.set_text(StringView(text, format_date_time(now, text)));
+      } else {
+        clock_.set_text("--/--/---- --:-- --");
+      }
+    }
   }
   if (!window_.dirty()) return false;
   window_.render();

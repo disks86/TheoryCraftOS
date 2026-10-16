@@ -30,6 +30,18 @@
 
 namespace desktop {
 
+struct DateTime {
+  uint16_t year = 0;
+  uint8_t month = 0, day = 0;  // 1-based
+  uint8_t hour = 0, minute = 0;  // 24-hour clock
+};
+
+// Where the taskbar clock gets the local time from; false if it cannot be read right now.
+using ClockSource = bool (*)(void* context, DateTime* out);
+
+// "MM/dd/yyyy hh:mm AM" - 12-hour clock, always 19 characters. `out` needs room for 20. Returns the length.
+uint32_t format_date_time(const DateTime& time, char* out);
+
 class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
@@ -42,11 +54,14 @@ class Desktop {
 
   gui::Window& window() { return window_; }
   gui::MenuButton& start_button() { return start_; }
+  StringView clock_text() const { return clock_.text(); }
   bool shutdown_requested() const { return shutdown_requested_; }
   void request_shutdown() { shutdown_requested_ = true; }
+  // The clock shows "--/--/---- --:-- --" until a source is set (and while it fails).
+  void set_clock_source(ClockSource source, void* context) { clock_source_ = source; clock_context_ = context; shown_ = ~0ull; }
 
-  // One turn of the event loop: delivers pending input, refreshes the clock from `uptime_us`
-  // and redraws if anything changed. Returns whether it drew.
+  // One turn of the event loop: delivers pending input, refreshes the clock (reads the source at most
+  // once per second of `uptime_us`) and redraws if anything changed. Returns whether it drew.
   bool step(uint64_t uptime_us);
 
  private:
@@ -60,7 +75,10 @@ class Desktop {
   gui::MenuButton start_;
   gui::Panel tray_;
   gui::Label clock_;
-  uint64_t shown_seconds_ = ~0ull;
+  ClockSource clock_source_ = nullptr;
+  void* clock_context_ = nullptr;
+  uint64_t polled_second_ = ~0ull;  // the uptime second the source was last read in
+  uint64_t shown_ = ~0ull;          // what the label shows, packed (see step())
   bool shutdown_requested_ = false;
 };
 

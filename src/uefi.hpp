@@ -150,9 +150,28 @@ struct BootServices {
 
 enum class ResetType : uint32_t { Cold, Warm, Shutdown };
 
+// EFI_TIME: the real-time clock, as the firmware reports it.
+struct Time {
+  uint16_t year;  // 1900..9999
+  uint8_t month;  // 1..12
+  uint8_t day;    // 1..31
+  uint8_t hour, minute, second;
+  uint8_t pad1;
+  uint32_t nanosecond;
+  int16_t time_zone;  // minutes from UTC, or kUnspecifiedTimeZone: the fields are local time
+  uint8_t daylight;
+  uint8_t pad2;
+};
+constexpr int16_t kUnspecifiedTimeZone = 0x07FF;
+
+struct TimeCapabilities {
+  uint32_t resolution, accuracy;
+  uint8_t sets_to_zero;
+};
+
 struct RuntimeServices {
   TableHeader hdr;
-  void* get_time;
+  Status (*get_time)(Time* time, TimeCapabilities* capabilities);  // capabilities may be null
   void* set_time;
   void* get_wakeup_time;
   void* set_wakeup_time;
