@@ -187,6 +187,22 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
     Not covered: textures/samplers, SPIR-V, compute, real GPUs (Intel/AMD/NVIDIA classes still use the firmware framebuffer),
     and virtio-gpu cursor/EDID/resize events.
 
+- `src/Gui/`: a small GUI toolkit that draws through `IRenderer2D`, so it is GPU-drawn wherever 2D is. `Control` is the base
+  of everything and any control can hold children. Layout is by dock style (`Control::layout()`): children are placed in the
+  order they were added, `Top`/`Bottom` take a strip of the area that is left (their own height, full width), `Left`/`Right` the
+  same sideways, `Fill` takes the rest (add it last) and `None` keeps its own bounds; padding shrinks the client area.
+  `Controls/Panel.hpp` has `Panel` (flat/raised/sunken container) and `UniformPanel`, which splits its area evenly between its
+  visible children, horizontally or vertically, with spacing (the leftover pixels go one each to the first children).
+  Controls: `Label`, `Button`, `TextBox` (single-line editing, caret, scrolling, max length, read-only), `DropDown` (list popup;
+  mouse and keyboard) and `MenuBar`/`Menu`/`MenuItem` (classic menus: shortcut text, check marks, separators, disabled items,
+  sliding between menus, keyboard navigation). Callbacks are `Handler`s (function + context pointer). `Window` is the root: title bar,
+  focus (Tab/Shift+Tab), mouse capture, hover, and one popup layer drawn above the tree (drop-down lists and menus use it);
+  `render()` lays out, paints and presents when `dirty()`. `InputPump` feeds a window from `IKeyboard`/`IMouse` (relative or
+  absolute). Controls do not own their children: whoever creates them keeps them alive while they are in a tree. Not yet:
+  submenus, text selection/clipboard, scrolling lists, a mouse cursor sprite beyond the simple arrow, several windows.
+  `src/GuiDemo` builds a window with all of it at boot and drives it with synthetic input (typing, choosing, menu items)
+  while checking the results; `tests/GuiTest.cpp` covers layout, every control and the input pump on the host.
+
 ## Requirements
 
 `cmake`, `ninja` (or make), `x86_64-w64-mingw32-gcc/g++` (mingw-w64),

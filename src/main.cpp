@@ -25,6 +25,7 @@
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "GraphicsDemo.hpp"
+#include "GuiDemo.hpp"
 #include "Graphics/SystemGraphics.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
@@ -360,11 +361,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (gpu) {
     graphics::SystemGraphics system_graphics(system_gpu, shared_allocator);
     const bool graphics_ok = run_graphics_demo(system_graphics, shared_allocator);
+    const bool gui_ok = run_gui_demo(system_graphics, shared_allocator);
     console::use_gpu(gpu);
     console::puts("Graphics: ");
     console::puts(system_graphics.device().info().name);
     console::puts(system_graphics.accelerated() ? ", accelerated, demo " : ", software, demo ");
     console::puts(graphics_ok ? "ok\n" : "FAILED\n");
+    console::puts("GUI: ");
+    console::puts(gui_ok ? "ok\n" : "FAILED\n");
   }
 
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.

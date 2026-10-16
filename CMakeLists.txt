@@ -151,6 +151,17 @@ add_executable(BOOTX64
   src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
   src/Graphics/SystemGraphics.cpp
   src/GraphicsDemo.cpp
+  src/GuiDemo.cpp
+  src/Gui/Painter.cpp
+  src/Gui/Control.cpp
+  src/Gui/Window.cpp
+  src/Gui/InputPump.cpp
+  src/Gui/Controls/Panel.cpp
+  src/Gui/Controls/Label.cpp
+  src/Gui/Controls/Button.cpp
+  src/Gui/Controls/TextBox.cpp
+  src/Gui/Controls/DropDown.cpp
+  src/Gui/Controls/Menu.cpp
   src/Graphics/Graphics3D/Software/SoftwareDevice.cpp
   src/Hardware/x86_64/port.S
 )

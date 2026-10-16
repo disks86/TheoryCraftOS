@@ -1,0 +1,132 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// The base of every GUI element, and the layout engine.
+//
+// Any control can hold children, which is how windows and panels nest. Bounds
+// are relative to the parent's top left. layout() places the children of a
+// control inside its client area by their DockStyle, in the order they were
+// added: Top/Bottom/Left/Right children take a strip of the area that is left
+// (their own height or width, the full length of the other side), a Fill child
+// takes what remains, None children keep the bounds they were given. Add Fill
+// children last, as later children only get what a Fill child left (nothing).
+//
+// Ownership: a control does not own its children or free anything; the code that
+// creates controls keeps them alive for as long as they are in a tree. Controls
+// use a protected, non-virtual destructor like every interface in this OS,
+// so they are never deleted through Control*.
+#pragma once
+#include "Allocators/IAllocator.hpp"
+#include "Gui/GuiTypes.hpp"
+#include "Gui/Painter.hpp"
+#include "ObjectContainer/List.hpp"
+
+namespace gui {
+
+class Window;
+
+class Control {
+ public:
+  Control(const Control&) = delete;
+  Control& operator=(const Control&) = delete;
+
+  // --- Geometry and layout
+  const Rect2D& bounds() const { return bounds_; }
+  // Absolute placement for DockStyle::None controls; docking overwrites it.
+  void set_bounds(const Rect2D& bounds) { bounds_ = bounds; invalidate(); }
+  DockStyle dock() const { return dock_; }
+  void set_dock(DockStyle dock) { dock_ = dock; invalidate(); }
+  // The size a docked control asks for (height for Top/Bottom, width for Left/Right). 0 means "use
+  // default_size()".
+  void set_size(int32_t width, int32_t height) { size_ = {width, height}; invalidate(); }
+  Size preferred_size() const {
+    const Size d = default_size();
+    return {size_.width > 0 ? size_.width : d.width, size_.height > 0 ? size_.height : d.height};
+  }
+  const Insets& padding() const { return padding_; }
+  void set_padding(const Insets& padding) { padding_ = padding; invalidate(); }
+  // The area inside the padding, in this control's coordinates.
+  virtual Rect2D client_rect() const;
+  // Places the children (and, recursively, theirs).
+  virtual void layout();
+
+  // --- Tree
+  bool add(Control* child);  // false if it is already in a tree or memory ran out
+  bool remove(Control* child);
+  Control* parent() const { return parent_; }
+  uint32_t child_count() const { return static_cast<uint32_t>(children_.count()); }
+  Control* child(uint32_t index) const { return index < children_.count() ? children_[index] : nullptr; }
+  // The window this control is in (nullptr while it is not in one).
+  Window* window() const;
+  // Position of this control's top left in window coordinates.
+  Point window_origin() const;
+
+  // --- State
+  bool visible() const { return visible_; }
+  void set_visible(bool v) { visible_ = v; invalidate(); }
+  bool enabled() const { return enabled_; }
+  void set_enabled(bool v) { enabled_ = v; invalidate(); }
+  bool hovered() const { return hovered_; }
+  bool focused() const { return focused_; }
+  virtual bool focusable() const { return false; }
+  // Asks for a repaint.
+  void invalidate() const;
+
+  // --- Painting. paint_tree() paints this control and then its children, clipped to the bounds.
+  void paint_tree(Painter& painter);
+  virtual void paint(Painter&) {}
+
+  // --- Input. Coordinates are relative to this control.
+  virtual void on_mouse_enter() {}
+  virtual void on_mouse_leave() {}
+  virtual void on_mouse_move(const MouseArgs&) {}
+  virtual void on_mouse_down(const MouseArgs&) {}
+  virtual void on_mouse_up(const MouseArgs&) {}
+  virtual void on_mouse_wheel(const MouseArgs&) {}
+  // Return true if the key was used; otherwise it goes to the parent.
+  virtual bool on_key(const KeyArgs&) { return false; }
+  virtual void on_focus_changed(bool) {}
+  // Called on the owner of a popup (Window::open_popup) when the popup closes.
+  virtual void on_popup_closed(Control*) {}
+
+  // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
+  Control* hit_test(int32_t x, int32_t y);
+
+ protected:
+  explicit Control(allocators::IAllocator& allocator) : allocator_(allocator), children_(allocator) {}
+  ~Control() = default;
+
+  virtual Size default_size() const { return {0, 0}; }
+  allocators::IAllocator& allocator() const { return allocator_; }
+
+  Rect2D bounds_;
+  Window* window_ = nullptr;  // set by Window on itself and on popups
+
+ private:
+  friend class Window;
+
+  allocators::IAllocator& allocator_;
+  List<Control*> children_;
+  Control* parent_ = nullptr;
+  DockStyle dock_ = DockStyle::None;
+  Size size_;
+  Insets padding_;
+  bool visible_ = true, enabled_ = true, hovered_ = false, focused_ = false;
+};
+
+}  // namespace gui
