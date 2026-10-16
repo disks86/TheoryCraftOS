@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "uefi-debug",
+      "displayName": "UEFI Debug (waits 10s for debugger)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-x86_64-uefi.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "TCOS_DEBUG_WAIT_SECS": "10"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "uefi-debug", "configurePreset": "uefi-debug" }
+  ]
+}
