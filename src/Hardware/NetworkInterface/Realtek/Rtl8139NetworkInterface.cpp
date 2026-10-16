@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
 #include "Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.hpp"
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
 
@@ -63,7 +64,7 @@ bool Rtl8139NetworkInterface::initialize() {
 
   write8(kConfig1, 0);  // power on
   write8(kCmd, kCmdReset);
-  for (int i = 0; i < 1000 && (read8(kCmd) & kCmdReset); ++i) st_->boot_services->stall(1000);
+  for (int i = 0; i < 1000 && (read8(kCmd) & kCmdReset); ++i) hardware::delay_us(1000);
   if (read8(kCmd) & kCmdReset) {
     shutdown();
     return false;
@@ -109,6 +110,7 @@ void Rtl8139NetworkInterface::shutdown() {
 bool Rtl8139NetworkInterface::link_up() const { return started_ && !(read8(kMsr) & kMsrLinkInactive); }
 
 bool Rtl8139NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
@@ -133,6 +135,7 @@ bool Rtl8139NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
 }
 
 bool Rtl8139NetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !buffer || !length) return false;
   while (!(read8(kCmd) & kCmdBufferEmpty)) {
     const uint8_t* packet = receive_ring_ + receive_offset_;

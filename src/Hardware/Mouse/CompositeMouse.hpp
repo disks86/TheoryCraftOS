@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Kernel/Sync.hpp"
 #include "Hardware/Mouse/IMouse.hpp"
 
 namespace hardware {
@@ -44,6 +45,7 @@ class CompositeMouse final : public IMouse {
   uint32_t max_y() const override { return 0; }
 
  private:
+  kernel::Mutex mutex_;  // polling threads take turns
   IMouse* mice_[kMaxMice] = {};
   uint32_t count_ = 0;
   uint32_t next_ = 0;

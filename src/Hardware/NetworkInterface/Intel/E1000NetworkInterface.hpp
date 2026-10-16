@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
+#include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -93,6 +94,7 @@ class E1000NetworkInterface final : public INetworkInterface {
   MacAddress mac_{};
   bool owns_device_ = false;
   bool started_ = false;
+  kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;
 };
 

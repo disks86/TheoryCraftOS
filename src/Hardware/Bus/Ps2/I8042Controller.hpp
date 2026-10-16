@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "Hardware/IHardware.hpp"
 #include "Hardware/IoPort.hpp"
+#include "Kernel/RawSpinLock.hpp"
 
 namespace hardware {
 
@@ -70,6 +71,7 @@ class I8042Controller final : public IHardware {
   bool read_data_blocking(uint8_t* out, bool from_mouse);
   bool send(uint8_t byte, bool to_mouse);
 
+  kernel::RawSpinLock lock_;  // keyboard and mouse code share the controller
   IoPort data_{0x60};
   IoPort status_command_{0x64};
   Queue keyboard_, mouse_;

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
 #include "Allocators/Allocator.hpp"
 #include "Allocators/ThreadSafeAllocator.hpp"
 #include "CPUScheduler/Scheduler.hpp"
@@ -28,10 +29,13 @@
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "StorageDemo.hpp"
+#include "ThreadSafetyDemo.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "ConcurrentDemo.hpp"
 #include "ContainerDemo.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "KernelDemo.hpp"
+#include "Kernel/Thread.hpp"
 #include "NetworkDemo.hpp"
 #include "NetworkStackDemo.hpp"
 #include "Hardware/Clock/TscClock.hpp"
@@ -118,7 +122,7 @@ static void kernel_main(efi::SystemTable* st, hardware::SystemInput& input, Netw
     console::puts("No keyboard found; press any key (firmware input) to shut down.\n");
     efi::InputKey key;
     while (st->con_in->read_key_stroke(st->con_in, &key) != efi::kSuccess)
-      st->boot_services->stall(10000);
+      hardware::delay_us(10000);
     return;
   }
 
@@ -132,12 +136,13 @@ static void kernel_main(efi::SystemTable* st, hardware::SystemInput& input, Netw
     hardware::MouseEvent mouse;
     while (input.mouse().poll(&mouse)) print_mouse(mouse);
     if (net) net->service();  // keeps the network stack (and its TCP server) running
-    st->boot_services->stall(5000);
+    hardware::delay_us(5000);
   }
 }
 
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::init(st);
+  hardware::delay_init(st);  // timing that works on every core, before anything waits
   st->boot_services->set_watchdog_timer(0, 0, 0, nullptr);  // no 5-minute reset
 
   efi::LoadedImage* li = nullptr;
@@ -154,7 +159,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // Gives a debugger time to attach (IDE) or lets you flip the flag by hand.
   console::puts("Waiting for debugger...\n");
   for (int i = 0; i < TCOS_DEBUG_WAIT * 10 && !g_debugger_attached; ++i)
-    st->boot_services->stall(100000);
+    hardware::delay_us(100000);
 #endif
 
   // Memory first: the PCI bus keeps its device list in it. (Nothing is lost by
@@ -171,9 +176,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     return efi::kBufferTooSmall;
   }
 
+  // The CPU comes next: the allocator's thread-safe front needs it, and from here on
+  // every subsystem allocates through that front, so any thread may use any of them.
+  // The CPU, then the scheduler.
+  hardware::SystemCpu system_cpu(st);
+  hardware::ICentralProcessingUnit& cpu = system_cpu.cpu();
+  if (!cpu.initialize()) {
+    console::puts("CPU initialization failed\n");
+    return efi::kBufferTooSmall;
+  }
+  // Everything that may run on several cores shares ONE thread-safe front for the
+  // allocator: the scheduler's queues grow through it, and so do the concurrent
+  // containers. (Two separate wrappers would use two locks and not exclude each other.)
+  allocators::ThreadSafeAllocator shared_allocator(allocator, cpu);
+
   // Then the display, so everything after it appears on screen. Falls back to the
   // firmware text console if no GPU class can drive a framebuffer.
-  hardware::SystemPciBus system_pci(st, allocator);
+  hardware::SystemPciBus system_pci(st, shared_allocator);
   hardware::IPciBus& pci = system_pci.pci();
   hardware::SystemGpu system_gpu(st, pci);
   hardware::IGraphicsProcessingUnit* gpu = system_gpu.gpu();
@@ -202,24 +221,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::put_hex(pci.device_count());
   console::puts(" devices\n");
 
-  // The CPU, then the scheduler.
-  hardware::SystemCpu system_cpu(st);
-  hardware::ICentralProcessingUnit& cpu = system_cpu.cpu();
-  if (!cpu.initialize()) {
-    console::puts("CPU initialization failed\n");
-    return efi::kBufferTooSmall;
-  }
   console::puts("Containers:\n");
   if (!run_container_demo(allocator)) console::puts("container self-check failed\n");
 
-  // Everything that may run on several cores shares ONE thread-safe front for the
-  // allocator: the scheduler's queues grow through it, and so do the concurrent
-  // containers. (Two separate wrappers would use two locks and not exclude each other.)
-  allocators::ThreadSafeAllocator shared_allocator(allocator, cpu);
   scheduling::Scheduler scheduler(cpu, shared_allocator);
 
+  // From here on the OS is preemptively multithreaded on every core.
+  if (kernel::start(cpu, shared_allocator)) {
+    console::puts("Kernel: preemptive threads on ");
+    console::put_dec(kernel::core_count());
+    console::puts(" cores\n");
+    if (!run_kernel_demo(shared_allocator)) console::puts("  kernel self-check incomplete\n");
+  } else {
+    console::puts("Kernel: could not start threads\n");
+  }
+
   // USB comes after the allocator: the xHCI driver needs DMA-able memory.
-  hardware::UsbBus usb(pci, allocator, st);
+  hardware::UsbBus usb(pci, shared_allocator, st);
   usb.initialize();
   console::puts("USB: ");
   console::put_hex(usb.controller_count());
@@ -276,7 +294,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::puts(", ");
   console::put_dec(npu.compute_units());
   console::puts(" compute units\n");
-  if (!run_npu_demo(npu, allocator)) console::puts("NPU self-check failed\n");
+  if (!run_npu_demo(npu, shared_allocator)) console::puts("NPU self-check failed\n");
 
   console::puts("Smart pointers and value types:\n");
   if (!run_utility_demo(allocator, scheduler)) console::puts("utility self-check failed\n");
@@ -285,7 +303,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   if (!run_concurrent_demo(allocator, shared_allocator, cpu, scheduler)) console::puts("concurrent self-check failed\n");
 
   // Network interfaces: native drivers where we have them, the firmware's driver otherwise.
-  hardware::SystemNetworkInterfaces network(pci, allocator, st);
+  hardware::SystemNetworkInterfaces network(pci, shared_allocator, st);
   network.initialize();
   console::puts("Network: ");
   console::put_dec(network.count());
@@ -301,6 +319,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     for (uint32_t i = 0; i < network.count(); ++i)
       if (!stacks.add(*network.at(i))) console::puts("could not start a network stack\n");
     if (stacks.count() > 0) {
+      stacks.start_service();  // one thread keeps every stack polled
       console::puts("Network stacks (");
       console::put_dec(stacks.count());
       console::puts(" interfaces):\n");
@@ -310,12 +329,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
 
   // Storage devices: native drivers where we have them, the firmware's driver otherwise.
-  hardware::SystemStorageDevices storage(pci, &usb, allocator, st);
+  hardware::SystemStorageDevices storage(pci, &usb, shared_allocator, st);
   storage.initialize();
   console::puts("Storage: ");
   console::put_dec(storage.count());
   console::puts(" devices\n");
-  if (!run_storage_demo(storage, allocator)) console::puts("  storage self-check incomplete\n");
+  if (!run_storage_demo(storage, shared_allocator)) console::puts("  storage self-check incomplete\n");
+
+  console::puts("Thread safety (concurrent use of the shared subsystems):\n");
+  if (!run_thread_safety_demo(storage, stacks, shared_allocator)) console::puts("  thread-safety self-check incomplete\n");
 
   // Image signal processor: a hardware one if the machine has a known ISP,
   // otherwise the software pipeline. The demo needs a screen to draw on.
@@ -324,10 +346,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::puts("ISP: ");
   console::puts(isp.name());
   console::puts("\n");
-  const bool isp_drawn = gpu && run_isp_demo(*gpu, isp, allocator);
+  const bool isp_drawn = gpu && run_isp_demo(*gpu, isp, shared_allocator);
 
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
-  hardware::SystemInput input(pci, usb, allocator, st);
+  hardware::SystemInput input(pci, usb, shared_allocator, st);
   input.initialize();
   if (gpu) console::puts(isp_drawn ? "ISP demo drawn (top right)\n" : "ISP demo failed\n");
   console::puts("Input: ");
@@ -346,12 +368,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::puts("\n");
   }
 
-  // The firmware polls PS/2 from its timer interrupt and would steal our bytes.
-  cpu.disable_interrupts();
   kernel_main(st, input, stack_demo.get());
   stack_demo.reset();  // the stacks go before the NICs underneath them
   stacks.clear();
-  cpu.enable_interrupts();
+  kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   input.shutdown();
   storage.shutdown();
   network.shutdown();

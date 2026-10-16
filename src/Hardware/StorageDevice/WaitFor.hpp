@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Kernel/Delay.hpp"
 #include <stdint.h>
 #include "uefi.hpp"
 
@@ -25,9 +26,14 @@ namespace hardware {
 // Polls `done()` until it returns true or `timeout_ms` passes (firmware timer).
 template <class F>
 bool wait_for(efi::SystemTable* st, uint32_t timeout_ms, F&& done) {
-  for (uint64_t us = 0; us < uint64_t{timeout_ms} * 1000; us += 10) {
+  // Poll fast at first (most devices answer within microseconds), then back off
+  // to sleeping so a slow device does not keep a core busy.
+  uint64_t waited = 0;
+  while (waited < uint64_t{timeout_ms} * 1000) {
     if (done()) return true;
-    st->boot_services->stall(10);
+    const uint64_t step = waited < 2000 ? 10 : 200;
+    delay_us(step);
+    waited += step;
   }
   return done();
 }

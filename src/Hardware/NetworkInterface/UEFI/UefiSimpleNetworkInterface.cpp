@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
+#include "Kernel/Firmware.hpp"
 #include "Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.hpp"
 
 namespace hardware {
@@ -51,6 +53,7 @@ bool UefiSimpleNetworkInterface::link_up() const {
 }
 
 bool UefiSimpleNetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
@@ -59,7 +62,9 @@ bool UefiSimpleNetworkInterface::transmit(const uint8_t* frame, uint32_t length)
   __builtin_memset(staging_, 0, padded);
   __builtin_memcpy(staging_, frame, length);
   // Header size 0: the buffer already holds a complete Ethernet frame.
-  if (snp_->transmit(snp_, 0, padded, staging_, nullptr, nullptr, nullptr) != efi::kSuccess) {
+  efi::Status sent = efi::kSuccess;
+  kernel::firmware([&] { sent = snp_->transmit(snp_, 0, padded, staging_, nullptr, nullptr, nullptr); });
+  if (sent != efi::kSuccess) {
     ++stats_.send_failures;
     return false;
   }
@@ -67,18 +72,23 @@ bool UefiSimpleNetworkInterface::transmit(const uint8_t* frame, uint32_t length)
   for (int i = 0; i < 1000; ++i) {
     uint32_t interrupts = 0;
     void* recycled = nullptr;
-    if (snp_->get_status(snp_, &interrupts, &recycled) == efi::kSuccess && recycled) break;
-    st_->boot_services->stall(1000);
+    efi::Status status = efi::kSuccess;
+    kernel::firmware([&] { status = snp_->get_status(snp_, &interrupts, &recycled); });
+    if (status == efi::kSuccess && recycled) break;
+    hardware::delay_us(1000);
   }
   ++stats_.frames_sent;
   return true;
 }
 
 bool UefiSimpleNetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !buffer || !length) return false;
   uint8_t frame[kEthernetMaxFrame + 64];
   efi::Uintn size = sizeof(frame), header = 0;
-  if (snp_->receive(snp_, &header, &size, frame, nullptr, nullptr, nullptr) != efi::kSuccess) return false;
+  efi::Status received = efi::kSuccess;
+  kernel::firmware([&] { received = snp_->receive(snp_, &header, &size, frame, nullptr, nullptr, nullptr); });
+  if (received != efi::kSuccess) return false;
   __builtin_memcpy(buffer, frame, size < capacity ? size : capacity);
   *length = static_cast<uint32_t>(size);
   ++stats_.frames_received;

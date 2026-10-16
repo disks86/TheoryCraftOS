@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Kernel/Sync.hpp"
 #include "Hardware/Keyboard/IKeyboard.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -41,6 +42,7 @@ class KeyboardBase : public IKeyboard {
   KeyEvent queue_[kCapacity] = {};
   uint32_t head_ = 0, count_ = 0;
   uint8_t modifiers_ = 0;
+  kernel::Mutex mutex_;  // polling threads take turns
 };
 
 }  // namespace hardware

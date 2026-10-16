@@ -20,12 +20,21 @@
 #include "GraphicsConsole.hpp"
 #include "Hardware/DebugConsole.hpp"
 #include "Hardware/TextConsole.hpp"
+#include "Kernel/Thread.hpp"
+#include "Kernel/RawSpinLock.hpp"
 
 namespace {
 // constexpr-constructed: no static initializers run in this freestanding image.
 hardware::DebugConsole g_debug;
 hardware::TextConsole g_text;
 GraphicsConsole g_graphics;
+
+// Output from several threads must not tear: one lock, taken per call (and
+// held across a whole ScopedLock block). Re-entrant on the same core, which is
+// enough because interrupts are masked while it is held.
+kernel::RawSpinLock g_lock;
+uint32_t g_owner = ~0u;
+uint32_t g_depth = 0;
 
 void putc(char c) {
   g_debug.put(c);
@@ -35,6 +44,33 @@ void putc(char c) {
 }  // namespace
 
 namespace console {
+void lock() {
+  const uint32_t me = kernel::current_core();
+  const uint64_t flags = kernel::irq_save();
+  if (g_depth > 0 && g_owner == me) {  // nested on this core: we already hold it
+    ++g_depth;
+    kernel::irq_restore(flags);
+    return;
+  }
+  kernel::irq_restore(flags);
+  g_lock.lock();
+  g_owner = me;
+  g_depth = 1;
+}
+
+void unlock() {
+  if (--g_depth == 0) {
+    g_owner = ~0u;
+    g_lock.unlock();
+  }
+}
+
+void break_lock() {  // for a panic: the holder may be the code that just crashed
+  g_depth = 0;
+  g_owner = ~0u;
+  g_lock.reset();
+}
+
 void init(efi::SystemTable* st) {
   g_debug.initialize();
   g_text.bind(st);
@@ -44,16 +80,19 @@ void init(efi::SystemTable* st) {
 void use_gpu(hardware::IGraphicsProcessingUnit* gpu) { g_graphics.attach(gpu); }
 
 void puts(const char* s) {
+  Guard guard;
   while (*s) putc(*s++);
 }
 
 void put_hex(uint64_t v) {
+  Guard guard;
   puts("0x");
   for (int shift = 60; shift >= 0; shift -= 4)
     putc("0123456789abcdef"[(v >> shift) & 0xF]);
 }
 
 void put_dec(int64_t v) {
+  Guard guard;
   char digits[21];
   int n = 0;
   uint64_t magnitude = v < 0 ? 0 - static_cast<uint64_t>(v) : static_cast<uint64_t>(v);

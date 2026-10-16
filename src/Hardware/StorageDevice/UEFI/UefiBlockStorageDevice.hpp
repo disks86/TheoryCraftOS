@@ -36,7 +36,7 @@ class UefiBlockStorageDevice final : public StorageDeviceBase {
 
  protected:
   bool transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) override;
-  bool flush_cache() override { return io_->flush_blocks(io_) == efi::kSuccess; }
+  bool flush_cache() override;
 
  private:
   efi::BlockIo* io_;

@@ -34,12 +34,14 @@ bool LegacyPciBus::initialize() {
 
 uint32_t LegacyPciBus::read32(PciAddress address, uint16_t offset) const {
   if (offset >= 256) return 0xFFFFFFFF;  // extended config space needs PCIe
+  kernel::RawSpinGuard guard(lock_);  // the address/data port pair is one access
   address_port_.write32(config_address(address, offset));
   return data_port_.read32();
 }
 
 void LegacyPciBus::write32(PciAddress address, uint16_t offset, uint32_t value) const {
   if (offset >= 256) return;
+  kernel::RawSpinGuard guard(lock_);
   address_port_.write32(config_address(address, offset));
   data_port_.write32(value);
 }

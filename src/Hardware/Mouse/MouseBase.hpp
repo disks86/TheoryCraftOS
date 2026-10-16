@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Kernel/Sync.hpp"
 #include "Hardware/Mouse/IMouse.hpp"
 
 namespace hardware {
@@ -38,6 +39,7 @@ class MouseBase : public IMouse {
   static constexpr uint32_t kCapacity = 64;
   MouseEvent queue_[kCapacity] = {};
   uint32_t head_ = 0, count_ = 0;
+  kernel::Mutex mutex_;  // polling threads take turns
 };
 
 }  // namespace hardware

@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
+#include "Kernel/Sync.hpp"
 #include "Hardware/Bus/Usb/Ehci/EhciController.hpp"
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
 
@@ -37,7 +39,7 @@ uint64_t address_of(const void* p) { return reinterpret_cast<uint64_t>(p); }
 
 // ---------------------------------------------------------------- helpers
 
-void EhciController::delay_us(uint64_t us) const { st_->boot_services->stall(us); }
+void EhciController::delay_us(uint64_t us) const { hardware::delay_us(us); }
 
 bool EhciController::wait_for(uint64_t address, uint32_t mask, uint32_t value, uint32_t timeout_ms) {
   for (uint32_t waited = 0; waited <= timeout_ms * 10; ++waited) {
@@ -392,6 +394,7 @@ bool EhciController::configuration_descriptor(uint32_t port, uint8_t* buffer, ui
 }
 
 bool EhciController::set_configuration(uint32_t port, uint8_t configuration) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   Device& d = devices_[port];
   if (d.configuration == configuration) return true;
@@ -402,12 +405,14 @@ bool EhciController::set_configuration(uint32_t port, uint8_t configuration) {
 
 bool EhciController::control_out(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
                                  uint16_t index) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   return control(devices_[port], request_type, request, value, index, 0, false);
 }
 
 bool EhciController::control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
                                 uint16_t index, void* buffer, uint16_t length) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !buffer || length > 4096) return false;
   if (!control(devices_[port], request_type, request, value, index, length, true)) return false;
   __builtin_memcpy(buffer, buffer_ + 4096, length);
@@ -422,6 +427,7 @@ EhciController::Endpoint* EhciController::find_endpoint(Device& d, uint8_t addre
 
 bool EhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                                         uint8_t /*interval: every frame is polled*/) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !(endpoint_address & 0x80) || !max_packet) return false;
   Device& d = devices_[port];
   if (find_endpoint(d, endpoint_address)) return true;
@@ -456,6 +462,7 @@ bool EhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
 
 bool EhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
                                        uint16_t* length) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !buffer) return false;
   Endpoint* e = find_endpoint(devices_[port], endpoint_address);
   if (!e || !e->interrupt) return false;
@@ -476,6 +483,7 @@ bool EhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, 
 }
 
 bool EhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !max_packet) return false;
   Device& d = devices_[port];
   if (find_endpoint(d, endpoint_address)) return true;
@@ -495,6 +503,7 @@ bool EhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
 
 bool EhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
                                    uint32_t* transferred) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (transferred) *transferred = 0;
   if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
   Endpoint* e = find_endpoint(devices_[port], endpoint_address);
@@ -516,6 +525,7 @@ bool EhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void
 }
 
 bool EhciController::reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   Endpoint* e = find_endpoint(devices_[port], endpoint_address);
   if (!e || e->interrupt) return false;

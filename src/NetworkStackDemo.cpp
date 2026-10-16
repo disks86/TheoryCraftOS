@@ -183,7 +183,7 @@ bool NetworkStackDemo::check_interface(uint32_t index) {
 }
 
 void NetworkStackDemo::service() {
-  stacks_.poll();
+  if (!stacks_.service_running()) stacks_.poll();
   for (UniquePointer<Endpoint>& endpoint : endpoints_) serve(*endpoint);
 }
 

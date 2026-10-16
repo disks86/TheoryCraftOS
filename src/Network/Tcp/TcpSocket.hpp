@@ -63,22 +63,49 @@ class TcpSocket final : public ITcpSocket {
   TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& allocator);
 
   // --- ITcpSocket
-  TcpState state() const override { return state_; }
+  TcpState state() const override {
+    StackLock guard(ip_);
+    return state_;
+  }
   bool connect(Ipv4Address address, uint16_t port) override;
   bool listen(uint16_t port) override;
   SharedPointer<ITcpSocket> accept() override;
   uint32_t send(const uint8_t* data, uint32_t length) override;
   uint32_t receive(uint8_t* buffer, uint32_t capacity) override;
-  uint32_t available() const override { return receive_buffer_.size(); }
-  uint32_t unsent_or_unacknowledged() const override { return send_buffer_.size(); }
-  bool is_connected() const override { return state_ == TcpState::Established || state_ == TcpState::CloseWait; }
-  bool peer_closed() const override { return fin_received_ && receive_buffer_.size() == 0; }
-  bool failed() const override { return failed_; }
+  uint32_t available() const override {
+    StackLock guard(ip_);
+    return receive_buffer_.size();
+  }
+  uint32_t unsent_or_unacknowledged() const override {
+    StackLock guard(ip_);
+    return send_buffer_.size();
+  }
+  bool is_connected() const override {
+    StackLock guard(ip_);
+    return state_ == TcpState::Established || state_ == TcpState::CloseWait;
+  }
+  bool peer_closed() const override {
+    StackLock guard(ip_);
+    return fin_received_ && receive_buffer_.size() == 0;
+  }
+  bool failed() const override {
+    StackLock guard(ip_);
+    return failed_;
+  }
   void close() override;
   void abort() override;
-  uint16_t local_port() const override { return local_port_; }
-  Ipv4Address remote_address() const override { return remote_address_; }
-  uint16_t remote_port() const override { return remote_port_; }
+  uint16_t local_port() const override {
+    StackLock guard(ip_);
+    return local_port_;
+  }
+  Ipv4Address remote_address() const override {
+    StackLock guard(ip_);
+    return remote_address_;
+  }
+  uint16_t remote_port() const override {
+    StackLock guard(ip_);
+    return remote_port_;
+  }
 
   // --- used by TcpManager
   bool matches(Ipv4Address remote_address, uint16_t remote_port, uint16_t local_port) const {

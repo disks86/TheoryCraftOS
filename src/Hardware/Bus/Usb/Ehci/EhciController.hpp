@@ -21,6 +21,7 @@
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Usb/Ehci/EhciRegisters.hpp"
 #include "Hardware/Bus/Usb/IUsbHostController.hpp"
+#include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -129,6 +130,7 @@ class EhciController final : public IUsbHostController {
   uint32_t ports_ = 0;
   bool address64_ = false;
   bool owns_controller_ = false;
+  kernel::Mutex lock_;  // one thread in the controller at a time
   bool running_ = false;
 
   ehci::Qh* async_head_ = nullptr;

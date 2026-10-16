@@ -21,6 +21,7 @@
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Usb/Xhci/IXhciController.hpp"
 #include "Hardware/Bus/Usb/Xhci/XhciRing.hpp"
+#include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -150,6 +151,7 @@ class XhciController final : public IXhciController {
   xhci::ProducerRing command_ring_;
   xhci::EventRing event_ring_;
   uint8_t* buffer_ = nullptr;  // 4 KiB bounce buffer for control transfers
+  kernel::Mutex lock_;  // one thread in the controller at a time
   bool running_ = false;
   bool ac64_ = false;
   bool owns_controller_ = false;  // firmware drivers are detached

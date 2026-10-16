@@ -45,6 +45,8 @@ class IdeController {
   void shutdown();  // safe to repeat
 
   Channel channel(uint32_t index) const { return channels_[index]; }
+  // The master and slave drive of a channel share its registers: one command at a time.
+  kernel::Mutex& channel_mutex(uint32_t index) { return channel_mutex_[index]; }
   efi::SystemTable* system_table() const { return st_; }
 
  private:
@@ -54,6 +56,7 @@ class IdeController {
   PciDeviceInfo device_;
   efi::SystemTable* st_;
   Channel channels_[2];
+  kernel::Mutex channel_mutex_[2];
   bool owns_device_ = false;
 };
 
@@ -64,7 +67,7 @@ class IdeStorageDevice final : public StorageDeviceBase {
   IdeStorageDevice(SharedPointer<IdeController> controller, uint32_t channel, uint32_t drive,
                    allocators::IAllocator& allocator)
       : StorageDeviceBase(allocator, controller->system_table()),
-        controller_(util::move(controller)), channel_(controller_->channel(channel)), drive_(drive) {}
+        controller_(util::move(controller)), channel_(controller_->channel(channel)), channel_index_(channel), drive_(drive) {}
 
   // Probes both channels of a controller and adds the drives that answer.
   static void discover(const SharedPointer<IdeController>& controller, allocators::IAllocator& allocator,
@@ -91,6 +94,7 @@ class IdeStorageDevice final : public StorageDeviceBase {
 
   SharedPointer<IdeController> controller_;
   IdeController::Channel channel_;
+  uint32_t channel_index_;
   uint32_t drive_;
   bool atapi_ = false;
   bool lba48_ = false;

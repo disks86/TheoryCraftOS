@@ -59,10 +59,12 @@ bool StorageDeviceBase::run(bool write, uint64_t lba, uint32_t count, uint8_t* b
 }
 
 bool StorageDeviceBase::read(uint64_t lba, uint32_t count, void* buffer) {
+  kernel::ScopedMutex guard(mutex_);
   return run(false, lba, count, static_cast<uint8_t*>(buffer));
 }
 
 bool StorageDeviceBase::write(uint64_t lba, uint32_t count, const void* buffer) {
+  kernel::ScopedMutex guard(mutex_);
   if (info_.read_only) {
     ++stats_.errors;
     return false;
@@ -71,6 +73,7 @@ bool StorageDeviceBase::write(uint64_t lba, uint32_t count, const void* buffer) 
 }
 
 bool StorageDeviceBase::flush() {
+  kernel::ScopedMutex guard(mutex_);
   if (info_.read_only) return true;  // nothing can be dirty
   if (flush_cache()) return true;
   ++stats_.errors;

@@ -72,18 +72,21 @@ void I8042Controller::pump() {
 }
 
 bool I8042Controller::read_keyboard(uint8_t* out) {
+  kernel::RawSpinGuard guard(lock_);
   pump();
   return keyboard_.pop(out);
 }
 
 bool I8042Controller::read_mouse(uint8_t* out) {
+  kernel::RawSpinGuard guard(lock_);
   pump();
   return mouse_.pop(out);
 }
 
 bool I8042Controller::read_data_blocking(uint8_t* out, bool from_mouse) {
   for (uint32_t i = 0; i < kSpins; ++i) {
-    if (from_mouse ? read_mouse(out) : read_keyboard(out)) return true;
+    pump();  // the caller (send()) already holds the lock
+    if (from_mouse ? mouse_.pop(out) : keyboard_.pop(out)) return true;
   }
   return false;
 }
@@ -100,8 +103,14 @@ bool I8042Controller::send(uint8_t byte, bool to_mouse) {
   return false;
 }
 
-bool I8042Controller::send_keyboard(uint8_t byte) { return send(byte, false); }
-bool I8042Controller::send_mouse(uint8_t byte) { return send(byte, true); }
+bool I8042Controller::send_keyboard(uint8_t byte) {
+  kernel::RawSpinGuard guard(lock_);
+  return send(byte, false);
+}
+bool I8042Controller::send_mouse(uint8_t byte) {
+  kernel::RawSpinGuard guard(lock_);
+  return send(byte, true);
+}
 
 bool I8042Controller::initialize() {
   if (status_command_.read8() == 0xFF) return false;  // floating bus: no 8042

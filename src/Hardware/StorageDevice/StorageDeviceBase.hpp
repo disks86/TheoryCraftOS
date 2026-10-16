@@ -19,6 +19,7 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
+#include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -58,6 +59,7 @@ class StorageDeviceBase : public IStorageDevice {
  private:
   bool run(bool write, uint64_t lba, uint32_t count, uint8_t* buffer);
 
+  kernel::Mutex mutex_;  // one request at a time per device
   uint8_t* bounce_ = nullptr;
   uint32_t bounce_bytes_ = 0;
 };

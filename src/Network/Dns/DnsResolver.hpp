@@ -38,8 +38,8 @@ class DnsResolver final : public IDnsResolver {
       : stack_(stack), allocator_(allocator), queries_(allocator), cache_(allocator) {}
 
   SharedPointer<IDnsQuery> query(const char* name) override;
-  void clear_cache() override { cache_.clear(); }
-  uint32_t cache_size() const override { return static_cast<uint32_t>(cache_.count()); }
+  void clear_cache() override;
+  uint32_t cache_size() const override;
 
   // Sends, retries and receives for the queries in flight. Called by the stack's poll().
   void poll();

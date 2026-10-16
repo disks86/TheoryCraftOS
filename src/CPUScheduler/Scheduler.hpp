@@ -22,18 +22,19 @@
 #include "ObjectContainer/Queue.hpp"
 #include "Synchronization/SpinLock.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
+#include "Kernel/Thread.hpp"
 
 namespace scheduling {
 
-// Default scheduler: cooperative and run-to-completion, spread across every
-// core the CPU interface reports. The two task queues are ring buffers drawn
-// from the allocator, so they grow on demand instead of rejecting work after a
-// fixed number of tasks (submit() fails only if the allocator is out of
-// memory). Strict priority: the efficiency queue only starts when the
-// high-performance queue is empty. High-performance tasks prefer Performance
-// cores and efficiency tasks prefer Efficiency cores, falling back to any free
-// core, then to this core. Call run()/run_next() from one core; submit() may be
-// called from any.
+// Default task scheduler. Once kernel::start() has been called every task runs in
+// its own kernel thread (preemptible, may block, may run on any core; high-
+// performance tasks prefer Performance cores, efficiency tasks Efficiency cores).
+// Before that - or if a thread cannot be created - a task runs to completion on
+// the calling core. The two task queues are ring buffers drawn from the
+// allocator, so they grow on demand instead of rejecting work after a fixed
+// number of tasks (submit() fails only if the allocator is out of memory).
+// Strict priority: the efficiency queue only starts when the high-performance
+// queue is empty. submit() may be called from any thread.
 //
 // Both queues are guarded by one SpinLock, and they allocate under it, so the
 // allocator is called from whichever core submits. It must therefore be safe to
@@ -61,13 +62,15 @@ class Scheduler final : public ICPUScheduler {
     void* context;
   };
 
-  bool dispatch(const Task& task, hardware::CoreKind preferred);
-  bool any_core_busy();
+  struct Job;
+  static void job_main(void* job);
 
   hardware::ICentralProcessingUnit& cpu_;
   mutable SpinLock lock_;  // guards both queues
   Queue<Task> high_;
   Queue<Task> efficiency_;
+  allocators::IAllocator& allocator_;
+  uint32_t active_ = 0;  // task threads started and not yet finished
 };
 
 }  // namespace scheduling

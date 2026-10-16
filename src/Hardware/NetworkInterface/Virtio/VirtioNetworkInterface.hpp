@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Kernel/Sync.hpp"
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
 
@@ -62,6 +63,7 @@ class VirtioNetworkInterface final : public INetworkInterface {
   MacAddress mac_{};
   bool has_status_ = false;
   bool started_ = false;
+  kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;
 };
 

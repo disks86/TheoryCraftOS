@@ -18,6 +18,7 @@
 
 #include "Network/NetworkStack.hpp"
 #include "Network/Checksum.hpp"
+#include "Kernel/Thread.hpp"
 
 namespace network {
 
@@ -55,12 +56,21 @@ bool NetworkStack::initialize() {
 
 // ------------------------------------------------------------------ configuration
 
+IpConfiguration NetworkStack::configuration() const {
+  kernel::ScopedRecursiveMutex guard(const_cast<kernel::RecursiveMutex&>(mutex_));
+  return config_;
+}
+
 void NetworkStack::configure(const IpConfiguration& configuration) {
+  kernel::ScopedRecursiveMutex guard(mutex_);
   dhcp_->stop();
   config_ = configuration;
 }
 
-void NetworkStack::start_dhcp() { dhcp_->start(); }
+void NetworkStack::start_dhcp() {
+  kernel::ScopedRecursiveMutex guard(mutex_);
+  dhcp_->start();
+}
 
 void NetworkStack::on_lease(const IpConfiguration& configuration) { config_ = configuration; }
 
@@ -68,22 +78,28 @@ void NetworkStack::on_lease_lost() { config_ = IpConfiguration{}; }
 
 bool NetworkStack::wait_for_address(uint32_t timeout_ms) {
   const uint64_t deadline = now_ms() + timeout_ms;
-  while (!config_.configured()) {
+  while (!configuration().configured()) {  // the lock is taken per step, never held while waiting
     if (now_ms() >= deadline) return false;
     poll();
+    kernel::sleep_us(200);
   }
   return true;
 }
 
 SharedPointer<IUdpSocket> NetworkStack::udp_open(uint16_t port) {
+  kernel::ScopedRecursiveMutex guard(mutex_);
   return SharedPointer<IUdpSocket>(udp_.open(port));
 }
 
-SharedPointer<ITcpSocket> NetworkStack::tcp_open() { return SharedPointer<ITcpSocket>(tcp_.create()); }
+SharedPointer<ITcpSocket> NetworkStack::tcp_open() {
+  kernel::ScopedRecursiveMutex guard(mutex_);
+  return SharedPointer<ITcpSocket>(tcp_.create());
+}
 
 // ------------------------------------------------------------------ receiving
 
 void NetworkStack::poll() {
+  kernel::ScopedRecursiveMutex guard(mutex_);
   uint8_t frame[hardware::kEthernetMaxFrame + 64];
   uint32_t length = 0;
   for (uint32_t i = 0; i < kFramesPerPoll && nic_.receive(frame, sizeof(frame), &length); ++i)
@@ -211,12 +227,14 @@ void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& targ
 }
 
 bool NetworkStack::send_ip(Ipv4Address destination, uint8_t protocol, const uint8_t* payload, uint32_t length) {
+  kernel::ScopedRecursiveMutex guard(mutex_);
   if (!config_.configured()) return false;
   return send_ip_from(config_.address, destination, protocol, payload, length, false);
 }
 
 bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, const uint8_t* payload,
                                 uint32_t length, bool link_broadcast) {
+  kernel::ScopedRecursiveMutex guard(mutex_);
   if (length > kMaxIpPayload || (length && !payload)) return false;
 
   uint8_t packet[kMtu];
@@ -301,7 +319,10 @@ bool NetworkStack::resolve(const char* name, uint32_t timeout_ms, Ipv4Address* a
   SharedPointer<IDnsQuery> query = resolver_->query(name);
   if (!query) return false;
   const uint64_t deadline = now_ms() + timeout_ms;
-  while (query->status() == DnsStatus::Pending && now_ms() < deadline) poll();
+  while (query->status() == DnsStatus::Pending && now_ms() < deadline) {
+    poll();
+    kernel::sleep_us(200);
+  }
   if (query->status() != DnsStatus::Resolved) return false;
   if (address) *address = query->address();
   return true;
@@ -310,7 +331,8 @@ bool NetworkStack::resolve(const char* name, uint32_t timeout_ms, Ipv4Address* a
 // ------------------------------------------------------------------ ping
 
 bool NetworkStack::ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_ms) {
-  if (!config_.configured()) return false;
+  kernel::ScopedMutex one_at_a_time(ping_mutex_);
+  if (!configuration().configured()) return false;
   uint8_t request[8 + 32];
   request[0] = kIcmpEchoRequest;
   request[1] = 0;
@@ -320,13 +342,26 @@ bool NetworkStack::ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_
   for (uint32_t i = 0; i < 32; ++i) request[8 + i] = static_cast<uint8_t>('a' + i % 26);
   store16(request + 2, checksum_finish(checksum_add(0, request, sizeof(request))));
 
-  ping_active_ = true;
-  ping_answered_ = false;
-  ping_target_ = address;
-  ping_sent_ms_ = now_ms();
-  const uint64_t deadline = ping_sent_ms_ + timeout_ms;
-  bool ok = send_ip(address, kProtocolIcmp, request, sizeof(request));
-  while (ok && !ping_answered_ && now_ms() < deadline) poll();
+  bool ok;
+  uint64_t deadline;
+  {
+    kernel::ScopedRecursiveMutex guard(mutex_);
+    ping_active_ = true;
+    ping_answered_ = false;
+    ping_target_ = address;
+    ping_sent_ms_ = now_ms();
+    deadline = ping_sent_ms_ + timeout_ms;
+    ok = send_ip(address, kProtocolIcmp, request, sizeof(request));
+  }
+  for (;;) {
+    {
+      kernel::ScopedRecursiveMutex guard(mutex_);
+      if (!ok || ping_answered_ || now_ms() >= deadline) break;
+    }
+    poll();
+    kernel::sleep_us(200);
+  }
+  kernel::ScopedRecursiveMutex guard(mutex_);
   ok = ok && ping_answered_;
   ping_active_ = false;
   if (ok && rtt_ms) *rtt_ms = static_cast<uint32_t>(ping_rtt_ms_);

@@ -362,6 +362,7 @@ OhciController::Pipe* OhciController::find_pipe(Device& d, uint8_t address) {
 }
 
 bool OhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !max_packet || max_packet > 64) return false;
   Device& d = devices_[port];
   if (find_pipe(d, endpoint_address)) return true;
@@ -377,6 +378,7 @@ bool OhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
 
 bool OhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
                                    uint32_t* transferred) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (transferred) *transferred = 0;
   if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
   Pipe* pipe = find_pipe(devices_[port], endpoint_address);
@@ -410,6 +412,7 @@ bool OhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void
 }
 
 bool OhciController::reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   Pipe* pipe = find_pipe(devices_[port], endpoint_address);
   if (!pipe || pipe->list != List::Bulk) return false;
@@ -419,6 +422,7 @@ bool OhciController::reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address
 
 bool OhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                                         uint8_t /*interval: every frame is polled*/) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !(endpoint_address & 0x80) || !max_packet || max_packet > 64)
     return false;
   Device& d = devices_[port];
@@ -443,6 +447,7 @@ bool OhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
 
 bool OhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer, uint16_t capacity,
                                        uint16_t* length) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !buffer) return false;
   Pipe* pipe = find_pipe(devices_[port], endpoint_address);
   if (!pipe || pipe->list != List::Interrupt) return false;

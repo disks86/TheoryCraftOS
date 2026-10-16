@@ -56,9 +56,21 @@ bool parse_ipv4(const char* text, Ipv4Address* address) {
 struct DnsResolver::Query final : IDnsQuery {
   enum class Phase : uint8_t { Udp, Tcp };
 
-  DnsStatus status() const override { return status_; }
-  Ipv4Address address() const override { return address_; }
-  uint32_t ttl_seconds() const override { return ttl_; }
+  // The resolver updates a query from the stack's poll(); readers take the same lock.
+  DnsStatus status() const override {
+    kernel::ScopedRecursiveMutex guard(*mutex);
+    return status_;
+  }
+  Ipv4Address address() const override {
+    kernel::ScopedRecursiveMutex guard(*mutex);
+    return address_;
+  }
+  uint32_t ttl_seconds() const override {
+    kernel::ScopedRecursiveMutex guard(*mutex);
+    return ttl_;
+  }
+
+  kernel::RecursiveMutex* mutex = nullptr;
 
   DnsStatus status_ = DnsStatus::Pending;
   Ipv4Address address_ = kAnyAddress;
@@ -75,6 +87,16 @@ struct DnsResolver::Query final : IDnsQuery {
   uint8_t tcp_buffer[2 + 4096];
   uint32_t tcp_received = 0;
 };
+
+void DnsResolver::clear_cache() {
+  kernel::ScopedRecursiveMutex guard(stack_.mutex());
+  cache_.clear();
+}
+
+uint32_t DnsResolver::cache_size() const {
+  kernel::ScopedRecursiveMutex guard(stack_.mutex());
+  return static_cast<uint32_t>(cache_.count());
+}
 
 uint32_t DnsResolver::random() {
   if (random_state_ == 0x2545F491) random_state_ ^= static_cast<uint32_t>(stack_.now_ms() * 2654435761u);
@@ -135,6 +157,7 @@ void DnsResolver::remember(const char* name, bool found, Ipv4Address address, ui
 }
 
 SharedPointer<IDnsQuery> DnsResolver::query(const char* name) {
+  kernel::ScopedRecursiveMutex guard(stack_.mutex());
   uint8_t scratch[dns::kMaxName + 1];
   Ipv4Address literal;
   const bool is_address = parse_ipv4(name, &literal);
@@ -142,6 +165,7 @@ SharedPointer<IDnsQuery> DnsResolver::query(const char* name) {
 
   SharedPointer<Query> q = SharedPointer<Query>::make(allocator_);
   if (!q) return SharedPointer<IDnsQuery>();
+  q->mutex = &stack_.mutex();
   if (is_address) {  // an address needs no lookup
     q->status_ = DnsStatus::Resolved;
     q->address_ = literal;

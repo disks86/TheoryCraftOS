@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
+#include "Kernel/Firmware.hpp"
 
 namespace hardware {
 
@@ -58,11 +59,15 @@ bool for_each_matching_handle(efi::SystemTable* st, PciAddress address, Action a
 }  // namespace
 
 bool detach_firmware_drivers(efi::SystemTable* st, PciAddress address) {
-  return for_each_matching_handle(st, address, Action::Disconnect);
+  bool ok = false;
+  kernel::firmware([&] { ok = for_each_matching_handle(st, address, Action::Disconnect); });
+  return ok;
 }
 
 bool reattach_firmware_drivers(efi::SystemTable* st, PciAddress address) {
-  return for_each_matching_handle(st, address, Action::Connect);
+  bool ok = false;
+  kernel::firmware([&] { ok = for_each_matching_handle(st, address, Action::Connect); });
+  return ok;
 }
 
 }  // namespace hardware

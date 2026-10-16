@@ -17,9 +17,11 @@
  */
 
 #pragma once
+#include "Kernel/Delay.hpp"
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Usb/IUsbHostController.hpp"
+#include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -68,8 +70,9 @@ class LegacyHostController : public IUsbHostController {
 
   // Address 0 -> descriptor -> SET_ADDRESS -> descriptors. True if the device is usable.
   bool enumerate_device(uint32_t port, bool low_speed);
-  void delay_us(uint64_t us) const { st_->boot_services->stall(us); }
+  void delay_us(uint64_t us) const { hardware::delay_us(us); }
 
+  kernel::Mutex lock_;  // one thread in the controller at a time
   const IPciBus& pci_;
   PciDeviceInfo device_;
   allocators::IAllocator& allocator_;

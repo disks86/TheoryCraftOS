@@ -21,12 +21,24 @@
 
 namespace network {
 
+uint32_t UdpSocket::pending() const {
+  StackLock guard(ip_);
+  return static_cast<uint32_t>(queue_.count());
+}
+
+void UdpSocket::close() {
+  StackLock guard(ip_);
+  closed_ = true;
+}
+
 bool UdpSocket::send_to(Ipv4Address address, uint16_t port, const uint8_t* data, uint32_t length) {
+  StackLock guard(ip_);
   return send_from(ip_.local_address(), address, port, data, length, false);
 }
 
 bool UdpSocket::send_from(Ipv4Address source, Ipv4Address address, uint16_t port, const uint8_t* data,
                           uint32_t length, bool link_broadcast) {
+  StackLock guard(ip_);
   if (closed_ || (length && !data) || length > kMaxDatagram) return false;
   uint8_t packet[8 + kMaxDatagram];
   store16(packet, port_);
@@ -45,6 +57,7 @@ bool UdpSocket::send_from(Ipv4Address source, Ipv4Address address, uint16_t port
 
 bool UdpSocket::receive_from(uint8_t* buffer, uint32_t capacity, Ipv4Address* from_address, uint16_t* from_port,
                              uint32_t* length) {
+  StackLock guard(ip_);
   Datagram d;
   if (!queue_.dequeue(&d)) return false;
   const uint32_t n = d.length < capacity ? d.length : capacity;
@@ -57,6 +70,7 @@ bool UdpSocket::receive_from(uint8_t* buffer, uint32_t capacity, Ipv4Address* fr
 }
 
 void UdpSocket::deliver(Ipv4Address from_address, uint16_t from_port, const uint8_t* data, uint32_t length) {
+  StackLock guard(ip_);
   if (closed_ || length > kMaxDatagram || queue_.count() >= kQueueLimit) return;
   Datagram d;
   d.from_address = from_address;

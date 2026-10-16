@@ -34,12 +34,12 @@ class UdpSocket final : public IUdpSocket {
   UdpSocket(IIpLayer& ip, allocators::IAllocator& allocator, uint16_t port)
       : ip_(ip), port_(port), queue_(allocator) {}
 
-  uint16_t local_port() const override { return port_; }
+  uint16_t local_port() const override { return port_; }  // fixed at creation
   bool send_to(Ipv4Address address, uint16_t port, const uint8_t* data, uint32_t length) override;
   bool receive_from(uint8_t* buffer, uint32_t capacity, Ipv4Address* from_address, uint16_t* from_port,
                     uint32_t* length) override;
-  uint32_t pending() const override { return static_cast<uint32_t>(queue_.count()); }
-  void close() override { closed_ = true; }
+  uint32_t pending() const override;
+  void close() override;
 
   // Like send_to() but with an explicit source address, which may be 0.0.0.0, and
   // optionally as a link-layer broadcast. DHCP uses it before it has an address.

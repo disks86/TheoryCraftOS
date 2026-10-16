@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
+#include "Kernel/Interrupts.hpp"
 
 // A mutual-exclusion lock for the cores of this machine. A waiting core spins,
 // calling the CPU's pause() between looks so it does not hammer the cache line
@@ -26,26 +27,45 @@
 // Keep critical sections short and never wait on anything inside one. The lock
 // is not re-entrant: taking it again on the core that holds it, e.g. by calling
 // back into the same concurrent container from inside a callback, deadlocks.
-// There is no fairness guarantee. Cooperative scheduling (no preemption) and the
-// absence of interrupt handlers that take locks are what make spinning safe here.
+// There is no fairness guarantee. Masking interrupts while held is what
+// makes spinning safe with preemptive threads.
 class SpinLock {
  public:
   explicit SpinLock(const hardware::ICentralProcessingUnit& cpu) : cpu_(cpu) {}
   SpinLock(const SpinLock&) = delete;
   SpinLock& operator=(const SpinLock&) = delete;
 
+  // Interrupts are masked while the lock is held, so a thread cannot be preempted
+  // inside a critical section (another thread on this core would then spin on the
+  // lock for its whole time slice) and an interrupt handler can never find the
+  // lock held by the code it interrupted.
   void lock() {
+    const uint64_t flags = kernel::irq_save();
     while (__atomic_exchange_n(&locked_, 1, __ATOMIC_ACQUIRE)) {
       // Wait with plain loads until it looks free; only then retry the exchange.
       while (__atomic_load_n(&locked_, __ATOMIC_RELAXED)) cpu_.pause();
     }
+    saved_flags_ = flags;
   }
-  bool try_lock() { return !__atomic_exchange_n(&locked_, 1, __ATOMIC_ACQUIRE); }
-  void unlock() { __atomic_store_n(&locked_, 0, __ATOMIC_RELEASE); }
+  bool try_lock() {
+    const uint64_t flags = kernel::irq_save();
+    if (__atomic_exchange_n(&locked_, 1, __ATOMIC_ACQUIRE)) {
+      kernel::irq_restore(flags);
+      return false;
+    }
+    saved_flags_ = flags;
+    return true;
+  }
+  void unlock() {
+    const uint64_t flags = saved_flags_;
+    __atomic_store_n(&locked_, 0, __ATOMIC_RELEASE);
+    kernel::irq_restore(flags);
+  }
 
  private:
   const hardware::ICentralProcessingUnit& cpu_;
   uint32_t locked_ = 0;
+  uint64_t saved_flags_ = 0;  // interrupt state of the holder, restored on unlock
 };
 
 // Holds a SpinLock for the lifetime of the object.

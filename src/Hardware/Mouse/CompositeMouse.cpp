@@ -27,6 +27,7 @@ bool CompositeMouse::add(IMouse* mouse) {
 }
 
 bool CompositeMouse::poll(MouseEvent* out) {
+  kernel::ScopedMutex guard(mutex_);
   for (uint32_t i = 0; i < count_; ++i) {
     IMouse* m = mice_[(next_ + i) % count_];
     if (m->poll(out)) {

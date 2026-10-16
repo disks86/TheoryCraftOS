@@ -65,6 +65,7 @@ class VirtioScsiController {
     uint8_t sense[96];
   } __attribute__((packed));
 
+  kernel::Mutex mutex_;  // one command in flight on the shared queue
   VirtioPciDevice transport_;
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;

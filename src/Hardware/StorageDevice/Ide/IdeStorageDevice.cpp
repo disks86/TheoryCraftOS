@@ -196,6 +196,7 @@ bool IdeStorageDevice::atapi_command(const uint8_t* cdb, void* data, uint32_t by
 }
 
 bool IdeStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
+  kernel::ScopedMutex guard(controller_->channel_mutex(channel_index_));
   uint16_t* words = static_cast<uint16_t*>(dma);
   if (atapi_) {
     if (write) return false;
@@ -233,6 +234,7 @@ bool IdeStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void*
 }
 
 bool IdeStorageDevice::flush_cache() {
+  kernel::ScopedMutex guard(controller_->channel_mutex(channel_index_));
   if (atapi_) return true;
   select(0);
   if (!wait_not_busy(2000)) return false;

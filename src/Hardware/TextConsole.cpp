@@ -17,10 +17,13 @@
  */
 
 #include "Hardware/TextConsole.hpp"
+#include "Kernel/Firmware.hpp"
 
 namespace hardware {
 void TextConsole::put(char c) const {
-  if (!st_ || !st_->con_out) return;
+  // Firmware output only from a context that may call the firmware (the console
+  // lock keeps the call exclusive); other threads reach the debug console only.
+  if (!st_ || !st_->con_out || !kernel::may_call_firmware_directly()) return;
   efi::Char16 buf[3] = {};
   if (c == '\n') { buf[0] = u'\r'; buf[1] = u'\n'; }
   else           { buf[0] = static_cast<efi::Char16>(c); }

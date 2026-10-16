@@ -42,6 +42,26 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   listed); `src/StorageDemo` reports each device, cross-checks reads and, only on a device whose first block begins
   with `TCOS-SCRATCH`, tests write/flush/read-back. Not covered: floppy and SD/MMC (only through the firmware),
   and the LSI/MegaRAID/MPT/PVSCSI SCSI adapters (only if the firmware has a driver for them - the stock OVMF does not).
+- `src/Kernel/`: the preemptive multithreading core. `Interrupts` builds a GDT/IDT (256 assembly stubs saving the full
+  register and x87/SSE state as a `Frame`), `Apic` drives each core's local APIC (calibrated timer tick, wake-up IPIs),
+  `ThreadScheduler` (`kernel::start()`) turns the boot context into the main thread (pinned to the boot core), parks
+  the other cores in the scheduler (started through the firmware's MP services *before* the tables are replaced),
+  and runs kernel threads from one run queue: round-robin with a time slice, per-thread core affinity and
+  Performance/Efficiency preference, `sleep`, `join`, `detach`, idle cores woken by IPI. `Sync` has blocking
+  `Mutex`, `RecursiveMutex`, `Semaphore`, `Event` (manual/auto reset), `ConditionVariable`, all with timeouts where
+  they make sense; `RawSpinLock` is the dependency-free spinlock for the lowest layers. `Delay` gives every core
+  TSC-based `delay_us()`/`uptime_us()` (long delays sleep instead of spinning), replacing the firmware's Stall().
+  `Firmware` (`kernel::firmware([&]{...})`) funnels every post-start UEFI call through the boot core, one at a time.
+  Boot services are *not* exited (so drivers can still be handed back to the firmware); the legacy PIC is masked while
+  the kernel runs and the firmware's tables are restored by `kernel::stop()`.
+- Thread safety: `SpinLock` now masks interrupts while held; the allocator is used through one `ThreadSafeAllocator`
+  everywhere; the console serializes output (`console::Guard` keeps several calls together); PCI config access, the
+  i8042, every USB host controller, each storage device (plus shared controller/channel state), each NIC and the input
+  devices have their own locks; each `NetworkStack` has a recursive lock taken by every public call of the stack, its
+  sockets and its resolver, and `NetworkStackSet::start_service()` runs a thread that polls all stacks. `ICPUScheduler`
+  tasks now run as kernel threads. Everything is still polled (no device interrupts); waits sleep instead of spinning.
+  `src/KernelDemo` and `src/ThreadSafetyDemo` stress all of it from many threads (allocator, console, concurrent
+  storage reads/writes across every controller type, UDP/TCP/DNS/ping through one stack).
 - `src/Synchronization/`: `SpinLock`/`ScopedLock` (spin with the CPU interface's `pause()`), `Synchronized<T>`
   (any type behind a lock; `with()` for one locked operation, `access()` for a lock-holding handle that can
   be iterated) and `AtomicSharedPointer<T>`. `Allocators/ThreadSafeAllocator` serializes any allocator.

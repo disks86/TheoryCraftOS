@@ -1,0 +1,583 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include <new>
+#include "Kernel/Apic.hpp"
+#include "Kernel/Delay.hpp"
+#include "Kernel/Firmware.hpp"
+#include "Kernel/Thread.hpp"
+
+namespace kernel {
+
+namespace {
+
+constexpr uint32_t kMaxCores = 128;
+constexpr uint32_t kSliceTicks = 10;
+
+struct Core {
+  Core* self = nullptr;  // first field: read through the GS base
+  uint32_t index = 0;
+  uint32_t apic_id = 0;
+  bool online = false;
+  bool parked = false;
+  hardware::CoreKind kind = hardware::CoreKind::Performance;
+  uint32_t slice = kSliceTicks;
+  Thread* current = nullptr;
+  Thread* idle = nullptr;
+};
+
+struct ApStart {
+  uint32_t core;
+};
+
+struct Scheduler {
+  uint32_t lock_word = 0;
+  Core cores[kMaxCores];
+  ApStart ap_start[kMaxCores];
+  uint32_t core_count = 1;
+  uint32_t boot_core = 0;
+  Thread* queue_head = nullptr;
+  Thread* queue_tail = nullptr;
+  Thread* sleepers = nullptr;
+  Thread* zombies = nullptr;
+  allocators::IAllocator* allocator = nullptr;
+  hardware::ICentralProcessingUnit* cpu = nullptr;
+  uint64_t tsc_per_us = 0;
+  uint32_t tick_hz = 1000;
+  uint64_t next_id = 1;
+  uint32_t aps_ready = 0;
+  uint64_t firmware_gs_base = 0;
+  volatile bool go = false;  // the boot core finished setting up; application processors may load the tables
+  volatile bool running = false;
+  volatile bool stopping = false;
+};
+
+Scheduler g;
+alignas(16) uint8_t g_fpu_template[512];
+
+constexpr uint32_t kMsrGsBase = 0xC0000101;
+
+uint64_t rdmsr(uint32_t msr) {
+  uint32_t low, high;
+  __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+  return (uint64_t{high} << 32) | low;
+}
+void wrmsr(uint32_t msr, uint64_t value) {
+  __asm__ volatile("wrmsr" ::"c"(msr), "a"(static_cast<uint32_t>(value)), "d"(static_cast<uint32_t>(value >> 32)));
+}
+
+Core* this_core() {
+  Core* c;
+  __asm__ volatile("movq %%gs:0, %0" : "=r"(c));
+  return c;
+}
+
+inline void pause_hint() { __asm__ volatile("pause"); }
+
+// ---- the scheduler lock (spin + interrupts masked) ----
+
+uint64_t lock_irq() {
+  const uint64_t flags = irq_save();
+  while (__atomic_exchange_n(&g.lock_word, 1, __ATOMIC_ACQUIRE)) {
+    while (__atomic_load_n(&g.lock_word, __ATOMIC_RELAXED)) pause_hint();
+  }
+  return flags;
+}
+void unlock_irq(uint64_t flags) {
+  __atomic_store_n(&g.lock_word, 0, __ATOMIC_RELEASE);
+  irq_restore(flags);
+}
+
+// ---- run queue / wait lists (doubly linked through prev/next); lock held ----
+
+void list_append(WaitList* list, Thread* t) {
+  t->next = nullptr;
+  t->prev = list->tail;
+  if (list->tail) list->tail->next = t;
+  else list->head = t;
+  list->tail = t;
+}
+
+void list_remove(WaitList* list, Thread* t) {
+  if (t->prev) t->prev->next = t->next;
+  else list->head = t->next;
+  if (t->next) t->next->prev = t->prev;
+  else list->tail = t->prev;
+  t->prev = t->next = nullptr;
+}
+
+WaitList* run_queue() {
+  static_assert(sizeof(WaitList) == 2 * sizeof(Thread*));
+  return reinterpret_cast<WaitList*>(&g.queue_head);  // queue_head, queue_tail are adjacent
+}
+
+void sleepers_insert(Thread* t) {
+  Thread** link = &g.sleepers;
+  while (*link && static_cast<int64_t>((*link)->wake_tsc - t->wake_tsc) <= 0) link = &(*link)->sleep_next;
+  t->sleep_next = *link;
+  *link = t;
+  t->in_sleepers = true;
+}
+
+void sleepers_remove(Thread* t) {
+  Thread** link = &g.sleepers;
+  while (*link && *link != t) link = &(*link)->sleep_next;
+  if (*link) *link = t->sleep_next;
+  t->sleep_next = nullptr;
+  t->in_sleepers = false;
+}
+
+// A core running only its idle thread can be told that work arrived.
+void poke_idle_core(const Thread* t) {
+  const Core* self = g.running ? this_core() : nullptr;
+  for (uint32_t i = 0; i < g.core_count; ++i) {
+    const Core& c = g.cores[i];
+    if (!c.online || &c == self || !c.current || !c.current->is_idle) continue;
+    if (t->affinity >= 0 && static_cast<uint32_t>(t->affinity) != i) continue;
+    apic::send_ipi(c.apic_id, kVectorWakeup);
+    return;
+  }
+}
+
+void enqueue_locked(Thread* t) {
+  t->state = ThreadState::Ready;
+  list_append(run_queue(), t);
+  poke_idle_core(t);
+}
+
+void make_ready_locked(Thread* t) {
+  if (t->state == ThreadState::Zombie || t->state == ThreadState::Ready) return;
+  t->state = ThreadState::Ready;
+  if (!t->on_cpu) {  // otherwise its core queues it as soon as it has saved the registers
+    list_append(run_queue(), t);
+    poke_idle_core(t);
+  }
+}
+
+bool eligible(const Thread* t, const Core* c, bool match_kind) {
+  if (t->affinity >= 0 && static_cast<uint32_t>(t->affinity) != c->index) return false;
+  if (match_kind && t->preferred_kind >= 0 && t->preferred_kind != static_cast<int8_t>(c->kind)) return false;
+  return true;
+}
+
+Thread* find_eligible(const Core* c) {
+  for (Thread* t = g.queue_head; t; t = t->next)
+    if (eligible(t, c, true)) return t;
+  for (Thread* t = g.queue_head; t; t = t->next)
+    if (eligible(t, c, false)) return t;
+  return nullptr;
+}
+
+// Decides what runs on this core after an interrupt or a yield. `frame` is the
+// state of the interrupted context. Lock held. Returns the frame to resume.
+Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
+  Thread* prev = c->current;
+  if (!voluntary && prev->state == ThreadState::Running) {
+    Thread* wanted = find_eligible(c);
+    if (!wanted) return frame;                                      // nobody else wants the core
+    if (!prev->is_idle && c->slice > 0) return frame;               // keeps running until its slice ends
+  }
+  prev->saved = frame;
+  prev->on_cpu = false;
+  if (prev->state == ThreadState::Running) prev->state = ThreadState::Ready;
+  if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(), prev);
+
+  Thread* next = find_eligible(c);
+  if (next) list_remove(run_queue(), next);
+  else next = c->idle;
+  next->state = ThreadState::Running;
+  next->on_cpu = true;
+  c->current = next;
+  c->slice = kSliceTicks;
+  return next->saved;
+}
+
+[[noreturn]] void park_core(Core* c) {
+  c->parked = true;
+  apic::stop_timer();
+  for (;;) __asm__ volatile("cli; hlt");
+}
+
+Frame* on_timer(Frame* frame, void*) {
+  apic::eoi();
+  Core* c = this_core();
+  if (g.stopping && c->index != g.boot_core) park_core(c);
+  const uint64_t flags = lock_irq();
+  const uint64_t now = hardware::read_tsc();
+  while (g.sleepers && static_cast<int64_t>(g.sleepers->wake_tsc - now) <= 0) {
+    Thread* t = g.sleepers;
+    g.sleepers = t->sleep_next;
+    t->sleep_next = nullptr;
+    t->in_sleepers = false;
+    if (t->waiting_on) {
+      list_remove(t->waiting_on, t);
+      t->waiting_on = nullptr;
+      t->timed_out = true;
+    }
+    make_ready_locked(t);
+  }
+  if (c->slice > 0) --c->slice;
+  Frame* result = reschedule_locked(frame, c, false);
+  unlock_irq(flags);
+  return result;
+}
+
+Frame* on_yield(Frame* frame, void*) {
+  Core* c = this_core();
+  const uint64_t flags = lock_irq();
+  Frame* result = reschedule_locked(frame, c, true);
+  unlock_irq(flags);
+  return result;
+}
+
+Frame* on_wakeup(Frame* frame, void*) {
+  apic::eoi();
+  Core* c = this_core();
+  if (g.stopping && c->index != g.boot_core) park_core(c);
+  const uint64_t flags = lock_irq();
+  Frame* result = reschedule_locked(frame, c, false);
+  unlock_irq(flags);
+  return result;
+}
+
+// ---- thread creation ----
+
+void thread_main(Thread* t) {
+  t->entry(t->argument);
+  exit_thread();
+}
+
+void build_initial_frame(Thread* t, uint32_t stack_bytes) {
+  uint8_t* top = t->stack + stack_bytes;  // 16-byte aligned
+  Frame* f = reinterpret_cast<Frame*>(reinterpret_cast<uint64_t>(top - 64 - sizeof(Frame)) & ~uint64_t{15});
+  __builtin_memcpy(f->fpu, g_fpu_template, sizeof(f->fpu));
+  f->r15 = f->r14 = f->r13 = f->r12 = f->r11 = f->r10 = f->r9 = f->r8 = 0;
+  f->rdi = f->rsi = f->rbp = f->rbx = f->rdx = f->rax = 0;
+  f->rcx = reinterpret_cast<uint64_t>(t);  // first argument (Microsoft x64 ABI)
+  f->vector = 0;
+  f->error = 0;
+  f->rip = reinterpret_cast<uint64_t>(&thread_main);
+  f->cs = kSelectorCode;
+  f->rflags = 0x202;
+  f->rsp = reinterpret_cast<uint64_t>(top) - 8;  // as if entered by a call
+  f->ss = kSelectorData;
+  t->saved = f;
+}
+
+Thread* make_thread(ThreadFunction fn, void* argument, const char* name, int32_t core, int8_t kind, uint32_t stack_bytes) {
+  void* memory = g.allocator->allocate(sizeof(Thread));
+  if (!memory) return nullptr;
+  Thread* t = new (memory) Thread();
+  t->stack = static_cast<uint8_t*>(g.allocator->allocate_aligned(stack_bytes, 16));
+  if (!t->stack) {
+    g.allocator->deallocate(t);
+    return nullptr;
+  }
+  t->entry = fn;
+  t->argument = argument;
+  t->name = name;
+  t->affinity = core;
+  t->preferred_kind = kind;
+  build_initial_frame(t, stack_bytes);
+  return t;
+}
+
+// A thread object for the context already running on this core (no stack of its own).
+Thread* adopt_context(const char* name, bool idle, int32_t core) {
+  void* memory = g.allocator->allocate(sizeof(Thread));
+  if (!memory) return nullptr;
+  Thread* t = new (memory) Thread();
+  t->name = name;
+  t->is_idle = idle;
+  t->affinity = core;
+  t->state = ThreadState::Running;
+  t->on_cpu = true;
+  return t;
+}
+
+uint32_t reap_zombies_impl() {
+  if (!g.zombies) return 0;
+  Thread* done = nullptr;
+  const uint64_t flags = lock_irq();
+  Thread** link = &g.zombies;
+  while (*link) {
+    Thread* t = *link;
+    if (t->on_cpu) {
+      link = &t->next;
+      continue;
+    }
+    *link = t->next;
+    t->next = done;
+    done = t;
+  }
+  uint32_t left = 0;
+  for (Thread* t = g.zombies; t; t = t->next) ++left;
+  unlock_irq(flags);
+  while (done) {
+    Thread* t = done;
+    done = t->next;
+    g.allocator->deallocate(t->stack);
+    g.allocator->deallocate(t);
+  }
+  return left;
+}
+
+void idle_loop(void*) {
+  for (;;) {
+    reap_zombies_impl();
+    __asm__ volatile("sti; hlt");
+  }
+}
+
+// What each application processor runs, forever, after the firmware hands it over.
+void ap_main(void* context) {
+  const ApStart* start = static_cast<ApStart*>(context);
+  while (!__atomic_load_n(&g.go, __ATOMIC_ACQUIRE)) pause_hint();
+  Core* c = &g.cores[start->core];
+  interrupts_load(false);
+  apic::enable_this_core();
+  c->self = c;
+  c->index = start->core;
+  c->apic_id = apic::this_apic_id();
+  c->kind = g.cpu->core_kind(start->core);
+  wrmsr(kMsrGsBase, reinterpret_cast<uint64_t>(c));
+  Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
+  if (!idle) for (;;) __asm__ volatile("cli; hlt");
+  c->idle = c->current = idle;
+  c->online = true;
+  __atomic_add_fetch(&g.aps_ready, 1, __ATOMIC_SEQ_CST);
+  apic::start_timer(g.tick_hz);
+  for (;;) __asm__ volatile("sti; hlt");
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------- public API
+
+bool running() { return g.running; }
+
+uint32_t reap_zombies() { return reap_zombies_impl(); }
+
+uint32_t current_core() { return g.running ? this_core()->index : 0; }
+uint32_t core_count() { return g.running ? g.core_count : 1; }
+
+Thread* current_thread() { return g.running ? this_core()->current : nullptr; }
+
+bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& allocator, uint32_t tick_hz) {
+  if (g.running || !hardware::tsc_ticks_per_us()) return false;
+  g.cpu = &cpu;
+  g.allocator = &allocator;
+  g.tsc_per_us = hardware::tsc_ticks_per_us();
+  g.tick_hz = tick_hz;
+  g.boot_core = cpu.current_core();
+  g.core_count = cpu.core_count() < kMaxCores ? cpu.core_count() : kMaxCores;
+  __asm__ volatile("fxsave %0" : "=m"(g_fpu_template));
+  // Application processors are started first, while the firmware's services still
+  // work normally; they wait in ap_main until the boot core has set everything up.
+  uint32_t expected = 0;
+  for (uint32_t core = 0; core < g.core_count; ++core) {
+    if (core == g.boot_core) continue;
+    g.ap_start[core].core = core;
+    if (cpu.start_on_core(core, ap_main, &g.ap_start[core])) ++expected;
+  }
+  const uint64_t flags = irq_save();
+  interrupts_init();
+  interrupts_load(true);
+  if (!apic::init_boot_core()) {
+    interrupts_restore_firmware();
+    irq_restore(flags);
+    return false;
+  }
+  set_interrupt_handler(kVectorTimer, on_timer, nullptr);
+  set_interrupt_handler(kVectorYield, on_yield, nullptr);
+  set_interrupt_handler(kVectorWakeup, on_wakeup, nullptr);
+
+  Core* boot = &g.cores[g.boot_core];
+  boot->self = boot;
+  boot->index = g.boot_core;
+  boot->apic_id = apic::this_apic_id();
+  boot->kind = cpu.core_kind(g.boot_core);
+  g.firmware_gs_base = rdmsr(kMsrGsBase);
+  wrmsr(kMsrGsBase, reinterpret_cast<uint64_t>(boot));
+
+  // The caller becomes the main thread, pinned here so it may keep calling firmware.
+  Thread* main_thread = adopt_context("main", false, static_cast<int32_t>(g.boot_core));
+  Thread* idle = make_thread(idle_loop, nullptr, "idle", static_cast<int32_t>(g.boot_core), -1, 16 * 1024);
+  if (!main_thread || !idle) {
+    wrmsr(kMsrGsBase, g.firmware_gs_base);
+    interrupts_restore_firmware();
+    irq_restore(flags);
+    return false;
+  }
+  idle->is_idle = true;
+  idle->state = ThreadState::Ready;
+  main_thread->id = g.next_id++;
+  boot->current = main_thread;
+  boot->idle = idle;
+  boot->online = true;
+  g.running = true;
+
+  __atomic_store_n(&g.go, true, __ATOMIC_RELEASE);
+  for (int i = 0; i < 2000 && __atomic_load_n(&g.aps_ready, __ATOMIC_SEQ_CST) < expected; ++i) hardware::delay_us(1000);
+  apic::start_timer(tick_hz);
+  hardware::set_sleep_function(sleep_us);  // long driver delays now give the core away
+  irq_restore(flags | kRflagsInterrupts);
+  irq_enable();
+  firmware_service_start();  // from now on firmware calls go through kernel::firmware()
+  return true;
+}
+
+void stop() {
+  if (!g.running) return;
+  hardware::set_sleep_function(nullptr);
+  g.stopping = true;
+  for (uint32_t i = 0; i < g.core_count; ++i) {
+    Core& c = g.cores[i];
+    if (!c.online || i == g.boot_core) continue;
+    apic::send_ipi(c.apic_id, kVectorWakeup);
+    for (int k = 0; k < 100 && !c.parked; ++k) hardware::delay_us(1000);
+  }
+  irq_disable();
+  apic::stop_timer();
+  g.running = false;
+  wrmsr(kMsrGsBase, g.firmware_gs_base);
+  interrupts_restore_firmware();
+  irq_enable();
+}
+
+Thread* spawn(ThreadFunction fn, void* argument, const char* name, int32_t core, int8_t preferred_kind,
+              uint32_t stack_bytes) {
+  if (!g.running || !fn) return nullptr;
+  reap_zombies_impl();
+  Thread* t = make_thread(fn, argument, name, core, preferred_kind, stack_bytes);
+  if (!t) return nullptr;
+  const uint64_t flags = lock_irq();
+  t->id = g.next_id++;
+  enqueue_locked(t);
+  unlock_irq(flags);
+  return t;
+}
+
+void yield() {
+  if (!g.running) return;
+  __asm__ volatile("int %0" ::"i"(kVectorYield) : "memory");
+}
+
+void sleep_us(uint64_t us) {
+  if (!g.running) {
+    hardware::delay_spin_us(us);
+    return;
+  }
+  if (us == 0) {
+    yield();
+    return;
+  }
+  const uint64_t flags = lock_irq();
+  detail::block_current_locked(nullptr, us);
+  unlock_irq(flags);
+  yield();
+}
+
+void exit_thread() {
+  Thread* me = current_thread();
+  const uint64_t flags = lock_irq();
+  me->state = ThreadState::Zombie;
+  detail::wake_all_locked(&me->joiners);
+  if (me->detached) {
+    me->next = g.zombies;
+    g.zombies = me;
+  }
+  unlock_irq(flags);
+  for (;;) yield();
+}
+
+bool join(Thread* t, uint64_t timeout_us) {
+  if (!t) return false;
+  const uint64_t deadline = timeout_us ? hardware::read_tsc() + timeout_us * g.tsc_per_us : 0;
+  for (;;) {
+    const uint64_t flags = lock_irq();
+    if (t->state == ThreadState::Zombie) {
+      unlock_irq(flags);
+      break;
+    }
+    uint64_t remaining = 0;
+    if (deadline) {
+      const int64_t left = static_cast<int64_t>(deadline - hardware::read_tsc());
+      if (left <= 0) {
+        unlock_irq(flags);
+        return false;
+      }
+      remaining = static_cast<uint64_t>(left) / g.tsc_per_us + 1;
+    }
+    detail::block_current_locked(&t->joiners, remaining);
+    unlock_irq(flags);
+    yield();
+  }
+  while (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) yield();  // its core is still leaving it
+  g.allocator->deallocate(t->stack);
+  g.allocator->deallocate(t);
+  return true;
+}
+
+void detach(Thread* t) {
+  if (!t) return;
+  const uint64_t flags = lock_irq();
+  t->detached = true;
+  if (t->state == ThreadState::Zombie) {
+    t->next = g.zombies;
+    g.zombies = t;
+  }
+  unlock_irq(flags);
+}
+
+namespace detail {
+
+uint64_t lock() { return lock_irq(); }
+void unlock(uint64_t flags) { unlock_irq(flags); }
+
+void block_current_locked(WaitList* list, uint64_t timeout_us) {
+  Thread* t = this_core()->current;
+  t->state = ThreadState::Blocked;
+  t->timed_out = false;
+  t->waiting_on = list;
+  if (list) list_append(list, t);
+  if (timeout_us) {
+    t->wake_tsc = hardware::read_tsc() + timeout_us * g.tsc_per_us;
+    sleepers_insert(t);
+  }
+}
+
+bool wake_one_locked(WaitList* list) {
+  Thread* t = list->head;
+  if (!t) return false;
+  list_remove(list, t);
+  t->waiting_on = nullptr;
+  if (t->in_sleepers) sleepers_remove(t);
+  make_ready_locked(t);
+  return true;
+}
+
+uint32_t wake_all_locked(WaitList* list) {
+  uint32_t n = 0;
+  while (wake_one_locked(list)) ++n;
+  return n;
+}
+
+}  // namespace detail
+
+}  // namespace kernel

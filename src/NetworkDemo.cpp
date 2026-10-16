@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
 #include "NetworkDemo.hpp"
 #include "console.hpp"
 
@@ -79,7 +80,7 @@ bool run_network_probe(hardware::INetworkInterface& nic, efi::SystemTable* st) {
         answered = true;
         break;
       }
-      if (!answered) st->boot_services->stall(1000);
+      if (!answered) hardware::delay_us(1000);
     }
   } else {
     console::puts("    could not send\n");
@@ -100,7 +101,7 @@ bool run_network_probe(hardware::INetworkInterface& nic, efi::SystemTable* st) {
     uint32_t reply_length = 0;
     while (nic.receive(reply, sizeof(reply), &reply_length))
       if (reply_length >= 42 && reply[12] == 0x08 && reply[13] == 0x06 && reply[21] == 0x02) ++replies;
-    st->boot_services->stall(1000);
+    hardware::delay_us(1000);
   }
   console::puts("    burst: sent ");
   console::put_dec(sent);

@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Pci/PciBusBase.hpp"
 #include "Hardware/IoPort.hpp"
+#include "Kernel/RawSpinLock.hpp"
 
 namespace hardware {
 
@@ -41,6 +42,7 @@ class LegacyPciBus final : public PciBusBase<IPciBus> {
 
   IoPort address_port_{kConfigAddress};
   IoPort data_port_{kConfigData};
+  mutable kernel::RawSpinLock lock_;  // the address/data pair must not interleave between threads
 };
 
 }  // namespace hardware

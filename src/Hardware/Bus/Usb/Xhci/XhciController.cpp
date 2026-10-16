@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
+#include "Kernel/Sync.hpp"
 #include "Hardware/Bus/Usb/Xhci/XhciController.hpp"
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
 
@@ -56,7 +58,7 @@ UsbSpeed to_usb_speed(uint32_t id) {
 
 // ---------------------------------------------------------------- helpers
 
-void XhciController::delay_us(uint64_t us) const { st_->boot_services->stall(us); }
+void XhciController::delay_us(uint64_t us) const { hardware::delay_us(us); }
 
 bool XhciController::wait_for(uint64_t address, uint32_t mask, uint32_t value, uint32_t timeout_ms) {
   for (uint32_t waited = 0; waited <= timeout_ms * 10; ++waited) {
@@ -434,6 +436,7 @@ bool XhciController::configuration_descriptor(uint32_t port, uint8_t* buffer, ui
 }
 
 bool XhciController::set_configuration(uint32_t port, uint8_t configuration) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   Device& d = devices_[port];
   if (d.configuration == configuration) return true;
@@ -444,12 +447,14 @@ bool XhciController::set_configuration(uint32_t port, uint8_t configuration) {
 
 bool XhciController::control_out(uint32_t port, uint8_t request_type, uint8_t request,
                                  uint16_t value, uint16_t index) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   return transfer(devices_[port], request_type, request, value, index, 0, false);
 }
 
 bool XhciController::control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
                                 uint16_t index, void* buffer, uint16_t length) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !buffer || length > 4096) return false;
   if (!transfer(devices_[port], request_type, request, value, index, length, true)) return false;
   __builtin_memcpy(buffer, buffer_, length);
@@ -465,6 +470,7 @@ void XhciController::arm_endpoint(Device& d, InterruptEndpoint& e) {
 
 bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                                         uint8_t interval) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !(endpoint_address & 0x80)) return false;
   Device& d = devices_[port];
   InterruptEndpoint* e = nullptr;
@@ -559,6 +565,7 @@ void XhciController::pump_events() {
 
 bool XhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, void* buffer,
                                        uint16_t capacity, uint16_t* length) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !buffer) return false;
   Device& d = devices_[port];
   pump_events();
@@ -577,6 +584,7 @@ bool XhciController::poll_interrupt_in(uint32_t port, uint8_t endpoint_address, 
 // ------------------------------------------------------------ bulk endpoints
 
 bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !max_packet) return false;
   Device& d = devices_[port];
   BulkEndpoint* e = nullptr;
@@ -621,6 +629,7 @@ bool XhciController::start_bulk_endpoint(uint32_t port, uint8_t endpoint_address
 
 bool XhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void* data, uint32_t length,
                                    uint32_t* transferred) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (transferred) *transferred = 0;
   if (port >= ports_ || !devices_[port].present || length > 0x10000) return false;
   const uint64_t address = reinterpret_cast<uint64_t>(data);
@@ -643,6 +652,7 @@ bool XhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, void
 }
 
 bool XhciController::reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   Device& d = devices_[port];
   for (BulkEndpoint& e : d.bulk) {

@@ -81,6 +81,7 @@ void VirtioNetworkInterface::reclaim_transmitted() {
 }
 
 bool VirtioNetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
@@ -105,6 +106,7 @@ bool VirtioNetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
 }
 
 bool VirtioNetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !buffer || !length) return false;
   uint16_t id;
   uint32_t written;

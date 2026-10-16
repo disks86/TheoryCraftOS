@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Bus/Usb/Legacy/LegacyHostController.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace hardware {
 
@@ -38,6 +39,7 @@ bool LegacyHostController::configuration_descriptor(uint32_t port, uint8_t* buff
 }
 
 bool LegacyHostController::set_configuration(uint32_t port, uint8_t configuration) {
+  kernel::ScopedMutex lock_guard(lock_);
   DeviceState* d = state(port);
   if (!d || !d->present) return false;
   if (d->configuration == configuration) return true;
@@ -48,6 +50,7 @@ bool LegacyHostController::set_configuration(uint32_t port, uint8_t configuratio
 
 bool LegacyHostController::control_out(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
                                        uint16_t index) {
+  kernel::ScopedMutex lock_guard(lock_);
   const DeviceState* d = state(port);
   if (!d || !d->present) return false;
   return control_transfer(port, request_type, request, value, index, nullptr, 0, false);
@@ -55,6 +58,7 @@ bool LegacyHostController::control_out(uint32_t port, uint8_t request_type, uint
 
 bool LegacyHostController::control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
                                       uint16_t index, void* buffer, uint16_t length) {
+  kernel::ScopedMutex lock_guard(lock_);
   const DeviceState* d = state(port);
   if (!d || !d->present || !buffer || length > 4096) return false;
   return control_transfer(port, request_type, request, value, index, buffer, length, true);

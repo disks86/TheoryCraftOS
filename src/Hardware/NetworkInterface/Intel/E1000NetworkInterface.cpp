@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
 #include "Hardware/NetworkInterface/Intel/E1000NetworkInterface.hpp"
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
 
@@ -60,7 +61,7 @@ bool E1000NetworkInterface::initialize() {
   // Reset, then keep interrupts off: everything here is polled.
   write(kImc, 0xFFFFFFFF);
   write(kCtrl, read(kCtrl) | kCtrlReset);
-  for (int i = 0; i < 1000 && (read(kCtrl) & kCtrlReset); ++i) st_->boot_services->stall(1000);
+  for (int i = 0; i < 1000 && (read(kCtrl) & kCtrlReset); ++i) hardware::delay_us(1000);
   write(kImc, 0xFFFFFFFF);
   write(kCtrl, (read(kCtrl) | kCtrlSetLinkUp | kCtrlAutoSpeed) & ~kCtrlReset);
 
@@ -131,6 +132,7 @@ void E1000NetworkInterface::shutdown() {
 bool E1000NetworkInterface::link_up() const { return started_ && (read(kStatus) & kStatusLinkUp); }
 
 bool E1000NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !frame || length == 0 || length > kEthernetMaxFrame) {
     ++stats_.send_failures;
     return false;
@@ -155,6 +157,7 @@ bool E1000NetworkInterface::transmit(const uint8_t* frame, uint32_t length) {
 }
 
 bool E1000NetworkInterface::receive(uint8_t* buffer, uint32_t capacity, uint32_t* length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !buffer || !length) return false;
   volatile ReceiveDescriptor& d = rx_ring_[rx_next_];
   if (!(d.status & kStatusDescriptorDone)) return false;

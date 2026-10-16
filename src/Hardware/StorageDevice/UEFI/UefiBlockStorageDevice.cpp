@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.hpp"
+#include "Kernel/Firmware.hpp"
 
 namespace hardware {
 
@@ -31,10 +32,19 @@ bool UefiBlockStorageDevice::initialize() {
   return prepare_bounce();
 }
 
+bool UefiBlockStorageDevice::flush_cache() {
+  efi::Status s = efi::kSuccess;
+  kernel::firmware([&] { s = io_->flush_blocks(io_); });
+  return s == efi::kSuccess;
+}
+
 bool UefiBlockStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, void* dma) {
   const uint64_t bytes = uint64_t{blocks} * info_.block_size;
-  const efi::Status s = write ? io_->write_blocks(io_, io_->media->media_id, lba, bytes, dma)
-                              : io_->read_blocks(io_, io_->media->media_id, lba, bytes, dma);
+  efi::Status s = efi::kSuccess;
+  kernel::firmware([&] {
+    s = write ? io_->write_blocks(io_, io_->media->media_id, lba, bytes, dma)
+              : io_->read_blocks(io_, io_->media->media_id, lba, bytes, dma);
+  });
   return s == efi::kSuccess;
 }
 

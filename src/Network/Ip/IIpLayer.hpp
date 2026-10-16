@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Kernel/Sync.hpp"
 #include "Network/NetworkTypes.hpp"
 #include "Hardware/NetworkInterface/NetworkTypes.hpp"
 
@@ -30,6 +31,9 @@ class IIpLayer {
   virtual Ipv4Address local_address() const = 0;
   virtual uint32_t max_payload() const = 0;  // largest IP payload that fits one frame
   virtual uint64_t now_ms() const = 0;       // monotonic milliseconds
+  // The stack's lock. The stack, its sockets and its resolver are used by many
+  // threads; every public entry point takes this (it is recursive).
+  virtual kernel::RecursiveMutex& mutex() = 0;
 
   // Wraps `payload` (UDP/TCP/ICMP bytes) in an IP header and sends it to
   // `destination`, via the gateway when it is off-link. False if the packet
@@ -44,6 +48,15 @@ class IIpLayer {
  protected:
   IIpLayer() = default;
   ~IIpLayer() = default;
+};
+
+// Holds a stack's lock for a scope.
+class StackLock {
+ public:
+  explicit StackLock(IIpLayer& ip) : guard_(ip.mutex()) {}
+
+ private:
+  kernel::ScopedRecursiveMutex guard_;
 };
 
 }  // namespace network

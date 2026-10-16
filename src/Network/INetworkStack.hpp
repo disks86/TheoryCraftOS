@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Network/Dhcp/IDhcpClient.hpp"
+#include "Kernel/Sync.hpp"
 #include "Network/Dns/IDnsResolver.hpp"
 #include "Network/NetworkTypes.hpp"
 #include "Network/Tcp/ITcpSocket.hpp"
@@ -37,6 +38,9 @@ namespace network {
 class INetworkStack {
  public:
   // Processes received frames and timers. Cheap when nothing is happening.
+  // The stack's lock (also IIpLayer::mutex()): everything here is safe to call from
+  // any thread; take it yourself to make several calls atomic.
+  virtual kernel::RecursiveMutex& mutex() = 0;
   virtual void poll() = 0;
   // Monotonic milliseconds from the clock the stack runs on.
   virtual uint64_t now_ms() const = 0;

@@ -32,6 +32,7 @@ void MouseBase::push(const MouseEvent& event) {
 }
 
 bool MouseBase::poll(MouseEvent* out) {
+  kernel::ScopedMutex guard(mutex_);
   if (count_ == 0) fetch();
   if (count_ == 0 || !out) return false;
   *out = queue_[head_];

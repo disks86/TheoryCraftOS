@@ -32,6 +32,15 @@ set(TCOS_DEBUG_WAIT_SECS 0 CACHE STRING
     "Seconds the OS pauses at boot (or until g_debugger_attached=1); 0 disables")
 
 add_executable(BOOTX64
+  src/Kernel/Delay.cpp
+  src/Kernel/Interrupts.cpp
+  src/Kernel/Interrupts.S
+  src/Kernel/Apic.cpp
+  src/Kernel/ThreadScheduler.cpp
+  src/Kernel/Sync.cpp
+  src/Kernel/Firmware.cpp
+  src/KernelDemo.cpp
+  src/ThreadSafetyDemo.cpp
   src/main.cpp
   src/console.cpp
   src/GraphicsConsole.cpp

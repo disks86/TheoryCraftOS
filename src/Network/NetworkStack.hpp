@@ -51,8 +51,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   hardware::INetworkInterface& interface() const { return nic_; }
 
   // --- INetworkStack
+  kernel::RecursiveMutex& mutex() override { return mutex_; }
   void poll() override;
-  IpConfiguration configuration() const override { return config_; }
+  IpConfiguration configuration() const override;
   void configure(const IpConfiguration& configuration) override;
   void start_dhcp() override;
   const IDhcpClient& dhcp() const override { return *dhcp_; }
@@ -99,6 +100,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void service_pending();
   bool accepts_destination(Ipv4Address destination) const;
 
+  kernel::RecursiveMutex mutex_;  // guards everything below, and the sockets and resolver
+  kernel::Mutex ping_mutex_;      // one ping at a time (they share the ping_* state)
   hardware::INetworkInterface& nic_;
   hardware::IClock& clock_;
   allocators::IAllocator& allocator_;

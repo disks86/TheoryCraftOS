@@ -27,6 +27,7 @@ bool CompositeKeyboard::add(IKeyboard* keyboard) {
 }
 
 bool CompositeKeyboard::poll(KeyEvent* out) {
+  kernel::ScopedMutex guard(mutex_);
   for (uint32_t i = 0; i < count_; ++i) {
     IKeyboard* k = keyboards_[(next_ + i) % count_];
     if (k->poll(out)) {

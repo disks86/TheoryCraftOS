@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/NetworkInterface/INetworkInterface.hpp"
+#include "Kernel/Sync.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -49,6 +50,7 @@ class UefiSimpleNetworkInterface final : public INetworkInterface {
   // The firmware keeps a pointer to the frame being sent until GetStatus returns
   // it, so frames are staged here, one at a time.
   alignas(64) uint8_t staging_[kEthernetMaxFrame + 64] = {};
+  kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;
 };
 

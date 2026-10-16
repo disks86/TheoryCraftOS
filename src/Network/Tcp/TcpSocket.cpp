@@ -50,6 +50,7 @@ TcpSocket::TcpSocket(IIpLayer& ip, TcpManager& manager, allocators::IAllocator& 
 // ------------------------------------------------------------------ user API
 
 bool TcpSocket::connect(Ipv4Address address, uint16_t port) {
+  StackLock guard(ip_);
   if (state_ != TcpState::Closed || failed_ || port == 0 || !ip_.local_address().value()) return false;
   remote_address_ = address;
   remote_port_ = port;
@@ -71,6 +72,7 @@ void TcpSocket::prepare_to_connect(uint16_t local_port, uint32_t initial_sequenc
 }
 
 bool TcpSocket::listen(uint16_t port) {
+  StackLock guard(ip_);
   if (state_ != TcpState::Closed || failed_ || port == 0 || manager_.listening_on(port)) return false;
   local_port_ = port;
   enter(TcpState::Listen);
@@ -78,6 +80,7 @@ bool TcpSocket::listen(uint16_t port) {
 }
 
 SharedPointer<ITcpSocket> TcpSocket::accept() {
+  StackLock guard(ip_);
   if (state_ != TcpState::Listen || accept_queue_.empty()) return SharedPointer<ITcpSocket>();
   SharedPointer<TcpSocket> child = accept_queue_[0];
   accept_queue_.remove_at(0);
@@ -85,6 +88,7 @@ SharedPointer<ITcpSocket> TcpSocket::accept() {
 }
 
 uint32_t TcpSocket::send(const uint8_t* data, uint32_t length) {
+  StackLock guard(ip_);
   const bool can_send = state_ == TcpState::Established || state_ == TcpState::CloseWait ||
                         state_ == TcpState::SynSent || state_ == TcpState::SynReceived;
   if (!can_send || close_requested_ || !data) return 0;
@@ -94,6 +98,7 @@ uint32_t TcpSocket::send(const uint8_t* data, uint32_t length) {
 }
 
 uint32_t TcpSocket::receive(uint8_t* buffer, uint32_t capacity) {
+  StackLock guard(ip_);
   if (!buffer) return 0;
   const uint32_t n = receive_buffer_.read(buffer, capacity);
   // The sender may be waiting on a closed window: tell it once there is room again.
@@ -104,6 +109,7 @@ uint32_t TcpSocket::receive(uint8_t* buffer, uint32_t capacity) {
 }
 
 void TcpSocket::close() {
+  StackLock guard(ip_);
   switch (state_) {
     case TcpState::Listen:
       enter(TcpState::Closed);
@@ -125,6 +131,7 @@ void TcpSocket::close() {
 }
 
 void TcpSocket::abort() {
+  StackLock guard(ip_);
   if (state_ == TcpState::Listen) {
     close();
     return;

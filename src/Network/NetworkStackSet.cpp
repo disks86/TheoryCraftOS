@@ -17,6 +17,7 @@
  */
 
 #include "Network/NetworkStackSet.hpp"
+#include "Kernel/Thread.hpp"
 
 namespace network {
 
@@ -24,6 +25,28 @@ bool NetworkStackSet::add(hardware::INetworkInterface& nic) {
   UniquePointer<NetworkStack> stack = UniquePointer<NetworkStack>::make(allocator_, nic, clock_, allocator_);
   if (!stack || !stack->initialize()) return false;
   return stacks_.push_back(util::move(stack));
+}
+
+bool NetworkStackSet::start_service() {
+  if (service_) return true;
+  stop_ = false;
+  service_ = kernel::spawn(service_main, this, "network");
+  return service_ != nullptr;
+}
+
+void NetworkStackSet::stop_service() {
+  if (!service_) return;
+  __atomic_store_n(&stop_, true, __ATOMIC_RELEASE);
+  kernel::join(service_);
+  service_ = nullptr;
+}
+
+void NetworkStackSet::service_main(void* self) {
+  NetworkStackSet* set = static_cast<NetworkStackSet*>(self);
+  while (!__atomic_load_n(&set->stop_, __ATOMIC_ACQUIRE)) {
+    set->poll();
+    kernel::sleep_us(500);
+  }
 }
 
 void NetworkStackSet::poll() {
@@ -44,6 +67,7 @@ uint32_t NetworkStackSet::wait_for_addresses(uint32_t timeout_ms) {
       else if (stack->dhcp().state() == DhcpState::Failed) ++giving_up;  // will not get one: stop waiting for it
     }
     if (have + giving_up == stacks_.count() || clock_.now_ms() >= deadline) return have;
+    kernel::sleep_us(200);
   }
 }
 
@@ -73,6 +97,7 @@ bool NetworkStackSet::resolve(const char* name, uint32_t timeout_ms, Ipv4Address
     }
     if (!pending || clock_.now_ms() >= deadline) return false;
     poll();
+    kernel::sleep_us(200);
   }
 }
 

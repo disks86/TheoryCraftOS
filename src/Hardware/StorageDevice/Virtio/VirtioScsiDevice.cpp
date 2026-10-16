@@ -71,6 +71,7 @@ VirtioScsiController::Result VirtioScsiController::command(uint32_t target, uint
                                                            bool device_writes) {
   Result result;
   if (!started_ || cdb_length > 32) return result;
+  kernel::ScopedMutex guard(mutex_);
   RequestHeader* request = reinterpret_cast<RequestHeader*>(memory_);
   ResponseHeader* response = reinterpret_cast<ResponseHeader*>(memory_ + 256);
   __builtin_memset(request, 0, sizeof(RequestHeader));

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Kernel/Delay.hpp"
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
 
@@ -41,7 +42,7 @@ constexpr uint32_t kFeatureVersion1 = 1u << 0;  // bit 32, in feature word 1
 constexpr uint32_t kPciCommand = 0x04;
 }  // namespace
 
-void VirtioPciDevice::delay_us(uint64_t us) const { st_->boot_services->stall(us); }
+void VirtioPciDevice::delay_us(uint64_t us) const { hardware::delay_us(us); }
 
 uint8_t VirtioPciDevice::common8(uint32_t o) const {
   return *reinterpret_cast<volatile uint8_t*>(common_.address + o);

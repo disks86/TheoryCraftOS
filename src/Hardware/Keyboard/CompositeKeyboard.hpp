@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Kernel/Sync.hpp"
 #include "Hardware/Keyboard/IKeyboard.hpp"
 
 namespace hardware {
@@ -41,6 +42,7 @@ class CompositeKeyboard final : public IKeyboard {
   uint8_t modifiers() const override;
 
  private:
+  kernel::Mutex mutex_;  // polling threads take turns
   IKeyboard* keyboards_[kMaxKeyboards] = {};
   uint32_t count_ = 0;
   uint32_t next_ = 0;  // round-robin start, so one chatty device cannot starve the rest

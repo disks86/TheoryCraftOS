@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Network/NetworkStack.hpp"
+#include "Kernel/Thread.hpp"
 #include "ObjectContainer/List.hpp"
 
 namespace network {
@@ -32,7 +33,9 @@ namespace network {
 //   stacks.wait_for_addresses(8000);       // all interfaces at once
 //   stacks.resolve("example.com", 3000, &address);   // asks every network
 //
-// Like a single stack it is polled from one core; poll() runs every stack.
+// Every stack is thread-safe. poll() may be called from any thread, or
+// start_service() starts a thread that polls all of them, so that application
+// threads only ever wait (sleep) for their sockets.
 class NetworkStackSet {
  public:
   NetworkStackSet(hardware::IClock& clock, allocators::IAllocator& allocator)
@@ -45,7 +48,19 @@ class NetworkStackSet {
   // The stack of interface `index` (in the order added), or null.
   NetworkStack* at(uint32_t index) const { return index < stacks_.count() ? stacks_[index].get() : nullptr; }
 
-  void clear() { stacks_.clear(); }  // drops every stack (before the NICs go away)
+  ~NetworkStackSet() { stop_service(); }
+  NetworkStackSet(const NetworkStackSet&) = delete;
+  NetworkStackSet& operator=(const NetworkStackSet&) = delete;
+
+  // Runs a thread that keeps every stack polled (about every 500 microseconds when
+  // idle, immediately again when there was traffic). Call after the last add().
+  bool start_service();
+  void stop_service();
+  bool service_running() const { return service_ != nullptr; }
+  void clear() {  // drops every stack (before the NICs go away)
+    stop_service();
+    stacks_.clear();
+  }
   void poll();
   // Starts DHCP on every interface.
   void start_dhcp();
@@ -61,7 +76,11 @@ class NetworkStackSet {
  private:
   hardware::IClock& clock_;
   allocators::IAllocator& allocator_;
+  static void service_main(void* self);
+
   List<UniquePointer<NetworkStack>> stacks_;
+  kernel::Thread* service_ = nullptr;
+  volatile bool stop_ = false;
 };
 
 }  // namespace network
