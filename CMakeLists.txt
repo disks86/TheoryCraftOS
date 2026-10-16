@@ -96,6 +96,10 @@ add_executable(BOOTX64
   src/hardware/Bus/Pci/FirmwareDriverDetach.cpp
   src/hardware/Bus/Usb/UsbBus.cpp
   src/hardware/Bus/Usb/Xhci/XhciController.cpp
+  src/hardware/Bus/Usb/Ehci/EhciController.cpp
+  src/hardware/Bus/Usb/Legacy/LegacyHostController.cpp
+  src/hardware/Bus/Usb/Uhci/UhciController.cpp
+  src/hardware/Bus/Usb/Ohci/OhciController.cpp
   src/hardware/Bus/Usb/Xhci/XhciRing.cpp
   src/hardware/Bus/SystemPciBus.cpp
   src/hardware/GraphicsProcessingUnit/Font8x16.cpp

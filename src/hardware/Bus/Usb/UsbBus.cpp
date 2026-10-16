@@ -1,4 +1,7 @@
 #include "hardware/Bus/Usb/UsbBus.hpp"
+#include "hardware/Bus/Usb/Ehci/EhciController.hpp"
+#include "hardware/Bus/Usb/Ohci/OhciController.hpp"
+#include "hardware/Bus/Usb/Uhci/UhciController.hpp"
 #include "hardware/Bus/Usb/Xhci/XhciController.hpp"
 
 namespace hardware {
@@ -18,20 +21,36 @@ UsbControllerKind kind_from_prog_if(uint8_t prog_if) {
 
 bool UsbBus::initialize() {
   controllers_.clear();
-  PciDeviceInfo d;
-  for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
-    if (d.class_code != kPciClassSerialBus || d.subclass != kPciSubclassUsb) continue;
-    const UsbControllerKind kind = kind_from_prog_if(d.prog_if);
-    if (kind == UsbControllerKind::Unknown) continue;
+  // Two passes: the USB 2.0 and 3.x controllers first. An EHCI controller claims
+  // every port of the chip (routing slower devices to its companion UHCI/OHCI
+  // controllers), so the companions must look at their ports only afterwards.
+  for (int pass = 0; pass < 2; ++pass) {
+    PciDeviceInfo d;
+    for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
+      if (d.class_code != kPciClassSerialBus || d.subclass != kPciSubclassUsb) continue;
+      const UsbControllerKind kind = kind_from_prog_if(d.prog_if);
+      if (kind == UsbControllerKind::Unknown) continue;
+      const bool companion = kind == UsbControllerKind::Uhci || kind == UsbControllerKind::Ohci;
+      if (companion != (pass == 1)) continue;
 
-    Controller controller{kind, UniquePointer<IUsbHostController>()};
-    if (kind == UsbControllerKind::Xhci) {
-      auto xhci = UniquePointer<XhciController>::make(allocator_, pci_, d, allocator_, st_);
+      Controller controller{kind, UniquePointer<IUsbHostController>()};
       // A controller that fails to initialize has already released its own
       // memory; the pointer frees the object itself.
-      if (xhci && xhci->initialize()) controller.host = util::move(xhci);
+      if (kind == UsbControllerKind::Xhci) {
+        auto host = UniquePointer<XhciController>::make(allocator_, pci_, d, allocator_, st_);
+        if (host && host->initialize()) controller.host = util::move(host);
+      } else if (kind == UsbControllerKind::Ehci) {
+        auto host = UniquePointer<EhciController>::make(allocator_, pci_, d, allocator_, st_);
+        if (host && host->initialize()) controller.host = util::move(host);
+      } else if (kind == UsbControllerKind::Uhci) {
+        auto host = UniquePointer<UhciController>::make(allocator_, pci_, d, allocator_, st_);
+        if (host && host->initialize()) controller.host = util::move(host);
+      } else if (kind == UsbControllerKind::Ohci) {
+        auto host = UniquePointer<OhciController>::make(allocator_, pci_, d, allocator_, st_);
+        if (host && host->initialize()) controller.host = util::move(host);
+      }
+      controllers_.push_back(util::move(controller));
     }
-    controllers_.push_back(util::move(controller));
   }
   return true;
 }

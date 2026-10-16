@@ -37,7 +37,7 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
   (synchronous, any buffer alignment and size; `StorageDeviceBase` checks ranges and chunks big requests through a
   DMA-able bounce buffer). Native drivers: `Virtio/` (virtio-blk, virtio-scsi), `NVMe/`, `Ahci/` (SATA disks and
   ATAPI drives; `AhciController` is shared by the drives on its ports), `Ide/` (legacy parallel ATA/ATAPI, PIO),
-  `Usb/` (mass storage, Bulk-Only Transport, over the xHCI driver's new bulk endpoints), and `UEFI/` (firmware
+  `Usb/` (mass storage, Bulk-Only Transport, over the bulk endpoints of the xHCI and EHCI drivers), and `UEFI/` (firmware
   Block I/O, for any controller the firmware drives). `SystemStorageDevices` finds them all (partitions are not
   listed); `src/StorageDemo` reports each device, cross-checks reads and, only on a device whose first block begins
   with `TCOS-SCRATCH`, tests write/flush/read-back. Not covered: floppy and SD/MMC (only through the firmware),
@@ -78,7 +78,7 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
       polling `XhciController` driver (firmware hand-off, reset, command/event rings, port reset, slot
       enable, address device, control and interrupt-IN transfers, configuration) plus its ring and register helpers. At boot it enumerates
       every device on the root ports and reads its descriptors; HID class drivers (keyboard, mouse, tablet)
-      build on it. UHCI/OHCI/EHCI are identified only, and hubs and other device classes are not handled.
+      build on it. `Bus/Usb/Ehci` is a USB 2.0 driver (async schedule for control/bulk, periodic for interrupt endpoints; high-speed devices on root ports only, others go to the companion controller); `Bus/Usb/Uhci` and `Bus/Usb/Ohci` drive the USB 1.1 controllers (low/full speed) on top of a shared `Bus/Usb/Legacy/LegacyHostController` (enumeration and control requests); on chips with an EHCI controller the companions start after it. Hubs and other device classes are not handled.
     - `SystemPciBus` picks PCIe/ECAM when firmware provides MCFG, else legacy PCI.
   - `hardware/Keyboard/`, `hardware/Mouse/`: `IKeyboard` (key press/release events as USB HID usages, polled)
     and `IMouse` (relative movement or absolute position, wheel, buttons), with shared queue bases and

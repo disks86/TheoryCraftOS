@@ -9,10 +9,10 @@
 
 namespace hardware {
 
-// USB host controllers discovered on a PCI bus. xHCI controllers get a driver
-// (XhciController) that enumerates the devices on their root ports. UHCI, OHCI
-// and EHCI controllers are identified but have no driver yet, so they report no
-// ports and no devices.
+// USB host controllers discovered on a PCI bus. every controller type gets a
+// driver (XhciController, EhciController, UhciController, OhciController) that
+// enumerates the devices on its root ports. Companion UHCI/OHCI controllers are
+// started after the EHCI controller whose ports they share.
 class UsbBus final : public IUsbBus {
  public:
   UsbBus(const IPciBus& pci, allocators::IAllocator& allocator, efi::SystemTable* st)
