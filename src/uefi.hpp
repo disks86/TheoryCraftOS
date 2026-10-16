@@ -12,6 +12,29 @@ using Status = uint64_t;
 using Char16 = char16_t;
 
 constexpr Status kSuccess = 0;
+constexpr Status kBufferTooSmall = 0x8000000000000005;  // EFI_BUFFER_TOO_SMALL
+
+using Uintn = uint64_t;
+
+enum class AllocateType : uint32_t { AnyPages, MaxAddress, Address };
+
+// Memory types 1-10 are real RAM; 0 (reserved), 11+ (MMIO, PAL code,
+// persistent) are holes or device space.
+enum class MemoryType : uint32_t {
+  LoaderData = 2,
+  ConventionalMemory = 7,
+};
+constexpr uint32_t kFirstRamType = 1;
+constexpr uint32_t kLastRamType = 10;
+
+struct MemoryDescriptor {
+  uint32_t type;
+  uint32_t pad;
+  uint64_t physical_start;
+  uint64_t virtual_start;
+  uint64_t number_of_pages;  // 4 KiB pages
+  uint64_t attribute;
+};
 
 struct Guid {
   uint32_t a;
@@ -52,11 +75,12 @@ struct BootServices {
   TableHeader hdr;
   void* raise_tpl;
   void* restore_tpl;
-  void* allocate_pages;
-  void* free_pages;
-  void* get_memory_map;
-  void* allocate_pool;
-  void* free_pool;
+  Status (*allocate_pages)(AllocateType, MemoryType, Uintn pages, uint64_t* address);
+  Status (*free_pages)(uint64_t address, Uintn pages);
+  Status (*get_memory_map)(Uintn* map_size, MemoryDescriptor* map, Uintn* map_key,
+                           Uintn* descriptor_size, uint32_t* descriptor_version);
+  Status (*allocate_pool)(MemoryType, Uintn size, void** buffer);
+  Status (*free_pool)(void* buffer);
   void* create_event;
   void* set_timer;
   void* wait_for_event;

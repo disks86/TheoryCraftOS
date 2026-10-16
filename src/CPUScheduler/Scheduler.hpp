@@ -1,4 +1,5 @@
 #pragma once
+#include "Allocators/IAllocator.hpp"
 #include "CPUScheduler/ICPUScheduler.hpp"
 #include "hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 
@@ -6,12 +7,14 @@ namespace scheduling {
 
 // Default scheduler: a cooperative, run-to-completion scheduler for one CPU
 // with fixed-size FIFO queues (no heap). Strict priority: the efficiency queue
-// only runs when the high-performance queue is empty.
+// only runs when the high-performance queue is empty. The allocator is held for
+// future use (e.g. growable queues, task stacks); nothing is allocated yet.
 class Scheduler final : public ICPUScheduler {
  public:
   static constexpr uint32_t kQueueCapacity = 64;
 
-  explicit constexpr Scheduler(hardware::ICentralProcessingUnit& cpu) : cpu_(cpu) {}
+  constexpr Scheduler(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& allocator)
+      : cpu_(cpu), allocator_(allocator) {}
 
   bool submit(TaskFunction fn, void* context, Queue queue = Queue::HighPerformance) override;
   bool run_next() override;
@@ -34,6 +37,7 @@ class Scheduler final : public ICPUScheduler {
   };
 
   hardware::ICentralProcessingUnit& cpu_;
+  allocators::IAllocator& allocator_;
   Fifo high_;
   Fifo efficiency_;
 };

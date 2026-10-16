@@ -24,6 +24,7 @@ add_executable(BOOTX64
   src/hardware/CentralProcessingUnit/X86_64Cpu.cpp
   src/hardware/CentralProcessingUnit/X86_64Cpu.S
   src/hardware/IoPort.cpp
+  src/hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
   src/hardware/TextConsole.cpp
   src/hardware/x86_64/port.S
 )
