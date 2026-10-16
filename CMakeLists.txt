@@ -56,6 +56,10 @@ add_executable(BOOTX64
   src/hardware/ImageSignalProcessor/Software/SoftwareImageSignalProcessor.cpp
   src/hardware/ImageSignalProcessor/SystemImageSignalProcessor.cpp
   src/IspDemo.cpp
+  src/NpuDemo.cpp
+  src/hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
+  src/hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
+  src/Math/FloatMath.cpp
   src/hardware/Bus/Pci/LegacyPciBus.cpp
   src/hardware/Bus/Pcie/EcamPcieBus.cpp
   src/hardware/Bus/Pci/FirmwareDriverDetach.cpp

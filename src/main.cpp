@@ -5,7 +5,9 @@
 #include "hardware/Bus/Usb/UsbBus.hpp"
 #include "hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
+#include "hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
 #include "hardware/SystemHardware.hpp"
+#include "NpuDemo.hpp"
 #include "IspDemo.hpp"
 #include "hardware/SystemInput.hpp"
 #include "hardware/Keyboard/KeyCodes.hpp"
@@ -224,6 +226,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::puts(", core mask: ");
   console::put_hex(demo.cores_used);
   console::puts("\n");
+
+  // Neural processing unit: a hardware one if the machine has a known NPU,
+  // otherwise matrix maths spread over the CPU cores by the scheduler.
+  hardware::SystemNeuralProcessingUnit system_npu(pci, cpu, scheduler);
+  hardware::INeuralProcessingUnit& npu = system_npu.npu();
+  console::puts("NPU: ");
+  console::puts(npu.name());
+  console::puts(", ");
+  console::put_dec(npu.compute_units());
+  console::puts(" compute units\n");
+  if (!run_npu_demo(npu, allocator)) console::puts("NPU self-check failed\n");
 
   // Image signal processor: a hardware one if the machine has a known ISP,
   // otherwise the software pipeline. The demo needs a screen to draw on.

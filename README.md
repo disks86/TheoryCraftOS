@@ -53,8 +53,12 @@ the UEFI console and the QEMU debug console (port 0x402, shown on your terminal)
     that path until a native driver exists; `SystemImageSignalProcessor` picks one. QEMU has no ISP
     hardware, so only the software path runs there. `src/IspDemo` draws a synthetic frame through it.
   - `hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup).
-  - `hardware/RandomAccessMemory/`, `NeuralProcessingUnit/`: `IRandomAccessMemory` (implemented by
-    `UefiRandomAccessMemory`) and `INeuralProcessingUnit` (no implementation yet).
+  - `hardware/RandomAccessMemory/`: `IRandomAccessMemory` (implemented by `UefiRandomAccessMemory`).
+  - `hardware/NeuralProcessingUnit/`: `INeuralProcessingUnit` (int8 and float matrix products, activations,
+    softmax). `Software/` splits products by rows over every core through the scheduler; `Intel/` (NPU
+    "VPU": Meteor Lake to Panther Lake) and `AMD/` (XDNA) classes match the PCI device and still use that
+    path until a native driver exists; `SystemNeuralProcessingUnit` picks one. QEMU has no NPU hardware, so
+    only the software path runs there. `src/NpuDemo` checks it at boot. `src/Math/FloatMath` supplies exp/ln.
   - `hardware/SystemHardware.hpp`: aliases `SystemCpu` / `SystemRam` to the classes for this architecture.
   - `hardware/x86_64/port.S`: port I/O assembly for `IoPort`; `asm.hpp` is private to `hardware/`.
 

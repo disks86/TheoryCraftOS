@@ -24,7 +24,7 @@ class Scheduler final : public ICPUScheduler {
   uint64_t pending() const override;
 
   // Runs tasks until both queues are empty and every started task has finished.
-  void run();
+  void run() override;
   // Runs tasks forever, halting the CPU whenever there is nothing to do.
   [[noreturn]] void run_forever();
 

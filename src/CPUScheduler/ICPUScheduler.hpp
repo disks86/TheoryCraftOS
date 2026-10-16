@@ -22,6 +22,8 @@ class ICPUScheduler {
   // once the task is started - possibly still running on another core - or false
   // if nothing was queued.
   virtual bool run_next() = 0;
+  // Runs until both queues are empty and every started task has finished.
+  virtual void run() = 0;
   // Tasks queued but not yet started, across both queues.
   virtual uint64_t pending() const = 0;
 
