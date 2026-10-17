@@ -24,6 +24,7 @@
 // power-off once the desktop loop returns.
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
+#include "Desktop/FileDialog.hpp"
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
@@ -78,8 +79,11 @@ class Desktop {
     explorer_.set_file_system(fs);
     notepad_.set_file_system(fs);
     paint_.set_file_system(fs);
+    file_dialog_.set_file_system(fs);
   }
   Paint& paint() { return paint_; }
+  // The Open and Save As dialog that the text editor and Paint share.
+  FileDialog& file_dialog() { return file_dialog_; }
   // Opens the paint program, or brings it forward (restoring it if minimized).
   void open_paint();
   Notepad& notepad() { return notepad_; }
@@ -144,6 +148,7 @@ class Desktop {
   gui::Panel tray_;
   gui::Label clock_;
   gui::MessageDialog shutdown_dialog_;
+  FileDialog file_dialog_;
   FileExplorer explorer_;
   TaskManager task_manager_;
   Notepad notepad_;

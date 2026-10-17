@@ -146,12 +146,9 @@ bool Paint::is_picture_name(StringView name) { return format_of_name(name) != me
 Paint::Paint(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
-      file_bar_(allocator),
       options_bar_(allocator),
       palette_bar_(allocator),
       status_bar_(allocator),
-      path_label_(allocator),
-      path_(allocator),
       size_label_(allocator),
       size_value_(allocator),
       zoom_label_(allocator),
@@ -162,6 +159,7 @@ Paint::Paint(allocators::IAllocator& allocator)
       palette_(allocator),
       picker_(allocator),
       canvas_(allocator),
+      path_(allocator),
       name_(allocator) {
   set_bounds({30, 20, 640, 470});
   set_padding(Insets::all(4));
@@ -172,8 +170,9 @@ Paint::Paint(allocators::IAllocator& allocator)
   menu_.set_size(0, 22);
   if (Menu* file = menu_.add_menu("File")) {
     file->add_item("New", {&Paint::on_new, this}, "Ctrl+N");
-    file->add_item("Open", {&Paint::on_open, this}, "Ctrl+O");
+    file->add_item("Open...", {&Paint::on_open, this}, "Ctrl+O");
     file->add_item("Save", {&Paint::on_save, this}, "Ctrl+S");
+    file->add_item("Save As...", {&Paint::on_save_as, this}, "Ctrl+Shift+S");
     file->add_separator();
     file->add_item("Close", {&Paint::on_close_window, this});
   }
@@ -195,17 +194,6 @@ Paint::Paint(allocators::IAllocator& allocator)
     grid_item_ = view->add_item("Pixel Grid", {&Paint::on_toggle_grid, this});
   }
   if (Menu* options = menu_.add_menu("Options")) filled_item_ = options->add_item("Filled Shapes", {&Paint::on_toggle_filled, this});
-
-  // The path row.
-  file_bar_.set_dock(DockStyle::Top);
-  file_bar_.set_size(0, 30);
-  file_bar_.set_padding(Insets{0, 2, 0, 2});
-  path_label_.set_text("File:");
-  path_label_.set_dock(DockStyle::Left);
-  path_label_.set_size(48, 0);
-  file_bar_.add(&path_label_);
-  path_.set_dock(DockStyle::Fill);
-  file_bar_.add(&path_);
 
   // Options bar: brush size and the zoom shown.
   options_bar_.set_dock(DockStyle::Top);
@@ -271,7 +259,6 @@ Paint::Paint(allocators::IAllocator& allocator)
   canvas_.new_image(kNewWidth, kNewHeight);
 
   add(&menu_);
-  add(&file_bar_);
   add(&options_bar_);
   add(&status_bar_);
   add(&palette_bar_);
@@ -422,9 +409,43 @@ bool Paint::may_discard() {
 
 void Paint::on_new(void* self, Control&) { static_cast<Paint*>(self)->new_picture(); }
 void Paint::on_save(void* self, Control&) { static_cast<Paint*>(self)->save_file(); }
-void Paint::on_open(void* self, Control&) {
+void Paint::on_open(void* self, Control&) { static_cast<Paint*>(self)->ask_open(); }
+void Paint::on_save_as(void* self, Control&) { static_cast<Paint*>(self)->ask_save_as(); }
+
+namespace {
+const FileDialog::Filter kPictureFilters[] = {
+    {"Pictures", "png;jpg;jpeg;bmp;gif;qoi;tga;tif;tiff;webp;ppm;pnm"}, {"PNG", "png"}, {"JPEG", "jpg;jpeg"}, {"BMP", "bmp"}, {"GIF", "gif"},
+    {"QOI", "qoi"}, {"TGA", "tga"}, {"TIFF", "tif;tiff"}, {"WebP", "webp"}, {"PPM", "ppm;pnm"}, {"All files", "*"}};
+constexpr uint32_t kPictureFilterCount = sizeof kPictureFilters / sizeof kPictureFilters[0];
+}  // namespace
+
+void Paint::ask_open() {
+  if (!dialog_ || !manager()) {
+    say("No file dialog available.");
+    return;
+  }
+  if (!may_discard()) return;
+  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kPictureFilters, kPictureFilterCount, path_.view(), {&Paint::on_open_picked, this}))
+    say("The file dialog is busy.");
+}
+
+void Paint::ask_save_as() {
+  if (!dialog_ || !manager()) {
+    say("No file dialog available.");
+    return;
+  }
+  if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kPictureFilters, kPictureFilterCount, path_.view(), {&Paint::on_save_picked, this}))
+    say("The file dialog is busy.");
+}
+
+void Paint::on_open_picked(void* self, Control&) {
   auto* p = static_cast<Paint*>(self);
-  p->open_file(p->path_.text());
+  if (p->dialog_->accepted()) p->read_picture(p->dialog_->selected_path());   // the unsaved changes were agreed to before the dialog opened
+}
+
+void Paint::on_save_picked(void* self, Control&) {
+  auto* p = static_cast<Paint*>(self);
+  if (p->dialog_->accepted()) p->write_picture(p->dialog_->selected_path());
 }
 
 bool Paint::new_picture(uint32_t width, uint32_t height) {
@@ -433,7 +454,7 @@ bool Paint::new_picture(uint32_t width, uint32_t height) {
     say("Cannot make a picture of that size.");
     return false;
   }
-  path_.set_text(StringView());
+  path_.clear();
   name_.clear();
   update_state();
   say("New picture.");
@@ -451,12 +472,20 @@ bool Paint::open_file(StringView requested) {
     return false;
   }
   if (!may_discard()) return false;
+  return read_picture(path.view());
+}
+
+bool Paint::read_picture(StringView path) {
+  if (!fs_) {
+    say("No storage available.");
+    return false;
+  }
   UniquePointer<IFile> file;
-  Status status = fs_->open_file(path.view(), OpenMode::Read, &file);
+  Status status = fs_->open_file(path, OpenMode::Read, &file);
   if (status != Status::Ok) {
     String message(allocator());
     message.append("Cannot open ");
-    message.append(path.view());
+    message.append(path);
     message.append(": ");
     message.append(describe_status(status));
     say(message.view());
@@ -483,24 +512,31 @@ bool Paint::open_file(StringView requested) {
     say("The picture is too large to edit (limit 4096 x 4096).");
     return false;
   }
-  path_.set_text(path.view());
-  const uint64_t slash = path.view().rfind('/');
-  name_.assign(slash == StringView::npos ? path.view() : path.view().substr(slash + 1));
+  path_.assign(path);
+  const uint64_t slash = path.rfind('/');
+  name_.assign(slash == StringView::npos ? path : path.substr(slash + 1));
   discard_armed_ = false;
   update_state();
   String message(allocator());
   message.append("Opened ");
-  message.append(path.view());
+  message.append(path);
   say(message.view());
   return true;
 }
 
 bool Paint::save_file(StringView requested) {
   String path(allocator());
-  if (!normalize(requested.empty() ? path_.text() : requested, &path) || path.empty()) {
-    say("Enter a path to save to.");
+  if (!normalize(requested.empty() ? path_.view() : requested, &path) || path.empty()) {
+    if (dialog_ && manager()) ask_save_as();   // nowhere to save to yet: the same as Save As
+    else say("Enter a path to save to.");
     return false;
   }
+  return write_picture(path.view());
+}
+
+bool Paint::write_picture(StringView requested) {
+  String path(allocator());
+  if (!path.assign(requested)) return false;
   if (!fs_) {
     say("No storage available.");
     return false;
@@ -539,7 +575,7 @@ bool Paint::save_file(StringView requested) {
     return false;
   }
   fs_->flush();
-  path_.set_text(path.view());
+  path_.assign(path.view());
   const uint64_t slash = path.view().rfind('/');
   name_.assign(slash == StringView::npos ? path.view() : path.view().substr(slash + 1));
   canvas_.mark_saved();
@@ -556,8 +592,11 @@ bool Paint::on_key(const KeyArgs& args) {
   if (args.modifiers & hardware::modifier::kControl) {
     switch (args.usage) {
       case key::kA + 13: new_picture(); return true;                 // N
-      case key::kA + 14: open_file(path_.text()); return true;       // O
-      case key::kA + 18: save_file(); return true;                   // S
+      case key::kA + 14: ask_open(); return true;                    // O
+      case key::kA + 18:                                             // S
+        if (args.modifiers & hardware::modifier::kShift) ask_save_as();
+        else save_file();
+        return true;
       case key::kA + 25: canvas_.undo(); return true;                // Z
       case key::kA + 24: canvas_.redo(); return true;                // Y
       case key::kA: on_select_all(this, *this); return true;   // A
@@ -571,10 +610,6 @@ bool Paint::on_key(const KeyArgs& args) {
       case key::kA + 21: paste_from_clipboard(); return true;        // V
       default: break;
     }
-  }
-  if (args.usage == key::kEnter && window() && window()->focus() == &path_) {
-    open_file(path_.text());
-    return true;
   }
   return Frame::on_key(args);
 }

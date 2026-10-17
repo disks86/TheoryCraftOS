@@ -16,16 +16,18 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The paint application: a window with a menu bar (File: New, Open, Save, Close; Edit: Undo, Redo, Cut, Copy, Paste,
-// Select All; View: Zoom In, Zoom Out, Actual Size, Pixel Grid; Options: Filled Shapes), a row with the file's path, the
+// The paint application: a window with a menu bar (File: New, Open, Save, Save As, Close; Edit: Undo, Redo, Cut, Copy, Paste,
+// Select All; View: Zoom In, Zoom Out, Actual Size, Pixel Grid; Options: Filled Shapes), the
 // brush size, a strip of tools at the left, the DrawingCanvas, and at the bottom a
 // color palette with a color picker for any other color. Files are opened and saved as images; the format follows the
-// extension (png, jpg, bmp, gif, ppm, qoi, tga, tif, webp; png when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Z, Ctrl+Y and Ctrl+A
+// extension (png, jpg, bmp, gif, ppm, qoi, tga, tif, webp; png when there is none); Open and Save As pick the file in
+// the shared FileDialog, Save writes to the file the picture came from (or asks like Save As when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Z, Ctrl+Y and Ctrl+A
 // do what their menu items do. Cut, Copy and Paste (Ctrl+X, Ctrl+C, Ctrl+V) use the system clipboard: the selection made with the
 // Select tool (the whole picture when nothing is selected) goes onto it as a picture, and a picture on it is pasted as a floating
 // selection to drag into place. A command that would throw away unsaved changes does nothing the first time (the status
 // line says so) and goes ahead when it is repeated.
 #pragma once
+#include "Desktop/FileDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/ColorPalette.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
@@ -34,7 +36,6 @@
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/Slider.hpp"
-#include "Gui/Controls/TextBox.hpp"
 #include "Gui/Controls/ToolStrip.hpp"
 #include "Gui/Windows/Frame.hpp"
 
@@ -49,6 +50,8 @@ class Paint : public gui::Frame {
 
   // The filesystem pictures are opened from and saved to (nullptr: none). It must outlive the window.
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
+  // The dialog that Open and Save As use (nullptr: none, they then say so). It must outlive the window.
+  void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
 
   // Starts a blank white picture. False (nothing changes) while there are unsaved changes the user has not agreed to lose.
   bool new_picture(uint32_t width = kNewWidth, uint32_t height = kNewHeight);
@@ -56,17 +59,19 @@ class Paint : public gui::Frame {
   bool open_file(StringView path);
   // Saves to `path` (the toolbar's path when empty). False if that fails.
   bool save_file(StringView path = StringView());
+  // The commands behind File > Open and File > Save As: they show the dialog and carry on when a file is picked.
+  void ask_open();
+  void ask_save_as();
   // True if a file name ends in an extension of a picture format (case does not matter).
   static bool is_picture_name(StringView name);
 
-  StringView path() const { return path_.text(); }
+  StringView path() const { return path_.view(); }
   gui::DrawingCanvas& canvas() { return canvas_; }
   gui::ToolStrip& tools() { return tools_; }
   gui::ColorPalette& palette() { return palette_; }
   gui::ColorPicker& color_picker() { return picker_; }
   gui::Slider& size_slider() { return size_; }
   gui::MenuBar& menu_bar() { return menu_; }
-  gui::TextBox& path_box() { return path_; }
   gui::Label& status_label() { return status_; }
   gui::Label& position_label() { return position_; }
   gui::Label& zoom_label() { return zoom_label_; }
@@ -77,6 +82,9 @@ class Paint : public gui::Frame {
   static void on_new(void* self, gui::Control&);
   static void on_open(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
+  static void on_save_as(void* self, gui::Control&);
+  static void on_open_picked(void* self, gui::Control&);
+  static void on_save_picked(void* self, gui::Control&);
   static void on_cut(void* self, gui::Control&);
   static void on_copy(void* self, gui::Control&);
   static void on_paste(void* self, gui::Control&);
@@ -102,14 +110,14 @@ class Paint : public gui::Frame {
   static void on_pointer(void* self, gui::Control&);
   static void on_zoom_changed(void* self, gui::Control&);
   bool may_discard();
+  bool read_picture(StringView path);
+  bool write_picture(StringView path);
   void say(StringView text) { status_.set_text(text); }
   void update_state();
   void update_position();
 
   gui::MenuBar menu_;
-  gui::Panel file_bar_, options_bar_, palette_bar_, status_bar_;
-  gui::Label path_label_;
-  gui::TextBox path_;
+  gui::Panel options_bar_, palette_bar_, status_bar_;
   gui::Label size_label_, size_value_, zoom_label_, status_, position_;
   gui::Slider size_;
   gui::MenuItem *undo_item_ = nullptr, *redo_item_ = nullptr, *filled_item_ = nullptr, *grid_item_ = nullptr;
@@ -118,6 +126,8 @@ class Paint : public gui::Frame {
   gui::ColorPicker picker_;
   gui::DrawingCanvas canvas_;
   filesystem::IFileSystem* fs_ = nullptr;
+  FileDialog* dialog_ = nullptr;
+  String path_;  // the file the picture came from or was saved to (empty: none yet)
   String name_;
   bool discard_armed_ = false;
 };

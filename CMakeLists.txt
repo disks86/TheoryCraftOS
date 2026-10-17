@@ -200,6 +200,8 @@ add_executable(BOOTX64
   src/Desktop/Desktop.cpp
   src/Desktop/DesktopSurface.cpp
   src/Desktop/FileExplorer.cpp
+  src/Desktop/DirectoryListing.cpp
+  src/Desktop/FileDialog.cpp
   src/Desktop/TaskManager.cpp
   src/Desktop/Notepad.cpp
   src/Desktop/Paint.cpp

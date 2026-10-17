@@ -16,18 +16,19 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The text editor application: a window with a toolbar (New, Open, Save and the path of the file), a TextEditor
-// and a status bar showing the caret position and what the last command did. Open and Save use the path in the
-// toolbar; Ctrl+N, Ctrl+O and Ctrl+S do the same as the buttons, and Enter in the path box opens the file. A
+// The text editor application: a window with a menu bar (File: New, Open, Save, Save As, Close; Edit: Cut, Copy, Paste,
+// Select All), a TextEditor and a status bar showing the caret position and what the last command did. Open and Save As
+// pick the file in the shared FileDialog; Save writes to the file the text came from (or asks like Save As when there is
+// none). Ctrl+N, Ctrl+O, Ctrl+S and Ctrl+Shift+S do the same as the menu items. A
 // command that would throw away unsaved changes does nothing the first time (the status line says so) and
 // goes ahead when it is repeated. Files are read and written as plain bytes; a CR before a line break is dropped
 // on opening, so saved files always use LF.
 #pragma once
+#include "Desktop/FileDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
-#include "Gui/Controls/TextBox.hpp"
 #include "Gui/Controls/TextEditor.hpp"
 #include "Gui/Windows/Frame.hpp"
 
@@ -42,18 +43,24 @@ class Notepad : public gui::Frame {
   // The filesystem files are opened from and saved to (nullptr: none). It must outlive the editor.
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
 
+  // The dialog that Open and Save As use (nullptr: none, they then say so). It must outlive the editor.
+  void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
+
   // Starts an empty, unnamed document. False (and nothing changes) while there are unsaved changes the user has not
   // agreed to lose.
   bool new_document();
   // Loads the file at `path` into the editor. False if it cannot be read (the status line says why) or unsaved changes
   // are in the way.
   bool open_file(StringView path);
-  // Writes the text to `path` (the toolbar's path when empty). False if that fails.
+  // Writes the text to `path` (the file it came from when empty; with neither, the Save As dialog opens and this returns false).
+  // False if that fails.
   bool save_file(StringView path = StringView());
+  // The commands behind File > Open and File > Save As: they show the dialog and carry on when a file is picked.
+  void ask_open();
+  void ask_save_as();
 
-  StringView path() const { return path_.text(); }
+  StringView path() const { return path_.view(); }
   gui::TextEditor& editor() { return editor_; }
-  gui::TextBox& path_box() { return path_; }
   gui::MenuBar& menu_bar() { return menu_; }
   gui::Label& status_label() { return status_; }
   gui::Label& position_label() { return position_; }
@@ -64,6 +71,9 @@ class Notepad : public gui::Frame {
   static void on_new(void* self, gui::Control&);
   static void on_open(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
+  static void on_save_as(void* self, gui::Control&);
+  static void on_open_picked(void* self, gui::Control&);
+  static void on_save_picked(void* self, gui::Control&);
   static void on_close(void* self, gui::Control&);
   static void on_cut(void* self, gui::Control&);
   static void on_copy(void* self, gui::Control&);
@@ -72,20 +82,22 @@ class Notepad : public gui::Frame {
   static void on_edited(void* self, gui::Control&);
   static void on_moved(void* self, gui::Control&);
   bool may_discard();
+  bool read_into_editor(StringView path);
+  bool write_from_editor(StringView path);
   void say(StringView text) { status_.set_text(text); }
   void update_title();
   void update_position();
   void update_menus();
 
   gui::MenuBar menu_;
-  gui::Panel toolbar_, status_bar_;
-  gui::Label path_label_;
-  gui::TextBox path_;
+  gui::Panel status_bar_;
   gui::Label status_, position_;
   gui::MenuItem *cut_item_ = nullptr, *copy_item_ = nullptr;
   gui::TextEditor editor_;
   filesystem::IFileSystem* fs_ = nullptr;
-  String name_;  // the file's name as shown in the title
+  FileDialog* dialog_ = nullptr;
+  String path_;  // the file the text came from or was saved to (empty: none yet)
+  String name_;  // its name as shown in the title
   bool discard_armed_ = false;
 };
 
