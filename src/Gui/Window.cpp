@@ -84,6 +84,15 @@ void Window::render() {
         // A classic arrow: black triangle with a white edge.
         renderer_.fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
         renderer_.fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
+      } else if (shape == CursorShape::Crosshair) {
+        for (int pass = 0; pass < 2; ++pass) {  // a white outline, then the black cross
+          const int32_t reach = pass == 0 ? 8 : 7;
+          const int32_t cx = cursor_.x, cy = cursor_.y;
+          const uint32_t color = pass == 0 ? theme_.highlight : theme_.dark;
+          const int32_t w = pass == 0 ? 3 : 1;
+          painter.fill({cx - reach, cy - w / 2, static_cast<uint32_t>(2 * reach + 1), static_cast<uint32_t>(w)}, color);
+          painter.fill({cx - w / 2, cy - reach, static_cast<uint32_t>(w), static_cast<uint32_t>(2 * reach + 1)}, color);
+        }
       } else {
         // A double arrow along the resize direction, centered on the pointer.
         const int32_t dx = shape == CursorShape::ResizeVertical ? 0 : 1;

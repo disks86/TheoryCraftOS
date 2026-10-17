@@ -17,6 +17,7 @@
  */
 
 #include "Gui/Controls/TextEditor.hpp"
+#include "Gui/ClipboardText.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/Move.hpp"
 
@@ -166,7 +167,22 @@ bool TextEditor::insert_text(StringView text) {
 }
 
 bool TextEditor::copy_selection() {
-  return has_selection() && clipboard_.assign(text_.view().substr(selection_start(), selection_end() - selection_start()));
+  return has_selection() && clipboard_put_text(clipboard(), &clipboard_, text_.view().substr(selection_start(), selection_end() - selection_start()));
+}
+
+void TextEditor::paste() {
+  String text(allocator());
+  if (read_only_ || !clipboard_get_text(clipboard(), clipboard_, &text)) return;
+  String clean(allocator());  // CR LF and lone CR become the editor's line break
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '\r') {
+      if (i + 1 < text.size() && text[i + 1] == '\n') continue;
+      clean.push_back('\n');
+    } else {
+      clean.push_back(text[i]);
+    }
+  }
+  replace(selection_start(), selection_end(), clean.view());
 }
 
 void TextEditor::select_all() {
@@ -363,11 +379,10 @@ bool TextEditor::on_key(const KeyArgs& args) {
         if (!read_only_ && copy_selection()) replace(selection_start(), selection_end(), StringView());
         return true;
       case key::kA + 21:  // V
-        if (!read_only_ && !clipboard_.empty()) {
-          String paste(allocator());
-          paste.assign(clipboard_.view());
-          replace(selection_start(), selection_end(), paste.view());
-        }
+        paste();
+        return true;
+      case 0x49:  // Ctrl+Insert
+        copy_selection();
         return true;
       default:
         break;
@@ -405,8 +420,12 @@ bool TextEditor::on_key(const KeyArgs& args) {
       if (has_selection()) replace(selection_start(), selection_end(), StringView());
       else if (caret_ > 0) replace(caret_ - 1, caret_, StringView());
       return true;
-    case 0x4C:  // Delete
-      if (has_selection()) replace(selection_start(), selection_end(), StringView());
+    case 0x49:  // Shift+Insert
+      if (shift) paste();
+      return true;
+    case 0x4C:  // Delete (with Shift: cut)
+      if (shift && copy_selection()) replace(selection_start(), selection_end(), StringView());
+      else if (has_selection()) replace(selection_start(), selection_end(), StringView());
       else if (caret_ < length) replace(caret_, caret_ + 1, StringView());
       return true;
     case key::kEnter: {

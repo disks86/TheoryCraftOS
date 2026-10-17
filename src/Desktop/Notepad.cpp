@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Notepad.hpp"
+#include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -29,20 +30,6 @@ using filesystem::OpenMode;
 using filesystem::Status;
 
 namespace {
-
-const char* describe(Status status) {
-  switch (status) {
-    case Status::NotFound: return "not found";
-    case Status::ReadOnly: return "the volume is read-only";
-    case Status::NoSpace: return "no space left";
-    case Status::IsADirectory: return "that is a folder";
-    case Status::NotADirectory: return "a folder in the path is a file";
-    case Status::InvalidPath: return "invalid path";
-    case Status::OutOfMemory: return "out of memory";
-    case Status::IoError: return "storage error";
-    default: return "failed";
-  }
-}
 
 // The text with a leading '/' and no surrounding blanks.
 bool normalize(StringView in, String* out) {
@@ -183,7 +170,7 @@ bool Notepad::open_file(StringView requested) {
     message.append("Cannot open ");
     message.append(path.view());
     message.append(": ");
-    message.append(describe(status));
+    message.append(describe_status(status));
     say(message.view());
     return false;
   }
@@ -241,7 +228,7 @@ bool Notepad::save_file(StringView requested) {
     message.append("Cannot save ");
     message.append(path.view());
     message.append(": ");
-    message.append(describe(status));
+    message.append(describe_status(status));
     say(message.view());
     return false;
   }

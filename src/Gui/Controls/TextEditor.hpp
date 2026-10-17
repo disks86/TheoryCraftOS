@@ -20,7 +20,7 @@
 // next multiple of 4 columns). Typing inserts at the caret (Enter keeps the line's indentation, Tab inserts a tab),
 // Backspace/Delete/arrows/Home/End/Page Up/Page Down edit and move it, Ctrl+Home/End jump to the ends of the text.
 // Shift with a movement key, a drag with the mouse or Ctrl+A select text; typing replaces the selection, and
-// Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste through a clipboard of the editor's own. Long text scrolls
+// Ctrl+C / Ctrl+X / Ctrl+V (also Ctrl+Insert, Shift+Delete, Shift+Insert) copy, cut and paste through the window's clipboard. Long text scrolls
 // (scroll bars, the mouse wheel, and the caret staying in view). No undo. Keys it does not use (Ctrl+S ...) go to the
 // parent.
 #pragma once
@@ -104,6 +104,7 @@ class TextEditor : public Control {
   void move_caret(uint32_t offset, bool extend, bool keep_column = false);
   uint32_t offset_at_point(int32_t x, int32_t y) const;
   bool copy_selection();
+  void paste();
   void expand_line(uint32_t line, String* out) const;
   void on_scroll_changed();
   static void vertical_changed(void* self, Control&);

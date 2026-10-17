@@ -27,6 +27,11 @@ Rect2D Control::client_rect() const {
   return {padding_.left, padding_.top, w > 0 ? static_cast<uint32_t>(w) : 0, h > 0 ? static_cast<uint32_t>(h) : 0};
 }
 
+kernel::Clipboard* Control::clipboard() const {
+  const Window* w = window();
+  return w ? w->clipboard() : nullptr;
+}
+
 void Control::layout() {
   Rect2D rest = client_rect();
   for (uint64_t i = 0; i < children_.count(); ++i) {

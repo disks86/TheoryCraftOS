@@ -18,6 +18,7 @@
 
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/Format.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
@@ -242,6 +243,20 @@ void FileExplorer::update_status() {
 }
 
 bool FileExplorer::on_key(const KeyArgs& args) {
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 2) {  // Ctrl+C: the selected item's path
+    const int32_t item = view_.selected_item();
+    if (item < 0 || !clipboard()) return false;
+    String name(allocator()), full(allocator());
+    view_.item_text(static_cast<uint32_t>(item), 0, &name);
+    if (!full.assign(path_.view()) || (path_.size() > 1 && !full.push_back('/')) || !full.append(name.view())) return true;
+    if (clipboard()->set_text(full.view())) {
+      String message(allocator());
+      message.append("Copied ");
+      message.append(full.view());
+      status_.set_text(message.view());
+    }
+    return true;
+  }
   if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 11) {  // Ctrl+L
     address_.begin_edit();
     return true;

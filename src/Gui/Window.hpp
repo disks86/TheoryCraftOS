@@ -29,6 +29,7 @@
 // (declare it first), and render() / the RenderLoop are the only users of the renderer.
 #pragma once
 #include "Gui/Control.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Utility/String.hpp"
 
 namespace gui {
@@ -88,6 +89,11 @@ class Window final : public Control {
     mark_dirty();
   }
 
+  // The clipboard the controls in this window copy to and paste from (nullptr: none; controls with a private fallback
+  // then use that). It must outlive the window.
+  void set_clipboard(kernel::Clipboard* clipboard) { __atomic_store_n(&clipboard_, clipboard, __ATOMIC_RELEASE); }
+  kernel::Clipboard* clipboard() const { return __atomic_load_n(&clipboard_, __ATOMIC_ACQUIRE); }
+
   // --- Input, in window coordinates.
   void mouse_move(int32_t x, int32_t y);
   void mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed);
@@ -139,6 +145,7 @@ class Window final : public Control {
   Control* captured_ = nullptr;
   Control* popup_ = nullptr;
   Control* popup_owner_ = nullptr;
+  kernel::Clipboard* clipboard_ = nullptr;
   Point cursor_;
   bool cursor_visible_ = false;
   bool dirty_ = true;

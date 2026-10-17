@@ -24,17 +24,26 @@
 #include "Audio/AudioPlayer.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/AudioPlayerControl.hpp"
+#include "Gui/Color.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Desktop/Paint.hpp"
 #include "Desktop/TaskManager.hpp"
 #include "Gui/Controls/TextEditor.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Gui/Controls/BreadcrumbBar.hpp"
+#include "Gui/Controls/ColorPalette.hpp"
+#include "Gui/Controls/DrawingCanvas.hpp"
+#include "Gui/Controls/ToolStrip.hpp"
+#include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/ImageView.hpp"
+#include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
+#include "Gui/Controls/TabControl.hpp"
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/Controls/VideoPlayerControl.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
@@ -1012,6 +1021,14 @@ static void test_file_explorer() {
     ex.view().select_item(3);
     press(w, key::kEnter);
     CHECK(opened.count == 1 && ex.opened_file().equals("/b.txt") && ex.path().equals("/"));
+    {
+      kernel::Clipboard cb(a);                  // Ctrl+C puts the selected item's full path on the clipboard
+      w.set_clipboard(&cb);
+      press(w, key::kA + 2, modifier::kLeftControl);
+      String copied(a);
+      CHECK(cb.get_text(&copied) && copied.view().equals("/b.txt") && ex.status_label().text().equals("Copied /b.txt"));
+      w.set_clipboard(nullptr);
+    }
 
     // Opening a folder: Enter on it, a double click, then Up and Backspace go back.
     w.set_focus(&ex.view());
@@ -1141,7 +1158,8 @@ static void test_task_manager() {
     CHECK(tm.grid().row_count() == 3 && tm.cpu_label().text().equals("0%"));
     CHECK(tm.memory_label().text().equals("512.0 MB / 1.0 GB") && tm.memory_meter().level() == 50);
     CHECK(tm.info_label().text().equals("Threads: 3   Cores: 2   Uptime: 00:00:01"));
-    CHECK(tm.cores_label().text().equals("Cores: 0 :0%  1e:0%"));
+    CHECK(tm.core_meter(0) && tm.core_meter(1) && !tm.core_meter(2) && tm.core_label(0)->text().equals("0%"));
+    CHECK(tm.tabs().page_count() == 2 && tm.tabs().page_title(0).equals("Processes") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().selected_page() == 0);
 
     // One second later: core 0 was 25% busy, core 1 75% busy, and the worker ran 600 of the 1000 ticks.
     mon.core_busy[0] = 250; mon.core_idle[0] = 750;
@@ -1150,7 +1168,13 @@ static void test_task_manager() {
     mon.free_bytes = 256ull << 20;
     tm.update(2000000);
     CHECK(tm.cpu_label().text().equals("50%") && tm.cpu_meter().level() == 50);
-    CHECK(tm.cores_label().text().equals("Cores: 0 :25%  1e:75%"));
+    CHECK(tm.core_meter(0)->level() == 25 && tm.core_label(0)->text().equals("25%") && tm.core_meter(1)->level() == 75 && tm.core_label(1)->text().equals("75%"));
+    CHECK(tm.grid().visible() && tm.tabs().page(0)->visible() && !tm.tabs().page(1)->visible());
+    tm.tabs().select_page(1);                   // the other tab shows the meters instead of the table
+    w.layout();
+    w.render();
+    CHECK(!tm.tabs().page(0)->visible() && tm.tabs().page(1)->visible() && tm.cpu_meter().bounds().width > 100 && tm.core_meter(1)->bounds().width > 100);
+    tm.tabs().select_page(0);
     CHECK(tm.memory_label().text().equals("768.0 MB / 1.0 GB") && tm.memory_meter().level() == 75);
     CHECK(tm.thread_load_tenths(7) == 600 && tm.thread_load_tenths(1) == 0 && tm.thread_load_tenths(99) == -1);
     String cell(a);
@@ -1453,7 +1477,745 @@ static void test_breadcrumb_bar() {
   CHECK(a.live == 0);
 }
 
+// --- Tab control ---------------------------------------------------------------------------------------------
+
+static void test_tab_control() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    TabControl tabs(a);
+    Panel one(a), two(a), three(a);
+    Button inside(a);
+    inside.set_dock(DockStyle::Top);
+    inside.set_size(0, 30);
+    one.add(&inside);
+    tabs.set_bounds({10, 10, 300, 200});
+    w.add(&tabs);
+    Counter changes;
+    tabs.on_selection_changed(changes.handler());
+    CHECK(tabs.selected_page() == -1 && tabs.add_page("One", &one) == 0 && tabs.add_page("Second", &two) == 1 && tabs.add_page("3", &three) == 2);
+    CHECK(tabs.add_page("none", nullptr) == -1 && tabs.page_count() == 3 && tabs.selected_page() == 0);
+    w.layout();
+    CHECK(one.visible() && !two.visible() && !three.visible() && changes.count == 0);
+    const Rect2D area = tabs.page_rect();
+    CHECK(one.bounds().x == area.x && one.bounds().y == area.y && one.bounds().width == area.width && one.bounds().height == area.height);
+    CHECK(area.y >= TabControl::kTabHeight && area.y + static_cast<int32_t>(area.height) <= 200 && inside.bounds().width == area.width);
+
+    // Tabs sit side by side, the selected one a little larger; a click selects.
+    const Rect2D t0 = tabs.tab_rect(0), t1 = tabs.tab_rect(1), t2 = tabs.tab_rect(2);
+    CHECK(t1.x >= t0.x + static_cast<int32_t>(t0.width) - 4 && t2.x >= t1.x + static_cast<int32_t>(t1.width) && t0.height > t1.height);
+    CHECK(tabs.tab_at(t1.x + 3, t1.y + 5) == 1 && tabs.tab_at(250, 10) == -1 && tabs.tab_at(t0.x + 3, 100) == -1);
+    click(w, 10 + t1.x + t1.width / 2, 10 + 12);
+    CHECK(tabs.selected_page() == 1 && !one.visible() && two.visible() && changes.count == 1 && w.focus() == &tabs);
+    w.render();
+    click(w, 10 + tabs.tab_rect(1).x + 8, 10 + 12);   // the selected tab again: nothing changes
+    CHECK(changes.count == 1);
+
+    // Arrow keys with the focus on the tabs, Ctrl+Tab from inside a page.
+    press(w, key::kRight);
+    CHECK(tabs.selected_page() == 2 && three.visible());
+    press(w, key::kRight);
+    CHECK(tabs.selected_page() == 0);          // wraps
+    press(w, key::kLeft);
+    CHECK(tabs.selected_page() == 2);
+    tabs.select_page(0);
+    w.set_focus(&inside);
+    press(w, key::kTab, modifier::kLeftControl);
+    CHECK(tabs.selected_page() == 1);
+    press(w, key::kTab, modifier::kLeftControl | modifier::kLeftShift);
+    CHECK(tabs.selected_page() == 0);
+    tabs.select_page(7);
+    tabs.select_page(-1);
+    CHECK(tabs.selected_page() == 0);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+// --- Tool strip, color palette, drawing canvas and Paint -------------------------------------------------------
+
+static void test_tool_strip() {
+  TestAllocator a;
+  {
+    Screen screen(a, 300, 200);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {300, 200});
+    ToolStrip strip(a);
+    static int drawn = 0;
+    ToolIcon icon = [](Painter& p, const Rect2D& r, uint32_t ink) { ++drawn; p.fill(r, ink); };
+    strip.set_columns(2);
+    const char* const tool_names[5] = {"A", "B", "C", "D", "E"};
+    for (const char* name : tool_names) strip.add_tool(name, icon);
+    CHECK(strip.tool_count() == 5 && strip.selected_tool() == 0 && strip.tool_name(2).equals("C"));
+    const Size size = strip.content_size();
+    CHECK(size.width == 2 * ToolStrip::kPad + 2 * ToolStrip::kButton && size.height == 2 * ToolStrip::kPad + 3 * ToolStrip::kButton);
+    strip.set_bounds({10, 10, static_cast<uint32_t>(size.width), static_cast<uint32_t>(size.height)});
+    w.add(&strip);
+    w.layout();
+    Counter selected, hovered;
+    strip.on_selection_changed(selected.handler());
+    strip.on_hover_changed(hovered.handler());
+    const Rect2D r3 = strip.tool_rect(3), r0 = strip.tool_rect(0);
+    CHECK(r3.x == r0.x + ToolStrip::kButton && r3.y == r0.y + ToolStrip::kButton && strip.tool_at(r3.x + 2, r3.y + 2) == 3 && strip.tool_at(0, 0) == -1);
+    w.mouse_move(10 + r3.x + 5, 10 + r3.y + 5);
+    CHECK(strip.hovered_tool() == 3 && hovered.count == 1);
+    w.mouse_move(250, 150);
+    CHECK(strip.hovered_tool() == -1 && hovered.count == 2);
+    click(w, 10 + r3.x + 5, 10 + r3.y + 5);
+    CHECK(strip.selected_tool() == 3 && selected.count == 1 && w.focus() == &strip);
+    press(w, key::kUp);
+    CHECK(strip.selected_tool() == 1);
+    press(w, key::kRight);
+    CHECK(strip.selected_tool() == 2);
+    press(w, key::kDown);
+    press(w, key::kDown);                       // past the end: stays
+    CHECK(strip.selected_tool() == 4);
+    strip.select_tool(9);
+    CHECK(strip.selected_tool() == 4 && selected.count == 4);
+    w.render();
+    CHECK(drawn >= 5);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_color_palette() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 100);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 100});
+    ColorPalette pal(a);
+    pal.set_bounds({10, 10, 360, 50});
+    w.add(&pal);
+    w.layout();
+    Counter changes;
+    pal.on_colors_changed(changes.handler());
+    CHECK(pal.color_count() == 28 && pal.columns() == 14 && pal.primary() == 0xFF000000 && pal.secondary() == 0xFFFFFFFF);
+    const Rect2D s16 = pal.swatch_rect(16), s2 = pal.swatch_rect(2);
+    CHECK(pal.color_at(16) == 0xFFFF0000 && s16.x == s2.x && s16.y > s2.y && pal.swatch_at(s16.x + 3, s16.y + 3) == 16);
+    click(w, 10 + s16.x + 3, 10 + s16.y + 3);
+    CHECK(pal.primary() == 0xFFFF0000 && changes.count == 1);
+    const Rect2D s18 = pal.swatch_rect(18);
+    w.mouse_move(10 + s18.x + 3, 10 + s18.y + 3);
+    w.mouse_button(10 + s18.x + 3, 10 + s18.y + 3, MouseButton::Right, true);
+    w.mouse_button(10 + s18.x + 3, 10 + s18.y + 3, MouseButton::Right, false);
+    CHECK(pal.secondary() == 0xFF00FF00 && changes.count == 2);
+    click(w, 10 + pal.indicator_rect().x + 30, 10 + pal.indicator_rect().y + 30);   // the squares: swap
+    CHECK(pal.primary() == 0xFF00FF00 && pal.secondary() == 0xFFFF0000 && changes.count == 3);
+    pal.set_primary(0x00123456);
+    CHECK(pal.primary() == 0xFF123456);
+    pal.set_primary(0xFF123456);
+    CHECK(changes.count == 4);
+    const uint32_t mine[3] = {0x00FF0000, 0x0000FF00, 0x000000FF};
+    CHECK(pal.set_colors(mine, 3) && pal.color_count() == 3 && pal.color_at(0) == 0xFFFF0000 && pal.columns() == 2);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void drag(Window& w, Point from, Point to, MouseButton button = MouseButton::Left) {
+  w.mouse_move(from.x, from.y);
+  w.mouse_button(from.x, from.y, button, true);
+  w.mouse_move((from.x + to.x) / 2, (from.y + to.y) / 2);
+  w.mouse_move(to.x, to.y);
+  w.mouse_button(to.x, to.y, button, false);
+}
+
+// Window coordinates of the middle of bitmap pixel (x, y).
+static Point pixel_point(DrawingCanvas& c, int32_t x, int32_t y) {
+  const Point v = c.image_to_view(x, y), o = c.window_origin();
+  return {o.x + v.x + static_cast<int32_t>(c.zoom()) / 2, o.y + v.y + static_cast<int32_t>(c.zoom()) / 2};
+}
+
+static void test_drawing_canvas() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    DrawingCanvas c(a);
+    c.set_bounds({10, 10, 300, 220});
+    w.add(&c);
+    CHECK(!c.new_image(0, 10) && !c.new_image(5000, 10) && c.image_width() == 0);
+    CHECK(c.new_image(100, 80) && c.image_width() == 100 && c.image_height() == 80 && c.pixel(5, 5) == 0xFFFFFFFF && c.pixel(100, 5) == 0);
+    w.layout();
+    Counter changes, picks;
+    c.on_changed(changes.handler());
+    c.on_color_picked(picks.handler());
+    const int32_t base = changes.count;
+    const uint32_t black = 0xFF000000, white = 0xFFFFFFFF, red = 0xFFFF0000, blue = 0xFF0000FF;
+
+    // The pencil follows the pointer; the left button paints the primary color, the right button the secondary.
+    c.set_primary(black);
+    c.set_secondary(red);
+    drag(w, pixel_point(c, 5, 5), pixel_point(c, 20, 5));
+    bool row_ok = true;
+    for (uint32_t x = 5; x <= 20; ++x) row_ok = row_ok && c.pixel(x, 5) == black;
+    CHECK(row_ok && c.pixel(4, 5) == white && c.pixel(21, 5) == white && c.pixel(10, 6) == white);
+    CHECK(c.modified() && c.can_undo() && !c.can_redo() && changes.count == base + 1 && !c.stroke_active());
+    drag(w, pixel_point(c, 5, 8), pixel_point(c, 10, 8), MouseButton::Right);
+    CHECK(c.pixel(7, 8) == red);
+    c.undo();
+    CHECK(c.pixel(7, 8) == white && c.pixel(10, 5) == black && c.can_redo());
+    c.undo();
+    CHECK(c.pixel(10, 5) == white && !c.can_undo());
+    c.redo();
+    CHECK(c.pixel(10, 5) == black && c.pixel(7, 8) == white);
+    w.set_focus(&c);
+    press(w, key::kA + 24, modifier::kLeftControl);   // Ctrl+Y
+    CHECK(c.pixel(7, 8) == red);
+    press(w, key::kA + 25, modifier::kLeftControl);   // Ctrl+Z
+    CHECK(c.pixel(7, 8) == white);
+
+    // A wider brush paints a disc.
+    c.set_brush_size(5);
+    drag(w, pixel_point(c, 50, 50), pixel_point(c, 50, 50));
+    CHECK(c.pixel(50, 50) == black && c.pixel(52, 50) == black && c.pixel(50, 48) == black && c.pixel(53, 50) == white && c.pixel(52, 52) == white);
+    c.set_brush_size(1);
+
+    // The eraser paints the secondary color.
+    c.set_tool(PaintTool::Eraser);
+    drag(w, pixel_point(c, 49, 50), pixel_point(c, 51, 50));
+    CHECK(c.pixel(50, 50) == red && c.pixel(50, 51) == red);
+
+    // Shapes are previewed while dragging and drawn when the button goes up.
+    c.set_tool(PaintTool::Rectangle);
+    w.mouse_move(pixel_point(c, 10, 20).x, pixel_point(c, 10, 20).y);
+    w.mouse_button(pixel_point(c, 10, 20).x, pixel_point(c, 10, 20).y, MouseButton::Left, true);
+    w.mouse_move(pixel_point(c, 30, 40).x, pixel_point(c, 30, 40).y);
+    CHECK(c.stroke_active() && c.pixel(30, 30) == black && c.pixel(20, 30) == white);
+    w.mouse_move(pixel_point(c, 25, 35).x, pixel_point(c, 25, 35).y);   // dragging back redraws it smaller
+    CHECK(c.pixel(30, 30) == white && c.pixel(25, 30) == black);
+    w.mouse_button(pixel_point(c, 25, 35).x, pixel_point(c, 25, 35).y, MouseButton::Left, false);
+    CHECK(!c.stroke_active() && c.pixel(10, 20) == black && c.pixel(25, 35) == black && c.pixel(15, 20) == black && c.pixel(15, 28) == white);
+    c.set_filled(true);
+    drag(w, pixel_point(c, 40, 20), pixel_point(c, 60, 30));
+    CHECK(c.pixel(40, 20) == black && c.pixel(60, 30) == black && c.pixel(50, 25) == red);
+
+    c.set_tool(PaintTool::Ellipse);
+    c.set_filled(false);
+    drag(w, pixel_point(c, 10, 50), pixel_point(c, 30, 70));
+    CHECK(c.pixel(10, 60) == black && c.pixel(30, 60) == black && c.pixel(20, 50) == black && c.pixel(20, 70) == black && c.pixel(20, 60) == white && c.pixel(10, 50) == white);
+    c.set_filled(true);
+    drag(w, pixel_point(c, 60, 50), pixel_point(c, 80, 70));
+    CHECK(c.pixel(70, 60) == red && c.pixel(60, 60) == black && c.pixel(60, 50) == white);
+    c.set_filled(false);
+
+    c.set_tool(PaintTool::Line);
+    drag(w, pixel_point(c, 0, 75), pixel_point(c, 20, 79));
+    CHECK(c.pixel(0, 75) == black && c.pixel(20, 79) == black && c.pixel(10, 77) == black);
+
+    // Fill stays inside the outline it is started in.
+    c.set_tool(PaintTool::Fill);
+    c.set_primary(blue);
+    click(w, pixel_point(c, 15, 25).x, pixel_point(c, 15, 25).y);
+    CHECK(c.pixel(15, 25) == blue && c.pixel(24, 34) == blue && c.pixel(10, 20) == black && c.pixel(9, 25) == white && c.pixel(26, 36) == white);
+    click(w, pixel_point(c, 90, 10).x, pixel_point(c, 90, 10).y);   // the outside: everything connected to it
+    CHECK(c.pixel(95, 75) == blue && c.pixel(9, 25) == blue && c.pixel(15, 25) == blue);
+    c.undo();
+    CHECK(c.pixel(95, 75) == white);
+
+    // The color picker takes the color under the pointer (left: primary, right: secondary).
+    c.set_tool(PaintTool::Picker);
+    const int32_t history = static_cast<int32_t>(c.can_undo());
+    click(w, pixel_point(c, 10, 20).x, pixel_point(c, 10, 20).y);
+    CHECK(c.primary() == black && picks.count == 1 && history == 1);
+    drag(w, pixel_point(c, 15, 25), pixel_point(c, 15, 25), MouseButton::Right);
+    CHECK(c.secondary() == blue && picks.count == 2);
+
+    // Escape cancels a stroke.
+    c.set_tool(PaintTool::Line);
+    w.set_focus(&c);
+    const uint32_t before = c.pixel(80, 10);
+    w.mouse_move(pixel_point(c, 70, 5).x, pixel_point(c, 70, 5).y);
+    w.mouse_button(pixel_point(c, 70, 5).x, pixel_point(c, 70, 5).y, MouseButton::Left, true);
+    w.mouse_move(pixel_point(c, 90, 15).x, pixel_point(c, 90, 15).y);
+    CHECK(c.stroke_active() && c.pixel(80, 10) == black);
+    press(w, key::kEscape);
+    CHECK(!c.stroke_active() && c.pixel(80, 10) == before);
+    w.mouse_button(pixel_point(c, 90, 15).x, pixel_point(c, 90, 15).y, MouseButton::Left, false);
+    CHECK(c.pixel(80, 10) == before);
+
+    // Zoom: pixels grow, scroll bars appear, and the pointer still hits the pixel it points at.
+    c.set_tool(PaintTool::Pencil);
+    c.set_zoom(4);
+    w.layout();
+    c.horizontal_scroll_bar().set_value(0);
+    c.vertical_scroll_bar().set_value(0);
+    CHECK(c.zoom() == 4 && c.horizontal_scroll_bar().visible() && c.vertical_scroll_bar().visible());
+    drag(w, pixel_point(c, 2, 2), pixel_point(c, 4, 2));
+    CHECK(c.pixel(2, 2) == black && c.pixel(4, 2) == black && c.pixel(5, 2) == white);
+    int32_t ix, iy;
+    CHECK(c.view_to_image(c.image_to_view(3, 3).x + 3, c.image_to_view(3, 3).y + 3, &ix, &iy) && ix == 3 && iy == 3);
+    c.set_grid(true);
+    c.set_zoom(8);
+    CHECK(c.zoom() == 8);
+    w.render();
+    c.zoom_in();
+    c.zoom_in();
+    c.zoom_in();
+    CHECK(c.zoom() == 16);
+    c.zoom_in();
+    CHECK(c.zoom() == 16);
+    w.mouse_wheel(60, 60, -1);
+    CHECK(c.scroll_position().y > 0);
+    w.render();
+    c.set_zoom(1);
+    c.set_grid(false);
+    w.layout();
+    CHECK(c.zoom() == 1 && !c.horizontal_scroll_bar().visible());
+    int32_t px, py;
+    w.mouse_move(pixel_point(c, 33, 44).x, pixel_point(c, 33, 44).y);
+    CHECK(c.pointer_position(&px, &py) && px == 33 && py == 44);
+    w.mouse_move(390, 290);
+    CHECK(!c.pointer_position(&px, &py));
+
+    // History is limited; the oldest strokes are forgotten.
+    c.set_tool(PaintTool::Pencil);
+    for (int i = 0; i < 70; ++i) drag(w, pixel_point(c, 1, 1), pixel_point(c, 2 + i % 3, 1));
+    uint32_t undone = 0;
+    while (c.can_undo() && undone < 200) { c.undo(); ++undone; }
+    CHECK(undone == DrawingCanvas::kMaxHistoryEntries);
+
+    // Pixels with transparency are laid over white.
+    const uint32_t src[4] = {0x80000000, 0xFFFF0000, 0x00000000, 0xFF00FF00};
+    CHECK(c.set_pixels(src, 2, 2) && c.image_width() == 2 && !c.modified() && !c.can_undo());
+    CHECK(c.pixel(1, 0) == 0xFFFF0000 && c.pixel(0, 1) == 0xFFFFFFFF && c.pixel(1, 1) == 0xFF00FF00);
+    CHECK(red_of(c.pixel(0, 0)) >= 0x7F && red_of(c.pixel(0, 0)) <= 0x80 && green_of(c.pixel(0, 0)) == red_of(c.pixel(0, 0)));
+    CHECK(c.surface().width == 2 && c.surface().valid());
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_paint() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/notes.txt", "not a picture");
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::Paint paint(a);
+    CHECK(mgr.add_window(&paint));
+    w.layout();
+    DrawingCanvas& c = paint.canvas();
+    CHECK(desktop::Paint::is_picture_name("a/b.PNG") && desktop::Paint::is_picture_name("x.jpeg") && !desktop::Paint::is_picture_name("x.txt") && !desktop::Paint::is_picture_name("png"));
+    CHECK(paint.title().equals("Paint - Untitled") && c.image_width() == 640 && c.image_height() == 480 && !paint.undo_button().enabled());
+    CHECK(paint.tools().tool_count() == 8 && paint.tools().tool_name(3).equals("Rectangle") && paint.tools().tool_name(7).equals("Select"));
+
+    // The tool strip, palette, size slider and options drive the canvas.
+    paint.tools().select_tool(3);
+    CHECK(c.tool() == PaintTool::Rectangle);
+    paint.tools().select_tool(0);
+    CHECK(c.tool() == PaintTool::Pencil);
+    const Rect2D swatch = paint.palette().swatch_rect(16);
+    const Point po = paint.palette().window_origin();
+    click(w, po.x + swatch.x + 3, po.y + swatch.y + 3);
+    CHECK(paint.palette().primary() == 0xFFFF0000 && c.primary() == 0xFFFF0000 && paint.color_picker().color() == 0xFFFF0000);
+    paint.size_slider().set_value(3);
+    CHECK(c.brush_size() == 3);
+    paint.filled_box().set_checked(true);
+    paint.grid_box().set_checked(true);
+    CHECK(c.filled() && c.grid());
+    paint.filled_box().set_checked(false);
+    paint.grid_box().set_checked(false);
+    paint.zoom_in_button().click();
+    CHECK(c.zoom() == 2 && paint.zoom_label().text().equals("200%"));
+    paint.zoom_out_button().click();
+    CHECK(c.zoom() == 1 && paint.zoom_label().text().equals("100%"));
+
+    // Drawing marks the picture modified and enables Undo.
+    w.layout();
+    drag(w, pixel_point(c, 10, 10), pixel_point(c, 40, 10));
+    CHECK(c.pixel(25, 10) == 0xFFFF0000 && c.modified() && paint.undo_button().enabled() && !paint.redo_button().enabled());
+    CHECK(paint.title().equals("Paint - Untitled *"));
+    paint.undo_button().click();
+    CHECK(c.pixel(25, 10) == 0xFFFFFFFF && paint.redo_button().enabled());
+    paint.redo_button().click();
+    CHECK(c.pixel(25, 10) == 0xFFFF0000);
+
+    // The color picker tool feeds the palette.
+    paint.tools().select_tool(6);
+    click(w, pixel_point(c, 25, 10).x, pixel_point(c, 25, 10).y);
+    CHECK(paint.palette().primary() == 0xFFFF0000);
+    paint.palette().set_primary(0xFF0000FF);
+    CHECK(c.primary() == 0xFF0000FF);
+
+    // Saving and opening: the format follows the extension; PNG is the default.
+    CHECK(!paint.save_file("/x.png") && paint.status_label().text().equals("No storage available."));
+    paint.set_file_system(&fs);
+    CHECK(!paint.save_file("") && paint.status_label().text().equals("Enter a path to save to."));
+    CHECK(!paint.save_file("/dir/missing.png"));
+    CHECK(paint.save_file("art"));
+    CHECK(paint.path().equals("/art.png") && !c.modified() && paint.title().equals("Paint - art.png") && paint.status_label().text().equals("Saved /art.png"));
+    UniquePointer<filesystem::IFile> f;
+    CHECK(fs.open_file("/art.png", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() > 8);
+    uint8_t magic[4] = {};
+    uint64_t n = 0;
+    CHECK(f->read(0, ByteView(magic, 4), &n) == filesystem::Status::Ok && magic[1] == 'P' && magic[2] == 'N' && magic[3] == 'G');
+    f.reset();
+    const char* names[] = {"/art.bmp", "/art.qoi", "/art.tga", "/art.ppm"};
+    for (const char* name : names) {
+      CHECK(paint.save_file(name));
+      c.new_image(8, 8, 0xFF123456);             // blank, then bring the picture back
+      CHECK(paint.open_file(name) && c.image_width() == 640 && c.pixel(25, 10) == 0xFFFF0000 && c.pixel(25, 11) == 0xFFFF0000 && c.pixel(100, 100) == 0xFFFFFFFF);
+    }
+    CHECK(paint.open_file("/art.png") && c.pixel(25, 10) == 0xFFFF0000 && !c.modified() && paint.title().equals("Paint - art.png"));
+    CHECK(!paint.open_file("/missing.png") && paint.status_label().text().equals("Cannot open /missing.png: not found"));
+    CHECK(!paint.open_file("/notes.txt") && paint.status_label().text().equals("That is not a picture this program can read."));
+
+    // Unsaved changes survive the first New / Open.
+    paint.tools().select_tool(0);
+    drag(w, pixel_point(c, 60, 60), pixel_point(c, 70, 60));
+    CHECK(c.modified());
+    CHECK(!paint.new_picture() && paint.status_label().text().first(13).equals("Unsaved chang") && c.pixel(65, 60) == 0xFF0000FF);
+    CHECK(paint.new_picture(200, 100) && c.image_width() == 200 && c.image_height() == 100 && c.pixel(65, 60) == 0xFFFFFFFF && paint.path().empty());
+    w.mouse_move(799, 599);
+    CHECK(paint.position_label().text().equals("200 x 100"));
+    press(w, key::kA + 18, modifier::kLeftControl);   // Ctrl+S with no path
+    CHECK(paint.status_label().text().equals("Enter a path to save to."));
+    w.render();
+    mgr.remove_window(&paint);
+  }
+  CHECK(a.live == 0);
+}
+
+// --- Clipboard -----------------------------------------------------------------------------------------------------
+
+static void test_text_clipboard() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 400, 200);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 200});
+    w.set_clipboard(&cb);
+    TextBox one(a), two(a);
+    TextEditor ed(a);
+    one.set_bounds({10, 10, 200, 24});
+    two.set_bounds({10, 40, 200, 24});
+    ed.set_bounds({10, 70, 300, 100});
+    w.add(&one);
+    w.add(&two);
+    w.add(&ed);
+    w.layout();
+    String got(a);
+
+    // Selecting in a text box: Shift with the arrows, Ctrl+A, replacing by typing.
+    one.set_text("hello world");
+    w.set_focus(&one);
+    CHECK(!one.has_selection());
+    for (int i = 0; i < 5; ++i) press(w, key::kLeft, modifier::kLeftShift);
+    CHECK(one.has_selection() && one.selected_text().equals("world") && one.selection_start() == 6 && one.selection_end() == 11);
+    press(w, key::kLeft);                       // collapses to the start of the selection
+    CHECK(!one.has_selection() && one.caret() == 6);
+    press(w, 0x4D, modifier::kLeftShift);       // Shift+End
+    CHECK(one.selected_text().equals("world"));
+    press(w, key::kA + 2, modifier::kLeftControl);   // copy
+    CHECK(cb.get_text(&got) && got.view().equals("world") && one.text().equals("hello world"));
+    press(w, key::kA + 23, modifier::kLeftControl);  // cut
+    CHECK(one.text().equals("hello ") && cb.get_text(&got) && got.view().equals("world") && !one.has_selection());
+    w.set_focus(&two);
+    press(w, key::kA + 21, modifier::kLeftControl);  // paste into another control
+    CHECK(two.text().equals("world") && two.caret() == 5);
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(two.selected_text().equals("world"));
+    type_char(w, 'z');
+    CHECK(two.text().equals("z"));
+    press(w, key::kBackspace);
+    CHECK(two.text().empty());
+
+    // A drag with the mouse selects; Backspace removes the selection.
+    one.set_text("abcdefgh");
+    w.mouse_move(10 + 4 + 2 * 8, 22);
+    w.mouse_button(10 + 4 + 2 * 8, 22, MouseButton::Left, true);
+    w.mouse_move(10 + 4 + 6 * 8, 22);
+    w.mouse_button(10 + 4 + 6 * 8, 22, MouseButton::Left, false);
+    CHECK(one.selected_text().equals("cdef") && w.focus() == &one);
+    press(w, key::kBackspace);
+    CHECK(one.text().equals("abgh") && one.caret() == 2);
+
+    // Line breaks become spaces in a single-line box; the maximum length holds.
+    CHECK(cb.set_text("a\r\nb\tc"));
+    two.set_text("");
+    w.set_focus(&two);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(two.text().equals("a  b c"));
+    two.set_text("");
+    two.set_max_length(5);
+    CHECK(cb.set_text("123456789"));
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(two.text().equals("12345"));
+    two.set_max_length(0);
+    two.set_read_only(true);
+    press(w, key::kA + 21, modifier::kLeftControl);   // read-only: nothing is pasted
+    CHECK(two.text().equals("12345"));
+    two.set_read_only(false);
+
+    // Shift+Insert, Ctrl+Insert and Shift+Delete are the older keys for paste, copy and cut.
+    two.set_text("");
+    CHECK(cb.set_text("zz"));
+    press(w, 0x49, modifier::kLeftShift);
+    CHECK(two.text().equals("zz"));
+    press(w, key::kA, modifier::kLeftControl);
+    press(w, 0x49, modifier::kLeftControl);
+    press(w, 0x4C, modifier::kLeftShift);
+    CHECK(two.text().empty() && cb.get_text(&got) && got.view().equals("zz"));
+
+    // A picture on the clipboard is not text.
+    const uint32_t px[1] = {0xFF112233};
+    CHECK(cb.set_image(px, 1, 1));
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(two.text().empty());
+
+    // The multi-line editor shares the clipboard; its line breaks are normalised.
+    CHECK(cb.set_text("line1\r\nline2\rline3"));
+    w.set_focus(&ed);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(ed.text().equals("line1\nline2\nline3") && ed.line_count() == 3);
+    press(w, key::kA, modifier::kLeftControl);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    CHECK(cb.get_text(&got) && got.view().equals("line1\nline2\nline3"));
+    ed.set_caret(0);
+    press(w, 0x4D, modifier::kLeftShift);
+    press(w, key::kA + 23, modifier::kLeftControl);
+    CHECK(cb.get_text(&got) && got.view().equals("line1") && ed.text().equals("\nline2\nline3"));
+    w.set_focus(&one);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(one.text().equals("abline1gh"));
+    w.render();
+
+    // Without a clipboard in the window each control keeps a copy of its own.
+    w.set_clipboard(nullptr);
+    one.set_text("private");
+    press(w, key::kA, modifier::kLeftControl);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    press(w, 0x4D);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(one.text().equals("privateprivate"));
+    cb.clear();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_canvas_clipboard() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    DrawingCanvas c(a);
+    c.set_bounds({10, 10, 300, 220});
+    w.add(&c);
+    c.new_image(40, 30);
+    w.layout();
+    w.set_focus(&c);
+    const uint32_t white = 0xFFFFFFFF, red = 0xFFFF0000, blue = 0xFF0000FF;
+    Counter changes, tools;
+    c.on_changed(changes.handler());
+    c.on_tool_changed(tools.handler());
+
+    // Without a clipboard in the window nothing is copied or pasted.
+    CHECK(!c.copy_selection() && !c.paste() && !c.cut_selection());
+    w.set_clipboard(&cb);
+
+    // A filled red square at (5,5)-(14,14).
+    c.set_tool(PaintTool::Rectangle);
+    c.set_filled(true);
+    c.set_primary(red);
+    c.set_secondary(red);
+    drag(w, pixel_point(c, 5, 5), pixel_point(c, 14, 14));
+    c.set_filled(false);
+    c.set_secondary(white);
+    CHECK(c.pixel(5, 5) == red && c.pixel(14, 14) == red && c.pixel(10, 10) == red && c.pixel(15, 15) == white);
+
+    // The Select tool drags out a rectangle; a click clears it; Ctrl+A selects all.
+    c.set_tool(PaintTool::Select);
+    drag(w, pixel_point(c, 3, 3), pixel_point(c, 16, 16));
+    CHECK(c.has_selection() && c.selection().x == 3 && c.selection().y == 3 && c.selection().width == 14 && c.selection().height == 14);
+    click(w, pixel_point(c, 30, 25).x, pixel_point(c, 30, 25).y);
+    CHECK(!c.has_selection());
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(c.has_selection() && c.selection().width == 40 && c.selection().height == 30);
+    w.render();
+    press(w, key::kEscape);
+    CHECK(!c.has_selection());
+    drag(w, pixel_point(c, 5, 5), pixel_point(c, 14, 14));
+    CHECK(c.selection().width == 10 && c.selection().height == 10);
+
+    // Copy takes the selection (the whole picture without one); the picture is unchanged.
+    CHECK(c.copy_selection() && cb.has_image());
+    uint32_t cw, ch;
+    CHECK(cb.image_size(&cw, &ch) && cw == 10 && ch == 10);
+    uint32_t part[100];
+    CHECK(cb.get_image(part, 100) && part[0] == red && part[99] == red);
+    c.clear_selection();
+    CHECK(c.copy_selection() && cb.image_size(&cw, &ch) && cw == 40 && ch == 30);
+    CHECK(!c.cut_selection());                  // nothing selected: nothing to cut
+
+    // Cut clears the area to the secondary color; undo brings it back.
+    c.select_rect(5, 5, 10, 10);
+    CHECK(c.cut_selection() && c.pixel(7, 7) == white && c.pixel(14, 14) == white && c.has_selection());   // the rectangle stays
+    CHECK(cb.image_size(&cw, &ch) && cw == 10 && cb.get_image(part, 100) && part[55] == red);
+    c.undo();
+    CHECK(c.pixel(7, 7) == red);
+
+    // Paste: a floating picture appears in the corner of the view, the tool becomes Select, and it can be dragged.
+    const int32_t tool_events = tools.count;
+    c.set_tool(PaintTool::Pencil);
+    CHECK(c.paste() && c.floating() && c.has_selection() && c.tool() == PaintTool::Select && tools.count == tool_events + 1);
+    CHECK(c.selection().x == 0 && c.selection().y == 0 && c.selection().width == 10 && c.pixel(3, 3) == red && c.pixel(12, 12) == red && c.modified());
+    w.mouse_move(pixel_point(c, 3, 3).x, pixel_point(c, 3, 3).y);
+    w.mouse_button(pixel_point(c, 3, 3).x, pixel_point(c, 3, 3).y, MouseButton::Left, true);
+    w.mouse_move(pixel_point(c, 23, 13).x, pixel_point(c, 23, 13).y);
+    w.mouse_button(pixel_point(c, 23, 13).x, pixel_point(c, 23, 13).y, MouseButton::Left, false);
+    CHECK(c.floating() && c.selection().x == 20 && c.selection().y == 10 && c.pixel(3, 3) == white && c.pixel(25, 15) == red && c.pixel(19, 15) == white);
+    press(w, key::kEnter);                      // set down
+    CHECK(!c.floating() && c.pixel(25, 15) == red && c.has_selection());
+    c.undo();                                   // one step undoes the whole paste
+    CHECK(c.pixel(25, 15) == white && c.pixel(7, 7) == red && c.can_undo());
+    c.redo();
+    CHECK(c.pixel(25, 15) == red);
+    c.undo();
+
+    // Escape takes a pasted picture back.
+    CHECK(c.paste() && c.floating() && c.pixel(2, 2) == red);
+    press(w, key::kEscape);
+    CHECK(!c.floating() && !c.has_selection() && c.pixel(2, 2) == white && c.pixel(7, 7) == red);
+    // Undo does the same.
+    CHECK(c.paste());
+    c.undo();
+    CHECK(!c.floating() && c.pixel(2, 2) == white);
+    // A pasted picture is set down when another tool is used.
+    CHECK(c.paste());
+    c.set_tool(PaintTool::Pencil);
+    CHECK(!c.floating() && c.pixel(2, 2) == red);
+    c.undo();
+
+    // Dragging inside a selection lifts it and carries it; the hole takes the secondary color.
+    c.set_tool(PaintTool::Select);
+    c.select_rect(5, 5, 10, 10);
+    w.mouse_move(pixel_point(c, 7, 7).x, pixel_point(c, 7, 7).y);
+    w.mouse_button(pixel_point(c, 7, 7).x, pixel_point(c, 7, 7).y, MouseButton::Left, true);
+    CHECK(c.floating() && c.pixel(7, 7) == red);      // lifted, but still where it was
+    w.mouse_move(pixel_point(c, 27, 17).x, pixel_point(c, 27, 17).y);
+    w.mouse_button(pixel_point(c, 27, 17).x, pixel_point(c, 27, 17).y, MouseButton::Left, false);
+    CHECK(c.selection().x == 25 && c.selection().y == 15 && c.pixel(7, 7) == white && c.pixel(5, 5) == white && c.pixel(30, 20) == red);
+    click(w, pixel_point(c, 1, 28).x, pixel_point(c, 1, 28).y);   // outside: set down, and start a new selection
+    CHECK(!c.floating() && c.pixel(30, 20) == red && !c.has_selection());
+    c.undo();
+    CHECK(c.pixel(7, 7) == red && c.pixel(30, 20) == white);
+
+    // Delete clears a selection; with a floating picture it drops the picture.
+    c.select_rect(5, 5, 10, 10);
+    press(w, 0x4C);
+    CHECK(c.pixel(7, 7) == white && c.has_selection());
+    c.undo();
+    CHECK(c.paste());
+    press(w, 0x4C);
+    CHECK(!c.floating() && c.pixel(2, 2) == white);
+    c.undo();
+    CHECK(c.pixel(7, 7) == red);
+
+    // Translucent pixels are blended over what is under them; a picture bigger than the bitmap is cut off.
+    const uint32_t soft[4] = {0x80000000, 0xFF00FF00, 0x00000000, 0xFF0000FF};
+    CHECK(cb.set_image(soft, 2, 2) && c.paste());
+    CHECK(red_of(c.pixel(0, 0)) > 0x70 && red_of(c.pixel(0, 0)) < 0x90 && c.pixel(1, 0) == 0xFF00FF00 && c.pixel(0, 1) == white && c.pixel(1, 1) == blue);
+    c.undo();
+    uint32_t* big = static_cast<uint32_t*>(malloc(60 * 50 * 4));
+    for (int i = 0; i < 60 * 50; ++i) big[i] = blue;
+    CHECK(cb.set_image(big, 60, 50) && c.paste() && c.pixel(39, 29) == blue && c.pixel(0, 0) == blue);
+    c.undo();
+    free(big);
+    CHECK(cb.set_text("text") && !c.paste());  // text is not a picture
+    c.clear_selection();
+    w.render();
+
+    // Ctrl+C, Ctrl+X and Ctrl+V on the canvas, and Shift+Insert.
+    CHECK(cb.set_image(soft, 2, 2));
+    c.select_rect(5, 5, 4, 4);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    CHECK(cb.image_size(&cw, &ch) && cw == 4 && ch == 4);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(c.floating());
+    press(w, key::kEnter);
+    press(w, 0x4A, modifier::kLeftControl);
+    c.select_rect(5, 5, 4, 4);
+    press(w, key::kA + 23, modifier::kLeftControl);
+    CHECK(c.pixel(6, 6) == white && c.has_selection());
+    press(w, 0x49, modifier::kLeftShift);
+    CHECK(c.floating());
+    c.clear_selection();
+    CHECK(!c.floating());
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_paint_clipboard() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    w.set_clipboard(&cb);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::Paint paint(a);
+    paint.set_file_system(&fs);
+    CHECK(mgr.add_window(&paint));
+    w.layout();
+    DrawingCanvas& c = paint.canvas();
+    paint.palette().set_primary(0xFFFF0000);
+    drag(w, pixel_point(c, 10, 10), pixel_point(c, 30, 10));
+    CHECK(c.pixel(20, 10) == 0xFFFF0000);
+
+    paint.cut_button().click();                 // nothing selected
+    CHECK(paint.status_label().text().equals("Select something to cut first."));
+    paint.copy_button().click();                // so the whole picture is copied
+    uint32_t cw, ch;
+    CHECK(paint.status_label().text().equals("Copied the whole picture.") && cb.image_size(&cw, &ch) && cw == 640 && ch == 480);
+
+    paint.tools().select_tool(7);
+    CHECK(c.tool() == PaintTool::Select);
+    c.select_rect(8, 8, 30, 6);
+    paint.copy_button().click();
+    CHECK(paint.status_label().text().equals("Copied the selection.") && cb.image_size(&cw, &ch) && cw == 30 && ch == 6);
+    paint.cut_button().click();
+    CHECK(paint.status_label().text().equals("Cut to the clipboard.") && c.pixel(20, 10) == 0xFFFFFFFF);
+
+    // Paste: a floating picture, and the tool strip follows the canvas to the Select tool.
+    paint.tools().select_tool(0);
+    paint.paste_button().click();
+    CHECK(c.floating() && paint.tools().selected_tool() == 7 && c.pixel(5, 3) == 0xFFFFFFFF && c.pixel(2, 3) == 0xFFFFFFFF);
+    CHECK(paint.status_label().text().first(7).equals("Pasted."));
+    // Saving sets it down first.
+    CHECK(paint.save_file("/p.png") && !c.floating());
+    // Ctrl+V from somewhere that is not the canvas goes through the window.
+    w.set_focus(&paint.palette());
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(c.floating());
+    c.undo();
+    CHECK(cb.set_text("words"));
+    paint.paste_button().click();
+    CHECK(!c.floating() && paint.status_label().text().equals("Nothing to paste: the clipboard has no picture."));
+    w.render();
+    mgr.remove_window(&paint);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
   test_data_grid();
   test_data_grid_scrolling();
@@ -1462,6 +2224,14 @@ int main() {
   test_player_control();
   test_video_control();
   test_list_view();
+  test_tab_control();
+  test_tool_strip();
+  test_color_palette();
+  test_drawing_canvas();
+  test_paint();
+  test_text_clipboard();
+  test_canvas_clipboard();
+  test_paint_clipboard();
   test_breadcrumb_bar();
   test_file_explorer();
   test_task_manager();

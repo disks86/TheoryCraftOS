@@ -40,6 +40,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       explorer_(allocator),
       task_manager_(allocator),
       notepad_(allocator),
+      paint_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)} {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
@@ -56,6 +57,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
   start_.menu().add_item("Task Manager", {&Desktop::on_task_manager, this});
   start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});
+  start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -133,6 +135,11 @@ void Desktop::open_text_editor() {
   else windows_.add_window(&notepad_);
 }
 
+void Desktop::open_paint() {
+  if (paint_.manager()) paint_.activate();
+  else windows_.add_window(&paint_);
+}
+
 void Desktop::open_about() {
   if (about_.manager()) about_.activate();
   else windows_.add_window(&about_);
@@ -141,9 +148,15 @@ void Desktop::open_about() {
 void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 
 void Desktop::on_task_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_task_manager(); }
+void Desktop::on_paint(void* self, Control&) { static_cast<Desktop*>(self)->open_paint(); }
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
 void Desktop::on_explorer_file(void* self, Control&) {
   auto* d = static_cast<Desktop*>(self);
+  if (Paint::is_picture_name(d->explorer_.opened_file())) {  // pictures open in Paint, everything else as text
+    d->paint_.open_file(d->explorer_.opened_file());
+    d->open_paint();
+    return;
+  }
   d->notepad_.open_file(d->explorer_.opened_file());
   d->open_text_editor();
 }

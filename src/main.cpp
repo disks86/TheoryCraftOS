@@ -49,6 +49,7 @@
 #include "Media/MediaCodecs.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
 #include "SystemMonitor.hpp"
 #include "uefi.hpp"
@@ -537,12 +538,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer) {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
+    kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
     desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
     desktop.window().show_cursor(input.mice().count() > 0);
     InputHotplugContext input_hotplug{&input, &desktop};
     input.set_notifier(on_input_change, &input_hotplug);
     if (!input.start_service()) Entry(Level::Warning, "Input").text("could not start hot-plug polling; USB keyboards and mice plugged in later are not seen");
     SystemFileSystem explorer_files(shared_allocator, storage);
+    desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());
     explorer_files.set_notifier(on_storage_change, &desktop);
     if (!explorer_files.start_service()) Entry(Level::Warning, "Storage").text("could not start hot-plug polling; USB sticks plugged in later are not seen");

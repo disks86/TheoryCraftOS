@@ -23,10 +23,12 @@
 namespace gui {
 
 // A single-line text editor: typing inserts at the caret, Backspace/Delete/Left/Right/Home/End edit and
-// move it, a click places it. Long text scrolls horizontally. (No selection or clipboard yet.)
+// move it, a click places it. Long text scrolls horizontally. Shift with a movement key, a drag with the mouse or Ctrl+A
+// select text, and typing replaces the selection. Ctrl+C / Ctrl+X / Ctrl+V (also Ctrl+Insert, Shift+Delete, Shift+Insert)
+// copy, cut and paste through the clipboard; line breaks in pasted text become spaces.
 class TextBox : public Control {
  public:
-  explicit TextBox(allocators::IAllocator& allocator) : Control(allocator), text_(allocator) {}
+  explicit TextBox(allocators::IAllocator& allocator) : Control(allocator), text_(allocator), fallback_(allocator) {}
 
   StringView text() const { return text_.view(); }
   // Replaces the text (the caret goes to the end). False if memory ran out.
@@ -34,11 +36,18 @@ class TextBox : public Control {
   void set_read_only(bool read_only) { UiGuard lock(this); read_only_ = read_only; }
   void set_max_length(uint32_t max) { UiGuard lock(this); max_length_ = max; }
   uint32_t caret() const { return caret_; }
+  bool has_selection() const { return caret_ != anchor_; }
+  uint32_t selection_start() const { return caret_ < anchor_ ? caret_ : anchor_; }
+  uint32_t selection_end() const { return caret_ < anchor_ ? anchor_ : caret_; }
+  void select_all();
+  StringView selected_text() const { return text_.view().substr(selection_start(), selection_end() - selection_start()); }
   void on_changed(Handler handler) { UiGuard lock(this); changed_ = handler; }
 
   bool focusable() const override { return true; }
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
+  void on_mouse_move(const MouseArgs& args) override;
+  void on_mouse_up(const MouseArgs& args) override { dragging_ = false; }
   bool on_key(const KeyArgs& args) override;
 
  protected:
@@ -46,15 +55,19 @@ class TextBox : public Control {
 
  private:
   void scroll_to_caret();
+  uint32_t index_at(int32_t x) const;
+  void move_caret(uint32_t to, bool extend);
+  bool replace_selection(StringView with);
+  void paste();
   uint32_t visible_chars() const;
   void changed();
 
-  String text_;
+  String text_, fallback_;  // fallback_: the clipboard when the window has none
   Handler changed_;
-  uint32_t caret_ = 0;   // between characters: 0 .. text length
+  uint32_t caret_ = 0, anchor_ = 0;  // between characters: 0 .. text length; the selection runs between them
   uint32_t scroll_ = 0;  // first visible character
   uint32_t max_length_ = 0;  // 0 = unlimited
-  bool read_only_ = false;
+  bool read_only_ = false, dragging_ = false;
 };
 
 }  // namespace gui

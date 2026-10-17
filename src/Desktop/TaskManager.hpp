@@ -16,8 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The task manager: a window with the processor load (overall and per core), memory use and a table of the
-// running kernel threads with their state, core and share of the processor. It reads the machine through
+// The task manager: a window with two tabs. "Processes" is a table of the running kernel threads with their state,
+// core and share of the processor; "Performance" shows the processor load (overall and per core) and memory use. It reads the machine through
 // an ISystemMonitor and refreshes itself when update() is called (the desktop does so once a second while the
 // window is open). Click a column title to sort the table.
 #pragma once
@@ -25,6 +25,8 @@
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
 #include "Gui/Controls/Panel.hpp"
+#include "Gui/Controls/TabControl.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "Gui/Windows/Frame.hpp"
 
 namespace desktop {
@@ -86,7 +88,10 @@ class TaskManager : public gui::Frame {
   gui::Label& cpu_label() { return cpu_value_; }
   gui::Label& memory_label() { return memory_value_; }
   gui::Label& info_label() { return info_; }
-  gui::Label& cores_label() { return cores_; }
+  gui::TabControl& tabs() { return tabs_; }
+  // The meter and label of core `index` (one per online core up to kMaxCoresShown; nullptr for others).
+  gui::LevelMeter* core_meter(uint32_t index);
+  gui::Label* core_label(uint32_t index);
   // The CPU share (tenths of a percent of one core) of the thread with this id, or -1 if it is not listed.
   int32_t thread_load_tenths(uint64_t id) const;
 
@@ -113,10 +118,20 @@ class TaskManager : public gui::Frame {
     uint32_t ticks_per_second = 1000;
   };
 
-  gui::Panel perf_, cpu_row_, memory_row_;
-  gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_, cores_;
+  // The row of one core on the Performance tab.
+  struct CoreRow {
+    explicit CoreRow(allocators::IAllocator& allocator) : row(allocator), title(allocator), value(allocator), meter(allocator) {}
+    gui::Panel row;
+    gui::Label title, value;
+    gui::LevelMeter meter;
+  };
+
+  gui::TabControl tabs_;
+  gui::Panel processes_page_, performance_page_, cpu_row_, memory_row_;
+  gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
   gui::LevelMeter cpu_meter_, memory_meter_;
   gui::DataGrid grid_;
+  List<UniquePointer<CoreRow>> core_rows_;
   Model model_;
   ISystemMonitor* monitor_ = nullptr;
   List<TaskCore> previous_cores_;
