@@ -73,11 +73,43 @@ void Window::render() {
     paint_tree(painter);
     if (popup_) popup_->paint_tree(painter);
     if (cursor_visible_) {
-      // A classic arrow: black triangle with a white edge.
       painter.renderer().reset_clip();
       const float x = static_cast<float>(cursor_.x), y = static_cast<float>(cursor_.y);
-      renderer_.fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
-      renderer_.fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
+      Control* under = captured_;
+      Point origin;
+      if (under) origin = under->window_origin();
+      else under = target_at(cursor_.x, cursor_.y, &origin);
+      const CursorShape shape = under ? under->cursor_shape(cursor_.x - origin.x, cursor_.y - origin.y) : CursorShape::Arrow;
+      if (shape == CursorShape::Arrow) {
+        // A classic arrow: black triangle with a white edge.
+        renderer_.fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
+        renderer_.fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
+      } else {
+        // A double arrow along the resize direction, centered on the pointer.
+        const int32_t dx = shape == CursorShape::ResizeVertical ? 0 : 1;
+        const int32_t dy = shape == CursorShape::ResizeHorizontal ? 0 : shape == CursorShape::ResizeDiagonalUp ? -1 : 1;
+        const int32_t px = -dy, py = dx;  // perpendicular
+        const float step = dx && dy ? 0.75f : 1.0f;
+        for (int pass = 0; pass < 2; ++pass) {  // white outline, then the black arrow on top
+          const float grow = pass == 0 ? 1.5f : 0.0f;
+          const uint32_t color = pass == 0 ? theme_.highlight : theme_.dark;
+          for (int sign = -1; sign <= 1; sign += 2) {
+            const float s = static_cast<float>(sign) * step;
+            const float tx = x + s * (9 + grow) * dx, ty = y + s * (9 + grow) * dy;
+            const float bx = x + s * 3 * dx, by = y + s * 3 * dy;
+            const float w = 4.5f + grow;
+            renderer_.fill_triangle({tx, ty}, {bx + w * px, by + w * py}, {bx - w * px, by - w * py}, color);
+          }
+          const float half = 1.0f + grow;
+          for (float t = -4; t <= 4; t += 1) {
+            const float cx = x + t * dx * step, cy = y + t * dy * step;
+            renderer_.fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py - half},
+                                    {cx + half * px + half, cy + half * py + half}, color);
+            renderer_.fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py + half},
+                                    {cx - half * px - half, cy - half * py + half}, color);
+          }
+        }
+      }
     }
   }
   // Presenting needs no access to the controls: the UI may change while the frame goes out.

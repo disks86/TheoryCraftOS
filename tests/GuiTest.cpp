@@ -724,6 +724,33 @@ static void test_windows() {
     w.mouse_move(corner.x + 100, corner.y + 50);
     w.mouse_button(corner.x + 100, corner.y + 50, MouseButton::Left, false);
     CHECK(is(fa.bounds(), 10, 10, 400, 250));
+    // The pointer shows the resize direction over the borders: the grab zone is kBorder wide.
+    CHECK(fa.cursor_shape(100, 100) == CursorShape::Arrow && fa.cursor_shape(0, 100) == CursorShape::ResizeHorizontal &&
+          fa.cursor_shape(Frame::kBorder - 1, 100) == CursorShape::ResizeHorizontal && fa.cursor_shape(Frame::kBorder, 100) != CursorShape::ResizeHorizontal);
+    CHECK(fa.cursor_shape(200, 0) == CursorShape::ResizeVertical && fa.cursor_shape(1, 1) == CursorShape::ResizeDiagonalDown &&
+          fa.cursor_shape(static_cast<int32_t>(fa.bounds().width) - 1, 1) == CursorShape::ResizeDiagonalUp);
+    {
+      w.show_cursor(true);  // drawn with the shape under it (ASAN checks the drawing stays on the screen)
+      const Point edge = {fa.window_origin().x + static_cast<int32_t>(fa.bounds().width) - 2, fa.window_origin().y + 100};
+      w.mouse_move(edge.x, edge.y);
+      w.render();
+      w.mouse_move(0, 0);
+      w.render();
+      w.mouse_move(799, 599);
+      w.render();
+      w.show_cursor(false);
+    }
+    // Dragging the right edge by a pixel inside the border widens the window.
+    {
+      const Point edge = {fa.window_origin().x + static_cast<int32_t>(fa.bounds().width) - 5, fa.window_origin().y + 100};
+      const uint32_t before = fa.bounds().width;
+      w.mouse_move(edge.x, edge.y);
+      w.mouse_button(edge.x, edge.y, MouseButton::Left, true);
+      w.mouse_move(edge.x + 30, edge.y);
+      w.mouse_button(edge.x + 30, edge.y, MouseButton::Left, false);
+      CHECK(fa.bounds().width == before + 30);
+      fa.set_bounds({10, 10, 400, 250});
+    }
     CHECK(fa.part_at(1, 1) == Frame::Part::TopLeft && fa.part_at(0, 100) == Frame::Part::Left && fa.part_at(200, 0) == Frame::Part::Top);
     const Point tl = {fa.window_origin().x + 1, fa.window_origin().y + 1};
     w.mouse_move(tl.x, tl.y);

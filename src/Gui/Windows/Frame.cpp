@@ -24,7 +24,7 @@
 namespace gui {
 
 namespace {
-constexpr int32_t kCorner = 14;  // how far along an edge a corner grip reaches
+constexpr int32_t kCorner = 18;  // how far along an edge a corner grip reaches
 }
 
 void Frame::minimize() {
@@ -90,6 +90,20 @@ Frame::Part Frame::part_at(int32_t x, int32_t y) const {
   }
   if (contains({kBorder, kBorder, bounds_.width - 2 * kBorder, static_cast<uint32_t>(kTitleHeight)}, x, y)) return Part::TitleBar;
   return Part::Client;
+}
+
+CursorShape Frame::cursor_shape(int32_t x, int32_t y) const {
+  switch (dragging_ != Part::None ? dragging_ : part_at(x, y)) {
+    case Part::Left:
+    case Part::Right: return CursorShape::ResizeHorizontal;
+    case Part::Top:
+    case Part::Bottom: return CursorShape::ResizeVertical;
+    case Part::TopLeft:
+    case Part::BottomRight: return CursorShape::ResizeDiagonalDown;
+    case Part::TopRight:
+    case Part::BottomLeft: return CursorShape::ResizeDiagonalUp;
+    default: return CursorShape::Arrow;
+  }
 }
 
 void Frame::draw_button(Painter& painter, Part button) {

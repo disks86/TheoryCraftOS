@@ -131,6 +131,9 @@ class Control {
   // Called on the owner of a popup (Window::open_popup) when the popup closes.
   virtual void on_popup_closed(Control*) {}
 
+  // The pointer to draw while the mouse is at (x, y) of this control (or is captured by it).
+  virtual CursorShape cursor_shape(int32_t /*x*/, int32_t /*y*/) const { return CursorShape::Arrow; }
+
   // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
   Control* hit_test(int32_t x, int32_t y);
 
