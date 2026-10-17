@@ -166,10 +166,32 @@ void SystemStorageDevices::sweep_removed() {
     StorageEvent event;
     event.kind = StorageEvent::Kind::Removed;
     event.id = id;
+    event.ejected = gone->ejected();
     event.device = util::move(gone);
     kernel::ScopedMutex guard(mutex_);
     pending_.push_back(util::move(event));
   }
+}
+
+SharedPointer<IStorageDevice> SystemStorageDevices::find(uint32_t id) const {
+  kernel::ScopedMutex guard(mutex_);
+  for (const Entry& e : devices_.view())
+    if (e.id == id) return e.device;
+  return SharedPointer<IStorageDevice>();
+}
+
+bool SystemStorageDevices::can_eject(uint32_t id) const {
+  SharedPointer<IStorageDevice> device = find(id);
+  return device && device->present() && device->can_eject();
+}
+
+EjectResult SystemStorageDevices::eject(uint32_t id) {
+  SharedPointer<IStorageDevice> device = find(id);
+  if (!device || !device->present()) return EjectResult::NotFound;
+  if (!device->can_eject()) return EjectResult::NotSupported;
+  if (!device->eject()) return EjectResult::Failed;
+  sweep_removed();   // it is no longer present: out of the list, shut down, reported
+  return EjectResult::Ok;
 }
 
 bool SystemStorageDevices::poll(StorageEvent* event) {

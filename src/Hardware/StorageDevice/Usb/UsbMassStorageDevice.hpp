@@ -47,7 +47,14 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
                             List<UniquePointer<IStorageDevice>>& out);
 
   // False once the device was unplugged (the port's generation moved on) or shut down: requests then fail at once.
-  bool present() const override { return !__atomic_load_n(&shut_down_, __ATOMIC_ACQUIRE) && host_.port_generation(port_) == generation_; }
+  bool present() const override {
+    return !__atomic_load_n(&shut_down_, __ATOMIC_ACQUIRE) && !__atomic_load_n(&ejected_, __ATOMIC_ACQUIRE) && host_.port_generation(port_) == generation_;
+  }
+  // Flushes the write cache (a device that does not know the command is let off), allows removal and stops the unit (opening the tray of an optical
+  // drive). False, with the device untouched, if the cache could not be flushed.
+  bool can_eject() const override { return true; }
+  bool eject() override;
+  bool ejected() const override { return __atomic_load_n(&ejected_, __ATOMIC_ACQUIRE); }
   const char* name() const override { return optical_ ? "USB optical drive" : "USB mass storage"; }
   bool initialize() override;
   void shutdown() override;
@@ -71,6 +78,8 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
   uint16_t in_max_packet_, out_max_packet_;
   uint32_t generation_;     // the port's generation when the device was taken over
   bool shut_down_ = false;
+  bool ejected_ = false;
+  uint8_t last_sense_key_ = 0;   // of the last command that failed with CHECK CONDITION (0: none, or it has not failed since)
   ByteView wire_;  // command and status wrappers, sense and identify data: one 64 KiB-aligned page
   uint32_t tag_ = 1;
   bool optical_ = false;

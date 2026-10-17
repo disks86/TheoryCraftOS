@@ -131,6 +131,13 @@ struct FakeStickHost final : IUsbHostController {
     uint8_t port_status = 0x18;      // selected, no error
     Bytes printed;
     int fail_out = 0;                // bulk OUT transfers still to fail
+    // Storage: what the host asked for, and how the stick behaves when it is ejected.
+    std::vector<uint8_t> opcodes;    // every SCSI command received
+    bool sync_unsupported = false;   // SYNCHRONIZE CACHE: ILLEGAL REQUEST
+    bool sync_fails = false;         // SYNCHRONIZE CACHE: MEDIUM ERROR
+    uint8_t sense_key = 0;           // reported by the next REQUEST SENSE
+    bool stopped = false, tray_opened = false, removal_allowed = false;
+    bool optical = false;            // answers INQUIRY as a CD/DVD drive
   };
   static constexpr uint32_t kPorts = 4;
   Stick* sticks[kPorts] = {};
@@ -263,10 +270,12 @@ struct FakeStickHost final : IUsbHostController {
     s.response.clear();
     s.csw_status = 0;
     s.expect_write = false;
+    s.opcodes.push_back(cdb[0]);
     switch (cdb[0]) {
       case 0x12:   // INQUIRY
         if (s.broken_inquiry) { s.csw_status = 1; break; }
         s.response.assign(36, 0);
+        s.response[0] = s.optical ? 5 : 0;
         s.response[1] = 0x80;   // removable
         s.response[4] = 31;
         memcpy(&s.response[8], "TESTSTK Hot-plug stick  ", 24);
@@ -290,10 +299,17 @@ struct FakeStickHost final : IUsbHostController {
         s.write_blocks = (cdb[7] << 8) | cdb[8];
         s.expect_write = true;
         break;
-      case 0x35: break;   // SYNCHRONIZE CACHE
+      case 0x35:          // SYNCHRONIZE CACHE
+        if (s.sync_unsupported) { s.csw_status = 1; s.sense_key = 5; }
+        else if (s.sync_fails) { s.csw_status = 1; s.sense_key = 3; }
+        break;
+      case 0x1E: s.removal_allowed = (cdb[4] & 1) == 0; break;   // PREVENT ALLOW MEDIUM REMOVAL
+      case 0x1B: s.stopped = (cdb[4] & 1) == 0; s.tray_opened = (cdb[4] & 2) != 0; break;   // START STOP UNIT
       case 0x03:          // REQUEST SENSE
         s.response.assign(18, 0);
         s.response[0] = 0x70;
+        s.response[2] = s.sense_key;
+        s.sense_key = 0;
         break;
       default: s.csw_status = 1; break;
     }

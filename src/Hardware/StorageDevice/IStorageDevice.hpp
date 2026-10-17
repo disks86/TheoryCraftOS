@@ -53,6 +53,14 @@ class IStorageDevice : public IHardware {
   // are always present.
   virtual bool present() const { return true; }
 
+  // Safe removal. can_eject() says whether the device supports it (a USB stick does, a disk in the machine does not). eject() writes out
+  // what the device still holds, tells it to stop (and, for a drive with a tray, opens it) and lets go of it: false if that did not work
+  // (the device is then as it was), true when it is safe to unplug - present() is false from then on, and ejected() says why. The caller
+  // has stopped using the device by then (SystemFileSystem unmounts first).
+  virtual bool can_eject() const { return false; }
+  virtual bool eject() { return false; }
+  virtual bool ejected() const { return false; }
+
   virtual StorageInfo info() const = 0;
   virtual StorageStatistics statistics() const = 0;
 

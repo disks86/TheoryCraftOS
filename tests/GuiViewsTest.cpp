@@ -984,6 +984,20 @@ static void make_file(filesystem::IFileSystem& fs, const char* path, const char*
   CHECK(file->write(0, ConstByteView(reinterpret_cast<const uint8_t*>(text), strlen(text)), &written) == filesystem::Status::Ok && written == strlen(text));
 }
 
+struct EjectProbe {
+  char volume[64] = {};
+  int calls = 0;
+  const char* answer = "ejected";
+};
+static const char* probe_eject(void* context, StringView volume) {
+  EjectProbe* p = static_cast<EjectProbe*>(context);
+  ++p->calls;
+  const uint64_t n = volume.size() < sizeof p->volume - 1 ? volume.size() : sizeof p->volume - 1;
+  memcpy(p->volume, volume.data(), n);
+  p->volume[n] = 0;
+  return p->answer;
+}
+
 static void test_file_explorer() {
   TestAllocator a;
   {
@@ -1120,6 +1134,20 @@ static void test_file_explorer() {
     CHECK(ex.refresh() && ex.path().equals("/docs") && ex.view().item_count() == 1);
     CHECK(fs.remove("/docs/note.md") == filesystem::Status::Ok && fs.remove("/docs") == filesystem::Status::Ok);
     CHECK(ex.refresh() && ex.path().equals("/") && ex.view().item_count() == 5);
+    // File > Eject: the selected folder at the root, else the folder of the path's first component; the answer goes to the status bar
+    {
+      EjectProbe probe;
+      ex.set_eject_handler(probe_eject, &probe);
+      CHECK(ex.open_folder("/") && !ex.eject_selected() && probe.calls == 0 && ex.status_label().text().equals("Select a drive to eject"));
+      ex.view().select_item(0);   // a folder (Apps)
+      CHECK(ex.eject_selected() && probe.calls == 1 && strcmp(probe.volume, "Apps") == 0 && ex.status_label().text().equals("ejected"));
+      CHECK(ex.open_folder("/Apps") && ex.eject_selected() && probe.calls == 2 && strcmp(probe.volume, "Apps") == 0);
+      probe.answer = nullptr;
+      CHECK(ex.eject_selected() && probe.calls == 3);
+      ex.set_eject_handler(nullptr, nullptr);
+      CHECK(!ex.eject_selected() && ex.status_label().text().equals("Nothing here can be ejected") && probe.calls == 3);
+      ex.open_folder("/");
+    }
     desktop::FileExplorer detached(a);
     CHECK(!detached.refresh());
     w.render();

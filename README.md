@@ -82,6 +82,18 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   mid-command, a port that gets another stick before the removal was seen, partitioned and blank sticks, handles outliving volumes);
   `tests/StorageHotplugThreadTest.cpp` does it with real threads under ThreadSanitizer. The xHCI port-change handling itself has no
   test (it needs a simulated controller) and has not been run on hardware or QEMU.
+  USB mass storage safe eject: `IStorageDevice::eject()` (USB sticks implement it) flushes the write cache (SYNCHRONIZE CACHE; a stick
+  that answers ILLEGAL REQUEST has nothing to flush, any other failure aborts with the device untouched), allows removal (PREVENT ALLOW
+  MEDIUM REMOVAL) and stops the unit (START STOP UNIT, with the tray eject for an optical drive); afterwards `present()` is false and
+  `ejected()` is true, so the existing removal path takes the device out of the list (a `StorageEvent` with `ejected`), and it is not found
+  again until it is physically plugged in again. `SystemFileSystem::eject(volume, force)` does the whole job for a volume: refuses while
+  anything is open on the drive (`InUse`; with `force` the handles answer `NoMedia`), ejects the device, then unmounts all its volumes
+  (`Failed` leaves everything mounted); the memory volume is `NotEjectable`. The file explorer has File > Eject (the selected drive at the root,
+  else the drive the current folder is on; the answer is shown in its status bar; `main` wires it to `SystemFileSystem::eject`). Limits: FAT
+  is read-only here, so there is never unwritten data of ours to lose - the flush matters to future writers; USB sticks only (internal
+  disks report `NotEjectable`); an optical drive whose tray was opened is not rediscovered without replugging it; no "eject on hot-plug
+  button" or per-LUN eject. `tests/StorageEjectTest.cpp` covers the commands, a stick without or with a failing cache sync, an optical drive,
+  in-use and forced eject, and the stick staying gone; the thread test now has an ejector thread running against the readers and plugger.
   USB HID hot-plug: several drivers watch the same ports, so `UsbBus::service_hotplug()` only makes the controllers do their work and
   each driver finds what changed through `UsbPortWatcher` (it remembers every root port's generation and reports ports with a
   new device; storage works this way too). `SystemInput::poll()` (or its "input-hotplug" service, 250 ms) takes up keyboards, mice

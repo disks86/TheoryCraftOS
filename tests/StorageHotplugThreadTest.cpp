@@ -33,7 +33,7 @@ struct World {
   SystemStorageDevices* storage = nullptr;
   SystemFileSystem* files = nullptr;
   bool stop = false;
-  long plugs = 0, unplugs = 0, reads_ok = 0, reads_failed = 0, mounts_seen = 0;
+  long plugs = 0, unplugs = 0, reads_ok = 0, reads_failed = 0, mounts_seen = 0, ejects_ok = 0, ejects_busy = 0, ejects_other = 0;
   std::mutex notes_mutex;
   long notes = 0;
 };
@@ -164,6 +164,32 @@ static void reader(void* arg) {
   }
 }
 
+// Ejects whatever it finds mounted, now and then (a drive in use is refused, and tried again later).
+static void ejector(void* arg) {
+  World* w = static_cast<World*>(arg);
+  IFileSystem& fs = w->files->file_system();
+  uint32_t seed = 4711;
+  auto rnd = [&] { seed = seed * 1664525 + 1013904223; return seed >> 8; };
+  while (!stopping(w)) {
+    UniquePointer<IDirectory> root;
+    std::vector<std::string> names;
+    if (fs.open_directory("/", &root) == Status::Ok) {
+      DirectoryEntry e;
+      while (root->next(&e) == Status::Ok) names.push_back(e.name.c_str());
+    }
+    root.reset();
+    for (const std::string& name : names) {
+      if (stick_of(name) < 0 || rnd() % 3 != 0) continue;
+      switch (w->files->eject(StringView(name.data(), name.size()), rnd() % 4 == 0)) {
+        case SystemFileSystem::EjectStatus::Ok: __atomic_add_fetch(&w->ejects_ok, 1, __ATOMIC_RELAXED); break;
+        case SystemFileSystem::EjectStatus::InUse: __atomic_add_fetch(&w->ejects_busy, 1, __ATOMIC_RELAXED); break;
+        default: __atomic_add_fetch(&w->ejects_other, 1, __ATOMIC_RELAXED); break;   // (it was pulled out meanwhile, or the stick failed)
+      }
+    }
+    nap(3000);
+  }
+}
+
 static void count_note(void* context, StringView) {
   World* w = static_cast<World*>(context);
   std::lock_guard<std::mutex> g(w->notes_mutex);
@@ -185,6 +211,7 @@ static void test_stress() {
     threads[0] = kernel::spawn(poller, w, "poller");
     threads[1] = kernel::spawn(reader, w, "reader1");
     threads[2] = kernel::spawn(reader, w, "reader2");
+    threads[3] = kernel::spawn(ejector, w, "ejector");
     kernel::Thread* plug = kernel::spawn(plugger, w, "plugger");
     kernel::join(plug);
     // everything is unplugged; let the poller see it all, then stop the others
@@ -200,7 +227,7 @@ static void test_stress() {
       nap(2000);
     }
     __atomic_store_n(&w->stop, true, __ATOMIC_RELEASE);
-    for (int i = 0; i < 3; ++i) kernel::join(threads[i]);
+    for (int i = 0; i < 4; ++i) kernel::join(threads[i]);
 
     files.poll();   // (whatever the poller had not got to)
     CHECK(storage.count() == 0);
@@ -213,8 +240,9 @@ static void test_stress() {
     CHECK(volumes == 1);
     CHECK(w->plugs > 100 && w->unplugs == w->plugs);
     CHECK(w->reads_ok > 10);
+    CHECK(w->ejects_ok + w->ejects_busy > 5);
     CHECK(w->notes > 50);
-    printf("  %ld plugs, %ld volumes seen, %ld reads ok, %ld failed because the stick left, %ld notices\n", w->plugs, w->mounts_seen, w->reads_ok, w->reads_failed, w->notes);
+    printf("  %ld plugs, %ld volumes seen, %ld reads ok, %ld failed because the stick left, %ld notices, ejects: %ld done, %ld refused as in use, %ld otherwise\n", w->plugs, w->mounts_seen, w->reads_ok, w->reads_failed, w->notes, w->ejects_ok, w->ejects_busy, w->ejects_other);
     w->files = nullptr;
     storage.shutdown();
   }

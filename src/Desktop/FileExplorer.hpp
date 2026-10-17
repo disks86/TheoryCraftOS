@@ -52,6 +52,13 @@ class FileExplorer : public gui::Frame {
   void on_file_opened(gui::Handler handler) { file_opened_ = handler; }
   StringView opened_file() const { return opened_file_.view(); }
 
+  // Ejecting a drive (File > Eject): the volume called `volume` - the selected folder when the explorer shows the root, else the volume the
+  // current folder is on. The function does it and returns what the status bar should say (a static string or one that stays valid until the
+  // next call; null for nothing); the explorer refreshes afterwards. Runs on the thread that fired the menu item.
+  using EjectFunction = const char* (*)(void* context, StringView volume);
+  void set_eject_handler(EjectFunction function, void* context) { eject_ = function; eject_context_ = context; }
+  bool eject_selected();
+
   StringView path() const { return path_.view(); }
   gui::ListView& view() { return view_; }
   gui::BreadcrumbBar& address_bar() { return address_; }
@@ -71,6 +78,7 @@ class FileExplorer : public gui::Frame {
   static void on_view_details(void* self, gui::Control&);
   static void on_open_item(void* self, gui::Control&);
   static void on_copy_path(void* self, gui::Control&);
+  static void on_eject_menu(void* self, gui::Control&);
   static void on_close_window(void* self, gui::Control&);
   static void on_up_menu(void* self, gui::Control&);
   static void on_refresh_menu(void* self, gui::Control&);
@@ -94,6 +102,8 @@ class FileExplorer : public gui::Frame {
   String scratch_;
   String opened_file_;
   gui::Handler file_opened_;
+  EjectFunction eject_ = nullptr;
+  void* eject_context_ = nullptr;
 };
 
 }  // namespace desktop

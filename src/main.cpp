@@ -125,6 +125,24 @@ static void on_storage_change(void* context, StringView text) {
   static_cast<desktop::Desktop*>(context)->explorer().refresh();
 }
 
+// File > Eject in the file explorer: safely remove the drive holding a volume. The answer is what the status bar says.
+struct EjectContext {
+  SystemFileSystem* files;
+  FixedString<192> message;
+};
+static const char* on_eject(void* context, StringView volume) {
+  auto* c = static_cast<EjectContext*>(context);
+  c->message.assign(volume);
+  switch (c->files->eject(volume)) {
+    case SystemFileSystem::EjectStatus::Ok: c->message.append(" can be removed safely"); break;
+    case SystemFileSystem::EjectStatus::InUse: c->message.append(" is in use: close its files and folders first"); break;
+    case SystemFileSystem::EjectStatus::NotEjectable: c->message.append(" cannot be ejected"); break;
+    case SystemFileSystem::EjectStatus::NotFound: c->message.append(": no such drive"); break;
+    case SystemFileSystem::EjectStatus::Failed: c->message.append(" could not be ejected: the drive did not take its data"); break;
+  }
+  return c->message.c_str();
+}
+
 // A USB keyboard or mouse was plugged in or pulled out: say so on the debug console, and show the pointer only while there is a mouse.
 struct InputHotplugContext {
   hardware::SystemInput* input;
@@ -561,6 +579,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());
     explorer_files.set_notifier(on_storage_change, &desktop);
+    EjectContext eject_context{&explorer_files, {}};
+    desktop.explorer().set_eject_handler(on_eject, &eject_context);
     if (!explorer_files.start_service()) Entry(Level::Warning, "Storage").text("could not start hot-plug polling; USB sticks plugged in later are not seen");
     SystemMonitor monitor(allocator, shared_allocator);
     desktop.set_system_monitor(&monitor);

@@ -162,6 +162,21 @@ uint32_t MountTable::unmount_owner(uint32_t owner) {
   }
 }
 
+bool MountTable::in_use(uint32_t owner) const {
+  kernel::ScopedMutex guard(mutex_);
+  for (const SharedPointer<Entry>& e : entries_.view())
+    if (e->owner == owner && e.use_count() > 1) return true;   // (the table's own reference is the one)
+  return false;
+}
+
+bool MountTable::owner_of(StringView name, uint32_t* owner) const {
+  kernel::ScopedMutex guard(mutex_);
+  SharedPointer<Entry> entry = find(name);
+  if (!entry) return false;
+  *owner = entry->owner;
+  return true;
+}
+
 uint32_t MountTable::count() const {
   kernel::ScopedMutex guard(mutex_);
   return static_cast<uint32_t>(entries_.count());

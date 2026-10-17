@@ -51,6 +51,14 @@ class SystemFileSystem {
 
   // Applies the changes SystemStorageDevices::poll() reports; returns how many devices came or went.
   uint32_t poll();
+
+  // Safe removal of the drive that holds the volume called `volume` (a folder of the root): refused while anything is open on it (InUse, unless
+  // `force`: then the handles fail with NoMedia from then on), then the device's cache is flushed, all its volumes are unmounted, and the
+  // device is stopped - after Ok it can be unplugged. Failed (nothing changed: still mounted) if the device could not be flushed or stopped.
+  // The memory volume and anything that is not on a USB stick cannot be ejected. May be called from any thread; it waits for the hot-plug
+  // service if that is busy.
+  enum class EjectStatus : uint8_t { Ok, NotFound, NotEjectable, InUse, Failed };
+  EjectStatus eject(StringView volume, bool force = false);
   // Runs poll() every 250 ms on a thread of its own ("hotplug").
   bool start_service();
   void stop_service();
@@ -64,6 +72,7 @@ class SystemFileSystem {
 
   allocators::IAllocator& allocator_;
   hardware::SystemStorageDevices& storage_;
+  kernel::Mutex changes_;   // mounting, unmounting and ejecting happen one at a time
   filesystem::MountTable table_;
   bool from_storage_ = false;
   Notifier notifier_ = nullptr;

@@ -164,12 +164,16 @@ UsbMassStorageDevice::Result UsbMassStorageDevice::command(ConstByteView cdb, By
 bool UsbMassStorageDevice::run(ConstByteView cdb, ByteView data, bool data_in) {
   for (int attempt = 0; attempt < 4 && present(); ++attempt) {
     const Result r = command(cdb, data, data_in);
-    if (r == Result::Good) return true;
+    if (r == Result::Good) {
+      last_sense_key_ = 0;
+      return true;
+    }
     if (r == Result::Error) return false;
     const uint8_t sense_cdb[6] = {kRequestSense, 0, 0, 0, 18, 0};
     const ByteView sense = wire_.subview(kSenseOffset, 18);
     if (command(ConstByteView(sense_cdb), sense, true) != Result::Good) return false;
     const uint8_t key = sense[2] & 0x0F;
+    last_sense_key_ = key;
     if (key == 0x02) wait_for(st_, 50, [] { return false; });  // NOT READY: give it a moment
     else if (key != 0x06) return false;                          // anything but UNIT ATTENTION is final
   }
@@ -219,6 +223,19 @@ void UsbMassStorageDevice::shutdown() {
   __atomic_store_n(&shut_down_, true, __ATOMIC_RELEASE);
   release_bounce();
   release_view(allocator_, wire_);
+}
+
+bool UsbMassStorageDevice::eject() {
+  kernel::ScopedMutex guard(mutex_);   // a request still running on another thread is over first
+  if (!present() || wire_.empty()) return false;
+  // Write out what the device holds. A stick that does not know SYNCHRONIZE CACHE (ILLEGAL REQUEST) has nothing to write out.
+  if (!info_.read_only && !optical_ && !flush_cache() && last_sense_key_ != 0x05) return false;
+  const uint8_t allow[6] = {0x1E, 0, 0, 0, 0, 0};          // PREVENT ALLOW MEDIUM REMOVAL: allow
+  run(ConstByteView(allow), ByteView(), false);
+  const uint8_t stop[6] = {0x1B, 0, 0, 0, static_cast<uint8_t>(optical_ ? 0x02 : 0x00), 0};   // START STOP UNIT: stop (and eject the tray)
+  run(ConstByteView(stop), ByteView(), false);   // (a device that will not stop is still safe to unplug once its cache is out)
+  __atomic_store_n(&ejected_, true, __ATOMIC_RELEASE);
+  return true;
 }
 
 bool UsbMassStorageDevice::transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) {

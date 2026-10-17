@@ -83,6 +83,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   if (Menu* file = menu_.add_menu("File")) {
     file->add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
     file->add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
+    file->add_item("Eject", {&FileExplorer::on_eject_menu, this});
     file->add_separator();
     file->add_item("Close", {&FileExplorer::on_close_window, this});
   }
@@ -214,6 +215,34 @@ bool FileExplorer::go_up() {
   return open_folder(parent.view());
 }
 
+bool FileExplorer::eject_selected() {
+  if (!fs_ || !eject_) {
+    status_.set_text("Nothing here can be ejected");
+    return false;
+  }
+  String volume(allocator());
+  {
+    kernel::ScopedMutex guard(navigation_);
+    if (path_.size() <= 1) {   // the root lists the drives: the selected one
+      const int32_t item = view_.selected_item();
+      if (item < 0 || view_.item_icon(static_cast<uint32_t>(item)) != ItemIcon::Folder) {
+        status_.set_text("Select a drive to eject");
+        return false;
+      }
+      view_.item_text(static_cast<uint32_t>(item), 0, &volume);
+    } else {                   // inside a drive: the first folder of the path
+      const StringView p = path_.view();
+      uint64_t end = p.find('/', 1);
+      if (end == StringView::npos) end = p.size();
+      volume.assign(StringView(p.data() + 1, end - 1));
+    }
+  }
+  const char* message = eject_(eject_context_, volume.view());
+  refresh();   // (the drive is gone from the root, and a folder on it from the view)
+  if (message) status_.set_text(message);
+  return true;
+}
+
 void FileExplorer::activate_selected() {
   const int32_t item = view_.selected_item();
   if (item < 0) return;
@@ -298,6 +327,7 @@ void FileExplorer::on_view_icons(void* self, Control&) { static_cast<FileExplore
 void FileExplorer::on_view_details(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::Details); }
 void FileExplorer::on_open_item(void* self, Control&) { static_cast<FileExplorer*>(self)->activate_selected(); }
 void FileExplorer::on_copy_path(void* self, Control&) { static_cast<FileExplorer*>(self)->copy_selected_path(); }
+void FileExplorer::on_eject_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->eject_selected(); }
 void FileExplorer::on_close_window(void* self, Control&) { static_cast<FileExplorer*>(self)->close(); }
 void FileExplorer::on_up_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->go_up(); }
 void FileExplorer::on_refresh_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->refresh(); }

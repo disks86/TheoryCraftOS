@@ -121,6 +121,7 @@ void SystemFileSystem::mount_fallback() {
 }
 
 uint32_t SystemFileSystem::poll() {
+  kernel::ScopedMutex guard(changes_);
   uint32_t changes = 0;
   StorageEvent event;
   while (storage_.poll(&event)) {
@@ -138,11 +139,26 @@ uint32_t SystemFileSystem::poll() {
     } else {
       table_.unmount_owner(event.id);
       text.assign(event.device->name());
-      text.append(": removed");
+      text.append(event.ejected ? ": ejected, safe to remove" : ": removed");
     }
     notify(text.view());
   }
   return changes;
+}
+
+SystemFileSystem::EjectStatus SystemFileSystem::eject(StringView volume, bool force) {
+  kernel::ScopedMutex guard(changes_);
+  uint32_t owner = 0;
+  if (!table_.owner_of(volume, &owner)) return EjectStatus::NotFound;
+  if (owner == 0 || !storage_.can_eject(owner)) return EjectStatus::NotEjectable;
+  if (!force && table_.in_use(owner)) return EjectStatus::InUse;
+  table_.flush();   // (the volumes first, then the device under them)
+  // The device flushes its cache and stops; if that fails nothing has changed. From then on it is not present, so whatever is still open on its
+  // volumes (only with `force`) answers NoMedia, and the volumes can be unmounted.
+  const EjectResult result = storage_.eject(owner);
+  if (result == EjectResult::Failed) return EjectStatus::Failed;
+  table_.unmount_owner(owner);   // (the device's Removed event comes through poll() as usual)
+  return result == EjectResult::NotSupported ? EjectStatus::NotEjectable : EjectStatus::Ok;   // (NotFound: it vanished meanwhile, as good as ejected)
 }
 
 bool SystemFileSystem::start_service() {

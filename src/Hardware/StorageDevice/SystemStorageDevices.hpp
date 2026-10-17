@@ -43,6 +43,14 @@ struct StorageEvent {
   Kind kind = Kind::Added;
   uint32_t id = 0;                         // the device's id, which stays the same for as long as it is plugged in
   SharedPointer<IStorageDevice> device;    // a removed device is shut down and present() is false; it lives while anyone holds this
+  bool ejected = false;                    // Removed: it was ejected (safe to unplug), not pulled out
+};
+
+enum class EjectResult : uint8_t {
+  Ok,            // the device has been stopped and taken out of the list: safe to unplug
+  NotFound,      // no such device (any more)
+  NotSupported,  // a device that cannot be removed
+  Failed,        // it could not be flushed or stopped; it is as it was
 };
 
 class SystemStorageDevices {
@@ -69,6 +77,11 @@ class SystemStorageDevices {
   // Only devices on host controllers that report hot-plug (xHCI) are seen; everything else is fixed from start-up on.
   bool poll(StorageEvent* event);
 
+  // Safe removal of the USB device with this id: flushes it, stops it and takes it out of the list (reported as a Removed event with `ejected`).
+  // Whoever has volumes on it unmounts them first (SystemFileSystem::eject does all of it).
+  EjectResult eject(uint32_t id);
+  bool can_eject(uint32_t id) const;
+
  private:
   struct Entry {
     uint32_t id = 0;
@@ -78,6 +91,7 @@ class SystemStorageDevices {
   void find_native(List<UniquePointer<IStorageDevice>>& found);
   void find_firmware(List<UniquePointer<IStorageDevice>>& found);
   void adopt(List<UniquePointer<IStorageDevice>>& found, bool report);
+  SharedPointer<IStorageDevice> find(uint32_t id) const;
   void sweep_removed();
 
   IPciBus& pci_;

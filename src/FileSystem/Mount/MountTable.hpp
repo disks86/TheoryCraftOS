@@ -60,6 +60,12 @@ class MountTable final : public IFileSystem {
   // Unmounts everything mounted with `owner`; returns how many.
   uint32_t unmount_owner(uint32_t owner);
 
+  // True if something is open on a volume mounted with `owner` (a file or folder handle, or a call in progress): it cannot be taken away
+  // politely.
+  bool in_use(uint32_t owner) const;
+  // The owner a volume was mounted with; false if there is no volume of that name.
+  bool owner_of(StringView name, uint32_t* owner) const;
+
   uint32_t count() const;
   bool name_at(uint32_t index, FixedString<kMaxName + 1>* name) const;
   // Increases every time a volume is mounted or unmounted, for whoever shows the list and wants to know when to look again.
