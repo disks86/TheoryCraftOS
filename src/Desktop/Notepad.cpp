@@ -47,13 +47,11 @@ bool normalize(StringView in, String* out) {
 Notepad::Notepad(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
-      toolbar_(allocator),
       status_bar_(allocator),
-      path_label_(allocator),
-      path_(allocator),
       status_(allocator),
       position_(allocator),
       editor_(allocator),
+      path_(allocator),
       name_(allocator) {
   set_bounds({120, 60, 560, 380});
   set_padding(Insets::all(4));
@@ -63,8 +61,9 @@ Notepad::Notepad(allocators::IAllocator& allocator)
   menu_.set_size(0, 22);
   if (Menu* file = menu_.add_menu("File")) {
     file->add_item("New", {&Notepad::on_new, this}, "Ctrl+N");
-    file->add_item("Open", {&Notepad::on_open, this}, "Ctrl+O");
+    file->add_item("Open...", {&Notepad::on_open, this}, "Ctrl+O");
     file->add_item("Save", {&Notepad::on_save, this}, "Ctrl+S");
+    file->add_item("Save As...", {&Notepad::on_save_as, this}, "Ctrl+Shift+S");
     file->add_separator();
     file->add_item("Close", {&Notepad::on_close, this});
   }
@@ -75,16 +74,6 @@ Notepad::Notepad(allocators::IAllocator& allocator)
     edit->add_separator();
     edit->add_item("Select All", {&Notepad::on_select_all, this}, "Ctrl+A");
   }
-
-  toolbar_.set_dock(DockStyle::Top);
-  toolbar_.set_size(0, 30);
-  toolbar_.set_padding(Insets{0, 2, 0, 2});
-  path_label_.set_text("File:");
-  path_label_.set_dock(DockStyle::Left);
-  path_label_.set_size(48, 0);
-  toolbar_.add(&path_label_);
-  path_.set_dock(DockStyle::Fill);
-  toolbar_.add(&path_);
 
   status_bar_.set_style(PanelStyle::Sunken);
   status_bar_.set_dock(DockStyle::Bottom);
@@ -100,12 +89,11 @@ Notepad::Notepad(allocators::IAllocator& allocator)
   editor_.on_caret_moved(Handler::immediate(&Notepad::on_moved, this));
 
   add(&menu_);
-  add(&toolbar_);
   add(&status_bar_);
   add(&editor_);  // Fill goes last
   update_title();
   update_position();
-  say("Type a path and choose File > Open, or start typing.");
+  say("Start typing, or choose File > Open.");
 }
 
 void Notepad::update_title() {
@@ -141,10 +129,8 @@ void Notepad::on_cut(void* self, Control&) { static_cast<Notepad*>(self)->editor
 void Notepad::on_copy(void* self, Control&) { static_cast<Notepad*>(self)->editor_.copy_selection(); }
 void Notepad::on_paste(void* self, Control&) { static_cast<Notepad*>(self)->editor_.paste(); }
 void Notepad::on_select_all(void* self, Control&) { static_cast<Notepad*>(self)->editor_.select_all(); }
-void Notepad::on_open(void* self, Control&) {
-  auto* n = static_cast<Notepad*>(self);
-  n->open_file(n->path_.text());
-}
+void Notepad::on_open(void* self, Control&) { static_cast<Notepad*>(self)->ask_open(); }
+void Notepad::on_save_as(void* self, Control&) { static_cast<Notepad*>(self)->ask_save_as(); }
 
 bool Notepad::may_discard() {
   if (!editor_.modified() || discard_armed_) {
@@ -159,11 +145,44 @@ bool Notepad::may_discard() {
 bool Notepad::new_document() {
   if (!may_discard()) return false;
   editor_.set_text(StringView());
-  path_.set_text(StringView());
+  path_.clear();
   name_.clear();
   update_position();
   say("New document.");
   return true;
+}
+
+namespace {
+const FileDialog::Filter kTextFilters[] = {{"Text files", "txt;md;log;cfg;ini;csv;json;xml;html"}, {"All files", "*"}};
+}
+
+void Notepad::ask_open() {
+  if (!dialog_ || !manager()) {
+    say("No file dialog available.");
+    return;
+  }
+  if (!may_discard()) return;
+  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kTextFilters, 2, path_.view(), {&Notepad::on_open_picked, this}))
+    say("The file dialog is busy.");
+}
+
+void Notepad::ask_save_as() {
+  if (!dialog_ || !manager()) {
+    say("No file dialog available.");
+    return;
+  }
+  if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kTextFilters, 2, path_.view(), {&Notepad::on_save_picked, this}))
+    say("The file dialog is busy.");
+}
+
+void Notepad::on_open_picked(void* self, Control&) {
+  auto* n = static_cast<Notepad*>(self);
+  if (n->dialog_->accepted()) n->read_into_editor(n->dialog_->selected_path());   // the unsaved changes were agreed to before the dialog opened
+}
+
+void Notepad::on_save_picked(void* self, Control&) {
+  auto* n = static_cast<Notepad*>(self);
+  if (n->dialog_->accepted()) n->write_from_editor(n->dialog_->selected_path());
 }
 
 bool Notepad::open_file(StringView requested) {
@@ -177,12 +196,20 @@ bool Notepad::open_file(StringView requested) {
     return false;
   }
   if (!may_discard()) return false;
+  return read_into_editor(path.view());
+}
+
+bool Notepad::read_into_editor(StringView path) {
+  if (!fs_) {
+    say("No storage available.");
+    return false;
+  }
   UniquePointer<IFile> file;
-  Status status = fs_->open_file(path.view(), OpenMode::Read, &file);
+  Status status = fs_->open_file(path, OpenMode::Read, &file);
   if (status != Status::Ok) {
     String message(allocator());
     message.append("Cannot open ");
-    message.append(path.view());
+    message.append(path);
     message.append(": ");
     message.append(describe_status(status));
     say(message.view());
@@ -207,30 +234,35 @@ bool Notepad::open_file(StringView requested) {
     return false;
   }
   editor_.set_text(text.view());
-  path_.set_text(path.view());
-  const uint64_t slash = path.view().rfind('/');
-  name_.assign(slash == StringView::npos ? path.view() : path.view().substr(slash + 1));
+  path_.assign(path);
+  const uint64_t slash = path.rfind('/');
+  name_.assign(slash == StringView::npos ? path : path.substr(slash + 1));
   discard_armed_ = false;
   update_position();
   String message(allocator());
   message.append("Opened ");
-  message.append(path.view());
+  message.append(path);
   say(message.view());
   return true;
 }
 
 bool Notepad::save_file(StringView requested) {
   String path(allocator());
-  if (!normalize(requested.empty() ? path_.text() : requested, &path) || path.empty()) {
-    say("Enter a path to save to.");
+  if (!normalize(requested.empty() ? path_.view() : requested, &path) || path.empty()) {
+    if (dialog_ && manager()) ask_save_as();   // nowhere to save to yet: the same as Save As
+    else say("Enter a path to save to.");
     return false;
   }
+  return write_from_editor(path.view());
+}
+
+bool Notepad::write_from_editor(StringView path) {
   if (!fs_) {
     say("No storage available.");
     return false;
   }
   UniquePointer<IFile> file;
-  Status status = fs_->open_file(path.view(), OpenMode::CreateTruncate, &file);
+  Status status = fs_->open_file(path, OpenMode::CreateTruncate, &file);
   uint64_t written = 0;
   const StringView text = editor_.text();
   if (status == Status::Ok && !text.empty())
@@ -240,21 +272,21 @@ bool Notepad::save_file(StringView requested) {
   String message(allocator());
   if (status != Status::Ok) {
     message.append("Cannot save ");
-    message.append(path.view());
+    message.append(path);
     message.append(": ");
     message.append(describe_status(status));
     say(message.view());
     return false;
   }
   fs_->flush();
-  path_.set_text(path.view());
-  const uint64_t slash = path.view().rfind('/');
-  name_.assign(slash == StringView::npos ? path.view() : path.view().substr(slash + 1));
+  path_.assign(path);
+  const uint64_t slash = path.rfind('/');
+  name_.assign(slash == StringView::npos ? path : path.substr(slash + 1));
   editor_.mark_saved();
   discard_armed_ = false;
   update_position();
   message.append("Saved ");
-  message.append(path.view());
+  message.append(path);
   say(message.view());
   return true;
 }
@@ -264,14 +296,13 @@ bool Notepad::on_key(const KeyArgs& args) {
   if (args.modifiers & hardware::modifier::kControl) {
     switch (args.usage) {
       case key::kA + 13: new_document(); return true;  // N
-      case key::kA + 14: open_file(path_.text()); return true;  // O
-      case key::kA + 18: save_file(); return true;  // S
+      case key::kA + 14: ask_open(); return true;      // O
+      case key::kA + 18:                               // S
+        if (args.modifiers & hardware::modifier::kShift) ask_save_as();
+        else save_file();
+        return true;
       default: break;
     }
-  }
-  if (args.usage == key::kEnter && window() && window()->focus() == &path_) {
-    open_file(path_.text());
-    return true;
   }
   return Frame::on_key(args);
 }

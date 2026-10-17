@@ -28,6 +28,8 @@
 #include "Kernel/Clipboard.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/Desktop.hpp"
+#include "Desktop/FileDialog.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/TaskManager.hpp"
@@ -1393,12 +1395,13 @@ static void test_notepad() {
     CHECK(!np.new_document() && np.editor().text().equals("a\nb\ncd"));
     CHECK(np.new_document() && np.editor().text().empty() && np.path().empty() && np.title().equals("Text Editor - Untitled"));
 
-    // Saving writes the text back (Ctrl+S, to the path in the toolbar).
-    np.path_box().set_text("out.txt");
+    // Saving writes the text to the file it came from; a new document has none (and without a dialog nothing asks).
     type_text(w, "hello");
     press(w, key::kEnter);
     type_text(w, "world");
     press(w, key::kA + 18, modifier::kLeftControl);
+    CHECK(np.editor().modified() && np.status_label().text().equals("Enter a path to save to."));
+    CHECK(np.save_file("out.txt"));
     CHECK(!np.editor().modified() && np.path().equals("/out.txt") && np.status_label().text().equals("Saved /out.txt") && np.title().equals("Text Editor - out.txt"));
     UniquePointer<filesystem::IFile> f;
     CHECK(fs.open_file("/out.txt", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() == 11);
@@ -1406,16 +1409,13 @@ static void test_notepad() {
     uint64_t n = 0;
     CHECK(f->read(0, ByteView(reinterpret_cast<uint8_t*>(got), 11), &n) == filesystem::Status::Ok && !strcmp(got, "hello\nworld"));
     f.reset();
+    type_text(w, "!");
+    press(w, key::kA + 18, modifier::kLeftControl);   // Ctrl+S writes to the same file again
+    CHECK(!np.editor().modified() && np.status_label().text().equals("Saved /out.txt"));
     CHECK(!np.save_file("/missing/x.txt") && np.status_label().text().equals("Cannot save /missing/x.txt: not found"));
-    CHECK(!np.save_file("") == false);          // the toolbar's path again
-    np.path_box().set_text("");
-    CHECK(!np.save_file() && np.status_label().text().equals("Enter a path to save to."));
-
-    // Enter in the path box opens the file.
-    np.path_box().set_text("/t.txt");
-    w.set_focus(&np.path_box());
-    press(w, key::kEnter);
-    CHECK(np.editor().text().equals("a\nb\n"));
+    CHECK(np.path().equals("/out.txt"));
+    press(w, key::kA + 14, modifier::kLeftControl);   // Ctrl+O without a dialog
+    CHECK(np.status_label().text().equals("No file dialog available."));
     w.render();
     mgr.remove_window(&np);
   }
@@ -2328,16 +2328,19 @@ static void test_app_menus() {
     mgr.set_dock(DockStyle::Fill);
     w.add(&mgr);
     String got(a);
+    desktop::FileDialog dlg(a);
+    dlg.set_file_system(&fs);
 
     // --- Text editor
     {
       desktop::Notepad np(a);
       np.set_file_system(&fs);
+      np.set_file_dialog(&dlg);
       CHECK(mgr.add_window(&np));
       w.layout();
       MenuBar& bar = np.menu_bar();
       CHECK(bar.menu_count() == 2 && bar.menu(0)->title().equals("File") && bar.menu(1)->title().equals("Edit") && bar.parent() == &np);
-      CHECK(bar.bounds().y < np.path_box().bounds().y + 40 && bar.bounds().width > 100 && bar.window_origin().y < np.editor().window_origin().y);
+      CHECK(bar.bounds().width > 100 && bar.window_origin().y < np.editor().window_origin().y && bar.find_item("File", "Save As..."));
       CHECK(bar.find_item("File", "Save") && bar.find_item("File", "Save")->shortcut.view().equals("Ctrl+S") && !bar.find_item("File", "Nope"));
       MenuItem* cut = bar.find_item("Edit", "Cut");
       MenuItem* copy = bar.find_item("Edit", "Copy");
@@ -2350,14 +2353,22 @@ static void test_app_menus() {
       CHECK(choose(w, bar, "Edit", "Cut") && np.editor().text().empty() && !cut->enabled());
       CHECK(!choose(w, bar, "Edit", "Cut") && w.popup() == nullptr);   // disabled: nothing happens, the menu closes
       CHECK(choose(w, bar, "Edit", "Paste") && np.editor().text().equals("hello"));
-      // File > Save writes to the path box; New asks first when there are unsaved changes.
-      np.path_box().set_text("note.txt");
-      CHECK(choose(w, bar, "File", "Save") && np.status_label().text().equals("Saved /note.txt") && !np.editor().modified());
+      // File > Save with no file yet opens the Save dialog; the name is completed with the type's extension.
+      CHECK(choose(w, bar, "File", "Save") && dlg.showing() && dlg.mode() == desktop::FileDialog::Mode::Save && dlg.name_box().text().empty());
+      dlg.name_box().set_text("note");
+      dlg.ok_button().click();
+      CHECK(!dlg.showing() && dlg.accepted() && np.status_label().text().equals("Saved /note.txt") && !np.editor().modified() && np.path().equals("/note.txt"));
       CHECK(choose(w, bar, "File", "New") && np.editor().text().empty() && np.path().empty());
-      np.path_box().set_text("/a.txt");
-      CHECK(choose(w, bar, "File", "Open") && np.editor().text().equals("abc"));
-      press(w, key::kA + 18, modifier::kLeftControl);    // the shortcut still works
+      // File > Open... shows the Open dialog; picking a file loads it.
+      CHECK(choose(w, bar, "File", "Open...") && dlg.showing() && dlg.mode() == desktop::FileDialog::Mode::Open);
+      dlg.name_box().set_text("a.txt");
+      dlg.ok_button().click();
+      CHECK(!dlg.showing() && np.editor().text().equals("abc") && np.path().equals("/a.txt"));
+      press(w, key::kA + 18, modifier::kLeftControl);    // Ctrl+S writes to the same file
       CHECK(np.status_label().text().equals("Saved /a.txt"));
+      CHECK(choose(w, bar, "File", "Save As...") && dlg.showing() && dlg.name_box().text().equals("a.txt") && dlg.folder().equals("/"));
+      dlg.cancel_button().click();                       // cancelled: nothing changes
+      CHECK(!dlg.showing() && !dlg.accepted() && np.path().equals("/a.txt"));
       CHECK(choose(w, bar, "File", "Close") && np.manager() == nullptr && mgr.window_count() == 0);
     }
 
@@ -2405,6 +2416,7 @@ static void test_app_menus() {
     {
       desktop::Paint paint(a);
       paint.set_file_system(&fs);
+      paint.set_file_dialog(&dlg);
       CHECK(mgr.add_window(&paint));
       w.layout();
       MenuBar& bar = paint.menu_bar();
@@ -2420,17 +2432,214 @@ static void test_app_menus() {
       press(w, 0x2D, modifier::kLeftControl);
       CHECK(c.zoom() == 2);
       CHECK(choose(w, bar, "View", "Actual Size") && c.zoom() == 1);
-      paint.path_box().set_text("pic");
-      CHECK(choose(w, bar, "File", "Save") && paint.path().equals("/pic.png") && paint.title().equals("Paint - pic.png"));
+      CHECK(choose(w, bar, "File", "Save") && dlg.showing());     // no file yet: the Save dialog
+      dlg.name_box().set_text("pic");
+      dlg.ok_button().click();
+      CHECK(paint.path().equals("/pic.png") && paint.title().equals("Paint - pic.png") && !c.modified());
       paint.tools().select_tool(0);
       drag(w, pixel_point(c, 50, 50), pixel_point(c, 60, 50));
       CHECK(choose(w, bar, "File", "New") && paint.status_label().text().first(13).equals("Unsaved chang") && c.pixel(55, 50) != 0xFFFFFFFF);
       CHECK(choose(w, bar, "File", "New") && c.pixel(55, 50) == 0xFFFFFFFF && c.image_width() == 640);
-      CHECK(choose(w, bar, "File", "Open") == true);   // the path box was cleared by New: asks for a path
-      CHECK(paint.status_label().text().equals("Enter the path of a picture to open."));
+      CHECK(choose(w, bar, "File", "Open...") && dlg.showing() && dlg.list().item_count() > 0);
+      dlg.name_box().set_text("pic.png");
+      dlg.ok_button().click();
+      CHECK(!dlg.showing() && paint.path().equals("/pic.png") && c.pixel(25, 10) == 0xFF000000);
       CHECK(choose(w, bar, "File", "Close") && paint.manager() == nullptr);
     }
     w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+// --- File dialogs ------------------------------------------------------------------------------------------------
+
+struct Closed2 {
+  int count = 0;
+  static void fn(void* context, Control&) { ++static_cast<Closed2*>(context)->count; }
+  Handler handler() { return {&Closed2::fn, this}; }
+};
+
+static void test_file_dialog() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok);
+    CHECK(fs.create_directory("/docs/old") == filesystem::Status::Ok);
+    make_file(fs, "/docs/note.md", "# hi");
+    make_file(fs, "/a.txt", "abc");
+    make_file(fs, "/b.png", "x");
+    make_file(fs, "/c.TXT", "upper");
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    w.layout();
+    desktop::FileDialog dlg(a);
+    using Mode = desktop::FileDialog::Mode;
+    static const desktop::FileDialog::Filter kFilters[] = {{"Text files", "txt;md"}, {"Pictures", "png"}, {"All files", "*"}};
+    Closed2 closed;
+    auto names = [&](uint32_t i) {
+      String s(a);
+      dlg.list().item_text(i, 0, &s);
+      return s;
+    };
+
+    // No filesystem: nothing opens.
+    CHECK(!dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/", closed.handler()) && !dlg.showing());
+    dlg.set_file_system(&fs);
+
+    // The Open dialog: folders first, then the files of the chosen type.
+    CHECK(dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/", closed.handler()) && dlg.showing() && mgr.has_modal());
+    CHECK(!dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/", closed.handler()));   // already showing
+    w.layout();
+    CHECK(dlg.title().equals("Open") && dlg.ok_button().window() == &w && w.focus() == &dlg.name_box());
+    CHECK(dlg.folder().equals("/") && dlg.address_bar().path().equals("/") && dlg.type_box().item_count() == 3 && dlg.type_box().selected_index() == 0);
+    CHECK(dlg.list().item_count() == 3 && names(0).view().equals("docs") && names(1).view().equals("a.txt") && names(2).view().equals("c.TXT"));
+    dlg.type_box().set_selected_index(1);        // another type: pictures
+    CHECK(dlg.list().item_count() == 2 && names(1).view().equals("b.png"));
+    dlg.type_box().set_selected_index(2);
+    CHECK(dlg.list().item_count() == 4);
+    dlg.type_box().set_selected_index(0);
+
+    // A click on a file puts its name in the box; Enter on a folder goes into it.
+    dlg.list().select_item(1);
+    CHECK(dlg.name_box().text().equals("a.txt"));
+    dlg.list().select_item(0);                   // a folder: the name box is left alone
+    CHECK(dlg.name_box().text().equals("a.txt"));
+    w.set_focus(&dlg.list());
+    press(w, key::kEnter);
+    CHECK(dlg.folder().equals("/docs") && dlg.address_bar().path().equals("/docs") && dlg.list().item_count() == 2 && names(0).view().equals("old") && names(1).view().equals("note.md"));
+    press(w, key::kBackspace);                   // Backspace in the list: up one folder
+    CHECK(dlg.folder().equals("/"));
+    {
+      const Point bar = dlg.address_bar().window_origin();   // the breadcrumb works too
+      dlg.list().select_item(0);
+      press(w, key::kEnter);
+      CHECK(dlg.folder().equals("/docs"));
+      click(w, bar.x + dlg.address_bar().segment(0).x + 4, bar.y + 12);
+      CHECK(dlg.folder().equals("/"));
+    }
+
+    // Names that do not exist or are not picked are refused with a message; a folder name goes into the folder.
+    dlg.name_box().set_text("zzz.txt");
+    dlg.ok_button().click();
+    CHECK(dlg.showing() && dlg.message_label().text().equals("Not found: zzz.txt") && closed.count == 0);
+    dlg.name_box().set_text("");
+    dlg.ok_button().click();
+    CHECK(dlg.message_label().text().equals("Enter a file name."));
+    dlg.name_box().set_text("docs");
+    dlg.ok_button().click();
+    CHECK(dlg.folder().equals("/docs") && dlg.name_box().text().empty() && dlg.message_label().text().empty());
+    dlg.address_bar().set_path("/");
+    dlg.open_folder("/");
+
+    // A file name typed with a path, accepted with Enter in the box.
+    dlg.name_box().set_text("/docs/note.md");
+    w.set_focus(&dlg.name_box());
+    press(w, key::kEnter);
+    CHECK(!dlg.showing() && dlg.accepted() && dlg.selected_path().equals("/docs/note.md") && closed.count == 1 && !mgr.has_modal());
+
+    // Cancel, Escape and the close button leave nothing picked.
+    CHECK(dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/a.txt", closed.handler()));
+    CHECK(dlg.name_box().text().equals("a.txt") && dlg.folder().equals("/"));   // started on that file
+    dlg.cancel_button().click();
+    CHECK(!dlg.showing() && !dlg.accepted() && closed.count == 2);
+    CHECK(dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/docs", closed.handler()) && dlg.folder().equals("/docs") && dlg.name_box().text().empty());
+    w.set_focus(&dlg.list());
+    press(w, key::kEscape);
+    CHECK(!dlg.showing() && !dlg.accepted() && closed.count == 3);
+    CHECK(dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/nowhere/x.txt", closed.handler()) && dlg.folder().equals("/") && dlg.name_box().text().equals("x.txt"));
+    dlg.close();
+    CHECK(!dlg.showing() && !dlg.accepted());
+
+    // Double-clicking a file (with a clock) takes it.
+    uint64_t now = 1000000;
+    dlg.list().set_clock(&now);
+    CHECK(dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/", closed.handler()));
+    w.layout();
+    {
+      Rect2D row;
+      CHECK(dlg.list().item_rect(1, &row));
+      const Point o = dlg.list().window_origin();
+      click(w, o.x + row.x + 30, o.y + row.y + 5);
+      now += 100000;
+      click(w, o.x + row.x + 30, o.y + row.y + 5);
+    }
+    CHECK(!dlg.showing() && dlg.accepted() && dlg.selected_path().equals("/a.txt"));
+    dlg.list().set_clock(nullptr);
+
+    // The Save dialog: the type's first extension is added to a bare name; a name that is a file asks before replacing it.
+    CHECK(dlg.show(mgr, Mode::Save, "Save As", kFilters, 3, "/docs", closed.handler()) && dlg.ok_button().text().equals("Save"));
+    dlg.name_box().set_text("fresh");
+    dlg.ok_button().click();
+    CHECK(!dlg.showing() && dlg.accepted() && dlg.selected_path().equals("/docs/fresh.txt"));
+    CHECK(dlg.show(mgr, Mode::Save, "Save As", kFilters, 3, "/a.txt", closed.handler()));
+    CHECK(dlg.type_box().selected_index() == 0 && dlg.name_box().text().equals("a.txt"));
+    dlg.ok_button().click();                     // a.txt exists
+    CHECK(dlg.showing() && !dlg.accepted() && dlg.replace_dialog().showing());
+    CHECK(dlg.replace_dialog().decline_button().text().equals("Cancel"));
+    dlg.replace_dialog().decline_button().click();
+    CHECK(!dlg.replace_dialog().showing() && dlg.showing() && !dlg.accepted() && w.focus() == &dlg.name_box());
+    dlg.ok_button().click();
+    dlg.replace_dialog().accept_button().click();   // Replace
+    CHECK(!dlg.replace_dialog().showing() && !dlg.showing() && dlg.accepted() && dlg.selected_path().equals("/a.txt"));
+    // Another type is chosen by name: .png for a bare name, and the files shown are those of the type.
+    CHECK(dlg.show(mgr, Mode::Save, "Save As", kFilters, 3, "/", closed.handler()));
+    dlg.type_box().set_selected_index(1);
+    CHECK(dlg.list().item_count() == 2);
+    dlg.name_box().set_text("shot");
+    dlg.ok_button().click();
+    CHECK(dlg.accepted() && dlg.selected_path().equals("/shot.png"));
+    // A name with its own extension keeps it, and an existing file is found with the case it has.
+    CHECK(dlg.show(mgr, Mode::Save, "Save As", kFilters, 3, "/", closed.handler()));
+    dlg.name_box().set_text("data.bin");
+    dlg.ok_button().click();
+    CHECK(dlg.accepted() && dlg.selected_path().equals("/data.bin"));
+    // The folder has to exist.
+    CHECK(dlg.show(mgr, Mode::Save, "Save As", kFilters, 3, "/", closed.handler()));
+    dlg.name_box().set_text("/missing/file.txt");
+    dlg.ok_button().click();
+    CHECK(dlg.showing() && dlg.message_label().text().equals("The folder does not exist."));
+    dlg.cancel_button().click();
+    // Starting on a file picks the type that fits it; a typed address goes there.
+    CHECK(dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/b.png", closed.handler()) && dlg.type_box().selected_index() == 1);
+    dlg.address_bar().begin_edit();
+    dlg.address_bar().edit_box().set_text("/docs/old");
+    press(w, key::kEnter);
+    CHECK(dlg.folder().equals("/docs/old") && dlg.showing());
+    dlg.address_bar().begin_edit();
+    dlg.address_bar().edit_box().set_text("/nowhere");
+    press(w, key::kEnter);
+    CHECK(dlg.folder().equals("/docs/old") && dlg.message_label().text().equals("That folder cannot be opened."));
+    w.render();
+    dlg.cancel_button().click();
+    // With no filters given every file is shown.
+    CHECK(dlg.show(mgr, Mode::Open, "Open", nullptr, 0, "/", closed.handler()) && dlg.type_box().item_count() == 1 && dlg.list().item_count() == 4);
+    dlg.cancel_button().click();
+    CHECK(!mgr.has_modal());
+  }
+  CHECK(a.live == 0);
+}
+
+// The desktop gives the text editor and Paint one shared file dialog.
+static void test_desktop_file_dialog() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/hello.txt", "hi there");
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    d.open_text_editor();
+    d.open_paint();
+    d.window().layout();
+    CHECK(choose(d.window(), d.notepad().menu_bar(), "File", "Open..."));
+    CHECK(d.file_dialog().showing() && d.windows().has_modal());
+    d.file_dialog().name_box().set_text("hello.txt");
+    d.file_dialog().ok_button().click();
+    CHECK(!d.file_dialog().showing() && d.notepad().editor().text().equals("hi there") && d.notepad().path().equals("/hello.txt"));
   }
   CHECK(a.live == 0);
 }
@@ -2454,6 +2663,8 @@ int main() {
   test_canvas_clipboard();
   test_paint_clipboard();
   test_list_copy();
+  test_file_dialog();
+  test_desktop_file_dialog();
   test_app_menus();
   test_select_all_keys();
   test_breadcrumb_bar();

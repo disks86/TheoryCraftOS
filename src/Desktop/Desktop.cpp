@@ -37,6 +37,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       tray_(allocator),
       clock_(allocator),
       shutdown_dialog_(allocator),
+      file_dialog_(allocator),
       explorer_(allocator),
       task_manager_(allocator),
       notepad_(allocator),
@@ -92,6 +93,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   shutdown_dialog_.set_texts("Shut Down", "Shut down TheoryCraftOS now?", "Running services will be stopped.", "Shut Down", "Cancel");
   shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
 
+  notepad_.set_file_dialog(&file_dialog_);
+  paint_.set_file_dialog(&file_dialog_);
   explorer_.set_clock(&now_us_);
   explorer_.on_file_opened({&Desktop::on_explorer_file, this});
 

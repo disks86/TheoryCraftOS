@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/DirectoryListing.hpp"
 #include "Desktop/Format.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -29,34 +30,6 @@ using filesystem::IDirectory;
 using filesystem::NodeType;
 using filesystem::Status;
 
-namespace {
-
-char lower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; }
-char upper(char c) { return c >= 'a' && c <= 'z' ? static_cast<char>(c - 32) : c; }
-
-// Folders first, then by name without regard to case.
-bool entry_less(const DirectoryEntry& a, const DirectoryEntry& b) {
-  if (a.type != b.type) return a.type == NodeType::Directory;
-  const StringView x = a.name.view(), y = b.name.view();
-  const uint64_t n = x.size() < y.size() ? x.size() : y.size();
-  for (uint64_t i = 0; i < n; ++i)
-    if (lower(x[i]) != lower(y[i])) return lower(x[i]) < lower(y[i]);
-  return x.size() < y.size();
-}
-
-// "TXT File" for "notes.txt", "File" without an extension.
-bool format_type(const DirectoryEntry& entry, String* out) {
-  out->clear();
-  if (entry.type == NodeType::Directory) return out->assign("Folder");
-  const StringView name = entry.name.view();
-  const uint64_t dot = name.rfind('.');
-  if (dot == StringView::npos || dot == 0 || dot + 1 == name.size()) return out->assign("File");
-  for (uint64_t i = dot + 1; i < name.size() && i < dot + 6; ++i)
-    if (!out->push_back(upper(name[i]))) return false;
-  return out->append(" File");
-}
-
-}  // namespace
 
 FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     : Frame(allocator),
@@ -169,21 +142,8 @@ bool FileExplorer::refresh() {
 
 bool FileExplorer::load(StringView path) {
   if (!fs_) return false;
-  UniquePointer<IDirectory> directory;
-  if (fs_->open_directory(path, &directory) != Status::Ok) return false;
-  // Read everything first, keeping the entries in display order.
   List<DirectoryEntry> entries(allocator());
-  DirectoryEntry entry;
-  while (directory->next(&entry) == Status::Ok) {
-    uint64_t low = 0, high = entries.count();  // binary search for the insertion point
-    while (low < high) {
-      const uint64_t mid = (low + high) / 2;
-      if (entry_less(entries[mid], entry)) low = mid + 1;
-      else high = mid;
-    }
-    if (!entries.insert(low, entry)) break;
-  }
-  directory.reset();
+  if (read_sorted_directory(*fs_, path, &entries) != Status::Ok) return false;
 
   String next(allocator());
   if (!next.assign(path.empty() ? StringView("/") : path)) return false;
@@ -194,7 +154,7 @@ bool FileExplorer::load(StringView path) {
     const bool folder = e.type == NodeType::Directory;
     if (folder) size.clear();
     else format_size(e.size, &size);
-    format_type(e, &type);
+    describe_entry_type(e, &type);
     const StringView cells[3] = {e.name.view(), size.view(), type.view()};
     view_.add_item(cells, 3, folder ? ItemIcon::Folder : ItemIcon::File);
   }
