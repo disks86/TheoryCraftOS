@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Printer/IPrinter.hpp"
+#include "Hardware/Printer/Usb/Dot4.hpp"
 #include "Hardware/Printer/Usb/Ieee1284.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -39,6 +40,7 @@ struct UsbPrinterEndpoints {
   uint8_t configuration = 1;
   uint8_t interface_number = 0;
   uint8_t alternate = 0;
+  uint8_t protocol = 2;  // 1 unidirectional, 2 bidirectional, 3 IEEE 1284.4 (Dot4) multiplexed
   uint8_t out_endpoint = 0, in_endpoint = 0;  // in_endpoint is 0 for a unidirectional interface
   uint16_t out_max_packet = 0, in_max_packet = 0;
 };
@@ -78,6 +80,9 @@ class UsbPrinter final : public IPrinter {
 
   const PrinterIdentity& identity() const { return identity_; }
   bool bidirectional() const { return ep_.in_endpoint != 0; }
+  // True if jobs travel through an IEEE 1284.4 channel (protocol 3 interface).
+  bool multiplexed() const { return dot4_ != nullptr; }
+  const Dot4Session* dot4() const { return dot4_.get(); }
   // Asks the printer for its port status (paper out, off line, error).
   bool read_status(UsbPrinterStatus* status);
   // Reads whatever the printer has sent back (a bidirectional interface only) into `out`; waits for the transfer to end, so only
@@ -101,7 +106,8 @@ class UsbPrinter final : public IPrinter {
   uint32_t port_;
   UsbPrinterEndpoints ep_;
   allocators::IAllocator& allocator_;
-  ByteView wire_;  // transfer buffer: one 64 KiB-aligned block
+  ByteView wire_;  // transfer buffers (out, then in): one 64 KiB-aligned block
+  UniquePointer<Dot4Session> dot4_;
   PrinterIdentity identity_;
   PrinterInfo info_;
   char name_[100] = "USB printer";

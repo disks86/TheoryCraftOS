@@ -28,6 +28,7 @@
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/Printer/Usb/UsbPrinter.hpp"
 #include "Hardware/Printer/PrinterMonitor.hpp"
+#include <algorithm>
 #include <map>
 #include "NetworkHarness.hpp"
 
@@ -383,6 +384,110 @@ static void test_failures_and_registry() {
 
 // ---- USB ----
 
+
+// The printer end of an IEEE 1284.4 session, as a state machine over the byte streams of the two bulk pipes. It checks what the host
+// does: data only with credit, packets no bigger than agreed, replies to its own commands.
+struct FakeDot4Peripheral {
+  std::string from_host, to_host;
+  std::string printed;                 // payload of data packets on the print channel
+  uint8_t socket = 0x01;
+  bool inited = false, opened = false, exited = false;
+  int credit_for_host = 2;             // credit the host holds now
+  int grant_open = 2, grant_on_request = 2;
+  int refuse_requests = 0;             // CreditRequests to answer with 0 credit (printer busy)
+  uint16_t max_p2s = 1024, max_s2p = 512;
+  int violations = 0, credit_requests = 0, credits_from_host = 0, replies_to_us = 0;
+  bool send_credit_command = false;    // after the first data packet, grant credit unprompted
+  std::string pending_reply;           // data waiting for host credit
+  uint32_t host_credit_for_us = 0;
+  size_t in_chunk = 0;                 // 0: serve whatever is queued; else at most this many bytes per transfer
+
+  static void be16(std::string& s, uint16_t v) { s.push_back(static_cast<char>(v >> 8)); s.push_back(static_cast<char>(v)); }
+  void packet(uint8_t ps, uint8_t ss, uint8_t credit, const std::string& payload) {
+    to_host.push_back(static_cast<char>(ps)); to_host.push_back(static_cast<char>(ss));
+    be16(to_host, static_cast<uint16_t>(6 + payload.size()));
+    to_host.push_back(static_cast<char>(credit)); to_host.push_back(0);
+    to_host += payload;
+  }
+  void reply(uint8_t cmd, const std::string& body) { packet(0, 0, 1, std::string(1, static_cast<char>(cmd | 0x80)) + body); }
+  void flush_pending() {
+    if (!pending_reply.empty() && host_credit_for_us > 0) { --host_credit_for_us; packet(socket, socket, 0, pending_reply); pending_reply.clear(); }
+  }
+  void feed(const uint8_t* d, size_t n) {
+    from_host.append(reinterpret_cast<const char*>(d), n);
+    while (from_host.size() >= 6) {
+      const uint8_t* h = reinterpret_cast<const uint8_t*>(from_host.data());
+      const size_t length = (h[2] << 8) | h[3];
+      if (length < 6) { ++violations; from_host.clear(); return; }
+      if (from_host.size() < length) return;
+      const std::string payload = from_host.substr(6, length - 6);
+      const uint8_t ps = h[0], ss = h[1];
+      from_host.erase(0, length);
+      if (ps == 0 && ss == 0) command(payload);
+      else if (ps == socket && ss == socket && opened) {
+        if (credit_for_host <= 0) ++violations; else --credit_for_host;
+        if (length > max_p2s) ++violations;
+        printed += payload;
+        if (payload.find("@PJL INFO STATUS") != std::string::npos) pending_reply = "@PJL INFO STATUS\r\nCODE=10001\r\nONLINE=TRUE\r\n";
+        flush_pending();
+        if (send_credit_command) { send_credit_command = false; ++credit_for_host; packet(0, 0, 1, std::string("\x03", 1) + char(socket) + char(socket) + char(0) + char(1)); }
+      } else {
+        ++violations;
+      }
+    }
+  }
+  void command(const std::string& c) {
+    if (c.empty()) { ++violations; return; }
+    const uint8_t cmd = static_cast<uint8_t>(c[0]);
+    if (cmd & 0x80) { if (cmd == 0x83) ++replies_to_us; return; }
+    if (cmd == 0) { inited = true; reply(0, std::string(1, 0) + char(0x20)); }
+    else if (cmd == 9) {
+      if (!inited) ++violations;
+      const std::string name = c.substr(1);
+      reply(9, name == "PRINT" ? std::string(1, 0) + char(socket) + name : std::string(1, 0x0A) + char(0));
+    } else if (cmd == 1 && c.size() >= 9) {
+      opened = true;
+      std::string body(1, 0);
+      body += c[1]; body += c[2];
+      be16(body, std::min<uint16_t>(max_p2s, static_cast<uint16_t>(((uint8_t)c[3] << 8) | (uint8_t)c[4])));
+      be16(body, std::min<uint16_t>(max_s2p, static_cast<uint16_t>(((uint8_t)c[5] << 8) | (uint8_t)c[6])));
+      be16(body, 0xFFFF);
+      be16(body, static_cast<uint16_t>(grant_open));
+      credit_for_host = grant_open;
+      reply(1, body);
+    } else if (cmd == 3 && c.size() >= 5) {
+      ++credits_from_host;
+      host_credit_for_us += static_cast<uint8_t>(c[3]) << 8 | static_cast<uint8_t>(c[4]);
+      reply(3, std::string(1, 0) + c[1] + c[2]);
+      flush_pending();
+    } else if (cmd == 4 && c.size() >= 5) {
+      ++credit_requests;
+      int grant = 0;
+      if (refuse_requests > 0) --refuse_requests; else grant = grant_on_request;
+      credit_for_host += grant;
+      std::string body(1, 0);
+      body += c[1]; body += c[2];
+      be16(body, static_cast<uint16_t>(grant));
+      reply(4, body);
+    } else if (cmd == 2) {
+      opened = false;
+      reply(2, std::string(1, 0) + c[1] + c[2]);
+    } else if (cmd == 8) {
+      exited = true;
+      reply(8, std::string(1, 0));
+    } else {
+      ++violations;
+    }
+  }
+  size_t serve(uint8_t* out, size_t capacity) {
+    size_t n = std::min(capacity, to_host.size());
+    if (in_chunk && n > in_chunk) n = in_chunk;
+    memcpy(out, to_host.data(), n);
+    to_host.erase(0, n);
+    return n;
+  }
+};
+
 // A host controller with scripted devices: port 0 a printer (one unidirectional and one bidirectional setting of its interface),
 // port 1 a mass-storage stick. Everything the driver sends is recorded.
 struct FakeUsbHost final : IUsbHostController {
@@ -396,12 +501,19 @@ struct FakeUsbHost final : IUsbHostController {
   std::vector<uint32_t> out_sizes;
   int fail_out = 0;             // bulk OUT transfers still to fail
   int halts_cleared = 0, endpoint_resets = 0;
+  FakeDot4Peripheral* dot4 = nullptr;   // when set, the pipes carry IEEE 1284.4
 
-  FakeUsbHost(bool bidirectional = true, bool with_alternates = true) {
+  explicit FakeUsbHost(bool bidirectional = true, bool with_alternates = true, bool dot4_interface = false) {
     auto put = [](std::vector<uint8_t>& v, std::initializer_list<uint8_t> b) { v.insert(v.end(), b.begin(), b.end()); };
     std::vector<uint8_t>& c = printer_config;
     put(c, {9, 2, 0, 0, 1, 1, 0, 0x80, 50});
-    if (bidirectional && with_alternates) {
+    if (dot4_interface) {
+      put(c, {9, 4, 0, 0, 1, 7, 1, 1, 0});   // setting 0: unidirectional
+      put(c, {7, 5, 0x01, 2, 0x00, 0x02, 0});
+      put(c, {9, 4, 0, 1, 2, 7, 1, 3, 0});   // setting 1: IEEE 1284.4
+      put(c, {7, 5, 0x01, 2, 0x00, 0x02, 0});
+      put(c, {7, 5, 0x82, 2, 0x00, 0x02, 0});
+    } else if (bidirectional && with_alternates) {
       put(c, {9, 4, 0, 0, 1, 7, 1, 1, 0});   // interface 0, setting 0: unidirectional
       put(c, {7, 5, 0x01, 2, 0x00, 0x02, 0});
       put(c, {9, 4, 0, 1, 2, 7, 1, 2, 0});   // setting 1: bidirectional
@@ -458,6 +570,13 @@ struct FakeUsbHost final : IUsbHostController {
     // The driver must hand over a block that does not cross a 64 KiB boundary.
     const uintptr_t start = reinterpret_cast<uintptr_t>(data.data());
     if ((start >> 16) != ((start + data.size() - 1) >> 16)) return false;
+    if (dot4) {
+      if (endpoint & 0x80) { *transferred = static_cast<uint32_t>(dot4->serve(data.data(), data.size())); return true; }
+      if (fail_out > 0) { --fail_out; return false; }
+      dot4->feed(data.data(), data.size());
+      *transferred = static_cast<uint32_t>(data.size());
+      return true;
+    }
     if (endpoint & 0x80) {
       const size_t n = reply.size() < data.size() ? reply.size() : data.size();
       memcpy(data.data(), reply.data(), n);
@@ -863,6 +982,109 @@ static void test_printer_monitor() {
   }
 }
 
+
+static void test_dot4() {
+  TestAllocator a;
+  FakeUsbBus* none = nullptr;
+  (void)none;
+  {
+    FakeUsbHost host(true, true, true);
+    FakeDot4Peripheral peri;
+    host.dot4 = &peri;
+    FakeUsbBus bus(&host);
+    List<UniquePointer<IPrinter>> found(a);
+    UsbPrinter::discover(bus, a, found);
+    CHECK(found.count() == 1);
+    if (found.count() != 1) return;
+    UsbPrinter& usb = static_cast<UsbPrinter&>(*found[0]);
+    CHECK(usb.multiplexed() && usb.bidirectional() && peri.inited && peri.opened && usb.dot4() && usb.dot4()->socket() == 1);
+    CHECK(usb.dot4()->max_packet() == 1024 && usb.dot4()->printer_max_packet() == 512);
+    bool set_alt = false;
+    for (const auto& c : host.controls) if (c.request == 0x0B && c.value == 1) set_alt = true;
+    CHECK(set_alt && strcmp(usb.name(), "Brother HL-2070N series") == 0);   // the device ID still comes by class request
+
+    // A 40 KB job: 1018 bytes a packet, two credits at a time.
+    std::string job(40000, 'x');
+    for (size_t i = 0; i < job.size(); ++i) job[i] = static_cast<char>(i * 13 + 1);
+    peri.send_credit_command = true;   // the printer also grants credit by itself once
+    CHECK(usb.submit(ConstByteView(reinterpret_cast<const uint8_t*>(job.data()), job.size()), "dot4 job"));
+    for (int i = 0; i < 1000 && usb.pending_jobs(); ++i) usb.poll();
+    CHECK(usb.pending_jobs() == 0 && peri.printed == job && peri.violations == 0 && usb.statistics().jobs_sent == 1);
+    CHECK(peri.credit_requests > 5 && usb.dot4()->packets_sent() == (job.size() + 1017) / 1018);   // (full packets: the job goes out in whole multiples of the packet size)
+    CHECK(peri.replies_to_us == 1);   // the unsolicited Credit command was answered
+
+    // A printer with no credit to give right now: nothing is lost, nothing is counted as a failure.
+    peri.printed.clear();
+    peri.refuse_requests = 3;
+    const std::string wait_job(6000, 'w');   // more than the credit it holds
+    CHECK(usb.submit(ConstByteView(reinterpret_cast<const uint8_t*>(wait_job.data()), wait_job.size()), "wait"));
+    int polls = 0;
+    while (usb.pending_jobs() && polls < 50) { usb.poll(); ++polls; }
+    CHECK(polls >= 4 && peri.printed == wait_job && peri.violations == 0 && usb.statistics().jobs_failed == 0 && usb.state() == PrinterState::Ready);
+
+    // The way back: a PJL query, answered on the channel. The printer needs credit for it (the host grants some).
+    peri.in_chunk = 7;   // the reply trickles in a few bytes per transfer
+    const char query[] = "\x1b%-12345X@PJL INFO STATUS\r\n\x1b%-12345X";
+    CHECK(usb.submit(ConstByteView(reinterpret_cast<const uint8_t*>(query), sizeof query - 1), "query"));
+    for (int i = 0; i < 20 && usb.pending_jobs(); ++i) usb.poll();
+    uint8_t back[256];
+    uint32_t n = 0;
+    CHECK(usb.read_back(ByteView(back), &n) && n > 20 && memcmp(back, "@PJL INFO STATUS", 16) == 0 && peri.credits_from_host >= 1 && peri.violations == 0);
+
+    // A failing pipe: the session is closed and opened again, and the job completes.
+    peri.printed.clear();
+    host.fail_out = 1;
+    const char small[] = "after a failure";
+    CHECK(usb.submit(ConstByteView(reinterpret_cast<const uint8_t*>(small), sizeof small - 1), "retry"));
+    for (int i = 0; i < 20 && usb.pending_jobs(); ++i) usb.poll();
+    CHECK(usb.statistics().jobs_failed == 0 && peri.printed == "after a failure" && usb.multiplexed());
+    usb.shutdown();
+    CHECK(peri.exited && !peri.opened);
+  }
+  {   // a printer that does not know the service, or that never answers: the printer is left out
+    FakeUsbHost host(true, true, true);
+    FakeDot4Peripheral peri;
+    peri.socket = 0;   // GetSocketID answers with an error
+    host.dot4 = &peri;
+    FakeUsbBus bus(&host);
+    List<UniquePointer<IPrinter>> found(a);
+    UsbPrinter::discover(bus, a, found);
+    CHECK(found.count() == 0);
+  }
+  {   // a printer that sends garbage instead of packets
+    FakeUsbHost host(true, true, true);
+    FakeDot4Peripheral peri;
+    peri.to_host = std::string("\xff\xff\xff\xff\xff\xff\xff\xff", 8);
+    host.dot4 = &peri;
+    FakeUsbBus bus(&host);
+    List<UniquePointer<IPrinter>> found(a);
+    UsbPrinter::discover(bus, a, found);
+    CHECK(found.count() == 0);
+  }
+  {   // plain bidirectional is preferred over 1284.4 when the printer offers both
+    FakeUsbHost host;
+    FakeUsbBus bus(&host);
+    List<UniquePointer<IPrinter>> found(a);
+    UsbPrinter::discover(bus, a, found);
+    CHECK(found.count() == 1 && !static_cast<UsbPrinter&>(*found[0]).multiplexed());
+  }
+  // The session directly: random traffic from the printer never crashes the host side.
+  {
+    uint32_t seed = 11;
+    for (int round = 0; round < 300; ++round) {
+      FakeUsbHost host(true, true, true);
+      FakeDot4Peripheral peri;
+      host.dot4 = &peri;
+      for (int k = 0, n = 1 + round % 40; k < n; ++k) { seed = seed * 1664525 + 1013904223; peri.to_host.push_back(static_cast<char>(seed >> 16)); }
+      if (round % 2) { peri.to_host.insert(0, std::string("\x00\x00\x00\x09\x01\x00\x80\x00\x20", 9)); }
+      FakeUsbBus bus(&host);
+      List<UniquePointer<IPrinter>> found(a);
+      UsbPrinter::discover(bus, a, found);
+    }
+  }
+  CHECK(g_live == 0);
+}
+
 int main() {
   test_packbits();
   test_pages_and_halftone();
@@ -874,6 +1096,7 @@ int main() {
   test_device_id();
   test_usb_printer();
   test_usb_variants();
+  test_dot4();
   test_snmp_messages();
   test_printer_monitor();
   if (g_failed) {

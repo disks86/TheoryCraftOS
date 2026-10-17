@@ -36,7 +36,12 @@ static long g_live = 0;
 struct TestAllocator final : allocators::IAllocator {
   long& live = g_live;
   void* allocate(uint64_t size) override { if (!size) return nullptr; ++live; return aligned_alloc(64, (size + 63) / 64 * 64); }
-  void* allocate_aligned(uint64_t size, uint64_t) override { return allocate(size); }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override {
+    if (!size) return nullptr;
+    ++live;
+    if (alignment < 64) alignment = 64;
+    return aligned_alloc(alignment, (size + alignment - 1) / alignment * alignment);
+  }
   void deallocate(void* p) override { if (p) { --live; free(p); } }
 };
 struct FakeClock final : hardware::IClock {

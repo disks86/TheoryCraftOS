@@ -123,8 +123,16 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   (prtMarkerLifeCount), every **supply** with its level as a percentage (toner, drum, waste toner, fuser... - `low()` at 10 %, or 90 %
   full for a receptacle), the **alerts** (severity, code, the printer's text) and the front-panel text. `NetworkPrinter::request_report()`
   runs it inside `poll()`; `IPrinter::report()` is the common accessor (a USB printer fills in the error bits from its port status).
+  **IEEE 1284.4 ("Dot4") multiplexing** (`Usb/Dot4`): a USB printer interface of protocol 3 carries logical channels over its one bulk
+  pipe pair, as multifunction printers use to print and scan at once. `Dot4Session` is the host side with one data channel: Init,
+  GetSocketID("PRINT"), OpenChannel, credit-based flow control (a data packet only against credit; CreditRequest when it runs out;
+  the printer's own Credit and CreditRequest commands answered), packets cut to the size the printer agreed to, a byte-stream parser
+  that copes with packets split over or sharing USB transfers, and CloseChannel / Exit. The packet formats and the command
+  sequence were checked against HP's Linux driver source (hplip `io/hpmud/dot4.c`). `UsbPrinter` prefers a plain bidirectional
+  interface, then protocol 3, then unidirectional; on a protocol-3 interface `submit()` and `read_back()` go through the channel, a printer
+  with no credit to spare just makes `poll()` wait (not a failure), and a broken session is reopened. Not tried on a physical printer.
   The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). Not covered: SNMPv3, traps, IPP,
-  discovery of network printers (BRAdmin, mDNS), IEEE 1284.4 multiplexing (protocol 3), the printer's Epson FX / IBM emulation, PCL 6
+  discovery of network printers (BRAdmin, mDNS), several simultaneous 1284.4 channels, the printer's Epson FX / IBM emulation, PCL 6
   (PCL XL) output, duplex and colour (the engine has neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure,
   text layout, both network transports and failures, and the USB driver against a scripted host controller (descriptors, device ID,
   chunking, retries, status, read-back, damaged descriptors); like the rest it has not been run against a physical printer.

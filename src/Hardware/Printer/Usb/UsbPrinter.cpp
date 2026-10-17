@@ -23,7 +23,7 @@
 namespace hardware {
 
 namespace {
-constexpr uint8_t kClassPrinter = 7, kSubclassPrinter = 1, kProtocolUnidirectional = 1, kProtocolBidirectional = 2;
+constexpr uint8_t kClassPrinter = 7, kSubclassPrinter = 1, kProtocolUnidirectional = 1, kProtocolBidirectional = 2, kProtocolDot4 = 3;
 constexpr uint8_t kClassInterfaceIn = 0xA1, kClassInterfaceOut = 0x21;
 constexpr uint8_t kGetDeviceId = 0, kGetPortStatus = 1, kSoftReset = 2;
 constexpr uint8_t kStandardInterfaceOut = 0x01, kSetInterface = 0x0B;
@@ -60,13 +60,14 @@ void UsbPrinter::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<
         UsbEndpointInfo endpoint;
         if (parse_usb_interface(descriptor, &interface)) {
           in_printer = interface.device_class == kClassPrinter && interface.subclass == kSubclassPrinter &&
-                       (interface.protocol == kProtocolUnidirectional || interface.protocol == kProtocolBidirectional) && n < 8;
+                       (interface.protocol == kProtocolUnidirectional || interface.protocol == kProtocolBidirectional || interface.protocol == kProtocolDot4) && n < 8;
           if (in_printer) {
             found[n].ep = UsbPrinterEndpoints();
             found[n].ep.configuration = configuration.value;
             found[n].ep.interface_number = interface.number;
             found[n].ep.alternate = interface.alternate_setting;
             found[n].protocol = interface.protocol;
+            found[n].ep.protocol = interface.protocol;
             ++n;
           }
         } else if (in_printer && parse_usb_endpoint(descriptor, &endpoint) && endpoint.transfer_type() == 2) {
@@ -84,12 +85,19 @@ void UsbPrinter::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<
         for (uint32_t k = 0; k < i; ++k)
           if (found[k].ep.interface_number == found[i].ep.interface_number) first_of_number = false;
         if (!first_of_number) continue;
+        // Plain bidirectional is simplest; 1284.4 next (both pipes needed); unidirectional last.
+        auto rank = [](const Candidate& k) {
+          if (!k.ep.out_endpoint) return 0;
+          if (k.protocol == kProtocolBidirectional && k.ep.in_endpoint) return 3;
+          if (k.protocol == kProtocolDot4 && k.ep.in_endpoint) return 2;
+          return k.protocol == kProtocolDot4 ? 0 : 1;
+        };
         const Candidate* best = nullptr;
         for (uint32_t k = i; k < n; ++k) {
-          if (found[k].ep.interface_number != found[i].ep.interface_number || !found[k].ep.out_endpoint) continue;
-          const bool bidi = found[k].protocol == kProtocolBidirectional && found[k].ep.in_endpoint;
-          if (!best || (bidi && !(best->protocol == kProtocolBidirectional && best->ep.in_endpoint))) best = &found[k];
+          if (found[k].ep.interface_number != found[i].ep.interface_number) continue;
+          if (!best || rank(found[k]) > rank(*best)) best = &found[k];
         }
+        if (best && rank(*best) == 0) best = nullptr;
         if (!best) continue;
         UniquePointer<UsbPrinter> printer = UniquePointer<UsbPrinter>::make(allocator, *host, port, best->ep, allocator);
         if (printer && printer->initialize()) out.push_back(UniquePointer<IPrinter>(util::move(printer)));
@@ -100,7 +108,7 @@ void UsbPrinter::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<
 
 bool UsbPrinter::initialize() {
   if (started_) return true;
-  wire_ = allocate_view<uint8_t>(allocator_, kChunk, 65536);
+  wire_ = allocate_view<uint8_t>(allocator_, 2 * kChunk, 65536);
   if (wire_.empty()) return false;
   if (!host_.set_configuration(port_, ep_.configuration) || !host_.start_bulk_endpoint(port_, ep_.out_endpoint, ep_.out_max_packet) ||
       (ep_.in_endpoint && !host_.start_bulk_endpoint(port_, ep_.in_endpoint, ep_.in_max_packet))) {
@@ -110,6 +118,14 @@ bool UsbPrinter::initialize() {
   if (ep_.alternate != 0 && !host_.control_out(port_, kStandardInterfaceOut, kSetInterface, ep_.alternate, ep_.interface_number)) {
     release_view(allocator_, wire_);
     return false;
+  }
+  if (ep_.protocol == kProtocolDot4) {
+    dot4_ = UniquePointer<Dot4Session>::make(allocator_, host_, port_, ep_.out_endpoint, ep_.in_endpoint, wire_.first(kChunk), wire_.subview(kChunk, kChunk));
+    if (!dot4_ || !dot4_->open("PRINT")) {
+      dot4_.reset();
+      release_view(allocator_, wire_);
+      return false;
+    }
   }
   started_ = true;
   read_identity();  // a printer that will not say who it is still prints
@@ -161,6 +177,10 @@ bool UsbPrinter::read_identity() {
 void UsbPrinter::shutdown() {
   if (!started_) return;
   cancel_all();
+  if (dot4_) {
+    dot4_->close();
+    dot4_.reset();
+  }
   started_ = false;
   release_view(allocator_, wire_);
 }
@@ -175,6 +195,15 @@ bool UsbPrinter::submit(ConstByteView job, const char*) {
 }
 
 void UsbPrinter::recover() {
+  if (dot4_) {  // the multiplexed session is in an unknown state: start it again
+    host_.reset_bulk_endpoint(port_, ep_.out_endpoint);
+    host_.reset_bulk_endpoint(port_, ep_.in_endpoint);
+    host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, ep_.out_endpoint);
+    host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, ep_.in_endpoint);
+    dot4_ = UniquePointer<Dot4Session>::make(allocator_, host_, port_, ep_.out_endpoint, ep_.in_endpoint, wire_.first(kChunk), wire_.subview(kChunk, kChunk));
+    if (dot4_ && !dot4_->open("PRINT")) dot4_.reset();
+    return;
+  }
   host_.reset_bulk_endpoint(port_, ep_.out_endpoint);
   host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, ep_.out_endpoint);
 }
@@ -192,8 +221,29 @@ void UsbPrinter::poll() {
   if (!started_ || count_ == 0) return;
   Job& job = *queue_[head_];
   const uint64_t left = job.data.size() - job.sent;
-  const uint32_t n = left < kChunk ? static_cast<uint32_t>(left) : kChunk;
+  uint32_t per_call = kChunk;
+  if (dot4_) per_call = kChunk / (dot4_->max_packet() - 6) * (dot4_->max_packet() - 6);  // whole packets, so none is left short
+  const uint32_t n = left < per_call ? static_cast<uint32_t>(left) : per_call;
   ConstByteView source = job.data.view().subview(job.sent, n);
+  if (ep_.protocol == kProtocolDot4) {
+    uint64_t sent = 0;
+    if (!dot4_ || !dot4_->send(source, &sent)) {
+      recover();
+      if (++job.failures >= kMaxFailures) fail_front();
+      return;
+    }
+    job.failures = 0;
+    job.sent += sent;
+    stats_.bytes_sent += sent;
+    if (job.sent >= job.data.size()) {
+      ++stats_.jobs_sent;
+      last_failed_ = false;
+      queue_[head_].reset();
+      head_ = (head_ + 1) % kQueueDepth;
+      --count_;
+    }
+    return;  // (sent may be 0: the printer has no credit yet, which is not a failure)
+  }
   ByteView chunk = wire_.first(n);
   chunk.copy_from(source);  // the controller wants the bytes in its DMA-safe block
   uint32_t moved = 0;
@@ -247,6 +297,7 @@ bool UsbPrinter::request_report() {
 
 bool UsbPrinter::read_back(ByteView out, uint32_t* length) {
   if (!started_ || !ep_.in_endpoint) return false;
+  if (dot4_) return dot4_->receive(out, length);
   const uint32_t want = out.size() < kChunk ? static_cast<uint32_t>(out.size()) : kChunk;
   uint32_t moved = 0;
   if (!host_.bulk_transfer(port_, ep_.in_endpoint, wire_.first(want), &moved)) return false;
