@@ -36,6 +36,10 @@ class ColorPalette : public Control {
   // Replaces the swatches. False if memory ran out (the old ones stay).
   bool set_colors(const uint32_t* colors, uint32_t count);
   void set_rows(uint32_t rows);
+  // Whether the two overlapping squares showing the primary and secondary colors are drawn (default: yes). Without them the swatches
+  // start at the left edge; the colors can still be set by clicking.
+  void set_indicator_visible(bool visible) { UiGuard lock(this); indicator_ = visible; invalidate(); }
+  bool indicator_visible() const { return indicator_; }
   uint32_t color_count() const { return static_cast<uint32_t>(colors_.count()); }
   uint32_t color_at(uint32_t index) const { return index < colors_.count() ? colors_[index] : 0; }
 
@@ -60,13 +64,14 @@ class ColorPalette : public Control {
 
  protected:
   Size default_size() const override {
-    return {2 * kPad + kIndicator + kPad + static_cast<int32_t>(columns()) * (kSwatch + kGap),
+    return {(indicator_ ? 2 * kPad + kIndicator + kPad : kPad) + static_cast<int32_t>(columns()) * (kSwatch + kGap),
             2 * kPad + static_cast<int32_t>(rows_) * (kSwatch + kGap)};
   }
 
  private:
   List<uint32_t> colors_;
   uint32_t rows_ = 2;
+  bool indicator_ = true;
   uint32_t primary_ = 0xFF000000, secondary_ = 0xFFFFFFFF;
   Handler changed_;
 };

@@ -65,6 +65,8 @@ Notepad::Notepad(allocators::IAllocator& allocator)
     file->add_item("Save", {&Notepad::on_save, this}, "Ctrl+S");
     file->add_item("Save As...", {&Notepad::on_save_as, this}, "Ctrl+Shift+S");
     file->add_separator();
+    file->add_item("Print...", {&Notepad::on_print, this}, "Ctrl+P");
+    file->add_separator();
     file->add_item("Close", {&Notepad::on_close, this});
   }
   if (Menu* edit = menu_.add_menu("Edit")) {
@@ -131,6 +133,35 @@ void Notepad::on_paste(void* self, Control&) { static_cast<Notepad*>(self)->edit
 void Notepad::on_select_all(void* self, Control&) { static_cast<Notepad*>(self)->editor_.select_all(); }
 void Notepad::on_open(void* self, Control&) { static_cast<Notepad*>(self)->ask_open(); }
 void Notepad::on_save_as(void* self, Control&) { static_cast<Notepad*>(self)->ask_save_as(); }
+void Notepad::on_print(void* self, Control&) { static_cast<Notepad*>(self)->ask_print(); }
+
+void Notepad::ask_print() {
+  if (!print_dialog_ || !manager()) {
+    say("No print dialog available.");
+    return;
+  }
+  if (editor_.text().empty()) {
+    say("There is nothing to print.");
+    return;
+  }
+  print_dialog_->set_text(editor_.text());   // for the preview and the page count
+  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Text, "Print", {&Notepad::on_print_picked, this})) say("The print dialog is busy.");
+}
+
+void Notepad::on_print_picked(void* self, Control&) {
+  auto* n = static_cast<Notepad*>(self);
+  PrintDialog& d = *n->print_dialog_;
+  if (!d.accepted() || !d.print_service()) return;
+  String error(n->allocator());
+  if (d.print_service()->print_text(d.printer_index(), n->editor_.text(), n->name_.empty() ? StringView("Untitled") : n->name_.view(), d.options(), &error)) {
+    n->say("Sent to the printer.");
+  } else {
+    String message(n->allocator());
+    message.append("Cannot print: ");
+    message.append(error.view());
+    n->say(message.view());
+  }
+}
 
 bool Notepad::may_discard() {
   if (!editor_.modified() || discard_armed_) {
@@ -297,6 +328,7 @@ bool Notepad::on_key(const KeyArgs& args) {
     switch (args.usage) {
       case key::kA + 13: new_document(); return true;  // N
       case key::kA + 14: ask_open(); return true;      // O
+      case key::kA + 15: ask_print(); return true;     // P
       case key::kA + 18:                               // S
         if (args.modifiers & hardware::modifier::kShift) ask_save_as();
         else save_file();

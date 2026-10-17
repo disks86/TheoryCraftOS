@@ -11,7 +11,7 @@ flags="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=unde
 
 # The GUI has player controls, which bring the audio player (and with it the mixer), the video player and the codecs along.
 media="src/Media/*.cpp src/Media/Audio/*.cpp src/Media/Image/*.cpp"
-gui_audio="src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp $media"
+gui_audio="src/Hardware/Printer/PrinterTypes.cpp src/Hardware/Printer/TextLayout.cpp src/Hardware/Printer/Halftone.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp $media"
 
 build_and_run() {
   local name=$1; shift
@@ -100,7 +100,7 @@ for t in "${WANTED[@]}"; do
     X509Test) build_and_run X509Test tests/X509Test.cpp tests/KernelStubs.cpp src/Crypto/*.cpp ;;
     TlsReplayTest) build_and_run TlsReplayTest tests/TlsReplayTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp ;;
     SnmpTest) build_and_run SnmpTest tests/SnmpTest.cpp tests/KernelStubs.cpp src/Crypto/*.cpp src/Network/Snmp/SnmpMessage.cpp src/Network/Snmp/SnmpUsm.cpp ;;
-    PrinterTest) build_and_run PrinterTest tests/PrinterTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
+    PrinterTest) build_and_run PrinterTest tests/PrinterTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/SystemPrintService.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
                    src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                    src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     PrinterHotplugTest) build_and_run PrinterHotplugTest tests/PrinterHotplugTest.cpp tests/UsbAudioStubs.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \

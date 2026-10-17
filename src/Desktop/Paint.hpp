@@ -16,8 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The paint application: a window with a menu bar (File: New, Open, Save, Save As, Close; Edit: Undo, Redo, Cut, Copy, Paste,
-// Select All; View: Zoom In, Zoom Out, Actual Size, Pixel Grid; Options: Filled Shapes), the
+// The paint application: a window with a menu bar (File: New, Open, Save, Save As, Print, Close; Edit: Undo, Redo, Cut, Copy, Paste,
+// Select All; View: Zoom In, Zoom Out, Actual Size, Pixel Grid; Options: Filled Shapes, Primary Color, Secondary Color), the
 // brush size, a strip of tools at the left, the DrawingCanvas, and at the bottom a
 // color palette with a color picker for any other color. Files are opened and saved as images; the format follows the
 // extension (png, jpg, bmp, gif, ppm, qoi, tga, tif, webp; png when there is none); Open and Save As pick the file in
@@ -27,7 +27,9 @@
 // selection to drag into place. A command that would throw away unsaved changes does nothing the first time (the status
 // line says so) and goes ahead when it is repeated.
 #pragma once
+#include "Desktop/ColorDialog.hpp"
 #include "Desktop/FileDialog.hpp"
+#include "Desktop/PrintDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/ColorPalette.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
@@ -52,6 +54,9 @@ class Paint : public gui::Frame {
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
   // The dialog that Open and Save As use (nullptr: none, they then say so). It must outlive the window.
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
+  // The dialog that Print uses, and the one that Options > Primary / Secondary Color use (nullptr: none, they then say so). They must outlive the window.
+  void set_print_dialog(PrintDialog* dialog) { print_dialog_ = dialog; }
+  void set_color_dialog(ColorDialog* dialog) { color_dialog_ = dialog; }
 
   // Starts a blank white picture. False (nothing changes) while there are unsaved changes the user has not agreed to lose.
   bool new_picture(uint32_t width = kNewWidth, uint32_t height = kNewHeight);
@@ -62,6 +67,10 @@ class Paint : public gui::Frame {
   // The commands behind File > Open and File > Save As: they show the dialog and carry on when a file is picked.
   void ask_open();
   void ask_save_as();
+  // File > Print: the print dialog, then the picture goes to the chosen printer.
+  void ask_print();
+  // Options > Primary Color / Secondary Color: the color dialog, then the palette takes the choice.
+  void ask_color(bool secondary);
   // True if a file name ends in an extension of a picture format (case does not matter).
   static bool is_picture_name(StringView name);
 
@@ -83,6 +92,11 @@ class Paint : public gui::Frame {
   static void on_open(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
   static void on_save_as(void* self, gui::Control&);
+  static void on_print(void* self, gui::Control&);
+  static void on_print_picked(void* self, gui::Control&);
+  static void on_primary_color(void* self, gui::Control&);
+  static void on_secondary_color(void* self, gui::Control&);
+  static void on_color_picked_by_dialog(void* self, gui::Control&);
   static void on_open_picked(void* self, gui::Control&);
   static void on_save_picked(void* self, gui::Control&);
   static void on_cut(void* self, gui::Control&);
@@ -127,6 +141,10 @@ class Paint : public gui::Frame {
   gui::DrawingCanvas canvas_;
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
+  PrintDialog* print_dialog_ = nullptr;
+  ColorDialog* color_dialog_ = nullptr;
+  bool choosing_secondary_ = false;
+  graphics::Surface print_surface_;   // the picture the print dialog previews (it borrows it)
   String path_;  // the file the picture came from or was saved to (empty: none yet)
   String name_;
   bool discard_armed_ = false;

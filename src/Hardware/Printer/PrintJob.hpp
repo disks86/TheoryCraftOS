@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/Printer/Halftone.hpp"
+#include "Hardware/Printer/TextLayout.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/StringView.hpp"
 
@@ -46,7 +47,9 @@ class PrintJob {
   // printer cannot do what was asked or memory ran out.
   bool begin();
   bool add_page(const PageBitmap& page);
-  bool add_text(StringView utf8);
+  // Prints only the pages first_page .. last_page of the layout (counted from 1; 0 for the last means to the end). Pages beyond the text
+  // are not printed, so a range past the end prints nothing (pages() stays as it was).
+  bool add_text(StringView utf8, uint32_t first_page = 1, uint32_t last_page = 0);
   bool add_postscript(ConstByteView program);
   // Writes the trailer. After this bytes() is the whole job.
   bool finish();

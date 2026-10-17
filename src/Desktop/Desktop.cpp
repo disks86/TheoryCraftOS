@@ -38,6 +38,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       clock_(allocator),
       shutdown_dialog_(allocator),
       file_dialog_(allocator),
+      color_dialog_(allocator),
+      print_dialog_(allocator),
       explorer_(allocator),
       task_manager_(allocator),
       notepad_(allocator),
@@ -95,6 +97,9 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
 
   notepad_.set_file_dialog(&file_dialog_);
   paint_.set_file_dialog(&file_dialog_);
+  notepad_.set_print_dialog(&print_dialog_);
+  paint_.set_print_dialog(&print_dialog_);
+  paint_.set_color_dialog(&color_dialog_);
   explorer_.set_clock(&now_us_);
   explorer_.on_file_opened({&Desktop::on_explorer_file, this});
 

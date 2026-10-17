@@ -202,6 +202,12 @@ add_executable(BOOTX64
   src/Desktop/FileExplorer.cpp
   src/Desktop/DirectoryListing.cpp
   src/Desktop/FileDialog.cpp
+  src/Desktop/ColorDialog.cpp
+  src/Desktop/PrintDialog.cpp
+  src/Desktop/PrintPreview.cpp
+  src/SystemPrintService.cpp
+  src/Gui/Controls/SpinBox.cpp
+  src/Gui/Controls/ColorSpectrum.cpp
   src/Desktop/TaskManager.cpp
   src/Desktop/Notepad.cpp
   src/Desktop/Paint.cpp
@@ -278,6 +284,7 @@ add_executable(BOOTX64
   src/Hardware/Printer/PrinterTypes.cpp
   src/Hardware/Printer/Halftone.cpp
   src/Hardware/Printer/PrintJob.cpp
+  src/Hardware/Printer/TextLayout.cpp
   src/Hardware/Printer/PrintTransport.cpp
   src/Hardware/Printer/NetworkPrinter.cpp
   src/Hardware/Printer/SystemPrinters.cpp

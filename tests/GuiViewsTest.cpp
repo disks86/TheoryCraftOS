@@ -19,6 +19,9 @@
 // Host-side tests for the larger controls: ScrollBar, DataGrid (with its models), ImageView and the audio
 // player control (over a fake audio device and the real mixer and player).
 #include <stdio.h>
+#include <string>
+#include <vector>
+#include <cstdlib>
 #include <stdlib.h>
 #include <string.h>
 #include "Audio/AudioPlayer.hpp"
@@ -28,7 +31,9 @@
 #include "Kernel/Clipboard.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/ColorDialog.hpp"
 #include "Desktop/Desktop.hpp"
+#include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
@@ -45,7 +50,9 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Windows/WindowManager.hpp"
+#include "Gui/Controls/ColorSpectrum.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
+#include "Gui/Controls/SpinBox.hpp"
 #include "Gui/Controls/TabControl.hpp"
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/Controls/VideoPlayerControl.hpp"
@@ -2668,6 +2675,628 @@ static void test_desktop_file_dialog() {
     d.file_dialog().name_box().set_text("hello.txt");
     d.file_dialog().ok_button().click();
     CHECK(!d.file_dialog().showing() && d.notepad().editor().text().equals("hi there") && d.notepad().path().equals("/hello.txt"));
+    // The print and color dialogs are shared the same way.
+    CHECK(choose(d.window(), d.notepad().menu_bar(), "File", "Print...") && d.print_dialog().showing() && d.print_dialog().kind() == desktop::PrintDialog::Kind::Text);
+    d.print_dialog().cancel_button().click();
+    CHECK(choose(d.window(), d.paint().menu_bar(), "File", "Print...") && d.print_dialog().showing());
+    d.print_dialog().cancel_button().click();
+    CHECK(choose(d.window(), d.paint().menu_bar(), "Options", "Primary Color...") && d.color_dialog().showing());
+    d.color_dialog().cancel_button().click();
+  }
+  CHECK(a.live == 0);
+}
+
+// --- Spin box, color spectrum and the color and print dialogs ---------------------------------------------------------
+
+static void test_spin_box() {
+  TestAllocator a;
+  {
+    Screen screen(a, 300, 200);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {300, 200});
+    SpinBox box(a);
+    TextBox other(a);
+    box.set_bounds({10, 10, 100, 24});
+    other.set_bounds({10, 60, 100, 24});
+    w.add(&box);
+    w.add(&other);
+    w.layout();
+    Counter changes;
+    box.on_value_changed(changes.handler());
+    box.set_range(1, 20);
+    changes.count = 0;
+    box.set_value(5);
+    CHECK(box.value() == 5 && box.edit_box().text().equals("5") && changes.count == 1);
+    box.set_value(5);
+    CHECK(changes.count == 1);                           // unchanged: no event
+    box.set_value(99);
+    CHECK(box.value() == 20 && box.edit_box().text().equals("20"));
+    box.set_value(-4);
+    CHECK(box.value() == 1);
+
+    // The two buttons step.
+    click(w, 10 + box.up_rect().x + 4, 10 + box.up_rect().y + 4);
+    CHECK(box.value() == 2);
+    click(w, 10 + box.down_rect().x + 4, 10 + box.down_rect().y + 4);
+    click(w, 10 + box.down_rect().x + 4, 10 + box.down_rect().y + 4);
+    CHECK(box.value() == 1);                             // not below the minimum
+    box.set_step(3);
+    click(w, 10 + box.up_rect().x + 4, 10 + box.up_rect().y + 4);
+    CHECK(box.value() == 4);
+    box.set_step(1);
+
+    // Keys and the wheel; Page Up goes ten steps.
+    w.set_focus(&box.edit_box());
+    press(w, key::kUp);
+    CHECK(box.value() == 5);
+    press(w, key::kDown);
+    press(w, key::kDown);
+    CHECK(box.value() == 3);
+    press(w, 0x4B);
+    CHECK(box.value() == 13);
+    press(w, 0x4B);
+    CHECK(box.value() == 20);
+    w.mouse_wheel(20, 20, -1);
+    CHECK(box.value() == 19);
+
+    // Typing a number: it counts as soon as it makes sense, and is corrected when the box is left.
+    press(w, key::kA, modifier::kLeftControl);
+    type_char(w, '1');
+    type_char(w, '2');
+    CHECK(box.edit_box().text().equals("12") && box.value() == 12);
+    type_char(w, 'x');                                   // not part of a number: thrown out
+    CHECK(box.edit_box().text().equals("12") && box.value() == 12);
+    type_char(w, '5');
+    CHECK(box.value() == 20 && box.edit_box().text().equals("125"));   // over the maximum: the value stops at it ...
+    w.set_focus(&other);
+    CHECK(box.edit_box().text().equals("20"));           // ... and the box says so once it is left
+    w.set_focus(&box.edit_box());
+    press(w, key::kA, modifier::kLeftControl);
+    press(w, key::kBackspace);
+    CHECK(box.value() == 20 && box.edit_box().text().empty());     // empty: the value waits
+    press(w, key::kEnter);
+    CHECK(box.edit_box().text().equals("20"));
+
+    // Negative numbers when the range has some.
+    box.set_range(-10, 10);
+    box.set_value(-3);
+    CHECK(box.edit_box().text().equals("-3"));
+    press(w, key::kA, modifier::kLeftControl);
+    type_char(w, '-');
+    type_char(w, '7');
+    CHECK(box.value() == -7);
+    box.set_range(5, 8);                                 // a new range moves the value into it
+    CHECK(box.value() == 5 && box.minimum() == 5 && box.maximum() == 8);
+    box.set_range(9, 3);
+    CHECK(box.maximum() == 9 && box.value() == 9);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_color_spectrum() {
+  TestAllocator a;
+  {
+    Screen screen(a, 300, 250);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {300, 250});
+    ColorSpectrum sp(a);
+    sp.set_bounds({10, 10, 200, 170});
+    w.add(&sp);
+    w.layout();
+    Counter changes;
+    sp.on_color_changed(changes.handler());
+    CHECK(sp.hsv().hue == 0 && sp.hsv().saturation == 255 && sp.hsv().value == 255 && sp.color() == 0xFFFF0000);
+    sp.set_color(0xFF00FF00);
+    CHECK(sp.hsv().hue == 120 && sp.color() == 0xFF00FF00 && changes.count == 0);   // from code: no event
+    // Clicking the square picks saturation (across) and brightness (down).
+    click(w, 10 + 0, 10 + 0);                                 // top left: no saturation, full brightness = white
+    CHECK(sp.hsv().saturation == 0 && sp.hsv().value == 255 && sp.color() == 0xFFFFFFFF && changes.count == 1 && sp.hsv().hue == 120);
+    click(w, 10 + ColorSpectrum::kField - 1, 10 + ColorSpectrum::kField - 1);   // bottom right: black
+    CHECK(sp.hsv().value == 0 && sp.hsv().saturation == 255 && sp.color() == 0xFF000000);
+    click(w, 10 + ColorSpectrum::kField - 1, 10);             // top right: the pure hue
+    CHECK(sp.color() == 0xFF00FF00 && changes.count == 3);
+    // The strip picks the hue, keeping the other two; a drag follows the pointer and may leave the control.
+    const Rect2D strip = sp.strip_rect();
+    click(w, 10 + strip.x + 4, 10 + ColorSpectrum::kField - 1);
+    CHECK(sp.hsv().hue == 359 && sp.hsv().saturation == 255 && sp.hsv().value == 255);
+    w.mouse_move(10 + strip.x + 4, 10 + 80);
+    w.mouse_button(10 + strip.x + 4, 10 + 80, MouseButton::Left, true);
+    w.mouse_move(10 + strip.x + 40, 10 + 0);
+    w.mouse_move(10 + strip.x + 40, 10 - 50);
+    w.mouse_button(10 + strip.x + 40, 10 - 50, MouseButton::Left, false);
+    CHECK(sp.hsv().hue == 0);
+    CHECK(sp.field_marker().x == ColorSpectrum::kField - 1 && sp.field_marker().y == 0 && sp.strip_marker() == 0);
+    // Keys.
+    w.set_focus(&sp);
+    press(w, key::kLeft);
+    CHECK(sp.hsv().saturation == 247);
+    press(w, key::kDown);
+    CHECK(sp.hsv().value == 247);
+    press(w, 0x4B);
+    CHECK(sp.hsv().hue == 10);
+    press(w, 0x4E);
+    press(w, 0x4E);
+    CHECK(sp.hsv().hue == 350);
+    for (int i = 0; i < 40; ++i) press(w, key::kUp);
+    CHECK(sp.hsv().value == 255);
+    w.render();
+    sp.set_hsv(Hsv{200, 100, 100});
+    w.render();                                               // another hue: the square is drawn again
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_color_dialog() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    w.layout();
+    desktop::ColorDialog dlg(a);
+    Closed2 closed;
+    CHECK(dlg.show(mgr, "Pick", 0xFF336699, closed.handler()) && dlg.showing() && mgr.has_modal() && !dlg.show(mgr, "Pick", 0xFF000000, closed.handler()));
+    w.layout();
+    // It starts at the color it was given, which every part shows.
+    CHECK(dlg.title().equals("Pick") && dlg.color() == 0xFF336699 && dlg.preview_color() == 0xFF336699 && dlg.original_color() == 0xFF336699);
+    CHECK(dlg.red_box().value() == 0x33 && dlg.green_box().value() == 0x66 && dlg.blue_box().value() == 0x99 && dlg.hex_box().text().equals("#336699"));
+    CHECK(red_of(dlg.spectrum().color()) >= 0x30 && red_of(dlg.spectrum().color()) <= 0x36 && blue_of(dlg.spectrum().color()) >= 0x96);
+
+    // Each way of choosing changes the others.
+    dlg.red_box().set_value(255);
+    CHECK(dlg.color() == 0xFFFF6699 && dlg.hex_box().text().equals("#FF6699") && dlg.preview_color() == 0xFFFF6699 && dlg.original_color() == 0xFF336699);
+    CHECK(red_of(dlg.spectrum().color()) >= 0xFD);
+    dlg.hex_box().set_text("00ff80");
+    CHECK(dlg.color() == 0xFF00FF80 && dlg.red_box().value() == 0 && dlg.green_box().value() == 255 && dlg.blue_box().value() == 128);
+    dlg.hex_box().set_text("#12");                       // not a color yet: nothing happens
+    CHECK(dlg.color() == 0xFF00FF80);
+    dlg.hex_box().set_text("#GG0000");
+    CHECK(dlg.color() == 0xFF00FF80);
+    const Point sp = dlg.spectrum().window_origin();
+    click(w, sp.x + 0, sp.y + 0);                        // the white corner of the square
+    CHECK(dlg.color() == 0xFFFFFFFF && dlg.red_box().value() == 255 && dlg.hex_box().text().equals("#FFFFFF"));
+    const uint16_t hue = dlg.spectrum().hsv().hue;
+    dlg.set_color(0xFF808080);                           // a grey keeps the hue the strip shows
+    CHECK(dlg.color() == 0xFF808080 && dlg.spectrum().hsv().hue == hue);
+    const Rect2D swatch = dlg.basic_colors().swatch_rect(16);   // red among the basic colors
+    const Point bp = dlg.basic_colors().window_origin();
+    click(w, bp.x + swatch.x + 3, bp.y + swatch.y + 3);
+    CHECK(dlg.color() == 0xFFFF0000 && dlg.green_box().value() == 0 && dlg.hex_box().text().equals("#FF0000"));
+    w.render();
+
+    // OK takes the choice; the dialog started from the color it was given.
+    dlg.ok_button().click();
+    CHECK(!dlg.showing() && dlg.accepted() && dlg.color() == 0xFFFF0000 && closed.count == 1 && !mgr.has_modal());
+    // Cancel, Escape and Enter.
+    CHECK(dlg.show(mgr, "Pick", 0x00123456, closed.handler()) && dlg.color() == 0xFF123456 && dlg.original_color() == 0xFF123456);   // the alpha is ignored
+    dlg.set_color(0xFFABCDEF);
+    dlg.cancel_button().click();
+    CHECK(!dlg.showing() && !dlg.accepted() && closed.count == 2);
+    CHECK(dlg.show(mgr, "Pick", 0xFF000000, closed.handler()));
+    w.set_focus(&dlg.hex_box());
+    press(w, key::kEscape);
+    CHECK(!dlg.showing() && !dlg.accepted() && closed.count == 3);
+    CHECK(dlg.show(mgr, "Pick", 0xFF000000, closed.handler()));
+    dlg.hex_box().set_text("#0A0B0C");
+    w.set_focus(&dlg.hex_box());
+    press(w, key::kEnter);
+    CHECK(!dlg.showing() && dlg.accepted() && dlg.color() == 0xFF0A0B0C);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_print_preview() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 400);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 400});
+    desktop::PrintPreview pv(a);
+    pv.set_bounds({10, 10, 220, 300});
+    w.add(&pv);
+    w.layout();
+    // Nothing to show: a blank sheet in the proportions of the paper, centred.
+    pv.set_sheet(hardware::PaperSize::A4, false, 42);
+    CHECK(pv.page_count() == 0);
+    Rect2D sheet = pv.sheet_rect();
+    CHECK(sheet.width > 100 && sheet.height > sheet.width && sheet.width <= 204 && std::abs(static_cast<int>(sheet.width * 297 / 210) - static_cast<int>(sheet.height)) <= 2);
+    CHECK(sheet.x * 2 + static_cast<int32_t>(sheet.width) == 220 && sheet.y * 2 + static_cast<int32_t>(sheet.height) == 300);
+    const Rect2D area = pv.printable_rect();
+    CHECK(area.x > sheet.x && area.y > sheet.y && area.width < sheet.width && area.height < sheet.height && area.x - sheet.x == static_cast<int32_t>(42 * sheet.width / 2100));
+    w.render();
+    CHECK(screen.px(10 + sheet.x + 5, 10 + sheet.y + 5) == 0xFFFFFFFF);          // paper
+    pv.set_sheet(hardware::PaperSize::A4, true, 42);                              // landscape: wider than high
+    CHECK(pv.sheet_rect().width > pv.sheet_rect().height && pv.sheet_rect().width <= 204);
+    pv.set_sheet(hardware::PaperSize::Letter, false, 42);
+    CHECK(std::abs(static_cast<int>(pv.sheet_rect().width * 2794 / 2159) - static_cast<int>(pv.sheet_rect().height)) <= 2);
+    pv.set_sheet(hardware::PaperSize::A4, false, 42);
+
+    // A text: its pages, the lines that have something on them, and bars where the characters are.
+    hardware::TextLayout layout(a);
+    const hardware::TextGeometry g = hardware::text_geometry(hardware::PaperSize::A4, false, 42);
+    CHECK(layout.layout("XXXXXXXXXX\n\n  XX XX\fsecond\n\nthird page\f", g.columns, g.lines) && layout.page_count() == 2);
+    pv.show_text(&layout);
+    CHECK(pv.page_count() == 2 && pv.page() == 0 && pv.drawn_lines(0) == 2 && pv.drawn_lines(1) == 2 && pv.drawn_lines(5) == 0);
+    w.render();
+    const Rect2D a0 = pv.printable_rect();
+    const int32_t line_h = static_cast<int32_t>(a0.height / g.lines);
+    CHECK(screen.px(10 + a0.x + 1, 10 + a0.y + line_h / 2) == 0xFF303030);       // the first line is a bar from the left margin
+    CHECK(screen.px(10 + a0.x + static_cast<int32_t>(a0.width) - 3, 10 + a0.y + line_h / 2) == 0xFFFFFFFF);   // not all the way across
+    CHECK(screen.px(10 + a0.x + 1, 10 + a0.y + line_h * 3 / 2 + line_h / 2) == 0xFFFFFFFF);   // the empty second line has none
+    pv.set_page(1);
+    CHECK(pv.page() == 1);
+    w.render();
+    CHECK(screen.px(10 + a0.x + 1, 10 + a0.y + line_h / 2) == 0xFF303030);       // page two starts with "second": a bar, shorter than the first page's
+    CHECK(screen.px(10 + a0.x + static_cast<int32_t>(a0.width) * 9 / 10, 10 + a0.y + line_h / 2) == 0xFFFFFFFF);
+    pv.set_page(9);
+    CHECK(pv.page() == 1);                                                         // clamped to the pages there are
+    pv.show_text(nullptr);
+    CHECK(pv.page_count() == 0 && pv.page() == 0);
+
+    // A picture: placed and halftoned like the print; black fills its part of the page.
+    std::vector<uint32_t> black(40 * 20, 0xFF000000);
+    graphics::Surface picture;
+    picture.pixels = ArrayView<uint32_t>(black.data(), black.size());
+    picture.width = 40;
+    picture.height = 20;
+    picture.pitch = 40;
+    pv.show_picture(&picture, hardware::Fit::Contain, hardware::Halftone::Threshold);
+    CHECK(pv.page_count() == 1 && pv.page() == 0);
+    w.render();
+    const Rect2D ar = pv.printable_rect();
+    const int32_t cx = 10 + ar.x + static_cast<int32_t>(ar.width) / 2, cy = 10 + ar.y + static_cast<int32_t>(ar.height) / 2;
+    CHECK(screen.px(cx, cy) == 0xFF202020);                                        // the middle of the picture
+    CHECK(screen.px(cx, 10 + ar.y + 2) == 0xFFFFFFFF);                              // contained: the page above and below it stays white
+    pv.show_picture(&picture, hardware::Fit::Stretch, hardware::Halftone::Threshold);
+    w.render();
+    CHECK(screen.px(cx, 10 + ar.y + 2) == 0xFF202020);                              // stretched: it fills the page
+    pv.show_picture(&picture, hardware::Fit::Contain, hardware::Halftone::ErrorDiffusion);
+    pv.set_bounds({10, 10, 120, 160});                                              // another size: drawn again
+    w.layout();
+    w.render();
+    pv.show_nothing();
+    CHECK(pv.page_count() == 0);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+struct FakePrintService final : desktop::IPrintService {
+  struct Printer {
+    const char* name;
+    bool color, duplex, present;
+    uint16_t papers, max_dpi;
+    uint8_t margin = 42;
+  };
+  Printer printers[3] = {{"Office laser", false, true, true, 0x03, 1200}, {"Color jet", true, false, true, 0x01, 600}, {"Gone", false, false, false, 0x03, 600}};
+  uint32_t count = 3;
+  uint32_t last_printer = 99;
+  std::string last_text, last_name;
+  uint32_t picture_w = 0, picture_h = 0;
+  desktop::PrintOptions last_options;
+  int jobs = 0;
+  const char* fail_with = nullptr;
+  uint32_t printer_count() override { return count; }
+  bool printer(uint32_t i, desktop::PrinterListing* out) override {
+    if (i >= count) return false;
+    *out = desktop::PrinterListing();
+    strncpy(out->name, printers[i].name, sizeof out->name - 1);
+    out->color = printers[i].color;
+    out->duplex = printers[i].duplex;
+    out->present = printers[i].present;
+    out->paper_sizes = printers[i].papers;
+    out->max_dpi = printers[i].max_dpi;
+    out->unprintable_mm10 = printers[i].margin;
+    out->pages_per_minute = 20;
+    return true;
+  }
+  uint32_t default_printer() override { return 0; }
+  bool print_text(uint32_t p, StringView text, StringView name, const desktop::PrintOptions& o, String* error) override {
+    if (fail_with) { error->assign(fail_with); return false; }
+    ++jobs;
+    last_printer = p;
+    last_text.assign(text.data(), text.size());
+    last_name.assign(name.data(), name.size());
+    last_options = o;
+    picture_w = picture_h = 0;
+    return true;
+  }
+  bool print_picture(uint32_t p, const graphics::Surface& pic, StringView name, const desktop::PrintOptions& o, String* error) override {
+    if (fail_with) { error->assign(fail_with); return false; }
+    ++jobs;
+    last_printer = p;
+    last_name.assign(name.data(), name.size());
+    last_options = o;
+    last_text.clear();
+    picture_w = pic.width;
+    picture_h = pic.height;
+    return true;
+  }
+};
+
+static void test_print_dialog() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    w.layout();
+    desktop::PrintDialog dlg(a);
+    using Kind = desktop::PrintDialog::Kind;
+    Closed2 closed;
+    FakePrintService service;
+
+    // Without a service there are no printers, and nothing can be printed.
+    CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && dlg.status_label().text().equals("No printers found.") && !dlg.print_button().enabled());
+    dlg.print_button().click();
+    CHECK(dlg.showing());
+    dlg.cancel_button().click();
+    CHECK(!dlg.showing() && !dlg.accepted() && closed.count == 1);
+    dlg.set_print_service(&service);
+
+    // The dialog lists the printers and shows the first (the default) with what it can do.
+    CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && !dlg.show(mgr, Kind::Text, "Print", closed.handler()));
+    w.layout();
+    CHECK(dlg.printer_box().item_count() == 3 && dlg.printer_box().item(1).equals("Color jet") && dlg.printer_box().selected_index() == 0);
+    CHECK(dlg.status_label().text().equals("Ready - black and white, duplex, up to 1200 dpi, 20 pages/min") && dlg.print_button().enabled());
+    CHECK(dlg.paper_box().item_count() == 2 && dlg.paper_box().selected_text().equals("A4") && dlg.paper_box().item(1).equals("Letter"));
+    CHECK(dlg.quality_box().item_count() == 3 && dlg.quality_box().selected_text().equals("600 dpi (normal)"));
+    CHECK(dlg.copies_box().value() == 1 && dlg.portrait_button().checked() && !dlg.landscape_button().checked() && !dlg.toner_box().checked());
+    CHECK(!dlg.picture_box().parent()->visible() && !dlg.stretch_box().parent()->visible());       // picture options are for pictures
+    // Another printer offers other things.
+    dlg.printer_box().set_selected_index(1);
+    CHECK(dlg.status_label().text().first(5).equals("Ready") && dlg.status_label().text().find("color") != StringView::npos);
+    CHECK(dlg.paper_box().item_count() == 1 && dlg.quality_box().item_count() == 2 && dlg.quality_box().selected_text().equals("600 dpi (normal)"));
+    dlg.printer_box().set_selected_index(2);              // one that is not there cannot be printed on
+    CHECK(dlg.status_label().text().first(13).equals("Not connected") && !dlg.print_button().enabled());
+    dlg.printer_box().set_selected_index(0);
+    CHECK(dlg.print_button().enabled());
+
+    // Choices come back as options.
+    dlg.paper_box().set_selected_index(1);
+    dlg.landscape_button().set_checked(true);
+    dlg.quality_box().set_selected_index(2);
+    dlg.copies_box().set_value(3);
+    dlg.toner_box().set_checked(true);
+    w.render();
+    dlg.print_button().click();
+    CHECK(!dlg.showing() && dlg.accepted() && closed.count == 2 && dlg.printer_index() == 0 && dlg.kind() == Kind::Text);
+    CHECK(dlg.options().paper == hardware::PaperSize::Letter && dlg.options().landscape && dlg.options().dpi == 1200 && dlg.options().copies == 3 && dlg.options().toner_save);
+
+    // A picture has more to choose; Enter prints, Escape cancels, and a typed copy count is taken.
+    CHECK(dlg.show(mgr, Kind::Picture, "Print Picture", closed.handler()) && dlg.title().equals("Print Picture"));
+    w.layout();
+    CHECK(dlg.picture_box().parent()->visible() && dlg.stretch_box().parent()->visible() && dlg.copies_box().value() == 1 && !dlg.landscape_button().checked() && !dlg.toner_box().checked());
+    dlg.printer_box().set_selected_index(1);
+    dlg.picture_box().set_selected_index(1);
+    dlg.stretch_box().set_checked(true);
+    w.set_focus(&dlg.copies_box().edit_box());
+    press(w, key::kA, modifier::kLeftControl);
+    type_char(w, '7');
+    press(w, key::kEnter);
+    CHECK(!dlg.showing() && dlg.accepted() && dlg.printer_index() == 1 && dlg.options().copies == 7 && dlg.options().halftone == hardware::Halftone::Threshold &&
+          dlg.options().fit == hardware::Fit::Stretch && dlg.options().dpi == 600);
+    CHECK(dlg.show(mgr, Kind::Picture, "Print", closed.handler()));
+    dlg.picture_box().set_selected_index(2);
+    dlg.print_button().click();
+    CHECK(dlg.options().halftone == hardware::Halftone::Ordered && dlg.options().fit == hardware::Fit::Contain);
+    CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()));
+    w.set_focus(&dlg.printer_box());
+    press(w, key::kEscape);
+    CHECK(!dlg.showing() && !dlg.accepted());
+
+    // A text with pages: the dialog counts them, shows them one at a time, and asks which to print.
+    {
+      String long_text(a);
+      for (int i = 0; i < 150; ++i) {
+        long_text.append("line ");
+        long_text.append_uint(static_cast<uint64_t>(i));
+        long_text.append("\n");
+      }
+      dlg.set_text(long_text.view());
+      CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()));
+      w.layout();
+      CHECK(dlg.page_count() == 3 && dlg.preview().page_count() == 3 && dlg.page_label().text().equals("Page 1 of 3"));   // 68 lines of A4 to a page
+      CHECK(dlg.all_pages_button().parent()->visible() && dlg.all_pages_button().checked() && !dlg.from_page_box().enabled() && !dlg.to_page_box().enabled());
+      CHECK(dlg.from_page_box().maximum() == 3 && dlg.to_page_box().maximum() == 3 && dlg.to_page_box().value() == 3);
+      CHECK(!dlg.previous_page_button().enabled() && dlg.next_page_button().enabled() && dlg.preview().drawn_lines(0) == 68);
+      dlg.next_page_button().click();
+      CHECK(dlg.preview().page() == 1 && dlg.page_label().text().equals("Page 2 of 3") && dlg.previous_page_button().enabled());
+      dlg.next_page_button().click();
+      CHECK(dlg.page_label().text().equals("Page 3 of 3") && !dlg.next_page_button().enabled() && dlg.preview().drawn_lines(2) == 150 - 136);
+      dlg.next_page_button().click();                          // at the end already
+      CHECK(dlg.preview().page() == 2);
+      dlg.previous_page_button().click();
+      CHECK(dlg.preview().page() == 1);
+      w.render();
+
+      // Paper and orientation change the pages: sideways pages hold fewer lines, so there are more of them.
+      dlg.landscape_button().set_checked(true);
+      CHECK(dlg.page_count() == 4 && dlg.to_page_box().maximum() == 4 && dlg.to_page_box().value() == 4 && dlg.preview().sheet_rect().width > dlg.preview().sheet_rect().height);
+      CHECK(dlg.preview().page() == 1 || dlg.preview().page() < 4);
+      dlg.portrait_button().set_checked(true);
+      CHECK(dlg.page_count() == 3);
+      dlg.paper_box().set_selected_index(1);                  // Letter: 11 inches tall
+      CHECK(dlg.page_count() == 3 && std::abs(static_cast<int>(dlg.preview().sheet_rect().height * 2159) - static_cast<int>(dlg.preview().sheet_rect().width * 2794)) < 3 * 2794);
+
+      // Choosing "From": the boxes wake up, keep in order, and the preview goes to the first page of the range.
+      dlg.page_range_button().set_checked(true);
+      CHECK(dlg.from_page_box().enabled() && dlg.to_page_box().enabled() && !dlg.all_pages_button().checked());
+      dlg.from_page_box().set_value(2);
+      CHECK(dlg.to_page_box().value() == 3 && dlg.preview().page() == 1);
+      dlg.to_page_box().set_value(1);                         // a last page before the first pulls the first back
+      CHECK(dlg.from_page_box().value() == 1 && dlg.to_page_box().value() == 1);
+      dlg.from_page_box().set_value(2);
+      dlg.to_page_box().set_value(2);
+      dlg.print_button().click();
+      CHECK(!dlg.showing() && dlg.accepted() && dlg.options().first_page == 2 && dlg.options().last_page == 2 && dlg.options().paper == hardware::PaperSize::Letter);
+
+      // "All" prints everything, whatever the boxes say.
+      CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()));
+      CHECK(dlg.all_pages_button().checked() && dlg.preview().page() == 0 && dlg.paper_box().selected_text().equals("A4"));
+      dlg.page_range_button().set_checked(true);
+      dlg.from_page_box().set_value(3);
+      dlg.all_pages_button().set_checked(true);
+      dlg.print_button().click();
+      CHECK(dlg.options().first_page == 1 && dlg.options().last_page == 0);
+
+      // The other printer's margins change the layout too (a bigger margin leaves fewer lines).
+      String longer(a);
+      for (int i = 0; i < 200; ++i) longer.append("x\n");
+      dlg.set_text(longer.view());
+      service.printers[1].margin = 200;
+      CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()));
+      const uint32_t pages_before = dlg.page_count();
+      CHECK(pages_before == 3);
+      dlg.printer_box().set_selected_index(1);
+      CHECK(dlg.page_count() > pages_before);
+      dlg.cancel_button().click();
+      service.printers[1].margin = 42;
+
+      // Short text: one page, and the page buttons are off. Nothing to print: nothing to preview.
+      dlg.set_text("hello\n");
+      CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && dlg.page_count() == 1 && dlg.page_label().text().equals("Page 1 of 1") &&
+            !dlg.previous_page_button().enabled() && !dlg.next_page_button().enabled());
+      dlg.cancel_button().click();
+      dlg.set_text(StringView());
+      CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && dlg.page_count() == 0 && dlg.page_label().text().equals("Nothing to preview"));
+      dlg.cancel_button().click();
+
+      // A picture is one page: its row of page choices goes, the preview shows the picture, and its options follow the dialog.
+      std::vector<uint32_t> px(30 * 30, 0xFF000000);
+      graphics::Surface picture;
+      picture.pixels = ArrayView<uint32_t>(px.data(), px.size());
+      picture.width = picture.height = picture.pitch = 30;
+      dlg.set_picture(&picture);
+      CHECK(dlg.show(mgr, Kind::Picture, "Print Picture", closed.handler()) && dlg.page_count() == 1 && dlg.page_label().text().equals("The page"));
+      w.layout();
+      CHECK(!dlg.all_pages_button().parent()->visible() && !dlg.next_page_button().enabled());
+      dlg.stretch_box().set_checked(true);
+      dlg.picture_box().set_selected_index(2);
+      dlg.landscape_button().set_checked(true);
+      w.render();
+      dlg.print_button().click();
+      CHECK(dlg.options().first_page == 1 && dlg.options().last_page == 0 && dlg.options().landscape && dlg.options().fit == hardware::Fit::Stretch);
+    }
+
+    // All printers gone.
+    service.count = 0;
+    CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && dlg.printer_box().item_count() == 0 && !dlg.print_button().enabled());
+    dlg.cancel_button().click();
+    CHECK(!mgr.has_modal());
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_print_and_color_flows() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    w.set_clipboard(&cb);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::PrintDialog print(a);
+    desktop::ColorDialog colors(a);
+    FakePrintService service;
+    print.set_print_service(&service);
+
+    // --- Text editor: File > Print...
+    {
+      desktop::Notepad np(a);
+      CHECK(mgr.add_window(&np));
+      w.layout();
+      MenuBar& bar = np.menu_bar();
+      CHECK(bar.find_item("File", "Print...") && bar.find_item("File", "Print...")->shortcut.view().equals("Ctrl+P"));
+      CHECK(choose(w, bar, "File", "Print...") && np.status_label().text().equals("No print dialog available."));
+      np.set_print_dialog(&print);
+      CHECK(choose(w, bar, "File", "Print...") && !print.showing() && np.status_label().text().equals("There is nothing to print."));
+      w.set_focus(&np.editor());
+      type_text(w, "print me");
+      CHECK(choose(w, bar, "File", "Print...") && print.showing() && print.kind() == desktop::PrintDialog::Kind::Text);
+      print.copies_box().set_value(2);
+      print.printer_box().set_selected_index(1);
+      print.print_button().click();
+      CHECK(!print.showing() && service.jobs == 1 && service.last_printer == 1 && service.last_text == "print me" && service.last_name == "Untitled" &&
+            service.last_options.copies == 2 && np.status_label().text().equals("Sent to the printer."));
+      press(w, key::kA + 15, modifier::kLeftControl);            // Ctrl+P
+      CHECK(print.showing());
+      print.cancel_button().click();
+      CHECK(service.jobs == 1);
+      // The editor's text is what the dialog previews, and a page range is passed on with the job.
+      np.editor().set_text("one\fpage two\fthree");
+      CHECK(choose(w, bar, "File", "Print...") && print.page_count() == 3 && print.page_label().text().equals("Page 1 of 3") && print.preview().drawn_lines(1) == 1);
+      print.page_range_button().set_checked(true);
+      print.from_page_box().set_value(2);
+      print.print_button().click();
+      CHECK(service.jobs == 2 && service.last_options.first_page == 2 && service.last_options.last_page == 3 && service.last_text == "one\fpage two\fthree");
+      service.jobs = 1;
+      service.fail_with = "The printer's queue is full.";
+      CHECK(choose(w, bar, "File", "Print..."));
+      print.print_button().click();
+      CHECK(np.status_label().text().equals("Cannot print: The printer's queue is full.") && service.jobs == 1);
+      service.fail_with = nullptr;
+      CHECK(choose(w, bar, "File", "Close"));
+    }
+
+    // --- Paint: File > Print... and Options > Primary / Secondary Color...
+    {
+      desktop::Paint paint(a);
+      CHECK(mgr.add_window(&paint));
+      w.layout();
+      MenuBar& bar = paint.menu_bar();
+      DrawingCanvas& c = paint.canvas();
+      CHECK(choose(w, bar, "File", "Print...") && paint.status_label().text().equals("No print dialog available."));
+      CHECK(choose(w, bar, "Options", "Primary Color...") && paint.status_label().text().equals("No color dialog available."));
+      paint.set_print_dialog(&print);
+      paint.set_color_dialog(&colors);
+      CHECK(choose(w, bar, "File", "Print...") && print.showing() && print.kind() == desktop::PrintDialog::Kind::Picture);
+      print.picture_box().set_selected_index(1);
+      print.print_button().click();
+      CHECK(!print.showing() && service.jobs == 2 && service.picture_w == 640 && service.picture_h == 480 && service.last_name == "Untitled" &&
+            service.last_options.halftone == hardware::Halftone::Threshold && paint.status_label().text().equals("Sent to the printer."));
+      // A picture still being placed is set down before it is printed.
+      paint.tools().select_tool(7);
+      c.select_rect(0, 0, 20, 20);
+      drag(w, pixel_point(c, 5, 5), pixel_point(c, 25, 25));
+      CHECK(c.floating());
+      CHECK(choose(w, bar, "File", "Print..."));
+      CHECK(!c.floating());
+      print.cancel_button().click();
+      // Colors: the dialog starts at the current color; OK sets it in the palette and the canvas.
+      CHECK(choose(w, bar, "Options", "Primary Color...") && colors.showing() && colors.title().equals("Primary Color") && colors.color() == paint.palette().primary());
+      colors.set_color(0xFF336699);
+      colors.ok_button().click();
+      CHECK(!colors.showing() && paint.palette().primary() == 0xFF336699 && c.primary() == 0xFF336699 && paint.color_picker().color() == 0xFF336699);
+      CHECK(choose(w, bar, "Options", "Secondary Color...") && colors.title().equals("Secondary Color") && colors.color() == 0xFFFFFFFF);
+      colors.set_color(0xFFFFEE00);
+      colors.cancel_button().click();                          // cancelled: nothing changes
+      CHECK(paint.palette().secondary() == 0xFFFFFFFF);
+      CHECK(choose(w, bar, "Options", "Secondary Color..."));
+      colors.hex_box().set_text("#FFEE00");
+      colors.ok_button().click();
+      CHECK(paint.palette().secondary() == 0xFFFFEE00 && c.secondary() == 0xFFFFEE00);
+      // What is drawn uses the new colors.
+      paint.tools().select_tool(0);
+      drag(w, pixel_point(c, 50, 50), pixel_point(c, 60, 50));
+      drag(w, pixel_point(c, 50, 52), pixel_point(c, 60, 52), MouseButton::Right);
+      CHECK(c.pixel(55, 50) == 0xFF336699 && c.pixel(55, 52) == 0xFFFFEE00);
+      press(w, key::kA + 15, modifier::kLeftControl);            // Ctrl+P
+      CHECK(print.showing());
+      print.cancel_button().click();
+      CHECK(choose(w, bar, "File", "Close"));
+    }
+    w.render();
   }
   CHECK(a.live == 0);
 }
@@ -2693,6 +3322,12 @@ int main() {
   test_list_copy();
   test_file_dialog();
   test_desktop_file_dialog();
+  test_spin_box();
+  test_color_spectrum();
+  test_color_dialog();
+  test_print_preview();
+  test_print_dialog();
+  test_print_and_color_flows();
   test_app_menus();
   test_select_all_keys();
   test_breadcrumb_bar();

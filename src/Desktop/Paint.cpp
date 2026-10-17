@@ -174,6 +174,8 @@ Paint::Paint(allocators::IAllocator& allocator)
     file->add_item("Save", {&Paint::on_save, this}, "Ctrl+S");
     file->add_item("Save As...", {&Paint::on_save_as, this}, "Ctrl+Shift+S");
     file->add_separator();
+    file->add_item("Print...", {&Paint::on_print, this}, "Ctrl+P");
+    file->add_separator();
     file->add_item("Close", {&Paint::on_close_window, this});
   }
   if (Menu* edit = menu_.add_menu("Edit")) {
@@ -193,7 +195,12 @@ Paint::Paint(allocators::IAllocator& allocator)
     view->add_separator();
     grid_item_ = view->add_item("Pixel Grid", {&Paint::on_toggle_grid, this});
   }
-  if (Menu* options = menu_.add_menu("Options")) filled_item_ = options->add_item("Filled Shapes", {&Paint::on_toggle_filled, this});
+  if (Menu* options = menu_.add_menu("Options")) {
+    filled_item_ = options->add_item("Filled Shapes", {&Paint::on_toggle_filled, this});
+    options->add_separator();
+    options->add_item("Primary Color...", {&Paint::on_primary_color, this});
+    options->add_item("Secondary Color...", {&Paint::on_secondary_color, this});
+  }
 
   // Options bar: brush size and the zoom shown.
   options_bar_.set_dock(DockStyle::Top);
@@ -411,6 +418,53 @@ void Paint::on_new(void* self, Control&) { static_cast<Paint*>(self)->new_pictur
 void Paint::on_save(void* self, Control&) { static_cast<Paint*>(self)->save_file(); }
 void Paint::on_open(void* self, Control&) { static_cast<Paint*>(self)->ask_open(); }
 void Paint::on_save_as(void* self, Control&) { static_cast<Paint*>(self)->ask_save_as(); }
+void Paint::on_print(void* self, Control&) { static_cast<Paint*>(self)->ask_print(); }
+void Paint::on_primary_color(void* self, Control&) { static_cast<Paint*>(self)->ask_color(false); }
+void Paint::on_secondary_color(void* self, Control&) { static_cast<Paint*>(self)->ask_color(true); }
+
+void Paint::ask_print() {
+  if (!print_dialog_ || !manager()) {
+    say("No print dialog available.");
+    return;
+  }
+  canvas_.commit_floating();  // a picture still being placed is part of what is printed
+  print_surface_ = canvas_.surface();
+  print_dialog_->set_picture(&print_surface_);   // for the preview
+  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Picture, "Print", {&Paint::on_print_picked, this})) say("The print dialog is busy.");
+}
+
+void Paint::on_print_picked(void* self, Control&) {
+  auto* p = static_cast<Paint*>(self);
+  PrintDialog& d = *p->print_dialog_;
+  if (!d.accepted() || !d.print_service()) return;
+  String error(p->allocator());
+  if (d.print_service()->print_picture(d.printer_index(), p->canvas_.surface(), p->name_.empty() ? StringView("Untitled") : p->name_.view(), d.options(), &error)) {
+    p->say("Sent to the printer.");
+  } else {
+    String message(p->allocator());
+    message.append("Cannot print: ");
+    message.append(error.view());
+    p->say(message.view());
+  }
+}
+
+void Paint::ask_color(bool secondary) {
+  if (!color_dialog_ || !manager()) {
+    say("No color dialog available.");
+    return;
+  }
+  choosing_secondary_ = secondary;
+  if (!color_dialog_->show(*manager(), secondary ? "Secondary Color" : "Primary Color", secondary ? palette_.secondary() : palette_.primary(),
+                           {&Paint::on_color_picked_by_dialog, this}))
+    say("The color dialog is busy.");
+}
+
+void Paint::on_color_picked_by_dialog(void* self, Control&) {
+  auto* p = static_cast<Paint*>(self);
+  if (!p->color_dialog_->accepted()) return;
+  if (p->choosing_secondary_) p->palette_.set_secondary(p->color_dialog_->color());
+  else p->palette_.set_primary(p->color_dialog_->color());
+}
 
 namespace {
 const FileDialog::Filter kPictureFilters[] = {
@@ -593,6 +647,7 @@ bool Paint::on_key(const KeyArgs& args) {
     switch (args.usage) {
       case key::kA + 13: new_picture(); return true;                 // N
       case key::kA + 14: ask_open(); return true;                    // O
+      case key::kA + 15: ask_print(); return true;                   // P
       case key::kA + 18:                                             // S
         if (args.modifiers & hardware::modifier::kShift) ask_save_as();
         else save_file();

@@ -16,15 +16,16 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The text editor application: a window with a menu bar (File: New, Open, Save, Save As, Close; Edit: Cut, Copy, Paste,
+// The text editor application: a window with a menu bar (File: New, Open, Save, Save As, Print, Close; Edit: Cut, Copy, Paste,
 // Select All), a TextEditor and a status bar showing the caret position and what the last command did. Open and Save As
 // pick the file in the shared FileDialog; Save writes to the file the text came from (or asks like Save As when there is
-// none). Ctrl+N, Ctrl+O, Ctrl+S and Ctrl+Shift+S do the same as the menu items. A
+// none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Shift+S and Ctrl+P do the same as the menu items. A
 // command that would throw away unsaved changes does nothing the first time (the status line says so) and
 // goes ahead when it is repeated. Files are read and written as plain bytes; a CR before a line break is dropped
 // on opening, so saved files always use LF.
 #pragma once
 #include "Desktop/FileDialog.hpp"
+#include "Desktop/PrintDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Menu.hpp"
@@ -45,6 +46,8 @@ class Notepad : public gui::Frame {
 
   // The dialog that Open and Save As use (nullptr: none, they then say so). It must outlive the editor.
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
+  // The dialog that Print uses (nullptr: none, Print then says so). It must outlive the editor.
+  void set_print_dialog(PrintDialog* dialog) { print_dialog_ = dialog; }
 
   // Starts an empty, unnamed document. False (and nothing changes) while there are unsaved changes the user has not
   // agreed to lose.
@@ -58,6 +61,8 @@ class Notepad : public gui::Frame {
   // The commands behind File > Open and File > Save As: they show the dialog and carry on when a file is picked.
   void ask_open();
   void ask_save_as();
+  // File > Print: the print dialog, then the text goes to the chosen printer.
+  void ask_print();
 
   StringView path() const { return path_.view(); }
   gui::TextEditor& editor() { return editor_; }
@@ -72,6 +77,8 @@ class Notepad : public gui::Frame {
   static void on_open(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
   static void on_save_as(void* self, gui::Control&);
+  static void on_print(void* self, gui::Control&);
+  static void on_print_picked(void* self, gui::Control&);
   static void on_open_picked(void* self, gui::Control&);
   static void on_save_picked(void* self, gui::Control&);
   static void on_close(void* self, gui::Control&);
@@ -96,6 +103,7 @@ class Notepad : public gui::Frame {
   gui::TextEditor editor_;
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
+  PrintDialog* print_dialog_ = nullptr;
   String path_;  // the file the text came from or was saved to (empty: none yet)
   String name_;  // its name as shown in the title
   bool discard_armed_ = false;

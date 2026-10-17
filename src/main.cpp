@@ -52,6 +52,7 @@
 #include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
 #include "SystemMonitor.hpp"
+#include "SystemPrintService.hpp"
 #include "uefi.hpp"
 
 // TCOS_SELFTESTS (cmake -DTCOS_SELFTESTS=ON) adds the boot-time self-checks and demos of every
@@ -576,6 +577,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     input.set_notifier(on_input_change, &input_hotplug);
     if (!input.start_service()) Entry(Level::Warning, "Input").text("could not start hot-plug polling; USB keyboards and mice plugged in later are not seen");
     SystemFileSystem explorer_files(shared_allocator, storage);
+    SystemPrintService print_service(shared_allocator, printers);
+    desktop.set_print_service(&print_service);
     desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());
     explorer_files.set_notifier(on_storage_change, &desktop);

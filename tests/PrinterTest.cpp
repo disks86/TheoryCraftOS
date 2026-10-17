@@ -24,7 +24,9 @@
 #include <string>
 #include <vector>
 #include "Hardware/Printer/Brother/BrotherHl2070n.hpp"
+#include "SystemPrintService.hpp"
 #include "Hardware/Printer/PrintJob.hpp"
+#include "Hardware/Printer/TextLayout.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/Printer/Usb/UsbPrinter.hpp"
 #include "Hardware/Printer/PrinterMonitor.hpp"
@@ -390,6 +392,149 @@ static void test_failures_and_registry() {
   CHECK(printers.count() == 0);
 }
 
+
+
+// The layout that the job prints and the preview shows, and printing a range of its pages.
+static std::string layout_line(const TextLayout& l, uint32_t page, uint32_t line) {
+  const ConstByteView v = l.line(page, line);
+  return std::string(reinterpret_cast<const char*>(v.data()), v.size());
+}
+
+static void test_text_layout() {
+  TestAllocator a;
+  const TextGeometry g = text_geometry(PaperSize::A4, false, 42);
+  CHECK(g.valid() && g.columns == (2100 - 84) * 10 / 254 && g.lines == (2970 - 84) * 6 / 254);
+  const TextGeometry sideways = text_geometry(PaperSize::A4, true, 42);
+  CHECK(sideways.columns == (2970 - 84) * 10 / 254 && sideways.lines == (2100 - 84) * 6 / 254 && sideways.columns > g.columns);
+  CHECK(!text_geometry(PaperSize::A6, false, 600).valid());   // margins bigger than the paper
+
+  TextLayout l(a);
+  CHECK(!l.layout("x", 9, 5) && !l.layout("x", 10, 4));        // pages too small
+  CHECK(l.layout("", 10, 5) && l.page_count() == 0);
+  CHECK(l.layout("Hello\nWorld\n", 20, 5) && l.page_count() == 1 && l.line_count(0) == 3);
+  CHECK(layout_line(l, 0, 0) == "Hello" && layout_line(l, 0, 1) == "World" && layout_line(l, 0, 2).empty() && layout_line(l, 0, 3).empty() && layout_line(l, 1, 0).empty());
+  CHECK(l.columns() == 20 && l.lines_per_page() == 5);
+  // Long lines wrap at the last column; a tab goes to the next multiple of eight.
+  CHECK(l.layout(std::string(25, 'W').c_str(), 10, 5) && l.line_count(0) == 3 && layout_line(l, 0, 0) == std::string(10, 'W') && layout_line(l, 0, 2) == std::string(5, 'W'));
+  CHECK(l.layout("a\tb", 20, 5) && layout_line(l, 0, 0) == "a       b");
+  // UTF-8 in, Latin-1 out; control characters are dropped; a lone CR does nothing.
+  CHECK(l.layout("caf\xC3\xA9 \xE2\x82\xAC\x01\r!", 20, 5) && layout_line(l, 0, 0) == "caf\xE9 ?!");
+  // A page ends after its last line; a text ending exactly there has no empty page after it.
+  CHECK(l.layout("a\nb\nc\nd\ne\nf\n", 10, 5) && l.page_count() == 2 && l.line_count(0) == 5 && layout_line(l, 0, 4) == "e" && l.line_count(1) == 2 && layout_line(l, 1, 0) == "f");
+  CHECK(l.layout("a\nb\nc\nd\ne\n", 10, 5) && l.page_count() == 1 && l.line_count(0) == 5);
+  CHECK(l.layout("a\fb\f\fc", 10, 5) && l.page_count() == 3 && layout_line(l, 0, 0) == "a" && layout_line(l, 1, 0) == "b" && layout_line(l, 2, 0) == "c");
+
+  // A job prints the pages asked for.
+  const PrinterInfo& info = BrotherHl2070n::model_info();
+  JobSettings s;
+  const char* text = "page one\fpage two\fpage three";
+  auto run = [&](uint32_t first, uint32_t last, std::string* out) {
+    PrintJob job(a, info, s);
+    CHECK(job.begin() && job.add_text(text, first, last) && job.finish());
+    *out = std::string(reinterpret_cast<const char*>(job.bytes().data()), job.bytes().size());
+    return job.pages();
+  };
+  std::string out;
+  CHECK(run(1, 0, &out) == 3 && out.find("page one") != std::string::npos && out.find("page three") != std::string::npos);
+  CHECK(run(2, 2, &out) == 1 && out.find("page one") == std::string::npos && out.find("page two") != std::string::npos && out.find("page three") == std::string::npos);
+  CHECK(run(2, 0, &out) == 2 && out.find("page one") == std::string::npos && out.find("page three") != std::string::npos);
+  CHECK(run(1, 99, &out) == 3);                                   // a range past the end stops at the end
+  CHECK(run(5, 9, &out) == 0 && out.find("page") == std::string::npos);   // nothing in it: nothing is printed
+}
+
+// ---- The print service (what the print dialog talks to) ----
+
+struct RecordingPrinter final : IPrinter {
+  PrinterInfo printer_info;
+  std::vector<uint8_t> job;
+  std::string job_name;
+  int submits = 0;
+  bool here = true, accepting = true;
+  const char* name() const override { return "Fake Laser"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool present() const override { return here; }
+  const PrinterInfo& info() const override { return printer_info; }
+  PrinterState state() const override { return PrinterState::Ready; }
+  bool submit(ConstByteView bytes, const char* name_of_job) override {
+    ++submits;
+    if (!accepting) return false;
+    job.assign(bytes.data(), bytes.data() + bytes.size());
+    job_name = name_of_job;
+    return true;
+  }
+  void poll() override {}
+  uint32_t pending_jobs() const override { return 0; }
+  void cancel_all() override {}
+  PrinterStatistics statistics() const override { return {}; }
+};
+
+static bool contains_text(const std::vector<uint8_t>& bytes, const char* text) {
+  return std::string(bytes.begin(), bytes.end()).find(text) != std::string::npos;
+}
+
+static void test_print_service() {
+  TestAllocator a;
+  SystemPrinters printers(a);
+  UniquePointer<RecordingPrinter> owned = UniquePointer<RecordingPrinter>::make(a);
+  RecordingPrinter* fake = owned.get();
+  fake->printer_info.manufacturer = "Fake";
+  fake->printer_info.model = "Laser";
+  fake->printer_info.languages = 1u << static_cast<uint8_t>(PrinterLanguage::Pcl);
+  fake->printer_info.paper_sizes = (1u << static_cast<uint8_t>(PaperSize::A4)) | (1u << static_cast<uint8_t>(PaperSize::Letter));
+  fake->printer_info.max_dpi = 600;
+  fake->printer_info.duplex = true;
+  CHECK(printers.add(UniquePointer<IPrinter>(static_cast<UniquePointer<RecordingPrinter>&&>(owned))));
+  SystemPrintService service(a, printers);
+
+  CHECK(service.printer_count() == 1 && service.default_printer() == 0);
+  desktop::PrinterListing listing;
+  CHECK(service.printer(0, &listing) && strcmp(listing.name, "Fake Laser") == 0 && listing.duplex && !listing.color && listing.pcl && listing.present);
+  CHECK(listing.max_dpi == 600 && (listing.paper_sizes & (1u << static_cast<uint8_t>(PaperSize::Letter))) && !service.printer(3, &listing));
+
+  // Text becomes a PCL job on the printer's queue.
+  desktop::PrintOptions options;
+  options.paper = PaperSize::Letter;
+  options.copies = 2;
+  options.dpi = 1200;                                    // more than the printer does: it prints at its best
+  String error(a);
+  CHECK(service.print_text(0, "Hello printer\n", "my doc", options, &error) && fake->submits == 1);
+  CHECK(fake->job_name == "my doc" && contains_text(fake->job, "@PJL") && contains_text(fake->job, "Hello printer") && contains_text(fake->job, "RESOLUTION=600"));
+  // Only the pages asked for are printed; a range with no pages is an error.
+  desktop::PrintOptions ranged = options;
+  ranged.first_page = 2;
+  ranged.last_page = 2;
+  CHECK(service.print_text(0, "one\ftwo\fthree", "r", ranged, &error) && contains_text(fake->job, "two") && !contains_text(fake->job, "one") && !contains_text(fake->job, "three"));
+  const int jobs_before = fake->submits;
+  ranged.first_page = 9;
+  ranged.last_page = 0;
+  CHECK(!service.print_text(0, "one\ftwo", "r", ranged, &error) && error.view().equals("There are no pages in that range.") && fake->submits == jobs_before);
+  // A picture is halftoned onto a page.
+  std::vector<uint32_t> black(40 * 30, 0xFF000000);
+  graphics::Surface picture;
+  picture.pixels = ArrayView<uint32_t>(black.data(), black.size());
+  picture.width = 40;
+  picture.height = 30;
+  picture.pitch = 40;
+  desktop::PrintOptions picture_options;
+  CHECK(service.print_picture(0, picture, "a picture", picture_options, &error) && fake->submits == jobs_before + 1 && fake->job_name == "a picture" && fake->job.size() > 100);
+  CHECK(contains_text(fake->job, "@PJL") && !contains_text(fake->job, "Hello printer"));
+  // What cannot be done is reported.
+  desktop::PrintOptions legal;
+  legal.paper = PaperSize::Legal;
+  CHECK(!service.print_text(0, "x", "j", legal, &error) && error.view().equals("This printer does not have that paper size.") && fake->submits == jobs_before + 1);
+  CHECK(!service.print_text(7, "x", "j", options, &error) && error.view().equals("There is no such printer."));
+  fake->accepting = false;
+  CHECK(!service.print_text(0, "x", "j", options, &error) && error.view().equals("The printer's queue is full."));
+  fake->accepting = true;
+  fake->here = false;
+  CHECK(!service.print_picture(0, picture, "j", picture_options, &error) && error.view().equals("The printer is not connected."));
+  CHECK(service.printer(0, &listing) && !listing.present);
+  fake->here = true;
+  fake->printer_info.languages = 1u << static_cast<uint8_t>(PrinterLanguage::PostScript);
+  CHECK(!service.print_text(0, "x", "j", options, &error) && error.view().equals("This printer does not understand PCL."));
+  printers.shutdown();
+}
 
 // ---- USB ----
 
@@ -1961,6 +2106,8 @@ int main() {
   test_raw_delivery();
   test_lpd_delivery();
   test_failures_and_registry();
+  test_text_layout();
+  test_print_service();
   test_device_id();
   test_usb_printer();
   test_usb_variants();

@@ -124,80 +124,32 @@ bool PrintJob::add_page(const PageBitmap& page) {
   return true;
 }
 
-// Text is laid out here, a page at a time, and printed in a fixed-pitch font so the layout is what the printer prints.
-bool PrintJob::add_text(StringView text) {
+// Text is laid out by TextLayout (the same layout the print preview shows) and printed in a fixed-pitch font so the layout is what the
+// printer prints. Only the pages from `first_page` to `last_page` (counted from 1; 0 for the last means to the end) are printed.
+bool PrintJob::add_text(StringView text, uint32_t first_page, uint32_t last_page) {
   if (!begun_ || finished_ || failed_) return false;
   if (settings_.language != PrinterLanguage::Pcl) return fail();
-  const uint32_t width_mm10 = (settings_.landscape ? paper_info(settings_.paper).height_mm10 : paper_info(settings_.paper).width_mm10) - 2 * printer_.unprintable_mm10;
-  const uint32_t height_mm10 = (settings_.landscape ? paper_info(settings_.paper).width_mm10 : paper_info(settings_.paper).height_mm10) - 2 * printer_.unprintable_mm10;
-  const uint32_t columns = width_mm10 * 10 / 254, lines = height_mm10 * 6 / 254;  // 10 characters and 6 lines per inch
-  if (columns < 10 || lines < 5) return fail();
-  uint32_t column = 0, line = 0;
-  bool page_open = false;
-  auto open_page = [&]() {
-    if (!page_open) {
-      if (!page_header()) return false;
-      // Latin-1 (Windows 19U), Courier-like fixed pitch at 10 cpi, 6 lpi, no top margin, LF as CR+LF.
-      bool ok = out_.put8(kEsc) && put("(19U") && out_.put8(kEsc) && put("(s0p10h12v0s0b3T") && out_.put8(kEsc) && put("&l6D") &&
-                out_.put8(kEsc) && put("&l0E") && out_.put8(kEsc) && put_number("&l", lines, "F") && out_.put8(kEsc) && put("&k2G") &&
-                out_.put8(kEsc) && put("&a0L") && out_.put8(kEsc) && put("*p0X") && out_.put8(kEsc) && put("*p0Y");
-      if (!ok) return false;
-      page_open = true;
-      column = line = 0;
+  const TextGeometry geometry = text_geometry(settings_.paper, settings_.landscape, printer_.unprintable_mm10);
+  if (!geometry.valid()) return fail();
+  TextLayout layout(allocator_);
+  if (!layout.layout(text, geometry.columns, geometry.lines)) return fail();
+  if (first_page == 0) first_page = 1;
+  if (last_page == 0 || last_page > layout.page_count()) last_page = layout.page_count();
+  for (uint32_t page = first_page - 1; page < last_page; ++page) {
+    if (!page_header()) return fail();
+    // Latin-1 (Windows 19U), Courier-like fixed pitch at 10 cpi, 6 lpi, no top margin, LF as CR+LF.
+    bool ok = out_.put8(kEsc) && put("(19U") && out_.put8(kEsc) && put("(s0p10h12v0s0b3T") && out_.put8(kEsc) && put("&l6D") && out_.put8(kEsc) &&
+              put("&l0E") && out_.put8(kEsc) && put_number("&l", geometry.lines, "F") && out_.put8(kEsc) && put("&k2G") && out_.put8(kEsc) &&
+              put("&a0L") && out_.put8(kEsc) && put("*p0X") && out_.put8(kEsc) && put("*p0Y");
+    for (uint32_t line = 0; ok && line < layout.line_count(page); ++line) {
+      if (line > 0) ok = put("\r\n");
+      ok = ok && out_.append(layout.line(page, line));
     }
-    return true;
-  };
-  auto eject = [&]() {
-    if (!page_open) return true;
-    page_open = false;
-    ++pages_;
-    return put("\f");
-  };
-  auto newline = [&]() {
-    column = 0;
-    if (++line >= lines) return eject();
-    return put("\r\n");
-  };
-  auto emit = [&](uint32_t c) {  // one character to the current position, wrapping
-    if (column >= columns && !newline()) return false;
-    if (!open_page()) return false;
-    ++column;
-    return out_.put8(static_cast<uint8_t>(c));
-  };
-  const uint8_t* d = reinterpret_cast<const uint8_t*>(text.data());
-  for (uint64_t i = 0; i < text.size(); ++i) {
-    uint32_t c = d[i];
-    if (c >= 0xC0 && c < 0xF8) {  // UTF-8 sequence -> code point
-      const uint32_t extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
-      uint32_t cp = c & (0x3F >> extra);
-      uint32_t k = 0;
-      while (k < extra && i + 1 < text.size() && (d[i + 1] & 0xC0) == 0x80) {
-        cp = (cp << 6) | (d[++i] & 0x3F);
-        ++k;
-      }
-      c = cp < 256 ? cp : '?';
-    } else if (c >= 0x80) {
-      c = '?';
-    }
-    bool ok = true;
-    if (c == '\n') {
-      if (!page_open && !open_page()) return fail();
-      ok = newline();
-    } else if (c == '\r') {
-      if (page_open) {
-        column = 0;
-        ok = put("\r");
-      }
-    } else if (c == '\f') {
-      ok = eject();
-    } else if (c == '\t') {
-      do ok = emit(' '); while (ok && column % 8 != 0 && column < columns);
-    } else if (c >= 0x20 && c != 0x7f && !(c >= 0x80 && c < 0xA0)) {
-      ok = emit(c);
-    }
+    ok = ok && put("\f");
     if (!ok) return fail();
+    ++pages_;
   }
-  return eject() ? true : fail();
+  return true;
 }
 
 bool PrintJob::add_postscript(ConstByteView program) {

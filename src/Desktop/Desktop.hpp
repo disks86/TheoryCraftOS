@@ -24,7 +24,9 @@
 // power-off once the desktop loop returns.
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
+#include "Desktop/ColorDialog.hpp"
 #include "Desktop/FileDialog.hpp"
+#include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
@@ -84,6 +86,11 @@ class Desktop {
   Paint& paint() { return paint_; }
   // The Open and Save As dialog that the text editor and Paint share.
   FileDialog& file_dialog() { return file_dialog_; }
+  // The color and print dialogs the programs share.
+  ColorDialog& color_dialog() { return color_dialog_; }
+  PrintDialog& print_dialog() { return print_dialog_; }
+  // The printers the print dialog offers and sends jobs to (nullptr: none). It must outlive the desktop.
+  void set_print_service(IPrintService* service) { print_dialog_.set_print_service(service); }
   // Opens the paint program, or brings it forward (restoring it if minimized).
   void open_paint();
   Notepad& notepad() { return notepad_; }
@@ -149,6 +156,8 @@ class Desktop {
   gui::Label clock_;
   gui::MessageDialog shutdown_dialog_;
   FileDialog file_dialog_;
+  ColorDialog color_dialog_;
+  PrintDialog print_dialog_;
   FileExplorer explorer_;
   TaskManager task_manager_;
   Notepad notepad_;

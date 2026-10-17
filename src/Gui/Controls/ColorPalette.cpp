@@ -78,7 +78,7 @@ void ColorPalette::swap_colors() {
 
 Rect2D ColorPalette::swatch_rect(uint32_t index) const {
   const uint32_t per_row = columns() ? columns() : 1, row = index / per_row, column = index % per_row;
-  const int32_t left = 2 * kPad + kIndicator + kPad;
+  const int32_t left = indicator_ ? 2 * kPad + kIndicator + kPad : kPad;
   return {left + static_cast<int32_t>(column) * (kSwatch + kGap), kPad + static_cast<int32_t>(row) * (kSwatch + kGap),
           static_cast<uint32_t>(kSwatch), static_cast<uint32_t>(kSwatch)};
 }
@@ -93,11 +93,13 @@ void ColorPalette::paint(Painter& painter) {
   const Theme& t = painter.theme();
   painter.fill({0, 0, bounds_.width, bounds_.height}, t.face);
   // The two colors in use: the secondary behind, the primary in front.
-  const Rect2D sec = secondary_rect(), pri = primary_rect();
-  painter.fill(sec, secondary_);
-  painter.bevel(sec, true);
-  painter.fill(pri, primary_);
-  painter.bevel(pri, true);
+  if (indicator_) {
+    const Rect2D sec = secondary_rect(), pri = primary_rect();
+    painter.fill(sec, secondary_);
+    painter.bevel(sec, true);
+    painter.fill(pri, primary_);
+    painter.bevel(pri, true);
+  }
   for (uint32_t i = 0; i < colors_.count(); ++i) {
     const Rect2D r = swatch_rect(i);
     painter.fill(r, colors_[i]);
@@ -111,7 +113,7 @@ void ColorPalette::on_mouse_down(const MouseArgs& args) {
   if (swatch >= 0) {
     if (args.button == MouseButton::Left) set_primary(colors_[static_cast<uint32_t>(swatch)]);
     else set_secondary(colors_[static_cast<uint32_t>(swatch)]);
-  } else if (contains(indicator_rect(), args.x, args.y)) {
+  } else if (indicator_ && contains(indicator_rect(), args.x, args.y)) {
     swap_colors();
   }
 }
