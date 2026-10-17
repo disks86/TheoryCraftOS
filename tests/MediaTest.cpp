@@ -109,9 +109,11 @@ static void test_fixtures() {
       snprintf(ref_path, sizeof ref_path, "tests/data/%s", reference);
       File ref(ref_path);
       AudioData au(a);
-      // (ffmpeg leaves out a last MPEG audio frame it cannot confirm by a following header: allow up to one more frame.)
-      ok = ref.data && decode_audio(file.view(), &au) && au.format().sample_rate == x && au.format().channels == y && au.frame_count() >= z && au.frame_count() <= z + 1152;
-      for (uint64_t i = 0; ok && i < static_cast<uint64_t>(ref.size) / 2; ++i) {
+      // (ffmpeg leaves out a last MPEG audio frame it cannot confirm by a following header, and does not cut MP4 audio at its edit list's
+      // end: the lengths may differ by a frame or two. The samples both have must agree.)
+      ok = ref.data && decode_audio(file.view(), &au) && au.format().sample_rate == x && au.format().channels == y && au.frame_count() + 2304 >= z && au.frame_count() <= z + 2304;
+      const uint64_t common = ok ? (au.frame_count() < z ? au.frame_count() : z) * y : 0;
+      for (uint64_t i = 0; ok && i < common; ++i) {
         const int d = au.samples()[i] - static_cast<int16_t>(ref.data[i * 2] | ref.data[i * 2 + 1] << 8);
         ok = d >= -2 && d <= 2;
       }
@@ -122,7 +124,7 @@ static void test_fixtures() {
     if (!ok) { printf("FAILED fixture %s\n", name); ++g_failed; }
   }
   fclose(m);
-  CHECK(count >= 68);
+  CHECK(count >= 73);
   {  // Ogg Opus shares the container with Vorbis but is a different codec: not Vorbis, not decoded.
     File opus("tests/data/opus.ogg");
     AudioData au(a);
@@ -274,7 +276,7 @@ static void test_audio_roundtrip() {
 static void test_fuzz() {
   TestAllocator a;
   const char* names[] = {"rgb.png", "rgba16.png", "anim.apng", "rgb.jpg", "progressive.jpg", "rle8.bmp", "rgba32.bmp", "anim.gif", "interlaced.gif", "rgba.qoi", "rgb.ppm",
-                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "lossy.webp", "lossy_alpha.webp", "anim.webp", "anim_lossy.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg", "stereo.mp3", "mono.mp3", "lsf.mp2", "layer1.mp1"};
+                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "lossy.webp", "lossy_alpha.webp", "anim.webp", "anim_lossy.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg", "stereo.mp3", "mono.mp3", "lsf.mp2", "layer1.mp1", "stereo.aac", "mono.m4a", "stereo.mov", "mp3.mp4"};
   uint32_t seed = 2024;
   auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
   for (const char* name : names) {

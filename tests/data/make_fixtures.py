@@ -248,6 +248,17 @@ def layer1_stream(frames, bitrate_idx=12, sr_idx=1):
         body = (acc << pad).to_bytes((nbits + pad) // 8, "big")
         out += bytes([0xFF, 0xFF, (bitrate_idx << 4) | (sr_idx << 2), 0]) + body + bytes(size - 4 - len(body))
     return bytes(out)
+# AAC: about two seconds (the source looped), so that the encoder uses long and short blocks, noise substitution and intensity stereo.
+def ff_audio_long(out, *args, mono=False):
+    run("ffmpeg", "-v", "error", "-y", "-stream_loop", "9", "-f", "s16le", "-ar", "11025", "-ac", "2", "-i", "src.raw", "-ac", "1" if mono else "2", *args, out)
+ff_audio_long("stereo.aac", "-acodec", "aac", "-b:a", "48k")
+add_tolerance_fixture("stereo.aac", 11025, 2)
+ff_audio_long("mono.m4a", "-acodec", "aac", "-b:a", "24k", mono=True)
+add_tolerance_fixture("mono.m4a", 11025, 1)
+ff_audio_long("stereo.mov", "-acodec", "aac", "-b:a", "64k")
+add_tolerance_fixture("stereo.mov", 11025, 2)
+ff_audio_long("mp3.mp4", "-acodec", "libmp3lame", "-b:a", "48k", "-ar", "22050")   # MP3 inside MP4 (MPEG-1/2 audio only: not MPEG-2.5)
+add_tolerance_fixture("mp3.mp4", 22050, 2)
 open("layer1.mp1", "wb").write(layer1_stream(20))
 add_tolerance_fixture("layer1.mp1", 48000, 2)
 ff_audio("opus.ogg", "-acodec", "libopus", "-b:a", "48k")   # a codec that is not here: must be refused, not misread

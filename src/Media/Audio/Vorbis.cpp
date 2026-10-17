@@ -22,6 +22,7 @@
 // stream is read, the rest of the file is ignored), Ogg page checksums (not verified).
 #include "Math/FloatMath.hpp"
 #include "Media/AudioCodecs.hpp"
+#include "Media/Audio/Mdct.hpp"
 
 namespace media {
 
@@ -269,50 +270,16 @@ void init_db_table() {
   g_db_ready = true;
 }
 
-// An inverse MDCT of size n (n/2 coefficients in, n samples out) through a DCT-IV computed by a complex FFT of n/8 points... see imdct().
+// The rising half of the power-sine window of a block of n samples.
 struct MdctPlan {
-  uint32_t n = 0;
-  float* pre_re = nullptr;
-  float* pre_im = nullptr;
-  float* post_re = nullptr;
-  float* post_im = nullptr;
-  float* fft_re = nullptr;  // twiddles of the radix-2 FFT of size n/4
-  float* fft_im = nullptr;
-  uint32_t* bitrev = nullptr;
-  float* window_slope = nullptr;  // rising half-window of n/2 samples
+  float* window_slope = nullptr;
 };
 
 bool make_plan(Arena& arena, uint32_t n, MdctPlan* p) {
-  const uint32_t m = n / 2, h = m / 2;  // m coefficients; the FFT has h points
-  p->n = n;
-  p->pre_re = arena.make<float>(h);
-  p->pre_im = arena.make<float>(h);
-  p->post_re = arena.make<float>(h);
-  p->post_im = arena.make<float>(h);
-  p->fft_re = arena.make<float>(h / 2 + 1);
-  p->fft_im = arena.make<float>(h / 2 + 1);
-  p->bitrev = arena.make<uint32_t>(h);
+  const uint32_t m = n / 2;
   p->window_slope = arena.make<float>(m);
-  if (!p->pre_re || !p->pre_im || !p->post_re || !p->post_im || !p->fft_re || !p->fft_im || !p->bitrev || !p->window_slope) return false;
+  if (!p->window_slope) return false;
   const double pi = 3.14159265358979323846;
-  for (uint32_t i = 0; i < h; ++i) {
-    const double a = -pi * (4.0 * i + 1.0) / (4.0 * m), b = -pi * i / m;
-    p->pre_re[i] = static_cast<float>(fmath::cos(a));
-    p->pre_im[i] = static_cast<float>(fmath::sin(a));
-    p->post_re[i] = static_cast<float>(fmath::cos(b));
-    p->post_im[i] = static_cast<float>(fmath::sin(b));
-  }
-  for (uint32_t i = 0; i <= h / 2; ++i) {
-    const double a = -2.0 * pi * i / h;
-    p->fft_re[i] = static_cast<float>(fmath::cos(a));
-    p->fft_im[i] = static_cast<float>(fmath::sin(a));
-  }
-  const uint32_t bits = ilog(h) - 1;
-  for (uint32_t i = 0; i < h; ++i) {
-    uint32_t r = 0;
-    for (uint32_t k = 0; k < bits; ++k) r |= ((i >> k) & 1u) << (bits - 1 - k);
-    p->bitrev[i] = r;
-  }
   for (uint32_t i = 0; i < m; ++i) {
     const double s = fmath::sin(pi / 2.0 * (i + 0.5) / m);
     p->window_slope[i] = static_cast<float>(fmath::sin(pi / 2.0 * s * s));
@@ -320,45 +287,11 @@ bool make_plan(Arena& arena, uint32_t n, MdctPlan* p) {
   return true;
 }
 
-// Inverse MDCT of the m = n/2 coefficients in `x` into n samples in `y` (Vorbis' definition, unscaled). `re`/`im` are h = m/2 floats of scratch.
-void imdct(const MdctPlan& p, const float* x, float* y, float* re, float* im, float* z) {
-  const uint32_t m = p.n / 2, h = m / 2;
-  // DCT-IV of x via an h-point complex FFT: pair x[2k] with x[m-1-2k], rotate, transform, rotate, unpack.
-  for (uint32_t k = 0; k < h; ++k) {
-    const float a = x[2 * k], b = x[m - 1 - 2 * k];
-    const uint32_t d = p.bitrev[k];
-    re[d] = a * p.pre_re[k] - b * p.pre_im[k];
-    im[d] = a * p.pre_im[k] + b * p.pre_re[k];
-  }
-  for (uint32_t size = 2; size <= h; size <<= 1) {
-    const uint32_t half = size / 2, step = h / size;
-    for (uint32_t start = 0; start < h; start += size)
-      for (uint32_t j = 0; j < half; ++j) {
-        const float wr = p.fft_re[j * step], wi = p.fft_im[j * step];
-        const uint32_t u = start + j, v = u + half;
-        const float tr = re[v] * wr - im[v] * wi, ti = re[v] * wi + im[v] * wr;
-        re[v] = re[u] - tr;
-        im[v] = im[u] - ti;
-        re[u] += tr;
-        im[u] += ti;
-      }
-  }
-  for (uint32_t k = 0; k < h; ++k) {
-    const float ur = re[k] * p.post_re[k] - im[k] * p.post_im[k], ui = re[k] * p.post_im[k] + im[k] * p.post_re[k];
-    z[2 * k] = ur;
-    z[m - 1 - 2 * k] = -ui;
-  }
-  // The MDCT's output is the DCT-IV result unfolded to twice the length.
-  for (uint32_t i = 0; i < m / 2; ++i) y[i] = z[m / 2 + i];
-  for (uint32_t i = m / 2; i < 3 * m / 2; ++i) y[i] = -z[3 * m / 2 - 1 - i];
-  for (uint32_t i = 3 * m / 2; i < 2 * m; ++i) y[i] = -z[i - 3 * m / 2];
-}
-
 constexpr float kScale = 32768.0f;
 
 class Decoder {
  public:
-  explicit Decoder(allocators::IAllocator& allocator) : allocator_(allocator), arena_(allocator), pcm_(allocator) {}
+  explicit Decoder(allocators::IAllocator& allocator) : allocator_(allocator), arena_(allocator), pcm_(allocator), mdct0_(allocator), mdct1_(allocator) {}
   ~Decoder() {
     allocator_.deallocate(work_);
     allocator_.deallocate(classes_);
@@ -393,13 +326,14 @@ class Decoder {
   Mode modes_[64];
   uint32_t mode_count_ = 0;
   MdctPlan plans_[2];
+  Mdct mdct0_, mdct1_;
   // Per-packet working memory, one block of allocation carved up in prepare().
   uint8_t* work_ = nullptr;
   float* floor_[kMaxChannels] = {};
   float* spectrum_[kMaxChannels] = {};
   float* overlap_[kMaxChannels] = {};
   float* time_ = nullptr;
-  float *scratch_re_ = nullptr, *scratch_im_ = nullptr, *scratch_z_ = nullptr, *window_ = nullptr;
+  float* window_ = nullptr;
   uint8_t* classes_ = nullptr;
   uint64_t classes_size_ = 0;
   bool have_previous_ = false;
@@ -574,9 +508,9 @@ bool Decoder::read_setup(Bits& b) {
 // Plans and working memory for both block sizes.
 bool Decoder::prepare() {
   init_db_table();
-  if (!make_plan(arena_, blocksize_[0], &plans_[0]) || !make_plan(arena_, blocksize_[1], &plans_[1])) return false;
+  if (!make_plan(arena_, blocksize_[0], &plans_[0]) || !make_plan(arena_, blocksize_[1], &plans_[1]) || !mdct0_.init(blocksize_[0]) || !mdct1_.init(blocksize_[1])) return false;
   const uint32_t max_n = blocksize_[1], half = max_n / 2;
-  const uint64_t floats = uint64_t{channels_} * (2 * half + max_n) + max_n + half + half + half + max_n;
+  const uint64_t floats = uint64_t{channels_} * (2 * half + max_n) + max_n + max_n;
   work_ = static_cast<uint8_t*>(allocator_.allocate(floats * sizeof(float) + 64));
   if (!work_) return false;
   float* at = reinterpret_cast<float*>((reinterpret_cast<uintptr_t>(work_) + 15) & ~uintptr_t{15});
@@ -587,9 +521,6 @@ bool Decoder::prepare() {
     overlap_[c] = at; at += max_n;
   }
   time_ = at; at += max_n;
-  scratch_re_ = at; at += half;
-  scratch_im_ = at; at += half;
-  scratch_z_ = at; at += half;
   window_ = at; at += max_n;
   prepared_ = true;
   return true;
@@ -841,7 +772,7 @@ bool Decoder::audio_packet(Bits& b) {
     float* acc = overlap_[c];
     if (!unused[c]) {
       for (uint32_t i = 0; i < half; ++i) spectrum_[c][i] *= floor_[c][i];
-      imdct(plan, spectrum_[c], time_, scratch_re_, scratch_im_, scratch_z_);
+      (mode.blockflag ? mdct1_ : mdct0_).inverse(spectrum_[c], time_);
       if (!have_previous_) {
         for (uint32_t i = 0; i < half; ++i) acc[i] = time_[half + i] * window_[half + i];
       } else {

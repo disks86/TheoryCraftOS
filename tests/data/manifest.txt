@@ -69,4 +69,8 @@ audiotol mono.ogg 11025 1 2205 mono.ogg.ref
 audiotol stereo.mp3 11025 2 2205 stereo.mp3.ref
 audiotol mono.mp3 11025 1 2205 mono.mp3.ref
 audiotol lsf.mp2 22050 2 4608 lsf.mp2.ref
+audiotol stereo.aac 11025 2 23552 stereo.aac.ref
+audiotol mono.m4a 11025 1 22528 mono.m4a.ref
+audiotol stereo.mov 11025 2 22528 stereo.mov.ref
+audiotol mp3.mp4 22050 2 44399 mp3.mp4.ref
 audiotol layer1.mp1 48000 2 7680 layer1.mp1.ref

@@ -44,6 +44,9 @@ bool decode_flac(ConstByteView data, AudioData* out);
 bool encode_flac(const AudioData& audio, ByteBuffer* out);
 bool decode_vorbis(ConstByteView data, AudioData* out);
 bool decode_mp3(ConstByteView data, AudioData* out);
+bool decode_aac(ConstByteView data, AudioData* out);  // an ADTS stream (.aac)
+bool looks_like_adts(ConstByteView data);
+bool decode_mp4_audio(ConstByteView data, AudioData* out);  // the first audio track of an MP4/M4A/MOV file: AAC-LC or MP3
 
 constexpr uint32_t kEncodableAudioFormats = 0x1E;
 
