@@ -17,7 +17,7 @@
  */
 
 // The file explorer: a window showing the folders and files of a filesystem in a ListView, which the
-// toolbar switches between list, icon and details views. Double-click (or Enter on) a folder opens it, the
+// toolbar switches between list, icon and details views. Double-click (or Enter on) a folder opens it, a file is passed on to on_file_opened, the
 // Up button (or Backspace) goes to the parent. The window starts at the root of the filesystem it is given.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
@@ -43,6 +43,10 @@ class FileExplorer : public gui::Frame {
   void set_view_mode(gui::ViewMode mode);
   // Double clicks are measured with this clock (see ListView::set_clock).
   void set_clock(const uint64_t* now_us) { view_.set_clock(now_us); }
+
+  // Fired (see Gui::Handler) when a file is opened with Enter or a double click; opened_file() is its full path.
+  void on_file_opened(gui::Handler handler) { file_opened_ = handler; }
+  StringView opened_file() const { return opened_file_.view(); }
 
   StringView path() const { return path_.view(); }
   gui::ListView& view() { return view_; }
@@ -72,6 +76,8 @@ class FileExplorer : public gui::Frame {
   filesystem::IFileSystem* fs_ = nullptr;
   String path_;
   String scratch_;
+  String opened_file_;
+  gui::Handler file_opened_;
 };
 
 }  // namespace desktop

@@ -39,6 +39,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       shutdown_dialog_(allocator),
       explorer_(allocator),
       task_manager_(allocator),
+      notepad_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)} {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
@@ -54,6 +55,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.set_menu_min_width(200);
   start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
   start_.menu().add_item("Task Manager", {&Desktop::on_task_manager, this});
+  start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -89,6 +91,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
 
   explorer_.set_clock(&now_us_);
+  explorer_.on_file_opened({&Desktop::on_explorer_file, this});
 
   about_.set_title("About TheoryCraftOS");
   about_.set_bounds({140, 90, 400, 170});
@@ -125,6 +128,11 @@ void Desktop::open_task_manager() {
   }
 }
 
+void Desktop::open_text_editor() {
+  if (notepad_.manager()) notepad_.activate();
+  else windows_.add_window(&notepad_);
+}
+
 void Desktop::open_about() {
   if (about_.manager()) about_.activate();
   else windows_.add_window(&about_);
@@ -133,6 +141,12 @@ void Desktop::open_about() {
 void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 
 void Desktop::on_task_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_task_manager(); }
+void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
+void Desktop::on_explorer_file(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->notepad_.open_file(d->explorer_.opened_file());
+  d->open_text_editor();
+}
 void Desktop::on_explorer(void* self, Control&) { static_cast<Desktop*>(self)->open_explorer(); }
 void Desktop::on_about(void* self, Control&) { static_cast<Desktop*>(self)->open_about(); }
 void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->ask_shut_down(); }

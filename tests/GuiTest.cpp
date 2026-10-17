@@ -1009,6 +1009,7 @@ static void test_desktop() {
     CHECK(start.open());
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // File Explorer
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Task Manager
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Text Editor
     d.step(5500000);
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...
