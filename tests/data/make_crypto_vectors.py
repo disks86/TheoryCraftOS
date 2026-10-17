@@ -2,6 +2,10 @@
 """Writes tests/CryptoVectors.inc: known-answer vectors for tests/CryptoTest.cpp from OpenSSL (through Python's hashlib and
 the cryptography package), so the C++ code is checked against an independent implementation. Deterministic (seeded)."""
 import hashlib, hmac, os, random
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand, HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
 
@@ -13,15 +17,15 @@ def rows(name, fields, items):
     for it in items: out.append("  {" + ", ".join('"%s"' % x for x in it) + "},\n")
     out.append("};\n")
 data = []
-for n in [0, 1, 3, 55, 56, 57, 63, 64, 65, 119, 120, 128, 1000]:
+for n in [0, 1, 3, 55, 56, 57, 63, 64, 65, 111, 112, 113, 119, 120, 127, 128, 129, 239, 240, 1000]:
     m = bytes(rnd.randrange(256) for _ in range(n))
-    data.append((h(m), hashlib.md5(m).hexdigest(), hashlib.sha1(m).hexdigest(), hashlib.sha224(m).hexdigest(), hashlib.sha256(m).hexdigest()))
-rows("Hash", ["message", "md5", "sha1", "sha224", "sha256"], data)
+    data.append((h(m), hashlib.md5(m).hexdigest(), hashlib.sha1(m).hexdigest(), hashlib.sha224(m).hexdigest(), hashlib.sha256(m).hexdigest(), hashlib.sha384(m).hexdigest(), hashlib.sha512(m).hexdigest()))
+rows("Hash", ["message", "md5", "sha1", "sha224", "sha256", "sha384", "sha512"], data)
 items = []
-for klen, mlen in [(1, 0), (16, 20), (20, 50), (64, 100), (65, 3), (100, 200), (4, 64), (32, 1)]:
+for klen, mlen in [(1, 0), (16, 20), (20, 50), (64, 100), (65, 3), (100, 200), (4, 64), (32, 1), (128, 33), (129, 400), (127, 5)]:
     k = bytes(rnd.randrange(256) for _ in range(klen)); m = bytes(rnd.randrange(256) for _ in range(mlen))
-    items.append((h(k), h(m)) + tuple(hmac.new(k, m, a).hexdigest() for a in ("md5", "sha1", "sha224", "sha256")))
-rows("Hmac", ["key", "message", "md5", "sha1", "sha224", "sha256"], items)
+    items.append((h(k), h(m)) + tuple(hmac.new(k, m, a).hexdigest() for a in ("md5", "sha1", "sha224", "sha256", "sha384", "sha512")))
+rows("Hmac", ["key", "message", "md5", "sha1", "sha224", "sha256", "sha384", "sha512"], items)
 items = []
 for klen, n in [(16, 16), (16, 1), (16, 33), (24, 40), (32, 17), (16, 100), (32, 64), (24, 5)]:
     k = bytes(rnd.randrange(256) for _ in range(klen)); iv = bytes(rnd.randrange(256) for _ in range(16)); m = bytes(rnd.randrange(256) for _ in range(n))
@@ -35,4 +39,54 @@ for n in [8, 16, 24, 64, 200]:
     b = Cipher(TripleDES(k * 3), modes.ECB()).encryptor().update(m[:8])
     items.append((h(k), h(iv), h(m), h(c), h(b)))
 rows("Des", ["key", "iv", "plain", "cbc", "ecb_first_block"], items)
+items = []
+for klen, alen, n in [(16, 0, 0), (16, 13, 0), (16, 0, 1), (16, 13, 16), (16, 20, 33), (32, 5, 100), (32, 0, 64), (16, 160, 1000), (32, 17, 15)]:
+    k = bytes(rnd.randrange(256) for _ in range(klen)); nonce = bytes(rnd.randrange(256) for _ in range(12))
+    a = bytes(rnd.randrange(256) for _ in range(alen)); m = bytes(rnd.randrange(256) for _ in range(n))
+    items.append((h(k), h(nonce), h(a), h(m), h(AESGCM(k).encrypt(nonce, m, a))))
+rows("Gcm", ["key", "nonce", "aad", "plain", "sealed"], items)
+items = []
+for alen, n in [(0, 0), (12, 0), (0, 1), (13, 16), (20, 17), (5, 63), (0, 64), (7, 65), (160, 1000), (16, 15), (3, 129)]:
+    k = bytes(rnd.randrange(256) for _ in range(32)); nonce = bytes(rnd.randrange(256) for _ in range(12))
+    a = bytes(rnd.randrange(256) for _ in range(alen)); m = bytes(rnd.randrange(256) for _ in range(n))
+    items.append((h(k), h(nonce), h(a), h(m), h(ChaCha20Poly1305(k).encrypt(nonce, m, a))))
+rows("ChaPoly", ["key", "nonce", "aad", "plain", "sealed"], items)
+items = []
+for _ in range(12):
+    a = X25519PrivateKey.from_private_bytes(bytes(rnd.randrange(256) for _ in range(32)))
+    b = X25519PrivateKey.generate()
+    ab = a.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    bb = b.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    pa = a.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    pb = b.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    items.append((h(ab), h(pa), h(bb), h(pb), h(a.exchange(b.public_key()))))
+rows("X25519", ["priv_a", "pub_a", "priv_b", "pub_b", "shared"], items)
+items = []
+for hn, hc in (("sha256", hashes.SHA256), ("sha384", hashes.SHA384), ("sha512", hashes.SHA512)):
+    for slen, ilen, infolen, olen in [(0, 22, 0, 42), (13, 32, 10, 82), (32, 48, 20, 100), (64, 5, 0, 17), (20, 20, 33, 200)]:
+        salt = bytes(rnd.randrange(256) for _ in range(slen)); ikm = bytes(rnd.randrange(256) for _ in range(ilen)); info = bytes(rnd.randrange(256) for _ in range(infolen))
+        okm = HKDF(hc(), olen, salt if salt else None, info).derive(ikm)
+        items.append((hn, h(salt), h(ikm), h(info), str(olen), h(okm)))
+rows("Hkdf", ["hash", "salt", "ikm", "info", "length", "okm"], items)
+def drbg(entropy, pers, outlens):
+    K = b"\x00" * 32; V = b"\x01" * 32
+    def update(data):
+        nonlocal K, V
+        K = hmac.new(K, V + b"\x00" + data, "sha256").digest(); V = hmac.new(K, V, "sha256").digest()
+        if data:
+            K = hmac.new(K, V + b"\x01" + data, "sha256").digest(); V = hmac.new(K, V, "sha256").digest()
+    update(entropy + pers)
+    res = []
+    for n in outlens:
+        out = b""
+        while len(out) < n:
+            V = hmac.new(K, V, "sha256").digest(); out += V
+        res.append(out[:n]); update(b"")
+    return res
+items = []
+for plen in (0, 5, 64):
+    e = bytes(rnd.randrange(256) for _ in range(48)); pers = bytes(rnd.randrange(256) for _ in range(plen))
+    a, b = drbg(e, pers, [48, 100])
+    items.append((h(e), h(pers), h(a), h(b)))
+rows("Drbg", ["entropy", "personalization", "first", "second"], items)
 open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "CryptoVectors.inc"), "w").write("".join(out))

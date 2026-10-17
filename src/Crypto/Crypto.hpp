@@ -22,14 +22,17 @@
 
 namespace crypto {
 
-// Hash functions and HMAC (RFC 2104), block ciphers and the modes SNMPv3 uses. Plain portable code with no tables that depend on
-// the data (the HMAC comparison helper is constant time); keys and state are on the caller's stack and cleared when done.
+// Hash functions and HMAC (RFC 2104), block ciphers and the modes SNMPv3 and TLS use. Plain portable code. The hashes, HMAC, ChaCha20,
+// Poly1305, GHASH and the comparison helper are constant time; AES and DES look up S-boxes by data, so their timing can leak through the
+// cache (the usual trade-off of table-based AES on machines without AES instructions). Keys and state are on the caller's stack.
 // MD5 and SHA-1 are here because the protocols that need them (SNMPv3 USM, RFC 3414) do: do not use them for anything new.
 
-enum class HashKind : uint8_t { Md5, Sha1, Sha224, Sha256 };
-constexpr uint32_t hash_size(HashKind k) { return k == HashKind::Md5 ? 16 : k == HashKind::Sha1 ? 20 : k == HashKind::Sha224 ? 28 : 32; }
-constexpr uint32_t hash_block_size(HashKind) { return 64; }
-constexpr uint32_t kMaxHashSize = 32;
+enum class HashKind : uint8_t { Md5, Sha1, Sha224, Sha256, Sha384, Sha512 };
+constexpr uint32_t hash_size(HashKind k) {
+  return k == HashKind::Md5 ? 16 : k == HashKind::Sha1 ? 20 : k == HashKind::Sha224 ? 28 : k == HashKind::Sha256 ? 32 : k == HashKind::Sha384 ? 48 : 64;
+}
+constexpr uint32_t hash_block_size(HashKind k) { return k == HashKind::Sha384 || k == HashKind::Sha512 ? 128 : 64; }
+constexpr uint32_t kMaxHashSize = 64, kMaxHashBlock = 128;
 
 class Hasher {
  public:
@@ -44,8 +47,9 @@ class Hasher {
   void reset();
   HashKind kind_;
   uint32_t h_[8];
+  uint64_t h64_[8];  // SHA-384 / SHA-512
   uint64_t total_ = 0;
-  uint8_t buffer_[64];
+  uint8_t buffer_[kMaxHashBlock];
   uint32_t buffered_ = 0;
 };
 
@@ -55,6 +59,10 @@ void hash(HashKind kind, ConstByteView data, uint8_t* out);
 void hmac(HashKind kind, ConstByteView key, ConstByteView data, uint8_t* out);
 // True if the first `n` bytes of a and b are equal; takes the same time wherever they differ.
 bool equal_constant_time(const uint8_t* a, const uint8_t* b, uint32_t n);
+
+// HKDF (RFC 5869). hkdf_expand() fills `out` (at most 255 hash lengths) and is false if it asks for more.
+void hkdf_extract(HashKind kind, ConstByteView salt, ConstByteView ikm, uint8_t* prk);
+bool hkdf_expand(HashKind kind, ConstByteView prk, ConstByteView info, ByteView out);
 
 // AES with 128-, 192- or 256-bit keys: encryption of one block, and CFB-128 (NIST SP 800-38A) which needs nothing else.
 class Aes {

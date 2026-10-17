@@ -97,6 +97,9 @@ add_executable(BOOTX64
   src/Network/Mdns/MdnsMessage.cpp
   src/Network/Snmp/SnmpClient.cpp
   src/Crypto/Crypto.cpp
+  src/Crypto/Aead.cpp
+  src/Crypto/X25519.cpp
+  src/Crypto/Random.cpp
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
   src/Network/Udp/UdpManager.cpp
