@@ -59,5 +59,7 @@ audio f32.au 11025 2 2205 4667b6931ff3a1bc
 audio fast.flac 11025 2 2205 4667b6931ff3a1bc
 audio best.flac 11025 2 2205 4667b6931ff3a1bc
 audio s32.flac 11025 2 2205 4667b6931ff3a1bc
-audiotol stereo.ogg 11025 2 2205 stereo.ref
-audiotol mono.ogg 11025 1 2205 mono.ref
+audiotol stereo.ogg 11025 2 2205 stereo.ogg.ref
+audiotol mono.ogg 11025 1 2205 mono.ogg.ref
+audiotol stereo.mp3 11025 2 2205 stereo.mp3.ref
+audiotol mono.mp3 11025 1 2205 mono.mp3.ref

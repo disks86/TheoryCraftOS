@@ -122,7 +122,7 @@ static void test_fixtures() {
     if (!ok) { printf("FAILED fixture %s\n", name); ++g_failed; }
   }
   fclose(m);
-  CHECK(count >= 58);
+  CHECK(count >= 60);
   {  // Ogg Opus shares the container with Vorbis but is a different codec: not Vorbis, not decoded.
     File opus("tests/data/opus.ogg");
     AudioData au(a);
@@ -279,7 +279,7 @@ static void test_audio_roundtrip() {
 static void test_fuzz() {
   TestAllocator a;
   const char* names[] = {"rgb.png", "rgba16.png", "anim.apng", "rgb.jpg", "progressive.jpg", "rle8.bmp", "rgba32.bmp", "anim.gif", "interlaced.gif", "rgba.qoi", "rgb.ppm",
-                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg"};
+                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg", "stereo.mp3", "mono.mp3"};
   uint32_t seed = 2024;
   auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
   for (const char* name : names) {
@@ -308,11 +308,11 @@ static void test_fuzz() {
     }
   }
   // Pure noise behind each signature.
-  for (int round = 0; round < 200; ++round) {
+  for (int round = 0; round < 300; ++round) {
     uint8_t noise[300];
     for (uint8_t& b : noise) b = static_cast<uint8_t>(rnd());
-    static const char* const sigs[] = {"\x89PNG\r\n\x1a\n", "\xFF\xD8\xFF\xE0", "BM", "GIF89a", "qoif", "P6\n", "RIFF\x24\x00\x00\x00WAVEfmt ", "FORM\x00\x00\x00\x40" "AIFF", ".snd", "fLaC", "YUV4MPEG2 W8 H8\n"};
-    const char* sig = sigs[round % 11];
+    static const char* const sigs[] = {"\x89PNG\r\n\x1a\n", "\xFF\xD8\xFF\xE0", "BM", "GIF89a", "qoif", "P6\n", "RIFF\x24\x00\x00\x00WAVEfmt ", "FORM\x00\x00\x00\x40" "AIFF", ".snd", "fLaC", "YUV4MPEG2 W8 H8\n", "\xFF\xFB\x90\x00", "\xFF\xFB\x92\x40", "II*\x00\x08\x00\x00\x00", "RIFF\x40\x00\x00\x00WEBPVP8L"};
+    const char* sig = sigs[round % 15];
     memcpy(noise, sig, strlen(sig) < 16 ? strlen(sig) : 16);
     Image img(a);
     AudioData au(a);

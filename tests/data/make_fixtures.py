@@ -202,12 +202,13 @@ for name, args in {"s16.aiff": ["-acodec", "pcm_s16be"], "s24.aiff": ["-acodec",
     ff_audio(name, *args)
     add_audio(name, ff_oracle(name), 11025, 2)
 # Vorbis is lossy and each decoder rounds a little differently: the reference is ffmpeg's decode, compared with a tolerance.
-for name, args, mono in [("stereo.ogg", ["-acodec", "libvorbis", "-q:a", "4"], False), ("mono.ogg", ["-acodec", "libvorbis", "-q:a", "2"], True)]:
+for name, args, mono in [("stereo.ogg", ["-acodec", "libvorbis", "-q:a", "4"], False), ("mono.ogg", ["-acodec", "libvorbis", "-q:a", "2"], True),
+                         ("stereo.mp3", ["-acodec", "libmp3lame", "-b:a", "96k"], False), ("mono.mp3", ["-acodec", "libmp3lame", "-b:a", "32k", "-ar", "11025"], True)]:
     ff_audio(name, *args, mono=mono)
     ch = 1 if mono else 2
     raw = ff_oracle(name)[:len(t) * ch * 2]   # the stream's true length (ffmpeg adds the padding of its last block)
-    open(name.replace(".ogg", ".ref"), "wb").write(raw)
-    manifest.append(f"audiotol {name} 11025 {ch} {len(raw) // 2 // ch} {name.replace('.ogg', '.ref')}")
+    open(name + ".ref", "wb").write(raw)
+    manifest.append(f"audiotol {name} 11025 {ch} {len(raw) // 2 // ch} {name + '.ref'}")
 ff_audio("opus.ogg", "-acodec", "libopus", "-b:a", "48k")   # a codec that is not here: must be refused, not misread
 os.remove("src.raw")
 

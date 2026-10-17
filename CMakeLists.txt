@@ -215,6 +215,7 @@ add_executable(BOOTX64
   src/Media/Audio/Au.cpp
   src/Media/Audio/Flac.cpp
   src/Media/Audio/Vorbis.cpp
+  src/Media/Audio/Mp3.cpp
   src/Media/VideoFiles.cpp
   src/Media/MediaCodecs.cpp
   src/Video/AviFile.cpp

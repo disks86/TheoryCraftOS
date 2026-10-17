@@ -42,6 +42,7 @@ bool encode_au(const AudioData& audio, ByteBuffer* out);
 bool decode_flac(ConstByteView data, AudioData* out);
 bool encode_flac(const AudioData& audio, ByteBuffer* out);
 bool decode_vorbis(ConstByteView data, AudioData* out);
+bool decode_mp3(ConstByteView data, AudioData* out);
 
 constexpr uint32_t kEncodableAudioFormats = 0x1E;
 

@@ -327,7 +327,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     for (uint8_t f = 1; f <= static_cast<uint8_t>(media::ImageFormat::Webp); ++f) images.text(" ").text(media::image_format_name(static_cast<media::ImageFormat>(f)));
     Entry sounds(Level::Ok, "Media");
     sounds.text("sound:");
-    for (uint8_t f = 1; f <= static_cast<uint8_t>(media::AudioFileFormat::Vorbis); ++f) sounds.text(" ").text(media::audio_format_name(static_cast<media::AudioFileFormat>(f)));
+    for (uint8_t f = 1; f <= static_cast<uint8_t>(media::AudioFileFormat::Mp3); ++f) sounds.text(" ").text(media::audio_format_name(static_cast<media::AudioFileFormat>(f)));
     Entry movies(Level::Ok, "Media");
     movies.text("video: AVI (Motion JPEG, raw), GIF, APNG, Y4M; JPEG on ").text(media_codecs.jpeg_accelerated() ? "a video engine, else the CPU" : "the CPU");
   }

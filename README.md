@@ -108,10 +108,10 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     predictor; Deflate RGB(A) encoder), WebP **lossless** (VP8L: all four transforms, colour cache, meta prefix codes; encoder
     with subtract-green and LZ77; lossy VP8 and animated WebP are refused).
   - Sound: WAV (PCM 8-32 bit, float, A-law, mu-law, IMA and Microsoft ADPCM, extensible), AIFF/AIFC, AU, FLAC (full decoder
-    with CRC checks; fixed-predictor encoder), Ogg Vorbis (decoder only: codebooks, floor 1, residue 0-2, channel coupling,
+    with CRC checks; fixed-predictor encoder), MP3 (Layer III, MPEG-1/2/2.5, mono/stereo/joint/intensity stereo, ID3v2, gapless trimming from the LAME tag; decoder ported from
+    the CC0 minimp3, within one 16-bit step of ffmpeg's), Ogg Vorbis (decoder only: codebooks, floor 1, residue 0-2, channel coupling,
     FFT-based IMDCT; within one 16-bit step of ffmpeg's output; floor type 0 and chained streams are not handled). Encoders
-    write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: MP3, AAC, Opus** (their Huffman/codebook/band tables are large
-    constant data that is not reproduced here), lossy WebP, or H.264/HEVC/VP9/AV1 video.
+    write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: AAC, Opus, MP3 Layers I/II**, lossy WebP, or H.264/HEVC/VP9/AV1 video.
   - Video files: `VideoFiles` reads GIF, APNG and Y4M (4:2:0/4:2:2/4:4:4/mono) as frames with their own durations, which
     `VideoPlayer::open_media()` plays (AVI as before, now also with A-law, mu-law and ADPCM soundtracks; a still picture opens
     as a one-frame video).
