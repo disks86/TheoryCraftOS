@@ -45,7 +45,9 @@ bool TaskManager::Model::cell_text(uint32_t row, uint32_t column, String* out) c
 
 TaskManager::TaskManager(allocators::IAllocator& allocator)
     : Frame(allocator),
-      perf_(allocator),
+      tabs_(allocator),
+      processes_page_(allocator),
+      performance_page_(allocator),
       cpu_row_(allocator),
       memory_row_(allocator),
       cpu_title_(allocator),
@@ -53,22 +55,24 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
       memory_title_(allocator),
       memory_value_(allocator),
       info_(allocator),
-      cores_(allocator),
       cpu_meter_(allocator),
       memory_meter_(allocator),
       grid_(allocator),
+      core_rows_(allocator),
       model_(allocator),
       previous_cores_(allocator),
       previous_threads_(allocator) {
   buffer_ = allocate_view<TaskThread>(allocator, kMaxThreads);
   set_title("Task Manager");
-  set_bounds({90, 50, 480, 380});
+  set_bounds({90, 40, 480, 430});
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
 
-  perf_.set_dock(DockStyle::Top);
-  perf_.set_size(0, 92);
-  perf_.set_padding(Insets::all(2));
+  tabs_.set_dock(DockStyle::Fill);
+  processes_page_.set_style(PanelStyle::Transparent);
+  processes_page_.set_padding(Insets::all(4));
+  performance_page_.set_style(PanelStyle::Transparent);
+  performance_page_.set_padding(Insets::all(6));
 
   struct RowParts {
     Panel& row;
@@ -93,14 +97,11 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
     r.row.add(&r.title);
     r.row.add(&r.value);
     r.row.add(&r.meter);
-    perf_.add(&r.row);
+    performance_page_.add(&r.row);
   }
   info_.set_dock(DockStyle::Top);
   info_.set_size(0, 20);
-  cores_.set_dock(DockStyle::Top);
-  cores_.set_size(0, 20);
-  perf_.add(&info_);
-  perf_.add(&cores_);
+  performance_page_.add(&info_);
 
   grid_.add_column("ID", 44, Align::Right);
   grid_.add_column("Thread", 150);
@@ -111,8 +112,18 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
   grid_.set_model(&model_);
   grid_.set_dock(DockStyle::Fill);
 
-  add(&perf_);
-  add(&grid_);  // Fill goes last
+  processes_page_.add(&grid_);
+  tabs_.add_page("Processes", &processes_page_);
+  tabs_.add_page("Performance", &performance_page_);
+  add(&tabs_);
+}
+
+LevelMeter* TaskManager::core_meter(uint32_t index) {
+  return index < core_rows_.count() && core_rows_[index]->row.visible() ? &core_rows_[index]->meter : nullptr;
+}
+
+Label* TaskManager::core_label(uint32_t index) {
+  return index < core_rows_.count() && core_rows_[index]->row.visible() ? &core_rows_[index]->value : nullptr;
 }
 
 TaskManager::~TaskManager() { release_view(allocator(), buffer_); }
@@ -145,33 +156,56 @@ void TaskManager::update(uint64_t now_us) {
   List<TaskCore> current(allocator());
   uint64_t all_busy = 0, all_total = 0;
   String text(allocator());
-  uint32_t online = 0, shown = 0;
+  uint32_t online = 0;
   for (uint32_t i = 0; i < cores; ++i) {
     TaskCore core;
     if (!monitor_->core(i, &core)) core = TaskCore();
     current.push_back(core);
-    if (!core.online) continue;
-    ++online;
     uint64_t busy = 0, idle = 0;
-    if (have_previous_ && i < previous_cores_.count()) {
+    if (core.online && have_previous_ && i < previous_cores_.count()) {
       busy = core.busy_ticks - previous_cores_[i].busy_ticks;
       idle = core.idle_ticks - previous_cores_[i].idle_ticks;
     }
-    all_busy += busy;
-    all_total += busy + idle;
-    if (shown < kMaxCoresShown) {
-      if (shown == 0) text.assign("Cores: ");
-      else text.append("  ");
-      text.append_uint(i);
-      text.push_back(core.efficiency ? 'e' : ' ');
-      text.push_back(':');
-      text.append_uint(busy + idle ? busy * 100 / (busy + idle) : 0);
-      text.push_back('%');
-      ++shown;
+    if (core.online) {
+      ++online;
+      all_busy += busy;
+      all_total += busy + idle;
     }
+    if (i >= kMaxCoresShown) continue;
+    while (core_rows_.count() <= i) {  // the rows of the Performance tab are made as cores turn up
+      UniquePointer<CoreRow> row = UniquePointer<CoreRow>::make(allocator(), allocator());
+      if (!row) break;
+      row->row.set_style(PanelStyle::Transparent);
+      row->row.set_dock(DockStyle::Top);
+      row->row.set_size(0, 22);
+      row->title.set_dock(DockStyle::Left);
+      row->title.set_size(96, 0);
+      row->value.set_dock(DockStyle::Right);
+      row->value.set_size(50, 0);
+      row->meter.set_peak_hold(false);
+      row->meter.set_dock(DockStyle::Fill);
+      row->row.add(&row->title);
+      row->row.add(&row->value);
+      row->row.add(&row->meter);
+      row->row.set_visible(false);
+      performance_page_.add(&row->row);
+      core_rows_.push_back(util::move(row));
+    }
+    if (i >= core_rows_.count()) continue;
+    CoreRow& row = *core_rows_[i];
+    row.row.set_visible(core.online);
+    if (!core.online) continue;
+    const uint64_t percent = busy + idle ? busy * 100 / (busy + idle) : 0;
+    text.assign("Core ");
+    text.append_uint(i);
+    if (core.efficiency) text.append(" (E)");
+    row.title.set_text(text.view());
+    row.meter.set_level(static_cast<int32_t>(percent));
+    text.assign("");
+    text.append_uint(percent);
+    text.append("%");
+    row.value.set_text(text.view());
   }
-  if (online > shown) text.append(" ...");
-  cores_.set_text(text.view());
   const uint64_t cpu_percent = all_total ? all_busy * 100 / all_total : 0;
   cpu_meter_.set_level(static_cast<int32_t>(cpu_percent));
   text.clear();

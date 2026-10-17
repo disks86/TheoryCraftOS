@@ -200,6 +200,7 @@ add_executable(BOOTX64
   src/Desktop/FileExplorer.cpp
   src/Desktop/TaskManager.cpp
   src/Desktop/Notepad.cpp
+  src/Desktop/Paint.cpp
   src/SystemMonitor.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
@@ -225,6 +226,10 @@ add_executable(BOOTX64
   src/Gui/Controls/GridModel.cpp
   src/Gui/Controls/DataGrid.cpp
   src/Gui/Controls/ListView.cpp
+  src/Gui/Controls/ToolStrip.cpp
+  src/Gui/Controls/ColorPalette.cpp
+  src/Gui/Controls/DrawingCanvas.cpp
+  src/Gui/Controls/TabControl.cpp
   src/Gui/Controls/BreadcrumbBar.cpp
   src/Gui/Controls/TextEditor.cpp
   src/Gui/Controls/ImageView.cpp
