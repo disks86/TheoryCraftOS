@@ -78,6 +78,12 @@ uint32_t AudioStream::free_bytes() {
   return format_.is_native() ? room : static_cast<uint32_t>(converter_.input_bytes_for(room));
 }
 
+void AudioStream::flush() {
+  kernel::ScopedMutex guard(mutex_);
+  read_ = 0;
+  queued_ = 0;
+}
+
 uint32_t AudioStream::queued_bytes() {
   kernel::ScopedMutex guard(mutex_);
   return format_.is_native() ? queued_ : static_cast<uint32_t>(converter_.input_bytes_for(queued_));
@@ -98,14 +104,23 @@ uint32_t AudioStream::mix_into(int32_t* accumulator, uint32_t max_frames) {
   if (ring_.empty()) return 0;
   const uint32_t size = static_cast<uint32_t>(ring_.size());
   const uint32_t frames = queued_ / kAudioFrameSize < max_frames ? queued_ / kAudioFrameSize : max_frames;
+  uint32_t peak = 0;
   // A muted stream still advances, so that it stays in step with the others.
   for (uint32_t i = 0; i < frames * hardware::kAudioChannels; ++i) {
     const uint32_t at = (read_ + i * hardware::kAudioBytesPerSample) % size;
     const int32_t sample = static_cast<int16_t>(ring_[at] | (ring_[(at + 1) % size] << 8));
-    if (!silent) accumulator[i] += (sample * ((i & 1) ? right_gain : left_gain)) >> 15;
+    if (silent) continue;
+    const int32_t scaled = (sample * ((i & 1) ? right_gain : left_gain)) >> 15;
+    accumulator[i] += scaled;
+    const uint32_t magnitude = static_cast<uint32_t>(scaled < 0 ? -scaled : scaled);
+    if (magnitude > peak) peak = magnitude;
   }
   read_ = (read_ + frames * kAudioFrameSize) % size;
   queued_ -= frames * kAudioFrameSize;
+  if (peak > 32767) peak = 32767;
+  for (uint32_t seen = __atomic_load_n(&peak_, __ATOMIC_RELAXED);
+       peak > seen && !__atomic_compare_exchange_n(&peak_, &seen, peak, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED);) {
+  }
   __atomic_fetch_add(&frames_mixed_, frames, __ATOMIC_RELAXED);
   return frames;
 }

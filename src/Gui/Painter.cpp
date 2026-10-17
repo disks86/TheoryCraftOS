@@ -77,6 +77,11 @@ void Painter::bevel(const Rect2D& r, bool sunken) {
   edges(1, inner_tl, inner_br);
 }
 
+void Painter::image(const graphics::Surface& source, const Rect2D& source_rect, int32_t x, int32_t y) {
+  const Frame& f = frames_[depth_];
+  renderer_.draw_image(source, source_rect, x + f.origin_x, y + f.origin_y);
+}
+
 void Painter::text(int32_t x, int32_t y, StringView s, uint32_t color) {
   // draw_text wants a C string: copy in pieces so any length works.
   char buffer[65];

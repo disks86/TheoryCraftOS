@@ -47,6 +47,8 @@ class Painter {
   void line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t color);
   // A two-pixel 3D edge; `sunken` swaps the light and dark sides. Leaves the inside (r shrunk by 2) alone.
   void bevel(const Rect2D& r, bool sunken);
+  // Copies `source_rect` of `source` with its top left at (x, y) (see IRenderer2D::draw_image).
+  void image(const graphics::Surface& source, const Rect2D& source_rect, int32_t x, int32_t y);
   void text(int32_t x, int32_t y, StringView text, uint32_t color);
   // Centered in `r`, both ways.
   void text_centered(const Rect2D& r, StringView text, uint32_t color);

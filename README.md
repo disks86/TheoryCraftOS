@@ -64,7 +64,10 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   (a 32 KiB ring in the fixed format, own volume and mute, `write()` never blocks, `close()` when done). `pump()` keeps
   the device topped up to ~50 ms, sums every stream with clipping (32-bit accumulator) and writes nothing when
   all streams are empty; `start_service()` runs it from the "audio" thread every 5 ms. Master volume/mute go to the
-  device. Up to 32 streams. Streams may use their own `StreamFormat` (4-192 kHz, mono/stereo, 16-bit or 8-bit): `write()` converts to the device
+  device. Up to 32 streams. `AudioPlayer` (`Audio/AudioPlayer.*`) is a transport - play, pause, stop, seek, loop, volume, pan, peak level - over an `IPcmSource`
+  (`MemoryPcmSource`; `WavFile::parse` reads 8/16-bit mono/stereo PCM WAV from memory) feeding one mixer stream; `update()` or its
+  service thread keeps the stream full. `tests/AudioPlayerTest.cpp` covers it.
+  Streams may use their own `StreamFormat` (4-192 kHz, mono/stereo, 16-bit or 8-bit): `write()` converts to the device
   format with `Resampler` (linear interpolation going up, box averaging going down) and `FormatConverter`, and
   `set_pan(-100..100)` places a mono sound (equal power) or balances a stereo one (`Pan.hpp`, compile-time table).
   Not covered: higher-quality resampling filters, surround, per-stream effects.
@@ -227,14 +230,18 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   sliding between menus, keyboard navigation). Input and display controls: `Slider` (horizontal/vertical, step/page keys, wheel,
   drag), `LevelMeter` (segmented green/yellow/red bar with peak hold), `CheckBox`, `RadioButton` + `RadioGroup` (exclusive, arrow keys
   move check and focus), `Toggle` (on/off switch), `ColorPicker` (swatch + popup with a saturation/brightness square and hue
-  strip; `Gui/Color.hpp` has the integer HSV conversions) and `DatePicker` (YYYY-MM-DD field + month calendar popup;
+  strip; `Gui/Color.hpp` has the integer HSV conversions) `ScrollBar`, `DataGrid` (a table over an `IGridModel` - or its own `TextGridModel` via `add_column`/`add_row` - with sortable,
+  resizable columns, row selection, vertical/horizontal scrolling; numbers sort as numbers, the sort is stable), `ImageView` (a `Surface`
+  at 1-3200% zoom: pixels repeat zooming in and average zooming out, drag to pan, wheel/keys to zoom, fit mode, chequerboard
+  under transparency, drawn through a viewport-sized cache), `AudioPlayerControl` (play/pause, stop, seek and volume sliders, time,
+  level meter, over an `audio::AudioPlayer`) and `DatePicker` (YYYY-MM-DD field + month calendar popup;
   `Gui/Date.hpp` has the Gregorian date maths, years 1-9999). Callbacks are `Handler`s (function + context pointer). `Window` is the root: title bar,
   focus (Tab/Shift+Tab), mouse capture, hover, and one popup layer drawn above the tree (drop-down lists and menus use it);
   `render()` lays out, paints and presents when `dirty()`. `InputPump` feeds a window from `IKeyboard`/`IMouse` (relative or
   absolute). Controls do not own their children: whoever creates them keeps them alive while they are in a tree. Not yet:
   submenus, text selection/clipboard, scrolling lists, a mouse cursor sprite beyond the simple arrow, several windows.
   `src/GuiDemo` builds a window with all of it at boot and drives it with synthetic input (typing, choosing, menu items)
-  while checking the results; `tests/GuiTest.cpp` covers layout, the basic controls and the input pump on the host; `tests/GuiControlsTest.cpp` covers the slider, level meter, check box, radio button, toggle, colour and date pickers and their helpers.
+  while checking the results; `tests/GuiTest.cpp` covers layout, the basic controls and the input pump on the host; `tests/GuiViewsTest.cpp` covers the scroll bar, data grid, image view and player control; `tests/GuiControlsTest.cpp` covers the slider, level meter, check box, radio button, toggle, colour and date pickers and their helpers.
 
 - `src/BootLog.*` is the boot log (`bootlog::Entry(Level, "Subsystem").text(...).dec(...)`; counts warnings and failures; `replay()` redraws
   the lines after a display mode change cleared the screen). `src/Desktop/` is the desktop shell built on the GUI toolkit: `Desktop`

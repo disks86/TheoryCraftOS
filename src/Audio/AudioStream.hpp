@@ -59,6 +59,9 @@ class AudioStream {
   uint32_t free_bytes();
   // Bytes written but not yet taken by the mixer.
   uint32_t queued_bytes();
+  // Throws away everything queued (for a seek or a stop): the mixer then has nothing from this stream
+  // until the program writes again.
+  void flush();
   // Nothing left in the ring (exact, unlike queued_bytes() when the rates differ).
   bool drained();
 
@@ -76,6 +79,10 @@ class AudioStream {
   bool closed() const { return __atomic_load_n(&closed_, __ATOMIC_ACQUIRE); }
   // Closed and fully taken by the mixer.
   bool finished() { return closed() && drained(); }
+
+  // The loudest sample (0 .. 32767, after volume, pan and mute) the mixer has taken from this stream since
+  // the last call; for level meters.
+  uint32_t take_peak() { return __atomic_exchange_n(&peak_, 0u, __ATOMIC_RELAXED); }
 
   uint64_t frames_written() const { return __atomic_load_n(&frames_written_, __ATOMIC_RELAXED); }
   uint64_t frames_mixed() const { return __atomic_load_n(&frames_mixed_, __ATOMIC_RELAXED); }
@@ -99,6 +106,7 @@ class AudioStream {
   int8_t pan_ = 0;
   bool muted_ = false;
   bool closed_ = false;
+  uint32_t peak_ = 0;
   uint64_t frames_written_ = 0;
   uint64_t frames_mixed_ = 0;
 };

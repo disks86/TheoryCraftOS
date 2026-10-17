@@ -44,6 +44,8 @@ class Slider : public Control {
     page_ = page > 0 ? page : 1;
   }
   Orientation orientation() const { return orientation_; }
+  // True while the thumb is held with the mouse.
+  bool dragging() const { return dragging_; }
   void on_value_changed(Handler handler) { UiGuard lock(this); changed_ = handler; }
 
   bool focusable() const override { return true; }

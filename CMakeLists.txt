@@ -102,6 +102,8 @@ add_executable(BOOTX64
   src/Audio/Resampler.cpp
   src/Audio/AudioStream.cpp
   src/Audio/AudioMixer.cpp
+  src/Audio/WavFile.cpp
+  src/Audio/AudioPlayer.cpp
   src/Audio/CaptureStream.cpp
   src/Audio/AudioCaptureHub.cpp
   src/Hardware/AudioDevice/PlaybackRing.cpp
@@ -187,6 +189,11 @@ add_executable(BOOTX64
   src/Gui/Controls/Toggle.cpp
   src/Gui/Controls/ColorPicker.cpp
   src/Gui/Controls/DatePicker.cpp
+  src/Gui/Controls/ScrollBar.cpp
+  src/Gui/Controls/GridModel.cpp
+  src/Gui/Controls/DataGrid.cpp
+  src/Gui/Controls/ImageView.cpp
+  src/Gui/Controls/AudioPlayerControl.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp
   src/Gui/Windows/WindowManager.cpp
