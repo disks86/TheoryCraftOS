@@ -29,6 +29,7 @@ const char* image_format_name(ImageFormat format) {
     case ImageFormat::Pnm: return "PNM";
     case ImageFormat::Qoi: return "QOI";
     case ImageFormat::Tga: return "TGA";
+    case ImageFormat::Tiff: return "TIFF";
     case ImageFormat::Unknown: break;
   }
   return "unknown";
@@ -46,6 +47,7 @@ ImageFormat detect_image_format(ConstByteView d) {
   if (starts("BM", 2) && d.size() >= 26) return ImageFormat::Bmp;
   if (starts("GIF87a", 6) || starts("GIF89a", 6)) return ImageFormat::Gif;
   if (starts("qoif", 4)) return ImageFormat::Qoi;
+  if (d.size() >= 8 && ((starts("II", 2) && d[2] == 42 && d[3] == 0) || (starts("MM", 2) && d[2] == 0 && d[3] == 42))) return ImageFormat::Tiff;
   if (d.size() >= 3 && d[0] == 'P' && d[1] >= '1' && d[1] <= '7' && (d[2] == ' ' || d[2] == '\n' || d[2] == '\r' || d[2] == '\t')) return ImageFormat::Pnm;
   // TGA has no signature. Accept a header that makes sense: a known image type, a colour map type 0 or 1, a sane depth.
   if (d.size() >= 18) {

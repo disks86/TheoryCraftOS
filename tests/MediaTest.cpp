@@ -105,7 +105,7 @@ static void test_fixtures() {
     if (!ok) { printf("FAILED fixture %s\n", name); ++g_failed; }
   }
   fclose(m);
-  CHECK(count >= 45);
+  CHECK(count >= 52);
   CHECK(a.live == 0);
 }
 
@@ -154,7 +154,7 @@ static void test_image_roundtrip() {
   Image opaque(a);
   make_picture(&opaque, 45, 33, 1, false);
   struct { ImageFormat f; bool exact; bool alpha; } cases[] = {{ImageFormat::Png, true, true}, {ImageFormat::Bmp, true, true}, {ImageFormat::Qoi, true, true},
-                                                             {ImageFormat::Tga, true, true}, {ImageFormat::Pnm, true, false}};
+                                                             {ImageFormat::Tga, true, true}, {ImageFormat::Pnm, true, false}, {ImageFormat::Tiff, true, true}};
   for (const auto& c : cases) {
     const Image& in = c.alpha ? src : opaque;
     ByteBuffer out(a);
@@ -251,7 +251,7 @@ static void test_audio_roundtrip() {
 static void test_fuzz() {
   TestAllocator a;
   const char* names[] = {"rgb.png", "rgba16.png", "anim.apng", "rgb.jpg", "progressive.jpg", "rle8.bmp", "rgba32.bmp", "anim.gif", "interlaced.gif", "rgba.qoi", "rgb.ppm",
-                         "rgba.pam", "rgb.tga", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac"};
+                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac"};
   uint32_t seed = 2024;
   auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
   for (const char* name : names) {

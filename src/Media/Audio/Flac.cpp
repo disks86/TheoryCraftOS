@@ -161,15 +161,17 @@ bool decode_subframe(BitReader& r, uint32_t block, uint32_t bits, int64_t* out) 
     for (uint32_t i = 0; i < order; ++i) out[i] = r.read_signed(depth);
     ok = decode_residual(r, block, order, out);
     for (uint32_t i = order; ok && i < block; ++i) {
-      int64_t p;
+      // Damaged data can make the predictions grow without bound: do the arithmetic modulo 2^64, where that is defined.
+      auto u = [&](uint32_t back) { return static_cast<uint64_t>(out[i - back]); };
+      uint64_t p;
       switch (order) {
         case 0: p = 0; break;
-        case 1: p = out[i - 1]; break;
-        case 2: p = 2 * out[i - 1] - out[i - 2]; break;
-        case 3: p = 3 * out[i - 1] - 3 * out[i - 2] + out[i - 3]; break;
-        default: p = 4 * out[i - 1] - 6 * out[i - 2] + 4 * out[i - 3] - out[i - 4]; break;
+        case 1: p = u(1); break;
+        case 2: p = 2 * u(1) - u(2); break;
+        case 3: p = 3 * u(1) - 3 * u(2) + u(3); break;
+        default: p = 4 * u(1) - 6 * u(2) + 4 * u(3) - u(4); break;
       }
-      out[i] += p;
+      out[i] = static_cast<int64_t>(static_cast<uint64_t>(out[i]) + p);
     }
   } else if (type >= 32) {
     const uint32_t order = type - 31;
@@ -184,16 +186,16 @@ bool decode_subframe(BitReader& r, uint32_t block, uint32_t bits, int64_t* out) 
     for (uint32_t i = 0; i < order; ++i) coefficients[i] = r.read_signed(precision);
     ok = decode_residual(r, block, order, out);
     for (uint32_t i = order; ok && i < block; ++i) {
-      int64_t sum = 0;
-      for (uint32_t j = 0; j < order; ++j) sum += coefficients[j] * out[i - 1 - j];
-      out[i] += sum >> shift;
+      uint64_t sum = 0;
+      for (uint32_t j = 0; j < order; ++j) sum += static_cast<uint64_t>(coefficients[j]) * static_cast<uint64_t>(out[i - 1 - j]);
+      out[i] = static_cast<int64_t>(static_cast<uint64_t>(out[i]) + static_cast<uint64_t>(static_cast<int64_t>(sum) >> shift));
     }
   } else {
     return false;
   }
   if (!ok || r.failed) return false;
   if (wasted)
-    for (uint32_t i = 0; i < block; ++i) out[i] *= int64_t{1} << wasted;
+    for (uint32_t i = 0; i < block; ++i) out[i] = static_cast<int64_t>(static_cast<uint64_t>(out[i]) << wasted);
   return true;
 }
 }  // namespace

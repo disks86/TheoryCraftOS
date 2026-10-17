@@ -89,6 +89,13 @@ Image.fromarray(base).convert("L").convert("1").save("bw.pbm")
 run("convert", "rgba.png", "pam:rgba.pam")
 Image.fromarray(base).save("rgb.tga", compression="tga_rle")
 Image.fromarray(rgba).save("rgba.tga")
+run("convert", "rgb.png", "-compress", "LZW", "-define", "tiff:predictor=2", "rgb_lzw.tif")
+run("convert", "rgba.png", "-compress", "Zip", "rgba_zip.tif")
+run("convert", "rgb.png", "-define", "tiff:tile-geometry=16x16", "-compress", "LZW", "tiled.tif")
+run("convert", "rgb.png", "-colors", "32", "-type", "palette", "pal.tif")
+run("convert", "rgb.png", "-colorspace", "gray", "-depth", "4", "gray4.tif")
+run("convert", "rgb.png", "-define", "tiff:endian=msb", "-compress", "RLE", "rgb_be.tif")
+run("convert", "rgb.png", "-interlace", "plane", "-define", "tiff:rows-per-strip=7", "planar.tif")
 run("ffmpeg", "-v", "error", "-y", "-i", "rgba.png", "rgba.qoi")
 run("ffmpeg", "-v", "error", "-y", "-i", "rgb.png", "rgb.qoi")
 
@@ -103,7 +110,7 @@ with tempfile.TemporaryDirectory() as t:
     run("ffmpeg", "-v", "error", "-y", "-framerate", "10", "-i", f"{t}/f%d.png", "-plays", "0", "-f", "apng", "anim.apng")
 
 for p in ["rgb.png", "rgba.png", "gray.png", "pal.png", "rgb_interlaced.png", "rgb.bmp", "pal8.bmp", "rgb.jpg", "rgb444.jpg", "progressive.jpg", "gray.jpg",
-          "rgb.ppm", "gray.pgm", "bw.pbm", "rgb.tga", "rgba.tga", "static.gif", "anim.gif", "interlaced.gif"]:
+          "rgb.ppm", "gray.pgm", "bw.pbm", "rgb.tga", "rgba.tga", "rgb_lzw.tif", "rgba_zip.tif", "tiled.tif", "pal.tif", "gray4.tif", "rgb_be.tif", "planar.tif", "static.gif", "anim.gif", "interlaced.gif"]:
     add_image(p, pil_oracle(p))
 # 16-bit grey: the decoders keep the high byte (ffmpeg rounds to nearest instead, so it is not the oracle here)
 g16 = (np.asarray(Image.open("gray16.png")).astype(np.uint32) >> 8).astype(np.uint8)

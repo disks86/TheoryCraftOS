@@ -23,7 +23,7 @@
 
 namespace media {
 
-enum class ImageFormat : uint8_t { Unknown, Png, Jpeg, Bmp, Gif, Pnm, Qoi, Tga };
+enum class ImageFormat : uint8_t { Unknown, Png, Jpeg, Bmp, Gif, Pnm, Qoi, Tga, Tiff };
 const char* image_format_name(ImageFormat format);
 constexpr uint32_t image_format_bit(ImageFormat format) { return 1u << static_cast<uint8_t>(format); }
 // Which format a file is, from its first bytes (Tga has no signature; it is recognised by a plausible header).

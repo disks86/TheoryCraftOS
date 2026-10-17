@@ -31,6 +31,7 @@ bool decode_image(ConstByteView data, Image* out, ImageFormat* detected) {
     case ImageFormat::Pnm: return decode_pnm(data, out);
     case ImageFormat::Qoi: return decode_qoi(data, out);
     case ImageFormat::Tga: return decode_tga(data, out);
+    case ImageFormat::Tiff: return decode_tiff(data, out);
     case ImageFormat::Unknown: break;
   }
   out->clear();
@@ -49,6 +50,7 @@ bool encode_image(const Image& image, ImageFormat format, uint32_t quality, Byte
     case ImageFormat::Pnm: return encode_pnm(image, out);
     case ImageFormat::Qoi: return encode_qoi(image, out);
     case ImageFormat::Tga: return encode_tga(image, out);
+    case ImageFormat::Tiff: return encode_tiff(image, out);
     case ImageFormat::Unknown: break;
   }
   return false;

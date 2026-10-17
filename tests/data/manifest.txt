@@ -14,6 +14,13 @@ image gray.pgm 40 30 1 cbf4290f68665a0a
 image bw.pbm 40 30 1 d66f89b24035d5b4
 image rgb.tga 40 30 1 a005f44188579fc3
 image rgba.tga 40 30 1 8e082edaf5863e56
+image rgb_lzw.tif 40 30 1 a005f44188579fc3
+image rgba_zip.tif 40 30 1 8e082edaf5863e56
+image tiled.tif 40 30 1 a005f44188579fc3
+image pal.tif 40 30 1 75e0ba7b5a7d84ab
+image gray4.tif 40 30 1 6f1e959a5c6f7bf3
+image rgb_be.tif 40 30 1 a005f44188579fc3
+image planar.tif 40 30 1 a005f44188579fc3
 image static.gif 40 30 1 0cfe1d6344ab9da8
 image anim.gif 40 30 4 799a81991f04a941
 image interlaced.gif 40 30 1 decb7a302aa94cd8

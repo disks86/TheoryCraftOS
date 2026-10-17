@@ -78,9 +78,9 @@ bool decode_ima(ConstByteView data, uint32_t channels, uint32_t block, uint32_t 
     uint32_t at = 4 * channels;
     for (uint32_t frame = 1; frame < per_block;) {
       for (uint32_t c = 0; c < channels; ++c)
-        for (uint32_t k = 0; k < 4 && at < block; ++k, ++at) {
-          dest[(frame + 2 * k) * channels + c] = state[c].decode(in[at] & 15);
-          dest[(frame + 2 * k + 1) * channels + c] = state[c].decode(in[at] >> 4);
+        for (uint32_t k = 0; k < 4 && at < block; ++k, ++at) {  // (a block size that is not a multiple of 4 bytes per channel ends mid-group)
+          if (frame + 2 * k < per_block) dest[(frame + 2 * k) * channels + c] = state[c].decode(in[at] & 15);
+          if (frame + 2 * k + 1 < per_block) dest[(frame + 2 * k + 1) * channels + c] = state[c].decode(in[at] >> 4);
         }
       frame += 8;
     }

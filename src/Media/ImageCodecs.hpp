@@ -35,6 +35,8 @@ namespace media {
 //   PNM   decode: P1-P6 and PAM (P7). encode: P6 (or P5 for a grey image).
 //   QOI   decode and encode: the Quite OK Image format.
 //   TGA   decode: types 1, 2, 3 and their run-length forms, 8/15/16/24/32 bits. encode: 32-bit uncompressed.
+//   TIFF  decode: strips and tiles, 1-16 bit grey/RGB/palette with alpha, chunky and planar, uncompressed/PackBits/LZW/Deflate,
+//         horizontal predictor; first page only, orientation not applied. encode: 8-bit RGB(A), Deflate + predictor.
 bool decode_png(ConstByteView data, Image* out);
 bool encode_png(const Image& image, uint32_t level, ByteBuffer* out);
 bool decode_jpeg(ConstByteView data, Image* out);
@@ -49,9 +51,11 @@ bool decode_qoi(ConstByteView data, Image* out);
 bool encode_qoi(const Image& image, ByteBuffer* out);
 bool decode_tga(ConstByteView data, Image* out);
 bool encode_tga(const Image& image, ByteBuffer* out);
+bool decode_tiff(ConstByteView data, Image* out);
+bool encode_tiff(const Image& image, ByteBuffer* out);
 
 // Formats the encoder exists for (all of the above).
-constexpr uint32_t kEncodableImageFormats = 0xFE;
+constexpr uint32_t kEncodableImageFormats = 0x1FE;
 
 // The whole-file entry points: detect the format and decode, or encode in a given format (`quality` 1-100 for JPEG,
 // the deflate effort 1-9 for PNG is derived from it; ignored elsewhere). Only frame 0 of an animation goes to a format

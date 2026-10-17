@@ -205,6 +205,7 @@ add_executable(BOOTX64
   src/Media/Image/Pnm.cpp
   src/Media/Image/Qoi.cpp
   src/Media/Image/Tga.cpp
+  src/Media/Image/Tiff.cpp
   src/Media/AudioData.cpp
   src/Media/AudioCodecs.cpp
   src/Media/Audio/Pcm.cpp
