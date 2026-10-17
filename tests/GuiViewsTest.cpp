@@ -30,10 +30,12 @@
 #include "Desktop/TaskManager.hpp"
 #include "Gui/Controls/TextEditor.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Gui/Controls/BreadcrumbBar.hpp"
 #include "Gui/Controls/ImageView.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
+#include "Gui/Controls/TextBox.hpp"
 #include "Gui/Controls/VideoPlayerControl.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Video/AviWriter.hpp"
@@ -991,7 +993,7 @@ static void test_file_explorer() {
     CHECK(ex.view().item_icon(1) == ItemIcon::Folder && ex.view().item_icon(2) == ItemIcon::File);
     CHECK(cell_of(3, 1).view().equals("11 B") && cell_of(3, 2).view().equals("TXT File") && cell_of(4, 2).view().equals("File") && cell_of(0, 2).view().equals("Folder") && cell_of(0, 1).empty());
     CHECK(ex.status_label().text().equals("5 items"));
-    CHECK(!ex.up_button().enabled() && ex.details_button().checked() && ex.view().view_mode() == ViewMode::Details);
+    CHECK(ex.address_bar().path().equals("/") && ex.address_bar().segment_count() == 1 && ex.details_button().checked() && ex.view().view_mode() == ViewMode::Details);
 
     // The three views are chosen with the toolbar's buttons.
     ex.list_button().set_checked(true);
@@ -1017,14 +1019,39 @@ static void test_file_explorer() {
     CHECK(ex.status_label().text().equals("5 items  |  docs"));
     press(w, key::kEnter);
     CHECK(ex.path().equals("/docs") && ex.view().item_count() == 2 && name_of(0).view().equals("old") && name_of(1).view().equals("note.md"));
-    CHECK(ex.path_label().text().equals("/docs") && ex.up_button().enabled() && ex.view().selected_item() == -1);
+    CHECK(ex.address_bar().path().equals("/docs") && ex.address_bar().segment_count() == 2 && ex.view().selected_item() == -1);
     CHECK(ex.status_label().text().equals("2 items"));
     ex.view().select_item(1);
     CHECK(ex.status_label().text().equals("2 items  |  note.md, 4 B"));
     press(w, key::kEnter);                      // a file: nothing opens
     CHECK(ex.path().equals("/docs"));
-    ex.up_button().click();
-    CHECK(ex.path().equals("/") && ex.view().item_count() == 5 && !ex.up_button().enabled());
+    // Clicking the root in the address bar goes back there.
+    {
+      const Point bar = ex.address_bar().window_origin();
+      const BreadcrumbBar::Segment root = ex.address_bar().segment(0);
+      click(w, bar.x + root.x + 4, bar.y + 12);
+    }
+    CHECK(ex.path().equals("/") && ex.view().item_count() == 5 && ex.address_bar().segment_count() == 1);
+    // Typing a path: click after the last folder, type, Enter; a path that does not exist is refused.
+    {
+      const Point bar = ex.address_bar().window_origin();
+      const uint32_t width = ex.address_bar().bounds().width;
+      click(w, bar.x + static_cast<int32_t>(width) - 6, bar.y + 12);
+      CHECK(ex.address_bar().editing() && w.focus() == &ex.address_bar().edit_box());
+      ex.address_bar().edit_box().set_text("/docs/old");
+      press(w, key::kEnter);
+      CHECK(!ex.address_bar().editing() && ex.path().equals("/docs/old") && ex.address_bar().segment_count() == 3);
+      ex.address_bar().begin_edit();
+      ex.address_bar().edit_box().set_text("/nowhere");
+      press(w, key::kEnter);
+      CHECK(ex.path().equals("/docs/old") && ex.status_label().text().equals("Cannot open /nowhere"));
+      press(w, key::kA + 11, modifier::kLeftControl);   // Ctrl+L, from anywhere in the window
+      CHECK(ex.address_bar().editing());
+      press(w, key::kEscape);
+      CHECK(!ex.address_bar().editing());
+      CHECK(ex.go_up() && ex.go_up() && ex.path().equals("/"));
+      w.set_focus(&ex.view());
+    }
     Rect2D row;
     CHECK(ex.view().item_rect(1, &row));
     const Point origin = ex.view().window_origin();
@@ -1345,6 +1372,87 @@ static void test_notepad() {
   CHECK(a.live == 0);
 }
 
+// --- Breadcrumb bar ------------------------------------------------------------------------------------------
+
+static void test_breadcrumb_bar() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 200);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 200});
+    BreadcrumbBar bar(a);
+    TextBox other(a);
+    bar.set_bounds({10, 10, 300, 24});
+    other.set_bounds({10, 100, 100, 24});
+    w.add(&bar);
+    w.add(&other);
+    w.layout();
+    Counter went;
+    bar.on_navigate(went.handler());
+    CHECK(bar.path().equals("/") && bar.segment_count() == 1 && bar.segment_label(0).equals("/"));
+
+    bar.set_path("docs//old/");
+    w.layout();
+    CHECK(bar.path().equals("/docs/old") && bar.segment_count() == 3);
+    CHECK(bar.segment_label(0).equals("/") && bar.segment_label(1).equals("docs") && bar.segment_label(2).equals("old"));
+    CHECK(bar.segment(0).path_length == 0 && bar.segment(1).path_length == 5 && bar.segment(2).path_length == 9);
+    CHECK(bar.segment(1).x > bar.segment(0).x + bar.segment(0).width && bar.segment(2).x > bar.segment(1).x + bar.segment(1).width);
+
+    // Hovering highlights a folder, clicking one reports where it goes.
+    auto center = [&](uint32_t i) { return Point{10 + bar.segment(i).x + bar.segment(i).width / 2, 10 + 12}; };
+    w.mouse_move(center(1).x, center(1).y);
+    CHECK(bar.hovered_segment() == 1);
+    w.mouse_move(300, 150);
+    CHECK(bar.hovered_segment() == -1);
+    click(w, center(1).x, center(1).y);
+    CHECK(went.count == 1 && bar.requested_path().equals("/docs") && bar.path().equals("/docs/old"));   // the program sets the path
+    click(w, center(0).x, center(0).y);
+    CHECK(went.count == 2 && bar.requested_path().equals("/"));
+    click(w, center(2).x, center(2).y);
+    CHECK(went.count == 3 && bar.requested_path().equals("/docs/old"));
+    w.render();
+
+    // Clicking beside the last folder turns the bar into a text box.
+    click(w, 10 + 290, 10 + 12);
+    CHECK(bar.editing() && bar.edit_box().visible() && w.focus() == &bar.edit_box() && bar.edit_box().text().equals("/docs/old"));
+    w.render();
+    bar.edit_box().set_text("  a//b/ ");
+    press(w, key::kEnter);
+    CHECK(!bar.editing() && !bar.edit_box().visible() && went.count == 4 && bar.requested_path().equals("/a/b"));
+    bar.edit_box().set_text("");
+    bar.begin_edit();
+    bar.edit_box().set_text("");
+    press(w, key::kEnter);
+    CHECK(went.count == 5 && bar.requested_path().equals("/"));
+
+    // Escape and moving the focus elsewhere cancel.
+    bar.begin_edit();
+    press(w, key::kEscape);
+    CHECK(!bar.editing() && went.count == 5);
+    bar.begin_edit();
+    w.set_focus(&other);
+    CHECK(!bar.editing() && went.count == 5);
+
+    // A path too long for the bar gives its first folders up for an ellipsis that goes to the one before the first shown.
+    bar.set_bounds({10, 10, 150, 24});
+    bar.set_path("/aaaaaaaa/bbbbbbbb/cccccccc/dddddddd");
+    w.layout();
+    CHECK(bar.segment_count() == 2 && bar.segment_label(0).equals("...") && bar.segment_label(1).equals("dddddddd"));
+    click(w, 10 + bar.segment(0).x + 4, 10 + 12);
+    CHECK(bar.requested_path().equals("/aaaaaaaa/bbbbbbbb/cccccccc"));
+    click(w, 10 + bar.segment(1).x + 4, 10 + 12);
+    CHECK(bar.requested_path().equals("/aaaaaaaa/bbbbbbbb/cccccccc/dddddddd"));
+    bar.set_bounds({10, 10, 60, 24});
+    w.layout();
+    CHECK(bar.segment_count() >= 1 && bar.segment_label(bar.segment_count() - 1).equals("dddddddd"));
+    w.render();
+    bar.set_bounds({10, 10, 390, 24});
+    w.layout();
+    CHECK(bar.segment_count() == 5 && bar.segment_label(0).equals("/"));
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_scroll_bar();
   test_data_grid();
@@ -1354,6 +1462,7 @@ int main() {
   test_player_control();
   test_video_control();
   test_list_view();
+  test_breadcrumb_bar();
   test_file_explorer();
   test_task_manager();
   test_text_editor();

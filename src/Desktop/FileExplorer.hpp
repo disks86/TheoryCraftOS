@@ -21,7 +21,7 @@
 // Up button (or Backspace) goes to the parent. The window starts at the root of the filesystem it is given.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
-#include "Gui/Controls/Button.hpp"
+#include "Gui/Controls/BreadcrumbBar.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -54,17 +54,16 @@ class FileExplorer : public gui::Frame {
 
   StringView path() const { return path_.view(); }
   gui::ListView& view() { return view_; }
-  gui::Button& up_button() { return up_; }
+  gui::BreadcrumbBar& address_bar() { return address_; }
   gui::RadioButton& list_button() { return list_button_; }
   gui::RadioButton& icons_button() { return icons_button_; }
   gui::RadioButton& details_button() { return details_button_; }
   gui::Label& status_label() { return status_; }
-  gui::Label& path_label() { return path_label_; }
 
   bool on_key(const gui::KeyArgs& args) override;
 
  private:
-  static void on_up(void* self, gui::Control&);
+  static void on_navigate(void* self, gui::Control&);
   static void on_mode(void* self, gui::Control& sender);
   static void on_activated(void* self, gui::Control&);
   static void on_selection(void* self, gui::Control&);
@@ -74,8 +73,8 @@ class FileExplorer : public gui::Frame {
 
   gui::RadioGroup group_;
   gui::Panel toolbar_, status_bar_;
-  gui::Button up_;
-  gui::Label path_label_, status_;
+  gui::BreadcrumbBar address_;
+  gui::Label status_;
   gui::RadioButton list_button_, icons_button_, details_button_;
   gui::ListView view_;
   kernel::Mutex navigation_;    // one folder is loaded at a time (a refresh from another thread must not interleave with a click)
