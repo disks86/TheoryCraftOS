@@ -41,12 +41,14 @@ void Allocator::add_run(uint64_t start, uint64_t end) {
   h->magic = Header::kUsed;  // deallocate() does the insertion and merging for a used run
   h->blocks = (end - start) / kBlock;
   h->next = nullptr;
+  total_bytes_ += end - start;
   deallocate(reinterpret_cast<uint8_t*>(h) + kBlock);
 }
 
 bool Allocator::initialize() {
   static_assert(sizeof(Header) == kBlockSize, "header must fill exactly one block");
   free_low_ = free_high_ = nullptr;
+  total_bytes_ = 0;
   auto start = reinterpret_cast<uint64_t>(ram_.base());
   uint64_t end = start + ram_.usable_bytes();
   start = (start + kBlock - 1) & ~(kBlock - 1);

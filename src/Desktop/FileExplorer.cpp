@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/Format.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
@@ -40,18 +41,6 @@ bool entry_less(const DirectoryEntry& a, const DirectoryEntry& b) {
   for (uint64_t i = 0; i < n; ++i)
     if (lower(x[i]) != lower(y[i])) return lower(x[i]) < lower(y[i]);
   return x.size() < y.size();
-}
-
-// "512 B", "4.5 KB", "12.0 MB", "1.2 GB".
-bool format_size(uint64_t bytes, String* out) {
-  out->clear();
-  if (bytes < 1024) return out->append_uint(bytes) && out->append(" B");
-  const char* unit = " KB";
-  uint64_t scale = 1024;
-  if (bytes >= 1024ull * 1024 * 1024) { unit = " GB"; scale = 1024ull * 1024 * 1024; }
-  else if (bytes >= 1024ull * 1024) { unit = " MB"; scale = 1024ull * 1024; }
-  const uint64_t tenths = bytes / (scale / 10);
-  return out->append_uint(tenths / 10) && out->push_back('.') && out->append_uint(tenths % 10) && out->append(unit);
 }
 
 // "TXT File" for "notes.txt", "File" without an extension.

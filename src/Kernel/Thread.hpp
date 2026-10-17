@@ -54,6 +54,8 @@ struct Thread {
   Thread* prev = nullptr;   // run queue / wait list links
   Thread* next = nullptr;
   Thread* sleep_next = nullptr;
+  Thread* all_next = nullptr;  // every live thread, newest first (see thread_snapshot)
+  uint64_t cpu_ticks = 0;      // timer ticks that found it running
   WaitList* waiting_on = nullptr;
   WaitList joiners;
 };
@@ -89,6 +91,26 @@ void detach(Thread* thread);
 // Returns how many finished detached threads are still waiting (a core may still be
 // leaving one).
 uint32_t reap_zombies();
+
+// --- Monitoring (the task manager). Cumulative counters; a tick is 1 / tick_rate() seconds on one core.
+struct ThreadInfo {
+  uint64_t id = 0;
+  char name[24] = {};
+  ThreadState state = ThreadState::Ready;
+  bool idle = false;       // a core's idle thread
+  int32_t core = -1;       // the core it is running on right now, or -1
+  int32_t affinity = -1;   // the only core allowed to run it, or -1
+  uint64_t cpu_ticks = 0;
+};
+struct CoreInfo {
+  bool online = false;
+  hardware::CoreKind kind = hardware::CoreKind::Performance;
+  uint64_t busy_ticks = 0, idle_ticks = 0;
+};
+// Copies up to `capacity` live threads (not finished ones); returns how many were written.
+uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity);
+bool core_info(uint32_t core, CoreInfo* out);
+uint32_t tick_rate();
 
 Thread* current_thread();
 uint32_t current_core();

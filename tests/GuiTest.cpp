@@ -531,7 +531,7 @@ static void test_rendering() {
 }
 
 struct FakeKeyboard final : hardware::IKeyboard {
-  hardware::KeyEvent events[16]; int head = 0, tail = 0; uint8_t mods = 0;
+  hardware::KeyEvent events[64]; int head = 0, tail = 0; uint8_t mods = 0;
   const char* name() const override { return "fake keyboard"; }
   bool initialize() override { return true; }
   void shutdown() override {}
@@ -1008,6 +1008,8 @@ static void test_desktop() {
     d.step(5000000);
     CHECK(start.open());
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // File Explorer
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Task Manager
+    d.step(5500000);
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);

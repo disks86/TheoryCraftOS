@@ -197,6 +197,8 @@ add_executable(BOOTX64
   src/Desktop/Desktop.cpp
   src/Desktop/DesktopSurface.cpp
   src/Desktop/FileExplorer.cpp
+  src/Desktop/TaskManager.cpp
+  src/SystemMonitor.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
   src/GuiDemo.cpp

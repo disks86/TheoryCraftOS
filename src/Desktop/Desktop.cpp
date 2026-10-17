@@ -38,6 +38,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       clock_(allocator),
       shutdown_dialog_(allocator),
       explorer_(allocator),
+      task_manager_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)} {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
@@ -52,6 +53,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.set_direction(MenuButton::Direction::Up);
   start_.set_menu_min_width(200);
   start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
+  start_.menu().add_item("Task Manager", {&Desktop::on_task_manager, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -114,6 +116,15 @@ void Desktop::open_explorer() {
   else windows_.add_window(&explorer_);
 }
 
+void Desktop::open_task_manager() {
+  if (task_manager_.manager()) {
+    task_manager_.activate();
+  } else {
+    task_manager_.update(now_us_);
+    windows_.add_window(&task_manager_);
+  }
+}
+
 void Desktop::open_about() {
   if (about_.manager()) about_.activate();
   else windows_.add_window(&about_);
@@ -121,6 +132,7 @@ void Desktop::open_about() {
 
 void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 
+void Desktop::on_task_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_task_manager(); }
 void Desktop::on_explorer(void* self, Control&) { static_cast<Desktop*>(self)->open_explorer(); }
 void Desktop::on_about(void* self, Control&) { static_cast<Desktop*>(self)->open_about(); }
 void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->ask_shut_down(); }
@@ -198,6 +210,7 @@ void Desktop::pump(uint64_t uptime_us) {
   const uint64_t second = uptime_us / 1000000;
   if (second != polled_second_) {
     polled_second_ = second;
+    if (task_manager_.manager()) task_manager_.update(uptime_us);
     DateTime now;
     const bool ok = clock_source_ && clock_source_(clock_context_, &now);
     // The label only changes when the minute does; ~0 stands for "no time".

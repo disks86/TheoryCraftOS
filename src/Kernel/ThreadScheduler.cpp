@@ -40,6 +40,7 @@ struct Core {
   uint32_t slice = kSliceTicks;
   Thread* current = nullptr;
   Thread* idle = nullptr;
+  uint64_t busy_ticks = 0, idle_ticks = 0;
 };
 
 struct ApStart {
@@ -56,6 +57,7 @@ struct Scheduler {
   Thread* queue_tail = nullptr;
   Thread* sleepers = nullptr;
   Thread* zombies = nullptr;
+  Thread* all = nullptr;  // every thread that exists, through Thread::all_next
   allocators::IAllocator* allocator = nullptr;
   hardware::ICentralProcessingUnit* cpu = nullptr;
   uint64_t tsc_per_us = 0;
@@ -102,6 +104,24 @@ uint64_t lock_irq() {
 void unlock_irq(uint64_t flags) {
   __atomic_store_n(&g.lock_word, 0, __ATOMIC_RELEASE);
   irq_restore(flags);
+}
+
+// ---- the list of all threads (for monitoring); lock held for unregister ----
+
+void register_thread(Thread* t) {
+  const uint64_t flags = lock_irq();
+  t->all_next = g.all;
+  g.all = t;
+  unlock_irq(flags);
+}
+
+void unregister_locked(Thread* t) {
+  for (Thread** link = &g.all; *link; link = &(*link)->all_next) {
+    if (*link == t) {
+      *link = t->all_next;
+      return;
+    }
+  }
 }
 
 // ---- run queue / wait lists (doubly linked through prev/next); lock held ----
@@ -232,6 +252,12 @@ Frame* on_timer(Frame* frame, void*) {
     }
     make_ready_locked(t);
   }
+  if (c->current->is_idle) {
+    ++c->idle_ticks;
+  } else {
+    ++c->busy_ticks;
+    ++c->current->cpu_ticks;
+  }
   if (c->slice > 0) --c->slice;
   Frame* result = reschedule_locked(frame, c, false);
   unlock_irq(flags);
@@ -295,6 +321,7 @@ Thread* make_thread(ThreadFunction fn, void* argument, const char* name, int32_t
   t->affinity = core;
   t->preferred_kind = kind;
   build_initial_frame(t, stack_bytes);
+  register_thread(t);
   return t;
 }
 
@@ -308,6 +335,7 @@ Thread* adopt_context(const char* name, bool idle, int32_t core) {
   t->affinity = core;
   t->state = ThreadState::Running;
   t->on_cpu = true;
+  register_thread(t);
   return t;
 }
 
@@ -323,6 +351,7 @@ uint32_t reap_zombies_impl() {
       continue;
     }
     *link = t->next;
+    unregister_locked(t);
     t->next = done;
     done = t;
   }
@@ -377,6 +406,43 @@ uint32_t reap_zombies() { return reap_zombies_impl(); }
 
 uint32_t current_core() { return g.running ? this_core()->index : 0; }
 uint32_t core_count() { return g.running ? g.core_count : 1; }
+
+uint32_t tick_rate() { return g.tick_hz; }
+
+bool core_info(uint32_t core, CoreInfo* out) {
+  if (!g.running || core >= g.core_count) return false;
+  const uint64_t flags = lock_irq();
+  const Core& c = g.cores[core];
+  out->online = c.online;
+  out->kind = c.kind;
+  out->busy_ticks = c.busy_ticks;
+  out->idle_ticks = c.idle_ticks;
+  unlock_irq(flags);
+  return true;
+}
+
+uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity) {
+  if (!g.running) return 0;
+  uint32_t n = 0;
+  const uint64_t flags = lock_irq();
+  for (const Thread* t = g.all; t && n < capacity; t = t->all_next) {
+    if (t->state == ThreadState::Zombie) continue;
+    ThreadInfo& info = out[n++];
+    info.id = t->id;
+    uint32_t i = 0;
+    for (; i + 1 < sizeof info.name && t->name && t->name[i]; ++i) info.name[i] = t->name[i];
+    info.name[i] = 0;
+    info.state = t->state;
+    info.idle = t->is_idle;
+    info.core = -1;
+    for (uint32_t c = 0; c < g.core_count; ++c)
+      if (g.cores[c].current == t) info.core = static_cast<int32_t>(c);
+    info.affinity = t->affinity;
+    info.cpu_ticks = t->cpu_ticks;
+  }
+  unlock_irq(flags);
+  return n;
+}
 
 Thread* current_thread() { return g.running ? this_core()->current : nullptr; }
 
@@ -535,6 +601,11 @@ bool join(Thread* t, uint64_t timeout_us) {
     yield();
   }
   while (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) yield();  // its core is still leaving it
+  {
+    const uint64_t flags = lock_irq();
+    unregister_locked(t);
+    unlock_irq(flags);
+  }
   g.allocator->deallocate(t->stack);
   g.allocator->deallocate(t);
   return true;
