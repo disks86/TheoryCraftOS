@@ -152,6 +152,7 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.cpp
   src/Hardware/StorageDevice/Usb/UsbMassStorageDevice.cpp
   src/FileSystemDemo.cpp
+  src/SystemFileSystem.cpp
   src/Hardware/StorageDevice/Partition/PartitionScanner.cpp
   src/AsyncDemo.cpp
   src/Async/Executor.cpp
@@ -191,6 +192,7 @@ add_executable(BOOTX64
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
   src/Desktop/DesktopSurface.cpp
+  src/Desktop/FileExplorer.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
   src/GuiDemo.cpp
@@ -214,6 +216,7 @@ add_executable(BOOTX64
   src/Gui/Controls/ScrollBar.cpp
   src/Gui/Controls/GridModel.cpp
   src/Gui/Controls/DataGrid.cpp
+  src/Gui/Controls/ListView.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
   src/Gui/Controls/VideoPlayerControl.cpp

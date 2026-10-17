@@ -18,12 +18,13 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "About"
-// (an ordinary window) and "Shut Down...", which asks for confirmation in a modal dialog and then only
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer"
+// and "About" (ordinary windows) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
 // power-off once the desktop loop returns.
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
+#include "Desktop/FileExplorer.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -65,6 +66,12 @@ class Desktop {
   gui::WindowSwitcher& switcher() { return switcher_; }
   gui::MessageDialog& shutdown_dialog() { return shutdown_dialog_; }
   gui::Frame& about_window() { return about_; }
+  gui::Frame& explorer_window() { return explorer_; }
+  FileExplorer& explorer() { return explorer_; }
+  // The filesystem the file explorer browses (nullptr: none). It must outlive the desktop.
+  void set_file_system(filesystem::IFileSystem* fs) { explorer_.set_file_system(fs); }
+  // Opens the file explorer window, or brings it forward (restoring it if minimized).
+  void open_explorer();
   // Opens the About window, or brings it forward (restoring it if minimized).
   void open_about();
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
@@ -95,6 +102,7 @@ class Desktop {
   bool step(uint64_t uptime_us);
 
  private:
+  static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
@@ -112,6 +120,7 @@ class Desktop {
   gui::Panel tray_;
   gui::Label clock_;
   gui::MessageDialog shutdown_dialog_;
+  FileExplorer explorer_;
   gui::Frame about_;
   gui::Label about_lines_[3];
   ClockSource clock_source_ = nullptr;
@@ -122,6 +131,7 @@ class Desktop {
   uint64_t stall_since_us_ = 0, stall_reported_us_ = 0;
   uint64_t polled_second_ = ~0ull;  // the uptime second the source was last read in
   uint64_t shown_ = ~0ull;          // what the label shows, packed (see step())
+  uint64_t now_us_ = 0;             // the latest uptime pump() was given (the explorer measures double clicks with it)
   bool shutdown_requested_ = false;
 };
 
