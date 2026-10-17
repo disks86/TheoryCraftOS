@@ -461,20 +461,31 @@ void DataGrid::on_mouse_wheel(const MouseArgs& args) {
   invalidate();
 }
 
+bool DataGrid::copy_selected_row() {
+  UiGuard lock(this);
+  if (selected_ < 0 || !clipboard()) return false;
+  String line(allocator());
+  for (uint32_t c = 0; c < columns_.count(); ++c) {
+    model_->cell_text(static_cast<uint32_t>(selected_), c, &cell_b_);
+    if ((c > 0 && !line.push_back('\t')) || !line.append(cell_b_.view())) return false;
+  }
+  return clipboard()->set_text(line.view());
+}
+
+// A right click on a row selects it, as a left click does; elsewhere (the header, empty space) the selection stays.
+void DataGrid::prepare_context_menu(int32_t x, int32_t y) {
+  if (x < 0 || y < 0) return;
+  const Rect2D body = body_rect();
+  if (!contains(body, x, y)) return;
+  const uint32_t position = top_ + static_cast<uint32_t>((y - body.y) / kRowHeight);
+  if (position < order_.count()) select_row(static_cast<int32_t>(order_[position]));
+}
+
 bool DataGrid::on_key(const KeyArgs& args) {
   using namespace hardware;
   const int32_t n = static_cast<int32_t>(order_.count());
   const int32_t current = selected_ >= 0 ? position_of_row(selected_) : -1;
-  if ((args.modifiers & modifier::kControl) && args.usage == key::kA + 2) {  // Ctrl+C: the selected row, cells tab separated
-    if (selected_ < 0 || !clipboard()) return false;
-    String line(allocator());
-    for (uint32_t c = 0; c < columns_.count(); ++c) {
-      model_->cell_text(static_cast<uint32_t>(selected_), c, &cell_b_);
-      if ((c > 0 && !line.push_back('\t')) || !line.append(cell_b_.view())) return true;
-    }
-    clipboard()->set_text(line.view());
-    return true;
-  }
+  if ((args.modifiers & modifier::kControl) && args.usage == key::kA + 2) return copy_selected_row();   // Ctrl+C
   const int32_t page = static_cast<int32_t>(visible_row_count()) > 1 ? static_cast<int32_t>(visible_row_count()) - 1 : 1;
   switch (args.usage) {
     case key::kDown: move_selection_to(current < 0 ? 0 : current + 1); return true;

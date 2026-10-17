@@ -97,7 +97,9 @@ class MenuPopup final : public Control {
 
   MenuPopup(allocators::IAllocator& allocator, MenuHost& host) : Control(allocator), host_(host) {}
   void set_min_width(int32_t width) { min_width_ = width; }
-  void show(Menu* menu) { menu_ = menu; highlighted_ = -1; }
+  // `armed_`: a menu opened by a mouse press ignores the release of that press until the pointer has moved, so a click that opens it at
+  // the pointer cannot also choose an item.
+  void show(Menu* menu) { menu_ = menu; highlighted_ = -1; armed_ = false; }
   void paint(Painter& painter) override;
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
@@ -117,6 +119,7 @@ class MenuPopup final : public Control {
   int32_t min_width_ = 100;
   Menu* menu_ = nullptr;
   int32_t highlighted_ = -1;
+  bool armed_ = false;
 };
 
 class MenuBar : public Control, public MenuHost {

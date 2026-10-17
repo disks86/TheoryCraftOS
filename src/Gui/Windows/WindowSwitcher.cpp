@@ -20,6 +20,51 @@
 
 namespace gui {
 
+WindowSwitcher::WindowSwitcher(allocators::IAllocator& allocator, WindowManager& manager) : Control(allocator), manager_(manager), menu_(allocator) {
+  restore_item_ = menu_.add_item("Restore", {&WindowSwitcher::run_restore, this});
+  minimize_item_ = menu_.add_item("Minimize", {&WindowSwitcher::run_minimize, this});
+  maximize_item_ = menu_.add_item("Maximize", {&WindowSwitcher::run_maximize, this});
+  menu_.add_separator();
+  close_item_ = menu_.add_item("Close", {&WindowSwitcher::run_close, this});
+  menu_.on_opening(Handler::immediate(&WindowSwitcher::opening, this));
+  set_context_menu(&menu_);
+}
+
+// The menu belongs to the window whose button was clicked (the active window when it comes from the keyboard).
+void WindowSwitcher::prepare_context_menu(int32_t x, int32_t y) {
+  const int32_t button = x < 0 ? -1 : button_at(x, y);
+  menu_frame_ = button >= 0 ? frame_at(static_cast<uint32_t>(button)) : manager_.active();
+}
+
+void WindowSwitcher::opening(void* self, Control&) {
+  auto* s = static_cast<WindowSwitcher*>(self);
+  Frame* f = s->menu_frame_;
+  const bool have = f != nullptr;
+  s->restore_item_->set_enabled(have && f->state() != Frame::State::Normal);
+  s->minimize_item_->set_enabled(have && f->minimize_enabled() && f->state() != Frame::State::Minimized);
+  s->maximize_item_->set_enabled(have && f->maximize_enabled() && f->state() != Frame::State::Maximized);
+  s->close_item_->set_enabled(have && f->close_enabled());
+}
+
+void WindowSwitcher::run_restore(void* self, Control&) {
+  if (Frame* f = static_cast<WindowSwitcher*>(self)->menu_frame_) {
+    f->restore();
+    f->activate();
+  }
+}
+void WindowSwitcher::run_minimize(void* self, Control&) {
+  if (Frame* f = static_cast<WindowSwitcher*>(self)->menu_frame_) f->minimize();
+}
+void WindowSwitcher::run_maximize(void* self, Control&) {
+  if (Frame* f = static_cast<WindowSwitcher*>(self)->menu_frame_) {
+    f->maximize();
+    f->activate();
+  }
+}
+void WindowSwitcher::run_close(void* self, Control&) {
+  if (Frame* f = static_cast<WindowSwitcher*>(self)->menu_frame_) f->close();
+}
+
 uint32_t WindowSwitcher::button_count() const {
   uint32_t n = 0;
   for (uint32_t i = 0; i < manager_.window_count(); ++i) n += !manager_.window_at(i)->modal();

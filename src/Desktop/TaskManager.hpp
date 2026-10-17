@@ -22,6 +22,7 @@
 // window is open). Click a column title to sort the table. The File menu closes the window; the View menu picks the tab.
 #pragma once
 #include "Gui/Controls/DataGrid.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
@@ -91,6 +92,8 @@ class TaskManager : public gui::Frame {
   gui::Label& info_label() { return info_; }
   gui::TabControl& tabs() { return tabs_; }
   gui::MenuBar& menu_bar() { return menu_; }
+  // The table's context menu (Copy Row).
+  gui::ContextMenu& grid_menu() { return grid_menu_; }
   // The meter and label of core `index` (one per online core up to kMaxCoresShown; nullptr for others).
   gui::LevelMeter* core_meter(uint32_t index);
   gui::Label* core_label(uint32_t index);
@@ -131,9 +134,13 @@ class TaskManager : public gui::Frame {
   static void on_show_processes(void* self, gui::Control&);
   static void on_show_performance(void* self, gui::Control&);
   static void on_close_window(void* self, gui::Control&);
+  static void on_copy_row(void* self, gui::Control&);
+  static void on_grid_menu_opening(void* self, gui::Control&);
   static void on_tab_changed(void* self, gui::Control&);
 
   gui::MenuBar menu_;
+  gui::ContextMenu grid_menu_;
+  gui::MenuItem* copy_row_item_ = nullptr;
   gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr;
   gui::TabControl tabs_;
   gui::Panel processes_page_, performance_page_, cpu_row_, memory_row_;

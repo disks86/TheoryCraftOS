@@ -34,6 +34,8 @@ using filesystem::Status;
 FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
+      list_menu_(allocator),
+      address_menu_(allocator),
       toolbar_(allocator),
       status_bar_(allocator),
       address_(allocator),
@@ -71,6 +73,22 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     go->add_item("Up One Level", {&FileExplorer::on_up_menu, this}, "Backspace");
     go->add_item("Address", {&FileExplorer::on_address_menu, this}, "Ctrl+L");
   }
+
+  // The context menus.
+  ctx_open_ = list_menu_.add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
+  ctx_copy_ = list_menu_.add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
+  list_menu_.add_separator();
+  ctx_list_ = list_menu_.add_item("List", {&FileExplorer::on_view_list, this});
+  ctx_icons_ = list_menu_.add_item("Icons", {&FileExplorer::on_view_icons, this});
+  ctx_details_ = list_menu_.add_item("Details", {&FileExplorer::on_view_details, this});
+  list_menu_.add_separator();
+  ctx_up_ = list_menu_.add_item("Up One Level", {&FileExplorer::on_up_menu, this}, "Backspace");
+  list_menu_.add_item("Refresh", {&FileExplorer::on_refresh_menu, this}, "F5");
+  list_menu_.on_opening(Handler::immediate(&FileExplorer::on_list_menu_opening, this));
+  address_menu_.add_item("Copy Address", {&FileExplorer::on_copy_address, this});
+  address_menu_.add_item("Edit Address", {&FileExplorer::on_address_menu, this}, "Ctrl+L");
+  address_.set_context_menu(&address_menu_);
+  view_.set_context_menu(&list_menu_);
 
   address_.set_dock(DockStyle::Fill);
   address_.on_navigate({&FileExplorer::on_navigate, this});
@@ -280,6 +298,23 @@ void FileExplorer::on_navigate(void* self, Control&) {
     message.append(target.view());
     e->status_.set_text(message.view());
   }
+}
+
+// The list's menu is enabled for what is selected and shows the view in use.
+void FileExplorer::on_list_menu_opening(void* self, Control&) {
+  auto* e = static_cast<FileExplorer*>(self);
+  const bool selected = e->view_.selected_item() >= 0;
+  e->ctx_open_->set_enabled(selected);
+  e->ctx_copy_->set_enabled(selected);
+  e->ctx_up_->set_enabled(e->path_.size() > 1);
+  e->ctx_list_->set_checked(e->view_.view_mode() == ViewMode::List);
+  e->ctx_icons_->set_checked(e->view_.view_mode() == ViewMode::Icons);
+  e->ctx_details_->set_checked(e->view_.view_mode() == ViewMode::Details);
+}
+
+void FileExplorer::on_copy_address(void* self, Control&) {
+  auto* e = static_cast<FileExplorer*>(self);
+  if (e->clipboard() && e->clipboard()->set_text(e->path_.view())) e->status_.set_text("Copied the address.");
 }
 
 void FileExplorer::on_view_list(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::List); }

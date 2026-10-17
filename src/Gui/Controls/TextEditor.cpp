@@ -19,6 +19,7 @@
 #include "Gui/Controls/TextEditor.hpp"
 #include "Gui/ClipboardText.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Utility/Move.hpp"
 
 namespace gui {
@@ -29,6 +30,7 @@ constexpr uint32_t kTabStop = static_cast<uint32_t>(TextEditor::kTabWidth);
 
 TextEditor::TextEditor(allocators::IAllocator& allocator)
     : Control(allocator),
+      context_(allocator),
       text_(allocator),
       clipboard_(allocator),
       scratch_(allocator),
@@ -43,6 +45,40 @@ TextEditor::TextEditor(allocators::IAllocator& allocator)
   vscroll_.set_visible(false);
   hscroll_.set_visible(false);
   starts_.push_back(0);
+  context_.on_opening(Handler::immediate(&TextEditor::opening, this));
+  set_context_menu(&context_);
+}
+
+void TextEditor::opening(void* self, Control&) {
+  auto* e = static_cast<TextEditor*>(self);
+  if (!e->cut_item_) {
+    e->cut_item_ = e->context_.add_item("Cut", {&TextEditor::run_cut, e}, "Ctrl+X");
+    e->copy_item_ = e->context_.add_item("Copy", {&TextEditor::run_copy, e}, "Ctrl+C");
+    e->paste_item_ = e->context_.add_item("Paste", {&TextEditor::run_paste, e}, "Ctrl+V");
+    e->delete_item_ = e->context_.add_item("Delete", {&TextEditor::run_delete, e}, "Del");
+    e->context_.add_separator();
+    e->select_item_ = e->context_.add_item("Select All", {&TextEditor::run_select_all, e}, "Ctrl+A");
+  }
+  kernel::Clipboard* clipboard = e->clipboard();
+  const bool can_paste = clipboard ? clipboard->has_text() : !e->clipboard_.empty();
+  e->cut_item_->set_enabled(e->has_selection() && !e->read_only_);
+  e->copy_item_->set_enabled(e->has_selection());
+  e->paste_item_->set_enabled(can_paste && !e->read_only_);
+  e->delete_item_->set_enabled(e->has_selection() && !e->read_only_);
+  e->select_item_->set_enabled(!e->text_.empty());
+}
+
+void TextEditor::run_cut(void* self, Control&) { static_cast<TextEditor*>(self)->cut_selection(); }
+void TextEditor::run_copy(void* self, Control&) { static_cast<TextEditor*>(self)->copy_selection(); }
+void TextEditor::run_paste(void* self, Control&) { static_cast<TextEditor*>(self)->paste(); }
+void TextEditor::run_delete(void* self, Control&) { static_cast<TextEditor*>(self)->delete_selection(); }
+void TextEditor::run_select_all(void* self, Control&) { static_cast<TextEditor*>(self)->select_all(); }
+
+// A right click outside the selection moves the caret there first, as a click does.
+void TextEditor::prepare_context_menu(int32_t x, int32_t y) {
+  if (x < 0 || y < 0) return;
+  const uint32_t at = offset_at_point(x, y);
+  if (!has_selection() || at < selection_start() || at > selection_end()) move_caret(at, false);
 }
 
 void TextEditor::vertical_changed(void* self, Control&) { static_cast<TextEditor*>(self)->on_scroll_changed(); }

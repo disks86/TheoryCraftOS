@@ -27,6 +27,55 @@ namespace {
 constexpr int32_t kPad = 4;  // between the border and the text
 }
 
+TextBox::TextBox(allocators::IAllocator& allocator) : Control(allocator), context_(allocator), text_(allocator), fallback_(allocator) {
+  context_.on_opening(Handler::immediate(&TextBox::opening, this));
+  set_context_menu(&context_);
+}
+
+// The context menu: built when first wanted, and its entries enabled for what the box holds.
+void TextBox::opening(void* self, Control&) {
+  auto* b = static_cast<TextBox*>(self);
+  if (!b->cut_item_) {
+    b->cut_item_ = b->context_.add_item("Cut", {&TextBox::run_cut, b}, "Ctrl+X");
+    b->copy_item_ = b->context_.add_item("Copy", {&TextBox::run_copy, b}, "Ctrl+C");
+    b->paste_item_ = b->context_.add_item("Paste", {&TextBox::run_paste, b}, "Ctrl+V");
+    b->delete_item_ = b->context_.add_item("Delete", {&TextBox::run_delete, b}, "Del");
+    b->context_.add_separator();
+    b->select_item_ = b->context_.add_item("Select All", {&TextBox::run_select_all, b}, "Ctrl+A");
+  }
+  kernel::Clipboard* clipboard = b->clipboard();
+  const bool can_paste = clipboard ? clipboard->has_text() : !b->fallback_.empty();
+  if (b->cut_item_) b->cut_item_->set_enabled(b->has_selection() && !b->read_only_);
+  if (b->copy_item_) b->copy_item_->set_enabled(b->has_selection());
+  if (b->paste_item_) b->paste_item_->set_enabled(can_paste && !b->read_only_);
+  if (b->delete_item_) b->delete_item_->set_enabled(b->has_selection() && !b->read_only_);
+  if (b->select_item_) b->select_item_->set_enabled(!b->text_.empty());
+}
+
+void TextBox::run_cut(void* self, Control&) { static_cast<TextBox*>(self)->cut_selection(); }
+void TextBox::run_copy(void* self, Control&) { static_cast<TextBox*>(self)->copy_selection(); }
+void TextBox::run_paste(void* self, Control&) { static_cast<TextBox*>(self)->paste(); }
+void TextBox::run_delete(void* self, Control&) { static_cast<TextBox*>(self)->delete_selection(); }
+void TextBox::run_select_all(void* self, Control&) { static_cast<TextBox*>(self)->select_all(); }
+
+// A right click outside the selection moves the caret there first, as a click does.
+void TextBox::prepare_context_menu(int32_t x, int32_t) {
+  if (x < 0) return;
+  const uint32_t at = index_at(x);
+  if (!has_selection() || at < selection_start() || at > selection_end()) move_caret(at, false);
+}
+
+bool TextBox::copy_selection() {
+  UiGuard lock(this);
+  return has_selection() && clipboard_put_text(clipboard(), &fallback_, selected_text());
+}
+
+bool TextBox::cut_selection() {
+  UiGuard lock(this);
+  if (read_only_ || !copy_selection()) return false;
+  return replace_selection(StringView());
+}
+
 uint32_t TextBox::visible_chars() const {
   const int32_t room = static_cast<int32_t>(bounds_.width) - 2 * kPad;
   return room > 0 ? static_cast<uint32_t>(room / Painter::kGlyphWidth) : 0;
@@ -90,6 +139,7 @@ bool TextBox::replace_selection(StringView with) {
 }
 
 void TextBox::paste() {
+  UiGuard lock(this);
   String text(allocator());
   if (read_only_ || !clipboard_get_text(clipboard(), fallback_, &text)) return;
   for (uint64_t i = 0; i < text.size(); ++i)  // one line only
@@ -149,19 +199,13 @@ bool TextBox::on_key(const KeyArgs& args) {
   using namespace hardware;
   const uint32_t length = static_cast<uint32_t>(text_.size());
   const bool shift = (args.modifiers & modifier::kShift) != 0, ctrl = (args.modifiers & modifier::kControl) != 0;
-  auto copy = [&] { clipboard_put_text(clipboard(), &fallback_, selected_text()); };
   if (ctrl) {
     switch (args.usage) {
       case key::kA: select_all(); return true;
-      case key::kA + 2: copy(); return true;  // C
-      case key::kA + 23:                      // X
-        if (has_selection()) {
-          copy();
-          replace_selection(StringView());
-        }
-        return true;
+      case key::kA + 2: copy_selection(); return true;  // C
+      case key::kA + 23: cut_selection(); return true;  // X
       case key::kA + 21: paste(); return true;  // V
-      case 0x49: copy(); return true;           // Ctrl+Insert
+      case 0x49: copy_selection(); return true;  // Ctrl+Insert
       default: break;
     }
   }
@@ -186,8 +230,7 @@ bool TextBox::on_key(const KeyArgs& args) {
       return true;
     case 0x4C:  // Delete (with Shift: cut)
       if (shift && has_selection()) {
-        copy();
-        replace_selection(StringView());
+        cut_selection();
       } else if (has_selection()) {
         replace_selection(StringView());
       } else if (!read_only_ && caret_ < length && text_.erase(caret_, 1)) {

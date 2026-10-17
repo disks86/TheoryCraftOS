@@ -67,6 +67,8 @@ class ListView : public Control {
 
   // Whether Ctrl+C copies the selected item's cells (default); a program with a better idea of what to copy turns it off.
   void set_copy_enabled(bool enabled) { UiGuard lock(this); copy_enabled_ = enabled; }
+  // Puts the selected item's cells (tab separated) on the clipboard; false if nothing is selected or there is no clipboard.
+  bool copy_selected_item();
 
   // --- Selection
   int32_t selected_item() const { return selected_; }  // -1 = none
@@ -96,6 +98,7 @@ class ListView : public Control {
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
   void on_mouse_wheel(const MouseArgs& args) override;
+  void prepare_context_menu(int32_t x, int32_t y) override;
   bool on_key(const KeyArgs& args) override;
 
  protected:

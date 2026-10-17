@@ -19,9 +19,10 @@
 // The taskbar's window switcher: one button per window (dialogs are left out), in the order the windows were
 // created. The active window's button is pressed in; clicking it minimizes that window, clicking any
 // other button restores (if needed), raises and activates its window. Ignores clicks while a modal
-// window is open.
+// window is open. A right click on a button opens that window's menu: Restore, Minimize, Maximize, Close.
 #pragma once
 #include "Gui/Control.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 
 namespace gui {
@@ -30,7 +31,12 @@ class WindowSwitcher : public Control {
  public:
   static constexpr int32_t kMaxButtonWidth = 160, kMinButtonWidth = 24, kGap = 2;
 
-  WindowSwitcher(allocators::IAllocator& allocator, WindowManager& manager) : Control(allocator), manager_(manager) {}
+  WindowSwitcher(allocators::IAllocator& allocator, WindowManager& manager);
+  // The window menu (for tests). It acts on the window whose button was clicked.
+  ContextMenu& window_menu() { return menu_; }
+  Frame* menu_frame() const { return menu_frame_; }
+  bool accepts_context_menu(int32_t x, int32_t y) const override { return !manager_.has_modal() && (button_at(x, y) >= 0 || x < 0); }
+  void prepare_context_menu(int32_t x, int32_t y) override;
 
   // The buttons, left to right.
   uint32_t button_count() const;
@@ -43,8 +49,16 @@ class WindowSwitcher : public Control {
 
  private:
   int32_t button_at(int32_t x, int32_t y) const;  // -1 = none
+  static void opening(void* self, Control&);
+  static void run_restore(void* self, Control&);
+  static void run_minimize(void* self, Control&);
+  static void run_maximize(void* self, Control&);
+  static void run_close(void* self, Control&);
 
   WindowManager& manager_;
+  ContextMenu menu_;
+  MenuItem *restore_item_ = nullptr, *minimize_item_ = nullptr, *maximize_item_ = nullptr, *close_item_ = nullptr;
+  Frame* menu_frame_ = nullptr;   // the window the menu is open for
   int32_t pressed_ = -1;
 };
 

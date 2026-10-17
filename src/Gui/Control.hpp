@@ -44,6 +44,7 @@ class Clipboard;
 namespace gui {
 
 class Window;
+class ContextMenu;
 
 // Threading. The control tree of a Window is protected by one recursive mutex (Window::ui_mutex()):
 // painting, input delivery and every public mutator of a control take it, so any thread may call
@@ -140,6 +141,15 @@ class Control {
   // The pointer to draw while the mouse is at (x, y) of this control (or is captured by it).
   virtual CursorShape cursor_shape(int32_t /*x*/, int32_t /*y*/) const { return CursorShape::Arrow; }
 
+  // --- Context menu. A control with one has it opened (at the pointer) by a right-button press on it or on a control inside it that has
+  // none of its own, and from the keyboard by the Menu key or Shift+F10 while it or something inside it has the focus. See ContextMenu.
+  void set_context_menu(ContextMenu* menu) { UiGuard lock(this); context_menu_ = menu; }
+  ContextMenu* context_menu() const { return context_menu_; }
+  // Whether a right click at (x, y) of this control opens the menu (a control can keep the right button for itself in places).
+  virtual bool accepts_context_menu(int32_t /*x*/, int32_t /*y*/) const { return true; }
+  // Called just before the menu opens for a click at (x, y) of this control: a list selects the item under the pointer.
+  virtual void prepare_context_menu(int32_t /*x*/, int32_t /*y*/) {}
+
   // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
   Control* hit_test(int32_t x, int32_t y);
 
@@ -164,6 +174,7 @@ class Control {
   allocators::IAllocator& allocator_;
   List<Control*> children_;
   Control* parent_ = nullptr;
+  ContextMenu* context_menu_ = nullptr;
   Window* attached_ = nullptr;  // the window whose tree this control is in (also set on a window's popup)
   Window* history_window_ = nullptr;  // the last window it was in: told when the control is destroyed (so the window must outlive its controls)
   void attach(Window* window);   // this control and everything below it

@@ -126,6 +126,8 @@ class DrawingCanvas : public Control {
 
   bool focusable() const override { return true; }
   CursorShape cursor_shape(int32_t x, int32_t y) const override;
+  // The right button paints with the secondary color, except while the Select tool is in use: then it opens the context menu.
+  bool accepts_context_menu(int32_t, int32_t) const override { return tool_ == PaintTool::Select && !drawing_; }
   void layout() override;
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;

@@ -32,6 +32,7 @@
 #include "Desktop/PrintDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/ColorPalette.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DrawingCanvas.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -81,6 +82,8 @@ class Paint : public gui::Frame {
   gui::ColorPicker& color_picker() { return picker_; }
   gui::Slider& size_slider() { return size_; }
   gui::MenuBar& menu_bar() { return menu_; }
+  // The canvas's context menu (while the Select tool is in use): Undo, Redo, Cut, Copy, Paste, Delete, Select All.
+  gui::ContextMenu& canvas_menu() { return canvas_menu_; }
   gui::Label& status_label() { return status_; }
   gui::Label& position_label() { return position_; }
   gui::Label& zoom_label() { return zoom_label_; }
@@ -119,6 +122,8 @@ class Paint : public gui::Frame {
   static void on_toggle_grid(void* self, gui::Control&);
   static void on_actual_size(void* self, gui::Control&);
   static void on_select_all(void* self, gui::Control&);
+  static void on_delete_selection(void* self, gui::Control&);
+  static void on_canvas_menu_opening(void* self, gui::Control&);
   static void on_close_window(void* self, gui::Control&);
   static void on_canvas_changed(void* self, gui::Control&);
   static void on_pointer(void* self, gui::Control&);
@@ -131,6 +136,8 @@ class Paint : public gui::Frame {
   void update_position();
 
   gui::MenuBar menu_;
+  gui::ContextMenu canvas_menu_;
+  gui::MenuItem *ctx_undo_ = nullptr, *ctx_redo_ = nullptr, *ctx_cut_ = nullptr, *ctx_copy_ = nullptr, *ctx_paste_ = nullptr, *ctx_delete_ = nullptr;
   gui::Panel options_bar_, palette_bar_, status_bar_;
   gui::Label size_label_, size_value_, zoom_label_, status_, position_;
   gui::Slider size_;

@@ -25,6 +25,7 @@
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Controls/Panel.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Kernel/Sync.hpp"
@@ -63,6 +64,9 @@ class FileExplorer : public gui::Frame {
   gui::ListView& view() { return view_; }
   gui::BreadcrumbBar& address_bar() { return address_; }
   gui::MenuBar& menu_bar() { return menu_; }
+  // The context menus: on the list (Open, Copy Path, the views, Refresh, Up) and on the address bar (Copy Address, Edit Address).
+  gui::ContextMenu& list_menu() { return list_menu_; }
+  gui::ContextMenu& address_menu() { return address_menu_; }
   // The View menu's entries; the one for the view in use is checked.
   gui::MenuItem* list_item() { return list_item_; }
   gui::MenuItem* icons_item() { return icons_item_; }
@@ -73,6 +77,8 @@ class FileExplorer : public gui::Frame {
 
  private:
   static void on_navigate(void* self, gui::Control&);
+  static void on_list_menu_opening(void* self, gui::Control&);
+  static void on_copy_address(void* self, gui::Control&);
   static void on_view_list(void* self, gui::Control&);
   static void on_view_icons(void* self, gui::Control&);
   static void on_view_details(void* self, gui::Control&);
@@ -91,6 +97,8 @@ class FileExplorer : public gui::Frame {
   void update_status();
 
   gui::MenuBar menu_;
+  gui::ContextMenu list_menu_, address_menu_;
+  gui::MenuItem *ctx_open_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
   gui::Panel toolbar_, status_bar_;
   gui::BreadcrumbBar address_;
   gui::Label status_;

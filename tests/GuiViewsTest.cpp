@@ -46,6 +46,7 @@
 #include "Gui/Controls/ToolStrip.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/ImageView.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/ListView.hpp"
@@ -109,6 +110,26 @@ static void click(Window& w, int32_t x, int32_t y) {
   w.mouse_button(x, y, MouseButton::Left, false);
 }
 
+// Clicks the row of `item` in the menu shown as the window's popup. False if there is no popup or no such item, or the item is disabled (the
+// click then does nothing and the popup is closed).
+static bool click_popup_item(Window& w, Menu* m, const char* item) {
+  Control* popup = w.popup();
+  if (!popup || !m) return false;
+  int32_t top = 2;
+  for (uint32_t i = 0; i < m->item_count(); ++i) {
+    const int32_t height = m->item(i)->separator ? MenuPopup::kSeparatorHeight : MenuPopup::kRowHeight;
+    if (!m->item(i)->separator && m->item(i)->text.view().equals(item)) {
+      const bool enabled = m->item(i)->enabled();
+      click(w, popup->bounds().x + 30, popup->bounds().y + top + height / 2);
+      if (w.popup()) w.close_popup();   // a disabled item keeps the menu open
+      return enabled;
+    }
+    top += height;
+  }
+  w.close_popup();
+  return false;
+}
+
 // Chooses a menu item the way a user does: clicks the title, then the item's row in the drop-down. False if there is no such
 // menu or item, or the item is disabled (the click then does nothing).
 static bool choose(Window& w, MenuBar& bar, const char* menu, const char* item) {
@@ -117,21 +138,20 @@ static bool choose(Window& w, MenuBar& bar, const char* menu, const char* item) 
     if (bar.menu(m)->title().equals(menu)) index = static_cast<int32_t>(m);
   if (index < 0 || !bar.find_item(menu, item)) return false;
   bar.open_menu(index);
-  Control* popup = w.popup();
-  if (!popup) return false;
-  int32_t top = 2;
-  Menu* m = bar.menu(static_cast<uint32_t>(index));
-  for (uint32_t i = 0; i < m->item_count(); ++i) {
-    const int32_t height = m->item(i)->separator ? MenuPopup::kSeparatorHeight : MenuPopup::kRowHeight;
-    if (!m->item(i)->separator && m->item(i)->text.view().equals(item)) {
-      const bool enabled = m->item(i)->enabled();
-      click(w, popup->bounds().x + 30, popup->bounds().y + top + height / 2);
-      if (!enabled) bar.close_menu();   // a disabled item keeps the menu open
-      return enabled;
-    }
-    top += height;
-  }
-  return false;
+  return click_popup_item(w, bar.menu(static_cast<uint32_t>(index)), item);
+}
+
+// Presses and releases the right button at (x, y) of the window, which opens the context menu there.
+static void right_click(Window& w, int32_t x, int32_t y) {
+  w.mouse_move(x, y);
+  w.mouse_button(x, y, MouseButton::Right, true);
+  w.mouse_button(x, y, MouseButton::Right, false);
+}
+
+// Right-clicks at (x, y) and chooses `item` in the menu that opens. False if no menu opened or the item cannot be chosen.
+static bool choose_context(Window& w, ContextMenu& menu, int32_t x, int32_t y, const char* item) {
+  right_click(w, x, y);
+  return w.popup() && menu.open() && click_popup_item(w, &menu.menu(), item);
 }
 static Point center(Control& c) {
   const Point o = c.window_origin();
@@ -3326,6 +3346,366 @@ static void test_print_and_color_flows() {
   CHECK(a.live == 0);
 }
 
+// --- Context menus -------------------------------------------------------------------------------------------------
+
+static void test_context_menu_control() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    Panel panel(a);
+    Button inner(a), plain(a);
+    panel.set_bounds({10, 10, 380, 280});
+    inner.set_bounds({20, 20, 100, 30});
+    plain.set_bounds({20, 100, 100, 30});
+    panel.add(&inner);
+    panel.add(&plain);
+    w.add(&panel);
+    ContextMenu menu(a);
+    Counter first, second, opening;
+    MenuItem* one = menu.add_item("First", first.handler(), "Ctrl+1");
+    menu.add_separator();
+    MenuItem* two = menu.add_item("Second", second.handler());
+    menu.on_opening(Handler::immediate([](void* c, Control&) { ++static_cast<Counter*>(c)->count; }, &opening));
+    CHECK(menu.find_item("Second") == two && !menu.find_item("Third") && !menu.open());
+    w.layout();
+
+    // Without a context menu the right button is the control's own.
+    right_click(w, 30, 30);
+    CHECK(!w.popup() && opening.count == 0);
+    panel.set_context_menu(&menu);
+    CHECK(panel.context_menu() == &menu);
+
+    // A right click opens the menu at the pointer - on the panel, or on a control inside it that has none.
+    right_click(w, 200, 150);
+    CHECK(menu.open() && w.popup() != nullptr && opening.count == 1 && w.popup()->bounds().x == 200 && w.popup()->bounds().y == 150);
+    CHECK(w.popup()->bounds().width >= 100 && w.popup()->bounds().height > 20);
+    w.render();
+    CHECK(click_popup_item(w, &menu.menu(), "First") && first.count == 1 && !menu.open() && !w.popup());
+    CHECK(choose_context(w, menu, 30, 30, "Second") && second.count == 1 && opening.count == 2);      // on the button inside
+    // Releasing the button right where the menu opened does not choose an item; moving first does.
+    right_click(w, 385, 285);                                // so near the corner that the menu is moved up and left, under the pointer
+    CHECK(menu.open() && w.popup()->bounds().x + static_cast<int32_t>(w.popup()->bounds().width) <= 400 && first.count == 1 && second.count == 1);
+    w.close_popup();
+    CHECK(!menu.open());
+    // A disabled item does nothing.
+    one->set_enabled(false);
+    CHECK(!choose_context(w, menu, 200, 150, "First") && first.count == 1 && !w.popup());
+    one->set_enabled(true);
+    // A click elsewhere closes it; a right click elsewhere opens it again there.
+    right_click(w, 200, 150);
+    CHECK(menu.open());
+    right_click(w, 250, 250);
+    CHECK(menu.open() && w.popup()->bounds().x <= 250 && w.popup()->bounds().x + static_cast<int32_t>(w.popup()->bounds().width) <= 400 && opening.count == 6);   // (every opening counts)
+    click(w, 5, 5);
+    CHECK(!menu.open() && !w.popup());
+    // A control can keep the right button for itself in places (here with no menu around it to fall back on).
+    struct Picky final : Control {
+      explicit Picky(allocators::IAllocator& al) : Control(al) {}
+      bool accepts_context_menu(int32_t x, int32_t) const override { return x < 50; }
+      int downs = 0;
+      void on_mouse_down(const MouseArgs& args) override { if (args.button == MouseButton::Right) ++downs; }
+    } picky(a);
+    picky.set_bounds({150, 100, 100, 30});
+    panel.add(&picky);
+    panel.set_context_menu(nullptr);
+    picky.set_context_menu(&menu);
+    right_click(w, 170, 125);                                // the left half: the menu
+    CHECK(menu.open() && picky.downs == 0);
+    w.close_popup();
+    right_click(w, 230, 125);                                // the right half: the control gets the click itself
+    CHECK(!menu.open() && picky.downs == 1);
+    picky.set_context_menu(nullptr);
+    panel.set_context_menu(&menu);
+    right_click(w, 230, 125);                                // now the panel's menu is the one that applies there
+    CHECK(menu.open() && picky.downs == 1);
+    w.close_popup();
+    w.render();
+
+    // From the keyboard: the Menu key or Shift+F10 opens it under the focused control, the arrows and Enter choose.
+    w.set_focus(&inner);
+    const int32_t before = opening.count;
+    press(w, 0x65);
+    CHECK(menu.open() && opening.count == before + 1 && w.popup()->bounds().y >= 20 + 30);
+    press(w, key::kDown);
+    press(w, key::kEnter);                                   // the first item is highlighted already; Down goes to the second
+    CHECK(!menu.open() && second.count == 2);
+    press(w, key::kF1 + 9, modifier::kLeftShift);
+    CHECK(menu.open());
+    press(w, key::kEscape);
+    CHECK(!menu.open());
+    // Without a window there is nothing to open in; without items there is no menu.
+    ContextMenu empty(a);
+    plain.set_context_menu(&empty);
+    right_click(w, 30, 110);
+    CHECK(!empty.open());
+    plain.set_context_menu(nullptr);
+    panel.remove(&picky);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_text_context_menus() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    w.set_clipboard(&cb);
+    TextBox box(a);
+    TextEditor ed(a);
+    box.set_bounds({10, 10, 200, 24});
+    ed.set_bounds({10, 60, 300, 100});
+    w.add(&box);
+    w.add(&ed);
+    w.layout();
+    String got(a);
+    auto enabled = [&](ContextMenu* m, const char* item) { return m->find_item(item) && m->find_item(item)->enabled(); };
+
+    // A text box: the items are enabled for what it holds, and run.
+    ContextMenu* menu = box.context_menu();
+    CHECK(menu != nullptr && menu->menu().item_count() == 0);          // built when first wanted
+    box.set_text("hello world");
+    right_click(w, 20, 20);
+    CHECK(menu->open() && w.focus() == &box && menu->menu().item_count() == 6);
+    CHECK(!enabled(menu, "Cut") && !enabled(menu, "Copy") && !enabled(menu, "Delete") && !enabled(menu, "Paste") && enabled(menu, "Select All"));
+    w.close_popup();
+    CHECK(choose_context(w, *menu, 20, 20, "Select All") && box.selected_text().equals("hello world"));
+    right_click(w, 20, 20);                                            // inside the selection: it stays
+    CHECK(box.has_selection() && enabled(menu, "Cut") && enabled(menu, "Copy") && enabled(menu, "Delete") && !enabled(menu, "Paste"));
+    w.close_popup();
+    CHECK(choose_context(w, *menu, 20, 20, "Copy") && cb.get_text(&got) && got.view().equals("hello world") && box.text().equals("hello world"));
+    press(w, 0x4A);                                                    // Home, then select "hello"
+    for (int i = 0; i < 5; ++i) press(w, key::kRight, modifier::kLeftShift);
+    right_click(w, 20, 20);                                            // inside the selection: it stays
+    CHECK(box.selected_text().equals("hello"));
+    w.close_popup();
+    right_click(w, 10 + 4 + 8 * 8, 20);                                // outside it: the caret goes where the click is
+    CHECK(!box.has_selection() && box.caret() == 8 && enabled(menu, "Paste"));
+    w.close_popup();
+    CHECK(choose_context(w, *menu, 10 + 4 + 8 * 8, 20, "Paste") && box.text().equals("hello wohello worldrld"));
+    box.set_text("one two");
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(choose_context(w, *menu, 20, 20, "Cut") && box.text().empty() && cb.get_text(&got) && got.view().equals("one two"));
+    box.set_text("abc");
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(choose_context(w, *menu, 20, 20, "Delete") && box.text().empty());
+    box.set_text("fixed");
+    box.set_read_only(true);
+    press(w, key::kA, modifier::kLeftControl);
+    right_click(w, 20, 20);
+    CHECK(!enabled(menu, "Cut") && enabled(menu, "Copy") && !enabled(menu, "Delete") && !enabled(menu, "Paste"));
+    w.close_popup();
+    box.set_read_only(false);
+    // Without a window clipboard, copy and paste still work inside the box.
+    w.set_clipboard(nullptr);
+    box.set_text("private");
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(choose_context(w, *menu, 20, 20, "Copy"));
+    press(w, 0x4D);
+    right_click(w, 20, 20);
+    CHECK(enabled(menu, "Paste"));
+    w.close_popup();
+    CHECK(choose_context(w, *menu, 20, 20, "Paste") && box.text().equals("pprivaterivate"));   // at the caret the click set
+    w.set_clipboard(&cb);
+    // The keyboard: the Menu key opens it under the box.
+    w.set_focus(&box);
+    press(w, 0x65);
+    CHECK(menu->open() && w.popup()->bounds().y >= 10 + 24);
+    press(w, key::kEscape);
+    CHECK(!menu->open());
+
+    // The multi-line editor has the same menu.
+    ContextMenu* emenu = ed.context_menu();
+    CHECK(emenu != nullptr && emenu != menu);
+    ed.set_text("alpha beta");
+    CHECK(choose_context(w, *emenu, 20, 70, "Select All") && ed.has_selection());
+    CHECK(choose_context(w, *emenu, 20, 70, "Cut") && ed.text().empty() && cb.get_text(&got) && got.view().equals("alpha beta"));
+    right_click(w, 20, 70);
+    CHECK(!enabled(emenu, "Cut") && !enabled(emenu, "Select All") && enabled(emenu, "Paste"));    // empty: nothing to select
+    w.close_popup();
+    CHECK(choose_context(w, *emenu, 20, 70, "Paste") && ed.text().equals("alpha beta"));
+    ed.set_caret(0);
+    right_click(w, 10 + 3 + 6 * 8, 70 + 4);                            // a click in the text moves the caret there
+    CHECK(ed.caret() == 6 && !ed.has_selection());
+    w.close_popup();
+    ed.set_read_only(true);
+    right_click(w, 20, 70);
+    CHECK(!enabled(emenu, "Paste") && !enabled(emenu, "Delete"));
+    w.close_popup();
+    ed.set_read_only(false);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_application_context_menus() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok);
+    make_file(fs, "/a.txt", "abc");
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    w.set_clipboard(&cb);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    String got(a);
+    auto enabled = [&](ContextMenu& m, const char* item) { return m.find_item(item) && m.find_item(item)->enabled(); };
+
+    // --- File explorer: a right click selects the item under the pointer; the menu follows the selection and the view.
+    {
+      desktop::FileExplorer ex(a);
+      ex.set_file_system(&fs);
+      CHECK(mgr.add_window(&ex));
+      w.layout();
+      Rect2D row;
+      const Point o = ex.view().window_origin();
+      CHECK(ex.view().item_rect(1, &row));                        // a.txt
+      const int32_t fx = o.x + row.x + 30, fy = o.y + row.y + 5;
+      right_click(w, fx, fy);
+      ContextMenu& menu = ex.list_menu();
+      CHECK(menu.open() && ex.view().selected_item() == 1 && enabled(menu, "Open") && enabled(menu, "Copy Path") && !enabled(menu, "Up One Level"));
+      CHECK(menu.find_item("Details")->checked() && !menu.find_item("List")->checked());
+      w.close_popup();
+      CHECK(choose_context(w, menu, fx, fy, "Copy Path") && cb.get_text(&got) && got.view().equals("/a.txt"));
+      CHECK(choose_context(w, menu, fx, fy, "Icons") && ex.view().view_mode() == ViewMode::Icons && ex.icons_item()->checked());
+      CHECK(ex.view().item_rect(0, &row));
+      CHECK(choose_context(w, menu, o.x + row.x + 20, o.y + row.y + 20, "Open") && ex.path().equals("/docs"));   // the folder, by its icon
+      CHECK(choose_context(w, menu, o.x + 200, o.y + 100, "Details") && ex.view().view_mode() == ViewMode::Details);
+      right_click(w, o.x + 200, o.y + 100);                       // an empty place: nothing is selected, so nothing to open
+      CHECK(ex.view().selected_item() == -1 && !enabled(menu, "Open") && !enabled(menu, "Copy Path") && enabled(menu, "Up One Level"));
+      w.close_popup();
+      CHECK(choose_context(w, menu, o.x + 200, o.y + 100, "Up One Level") && ex.path().equals("/"));
+      CHECK(choose_context(w, menu, o.x + 200, o.y + 100, "Refresh") && ex.view().item_count() == 2);
+      // The address bar's menu.
+      const Point bar = ex.address_bar().window_origin();
+      CHECK(choose_context(w, ex.address_menu(), bar.x + 6, bar.y + 12, "Copy Address") && cb.get_text(&got) && got.view().equals("/") &&
+            ex.status_label().text().equals("Copied the address."));
+      CHECK(choose_context(w, ex.address_menu(), bar.x + 6, bar.y + 12, "Edit Address") && ex.address_bar().editing());
+      press(w, key::kEscape);
+      // From the keyboard, on the selected item.
+      ex.view().select_item(0);
+      w.set_focus(&ex.view());
+      press(w, 0x65);
+      CHECK(menu.open() && enabled(menu, "Open"));
+      press(w, key::kEscape);
+      CHECK(choose(w, ex.menu_bar(), "File", "Close"));
+    }
+
+    // --- Task manager: Copy Row.
+    {
+      desktop::TaskManager tm(a);
+      FakeMonitor mon;
+      tm.set_monitor(&mon);
+      CHECK(mgr.add_window(&tm));
+      tm.update(1000000);
+      w.layout();
+      const Point o = tm.grid().window_origin();
+      const Rect2D body = tm.grid().body_rect();
+      const int32_t rx = o.x + body.x + 30, ry = o.y + body.y + 5 + DataGrid::kRowHeight;   // the second row
+      right_click(w, o.x + 20, o.y + 5);                           // the header: nothing selected, nothing to copy
+      CHECK(tm.grid_menu().open() && tm.grid().selected_row() == -1 && !enabled(tm.grid_menu(), "Copy Row"));
+      w.close_popup();
+      CHECK(choose_context(w, tm.grid_menu(), rx, ry, "Copy Row") && tm.grid().selected_row() >= 0 && cb.get_text(&got));
+      CHECK(got.view().find('\t') != StringView::npos && got.view().find("idle") != StringView::npos);
+      CHECK(choose(w, tm.menu_bar(), "File", "Close"));
+    }
+
+    // --- Paint: the right button paints, except with the Select tool, where it opens the menu.
+    {
+      desktop::Paint paint(a);
+      CHECK(mgr.add_window(&paint));
+      w.layout();
+      DrawingCanvas& c = paint.canvas();
+      ContextMenu& menu = paint.canvas_menu();
+      paint.palette().set_secondary(0xFF00FF00);
+      right_click(w, pixel_point(c, 20, 20).x, pixel_point(c, 20, 20).y);
+      CHECK(!menu.open() && !w.popup());
+      drag(w, pixel_point(c, 20, 20), pixel_point(c, 30, 20), MouseButton::Right);
+      CHECK(c.pixel(25, 20) == 0xFF00FF00 && !menu.open());      // painted with the secondary color
+      paint.tools().select_tool(7);
+      const Point at = pixel_point(c, 100, 100);
+      right_click(w, at.x, at.y);
+      CHECK(menu.open() && enabled(menu, "Undo") && !enabled(menu, "Redo") && !enabled(menu, "Cut") && !enabled(menu, "Delete") && enabled(menu, "Copy") && !enabled(menu, "Paste"));
+      w.close_popup();
+      c.select_rect(10, 10, 30, 30);
+      CHECK(choose_context(w, menu, at.x, at.y, "Copy") && cb.has_image());
+      right_click(w, at.x, at.y);
+      CHECK(enabled(menu, "Cut") && enabled(menu, "Delete") && enabled(menu, "Paste"));
+      w.close_popup();
+      CHECK(choose_context(w, menu, at.x, at.y, "Delete") && c.pixel(25, 20) == 0xFF00FF00 && c.has_selection());
+      CHECK(choose_context(w, menu, at.x, at.y, "Undo") && c.pixel(25, 20) == 0xFF00FF00);
+      CHECK(choose_context(w, menu, at.x, at.y, "Select All") && c.has_selection() && c.selection().width == 640);
+      CHECK(choose_context(w, menu, at.x, at.y, "Paste") && c.floating());
+      CHECK(choose(w, paint.menu_bar(), "File", "Close"));
+    }
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_window_switcher_menu() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.open_text_editor();
+    d.open_paint();
+    d.open_explorer();
+    d.window().layout();
+    WindowSwitcher& sw = d.switcher();
+    Window& w = d.window();
+    CHECK(sw.button_count() == 3);
+    auto button_point = [&](uint32_t i) {
+      const Point o = sw.window_origin();
+      const Rect2D r = sw.button_rect(i);
+      return Point{o.x + r.x + static_cast<int32_t>(r.width) / 2, o.y + r.y + static_cast<int32_t>(r.height) / 2};
+    };
+    // Right-clicking a button opens the menu of that window.
+    Point p = button_point(0);
+    right_click(w, p.x, p.y);
+    CHECK(sw.window_menu().open() && sw.menu_frame() == &d.notepad());
+    CHECK(!sw.window_menu().find_item("Restore")->enabled() && sw.window_menu().find_item("Minimize")->enabled() && sw.window_menu().find_item("Maximize")->enabled() &&
+          sw.window_menu().find_item("Close")->enabled());
+    w.close_popup();
+    CHECK(d.notepad().state() == Frame::State::Normal);
+    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Minimize") && d.notepad().state() == Frame::State::Minimized);
+    right_click(w, p.x, p.y);
+    CHECK(sw.window_menu().find_item("Restore")->enabled() && !sw.window_menu().find_item("Minimize")->enabled());
+    w.close_popup();
+    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Restore") && d.notepad().state() == Frame::State::Normal && d.windows().active() == &d.notepad());
+    p = button_point(1);
+    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Maximize") && d.paint().state() == Frame::State::Maximized && sw.menu_frame() == &d.paint());
+    right_click(w, p.x, p.y);
+    CHECK(sw.window_menu().find_item("Restore")->enabled() && !sw.window_menu().find_item("Maximize")->enabled());
+    w.close_popup();
+    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Restore") && d.paint().state() == Frame::State::Normal);
+    p = button_point(2);
+    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Close") && sw.button_count() == 2 && d.explorer().manager() == nullptr);
+    // An empty part of the switcher has no menu, and neither does it while a dialog is up.
+    right_click(w, sw.window_origin().x + static_cast<int32_t>(sw.bounds().width) - 3, sw.window_origin().y + 5);
+    CHECK(!sw.window_menu().open());
+    d.ask_shut_down();
+    p = button_point(0);
+    right_click(w, p.x, p.y);
+    CHECK(!sw.window_menu().open());
+    d.shutdown_dialog().close();
+    // From the keyboard it is the active window's.
+    w.set_focus(&sw);
+    press(w, 0x65);
+    CHECK(sw.window_menu().open() && sw.menu_frame() == d.windows().active());
+    press(w, key::kEscape);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -3354,6 +3734,10 @@ int main() {
   test_print_dialog();
   test_print_and_color_flows();
   test_app_menus();
+  test_context_menu_control();
+  test_text_context_menus();
+  test_application_context_menus();
+  test_window_switcher_menu();
   test_select_all_keys();
   test_breadcrumb_bar();
   test_file_explorer();

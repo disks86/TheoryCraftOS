@@ -25,6 +25,7 @@
 // parent.
 #pragma once
 #include "Gui/Control.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
 #include "Utility/String.hpp"
 
@@ -96,6 +97,7 @@ class TextEditor : public Control {
   void on_mouse_down(const MouseArgs& args) override;
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
+  void prepare_context_menu(int32_t x, int32_t y) override;
   void on_mouse_wheel(const MouseArgs& args) override;
   bool on_key(const KeyArgs& args) override;
 
@@ -114,6 +116,15 @@ class TextEditor : public Control {
   static void vertical_changed(void* self, Control&);
   static void horizontal_changed(void* self, Control&);
 
+  static void opening(void* self, Control&);
+  static void run_cut(void* self, Control&);
+  static void run_copy(void* self, Control&);
+  static void run_paste(void* self, Control&);
+  static void run_delete(void* self, Control&);
+  static void run_select_all(void* self, Control&);
+
+  ContextMenu context_;   // Cut, Copy, Paste, Delete, Select All; built the first time it is wanted
+  MenuItem *cut_item_ = nullptr, *copy_item_ = nullptr, *paste_item_ = nullptr, *delete_item_ = nullptr, *select_item_ = nullptr;
   String text_, clipboard_, scratch_;
   List<uint32_t> starts_;  // offset of each line's first byte
   uint32_t max_columns_ = 0;

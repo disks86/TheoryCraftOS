@@ -17,6 +17,7 @@
  */
 
 #include "Gui/Window.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace gui {
@@ -225,6 +226,16 @@ void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed
   for (Control* c = target; c && c->parent_ && c != popup_; c = c->parent_) c->parent_->on_descendant_pressed(c);
   if (!target->effectively_enabled()) return;
   if (target->focusable()) set_focus(target);
+  if (button == MouseButton::Right) {  // a right click opens the context menu of the control, or the nearest one around it that has one
+    for (Control* c = target; c; c = c->parent_) {
+      if (!c->context_menu_) continue;
+      const Point o = c->window_origin();
+      if (!c->accepts_context_menu(x - o.x, y - o.y)) continue;
+      c->prepare_context_menu(x - o.x, y - o.y);
+      c->context_menu_->show(*this, x, y);
+      return;
+    }
+  }
   captured_ = target;
   MouseArgs a;
   a.x = x - origin.x;
@@ -252,6 +263,15 @@ void Window::key(const KeyArgs& args) {
   if (popup_) {
     popup_->on_key(args);
     return;
+  }
+  if (args.usage == 0x65 || (args.usage == hardware::key::kF1 + 9 && (args.modifiers & hardware::modifier::kShift))) {  // Menu key, Shift+F10
+    for (Control* c = focus_; c; c = c->parent_) {
+      if (!c->context_menu_ || !c->effectively_enabled()) continue;
+      const Point o = c->window_origin();
+      c->prepare_context_menu(-1, -1);   // no pointer: the control uses what it has selected
+      c->context_menu_->show(*this, o.x + 8, o.y + static_cast<int32_t>(c->bounds().height), true);
+      return;
+    }
   }
   for (Control* c = focus_; c; c = c->parent_)
     if (c->effectively_enabled() && c->on_key(args)) return;

@@ -504,20 +504,29 @@ void ListView::on_mouse_wheel(const MouseArgs& args) {
   else scroll_by(0, direction * 3 * (mode_ == ViewMode::Icons ? kIconCellHeight / 2 : kRowHeight));
 }
 
+bool ListView::copy_selected_item() {
+  UiGuard lock(this);
+  if (selected_ < 0 || !clipboard()) return false;
+  String line(allocator()), cell(allocator());
+  for (uint32_t c = 0; c < columns_.count(); ++c) {
+    model_.cell_text(static_cast<uint32_t>(selected_), c, &cell);
+    if ((c > 0 && !line.push_back('\t')) || !line.append(cell.view())) return false;
+  }
+  return clipboard()->set_text(line.view());
+}
+
+// A right click selects the item under the pointer (and no item on an empty place), as a left click does.
+void ListView::prepare_context_menu(int32_t x, int32_t y) {
+  if (x < 0 || y < 0) return;   // from the keyboard: the selection stays
+  if (contains(header_rect(), x, y)) return;
+  select_item(item_at(x, y));
+}
+
 bool ListView::on_key(const KeyArgs& args) {
   using namespace hardware;
   const int32_t n = static_cast<int32_t>(model_.row_count());
   const int32_t per = metrics_.per_line;
-  if (copy_enabled_ && (args.modifiers & modifier::kControl) && args.usage == key::kA + 2) {  // Ctrl+C: the selected item's cells, tab separated
-    if (selected_ < 0 || !clipboard()) return false;
-    String line(allocator()), cell(allocator());
-    for (uint32_t c = 0; c < columns_.count(); ++c) {
-      model_.cell_text(static_cast<uint32_t>(selected_), c, &cell);
-      if ((c > 0 && !line.push_back('\t')) || !line.append(cell.view())) return true;
-    }
-    clipboard()->set_text(line.view());
-    return true;
-  }
+  if (copy_enabled_ && (args.modifiers & modifier::kControl) && args.usage == key::kA + 2) return copy_selected_item();   // Ctrl+C
   switch (args.usage) {
     case key::kEnter:
       if (selected_ >= 0) fire(activated_);

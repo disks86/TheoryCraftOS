@@ -20,6 +20,7 @@
 #include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Media/ImageCodecs.hpp"
 
 namespace desktop {
@@ -146,6 +147,7 @@ bool Paint::is_picture_name(StringView name) { return format_of_name(name) != me
 Paint::Paint(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
+      canvas_menu_(allocator),
       options_bar_(allocator),
       palette_bar_(allocator),
       status_bar_(allocator),
@@ -255,6 +257,17 @@ Paint::Paint(allocators::IAllocator& allocator)
   tools_.on_selection_changed({&Paint::on_tool, this});
   tools_.on_hover_changed({&Paint::on_tool_hover, this});
 
+  ctx_undo_ = canvas_menu_.add_item("Undo", {&Paint::on_undo, this}, "Ctrl+Z");
+  ctx_redo_ = canvas_menu_.add_item("Redo", {&Paint::on_redo, this}, "Ctrl+Y");
+  canvas_menu_.add_separator();
+  ctx_cut_ = canvas_menu_.add_item("Cut", {&Paint::on_cut, this}, "Ctrl+X");
+  ctx_copy_ = canvas_menu_.add_item("Copy", {&Paint::on_copy, this}, "Ctrl+C");
+  ctx_paste_ = canvas_menu_.add_item("Paste", {&Paint::on_paste, this}, "Ctrl+V");
+  ctx_delete_ = canvas_menu_.add_item("Delete", {&Paint::on_delete_selection, this}, "Del");
+  canvas_menu_.add_separator();
+  canvas_menu_.add_item("Select All", {&Paint::on_select_all, this}, "Ctrl+A");
+  canvas_menu_.on_opening(Handler::immediate(&Paint::on_canvas_menu_opening, this));
+  canvas_.set_context_menu(&canvas_menu_);
   canvas_.set_dock(DockStyle::Fill);
   canvas_.on_changed({&Paint::on_canvas_changed, this});
   canvas_.on_pointer_moved({&Paint::on_pointer, this});
@@ -387,6 +400,20 @@ void Paint::on_toggle_grid(void* self, Control&) {
   auto* p = static_cast<Paint*>(self);
   p->canvas_.set_grid(!p->canvas_.grid());
   p->grid_item_->set_checked(p->canvas_.grid());
+}
+
+void Paint::on_delete_selection(void* self, Control&) { static_cast<Paint*>(self)->canvas_.delete_selection(); }
+
+// What can be done with the selection and the clipboard right now.
+void Paint::on_canvas_menu_opening(void* self, Control&) {
+  auto* p = static_cast<Paint*>(self);
+  const bool selected = p->canvas_.has_selection();
+  p->ctx_undo_->set_enabled(p->canvas_.can_undo());
+  p->ctx_redo_->set_enabled(p->canvas_.can_redo());
+  p->ctx_cut_->set_enabled(selected);
+  p->ctx_copy_->set_enabled(true);   // nothing selected: the whole picture
+  p->ctx_delete_->set_enabled(selected);
+  p->ctx_paste_->set_enabled(p->clipboard() && p->clipboard()->has_image());
 }
 
 void Paint::on_actual_size(void* self, Control&) { static_cast<Paint*>(self)->canvas_.set_zoom(1); }

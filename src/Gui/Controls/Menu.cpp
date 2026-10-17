@@ -120,6 +120,7 @@ void MenuPopup::paint(Painter& painter) {
 }
 
 void MenuPopup::on_mouse_move(const MouseArgs& args) {
+  armed_ = true;
   const int32_t i = item_at(args.y);
   const bool inside = contains({0, 0, bounds_.width, bounds_.height}, args.x, args.y);
   const int32_t now = inside && i >= 0 && !menu_->item(static_cast<uint32_t>(i))->separator ? i : -1;
@@ -135,7 +136,9 @@ void MenuPopup::run(int32_t index) {
   if (it && it->enabled() && !it->separator) host_.activate(it);
 }
 
-void MenuPopup::on_mouse_up(const MouseArgs& args) { run(item_at(args.y)); }
+void MenuPopup::on_mouse_up(const MouseArgs& args) {
+  if (armed_) run(item_at(args.y));
+}
 
 void MenuPopup::step(int32_t direction, int32_t from) {
   const int32_t n = static_cast<int32_t>(menu_->item_count());

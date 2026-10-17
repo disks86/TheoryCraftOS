@@ -64,6 +64,9 @@ class DataGrid : public Control {
   // Fired by Enter on the selected row.
   void on_row_activated(Handler handler) { UiGuard lock(this); activated_ = handler; }
 
+  // Puts the selected row (cells separated by tabs) on the clipboard; false if nothing is selected or there is no clipboard.
+  bool copy_selected_row();
+
   // --- Sorting. column -1 restores the model's order.
   bool sort_by(int32_t column, bool ascending = true);
   int32_t sort_column() const { return sort_column_; }
@@ -89,6 +92,7 @@ class DataGrid : public Control {
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
   void on_mouse_wheel(const MouseArgs& args) override;
+  void prepare_context_menu(int32_t x, int32_t y) override;
   bool on_key(const KeyArgs& args) override;
 
  protected:

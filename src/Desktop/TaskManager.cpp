@@ -47,6 +47,7 @@ bool TaskManager::Model::cell_text(uint32_t row, uint32_t column, String* out) c
 TaskManager::TaskManager(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
+      grid_menu_(allocator),
       tabs_(allocator),
       processes_page_(allocator),
       performance_page_(allocator),
@@ -77,6 +78,8 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
     processes_item_ = view->add_item("Processes", {&TaskManager::on_show_processes, this});
     performance_item_ = view->add_item("Performance", {&TaskManager::on_show_performance, this});
   }
+  copy_row_item_ = grid_menu_.add_item("Copy Row", {&TaskManager::on_copy_row, this}, "Ctrl+C");
+  grid_menu_.on_opening(Handler::immediate(&TaskManager::on_grid_menu_opening, this));
   tabs_.set_dock(DockStyle::Fill);
   tabs_.on_selection_changed(Handler::immediate(&TaskManager::on_tab_changed, this));
   processes_page_.set_style(PanelStyle::Transparent);
@@ -121,6 +124,7 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
   grid_.add_column("CPU s", 70, Align::Right);
   grid_.set_model(&model_);
   grid_.set_dock(DockStyle::Fill);
+  grid_.set_context_menu(&grid_menu_);
 
   processes_page_.add(&grid_);
   tabs_.add_page("Processes", &processes_page_);
@@ -145,6 +149,11 @@ void TaskManager::on_tab_changed(void* self, Control&) {  // the View menu shows
 }
 void TaskManager::on_show_processes(void* self, Control&) { static_cast<TaskManager*>(self)->tabs_.select_page(0); }
 void TaskManager::on_show_performance(void* self, Control&) { static_cast<TaskManager*>(self)->tabs_.select_page(1); }
+void TaskManager::on_copy_row(void* self, Control&) { static_cast<TaskManager*>(self)->grid_.copy_selected_row(); }
+void TaskManager::on_grid_menu_opening(void* self, Control&) {
+  auto* t = static_cast<TaskManager*>(self);
+  t->copy_row_item_->set_enabled(t->grid_.selected_row() >= 0);
+}
 void TaskManager::on_close_window(void* self, Control&) { static_cast<TaskManager*>(self)->close(); }
 
 TaskManager::~TaskManager() { release_view(allocator(), buffer_); }

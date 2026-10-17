@@ -236,6 +236,7 @@ add_executable(BOOTX64
   src/Gui/Controls/GridModel.cpp
   src/Gui/Controls/DataGrid.cpp
   src/Gui/Controls/ListView.cpp
+  src/Gui/Controls/ContextMenu.cpp
   src/Gui/Controls/ToolStrip.cpp
   src/Gui/Controls/ColorPalette.cpp
   src/Gui/Controls/DrawingCanvas.cpp
