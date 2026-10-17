@@ -27,12 +27,12 @@ class MenuButton : public Control, public MenuHost {
   enum class Direction : uint8_t { Up, Down };
 
   explicit MenuButton(allocators::IAllocator& allocator)
-      : Control(allocator), text_(allocator), menu_(allocator), popup_(allocator, *this) {}
+      : Control(allocator), text_(allocator), menu_(allocator, this), popup_(allocator, *this) {}
 
-  void set_text(StringView text) { text_.assign(text); invalidate(); }
+  void set_text(StringView text) { UiGuard lock(this); text_.assign(text); invalidate(); }
   Menu& menu() { return menu_; }
-  void set_direction(Direction d) { direction_ = d; }
-  void set_menu_min_width(int32_t width) { popup_.set_min_width(width); }
+  void set_direction(Direction d) { UiGuard lock(this); direction_ = d; }
+  void set_menu_min_width(int32_t width) { UiGuard lock(this); popup_.set_min_width(width); }
   bool open() const { return open_; }
 
   bool focusable() const override { return true; }

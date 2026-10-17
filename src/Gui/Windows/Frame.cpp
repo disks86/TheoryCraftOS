@@ -17,6 +17,7 @@
  */
 
 #include "Gui/Windows/Frame.hpp"
+#include "Gui/Window.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -26,11 +27,26 @@ namespace {
 constexpr int32_t kCorner = 14;  // how far along an edge a corner grip reaches
 }
 
-void Frame::minimize() { if (manager_) manager_->minimize(this); }
-void Frame::maximize() { if (manager_) manager_->maximize(this); }
-void Frame::restore() { if (manager_) manager_->restore(this); }
-void Frame::close() { if (manager_) manager_->close_window(this); }
-void Frame::activate() { if (manager_) manager_->activate(this); }
+void Frame::minimize() {
+  UiGuard lock(this);
+  if (manager_) manager_->minimize(this);
+}
+void Frame::maximize() {
+  UiGuard lock(this);
+  if (manager_) manager_->maximize(this);
+}
+void Frame::restore() {
+  UiGuard lock(this);
+  if (manager_) manager_->restore(this);
+}
+void Frame::close() {
+  UiGuard lock(this);
+  if (manager_) manager_->close_window(this);
+}
+void Frame::activate() {
+  UiGuard lock(this);
+  if (manager_) manager_->activate(this);
+}
 
 Rect2D Frame::client_rect() const {
   const int32_t top = kBorder + kTitleHeight + 1;

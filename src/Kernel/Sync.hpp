@@ -61,24 +61,26 @@ class RecursiveMutex {
   RecursiveMutex(const RecursiveMutex&) = delete;
   RecursiveMutex& operator=(const RecursiveMutex&) = delete;
 
+  // owner_ is read by threads that do not own the mutex (to find out that they do not), so it is
+  // accessed atomically; depth_ is only ever touched by the owner.
   void lock() {
     Thread* me = current_thread();
-    if (depth_ > 0 && owner_ == me) {
+    if (__atomic_load_n(&owner_, __ATOMIC_RELAXED) == me) {  // only the owner can see itself here
       ++depth_;
       return;
     }
     mutex_.lock();
-    owner_ = me;
+    __atomic_store_n(&owner_, me, __ATOMIC_RELAXED);
     depth_ = 1;
   }
   void unlock() {
     if (--depth_ == 0) {
-      owner_ = nullptr;
+      __atomic_store_n(&owner_, static_cast<Thread*>(nullptr), __ATOMIC_RELAXED);
       mutex_.unlock();
     }
   }
   // True if the calling thread holds it.
-  bool held_by_me() const { return depth_ > 0 && owner_ == current_thread(); }
+  bool held_by_me() const { return __atomic_load_n(&owner_, __ATOMIC_RELAXED) == current_thread(); }
 
  private:
   Mutex mutex_;

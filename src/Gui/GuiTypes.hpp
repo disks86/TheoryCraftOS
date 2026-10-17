@@ -68,13 +68,24 @@ struct KeyArgs {
 class Control;
 
 // A callback without std::function: a plain function and the pointer it is given back.
+//
+// Where it runs: a control that fires a handler (a click, a changed text, a chosen menu item) hands it to
+// its Window, and when the window has a handler thread (Window::start_handler_thread()) the call runs
+// there - never on the input thread and never under the UI lock - so a slow handler cannot freeze
+// painting or input. Handlers of one window run one at a time in the order they were fired.
+// A handler may change controls from its thread: every property setter is thread-safe. Without a handler
+// thread, or with `inline_call` set (the toolkit's own plumbing), the handler runs immediately in the
+// firing thread instead.
 struct Handler {
   void (*function)(void* context, Control& sender) = nullptr;
   void* context = nullptr;
+  bool inline_call = false;  // run immediately in the firing thread, even if the window has a handler thread
+
   void operator()(Control& sender) const {
     if (function) function(context, sender);
   }
   explicit operator bool() const { return function != nullptr; }
+  static Handler immediate(void (*function)(void*, Control&), void* context) { return {function, context, true}; }
 };
 
 inline bool contains(const Rect2D& r, int32_t x, int32_t y) {

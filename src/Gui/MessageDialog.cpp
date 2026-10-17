@@ -29,7 +29,6 @@ MessageDialog::MessageDialog(allocators::IAllocator& allocator)
   set_resizable(false);
   set_escape_closes(true);
   set_padding(Insets::all(10));
-  Frame::on_closed({&MessageDialog::on_closed_thunk, this});
 
   line1_.set_dock(DockStyle::Top);
   line1_.set_size(0, 22);
@@ -48,8 +47,8 @@ MessageDialog::MessageDialog(allocators::IAllocator& allocator)
   gap_.set_size(10, 0);
   accept_.set_dock(DockStyle::Right);
   accept_.set_size(104, 0);
-  decline_.on_click({&MessageDialog::on_decline, this});
-  accept_.on_click({&MessageDialog::on_accept, this});
+  decline_.on_click(Handler::immediate(&MessageDialog::on_decline, this));
+  accept_.on_click(Handler::immediate(&MessageDialog::on_accept, this));
   buttons_.add(&decline_);
   buttons_.add(&gap_);
   buttons_.add(&accept_);
@@ -60,6 +59,7 @@ MessageDialog::MessageDialog(allocators::IAllocator& allocator)
 }
 
 void MessageDialog::set_texts(StringView title, StringView line1, StringView line2, StringView accept, StringView decline) {
+  UiGuard lock(this);
   set_title(title);
   line1_.set_text(line1);
   line2_.set_text(line2);
@@ -68,11 +68,12 @@ void MessageDialog::set_texts(StringView title, StringView line1, StringView lin
 }
 
 bool MessageDialog::show(WindowManager& manager) {
+  UiGuard lock(&manager);
   if (showing()) {
     activate();
     return true;
   }
-  accepted_ = false;
+  __atomic_store_n(&accepted_, false, __ATOMIC_RELEASE);
   const int32_t w = kWidth, h = kHeight;
   const int32_t area_w = static_cast<int32_t>(manager.bounds().width), area_h = static_cast<int32_t>(manager.bounds().height);
   set_bounds({(area_w - w) / 2 > 0 ? (area_w - w) / 2 : 0, (area_h - h) / 3 > 0 ? (area_h - h) / 3 : 0, static_cast<uint32_t>(w),
@@ -87,19 +88,14 @@ bool MessageDialog::show(WindowManager& manager) {
 
 void MessageDialog::on_accept(void* self, Control&) {
   auto* d = static_cast<MessageDialog*>(self);
-  d->accepted_ = true;
+  __atomic_store_n(&d->accepted_, true, __ATOMIC_RELEASE);
   d->close();
 }
 
 void MessageDialog::on_decline(void* self, Control&) {
   auto* d = static_cast<MessageDialog*>(self);
-  d->accepted_ = false;
+  __atomic_store_n(&d->accepted_, false, __ATOMIC_RELEASE);
   d->close();
-}
-
-void MessageDialog::on_closed_thunk(void* self, Control&) {
-  auto* d = static_cast<MessageDialog*>(self);
-  d->result_(*d);
 }
 
 bool MessageDialog::on_key(const KeyArgs& args) {

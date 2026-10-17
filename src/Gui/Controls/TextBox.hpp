@@ -31,10 +31,10 @@ class TextBox : public Control {
   StringView text() const { return text_.view(); }
   // Replaces the text (the caret goes to the end). False if memory ran out.
   bool set_text(StringView text);
-  void set_read_only(bool read_only) { read_only_ = read_only; }
-  void set_max_length(uint32_t max) { max_length_ = max; }
+  void set_read_only(bool read_only) { UiGuard lock(this); read_only_ = read_only; }
+  void set_max_length(uint32_t max) { UiGuard lock(this); max_length_ = max; }
   uint32_t caret() const { return caret_; }
-  void on_changed(Handler handler) { changed_ = handler; }
+  void on_changed(Handler handler) { UiGuard lock(this); changed_ = handler; }
 
   bool focusable() const override { return true; }
   void paint(Painter& painter) override;

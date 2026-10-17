@@ -26,6 +26,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
                  hardware::IMouse* mouse)
     : window_(allocator, renderer, theme_, renderer.extent()),
       input_(window_, keyboard, mouse),
+      render_loop_(window_),
       surface_(allocator),
       taskbar_(allocator),
       start_(allocator),
@@ -116,7 +117,7 @@ void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->
 
 void Desktop::on_shutdown_answer(void* self, Control&) {
   auto* d = static_cast<Desktop*>(self);
-  if (d->shutdown_dialog_.accepted()) d->shutdown_requested_ = true;
+  if (d->shutdown_dialog_.accepted()) d->request_shutdown();
 }
 
 uint32_t format_date_time(const DateTime& t, char* out) {
@@ -143,7 +144,27 @@ uint32_t format_date_time(const DateTime& t, char* out) {
   return 19;
 }
 
+bool Desktop::start() {
+  const bool handlers = window_.start_handler_thread();
+  const bool rendering = render_loop_.start();
+  if (handlers && rendering) return true;
+  stop();
+  return false;
+}
+
+void Desktop::stop() {
+  render_loop_.stop();
+  window_.stop_handler_thread();
+}
+
 bool Desktop::step(uint64_t uptime_us) {
+  pump(uptime_us);
+  if (!window_.dirty()) return false;
+  window_.render();
+  return true;
+}
+
+void Desktop::pump(uint64_t uptime_us) {
   input_.pump();
   const uint64_t second = uptime_us / 1000000;
   if (second != polled_second_) {
@@ -162,9 +183,6 @@ bool Desktop::step(uint64_t uptime_us) {
       }
     }
   }
-  if (!window_.dirty()) return false;
-  window_.render();
-  return true;
 }
 
 }  // namespace desktop

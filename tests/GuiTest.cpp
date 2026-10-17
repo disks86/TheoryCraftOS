@@ -411,11 +411,11 @@ static void test_menu() {
     Counter open_item, exit_item, undo_item, disabled_item;
     file->add_item("Open", open_item.handler(), "Ctrl+O");
     MenuItem* off = file->add_item("Save", disabled_item.handler());
-    off->enabled = false;
+    off->set_enabled(false);
     file->add_separator();
     file->add_item("Exit", exit_item.handler());
     MenuItem* undo = edit->add_item("Undo", undo_item.handler(), "Ctrl+Z");
-    undo->checked = true;
+    undo->set_checked(true);
     w.add(&bar); w.add(&body);
     w.layout();
     CHECK(bar.bounds().height == 22 && bar.bounds().width == 400 && bar.menu_count() == 2);

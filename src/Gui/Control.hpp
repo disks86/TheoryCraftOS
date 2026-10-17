@@ -34,11 +34,29 @@
 #include "Allocators/IAllocator.hpp"
 #include "Gui/GuiTypes.hpp"
 #include "Gui/Painter.hpp"
+#include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
 
 namespace gui {
 
 class Window;
+
+// Threading. The control tree of a Window is protected by one recursive mutex (Window::ui_mutex()):
+// painting, input delivery and every public mutator of a control take it, so any thread may call
+// the setters (set_text, add, set_bounds, Frame/WindowManager operations, ...) while the window is being
+// painted and fed input, with no corruption. Plain getters (text(), bounds(), ...) do not lock and
+// return references into live state: from another thread read through Window::locked(). A control that
+// is not in a window yet needs no lock (build the tree, then show it).
+class UiGuard {
+ public:
+  explicit UiGuard(const Control* control);
+  ~UiGuard();
+  UiGuard(const UiGuard&) = delete;
+  UiGuard& operator=(const UiGuard&) = delete;
+
+ private:
+  kernel::RecursiveMutex* mutex_;
+};
 
 class Control {
  public:
@@ -48,18 +66,18 @@ class Control {
   // --- Geometry and layout
   const Rect2D& bounds() const { return bounds_; }
   // Absolute placement for DockStyle::None controls; docking overwrites it.
-  void set_bounds(const Rect2D& bounds) { bounds_ = bounds; invalidate(); }
+  void set_bounds(const Rect2D& bounds) { UiGuard lock(this); bounds_ = bounds; invalidate(); }
   DockStyle dock() const { return dock_; }
-  void set_dock(DockStyle dock) { dock_ = dock; invalidate(); }
+  void set_dock(DockStyle dock) { UiGuard lock(this); dock_ = dock; invalidate(); }
   // The size a docked control asks for (height for Top/Bottom, width for Left/Right). 0 means "use
   // default_size()".
-  void set_size(int32_t width, int32_t height) { size_ = {width, height}; invalidate(); }
+  void set_size(int32_t width, int32_t height) { UiGuard lock(this); size_ = {width, height}; invalidate(); }
   Size preferred_size() const {
     const Size d = default_size();
     return {size_.width > 0 ? size_.width : d.width, size_.height > 0 ? size_.height : d.height};
   }
   const Insets& padding() const { return padding_; }
-  void set_padding(const Insets& padding) { padding_ = padding; invalidate(); }
+  void set_padding(const Insets& padding) { UiGuard lock(this); padding_ = padding; invalidate(); }
   // The area inside the padding, in this control's coordinates.
   virtual Rect2D client_rect() const;
   // Places the children (and, recursively, theirs).
@@ -71,16 +89,16 @@ class Control {
   Control* parent() const { return parent_; }
   uint32_t child_count() const { return static_cast<uint32_t>(children_.count()); }
   Control* child(uint32_t index) const { return index < children_.count() ? children_[index] : nullptr; }
-  // The window this control is in (nullptr while it is not in one).
-  Window* window() const;
+  // The window this control is in (nullptr while it is not in one). Safe from any thread.
+  Window* window() const { return __atomic_load_n(&attached_, __ATOMIC_ACQUIRE); }
   // Position of this control's top left in window coordinates.
   Point window_origin() const;
 
   // --- State
   bool visible() const { return visible_; }
-  void set_visible(bool v) { visible_ = v; invalidate(); }
+  void set_visible(bool v) { UiGuard lock(this); visible_ = v; invalidate(); }
   bool enabled() const { return enabled_; }
-  void set_enabled(bool v) { enabled_ = v; invalidate(); }
+  void set_enabled(bool v) { UiGuard lock(this); enabled_ = v; invalidate(); }
   // False if this control or any ancestor is disabled (a disabled window disables everything in it).
   bool effectively_enabled() const {
     for (const Control* c = this; c; c = c->parent_)
@@ -118,7 +136,11 @@ class Control {
 
  protected:
   explicit Control(allocators::IAllocator& allocator) : allocator_(allocator), children_(allocator) {}
-  ~Control() = default;
+  // Tells the window (if any) that this control is gone, so nothing queued for it runs afterwards.
+  ~Control();
+
+  // Runs a handler the way the window wants it run (see Handler): on its handler thread if it has one.
+  void fire(const Handler& handler);
 
   virtual Size default_size() const { return {0, 0}; }
   // Moves `child` to the end of the child list: painted last (on top) and hit first.
@@ -126,7 +148,6 @@ class Control {
   allocators::IAllocator& allocator() const { return allocator_; }
 
   Rect2D bounds_;
-  Window* window_ = nullptr;  // set by Window on itself and on popups
 
  private:
   friend class Window;
@@ -134,6 +155,9 @@ class Control {
   allocators::IAllocator& allocator_;
   List<Control*> children_;
   Control* parent_ = nullptr;
+  Window* attached_ = nullptr;  // the window whose tree this control is in (also set on a window's popup)
+  Window* history_window_ = nullptr;  // the last window it was in: told when the control is destroyed (so the window must outlive its controls)
+  void attach(Window* window);   // this control and everything below it
   DockStyle dock_ = DockStyle::None;
   Size size_;
   Insets padding_;

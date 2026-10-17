@@ -89,12 +89,14 @@ bool DropDownList::on_key(const KeyArgs& args) {
 // --- DropDown ------------------------------------------------------------------
 
 int32_t DropDown::add_item(StringView text) {
+  UiGuard lock(this);
   const int32_t index = items_.add(text);
   invalidate();
   return index;
 }
 
 void DropDown::clear_items() {
+  UiGuard lock(this);
   close_list();
   items_.clear();
   selected_ = -1;
@@ -102,11 +104,12 @@ void DropDown::clear_items() {
 }
 
 void DropDown::set_selected_index(int32_t index) {
+  UiGuard lock(this);
   if (index < -1 || index >= items_.count()) return;
   if (index == selected_) return;
   selected_ = index;
   invalidate();
-  changed_(*this);
+  fire(changed_);
 }
 
 void DropDown::paint(Painter& painter) {
@@ -138,11 +141,13 @@ void DropDown::open_list() {
 }
 
 void DropDown::close_list() {
+  UiGuard lock(this);
   if (open_ && window()) window()->close_popup();
   open_ = false;
 }
 
 void DropDown::choose(int32_t index) {
+  UiGuard lock(this);
   close_list();
   set_selected_index(index);
 }

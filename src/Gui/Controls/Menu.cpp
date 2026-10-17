@@ -40,7 +40,8 @@ Menu::~Menu() {
 MenuItem* Menu::add(StringView text, StringView shortcut, bool separator, Handler on_click) {
   void* memory = allocator_.allocate(sizeof(MenuItem));
   if (!memory) return nullptr;
-  MenuItem* item = new (memory) MenuItem(allocator_);
+  UiGuard lock(owner_);
+  MenuItem* item = new (memory) MenuItem(allocator_, owner_);
   item->separator = separator;
   item->on_click = on_click;
   if (!item->text.assign(text) || !item->shortcut.assign(shortcut) || !items_.push_back(item)) {
@@ -103,11 +104,11 @@ void MenuPopup::paint(Painter& painter) {
       painter.line(4, top + kSeparatorHeight / 2, w - 5, top + kSeparatorHeight / 2, t.highlight);
       continue;
     }
-    const bool hot = static_cast<int32_t>(i) == highlighted_ && it->enabled;
+    const bool hot = static_cast<int32_t>(i) == highlighted_ && it->enabled();
     if (hot) painter.fill({3, top, bounds_.width - 6, static_cast<uint32_t>(kRowHeight)}, t.selection);
-    const uint32_t color = !it->enabled ? t.disabled_text : hot ? t.selection_text : t.text;
+    const uint32_t color = !it->enabled() ? t.disabled_text : hot ? t.selection_text : t.text;
     const int32_t ty = top + (kRowHeight - Painter::kGlyphHeight) / 2;
-    if (it->checked) {  // a check mark
+    if (it->checked()) {  // a check mark
       painter.line(8, top + 9, 10, top + 11, color);
       painter.line(10, top + 11, 15, top + 5, color);
       painter.line(8, top + 10, 10, top + 12, color);
@@ -131,7 +132,7 @@ void MenuPopup::on_mouse_move(const MouseArgs& args) {
 void MenuPopup::run(int32_t index) {
   if (index < 0) return;
   MenuItem* it = menu_->item(static_cast<uint32_t>(index));
-  if (it && it->enabled && !it->separator) host_.activate(it);
+  if (it && it->enabled() && !it->separator) host_.activate(it);
 }
 
 void MenuPopup::on_mouse_up(const MouseArgs& args) { run(item_at(args.y)); }
@@ -143,7 +144,7 @@ void MenuPopup::step(int32_t direction, int32_t from) {
   for (int32_t tries = 0; tries < n; ++tries) {
     i = (i + direction + n) % n;
     const MenuItem* it = menu_->item(static_cast<uint32_t>(i));
-    if (!it->separator && it->enabled) {
+    if (!it->separator && it->enabled()) {
       highlighted_ = i;
       invalidate();
       return;
@@ -188,7 +189,8 @@ MenuBar::~MenuBar() {
 Menu* MenuBar::add_menu(StringView title) {
   void* memory = allocator().allocate(sizeof(Menu));
   if (!memory) return nullptr;
-  Menu* m = new (memory) Menu(allocator());
+  UiGuard lock(this);
+  Menu* m = new (memory) Menu(allocator(), this);
   if (!m->title_.assign(title) || !menus_.push_back(m)) {
     destroy(allocator(), m);
     return nullptr;
@@ -228,6 +230,7 @@ void MenuBar::paint(Painter& painter) {
 }
 
 void MenuBar::open_menu(int32_t index) {
+  UiGuard lock(this);
   Window* w = window();
   if (!w || index < 0 || index >= static_cast<int32_t>(menus_.count()) || index == open_) return;
   popup_.show(menus_[static_cast<uint64_t>(index)]);
@@ -238,6 +241,7 @@ void MenuBar::open_menu(int32_t index) {
 }
 
 void MenuBar::close_menu() {
+  UiGuard lock(this);
   if (open_ >= 0 && window()) window()->close_popup();
   open_ = -1;
   invalidate();
@@ -253,7 +257,7 @@ void MenuBar::switch_menu(int32_t direction) {
 void MenuBar::activate(MenuItem* item) {
   const Handler handler = item->on_click;
   close_menu();
-  handler(*this);
+  fire(handler);
 }
 
 void MenuBar::on_mouse_move(const MouseArgs& args) {

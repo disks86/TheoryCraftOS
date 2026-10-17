@@ -23,12 +23,21 @@ namespace gui {
 
 Window::Window(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, const Theme& theme,
                const graphics::Extent2D& size)
-    : Control(allocator), renderer_(renderer), theme_(theme), title_(allocator) {
-  window_ = this;
+    : Control(allocator), renderer_(renderer), theme_(theme), title_(allocator), pending_(allocator) {
+  attach(this);  // (no children yet)
   bounds_ = {0, 0, size.width, size.height};
 }
 
+Window::~Window() {
+  wait_for_background(30000000);
+  stop_handler_thread();
+  // Controls outliving the window must not call back into it (they should not outlive it at all).
+  __atomic_store_n(&attached_, static_cast<Window*>(nullptr), __ATOMIC_RELEASE);
+  history_window_ = nullptr;  // (~Control must not call back into a window that is being destroyed)
+}
+
 void Window::set_title(StringView title) {
+  UiGuard lock(this);
   title_.assign(title);
   mark_dirty();
 }
@@ -51,21 +60,29 @@ void Window::paint(Painter& painter) {
   }
 }
 
+void Window::mark_dirty() {
+  if (!__atomic_exchange_n(&dirty_, true, __ATOMIC_ACQ_REL)) frame_event_.set();
+}
+
 void Window::render() {
-  layout();
-  Painter painter(renderer_, theme_);
-  paint_tree(painter);
-  if (popup_) popup_->paint_tree(painter);
-  if (cursor_visible_) {
-    // A classic arrow: black triangle with a white edge.
-    painter.renderer().reset_clip();
-    const float x = static_cast<float>(cursor_.x), y = static_cast<float>(cursor_.y);
-    renderer_.fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
-    renderer_.fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
+  {
+    UiGuard lock(this);
+    __atomic_store_n(&dirty_, false, __ATOMIC_RELEASE);  // changes made while we draw ask for the next frame
+    layout();
+    Painter painter(renderer_, theme_);
+    paint_tree(painter);
+    if (popup_) popup_->paint_tree(painter);
+    if (cursor_visible_) {
+      // A classic arrow: black triangle with a white edge.
+      painter.renderer().reset_clip();
+      const float x = static_cast<float>(cursor_.x), y = static_cast<float>(cursor_.y);
+      renderer_.fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
+      renderer_.fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
+    }
   }
+  // Presenting needs no access to the controls: the UI may change while the frame goes out.
   renderer_.reset_clip();
   renderer_.present();
-  dirty_ = false;
 }
 
 // --- Input -------------------------------------------------------------------
@@ -113,6 +130,7 @@ void Window::deliver_move(Control* target, const Point& origin, int32_t x, int32
 }
 
 void Window::mouse_move(int32_t x, int32_t y) {
+  UiGuard lock(this);
   cursor_ = {x, y};
   Point origin;
   if (captured_) {
@@ -132,6 +150,7 @@ void Window::mouse_move(int32_t x, int32_t y) {
 }
 
 void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed) {
+  UiGuard lock(this);
   cursor_ = {x, y};
   mark_dirty();
   Point origin;
@@ -174,6 +193,7 @@ void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed
 }
 
 void Window::mouse_wheel(int32_t x, int32_t y, int32_t delta) {
+  UiGuard lock(this);
   Point origin;
   Control* target = target_at(x, y, &origin);
   if (!target || !target->effectively_enabled()) return;
@@ -186,6 +206,7 @@ void Window::mouse_wheel(int32_t x, int32_t y, int32_t delta) {
 }
 
 void Window::key(const KeyArgs& args) {
+  UiGuard lock(this);
   mark_dirty();
   if (popup_) {
     popup_->on_key(args);
@@ -199,6 +220,7 @@ void Window::key(const KeyArgs& args) {
 // --- Focus -------------------------------------------------------------------
 
 void Window::set_focus(Control* control) {
+  UiGuard lock(this);
   if (control == focus_) return;
   Control* old = focus_;
   focus_ = control;
@@ -221,6 +243,7 @@ uint32_t Window::collect_focusable(Control* from, Control** out, uint32_t count,
 }
 
 void Window::set_focus_scope(Control* scope) {
+  UiGuard lock(this);
   focus_scope_ = scope;
   if (!scope || (focus_ && is_inside(scope, focus_))) return;
   Control* order[64];
@@ -229,6 +252,7 @@ void Window::set_focus_scope(Control* scope) {
 }
 
 void Window::focus_next(bool forward) {
+  UiGuard lock(this);
   Control* order[64];
   const uint32_t n = collect_focusable(focus_scope_ ? focus_scope_ : this, order, 0, 64);
   if (n == 0) return;
@@ -242,9 +266,10 @@ void Window::focus_next(bool forward) {
 // --- Popups ------------------------------------------------------------------
 
 bool Window::open_popup(Control* popup, Control* owner, int32_t x, int32_t y) {
+  UiGuard lock(this);
   if (!popup || popup->parent_) return false;
   close_popup();
-  popup->window_ = this;
+  popup->attach(this);
   const Size size = popup->preferred_size();
   if (x + size.width > static_cast<int32_t>(bounds_.width)) x = static_cast<int32_t>(bounds_.width) - size.width;
   if (y + size.height > static_cast<int32_t>(bounds_.height)) y = static_cast<int32_t>(bounds_.height) - size.height;
@@ -259,23 +284,179 @@ bool Window::open_popup(Control* popup, Control* owner, int32_t x, int32_t y) {
 }
 
 void Window::close_popup() {
+  UiGuard lock(this);
   if (!popup_) return;
   Control* popup = popup_;
   Control* owner = popup_owner_;
   popup_ = popup_owner_ = nullptr;
   if (captured_ == popup) captured_ = nullptr;
   if (hover_ == popup) hover_ = nullptr;
-  popup->window_ = nullptr;
+  popup->attach(nullptr);
   if (owner) owner->on_popup_closed(popup);
   mark_dirty();
 }
 
 void Window::control_removed(Control* control) {
+  // (the caller, Control::remove, holds the UI lock)
   if (focus_scope_ && is_inside(control, focus_scope_)) focus_scope_ = nullptr;
   if (focus_ && is_inside(control, focus_)) set_focus(nullptr);
   if (hover_ && is_inside(control, hover_)) hover_ = nullptr;
   if (captured_ && is_inside(control, captured_)) captured_ = nullptr;
   if (popup_owner_ && is_inside(control, popup_owner_)) close_popup();
+}
+
+}  // namespace gui
+
+namespace gui {
+
+// --- Handler thread, background work, destruction -----------------------------------
+
+bool Window::start_handler_thread() {
+  if (!kernel::running() || has_handler_thread()) return false;
+  handler_stop_ = false;
+  kernel::Thread* thread = kernel::spawn(&Window::handler_main, this, "gui-handlers");
+  if (!thread) return false;
+  __atomic_store_n(&handler_thread_, thread, __ATOMIC_RELEASE);
+  return true;
+}
+
+void Window::handler_main(void* window) { static_cast<Window*>(window)->run_handlers(); }
+
+void Window::run_handlers() {
+  for (;;) {
+    queue_signal_.acquire();
+    Pending item;
+    {
+      kernel::ScopedMutex lock(queue_mutex_);
+      if (pending_.count() == 0) {
+        if (handler_stop_) return;
+        continue;
+      }
+      item = pending_[0];
+      pending_.remove_at(0);
+      running_sender_ = item.sender;
+      running_handler_ = true;
+    }
+    item.handler(*item.sender);  // no lock held: this may take as long as it likes
+    kernel::ScopedMutex lock(queue_mutex_);
+    running_handler_ = false;
+    running_sender_ = nullptr;
+  }
+}
+
+void Window::stop_handler_thread() {
+  kernel::Thread* thread = __atomic_load_n(&handler_thread_, __ATOMIC_ACQUIRE);
+  if (!thread || thread == kernel::current_thread()) return;
+  {
+    kernel::ScopedMutex lock(queue_mutex_);
+    handler_stop_ = true;
+  }
+  queue_signal_.release();  // the thread first runs what is queued, then sees the flag
+  kernel::join(thread);
+  __atomic_store_n(&handler_thread_, static_cast<kernel::Thread*>(nullptr), __ATOMIC_RELEASE);
+}
+
+void Window::dispatch(const Handler& handler, Control& sender) {
+  if (!handler) return;
+  if (handler.inline_call || !has_handler_thread()) {
+    handler(sender);
+    return;
+  }
+  bool queued = false;
+  {
+    kernel::ScopedMutex lock(queue_mutex_);
+    if (!handler_stop_) queued = pending_.push_back(Pending{handler, &sender});
+  }
+  if (queued) queue_signal_.release();
+  else handler(sender);  // stopping, or out of memory: run it here rather than lose it
+}
+
+bool Window::wait_for_handlers(uint64_t timeout_us) {
+  for (uint64_t waited = 0;; waited += 500) {
+    {
+      kernel::ScopedMutex lock(queue_mutex_);
+      if (pending_.count() == 0 && !running_handler_) return true;
+    }
+    if (waited >= timeout_us) return false;
+    kernel::sleep_us(500);
+  }
+}
+
+namespace {
+struct AsyncJob {
+  Window* window;
+  allocators::IAllocator* allocator;
+  void (*work)(void*);
+  void* context;
+  Handler done;
+  uint32_t* counter;
+};
+
+void async_main(void* argument) {
+  AsyncJob job = *static_cast<AsyncJob*>(argument);
+  job.allocator->deallocate(argument);
+  job.work(job.context);
+  job.window->dispatch(job.done, *job.window);
+  __atomic_fetch_sub(job.counter, 1, __ATOMIC_ACQ_REL);
+}
+}  // namespace
+
+bool Window::run_async(void (*work)(void*), void* context, Handler done) {
+  if (!work) return false;
+  if (kernel::running()) {
+    void* memory = allocator().allocate(sizeof(AsyncJob));
+    if (memory) {
+      *static_cast<AsyncJob*>(memory) = AsyncJob{this, &allocator(), work, context, done, &background_};
+      __atomic_fetch_add(&background_, 1, __ATOMIC_ACQ_REL);
+      if (kernel::Thread* thread = kernel::spawn(async_main, memory, "gui-async")) {
+        kernel::detach(thread);
+        return true;
+      }
+      __atomic_fetch_sub(&background_, 1, __ATOMIC_ACQ_REL);
+      allocator().deallocate(memory);
+    }
+  }
+  work(context);  // no thread to be had: do it here
+  dispatch(done, *this);
+  return true;
+}
+
+bool Window::wait_for_background(uint64_t timeout_us) {
+  for (uint64_t waited = 0;; waited += 500) {
+    if (__atomic_load_n(&background_, __ATOMIC_ACQUIRE) == 0) return true;
+    if (waited >= timeout_us) return false;
+    kernel::sleep_us(500);
+  }
+}
+
+void Window::control_destroyed(Control* control) {
+  {
+    // Queued handlers of this control are dropped. (Their semaphore counts stay: the handler thread just
+    // finds the queue shorter than the count and goes back to waiting.)
+    kernel::ScopedMutex lock(queue_mutex_);
+    for (uint64_t i = 0; i < pending_.count();) {
+      if (pending_[i].sender == control) pending_.remove_at(i);
+      else ++i;
+    }
+  }
+  // A handler of this control that is running right now must finish before the control goes away - unless we
+  // are that handler (a control destroying itself from its own callback).
+  if (kernel::current_thread() != __atomic_load_n(&handler_thread_, __ATOMIC_ACQUIRE)) {
+    for (;;) {
+      {
+        kernel::ScopedMutex lock(queue_mutex_);
+        if (!(running_handler_ && running_sender_ == control)) break;
+      }
+      kernel::sleep_us(200);
+    }
+  }
+  kernel::ScopedRecursiveMutex guard(ui_mutex_);
+  if (focus_ == control) focus_ = nullptr;
+  if (focus_scope_ == control) focus_scope_ = nullptr;
+  if (hover_ == control) hover_ = nullptr;
+  if (captured_ == control) captured_ = nullptr;
+  if (popup_owner_ == control) popup_owner_ = nullptr;
+  if (popup_ == control) popup_ = nullptr;
 }
 
 }  // namespace gui

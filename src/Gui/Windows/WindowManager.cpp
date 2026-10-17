@@ -50,13 +50,14 @@ void WindowManager::keep_inside(Frame* frame) {
 }
 
 bool WindowManager::add_window(Frame* frame, bool modal) {
+  UiGuard lock(this);
   if (!frame || frame->manager_) return false;
   if (!order_.push_back(frame)) return false;
   if (!add(frame)) {
     order_.remove_at(order_.count() - 1);
     return false;
   }
-  frame->manager_ = this;
+  __atomic_store_n(&frame->manager_, this, __ATOMIC_RELEASE);
   frame->modal_ = modal;
   frame->state_ = Frame::State::Normal;
   frame->set_visible(true);
@@ -66,6 +67,7 @@ bool WindowManager::add_window(Frame* frame, bool modal) {
 }
 
 bool WindowManager::remove_window(Frame* frame) {
+  UiGuard lock(this);
   if (!frame || frame->manager_ != this) return false;
   for (uint64_t i = 0; i < order_.count(); ++i)
     if (order_[i] == frame) {
@@ -73,7 +75,7 @@ bool WindowManager::remove_window(Frame* frame) {
       break;
     }
   remove(frame);
-  frame->manager_ = nullptr;
+  __atomic_store_n(&frame->manager_, static_cast<WindowManager*>(nullptr), __ATOMIC_RELEASE);
   frame->modal_ = false;
   frame->active_ = false;
   frame->set_enabled(true);
@@ -87,10 +89,14 @@ bool WindowManager::remove_window(Frame* frame) {
 }
 
 void WindowManager::close_window(Frame* frame) {
+  UiGuard lock(this);
   if (!frame || frame->manager_ != this) return;
   const Handler closed = frame->closed_;
+  Window* w = window();
   remove_window(frame);
-  closed(*frame);
+  if (!closed) return;
+  if (w) w->dispatch(closed, *frame);
+  else closed(*frame);
 }
 
 Frame* WindowManager::top_usable() const {
@@ -120,6 +126,7 @@ void WindowManager::refresh() {
 }
 
 void WindowManager::activate(Frame* frame) {
+  UiGuard lock(this);
   if (!frame || frame->manager_ != this || !frame->enabled()) return;
   if (frame->state_ == Frame::State::Minimized) {
     frame->state_ = frame->before_minimize_;
@@ -131,6 +138,7 @@ void WindowManager::activate(Frame* frame) {
 }
 
 void WindowManager::minimize(Frame* frame) {
+  UiGuard lock(this);
   if (!frame || frame->manager_ != this || frame->state_ == Frame::State::Minimized) return;
   frame->before_minimize_ = frame->state_;
   frame->state_ = Frame::State::Minimized;
@@ -140,6 +148,7 @@ void WindowManager::minimize(Frame* frame) {
 }
 
 void WindowManager::maximize(Frame* frame) {
+  UiGuard lock(this);
   if (!frame || frame->manager_ != this) return;
   if (frame->state_ == Frame::State::Minimized) activate(frame);
   if (frame->state_ == Frame::State::Maximized) {
@@ -154,6 +163,7 @@ void WindowManager::maximize(Frame* frame) {
 }
 
 void WindowManager::restore(Frame* frame) {
+  UiGuard lock(this);
   if (!frame || frame->manager_ != this) return;
   if (frame->state_ == Frame::State::Minimized) {
     activate(frame);

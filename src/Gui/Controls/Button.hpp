@@ -27,11 +27,14 @@ namespace gui {
 class Button : public Control {
  public:
   explicit Button(allocators::IAllocator& allocator) : Control(allocator), text_(allocator) {}
-  void set_text(StringView text) { text_.assign(text); invalidate(); }
+  void set_text(StringView text) { UiGuard lock(this); text_.assign(text); invalidate(); }
   StringView text() const { return text_.view(); }
-  void on_click(Handler handler) { click_ = handler; }
+  void on_click(Handler handler) { UiGuard lock(this); click_ = handler; }
   // Does what a click does (also used by keyboard handling and by tests).
-  void click() { if (enabled()) click_(*this); }
+  void click() {
+    UiGuard lock(this);
+    if (enabled()) fire(click_);
+  }
 
   bool focusable() const override { return true; }
   void paint(Painter& painter) override;

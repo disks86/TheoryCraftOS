@@ -45,19 +45,30 @@ class MenuHost {
   ~MenuHost() = default;
 };
 
-struct MenuItem {
-  explicit MenuItem(allocators::IAllocator& allocator) : text(allocator), shortcut(allocator) {}
+class MenuItem {
+ public:
+  MenuItem(allocators::IAllocator& allocator, const Control* owner) : text(allocator), shortcut(allocator), owner_(owner) {}
   String text;
   String shortcut;  // display only, e.g. "Ctrl+O"
   Handler on_click;
-  bool enabled = true;
-  bool checked = false;
   bool separator = false;
+
+  // Thread-safe: may be changed from any thread while the menu is in use.
+  bool enabled() const { return enabled_; }
+  void set_enabled(bool enabled) { UiGuard lock(owner_); enabled_ = enabled; if (owner_) owner_->invalidate(); }
+  bool checked() const { return checked_; }
+  void set_checked(bool checked) { UiGuard lock(owner_); checked_ = checked; if (owner_) owner_->invalidate(); }
+
+ private:
+  const Control* owner_;  // the control the menu belongs to: its window's lock protects the flags
+  bool enabled_ = true;
+  bool checked_ = false;
 };
 
 class Menu {
  public:
-  Menu(allocators::IAllocator& allocator) : allocator_(allocator), title_(allocator), items_(allocator) {}
+  // `owner` is the MenuBar / MenuButton the menu belongs to (for locking and repainting).
+  Menu(allocators::IAllocator& allocator, const Control* owner) : allocator_(allocator), owner_(owner), title_(allocator), items_(allocator) {}
   ~Menu();
   Menu(const Menu&) = delete;
   Menu& operator=(const Menu&) = delete;
@@ -74,6 +85,7 @@ class Menu {
   MenuItem* add(StringView text, StringView shortcut, bool separator, Handler on_click);
 
   allocators::IAllocator& allocator_;
+  const Control* owner_;
   String title_;
   List<MenuItem*> items_;
 };

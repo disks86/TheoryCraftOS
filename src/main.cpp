@@ -377,10 +377,20 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop::Desktop desktop(shared_allocator, *renderer, input.keyboards().count() ? &input.keyboard() : nullptr,
                              input.mice().count() ? &input.mouse() : nullptr);
     desktop.set_clock_source(read_local_time, st);
+    // Three threads: this one reads input and the clock (firmware calls must stay on the boot core), a render
+    // thread redraws whenever something changed, and a handler thread runs what buttons and menus fire - so a
+    // slow click handler can freeze neither the screen nor the pointer.
+    const bool threaded = desktop.start();
+    if (!threaded) Entry(Level::Warning, "Desktop").text("could not start the render and handler threads; running single-threaded");
     while (!desktop.shutdown_requested()) {
-      desktop.step(hardware::uptime_us());
+      if (threaded) {
+        desktop.pump(hardware::uptime_us());
+      } else {
+        desktop.step(hardware::uptime_us());
+      }
       hardware::delay_us(4000);
     }
+    desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
   } else {
     console::puts("No desktop (no graphics display). Press any key to shut down.\n");
     wait_for_key(st, input, ~0ull >> 1);

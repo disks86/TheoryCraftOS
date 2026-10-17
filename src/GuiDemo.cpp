@@ -81,13 +81,13 @@ bool run_gui_demo(graphics::SystemGraphics& system, allocators::IAllocator& allo
   if (!file || !edit || !help) return false;
   file->add_item("New", h_new, "Ctrl+N");
   file->add_item("Open...", {}, "Ctrl+O");
-  if (MenuItem* save = file->add_item("Save", {}, "Ctrl+S")) save->enabled = false;
+  if (MenuItem* save = file->add_item("Save", {}, "Ctrl+S")) save->set_enabled(false);
   file->add_separator();
   file->add_item("Exit", h_exit, "Alt+F4");
   edit->add_item("Undo", {}, "Ctrl+Z");
   edit->add_item("Redo", {}, "Ctrl+Y");
   edit->add_separator();
-  if (MenuItem* wrap = edit->add_item("Word wrap")) wrap->checked = true;
+  if (MenuItem* wrap = edit->add_item("Word wrap")) wrap->set_checked(true);
   help->add_item("About TheoryCraftOS");
 
   Panel tool_bar(allocator);

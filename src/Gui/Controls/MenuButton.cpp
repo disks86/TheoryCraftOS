@@ -34,6 +34,7 @@ void MenuButton::paint(Painter& painter) {
 }
 
 void MenuButton::open_menu() {
+  UiGuard lock(this);
   Window* w = window();
   if (!w || open_ || menu_.item_count() == 0) return;
   popup_.show(&menu_);
@@ -44,6 +45,7 @@ void MenuButton::open_menu() {
 }
 
 void MenuButton::close_menu() {
+  UiGuard lock(this);
   if (open_ && window()) window()->close_popup();
   open_ = false;
   invalidate();
@@ -52,7 +54,7 @@ void MenuButton::close_menu() {
 void MenuButton::activate(MenuItem* item) {
   const Handler handler = item->on_click;
   close_menu();
-  handler(*this);
+  fire(handler);
 }
 
 void MenuButton::on_mouse_down(const MouseArgs& args) {

@@ -39,10 +39,11 @@ void TextBox::scroll_to_caret() {
 void TextBox::changed() {
   scroll_to_caret();
   invalidate();
-  changed_(*this);
+  fire(changed_);
 }
 
 bool TextBox::set_text(StringView text) {
+  UiGuard lock(this);
   if (max_length_ && text.size() > max_length_) text = text.substr(0, max_length_);
   if (!text_.assign(text)) return false;
   caret_ = static_cast<uint32_t>(text_.size());

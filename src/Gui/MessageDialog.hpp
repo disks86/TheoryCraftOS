@@ -38,9 +38,9 @@ class MessageDialog : public Frame {
   // Texts; call before show().
   void set_texts(StringView title, StringView line1, StringView line2, StringView accept, StringView decline);
   // Runs after the dialog has closed and been removed from the manager.
-  void on_result(Handler handler) { result_ = handler; }
+  void on_result(Handler handler) { on_closed(handler); }
   // True if the default (first) button was chosen.
-  bool accepted() const { return accepted_; }
+  bool accepted() const { return __atomic_load_n(&accepted_, __ATOMIC_ACQUIRE); }
   bool showing() const { return manager() != nullptr; }
   Button& accept_button() { return accept_; }
   Button& decline_button() { return decline_; }
@@ -53,12 +53,10 @@ class MessageDialog : public Frame {
  private:
   static void on_accept(void* self, Control&);
   static void on_decline(void* self, Control&);
-  static void on_closed_thunk(void* self, Control&);
 
   Label line1_, line2_;
   Panel buttons_, gap_;
   Button accept_, decline_;
-  Handler result_;
   bool accepted_ = false;
 };
 

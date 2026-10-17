@@ -32,6 +32,7 @@ void yield() {}
 void sleep_us(uint64_t) {}
 Thread* spawn(ThreadFunction, void*, const char*, int32_t, int8_t, uint32_t) { return nullptr; }
 bool join(Thread*, uint64_t) { return true; }
+void detach(Thread*) {}
 namespace detail {
 uint64_t lock() { return 0; }
 void unlock(uint64_t) {}

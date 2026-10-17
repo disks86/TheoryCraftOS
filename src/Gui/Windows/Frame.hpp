@@ -41,26 +41,27 @@ class Frame : public Control {
 
   explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator) {}
 
-  void set_title(StringView title) { title_.assign(title); invalidate(); }
+  void set_title(StringView title) { UiGuard lock(this); title_.assign(title); invalidate(); }
   StringView title() const { return title_.view(); }
 
   // The three title bar buttons (all enabled by default), and whether the borders resize.
-  void set_minimize_enabled(bool enabled) { can_minimize_ = enabled; invalidate(); }
-  void set_maximize_enabled(bool enabled) { can_maximize_ = enabled; invalidate(); }
-  void set_close_enabled(bool enabled) { can_close_ = enabled; invalidate(); }
+  void set_minimize_enabled(bool enabled) { UiGuard lock(this); can_minimize_ = enabled; invalidate(); }
+  void set_maximize_enabled(bool enabled) { UiGuard lock(this); can_maximize_ = enabled; invalidate(); }
+  void set_close_enabled(bool enabled) { UiGuard lock(this); can_close_ = enabled; invalidate(); }
   bool minimize_enabled() const { return can_minimize_; }
   bool maximize_enabled() const { return can_maximize_; }
   bool close_enabled() const { return can_close_; }
-  void set_resizable(bool resizable) { resizable_ = resizable; }
+  void set_resizable(bool resizable) { UiGuard lock(this); resizable_ = resizable; }
   // Escape closes the window (dialogs).
-  void set_escape_closes(bool closes) { escape_closes_ = closes; }
-  // Called after the window was closed and removed from its manager.
-  void on_closed(Handler handler) { closed_ = handler; }
+  void set_escape_closes(bool closes) { UiGuard lock(this); escape_closes_ = closes; }
+  // Fired (see Handler: on the window's handler thread, if it has one) after the window was closed and
+  // removed from its manager.
+  void on_closed(Handler handler) { UiGuard lock(this); closed_ = handler; }
 
   State state() const { return state_; }
   bool active() const { return active_; }
   bool modal() const { return modal_; }
-  WindowManager* manager() const { return manager_; }
+  WindowManager* manager() const { return __atomic_load_n(&manager_, __ATOMIC_ACQUIRE); }  // safe from any thread
   // What the manager does for the buttons; no-ops while the frame is not in a manager.
   void minimize();
   void maximize();   // or restore, if already maximized

@@ -21,9 +21,12 @@
 // into control events and owns focus, mouse capture and the single popup
 // (drop-down list or menu) that is drawn above everything else.
 //
-// Typical use: build controls, add them to the window, then per frame feed input
-// (InputPump does that from the keyboard and mouse drivers) and call render() when
-// dirty() says something changed.
+// Typical use: build controls, add them to the window, then feed input (InputPump does that from the
+// keyboard and mouse drivers) from one thread while a RenderLoop thread calls render() whenever
+// dirty() says something changed, and let the handler thread run what controls fire.
+//
+// Threading: see UiGuard (Control.hpp) for the locking rules. A window must outlive the controls in it
+// (declare it first), and render() / the RenderLoop are the only users of the renderer.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Utility/String.hpp"
@@ -34,6 +37,8 @@ class Window final : public Control {
  public:
   Window(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, const Theme& theme,
          const graphics::Extent2D& size);
+  // Waits for background work, stops the handler thread. Do not destroy a window from inside a handler.
+  ~Window();
 
   // The title bar is drawn when the title is not empty.
   void set_title(StringView title);
@@ -42,12 +47,46 @@ class Window final : public Control {
   Rect2D client_rect() const override;
   void paint(Painter& painter) override;
 
-  // Lays out, draws everything (children, popup, cursor) and presents. Clears dirty().
+  // Lays out, draws everything (children, popup, cursor) and presents. Clears dirty(). The tree is locked
+  // only while it is drawn, not while the finished frame is presented. Call from one thread at a time.
   void render();
-  bool dirty() const { return dirty_; }
-  void mark_dirty() { dirty_ = true; }
+  bool dirty() const { return __atomic_load_n(&dirty_, __ATOMIC_ACQUIRE); }
+  // Something changed: wakes whoever waits in wait_for_frame(). Safe from any thread.
+  void mark_dirty();
+  // Waits until the window was marked dirty (or the timeout passed); true if it was. For render loops.
+  bool wait_for_frame(uint64_t timeout_us) { return frame_event_.wait(timeout_us); }
+
+  // --- Threads
+  kernel::RecursiveMutex& ui_mutex() { return ui_mutex_; }
+  // Runs `function` (any callable) with the UI lock held: the way another thread reads state that has no
+  // thread-safe accessor, e.g. window.locked([&]{ copy(label.text()); }).
+  template <class F>
+  void locked(F&& function) {
+    kernel::ScopedRecursiveMutex guard(ui_mutex_);
+    function();
+  }
+  // Starts the thread that runs fired handlers (see Handler); false if threads are not available (the
+  // kernel has not started) or it already runs - handlers then run in the thread that fires them.
+  bool start_handler_thread();
+  // Runs everything still queued, then ends the thread. Must not be called with the UI lock held or from
+  // a handler.
+  void stop_handler_thread();
+  bool has_handler_thread() const { return __atomic_load_n(&handler_thread_, __ATOMIC_ACQUIRE) != nullptr; }
+  // Queues the handler (or calls it, see Handler). Safe from any thread.
+  void dispatch(const Handler& handler, Control& sender);
+  // Waits until no handler is queued or running; false on timeout. For shutdown and tests.
+  bool wait_for_handlers(uint64_t timeout_us);
+  // Runs `work` on a new thread; when it returns `done` is fired with this window as sender. The UI stays
+  // live meanwhile and `work` may use any setter. With no threads it simply runs both in the caller.
+  bool run_async(void (*work)(void* context), void* context, Handler done = {});
+  // Waits for run_async() work to finish; false on timeout.
+  bool wait_for_background(uint64_t timeout_us);
   // Draws a small arrow at the mouse position (for relative-mouse setups with no hardware cursor).
-  void show_cursor(bool show) { cursor_visible_ = show; mark_dirty(); }
+  void show_cursor(bool show) {
+    UiGuard lock(this);
+    cursor_visible_ = show;
+    mark_dirty();
+  }
 
   // --- Input, in window coordinates.
   void mouse_move(int32_t x, int32_t y);
@@ -74,12 +113,22 @@ class Window final : public Control {
 
   // Called by Control::remove so no pointer to a removed control lingers.
   void control_removed(Control* control);
+  // Called when a control in this window is destroyed: queued handlers of it are dropped (one already
+  // running is waited for, except from the handler thread itself) and no pointer to it lingers.
+  void control_destroyed(Control* control);
 
  private:
   Control* target_at(int32_t x, int32_t y, Point* origin);
   void deliver_move(Control* target, const Point& origin, int32_t x, int32_t y);
   static bool is_inside(const Control* ancestor, const Control* c);
   uint32_t collect_focusable(Control* from, Control** out, uint32_t count, uint32_t capacity);
+
+  struct Pending {
+    Handler handler;
+    Control* sender;
+  };
+  static void handler_main(void* window);
+  void run_handlers();
 
   graphics::IRenderer2D& renderer_;
   const Theme& theme_;
@@ -93,6 +142,18 @@ class Window final : public Control {
   Point cursor_;
   bool cursor_visible_ = false;
   bool dirty_ = true;
+
+  kernel::RecursiveMutex ui_mutex_;
+  kernel::Event frame_event_{true};  // auto-reset: set when the window becomes dirty
+  // The handler queue.
+  kernel::Mutex queue_mutex_;
+  kernel::Semaphore queue_signal_{0};
+  List<Pending> pending_;
+  kernel::Thread* handler_thread_ = nullptr;
+  const Control* running_sender_ = nullptr;
+  bool running_handler_ = false;
+  bool handler_stop_ = false;
+  uint32_t background_ = 0;  // run_async() jobs in flight
 };
 
 }  // namespace gui

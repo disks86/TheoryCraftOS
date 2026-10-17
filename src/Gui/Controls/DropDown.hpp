@@ -60,7 +60,7 @@ class DropDown : public Control {
   int32_t selected_index() const { return selected_; }  // -1 = nothing selected
   StringView selected_text() const { return items_.at(selected_); }
   void set_selected_index(int32_t index);
-  void on_selection_changed(Handler handler) { changed_ = handler; }
+  void on_selection_changed(Handler handler) { UiGuard lock(this); changed_ = handler; }
   bool open() const { return open_; }
 
   bool focusable() const override { return true; }

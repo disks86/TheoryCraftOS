@@ -224,6 +224,23 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   modal two-button question (Enter = default button, Escape/close = no). The desktop's Start menu has *About* (an ordinary window) and
   *Shut Down...*, which asks for confirmation in such a dialog.
 
+- GUI threading (`src/Gui/Window.*`, `RenderLoop.*`, `Control.hpp`): the desktop runs on three kinds of thread. The *input thread*
+  (the boot loop: `Desktop::pump()`) reads the keyboard, mouse and clock; a *render thread* (`RenderLoop`) sleeps until something marks
+  the window dirty and then draws it; a *handler thread* (`Window::start_handler_thread()`) runs the callbacks controls fire
+  (button clicks, menu items, changed text, closed windows, dialog answers - in order, one at a time, never under the UI
+  lock). A handler that sleeps for seconds therefore freezes neither painting nor the pointer. All shared state is one recursive
+  lock per window (`Window::ui_mutex()`, taken through `UiGuard`): painting, input delivery and **every public mutator** of a control
+  (`set_text`, `add`/`remove`, `set_bounds`, menu item flags, window-manager operations, `MessageDialog::show`, ...) take it, so any
+  thread may change the UI at any time - from a handler, from `Window::run_async()` work (a background kernel thread whose completion
+  handler is fired when it returns), or from your own thread - without corrupting what is being drawn. Plain getters do not lock:
+  read them through `Window::locked([&]{ ... })` from another thread. Rules: a `Window` must outlive its controls; destroying a
+  control drops its queued handlers and waits for one that is running (not from inside the UI lock);
+  `Handler::immediate()` marks toolkit-internal callbacks that must run in the firing thread; before `kernel::start()` (or with no handler
+  thread) handlers simply run inline. `tests/GuiThreadTest.cpp` runs the real thing with pthreads (`tests/HostThreads.cpp`) under
+  ThreadSanitizer: a 400 ms handler, handler ordering, a four-thread stress test (text, drop-down items, controls and windows
+  coming and going, menu flags, titles) while the window is drawn and clicked, `run_async`, and destroying controls with handlers
+  queued or running. (`Kernel/Sync.hpp`'s `RecursiveMutex` now reads its owner atomically: a benign race ThreadSanitizer reported.)
+
 ## Requirements
 
 `cmake`, `ninja` (or make), `x86_64-w64-mingw32-gcc/g++` (mingw-w64),

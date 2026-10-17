@@ -159,6 +159,7 @@ add_executable(BOOTX64
   src/Gui/Painter.cpp
   src/Gui/Control.cpp
   src/Gui/Window.cpp
+  src/Gui/RenderLoop.cpp
   src/Gui/InputPump.cpp
   src/Gui/Controls/Panel.cpp
   src/Gui/Controls/Label.cpp

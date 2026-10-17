@@ -29,6 +29,7 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/InputPump.hpp"
 #include "Gui/MessageDialog.hpp"
+#include "Gui/RenderLoop.hpp"
 #include "Gui/Window.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
@@ -69,13 +70,26 @@ class Desktop {
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
   void ask_shut_down();
   StringView clock_text() const { return clock_.text(); }
-  bool shutdown_requested() const { return shutdown_requested_; }
-  void request_shutdown() { shutdown_requested_ = true; }
+  bool shutdown_requested() const { return __atomic_load_n(&shutdown_requested_, __ATOMIC_ACQUIRE); }
+  void request_shutdown() { __atomic_store_n(&shutdown_requested_, true, __ATOMIC_RELEASE); }
   // The clock shows "--/--/---- --:-- --" until a source is set (and while it fails).
   void set_clock_source(ClockSource source, void* context) { clock_source_ = source; clock_context_ = context; shown_ = ~0ull; }
 
-  // One turn of the event loop: delivers pending input, refreshes the clock (reads the source at most
-  // once per second of `uptime_us`) and redraws if anything changed. Returns whether it drew.
+  // --- Running. The desktop uses three threads: the caller's loop (input and the clock: pump()), a render
+  // thread (redraws whenever something changed) and the handler thread that runs what controls fire
+  // (menu items, button clicks, dialog answers). A slow handler therefore cannot stop the screen
+  // from updating or the mouse from moving; handlers and other threads may change controls freely
+  // (every setter is thread-safe, see UiGuard).
+  // Starts the render and handler threads; false if threads are unavailable (then use step()).
+  bool start();
+  // Ends both threads (what was queued still runs).
+  void stop();
+  // Frames the render thread has drawn.
+  uint32_t frames_drawn() const { return render_loop_.frames(); }
+  // Delivers pending input and refreshes the clock (reads the source at most once per second of
+  // `uptime_us`). Call in a loop from the thread that owns the input devices.
+  void pump(uint64_t uptime_us);
+  // Single-threaded alternative to start(): pump(), then draw if anything changed. Returns whether it drew.
   bool step(uint64_t uptime_us);
 
  private:
@@ -86,6 +100,7 @@ class Desktop {
   gui::Theme theme_;
   gui::Window window_;
   gui::InputPump input_;
+  gui::RenderLoop render_loop_;
   DesktopSurface surface_;
   gui::Panel taskbar_;
   gui::MenuButton start_;

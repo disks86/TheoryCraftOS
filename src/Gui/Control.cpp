@@ -74,20 +74,51 @@ void Control::layout() {
   }
 }
 
+UiGuard::UiGuard(const Control* control) : mutex_(nullptr) {
+  if (control) {
+    if (Window* w = control->window()) mutex_ = &w->ui_mutex();
+  }
+  if (mutex_) mutex_->lock();
+}
+
+UiGuard::~UiGuard() {
+  if (mutex_) mutex_->unlock();
+}
+
+Control::~Control() {
+  if (history_window_) history_window_->control_destroyed(this);
+}
+
+void Control::fire(const Handler& handler) {
+  if (!handler) return;
+  if (Window* w = window()) w->dispatch(handler, *this);
+  else handler(*this);
+}
+
+void Control::attach(Window* window) {
+  if (window) history_window_ = window;
+  __atomic_store_n(&attached_, window, __ATOMIC_RELEASE);
+  for (uint64_t i = 0; i < children_.count(); ++i) children_[i]->attach(window);
+}
+
 bool Control::add(Control* child) {
+  UiGuard lock(this);
   if (!child || child == this || child->parent_) return false;
   if (!children_.push_back(child)) return false;
   child->parent_ = this;
+  child->attach(window());
   invalidate();
   return true;
 }
 
 bool Control::remove(Control* child) {
+  UiGuard lock(this);
   for (uint64_t i = 0; i < children_.count(); ++i) {
     if (children_[i] != child) continue;
     if (Window* w = window()) w->control_removed(child);
     children_.remove_at(i);
     child->parent_ = nullptr;
+    child->attach(nullptr);
     invalidate();
     return true;
   }
@@ -95,6 +126,7 @@ bool Control::remove(Control* child) {
 }
 
 bool Control::move_child_to_front(Control* child) {
+  UiGuard lock(this);
   for (uint64_t i = 0; i < children_.count(); ++i) {
     if (children_[i] != child) continue;
     for (uint64_t j = i; j + 1 < children_.count(); ++j) children_[j] = children_[j + 1];
@@ -105,15 +137,11 @@ bool Control::move_child_to_front(Control* child) {
   return false;
 }
 
-Window* Control::window() const {
-  for (const Control* c = this; c; c = c->parent_)
-    if (c->window_) return c->window_;
-  return nullptr;
-}
-
 Point Control::window_origin() const {
+  // Everything up to, but not including, the root (the window itself or a popup, whose bounds are
+  // already window coordinates).
   Point p;
-  for (const Control* c = this; c && !c->window_; c = c->parent_) {
+  for (const Control* c = this; c && c->parent_; c = c->parent_) {
     p.x += c->bounds_.x;
     p.y += c->bounds_.y;
   }

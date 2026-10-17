@@ -28,7 +28,7 @@ enum class PanelStyle : uint8_t { Flat, Raised, Sunken, Transparent };
 class Panel : public Control {
  public:
   explicit Panel(allocators::IAllocator& allocator) : Control(allocator) {}
-  void set_style(PanelStyle style) { style_ = style; invalidate(); }
+  void set_style(PanelStyle style) { UiGuard lock(this); style_ = style; invalidate(); }
   void paint(Painter& painter) override;
 
  private:
@@ -42,8 +42,8 @@ class Panel : public Control {
 class UniformPanel : public Panel {
  public:
   explicit UniformPanel(allocators::IAllocator& allocator) : Panel(allocator) {}
-  void set_orientation(Orientation o) { orientation_ = o; invalidate(); }
-  void set_spacing(int32_t pixels) { spacing_ = pixels < 0 ? 0 : pixels; invalidate(); }
+  void set_orientation(Orientation o) { UiGuard lock(this); orientation_ = o; invalidate(); }
+  void set_spacing(int32_t pixels) { UiGuard lock(this); spacing_ = pixels < 0 ? 0 : pixels; invalidate(); }
   void layout() override;
 
  private:
