@@ -61,8 +61,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     : Frame(allocator),
       toolbar_(allocator),
       status_bar_(allocator),
-      up_(allocator),
-      path_label_(allocator),
+      address_(allocator),
       status_(allocator),
       list_button_(allocator),
       icons_button_(allocator),
@@ -80,11 +79,6 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   toolbar_.set_size(0, 28);
   toolbar_.set_padding(Insets{0, 2, 0, 2});
 
-  up_.set_text("Up");
-  up_.set_dock(DockStyle::Left);
-  up_.set_size(48, 0);
-  up_.on_click({&FileExplorer::on_up, this});
-
   struct Mode {
     RadioButton& button;
     const char* text;
@@ -99,10 +93,9 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     m.button.on_changed({&FileExplorer::on_mode, this});
     toolbar_.add(&m.button);
   }
-  path_label_.set_dock(DockStyle::Fill);
-  path_label_.set_text("/");
-  toolbar_.add(&up_);
-  toolbar_.add(&path_label_);
+  address_.set_dock(DockStyle::Fill);
+  address_.on_navigate({&FileExplorer::on_navigate, this});
+  toolbar_.add(&address_);  // Fill goes last
 
   status_bar_.set_style(PanelStyle::Sunken);
   status_bar_.set_dock(DockStyle::Bottom);
@@ -198,8 +191,7 @@ bool FileExplorer::load(StringView path) {
     const StringView cells[3] = {e.name.view(), size.view(), type.view()};
     view_.add_item(cells, 3, folder ? ItemIcon::Folder : ItemIcon::File);
   }
-  path_label_.set_text(path_.view());
-  up_.set_enabled(path_.size() > 1);
+  address_.set_path(path_.view());
   update_status();
   return true;
 }
@@ -250,6 +242,10 @@ void FileExplorer::update_status() {
 }
 
 bool FileExplorer::on_key(const KeyArgs& args) {
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 11) {  // Ctrl+L
+    address_.begin_edit();
+    return true;
+  }
   if (args.usage == hardware::key::kBackspace) {
     go_up();
     return true;
@@ -257,7 +253,17 @@ bool FileExplorer::on_key(const KeyArgs& args) {
   return Frame::on_key(args);
 }
 
-void FileExplorer::on_up(void* self, Control&) { static_cast<FileExplorer*>(self)->go_up(); }
+void FileExplorer::on_navigate(void* self, Control&) {
+  auto* e = static_cast<FileExplorer*>(self);
+  String target(e->allocator());
+  target.assign(e->address_.requested_path());
+  if (!e->open_folder(target.view())) {
+    String message(e->allocator());
+    message.append("Cannot open ");
+    message.append(target.view());
+    e->status_.set_text(message.view());
+  }
+}
 
 void FileExplorer::on_mode(void* self, Control& sender) {
   auto* e = static_cast<FileExplorer*>(self);

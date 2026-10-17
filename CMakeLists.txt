@@ -225,6 +225,7 @@ add_executable(BOOTX64
   src/Gui/Controls/GridModel.cpp
   src/Gui/Controls/DataGrid.cpp
   src/Gui/Controls/ListView.cpp
+  src/Gui/Controls/BreadcrumbBar.cpp
   src/Gui/Controls/TextEditor.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
