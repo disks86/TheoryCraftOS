@@ -42,6 +42,7 @@ add_executable(BOOTX64
   src/Hardware/Bus/Pci/PciBar.cpp
   src/Kernel/ThreadScheduler.cpp
   src/Kernel/Sync.cpp
+  src/Kernel/Clipboard.cpp
   src/Kernel/Firmware.cpp
   src/KernelDemo.cpp
   src/ThreadSafetyDemo.cpp

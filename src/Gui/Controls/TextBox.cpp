@@ -17,7 +17,9 @@
  */
 
 #include "Gui/Controls/TextBox.hpp"
+#include "Gui/ClipboardText.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Utility/Move.hpp"
 
 namespace gui {
 
@@ -46,10 +48,53 @@ bool TextBox::set_text(StringView text) {
   UiGuard lock(this);
   if (max_length_ && text.size() > max_length_) text = text.substr(0, max_length_);
   if (!text_.assign(text)) return false;
-  caret_ = static_cast<uint32_t>(text_.size());
+  caret_ = anchor_ = static_cast<uint32_t>(text_.size());
   scroll_ = 0;
   changed();
   return true;
+}
+
+void TextBox::select_all() {
+  UiGuard lock(this);
+  anchor_ = 0;
+  caret_ = static_cast<uint32_t>(text_.size());
+  scroll_to_caret();
+  invalidate();
+}
+
+void TextBox::move_caret(uint32_t to, bool extend) {
+  const uint32_t length = static_cast<uint32_t>(text_.size());
+  caret_ = to > length ? length : to;
+  if (!extend) anchor_ = caret_;
+  scroll_to_caret();
+  invalidate();
+}
+
+// Replaces the selection (or inserts at the caret) with `with`, within the maximum length.
+bool TextBox::replace_selection(StringView with) {
+  if (read_only_) return false;
+  const uint32_t from = selection_start(), to = selection_end();
+  if (max_length_ && text_.size() - (to - from) + with.size() > max_length_) {
+    const uint64_t room = max_length_ > text_.size() - (to - from) ? max_length_ - (text_.size() - (to - from)) : 0;
+    with = with.first(room);
+  }
+  if (from == to && with.empty()) return false;
+  String next(allocator());
+  if (!next.reserve(text_.size() - (to - from) + with.size()) || !next.append(text_.view().first(from)) || !next.append(with) ||
+      !next.append(text_.view().without_prefix(to)))
+    return false;
+  text_ = util::move(next);
+  caret_ = anchor_ = from + static_cast<uint32_t>(with.size());
+  changed();
+  return true;
+}
+
+void TextBox::paste() {
+  String text(allocator());
+  if (read_only_ || !clipboard_get_text(clipboard(), fallback_, &text)) return;
+  for (uint64_t i = 0; i < text.size(); ++i)  // one line only
+    if (text[i] == '\n' || text[i] == '\r' || text[i] == '\t') text.set(i, ' ');
+  replace_selection(text.view());
 }
 
 void TextBox::paint(Painter& painter) {
@@ -63,7 +108,18 @@ void TextBox::paint(Painter& painter) {
   const uint64_t from = scroll_ < text_.size() ? scroll_ : text_.size();
   uint64_t count = text_.size() - from;
   if (count > vis + 1) count = vis + 1;  // one partial character may show
-  painter.text(kPad - 2, y, text_.view().substr(from, count), enabled() ? t.text : t.disabled_text);
+  const uint32_t ink = enabled() ? t.text : t.disabled_text;
+  painter.text(kPad - 2, y, text_.view().substr(from, count), ink);
+  if (has_selection()) {  // the selected part again, light on dark
+    uint64_t a = selection_start(), b = selection_end();
+    if (a < from) a = from;
+    if (b > from + count) b = from + count;
+    if (b > a) {
+      const int32_t x = kPad - 2 + static_cast<int32_t>(a - scroll_) * Painter::kGlyphWidth;
+      painter.fill({x, y, static_cast<uint32_t>((b - a) * Painter::kGlyphWidth), static_cast<uint32_t>(Painter::kGlyphHeight)}, focused() ? t.selection : t.shadow);
+      painter.text(x, y, text_.view().substr(a, b - a), t.selection_text);
+    }
+  }
   if (focused() && enabled()) {
     const int32_t cx = kPad - 2 + static_cast<int32_t>(caret_ - scroll_) * Painter::kGlyphWidth;
     painter.line(cx, y, cx, y + Painter::kGlyphHeight - 1, t.text);
@@ -71,58 +127,82 @@ void TextBox::paint(Painter& painter) {
   painter.pop_frame();
 }
 
-void TextBox::on_mouse_down(const MouseArgs& args) {
-  if (args.button != MouseButton::Left) return;
-  int32_t col = (args.x - kPad + Painter::kGlyphWidth / 2) / Painter::kGlyphWidth;
-  if (args.x < kPad) col = 0;
+uint32_t TextBox::index_at(int32_t x) const {
+  int32_t col = (x - kPad + Painter::kGlyphWidth / 2) / Painter::kGlyphWidth;
+  if (x < kPad) col = 0;
   int64_t index = static_cast<int64_t>(scroll_) + col;
   if (index > static_cast<int64_t>(text_.size())) index = static_cast<int64_t>(text_.size());
-  caret_ = static_cast<uint32_t>(index < 0 ? 0 : index);
-  invalidate();
+  return static_cast<uint32_t>(index < 0 ? 0 : index);
+}
+
+void TextBox::on_mouse_down(const MouseArgs& args) {
+  if (args.button != MouseButton::Left) return;
+  dragging_ = true;
+  move_caret(index_at(args.x), false);
+}
+
+void TextBox::on_mouse_move(const MouseArgs& args) {
+  if (dragging_) move_caret(index_at(args.x), true);
 }
 
 bool TextBox::on_key(const KeyArgs& args) {
   using namespace hardware;
   const uint32_t length = static_cast<uint32_t>(text_.size());
+  const bool shift = (args.modifiers & modifier::kShift) != 0, ctrl = (args.modifiers & modifier::kControl) != 0;
+  auto copy = [&] { clipboard_put_text(clipboard(), &fallback_, selected_text()); };
+  if (ctrl) {
+    switch (args.usage) {
+      case key::kA: select_all(); return true;
+      case key::kA + 2: copy(); return true;  // C
+      case key::kA + 23:                      // X
+        if (has_selection()) {
+          copy();
+          replace_selection(StringView());
+        }
+        return true;
+      case key::kA + 21: paste(); return true;  // V
+      case 0x49: copy(); return true;           // Ctrl+Insert
+      default: break;
+    }
+  }
   switch (args.usage) {
     case key::kLeft:
-      if (caret_ > 0) --caret_;
-      scroll_to_caret();
-      invalidate();
+      if (has_selection() && !shift) move_caret(selection_start(), false);
+      else move_caret(caret_ > 0 ? caret_ - 1 : 0, shift);
       return true;
     case key::kRight:
-      if (caret_ < length) ++caret_;
-      scroll_to_caret();
-      invalidate();
+      if (has_selection() && !shift) move_caret(selection_end(), false);
+      else move_caret(caret_ < length ? caret_ + 1 : length, shift);
       return true;
-    case 0x4A:  // Home
-      caret_ = 0;
-      scroll_to_caret();
-      invalidate();
-      return true;
-    case 0x4D:  // End
-      caret_ = length;
-      scroll_to_caret();
-      invalidate();
-      return true;
+    case 0x4A: move_caret(0, shift); return true;       // Home
+    case 0x4D: move_caret(length, shift); return true;  // End
     case key::kBackspace:
-      if (!read_only_ && caret_ > 0 && text_.erase(caret_ - 1, 1)) {
+      if (has_selection()) replace_selection(StringView());
+      else if (!read_only_ && caret_ > 0 && text_.erase(caret_ - 1, 1)) {
         --caret_;
+        anchor_ = caret_;
         changed();
       }
       return true;
-    case 0x4C:  // Delete
-      if (!read_only_ && caret_ < length && text_.erase(caret_, 1)) changed();
+    case 0x4C:  // Delete (with Shift: cut)
+      if (shift && has_selection()) {
+        copy();
+        replace_selection(StringView());
+      } else if (has_selection()) {
+        replace_selection(StringView());
+      } else if (!read_only_ && caret_ < length && text_.erase(caret_, 1)) {
+        changed();
+      }
+      return true;
+    case 0x49:  // Insert (with Shift: paste)
+      if (shift) paste();
       return true;
     default:
       break;
   }
   const char c = args.character;
-  if (c >= 32 && c < 127 && !(args.modifiers & modifier::kControl)) {
-    if (!read_only_ && (!max_length_ || length < max_length_) && text_.insert(caret_, StringView(&c, 1))) {
-      ++caret_;
-      changed();
-    }
+  if (c >= 32 && c < 127 && !ctrl) {
+    if (!read_only_ && (!max_length_ || length - (selection_end() - selection_start()) < max_length_)) replace_selection(StringView(&c, 1));
     return true;
   }
   return false;  // Tab, Enter, Escape and friends go to the parent

@@ -83,12 +83,23 @@ void icon_picker(Painter& p, const Rect2D& a, uint32_t ink) {  // an eyedropper
   p.line(a.x + 2, a.y + 14, a.x + 3, a.y + 13, ink);
 }
 
+void icon_select(Painter& p, const Rect2D& a, uint32_t ink) {  // a dashed rectangle
+  for (int32_t i = 1; i < 15; i += 3) {
+    p.fill({a.x + i, a.y + 2, 2, 1}, ink);
+    p.fill({a.x + i, a.y + 13, 2, 1}, ink);
+  }
+  for (int32_t i = 3; i < 13; i += 3) {
+    p.fill({a.x + 1, a.y + i, 1, 2}, ink);
+    p.fill({a.x + 14, a.y + i, 1, 2}, ink);
+  }
+}
+
 struct ToolDef {
   const char* name;
   ToolIcon icon;
 };
 const ToolDef kTools[] = {{"Pencil", icon_pencil}, {"Eraser", icon_eraser}, {"Line", icon_line},      {"Rectangle", icon_rectangle},
-                          {"Ellipse", icon_ellipse}, {"Fill", icon_fill},   {"Color picker", icon_picker}};
+                          {"Ellipse", icon_ellipse}, {"Fill", icon_fill},   {"Color picker", icon_picker}, {"Select", icon_select}};
 
 // --- Files ---
 
@@ -143,6 +154,9 @@ Paint::Paint(allocators::IAllocator& allocator)
       new_(allocator),
       open_(allocator),
       save_(allocator),
+      cut_(allocator),
+      copy_(allocator),
+      paste_(allocator),
       undo_(allocator),
       redo_(allocator),
       zoom_in_(allocator),
@@ -177,7 +191,9 @@ Paint::Paint(allocators::IAllocator& allocator)
     void (*handler)(void*, Control&);
   };
   const Part parts[] = {{new_, "New", DockStyle::Left, 52, &Paint::on_new},      {open_, "Open", DockStyle::Left, 52, &Paint::on_open},
-                        {save_, "Save", DockStyle::Left, 52, &Paint::on_save},   {redo_, "Redo", DockStyle::Right, 52, &Paint::on_redo},
+                        {save_, "Save", DockStyle::Left, 52, &Paint::on_save},   {cut_, "Cut", DockStyle::Left, 44, &Paint::on_cut},
+                        {copy_, "Copy", DockStyle::Left, 48, &Paint::on_copy},   {paste_, "Paste", DockStyle::Left, 52, &Paint::on_paste},
+                        {redo_, "Redo", DockStyle::Right, 52, &Paint::on_redo},
                         {undo_, "Undo", DockStyle::Right, 52, &Paint::on_undo}};
   for (const Part& p : parts) {
     p.button.set_text(p.text);
@@ -274,6 +290,7 @@ Paint::Paint(allocators::IAllocator& allocator)
   canvas_.on_changed({&Paint::on_canvas_changed, this});
   canvas_.on_pointer_moved({&Paint::on_pointer, this});
   canvas_.on_zoom_changed({&Paint::on_zoom_changed, this});
+  canvas_.on_tool_changed({&Paint::on_tool_changed, this});
   canvas_.on_color_picked({&Paint::on_picked, this});
   canvas_.set_primary(palette_.primary());
   canvas_.set_secondary(palette_.secondary());
@@ -344,6 +361,26 @@ void Paint::on_tool_hover(void* self, Control&) {
   const int32_t hovered = p->tools_.hovered_tool();
   if (hovered >= 0) p->say(p->tools_.tool_name(static_cast<uint32_t>(hovered)));
 }
+
+void Paint::on_tool_changed(void* self, Control&) {  // the canvas switched tools itself (a paste selects Select)
+  auto* p = static_cast<Paint*>(self);
+  p->tools_.select_tool(static_cast<int32_t>(p->canvas_.tool()));
+}
+
+void Paint::copy_to_clipboard(bool cut) {
+  const bool ok = cut ? canvas_.cut_selection() : canvas_.copy_selection();
+  if (ok) say(cut ? "Cut to the clipboard." : canvas_.has_selection() ? "Copied the selection." : "Copied the whole picture.");
+  else say(cut ? "Select something to cut first." : "Cannot copy.");
+}
+
+void Paint::paste_from_clipboard() {
+  if (canvas_.paste()) say("Pasted. Drag it into place; Enter sets it down, Escape takes it back.");
+  else say("Nothing to paste: the clipboard has no picture.");
+}
+
+void Paint::on_cut(void* self, Control&) { static_cast<Paint*>(self)->copy_to_clipboard(true); }
+void Paint::on_copy(void* self, Control&) { static_cast<Paint*>(self)->copy_to_clipboard(false); }
+void Paint::on_paste(void* self, Control&) { static_cast<Paint*>(self)->paste_from_clipboard(); }
 
 void Paint::on_palette(void* self, Control&) {
   auto* p = static_cast<Paint*>(self);
@@ -484,6 +521,7 @@ bool Paint::save_file(StringView requested) {
     if (!path.append(".png")) return false;
     format = media::ImageFormat::Png;
   }
+  canvas_.commit_floating();  // a picture still being placed is part of what is saved
   media::Image image(allocator());
   ByteBuffer encoded(allocator());
   const ArrayView<const uint32_t> pixels = canvas_.pixels();
@@ -533,6 +571,9 @@ bool Paint::on_key(const KeyArgs& args) {
       case key::kA + 18: save_file(); return true;                   // S
       case key::kA + 25: canvas_.undo(); return true;                // Z
       case key::kA + 24: canvas_.redo(); return true;                // Y
+      case key::kA + 2: copy_to_clipboard(false); return true;       // C
+      case key::kA + 23: copy_to_clipboard(true); return true;       // X
+      case key::kA + 21: paste_from_clipboard(); return true;        // V
       default: break;
     }
   }

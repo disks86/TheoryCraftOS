@@ -37,6 +37,10 @@
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
 
+namespace kernel {
+class Clipboard;
+}
+
 namespace gui {
 
 class Window;
@@ -91,6 +95,8 @@ class Control {
   Control* child(uint32_t index) const { return index < children_.count() ? children_[index] : nullptr; }
   // The window this control is in (nullptr while it is not in one). Safe from any thread.
   Window* window() const { return __atomic_load_n(&attached_, __ATOMIC_ACQUIRE); }
+  // The system clipboard of the window this control is in (nullptr while it is in none, or the window has none).
+  kernel::Clipboard* clipboard() const;
   // Position of this control's top left in window coordinates.
   Point window_origin() const;
 

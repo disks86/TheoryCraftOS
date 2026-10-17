@@ -23,6 +23,11 @@
 //    pointer, Picker takes the color under it. The left button paints with the primary color, the right button with
 //    the secondary (the eraser always paints the secondary color, at least 3 pixels wide). A filled shape has its
 //    outline in the button's color and its inside in the other.
+//  - The Select tool drags out a rectangle (dashed outline). Dragging inside it lifts that part of the picture and moves it
+//    (the hole is filled with the secondary color); it is set down again when anything else is done, or with Enter.
+//    Ctrl+C copies the selection (the whole picture if nothing is selected) to the window's clipboard, Ctrl+X cuts it,
+//    Ctrl+V pastes a picture from the clipboard as a floating selection that can be dragged into place, Delete clears the
+//    selection, Ctrl+A selects everything. Copy and paste need a window that has a clipboard.
 //  - Undo and redo (Ctrl+Z, Ctrl+Y, or the methods) go back over strokes within a memory budget; Escape during a
 //    stroke cancels it.
 //  - Zoom steps are 1, 2, 3, 4, 6, 8, 12 and 16; from 6 up an optional pixel grid can be shown.
@@ -35,7 +40,7 @@
 
 namespace gui {
 
-enum class PaintTool : uint8_t { Pencil, Eraser, Line, Rectangle, Ellipse, Fill, Picker };
+enum class PaintTool : uint8_t { Pencil, Eraser, Line, Rectangle, Ellipse, Fill, Picker, Select };
 
 class DrawingCanvas : public Control {
  public:
@@ -78,6 +83,20 @@ class DrawingCanvas : public Control {
   uint32_t secondary() const { return secondary_; }
   // Fired when the Picker took a color; read primary() / secondary() for it.
   void on_color_picked(Handler handler) { UiGuard lock(this); picked_ = handler; }
+
+  // --- Selection and clipboard
+  bool has_selection() const { return sel_valid_; }
+  Rect2D selection() const { return {sel_x_, sel_y_, sel_w_, sel_h_}; }  // in bitmap coordinates
+  void select_all();
+  void select_rect(int32_t x, int32_t y, uint32_t width, uint32_t height);  // clipped to the bitmap
+  void clear_selection();             // sets a floating selection down first
+  bool floating() const { return floating_; }
+  void commit_floating();             // sets a floating selection down where it is
+  bool copy_selection();              // false if there is no clipboard
+  bool cut_selection();               // copies, then clears
+  bool paste();                       // false if there is no clipboard or no picture on it
+  void delete_selection();
+  void on_tool_changed(Handler handler) { UiGuard lock(this); tool_changed_ = handler; }
 
   // --- History
   bool can_undo() const { return undo_.count() > 0; }
@@ -128,6 +147,13 @@ class DrawingCanvas : public Control {
   void begin_stroke(const MouseArgs& args);
   void draw_to(int32_t x, int32_t y);
   void cancel_stroke();
+  void cancel_floating();
+  void lift_selection();
+  void render_floating();
+  void release_floating();
+  void begin_selection(int32_t x, int32_t y);
+  void drag_selection(int32_t x, int32_t y);
+  void set_tool_quietly(PaintTool tool);
   void update_scroll_bars();
   void rebuild_cache();
   void after_pixels_changed();
@@ -153,7 +179,12 @@ class DrawingCanvas : public Control {
   MouseButton button_ = MouseButton::None;
   int32_t start_x_ = 0, start_y_ = 0, last_x_ = 0, last_y_ = 0;
   int32_t pointer_x_ = -1, pointer_y_ = -1;
-  Handler changed_, picked_, zoom_changed_, pointer_moved_;
+  // The selection (bitmap coordinates) and, once lifted or pasted, the picture floating over it.
+  bool sel_valid_ = false, selecting_ = false, floating_ = false, moving_ = false;
+  int32_t sel_x_ = 0, sel_y_ = 0, grab_dx_ = 0, grab_dy_ = 0;
+  uint32_t sel_w_ = 0, sel_h_ = 0;
+  ArrayView<uint32_t> float_, base_;  // the floating picture; the bitmap without it
+  Handler changed_, picked_, zoom_changed_, pointer_moved_, tool_changed_;
 };
 
 }  // namespace gui

@@ -20,7 +20,9 @@
 // (brush size, filled shapes, pixel grid, zoom), a strip of tools at the left, the DrawingCanvas, and at the bottom a
 // color palette with a color picker for any other color. Files are opened and saved as images; the format follows the
 // extension (png, jpg, bmp, gif, ppm, qoi, tga, tif, webp; png when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Z and Ctrl+Y
-// do what their buttons do. A command that would throw away unsaved changes does nothing the first time (the status
+// do what their buttons do. Cut, Copy and Paste (Ctrl+X, Ctrl+C, Ctrl+V) use the system clipboard: the selection made with the
+// Select tool (the whole picture when nothing is selected) goes onto it as a picture, and a picture on it is pasted as a floating
+// selection to drag into place. A command that would throw away unsaved changes does nothing the first time (the status
 // line says so) and goes ahead when it is repeated.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
@@ -69,6 +71,9 @@ class Paint : public gui::Frame {
   gui::Button& new_button() { return new_; }
   gui::Button& open_button() { return open_; }
   gui::Button& save_button() { return save_; }
+  gui::Button& cut_button() { return cut_; }
+  gui::Button& copy_button() { return copy_; }
+  gui::Button& paste_button() { return paste_; }
   gui::Button& undo_button() { return undo_; }
   gui::Button& redo_button() { return redo_; }
   gui::Button& zoom_in_button() { return zoom_in_; }
@@ -83,6 +88,12 @@ class Paint : public gui::Frame {
   static void on_new(void* self, gui::Control&);
   static void on_open(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
+  static void on_cut(void* self, gui::Control&);
+  static void on_copy(void* self, gui::Control&);
+  static void on_paste(void* self, gui::Control&);
+  static void on_tool_changed(void* self, gui::Control&);
+  void copy_to_clipboard(bool cut);
+  void paste_from_clipboard();
   static void on_undo(void* self, gui::Control&);
   static void on_redo(void* self, gui::Control&);
   static void on_zoom_in(void* self, gui::Control&);
@@ -103,7 +114,7 @@ class Paint : public gui::Frame {
   void update_position();
 
   gui::Panel file_bar_, options_bar_, palette_bar_, status_bar_, gap_a_, gap_b_;
-  gui::Button new_, open_, save_, undo_, redo_, zoom_in_, zoom_out_;
+  gui::Button new_, open_, save_, cut_, copy_, paste_, undo_, redo_, zoom_in_, zoom_out_;
   gui::TextBox path_;
   gui::Label size_label_, size_value_, zoom_label_, status_, position_;
   gui::Slider size_;

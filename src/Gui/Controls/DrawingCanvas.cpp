@@ -18,6 +18,7 @@
 
 #include "Gui/Controls/DrawingCanvas.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Clipboard.hpp"
 
 namespace gui {
 
@@ -189,6 +190,7 @@ DrawingCanvas::DrawingCanvas(allocators::IAllocator& allocator)
 }
 
 DrawingCanvas::~DrawingCanvas() {
+  release_floating();
   drop_history(&undo_);
   drop_history(&redo_);
   release_view(allocator(), pixels_);
@@ -230,6 +232,8 @@ bool DrawingCanvas::new_image(uint32_t width, uint32_t height, uint32_t fill) {
   if (fresh.empty()) return false;
   for (uint32_t& p : fresh) p = fill | 0xFF000000u;
   cancel_stroke();
+  release_floating();
+  sel_valid_ = selecting_ = false;
   drop_history(&undo_);
   drop_history(&redo_);
   release_view(allocator(), pixels_);
@@ -315,13 +319,17 @@ void DrawingCanvas::undo() {
     cancel_stroke();
     return;
   }
+  if (floating_) {
+    cancel_floating();
+    return;
+  }
   swap_with(&undo_, &redo_);
   finish_change();
 }
 
 void DrawingCanvas::redo() {
   UiGuard lock(this);
-  if (drawing_ || redo_.count() == 0) return;
+  if (drawing_ || floating_ || redo_.count() == 0) return;
   swap_with(&redo_, &undo_);
   finish_change();
 }
@@ -330,8 +338,11 @@ void DrawingCanvas::redo() {
 
 void DrawingCanvas::set_tool(PaintTool tool) {
   UiGuard lock(this);
+  if (tool != PaintTool::Select) commit_floating();
   tool_ = tool;
 }
+
+void DrawingCanvas::set_tool_quietly(PaintTool tool) { tool_ = tool; }
 
 void DrawingCanvas::set_brush_size(uint32_t size) {
   UiGuard lock(this);
@@ -348,10 +359,35 @@ bool DrawingCanvas::pointer_to_image(const MouseArgs& args, int32_t* x, int32_t*
 }
 
 void DrawingCanvas::begin_stroke(const MouseArgs& args) {
+  if (pixels_.empty()) return;
   int32_t x, y;
   const bool inside = pointer_to_image(args, &x, &y);
   const bool left = args.button == MouseButton::Left;
   const uint32_t main_color = left ? primary_ : secondary_;
+  if (tool_ == PaintTool::Select) {
+    if (!left) return;
+    if (floating_) {
+      if (contains(selection(), x, y)) {  // grab the floating picture
+        moving_ = true;
+        grab_dx_ = x - sel_x_;
+        grab_dy_ = y - sel_y_;
+        return;
+      }
+      commit_floating();
+    }
+    if (sel_valid_ && contains(selection(), x, y)) {  // lift what is selected and carry it
+      lift_selection();
+      if (floating_) {
+        moving_ = true;
+        grab_dx_ = x - sel_x_;
+        grab_dy_ = y - sel_y_;
+      }
+      return;
+    }
+    begin_selection(x, y);
+    return;
+  }
+  commit_floating();
   if (tool_ == PaintTool::Picker) {
     if (!inside) return;
     const uint32_t c = pixels_[uint64_t{static_cast<uint32_t>(y)} * width_ + static_cast<uint32_t>(x)];
@@ -414,6 +450,220 @@ void DrawingCanvas::cancel_stroke() {
   }
   cache_dirty_ = true;
   invalidate();
+}
+
+// --- Selection and clipboard ------------------------------------------------------------------
+
+void DrawingCanvas::release_floating() {
+  release_view(allocator(), float_);
+  release_view(allocator(), base_);
+  floating_ = moving_ = false;
+}
+
+// Puts the floating picture over the bitmap as it was without it.
+void DrawingCanvas::render_floating() {
+  if (!floating_) return;
+  pixels_.copy_from(ArrayView<const uint32_t>(base_.data(), base_.size()));
+  for (uint32_t y = 0; y < sel_h_; ++y) {
+    const int64_t dy = int64_t{sel_y_} + y;
+    if (dy < 0 || dy >= height_) continue;
+    for (uint32_t x = 0; x < sel_w_; ++x) {
+      const int64_t dx = int64_t{sel_x_} + x;
+      if (dx < 0 || dx >= width_) continue;
+      const uint32_t src = float_[uint64_t{y} * sel_w_ + x], a = src >> 24;
+      uint32_t& dst = pixels_[static_cast<uint64_t>(dy) * width_ + static_cast<uint64_t>(dx)];
+      if (a == 255) {
+        dst = src;
+      } else if (a != 0) {  // translucent: blend over what is there
+        auto mix = [&](uint32_t shift) { return (((src >> shift) & 255) * a + ((dst >> shift) & 255) * (255 - a) + 127) / 255; };
+        dst = 0xFF000000u | (mix(16) << 16) | (mix(8) << 8) | mix(0);
+      }
+    }
+  }
+  cache_dirty_ = true;
+  invalidate();
+}
+
+// Sets the floating picture down where it is; the selection stays, cut to the bitmap.
+void DrawingCanvas::commit_floating() {
+  UiGuard lock(this);
+  if (!floating_) return;
+  release_floating();
+  const int64_t x0 = sel_x_ < 0 ? 0 : sel_x_, y0 = sel_y_ < 0 ? 0 : sel_y_;
+  const int64_t x1 = int64_t{sel_x_} + sel_w_ < width_ ? int64_t{sel_x_} + sel_w_ : width_;
+  const int64_t y1 = int64_t{sel_y_} + sel_h_ < height_ ? int64_t{sel_y_} + sel_h_ : height_;
+  if (x1 > x0 && y1 > y0) {
+    sel_x_ = static_cast<int32_t>(x0);
+    sel_y_ = static_cast<int32_t>(y0);
+    sel_w_ = static_cast<uint32_t>(x1 - x0);
+    sel_h_ = static_cast<uint32_t>(y1 - y0);
+  } else {
+    sel_valid_ = false;
+  }
+  finish_change();
+}
+
+// Takes the floating picture back: the bitmap returns to how it was before it was lifted or pasted.
+void DrawingCanvas::cancel_floating() {
+  if (!floating_) return;
+  if (undo_.count() > 0) {
+    ArrayView<uint32_t> saved = undo_[undo_.count() - 1];
+    pixels_.copy_from(ArrayView<const uint32_t>(saved.data(), saved.size()));
+    history_bytes_ -= saved.size() * sizeof(uint32_t);
+    release_view(allocator(), saved);
+    undo_.remove_at(undo_.count() - 1);
+  }
+  release_floating();
+  sel_valid_ = false;
+  finish_change();
+}
+
+void DrawingCanvas::lift_selection() {
+  if (!sel_valid_ || floating_ || pixels_.empty()) return;
+  ArrayView<uint32_t> base = allocate_view<uint32_t>(allocator(), pixels_.size());
+  ArrayView<uint32_t> picture = allocate_view<uint32_t>(allocator(), uint64_t{sel_w_} * sel_h_);
+  if (base.empty() || picture.empty() || !push_history()) {
+    release_view(allocator(), base);
+    release_view(allocator(), picture);
+    return;
+  }
+  base.copy_from(ArrayView<const uint32_t>(pixels_.data(), pixels_.size()));
+  for (uint32_t y = 0; y < sel_h_; ++y)
+    for (uint32_t x = 0; x < sel_w_; ++x) {
+      const uint64_t at = uint64_t{static_cast<uint32_t>(sel_y_) + y} * width_ + static_cast<uint32_t>(sel_x_) + x;
+      picture[uint64_t{y} * sel_w_ + x] = pixels_[at];
+      base[at] = secondary_;  // the hole it leaves
+    }
+  base_ = base;
+  float_ = picture;
+  floating_ = true;
+  render_floating();
+}
+
+void DrawingCanvas::begin_selection(int32_t x, int32_t y) {
+  x = x < 0 ? 0 : x >= static_cast<int32_t>(width_) ? static_cast<int32_t>(width_) - 1 : x;
+  y = y < 0 ? 0 : y >= static_cast<int32_t>(height_) ? static_cast<int32_t>(height_) - 1 : y;
+  start_x_ = x;
+  start_y_ = y;
+  sel_x_ = x;
+  sel_y_ = y;
+  sel_w_ = sel_h_ = 1;
+  sel_valid_ = selecting_ = true;
+  invalidate();
+}
+
+void DrawingCanvas::drag_selection(int32_t x, int32_t y) {
+  x = x < 0 ? 0 : x >= static_cast<int32_t>(width_) ? static_cast<int32_t>(width_) - 1 : x;
+  y = y < 0 ? 0 : y >= static_cast<int32_t>(height_) ? static_cast<int32_t>(height_) - 1 : y;
+  sel_x_ = x < start_x_ ? x : start_x_;
+  sel_y_ = y < start_y_ ? y : start_y_;
+  sel_w_ = static_cast<uint32_t>((x < start_x_ ? start_x_ - x : x - start_x_) + 1);
+  sel_h_ = static_cast<uint32_t>((y < start_y_ ? start_y_ - y : y - start_y_) + 1);
+  invalidate();
+}
+
+void DrawingCanvas::select_all() {
+  UiGuard lock(this);
+  commit_floating();
+  if (pixels_.empty()) return;
+  sel_x_ = sel_y_ = 0;
+  sel_w_ = width_;
+  sel_h_ = height_;
+  sel_valid_ = true;
+  invalidate();
+}
+
+void DrawingCanvas::select_rect(int32_t x, int32_t y, uint32_t width, uint32_t height) {
+  UiGuard lock(this);
+  commit_floating();
+  const int64_t x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+  const int64_t x1 = int64_t{x} + width < width_ ? int64_t{x} + width : width_, y1 = int64_t{y} + height < height_ ? int64_t{y} + height : height_;
+  sel_valid_ = x1 > x0 && y1 > y0;
+  if (sel_valid_) {
+    sel_x_ = static_cast<int32_t>(x0);
+    sel_y_ = static_cast<int32_t>(y0);
+    sel_w_ = static_cast<uint32_t>(x1 - x0);
+    sel_h_ = static_cast<uint32_t>(y1 - y0);
+  }
+  invalidate();
+}
+
+void DrawingCanvas::clear_selection() {
+  UiGuard lock(this);
+  commit_floating();
+  sel_valid_ = selecting_ = false;
+  invalidate();
+}
+
+bool DrawingCanvas::copy_selection() {
+  UiGuard lock(this);
+  kernel::Clipboard* clipboard = this->clipboard();
+  if (!clipboard || pixels_.empty()) return false;
+  if (floating_) return clipboard->set_image(float_.data(), sel_w_, sel_h_);
+  if (!sel_valid_) return clipboard->set_image(pixels_.data(), width_, height_);  // nothing selected: the whole picture
+  ArrayView<uint32_t> part = allocate_view<uint32_t>(allocator(), uint64_t{sel_w_} * sel_h_);
+  if (part.empty()) return false;
+  for (uint32_t y = 0; y < sel_h_; ++y)
+    for (uint32_t x = 0; x < sel_w_; ++x) part[uint64_t{y} * sel_w_ + x] = pixels_[uint64_t{static_cast<uint32_t>(sel_y_) + y} * width_ + static_cast<uint32_t>(sel_x_) + x];
+  const bool ok = clipboard->set_image(part.data(), sel_w_, sel_h_);
+  release_view(allocator(), part);
+  return ok;
+}
+
+bool DrawingCanvas::cut_selection() {
+  UiGuard lock(this);
+  if (!sel_valid_ || !copy_selection()) return false;
+  delete_selection();
+  return true;
+}
+
+void DrawingCanvas::delete_selection() {
+  UiGuard lock(this);
+  if (!sel_valid_) return;
+  if (floating_) {  // the floating picture is dropped; what was under it stays as the lift left it
+    pixels_.copy_from(ArrayView<const uint32_t>(base_.data(), base_.size()));
+    release_floating();
+    sel_valid_ = false;
+    finish_change();
+    return;
+  }
+  if (!push_history()) return;
+  Raster{pixels_.data(), static_cast<int32_t>(width_), static_cast<int32_t>(height_)}
+      .fill_rect(sel_x_, sel_y_, sel_x_ + static_cast<int32_t>(sel_w_) - 1, sel_y_ + static_cast<int32_t>(sel_h_) - 1, secondary_);
+  finish_change();
+}
+
+bool DrawingCanvas::paste() {
+  UiGuard lock(this);
+  kernel::Clipboard* clipboard = this->clipboard();
+  uint32_t w, h;
+  if (!clipboard || pixels_.empty() || !clipboard->image_size(&w, &h) || w > kMaxSide || h > kMaxSide) return false;
+  commit_floating();
+  ArrayView<uint32_t> picture = allocate_view<uint32_t>(allocator(), uint64_t{w} * h);
+  ArrayView<uint32_t> base = allocate_view<uint32_t>(allocator(), pixels_.size());
+  if (picture.empty() || base.empty() || !clipboard->get_image(picture.data(), picture.size()) || !push_history()) {
+    release_view(allocator(), picture);
+    release_view(allocator(), base);
+    return false;
+  }
+  base.copy_from(ArrayView<const uint32_t>(pixels_.data(), pixels_.size()));
+  base_ = base;
+  float_ = picture;
+  floating_ = true;
+  sel_valid_ = true;
+  sel_w_ = w;
+  sel_h_ = h;
+  // It appears in the top left corner of what is in view, kept inside the bitmap if it fits.
+  int64_t x = scroll_x_ / static_cast<int32_t>(zoom_), y = scroll_y_ / static_cast<int32_t>(zoom_);
+  if (x + w > width_) x = width_ > w ? width_ - w : 0;
+  if (y + h > height_) y = height_ > h ? height_ - h : 0;
+  sel_x_ = static_cast<int32_t>(x);
+  sel_y_ = static_cast<int32_t>(y);
+  set_tool_quietly(PaintTool::Select);
+  render_floating();
+  finish_change();
+  fire(tool_changed_);
+  return true;
 }
 
 // --- View ---------------------------------------------------------------------------------------
@@ -569,6 +819,23 @@ void DrawingCanvas::paint(Painter& painter) {
     const Rect2D v = viewport();
     painter.image(s, {0, 0, cache_w_, cache_h_}, v.x, v.y);
   }
+  if (sel_valid_ && sel_w_ > 0 && sel_h_ > 0) {  // the selection: a dashed outline
+    const Rect2D v = viewport();
+    painter.push_frame(v);
+    const int32_t x0 = (sel_x_ * static_cast<int32_t>(zoom_) - scroll_x_), y0 = (sel_y_ * static_cast<int32_t>(zoom_) - scroll_y_);
+    const int32_t x1 = x0 + static_cast<int32_t>(sel_w_ * zoom_) - 1, y1 = y0 + static_cast<int32_t>(sel_h_ * zoom_) - 1;
+    auto dot = [&](int32_t x, int32_t y, int32_t i) { painter.fill({x, y, 1, 1}, (i / 3) % 2 ? 0xFFFFFFFF : 0xFF000000); };
+    const int32_t span_x = x1 - x0 < 4096 ? x1 - x0 : 4096, span_y = y1 - y0 < 4096 ? y1 - y0 : 4096;
+    for (int32_t i = 0; i <= span_x; ++i) {
+      dot(x0 + i, y0, i);
+      dot(x0 + i, y1, i);
+    }
+    for (int32_t i = 0; i <= span_y; ++i) {
+      dot(x0, y0 + i, i);
+      dot(x1, y0 + i, i);
+    }
+    painter.pop_frame();
+  }
   if (show_v_ && show_h_)
     painter.fill({static_cast<int32_t>(bounds_.width) - kBorder - ScrollBar::kThickness, static_cast<int32_t>(bounds_.height) - kBorder - ScrollBar::kThickness,
                   static_cast<uint32_t>(ScrollBar::kThickness), static_cast<uint32_t>(ScrollBar::kThickness)}, t.face);
@@ -578,7 +845,7 @@ void DrawingCanvas::paint(Painter& painter) {
 
 void DrawingCanvas::on_mouse_down(const MouseArgs& args) {
   if (args.button != MouseButton::Left && args.button != MouseButton::Right) return;
-  if (drawing_) return;  // the other button went down mid-stroke
+  if (drawing_ || moving_ || selecting_) return;  // the other button went down mid-stroke
   begin_stroke(args);
 }
 
@@ -592,9 +859,26 @@ void DrawingCanvas::on_mouse_move(const MouseArgs& args) {
     fire(pointer_moved_);
   }
   if (drawing_ && (x != last_x_ || y != last_y_)) draw_to(x, y);
+  if (moving_) {
+    sel_x_ = x - grab_dx_;
+    sel_y_ = y - grab_dy_;
+    render_floating();
+  } else if (selecting_) {
+    drag_selection(x, y);
+  }
 }
 
 void DrawingCanvas::on_mouse_up(const MouseArgs& args) {
+  if (moving_) {
+    moving_ = false;
+    return;
+  }
+  if (selecting_) {
+    selecting_ = false;
+    if (sel_w_ <= 1 && sel_h_ <= 1) sel_valid_ = false;  // a click, not a drag
+    invalidate();
+    return;
+  }
   if (!drawing_ || args.button != button_) return;
   int32_t x, y;
   pointer_to_image(args, &x, &y);
@@ -619,9 +903,34 @@ void DrawingCanvas::on_mouse_wheel(const MouseArgs& args) {
 
 bool DrawingCanvas::on_key(const KeyArgs& args) {
   using namespace hardware;
-  if (args.usage == key::kEscape && drawing_) {
-    cancel_stroke();
+  if (args.usage == key::kEscape) {
+    if (drawing_) cancel_stroke();
+    else if (floating_) cancel_floating();
+    else if (sel_valid_) clear_selection();
+    else return false;
     return true;
+  }
+  if (args.usage == key::kEnter && floating_) {
+    commit_floating();
+    return true;
+  }
+  if (args.usage == 0x4C && !drawing_) {  // Delete; with Shift: cut
+    if (!sel_valid_) return false;
+    if ((args.modifiers & modifier::kShift) && copy_selection()) delete_selection();
+    else if (!(args.modifiers & modifier::kShift)) delete_selection();
+    return true;
+  }
+  if (args.usage == 0x49 && !drawing_) {  // Insert: Ctrl copies, Shift pastes
+    if (args.modifiers & modifier::kControl) copy_selection();
+    else if (args.modifiers & modifier::kShift) paste();
+    else return false;
+    return true;
+  }
+  if ((args.modifiers & modifier::kControl) && !drawing_) {
+    if (args.usage == key::kA) { select_all(); return true; }
+    if (args.usage == key::kA + 2) { copy_selection(); return true; }          // C
+    if (args.usage == key::kA + 23) { cut_selection(); return true; }          // X
+    if (args.usage == key::kA + 21) { paste(); return true; }                  // V
   }
   if (args.modifiers & modifier::kControl) {
     if (args.usage == key::kA + 25 && !(args.modifiers & modifier::kShift)) { undo(); return true; }  // Z

@@ -64,6 +64,8 @@ class Desktop {
   Desktop& operator=(const Desktop&) = delete;
 
   gui::Window& window() { return window_; }
+  // The system clipboard that copy and paste in every window of the desktop use (nullptr: none).
+  void set_clipboard(kernel::Clipboard* clipboard) { window_.set_clipboard(clipboard); }
   gui::MenuButton& start_button() { return start_; }
   gui::WindowManager& windows() { return windows_; }
   gui::WindowSwitcher& switcher() { return switcher_; }

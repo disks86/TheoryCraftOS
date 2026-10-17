@@ -25,6 +25,7 @@
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/AudioPlayerControl.hpp"
 #include "Gui/Color.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/Notepad.hpp"
@@ -1020,6 +1021,14 @@ static void test_file_explorer() {
     ex.view().select_item(3);
     press(w, key::kEnter);
     CHECK(opened.count == 1 && ex.opened_file().equals("/b.txt") && ex.path().equals("/"));
+    {
+      kernel::Clipboard cb(a);                  // Ctrl+C puts the selected item's full path on the clipboard
+      w.set_clipboard(&cb);
+      press(w, key::kA + 2, modifier::kLeftControl);
+      String copied(a);
+      CHECK(cb.get_text(&copied) && copied.view().equals("/b.txt") && ex.status_label().text().equals("Copied /b.txt"));
+      w.set_clipboard(nullptr);
+    }
 
     // Opening a folder: Enter on it, a double click, then Up and Backspace go back.
     w.set_focus(&ex.view());
@@ -1798,7 +1807,7 @@ static void test_paint() {
     DrawingCanvas& c = paint.canvas();
     CHECK(desktop::Paint::is_picture_name("a/b.PNG") && desktop::Paint::is_picture_name("x.jpeg") && !desktop::Paint::is_picture_name("x.txt") && !desktop::Paint::is_picture_name("png"));
     CHECK(paint.title().equals("Paint - Untitled") && c.image_width() == 640 && c.image_height() == 480 && !paint.undo_button().enabled());
-    CHECK(paint.tools().tool_count() == 7 && paint.tools().tool_name(3).equals("Rectangle"));
+    CHECK(paint.tools().tool_count() == 8 && paint.tools().tool_name(3).equals("Rectangle") && paint.tools().tool_name(7).equals("Select"));
 
     // The tool strip, palette, size slider and options drive the canvas.
     paint.tools().select_tool(3);
@@ -1877,6 +1886,334 @@ static void test_paint() {
   CHECK(a.live == 0);
 }
 
+// --- Clipboard -----------------------------------------------------------------------------------------------------
+
+static void test_text_clipboard() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 400, 200);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 200});
+    w.set_clipboard(&cb);
+    TextBox one(a), two(a);
+    TextEditor ed(a);
+    one.set_bounds({10, 10, 200, 24});
+    two.set_bounds({10, 40, 200, 24});
+    ed.set_bounds({10, 70, 300, 100});
+    w.add(&one);
+    w.add(&two);
+    w.add(&ed);
+    w.layout();
+    String got(a);
+
+    // Selecting in a text box: Shift with the arrows, Ctrl+A, replacing by typing.
+    one.set_text("hello world");
+    w.set_focus(&one);
+    CHECK(!one.has_selection());
+    for (int i = 0; i < 5; ++i) press(w, key::kLeft, modifier::kLeftShift);
+    CHECK(one.has_selection() && one.selected_text().equals("world") && one.selection_start() == 6 && one.selection_end() == 11);
+    press(w, key::kLeft);                       // collapses to the start of the selection
+    CHECK(!one.has_selection() && one.caret() == 6);
+    press(w, 0x4D, modifier::kLeftShift);       // Shift+End
+    CHECK(one.selected_text().equals("world"));
+    press(w, key::kA + 2, modifier::kLeftControl);   // copy
+    CHECK(cb.get_text(&got) && got.view().equals("world") && one.text().equals("hello world"));
+    press(w, key::kA + 23, modifier::kLeftControl);  // cut
+    CHECK(one.text().equals("hello ") && cb.get_text(&got) && got.view().equals("world") && !one.has_selection());
+    w.set_focus(&two);
+    press(w, key::kA + 21, modifier::kLeftControl);  // paste into another control
+    CHECK(two.text().equals("world") && two.caret() == 5);
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(two.selected_text().equals("world"));
+    type_char(w, 'z');
+    CHECK(two.text().equals("z"));
+    press(w, key::kBackspace);
+    CHECK(two.text().empty());
+
+    // A drag with the mouse selects; Backspace removes the selection.
+    one.set_text("abcdefgh");
+    w.mouse_move(10 + 4 + 2 * 8, 22);
+    w.mouse_button(10 + 4 + 2 * 8, 22, MouseButton::Left, true);
+    w.mouse_move(10 + 4 + 6 * 8, 22);
+    w.mouse_button(10 + 4 + 6 * 8, 22, MouseButton::Left, false);
+    CHECK(one.selected_text().equals("cdef") && w.focus() == &one);
+    press(w, key::kBackspace);
+    CHECK(one.text().equals("abgh") && one.caret() == 2);
+
+    // Line breaks become spaces in a single-line box; the maximum length holds.
+    CHECK(cb.set_text("a\r\nb\tc"));
+    two.set_text("");
+    w.set_focus(&two);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(two.text().equals("a  b c"));
+    two.set_text("");
+    two.set_max_length(5);
+    CHECK(cb.set_text("123456789"));
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(two.text().equals("12345"));
+    two.set_max_length(0);
+    two.set_read_only(true);
+    press(w, key::kA + 21, modifier::kLeftControl);   // read-only: nothing is pasted
+    CHECK(two.text().equals("12345"));
+    two.set_read_only(false);
+
+    // Shift+Insert, Ctrl+Insert and Shift+Delete are the older keys for paste, copy and cut.
+    two.set_text("");
+    CHECK(cb.set_text("zz"));
+    press(w, 0x49, modifier::kLeftShift);
+    CHECK(two.text().equals("zz"));
+    press(w, key::kA, modifier::kLeftControl);
+    press(w, 0x49, modifier::kLeftControl);
+    press(w, 0x4C, modifier::kLeftShift);
+    CHECK(two.text().empty() && cb.get_text(&got) && got.view().equals("zz"));
+
+    // A picture on the clipboard is not text.
+    const uint32_t px[1] = {0xFF112233};
+    CHECK(cb.set_image(px, 1, 1));
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(two.text().empty());
+
+    // The multi-line editor shares the clipboard; its line breaks are normalised.
+    CHECK(cb.set_text("line1\r\nline2\rline3"));
+    w.set_focus(&ed);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(ed.text().equals("line1\nline2\nline3") && ed.line_count() == 3);
+    press(w, key::kA, modifier::kLeftControl);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    CHECK(cb.get_text(&got) && got.view().equals("line1\nline2\nline3"));
+    ed.set_caret(0);
+    press(w, 0x4D, modifier::kLeftShift);
+    press(w, key::kA + 23, modifier::kLeftControl);
+    CHECK(cb.get_text(&got) && got.view().equals("line1") && ed.text().equals("\nline2\nline3"));
+    w.set_focus(&one);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(one.text().equals("abline1gh"));
+    w.render();
+
+    // Without a clipboard in the window each control keeps a copy of its own.
+    w.set_clipboard(nullptr);
+    one.set_text("private");
+    press(w, key::kA, modifier::kLeftControl);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    press(w, 0x4D);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(one.text().equals("privateprivate"));
+    cb.clear();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_canvas_clipboard() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    DrawingCanvas c(a);
+    c.set_bounds({10, 10, 300, 220});
+    w.add(&c);
+    c.new_image(40, 30);
+    w.layout();
+    w.set_focus(&c);
+    const uint32_t white = 0xFFFFFFFF, red = 0xFFFF0000, blue = 0xFF0000FF;
+    Counter changes, tools;
+    c.on_changed(changes.handler());
+    c.on_tool_changed(tools.handler());
+
+    // Without a clipboard in the window nothing is copied or pasted.
+    CHECK(!c.copy_selection() && !c.paste() && !c.cut_selection());
+    w.set_clipboard(&cb);
+
+    // A filled red square at (5,5)-(14,14).
+    c.set_tool(PaintTool::Rectangle);
+    c.set_filled(true);
+    c.set_primary(red);
+    c.set_secondary(red);
+    drag(w, pixel_point(c, 5, 5), pixel_point(c, 14, 14));
+    c.set_filled(false);
+    c.set_secondary(white);
+    CHECK(c.pixel(5, 5) == red && c.pixel(14, 14) == red && c.pixel(10, 10) == red && c.pixel(15, 15) == white);
+
+    // The Select tool drags out a rectangle; a click clears it; Ctrl+A selects all.
+    c.set_tool(PaintTool::Select);
+    drag(w, pixel_point(c, 3, 3), pixel_point(c, 16, 16));
+    CHECK(c.has_selection() && c.selection().x == 3 && c.selection().y == 3 && c.selection().width == 14 && c.selection().height == 14);
+    click(w, pixel_point(c, 30, 25).x, pixel_point(c, 30, 25).y);
+    CHECK(!c.has_selection());
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(c.has_selection() && c.selection().width == 40 && c.selection().height == 30);
+    w.render();
+    press(w, key::kEscape);
+    CHECK(!c.has_selection());
+    drag(w, pixel_point(c, 5, 5), pixel_point(c, 14, 14));
+    CHECK(c.selection().width == 10 && c.selection().height == 10);
+
+    // Copy takes the selection (the whole picture without one); the picture is unchanged.
+    CHECK(c.copy_selection() && cb.has_image());
+    uint32_t cw, ch;
+    CHECK(cb.image_size(&cw, &ch) && cw == 10 && ch == 10);
+    uint32_t part[100];
+    CHECK(cb.get_image(part, 100) && part[0] == red && part[99] == red);
+    c.clear_selection();
+    CHECK(c.copy_selection() && cb.image_size(&cw, &ch) && cw == 40 && ch == 30);
+    CHECK(!c.cut_selection());                  // nothing selected: nothing to cut
+
+    // Cut clears the area to the secondary color; undo brings it back.
+    c.select_rect(5, 5, 10, 10);
+    CHECK(c.cut_selection() && c.pixel(7, 7) == white && c.pixel(14, 14) == white && c.has_selection());   // the rectangle stays
+    CHECK(cb.image_size(&cw, &ch) && cw == 10 && cb.get_image(part, 100) && part[55] == red);
+    c.undo();
+    CHECK(c.pixel(7, 7) == red);
+
+    // Paste: a floating picture appears in the corner of the view, the tool becomes Select, and it can be dragged.
+    const int32_t tool_events = tools.count;
+    c.set_tool(PaintTool::Pencil);
+    CHECK(c.paste() && c.floating() && c.has_selection() && c.tool() == PaintTool::Select && tools.count == tool_events + 1);
+    CHECK(c.selection().x == 0 && c.selection().y == 0 && c.selection().width == 10 && c.pixel(3, 3) == red && c.pixel(12, 12) == red && c.modified());
+    w.mouse_move(pixel_point(c, 3, 3).x, pixel_point(c, 3, 3).y);
+    w.mouse_button(pixel_point(c, 3, 3).x, pixel_point(c, 3, 3).y, MouseButton::Left, true);
+    w.mouse_move(pixel_point(c, 23, 13).x, pixel_point(c, 23, 13).y);
+    w.mouse_button(pixel_point(c, 23, 13).x, pixel_point(c, 23, 13).y, MouseButton::Left, false);
+    CHECK(c.floating() && c.selection().x == 20 && c.selection().y == 10 && c.pixel(3, 3) == white && c.pixel(25, 15) == red && c.pixel(19, 15) == white);
+    press(w, key::kEnter);                      // set down
+    CHECK(!c.floating() && c.pixel(25, 15) == red && c.has_selection());
+    c.undo();                                   // one step undoes the whole paste
+    CHECK(c.pixel(25, 15) == white && c.pixel(7, 7) == red && c.can_undo());
+    c.redo();
+    CHECK(c.pixel(25, 15) == red);
+    c.undo();
+
+    // Escape takes a pasted picture back.
+    CHECK(c.paste() && c.floating() && c.pixel(2, 2) == red);
+    press(w, key::kEscape);
+    CHECK(!c.floating() && !c.has_selection() && c.pixel(2, 2) == white && c.pixel(7, 7) == red);
+    // Undo does the same.
+    CHECK(c.paste());
+    c.undo();
+    CHECK(!c.floating() && c.pixel(2, 2) == white);
+    // A pasted picture is set down when another tool is used.
+    CHECK(c.paste());
+    c.set_tool(PaintTool::Pencil);
+    CHECK(!c.floating() && c.pixel(2, 2) == red);
+    c.undo();
+
+    // Dragging inside a selection lifts it and carries it; the hole takes the secondary color.
+    c.set_tool(PaintTool::Select);
+    c.select_rect(5, 5, 10, 10);
+    w.mouse_move(pixel_point(c, 7, 7).x, pixel_point(c, 7, 7).y);
+    w.mouse_button(pixel_point(c, 7, 7).x, pixel_point(c, 7, 7).y, MouseButton::Left, true);
+    CHECK(c.floating() && c.pixel(7, 7) == red);      // lifted, but still where it was
+    w.mouse_move(pixel_point(c, 27, 17).x, pixel_point(c, 27, 17).y);
+    w.mouse_button(pixel_point(c, 27, 17).x, pixel_point(c, 27, 17).y, MouseButton::Left, false);
+    CHECK(c.selection().x == 25 && c.selection().y == 15 && c.pixel(7, 7) == white && c.pixel(5, 5) == white && c.pixel(30, 20) == red);
+    click(w, pixel_point(c, 1, 28).x, pixel_point(c, 1, 28).y);   // outside: set down, and start a new selection
+    CHECK(!c.floating() && c.pixel(30, 20) == red && !c.has_selection());
+    c.undo();
+    CHECK(c.pixel(7, 7) == red && c.pixel(30, 20) == white);
+
+    // Delete clears a selection; with a floating picture it drops the picture.
+    c.select_rect(5, 5, 10, 10);
+    press(w, 0x4C);
+    CHECK(c.pixel(7, 7) == white && c.has_selection());
+    c.undo();
+    CHECK(c.paste());
+    press(w, 0x4C);
+    CHECK(!c.floating() && c.pixel(2, 2) == white);
+    c.undo();
+    CHECK(c.pixel(7, 7) == red);
+
+    // Translucent pixels are blended over what is under them; a picture bigger than the bitmap is cut off.
+    const uint32_t soft[4] = {0x80000000, 0xFF00FF00, 0x00000000, 0xFF0000FF};
+    CHECK(cb.set_image(soft, 2, 2) && c.paste());
+    CHECK(red_of(c.pixel(0, 0)) > 0x70 && red_of(c.pixel(0, 0)) < 0x90 && c.pixel(1, 0) == 0xFF00FF00 && c.pixel(0, 1) == white && c.pixel(1, 1) == blue);
+    c.undo();
+    uint32_t* big = static_cast<uint32_t*>(malloc(60 * 50 * 4));
+    for (int i = 0; i < 60 * 50; ++i) big[i] = blue;
+    CHECK(cb.set_image(big, 60, 50) && c.paste() && c.pixel(39, 29) == blue && c.pixel(0, 0) == blue);
+    c.undo();
+    free(big);
+    CHECK(cb.set_text("text") && !c.paste());  // text is not a picture
+    c.clear_selection();
+    w.render();
+
+    // Ctrl+C, Ctrl+X and Ctrl+V on the canvas, and Shift+Insert.
+    CHECK(cb.set_image(soft, 2, 2));
+    c.select_rect(5, 5, 4, 4);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    CHECK(cb.image_size(&cw, &ch) && cw == 4 && ch == 4);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(c.floating());
+    press(w, key::kEnter);
+    press(w, 0x4A, modifier::kLeftControl);
+    c.select_rect(5, 5, 4, 4);
+    press(w, key::kA + 23, modifier::kLeftControl);
+    CHECK(c.pixel(6, 6) == white && c.has_selection());
+    press(w, 0x49, modifier::kLeftShift);
+    CHECK(c.floating());
+    c.clear_selection();
+    CHECK(!c.floating());
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_paint_clipboard() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    w.set_clipboard(&cb);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::Paint paint(a);
+    paint.set_file_system(&fs);
+    CHECK(mgr.add_window(&paint));
+    w.layout();
+    DrawingCanvas& c = paint.canvas();
+    paint.palette().set_primary(0xFFFF0000);
+    drag(w, pixel_point(c, 10, 10), pixel_point(c, 30, 10));
+    CHECK(c.pixel(20, 10) == 0xFFFF0000);
+
+    paint.cut_button().click();                 // nothing selected
+    CHECK(paint.status_label().text().equals("Select something to cut first."));
+    paint.copy_button().click();                // so the whole picture is copied
+    uint32_t cw, ch;
+    CHECK(paint.status_label().text().equals("Copied the whole picture.") && cb.image_size(&cw, &ch) && cw == 640 && ch == 480);
+
+    paint.tools().select_tool(7);
+    CHECK(c.tool() == PaintTool::Select);
+    c.select_rect(8, 8, 30, 6);
+    paint.copy_button().click();
+    CHECK(paint.status_label().text().equals("Copied the selection.") && cb.image_size(&cw, &ch) && cw == 30 && ch == 6);
+    paint.cut_button().click();
+    CHECK(paint.status_label().text().equals("Cut to the clipboard.") && c.pixel(20, 10) == 0xFFFFFFFF);
+
+    // Paste: a floating picture, and the tool strip follows the canvas to the Select tool.
+    paint.tools().select_tool(0);
+    paint.paste_button().click();
+    CHECK(c.floating() && paint.tools().selected_tool() == 7 && c.pixel(5, 3) == 0xFFFFFFFF && c.pixel(2, 3) == 0xFFFFFFFF);
+    CHECK(paint.status_label().text().first(7).equals("Pasted."));
+    // Saving sets it down first.
+    CHECK(paint.save_file("/p.png") && !c.floating());
+    // Ctrl+V from somewhere that is not the canvas goes through the window.
+    w.set_focus(&paint.palette());
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(c.floating());
+    c.undo();
+    CHECK(cb.set_text("words"));
+    paint.paste_button().click();
+    CHECK(!c.floating() && paint.status_label().text().equals("Nothing to paste: the clipboard has no picture."));
+    w.render();
+    mgr.remove_window(&paint);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -1892,6 +2229,9 @@ int main() {
   test_color_palette();
   test_drawing_canvas();
   test_paint();
+  test_text_clipboard();
+  test_canvas_clipboard();
+  test_paint_clipboard();
   test_breadcrumb_bar();
   test_file_explorer();
   test_task_manager();
