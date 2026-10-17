@@ -33,7 +33,7 @@ class WindowManager;
 
 class Frame : public Control {
  public:
-  static constexpr int32_t kBorder = 4, kTitleHeight = 18, kButtonWidth = 16, kButtonHeight = 14;
+  static constexpr int32_t kBorder = 6, kTitleHeight = 18, kButtonWidth = 16, kButtonHeight = 14;
   static constexpr int32_t kMinWidth = 140, kMinHeight = 60;
 
   enum class State : uint8_t { Normal, Minimized, Maximized };
@@ -73,6 +73,8 @@ class Frame : public Control {
   Part part_at(int32_t x, int32_t y) const;
   Rect2D button_rect(Part button) const;
 
+  // A double arrow over the borders and corners that resize the window (and while one is being dragged).
+  CursorShape cursor_shape(int32_t x, int32_t y) const override;
   Rect2D client_rect() const override;
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;

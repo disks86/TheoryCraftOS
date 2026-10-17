@@ -18,13 +18,14 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager"
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager", "Text Editor"
 // and "About" (ordinary windows) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
 // power-off once the desktop loop returns.
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/Notepad.hpp"
 #include "Desktop/TaskManager.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
@@ -70,7 +71,13 @@ class Desktop {
   gui::Frame& explorer_window() { return explorer_; }
   FileExplorer& explorer() { return explorer_; }
   // The filesystem the file explorer browses (nullptr: none). It must outlive the desktop.
-  void set_file_system(filesystem::IFileSystem* fs) { explorer_.set_file_system(fs); }
+  void set_file_system(filesystem::IFileSystem* fs) {
+    explorer_.set_file_system(fs);
+    notepad_.set_file_system(fs);
+  }
+  Notepad& notepad() { return notepad_; }
+  // Opens the text editor, or brings it forward (restoring it if minimized).
+  void open_text_editor();
   TaskManager& task_manager() { return task_manager_; }
   // The machine's figures for the task manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { task_manager_.set_monitor(monitor); }
@@ -108,6 +115,8 @@ class Desktop {
   bool step(uint64_t uptime_us);
 
  private:
+  static void on_text_editor(void* self, gui::Control&);
+  static void on_explorer_file(void* self, gui::Control&);
   static void on_task_manager(void* self, gui::Control&);
   static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
@@ -129,6 +138,7 @@ class Desktop {
   gui::MessageDialog shutdown_dialog_;
   FileExplorer explorer_;
   TaskManager task_manager_;
+  Notepad notepad_;
   gui::Frame about_;
   gui::Label about_lines_[3];
   ClockSource clock_source_ = nullptr;

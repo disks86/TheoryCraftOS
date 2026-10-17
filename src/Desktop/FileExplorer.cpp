@@ -69,7 +69,8 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
       details_button_(allocator),
       view_(allocator),
       path_(allocator),
-      scratch_(allocator) {
+      scratch_(allocator),
+      opened_file_(allocator) {
   set_title("File Explorer");
   set_bounds({60, 40, 540, 360});
   set_padding(Insets::all(4));
@@ -216,11 +217,16 @@ bool FileExplorer::go_up() {
 
 void FileExplorer::activate_selected() {
   const int32_t item = view_.selected_item();
-  if (item < 0 || view_.item_icon(static_cast<uint32_t>(item)) != ItemIcon::Folder) return;
+  if (item < 0) return;
   String name(allocator());
   view_.item_text(static_cast<uint32_t>(item), 0, &name);
   String child(allocator());
   if (!child.assign(path_.view()) || (path_.size() > 1 && !child.push_back('/')) || !child.append(name.view())) return;
+  if (view_.item_icon(static_cast<uint32_t>(item)) != ItemIcon::Folder) {
+    opened_file_ = util::move(child);
+    fire(file_opened_);
+    return;
+  }
   if (!open_folder(child.view())) status_.set_text("The folder could not be opened");
 }
 

@@ -26,7 +26,9 @@
 #include "Gui/Controls/AudioPlayerControl.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/Notepad.hpp"
 #include "Desktop/TaskManager.hpp"
+#include "Gui/Controls/TextEditor.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Gui/Controls/ImageView.hpp"
 #include "Gui/Controls/ListView.hpp"
@@ -41,6 +43,7 @@
 
 using namespace gui;
 namespace key = hardware::key;
+namespace modifier = hardware::modifier;
 
 struct TestAllocator final : allocators::IAllocator {
   int live = 0;
@@ -1000,6 +1003,14 @@ static void test_file_explorer() {
     ex.set_view_mode(ViewMode::Details);
     CHECK(ex.view().view_mode() == ViewMode::Details && ex.details_button().checked() && !ex.icons_button().checked());
 
+    // A file is passed on, not opened as a folder.
+    Counter opened;
+    ex.on_file_opened(opened.handler());
+    w.set_focus(&ex.view());
+    ex.view().select_item(3);
+    press(w, key::kEnter);
+    CHECK(opened.count == 1 && ex.opened_file().equals("/b.txt") && ex.path().equals("/"));
+
     // Opening a folder: Enter on it, a double click, then Up and Backspace go back.
     w.set_focus(&ex.view());
     ex.view().select_item(1);
@@ -1138,6 +1149,202 @@ static void test_task_manager() {
   CHECK(a.live == 0);
 }
 
+// --- Text editor ---------------------------------------------------------------------------------------------
+
+static void type_text(Window& w, const char* text) {
+  for (; *text; ++text) type_char(w, *text);
+}
+static bool text_is(TextEditor& e, const char* expected) { return e.text().equals(expected); }
+
+static void test_text_editor() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    TextEditor ed(a);
+    ed.set_bounds({10, 10, 300, 100});
+    w.add(&ed);
+    w.layout();
+    w.set_focus(&ed);
+    Counter edits, moves;
+    ed.on_changed(edits.handler());
+    ed.on_caret_moved(moves.handler());
+    CHECK(ed.line_count() == 1 && !ed.modified());
+
+    type_text(w, "ab");
+    press(w, key::kEnter);
+    type_text(w, "  cd");
+    press(w, key::kEnter);                      // keeps the indentation
+    type_text(w, "ef");
+    CHECK(text_is(ed, "ab\n  cd\n  ef") && ed.modified() && edits.count == 10);
+    CHECK(ed.line_count() == 3 && ed.caret_line() == 2 && ed.caret_column() == 4 && ed.line_length(1) == 4);
+
+    // Up and Down aim for the column they started from.
+    press(w, key::kUp);
+    CHECK(ed.caret_line() == 1 && ed.caret_column() == 4);
+    press(w, key::kUp);
+    CHECK(ed.caret_line() == 0 && ed.caret_column() == 2);
+    press(w, key::kDown);
+    CHECK(ed.caret_line() == 1 && ed.caret_column() == 4);
+    press(w, 0x4A);                             // Home
+    CHECK(ed.caret() == 3);
+    press(w, 0x4D);                             // End
+    CHECK(ed.caret() == 7);
+    press(w, key::kLeft);
+    press(w, key::kRight);
+    CHECK(ed.caret() == 7);
+
+    // Selecting and replacing.
+    press(w, key::kLeft, modifier::kLeftShift);
+    press(w, key::kLeft, modifier::kLeftShift);
+    CHECK(ed.has_selection() && ed.selection_start() == 5 && ed.selection_end() == 7);
+    type_char(w, 'X');
+    CHECK(text_is(ed, "ab\n  X\n  ef") && !ed.has_selection());
+
+    // Line breaks are deleted like any other character.
+    press(w, 0x4A);
+    press(w, key::kBackspace);                  // at the start of the line: it joins the previous one
+    CHECK(ed.line_count() == 2 && text_is(ed, "ab  X\n  ef") && ed.caret() == 2);
+    press(w, 0x4C);                             // Delete the character after the caret
+    CHECK(text_is(ed, "ab X\n  ef"));
+
+    // Clipboard: copy everything, paste it at the end.
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(ed.selection_start() == 0 && ed.selection_end() == ed.text().size());
+    press(w, key::kA + 2, modifier::kLeftControl);
+    press(w, 0x4D, modifier::kLeftControl);
+    CHECK(ed.caret() == ed.text().size());
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(text_is(ed, "ab X\n  efab X\n  ef"));
+    press(w, 0x4A, modifier::kLeftControl);
+    press(w, 0x4D, modifier::kLeftShift);       // select the first line
+    press(w, key::kA + 23, modifier::kLeftControl);   // cut it
+    CHECK(text_is(ed, "\n  efab X\n  ef") && ed.caret() == 0);
+    press(w, key::kA + 18, modifier::kLeftControl);  // not the editor's: left for the parent
+    CHECK(text_is(ed, "\n  efab X\n  ef"));
+
+    // Tabs show as spaces up to the next multiple of four.
+    ed.set_text("");
+    CHECK(!ed.modified() && ed.line_count() == 1);
+    press(w, key::kTab);
+    type_char(w, 'x');
+    CHECK(text_is(ed, "\tx") && ed.caret_column() == 5 && ed.offset_at(0, 1) == 0 && ed.offset_at(0, 2) == 1 && ed.column_at(0, 1) == 4);
+    ed.set_read_only(true);
+    type_char(w, 'y');
+    CHECK(text_is(ed, "\tx"));
+    ed.set_read_only(false);
+
+    // Long text scrolls and keeps the caret in view.
+    String lines(a);
+    for (int i = 0; i < 40; ++i) {
+      lines.append("line number ");
+      lines.append_uint(static_cast<uint64_t>(i));
+      lines.append(i == 5 ? " with a very long tail that does not fit in the editor width at all, not even close" : "");
+      lines.append("\n");
+    }
+    ed.set_text(lines.view());
+    w.layout();
+    CHECK(ed.line_count() == 41 && ed.vertical_scroll_bar().visible() && ed.horizontal_scroll_bar().visible() && ed.top_line() == 0);
+    press(w, 0x4D, modifier::kLeftControl);
+    CHECK(ed.caret_line() == 40 && ed.top_line() > 0 && ed.caret_line() < ed.top_line() + ed.visible_lines());
+    press(w, 0x4A, modifier::kLeftControl);
+    CHECK(ed.top_line() == 0);
+    for (int i = 0; i < 5; ++i) press(w, key::kDown);
+    press(w, 0x4D);
+    CHECK(ed.left_column() > 0 && ed.caret_column() > ed.visible_columns());
+    press(w, 0x4A);
+    CHECK(ed.left_column() == 0);
+    press(w, 0x4E);                             // Page Down
+    CHECK(ed.caret_line() == 5 + ed.visible_lines() - 1);
+    w.mouse_wheel(60, 60, -1);
+    CHECK(ed.top_line() >= 3);
+    w.render();
+
+    // The mouse places the caret and drags selections.
+    ed.set_text("alpha\nbeta\ngamma");
+    w.layout();
+    const Point c = ed.cell_origin(1, 2);
+    click(w, 10 + c.x, 10 + c.y + 4);
+    CHECK(ed.caret() == 8 && !ed.has_selection());
+    const Point d = ed.cell_origin(2, 3);
+    w.mouse_move(10 + c.x, 10 + c.y + 4);
+    w.mouse_button(10 + c.x, 10 + c.y + 4, MouseButton::Left, true);
+    w.mouse_move(10 + d.x, 10 + d.y + 4);
+    w.mouse_button(10 + d.x, 10 + d.y + 4, MouseButton::Left, false);
+    CHECK(ed.selection_start() == 8 && ed.selection_end() == 14);
+    w.render();
+    ed.set_max_length(10);
+    CHECK(!ed.insert_text("0123456789"));
+    CHECK(!ed.set_text("this is longer than ten"));
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_notepad() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/t.txt", "a\r\nb\r\n");
+    CHECK(fs.create_directory("/dir") == filesystem::Status::Ok);
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::Notepad np(a);
+    CHECK(mgr.add_window(&np));
+    w.layout();
+    CHECK(!np.open_file("/t.txt") && np.status_label().text().equals("No storage available."));
+    np.set_file_system(&fs);
+    CHECK(np.title().equals("Text Editor - Untitled") && np.position_label().text().equals("Ln 1, Col 1"));
+
+    CHECK(np.open_file("t.txt"));               // the leading slash is optional; CRs are dropped
+    CHECK(np.editor().text().equals("a\nb\n") && np.path().equals("/t.txt") && !np.editor().modified());
+    CHECK(np.title().equals("Text Editor - t.txt") && np.status_label().text().equals("Opened /t.txt"));
+    CHECK(!np.open_file("/nope") && np.status_label().text().equals("Cannot open /nope: not found") && np.editor().text().equals("a\nb\n"));
+    CHECK(!np.open_file("/dir"));
+
+    // Unsaved changes are only thrown away when the command is repeated.
+    w.set_focus(&np.editor());
+    np.editor().set_caret(np.editor().text().size());
+    type_char(w, 'c');
+    CHECK(np.editor().modified() && np.title().equals("Text Editor - t.txt *") && np.position_label().text().equals("Ln 3, Col 2"));
+    CHECK(!np.new_document() && np.status_label().text().first(13).equals("Unsaved chang"));
+    type_char(w, 'd');                          // typing again disarms it
+    CHECK(!np.new_document() && np.editor().text().equals("a\nb\ncd"));
+    CHECK(np.new_document() && np.editor().text().empty() && np.path().empty() && np.title().equals("Text Editor - Untitled"));
+
+    // Saving writes the text back (Ctrl+S, to the path in the toolbar).
+    np.path_box().set_text("out.txt");
+    type_text(w, "hello");
+    press(w, key::kEnter);
+    type_text(w, "world");
+    press(w, key::kA + 18, modifier::kLeftControl);
+    CHECK(!np.editor().modified() && np.path().equals("/out.txt") && np.status_label().text().equals("Saved /out.txt") && np.title().equals("Text Editor - out.txt"));
+    UniquePointer<filesystem::IFile> f;
+    CHECK(fs.open_file("/out.txt", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() == 11);
+    char got[16] = {};
+    uint64_t n = 0;
+    CHECK(f->read(0, ByteView(reinterpret_cast<uint8_t*>(got), 11), &n) == filesystem::Status::Ok && !strcmp(got, "hello\nworld"));
+    f.reset();
+    CHECK(!np.save_file("/missing/x.txt") && np.status_label().text().equals("Cannot save /missing/x.txt: not found"));
+    CHECK(!np.save_file("") == false);          // the toolbar's path again
+    np.path_box().set_text("");
+    CHECK(!np.save_file() && np.status_label().text().equals("Enter a path to save to."));
+
+    // Enter in the path box opens the file.
+    np.path_box().set_text("/t.txt");
+    w.set_focus(&np.path_box());
+    press(w, key::kEnter);
+    CHECK(np.editor().text().equals("a\nb\n"));
+    w.render();
+    mgr.remove_window(&np);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_scroll_bar();
   test_data_grid();
@@ -1149,6 +1356,8 @@ int main() {
   test_list_view();
   test_file_explorer();
   test_task_manager();
+  test_text_editor();
+  test_notepad();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");
   return 0;
