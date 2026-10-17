@@ -129,6 +129,8 @@ class MenuBar : public Control, public MenuHost {
   uint32_t menu_count() const { return static_cast<uint32_t>(menus_.count()); }
   Menu* menu(uint32_t index) const { return index < menus_.count() ? menus_[index] : nullptr; }
   int32_t open_menu_index() const { return open_; }  // -1 = none open
+  // The item with this text in the menu with this title (for enabling, checking or running it from code); nullptr if there is none.
+  MenuItem* find_item(StringView menu_title, StringView item_text) const;
 
   void paint(Painter& painter) override;
   void on_mouse_move(const MouseArgs& args) override;

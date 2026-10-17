@@ -145,22 +145,12 @@ bool Paint::is_picture_name(StringView name) { return format_of_name(name) != me
 
 Paint::Paint(allocators::IAllocator& allocator)
     : Frame(allocator),
+      menu_(allocator),
       file_bar_(allocator),
       options_bar_(allocator),
       palette_bar_(allocator),
       status_bar_(allocator),
-      gap_a_(allocator),
-      gap_b_(allocator),
-      new_(allocator),
-      open_(allocator),
-      save_(allocator),
-      cut_(allocator),
-      copy_(allocator),
-      paste_(allocator),
-      undo_(allocator),
-      redo_(allocator),
-      zoom_in_(allocator),
-      zoom_out_(allocator),
+      path_label_(allocator),
       path_(allocator),
       size_label_(allocator),
       size_value_(allocator),
@@ -168,8 +158,6 @@ Paint::Paint(allocators::IAllocator& allocator)
       status_(allocator),
       position_(allocator),
       size_(allocator),
-      filled_(allocator),
-      grid_(allocator),
       tools_(allocator),
       palette_(allocator),
       picker_(allocator),
@@ -179,41 +167,47 @@ Paint::Paint(allocators::IAllocator& allocator)
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
 
-  // File bar: New Open Save, the path, Undo Redo.
+  // The menus.
+  menu_.set_dock(DockStyle::Top);
+  menu_.set_size(0, 22);
+  if (Menu* file = menu_.add_menu("File")) {
+    file->add_item("New", {&Paint::on_new, this}, "Ctrl+N");
+    file->add_item("Open", {&Paint::on_open, this}, "Ctrl+O");
+    file->add_item("Save", {&Paint::on_save, this}, "Ctrl+S");
+    file->add_separator();
+    file->add_item("Close", {&Paint::on_close_window, this});
+  }
+  if (Menu* edit = menu_.add_menu("Edit")) {
+    undo_item_ = edit->add_item("Undo", {&Paint::on_undo, this}, "Ctrl+Z");
+    redo_item_ = edit->add_item("Redo", {&Paint::on_redo, this}, "Ctrl+Y");
+    edit->add_separator();
+    edit->add_item("Cut", {&Paint::on_cut, this}, "Ctrl+X");
+    edit->add_item("Copy", {&Paint::on_copy, this}, "Ctrl+C");
+    edit->add_item("Paste", {&Paint::on_paste, this}, "Ctrl+V");
+    edit->add_separator();
+    edit->add_item("Select All", {&Paint::on_select_all, this}, "Ctrl+A");
+  }
+  if (Menu* view = menu_.add_menu("View")) {
+    view->add_item("Zoom In", {&Paint::on_zoom_in, this}, "Ctrl++");
+    view->add_item("Zoom Out", {&Paint::on_zoom_out, this}, "Ctrl+-");
+    view->add_item("Actual Size", {&Paint::on_actual_size, this}, "Ctrl+0");
+    view->add_separator();
+    grid_item_ = view->add_item("Pixel Grid", {&Paint::on_toggle_grid, this});
+  }
+  if (Menu* options = menu_.add_menu("Options")) filled_item_ = options->add_item("Filled Shapes", {&Paint::on_toggle_filled, this});
+
+  // The path row.
   file_bar_.set_dock(DockStyle::Top);
   file_bar_.set_size(0, 30);
   file_bar_.set_padding(Insets{0, 2, 0, 2});
-  struct Part {
-    Button& button;
-    const char* text;
-    DockStyle dock;
-    int32_t width;
-    void (*handler)(void*, Control&);
-  };
-  const Part parts[] = {{new_, "New", DockStyle::Left, 52, &Paint::on_new},      {open_, "Open", DockStyle::Left, 52, &Paint::on_open},
-                        {save_, "Save", DockStyle::Left, 52, &Paint::on_save},   {cut_, "Cut", DockStyle::Left, 44, &Paint::on_cut},
-                        {copy_, "Copy", DockStyle::Left, 48, &Paint::on_copy},   {paste_, "Paste", DockStyle::Left, 52, &Paint::on_paste},
-                        {redo_, "Redo", DockStyle::Right, 52, &Paint::on_redo},
-                        {undo_, "Undo", DockStyle::Right, 52, &Paint::on_undo}};
-  for (const Part& p : parts) {
-    p.button.set_text(p.text);
-    p.button.set_dock(p.dock);
-    p.button.set_size(p.width, 0);
-    p.button.on_click({p.handler, this});
-    file_bar_.add(&p.button);
-  }
-  gap_a_.set_style(PanelStyle::Transparent);
-  gap_a_.set_dock(DockStyle::Left);
-  gap_a_.set_size(6, 0);
-  gap_b_.set_style(PanelStyle::Transparent);
-  gap_b_.set_dock(DockStyle::Right);
-  gap_b_.set_size(6, 0);
-  file_bar_.add(&gap_a_);
-  file_bar_.add(&gap_b_);
+  path_label_.set_text("File:");
+  path_label_.set_dock(DockStyle::Left);
+  path_label_.set_size(48, 0);
+  file_bar_.add(&path_label_);
   path_.set_dock(DockStyle::Fill);
   file_bar_.add(&path_);
 
-  // Options bar: brush size, shape style, grid, zoom.
+  // Options bar: brush size and the zoom shown.
   options_bar_.set_dock(DockStyle::Top);
   options_bar_.set_size(0, 28);
   options_bar_.set_padding(Insets{0, 2, 0, 2});
@@ -229,33 +223,13 @@ Paint::Paint(allocators::IAllocator& allocator)
   size_value_.set_text("1");
   size_value_.set_dock(DockStyle::Left);
   size_value_.set_size(36, 0);
-  filled_.set_text("Filled shapes");
-  filled_.set_dock(DockStyle::Left);
-  filled_.set_size(128, 0);
-  filled_.on_changed({&Paint::on_options, this});
-  grid_.set_text("Grid");
-  grid_.set_dock(DockStyle::Left);
-  grid_.set_size(64, 0);
-  grid_.on_changed({&Paint::on_options, this});
-  zoom_in_.set_text("+");
-  zoom_in_.set_dock(DockStyle::Right);
-  zoom_in_.set_size(28, 0);
-  zoom_in_.on_click({&Paint::on_zoom_in, this});
   zoom_label_.set_text("100%");
   zoom_label_.set_dock(DockStyle::Right);
   zoom_label_.set_size(56, 0);
-  zoom_out_.set_text("-");
-  zoom_out_.set_dock(DockStyle::Right);
-  zoom_out_.set_size(28, 0);
-  zoom_out_.on_click({&Paint::on_zoom_out, this});
   options_bar_.add(&size_label_);
   options_bar_.add(&size_);
   options_bar_.add(&size_value_);
-  options_bar_.add(&filled_);
-  options_bar_.add(&grid_);
-  options_bar_.add(&zoom_in_);
   options_bar_.add(&zoom_label_);
-  options_bar_.add(&zoom_out_);
 
   // Status bar, then the palette above it.
   status_bar_.set_style(PanelStyle::Sunken);
@@ -296,6 +270,7 @@ Paint::Paint(allocators::IAllocator& allocator)
   canvas_.set_secondary(palette_.secondary());
   canvas_.new_image(kNewWidth, kNewHeight);
 
+  add(&menu_);
   add(&file_bar_);
   add(&options_bar_);
   add(&status_bar_);
@@ -314,8 +289,8 @@ void Paint::update_state() {
   title.append(name_.empty() ? StringView("Untitled") : name_.view());
   if (canvas_.modified()) title.append(" *");
   set_title(title.view());
-  undo_.set_enabled(canvas_.can_undo());
-  redo_.set_enabled(canvas_.can_redo());
+  if (undo_item_) undo_item_->set_enabled(canvas_.can_undo());
+  if (redo_item_) redo_item_->set_enabled(canvas_.can_redo());
   update_position();
 }
 
@@ -408,10 +383,24 @@ void Paint::on_size(void* self, Control&) {
   p->size_value_.set_text(text.view());
 }
 
-void Paint::on_options(void* self, Control&) {
+void Paint::on_toggle_filled(void* self, Control&) {
   auto* p = static_cast<Paint*>(self);
-  p->canvas_.set_filled(p->filled_.checked());
-  p->canvas_.set_grid(p->grid_.checked());
+  p->canvas_.set_filled(!p->canvas_.filled());
+  p->filled_item_->set_checked(p->canvas_.filled());
+}
+
+void Paint::on_toggle_grid(void* self, Control&) {
+  auto* p = static_cast<Paint*>(self);
+  p->canvas_.set_grid(!p->canvas_.grid());
+  p->grid_item_->set_checked(p->canvas_.grid());
+}
+
+void Paint::on_actual_size(void* self, Control&) { static_cast<Paint*>(self)->canvas_.set_zoom(1); }
+void Paint::on_close_window(void* self, Control&) { static_cast<Paint*>(self)->close(); }
+void Paint::on_select_all(void* self, Control&) {
+  auto* p = static_cast<Paint*>(self);
+  p->canvas_.select_all();
+  p->say("Selected the whole picture.");
 }
 
 void Paint::on_undo(void* self, Control&) { static_cast<Paint*>(self)->canvas_.undo(); }
@@ -571,7 +560,12 @@ bool Paint::on_key(const KeyArgs& args) {
       case key::kA + 18: save_file(); return true;                   // S
       case key::kA + 25: canvas_.undo(); return true;                // Z
       case key::kA + 24: canvas_.redo(); return true;                // Y
-      case key::kA: canvas_.select_all(); say("Selected the whole picture."); return true;   // A
+      case key::kA: on_select_all(this, *this); return true;   // A
+      case 0x2E: canvas_.zoom_in(); return true;                // + (the = key)
+      case 0x57: canvas_.zoom_in(); return true;                // + on the numeric keypad
+      case 0x2D: canvas_.zoom_out(); return true;               // -
+      case 0x56: canvas_.zoom_out(); return true;               // - on the numeric keypad
+      case key::k1 + 9: canvas_.set_zoom(1); return true;       // 0
       case key::kA + 2: copy_to_clipboard(false); return true;       // C
       case key::kA + 23: copy_to_clipboard(true); return true;       // X
       case key::kA + 21: paste_from_clipboard(); return true;        // V

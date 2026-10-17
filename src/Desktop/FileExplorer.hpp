@@ -17,7 +17,7 @@
  */
 
 // The file explorer: a window showing the folders and files of a filesystem in a ListView, which the
-// toolbar switches between list, icon and details views. Double-click (or Enter on) a folder opens it, a file is passed on to on_file_opened, the
+// View menu switches between list, icon and details views. Double-click (or Enter on) a folder opens it, a file is passed on to on_file_opened, the
 // Up button (or Backspace) goes to the parent. The window starts at the root of the filesystem it is given.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
@@ -25,7 +25,7 @@
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Controls/Panel.hpp"
-#include "Gui/Controls/RadioButton.hpp"
+#include "Gui/Controls/Menu.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Kernel/Sync.hpp"
 
@@ -55,27 +55,38 @@ class FileExplorer : public gui::Frame {
   StringView path() const { return path_.view(); }
   gui::ListView& view() { return view_; }
   gui::BreadcrumbBar& address_bar() { return address_; }
-  gui::RadioButton& list_button() { return list_button_; }
-  gui::RadioButton& icons_button() { return icons_button_; }
-  gui::RadioButton& details_button() { return details_button_; }
+  gui::MenuBar& menu_bar() { return menu_; }
+  // The View menu's entries; the one for the view in use is checked.
+  gui::MenuItem* list_item() { return list_item_; }
+  gui::MenuItem* icons_item() { return icons_item_; }
+  gui::MenuItem* details_item() { return details_item_; }
   gui::Label& status_label() { return status_; }
 
   bool on_key(const gui::KeyArgs& args) override;
 
  private:
   static void on_navigate(void* self, gui::Control&);
-  static void on_mode(void* self, gui::Control& sender);
+  static void on_view_list(void* self, gui::Control&);
+  static void on_view_icons(void* self, gui::Control&);
+  static void on_view_details(void* self, gui::Control&);
+  static void on_open_item(void* self, gui::Control&);
+  static void on_copy_path(void* self, gui::Control&);
+  static void on_close_window(void* self, gui::Control&);
+  static void on_up_menu(void* self, gui::Control&);
+  static void on_refresh_menu(void* self, gui::Control&);
+  static void on_address_menu(void* self, gui::Control&);
+  bool copy_selected_path();
   static void on_activated(void* self, gui::Control&);
   static void on_selection(void* self, gui::Control&);
   bool load(StringView path);   // (with navigation_ held)
   void activate_selected();
   void update_status();
 
-  gui::RadioGroup group_;
+  gui::MenuBar menu_;
   gui::Panel toolbar_, status_bar_;
   gui::BreadcrumbBar address_;
   gui::Label status_;
-  gui::RadioButton list_button_, icons_button_, details_button_;
+  gui::MenuItem *list_item_ = nullptr, *icons_item_ = nullptr, *details_item_ = nullptr;
   gui::ListView view_;
   kernel::Mutex navigation_;    // one folder is loaded at a time (a refresh from another thread must not interleave with a click)
   filesystem::IFileSystem* fs_ = nullptr;

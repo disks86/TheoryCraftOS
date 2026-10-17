@@ -19,10 +19,11 @@
 // The task manager: a window with two tabs. "Processes" is a table of the running kernel threads with their state,
 // core and share of the processor; "Performance" shows the processor load (overall and per core) and memory use. It reads the machine through
 // an ISystemMonitor and refreshes itself when update() is called (the desktop does so once a second while the
-// window is open). Click a column title to sort the table.
+// window is open). Click a column title to sort the table. The File menu closes the window; the View menu picks the tab.
 #pragma once
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TabControl.hpp"
@@ -89,6 +90,7 @@ class TaskManager : public gui::Frame {
   gui::Label& memory_label() { return memory_value_; }
   gui::Label& info_label() { return info_; }
   gui::TabControl& tabs() { return tabs_; }
+  gui::MenuBar& menu_bar() { return menu_; }
   // The meter and label of core `index` (one per online core up to kMaxCoresShown; nullptr for others).
   gui::LevelMeter* core_meter(uint32_t index);
   gui::Label* core_label(uint32_t index);
@@ -126,6 +128,13 @@ class TaskManager : public gui::Frame {
     gui::LevelMeter meter;
   };
 
+  static void on_show_processes(void* self, gui::Control&);
+  static void on_show_performance(void* self, gui::Control&);
+  static void on_close_window(void* self, gui::Control&);
+  static void on_tab_changed(void* self, gui::Control&);
+
+  gui::MenuBar menu_;
+  gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr;
   gui::TabControl tabs_;
   gui::Panel processes_page_, performance_page_, cpu_row_, memory_row_;
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
