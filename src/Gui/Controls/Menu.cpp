@@ -199,6 +199,15 @@ Menu* MenuBar::add_menu(StringView title) {
   return m;
 }
 
+MenuItem* MenuBar::find_item(StringView menu_title, StringView item_text) const {
+  for (uint32_t m = 0; m < menus_.count(); ++m) {
+    if (!menus_[m]->title().equals(menu_title)) continue;
+    for (uint32_t i = 0; i < menus_[m]->item_count(); ++i)
+      if (menus_[m]->item(i)->text.view().equals(item_text)) return menus_[m]->item(i);
+  }
+  return nullptr;
+}
+
 int32_t MenuBar::title_width(int32_t index) const {
   return Painter::text_width(menus_[static_cast<uint64_t>(index)]->title()) + 2 * kTitlePad;
 }

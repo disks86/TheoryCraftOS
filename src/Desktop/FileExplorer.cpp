@@ -60,13 +60,11 @@ bool format_type(const DirectoryEntry& entry, String* out) {
 
 FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     : Frame(allocator),
+      menu_(allocator),
       toolbar_(allocator),
       status_bar_(allocator),
       address_(allocator),
       status_(allocator),
-      list_button_(allocator),
-      icons_button_(allocator),
-      details_button_(allocator),
       view_(allocator),
       path_(allocator),
       scratch_(allocator),
@@ -80,20 +78,26 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   toolbar_.set_size(0, 28);
   toolbar_.set_padding(Insets{0, 2, 0, 2});
 
-  struct Mode {
-    RadioButton& button;
-    const char* text;
-    int32_t width;
-  };
-  const Mode modes[3] = {{details_button_, "Details", 82}, {icons_button_, "Icons", 68}, {list_button_, "List", 58}};
-  for (const Mode& m : modes) {  // docked right: the first added is the rightmost
-    m.button.set_text(m.text);
-    m.button.set_dock(DockStyle::Right);
-    m.button.set_size(m.width, 0);
-    m.button.set_group(&group_);
-    m.button.on_changed({&FileExplorer::on_mode, this});
-    toolbar_.add(&m.button);
+  menu_.set_dock(DockStyle::Top);
+  menu_.set_size(0, 22);
+  if (Menu* file = menu_.add_menu("File")) {
+    file->add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
+    file->add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
+    file->add_separator();
+    file->add_item("Close", {&FileExplorer::on_close_window, this});
   }
+  if (Menu* view = menu_.add_menu("View")) {
+    list_item_ = view->add_item("List", {&FileExplorer::on_view_list, this});
+    icons_item_ = view->add_item("Icons", {&FileExplorer::on_view_icons, this});
+    details_item_ = view->add_item("Details", {&FileExplorer::on_view_details, this});
+    view->add_separator();
+    view->add_item("Refresh", {&FileExplorer::on_refresh_menu, this}, "F5");
+  }
+  if (Menu* go = menu_.add_menu("Go")) {
+    go->add_item("Up One Level", {&FileExplorer::on_up_menu, this}, "Backspace");
+    go->add_item("Address", {&FileExplorer::on_address_menu, this}, "Ctrl+L");
+  }
+
   address_.set_dock(DockStyle::Fill);
   address_.on_navigate({&FileExplorer::on_navigate, this});
   toolbar_.add(&address_);  // Fill goes last
@@ -112,11 +116,11 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   view_.on_item_activated({&FileExplorer::on_activated, this});
   view_.on_selection_changed({&FileExplorer::on_selection, this});
 
+  add(&menu_);
   add(&toolbar_);
   add(&status_bar_);
   add(&view_);  // Fill goes last
   path_.assign("/");
-  details_button_.set_checked(true);
   set_view_mode(ViewMode::Details);
   update_status();
 }
@@ -131,8 +135,9 @@ void FileExplorer::set_file_system(filesystem::IFileSystem* fs) {
 
 void FileExplorer::set_view_mode(ViewMode mode) {
   view_.set_view_mode(mode);
-  RadioButton& button = mode == ViewMode::List ? list_button_ : mode == ViewMode::Icons ? icons_button_ : details_button_;
-  button.set_checked(true);
+  if (list_item_) list_item_->set_checked(mode == ViewMode::List);
+  if (icons_item_) icons_item_->set_checked(mode == ViewMode::Icons);
+  if (details_item_) details_item_->set_checked(mode == ViewMode::Details);
 }
 
 bool FileExplorer::open_folder(StringView path) {
@@ -243,19 +248,26 @@ void FileExplorer::update_status() {
   status_.set_text(scratch_.view());
 }
 
+// Puts the full path of the selected item on the clipboard. False if nothing is selected or there is no clipboard.
+bool FileExplorer::copy_selected_path() {
+  const int32_t item = view_.selected_item();
+  if (item < 0 || !clipboard()) return false;
+  String name(allocator()), full(allocator());
+  view_.item_text(static_cast<uint32_t>(item), 0, &name);
+  if (!full.assign(path_.view()) || (path_.size() > 1 && !full.push_back('/')) || !full.append(name.view())) return true;
+  if (clipboard()->set_text(full.view())) {
+    String message(allocator());
+    message.append("Copied ");
+    message.append(full.view());
+    status_.set_text(message.view());
+  }
+  return true;
+}
+
 bool FileExplorer::on_key(const KeyArgs& args) {
-  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 2) {  // Ctrl+C: the selected item's path
-    const int32_t item = view_.selected_item();
-    if (item < 0 || !clipboard()) return false;
-    String name(allocator()), full(allocator());
-    view_.item_text(static_cast<uint32_t>(item), 0, &name);
-    if (!full.assign(path_.view()) || (path_.size() > 1 && !full.push_back('/')) || !full.append(name.view())) return true;
-    if (clipboard()->set_text(full.view())) {
-      String message(allocator());
-      message.append("Copied ");
-      message.append(full.view());
-      status_.set_text(message.view());
-    }
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 2) return copy_selected_path();   // Ctrl+C
+  if (args.usage == hardware::key::kF1 + 4) {  // F5
+    refresh();
     return true;
   }
   if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 11) {  // Ctrl+L
@@ -281,12 +293,15 @@ void FileExplorer::on_navigate(void* self, Control&) {
   }
 }
 
-void FileExplorer::on_mode(void* self, Control& sender) {
-  auto* e = static_cast<FileExplorer*>(self);
-  auto& button = static_cast<RadioButton&>(sender);
-  if (!button.checked()) return;
-  e->view_.set_view_mode(&button == &e->list_button_ ? ViewMode::List : &button == &e->icons_button_ ? ViewMode::Icons : ViewMode::Details);
-}
+void FileExplorer::on_view_list(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::List); }
+void FileExplorer::on_view_icons(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::Icons); }
+void FileExplorer::on_view_details(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::Details); }
+void FileExplorer::on_open_item(void* self, Control&) { static_cast<FileExplorer*>(self)->activate_selected(); }
+void FileExplorer::on_copy_path(void* self, Control&) { static_cast<FileExplorer*>(self)->copy_selected_path(); }
+void FileExplorer::on_close_window(void* self, Control&) { static_cast<FileExplorer*>(self)->close(); }
+void FileExplorer::on_up_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->go_up(); }
+void FileExplorer::on_refresh_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->refresh(); }
+void FileExplorer::on_address_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->address_.begin_edit(); }
 
 void FileExplorer::on_activated(void* self, Control&) { static_cast<FileExplorer*>(self)->activate_selected(); }
 void FileExplorer::on_selection(void* self, Control&) { static_cast<FileExplorer*>(self)->update_status(); }

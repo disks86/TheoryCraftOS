@@ -63,6 +63,12 @@ class TextEditor : public Control {
   uint32_t caret_line() const { return line_of(caret_); }
   uint32_t caret_column() const { return column_at(line_of(caret_), caret_); }
 
+  // --- Clipboard (the keys do the same). Copy and cut need a selection; false if there is none or it cannot be done.
+  bool copy_selection();
+  bool cut_selection();
+  void paste();
+  void delete_selection() { UiGuard lock(this); if (has_selection()) replace(selection_start(), selection_end(), StringView()); }
+
   // --- Lines
   uint32_t line_count() const { return static_cast<uint32_t>(starts_.count()); }
   uint32_t line_start(uint32_t line) const { return line < starts_.count() ? starts_[line] : static_cast<uint32_t>(text_.size()); }
@@ -103,8 +109,6 @@ class TextEditor : public Control {
   void ensure_caret_visible();
   void move_caret(uint32_t offset, bool extend, bool keep_column = false);
   uint32_t offset_at_point(int32_t x, int32_t y) const;
-  bool copy_selection();
-  void paste();
   void expand_line(uint32_t line, String* out) const;
   void on_scroll_changed();
   static void vertical_changed(void* self, Control&);

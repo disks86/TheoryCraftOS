@@ -16,22 +16,22 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The paint application: a window with a toolbar (New, Open, Save, the file's path, Undo, Redo), the drawing options
-// (brush size, filled shapes, pixel grid, zoom), a strip of tools at the left, the DrawingCanvas, and at the bottom a
+// The paint application: a window with a menu bar (File: New, Open, Save, Close; Edit: Undo, Redo, Cut, Copy, Paste,
+// Select All; View: Zoom In, Zoom Out, Actual Size, Pixel Grid; Options: Filled Shapes), a row with the file's path, the
+// brush size, a strip of tools at the left, the DrawingCanvas, and at the bottom a
 // color palette with a color picker for any other color. Files are opened and saved as images; the format follows the
-// extension (png, jpg, bmp, gif, ppm, qoi, tga, tif, webp; png when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Z and Ctrl+Y
-// do what their buttons do. Cut, Copy and Paste (Ctrl+X, Ctrl+C, Ctrl+V) use the system clipboard: the selection made with the
+// extension (png, jpg, bmp, gif, ppm, qoi, tga, tif, webp; png when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Z, Ctrl+Y and Ctrl+A
+// do what their menu items do. Cut, Copy and Paste (Ctrl+X, Ctrl+C, Ctrl+V) use the system clipboard: the selection made with the
 // Select tool (the whole picture when nothing is selected) goes onto it as a picture, and a picture on it is pasted as a floating
 // selection to drag into place. A command that would throw away unsaved changes does nothing the first time (the status
 // line says so) and goes ahead when it is repeated.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
-#include "Gui/Controls/Button.hpp"
-#include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/ColorPalette.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DrawingCanvas.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/TextBox.hpp"
@@ -65,19 +65,8 @@ class Paint : public gui::Frame {
   gui::ColorPalette& palette() { return palette_; }
   gui::ColorPicker& color_picker() { return picker_; }
   gui::Slider& size_slider() { return size_; }
-  gui::CheckBox& filled_box() { return filled_; }
-  gui::CheckBox& grid_box() { return grid_; }
+  gui::MenuBar& menu_bar() { return menu_; }
   gui::TextBox& path_box() { return path_; }
-  gui::Button& new_button() { return new_; }
-  gui::Button& open_button() { return open_; }
-  gui::Button& save_button() { return save_; }
-  gui::Button& cut_button() { return cut_; }
-  gui::Button& copy_button() { return copy_; }
-  gui::Button& paste_button() { return paste_; }
-  gui::Button& undo_button() { return undo_; }
-  gui::Button& redo_button() { return redo_; }
-  gui::Button& zoom_in_button() { return zoom_in_; }
-  gui::Button& zoom_out_button() { return zoom_out_; }
   gui::Label& status_label() { return status_; }
   gui::Label& position_label() { return position_; }
   gui::Label& zoom_label() { return zoom_label_; }
@@ -104,7 +93,11 @@ class Paint : public gui::Frame {
   static void on_picker(void* self, gui::Control&);
   static void on_picked(void* self, gui::Control&);
   static void on_size(void* self, gui::Control&);
-  static void on_options(void* self, gui::Control&);
+  static void on_toggle_filled(void* self, gui::Control&);
+  static void on_toggle_grid(void* self, gui::Control&);
+  static void on_actual_size(void* self, gui::Control&);
+  static void on_select_all(void* self, gui::Control&);
+  static void on_close_window(void* self, gui::Control&);
   static void on_canvas_changed(void* self, gui::Control&);
   static void on_pointer(void* self, gui::Control&);
   static void on_zoom_changed(void* self, gui::Control&);
@@ -113,12 +106,13 @@ class Paint : public gui::Frame {
   void update_state();
   void update_position();
 
-  gui::Panel file_bar_, options_bar_, palette_bar_, status_bar_, gap_a_, gap_b_;
-  gui::Button new_, open_, save_, cut_, copy_, paste_, undo_, redo_, zoom_in_, zoom_out_;
+  gui::MenuBar menu_;
+  gui::Panel file_bar_, options_bar_, palette_bar_, status_bar_;
+  gui::Label path_label_;
   gui::TextBox path_;
   gui::Label size_label_, size_value_, zoom_label_, status_, position_;
   gui::Slider size_;
-  gui::CheckBox filled_, grid_;
+  gui::MenuItem *undo_item_ = nullptr, *redo_item_ = nullptr, *filled_item_ = nullptr, *grid_item_ = nullptr;
   gui::ToolStrip tools_;
   gui::ColorPalette palette_;
   gui::ColorPicker picker_;

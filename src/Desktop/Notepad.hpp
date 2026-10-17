@@ -24,8 +24,8 @@
 // on opening, so saved files always use LF.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
-#include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/Controls/TextEditor.hpp"
@@ -54,9 +54,7 @@ class Notepad : public gui::Frame {
   StringView path() const { return path_.text(); }
   gui::TextEditor& editor() { return editor_; }
   gui::TextBox& path_box() { return path_; }
-  gui::Button& new_button() { return new_; }
-  gui::Button& open_button() { return open_; }
-  gui::Button& save_button() { return save_; }
+  gui::MenuBar& menu_bar() { return menu_; }
   gui::Label& status_label() { return status_; }
   gui::Label& position_label() { return position_; }
 
@@ -66,17 +64,25 @@ class Notepad : public gui::Frame {
   static void on_new(void* self, gui::Control&);
   static void on_open(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
+  static void on_close(void* self, gui::Control&);
+  static void on_cut(void* self, gui::Control&);
+  static void on_copy(void* self, gui::Control&);
+  static void on_paste(void* self, gui::Control&);
+  static void on_select_all(void* self, gui::Control&);
   static void on_edited(void* self, gui::Control&);
   static void on_moved(void* self, gui::Control&);
   bool may_discard();
   void say(StringView text) { status_.set_text(text); }
   void update_title();
   void update_position();
+  void update_menus();
 
-  gui::Panel toolbar_, status_bar_, gap_;
-  gui::Button new_, open_, save_;
+  gui::MenuBar menu_;
+  gui::Panel toolbar_, status_bar_;
+  gui::Label path_label_;
   gui::TextBox path_;
   gui::Label status_, position_;
+  gui::MenuItem *cut_item_ = nullptr, *copy_item_ = nullptr;
   gui::TextEditor editor_;
   filesystem::IFileSystem* fs_ = nullptr;
   String name_;  // the file's name as shown in the title

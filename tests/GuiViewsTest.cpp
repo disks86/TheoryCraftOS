@@ -39,6 +39,7 @@
 #include "Gui/Controls/ToolStrip.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/ImageView.hpp"
+#include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Windows/WindowManager.hpp"
@@ -97,6 +98,31 @@ static void click(Window& w, int32_t x, int32_t y) {
   w.mouse_move(x, y);
   w.mouse_button(x, y, MouseButton::Left, true);
   w.mouse_button(x, y, MouseButton::Left, false);
+}
+
+// Chooses a menu item the way a user does: clicks the title, then the item's row in the drop-down. False if there is no such
+// menu or item, or the item is disabled (the click then does nothing).
+static bool choose(Window& w, MenuBar& bar, const char* menu, const char* item) {
+  int32_t index = -1;
+  for (uint32_t m = 0; m < bar.menu_count(); ++m)
+    if (bar.menu(m)->title().equals(menu)) index = static_cast<int32_t>(m);
+  if (index < 0 || !bar.find_item(menu, item)) return false;
+  bar.open_menu(index);
+  Control* popup = w.popup();
+  if (!popup) return false;
+  int32_t top = 2;
+  Menu* m = bar.menu(static_cast<uint32_t>(index));
+  for (uint32_t i = 0; i < m->item_count(); ++i) {
+    const int32_t height = m->item(i)->separator ? MenuPopup::kSeparatorHeight : MenuPopup::kRowHeight;
+    if (!m->item(i)->separator && m->item(i)->text.view().equals(item)) {
+      const bool enabled = m->item(i)->enabled();
+      click(w, popup->bounds().x + 30, popup->bounds().y + top + height / 2);
+      if (!enabled) bar.close_menu();   // a disabled item keeps the menu open
+      return enabled;
+    }
+    top += height;
+  }
+  return false;
 }
 static Point center(Control& c) {
   const Point o = c.window_origin();
@@ -1002,17 +1028,17 @@ static void test_file_explorer() {
     CHECK(ex.view().item_icon(1) == ItemIcon::Folder && ex.view().item_icon(2) == ItemIcon::File);
     CHECK(cell_of(3, 1).view().equals("11 B") && cell_of(3, 2).view().equals("TXT File") && cell_of(4, 2).view().equals("File") && cell_of(0, 2).view().equals("Folder") && cell_of(0, 1).empty());
     CHECK(ex.status_label().text().equals("5 items"));
-    CHECK(ex.address_bar().path().equals("/") && ex.address_bar().segment_count() == 1 && ex.details_button().checked() && ex.view().view_mode() == ViewMode::Details);
+    CHECK(ex.address_bar().path().equals("/") && ex.address_bar().segment_count() == 1 && ex.details_item()->checked() && ex.view().view_mode() == ViewMode::Details);
 
     // The three views are chosen with the toolbar's buttons.
-    ex.list_button().set_checked(true);
-    CHECK(ex.view().view_mode() == ViewMode::List && !ex.details_button().checked());
-    ex.icons_button().set_checked(true);
+    CHECK(choose(w, ex.menu_bar(), "View", "List"));
+    CHECK(ex.view().view_mode() == ViewMode::List && !ex.details_item()->checked() && ex.list_item()->checked());
+    CHECK(choose(w, ex.menu_bar(), "View", "Icons"));
     CHECK(ex.view().view_mode() == ViewMode::Icons);
     w.layout();
     w.render();
     ex.set_view_mode(ViewMode::Details);
-    CHECK(ex.view().view_mode() == ViewMode::Details && ex.details_button().checked() && !ex.icons_button().checked());
+    CHECK(ex.view().view_mode() == ViewMode::Details && ex.details_item()->checked() && !ex.icons_item()->checked());
 
     // A file is passed on, not opened as a folder.
     Counter opened;
@@ -1806,7 +1832,7 @@ static void test_paint() {
     w.layout();
     DrawingCanvas& c = paint.canvas();
     CHECK(desktop::Paint::is_picture_name("a/b.PNG") && desktop::Paint::is_picture_name("x.jpeg") && !desktop::Paint::is_picture_name("x.txt") && !desktop::Paint::is_picture_name("png"));
-    CHECK(paint.title().equals("Paint - Untitled") && c.image_width() == 640 && c.image_height() == 480 && !paint.undo_button().enabled());
+    CHECK(paint.title().equals("Paint - Untitled") && c.image_width() == 640 && c.image_height() == 480 && !paint.menu_bar().find_item("Edit", "Undo")->enabled());
     CHECK(paint.tools().tool_count() == 8 && paint.tools().tool_name(3).equals("Rectangle") && paint.tools().tool_name(7).equals("Select"));
 
     // The tool strip, palette, size slider and options drive the canvas.
@@ -1820,24 +1846,23 @@ static void test_paint() {
     CHECK(paint.palette().primary() == 0xFFFF0000 && c.primary() == 0xFFFF0000 && paint.color_picker().color() == 0xFFFF0000);
     paint.size_slider().set_value(3);
     CHECK(c.brush_size() == 3);
-    paint.filled_box().set_checked(true);
-    paint.grid_box().set_checked(true);
-    CHECK(c.filled() && c.grid());
-    paint.filled_box().set_checked(false);
-    paint.grid_box().set_checked(false);
-    paint.zoom_in_button().click();
+    CHECK(choose(w, paint.menu_bar(), "Options", "Filled Shapes") && choose(w, paint.menu_bar(), "View", "Pixel Grid"));
+    CHECK(c.filled() && c.grid() && paint.menu_bar().find_item("Options", "Filled Shapes")->checked() && paint.menu_bar().find_item("View", "Pixel Grid")->checked());
+    CHECK(choose(w, paint.menu_bar(), "Options", "Filled Shapes") && choose(w, paint.menu_bar(), "View", "Pixel Grid"));
+    CHECK(!c.filled() && !c.grid() && !paint.menu_bar().find_item("Options", "Filled Shapes")->checked());
+    CHECK(choose(w, paint.menu_bar(), "View", "Zoom In"));
     CHECK(c.zoom() == 2 && paint.zoom_label().text().equals("200%"));
-    paint.zoom_out_button().click();
+    CHECK(choose(w, paint.menu_bar(), "View", "Zoom Out"));
     CHECK(c.zoom() == 1 && paint.zoom_label().text().equals("100%"));
 
     // Drawing marks the picture modified and enables Undo.
     w.layout();
     drag(w, pixel_point(c, 10, 10), pixel_point(c, 40, 10));
-    CHECK(c.pixel(25, 10) == 0xFFFF0000 && c.modified() && paint.undo_button().enabled() && !paint.redo_button().enabled());
+    CHECK(c.pixel(25, 10) == 0xFFFF0000 && c.modified() && paint.menu_bar().find_item("Edit", "Undo")->enabled() && !paint.menu_bar().find_item("Edit", "Redo")->enabled());
     CHECK(paint.title().equals("Paint - Untitled *"));
-    paint.undo_button().click();
-    CHECK(c.pixel(25, 10) == 0xFFFFFFFF && paint.redo_button().enabled());
-    paint.redo_button().click();
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Undo"));
+    CHECK(c.pixel(25, 10) == 0xFFFFFFFF && paint.menu_bar().find_item("Edit", "Redo")->enabled());
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Redo"));
     CHECK(c.pixel(25, 10) == 0xFFFF0000);
 
     // The color picker tool feeds the palette.
@@ -2179,23 +2204,23 @@ static void test_paint_clipboard() {
     drag(w, pixel_point(c, 10, 10), pixel_point(c, 30, 10));
     CHECK(c.pixel(20, 10) == 0xFFFF0000);
 
-    paint.cut_button().click();                 // nothing selected
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Cut"));                 // nothing selected
     CHECK(paint.status_label().text().equals("Select something to cut first."));
-    paint.copy_button().click();                // so the whole picture is copied
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Copy"));                // so the whole picture is copied
     uint32_t cw, ch;
     CHECK(paint.status_label().text().equals("Copied the whole picture.") && cb.image_size(&cw, &ch) && cw == 640 && ch == 480);
 
     paint.tools().select_tool(7);
     CHECK(c.tool() == PaintTool::Select);
     c.select_rect(8, 8, 30, 6);
-    paint.copy_button().click();
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Copy"));
     CHECK(paint.status_label().text().equals("Copied the selection.") && cb.image_size(&cw, &ch) && cw == 30 && ch == 6);
-    paint.cut_button().click();
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Cut"));
     CHECK(paint.status_label().text().equals("Cut to the clipboard.") && c.pixel(20, 10) == 0xFFFFFFFF);
 
     // Paste: a floating picture, and the tool strip follows the canvas to the Select tool.
     paint.tools().select_tool(0);
-    paint.paste_button().click();
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Paste"));
     CHECK(c.floating() && paint.tools().selected_tool() == 7 && c.pixel(5, 3) == 0xFFFFFFFF && c.pixel(2, 3) == 0xFFFFFFFF);
     CHECK(paint.status_label().text().first(7).equals("Pasted."));
     // Saving sets it down first.
@@ -2206,7 +2231,7 @@ static void test_paint_clipboard() {
     CHECK(c.floating());
     c.undo();
     CHECK(cb.set_text("words"));
-    paint.paste_button().click();
+    CHECK(choose(w, paint.menu_bar(), "Edit", "Paste"));
     CHECK(!c.floating() && paint.status_label().text().equals("Nothing to paste: the clipboard has no picture."));
     w.render();
     mgr.remove_window(&paint);
@@ -2285,6 +2310,131 @@ static void test_select_all_keys() {
   CHECK(a.live == 0);
 }
 
+// --- Menu bars of the applications ------------------------------------------------------------------------------
+
+static void test_app_menus() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok);
+    CHECK(fs.create_directory("/docs/old") == filesystem::Status::Ok);
+    make_file(fs, "/a.txt", "abc");
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    w.set_clipboard(&cb);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    String got(a);
+
+    // --- Text editor
+    {
+      desktop::Notepad np(a);
+      np.set_file_system(&fs);
+      CHECK(mgr.add_window(&np));
+      w.layout();
+      MenuBar& bar = np.menu_bar();
+      CHECK(bar.menu_count() == 2 && bar.menu(0)->title().equals("File") && bar.menu(1)->title().equals("Edit") && bar.parent() == &np);
+      CHECK(bar.bounds().y < np.path_box().bounds().y + 40 && bar.bounds().width > 100 && bar.window_origin().y < np.editor().window_origin().y);
+      CHECK(bar.find_item("File", "Save") && bar.find_item("File", "Save")->shortcut.view().equals("Ctrl+S") && !bar.find_item("File", "Nope"));
+      MenuItem* cut = bar.find_item("Edit", "Cut");
+      MenuItem* copy = bar.find_item("Edit", "Copy");
+      CHECK(!cut->enabled() && !copy->enabled());      // nothing selected
+      w.set_focus(&np.editor());
+      type_text(w, "hello");
+      CHECK(choose(w, bar, "Edit", "Select All"));
+      CHECK(np.editor().has_selection() && cut->enabled() && copy->enabled());
+      CHECK(choose(w, bar, "Edit", "Copy") && cb.get_text(&got) && got.view().equals("hello") && np.editor().text().equals("hello"));
+      CHECK(choose(w, bar, "Edit", "Cut") && np.editor().text().empty() && !cut->enabled());
+      CHECK(!choose(w, bar, "Edit", "Cut") && w.popup() == nullptr);   // disabled: nothing happens, the menu closes
+      CHECK(choose(w, bar, "Edit", "Paste") && np.editor().text().equals("hello"));
+      // File > Save writes to the path box; New asks first when there are unsaved changes.
+      np.path_box().set_text("note.txt");
+      CHECK(choose(w, bar, "File", "Save") && np.status_label().text().equals("Saved /note.txt") && !np.editor().modified());
+      CHECK(choose(w, bar, "File", "New") && np.editor().text().empty() && np.path().empty());
+      np.path_box().set_text("/a.txt");
+      CHECK(choose(w, bar, "File", "Open") && np.editor().text().equals("abc"));
+      press(w, key::kA + 18, modifier::kLeftControl);    // the shortcut still works
+      CHECK(np.status_label().text().equals("Saved /a.txt"));
+      CHECK(choose(w, bar, "File", "Close") && np.manager() == nullptr && mgr.window_count() == 0);
+    }
+
+    // --- File explorer
+    {
+      desktop::FileExplorer ex(a);
+      ex.set_file_system(&fs);
+      CHECK(mgr.add_window(&ex));
+      w.layout();
+      MenuBar& bar = ex.menu_bar();
+      CHECK(bar.menu_count() == 3 && bar.menu(2)->title().equals("Go") && ex.details_item()->checked() && !ex.list_item()->checked());
+      CHECK(choose(w, bar, "View", "Icons") && ex.view().view_mode() == ViewMode::Icons && ex.icons_item()->checked() && !ex.details_item()->checked());
+      CHECK(choose(w, bar, "View", "Details") && ex.view().view_mode() == ViewMode::Details);
+      ex.view().select_item(0);                        // "docs"
+      CHECK(choose(w, bar, "File", "Open") && ex.path().equals("/docs"));
+      CHECK(choose(w, bar, "Go", "Up One Level") && ex.path().equals("/"));
+      CHECK(!choose(w, bar, "Go", "Up One Level") || ex.path().equals("/"));   // at the root nothing changes
+      ex.view().select_item(1);
+      CHECK(choose(w, bar, "File", "Copy Path") && cb.get_text(&got) && got.view().equals("/a.txt"));
+      CHECK(choose(w, bar, "Go", "Address") && ex.address_bar().editing());
+      press(w, key::kEscape);
+      CHECK(!ex.address_bar().editing());
+      const uint32_t before = ex.view().item_count();
+      CHECK(before == 3 && choose(w, bar, "View", "Refresh") && ex.view().item_count() == before);   // nothing changed yet
+      make_file(fs, "/c.txt", "newer");
+      CHECK(choose(w, bar, "View", "Refresh") && ex.view().item_count() == before + 1);
+      CHECK(choose(w, bar, "File", "Close") && ex.manager() == nullptr);
+    }
+
+    // --- Task manager
+    {
+      desktop::TaskManager tm(a);
+      CHECK(mgr.add_window(&tm));
+      w.layout();
+      MenuBar& bar = tm.menu_bar();
+      CHECK(bar.menu_count() == 2 && bar.find_item("View", "Processes")->checked() && !bar.find_item("View", "Performance")->checked());
+      CHECK(choose(w, bar, "View", "Performance") && tm.tabs().selected_page() == 1 && bar.find_item("View", "Performance")->checked() && !bar.find_item("View", "Processes")->checked());
+      tm.tabs().select_page(0);                        // switching the tab by hand moves the check mark too
+      CHECK(bar.find_item("View", "Processes")->checked() && !bar.find_item("View", "Performance")->checked());
+      CHECK(choose(w, bar, "View", "Processes") && tm.tabs().selected_page() == 0);
+      CHECK(choose(w, bar, "File", "Close") && tm.manager() == nullptr);
+    }
+
+    // --- Paint
+    {
+      desktop::Paint paint(a);
+      paint.set_file_system(&fs);
+      CHECK(mgr.add_window(&paint));
+      w.layout();
+      MenuBar& bar = paint.menu_bar();
+      DrawingCanvas& c = paint.canvas();
+      CHECK(bar.menu_count() == 4 && bar.menu(3)->title().equals("Options") && bar.find_item("Edit", "Paste")->shortcut.view().equals("Ctrl+V"));
+      CHECK(!bar.find_item("Edit", "Undo")->enabled() && !choose(w, bar, "Edit", "Undo"));
+      drag(w, pixel_point(c, 10, 10), pixel_point(c, 30, 10));
+      CHECK(bar.find_item("Edit", "Undo")->enabled());
+      CHECK(choose(w, bar, "Edit", "Select All") && c.has_selection() && paint.tools().selected_tool() == 7);
+      CHECK(choose(w, bar, "View", "Zoom In") && c.zoom() == 2 && paint.zoom_label().text().equals("200%"));
+      press(w, 0x2E, modifier::kLeftControl);          // Ctrl+= zooms in, Ctrl+- out, Ctrl+0 resets
+      CHECK(c.zoom() == 3);
+      press(w, 0x2D, modifier::kLeftControl);
+      CHECK(c.zoom() == 2);
+      CHECK(choose(w, bar, "View", "Actual Size") && c.zoom() == 1);
+      paint.path_box().set_text("pic");
+      CHECK(choose(w, bar, "File", "Save") && paint.path().equals("/pic.png") && paint.title().equals("Paint - pic.png"));
+      paint.tools().select_tool(0);
+      drag(w, pixel_point(c, 50, 50), pixel_point(c, 60, 50));
+      CHECK(choose(w, bar, "File", "New") && paint.status_label().text().first(13).equals("Unsaved chang") && c.pixel(55, 50) != 0xFFFFFFFF);
+      CHECK(choose(w, bar, "File", "New") && c.pixel(55, 50) == 0xFFFFFFFF && c.image_width() == 640);
+      CHECK(choose(w, bar, "File", "Open") == true);   // the path box was cleared by New: asks for a path
+      CHECK(paint.status_label().text().equals("Enter the path of a picture to open."));
+      CHECK(choose(w, bar, "File", "Close") && paint.manager() == nullptr);
+    }
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -2304,6 +2454,7 @@ int main() {
   test_canvas_clipboard();
   test_paint_clipboard();
   test_list_copy();
+  test_app_menus();
   test_select_all_keys();
   test_breadcrumb_bar();
   test_file_explorer();

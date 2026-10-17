@@ -18,6 +18,7 @@
 
 #include "Desktop/TaskManager.hpp"
 #include "Desktop/Format.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace desktop {
@@ -45,6 +46,7 @@ bool TaskManager::Model::cell_text(uint32_t row, uint32_t column, String* out) c
 
 TaskManager::TaskManager(allocators::IAllocator& allocator)
     : Frame(allocator),
+      menu_(allocator),
       tabs_(allocator),
       processes_page_(allocator),
       performance_page_(allocator),
@@ -68,7 +70,15 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
 
+  menu_.set_dock(DockStyle::Top);
+  menu_.set_size(0, 22);
+  if (Menu* file = menu_.add_menu("File")) file->add_item("Close", {&TaskManager::on_close_window, this});
+  if (Menu* view = menu_.add_menu("View")) {
+    processes_item_ = view->add_item("Processes", {&TaskManager::on_show_processes, this});
+    performance_item_ = view->add_item("Performance", {&TaskManager::on_show_performance, this});
+  }
   tabs_.set_dock(DockStyle::Fill);
+  tabs_.on_selection_changed(Handler::immediate(&TaskManager::on_tab_changed, this));
   processes_page_.set_style(PanelStyle::Transparent);
   processes_page_.set_padding(Insets::all(4));
   performance_page_.set_style(PanelStyle::Transparent);
@@ -115,7 +125,9 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
   processes_page_.add(&grid_);
   tabs_.add_page("Processes", &processes_page_);
   tabs_.add_page("Performance", &performance_page_);
+  add(&menu_);
   add(&tabs_);
+  on_tab_changed(this, tabs_);
 }
 
 LevelMeter* TaskManager::core_meter(uint32_t index) {
@@ -125,6 +137,15 @@ LevelMeter* TaskManager::core_meter(uint32_t index) {
 Label* TaskManager::core_label(uint32_t index) {
   return index < core_rows_.count() && core_rows_[index]->row.visible() ? &core_rows_[index]->value : nullptr;
 }
+
+void TaskManager::on_tab_changed(void* self, Control&) {  // the View menu shows which tab is up
+  auto* t = static_cast<TaskManager*>(self);
+  if (t->processes_item_) t->processes_item_->set_checked(t->tabs_.selected_page() == 0);
+  if (t->performance_item_) t->performance_item_->set_checked(t->tabs_.selected_page() == 1);
+}
+void TaskManager::on_show_processes(void* self, Control&) { static_cast<TaskManager*>(self)->tabs_.select_page(0); }
+void TaskManager::on_show_performance(void* self, Control&) { static_cast<TaskManager*>(self)->tabs_.select_page(1); }
+void TaskManager::on_close_window(void* self, Control&) { static_cast<TaskManager*>(self)->close(); }
 
 TaskManager::~TaskManager() { release_view(allocator(), buffer_); }
 

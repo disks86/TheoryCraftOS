@@ -46,12 +46,10 @@ bool normalize(StringView in, String* out) {
 
 Notepad::Notepad(allocators::IAllocator& allocator)
     : Frame(allocator),
+      menu_(allocator),
       toolbar_(allocator),
       status_bar_(allocator),
-      gap_(allocator),
-      new_(allocator),
-      open_(allocator),
-      save_(allocator),
+      path_label_(allocator),
       path_(allocator),
       status_(allocator),
       position_(allocator),
@@ -61,26 +59,30 @@ Notepad::Notepad(allocators::IAllocator& allocator)
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
 
+  menu_.set_dock(DockStyle::Top);
+  menu_.set_size(0, 22);
+  if (Menu* file = menu_.add_menu("File")) {
+    file->add_item("New", {&Notepad::on_new, this}, "Ctrl+N");
+    file->add_item("Open", {&Notepad::on_open, this}, "Ctrl+O");
+    file->add_item("Save", {&Notepad::on_save, this}, "Ctrl+S");
+    file->add_separator();
+    file->add_item("Close", {&Notepad::on_close, this});
+  }
+  if (Menu* edit = menu_.add_menu("Edit")) {
+    cut_item_ = edit->add_item("Cut", {&Notepad::on_cut, this}, "Ctrl+X");
+    copy_item_ = edit->add_item("Copy", {&Notepad::on_copy, this}, "Ctrl+C");
+    edit->add_item("Paste", {&Notepad::on_paste, this}, "Ctrl+V");
+    edit->add_separator();
+    edit->add_item("Select All", {&Notepad::on_select_all, this}, "Ctrl+A");
+  }
+
   toolbar_.set_dock(DockStyle::Top);
   toolbar_.set_size(0, 30);
   toolbar_.set_padding(Insets{0, 2, 0, 2});
-  struct Part {
-    Button& button;
-    const char* text;
-    void (*handler)(void*, Control&);
-  };
-  const Part parts[3] = {{new_, "New", &Notepad::on_new}, {open_, "Open", &Notepad::on_open}, {save_, "Save", &Notepad::on_save}};
-  for (const Part& p : parts) {
-    p.button.set_text(p.text);
-    p.button.set_dock(DockStyle::Left);
-    p.button.set_size(56, 0);
-    p.button.on_click({p.handler, this});
-    toolbar_.add(&p.button);
-  }
-  gap_.set_style(PanelStyle::Transparent);
-  gap_.set_dock(DockStyle::Left);
-  gap_.set_size(6, 0);
-  toolbar_.add(&gap_);
+  path_label_.set_text("File:");
+  path_label_.set_dock(DockStyle::Left);
+  path_label_.set_size(48, 0);
+  toolbar_.add(&path_label_);
   path_.set_dock(DockStyle::Fill);
   toolbar_.add(&path_);
 
@@ -97,12 +99,13 @@ Notepad::Notepad(allocators::IAllocator& allocator)
   editor_.on_changed(Handler::immediate(&Notepad::on_edited, this));
   editor_.on_caret_moved(Handler::immediate(&Notepad::on_moved, this));
 
+  add(&menu_);
   add(&toolbar_);
   add(&status_bar_);
   add(&editor_);  // Fill goes last
   update_title();
   update_position();
-  say("Type a path and press Open, or start typing.");
+  say("Type a path and choose File > Open, or start typing.");
 }
 
 void Notepad::update_title() {
@@ -113,6 +116,11 @@ void Notepad::update_title() {
   set_title(title.view());
 }
 
+void Notepad::update_menus() {
+  if (cut_item_) cut_item_->set_enabled(editor_.has_selection());
+  if (copy_item_) copy_item_->set_enabled(editor_.has_selection());
+}
+
 void Notepad::update_position() {
   String text(allocator());
   text.append("Ln ");
@@ -121,12 +129,18 @@ void Notepad::update_position() {
   text.append_uint(editor_.caret_column() + 1);
   position_.set_text(text.view());
   update_title();
+  update_menus();
 }
 
 void Notepad::on_edited(void* self, Control&) { static_cast<Notepad*>(self)->discard_armed_ = false; }
 void Notepad::on_moved(void* self, Control&) { static_cast<Notepad*>(self)->update_position(); }
 void Notepad::on_new(void* self, Control&) { static_cast<Notepad*>(self)->new_document(); }
 void Notepad::on_save(void* self, Control&) { static_cast<Notepad*>(self)->save_file(); }
+void Notepad::on_close(void* self, Control&) { static_cast<Notepad*>(self)->close(); }
+void Notepad::on_cut(void* self, Control&) { static_cast<Notepad*>(self)->editor_.cut_selection(); }
+void Notepad::on_copy(void* self, Control&) { static_cast<Notepad*>(self)->editor_.copy_selection(); }
+void Notepad::on_paste(void* self, Control&) { static_cast<Notepad*>(self)->editor_.paste(); }
+void Notepad::on_select_all(void* self, Control&) { static_cast<Notepad*>(self)->editor_.select_all(); }
 void Notepad::on_open(void* self, Control&) {
   auto* n = static_cast<Notepad*>(self);
   n->open_file(n->path_.text());

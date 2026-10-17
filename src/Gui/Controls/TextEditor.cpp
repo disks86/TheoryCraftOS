@@ -167,10 +167,18 @@ bool TextEditor::insert_text(StringView text) {
 }
 
 bool TextEditor::copy_selection() {
+  UiGuard lock(this);
   return has_selection() && clipboard_put_text(clipboard(), &clipboard_, text_.view().substr(selection_start(), selection_end() - selection_start()));
 }
 
+bool TextEditor::cut_selection() {
+  UiGuard lock(this);
+  if (read_only_ || !copy_selection()) return false;
+  return replace(selection_start(), selection_end(), StringView());
+}
+
 void TextEditor::paste() {
+  UiGuard lock(this);
   String text(allocator());
   if (read_only_ || !clipboard_get_text(clipboard(), clipboard_, &text)) return;
   String clean(allocator());  // CR LF and lone CR become the editor's line break
