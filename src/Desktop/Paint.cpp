@@ -571,6 +571,7 @@ bool Paint::on_key(const KeyArgs& args) {
       case key::kA + 18: save_file(); return true;                   // S
       case key::kA + 25: canvas_.undo(); return true;                // Z
       case key::kA + 24: canvas_.redo(); return true;                // Y
+      case key::kA: canvas_.select_all(); say("Selected the whole picture."); return true;   // A
       case key::kA + 2: copy_to_clipboard(false); return true;       // C
       case key::kA + 23: copy_to_clipboard(true); return true;       // X
       case key::kA + 21: paste_from_clipboard(); return true;        // V

@@ -592,9 +592,16 @@ static void test_input_pump() {
     kb.push(key::kA + 7, false);
     CHECK(pump.pump() == 2);
     kb.mods = hardware::modifier::kLeftShift;
+    kb.push(key::kLeftShift, true);
     kb.push(key::kA + 8, true);   // I
-    CHECK(pump.pump() == 1);
+    kb.push(key::kA + 8, false);
+    kb.push(key::kLeftShift, false);
+    kb.mods = 0;                  // Shift is already up again when the pump reads the events: still a capital
+    CHECK(pump.pump() == 4);
     CHECK(t.text().equals("hI"));
+    kb.push(key::kA + 8, true);   // i
+    CHECK(pump.pump() == 1);
+    CHECK(t.text().equals("hIi"));
   }
   CHECK(a.live == 0);
 }
@@ -1061,6 +1068,70 @@ static void test_desktop() {
   CHECK(a.live == 0);
 }
 
+// Ctrl+A in a text box selects all of its text, through the whole input path (keyboard events with Ctrl held).
+static void test_select_all_from_keyboard() {
+  TestAllocator a;
+  {
+    Theme theme;
+    Screen screen(a, 200, 100);
+    Window w(a, screen.renderer, theme, {200, 100});
+    TextBox box(a), other(a);
+    box.set_dock(DockStyle::Top);
+    other.set_dock(DockStyle::Top);
+    w.add(&box);
+    w.add(&other);
+    w.layout();
+    FakeKeyboard kb;
+    InputPump pump(w, &kb, nullptr);
+    w.set_focus(&box);
+    // A quick chord: Ctrl goes down and up again before the pump reads the events, so the keyboard's own modifier state
+    // is already clear when 'A' is delivered - the order of the events is what says Ctrl was held.
+    auto ctrl_a = [&](uint8_t ctrl) {
+      const uint8_t bits[] = {key::kLeftControl, key::kRightControl, key::kLeftShift};
+      for (uint8_t b : bits)
+        if (ctrl & (1u << (b - key::kLeftControl))) kb.push(b, true);
+      kb.push(key::kA, true);
+      kb.push(key::kA, false);
+      for (uint8_t b : bits)
+        if (ctrl & (1u << (b - key::kLeftControl))) kb.push(b, false);
+      pump.pump();
+    };
+    box.set_text("some text here");
+    kb.push(key::kLeft, true); kb.push(key::kLeft, false);
+    kb.push(key::kLeft, true); kb.push(key::kLeft, false);
+    pump.pump();
+    CHECK(box.caret() == 12 && !box.has_selection());
+    ctrl_a(hardware::modifier::kLeftControl);           // caret in the middle
+    CHECK(box.has_selection() && box.selected_text().equals("some text here") && box.selection_start() == 0 && box.selection_end() == 14);
+    CHECK(box.text().equals("some text here"));         // and no 'a' was typed
+    kb.push(key::kRight, true); kb.push(key::kRight, false);
+    pump.pump();
+    CHECK(!box.has_selection() && box.caret() == 14);
+    ctrl_a(hardware::modifier::kRightControl);          // the right Ctrl key too
+    CHECK(box.selected_text().equals("some text here"));
+    ctrl_a(hardware::modifier::kLeftControl | hardware::modifier::kLeftShift);   // extra modifiers do not matter
+    CHECK(box.selected_text().equals("some text here"));
+    kb.mods = 0;
+    kb.push(key::kA, true); kb.push(key::kA, false);    // without Ctrl, 'a' replaces the selection
+    pump.pump();
+    CHECK(box.text().equals("a") && !box.has_selection());
+
+    // Text wider than the box, with the beginning scrolled out of view; an empty box; the other box is untouched.
+    box.set_text("0123456789012345678901234567890123456789012345678901234567890123456789");
+    ctrl_a(hardware::modifier::kLeftControl);
+    CHECK(box.selected_text().size() == 70 && box.selection_start() == 0);
+    w.render();
+    box.set_text("");
+    ctrl_a(hardware::modifier::kLeftControl);
+    CHECK(!box.has_selection() && box.text().empty() && !other.has_selection());
+    other.set_text("other");
+    w.set_focus(&other);
+    ctrl_a(hardware::modifier::kLeftControl);
+    CHECK(other.selected_text().equals("other") && !box.has_selection());
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_dock_layout();
   test_uniform_panel();
@@ -1070,6 +1141,7 @@ int main() {
   test_menu();
   test_rendering();
   test_input_pump();
+  test_select_all_from_keyboard();
   test_desktop();
   test_clock();
   test_windows();

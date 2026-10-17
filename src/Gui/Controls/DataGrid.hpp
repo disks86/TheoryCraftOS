@@ -31,7 +31,7 @@ enum class Align : uint8_t { Left, Center, Right };
 //  - Clicking a header sorts by that column, again to reverse it (numbers sort as numbers, other text
 //    without regard to case; the sort is stable). Dragging the border at a header's right edge resizes the column.
 //  - One row is selected: click it, or use Up/Down/Page Up/Page Down/Home/End; Enter activates it. Left/Right
-//    scroll sideways and the mouse wheel scrolls three rows.
+//    scroll sideways and the mouse wheel scrolls three rows. Ctrl+C copies the selected row (cells separated by tabs) to the clipboard.
 // Row numbers given to and returned by the grid are the model's, not positions on screen.
 class DataGrid : public Control {
  public:

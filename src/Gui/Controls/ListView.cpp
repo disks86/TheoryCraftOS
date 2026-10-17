@@ -18,6 +18,7 @@
 
 #include "Gui/Controls/ListView.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Clipboard.hpp"
 
 namespace gui {
 
@@ -507,6 +508,16 @@ bool ListView::on_key(const KeyArgs& args) {
   using namespace hardware;
   const int32_t n = static_cast<int32_t>(model_.row_count());
   const int32_t per = metrics_.per_line;
+  if (copy_enabled_ && (args.modifiers & modifier::kControl) && args.usage == key::kA + 2) {  // Ctrl+C: the selected item's cells, tab separated
+    if (selected_ < 0 || !clipboard()) return false;
+    String line(allocator()), cell(allocator());
+    for (uint32_t c = 0; c < columns_.count(); ++c) {
+      model_.cell_text(static_cast<uint32_t>(selected_), c, &cell);
+      if ((c > 0 && !line.push_back('\t')) || !line.append(cell.view())) return true;
+    }
+    clipboard()->set_text(line.view());
+    return true;
+  }
   switch (args.usage) {
     case key::kEnter:
       if (selected_ >= 0) fire(activated_);

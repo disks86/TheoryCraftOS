@@ -23,7 +23,7 @@
 //  - Icons: large icons with the name below, in a grid that wraps to the width; scrolls vertically.
 // Every item has a text cell per column (the first is its name) and an icon. One item is selected: click it, or use the
 // arrow keys (along the way the items are laid out), Home/End; Enter - or a second click on the selected item
-// within a double-click interval - activates it. The mouse wheel scrolls.
+// within a double-click interval - activates it. Ctrl+C copies the selected item's cells (tab separated) to the clipboard. The mouse wheel scrolls.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Gui/Controls/DataGrid.hpp"
@@ -64,6 +64,9 @@ class ListView : public Control {
   uint32_t item_count() const { return model_.row_count(); }
   ItemIcon item_icon(uint32_t item) const { return item < icons_.count() ? static_cast<ItemIcon>(icons_[item]) : ItemIcon::File; }
   bool item_text(uint32_t item, uint32_t column, String* out) const { return model_.cell_text(item, column, out); }
+
+  // Whether Ctrl+C copies the selected item's cells (default); a program with a better idea of what to copy turns it off.
+  void set_copy_enabled(bool enabled) { UiGuard lock(this); copy_enabled_ = enabled; }
 
   // --- Selection
   int32_t selected_item() const { return selected_; }  // -1 = none
@@ -133,7 +136,7 @@ class ListView : public Control {
   int32_t scroll_x_ = 0, scroll_y_ = 0;
   Metrics metrics_;
   bool show_v_ = false, show_h_ = false;
-  bool syncing_ = false;
+  bool syncing_ = false, copy_enabled_ = true;
   ScrollBar vscroll_, hscroll_;
   Handler selection_changed_, activated_;
   const uint64_t* clock_ = nullptr;
