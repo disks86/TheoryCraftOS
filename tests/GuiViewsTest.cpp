@@ -2675,6 +2675,31 @@ static void test_desktop_file_dialog() {
     d.file_dialog().name_box().set_text("hello.txt");
     d.file_dialog().ok_button().click();
     CHECK(!d.file_dialog().showing() && d.notepad().editor().text().equals("hi there") && d.notepad().path().equals("/hello.txt"));
+    // Double-clicking a folder in the dialog goes into it, and double-clicking a file takes it (the desktop supplies the clock).
+    CHECK(fs.create_directory("/sub") == filesystem::Status::Ok);
+    make_file(fs, "/sub/inner.txt", "x");
+    d.step(1000000);
+    CHECK(choose(d.window(), d.notepad().menu_bar(), "File", "Open...") && d.file_dialog().folder().equals("/"));
+    d.window().layout();
+    {
+      Rect2D row;
+      CHECK(d.file_dialog().list().item_rect(0, &row));   // "sub", the only folder
+      const Point o = d.file_dialog().list().window_origin();
+      click(d.window(), o.x + row.x + 30, o.y + row.y + 5);
+      CHECK(d.file_dialog().folder().equals("/"));        // one click only selects it
+      d.step(1100000);
+      click(d.window(), o.x + row.x + 30, o.y + row.y + 5);
+      CHECK(d.file_dialog().folder().equals("/sub") && d.file_dialog().list().item_count() == 1);
+      d.step(5000000);                                    // clicks too far apart are not a double click
+      CHECK(d.file_dialog().list().item_rect(0, &row));
+      click(d.window(), o.x + row.x + 30, o.y + row.y + 5);
+      d.step(5900000);
+      click(d.window(), o.x + row.x + 30, o.y + row.y + 5);
+      CHECK(d.file_dialog().showing() && d.file_dialog().folder().equals("/sub"));
+      d.step(6000000);
+      click(d.window(), o.x + row.x + 30, o.y + row.y + 5);
+      CHECK(!d.file_dialog().showing() && d.notepad().path().equals("/sub/inner.txt"));
+    }
     // The print and color dialogs are shared the same way.
     CHECK(choose(d.window(), d.notepad().menu_bar(), "File", "Print...") && d.print_dialog().showing() && d.print_dialog().kind() == desktop::PrintDialog::Kind::Text);
     d.print_dialog().cancel_button().click();

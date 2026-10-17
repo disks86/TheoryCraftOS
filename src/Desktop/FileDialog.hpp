@@ -51,6 +51,8 @@ class FileDialog : public gui::Frame {
 
   // The filesystem to pick from (nullptr: none). It must outlive the dialog.
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
+  // Double clicks in the list are measured with this clock (see ListView::set_clock); without one only Enter opens a folder or takes a file.
+  void set_clock(const uint64_t* now_us) { list_.set_clock(now_us); }
 
   // Opens the dialog modally in `manager`. `start_path` is a folder or a file: its folder is shown and its name (if it names a file or
   // is not an existing folder) is put in the name box. `result` runs once the dialog has closed, accepted or not. False if the

@@ -101,6 +101,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   paint_.set_print_dialog(&print_dialog_);
   paint_.set_color_dialog(&color_dialog_);
   explorer_.set_clock(&now_us_);
+  file_dialog_.set_clock(&now_us_);
   explorer_.on_file_opened({&Desktop::on_explorer_file, this});
 
   about_.set_title("About TheoryCraftOS");
