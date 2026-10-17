@@ -23,7 +23,7 @@
 // which is dedicated to the public domain under CC0 1.0 (https://github.com/lieff/minimp3): the scalar code paths only,
 // restated in this code base's style. The file-level handling around it (ID3v2 skipping, frame sync, the Xing/Info
 // and LAME tags for gapless trimming, assembling the result) is this project's own.
-// Not handled: Layer I and II streams, free-format bitrates, CRC verification (the checksum is skipped, not checked).
+// Layers I and II decode too. Not handled: free-format bitrates; the CRC is skipped, not checked.
 #include "Media/AudioCodecs.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -97,7 +97,7 @@ inline bool hdr_is_mpeg1(const uint8_t* h) { return h[1] & 8; }
 inline bool hdr_not_mpeg25(const uint8_t* h) { return h[1] & 0x10; }
 inline bool hdr_i_stereo(const uint8_t* h) { return h[3] & 0x10; }
 inline bool hdr_ms_stereo(const uint8_t* h) { return h[3] & 0x20; }
-inline int hdr_layer(const uint8_t* h) { return (h[1] >> 1) & 3; }  // 1 = Layer III
+inline int hdr_layer(const uint8_t* h) { return (h[1] >> 1) & 3; }  // 1 = Layer III, 2 = Layer II, 3 = Layer I
 inline int hdr_bitrate_index(const uint8_t* h) { return h[2] >> 4; }
 inline int hdr_sample_rate_index(const uint8_t* h) { return (h[2] >> 2) & 3; }
 inline int hdr_my_sample_rate(const uint8_t* h) { return hdr_sample_rate_index(h) + (((h[1] >> 3) & 1) + ((h[1] >> 4) & 1)) * 3; }
@@ -729,6 +729,130 @@ void synth(float* xl, int16_t* dstl, int nch, float* lins) {
   }
 }
 
+
+// ---- Layers I and II ----
+struct SubbandAlloc {
+  uint8_t tab_offset, code_tab_width, band_count;
+};
+
+struct ScaleInfo {
+  float scf[3 * 64];
+  uint8_t total_bands, stereo_bands, bitalloc[64], scfcod[64];
+};
+
+inline int hdr_stereo_mode(const uint8_t* h) { return (h[3] >> 6) & 3; }
+inline int hdr_stereo_mode_ext(const uint8_t* h) { return (h[3] >> 4) & 3; }
+
+const SubbandAlloc* subband_alloc_table(const uint8_t* hdr, ScaleInfo* sci) {
+  const SubbandAlloc* alloc;
+  const int mode = hdr_stereo_mode(hdr);
+  int nbands, stereo_bands = (mode == 3) ? 0 : (mode == 1) ? (hdr_stereo_mode_ext(hdr) << 2) + 4 : 32;
+  if (hdr_is_layer_1(hdr)) {
+    static const SubbandAlloc alloc_l1[] = {{76, 4, 32}};
+    alloc = alloc_l1;
+    nbands = 32;
+  } else if (!hdr_is_mpeg1(hdr)) {
+    static const SubbandAlloc alloc_l2m2[] = {{60, 4, 4}, {44, 3, 7}, {44, 2, 19}};
+    alloc = alloc_l2m2;
+    nbands = 30;
+  } else {
+    static const SubbandAlloc alloc_l2m1[] = {{0, 4, 3}, {16, 4, 8}, {32, 3, 12}, {40, 2, 7}};
+    const int sample_rate_idx = hdr_sample_rate_index(hdr);
+    unsigned kbps = hdr_bitrate_kbps(hdr) >> (mode != 3 ? 1 : 0);
+    if (!kbps) kbps = 192;
+    alloc = alloc_l2m1;
+    nbands = 27;
+    if (kbps < 56) {
+      static const SubbandAlloc alloc_l2m1_lowrate[] = {{44, 4, 2}, {44, 3, 10}};
+      alloc = alloc_l2m1_lowrate;
+      nbands = sample_rate_idx == 2 ? 12 : 8;
+    } else if (kbps >= 96 && sample_rate_idx != 1) {
+      nbands = 30;
+    }
+  }
+  sci->total_bands = static_cast<uint8_t>(nbands);
+  sci->stereo_bands = static_cast<uint8_t>(stereo_bands < nbands ? stereo_bands : nbands);
+  return alloc;
+}
+
+void l12_read_scalefactors(BitStream* bs, uint8_t* pba, uint8_t* scfcod, int bands, float* scf) {
+  static const float deq_l12[18 * 3] = {
+#define DQ(x) 9.53674316e-07f / x, 7.56931807e-07f / x, 6.00777173e-07f / x
+      DQ(3), DQ(7), DQ(15), DQ(31), DQ(63), DQ(127), DQ(255), DQ(511), DQ(1023), DQ(2047), DQ(4095), DQ(8191), DQ(16383), DQ(32767), DQ(65535), DQ(3), DQ(5), DQ(9)
+#undef DQ
+  };
+  for (int i = 0; i < bands; i++) {
+    float s = 0;
+    const int ba = *pba++;
+    const int mask = ba ? 4 + ((19 >> scfcod[i]) & 3) : 0;
+    for (int m = 4; m; m >>= 1) {
+      if (mask & m) {
+        const int b = static_cast<int>(bs->get(6));
+        s = deq_l12[ba * 3 - 6 + b % 3] * static_cast<float>(1 << 21 >> b / 3);
+      }
+      *scf++ = s;
+    }
+  }
+}
+
+void l12_read_scale_info(const uint8_t* hdr, BitStream* bs, ScaleInfo* sci) {
+  static const uint8_t bitalloc_code_tab[] = {0, 17, 3,  4,  5, 6, 7, 8,  9,  10, 11, 12, 13, 14, 15, 16, 0, 17, 18, 3,  19, 4, 5, 6,  7,  8,  9,  10, 11, 12, 13, 16,
+                                              0, 17, 18, 3,  19, 4, 5, 16, 0,  17, 18, 16, 0,  17, 18, 19, 4, 5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 0,  17, 18, 3,
+                                              19, 4, 5,  6,  7,  8, 9, 10, 11, 12, 13, 14, 0,  2,  3,  4,  5, 6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16};
+  const SubbandAlloc* subband_alloc = subband_alloc_table(hdr, sci);
+  int k = 0, ba_bits = 0;
+  const uint8_t* ba_code_tab = bitalloc_code_tab;
+  for (int i = 0; i < sci->total_bands; i++) {
+    if (i == k) {
+      k += subband_alloc->band_count;
+      ba_bits = subband_alloc->code_tab_width;
+      ba_code_tab = bitalloc_code_tab + subband_alloc->tab_offset;
+      subband_alloc++;
+    }
+    uint8_t ba = ba_code_tab[bs->get(ba_bits)];
+    sci->bitalloc[2 * i] = ba;
+    if (i < sci->stereo_bands) ba = ba_code_tab[bs->get(ba_bits)];
+    sci->bitalloc[2 * i + 1] = sci->stereo_bands ? ba : 0;
+  }
+  for (int i = 0; i < 2 * sci->total_bands; i++)
+    sci->scfcod[i] = sci->bitalloc[i] ? (hdr_is_layer_1(hdr) ? 2 : static_cast<uint8_t>(bs->get(2))) : 6;
+  l12_read_scalefactors(bs, sci->bitalloc, sci->scfcod, sci->total_bands * 2, sci->scf);
+  for (int i = sci->stereo_bands; i < sci->total_bands; i++) sci->bitalloc[2 * i + 1] = 0;
+}
+
+int l12_dequantize_granule(float* grbuf, BitStream* bs, ScaleInfo* sci, int group_size) {
+  int choff = 576;
+  for (int j = 0; j < 4; j++) {
+    float* dst = grbuf + group_size * j;
+    for (int i = 0; i < 2 * sci->total_bands; i++) {
+      const int ba = sci->bitalloc[i];
+      if (ba != 0) {
+        if (ba < 17) {
+          const int half = (1 << (ba - 1)) - 1;
+          for (int k = 0; k < group_size; k++) dst[k] = static_cast<float>(static_cast<int>(bs->get(ba)) - half);
+        } else {
+          const unsigned mod = (2u << (ba - 17)) + 1;  // 3, 5, 9
+          unsigned code = bs->get(static_cast<int>(mod + 2 - (mod >> 3)));  // 5, 7, 10 bits
+          for (int k = 0; k < group_size; k++, code /= mod) dst[k] = static_cast<float>(static_cast<int>(code % mod) - static_cast<int>(mod / 2));
+        }
+      }
+      dst += choff;
+      choff = 18 - choff;
+    }
+  }
+  return group_size * 4;
+}
+
+void l12_apply_scf_384(ScaleInfo* sci, const float* scf, float* dst) {
+  for (int i = 0; i < (sci->total_bands - sci->stereo_bands) * 18; ++i) dst[576 + sci->stereo_bands * 18 + i] = dst[sci->stereo_bands * 18 + i];
+  for (int i = 0; i < sci->total_bands; i++, dst += 18, scf += 6) {
+    for (int k = 0; k < 12; k++) {
+      dst[k + 0] *= scf[0];
+      dst[k + 576] *= scf[3];
+    }
+  }
+}
+
 class Mp3Decoder {
  public:
   Mp3Decoder() { reset(); }
@@ -819,26 +943,50 @@ void Mp3Decoder::synth_granule(float* grbuf, int nbands, int nch, int16_t* pcm, 
 
 int Mp3Decoder::decode_frame(const uint8_t* hdr, int frame_size, int16_t* pcm) {
   const int channels = hdr_is_mono(hdr) ? 1 : 2;
+  const int layer = 4 - hdr_layer(hdr);
   Scratch* scratch = &scratch_;
   BitStream bs_frame;
   bs_frame.init(hdr + 4, frame_size - 4);
   if (hdr_is_crc(hdr)) bs_frame.get(16);
-  const int main_data_begin = read_side_info(&bs_frame, scratch->gr_info, hdr);
-  if (main_data_begin < 0 || bs_frame.pos > bs_frame.limit) {
-    reset();
-    return 0;
+  if (layer == 3) {
+    const int main_data_begin = read_side_info(&bs_frame, scratch->gr_info, hdr);
+    if (main_data_begin < 0 || bs_frame.pos > bs_frame.limit) {
+      reset();
+      return 0;
+    }
+    const bool success = restore_reservoir(&bs_frame, scratch, main_data_begin);
+    if (success) {
+      for (int igr = 0; igr < (hdr_is_mpeg1(hdr) ? 2 : 1); igr++, pcm += 576 * channels) {
+        for (float& f : scratch->grbuf[0]) f = 0;
+        for (float& f : scratch->grbuf[1]) f = 0;
+        decode_granule(scratch, scratch->gr_info + igr * channels, channels, hdr);
+        synth_granule(scratch->grbuf[0], 18, channels, pcm, scratch->syn[0]);
+      }
+    }
+    save_reservoir(scratch);
+    return success ? static_cast<int>(hdr_frame_samples(hdr)) : 0;
   }
-  const bool success = restore_reservoir(&bs_frame, scratch, main_data_begin);
-  if (success) {
-    for (int igr = 0; igr < (hdr_is_mpeg1(hdr) ? 2 : 1); igr++, pcm += 576 * channels) {
+  // Layers I and II: scale information, then three granules (Layer II) of 12 samples per sub-band, or one (Layer I).
+  ScaleInfo sci;
+  l12_read_scale_info(hdr, &bs_frame, &sci);
+  for (float& f : scratch->grbuf[0]) f = 0;
+  for (float& f : scratch->grbuf[1]) f = 0;
+  int i = 0;
+  for (int igr = 0; igr < 3; igr++) {
+    if (12 == (i += l12_dequantize_granule(scratch->grbuf[0] + i, &bs_frame, &sci, layer | 1))) {
+      i = 0;
+      l12_apply_scf_384(&sci, sci.scf + igr, scratch->grbuf[0]);
+      synth_granule(scratch->grbuf[0], 12, channels, pcm, scratch->syn[0]);
       for (float& f : scratch->grbuf[0]) f = 0;
       for (float& f : scratch->grbuf[1]) f = 0;
-      decode_granule(scratch, scratch->gr_info + igr * channels, channels, hdr);
-      synth_granule(scratch->grbuf[0], 18, channels, pcm, scratch->syn[0]);
+      pcm += 384 * channels;
+    }
+    if (bs_frame.pos > bs_frame.limit) {
+      reset();
+      return 0;
     }
   }
-  save_reservoir(scratch);
-  return success ? static_cast<int>(hdr_frame_samples(hdr)) : 0;
+  return static_cast<int>(hdr_frame_samples(hdr));
 }
 
 // Finds the next frame at or after `from`: a valid Layer III header whose frame fits and is followed by another matching
@@ -846,7 +994,7 @@ int Mp3Decoder::decode_frame(const uint8_t* hdr, int frame_size, int16_t* pcm) {
 bool find_frame(ConstByteView d, uint64_t from, uint64_t* at, uint32_t* size) {
   for (uint64_t i = from; i + 4 <= d.size(); ++i) {
     const uint8_t* h = d.data() + i;
-    if (!hdr_valid(h) || hdr_layer(h) != 1) continue;
+    if (!hdr_valid(h)) continue;
     const unsigned frame_bytes = hdr_frame_bytes(h);
     if (frame_bytes < 24) continue;  // free format or implausibly small
     const uint64_t total = frame_bytes + hdr_padding(h);

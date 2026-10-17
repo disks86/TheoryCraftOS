@@ -223,7 +223,7 @@ OpenResult VideoPlayer::open_media(ConstByteView data) {
   kernel::ScopedMutex guard(mutex_);
   release();
   // GIF, APNG and Y4M are videos; any other picture format opens as a video of one frame.
-  if (format == media::VideoFileFormat::Unknown && media::detect_image_format(data) == media::ImageFormat::Unknown) return OpenResult::Unsupported;
+  if (format == media::VideoFileFormat::Unknown && media::detect_image_format(data) == media::ImageFormat::Unknown) return OpenResult::Unsupported;  // (GIF, APNG, animated WebP and Y4M are videos)
   if (!(format == media::VideoFileFormat::Y4m ? media::decode_y4m(data, &images_) : media::decode_image(data, &images_))) return OpenResult::Unsupported;
   const OpenResult result = open_images();
   if (result != OpenResult::Ok) release();

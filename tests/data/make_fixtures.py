@@ -100,7 +100,13 @@ big = Image.fromarray(base).resize((160, 120), Image.BICUBIC)
 big.save("big.webp", lossless=True, method=6, quality=100)               # predictor, cross-colour, meta prefix codes
 Image.fromarray(rgba).save("rgba.webp", lossless=True, method=4, quality=50, exact=True)
 Image.fromarray(base).convert("P", palette=Image.ADAPTIVE, colors=12).convert("RGBA").save("pal.webp", lossless=True, method=4, quality=0)  # colour indexing
-Image.fromarray(base).save("lossy.webp", quality=70)                      # VP8: must be refused
+Image.fromarray(base).resize((160, 120), Image.BICUBIC).save("lossy.webp", quality=70, method=6)   # VP8
+Image.fromarray(rgba).resize((96, 72), Image.BICUBIC).save("lossy_alpha.webp", quality=60, alpha_quality=70, exact=True)  # VP8 + ALPH
+Image.fromarray(base).resize((130, 99), Image.BICUBIC).save("lossy_odd.webp", quality=40, method=2)
+wframes = [picture(w=48, h=36, shift=s) for s in range(5)]
+wframes = [Image.fromarray(with_alpha(f) if i % 2 else f).convert("RGBA") for i, f in enumerate(wframes)]
+wframes[0].save("anim.webp", save_all=True, append_images=wframes[1:], duration=[40, 90, 60, 120, 30], loop=3, lossless=True)
+wframes[0].save("anim_lossy.webp", save_all=True, append_images=wframes[1:], duration=50, loop=0, quality=60)
 run("ffmpeg", "-v", "error", "-y", "-i", "rgba.png", "rgba.qoi")
 run("ffmpeg", "-v", "error", "-y", "-i", "rgb.png", "rgb.qoi")
 
@@ -115,7 +121,7 @@ with tempfile.TemporaryDirectory() as t:
     run("ffmpeg", "-v", "error", "-y", "-framerate", "10", "-i", f"{t}/f%d.png", "-plays", "0", "-f", "apng", "anim.apng")
 
 for p in ["rgb.png", "rgba.png", "gray.png", "pal.png", "rgb_interlaced.png", "rgb.bmp", "pal8.bmp", "rgb.jpg", "rgb444.jpg", "progressive.jpg", "gray.jpg",
-          "rgb.ppm", "gray.pgm", "bw.pbm", "rgb.tga", "rgba.tga", "big.webp", "rgba.webp", "pal.webp", "rgb_lzw.tif", "rgba_zip.tif", "tiled.tif", "pal.tif", "gray4.tif", "rgb_be.tif", "planar.tif", "static.gif", "anim.gif", "interlaced.gif"]:
+          "rgb.ppm", "gray.pgm", "bw.pbm", "rgb.tga", "rgba.tga", "big.webp", "rgba.webp", "pal.webp", "lossy.webp", "lossy_alpha.webp", "lossy_odd.webp", "rgb_lzw.tif", "rgba_zip.tif", "tiled.tif", "pal.tif", "gray4.tif", "rgb_be.tif", "planar.tif", "static.gif", "anim.gif", "interlaced.gif", "anim.webp", "anim_lossy.webp"]:
     add_image(p, pil_oracle(p))
 # 16-bit grey: the decoders keep the high byte (ffmpeg rounds to nearest instead, so it is not the oracle here)
 g16 = (np.asarray(Image.open("gray16.png")).astype(np.uint32) >> 8).astype(np.uint8)
@@ -201,14 +207,49 @@ for name, args in {"s16.aiff": ["-acodec", "pcm_s16be"], "s24.aiff": ["-acodec",
                    "best.flac": ["-compression_level", "8"], "s32.flac": ["-sample_fmt", "s32"]}.items():
     ff_audio(name, *args)
     add_audio(name, ff_oracle(name), 11025, 2)
-# Vorbis is lossy and each decoder rounds a little differently: the reference is ffmpeg's decode, compared with a tolerance.
+# Lossy codecs: each decoder rounds a little differently, so the reference is ffmpeg's decode, compared with a tolerance.
+def add_tolerance_fixture(name, rate, ch, true_frames=None):
+    raw = ff_oracle(name)
+    if true_frames is not None:
+        raw = raw[:true_frames * ch * 2]   # the stream's true length (ffmpeg adds the padding of its last block)
+    open(name + ".ref", "wb").write(raw)
+    manifest.append(f"audiotol {name} {rate} {ch} {len(raw) // 2 // ch} {name}.ref")
+
 for name, args, mono in [("stereo.ogg", ["-acodec", "libvorbis", "-q:a", "4"], False), ("mono.ogg", ["-acodec", "libvorbis", "-q:a", "2"], True),
                          ("stereo.mp3", ["-acodec", "libmp3lame", "-b:a", "96k"], False), ("mono.mp3", ["-acodec", "libmp3lame", "-b:a", "32k", "-ar", "11025"], True)]:
     ff_audio(name, *args, mono=mono)
-    ch = 1 if mono else 2
-    raw = ff_oracle(name)[:len(t) * ch * 2]   # the stream's true length (ffmpeg adds the padding of its last block)
-    open(name + ".ref", "wb").write(raw)
-    manifest.append(f"audiotol {name} 11025 {ch} {len(raw) // 2 // ch} {name + '.ref'}")
+    add_tolerance_fixture(name, 11025, 1 if mono else 2, len(t))
+ff_audio("lsf.mp2", "-acodec", "mp2", "-b:a", "64k", "-ar", "22050")   # MPEG-2 (low sampling frequency) Layer II
+add_tolerance_fixture("lsf.mp2", 22050, 2)
+# MPEG-1 Layer I has no encoder to hand: a stream is built directly (random allocations, scale factors and samples), which is a
+# legitimate bitstream, and ffmpeg's decoder is the reference.
+def layer1_stream(frames, bitrate_idx=12, sr_idx=1):
+    import random
+    rnd = random.Random(7)
+    kbps = [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448][bitrate_idx]
+    size = 12 * kbps * 1000 // [44100, 48000, 32000][sr_idx] * 4
+    out = bytearray()
+    for _ in range(frames):
+        allocs = [[rnd.choice([0, 1, 2, 3, 5]) if sb < 26 else 0 for sb in range(32)] for _ in range(2)]
+        fields = [(allocs[c][sb], 4) for sb in range(32) for c in range(2)]
+        fields += [(rnd.randrange(0, 63), 6) for sb in range(32) for c in range(2) if allocs[c][sb]]
+        for _s in range(12):
+            for sb in range(32):
+                for c in range(2):
+                    if allocs[c][sb]:
+                        n = allocs[c][sb] + 1
+                        fields.append((rnd.randrange(0, (1 << n) - 1), n))
+        acc = 0
+        nbits = 0
+        for v, n in fields:
+            acc = (acc << n) | v
+            nbits += n
+        pad = (-nbits) % 8
+        body = (acc << pad).to_bytes((nbits + pad) // 8, "big")
+        out += bytes([0xFF, 0xFF, (bitrate_idx << 4) | (sr_idx << 2), 0]) + body + bytes(size - 4 - len(body))
+    return bytes(out)
+open("layer1.mp1", "wb").write(layer1_stream(20))
+add_tolerance_fixture("layer1.mp1", 48000, 2)
 ff_audio("opus.ogg", "-acodec", "libopus", "-b:a", "48k")   # a codec that is not here: must be refused, not misread
 os.remove("src.raw")
 

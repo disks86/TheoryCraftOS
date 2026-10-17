@@ -18,6 +18,7 @@
 
 // WebP, lossless only (the VP8L format: LZ77 + colour cache + prefix codes + the four image transforms). The lossy VP8
 // format and animated files are refused. Written from the format's specification.
+#include "Media/Image/WebpInternal.hpp"
 #include "Media/ImageCodecs.hpp"
 
 namespace media {
@@ -175,6 +176,7 @@ class Decoder {
   }
 
   bool decode(Image* out);
+  bool decode_body(uint32_t width, uint32_t height, ArrayView<uint32_t>* result);
 
  private:
   bool decode_stream(uint32_t xsize, uint32_t ysize, bool main, ArrayView<uint32_t> pixels);
@@ -396,11 +398,9 @@ bool Decoder::inverse_transforms(ArrayView<uint32_t>* pixels, uint32_t height, u
   return true;
 }
 
-bool Decoder::decode(Image* out) {
-  if (r_.read(8) != 0x2F) return false;
-  const uint32_t width = r_.read(14) + 1, height = r_.read(14) + 1;
-  r_.read(1);  // alpha_is_used: only a hint; the pixels carry the alpha
-  if (r_.read(3) != 0 || r_.failed || uint64_t{width} * height > Image::kMaxPixels) return false;
+// The transforms and entropy-coded pixels that follow the header (or, for an ALPH chunk, make up the whole stream). On success
+// `*pixels` holds width x height ARGB pixels allocated here; the caller releases it.
+bool Decoder::decode_body(uint32_t width, uint32_t height, ArrayView<uint32_t>* result) {
   uint32_t xsize = width;
   uint32_t used = 0;
   while (r_.read(1)) {
@@ -435,7 +435,23 @@ bool Decoder::decode(Image* out) {
   if (pixels.empty()) return false;
   bool ok = decode_stream(xsize, height, true, pixels);
   uint32_t w = xsize;
-  ok = ok && inverse_transforms(&pixels, height, &w) && w == width && out->create(width, height, 1);
+  ok = ok && inverse_transforms(&pixels, height, &w) && w == width;
+  if (!ok) {
+    release_view(allocator_, pixels);
+    return false;
+  }
+  *result = pixels;
+  return true;
+}
+
+bool Decoder::decode(Image* out) {
+  if (r_.read(8) != 0x2F) return false;
+  const uint32_t width = r_.read(14) + 1, height = r_.read(14) + 1;
+  r_.read(1);  // alpha_is_used: only a hint; the pixels carry the alpha
+  if (r_.read(3) != 0 || r_.failed || uint64_t{width} * height > Image::kMaxPixels) return false;
+  ArrayView<uint32_t> pixels;
+  if (!decode_body(width, height, &pixels)) return false;
+  bool ok = out->create(width, height, 1);
   bool alpha = false;
   if (ok) {
     ArrayView<uint32_t> dest = out->frame(0);
@@ -453,24 +469,219 @@ uint32_t le32(ConstByteView d, uint64_t at) { return d[at] | (d[at + 1] << 8) | 
 bool tag_is(ConstByteView d, uint64_t at, const char* tag) { return d[at] == static_cast<uint8_t>(tag[0]) && d[at + 1] == static_cast<uint8_t>(tag[1]) && d[at + 2] == static_cast<uint8_t>(tag[2]) && d[at + 3] == static_cast<uint8_t>(tag[3]); }
 }  // namespace
 
+namespace webp_internal {
+bool decode_alpha_plane(allocators::IAllocator& allocator, ConstByteView alph, uint32_t width, uint32_t height, uint8_t* alpha) {
+  if (alph.size() < 2) return false;
+  const uint32_t method = alph[0] & 3, filter = (alph[0] >> 2) & 3;
+  const ConstByteView data = alph.subview(1, alph.size() - 1);
+  const uint64_t count = uint64_t{width} * height;
+  if (method == 0) {  // stored
+    if (data.size() < count) return false;
+    for (uint64_t i = 0; i < count; ++i) alpha[i] = data[i];
+  } else if (method == 1) {  // a headerless lossless picture whose green channel is the alpha
+    BitReader reader{data};
+    Decoder decoder(allocator, reader);
+    ArrayView<uint32_t> pixels;
+    if (!decoder.decode_body(width, height, &pixels)) return false;
+    for (uint64_t i = 0; i < count; ++i) alpha[i] = static_cast<uint8_t>(pixels[i] >> 8);
+    release_view(allocator, pixels);
+  } else {
+    return false;
+  }
+  // Undo the prediction filter row by row (each row is predicted from the output of the row above).
+  if (filter != 0) {
+    for (uint32_t y = 0; y < height; ++y) {
+      uint8_t* row = alpha + uint64_t{y} * width;
+      const uint8_t* prev = y ? row - width : nullptr;
+      if (filter == 1 || !prev) {  // horizontal (and the first row of the vertical and gradient filters)
+        uint8_t pred = (filter == 1 && prev) ? prev[0] : 0;
+        for (uint32_t i = 0; i < width; ++i) pred = row[i] = static_cast<uint8_t>(pred + row[i]);
+      } else if (filter == 2) {  // vertical
+        for (uint32_t i = 0; i < width; ++i) row[i] = static_cast<uint8_t>(prev[i] + row[i]);
+      } else {  // gradient
+        int top = prev[0], top_left = top, left = top;
+        for (uint32_t i = 0; i < width; ++i) {
+          top = prev[i];
+          const int pred = left + top - top_left;
+          left = static_cast<uint8_t>(row[i] + (pred < 0 ? 0 : pred > 255 ? 255 : pred));
+          top_left = top;
+          row[i] = static_cast<uint8_t>(left);
+        }
+      }
+    }
+  }
+  return true;
+}
+}  // namespace webp_internal
+
+namespace {
+uint32_t le24(ConstByteView d, uint64_t at) { return d[at] | (d[at + 1] << 8) | (d[at + 2] << 16); }
+
+// One still picture from its chunks: lossless VP8L, or lossy VP8 with an optional ALPH.
+bool decode_still(ConstByteView vp8l, ConstByteView vp8, ConstByteView alph, Image* out) {
+  if (!vp8l.empty()) {
+    BitReader reader{vp8l};
+    Decoder decoder(out->allocator(), reader);
+    if (decoder.decode(out)) return true;
+    out->clear();
+    return false;
+  }
+  if (!vp8.empty()) return webp_internal::decode_vp8(vp8, alph, out);
+  return false;
+}
+
+// Blends a new pixel over the canvas, the way libwebp's animation decoder does (straight alpha, integer arithmetic).
+uint32_t blend_pixel(uint32_t src, uint32_t dst) {
+  const uint32_t src_a = src >> 24;
+  if (src_a == 0) return dst;
+  const uint32_t dst_a = dst >> 24;
+  const uint32_t dst_factor_a = (dst_a * (256 - src_a)) >> 8;
+  const uint32_t blend_a = src_a + dst_factor_a;
+  const uint32_t scale = (1u << 24) / blend_a;
+  auto channel = [&](int shift) {
+    const uint32_t blend_unscaled = ((src >> shift) & 0xFF) * src_a + ((dst >> shift) & 0xFF) * dst_factor_a;
+    return static_cast<uint32_t>((blend_unscaled * scale) >> 24) & 0xFF;
+  };
+  return (channel(0)) | (channel(8) << 8) | (channel(16) << 16) | (blend_a << 24);
+}
+
+struct AnimFrame {
+  uint32_t x, y, width, height, duration;
+  bool blend, dispose_background;
+  ConstByteView vp8l, vp8, alph;
+};
+
+// An animated file: every frame composed onto the canvas (frames in the file are rectangles that may be blended with, and
+// disposed against, what came before). The result has one full-canvas frame per animation frame.
+bool decode_animation(ConstByteView data, uint64_t canvas_w, uint64_t canvas_h, uint32_t loops, Image* out) {
+  allocators::IAllocator& allocator = out->allocator();
+  // Count the frames.
+  uint32_t frames = 0;
+  for (uint64_t at = 12; at + 8 <= data.size();) {
+    const uint64_t size = le32(data, at + 4);
+    if (tag_is(data, at, "ANMF")) ++frames;
+    at += 8 + size + (size & 1);
+  }
+  if (frames == 0 || canvas_w == 0 || canvas_h == 0 || canvas_w * canvas_h * frames > Image::kMaxPixels || !out->create(static_cast<uint32_t>(canvas_w), static_cast<uint32_t>(canvas_h), frames)) return false;
+  const uint32_t cw = static_cast<uint32_t>(canvas_w), ch = static_cast<uint32_t>(canvas_h);
+  ArrayView<uint32_t> disposed = allocate_view<uint32_t>(allocator, uint64_t{cw} * ch);
+  if (disposed.empty()) {
+    out->clear();
+    return false;
+  }
+  disposed.fill(0);
+  bool ok = true, any_alpha = false;
+  AnimFrame prev = {};
+  bool have_prev = false, prev_key = false;
+  uint32_t index = 0;
+  for (uint64_t at = 12; ok && index < frames && at + 8 <= data.size();) {
+    const uint64_t size = le32(data, at + 4), body = at + 8;
+    const uint64_t length = size < data.size() - body ? size : data.size() - body;
+    if (tag_is(data, at, "ANMF") && length >= 16) {
+      AnimFrame f = {};
+      f.x = 2 * le24(data, body);
+      f.y = 2 * le24(data, body + 3);
+      f.width = le24(data, body + 6) + 1;
+      f.height = le24(data, body + 9) + 1;
+      f.duration = le24(data, body + 12);
+      f.blend = !(data[body + 15] & 2);
+      f.dispose_background = data[body + 15] & 1;
+      // The frame's own chunks.
+      for (uint64_t p = body + 16; p + 8 <= body + length;) {
+        const uint64_t csize = le32(data, p + 4), cbody = p + 8;
+        const uint64_t clen = csize < body + length - cbody ? csize : body + length - cbody;
+        if (tag_is(data, p, "VP8L")) f.vp8l = data.subview(cbody, clen);
+        else if (tag_is(data, p, "VP8 ")) f.vp8 = data.subview(cbody, clen);
+        else if (tag_is(data, p, "ALPH")) f.alph = data.subview(cbody, clen);
+        p = cbody + csize + (csize & 1);
+      }
+      if (uint64_t{f.x} + f.width > cw || uint64_t{f.y} + f.height > ch) {
+        ok = false;
+        break;
+      }
+      Image still(allocator);
+      if (!decode_still(f.vp8l, f.vp8, f.alph, &still) || still.width() != f.width || still.height() != f.height) {
+        ok = false;
+        break;
+      }
+      const bool frame_alpha = still.has_alpha();
+      const bool full = f.width == cw && f.height == ch;
+      const bool prev_full = have_prev && prev.width == cw && prev.height == ch;
+      bool key;
+      if (index == 0) key = true;
+      else if ((!frame_alpha || !f.blend) && full) key = true;
+      else key = prev.dispose_background && (prev_full || prev_key);
+      ArrayView<uint32_t> canvas = out->frame(index);
+      if (key) canvas.fill(0);
+      else for (uint64_t i = 0; i < canvas.size(); ++i) canvas[i] = disposed[i];
+      for (uint32_t y = 0; y < f.height; ++y)
+        for (uint32_t x = 0; x < f.width; ++x) {
+          const uint64_t pos = uint64_t{f.y + y} * cw + f.x + x;
+          uint32_t px = still.frame(0)[uint64_t{y} * f.width + x];
+          if (index > 0 && f.blend && !key && (px >> 24) != 255) {
+            // (Where the previous frame was cleared to the background, the canvas is transparent there: no blending.)
+            const bool in_prev_rect = prev.dispose_background && f.x + x >= prev.x && f.x + x < prev.x + prev.width && f.y + y >= prev.y && f.y + y < prev.y + prev.height;
+            if (!in_prev_rect) px = blend_pixel(px, disposed[pos]);
+          }
+          canvas[pos] = px;
+        }
+      for (uint64_t i = 0; i < canvas.size(); ++i) {
+        disposed[i] = canvas[i];
+        any_alpha = any_alpha || (canvas[i] >> 24) != 255;
+      }
+      if (f.dispose_background)
+        for (uint32_t y = 0; y < f.height; ++y)
+          for (uint32_t x = 0; x < f.width; ++x) disposed[uint64_t{f.y + y} * cw + f.x + x] = 0;
+      out->set_delay_ms(index, f.duration);
+      prev = f;
+      prev_key = key;
+      have_prev = true;
+      ++index;
+    }
+    at = body + size + (size & 1);
+  }
+  release_view(allocator, disposed);
+  if (!ok || index != frames) {
+    out->clear();
+    return false;
+  }
+  out->set_loop_count(loops);
+  out->set_has_alpha(any_alpha);
+  return true;
+}
+}  // namespace
+
 bool decode_webp(ConstByteView data, Image* out) {
   out->clear();
   if (data.size() < 20 || detect_image_format(data) != ImageFormat::Webp) return false;
   uint64_t at = 12;
+  ConstByteView vp8l, vp8, alph;
+  uint64_t canvas_w = 0, canvas_h = 0;
+  uint32_t loops = 0;
+  bool animated = false;
   while (at + 8 <= data.size()) {
     const uint64_t size = le32(data, at + 4), body = at + 8;
     const uint64_t length = size < data.size() - body ? size : data.size() - body;
-    if (tag_is(data, at, "VP8L")) {
-      BitReader reader{data.subview(body, length)};
-      Decoder decoder(out->allocator(), reader);
-      if (decoder.decode(out)) return true;
+    if (tag_is(data, at, "VP8L")) vp8l = data.subview(body, length);
+    else if (tag_is(data, at, "VP8 ")) vp8 = data.subview(body, length);
+    else if (tag_is(data, at, "ALPH")) alph = data.subview(body, length);
+    else if (tag_is(data, at, "VP8X") && length >= 10) {
+      animated = data[body] & 2;
+      canvas_w = uint64_t{le24(data, body + 4)} + 1;
+      canvas_h = uint64_t{le24(data, body + 7)} + 1;
+    } else if (tag_is(data, at, "ANIM") && length >= 6) {
+      loops = data[body + 4] | (data[body + 5] << 8);
+    }
+    at = body + size + (size & 1);
+  }
+  if (animated) {
+    if (!decode_animation(data, canvas_w, canvas_h, loops, out)) {
       out->clear();
       return false;
     }
-    if (tag_is(data, at, "VP8 ") || tag_is(data, at, "ANMF")) return false;  // lossy or animated: not handled
-    at = body + size + (size & 1);
+    return true;
   }
-  return false;
+  return decode_still(vp8l, vp8, alph, out);
 }
 
 // ---- Encoding -------------------------------------------------------------------------------

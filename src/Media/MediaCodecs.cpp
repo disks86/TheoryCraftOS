@@ -143,7 +143,8 @@ bool MediaCodecs::decode_video(ConstByteView data, Image* out, VideoFileFormat* 
   switch (format) {
     case VideoFileFormat::Y4m: return decode_y4m(data, out);
     case VideoFileFormat::Gif:
-    case VideoFileFormat::Apng: return media::decode_image(data, out, nullptr);
+    case VideoFileFormat::Apng:
+    case VideoFileFormat::AnimatedWebp: return media::decode_image(data, out, nullptr);
     default: out->clear(); return false;
   }
 }

@@ -72,6 +72,7 @@ const char* video_file_format_name(VideoFileFormat format) {
     case VideoFileFormat::Gif: return "GIF";
     case VideoFileFormat::Apng: return "APNG";
     case VideoFileFormat::Y4m: return "Y4M";
+    case VideoFileFormat::AnimatedWebp: return "animated WebP";
     default: return "unknown";
   }
 }
@@ -82,6 +83,13 @@ VideoFileFormat detect_video_file(ConstByteView data) {
   const ImageFormat image = detect_image_format(data);
   if (image == ImageFormat::Gif) return VideoFileFormat::Gif;
   if (image == ImageFormat::Png && is_apng(data)) return VideoFileFormat::Apng;
+  if (image == ImageFormat::Webp) {  // an extended file whose VP8X flags say "animation"
+    for (uint64_t at = 12; at + 18 <= data.size();) {
+      const uint64_t size = data[at + 4] | (data[at + 5] << 8) | (data[at + 6] << 16) | (uint64_t{data[at + 7]} << 24);
+      if (data[at] == 'V' && data[at + 1] == 'P' && data[at + 2] == '8' && data[at + 3] == 'X') return (data[at + 8] & 2) ? VideoFileFormat::AnimatedWebp : VideoFileFormat::Unknown;
+      at += 8 + size + (size & 1);
+    }
+  }
   return VideoFileFormat::Unknown;
 }
 

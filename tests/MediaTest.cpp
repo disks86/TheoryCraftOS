@@ -109,9 +109,9 @@ static void test_fixtures() {
       snprintf(ref_path, sizeof ref_path, "tests/data/%s", reference);
       File ref(ref_path);
       AudioData au(a);
-      ok = ref.data && decode_audio(file.view(), &au) && au.format().sample_rate == x && au.format().channels == y && au.frame_count() == z &&
-           au.bytes().size() == static_cast<uint64_t>(ref.size);
-      for (uint64_t i = 0; ok && i < au.samples().size(); ++i) {
+      // (ffmpeg leaves out a last MPEG audio frame it cannot confirm by a following header: allow up to one more frame.)
+      ok = ref.data && decode_audio(file.view(), &au) && au.format().sample_rate == x && au.format().channels == y && au.frame_count() >= z && au.frame_count() <= z + 1152;
+      for (uint64_t i = 0; ok && i < static_cast<uint64_t>(ref.size) / 2; ++i) {
         const int d = au.samples()[i] - static_cast<int16_t>(ref.data[i * 2] | ref.data[i * 2 + 1] << 8);
         ok = d >= -2 && d <= 2;
       }
@@ -122,7 +122,7 @@ static void test_fixtures() {
     if (!ok) { printf("FAILED fixture %s\n", name); ++g_failed; }
   }
   fclose(m);
-  CHECK(count >= 60);
+  CHECK(count >= 68);
   {  // Ogg Opus shares the container with Vorbis but is a different codec: not Vorbis, not decoded.
     File opus("tests/data/opus.ogg");
     AudioData au(a);
@@ -184,11 +184,6 @@ static void test_image_roundtrip() {
     ImageFormat detected = ImageFormat::Unknown;
     CHECK(encode_image(in, c.f, 80, &out));
     CHECK(decode_image(out.view(), &dst, &detected) && detected == c.f && same_pixels(in, dst));
-  }
-  // Lossy WebP is a different codec (VP8), which is not here: refused, not misread.
-  {
-    File lossy("tests/data/lossy.webp");
-    CHECK(lossy.data != nullptr && detect_image_format(lossy.view()) == ImageFormat::Webp && !decode_image(lossy.view(), &dst) && dst.empty());
   }
   // Lossy: JPEG at high quality is close; GIF is a 216-colour dither, so only roughly close.
   ByteBuffer jpg(a), gif(a);
@@ -279,7 +274,7 @@ static void test_audio_roundtrip() {
 static void test_fuzz() {
   TestAllocator a;
   const char* names[] = {"rgb.png", "rgba16.png", "anim.apng", "rgb.jpg", "progressive.jpg", "rle8.bmp", "rgba32.bmp", "anim.gif", "interlaced.gif", "rgba.qoi", "rgb.ppm",
-                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg", "stereo.mp3", "mono.mp3"};
+                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "lossy.webp", "lossy_alpha.webp", "anim.webp", "anim_lossy.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg", "stereo.mp3", "mono.mp3", "lsf.mp2", "layer1.mp1"};
   uint32_t seed = 2024;
   auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
   for (const char* name : names) {
@@ -311,9 +306,12 @@ static void test_fuzz() {
   for (int round = 0; round < 300; ++round) {
     uint8_t noise[300];
     for (uint8_t& b : noise) b = static_cast<uint8_t>(rnd());
-    static const char* const sigs[] = {"\x89PNG\r\n\x1a\n", "\xFF\xD8\xFF\xE0", "BM", "GIF89a", "qoif", "P6\n", "RIFF\x24\x00\x00\x00WAVEfmt ", "FORM\x00\x00\x00\x40" "AIFF", ".snd", "fLaC", "YUV4MPEG2 W8 H8\n", "\xFF\xFB\x90\x00", "\xFF\xFB\x92\x40", "II*\x00\x08\x00\x00\x00", "RIFF\x40\x00\x00\x00WEBPVP8L"};
-    const char* sig = sigs[round % 15];
-    memcpy(noise, sig, strlen(sig) < 16 ? strlen(sig) : 16);
+    struct Sig { const char* bytes; unsigned size; };
+#define SIG(x) {x, sizeof(x) - 1}
+    static const Sig sigs[] = {SIG("\x89PNG\r\n\x1a\n"), SIG("\xFF\xD8\xFF\xE0"), SIG("BM"), SIG("GIF89a"), SIG("qoif"), SIG("P6\n"), SIG("RIFF\x24\x00\x00\x00WAVEfmt "), SIG("FORM\x00\x00\x00\x40" "AIFF"), SIG(".snd"), SIG("fLaC"), SIG("YUV4MPEG2 W8 H8\n"), SIG("\xFF\xFB\x90\x00"), SIG("\xFF\xFB\x92\x40"), SIG("II*\x00\x08\x00\x00\x00"), SIG("RIFF\x40\x00\x00\x00WEBPVP8L"), SIG("RIFF\x40\x00\x00\x00WEBPVP8 "), SIG("RIFF\x40\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x10\x00\x00\x00")};
+#undef SIG
+    const Sig& sig = sigs[round % (sizeof sigs / sizeof sigs[0])];
+    memcpy(noise, sig.bytes, sig.size < 24 ? sig.size : 24);
     Image img(a);
     AudioData au(a);
     decode_image(ConstByteView(noise, sizeof noise), &img);
@@ -479,6 +477,10 @@ static void test_media_front_door_audio_video() {
   CHECK(codecs.decode_audio(wav.view(), &au, &af, &path) && af == AudioFileFormat::Wav && path == CodecPath::Cpu && au.frame_count() > 2000);
   CHECK(codecs.decode_video(gif.view(), &clip, &vf) && vf == VideoFileFormat::Gif && clip.frame_count() == 4);
   CHECK(!codecs.decode_video(wav.view(), &clip, &vf) && vf == VideoFileFormat::Unknown);
+  File webp("tests/data/anim.webp");
+  CHECK(codecs.decode_video(webp.view(), &clip, &vf) && vf == VideoFileFormat::AnimatedWebp && clip.frame_count() == 5 && clip.delay_ms(1) == 90 && clip.loop_count() == 3);
+  File still_webp("tests/data/lossy.webp");
+  CHECK(detect_video_file(still_webp.view()) == VideoFileFormat::Unknown);
 }
 
 static int player_red(const graphics::Surface* s) { return s ? static_cast<int>((s->row(s->height / 2)[s->width / 2] >> 16) & 0xFF) : -1; }

@@ -17,6 +17,9 @@ image rgba.tga 40 30 1 8e082edaf5863e56
 image big.webp 160 120 1 516e2cd9ce082324
 image rgba.webp 40 30 1 8e082edaf5863e56
 image pal.webp 40 30 1 1e9c99529aca1ee4
+image lossy.webp 160 120 1 cfead57b7edd7217
+image lossy_alpha.webp 96 72 1 a9547843aa6f3487
+image lossy_odd.webp 130 99 1 133f05ac06790889
 image rgb_lzw.tif 40 30 1 a005f44188579fc3
 image rgba_zip.tif 40 30 1 8e082edaf5863e56
 image tiled.tif 40 30 1 a005f44188579fc3
@@ -27,6 +30,8 @@ image planar.tif 40 30 1 a005f44188579fc3
 image static.gif 40 30 1 0cfe1d6344ab9da8
 image anim.gif 40 30 4 799a81991f04a941
 image interlaced.gif 40 30 1 decb7a302aa94cd8
+image anim.webp 48 36 5 a7c416ac642c77ef
+image anim_lossy.webp 48 36 5 03d14f702bfb73c5
 image gray16.png 40 30 1 180bb1d0efc7f928
 image rgba16.png 40 30 1 8e082edaf5863e56
 image rle8.bmp 40 30 1 976878b2e048ed75
@@ -63,3 +68,5 @@ audiotol stereo.ogg 11025 2 2205 stereo.ogg.ref
 audiotol mono.ogg 11025 1 2205 mono.ogg.ref
 audiotol stereo.mp3 11025 2 2205 stereo.mp3.ref
 audiotol mono.mp3 11025 1 2205 mono.mp3.ref
+audiotol lsf.mp2 22050 2 4608 lsf.mp2.ref
+audiotol layer1.mp1 48000 2 7680 layer1.mp1.ref

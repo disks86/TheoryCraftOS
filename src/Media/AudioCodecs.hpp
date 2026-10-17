@@ -31,8 +31,9 @@ namespace media {
 //   AU    decode: PCM 8/16/24/32-bit, float 32/64, A-law, mu-law. encode: 16-bit PCM.
 //   FLAC  decode: all of the format (1-8 channels, 4-32 bits, fixed and LPC predictors, all stereo modes, CRC-checked). encode:
 //         fixed predictors with Rice coding, adaptive stereo, 16-bit.
+//   MPEG audio  decode only: Layer III (MP3), Layer II (MP2) and Layer I, MPEG-1, 2 and 2.5, mono and stereo.
 //   Ogg Vorbis  decode only: floor 1 streams (all current encoders), mono and stereo (more channels keep the front pair).
-// Not provided: MP3, AAC, Opus - lossy codecs whose code tables are not here.
+// Not provided: AAC and Opus.
 bool decode_wav(ConstByteView data, AudioData* out);
 bool encode_wav(const AudioData& audio, ByteBuffer* out);
 bool decode_aiff(ConstByteView data, AudioData* out);

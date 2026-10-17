@@ -46,7 +46,7 @@ class MediaCodecs {
   bool encode_image(const Image& image, ImageFormat format, uint32_t quality, ByteBuffer* out, CodecPath* path = nullptr) const;
   bool decode_audio(ConstByteView data, AudioData* out, AudioFileFormat* detected = nullptr, CodecPath* path = nullptr) const;
   bool encode_audio(const AudioData& audio, AudioFileFormat format, ByteBuffer* out, CodecPath* path = nullptr) const;
-  // Any video file the player reads by decoding it into frames: GIF, APNG or Y4M (AVI is read by the player itself).
+  // Any video file the player reads by decoding it into frames: GIF, APNG, animated WebP or Y4M (AVI is read by the player itself).
   bool decode_video(ConstByteView data, Image* out, VideoFileFormat* detected = nullptr) const;
 
   // True if JPEG pictures would go to an accelerating device right now.

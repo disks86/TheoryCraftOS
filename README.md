@@ -105,14 +105,14 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     deflate in `Zlib`), JPEG (baseline and progressive, bit-exact with libjpeg-turbo for the checked cases; baseline 4:2:0
     encoder), BMP (1-32 bit, RLE, bit fields), GIF (LZW, interlace, animation; encoder uses a fixed 216-colour palette with
     dithering), PNM/PAM, QOI, TGA, TIFF (strips and tiles, 1-16 bit grey/RGB/palette/alpha, planar, PackBits/LZW/Deflate and the
-    predictor; Deflate RGB(A) encoder), WebP **lossless** (VP8L: all four transforms, colour cache, meta prefix codes; encoder
-    with subtract-green and LZ77; lossy VP8 and animated WebP are refused).
+    predictor; Deflate RGB(A) encoder), WebP (lossless VP8L with all four transforms, colour cache and meta prefix codes, encoder with subtract-green and LZ77;
+    lossy VP8 key frames with the ALPH alpha plane, decode only, bit-exact with libwebp's output; animated WebP is composed frame by frame as libwebp's animation decoder does).
   - Sound: WAV (PCM 8-32 bit, float, A-law, mu-law, IMA and Microsoft ADPCM, extensible), AIFF/AIFC, AU, FLAC (full decoder
-    with CRC checks; fixed-predictor encoder), MP3 (Layer III, MPEG-1/2/2.5, mono/stereo/joint/intensity stereo, ID3v2, gapless trimming from the LAME tag; decoder ported from
-    the CC0 minimp3, within one 16-bit step of ffmpeg's), Ogg Vorbis (decoder only: codebooks, floor 1, residue 0-2, channel coupling,
+    with CRC checks; fixed-predictor encoder), MPEG audio (MP3 = Layer III, MPEG-1/2/2.5, mono/stereo/joint/intensity stereo, ID3v2, gapless trimming from the LAME tag; also
+    Layers I and II; decoder ported from the CC0 minimp3, within two 16-bit steps of ffmpeg's), Ogg Vorbis (decoder only: codebooks, floor 1, residue 0-2, channel coupling,
     FFT-based IMDCT; within one 16-bit step of ffmpeg's output; floor type 0 and chained streams are not handled). Encoders
-    write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: AAC, Opus, MP3 Layers I/II**, lossy WebP, or H.264/HEVC/VP9/AV1 video.
-  - Video files: `VideoFiles` reads GIF, APNG and Y4M (4:2:0/4:2:2/4:4:4/mono) as frames with their own durations, which
+    write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: AAC, Opus, H.264/HEVC/VP9/AV1 video.**
+  - Video files: `VideoFiles` reads GIF, APNG, animated WebP and Y4M (4:2:0/4:2:2/4:4:4/mono) as frames with their own durations, which
     `VideoPlayer::open_media()` plays (AVI as before, now also with A-law, mu-law and ADPCM soundtracks; a still picture opens
     as a one-frame video).
   `tests/MediaTest.cpp` checks every decoder against fixtures in `tests/data/` whose expected output comes from Pillow/ffmpeg

@@ -46,7 +46,7 @@ AudioFileFormat detect_audio_format(ConstByteView d) {
   if (starts("fLaC", 0)) return AudioFileFormat::Flac;
   // MP3 has no signature: an ID3v2 tag, or an MPEG audio frame header (sync, Layer III, a real bitrate and sample rate) right at the start.
   if (d.size() >= 10 && d[0] == 'I' && d[1] == 'D' && d[2] == '3' && d[3] < 0xFF) return AudioFileFormat::Mp3;
-  if (d.size() >= 4 && d[0] == 0xFF && (d[1] & 0xE0) == 0xE0 && ((d[1] >> 1) & 3) == 1 && ((d[1] >> 3) & 3) != 1 && (d[2] >> 4) != 15 && (d[2] >> 4) != 0 && ((d[2] >> 2) & 3) != 3)
+  if (d.size() >= 4 && d[0] == 0xFF && (d[1] & 0xE0) == 0xE0 && ((d[1] >> 1) & 3) != 0 && ((d[1] >> 3) & 3) != 1 && (d[2] >> 4) != 15 && (d[2] >> 4) != 0 && ((d[2] >> 2) & 3) != 3)
     return AudioFileFormat::Mp3;
   // Ogg holds many codecs: only a first packet that is a Vorbis identification header counts (the first page's lacing table is
   // 27 bytes in, then the packet).

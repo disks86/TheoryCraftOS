@@ -42,7 +42,7 @@ enum class OpenResult : uint8_t {
   OutOfMemory,
 };
 
-// Plays an AVI file held in memory (or, with open_media(), a GIF, APNG or Y4M file - decoded up front into frames that
+// Plays an AVI file held in memory (or, with open_media(), a GIF, APNG, animated WebP or Y4M file - decoded up front into frames that
 // carry their own durations, and silent): the picture through a video decoder session from the machine's codec devices,
 // the sound (if the file has PCM audio and a mixer is given) through an audio::AudioPlayer. The sound is the clock
 // while it plays - the picture follows it, skipping frames when decoding falls behind - and with no sound the picture
@@ -62,7 +62,7 @@ class VideoPlayer {
   // Opens `avi` (borrowed: it must outlive the player or the next open()/close()), replacing what was open. The first
   // picture is decoded at once, so a stopped or paused player shows something.
   OpenResult open(ConstByteView avi);
-  // Opens any video file this OS reads, by looking at it: AVI as open(), GIF/APNG/Y4M as frames in memory. `data` is
+  // Opens any video file this OS reads, by looking at it: AVI as open(), GIF/APNG/WebP/Y4M as frames in memory. `data` is
   // borrowed for AVI only (the other formats are decoded into the player). A still picture opens as a one-frame video.
   OpenResult open_media(ConstByteView data);
   void close();

@@ -207,6 +207,7 @@ add_executable(BOOTX64
   src/Media/Image/Tga.cpp
   src/Media/Image/Tiff.cpp
   src/Media/Image/Webp.cpp
+  src/Media/Image/WebpLossy.cpp
   src/Media/AudioData.cpp
   src/Media/AudioCodecs.cpp
   src/Media/Audio/Pcm.cpp
