@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Audio/CaptureStream.hpp"
 #include "Hardware/AudioDevice/IAudioCapture.hpp"
+#include "Hardware/AudioDevice/IAudioDevice.hpp"
 #include "Kernel/Thread.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/SharedPointer.hpp"
@@ -41,15 +42,20 @@ struct CaptureHubStatistics {
 // discarded, so a stream opened later starts with sound from that moment, not
 // old audio. start_service() runs pump() from a thread every few milliseconds.
 //
-// Master gain and mute go to the device. Thread safe.
+// Master gain and mute go to the device. The source can be exchanged, or taken away, while the hub runs (set_source(): a USB microphone was
+// plugged in or the one in use was pulled out): open streams stay open (they receive nothing while there is no source) and the master gain and
+// mute are applied to the new source. Thread safe.
 class AudioCaptureHub {
  public:
   static constexpr uint32_t kMaxStreams = 32;
   static constexpr uint32_t kChunkFrames = 1024;
   static constexpr uint32_t kPumpIntervalUs = 5000;
 
+  // A hub on `device`, which must outlive it (and must not be one that is removed while the hub runs: use set_source()).
   AudioCaptureHub(hardware::IAudioCapture& device, allocators::IAllocator& allocator)
-      : device_(device), allocator_(allocator), streams_(allocator) {}
+      : device_(&device), allocator_(allocator), streams_(allocator), gain_(device.gain()), muted_(device.muted()) {}
+  // A hub with no source yet (set_source() gives it one when a microphone turns up).
+  explicit AudioCaptureHub(allocators::IAllocator& allocator) : allocator_(allocator), streams_(allocator) {}
   ~AudioCaptureHub() {
     stop_service();
     release_view(allocator_, chunk_);
@@ -72,24 +78,36 @@ class AudioCaptureHub {
   void stop_service();
   bool service_running() const { return service_ != nullptr; }
 
-  void set_master_gain(uint8_t gain) { device_.set_gain(gain); }
-  uint8_t master_gain() const { return device_.gain(); }
-  void set_master_muted(bool muted) { device_.set_muted(muted); }
-  bool master_muted() const { return device_.muted(); }
+  // Records from `source` from now on, or from nothing (null). `owner` is the audio device it belongs to; the hub shares it, so it stays valid
+  // while in use. The master gain and mute are set on the new source.
+  void set_source(hardware::IAudioCapture* source, SharedPointer<hardware::IAudioDevice> owner);
+  // The source in use (may be null; only good until the next set_source()).
+  hardware::IAudioCapture* source();
+  // The audio device the source belongs to (null when it was bound by reference or there is none).
+  hardware::IAudioDevice* source_device();
+
+  void set_master_gain(uint8_t gain);
+  uint8_t master_gain() const;
+  void set_master_muted(bool muted);
+  bool master_muted() const;
 
   uint32_t stream_count();
   CaptureHubStatistics statistics();
-  hardware::IAudioCapture& device() { return device_; }
+  // (the source in use, which must exist; see source() when it can change)
+  hardware::IAudioCapture& device() { return *device_; }
 
  private:
   static void service_main(void* self);
 
-  hardware::IAudioCapture& device_;
+  hardware::IAudioCapture* device_ = nullptr;
+  SharedPointer<hardware::IAudioDevice> owner_;   // keeps the source's device alive
   allocators::IAllocator& allocator_;
-  kernel::Mutex mutex_;  // guards the stream list, the buffer and the statistics
+  mutable kernel::Mutex mutex_;  // guards the source, the stream list, the buffer and the statistics
   List<SharedPointer<CaptureStream>> streams_;
   ByteView chunk_;
   CaptureHubStatistics stats_;
+  uint8_t gain_ = hardware::kAudioMaxVolume;
+  bool muted_ = false;
   kernel::Thread* service_ = nullptr;
   bool stop_ = false;
 };

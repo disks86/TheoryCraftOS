@@ -22,6 +22,50 @@ namespace audio {
 
 using namespace hardware;
 
+bool AudioMixer::set_device(SharedPointer<IAudioDevice> device) {
+  if (!device) return false;
+  kernel::ScopedMutex guard(mutex_);
+  device->set_volume(volume_);
+  device->set_muted(muted_);
+  pending_bytes_ = 0;       // what was cut for the old device is lost
+  pending_offset_ = 0;
+  device_ = device.get();
+  owner_ = util::move(device);
+  return true;
+}
+
+IAudioDevice* AudioMixer::current_device() {
+  kernel::ScopedMutex guard(mutex_);
+  return device_;
+}
+
+SharedPointer<IAudioDevice> AudioMixer::shared_device() {
+  kernel::ScopedMutex guard(mutex_);
+  return owner_;
+}
+
+void AudioMixer::set_master_volume(uint8_t volume) {
+  kernel::ScopedMutex guard(mutex_);
+  device_->set_volume(volume);
+  volume_ = device_->volume();
+}
+
+uint8_t AudioMixer::master_volume() const {
+  kernel::ScopedMutex guard(mutex_);
+  return volume_;
+}
+
+void AudioMixer::set_master_muted(bool muted) {
+  kernel::ScopedMutex guard(mutex_);
+  device_->set_muted(muted);
+  muted_ = muted;
+}
+
+bool AudioMixer::master_muted() const {
+  kernel::ScopedMutex guard(mutex_);
+  return muted_;
+}
+
 bool AudioMixer::initialize() {
   accumulator_ = allocate_view<int32_t>(allocator_, uint64_t{kChunkFrames} * kAudioChannels, 16);
   output_ = allocate_view<uint8_t>(allocator_, uint64_t{kChunkFrames} * kAudioFrameSize, 16);
@@ -57,7 +101,7 @@ MixerStatistics AudioMixer::statistics() {
 // Offers the device what it did not take last time.
 void AudioMixer::flush_pending() {
   if (pending_bytes_ == 0) return;
-  const uint32_t taken = device_.write(ConstByteView(output_).subview(pending_offset_, pending_bytes_));
+  const uint32_t taken = device_->write(ConstByteView(output_).subview(pending_offset_, pending_bytes_));
   pending_offset_ += taken;
   pending_bytes_ -= taken;
 }
@@ -74,10 +118,10 @@ void AudioMixer::pump() {
   if (pending_bytes_ > 0) return;  // the device is still behind
 
   // How much to add: up to the target delay, and no more than the device has room for.
-  const uint32_t queued_frames = device_.queued_bytes() / kAudioFrameSize;
+  const uint32_t queued_frames = device_->queued_bytes() / kAudioFrameSize;
   if (queued_frames >= kTargetDelayFrames) return;
   uint32_t frames = kTargetDelayFrames - queued_frames;
-  const uint32_t room = device_.free_bytes() / kAudioFrameSize;
+  const uint32_t room = device_->free_bytes() / kAudioFrameSize;
   if (frames > room) frames = room;
   if (frames > kChunkFrames) frames = kChunkFrames;
   if (frames == 0) return;

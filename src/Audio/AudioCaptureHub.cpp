@@ -22,6 +22,53 @@ namespace audio {
 
 using namespace hardware;
 
+void AudioCaptureHub::set_source(IAudioCapture* source, SharedPointer<IAudioDevice> owner) {
+  kernel::ScopedMutex guard(mutex_);
+  if (source) {
+    source->set_gain(gain_);
+    source->set_muted(muted_);
+    source->flush();   // listeners hear the new source from now
+  }
+  device_ = source;
+  owner_ = source ? util::move(owner) : SharedPointer<IAudioDevice>();
+}
+
+IAudioCapture* AudioCaptureHub::source() {
+  kernel::ScopedMutex guard(mutex_);
+  return device_;
+}
+
+IAudioDevice* AudioCaptureHub::source_device() {
+  kernel::ScopedMutex guard(mutex_);
+  return owner_.get();
+}
+
+void AudioCaptureHub::set_master_gain(uint8_t gain) {
+  kernel::ScopedMutex guard(mutex_);
+  if (device_) {
+    device_->set_gain(gain);
+    gain_ = device_->gain();
+  } else {
+    gain_ = gain < kAudioMaxVolume ? gain : kAudioMaxVolume;
+  }
+}
+
+uint8_t AudioCaptureHub::master_gain() const {
+  kernel::ScopedMutex guard(mutex_);
+  return gain_;
+}
+
+void AudioCaptureHub::set_master_muted(bool muted) {
+  kernel::ScopedMutex guard(mutex_);
+  if (device_) device_->set_muted(muted);
+  muted_ = muted;
+}
+
+bool AudioCaptureHub::master_muted() const {
+  kernel::ScopedMutex guard(mutex_);
+  return muted_;
+}
+
 bool AudioCaptureHub::initialize() {
   chunk_ = allocate_view<uint8_t>(allocator_, uint64_t{kChunkFrames} * kAudioFrameSize, 16);
   return !chunk_.empty();
@@ -32,7 +79,7 @@ SharedPointer<CaptureStream> AudioCaptureHub::open_stream(const StreamFormat& fo
   if (streams_.count() >= kMaxStreams) return SharedPointer<CaptureStream>();
   SharedPointer<CaptureStream> stream = SharedPointer<CaptureStream>::make(allocator_, allocator_, format);
   if (!stream || !stream->allocate(ring_bytes)) return SharedPointer<CaptureStream>();
-  if (streams_.count() == 0) device_.flush();  // the first listener hears from now, not from earlier
+  if (streams_.count() == 0 && device_) device_->flush();  // the first listener hears from now, not from earlier
   if (!streams_.push_back(stream)) return SharedPointer<CaptureStream>();
   ++stats_.streams_opened;
   return stream;
@@ -56,11 +103,11 @@ void AudioCaptureHub::pump() {
   for (uint64_t i = streams_.count(); i > 0; --i)
     if (streams_[i - 1]->closed()) streams_.remove_at(i - 1);
   if (streams_.count() == 0) {
-    device_.flush();  // nobody is listening
+    if (device_) device_->flush();  // nobody is listening
     return;
   }
-  for (;;) {
-    const uint32_t bytes = device_.read(chunk_);
+  for (; device_;) {
+    const uint32_t bytes = device_->read(chunk_);
     if (bytes == 0) break;
     stats_.frames_distributed += bytes / kAudioFrameSize;
     const ConstByteView block = ConstByteView(chunk_).first(bytes);

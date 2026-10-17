@@ -41,6 +41,7 @@
 #include "Kernel/Thread.hpp"
 #include "Audio/AudioCaptureHub.hpp"
 #include "Audio/AudioMixer.hpp"
+#include "Audio/AudioRouter.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Camera/SystemCameras.hpp"
 #include "Hardware/Clock/TscClock.hpp"
@@ -398,7 +399,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The sound server: the first device belongs to the mixer, which every program's audio goes through.
   UniquePointer<audio::AudioMixer> mixer;
   if (audio.count() > 0) {
-    mixer = UniquePointer<audio::AudioMixer>::make(shared_allocator, *audio.at(0), shared_allocator);
+    mixer = UniquePointer<audio::AudioMixer>::make(shared_allocator, audio.share(0), shared_allocator);
     if (mixer && mixer->initialize() && mixer->start_service()) {
       Entry(Level::Ok, "Audio").text("mixer running (up to ").dec(audio::AudioMixer::kMaxStreams).text(" streams)");
 #ifdef TCOS_SELFTESTS
@@ -410,23 +411,38 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
   }
 
-  // The recording side: the first device with an input, shared by every program through the capture hub.
-  UniquePointer<audio::AudioCaptureHub> capture_hub;
-  for (uint32_t i = 0; i < audio.count() && !capture_hub; ++i) {
-    hardware::IAudioCapture* input = audio.at(i)->capture();
-    if (!input) continue;
-    capture_hub = UniquePointer<audio::AudioCaptureHub>::make(shared_allocator, *input, shared_allocator);
-    if (capture_hub && capture_hub->initialize() && capture_hub->start_service()) {
+  // The recording side: the first device with an input, shared by every program through the capture hub. The hub exists without one too:
+  // a USB microphone plugged in later is taken up by the audio router below.
+  UniquePointer<audio::AudioCaptureHub> capture_hub = UniquePointer<audio::AudioCaptureHub>::make(shared_allocator, shared_allocator);
+  if (capture_hub && capture_hub->initialize()) {
+    for (uint32_t i = 0; i < audio.count(); ++i) {
+      hardware::IAudioCapture* input = audio.at(i)->capture();
+      if (!input) continue;
+      capture_hub->set_source(input, audio.share(i));
       Entry(Level::Ok, "Audio").text("capture running: ").text(input->name());
+      break;
+    }
+    if (capture_hub->start_service()) {
 #ifdef TCOS_SELFTESTS
-      if (!run_capture_demo(*capture_hub)) console::puts("  capture self-check failed\n");
+      if (capture_hub->source() && !run_capture_demo(*capture_hub)) console::puts("  capture self-check failed\n");
 #endif
     } else {
       Entry(Level::Warning, "Audio").text("could not start capture");
       capture_hub.reset();
     }
+  } else {
+    Entry(Level::Warning, "Audio").text("could not start capture");
+    capture_hub.reset();
   }
-  if (!capture_hub) Entry(Level::Info, "Audio").text("no audio input");
+  if (!capture_hub || !capture_hub->source()) Entry(Level::Info, "Audio").text("no audio input");
+
+  // USB audio devices come and go: the router keeps the mixer and the capture hub pointed at the right ones.
+  audio::AudioRouter audio_router(audio, mixer.get(), capture_hub.get());
+  audio_router.set_notifier([](void*, StringView text) {
+    console::debug_puts(text);
+    console::debug_puts("\n");
+  }, nullptr);
+  if (!audio_router.start_service()) Entry(Level::Warning, "Audio").text("could not start audio hot-plug polling; USB audio devices plugged in later are not seen");
 
   // Cameras: USB video class devices. They are only found here; a program starts one and reads its pictures.
   hardware::SystemCameras cameras(usb, shared_allocator);
@@ -560,6 +576,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::use_gpu(gpu);
     console::puts("TheoryCraftOS: shutting down\n");
   }
+  audio_router.stop_service();   // (it points the mixer and the hub at devices)
   capture_hub.reset();
   mixer.reset();   // the mixer thread ends before its audio device goes
   cameras.stop_service();

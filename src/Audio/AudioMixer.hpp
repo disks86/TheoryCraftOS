@@ -47,7 +47,8 @@ struct MixerStatistics {
 // pump() from a thread every few milliseconds; without it, call pump() often.
 // When nothing is queued nothing is written, and the device plays silence.
 //
-// Master volume and mute go to the device. Thread safe.
+// Master volume and mute go to the device. The device can be exchanged while the mixer runs (set_device(): a USB headset was plugged in
+// or the one in use was pulled out): the streams carry on into the new device and the master volume and mute are applied to it. Thread safe.
 class AudioMixer {
  public:
   static constexpr uint32_t kMaxStreams = 32;
@@ -55,8 +56,12 @@ class AudioMixer {
   static constexpr uint32_t kChunkFrames = 1024;
   static constexpr uint32_t kPumpIntervalUs = 5000;
 
+  // The mixer plays into `device`, which must outlive it (and must not be one that is removed while the mixer runs: use the next constructor).
   AudioMixer(hardware::IAudioDevice& device, allocators::IAllocator& allocator)
-      : device_(device), allocator_(allocator), streams_(allocator) {}
+      : device_(&device), allocator_(allocator), streams_(allocator), volume_(device.volume()), muted_(device.muted()) {}
+  // The mixer shares the device, so it stays valid for as long as the mixer uses it.
+  AudioMixer(SharedPointer<hardware::IAudioDevice> device, allocators::IAllocator& allocator)
+      : device_(device.get()), owner_(device), allocator_(allocator), streams_(allocator), volume_(device->volume()), muted_(device->muted()) {}
   ~AudioMixer() {
     stop_service();
     release_view(allocator_, accumulator_);
@@ -80,28 +85,41 @@ class AudioMixer {
   void stop_service();
   bool service_running() const { return service_ != nullptr; }
 
-  void set_master_volume(uint8_t volume) { device_.set_volume(volume); }
-  uint8_t master_volume() const { return device_.volume(); }
-  void set_master_muted(bool muted) { device_.set_muted(muted); }
-  bool master_muted() const { return device_.muted(); }
+  // Switches to another device: what is queued for the old one is dropped (a few milliseconds), the streams are untouched, and the master
+  // volume and mute are set on the new device. False for a null device.
+  bool set_device(SharedPointer<hardware::IAudioDevice> device);
+  // The device now in use (null never; the pointer is only good until the next set_device()).
+  hardware::IAudioDevice* current_device();
+  // The same, kept alive for as long as the caller holds it (null if the mixer was bound to a device by reference). Use this to look at the device
+  // from another thread while devices may be exchanged.
+  SharedPointer<hardware::IAudioDevice> shared_device();
+
+  void set_master_volume(uint8_t volume);
+  uint8_t master_volume() const;
+  void set_master_muted(bool muted);
+  bool master_muted() const;
 
   uint32_t stream_count();
   MixerStatistics statistics();
-  hardware::IAudioDevice& device() { return device_; }
+  // (the device in use; see current_device() when it can change)
+  hardware::IAudioDevice& device() { return *device_; }
 
  private:
   static void service_main(void* self);
   void flush_pending();
 
-  hardware::IAudioDevice& device_;
+  hardware::IAudioDevice* device_;
+  SharedPointer<hardware::IAudioDevice> owner_;   // keeps the device alive when the mixer was given a shared one
   allocators::IAllocator& allocator_;
-  kernel::Mutex mutex_;  // guards the stream list, the buffers and the statistics
+  mutable kernel::Mutex mutex_;  // guards the device in use, the stream list, the buffers and the statistics
   List<SharedPointer<AudioStream>> streams_;
   ArrayView<int32_t> accumulator_;  // kChunkFrames stereo frames
   ByteView output_;                 // the same, as 16-bit samples
   uint32_t pending_offset_ = 0;     // part of output_ the device has not taken yet
   uint32_t pending_bytes_ = 0;
   MixerStatistics stats_;
+  uint8_t volume_;
+  bool muted_;
   kernel::Thread* service_ = nullptr;
   bool stop_ = false;
 };

@@ -122,6 +122,7 @@ add_executable(BOOTX64
   src/Audio/Resampler.cpp
   src/Audio/AudioStream.cpp
   src/Audio/AudioMixer.cpp
+  src/Audio/AudioRouter.cpp
   src/Audio/WavFile.cpp
   src/Audio/AudioPlayer.cpp
   src/Audio/CaptureStream.cpp

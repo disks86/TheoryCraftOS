@@ -126,7 +126,7 @@ int UsbAudioDevice::pick_stream(const UacDevice& model, bool input) {
 }
 
 UsbAudioDevice::UsbAudioDevice(IUsbHostController& host, uint32_t port, const UacDevice& model, const UsbDeviceDescriptor& descriptor, allocators::IAllocator& allocator)
-    : host_(host), port_(port), allocator_(allocator), model_(model), capture_(*this) {
+    : host_(host), port_(port), allocator_(allocator), model_(model), capture_(*this), generation_(host.port_generation(port)) {
   out_.stream = pick_stream(model_, false);
   in_.stream = pick_stream(model_, true);
   read_name(descriptor);
@@ -137,19 +137,22 @@ UsbAudioDevice::~UsbAudioDevice() { shutdown(); }
 void UsbAudioDevice::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<UniquePointer<UsbAudioDevice>>& out) {
   for (uint32_t c = 0; c < usb.controller_count(); ++c) {
     IUsbHostController* host = usb.host_controller(c);
-    if (!host || !host->supports_isochronous()) continue;
-    for (uint32_t port = 0; port < host->port_count(); ++port) {
-      UsbDeviceDescriptor descriptor;
-      uint8_t blob[2048];
-      uint16_t length = 0;
-      if (!host->device_descriptor(port, &descriptor) || !host->configuration_descriptor(port, ByteView(blob), &length)) continue;
-      UacDevice model;
-      if (!parse_uac_configuration(ConstByteView(blob).at_most(length), &model)) continue;
-      UniquePointer<UsbAudioDevice> device = UniquePointer<UsbAudioDevice>::make(allocator, *host, port, model, descriptor, allocator);
-      if (!device || (device->out_.stream < 0 && device->in_.stream < 0)) continue;
-      if (device->initialize()) out.push_back(util::move(device));   // (a device that does not come up has put the interfaces back already)
-    }
+    if (!host) continue;
+    for (uint32_t port = 0; port < host->port_count(); ++port) discover_port(*host, port, allocator, out);
   }
+}
+
+void UsbAudioDevice::discover_port(IUsbHostController& host, uint32_t port, allocators::IAllocator& allocator, List<UniquePointer<UsbAudioDevice>>& out) {
+  if (!host.supports_isochronous()) return;
+  UsbDeviceDescriptor descriptor;
+  uint8_t blob[2048];
+  uint16_t length = 0;
+  if (!host.device_descriptor(port, &descriptor) || !host.configuration_descriptor(port, ByteView(blob), &length)) return;
+  UacDevice model;
+  if (!parse_uac_configuration(ConstByteView(blob).at_most(length), &model)) return;
+  UniquePointer<UsbAudioDevice> device = UniquePointer<UsbAudioDevice>::make(allocator, host, port, model, descriptor, allocator);
+  if (!device || (device->out_.stream < 0 && device->in_.stream < 0)) return;
+  if (device->initialize()) out.push_back(util::move(device));   // (a device that does not come up has put the interfaces back already)
 }
 
 void UsbAudioDevice::read_name(const UsbDeviceDescriptor& d) {
@@ -209,8 +212,11 @@ bool UsbAudioDevice::initialize() {
 }
 
 void UsbAudioDevice::shutdown() {
+  // The recording side first: stop() waits for a read that is running on another thread, and nothing records after it.
   if (capture_started_) capture_.stop(allocator_);
   capture_started_ = false;
+  kernel::ScopedMutex guard(mutex_);   // then a write() or refresh() that is running on another thread is over
+  __atomic_store_n(&shut_down_, true, __ATOMIC_RELEASE);
   running_ = false;
   if (out_.running) tear_down(out_, false);
   if (in_.running) tear_down(in_, true);
@@ -393,7 +399,7 @@ void UsbAudioDevice::apply_input_gain() {
 // ------------------------------------------------------------------------------------------------ streaming
 
 void UsbAudioDevice::refresh() {
-  if (running_ && out_.running) pump_output();
+  if (running_ && out_.running && present()) pump_output();
 }
 
 void UsbAudioDevice::poll_feedback() {

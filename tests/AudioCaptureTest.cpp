@@ -241,7 +241,55 @@ static void test_capture_formats() {
   CHECK(wide->available_bytes() >= 4 * 398 && wide->available_bytes() <= 4 * 400);
 }
 
+// The source is exchanged, or taken away, while the hub runs.
+static void test_hub_source() {
+  TestAllocator a;
+  FakeInput one, two;
+  {
+    audio::AudioCaptureHub hub(a);
+    CHECK(hub.initialize());
+    CHECK(hub.source() == nullptr && hub.source_device() == nullptr && hub.master_gain() == 100 && !hub.master_muted());
+    int16_t pcm[100 * 2];
+    for (int i = 0; i < 200; ++i) pcm[i] = static_cast<int16_t>(1000 + i);
+    auto s = hub.open_stream(4096);
+    CHECK(s);
+    hub.pump();                      // no source: nothing happens
+    hub.set_master_gain(40);         // remembered for the source that comes
+    hub.set_master_muted(true);
+    CHECK(hub.master_gain() == 40 && hub.master_muted());
+
+    hub.set_source(&one, SharedPointer<IAudioDevice>());
+    CHECK(hub.source() == &one && one.level == 40 && one.mute && one.flushes >= 1);
+    one.add(pcm, 100);
+    hub.pump();
+    uint8_t out[400];
+    CHECK(s->available_bytes() == 400 && s->read(ByteView(out, 400)) == 400 && memcmp(out, pcm, 400) == 0);
+
+    two.level = 90;
+    hub.set_source(&two, SharedPointer<IAudioDevice>());   // the first one is left alone from now on
+    CHECK(hub.source() == &two && two.level == 40 && two.mute);
+    one.add(pcm, 100);
+    two.add(pcm, 50);
+    hub.pump();
+    CHECK(s->available_bytes() == 200 && one.length == 400);
+    s->flush();
+
+    hub.set_master_gain(70);
+    CHECK(two.level == 70 && one.level == 40 && hub.master_gain() == 70);
+    hub.set_source(nullptr, SharedPointer<IAudioDevice>());
+    CHECK(hub.source() == nullptr);
+    two.add(pcm, 100);
+    hub.pump();                      // nothing to record from: the stream stays open and quiet
+    CHECK(s->available_bytes() == 0 && hub.stream_count() == 1 && two.length == 400);
+    hub.set_master_gain(20);
+    hub.set_source(&one, SharedPointer<IAudioDevice>());
+    CHECK(one.level == 20);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_hub_source();
   test_ring();
   test_software_input();
   test_hub();

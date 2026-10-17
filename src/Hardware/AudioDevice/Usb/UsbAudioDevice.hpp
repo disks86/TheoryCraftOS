@@ -62,6 +62,8 @@ class UsbAudioDevice final : public RingAudioDevice {
 
   // Looks at every device on every host controller that can do isochronous transfers and brings up the audio ones; `out` gets them in bus order.
   static void discover(IUsbBus& usb, allocators::IAllocator& allocator, List<UniquePointer<UsbAudioDevice>>& out);
+  // The same for the one device on a root port (a headset that was just plugged in).
+  static void discover_port(IUsbHostController& host, uint32_t port, allocators::IAllocator& allocator, List<UniquePointer<UsbAudioDevice>>& out);
 
   UsbAudioDevice(IUsbHostController& host, uint32_t port, const UacDevice& model, const UsbDeviceDescriptor& descriptor, allocators::IAllocator& allocator);
   ~UsbAudioDevice();
@@ -71,7 +73,9 @@ class UsbAudioDevice final : public RingAudioDevice {
   void shutdown() override;
   IAudioCapture* capture() override { return capture_started_ ? &capture_ : nullptr; }
 
-  bool has_output() const { return out_.running; }
+  // False once the device was unplugged (the port's generation moved on) or shut down; everything it was doing has stopped by then.
+  bool present() const override { return !__atomic_load_n(&shut_down_, __ATOMIC_ACQUIRE) && host_.port_generation(port_) == generation_; }
+  bool has_output() const override { return out_.running; }
   bool has_input() const { return in_.running; }
 
  private:
@@ -127,6 +131,8 @@ class UsbAudioDevice final : public RingAudioDevice {
   UsbAudioCapture capture_;
   bool capture_started_ = false;
   bool configured_ = false;
+  uint32_t generation_ = 0;         // the port's generation when the device was taken over
+  bool shut_down_ = false;
   char name_[64] = "USB audio";
 };
 

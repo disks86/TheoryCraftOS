@@ -119,6 +119,17 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   count as played when queued (about 24 ms early), and the mixer must call at least every ~20 ms (its 5 ms pump does).
   `tests/UsbAudioTest.cpp` covers it against a fake controller and fake UAC1/UAC2 devices; the xHCI isochronous path, the
   feedback loop and the real timing have not been run on hardware or QEMU.
+  USB audio hot-plug: `SystemAudioDevices::poll()` finds headsets, DACs and microphones plugged in later (through `UsbPortWatcher`, like
+  storage and input) and drops those pulled out (`UsbAudioDevice::present()` follows the port's generation; its `shutdown()` waits for
+  a write or read running on another thread). Devices are shared pointers; when the last device that plays sound goes, the software
+  fallback is brought up. `audio::AudioRouter` (service thread "audio-hotplug", 250 ms) keeps the sound server on the right devices:
+  a newly plugged output becomes the mixer's device (`AudioMixer::set_device()`), when the mixer's device leaves it moves to the first
+  other hardware output, else the fallback; the capture hub follows the same rules for microphones (`AudioCaptureHub::set_source()`,
+  which also accepts no source - the hub now exists even without a microphone). Streams stay open throughout, the master volume and mute
+  are applied to the new device, and what was cut for the old one (a few ms) is dropped. Limits: xHCI only, no hubs, a policy of
+  "newest device wins" with no per-program routing or remembered preferences, no sample-rate conversion (as before), and audio
+  playing to a device that is pulled out is lost rather than re-queued. `tests/AudioHotplugTest.cpp` covers the logic against a fake
+  four-port controller; `tests/AudioHotplugThreadTest.cpp` runs it with real threads under ThreadSanitizer.
 - `src/Audio/`: the sound server. Audio hardware plays one stream, so `AudioMixer` owns the device (the first one
   `SystemAudioDevices` found) and any number of programs mix through it: `open_stream()` gives an `AudioStream`
   (a 32 KiB ring in the fixed format, own volume and mute, `write()` never blocks, `close()` when done). `pump()` keeps

@@ -242,8 +242,55 @@ static void test_formats_and_pan() {
   CHECK(slow->queued_bytes() >= taken - 8);
 }
 
+// The device is exchanged while the mixer runs: the streams carry on, the master volume and mute go along, what was cut for the old device is dropped.
+static void test_set_device() {
+  TestAllocator a;
+  {
+    FakeDevice first;
+    audio::AudioMixer mixer(first, a);
+    CHECK(mixer.initialize());
+    CHECK(mixer.master_volume() == 80 && !mixer.master_muted() && mixer.current_device() == &first);
+    mixer.set_master_volume(30);
+    mixer.set_master_muted(true);
+    CHECK(first.vol == 30 && first.mute && mixer.master_volume() == 30 && mixer.master_muted());
+    auto s = mixer.open_stream(4096);
+    int16_t pcm[100 * 2];
+    s->write(ConstByteView((uint8_t*)pcm, constant_frames(pcm, 100, 1000)));
+    mixer.pump();
+    CHECK(first.recorded == 400);
+
+    CHECK(!mixer.set_device(SharedPointer<IAudioDevice>()) && mixer.current_device() == &first);
+    SharedPointer<IAudioDevice> second = SharedPointer<IAudioDevice>::make_as<FakeDevice>(a);
+    FakeDevice* d2 = static_cast<FakeDevice*>(second.get());
+    CHECK(mixer.set_device(second));
+    CHECK(mixer.current_device() == d2 && d2->vol == 30 && d2->mute && mixer.master_volume() == 30 && mixer.master_muted());
+    s->write(ConstByteView((uint8_t*)pcm, constant_frames(pcm, 50, 2000)));   // the stream is the same one, the audio goes to the new device
+    mixer.pump();
+    CHECK(d2->recorded == 200 && first.recorded == 400 && d2->samples[0] == 2000);
+    mixer.set_master_volume(55);
+    CHECK(d2->vol == 55 && first.vol == 30);
+
+    // A device that did not take everything: what is left is dropped with it
+    d2->accept_limit = 0;
+    s->write(ConstByteView((uint8_t*)pcm, constant_frames(pcm, 50, 3000)));
+    mixer.pump();
+    CHECK(d2->recorded == 200);
+    SharedPointer<IAudioDevice> third = SharedPointer<IAudioDevice>::make_as<FakeDevice>(a);
+    FakeDevice* d3 = static_cast<FakeDevice*>(third.get());
+    second.reset();
+    CHECK(mixer.set_device(third));
+    third.reset();
+    s->write(ConstByteView((uint8_t*)pcm, constant_frames(pcm, 10, 4000)));
+    mixer.pump();
+    CHECK(d3->recorded == 40 && d3->samples[0] == 4000 && d3->vol == 55);
+    CHECK(mixer.stream_count() == 1);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_single_stream();
+  test_set_device();
   test_mixing_and_clipping();
   test_close_and_limits();
   test_device_pressure();

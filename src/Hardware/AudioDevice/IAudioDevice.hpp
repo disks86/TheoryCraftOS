@@ -43,6 +43,12 @@ class IAudioDevice : public IHardware {
   // Bytes write() would accept right now.
   virtual uint32_t free_bytes() = 0;
 
+  // False once the device is gone (a USB headset that was pulled out): it then plays and records nothing. Devices that cannot be removed
+  // are always present.
+  virtual bool present() const { return true; }
+  // Whether this plays sound at all (a USB microphone does not; it only has capture()).
+  virtual bool has_output() const { return true; }
+
   // 0 (silent) .. kAudioMaxVolume. Mute keeps the volume setting.
   virtual void set_volume(uint8_t volume) = 0;
   virtual uint8_t volume() const = 0;
