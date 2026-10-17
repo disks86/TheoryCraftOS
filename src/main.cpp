@@ -42,6 +42,7 @@
 #include "Audio/AudioCaptureHub.hpp"
 #include "Audio/AudioMixer.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
+#include "Hardware/Camera/SystemCameras.hpp"
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Media/MediaCodecs.hpp"
@@ -404,6 +405,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
   }
   if (!capture_hub) Entry(Level::Info, "Audio").text("no audio input");
+
+  // Cameras: USB video class devices. They are only found here; a program starts one and reads its pictures.
+  hardware::SystemCameras cameras(usb, shared_allocator);
+  cameras.initialize();
+  for (uint32_t i = 0; i < cameras.count(); ++i) Entry(Level::Ok, "Camera").text(cameras.at(i)->name()).text(", ").dec(cameras.at(i)->mode_count()).text(" modes");
+  if (cameras.count() == 0) Entry(Level::Info, "Camera").text("no camera");
+  else if (!cameras.start_service()) Entry(Level::Warning, "Camera").text("could not start the camera service");
 #ifdef TCOS_SELFTESTS
   UniquePointer<NetworkStackDemo> stack_demo;
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
@@ -523,6 +531,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   capture_hub.reset();
   mixer.reset();   // the mixer thread ends before its audio device goes
+  cameras.stop_service();
   stacks.clear();  // the stacks go before the NICs underneath them
 #ifdef TCOS_SELFTESTS
   stack_demo.reset();
@@ -539,6 +548,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   storage.shutdown();
   Entry(Level::Ok, "Shutdown").text("storage flushed and released");
   audio.shutdown();
+  cameras.shutdown();
   video_codecs.shutdown();
   network.shutdown();
   printers.shutdown();

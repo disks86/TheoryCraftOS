@@ -136,6 +136,10 @@ add_executable(BOOTX64
   src/Hardware/AudioDevice/Virtio/VirtioSoundDevice.cpp
   src/Hardware/AudioDevice/Usb/UsbAudioDescriptors.cpp
   src/Hardware/AudioDevice/Usb/UsbAudioDevice.cpp
+  src/Hardware/Camera/SystemCameras.cpp
+  src/Hardware/Camera/Usb/UvcDescriptors.cpp
+  src/Hardware/Camera/Usb/UvcMjpeg.cpp
+  src/Hardware/Camera/Usb/UvcCamera.cpp
   src/Hardware/NetworkInterface/SystemNetworkInterfaces.cpp
   src/Hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
   src/Hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp

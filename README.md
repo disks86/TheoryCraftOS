@@ -132,6 +132,20 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   B pyramids, weighted prediction, both direct modes, 8x8 transform, quantisation matrices, slices, constrained intra, noise at
   QP 8, odd sizes, open GOP, intra refresh) and on OpenH264 streams (long-term references, reordering), and fuzzed under ASAN/UBSAN.
   `tests/VideoCodecTest.cpp` includes a fuzz run of the JPEG decoder under ASAN/UBSAN.
+- `src/Hardware/Camera/`: cameras. `ICamera` (polled: `start(width, height, fps)` or `start_mode()`, `pump()` services the hardware, `read_frame()`
+  copies the newest unread picture into a `VideoFrameBuffer` in any pixel format; brightness, contrast, saturation and sharpness as 0..100)
+  and `SystemCameras` (finds the cameras; `start_service()` runs `pump()` every 4 ms from the "camera" thread, which `main` starts when a camera
+  is present - cameras are found at boot but only start streaming when a program asks). `Usb/UvcCamera` drives USB video class 1.0/1.1/1.5
+  devices on xHCI: `UvcDescriptors` reads the formats (Motion JPEG; uncompressed YUY2, UYVY, NV12, I420), frames and rates and the alternate
+  settings; `start_mode()` does the probe/commit negotiation, picks the smallest alternate setting that carries the payload and collects the
+  isochronous payloads into pictures (frame ID, end-of-frame and error bits; a stream is joined at the next picture boundary). Pictures are
+  decoded when read: JPEG through the software decoder (`UvcMjpeg` supplies the standard Huffman tables that most cameras leave out), packed
+  YUV converted. Limits: xHCI only (isochronous API shared with USB audio), no hubs and no hot-plug, no bulk-streaming cameras and no
+  high-bandwidth alternate settings (so a camera whose uncompressed or large formats need more than one transaction per interval offers
+  only the modes that fit, usually Motion JPEG), no H.264/frame-based formats, no still capture, no pan/tilt/zoom or exposure controls, a
+  new picture replaces an unread one, and `pump()` must run at least every ~10 ms at high speed. `tests/UvcTest.cpp` covers it against a fake
+  controller and fake cameras (descriptor fuzzing under ASAN/UBSAN, assembly with lost and damaged payloads, MJPEG and YUV pictures); it has
+  not been run with a real camera, on QEMU, or on the real xHCI isochronous path.
 - `src/Hardware/Printer/`: printing. `IPrinter` (polled, never blocks: `submit(job bytes)` queues, `poll()` delivers; `PrinterInfo` says
   languages, resolution, paper sizes, margins) with `NetworkPrinter` for a printer with its own print server: jobs go over raw TCP
   port 9100 (`RawSocketTransport`) or LPD port 515 (`LpdTransport`, RFC 1179, queue name configurable), eight jobs deep, a failed
