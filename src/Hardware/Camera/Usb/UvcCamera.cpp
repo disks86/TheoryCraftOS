@@ -51,23 +51,27 @@ const ControlInfo kControls[kCameraControlCount] = {
 void UvcCamera::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<UniquePointer<UvcCamera>>& out) {
   for (uint32_t c = 0; c < usb.controller_count(); ++c) {
     IUsbHostController* host = usb.host_controller(c);
-    if (!host || !host->supports_isochronous()) continue;
-    for (uint32_t port = 0; port < host->port_count(); ++port) {
-      UsbDeviceDescriptor descriptor;
-      uint8_t blob[2048];
-      uint16_t length = 0;
-      if (!host->device_descriptor(port, &descriptor) || !host->configuration_descriptor(port, ByteView(blob), &length)) continue;
-      UvcDevice model;
-      if (!parse_uvc_configuration(ConstByteView(blob).at_most(length), &model) || model.stream.alternate_count == 0) continue;
-      UniquePointer<UvcCamera> camera = UniquePointer<UvcCamera>::make(allocator, *host, port, model, descriptor, allocator);
-      if (!camera || camera->mode_count() == 0) continue;
-      if (camera->initialize()) out.push_back(util::move(camera));
-    }
+    if (!host) continue;
+    for (uint32_t port = 0; port < host->port_count(); ++port) discover_port(*host, port, allocator, out);
   }
+}
+
+void UvcCamera::discover_port(IUsbHostController& host, uint32_t port, allocators::IAllocator& allocator, List<UniquePointer<UvcCamera>>& out) {
+  if (!host.supports_isochronous()) return;
+  UsbDeviceDescriptor descriptor;
+  uint8_t blob[2048];
+  uint16_t length = 0;
+  if (!host.device_descriptor(port, &descriptor) || !host.configuration_descriptor(port, ByteView(blob), &length)) return;
+  UvcDevice model;
+  if (!parse_uvc_configuration(ConstByteView(blob).at_most(length), &model) || model.stream.alternate_count == 0) return;
+  UniquePointer<UvcCamera> camera = UniquePointer<UvcCamera>::make(allocator, host, port, model, descriptor, allocator);
+  if (!camera || camera->mode_count() == 0) return;
+  if (camera->initialize()) out.push_back(util::move(camera));
 }
 
 UvcCamera::UvcCamera(IUsbHostController& host, uint32_t port, const UvcDevice& model, const UsbDeviceDescriptor& descriptor, allocators::IAllocator& allocator)
     : host_(host), port_(port), allocator_(allocator), model_(model), jpeg_(allocator) {
+  generation_ = host.port_generation(port);
   build_modes();
   read_name(descriptor);
 }
@@ -164,6 +168,11 @@ uint32_t UvcCamera::raw_frame_bytes(const Mode& mode) const {
   return static_cast<uint32_t>(f.frame_bytes());
 }
 
+bool UvcCamera::limited_range() const {
+  kernel::ScopedMutex guard(mutex_);
+  return active_ >= 0 && modes_[active_].kind != UvcFormatKind::Mjpeg;
+}
+
 VideoFormat UvcCamera::frame_format() const {
   kernel::ScopedMutex guard(mutex_);
   return streaming_ ? format_ : VideoFormat{0, 0, PixelFormat::Bgra8888};
@@ -178,14 +187,15 @@ CameraStatistics UvcCamera::statistics() const {
 
 bool UvcCamera::initialize() {
   if (!host_.set_configuration(port_, model_.configuration)) return false;
-  configured_ = true;
+  __atomic_store_n(&configured_, true, __ATOMIC_RELEASE);
   find_controls();
   return true;
 }
 
 void UvcCamera::shutdown() {
-  stop();
-  configured_ = false;
+  stop();   // (waits for a read_frame() running on another thread)
+  __atomic_store_n(&shut_down_, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&configured_, false, __ATOMIC_RELEASE);
 }
 
 bool UvcCamera::control_get(uint8_t request, uint8_t selector, uint16_t index, ByteView out) {
@@ -263,10 +273,10 @@ bool UvcCamera::start(uint32_t width, uint32_t height, uint32_t fps) {
 }
 
 bool UvcCamera::start_mode(uint32_t index) {
-  if (index >= mode_count_ || !configured_) return false;
-  stop();
+  if (index >= mode_count_ || !__atomic_load_n(&configured_, __ATOMIC_ACQUIRE) || !present()) return false;
   kernel::ScopedMutex read_guard(read_mutex_);
   kernel::ScopedMutex guard(mutex_);
+  stop_locked();   // (under the same locks: two programs starting the camera at once must not both set it up)
   const Mode& mode = modes_[index];
   const UvcStream& stream = model_.stream;
   const uint16_t interface = stream.interface;
@@ -349,7 +359,7 @@ bool UvcCamera::start_mode(uint32_t index) {
   synced_ = false;
   finished_ = true;
   frame_error_ = false;
-  streaming_ = true;
+  __atomic_store_n(&streaming_, true, __ATOMIC_RELEASE);
   return true;
 }
 
@@ -363,7 +373,7 @@ void UvcCamera::stop_locked() {
   if (!streaming_) return;
   host_.control_out(port_, 0x01, kSetInterface, 0, model_.stream.interface);   // back to the setting without bandwidth
   host_.stop_iso_endpoint(port_, alternate_.endpoint);
-  streaming_ = false;
+  __atomic_store_n(&streaming_, false, __ATOMIC_RELEASE);
   active_ = -1;
   release_buffers();
 }
@@ -381,7 +391,7 @@ void UvcCamera::release_buffers() {
 
 void UvcCamera::pump() {
   kernel::ScopedMutex guard(mutex_);
-  if (!streaming_) return;
+  if (!streaming_ || !present()) return;
   uint8_t packet[1024];
   uint16_t length = 0;
   for (uint32_t guard_count = 0; guard_count < 1024 && host_.iso_receive(port_, alternate_.endpoint, ByteView(packet), &length); ++guard_count) {

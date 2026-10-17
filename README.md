@@ -182,6 +182,16 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   new picture replaces an unread one, and `pump()` must run at least every ~10 ms at high speed. `tests/UvcTest.cpp` covers it against a fake
   controller and fake cameras (descriptor fuzzing under ASAN/UBSAN, assembly with lost and damaged payloads, MJPEG and YUV pictures); it has
   not been run with a real camera, on QEMU, or on the real xHCI isochronous path.
+  USB camera hot-plug: `SystemCameras::poll()` finds cameras plugged in after start-up (through `UsbPortWatcher`, like storage, input, audio and
+  printers) and drops those pulled out; `UvcCamera::present()` follows the port's generation, `pump()`, `start()` and `start_mode()` do nothing
+  for a camera that left, and a stream running when it left stops (the event says `was_streaming`). The list holds shared pointers (`share()`;
+  `at()` is only good while the camera stays), so a program that keeps a camera sees `present()` turn false and `read_frame()` return false
+  instead of touching freed memory; a port that gets another camera never passes the old camera's stream on. The "camera" service thread
+  pumps every 4 ms and checks for changes every 250 ms and `main` now always starts it (a camera plugged in later is taken up); each change
+  goes to the debug console. Limits: xHCI only, no hubs, a program using a camera that leaves has to notice (nothing is pushed to it), and the
+  pictures not yet read are lost with it. `tests/CameraHotplugTest.cpp` (fake four-port controller with fake cameras, including one pulled out
+  while streaming) and, under ThreadSanitizer, `tests/CameraHotplugThreadTest.cpp` cover it. The thread test found two real races (an unlocked
+  streaming flag and two programs starting the same camera at once, which leaked its buffers), both fixed.
 - `src/Hardware/Printer/`: printing. `IPrinter` (polled, never blocks: `submit(job bytes)` queues, `poll()` delivers; `PrinterInfo` says
   languages, resolution, paper sizes, margins) with `NetworkPrinter` for a printer with its own print server: jobs go over raw TCP
   port 9100 (`RawSocketTransport`) or LPD port 515 (`LpdTransport`, RFC 1179, queue name configurable), eight jobs deep, a failed

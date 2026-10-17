@@ -450,7 +450,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   cameras.initialize();
   for (uint32_t i = 0; i < cameras.count(); ++i) Entry(Level::Ok, "Camera").text(cameras.at(i)->name()).text(", ").dec(cameras.at(i)->mode_count()).text(" modes");
   if (cameras.count() == 0) Entry(Level::Info, "Camera").text("no camera");
-  else if (!cameras.start_service()) Entry(Level::Warning, "Camera").text("could not start the camera service");
+  // The service pumps the cameras that stream and notices cameras plugged in or pulled out later.
+  if (!cameras.start_service([](void*, StringView text) {
+        console::debug_puts("Camera: ");
+        console::debug_puts(text);
+        console::debug_puts("\n");
+      }, nullptr))
+    Entry(Level::Warning, "Camera").text("could not start the camera service; USB cameras plugged in later are not seen");
 #ifdef TCOS_SELFTESTS
   UniquePointer<NetworkStackDemo> stack_demo;
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");

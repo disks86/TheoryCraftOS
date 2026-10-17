@@ -43,11 +43,15 @@ class UvcCamera final : public ICamera {
 
   // Looks at every device on every host controller that can do isochronous transfers and keeps the cameras (not yet streaming).
   static void discover(IUsbBus& usb, allocators::IAllocator& allocator, List<UniquePointer<UvcCamera>>& out);
+  // The same for the one device on a root port (a camera that was just plugged in).
+  static void discover_port(IUsbHostController& host, uint32_t port, allocators::IAllocator& allocator, List<UniquePointer<UvcCamera>>& out);
 
   UvcCamera(IUsbHostController& host, uint32_t port, const UvcDevice& model, const UsbDeviceDescriptor& descriptor, allocators::IAllocator& allocator);
   ~UvcCamera();
 
   const char* name() const override { return name_; }
+  // False once the camera was unplugged (the port's generation moved on) or shut down: nothing streams then and start() fails.
+  bool present() const override { return !__atomic_load_n(&shut_down_, __ATOMIC_ACQUIRE) && host_.port_generation(port_) == generation_; }
   bool initialize() override;
   void shutdown() override;
 
@@ -56,9 +60,9 @@ class UvcCamera final : public ICamera {
   bool start_mode(uint32_t index) override;
   bool start(uint32_t width, uint32_t height, uint32_t fps) override;
   void stop() override;
-  bool streaming() const override { return streaming_; }
+  bool streaming() const override { return __atomic_load_n(&streaming_, __ATOMIC_ACQUIRE); }
   VideoFormat frame_format() const override;
-  bool limited_range() const override { return active_ >= 0 && modes_[active_].kind != UvcFormatKind::Mjpeg; }
+  bool limited_range() const override;
   void pump() override;
   bool read_frame(const VideoFrameBuffer& out) override;
 
@@ -103,6 +107,8 @@ class UvcCamera final : public ICamera {
   uint32_t mode_count_ = 0;
   Control controls_[kCameraControlCount];
   bool configured_ = false;
+  uint32_t generation_ = 0;        // the port's generation when the camera was taken over
+  bool shut_down_ = false;
 
   mutable kernel::Mutex mutex_;       // the streaming state and the buffers' roles
   kernel::Mutex read_mutex_;          // one reader at a time

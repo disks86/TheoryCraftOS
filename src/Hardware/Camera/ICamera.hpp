@@ -46,6 +46,10 @@ struct CameraStatistics {
 
 class ICamera : public IHardware {
  public:
+  // False once the camera is gone (a USB camera that was unplugged): it then streams nothing and start() fails. Cameras that cannot be removed
+  // are always present.
+  virtual bool present() const { return true; }
+
   virtual uint32_t mode_count() const = 0;
   virtual bool mode(uint32_t index, CameraMode* out) const = 0;
 
