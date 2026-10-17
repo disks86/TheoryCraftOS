@@ -37,15 +37,22 @@ void UsbPrinter::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<
   for (uint32_t c = 0; c < usb.controller_count(); ++c) {
     IUsbHostController* host = usb.host_controller(c);
     if (!host) continue;
-    for (uint32_t port = 0; port < host->port_count(); ++port) {
+    for (uint32_t port = 0; port < host->port_count(); ++port) discover_port(*host, port, allocator, out);
+  }
+}
+
+void UsbPrinter::discover_port(IUsbHostController& host_controller, uint32_t port, allocators::IAllocator& allocator, List<UniquePointer<IPrinter>>& out) {
+  IUsbHostController* host = &host_controller;
+  {
+    {
       uint8_t blob[512];
       uint16_t length = 0;
-      if (!host->configuration_descriptor(port, ByteView(blob), &length)) continue;
+      if (!host->configuration_descriptor(port, ByteView(blob), &length)) return;
       const ConstByteView config = ConstByteView(blob).at_most(length);
       UsbDescriptorWalker walker(config);
       ConstByteView descriptor;
       UsbConfigurationInfo configuration;
-      if (!walker.next(&descriptor) || !parse_usb_configuration(descriptor, &configuration)) continue;
+      if (!walker.next(&descriptor) || !parse_usb_configuration(descriptor, &configuration)) return;
 
       // Every printer-class interface setting with its bulk endpoints.
       struct Candidate {
@@ -107,6 +114,7 @@ void UsbPrinter::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<
 }
 
 bool UsbPrinter::initialize() {
+  kernel::ScopedMutex guard(mutex_);
   if (started_) return true;
   wire_ = allocate_dma_view<uint8_t>(allocator_, 2 * kChunk, 65536);
   if (wire_.empty()) return false;
@@ -128,6 +136,7 @@ bool UsbPrinter::initialize() {
     }
   }
   started_ = true;
+  __atomic_store_n(&running_, true, __ATOMIC_RELEASE);
   read_identity();  // a printer that will not say who it is still prints
   return true;
 }
@@ -175,8 +184,11 @@ bool UsbPrinter::read_identity() {
 }
 
 void UsbPrinter::shutdown() {
+  kernel::ScopedMutex guard(mutex_);   // a poll() or submit() running on another thread is over first
   if (!started_) return;
-  cancel_all();
+  __atomic_store_n(&running_, false, __ATOMIC_RELEASE);
+  if (host_.port_generation(port_) != generation_) fail_all();   // unplugged: whatever was still queued did not print
+  else cancel_all_locked();
   if (dot4_) {
     dot4_->close();
     dot4_.reset();
@@ -186,7 +198,8 @@ void UsbPrinter::shutdown() {
 }
 
 bool UsbPrinter::submit(ConstByteView job, const char*) {
-  if (!started_ || count_ >= kQueueDepth || job.empty()) return false;
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_ || !present() || count_ >= kQueueDepth || job.empty()) return false;
   UniquePointer<Job> entry = UniquePointer<Job>::make(allocator_, allocator_);
   if (!entry || !entry->data.append(job)) return false;
   queue_[(head_ + count_) % kQueueDepth] = util::move(entry);
@@ -208,8 +221,16 @@ void UsbPrinter::recover() {
   host_.control_out(port_, kEndpointOut, kClearFeature, kFeatureEndpointHalt, ep_.out_endpoint);
 }
 
+void UsbPrinter::fail_all() {
+  if (count_ > 0) {
+    stats_.jobs_failed += count_;
+    last_failed_ = true;
+  }
+  cancel_all_locked();
+}
+
 void UsbPrinter::fail_front() {
-  soft_reset();
+  soft_reset_locked();
   ++stats_.jobs_failed;
   last_failed_ = true;
   queue_[head_].reset();
@@ -218,7 +239,9 @@ void UsbPrinter::fail_front() {
 }
 
 void UsbPrinter::poll() {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || count_ == 0) return;
+  if (!present()) return;   // pulled out with a job queued: nothing can be sent; shutdown() (when the removal is noticed) counts the job as lost
   Job& job = *queue_[head_];
   const uint64_t left = job.data.size() - job.sent;
   uint32_t per_call = kChunk;
@@ -264,12 +287,22 @@ void UsbPrinter::poll() {
   }
 }
 
-void UsbPrinter::cancel_all() {
+void UsbPrinter::cancel_all_locked() {
   for (UniquePointer<Job>& j : queue_) j.reset();
   head_ = count_ = 0;
 }
 
+void UsbPrinter::cancel_all() {
+  kernel::ScopedMutex guard(mutex_);
+  cancel_all_locked();
+}
+
 bool UsbPrinter::read_status(UsbPrinterStatus* status) {
+  kernel::ScopedMutex guard(mutex_);
+  return read_status_locked(status);
+}
+
+bool UsbPrinter::read_status_locked(UsbPrinterStatus* status) {
   if (!started_) return false;
   ByteView b = wire_.first(8);
   b.fill(0);
@@ -281,8 +314,9 @@ bool UsbPrinter::read_status(UsbPrinterStatus* status) {
 }
 
 bool UsbPrinter::request_report() {
+  kernel::ScopedMutex guard(mutex_);
   UsbPrinterStatus st;
-  if (!read_status(&st)) return false;
+  if (!read_status_locked(&st)) return false;
   report_ = PrinterReport();
   if (st.paper_empty) report_.errors = static_cast<uint16_t>(report_.errors | kErrorNoPaper);
   if (!st.selected) report_.errors = static_cast<uint16_t>(report_.errors | kErrorOffline);
@@ -296,6 +330,7 @@ bool UsbPrinter::request_report() {
 }
 
 bool UsbPrinter::read_back(ByteView out, uint32_t* length) {
+  kernel::ScopedMutex guard(mutex_);
   if (!started_ || !ep_.in_endpoint) return false;
   if (dot4_) return dot4_->receive(out, length);
   const uint32_t want = out.size() < kChunk ? static_cast<uint32_t>(out.size()) : kChunk;
@@ -308,6 +343,11 @@ bool UsbPrinter::read_back(ByteView out, uint32_t* length) {
 }
 
 bool UsbPrinter::soft_reset() {
+  kernel::ScopedMutex guard(mutex_);
+  return soft_reset_locked();
+}
+
+bool UsbPrinter::soft_reset_locked() {
   if (!started_) return false;
   return host_.control_out(port_, kClassInterfaceOut, kSoftReset, 0, ep_.interface_number);
 }

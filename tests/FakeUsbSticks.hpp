@@ -126,6 +126,11 @@ struct FakeStickHost final : IUsbHostController {
     int hid = 0;
     std::vector<Bytes> reports;      // what the device has sent and the host has not read yet
     bool fail_start = false;         // the interrupt endpoint cannot be set up
+    // A printer (hid == 5): a bidirectional USB printer interface. Everything sent to it lands in `printed`.
+    std::string device_id = "MFG:Brother;CMD:PJL,PCL;MDL:HL-2070N series;CLS:PRINTER;";
+    uint8_t port_status = 0x18;      // selected, no error
+    Bytes printed;
+    int fail_out = 0;                // bulk OUT transfers still to fail
   };
   static constexpr uint32_t kPorts = 4;
   Stick* sticks[kPorts] = {};
@@ -165,6 +170,10 @@ struct FakeStickHost final : IUsbHostController {
       put({9, 4, 0, 0, 1, 3, 0, 0, 0});
       put({9, 0x21, 0x11, 0x01, 0, 1, 0x22, static_cast<uint8_t>(sizeof(kTabletDescriptor)), 0});
       put({7, 5, 0x81, 3, 8, 0, 4});
+    } else if (hid == 5) {   // printer, bidirectional
+      put({9, 4, 0, 0, 2, 7, 1, 2, 0});
+      put({7, 5, 0x01, 2, 0x00, 0x02, 0});
+      put({7, 5, 0x82, 2, 0x00, 0x02, 0});
     } else if (hid == 4) {   // vendor specific
       put({9, 4, 0, 0, 1, 0xFF, 0, 0, 0});
       put({7, 5, 0x81, 3, 8, 0, 10});
@@ -186,7 +195,21 @@ struct FakeStickHost final : IUsbHostController {
   bool control_out(uint32_t port, uint8_t, uint8_t, uint16_t, uint16_t) override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts && sticks[port]; }
   bool control_in(uint32_t port, uint8_t, uint8_t request, uint16_t value, uint16_t, ByteView buffer) override {   // (no GET_MAX_LUN: a stall)
     std::lock_guard<std::recursive_mutex> g(m);
-    if (port >= kPorts || !sticks[port] || sticks[port]->hid != 3 || request != 6 || value != 0x2200) return false;
+    if (port >= kPorts || !sticks[port]) return false;
+    Stick& s = *sticks[port];
+    if (s.hid == 5) {   // printer class requests
+      memset(buffer.data(), 0, buffer.size());
+      if (request == 0) {   // GET_DEVICE_ID: big-endian length (counting itself), then the text
+        const size_t n = s.device_id.size() + 2 < buffer.size() ? s.device_id.size() + 2 : buffer.size();
+        buffer[0] = static_cast<uint8_t>((s.device_id.size() + 2) >> 8);
+        buffer[1] = static_cast<uint8_t>(s.device_id.size() + 2);
+        if (n > 2) memcpy(buffer.data() + 2, s.device_id.data(), n - 2);
+        return true;
+      }
+      if (request == 1 && buffer.size() >= 1) { buffer[0] = s.port_status; return true; }   // GET_PORT_STATUS
+      return false;
+    }
+    if (s.hid != 3 || request != 6 || value != 0x2200) return false;
     memcpy(buffer.data(), kTabletDescriptor, buffer.size() < sizeof kTabletDescriptor ? buffer.size() : sizeof kTabletDescriptor);
     return true;
   }
@@ -281,6 +304,15 @@ struct FakeStickHost final : IUsbHostController {
     if (transferred) *transferred = 0;
     if (port >= kPorts || !sticks[port]) return false;
     Stick& s = *sticks[port];
+    if (s.hid == 5) {   // a printer: bytes out are printed, nothing comes back
+      if (endpoint & 0x80) return true;
+      if (s.unplug_after >= 0 && s.commands >= s.unplug_after) { unplug(port); return false; }
+      ++s.commands;
+      if (s.fail_out > 0) { --s.fail_out; return false; }
+      s.printed.insert(s.printed.end(), data.data(), data.data() + data.size());
+      if (transferred) *transferred = static_cast<uint32_t>(data.size());
+      return true;
+    }
     if (s.unplug_after >= 0 && s.commands >= s.unplug_after) {   // pulled out in the middle of the command
       unplug(port);
       return false;

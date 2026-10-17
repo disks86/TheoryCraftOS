@@ -519,6 +519,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   printers.discover_usb(usb);
   Entry(Level::Ok, "Printer").dec(printers.count()).text(" USB printers");
   for (uint32_t i = 0; i < printers.count(); ++i) Entry(Level::Info, "Printer").text("  ").text(printers.at(i)->name());
+  // USB printers come and go: the service watches for that and delivers the USB printers' jobs.
+  if (!printers.start_service([](void*, StringView text) {
+        console::debug_puts("Printer: ");
+        console::debug_puts(text);
+        console::debug_puts("\n");
+      }, nullptr))
+    Entry(Level::Warning, "Printer").text("could not start the printer service; USB printers plugged in later are not seen and jobs are not delivered");
 
   // The log is read before the desktop covers it: a clean boot pauses a moment, a boot with warnings
   // or failures waits (up to 15 s) for a key so they can be read.

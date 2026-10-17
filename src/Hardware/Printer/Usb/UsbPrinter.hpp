@@ -21,6 +21,7 @@
 #include "Hardware/Printer/IPrinter.hpp"
 #include "Hardware/Printer/Usb/Dot4.hpp"
 #include "Hardware/Printer/Usb/Ieee1284.hpp"
+#include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -56,23 +57,36 @@ class UsbPrinter final : public IPrinter {
   static constexpr uint32_t kChunk = 16384;
 
   UsbPrinter(IUsbHostController& host, uint32_t port, const UsbPrinterEndpoints& endpoints, allocators::IAllocator& allocator)
-      : host_(host), port_(port), ep_(endpoints), allocator_(allocator) {}
+      : host_(host), port_(port), ep_(endpoints), allocator_(allocator), generation_(host.port_generation(port)) {}
   ~UsbPrinter();
 
   // Adds a printer for every printer-class interface on every enumerated USB device (several alternate settings of an interface count
   // once, the bidirectional one preferred). Printers that do not start are left out.
   static void discover(IUsbBus& usb, allocators::IAllocator& allocator, List<UniquePointer<IPrinter>>& out);
+  // The same for the one device on a root port (a printer that was just plugged in).
+  static void discover_port(IUsbHostController& host, uint32_t port, allocators::IAllocator& allocator, List<UniquePointer<IPrinter>>& out);
 
   const char* name() const override { return name_; }
+  // False once the printer was unplugged (the port's generation moved on) or shut down. Jobs still queued then fail (poll() counts them as failed).
+  bool present() const override { return started_flag() && host_.port_generation(port_) == generation_; }
   bool initialize() override;
   void shutdown() override;
   const PrinterInfo& info() const override { return info_; }
-  PrinterState state() const override { return count_ > 0 ? PrinterState::Busy : last_failed_ ? PrinterState::Error : PrinterState::Ready; }
+  PrinterState state() const override {
+    kernel::ScopedMutex guard(mutex_);
+    return count_ > 0 ? PrinterState::Busy : last_failed_ ? PrinterState::Error : PrinterState::Ready;
+  }
   bool submit(ConstByteView job, const char* job_name) override;
   void poll() override;
-  uint32_t pending_jobs() const override { return count_; }
+  uint32_t pending_jobs() const override {
+    kernel::ScopedMutex guard(mutex_);
+    return count_;
+  }
   void cancel_all() override;
-  PrinterStatistics statistics() const override { return stats_; }
+  PrinterStatistics statistics() const override {
+    kernel::ScopedMutex guard(mutex_);
+    return stats_;
+  }
   // A USB printer's port status gives only the error bits: paper out (no paper), off line (the select line), and the error line
   // (reported as "service requested"). Completes at once. Page counts and supplies need SNMP, which USB does not carry.
   bool request_report() override;
@@ -98,6 +112,11 @@ class UsbPrinter final : public IPrinter {
     uint64_t sent = 0;
     uint32_t failures = 0;
   };
+  bool started_flag() const { return __atomic_load_n(&running_, __ATOMIC_ACQUIRE); }
+  void cancel_all_locked();
+  bool soft_reset_locked();
+  void fail_all();   // (with the lock held) every queued job counts as failed
+  bool read_status_locked(UsbPrinterStatus* status);
   bool read_identity();
   void recover();
   void fail_front();
@@ -114,6 +133,9 @@ class UsbPrinter final : public IPrinter {
   UniquePointer<Job> queue_[kQueueDepth];
   uint32_t head_ = 0, count_ = 0;
   bool last_failed_ = false, started_ = false;
+  bool running_ = false;       // started_, readable without the lock
+  uint32_t generation_;        // the port's generation when the printer was taken over
+  mutable kernel::Mutex mutex_;   // one thread in the printer at a time (the hot-plug thread shuts it down while programs use it)
   PrinterStatistics stats_;
   PrinterReport report_;
   bool have_report_ = false;

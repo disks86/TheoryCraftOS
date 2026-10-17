@@ -41,6 +41,9 @@ class IPrinter {
  public:
   virtual const char* name() const = 0;
   virtual bool initialize() = 0;
+  // False once the printer is gone (a USB printer that was unplugged): jobs submitted to it fail and the ones queued are lost. Printers that
+  // cannot be removed (network ones, which just stop answering) are always present.
+  virtual bool present() const { return true; }
   virtual void shutdown() = 0;
   virtual const PrinterInfo& info() const = 0;
   virtual PrinterState state() const = 0;

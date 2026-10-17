@@ -216,6 +216,15 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   sequence were checked against HP's Linux driver source (hplip `io/hpmud/dot4.c`). `UsbPrinter` prefers a plain bidirectional
   interface, then protocol 3, then unidirectional; on a protocol-3 interface `submit()` and `read_back()` go through the channel, a printer
   with no credit to spare just makes `poll()` wait (not a failure), and a broken session is reopened. Not tried on a physical printer.
+  **USB printer hot-plug:** `SystemPrinters::poll_usb()` finds printers plugged in after start-up (through `UsbPortWatcher`, like storage,
+  input and audio) and drops those pulled out. `UsbPrinter` follows the port's generation (`present()`), has a lock so the hot-plug thread can
+  shut it down while a program submits or polls, and a job that was queued when the printer left counts as failed and is reported as
+  `PrinterEvent::lost_jobs`; a port that gets a different printer never passes the old one's jobs on. The list holds shared pointers
+  (`share()`; `at()` is only good while the printer stays). `start_service()` runs the hot-plug check (250 ms) and delivers the USB
+  printers' jobs (10 ms) on a "printers" thread - `main` starts it, which also means queued USB jobs now actually go out; network printers
+  are still polled by whoever runs the network stack. Limits: xHCI only, no hubs, no re-queueing of lost jobs, a printer's name
+  can repeat when two of the same model are plugged in. `tests/PrinterHotplugTest.cpp` (fake controller with fake printers, including one
+  pulled out mid-job) and, under ThreadSanitizer, `tests/PrinterHotplugThreadTest.cpp` cover it; no real printer was involved.
   **SNMPv3 and traps:** `SnmpUsm` implements USM (MD5/SHA-1/SHA-224/SHA-256 authentication, DES/AES-128 privacy, key localization,
   engine discovery and time sync) on top of `src/Crypto` (hashes, HMAC, AES, DES, checked against OpenSSL); the v3 client was checked
   live against a pysnmp agent. `SnmpTrapReceiver` (UDP 162, needs IGMP/multicast-free unicast only) decodes v1/v2c/v3 traps and informs
