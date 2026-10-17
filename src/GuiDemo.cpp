@@ -18,6 +18,9 @@
 
 #include "GuiDemo.hpp"
 #include "Gui/Controls/Button.hpp"
+#include "Gui/Controls/CheckBox.hpp"
+#include "Gui/Controls/Slider.hpp"
+#include "Gui/Controls/Toggle.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Menu.hpp"
@@ -32,7 +35,7 @@ namespace {
 using namespace gui;
 
 struct Counters {
-  int new_items = 0, exits = 0, button_clicks = 0, selections = 0, edits = 0;
+  int new_items = 0, exits = 0, button_clicks = 0, selections = 0, edits = 0, changes = 0;
 };
 
 void count(int* counter) { ++*counter; }
@@ -42,6 +45,7 @@ void on_exit(void* c, Control&) { count(&static_cast<Counters*>(c)->exits); }
 void on_button(void* c, Control&) { count(&static_cast<Counters*>(c)->button_clicks); }
 void on_selection(void* c, Control&) { count(&static_cast<Counters*>(c)->selections); }
 void on_edit(void* c, Control&) { count(&static_cast<Counters*>(c)->edits); }
+void on_change(void* c, Control&) { count(&static_cast<Counters*>(c)->changes); }
 
 void click_at(Window& w, Point p) {
   w.mouse_move(p.x, p.y);
@@ -128,11 +132,23 @@ bool run_gui_demo(graphics::SystemGraphics& system, allocators::IAllocator& allo
   mode.add_item("Accelerated");
   mode.add_item("Auto");
   mode.on_selection_changed({on_selection, &counters});
-  Control* fields[4] = {&name_label, &name, &mode_label, &mode};
+  Label volume_label(allocator);
+  volume_label.set_text("Volume:");
+  Slider volume(allocator);
+  volume.on_value_changed({on_change, &counters});
+  CheckBox echo(allocator);
+  echo.set_text("Echo");
+  echo.on_changed({on_change, &counters});
+  Toggle mute(allocator);
+  mute.set_text("Mute");
+  mute.on_changed({on_change, &counters});
+  Control* fields[7] = {&name_label, &name, &mode_label, &mode, &volume_label, &volume, &echo};
   for (Control* c : fields) {
     c->set_dock(DockStyle::Top);
     side.add(c);
   }
+  mute.set_dock(DockStyle::Top);
+  side.add(&mute);
 
   UniformPanel content(allocator);
   content.set_dock(DockStyle::Fill);
@@ -179,6 +195,12 @@ bool run_gui_demo(graphics::SystemGraphics& system, allocators::IAllocator& allo
   const Rect2D list = window.popup() ? window.popup()->bounds() : Rect2D{};
   click_at(window, {list.x + 10, list.y + 2 + DropDownList::kRowHeight + 4});  // the second item
   ok = ok && !mode.open() && mode.selected_index() == 1 && counters.selections == 1;
+  // The slider, check box and toggle: click the track, tick the box, flip the switch.
+  const Point track = volume.window_origin();
+  click_at(window, {track.x + static_cast<int32_t>(volume.bounds().width) - 6, track.y + 10});
+  click_at(window, center_of(echo));
+  click_at(window, center_of(mute));
+  ok = ok && counters.changes == 3 && volume.value() > 90 && echo.checked() && mute.on();
   // Menu: File > New, then File > Exit.
   Point title = {12, menu_bar.window_origin().y + 8};
   click_at(window, title);

@@ -224,13 +224,17 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   visible children, horizontally or vertically, with spacing (the leftover pixels go one each to the first children).
   Controls: `Label`, `Button`, `TextBox` (single-line editing, caret, scrolling, max length, read-only), `DropDown` (list popup;
   mouse and keyboard) and `MenuBar`/`Menu`/`MenuItem` (classic menus: shortcut text, check marks, separators, disabled items,
-  sliding between menus, keyboard navigation). Callbacks are `Handler`s (function + context pointer). `Window` is the root: title bar,
+  sliding between menus, keyboard navigation). Input and display controls: `Slider` (horizontal/vertical, step/page keys, wheel,
+  drag), `LevelMeter` (segmented green/yellow/red bar with peak hold), `CheckBox`, `RadioButton` + `RadioGroup` (exclusive, arrow keys
+  move check and focus), `Toggle` (on/off switch), `ColorPicker` (swatch + popup with a saturation/brightness square and hue
+  strip; `Gui/Color.hpp` has the integer HSV conversions) and `DatePicker` (YYYY-MM-DD field + month calendar popup;
+  `Gui/Date.hpp` has the Gregorian date maths, years 1-9999). Callbacks are `Handler`s (function + context pointer). `Window` is the root: title bar,
   focus (Tab/Shift+Tab), mouse capture, hover, and one popup layer drawn above the tree (drop-down lists and menus use it);
   `render()` lays out, paints and presents when `dirty()`. `InputPump` feeds a window from `IKeyboard`/`IMouse` (relative or
   absolute). Controls do not own their children: whoever creates them keeps them alive while they are in a tree. Not yet:
   submenus, text selection/clipboard, scrolling lists, a mouse cursor sprite beyond the simple arrow, several windows.
   `src/GuiDemo` builds a window with all of it at boot and drives it with synthetic input (typing, choosing, menu items)
-  while checking the results; `tests/GuiTest.cpp` covers layout, every control and the input pump on the host.
+  while checking the results; `tests/GuiTest.cpp` covers layout, the basic controls and the input pump on the host; `tests/GuiControlsTest.cpp` covers the slider, level meter, check box, radio button, toggle, colour and date pickers and their helpers.
 
 - `src/BootLog.*` is the boot log (`bootlog::Entry(Level, "Subsystem").text(...).dec(...)`; counts warnings and failures; `replay()` redraws
   the lines after a display mode change cleared the screen). `src/Desktop/` is the desktop shell built on the GUI toolkit: `Desktop`

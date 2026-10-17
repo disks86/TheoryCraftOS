@@ -180,6 +180,13 @@ add_executable(BOOTX64
   src/Gui/Controls/Button.cpp
   src/Gui/Controls/TextBox.cpp
   src/Gui/Controls/DropDown.cpp
+  src/Gui/Controls/Slider.cpp
+  src/Gui/Controls/LevelMeter.cpp
+  src/Gui/Controls/CheckBox.cpp
+  src/Gui/Controls/RadioButton.cpp
+  src/Gui/Controls/Toggle.cpp
+  src/Gui/Controls/ColorPicker.cpp
+  src/Gui/Controls/DatePicker.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp
   src/Gui/Windows/WindowManager.cpp
