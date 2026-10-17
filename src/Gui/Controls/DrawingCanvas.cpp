@@ -570,6 +570,10 @@ void DrawingCanvas::select_all() {
   sel_w_ = width_;
   sel_h_ = height_;
   sel_valid_ = true;
+  if (tool_ != PaintTool::Select) {  // so the selection can be dragged at once
+    tool_ = PaintTool::Select;
+    fire(tool_changed_);
+  }
   invalidate();
 }
 

@@ -26,13 +26,18 @@ uint32_t InputPump::pump() {
   hardware::KeyEvent key;
   while (keyboard_ && keyboard_->poll(&key)) {
     ++events;
+    if (key.usage >= hardware::key::kLeftControl && key.usage <= hardware::key::kRightGui) {
+      const uint8_t bit = static_cast<uint8_t>(1u << (key.usage - hardware::key::kLeftControl));
+      modifiers_ = key.pressed ? (modifiers_ | bit) : (modifiers_ & ~bit);
+    }
     if (!key.pressed) continue;
     KeyArgs args;
     args.usage = key.usage;
-    args.modifiers = keyboard_->modifiers();
+    args.modifiers = modifiers_;
     args.character = hardware::key_to_ascii(key.usage, args.modifiers);
     window_.key(args);
   }
+  if (keyboard_) modifiers_ = keyboard_->modifiers();  // everything is delivered: the keyboard's own state is the truth again
 
   hardware::MouseEvent m;
   const int32_t max_x = static_cast<int32_t>(window_.bounds().width) - 1;

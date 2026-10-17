@@ -17,7 +17,8 @@
  */
 
 // Feeds a Window from the keyboard and mouse drivers: key presses become KeyArgs (with the
-// character the key types), mouse movement and buttons become window-coordinate events. A relative
+// character the key types, and the modifier keys that were held when it went down - taken from the order of the key events, not
+// from the keyboard's state at the moment they are read, so a quick Ctrl+A is still Ctrl+A), mouse movement and buttons become window-coordinate events. A relative
 // mouse moves a cursor position kept here (clamped to the window); an absolute one (tablet) is scaled
 // to the window.
 #pragma once
@@ -31,7 +32,7 @@ class InputPump {
  public:
   // Either device may be null.
   InputPump(Window& window, hardware::IKeyboard* keyboard, hardware::IMouse* mouse)
-      : window_(window), keyboard_(keyboard), mouse_(mouse) {
+      : window_(window), keyboard_(keyboard), mouse_(mouse), modifiers_(keyboard ? keyboard->modifiers() : 0) {
     x_ = static_cast<int32_t>(window.bounds().width / 2);
     y_ = static_cast<int32_t>(window.bounds().height / 2);
     window_.mouse_move(x_, y_);  // the cursor starts in the middle, not at the corner
@@ -47,6 +48,7 @@ class InputPump {
   hardware::IMouse* mouse_;
   int32_t x_ = 0, y_ = 0;
   uint8_t buttons_ = 0;
+  uint8_t modifiers_ = 0;  // held after the last key event delivered
 };
 
 }  // namespace gui

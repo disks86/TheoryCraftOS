@@ -18,6 +18,7 @@
 
 #include "Gui/Controls/DataGrid.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace gui {
@@ -464,6 +465,16 @@ bool DataGrid::on_key(const KeyArgs& args) {
   using namespace hardware;
   const int32_t n = static_cast<int32_t>(order_.count());
   const int32_t current = selected_ >= 0 ? position_of_row(selected_) : -1;
+  if ((args.modifiers & modifier::kControl) && args.usage == key::kA + 2) {  // Ctrl+C: the selected row, cells tab separated
+    if (selected_ < 0 || !clipboard()) return false;
+    String line(allocator());
+    for (uint32_t c = 0; c < columns_.count(); ++c) {
+      model_->cell_text(static_cast<uint32_t>(selected_), c, &cell_b_);
+      if ((c > 0 && !line.push_back('\t')) || !line.append(cell_b_.view())) return true;
+    }
+    clipboard()->set_text(line.view());
+    return true;
+  }
   const int32_t page = static_cast<int32_t>(visible_row_count()) > 1 ? static_cast<int32_t>(visible_row_count()) - 1 : 1;
   switch (args.usage) {
     case key::kDown: move_selection_to(current < 0 ? 0 : current + 1); return true;

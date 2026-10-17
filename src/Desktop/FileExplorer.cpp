@@ -108,6 +108,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   view_.add_column("Size", 80, Align::Right);
   view_.add_column("Type", 100);
   view_.set_dock(DockStyle::Fill);
+  view_.set_copy_enabled(false);  // Ctrl+C copies the item's path instead (see on_key)
   view_.on_item_activated({&FileExplorer::on_activated, this});
   view_.on_selection_changed({&FileExplorer::on_selection, this});
 

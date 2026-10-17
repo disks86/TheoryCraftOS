@@ -2214,6 +2214,77 @@ static void test_paint_clipboard() {
   CHECK(a.live == 0);
 }
 
+static void test_list_copy() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    w.set_clipboard(&cb);
+    ListView list(a);
+    DataGrid grid(a);
+    list.set_bounds({10, 10, 300, 100});
+    grid.set_bounds({10, 120, 300, 100});
+    w.add(&list);
+    w.add(&grid);
+    fill_list(list, 4, 1);
+    grid.add_column("A", 60);
+    grid.add_column("B", 60);
+    const StringView r0[2] = {"x", "y"}, r1[2] = {"left", "right"};
+    grid.add_row(r0, 2);
+    grid.add_row(r1, 2);
+    w.layout();
+    String got(a);
+    w.set_focus(&list);
+    press(w, key::kA + 2, modifier::kLeftControl);       // nothing selected: nothing copied
+    CHECK(!cb.get_text(&got));
+    list.select_item(2);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    CHECK(cb.get_text(&got) && got.view().equals("item02\t1 KB"));
+    list.set_copy_enabled(false);
+    CHECK(cb.set_text("kept"));
+    press(w, key::kA + 2, modifier::kLeftControl);
+    CHECK(cb.get_text(&got) && got.view().equals("kept"));
+    w.set_focus(&grid);
+    grid.select_row(1);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    CHECK(cb.get_text(&got) && got.view().equals("left\tright"));
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_select_all_keys() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    w.set_clipboard(&cb);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::Paint paint(a);
+    CHECK(mgr.add_window(&paint));
+    w.layout();
+    // Ctrl+A in Paint selects the whole picture and switches to the Select tool, wherever the focus is.
+    w.set_focus(&paint.palette());
+    CHECK(paint.canvas().tool() == PaintTool::Pencil);
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(paint.canvas().has_selection() && paint.canvas().selection().width == 640 && paint.canvas().tool() == PaintTool::Select && paint.tools().selected_tool() == 7);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    uint32_t cw, ch;
+    CHECK(cb.image_size(&cw, &ch) && cw == 640 && ch == 480);
+    paint.tools().select_tool(0);
+    w.set_focus(&paint.canvas());
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(paint.tools().selected_tool() == 7);
+    mgr.remove_window(&paint);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -2232,6 +2303,8 @@ int main() {
   test_text_clipboard();
   test_canvas_clipboard();
   test_paint_clipboard();
+  test_list_copy();
+  test_select_all_keys();
   test_breadcrumb_bar();
   test_file_explorer();
   test_task_manager();
