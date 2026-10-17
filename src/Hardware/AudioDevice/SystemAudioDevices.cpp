@@ -20,6 +20,7 @@
 #include "Hardware/AudioDevice/Intel/Ac97AudioDevice.hpp"
 #include "Hardware/AudioDevice/Intel/IntelHdaAudioDevice.hpp"
 #include "Hardware/AudioDevice/Software/SoftwareAudioDevice.hpp"
+#include "Hardware/AudioDevice/Usb/UsbAudioDevice.hpp"
 #include "Hardware/AudioDevice/Virtio/VirtioSoundDevice.hpp"
 
 namespace hardware {
@@ -52,16 +53,23 @@ void SystemAudioDevices::initialize() {
              Ac97AudioDevice::supports(d.vendor_id, d.device_id))
       try_add<Ac97AudioDevice>(devices_, allocator_, pci_, d, allocator_, st_);
   }
+  List<UniquePointer<UsbAudioDevice>> usb_audio(allocator_);
+  if (usb_) UsbAudioDevice::discover(*usb_, allocator_, usb_audio);
+  // Outputs first (the first device is the default), then the software fallback if nothing can play, then the record-only devices.
+  for (uint64_t i = 0; i < usb_audio.count(); ++i)
+    if (usb_audio[i]->has_output()) devices_.push_back(UniquePointer<IAudioDevice>(util::move(usb_audio[i])));
   if (devices_.count() == 0) {
     try_add<SoftwareAudioDevice>(devices_, allocator_, clock_, allocator_);
-    fallback_ = devices_.count() > 0;
+    if (devices_.count() > 0) fallback_index_ = static_cast<int32_t>(devices_.count()) - 1;
   }
+  for (uint64_t i = 0; i < usb_audio.count(); ++i)
+    if (usb_audio[i]) devices_.push_back(UniquePointer<IAudioDevice>(util::move(usb_audio[i])));
 }
 
 void SystemAudioDevices::shutdown() {
   for (uint64_t i = devices_.count(); i > 0; --i) devices_[i - 1]->shutdown();  // newest first
   devices_.clear();
-  fallback_ = false;
+  fallback_index_ = -1;
 }
 
 }  // namespace hardware

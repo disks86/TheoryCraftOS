@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/AudioDevice/IAudioDevice.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -33,8 +34,8 @@ namespace hardware {
 // discards what it is given, so there is always something to play to.
 class SystemAudioDevices {
  public:
-  SystemAudioDevices(IPciBus& pci, const IClock& clock, allocators::IAllocator& allocator, efi::SystemTable* st)
-      : pci_(pci), clock_(clock), allocator_(allocator), st_(st), devices_(allocator) {}
+  SystemAudioDevices(IPciBus& pci, const IClock& clock, allocators::IAllocator& allocator, efi::SystemTable* st, IUsbBus* usb = nullptr)
+      : pci_(pci), usb_(usb), clock_(clock), allocator_(allocator), st_(st), devices_(allocator) {}
 
   void initialize();
   // Stops every device and frees them.
@@ -43,15 +44,16 @@ class SystemAudioDevices {
   uint32_t count() const { return static_cast<uint32_t>(devices_.count()); }
   IAudioDevice* at(uint32_t index) const { return index < devices_.count() ? devices_[index].get() : nullptr; }
   // True for a device that is real hardware, false for the software fallback.
-  bool is_hardware(uint32_t index) const { return index < devices_.count() && !fallback_; }
+  bool is_hardware(uint32_t index) const { return index < devices_.count() && static_cast<int32_t>(index) != fallback_index_; }
 
  private:
   IPciBus& pci_;
+  IUsbBus* usb_;
   const IClock& clock_;
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;
   List<UniquePointer<IAudioDevice>> devices_;
-  bool fallback_ = false;
+  int32_t fallback_index_ = -1;  // where the software fallback sits, if there is one
 };
 
 }  // namespace hardware

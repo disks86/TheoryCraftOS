@@ -23,6 +23,7 @@
 #include "Hardware/Bus/Usb/Xhci/XhciRing.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -59,12 +60,21 @@ class XhciController final : public IXhciController {
   bool control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
                   uint16_t index,
                   ByteView buffer) override;
+  bool control_out_data(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, ConstByteView data) override;
   bool start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                           uint8_t interval) override;
   bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) override;
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
   bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
   bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
+  bool supports_isochronous() const override { return true; }
+  bool start_iso_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) override;
+  void stop_iso_endpoint(uint32_t port, uint8_t endpoint_address) override;
+  uint32_t iso_interval_us(uint32_t port, uint8_t endpoint_address) override;
+  uint32_t iso_free_packets(uint32_t port, uint8_t endpoint_address) override;
+  bool iso_submit(uint32_t port, uint8_t endpoint_address, ConstByteView packet) override;
+  uint64_t iso_completed_packets(uint32_t port, uint8_t endpoint_address) override;
+  bool iso_receive(uint32_t port, uint8_t endpoint_address, ByteView out, uint16_t* length) override;
 
  private:
   struct InterruptEndpoint {
@@ -86,9 +96,28 @@ class XhciController final : public IXhciController {
     xhci::ProducerRing ring;
   };
 
+  // One isochronous endpoint: a ring of transfer descriptors of one packet each, and a buffer with one slot per descriptor. OUT: slots from head to
+  // tail are queued and not yet sent. IN: every slot is armed or holds a packet nobody has taken; head is the oldest.
+  struct IsoEndpoint {
+    static constexpr uint32_t kSlots = 128;
+    bool in = false;
+    uint8_t address = 0;
+    uint8_t context_id = 0;
+    uint16_t max_packet = 0;
+    uint32_t interval_us = 0;
+    xhci::ProducerRing ring;
+    ByteView buffer;           // kSlots * max_packet
+    uint16_t length[kSlots] = {};
+    uint64_t trb[kSlots] = {};
+    bool done[kSlots] = {};
+    uint32_t head = 0, tail = 0, count = 0;
+    uint64_t completed = 0, errors = 0;
+  };
+
   struct Device {
     static constexpr uint32_t kMaxEndpoints = 4;
     static constexpr uint32_t kMaxBulkEndpoints = 4;
+    static constexpr uint32_t kMaxIsoEndpoints = 3;   // audio out, audio in, and a feedback endpoint
     bool present = false;
     uint8_t slot = 0;
     uint32_t speed_id = 0;
@@ -97,12 +126,13 @@ class XhciController final : public IXhciController {
     ByteView input_context;
     xhci::ProducerRing control_ring;
     UsbDeviceDescriptor descriptor{};
-    uint8_t config[256] = {};
+    uint8_t config[1024] = {};   // the first configuration (audio devices have long ones)
     uint16_t config_length = 0;
     uint8_t configuration = 0;   // value passed to SET_CONFIGURATION, 0 = none yet
     uint8_t context_entries = 1;  // highest endpoint context index in use
     InterruptEndpoint endpoints[kMaxEndpoints];
     BulkEndpoint bulk[kMaxBulkEndpoints];
+    UniquePointer<IsoEndpoint> iso[kMaxIsoEndpoints];
   };
 
   // Bring-up steps.
@@ -122,7 +152,11 @@ class XhciController final : public IXhciController {
   bool address_device(uint32_t port, Device& d);
   bool update_max_packet(Device& d, uint16_t max_packet);
   bool transfer(Device& d, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index,
-                uint16_t length, bool data_in);
+                uint16_t length, bool data_in, const uint8_t* out_data = nullptr);
+  IsoEndpoint* find_iso(uint32_t port, uint8_t endpoint_address);
+  void arm_iso_slot(Device& d, IsoEndpoint& e, uint32_t slot);
+  void handle_iso_event(IsoEndpoint& e, const xhci::Trb& event);
+  void release_iso(Device& d, IsoEndpoint& e);
   void handle_event(const xhci::Trb& event);
   void pump_events();
   void arm_endpoint(Device& d, InterruptEndpoint& e);

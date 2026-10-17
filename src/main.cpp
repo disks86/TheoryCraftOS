@@ -357,7 +357,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
 
   // Audio outputs: native drivers (HD Audio, AC'97, virtio-sound), or a silent software device.
-  hardware::SystemAudioDevices audio(pci, clock, shared_allocator, st);
+  hardware::SystemAudioDevices audio(pci, clock, shared_allocator, st, &usb);
   audio.initialize();
   for (uint32_t i = 0; i < audio.count(); ++i) {
     hardware::IAudioDevice& device = *audio.at(i);

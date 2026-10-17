@@ -53,6 +53,9 @@ class PlaybackRing {
   // Copies in whole frames; returns the bytes taken.
   uint32_t write(ConstByteView pcm);
 
+  // Copies up to out.size() bytes (whole frames) of the audio that is queued, oldest first, without consuming it; returns the bytes copied.
+  uint32_t peek(ByteView out) const;
+
   uint32_t queued() const { return queued_; }
   uint32_t free() const { return size() - queued_; }
   uint64_t frames_played() const { return frames_played_; }

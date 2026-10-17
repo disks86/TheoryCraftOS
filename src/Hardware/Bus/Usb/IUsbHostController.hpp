@@ -50,6 +50,12 @@ class IUsbHostController : public IHardware {
                           uint16_t index,
                   ByteView buffer) = 0;
 
+  // Control transfer with a data stage from host to device (class requests that set something: a sampling rate, a clock). Default: unsupported.
+  virtual bool control_out_data(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, ConstByteView data) {
+    (void)port; (void)request_type; (void)request; (void)value; (void)index; (void)data;
+    return false;
+  }
+
   // --- Interrupt IN endpoints (HID reports and the like).
   // Configures the endpoint and starts receiving packets of up to max_packet
   // bytes. `interval` is the descriptor's bInterval.
@@ -71,6 +77,30 @@ class IUsbHostController : public IHardware {
   // Brings a stalled bulk endpoint back to life (the controller side of
   // CLEAR_FEATURE(ENDPOINT_HALT), which the caller still sends).
   virtual bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) = 0;
+
+  // --- Isochronous endpoints (audio): a steady stream of packets, one per service interval, delivered on time or lost, never retried.
+  // Controllers that cannot do them say so here and refuse the calls below (the defaults).
+  virtual bool supports_isochronous() const { return false; }
+  // Sets up the endpoint of an enumerated device and its queue of packets. `max_packet` is wMaxPacketSize (bits 10:0) and `interval` the descriptor's bInterval.
+  // Do this before the device is switched to the alternate setting that uses the endpoint (SET_INTERFACE), and stop it before switching back.
+  virtual bool start_iso_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) {
+    (void)port; (void)endpoint_address; (void)max_packet; (void)interval;
+    return false;
+  }
+  virtual void stop_iso_endpoint(uint32_t port, uint8_t endpoint_address) { (void)port; (void)endpoint_address; }
+  // How long a service interval of the endpoint is (what one packet covers), in microseconds; 0 if the endpoint is not running.
+  virtual uint32_t iso_interval_us(uint32_t port, uint8_t endpoint_address) { (void)port; (void)endpoint_address; return 0; }
+  // OUT: how many more packets iso_submit() takes right now.
+  virtual uint32_t iso_free_packets(uint32_t port, uint8_t endpoint_address) { (void)port; (void)endpoint_address; return 0; }
+  // OUT: queues one packet (at most max_packet bytes; copied) for the first service interval after the ones already queued. False if the queue is full.
+  virtual bool iso_submit(uint32_t port, uint8_t endpoint_address, ConstByteView packet) { (void)port; (void)endpoint_address; (void)packet; return false; }
+  // Packets the controller has finished with since the endpoint started (OUT: sent or missed, IN: received or missed).
+  virtual uint64_t iso_completed_packets(uint32_t port, uint8_t endpoint_address) { (void)port; (void)endpoint_address; return 0; }
+  // IN: copies out the oldest packet received and not yet taken (an empty one if a service interval passed without data); false if there is none.
+  virtual bool iso_receive(uint32_t port, uint8_t endpoint_address, ByteView out, uint16_t* length) {
+    (void)port; (void)endpoint_address; (void)out; (void)length;
+    return false;
+  }
 
  protected:
   constexpr IUsbHostController() = default;

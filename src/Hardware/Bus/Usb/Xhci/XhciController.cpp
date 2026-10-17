@@ -295,6 +295,8 @@ void XhciController::release_device(Device& d) {
     e.ring.release(allocator_);
     e = BulkEndpoint{};
   }
+  for (UniquePointer<IsoEndpoint>& e : d.iso)
+    if (e) release_iso(d, *e);
   release_view(allocator_, d.output_context);
   release_view(allocator_, d.input_context);
   d.control_ring.release(allocator_);
@@ -398,17 +400,19 @@ bool XhciController::update_max_packet(Device& d, uint16_t max_packet) {
 // Control transfer on endpoint 0. With data_in the data lands in buffer_;
 // otherwise there is no data stage. (`length` is the wLength field.)
 bool XhciController::transfer(Device& d, uint8_t request_type, uint8_t request, uint16_t value,
-                              uint16_t index, uint16_t length, bool data_in) {
+                              uint16_t index, uint16_t length, bool data_in, const uint8_t* out_data) {
   if (data_in) buffer_.first(length).fill(0);
+  if (!data_in && length && out_data) buffer_.first(length).copy_from(ConstByteView(out_data, length));
   const uint64_t setup = uint64_t{request_type} | (uint64_t{request} << 8) | (uint64_t{value} << 16) |
                          (uint64_t{index} << 32) | (uint64_t{length} << 48);
-  constexpr uint32_t kTransferTypeIn = 3u << 16;  // setup TRB TRT field; 0 = no data stage
+  constexpr uint32_t kTransferTypeIn = 3u << 16, kTransferTypeOut = 2u << 16;  // setup TRB TRT field; 0 = no data stage
+  const bool data_out = !data_in && length > 0;
 
   d.control_ring.push(setup, 8,
-                      (kTrbSetupStage << 10) | kTrbImmediateData | (data_in ? kTransferTypeIn : 0));
-  if (data_in)
+                      (kTrbSetupStage << 10) | kTrbImmediateData | (data_in ? kTransferTypeIn : data_out ? kTransferTypeOut : 0));
+  if (data_in || data_out)
     d.control_ring.push(reinterpret_cast<uint64_t>(buffer_.data()), length,
-                        (kTrbDataStage << 10) | kTrbDirectionIn);
+                        (kTrbDataStage << 10) | (data_in ? kTrbDirectionIn : 0));
   // The status stage runs opposite to the data: host-to-device after an IN data
   // stage, device-to-host when there was no data stage.
   const uint64_t status_trb = d.control_ring.push(
@@ -446,6 +450,12 @@ bool XhciController::control_out(uint32_t port, uint8_t request_type, uint8_t re
   kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present) return false;
   return transfer(devices_[port], request_type, request, value, index, 0, false);
+}
+
+bool XhciController::control_out_data(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, ConstByteView data) {
+  kernel::ScopedMutex lock_guard(lock_);
+  if (port >= ports_ || !devices_[port].present || data.size() > 4096) return false;
+  return transfer(devices_[port], request_type, request, value, index, static_cast<uint16_t>(data.size()), false, data.data());
 }
 
 bool XhciController::control_in(uint32_t port, uint8_t request_type, uint8_t request, uint16_t value,
@@ -534,6 +544,11 @@ void XhciController::handle_event(const Trb& event) {
   const uint32_t endpoint_id = (event.control >> 16) & 0x1F;
   for (Device& d : devices_) {
     if (!d.slot || d.slot != slot) continue;
+    for (UniquePointer<IsoEndpoint>& iso : d.iso)
+      if (iso && iso->context_id == endpoint_id) {
+        handle_iso_event(*iso, event);
+        return;
+      }
     for (InterruptEndpoint& e : d.endpoints) {
       if (!e.active || e.context_id != endpoint_id || e.pending_trb != event.parameter) continue;
       const uint32_t code = completion_code(event.status);
@@ -659,6 +674,198 @@ bool XhciController::reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address
     return run_command(next, (kTrbSetTrDequeuePointer << 10) | target, &completion);
   }
   return false;
+}
+
+// -------------------------------------------------------- isochronous endpoints
+
+XhciController::IsoEndpoint* XhciController::find_iso(uint32_t port, uint8_t endpoint_address) {
+  if (port >= ports_ || !devices_[port].present) return nullptr;
+  for (UniquePointer<IsoEndpoint>& e : devices_[port].iso)
+    if (e && e->address == endpoint_address) return e.get();
+  return nullptr;
+}
+
+void XhciController::release_iso(Device& d, IsoEndpoint& e) {
+  e.ring.release(allocator_);
+  release_view(allocator_, e.buffer);
+  for (UniquePointer<IsoEndpoint>& slot : d.iso)
+    if (slot.get() == &e) slot.reset();
+}
+
+// Queues the slot's TD: one isochronous TRB that moves the slot's bytes in the next service interval (SIA: start as soon as the endpoint is ready).
+void XhciController::arm_iso_slot(Device& d, IsoEndpoint& e, uint32_t slot) {
+  const uint64_t address = reinterpret_cast<uint64_t>(e.buffer.data()) + uint64_t{slot} * e.max_packet;
+  const uint32_t length = e.in ? e.max_packet : e.length[slot];
+  e.trb[slot] = e.ring.push(address, length & 0x1FFFF, (kTrbIsoch << 10) | kTrbIoc | kTrbStartIsochAsap | (e.in ? kTrbInterruptOnShortPacket : 0));
+  e.done[slot] = false;
+  (void)d;
+}
+
+void XhciController::handle_iso_event(IsoEndpoint& e, const Trb& event) {
+  // Events come in ring order; one with a pointer that is not an outstanding TD (a ring underrun or overrun) says nothing about a slot.
+  uint32_t found = IsoEndpoint::kSlots;
+  for (uint32_t k = 0; k < e.count; ++k) {
+    const uint32_t slot = (e.head + k) % IsoEndpoint::kSlots;
+    if (e.trb[slot] == event.parameter && !e.done[slot]) {
+      found = slot;
+      break;
+    }
+  }
+  if (found == IsoEndpoint::kSlots) return;
+  const uint32_t code = completion_code(event.status);
+  if (code != kCompletionSuccess && code != kCompletionShortPacket) ++e.errors;
+  if (e.in) {
+    const uint32_t residual = event.status & 0xFFFFFF;
+    e.length[found] = (code == kCompletionSuccess || code == kCompletionShortPacket) && residual <= e.max_packet ? e.max_packet - residual : 0;
+    e.done[found] = true;
+    ++e.completed;
+    return;
+  }
+  e.done[found] = true;
+  while (e.count > 0 && e.done[e.head]) {   // retire what is finished, oldest first
+    e.done[e.head] = false;
+    e.head = (e.head + 1) % IsoEndpoint::kSlots;
+    --e.count;
+    ++e.completed;
+  }
+}
+
+bool XhciController::start_iso_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) {
+  kernel::ScopedMutex lock_guard(lock_);
+  if (port >= ports_ || !devices_[port].present || max_packet == 0 || max_packet > 1024 || interval == 0 || interval > 16) return false;
+  Device& d = devices_[port];
+  if (IsoEndpoint* running = find_iso(port, endpoint_address)) return running->max_packet == max_packet;   // already running as asked
+  UniquePointer<IsoEndpoint>* free_slot = nullptr;
+  for (UniquePointer<IsoEndpoint>& slot : d.iso)
+    if (!slot && !free_slot) free_slot = &slot;
+  if (!free_slot) return false;
+  UniquePointer<IsoEndpoint> e = UniquePointer<IsoEndpoint>::make(allocator_);
+  if (!e) return false;
+
+  const bool in = endpoint_address & 0x80;
+  const uint8_t dci = (endpoint_address & 0x0F) * 2 + (in ? 1 : 0);
+  e->in = in;
+  e->address = endpoint_address;
+  e->context_id = dci;
+  e->max_packet = max_packet;
+  e->buffer = allocate_dma_view<uint8_t>(allocator_, uint64_t{IsoEndpoint::kSlots} * max_packet, 64);
+  if (e->buffer.empty() || !e->ring.init(allocator_) || !dma_reachable(e->buffer.data())) {
+    e->ring.release(allocator_);
+    release_view(allocator_, e->buffer);
+    return false;
+  }
+  e->buffer.fill(0);
+
+  // Interval is 2^n * 125 us. Full speed counts 1 ms frames and bInterval is an exponent there as well; high and super speed bInterval is the exponent plus one.
+  uint32_t n = (interval - 1) + (d.speed_id <= 2 ? 3 : 0);
+  if (n > 15) n = 15;
+  e->interval_us = 125u << n;
+
+  d.input_context.fill(0);
+  if (dci > d.context_entries) d.context_entries = dci;
+  const ArrayView<uint32_t> control = context_at(d.input_context, 0);
+  control[1] = (1u << 0) | (1u << dci);
+  const ArrayView<uint32_t> slot = context_at(d.input_context, 1);
+  slot.copy_from(context_at(d.output_context, 0).first(8));
+  slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
+  constexpr uint32_t kEndpointTypeIsochOut = 1, kEndpointTypeIsochIn = 5;
+  const ArrayView<uint32_t> ep = context_at(d.input_context, dci + 1);
+  ep[0] = n << 16;
+  ep[1] = ((in ? kEndpointTypeIsochIn : kEndpointTypeIsochOut) << 3) | (uint32_t{max_packet} << 16);   // CErr 0: isochronous transfers are not retried
+  const uint64_t ring = e->ring.address() | e->ring.cycle();
+  ep[2] = static_cast<uint32_t>(ring);
+  ep[3] = static_cast<uint32_t>(ring >> 32);
+  ep[4] = (uint32_t{max_packet} << 16) | max_packet;   // max ESIT payload, average TRB length
+
+  Trb completion;
+  if (!run_command(reinterpret_cast<uint64_t>(d.input_context.data()), (kTrbConfigureEndpoint << 10) | (uint32_t{d.slot} << 24), &completion)) {
+    e->ring.release(allocator_);
+    release_view(allocator_, e->buffer);
+    return false;
+  }
+  IsoEndpoint& ref = *e;
+  *free_slot = util::move(e);
+  if (ref.in) {   // listen from the start: every slot is a TD waiting for its interval
+    for (uint32_t k = 0; k < IsoEndpoint::kSlots; ++k) arm_iso_slot(d, ref, k);
+    ref.count = IsoEndpoint::kSlots;
+    ring_doorbell(d.slot, ref.context_id);
+  }
+  return true;
+}
+
+void XhciController::stop_iso_endpoint(uint32_t port, uint8_t endpoint_address) {
+  kernel::ScopedMutex lock_guard(lock_);
+  IsoEndpoint* e = find_iso(port, endpoint_address);
+  if (!e) return;
+  Device& d = devices_[port];
+  Trb completion;
+  run_command(0, (kTrbStopEndpoint << 10) | (uint32_t{e->context_id} << 16) | (uint32_t{d.slot} << 24), &completion);
+  // drop the endpoint from the device's configuration so that its bandwidth is free again
+  d.input_context.fill(0);
+  const ArrayView<uint32_t> control = context_at(d.input_context, 0);
+  control[0] = 1u << e->context_id;   // drop
+  control[1] = 1u << 0;               // (the slot context is re-evaluated)
+  const ArrayView<uint32_t> slot = context_at(d.input_context, 1);
+  slot.copy_from(context_at(d.output_context, 0).first(8));
+  slot[0] = (slot[0] & ~(0x1Fu << 27)) | (uint32_t{d.context_entries} << 27);
+  run_command(reinterpret_cast<uint64_t>(d.input_context.data()), (kTrbConfigureEndpoint << 10) | (uint32_t{d.slot} << 24), &completion);
+  pump_events();   // whatever the controller reported on its way out
+  release_iso(d, *e);
+}
+
+uint32_t XhciController::iso_interval_us(uint32_t port, uint8_t endpoint_address) {
+  kernel::ScopedMutex lock_guard(lock_);
+  const IsoEndpoint* e = find_iso(port, endpoint_address);
+  return e ? e->interval_us : 0;
+}
+
+uint32_t XhciController::iso_free_packets(uint32_t port, uint8_t endpoint_address) {
+  kernel::ScopedMutex lock_guard(lock_);
+  IsoEndpoint* e = find_iso(port, endpoint_address);
+  if (!e || e->in) return 0;
+  pump_events();
+  return IsoEndpoint::kSlots - e->count;
+}
+
+bool XhciController::iso_submit(uint32_t port, uint8_t endpoint_address, ConstByteView packet) {
+  kernel::ScopedMutex lock_guard(lock_);
+  IsoEndpoint* e = find_iso(port, endpoint_address);
+  if (!e || e->in || packet.size() > e->max_packet) return false;
+  pump_events();
+  if (e->count == IsoEndpoint::kSlots) return false;
+  const uint32_t slot = e->tail;
+  e->buffer.subview(uint64_t{slot} * e->max_packet, packet.size()).copy_from(packet);
+  e->length[slot] = static_cast<uint16_t>(packet.size());
+  e->tail = (slot + 1) % IsoEndpoint::kSlots;
+  ++e->count;
+  arm_iso_slot(devices_[port], *e, slot);
+  ring_doorbell(devices_[port].slot, e->context_id);
+  return true;
+}
+
+uint64_t XhciController::iso_completed_packets(uint32_t port, uint8_t endpoint_address) {
+  kernel::ScopedMutex lock_guard(lock_);
+  IsoEndpoint* e = find_iso(port, endpoint_address);
+  if (!e) return 0;
+  pump_events();
+  return e->completed;
+}
+
+bool XhciController::iso_receive(uint32_t port, uint8_t endpoint_address, ByteView out, uint16_t* length) {
+  kernel::ScopedMutex lock_guard(lock_);
+  IsoEndpoint* e = find_iso(port, endpoint_address);
+  if (!e || !e->in) return false;
+  pump_events();
+  const uint32_t slot = e->head;
+  if (!e->done[slot]) return false;
+  const uint16_t received = e->length[slot];
+  out.copy_from(ConstByteView(e->buffer).subview(uint64_t{slot} * e->max_packet, received).at_most(out.size()));   // as much as fits
+  if (length) *length = received;
+  e->length[slot] = 0;
+  e->head = (slot + 1) % IsoEndpoint::kSlots;
+  arm_iso_slot(devices_[port], *e, slot);   // the slot listens again, at the end of the ring
+  ring_doorbell(devices_[port].slot, e->context_id);
+  return true;
 }
 
 }  // namespace hardware

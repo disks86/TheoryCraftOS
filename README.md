@@ -82,6 +82,18 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   interrupts, capture from several inputs at once. `src/AudioDemo` plays a short tone at boot
   (`TCOS_SELFTESTS`); `tests/AudioTest.cpp` covers the ring and the software device, `tests/AudioCaptureTest.cpp` the capture ring, software input and hub, `tests/AudioConvertTest.cpp` the resampler, format conversion and pan law. The `run` targets give QEMU an
   `intel-hda` + `hda-duplex` with a `none` audio backend.
+  USB audio: `Usb/UsbAudioDevice` drives USB Audio Class 1.0 and 2.0 devices (sound cards, DACs, headsets, microphones;
+  `Usb/UsbAudioDescriptors` reads the entities and alternate settings, every length checked). It picks the 48 kHz alternate
+  setting (16-bit stereo first, else mono, 24/32-bit or more channels, converted on the way), sets the UAC2 clock, plays and
+  records over isochronous endpoints (packets queued ~24 ms ahead, silence when the ring is dry, mono duplicated on capture),
+  follows an asynchronous device's feedback endpoint, and uses the feature unit for volume/mute (software gain without one).
+  `SystemAudioDevices` lists USB outputs after the PCI ones (a record-only device comes after the software fallback).
+  Isochronous transfers are a new polled API on `IUsbHostController` implemented on xHCI only (Configure Endpoint, one
+  Isoch TD per packet, Start Isoch ASAP); UHCI/OHCI/EHCI devices are left alone. Limits: 48 kHz only (no resampling), no
+  hubs and no hot-plug, no high-bandwidth (multi-transaction) endpoints, one output and one input stream per device, frames
+  count as played when queued (about 24 ms early), and the mixer must call at least every ~20 ms (its 5 ms pump does).
+  `tests/UsbAudioTest.cpp` covers it against a fake controller and fake UAC1/UAC2 devices; the xHCI isochronous path, the
+  feedback loop and the real timing have not been run on hardware or QEMU.
 - `src/Audio/`: the sound server. Audio hardware plays one stream, so `AudioMixer` owns the device (the first one
   `SystemAudioDevices` found) and any number of programs mix through it: `open_stream()` gives an `AudioStream`
   (a 32 KiB ring in the fixed format, own volume and mute, `write()` never blocks, `close()` when done). `pump()` keeps

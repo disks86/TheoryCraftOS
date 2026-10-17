@@ -85,4 +85,18 @@ uint32_t PlaybackRing::write(ConstByteView pcm) {
   return bytes;
 }
 
+uint32_t PlaybackRing::peek(ByteView out) const {
+  if (memory_.empty()) return 0;
+  uint32_t bytes = out.size() < queued_ ? static_cast<uint32_t>(out.size()) : queued_;
+  bytes -= bytes % kAudioFrameSize;
+  uint32_t at = read_, done = 0;
+  while (done < bytes) {
+    const uint32_t chunk = bytes - done < size() - at ? bytes - done : size() - at;
+    out.subview(done, chunk).copy_from(ConstByteView(memory_).subview(at, chunk));
+    at = (at + chunk) % size();
+    done += chunk;
+  }
+  return bytes;
+}
+
 }  // namespace hardware

@@ -94,6 +94,7 @@ enum TrbType : uint32_t {
   kTrbSetupStage = 2,
   kTrbDataStage = 3,
   kTrbStatusStage = 4,
+  kTrbIsoch = 5,
   kTrbLink = 6,
   kTrbEnableSlot = 9,
   kTrbDisableSlot = 10,
@@ -101,6 +102,7 @@ enum TrbType : uint32_t {
   kTrbConfigureEndpoint = 12,
   kTrbEvaluateContext = 13,
   kTrbResetEndpoint = 14,
+  kTrbStopEndpoint = 15,
   kTrbSetTrDequeuePointer = 16,
   kTrbNoop = 23,
   kTrbTransferEvent = 32,
@@ -114,6 +116,7 @@ constexpr uint32_t kTrbIoc = 1u << 5;
 constexpr uint32_t kTrbInterruptOnShortPacket = 1u << 2;
 constexpr uint32_t kTrbImmediateData = 1u << 6;
 constexpr uint32_t kTrbDirectionIn = 1u << 16;  // data/status stage direction
+constexpr uint32_t kTrbStartIsochAsap = 1u << 31;  // SIA, on isochronous TRBs
 
 inline uint32_t trb_type(uint32_t control) { return (control >> 10) & 0x3F; }
 inline uint32_t completion_code(uint32_t status) { return status >> 24; }
