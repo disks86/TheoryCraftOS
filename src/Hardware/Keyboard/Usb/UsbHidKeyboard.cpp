@@ -41,6 +41,14 @@ bool UsbHidKeyboard::initialize() {
                                   interface_.interval);
 }
 
+void UsbHidKeyboard::on_release_all() {
+  for (int bit = 0; bit < 8; ++bit)
+    if (previous_[0] & (1u << bit)) push(key::kLeftControl + bit, false);
+  for (int i = 2; i < 8; ++i)
+    if (previous_[i] > 3) push(previous_[i], false);
+  ByteView(previous_).fill(0);
+}
+
 void UsbHidKeyboard::fetch() {
   uint8_t report[8];
   uint16_t length = 0;

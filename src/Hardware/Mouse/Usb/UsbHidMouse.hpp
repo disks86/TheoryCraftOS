@@ -31,11 +31,14 @@ namespace hardware {
 class UsbHidMouse final : public MouseBase {
  public:
   UsbHidMouse(IUsbHostController& host, uint32_t port, const UsbHidInterface& interface)
-      : host_(host), port_(port), interface_(interface) {}
+      : host_(host), port_(port), interface_(interface), generation_(host.port_generation(port)) {}
 
   const char* name() const override { return layout_.x.relative ? "USB HID mouse" : "USB HID tablet"; }
   bool initialize() override;
   void shutdown() override {}
+
+  // False once the mouse was unplugged (the port's generation moved on).
+  bool present() const { return host_.port_generation(port_) == generation_; }
 
   bool is_absolute() const override { return !layout_.x.relative; }
   uint32_t max_x() const override { return is_absolute() ? layout_.x.logical_max : 0; }
@@ -43,11 +46,14 @@ class UsbHidMouse final : public MouseBase {
 
  private:
   void fetch() override;
+  void on_release_all() override;
 
   IUsbHostController& host_;
   uint32_t port_;
   UsbHidInterface interface_;
+  uint32_t generation_;
   HidPointerLayout layout_;
+  MouseEvent last_{};   // the latest report, to let go of its buttons
 };
 
 }  // namespace hardware

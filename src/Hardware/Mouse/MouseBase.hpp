@@ -27,12 +27,15 @@ namespace hardware {
 class MouseBase : public IMouse {
  public:
   bool poll(MouseEvent* out) override;
+  // The device is going away: queues an event that lets go of the buttons it holds down.
+  void release_all();
 
  protected:
   constexpr MouseBase() = default;
   ~MouseBase() = default;
 
   virtual void fetch() = 0;
+  virtual void on_release_all() {}   // (with the lock held) push() the final event
   void push(const MouseEvent& event);
 
  private:

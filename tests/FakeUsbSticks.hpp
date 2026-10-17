@@ -103,7 +103,12 @@ static Bytes partitioned_stick() {
 
 // ------------------------------------------------------------------------------------------------ the fake host with sticks
 
-// A Bulk-Only mass-storage target behind a root port.
+// An absolute pointer: three buttons, X and Y as 16 bits each in 0..32767.
+static const uint8_t kTabletDescriptor[] = {0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
+                                            0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00,
+                                            0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02, 0xC0, 0xC0};
+
+// A Bulk-Only mass-storage target (or a keyboard, mouse or tablet) behind a root port.
 struct FakeStickHost final : IUsbHostController {
   struct Stick {
     Bytes image;
@@ -117,6 +122,10 @@ struct FakeStickHost final : IUsbHostController {
     int unplug_after = -1;           // yank the stick after this many commands
     bool broken_inquiry = false;     // answers nothing sensible
     bool no_storage = false;         // not a mass-storage device at all
+    // Human interface devices instead of storage: 0 none, 1 boot keyboard, 2 boot mouse, 3 absolute tablet (report descriptor served), 4 vendor device
+    int hid = 0;
+    std::vector<Bytes> reports;      // what the device has sent and the host has not read yet
+    bool fail_start = false;         // the interrupt endpoint cannot be set up
   };
   static constexpr uint32_t kPorts = 4;
   Stick* sticks[kPorts] = {};
@@ -143,7 +152,23 @@ struct FakeStickHost final : IUsbHostController {
     Bytes c;
     auto put = [&](std::initializer_list<uint8_t> b) { c.insert(c.end(), b.begin(), b.end()); };
     put({9, 2, 0, 0, 1, 1, 0, 0x80, 50});
-    if (sticks[port]->no_storage) {
+    const int hid = sticks[port]->hid;
+    if (hid == 1) {   // boot keyboard
+      put({9, 4, 0, 0, 1, 3, 1, 1, 0});
+      put({9, 0x21, 0x11, 0x01, 0, 1, 0x22, 63, 0});
+      put({7, 5, 0x81, 3, 8, 0, 10});
+    } else if (hid == 2) {   // boot mouse
+      put({9, 4, 0, 0, 1, 3, 1, 2, 0});
+      put({9, 0x21, 0x11, 0x01, 0, 1, 0x22, 52, 0});
+      put({7, 5, 0x81, 3, 4, 0, 10});
+    } else if (hid == 3) {   // tablet: not a boot device, described by its report descriptor
+      put({9, 4, 0, 0, 1, 3, 0, 0, 0});
+      put({9, 0x21, 0x11, 0x01, 0, 1, 0x22, static_cast<uint8_t>(sizeof(kTabletDescriptor)), 0});
+      put({7, 5, 0x81, 3, 8, 0, 4});
+    } else if (hid == 4) {   // vendor specific
+      put({9, 4, 0, 0, 1, 0xFF, 0, 0, 0});
+      put({7, 5, 0x81, 3, 8, 0, 10});
+    } else if (sticks[port]->no_storage) {
       put({9, 4, 0, 0, 1, 3, 1, 1, 0});   // a keyboard
       put({7, 5, 0x81, 3, 8, 0, 10});
     } else {
@@ -159,9 +184,31 @@ struct FakeStickHost final : IUsbHostController {
   }
   bool set_configuration(uint32_t port, uint8_t) override { std::lock_guard<std::recursive_mutex> g(m); ++set_configurations; return port < kPorts && sticks[port]; }
   bool control_out(uint32_t port, uint8_t, uint8_t, uint16_t, uint16_t) override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts && sticks[port]; }
-  bool control_in(uint32_t, uint8_t, uint8_t, uint16_t, uint16_t, ByteView) override { return false; }   // (no GET_MAX_LUN: a stall)
-  bool start_interrupt_in(uint32_t, uint8_t, uint16_t, uint8_t) override { return false; }
-  bool poll_interrupt_in(uint32_t, uint8_t, ByteView, uint16_t*) override { return false; }
+  bool control_in(uint32_t port, uint8_t, uint8_t request, uint16_t value, uint16_t, ByteView buffer) override {   // (no GET_MAX_LUN: a stall)
+    std::lock_guard<std::recursive_mutex> g(m);
+    if (port >= kPorts || !sticks[port] || sticks[port]->hid != 3 || request != 6 || value != 0x2200) return false;
+    memcpy(buffer.data(), kTabletDescriptor, buffer.size() < sizeof kTabletDescriptor ? buffer.size() : sizeof kTabletDescriptor);
+    return true;
+  }
+  bool start_interrupt_in(uint32_t port, uint8_t, uint16_t, uint8_t) override {
+    std::lock_guard<std::recursive_mutex> g(m);
+    return port < kPorts && sticks[port] && sticks[port]->hid && !sticks[port]->fail_start;
+  }
+  bool poll_interrupt_in(uint32_t port, uint8_t, ByteView buffer, uint16_t* length) override {
+    std::lock_guard<std::recursive_mutex> g(m);
+    if (port >= kPorts || !sticks[port] || sticks[port]->reports.empty()) return false;
+    const Bytes r = sticks[port]->reports.front();
+    sticks[port]->reports.erase(sticks[port]->reports.begin());
+    const size_t n = r.size() < buffer.size() ? r.size() : buffer.size();
+    memcpy(buffer.data(), r.data(), n);
+    *length = static_cast<uint16_t>(n);
+    return true;
+  }
+  // The device sends a report (it is read by whoever polls the port).
+  void send_report(uint32_t port, const Bytes& report) {
+    std::lock_guard<std::recursive_mutex> g(m);
+    if (port < kPorts && sticks[port]) sticks[port]->reports.push_back(report);
+  }
   bool start_bulk_endpoint(uint32_t port, uint8_t, uint16_t) override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts && sticks[port]; }
   bool reset_bulk_endpoint(uint32_t port, uint8_t) override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts && sticks[port]; }
 
@@ -176,12 +223,12 @@ struct FakeStickHost final : IUsbHostController {
 
   void plug(uint32_t port, Stick* stick) { std::lock_guard<std::recursive_mutex> g(m);
     sticks[port] = stick;
-    ++generation[port];
+    if (hotplug) ++generation[port];
     events.push_back({0, port, true});
   }
   void unplug(uint32_t port) { std::lock_guard<std::recursive_mutex> g(m);
     sticks[port] = nullptr;
-    ++generation[port];
+    if (hotplug) ++generation[port];
     events.push_back({0, port, false});
   }
 
@@ -293,10 +340,13 @@ struct FakeUsb final : IUsbBus {
   bool port_info(uint32_t c, uint32_t p, UsbPortInfo* out) const override { return hosts[c]->port_info(p, out); }
   bool device_descriptor(uint32_t c, uint32_t p, UsbDeviceDescriptor* out) const override { return hosts[c]->device_descriptor(p, out); }
   IUsbHostController* host_controller(uint32_t c) override { return c < hosts.size() ? hosts[c] : nullptr; }
-  bool poll_hotplug(UsbHotplugEvent* event) override {
-    for (uint32_t c = 0; c < hosts.size(); ++c)
-      if (hosts[c]->supports_hotplug() && hosts[c]->poll_hotplug(event)) { event->controller = c; return true; }
-    return false;
+  bool service_hotplug() override {
+    bool changed = false;
+    for (FakeStickHost* h : hosts) {
+      UsbHotplugEvent event;
+      while (h->supports_hotplug() && h->poll_hotplug(&event)) changed = true;
+    }
+    return changed;
   }
 };
 

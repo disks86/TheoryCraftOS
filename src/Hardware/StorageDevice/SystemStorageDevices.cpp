@@ -119,6 +119,7 @@ void SystemStorageDevices::initialize() {
   find_native(found);
   find_firmware(found);
   adopt(found, false);
+  watcher_.snapshot();   // what was plugged in at start-up has been taken over; later ports are new
 }
 
 void SystemStorageDevices::shutdown() {
@@ -181,17 +182,17 @@ bool SystemStorageDevices::poll(StorageEvent* event) {
         return true;
       }
     }
-    UsbHotplugEvent change;
-    if (!usb_ || !usb_->poll_hotplug(&change)) return false;
-    if (!change.connected) {
+    if (!usb_) return false;
+    // Look for the USB sticks that went (their port moved on to another device or to none), then for new ones.
+    watcher_.scan([&](uint32_t, IUsbHostController& host, uint32_t port) {
       sweep_removed();
-      continue;
-    }
-    IUsbHostController* host = usb_->host_controller(change.controller);
-    if (!host) continue;
-    List<UniquePointer<IStorageDevice>> found(allocator_);
-    UsbMassStorageDevice::discover_port(*host, change.port, allocator_, st_, found);
-    adopt(found, true);
+      List<UniquePointer<IStorageDevice>> found(allocator_);
+      UsbMassStorageDevice::discover_port(host, port, allocator_, st_, found);
+      adopt(found, true);
+    });
+    sweep_removed();   // (a stick that was pulled out and nothing came: no port reports it, but the device knows)
+    kernel::ScopedMutex guard(mutex_);
+    if (pending_.count() == 0) return false;
   }
   return false;
 }

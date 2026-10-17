@@ -21,13 +21,49 @@
 namespace hardware {
 
 bool CompositeMouse::add(IMouse* mouse) {
+  kernel::ScopedMutex guard(mutex_);
   if (!mouse || count_ == kMaxMice) return false;
   mice_[count_++] = mouse;
   return true;
 }
 
+bool CompositeMouse::remove(IMouse* mouse) {
+  kernel::ScopedMutex guard(mutex_);
+  for (uint32_t i = 0; i < count_; ++i) {
+    if (mice_[i] != mouse) continue;
+    MouseEvent event;
+    for (uint32_t n = 0; n < 4 * kOrphans && mouse->poll(&event); ++n)
+      if (orphan_count_ < kOrphans) {
+        orphans_[(orphan_head_ + orphan_count_) % kOrphans] = event;
+        ++orphan_count_;
+      }
+    for (uint32_t k = i + 1; k < count_; ++k) mice_[k - 1] = mice_[k];
+    mice_[--count_] = nullptr;
+    if (count_ > 0) next_ %= count_;
+    else next_ = 0;
+    return true;
+  }
+  return false;
+}
+
+uint32_t CompositeMouse::count() const {
+  kernel::ScopedMutex guard(mutex_);
+  return count_;
+}
+
+IMouse* CompositeMouse::at(uint32_t index) const {
+  kernel::ScopedMutex guard(mutex_);
+  return index < count_ ? mice_[index] : nullptr;
+}
+
 bool CompositeMouse::poll(MouseEvent* out) {
   kernel::ScopedMutex guard(mutex_);
+  if (orphan_count_ > 0 && out) {
+    *out = orphans_[orphan_head_];
+    orphan_head_ = (orphan_head_ + 1) % kOrphans;
+    --orphan_count_;
+    return true;
+  }
   for (uint32_t i = 0; i < count_; ++i) {
     IMouse* m = mice_[(next_ + i) % count_];
     if (m->poll(out)) {

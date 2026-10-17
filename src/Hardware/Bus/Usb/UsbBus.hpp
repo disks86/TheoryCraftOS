@@ -21,6 +21,7 @@
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Bus/Usb/IUsbHostController.hpp"
+#include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "uefi.hpp"
@@ -46,7 +47,7 @@ class UsbBus final : public IUsbBus {
   uint32_t port_count(uint32_t controller) const override;
   bool port_info(uint32_t controller, uint32_t port, UsbPortInfo* out) const override;
   bool device_descriptor(uint32_t controller, uint32_t port, UsbDeviceDescriptor* out) const override;
-  bool poll_hotplug(UsbHotplugEvent* event) override;
+  bool service_hotplug() override;
   IUsbHostController* host_controller(uint32_t controller) override {
     return controller < controllers_.count() ? controllers_[controller].host.get() : nullptr;
   }
@@ -61,7 +62,7 @@ class UsbBus final : public IUsbBus {
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;
   List<Controller> controllers_;
-  uint32_t next_poll_ = 0;
+  kernel::Mutex hotplug_mutex_;   // one thread services the controllers at a time
 };
 
 }  // namespace hardware

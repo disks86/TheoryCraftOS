@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest UvcTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PartitionTest FileSystemTest StorageHotplugTest StorageHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest UvcTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PartitionTest FileSystemTest StorageHotplugTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -58,6 +58,12 @@ for t in "${WANTED[@]}"; do
                           src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp \
                           src/Hardware/StorageDevice/StorageDeviceBase.cpp src/Hardware/StorageDevice/SystemStorageDevices.cpp src/Hardware/StorageDevice/*/*.cpp \
                           src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp src/FileSystem/Mount/*.cpp src/SystemFileSystem.cpp ;;
+    InputHotplugTest) build_and_run InputHotplugTest tests/InputHotplugTest.cpp tests/UsbAudioStubs.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Paging.cpp \
+                        src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp src/Hardware/Bus/Virtio/VirtioInputDevice.cpp \
+                        src/Hardware/SystemInput.cpp src/Hardware/Bus/Ps2/*.cpp src/Hardware/Keyboard/*.cpp src/Hardware/Keyboard/*/*.cpp src/Hardware/Mouse/*.cpp src/Hardware/Mouse/*/*.cpp \
+                        src/Hardware/Bus/Usb/Hid/*.cpp \
+                        src/Hardware/StorageDevice/StorageDeviceBase.cpp src/Hardware/StorageDevice/SystemStorageDevices.cpp src/Hardware/StorageDevice/*/*.cpp \
+                        src/FileSystem/FileSystemTypes.cpp ;;
     StreamTest) build_and_run StreamTest tests/StreamTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Stream/StreamStatus.cpp src/Async/Executor.cpp \
                   src/Stream/Memory/*.cpp src/Stream/File/*.cpp src/Stream/Tcp/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp \
                   src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
@@ -98,6 +104,14 @@ for t in "${WANTED[@]}"; do
         src/Hardware/StorageDevice/StorageDeviceBase.cpp src/Hardware/StorageDevice/SystemStorageDevices.cpp src/Hardware/StorageDevice/*/*.cpp \
         src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp src/FileSystem/Mount/*.cpp src/SystemFileSystem.cpp
       "$out/StorageHotplugThreadTest" ;;
+    InputHotplugThreadTest)  # real threads, checked with ThreadSanitizer
+      echo "== InputHotplugThreadTest"
+      $cxx -std=c++20 -O1 -g -fsanitize=thread -pthread -I src -I tests -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-misleading-indentation -Wno-delete-non-virtual-dtor \
+        -o "$out/InputHotplugThreadTest" tests/InputHotplugThreadTest.cpp tests/HostThreads.cpp tests/UsbAudioStubs.cpp src/Kernel/Paging.cpp \
+        src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp src/Hardware/Bus/Virtio/VirtioInputDevice.cpp \
+        src/Hardware/SystemInput.cpp src/Hardware/Bus/Ps2/*.cpp src/Hardware/Keyboard/*.cpp src/Hardware/Keyboard/*/*.cpp src/Hardware/Mouse/*.cpp src/Hardware/Mouse/*/*.cpp \
+        src/Hardware/Bus/Usb/Hid/*.cpp
+      "$out/InputHotplugThreadTest" ;;
     GuiThreadTest)  # real threads, checked with ThreadSanitizer (cannot be combined with the address sanitizer)
       echo "== GuiThreadTest"
       $cxx -std=c++20 -O1 -g -fsanitize=thread -pthread -I src -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-misleading-indentation -Wno-delete-non-virtual-dtor \

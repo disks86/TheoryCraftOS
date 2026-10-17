@@ -24,7 +24,10 @@ namespace hardware {
 
 // Presents several mice/tablets as one stream of events. Children are not
 // owned. Absolute and relative events can interleave; check MouseEvent::absolute
-// (and use the producing device's max_x()/max_y() through at()).
+// (and use the producing device's max_x()/max_y() through at()). Mice may be
+// added and removed while other threads poll (USB hot-plug); a removed mouse's
+// remaining events are still delivered, and nothing calls into it once remove()
+// has returned.
 class CompositeMouse final : public IMouse {
  public:
   static constexpr uint32_t kMaxMice = 8;
@@ -36,8 +39,11 @@ class CompositeMouse final : public IMouse {
   void shutdown() override {}
 
   bool add(IMouse* mouse);
-  uint32_t count() const { return count_; }
-  IMouse* at(uint32_t index) const { return index < count_ ? mice_[index] : nullptr; }
+  // Takes a mouse out; its remaining events (a button release, if the caller asked it to) are kept and delivered by poll() first.
+  bool remove(IMouse* mouse);
+  uint32_t count() const;
+  // (A pointer for use on the thread that adds and removes mice, or while none can be removed.)
+  IMouse* at(uint32_t index) const;
 
   bool poll(MouseEvent* out) override;
   bool is_absolute() const override { return false; }
@@ -45,7 +51,11 @@ class CompositeMouse final : public IMouse {
   uint32_t max_y() const override { return 0; }
 
  private:
-  kernel::Mutex mutex_;  // polling threads take turns
+  static constexpr uint32_t kOrphans = 64;
+
+  mutable kernel::Mutex mutex_;  // polling threads take turns, and the list changes under it
+  MouseEvent orphans_[kOrphans] = {};   // events of mice that were removed
+  uint32_t orphan_head_ = 0, orphan_count_ = 0;
   IMouse* mice_[kMaxMice] = {};
   uint32_t count_ = 0;
   uint32_t next_ = 0;

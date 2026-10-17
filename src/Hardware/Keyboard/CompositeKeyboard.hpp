@@ -23,7 +23,10 @@
 namespace hardware {
 
 // Presents several keyboards as one: poll() returns events from whichever has
-// them, and modifiers() is the union. Children are not owned.
+// them, and modifiers() is the union. Children are not owned. Keyboards may be
+// added and removed while other threads poll (USB hot-plug); a removed
+// keyboard's remaining events are still delivered, and nothing calls into it
+// once remove() has returned.
 class CompositeKeyboard final : public IKeyboard {
  public:
   static constexpr uint32_t kMaxKeyboards = 8;
@@ -35,14 +38,22 @@ class CompositeKeyboard final : public IKeyboard {
   void shutdown() override {}
 
   bool add(IKeyboard* keyboard);
-  uint32_t count() const { return count_; }
-  IKeyboard* at(uint32_t index) const { return index < count_ ? keyboards_[index] : nullptr; }
+  // Takes a keyboard out. Whatever events it still has (a release for every key it held, if the caller asked it to) are kept and delivered
+  // by poll() first. False if it was not there.
+  bool remove(IKeyboard* keyboard);
+  uint32_t count() const;
+  // (A pointer for use on the thread that adds and removes keyboards, or while none can be removed.)
+  IKeyboard* at(uint32_t index) const;
 
   bool poll(KeyEvent* out) override;
   uint8_t modifiers() const override;
 
  private:
-  kernel::Mutex mutex_;  // polling threads take turns
+  static constexpr uint32_t kOrphans = 64;
+
+  mutable kernel::Mutex mutex_;  // polling threads take turns, and the list changes under it
+  KeyEvent orphans_[kOrphans] = {};   // events of keyboards that were removed
+  uint32_t orphan_head_ = 0, orphan_count_ = 0;
   IKeyboard* keyboards_[kMaxKeyboards] = {};
   uint32_t count_ = 0;
   uint32_t next_ = 0;  // round-robin start, so one chatty device cannot starve the rest

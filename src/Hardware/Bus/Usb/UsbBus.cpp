@@ -107,17 +107,15 @@ bool UsbBus::device_descriptor(uint32_t controller, uint32_t port, UsbDeviceDesc
   return controllers_[controller].host->device_descriptor(port, out);
 }
 
-bool UsbBus::poll_hotplug(UsbHotplugEvent* event) {
-  for (uint32_t i = 0; i < controllers_.count(); ++i) {
-    // Start after the controller that reported last, so a busy one cannot starve the others.
-    const uint32_t c = (next_poll_ + i) % static_cast<uint32_t>(controllers_.count());
-    IUsbHostController* host = controllers_[c].host.get();
-    if (!host || !host->supports_hotplug() || !host->poll_hotplug(event)) continue;
-    event->controller = c;
-    next_poll_ = c;
-    return true;
+bool UsbBus::service_hotplug() {
+  kernel::ScopedMutex guard(hotplug_mutex_);
+  bool changed = false;
+  for (Controller& c : controllers_) {
+    if (!c.host || !c.host->supports_hotplug()) continue;
+    UsbHotplugEvent event;
+    for (uint32_t n = 0; n < 64 && c.host->poll_hotplug(&event); ++n) changed = true;   // (the events themselves are not kept: the ports' generations are the record)
   }
-  return false;
+  return changed;
 }
 
 }  // namespace hardware

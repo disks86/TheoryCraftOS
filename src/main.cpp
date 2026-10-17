@@ -123,6 +123,19 @@ static void on_storage_change(void* context, StringView text) {
   static_cast<desktop::Desktop*>(context)->explorer().refresh();
 }
 
+// A USB keyboard or mouse was plugged in or pulled out: say so on the debug console, and show the pointer only while there is a mouse.
+struct InputHotplugContext {
+  hardware::SystemInput* input;
+  desktop::Desktop* desktop;
+};
+static void on_input_change(void* context, StringView text) {
+  auto* c = static_cast<InputHotplugContext*>(context);
+  console::debug_puts("Input: ");
+  console::debug_puts(text);
+  console::debug_puts("\n");
+  c->desktop->window().show_cursor(c->input->mice().count() > 0);
+}
+
 static bool read_local_time(void* context, desktop::DateTime* out) {
   auto* st = static_cast<efi::SystemTable*>(context);
   efi::Time t{};
@@ -507,8 +520,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The desktop: runs until Shut Down is chosen from the Start menu (or, with no display, until a key).
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer) {
-    desktop::Desktop desktop(shared_allocator, *renderer, input.keyboards().count() ? &input.keyboard() : nullptr,
-                             input.mice().count() ? &input.mouse() : nullptr);
+    // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
+    desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
+    desktop.window().show_cursor(input.mice().count() > 0);
+    InputHotplugContext input_hotplug{&input, &desktop};
+    input.set_notifier(on_input_change, &input_hotplug);
+    if (!input.start_service()) Entry(Level::Warning, "Input").text("could not start hot-plug polling; USB keyboards and mice plugged in later are not seen");
     SystemFileSystem explorer_files(shared_allocator, storage);
     desktop.set_file_system(&explorer_files.file_system());
     explorer_files.set_notifier(on_storage_change, &desktop);
@@ -530,6 +547,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       hardware::delay_us(4000);
     }
+    input.stop_service();  // (its notices touch the desktop)
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
   } else {
     console::puts("No desktop (no graphics display). Press any key to shut down.\n");

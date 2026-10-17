@@ -82,6 +82,16 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   mid-command, a port that gets another stick before the removal was seen, partitioned and blank sticks, handles outliving volumes);
   `tests/StorageHotplugThreadTest.cpp` does it with real threads under ThreadSanitizer. The xHCI port-change handling itself has no
   test (it needs a simulated controller) and has not been run on hardware or QEMU.
+  USB HID hot-plug: several drivers watch the same ports, so `UsbBus::service_hotplug()` only makes the controllers do their work and
+  each driver finds what changed through `UsbPortWatcher` (it remembers every root port's generation and reports ports with a
+  new device; storage works this way too). `SystemInput::poll()` (or its "input-hotplug" service, 250 ms) takes up keyboards, mice
+  and tablets plugged in later and drops those pulled out: the device first releases the keys and buttons it held
+  (`KeyboardBase::release_all()`, `MouseBase::release_all()`), `CompositeKeyboard::remove()` / `CompositeMouse::remove()` hand over
+  what it still had and nothing calls into it afterwards, and it is freed. The merged `keyboard()` and `mouse()` are thread-safe
+  against that; the desktop is always given them (even with no device yet) and shows the pointer only while a mouse exists. Limits: xHCI
+  only, no hubs, at most 8 keyboards and 8 mice (a ninth is left alone and not retried), a keyboard's LEDs and
+  non-pointer/non-keyboard HID devices (gamepads, media keys) are not handled, and a machine without a screen does not poll.
+  `tests/InputHotplugTest.cpp` and (ThreadSanitizer) `tests/InputHotplugThreadTest.cpp` cover it against a fake controller.
 - `src/Hardware/AudioDevice/`: audio output. `IAudioDevice` plays one fixed format (48 kHz, 16-bit signed, stereo)
   and is polled: `write()` copies whole frames into the device's ring and returns how many it took, `queued_bytes()` /
   `free_bytes()` say how much is waiting, plus volume, mute and statistics (frames played, underruns). A cyclic-DMA

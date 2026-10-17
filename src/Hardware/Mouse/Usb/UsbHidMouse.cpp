@@ -71,6 +71,15 @@ bool UsbHidMouse::initialize() {
                                   interface_.interval);
 }
 
+void UsbHidMouse::on_release_all() {
+  if (last_.buttons == 0) return;
+  MouseEvent e = last_;
+  e.buttons = 0;
+  e.dx = e.dy = e.wheel = 0;
+  last_ = e;
+  push(e);
+}
+
 void UsbHidMouse::fetch() {
   uint8_t report[64];
   uint16_t length = 0;
@@ -94,6 +103,7 @@ void UsbHidMouse::fetch() {
       e.y = y < 0 ? 0 : static_cast<uint32_t>(y);
     }
     e.wheel = hid_extract(received, layout_.wheel, id);  // HID +wheel is away from the user
+    last_ = e;
     push(e);
   }
 }

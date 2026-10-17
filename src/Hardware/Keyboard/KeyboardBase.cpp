@@ -31,6 +31,11 @@ void KeyboardBase::push(uint8_t usage, bool pressed) {
   ++count_;
 }
 
+void KeyboardBase::release_all() {
+  kernel::ScopedMutex guard(mutex_);
+  on_release_all();
+}
+
 bool KeyboardBase::poll(KeyEvent* out) {
   kernel::ScopedMutex guard(mutex_);
   if (count_ == 0) fetch();

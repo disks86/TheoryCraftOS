@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
+#include "Hardware/Bus/Usb/UsbPortWatcher.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Kernel/Sync.hpp"
@@ -49,7 +50,7 @@ class SystemStorageDevices {
   // `usb` may be null; without it USB mass storage is left to the firmware (which
   // cannot see devices on a controller this OS has taken over).
   SystemStorageDevices(IPciBus& pci, IUsbBus* usb, allocators::IAllocator& allocator, efi::SystemTable* st)
-      : pci_(pci), usb_(usb), allocator_(allocator), st_(st), devices_(allocator), pending_(allocator) {}
+      : pci_(pci), usb_(usb), allocator_(allocator), st_(st), devices_(allocator), pending_(allocator), watcher_(usb) {}
 
   void initialize();
   // Stops every device and frees them.
@@ -87,6 +88,7 @@ class SystemStorageDevices {
   List<Entry> devices_;
   List<StorageEvent> pending_;    // changes found but not yet handed out
   uint32_t next_id_ = 1;
+  UsbPortWatcher watcher_;        // the USB ports as last looked at
 };
 
 }  // namespace hardware

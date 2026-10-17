@@ -28,18 +28,23 @@ namespace hardware {
 class UsbHidKeyboard final : public KeyboardBase {
  public:
   UsbHidKeyboard(IUsbHostController& host, uint32_t port, const UsbHidInterface& interface)
-      : host_(host), port_(port), interface_(interface) {}
+      : host_(host), port_(port), interface_(interface), generation_(host.port_generation(port)) {}
 
   const char* name() const override { return "USB HID keyboard"; }
   bool initialize() override;
   void shutdown() override {}
 
+  // False once the keyboard was unplugged (the port's generation moved on).
+  bool present() const { return host_.port_generation(port_) == generation_; }
+
  private:
   void fetch() override;
+  void on_release_all() override;
 
   IUsbHostController& host_;
   uint32_t port_;
   UsbHidInterface interface_;
+  uint32_t generation_;
   uint8_t previous_[8] = {};
 };
 

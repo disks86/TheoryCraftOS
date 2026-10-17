@@ -32,6 +32,11 @@ void MouseBase::push(const MouseEvent& event) {
   ++count_;
 }
 
+void MouseBase::release_all() {
+  kernel::ScopedMutex guard(mutex_);
+  on_release_all();
+}
+
 bool MouseBase::poll(MouseEvent* out) {
   kernel::ScopedMutex guard(mutex_);
   if (count_ == 0) fetch();

@@ -29,12 +29,15 @@ class KeyboardBase : public IKeyboard {
  public:
   bool poll(KeyEvent* out) override;
   uint8_t modifiers() const override { return modifiers_; }
+  // The device is going away: queues a release for every key it still holds down, so nothing stays pressed in whoever reads the events.
+  void release_all();
 
  protected:
   constexpr KeyboardBase() = default;
   ~KeyboardBase() = default;
 
   virtual void fetch() = 0;
+  virtual void on_release_all() {}   // (with the lock held) push() the releases
   void push(uint8_t usage, bool pressed);
 
  private:
