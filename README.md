@@ -131,7 +131,12 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   sequence were checked against HP's Linux driver source (hplip `io/hpmud/dot4.c`). `UsbPrinter` prefers a plain bidirectional
   interface, then protocol 3, then unidirectional; on a protocol-3 interface `submit()` and `read_back()` go through the channel, a printer
   with no credit to spare just makes `poll()` wait (not a failure), and a broken session is reopened. Not tried on a physical printer.
-  The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). Not covered: SNMPv3, traps, IPP,
+  **SNMPv3 and traps:** `SnmpUsm` implements USM (MD5/SHA-1/SHA-224/SHA-256 authentication, DES/AES-128 privacy, key localization,
+  engine discovery and time sync) on top of `src/Crypto` (hashes, HMAC, AES, DES, checked against OpenSSL); the v3 client was checked
+  live against a pysnmp agent. `SnmpTrapReceiver` (UDP 162, needs IGMP/multicast-free unicast only) decodes v1/v2c/v3 traps and informs
+  (v2c informs are acknowledged, v3 informs are not); `PrinterAlertListener` turns prtAlert and standard traps into events, and
+  `SystemPrinters::enable_alerts()` refreshes the sending printer's report. Never run against a real printer.
+  The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). Not covered: IPP,
   discovery of network printers (BRAdmin, mDNS), several simultaneous 1284.4 channels, the printer's Epson FX / IBM emulation, PCL 6
   (PCL XL) output, duplex and colour (the engine has neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure,
   text layout, both network transports and failures, and the USB driver against a scripted host controller (descriptors, device ID,

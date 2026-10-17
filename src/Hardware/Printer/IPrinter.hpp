@@ -55,6 +55,8 @@ class IPrinter {
   // Asks the printer how it is: error conditions, page count, supplies and alerts (see PrinterReport; what is filled in depends
   // on how the printer is connected). Starts the query and returns; poll() carries it out and report_pending() turns false when
   // report() is current. False if the printer cannot be asked or a query is already running.
+  // The printer's IPv4 address as one number (a.b.c.d with a in the top byte) if it has one, else 0; lets notifications from the network be matched to it.
+  virtual uint32_t ipv4_address() const { return 0; }
   virtual bool request_report() { return false; }
   virtual bool report_pending() const { return false; }
   // The last completed report, or nullptr if there is none yet.

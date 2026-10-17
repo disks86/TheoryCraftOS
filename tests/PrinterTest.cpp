@@ -29,6 +29,7 @@
 #include "Hardware/Printer/Usb/UsbPrinter.hpp"
 #include "Hardware/Printer/PrinterMonitor.hpp"
 #include "Network/Snmp/SnmpUsm.hpp"
+#include "Hardware/Printer/PrinterAlertListener.hpp"
 #include <algorithm>
 #include <map>
 #include "NetworkHarness.hpp"
@@ -1220,6 +1221,178 @@ static void test_snmp_v3_monitor() {
   }
 }
 
+
+// ---- SNMP traps ----
+
+static void send_msg(SharedPointer<IUdpSocket>& from_socket, const SnmpMessage& m, Lan& lan, uint16_t port = 162) {
+  ByteBuffer out(lan.alloc);
+  assert(encode_snmp(m, lan.alloc, &out));
+  assert(from_socket->send_to(Ipv4Address::make(10, 0, 0, 1), port, out.view()));
+}
+
+static SnmpMessage v2_trap(const char* trap_oid, SnmpPdu pdu = SnmpPdu::TrapV2, uint32_t request_id = 77) {
+  SnmpMessage m;
+  m.version = 1;
+  m.pdu = pdu;
+  m.request_id = request_id;
+  m.count = 2;
+  m.binds[0].oid = O("1.3.6.1.2.1.1.3.0");
+  m.binds[0].value = vint(123456, SnmpType::TimeTicks);
+  m.binds[1].oid = O("1.3.6.1.6.3.1.1.4.1.0");
+  m.binds[1].value.type = SnmpType::ObjectId;
+  m.binds[1].value.oid = O(trap_oid);
+  return m;
+}
+
+static void test_traps() {
+  Lan lan;
+  lan.configure_static();
+  auto printer = lan.b.udp_open(0);   // the printer's side
+  SnmpTrapReceiver rx(lan.a, lan.alloc);
+  assert(!rx.running() && rx.start() && rx.running() && rx.start());
+  assert(!lan.a.udp_open(162));   // the port is taken
+  auto pump = [&](int ms = 20) { lan.step(ms); rx.poll(); };
+
+  // Version 1 trap: a generic one (linkDown) and an enterprise-specific one.
+  SnmpMessage t1;
+  t1.version = 0;
+  t1.pdu = SnmpPdu::TrapV1;
+  t1.trap1.enterprise = O("1.3.6.1.4.1.2435.2.3.9");
+  t1.trap1.agent_address[0] = 10; t1.trap1.agent_address[3] = 2;
+  t1.trap1.generic = 2;
+  t1.trap1.timestamp = 4242;
+  t1.count = 1;
+  t1.binds[0].oid = O("1.3.6.1.2.1.2.2.1.1.1");
+  t1.binds[0].value = vint(1);
+  send_msg(printer, t1, lan);
+  t1.trap1.generic = 6;
+  t1.trap1.specific = 17;
+  send_msg(printer, t1, lan);
+  pump();
+  SnmpNotification n;
+  CHECK(rx.pending() == 2 && rx.next(&n) && n.version == 0 && !n.inform && n.trap_oid == O("1.3.6.1.6.3.1.1.5.3") && n.uptime == 4242 &&
+        n.agent_address == Ipv4Address::make(10, 0, 0, 2) && n.source == Ipv4Address::make(10, 0, 0, 2) && n.count == 1 && n.find(O("1.3.6.1.2.1.2.2.1.1.1")) &&
+        strcmp(n.community, "public") == 0 && n.enterprise == O("1.3.6.1.4.1.2435.2.3.9"));
+  CHECK(rx.next(&n) && n.trap_oid == O("1.3.6.1.4.1.2435.2.3.9.0.17") && !rx.next(&n));
+
+  // Version 2c trap, and an inform that must be acknowledged.
+  SnmpMessage t2 = v2_trap("1.3.6.1.6.3.1.1.5.1");
+  send_msg(printer, t2, lan);
+  pump();
+  CHECK(rx.next(&n) && n.version == 1 && n.trap_oid == O("1.3.6.1.6.3.1.1.5.1") && n.uptime == 123456 && n.count == 0);
+  SnmpMessage inf = v2_trap("1.3.6.1.6.3.1.1.5.2", SnmpPdu::Inform, 9001);
+  inf.count = 3;
+  inf.binds[2].oid = O("1.3.6.1.2.1.1.5.0");
+  inf.binds[2].value = vstr("hl2070");
+  send_msg(printer, inf, lan);
+  pump();
+  uint8_t buf[1500];
+  Ipv4Address from; uint16_t port; uint32_t len;
+  CHECK(rx.next(&n) && n.inform && n.count == 1 && n.find(O("1.3.6.1.2.1.1.5.0")));
+  lan.step(20);
+  SnmpMessage ack;
+  CHECK(printer->receive_from(ByteView(buf), &from, &port, &len) && decode_snmp(ConstByteView(buf, len), &ack) && ack.pdu == SnmpPdu::Response && ack.request_id == 9001 && ack.count == 3 && port == 162);
+
+  // Communities: only the ones named pass.
+  CHECK(rx.accept_community("secret") && !rx.accept_community(nullptr));
+  send_msg(printer, t2, lan);
+  pump();
+  CHECK(rx.pending() == 0 && rx.rejected() == 1);
+  strcpy(t2.community, "secret");
+  send_msg(printer, t2, lan);
+  pump();
+  CHECK(rx.pending() == 1 && rx.next(&n) && strcmp(n.community, "secret") == 0);
+
+  // Junk, a response PDU and a truncated message are refused.
+  const uint8_t junk[] = {0x30, 0x05, 0x02, 0x01, 0x01, 0x04, 0x00};
+  printer->send_to(Ipv4Address::make(10, 0, 0, 1), 162, ConstByteView(junk, sizeof junk));
+  SnmpMessage resp = v2_trap("1.3.6.1.6.3.1.1.5.1", SnmpPdu::Response);
+  strcpy(resp.community, "secret");
+  send_msg(printer, resp, lan);
+  pump();
+  CHECK(rx.pending() == 0 && rx.rejected() == 3);
+
+  // The queue keeps the newest sixteen.
+  for (uint32_t i = 0; i < 20; ++i) { SnmpMessage x = v2_trap("1.3.6.1.6.3.1.1.5.4", SnmpPdu::TrapV2, i); strcpy(x.community, "secret"); x.binds[0].value = vint(i, SnmpType::TimeTicks); send_msg(printer, x, lan); lan.step(3); }
+  pump();
+  CHECK(rx.pending() == 16 && rx.dropped() == 4 && rx.next(&n) && n.uptime == 4);
+
+  // Version 3 traps from a known user: authenticated and encrypted with keys for the sender's engine ID.
+  {
+    SnmpTrapReceiver v3rx(lan.a, lan.alloc, 1162);
+    assert(v3rx.start());
+    CHECK(v3rx.add_v3_user("alerts", UsmAuth::HmacSha1, "authpassword", UsmPriv::Aes128, "privpassword") && !v3rx.add_v3_user("x", UsmAuth::None, "", UsmPriv::Des, "pass"));
+    const uint8_t engine[12] = {0x80, 0, 0x0a, 0x13, 5, 'H', 'L', '2', '0', '7', '0', 'N'};
+    UsmKeys keys;
+    CHECK(usm_make_keys(UsmAuth::HmacSha1, "authpassword", UsmPriv::Aes128, "privpassword", engine, sizeof engine, &keys));
+    SnmpMessage t3 = v2_trap("1.3.6.1.2.1.43.18.2.0.1");
+    t3.version = 3;
+    t3.v3.msg_id = 5;
+    t3.v3.engine_id_length = sizeof engine;
+    memcpy(t3.v3.engine_id, engine, sizeof engine);
+    memcpy(t3.v3.context_engine_id, engine, sizeof engine);
+    t3.v3.context_engine_id_length = sizeof engine;
+    t3.v3.boots = 7;
+    t3.v3.time = 300;
+    strcpy(t3.v3.user, "alerts");
+    ByteBuffer out(lan.alloc);
+    CHECK(encode_snmp_v3(t3, &keys, 1, lan.alloc, &out));
+    printer->send_to(Ipv4Address::make(10, 0, 0, 1), 1162, out.view());
+    UsmKeys wrong = keys;
+    wrong.auth_key[1] ^= 1;
+    CHECK(encode_snmp_v3(t3, &wrong, 2, lan.alloc, &out));
+    printer->send_to(Ipv4Address::make(10, 0, 0, 1), 1162, out.view());
+    strcpy(t3.v3.user, "stranger");
+    CHECK(encode_snmp_v3(t3, &keys, 3, lan.alloc, &out));
+    printer->send_to(Ipv4Address::make(10, 0, 0, 1), 1162, out.view());
+    lan.step(30);
+    v3rx.poll();
+    CHECK(v3rx.pending() == 1 && v3rx.rejected() == 2 && v3rx.next(&n) && n.version == 3 && strcmp(n.user, "alerts") == 0 && n.trap_oid == O("1.3.6.1.2.1.43.18.2.0.1") && n.uptime == 123456);
+  }
+}
+
+struct AlertLog { int count = 0; IPrinter* printer = nullptr; PrinterAlertEvent last; };
+static void on_alert(void* context, IPrinter* printer, const PrinterAlertEvent& event) {
+  AlertLog* log = static_cast<AlertLog*>(context);
+  ++log->count;
+  log->printer = printer;
+  log->last = event;
+}
+
+static void test_printer_alerts() {
+  Lan lan;
+  lan.configure_static();
+  FakeAgent agent(lan);
+  populate_hl2070n(agent);
+  auto sender = lan.b.udp_open(0);
+  SystemPrinters printers(lan.alloc);
+  CHECK(printers.add(UniquePointer<IPrinter>(UniquePointer<BrotherHl2070n>::make(lan.alloc, lan.a, Ipv4Address::make(10, 0, 0, 2), lan.alloc))));
+  AlertLog log;
+  CHECK(printers.enable_alerts(lan.a, on_alert, &log) && printers.alerts());
+  // prtAlert: warning, marker supplies group (7), index 1, code 12 "almost empty", located at the toner
+  SnmpMessage t = v2_trap("1.3.6.1.2.1.43.18.2.0.1");
+  t.count = 7;
+  t.binds[2].oid = O("1.3.6.1.2.1.43.18.1.1.2.1.5"); t.binds[2].value = vint(4);
+  t.binds[3].oid = O("1.3.6.1.2.1.43.18.1.1.4.1.5"); t.binds[3].value = vint(7);
+  t.binds[4].oid = O("1.3.6.1.2.1.43.18.1.1.5.1.5"); t.binds[4].value = vint(1);
+  t.binds[5].oid = O("1.3.6.1.2.1.43.18.1.1.6.1.5"); t.binds[5].value = vstr("Black toner");
+  t.binds[6].oid = O("1.3.6.1.2.1.43.18.1.1.7.1.5"); t.binds[6].value = vint(12);
+  send_msg(sender, t, lan);
+  for (int i = 0; i < 20; ++i) { lan.step(); printers.poll(); }
+  CHECK(log.count == 1 && log.printer == printers.at(0) && log.last.kind == PrinterAlertEvent::Kind::Alert && log.last.severity == AlertSeverity::Warning && log.last.group == 7 &&
+        log.last.group_index == 1 && log.last.code == 12 && strcmp(log.last.location, "Black toner") == 0 && log.last.uptime == 123456 && printers.alerts_handled() == 1);
+  CHECK(printers.at(0)->report_pending());   // the alert made the printer look again
+  for (int i = 0; i < 30000 && printers.at(0)->report_pending(); ++i) { lan.step(); agent.step(); printers.poll(); }
+  CHECK(printers.at(0)->report() && printers.at(0)->report()->page_count == 12345);
+  // A generic trap from an address that is not a known printer still reaches the callback.
+  auto stranger = lan.b.udp_open(0);
+  SnmpMessage cold = v2_trap("1.3.6.1.6.3.1.1.5.1");
+  send_msg(stranger, cold, lan);
+  for (int i = 0; i < 20; ++i) { lan.step(); printers.poll(); }
+  CHECK(log.count == 2 && log.last.kind == PrinterAlertEvent::Kind::ColdStart && log.last.source == Ipv4Address::make(10, 0, 0, 2));
+  printers.shutdown();
+}
+
 int main() {
   test_packbits();
   test_pages_and_halftone();
@@ -1235,6 +1408,8 @@ int main() {
   test_snmp_messages();
   test_printer_monitor();
   test_snmp_v3_monitor();
+  test_traps();
+  test_printer_alerts();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

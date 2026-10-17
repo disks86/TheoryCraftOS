@@ -59,6 +59,7 @@ class NetworkPrinter : public IPrinter {
   bool set_snmp_v3_user(const char* user, network::UsmAuth auth, const char* auth_password, network::UsmPriv priv, const char* priv_password);
 
   network::Ipv4Address address() const { return address_; }
+  uint32_t ipv4_address() const override { return address_.value(); }
   PrintProtocol protocol() const { return protocol_; }
   void set_protocol(PrintProtocol protocol) { protocol_ = protocol; }
   void set_lpd_queue(const char* queue) { lpd_queue_ = queue; }

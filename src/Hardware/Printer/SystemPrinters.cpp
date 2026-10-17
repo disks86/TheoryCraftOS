@@ -42,11 +42,31 @@ void SystemPrinters::set_default(uint32_t index) {
   printers_[0] = util::move(chosen);
 }
 
+bool SystemPrinters::enable_alerts(network::INetworkStack& stack, AlertCallback callback, void* context) {
+  if (!alerts_) alerts_ = UniquePointer<PrinterAlertListener>::make(allocator_, stack, allocator_);
+  alert_callback_ = callback;
+  alert_context_ = context;
+  return alerts_ && alerts_->start();
+}
+
 void SystemPrinters::poll() {
+  if (alerts_) {
+    alerts_->poll();
+    PrinterAlertEvent event;
+    while (alerts_->next(&event)) {
+      IPrinter* from = nullptr;
+      for (uint64_t i = 0; i < printers_.count(); ++i)
+        if (printers_[i]->ipv4_address() != 0 && printers_[i]->ipv4_address() == event.source.value()) from = printers_[i].get();
+      if (from && !from->report_pending()) from->request_report();   // something changed: look again
+      if (alert_callback_) alert_callback_(alert_context_, from, event);
+      ++alerts_handled_;
+    }
+  }
   for (uint64_t i = 0; i < printers_.count(); ++i) printers_[i]->poll();
 }
 
 void SystemPrinters::shutdown() {
+  alerts_.reset();
   for (uint64_t i = 0; i < printers_.count(); ++i) printers_[i]->shutdown();
   printers_.clear();
 }

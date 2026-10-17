@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Printer/IPrinter.hpp"
+#include "Hardware/Printer/PrinterAlertListener.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -38,6 +39,12 @@ class SystemPrinters {
   IPrinter* at(uint32_t index) { return index < printers_.count() ? printers_[index].get() : nullptr; }
   IPrinter* default_printer() { return at(0); }
   void set_default(uint32_t index);
+  // Starts listening for the printers' SNMP traps (UDP 162). Each event is passed to `callback` (if any) with the printer it came from
+  // (matched by IP address; null for an unknown sender), and that printer is asked for a fresh report. Events are handled in poll().
+  using AlertCallback = void (*)(void* context, IPrinter* printer, const PrinterAlertEvent& event);
+  bool enable_alerts(network::INetworkStack& stack, AlertCallback callback = nullptr, void* context = nullptr);
+  PrinterAlertListener* alerts() { return alerts_.get(); }
+  uint64_t alerts_handled() const { return alerts_handled_; }
   // Lets every printer deliver its queue.
   void poll();
   void shutdown();
@@ -45,6 +52,10 @@ class SystemPrinters {
  private:
   allocators::IAllocator& allocator_;
   List<UniquePointer<IPrinter>> printers_;
+  UniquePointer<PrinterAlertListener> alerts_;
+  AlertCallback alert_callback_ = nullptr;
+  void* alert_context_ = nullptr;
+  uint64_t alerts_handled_ = 0;
 };
 
 }  // namespace hardware
