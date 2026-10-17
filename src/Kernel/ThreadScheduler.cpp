@@ -580,6 +580,8 @@ void exit_thread() {
 
 bool join(Thread* t, uint64_t timeout_us) {
   if (!t) return false;
+  // Once the scheduler has been stopped no thread runs any more, so none can finish: waiting for one would never end.
+  if (!g.running) return false;
   const uint64_t deadline = timeout_us ? hardware::read_tsc() + timeout_us * g.tsc_per_us : 0;
   for (;;) {
     const uint64_t flags = lock_irq();

@@ -619,6 +619,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   capture_hub.reset();
   mixer.reset();   // the mixer thread ends before its audio device goes
   cameras.stop_service();
+  printers.stop_service();   // (its thread ends before the threads do: joining it afterwards would wait for ever)
   stacks.clear();  // the stacks go before the NICs underneath them
 #ifdef TCOS_SELFTESTS
   stack_demo.reset();
