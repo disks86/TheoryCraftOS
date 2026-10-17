@@ -37,6 +37,9 @@ add_executable(BOOTX64
   src/Kernel/Interrupts.cpp
   src/Kernel/Interrupts.S
   src/Kernel/Apic.cpp
+  src/Kernel/Paging.cpp
+  src/Hardware/MmioMapper.cpp
+  src/Hardware/Bus/Pci/PciBar.cpp
   src/Kernel/ThreadScheduler.cpp
   src/Kernel/Sync.cpp
   src/Kernel/Firmware.cpp

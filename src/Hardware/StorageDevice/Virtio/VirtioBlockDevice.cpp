@@ -52,7 +52,7 @@ bool VirtioBlockDevice::initialize() {
   }
   info_.block_count = read_config64(kConfigCapacity) / (info_.block_size / kSectorBytes);
 
-  request_ = static_cast<Request*>(allocator_.allocate_aligned(4096, 4096));
+  request_ = static_cast<Request*>(allocator_.allocate_dma(4096, 4096));
   if (!request_ || !transport_.setup_queue(0, &queue_) || queue_.size() < 3 || !prepare_bounce()) {
     shutdown();
     return false;

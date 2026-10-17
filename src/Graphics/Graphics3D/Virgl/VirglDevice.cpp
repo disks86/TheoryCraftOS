@@ -67,7 +67,7 @@ uint32_t string_length(const char* s) {
 class Stream {
  public:
   Stream(allocators::IAllocator& allocator) : allocator_(allocator) {
-    data_ = allocate_view<uint32_t>(allocator, kCapacity, 16);
+    data_ = allocate_view<uint32_t>(allocator, kCapacity, 16);   // (the stream is copied into the request, not read by the device)
   }
   ~Stream() { release_view(allocator_, data_); }
   bool valid() const { return !data_.empty(); }
@@ -104,7 +104,7 @@ class VirglBuffer final : public IBuffer {
  public:
   VirglBuffer(VirglDevice& device, uint64_t size, uint32_t usage) : device_(device) {
     hardware::VirtioGpu& gpu = device.gpu();
-    memory_ = allocate_view<uint8_t>(gpu.allocator(), size, 4096);
+    memory_ = allocate_dma_view<uint8_t>(gpu.allocator(), size, 4096);
     if (memory_.empty()) return;
     memory_.fill(0);
     id_ = gpu.allocate_resource_id();
@@ -189,7 +189,7 @@ class VirglImage final : public IImage {
     if (desc_.format == Format::D32Float || out.size() < count) return false;
     hardware::VirtioGpu& gpu = device_.gpu();
     if (backing_.empty()) {  // guest memory for the host to copy into, attached on first use
-      backing_ = allocate_view<uint8_t>(gpu.allocator(), count * 4, 4096);
+      backing_ = allocate_dma_view<uint8_t>(gpu.allocator(), count * 4, 4096);
       if (backing_.empty()) return false;
       ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
                                    {reinterpret_cast<uint64_t>(backing_.data()), static_cast<uint32_t>(count * 4), 0}};

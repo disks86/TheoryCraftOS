@@ -96,8 +96,8 @@ bool VirtioGpu::initialize() {
     transport_ = nullptr;
     return false;
   }
-  request_ = allocate_view<uint8_t>(*allocator_, kRequestBytes, 4096);
-  response_ = allocate_view<uint8_t>(*allocator_, kResponseBytes, 4096);
+  request_ = allocate_dma_view<uint8_t>(*allocator_, kRequestBytes, 4096);
+  response_ = allocate_dma_view<uint8_t>(*allocator_, kResponseBytes, 4096);
   if (request_.empty() || response_.empty()) {
     shutdown();
     return false;
@@ -141,7 +141,7 @@ void VirtioGpu::release_screen() {
 }
 
 bool VirtioGpu::create_screen(uint32_t width, uint32_t height) {
-  ByteView memory = allocate_view<uint8_t>(*allocator_, uint64_t{width} * height * 4, 4096);
+  ByteView memory = allocate_dma_view<uint8_t>(*allocator_, uint64_t{width} * height * 4, 4096);
   if (memory.empty()) return false;
   memory.fill(0);
   const uint32_t id = allocate_resource_id();

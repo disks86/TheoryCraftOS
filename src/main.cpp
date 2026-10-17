@@ -20,6 +20,9 @@
 #include "Kernel/Firmware.hpp"
 #include "Allocators/Allocator.hpp"
 #include "Allocators/ThreadSafeAllocator.hpp"
+#include "Hardware/Bus/Pci/PciBar.hpp"
+#include "Hardware/MmioMapper.hpp"
+#include "Kernel/Paging.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
 #include "Hardware/Bus/SystemPciBus.hpp"
@@ -164,6 +167,20 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   Entry(Level::Ok, "RAM").size(ram.total_bytes()).text(" total, ").size(ram.usable_bytes()).text(" in the allocator pool");
 
+  // Page tables: the firmware identity-maps its memory map, and we add what it left out. First the memory above 4 GiB the RAM class claimed: it goes to the
+  // allocator's high pool, which serves everything except what devices read by themselves (allocate_dma stays below 4 GiB).
+  kernel::PageTables paging(kernel::cpu_paging_host(), allocator);
+  const bool paging_ok = paging.initialize();
+  if (!paging_ok) Entry(Level::Warning, "Paging").text("5-level paging: memory above 4 GiB and MMIO mapping are not used");
+  uint64_t high_bytes = 0;
+  for (uint32_t i = 0; paging_ok && i < ram.extra_region_count(); ++i) {
+    const hardware::MemoryRegion r = ram.extra_region(i);
+    // (a region the firmware did not map after all is mapped here; one it did map is left as it is)
+    if (paging.map_missing(r.base, r.bytes, kernel::PageAttributes()) && paging.is_mapped(r.base, r.bytes) && allocator.add_region(reinterpret_cast<void*>(r.base), r.bytes))
+      high_bytes += r.bytes;
+  }
+  if (high_bytes) Entry(Level::Ok, "RAM").size(high_bytes).text(" above 4 GiB for ordinary allocations (").size(allocator.free_bytes_low()).text(" below 4 GiB left for DMA)");
+
   // The CPU comes next: the allocator's thread-safe front needs it, and from here on
   // every subsystem allocates through that front, so any thread may use any of them.
   // The CPU, then the scheduler.
@@ -189,6 +206,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // firmware text console if no GPU class can drive a framebuffer.
   hardware::SystemPciBus system_pci(st, shared_allocator);
   hardware::IPciBus& pci = system_pci.pci();
+  // Device registers the firmware left unmapped (64-bit BARs placed above its map) become reachable before any driver wants them.
+  hardware::MmioMapper mmio(paging, ram);
+  if (paging_ok) {
+    const uint32_t mapped_bars = hardware::pci_map_all_bars(pci, mmio);
+    if (mapped_bars) Entry(Level::Info, "MMIO").dec(mapped_bars).text(" BAR(s) mapped that the firmware had not mapped");
+  }
   hardware::SystemGpu system_gpu(st, pci, shared_allocator);
   hardware::IGraphicsProcessingUnit* gpu = system_gpu.gpu();
   if (gpu) {

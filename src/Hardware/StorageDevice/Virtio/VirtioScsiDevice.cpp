@@ -46,7 +46,7 @@ bool VirtioScsiController::initialize() {
     transport_.shutdown();
     return false;
   }
-  memory_ = allocate_view<uint8_t>(allocator_, 4096, 4096);
+  memory_ = allocate_dma_view<uint8_t>(allocator_, 4096, 4096);
   if (memory_.empty() || !transport_.setup_queue(kControlQueue, &control_) || !transport_.setup_queue(kEventQueue, &event_) ||
       !transport_.setup_queue(kRequestQueue, &request_) || request_.size() < 4 || !transport_.start()) {
     shutdown();

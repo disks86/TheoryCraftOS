@@ -10,7 +10,14 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
 
 - `src/main.cpp`, `console.*`, `uefi.hpp`, `runtime.cpp`: entry point, logging facade, UEFI types, compiler runtime stubs.
 - `src/Allocators/`: `IAllocator` and the default `Allocator`, a cache-line block pool
-  that gets its memory from an `IRandomAccessMemory` (`base()` / `usable_bytes()`).
+  that gets its memory from an `IRandomAccessMemory` (`base()` / `usable_bytes()`, and the `extra_region()`s above 4 GiB). There are two pools: the
+  low one (below 4 GiB, where the RAM class puts its main region) and a high one. `allocate()` / `allocate_aligned()` serve from the high pool first
+  and fall back to the low one; **`allocate_dma()` (and `allocate_dma_view<T>()`) is for anything a device reads or writes by itself** - descriptor
+  rings, DMA buffers, USB transfer buffers, virtio queues - and only ever returns memory below 4 GiB, where every controller (RTL8139, UHCI, OHCI
+  among them) can reach it. Every such place in `src/Hardware` and the virgl driver was switched over; new drivers must use it. The UEFI RAM class claims the
+  largest free regions above 4 GiB (all but a reserve at the end of each, up to 16 MiB, left to the firmware), `main.cpp` makes sure they are mapped and
+  adds them to the allocator. `tests/AllocatorTest.cpp` covers the pools, a region that crosses 4 GiB and a randomized overlap/coalescing check (built without
+  the address sanitizer, which keeps the address space above 2 GiB for itself).
 - `src/ObjectContainer/`: `IObjectContainer<T>` (count, clear, allocation-free iteration through a plain
   `ObjectCursor`, plus range-for) and its implementations `List<T>` (growable array), `LinkedList<T>`
   (doubly linked, erase while walking), `Dictionary<K, V>` (chained hash map; `Hashing.hpp` has the
@@ -255,6 +262,17 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   `Firmware` (`kernel::firmware([&]{...})`) funnels every post-start UEFI call through the boot core, one at a time.
   Boot services are *not* exited (so drivers can still be handed back to the firmware); the legacy PIC is masked while
   the kernel runs and the firmware's tables are restored by `kernel::stop()`.
+- Paging and MMIO: `Kernel/Paging` (`PageTables`) edits the live page tables (4-level; the firmware's identity map stays): `map()` /
+  `map_missing()` / `unmap()` make ranges mapped 1:1 with a memory type (write-back, write-through, uncached, write-combining via the PAT) and
+  permissions (no-execute when the CPU has NX on), using the largest pages that fit and splitting the firmware's 1 GiB / 2 MiB pages where only part changes.
+  `Hardware/Mmio.hpp` (`MmioRegion`) is a window onto device registers with exact-width, aligned, bounds-checked volatile accesses (`read8..64`,
+  split 64-bit access, `update32` / `set_bits32` / `wait32`, `subregion`). `MmioMapper` maps device ranges (uncached, or write-combining for frame buffers)
+  and refuses anything the firmware lists as RAM. `Hardware/Bus/Pci/PciBar` sizes BARs the way the PCI spec says (decoding off, ones written, mask read
+  back, everything restored; 32- and 64-bit, I/O, bridges) and `pci_map_all_bars()` - called at boot before any driver - maps the BARs whose first page the
+  firmware had not mapped, typically 64-bit ones above 4 GiB, leaving everything it did map alone. Limits: no 5-level paging; a changed mapping is only
+  flushed on the core that made it (the boot core does all of it before the other cores start, and they load the same PAT); tables of replaced pages are not
+  freed; `release()` keeps the page-table entries. The existing drivers still use their own `volatile` helpers on raw addresses and have not been
+  converted to `MmioRegion`. `tests/PagingTest.cpp`, `tests/MmioTest.cpp`: against a pretend CPU and PCI function, no real hardware.
 - Thread safety: `SpinLock` now masks interrupts while held; the allocator is used through one `ThreadSafeAllocator`
   everywhere; the console serializes output (`console::Guard` keeps several calls together); PCI config access, the
   i8042, every USB host controller, each storage device (plus shared controller/channel state), each NIC and the input

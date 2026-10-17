@@ -48,7 +48,7 @@ void UhciController::write16(uint16_t reg, uint16_t value) const { IoPort(io_ + 
 
 template <class T>
 ArrayView<T> UhciController::low_allocate(uint64_t count, uint64_t alignment) {
-  ArrayView<T> memory = allocate_view<T>(allocator_, count, alignment);
+  ArrayView<T> memory = allocate_dma_view<T>(allocator_, count, alignment);
   if (!memory.empty() && !below_4g(memory.data(), memory.size_bytes())) release_view(allocator_, memory);  // out of the controller's reach
   if (!memory.empty()) __builtin_memset(memory.data(), 0, memory.size_bytes());
   return memory;

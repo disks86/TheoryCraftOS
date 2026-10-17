@@ -22,13 +22,27 @@
 
 namespace hardware {
 
+struct MemoryRegion {
+  uint64_t base = 0;
+  uint64_t bytes = 0;
+};
+
 // System memory as seen by the OS. Implementations live beside this file.
 class IRandomAccessMemory : public IHardware {
  public:
   virtual uint64_t total_bytes() const = 0;   // all installed memory
   virtual uint64_t usable_bytes() const = 0;  // memory the OS may allocate
-  // Start of one contiguous, writable region of usable_bytes() bytes.
+  // Start of one contiguous, writable region of usable_bytes() bytes: the main one, below 4 GiB when the machine has memory there
+  // (it is what DMA buffers come from).
   virtual void* base() const = 0;
+
+  // Further regions the OS may allocate from, mostly above 4 GiB. They are claimed (nobody else will use them) and may be handed to
+  // the allocator for memory no device reads by itself. The platform's page tables must map them 1:1 (UEFI promises that for
+  // everything in its memory map; kernel/Paging can check).
+  virtual uint32_t extra_region_count() const { return 0; }
+  virtual MemoryRegion extra_region(uint32_t index) const { (void)index; return MemoryRegion(); }
+  // Does [address, address + bytes) overlap memory (as opposed to device registers)? What MMIO mappings must never cover.
+  virtual bool overlaps_memory(uint64_t address, uint64_t bytes) const { (void)address; (void)bytes; return false; }
 
  protected:
   constexpr IRandomAccessMemory() = default;

@@ -52,7 +52,7 @@ bool below_4g(const void* p, uint64_t length) { return reinterpret_cast<uint64_t
 
 template <class T>
 ArrayView<T> OhciController::low_allocate(uint64_t count, uint64_t alignment) {
-  ArrayView<T> memory = allocate_view<T>(allocator_, count, alignment);
+  ArrayView<T> memory = allocate_dma_view<T>(allocator_, count, alignment);
   if (!memory.empty() && !below_4g(memory.data(), memory.size_bytes())) release_view(allocator_, memory);  // out of the controller's reach
   if (!memory.empty()) __builtin_memset(memory.data(), 0, memory.size_bytes());
   return memory;

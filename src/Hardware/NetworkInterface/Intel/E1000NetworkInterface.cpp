@@ -74,9 +74,9 @@ bool E1000NetworkInterface::initialize() {
   for (uint32_t i = 0; i < 128; ++i) write(kMulticastTable + 4 * i, 0);
 
   // Descriptor rings and the frame buffers (this family does 64-bit DMA).
-  rx_ring_ = allocate_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
-  tx_ring_ = allocate_view<TransmitDescriptor>(allocator_, kTransmitDescriptors, 4096);
-  buffers_ = allocate_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096);
+  rx_ring_ = allocate_dma_view<ReceiveDescriptor>(allocator_, kReceiveDescriptors, 4096);
+  tx_ring_ = allocate_dma_view<TransmitDescriptor>(allocator_, kTransmitDescriptors, 4096);
+  buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kReceiveDescriptors + kTransmitDescriptors} * kBufferSize, 4096);
   if (rx_ring_.empty() || tx_ring_.empty() || buffers_.empty()) {
     shutdown();
     return false;

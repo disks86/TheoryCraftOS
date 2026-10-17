@@ -39,7 +39,7 @@ bool VirtioNetworkInterface::initialize() {
   if (accepted & kFeatureMac)
     for (uint32_t i = 0; i < 6; ++i) mac_.bytes[i] = transport_.read_config8(kConfigMac + i);
 
-  buffers_ = allocate_view<uint8_t>(allocator_, uint64_t{2 * kBuffers} * kBufferSize, 4096);
+  buffers_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{2 * kBuffers} * kBufferSize, 4096);
   if (buffers_.empty() || !transport_.setup_queue(kReceiveQueue, &rx_) || !transport_.setup_queue(kTransmitQueue, &tx_) ||
       rx_.size() < kBuffers || tx_.size() < kBuffers) {
     shutdown();

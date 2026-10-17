@@ -169,7 +169,7 @@ bool UsbMassStorageDevice::run(ConstByteView cdb, ByteView data, bool data_in) {
 
 bool UsbMassStorageDevice::initialize() {
   bounce_alignment_ = 65536;  // a bulk transfer must not cross a 64 KiB boundary
-  wire_ = allocate_view<uint8_t>(allocator_, 4096, 65536);
+  wire_ = allocate_dma_view<uint8_t>(allocator_, 4096, 65536);
   if (wire_.empty()) return false;
   wire_.fill(0);
 

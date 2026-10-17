@@ -23,7 +23,7 @@ namespace hardware {
 bool StorageDeviceBase::prepare_bounce() {
   release_bounce();
   if (info_.block_size == 0 || info_.block_size > kBounceBytes) return false;
-  bounce_ = allocate_view<uint8_t>(allocator_, kBounceBytes, bounce_alignment_);
+  bounce_ = allocate_dma_view<uint8_t>(allocator_, kBounceBytes, bounce_alignment_);
   return !bounce_.empty();
 }
 

@@ -39,6 +39,10 @@ class ThreadSafeAllocator final : public IAllocator {
     ScopedLock guard(lock_);
     return inner_.allocate_aligned(size, alignment);
   }
+  void* allocate_dma(uint64_t size, uint64_t alignment) override {
+    ScopedLock guard(lock_);
+    return inner_.allocate_dma(size, alignment);
+  }
   void deallocate(void* ptr) override {
     ScopedLock guard(lock_);
     inner_.deallocate(ptr);

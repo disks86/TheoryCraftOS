@@ -115,10 +115,10 @@ bool EhciController::reset() {
 }
 
 bool EhciController::setup_memory() {
-  async_head_ = static_cast<Qh*>(allocator_.allocate_aligned(sizeof(Qh), 64));
-  pool_ = allocate_view<Qtd>(allocator_, kPoolQtds, 64);
-  frame_list_ = allocate_view<uint32_t>(allocator_, kFrameListEntries, 4096);
-  buffer_ = allocate_view<uint8_t>(allocator_, 8192, 4096);
+  async_head_ = static_cast<Qh*>(allocator_.allocate_dma(sizeof(Qh), 64));
+  pool_ = allocate_dma_view<Qtd>(allocator_, kPoolQtds, 64);
+  frame_list_ = allocate_dma_view<uint32_t>(allocator_, kFrameListEntries, 4096);
+  buffer_ = allocate_dma_view<uint8_t>(allocator_, 8192, 4096);
   if (!async_head_ || pool_.empty() || frame_list_.empty() || buffer_.empty()) return false;
   if ((address_of(async_head_) | address_of(pool_.data()) | address_of(frame_list_.data())) >> 32) return false;
   if (!reachable(buffer_.data(), buffer_.size())) return false;
@@ -175,7 +175,7 @@ void EhciController::shutdown() {
 // ---------------------------------------------------------------- queue heads
 
 Qh* EhciController::make_queue_head(uint8_t address, uint8_t endpoint, uint16_t max_packet, bool control) {
-  Qh* qh = static_cast<Qh*>(allocator_.allocate_aligned(sizeof(Qh), 64));
+  Qh* qh = static_cast<Qh*>(allocator_.allocate_dma(sizeof(Qh), 64));
   if (!qh) return nullptr;
   if (address_of(qh) >> 32) {
     allocator_.deallocate(qh);
@@ -434,8 +434,8 @@ bool EhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   if (!e) return false;
 
   e->qh = make_queue_head(d.address, endpoint_address & 0x0F, max_packet, false);
-  e->qtd = allocate_view<Qtd>(allocator_, 1, 64).data();
-  e->buffer = allocate_view<uint8_t>(allocator_, max_packet < 64 ? 64 : max_packet, 64);
+  e->qtd = allocate_dma_view<Qtd>(allocator_, 1, 64).data();
+  e->buffer = allocate_dma_view<uint8_t>(allocator_, max_packet < 64 ? 64 : max_packet, 64);
   if (!e->qh || !e->qtd || e->buffer.empty() || (address_of(e->qtd) >> 32) || !reachable(e->buffer.data(), max_packet)) {
     free_queue_head(e->qh);
     allocator_.deallocate(e->qtd);

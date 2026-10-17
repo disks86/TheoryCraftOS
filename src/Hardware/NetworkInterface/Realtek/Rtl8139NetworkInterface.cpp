@@ -71,8 +71,8 @@ bool Rtl8139NetworkInterface::initialize() {
   }
   for (uint32_t i = 0; i < 6; ++i) mac_.bytes[i] = read8(kIdr0 + i);
 
-  receive_ring_ = allocate_view<uint8_t>(allocator_, kReceiveRingSize + kRingSlack, 4096);
-  transmit_buffers_ = allocate_view<uint8_t>(allocator_, kTransmitSlots * kTransmitBufferSize, 4096);
+  receive_ring_ = allocate_dma_view<uint8_t>(allocator_, kReceiveRingSize + kRingSlack, 4096);
+  transmit_buffers_ = allocate_dma_view<uint8_t>(allocator_, kTransmitSlots * kTransmitBufferSize, 4096);
   if (receive_ring_.empty() || transmit_buffers_.empty() ||
       reinterpret_cast<uint64_t>(receive_ring_.data()) + receive_ring_.size() > 0x100000000ull ||
       reinterpret_cast<uint64_t>(transmit_buffers_.data()) + transmit_buffers_.size() > 0x100000000ull) {

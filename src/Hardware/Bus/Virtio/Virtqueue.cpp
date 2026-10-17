@@ -31,9 +31,9 @@ bool Virtqueue::init(allocators::IAllocator& allocator, uint16_t size) {
   last_used_ = 0;
   const uint64_t avail_bytes = 4 + uint64_t{size} * 2 + 2;
   const uint64_t used_bytes = 4 + uint64_t{size} * sizeof(UsedElement) + 2;
-  descriptors_ = allocate_view<Descriptor>(allocator, size, 4096);
-  available_memory_ = allocate_view<uint8_t>(allocator, avail_bytes, 4096);
-  used_memory_ = allocate_view<uint8_t>(allocator, used_bytes, 4096);
+  descriptors_ = allocate_dma_view<Descriptor>(allocator, size, 4096);
+  available_memory_ = allocate_dma_view<uint8_t>(allocator, avail_bytes, 4096);
+  used_memory_ = allocate_dma_view<uint8_t>(allocator, used_bytes, 4096);
   if (descriptors_.empty() || available_memory_.empty() || used_memory_.empty()) {
     release(allocator);
     return false;

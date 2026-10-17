@@ -23,7 +23,7 @@ namespace hardware {
 bool PlaybackRing::allocate(allocators::IAllocator& allocator, uint32_t bytes) {
   release(allocator);
   if (bytes == 0 || bytes % kAudioFrameSize != 0) return false;
-  memory_ = allocate_view<uint8_t>(allocator, bytes, 128);
+  memory_ = allocate_dma_view<uint8_t>(allocator, bytes, 128);
   if (memory_.empty()) return false;
   reset();
   return true;

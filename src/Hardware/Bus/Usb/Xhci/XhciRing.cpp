@@ -21,7 +21,7 @@
 namespace hardware::xhci {
 
 bool ProducerRing::init(allocators::IAllocator& allocator) {
-  trbs_ = allocate_view<Trb>(allocator, kRingTrbs, 4096);
+  trbs_ = allocate_dma_view<Trb>(allocator, kRingTrbs, 4096);
   if (trbs_.empty()) return false;
   __builtin_memset(trbs_.data(), 0, trbs_.size_bytes());
   index_ = 0;
@@ -59,8 +59,8 @@ void ProducerRing::wrap_if_needed() {
 }
 
 bool EventRing::init(allocators::IAllocator& allocator) {
-  trbs_ = allocate_view<Trb>(allocator, kRingTrbs, 4096);
-  table_ = allocate_view<SegmentEntry>(allocator, 1, 64);
+  trbs_ = allocate_dma_view<Trb>(allocator, kRingTrbs, 4096);
+  table_ = allocate_dma_view<SegmentEntry>(allocator, 1, 64);
   if (trbs_.empty() || table_.empty()) {
     release(allocator);
     return false;

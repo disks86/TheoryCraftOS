@@ -108,7 +108,7 @@ void UsbPrinter::discover(IUsbBus& usb, allocators::IAllocator& allocator, List<
 
 bool UsbPrinter::initialize() {
   if (started_) return true;
-  wire_ = allocate_view<uint8_t>(allocator_, 2 * kChunk, 65536);
+  wire_ = allocate_dma_view<uint8_t>(allocator_, 2 * kChunk, 65536);
   if (wire_.empty()) return false;
   if (!host_.set_configuration(port_, ep_.configuration) || !host_.start_bulk_endpoint(port_, ep_.out_endpoint, ep_.out_max_packet) ||
       (ep_.in_endpoint && !host_.start_bulk_endpoint(port_, ep_.in_endpoint, ep_.in_max_packet))) {

@@ -24,7 +24,7 @@ bool CaptureRing::allocate(allocators::IAllocator& allocator, uint32_t bytes, ui
   release(allocator);
   if (frame_size == 0 || bytes == 0 || bytes % frame_size != 0) return false;
   frame_size_ = frame_size;
-  memory_ = allocate_view<uint8_t>(allocator, bytes, 128);
+  memory_ = allocate_dma_view<uint8_t>(allocator, bytes, 128);
   if (memory_.empty()) return false;
   reset();
   return true;

@@ -115,8 +115,8 @@ bool IntelHdaAudioDevice::start_command_rings() {
   write8(kCorbSize, static_cast<uint8_t>(corb_code));
   write8(kRirbSize, static_cast<uint8_t>(rirb_code));
 
-  corb_ = allocate_view<uint8_t>(allocator_, uint64_t{corb_entries_} * 4, 128);
-  rirb_ = allocate_view<uint8_t>(allocator_, uint64_t{rirb_entries_} * 8, 128);
+  corb_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{corb_entries_} * 4, 128);
+  rirb_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{rirb_entries_} * 8, 128);
   if (corb_.empty() || rirb_.empty() || !dma_reachable(reinterpret_cast<uint64_t>(corb_.data()), corb_.size()) ||
       !dma_reachable(reinterpret_cast<uint64_t>(rirb_.data()), rirb_.size()))
     return false;
@@ -332,7 +332,7 @@ bool IntelHdaAudioDevice::configure_path() {
 // (allocated and filled here), and starts it.
 bool IntelHdaAudioDevice::run_stream(uint32_t stream, ArrayView<BufferDescriptor>& descriptors, uint64_t ring_address,
                                      uint8_t tag) {
-  descriptors = allocate_view<BufferDescriptor>(allocator_, kEntries, 128);
+  descriptors = allocate_dma_view<BufferDescriptor>(allocator_, kEntries, 128);
   if (descriptors.empty() ||
       !dma_reachable(reinterpret_cast<uint64_t>(descriptors.data()), descriptors.size() * sizeof(BufferDescriptor)) ||
       !dma_reachable(ring_address, kRingBytes))

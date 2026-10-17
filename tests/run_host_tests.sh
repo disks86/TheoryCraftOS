@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -62,6 +62,10 @@ for t in "${WANTED[@]}"; do
                    src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                    src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     CryptoTest) build_and_run CryptoTest tests/CryptoTest.cpp tests/KernelStubs.cpp src/Crypto/*.cpp ;;
+    # (without the address sanitizer: this test maps memory above 4 GiB, which the sanitizer reserves for its shadow)
+    AllocatorTest) echo "== AllocatorTest"; $cxx ${flags/address,undefined/undefined} tests/AllocatorTest.cpp tests/KernelStubs.cpp src/Allocators/Allocator.cpp -o "$out/AllocatorTest" && "$out/AllocatorTest" ;;
+    PagingTest) build_and_run PagingTest tests/PagingTest.cpp tests/KernelStubs.cpp src/Kernel/Paging.cpp ;;
+    MmioTest) build_and_run MmioTest tests/MmioTest.cpp tests/KernelStubs.cpp src/Kernel/Paging.cpp src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp ;;
     X509Test) build_and_run X509Test tests/X509Test.cpp tests/KernelStubs.cpp src/Crypto/*.cpp ;;
     TlsReplayTest) build_and_run TlsReplayTest tests/TlsReplayTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp ;;
     SnmpTest) build_and_run SnmpTest tests/SnmpTest.cpp tests/KernelStubs.cpp src/Crypto/*.cpp src/Network/Snmp/SnmpMessage.cpp src/Network/Snmp/SnmpUsm.cpp ;;

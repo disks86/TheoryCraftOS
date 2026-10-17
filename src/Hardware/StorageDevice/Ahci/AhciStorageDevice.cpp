@@ -222,7 +222,7 @@ bool AhciStorageDevice::identify_atapi() {
 }
 
 bool AhciStorageDevice::initialize() {
-  memory_ = allocate_view<uint8_t>(allocator_, 4096, 4096);
+  memory_ = allocate_dma_view<uint8_t>(allocator_, 4096, 4096);
   if (memory_.empty()) return false;
   memory_.fill(0);
   started_ = start_port();

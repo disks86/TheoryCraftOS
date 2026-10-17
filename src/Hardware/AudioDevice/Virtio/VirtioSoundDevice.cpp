@@ -106,8 +106,8 @@ bool VirtioSoundDevice::initialize() {
     transport_.shutdown();
     return false;
   }
-  control_buffer_ = allocate_view<uint8_t>(allocator_, 4096, 4096);
-  slots_ = allocate_view<uint8_t>(allocator_, uint64_t{kMaxPeriods} * kSlotStride, 4096);
+  control_buffer_ = allocate_dma_view<uint8_t>(allocator_, 4096, 4096);
+  slots_ = allocate_dma_view<uint8_t>(allocator_, uint64_t{kMaxPeriods} * kSlotStride, 4096);
   bool queues_ok = !control_buffer_.empty() && !slots_.empty();
   for (uint16_t q = 0; q < 4 && queues_ok; ++q) queues_ok = transport_.setup_queue(q, &queues_[q]);
   if (!queues_ok || queues_[kControlQueue].size() < 2) {
@@ -275,7 +275,7 @@ bool VirtioSoundDevice::Capture::start() {
   if (!d.has_capture_stream_ || !d.started_) return false;
   periods_ = d.queues_[kReceiveQueue].size() / 3;
   if (periods_ > kMaxPeriods) periods_ = kMaxPeriods;
-  slots_ = allocate_view<uint8_t>(d.allocator_, uint64_t{kMaxPeriods} * kSlotStride, 4096);
+  slots_ = allocate_dma_view<uint8_t>(d.allocator_, uint64_t{kMaxPeriods} * kSlotStride, 4096);
   if (periods_ < 2 || slots_.empty() || !ring_.allocate(d.allocator_, kRingBytes)) {
     stop();
     return false;

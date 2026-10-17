@@ -44,6 +44,9 @@ bool UefiRandomAccessMemory::initialize() {
   }
 
   total_bytes_ = free_bytes_ = 0;
+  extra_count_ = ram_range_count_ = 0;
+  struct Candidate { uint64_t start, pages; } high[kMaxExtra];   // the largest free regions at or above 4 GiB
+  uint32_t high_count = 0;
   uint64_t best_start = 0, best_pages = 0;      // largest free region anywhere
   uint64_t low_start = 0, low_pages = 0;        // largest free region that ends below 4 GiB
   constexpr uint64_t kFourGiB = 1ull << 32;
@@ -60,6 +63,11 @@ bool UefiRandomAccessMemory::initialize() {
     if (d->type < efi::kFirstRamType || d->type > efi::kLastRamType) continue;
     auto type = static_cast<efi::MemoryType>(d->type);
     total_bytes_ += d->number_of_pages * kPageSize;
+    {  // remember where memory is, merging with the previous entry when it follows on (the map is sorted)
+      const uint64_t bytes = d->number_of_pages * kPageSize;
+      if (ram_range_count_ && ram_ranges_[ram_range_count_ - 1].base + ram_ranges_[ram_range_count_ - 1].bytes == d->physical_start) ram_ranges_[ram_range_count_ - 1].bytes += bytes;
+      else if (ram_range_count_ < kMaxRamRanges) ram_ranges_[ram_range_count_++] = MemoryRegion{d->physical_start, bytes};
+    }
     if (type == efi::MemoryType::ConventionalMemory) {
       free_bytes_ += d->number_of_pages * kPageSize;
       if (d->number_of_pages > best_pages) {
@@ -69,6 +77,17 @@ bool UefiRandomAccessMemory::initialize() {
       if (d->physical_start + d->number_of_pages * kPageSize <= kFourGiB && d->number_of_pages > low_pages) {
         low_pages = d->number_of_pages;
         low_start = d->physical_start;
+      }
+      if (d->physical_start >= kFourGiB && d->number_of_pages >= kMinExtraPages) {   // keep the kMaxExtra largest
+        uint32_t slot = high_count;
+        if (high_count < kMaxExtra) ++high_count;
+        else {
+          slot = 0;
+          for (uint32_t i = 1; i < high_count; ++i)
+            if (high[i].pages < high[slot].pages) slot = i;
+          if (high[slot].pages >= d->number_of_pages) slot = kMaxExtra;   // not larger than any kept one
+        }
+        if (slot < kMaxExtra) high[slot] = Candidate{d->physical_start, d->number_of_pages};
       }
     }
   }
@@ -89,10 +108,28 @@ bool UefiRandomAccessMemory::initialize() {
     return false;
   pool_base_ = address;
   pool_bytes_ = pages * kPageSize;
+
+  // The big regions above 4 GiB, for memory no device reads by itself. Failing to claim one is no reason to fail.
+  for (uint32_t i = 0; i < high_count; ++i) {
+    uint64_t claim = high[i].pages - (high[i].pages / 8 < kHighReservePages ? high[i].pages / 8 : kHighReservePages);
+    uint64_t at = high[i].start;
+    if (claim >= kMinExtraPages && bs->allocate_pages(efi::AllocateType::Address, efi::MemoryType::LoaderData, claim, &at) == efi::kSuccess)
+      extra_[extra_count_++] = MemoryRegion{at, claim * kPageSize};
+  }
   return true;
 }
 
+bool UefiRandomAccessMemory::overlaps_memory(uint64_t address, uint64_t bytes) const {
+  if (bytes == 0) return false;
+  for (uint32_t i = 0; i < ram_range_count_; ++i)
+    if (address < ram_ranges_[i].base + ram_ranges_[i].bytes && ram_ranges_[i].base < address + bytes) return true;
+  return false;
+}
+
 void UefiRandomAccessMemory::shutdown() {
+  if (st_ && st_->boot_services)
+    for (uint32_t i = 0; i < extra_count_; ++i) st_->boot_services->free_pages(extra_[i].base, extra_[i].bytes / kPageSize);
+  extra_count_ = 0;
   if (pool_base_ && st_ && st_->boot_services)
     st_->boot_services->free_pages(pool_base_, pool_bytes_ / kPageSize);
   pool_base_ = pool_bytes_ = 0;

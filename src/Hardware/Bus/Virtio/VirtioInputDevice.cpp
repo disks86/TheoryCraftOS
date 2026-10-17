@@ -75,7 +75,7 @@ bool VirtioInputDevice::initialize() {
     return false;
   }
   const uint16_t count = events_.size() < kEventBuffers ? events_.size() : kEventBuffers;
-  buffers_ = allocate_view<VirtioInputEvent>(allocator_, count, 64);
+  buffers_ = allocate_dma_view<VirtioInputEvent>(allocator_, count, 64);
   if (buffers_.empty()) {
     shutdown();
     return false;

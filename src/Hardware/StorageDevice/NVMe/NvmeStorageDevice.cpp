@@ -48,8 +48,8 @@ bool NvmeStorageDevice::disable_controller() {
 }
 
 bool NvmeStorageDevice::setup_queue(Queue* q, uint16_t id) {
-  q->submission = allocate_view<Command>(allocator_, kPage / sizeof(Command), kPage);
-  q->completion = allocate_view<Completion>(allocator_, kPage / sizeof(Completion), kPage);
+  q->submission = allocate_dma_view<Command>(allocator_, kPage / sizeof(Command), kPage);
+  q->completion = allocate_dma_view<Completion>(allocator_, kPage / sizeof(Completion), kPage);
   if (q->submission.empty() || q->completion.empty()) return false;
   __builtin_memset(q->submission.data(), 0, q->submission.size_bytes());
   __builtin_memset(q->completion.data(), 0, q->completion.size_bytes());
@@ -131,7 +131,7 @@ bool NvmeStorageDevice::initialize() {
   if (!(cap & (1ull << 37))) return false;                              // NVM command set
 
   if (!disable_controller()) return false;
-  scratch_ = allocate_view<uint8_t>(allocator_, 2 * kPage, kPage);
+  scratch_ = allocate_dma_view<uint8_t>(allocator_, 2 * kPage, kPage);
   if (scratch_.empty() || !setup_queue(&admin_, 0) || !setup_queue(&io_, 1)) return false;
   scratch_.fill(0);
 

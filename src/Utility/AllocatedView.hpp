@@ -34,6 +34,14 @@ ArrayView<T> allocate_view(allocators::IAllocator& allocator, uint64_t count, ui
   return memory ? ArrayView<T>(memory, count) : ArrayView<T>();
 }
 
+// The same for memory a device reads or writes by itself (see IAllocator::allocate_dma): in the first 4 GiB.
+template <class T>
+ArrayView<T> allocate_dma_view(allocators::IAllocator& allocator, uint64_t count, uint64_t alignment = alignof(T)) {
+  if (count == 0 || count > ~uint64_t{0} / sizeof(T)) return ArrayView<T>();
+  T* memory = static_cast<T*>(allocator.allocate_dma(count * sizeof(T), alignment < alignof(T) ? alignof(T) : alignment));
+  return memory ? ArrayView<T>(memory, count) : ArrayView<T>();
+}
+
 // Frees the memory behind the view (nullptr/empty is fine) and leaves it empty.
 template <class T>
 void release_view(allocators::IAllocator& allocator, ArrayView<T>& view) {

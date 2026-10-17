@@ -155,17 +155,17 @@ bool XhciController::dma_reachable(const void* p) const {
 bool XhciController::setup_memory() {
   write32(op_ + kOpConfig, max_slots_);  // enable every slot the controller has
 
-  dcbaa_ = static_cast<uint64_t*>(allocator_.allocate_aligned((max_slots_ + 1) * 8, 4096));
-  buffer_ = allocate_view<uint8_t>(allocator_, 4096, 4096);
+  dcbaa_ = static_cast<uint64_t*>(allocator_.allocate_dma((max_slots_ + 1) * 8, 4096));
+  buffer_ = allocate_dma_view<uint8_t>(allocator_, 4096, 4096);
   if (!dcbaa_ || buffer_.empty() || !dma_reachable(dcbaa_)) return false;
   __builtin_memset(dcbaa_, 0, (max_slots_ + 1) * 8);
 
   if (scratchpad_count_) {  // the controller keeps private state in these pages
     if (scratchpad_count_ > 32) return false;
-    scratchpad_table_ = static_cast<uint64_t*>(allocator_.allocate_aligned(scratchpad_count_ * 8, 64));
+    scratchpad_table_ = static_cast<uint64_t*>(allocator_.allocate_dma(scratchpad_count_ * 8, 64));
     if (!scratchpad_table_) return false;
     for (uint32_t i = 0; i < scratchpad_count_; ++i) {
-      scratchpad_pages_[i] = static_cast<uint8_t*>(allocator_.allocate_aligned(4096, 4096));
+      scratchpad_pages_[i] = static_cast<uint8_t*>(allocator_.allocate_dma(4096, 4096));
       if (!scratchpad_pages_[i]) return false;
       __builtin_memset(scratchpad_pages_[i], 0, 4096);
       scratchpad_table_[i] = reinterpret_cast<uint64_t>(scratchpad_pages_[i]);
@@ -355,8 +355,8 @@ bool XhciController::address_device(uint32_t port, Device& d) {
   }
 
   const uint32_t context_bytes = 33 * context_size_;  // input control + slot + 31 endpoints
-  d.output_context = allocate_view<uint8_t>(allocator_, context_bytes, 4096);
-  d.input_context = allocate_view<uint8_t>(allocator_, context_bytes, 4096);
+  d.output_context = allocate_dma_view<uint8_t>(allocator_, context_bytes, 4096);
+  d.input_context = allocate_dma_view<uint8_t>(allocator_, context_bytes, 4096);
   if (d.output_context.empty() || d.input_context.empty() || !d.control_ring.init(allocator_) ||
       !dma_reachable(d.output_context.data()) || !dma_reachable(d.input_context.data()))
     return false;
@@ -481,7 +481,7 @@ bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   e->address = endpoint_address;
   e->context_id = dci;
   e->max_packet = max_packet;
-  e->buffer = allocate_view<uint8_t>(allocator_, max_packet < 64 ? 64 : max_packet, 64);
+  e->buffer = allocate_dma_view<uint8_t>(allocator_, max_packet < 64 ? 64 : max_packet, 64);
   if (e->buffer.empty() || !e->ring.init(allocator_) || !dma_reachable(e->buffer.data())) {
     e->ring.release(allocator_);
     release_view(allocator_, e->buffer);

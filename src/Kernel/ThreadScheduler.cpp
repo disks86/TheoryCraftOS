@@ -20,6 +20,7 @@
 #include "Kernel/Apic.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Firmware.hpp"
+#include "Kernel/Paging.hpp"
 #include "Kernel/Thread.hpp"
 
 namespace kernel {
@@ -350,6 +351,7 @@ void ap_main(void* context) {
   while (!__atomic_load_n(&g.go, __ATOMIC_ACQUIRE)) pause_hint();
   Core* c = &g.cores[start->core];
   interrupts_load(false);
+  load_shared_pat_on_this_core();   // the same write-combining setup as the boot core
   apic::enable_this_core();
   c->self = c;
   c->index = start->core;

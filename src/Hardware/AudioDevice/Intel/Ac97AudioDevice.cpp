@@ -80,7 +80,7 @@ bool Ac97AudioDevice::initialize() {
   }
   mixer_write(kMixerReset, 0);
 
-  descriptors_ = allocate_view<BufferDescriptor>(allocator_, kEntries, 128);
+  descriptors_ = allocate_dma_view<BufferDescriptor>(allocator_, kEntries, 128);
   if (descriptors_.empty() || !ring_.allocate(allocator_, kRingBytes) ||
       reinterpret_cast<uint64_t>(descriptors_.data()) + descriptors_.size() * sizeof(BufferDescriptor) > 0x100000000ull ||
       ring_.address() + ring_.size() > 0x100000000ull) {
@@ -175,7 +175,7 @@ void Ac97AudioDevice::refresh() {
 // Recording: the codec's microphone input, at 0 dB, through the PCM-in engine. Gain and mute are done in software.
 bool Ac97AudioDevice::Capture::start() {
   Ac97AudioDevice& d = owner_;
-  descriptors_ = allocate_view<BufferDescriptor>(d.allocator_, kEntries, 128);
+  descriptors_ = allocate_dma_view<BufferDescriptor>(d.allocator_, kEntries, 128);
   if (descriptors_.empty() || !ring_.allocate(d.allocator_, kRingBytes) ||
       reinterpret_cast<uint64_t>(descriptors_.data()) + descriptors_.size() * sizeof(BufferDescriptor) > 0x100000000ull ||
       ring_.address() + ring_.size() > 0x100000000ull || !d.reset_box(kPiBase)) {
