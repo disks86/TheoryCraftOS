@@ -20,9 +20,10 @@
 
 namespace hardware {
 
-bool CaptureRing::allocate(allocators::IAllocator& allocator, uint32_t bytes) {
+bool CaptureRing::allocate(allocators::IAllocator& allocator, uint32_t bytes, uint32_t frame_size) {
   release(allocator);
-  if (bytes == 0 || bytes % kAudioFrameSize != 0) return false;
+  if (frame_size == 0 || bytes == 0 || bytes % frame_size != 0) return false;
+  frame_size_ = frame_size;
   memory_ = allocate_view<uint8_t>(allocator, bytes, 128);
   if (memory_.empty()) return false;
   reset();
@@ -37,19 +38,19 @@ void CaptureRing::release(allocators::IAllocator& allocator) {
 void CaptureRing::reset(uint32_t position) {
   if (memory_.empty()) return;
   memory_.fill(0);
-  head_ = position % size() / kAudioFrameSize * kAudioFrameSize;
+  head_ = position % size() / frame_size_ * frame_size_;
   queued_ = 0;
 }
 
 // `bytes` more were recorded: they are queued, and anything beyond the buffer's size pushes the oldest out.
 void CaptureRing::note_arrival(uint64_t bytes) {
-  bytes -= bytes % kAudioFrameSize;
+  bytes -= bytes % frame_size_;
   if (bytes == 0) return;
-  frames_captured_ += bytes / kAudioFrameSize;
+  frames_captured_ += bytes / frame_size_;
   const uint64_t total = uint64_t{queued_} + bytes;
   if (total > size()) {
     const uint64_t lost = total - size();
-    frames_lost_ += lost / kAudioFrameSize;
+    frames_lost_ += lost / frame_size_;
     ++overruns_;
     queued_ = size();
   } else {
@@ -59,13 +60,13 @@ void CaptureRing::note_arrival(uint64_t bytes) {
 
 void CaptureRing::advance(uint32_t position) {
   if (memory_.empty()) return;
-  position = position % size() / kAudioFrameSize * kAudioFrameSize;
+  position = position % size() / frame_size_ * frame_size_;
   advance_by(position >= head_ ? position - head_ : size() - head_ + position);
 }
 
 void CaptureRing::advance_by(uint64_t bytes) {
   if (memory_.empty()) return;
-  bytes -= bytes % kAudioFrameSize;
+  bytes -= bytes % frame_size_;
   if (bytes == 0) return;
   note_arrival(bytes);
   head_ = static_cast<uint32_t>((head_ + bytes % size()) % size());
@@ -73,10 +74,10 @@ void CaptureRing::advance_by(uint64_t bytes) {
 
 void CaptureRing::push(ConstByteView pcm) {
   if (memory_.empty()) return;
-  uint64_t bytes = pcm.size() - pcm.size() % kAudioFrameSize;
+  uint64_t bytes = pcm.size() - pcm.size() % frame_size_;
   // Only the last buffer's worth of a huge block can survive.
   uint64_t skip = bytes > size() ? bytes - size() : 0;
-  skip -= skip % kAudioFrameSize;
+  skip -= skip % frame_size_;
   uint32_t at = static_cast<uint32_t>((head_ + skip) % size());
   for (uint64_t done = skip; done < bytes;) {
     const uint32_t chunk = static_cast<uint32_t>(bytes - done < size() - at ? bytes - done : size() - at);
@@ -91,7 +92,7 @@ void CaptureRing::push(ConstByteView pcm) {
 uint32_t CaptureRing::read(ByteView out) {
   if (memory_.empty()) return 0;
   uint32_t bytes = out.size() < queued_ ? static_cast<uint32_t>(out.size()) : queued_;
-  bytes -= bytes % kAudioFrameSize;
+  bytes -= bytes % frame_size_;
   uint32_t at = (head_ + size() - queued_) % size();
   for (uint32_t done = 0; done < bytes;) {
     const uint32_t chunk = bytes - done < size() - at ? bytes - done : size() - at;
@@ -100,7 +101,7 @@ uint32_t CaptureRing::read(ByteView out) {
     done += chunk;
   }
   queued_ -= bytes;
-  frames_read_ += bytes / kAudioFrameSize;
+  frames_read_ += bytes / frame_size_;
   return bytes;
 }
 

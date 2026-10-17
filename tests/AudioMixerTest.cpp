@@ -187,11 +187,67 @@ static void test_device_pressure() {
   CHECK(dev.vol == 33 && dev.mute && mixer.master_volume() == 33 && mixer.master_muted());
 }
 
+static void test_formats_and_pan() {
+  TestAllocator a; FakeDevice dev;
+  audio::AudioMixer mixer(dev, a);
+  CHECK(mixer.initialize());
+  CHECK(!mixer.open_stream(audio::StreamFormat{100, 1, audio::SampleType::S16}));  // invalid rate
+
+  // A mono 8-bit stream at 24 kHz plays at twice the frames, on both channels at the centre (0.707).
+  audio::StreamFormat mono{24000, 1, audio::SampleType::U8};
+  auto m = mixer.open_stream(mono, 4096);
+  CHECK(m && m->format().frame_size() == 1);
+  uint8_t u8[100];
+  for (auto& b : u8) b = 128 + 64;  // +64 * 256 = 16384
+  CHECK(m->write(ConstByteView(u8, 100)) == 100);
+  mixer.pump();
+  const uint32_t frames = dev.recorded / kAudioFrameSize;
+  CHECK(frames >= 195 && frames <= 200);
+  CHECK(dev.samples[20] == dev.samples[21]);
+  CHECK(dev.samples[20] > 11000 && dev.samples[20] < 11700);  // 16384 * 0.707 = 11585
+
+  // Pan hard left puts it all in the left channel; hard right all in the right.
+  m->set_pan(-100);
+  for (auto& b : u8) b = 128 + 64;
+  uint32_t before = dev.recorded / 2;
+  m->write(ConstByteView(u8, 100));
+  mixer.pump();
+  CHECK(dev.samples[before + 40] > 16000 && dev.samples[before + 41] == 0);
+  m->set_pan(100);
+  before = dev.recorded / 2;
+  m->write(ConstByteView(u8, 100));
+  mixer.pump();
+  CHECK(dev.samples[before + 40] == 0 && dev.samples[before + 41] > 16000);
+  CHECK(m->pan() == 100);
+  m->set_pan(500);
+  CHECK(m->pan() == 100);
+
+  // A stereo stream is balanced: pan right leaves the right channel alone and turns the left down.
+  auto st = mixer.open_stream(4096);
+  int16_t pcm[10 * 2];
+  for (auto& v : pcm) v = 10000;
+  st->set_pan(60);
+  before = dev.recorded / 2;
+  st->write(ConstByteView(reinterpret_cast<uint8_t*>(pcm), sizeof pcm));
+  mixer.pump();
+  CHECK(dev.samples[before + 1] == 10000 && dev.samples[before] < 8000 && dev.samples[before] > 0);
+
+  // The backlog and room are reported in the stream's own format.
+  auto slow = mixer.open_stream(audio::StreamFormat{8000, 2, audio::SampleType::S16}, 4096);
+  const uint32_t room = slow->free_bytes();
+  CHECK(room >= 4096 / 6 - 8 && room <= 4096 / 6 + 8);  // 4 KiB of 48 kHz is a sixth as many 8 kHz bytes
+  uint8_t chunk[8000] = {};
+  const uint32_t taken = slow->write(ConstByteView(chunk, sizeof chunk));
+  CHECK(taken > 0 && taken <= room + 8 && slow->free_bytes() <= 8);
+  CHECK(slow->queued_bytes() >= taken - 8);
+}
+
 int main() {
   test_single_stream();
   test_mixing_and_clipping();
   test_close_and_limits();
   test_device_pressure();
+  test_formats_and_pan();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("audio mixer tests passed\n");
   return 0;

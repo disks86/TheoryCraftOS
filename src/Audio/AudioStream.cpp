@@ -24,10 +24,25 @@ using hardware::kAudioFrameSize;
 
 bool AudioStream::allocate(uint32_t ring_bytes) {
   if (ring_bytes == 0 || ring_bytes % kAudioFrameSize != 0) return false;
+  StreamFormat device;  // the defaults are the device's format
+  if (!converter_.configure(format_, device)) return false;
   release_view(allocator_, ring_);
   ring_ = allocate_view<uint8_t>(allocator_, ring_bytes, 16);
   read_ = queued_ = 0;
   return !ring_.empty();
+}
+
+// Appends device-format bytes at the write position.
+void AudioStream::append(ConstByteView converted) {
+  const uint32_t size = static_cast<uint32_t>(ring_.size());
+  uint32_t at = (read_ + queued_) % size;
+  for (uint32_t done = 0; done < converted.size();) {
+    const uint32_t chunk = converted.size() - done < size - at ? static_cast<uint32_t>(converted.size()) - done : size - at;
+    ring_.subview(at, chunk).copy_from(converted.subview(done, chunk));
+    at = (at + chunk) % size;
+    done += chunk;
+  }
+  queued_ += static_cast<uint32_t>(converted.size());
 }
 
 uint32_t AudioStream::write(ConstByteView pcm) {
@@ -35,34 +50,50 @@ uint32_t AudioStream::write(ConstByteView pcm) {
   kernel::ScopedMutex guard(mutex_);
   if (ring_.empty()) return 0;
   const uint32_t size = static_cast<uint32_t>(ring_.size());
-  uint32_t bytes = pcm.size() < size - queued_ ? static_cast<uint32_t>(pcm.size()) : size - queued_;
-  bytes -= bytes % kAudioFrameSize;
-  uint32_t at = (read_ + queued_) % size;
-  for (uint32_t done = 0; done < bytes;) {
-    const uint32_t chunk = bytes - done < size - at ? bytes - done : size - at;
-    ring_.subview(at, chunk).copy_from(pcm.subview(done, chunk));
-    at = (at + chunk) % size;
-    done += chunk;
+  uint32_t taken = 0;
+  if (format_.is_native()) {
+    uint32_t bytes = pcm.size() < size - queued_ ? static_cast<uint32_t>(pcm.size()) : size - queued_;
+    bytes -= bytes % kAudioFrameSize;
+    append(pcm.first(bytes));
+    taken = bytes;
+  } else {
+    uint8_t converted[2048];
+    while (taken < pcm.size() && queued_ < size) {
+      const uint32_t room = size - queued_ < sizeof converted ? size - queued_ : static_cast<uint32_t>(sizeof converted);
+      uint32_t used = 0;
+      const uint32_t made = converter_.convert(pcm.dropped(taken), ByteView(converted).first(room), &used);
+      if (made == 0 && used == 0) break;
+      append(ConstByteView(converted).first(made));
+      taken += used;
+    }
   }
-  queued_ += bytes;
-  __atomic_fetch_add(&frames_written_, bytes / kAudioFrameSize, __ATOMIC_RELAXED);
-  return bytes;
+  __atomic_fetch_add(&frames_written_, taken / format_.frame_size(), __ATOMIC_RELAXED);
+  return taken;
 }
 
 uint32_t AudioStream::free_bytes() {
   if (closed()) return 0;
   kernel::ScopedMutex guard(mutex_);
-  return static_cast<uint32_t>(ring_.size()) - queued_;
+  const uint32_t room = static_cast<uint32_t>(ring_.size()) - queued_;
+  return format_.is_native() ? room : static_cast<uint32_t>(converter_.input_bytes_for(room));
 }
 
 uint32_t AudioStream::queued_bytes() {
   kernel::ScopedMutex guard(mutex_);
-  return queued_;
+  return format_.is_native() ? queued_ : static_cast<uint32_t>(converter_.input_bytes_for(queued_));
+}
+
+bool AudioStream::drained() {
+  kernel::ScopedMutex guard(mutex_);
+  return queued_ == 0;
 }
 
 uint32_t AudioStream::mix_into(int32_t* accumulator, uint32_t max_frames) {
   const bool silent = muted() || volume() == 0;
-  const int32_t gain = volume();
+  int32_t left_gain, right_gain;  // Q15: the volume and the pan together
+  pan_gains(pan(), format_.channels == 1, &left_gain, &right_gain);
+  left_gain = left_gain * volume() / hardware::kAudioMaxVolume;
+  right_gain = right_gain * volume() / hardware::kAudioMaxVolume;
   kernel::ScopedMutex guard(mutex_);
   if (ring_.empty()) return 0;
   const uint32_t size = static_cast<uint32_t>(ring_.size());
@@ -71,7 +102,7 @@ uint32_t AudioStream::mix_into(int32_t* accumulator, uint32_t max_frames) {
   for (uint32_t i = 0; i < frames * hardware::kAudioChannels; ++i) {
     const uint32_t at = (read_ + i * hardware::kAudioBytesPerSample) % size;
     const int32_t sample = static_cast<int16_t>(ring_[at] | (ring_[(at + 1) % size] << 8));
-    if (!silent) accumulator[i] += sample * gain / hardware::kAudioMaxVolume;
+    if (!silent) accumulator[i] += (sample * ((i & 1) ? right_gain : left_gain)) >> 15;
   }
   read_ = (read_ + frames * kAudioFrameSize) % size;
   queued_ -= frames * kAudioFrameSize;

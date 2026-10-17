@@ -33,10 +33,10 @@ bool AudioMixer::initialize() {
   return true;
 }
 
-SharedPointer<AudioStream> AudioMixer::open_stream(uint32_t ring_bytes) {
+SharedPointer<AudioStream> AudioMixer::open_stream(const StreamFormat& format, uint32_t ring_bytes) {
   kernel::ScopedMutex guard(mutex_);
   if (streams_.count() >= kMaxStreams) return SharedPointer<AudioStream>();
-  SharedPointer<AudioStream> stream = SharedPointer<AudioStream>::make(allocator_, allocator_);
+  SharedPointer<AudioStream> stream = SharedPointer<AudioStream>::make(allocator_, allocator_, format);
   if (!stream || !stream->allocate(ring_bytes) || !streams_.push_back(stream)) return SharedPointer<AudioStream>();
   ++stats_.streams_opened;
   return stream;

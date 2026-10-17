@@ -201,10 +201,51 @@ static void test_hub() {
   for (auto& p : many) p.reset();
 }
 
+static void test_capture_formats() {
+  TestAllocator a; FakeInput input;
+  audio::AudioCaptureHub hub(input, a);
+  CHECK(hub.initialize());
+  CHECK(!hub.open_stream(audio::StreamFormat{300000, 2, audio::SampleType::S16}));
+
+  // 16 kHz mono 8-bit: a third of the frames, one byte each, the two channels averaged.
+  auto voice = hub.open_stream(audio::StreamFormat{16000, 1, audio::SampleType::U8}, 4096);
+  auto raw = hub.open_stream(4096);
+  CHECK(voice && raw);
+  int16_t pcm[300 * 2];
+  for (int i = 0; i < 300; ++i) { pcm[2 * i] = 8192; pcm[2 * i + 1] = 8192; }  // 0.25 of full scale
+  input.add(pcm, 300);
+  hub.pump();
+  CHECK(raw->available_bytes() == 1200);
+  const uint32_t got = voice->available_bytes();
+  CHECK(got >= 98 && got <= 100);
+  uint8_t out[200];
+  CHECK(voice->read(ByteView(out, 200)) == got);
+  for (uint32_t i = 1; i < got; ++i) CHECK(out[i] == 128 + 32);  // 8192 / 256 = 32
+
+  // Gain on an 8-bit stream scales around the middle.
+  voice->set_gain(50);
+  input.add(pcm, 300);
+  hub.pump();
+  CHECK(voice->read(ByteView(out, 200)) > 90 && out[10] == 128 + 16);
+  voice->set_muted(true);
+  input.add(pcm, 300);
+  hub.pump();
+  CHECK(voice->read(ByteView(out, 200)) > 90 && out[10] == 128);
+
+  // Upsampling to 96 kHz doubles the frames, and a stream with a pending conversion keeps up across pumps.
+  auto wide = hub.open_stream(audio::StreamFormat{96000, 2, audio::SampleType::S16}, 8192);
+  input.add(pcm, 100);
+  hub.pump();
+  input.add(pcm, 100);
+  hub.pump();
+  CHECK(wide->available_bytes() >= 4 * 398 && wide->available_bytes() <= 4 * 400);
+}
+
 int main() {
   test_ring();
   test_software_input();
   test_hub();
+  test_capture_formats();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("audio capture tests passed\n");
   return 0;

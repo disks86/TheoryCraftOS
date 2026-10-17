@@ -133,6 +133,23 @@ bool run_mixer_demo(audio::AudioMixer& mixer) {
   const bool accepted = sent[0] == kToneFrames && sent[1] == kToneFrames;
   report("both tones accepted", accepted);
   all_ok &= accepted;
+  // A third sound in another format: 24 kHz mono, 8-bit, panned to the left.
+  SharedPointer<audio::AudioStream> side = mixer.open_stream(audio::StreamFormat{24000, 1, audio::SampleType::U8});
+  bool side_ok = static_cast<bool>(side);
+  if (side) {
+    side->set_pan(audio::kPanLeft);
+    uint8_t note[240];
+    for (uint32_t i = 0; i < sizeof note; ++i) note[i] = (i / 27) % 2 ? 128 + 40 : 128 - 40;
+    uint32_t written = 0;
+    for (int tries = 0; written < sizeof note && tries < 100; ++tries) {
+      written += side->write(ConstByteView(note).dropped(written));
+      if (written < sizeof note) hardware::delay_us(5000);
+    }
+    side_ok = written == sizeof note;
+    side->close();
+  }
+  report("24 kHz mono stream resampled and panned", side_ok);
+  all_ok &= side_ok;
   low->close();
   high->close();
 
@@ -143,8 +160,8 @@ bool run_mixer_demo(audio::AudioMixer& mixer) {
     waited_us += 10000;
   }
   const audio::MixerStatistics after = mixer.statistics();
-  const bool mixed = after.frames_mixed - before.frames_mixed == kToneFrames &&
-                     after.streams_opened - before.streams_opened == 2 && mixer.stream_count() == 0;
+  const bool mixed = after.frames_mixed - before.frames_mixed >= kToneFrames &&
+                     after.streams_opened - before.streams_opened == 3 && mixer.stream_count() == 0;
   report("tones mixed, played and streams released", mixed);
   all_ok &= mixed;
   return all_ok;

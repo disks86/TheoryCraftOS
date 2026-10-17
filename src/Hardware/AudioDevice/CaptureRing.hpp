@@ -32,8 +32,9 @@ namespace hardware {
 // push() instead.
 class CaptureRing {
  public:
-  // A buffer of `bytes` (a multiple of the frame size), aligned to 128 bytes. False when out of memory.
-  bool allocate(allocators::IAllocator& allocator, uint32_t bytes);
+  // A buffer of `bytes` (a multiple of `frame_size`, the size of one sample frame in whatever format the
+  // ring holds), aligned to 128 bytes. False when out of memory.
+  bool allocate(allocators::IAllocator& allocator, uint32_t bytes, uint32_t frame_size = kAudioFrameSize);
   void release(allocators::IAllocator& allocator);
 
   uint8_t* data() const { return memory_.data(); }
@@ -64,6 +65,7 @@ class CaptureRing {
   void note_arrival(uint64_t bytes);
 
   ByteView memory_;
+  uint32_t frame_size_ = kAudioFrameSize;
   uint32_t head_ = 0;    // where the next recorded byte goes
   uint32_t queued_ = 0;  // bytes recorded and not read; they end at head_
   uint64_t frames_captured_ = 0;

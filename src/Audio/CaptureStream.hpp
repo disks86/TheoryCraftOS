@@ -18,6 +18,8 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Audio/Resampler.hpp"
+#include "Audio/StreamFormat.hpp"
 #include "Hardware/AudioDevice/CaptureRing.hpp"
 #include "Kernel/Sync.hpp"
 
@@ -25,7 +27,9 @@ namespace audio {
 
 // One program's view of the microphone: a ring the capture hub fills with every
 // frame recorded from the moment the stream was opened, and the program reads at
-// its own pace (fixed format: 48 kHz, 16-bit, stereo). If the program falls a
+// its own pace. The device records 48 kHz, 16-bit, stereo; the stream converts
+// to the program's StreamFormat (any rate from 4 to 192 kHz, mono or stereo, 16
+// or 8 bits) as the audio arrives. If the program falls a
 // whole ring behind, the oldest audio is overwritten and counted as lost. Each
 // stream has its own gain and mute. Thread safe.
 //
@@ -34,12 +38,15 @@ class CaptureStream {
  public:
   static constexpr uint32_t kDefaultRingBytes = 64 * 1024;  // about 340 ms
 
-  explicit CaptureStream(allocators::IAllocator& allocator) : allocator_(allocator) {}
+  explicit CaptureStream(allocators::IAllocator& allocator, const StreamFormat& format = StreamFormat())
+      : allocator_(allocator), format_(format) {}
   ~CaptureStream() { ring_.release(allocator_); }
   CaptureStream(const CaptureStream&) = delete;
   CaptureStream& operator=(const CaptureStream&) = delete;
 
+  // False if the format is not valid or memory ran out. `ring_bytes` is the size of the ring in the stream's format.
   bool allocate(uint32_t ring_bytes = kDefaultRingBytes);
+  const StreamFormat& format() const { return format_; }
 
   // Copies out the oldest whole frames, scaled by the stream's gain; returns the bytes copied.
   uint32_t read(ByteView out);
@@ -58,11 +65,13 @@ class CaptureStream {
 
   hardware::AudioCaptureStatistics statistics();
 
-  // Hub side: appends recorded frames.
+  // Hub side: appends recorded frames (in the device's format; they are converted here).
   void deliver(ConstByteView pcm);
 
  private:
   allocators::IAllocator& allocator_;
+  StreamFormat format_;
+  FormatConverter converter_;  // from the device format to format_
   hardware::CaptureRing ring_;
   kernel::Mutex mutex_;
   uint8_t gain_ = hardware::kAudioMaxVolume;

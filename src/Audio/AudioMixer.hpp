@@ -38,6 +38,9 @@ struct MixerStatistics {
 // open_stream() their own AudioStream, write to it whenever they like, and the
 // mixer adds all the streams together in real time into the device.
 //
+// Each stream can use its own format (see StreamFormat), volume and pan; the
+// stream converts on write.
+//
 // pump() does the work: it tops the device up to a short target delay (about
 // 50 ms), sums the queued audio of every stream (each at its own volume) with
 // clipping, and drops streams that are closed and drained. start_service() runs
@@ -65,8 +68,12 @@ class AudioMixer {
   // Allocates the mixing buffers. False if out of memory.
   bool initialize();
 
-  // A new stream, or an empty pointer at kMaxStreams / out of memory.
-  SharedPointer<AudioStream> open_stream(uint32_t ring_bytes = AudioStream::kDefaultRingBytes);
+  // A new stream, or an empty pointer at kMaxStreams / out of memory / an invalid format. The program writes
+  // in `format` (default: the device's own, 48 kHz 16-bit stereo, which needs no conversion).
+  SharedPointer<AudioStream> open_stream(const StreamFormat& format, uint32_t ring_bytes = AudioStream::kDefaultRingBytes);
+  SharedPointer<AudioStream> open_stream(uint32_t ring_bytes = AudioStream::kDefaultRingBytes) {
+    return open_stream(StreamFormat(), ring_bytes);
+  }
 
   void pump();
   bool start_service();

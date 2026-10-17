@@ -27,10 +27,10 @@ bool AudioCaptureHub::initialize() {
   return !chunk_.empty();
 }
 
-SharedPointer<CaptureStream> AudioCaptureHub::open_stream(uint32_t ring_bytes) {
+SharedPointer<CaptureStream> AudioCaptureHub::open_stream(const StreamFormat& format, uint32_t ring_bytes) {
   kernel::ScopedMutex guard(mutex_);
   if (streams_.count() >= kMaxStreams) return SharedPointer<CaptureStream>();
-  SharedPointer<CaptureStream> stream = SharedPointer<CaptureStream>::make(allocator_, allocator_);
+  SharedPointer<CaptureStream> stream = SharedPointer<CaptureStream>::make(allocator_, allocator_, format);
   if (!stream || !stream->allocate(ring_bytes)) return SharedPointer<CaptureStream>();
   if (streams_.count() == 0) device_.flush();  // the first listener hears from now, not from earlier
   if (!streams_.push_back(stream)) return SharedPointer<CaptureStream>();

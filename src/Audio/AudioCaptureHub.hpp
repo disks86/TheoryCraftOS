@@ -61,7 +61,11 @@ class AudioCaptureHub {
   bool initialize();
 
   // A new stream, or an empty pointer at kMaxStreams / out of memory.
-  SharedPointer<CaptureStream> open_stream(uint32_t ring_bytes = CaptureStream::kDefaultRingBytes);
+  // The program reads in `format` (default: the device's own, 48 kHz 16-bit stereo, which needs no conversion).
+  SharedPointer<CaptureStream> open_stream(const StreamFormat& format, uint32_t ring_bytes = CaptureStream::kDefaultRingBytes);
+  SharedPointer<CaptureStream> open_stream(uint32_t ring_bytes = CaptureStream::kDefaultRingBytes) {
+    return open_stream(StreamFormat(), ring_bytes);
+  }
 
   void pump();
   bool start_service();
