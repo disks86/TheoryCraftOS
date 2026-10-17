@@ -96,6 +96,11 @@ run("convert", "rgb.png", "-colors", "32", "-type", "palette", "pal.tif")
 run("convert", "rgb.png", "-colorspace", "gray", "-depth", "4", "gray4.tif")
 run("convert", "rgb.png", "-define", "tiff:endian=msb", "-compress", "RLE", "rgb_be.tif")
 run("convert", "rgb.png", "-interlace", "plane", "-define", "tiff:rows-per-strip=7", "planar.tif")
+big = Image.fromarray(base).resize((160, 120), Image.BICUBIC)
+big.save("big.webp", lossless=True, method=6, quality=100)               # predictor, cross-colour, meta prefix codes
+Image.fromarray(rgba).save("rgba.webp", lossless=True, method=4, quality=50, exact=True)
+Image.fromarray(base).convert("P", palette=Image.ADAPTIVE, colors=12).convert("RGBA").save("pal.webp", lossless=True, method=4, quality=0)  # colour indexing
+Image.fromarray(base).save("lossy.webp", quality=70)                      # VP8: must be refused
 run("ffmpeg", "-v", "error", "-y", "-i", "rgba.png", "rgba.qoi")
 run("ffmpeg", "-v", "error", "-y", "-i", "rgb.png", "rgb.qoi")
 
@@ -110,7 +115,7 @@ with tempfile.TemporaryDirectory() as t:
     run("ffmpeg", "-v", "error", "-y", "-framerate", "10", "-i", f"{t}/f%d.png", "-plays", "0", "-f", "apng", "anim.apng")
 
 for p in ["rgb.png", "rgba.png", "gray.png", "pal.png", "rgb_interlaced.png", "rgb.bmp", "pal8.bmp", "rgb.jpg", "rgb444.jpg", "progressive.jpg", "gray.jpg",
-          "rgb.ppm", "gray.pgm", "bw.pbm", "rgb.tga", "rgba.tga", "rgb_lzw.tif", "rgba_zip.tif", "tiled.tif", "pal.tif", "gray4.tif", "rgb_be.tif", "planar.tif", "static.gif", "anim.gif", "interlaced.gif"]:
+          "rgb.ppm", "gray.pgm", "bw.pbm", "rgb.tga", "rgba.tga", "big.webp", "rgba.webp", "pal.webp", "rgb_lzw.tif", "rgba_zip.tif", "tiled.tif", "pal.tif", "gray4.tif", "rgb_be.tif", "planar.tif", "static.gif", "anim.gif", "interlaced.gif"]:
     add_image(p, pil_oracle(p))
 # 16-bit grey: the decoders keep the high byte (ffmpeg rounds to nearest instead, so it is not the oracle here)
 g16 = (np.asarray(Image.open("gray16.png")).astype(np.uint32) >> 8).astype(np.uint8)
@@ -196,6 +201,14 @@ for name, args in {"s16.aiff": ["-acodec", "pcm_s16be"], "s24.aiff": ["-acodec",
                    "best.flac": ["-compression_level", "8"], "s32.flac": ["-sample_fmt", "s32"]}.items():
     ff_audio(name, *args)
     add_audio(name, ff_oracle(name), 11025, 2)
+# Vorbis is lossy and each decoder rounds a little differently: the reference is ffmpeg's decode, compared with a tolerance.
+for name, args, mono in [("stereo.ogg", ["-acodec", "libvorbis", "-q:a", "4"], False), ("mono.ogg", ["-acodec", "libvorbis", "-q:a", "2"], True)]:
+    ff_audio(name, *args, mono=mono)
+    ch = 1 if mono else 2
+    raw = ff_oracle(name)[:len(t) * ch * 2]   # the stream's true length (ffmpeg adds the padding of its last block)
+    open(name.replace(".ogg", ".ref"), "wb").write(raw)
+    manifest.append(f"audiotol {name} 11025 {ch} {len(raw) // 2 // ch} {name.replace('.ogg', '.ref')}")
+ff_audio("opus.ogg", "-acodec", "libopus", "-b:a", "48k")   # a codec that is not here: must be refused, not misread
 os.remove("src.raw")
 
 open("manifest.txt", "w").write("\n".join(manifest) + "\n")

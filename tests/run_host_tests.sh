@@ -40,10 +40,10 @@ for t in "${WANTED[@]}"; do
     VideoCodecTest) build_and_run VideoCodecTest tests/VideoCodecTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                       src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp ;;
     VideoPlayerTest) build_and_run VideoPlayerTest tests/VideoPlayerTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-                       src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp \
+                       src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
                        src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp $media ;;
     MediaTest) build_and_run MediaTest tests/MediaTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
-                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp \
+                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
                  src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp ;;
     PartitionTest) build_and_run PartitionTest tests/PartitionTest.cpp tests/KernelStubs.cpp src/Hardware/StorageDevice/Partition/PartitionScanner.cpp ;;
     FileSystemTest) build_and_run FileSystemTest tests/FileSystemTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \

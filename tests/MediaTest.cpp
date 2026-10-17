@@ -84,11 +84,16 @@ static void test_fixtures() {
   FILE* m = fopen("tests/data/manifest.txt", "r");
   CHECK(m != nullptr);
   if (!m) return;
-  char kind[16], name[96];
+  char kind[16], name[96], reference[96] = "";
   unsigned x, y, z;
-  unsigned long long hash;
+  unsigned long long hash = 0;
   int count = 0;
-  while (fscanf(m, "%15s %95s %u %u %u %llx", kind, name, &x, &y, &z, &hash) == 6) {
+  while (fscanf(m, "%15s %95s %u %u %u", kind, name, &x, &y, &z) == 5) {
+    if (!strcmp(kind, "audiotol")) {
+      if (fscanf(m, "%95s", reference) != 1) break;
+    } else if (fscanf(m, "%llx", &hash) != 1) {
+      break;
+    }
     char path[160];
     snprintf(path, sizeof path, "tests/data/%s", name);
     File file(path);
@@ -98,6 +103,18 @@ static void test_fixtures() {
     if (!strcmp(kind, "image")) {
       Image img(a);
       ok = decode_image(file.view(), &img) && img.width() == x && img.height() == y && img.frame_count() == z && image_hash(img) == hash;
+    } else if (!strcmp(kind, "audiotol")) {
+      // Lossy audio: the samples must be within a couple of steps of the reference decoder's, in the same count.
+      char ref_path[160];
+      snprintf(ref_path, sizeof ref_path, "tests/data/%s", reference);
+      File ref(ref_path);
+      AudioData au(a);
+      ok = ref.data && decode_audio(file.view(), &au) && au.format().sample_rate == x && au.format().channels == y && au.frame_count() == z &&
+           au.bytes().size() == static_cast<uint64_t>(ref.size);
+      for (uint64_t i = 0; ok && i < au.samples().size(); ++i) {
+        const int d = au.samples()[i] - static_cast<int16_t>(ref.data[i * 2] | ref.data[i * 2 + 1] << 8);
+        ok = d >= -2 && d <= 2;
+      }
     } else {
       AudioData au(a);
       ok = decode_audio(file.view(), &au) && au.format().sample_rate == x && au.format().channels == y && au.frame_count() == z && audio_hash(au) == hash;
@@ -105,7 +122,13 @@ static void test_fixtures() {
     if (!ok) { printf("FAILED fixture %s\n", name); ++g_failed; }
   }
   fclose(m);
-  CHECK(count >= 52);
+  CHECK(count >= 58);
+  {  // Ogg Opus shares the container with Vorbis but is a different codec: not Vorbis, not decoded.
+    File opus("tests/data/opus.ogg");
+    AudioData au(a);
+    AudioFileFormat f = AudioFileFormat::Vorbis;
+    CHECK(opus.data && !decode_audio(opus.view(), &au, &f) && f == AudioFileFormat::Unknown);
+  }
   CHECK(a.live == 0);
 }
 
@@ -154,13 +177,18 @@ static void test_image_roundtrip() {
   Image opaque(a);
   make_picture(&opaque, 45, 33, 1, false);
   struct { ImageFormat f; bool exact; bool alpha; } cases[] = {{ImageFormat::Png, true, true}, {ImageFormat::Bmp, true, true}, {ImageFormat::Qoi, true, true},
-                                                             {ImageFormat::Tga, true, true}, {ImageFormat::Pnm, true, false}, {ImageFormat::Tiff, true, true}};
+                                                             {ImageFormat::Tga, true, true}, {ImageFormat::Pnm, true, false}, {ImageFormat::Tiff, true, true}, {ImageFormat::Webp, true, true}};
   for (const auto& c : cases) {
     const Image& in = c.alpha ? src : opaque;
     ByteBuffer out(a);
     ImageFormat detected = ImageFormat::Unknown;
     CHECK(encode_image(in, c.f, 80, &out));
     CHECK(decode_image(out.view(), &dst, &detected) && detected == c.f && same_pixels(in, dst));
+  }
+  // Lossy WebP is a different codec (VP8), which is not here: refused, not misread.
+  {
+    File lossy("tests/data/lossy.webp");
+    CHECK(lossy.data != nullptr && detect_image_format(lossy.view()) == ImageFormat::Webp && !decode_image(lossy.view(), &dst) && dst.empty());
   }
   // Lossy: JPEG at high quality is close; GIF is a 216-colour dither, so only roughly close.
   ByteBuffer jpg(a), gif(a);
@@ -251,7 +279,7 @@ static void test_audio_roundtrip() {
 static void test_fuzz() {
   TestAllocator a;
   const char* names[] = {"rgb.png", "rgba16.png", "anim.apng", "rgb.jpg", "progressive.jpg", "rle8.bmp", "rgba32.bmp", "anim.gif", "interlaced.gif", "rgba.qoi", "rgb.ppm",
-                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac"};
+                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg"};
   uint32_t seed = 2024;
   auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
   for (const char* name : names) {

@@ -206,6 +206,7 @@ add_executable(BOOTX64
   src/Media/Image/Qoi.cpp
   src/Media/Image/Tga.cpp
   src/Media/Image/Tiff.cpp
+  src/Media/Image/Webp.cpp
   src/Media/AudioData.cpp
   src/Media/AudioCodecs.cpp
   src/Media/Audio/Pcm.cpp
@@ -213,6 +214,7 @@ add_executable(BOOTX64
   src/Media/Audio/Aiff.cpp
   src/Media/Audio/Au.cpp
   src/Media/Audio/Flac.cpp
+  src/Media/Audio/Vorbis.cpp
   src/Media/VideoFiles.cpp
   src/Media/MediaCodecs.cpp
   src/Video/AviFile.cpp

@@ -104,16 +104,21 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   - Images: PNG and APNG (all colour types and depths, interlacing, tRNS; encoder with adaptive filters and LZ77 + Huffman
     deflate in `Zlib`), JPEG (baseline and progressive, bit-exact with libjpeg-turbo for the checked cases; baseline 4:2:0
     encoder), BMP (1-32 bit, RLE, bit fields), GIF (LZW, interlace, animation; encoder uses a fixed 216-colour palette with
-    dithering), PNM/PAM, QOI, TGA.
+    dithering), PNM/PAM, QOI, TGA, TIFF (strips and tiles, 1-16 bit grey/RGB/palette/alpha, planar, PackBits/LZW/Deflate and the
+    predictor; Deflate RGB(A) encoder), WebP **lossless** (VP8L: all four transforms, colour cache, meta prefix codes; encoder
+    with subtract-green and LZ77; lossy VP8 and animated WebP are refused).
   - Sound: WAV (PCM 8-32 bit, float, A-law, mu-law, IMA and Microsoft ADPCM, extensible), AIFF/AIFC, AU, FLAC (full decoder
-    with CRC checks; fixed-predictor encoder). Encoders write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: MP3, AAC,
-    Vorbis, Opus** (lossy codecs), nor WebP, TIFF, H.264/HEVC/VP9/AV1 video.
+    with CRC checks; fixed-predictor encoder), Ogg Vorbis (decoder only: codebooks, floor 1, residue 0-2, channel coupling,
+    FFT-based IMDCT; within one 16-bit step of ffmpeg's output; floor type 0 and chained streams are not handled). Encoders
+    write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: MP3, AAC, Opus** (their Huffman/codebook/band tables are large
+    constant data that is not reproduced here), lossy WebP, or H.264/HEVC/VP9/AV1 video.
   - Video files: `VideoFiles` reads GIF, APNG and Y4M (4:2:0/4:2:2/4:4:4/mono) as frames with their own durations, which
     `VideoPlayer::open_media()` plays (AVI as before, now also with A-law, mu-law and ADPCM soundtracks; a still picture opens
     as a one-frame video).
   `tests/MediaTest.cpp` checks every decoder against fixtures in `tests/data/` whose expected output comes from Pillow/ffmpeg
   (`tests/data/make_fixtures.py` regenerates them), plus encoder round trips, the accelerated-device/fallback logic with a
-  fake engine, the player, and a fuzz run (truncation, bit flips, noise behind each signature) under ASAN/UBSAN.
+  fake engine, the player, and a fuzz run (truncation, bit flips, noise behind each signature) under ASAN/UBSAN. The Vorbis, WebP and TIFF decoders were
+  also checked against libvorbis-, libwebp- and ImageMagick-encoded files with many settings.
 - `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
   `remove`, `rename`) hands out `IFile` (offset-based read/write/resize) and `IDirectory` (entry iteration) handles;
   every call returns a `Status` instead of throwing. `Path.hpp` holds the shared path rules. `Ram/` is a

@@ -26,6 +26,7 @@ const char* audio_format_name(AudioFileFormat format) {
     case AudioFileFormat::Aiff: return "AIFF";
     case AudioFileFormat::Au: return "AU";
     case AudioFileFormat::Flac: return "FLAC";
+    case AudioFileFormat::Vorbis: return "Ogg Vorbis";
     case AudioFileFormat::Unknown: break;
   }
   return "unknown";
@@ -42,6 +43,13 @@ AudioFileFormat detect_audio_format(ConstByteView d) {
   if (starts("FORM", 0) && (starts("AIFF", 8) || starts("AIFC", 8))) return AudioFileFormat::Aiff;
   if (starts(".snd", 0)) return AudioFileFormat::Au;
   if (starts("fLaC", 0)) return AudioFileFormat::Flac;
+  // Ogg holds many codecs: only a first packet that is a Vorbis identification header counts (the first page's lacing table is
+  // 27 bytes in, then the packet).
+  if (starts("OggS", 0) && d.size() > 27 + 7) {
+    const uint32_t body = 27 + d[26];
+    if (d.size() >= body + 7 && d[body] == 1 && d[body + 1] == 'v' && d[body + 2] == 'o' && d[body + 3] == 'r' && d[body + 4] == 'b' && d[body + 5] == 'i' && d[body + 6] == 's')
+      return AudioFileFormat::Vorbis;
+  }
   return AudioFileFormat::Unknown;
 }
 

@@ -37,6 +37,8 @@ namespace media {
 //   TGA   decode: types 1, 2, 3 and their run-length forms, 8/15/16/24/32 bits. encode: 32-bit uncompressed.
 //   TIFF  decode: strips and tiles, 1-16 bit grey/RGB/palette with alpha, chunky and planar, uncompressed/PackBits/LZW/Deflate,
 //         horizontal predictor; first page only, orientation not applied. encode: 8-bit RGB(A), Deflate + predictor.
+//   WebP  lossless (VP8L) only: all four transforms, colour cache, meta prefix codes. encode: subtract-green + LZ77 + prefix codes.
+//         Lossy (VP8) and animated files are refused.
 bool decode_png(ConstByteView data, Image* out);
 bool encode_png(const Image& image, uint32_t level, ByteBuffer* out);
 bool decode_jpeg(ConstByteView data, Image* out);
@@ -53,9 +55,11 @@ bool decode_tga(ConstByteView data, Image* out);
 bool encode_tga(const Image& image, ByteBuffer* out);
 bool decode_tiff(ConstByteView data, Image* out);
 bool encode_tiff(const Image& image, ByteBuffer* out);
+bool decode_webp(ConstByteView data, Image* out);
+bool encode_webp(const Image& image, ByteBuffer* out);
 
 // Formats the encoder exists for (all of the above).
-constexpr uint32_t kEncodableImageFormats = 0x1FE;
+constexpr uint32_t kEncodableImageFormats = 0x3FE;
 
 // The whole-file entry points: detect the format and decode, or encode in a given format (`quality` 1-100 for JPEG,
 // the deflate effort 1-9 for PNG is derived from it; ignored elsewhere). Only frame 0 of an animation goes to a format

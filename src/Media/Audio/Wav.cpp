@@ -124,13 +124,16 @@ bool decode_ms(ConstByteView data, uint32_t channels, uint32_t block, uint32_t r
       for (uint32_t half = 0; half < 2 && frame < per_block; ++half) {
         const uint32_t nibble = half == 0 ? in[at] >> 4 : in[at] & 15;
         const int32_t signed_nibble = nibble >= 8 ? static_cast<int32_t>(nibble) - 16 : static_cast<int32_t>(nibble);
-        int32_t value = (s1[channel] * coefficients[predictor[channel]][0] + s2[channel] * coefficients[predictor[channel]][1]) / 256 + signed_nibble * delta[channel];
-        value = value > 32767 ? 32767 : value < -32768 ? -32768 : value;
+        // (64-bit: damaged coefficients and a delta that has grown must not overflow.)
+        int64_t wide = (int64_t{s1[channel]} * coefficients[predictor[channel]][0] + int64_t{s2[channel]} * coefficients[predictor[channel]][1]) / 256 +
+                       int64_t{signed_nibble} * delta[channel];
+        const int32_t value = wide > 32767 ? 32767 : wide < -32768 ? -32768 : static_cast<int32_t>(wide);
         dest[frame * channels + channel] = static_cast<int16_t>(value);
         s2[channel] = s1[channel];
         s1[channel] = value;
-        delta[channel] = kMsAdaptation[nibble] * delta[channel] / 256;
+        delta[channel] = static_cast<int32_t>(int64_t{kMsAdaptation[nibble]} * delta[channel] / 256);
         if (delta[channel] < 16) delta[channel] = 16;
+        if (delta[channel] > (1 << 24)) delta[channel] = 1 << 24;
         if (++channel == channels) {
           channel = 0;
           ++frame;

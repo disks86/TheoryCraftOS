@@ -14,6 +14,9 @@ image gray.pgm 40 30 1 cbf4290f68665a0a
 image bw.pbm 40 30 1 d66f89b24035d5b4
 image rgb.tga 40 30 1 a005f44188579fc3
 image rgba.tga 40 30 1 8e082edaf5863e56
+image big.webp 160 120 1 516e2cd9ce082324
+image rgba.webp 40 30 1 8e082edaf5863e56
+image pal.webp 40 30 1 1e9c99529aca1ee4
 image rgb_lzw.tif 40 30 1 a005f44188579fc3
 image rgba_zip.tif 40 30 1 8e082edaf5863e56
 image tiled.tif 40 30 1 a005f44188579fc3
@@ -56,3 +59,5 @@ audio f32.au 11025 2 2205 4667b6931ff3a1bc
 audio fast.flac 11025 2 2205 4667b6931ff3a1bc
 audio best.flac 11025 2 2205 4667b6931ff3a1bc
 audio s32.flac 11025 2 2205 4667b6931ff3a1bc
+audiotol stereo.ogg 11025 2 2205 stereo.ref
+audiotol mono.ogg 11025 1 2205 mono.ref
