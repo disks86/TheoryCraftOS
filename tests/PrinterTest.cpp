@@ -28,6 +28,7 @@
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/Printer/Usb/UsbPrinter.hpp"
 #include "Hardware/Printer/PrinterMonitor.hpp"
+#include "Network/Snmp/SnmpUsm.hpp"
 #include <algorithm>
 #include <map>
 #include "NetworkHarness.hpp"
@@ -827,6 +828,99 @@ struct FakeAgent {
   explicit FakeAgent(Lan& l) : lan(l) { udp = lan.b.udp_open(161); }
   static std::vector<uint32_t> key(const Oid& o) { return std::vector<uint32_t>(o.arc, o.arc + o.length); }
   void put(const char* oid, const SnmpValue& v) { mib[key(O(oid))] = v; }
+  void fill(const SnmpMessage& req, SnmpMessage* out) {
+    SnmpMessage& rsp = *out;
+    if (reject_all) {
+      rsp.error_status = 2;
+      rsp.error_index = 1;
+    } else {
+      for (uint32_t i = 0; i < req.count; ++i) {
+        if (req.pdu == SnmpPdu::Get) {
+          auto it = mib.find(key(req.binds[i].oid));
+          if (it != mib.end()) rsp.binds[i].value = it->second;
+          else rsp.binds[i].value.type = SnmpType::NoSuchObject;
+        } else {
+          auto it = mib.upper_bound(key(req.binds[i].oid));
+          if (it != mib.end()) {
+            Oid o;
+            o.length = static_cast<uint8_t>(it->first.size());
+            for (size_t k = 0; k < it->first.size(); ++k) o.arc[k] = it->first[k];
+            rsp.binds[i].oid = o;
+            rsp.binds[i].value = it->second;
+          } else {
+            rsp.binds[i].value.type = SnmpType::EndOfMibView;
+          }
+        }
+      }
+    }
+  }
+  // --- SNMPv3 (user-based security), the agent side
+  struct V3User { std::string name, auth_password, priv_password; UsmAuth auth; UsmPriv priv; UsmKeys keys; };
+  std::vector<V3User> v3_users;
+  uint8_t engine[12] = {0x80, 0, 0x0a, 0x13, 5, 'H', 'L', '2', '0', '7', '0', 'N'};
+  uint32_t boots = 7;
+  int64_t clock_offset_s = 0;     // the agent's clock runs this far from the stack's
+  int not_in_window_once = 0;     // answer the next authenticated requests with notInTimeWindow
+  int v3_requests = 0, discoveries = 0, resyncs = 0;
+  uint32_t engine_time() const { return static_cast<uint32_t>(lan.clock.us / 1000000 + 5000 + clock_offset_s); }
+  void add_user(const char* name, UsmAuth a, const char* ap, UsmPriv p, const char* pp) {
+    V3User u{name, ap, pp, a, p, UsmKeys()};
+    usm_make_keys(a, ap, p, pp, engine, sizeof engine, &u.keys);
+    v3_users.push_back(u);
+  }
+  void send_v3(const SnmpMessage& m, const UsmKeys* keys, Ipv4Address to, uint16_t port) {
+    ByteBuffer out(lan.alloc);
+    static uint64_t salt = 1;
+    if (encode_snmp_v3(m, keys, salt++, lan.alloc, &out)) udp->send_to(to, port, out.view());
+  }
+  void report(const SnmpMessage& req, const char* stat_oid, Ipv4Address to, uint16_t port) {
+    SnmpMessage r;
+    r.version = 3;
+    r.pdu = SnmpPdu::Report;
+    r.request_id = req.request_id;
+    r.v3.msg_id = req.v3.msg_id;
+    r.v3.engine_id_length = sizeof engine;
+    memcpy(r.v3.engine_id, engine, sizeof engine);
+    memcpy(r.v3.context_engine_id, engine, sizeof engine);
+    r.v3.context_engine_id_length = sizeof engine;
+    r.v3.boots = boots;
+    r.v3.time = engine_time();
+    r.count = 1;
+    r.binds[0].oid = O(stat_oid);
+    r.binds[0].value = vint(1, SnmpType::Counter32);
+    send_v3(r, nullptr, to, port);
+  }
+  bool handle_v3(const uint8_t* buf, uint32_t n, Ipv4Address from, uint16_t port) {
+    SnmpMessage req;
+    ConstByteView data(buf, n);
+    ++v3_requests;
+    if (decode_snmp_v3(data, nullptr, &req) == UsmStatus::Ok && req.v3.engine_id_length == 0) {   // engine discovery
+      ++discoveries;
+      report(req, "1.3.6.1.6.3.15.1.1.4.0", from, port);
+      return true;
+    }
+    for (V3User& u : v3_users) {
+      if (decode_snmp_v3(data, u.auth == UsmAuth::None ? nullptr : &u.keys, &req) != UsmStatus::Ok || u.name != req.v3.user) continue;
+      if (req.v3.engine_id_length != sizeof engine || memcmp(req.v3.engine_id, engine, sizeof engine)) { report(req, "1.3.6.1.6.3.15.1.1.4.0", from, port); return true; }
+      const int64_t skew = static_cast<int64_t>(req.v3.time) - static_cast<int64_t>(engine_time());
+      if (u.auth != UsmAuth::None && (req.v3.boots != boots || skew > 150 || skew < -150 || not_in_window_once > 0)) {
+        if (not_in_window_once > 0) --not_in_window_once;
+        ++resyncs;
+        report(req, "1.3.6.1.6.3.15.1.1.2.0", from, port);
+        return true;
+      }
+      SnmpMessage rsp = req;
+      rsp.pdu = SnmpPdu::Response;
+      fill(req, &rsp);
+      rsp.v3.flags = 0;
+      rsp.v3.boots = boots;
+      rsp.v3.time = engine_time();
+      send_v3(rsp, u.auth == UsmAuth::None ? nullptr : &u.keys, from, port);
+      return true;
+    }
+    report(req, "1.3.6.1.6.3.15.1.1.5.0", from, port);   // wrongDigests / unknown user
+    return true;
+  }
   void step() {
     uint8_t buf[1500];
     Ipv4Address from;
@@ -835,33 +929,16 @@ struct FakeAgent {
     while (udp->receive_from(ByteView(buf), &from, &port, &n)) {
       SnmpMessage req, rsp;
       ++requests;
-      if (silent || !decode_snmp(ConstByteView(buf, n), &req)) continue;
+      if (silent) continue;
+      {   // version 3?  30 <length> 02 01 03
+        size_t at = 1 + 1 + (n > 1 && (buf[1] & 0x80) ? (buf[1] & 0x7F) : 0);
+        if (n > at + 2 && buf[0] == 0x30 && buf[at] == 0x02 && buf[at + 1] == 0x01 && buf[at + 2] == 0x03 && handle_v3(buf, n, from, port)) continue;
+      }
+      if (!decode_snmp(ConstByteView(buf, n), &req)) continue;
       if (drop_first > 0) { --drop_first; continue; }
       rsp = req;
       rsp.pdu = SnmpPdu::Response;
-      if (reject_all) {
-        rsp.error_status = 2;
-        rsp.error_index = 1;
-      } else {
-        for (uint32_t i = 0; i < req.count; ++i) {
-          if (req.pdu == SnmpPdu::Get) {
-            auto it = mib.find(key(req.binds[i].oid));
-            if (it != mib.end()) rsp.binds[i].value = it->second;
-            else rsp.binds[i].value.type = SnmpType::NoSuchObject;
-          } else {
-            auto it = mib.upper_bound(key(req.binds[i].oid));
-            if (it != mib.end()) {
-              Oid o;
-              o.length = static_cast<uint8_t>(it->first.size());
-              for (size_t k = 0; k < it->first.size(); ++k) o.arc[k] = it->first[k];
-              rsp.binds[i].oid = o;
-              rsp.binds[i].value = it->second;
-            } else {
-              rsp.binds[i].value.type = SnmpType::EndOfMibView;
-            }
-          }
-        }
-      }
+      fill(req, &rsp);
       ByteBuffer out(lan.alloc);
       if (encode_snmp(rsp, lan.alloc, &out)) udp->send_to(from, port, out.view());
     }
@@ -1085,6 +1162,64 @@ static void test_dot4() {
   CHECK(g_live == 0);
 }
 
+
+static void test_snmp_v3_monitor() {
+  const UsmAuth auths[] = {UsmAuth::None, UsmAuth::HmacMd5, UsmAuth::HmacSha1, UsmAuth::HmacSha256, UsmAuth::HmacSha1, UsmAuth::HmacMd5};
+  const UsmPriv privs[] = {UsmPriv::None, UsmPriv::None, UsmPriv::Aes128, UsmPriv::Aes128, UsmPriv::Des, UsmPriv::Des};
+  for (int k = 0; k < 6; ++k) {
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    populate_hl2070n(agent);
+    agent.add_user("monitor", auths[k], "authpassword", privs[k], "privpassword");
+    PrinterMonitor mon(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(mon.client().set_v3_user("monitor", auths[k], "authpassword", privs[k], "privpassword"));
+    CHECK(mon.start() && pump_monitor(lan, agent, mon, 60000) && mon.succeeded());
+    CHECK(mon.report().page_count == 12345 && mon.report().supply_count == 3 && mon.report().alert_count == 2 && mon.report().toner_low());
+    CHECK(agent.discoveries == 1 && mon.client().engine_known() && mon.client().engine_boots() == 7);
+    // A second refresh reuses the engine: no new discovery.
+    CHECK(mon.start() && pump_monitor(lan, agent, mon, 60000) && mon.succeeded() && agent.discoveries == 1);
+  }
+  {   // the agent's clock is far off (or it rebooted): its notInTimeWindow report makes the client adopt the clock and send again
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    populate_hl2070n(agent);
+    agent.add_user("monitor", UsmAuth::HmacSha1, "authpassword", UsmPriv::Aes128, "privpassword");
+    PrinterMonitor mon(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(mon.client().set_v3_user("monitor", UsmAuth::HmacSha1, "authpassword", UsmPriv::Aes128, "privpassword"));
+    CHECK(mon.start() && pump_monitor(lan, agent, mon, 60000) && mon.succeeded());
+    agent.not_in_window_once = 1;
+    CHECK(mon.start() && pump_monitor(lan, agent, mon, 60000) && mon.succeeded() && agent.resyncs == 1);
+    agent.boots = 8;   // the printer was switched off and on: new boot count
+    CHECK(mon.start() && pump_monitor(lan, agent, mon, 60000) && mon.succeeded() && mon.client().engine_boots() == 8);
+  }
+  {   // wrong password, unknown user, a user that must authenticate when the agent knows only a plain one: a clean failure, not a hang
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    populate_hl2070n(agent);
+    agent.add_user("monitor", UsmAuth::HmacSha1, "authpassword", UsmPriv::Aes128, "privpassword");
+    PrinterMonitor bad(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(bad.client().set_v3_user("monitor", UsmAuth::HmacSha1, "wrong-password", UsmPriv::Aes128, "privpassword"));
+    CHECK(bad.start() && pump_monitor(lan, agent, bad) && bad.failed() && bad.client().error() == SnmpError::Security);
+    PrinterMonitor nobody(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(nobody.client().set_v3_user("nobody", UsmAuth::HmacSha1, "authpassword", UsmPriv::None, "") && nobody.start() && pump_monitor(lan, agent, nobody) && nobody.failed());
+    CHECK(!nobody.client().set_v3_user("x", UsmAuth::None, "", UsmPriv::Aes128, "privpassword") && !nobody.client().set_v3_user("x", UsmAuth::HmacSha1, "short", UsmPriv::None, ""));
+  }
+  {   // through the printer object
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    populate_hl2070n(agent);
+    agent.add_user("monitor", UsmAuth::HmacSha1, "authpassword", UsmPriv::Aes128, "privpassword");
+    BrotherHl2070n printer(lan.a, Ipv4Address::make(10, 0, 0, 2), lan.alloc);
+    CHECK(printer.set_snmp_v3_user("monitor", UsmAuth::HmacSha1, "authpassword", UsmPriv::Aes128, "privpassword") && printer.request_report());
+    for (int i = 0; i < 60000 && printer.report_pending(); ++i) { lan.step(); agent.step(); printer.poll(); }
+    CHECK(printer.report() && printer.report()->page_count == 12345 && agent.v3_requests >= 2);
+  }
+}
+
 int main() {
   test_packbits();
   test_pages_and_halftone();
@@ -1099,6 +1234,7 @@ int main() {
   test_dot4();
   test_snmp_messages();
   test_printer_monitor();
+  test_snmp_v3_monitor();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

@@ -38,6 +38,8 @@ namespace network {
 //   - IPv4: header checksums verified and generated, TTL 64, "don't fragment"
 //     set; incoming fragments are dropped, outgoing packets over the MTU refused.
 //   - ICMP: replies to echo requests and sends them for ping().
+//   - Multicast: join_multicast() receives a group's datagrams (IGMPv2 reports, answers to queries); multicast is sent to the
+//     group's Ethernet address.
 class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpListener {
  public:
   // The stack drives `nic` and takes time from `clock`; both must outlive it.
@@ -63,6 +65,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   bool ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_ms) override;
   SharedPointer<IUdpSocket> udp_open(uint16_t port) override;
   SharedPointer<ITcpSocket> tcp_open() override;
+  bool join_multicast(Ipv4Address group) override;
+  void leave_multicast(Ipv4Address group) override;
 
   // --- IIpLayer
   Ipv4Address local_address() const override { return config_.address; }
@@ -99,6 +103,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void flush_pending(Ipv4Address resolved);
   void service_pending();
   bool accepts_destination(Ipv4Address destination) const;
+  bool is_member(Ipv4Address group) const;
+  void handle_igmp(ConstByteView igmp);
+  void send_igmp_report(Ipv4Address group);
 
   kernel::RecursiveMutex mutex_;  // guards everything below, and the sockets and resolver
   kernel::Mutex ping_mutex_;      // one ping at a time (they share the ping_* state)
@@ -114,6 +121,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   UniquePointer<DhcpClient> dhcp_;
   UniquePointer<DnsResolver> resolver_;
   uint16_t ip_id_ = 1;
+  static constexpr uint32_t kMaxGroups = 8;
+  Ipv4Address groups_[kMaxGroups];
+  uint32_t group_count_ = 0;
   // The ping in progress.
   bool ping_active_ = false;
   bool ping_answered_ = false;

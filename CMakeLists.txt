@@ -90,7 +90,9 @@ add_executable(BOOTX64
   src/Network/Checksum.cpp
   src/Network/NetworkStack.cpp
   src/Network/Snmp/SnmpMessage.cpp
+  src/Network/Snmp/SnmpUsm.cpp
   src/Network/Snmp/SnmpClient.cpp
+  src/Crypto/Crypto.cpp
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
   src/Network/Udp/UdpManager.cpp

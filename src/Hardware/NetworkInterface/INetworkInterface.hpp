@@ -44,6 +44,13 @@ class INetworkInterface : public IHardware {
   // frame is waiting.
   virtual bool receive(ByteView buffer, uint32_t* length) = 0;
 
+  // Asks the interface to deliver multicast frames too (they are dropped by default on hardware that filters them), for as long as
+  // `enable` is true. True if frames to any multicast address will now arrive; false if the interface cannot say so.
+  virtual bool accept_all_multicast(bool enable) {
+    (void)enable;
+    return false;
+  }
+
   virtual NetworkStatistics statistics() const = 0;
 
  protected:

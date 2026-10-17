@@ -85,6 +85,7 @@ constexpr uint16_t kEtherTypeIpv4 = 0x0800;
 constexpr uint16_t kEtherTypeArp = 0x0806;
 
 constexpr uint8_t kProtocolIcmp = 1;
+constexpr uint8_t kProtocolIgmp = 2;
 constexpr uint8_t kProtocolTcp = 6;
 constexpr uint8_t kProtocolUdp = 17;
 

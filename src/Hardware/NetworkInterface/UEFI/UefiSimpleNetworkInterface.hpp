@@ -39,6 +39,7 @@ class UefiSimpleNetworkInterface final : public INetworkInterface {
   bool link_up() const override;
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
+  bool accept_all_multicast(bool enable) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:

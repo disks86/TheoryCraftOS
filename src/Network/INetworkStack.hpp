@@ -69,6 +69,15 @@ class INetworkStack {
   // A new, unconnected TCP socket.
   virtual SharedPointer<ITcpSocket> tcp_open() = 0;
 
+  // Multicast reception (IGMPv2 on the link): after joining, datagrams addressed to `group` reach UDP sockets bound to their port, and
+  // the interface is asked to deliver multicast frames. Up to 8 groups; joining twice counts once. Sending to a multicast address
+  // needs no membership (the packet goes to the group's Ethernet address with TTL 255 for UDP). Stacks without multicast say no.
+  virtual bool join_multicast(Ipv4Address group) {
+    (void)group;
+    return false;
+  }
+  virtual void leave_multicast(Ipv4Address group) { (void)group; }
+
  protected:
   INetworkStack() = default;
   ~INetworkStack() = default;

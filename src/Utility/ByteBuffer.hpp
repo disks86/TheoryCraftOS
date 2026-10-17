@@ -62,6 +62,12 @@ class ByteBuffer {
     size_ += count;
     return true;
   }
+  // Overwrites one byte already written.
+  bool patch8(uint64_t offset, uint8_t v) {
+    if (offset >= size_) return false;
+    storage_[offset] = v;
+    return true;
+  }
   // Overwrites four bytes already written.
   bool patch32(uint64_t offset, uint32_t v) {
     if (offset + 4 > size_) return false;

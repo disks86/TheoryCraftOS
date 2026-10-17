@@ -70,12 +70,39 @@ struct SnmpVarBind {
   SnmpValue value;
 };
 
-enum class SnmpPdu : uint8_t { Get = 0xA0, GetNext = 0xA1, Response = 0xA2, GetBulk = 0xA5 };
+enum class SnmpPdu : uint8_t { Get = 0xA0, GetNext = 0xA1, Response = 0xA2, Set = 0xA3, TrapV1 = 0xA4, GetBulk = 0xA5, Inform = 0xA6, TrapV2 = 0xA7, Report = 0xA8 };
 
-// An SNMP version 1 or 2c message (RFC 1157 / 3416): community, one PDU, up to 12 variable bindings.
+// The fields of a version 1 Trap PDU (RFC 1157), which has its own layout.
+struct SnmpTrapV1 {
+  Oid enterprise;
+  uint8_t agent_address[4] = {};
+  int32_t generic = 0;   // 0 coldStart ... 6 enterpriseSpecific
+  int32_t specific = 0;
+  uint32_t timestamp = 0;  // sysUpTime in hundredths of a second
+};
+
+// The version 3 parts of a message (RFC 3412 header and RFC 3414 user-based security parameters, plus the scoped PDU's context).
+struct SnmpV3 {
+  int32_t msg_id = 0;
+  int32_t max_size = 1400;
+  uint8_t flags = 0;  // bit 0 authenticated, bit 1 encrypted, bit 2 a report may be returned
+  uint8_t engine_id[32] = {};
+  uint8_t engine_id_length = 0;
+  uint32_t boots = 0, time = 0;
+  char user[32] = {};
+  uint8_t auth_parameters[24] = {};
+  uint8_t auth_length = 0;
+  uint8_t priv_parameters[8] = {};
+  uint8_t priv_length = 0;
+  uint8_t context_engine_id[32] = {};
+  uint8_t context_engine_id_length = 0;
+  char context_name[32] = {};
+};
+
+// An SNMP message (RFC 1157 / 3416 / 3412): version 1, 2c or 3; community (v1/v2c) or `v3`; one PDU with up to 12 variable bindings.
 struct SnmpMessage {
   static constexpr uint32_t kMaxBinds = 12;
-  uint8_t version = 1;  // 0 = v1, 1 = v2c
+  uint8_t version = 1;  // 0 = v1, 1 = v2c, 3 = v3
   char community[32] = "public";
   SnmpPdu pdu = SnmpPdu::Get;
   int32_t request_id = 0;
@@ -83,11 +110,17 @@ struct SnmpMessage {
   int32_t error_index = 0;   // (GetBulk: max-repetitions)
   SnmpVarBind binds[kMaxBinds];
   uint32_t count = 0;
+  SnmpTrapV1 trap1;  // TrapV1 PDUs
+  SnmpV3 v3;         // version 3
 };
 
-// Writes the message in BER into `out` (cleared first; `allocator` is for the scratch buffers). Values are written as given - a request's are Null.
+// Writes a version 1 or 2c message in BER into `out` (cleared first; `allocator` is for the scratch buffers). Values are written as given - a request's are Null.
 bool encode_snmp(const SnmpMessage& message, allocators::IAllocator& allocator, ByteBuffer* out);
-// Reads a message from untrusted bytes; false if anything is malformed, truncated or unsupported. Strings longer than
+// Just the PDU (what is inside a v1/v2c message after the community, or inside a v3 scoped PDU): its tag byte, length and body.
+bool encode_snmp_pdu(const SnmpMessage& message, allocators::IAllocator& allocator, ByteBuffer* out);
+// Fills pdu, request id, error fields, bindings (or the v1 trap fields) from a PDU whose tag byte is `tag` and body `body`.
+bool decode_snmp_pdu(uint8_t tag, ConstByteView body, SnmpMessage* out);
+// Reads a version 1 or 2c message from untrusted bytes; false if anything is malformed, truncated or unsupported. Strings longer than
 // SnmpValue::kMaxBytes are cut, bindings beyond kMaxBinds make the message invalid.
 bool decode_snmp(ConstByteView data, SnmpMessage* out);
 

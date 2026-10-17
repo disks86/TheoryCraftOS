@@ -19,6 +19,7 @@
 #pragma once
 #include "Network/INetworkStack.hpp"
 #include "Network/Snmp/SnmpMessage.hpp"
+#include "Network/Snmp/SnmpUsm.hpp"
 
 namespace network {
 
@@ -29,6 +30,7 @@ enum class SnmpError : uint8_t {
   Agent,     // the agent answered with an error status (error_status() says which)
   Send,      // the request could not be sent
   Invalid,   // the request was malformed (too many bindings...)
+  Security,  // version 3: unknown user, wrong password (authentication or decryption failed), or a security level the agent refuses
 };
 
 // An SNMP manager talking to one agent over UDP (port 161), one request at a time. Polled like the rest of the stack: start a
@@ -46,8 +48,17 @@ class SnmpClient {
     next_id_ = static_cast<int32_t>(stack.now_ms() & 0x3FFFFFFF) | 1;
   }
 
+  // Switches to SNMPv3 with a user (RFC 3414). Passwords need at least 8 characters; with `auth` None the messages go in the clear,
+  // with `priv` None they are only authenticated. The first request finds the agent's engine ID and clock itself.
+  bool set_v3_user(const char* user, UsmAuth auth, const char* auth_password, UsmPriv priv, const char* priv_password);
+  bool v3() const { return version_ == 3; }
+  bool engine_known() const { return engine_known_; }
+  uint32_t engine_boots() const { return boots_; }
+
   bool get(const Oid* oids, uint32_t count) { return start(SnmpPdu::Get, oids, count, 0, 0); }
   bool get_next(const Oid* oids, uint32_t count) { return start(SnmpPdu::GetNext, oids, count, 0, 0); }
+  // SET (needs a community or user with write access).
+  bool set(const Oid* oids, const SnmpValue* values, uint32_t count);
   // Version 2c only: the next `max_repetitions` entries after each of `oids`.
   bool get_bulk(const Oid* oids, uint32_t count, uint32_t max_repetitions) { return version_ == 1 && start(SnmpPdu::GetBulk, oids, count, 0, static_cast<int32_t>(max_repetitions)); }
 
@@ -65,6 +76,14 @@ class SnmpClient {
  private:
   bool start(SnmpPdu pdu, const Oid* oids, uint32_t count, int32_t a, int32_t b);
   bool transmit();
+  bool send_discovery();
+  bool send_v3_request();
+  void handle_v3(const SnmpMessage& m);
+  void handle_report(const SnmpMessage& m);
+  void fail(SnmpError error) {
+    state_ = SnmpState::Failed;
+    error_ = error;
+  }
 
   INetworkStack& stack_;
   allocators::IAllocator& allocator_;
@@ -80,6 +99,21 @@ class SnmpClient {
   uint64_t sent_at_ms_ = 0;
   SnmpState state_ = SnmpState::Idle;
   SnmpError error_ = SnmpError::None;
+  // version 3
+  char user_[32] = {};
+  UsmAuth auth_ = UsmAuth::None;
+  UsmPriv priv_ = UsmPriv::None;
+  char auth_password_[64] = {}, priv_password_[64] = {};
+  bool engine_known_ = false, resynced_ = false;
+  uint8_t engine_id_[32] = {};
+  uint32_t engine_id_length_ = 0;
+  uint32_t boots_ = 0, engine_time_ = 0;  // the agent's clock as last seen, at local time time_seen_ms_
+  uint64_t time_seen_ms_ = 0;
+  UsmKeys keys_;
+  uint64_t salt_ = 1;
+  bool discovering_ = false;
+  SnmpMessage pending_;  // the request to send once the engine is known
+  const SnmpValue* set_values_ = nullptr;
 };
 
 }  // namespace network

@@ -32,7 +32,7 @@ constexpr uint32_t kMulticastTable = 0x5200, kRal0 = 0x5400, kRah0 = 0x5404;
 
 constexpr uint32_t kCtrlReset = 1u << 26, kCtrlSetLinkUp = 1u << 6, kCtrlAutoSpeed = 1u << 5;
 constexpr uint32_t kStatusLinkUp = 1u << 1;
-constexpr uint32_t kRctlEnable = 1u << 1, kRctlBroadcast = 1u << 15, kRctlStripCrc = 1u << 26;  // 2 KiB buffers: BSIZE = 0
+constexpr uint32_t kRctlEnable = 1u << 1, kRctlMulticastPromiscuous = 1u << 4, kRctlBroadcast = 1u << 15, kRctlStripCrc = 1u << 26;  // 2 KiB buffers: BSIZE = 0
 constexpr uint32_t kTctlEnable = 1u << 1, kTctlPadShortPackets = 1u << 3;
 constexpr uint32_t kTctlCollisionThreshold = 0x0F << 4, kTctlCollisionDistance = 0x40 << 12;
 constexpr uint32_t kTipgDefault = 0x0060200A;  // IPGT 10, IPGR1 8, IPGR2 6 (IEEE 802.3)
@@ -104,7 +104,8 @@ bool E1000NetworkInterface::initialize() {
   tx_next_ = 0;
   write(kTipg, kTipgDefault);
 
-  write(kRctl, kRctlEnable | kRctlBroadcast | kRctlStripCrc);
+  receive_control_ = kRctlEnable | kRctlBroadcast | kRctlStripCrc;
+  write(kRctl, receive_control_);
   write(kTctl, kTctlEnable | kTctlPadShortPackets | kTctlCollisionThreshold | kTctlCollisionDistance);
   started_ = true;
   return true;
@@ -175,4 +176,13 @@ bool E1000NetworkInterface::receive(ByteView buffer, uint32_t* length) {
   return usable ? true : receive(buffer, length);  // skip a bad frame, look at the next
 }
 
+}  // namespace hardware
+
+namespace hardware {
+bool E1000NetworkInterface::accept_all_multicast(bool enable) {
+  if (!started_) return false;
+  receive_control_ = enable ? (receive_control_ | kRctlMulticastPromiscuous) : (receive_control_ & ~kRctlMulticastPromiscuous);
+  write(kRctl, receive_control_);
+  return enable;
+}
 }  // namespace hardware

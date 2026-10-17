@@ -176,6 +176,39 @@ int main() {
     lan.wire.tap = nullptr; server->close(); client->close(); lan.step(5);
     assert(lan.b.udp_open(7000));   // freed
   }
+  { // ---- multicast: only members receive; IGMP reports and query answers
+    Lan lan; lan.configure_static();
+    const Ipv4Address group = Ipv4Address::make(224, 0, 0, 251);
+    auto listener = lan.b.udp_open(5353); auto sender = lan.a.udp_open(0); assert(listener && sender);
+    const uint8_t msg[] = "mdns";
+    int igmp_reports = 0, wrong_ttl = 0; bool mac_ok = true;
+    lan.wire.tap = [&](const std::vector<uint8_t>& f, int from) {
+      if (f.size() < 34 || f[12] != 0x08 || f[13] != 0x00) return;
+      const bool to_group = f[30] == 224;
+      if (to_group && !(f[0] == 0x01 && f[1] == 0x00 && f[2] == 0x5E && f[3] == 0x00 && f[4] == 0x00 && f[5] == 0xFB)) mac_ok = false;
+      if (f[23] == 2 && f[34] == 0x16) { ++igmp_reports; if (f[22] != 1) ++wrong_ttl; uint32_t sum = 0; for (int i = 34; i < 42; i += 2) sum += (f[i] << 8) | f[i + 1]; while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16); if (sum != 0xFFFF) mac_ok = false; }
+      if (from == 0 && f[23] == 17 && to_group && f[22] != 255) ++wrong_ttl;
+    };
+    assert(sender->send_to(group, 5353, ConstByteView(msg, sizeof(msg))));
+    lan.step(20); assert(listener->pending() == 0);                 // not a member yet: dropped
+    assert(lan.b.join_multicast(group) && lan.b.join_multicast(group) && igmp_reports == 1);   // joining twice counts once
+    assert(!lan.b.join_multicast(Ipv4Address::make(10, 0, 0, 5)));    // not a multicast address
+    assert(sender->send_to(group, 5353, ConstByteView(msg, sizeof(msg))));
+    assert(lan.run_until([&] { return listener->pending() > 0; }, 3000));
+    uint8_t buf[16]; Ipv4Address from; uint16_t port; uint32_t len;
+    assert(listener->receive_from(ByteView(buf, sizeof(buf)), &from, &port, &len) && len == sizeof(msg) && from == Ipv4Address::make(10,0,0,1));
+    // a general query from the router makes the member report again
+    { std::vector<uint8_t> q(14 + 20 + 8, 0); q[0] = 0x01; q[1] = 0x00; q[2] = 0x5E; q[5] = 0x01; q[6] = 2; q[11] = 9; q[12] = 8; q[13] = 0; q[14] = 0x45; q[16] = 0; q[17] = 28; q[22] = 1; q[23] = 2;
+      q[26] = 10; q[29] = 254; q[30] = 224; q[33] = 1; uint32_t sum = 0; for (int i = 14; i < 34; i += 2) sum += (q[i] << 8) | q[i + 1]; while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16); sum = ~sum & 0xFFFF; q[24] = sum >> 8; q[25] = sum;
+      q[34] = 0x11; q[35] = 100; sum = 0; for (int i = 34; i < 42; i += 2) sum += (q[i] << 8) | q[i + 1]; while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16); sum = ~sum & 0xFFFF; q[36] = sum >> 8; q[37] = sum;
+      lan.nic_b.inbox.push_back(q); }
+    lan.step(20); assert(igmp_reports == 2);
+    lan.b.leave_multicast(group);
+    assert(sender->send_to(group, 5353, ConstByteView(msg, sizeof(msg))));
+    lan.step(20); assert(listener->pending() == 0);                 // left again
+    assert(mac_ok && wrong_ttl == 0);
+    lan.wire.tap = nullptr;
+  }
   { // ---- TCP: handshake, echo of 300 KB, orderly close, no leaks
     { Lan lan; lan.configure_static(); assert(echo_transfer(lan, 300000, 8080));
       lan.step(5000); }

@@ -54,6 +54,9 @@ class NetworkPrinter : public IPrinter {
   const PrinterReport* report() const override { return have_report_ ? &report_ : nullptr; }
   bool report_failed() const { return monitor_ && monitor_->failed(); }
   void set_snmp_community(const char* community) { community_ = community; }
+  // Asks with SNMPv3 (user-based security) instead of a community: the user, and the algorithms and passwords it was set up with on
+  // the printer (passwords of at least 8 characters). Takes effect for the next report. False if the arguments cannot be used.
+  bool set_snmp_v3_user(const char* user, network::UsmAuth auth, const char* auth_password, network::UsmPriv priv, const char* priv_password);
 
   network::Ipv4Address address() const { return address_; }
   PrintProtocol protocol() const { return protocol_; }
@@ -79,6 +82,10 @@ class NetworkPrinter : public IPrinter {
   bool last_failed_ = false;
   PrinterStatistics stats_;
   const char* community_ = "public";
+  bool v3_ = false;
+  char v3_user_[32] = {}, v3_auth_password_[64] = {}, v3_priv_password_[64] = {};
+  network::UsmAuth v3_auth_ = network::UsmAuth::None;
+  network::UsmPriv v3_priv_ = network::UsmPriv::None;
   UniquePointer<PrinterMonitor> monitor_;
   PrinterReport report_;
   bool have_report_ = false;

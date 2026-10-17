@@ -118,7 +118,8 @@ void NetworkStack::handle_frame(ConstByteView frame) {
   in.skip(6);  // the sender's address is not needed here
   const uint16_t type = in.be16();
   if (!in.ok()) return;  // shorter than an Ethernet header
-  if (!destination.is_broadcast() && !(destination == nic_.mac_address())) return;  // not for us
+  const bool multicast_mac = (destination.bytes[0] & 1) && !destination.is_broadcast();
+  if (!destination.is_broadcast() && !(destination == nic_.mac_address()) && !(multicast_mac && group_count_ > 0)) return;  // not for us
 
   if (type == kEtherTypeArp) handle_arp(in.rest());
   else if (type == kEtherTypeIpv4) handle_ipv4(in.rest());
@@ -151,7 +152,57 @@ void NetworkStack::handle_arp(ConstByteView arp) {
 bool NetworkStack::accepts_destination(Ipv4Address destination) const {
   if (!config_.configured()) return true;  // before DHCP finishes we take what the server sends us
   return destination == config_.address || destination.is_limited_broadcast() ||
-         destination == Ipv4Address::subnet_broadcast(config_.address, config_.netmask);
+         destination == Ipv4Address::subnet_broadcast(config_.address, config_.netmask) || is_member(destination);
+}
+
+bool NetworkStack::is_member(Ipv4Address group) const {
+  if (!group.is_multicast()) return false;
+  if (group_count_ > 0 && group == Ipv4Address::make(224, 0, 0, 1)) return true;  // every member listens to "all hosts" (IGMP queries)
+  for (uint32_t i = 0; i < group_count_; ++i)
+    if (groups_[i] == group) return true;
+  return false;
+}
+
+// ------------------------------------------------------------------ multicast
+
+bool NetworkStack::join_multicast(Ipv4Address group) {
+  kernel::ScopedRecursiveMutex guard(mutex_);
+  if (!group.is_multicast()) return false;
+  if (is_member(group)) return true;
+  if (group_count_ >= kMaxGroups) return false;
+  groups_[group_count_++] = group;
+  nic_.accept_all_multicast(true);
+  send_igmp_report(group);
+  return true;
+}
+
+void NetworkStack::leave_multicast(Ipv4Address group) {
+  kernel::ScopedRecursiveMutex guard(mutex_);
+  for (uint32_t i = 0; i < group_count_; ++i) {
+    if (!(groups_[i] == group)) continue;
+    groups_[i] = groups_[--group_count_];
+    if (group_count_ == 0) nic_.accept_all_multicast(false);
+    return;
+  }
+}
+
+// IGMPv2 (RFC 2236): a membership report is the 8 bytes {0x16, 0, checksum, group}, sent to the group itself.
+void NetworkStack::send_igmp_report(Ipv4Address group) {
+  if (!config_.configured()) return;
+  uint8_t msg[8] = {0x16, 0, 0, 0};
+  for (int i = 0; i < 4; ++i) msg[4 + i] = group.octets[i];
+  const uint16_t sum = checksum_finish(checksum_add(0, ConstByteView(msg, 8)));
+  msg[2] = static_cast<uint8_t>(sum >> 8);
+  msg[3] = static_cast<uint8_t>(sum);
+  send_ip(group, kProtocolIgmp, ConstByteView(msg, 8));
+}
+
+void NetworkStack::handle_igmp(ConstByteView igmp) {
+  if (igmp.size() < 8 || checksum_finish(checksum_add(0, igmp.first(8))) != 0) return;
+  if (igmp[0] != 0x11) return;  // only queries matter: a general query (group 0) or one for a group we are in
+  const Ipv4Address asked = Ipv4Address::make(igmp[4], igmp[5], igmp[6], igmp[7]);
+  for (uint32_t i = 0; i < group_count_; ++i)
+    if (asked.is_unspecified() || asked == groups_[i]) send_igmp_report(groups_[i]);
 }
 
 void NetworkStack::handle_ipv4(ConstByteView packet) {
@@ -181,6 +232,8 @@ void NetworkStack::handle_ipv4(ConstByteView packet) {
     if (config_.configured() && destination == config_.address) tcp_.handle(source, destination, payload);
   } else if (protocol == kProtocolIcmp) {
     if (config_.configured() && destination == config_.address) handle_icmp(source, payload);
+  } else if (protocol == kProtocolIgmp) {
+    handle_igmp(payload);
   }
 }
 
@@ -260,7 +313,7 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
   out.be16(static_cast<uint16_t>(kIpv4HeaderSize + payload.size()));
   out.be16(ip_id_++);
   out.be16(0x4000);  // don't fragment
-  out.u8(64);        // TTL
+  out.u8(destination.is_multicast() ? (protocol == kProtocolIgmp ? 1 : 255) : 64);  // TTL (mDNS wants 255 for multicast UDP)
   out.u8(protocol);
   out.be16(0);  // header checksum, filled in below
   source.write(out);
@@ -273,6 +326,9 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
   const bool broadcast = link_broadcast || destination.is_limited_broadcast() ||
                          (config_.configured() && destination == Ipv4Address::subnet_broadcast(config_.address, config_.netmask));
   if (broadcast) return send_frame(hardware::MacAddress{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}, kEtherTypeIpv4, packet);
+  if (destination.is_multicast()) {  // the group's Ethernet address: 01:00:5e and the low 23 bits of the group
+    return send_frame(hardware::MacAddress{{0x01, 0x00, 0x5E, static_cast<uint8_t>(destination.octets[1] & 0x7F), destination.octets[2], destination.octets[3]}}, kEtherTypeIpv4, packet);
+  }
 
   // On our subnet we talk to the destination directly, otherwise to the gateway.
   Ipv4Address next_hop = destination;

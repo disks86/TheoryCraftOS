@@ -55,6 +55,7 @@ class E1000NetworkInterface final : public INetworkInterface {
   bool link_up() const override;
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
+  bool accept_all_multicast(bool enable) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:
@@ -95,6 +96,7 @@ class E1000NetworkInterface final : public INetworkInterface {
   MacAddress mac_{};
   bool owns_device_ = false;
   bool started_ = false;
+  uint32_t receive_control_ = 0;
   kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;
 };

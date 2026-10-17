@@ -31,8 +31,28 @@ bool NetworkPrinter::submit(ConstByteView job, const char* job_name) {
   return true;
 }
 
+bool NetworkPrinter::set_snmp_v3_user(const char* user, network::UsmAuth auth, const char* auth_password, network::UsmPriv priv, const char* priv_password) {
+  auto copy = [](char* dst, uint32_t capacity, const char* src) {
+    uint32_t n = 0;
+    for (; src && src[n] && n + 1 < capacity; ++n) dst[n] = src[n];
+    dst[n] = 0;
+    return !src || !src[n];
+  };
+  if (!user || !copy(v3_user_, sizeof v3_user_, user) || !copy(v3_auth_password_, sizeof v3_auth_password_, auth_password) ||
+      !copy(v3_priv_password_, sizeof v3_priv_password_, priv_password))
+    return false;
+  v3_auth_ = auth;
+  v3_priv_ = priv;
+  v3_ = true;
+  monitor_.reset();  // the next report starts from a fresh session (and a fresh engine discovery)
+  return true;
+}
+
 bool NetworkPrinter::request_report() {
-  if (!monitor_) monitor_ = UniquePointer<PrinterMonitor>::make(allocator_, stack_, allocator_, address_, community_);
+  if (!monitor_) {
+    monitor_ = UniquePointer<PrinterMonitor>::make(allocator_, stack_, allocator_, address_, community_);
+    if (monitor_ && v3_ && !monitor_->client().set_v3_user(v3_user_, v3_auth_, v3_auth_password_, v3_priv_, v3_priv_password_)) monitor_.reset();
+  }
   return monitor_ && monitor_->start();
 }
 

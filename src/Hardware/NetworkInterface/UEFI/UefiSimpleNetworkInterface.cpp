@@ -97,4 +97,15 @@ bool UefiSimpleNetworkInterface::receive(ByteView buffer, uint32_t* length) {
   return true;
 }
 
+bool UefiSimpleNetworkInterface::accept_all_multicast(bool enable) {
+  if (!started_) return false;
+  efi::SimpleNetworkMode* mode = snp_->mode;
+  uint32_t wanted = efi::kReceiveFilterUnicast | efi::kReceiveFilterBroadcast;
+  if (enable) wanted |= efi::kReceiveFilterPromiscuousMulticast | efi::kReceiveFilterMulticast;
+  wanted &= mode->receive_filter_mask;
+  if (enable && !(wanted & (efi::kReceiveFilterPromiscuousMulticast | efi::kReceiveFilterMulticast))) return false;
+  snp_->receive_filters(snp_, wanted, mode->receive_filter_mask & ~wanted, 0, 0, nullptr);
+  return enable;
+}
+
 }  // namespace hardware

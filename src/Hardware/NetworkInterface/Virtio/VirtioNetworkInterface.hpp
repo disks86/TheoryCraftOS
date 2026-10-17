@@ -47,6 +47,7 @@ class VirtioNetworkInterface final : public INetworkInterface {
   bool link_up() const override;
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
+  bool accept_all_multicast(bool) override { return true; }  // (the device passes every frame unless told to filter)
   NetworkStatistics statistics() const override { return stats_; }
 
  private:
