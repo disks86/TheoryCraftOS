@@ -84,6 +84,8 @@ class Desktop {
   bool start();
   // Ends both threads (what was queued still runs).
   void stop();
+  // Where the desktop reports trouble it can see but not fix (no screen output: the screen may be what is stuck).
+  void set_diagnostic_output(void (*write)(StringView text)) { diagnostic_ = write; }
   // Frames the render thread has drawn.
   uint32_t frames_drawn() const { return render_loop_.frames(); }
   // Delivers pending input and refreshes the clock (reads the source at most once per second of
@@ -114,6 +116,10 @@ class Desktop {
   gui::Label about_lines_[3];
   ClockSource clock_source_ = nullptr;
   void* clock_context_ = nullptr;
+  void (*diagnostic_)(StringView) = nullptr;
+  bool watching_ = false;  // the watchdog has its first sample
+  uint32_t last_frames_ = 0;
+  uint64_t stall_since_us_ = 0, stall_reported_us_ = 0;
   uint64_t polled_second_ = ~0ull;  // the uptime second the source was last read in
   uint64_t shown_ = ~0ull;          // what the label shows, packed (see step())
   bool shutdown_requested_ = false;

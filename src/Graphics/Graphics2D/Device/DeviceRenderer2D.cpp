@@ -57,16 +57,22 @@ DeviceRenderer2D::~DeviceRenderer2D() {
   if (vs_) device_.destroy_shader_module(vs_);
 }
 
-bool DeviceRenderer2D::flush() {
-  if (!valid_ || count_ == 0) return true;
+void DeviceRenderer2D::close_range() {
+  if (count_ <= range_start_) return;
+  ranges_[range_count_++] = {range_start_, count_ - range_start_, clip_, blend_};
+  range_start_ = count_;
+  if (range_count_ == kMaxRanges) submit_pending();
+}
+
+bool DeviceRenderer2D::submit_pending() {
+  close_range();
+  if (!valid_ || range_count_ == 0) return true;
   vertices_->unmap();
   commands_->begin();
   RenderPassBegin pass;
   pass.color = image_;
-  pass.clear_color = false;  // keep what earlier frames and flushes drew
+  pass.clear_color = false;  // keep what earlier frames and submissions drew
   commands_->begin_render_pass(pass);
-  commands_->set_scissor(clip_);
-  commands_->bind_pipeline(blend_ == BlendMode::Alpha ? blended_ : opaque_);
   commands_->bind_vertex_buffer(vertices_);
   // Pixel coordinates (0,0 top left) to clip space; depth is constant.
   ColoredConstants constants;
@@ -76,17 +82,26 @@ bool DeviceRenderer2D::flush() {
   constants.mvp.m[12] = -1;
   constants.mvp.m[13] = -1;
   constants.mvp.m[14] = 0.5f;
-  commands_->push_constants(&constants, sizeof(constants));
-  commands_->draw(count_);
+  bool pushed = false;
+  for (uint32_t i = 0; i < range_count_; ++i) {
+    const Range& r = ranges_[i];
+    commands_->set_scissor(r.clip);
+    commands_->bind_pipeline(r.blend == BlendMode::Alpha ? blended_ : opaque_);
+    if (!pushed) {  // (constants stay with the commands; binding another pipeline does not lose them)
+      commands_->push_constants(&constants, sizeof(constants));
+      pushed = true;
+    }
+    commands_->draw(r.count, r.first);
+  }
   commands_->end_render_pass();
   const bool ok = commands_->end() && device_.submit(commands_);
-  count_ = 0;
+  count_ = range_start_ = range_count_ = 0;
   return ok;
 }
 
 void DeviceRenderer2D::triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color) {
   if (!valid_) return;
-  if (count_ + 3 > kMaxVertices) flush();
+  if (count_ + 3 > kMaxVertices) submit_pending();
   const Vec4 c = unpack_color(color);
   const float xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
   for (int i = 0; i < 3; ++i) batch_[count_++] = {{xs[i], ys[i], 0}, {c.x, c.y, c.z, c.w}};
@@ -98,23 +113,23 @@ void DeviceRenderer2D::quad(float x0, float y0, float x1, float y1, uint32_t col
 }
 
 void DeviceRenderer2D::set_clip(const Rect2D& clip) {
-  flush();  // what is batched belongs to the old clip
+  close_range();  // what is recorded belongs to the old clip
   clip_ = clip;
 }
 
 void DeviceRenderer2D::reset_clip() {
-  flush();
+  close_range();
   clip_ = {0, 0, extent_.width, extent_.height};
 }
 
 void DeviceRenderer2D::set_blend(BlendMode mode) {
-  if (mode != blend_) flush();
+  if (mode != blend_) close_range();
   blend_ = mode;
 }
 
 void DeviceRenderer2D::clear(uint32_t color) {
   if (!valid_) return;
-  count_ = 0;  // the clear wipes whatever was batched
+  count_ = range_start_ = range_count_ = 0;  // the clear wipes whatever was recorded
   commands_->begin();
   RenderPassBegin pass;
   pass.color = image_;
@@ -221,9 +236,9 @@ void DeviceRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_
 }
 
 void DeviceRenderer2D::present() {
-  if (flush()) device_.present(image_);
+  if (submit_pending()) device_.present(image_);
 }
 
-bool DeviceRenderer2D::read_pixels(ArrayView<uint32_t> out) { return flush() && image_ && image_->read_pixels(out); }
+bool DeviceRenderer2D::read_pixels(ArrayView<uint32_t> out) { return submit_pending() && image_ && image_->read_pixels(out); }
 
 }  // namespace graphics

@@ -31,6 +31,11 @@ namespace graphics {
 // software device it works too, but SoftwareRenderer2D is the exact and faster
 // choice there (SystemGraphics picks).
 //
+// Drawing only records: shapes are appended to the vertex buffer in runs that share a clip and a blend
+// mode, and nothing reaches the device until present() (or read_pixels(), or when the buffer fills). That
+// keeps the slow part - talking to a GPU that may take its time - out of the window's UI lock, which is held
+// while the controls paint.
+//
 // Differences from the CPU renderer: lines are one-pixel-wide quads and circles
 // are polygons, so their pixels are not identical; draw_image costs one rectangle
 // per run of equal pixels (there are no textures yet), so keep images small.
@@ -68,10 +73,19 @@ class DeviceRenderer2D final : public IRenderer2D {
 
  private:
   static constexpr uint32_t kMaxVertices = 6 * 4096;
+  static constexpr uint32_t kMaxRanges = 128;
+
+  // A run of recorded vertices drawn with one clip and blend mode.
+  struct Range {
+    uint32_t first, count;
+    Rect2D clip;
+    BlendMode blend;
+  };
 
   void triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color);
   void quad(float x0, float y0, float x1, float y1, uint32_t color);  // axis-aligned, corners
-  bool flush();
+  void close_range();   // ends the run in progress (when the clip or blend mode changes)
+  bool submit_pending();  // sends everything recorded to the device
 
   IGraphicsDevice& device_;
   allocators::IAllocator& allocator_;
@@ -84,7 +98,10 @@ class DeviceRenderer2D final : public IRenderer2D {
   IImage* image_ = nullptr;
   ICommandBuffer* commands_ = nullptr;
   ArrayView<ColoredVertex> batch_;  // the mapped vertex buffer
-  uint32_t count_ = 0;
+  uint32_t count_ = 0;         // vertices recorded
+  uint32_t range_start_ = 0;   // where the run in progress began
+  Range ranges_[kMaxRanges];
+  uint32_t range_count_ = 0;
   Rect2D clip_;
   BlendMode blend_ = BlendMode::Alpha;
   bool valid_ = false;

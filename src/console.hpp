@@ -36,6 +36,8 @@ void set_color(uint32_t rgb);
 // redrawing text the debug console has already seen.
 void set_debug_output(bool enabled);
 void puts(StringView text);  // a literal or any C string converts implicitly
+// Text for the debug console only (port 0x402), never the screen: safe to use while something else is drawing.
+void debug_puts(StringView text);
 // Holds the console for several calls, so a line from one thread is not torn by
 // output from another. Nests; always release in reverse order (use Guard).
 void lock();

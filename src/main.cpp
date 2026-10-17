@@ -377,6 +377,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop::Desktop desktop(shared_allocator, *renderer, input.keyboards().count() ? &input.keyboard() : nullptr,
                              input.mice().count() ? &input.mouse() : nullptr);
     desktop.set_clock_source(read_local_time, st);
+    desktop.set_diagnostic_output(console::debug_puts);
     // Three threads: this one reads input and the clock (firmware calls must stay on the boot core), a render
     // thread redraws whenever something changed, and a handler thread runs what buttons and menus fire - so a
     // slow click handler can freeze neither the screen nor the pointer.
@@ -424,6 +425,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   allocator.deallocate(allocator.allocate(1));  // exercise the pool once
   ram.shutdown();
   cpu.shutdown();
+  if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu(); virtio && virtio->timeouts())
+    Entry(Level::Warning, "Shutdown").text("virtio-gpu: ").dec(virtio->timeouts()).text(" commands timed out (the host display was not answering)");
   Entry(Level::Ok, "Shutdown").text("powering off");
 
   st->runtime_services->reset_system(efi::ResetType::Shutdown, efi::kSuccess, 0, nullptr);

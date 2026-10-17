@@ -22,7 +22,7 @@
 #include "Hardware/GraphicsProcessingUnit/FramebufferGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpuProtocol.hpp"
-#include "Kernel/RawSpinLock.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace hardware {
 
@@ -56,7 +56,11 @@ class VirtioGpu : public FramebufferGpu {
   uint32_t context_id() const { return kContextId; }
   uint32_t allocate_resource_id() { return next_resource_++; }
   // Sends one request and waits for the response. `response` (optional) receives the reply
-  // (as much as fits). Returns the response type (virtio_gpu::kRespOk... or an error), 0 on timeout.
+  // (as much as fits). Returns the response type (virtio_gpu::kRespOk... or an error), 0 on failure.
+  // The host may stop answering (QEMU's GTK/GL display holds the queue while its window is hidden or
+  // busy): a command waits at most kCommandTimeoutUs, and while one is still outstanding the buffers
+  // are not reused and further calls fail at once instead of piling up. The wait never masks interrupts,
+  // so the rest of the system keeps running.
   uint32_t execute(ConstByteView request, ByteView response = ByteView());
   // execute() for commands that answer with "OK, no data".
   bool command(ConstByteView request) { return execute(request) == virtio_gpu::kRespOkNoData; }
@@ -64,6 +68,9 @@ class VirtioGpu : public FramebufferGpu {
   // on the next present() of this class.
   bool show_resource(uint32_t id, uint32_t width, uint32_t height);
   allocators::IAllocator& allocator() { return *allocator_; }
+  // How many commands timed out so far (the host was not answering).
+  uint32_t timeouts() const { return __atomic_load_n(&timeouts_, __ATOMIC_ACQUIRE); }
+  static constexpr uint64_t kCommandTimeoutUs = 250000;
 
  private:
   static constexpr uint32_t kContextId = 1;
@@ -83,8 +90,10 @@ class VirtioGpu : public FramebufferGpu {
   alignas(8) unsigned char transport_storage_[sizeof(VirtioPciDevice)];
   Virtqueue control_;
   ByteView request_, response_;
-  kernel::RawSpinLock lock_;
+  kernel::Mutex lock_;
   uint64_t fence_ = 0;
+  bool in_flight_ = false;  // a command timed out and the device still holds its buffers
+  uint32_t timeouts_ = 0;
 
   bool has_3d_ = false;
   uint32_t next_resource_ = 1;

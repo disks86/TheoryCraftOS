@@ -19,6 +19,7 @@
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
 #include <new>
 #include "Kernel/Delay.hpp"
+#include "console.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace hardware {
@@ -32,7 +33,6 @@ constexpr DisplayMode kModes[] = {
 };
 constexpr uint32_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
 constexpr uint32_t kDefaultMode = 2;
-constexpr uint64_t kTimeoutUs = 2000000;
 
 template <class T>
 ConstByteView as_bytes(const T& object) {
@@ -48,7 +48,13 @@ ControlHeader header(uint32_t type) {
 
 uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
   if (!ready_ || request.size() < sizeof(ControlHeader) || request.size() > request_.size()) return 0;
-  kernel::RawSpinGuard guard(lock_);
+  kernel::ScopedMutex guard(lock_);
+  uint16_t index;
+  uint32_t length;
+  if (in_flight_) {  // an earlier command never got its answer: the buffers still belong to the device
+    if (!control_.take_used(&index, &length)) return 0;
+    in_flight_ = false;
+  }
   request_.copy_from(request);
   auto* head = reinterpret_cast<ControlHeader*>(request_.data());
   if (head->type >= kCmdCtxCreate) {
@@ -66,11 +72,14 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
   control_.post_chain(0, segments, 2);
   transport_->notify(0);
 
-  uint16_t index;
-  uint32_t length;
-  for (uint64_t waited = 0; !control_.take_used(&index, &length); waited += 20) {
-    if (waited > kTimeoutUs) return 0;
-    delay_spin_us(20);
+  for (uint64_t waited = 0; !control_.take_used(&index, &length); waited += 100) {
+    if (waited >= kCommandTimeoutUs) {
+      in_flight_ = true;
+      if (__atomic_fetch_add(&timeouts_, 1, __ATOMIC_ACQ_REL) % 16 == 0)
+        console::debug_puts("virtio-gpu: the host is not answering (display hidden or busy?); skipping frames\n");
+      return 0;
+    }
+    delay_us(100);  // sleeps the thread where that is allowed instead of spinning with the core
   }
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
   const uint32_t type = reply->type;

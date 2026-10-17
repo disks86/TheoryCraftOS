@@ -166,6 +166,24 @@ bool Desktop::step(uint64_t uptime_us) {
 
 void Desktop::pump(uint64_t uptime_us) {
   input_.pump();
+  // Watchdog: a changed window that the render thread has not redrawn for seconds means that thread (or
+  // whatever it is waiting for - the GPU, the UI lock) is stuck. Say so where it can be read afterwards.
+  if (render_loop_.running() && diagnostic_) {
+    const uint32_t frames = render_loop_.frames();
+    if (!watching_ || frames != last_frames_ || !window_.dirty()) {
+      watching_ = true;
+      last_frames_ = frames;
+      stall_since_us_ = uptime_us;
+    } else if (uptime_us - stall_since_us_ > 3000000 && uptime_us - stall_reported_us_ > 5000000) {
+      stall_reported_us_ = uptime_us;
+      char text[64] = "desktop: no frame drawn for    s although the window changed\n";
+      const uint64_t seconds = (uptime_us - stall_since_us_) / 1000000;
+      text[26] = seconds >= 100 ? static_cast<char>('0' + (seconds / 100) % 10) : ' ';
+      text[27] = seconds >= 10 ? static_cast<char>('0' + (seconds / 10) % 10) : ' ';
+      text[28] = static_cast<char>('0' + seconds % 10);
+      diagnostic_(text);
+    }
+  }
   const uint64_t second = uptime_us / 1000000;
   if (second != polled_second_) {
     polled_second_ = second;

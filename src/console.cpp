@@ -92,6 +92,12 @@ void set_color(uint32_t rgb) {
   g_graphics.set_foreground(rgb);
 }
 
+void debug_puts(StringView text) {
+  Guard guard;
+  if (!g_debug_enabled) return;
+  for (char c : text) g_debug.put(c);
+}
+
 void puts(StringView text) {
   Guard guard;
   for (char c : text) putc(c);
