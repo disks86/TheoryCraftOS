@@ -1029,6 +1029,18 @@ static void test_file_explorer() {
     CHECK(ex.path().equals("/docs"));
     CHECK(ex.go_up() && ex.path().equals("/") && !ex.go_up());
     CHECK(!ex.open_folder("/missing") && ex.path().equals("/"));
+
+    // refresh() reads the folder again: a new file shows up, and a folder that has vanished is replaced by the nearest one above it that is there
+    CHECK(ex.refresh() && ex.view().item_count() == 5);
+    make_file(fs, "/c.txt", "new");
+    CHECK(ex.refresh() && ex.view().item_count() == 6 && ex.path().equals("/"));
+    CHECK(ex.open_folder("/docs/old") && ex.path().equals("/docs/old"));
+    CHECK(fs.remove("/docs/old") == filesystem::Status::Ok);
+    CHECK(ex.refresh() && ex.path().equals("/docs") && ex.view().item_count() == 1);
+    CHECK(fs.remove("/docs/note.md") == filesystem::Status::Ok && fs.remove("/docs") == filesystem::Status::Ok);
+    CHECK(ex.refresh() && ex.path().equals("/") && ex.view().item_count() == 5);
+    desktop::FileExplorer detached(a);
+    CHECK(!detached.refresh());
     w.render();
     mgr.remove_window(&ex);
   }

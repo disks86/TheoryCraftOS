@@ -67,6 +67,21 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   listed); `src/StorageDemo` reports each device, cross-checks reads and, only on a device whose first block begins
   with `TCOS-SCRATCH`, tests write/flush/read-back. Not covered: floppy and SD/MMC (only through the firmware),
   and the LSI/MegaRAID/MPT/PVSCSI SCSI adapters (only if the firmware has a driver for them - the stock OVMF does not).
+  USB hot-plug: `IUsbHostController::poll_hotplug()` / `port_generation()` (xHCI implements them: it reads the root ports' connect-change
+  bits, releases a removed device's slot and endpoints and enumerates a new one; `UsbBus::poll_hotplug()` merges the controllers).
+  `SystemStorageDevices::poll()` turns that into `StorageEvent`s: a stick that was plugged in is brought up and listed, one that was pulled
+  out is shut down and unlisted (devices are shared pointers, `present()` says whether one is still there, and a request to a device
+  whose port moved on to another device fails at once instead of reaching the new one). `SystemFileSystem` mounts every FAT volume of
+  every device into a `MountTable` (the root is a folder per volume, named by its label, "Memory" when there is none) and its
+  service thread ("hotplug", 250 ms) mounts and unmounts as sticks come and go; handles open on a removed volume answer
+  `Status::NoMedia` and the volume is freed when they are closed; the desktop's file explorer refreshes itself. Limits: only xHCI
+  reports hot-plug (EHCI/OHCI/UHCI controllers keep the devices present at start-up), no hubs, only LUN 0 of a stick, no media-change
+  detection for card readers, no safe-eject command (FAT is read-only here, so nothing is lost by pulling a stick out), other device
+  classes (audio, cameras, printers, keyboards) are still only taken up at start-up, and a machine without a screen does not poll.
+  `tests/StorageHotplugTest.cpp` runs the whole chain against a fake controller with fake Bulk-Only sticks (a stick pulled out
+  mid-command, a port that gets another stick before the removal was seen, partitioned and blank sticks, handles outliving volumes);
+  `tests/StorageHotplugThreadTest.cpp` does it with real threads under ThreadSanitizer. The xHCI port-change handling itself has no
+  test (it needs a simulated controller) and has not been run on hardware or QEMU.
 - `src/Hardware/AudioDevice/`: audio output. `IAudioDevice` plays one fixed format (48 kHz, 16-bit signed, stereo)
   and is polled: `write()` copies whole frames into the device's ring and returns how many it took, `queued_bytes()` /
   `free_bytes()` say how much is waiting, plus volume, mute and statistics (frames played, underruns). A cyclic-DMA

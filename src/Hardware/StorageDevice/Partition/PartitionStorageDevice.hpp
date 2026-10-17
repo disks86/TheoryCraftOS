@@ -40,6 +40,8 @@ class PartitionStorageDevice final : public IStorageDevice {
   bool initialize() override { return true; }
   void shutdown() override {}
 
+  bool present() const override { return parent_.present(); }
+
   StorageInfo info() const override {
     StorageInfo result = parent_.info();
     result.block_count = count_;

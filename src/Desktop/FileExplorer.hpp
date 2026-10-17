@@ -27,6 +27,7 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/RadioButton.hpp"
 #include "Gui/Windows/Frame.hpp"
+#include "Kernel/Sync.hpp"
 
 namespace desktop {
 
@@ -38,6 +39,9 @@ class FileExplorer : public gui::Frame {
   void set_file_system(filesystem::IFileSystem* fs);
   // Shows the folder at `path` ("/" or "/a/b"). False (and the view stays where it was) if it cannot be read.
   bool open_folder(StringView path);
+  // Reads the current folder again (volumes come and go, files change). A folder that is gone is replaced by the nearest one above it
+  // that can still be read. Safe to call from any thread.
+  bool refresh();
   // Opens the parent folder; false at the root.
   bool go_up();
   void set_view_mode(gui::ViewMode mode);
@@ -60,6 +64,7 @@ class FileExplorer : public gui::Frame {
   static void on_mode(void* self, gui::Control& sender);
   static void on_activated(void* self, gui::Control&);
   static void on_selection(void* self, gui::Control&);
+  bool load(StringView path);   // (with navigation_ held)
   void activate_selected();
   void update_status();
 
@@ -69,6 +74,7 @@ class FileExplorer : public gui::Frame {
   gui::Label path_label_, status_;
   gui::RadioButton list_button_, icons_button_, details_button_;
   gui::ListView view_;
+  kernel::Mutex navigation_;    // one folder is loaded at a time (a refresh from another thread must not interleave with a click)
   filesystem::IFileSystem* fs_ = nullptr;
   String path_;
   String scratch_;

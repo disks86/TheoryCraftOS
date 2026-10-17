@@ -115,6 +115,14 @@ static void wait_for_key(efi::SystemTable* st, hardware::SystemInput& input, uin
 }
 
 // The taskbar clock: the firmware's real-time clock, whose fields are local time (QEMU: -rtc base=localtime).
+// A USB mass-storage device was plugged in or pulled out: say so on the debug console and bring the file explorer up to date.
+static void on_storage_change(void* context, StringView text) {
+  console::debug_puts("Storage: ");
+  console::debug_puts(text);
+  console::debug_puts("\n");
+  static_cast<desktop::Desktop*>(context)->explorer().refresh();
+}
+
 static bool read_local_time(void* context, desktop::DateTime* out) {
   auto* st = static_cast<efi::SystemTable*>(context);
   efi::Time t{};
@@ -503,6 +511,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
                              input.mice().count() ? &input.mouse() : nullptr);
     SystemFileSystem explorer_files(shared_allocator, storage);
     desktop.set_file_system(&explorer_files.file_system());
+    explorer_files.set_notifier(on_storage_change, &desktop);
+    if (!explorer_files.start_service()) Entry(Level::Warning, "Storage").text("could not start hot-plug polling; USB sticks plugged in later are not seen");
     SystemMonitor monitor(allocator, shared_allocator);
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);

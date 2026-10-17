@@ -1,0 +1,308 @@
+// Shared by the storage hot-plug tests: a thread-safe counting allocator, FAT12 volume images, and a fake xHCI-like host controller with
+// USB sticks (Bulk-Only mass-storage targets) that can be plugged in and pulled out.
+#pragma once
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <mutex>
+#include <string>
+#include <vector>
+#include "Allocators/IAllocator.hpp"
+#include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Bus/Usb/IUsbBus.hpp"
+
+using namespace hardware;
+
+struct TestAllocator final : allocators::IAllocator {
+  long live = 0;   // (atomic: threads share the allocator in the thread test)
+  void* allocate(uint64_t size) override { if (!size) return nullptr; __atomic_add_fetch(&live, 1, __ATOMIC_RELAXED); return aligned_alloc(64, (size + 63) / 64 * 64); }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override {
+    if (!size) return nullptr;
+    __atomic_add_fetch(&live, 1, __ATOMIC_RELAXED);
+    if (alignment < 64) alignment = 64;
+    return aligned_alloc(alignment, (size + alignment - 1) / alignment * alignment);
+  }
+  void deallocate(void* p) override { if (p) { __atomic_sub_fetch(&live, 1, __ATOMIC_RELAXED); free(p); } }
+};
+
+typedef std::vector<uint8_t> Bytes;
+
+// ------------------------------------------------------------------------------------------------ disk images
+
+static void put16(uint8_t* p, uint32_t v) { p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8); }
+static void put32(uint8_t* p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
+
+// A FAT12 floppy-sized volume with a few files in the root directory.
+struct Fat12 {
+  Bytes img = Bytes(2880 * 512);
+  uint32_t next = 2, entries = 0;
+
+  explicit Fat12(const char* label11 = "SMALLVOL   ") {
+    uint8_t* b = img.data();
+    b[0] = 0xEB; b[1] = 0x3C; b[2] = 0x90;
+    memcpy(b + 3, "TESTFMT ", 8);
+    put16(b + 11, 512); b[13] = 1; put16(b + 14, 1); b[16] = 2; put16(b + 17, 224);
+    put16(b + 19, 2880); b[21] = 0xF8; put16(b + 22, 9);
+    memcpy(b + 43, label11, 11);
+    b[510] = 0x55; b[511] = 0xAA;
+    set_fat(0, 0xFF8);
+    set_fat(1, 0xFFF);
+  }
+  void set_fat(uint32_t c, uint32_t v) {
+    for (int copy = 0; copy < 2; ++copy) {
+      uint8_t* f = img.data() + 512 + copy * 9 * 512;
+      const uint32_t o = c + c / 2;
+      if (c & 1) { f[o] = (f[o] & 0x0F) | ((v & 0xF) << 4); f[o + 1] = static_cast<uint8_t>(v >> 4); }
+      else { f[o] = static_cast<uint8_t>(v); f[o + 1] = (f[o + 1] & 0xF0) | ((v >> 8) & 0xF); }
+    }
+  }
+  void file(const char* name83, const Bytes& data) {
+    uint32_t first = 0, prev = 0;
+    for (size_t off = 0; off < data.size(); off += 512) {
+      const uint32_t c = next++;
+      if (prev) set_fat(prev, c); else first = c;
+      set_fat(c, 0xFFF);
+      const size_t n = data.size() - off < 512 ? data.size() - off : 512;
+      memcpy(img.data() + (33 + c - 2) * 512, data.data() + off, n);
+      prev = c;
+    }
+    uint8_t* e = img.data() + (1 + 18) * 512 + (entries++) * 32;
+    memcpy(e, name83, 11);
+    e[11] = 0x20;
+    put16(e + 26, first);
+    put32(e + 28, static_cast<uint32_t>(data.size()));
+  }
+};
+
+static Bytes pattern(size_t n, uint8_t seed) {
+  Bytes b(n);
+  for (size_t i = 0; i < n; ++i) b[i] = static_cast<uint8_t>(seed + i * 7 + (i >> 8));
+  return b;
+}
+
+static Bytes stick_with_files(const char* label = "SMALLVOL   ") {
+  Fat12 fat(label);
+  fat.file("HELLO   TXT", Bytes{'h', 'e', 'l', 'l', 'o', ' ', 'f', 'a', 't'});
+  fat.file("BIG     BIN", pattern(3000, 5));
+  return fat.img;
+}
+
+// The same volume behind an MBR partition table, starting at block 8.
+static Bytes partitioned_stick() {
+  Fat12 fat;
+  fat.file("HELLO   TXT", Bytes{'p', 'a', 'r', 't'});
+  Bytes disk(8 * 512 + fat.img.size());
+  memcpy(disk.data() + 8 * 512, fat.img.data(), fat.img.size());
+  uint8_t* e = disk.data() + 446;
+  e[0] = 0x80; e[4] = 0x01;
+  put32(e + 8, 8);
+  put32(e + 12, 2880);
+  disk[510] = 0x55; disk[511] = 0xAA;
+  return disk;
+}
+
+// ------------------------------------------------------------------------------------------------ the fake host with sticks
+
+// A Bulk-Only mass-storage target behind a root port.
+struct FakeStickHost final : IUsbHostController {
+  struct Stick {
+    Bytes image;
+    uint32_t pending_data = 0;       // bytes of data the host still reads (IN) after the last command
+    Bytes response;
+    uint32_t write_lba = 0, write_blocks = 0;
+    bool expect_write = false;
+    uint8_t csw_status = 0;
+    uint32_t tag = 0;
+    int commands = 0;
+    int unplug_after = -1;           // yank the stick after this many commands
+    bool broken_inquiry = false;     // answers nothing sensible
+    bool no_storage = false;         // not a mass-storage device at all
+  };
+  static constexpr uint32_t kPorts = 4;
+  Stick* sticks[kPorts] = {};
+  uint32_t generation[kPorts] = {};
+  std::vector<UsbHotplugEvent> events;
+  bool hotplug = true;
+  uint32_t set_configurations = 0;
+  mutable std::recursive_mutex m;   // the host is shared between threads in the thread test
+
+  const char* name() const override { return "fake host"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  UsbControllerKind kind() const override { return UsbControllerKind::Xhci; }
+  uint32_t port_count() const override { return kPorts; }
+  bool port_info(uint32_t port, UsbPortInfo* out) const override { std::lock_guard<std::recursive_mutex> g(m); out->connected = port < kPorts && sticks[port]; out->speed = UsbSpeed::High; return true; }
+  bool device_descriptor(uint32_t port, UsbDeviceDescriptor* out) const override { std::lock_guard<std::recursive_mutex> g(m);
+    if (port >= kPorts || !sticks[port]) return false;
+    memset(out, 0, sizeof *out);
+    out->length = 18; out->descriptor_type = 1; out->vendor_id = 0x0781; out->product_id = 0x5567;
+    return true;
+  }
+  bool configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const override { std::lock_guard<std::recursive_mutex> g(m);
+    if (port >= kPorts || !sticks[port]) return false;
+    Bytes c;
+    auto put = [&](std::initializer_list<uint8_t> b) { c.insert(c.end(), b.begin(), b.end()); };
+    put({9, 2, 0, 0, 1, 1, 0, 0x80, 50});
+    if (sticks[port]->no_storage) {
+      put({9, 4, 0, 0, 1, 3, 1, 1, 0});   // a keyboard
+      put({7, 5, 0x81, 3, 8, 0, 10});
+    } else {
+      put({9, 4, 0, 0, 2, 8, 6, 0x50, 0});
+      put({7, 5, 0x81, 2, 0x00, 0x02, 0});
+      put({7, 5, 0x02, 2, 0x00, 0x02, 0});
+    }
+    c[2] = static_cast<uint8_t>(c.size());
+    const size_t n = c.size() < buffer.size() ? c.size() : buffer.size();
+    memcpy(buffer.data(), c.data(), n);
+    *length = static_cast<uint16_t>(c.size());
+    return true;
+  }
+  bool set_configuration(uint32_t port, uint8_t) override { std::lock_guard<std::recursive_mutex> g(m); ++set_configurations; return port < kPorts && sticks[port]; }
+  bool control_out(uint32_t port, uint8_t, uint8_t, uint16_t, uint16_t) override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts && sticks[port]; }
+  bool control_in(uint32_t, uint8_t, uint8_t, uint16_t, uint16_t, ByteView) override { return false; }   // (no GET_MAX_LUN: a stall)
+  bool start_interrupt_in(uint32_t, uint8_t, uint16_t, uint8_t) override { return false; }
+  bool poll_interrupt_in(uint32_t, uint8_t, ByteView, uint16_t*) override { return false; }
+  bool start_bulk_endpoint(uint32_t port, uint8_t, uint16_t) override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts && sticks[port]; }
+  bool reset_bulk_endpoint(uint32_t port, uint8_t) override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts && sticks[port]; }
+
+  bool supports_hotplug() const override { return hotplug; }
+  bool poll_hotplug(UsbHotplugEvent* event) override { std::lock_guard<std::recursive_mutex> g(m);
+    if (events.empty()) return false;
+    *event = events.front();
+    events.erase(events.begin());
+    return true;
+  }
+  uint32_t port_generation(uint32_t port) const override { std::lock_guard<std::recursive_mutex> g(m); return port < kPorts ? generation[port] : 0; }
+
+  void plug(uint32_t port, Stick* stick) { std::lock_guard<std::recursive_mutex> g(m);
+    sticks[port] = stick;
+    ++generation[port];
+    events.push_back({0, port, true});
+  }
+  void unplug(uint32_t port) { std::lock_guard<std::recursive_mutex> g(m);
+    sticks[port] = nullptr;
+    ++generation[port];
+    events.push_back({0, port, false});
+  }
+
+  static uint32_t be32(const uint8_t* p) { return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3]; }
+
+  void command(Stick& s, const uint8_t* cbw) {
+    s.tag = cbw[4] | (cbw[5] << 8) | (cbw[6] << 16) | (uint32_t{cbw[7]} << 24);
+    const uint8_t* cdb = cbw + 15;
+    s.response.clear();
+    s.csw_status = 0;
+    s.expect_write = false;
+    switch (cdb[0]) {
+      case 0x12:   // INQUIRY
+        if (s.broken_inquiry) { s.csw_status = 1; break; }
+        s.response.assign(36, 0);
+        s.response[1] = 0x80;   // removable
+        s.response[4] = 31;
+        memcpy(&s.response[8], "TESTSTK Hot-plug stick  ", 24);
+        break;
+      case 0x00: break;   // TEST UNIT READY
+      case 0x25: {        // READ CAPACITY(10)
+        s.response.assign(8, 0);
+        const uint32_t last = static_cast<uint32_t>(s.image.size() / 512 - 1);
+        for (int i = 0; i < 4; ++i) s.response[i] = static_cast<uint8_t>(last >> (24 - 8 * i));
+        s.response[6] = 2;   // 512
+        break;
+      }
+      case 0x28: {        // READ(10)
+        const uint32_t lba = be32(cdb + 2), count = (cdb[7] << 8) | cdb[8];
+        if (static_cast<uint64_t>(lba + count) * 512 > s.image.size()) { s.csw_status = 1; break; }
+        s.response.assign(s.image.begin() + lba * 512, s.image.begin() + (lba + count) * 512);
+        break;
+      }
+      case 0x2A:          // WRITE(10)
+        s.write_lba = be32(cdb + 2);
+        s.write_blocks = (cdb[7] << 8) | cdb[8];
+        s.expect_write = true;
+        break;
+      case 0x35: break;   // SYNCHRONIZE CACHE
+      case 0x03:          // REQUEST SENSE
+        s.response.assign(18, 0);
+        s.response[0] = 0x70;
+        break;
+      default: s.csw_status = 1; break;
+    }
+    s.pending_data = static_cast<uint32_t>(s.response.size());
+  }
+
+  bool bulk_transfer(uint32_t port, uint8_t endpoint, ByteView data, uint32_t* transferred) override { std::lock_guard<std::recursive_mutex> g(m);
+    if (transferred) *transferred = 0;
+    if (port >= kPorts || !sticks[port]) return false;
+    Stick& s = *sticks[port];
+    if (s.unplug_after >= 0 && s.commands >= s.unplug_after) {   // pulled out in the middle of the command
+      unplug(port);
+      return false;
+    }
+    if (!(endpoint & 0x80)) {
+      if (s.expect_write) {   // the data stage of a write
+        const size_t n = data.size() < s.write_blocks * 512u ? data.size() : s.write_blocks * 512u;
+        if ((s.write_lba * 512u) + n <= s.image.size()) memcpy(s.image.data() + s.write_lba * 512u, data.data(), n);
+        s.expect_write = false;
+        if (transferred) *transferred = static_cast<uint32_t>(data.size());
+        return true;
+      }
+      if (data.size() != 31 || memcmp(data.data(), "USBC", 4) != 0) return false;   // a command block wrapper
+      ++s.commands;
+      command(s, data.data());
+      if (transferred) *transferred = 31;
+      return true;
+    }
+    if (s.pending_data > 0) {   // the data stage of a read
+      const size_t n = s.pending_data < data.size() ? s.pending_data : data.size();
+      memcpy(data.data(), s.response.data(), n);
+      s.pending_data = 0;
+      if (transferred) *transferred = static_cast<uint32_t>(n);
+      return true;
+    }
+    if (data.size() != 13) return false;
+    memcpy(data.data(), "USBS", 4);
+    memcpy(data.data() + 4, &s.tag, 4);
+    memset(data.data() + 8, 0, 4);
+    data.data()[12] = s.csw_status;
+    if (transferred) *transferred = 13;
+    return true;
+  }
+};
+
+struct FakePci final : IPciBus {
+  const char* name() const override { return "fake pci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 0; }
+  bool pci_device(uint32_t, PciDeviceInfo*) const override { return false; }
+  uint32_t read32(PciAddress, uint16_t) const override { return 0; }
+  void write32(PciAddress, uint16_t, uint32_t) const override {}
+  uint64_t memory_bar(PciAddress, uint8_t) const override { return 0; }
+  uint16_t find_capability(PciAddress, uint8_t) const override { return 0; }
+};
+
+struct FakeUsb final : IUsbBus {
+  std::vector<FakeStickHost*> hosts;
+  const char* name() const override { return "fake usb"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 0; }
+  uint32_t controller_count() const override { return static_cast<uint32_t>(hosts.size()); }
+  UsbControllerKind controller_kind(uint32_t) const override { return UsbControllerKind::Xhci; }
+  uint32_t port_count(uint32_t c) const override { return hosts[c]->port_count(); }
+  bool port_info(uint32_t c, uint32_t p, UsbPortInfo* out) const override { return hosts[c]->port_info(p, out); }
+  bool device_descriptor(uint32_t c, uint32_t p, UsbDeviceDescriptor* out) const override { return hosts[c]->device_descriptor(p, out); }
+  IUsbHostController* host_controller(uint32_t c) override { return c < hosts.size() ? hosts[c] : nullptr; }
+  bool poll_hotplug(UsbHotplugEvent* event) override {
+    for (uint32_t c = 0; c < hosts.size(); ++c)
+      if (hosts[c]->supports_hotplug() && hosts[c]->poll_hotplug(event)) { event->controller = c; return true; }
+    return false;
+  }
+};
+
+static FakeStickHost::Stick make_stick(Bytes image) {
+  FakeStickHost::Stick s;
+  s.image = static_cast<Bytes&&>(image);
+  return s;
+}
+

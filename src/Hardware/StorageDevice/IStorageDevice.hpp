@@ -49,6 +49,10 @@ struct StorageStatistics {
 // fallback for controllers without a native driver.
 class IStorageDevice : public IHardware {
  public:
+  // False once the device is gone (a USB stick that was pulled out): every request then fails at once. Devices that cannot be removed
+  // are always present.
+  virtual bool present() const { return true; }
+
   virtual StorageInfo info() const = 0;
   virtual StorageStatistics statistics() const = 0;
 

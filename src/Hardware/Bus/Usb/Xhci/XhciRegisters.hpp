@@ -63,6 +63,7 @@ constexpr uint32_t kStsNotReady = 1u << 11;
 constexpr uint32_t kPortConnected = 1u << 0;
 constexpr uint32_t kPortEnabled = 1u << 1;
 constexpr uint32_t kPortReset = 1u << 4;
+constexpr uint32_t kPortConnectChange = 1u << 17;
 constexpr uint32_t kPortResetChange = 1u << 21;
 constexpr uint32_t kPortChangeBits = 0x00FE0000;  // bits 17-23, RW1C
 // Fields that are safe to write back unchanged: PLS [8:5], PP [9], wake [27:25].

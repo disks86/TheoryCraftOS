@@ -41,6 +41,7 @@ enum class Status : uint8_t {
   Corrupt,          // the on-disk structures make no sense
   Unsupported,
   OutOfMemory,
+  NoMedia,          // the medium is gone: a removable volume that was unplugged or ejected
 };
 
 const char* status_name(Status status);

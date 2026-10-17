@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest UvcTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest UvcTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PartitionTest FileSystemTest StorageHotplugTest StorageHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -54,6 +54,10 @@ for t in "${WANTED[@]}"; do
     PartitionTest) build_and_run PartitionTest tests/PartitionTest.cpp tests/KernelStubs.cpp src/Hardware/StorageDevice/Partition/PartitionScanner.cpp ;;
     FileSystemTest) build_and_run FileSystemTest tests/FileSystemTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                       src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp ;;
+    StorageHotplugTest) build_and_run StorageHotplugTest tests/StorageHotplugTest.cpp tests/UsbAudioStubs.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Paging.cpp \
+                          src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp \
+                          src/Hardware/StorageDevice/StorageDeviceBase.cpp src/Hardware/StorageDevice/SystemStorageDevices.cpp src/Hardware/StorageDevice/*/*.cpp \
+                          src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp src/FileSystem/Mount/*.cpp src/SystemFileSystem.cpp ;;
     StreamTest) build_and_run StreamTest tests/StreamTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Stream/StreamStatus.cpp src/Async/Executor.cpp \
                   src/Stream/Memory/*.cpp src/Stream/File/*.cpp src/Stream/Tcp/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp \
                   src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
@@ -86,6 +90,14 @@ for t in "${WANTED[@]}"; do
                 src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp $gui_audio ;;
     GuiViewsTest) build_and_run GuiViewsTest tests/GuiViewsTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp \
                 src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp $gui_audio ;;
+    StorageHotplugThreadTest)  # real threads, checked with ThreadSanitizer
+      echo "== StorageHotplugThreadTest"
+      $cxx -std=c++20 -O1 -g -fsanitize=thread -pthread -I src -I tests -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-misleading-indentation -Wno-delete-non-virtual-dtor \
+        -o "$out/StorageHotplugThreadTest" tests/StorageHotplugThreadTest.cpp tests/HostThreads.cpp tests/UsbAudioStubs.cpp src/Kernel/Paging.cpp \
+        src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp \
+        src/Hardware/StorageDevice/StorageDeviceBase.cpp src/Hardware/StorageDevice/SystemStorageDevices.cpp src/Hardware/StorageDevice/*/*.cpp \
+        src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp src/FileSystem/Mount/*.cpp src/SystemFileSystem.cpp
+      "$out/StorageHotplugThreadTest" ;;
     GuiThreadTest)  # real threads, checked with ThreadSanitizer (cannot be combined with the address sanitizer)
       echo "== GuiThreadTest"
       $cxx -std=c++20 -O1 -g -fsanitize=thread -pthread -I src -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-misleading-indentation -Wno-delete-non-virtual-dtor \

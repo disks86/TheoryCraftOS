@@ -140,6 +140,33 @@ void FileExplorer::set_view_mode(ViewMode mode) {
 }
 
 bool FileExplorer::open_folder(StringView path) {
+  kernel::ScopedMutex guard(navigation_);
+  return load(path);
+}
+
+bool FileExplorer::refresh() {
+  kernel::ScopedMutex guard(navigation_);
+  if (!fs_) return false;
+  String path(allocator());
+  if (!path.assign(path_.view())) return false;
+  for (;;) {
+    if (load(path.view())) return true;
+    if (path.size() <= 1) break;
+    // The folder is gone (its volume was unplugged, say): try the one above it.
+    const StringView p = path.view();
+    uint64_t end = p.size();
+    while (end > 1 && p[end - 1] == '/') --end;
+    const uint64_t slash = p.first(end).rfind('/');
+    String parent(allocator());
+    if (!parent.assign(slash == StringView::npos || slash == 0 ? StringView("/") : p.first(slash))) break;
+    path = util::move(parent);
+  }
+  view_.clear_items();
+  status_.set_text("The folder could not be read");
+  return false;
+}
+
+bool FileExplorer::load(StringView path) {
   if (!fs_) return false;
   UniquePointer<IDirectory> directory;
   if (fs_->open_directory(path, &directory) != Status::Ok) return false;

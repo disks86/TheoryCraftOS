@@ -17,3 +17,8 @@ void delay_us(uint64_t) {}
 bool detach_firmware_drivers(efi::SystemTable*, PciAddress) { return false; }
 bool reattach_firmware_drivers(efi::SystemTable*, PciAddress) { return false; }
 }
+
+#include "Kernel/Firmware.hpp"
+namespace kernel {
+void firmware_call(void (*function)(void*), void* argument) { function(argument); }
+}

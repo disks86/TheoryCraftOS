@@ -22,6 +22,8 @@
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "ObjectContainer/List.hpp"
+#include "Kernel/Sync.hpp"
+#include "Utility/SharedPointer.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "uefi.hpp"
 
@@ -34,29 +36,57 @@ namespace hardware {
 // without a native driver, SCSI adapters, SD/MMC, floppy - is
 // used through the firmware's Block I/O driver instead. Partitions are not
 // listed: only whole devices.
+// A change to the set of devices (see SystemStorageDevices::poll).
+struct StorageEvent {
+  enum class Kind : uint8_t { Added, Removed };
+  Kind kind = Kind::Added;
+  uint32_t id = 0;                         // the device's id, which stays the same for as long as it is plugged in
+  SharedPointer<IStorageDevice> device;    // a removed device is shut down and present() is false; it lives while anyone holds this
+};
+
 class SystemStorageDevices {
  public:
   // `usb` may be null; without it USB mass storage is left to the firmware (which
   // cannot see devices on a controller this OS has taken over).
   SystemStorageDevices(IPciBus& pci, IUsbBus* usb, allocators::IAllocator& allocator, efi::SystemTable* st)
-      : pci_(pci), usb_(usb), allocator_(allocator), st_(st), devices_(allocator) {}
+      : pci_(pci), usb_(usb), allocator_(allocator), st_(st), devices_(allocator), pending_(allocator) {}
 
   void initialize();
   // Stops every device and frees them.
   void shutdown();
 
-  uint32_t count() const { return static_cast<uint32_t>(devices_.count()); }
-  IStorageDevice* at(uint32_t index) const { return index < devices_.count() ? devices_[index].get() : nullptr; }
+  // The devices there are now. at() hands out a plain pointer, which is only good while the device stays plugged in: a program that
+  // keeps one while hot-plug is running holds share() instead (and checks present()).
+  uint32_t count() const;
+  IStorageDevice* at(uint32_t index) const;
+  uint32_t id(uint32_t index) const;
+  SharedPointer<IStorageDevice> share(uint32_t index) const;
+
+  // Hot-plug: USB mass-storage devices plugged in or pulled out since start-up. Returns one change per call (false when there is none);
+  // call it every few hundred milliseconds from one thread. A new device is already initialized and in the list; a removed one has been
+  // taken out of the list and shut down (requests to it fail), and is freed once everyone has let go of the event's pointer.
+  // Only devices on host controllers that report hot-plug (xHCI) are seen; everything else is fixed from start-up on.
+  bool poll(StorageEvent* event);
 
  private:
-  void find_native();
-  void find_firmware();
+  struct Entry {
+    uint32_t id = 0;
+    SharedPointer<IStorageDevice> device;
+  };
+
+  void find_native(List<UniquePointer<IStorageDevice>>& found);
+  void find_firmware(List<UniquePointer<IStorageDevice>>& found);
+  void adopt(List<UniquePointer<IStorageDevice>>& found, bool report);
+  void sweep_removed();
 
   IPciBus& pci_;
   IUsbBus* usb_;
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;
-  List<UniquePointer<IStorageDevice>> devices_;
+  mutable kernel::Mutex mutex_;   // the list of devices
+  List<Entry> devices_;
+  List<StorageEvent> pending_;    // changes found but not yet handed out
+  uint32_t next_id_ = 1;
 };
 
 }  // namespace hardware

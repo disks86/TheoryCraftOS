@@ -166,6 +166,7 @@ add_executable(BOOTX64
   src/Stream/Tcp/TcpStream.cpp
   src/FileSystem/FileSystemTypes.cpp
   src/FileSystem/Ram/RamFileSystem.cpp
+  src/FileSystem/Mount/MountTable.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
   src/ConcurrentDemo.cpp
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp

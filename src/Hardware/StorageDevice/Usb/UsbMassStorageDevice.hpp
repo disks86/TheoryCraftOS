@@ -35,12 +35,19 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
                        uint16_t in_max_packet, uint8_t out_endpoint, uint16_t out_max_packet,
                        allocators::IAllocator& allocator, efi::SystemTable* st)
       : StorageDeviceBase(allocator, st), host_(host), port_(port), interface_(interface_number),
-        in_(in_endpoint), out_(out_endpoint), in_max_packet_(in_max_packet), out_max_packet_(out_max_packet) {}
+        in_(in_endpoint), out_(out_endpoint), in_max_packet_(in_max_packet), out_max_packet_(out_max_packet),
+        generation_(host.port_generation(port)) {}
 
   // Adds a device for every mass-storage interface on every enumerated USB device.
   static void discover(IUsbBus& usb, allocators::IAllocator& allocator, efi::SystemTable* st,
                        List<UniquePointer<IStorageDevice>>& out);
 
+  // The same for the one device on a root port (a stick that was just plugged in).
+  static void discover_port(IUsbHostController& host, uint32_t port, allocators::IAllocator& allocator, efi::SystemTable* st,
+                            List<UniquePointer<IStorageDevice>>& out);
+
+  // False once the device was unplugged (the port's generation moved on) or shut down: requests then fail at once.
+  bool present() const override { return !__atomic_load_n(&shut_down_, __ATOMIC_ACQUIRE) && host_.port_generation(port_) == generation_; }
   const char* name() const override { return optical_ ? "USB optical drive" : "USB mass storage"; }
   bool initialize() override;
   void shutdown() override;
@@ -62,6 +69,8 @@ class UsbMassStorageDevice final : public StorageDeviceBase {
   uint32_t port_;
   uint8_t interface_, in_, out_;
   uint16_t in_max_packet_, out_max_packet_;
+  uint32_t generation_;     // the port's generation when the device was taken over
+  bool shut_down_ = false;
   ByteView wire_;  // command and status wrappers, sense and identify data: one 64 KiB-aligned page
   uint32_t tag_ = 1;
   bool optical_ = false;

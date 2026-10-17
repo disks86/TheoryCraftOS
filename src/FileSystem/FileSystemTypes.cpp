@@ -38,6 +38,7 @@ const char* status_name(Status status) {
     case Status::Corrupt: return "corrupt filesystem";
     case Status::Unsupported: return "unsupported";
     case Status::OutOfMemory: return "out of memory";
+    case Status::NoMedia: return "no media";
   }
   return "unknown";
 }

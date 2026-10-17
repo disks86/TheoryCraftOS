@@ -56,6 +56,17 @@ class IUsbHostController : public IHardware {
     return false;
   }
 
+  // --- Hot-plug. A controller that notices devices coming and going after start-up says so here (xHCI); the others only know the devices
+  // present when initialize() ran.
+  virtual bool supports_hotplug() const { return false; }
+  // Looks at the root ports and reports at most one change: a device that was unplugged (its slot and endpoints are already released, so
+  // everything addressed to that port fails from now on) or a new one, enumerated and ready (descriptors readable). Call it every few
+  // hundred milliseconds from one thread; false when nothing changed. May block while a transfer to the port is still running.
+  virtual bool poll_hotplug(UsbHotplugEvent* event) { (void)event; return false; }
+  // Changes whenever a device on the port is enumerated or released. A driver notes it when it takes the device over and treats the device
+  // as gone once the number differs: the port may hold a different device by then.
+  virtual uint32_t port_generation(uint32_t port) const { (void)port; return 0; }
+
   // --- Interrupt IN endpoints (HID reports and the like).
   // Configures the endpoint and starts receiving packets of up to max_packet
   // bytes. `interval` is the descriptor's bInterval.

@@ -39,6 +39,10 @@ class IUsbBus : public IBus {
   // The driver for a controller (to talk to its devices), or nullptr if it has none.
   virtual IUsbHostController* host_controller(uint32_t controller) = 0;
 
+  // Reports one device that appeared or disappeared since the last call (see IUsbHostController::poll_hotplug), with the controller filled
+  // in. Only controllers that support hot-plug contribute. False when nothing changed. Call from one thread.
+  virtual bool poll_hotplug(UsbHotplugEvent* event) { (void)event; return false; }
+
  protected:
   constexpr IUsbBus() = default;
   ~IUsbBus() = default;

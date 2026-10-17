@@ -38,17 +38,25 @@ void UsbMassStorageDevice::discover(IUsbBus& usb, allocators::IAllocator& alloca
   for (uint32_t c = 0; c < usb.controller_count(); ++c) {
     IUsbHostController* host = usb.host_controller(c);
     if (!host) continue;
-    for (uint32_t port = 0; port < host->port_count(); ++port) {
+    for (uint32_t port = 0; port < host->port_count(); ++port) discover_port(*host, port, allocator, st, out);
+  }
+}
+
+void UsbMassStorageDevice::discover_port(IUsbHostController& host_controller, uint32_t port, allocators::IAllocator& allocator,
+                                         efi::SystemTable* st, List<UniquePointer<IStorageDevice>>& out) {
+  IUsbHostController* host = &host_controller;
+  {
+    {
       uint8_t storage[256];
       uint16_t length = 0;
-      if (!host->configuration_descriptor(port, ByteView(storage), &length)) continue;  // length is the full size
+      if (!host->configuration_descriptor(port, ByteView(storage), &length)) return;  // length is the full size
       const ConstByteView config = ConstByteView(storage).at_most(length);
 
       // Walk the descriptors for a Bulk-Only mass-storage interface and its endpoints.
       UsbDescriptorWalker walker(config);
       ConstByteView descriptor;
       UsbConfigurationInfo configuration;
-      if (!walker.next(&descriptor) || !parse_usb_configuration(descriptor, &configuration)) continue;
+      if (!walker.next(&descriptor) || !parse_usb_configuration(descriptor, &configuration)) return;
 
       bool in_interface = false;
       uint8_t number = 0, in_ep = 0, out_ep = 0;
@@ -91,6 +99,7 @@ void UsbMassStorageDevice::discover(IUsbBus& usb, allocators::IAllocator& alloca
 }
 
 void UsbMassStorageDevice::recover() {
+  if (!present()) return;
   // Reset recovery (Bulk-Only Transport 5.3.4): class reset, then clear both halts.
   host_.control_out(port_, kClassInterfaceOut, kBulkReset, 0, interface_);
   host_.reset_bulk_endpoint(port_, in_);
@@ -100,7 +109,7 @@ void UsbMassStorageDevice::recover() {
 }
 
 UsbMassStorageDevice::Result UsbMassStorageDevice::command(ConstByteView cdb, ByteView data, bool data_in) {
-  if (cdb.size() > 16) return Result::Error;
+  if (cdb.size() > 16 || wire_.empty() || !present()) return Result::Error;
   const ByteView cbw = wire_.subview(kCbwOffset, kCbwSize);
   const ByteView csw = wire_.subview(kCswOffset, kCswSize);
   const uint32_t tag = tag_++;
@@ -153,7 +162,7 @@ UsbMassStorageDevice::Result UsbMassStorageDevice::command(ConstByteView cdb, By
 // Runs a command; when it fails with CHECK CONDITION the sense data is fetched
 // (required to clear the condition) and the command is tried again a few times.
 bool UsbMassStorageDevice::run(ConstByteView cdb, ByteView data, bool data_in) {
-  for (int attempt = 0; attempt < 4; ++attempt) {
+  for (int attempt = 0; attempt < 4 && present(); ++attempt) {
     const Result r = command(cdb, data, data_in);
     if (r == Result::Good) return true;
     if (r == Result::Error) return false;
@@ -206,6 +215,8 @@ bool UsbMassStorageDevice::initialize() {
 }
 
 void UsbMassStorageDevice::shutdown() {
+  kernel::ScopedMutex guard(mutex_);   // a request still running on another thread is over first
+  __atomic_store_n(&shut_down_, true, __ATOMIC_RELEASE);
   release_bounce();
   release_view(allocator_, wire_);
 }

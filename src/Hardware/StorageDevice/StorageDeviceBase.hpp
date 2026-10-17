@@ -48,6 +48,10 @@ class StorageDeviceBase : public IStorageDevice {
   virtual bool transfer(bool write, uint64_t lba, uint32_t blocks, ByteView dma) = 0;
   virtual bool flush_cache() { return true; }
 
+  // Held while a request runs. A driver that frees what requests use (the bounce buffer, its own command memory) takes it first, so a
+  // request still in flight on another thread is over by then.
+  kernel::Mutex mutex_;
+
   bool prepare_bounce();  // needs info_.block_size
   void release_bounce();
   uint32_t max_blocks() const { return static_cast<uint32_t>(bounce_.size() / info_.block_size); }
@@ -61,7 +65,6 @@ class StorageDeviceBase : public IStorageDevice {
  private:
   bool run(bool write, uint64_t lba, ByteView into, ConstByteView from);
 
-  kernel::Mutex mutex_;  // one request at a time per device
   ByteView bounce_;  // kBounceBytes of device-reachable memory
 };
 

@@ -29,6 +29,13 @@ struct UsbPortInfo {
   UsbSpeed speed;  // meaningful only when connected
 };
 
+// A device appearing on or disappearing from a root port after start-up (see IUsbHostController::poll_hotplug).
+struct UsbHotplugEvent {
+  uint32_t controller = 0;  // filled in by the bus; a host controller leaves it 0
+  uint32_t port = 0;
+  bool connected = false;   // true: enumerated and ready for class drivers; false: gone
+};
+
 // USB 2.0 standard device descriptor (section 9.6.1), as sent on the wire.
 struct UsbDeviceDescriptor {
   uint8_t length;

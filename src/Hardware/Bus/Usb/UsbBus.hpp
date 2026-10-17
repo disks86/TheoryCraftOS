@@ -46,6 +46,7 @@ class UsbBus final : public IUsbBus {
   uint32_t port_count(uint32_t controller) const override;
   bool port_info(uint32_t controller, uint32_t port, UsbPortInfo* out) const override;
   bool device_descriptor(uint32_t controller, uint32_t port, UsbDeviceDescriptor* out) const override;
+  bool poll_hotplug(UsbHotplugEvent* event) override;
   IUsbHostController* host_controller(uint32_t controller) override {
     return controller < controllers_.count() ? controllers_[controller].host.get() : nullptr;
   }
@@ -60,6 +61,7 @@ class UsbBus final : public IUsbBus {
   allocators::IAllocator& allocator_;
   efi::SystemTable* st_;
   List<Controller> controllers_;
+  uint32_t next_poll_ = 0;
 };
 
 }  // namespace hardware

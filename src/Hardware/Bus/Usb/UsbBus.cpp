@@ -107,4 +107,17 @@ bool UsbBus::device_descriptor(uint32_t controller, uint32_t port, UsbDeviceDesc
   return controllers_[controller].host->device_descriptor(port, out);
 }
 
+bool UsbBus::poll_hotplug(UsbHotplugEvent* event) {
+  for (uint32_t i = 0; i < controllers_.count(); ++i) {
+    // Start after the controller that reported last, so a busy one cannot starve the others.
+    const uint32_t c = (next_poll_ + i) % static_cast<uint32_t>(controllers_.count());
+    IUsbHostController* host = controllers_[c].host.get();
+    if (!host || !host->supports_hotplug() || !host->poll_hotplug(event)) continue;
+    event->controller = c;
+    next_poll_ = c;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace hardware

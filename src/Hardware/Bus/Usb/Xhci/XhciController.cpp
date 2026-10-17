@@ -113,8 +113,12 @@ bool XhciController::initialize() {
     return false;
   }
 
-  for (uint32_t port = 0; port < ports_; ++port)
+  for (uint32_t port = 0; port < ports_; ++port) {
+    // Acknowledge the connect change first: one that comes after this is a device plugged in later, which poll_hotplug() takes up.
+    const uint32_t status = read32(port_register(port));
+    if (status & kPortConnectChange) write32(port_register(port), (status & kPortPreserveMask) | kPortConnectChange);
     if (read32(port_register(port)) & kPortConnected) enumerate_port(port);
+  }
   return true;
 }
 
@@ -260,6 +264,7 @@ bool XhciController::port_info(uint32_t port, UsbPortInfo* out) const {
 }
 
 bool XhciController::device_descriptor(uint32_t port, UsbDeviceDescriptor* out) const {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !out || !devices_[port].present) return false;
   *out = devices_[port].descriptor;
   return true;
@@ -278,9 +283,53 @@ bool XhciController::reset_port(uint32_t port) {
   return read32(reg) & kPortEnabled;
 }
 
+uint32_t XhciController::port_generation(uint32_t port) const {
+  return port < ports_ ? __atomic_load_n(&generation_[port], __ATOMIC_ACQUIRE) : 0;
+}
+
+bool XhciController::poll_hotplug(UsbHotplugEvent* event) {
+  kernel::ScopedMutex lock_guard(lock_);
+  if (!running_ || !event || ports_ == 0) return false;
+  pump_events();
+  for (uint32_t n = 0; n < ports_; ++n) {
+    const uint32_t port = (hotplug_cursor_ + n) % ports_;
+    const uint64_t reg = port_register(port);
+    const uint32_t status = read32(reg);
+    const bool changed = status & kPortConnectChange;
+    if (changed) write32(reg, (status & kPortPreserveMask) | kPortConnectChange);   // acknowledge
+    const bool connected = status & kPortConnected;
+    Device& d = devices_[port];
+    if (d.present && (!connected || changed)) {   // unplugged (possibly plugged in again before this look: the new device comes next)
+      release_device(d);
+      attempts_[port] = 0;
+      pending_connect_[port] = connected;
+      hotplug_cursor_ = port;
+      *event = UsbHotplugEvent{0, port, false};
+      return true;
+    }
+    if (!connected) {
+      pending_connect_[port] = false;
+      attempts_[port] = 0;
+      continue;
+    }
+    if (!d.present && (changed || pending_connect_[port])) {
+      pending_connect_[port] = false;
+      if (enumerate_port(port)) {
+        attempts_[port] = 0;
+        hotplug_cursor_ = (port + 1) % ports_;
+        *event = UsbHotplugEvent{0, port, true};
+        return true;
+      }
+      if (++attempts_[port] < 3) pending_connect_[port] = true;   // devices often need a second try
+    }
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------- devices
 
 void XhciController::release_device(Device& d) {
+  if (d.present) __atomic_add_fetch(&generation_[&d - devices_], 1, __ATOMIC_ACQ_REL);
   if (d.slot) {
     Trb completion;
     run_command(0, (kTrbDisableSlot << 10) | (uint32_t{d.slot} << 24), &completion);
@@ -334,6 +383,7 @@ bool XhciController::enumerate_port(uint32_t port) {
   }
   bytes_of(d.descriptor).copy_from(buffer_.first(sizeof(UsbDeviceDescriptor)));
   d.present = true;
+  __atomic_add_fetch(&generation_[port], 1, __ATOMIC_ACQ_REL);
 
   // Cache the first configuration (interfaces/endpoints) for class drivers. A
   // device without a readable one is still enumerated, just not usable by them.
@@ -428,6 +478,7 @@ bool XhciController::transfer(Device& d, uint8_t request_type, uint8_t request, 
 // ---------------------------------------------------------- class driver API
 
 bool XhciController::configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const {
+  kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !devices_[port].config_length || buffer.empty()) return false;
   const Device& d = devices_[port];
   buffer.copy_from(ConstByteView(d.config).first(d.config_length).at_most(buffer.size()));  // as much as fits
@@ -650,7 +701,13 @@ bool XhciController::bulk_transfer(uint32_t port, uint8_t endpoint_address, Byte
                                      (kTrbNormal << 10) | kTrbIoc | kTrbInterruptOnShortPacket);
     ring_doorbell(d.slot, e.context_id);
     Trb event;
-    if (!wait_event(kTrbTransferEvent, trb, &event, 5000)) return false;
+    // Wait in slices so that a device unplugged in the middle of the transfer is noticed at once, not after the full timeout.
+    bool arrived = false;
+    for (uint32_t waited = 0; waited < 5000 && !arrived; waited += 100) {
+      arrived = wait_event(kTrbTransferEvent, trb, &event, 100);
+      if (!arrived && !(read32(port_register(port)) & kPortConnected)) return false;
+    }
+    if (!arrived) return false;
     const uint32_t code = completion_code(event.status);
     const uint32_t residual = event.status & 0xFFFFFF;
     if (transferred) *transferred = residual <= length ? length - residual : 0;

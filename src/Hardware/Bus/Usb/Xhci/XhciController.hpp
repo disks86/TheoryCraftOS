@@ -67,6 +67,9 @@ class XhciController final : public IXhciController {
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
   bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
   bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
+  bool supports_hotplug() const override { return true; }
+  bool poll_hotplug(UsbHotplugEvent* event) override;
+  uint32_t port_generation(uint32_t port) const override;
   bool supports_isochronous() const override { return true; }
   bool start_iso_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) override;
   void stop_iso_endpoint(uint32_t port, uint8_t endpoint_address) override;
@@ -187,12 +190,16 @@ class XhciController final : public IXhciController {
   xhci::ProducerRing command_ring_;
   xhci::EventRing event_ring_;
   ByteView buffer_;  // 4 KiB bounce buffer for control transfers
-  kernel::Mutex lock_;  // one thread in the controller at a time
+  mutable kernel::Mutex lock_;  // one thread in the controller at a time
   bool running_ = false;
   bool ac64_ = false;
   bool owns_controller_ = false;  // firmware drivers are detached
 
   Device devices_[kMaxPorts];
+  uint32_t generation_[kMaxPorts] = {};     // bumped when a device on the port is enumerated or released
+  bool pending_connect_[kMaxPorts] = {};    // enumerate the port on the next poll_hotplug() (a device that came back, or a failed attempt)
+  uint8_t attempts_[kMaxPorts] = {};        // failed enumerations since the device appeared
+  uint32_t hotplug_cursor_ = 0;
 };
 
 }  // namespace hardware

@@ -58,29 +58,29 @@ void add_device(List<UniquePointer<IStorageDevice>>& list, allocators::IAllocato
 }
 }  // namespace
 
-void SystemStorageDevices::find_native() {
+void SystemStorageDevices::find_native(List<UniquePointer<IStorageDevice>>& found) {
   PciDeviceInfo d;
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassMassStorage) continue;
     if (d.vendor_id == kVirtioPciVendor) {
       if (d.device_id == kVirtioBlockDevice || d.device_id == kVirtioBlockTransitionalDevice)
-        add_device<VirtioBlockDevice>(devices_, allocator_, pci_, d, allocator_, st_);
+        add_device<VirtioBlockDevice>(found, allocator_, pci_, d, allocator_, st_);
       else if (d.device_id == kVirtioScsiDevice || d.device_id == kVirtioScsiTransitionalDevice)
-        add_controller<VirtioScsiController, VirtioScsiDevice>(devices_, allocator_, pci_, d, allocator_, st_);
+        add_controller<VirtioScsiController, VirtioScsiDevice>(found, allocator_, pci_, d, allocator_, st_);
     } else if (NvmeStorageDevice::supports(d)) {
-      add_device<NvmeStorageDevice>(devices_, allocator_, pci_, d, allocator_, st_);
+      add_device<NvmeStorageDevice>(found, allocator_, pci_, d, allocator_, st_);
     } else if (AhciController::supports(d)) {
-      add_controller<AhciController, AhciStorageDevice>(devices_, allocator_, pci_, d, st_);
+      add_controller<AhciController, AhciStorageDevice>(found, allocator_, pci_, d, st_);
     } else if (IdeController::supports(d)) {
-      add_controller<IdeController, IdeStorageDevice>(devices_, allocator_, pci_, d, st_);
+      add_controller<IdeController, IdeStorageDevice>(found, allocator_, pci_, d, st_);
     }
   }
-  if (usb_) UsbMassStorageDevice::discover(*usb_, allocator_, st_, devices_);
+  if (usb_) UsbMassStorageDevice::discover(*usb_, allocator_, st_, found);
 }
 
 // Whole devices still bound to a firmware driver. (Native drivers detach the
 // firmware's, so their devices no longer show up here.)
-void SystemStorageDevices::find_firmware() {
+void SystemStorageDevices::find_firmware(List<UniquePointer<IStorageDevice>>& found) {
   efi::BootServices* bs = st_->boot_services;
   efi::Uintn count = 0;
   efi::Handle* handles = nullptr;
@@ -92,19 +92,108 @@ void SystemStorageDevices::find_firmware() {
     if (bs->handle_protocol(handles[i], &efi::kBlockIoGuid, reinterpret_cast<void**>(&io)) != efi::kSuccess || !io ||
         !io->media || io->media->logical_partition || !io->media->media_present)
       continue;
-    add_device<UefiBlockStorageDevice>(devices_, allocator_, io, allocator_, st_);
+    add_device<UefiBlockStorageDevice>(found, allocator_, io, allocator_, st_);
   }
   bs->free_pool(handles);
 }
 
+void SystemStorageDevices::adopt(List<UniquePointer<IStorageDevice>>& found, bool report) {
+  for (uint64_t i = 0; i < found.count(); ++i) {
+    Entry entry;
+    entry.device = SharedPointer<IStorageDevice>::from(util::move(found[i]));
+    if (!entry.device) continue;   // (out of memory: the device is dropped with the list)
+    entry.id = next_id_++;
+    StorageEvent event;
+    event.kind = StorageEvent::Kind::Added;
+    event.id = entry.id;
+    event.device = entry.device;
+    kernel::ScopedMutex guard(mutex_);
+    devices_.push_back(util::move(entry));
+    if (report) pending_.push_back(util::move(event));
+  }
+  found.clear();
+}
+
 void SystemStorageDevices::initialize() {
-  find_native();
-  find_firmware();
+  List<UniquePointer<IStorageDevice>> found(allocator_);
+  find_native(found);
+  find_firmware(found);
+  adopt(found, false);
 }
 
 void SystemStorageDevices::shutdown() {
-  for (uint64_t i = devices_.count(); i > 0; --i) devices_[i - 1]->shutdown();  // newest first
+  kernel::ScopedMutex guard(mutex_);
+  pending_.clear();
+  for (uint64_t i = devices_.count(); i > 0; --i) devices_[i - 1].device->shutdown();  // newest first
   devices_.clear();
+}
+
+uint32_t SystemStorageDevices::count() const {
+  kernel::ScopedMutex guard(mutex_);
+  return static_cast<uint32_t>(devices_.count());
+}
+
+IStorageDevice* SystemStorageDevices::at(uint32_t index) const {
+  kernel::ScopedMutex guard(mutex_);
+  return index < devices_.count() ? devices_[index].device.get() : nullptr;
+}
+
+uint32_t SystemStorageDevices::id(uint32_t index) const {
+  kernel::ScopedMutex guard(mutex_);
+  return index < devices_.count() ? devices_[index].id : 0;
+}
+
+SharedPointer<IStorageDevice> SystemStorageDevices::share(uint32_t index) const {
+  kernel::ScopedMutex guard(mutex_);
+  return index < devices_.count() ? devices_[index].device : SharedPointer<IStorageDevice>();
+}
+
+// Takes every device that is no longer present out of the list: shut down first (which waits for a request still running on it), then reported.
+void SystemStorageDevices::sweep_removed() {
+  for (uint64_t i = 0;;) {
+    SharedPointer<IStorageDevice> gone;
+    uint32_t id = 0;
+    {
+      kernel::ScopedMutex guard(mutex_);
+      while (i < devices_.count() && devices_[i].device->present()) ++i;
+      if (i >= devices_.count()) return;
+      gone = devices_[i].device;
+      id = devices_[i].id;
+      devices_.remove_at(i);
+    }
+    gone->shutdown();   // (outside the list's lock: it waits for requests, which may be using the list through a mount)
+    StorageEvent event;
+    event.kind = StorageEvent::Kind::Removed;
+    event.id = id;
+    event.device = util::move(gone);
+    kernel::ScopedMutex guard(mutex_);
+    pending_.push_back(util::move(event));
+  }
+}
+
+bool SystemStorageDevices::poll(StorageEvent* event) {
+  for (int rounds = 0; rounds < 64; ++rounds) {
+    {
+      kernel::ScopedMutex guard(mutex_);
+      if (pending_.count() > 0) {
+        *event = util::move(pending_[0]);
+        pending_.remove_at(0);
+        return true;
+      }
+    }
+    UsbHotplugEvent change;
+    if (!usb_ || !usb_->poll_hotplug(&change)) return false;
+    if (!change.connected) {
+      sweep_removed();
+      continue;
+    }
+    IUsbHostController* host = usb_->host_controller(change.controller);
+    if (!host) continue;
+    List<UniquePointer<IStorageDevice>> found(allocator_);
+    UsbMassStorageDevice::discover_port(*host, change.port, allocator_, st_, found);
+    adopt(found, true);
+  }
+  return false;
 }
 
 }  // namespace hardware
