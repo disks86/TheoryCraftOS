@@ -20,6 +20,7 @@
 #include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Printer/IPrinter.hpp"
 #include "Hardware/Printer/PrinterAlertListener.hpp"
+#include "Hardware/Printer/PrinterDiscovery.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -35,6 +36,8 @@ class SystemPrinters {
   bool add(UniquePointer<IPrinter> printer);
   // Adds every printer found on the USB bus (printer-class interfaces); returns how many.
   uint32_t discover_usb(IUsbBus& usb);
+  // Adds a printer object (make_discovered_printer) for every printer `discovery` has found that is not here yet (matched by IP address); returns how many.
+  uint32_t add_discovered(network::INetworkStack& stack, const PrinterDiscovery& discovery);
   uint32_t count() const { return static_cast<uint32_t>(printers_.count()); }
   IPrinter* at(uint32_t index) { return index < printers_.count() ? printers_[index].get() : nullptr; }
   IPrinter* default_printer() { return at(0); }

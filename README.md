@@ -142,8 +142,17 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   (state, state reasons as errors and alerts, marker levels as supplies, serial from the device id), Get-Jobs and Cancel-Job. It has
   no page count (IPP has none for the printer; use SNMP) and no TLS (ipps://), authentication, Validate-Job or Create-Job/Send-Document.
   Tested against a scripted server only; the encoder against bytes laid out independently.
-  The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). Not covered:
-  discovery of network printers (BRAdmin, mDNS), several simultaneous 1284.4 channels, the printer's Epson FX / IBM emulation, PCL 6
+  The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). 
+  **Discovery:** `PrinterDiscovery` looks for printers two ways at once: mDNS / DNS-SD (`src/Network/Mdns/`: queries for `_ipp._tcp`,
+  `_printer._tcp` and `_pdl-datastream._tcp`, then SRV / TXT / A for what answers or only partly answers; TXT `rp`, `ty`, `pdl`,
+  `usb_MFG` are read; goodbyes remove services) over multicast 224.0.0.251:5353 using the stack's IGMP support, and an SNMP v2c probe
+  (sysDescr, sysName, hrDeviceType, prtGeneralPrinterName) sent to the subnet and limited broadcast addresses, which is how BRAdmin-style
+  tools find print servers. Both land in one entry per IP address. `SystemPrinters::add_discovered()` turns the entries into printers
+  (`make_discovered_printer`: IPP if advertised, else raw 9100 - assumed for a printer only SNMP found, else LPD; the printer details
+  discovery cannot know are defaults). Not covered: IPv6, mDNS responses to our own conflicting names (we only browse), escaped dots in instance
+  names, BRAdmin's own UDP protocol, scanning a subnet address by address (`probe_host()` asks one), raw ports other than 9100.
+  Not tried on a real network or printer.
+  Not covered: several simultaneous 1284.4 channels, the printer's Epson FX / IBM emulation, PCL 6
   (PCL XL) output, duplex and colour (the engine has neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure,
   text layout, both network transports and failures, and the USB driver against a scripted host controller (descriptors, device ID,
   chunking, retries, status, read-back, damaged descriptors); like the rest it has not been run against a physical printer.

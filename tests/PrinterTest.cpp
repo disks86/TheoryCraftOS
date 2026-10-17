@@ -31,6 +31,9 @@
 #include "Network/Snmp/SnmpUsm.hpp"
 #include "Hardware/Printer/IppPrinter.hpp"
 #include "Network/Ipp/IppMessage.hpp"
+#include "Network/Mdns/MdnsMessage.hpp"
+#include "Hardware/Printer/PrinterDiscovery.hpp"
+#include "Hardware/Printer/PrinterFactory.hpp"
 #include <set>
 #include "Hardware/Printer/PrinterAlertListener.hpp"
 #include <algorithm>
@@ -1713,6 +1716,230 @@ static void test_ipp_unreachable() {
   CHECK(printer.report() == nullptr);
 }
 
+// ---- discovery
+
+static ConstByteView view_of(const std::string& s) { return ConstByteView(reinterpret_cast<const uint8_t*>(s.data()), s.size()); }
+
+static void test_mdns_messages() {
+  TestAllocator alloc;
+  // Names with compression pointers: the PTR's target ends in a pointer to the owner name.
+  std::string m = unhex_string("000084000000000100000000");
+  m += unhex_string("045f697070045f746370056c6f63616c00");                       // _ipp._tcp.local at offset 12
+  m += unhex_string("000c0001" "00000078" "000a" "074d792050726e74" "c00c");          // PTR IN ttl 120 rdlength 10: "My Prnt" + pointer
+  mdns::Message msg;
+  CHECK(mdns::decode_message(view_of(m), &msg) && msg.response && msg.record_count == 1);
+  CHECK(msg.record_count == 1 && msg.records[0].type == mdns::kTypePtr && std::string(msg.records[0].name) == "_ipp._tcp.local" &&
+        std::string(msg.records[0].target) == "My Prnt._ipp._tcp.local" && msg.records[0].ttl == 120);
+  // A pointer loop and a pointer past the end are refused; every truncation is handled.
+  std::string loop = unhex_string("000084000000000100000000" "c00c" "000c000100000078" "0002" "c00c");
+  CHECK(!mdns::decode_message(view_of(loop), &msg));
+  for (size_t cut = 0; cut < m.size(); ++cut) mdns::decode_message(ConstByteView(reinterpret_cast<const uint8_t*>(m.data()), cut), &msg);
+
+  // A response built here reads back the same, with a TXT's values.
+  ByteBuffer out(alloc);
+  mdns::ResponseBuilder b(out);
+  const char* txt[] = {"txtvers=1", "rp=ipp/print", "ty=Test Printer", "pdl=application/postscript", "flag", "empty="};
+  CHECK(b.add_ptr("_ipp._tcp.local", "Test._ipp._tcp.local", 4500) && b.add_srv("Test._ipp._tcp.local", "host.local", 631, 120) && b.add_txt("Test._ipp._tcp.local", txt, 6, 4500) &&
+        b.add_a("host.local", Ipv4Address::make(10, 1, 2, 3), 120) && b.finish());
+  CHECK(mdns::decode_message(out.view(), &msg) && msg.record_count == 4);
+  CHECK(msg.records[1].type == mdns::kTypeSrv && msg.records[1].port == 631 && std::string(msg.records[1].target) == "host.local");
+  CHECK(msg.records[3].type == mdns::kTypeA && msg.records[3].address == Ipv4Address::make(10, 1, 2, 3));
+  char v[32];
+  CHECK(mdns::txt_value(msg.records[2].txt, msg.records[2].txt_length, "RP", v, sizeof v) && std::string(v) == "ipp/print");   // keys match in any case
+  CHECK(mdns::txt_value(msg.records[2].txt, msg.records[2].txt_length, "ty", v, sizeof v) && std::string(v) == "Test Printer");
+  CHECK(mdns::txt_value(msg.records[2].txt, msg.records[2].txt_length, "flag", v, sizeof v) && std::string(v) == "");
+  CHECK(mdns::txt_value(msg.records[2].txt, msg.records[2].txt_length, "empty", v, sizeof v) && std::string(v) == "");
+  CHECK(!mdns::txt_value(msg.records[2].txt, msg.records[2].txt_length, "missing", v, sizeof v) && !mdns::txt_value(msg.records[2].txt, msg.records[2].txt_length, "rpx", v, sizeof v));
+  CHECK(mdns::txt_value(msg.records[2].txt, msg.records[2].txt_length, "ty", v, 5) && std::string(v) == "Test");   // cut to the buffer
+  // A query round-trips.
+  ByteBuffer q(alloc);
+  mdns::Question qs[2];
+  strcpy(qs[0].name, "_ipp._tcp.local"); qs[0].type = mdns::kTypePtr;
+  strcpy(qs[1].name, "host.local"); qs[1].type = mdns::kTypeA; qs[1].unicast_response = true;
+  CHECK(mdns::build_query(qs, 2, q) && mdns::decode_message(q.view(), &msg) && !msg.response && msg.question_count == 2 && msg.questions[1].unicast_response &&
+        msg.questions[1].type == mdns::kTypeA && mdns::names_equal(msg.questions[0].name, "_IPP._tcp.local."));
+}
+
+// Stack B as a network printer for discovery: answers mDNS questions about "Brother HL-2070N series" and SNMP probes.
+struct FakeDiscoverable {
+  Lan& lan;
+  SharedPointer<IUdpSocket> mdns_socket, snmp_socket;
+  bool snmp_is_printer = true;
+  bool announce_raw = true;
+  uint32_t queries_seen = 0, snmp_seen = 0;
+  static constexpr const char* kHost = "brn30055c.local";
+  static constexpr const char* kIpp = "Brother HL-2070N series._ipp._tcp.local";
+  static constexpr const char* kLpd = "Brother HL-2070N series._printer._tcp.local";
+  static constexpr const char* kRaw = "Brother HL-2070N series._pdl-datastream._tcp.local";
+
+  explicit FakeDiscoverable(Lan& l) : lan(l) {
+    mdns_socket = lan.b.udp_open(mdns::kPort);
+    assert(mdns_socket && lan.b.join_multicast(mdns::kGroup));
+    snmp_socket = lan.b.udp_open(161);
+    assert(snmp_socket);
+  }
+  void send_mdns(ByteBuffer& out) { mdns_socket->send_to(mdns::kGroup, mdns::kPort, out.view()); }
+  void add_ipp(mdns::ResponseBuilder& b, bool with_address) {
+    const char* txt[] = {"txtvers=1", "rp=ipp/print", "ty=Brother HL-2070N series", "pdl=application/vnd.hp-PCL,application/postscript", "usb_MFG=Brother", "product=(Brother HL-2070N series)"};
+    b.add_ptr("_ipp._tcp.local", kIpp, 4500);
+    b.add_srv(kIpp, kHost, 631, 120);
+    b.add_txt(kIpp, txt, 6, 4500);
+    if (with_address) b.add_a(kHost, Ipv4Address::make(10, 0, 0, 2), 120);
+  }
+  void poll() {
+    uint8_t buffer[1500];
+    Ipv4Address from;
+    uint16_t port;
+    uint32_t length;
+    while (mdns_socket->receive_from(ByteView(buffer), &from, &port, &length)) {
+      mdns::Message q;
+      if (!mdns::decode_message(ConstByteView(buffer, length), &q) || q.response) continue;
+      ++queries_seen;
+      TestAllocator alloc;
+      ByteBuffer out(alloc);
+      mdns::ResponseBuilder b(out);
+      uint32_t records = 0;
+      for (uint32_t i = 0; i < q.question_count; ++i) {
+        const mdns::Question& k = q.questions[i];
+        if (k.type == mdns::kTypePtr && mdns::names_equal(k.name, "_ipp._tcp.local")) { add_ipp(b, true); ++records; }
+        else if (k.type == mdns::kTypePtr && mdns::names_equal(k.name, "_printer._tcp.local")) {
+          const char* txt[] = {"rp=BINARY_P1", "ty=Brother HL-2070N series"};
+          b.add_ptr("_printer._tcp.local", kLpd, 4500);
+          b.add_srv(kLpd, kHost, 515, 120);
+          b.add_txt(kLpd, txt, 2, 4500);
+          ++records;
+        } else if (k.type == mdns::kTypePtr && mdns::names_equal(k.name, "_pdl-datastream._tcp.local")) {
+          if (announce_raw) { b.add_ptr("_pdl-datastream._tcp.local", kRaw, 4500); ++records; }   // the PTR alone: the rest has to be asked for
+        } else if (k.type == mdns::kTypeSrv && mdns::names_equal(k.name, kRaw)) { b.add_srv(kRaw, kHost, 9100, 120); ++records; }
+        else if (k.type == mdns::kTypeTxt && mdns::names_equal(k.name, kRaw)) { const char* txt[] = {"ty=Brother HL-2070N series"}; b.add_txt(kRaw, txt, 1, 4500); ++records; }
+      }
+      if (records) { b.finish(); send_mdns(out); }
+    }
+    while (snmp_socket->receive_from(ByteView(buffer), &from, &port, &length)) {
+      SnmpMessage m;
+      if (!decode_snmp(ConstByteView(buffer, length), &m) || m.pdu != SnmpPdu::Get || m.count != 4) continue;
+      ++snmp_seen;
+      m.pdu = SnmpPdu::Response;
+      auto text = [](SnmpVarBind& bind, const char* s) { bind.value.type = SnmpType::OctetString; bind.value.length = static_cast<uint8_t>(strlen(s)); memcpy(bind.value.bytes, s, strlen(s)); };
+      text(m.binds[0], "Brother NC-6400h, Firmware Ver.1.11");
+      text(m.binds[1], "BRN30055C");
+      if (snmp_is_printer) {
+        m.binds[2].value.type = SnmpType::ObjectId;
+        Oid::parse("1.3.6.1.2.1.25.3.1.5", &m.binds[2].value.oid);
+        text(m.binds[3], "HL-2070N series");
+      } else {
+        m.binds[2].value.type = SnmpType::NoSuchInstance;
+        m.binds[3].value.type = SnmpType::NoSuchObject;
+      }
+      TestAllocator alloc;
+      ByteBuffer out(alloc);
+      if (encode_snmp(m, alloc, &out)) snmp_socket->send_to(from, port, out.view());
+    }
+  }
+};
+
+static void test_discovery() {
+  Lan lan;
+  lan.configure_static();
+  FakeDiscoverable device(lan);
+  PrinterDiscovery discovery(lan.a, lan.alloc);
+  auto run = [&](const std::function<bool()>& done, int max_ms = 12000) { return lan.run_until([&] { device.poll(); discovery.poll(); return done(); }, max_ms); };
+
+  CHECK(discovery.start());
+  CHECK(run([&] { const DiscoveredPrinter* p = discovery.find(Ipv4Address::make(10, 0, 0, 2)); return p && p->has_ipp && p->has_lpd && p->has_raw && p->has_snmp; }));
+  CHECK(discovery.count() == 1);
+  const DiscoveredPrinter& p = discovery.at(0);
+  CHECK(p.address == Ipv4Address::make(10, 0, 0, 2) && std::string(p.name) == "Brother HL-2070N series" && std::string(p.make_model) == "Brother HL-2070N series" && std::string(p.manufacturer) == "Brother");
+  CHECK(p.by_mdns && p.has_snmp && p.ipp_port == 631 && std::string(p.ipp_path) == "/ipp/print" && p.lpd_port == 515 && std::string(p.lpd_queue) == "BINARY_P1" && p.raw_port == 9100);
+  CHECK(p.supports_pcl() && p.supports_postscript() && std::string(p.description) == "Brother NC-6400h, Firmware Ver.1.11" && !p.raw_assumed());
+  CHECK(device.queries_seen >= 1 && device.snmp_seen >= 1);
+  CHECK(run([&] { return discovery.finished(); }) && discovery.running());
+
+  // The printer withdraws the raw service (a goodbye: the PTR with a zero TTL).
+  {
+    ByteBuffer out(lan.alloc);
+    mdns::ResponseBuilder b(out);
+    b.add_ptr("_pdl-datastream._tcp.local", FakeDiscoverable::kRaw, 0);
+    b.finish();
+    device.send_mdns(out);
+    CHECK(run([&] { return !discovery.at(0).has_raw; }, 500) && discovery.at(0).has_ipp && discovery.count() == 1);
+  }
+  // An announcement for a device that is not there changes nothing about the others, and junk is ignored.
+  {
+    ByteBuffer out(lan.alloc);
+    out.put_zeros(30);
+    device.send_mdns(out);
+    ByteBuffer junk(lan.alloc);
+    for (int i = 0; i < 40; ++i) junk.put8(static_cast<uint8_t>(i * 37));
+    device.send_mdns(junk);
+    lan.step(20);
+    discovery.poll();
+    CHECK(discovery.count() == 1);
+  }
+  discovery.stop();
+  CHECK(!discovery.running());
+
+  // Only SNMP: the printer shows up with the raw port assumed; a device that answers but is no printer does not.
+  CHECK(discovery.start(PrinterDiscovery::kSnmp) && discovery.count() == 0);
+  CHECK(run([&] { return discovery.count() == 1; }));
+  CHECK(discovery.at(0).has_snmp && !discovery.at(0).by_mdns && !discovery.at(0).has_ipp && discovery.at(0).raw_assumed() && std::string(discovery.at(0).name) == "HL-2070N series");
+  discovery.stop();
+  device.snmp_is_printer = false;
+  CHECK(discovery.start(PrinterDiscovery::kSnmp));
+  run([&] { return false; }, 4000);
+  CHECK(device.snmp_seen >= 2 && discovery.count() == 0);
+  discovery.stop();
+  device.snmp_is_printer = true;
+
+  // Only mDNS: no SNMP involved.
+  CHECK(discovery.start(PrinterDiscovery::kMdns));
+  CHECK(run([&] { return discovery.count() == 1 && discovery.at(0).has_raw; }));
+  CHECK(!discovery.at(0).has_snmp);
+  discovery.stop();
+}
+
+static void test_discovered_printers() {
+  Lan lan;
+  lan.configure_static();
+  FakeDiscoverable device(lan);
+  Server server(lan, 631);
+  FakeIppServer ipp_server(lan);
+  server.app = [&](Server& s) { ipp_server.step(s); };
+  PrinterDiscovery discovery(lan.a, lan.alloc);
+  SystemPrinters printers(lan.alloc);
+  CHECK(discovery.start());
+  CHECK(lan.run_until([&] { device.poll(); discovery.poll(); return discovery.count() == 1 && discovery.at(0).has_raw && discovery.at(0).has_snmp; }, 12000));
+  CHECK(printers.add_discovered(lan.a, discovery) == 1 && printers.count() == 1);
+  CHECK(printers.add_discovered(lan.a, discovery) == 0 && printers.count() == 1);   // already known
+  IPrinter* printer = printers.default_printer();
+  CHECK(printer && printer->ipv4_address() == Ipv4Address::make(10, 0, 0, 2).value() && std::string(printer->name()) == "Brother HL-2070N series");
+  CHECK(printer && printer->info().supports(PrinterLanguage::Pcl) && printer->info().supports(PrinterLanguage::PostScript) && std::string(printer->info().manufacturer) == "Brother");
+  discovery.stop();
+  // It is an IPP printer: a job goes over HTTP with the path and format discovery found.
+  CHECK(printer && printer->submit(view_of("hello"), "discovered"));
+  CHECK(pump(lan, *printer, [&] { return printer->pending_jobs() == 0; }));
+  CHECK(ipp_server.documents.size() == 1 && ipp_server.documents[0] == "hello" && ipp_server.request_lines[0] == "POST /ipp/print HTTP/1.1" && ipp_server.last_format == "application/vnd.hp-PCL");
+  printers.shutdown();
+
+  // Found by SNMP alone, it becomes a raw 9100 printer; found with only LPD, an LPD printer.
+  DiscoveredPrinter raw;
+  raw.address = Ipv4Address::make(10, 0, 0, 2);
+  raw.has_snmp = true;
+  strcpy(raw.name, "Mystery");
+  UniquePointer<IPrinter> r = make_discovered_printer(lan.a, lan.alloc, raw);
+  CHECK(r && std::string(r->name()) == "Mystery" && r->info().supports(PrinterLanguage::Pcl));
+  DiscoveredPrinter lpd;
+  lpd.address = Ipv4Address::make(10, 0, 0, 2);
+  lpd.has_lpd = true;
+  strcpy(lpd.name, "Old");
+  CHECK(make_discovered_printer(lan.a, lan.alloc, lpd));
+  DiscoveredPrinter none;
+  none.address = Ipv4Address::make(10, 0, 0, 2);
+  none.has_raw = true;
+  none.raw_port = 9101;   // a raw port other than 9100 is not supported
+  CHECK(!make_discovered_printer(lan.a, lan.alloc, none));
+}
+
 int main() {
   test_packbits();
   test_pages_and_halftone();
@@ -1732,6 +1959,9 @@ int main() {
   test_printer_alerts();
   test_ipp();
   test_ipp_unreachable();
+  test_mdns_messages();
+  test_discovery();
+  test_discovered_printers();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

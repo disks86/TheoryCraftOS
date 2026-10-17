@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Printer/SystemPrinters.hpp"
+#include "Hardware/Printer/PrinterFactory.hpp"
 #include "Hardware/Printer/Usb/UsbPrinter.hpp"
 
 namespace hardware {
@@ -47,6 +48,20 @@ bool SystemPrinters::enable_alerts(network::INetworkStack& stack, AlertCallback 
   alert_callback_ = callback;
   alert_context_ = context;
   return alerts_ && alerts_->start();
+}
+
+uint32_t SystemPrinters::add_discovered(network::INetworkStack& stack, const PrinterDiscovery& discovery) {
+  uint32_t added = 0;
+  for (uint32_t i = 0; i < discovery.count(); ++i) {
+    const DiscoveredPrinter& found = discovery.at(i);
+    bool known = false;
+    for (uint32_t k = 0; k < count(); ++k)
+      if (at(k)->ipv4_address() == found.address.value()) known = true;
+    if (known) continue;
+    UniquePointer<IPrinter> printer = make_discovered_printer(stack, allocator_, found);
+    if (printer && add(util::move(printer))) ++added;
+  }
+  return added;
 }
 
 void SystemPrinters::poll() {
