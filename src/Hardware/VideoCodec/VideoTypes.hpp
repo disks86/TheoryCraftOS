@@ -82,6 +82,9 @@ struct DecoderConfig {
   uint32_t width = 0, height = 0;  // what the container says; 0 if unknown (the stream's own headers win)
   PixelFormat output = PixelFormat::Bgra8888;  // what receive() should deliver
   PixelFormat raw_format = PixelFormat::I420;  // for VideoCodec::Raw: how the packets are laid out (width and height are needed)
+  // For VideoCodec::H264: the avcC record (ISO 14496-15) of an MP4 or AVI file, which also says the packets hold
+  // length-prefixed NAL units. Empty for an Annex B stream (start codes, parameter sets in the stream).
+  ConstByteView codec_config;
 };
 
 struct EncoderConfig {

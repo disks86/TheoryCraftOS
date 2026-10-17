@@ -329,7 +329,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     sounds.text("sound:");
     for (uint8_t f = 1; f <= static_cast<uint8_t>(media::AudioFileFormat::Mp4); ++f) sounds.text(" ").text(media::audio_format_name(static_cast<media::AudioFileFormat>(f)));
     Entry movies(Level::Ok, "Media");
-    movies.text("video: AVI (Motion JPEG, raw), GIF, APNG, Y4M; JPEG on ").text(media_codecs.jpeg_accelerated() ? "a video engine, else the CPU" : "the CPU");
+    movies.text("video: AVI (Motion JPEG, raw, H.264), MP4/MOV (H.264), GIF, APNG, Y4M; JPEG on ").text(media_codecs.jpeg_accelerated() ? "a video engine, else the CPU" : "the CPU");
   }
 
   // Audio outputs: native drivers (HD Audio, AC'97, virtio-sound), or a silent software device.

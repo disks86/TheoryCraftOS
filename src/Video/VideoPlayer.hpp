@@ -27,6 +27,7 @@
 #include "Kernel/Thread.hpp"
 #include "Media/AudioData.hpp"
 #include "Media/Image.hpp"
+#include "Media/Mp4.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Video/AviFile.hpp"
 
@@ -38,12 +39,12 @@ enum class OpenResult : uint8_t {
   Ok,
   NotAvi,       // not an AVI file, or no video in it
   Unsupported,  // open_media(): not a video format this OS reads (see media::VideoFileFormat)
-  NoDecoder,    // no video codec device can decode this stream (H.264 and the like need a hardware engine driver)
+  NoDecoder,    // no video codec device can decode this stream (H.265, VP9 and AV1 need a hardware engine driver)
   OutOfMemory,
 };
 
-// Plays an AVI file held in memory (or, with open_media(), a GIF, APNG, animated WebP or Y4M file - decoded up front into frames that
-// carry their own durations, and silent): the picture through a video decoder session from the machine's codec devices,
+// Plays an AVI file held in memory (or, with open_media(), an MP4 / MOV file with H.264 video, or a GIF, APNG, animated WebP or Y4M file -
+// decoded up front into frames that carry their own durations, and silent): the picture through a video decoder session from the machine's codec devices,
 // the sound (if the file has PCM audio and a mixer is given) through an audio::AudioPlayer. The sound is the clock
 // while it plays - the picture follows it, skipping frames when decoding falls behind - and with no sound the picture
 // follows the system clock. update() does the work and must be called often (every 10 ms or so) while playing, or
@@ -54,7 +55,8 @@ class VideoPlayer {
   VideoPlayer(const hardware::IClock& clock, hardware::SystemVideoCodecs& codecs, allocators::IAllocator& allocator,
               audio::AudioMixer* mixer = nullptr)
       : clock_(clock), codecs_(codecs), allocator_(allocator), mixer_(mixer), file_(allocator), images_(allocator), frame_starts_(allocator),
-        decoded_audio_(allocator), display_(allocator) {}
+        decoded_audio_(allocator), mp4_(allocator), seq_dec_of_rank_(allocator), seq_rank_of_dec_(allocator),
+        seq_times_(allocator), seq_sync_(allocator), display_(allocator) {}
   ~VideoPlayer();
   VideoPlayer(const VideoPlayer&) = delete;
   VideoPlayer& operator=(const VideoPlayer&) = delete;
@@ -83,7 +85,9 @@ class VideoPlayer {
   uint32_t frame_width() const { return width_; }
   uint32_t frame_height() const { return height_; }
   uint32_t current_frame() const { return current_frame_; }
-  uint32_t frame_count() const { return image_mode_ ? images_.frame_count() : file_.frame_count(); }
+  uint32_t frame_count() const {
+    return image_mode_ ? images_.frame_count() : seq_mode() ? static_cast<uint32_t>(seq_dec_of_rank_.count()) : file_.frame_count();
+  }
   // The picture now to be shown (nullptr when nothing is open). The pixels may change at the next update(): copy or
   // draw under no concurrent update, or re-read it when picture_serial() changes.
   const graphics::Surface* picture() const { return state_ == VideoState::Empty ? nullptr : &surface_; }
@@ -109,10 +113,19 @@ class VideoPlayer {
   static void service_main(void* self);
   void release();
   bool decode_frame(uint32_t index);
-  bool all_keyframes() const { return image_mode_ || file_.all_keyframes(); }
+  bool all_keyframes() const { return image_mode_ || (!seq_mode() && file_.all_keyframes()); }
+  bool seq_mode() const { return seq_source_ != SeqSource::None; }
   uint32_t frame_at_time(int64_t time_us) const;
   OpenResult open_images();
+  OpenResult open_mp4(ConstByteView data);
+  bool show_decoded(const hardware::VideoFrame& frame);
+  bool seq_show(uint32_t target);
+  bool seq_packet(uint32_t decode_index, hardware::VideoPacket* packet) const;
+  bool seq_build_avi();
+  bool seq_build_mp4(const media::Mp4Track& track);
+  void seq_clear();
   void open_audio();
+  void start_audio(audio::IPcmSource* source);
   void show_frame(uint32_t target);
   int64_t position_locked();
   void rebase(int64_t position_us);
@@ -128,6 +141,19 @@ class VideoPlayer {
   List<int64_t> frame_starts_;     // when each frame of images_ starts (microseconds), and the end after the last
   media::AudioData decoded_audio_; // a compressed AVI soundtrack, decoded
   bool image_mode_ = false;
+  // Streams whose pictures come out of the decoder later than they go in (H.264): packets are fed in decode order, and
+  // the pictures come back in display order, each display position being a "frame" for the player.
+  enum class SeqSource : uint8_t { None, Avi, Mp4 };
+  SeqSource seq_source_ = SeqSource::None;
+  media::Mp4File mp4_;
+  const media::Mp4Track* mp4_track_ = nullptr;
+  List<uint32_t> seq_dec_of_rank_;  // decode index of the frame at each display position
+  List<uint32_t> seq_rank_of_dec_;
+  List<int64_t> seq_times_;         // when each display position starts, and the end after the last
+  List<uint8_t> seq_sync_;          // per decode index: can start decoding here
+  uint32_t seq_fed_ = 0;            // next packet to feed (decode index)
+  uint32_t seq_next_rank_ = 0;      // display position of the next picture the decoder gives
+  bool seq_started_ = false;
   UniquePointer<hardware::IVideoDecoder> decoder_;
   hardware::VideoFrameBuffer display_;
   graphics::Surface surface_;

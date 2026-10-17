@@ -25,7 +25,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "Hardware/Clock/IClock.hpp"
+#include "Hardware/VideoCodec/ColorConvert.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Media/Mp4.hpp"
 #include "Media/MediaCodecs.hpp"
 #include "Media/Zlib.hpp"
 #include "Video/AviWriter.hpp"
@@ -325,6 +327,7 @@ static void test_fuzz() {
 
 // ---- video: Y4M, the player, and the acceleration-first front door ----
 
+
 static void test_y4m() {
   TestAllocator a;
   Image clip(a), back(a);
@@ -485,6 +488,7 @@ static void test_media_front_door_audio_video() {
   CHECK(detect_video_file(still_webp.view()) == VideoFileFormat::Unknown);
 }
 
+// (the H.264 tests follow the player test)
 static int player_red(const graphics::Surface* s) { return s ? static_cast<int>((s->row(s->height / 2)[s->width / 2] >> 16) & 0xFF) : -1; }
 
 static void test_player_media() {
@@ -576,6 +580,281 @@ static void test_player_media() {
   CHECK(a.live == 0);
 }
 
+
+// ---- H.264 ----
+
+// Feeds a whole stream to a decoder session and hashes the pictures that come out, the way make_video_fixtures.py hashes
+// ffmpeg's: the cropped I420 frames one after the other. With `bgra` set the hashes are those of the converted pictures instead.
+struct H264Run {
+  uint64_t hash = kFnvBasis;
+  uint32_t frames = 0, width = 0, height = 0;
+  uint64_t frame_hash[64];
+  int64_t last_pts = 0;
+};
+
+static void h264_take(hardware::IVideoDecoder& dec, H264Run* run, bool bgra) {
+  hardware::VideoFrame f;
+  while (dec.receive(&f)) {
+    const uint32_t w = f.format.width, h = f.format.height;
+    run->width = w;
+    run->height = h;
+    uint64_t fh = kFnvBasis;
+    if (bgra) {
+      CHECK(f.format.pixel_format == hardware::PixelFormat::Bgra8888);
+      for (uint32_t y = 0; y < h; ++y) fh = fnv(fh, f.plane[0] + uint64_t{y} * f.stride[0], uint64_t{w} * 4);
+    } else {
+      CHECK(f.format.pixel_format == hardware::PixelFormat::I420);
+      for (uint32_t p = 0; p < 3; ++p)
+        for (uint32_t y = 0; y < (p ? h / 2 : h); ++y) {
+          run->hash = fnv(run->hash, f.plane[p] + uint64_t{y} * f.stride[p], p ? w / 2 : w);
+        }
+    }
+    if (run->frames < 64) run->frame_hash[run->frames] = fh;
+    ++run->frames;
+  }
+}
+
+static void h264_feed(hardware::IVideoDecoder& dec, ConstByteView packet, H264Run* run, bool bgra) {
+  hardware::VideoPacket p;
+  p.data = packet;
+  hardware::SubmitResult r = dec.submit(p);
+  if (r == hardware::SubmitResult::Full) {
+    h264_take(dec, run, bgra);
+    r = dec.submit(p);
+  }
+  h264_take(dec, run, bgra);
+}
+
+// Splits an Annex B stream into access units: a slice with first_mb_in_slice 0, or parameter sets / SEI / a delimiter after a slice, starts one.
+static bool next_access_unit(ConstByteView d, uint64_t* pos, ConstByteView* au) {
+  auto start_at = [&](uint64_t k) { return k + 3 <= d.size() && d[k] == 0 && d[k + 1] == 0 && d[k + 2] == 1; };
+  uint64_t i = *pos;
+  while (i < d.size() && !start_at(i)) ++i;
+  if (i >= d.size()) return false;
+  const uint64_t begin = i;
+  bool has_slice = false;
+  while (i < d.size()) {
+    const uint64_t hdr = i + 3;
+    if (hdr >= d.size()) { i = d.size(); break; }
+    const int t = d[hdr] & 31;
+    const bool slice = t == 1 || t == 5;
+    const bool first = slice && hdr + 1 < d.size() && (d[hdr + 1] & 0x80);
+    if (i != begin && ((has_slice && (t == 6 || t == 7 || t == 8 || t == 9)) || (slice && first && has_slice))) break;
+    has_slice = has_slice || slice;
+    uint64_t j = hdr + 1;
+    while (j < d.size() && !start_at(j)) ++j;
+    i = j;
+  }
+  *au = d.subview(begin, i - begin);
+  *pos = i;
+  return true;
+}
+
+// Decodes a fixture (Annex B file, MP4 or AVI) through the CPU codec device; false if the file could not be opened.
+static bool h264_decode_file(allocators::IAllocator& a, ConstByteView data, H264Run* run, bool bgra) {
+  hardware::SoftwareVideoCodec device(a);
+  hardware::DecoderConfig config;
+  config.codec = hardware::VideoCodec::H264;
+  config.output = bgra ? hardware::PixelFormat::Bgra8888 : hardware::PixelFormat::I420;
+  const VideoFileFormat format = detect_video_file(data);
+  if (format == VideoFileFormat::Mp4) {
+    Mp4File mp4(a);
+    if (!mp4.open(data)) return false;
+    const Mp4Track* t = mp4.find(Mp4TrackKind::Video);
+    if (!t) return false;
+    config.codec_config = t->config;
+    UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+    if (!dec) return false;
+    for (uint32_t i = 0; i < t->sample_count; ++i) h264_feed(*dec, mp4.sample(*t, i), run, bgra);
+    dec->flush();
+    h264_take(*dec, run, bgra);
+    return true;
+  }
+  UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+  if (!dec) return false;
+  if (format == VideoFileFormat::Avi) {
+    video::AviFile avi(a);
+    if (!avi.open(data) || avi.video().codec != hardware::VideoCodec::H264) return false;
+    for (uint32_t i = 0; i < avi.frame_count(); ++i) {
+      hardware::VideoPacket p;
+      if (avi.frame(i, &p)) h264_feed(*dec, p.data, run, bgra);
+    }
+  } else {
+    uint64_t pos = 0;
+    ConstByteView au;
+    while (next_access_unit(data, &pos, &au)) h264_feed(*dec, au, run, bgra);
+  }
+  dec->flush();
+  h264_take(*dec, run, bgra);
+  return true;
+}
+
+static void test_h264() {
+  TestAllocator a;
+  FILE* m = fopen("tests/data/manifest_video.txt", "r");
+  CHECK(m != nullptr);
+  if (!m) return;
+  char kind[16], name[96];
+  unsigned w, h, frames;
+  unsigned long long hash;
+  int count = 0;
+  while (fscanf(m, "%15s %95s %u %u %u %llx", kind, name, &w, &h, &frames, &hash) == 6) {
+    char path[160];
+    snprintf(path, sizeof path, "tests/data/%s", name);
+    File file(path);
+    if (!file.data) { printf("missing fixture %s\n", path); ++g_failed; continue; }
+    H264Run run;
+    CHECK(h264_decode_file(a, file.view(), &run, false));
+    if (run.frames != frames || run.width != w || run.height != h || run.hash != hash) {
+      printf("H.264 fixture %s: got %u frames %ux%u hash %016llx, wanted %u frames %ux%u hash %016llx\n", name, run.frames, run.width, run.height,
+             static_cast<unsigned long long>(run.hash), frames, w, h, hash);
+      ++g_failed;
+    }
+    ++count;
+  }
+  fclose(m);
+  CHECK(count >= 10);
+  CHECK(a.live == 0);
+
+  // Refused or damaged input: not an H.264 stream, a stream without parameter sets, pictures before the first IDR.
+  {
+    hardware::SoftwareVideoCodec device(a);
+    hardware::DecoderConfig config;
+    config.codec = hardware::VideoCodec::H264;
+    UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+    CHECK(dec != nullptr);
+    hardware::VideoPacket junk;
+    const uint8_t noise[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    junk.data = ConstByteView(noise, sizeof noise);
+    CHECK(dec->submit(junk) == hardware::SubmitResult::Invalid);
+    File file("tests/data/h264_cavlc.h264");
+    uint64_t pos = 0;
+    ConstByteView sps_au, p_au, p2_au;
+    CHECK(next_access_unit(file.view(), &pos, &sps_au) && next_access_unit(file.view(), &pos, &p_au) && next_access_unit(file.view(), &pos, &p2_au));
+    // The P pictures alone (no sequence parameter set seen) give nothing.
+    hardware::VideoPacket pk;
+    pk.data = p_au;
+    hardware::VideoFrame f;
+    dec->submit(pk);
+    CHECK(!dec->receive(&f));
+    CHECK(dec->output_format().width == 0);
+    // After the IDR picture and a seek (reset) they do not decode either, until the next IDR.
+    pk.data = sps_au;
+    CHECK(dec->submit(pk) == hardware::SubmitResult::Accepted);
+    dec->flush();
+    CHECK(dec->receive(&f) && f.format.width == 90 && f.format.height == 50 && f.keyframe);
+    CHECK(dec->output_format().width == 90 && dec->output_format().height == 50);
+    dec->reset();
+    pk.data = p2_au;
+    dec->submit(pk);
+    dec->flush();
+    CHECK(!dec->receive(&f));
+    CHECK(dec->statistics().frames == 1);
+  }
+  CHECK(a.live == 0);
+}
+
+// Mutated copies of the H.264 fixtures must neither crash nor leak.
+static void test_h264_fuzz() {
+  TestAllocator a;
+  const char* names[] = {"h264_pcm_cavlc.h264", "h264_pcm_cabac.h264", "h264_cavlc.h264", "h264_bframes.h264", "h264_cqm.h264", "h264_noise.h264", "h264_ltr.h264", "h264_bframes.mp4", "h264.avi"};
+  uint32_t seed = 77;
+  auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
+  for (const char* name : names) {
+    char path[160];
+    snprintf(path, sizeof path, "tests/data/%s", name);
+    File file(path);
+    CHECK(file.data != nullptr);
+    if (!file.data) continue;
+    for (int round = 0; round < 25; ++round) {
+      uint8_t* copy = static_cast<uint8_t*>(malloc(file.size));
+      memcpy(copy, file.data, file.size);
+      long len = file.size;
+      switch (round % 4) {
+        case 0: len = rnd() % file.size; break;
+        case 1: for (int k = 0; k < 4; ++k) copy[rnd() % file.size] ^= 1 << (rnd() % 8); break;
+        case 2: for (int k = 0; k < 12; ++k) copy[rnd() % file.size] = static_cast<uint8_t>(rnd()); break;
+        default: for (int k = 0; k < 3; ++k) copy[rnd() % (file.size < 400 ? file.size : 400)] = static_cast<uint8_t>(rnd()); break;
+      }
+      H264Run run;
+      h264_decode_file(a, ConstByteView(copy, len), &run, round & 1);
+      free(copy);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
+// The player on H.264: an MP4 with B frames (frames decoded out of order and shown in order) and an AVI.
+static void test_h264_player() {
+  TestAllocator a;
+  {
+  NoPci pci;
+  hardware::SystemVideoCodecs codecs(pci, a);
+  codecs.initialize();
+  FakeClock clock;
+  video::VideoPlayer player(clock, codecs, a);
+  const struct { const char* name; uint32_t frames; int64_t frame_us; } cases[] = {{"h264_bframes.mp4", 15, 40000}, {"h264.avi", 8, 40000}};
+  for (const auto& c : cases) {
+    char path[160];
+    snprintf(path, sizeof path, "tests/data/%s", c.name);
+    File file(path);
+    CHECK(file.data != nullptr);
+    if (!file.data) continue;
+    H264Run expect;
+    CHECK(h264_decode_file(a, file.view(), &expect, true) && expect.frames == c.frames);
+    CHECK(player.open_media(file.view()) == video::OpenResult::Ok);
+    CHECK(player.frame_count() == c.frames && player.frame_width() == expect.width && player.frame_height() == expect.height);
+    CHECK(player.duration_us() >= int64_t{c.frames} * c.frame_us - 1000 && player.duration_us() <= int64_t{c.frames} * c.frame_us + 1000);
+    auto picture_hash = [&]() {
+      const graphics::Surface* s = player.picture();
+      uint64_t h = kFnvBasis;
+      for (uint32_t y = 0; y < s->height; ++y) h = fnv(h, reinterpret_cast<const uint8_t*>(s->row(y)), uint64_t{s->width} * 4);
+      return h;
+    };
+    CHECK(picture_hash() == expect.frame_hash[0]);
+    // Seeking forwards, backwards and far: each shows the right picture.
+    const uint32_t order[] = {3, 4, 5, 2, 7, 1, 14 % c.frames, 0, c.frames - 1, 6, 6, 5};
+    for (uint32_t f : order) {
+      player.seek(int64_t{f} * c.frame_us + 5000);
+      CHECK(player.current_frame() == f);
+      if (picture_hash() != expect.frame_hash[f]) { printf("%s: wrong picture at frame %u\n", c.name, f); ++g_failed; }
+    }
+    // Playing: the pictures follow the clock.
+    player.stop();
+    clock.now = 5000000;
+    CHECK(player.play());
+    for (uint32_t f = 1; f < c.frames; ++f) {
+      clock.now += c.frame_us;
+      player.update();
+      CHECK(player.current_frame() == f);
+      if (picture_hash() != expect.frame_hash[f]) { printf("%s: wrong picture while playing, frame %u\n", c.name, f); ++g_failed; }
+    }
+    clock.now += 100000;
+    player.update();
+    CHECK(!player.playing());
+    player.close();
+  }
+  // The MP4's AAC soundtrack plays through a mixer: 0.6 s at 22.05 kHz, give or take the codec's priming.
+  {
+    File mp4("tests/data/h264_bframes.mp4");
+    FakeDevice device;
+    audio::AudioMixer mixer(device, a);
+    CHECK(mp4.data != nullptr && mixer.initialize());
+    video::VideoPlayer with_sound(clock, codecs, a, &mixer);
+    CHECK(with_sound.open_media(mp4.view()) == video::OpenResult::Ok && with_sound.has_audio());
+    CHECK(with_sound.audio()->duration() > 22050 * 55 / 100 && with_sound.audio()->duration() < 22050 * 65 / 100);
+    with_sound.seek(240000);
+    CHECK(with_sound.current_frame() == 6);
+    with_sound.close();
+  }
+  // An MP4 without H.264 video (an audio file) is not a video.
+  File m4a("tests/data/mono.m4a");
+  CHECK(m4a.data != nullptr && player.open_media(m4a.view()) == video::OpenResult::Unsupported);
+  player.close();
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_fixtures();
   test_image_roundtrip();
@@ -585,7 +864,10 @@ int main() {
   test_acceleration_and_fallback();
   test_media_front_door_audio_video();
   test_player_media();
+  test_h264();
+  test_h264_player();
   test_fuzz();
+  test_h264_fuzz();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

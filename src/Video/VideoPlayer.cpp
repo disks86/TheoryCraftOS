@@ -39,6 +39,9 @@ void VideoPlayer::release() {
   release_view(allocator_, audio_samples_);
   decoder_.reset();
   decoded_audio_.clear();
+  seq_clear();
+  mp4_.clear();
+  mp4_track_ = nullptr;
   images_.clear();
   frame_starts_.clear();
   image_mode_ = false;
@@ -71,13 +74,17 @@ OpenResult VideoPlayer::open(ConstByteView avi) {
   config.raw_format = info.raw_format;
   decoder_ = codecs_.create_decoder(config);
   if (!decoder_) return OpenResult::NoDecoder;
+  if (info.codec == VideoCodec::H264 && !seq_build_avi()) {
+    release();
+    return OpenResult::OutOfMemory;
+  }
 
   // The first picture tells the real size (the stream's headers win over the container's).
   width_ = info.width;
   height_ = info.height;
-  duration_us_ = file_.duration_us();
+  duration_us_ = seq_mode() ? seq_times_[seq_times_.count() - 1] : file_.duration_us();
   current_frame_ = 0;
-  if (!decode_frame(0)) {
+  if (!(seq_mode() ? seq_show(0) : decode_frame(0))) {
     release();
     return OpenResult::NoDecoder;
   }
@@ -114,6 +121,10 @@ void VideoPlayer::open_audio() {
     if (!built || !media::decode_wav(wav.view(), &decoded_audio_)) return;
     source = decoded_audio_.source();
   }
+  start_audio(source);
+}
+
+void VideoPlayer::start_audio(audio::IPcmSource* source) {
   audio_player_ = UniquePointer<audio::AudioPlayer>::make(allocator_, *mixer_, allocator_);
   if (!source || !audio_player_ || !audio_player_->open(source)) {
     audio_player_.reset();
@@ -144,8 +155,15 @@ bool VideoPlayer::decode_frame(uint32_t index) {
   }
   if (result != SubmitResult::Accepted || !decoder_->receive(&frame)) return false;
   ++decoded_;
+  if (!show_decoded(frame)) return false;
+  current_frame_ = index;
+  return true;
+}
+
+// Makes a decoded picture the one on show.
+bool VideoPlayer::show_decoded(const VideoFrame& frame) {
   const VideoFormat& f = frame.format;
-  if (f.width != width_ || f.height != height_ || !display_.valid()) {
+  if (f.width != width_ || f.height != height_ || !display_.valid() || display_.format().width != f.width || display_.format().height != f.height) {
     if (!display_.allocate({f.width, f.height, PixelFormat::Bgra8888})) return false;
     width_ = f.width;
     height_ = f.height;
@@ -155,7 +173,6 @@ bool VideoPlayer::decode_frame(uint32_t index) {
     surface_.pitch = f.width;
   }
   if (!convert_to_bgra(frame, reinterpret_cast<uint32_t*>(display_.plane(0).data()), width_)) return false;
-  current_frame_ = index;
   ++serial_;
   return true;
 }
@@ -163,6 +180,10 @@ bool VideoPlayer::decode_frame(uint32_t index) {
 // Brings the picture to frame `target`. A codec whose pictures all stand alone jumps there; one that builds on earlier
 // pictures decodes every frame since the last keyframe it can reach.
 void VideoPlayer::show_frame(uint32_t target) {
+  if (seq_mode()) {
+    seq_show(target);
+    return;
+  }
   if (all_keyframes()) {
     if (target > current_frame_ + 1) skipped_ += target - current_frame_ - 1;
     decode_frame(target);
@@ -180,16 +201,154 @@ void VideoPlayer::show_frame(uint32_t target) {
 }
 
 uint32_t VideoPlayer::frame_at_time(int64_t time_us) const {
-  if (!image_mode_) return file_.frame_at_time(time_us);
-  const uint64_t n = images_.frame_count();
+  if (!image_mode_ && !seq_mode()) return file_.frame_at_time(time_us);
+  const List<int64_t>& starts = image_mode_ ? frame_starts_ : seq_times_;
+  const uint64_t n = image_mode_ ? images_.frame_count() : seq_dec_of_rank_.count();
   if (n == 0 || time_us <= 0) return 0;
   uint64_t lo = 0, hi = n - 1;  // the last frame that starts at or before time_us
   while (lo < hi) {
     const uint64_t mid = (lo + hi + 1) / 2;
-    if (frame_starts_[mid] <= time_us) lo = mid;
+    if (starts[mid] <= time_us) lo = mid;
     else hi = mid - 1;
   }
   return static_cast<uint32_t>(lo);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Streams with picture reordering (H.264)
+
+void VideoPlayer::seq_clear() {
+  seq_source_ = SeqSource::None;
+  seq_dec_of_rank_.clear();
+  seq_rank_of_dec_.clear();
+  seq_times_.clear();
+  seq_sync_.clear();
+  seq_fed_ = seq_next_rank_ = 0;
+  seq_started_ = false;
+}
+
+bool VideoPlayer::seq_packet(uint32_t decode_index, VideoPacket* packet) const {
+  if (seq_source_ == SeqSource::Avi) return file_.frame(decode_index, packet);
+  if (seq_source_ != SeqSource::Mp4 || !mp4_track_) return false;
+  const ConstByteView sample = mp4_.sample(*mp4_track_, decode_index);
+  if (sample.empty()) return false;
+  packet->data = sample;
+  packet->pts_us = 0;
+  packet->keyframe = seq_sync_[decode_index] != 0;
+  return true;
+}
+
+// An AVI file's frames are stored in display order already (the codec holds pictures back by itself).
+bool VideoPlayer::seq_build_avi() {
+  const uint32_t n = file_.frame_count();
+  if (n == 0) return false;
+  for (uint32_t i = 0; i < n; ++i) {
+    if (!seq_dec_of_rank_.push_back(i) || !seq_rank_of_dec_.push_back(i) || !seq_times_.push_back(file_.frame_time_us(i)) ||
+        !seq_sync_.push_back(file_.keyframe_at_or_before(i) == i ? 1 : 0))
+      return false;
+  }
+  if (!seq_times_.push_back(file_.frame_time_us(n))) return false;
+  seq_source_ = SeqSource::Avi;
+  return true;
+}
+
+// An MP4 track: samples are in decode order; their composition times give the display order.
+bool VideoPlayer::seq_build_mp4(const media::Mp4Track& track) {
+  const uint32_t n = track.sample_count;
+  if (n == 0 || track.timescale == 0) return false;
+  List<int64_t> cts(allocator_);
+  List<uint32_t> scratch(allocator_);
+  if (!cts.reserve(n) || !scratch.reserve(n) || !seq_dec_of_rank_.reserve(n) || !seq_rank_of_dec_.reserve(n) || !seq_sync_.reserve(n) ||
+      !seq_times_.reserve(n + 1))
+    return false;
+  for (uint32_t i = 0; i < n; ++i) {
+    const int64_t t = track.dts[i] + (track.cts_offsets.empty() ? 0 : track.cts_offsets[i]);
+    if (!cts.push_back(t) || !seq_dec_of_rank_.push_back(i) || !scratch.push_back(i) || !seq_rank_of_dec_.push_back(0) ||
+        !seq_sync_.push_back(track.sync.empty() || track.sync[i] ? 1 : 0))
+      return false;
+  }
+  // Stable merge sort of the decode indices by composition time.
+  uint32_t* a = &seq_dec_of_rank_[0];
+  uint32_t* b = &scratch[0];
+  for (uint64_t width = 1; width < n; width *= 2) {
+    for (uint64_t lo = 0; lo < n; lo += 2 * width) {
+      const uint64_t mid = lo + width < n ? lo + width : n, hi = lo + 2 * width < n ? lo + 2 * width : n;
+      uint64_t i = lo, j = mid, k = lo;
+      while (i < mid && j < hi) b[k++] = cts[a[j]] < cts[a[i]] ? a[j++] : a[i++];
+      while (i < mid) b[k++] = a[i++];
+      while (j < hi) b[k++] = a[j++];
+    }
+    uint32_t* t = a;
+    a = b;
+    b = t;
+  }
+  if (a != &seq_dec_of_rank_[0])
+    for (uint32_t i = 0; i < n; ++i) seq_dec_of_rank_[i] = a[i];
+  const int64_t scale = track.timescale;
+  int64_t previous = 0;
+  for (uint32_t r = 0; r < n; ++r) {
+    const uint32_t d = seq_dec_of_rank_[r];
+    seq_rank_of_dec_[d] = r;
+    int64_t t = (cts[d] - track.skip) * 1000000 / scale;
+    if (t < previous) t = previous;
+    previous = t;
+    if (!seq_times_.push_back(t)) return false;
+  }
+  int64_t last = n >= 2 ? (track.dts[n - 1] - track.dts[n - 2]) * 1000000 / scale : 33333;
+  if (last <= 0) last = 33333;
+  int64_t end = seq_times_[n - 1] + last;
+  if (track.play_duration >= 0 && track.play_duration * 1000000 / scale < end && track.play_duration * 1000000 / scale > seq_times_[n - 1])
+    end = track.play_duration * 1000000 / scale;
+  if (!seq_times_.push_back(end)) return false;
+  seq_source_ = SeqSource::Mp4;
+  mp4_track_ = &track;
+  return true;
+}
+
+// Brings the picture to display position `target`: continues decoding where the decoder is, or (after going back or
+// a long jump forward) restarts from the sync sample at or before it.
+bool VideoPlayer::seq_show(uint32_t target) {
+  const uint32_t n = static_cast<uint32_t>(seq_dec_of_rank_.count());
+  if (n == 0 || !decoder_) return false;
+  if (target >= n) target = n - 1;
+  if (have_picture_ && seq_started_ && target == current_frame_) return true;
+  auto sync_rank_at_or_before = [&](uint32_t rank) {
+    while (rank > 0 && !seq_sync_[seq_dec_of_rank_[rank]]) --rank;
+    return rank;
+  };
+  bool restart = !seq_started_ || target < seq_next_rank_;
+  if (!restart && target - seq_next_rank_ > kMaxCatchUpFrames) {
+    if (sync_rank_at_or_before(target) > seq_next_rank_) restart = true;
+  }
+  if (restart) {
+    const uint32_t rank = sync_rank_at_or_before(target);
+    decoder_->reset();
+    seq_fed_ = seq_dec_of_rank_[rank];
+    seq_next_rank_ = rank;
+    seq_started_ = true;
+  }
+  VideoFrame frame;
+  bool shown = false;
+  while (seq_next_rank_ <= target) {
+    if (!decoder_->receive(&frame)) {
+      if (seq_fed_ >= n) {
+        decoder_->flush();
+        if (!decoder_->receive(&frame)) break;
+      } else {
+        VideoPacket packet;
+        const uint32_t d = seq_fed_++;
+        if (!seq_packet(d, &packet)) continue;
+        if (decoder_->submit(packet) == SubmitResult::Full) break;
+        continue;
+      }
+    }
+    ++decoded_;
+    if (seq_next_rank_ == target) shown = show_decoded(frame);
+    else if (seq_next_rank_ > current_frame_ || !have_picture_) ++skipped_;
+    ++seq_next_rank_;
+  }
+  current_frame_ = target;  // if no picture came, the old one stays up
+  return shown;
 }
 
 // Takes the Y4M/GIF/APNG frames in images_ as the video: a picture surface, and when each frame starts.
@@ -220,6 +379,7 @@ OpenResult VideoPlayer::open_images() {
 OpenResult VideoPlayer::open_media(ConstByteView data) {
   const media::VideoFileFormat format = media::detect_video_file(data);
   if (format == media::VideoFileFormat::Avi) return open(data);
+  if (format == media::VideoFileFormat::Mp4) return open_mp4(data);
   kernel::ScopedMutex guard(mutex_);
   release();
   // GIF, APNG and Y4M are videos; any other picture format opens as a video of one frame.
@@ -228,6 +388,41 @@ OpenResult VideoPlayer::open_media(ConstByteView data) {
   const OpenResult result = open_images();
   if (result != OpenResult::Ok) release();
   return result;
+}
+
+// An MP4 / MOV file: its H.264 video track, and its audio track (AAC or MP3) decoded up front.
+OpenResult VideoPlayer::open_mp4(ConstByteView data) {
+  kernel::ScopedMutex guard(mutex_);
+  release();
+  if (!mp4_.open(data)) return OpenResult::Unsupported;
+  const media::Mp4Track* track = mp4_.find(media::Mp4TrackKind::Video);
+  if (!track) return OpenResult::Unsupported;
+  const uint32_t avc1 = 0x61766331, avc3 = 0x61766333;
+  if ((track->codec != avc1 && track->codec != avc3) || track->config.empty()) return OpenResult::NoDecoder;
+  DecoderConfig config;
+  config.codec = VideoCodec::H264;
+  config.width = track->width;
+  config.height = track->height;
+  config.output = PixelFormat::Bgra8888;
+  config.codec_config = track->config;
+  decoder_ = codecs_.create_decoder(config);
+  if (!decoder_) return OpenResult::NoDecoder;
+  if (!seq_build_mp4(*track)) {
+    release();
+    return OpenResult::OutOfMemory;
+  }
+  width_ = track->width;
+  height_ = track->height;
+  duration_us_ = seq_times_[seq_times_.count() - 1];
+  current_frame_ = 0;
+  if (!seq_show(0)) {
+    release();
+    return OpenResult::NoDecoder;
+  }
+  have_picture_ = true;
+  if (mixer_ && media::decode_mp4_audio(data, &decoded_audio_)) start_audio(decoded_audio_.source());
+  state_ = VideoState::Stopped;
+  return OpenResult::Ok;
 }
 
 void VideoPlayer::rebase(int64_t position_us) {

@@ -354,10 +354,15 @@ static void test_sessions() {
   {
     SoftwareVideoCodec device(a);
     CHECK(device.initialize() && !device.info().hardware_engine && !device.info().accelerated);
-    CHECK(device.can_decode(VideoCodec::Mjpeg) && device.can_encode(VideoCodec::Raw) && !device.can_decode(VideoCodec::H264) && !device.can_encode(VideoCodec::Av1));
+    CHECK(device.can_decode(VideoCodec::Mjpeg) && device.can_encode(VideoCodec::Raw) && device.can_decode(VideoCodec::H264) && !device.can_encode(VideoCodec::H264) && !device.can_decode(VideoCodec::Hevc) && !device.can_encode(VideoCodec::Av1));
     DecoderConfig h264;
     h264.codec = VideoCodec::H264;
-    CHECK(!device.create_decoder(h264));
+    CHECK(device.create_decoder(h264));  // an Annex B stream: the parameter sets come with the pictures
+    h264.codec_config = ConstByteView(reinterpret_cast<const uint8_t*>("junk"), 4);
+    CHECK(!device.create_decoder(h264));  // not an avcC record
+    DecoderConfig hevc;
+    hevc.codec = VideoCodec::Hevc;
+    CHECK(!device.create_decoder(hevc));
     EncoderConfig bad;
     bad.codec = VideoCodec::Mjpeg;
     bad.width = 0; bad.height = 10;
@@ -468,7 +473,7 @@ static void test_system_list() {
     CHECK(system.at(0)->info().hardware_engine && !system.at(0)->info().accelerated && strstr(system.at(0)->name(), "NVIDIA"));
     CHECK(!system.at(1)->info().hardware_engine && strcmp(system.at(1)->name(), "Software video codec") == 0);
     CHECK(system.at(2) == nullptr);
-    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg)));
+    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264)));
     DecoderConfig dc;
     dc.codec = VideoCodec::Mjpeg;
     CHECK(system.create_decoder(dc));

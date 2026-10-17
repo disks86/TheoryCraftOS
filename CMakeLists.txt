@@ -232,6 +232,11 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
   src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
   src/Hardware/VideoCodec/Software/JpegDecoder.cpp
+  src/Hardware/VideoCodec/Software/H264Syntax.cpp
+  src/Hardware/VideoCodec/Software/H264Macroblock.cpp
+  src/Hardware/VideoCodec/Software/H264Cabac.cpp
+  src/Hardware/VideoCodec/Software/H264Predict.cpp
+  src/Hardware/VideoCodec/Software/H264Deblock.cpp
   src/Hardware/VideoCodec/Software/JpegEncoder.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp

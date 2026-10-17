@@ -18,6 +18,7 @@
 
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Hardware/VideoCodec/ColorConvert.hpp"
+#include "Hardware/VideoCodec/Software/H264.hpp"
 #include "Hardware/VideoCodec/Software/Jpeg.hpp"
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 
@@ -119,6 +120,52 @@ class RawDecoder final : public IVideoDecoder {
   VideoCodecStatistics stats_;
 };
 
+// Decodes H.264: packets are access units; pictures come out in display order, a few packets late.
+class H264Adapter final : public IVideoDecoder {
+ public:
+  H264Adapter(allocators::IAllocator& allocator, const DecoderConfig& config) : config_(config), dec_(allocator), out_(allocator) {}
+
+  bool prepare() { return config_.codec_config.empty() || dec_.configure(config_.codec_config); }
+
+  VideoCodec codec() const override { return VideoCodec::H264; }
+  SubmitResult submit(const VideoPacket& packet) override {
+    if (dec_.ready()) return SubmitResult::Full;
+    if (!dec_.decode(packet.data, packet.pts_us)) {
+      ++stats_.errors;
+      return SubmitResult::Invalid;
+    }
+    ++stats_.packets;
+    stats_.bytes += packet.data.size();
+    return SubmitResult::Accepted;
+  }
+  bool receive(VideoFrame* frame) override {
+    VideoFrame in;
+    if (!dec_.receive(&in)) return false;
+    if (!out_.allocate({in.format.width, in.format.height, config_.output}) || !convert_frame(in, out_)) {
+      ++stats_.errors;
+      return false;
+    }
+    *frame = out_.frame(in.pts_us, in.keyframe);
+    frame->limited_range = in.limited_range && config_.output != PixelFormat::Bgra8888;
+    ++stats_.frames;
+    return true;
+  }
+  void flush() override { dec_.flush(); }
+  void reset() override { dec_.reset(); }
+  VideoFormat output_format() const override {
+    VideoFormat f = dec_.output_format();
+    f.pixel_format = config_.output;
+    return f;
+  }
+  VideoCodecStatistics statistics() const override { return stats_; }
+
+ private:
+  DecoderConfig config_;
+  H264Decoder dec_;
+  VideoFrameBuffer out_;
+  VideoCodecStatistics stats_;
+};
+
 class MjpegEncoder final : public IVideoEncoder {
  public:
   MjpegEncoder(allocators::IAllocator& allocator, const EncoderConfig& config) : config_(config), jpeg_(allocator) {}
@@ -210,6 +257,11 @@ class RawEncoder final : public IVideoEncoder {
 
 UniquePointer<IVideoDecoder> SoftwareVideoCodec::create_decoder(const DecoderConfig& config) {
   if (config.codec == VideoCodec::Mjpeg) return UniquePointer<IVideoDecoder>(UniquePointer<MjpegDecoder>::make(allocator_, allocator_, config));
+  if (config.codec == VideoCodec::H264) {
+    UniquePointer<H264Adapter> avc = UniquePointer<H264Adapter>::make(allocator_, allocator_, config);
+    if (avc && avc->prepare()) return UniquePointer<IVideoDecoder>(util::move(avc));
+    return UniquePointer<IVideoDecoder>();
+  }
   if (config.codec == VideoCodec::Raw) {
     UniquePointer<RawDecoder> raw = UniquePointer<RawDecoder>::make(allocator_, allocator_, config);
     if (raw && raw->prepare()) return UniquePointer<IVideoDecoder>(util::move(raw));

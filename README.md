@@ -81,18 +81,31 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   range). `Software/SoftwareVideoCodec` really decodes and encodes **Motion JPEG** (`Jpeg.hpp`: a baseline JPEG decoder - any
   sampling up to 2x2, restart markers, several scans - using the IJG accurate integer DCT, bit-exact with a reference decoder
   on 4:4:4 and grey, and an encoder with per-picture optimal Huffman tables, quality 1-100, 4:2:0) and **raw** I420/NV12/BGRA
-  frames. The vendor classes `NVIDIA/NvidiaVideoEngine` (NVDEC/NVENC), `AMD/AmdVcnVideoEngine` (VCN) and
+  frames, and decodes **H.264 / AVC** (`H264.hpp`, see below). The vendor classes `NVIDIA/NvidiaVideoEngine` (NVDEC/NVENC), `AMD/AmdVcnVideoEngine` (VCN) and
   `Intel/IntelMediaVideoEngine` (Quick Sync) are what `SystemVideoCodecs` creates for a display controller of that vendor: they
   report `info().hardware_engine` but `accelerated` stays false - this OS does not drive those engines, so their sessions run on
-  the CPU and **H.264, H.265, VP9 and AV1 are not available** until a native driver exists (that is where it goes). Not covered:
-  arithmetic JPEG, B-frame reordering is in the interface but unused, capture devices.
+  the CPU, and **H.265, VP9 and AV1 are not available** (and H.264 can only be decoded, not encoded) until a native driver exists
+  (that is where it goes). Not covered: arithmetic JPEG, capture devices.
+  The H.264 decoder (`H264*.cpp`, about 3,700 lines, integer only) covers Baseline, Main and High profile 8-bit 4:2:0 progressive video:
+  CAVLC and CABAC, I/P/B slices, 4x4 and 8x8 transforms, quantisation matrices, intra 4x4/8x8/16x16, quarter-sample motion with
+  multiple reference frames, spatial and temporal direct prediction, explicit and implicit weighted prediction, long-term
+  references and reference list modification, multiple slices, I_PCM, frame cropping and the deblocking filter.
+  Annex B streams (parameter sets in the stream) or, after `DecoderConfig::codec_config` is given an avcC record, length-prefixed
+  NAL units as stored in MP4. Pictures come out in display order a few packets late (`flush()` drains them). **Not covered:**
+  interlaced coding (field pictures, MBAFF), flexible macroblock ordering, data partitioning, SP/SI slices, lossless
+  (transform bypass), bit depths above 8 and 4:2:2/4:4:4. It was checked bit for bit against ffmpeg on x264 streams (CAVLC and CABAC,
+  B pyramids, weighted prediction, both direct modes, 8x8 transform, quantisation matrices, slices, constrained intra, noise at
+  QP 8, odd sizes, open GOP, intra refresh) and on OpenH264 streams (long-term references, reordering), and fuzzed under ASAN/UBSAN.
   `tests/VideoCodecTest.cpp` includes a fuzz run of the JPEG decoder under ASAN/UBSAN.
-- `src/Video/`: `AviFile` reads an in-memory AVI (video stream: MJPG, I420/NV12, or a named codec such as H264 flagged for the
+- `src/Video/`: `AviFile` reads an in-memory AVI (video stream: MJPG, I420/NV12, H264 as Annex B frames, or another named codec flagged for the
   decoders; PCM audio; frames found by scanning `movi`, keyframes from `idx1`), `AviWriter` builds one, and `VideoPlayer` plays it:
   a decoder session from `SystemVideoCodecs`, the audio through an `audio::AudioPlayer` whose position is the clock (picture
   frames are skipped when decoding falls behind; without sound the system clock is used), play/pause/stop/seek (back to the
-  nearest keyframe for inter-coded streams)/loop, a BGRA picture with a serial number. `OpenResult::NoDecoder` is what an H.264
-  file gets today. `tests/VideoPlayerTest.cpp` covers it with a fake clock and audio device.
+  nearest keyframe for inter-coded streams)/loop, a BGRA picture with a serial number. Streams that hold pictures back (H.264) are
+  played in display order: packets are fed in decode order, and the player keeps a table from display position to sample, so
+  seeking restarts at the sync sample before the target. `open_media()` also plays **MP4 / MOV** files: H.264 video (B frames,
+  edit lists) with the AAC or MP3 soundtrack decoded up front; `OpenResult::NoDecoder` is what H.265 and the like get.
+  `tests/VideoPlayerTest.cpp` covers it with a fake clock and audio device.
 - `src/Media/`: picture, sound and video **file formats**, all in software, with hardware used first where there is any.
   `MediaCodecs` is the front door (`decode_image`/`encode_image`/`decode_audio`/`encode_audio`/`decode_video`): JPEG goes to a
   video codec device that really accelerates Motion JPEG (`info().accelerated`, found through `SystemVideoCodecs`; sessions are
@@ -110,13 +123,15 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   - Sound: WAV (PCM 8-32 bit, float, A-law, mu-law, IMA and Microsoft ADPCM, extensible), AIFF/AIFC, AU, FLAC (full decoder
     with CRC checks; fixed-predictor encoder), MPEG audio (MP3 = Layer III, MPEG-1/2/2.5, mono/stereo/joint/intensity stereo, ID3v2, gapless trimming from the LAME tag; also
     Layers I and II; decoder ported from the CC0 minimp3, within two 16-bit steps of ffmpeg's), Ogg Vorbis (decoder only: codebooks, floor 1, residue 0-2, channel coupling,
-    FFT-based IMDCT; within one 16-bit step of ffmpeg's output; floor type 0 and chained streams are not handled). Encoders
-    write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: AAC, Opus, H.264/HEVC/VP9/AV1 video.**
+    FFT-based IMDCT; within one 16-bit step of ffmpeg's output; floor type 0 and chained streams are not handled), AAC-LC (ADTS `.aac`,
+    and the audio of MP4 / M4A / MOV files through the `Mp4` container reader: all of ISO 14496-3's LC tools - long and short blocks,
+    window shapes, M/S and intensity stereo, PNS, TNS, pulse data - decoded to the front channel pair, within two 16-bit steps of ffmpeg's output; Main, LTP, SBR/HE-AAC and
+    fragmented MP4 are not handled; MP3 inside MP4 works too). Encoders write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: Opus, HEVC/VP9/AV1 video.**
   - Video files: `VideoFiles` reads GIF, APNG, animated WebP and Y4M (4:2:0/4:2:2/4:4:4/mono) as frames with their own durations, which
-    `VideoPlayer::open_media()` plays (AVI as before, now also with A-law, mu-law and ADPCM soundtracks; a still picture opens
-    as a one-frame video).
+    `VideoPlayer::open_media()` plays (AVI as before, now also with A-law, mu-law and ADPCM soundtracks and H.264 video; MP4 / MOV
+    with H.264; a still picture opens as a one-frame video).
   `tests/MediaTest.cpp` checks every decoder against fixtures in `tests/data/` whose expected output comes from Pillow/ffmpeg
-  (`tests/data/make_fixtures.py` regenerates them), plus encoder round trips, the accelerated-device/fallback logic with a
+  (`tests/data/make_fixtures.py` regenerates them; `make_video_fixtures.py` the H.264 streams), plus encoder round trips, the accelerated-device/fallback logic with a
   fake engine, the player, and a fuzz run (truncation, bit flips, noise behind each signature) under ASAN/UBSAN. The Vorbis, WebP and TIFF decoders were
   also checked against libvorbis-, libwebp- and ImageMagick-encoded files with many settings.
 - `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
