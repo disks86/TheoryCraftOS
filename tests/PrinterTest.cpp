@@ -29,12 +29,16 @@
 #include "Hardware/Printer/Usb/UsbPrinter.hpp"
 #include "Hardware/Printer/PrinterMonitor.hpp"
 #include "Network/Snmp/SnmpUsm.hpp"
+#include "Hardware/Printer/IppPrinter.hpp"
+#include "Network/Ipp/IppMessage.hpp"
+#include <set>
 #include "Hardware/Printer/PrinterAlertListener.hpp"
 #include <algorithm>
 #include <map>
 #include "NetworkHarness.hpp"
 
 using namespace hardware;
+using namespace network::ipp;
 
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
@@ -271,7 +275,7 @@ static void test_text() {
 }
 
 // Runs the fake network until `done` or a deadline, also polling the printer.
-static bool pump(Lan& lan, NetworkPrinter& printer, const std::function<bool()>& done, int max_ms = 60000) {
+static bool pump(Lan& lan, IPrinter& printer, const std::function<bool()>& done, int max_ms = 60000) {
   for (int i = 0; i < max_ms; ++i) {
     if (done()) return true;
     lan.step();
@@ -1393,6 +1397,322 @@ static void test_printer_alerts() {
   printers.shutdown();
 }
 
+// ---- IPP
+
+static std::string unhex_string(const char* hex) {
+  std::string out;
+  auto nib = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+  for (size_t i = 0; hex[i] && hex[i + 1]; i += 2) out.push_back(static_cast<char>(nib(hex[i]) * 16 + nib(hex[i + 1])));
+  return out;
+}
+
+// A scripted IPP printer on stack B. Every request arrives on its own connection; the framing of the answers rotates through
+// Content-Length, chunked and "until the connection closes".
+struct FakeIppServer {
+  struct Conn { SharedPointer<ITcpSocket> socket; std::string data; bool answered = false; };
+  Lan& lan;
+  std::vector<Conn> conns;
+  std::vector<std::string> documents;      // what each Print-Job carried after its attributes
+  std::vector<uint16_t> operations;
+  std::vector<std::string> request_lines;
+  std::string last_printer_uri, last_format, last_job_name;
+  uint32_t served = 0;
+  int busy_answers = 0;                    // answer the next Print-Jobs with server-error-busy
+  uint32_t http_status = 200;
+  bool garbage = false;                    // answer with something that is not IPP
+  uint32_t unsupported_format = 0;         // refuse Print-Jobs outright (client-error-document-format-not-supported)
+
+  explicit FakeIppServer(Lan& l) : lan(l) {}
+
+  void respond(Conn& c, const std::string& body) {
+    std::string out;
+    const uint32_t mode = served++ % 3;
+    if (http_status != 200) out = "HTTP/1.1 " + std::to_string(http_status) + " Nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    else if (mode == 0) out = "HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\ncontent-length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    else if (mode == 1) {
+      out = "HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nTransfer-Encoding: chunked\r\n\r\n";
+      for (size_t i = 0; i < body.size(); i += 37) {
+        const std::string piece = body.substr(i, 37);
+        char n[16];
+        snprintf(n, sizeof n, "%zX", piece.size());
+        out += std::string(n) + "\r\n" + piece + "\r\n";
+      }
+      out += "0\r\n\r\n";
+    } else out = "HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nConnection: close\r\n\r\n" + body;
+    c.data = out;   // from here on the unsent remainder
+    c.answered = true;
+  }
+
+  void step(Server& s) {
+    while (SharedPointer<ITcpSocket> k = s.listener->accept()) conns.push_back({k, "", false});
+    for (Conn& c : conns) {
+      if (!c.socket) continue;
+      if (c.answered) {
+        if (!c.data.empty()) c.data.erase(0, c.socket->send(ConstByteView(reinterpret_cast<const uint8_t*>(c.data.data()), c.data.size())));
+        if (c.data.empty()) { c.socket->close(); c.socket = SharedPointer<ITcpSocket>(); }
+        continue;
+      }
+      uint8_t b[512];
+      for (uint32_t n; (n = c.socket->receive(ByteView(b))) > 0;) c.data.append(reinterpret_cast<char*>(b), n);
+      const size_t end = c.data.find("\r\n\r\n");
+      const size_t at = c.data.find("Content-Length: ");
+      if (end == std::string::npos || at == std::string::npos) continue;
+      const size_t length = strtoul(c.data.c_str() + at + 16, nullptr, 10);
+      if (c.data.size() < end + 4 + length) continue;
+      request_lines.push_back(c.data.substr(0, c.data.find("\r\n")));
+      handle(c, c.data.substr(end + 4, length));
+    }
+  }
+
+  void handle(Conn& c, const std::string& body) {
+    ByteBuffer out(lan.alloc);
+    if (garbage) return respond(c, "this is not ipp at all");
+    Response request;   // (a request decodes the same way: the operation sits where a response has its status)
+    uint32_t used = 0;
+    if (!decode_response(ConstByteView(reinterpret_cast<const uint8_t*>(body.data()), body.size()), &request, &used)) {
+      RequestBuilder bad(out, 0x0400, 0);
+      bad.standard_operation_attributes();
+      bad.finish();
+      return respond(c, std::string(reinterpret_cast<const char*>(out.view().data()), out.size()));
+    }
+    const uint16_t op = request.status;
+    operations.push_back(op);
+    if (const Attribute* a = request.find("printer-uri")) last_printer_uri = a->text;
+    RequestBuilder b(out, 0x0000, request.request_id);
+    switch (op) {
+      case kPrintJob: {
+        if (const Attribute* a = request.find("document-format")) last_format = a->text;
+        if (const Attribute* a = request.find("job-name")) last_job_name = a->text;
+        if (busy_answers > 0) {
+          --busy_answers;
+          out.clear();
+          RequestBuilder busy(out, 0x0507, request.request_id);
+          busy.standard_operation_attributes();
+          busy.finish();
+          break;
+        }
+        if (unsupported_format) {
+          out.clear();
+          RequestBuilder no(out, 0x040a, request.request_id);
+          no.standard_operation_attributes();
+          no.finish();
+          break;
+        }
+        documents.push_back(body.substr(used));
+        b.standard_operation_attributes();
+        b.group(kGroupJob);
+        b.add_integer(kTagInteger, "job-id", 40 + static_cast<int32_t>(documents.size()));
+        b.add_string(kTagUri, "job-uri", "ipp://10.0.0.2/ipp/print/42");
+        b.add_integer(kTagEnum, "job-state", 3);
+        b.finish();
+        break;
+      }
+      case kGetPrinterAttributes:
+        b.standard_operation_attributes();
+        b.group(kGroupPrinter);
+        b.add_integer(kTagEnum, "printer-state", 4);
+        b.add_string(kTagKeyword, "printer-state-reasons", "toner-low-warning");
+        b.add_more_string(kTagKeyword, "media-jam-error");
+        b.add_more_string(kTagKeyword, "door-open-report");
+        b.add_string(kTagText, "printer-state-message", "Toner low");
+        b.add_string(kTagText, "printer-make-and-model", "Brother HL-2070N series");
+        b.add_string(kTagText, "printer-device-id", "MFG:Brother;CMD:PJL,PCL,PCLXL;MDL:HL-2070N;CLS:PRINTER;SN:U63083H1J123456;");
+        b.add_string(kTagName, "marker-names", "Black Toner Cartridge");
+        b.add_more_string(kTagName, "Drum Unit");
+        b.add_more_string(kTagName, "Waste Toner");
+        b.add_string(kTagKeyword, "marker-types", "toner-cartridge");
+        b.add_more_string(kTagKeyword, "opc");
+        b.add_more_string(kTagKeyword, "waste-toner");
+        b.add_integer(kTagInteger, "marker-levels", 7);
+        b.add_more_integer(kTagInteger, 80);
+        b.add_more_integer(kTagInteger, 95);
+        b.finish();
+        break;
+      case kGetJobs:
+        b.standard_operation_attributes();
+        b.group(kGroupJob);
+        b.add_integer(kTagInteger, "job-id", 42);
+        b.add_integer(kTagEnum, "job-state", 5);
+        b.add_string(kTagName, "job-name", "report.pdf");
+        b.add_integer(kTagInteger, "job-k-octets", 120);
+        b.group(kGroupJob);
+        b.add_integer(kTagInteger, "job-id", 43);
+        b.add_integer(kTagEnum, "job-state", 3);
+        b.add_string(kTagName, "job-name", "letter");
+        b.finish();
+        break;
+      case kCancelJob: {
+        const Attribute* id = request.find("job-id");
+        out.clear();
+        RequestBuilder r(out, id && (id->integer == 42 || id->integer == 43) ? 0x0000 : 0x0406, request.request_id);
+        r.standard_operation_attributes();
+        r.finish();
+        break;
+      }
+      default: {
+        out.clear();
+        RequestBuilder r(out, 0x0501, request.request_id);   // server-error-operation-not-supported
+        r.standard_operation_attributes();
+        r.finish();
+      }
+    }
+    respond(c, std::string(reinterpret_cast<const char*>(out.view().data()), out.size()));
+  }
+};
+
+static void test_ipp() {
+  // The encoder against bytes laid out by hand (independently, in Python): header, three groups of attribute encodings, 1setOf, integer, boolean.
+  {
+    TestAllocator alloc;
+    ByteBuffer buf(alloc);
+    RequestBuilder b(buf, kGetPrinterAttributes, 1);
+    CHECK(b.standard_operation_attributes() && b.add_string(kTagUri, "printer-uri", "ipp://h/p") && b.add_string(kTagKeyword, "requested-attributes", "printer-state") &&
+          b.add_more_string(kTagKeyword, "job-id") && b.add_integer(kTagInteger, "copies", -2) && b.add_boolean("x", true) && b.finish());
+    const std::string want = unhex_string(
+        "0101000b0000000101470012617474726962757465732d6368617273657400057574662d3848001b617474726962757465732d6e61747572616c2d6c616e67756167650002656e45000b7072696e7465722d75726900096970703a2f2f682f704400147265717565737465642d61747472696275746573000d7072696e7465722d737461746544000000066a6f622d6964210006636f706965730004fffffffe2200017800010103");
+    CHECK(std::string(reinterpret_cast<const char*>(buf.view().data()), buf.size()) == want);
+    Response r;
+    uint32_t used = 0;
+    CHECK(decode_response(buf.view(), &r, &used) && used == buf.size() && r.status == kGetPrinterAttributes && r.request_id == 1);
+    CHECK(r.value_count("requested-attributes") == 2 && r.find("requested-attributes", 1, 0) && std::string(r.find("requested-attributes", 1, 0)->text) == "job-id");
+    CHECK(r.find("copies") && r.find("copies")->integer == -2 && r.find("x") && r.find("x")->integer == 1);
+    // Truncations and nonsense are refused, never read past.
+    for (uint64_t cut = 0; cut < buf.size(); ++cut) CHECK(!decode_response(buf.view().first(cut), &r));
+    std::string mangled = want;
+    mangled[0] = 9;
+    CHECK(!decode_response(ConstByteView(reinterpret_cast<const uint8_t*>(mangled.data()), mangled.size()), &r));
+    mangled = want;
+    mangled[8] = static_cast<char>(0x21);   // an attribute with no group in front
+    CHECK(!decode_response(ConstByteView(reinterpret_cast<const uint8_t*>(mangled.data()), mangled.size()), &r));
+  }
+  // Collections are skipped (members and all), long strings cut short, resolutions shown.
+  {
+    TestAllocator alloc;
+    ByteBuffer buf(alloc);
+    RequestBuilder b(buf, 0, 9);
+    b.group(kGroupPrinter);
+    b.add_string(kTagKeyword, "before", "a");
+    auto raw = [&](uint8_t tag, const char* name, const std::string& value) {
+      buf.put8(tag);
+      buf.put8(0); buf.put8(static_cast<uint8_t>(strlen(name)));
+      buf.append(ConstByteView(reinterpret_cast<const uint8_t*>(name), strlen(name)));
+      buf.put8(static_cast<uint8_t>(value.size() >> 8)); buf.put8(static_cast<uint8_t>(value.size()));
+      buf.append(ConstByteView(reinterpret_cast<const uint8_t*>(value.data()), value.size()));
+    };
+    raw(kTagBegCollection, "media-col", "");
+    raw(kTagMemberName, "", "media-size");
+    raw(kTagBegCollection, "", "");
+    raw(kTagMemberName, "", "x-dimension");
+    raw(kTagInteger, "", std::string("\0\0\x52\x08", 4));
+    raw(kTagEndCollection, "", "");
+    raw(kTagEndCollection, "", "");
+    b.add_string(kTagKeyword, "after", "b");
+    std::string long_text(300, 'q');
+    b.add_string(kTagText, "long", long_text.c_str());
+    raw(kTagResolution, "res", std::string("\0\0\x02\x58\0\0\x02\x58\x03", 9));
+    b.finish();
+    Response r;
+    CHECK(decode_response(buf.view(), &r));
+    CHECK(r.find("before") && r.find("after") && std::string(r.find("after")->text) == "b" && !r.find("media-col") && !r.find("x-dimension") && r.count == 4);
+    CHECK(r.find("long") && r.find("long")->truncated && strlen(r.find("long")->text) == Attribute::kValueMax - 1);
+    CHECK(r.find("res") && std::string(r.find("res")->text) == "600x600dpi");
+  }
+
+  Lan lan;
+  lan.configure_static();
+  Server server(lan, 631);
+  FakeIppServer ipp_server(lan);
+  server.app = [&](Server& s) { ipp_server.step(s); };
+  const Ipv4Address addr = Ipv4Address::make(10, 0, 0, 2);
+  IppPrinter printer(lan.a, addr, BrotherHl2070n::model_info(), lan.alloc);
+  CHECK(printer.initialize() && printer.state() == PrinterState::Ready && printer.ipv4_address() == addr.value());
+
+  // A job: one Print-Job, the document right after the attributes, framing rotating.
+  std::string document(9000, 'x');
+  for (size_t i = 0; i < document.size(); ++i) document[i] = static_cast<char>(i * 11);
+  printer.set_document_format("application/vnd.hp-PCL");
+  CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>(document.data()), document.size()), "my job") && printer.state() == PrinterState::Busy);
+  CHECK(!printer.submit(ConstByteView(), "x"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }));
+  CHECK(ipp_server.documents.size() == 1 && ipp_server.documents[0] == document);
+  CHECK(ipp_server.request_lines[0] == "POST /ipp/print HTTP/1.1");
+  CHECK(ipp_server.last_printer_uri == "ipp://10.0.0.2:631/ipp/print" && ipp_server.last_format == "application/vnd.hp-PCL" && ipp_server.last_job_name == "my job");
+  CHECK(printer.last_job_id() == 41 && printer.last_status() == 0 && printer.statistics().jobs_sent == 1 && printer.statistics().bytes_sent == document.size());
+  CHECK(printer.state() == PrinterState::Ready);
+
+  // Two more jobs in a row, each over its own connection and with another answer framing.
+  for (int i = 0; i < 2; ++i) CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>("job"), 3), "more"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }));
+  CHECK(ipp_server.documents.size() == 3 && printer.statistics().jobs_sent == 3 && printer.last_job_id() == 43);
+
+  // Status.
+  CHECK(printer.request_report() && !printer.request_report() && printer.report_pending());
+  CHECK(pump(lan, printer, [&] { return !printer.report_pending(); }));
+  const PrinterReport* rep = printer.report();
+  CHECK(rep && rep->valid && rep->engine == PrinterEngineState::Printing);
+  CHECK(rep && std::string(rep->description) == "Brother HL-2070N series" && std::string(rep->display) == "Toner low" && std::string(rep->serial) == "U63083H1J123456");
+  CHECK(rep && rep->has_error(kErrorLowToner) && rep->has_error(kErrorJammed) && rep->has_error(kErrorDoorOpen) && !rep->has_error(kErrorOffline));
+  CHECK(rep && rep->alert_count == 3 && rep->alerts[0].severity == AlertSeverity::Warning && rep->alerts[0].code == 12 && rep->alerts[1].severity == AlertSeverity::Critical && rep->alerts[1].code == 8 &&
+        rep->alerts[2].severity == AlertSeverity::Other && rep->alerts[2].code == 3 && std::string(rep->alerts[1].description) == "media-jam-error");
+  CHECK(rep && rep->supply_count == 3 && std::string(rep->supplies[0].description) == "Black Toner Cartridge" && rep->supplies[0].kind == SupplyKind::Toner && rep->supplies[0].level_percent == 7 &&
+        rep->supplies[0].low() && rep->supplies[1].kind == SupplyKind::Drum && rep->supplies[1].level_percent == 80 && rep->supplies[2].kind == SupplyKind::WasteToner &&
+        !rep->supplies[2].consumed && rep->supplies[2].low() && rep->toner_low());
+
+  // The queue and cancelling.
+  CHECK(printer.request_jobs() && printer.jobs_pending());
+  CHECK(pump(lan, printer, [&] { return !printer.jobs_pending(); }));
+  CHECK(printer.job_count() == 2 && printer.job(0).id == 42 && printer.job(0).state == 5 && printer.job(0).active() && printer.job(0).size_kb == 120 && std::string(printer.job(0).name) == "report.pdf" &&
+        printer.job(1).id == 43 && std::string(printer.job(1).name) == "letter");
+  CHECK(!printer.cancel_job(0));
+  CHECK(printer.cancel_job(43) && printer.cancel_pending());
+  CHECK(pump(lan, printer, [&] { return !printer.cancel_pending(); }));
+  CHECK(printer.cancel_result() == 0);
+  CHECK(printer.cancel_job(99));
+  CHECK(pump(lan, printer, [&] { return !printer.cancel_pending(); }));
+  CHECK(printer.cancel_result() == 0x0406);
+
+  // A busy printer: the same job again after a pause; a printer that refuses the format: dropped at once.
+  ipp_server.busy_answers = 2;
+  CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>("busy"), 4), "busy job"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }, 20000));
+  CHECK(ipp_server.documents.size() == 4 && ipp_server.documents.back() == "busy" && printer.statistics().jobs_failed == 0 && printer.state() == PrinterState::Ready);
+  ipp_server.unsupported_format = 1;
+  CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>("nope"), 4), "refused"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }));
+  CHECK(printer.statistics().jobs_failed == 1 && printer.state() == PrinterState::Error && printer.last_status() == 0x040a && ipp_server.documents.size() == 4);
+  ipp_server.unsupported_format = 0;
+  CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>("ok"), 2), "again"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }));
+  CHECK(printer.state() == PrinterState::Ready && ipp_server.documents.back() == "ok");
+
+  // Trouble below IPP: an HTTP error and a body that is not IPP both fail the job after three tries; the status says why.
+  ipp_server.http_status = 401;
+  CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>("x"), 1), "denied"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }, 30000));
+  CHECK(printer.state() == PrinterState::Error && printer.http_status() == 401 && printer.last_status() == 0xffff);
+  const uint64_t failed = printer.statistics().jobs_failed;
+  ipp_server.http_status = 200;
+  ipp_server.garbage = true;
+  CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>("x"), 1), "junk"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }, 30000));
+  CHECK(printer.statistics().jobs_failed == failed + 1 && printer.last_status() == 0xffff);
+  ipp_server.garbage = false;
+  printer.shutdown();
+}
+
+// A printer with nobody home: the connection is refused, the job fails after its tries and the printer says so.
+static void test_ipp_unreachable() {
+  Lan lan;
+  lan.configure_static();   // (nothing listens on 631)
+  IppPrinter printer(lan.a, Ipv4Address::make(10, 0, 0, 2), BrotherHl2070n::model_info(), lan.alloc);
+  CHECK(printer.submit(ConstByteView(reinterpret_cast<const uint8_t*>("x"), 1), "lost"));
+  CHECK(pump(lan, printer, [&] { return printer.pending_jobs() == 0; }, 60000));
+  CHECK(printer.state() == PrinterState::Error && printer.statistics().jobs_failed == 1);
+  CHECK(printer.request_report());
+  CHECK(pump(lan, printer, [&] { return !printer.report_pending(); }, 30000));
+  CHECK(printer.report() == nullptr);
+}
+
 int main() {
   test_packbits();
   test_pages_and_halftone();
@@ -1410,6 +1730,8 @@ int main() {
   test_snmp_v3_monitor();
   test_traps();
   test_printer_alerts();
+  test_ipp();
+  test_ipp_unreachable();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

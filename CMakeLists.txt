@@ -92,6 +92,8 @@ add_executable(BOOTX64
   src/Network/Snmp/SnmpMessage.cpp
   src/Network/Snmp/SnmpUsm.cpp
   src/Network/Snmp/SnmpTrap.cpp
+  src/Network/Ipp/IppMessage.cpp
+  src/Network/Ipp/IppExchange.cpp
   src/Network/Snmp/SnmpClient.cpp
   src/Crypto/Crypto.cpp
   src/Network/NetworkStackSet.cpp
@@ -245,6 +247,7 @@ add_executable(BOOTX64
   src/Hardware/Printer/Brother/BrotherHl2070n.cpp
   src/Hardware/Printer/PrinterMonitor.cpp
   src/Hardware/Printer/PrinterAlertListener.cpp
+  src/Hardware/Printer/IppPrinter.cpp
   src/Hardware/Printer/Usb/Ieee1284.cpp
   src/Hardware/Printer/Usb/Dot4.cpp
   src/Hardware/Printer/Usb/UsbPrinter.cpp

@@ -136,7 +136,13 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   live against a pysnmp agent. `SnmpTrapReceiver` (UDP 162, needs IGMP/multicast-free unicast only) decodes v1/v2c/v3 traps and informs
   (v2c informs are acknowledged, v3 informs are not); `PrinterAlertListener` turns prtAlert and standard traps into events, and
   `SystemPrinters::enable_alerts()` refreshes the sending printer's report. Never run against a real printer.
-  The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). Not covered: IPP,
+  **IPP:** `src/Network/Ipp/` encodes IPP/1.1 requests and decodes responses (collections skipped, long strings cut, 1setOf values numbered)
+  and `IppExchange` carries one request over HTTP/1.1 on TCP 631 (Content-Length, chunked and close-delimited answers, `100 Continue`
+  skipped). `IppPrinter` is an `IPrinter` doing Print-Job (document format settable, busy answers retried), Get-Printer-Attributes
+  (state, state reasons as errors and alerts, marker levels as supplies, serial from the device id), Get-Jobs and Cancel-Job. It has
+  no page count (IPP has none for the printer; use SNMP) and no TLS (ipps://), authentication, Validate-Job or Create-Job/Send-Document.
+  Tested against a scripted server only; the encoder against bytes laid out independently.
+  The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). Not covered:
   discovery of network printers (BRAdmin, mDNS), several simultaneous 1284.4 channels, the printer's Epson FX / IBM emulation, PCL 6
   (PCL XL) output, duplex and colour (the engine has neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure,
   text layout, both network transports and failures, and the USB driver against a scripted host controller (descriptors, device ID,
