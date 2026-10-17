@@ -26,6 +26,7 @@
 #include "Gui/Controls/AudioPlayerControl.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/TaskManager.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Gui/Controls/ImageView.hpp"
 #include "Gui/Controls/ListView.hpp"
@@ -1034,6 +1035,97 @@ static void test_file_explorer() {
   CHECK(a.live == 0);
 }
 
+// --- Task manager ----------------------------------------------------------------------------------------------
+
+struct FakeMonitor final : desktop::ISystemMonitor {
+  uint64_t core_busy[2] = {0, 0}, core_idle[2] = {0, 0};
+  uint64_t worker_ticks = 0, idle_ticks[2] = {0, 0};
+  bool second_thread = true;
+  uint64_t free_bytes = 512ull << 20;
+  uint32_t ticks_per_second() const override { return 1000; }
+  uint32_t core_count() const override { return 3; }
+  bool core(uint32_t i, desktop::TaskCore* out) override {
+    if (i >= 3) return false;
+    *out = desktop::TaskCore();
+    out->online = i < 2;
+    out->efficiency = i == 1;
+    if (i < 2) { out->busy_ticks = core_busy[i]; out->idle_ticks = core_idle[i]; }
+    return true;
+  }
+  uint32_t threads(desktop::TaskThread* out, uint32_t capacity) override {
+    uint32_t n = 0;
+    auto put = [&](uint64_t id, const char* name, desktop::TaskState state, bool idle, int32_t core, uint64_t ticks) {
+      if (n >= capacity) return;
+      out[n] = desktop::TaskThread();
+      out[n].id = id;
+      strncpy(out[n].name, name, sizeof out[n].name - 1);
+      out[n].state = state; out[n].idle = idle; out[n].core = core; out[n].cpu_ticks = ticks;
+      ++n;
+    };
+    put(1, "main", desktop::TaskState::Blocked, false, -1, 5);
+    put(0, "idle", desktop::TaskState::Running, true, 0, 0);
+    if (second_thread) put(7, "worker", desktop::TaskState::Running, false, 1, worker_ticks);
+    return n;
+  }
+  desktop::TaskMemory memory() override { return {1ull << 30, free_bytes}; }
+};
+
+static void test_task_manager() {
+  TestAllocator a;
+  {
+    FakeMonitor mon;
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::TaskManager tm(a);
+    tm.update(1000000);
+    CHECK(tm.info_label().text().equals("No system monitor available"));
+    tm.set_monitor(&mon);
+    CHECK(mgr.add_window(&tm));
+    w.layout();
+
+    tm.update(1000000);   // first sample: no load yet, but memory and the threads are there
+    CHECK(tm.grid().row_count() == 3 && tm.cpu_label().text().equals("0%"));
+    CHECK(tm.memory_label().text().equals("512.0 MB / 1.0 GB") && tm.memory_meter().level() == 50);
+    CHECK(tm.info_label().text().equals("Threads: 3   Cores: 2   Uptime: 00:00:01"));
+    CHECK(tm.cores_label().text().equals("Cores: 0 :0%  1e:0%"));
+
+    // One second later: core 0 was 25% busy, core 1 75% busy, and the worker ran 600 of the 1000 ticks.
+    mon.core_busy[0] = 250; mon.core_idle[0] = 750;
+    mon.core_busy[1] = 750; mon.core_idle[1] = 250;
+    mon.worker_ticks = 600;
+    mon.free_bytes = 256ull << 20;
+    tm.update(2000000);
+    CHECK(tm.cpu_label().text().equals("50%") && tm.cpu_meter().level() == 50);
+    CHECK(tm.cores_label().text().equals("Cores: 0 :25%  1e:75%"));
+    CHECK(tm.memory_label().text().equals("768.0 MB / 1.0 GB") && tm.memory_meter().level() == 75);
+    CHECK(tm.thread_load_tenths(7) == 600 && tm.thread_load_tenths(1) == 0 && tm.thread_load_tenths(99) == -1);
+    String cell(a);
+    CHECK(tm.grid().row_count() == 3);
+    // Row 2 is the worker: id, name, state, core, CPU %, CPU seconds.
+    int32_t row = -1;
+    for (uint32_t i = 0; i < 3; ++i) if (tm.grid().row_at_position(i) == 2) row = 2;
+    CHECK(row == 2);
+    tm.grid().sort_by(4, false);                // by CPU %, highest first
+    CHECK(tm.grid().row_at_position(0) == 2);
+
+    // The selection follows its thread when the list changes.
+    tm.grid().select_row(2);
+    mon.worker_ticks = 700;
+    tm.update(3000000);
+    CHECK(tm.grid().selected_row() == 2 && tm.thread_load_tenths(7) == 100);
+    mon.second_thread = false;                  // the worker exits
+    tm.update(4000000);
+    CHECK(tm.grid().row_count() == 2 && tm.grid().selected_row() == -1 && tm.thread_load_tenths(7) == -1);
+    w.render();
+    mgr.remove_window(&tm);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_scroll_bar();
   test_data_grid();
@@ -1044,6 +1136,7 @@ int main() {
   test_video_control();
   test_list_view();
   test_file_explorer();
+  test_task_manager();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");
   return 0;

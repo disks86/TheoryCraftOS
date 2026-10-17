@@ -48,6 +48,13 @@ class ThreadSafeAllocator final : public IAllocator {
     inner_.deallocate(ptr);
   }
 
+  // Runs `function` with the allocator's lock held, for reading the inner allocator's statistics.
+  template <class F>
+  void locked(F&& function) {
+    ScopedLock guard(lock_);
+    function();
+  }
+
  private:
   IAllocator& inner_;
   SpinLock lock_;

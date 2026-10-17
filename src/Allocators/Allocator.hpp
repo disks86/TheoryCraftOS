@@ -51,6 +51,7 @@ class Allocator final : public IAllocator {
   void* allocate_dma(uint64_t size, uint64_t alignment) override;
   void deallocate(void* ptr) override;
 
+  uint64_t total_bytes() const { return total_bytes_; }  // everything handed to the pools (headers included)
   uint64_t free_bytes() const;       // payload bytes still available in both pools (sum over runs)
   uint64_t free_bytes_low() const;   // ... in the pool below 4 GiB
   uint64_t free_bytes_high() const;  // ... in the pool above
@@ -67,6 +68,7 @@ class Allocator final : public IAllocator {
   hardware::IRandomAccessMemory& ram_;
   Header* free_low_ = nullptr;
   Header* free_high_ = nullptr;
+  uint64_t total_bytes_ = 0;
 };
 
 }  // namespace allocators

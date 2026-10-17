@@ -48,6 +48,7 @@
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "SystemFileSystem.hpp"
+#include "SystemMonitor.hpp"
 #include "uefi.hpp"
 
 // TCOS_SELFTESTS (cmake -DTCOS_SELFTESTS=ON) adds the boot-time self-checks and demos of every
@@ -494,6 +495,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
                              input.mice().count() ? &input.mouse() : nullptr);
     SystemFileSystem explorer_files(shared_allocator, storage);
     desktop.set_file_system(&explorer_files.file_system());
+    SystemMonitor monitor(allocator, shared_allocator);
+    desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);
     // Three threads: this one reads input and the clock (firmware calls must stay on the boot core), a render
