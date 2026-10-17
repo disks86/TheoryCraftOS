@@ -27,7 +27,7 @@ which the IDE shows in its debugger console. QEMU exits with the debugger.
 import os, queue, shutil, socket, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PORT = 1234
+PORT = int(os.environ.get("QEMU_GDB_PORT", "1234"))
 
 
 def build_dir():
@@ -58,7 +58,7 @@ def start_qemu(build):
         os.chmod(vars_fd, 0o644)
     log = os.path.join(build, "debugcon.log")
     cmd = [
-        "qemu-system-x86_64", "-machine", "q35", "-smp", os.environ.get("QEMU_SMP", "4"), "-m", "256M", "-net", "none", "-rtc", "base=localtime",
+        "qemu-system-x86_64", "-machine", "q35", "-smp", os.environ.get("QEMU_SMP", "4"), "-m", "8G", "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0", "-rtc", "base=localtime",
         # The tablet gives the desktop an absolute pointer: no click-to-grab, and the host pointer maps
         # straight onto the guest's (relative PS/2 grabbing is unreliable under Wayland).
         "-device", "virtio-tablet-pci",
@@ -69,9 +69,35 @@ def start_qemu(build):
         "-drive", f"format=raw,file=fat:rw:{os.path.join(build, 'esp')}",
         "-chardev", f"stdio,id=dbg,logfile={log},signal=off",
         "-device", "isa-debugcon,iobase=0x402,chardev=dbg", "-serial", "null",
-    ]
+    ] + os.environ.get("QEMU_EXTRA", "").split()  # e.g. QEMU_EXTRA="-vga none -device virtio-gpu-gl-pci"
     # QEMU's stdout would corrupt the gdb channel: send it to stderr instead.
     return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno())
+
+
+SIGNALS = {2: "SIGINT (pause requested)", 4: "SIGILL (invalid instruction)", 5: "SIGTRAP (breakpoint, watchpoint or step)",
+           8: "SIGFPE (divide error)", 11: "SIGSEGV (page fault / memory fault)", 6: "SIGABRT"}
+
+
+def report_stops(buf):
+    """Says on stderr (the IDE's debugger console) whenever QEMU stops the virtual machine: a stopped VM shows
+    as [Paused] in QEMU's window and looks like a hang. Returns the unparsed tail of the stream."""
+    while True:
+        start = max(buf.find(b"$T"), -1)
+        s_start = buf.find(b"$S")
+        if start < 0 or (0 <= s_start < start):
+            start = s_start
+        if start < 0:
+            return buf[-8:]
+        end = buf.find(b"#", start)
+        if end < 0 or len(buf) < end + 3:
+            return buf[start:]
+        body = buf[start + 2:end].decode("ascii", "replace")
+        sig = int(body[:2], 16) if body[:2].strip() else 0
+        details = [f for f in body[2:].split(";") if f]
+        sys.stderr.write(f"[gdb-proxy] the VM was stopped by the debugger: {SIGNALS.get(sig, 'signal %d' % sig)}"
+                         f"{' [' + ', '.join(details) + ']' if details else ''}\n")
+        sys.stderr.flush()
+        buf = buf[end + 3:]
 
 
 def checksum(payload):
@@ -149,11 +175,14 @@ def main():
         sys.exit("could not connect to QEMU's gdbstub")
 
     def qemu_to_gdb():
+        pending = b""
         while True:
             data = sock.recv(65536)
             if not data:
                 break
             os.write(1, data)
+            pending = (pending + data)[-4096:]
+            pending = report_stops(pending)
         os._exit(0)
 
     threading.Thread(target=qemu_to_gdb, daemon=True).start()

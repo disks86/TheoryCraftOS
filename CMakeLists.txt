@@ -227,7 +227,7 @@ find_file(OVMF_VARS NAMES OVMF_VARS.4m.fd OVMF_VARS_4M.fd OVMF_VARS.fd
 
 if(QEMU AND OVMF_CODE AND OVMF_VARS)
   set(QEMU_COMMON
-    ${QEMU} -machine q35 -smp 4 -m 256M -net none
+    ${QEMU} -machine q35 -smp 4 -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
     -rtc base=localtime  # the taskbar clock shows local time
     # An absolute pointer for the desktop (no click-to-grab; relative PS/2 grabbing is unreliable under Wayland).
     -device virtio-tablet-pci

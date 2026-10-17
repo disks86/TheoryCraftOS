@@ -24,11 +24,13 @@ namespace hardware {
 
 // System memory discovered through UEFI boot services. initialize() reads the
 // firmware memory map for the total/usable figures and reserves one contiguous
-// pool (up to kPoolBytes, from the largest free region) for the OS allocator.
+// pool for the OS allocator: the whole of the largest free region below 4 GiB (the device drivers
+// hand this memory to hardware for DMA, and some controllers - RTL8139, OHCI, UHCI - only reach 32-bit
+// addresses), or of the largest free region anywhere if there is none down there - less a reserve at
+// its end (kFirmwareReserve) that the firmware keeps for its own buffers. Memory above 4 GiB
+// in other regions is counted in total_bytes() but not used yet.
 class UefiRandomAccessMemory final : public IRandomAccessMemory {
  public:
-  static constexpr uint64_t kPoolBytes = 64ull * 1024 * 1024;
-
   explicit constexpr UefiRandomAccessMemory(efi::SystemTable* st) : st_(st) {}
 
   const char* name() const override { return "UEFI RAM"; }
@@ -44,6 +46,7 @@ class UefiRandomAccessMemory final : public IRandomAccessMemory {
 
  private:
   static constexpr uint64_t kPageSize = 4096;
+  static constexpr uint64_t kFirmwareReserve = 128ull * 1024 * 1024;
 
   efi::SystemTable* st_;
   uint64_t total_bytes_ = 0;

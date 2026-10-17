@@ -33,7 +33,7 @@ case ${QEMU_GPU:-std} in
   std) GPU_ARGS=""; DISPLAY_ARGS="gtk,show-cursor=off" ;;
   *) echo "unknown QEMU_GPU=$QEMU_GPU (std, virtio, gl)" >&2; exit 2 ;;
 esac
-exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 256M -net none -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \
+exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \
   -drive if=pflash,format=raw,readonly=on,file="$(sed -n 's/^OVMF_CODE:FILEPATH=//p' "$BUILD/CMakeCache.txt")" \
   -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
   -drive format=raw,file=fat:rw:"$BUILD/esp" \

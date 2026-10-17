@@ -44,7 +44,9 @@ bool UefiRandomAccessMemory::initialize() {
   }
 
   total_bytes_ = free_bytes_ = 0;
-  uint64_t best_start = 0, best_pages = 0;
+  uint64_t best_start = 0, best_pages = 0;      // largest free region anywhere
+  uint64_t low_start = 0, low_pages = 0;        // largest free region that ends below 4 GiB
+  constexpr uint64_t kFourGiB = 1ull << 32;
   // The firmware's descriptors are desc_size bytes apart (more than sizeof(MemoryDescriptor)
   // on some firmware), so step through the map as bytes and take one entry at a time.
   const ConstByteView map_bytes(reinterpret_cast<const uint8_t*>(map), map_size);
@@ -64,15 +66,24 @@ bool UefiRandomAccessMemory::initialize() {
         best_pages = d->number_of_pages;
         best_start = d->physical_start;
       }
+      if (d->physical_start + d->number_of_pages * kPageSize <= kFourGiB && d->number_of_pages > low_pages) {
+        low_pages = d->number_of_pages;
+        low_start = d->physical_start;
+      }
     }
   }
   bs->free_pool(buffer);
 
-  uint64_t pages = best_pages;
-  if (pages * kPageSize > kPoolBytes) pages = kPoolBytes / kPageSize;
+  const bool use_low = low_pages > 0;
+  uint64_t pages = use_low ? low_pages : best_pages;
+  if (pages == 0) return false;
+  // Boot services stay alive, and firmware drivers (the UEFI block and network fallbacks) allocate DMA
+  // buffers below 4 GiB while we run: leave them the end of the region, 128 MiB or half of a small one.
+  const uint64_t reserve_pages = (pages / 2 < kFirmwareReserve / kPageSize) ? pages / 2 : kFirmwareReserve / kPageSize;
+  pages -= reserve_pages;
   if (pages == 0) return false;
 
-  uint64_t address = best_start;
+  uint64_t address = use_low ? low_start : best_start;
   if (bs->allocate_pages(efi::AllocateType::Address, efi::MemoryType::LoaderData, pages,
                          &address) != efi::kSuccess)
     return false;
