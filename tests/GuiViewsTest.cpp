@@ -25,7 +25,11 @@
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/AudioPlayerControl.hpp"
 #include "Gui/Controls/DataGrid.hpp"
+#include "Desktop/FileExplorer.hpp"
+#include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Gui/Controls/ImageView.hpp"
+#include "Gui/Controls/ListView.hpp"
+#include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
 #include "Gui/Controls/VideoPlayerControl.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
@@ -809,6 +813,227 @@ static void test_video_control() {
   CHECK(mixer.stream_count() == 0);
 }
 
+
+// --- ListView and the file explorer ---------------------------------------------------------------------------
+
+static void fill_list(ListView& list, uint32_t count, uint32_t folders) {
+  list.add_column("Name", 120);
+  list.add_column("Size", 60, Align::Right);
+  for (uint32_t i = 0; i < count; ++i) {
+    char name[16];
+    snprintf(name, sizeof name, "item%02u", i);
+    const StringView cells[2] = {name, "1 KB"};
+    list.add_item(cells, 2, i < folders ? ItemIcon::Folder : ItemIcon::File);
+  }
+}
+
+static void test_list_view() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    ListView list(a);
+    list.set_bounds({10, 10, 300, 100});
+    w.add(&list);
+    CHECK(list.add_item(nullptr, 0, ItemIcon::File) == -1);  // no columns yet
+    fill_list(list, 20, 3);
+    CHECK(list.add_column("Late", 40) == -1);                // not once there are items
+    CHECK(list.item_count() == 20 && list.column_count() == 2 && list.item_icon(2) == ItemIcon::Folder && list.item_icon(3) == ItemIcon::File);
+    w.layout();
+    Counter selections, activations;
+    list.on_selection_changed(selections.handler());
+    list.on_item_activated(activations.handler());
+    uint64_t now = 1000000;
+    list.set_clock(&now);
+
+    // Details: a row per item under the header, a vertical scroll bar because they do not all fit.
+    list.set_view_mode(ViewMode::Details);
+    w.layout();
+    Rect2D r0, r1;
+    CHECK(list.item_rect(0, &r0) && list.item_rect(1, &r1) && r1.y - r0.y == ListView::kRowHeight && r0.y == ListView::kBorder + ListView::kHeaderHeight);
+    CHECK(list.vertical_scroll_bar().visible() && !list.horizontal_scroll_bar().visible());
+    click(w, 10 + r1.x + 20, 10 + r1.y + 5);
+    CHECK(list.selected_item() == 1 && selections.count == 1 && activations.count == 0);
+    now += 100000;
+    click(w, 10 + r1.x + 20, 10 + r1.y + 5);   // a second click within the interval
+    CHECK(activations.count == 1);
+    now += 100000;
+    click(w, 10 + r1.x + 20, 10 + r1.y + 5);   // the double click was used up: this starts a new one
+    CHECK(activations.count == 1);
+    now += 900000;
+    click(w, 10 + r1.x + 20, 10 + r1.y + 5);   // too slow
+    CHECK(activations.count == 1);
+    press(w, key::kDown);
+    CHECK(list.selected_item() == 2);
+    press(w, key::kEnter);
+    CHECK(activations.count == 2);
+    press(w, 0x4D);                            // End
+    CHECK(list.selected_item() == 19 && list.scroll_y() > 0);
+    Rect2D last;
+    CHECK(list.item_rect(19, &last) && last.y >= list.body_rect().y && last.y + static_cast<int32_t>(last.height) <= list.body_rect().y + static_cast<int32_t>(list.body_rect().height));
+    press(w, 0x4A);                            // Home
+    CHECK(list.selected_item() == 0 && list.scroll_y() == 0);
+    w.mouse_wheel(60, 60, -1);
+    CHECK(list.scroll_y() == 3 * ListView::kRowHeight);
+    w.render();
+
+    // Dragging the border at a header's right edge resizes the column.
+    w.mouse_move(10 + 2 + 120, 10 + 2 + 5);
+    w.mouse_button(10 + 2 + 120, 10 + 2 + 5, MouseButton::Left, true);
+    w.mouse_move(10 + 2 + 150, 10 + 2 + 5);
+    w.mouse_button(10 + 2 + 150, 10 + 2 + 5, MouseButton::Left, false);
+    CHECK(list.column_width(0) == 150);
+
+    // List: top to bottom, then left to right, with a horizontal scroll bar.
+    list.set_view_mode(ViewMode::List);
+    w.layout();
+    CHECK(list.scroll_x() == 0 && list.scroll_y() == 0 && list.horizontal_scroll_bar().visible() && !list.vertical_scroll_bar().visible());
+    Rect2D a0, a1, a4;
+    const int32_t per = list.body_rect().height / ListView::kRowHeight;
+    CHECK(per >= 3 && list.item_rect(0, &a0) && list.item_rect(1, &a1) && list.item_rect(static_cast<uint32_t>(per), &a4));
+    CHECK(a1.x == a0.x && a1.y - a0.y == ListView::kRowHeight && a4.x > a0.x && a4.y == a0.y);
+    list.select_item(0);
+    press(w, key::kRight);
+    CHECK(list.selected_item() == per);
+    press(w, key::kDown);
+    CHECK(list.selected_item() == per + 1);
+    press(w, key::kLeft);
+    CHECK(list.selected_item() == 1);
+    list.select_item(19);
+    Rect2D end;
+    CHECK(list.item_rect(19, &end) && end.x >= 0 && end.x < 300 && list.scroll_x() > 0);
+    click(w, 10 + end.x + 20, 10 + end.y + 5);
+    CHECK(list.selected_item() == 19);
+    w.render();
+
+    // Icons: a grid that wraps to the width, scrolling vertically.
+    list.set_view_mode(ViewMode::Icons);
+    w.layout();
+    list.select_item(0);
+    CHECK(list.vertical_scroll_bar().visible() && !list.horizontal_scroll_bar().visible());
+    Rect2D i0, i1, i3;
+    CHECK(list.item_rect(0, &i0) && list.item_rect(1, &i1) && list.item_rect(3, &i3));
+    CHECK(i1.x - i0.x == ListView::kIconCellWidth && i1.y == i0.y && i3.x == i0.x && i3.y - i0.y == ListView::kIconCellHeight);
+    press(w, key::kDown);
+    CHECK(list.selected_item() == 3);
+    press(w, key::kRight);
+    CHECK(list.selected_item() == 4);
+    click(w, 10 + i1.x + 40, 10 + i1.y + 20);
+    CHECK(list.selected_item() == 1);
+    click(w, 10 + 290, 10 + 90);               // not on an item: nothing selected
+    w.render();
+    list.select_item(19);
+    w.render();
+    CHECK(list.scroll_y() > 0);
+
+    // Switching back and clearing.
+    list.set_view_mode(ViewMode::Details);
+    list.clear_items();
+    CHECK(list.item_count() == 0 && list.selected_item() == -1 && list.scroll_y() == 0 && !list.vertical_scroll_bar().visible());
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void make_file(filesystem::IFileSystem& fs, const char* path, const char* text) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t written = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+  CHECK(file->write(0, ConstByteView(reinterpret_cast<const uint8_t*>(text), strlen(text)), &written) == filesystem::Status::Ok && written == strlen(text));
+}
+
+static void test_file_explorer() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok);
+    CHECK(fs.create_directory("/Apps") == filesystem::Status::Ok);
+    CHECK(fs.create_directory("/docs/old") == filesystem::Status::Ok);
+    make_file(fs, "/readme", "hello");
+    make_file(fs, "/b.txt", "12345678901");
+    make_file(fs, "/a.bin", "x");
+    make_file(fs, "/docs/note.md", "# hi");
+
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::FileExplorer ex(a);
+    uint64_t now = 0;
+    ex.set_clock(&now);
+    ex.set_file_system(nullptr);
+    CHECK(ex.status_label().text().equals("No storage available") && ex.view().item_count() == 0);
+    ex.set_file_system(&fs);
+    CHECK(mgr.add_window(&ex));
+    w.layout();
+
+    auto name_of = [&](uint32_t i) {
+      String s(a);
+      ex.view().item_text(i, 0, &s);
+      return s;
+    };
+    auto cell_of = [&](uint32_t i, uint32_t column) {
+      String s(a);
+      ex.view().item_text(i, column, &s);
+      return s;
+    };
+    // Folders first, then files, each by name without regard to case.
+    CHECK(ex.path().equals("/") && ex.view().item_count() == 5);
+    CHECK(name_of(0).view().equals("Apps") && name_of(1).view().equals("docs") && name_of(2).view().equals("a.bin") &&
+          name_of(3).view().equals("b.txt") && name_of(4).view().equals("readme"));
+    CHECK(ex.view().item_icon(1) == ItemIcon::Folder && ex.view().item_icon(2) == ItemIcon::File);
+    CHECK(cell_of(3, 1).view().equals("11 B") && cell_of(3, 2).view().equals("TXT File") && cell_of(4, 2).view().equals("File") && cell_of(0, 2).view().equals("Folder") && cell_of(0, 1).empty());
+    CHECK(ex.status_label().text().equals("5 items"));
+    CHECK(!ex.up_button().enabled() && ex.details_button().checked() && ex.view().view_mode() == ViewMode::Details);
+
+    // The three views are chosen with the toolbar's buttons.
+    ex.list_button().set_checked(true);
+    CHECK(ex.view().view_mode() == ViewMode::List && !ex.details_button().checked());
+    ex.icons_button().set_checked(true);
+    CHECK(ex.view().view_mode() == ViewMode::Icons);
+    w.layout();
+    w.render();
+    ex.set_view_mode(ViewMode::Details);
+    CHECK(ex.view().view_mode() == ViewMode::Details && ex.details_button().checked() && !ex.icons_button().checked());
+
+    // Opening a folder: Enter on it, a double click, then Up and Backspace go back.
+    w.set_focus(&ex.view());
+    ex.view().select_item(1);
+    CHECK(ex.status_label().text().equals("5 items  |  docs"));
+    press(w, key::kEnter);
+    CHECK(ex.path().equals("/docs") && ex.view().item_count() == 2 && name_of(0).view().equals("old") && name_of(1).view().equals("note.md"));
+    CHECK(ex.path_label().text().equals("/docs") && ex.up_button().enabled() && ex.view().selected_item() == -1);
+    CHECK(ex.status_label().text().equals("2 items"));
+    ex.view().select_item(1);
+    CHECK(ex.status_label().text().equals("2 items  |  note.md, 4 B"));
+    press(w, key::kEnter);                      // a file: nothing opens
+    CHECK(ex.path().equals("/docs"));
+    ex.up_button().click();
+    CHECK(ex.path().equals("/") && ex.view().item_count() == 5 && !ex.up_button().enabled());
+    Rect2D row;
+    CHECK(ex.view().item_rect(1, &row));
+    const Point origin = ex.view().window_origin();
+    now = 5000000;
+    click(w, origin.x + row.x + 30, origin.y + row.y + 5);
+    now += 200000;
+    click(w, origin.x + row.x + 30, origin.y + row.y + 5);
+    CHECK(ex.path().equals("/docs"));
+    ex.view().select_item(0);
+    press(w, key::kEnter);
+    CHECK(ex.path().equals("/docs/old") && ex.view().item_count() == 0);
+    press(w, key::kBackspace);
+    CHECK(ex.path().equals("/docs"));
+    CHECK(ex.go_up() && ex.path().equals("/") && !ex.go_up());
+    CHECK(!ex.open_folder("/missing") && ex.path().equals("/"));
+    w.render();
+    mgr.remove_window(&ex);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_scroll_bar();
   test_data_grid();
@@ -817,6 +1042,8 @@ int main() {
   test_image_view();
   test_player_control();
   test_video_control();
+  test_list_view();
+  test_file_explorer();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");
   return 0;

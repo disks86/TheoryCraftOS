@@ -995,7 +995,7 @@ static void test_desktop() {
     CHECK(start.open() && w.popup() != nullptr);
     const Rect2D menu = w.popup()->bounds();
     CHECK(menu.y + static_cast<int32_t>(menu.height) <= o.y && menu.x == o.x && menu.width >= 180);
-    // Its only item shuts down: clicking elsewhere first just closes the menu.
+    // It ends with Shut Down: clicking elsewhere first just closes the menu.
     mouse.at(20000, 10000, hardware::mouse_button::kLeft);
     mouse.at(20000, 10000, 0);
     d.step(3000000);
@@ -1007,6 +1007,7 @@ static void test_desktop() {
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);
     d.step(5000000);
     CHECK(start.open());
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // File Explorer
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);

@@ -37,6 +37,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       tray_(allocator),
       clock_(allocator),
       shutdown_dialog_(allocator),
+      explorer_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)} {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
@@ -50,6 +51,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.set_size(76, 0);
   start_.set_direction(MenuButton::Direction::Up);
   start_.set_menu_min_width(200);
+  start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -84,6 +86,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   shutdown_dialog_.set_texts("Shut Down", "Shut down TheoryCraftOS now?", "Running services will be stopped.", "Shut Down", "Cancel");
   shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
 
+  explorer_.set_clock(&now_us_);
+
   about_.set_title("About TheoryCraftOS");
   about_.set_bounds({140, 90, 400, 170});
   about_.set_padding(Insets::all(12));
@@ -105,6 +109,11 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.layout();
 }
 
+void Desktop::open_explorer() {
+  if (explorer_.manager()) explorer_.activate();
+  else windows_.add_window(&explorer_);
+}
+
 void Desktop::open_about() {
   if (about_.manager()) about_.activate();
   else windows_.add_window(&about_);
@@ -112,6 +121,7 @@ void Desktop::open_about() {
 
 void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 
+void Desktop::on_explorer(void* self, Control&) { static_cast<Desktop*>(self)->open_explorer(); }
 void Desktop::on_about(void* self, Control&) { static_cast<Desktop*>(self)->open_about(); }
 void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->ask_shut_down(); }
 
@@ -165,6 +175,7 @@ bool Desktop::step(uint64_t uptime_us) {
 }
 
 void Desktop::pump(uint64_t uptime_us) {
+  __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   input_.pump();
   // Watchdog: a changed window that the render thread has not redrawn for seconds means that thread (or
   // whatever it is waiting for - the GPU, the UI lock) is stuck. Say so where it can be read afterwards.
