@@ -33,6 +33,8 @@ class ByteBuffer {
   uint64_t size() const { return size_; }
   ConstByteView view() const { return ConstByteView(storage_).first(size_); }
   void clear() { size_ = 0; }
+  // Drops everything after the first `size` bytes.
+  void truncate(uint64_t size) { if (size < size_) size_ = size; }
 
   bool append(ConstByteView bytes) {
     if (!reserve(size_ + bytes.size())) return false;

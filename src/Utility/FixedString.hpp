@@ -76,7 +76,7 @@ class FixedString {
   bool assign(StringView text) {
     if (text.size() > kCapacity) return false;
     // `text` may point into this string, so move rather than copy.
-    __builtin_memmove(buffer_, text.data(), text.size());
+    if (text.size()) __builtin_memmove(buffer_, text.data(), text.size());
     set_size(text.size());
     return true;
   }

@@ -195,6 +195,25 @@ add_executable(BOOTX64
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
   src/Gui/Controls/VideoPlayerControl.cpp
+  src/Media/Image.cpp
+  src/Media/ImageCodecs.cpp
+  src/Media/Zlib.cpp
+  src/Media/Image/Png.cpp
+  src/Media/Image/Jpeg.cpp
+  src/Media/Image/Bmp.cpp
+  src/Media/Image/Gif.cpp
+  src/Media/Image/Pnm.cpp
+  src/Media/Image/Qoi.cpp
+  src/Media/Image/Tga.cpp
+  src/Media/AudioData.cpp
+  src/Media/AudioCodecs.cpp
+  src/Media/Audio/Pcm.cpp
+  src/Media/Audio/Wav.cpp
+  src/Media/Audio/Aiff.cpp
+  src/Media/Audio/Au.cpp
+  src/Media/Audio/Flac.cpp
+  src/Media/VideoFiles.cpp
+  src/Media/MediaCodecs.cpp
   src/Video/AviFile.cpp
   src/Video/AviWriter.cpp
   src/Video/VideoPlayer.cpp

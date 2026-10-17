@@ -40,6 +40,7 @@
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#include "Media/MediaCodecs.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "uefi.hpp"
@@ -316,6 +317,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       first = false;
     }
     if (info.hardware_engine && !info.accelerated) e.text(" (engine present, not driven yet)");
+  }
+
+  // Picture, sound and video files: software codecs for every format, JPEG handed to a video engine first when one really accelerates it.
+  {
+    const media::MediaCodecs media_codecs(&video_codecs);
+    Entry images(Level::Ok, "Media");
+    images.text("images:");
+    for (uint8_t f = 1; f <= static_cast<uint8_t>(media::ImageFormat::Tga); ++f) images.text(" ").text(media::image_format_name(static_cast<media::ImageFormat>(f)));
+    Entry sounds(Level::Ok, "Media");
+    sounds.text("sound:");
+    for (uint8_t f = 1; f <= static_cast<uint8_t>(media::AudioFileFormat::Flac); ++f) sounds.text(" ").text(media::audio_format_name(static_cast<media::AudioFileFormat>(f)));
+    Entry movies(Level::Ok, "Media");
+    movies.text("video: AVI (Motion JPEG, raw), GIF, APNG, Y4M; JPEG on ").text(media_codecs.jpeg_accelerated() ? "a video engine, else the CPU" : "the CPU");
   }
 
   // Audio outputs: native drivers (HD Audio, AC'97, virtio-sound), or a silent software device.

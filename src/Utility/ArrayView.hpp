@@ -130,7 +130,7 @@ class ArrayView {
     requires(std::is_same_v<std::remove_const_t<U>, std::remove_const_t<T>> && !std::is_const_v<T>)
   bool copy_from(ArrayView<U> source) const {
     if (source.size() > size_) return false;
-    __builtin_memmove(data_, source.data(), source.size() * sizeof(T));
+    if (source.size()) __builtin_memmove(data_, source.data(), source.size() * sizeof(T));
     return true;
   }
   // Fills the whole view.

@@ -101,9 +101,14 @@ bool AviFile::parse_headers(ConstByteView list) {
             f.sample_rate = rate_hz;
             f.channels = static_cast<uint8_t>(channels);
             f.type = bits == 16 ? audio::SampleType::S16 : audio::SampleType::U8;
-            if (tag == 1 && (bits == 8 || bits == 16) && f.valid()) {
+            const bool pcm = tag == 1 && (bits == 8 || bits == 16);
+            const bool compressed = tag == 2 || tag == 6 || tag == 7 || tag == 0x11;
+            if (compressed) f.type = audio::SampleType::S16;  // decoded
+            if ((pcm || compressed) && f.valid()) {
               audio_.present = true;
               audio_.format = f;
+              audio_.tag = tag;
+              audio_.wave_format = strl.subview(cbody, csize);
               audio_stream_ = stream;
             }
           }
@@ -210,7 +215,7 @@ bool AviFile::open(ConstByteView file) {
     for (uint64_t i = 0; i < keyframes_.count(); ++i) keyframes_[i] = i == 0;
   }
   for (uint64_t i = 0; i < audio_chunks_.count(); ++i) audio_.bytes += audio_chunks_[i].size;
-  if (audio_.present) audio_.bytes -= audio_.bytes % audio_.format.frame_size();
+  if (audio_.present && audio_.tag == 1) audio_.bytes -= audio_.bytes % audio_.format.frame_size();
   return true;
 }
 
@@ -250,7 +255,7 @@ uint64_t AviFile::copy_audio(ByteView out) const {
     out.subview(done, n).copy_from(file_.subview(c.offset, n));
     done += n;
   }
-  return done - (audio_.present ? done % audio_.format.frame_size() : 0);
+  return done - (audio_.present && audio_.tag == 1 ? done % audio_.format.frame_size() : 0);
 }
 
 }  // namespace video

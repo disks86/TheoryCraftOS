@@ -25,6 +25,8 @@
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Thread.hpp"
+#include "Media/AudioData.hpp"
+#include "Media/Image.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Video/AviFile.hpp"
 
@@ -35,11 +37,13 @@ enum class VideoState : uint8_t { Empty, Stopped, Playing, Paused };
 enum class OpenResult : uint8_t {
   Ok,
   NotAvi,       // not an AVI file, or no video in it
+  Unsupported,  // open_media(): not a video format this OS reads (see media::VideoFileFormat)
   NoDecoder,    // no video codec device can decode this stream (H.264 and the like need a hardware engine driver)
   OutOfMemory,
 };
 
-// Plays an AVI file held in memory: the picture through a video decoder session from the machine's codec devices,
+// Plays an AVI file held in memory (or, with open_media(), a GIF, APNG or Y4M file - decoded up front into frames that
+// carry their own durations, and silent): the picture through a video decoder session from the machine's codec devices,
 // the sound (if the file has PCM audio and a mixer is given) through an audio::AudioPlayer. The sound is the clock
 // while it plays - the picture follows it, skipping frames when decoding falls behind - and with no sound the picture
 // follows the system clock. update() does the work and must be called often (every 10 ms or so) while playing, or
@@ -49,7 +53,8 @@ class VideoPlayer {
  public:
   VideoPlayer(const hardware::IClock& clock, hardware::SystemVideoCodecs& codecs, allocators::IAllocator& allocator,
               audio::AudioMixer* mixer = nullptr)
-      : clock_(clock), codecs_(codecs), allocator_(allocator), mixer_(mixer), file_(allocator), display_(allocator) {}
+      : clock_(clock), codecs_(codecs), allocator_(allocator), mixer_(mixer), file_(allocator), images_(allocator), frame_starts_(allocator),
+        decoded_audio_(allocator), display_(allocator) {}
   ~VideoPlayer();
   VideoPlayer(const VideoPlayer&) = delete;
   VideoPlayer& operator=(const VideoPlayer&) = delete;
@@ -57,6 +62,9 @@ class VideoPlayer {
   // Opens `avi` (borrowed: it must outlive the player or the next open()/close()), replacing what was open. The first
   // picture is decoded at once, so a stopped or paused player shows something.
   OpenResult open(ConstByteView avi);
+  // Opens any video file this OS reads, by looking at it: AVI as open(), GIF/APNG/Y4M as frames in memory. `data` is
+  // borrowed for AVI only (the other formats are decoded into the player). A still picture opens as a one-frame video.
+  OpenResult open_media(ConstByteView data);
   void close();
 
   bool play();
@@ -75,7 +83,7 @@ class VideoPlayer {
   uint32_t frame_width() const { return width_; }
   uint32_t frame_height() const { return height_; }
   uint32_t current_frame() const { return current_frame_; }
-  uint32_t frame_count() const { return file_.frame_count(); }
+  uint32_t frame_count() const { return image_mode_ ? images_.frame_count() : file_.frame_count(); }
   // The picture now to be shown (nullptr when nothing is open). The pixels may change at the next update(): copy or
   // draw under no concurrent update, or re-read it when picture_serial() changes.
   const graphics::Surface* picture() const { return state_ == VideoState::Empty ? nullptr : &surface_; }
@@ -101,6 +109,10 @@ class VideoPlayer {
   static void service_main(void* self);
   void release();
   bool decode_frame(uint32_t index);
+  bool all_keyframes() const { return image_mode_ || file_.all_keyframes(); }
+  uint32_t frame_at_time(int64_t time_us) const;
+  OpenResult open_images();
+  void open_audio();
   void show_frame(uint32_t target);
   int64_t position_locked();
   void rebase(int64_t position_us);
@@ -112,6 +124,10 @@ class VideoPlayer {
   kernel::Mutex mutex_;
 
   AviFile file_;
+  media::Image images_;            // the frames of a GIF/APNG/Y4M file
+  List<int64_t> frame_starts_;     // when each frame of images_ starts (microseconds), and the end after the last
+  media::AudioData decoded_audio_; // a compressed AVI soundtrack, decoded
+  bool image_mode_ = false;
   UniquePointer<hardware::IVideoDecoder> decoder_;
   hardware::VideoFrameBuffer display_;
   graphics::Surface surface_;

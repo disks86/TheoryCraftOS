@@ -36,6 +36,10 @@ class SystemVideoCodecs {
   void initialize();
   void shutdown();
 
+  // Adds a device (a driver loaded later, or one brought up by a test): it is initialised here and asked before the
+  // devices already present. False if it fails to initialise or memory ran out.
+  bool add_device(UniquePointer<IVideoCodecDevice> device);
+
   uint32_t count() const { return static_cast<uint32_t>(devices_.count()); }
   IVideoCodecDevice* at(uint32_t index) const { return index < devices_.count() ? devices_[index].get() : nullptr; }
   // Codecs some device decodes / encodes.

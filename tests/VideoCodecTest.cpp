@@ -286,7 +286,8 @@ static void test_jpeg_roundtrip() {
     CHECK(out_bgra.allocate({128, 96, PixelFormat::Bgra8888}) && dec.output(out_bgra));
     VideoFrameBuffer via_yuv(a);
     CHECK(via_yuv.allocate({128, 96, PixelFormat::Bgra8888}) && convert_frame(out_yuv.frame(), via_yuv));
-    CHECK(psnr_bgra(out_bgra.frame(), via_yuv.frame()) > 45);   // the same picture reached two ways
+    // The same picture reached two ways: the BGRA path smooths the chroma while upsampling it (as libjpeg does), the other repeats it.
+    CHECK(psnr_bgra(out_bgra.frame(), via_yuv.frame()) > 30);
 
     // A limited-range YUV picture is widened before it is encoded: black (16) comes out black.
     VideoFrameBuffer dark(a);

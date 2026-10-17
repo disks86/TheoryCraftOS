@@ -22,9 +22,9 @@
 
 namespace hardware {
 
-// A baseline JPEG decoder (ITU T.81 sequential DCT, Huffman coded, 8-bit samples) with integer arithmetic:
-// one component (grey) or three (YCbCr) with any sampling up to 2x2 per component, restart markers, any
-// number of scans. Progressive, arithmetic-coded, 12-bit, lossless and four-component (CMYK) files are refused.
+// A JPEG decoder (ITU T.81, Huffman coded, 8-bit samples) with integer arithmetic: sequential (baseline) and progressive
+// files, one component (grey) or three (YCbCr) with any sampling up to 2x2 per component, restart markers, any number
+// of scans. Arithmetic-coded, 12-bit, lossless, hierarchical and four-component (CMYK) files are refused.
 class JpegDecoder {
  public:
   explicit JpegDecoder(allocators::IAllocator& allocator) : allocator_(allocator) {}
@@ -40,12 +40,16 @@ class JpegDecoder {
   bool decoded() const { return decoded_; }
   // Writes the last decoded picture into `out` (allocated for the picture's width and height in any pixel format).
   bool output(const VideoFrameBuffer& out) const;
+  // The same into a Bgra8888 picture held elsewhere (`pitch` in pixels, at least the width).
+  bool output_bgra(uint32_t* dest, uint32_t pitch) const;
 
  private:
   struct Component {
     uint8_t id = 0, h = 1, v = 1, quant = 0;
     uint32_t blocks_x = 0, blocks_y = 0;  // the plane in whole blocks (padded to the MCU grid)
     ByteView plane;
+    ByteView full;                    // after decoding: the plane brought up to the picture's resolution (empty when it already is)
+    ArrayView<int16_t> coefficients;  // progressive files: every coefficient of the component until the last scan is in
     int32_t dc_prediction = 0;
     uint8_t dc_table = 0, ac_table = 0;
   };
@@ -55,12 +59,18 @@ class JpegDecoder {
     int32_t min_code[17], max_code[18], first_index[17];
   };
   struct Bits;
+  struct ScanParams {
+    uint32_t spectral_start = 0, spectral_end = 63, approximation_high = 0, approximation_low = 0;
+  };
 
   void release();
   bool parse_frame_header(ConstByteView segment);
   bool parse_huffman(ConstByteView segment);
   bool parse_quant(ConstByteView segment);
-  bool decode_scan(ConstByteView data, uint64_t* position, const uint8_t* scan_components, uint32_t scan_count);
+  bool decode_scan(ConstByteView data, uint64_t* position, const uint8_t* scan_components, uint32_t scan_count, const ScanParams& params);
+  bool decode_block_progressive(Bits& bits, Component& c, int16_t* block, const ScanParams& params, uint32_t* eob_run);
+  void finish_progressive();
+  void upsample_components();
   bool decode_block(Bits& bits, Component& c, uint8_t* destination, uint32_t stride);
   uint32_t sample(uint32_t component, uint32_t x, uint32_t y) const;
 
@@ -75,6 +85,7 @@ class JpegDecoder {
   uint32_t restart_interval_ = 0;
   bool decoded_ = false;
   bool frame_seen_ = false;
+  bool progressive_ = false;
 };
 
 // A baseline JPEG encoder: 4:2:0 YCbCr (or one grey component never - always colour), quality 1-100 (libjpeg's

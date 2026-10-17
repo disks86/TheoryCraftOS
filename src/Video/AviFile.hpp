@@ -35,9 +35,13 @@ struct AviVideoInfo {
 };
 
 struct AviAudioInfo {
-  bool present = false;  // an audio stream we can play: uncompressed 8- or 16-bit PCM, mono or stereo
-  audio::StreamFormat format;
-  uint64_t bytes = 0;    // all the audio in the file
+  // An audio stream we can play: uncompressed 8- or 16-bit PCM, or A-law, mu-law, IMA ADPCM or Microsoft ADPCM (see
+  // `tag`), mono or stereo.
+  bool present = false;
+  audio::StreamFormat format;  // what it plays as (the compressed kinds decode to 16-bit)
+  uint32_t tag = 1;            // WAVE_FORMAT_*: 1 PCM, 2 MS ADPCM, 6 A-law, 7 mu-law, 0x11 IMA ADPCM
+  ConstByteView wave_format;   // the stream's WAVEFORMATEX as stored (in the file), for decoding the compressed kinds
+  uint64_t bytes = 0;          // all the audio in the file (compressed bytes for the compressed kinds)
 };
 
 // Reads an AVI file that is held in memory (borrowed: it must outlive the reader): one video stream and, if

@@ -18,6 +18,10 @@
 
 #include "Video/VideoPlayer.hpp"
 #include "Hardware/VideoCodec/ColorConvert.hpp"
+#include "Media/AudioCodecs.hpp"
+#include "Media/ImageCodecs.hpp"
+#include "Media/VideoFiles.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 namespace video {
 
@@ -34,6 +38,10 @@ void VideoPlayer::release() {
   audio_source_.reset();
   release_view(allocator_, audio_samples_);
   decoder_.reset();
+  decoded_audio_.clear();
+  images_.clear();
+  frame_starts_.clear();
+  image_mode_ = false;
   state_ = VideoState::Empty;
   have_picture_ = false;
   width_ = height_ = 0;
@@ -75,26 +83,57 @@ OpenResult VideoPlayer::open(ConstByteView avi) {
   }
   have_picture_ = true;
 
-  // The sound: all the audio chunks gathered into one run, played by an AudioPlayer.
-  if (mixer_ && file_.audio().present && file_.audio().bytes > 0) {
-    audio_samples_ = allocate_view<uint8_t>(allocator_, file_.audio().bytes);
-    if (!audio_samples_.empty()) {
-      const uint64_t bytes = file_.copy_audio(audio_samples_);
-      audio_source_ = UniquePointer<audio::MemoryPcmSource>::make(allocator_, ConstByteView(audio_samples_).first(bytes), file_.audio().format);
-      audio_player_ = UniquePointer<audio::AudioPlayer>::make(allocator_, *mixer_, allocator_);
-      if (!audio_source_ || !audio_player_ || !audio_player_->open(audio_source_.get())) {
-        audio_player_.reset();
-        audio_source_.reset();
-        release_view(allocator_, audio_samples_);  // play without sound
-      }
-    }
-  }
+  open_audio();
   state_ = VideoState::Stopped;
   return OpenResult::Ok;
 }
 
+// The sound of an AVI file: all its audio chunks gathered into one run (decoded first, for the compressed kinds), played by
+// an AudioPlayer. Without a mixer, or if anything fails, the video plays silently.
+void VideoPlayer::open_audio() {
+  const AviAudioInfo& info = file_.audio();
+  if (!mixer_ || !info.present || info.bytes == 0) return;
+  audio::IPcmSource* source = nullptr;
+  if (info.tag == 1) {
+    audio_samples_ = allocate_view<uint8_t>(allocator_, info.bytes);
+    if (audio_samples_.empty()) return;
+    const uint64_t bytes = file_.copy_audio(audio_samples_);
+    audio_source_ = UniquePointer<audio::MemoryPcmSource>::make(allocator_, ConstByteView(audio_samples_).first(bytes), info.format);
+    source = audio_source_.get();
+  } else {
+    // Wrap the compressed bytes in a WAV file (the stream's own format header, then the data) and let the WAV decoder do it.
+    ByteView packed = allocate_view<uint8_t>(allocator_, info.bytes);
+    if (packed.empty()) return;
+    const uint64_t got = file_.copy_audio(packed);
+    ByteBuffer wav(allocator_);
+    const bool built = wav.put_tag("RIFF") && wav.put32(static_cast<uint32_t>(4 + 8 + info.wave_format.size() + 8 + got)) && wav.put_tag("WAVE") &&
+                       wav.put_tag("fmt ") && wav.put32(static_cast<uint32_t>(info.wave_format.size())) && wav.append(info.wave_format) &&
+                       ((info.wave_format.size() & 1) == 0 || wav.put8(0)) && wav.put_tag("data") && wav.put32(static_cast<uint32_t>(got)) &&
+                       wav.append(ConstByteView(packed).first(got));
+    release_view(allocator_, packed);
+    if (!built || !media::decode_wav(wav.view(), &decoded_audio_)) return;
+    source = decoded_audio_.source();
+  }
+  audio_player_ = UniquePointer<audio::AudioPlayer>::make(allocator_, *mixer_, allocator_);
+  if (!source || !audio_player_ || !audio_player_->open(source)) {
+    audio_player_.reset();
+    audio_source_.reset();
+    decoded_audio_.clear();
+    release_view(allocator_, audio_samples_);  // play without sound
+  }
+}
+
 // Decodes frame `index` into the picture. False if the decoder gave nothing (the old picture stays).
 bool VideoPlayer::decode_frame(uint32_t index) {
+  if (image_mode_) {
+    ArrayView<uint32_t> pixels = images_.frame(index);
+    if (pixels.empty()) return false;
+    __builtin_memcpy(display_.plane(0).data(), pixels.data(), pixels.size() * 4);
+    current_frame_ = index;
+    ++decoded_;
+    ++serial_;
+    return true;
+  }
   VideoPacket packet;
   if (!decoder_ || !file_.frame(index, &packet)) return false;
   VideoFrame frame;
@@ -124,7 +163,7 @@ bool VideoPlayer::decode_frame(uint32_t index) {
 // Brings the picture to frame `target`. A codec whose pictures all stand alone jumps there; one that builds on earlier
 // pictures decodes every frame since the last keyframe it can reach.
 void VideoPlayer::show_frame(uint32_t target) {
-  if (file_.all_keyframes()) {
+  if (all_keyframes()) {
     if (target > current_frame_ + 1) skipped_ += target - current_frame_ - 1;
     decode_frame(target);
     return;
@@ -138,6 +177,57 @@ void VideoPlayer::show_frame(uint32_t target) {
     }
   }
   for (uint32_t i = from; i <= target; ++i) decode_frame(i);
+}
+
+uint32_t VideoPlayer::frame_at_time(int64_t time_us) const {
+  if (!image_mode_) return file_.frame_at_time(time_us);
+  const uint64_t n = images_.frame_count();
+  if (n == 0 || time_us <= 0) return 0;
+  uint64_t lo = 0, hi = n - 1;  // the last frame that starts at or before time_us
+  while (lo < hi) {
+    const uint64_t mid = (lo + hi + 1) / 2;
+    if (frame_starts_[mid] <= time_us) lo = mid;
+    else hi = mid - 1;
+  }
+  return static_cast<uint32_t>(lo);
+}
+
+// Takes the Y4M/GIF/APNG frames in images_ as the video: a picture surface, and when each frame starts.
+OpenResult VideoPlayer::open_images() {
+  if (images_.empty() || !display_.allocate({images_.width(), images_.height(), PixelFormat::Bgra8888})) return OpenResult::OutOfMemory;
+  int64_t at = 0;
+  for (uint32_t i = 0; i < images_.frame_count(); ++i) {
+    if (!frame_starts_.push_back(at)) return OpenResult::OutOfMemory;
+    const uint32_t delay = images_.delay_ms(i);
+    at += int64_t{delay ? delay : 1} * 1000;
+  }
+  if (!frame_starts_.push_back(at)) return OpenResult::OutOfMemory;
+  image_mode_ = true;
+  width_ = images_.width();
+  height_ = images_.height();
+  surface_.pixels = ArrayView<uint32_t>(reinterpret_cast<uint32_t*>(display_.plane(0).data()), uint64_t{width_} * height_);
+  surface_.width = width_;
+  surface_.height = height_;
+  surface_.pitch = width_;
+  duration_us_ = at;
+  current_frame_ = 0;
+  if (!decode_frame(0)) return OpenResult::OutOfMemory;
+  have_picture_ = true;
+  state_ = VideoState::Stopped;
+  return OpenResult::Ok;
+}
+
+OpenResult VideoPlayer::open_media(ConstByteView data) {
+  const media::VideoFileFormat format = media::detect_video_file(data);
+  if (format == media::VideoFileFormat::Avi) return open(data);
+  kernel::ScopedMutex guard(mutex_);
+  release();
+  // GIF, APNG and Y4M are videos; any other picture format opens as a video of one frame.
+  if (format == media::VideoFileFormat::Unknown && media::detect_image_format(data) == media::ImageFormat::Unknown) return OpenResult::Unsupported;
+  if (!(format == media::VideoFileFormat::Y4m ? media::decode_y4m(data, &images_) : media::decode_image(data, &images_))) return OpenResult::Unsupported;
+  const OpenResult result = open_images();
+  if (result != OpenResult::Ok) release();
+  return result;
 }
 
 void VideoPlayer::rebase(int64_t position_us) {
@@ -205,7 +295,7 @@ void VideoPlayer::seek(int64_t time_us) {
   if (state_ == VideoState::Empty) return;
   if (time_us < 0) time_us = 0;
   if (time_us > duration_us_) time_us = duration_us_;
-  show_frame(file_.frame_at_time(time_us));
+  show_frame(frame_at_time(time_us));
   paused_position_us_ = time_us;
   rebase(time_us);
   if (audio_player_) audio_player_->seek(static_cast<uint64_t>(time_us) * audio_player_->sample_rate() / 1000000);
@@ -232,7 +322,7 @@ void VideoPlayer::update() {
   if (state_ != VideoState::Playing) return;
   if (audio_player_) audio_player_->update();
   const int64_t position = position_locked();
-  const uint32_t target = file_.frame_at_time(position);
+  const uint32_t target = frame_at_time(position);
   if (target != current_frame_) show_frame(target);
   if (position >= duration_us_) {
     if (looping_) {

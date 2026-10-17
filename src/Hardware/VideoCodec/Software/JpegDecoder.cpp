@@ -193,7 +193,12 @@ struct JpegDecoder::Bits {
 };
 
 void JpegDecoder::release() {
-  for (Component& c : components_) release_view(allocator_, c.plane);
+  for (Component& c : components_) {
+    release_view(allocator_, c.plane);
+    release_view(allocator_, c.full);
+    release_view(allocator_, c.coefficients);
+  }
+  progressive_ = false;
   decoded_ = false;
   frame_seen_ = false;
 }
@@ -278,6 +283,11 @@ bool JpegDecoder::parse_frame_header(ConstByteView s) {
     c.plane = allocate_view<uint8_t>(allocator_, uint64_t{c.blocks_x} * 8 * c.blocks_y * 8, 16);
     if (c.plane.empty()) return false;
     c.plane.fill(128);
+    if (progressive_) {
+      c.coefficients = allocate_view<int16_t>(allocator_, uint64_t{c.blocks_x} * c.blocks_y * 64, 16);
+      if (c.coefficients.empty()) return false;
+      c.coefficients.fill(0);
+    }
   }
   frame_seen_ = true;
   return true;
@@ -325,8 +335,119 @@ bool JpegDecoder::decode_block(Bits& bits, Component& c, uint8_t* destination, u
   return true;
 }
 
-bool JpegDecoder::decode_scan(ConstByteView data, uint64_t* position, const uint8_t* scan_components, uint32_t scan_count) {
+// One block of a progressive scan: the DC or AC coefficients of one band, either their first appearance or a refinement
+// bit by bit (T.81 G.1.2). `block` holds the coefficients in natural order.
+bool JpegDecoder::decode_block_progressive(Bits& bits, Component& c, int16_t* block, const ScanParams& params, uint32_t* eob_run) {
+  auto decode_symbol = [&](const Huffman& h) -> int32_t {
+    int32_t code = 0;
+    for (int len = 1; len <= 16; ++len) {
+      code = (code << 1) | bits.bit();
+      if (h.max_code[len] >= 0 && code <= h.max_code[len] && code >= h.min_code[len]) return h.symbols[h.first_index[len] + code - h.min_code[len]];
+    }
+    return -1;
+  };
+  auto extend = [](int32_t v, int32_t t) { return v < (1 << (t - 1)) ? v - (1 << t) + 1 : v; };
+  const uint32_t low = params.approximation_low;
+  if (params.spectral_start == 0) {  // DC
+    if (params.approximation_high == 0) {
+      const int32_t t = decode_symbol(dc_[c.dc_table]);
+      if (t < 0 || t > 11) return false;
+      c.dc_prediction += t ? extend(static_cast<int32_t>(bits.receive(t)), t) : 0;
+      if (c.dc_prediction > 32767) c.dc_prediction = 32767;
+      if (c.dc_prediction < -32768) c.dc_prediction = -32768;
+      block[0] = static_cast<int16_t>(c.dc_prediction * (1 << low));
+    } else if (bits.bit()) {
+      block[0] = static_cast<int16_t>(block[0] | (1 << low));
+    }
+    return true;
+  }
+  const Huffman& ac = ac_[c.ac_table];
+  if (params.approximation_high == 0) {  // AC, first pass
+    if (*eob_run > 0) {
+      --*eob_run;
+      return true;
+    }
+    for (uint32_t k = params.spectral_start; k <= params.spectral_end; ++k) {
+      const int32_t rs = decode_symbol(ac);
+      if (rs < 0) return false;
+      const int32_t s = rs & 15, r = rs >> 4;
+      if (s == 0) {
+        if (r < 15) {  // end of band for this block and the next 2^r - 1 + extra blocks
+          *eob_run = (1u << r) - 1;
+          if (r) *eob_run += bits.receive(r);
+          break;
+        }
+        k += 15;  // sixteen zeros (the loop adds the last one)
+      } else {
+        k += r;
+        if (k > 63) return false;
+        block[kZigZag[k]] = static_cast<int16_t>(extend(static_cast<int32_t>(bits.receive(s)), s) * (1 << low));
+      }
+    }
+    return true;
+  }
+  // AC refinement: one more bit of every coefficient already nonzero, and some new ones of magnitude 1 << low.
+  const int32_t p1 = 1 << low, m1 = -(1 << low);
+  uint32_t k = params.spectral_start;
+  auto refine = [&](int16_t* coefficient) {
+    if (bits.bit() && (*coefficient & p1) == 0) *coefficient = static_cast<int16_t>(*coefficient + (*coefficient >= 0 ? p1 : m1));
+  };
+  if (*eob_run == 0) {
+    for (; k <= params.spectral_end; ++k) {
+      const int32_t rs = decode_symbol(ac);
+      if (rs < 0) return false;
+      int32_t r = rs >> 4, s = rs & 15;
+      if (s) {
+        if (s != 1) return false;
+        s = bits.bit() ? p1 : m1;
+      } else if (r != 15) {
+        *eob_run = 1u << r;
+        if (r) *eob_run += bits.receive(r);
+        break;
+      }
+      // Move over r zero coefficients (and refine the nonzero ones passed on the way).
+      do {
+        int16_t* coefficient = &block[kZigZag[k]];
+        if (*coefficient != 0) {
+          refine(coefficient);
+        } else {
+          if (--r < 0) break;
+        }
+        ++k;
+      } while (k <= params.spectral_end);
+      if (s && k <= 63) block[kZigZag[k]] = static_cast<int16_t>(s);
+    }
+  }
+  if (*eob_run > 0) {  // the rest of the band: refine what is nonzero
+    for (; k <= params.spectral_end; ++k) {
+      int16_t* coefficient = &block[kZigZag[k]];
+      if (*coefficient != 0) refine(coefficient);
+    }
+    --*eob_run;
+  }
+  return true;
+}
+
+// All scans are in: dequantise every block and transform it into its plane.
+void JpegDecoder::finish_progressive() {
+  for (uint32_t i = 0; i < component_count_; ++i) {
+    Component& c = components_[i];
+    const uint16_t* q = quant_[c.quant];
+    const uint32_t stride = c.blocks_x * 8;
+    for (uint32_t by = 0; by < c.blocks_y; ++by)
+      for (uint32_t bx = 0; bx < c.blocks_x; ++bx) {
+        const int16_t* block = c.coefficients.data() + (uint64_t{by} * c.blocks_x + bx) * 64;
+        int32_t dequantised[64];
+        for (int k = 0; k < 64; ++k) dequantised[k] = limit_coefficient(block[k] * q[k]);
+        inverse_dct(dequantised, c.plane.data() + uint64_t{by} * 8 * stride + uint64_t{bx} * 8, stride);
+      }
+    release_view(allocator_, c.coefficients);
+  }
+}
+
+bool JpegDecoder::decode_scan(ConstByteView data, uint64_t* position, const uint8_t* scan_components, uint32_t scan_count, const ScanParams& params) {
   Bits bits{data, *position};
+  uint32_t eob_run = 0;
   for (uint32_t i = 0; i < component_count_; ++i) components_[i].dc_prediction = 0;
   uint32_t until_restart = restart_interval_;
 
@@ -348,6 +469,7 @@ bool JpegDecoder::decode_scan(ConstByteView data, uint64_t* position, const uint
     for (uint32_t ux = 0; ux < units_x; ++ux) {
       if (restart_interval_ && until_restart == 0) {
         bits.restart();
+        eob_run = 0;
         for (uint32_t i = 0; i < component_count_; ++i) components_[i].dc_prediction = 0;
         until_restart = restart_interval_;
       }
@@ -359,6 +481,11 @@ bool JpegDecoder::decode_scan(ConstByteView data, uint64_t* position, const uint
             const uint32_t block_x = scan_count == 1 ? ux : ux * c.h + bx, block_y = scan_count == 1 ? uy : uy * c.v + by;
             if (block_x >= c.blocks_x || block_y >= c.blocks_y) {  // outside the padded plane (cannot happen for valid files)
               return false;
+            }
+            if (progressive_) {
+              int16_t* block = c.coefficients.data() + (uint64_t{block_y} * c.blocks_x + block_x) * 64;
+              if (!decode_block_progressive(bits, c, block, params, &eob_run)) return false;
+              continue;
             }
             const uint32_t stride = c.blocks_x * 8;
             uint8_t* destination = c.plane.data() + uint64_t{block_y} * 8 * stride + uint64_t{block_x} * 8;
@@ -411,7 +538,12 @@ bool JpegDecoder::decode(ConstByteView data) {
       case 0xC1:
         if (frame_seen_ || !parse_frame_header(segment)) return false;
         break;
-      case 0xC2: case 0xC3: case 0xC5: case 0xC6: case 0xC7: case 0xC9: case 0xCA: case 0xCB: case 0xCD: case 0xCE: case 0xCF:
+      case 0xC2:
+        if (frame_seen_) return false;
+        progressive_ = true;
+        if (!parse_frame_header(segment)) return false;
+        break;
+      case 0xC3: case 0xC5: case 0xC6: case 0xC7: case 0xC9: case 0xCA: case 0xCB: case 0xCD: case 0xCE: case 0xCF:
         return false;  // progressive, lossless, arithmetic or hierarchical: not supported
       case 0xDA: {
         if (!frame_seen_ || segment.size() < 1 + 2 * uint64_t{segment[0]} + 3) return false;
@@ -427,12 +559,30 @@ bool JpegDecoder::decode(ConstByteView data) {
           scan[i] = static_cast<uint8_t>(found);
           components_[found].dc_table = segment[2 + 2 * i] >> 4;
           components_[found].ac_table = segment[2 + 2 * i] & 15;
-          if (components_[found].dc_table > 3 || components_[found].ac_table > 3 || !dc_[components_[found].dc_table].defined ||
-              !ac_[components_[found].ac_table].defined || !quant_defined_[components_[found].quant])
-            return false;
+          if (components_[found].dc_table > 3 || components_[found].ac_table > 3 || !quant_defined_[components_[found].quant]) return false;
         }
         if (count != 1 && count != component_count_) return false;
-        if (!decode_scan(data, &at, scan, count)) return false;
+        ScanParams params;
+        if (progressive_) {
+          const uint64_t base = 1 + 2 * uint64_t{count};
+          params.spectral_start = segment[base];
+          params.spectral_end = segment[base + 1];
+          params.approximation_high = segment[base + 2] >> 4;
+          params.approximation_low = segment[base + 2] & 15;
+          if (params.spectral_start > params.spectral_end || params.spectral_end > 63 || params.approximation_low > 13 ||
+              (params.spectral_start == 0 && params.spectral_end != 0) || (params.spectral_start > 0 && count != 1) ||
+              (params.approximation_high != 0 && params.approximation_high != params.approximation_low + 1))
+            return false;
+        }
+        // The Huffman tables the scan will use must exist: a baseline scan needs both kinds, a progressive one only the kind of
+        // its band (and a DC refinement none).
+        for (uint32_t i = 0; i < count; ++i) {
+          const Component& c = components_[scan[i]];
+          const bool need_dc = !progressive_ || (params.spectral_start == 0 && params.approximation_high == 0);
+          const bool need_ac = !progressive_ || params.spectral_start > 0;
+          if ((need_dc && !dc_[c.dc_table].defined) || (need_ac && !ac_[c.ac_table].defined)) return false;
+        }
+        if (!decode_scan(data, &at, scan, count, params)) return false;
         scanned = true;
         break;
       }
@@ -440,38 +590,93 @@ bool JpegDecoder::decode(ConstByteView data) {
     }
   }
   decoded_ = scanned && frame_seen_;
+  if (decoded_ && progressive_) finish_progressive();
+  if (decoded_) upsample_components();
   return decoded_;
+}
+
+// Brings the subsampled components up to the resolution of the picture the way libjpeg does ("fancy upsampling"): the
+// triangle filters for the common 2:1 cases, plain repetition otherwise.
+void JpegDecoder::upsample_components() {
+  for (uint32_t i = 0; i < component_count_; ++i) {
+    Component& c = components_[i];
+    if (c.h == max_h_ && c.v == max_v_) continue;
+    const uint32_t stride = c.blocks_x * 8;  // of the plane
+    const uint32_t in_w = (width_ * c.h + max_h_ - 1) / max_h_, in_h = (height_ * c.v + max_v_ - 1) / max_v_;  // the real size
+    const uint32_t out_stride = width_;
+    c.full = allocate_view<uint8_t>(allocator_, uint64_t{out_stride} * height_);
+    if (c.full.empty()) continue;  // sample() falls back to repetition
+    const uint8_t* in = c.plane.data();
+    uint8_t* out = c.full.data();
+    const bool wide = c.h * 2 == max_h_, tall = c.v * 2 == max_v_;
+    auto clamp_row = [&](int32_t y) { return static_cast<uint32_t>(y < 0 ? 0 : y >= static_cast<int32_t>(in_h) ? in_h - 1 : y); };
+    for (uint32_t y = 0; y < height_; ++y) {
+      uint8_t* dest = out + uint64_t{y} * out_stride;
+      if (wide && !tall && c.v == max_v_) {  // 2:1 across
+        const uint8_t* row = in + uint64_t{clamp_row(static_cast<int32_t>(y))} * stride;
+        for (uint32_t x = 0; x < width_; ++x) {
+          const uint32_t cx = x / 2;
+          const int32_t near_v = row[cx];
+          if (x % 2 == 0) dest[x] = static_cast<uint8_t>(cx == 0 ? near_v : (near_v * 3 + row[cx - 1] + 1) >> 2);
+          else dest[x] = static_cast<uint8_t>(cx + 1 >= in_w ? near_v : (near_v * 3 + row[cx + 1] + 2) >> 2);
+        }
+      } else if (wide && tall) {  // 2:1 both ways
+        const uint32_t cy = y / 2;
+        const uint8_t* row0 = in + uint64_t{cy} * stride;
+        const uint8_t* row1 = in + uint64_t{clamp_row(static_cast<int32_t>(cy) + (y % 2 == 0 ? -1 : 1))} * stride;
+        auto column_sum = [&](uint32_t cx) { return static_cast<int32_t>(row0[cx]) * 3 + row1[cx]; };
+        for (uint32_t x = 0; x < width_; ++x) {
+          const uint32_t cx = x / 2;
+          const int32_t this_sum = column_sum(cx);
+          if (x % 2 == 0) dest[x] = static_cast<uint8_t>(cx == 0 ? (this_sum * 4 + 8) >> 4 : (this_sum * 3 + column_sum(cx - 1) + 8) >> 4);
+          else dest[x] = static_cast<uint8_t>(cx + 1 >= in_w ? (this_sum * 4 + 7) >> 4 : (this_sum * 3 + column_sum(cx + 1) + 7) >> 4);
+        }
+      } else if (tall && c.h == max_h_) {  // 2:1 down the picture
+        const uint32_t cy = y / 2;
+        const uint8_t* row0 = in + uint64_t{cy} * stride;
+        const uint8_t* row1 = in + uint64_t{clamp_row(static_cast<int32_t>(cy) + (y % 2 == 0 ? -1 : 1))} * stride;
+        const int32_t bias = y % 2 == 0 ? 1 : 2;
+        for (uint32_t x = 0; x < width_; ++x) dest[x] = static_cast<uint8_t>((row0[x] * 3 + row1[x] + bias) >> 2);
+      } else {  // any other ratio: repeat
+        for (uint32_t x = 0; x < width_; ++x) dest[x] = in[uint64_t{y * c.v / max_v_} * stride + x * c.h / max_h_];
+      }
+    }
+  }
 }
 
 // One component's value at picture pixel (x, y), whatever its sampling.
 uint32_t JpegDecoder::sample(uint32_t component, uint32_t x, uint32_t y) const {
   const Component& c = components_[component];
+  if (!c.full.empty()) return c.full[uint64_t{y} * width_ + x];
   const uint32_t cx = x * c.h / max_h_, cy = y * c.v / max_v_;
   return c.plane[uint64_t{cy} * c.blocks_x * 8 + cx];
+}
+
+bool JpegDecoder::output_bgra(uint32_t* dest, uint32_t pitch) const {
+  if (!decoded_ || !dest || pitch < width_) return false;
+  const bool grey = component_count_ == 1;
+  for (uint32_t y = 0; y < height_; ++y)
+    for (uint32_t x = 0; x < width_; ++x) {
+      const int32_t yy = static_cast<int32_t>(sample(0, x, y));
+      int32_t u = 0, v = 0;
+      if (!grey) {
+        u = static_cast<int32_t>(sample(1, x, y)) - 128;
+        v = static_cast<int32_t>(sample(2, x, y)) - 128;
+      }
+      auto clamp = [](int32_t value) { return static_cast<uint32_t>(value < 0 ? 0 : value > 255 ? 255 : value); };
+      const uint32_t r = clamp(yy + ((91881 * v + 32768) >> 16));
+      const uint32_t g = clamp(yy - ((22554 * u + 46802 * v + 32768) >> 16));
+      const uint32_t b = clamp(yy + ((116130 * u + 32768) >> 16));
+      dest[uint64_t{y} * pitch + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+    }
+  return true;
 }
 
 bool JpegDecoder::output(const VideoFrameBuffer& out) const {
   if (!decoded_ || !out.valid() || out.format().width != width_ || out.format().height != height_) return false;
   const VideoFormat& fmt = out.format();
   const bool grey = component_count_ == 1;
-  if (fmt.pixel_format == PixelFormat::Bgra8888) {
-    uint32_t* dest = reinterpret_cast<uint32_t*>(out.plane(0).data());
-    for (uint32_t y = 0; y < height_; ++y)
-      for (uint32_t x = 0; x < width_; ++x) {
-        const int32_t yy = static_cast<int32_t>(sample(0, x, y));
-        int32_t u = 0, v = 0;
-        if (!grey) {
-          u = static_cast<int32_t>(sample(1, x, y)) - 128;
-          v = static_cast<int32_t>(sample(2, x, y)) - 128;
-        }
-        auto clamp = [](int32_t value) { return static_cast<uint32_t>(value < 0 ? 0 : value > 255 ? 255 : value); };
-        const uint32_t r = clamp(yy + ((91881 * v + 32768) >> 16));
-        const uint32_t g = clamp(yy - ((22554 * u + 46802 * v + 32768) >> 16));
-        const uint32_t b = clamp(yy + ((116130 * u + 32768) >> 16));
-        dest[uint64_t{y} * width_ + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
-      }
-    return true;
-  }
+  if (fmt.pixel_format == PixelFormat::Bgra8888) return output_bgra(reinterpret_cast<uint32_t*>(out.plane(0).data()), width_);
   // I420 or NV12: the luma as is, the chroma averaged over 2x2 pixels (grey: neutral).
   for (uint32_t y = 0; y < height_; ++y)
     for (uint32_t x = 0; x < width_; ++x) out.plane(0)[uint64_t{y} * fmt.plane_stride(0) + x] = static_cast<uint8_t>(sample(0, x, y));

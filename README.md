@@ -85,7 +85,7 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   `Intel/IntelMediaVideoEngine` (Quick Sync) are what `SystemVideoCodecs` creates for a display controller of that vendor: they
   report `info().hardware_engine` but `accelerated` stays false - this OS does not drive those engines, so their sessions run on
   the CPU and **H.264, H.265, VP9 and AV1 are not available** until a native driver exists (that is where it goes). Not covered:
-  progressive/arithmetic JPEG, B-frame reordering is in the interface but unused, capture devices.
+  arithmetic JPEG, B-frame reordering is in the interface but unused, capture devices.
   `tests/VideoCodecTest.cpp` includes a fuzz run of the JPEG decoder under ASAN/UBSAN.
 - `src/Video/`: `AviFile` reads an in-memory AVI (video stream: MJPG, I420/NV12, or a named codec such as H264 flagged for the
   decoders; PCM audio; frames found by scanning `movi`, keyframes from `idx1`), `AviWriter` builds one, and `VideoPlayer` plays it:
@@ -93,6 +93,27 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   frames are skipped when decoding falls behind; without sound the system clock is used), play/pause/stop/seek (back to the
   nearest keyframe for inter-coded streams)/loop, a BGRA picture with a serial number. `OpenResult::NoDecoder` is what an H.264
   file gets today. `tests/VideoPlayerTest.cpp` covers it with a fake clock and audio device.
+- `src/Media/`: picture, sound and video **file formats**, all in software, with hardware used first where there is any.
+  `MediaCodecs` is the front door (`decode_image`/`encode_image`/`decode_audio`/`encode_audio`/`decode_video`): JPEG goes to a
+  video codec device that really accelerates Motion JPEG (`info().accelerated`, found through `SystemVideoCodecs`; sessions are
+  tried in device order), and when there is none - which is every machine today, since the NVIDIA/AMD/Intel engines are named
+  but not driven - or the device refuses the data, the CPU codecs do it; each call reports which path ran (`CodecPath`). Every
+  other format below has no hardware engine on current machines and is always CPU. Pictures decode to `Image` (frames of
+  0xAARRGGBB with per-frame delays and a loop count), sounds to `AudioData` (16-bit mono/stereo, plays through
+  `source()` into `AudioPlayer`).
+  - Images: PNG and APNG (all colour types and depths, interlacing, tRNS; encoder with adaptive filters and LZ77 + Huffman
+    deflate in `Zlib`), JPEG (baseline and progressive, bit-exact with libjpeg-turbo for the checked cases; baseline 4:2:0
+    encoder), BMP (1-32 bit, RLE, bit fields), GIF (LZW, interlace, animation; encoder uses a fixed 216-colour palette with
+    dithering), PNM/PAM, QOI, TGA.
+  - Sound: WAV (PCM 8-32 bit, float, A-law, mu-law, IMA and Microsoft ADPCM, extensible), AIFF/AIFC, AU, FLAC (full decoder
+    with CRC checks; fixed-predictor encoder). Encoders write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: MP3, AAC,
+    Vorbis, Opus** (lossy codecs), nor WebP, TIFF, H.264/HEVC/VP9/AV1 video.
+  - Video files: `VideoFiles` reads GIF, APNG and Y4M (4:2:0/4:2:2/4:4:4/mono) as frames with their own durations, which
+    `VideoPlayer::open_media()` plays (AVI as before, now also with A-law, mu-law and ADPCM soundtracks; a still picture opens
+    as a one-frame video).
+  `tests/MediaTest.cpp` checks every decoder against fixtures in `tests/data/` whose expected output comes from Pillow/ffmpeg
+  (`tests/data/make_fixtures.py` regenerates them), plus encoder round trips, the accelerated-device/fallback logic with a
+  fake engine, the player, and a fuzz run (truncation, bit flips, noise behind each signature) under ASAN/UBSAN.
 - `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
   `remove`, `rename`) hands out `IFile` (offset-based read/write/resize) and `IDirectory` (entry iteration) handles;
   every call returns a `Status` instead of throwing. `Path.hpp` holds the shared path rules. `Ram/` is a

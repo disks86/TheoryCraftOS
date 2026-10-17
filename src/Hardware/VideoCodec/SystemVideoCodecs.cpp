@@ -47,6 +47,15 @@ void SystemVideoCodecs::initialize() {
   try_add<SoftwareVideoCodec>(devices_, allocator_);
 }
 
+bool SystemVideoCodecs::add_device(UniquePointer<IVideoCodecDevice> device) {
+  if (!device) return false;
+  if (!device->initialize()) {
+    device->shutdown();
+    return false;
+  }
+  return devices_.insert(0, util::move(device));
+}
+
 void SystemVideoCodecs::shutdown() {
   for (uint64_t i = devices_.count(); i > 0; --i) devices_[i - 1]->shutdown();
   devices_.clear();
