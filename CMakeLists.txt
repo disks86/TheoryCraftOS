@@ -103,6 +103,7 @@ add_executable(BOOTX64
   src/Crypto/BigInt.cpp
   src/Crypto/Rsa.cpp
   src/Crypto/Ecc.cpp
+  src/Crypto/X509.cpp
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
   src/Network/Udp/UdpManager.cpp
