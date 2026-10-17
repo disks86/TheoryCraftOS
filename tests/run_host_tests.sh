@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest PrinterTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -59,6 +59,9 @@ for t in "${WANTED[@]}"; do
     ParserFuzzTest) build_and_run ParserFuzzTest tests/ParserFuzzTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                       src/Hardware/Bus/Usb/Hid/HidReportParser.cpp src/Hardware/Bus/Usb/Hid/UsbHidInterface.cpp ;;
     NetworkTest) build_and_run NetworkTest tests/NetworkTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
+                   src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
+                   src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
+    PrinterTest) build_and_run PrinterTest tests/PrinterTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp \
                    src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                    src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     GraphicsTest) build_and_run GraphicsTest tests/GraphicsTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \

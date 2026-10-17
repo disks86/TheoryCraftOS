@@ -97,6 +97,21 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   B pyramids, weighted prediction, both direct modes, 8x8 transform, quantisation matrices, slices, constrained intra, noise at
   QP 8, odd sizes, open GOP, intra refresh) and on OpenH264 streams (long-term references, reordering), and fuzzed under ASAN/UBSAN.
   `tests/VideoCodecTest.cpp` includes a fuzz run of the JPEG decoder under ASAN/UBSAN.
+- `src/Hardware/Printer/`: printing. `IPrinter` (polled, never blocks: `submit(job bytes)` queues, `poll()` delivers; `PrinterInfo` says
+  languages, resolution, paper sizes, margins) with `NetworkPrinter` for a printer with its own print server: jobs go over raw TCP
+  port 9100 (`RawSocketTransport`) or LPD port 515 (`LpdTransport`, RFC 1179, queue name configurable), eight jobs deep, a failed
+  delivery retried twice before the job is dropped (`PrinterState::Error`). `SystemPrinters` is the registry (network printers
+  are added by address; there is no discovery, and no USB host stack yet). `PrintJob` builds a job: a PJL header (job name,
+  resolution 300/600/1200, toner save), then either **PCL 5e** pages - bitmaps as raster graphics with PackBits rows, or text laid out
+  here in a fixed-pitch font (UTF-8 in, Latin-1 out, wrapped and paginated) - or one **PostScript** program, and the PJL trailer.
+  `Halftone` turns a `graphics::Surface` into a 1-bit `PageBitmap` (scaled to fit the printable area with box/bilinear
+  filtering; threshold, 8x8 ordered or Floyd-Steinberg dots). `Brother/BrotherHl2070n` is the **Brother HL-2070N**: A4/Letter/Legal/
+  Executive/A5/B5/A6, 600 dpi (HQ1200 at 1200), 23 ppm, no duplex, PCL and BR-Script 3 (PostScript), 4.2 mm unprintable margins, LPD
+  queue `BINARY_P1`; tray 1 and the manual slot are selectable. The PCL output follows the PCL 5 reference and was verified by
+  parsing it back and by the fake-network delivery tests, not on a physical printer (none was available): the first print on real
+  hardware may need small adjustments. Not covered: status readback (PJL INFO / SNMP page counts, toner and paper alarms), IPP,
+  discovery (BRAdmin, mDNS), the printer's Epson FX / IBM emulation, PCL 6 (PCL XL) output, duplex and colour (the engine has
+  neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure, text layout, both transports and failures.
 - `src/Video/`: `AviFile` reads an in-memory AVI (video stream: MJPG, I420/NV12, H264 as Annex B frames, or another named codec flagged for the
   decoders; PCM audio; frames found by scanning `movi`, keyframes from `idx1`), `AviWriter` builds one, and `VideoPlayer` plays it:
   a decoder session from `SystemVideoCodecs`, the audio through an `audio::AudioPlayer` whose position is the clock (picture

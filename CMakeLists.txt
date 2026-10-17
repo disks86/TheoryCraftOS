@@ -231,6 +231,13 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/ColorConvert.cpp
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
   src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
+  src/Hardware/Printer/PrinterTypes.cpp
+  src/Hardware/Printer/Halftone.cpp
+  src/Hardware/Printer/PrintJob.cpp
+  src/Hardware/Printer/PrintTransport.cpp
+  src/Hardware/Printer/NetworkPrinter.cpp
+  src/Hardware/Printer/SystemPrinters.cpp
+  src/Hardware/Printer/Brother/BrotherHl2070n.cpp
   src/Hardware/VideoCodec/Software/JpegDecoder.cpp
   src/Hardware/VideoCodec/Software/H264Syntax.cpp
   src/Hardware/VideoCodec/Software/H264Macroblock.cpp
