@@ -98,6 +98,13 @@ add_executable(BOOTX64
   src/Network/Dns/DnsMessage.cpp
   src/Network/Dns/DnsResolver.cpp
   src/Hardware/Clock/TscClock.cpp
+  src/AudioDemo.cpp
+  src/Hardware/AudioDevice/PlaybackRing.cpp
+  src/Hardware/AudioDevice/SystemAudioDevices.cpp
+  src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp
+  src/Hardware/AudioDevice/Intel/IntelHdaAudioDevice.cpp
+  src/Hardware/AudioDevice/Intel/Ac97AudioDevice.cpp
+  src/Hardware/AudioDevice/Virtio/VirtioSoundDevice.cpp
   src/Hardware/NetworkInterface/SystemNetworkInterfaces.cpp
   src/Hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
   src/Hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
@@ -231,6 +238,8 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -rtc base=localtime  # the taskbar clock shows local time
     # An absolute pointer for the desktop (no click-to-grab; relative PS/2 grabbing is unreliable under Wayland).
     -device virtio-tablet-pci
+    # An HD Audio controller with a duplex codec; the `none` backend discards the sound (use e.g. `pa` to hear it).
+    -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
     -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
     -drive if=pflash,format=raw,file=${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     -drive format=raw,file=fat:rw:${ESP_DIR}

@@ -35,6 +35,7 @@
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
 #include "Kernel/Thread.hpp"
+#include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -44,6 +45,7 @@
 // subsystem; the default boot only reports the hardware and opens the desktop.
 #ifdef TCOS_SELFTESTS
 #include "AsyncDemo.hpp"
+#include "AudioDemo.hpp"
 #include "ConcurrentDemo.hpp"
 #include "ContainerDemo.hpp"
 #include "FileSystemDemo.hpp"
@@ -294,6 +296,21 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   network::NetworkStackSet stacks(clock, shared_allocator);
   const bool clock_ok = clock.initialize();
   if (!clock_ok) Entry(Level::Warning, "Clock").text("could not calibrate the timer; networking is off");
+
+  // Audio outputs: native drivers (HD Audio, AC'97, virtio-sound), or a silent software device.
+  hardware::SystemAudioDevices audio(pci, clock, shared_allocator, st);
+  audio.initialize();
+  for (uint32_t i = 0; i < audio.count(); ++i) {
+    hardware::IAudioDevice& device = *audio.at(i);
+    if (audio.is_hardware(i)) {
+      Entry(Level::Ok, "Audio").text(device.name()).text(", ").dec(hardware::kAudioSampleRate).text(" Hz 16-bit stereo");
+    } else {
+      Entry(Level::Info, "Audio").text("no sound hardware found; ").text(device.name());
+    }
+#ifdef TCOS_SELFTESTS
+    if (!run_audio_demo(device)) console::puts("  audio self-check failed\n");
+#endif
+  }
 #ifdef TCOS_SELFTESTS
   UniquePointer<NetworkStackDemo> stack_demo;
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
@@ -418,6 +435,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   storage.shutdown();
   Entry(Level::Ok, "Shutdown").text("storage flushed and released");
+  audio.shutdown();
   network.shutdown();
   usb.shutdown();  // resets the USB controllers and returns them to the firmware
   Entry(Level::Ok, "Shutdown").text("USB and network released");

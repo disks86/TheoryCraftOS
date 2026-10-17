@@ -44,6 +44,18 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   listed); `src/StorageDemo` reports each device, cross-checks reads and, only on a device whose first block begins
   with `TCOS-SCRATCH`, tests write/flush/read-back. Not covered: floppy and SD/MMC (only through the firmware),
   and the LSI/MegaRAID/MPT/PVSCSI SCSI adapters (only if the firmware has a driver for them - the stock OVMF does not).
+- `src/Hardware/AudioDevice/`: audio output. `IAudioDevice` plays one fixed format (48 kHz, 16-bit signed, stereo)
+  and is polled: `write()` copies whole frames into the device's ring and returns how many it took, `queued_bytes()` /
+  `free_bytes()` say how much is waiting, plus volume, mute and statistics (frames played, underruns). A cyclic-DMA
+  driver reads the hardware position and `PlaybackRing` does the bookkeeping (played bytes are zeroed, so an underrun
+  plays silence); poll at least every ~300 ms while playing. Drivers: `Intel/IntelHdaAudioDevice` (any HD Audio
+  controller: CORB/RIRB verbs, finds an output pin and the DAC behind it, unmutes the path, stream 0 over a buffer
+  descriptor list), `Intel/Ac97AudioDevice` (ICH AC'97, PCM-out engine over 32 descriptors), `Virtio/VirtioSoundDevice`
+  (period buffers on the transmit queue; volume applied in software) and `Software/SoftwareAudioDevice` (discards
+  samples at real-time pace; `SystemAudioDevices` uses it when no sound hardware is found). Not covered: capture,
+  other formats/rates (no resampling), jack detection, interrupts. `src/AudioDemo` plays a short tone at boot
+  (`TCOS_SELFTESTS`); `tests/AudioTest.cpp` covers the ring and the software device. The `run` targets give QEMU an
+  `intel-hda` + `hda-duplex` with a `none` audio backend.
 - `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
   `remove`, `rename`) hands out `IFile` (offset-based read/write/resize) and `IDirectory` (entry iteration) handles;
   every call returns a `Status` instead of throwing. `Path.hpp` holds the shared path rules. `Ram/` is a
