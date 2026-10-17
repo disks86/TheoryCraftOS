@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Writes tests/CryptoVectors.inc: known-answer vectors for tests/CryptoTest.cpp from OpenSSL (through Python's hashlib and
-the cryptography package), so the C++ code is checked against an independent implementation. Deterministic (seeded)."""
+the cryptography package), so the C++ code is checked against an independent implementation. The inputs are seeded, except for
+the RSA and EC keys (the library generates those), so running it again changes the vectors but not what they test."""
 import hashlib, hmac, os, random
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding, utils
 from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand, HKDF
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
@@ -68,6 +70,68 @@ for hn, hc in (("sha256", hashes.SHA256), ("sha384", hashes.SHA384), ("sha512", 
         okm = HKDF(hc(), olen, salt if salt else None, info).derive(ikm)
         items.append((hn, h(salt), h(ikm), h(info), str(olen), h(okm)))
 rows("Hkdf", ["hash", "salt", "ikm", "info", "length", "okm"], items)
+def raw_public(k): return k.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+def raw_private(k, size): return k.private_numbers().private_value.to_bytes(size, "big")
+hashmap = {"sha1": hashes.SHA1, "sha256": hashes.SHA256, "sha384": hashes.SHA384, "sha512": hashes.SHA512}
+items = []
+for cname, curve, size in (("p256", ec.SECP256R1(), 32), ("p384", ec.SECP384R1(), 48)):
+    for _ in range(6):
+        a = ec.generate_private_key(curve); b = ec.generate_private_key(curve)
+        items.append((cname, h(raw_private(a, size)), h(raw_public(a)), h(raw_private(b, size)), h(raw_public(b)), h(a.exchange(ec.ECDH(), b.public_key()))))
+rows("Ecdh", ["curve", "priv_a", "pub_a", "priv_b", "pub_b", "shared"], items)
+items = []
+for cname, curve in (("p256", ec.SECP256R1()), ("p384", ec.SECP384R1())):
+    for hn in ("sha1", "sha256", "sha384", "sha512"):
+        for _ in range(3):
+            k = ec.generate_private_key(curve)
+            m = bytes(rnd.randrange(256) for _ in range(rnd.randrange(1, 200)))
+            sig = k.sign(m, ec.ECDSA(hashmap[hn]()))
+            r, s = utils.decode_dss_signature(sig)
+            digest = hashlib.new(hn, m).digest()
+            items.append((cname, h(raw_public(k)), hn, h(digest), h(r.to_bytes(48, "big").lstrip(b"\0") or b"\0"), h(s.to_bytes(48, "big").lstrip(b"\0") or b"\0")))
+rows("Ecdsa", ["curve", "pub", "hash", "digest", "r", "s"], items)
+items = []
+for bits in (1024, 2048, 2048, 3072, 4096):
+    k = rsa.generate_private_key(65537, bits)
+    n = k.public_key().public_numbers().n
+    for hn in ("sha1", "sha256", "sha384", "sha512"):
+        if bits == 1024 and hn == "sha512": continue
+        m = bytes(rnd.randrange(256) for _ in range(rnd.randrange(1, 100)))
+        digest = hashlib.new(hn, m).digest()
+        s1 = k.sign(m, padding.PKCS1v15(), hashmap[hn]())
+        items.append((str(bits), h(n.to_bytes((bits + 7) // 8, "big")), "010001", hn, "pkcs1", h(digest), h(s1)))
+        if hn != "sha1":
+            s2 = k.sign(m, padding.PSS(padding.MGF1(hashmap[hn]()), hashmap[hn]().digest_size), hashmap[hn]())
+            items.append((str(bits), h(n.to_bytes((bits + 7) // 8, "big")), "010001", hn, "pss", h(digest), h(s2)))
+# a modulus whose bit length is one more than a multiple of 8 (PSS has a short EM there)
+def is_prime(n, rounds=24):
+    if n < 4: return n in (2, 3)
+    if n % 2 == 0: return False
+    d, r = n - 1, 0
+    while d % 2 == 0: d //= 2; r += 1
+    for _ in range(rounds):
+        a = rnd.randrange(2, n - 1); x = pow(a, d, n)
+        if x in (1, n - 1): continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1: break
+        else: return False
+    return True
+def rand_prime(bits):
+    while True:
+        c = rnd.getrandbits(bits) | (3 << (bits - 2)) | 1
+        if is_prime(c) and (c - 1) % 65537: return c
+while True:
+    p_, q_ = rand_prime(1025), rand_prime(1024)
+    if (p_ * q_).bit_length() == 2049: break
+d_ = pow(65537, -1, (p_ - 1) * (q_ - 1))
+k = rsa.RSAPrivateNumbers(p_, q_, d_, d_ % (p_ - 1), d_ % (q_ - 1), pow(q_, -1, p_), rsa.RSAPublicNumbers(65537, p_ * q_)).private_key()
+n = k.public_key().public_numbers().n
+m = b"odd sizes"
+digest = hashlib.sha256(m).digest()
+items.append((str(n.bit_length()), h(n.to_bytes(257, "big")), "010001", "sha256", "pkcs1", h(digest), h(k.sign(m, padding.PKCS1v15(), hashes.SHA256()))))
+items.append((str(n.bit_length()), h(n.to_bytes(257, "big")), "010001", "sha256", "pss", h(digest), h(k.sign(m, padding.PSS(padding.MGF1(hashes.SHA256()), 32), hashes.SHA256()))))
+rows("Rsa", ["bits", "n", "e", "hash", "padding", "digest", "sig"], items)
 def drbg(entropy, pers, outlens):
     K = b"\x00" * 32; V = b"\x01" * 32
     def update(data):

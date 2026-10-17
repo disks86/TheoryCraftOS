@@ -25,7 +25,9 @@
 #include <vector>
 #include "Crypto/Aead.hpp"
 #include "Crypto/Crypto.hpp"
+#include "Crypto/Ecc.hpp"
 #include "Crypto/Random.hpp"
+#include "Crypto/Rsa.hpp"
 
 using namespace crypto;
 
@@ -251,6 +253,84 @@ int main() {
     CHECK(rng2.initialize());
     uint8_t x[32], y[32];
     CHECK(rng2.fill(ByteView(x, 32)) && rng2.fill(ByteView(y, 32)) && memcmp(x, y, 32) != 0);
+  }
+  // Elliptic curves and RSA against OpenSSL.
+  for (const EcdhVector& v : kEcdhVectors) {
+    const EcCurve curve = std::string(v.curve) == "p256" ? EcCurve::P256 : EcCurve::P384;
+    const std::vector<uint8_t> a = unhex(v.priv_a), pa = unhex(v.pub_a), b = unhex(v.priv_b), pb = unhex(v.pub_b), shared = unhex(v.shared);
+    uint8_t point[kMaxEcPoint], x[48];
+    CHECK(ec_public_key(curve, a.data(), point) && hex(point, ec_point_size(curve)) == v.pub_a);
+    CHECK(ec_public_key(curve, b.data(), point) && hex(point, ec_point_size(curve)) == v.pub_b);
+    CHECK(ec_ecdh(curve, a.data(), view(pb), x) && hex(x, ec_field_size(curve)) == v.shared);
+    CHECK(ec_ecdh(curve, b.data(), view(pa), x) && hex(x, ec_field_size(curve)) == v.shared);
+    // a point off the curve, a malformed one and a zero scalar are refused
+    std::vector<uint8_t> bad = pb;
+    bad[bad.size() - 1] ^= 1;
+    CHECK(!ec_point_valid(curve, view(bad)) && !ec_ecdh(curve, a.data(), view(bad), x));
+    bad = pb;
+    bad[0] = 2;
+    CHECK(!ec_point_valid(curve, view(bad)));
+    bad.pop_back();
+    CHECK(!ec_point_valid(curve, view(bad)) && ec_point_valid(curve, view(pb)));
+    std::vector<uint8_t> zero(a.size(), 0);
+    CHECK(!ec_ecdh(curve, zero.data(), view(pb), x) && !ec_public_key(curve, zero.data(), point));
+    // coordinates that are not reduced
+    std::vector<uint8_t> big(pb.size(), 0xff);
+    big[0] = 4;
+    CHECK(!ec_point_valid(curve, view(big)));
+  }
+  {
+    // (n-1) * G is -G: the same X, the negated Y; the generator's own coordinates are on the curve.
+    const std::vector<uint8_t> n_minus_1 = unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550");
+    uint8_t g[kMaxEcPoint], minus_g[kMaxEcPoint], one[32] = {0};
+    one[31] = 1;
+    CHECK(ec_public_key(EcCurve::P256, one, g) && ec_point_valid(EcCurve::P256, ConstByteView(g, 65)));
+    CHECK(hex(g + 1, 32) == "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
+    CHECK(ec_public_key(EcCurve::P256, n_minus_1.data(), minus_g) && memcmp(g + 1, minus_g + 1, 32) == 0 && memcmp(g + 33, minus_g + 33, 32) != 0);
+    std::vector<uint8_t> n = unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+    CHECK(!ec_public_key(EcCurve::P256, n.data(), minus_g));   // the order itself is out of range
+    // random scalars come from the generator in range
+    struct Counter final : IRandom {
+      uint8_t next = 1;
+      bool fill(ByteView out) override { for (size_t i = 0; i < out.size(); ++i) out[i] = next++; return true; }
+    } counter;
+    uint8_t priv[48], pub[kMaxEcPoint];
+    CHECK(ec_generate_private(EcCurve::P384, counter, priv) && ec_public_key(EcCurve::P384, priv, pub) && ec_point_valid(EcCurve::P384, ConstByteView(pub, 97)));
+  }
+  for (const EcdsaVector& v : kEcdsaVectors) {
+    const EcCurve curve = std::string(v.curve) == "p256" ? EcCurve::P256 : EcCurve::P384;
+    const std::vector<uint8_t> pub = unhex(v.pub), digest = unhex(v.digest), r = unhex(v.r), s = unhex(v.s);
+    CHECK(ecdsa_verify(curve, view(pub), digest.data(), digest.size(), view(r), view(s)));
+    std::vector<uint8_t> d2 = digest;
+    d2[0] ^= 0x80;
+    CHECK(!ecdsa_verify(curve, view(pub), d2.data(), d2.size(), view(r), view(s)));
+    std::vector<uint8_t> s2 = s;
+    s2[s2.size() - 1] ^= 1;
+    CHECK(!ecdsa_verify(curve, view(pub), digest.data(), digest.size(), view(r), view(s2)));
+    const std::vector<uint8_t> zero(1, 0);
+    CHECK(!ecdsa_verify(curve, view(pub), digest.data(), digest.size(), view(zero), view(s)) && !ecdsa_verify(curve, view(pub), digest.data(), digest.size(), view(r), view(zero)));
+    std::vector<uint8_t> huge(49, 0xff);   // r or s not below the order
+    CHECK(!ecdsa_verify(curve, view(pub), digest.data(), digest.size(), view(huge), view(s)) && !ecdsa_verify(curve, view(pub), digest.data(), digest.size(), view(r), view(huge)));
+    std::vector<uint8_t> other = pub;
+    other[1] ^= 1;   // not on the curve (almost surely)
+    CHECK(!ecdsa_verify(curve, view(other), digest.data(), digest.size(), view(r), view(s)));
+  }
+  for (const RsaVector& v : kRsaVectors) {
+    const HashKind kind = std::string(v.hash) == "sha1" ? HashKind::Sha1 : std::string(v.hash) == "sha256" ? HashKind::Sha256 : std::string(v.hash) == "sha384" ? HashKind::Sha384 : HashKind::Sha512;
+    const RsaPadding padding = std::string(v.padding) == "pss" ? RsaPadding::Pss : RsaPadding::Pkcs1V15;
+    const std::vector<uint8_t> n = unhex(v.n), e = unhex(v.e), digest = unhex(v.digest), sig = unhex(v.sig);
+    CHECK(rsa_modulus_bits(view(n)) == (uint32_t)atoi(v.bits));
+    CHECK(rsa_verify(padding, kind, view(n), view(e), digest.data(), view(sig)));
+    std::vector<uint8_t> d2 = digest;
+    d2[d2.size() - 1] ^= 1;
+    CHECK(!rsa_verify(padding, kind, view(n), view(e), d2.data(), view(sig)));
+    std::vector<uint8_t> s2 = sig;
+    s2[s2.size() / 2] ^= 0x04;
+    CHECK(!rsa_verify(padding, kind, view(n), view(e), digest.data(), view(s2)));
+    CHECK(!rsa_verify(padding, kind, view(n), view(e), digest.data(), view(std::vector<uint8_t>(sig.begin() + 1, sig.end()))));   // wrong length
+    CHECK(!rsa_verify(padding == RsaPadding::Pss ? RsaPadding::Pkcs1V15 : RsaPadding::Pss, kind, view(n), view(e), digest.data(), view(sig)));
+    std::vector<uint8_t> ones = n;   // a signature equal to the modulus is out of range
+    CHECK(!rsa_verify(padding, kind, view(n), view(e), digest.data(), view(ones)));
   }
   CHECK(equal_constant_time(d, d, 20));
   uint8_t other[64];
