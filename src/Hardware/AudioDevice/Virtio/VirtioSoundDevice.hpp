@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/AudioDevice/AudioCaptureBase.hpp"
 #include "Hardware/AudioDevice/AudioDeviceBase.hpp"
 #include "Hardware/Bus/Virtio/VirtioPciDevice.hpp"
 
@@ -31,10 +32,13 @@ constexpr uint16_t kVirtioSoundDevice = 0x1059;  // 0x1040 + device type 25 (mod
 // current period, which is submitted when it is full - or at once, if nothing else
 // is playing, to keep the delay small. The virtio-sound specification has no volume
 // control, so volume and mute are applied to the samples as they are copied in.
+// Recording uses the receive queue the same way: empty period buffers go to the
+// device and come back full.
 class VirtioSoundDevice final : public AudioDeviceBase {
  public:
   static constexpr uint32_t kPeriodBytes = 4096;  // about 21 ms
   static constexpr uint32_t kMaxPeriods = 8;
+  static constexpr uint32_t kRingBytes = 64 * 1024;  // capture ring
 
   VirtioSoundDevice(const IPciBus& pci, const PciDeviceInfo& device, allocators::IAllocator& allocator,
                     efi::SystemTable* st)
@@ -48,12 +52,32 @@ class VirtioSoundDevice final : public AudioDeviceBase {
   uint32_t queued_bytes() override;
   uint32_t free_bytes() override;
   AudioStatistics statistics() override;
+  IAudioCapture* capture() override { return capture_.active() ? &capture_ : nullptr; }
 
  private:
   static constexpr uint16_t kControlQueue = 0, kEventQueue = 1, kTransmitQueue = 2, kReceiveQueue = 3;
 
+  // The recording side: period buffers posted on the receive queue, collected into a ring.
+  class Capture final : public RingAudioCapture {
+   public:
+    explicit Capture(VirtioSoundDevice& owner) : owner_(owner) {}
+    const char* name() const override { return "virtio sound input"; }
+    bool start();
+    void stop();
+    bool active() const { return running_; }
+
+   private:
+    void refresh() override;
+    void post(uint32_t slot);
+    ByteView slot_base(uint32_t slot) const;
+    VirtioSoundDevice& owner_;
+    ByteView slots_;
+    uint32_t periods_ = 0;
+    bool stream_started_ = false;
+  };
+
   bool control(uint32_t request_bytes, uint32_t response_bytes);
-  bool simple_request(uint32_t code);
+  bool simple_request(uint32_t code, uint32_t stream);
   bool choose_stream();
   ByteView slot_data(uint32_t slot) const;
   void submit_current();
@@ -67,6 +91,8 @@ class VirtioSoundDevice final : public AudioDeviceBase {
   ByteView slots_;            // kPeriods transmit buffers, each: header, data, status
   uint32_t periods_ = 0;
   uint32_t stream_id_ = 0;
+  uint32_t capture_stream_id_ = 0;
+  bool has_capture_stream_ = false;
 
   uint32_t current_slot_ = 0;       // the slot being filled, if filling_
   uint32_t current_bytes_ = 0;
@@ -77,6 +103,7 @@ class VirtioSoundDevice final : public AudioDeviceBase {
   uint32_t in_flight_bytes_ = 0;
   bool started_ = false;
   AudioStatistics stats_;
+  Capture capture_{*this};
 };
 
 }  // namespace hardware

@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/AudioDevice/AudioTypes.hpp"
+#include "Hardware/AudioDevice/IAudioCapture.hpp"
 #include "Hardware/IHardware.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -49,6 +50,10 @@ class IAudioDevice : public IHardware {
   virtual bool muted() const = 0;
 
   virtual AudioStatistics statistics() = 0;
+
+  // The recording side of the same hardware, running from initialize() until
+  // shutdown(); null when the device has no input (or none this OS can use).
+  virtual IAudioCapture* capture() { return nullptr; }
 
  protected:
   constexpr IAudioDevice() = default;

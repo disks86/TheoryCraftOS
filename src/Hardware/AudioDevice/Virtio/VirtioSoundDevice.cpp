@@ -26,7 +26,7 @@ namespace {
 constexpr uint32_t kPcmInfo = 0x0100, kPcmSetParams = 0x0101, kPcmPrepare = 0x0102, kPcmRelease = 0x0103,
                    kPcmStart = 0x0104, kPcmStop = 0x0105;
 constexpr uint32_t kStatusOk = 0x8000;
-constexpr uint32_t kDirectionOutput = 0;
+constexpr uint32_t kDirectionOutput = 0, kDirectionInput = 1;
 constexpr uint32_t kFormatS16 = 5, kRate48k = 7;  // codes of virtio_snd_pcm_fmt / _rate
 constexpr uint32_t kInfoSize = 32;
 constexpr uint32_t kMaxStreamsQueried = 16;
@@ -67,13 +67,13 @@ bool VirtioSoundDevice::control(uint32_t request_bytes, uint32_t response_bytes)
 }
 
 // A request that is just a header and a stream id.
-bool VirtioSoundDevice::simple_request(uint32_t code) {
+bool VirtioSoundDevice::simple_request(uint32_t code, uint32_t stream) {
   put32(control_buffer_, code);
-  put32(control_buffer_.subview(4), stream_id_);
+  put32(control_buffer_.subview(4), stream);
   return control(8, 4);
 }
 
-// Picks the first output stream that can play 48 kHz, 16-bit, two-channel audio.
+// Picks the first output stream (and the first input stream, if any) that can do 48 kHz, 16-bit, two-channel audio.
 bool VirtioSoundDevice::choose_stream() {
   uint32_t streams = 0;
   for (uint32_t i = 0; i < 4; ++i) streams |= uint32_t{transport_.read_config8(kConfigStreams + i)} << (8 * i);
@@ -84,17 +84,21 @@ bool VirtioSoundDevice::choose_stream() {
   put32(control_buffer_.subview(8), streams);  // how many
   put32(control_buffer_.subview(12), kInfoSize);
   if (!control(16, 4 + streams * kInfoSize)) return false;
+  bool have_output = false;
   for (uint32_t s = 0; s < streams; ++s) {
     const ConstByteView info = ConstByteView(control_buffer_).subview(kResponseOffset + 4 + uint64_t{s} * kInfoSize, kInfoSize);
     const uint64_t formats = get64(info.subview(8)), rates = get64(info.subview(16));
     const uint8_t direction = info[24], channels_min = info[25], channels_max = info[26];
-    if (direction == kDirectionOutput && (formats >> kFormatS16 & 1) && (rates >> kRate48k & 1) && channels_min <= 2 &&
-        channels_max >= 2) {
+    if (!((formats >> kFormatS16 & 1) && (rates >> kRate48k & 1) && channels_min <= 2 && channels_max >= 2)) continue;
+    if (direction == kDirectionOutput && !have_output) {
       stream_id_ = s;
-      return true;
+      have_output = true;
+    } else if (direction == kDirectionInput && !has_capture_stream_) {
+      capture_stream_id_ = s;
+      has_capture_stream_ = true;
     }
   }
-  return false;
+  return have_output;
 }
 
 bool VirtioSoundDevice::initialize() {
@@ -132,17 +136,19 @@ bool VirtioSoundDevice::initialize() {
   control_buffer_[21] = kFormatS16;
   control_buffer_[22] = kRate48k;
   control_buffer_[23] = 0;
-  if (!control(24, 4) || !simple_request(kPcmPrepare) || !simple_request(kPcmStart)) {
+  if (!control(24, 4) || !simple_request(kPcmPrepare, stream_id_) || !simple_request(kPcmStart, stream_id_)) {
     shutdown();
     return false;
   }
+  capture_.start();  // the input is optional
   return true;
 }
 
 void VirtioSoundDevice::shutdown() {
+  capture_.stop();
   if (started_) {
-    simple_request(kPcmStop);
-    simple_request(kPcmRelease);
+    simple_request(kPcmStop, stream_id_);
+    simple_request(kPcmRelease, stream_id_);
   }
   started_ = false;
   transport_.shutdown();  // reset first: the device must stop using our memory
@@ -247,6 +253,84 @@ AudioStatistics VirtioSoundDevice::statistics() {
   kernel::ScopedMutex guard(mutex_);
   if (started_) reclaim();
   return stats_;
+}
+
+ByteView VirtioSoundDevice::Capture::slot_base(uint32_t slot) const {
+  return slots_.subview(uint64_t{slot} * kSlotStride, kSlotStride);
+}
+
+// Offers one empty period buffer to the device: stream id in, then room for the audio and the status.
+void VirtioSoundDevice::Capture::post(uint32_t slot) {
+  const ByteView base = slot_base(slot);
+  put32(base.subview(kSlotHeader), owner_.capture_stream_id_);
+  base.subview(kSlotStatus, 8).fill(0);
+  const Virtqueue::Segment chain[3] = {{base.data() + kSlotHeader, 4, false},
+                                       {base.data() + kSlotData, kPeriodBytes, true},
+                                       {base.data() + kSlotStatus, 8, true}};
+  owner_.queues_[kReceiveQueue].post_chain(static_cast<uint16_t>(slot * 3), chain, 3);
+}
+
+bool VirtioSoundDevice::Capture::start() {
+  VirtioSoundDevice& d = owner_;
+  if (!d.has_capture_stream_ || !d.started_) return false;
+  periods_ = d.queues_[kReceiveQueue].size() / 3;
+  if (periods_ > kMaxPeriods) periods_ = kMaxPeriods;
+  slots_ = allocate_view<uint8_t>(d.allocator_, uint64_t{kMaxPeriods} * kSlotStride, 4096);
+  if (periods_ < 2 || slots_.empty() || !ring_.allocate(d.allocator_, kRingBytes)) {
+    stop();
+    return false;
+  }
+  put32(d.control_buffer_, kPcmSetParams);
+  put32(d.control_buffer_.subview(4), d.capture_stream_id_);
+  put32(d.control_buffer_.subview(8), periods_ * kPeriodBytes);
+  put32(d.control_buffer_.subview(12), kPeriodBytes);
+  put32(d.control_buffer_.subview(16), 0);
+  d.control_buffer_[20] = kAudioChannels;
+  d.control_buffer_[21] = kFormatS16;
+  d.control_buffer_[22] = kRate48k;
+  d.control_buffer_[23] = 0;
+  if (!d.control(24, 4) || !d.simple_request(kPcmPrepare, d.capture_stream_id_)) {
+    stop();
+    return false;
+  }
+  for (uint32_t slot = 0; slot < periods_; ++slot) post(slot);
+  if (!d.simple_request(kPcmStart, d.capture_stream_id_)) {
+    stop();
+    return false;
+  }
+  stream_started_ = true;
+  d.transport_.notify(kReceiveQueue);
+  running_ = true;
+  return true;
+}
+
+void VirtioSoundDevice::Capture::stop() {
+  VirtioSoundDevice& d = owner_;
+  running_ = false;
+  if (stream_started_ && d.started_) {
+    d.simple_request(kPcmStop, d.capture_stream_id_);
+    d.simple_request(kPcmRelease, d.capture_stream_id_);
+  }
+  stream_started_ = false;
+  ring_.release(d.allocator_);
+  release_view(d.allocator_, slots_);
+}
+
+// Collects the periods the device has filled and hands the buffers back.
+void VirtioSoundDevice::Capture::refresh() {
+  if (!running_) return;
+  uint16_t id;
+  uint32_t written;
+  bool any = false;
+  while (owner_.queues_[kReceiveQueue].take_used(&id, &written)) {
+    const uint32_t slot = id / 3;
+    if (id % 3 != 0 || slot >= periods_) continue;  // not one of ours
+    const uint32_t bytes = written > 8 ? written - 8 : 0;  // the status takes the last 8
+    if (bytes > 0 && bytes <= kPeriodBytes) ring_.push(ConstByteView(slot_base(slot)).subview(kSlotData, bytes));
+    post(slot);
+    any = true;
+  }
+  if (any) owner_.transport_.notify(kReceiveQueue);
 }
 
 }  // namespace hardware

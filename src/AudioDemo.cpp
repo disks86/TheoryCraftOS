@@ -149,3 +149,46 @@ bool run_mixer_demo(audio::AudioMixer& mixer) {
   all_ok &= mixed;
   return all_ok;
 }
+
+bool run_capture_demo(audio::AudioCaptureHub& hub) {
+  bool all_ok = true;
+  SharedPointer<audio::CaptureStream> a = hub.open_stream(), b = hub.open_stream();
+  const bool opened = a && b;
+  report("two capture streams opened", opened);
+  if (!opened) return false;
+
+  constexpr uint64_t kListenUs = 250000;
+  hardware::delay_us(kListenUs);
+  static uint8_t buffer[hardware::kAudioSampleRate * hardware::kAudioFrameSize / 4];  // up to 250 ms
+  const uint32_t got_a = a->read(ByteView(buffer));
+  int32_t peak = 0;
+  for (uint32_t i = 0; i + 1 < got_a; i += 2) {
+    int32_t sample = static_cast<int16_t>(buffer[i] | (buffer[i + 1] << 8));
+    if (sample < 0) sample = -sample;
+    if (sample > peak) peak = sample;
+  }
+  const uint32_t got_b = b->read(ByteView(buffer));
+  const uint32_t expected = static_cast<uint32_t>(kListenUs * hardware::kAudioSampleRate / 1000000) * hardware::kAudioFrameSize;
+  // The hub delivers every few milliseconds, and delay_us may run long: accept a wide band.
+  const bool amount = got_a > expected / 2 && got_a <= sizeof buffer && got_b > expected / 2;
+  report("about a quarter second recorded by each stream", amount);
+  all_ok &= amount;
+  console::puts("  loudest sample heard: ");
+  console::put_dec(static_cast<uint64_t>(peak));
+  console::puts("\n");
+
+  a->set_gain(50);
+  a->set_muted(true);
+  const bool controls = a->gain() == 50 && a->muted();
+  a->set_muted(false);
+  report("gain and mute", controls && !a->muted());
+  all_ok &= controls;
+
+  a->close();
+  b->close();
+  hardware::delay_us(20000);
+  const bool released = hub.stream_count() == 0;
+  report("streams released", released);
+  all_ok &= released;
+  return all_ok;
+}

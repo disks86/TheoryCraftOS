@@ -101,9 +101,13 @@ add_executable(BOOTX64
   src/AudioDemo.cpp
   src/Audio/AudioStream.cpp
   src/Audio/AudioMixer.cpp
+  src/Audio/CaptureStream.cpp
+  src/Audio/AudioCaptureHub.cpp
   src/Hardware/AudioDevice/PlaybackRing.cpp
+  src/Hardware/AudioDevice/CaptureRing.cpp
   src/Hardware/AudioDevice/SystemAudioDevices.cpp
   src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp
+  src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp
   src/Hardware/AudioDevice/Intel/IntelHdaAudioDevice.cpp
   src/Hardware/AudioDevice/Intel/Ac97AudioDevice.cpp
   src/Hardware/AudioDevice/Virtio/VirtioSoundDevice.cpp

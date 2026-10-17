@@ -19,23 +19,26 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/AudioDevice/AudioDeviceBase.hpp"
+#include "Hardware/AudioDevice/Software/SoftwareAudioCapture.hpp"
 #include "Hardware/Clock/IClock.hpp"
 
 namespace hardware {
 
 // An audio device with no hardware behind it: it accepts samples and throws them
-// away at the rate real hardware would play them, timed by a clock. It is what
+// away at the rate real hardware would play them, timed by a clock (and its input hears silence). It is what
 // the system falls back to on a machine without a supported sound card, so
 // programs that play audio still run (silently). Volume and mute are remembered.
 class SoftwareAudioDevice final : public RingAudioDevice {
  public:
   static constexpr uint32_t kRingBytes = 64 * 1024;
 
-  SoftwareAudioDevice(const IClock& clock, allocators::IAllocator& allocator) : clock_(clock), allocator_(allocator) {}
+  SoftwareAudioDevice(const IClock& clock, allocators::IAllocator& allocator)
+      : clock_(clock), allocator_(allocator), capture_(clock) {}
 
   const char* name() const override { return "Software audio (silent)"; }
   bool initialize() override;
   void shutdown() override;
+  IAudioCapture* capture() override { return capture_started_ ? &capture_ : nullptr; }
 
  private:
   void refresh() override;
@@ -43,6 +46,8 @@ class SoftwareAudioDevice final : public RingAudioDevice {
 
   const IClock& clock_;
   allocators::IAllocator& allocator_;
+  SoftwareAudioCapture capture_;
+  bool capture_started_ = false;
   uint64_t last_us_ = 0;
   uint64_t fraction_ = 0;   // microsecond-samples carried between calls (not yet a whole frame)
 };

@@ -50,9 +50,9 @@ constexpr uint32_t kSetFormat = 0x2, kSetAmplifier = 0x3;
 // Parameters.
 constexpr uint8_t kParamNodeCount = 0x04, kParamFunctionGroupType = 0x05, kParamWidgetCaps = 0x09, kParamPcmRates = 0x0A,
                   kParamPinCaps = 0x0C, kParamInputAmpCaps = 0x0D, kParamConnectionLength = 0x0E, kParamOutputAmpCaps = 0x12;
-constexpr uint32_t kWidgetOutput = 0, kWidgetMixer = 2, kWidgetSelector = 3, kWidgetPin = 4;
+constexpr uint32_t kWidgetOutput = 0, kWidgetInput = 1, kWidgetMixer = 2, kWidgetSelector = 3, kWidgetPin = 4;
 constexpr uint32_t kCapsOutputAmp = 1u << 2, kCapsAmpOverride = 1u << 3, kCapsFormatOverride = 1u << 4, kCapsInputAmp = 1u << 1;
-constexpr uint32_t kPinCapsOutput = 1u << 4, kPinCapsEapd = 1u << 16;
+constexpr uint32_t kPinCapsInput = 1u << 5, kPinCapsOutput = 1u << 4, kPinCapsEapd = 1u << 16;
 constexpr uint32_t kPcm48k = 1u << 6, kPcm16bit = 1u << 17;
 
 constexpr uint32_t kRingTimeoutUs = 50000;
@@ -147,6 +147,7 @@ bool IntelHdaAudioDevice::start_command_rings() {
 
 // Sends one command (everything below the codec address) and waits for the answer.
 bool IntelHdaAudioDevice::verb(uint8_t nid, uint32_t command, uint32_t* response) {
+  kernel::ScopedMutex guard(codec_mutex_);
   const uint32_t entry = (uint32_t{codec_} << 28) | (uint32_t{nid} << 20) | (command & 0xFFFFF);
   corb_write_ = (corb_write_ + 1) % corb_entries_;
   const ByteView slot = corb_.subview(uint64_t{corb_write_} * 4, 4);
@@ -251,6 +252,8 @@ bool IntelHdaAudioDevice::find_output_path() {
   uint32_t widgets = 0;
   if (!get_parameter(function_group_, kParamNodeCount, &widgets)) return false;
   const uint32_t first = (widgets >> 16) & 0xFF, count = widgets & 0xFF;
+  first_widget_ = first;
+  widget_count_ = count;
   for (uint32_t n = first; n < first + count && n < 256; ++n) {
     uint32_t caps = 0;
     if (get_parameter(static_cast<uint8_t>(n), kParamWidgetCaps, &caps)) widget_caps_[n] = caps ? caps : 1;  // never 0 for a widget that exists
@@ -325,33 +328,36 @@ bool IntelHdaAudioDevice::configure_path() {
   return true;
 }
 
-bool IntelHdaAudioDevice::start_stream() {
-  descriptors_ = allocate_view<BufferDescriptor>(allocator_, kEntries, 128);
-  if (descriptors_.empty() || !ring_.allocate(allocator_, kRingBytes) ||
-      !dma_reachable(reinterpret_cast<uint64_t>(descriptors_.data()), descriptors_.size() * sizeof(BufferDescriptor)) ||
-      !dma_reachable(ring_.address(), ring_.size()))
+// Programs one stream descriptor to run through a cyclic buffer, described by `descriptors`
+// (allocated and filled here), and starts it.
+bool IntelHdaAudioDevice::run_stream(uint32_t stream, ArrayView<BufferDescriptor>& descriptors, uint64_t ring_address,
+                                     uint8_t tag) {
+  descriptors = allocate_view<BufferDescriptor>(allocator_, kEntries, 128);
+  if (descriptors.empty() ||
+      !dma_reachable(reinterpret_cast<uint64_t>(descriptors.data()), descriptors.size() * sizeof(BufferDescriptor)) ||
+      !dma_reachable(ring_address, kRingBytes))
     return false;
   for (uint32_t i = 0; i < kEntries; ++i) {
-    descriptors_[i].address = ring_.address() + uint64_t{i} * kEntryBytes;
-    descriptors_[i].length = kEntryBytes;
-    descriptors_[i].flags = 0;  // no interrupt on completion
+    descriptors[i].address = ring_address + uint64_t{i} * kEntryBytes;
+    descriptors[i].length = kEntryBytes;
+    descriptors[i].flags = 0;  // no interrupt on completion
   }
 
   // Reset the stream descriptor, then program it.
-  write8(stream_ + kSdControl, kSdReset);
-  if (!wait_register(stream_ + kSdControl, kSdReset, kSdReset, 10000)) return false;
-  write8(stream_ + kSdControl, 0);
-  if (!wait_register(stream_ + kSdControl, kSdReset, 0, 10000)) return false;
+  write8(stream + kSdControl, kSdReset);
+  if (!wait_register(stream + kSdControl, kSdReset, kSdReset, 10000)) return false;
+  write8(stream + kSdControl, 0);
+  if (!wait_register(stream + kSdControl, kSdReset, 0, 10000)) return false;
 
-  const uint64_t list = reinterpret_cast<uint64_t>(descriptors_.data());
-  write32(stream_ + kSdListLower, static_cast<uint32_t>(list));
-  write32(stream_ + kSdListUpper, static_cast<uint32_t>(list >> 32));
-  write32(stream_ + kSdBufferLength, kRingBytes);
-  write16(stream_ + kSdLastIndex, kEntries - 1);
-  write16(stream_ + kSdFormat, kFormat48k16bitStereo);
-  write8(stream_ + kSdTag, static_cast<uint8_t>(kStreamTag << 4));
+  const uint64_t list = reinterpret_cast<uint64_t>(descriptors.data());
+  write32(stream + kSdListLower, static_cast<uint32_t>(list));
+  write32(stream + kSdListUpper, static_cast<uint32_t>(list >> 32));
+  write32(stream + kSdBufferLength, kRingBytes);
+  write16(stream + kSdLastIndex, kEntries - 1);
+  write16(stream + kSdFormat, kFormat48k16bitStereo);
+  write8(stream + kSdTag, static_cast<uint8_t>(tag << 4));
   __atomic_thread_fence(__ATOMIC_RELEASE);
-  write8(stream_ + kSdControl, kSdRun);
+  write8(stream + kSdControl, kSdRun);
   return true;
 }
 
@@ -372,19 +378,23 @@ bool IntelHdaAudioDevice::initialize() {
     shutdown();
     return false;
   }
+  input_streams_ = input_streams;
   stream_ = 0x80 + 0x20 * input_streams;  // the output descriptors follow the input ones
 
-  if (!reset_controller() || !start_command_rings() || !find_output_path() || !configure_path() || !start_stream()) {
+  if (!reset_controller() || !start_command_rings() || !find_output_path() || !configure_path() || !ring_.allocate(allocator_, kRingBytes) ||
+      !run_stream(stream_, descriptors_, ring_.address(), kStreamTag)) {
     shutdown();
     return false;
   }
   write32(kIntctl, 0);  // polled
   running_ = true;
   apply_volume();
+  capture_.start();  // the input is optional
   return true;
 }
 
 void IntelHdaAudioDevice::shutdown() {
+  capture_.stop();
   running_ = false;
   if (registers_ && owns_device_) {
     write8(stream_ + kSdControl, 0);
@@ -417,5 +427,112 @@ void IntelHdaAudioDevice::apply_volume() {
 }
 
 uint32_t IntelHdaAudioDevice::hardware_position() { return read32(stream_ + kSdPosition) % kRingBytes; }
+
+
+// Depth-first from a converter towards an input pin (of the kind `wanted_device`, or any if 0xFF).
+bool IntelHdaAudioDevice::search_pin(uint8_t nid, uint32_t depth, uint8_t wanted_device, Hop* path, uint32_t* length,
+                                     uint8_t* device) {
+  if (depth >= kMaxPath || !widget_caps_[nid]) return false;
+  const uint32_t type = widget_type(widget_caps_[nid]);
+  path[depth].nid = nid;
+  if (type == kWidgetPin) {
+    uint32_t pin_caps = 0, config = 0;
+    if (depth == 0 || !get_parameter(nid, kParamPinCaps, &pin_caps) || !(pin_caps & kPinCapsInput)) return false;
+    if (!verb(nid, kGetConfigDefault << 8, &config) || ((config >> 30) & 3) == 1) return false;
+    const uint8_t kind = (config >> 20) & 0xF;
+    if (wanted_device != 0xFF && kind != wanted_device) return false;
+    *length = depth + 1;
+    *device = kind;
+    return true;
+  }
+  if (type != kWidgetInput && type != kWidgetMixer && type != kWidgetSelector) return false;
+  if (type == kWidgetInput && depth != 0) return false;
+  uint8_t list[32];
+  const uint32_t count = connections(nid, list, sizeof(list));
+  path[depth].connections = static_cast<uint8_t>(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    path[depth].select = static_cast<uint8_t>(i);
+    if (search_pin(list[i], depth + 1, wanted_device, path, length, device)) return true;
+  }
+  return false;
+}
+
+bool IntelHdaAudioDevice::Capture::start() {
+  IntelHdaAudioDevice& d = owner_;
+  if (!d.input_streams_) return false;
+  stream_ = 0x80;  // the first input descriptor
+
+  // Find an input pin and the converter that can listen to it: microphone first, then line in, then any input.
+  static constexpr uint8_t kPreference[] = {0xA, 0x8, 0xFF};
+  uint8_t kind = 0xFF;
+  bool found = false;
+  for (uint8_t wanted : kPreference) {
+    for (uint32_t n = d.first_widget_; n < d.first_widget_ + d.widget_count_ && n < 256 && !found; ++n)
+      if (widget_type(d.widget_caps_[n]) == kWidgetInput) found = d.search_pin(static_cast<uint8_t>(n), 0, wanted, path_, &path_length_, &kind);
+    if (found) break;
+  }
+  if (!found) return false;
+  pin_control_ = kind == 0xA ? 0x24 : 0x20;  // input enable (a microphone also gets its bias voltage)
+
+  const uint8_t adc = path_[0].nid, pin = path_[path_length_ - 1].nid;
+  uint32_t rates = 0;
+  const bool own_formats = d.widget_caps_[adc] & kCapsFormatOverride;
+  if (!d.get_parameter(own_formats ? adc : d.function_group_, kParamPcmRates, &rates) || !(rates & kPcm48k) || !(rates & kPcm16bit))
+    return false;
+
+  amp_nid_ = 0;
+  for (uint32_t i = 0; i < path_length_; ++i) {
+    const Hop& hop = path_[i];
+    d.verb(hop.nid, (kSetPower << 8) | 0, nullptr);
+    if (i + 1 < path_length_ && hop.connections > 1) d.verb(hop.nid, (kSetConnectionSelect << 8) | hop.select, nullptr);
+    if (!(d.widget_caps_[hop.nid] & kCapsInputAmp)) continue;
+    // Open the input amplifier of the connection the path uses (a pin has only one).
+    const uint32_t index = i + 1 < path_length_ ? hop.select : 0;
+    const Amplifier amp = d.amplifier(hop.nid, kParamInputAmpCaps);
+    const uint32_t top = amp.offset ? amp.offset : amp.steps;
+    d.verb(hop.nid, (kSetAmplifier << 16) | (1u << 14) | (1u << 13) | (1u << 12) | (index << 8) | top, nullptr);
+    if (i == 0 && amp.present) {  // the converter's amplifier is the level control
+      amp_nid_ = hop.nid;
+      amp_index_ = static_cast<uint8_t>(index);
+      amp_ = amp;
+    }
+  }
+  d.verb(pin, (kSetPinControl << 8) | pin_control_, nullptr);
+  d.verb(adc, (kSetChannelStream << 8) | (kCaptureStreamTag << 4), nullptr);
+  d.verb(adc, (kSetFormat << 16) | kFormat48k16bitStereo, nullptr);
+
+  if (!ring_.allocate(d.allocator_, kRingBytes) || !d.run_stream(stream_, descriptors_, ring_.address(), kCaptureStreamTag)) {
+    stop();
+    return false;
+  }
+  owns_stream_ = true;
+  running_ = true;
+  return true;
+}
+
+void IntelHdaAudioDevice::Capture::stop() {
+  IntelHdaAudioDevice& d = owner_;
+  if (owns_stream_ && d.registers_) d.write8(stream_ + kSdControl, 0);
+  owns_stream_ = false;
+  running_ = false;
+  ring_.release(d.allocator_);
+  release_view(d.allocator_, descriptors_);
+}
+
+uint32_t IntelHdaAudioDevice::Capture::hardware_position() { return owner_.read32(stream_ + kSdPosition) % kRingBytes; }
+
+bool IntelHdaAudioDevice::Capture::hardware_gain() const { return amp_nid_ && amp_.offset > 0; }
+
+void IntelHdaAudioDevice::Capture::apply_gain() {
+  if (!running_ || !hardware_gain()) return;
+  const bool silent = muted_ || gain_ == 0;
+  uint32_t value = gain_ * amp_.offset / kAudioMaxVolume;  // attenuation from the 0 dB point
+  uint32_t flags = (1u << 14) | (1u << 13) | (1u << 12) | (uint32_t{amp_index_} << 8);  // input amplifier, both channels
+  if (silent) {
+    if (amp_.can_mute) flags |= 1u << 7;
+    else value = 0;
+  }
+  owner_.verb(amp_nid_, (kSetAmplifier << 16) | flags | value, nullptr);
+}
 
 }  // namespace hardware

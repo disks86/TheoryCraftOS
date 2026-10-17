@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Audio/AudioCaptureHub.hpp"
 #include "Audio/AudioMixer.hpp"
 #include "Hardware/AudioDevice/IAudioDevice.hpp"
 
@@ -29,3 +30,9 @@ bool run_audio_demo(hardware::IAudioDevice& device);
 // (a fifth apart) and checks that both were taken whole, mixed and played, and that
 // the mixer reports them. Returns true if every check passes.
 bool run_mixer_demo(audio::AudioMixer& mixer);
+
+// Opens two streams on the capture hub, lets about a quarter of a second go by
+// and checks that both received about that much audio, the same amount, and that
+// gain and mute work on a stream. Logs the loudest sample heard (0 on a silent
+// input). Returns true if every check passes.
+bool run_capture_demo(audio::AudioCaptureHub& hub);

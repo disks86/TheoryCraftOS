@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/AudioDevice/AudioCaptureBase.hpp"
 #include "Hardware/AudioDevice/AudioDeviceBase.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "uefi.hpp"
@@ -27,7 +28,8 @@ namespace hardware {
 // The Intel ICH AC'97 audio controller (QEMU's `AC97`) with its codec. The codec
 // mixer sits in one I/O range (BAR 0), the bus-master DMA engines in another
 // (BAR 1). Playback uses the PCM-out engine over a ring of 32 buffer descriptors
-// that is kept permanently valid, so the engine never stops. Polled; 32-bit DMA,
+// that is kept permanently valid, so the engine never stops. Recording is the
+// mirror image on the PCM-in engine (from the codec's microphone input). Polled; 32-bit DMA,
 // so the buffers must be below 4 GiB.
 class Ac97AudioDevice final : public RingAudioDevice {
  public:
@@ -48,6 +50,7 @@ class Ac97AudioDevice final : public RingAudioDevice {
   const char* name() const override { return "Intel AC'97 audio"; }
   bool initialize() override;
   void shutdown() override;
+  IAudioCapture* capture() override { return capture_.active() ? &capture_ : nullptr; }
 
  private:
   struct BufferDescriptor {
@@ -65,9 +68,28 @@ class Ac97AudioDevice final : public RingAudioDevice {
   void bus_write16(uint16_t reg, uint16_t value) const;
   void bus_write32(uint16_t reg, uint32_t value) const;
 
+  // The recording side: the PCM-in engine over its own descriptor list and ring.
+  class Capture final : public RingAudioCapture {
+   public:
+    explicit Capture(Ac97AudioDevice& owner) : owner_(owner) {}
+    const char* name() const override { return "Intel AC'97 input"; }
+    bool start();
+    void stop();
+    bool active() const { return running_; }
+
+   private:
+    void refresh() override;
+    Ac97AudioDevice& owner_;
+    ArrayView<BufferDescriptor> descriptors_;
+  };
+
+  // Where an engine (its register block at `box`) is in its ring, and keeping its descriptor list from running out.
+  uint32_t box_position(uint16_t box) const;
+  void keep_box_running(uint16_t box) const;
+  bool reset_box(uint16_t box) const;
+
   void apply_volume() override;
   void refresh() override;
-  uint32_t hardware_position();
 
   const IPciBus& pci_;
   PciDeviceInfo device_;
@@ -77,6 +99,7 @@ class Ac97AudioDevice final : public RingAudioDevice {
   uint16_t mixer_ = 0;  // I/O base of the codec mixer registers
   uint16_t bus_ = 0;    // I/O base of the bus-master registers
   ArrayView<BufferDescriptor> descriptors_;
+  Capture capture_{*this};
   bool owns_device_ = false;
 };
 

@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/AudioDevice/AudioCaptureBase.hpp"
 #include "Hardware/AudioDevice/AudioDeviceBase.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "uefi.hpp"
@@ -29,7 +30,8 @@ namespace hardware {
 // The driver talks to the codec through the CORB/RIRB command rings, finds an
 // output pin (line out, speaker or headphones) and the DAC behind it, unmutes the
 // path and plays through output stream 0 from one cyclic buffer described by a
-// buffer descriptor list. Polled: no interrupts. Any vendor's controller that
+// buffer descriptor list. Recording works the same way backwards: an input pin
+// (microphone or line in), the converter that can reach it and input stream 0. Polled: no interrupts. Any vendor's controller that
 // follows the specification (PCI class 0x0403) is used.
 class IntelHdaAudioDevice final : public RingAudioDevice {
  public:
@@ -37,6 +39,7 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   static constexpr uint32_t kEntryBytes = 8192;
   static constexpr uint32_t kRingBytes = kEntries * kEntryBytes;
   static constexpr uint8_t kStreamTag = 1;
+  static constexpr uint8_t kCaptureStreamTag = 2;
 
   IntelHdaAudioDevice(const IPciBus& pci, const PciDeviceInfo& device, allocators::IAllocator& allocator,
                       efi::SystemTable* st)
@@ -45,6 +48,7 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   const char* name() const override { return "Intel High Definition Audio"; }
   bool initialize() override;
   void shutdown() override;
+  IAudioCapture* capture() override { return capture_.active() ? &capture_ : nullptr; }
 
  private:
   struct BufferDescriptor {
@@ -66,6 +70,31 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   };
   static constexpr uint32_t kMaxPath = 5;
 
+  // The recording side: its own path through the codec, stream descriptor, buffer list and ring.
+  class Capture final : public RingAudioCapture {
+   public:
+    explicit Capture(IntelHdaAudioDevice& owner) : owner_(owner) {}
+    const char* name() const override { return "Intel HD Audio input"; }
+    bool start();
+    void stop();
+    bool active() const { return running_; }
+
+   private:
+    uint32_t hardware_position() override;
+    bool hardware_gain() const override;
+    void apply_gain() override;
+    IntelHdaAudioDevice& owner_;
+    ArrayView<BufferDescriptor> descriptors_;
+    Hop path_[kMaxPath] = {};
+    uint32_t path_length_ = 0;
+    uint32_t pin_control_ = 0x20;
+    Amplifier amp_;       // the input amplifier that sets the level
+    uint8_t amp_nid_ = 0;
+    uint8_t amp_index_ = 0;
+    uint32_t stream_ = 0;  // register offset of input stream 0's descriptor
+    bool owns_stream_ = false;
+  };
+
   uint8_t read8(uint32_t reg) const;
   uint16_t read16(uint32_t reg) const;
   uint32_t read32(uint32_t reg) const;
@@ -83,7 +112,8 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   uint32_t connections(uint8_t nid, uint8_t* out, uint32_t capacity);
   Amplifier amplifier(uint8_t nid, uint8_t parameter);
   bool configure_path();
-  bool start_stream();
+  bool run_stream(uint32_t stream, ArrayView<BufferDescriptor>& descriptors, uint64_t ring_address, uint8_t tag);
+  bool search_pin(uint8_t nid, uint32_t depth, uint8_t wanted_device, Hop* path, uint32_t* length, uint8_t* device);
   bool dma_reachable(uint64_t address, uint64_t bytes) const;
 
   void apply_volume() override;
@@ -97,6 +127,7 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   uint64_t registers_ = 0;
   uint32_t stream_ = 0;  // register offset of output stream 0's descriptor
   bool dma64_ = false;
+  uint32_t input_streams_ = 0;
   uint8_t codec_ = 0;
 
   ByteView corb_, rirb_;
@@ -105,6 +136,8 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   ArrayView<BufferDescriptor> descriptors_;
 
   uint8_t function_group_ = 0;
+  uint32_t first_widget_ = 0, widget_count_ = 0;
+  kernel::Mutex codec_mutex_;  // one command at a time on the CORB/RIRB, from the playback and capture sides
   uint32_t widget_caps_[256] = {};  // audio widget capabilities by node id (0 = no such widget)
   Hop path_[kMaxPath] = {};
   uint32_t path_length_ = 0;
@@ -112,6 +145,7 @@ class IntelHdaAudioDevice final : public RingAudioDevice {
   bool pin_has_eapd_ = false;
   Amplifier volume_amp_;
   uint8_t volume_nid_ = 0;
+  Capture capture_{*this};
   bool owns_device_ = false;
 };
 

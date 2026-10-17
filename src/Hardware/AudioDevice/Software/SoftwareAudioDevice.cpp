@@ -25,10 +25,13 @@ bool SoftwareAudioDevice::initialize() {
   last_us_ = clock_.now_us();
   fraction_ = 0;
   running_ = true;
+  capture_started_ = capture_.start(allocator_);  // the input is optional
   return true;
 }
 
 void SoftwareAudioDevice::shutdown() {
+  if (capture_started_) capture_.stop(allocator_);
+  capture_started_ = false;
   running_ = false;
   ring_.release(allocator_);
 }

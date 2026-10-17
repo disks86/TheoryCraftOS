@@ -35,6 +35,7 @@
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
 #include "Kernel/Thread.hpp"
+#include "Audio/AudioCaptureHub.hpp"
 #include "Audio/AudioMixer.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Clock/TscClock.hpp"
@@ -327,6 +328,24 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       mixer.reset();
     }
   }
+
+  // The recording side: the first device with an input, shared by every program through the capture hub.
+  UniquePointer<audio::AudioCaptureHub> capture_hub;
+  for (uint32_t i = 0; i < audio.count() && !capture_hub; ++i) {
+    hardware::IAudioCapture* input = audio.at(i)->capture();
+    if (!input) continue;
+    capture_hub = UniquePointer<audio::AudioCaptureHub>::make(shared_allocator, *input, shared_allocator);
+    if (capture_hub && capture_hub->initialize() && capture_hub->start_service()) {
+      Entry(Level::Ok, "Audio").text("capture running: ").text(input->name());
+#ifdef TCOS_SELFTESTS
+      if (!run_capture_demo(*capture_hub)) console::puts("  capture self-check failed\n");
+#endif
+    } else {
+      Entry(Level::Warning, "Audio").text("could not start capture");
+      capture_hub.reset();
+    }
+  }
+  if (!capture_hub) Entry(Level::Info, "Audio").text("no audio input");
 #ifdef TCOS_SELFTESTS
   UniquePointer<NetworkStackDemo> stack_demo;
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
@@ -436,6 +455,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::use_gpu(gpu);
     console::puts("TheoryCraftOS: shutting down\n");
   }
+  capture_hub.reset();
   mixer.reset();   // the mixer thread ends before its audio device goes
   stacks.clear();  // the stacks go before the NICs underneath them
 #ifdef TCOS_SELFTESTS

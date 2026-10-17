@@ -37,4 +37,11 @@ struct AudioStatistics {
   uint64_t write_failures = 0;   // write() calls refused (device not running, nothing fits)
 };
 
+struct AudioCaptureStatistics {
+  uint64_t frames_captured = 0;  // frames the device has recorded
+  uint64_t frames_read = 0;      // frames handed out by read()
+  uint64_t frames_lost = 0;      // recorded frames overwritten before they were read
+  uint64_t overruns = 0;         // times that happened
+};
+
 }  // namespace hardware

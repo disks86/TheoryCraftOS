@@ -52,16 +52,21 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   controller: CORB/RIRB verbs, finds an output pin and the DAC behind it, unmutes the path, stream 0 over a buffer
   descriptor list), `Intel/Ac97AudioDevice` (ICH AC'97, PCM-out engine over 32 descriptors), `Virtio/VirtioSoundDevice`
   (period buffers on the transmit queue; volume applied in software) and `Software/SoftwareAudioDevice` (discards
-  samples at real-time pace; `SystemAudioDevices` uses it when no sound hardware is found). Not covered: capture,
-  other formats/rates (no resampling), jack detection, interrupts. `src/AudioDemo` plays a short tone at boot
-  (`TCOS_SELFTESTS`); `tests/AudioTest.cpp` covers the ring and the software device. The `run` targets give QEMU an
+  samples at real-time pace; `SystemAudioDevices` uses it when no sound hardware is found). Capture: `IAudioDevice::capture()` gives the
+  recording side (`IAudioCapture`: `read()`, `available_bytes()`, `flush()`, gain, mute, statistics incl. lost frames), filled
+  by the hardware into a `CaptureRing` (HD Audio input stream from a mic/line-in pin, AC'97 PCM-in from the mic, virtio-sound
+  receive queue, or silence from the software device). Not covered: other formats/rates (no resampling), jack detection,
+  interrupts, capture from several inputs at once. `src/AudioDemo` plays a short tone at boot
+  (`TCOS_SELFTESTS`); `tests/AudioTest.cpp` covers the ring and the software device, `tests/AudioCaptureTest.cpp` the capture ring, software input and hub. The `run` targets give QEMU an
   `intel-hda` + `hda-duplex` with a `none` audio backend.
 - `src/Audio/`: the sound server. Audio hardware plays one stream, so `AudioMixer` owns the device (the first one
   `SystemAudioDevices` found) and any number of programs mix through it: `open_stream()` gives an `AudioStream`
   (a 32 KiB ring in the fixed format, own volume and mute, `write()` never blocks, `close()` when done). `pump()` keeps
   the device topped up to ~50 ms, sums every stream with clipping (32-bit accumulator) and writes nothing when
   all streams are empty; `start_service()` runs it from the "audio" thread every 5 ms. Master volume/mute go to the
-  device. Up to 32 streams. Not covered: resampling or other formats, per-stream panning, capture.
+  device. Up to 32 streams. Not covered: resampling or other formats, per-stream panning.
+  `AudioCaptureHub` is the same idea for recording: one microphone, many `CaptureStream`s, each getting every frame recorded since
+  it was opened (own gain/mute, oldest audio overwritten if a reader lags); the "capture" thread feeds them.
   `tests/AudioMixerTest.cpp` covers it; `src/AudioDemo` mixes two tones at boot (`TCOS_SELFTESTS`).
 - `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
   `remove`, `rename`) hands out `IFile` (offset-based read/write/resize) and `IDirectory` (entry iteration) handles;

@@ -35,9 +35,12 @@ constexpr uint16_t kMixerMaxAttenuation = 31;  // 1.5 dB steps
 constexpr uint16_t kGlobalControl = 0x2C, kGlobalStatus = 0x30;
 constexpr uint32_t kGlobalColdResetOff = 1u << 1;  // 1 = the codec is not held in reset
 constexpr uint32_t kGlobalPrimaryReady = 1u << 8;
-// The PCM-out box.
-constexpr uint16_t kPoBase = 0x10, kPoBdbar = kPoBase + 0x00, kPoCiv = kPoBase + 0x04, kPoLvi = kPoBase + 0x05,
-                   kPoSr = kPoBase + 0x06, kPoPicb = kPoBase + 0x08, kPoCr = kPoBase + 0x0B;
+// The bus-master engines ("boxes"): PCM-in at 0x00, PCM-out at 0x10, each with the same registers.
+constexpr uint16_t kPiBase = 0x00, kPoBase = 0x10;
+constexpr uint16_t kBdbar = 0x00, kCiv = 0x04, kLvi = 0x05, kSr = 0x06, kPicb = 0x08, kCr = 0x0B;
+constexpr uint16_t kPoBdbar = kPoBase + kBdbar, kPoLvi = kPoBase + kLvi, kPoCr = kPoBase + kCr;
+// Codec registers for recording.
+constexpr uint16_t kMixerRecordSelect = 0x1A, kMixerRecordGain = 0x1C, kMixerMic = 0x0E;
 constexpr uint8_t kCrRun = 1u << 0, kCrReset = 1u << 1;
 constexpr uint16_t kSrHalted = 1u << 0, kSrClearable = 0x1C;  // last-buffer, completion and FIFO-error flags
 }  // namespace
@@ -91,14 +94,7 @@ bool Ac97AudioDevice::initialize() {
   }
 
   // Reset the PCM-out box and point it at the descriptor list.
-  bus_write8(kPoCr, 0);
-  bus_write8(kPoCr, kCrReset);
-  bool reset_done = false;
-  for (int i = 0; i < 100 && !reset_done; ++i) {
-    reset_done = !(bus_read8(kPoCr) & kCrReset);
-    if (!reset_done) hardware::delay_us(100);
-  }
-  if (!reset_done) {
+  if (!reset_box(kPoBase)) {
     shutdown();
     return false;
   }
@@ -109,10 +105,12 @@ bool Ac97AudioDevice::initialize() {
   bus_write32(kPoBdbar, static_cast<uint32_t>(reinterpret_cast<uint64_t>(descriptors_.data())));
   bus_write8(kPoLvi, kEntries - 1);
   bus_write8(kPoCr, kCrRun);
+  capture_.start();  // the input is optional
   return true;
 }
 
 void Ac97AudioDevice::shutdown() {
+  capture_.stop();
   running_ = false;
   if (bus_ && owns_device_) {
     bus_write8(kPoCr, 0);
@@ -134,30 +132,87 @@ void Ac97AudioDevice::apply_volume() {
   mixer_write(kMixerMaster, value);
 }
 
-// Where the engine is: the current descriptor, and how far into it.
-uint32_t Ac97AudioDevice::hardware_position() {
-  uint8_t index = bus_read8(kPoCiv);
-  uint16_t left = bus_read16(kPoPicb);  // samples of this descriptor still to play
-  const uint8_t again = bus_read8(kPoCiv);
+bool Ac97AudioDevice::reset_box(uint16_t box) const {
+  bus_write8(box + kCr, 0);
+  bus_write8(box + kCr, kCrReset);
+  for (int i = 0; i < 100; ++i) {
+    if (!(bus_read8(box + kCr) & kCrReset)) return true;
+    hardware::delay_us(100);
+  }
+  return false;
+}
+
+// Where an engine is: the current descriptor, and how far into it.
+uint32_t Ac97AudioDevice::box_position(uint16_t box) const {
+  uint8_t index = bus_read8(box + kCiv);
+  uint16_t left = bus_read16(box + kPicb);  // samples of this descriptor still to go
+  const uint8_t again = bus_read8(box + kCiv);
   if (again != index) {  // moved on between the reads: take the new descriptor, from its start
     index = again;
-    left = bus_read16(kPoPicb);
+    left = bus_read16(box + kPicb);
   }
   const uint32_t remaining = uint32_t{left} * kAudioBytesPerSample;
-  const uint32_t played = remaining >= kEntryBytes ? 0 : kEntryBytes - remaining;
-  return (uint32_t{index} % kEntries) * kEntryBytes + played;
+  const uint32_t done = remaining >= kEntryBytes ? 0 : kEntryBytes - remaining;
+  return (uint32_t{index} % kEntries) * kEntryBytes + done;
+}
+
+// Keeps the last valid descriptor just behind the current one so the list never runs out.
+void Ac97AudioDevice::keep_box_running(uint16_t box) const {
+  const uint8_t current = bus_read8(box + kCiv);
+  bus_write8(box + kLvi, static_cast<uint8_t>((current + kEntries - 1) % kEntries));
+  if (bus_read16(box + kSr) & kSrHalted) {  // it stopped (we were not polled in time): clear and run again
+    bus_write16(box + kSr, kSrClearable);
+    bus_write8(box + kCr, kCrRun);
+  }
 }
 
 void Ac97AudioDevice::refresh() {
   if (!running_) return;
-  ring_.advance(hardware_position());
-  // Keep the last valid descriptor just behind the current one so the list never runs out.
-  const uint8_t current = bus_read8(kPoCiv);
-  bus_write8(kPoLvi, static_cast<uint8_t>((current + kEntries - 1) % kEntries));
-  if (bus_read16(kPoSr) & kSrHalted) {  // it stopped (we were not polled in time): clear and run again
-    bus_write16(kPoSr, kSrClearable);
-    bus_write8(kPoCr, kCrRun);
+  ring_.advance(box_position(kPoBase));
+  keep_box_running(kPoBase);
+}
+
+// Recording: the codec's microphone input, at 0 dB, through the PCM-in engine. Gain and mute are done in software.
+bool Ac97AudioDevice::Capture::start() {
+  Ac97AudioDevice& d = owner_;
+  descriptors_ = allocate_view<BufferDescriptor>(d.allocator_, kEntries, 128);
+  if (descriptors_.empty() || !ring_.allocate(d.allocator_, kRingBytes) ||
+      reinterpret_cast<uint64_t>(descriptors_.data()) + descriptors_.size() * sizeof(BufferDescriptor) > 0x100000000ull ||
+      ring_.address() + ring_.size() > 0x100000000ull || !d.reset_box(kPiBase)) {
+    stop();
+    return false;
   }
+  for (uint32_t i = 0; i < kEntries; ++i) {
+    descriptors_[i].address = static_cast<uint32_t>(ring_.address() + uint64_t{i} * kEntryBytes);
+    descriptors_[i].samples = kEntryBytes / kAudioBytesPerSample;
+    descriptors_[i].flags = 0;
+  }
+  d.mixer_write(kMixerRecordSelect, 0x0000);  // record from the microphone
+  d.mixer_write(kMixerRecordGain, 0x0000);    // 0 dB, not muted
+  d.mixer_write(kMixerMic, 0x0008);           // microphone: 0 dB, not muted
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  d.bus_write32(kPiBase + kBdbar, static_cast<uint32_t>(reinterpret_cast<uint64_t>(descriptors_.data())));
+  d.bus_write8(kPiBase + kLvi, kEntries - 1);
+  d.bus_write8(kPiBase + kCr, kCrRun);
+  running_ = true;
+  return true;
+}
+
+void Ac97AudioDevice::Capture::stop() {
+  Ac97AudioDevice& d = owner_;
+  if (running_ && d.bus_) {
+    d.bus_write8(kPiBase + kCr, 0);
+    d.bus_write8(kPiBase + kCr, kCrReset);  // the engine stops writing into our buffers
+  }
+  running_ = false;
+  ring_.release(d.allocator_);
+  release_view(d.allocator_, descriptors_);
+}
+
+void Ac97AudioDevice::Capture::refresh() {
+  if (!running_) return;
+  ring_.advance(owner_.box_position(kPiBase));
+  owner_.keep_box_running(kPiBase);
 }
 
 }  // namespace hardware
