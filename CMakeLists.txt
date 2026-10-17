@@ -194,6 +194,17 @@ add_executable(BOOTX64
   src/Gui/Controls/DataGrid.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
+  src/Gui/Controls/VideoPlayerControl.cpp
+  src/Video/AviFile.cpp
+  src/Video/AviWriter.cpp
+  src/Video/VideoPlayer.cpp
+  src/Hardware/VideoCodec/VideoTypes.cpp
+  src/Hardware/VideoCodec/VideoFrameBuffer.cpp
+  src/Hardware/VideoCodec/ColorConvert.cpp
+  src/Hardware/VideoCodec/SystemVideoCodecs.cpp
+  src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
+  src/Hardware/VideoCodec/Software/JpegDecoder.cpp
+  src/Hardware/VideoCodec/Software/JpegEncoder.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp
   src/Gui/Windows/WindowManager.cpp

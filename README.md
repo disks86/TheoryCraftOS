@@ -74,6 +74,25 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   `AudioCaptureHub` is the same idea for recording: one microphone, many `CaptureStream`s, each getting every frame recorded since
   it was opened (own gain/mute and own `StreamFormat`, converted as the audio arrives; oldest audio overwritten if a reader lags); the "capture" thread feeds them.
   `tests/AudioMixerTest.cpp` covers it; `src/AudioDemo` mixes two tones at boot (`TCOS_SELFTESTS`).
+- `src/Hardware/VideoCodec/`: video encode/decode. `IVideoCodecDevice` (a GPU's video engine, or the software fallback) hands out
+  sessions: `IVideoDecoder` (`submit(packet)` / `receive(frame)`, `flush`, `reset` for a seek) and `IVideoEncoder`, polled and
+  non-blocking, with `VideoFrame` views in `Bgra8888`, `I420` or `Nv12` and a `VideoPacket` carrying pts and keyframe flag
+  (`VideoTypes.hpp`; `VideoFrameBuffer` owns frame memory; `ColorConvert` does BT.601 conversions in integers, full or limited
+  range). `Software/SoftwareVideoCodec` really decodes and encodes **Motion JPEG** (`Jpeg.hpp`: a baseline JPEG decoder - any
+  sampling up to 2x2, restart markers, several scans - using the IJG accurate integer DCT, bit-exact with a reference decoder
+  on 4:4:4 and grey, and an encoder with per-picture optimal Huffman tables, quality 1-100, 4:2:0) and **raw** I420/NV12/BGRA
+  frames. The vendor classes `NVIDIA/NvidiaVideoEngine` (NVDEC/NVENC), `AMD/AmdVcnVideoEngine` (VCN) and
+  `Intel/IntelMediaVideoEngine` (Quick Sync) are what `SystemVideoCodecs` creates for a display controller of that vendor: they
+  report `info().hardware_engine` but `accelerated` stays false - this OS does not drive those engines, so their sessions run on
+  the CPU and **H.264, H.265, VP9 and AV1 are not available** until a native driver exists (that is where it goes). Not covered:
+  progressive/arithmetic JPEG, B-frame reordering is in the interface but unused, capture devices.
+  `tests/VideoCodecTest.cpp` includes a fuzz run of the JPEG decoder under ASAN/UBSAN.
+- `src/Video/`: `AviFile` reads an in-memory AVI (video stream: MJPG, I420/NV12, or a named codec such as H264 flagged for the
+  decoders; PCM audio; frames found by scanning `movi`, keyframes from `idx1`), `AviWriter` builds one, and `VideoPlayer` plays it:
+  a decoder session from `SystemVideoCodecs`, the audio through an `audio::AudioPlayer` whose position is the clock (picture
+  frames are skipped when decoding falls behind; without sound the system clock is used), play/pause/stop/seek (back to the
+  nearest keyframe for inter-coded streams)/loop, a BGRA picture with a serial number. `OpenResult::NoDecoder` is what an H.264
+  file gets today. `tests/VideoPlayerTest.cpp` covers it with a fake clock and audio device.
 - `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
   `remove`, `rename`) hands out `IFile` (offset-based read/write/resize) and `IDirectory` (entry iteration) handles;
   every call returns a `Status` instead of throwing. `Path.hpp` holds the shared path rules. `Ram/` is a
@@ -234,7 +253,8 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   resizable columns, row selection, vertical/horizontal scrolling; numbers sort as numbers, the sort is stable), `ImageView` (a `Surface`
   at 1-3200% zoom: pixels repeat zooming in and average zooming out, drag to pan, wheel/keys to zoom, fit mode, chequerboard
   under transparency, drawn through a viewport-sized cache), `AudioPlayerControl` (play/pause, stop, seek and volume sliders, time,
-  level meter, over an `audio::AudioPlayer`) and `DatePicker` (YYYY-MM-DD field + month calendar popup;
+  level meter, over an `audio::AudioPlayer`), `VideoPlayerControl` (the picture in an `ImageView` that enlarges to fill, with
+  play/pause, stop, seek, loop, volume and time, over a `video::VideoPlayer`) and `DatePicker` (YYYY-MM-DD field + month calendar popup;
   `Gui/Date.hpp` has the Gregorian date maths, years 1-9999). Callbacks are `Handler`s (function + context pointer). `Window` is the root: title bar,
   focus (Tab/Shift+Tab), mouse capture, hover, and one popup layer drawn above the tree (drop-down lists and menus use it);
   `render()` lays out, paints and presents when `dirty()`. `InputPump` feeds a window from `IKeyboard`/`IMouse` (relative or

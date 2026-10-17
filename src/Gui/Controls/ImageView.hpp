@@ -53,6 +53,9 @@ class ImageView : public Control {
   void zoom_out();
   void actual_size() { set_zoom(100); }
   void fit();
+  // Whether fit mode may also enlarge a picture that is smaller than the view (default: no, it only shrinks).
+  void set_fit_enlarges(bool enlarge);
+  bool fit_enlarges() const { return fit_enlarges_; }
   void on_zoom_changed(Handler handler) { UiGuard lock(this); zoom_changed_ = handler; }
 
   // The part of the picture shown: the picture-space (zoomed) coordinate at the top left of the viewport.
@@ -87,6 +90,7 @@ class ImageView : public Control {
   uint32_t generation_ = 1;
   int32_t zoom_ = 100;
   bool fit_ = true;
+  bool fit_enlarges_ = false;
   int32_t origin_x_ = 0, origin_y_ = 0;
   Handler zoom_changed_;
 

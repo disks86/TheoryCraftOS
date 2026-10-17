@@ -17,6 +17,7 @@
  */
 
 #include "Gui/Controls/AudioPlayerControl.hpp"
+#include "Gui/TimeText.hpp"
 
 namespace gui {
 
@@ -24,22 +25,6 @@ namespace {
 constexpr int32_t kPad = 4, kRow1 = 4, kRow2 = 32, kRow3 = 60, kRowHeight = 24;
 constexpr int32_t kMeterFall = 4;  // how far the meter drops per refresh
 
-// "MM:SS", or "H:MM:SS" from an hour on. Returns the length.
-uint32_t format_clock(uint64_t seconds, char* out) {
-  const uint64_t hours = seconds / 3600, minutes = seconds / 60 % 60, secs = seconds % 60;
-  uint32_t n = 0;
-  if (hours > 0) {
-    out[n++] = static_cast<char>('0' + hours % 10);
-    out[n++] = ':';
-  }
-  out[n++] = static_cast<char>('0' + minutes / 10);
-  out[n++] = static_cast<char>('0' + minutes % 10);
-  out[n++] = ':';
-  out[n++] = static_cast<char>('0' + secs / 10);
-  out[n++] = static_cast<char>('0' + secs % 10);
-  out[n] = 0;
-  return n;
-}
 }  // namespace
 
 AudioPlayerControl::AudioPlayerControl(allocators::IAllocator& allocator, audio::AudioPlayer& player)

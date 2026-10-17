@@ -74,7 +74,8 @@ int32_t ImageView::fit_zoom() const {
   if (view.width == 0 || view.height == 0) return 100;
   const int64_t by_width = int64_t{view.width} * 100 / image_->width, by_height = int64_t{view.height} * 100 / image_->height;
   int64_t zoom = by_width < by_height ? by_width : by_height;
-  if (zoom > 100) zoom = 100;  // shrink to fit, never enlarge
+  if (zoom > 100 && !fit_enlarges_) zoom = 100;  // shrink to fit, and enlarge only if asked to
+  if (zoom > kMaxZoom) zoom = kMaxZoom;
   return zoom < kMinZoom ? kMinZoom : static_cast<int32_t>(zoom);
 }
 
@@ -106,6 +107,12 @@ void ImageView::fit() {
   UiGuard lock(this);
   fit_ = true;
   refit();
+}
+
+void ImageView::set_fit_enlarges(bool enlarge) {
+  UiGuard lock(this);
+  fit_enlarges_ = enlarge;
+  if (fit_) refit();
 }
 
 void ImageView::layout() {

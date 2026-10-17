@@ -9,8 +9,8 @@ mkdir -p "$out"
 cxx=${CXX:-g++}
 flags="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I src -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-variable"
 
-# The GUI has a player control, which brings the audio player (and with it the mixer) along.
-gui_audio="src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp"
+# The GUI has player controls, which bring the audio player (and with it the mixer), the video player and the codecs along.
+gui_audio="src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp"
 
 build_and_run() {
   local name=$1; shift
@@ -21,7 +21,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest VideoCodecTest VideoPlayerTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -36,6 +36,11 @@ for t in "${WANTED[@]}"; do
     AudioConvertTest) build_and_run AudioConvertTest tests/AudioConvertTest.cpp src/Audio/Resampler.cpp ;;
     AudioPlayerTest) build_and_run AudioPlayerTest tests/AudioPlayerTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                        src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/WavFile.cpp src/Audio/AudioPlayer.cpp ;;
+    VideoCodecTest) build_and_run VideoCodecTest tests/VideoCodecTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
+                      src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp ;;
+    VideoPlayerTest) build_and_run VideoPlayerTest tests/VideoPlayerTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
+                       src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp \
+                       src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp ;;
     PartitionTest) build_and_run PartitionTest tests/PartitionTest.cpp tests/KernelStubs.cpp src/Hardware/StorageDevice/Partition/PartitionScanner.cpp ;;
     FileSystemTest) build_and_run FileSystemTest tests/FileSystemTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                       src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp ;;
@@ -59,8 +64,7 @@ for t in "${WANTED[@]}"; do
     GuiControlsTest) build_and_run GuiControlsTest tests/GuiControlsTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
                 src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp $gui_audio ;;
     GuiViewsTest) build_and_run GuiViewsTest tests/GuiViewsTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
-                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp \
-                src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp ;;
+                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp $gui_audio ;;
     GuiThreadTest)  # real threads, checked with ThreadSanitizer (cannot be combined with the address sanitizer)
       echo "== GuiThreadTest"
       $cxx -std=c++20 -O1 -g -fsanitize=thread -pthread -I src -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-misleading-indentation -Wno-delete-non-virtual-dtor \

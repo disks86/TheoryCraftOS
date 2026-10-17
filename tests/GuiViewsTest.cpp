@@ -27,6 +27,9 @@
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/ImageView.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
+#include "Gui/Controls/VideoPlayerControl.hpp"
+#include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Video/AviWriter.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -663,6 +666,149 @@ static void test_player_control() {
   CHECK(mixer.stream_count() == 0);
 }
 
+// --- VideoPlayerControl --------------------------------------------------------------
+
+struct FixedClock final : hardware::IClock {
+  uint64_t now = 0;
+  const char* name() const override { return "test clock"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint64_t now_us() const override { return now; }
+};
+
+struct NoPci final : hardware::IPciBus {
+  const char* name() const override { return "no pci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 0; }
+  bool pci_device(uint32_t, hardware::PciDeviceInfo*) const override { return false; }
+  uint32_t read32(hardware::PciAddress, uint16_t) const override { return 0; }
+  void write32(hardware::PciAddress, uint16_t, uint32_t) const override {}
+  uint64_t memory_bar(hardware::PciAddress, uint8_t) const override { return 0; }
+  uint16_t find_capability(hardware::PciAddress, uint8_t) const override { return 0; }
+};
+
+// A clip of `frames` frames at 10 fps; frame i is a flat colour with red level 10 * i + 5.
+static bool make_video_clip(TestAllocator& a, video::AviWriter& writer, uint32_t frames, bool with_audio) {
+  using namespace hardware;
+  const uint32_t w = 64, h = 36;
+  audio::StreamFormat audio_format{8000, 1, audio::SampleType::U8};
+  if (!writer.begin(VideoCodec::Mjpeg, w, h, 10, 1, PixelFormat::I420, with_audio ? &audio_format : nullptr)) return false;
+  SoftwareVideoCodec device(a);
+  EncoderConfig ec;
+  ec.codec = VideoCodec::Mjpeg; ec.width = w; ec.height = h; ec.input = PixelFormat::Bgra8888; ec.quality = 90;
+  UniquePointer<IVideoEncoder> enc = device.create_encoder(ec);
+  if (!enc) return false;
+  for (uint32_t i = 0; i < frames; ++i) {
+    VideoFrameBuffer frame(a);
+    if (!frame.allocate({w, h, PixelFormat::Bgra8888})) return false;
+    uint32_t* p = reinterpret_cast<uint32_t*>(frame.plane(0).data());
+    for (uint32_t k = 0; k < w * h; ++k) p[k] = 0xFF000000 | ((10 * i + 5) << 16) | (80 << 8) | 60;
+    VideoPacket packet;
+    if (enc->submit(frame.frame()) != SubmitResult::Accepted || !enc->receive(&packet) || !writer.add_frame(packet.data, true)) return false;
+    if (with_audio) {
+      uint8_t samples[800];
+      for (uint32_t k = 0; k < 800; ++k) samples[k] = (uint8_t)(128 + (k % 64) - 32);
+      if (!writer.add_audio(ConstByteView(samples, 800))) return false;
+    }
+  }
+  return writer.finish();
+}
+
+static void test_video_control() {
+  TestAllocator a;
+  Theme theme;
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, a);
+  CHECK(mixer.initialize());
+  {
+    NoPci pci;
+    hardware::SystemVideoCodecs codecs(pci, a);
+    codecs.initialize();
+    FixedClock clock;
+    video::AviWriter clip(a);
+    CHECK(make_video_clip(a, clip, 20, true));
+    video::VideoPlayer player(clock, codecs, a, &mixer);
+    Screen screen(a, 520, 400);
+    Window w(a, screen.renderer, theme, {520, 400});
+    VideoPlayerControl panel(a, player);
+    panel.set_bounds({10, 10, 480, 360});
+    w.add(&panel);
+    w.layout();
+    auto step = [&](int rounds) { for (int i = 0; i < rounds; ++i) { player.update(); mixer.pump(); dev.play_all(); panel.refresh(); } };
+
+    // Nothing open: disabled controls, no picture.
+    CHECK(!panel.play_button().enabled() && !panel.seek_slider().enabled() && !panel.volume_slider().enabled());
+    CHECK(panel.view().image() == nullptr && panel.time_text().equals("00:00 / 00:00"));
+    w.render();
+
+    CHECK(player.open(clip.file()) == video::OpenResult::Ok);
+    panel.refresh();
+    CHECK(panel.play_button().enabled() && panel.seek_slider().enabled() && panel.volume_slider().enabled());
+    CHECK(panel.view().image() != nullptr && panel.view().fitted() && panel.time_text().equals("00:00 / 00:02"));
+    w.layout();
+    // The picture fills the view: it is enlarged (64 x 36 into 476 x 298 is x7.4, bounded by the width).
+    CHECK(panel.view().zoom_percent() > 400);
+    w.render();
+    const Rect2D vp = panel.view().viewport();
+    const int32_t cx = 10 + vp.x + (int32_t)vp.width / 2, cy = 10 + vp.y + (int32_t)vp.height / 2;
+    CHECK(near((int)((screen.px(cx, cy) >> 16) & 0xFF), 5, 6));   // frame 0
+
+    // Play: the button says Pause, the picture and the slider follow the sound.
+    click_center(w, panel.play_button());
+    CHECK(player.playing() && panel.play_button().text().equals("Pause"));
+    step(12);
+    CHECK(panel.seek_slider().value() > 0);
+    w.render();
+    const int red = (int)((screen.px(cx, cy) >> 16) & 0xFF);
+    CHECK(red >= 5 + 10 * (int)player.current_frame() - 6 && red <= 5 + 10 * (int)player.current_frame() + 6 && player.current_frame() > 0);
+
+    click_center(w, panel.play_button());   // pause
+    CHECK(player.state() == video::VideoState::Paused && panel.play_button().text().equals("Play"));
+    const int64_t at = player.position_us();
+    step(5);
+    CHECK(player.position_us() == at);
+
+    // Seek by clicking the slider at 3/4.
+    const Point track = panel.seek_slider().window_origin();
+    click(w, track.x + (int32_t)panel.seek_slider().bounds().width * 3 / 4, track.y + 12);
+    CHECK(near((int)(player.position_us() / 1000), 1500, 90) && player.current_frame() >= 13 && player.current_frame() <= 16);
+    panel.refresh();
+    CHECK(panel.time_text().equals("00:01 / 00:02"));
+    w.render();
+    const int red_after = (int)((screen.px(cx, cy) >> 16) & 0xFF);
+    CHECK(red_after >= 5 + 10 * (int)player.current_frame() - 6 && red_after <= 5 + 10 * (int)player.current_frame() + 6);
+
+    // Stop: back to the start; the picture is the first one again.
+    click_center(w, panel.stop_button());
+    CHECK(player.state() == video::VideoState::Stopped && player.position_us() == 0 && panel.seek_slider().value() == 0);
+    w.render();
+    CHECK(near((int)((screen.px(cx, cy) >> 16) & 0xFF), 5, 6));
+
+    // Volume and loop.
+    const Point vol = panel.volume_slider().window_origin();
+    click(w, vol.x + 8, vol.y + 12);
+    CHECK(player.audio()->volume() < 25);
+    click_center(w, panel.loop_box());
+    CHECK(player.looping() && panel.loop_box().checked());
+    click_center(w, panel.loop_box());
+    CHECK(!player.looping());
+
+    // The viewer's own controls still work on the picture: zoom with the wheel makes it leave fit mode.
+    panel.view().set_zoom(100);
+    CHECK(!panel.view().fitted());
+    panel.view().fit();
+    CHECK(panel.view().fitted());
+
+    player.close();
+    panel.refresh();
+    CHECK(!panel.play_button().enabled() && panel.view().image() == nullptr && panel.time_text().equals("00:00 / 00:00"));
+    w.render();
+  }
+  mixer.pump();
+  CHECK(mixer.stream_count() == 0);
+}
+
 int main() {
   test_scroll_bar();
   test_data_grid();
@@ -670,6 +816,7 @@ int main() {
   test_grid_rendering();
   test_image_view();
   test_player_control();
+  test_video_control();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");
   return 0;

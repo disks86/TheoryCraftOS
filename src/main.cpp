@@ -39,6 +39,7 @@
 #include "Audio/AudioMixer.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Clock/TscClock.hpp"
+#include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "uefi.hpp"
@@ -299,6 +300,24 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   const bool clock_ok = clock.initialize();
   if (!clock_ok) Entry(Level::Warning, "Clock").text("could not calibrate the timer; networking is off");
 
+  // Video codecs: a device per GPU video engine found (not driven yet: its sessions run on the CPU) and the software codec.
+  hardware::SystemVideoCodecs video_codecs(pci, shared_allocator);
+  video_codecs.initialize();
+  for (uint32_t i = 0; i < video_codecs.count(); ++i) {
+    hardware::IVideoCodecDevice& codec_device = *video_codecs.at(i);
+    const hardware::VideoCodecInfo& info = codec_device.info();
+    Entry e(Level::Ok, "Video");
+    e.text(codec_device.name()).text(": ");
+    bool first = true;
+    for (uint32_t c = 0; c < hardware::kVideoCodecCount; ++c) {
+      const hardware::VideoCodec codec = static_cast<hardware::VideoCodec>(c);
+      if (!codec_device.can_decode(codec) && !codec_device.can_encode(codec)) continue;
+      e.text(first ? "" : ", ").text(hardware::codec_name(codec)).text(codec_device.can_decode(codec) ? (codec_device.can_encode(codec) ? " dec/enc" : " dec") : " enc");
+      first = false;
+    }
+    if (info.hardware_engine && !info.accelerated) e.text(" (engine present, not driven yet)");
+  }
+
   // Audio outputs: native drivers (HD Audio, AC'97, virtio-sound), or a silent software device.
   hardware::SystemAudioDevices audio(pci, clock, shared_allocator, st);
   audio.initialize();
@@ -473,6 +492,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   storage.shutdown();
   Entry(Level::Ok, "Shutdown").text("storage flushed and released");
   audio.shutdown();
+  video_codecs.shutdown();
   network.shutdown();
   usb.shutdown();  // resets the USB controllers and returns them to the firmware
   Entry(Level::Ok, "Shutdown").text("USB and network released");
