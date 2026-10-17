@@ -31,7 +31,19 @@ bool NetworkPrinter::submit(ConstByteView job, const char* job_name) {
   return true;
 }
 
+bool NetworkPrinter::request_report() {
+  if (!monitor_) monitor_ = UniquePointer<PrinterMonitor>::make(allocator_, stack_, allocator_, address_, community_);
+  return monitor_ && monitor_->start();
+}
+
 void NetworkPrinter::poll() {
+  if (monitor_ && monitor_->busy()) {
+    monitor_->poll();
+    if (monitor_->succeeded()) {
+      report_ = monitor_->report();
+      have_report_ = true;
+    }
+  }
   if (count_ == 0) return;
   Job& job = *queue_[head_];
   if (!transport_) {

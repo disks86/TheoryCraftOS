@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Hardware/Printer/PrinterReport.hpp"
 #include "Hardware/Printer/PrinterTypes.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -50,6 +51,14 @@ class IPrinter {
   // Drops every queued job and the one in flight.
   virtual void cancel_all() = 0;
   virtual PrinterStatistics statistics() const = 0;
+
+  // Asks the printer how it is: error conditions, page count, supplies and alerts (see PrinterReport; what is filled in depends
+  // on how the printer is connected). Starts the query and returns; poll() carries it out and report_pending() turns false when
+  // report() is current. False if the printer cannot be asked or a query is already running.
+  virtual bool request_report() { return false; }
+  virtual bool report_pending() const { return false; }
+  // The last completed report, or nullptr if there is none yet.
+  virtual const PrinterReport* report() const { return nullptr; }
 
  protected:
   constexpr IPrinter() = default;

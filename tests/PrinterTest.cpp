@@ -27,6 +27,8 @@
 #include "Hardware/Printer/PrintJob.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/Printer/Usb/UsbPrinter.hpp"
+#include "Hardware/Printer/PrinterMonitor.hpp"
+#include <map>
 #include "NetworkHarness.hpp"
 
 using namespace hardware;
@@ -570,6 +572,9 @@ static void test_usb_printer() {
   uint8_t back[256];
   uint32_t n = 0;
   CHECK(usb.read_back(ByteView(back), &n) && n == host.reply.size() + n - host.reply.size() && n > 20 && memcmp(back, "@PJL INFO STATUS", 16) == 0);
+  host.port_status = 0x08 | 0x20;   // paper out, still selected? (bit 4 clear = off line), no error
+  CHECK(p.report() == nullptr && p.request_report() && p.report() && p.report()->has_error(kErrorNoPaper) && p.report()->has_error(kErrorOffline) && !p.report()->has_error(kErrorServiceRequested));
+  CHECK(strcmp(p.report()->description, "Brother HL-2070N series") == 0 && p.report()->supply_count == 0 && !p.report()->has_page_count);
   CHECK(usb.soft_reset());
   p.shutdown();
   CHECK(!p.submit(ConstByteView(reinterpret_cast<const uint8_t*>("x"), 1), "after shutdown"));
@@ -616,6 +621,248 @@ static void test_usb_variants() {
   CHECK(g_live == 0);
 }
 
+
+// ---- SNMP ----
+
+static SnmpValue vstr(const char* text) {
+  SnmpValue v;
+  v.type = SnmpType::OctetString;
+  v.length = static_cast<uint8_t>(strlen(text));
+  memcpy(v.bytes, text, v.length);
+  return v;
+}
+static SnmpValue vint(int64_t n, SnmpType t = SnmpType::Integer) { SnmpValue v; v.type = t; v.integer = n; return v; }
+static Oid O(const char* text) { Oid o; assert(Oid::parse(text, &o)); return o; }
+
+static void test_snmp_messages() {
+  TestAllocator a;
+  // The classic GET of sysDescr.0 (version 1, community "public", request id 1), byte for byte.
+  SnmpMessage m;
+  m.version = 0;
+  m.request_id = 1;
+  m.count = 1;
+  m.binds[0].oid = O("1.3.6.1.2.1.1.1.0");
+  ByteBuffer out(a);
+  CHECK(encode_snmp(m, a, &out));
+  const uint8_t want[] = {0x30, 0x26, 0x02, 0x01, 0x00, 0x04, 0x06, 'p', 'u', 'b', 'l', 'i', 'c', 0xA0, 0x19, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
+                          0x30, 0x0E, 0x30, 0x0C, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00, 0x05, 0x00};
+  CHECK(out.size() == sizeof want && memcmp(out.view().data(), want, sizeof want) == 0);
+  SnmpMessage back;
+  CHECK(decode_snmp(out.view(), &back) && back.version == 0 && strcmp(back.community, "public") == 0 && back.pdu == SnmpPdu::Get && back.request_id == 1 &&
+        back.count == 1 && back.binds[0].oid == m.binds[0].oid && back.binds[0].value.type == SnmpType::Null);
+  // Every value type, including big and negative numbers and arcs that need several bytes.
+  SnmpMessage r;
+  r.pdu = SnmpPdu::Response;
+  r.request_id = 0x12345678;
+  r.count = 9;
+  const char* oids[9] = {"1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.10.0", "2.100.3", "1.3.6.1.2.1.43.10.2.1.4.1.1", "0.0", "1.3.6.1.2", "1.3.6.1.3", "1.3.6.1.4", "1.3.6.1.5", "1.3.6.1.6"};
+  r.binds[0].value = vint(-129);
+  r.binds[1].value = vstr("Brother HL-2070N");
+  r.binds[2].value = vint(4000000000ll, SnmpType::Counter32);
+  r.binds[3].value = vint(0x7fffffff, SnmpType::Gauge32);
+  r.binds[4].value.type = SnmpType::ObjectId;
+  r.binds[4].value.oid = O("1.3.6.1.4.1.2435");
+  r.binds[5].value = vint(123456, SnmpType::TimeTicks);
+  r.binds[6].value.type = SnmpType::NoSuchObject;
+  r.binds[7].value.type = SnmpType::EndOfMibView;
+  r.binds[8].value = vint(1ll << 40, SnmpType::Counter64);
+  for (int i = 0; i < 9; ++i) r.binds[i].oid = O(oids[i]);
+  CHECK(encode_snmp(r, a, &out) && decode_snmp(out.view(), &back) && back.count == 9 && back.request_id == 0x12345678);
+  CHECK(back.binds[0].value.integer == -129 && back.binds[1].value.length == 16 && memcmp(back.binds[1].value.bytes, "Brother HL-2070N", 16) == 0);
+  CHECK(back.binds[2].value.integer == 4000000000ll && back.binds[3].value.integer == 0x7fffffff && back.binds[4].value.oid == O("1.3.6.1.4.1.2435"));
+  CHECK(back.binds[5].value.type == SnmpType::TimeTicks && back.binds[6].value.type == SnmpType::NoSuchObject && back.binds[7].value.type == SnmpType::EndOfMibView);
+  CHECK(back.binds[8].value.integer == (1ll << 40) && back.binds[1].oid == O("2.100.3") && back.binds[0].oid == O(oids[0]));
+  // Parsing OIDs.
+  Oid o;
+  CHECK(Oid::parse(".1.3.6.1", &o) && o.length == 4 && !Oid::parse("1", &o) && !Oid::parse("1.3.x", &o) && !Oid::parse("1.3.", &o) && !Oid::parse("", &o) && !Oid::parse("1.3.99999999999", &o));
+  CHECK(O("1.3.6.1.2.1.1.1.0").starts_with(O("1.3.6.1.2")) && !O("1.3.6").starts_with(O("1.3.6.1")));
+  // Damaged messages never crash, and most are refused.
+  uint32_t seed = 3;
+  int accepted = 0;
+  for (int round = 0; round < 3000; ++round) {
+    std::vector<uint8_t> bytes(out.view().data(), out.view().data() + out.size());
+    seed = seed * 1664525 + 1013904223;
+    if (round % 3 == 0) bytes.resize((seed >> 8) % bytes.size());
+    else for (int k = 0; k < 1 + round % 4; ++k) { seed = seed * 1664525 + 1013904223; bytes[(seed >> 8) % bytes.size()] = static_cast<uint8_t>(seed >> 20); }
+    SnmpMessage x;
+    if (decode_snmp(ConstByteView(bytes.data(), bytes.size()), &x)) ++accepted;
+  }
+  CHECK(accepted < 1500);
+  // Refused outright.
+  const uint8_t junk[] = {0x30, 0x03, 0x02, 0x01};
+  CHECK(!decode_snmp(ConstByteView(junk, sizeof junk), &back) && !decode_snmp(ConstByteView(), &back));
+  SnmpMessage too_many;
+  too_many.count = 13;
+  CHECK(!encode_snmp(too_many, a, &out));
+}
+
+// A scripted SNMP agent on stack B (UDP 161): a sorted MIB, GET and GETNEXT, with switches for misbehaviour.
+struct FakeAgent {
+  Lan& lan;
+  SharedPointer<IUdpSocket> udp;
+  std::map<std::vector<uint32_t>, SnmpValue> mib;
+  int drop_first = 0;       // requests to ignore
+  bool reject_all = false;  // answer everything with error-status noSuchName
+  bool silent = false;
+  int requests = 0;
+  explicit FakeAgent(Lan& l) : lan(l) { udp = lan.b.udp_open(161); }
+  static std::vector<uint32_t> key(const Oid& o) { return std::vector<uint32_t>(o.arc, o.arc + o.length); }
+  void put(const char* oid, const SnmpValue& v) { mib[key(O(oid))] = v; }
+  void step() {
+    uint8_t buf[1500];
+    Ipv4Address from;
+    uint16_t port;
+    uint32_t n;
+    while (udp->receive_from(ByteView(buf), &from, &port, &n)) {
+      SnmpMessage req, rsp;
+      ++requests;
+      if (silent || !decode_snmp(ConstByteView(buf, n), &req)) continue;
+      if (drop_first > 0) { --drop_first; continue; }
+      rsp = req;
+      rsp.pdu = SnmpPdu::Response;
+      if (reject_all) {
+        rsp.error_status = 2;
+        rsp.error_index = 1;
+      } else {
+        for (uint32_t i = 0; i < req.count; ++i) {
+          if (req.pdu == SnmpPdu::Get) {
+            auto it = mib.find(key(req.binds[i].oid));
+            if (it != mib.end()) rsp.binds[i].value = it->second;
+            else rsp.binds[i].value.type = SnmpType::NoSuchObject;
+          } else {
+            auto it = mib.upper_bound(key(req.binds[i].oid));
+            if (it != mib.end()) {
+              Oid o;
+              o.length = static_cast<uint8_t>(it->first.size());
+              for (size_t k = 0; k < it->first.size(); ++k) o.arc[k] = it->first[k];
+              rsp.binds[i].oid = o;
+              rsp.binds[i].value = it->second;
+            } else {
+              rsp.binds[i].value.type = SnmpType::EndOfMibView;
+            }
+          }
+        }
+      }
+      ByteBuffer out(lan.alloc);
+      if (encode_snmp(rsp, lan.alloc, &out)) udp->send_to(from, port, out.view());
+    }
+  }
+};
+
+static void populate_hl2070n(FakeAgent& agent) {
+  agent.put("1.3.6.1.2.1.1.1.0", vstr("Brother NC-6200h, Firmware Ver.1.12  (06.03.31),MID 8C5-129,FID 2"));
+  agent.put("1.3.6.1.2.1.25.3.5.1.1.1", vint(3));
+  const char err[2] = {0x20, 0x00};   // low toner (bit 2)
+  SnmpValue e = vstr("");
+  e.length = 2; e.bytes[0] = static_cast<uint8_t>(err[0]); e.bytes[1] = static_cast<uint8_t>(err[1]);
+  agent.put("1.3.6.1.2.1.25.3.5.1.2.1", e);
+  agent.put("1.3.6.1.2.1.43.10.2.1.4.1.1", vint(12345, SnmpType::Counter32));
+  // (no serial number: noSuchObject)
+  agent.put("1.3.6.1.2.1.43.11.1.1.4.1.1", vint(3));
+  agent.put("1.3.6.1.2.1.43.11.1.1.5.1.1", vint(21));
+  agent.put("1.3.6.1.2.1.43.11.1.1.6.1.1", vstr("Black Toner Cartridge"));
+  agent.put("1.3.6.1.2.1.43.11.1.1.8.1.1", vint(100));
+  agent.put("1.3.6.1.2.1.43.11.1.1.9.1.1", vint(7));
+  agent.put("1.3.6.1.2.1.43.11.1.1.4.1.2", vint(3));
+  agent.put("1.3.6.1.2.1.43.11.1.1.5.1.2", vint(9));
+  agent.put("1.3.6.1.2.1.43.11.1.1.6.1.2", vstr("Drum Unit"));
+  agent.put("1.3.6.1.2.1.43.11.1.1.8.1.2", vint(12000));
+  agent.put("1.3.6.1.2.1.43.11.1.1.9.1.2", vint(9000));
+  agent.put("1.3.6.1.2.1.43.11.1.1.4.1.3", vint(4));
+  agent.put("1.3.6.1.2.1.43.11.1.1.5.1.3", vint(4));
+  agent.put("1.3.6.1.2.1.43.11.1.1.6.1.3", vstr("Waste Toner Box"));
+  agent.put("1.3.6.1.2.1.43.11.1.1.8.1.3", vint(-2));
+  agent.put("1.3.6.1.2.1.43.11.1.1.9.1.3", vint(-3));
+  agent.put("1.3.6.1.2.1.43.16.5.1.2.1.1", vstr("TONER LOW"));
+  agent.put("1.3.6.1.2.1.43.18.1.1.2.1.1", vint(4));
+  agent.put("1.3.6.1.2.1.43.18.1.1.7.1.1", vint(12));
+  agent.put("1.3.6.1.2.1.43.18.1.1.8.1.1", vstr("Toner low"));
+  agent.put("1.3.6.1.2.1.43.18.1.1.2.1.2", vint(3));
+  agent.put("1.3.6.1.2.1.43.18.1.1.7.1.2", vint(501));
+  agent.put("1.3.6.1.2.1.43.18.1.1.8.1.2", vstr("Cover is open"));
+  agent.put("1.3.6.1.2.1.44.1.1.0", vint(1));   // (beyond everything the monitor walks)
+}
+
+static bool pump_monitor(Lan& lan, FakeAgent& agent, PrinterMonitor& mon, int max_ms = 30000) {
+  for (int i = 0; i < max_ms; ++i) {
+    if (!mon.busy()) return true;
+    lan.step();
+    agent.step();
+    mon.poll();
+  }
+  return !mon.busy();
+}
+
+static void test_printer_monitor() {
+  {
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    populate_hl2070n(agent);
+    PrinterMonitor mon(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(!mon.succeeded() && mon.start() && mon.busy() && !mon.start());
+    CHECK(pump_monitor(lan, agent, mon) && mon.succeeded());
+    const PrinterReport& r = mon.report();
+    CHECK(r.valid && r.engine == PrinterEngineState::Idle && r.has_page_count && r.page_count == 12345);
+    CHECK(strncmp(r.description, "Brother NC-6200h", 16) == 0 && r.serial[0] == 0 && strcmp(r.display, "TONER LOW") == 0);
+    CHECK(r.has_error(kErrorLowToner) && !r.has_error(kErrorNoToner) && !r.has_error(kErrorJammed) && r.toner_low());
+    CHECK(r.supply_count == 3);
+    if (r.supply_count == 3) {
+      CHECK(r.supplies[0].kind == SupplyKind::Toner && strcmp(r.supplies[0].description, "Black Toner Cartridge") == 0 && r.supplies[0].level_percent == 7 && r.supplies[0].low() && !r.supplies[0].empty());
+      CHECK(r.supplies[1].kind == SupplyKind::Drum && r.supplies[1].level_percent == 75 && !r.supplies[1].low());
+      CHECK(r.supplies[2].kind == SupplyKind::WasteToner && !r.supplies[2].consumed && r.supplies[2].level_percent == SupplyInfo::kLevelSomeRemaining && !r.supplies[2].low());
+      CHECK(r.supply(SupplyKind::Toner) == &r.supplies[0] && r.supply(SupplyKind::Fuser) == nullptr);
+    }
+    CHECK(r.alert_count == 2);
+    if (r.alert_count == 2) {
+      CHECK(r.alerts[0].severity == AlertSeverity::Warning && r.alerts[0].code == 12 && strcmp(r.alerts[0].description, "Toner low") == 0);
+      CHECK(r.alerts[1].severity == AlertSeverity::Critical && r.alerts[1].code == 501 && strcmp(alert_code_name(r.alerts[1].code), "door open") == 0);
+    }
+    // A second refresh sees the changes: the toner is gone and the printer is printing.
+    agent.put("1.3.6.1.2.1.43.11.1.1.9.1.1", vint(0));
+    agent.put("1.3.6.1.2.1.25.3.5.1.1.1", vint(4));
+    agent.put("1.3.6.1.2.1.25.3.5.1.2.1", [] { SnmpValue e = vstr(""); e.length = 1; e.bytes[0] = 0x10 | 0x04; return e; }());
+    CHECK(mon.start() && pump_monitor(lan, agent, mon) && mon.succeeded());
+    CHECK(mon.report().engine == PrinterEngineState::Printing && mon.report().supplies[0].empty() && mon.report().has_error(kErrorNoToner) && mon.report().has_error(kErrorJammed) && !mon.report().has_error(kErrorLowToner));
+  }
+  {   // a lost request is sent again
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    populate_hl2070n(agent);
+    agent.drop_first = 2;
+    PrinterMonitor mon(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(mon.start() && pump_monitor(lan, agent, mon) && mon.succeeded() && mon.report().page_count == 12345 && agent.requests > 3);
+  }
+  {   // nobody answers: it fails after the retries, and the failure is clean
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    agent.silent = true;
+    PrinterMonitor mon(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(mon.start() && pump_monitor(lan, agent, mon) && mon.failed() && !mon.report().valid && agent.requests == 3);
+    CHECK(mon.start());   // and can be tried again
+  }
+  {   // an agent that refuses everything (noSuchName): the refresh completes with an empty report
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    agent.reject_all = true;
+    PrinterMonitor mon(lan.a, lan.alloc, Ipv4Address::make(10, 0, 0, 2));
+    CHECK(mon.start() && pump_monitor(lan, agent, mon) && mon.succeeded() && mon.report().supply_count == 0 && mon.report().alert_count == 0 && !mon.report().has_page_count);
+  }
+  {   // through the printer object
+    Lan lan;
+    lan.configure_static();
+    FakeAgent agent(lan);
+    populate_hl2070n(agent);
+    BrotherHl2070n printer(lan.a, Ipv4Address::make(10, 0, 0, 2), lan.alloc);
+    CHECK(printer.report() == nullptr && !printer.report_pending() && printer.request_report() && printer.report_pending() && !printer.request_report());
+    for (int i = 0; i < 30000 && printer.report_pending(); ++i) { lan.step(); agent.step(); printer.poll(); }
+    CHECK(printer.report() != nullptr && printer.report()->page_count == 12345 && printer.report()->toner_low());
+  }
+}
+
 int main() {
   test_packbits();
   test_pages_and_halftone();
@@ -627,6 +874,8 @@ int main() {
   test_device_id();
   test_usb_printer();
   test_usb_variants();
+  test_snmp_messages();
+  test_printer_monitor();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

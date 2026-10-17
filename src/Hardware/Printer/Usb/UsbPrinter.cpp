@@ -230,6 +230,21 @@ bool UsbPrinter::read_status(UsbPrinterStatus* status) {
   return true;
 }
 
+bool UsbPrinter::request_report() {
+  UsbPrinterStatus st;
+  if (!read_status(&st)) return false;
+  report_ = PrinterReport();
+  if (st.paper_empty) report_.errors = static_cast<uint16_t>(report_.errors | kErrorNoPaper);
+  if (!st.selected) report_.errors = static_cast<uint16_t>(report_.errors | kErrorOffline);
+  if (!st.no_error) report_.errors = static_cast<uint16_t>(report_.errors | kErrorServiceRequested);
+  report_.engine = count_ > 0 ? PrinterEngineState::Printing : PrinterEngineState::Idle;
+  uint32_t n = 0;
+  for (const char* p = name_; *p && n + 1 < sizeof report_.description; ++p) report_.description[n++] = *p;
+  report_.valid = true;
+  have_report_ = true;
+  return true;
+}
+
 bool UsbPrinter::read_back(ByteView out, uint32_t* length) {
   if (!started_ || !ep_.in_endpoint) return false;
   const uint32_t want = out.size() < kChunk ? static_cast<uint32_t>(out.size()) : kChunk;

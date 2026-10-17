@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Printer/IPrinter.hpp"
 #include "Hardware/Printer/PrintTransport.hpp"
+#include "Hardware/Printer/PrinterMonitor.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
@@ -46,6 +47,13 @@ class NetworkPrinter : public IPrinter {
   uint32_t pending_jobs() const override { return count_; }
   void cancel_all() override;
   PrinterStatistics statistics() const override { return stats_; }
+  // Status over SNMP (UDP port 161): see PrinterMonitor. A printer that does not answer leaves report() null and
+  // report_failed() true.
+  bool request_report() override;
+  bool report_pending() const override { return monitor_ && monitor_->busy(); }
+  const PrinterReport* report() const override { return have_report_ ? &report_ : nullptr; }
+  bool report_failed() const { return monitor_ && monitor_->failed(); }
+  void set_snmp_community(const char* community) { community_ = community; }
 
   network::Ipv4Address address() const { return address_; }
   PrintProtocol protocol() const { return protocol_; }
@@ -70,6 +78,10 @@ class NetworkPrinter : public IPrinter {
   UniquePointer<IPrintTransport> transport_;
   bool last_failed_ = false;
   PrinterStatistics stats_;
+  const char* community_ = "public";
+  UniquePointer<PrinterMonitor> monitor_;
+  PrinterReport report_;
+  bool have_report_ = false;
 };
 
 }  // namespace hardware

@@ -89,6 +89,8 @@ add_executable(BOOTX64
   src/NetworkStackDemo.cpp
   src/Network/Checksum.cpp
   src/Network/NetworkStack.cpp
+  src/Network/Snmp/SnmpMessage.cpp
+  src/Network/Snmp/SnmpClient.cpp
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
   src/Network/Udp/UdpManager.cpp
@@ -238,6 +240,7 @@ add_executable(BOOTX64
   src/Hardware/Printer/NetworkPrinter.cpp
   src/Hardware/Printer/SystemPrinters.cpp
   src/Hardware/Printer/Brother/BrotherHl2070n.cpp
+  src/Hardware/Printer/PrinterMonitor.cpp
   src/Hardware/Printer/Usb/Ieee1284.cpp
   src/Hardware/Printer/Usb/UsbPrinter.cpp
   src/Hardware/VideoCodec/Software/JpegDecoder.cpp

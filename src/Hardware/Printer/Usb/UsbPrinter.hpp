@@ -71,6 +71,10 @@ class UsbPrinter final : public IPrinter {
   uint32_t pending_jobs() const override { return count_; }
   void cancel_all() override;
   PrinterStatistics statistics() const override { return stats_; }
+  // A USB printer's port status gives only the error bits: paper out (no paper), off line (the select line), and the error line
+  // (reported as "service requested"). Completes at once. Page counts and supplies need SNMP, which USB does not carry.
+  bool request_report() override;
+  const PrinterReport* report() const override { return have_report_ ? &report_ : nullptr; }
 
   const PrinterIdentity& identity() const { return identity_; }
   bool bidirectional() const { return ep_.in_endpoint != 0; }
@@ -105,6 +109,8 @@ class UsbPrinter final : public IPrinter {
   uint32_t head_ = 0, count_ = 0;
   bool last_failed_ = false, started_ = false;
   PrinterStatistics stats_;
+  PrinterReport report_;
+  bool have_report_ = false;
 };
 
 }  // namespace hardware

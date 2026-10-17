@@ -115,7 +115,15 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   64 KiB-aligned block, a failed transfer clears the endpoint halt and is retried, a job that fails three times is dropped after a
   printer SOFT_RESET. It reads the IEEE 1284 device ID (`Ieee1284`: manufacturer, model, command set - a model it knows, such as the
   HL-2070N, gets its real capabilities; any other gets what its command set promises), the port status (paper out, off line, error)
-  and, on a bidirectional interface, the printer's replies (PJL status). Not covered: SNMP page counts and toner alarms, IPP,
+  and, on a bidirectional interface, the printer's replies (PJL status).
+  **Status over SNMP:** `src/Network/Snmp/` is an SNMP v1/v2c manager (`SnmpMessage`: BER encoding and a bounds-checked decoder for every
+  value type; `SnmpClient`: GET / GETNEXT / GETBULK over UDP 161, one request at a time, resent on a timeout, answers matched by
+  request id and sender). `PrinterMonitor` uses it to read the Host Resources and Printer MIBs into a `PrinterReport`: engine state,
+  error bits (low/no paper, low/no toner, door open, jam, off line, service requested...), the **page counter**
+  (prtMarkerLifeCount), every **supply** with its level as a percentage (toner, drum, waste toner, fuser... - `low()` at 10 %, or 90 %
+  full for a receptacle), the **alerts** (severity, code, the printer's text) and the front-panel text. `NetworkPrinter::request_report()`
+  runs it inside `poll()`; `IPrinter::report()` is the common accessor (a USB printer fills in the error bits from its port status).
+  The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). Not covered: SNMPv3, traps, IPP,
   discovery of network printers (BRAdmin, mDNS), IEEE 1284.4 multiplexing (protocol 3), the printer's Epson FX / IBM emulation, PCL 6
   (PCL XL) output, duplex and colour (the engine has neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure,
   text layout, both network transports and failures, and the USB driver against a scripted host controller (descriptors, device ID,
