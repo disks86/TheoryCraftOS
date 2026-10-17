@@ -238,6 +238,8 @@ add_executable(BOOTX64
   src/Hardware/Printer/NetworkPrinter.cpp
   src/Hardware/Printer/SystemPrinters.cpp
   src/Hardware/Printer/Brother/BrotherHl2070n.cpp
+  src/Hardware/Printer/Usb/Ieee1284.cpp
+  src/Hardware/Printer/Usb/UsbPrinter.cpp
   src/Hardware/VideoCodec/Software/JpegDecoder.cpp
   src/Hardware/VideoCodec/Software/H264Syntax.cpp
   src/Hardware/VideoCodec/Software/H264Macroblock.cpp

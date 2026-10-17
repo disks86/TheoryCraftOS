@@ -24,6 +24,7 @@
 #include "console.hpp"
 #include "Hardware/Bus/SystemPciBus.hpp"
 #include "Hardware/Bus/Usb/UsbBus.hpp"
+#include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "BootLog.hpp"
 #include "Desktop/Desktop.hpp"
@@ -442,6 +443,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
   for (uint32_t i = 0; i < input.mice().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.mice().at(i)->name());
 
+  // Printers: those on USB are found on the bus (network printers are added by address, by whoever knows it).
+  hardware::SystemPrinters printers(shared_allocator);
+  printers.discover_usb(usb);
+  Entry(Level::Ok, "Printer").dec(printers.count()).text(" USB printers");
+  for (uint32_t i = 0; i < printers.count(); ++i) Entry(Level::Info, "Printer").text("  ").text(printers.at(i)->name());
+
   // The log is read before the desktop covers it: a clean boot pauses a moment, a boot with warnings
   // or failures waits (up to 15 s) for a key so they can be read.
   const uint32_t warnings = bootlog::warnings(), faults = bootlog::faults();
@@ -508,6 +515,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   audio.shutdown();
   video_codecs.shutdown();
   network.shutdown();
+  printers.shutdown();
   usb.shutdown();  // resets the USB controllers and returns them to the firmware
   Entry(Level::Ok, "Shutdown").text("USB and network released");
 

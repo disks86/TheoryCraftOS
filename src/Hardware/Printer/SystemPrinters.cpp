@@ -17,12 +17,22 @@
  */
 
 #include "Hardware/Printer/SystemPrinters.hpp"
+#include "Hardware/Printer/Usb/UsbPrinter.hpp"
 
 namespace hardware {
 
 bool SystemPrinters::add(UniquePointer<IPrinter> printer) {
   if (!printer || !printer->initialize()) return false;
   return printers_.push_back(util::move(printer));
+}
+
+uint32_t SystemPrinters::discover_usb(IUsbBus& usb) {
+  List<UniquePointer<IPrinter>> found(allocator_);
+  UsbPrinter::discover(usb, allocator_, found);
+  uint32_t added = 0;
+  for (uint64_t i = 0; i < found.count(); ++i)
+    if (printers_.push_back(util::move(found[i]))) ++added;
+  return added;
 }
 
 void SystemPrinters::set_default(uint32_t index) {

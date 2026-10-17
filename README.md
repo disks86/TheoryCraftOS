@@ -101,7 +101,7 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   languages, resolution, paper sizes, margins) with `NetworkPrinter` for a printer with its own print server: jobs go over raw TCP
   port 9100 (`RawSocketTransport`) or LPD port 515 (`LpdTransport`, RFC 1179, queue name configurable), eight jobs deep, a failed
   delivery retried twice before the job is dropped (`PrinterState::Error`). `SystemPrinters` is the registry (network printers
-  are added by address; there is no discovery, and no USB host stack yet). `PrintJob` builds a job: a PJL header (job name,
+  are added by address; USB ones are found on the bus by `discover_usb()`, which `main.cpp` runs at boot). `PrintJob` builds a job: a PJL header (job name,
   resolution 300/600/1200, toner save), then either **PCL 5e** pages - bitmaps as raster graphics with PackBits rows, or text laid out
   here in a fixed-pitch font (UTF-8 in, Latin-1 out, wrapped and paginated) - or one **PostScript** program, and the PJL trailer.
   `Halftone` turns a `graphics::Surface` into a 1-bit `PageBitmap` (scaled to fit the printable area with box/bilinear
@@ -109,9 +109,17 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   Executive/A5/B5/A6, 600 dpi (HQ1200 at 1200), 23 ppm, no duplex, PCL and BR-Script 3 (PostScript), 4.2 mm unprintable margins, LPD
   queue `BINARY_P1`; tray 1 and the manual slot are selectable. The PCL output follows the PCL 5 reference and was verified by
   parsing it back and by the fake-network delivery tests, not on a physical printer (none was available): the first print on real
-  hardware may need small adjustments. Not covered: status readback (PJL INFO / SNMP page counts, toner and paper alarms), IPP,
-  discovery (BRAdmin, mDNS), the printer's Epson FX / IBM emulation, PCL 6 (PCL XL) output, duplex and colour (the engine has
-  neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure, text layout, both transports and failures.
+  hardware may need small adjustments. **`Usb/UsbPrinter`** is the USB Printer Class driver (class 7 / subclass 1, unidirectional or
+  bidirectional setting - the latter preferred, selected with SET_INTERFACE), over the existing USB host stack (`Hardware/Bus/Usb`:
+  xHCI, EHCI, OHCI and UHCI controllers with bulk endpoints): jobs go out on the bulk OUT endpoint 16 KiB per `poll()` through a
+  64 KiB-aligned block, a failed transfer clears the endpoint halt and is retried, a job that fails three times is dropped after a
+  printer SOFT_RESET. It reads the IEEE 1284 device ID (`Ieee1284`: manufacturer, model, command set - a model it knows, such as the
+  HL-2070N, gets its real capabilities; any other gets what its command set promises), the port status (paper out, off line, error)
+  and, on a bidirectional interface, the printer's replies (PJL status). Not covered: SNMP page counts and toner alarms, IPP,
+  discovery of network printers (BRAdmin, mDNS), IEEE 1284.4 multiplexing (protocol 3), the printer's Epson FX / IBM emulation, PCL 6
+  (PCL XL) output, duplex and colour (the engine has neither). `tests/PrinterTest.cpp` covers PackBits, halftoning, job structure,
+  text layout, both network transports and failures, and the USB driver against a scripted host controller (descriptors, device ID,
+  chunking, retries, status, read-back, damaged descriptors); like the rest it has not been run against a physical printer.
 - `src/Video/`: `AviFile` reads an in-memory AVI (video stream: MJPG, I420/NV12, H264 as Annex B frames, or another named codec flagged for the
   decoders; PCM audio; frames found by scanning `movi`, keyframes from `idx1`), `AviWriter` builds one, and `VideoPlayer` plays it:
   a decoder session from `SystemVideoCodecs`, the audio through an `audio::AudioPlayer` whose position is the clock (picture

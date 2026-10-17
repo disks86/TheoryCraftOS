@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Hardware/Bus/Usb/IUsbBus.hpp"
 #include "Hardware/Printer/IPrinter.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -24,13 +25,15 @@
 namespace hardware {
 
 // The printers the machine knows about. Network printers cannot be found by scanning buses, so they are added by whoever knows
-// their address (a settings file, the user); the first one added is the default.
+// their address (a settings file, the user), USB ones are found on the bus; the first one added is the default.
 class SystemPrinters {
  public:
-  explicit SystemPrinters(allocators::IAllocator& allocator) : printers_(allocator) {}
+  explicit SystemPrinters(allocators::IAllocator& allocator) : allocator_(allocator), printers_(allocator) {}
   ~SystemPrinters() { shutdown(); }
 
   bool add(UniquePointer<IPrinter> printer);
+  // Adds every printer found on the USB bus (printer-class interfaces); returns how many.
+  uint32_t discover_usb(IUsbBus& usb);
   uint32_t count() const { return static_cast<uint32_t>(printers_.count()); }
   IPrinter* at(uint32_t index) { return index < printers_.count() ? printers_[index].get() : nullptr; }
   IPrinter* default_printer() { return at(0); }
@@ -40,6 +43,7 @@ class SystemPrinters {
   void shutdown();
 
  private:
+  allocators::IAllocator& allocator_;
   List<UniquePointer<IPrinter>> printers_;
 };
 

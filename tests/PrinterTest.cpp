@@ -26,6 +26,7 @@
 #include "Hardware/Printer/Brother/BrotherHl2070n.hpp"
 #include "Hardware/Printer/PrintJob.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
+#include "Hardware/Printer/Usb/UsbPrinter.hpp"
 #include "NetworkHarness.hpp"
 
 using namespace hardware;
@@ -377,6 +378,244 @@ static void test_failures_and_registry() {
   CHECK(printers.count() == 0);
 }
 
+
+// ---- USB ----
+
+// A host controller with scripted devices: port 0 a printer (one unidirectional and one bidirectional setting of its interface),
+// port 1 a mass-storage stick. Everything the driver sends is recorded.
+struct FakeUsbHost final : IUsbHostController {
+  struct Control { uint8_t type, request; uint16_t value, index; };
+  std::vector<uint8_t> printer_config, stick_config;
+  std::string device_id = "MFG:Brother;CMD:PJL,PCL,PCLXL,POSTSCRIPT;MDL:HL-2070N series;CLS:PRINTER;";
+  uint8_t port_status = 0x18;   // selected, no error
+  std::string printed, reply;
+  std::vector<Control> controls;
+  std::vector<uint8_t> started;
+  std::vector<uint32_t> out_sizes;
+  int fail_out = 0;             // bulk OUT transfers still to fail
+  int halts_cleared = 0, endpoint_resets = 0;
+
+  FakeUsbHost(bool bidirectional = true, bool with_alternates = true) {
+    auto put = [](std::vector<uint8_t>& v, std::initializer_list<uint8_t> b) { v.insert(v.end(), b.begin(), b.end()); };
+    std::vector<uint8_t>& c = printer_config;
+    put(c, {9, 2, 0, 0, 1, 1, 0, 0x80, 50});
+    if (bidirectional && with_alternates) {
+      put(c, {9, 4, 0, 0, 1, 7, 1, 1, 0});   // interface 0, setting 0: unidirectional
+      put(c, {7, 5, 0x01, 2, 0x00, 0x02, 0});
+      put(c, {9, 4, 0, 1, 2, 7, 1, 2, 0});   // setting 1: bidirectional
+      put(c, {7, 5, 0x01, 2, 0x00, 0x02, 0});
+      put(c, {7, 5, 0x82, 2, 0x00, 0x02, 0});
+    } else if (bidirectional) {
+      put(c, {9, 4, 0, 0, 2, 7, 1, 2, 0});
+      put(c, {7, 5, 0x01, 2, 0x00, 0x02, 0});
+      put(c, {7, 5, 0x82, 2, 0x00, 0x02, 0});
+    } else {
+      put(c, {9, 4, 0, 0, 1, 7, 1, 1, 0});
+      put(c, {7, 5, 0x01, 2, 0x00, 0x02, 0});
+    }
+    c[2] = static_cast<uint8_t>(c.size());
+    put(stick_config, {9, 2, 32, 0, 1, 1, 0, 0x80, 50, 9, 4, 0, 0, 2, 8, 6, 0x50, 0, 7, 5, 0x81, 2, 0, 2, 0, 7, 5, 0x02, 2, 0, 2, 0});
+  }
+  const char* name() const override { return "fake xhci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  UsbControllerKind kind() const override { return UsbControllerKind::Xhci; }
+  uint32_t port_count() const override { return 2; }
+  bool port_info(uint32_t, UsbPortInfo* out) const override { out->connected = true; out->speed = UsbSpeed::High; return true; }
+  bool device_descriptor(uint32_t, UsbDeviceDescriptor* out) const override { *out = UsbDeviceDescriptor(); return true; }
+  bool configuration_descriptor(uint32_t port, ByteView buffer, uint16_t* length) const override {
+    const std::vector<uint8_t>& c = port == 0 ? printer_config : stick_config;
+    const size_t n = c.size() < buffer.size() ? c.size() : buffer.size();
+    memcpy(buffer.data(), c.data(), n);
+    *length = static_cast<uint16_t>(c.size());
+    return true;
+  }
+  bool set_configuration(uint32_t, uint8_t) override { return true; }
+  bool control_out(uint32_t, uint8_t type, uint8_t request, uint16_t value, uint16_t index) override {
+    controls.push_back({type, request, value, index});
+    if (request == 1) ++halts_cleared;
+    return true;
+  }
+  bool control_in(uint32_t, uint8_t type, uint8_t request, uint16_t value, uint16_t index, ByteView buffer) override {
+    controls.push_back({type, request, value, index});
+    if (type != 0xA1) return false;
+    if (request == 0) {
+      const uint16_t total = static_cast<uint16_t>(device_id.size() + 2);
+      std::vector<uint8_t> r = {static_cast<uint8_t>(total >> 8), static_cast<uint8_t>(total)};
+      r.insert(r.end(), device_id.begin(), device_id.end());
+      memcpy(buffer.data(), r.data(), r.size() < buffer.size() ? r.size() : buffer.size());
+      return true;
+    }
+    if (request == 1) { buffer[0] = port_status; return true; }
+    return false;
+  }
+  bool start_interrupt_in(uint32_t, uint8_t, uint16_t, uint8_t) override { return false; }
+  bool poll_interrupt_in(uint32_t, uint8_t, ByteView, uint16_t*) override { return false; }
+  bool start_bulk_endpoint(uint32_t, uint8_t endpoint, uint16_t) override { started.push_back(endpoint); return true; }
+  bool bulk_transfer(uint32_t, uint8_t endpoint, ByteView data, uint32_t* transferred) override {
+    // The driver must hand over a block that does not cross a 64 KiB boundary.
+    const uintptr_t start = reinterpret_cast<uintptr_t>(data.data());
+    if ((start >> 16) != ((start + data.size() - 1) >> 16)) return false;
+    if (endpoint & 0x80) {
+      const size_t n = reply.size() < data.size() ? reply.size() : data.size();
+      memcpy(data.data(), reply.data(), n);
+      reply.erase(0, n);
+      *transferred = static_cast<uint32_t>(n);
+      return true;
+    }
+    if (fail_out > 0) { --fail_out; return false; }
+    printed.append(reinterpret_cast<const char*>(data.data()), data.size());
+    out_sizes.push_back(static_cast<uint32_t>(data.size()));
+    *transferred = static_cast<uint32_t>(data.size());
+    return true;
+  }
+  bool reset_bulk_endpoint(uint32_t, uint8_t) override { ++endpoint_resets; return true; }
+};
+
+struct FakeUsbBus final : IUsbBus {
+  FakeUsbHost* host;
+  explicit FakeUsbBus(FakeUsbHost* h) : host(h) {}
+  const char* name() const override { return "fake usb"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 2; }
+  uint32_t controller_count() const override { return 1; }
+  UsbControllerKind controller_kind(uint32_t) const override { return UsbControllerKind::Xhci; }
+  uint32_t port_count(uint32_t) const override { return 2; }
+  bool port_info(uint32_t, uint32_t p, UsbPortInfo* o) const override { return host->port_info(p, o); }
+  bool device_descriptor(uint32_t, uint32_t p, UsbDeviceDescriptor* o) const override { return host->device_descriptor(p, o); }
+  IUsbHostController* host_controller(uint32_t c) override { return c == 0 ? host : nullptr; }
+};
+
+static void test_device_id() {
+  PrinterIdentity a = parse_device_id(ConstByteView(reinterpret_cast<const uint8_t*>("MFG:Brother;CMD:PJL,PCL,PCLXL,POSTSCRIPT;MDL:HL-2070N series;CLS:PRINTER;"), 69));
+  CHECK(strcmp(a.manufacturer, "Brother") == 0 && strcmp(a.model, "HL-2070N series") == 0 && a.pjl && a.pcl_xl && a.languages == 3);
+  const char longform[] = "MANUFACTURER:ACME;COMMAND SET:PCL5E,ESCP2;MODEL:Jet 9;";
+  PrinterIdentity b = parse_device_id(ConstByteView(reinterpret_cast<const uint8_t*>(longform), sizeof longform - 1));
+  CHECK(strcmp(b.manufacturer, "ACME") == 0 && strcmp(b.model, "Jet 9") == 0 && b.languages == 1 && !b.pjl);
+  const char spaced[] = "MFG:A; MDL:B ;CMD:PS;;junk;:;MDL";
+  PrinterIdentity c = parse_device_id(ConstByteView(reinterpret_cast<const uint8_t*>(spaced), sizeof spaced - 1));
+  CHECK(strcmp(c.manufacturer, "A") == 0 && strcmp(c.model, "B ") == 0 && c.languages == 2);
+  PrinterIdentity d = parse_device_id(ConstByteView());
+  CHECK(d.manufacturer[0] == 0 && d.languages == 0);
+  std::string long_value = "MDL:" + std::string(200, 'x') + ";";
+  PrinterIdentity e = parse_device_id(ConstByteView(reinterpret_cast<const uint8_t*>(long_value.data()), long_value.size()));
+  CHECK(strlen(e.model) == sizeof e.model - 1);
+}
+
+static void test_usb_printer() {
+  TestAllocator a;
+  FakeUsbHost host;
+  FakeUsbBus bus(&host);
+  List<UniquePointer<IPrinter>> found(a);
+  UsbPrinter::discover(bus, a, found);
+  CHECK(found.count() == 1);   // the stick is not a printer; the two settings of the interface make one printer
+  if (found.count() != 1) return;
+  IPrinter& p = *found[0];
+  UsbPrinter& usb = static_cast<UsbPrinter&>(p);
+  CHECK(strcmp(p.name(), "Brother HL-2070N series") == 0 && usb.bidirectional() && p.info().max_dpi == 1200 && p.info().supports(PaperSize::A4));
+  CHECK(host.started.size() == 2 && host.started[0] == 0x01 && host.started[1] == 0x82);
+  bool set_interface = false, got_id = false;
+  for (const auto& c : host.controls) {
+    if (c.type == 0x01 && c.request == 0x0B && c.value == 1 && c.index == 0) set_interface = true;   // the bidirectional setting
+    if (c.type == 0xA1 && c.request == 0 && c.index == 0x0001) got_id = true;                       // interface 0, setting 1
+  }
+  CHECK(set_interface && got_id);
+  CHECK(p.state() == PrinterState::Ready);
+
+  // A real job, built for this printer, goes out in chunks.
+  JobSettings s;
+  PrintJob job(a, p.info(), s);
+  PageBitmap page(a);
+  CHECK(page.create(job.page_width(), job.page_height()));
+  for (uint32_t y = 0; y < page.height(); y += 3)
+    for (uint32_t x = (y * 7) % 100; x < page.width(); x += 101) page.set(x, y, true);
+  CHECK(job.begin() && job.add_page(page) && job.finish());
+  const std::string bytes(reinterpret_cast<const char*>(job.bytes().data()), job.bytes().size());
+  CHECK(bytes.size() > 3 * UsbPrinter::kChunk);
+  CHECK(p.submit(job.bytes(), "page") && p.pending_jobs() == 1 && p.state() == PrinterState::Busy);
+  int polls = 0;
+  while (p.pending_jobs() && polls < 1000) { p.poll(); ++polls; }
+  CHECK(host.printed == bytes && polls == static_cast<int>((bytes.size() + UsbPrinter::kChunk - 1) / UsbPrinter::kChunk));
+  CHECK(p.statistics().jobs_sent == 1 && p.statistics().bytes_sent == bytes.size() && p.state() == PrinterState::Ready);
+  CHECK(!p.submit(ConstByteView(), "empty"));
+
+  // A transfer that fails twice is retried (clearing the halt each time); one that always fails drops the job and resets the printer.
+  host.printed.clear();
+  host.fail_out = 2;
+  const char small[] = "small job";
+  CHECK(p.submit(ConstByteView(reinterpret_cast<const uint8_t*>(small), sizeof small - 1), "small"));
+  for (int i = 0; i < 10 && p.pending_jobs(); ++i) p.poll();
+  CHECK(host.printed == "small job" && host.halts_cleared == 2 && host.endpoint_resets == 2 && p.state() == PrinterState::Ready);
+  host.printed.clear();
+  host.fail_out = 1000;
+  CHECK(p.submit(ConstByteView(reinterpret_cast<const uint8_t*>(small), sizeof small - 1), "doomed"));
+  for (int i = 0; i < 10 && p.pending_jobs(); ++i) p.poll();
+  bool reset = false;
+  for (const auto& c : host.controls) if (c.type == 0x21 && c.request == 2 && c.index == 0) reset = true;
+  CHECK(p.pending_jobs() == 0 && p.state() == PrinterState::Error && p.statistics().jobs_failed == 1 && reset && host.printed.empty());
+  host.fail_out = 0;
+  CHECK(p.submit(ConstByteView(reinterpret_cast<const uint8_t*>(small), sizeof small - 1), "again"));
+  for (int i = 0; i < 10 && p.pending_jobs(); ++i) p.poll();
+  CHECK(host.printed == "small job" && p.state() == PrinterState::Ready);
+
+  // Status and the way back.
+  UsbPrinterStatus st;
+  CHECK(usb.read_status(&st) && st.ok());
+  host.port_status = 0x28;   // paper empty (bit 5), not selected (bit 4 clear), no error
+  CHECK(usb.read_status(&st) && st.paper_empty && !st.selected && st.no_error && !st.ok());
+  host.port_status = 0x00;
+  CHECK(usb.read_status(&st) && !st.no_error);
+  host.reply = "@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY=\"READY\"\r\nONLINE=TRUE\r\n";
+  uint8_t back[256];
+  uint32_t n = 0;
+  CHECK(usb.read_back(ByteView(back), &n) && n == host.reply.size() + n - host.reply.size() && n > 20 && memcmp(back, "@PJL INFO STATUS", 16) == 0);
+  CHECK(usb.soft_reset());
+  p.shutdown();
+  CHECK(!p.submit(ConstByteView(reinterpret_cast<const uint8_t*>("x"), 1), "after shutdown"));
+}
+
+static void test_usb_variants() {
+  TestAllocator a;
+  {
+    FakeUsbHost host(false);   // unidirectional only: no way back
+    host.device_id = "MFG:Generic;CMD:PCL;MDL:Plain 1;";
+    FakeUsbBus bus(&host);
+    List<UniquePointer<IPrinter>> found(a);
+    UsbPrinter::discover(bus, a, found);
+    CHECK(found.count() == 1);
+    UsbPrinter& u = static_cast<UsbPrinter&>(*found[0]);
+    uint8_t b[8];
+    uint32_t n;
+    CHECK(!u.bidirectional() && !u.read_back(ByteView(b), &n) && strcmp(u.name(), "Generic Plain 1") == 0);
+    CHECK(u.info().supports(PrinterLanguage::Pcl) && !u.info().supports(PrinterLanguage::PostScript) && u.info().max_dpi == 600);
+    bool no_set_interface = true;
+    for (const auto& c : host.controls) if (c.request == 0x0B) no_set_interface = false;
+    CHECK(no_set_interface);   // setting 0 needs no SET_INTERFACE
+  }
+  {
+    FakeUsbHost host(true, false);   // bidirectional in setting 0
+    host.device_id = "";
+    FakeUsbBus bus(&host);
+    SystemPrinters printers(a);
+    CHECK(printers.discover_usb(bus) == 1 && printers.count() == 1 && strcmp(printers.default_printer()->name(), "USB printer") == 0);
+    printers.shutdown();
+  }
+  // Damaged configuration descriptors never crash discovery.
+  FakeUsbHost host;
+  FakeUsbBus bus(&host);
+  const std::vector<uint8_t> good = host.printer_config;
+  uint32_t seed = 9;
+  for (int round = 0; round < 400; ++round) {
+    host.printer_config = good;
+    host.printer_config.resize(round % (good.size() + 1));
+    for (int k = 0; k < round % 5; ++k) { seed = seed * 1664525 + 1013904223; if (!host.printer_config.empty()) host.printer_config[(seed >> 8) % host.printer_config.size()] = static_cast<uint8_t>(seed >> 16); }
+    List<UniquePointer<IPrinter>> found(a);
+    UsbPrinter::discover(bus, a, found);
+  }
+  CHECK(g_live == 0);
+}
+
 int main() {
   test_packbits();
   test_pages_and_halftone();
@@ -385,6 +624,9 @@ int main() {
   test_raw_delivery();
   test_lpd_delivery();
   test_failures_and_registry();
+  test_device_id();
+  test_usb_printer();
+  test_usb_variants();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;
