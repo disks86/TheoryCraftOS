@@ -31,18 +31,19 @@ struct DiscoveredPrinter {
   char manufacturer[32] = {};  // "usb_MFG" / "mfg"
   char pdl[96] = {};           // the page description languages announced ("application/postscript,application/vnd.hp-PCL")
   char description[80] = {};   // sysDescr from SNMP
-  bool has_ipp = false, has_lpd = false, has_raw = false, has_snmp = false;
+  bool has_ipp = false, has_ipps = false, has_lpd = false, has_raw = false, has_snmp = false;
   bool by_mdns = false;
-  uint16_t ipp_port = 631, lpd_port = 515, raw_port = 9100;
+  uint16_t ipp_port = 631, ipps_port = 631, lpd_port = 515, raw_port = 9100;
   char ipp_path[48] = {};      // the resource path from TXT "rp", with a leading slash ("/ipp/print")
+  char ipps_path[48] = {};     // the same for the _ipps service (TLS)
   char lpd_queue[32] = {};     // the queue from the _printer service's TXT "rp"
   // A printer found only by SNMP is assumed to take raw jobs on port 9100 (HP JetDirect, Brother and most print servers do); this was not checked.
-  bool raw_assumed() const { return !has_raw && has_snmp && !has_ipp && !has_lpd; }
+  bool raw_assumed() const { return !has_raw && has_snmp && !has_ipp && !has_ipps && !has_lpd; }
   bool supports_pcl() const;
   bool supports_postscript() const;
 };
 
-// Looks for printers on the local network, two ways at once: multicast DNS service discovery (queries for _ipp._tcp, _printer._tcp and
+// Looks for printers on the local network, two ways at once: multicast DNS service discovery (queries for _ipp._tcp, _ipps._tcp, _printer._tcp and
 // _pdl-datastream._tcp, then SRV, TXT and A for what answers) and an SNMP probe (a v2c GET for the printer MIB objects, sent to the broadcast
 // addresses; printers answer directly). Polled: call poll() while the stack is polled; results accumulate in at(), and finished() turns true
 // once the query schedule has run out (the listening goes on until stop()). Not tried on a real network.

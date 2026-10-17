@@ -35,6 +35,7 @@ struct OwnedInfo {
     copy_text(manufacturer, sizeof manufacturer, d.manufacturer);
     copy_text(model, sizeof model, d.make_model[0] ? d.make_model : d.name);
     copy_text(ipp_path, sizeof ipp_path, d.ipp_path[0] ? d.ipp_path : "/ipp/print");
+    copy_text(ipps_path, sizeof ipps_path, d.ipps_path[0] ? d.ipps_path : "/ipp/print");
     copy_text(lpd_queue, sizeof lpd_queue, d.lpd_queue[0] ? d.lpd_queue : "lp");
     info.manufacturer = manufacturer;
     info.model = model;
@@ -43,16 +44,17 @@ struct OwnedInfo {
     info.paper_sizes = static_cast<uint16_t>((1 << static_cast<int>(PaperSize::A4)) | (1 << static_cast<int>(PaperSize::Letter)));
     use_pcl = pcl || !ps;
   }
-  char manufacturer[32] = {}, model[64] = {}, ipp_path[48] = {}, lpd_queue[32] = {};
+  char manufacturer[32] = {}, model[64] = {}, ipp_path[48] = {}, ipps_path[48] = {}, lpd_queue[32] = {};
   PrinterInfo info;
   bool use_pcl = true;
 };
 
 class DiscoveredIppPrinter final : private OwnedInfo, public IppPrinter {
  public:
-  DiscoveredIppPrinter(network::INetworkStack& stack, allocators::IAllocator& allocator, const DiscoveredPrinter& d)
-      : OwnedInfo(d), IppPrinter(stack, d.address, OwnedInfo::info, allocator, OwnedInfo::ipp_path, d.ipp_port) {
+  DiscoveredIppPrinter(network::INetworkStack& stack, allocators::IAllocator& allocator, const DiscoveredPrinter& d, const network::TlsConfig* tls)
+      : OwnedInfo(d), IppPrinter(stack, d.address, OwnedInfo::info, allocator, tls ? OwnedInfo::ipps_path : OwnedInfo::ipp_path, tls ? d.ipps_port : d.ipp_port) {
     set_document_format(use_pcl ? "application/vnd.hp-PCL" : "application/postscript");
+    if (tls) set_tls(*tls);
   }
 };
 
@@ -65,8 +67,9 @@ class DiscoveredNetworkPrinter final : private OwnedInfo, public NetworkPrinter 
 };
 }  // namespace
 
-UniquePointer<IPrinter> make_discovered_printer(network::INetworkStack& stack, allocators::IAllocator& allocator, const DiscoveredPrinter& found) {
-  if (found.has_ipp) return UniquePointer<IPrinter>(UniquePointer<DiscoveredIppPrinter>::make(allocator, stack, allocator, found));
+UniquePointer<IPrinter> make_discovered_printer(network::INetworkStack& stack, allocators::IAllocator& allocator, const DiscoveredPrinter& found, const network::TlsConfig* tls) {
+  if (found.has_ipps && tls) return UniquePointer<IPrinter>(UniquePointer<DiscoveredIppPrinter>::make(allocator, stack, allocator, found, tls));
+  if (found.has_ipp) return UniquePointer<IPrinter>(UniquePointer<DiscoveredIppPrinter>::make(allocator, stack, allocator, found, nullptr));
   if ((found.has_raw && found.raw_port == 9100) || found.raw_assumed())
     return UniquePointer<IPrinter>(UniquePointer<DiscoveredNetworkPrinter>::make(allocator, stack, allocator, found, PrintProtocol::Raw9100));
   if (found.has_lpd && found.lpd_port == 515)

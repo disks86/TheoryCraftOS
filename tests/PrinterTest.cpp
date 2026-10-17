@@ -1933,6 +1933,19 @@ static void test_discovered_printers() {
   lpd.has_lpd = true;
   strcpy(lpd.name, "Old");
   CHECK(make_discovered_printer(lan.a, lan.alloc, lpd));
+  // IPPS is chosen when the printer offers it and TLS settings are given; otherwise it stays on plain IPP (or what else there is)
+  {
+    DiscoveredPrinter secure;
+    secure.address = Ipv4Address::make(10, 0, 0, 2);
+    secure.has_ipp = secure.has_ipps = true;
+    strcpy(secure.name, "Secure");
+    TlsConfig tls;
+    UniquePointer<IPrinter> with = make_discovered_printer(lan.a, lan.alloc, secure, &tls), without = make_discovered_printer(lan.a, lan.alloc, secure);
+    CHECK(with && with->encrypted() && without && !without->encrypted());
+    secure.has_ipp = false;
+    CHECK(!make_discovered_printer(lan.a, lan.alloc, secure));   // IPPS only, but no TLS settings: nothing to use
+    CHECK(make_discovered_printer(lan.a, lan.alloc, secure, &tls) && !r->encrypted());
+  }
   DiscoveredPrinter none;
   none.address = Ipv4Address::make(10, 0, 0, 2);
   none.has_raw = true;

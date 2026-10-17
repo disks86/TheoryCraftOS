@@ -77,7 +77,12 @@ bool IppExchange::start(Ipv4Address address, uint16_t port, const char* path, Co
     return false;
   }
   total_ = head_.size() + document.size();
-  socket_ = stack_.tcp_open();
+  if (use_tls_) {
+    if (!tls_.server_name && tls_.server_ipv4 == 0) tls_.server_ipv4 = address.value();
+    socket_ = SharedPointer<ITcpSocket>::make_as<TlsSocket>(allocator_, stack_, allocator_, tls_);
+  } else {
+    socket_ = stack_.tcp_open();
+  }
   if (!socket_ || !socket_->connect(address, port)) {
     socket_ = SharedPointer<ITcpSocket>();
     state_ = IppExchangeState::Failed;

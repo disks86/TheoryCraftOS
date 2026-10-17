@@ -35,6 +35,22 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   started on all of them at once (a silent network doesn't delay the others), and `resolve()` asks every configured
   interface's DNS server and takes the first answer. `src/NetworkStackDemo` reports each interface's lease, pings
   its gateway, resolves names through it, talks UDP/TCP to the host and serves HTTP on port 8080 on every interface.
+  **TLS:** `src/Network/Tls/TlsSocket` is a TLS 1.3 / 1.2 client that is itself an `ITcpSocket`, so anything that takes a socket (the print transports,
+  the IPP exchange, `TcpStream`) can be given one. Cipher suites: ChaCha20-Poly1305, AES-128/256-GCM (TLS 1.3 and the ECDHE_RSA / ECDHE_ECDSA suites of TLS
+  1.2); key exchange X25519, P-256, P-384 (HelloRetryRequest, TLS 1.3 key updates and the extended master secret are handled); server signatures RSA
+  PKCS#1 v1.5 and PSS, ECDSA. Certificates are validated by `src/Crypto/X509` (chain building from the supplied intermediates to a `TrustStore`
+  - PEM bundles can be loaded, a pinned self-signed certificate works - signatures, dates, CA/path-length/key-usage rules, server-auth usage, SAN
+  host names with `*.` wildcards or the IP address; no revocation, no name constraints) and the host check cannot be forgotten: with neither a name nor
+  an address to check the handshake fails unless `skip_hostname_check` is set. The clock for the date checks is passed in (`TlsConfig::clock`; the
+  firmware RTC is local time, so wiring one up is left to the caller), randomness comes from `crypto::IRandom` (`DrbgRandom` over `CpuEntropySource`:
+  RDSEED/RDRAND, untested on hardware). The primitives are in `src/Crypto` (SHA-2, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, big integers, RSA
+  verification, P-256/P-384, X.509) and were checked against OpenSSL's output; `tests/TlsReplayTest.cpp` plays recordings of real `openssl s_server`
+  handshakes (every version/suite/certificate combination above, plus a retry request and key updates) back to the client, then damages them in
+  many ways; `tests/tls_live.sh` runs the client against live `openssl s_server` and Python TLS servers (50 checks: combinations, failures, 2 MB echoes both
+  ways, IPPS printing). Not supported: server mode, client certificates, session resumption / 0-RTT, renegotiation, SSL 3.0 and TLS 1.0/1.1 (refused),
+  RSA key exchange, DHE, Ed25519 / RSA-PSS certificates, P-521, OCSP stapling checks. AES uses table lookups, so it can leak through the cache (ChaCha20
+  is offered first for that reason); the elliptic-curve private-key code is constant-time apart from the group law's exceptional cases. Nobody has
+  audited this; do not take it for a vetted library. IPP can run over it (`IppPrinter::set_tls`, `ipps://`), and discovery finds `_ipps._tcp`.
 - `src/Hardware/StorageDevice/`: block storage. `IStorageDevice` reads/writes/flushes whole logical blocks
   (synchronous, any buffer alignment and size; `StorageDeviceBase` checks ranges and chunks big requests through a
   DMA-able bounce buffer). Native drivers: `Virtio/` (virtio-blk, virtio-scsi), `NVMe/`, `Ahci/` (SATA disks and
@@ -140,7 +156,7 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   and `IppExchange` carries one request over HTTP/1.1 on TCP 631 (Content-Length, chunked and close-delimited answers, `100 Continue`
   skipped). `IppPrinter` is an `IPrinter` doing Print-Job (document format settable, busy answers retried), Get-Printer-Attributes
   (state, state reasons as errors and alerts, marker levels as supplies, serial from the device id), Get-Jobs and Cancel-Job. It has
-  no page count (IPP has none for the printer; use SNMP) and no TLS (ipps://), authentication, Validate-Job or Create-Job/Send-Document.
+  no page count (IPP has none for the printer; use SNMP); ipps:// works through `set_tls()`; no HTTP authentication, Validate-Job or Create-Job/Send-Document.
   Tested against a scripted server only; the encoder against bytes laid out independently.
   The agent is assumed to be at device index 1 with community "public" (`set_snmp_community()`). 
   **Discovery:** `PrinterDiscovery` looks for printers two ways at once: mDNS / DNS-SD (`src/Network/Mdns/`: queries for `_ipp._tcp`,

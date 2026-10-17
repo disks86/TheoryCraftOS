@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test SnmpTest PrinterTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PartitionTest FileSystemTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -63,8 +63,9 @@ for t in "${WANTED[@]}"; do
                    src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     CryptoTest) build_and_run CryptoTest tests/CryptoTest.cpp tests/KernelStubs.cpp src/Crypto/*.cpp ;;
     X509Test) build_and_run X509Test tests/X509Test.cpp tests/KernelStubs.cpp src/Crypto/*.cpp ;;
+    TlsReplayTest) build_and_run TlsReplayTest tests/TlsReplayTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp ;;
     SnmpTest) build_and_run SnmpTest tests/SnmpTest.cpp tests/KernelStubs.cpp src/Crypto/*.cpp src/Network/Snmp/SnmpMessage.cpp src/Network/Snmp/SnmpUsm.cpp ;;
-    PrinterTest) build_and_run PrinterTest tests/PrinterTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
+    PrinterTest) build_and_run PrinterTest tests/PrinterTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
                    src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                    src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     GraphicsTest) build_and_run GraphicsTest tests/GraphicsTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \

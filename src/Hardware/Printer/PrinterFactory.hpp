@@ -19,13 +19,15 @@
 #pragma once
 #include "Hardware/Printer/IPrinter.hpp"
 #include "Hardware/Printer/PrinterDiscovery.hpp"
+#include "Network/Tls/TlsSocket.hpp"
 
 namespace hardware {
 
-// Makes a printer object for a discovered printer: IPP if it advertises it, else raw port 9100 (advertised, or assumed for a printer
+// Makes a printer object for a discovered printer: IPPS if it advertises it and `tls` (the TLS settings to use, copied; the trust store in it must
+// outlive the printer) is given, else IPP if it advertises it, else raw port 9100 (advertised, or assumed for a printer
 // only SNMP found), else LPD. The PrinterInfo is built from what discovery learned: languages from the announced "pdl" list (PCL
 // assumed when nothing was announced), 600 dpi, mono, A4 and Letter - the details discovery does not know are defaults. Null if no
 // protocol fits or memory ran out.
-UniquePointer<IPrinter> make_discovered_printer(network::INetworkStack& stack, allocators::IAllocator& allocator, const DiscoveredPrinter& found);
+UniquePointer<IPrinter> make_discovered_printer(network::INetworkStack& stack, allocators::IAllocator& allocator, const DiscoveredPrinter& found, const network::TlsConfig* tls = nullptr);
 
 }  // namespace hardware

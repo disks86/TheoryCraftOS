@@ -144,7 +144,7 @@ bool IppPrinter::build_printer_uri(char* out, uint32_t capacity) const {
     do { digits[k++] = static_cast<char>('0' + v % 10); v /= 10; } while (v);
     while (k && n + 1 < sizeof t) t[n++] = digits[--k];
   };
-  text("ipp://");
+  text(exchange_.uses_tls() ? "ipps://" : "ipp://");
   for (int i = 0; i < 4; ++i) {
     number((address_.value() >> (24 - 8 * i)) & 0xff);
     if (i < 3) text(".");

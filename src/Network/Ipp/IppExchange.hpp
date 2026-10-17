@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Network/INetworkStack.hpp"
+#include "Network/Tls/TlsSocket.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace network {
@@ -26,15 +27,24 @@ enum class IppExchangeState : uint8_t { Idle, Connecting, Sending, Receiving, Do
 
 // One IPP request and its answer over HTTP/1.1 (POST of application/ipp; the answer may come with a Content-Length, chunked, or
 // simply end with the connection). Polled like the sockets underneath: call poll() while the stack is polled. One exchange at a time;
-// start() again after Done or Failed. The connection is closed after each exchange.
+// start() again after Done or Failed. The connection is closed after each exchange. Plain HTTP by default, HTTPS after set_tls().
 class IppExchange {
  public:
   static constexpr uint16_t kPort = 631;
   static constexpr uint32_t kMaxResponse = 128 * 1024;
-  IppExchange(INetworkStack& stack, allocators::IAllocator& allocator) : stack_(stack), raw_(allocator), head_(allocator), body_(allocator) {}
+  IppExchange(INetworkStack& stack, allocators::IAllocator& allocator) : stack_(stack), allocator_(allocator), raw_(allocator), head_(allocator), body_(allocator) {}
   ~IppExchange() { cancel(); }
   IppExchange(const IppExchange&) = delete;
   IppExchange& operator=(const IppExchange&) = delete;
+
+  // Talks TLS (ipps) from now on: the connection is wrapped in a TlsSocket with this configuration (copied; what it points to - the trust store, the
+  // random source - must outlive the exchange). nullptr goes back to plain TCP. If the configuration names no server_name, the certificate is checked
+  // against the printer's address.
+  void set_tls(const TlsConfig* config) {
+    use_tls_ = config != nullptr;
+    if (config) tls_ = *config;
+  }
+  bool uses_tls() const { return use_tls_; }
 
   // Sends `ipp_head` (the encoded request) followed by `document` (may be empty; must stay valid until Done or Failed) to
   // http://address:port/path. `host` is the Host header value. False if a socket could not be opened.
@@ -53,6 +63,9 @@ class IppExchange {
   bool parse_response();  // true once the answer is complete (and body_ filled)
   void fail();
   INetworkStack& stack_;
+  allocators::IAllocator& allocator_;
+  TlsConfig tls_;
+  bool use_tls_ = false;
   SharedPointer<ITcpSocket> socket_;
   ByteBuffer raw_, head_, body_;
   ConstByteView document_;

@@ -50,7 +50,7 @@ bool SystemPrinters::enable_alerts(network::INetworkStack& stack, AlertCallback 
   return alerts_ && alerts_->start();
 }
 
-uint32_t SystemPrinters::add_discovered(network::INetworkStack& stack, const PrinterDiscovery& discovery) {
+uint32_t SystemPrinters::add_discovered(network::INetworkStack& stack, const PrinterDiscovery& discovery, const network::TlsConfig* tls) {
   uint32_t added = 0;
   for (uint32_t i = 0; i < discovery.count(); ++i) {
     const DiscoveredPrinter& found = discovery.at(i);
@@ -58,7 +58,7 @@ uint32_t SystemPrinters::add_discovered(network::INetworkStack& stack, const Pri
     for (uint32_t k = 0; k < count(); ++k)
       if (at(k)->ipv4_address() == found.address.value()) known = true;
     if (known) continue;
-    UniquePointer<IPrinter> printer = make_discovered_printer(stack, allocator_, found);
+    UniquePointer<IPrinter> printer = make_discovered_printer(stack, allocator_, found, tls);
     if (printer && add(util::move(printer))) ++added;
   }
   return added;

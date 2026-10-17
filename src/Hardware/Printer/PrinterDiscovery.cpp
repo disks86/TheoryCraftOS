@@ -32,12 +32,12 @@ constexpr uint64_t kFinishedAfterMs = 10000, kAskIntervalMs = 500;
 constexpr uint32_t kMaxAsks = 4;
 constexpr int32_t kProbeId = 0x5c0de;
 
-enum class Kind : uint8_t { None, Ipp, Lpd, Raw };
+enum class Kind : uint8_t { None, Ipp, Ipps, Lpd, Raw };
 struct ServiceType {
   const char* name;
   Kind kind;
 };
-constexpr ServiceType kTypes[] = {{"_ipp._tcp.local", Kind::Ipp}, {"_printer._tcp.local", Kind::Lpd}, {"_pdl-datastream._tcp.local", Kind::Raw}};
+constexpr ServiceType kTypes[] = {{"_ipp._tcp.local", Kind::Ipp}, {"_ipps._tcp.local", Kind::Ipps}, {"_printer._tcp.local", Kind::Lpd}, {"_pdl-datastream._tcp.local", Kind::Raw}};
 
 uint32_t length_of(const char* s) {
   uint32_t n = 0;
@@ -415,6 +415,15 @@ void PrinterDiscovery::rebuild() {
           copy_text(p->ipp_path + 1, sizeof p->ipp_path - 1, s.rp[0] ? s.rp : "ipp/print");
         }
         break;
+      case Kind::Ipps:
+        p->has_ipps = true;
+        p->ipps_port = s.port;
+        if (s.rp[0] == '/') copy_text(p->ipps_path, sizeof p->ipps_path, s.rp);
+        else {
+          p->ipps_path[0] = '/';
+          copy_text(p->ipps_path + 1, sizeof p->ipps_path - 1, s.rp[0] ? s.rp : "ipp/print");
+        }
+        break;
       case Kind::Lpd:
         p->has_lpd = true;
         p->lpd_port = s.port;
@@ -440,7 +449,7 @@ void PrinterDiscovery::rebuild() {
   uint32_t kept = 0;
   for (uint32_t i = 0; i < t.printer_count; ++i) {
     const DiscoveredPrinter& p = t.printers[i];
-    if (!(p.has_ipp || p.has_lpd || p.has_raw || p.has_snmp)) continue;
+    if (!(p.has_ipp || p.has_ipps || p.has_lpd || p.has_raw || p.has_snmp)) continue;
     if (kept != i) t.printers[kept] = p;
     ++kept;
   }

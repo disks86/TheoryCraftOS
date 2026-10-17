@@ -24,6 +24,10 @@
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 
+namespace network {
+struct TlsConfig;
+}
+
 namespace hardware {
 
 // The printers the machine knows about. Network printers cannot be found by scanning buses, so they are added by whoever knows
@@ -36,8 +40,9 @@ class SystemPrinters {
   bool add(UniquePointer<IPrinter> printer);
   // Adds every printer found on the USB bus (printer-class interfaces); returns how many.
   uint32_t discover_usb(IUsbBus& usb);
-  // Adds a printer object (make_discovered_printer) for every printer `discovery` has found that is not here yet (matched by IP address); returns how many.
-  uint32_t add_discovered(network::INetworkStack& stack, const PrinterDiscovery& discovery);
+  // Adds a printer object (make_discovered_printer, IPPS when `tls` is given and the printer offers it) for every printer `discovery` has found that is
+  // not here yet (matched by IP address); returns how many.
+  uint32_t add_discovered(network::INetworkStack& stack, const PrinterDiscovery& discovery, const network::TlsConfig* tls = nullptr);
   uint32_t count() const { return static_cast<uint32_t>(printers_.count()); }
   IPrinter* at(uint32_t index) { return index < printers_.count() ? printers_[index].get() : nullptr; }
   IPrinter* default_printer() { return at(0); }

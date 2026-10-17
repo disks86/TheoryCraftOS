@@ -104,6 +104,8 @@ add_executable(BOOTX64
   src/Crypto/Rsa.cpp
   src/Crypto/Ecc.cpp
   src/Crypto/X509.cpp
+  src/Network/Tls/TlsKeys.cpp
+  src/Network/Tls/TlsSocket.cpp
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
   src/Network/Udp/UdpManager.cpp

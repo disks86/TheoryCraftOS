@@ -72,6 +72,10 @@ class IppPrinter : public IPrinter {
   bool cancel_pending() const { return cancel_requested_ || op_ == Op::Cancel; }
   uint16_t cancel_result() const { return cancel_result_; }
 
+  // Talks IPPS: HTTP over TLS (see TlsSocket; the configuration is copied, what it points to must outlive the printer). The certificate must
+  // be trusted through config.trust unless config.verify_certificates is off.
+  void set_tls(const network::TlsConfig& config) { exchange_.set_tls(&config); }
+  bool encrypted() const override { return exchange_.uses_tls(); }
   void set_document_format(const char* mime) { format_ = mime; }
   void set_user_name(const char* user) { user_ = user; }
   // The job-id the printer gave the last job it accepted (0 if none yet).
