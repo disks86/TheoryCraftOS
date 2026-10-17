@@ -99,6 +99,8 @@ add_executable(BOOTX64
   src/Network/Dns/DnsResolver.cpp
   src/Hardware/Clock/TscClock.cpp
   src/AudioDemo.cpp
+  src/Audio/AudioStream.cpp
+  src/Audio/AudioMixer.cpp
   src/Hardware/AudioDevice/PlaybackRing.cpp
   src/Hardware/AudioDevice/SystemAudioDevices.cpp
   src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp

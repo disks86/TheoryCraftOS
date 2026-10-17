@@ -22,7 +22,7 @@
 
 namespace {
 constexpr uint32_t kToneFrames = hardware::kAudioSampleRate / 3;
-constexpr uint32_t kPeriodFrames = hardware::kAudioSampleRate / 440;  // one wave
+constexpr uint32_t kPeriodFrames = hardware::kAudioSampleRate / 440;  // one wave of 440 Hz
 constexpr int32_t kAmplitude = 6000;
 
 void report(const char* what, bool ok) {
@@ -86,5 +86,66 @@ bool run_audio_demo(hardware::IAudioDevice& device) {
   device.set_volume(old_volume);
   report("volume and mute", controls && !device.muted() && device.volume() == old_volume);
   all_ok &= controls;
+  return all_ok;
+}
+
+namespace {
+// Stereo frame `n` of a triangle wave of `period` frames, at `amplitude`.
+void tone_frame(uint8_t* out, uint32_t n, uint32_t period, int32_t amplitude) {
+  const uint32_t phase = n % period, half = period / 2;
+  const int32_t rising = phase < half ? static_cast<int32_t>(phase) : static_cast<int32_t>(period - phase);
+  const int32_t sample = (rising * 2 * amplitude / static_cast<int32_t>(half)) - amplitude;
+  for (uint32_t channel = 0; channel < hardware::kAudioChannels; ++channel) {
+    out[2 * channel] = static_cast<uint8_t>(sample);
+    out[2 * channel + 1] = static_cast<uint8_t>(sample >> 8);
+  }
+}
+}  // namespace
+
+bool run_mixer_demo(audio::AudioMixer& mixer) {
+  bool all_ok = true;
+  const audio::MixerStatistics before = mixer.statistics();
+  SharedPointer<audio::AudioStream> low = mixer.open_stream(), high = mixer.open_stream();
+  const bool opened = low && high && mixer.stream_count() >= 2;
+  report("two streams opened", opened);
+  if (!opened) return false;
+
+  const uint32_t periods[2] = {hardware::kAudioSampleRate / 440, hardware::kAudioSampleRate / 660};
+  audio::AudioStream* streams[2] = {low.get(), high.get()};
+  uint32_t sent[2] = {0, 0};
+  uint64_t waited_us = 0;
+  while ((sent[0] < kToneFrames || sent[1] < kToneFrames) && waited_us < 3000000) {
+    bool blocked = true;
+    for (int s = 0; s < 2; ++s) {
+      if (sent[s] >= kToneFrames) continue;
+      uint8_t chunk[hardware::kAudioFrameSize * 256];
+      const uint32_t frames = kToneFrames - sent[s] < 256 ? kToneFrames - sent[s] : 256;
+      for (uint32_t i = 0; i < frames; ++i) tone_frame(chunk + i * hardware::kAudioFrameSize, sent[s] + i, periods[s], 4000);
+      const uint32_t taken = streams[s]->write(ConstByteView(chunk).first(frames * hardware::kAudioFrameSize));
+      sent[s] += taken / hardware::kAudioFrameSize;
+      if (taken > 0) blocked = false;
+    }
+    if (blocked) {
+      hardware::delay_us(5000);
+      waited_us += 5000;
+    }
+  }
+  const bool accepted = sent[0] == kToneFrames && sent[1] == kToneFrames;
+  report("both tones accepted", accepted);
+  all_ok &= accepted;
+  low->close();
+  high->close();
+
+  // The mixer thread drains the streams and the device plays the sum.
+  waited_us = 0;
+  while ((mixer.stream_count() > 0 || mixer.device().queued_bytes() > 0) && waited_us < 3000000) {
+    hardware::delay_us(10000);
+    waited_us += 10000;
+  }
+  const audio::MixerStatistics after = mixer.statistics();
+  const bool mixed = after.frames_mixed - before.frames_mixed == kToneFrames &&
+                     after.streams_opened - before.streams_opened == 2 && mixer.stream_count() == 0;
+  report("tones mixed, played and streams released", mixed);
+  all_ok &= mixed;
   return all_ok;
 }

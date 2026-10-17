@@ -56,6 +56,13 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   other formats/rates (no resampling), jack detection, interrupts. `src/AudioDemo` plays a short tone at boot
   (`TCOS_SELFTESTS`); `tests/AudioTest.cpp` covers the ring and the software device. The `run` targets give QEMU an
   `intel-hda` + `hda-duplex` with a `none` audio backend.
+- `src/Audio/`: the sound server. Audio hardware plays one stream, so `AudioMixer` owns the device (the first one
+  `SystemAudioDevices` found) and any number of programs mix through it: `open_stream()` gives an `AudioStream`
+  (a 32 KiB ring in the fixed format, own volume and mute, `write()` never blocks, `close()` when done). `pump()` keeps
+  the device topped up to ~50 ms, sums every stream with clipping (32-bit accumulator) and writes nothing when
+  all streams are empty; `start_service()` runs it from the "audio" thread every 5 ms. Master volume/mute go to the
+  device. Up to 32 streams. Not covered: resampling or other formats, per-stream panning, capture.
+  `tests/AudioMixerTest.cpp` covers it; `src/AudioDemo` mixes two tones at boot (`TCOS_SELFTESTS`).
 - `src/FileSystem/`: filesystems. `IFileSystem` (path based: `open_file`, `open_directory`, `stat`, `create_directory`,
   `remove`, `rename`) hands out `IFile` (offset-based read/write/resize) and `IDirectory` (entry iteration) handles;
   every call returns a `Status` instead of throwing. `Path.hpp` holds the shared path rules. `Ram/` is a

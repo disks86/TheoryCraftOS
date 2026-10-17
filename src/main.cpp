@@ -35,6 +35,7 @@
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
 #include "Kernel/Thread.hpp"
+#include "Audio/AudioMixer.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/SystemInput.hpp"
@@ -311,6 +312,21 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (!run_audio_demo(device)) console::puts("  audio self-check failed\n");
 #endif
   }
+
+  // The sound server: the first device belongs to the mixer, which every program's audio goes through.
+  UniquePointer<audio::AudioMixer> mixer;
+  if (audio.count() > 0) {
+    mixer = UniquePointer<audio::AudioMixer>::make(shared_allocator, *audio.at(0), shared_allocator);
+    if (mixer && mixer->initialize() && mixer->start_service()) {
+      Entry(Level::Ok, "Audio").text("mixer running (up to ").dec(audio::AudioMixer::kMaxStreams).text(" streams)");
+#ifdef TCOS_SELFTESTS
+      if (!run_mixer_demo(*mixer)) console::puts("  mixer self-check failed\n");
+#endif
+    } else {
+      Entry(Level::Warning, "Audio").text("could not start the mixer");
+      mixer.reset();
+    }
+  }
 #ifdef TCOS_SELFTESTS
   UniquePointer<NetworkStackDemo> stack_demo;
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
@@ -420,6 +436,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::use_gpu(gpu);
     console::puts("TheoryCraftOS: shutting down\n");
   }
+  mixer.reset();   // the mixer thread ends before its audio device goes
   stacks.clear();  // the stacks go before the NICs underneath them
 #ifdef TCOS_SELFTESTS
   stack_demo.reset();
