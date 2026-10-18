@@ -18,7 +18,7 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager", "Text Editor", "Terminal", "Paint", "Media Player",
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Paint", "Media Player",
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -35,7 +35,7 @@
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/Terminal.hpp"
-#include "Desktop/TaskManager.hpp"
+#include "Desktop/ComputerManager.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -123,11 +123,11 @@ class Desktop {
   uint32_t terminal_count() const;
   // Opens a text editor window: the first one is notepad() (when that is closed), further ones are made as needed and go away when closed.
   Notepad* open_text_editor(gui::TabFrame* into = nullptr);
-  TaskManager& task_manager() { return task_manager_; }
-  // The machine's figures for the task manager (nullptr: none). It must outlive the desktop.
-  void set_system_monitor(ISystemMonitor* monitor) { task_manager_.set_monitor(monitor); }
-  // Opens the task manager, or brings it forward (restoring it if minimized); it refreshes once a second meanwhile.
-  void open_task_manager();
+  ComputerManager& computer_manager() { return computer_manager_; }
+  // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
+  void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
+  // Opens the computer manager, or brings it forward (restoring it if minimized); it refreshes once a second meanwhile.
+  void open_computer_manager();
   // Opens a file explorer window: the first one is explorer() (when that is closed), further ones are made as needed and go away when closed.
   FileExplorer* open_explorer(gui::TabFrame* into = nullptr);
   // Opens what `path` names the way a double click in a file explorer would: a folder in a file explorer (an open one, else a new one), a
@@ -149,7 +149,9 @@ class Desktop {
   DisplaySettings& display_settings() { return display_settings_; }
   // Where the pointer is (window coordinates).
   gui::Point pointer() const { return input_.cursor(); }
-  // Opens the display settings window, or brings it forward.
+  // The devices of the machine for the computer manager's Hardware tab (nullptr: none). It must outlive the desktop.
+  void set_hardware_inventory(IHardwareInventory* inventory) { computer_manager_.set_hardware_inventory(inventory); }
+  // Opens the display settings window, or brings it forward. It is reached from the Displays group of the computer manager's hardware tree.
   void open_display_settings();
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
   void ask_shut_down();
@@ -191,7 +193,7 @@ class Desktop {
   void open_file(StringView file);
   static void on_copy_finished(void* self, gui::Control&);
   static void on_extra_closed(void* self, gui::Control&);
-  static void on_task_manager(void* self, gui::Control&);
+  static void on_computer_manager(void* self, gui::Control&);
   static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
   static void on_display_settings(void* self, gui::Control&);
@@ -237,7 +239,7 @@ class Desktop {
   ColorDialog color_dialog_;
   PrintDialog print_dialog_;
   FileExplorer explorer_;
-  TaskManager task_manager_;
+  ComputerManager computer_manager_;
   Notepad notepad_;
   Paint paint_;
   Terminal terminal_;

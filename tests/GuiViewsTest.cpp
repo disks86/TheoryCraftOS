@@ -42,7 +42,7 @@
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/Paint.hpp"
-#include "Desktop/TaskManager.hpp"
+#include "Desktop/ComputerManager.hpp"
 #include "Gui/Controls/TextEditor.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Gui/Controls/BreadcrumbBar.hpp"
@@ -1526,7 +1526,7 @@ struct FakeMonitor final : desktop::ISystemMonitor {
   desktop::TaskMemory memory() override { return {1ull << 30, free_bytes}; }
 };
 
-static void test_task_manager() {
+static void test_computer_manager() {
   TestAllocator a;
   {
     FakeMonitor mon;
@@ -1536,7 +1536,7 @@ static void test_task_manager() {
     WindowManager mgr(a);
     mgr.set_dock(DockStyle::Fill);
     w.add(&mgr);
-    desktop::TaskManager tm(a);
+    desktop::ComputerManager tm(a);
     tm.update(1000000);
     CHECK(tm.info_label().text().equals("No system monitor available"));
     tm.set_monitor(&mon);
@@ -1548,7 +1548,7 @@ static void test_task_manager() {
     CHECK(tm.memory_label().text().equals("512.0 MB / 1.0 GB") && tm.memory_meter().level() == 50);
     CHECK(tm.info_label().text().equals("Threads: 3   Cores: 2   Uptime: 00:00:01"));
     CHECK(tm.core_meter(0) && tm.core_meter(1) && !tm.core_meter(2) && tm.core_label(0)->text().equals("0%"));
-    CHECK(tm.tabs().page_count() == 2 && tm.tabs().page_title(0).equals("Processes") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().selected_page() == 0);
+    CHECK(tm.tabs().page_count() == 3 && tm.tabs().page_title(0).equals("Processes") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().page_title(2).equals("Hardware") && tm.tabs().selected_page() == 0);
 
     // One second later: core 0 was 25% busy, core 1 75% busy, and the worker ran 600 of the 1000 ticks.
     mon.core_busy[0] = 250; mon.core_idle[0] = 750;
@@ -1585,6 +1585,245 @@ static void test_task_manager() {
     CHECK(tm.grid().row_count() == 2 && tm.grid().selected_row() == -1 && tm.thread_load_tenths(7) == -1);
     w.render();
     mgr.remove_window(&tm);
+  }
+  CHECK(a.live == 0);
+}
+
+// --- Tree view and the computer manager's Hardware tab ------------------------------------------------------------
+
+static Point node_point(TreeView& t, int32_t node, int32_t dx = 80) {
+  Rect2D r;
+  CHECK(t.node_rect(node, &r));
+  const Point o = t.window_origin();
+  return {o.x + r.x + dx, o.y + r.y + static_cast<int32_t>(r.height) / 2};
+}
+
+static void test_tree_view() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    TreeView t(a);
+    t.set_dock(DockStyle::Fill);
+    w.add(&t);
+    w.layout();
+    Counter selected;
+    t.on_selection_changed(selected.handler());
+    CHECK(t.node_count() == 0 && t.selected() == -1 && t.visible_count() == 0 && t.add_node(5, "x") == -1);
+    // A small tree: two groups, the first with three devices, one of them with a child.
+    const int32_t g1 = t.add_node(-1, "Group one", 100, ItemIcon::Folder);
+    const int32_t g2 = t.add_node(-1, "Group two", 200, ItemIcon::Folder);
+    const int32_t a1 = t.add_node(g1, "Alpha", 1), b1 = t.add_node(g1, "Beta", 2), c1 = t.add_node(g1, "Gamma", 3);
+    const int32_t d1 = t.add_node(g2, "Delta", 4);
+    const int32_t sub = t.add_node(b1, "Beta child", 5);
+    CHECK(g1 == 0 && g2 == 1 && t.node_count() == 7 && t.child_count(-1) == 2 && t.child_count(g1) == 3 && t.child_count(b1) == 1 && t.child_count(a1) == 0);
+    CHECK(t.child_at(-1, 1) == g2 && t.child_at(g1, 2) == c1 && t.child_at(g1, 3) == -1 && t.child_at(99, 0) == -1);
+    CHECK(t.parent_of(sub) == b1 && t.parent_of(g1) == -1 && t.node_tag(d1) == 4 && t.node_text(c1).equals("Gamma"));
+    // Everything is closed: only the two groups show.
+    CHECK(t.visible_count() == 2 && t.node_at_row(0) == g1 && t.node_at_row(1) == g2 && !t.expanded(g1));
+    Rect2D r;
+    CHECK(t.node_rect(g1, &r) && !t.node_rect(a1, &r) && !t.box_rect(a1, &r));
+    // The box opens a group; a click on the row selects it.
+    Rect2D box;
+    CHECK(t.box_rect(g1, &box));
+    const Point o = t.window_origin();
+    click(w, o.x + box.x + 3, o.y + box.y + 3);
+    CHECK(t.expanded(g1) && t.visible_count() == 5 && t.selected() == -1);
+    const Point at_beta = node_point(t, b1, 90);
+    click(w, at_beta.x, at_beta.y);
+    CHECK(t.selected() == b1 && selected.count == 1 && !t.expanded(b1));
+    click(w, at_beta.x, at_beta.y);
+    CHECK(selected.count == 1);   // (the same node: no change)
+
+    // Keys: Right opens, Right again goes to the first child, Left goes back to the parent, Left closes, Up and Down walk the shown nodes.
+    w.set_focus(&t);
+    press(w, hardware::key::kRight);
+    CHECK(t.expanded(b1) && t.selected() == b1 && t.visible_count() == 6);
+    press(w, hardware::key::kRight);
+    CHECK(t.selected() == sub);
+    press(w, hardware::key::kLeft);
+    CHECK(t.selected() == b1);
+    press(w, hardware::key::kLeft);
+    CHECK(!t.expanded(b1) && t.selected() == b1 && t.visible_count() == 5);
+    press(w, hardware::key::kDown);
+    CHECK(t.selected() == c1);
+    press(w, hardware::key::kDown);
+    CHECK(t.selected() == g2);
+    press(w, hardware::key::kDown);
+    CHECK(t.selected() == g2);   // (the last shown node)
+    press(w, hardware::key::kEnter);
+    CHECK(t.expanded(g2) && t.visible_count() == 6);
+    press(w, 0x4A);   // Home
+    CHECK(t.selected() == g1);
+    press(w, 0x4D);   // End
+    CHECK(t.selected() == d1);
+    press(w, hardware::key::kSpace);
+    CHECK(t.selected() == d1);   // (no children: nothing to open)
+    press(w, hardware::key::kUp);
+    CHECK(t.selected() == g2);
+    // Closing a group that holds the selection hands it to the group.
+    t.select(a1);
+    CHECK(t.selected() == a1);
+    t.set_expanded(g1, false);
+    CHECK(t.selected() == g1 && t.visible_count() == 3);
+    // select() opens the parents of a node that is hidden.
+    t.select(sub);
+    CHECK(t.expanded(g1) && t.expanded(b1) && t.selected() == sub);
+    CHECK(t.node_at(5, 5) == g1 && t.node_at(5, 295) == -1);
+
+    // The menu belongs to the nodes marked for it: a right click elsewhere opens nothing.
+    ContextMenu menu(a);
+    Counter chosen;
+    menu.add_item("Do it", chosen.handler());
+    t.set_context_menu(&menu);
+    t.set_node_menu(g2, true);
+    CHECK(!t.accepts_context_menu(-1, -1) || t.selected() == g2);
+    t.select(g1);
+    const Point on_g1 = node_point(t, g1), on_g2 = node_point(t, g2);
+    CHECK(!choose_context(w, menu, on_g1.x, on_g1.y, "Do it") && !w.popup());
+    CHECK(choose_context(w, menu, on_g2.x, on_g2.y, "Do it") && chosen.count == 1 && t.selected() == g2);   // (the right click selects it too)
+    // clear() empties it.
+    t.clear();
+    CHECK(t.node_count() == 0 && t.visible_count() == 0 && t.selected() == -1);
+
+    // A tall tree scrolls: the wheel, the scroll bar, and the keys bring the selection into view.
+    for (int i = 0; i < 40; ++i) {
+      String name(a);
+      name.assign("Node ");
+      name.append_uint(static_cast<uint64_t>(i));
+      t.add_node(-1, name.view(), static_cast<uint32_t>(i));
+    }
+    w.layout();
+    CHECK(t.visible_count() == 40);
+    CHECK(t.node_rect(0, &r) && !t.node_rect(39, &r));
+    w.mouse_move(100, 100);
+    w.mouse_wheel(100, 100, -1);
+    CHECK(!t.node_rect(0, &r) && t.node_rect(3, &r));
+    t.select(39);
+    CHECK(t.node_rect(39, &r) && !t.node_rect(0, &r));
+    press(w, 0x4B);   // Page Up
+    CHECK(t.selected() < 39 && t.node_rect(t.selected(), &r));
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+struct FakeInventory final : desktop::IHardwareInventory {
+  desktop::HardwareList list;
+  bool changed = true;
+  explicit FakeInventory(allocators::IAllocator& a) : list(a) {}
+  bool refresh() override { const bool c = changed; changed = false; return c; }
+  uint32_t count() const override { return list.count(); }
+  bool entry(uint32_t i, desktop::HardwareEntry* out) const override {
+    if (i >= list.count()) return false;
+    *out = list.at(i);
+    return true;
+  }
+};
+
+static void test_hardware_tab() {
+  TestAllocator a;
+  {
+    using desktop::HardwareGroup;
+    // The list type itself.
+    desktop::HardwareList one(a), two(a);
+    CHECK(one.add(HardwareGroup::Storage, "Disk", "10 GB") && two.add(HardwareGroup::Storage, "Disk", "10 GB") && one.same_as(two));
+    two.add(HardwareGroup::Audio, "Speaker");
+    CHECK(!one.same_as(two) && two.count() == 2 && two.at(1).group == HardwareGroup::Audio);
+    String longer(a);
+    for (int i = 0; i < 200; ++i) longer.push_back('x');
+    one.add(HardwareGroup::System, longer.view(), longer.view());
+    CHECK(one.at(1).name[63] == 0 && one.at(1).detail[95] == 0 && strlen(one.at(1).name) == 63);
+    CHECK(strcmp(desktop::hardware_group_name(HardwareGroup::Displays), "Displays") == 0 && strcmp(desktop::hardware_group_name(HardwareGroup::DisplayAdapters), "Display adapters") == 0);
+
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::ComputerManager tm(a);
+    FakeInventory inv(a);
+    inv.list.add(HardwareGroup::Processors, "Fake CPU", "Fake CPU, 4 cores");
+    inv.list.add(HardwareGroup::Memory, "2.0 GB of memory", "1.9 GB in the allocator pool");
+    inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1, 1920x1080, primary");
+    inv.list.add(HardwareGroup::Displays, "Monitor B", "HDMI-2, 1280x1024");
+    inv.list.add(HardwareGroup::Storage, "Disk X", "8.0 GB");
+    Counter opened;
+    tm.on_open_display_settings(opened.handler());
+    CHECK(mgr.add_window(&tm));
+    tm.set_hardware_inventory(&inv);
+    tm.tabs().select_page(2);
+    w.layout();
+    TreeView& tree = tm.hardware_tree();
+    // The groups that have devices, in a fixed order, all open at first; Network has none.
+    CHECK(tree.child_count(-1) == 4 && tm.hardware_group_node(HardwareGroup::Network) < 0);
+    const int32_t displays = tm.hardware_group_node(HardwareGroup::Displays), storage = tm.hardware_group_node(HardwareGroup::Storage);
+    CHECK(displays >= 0 && tree.node_text(displays).equals("Displays") && tree.child_count(displays) == 2 && tree.expanded(displays));
+    CHECK(tree.node_text(tree.child_at(displays, 1)).equals("Monitor B") && tree.visible_count() == 4 + 1 + 1 + 2 + 1);
+    CHECK(tm.tabs().selected_page() == 2 && tm.tabs().page_title(2).equals("Hardware") && tree.visible());
+    // The line under the tree tells about the selected device or group.
+    tree.select(tree.child_at(displays, 0));
+    CHECK(tm.hardware_info().text().equals("HDMI-1, 1920x1080, primary"));
+    tree.select(displays);
+    CHECK(tm.hardware_info().text().find(StringView("2 devices")) != StringView::npos && tm.hardware_info().text().find(StringView("Display Settings")) != StringView::npos);
+    tree.select(storage);
+    CHECK(tm.hardware_info().text().equals("1 device"));
+    // Display Settings is in the menu of the Displays group, and of nothing else.
+    const Point on_displays = node_point(tree, displays), on_storage = node_point(tree, storage);
+    CHECK(!choose_context(w, tm.hardware_menu(), on_storage.x, on_storage.y, "Display Settings...") && !w.popup() && opened.count == 0);
+    CHECK(choose_context(w, tm.hardware_menu(), on_displays.x, on_displays.y, "Display Settings...") && opened.count == 1);
+    const Point on_monitor = node_point(tree, tree.child_at(displays, 0));
+    right_click(w, on_monitor.x, on_monitor.y);
+    CHECK(!w.popup() && opened.count == 1);
+
+    // A new look at the machine: another monitor, a network adapter; what was closed stays closed and the selection stays on its device.
+    tree.set_expanded(storage, false);
+    tree.select(tree.child_at(displays, 1));
+    inv.list.add(HardwareGroup::Network, "Fake NIC", "up");
+    inv.changed = true;
+    tm.update(1000000);
+    CHECK(tree.child_count(-1) == 5 && tm.hardware_group_node(HardwareGroup::Network) >= 0);
+    CHECK(!tree.expanded(tm.hardware_group_node(HardwareGroup::Storage)) && tree.expanded(tm.hardware_group_node(HardwareGroup::Displays)));
+    CHECK(tree.selected() >= 0 && tree.node_text(tree.selected()).equals("Monitor B") && tm.hardware_info().text().equals("HDMI-2, 1280x1024"));
+    // Nothing changed: the tree is left alone (a user who scrolled or selected keeps it).
+    const uint32_t nodes = tree.node_count();
+    tm.update(2000000);
+    CHECK(tree.node_count() == nodes && tree.node_text(tree.selected()).equals("Monitor B"));
+    // The View menu has the tab, checked when it is up.
+    CHECK(choose(w, tm.menu_bar(), "View", "Processes") && tm.tabs().selected_page() == 0);
+    CHECK(choose(w, tm.menu_bar(), "View", "Hardware") && tm.tabs().selected_page() == 2);
+    // Without an inventory the tab says so.
+    tm.set_hardware_inventory(nullptr);
+    CHECK(tree.node_count() == 0 && tm.hardware_info().text().find(StringView("No hardware")) != StringView::npos);
+    w.render();
+    mgr.remove_window(&tm);
+  }
+  CHECK(a.live == 0);
+}
+
+// Display Settings is no longer in the Start menu: it is in the menu of the Displays group of the computer manager's hardware tree.
+static void test_display_settings_entry() {
+  TestAllocator a;
+  {
+    using desktop::HardwareGroup;
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    CHECK(d.start_button().menu().item_count() == 9);   // Explorer, Computer Manager, Text Editor, Terminal, Paint, Media Player, About, a line, Shut Down
+    FakeInventory inv(a);
+    inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
+    d.set_hardware_inventory(&inv);
+    d.open_computer_manager();
+    desktop::ComputerManager& cm = d.computer_manager();
+    cm.tabs().select_page(2);
+    d.window().layout();
+    Window& w = d.window();
+    const int32_t displays = cm.hardware_group_node(HardwareGroup::Displays);
+    CHECK(displays >= 0 && !d.display_settings().manager());
+    const Point p = node_point(cm.hardware_tree(), displays);
+    CHECK(choose_context(w, cm.hardware_menu(), p.x, p.y, "Display Settings...") && d.display_settings().manager() != nullptr);
+    CHECK(strcmp(cm.title().data(), "Computer Manager") == 0);
   }
   CHECK(a.live == 0);
 }
@@ -2881,7 +3120,7 @@ static void test_app_menus() {
 
     // --- Task manager
     {
-      desktop::TaskManager tm(a);
+      desktop::ComputerManager tm(a);
       CHECK(mgr.add_window(&tm));
       w.layout();
       MenuBar& bar = tm.menu_bar();
@@ -4026,7 +4265,7 @@ static void test_application_context_menus() {
 
     // --- Task manager: Copy Row.
     {
-      desktop::TaskManager tm(a);
+      desktop::ComputerManager tm(a);
       FakeMonitor mon;
       tm.set_monitor(&mon);
       CHECK(mgr.add_window(&tm));
@@ -4981,7 +5220,10 @@ int main() {
   test_explorer_network();
   test_explorer_nfs();
   test_explorer_sftp_ftps();
-  test_task_manager();
+  test_computer_manager();
+  test_tree_view();
+  test_hardware_tab();
+  test_display_settings_entry();
   test_text_editor();
   test_notepad();
   test_media_player();

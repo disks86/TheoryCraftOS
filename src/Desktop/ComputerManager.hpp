@@ -16,10 +16,12 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The task manager: a window with two tabs. "Processes" is a table of the running kernel threads with their state,
-// core and share of the processor; "Performance" shows the processor load (overall and per core) and memory use. It reads the machine through
-// an ISystemMonitor and refreshes itself when update() is called (the desktop does so once a second while the
-// window is open). Click a column title to sort the table. The File menu closes the window; the View menu picks the tab.
+// The computer manager: a window with three tabs. "Processes" is a table of the running kernel threads with their state,
+// core and share of the processor; "Performance" shows the processor load (overall and per core) and memory use; "Hardware" is a tree of the
+// devices of the machine grouped by kind (processors, memory, display adapters, displays, disk drives, ...), with a line of detail for the selected one.
+// It reads the machine through an ISystemMonitor and an IHardwareInventory and refreshes itself when update() is called (the desktop does so once
+// a second while the window is open). Right-clicking the Displays group of the hardware tree offers Display Settings. The File menu closes the
+// window; the View menu picks the tab.
 #pragma once
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
@@ -27,7 +29,9 @@
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
 #include "Gui/Controls/Panel.hpp"
+#include "Desktop/HardwareInventory.hpp"
 #include "Gui/Controls/TabControl.hpp"
+#include "Gui/Controls/TreeView.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Gui/Windows/Frame.hpp"
 
@@ -54,7 +58,7 @@ struct TaskMemory {
   uint64_t total_bytes = 0, free_bytes = 0;
 };
 
-// Where the task manager gets its numbers (the kernel's, in the real system). All counters only grow.
+// Where the computer manager gets its numbers (the kernel's, in the real system). All counters only grow.
 class ISystemMonitor {
  public:
   // How many ticks a core counts per second (the unit of cpu_ticks, busy_ticks and idle_ticks).
@@ -70,16 +74,20 @@ class ISystemMonitor {
   ~ISystemMonitor() = default;
 };
 
-class TaskManager : public gui::Frame {
+class ComputerManager : public gui::Frame {
  public:
   static constexpr uint32_t kMaxThreads = 256;
   static constexpr uint32_t kMaxCoresShown = 16;
 
-  explicit TaskManager(allocators::IAllocator& allocator);
-  ~TaskManager();
+  explicit ComputerManager(allocators::IAllocator& allocator);
+  ~ComputerManager();
 
-  // The source of the numbers (nullptr: none); it must outlive the task manager.
+  // The source of the numbers (nullptr: none); it must outlive the computer manager.
   void set_monitor(ISystemMonitor* monitor);
+  // The list of devices the Hardware tab shows (nullptr: none); it must outlive the computer manager.
+  void set_hardware_inventory(IHardwareInventory* inventory);
+  // Fired when Display Settings is chosen from the menu of the Displays group.
+  void on_open_display_settings(gui::Handler handler) { open_display_settings_ = handler; }
   // Reads the monitor and refreshes everything. `now_us` is the uptime; load figures are over the time since
   // the previous call.
   void update(uint64_t now_us);
@@ -91,6 +99,11 @@ class TaskManager : public gui::Frame {
   gui::Label& memory_label() { return memory_value_; }
   gui::Label& info_label() { return info_; }
   gui::TabControl& tabs() { return tabs_; }
+  gui::TreeView& hardware_tree() { return tree_; }
+  gui::ContextMenu& hardware_menu() { return hardware_menu_; }
+  gui::Label& hardware_info() { return hardware_info_; }
+  // The tree node of a group (-1 if no device of the group is listed).
+  int32_t hardware_group_node(HardwareGroup group) const;
   gui::MenuBar& menu_bar() { return menu_; }
   // The table's context menu (Copy Row).
   gui::ContextMenu& grid_menu() { return grid_menu_; }
@@ -137,13 +150,25 @@ class TaskManager : public gui::Frame {
   static void on_copy_row(void* self, gui::Control&);
   static void on_grid_menu_opening(void* self, gui::Control&);
   static void on_tab_changed(void* self, gui::Control&);
+  static void on_show_hardware(void* self, gui::Control&);
+  static void on_hardware_selection(void* self, gui::Control&);
+  static void on_hardware_menu_opening(void* self, gui::Control&);
+  static void on_display_settings_item(void* self, gui::Control&);
+  void rebuild_hardware();
 
   gui::MenuBar menu_;
   gui::ContextMenu grid_menu_;
   gui::MenuItem* copy_row_item_ = nullptr;
-  gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr;
+  gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr, *hardware_item_ = nullptr;
   gui::TabControl tabs_;
-  gui::Panel processes_page_, performance_page_, cpu_row_, memory_row_;
+  gui::Panel processes_page_, performance_page_, hardware_page_, cpu_row_, memory_row_;
+  gui::TreeView tree_;
+  gui::ContextMenu hardware_menu_;
+  gui::MenuItem* display_settings_item_ = nullptr;
+  gui::Label hardware_info_;
+  IHardwareInventory* inventory_ = nullptr;
+  gui::Handler open_display_settings_;
+  int32_t group_nodes_[kHardwareGroupCount] = {};
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
   gui::LevelMeter cpu_meter_, memory_meter_;
   gui::DataGrid grid_;

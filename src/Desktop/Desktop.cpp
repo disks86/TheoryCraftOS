@@ -45,7 +45,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       color_dialog_(allocator),
       print_dialog_(allocator),
       explorer_(allocator),
-      task_manager_(allocator),
+      computer_manager_(allocator),
       notepad_(allocator),
       paint_(allocator),
       terminal_(allocator),
@@ -70,12 +70,11 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.set_direction(MenuButton::Direction::Up);
   start_.set_menu_min_width(200);
   start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
-  start_.menu().add_item("Task Manager", {&Desktop::on_task_manager, this});
+  start_.menu().add_item("Computer Manager", {&Desktop::on_computer_manager, this});
   start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
-  start_.menu().add_item("Display Settings...", {&Desktop::on_display_settings, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -140,6 +139,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.add(&surface_);
   window_.show_cursor(mouse != nullptr);
   display_settings_.on_changed({&Desktop::on_settings_changed, this});
+  computer_manager_.on_open_display_settings({&Desktop::on_display_settings, this});
   input_.set_confine(&Desktop::confine_pointer, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
@@ -357,12 +357,12 @@ uint32_t Desktop::paint_count() const {
   return n;
 }
 
-void Desktop::open_task_manager() {
-  if (task_manager_.manager()) {
-    task_manager_.activate();
+void Desktop::open_computer_manager() {
+  if (computer_manager_.manager()) {
+    computer_manager_.activate();
   } else {
-    task_manager_.update(now_us_);
-    windows_.add_window(&task_manager_);
+    computer_manager_.update(now_us_);
+    windows_.add_window(&computer_manager_);
   }
 }
 
@@ -520,7 +520,7 @@ void Desktop::open_about() {
 
 void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 
-void Desktop::on_task_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_task_manager(); }
+void Desktop::on_computer_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_computer_manager(); }
 void Desktop::on_paint(void* self, Control&) { static_cast<Desktop*>(self)->open_paint(); }
 void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self)->open_media_player(); }
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
@@ -659,7 +659,7 @@ void Desktop::pump(uint64_t uptime_us) {
   }
   if (second != polled_second_) {
     polled_second_ = second;
-    if (task_manager_.manager()) task_manager_.update(uptime_us);
+    if (computer_manager_.manager()) computer_manager_.update(uptime_us);
     DateTime now;
     const bool ok = clock_source_ && clock_source_(clock_context_, &now);
     // The label only changes when the minute does; ~0 stands for "no time".

@@ -16,11 +16,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The task manager's view of the running machine: the kernel's threads and cores and the allocator's memory.
+// The computer manager's view of the running machine: the kernel's threads and cores and the allocator's memory.
 #pragma once
 #include "Allocators/Allocator.hpp"
 #include "Allocators/ThreadSafeAllocator.hpp"
-#include "Desktop/TaskManager.hpp"
+#include "Desktop/ComputerManager.hpp"
 
 class SystemMonitor final : public desktop::ISystemMonitor {
  public:

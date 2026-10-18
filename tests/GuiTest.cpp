@@ -1205,13 +1205,12 @@ static void test_desktop() {
     d.step(5000000);
     CHECK(start.open());
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // File Explorer
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Task Manager
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Computer Manager
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Text Editor
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Terminal
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Paint
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Media Player
     d.step(5500000);
-    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Display Settings
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);

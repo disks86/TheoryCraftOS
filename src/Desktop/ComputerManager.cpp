@@ -16,8 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "Desktop/TaskManager.hpp"
+#include "Desktop/ComputerManager.hpp"
 #include "Desktop/Format.hpp"
+#include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
 
@@ -25,7 +26,7 @@ namespace desktop {
 
 using namespace gui;
 
-bool TaskManager::Model::cell_text(uint32_t row, uint32_t column, String* out) const {
+bool ComputerManager::Model::cell_text(uint32_t row, uint32_t column, String* out) const {
   out->clear();
   if (row >= rows.count()) return true;
   const Row& r = rows[row];
@@ -44,13 +45,14 @@ bool TaskManager::Model::cell_text(uint32_t row, uint32_t column, String* out) c
   }
 }
 
-TaskManager::TaskManager(allocators::IAllocator& allocator)
+ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
       grid_menu_(allocator),
       tabs_(allocator),
       processes_page_(allocator),
       performance_page_(allocator),
+      hardware_page_(allocator),
       cpu_row_(allocator),
       memory_row_(allocator),
       cpu_title_(allocator),
@@ -58,6 +60,9 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
       memory_title_(allocator),
       memory_value_(allocator),
       info_(allocator),
+      tree_(allocator),
+      hardware_menu_(allocator),
+      hardware_info_(allocator),
       cpu_meter_(allocator),
       memory_meter_(allocator),
       grid_(allocator),
@@ -66,22 +71,24 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
       previous_cores_(allocator),
       previous_threads_(allocator) {
   buffer_ = allocate_view<TaskThread>(allocator, kMaxThreads);
-  set_title("Task Manager");
+  for (int32_t& node : group_nodes_) node = -1;
+  set_title("Computer Manager");
   set_bounds({90, 40, 480, 430});
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
 
   menu_.set_dock(DockStyle::Top);
   menu_.set_size(0, 22);
-  if (Menu* file = menu_.add_menu("File")) file->add_item("Close", {&TaskManager::on_close_window, this});
+  if (Menu* file = menu_.add_menu("File")) file->add_item("Close", {&ComputerManager::on_close_window, this});
   if (Menu* view = menu_.add_menu("View")) {
-    processes_item_ = view->add_item("Processes", {&TaskManager::on_show_processes, this});
-    performance_item_ = view->add_item("Performance", {&TaskManager::on_show_performance, this});
+    processes_item_ = view->add_item("Processes", {&ComputerManager::on_show_processes, this});
+    performance_item_ = view->add_item("Performance", {&ComputerManager::on_show_performance, this});
+    hardware_item_ = view->add_item("Hardware", {&ComputerManager::on_show_hardware, this});
   }
-  copy_row_item_ = grid_menu_.add_item("Copy Row", {&TaskManager::on_copy_row, this}, "Ctrl+C");
-  grid_menu_.on_opening(Handler::immediate(&TaskManager::on_grid_menu_opening, this));
+  copy_row_item_ = grid_menu_.add_item("Copy Row", {&ComputerManager::on_copy_row, this}, "Ctrl+C");
+  grid_menu_.on_opening(Handler::immediate(&ComputerManager::on_grid_menu_opening, this));
   tabs_.set_dock(DockStyle::Fill);
-  tabs_.on_selection_changed(Handler::immediate(&TaskManager::on_tab_changed, this));
+  tabs_.on_selection_changed(Handler::immediate(&ComputerManager::on_tab_changed, this));
   processes_page_.set_style(PanelStyle::Transparent);
   processes_page_.set_padding(Insets::all(4));
   performance_page_.set_style(PanelStyle::Transparent);
@@ -126,39 +133,140 @@ TaskManager::TaskManager(allocators::IAllocator& allocator)
   grid_.set_dock(DockStyle::Fill);
   grid_.set_context_menu(&grid_menu_);
 
+  // The Hardware tab: the tree, and a line about the selected device under it. The Displays group has a menu of its own.
+  hardware_page_.set_style(PanelStyle::Transparent);
+  hardware_page_.set_padding(Insets::all(4));
+  hardware_info_.set_dock(DockStyle::Bottom);
+  hardware_info_.set_size(0, 22);
+  tree_.set_dock(DockStyle::Fill);
+  tree_.on_selection_changed(Handler::immediate(&ComputerManager::on_hardware_selection, this));
+  tree_.set_context_menu(&hardware_menu_);
+  display_settings_item_ = hardware_menu_.add_item("Display Settings...", {&ComputerManager::on_display_settings_item, this});
+  hardware_page_.add(&hardware_info_);
+  hardware_page_.add(&tree_);
+
   processes_page_.add(&grid_);
   tabs_.add_page("Processes", &processes_page_);
   tabs_.add_page("Performance", &performance_page_);
+  tabs_.add_page("Hardware", &hardware_page_);
   add(&menu_);
   add(&tabs_);
   on_tab_changed(this, tabs_);
 }
 
-LevelMeter* TaskManager::core_meter(uint32_t index) {
+LevelMeter* ComputerManager::core_meter(uint32_t index) {
   return index < core_rows_.count() && core_rows_[index]->row.visible() ? &core_rows_[index]->meter : nullptr;
 }
 
-Label* TaskManager::core_label(uint32_t index) {
+Label* ComputerManager::core_label(uint32_t index) {
   return index < core_rows_.count() && core_rows_[index]->row.visible() ? &core_rows_[index]->value : nullptr;
 }
 
-void TaskManager::on_tab_changed(void* self, Control&) {  // the View menu shows which tab is up
-  auto* t = static_cast<TaskManager*>(self);
+void ComputerManager::on_tab_changed(void* self, Control&) {  // the View menu shows which tab is up
+  auto* t = static_cast<ComputerManager*>(self);
   if (t->processes_item_) t->processes_item_->set_checked(t->tabs_.selected_page() == 0);
   if (t->performance_item_) t->performance_item_->set_checked(t->tabs_.selected_page() == 1);
+  if (t->hardware_item_) t->hardware_item_->set_checked(t->tabs_.selected_page() == 2);
 }
-void TaskManager::on_show_processes(void* self, Control&) { static_cast<TaskManager*>(self)->tabs_.select_page(0); }
-void TaskManager::on_show_performance(void* self, Control&) { static_cast<TaskManager*>(self)->tabs_.select_page(1); }
-void TaskManager::on_copy_row(void* self, Control&) { static_cast<TaskManager*>(self)->grid_.copy_selected_row(); }
-void TaskManager::on_grid_menu_opening(void* self, Control&) {
-  auto* t = static_cast<TaskManager*>(self);
+void ComputerManager::on_show_processes(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(0); }
+void ComputerManager::on_show_performance(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(1); }
+void ComputerManager::on_show_hardware(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(2); }
+void ComputerManager::on_display_settings_item(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  t->fire(t->open_display_settings_);
+}
+void ComputerManager::on_copy_row(void* self, Control&) { static_cast<ComputerManager*>(self)->grid_.copy_selected_row(); }
+void ComputerManager::on_grid_menu_opening(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
   t->copy_row_item_->set_enabled(t->grid_.selected_row() >= 0);
 }
-void TaskManager::on_close_window(void* self, Control&) { static_cast<TaskManager*>(self)->close(); }
+void ComputerManager::on_close_window(void* self, Control&) { static_cast<ComputerManager*>(self)->close(); }
 
-TaskManager::~TaskManager() { release_view(allocator(), buffer_); }
+// --- The Hardware tab ---------------------------------------------------------------------------------
 
-void TaskManager::set_monitor(ISystemMonitor* monitor) {
+void ComputerManager::set_hardware_inventory(IHardwareInventory* inventory) {
+  UiGuard lock(this);
+  inventory_ = inventory;
+  if (inventory_) inventory_->refresh();
+  tree_.clear();
+  rebuild_hardware();
+}
+
+int32_t ComputerManager::hardware_group_node(HardwareGroup group) const { return group_nodes_[static_cast<uint32_t>(group)]; }
+
+// Fills the tree from the inventory: the groups that have devices, in a fixed order, each with its devices. What was open and what was selected
+// stays so (the first time, every group is open).
+void ComputerManager::rebuild_hardware() {
+  UiGuard lock(this);
+  const bool first = tree_.node_count() == 0;
+  uint32_t open_mask = 0;
+  for (uint32_t g = 0; g < kHardwareGroupCount; ++g)
+    if (group_nodes_[g] >= 0 && tree_.expanded(group_nodes_[g])) open_mask |= 1u << g;
+  String selected_name(allocator());
+  uint32_t selected_tag = ~0u;
+  if (tree_.selected() >= 0) {
+    selected_name.assign(tree_.node_text(tree_.selected()));
+    selected_tag = tree_.node_tag(tree_.selected());
+  }
+  tree_.clear();
+  for (int32_t& node : group_nodes_) node = -1;
+  if (!inventory_) {
+    hardware_info_.set_text("No hardware information is available.");
+    return;
+  }
+  const uint32_t count = inventory_->count();
+  for (uint32_t g = 0; g < kHardwareGroupCount; ++g) {
+    int32_t node = -1;
+    for (uint32_t i = 0; i < count; ++i) {
+      HardwareEntry e;
+      if (!inventory_->entry(i, &e) || static_cast<uint32_t>(e.group) != g) continue;
+      if (node < 0) {
+        node = tree_.add_node(-1, hardware_group_name(static_cast<HardwareGroup>(g)), 0x10000u | g, ItemIcon::Folder);
+        if (node < 0) break;
+        group_nodes_[g] = node;
+      }
+      tree_.add_node(node, e.name, i, g == static_cast<uint32_t>(HardwareGroup::Storage) ? ItemIcon::Drive : ItemIcon::File);
+    }
+    if (node < 0) continue;
+    if (first || (open_mask & (1u << g))) tree_.set_expanded(node, true);
+    if (g == static_cast<uint32_t>(HardwareGroup::Displays)) tree_.set_node_menu(node, true);   // (the only menu: Display Settings)
+  }
+  // The selection: the same device, or the same group.
+  for (uint32_t n = 0; selected_tag != ~0u && n < tree_.node_count(); ++n) {
+    const bool group = (selected_tag & 0x10000u) != 0;
+    if ((group && tree_.node_tag(static_cast<int32_t>(n)) == selected_tag) ||
+        (!group && tree_.node_tag(static_cast<int32_t>(n)) < 0x10000u && tree_.node_text(static_cast<int32_t>(n)).equals(selected_name.view()))) {
+      tree_.select(static_cast<int32_t>(n));
+      break;
+    }
+  }
+  if (tree_.selected() < 0 && tree_.node_count()) tree_.select(0);
+  on_hardware_selection(this, tree_);
+}
+
+void ComputerManager::on_hardware_selection(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  const int32_t node = t->tree_.selected();
+  if (node < 0 || !t->inventory_) {
+    t->hardware_info_.set_text(StringView());
+    return;
+  }
+  const uint32_t tag = t->tree_.node_tag(node);
+  String text(t->allocator());
+  if (tag & 0x10000u) {
+    text.append_uint(t->tree_.child_count(node));
+    text.append(t->tree_.child_count(node) == 1 ? " device" : " devices");
+    if ((tag & 0xFFFFu) == static_cast<uint32_t>(HardwareGroup::Displays)) text.append(" - right-click for Display Settings");
+  } else {
+    HardwareEntry e;
+    if (t->inventory_->entry(tag, &e)) text.assign(e.detail[0] ? StringView(e.detail) : StringView(e.name));
+  }
+  t->hardware_info_.set_text(text.view());
+}
+
+ComputerManager::~ComputerManager() { release_view(allocator(), buffer_); }
+
+void ComputerManager::set_monitor(ISystemMonitor* monitor) {
   monitor_ = monitor;
   have_previous_ = false;
   previous_cores_.clear();
@@ -166,14 +274,15 @@ void TaskManager::set_monitor(ISystemMonitor* monitor) {
   model_.ticks_per_second = monitor ? monitor->ticks_per_second() : 1000;
 }
 
-int32_t TaskManager::thread_load_tenths(uint64_t id) const {
+int32_t ComputerManager::thread_load_tenths(uint64_t id) const {
   for (const Row& r : model_.rows)
     if (r.id == id && !r.idle) return static_cast<int32_t>(r.tenths);
   return -1;
 }
 
-void TaskManager::update(uint64_t now_us) {
+void ComputerManager::update(uint64_t now_us) {
   UiGuard lock(this);
+  if (inventory_ && inventory_->refresh()) rebuild_hardware();
   if (!monitor_ || buffer_.empty()) {
     info_.set_text("No system monitor available");
     return;

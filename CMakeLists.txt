@@ -225,11 +225,13 @@ add_executable(BOOTX64
   src/SystemPrintService.cpp
   src/Gui/Controls/SpinBox.cpp
   src/Gui/Controls/ColorSpectrum.cpp
-  src/Desktop/TaskManager.cpp
+  src/Desktop/ComputerManager.cpp
+  src/Desktop/HardwareInventory.cpp
   src/Desktop/Notepad.cpp
   src/Desktop/Paint.cpp
   src/Desktop/MediaPlayer.cpp
   src/SystemMonitor.cpp
+  src/SystemInventory.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
   src/GuiDemo.cpp
@@ -242,6 +244,7 @@ add_executable(BOOTX64
   src/Gui/Controls/Label.cpp
   src/Gui/Controls/ProgressBar.cpp
   src/Gui/Controls/TerminalView.cpp
+  src/Gui/Controls/TreeView.cpp
   src/Gui/Controls/Button.cpp
   src/Gui/Controls/TextBox.cpp
   src/Gui/Controls/DropDown.cpp

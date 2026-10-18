@@ -32,6 +32,7 @@
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
+#include "SystemInventory.hpp"
 #include "BootLog.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/SystemGraphics.hpp"
@@ -680,6 +681,22 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       Entry(Level::Ok, "MIDI").text(info.name).text(info.input ? (info.output ? ": keys and output" : ": keys") : ": output").text(info.synthesizer ? ", a synthesizer" : "");
   }
 
+  // What the computer manager's Hardware tab lists: every subsystem above, looked at again once a second (hot-plugged devices come and go).
+  SystemInventory inventory(shared_allocator);
+  inventory.set_cpu(&cpu);
+  inventory.set_memory(ram.total_bytes(), ram.usable_bytes());
+  inventory.set_gpu(gpu);
+  inventory.set_monitors(&monitors);
+  inventory.set_storage(&storage);
+  inventory.set_network(&network);
+  inventory.set_audio(&audio);
+  inventory.set_midi(&usb_midi, &midi_usual);
+  inventory.set_input(&input);
+  inventory.set_usb(&usb);
+  inventory.set_printers(&printers);
+  inventory.set_cameras(&cameras);
+  inventory.set_pci(&pci);
+
   // The desktop: runs until Shut Down is chosen from the Start menu (or, with no display, until a key).
   // Several monitors: the display becomes one surface as big as all of them side by side, and the renderer is built again for that size.
   if (gpu && monitors.layout().count() > 1) {
@@ -740,6 +757,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_monitors(&monitors);
+    desktop.set_hardware_inventory(&inventory);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
     desktop.set_midi_output(&usb_midi);
     desktop.set_clipboard(&clipboard);

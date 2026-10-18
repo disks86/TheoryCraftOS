@@ -92,7 +92,7 @@ void detach(Thread* thread);
 // leaving one).
 uint32_t reap_zombies();
 
-// --- Monitoring (the task manager). Cumulative counters; a tick is 1 / tick_rate() seconds on one core.
+// --- Monitoring (the computer manager). Cumulative counters; a tick is 1 / tick_rate() seconds on one core.
 struct ThreadInfo {
   uint64_t id = 0;
   char name[24] = {};
