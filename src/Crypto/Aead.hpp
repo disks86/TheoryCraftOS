@@ -72,4 +72,7 @@ void poly1305(const uint8_t key[32], ConstByteView data, uint8_t tag[16]);
 void x25519_public_key(const uint8_t private_key[32], uint8_t public_key[32]);
 bool x25519_shared_secret(const uint8_t private_key[32], const uint8_t peer_public[32], uint8_t secret[32]);
 
+// Ed25519 (RFC 8032) signature check: true if `signature` (64 bytes) is valid for `message` under `public_key`.
+bool ed25519_verify(const uint8_t public_key[32], ConstByteView message, const uint8_t signature[64]);
+
 }  // namespace crypto

@@ -201,7 +201,7 @@ static void test_status_mapping() {
 }
 
 // A network that cannot reach anything: the parts of the filesystem that need no server.
-struct NoNetwork final : ISmbNetwork {
+struct NoNetwork final : IServerNetwork {
   int attempts = 0;
   filesystem::Status connect(StringView, uint16_t, uint32_t, SharedPointer<ITcpSocket>*, INetworkStack**) override {
     ++attempts;

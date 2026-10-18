@@ -101,6 +101,8 @@ class TlsSocket final : public ITcpSocket {
   const char* cipher_suite_name() const { return suite_ ? suite_->name : ""; }
   const char* alpn_selected() const { return alpn_selected_; }
   bool extended_master_secret() const { return ems_; }
+  // The server's certificate (DER) once the handshake is done: what a program that pins certificates compares.
+  ConstByteView server_certificate() const { return server_certificate_.view(); }
 
  private:
   enum class St : uint8_t {
@@ -156,6 +158,7 @@ class TlsSocket final : public ITcpSocket {
   uint64_t started_ms_ = 0;
 
   UniquePointer<Handshake> hs_;
+  ByteBuffer server_certificate_;
   const tls::CipherSuite* suite_ = nullptr;
   bool tls13_ = false, ems_ = false;
   char alpn_selected_[32] = {};

@@ -51,7 +51,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
       delete_path_(allocator),
       credentials_dialog_(allocator),
       pending_path_(allocator),
-      last_user_(allocator) {
+      last_user_(allocator), last_uid_(allocator), last_gid_(allocator) {
   set_title("File Explorer");
   set_bounds({60, 40, 540, 360});
   set_padding(Insets::all(4));
@@ -87,6 +87,9 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     go->add_item("Address", {&FileExplorer::on_address_menu, this}, "Ctrl+L");
     go->add_separator();
     go->add_item("Network", {&FileExplorer::on_network_menu, this});
+    go->add_item("NFS", {&FileExplorer::on_nfs_menu, this});
+    go->add_item("SFTP", {&FileExplorer::on_sftp_menu, this});
+    go->add_item("FTPS", {&FileExplorer::on_ftps_menu, this});
     go->add_item("Connect to Server...", {&FileExplorer::on_connect_menu, this});
   }
 
@@ -365,8 +368,18 @@ bool FileExplorer::parse_network_address(allocators::IAllocator& allocator, Stri
   address = StringView(address).trimmed();
   StringView rest;
   bool backslashes = false;
+  const char* folder = kNetworkFolder;
   if (address.size() >= 6 && address.first(6).equals_ignore_case("smb://")) {
     rest = address.substr(6);
+  } else if (address.size() >= 6 && address.first(6).equals_ignore_case("nfs://")) {
+    rest = address.substr(6);
+    folder = kNfsFolder;
+  } else if (address.size() >= 7 && address.first(7).equals_ignore_case("sftp://")) {
+    rest = address.substr(7);
+    folder = kSftpFolder;
+  } else if (address.size() >= 7 && address.first(7).equals_ignore_case("ftps://")) {
+    rest = address.substr(7);
+    folder = kFtpsFolder;
   } else if (address.size() >= 2 && address[0] == '\\' && address[1] == '\\') {   // \\server\share
     rest = address.substr(2);
     backslashes = true;
@@ -393,7 +406,7 @@ bool FileExplorer::parse_network_address(allocators::IAllocator& allocator, Stri
   }
   // Drop a trailing slash, collapse the rest into the tree's path.
   String tree(allocator);
-  if (!tree.push_back('/') || !tree.append(kNetworkFolder)) return false;
+  if (!tree.push_back('/') || !tree.append(folder)) return false;
   String decoded(allocator);
   if (!percent_decode(t, &decoded)) return false;
   uint64_t i = 0;
@@ -408,12 +421,45 @@ bool FileExplorer::parse_network_address(allocators::IAllocator& allocator, Stri
   return path->assign(tree.view());
 }
 
+// Which network folder a path is in: 1 for /Network (SMB), 2 for /NFS, 3 for /SFTP, 4 for /FTPS; *prefix gets the length of "/Network/" and the like
+// (0 for none).
+static int network_kind(StringView path, uint64_t* prefix) {
+  static const char* const folders[] = {"/Network/", "/NFS/", "/SFTP/", "/FTPS/"};
+  *prefix = 0;
+  for (int i = 0; i < 4; ++i) {
+    const StringView folder(folders[i]);
+    if (path.size() > folder.size() && path.first(folder.size()).equals_ignore_case(folder)) {
+      *prefix = folder.size();
+      return i + 1;
+    }
+  }
+  return 0;
+}
+
+FileExplorer::LoginFunction FileExplorer::login_of(int kind, void** context) const {
+  switch (kind) {
+    case 1: *context = login_context_; return login_;
+    case 2: *context = nfs_login_context_; return nfs_login_;
+    case 3: *context = sftp_login_context_; return sftp_login_;
+    case 4: *context = ftps_login_context_; return ftps_login_;
+    default: *context = nullptr; return nullptr;
+  }
+}
+
+static StringView first_part(StringView rest) {
+  const uint64_t slash = rest.find('/');
+  return slash == StringView::npos ? rest : rest.first(slash);
+}
+
 // Opens a folder; a network server's request for a login is answered by asking the user. False if the folder was not opened.
 bool FileExplorer::open_or_ask(StringView path) {
-  const bool network = path.size() > 8 && path.first(9).equals_ignore_case("/Network/");
+  uint64_t prefix = 0;
+  const int kind = network_kind(path, &prefix);
+  const bool network = kind != 0;
   if (network) status_.set_text("Connecting...");
   if (open_folder(path)) return true;
-  if (network && (last_status_ == Status::LoginRequired || last_status_ == Status::LoginFailed || last_status_ == Status::AccessDenied) && login_) {
+  void* unused = nullptr;
+  if (network && (last_status_ == Status::LoginRequired || last_status_ == Status::LoginFailed || last_status_ == Status::AccessDenied) && login_of(kind, &unused)) {
     update_status();
     ask_login(path, last_status_);
   } else if (network) {
@@ -425,11 +471,13 @@ bool FileExplorer::open_or_ask(StringView path) {
 bool FileExplorer::go_to(StringView address) {
   String path(allocator()), user(allocator()), password(allocator());
   if (parse_network_address(allocator(), address, &path, &user, &password)) {
-    if ((!user.empty() || !password.empty()) && login_) {   // a login in the address itself
-      const StringView rest = path.size() > 9 ? path.view().substr(9) : StringView();
-      const uint64_t slash = rest.find('/');
-      const StringView server = slash == StringView::npos ? rest : rest.first(slash);
-      if (!server.empty()) login_(login_context_, server, user.view(), password.view());
+    uint64_t prefix = 0;
+    const int kind = network_kind(path.view(), &prefix);
+    void* context = nullptr;
+    LoginFunction login = login_of(kind, &context);
+    if ((!user.empty() || !password.empty()) && login) {   // a login in the address itself
+      const StringView server = first_part(path.view().substr(prefix));
+      if (!server.empty()) login(context, server, user.view(), password.view());
     }
     return open_or_ask(path.view());
   }
@@ -440,24 +488,36 @@ bool FileExplorer::go_to(StringView address) {
 
 void FileExplorer::ask_login(StringView path, Status why) {
   if (!manager()) return;
-  StringView rest = path.substr(9);   // after "/Network/"
-  const uint64_t slash = rest.find('/');
-  const StringView server = slash == StringView::npos ? rest : rest.first(slash);
+  uint64_t prefix = 0;
+  const int kind = network_kind(path, &prefix);
+  if (kind == 0) return;
+  const StringView server = first_part(path.substr(prefix));
   if (server.empty()) return;
   pending_path_.assign(path);
-  const char* note = why == Status::LoginFailed ? "The user name or password was not accepted." : why == Status::AccessDenied ? "Access was denied. Try another account." : "";
-  credentials_dialog_.show(*manager(), server, note, last_user_.view(), {&FileExplorer::on_login_answer, this});
+  const char* note = kind == 2 ? (why == Status::AccessDenied ? "Access was denied. Try other user and group ids." : "")
+                               : why == Status::LoginFailed ? "The user name or password was not accepted." : why == Status::AccessDenied ? "Access was denied. Try another account." : "";
+  credentials_dialog_.show(*manager(), server, note, kind == 2 ? last_uid_.view() : last_user_.view(), {&FileExplorer::on_login_answer, this},
+                           kind == 2 ? CredentialsDialog::Style::UnixIds : CredentialsDialog::Style::Login, kind == 2 ? last_gid_.view() : StringView());
 }
 
 void FileExplorer::on_login_answer(void* self, Control&) {
   auto* e = static_cast<FileExplorer*>(self);
   CredentialsDialog& d = e->credentials_dialog_;
-  if (!d.accepted() || !e->login_) {
+  uint64_t prefix = 0;
+  const int kind = network_kind(e->pending_path_.view(), &prefix);
+  void* context = nullptr;
+  LoginFunction login = e->login_of(kind, &context);
+  if (!d.accepted() || !login) {
     d.clear();
     return;
   }
-  e->last_user_.assign(d.user());
-  e->login_(e->login_context_, d.server(), d.user(), d.password());
+  if (kind == 2) {
+    e->last_uid_.assign(d.user());
+    e->last_gid_.assign(d.password());
+  } else {
+    e->last_user_.assign(d.user());
+  }
+  login(context, d.server(), d.user(), d.password());
   d.clear();
   String path(e->allocator());
   path.assign(e->pending_path_.view());
@@ -466,6 +526,9 @@ void FileExplorer::on_login_answer(void* self, Control&) {
 
 void FileExplorer::on_connect_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->address_.begin_edit("smb://"); }
 void FileExplorer::on_network_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->open_or_ask("/Network"); }
+void FileExplorer::on_nfs_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->open_or_ask("/NFS"); }
+void FileExplorer::on_sftp_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->open_or_ask("/SFTP"); }
+void FileExplorer::on_ftps_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->open_or_ask("/FTPS"); }
 
 // The list's menu is enabled for what is selected and shows the view in use.
 void FileExplorer::on_list_menu_opening(void* self, Control&) {

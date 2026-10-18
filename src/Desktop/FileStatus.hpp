@@ -41,6 +41,7 @@ inline const char* describe_status(filesystem::Status status) {
     case Status::AccessDenied: return "access denied";
     case Status::LoginRequired: return "a user name and password are needed";
     case Status::LoginFailed: return "the user name or password was refused";
+    case Status::UntrustedHost: return "the server's identity has changed or cannot be trusted";
     case Status::Network: return "the network share could not be reached";
     default: return "failed";
   }

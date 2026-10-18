@@ -1048,9 +1048,10 @@ struct LockedNetworkFs final : filesystem::IFileSystem {
   explicit LockedNetworkFs(filesystem::RamFileSystem& inner) : ram(inner) {}
   filesystem::RamFileSystem& ram;
   bool unlocked = false;
+  const char* locked_prefix = "/Network/srv";
   filesystem::Status failure = filesystem::Status::LoginRequired;
   filesystem::FileSystemInfo info() const override { return ram.info(); }
-  filesystem::Status gate(StringView path) const { return path.starts_with(StringView("/Network/srv")) && !unlocked ? failure : filesystem::Status::Ok; }
+  filesystem::Status gate(StringView path) const { return path.starts_with(StringView(locked_prefix)) && !unlocked ? failure : filesystem::Status::Ok; }
   filesystem::Status open_file(StringView p, filesystem::OpenMode m, UniquePointer<filesystem::IFile>* f) override { return ram.open_file(p, m, f); }
   filesystem::Status open_directory(StringView p, UniquePointer<filesystem::IDirectory>* d) override {
     const filesystem::Status g = gate(p);
@@ -1158,6 +1159,134 @@ static void test_explorer_network() {
     press(w, key::kEnter);
     CHECK(!dialog.showing() && ex.status_label().text().find("Cannot open") != StringView::npos);
     mgr.remove_window(&ex);
+  }
+  CHECK(a.live == 0);
+}
+
+// NFS: its own folder, addresses with user and group ids, and a dialog that asks for ids instead of a password.
+static bool record_nfs_login(void* context, StringView server, StringView uid, StringView gid) {
+  auto* r = static_cast<LoginRecord*>(context);
+  ++r->calls;
+  r->server.assign(server.data(), server.size());
+  r->user.assign(uid.data(), uid.size());
+  r->password.assign(gid.data(), gid.size());
+  r->fs->unlocked = r->user == "1000";
+  return true;
+}
+
+static void test_explorer_nfs() {
+  TestAllocator a;
+  {
+    using desktop::FileExplorer;
+    String path(a), user(a), password(a);
+    CHECK(FileExplorer::parse_network_address(a, "nfs://srv/export/data", &path, &user, &password) && path.view().equals("/NFS/srv/export/data") && user.empty());
+    CHECK(FileExplorer::parse_network_address(a, "NFS://srv:2049//export///data/", &path, &user, &password) && path.view().equals("/NFS/srv:2049/export/data"));
+    CHECK(FileExplorer::parse_network_address(a, "nfs://", &path, &user, &password) && path.view().equals("/NFS"));
+    CHECK(FileExplorer::parse_network_address(a, "nfs://1000:100@srv/export", &path, &user, &password) && path.view().equals("/NFS/srv/export") && user.view().equals("1000") && password.view().equals("100"));
+    CHECK(!FileExplorer::parse_network_address(a, "/NFS/srv", &path, &user, &password));
+
+    filesystem::RamFileSystem ram(a);
+    CHECK(ram.create_directory("/NFS") == filesystem::Status::Ok && ram.create_directory("/NFS/srv") == filesystem::Status::Ok);
+    CHECK(ram.create_directory("/NFS/srv/export") == filesystem::Status::Ok && ram.create_directory("/NFS/srv/export/data") == filesystem::Status::Ok);
+    make_file(ram, "/NFS/srv/export/data/a.txt", "hello");
+    LockedNetworkFs fs(ram);
+    fs.locked_prefix = "/NFS/srv";
+    fs.failure = filesystem::Status::AccessDenied;
+    LoginRecord record;
+    record.fs = &fs;
+
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::FileExplorer ex(a);
+    ex.set_file_system(&fs);
+    ex.set_nfs_login_handler(record_nfs_login, &record);
+    CHECK(mgr.add_window(&ex));
+    w.layout();
+    desktop::CredentialsDialog& dialog = ex.credentials_dialog();
+
+    // Denied: the dialog asks for ids (65534 to start with, in plain text) and says why; other ids open the folder.
+    CHECK(!ex.go_to("nfs://srv/export/data") && dialog.showing() && dialog.server().equals("srv"));
+    CHECK(dialog.user().equals("65534") && dialog.password().equals("65534") && !dialog.password_box().password());
+    CHECK(dialog.note_label().text().size() > 6 && dialog.note_label().text().first(6).equals("Access"));
+    dialog.user_box().set_text("1000");
+    dialog.password_box().set_text("100");
+    click_center(w, dialog.ok_button());
+    CHECK(!dialog.showing() && record.calls == 1 && record.server == "srv" && record.user == "1000" && record.password == "100");
+    CHECK(ex.path().equals("/NFS/srv/export/data") && ex.view().item_count() == 1);
+    // Ids in the address go straight to the handler.
+    fs.unlocked = false;
+    CHECK(ex.go_to("nfs://1000:5@srv/export") && record.calls == 2 && record.password == "5" && ex.path().equals("/NFS/srv/export"));
+    // The next sign-in remembers what was typed.
+    fs.unlocked = false;
+    CHECK(!ex.go_to("nfs://srv/export/data") && dialog.showing() && dialog.user().equals("1000") && dialog.password().equals("100"));
+    click_center(w, dialog.cancel_button());
+    CHECK(!dialog.showing() && record.calls == 2);
+    mgr.remove_window(&ex);
+  }
+  CHECK(a.live == 0);
+}
+
+// SFTP and FTPS: their own folders and addresses, signed in to with a user name and a password.
+static void test_explorer_sftp_ftps() {
+  TestAllocator a;
+  {
+    using desktop::FileExplorer;
+    String path(a), user(a), password(a);
+    CHECK(FileExplorer::parse_network_address(a, "sftp://srv/home/me", &path, &user, &password) && path.view().equals("/SFTP/srv/home/me") && user.empty());
+    CHECK(FileExplorer::parse_network_address(a, "SFTP://me:p%40ss@srv:2222/", &path, &user, &password) && path.view().equals("/SFTP/srv:2222") && user.view().equals("me") && password.view().equals("p@ss"));
+    CHECK(FileExplorer::parse_network_address(a, "ftps://srv/pub//docs/", &path, &user, &password) && path.view().equals("/FTPS/srv/pub/docs"));
+    CHECK(FileExplorer::parse_network_address(a, "ftps://srv:990", &path, &user, &password) && path.view().equals("/FTPS/srv:990"));
+    CHECK(FileExplorer::parse_network_address(a, "sftp://", &path, &user, &password) && path.view().equals("/SFTP"));
+    CHECK(!FileExplorer::parse_network_address(a, "ftp://srv/", &path, &user, &password) && !FileExplorer::parse_network_address(a, "/SFTP/srv", &path, &user, &password));
+
+    for (int round = 0; round < 2; ++round) {
+      const bool sftp = round == 0;
+      const char* folder = sftp ? "SFTP" : "FTPS";
+      filesystem::RamFileSystem ram(a);
+      String base(a);
+      base.append("/");
+      base.append(folder);
+      CHECK(ram.create_directory(base.view()) == filesystem::Status::Ok);
+      base.append("/srv");
+      CHECK(ram.create_directory(base.view()) == filesystem::Status::Ok);
+      String file(a);
+      file.assign(base.view());
+      file.append("/a.txt");
+      make_file(ram, file.c_str(), "hello");
+      LockedNetworkFs fs(ram);
+      fs.locked_prefix = sftp ? "/SFTP/srv" : "/FTPS/srv";
+      fs.failure = filesystem::Status::LoginRequired;
+      LoginRecord record;
+      record.fs = &fs;
+
+      Screen screen(a, 640, 480);
+      Theme theme;
+      Window w(a, screen.renderer, theme, {640, 480});
+      WindowManager mgr(a);
+      mgr.set_dock(DockStyle::Fill);
+      w.add(&mgr);
+      desktop::FileExplorer ex(a);
+      ex.set_file_system(&fs);
+      if (sftp) ex.set_sftp_login_handler(record_login, &record);
+      else ex.set_ftps_login_handler(record_login, &record);
+      CHECK(mgr.add_window(&ex));
+      w.layout();
+      desktop::CredentialsDialog& dialog = ex.credentials_dialog();
+      CHECK(!ex.go_to(sftp ? "sftp://srv" : "ftps://srv") && dialog.showing() && dialog.server().equals("srv") && dialog.password_box().password());
+      dialog.user_box().set_text("alice");
+      dialog.password_box().set_text("secret");
+      click_center(w, dialog.ok_button());
+      CHECK(!dialog.showing() && record.calls == 1 && record.server == "srv" && record.user == "alice" && record.password == "secret");
+      CHECK(ex.path().equals(sftp ? "/SFTP/srv" : "/FTPS/srv") && ex.view().item_count() == 1);
+      fs.unlocked = false;
+      fs.failure = filesystem::Status::UntrustedHost;
+      CHECK(!ex.go_to(sftp ? "sftp://srv/" : "ftps://srv/") && !dialog.showing() && record.calls == 1);   // (an untrusted server is not a reason to ask for a login)
+      mgr.remove_window(&ex);
+    }
   }
   CHECK(a.live == 0);
 }
@@ -3994,6 +4123,8 @@ int main() {
   test_breadcrumb_bar();
   test_file_explorer();
   test_explorer_network();
+  test_explorer_nfs();
+  test_explorer_sftp_ftps();
   test_task_manager();
   test_text_editor();
   test_notepad();

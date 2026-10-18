@@ -38,6 +38,10 @@
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "Network/Ftp/FtpFileSystem.hpp"
+#include "Network/NetworkVolume.hpp"
+#include "Network/Nfs/NfsVolume.hpp"
+#include "Network/Sftp/SftpFileSystem.hpp"
 #include "Network/Smb/SmbVolume.hpp"
 #include "Crypto/Random.hpp"
 #include "Kernel/Thread.hpp"
@@ -215,6 +219,35 @@ static bool on_smb_login(void* context, StringView server, StringView user, Stri
   return true;
 }
 
+// Network filesystems that sign in with a user name and a password (SFTP, FTPS) share this.
+template <class Fs>
+struct PasswordLoginContext {
+  Fs* fs;
+};
+template <class Fs>
+static bool on_password_login(void* context, StringView server, StringView user, StringView password) {
+  static_cast<PasswordLoginContext<Fs>*>(context)->fs->set_credentials(server, user, password);
+  return true;
+}
+
+struct NfsLoginContext {
+  network::NfsFileSystem* nfs;
+};
+static uint32_t parse_id(StringView text) {
+  uint64_t v = 0;
+  bool any = false;
+  for (char c : text) {
+    if (c < '0' || c > '9') break;
+    v = v * 10 + static_cast<uint32_t>(c - '0');
+    any = true;
+    if (v > 0xFFFFFFFEull) return 65534;
+  }
+  return any ? static_cast<uint32_t>(v) : 65534u;
+}
+static bool on_nfs_login(void* context, StringView server, StringView uid, StringView gid) {
+  static_cast<NfsLoginContext*>(context)->nfs->set_credentials(server, parse_id(uid), parse_id(gid));
+  return true;
+}
 
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::init(st);
@@ -620,7 +653,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     InputHotplugContext input_hotplug{&input, &desktop};
     input.set_notifier(on_input_change, &input_hotplug);
     if (!input.start_service()) Entry(Level::Warning, "Input").text("could not start hot-plug polling; USB keyboards and mice plugged in later are not seen");
-    // Network shares (SMB): a folder of the explorer's tree whose contents are the shares of the servers the user goes to.
+    // Network shares (SMB, NFS, SFTP, FTPS): folders of the explorer's tree whose contents are the shares of the servers the user goes to.
     TimingEntropy timing_entropy;
     crypto::CpuEntropySource cpu_entropy;
     crypto::DrbgRandom smb_random(crypto::CpuEntropySource::available() ? static_cast<crypto::IEntropySource&>(cpu_entropy) : static_cast<crypto::IEntropySource&>(timing_entropy));
@@ -631,11 +664,32 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     smb_environment.context = st;
     network::SmbFileSystem smb(smb_network, shared_allocator, smb_environment);
     SmbLoginContext smb_login{&smb};
+    network::NfsFileSystem nfs(smb_network, shared_allocator);
+    NfsLoginContext nfs_login{&nfs};
+    network::HostTrust host_trust(shared_allocator);   // the host keys and certificates seen first
+    network::SftpFileSystem sftp(smb_network, shared_allocator, smb_random, host_trust);
+    PasswordLoginContext<network::SftpFileSystem> sftp_login{&sftp};
+    network::FtpEnvironment ftp_environment;
+    ftp_environment.random = &smb_random;
+    ftp_environment.trust = &host_trust;
+    network::FtpFileSystem ftps(smb_network, shared_allocator, ftp_environment);
+    PasswordLoginContext<network::FtpFileSystem> ftps_login{&ftps};
     SystemFileSystem explorer_files(shared_allocator, storage);
+    if (stacks.count() > 0) {
+      SharedPointer<network::NfsVolume> nfs_volume = SharedPointer<network::NfsVolume>::make(shared_allocator, nfs);
+      if (nfs_volume && explorer_files.mounts().mount(desktop::FileExplorer::kNfsFolder, SharedPointer<filesystem::IVolume>(nfs_volume), 0xFFFFFFFFu))
+        desktop.explorer().set_nfs_login_handler(on_nfs_login, &nfs_login);
+    }
     if (stacks.count() > 0 && smb_random.initialize()) {
       SharedPointer<network::SmbVolume> smb_volume = SharedPointer<network::SmbVolume>::make(shared_allocator, smb);
       if (smb_volume && explorer_files.mounts().mount(desktop::FileExplorer::kNetworkFolder, SharedPointer<filesystem::IVolume>(smb_volume), 0xFFFFFFFFu))
         desktop.explorer().set_login_handler(on_smb_login, &smb_login);
+      SharedPointer<network::NetworkVolume<network::SftpFileSystem>> sftp_volume = SharedPointer<network::NetworkVolume<network::SftpFileSystem>>::make(shared_allocator, sftp);
+      if (sftp_volume && explorer_files.mounts().mount(desktop::FileExplorer::kSftpFolder, SharedPointer<filesystem::IVolume>(sftp_volume), 0xFFFFFFFFu))
+        desktop.explorer().set_sftp_login_handler(on_password_login<network::SftpFileSystem>, &sftp_login);
+      SharedPointer<network::NetworkVolume<network::FtpFileSystem>> ftps_volume = SharedPointer<network::NetworkVolume<network::FtpFileSystem>>::make(shared_allocator, ftps);
+      if (ftps_volume && explorer_files.mounts().mount(desktop::FileExplorer::kFtpsFolder, SharedPointer<filesystem::IVolume>(ftps_volume), 0xFFFFFFFFu))
+        desktop.explorer().set_ftps_login_handler(on_password_login<network::FtpFileSystem>, &ftps_login);
     }
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);

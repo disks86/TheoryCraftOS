@@ -45,6 +45,7 @@ enum class Status : uint8_t {
   AccessDenied,     // permission refused (a network share that wants other rights)
   LoginRequired,    // a network server wants a user name and password and none was given
   LoginFailed,      // the user name or password was refused
+  UntrustedHost,    // the server is not who it was: its host key or certificate changed since the first visit, or was refused
   Network,          // the network failed: the server could not be found or reached, or the connection broke
 };
 

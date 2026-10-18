@@ -69,8 +69,20 @@ class FileExplorer : public gui::Frame {
   // LoginRequired, LoginFailed or AccessDenied - gets the sign-in dialog; its answer is handed to the login handler (which remembers it for the
   // server) and the folder is opened again.
   static constexpr const char* kNetworkFolder = "Network";
+  // NFS is another folder, reached with "nfs://server/export/folder" (/NFS/server/export/folder). It has no passwords: its sign-in dialog asks for a
+  // user id and a group id, handed to the NFS login handler in the user and password arguments (decimal text; "nfs://uid:gid@server/..." writes them in
+  // the address).
+  static constexpr const char* kNfsFolder = "NFS";
+  // SFTP and FTPS are the folders kSftpFolder and kFtpsFolder, reached with "sftp://server/dir/file" and "ftps://server/dir/file" and signed in to with
+  // a user name and a password like SMB. (ftps:// on port 990 is the implicit kind of FTPS, any other port starts in the clear and switches to TLS
+  // before anything secret is sent.) FTPS servers are tried anonymously first.
+  static constexpr const char* kSftpFolder = "SFTP";
+  static constexpr const char* kFtpsFolder = "FTPS";
   using LoginFunction = bool (*)(void* context, StringView server, StringView user, StringView password);
   void set_login_handler(LoginFunction function, void* context) { login_ = function; login_context_ = context; }
+  void set_nfs_login_handler(LoginFunction function, void* context) { nfs_login_ = function; nfs_login_context_ = context; }
+  void set_sftp_login_handler(LoginFunction function, void* context) { sftp_login_ = function; sftp_login_context_ = context; }
+  void set_ftps_login_handler(LoginFunction function, void* context) { ftps_login_ = function; ftps_login_context_ = context; }
   CredentialsDialog& credentials_dialog() { return credentials_dialog_; }
   // Goes to `address`: a path, or a network address as above. False if the folder could not be opened (a login dialog or a notice says why).
   bool go_to(StringView address);
@@ -123,6 +135,10 @@ class FileExplorer : public gui::Frame {
   static void on_rename_menu(void* self, gui::Control&);
   static void on_connect_menu(void* self, gui::Control&);
   static void on_network_menu(void* self, gui::Control&);
+  static void on_nfs_menu(void* self, gui::Control&);
+  static void on_sftp_menu(void* self, gui::Control&);
+  static void on_ftps_menu(void* self, gui::Control&);
+  LoginFunction login_of(int kind, void** context) const;
   static void on_login_answer(void* self, gui::Control&);
   bool open_or_ask(StringView path);
   void ask_login(StringView path, filesystem::Status why);
@@ -166,6 +182,13 @@ class FileExplorer : public gui::Frame {
   CredentialsDialog credentials_dialog_;
   LoginFunction login_ = nullptr;
   void* login_context_ = nullptr;
+  LoginFunction nfs_login_ = nullptr;
+  void* nfs_login_context_ = nullptr;
+  LoginFunction sftp_login_ = nullptr;
+  void* sftp_login_context_ = nullptr;
+  LoginFunction ftps_login_ = nullptr;
+  void* ftps_login_context_ = nullptr;
+  String last_uid_, last_gid_;   // the ids typed last for NFS
   String pending_path_, last_user_;   // the folder being opened when a login was asked for, and the user name typed last
   filesystem::Status last_status_ = filesystem::Status::Ok;   // why the last load() failed
   EjectFunction eject_ = nullptr;

@@ -168,7 +168,7 @@ struct TlsSocket::Handshake {
 };
 
 TlsSocket::TlsSocket(INetworkStack& stack, allocators::IAllocator& allocator, const TlsConfig& config, SharedPointer<ITcpSocket> inner)
-    : stack_(stack), allocator_(allocator), config_(config), inner_(static_cast<SharedPointer<ITcpSocket>&&>(inner)), handshake_data_(allocator), in_(allocator), out_(allocator) {
+    : stack_(stack), allocator_(allocator), config_(config), inner_(static_cast<SharedPointer<ITcpSocket>&&>(inner)), server_certificate_(allocator), handshake_data_(allocator), in_(allocator), out_(allocator) {
   uint32_t n = 0;
   for (; config.server_name && config.server_name[n] && n + 1 < sizeof server_name_; ++n) server_name_[n] = config.server_name[n];
   server_name_[n] = 0;
@@ -1120,6 +1120,10 @@ bool TlsSocket::on_finished_12(ConstByteView body) {
 }
 
 void TlsSocket::finish_handshake() {
+  if (hs_) {
+    server_certificate_.clear();
+    server_certificate_.append(hs_->leaf.view());
+  }
   hs_.reset();
   state_ = St::Open;
 }

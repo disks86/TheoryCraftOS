@@ -94,19 +94,23 @@ void CredentialsDialog::clear() {
   password_.set_text(StringView());
 }
 
-bool CredentialsDialog::show(WindowManager& manager, StringView server, StringView note, StringView user, Handler result) {
+bool CredentialsDialog::show(WindowManager& manager, StringView server, StringView note, StringView user, Handler result, Style style, StringView password) {
   UiGuard lock(&manager);
   if (showing()) return false;
   __atomic_store_n(&accepted_, false, __ATOMIC_RELEASE);
   on_closed(result);
   server_.assign(server);
+  const bool ids = style == Style::UnixIds;
   String heading(allocator());
-  heading.assign("Enter the login for ");
+  heading.assign(ids ? "Enter the user and group ids for " : "Enter the login for ");
   heading.append(server);
   heading_.set_text(heading.view());
   note_.set_text(note);
-  user_.set_text(user);
-  password_.set_text(StringView());
+  user_label_.set_text(ids ? "User id:" : "User name:");
+  password_label_.set_text(ids ? "Group id:" : "Password:");
+  password_.set_password(!ids);
+  user_.set_text(ids && user.empty() ? StringView("65534") : user);
+  password_.set_text(ids ? (password.empty() ? StringView("65534") : password) : StringView());
   const int32_t area_w = static_cast<int32_t>(manager.bounds().width), area_h = static_cast<int32_t>(manager.bounds().height);
   set_bounds({(area_w - kWidth) / 2 > 0 ? (area_w - kWidth) / 2 : 0, (area_h - kHeight) / 3 > 0 ? (area_h - kHeight) / 3 : 0, static_cast<uint32_t>(kWidth),
               static_cast<uint32_t>(kHeight)});

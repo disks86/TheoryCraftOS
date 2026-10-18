@@ -279,7 +279,7 @@ class SmbFileSystem::ListDirectory final : public IDirectory {
 
 // ---------------------------------------------------------------------------------------------------------------------------------------- the filesystem
 
-SmbFileSystem::SmbFileSystem(ISmbNetwork& network, allocators::IAllocator& allocator, const SmbEnvironment& environment)
+SmbFileSystem::SmbFileSystem(IServerNetwork& network, allocators::IAllocator& allocator, const SmbEnvironment& environment)
     : network_(network), allocator_(allocator), environment_(environment), servers_(allocator) {}
 
 SmbFileSystem::~SmbFileSystem() {

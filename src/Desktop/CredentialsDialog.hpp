@@ -37,7 +37,11 @@ class CredentialsDialog : public gui::Frame {
 
   // Opens it modally in the middle of the manager's area. `server` is named in the heading; `note` (may be empty) is a line under it, e.g. why
   // the dialog is back. The user name box starts with `user` (what was typed last time). `result` runs once the dialog is gone.
-  bool show(gui::WindowManager& manager, StringView server, StringView note, StringView user, gui::Handler result);
+  // Style::UnixIds (NFS): the two boxes are a user id and a group id (user() and password() are the numbers as typed; `password` starts the second box,
+  // else 65534), shown in plain text.
+  enum class Style { Login, UnixIds };
+  bool show(gui::WindowManager& manager, StringView server, StringView note, StringView user, gui::Handler result, Style style = Style::Login,
+            StringView password = StringView());
   bool showing() const { return manager() != nullptr; }
   bool accepted() const { return __atomic_load_n(&accepted_, __ATOMIC_ACQUIRE); }
   StringView server() const { return server_.view(); }

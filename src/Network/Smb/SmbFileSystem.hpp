@@ -31,7 +31,7 @@
 #include "FileSystem/IFileSystem.hpp"
 #include "Kernel/Sync.hpp"
 #include "Network/Smb/SmbConnection.hpp"
-#include "Network/Smb/SmbNetwork.hpp"
+#include "Network/ServerNetwork.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/SharedPointer.hpp"
 
@@ -39,7 +39,7 @@ namespace network {
 
 class SmbFileSystem final : public filesystem::IFileSystem {
  public:
-  SmbFileSystem(ISmbNetwork& network, allocators::IAllocator& allocator, const SmbEnvironment& environment);
+  SmbFileSystem(IServerNetwork& network, allocators::IAllocator& allocator, const SmbEnvironment& environment);
   ~SmbFileSystem();
   SmbFileSystem(const SmbFileSystem&) = delete;
   SmbFileSystem& operator=(const SmbFileSystem&) = delete;
@@ -105,7 +105,7 @@ class SmbFileSystem final : public filesystem::IFileSystem {
   filesystem::Status list_shares_locked(Server& server, List<String>* names);
   void drop(Server& server);
 
-  ISmbNetwork& network_;
+  IServerNetwork& network_;
   allocators::IAllocator& allocator_;
   SmbEnvironment environment_;
   mutable kernel::RecursiveMutex mutex_;

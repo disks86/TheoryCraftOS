@@ -42,6 +42,7 @@ const char* status_name(Status status) {
     case Status::AccessDenied: return "access denied";
     case Status::LoginRequired: return "login required";
     case Status::LoginFailed: return "login failed";
+    case Status::UntrustedHost: return "untrusted host";
     case Status::Network: return "network error";
   }
   return "unknown";

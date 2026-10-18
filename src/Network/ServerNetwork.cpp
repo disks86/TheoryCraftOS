@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "Network/Smb/SmbNetwork.hpp"
+#include "Network/ServerNetwork.hpp"
 #include "Kernel/Thread.hpp"
 #include "Utility/Move.hpp"
 

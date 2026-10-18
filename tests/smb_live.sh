@@ -14,7 +14,7 @@ if [ ! -x "$venv/bin/python" ]; then
 fi
 tool=$work/SmbLive
 g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -I tests -Wall -Wextra -Wno-unused-parameter tests/SmbLive.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-  src/FileSystem/FileSystemTypes.cpp src/Network/Smb/*.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp \
+  src/FileSystem/FileSystemTypes.cpp src/Network/Smb/*.cpp src/Network/ServerNetwork.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp \
   src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Checksum.cpp src/Crypto/*.cpp -o "$tool" || exit 1
 
 share=$work/share
