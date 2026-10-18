@@ -99,6 +99,14 @@ class Window final : public Control {
   void mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed);
   void mouse_wheel(int32_t x, int32_t y, int32_t delta);
   void key(const KeyArgs& args);  // a key press (or repeat)
+  // A function that sees every key press before anything else does (a popup, the focused control); true means it was used up. For shortcuts
+  // of the whole desktop. It runs on the thread that delivers input, with the UI lock held.
+  using KeyFilter = bool (*)(void* context, const KeyArgs& args);
+  void set_key_filter(KeyFilter filter, void* context) {
+    UiGuard lock(this);
+    key_filter_ = filter;
+    key_filter_context_ = context;
+  }
 
   // --- Drag and drop between controls (also in different windows of the manager). A control that sees the mouse move far enough
   // with the button held calls begin_drag() with what it carries (`text`, e.g. a file's full path); the pointer then shows the last
@@ -157,6 +165,8 @@ class Window final : public Control {
   Control* captured_ = nullptr;
   Control* popup_ = nullptr;
   Control* popup_owner_ = nullptr;
+  KeyFilter key_filter_ = nullptr;
+  void* key_filter_context_ = nullptr;
   Control* drag_source_ = nullptr;
   String drag_text_;
   Control* drop_target_ = nullptr;   // the drop waiting for the handler thread

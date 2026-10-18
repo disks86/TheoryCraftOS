@@ -41,6 +41,10 @@ class WindowManager : public Control {
   // What the close button does: takes the window out, then runs its on_closed handler.
   void close_window(Frame* frame);
 
+  // Alt+Tab: brings the window at the bottom of the stack to the front and activates it (restoring it if minimized), so repeating it goes through
+  // all of them; backwards, the window in front goes to the bottom. Does nothing while a modal window is open.
+  void cycle(bool forward);
+
   void activate(Frame* frame);  // raises it (restoring it first if minimized) and makes it active
   void minimize(Frame* frame);
   void maximize(Frame* frame);  // toggles with the restored size

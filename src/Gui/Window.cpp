@@ -321,6 +321,7 @@ void Window::mouse_wheel(int32_t x, int32_t y, int32_t delta) {
 void Window::key(const KeyArgs& args) {
   UiGuard lock(this);
   mark_dirty();
+  if (key_filter_ && key_filter_(key_filter_context_, args)) return;
   if (drag_source_ && args.usage == hardware::key::kEscape) {
     cancel_drag();
     return;

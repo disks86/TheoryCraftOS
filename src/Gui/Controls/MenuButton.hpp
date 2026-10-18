@@ -34,6 +34,8 @@ class MenuButton : public Control, public MenuHost {
   void set_direction(Direction d) { UiGuard lock(this); direction_ = d; }
   void set_menu_min_width(int32_t width) { UiGuard lock(this); popup_.set_min_width(width); }
   bool open() const { return open_; }
+  // Opens the menu, or closes it if it is open (the keyboard shortcut of the desktop's Start button).
+  void toggle_menu() { if (open_) close_menu(); else open_menu(); }
 
   bool focusable() const override { return true; }
   void paint(Painter& painter) override;

@@ -138,6 +138,24 @@ void WindowManager::activate(Frame* frame) {
   refresh();
 }
 
+void WindowManager::cycle(bool forward) {
+  UiGuard lock(this);
+  const uint32_t count = child_count();
+  if (count < 2 || has_modal()) return;
+  if (forward) {
+    activate(as_frame(child(0)));
+    return;
+  }
+  // Each window but the front one comes to the front in turn, bottom first: the old front window ends at the bottom, the one that was
+  // directly behind it is in front now. (Minimized windows are passed over, unless it is the one to come out in front.)
+  constexpr uint32_t kMax = 64;
+  Frame* stack[kMax];
+  if (count > kMax) return;
+  for (uint32_t i = 0; i < count; ++i) stack[i] = as_frame(child(i));
+  for (uint32_t i = 0; i + 1 < count; ++i)
+    if (stack[i]->state() != Frame::State::Minimized || i + 2 == count) activate(stack[i]);
+}
+
 void WindowManager::minimize(Frame* frame) {
   UiGuard lock(this);
   if (!frame || frame->manager_ != this || frame->state_ == Frame::State::Minimized) return;

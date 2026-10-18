@@ -162,6 +162,7 @@ class Desktop {
   static void on_paint(void* self, gui::Control&);
   static void on_media_player(void* self, gui::Control&);
   static void on_text_editor(void* self, gui::Control&);
+  static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);

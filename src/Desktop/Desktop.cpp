@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Desktop.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
 
@@ -134,7 +135,24 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.add(&taskbar_);
   window_.add(&surface_);
   window_.show_cursor(mouse != nullptr);
+  window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
+}
+
+bool Desktop::on_shortcut(void* self, const KeyArgs& args) {
+  namespace key = hardware::key;
+  auto* d = static_cast<Desktop*>(self);
+  if (d->windows_.has_modal()) return false;   // a dialog wants an answer first
+  if (args.usage == key::kTab && (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt))) {
+    d->window_.close_popup();
+    d->windows_.cycle(!(args.modifiers & hardware::modifier::kShift));
+    return true;
+  }
+  if (args.usage == key::kLeftGui || args.usage == key::kRightGui) {
+    d->start_.toggle_menu();
+    return true;
+  }
+  return false;
 }
 
 void Desktop::set_file_system(filesystem::IFileSystem* fs) {

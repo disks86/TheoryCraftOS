@@ -4372,6 +4372,62 @@ static void test_dock_buttons() {
   CHECK(a.live == 0);
 }
 
+// Alt+Tab goes through the open windows, Shift+Alt+Tab backwards, and the Super key opens and closes the Start menu.
+static void test_desktop_shortcuts() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.open_text_editor();
+    d.open_paint();
+    d.open_explorer();
+    d.window().layout();
+    Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+    Frame* e = &d.notepad();
+    Frame* p = &d.paint();
+    Frame* x = &d.explorer();
+    CHECK(m.active() == x);
+    auto press = [&](uint8_t usage, uint8_t modifiers) {
+      KeyArgs k;
+      k.usage = usage;
+      k.modifiers = modifiers;
+      w.key(k);
+    };
+    const uint8_t alt = hardware::modifier::kLeftAlt, shift = hardware::modifier::kLeftShift;
+    press(hardware::key::kTab, alt);
+    CHECK(m.active() == e && m.stacking_index(e) == 2);
+    press(hardware::key::kTab, alt);
+    CHECK(m.active() == p);
+    press(hardware::key::kTab, alt);
+    CHECK(m.active() == x);                                   // all the way round
+    press(hardware::key::kTab, alt | shift);
+    CHECK(m.active() == p);                                   // backwards: the window behind the front one
+    press(hardware::key::kTab, alt | shift);
+    CHECK(m.active() == e);
+    // A minimized window is brought back by going forwards to it.
+    e->minimize();
+    CHECK(e->state() == Frame::State::Minimized);
+    for (int i = 0; i < 3 && e->state() == Frame::State::Minimized; ++i) press(hardware::key::kTab, alt);
+    CHECK(e->state() == Frame::State::Normal && m.active() == e);
+    // Tab without Alt is still an ordinary key.
+    Frame* before = m.active();
+    press(hardware::key::kTab, 0);
+    CHECK(m.active() == before);
+
+    CHECK(!d.start_button().open());
+    press(hardware::key::kLeftGui, hardware::modifier::kLeftGui);
+    CHECK(d.start_button().open() && w.popup() != nullptr);
+    press(hardware::key::kRightGui, hardware::modifier::kRightGui);
+    CHECK(!d.start_button().open() && w.popup() == nullptr);
+    // A modal dialog keeps both to itself.
+    d.ask_shut_down();
+    press(hardware::key::kLeftGui, hardware::modifier::kLeftGui);
+    CHECK(!d.start_button().open());
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4453,6 +4509,7 @@ int main() {
   test_copy_progress();
   test_terminal();
   test_dock_buttons();
+  test_desktop_shortcuts();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();
