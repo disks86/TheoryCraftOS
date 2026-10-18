@@ -476,4 +476,103 @@ void Des::cbc(const uint8_t iv[8], ByteView data, bool decrypt) const {
   }
 }
 
+void md4(ConstByteView data, uint8_t out[16]) {
+  auto rol32 = [](uint32_t x, uint32_t n) { return (x << n) | (x >> (32 - n)); };
+  uint32_t a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
+  auto block = [&](const uint8_t* p) {
+    uint32_t x[16];
+    for (int i = 0; i < 16; ++i) x[i] = uint32_t{p[4 * i]} | (uint32_t{p[4 * i + 1]} << 8) | (uint32_t{p[4 * i + 2]} << 16) | (uint32_t{p[4 * i + 3]} << 24);
+    const uint32_t aa = a, bb = b, cc = c, dd = d;
+    auto f = [](uint32_t x1, uint32_t y, uint32_t z) { return (x1 & y) | (~x1 & z); };
+    auto g = [](uint32_t x1, uint32_t y, uint32_t z) { return (x1 & y) | (x1 & z) | (y & z); };
+    auto h = [](uint32_t x1, uint32_t y, uint32_t z) { return x1 ^ y ^ z; };
+    static const uint8_t s1[4] = {3, 7, 11, 19}, s2[4] = {3, 5, 9, 13}, s3[4] = {3, 9, 11, 15};
+    for (int i = 0; i < 16; ++i) {   // round 1
+      uint32_t t = rol32(a + f(b, c, d) + x[i], s1[i % 4]);
+      a = d; d = c; c = b; b = t;
+    }
+    static const uint8_t o2[16] = {0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15};
+    for (int i = 0; i < 16; ++i) {   // round 2
+      uint32_t t = rol32(a + g(b, c, d) + x[o2[i]] + 0x5a827999u, s2[i % 4]);
+      a = d; d = c; c = b; b = t;
+    }
+    static const uint8_t o3[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    for (int i = 0; i < 16; ++i) {   // round 3
+      uint32_t t = rol32(a + h(b, c, d) + x[o3[i]] + 0x6ed9eba1u, s3[i % 4]);
+      a = d; d = c; c = b; b = t;
+    }
+    a += aa; b += bb; c += cc; d += dd;
+  };
+  const uint64_t total = data.size();
+  uint64_t done = 0;
+  for (; done + 64 <= total; done += 64) block(data.data() + done);
+  uint8_t tail[128] = {};
+  const uint64_t rest = total - done;
+  for (uint64_t i = 0; i < rest; ++i) tail[i] = data[done + i];
+  tail[rest] = 0x80;
+  const uint64_t blocks = rest < 56 ? 1 : 2;
+  const uint64_t bits = total * 8;
+  for (int i = 0; i < 8; ++i) tail[blocks * 64 - 8 + i] = static_cast<uint8_t>(bits >> (8 * i));
+  for (uint64_t k = 0; k < blocks; ++k) block(tail + 64 * k);
+  const uint32_t words[4] = {a, b, c, d};
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) out[4 * i + j] = static_cast<uint8_t>(words[i] >> (8 * j));
+}
+
+bool kdf_hmac_sha256(ConstByteView key, ConstByteView label, ConstByteView context, ByteView out) {
+  if (out.size() == 0 || out.size() > 32) return false;
+  // K(1) = HMAC(key, [1]_32 || label || 0x00 || context || [L]_32), L the output length in bits.
+  uint8_t message[256];
+  if (label.size() + context.size() + 9 > sizeof message) return false;
+  uint32_t n = 0;
+  message[n++] = 0; message[n++] = 0; message[n++] = 0; message[n++] = 1;
+  for (uint8_t b : label) message[n++] = b;
+  message[n++] = 0;
+  for (uint8_t b : context) message[n++] = b;
+  const uint32_t bits = static_cast<uint32_t>(out.size() * 8);
+  message[n++] = static_cast<uint8_t>(bits >> 24); message[n++] = static_cast<uint8_t>(bits >> 16);
+  message[n++] = static_cast<uint8_t>(bits >> 8); message[n++] = static_cast<uint8_t>(bits);
+  uint8_t mac[32];
+  hmac(HashKind::Sha256, key, ConstByteView(message, n), mac);
+  for (uint64_t i = 0; i < out.size(); ++i) out[i] = mac[i];
+  return true;
+}
+
+bool aes_cmac(ConstByteView key, ConstByteView data, uint8_t mac[16]) {
+  Aes aes;
+  if (key.size() != 16 || !aes.set_key(key)) return false;
+  auto shift_left = [](const uint8_t in[16], uint8_t out[16]) {
+    uint8_t carry = 0;
+    for (int i = 15; i >= 0; --i) {
+      out[i] = static_cast<uint8_t>((in[i] << 1) | carry);
+      carry = in[i] >> 7;
+    }
+    return carry;
+  };
+  uint8_t zero[16] = {}, l[16], k1[16], k2[16];
+  aes.encrypt_block(zero, l);
+  if (shift_left(l, k1)) k1[15] ^= 0x87;
+  if (shift_left(k1, k2)) k2[15] ^= 0x87;
+  const uint64_t n = (data.size() + 15) / 16;
+  const bool complete = n > 0 && data.size() % 16 == 0;
+  uint8_t x[16] = {}, y[16];
+  const uint64_t full = n == 0 ? 0 : n - 1;
+  for (uint64_t i = 0; i < full; ++i) {
+    for (int k = 0; k < 16; ++k) y[k] = x[k] ^ data[i * 16 + k];
+    aes.encrypt_block(y, x);
+  }
+  uint8_t last[16] = {};
+  const uint64_t remain = data.size() - full * 16;
+  for (uint64_t k = 0; k < remain; ++k) last[k] = data[full * 16 + k];
+  if (complete) {
+    for (int k = 0; k < 16; ++k) last[k] ^= k1[k];
+  } else {
+    last[remain] = 0x80;
+    for (int k = 0; k < 16; ++k) last[k] ^= k2[k];
+  }
+  for (int k = 0; k < 16; ++k) y[k] = x[k] ^ last[k];
+  aes.encrypt_block(y, mac);
+  return true;
+}
+
 }  // namespace crypto

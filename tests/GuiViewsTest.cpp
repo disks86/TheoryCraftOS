@@ -1043,6 +1043,125 @@ static const char* probe_eject(void* context, StringView volume, bool*) {
   return p->answer;
 }
 
+// A filesystem that locks the folders of the "Network" tree until it has been given the right password, like a server that wants a login.
+struct LockedNetworkFs final : filesystem::IFileSystem {
+  explicit LockedNetworkFs(filesystem::RamFileSystem& inner) : ram(inner) {}
+  filesystem::RamFileSystem& ram;
+  bool unlocked = false;
+  filesystem::Status failure = filesystem::Status::LoginRequired;
+  filesystem::FileSystemInfo info() const override { return ram.info(); }
+  filesystem::Status gate(StringView path) const { return path.starts_with(StringView("/Network/srv")) && !unlocked ? failure : filesystem::Status::Ok; }
+  filesystem::Status open_file(StringView p, filesystem::OpenMode m, UniquePointer<filesystem::IFile>* f) override { return ram.open_file(p, m, f); }
+  filesystem::Status open_directory(StringView p, UniquePointer<filesystem::IDirectory>* d) override {
+    const filesystem::Status g = gate(p);
+    return g != filesystem::Status::Ok ? g : ram.open_directory(p, d);
+  }
+  filesystem::Status stat(StringView p, filesystem::DirectoryEntry* e) override { return ram.stat(p, e); }
+  filesystem::Status create_directory(StringView p) override { return ram.create_directory(p); }
+  filesystem::Status remove(StringView p) override { return ram.remove(p); }
+  filesystem::Status rename(StringView a, StringView b) override { return ram.rename(a, b); }
+  filesystem::Status flush() override { return ram.flush(); }
+};
+
+struct LoginRecord {
+  LockedNetworkFs* fs = nullptr;
+  int calls = 0;
+  std::string server, user, password;
+};
+static bool record_login(void* context, StringView server, StringView user, StringView password) {
+  auto* r = static_cast<LoginRecord*>(context);
+  ++r->calls;
+  r->server.assign(server.data(), server.size());
+  r->user.assign(user.data(), user.size());
+  r->password.assign(password.data(), password.size());
+  r->fs->unlocked = r->password == "secret";
+  return true;
+}
+
+static void test_explorer_network() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem ram(a);
+    CHECK(ram.create_directory("/Network") == filesystem::Status::Ok && ram.create_directory("/Network/srv") == filesystem::Status::Ok);
+    CHECK(ram.create_directory("/Network/srv/share") == filesystem::Status::Ok && ram.create_directory("/Network/srv/share/docs") == filesystem::Status::Ok);
+    make_file(ram, "/Network/srv/share/a.txt", "hello");
+    LockedNetworkFs fs(ram);
+    LoginRecord record;
+    record.fs = &fs;
+
+    // Addresses: smb:// and UNC forms become paths in the tree; a login in the address comes out separately.
+    {
+      String path(a), user(a), password(a);
+      using desktop::FileExplorer;
+      CHECK(FileExplorer::parse_network_address(a, "smb://srv/share/docs", &path, &user, &password) && path.view().equals("/Network/srv/share/docs") && user.empty());
+      CHECK(FileExplorer::parse_network_address(a, "SMB://srv", &path, &user, &password) && path.view().equals("/Network/srv"));
+      CHECK(FileExplorer::parse_network_address(a, "smb://", &path, &user, &password) && path.view().equals("/Network"));
+      CHECK(FileExplorer::parse_network_address(a, "smb://srv:4455//share///docs/", &path, &user, &password) && path.view().equals("/Network/srv:4455/share/docs"));
+      CHECK(FileExplorer::parse_network_address(a, "smb://al%40ice:p%3Ass@srv/share", &path, &user, &password) && path.view().equals("/Network/srv/share") && user.view().equals("al@ice") && password.view().equals("p:ss"));
+      CHECK(FileExplorer::parse_network_address(a, "smb://bob@srv/share", &path, &user, &password) && user.view().equals("bob") && password.empty());
+      CHECK(FileExplorer::parse_network_address(a, "\\\\srv\\share\\docs", &path, &user, &password) && path.view().equals("/Network/srv/share/docs"));
+      CHECK(!FileExplorer::parse_network_address(a, "/Network/srv", &path, &user, &password) && !FileExplorer::parse_network_address(a, "http://srv/", &path, &user, &password));
+    }
+
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::FileExplorer ex(a);
+    ex.set_file_system(&fs);
+    ex.set_login_handler(record_login, &record);
+    CHECK(mgr.add_window(&ex));
+    w.layout();
+    desktop::CredentialsDialog& dialog = ex.credentials_dialog();
+
+    // A locked server asks for a login; a wrong password asks again, saying so; the right one opens the folder.
+    CHECK(!ex.go_to("smb://srv/share") && dialog.showing() && dialog.server().equals("srv") && dialog.note_label().text().empty());
+    CHECK(ex.path().equals("/") && dialog.modal() && w.focus() == &dialog.user_box());
+    dialog.user_box().set_text("alice");
+    w.set_focus(&dialog.password_box());
+    dialog.password_box().set_text("wrong");
+    CHECK(dialog.password_box().password());
+    fs.failure = filesystem::Status::LoginFailed;   // (what the server answers to a wrong login)
+    click_center(w, dialog.ok_button());
+    CHECK(record.calls == 1 && record.server == "srv" && record.user == "alice" && record.password == "wrong");
+    CHECK(dialog.showing() && dialog.user().equals("alice") && dialog.note_label().text().size() > 8 && dialog.note_label().text().first(8).equals("The user"));
+    dialog.password_box().set_text("secret");
+    press(w, key::kEnter);
+    CHECK(!dialog.showing() && record.calls == 2 && record.password == "secret" && dialog.password().empty());
+    CHECK(ex.path().equals("/Network/srv/share") && ex.view().item_count() == 2);
+    // Cancel hands nothing over.
+    fs.unlocked = false;
+    fs.failure = filesystem::Status::LoginRequired;
+    CHECK(!ex.go_to("smb://srv/share/docs") && dialog.showing());
+    click_center(w, dialog.cancel_button());
+    CHECK(!dialog.showing() && record.calls == 2 && ex.path().equals("/Network/srv/share"));
+    // A login written in the address goes straight to the handler.
+    CHECK(ex.go_to("smb://carol:secret@srv/share/docs") && record.calls == 3 && record.user == "carol" && ex.path().equals("/Network/srv/share/docs"));
+    // Typing the address in the address bar works the same, and so does the menu's way in.
+    fs.unlocked = true;
+    ex.address_bar().begin_edit();
+    ex.address_bar().edit_box().set_text("smb://srv/share");
+    w.set_focus(&ex.address_bar().edit_box());
+    press(w, key::kEnter);
+    CHECK(ex.path().equals("/Network/srv/share"));
+    ex.address_bar().begin_edit("smb://");
+    CHECK(ex.address_bar().editing() && ex.address_bar().edit_box().text().equals("smb://"));
+    press(w, key::kEscape);
+    // Other kinds of failure are told as errors, not asked for a login.
+    fs.unlocked = false;
+    fs.failure = filesystem::Status::Network;
+    ex.address_bar().begin_edit();
+    ex.address_bar().edit_box().set_text("smb://srv/other");
+    w.set_focus(&ex.address_bar().edit_box());
+    press(w, key::kEnter);
+    CHECK(!dialog.showing() && ex.status_label().text().find("Cannot open") != StringView::npos);
+    mgr.remove_window(&ex);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_file_explorer() {
   TestAllocator a;
   {
@@ -3874,6 +3993,7 @@ int main() {
   test_select_all_keys();
   test_breadcrumb_bar();
   test_file_explorer();
+  test_explorer_network();
   test_task_manager();
   test_text_editor();
   test_notepad();

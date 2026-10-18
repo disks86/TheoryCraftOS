@@ -53,7 +53,43 @@ static bool same_bytes(const void* a, const void* b, size_t n) { return n == 0 |
 static ConstByteView view(const std::vector<uint8_t>& v) { return ConstByteView(v.data(), v.size()); }
 static ConstByteView text(const char* s) { return ConstByteView(reinterpret_cast<const uint8_t*>(s), strlen(s)); }
 
+// MD4 (RFC 1320 appendix A.5), AES-CMAC (RFC 4493 section 4) and the SP 800-108 counter KDF (checked against an independent computation).
+static void test_smb_primitives() {
+  uint8_t d[32];
+  md4(text(""), d); CHECK(hex(d, 16) == "31d6cfe0d16ae931b73c59d7e0c089c0");
+  md4(text("a"), d); CHECK(hex(d, 16) == "bde52cb31de33e46245e05fbdbd6fb24");
+  md4(text("abc"), d); CHECK(hex(d, 16) == "a448017aaf21d8525fc10ae87aa6729d");
+  md4(text("message digest"), d); CHECK(hex(d, 16) == "d9130a8164549fe818874806e1c7014b");
+  md4(text("12345678901234567890123456789012345678901234567890123456789012345678901234567890"), d); CHECK(hex(d, 16) == "e33b4ddc9c38f2199c3e7b164fcc0536");
+  md4(text("abcdefghijklmnopqrstuvwxyz"), d); CHECK(hex(d, 16) == "d79e1c308aa5bbcdeea8ed63df412da9");
+  const std::vector<uint8_t> key = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+  const std::vector<uint8_t> msg = unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
+  uint8_t mac[16];
+  CHECK(aes_cmac(view(key), ConstByteView(), mac) && hex(mac, 16) == "bb1d6929e95937287fa37d129b756746");
+  CHECK(aes_cmac(view(key), ConstByteView(msg.data(), 16), mac) && hex(mac, 16) == "070a16b46b4d4144f79bdd9dd04a287c");
+  CHECK(aes_cmac(view(key), ConstByteView(msg.data(), 40), mac) && hex(mac, 16) == "dfa66747de9ae63030ca32611497c827");
+  CHECK(aes_cmac(view(key), view(msg), mac) && hex(mac, 16) == "51f0bebf7e3b9d92fc49741779363cfe");
+  CHECK(!aes_cmac(ConstByteView(key.data(), 15), view(msg), mac));
+  // KDF: HMAC-SHA256(key, 00000001 || label || 00 || context || 00000080), SMB passing its label and context with their terminators
+  uint8_t out[16];
+  const std::vector<uint8_t> k = unhex("000102030405060708090a0b0c0d0e0f");
+  CHECK(kdf_hmac_sha256(view(k), ConstByteView(reinterpret_cast<const uint8_t*>("SMB2AESCMAC"), 12), ConstByteView(reinterpret_cast<const uint8_t*>("SmbSign"), 8), ByteView(out)));
+  uint8_t expect[32];
+  std::vector<uint8_t> input = unhex("00000001");
+  for (const char* p = "SMB2AESCMAC"; *p; ++p) input.push_back(static_cast<uint8_t>(*p));
+  input.push_back(0);   // (the label's own terminator, as SMB passes it)
+  input.push_back(0);   // the separator
+  for (const char* p = "SmbSign"; *p; ++p) input.push_back(static_cast<uint8_t>(*p));
+  input.push_back(0);   // (the context's terminator)
+  const std::vector<uint8_t> tail = unhex("00000080");
+  input.insert(input.end(), tail.begin(), tail.end());
+  hmac(HashKind::Sha256, view(k), view(input), expect);
+  CHECK(same_bytes(out, expect, 16));
+  CHECK(!kdf_hmac_sha256(view(k), text("a"), text("b"), ByteView(expect, 33)) );
+}
+
 int main() {
+  test_smb_primitives();
   // Published vectors.
   uint8_t d[64];
   hash(HashKind::Md5, text("abc"), d);

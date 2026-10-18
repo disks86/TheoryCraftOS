@@ -35,6 +35,9 @@ class TextBox : public Control {
   // Replaces the text (the caret goes to the end). False if memory ran out.
   bool set_text(StringView text);
   void set_read_only(bool read_only) { UiGuard lock(this); read_only_ = read_only; }
+  // A password box: the characters show as '*' and cannot be copied or cut.
+  void set_password(bool password) { UiGuard lock(this); password_ = password; invalidate(); }
+  bool password() const { return password_; }
   void set_max_length(uint32_t max) { UiGuard lock(this); max_length_ = max; }
   uint32_t caret() const { return caret_; }
   bool has_selection() const { return caret_ != anchor_; }
@@ -82,7 +85,7 @@ class TextBox : public Control {
   uint32_t caret_ = 0, anchor_ = 0;  // between characters: 0 .. text length; the selection runs between them
   uint32_t scroll_ = 0;  // first visible character
   uint32_t max_length_ = 0;  // 0 = unlimited
-  bool read_only_ = false, dragging_ = false;
+  bool read_only_ = false, dragging_ = false, password_ = false;
 };
 
 }  // namespace gui

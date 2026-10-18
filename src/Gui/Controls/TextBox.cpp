@@ -67,7 +67,7 @@ void TextBox::prepare_context_menu(int32_t x, int32_t) {
 
 bool TextBox::copy_selection() {
   UiGuard lock(this);
-  return has_selection() && clipboard_put_text(clipboard(), &fallback_, selected_text());
+  return !password_ && has_selection() && clipboard_put_text(clipboard(), &fallback_, selected_text());
 }
 
 bool TextBox::cut_selection() {
@@ -159,7 +159,15 @@ void TextBox::paint(Painter& painter) {
   uint64_t count = text_.size() - from;
   if (count > vis + 1) count = vis + 1;  // one partial character may show
   const uint32_t ink = enabled() ? t.text : t.disabled_text;
-  painter.text(kPad - 2, y, text_.view().substr(from, count), ink);
+  String stars(allocator());
+  if (password_) stars.assign("");
+  auto shown = [&](uint64_t a, uint64_t n) {   // the text in [a, a + n) as it is drawn
+    if (!password_) return text_.view().substr(a, n);
+    stars.clear();
+    for (uint64_t i = 0; i < n; ++i) stars.push_back('*');
+    return stars.view();
+  };
+  painter.text(kPad - 2, y, shown(from, count), ink);
   if (has_selection()) {  // the selected part again, light on dark
     uint64_t a = selection_start(), b = selection_end();
     if (a < from) a = from;
@@ -167,7 +175,7 @@ void TextBox::paint(Painter& painter) {
     if (b > a) {
       const int32_t x = kPad - 2 + static_cast<int32_t>(a - scroll_) * Painter::kGlyphWidth;
       painter.fill({x, y, static_cast<uint32_t>((b - a) * Painter::kGlyphWidth), static_cast<uint32_t>(Painter::kGlyphHeight)}, focused() ? t.selection : t.shadow);
-      painter.text(x, y, text_.view().substr(a, b - a), t.selection_text);
+      painter.text(x, y, shown(a, b - a), t.selection_text);
     }
   }
   if (focused() && enabled()) {

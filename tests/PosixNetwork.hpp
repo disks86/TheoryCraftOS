@@ -152,7 +152,12 @@ struct PosixNetworkStack final : INetworkStack {
   void start_dhcp() override {}
   const IDhcpClient& dhcp() const override { return *static_cast<IDhcpClient*>(nullptr); }
   bool wait_for_address(uint32_t) override { return true; }
-  bool resolve(StringView, uint32_t, Ipv4Address*) override { return false; }
+  bool resolve(StringView name, uint32_t, Ipv4Address* address) override {
+    SharedPointer<IDnsQuery> q = resolver.query(name);
+    if (!q || q->status() != DnsStatus::Resolved) return false;
+    *address = q->address();
+    return true;
+  }
   IDnsResolver& dns() override { return resolver; }
   bool ping(Ipv4Address, uint32_t, uint32_t*) override { return false; }
   SharedPointer<IUdpSocket> udp_open(uint16_t) override { return SharedPointer<IUdpSocket>(); }

@@ -48,7 +48,10 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
       scratch_(allocator),
       opened_file_(allocator),
       delete_dialog_(allocator),
-      delete_path_(allocator) {
+      delete_path_(allocator),
+      credentials_dialog_(allocator),
+      pending_path_(allocator),
+      last_user_(allocator) {
   set_title("File Explorer");
   set_bounds({60, 40, 540, 360});
   set_padding(Insets::all(4));
@@ -82,6 +85,9 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   if (Menu* go = menu_.add_menu("Go")) {
     go->add_item("Up One Level", {&FileExplorer::on_up_menu, this}, "Backspace");
     go->add_item("Address", {&FileExplorer::on_address_menu, this}, "Ctrl+L");
+    go->add_separator();
+    go->add_item("Network", {&FileExplorer::on_network_menu, this});
+    go->add_item("Connect to Server...", {&FileExplorer::on_connect_menu, this});
   }
 
   // The context menus.
@@ -179,7 +185,8 @@ bool FileExplorer::refresh() {
 bool FileExplorer::load(StringView path) {
   if (!fs_) return false;
   List<DirectoryEntry> entries(allocator());
-  if (read_sorted_directory(*fs_, path, &entries) != Status::Ok) return false;
+  last_status_ = read_sorted_directory(*fs_, path, &entries);
+  if (last_status_ != Status::Ok) return false;
 
   String next(allocator());
   if (!next.assign(path.empty() ? StringView("/") : path)) return false;
@@ -251,7 +258,9 @@ void FileExplorer::activate_selected() {
     fire(file_opened_);
     return;
   }
-  if (!open_folder(child.view())) notify(gui::NoticeKind::Error, "The folder could not be opened");
+  if (!open_or_ask(child.view())) {
+    if (last_status_ == Status::Ok || last_status_ == Status::NotFound) notify(gui::NoticeKind::Error, "The folder could not be opened");
+  }
 }
 
 void FileExplorer::update_status() {
@@ -317,14 +326,146 @@ bool FileExplorer::on_key(const KeyArgs& args) {
 void FileExplorer::on_navigate(void* self, Control&) {
   auto* e = static_cast<FileExplorer*>(self);
   String target(e->allocator());
-  target.assign(e->address_.requested_path());
-  if (!e->open_folder(target.view())) {
-    String message(e->allocator());
-    message.append("Cannot open ");
-    message.append(target.view());
-    e->notify(gui::NoticeKind::Error, message.view());
+  target.assign(e->address_.typed_text().empty() ? e->address_.requested_path() : e->address_.typed_text());
+  if (e->go_to(target.view())) return;
+  if (e->last_status_ == Status::LoginRequired || e->last_status_ == Status::LoginFailed || e->last_status_ == Status::AccessDenied) return;   // (the dialog is up)
+  String message(e->allocator());
+  message.append("Cannot open ");
+  message.append(target.view());
+  if (e->last_status_ != Status::Ok && e->last_status_ != Status::NotFound) {
+    message.append(": ");
+    message.append(describe_status(e->last_status_));
   }
+  e->notify(gui::NoticeKind::Error, message.view());
 }
+
+static int hex_digit(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+static bool percent_decode(StringView in, String* out) {
+  for (uint64_t i = 0; i < in.size(); ++i) {
+    if (in[i] == '%') {
+      const int hi = i + 1 < in.size() ? hex_digit(in[i + 1]) : -1, lo = i + 2 < in.size() ? hex_digit(in[i + 2]) : -1;
+      if (hi >= 0 && lo >= 0) {
+        if (!out->push_back(static_cast<char>(hi * 16 + lo))) return false;
+        i += 2;
+        continue;
+      }
+    }
+    if (!out->push_back(in[i])) return false;
+  }
+  return true;
+}
+
+bool FileExplorer::parse_network_address(allocators::IAllocator& allocator, StringView address, String* path, String* user, String* password) {
+  address = StringView(address).trimmed();
+  StringView rest;
+  bool backslashes = false;
+  if (address.size() >= 6 && address.first(6).equals_ignore_case("smb://")) {
+    rest = address.substr(6);
+  } else if (address.size() >= 2 && address[0] == '\\' && address[1] == '\\') {   // \\server\share
+    rest = address.substr(2);
+    backslashes = true;
+  } else {
+    return false;
+  }
+  String text(allocator);
+  for (char c : rest) {
+    if (!text.push_back(backslashes && c == '\\' ? '/' : c)) return false;
+  }
+  StringView t = text.view();
+  // user[:password]@ in front of the server (the last '@' before the first '/')
+  const uint64_t slash = t.find('/');
+  const StringView authority = slash == StringView::npos ? t : t.first(slash);
+  const uint64_t at = authority.rfind('@');
+  if (at != StringView::npos) {
+    const StringView login = authority.first(at);
+    const uint64_t colon = login.find(':');
+    user->clear();
+    password->clear();
+    if (!percent_decode(colon == StringView::npos ? login : login.first(colon), user)) return false;
+    if (colon != StringView::npos && !percent_decode(login.substr(colon + 1), password)) return false;
+    t = t.substr(at + 1);
+  }
+  // Drop a trailing slash, collapse the rest into the tree's path.
+  String tree(allocator);
+  if (!tree.push_back('/') || !tree.append(kNetworkFolder)) return false;
+  String decoded(allocator);
+  if (!percent_decode(t, &decoded)) return false;
+  uint64_t i = 0;
+  const StringView d = decoded.view();
+  while (i < d.size()) {
+    while (i < d.size() && d[i] == '/') ++i;
+    uint64_t j = i;
+    while (j < d.size() && d[j] != '/') ++j;
+    if (j > i && (!tree.push_back('/') || !tree.append(d.substr(i, j - i)))) return false;
+    i = j;
+  }
+  return path->assign(tree.view());
+}
+
+// Opens a folder; a network server's request for a login is answered by asking the user. False if the folder was not opened.
+bool FileExplorer::open_or_ask(StringView path) {
+  const bool network = path.size() > 8 && path.first(9).equals_ignore_case("/Network/");
+  if (network) status_.set_text("Connecting...");
+  if (open_folder(path)) return true;
+  if (network && (last_status_ == Status::LoginRequired || last_status_ == Status::LoginFailed || last_status_ == Status::AccessDenied) && login_) {
+    update_status();
+    ask_login(path, last_status_);
+  } else if (network) {
+    update_status();
+  }
+  return false;
+}
+
+bool FileExplorer::go_to(StringView address) {
+  String path(allocator()), user(allocator()), password(allocator());
+  if (parse_network_address(allocator(), address, &path, &user, &password)) {
+    if ((!user.empty() || !password.empty()) && login_) {   // a login in the address itself
+      const StringView rest = path.size() > 9 ? path.view().substr(9) : StringView();
+      const uint64_t slash = rest.find('/');
+      const StringView server = slash == StringView::npos ? rest : rest.first(slash);
+      if (!server.empty()) login_(login_context_, server, user.view(), password.view());
+    }
+    return open_or_ask(path.view());
+  }
+  String plain(allocator());
+  if (!plain.assign(address)) return false;
+  return open_or_ask(plain.view());
+}
+
+void FileExplorer::ask_login(StringView path, Status why) {
+  if (!manager()) return;
+  StringView rest = path.substr(9);   // after "/Network/"
+  const uint64_t slash = rest.find('/');
+  const StringView server = slash == StringView::npos ? rest : rest.first(slash);
+  if (server.empty()) return;
+  pending_path_.assign(path);
+  const char* note = why == Status::LoginFailed ? "The user name or password was not accepted." : why == Status::AccessDenied ? "Access was denied. Try another account." : "";
+  credentials_dialog_.show(*manager(), server, note, last_user_.view(), {&FileExplorer::on_login_answer, this});
+}
+
+void FileExplorer::on_login_answer(void* self, Control&) {
+  auto* e = static_cast<FileExplorer*>(self);
+  CredentialsDialog& d = e->credentials_dialog_;
+  if (!d.accepted() || !e->login_) {
+    d.clear();
+    return;
+  }
+  e->last_user_.assign(d.user());
+  e->login_(e->login_context_, d.server(), d.user(), d.password());
+  d.clear();
+  String path(e->allocator());
+  path.assign(e->pending_path_.view());
+  e->open_or_ask(path.view());
+}
+
+void FileExplorer::on_connect_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->address_.begin_edit("smb://"); }
+void FileExplorer::on_network_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->open_or_ask("/Network"); }
 
 // The list's menu is enabled for what is selected and shows the view in use.
 void FileExplorer::on_list_menu_opening(void* self, Control&) {

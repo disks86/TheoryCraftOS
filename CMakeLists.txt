@@ -100,6 +100,11 @@ add_executable(BOOTX64
   src/Network/Ipp/IppExchange.cpp
   src/Network/Http/HttpUrl.cpp
   src/Network/Http/HttpClient.cpp
+  src/Network/Smb/Ntlm.cpp
+  src/Network/Smb/SmbConnection.cpp
+  src/Network/Smb/SmbNetwork.cpp
+  src/Network/Smb/SmbFileSystem.cpp
+  src/Desktop/CredentialsDialog.cpp
   src/Network/Mdns/MdnsMessage.cpp
   src/Network/Snmp/SnmpClient.cpp
   src/Crypto/Crypto.cpp

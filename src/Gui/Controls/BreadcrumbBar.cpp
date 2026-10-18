@@ -40,7 +40,7 @@ void BreadcrumbBar::EditBox::on_focus_changed(bool focused) {
 }
 
 BreadcrumbBar::BreadcrumbBar(allocators::IAllocator& allocator)
-    : Control(allocator), path_(allocator), requested_(allocator), ends_(allocator), segments_(allocator), edit_(allocator, *this) {
+    : Control(allocator), path_(allocator), requested_(allocator), typed_(allocator), ends_(allocator), segments_(allocator), edit_(allocator, *this) {
   path_.assign("/");
   edit_.set_visible(false);
   add(&edit_);
@@ -207,6 +207,7 @@ void BreadcrumbBar::on_mouse_down(const MouseArgs& args) {
     return;
   }
   const Segment& s = segments_[static_cast<uint32_t>(hit)];
+  typed_.clear();
   request(s.path_length ? path_.view().first(s.path_length) : StringView("/"));
 }
 
@@ -217,12 +218,14 @@ void BreadcrumbBar::request(StringView path) {
   fire(navigate_);
 }
 
-void BreadcrumbBar::begin_edit() {
+void BreadcrumbBar::begin_edit() { begin_edit(path_.view()); }
+
+void BreadcrumbBar::begin_edit(StringView text) {
   UiGuard lock(this);
   if (editing_) return;
   editing_ = true;
   hover_ = -1;
-  edit_.set_text(path_.view());
+  edit_.set_text(text);
   edit_.set_visible(true);
   if (Window* w = window()) w->set_focus(&edit_);
   invalidate();
@@ -245,6 +248,7 @@ void BreadcrumbBar::commit_edit() {
     return copy;
   }();
   cancel_edit();
+  typed_.assign(typed.view());
   request(typed.view());
 }
 

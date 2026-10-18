@@ -64,6 +64,13 @@ bool equal_constant_time(const uint8_t* a, const uint8_t* b, uint32_t n);
 void hkdf_extract(HashKind kind, ConstByteView salt, ConstByteView ikm, uint8_t* prk);
 bool hkdf_expand(HashKind kind, ConstByteView prk, ConstByteView info, ByteView out);
 
+// MD4 (RFC 1320), 16 bytes into `out`. Broken as a hash: it is here because NTLM's password hash is defined with it. Nothing new may use it.
+void md4(ConstByteView data, uint8_t out[16]);
+
+// The counter mode key derivation of NIST SP 800-108 with HMAC-SHA-256 as the PRF (what SMB 3 derives its keys with): `out.size()` bytes
+// (at most 32) from `key`, `label` and `context` (both used as given, a zero byte between them, the length in bits at the end).
+bool kdf_hmac_sha256(ConstByteView key, ConstByteView label, ConstByteView context, ByteView out);
+
 // AES with 128-, 192- or 256-bit keys: encryption of one block, and CFB-128 (NIST SP 800-38A) which needs nothing else.
 class Aes {
  public:
@@ -77,6 +84,9 @@ class Aes {
   uint32_t round_keys_[60];
   uint32_t rounds_ = 0;
 };
+
+// AES-CMAC (RFC 4493) of `data` under a 128-bit key: 16 bytes into `mac`. False for a key that is not 16 bytes.
+bool aes_cmac(ConstByteView key, ConstByteView data, uint8_t mac[16]);
 
 // Single DES (FIPS 46-3) and CBC mode: RFC 3414's privacy protocol. The 8-byte key's parity bits are ignored.
 class Des {

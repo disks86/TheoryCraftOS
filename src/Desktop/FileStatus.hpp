@@ -38,6 +38,10 @@ inline const char* describe_status(filesystem::Status status) {
     case Status::NotEmpty: return "the folder is not empty";
     case Status::Unsupported: return "not possible here";
     case Status::NoMedia: return "the drive is gone";
+    case Status::AccessDenied: return "access denied";
+    case Status::LoginRequired: return "a user name and password are needed";
+    case Status::LoginFailed: return "the user name or password was refused";
+    case Status::Network: return "the network share could not be reached";
     default: return "failed";
   }
 }

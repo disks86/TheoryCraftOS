@@ -42,6 +42,10 @@ enum class Status : uint8_t {
   Unsupported,
   OutOfMemory,
   NoMedia,          // the medium is gone: a removable volume that was unplugged or ejected
+  AccessDenied,     // permission refused (a network share that wants other rights)
+  LoginRequired,    // a network server wants a user name and password and none was given
+  LoginFailed,      // the user name or password was refused
+  Network,          // the network failed: the server could not be found or reached, or the connection broke
 };
 
 const char* status_name(Status status);

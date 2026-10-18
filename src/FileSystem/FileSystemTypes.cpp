@@ -39,6 +39,10 @@ const char* status_name(Status status) {
     case Status::Unsupported: return "unsupported";
     case Status::OutOfMemory: return "out of memory";
     case Status::NoMedia: return "no media";
+    case Status::AccessDenied: return "access denied";
+    case Status::LoginRequired: return "login required";
+    case Status::LoginFailed: return "login failed";
+    case Status::Network: return "network error";
   }
   return "unknown";
 }

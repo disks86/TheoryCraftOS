@@ -20,6 +20,7 @@
 // View menu switches between list, icon and details views. Double-click (or Enter on) a folder opens it, a file is passed on to on_file_opened, the
 // Up button (or Backspace) goes to the parent. The window starts at the root of the filesystem it is given.
 #pragma once
+#include "Desktop/CredentialsDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/BreadcrumbBar.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -62,6 +63,20 @@ class FileExplorer : public gui::Frame {
   using EjectFunction = const char* (*)(void* context, StringView volume, bool* succeeded);   // *succeeded is true on entry
   void set_eject_handler(EjectFunction function, void* context) { eject_ = function; eject_context_ = context; }
   bool eject_selected();
+
+  // --- Network shares. The network filesystem is mounted as a folder of the tree (kNetworkFolder); typing an address like "smb://server/share/folder"
+  // (or \\server\share\folder) into the address bar goes to /Network/server/share/folder. A server that wants a login - answered with
+  // LoginRequired, LoginFailed or AccessDenied - gets the sign-in dialog; its answer is handed to the login handler (which remembers it for the
+  // server) and the folder is opened again.
+  static constexpr const char* kNetworkFolder = "Network";
+  using LoginFunction = bool (*)(void* context, StringView server, StringView user, StringView password);
+  void set_login_handler(LoginFunction function, void* context) { login_ = function; login_context_ = context; }
+  CredentialsDialog& credentials_dialog() { return credentials_dialog_; }
+  // Goes to `address`: a path, or a network address as above. False if the folder could not be opened (a login dialog or a notice says why).
+  bool go_to(StringView address);
+  // Turns a network address into the path in the tree ("/Network/server/share/folder"); *user and *password get a login written into the address
+  // ("smb://user:password@server/..."). False if `address` is not a network address.
+  static bool parse_network_address(allocators::IAllocator& allocator, StringView address, String* path, String* user, String* password);
   // File > New Folder / New File (also in the list's context menu): makes "New Folder" / "New File.txt" in the current folder - or "New Folder 2",
   // "New Folder 3", ... if the name is taken - and selects it. False (with a notice) if it could not be made, e.g. in the read-only root.
   bool new_folder();
@@ -106,6 +121,11 @@ class FileExplorer : public gui::Frame {
   static void on_new_folder(void* self, gui::Control&);
   static void on_new_file(void* self, gui::Control&);
   static void on_rename_menu(void* self, gui::Control&);
+  static void on_connect_menu(void* self, gui::Control&);
+  static void on_network_menu(void* self, gui::Control&);
+  static void on_login_answer(void* self, gui::Control&);
+  bool open_or_ask(StringView path);
+  void ask_login(StringView path, filesystem::Status why);
   static void on_delete_menu(void* self, gui::Control&);
   static void on_delete_answer(void* self, gui::Control&);
   Status remove_tree(StringView path, uint32_t depth);
@@ -143,6 +163,11 @@ class FileExplorer : public gui::Frame {
   gui::NoticeDialog* notices_ = nullptr;
   gui::MessageDialog delete_dialog_;
   String delete_path_;   // what the dialog asks about
+  CredentialsDialog credentials_dialog_;
+  LoginFunction login_ = nullptr;
+  void* login_context_ = nullptr;
+  String pending_path_, last_user_;   // the folder being opened when a login was asked for, and the user name typed last
+  filesystem::Status last_status_ = filesystem::Status::Ok;   // why the last load() failed
   EjectFunction eject_ = nullptr;
   void* eject_context_ = nullptr;
 };

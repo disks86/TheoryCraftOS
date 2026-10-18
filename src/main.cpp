@@ -38,6 +38,8 @@
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemHardware.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "Network/Smb/SmbVolume.hpp"
+#include "Crypto/Random.hpp"
 #include "Kernel/Thread.hpp"
 #include "Audio/AudioCaptureHub.hpp"
 #include "Audio/AudioMixer.hpp"
@@ -173,6 +175,46 @@ static bool read_local_time(void* context, desktop::DateTime* out) {
   out->minute = t.minute;
   return true;
 }
+
+// Unpredictable bytes from the timing of things, for machines whose CPU has neither RDSEED nor RDRAND (QEMU's default CPU, for one): the cycle
+// counter sampled around short waits, hashed. Weaker than a hardware generator, and good enough for what SMB uses it for (client nonces).
+struct TimingEntropy final : crypto::IEntropySource {
+  bool read(ByteView out) override {
+    uint8_t pool[64] = {};
+    for (uint64_t i = 0; i < out.size(); ++i) {
+      for (int round = 0; round < 24; ++round) {
+        const uint64_t t = __builtin_ia32_rdtsc() ^ (hardware::uptime_us() << 17);
+        pool[(i + round) % 64] = static_cast<uint8_t>(pool[(i + round) % 64] * 31 + (t ^ (t >> 7) ^ (t >> 15)));
+        hardware::delay_us(1);
+      }
+      uint8_t digest[32];
+      crypto::hash(crypto::HashKind::Sha256, ConstByteView(pool, sizeof pool), digest);
+      out[i] = digest[i % 32];
+    }
+    return true;
+  }
+};
+
+// The local clock as a Windows FILETIME (100 ns steps since 1601), the way SMB logins state the time.
+static uint64_t smb_filetime(void* context) {
+  desktop::DateTime t;
+  if (!read_local_time(context, &t)) return 0;
+  int64_t y = t.year, m = t.month;
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400, doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + t.day - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  const int64_t days = era * 146097 + doe - 719468;   // since 1970
+  const uint64_t seconds = static_cast<uint64_t>(days) * 86400 + t.hour * 3600u + t.minute * 60u + 11644473600ull;
+  return seconds * 10000000ull;
+}
+
+struct SmbLoginContext {
+  network::SmbFileSystem* smb;
+};
+static bool on_smb_login(void* context, StringView server, StringView user, StringView password) {
+  static_cast<SmbLoginContext*>(context)->smb->set_credentials(server, user, password);
+  return true;
+}
+
 
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   console::init(st);
@@ -578,7 +620,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     InputHotplugContext input_hotplug{&input, &desktop};
     input.set_notifier(on_input_change, &input_hotplug);
     if (!input.start_service()) Entry(Level::Warning, "Input").text("could not start hot-plug polling; USB keyboards and mice plugged in later are not seen");
+    // Network shares (SMB): a folder of the explorer's tree whose contents are the shares of the servers the user goes to.
+    TimingEntropy timing_entropy;
+    crypto::CpuEntropySource cpu_entropy;
+    crypto::DrbgRandom smb_random(crypto::CpuEntropySource::available() ? static_cast<crypto::IEntropySource&>(cpu_entropy) : static_cast<crypto::IEntropySource&>(timing_entropy));
+    network::StackSetNetwork smb_network(stacks);
+    network::SmbEnvironment smb_environment;
+    smb_environment.random = &smb_random;
+    smb_environment.filetime = smb_filetime;
+    smb_environment.context = st;
+    network::SmbFileSystem smb(smb_network, shared_allocator, smb_environment);
+    SmbLoginContext smb_login{&smb};
     SystemFileSystem explorer_files(shared_allocator, storage);
+    if (stacks.count() > 0 && smb_random.initialize()) {
+      SharedPointer<network::SmbVolume> smb_volume = SharedPointer<network::SmbVolume>::make(shared_allocator, smb);
+      if (smb_volume && explorer_files.mounts().mount(desktop::FileExplorer::kNetworkFolder, SharedPointer<filesystem::IVolume>(smb_volume), 0xFFFFFFFFu))
+        desktop.explorer().set_login_handler(on_smb_login, &smb_login);
+    }
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);

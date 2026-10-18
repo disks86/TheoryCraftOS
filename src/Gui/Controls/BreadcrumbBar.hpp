@@ -47,11 +47,16 @@ class BreadcrumbBar : public Control {
   StringView path() const { return path_.view(); }
   // Where the user asked to go (a clicked folder or a typed path, normalized as above).
   StringView requested_path() const { return requested_.view(); }
+  // What was typed, as typed (not normalized), when the request came from the text box; empty after a click on a folder. For programs that accept
+  // other kinds of address than a path ("smb://server/share").
+  StringView typed_text() const { return typed_.view(); }
   void on_navigate(Handler handler) { UiGuard lock(this); navigate_ = handler; }
 
   // --- Typing a path
   bool editing() const { return editing_; }
   void begin_edit();
+  // The same, with `text` in the box instead of the current path.
+  void begin_edit(StringView text);
   void cancel_edit();
   TextBox& edit_box() { return edit_; }
 
@@ -89,7 +94,7 @@ class BreadcrumbBar : public Control {
   void commit_edit();
   static bool normalize(StringView in, String* out);
 
-  String path_, requested_;
+  String path_, requested_, typed_;
   List<uint32_t> ends_;  // where each folder name ends in path_
   List<Segment> segments_;
   EditBox edit_;
