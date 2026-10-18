@@ -1185,6 +1185,19 @@ static void test_file_explorer() {
       CHECK(!ex.rename_item("Projects", "New Folder 2") && !ex.rename_item("Projects", "") && !ex.rename_item("Projects", "a/b"));
       CHECK(ex.rename_item("Projects", "Projects") && ex.rename_item("Projects", "  Work  ") && fs.stat("/Work", &made) == filesystem::Status::Ok);
       CHECK(fs.rename("/Work", "/New File 2.txt") == filesystem::Status::Ok);
+      // Delete asks first: Cancel keeps the item, Delete removes a folder with its contents.
+      CHECK(fs.create_directory("/New Folder/inner") == filesystem::Status::Ok);
+      make_file(fs, "/New Folder/inner/f.txt", "x");
+      CHECK(ex.refresh());
+      for (uint32_t i = 0; i < ex.view().item_count(); ++i) { String t(a); ex.view().item_text(i, 0, &t); if (t.view().equals("New Folder")) ex.view().select_item(static_cast<int32_t>(i)); }
+      CHECK(ex.delete_selected() && ex.delete_dialog().showing());
+      ex.delete_dialog().decline_button().click();
+      CHECK(!ex.delete_dialog().showing() && fs.stat("/New Folder", &made) == filesystem::Status::Ok);
+      CHECK(ex.delete_selected());
+      ex.delete_dialog().accept_button().click();
+      CHECK(!ex.delete_dialog().showing() && fs.stat("/New Folder", &made) == filesystem::Status::NotFound);
+      CHECK(fs.create_directory("/New Folder") == filesystem::Status::Ok);
+      CHECK(ex.refresh());
       CHECK(fs.remove("/New Folder") == filesystem::Status::Ok && fs.remove("/New Folder 2") == filesystem::Status::Ok);
       CHECK(fs.remove("/New File.txt") == filesystem::Status::Ok && fs.remove("/New File 2.txt") == filesystem::Status::Ok);
       CHECK(ex.refresh() && ex.view().item_count() == 5);

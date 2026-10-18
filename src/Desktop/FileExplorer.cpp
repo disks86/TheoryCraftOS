@@ -46,7 +46,9 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
       view_(allocator),
       path_(allocator),
       scratch_(allocator),
-      opened_file_(allocator) {
+      opened_file_(allocator),
+      delete_dialog_(allocator),
+      delete_path_(allocator) {
   set_title("File Explorer");
   set_bounds({60, 40, 540, 360});
   set_padding(Insets::all(4));
@@ -62,6 +64,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
     file->add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
     file->add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
     file->add_item("Rename", {&FileExplorer::on_rename_menu, this}, "F2");
+    file->add_item("Delete", {&FileExplorer::on_delete_menu, this}, "Del");
     file->add_item("New Folder", {&FileExplorer::on_new_folder, this});
     file->add_item("New File", {&FileExplorer::on_new_file, this});
     file->add_separator();
@@ -86,6 +89,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   ctx_copy_ = list_menu_.add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
   list_menu_.add_separator();
   ctx_rename_ = list_menu_.add_item("Rename", {&FileExplorer::on_rename_menu, this}, "F2");
+  ctx_delete_ = list_menu_.add_item("Delete", {&FileExplorer::on_delete_menu, this}, "Del");
   list_menu_.add_item("New Folder", {&FileExplorer::on_new_folder, this});
   list_menu_.add_item("New File", {&FileExplorer::on_new_file, this});
   list_menu_.add_separator();
@@ -116,6 +120,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   view_.add_column("Type", 100);
   view_.set_dock(DockStyle::Fill);
   view_.set_copy_enabled(false);  // Ctrl+C copies the item's path instead (see on_key)
+  delete_dialog_.on_result({&FileExplorer::on_delete_answer, this});
   view_.on_item_activated({&FileExplorer::on_activated, this});
   view_.on_item_renamed({&FileExplorer::on_renamed, this});
   view_.on_selection_changed({&FileExplorer::on_selection, this});
@@ -286,6 +291,10 @@ bool FileExplorer::copy_selected_path() {
 
 bool FileExplorer::on_key(const KeyArgs& args) {
   if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 2) return copy_selected_path();   // Ctrl+C
+  if (args.usage == hardware::key::kDelete) {
+    delete_selected();
+    return true;
+  }
   if (args.usage == hardware::key::kF1 + 1) {  // F2
     rename_selected();
     return true;
@@ -324,6 +333,7 @@ void FileExplorer::on_list_menu_opening(void* self, Control&) {
   e->ctx_open_->set_enabled(selected);
   e->ctx_copy_->set_enabled(selected);
   e->ctx_rename_->set_enabled(selected);
+  e->ctx_delete_->set_enabled(selected);
   e->ctx_up_->set_enabled(e->path_.size() > 1);
   e->ctx_list_->set_checked(e->view_.view_mode() == ViewMode::List);
   e->ctx_icons_->set_checked(e->view_.view_mode() == ViewMode::Icons);
@@ -448,6 +458,69 @@ bool FileExplorer::rename_item(StringView from, StringView to) {
     }
   }
   return true;
+}
+
+bool FileExplorer::delete_selected() {
+  const int32_t item = view_.selected_item();
+  if (item < 0 || !manager() || view_.renaming()) return false;
+  String name(allocator());
+  view_.item_text(static_cast<uint32_t>(item), 0, &name);
+  const bool folder = view_.item_icon(static_cast<uint32_t>(item)) != ItemIcon::File;
+  delete_path_.assign(path_.view());
+  if (path_.size() > 1) delete_path_.push_back('/');
+  delete_path_.append(name.view());
+  String question(allocator());
+  question.append("Delete \"");
+  if (name.size() > 28) {
+    question.append(name.view().first(25));
+    question.append("...");
+  } else {
+    question.append(name.view());
+  }
+  question.append("\"?");
+  delete_dialog_.set_texts(folder ? "Delete Folder" : "Delete File", question.view(),
+                           folder ? "It and everything in it will be deleted." : "This cannot be undone.", "Delete", "Cancel");
+  return delete_dialog_.show(*manager());
+}
+
+// Removes a file, or a folder after what is in it. Stops at the first failure.
+Status FileExplorer::remove_tree(StringView path, uint32_t depth) {
+  DirectoryEntry entry;
+  Status status = fs_->stat(path, &entry);
+  if (status != Status::Ok) return status;
+  if (entry.type == NodeType::Directory) {
+    if (depth > 32) return Status::InvalidPath;
+    List<DirectoryEntry> children(allocator());
+    status = read_sorted_directory(*fs_, path, &children);
+    if (status != Status::Ok) return status;
+    for (const DirectoryEntry& child : children) {
+      String full(allocator());
+      full.assign(path);
+      full.push_back('/');
+      full.append(child.name.view());
+      status = remove_tree(full.view(), depth + 1);
+      if (status != Status::Ok) return status;
+    }
+  }
+  return fs_->remove(path);
+}
+
+void FileExplorer::on_delete_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->delete_selected(); }
+
+void FileExplorer::on_delete_answer(void* self, Control&) {
+  auto* e = static_cast<FileExplorer*>(self);
+  if (!e->delete_dialog_.accepted() || !e->fs_) return;
+  const Status status = e->remove_tree(e->delete_path_.view(), 0);
+  e->fs_->flush();
+  e->refresh();
+  if (status != Status::Ok) {
+    String message(e->allocator());
+    message.append("Cannot delete ");
+    message.append(e->delete_path_.view().substr(e->delete_path_.view().rfind('/') + 1));
+    message.append(": ");
+    message.append(describe_status(status));
+    e->notify(gui::NoticeKind::Error, message.view());
+  }
 }
 
 void FileExplorer::on_rename_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->rename_selected(); }

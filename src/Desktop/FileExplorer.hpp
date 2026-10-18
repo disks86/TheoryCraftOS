@@ -27,6 +27,7 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Menu.hpp"
+#include "Gui/MessageDialog.hpp"
 #include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Kernel/Sync.hpp"
@@ -35,6 +36,7 @@ namespace desktop {
 
 class FileExplorer : public gui::Frame {
  public:
+  using Status = filesystem::Status;
   explicit FileExplorer(allocators::IAllocator& allocator);
 
   // The filesystem to browse (nullptr: none, the window says so). It must outlive the explorer. Goes to its root.
@@ -69,6 +71,10 @@ class FileExplorer : public gui::Frame {
   // if it fails, e.g. because the name is taken or this place cannot be changed.
   bool rename_selected();
   bool rename_item(StringView from, StringView to);
+  // File > Delete (the Delete key, or Delete in the list's context menu): asks "Delete <name>?" in delete_dialog(); on "Delete" the selected file
+  // - or folder with everything in it - is removed. False if nothing is selected or the dialog cannot be shown.
+  bool delete_selected();
+  gui::MessageDialog& delete_dialog() { return delete_dialog_; }
   // The dialog that warnings, information and errors are shown in (nullptr: the status bar says them instead). It must outlive the explorer.
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
@@ -100,6 +106,9 @@ class FileExplorer : public gui::Frame {
   static void on_new_folder(void* self, gui::Control&);
   static void on_new_file(void* self, gui::Control&);
   static void on_rename_menu(void* self, gui::Control&);
+  static void on_delete_menu(void* self, gui::Control&);
+  static void on_delete_answer(void* self, gui::Control&);
+  Status remove_tree(StringView path, uint32_t depth);
   static void on_renamed(void* self, gui::Control&);
   bool create_new(bool folder);
   static void on_close_window(void* self, gui::Control&);
@@ -119,7 +128,7 @@ class FileExplorer : public gui::Frame {
 
   gui::MenuBar menu_;
   gui::ContextMenu list_menu_, address_menu_;
-  gui::MenuItem *ctx_open_ = nullptr, *ctx_rename_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
+  gui::MenuItem *ctx_open_ = nullptr, *ctx_rename_ = nullptr, *ctx_delete_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
   gui::Panel toolbar_, status_bar_;
   gui::BreadcrumbBar address_;
   gui::Label status_;
@@ -132,6 +141,8 @@ class FileExplorer : public gui::Frame {
   String opened_file_;
   gui::Handler file_opened_;
   gui::NoticeDialog* notices_ = nullptr;
+  gui::MessageDialog delete_dialog_;
+  String delete_path_;   // what the dialog asks about
   EjectFunction eject_ = nullptr;
   void* eject_context_ = nullptr;
 };
