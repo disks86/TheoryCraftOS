@@ -660,7 +660,7 @@ static void test_windows() {
     // Title bar colors: active vs inactive.
     w.render();
     CHECK(screen.px(fa.bounds().x + 8, fa.bounds().y + 8) == theme.title);
-    CHECK(screen.px(fc.bounds().x + 180, fc.bounds().y + 8) == theme.inactive_title);
+    CHECK(screen.px(fc.bounds().x + 120, fc.bounds().y + 8) == theme.inactive_title);
 
     // Minimize button: the window disappears, the next window below becomes active.
     const Point min_a = at_part(fa, Frame::Part::Minimize);

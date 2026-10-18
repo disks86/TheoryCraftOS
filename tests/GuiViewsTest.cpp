@@ -4319,6 +4319,59 @@ static void test_terminal() {
   CHECK(a.live == 0);
 }
 
+// The dock buttons in the title bar snap a window to a half of the desktop area, and the same button again puts it back.
+static void test_dock_buttons() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    Frame f(a), dialog(a);
+    f.set_bounds({100, 80, 300, 200});
+    dialog.set_bounds({10, 10, 200, 100});
+    dialog.set_maximize_enabled(false);
+    CHECK(mgr.add_window(&f) && mgr.add_window(&dialog));
+    w.layout();
+    CHECK(f.dock_enabled() && !dialog.dock_enabled());
+    auto press = [&](Frame::Part part) {
+      const Rect2D r = f.button_rect(part);
+      const Point o = f.window_origin();
+      click(w, o.x + r.x + r.width / 2, o.y + r.y + r.height / 2);
+    };
+    // Left to right: the four dock buttons, then Minimize, Maximize, Close.
+    CHECK(f.button_rect(Frame::Part::DockLeft).x < f.button_rect(Frame::Part::DockRight).x && f.button_rect(Frame::Part::DockBottom).x < f.button_rect(Frame::Part::Minimize).x);
+    press(Frame::Part::DockLeft);
+    CHECK(f.docked() == Frame::Dock::Left && f.bounds().x == 0 && f.bounds().y == 0 && f.bounds().width == 400 && f.bounds().height == 600);
+    press(Frame::Part::DockRight);
+    CHECK(f.docked() == Frame::Dock::Right && f.bounds().x == 400 && f.bounds().width == 400 && f.bounds().height == 600);
+    press(Frame::Part::DockTop);
+    CHECK(f.docked() == Frame::Dock::Top && f.bounds().x == 0 && f.bounds().width == 800 && f.bounds().height == 300);
+    press(Frame::Part::DockBottom);
+    CHECK(f.docked() == Frame::Dock::Bottom && f.bounds().y == 300 && f.bounds().width == 800 && f.bounds().height == 300);
+    press(Frame::Part::DockBottom);   // again: back to where it was before the first docking
+    CHECK(f.docked() == Frame::Dock::None && f.bounds().x == 100 && f.bounds().y == 80 && f.bounds().width == 300 && f.bounds().height == 200);
+    // Dragging by the title bar frees a docked window; maximize then restore returns to the undocked size.
+    f.dock(Frame::Dock::Left);
+    const Point o = f.window_origin();
+    w.mouse_move(o.x + 20, o.y + 10);
+    w.mouse_button(o.x + 20, o.y + 10, MouseButton::Left, true);
+    w.mouse_move(o.x + 120, o.y + 60);
+    w.mouse_button(o.x + 120, o.y + 60, MouseButton::Left, false);
+    CHECK(f.docked() == Frame::Dock::None && f.bounds().x == 100);
+    f.dock(Frame::Dock::Right);
+    f.maximize();
+    CHECK(f.state() == Frame::State::Maximized && f.docked() == Frame::Dock::None);
+    f.maximize();
+    CHECK(f.state() == Frame::State::Normal && f.bounds().x == 100 && f.bounds().width == 400);
+    dialog.dock(Frame::Dock::Left);
+    CHECK(dialog.docked() == Frame::Dock::None);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4399,6 +4452,7 @@ int main() {
   test_desktop_multiple_windows();
   test_copy_progress();
   test_terminal();
+  test_dock_buttons();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

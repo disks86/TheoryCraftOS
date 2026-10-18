@@ -22,7 +22,10 @@
 // one active and does what the buttons ask. Each button can be disabled: it is then drawn greyed and
 // ignores clicks (a dialog disables minimize and maximize).
 //
-// The title bar drags the window; the borders resize it (unless set_resizable(false)).
+// The title bar drags the window; the borders resize it (unless set_resizable(false)). Four more buttons left of those dock the window to a
+// half of the desktop area - the left or right half, or the upper or lower one - and pressing the one of the edge the window is docked at
+// puts it back. They are drawn for windows that can be maximized and resized. Moving or resizing a docked window frees it; maximizing it
+// and restoring that brings back the size it had before it was docked.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Utility/String.hpp"
@@ -37,7 +40,9 @@ class Frame : public Control {
   static constexpr int32_t kMinWidth = 140, kMinHeight = 60;
 
   enum class State : uint8_t { Normal, Minimized, Maximized };
-  enum class Part : uint8_t { None, Minimize, Maximize, Close, TitleBar, Client, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight };
+  enum class Dock : uint8_t { None, Left, Right, Top, Bottom };
+  enum class Part : uint8_t { None, Minimize, Maximize, Close, TitleBar, Client, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight,
+                              DockLeft, DockRight, DockTop, DockBottom };
 
   explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator) {}
 
@@ -59,6 +64,10 @@ class Frame : public Control {
   void on_closed(Handler handler) { UiGuard lock(this); closed_ = handler; }
 
   State state() const { return state_; }
+  // The half of the desktop the window is docked to (None: free).
+  Dock docked() const { return docked_; }
+  // Whether the dock buttons show: the window can be maximized and resized.
+  bool dock_enabled() const { return can_maximize_ && resizable_; }
   bool active() const { return active_; }
   bool modal() const { return modal_; }
   WindowManager* manager() const { return __atomic_load_n(&manager_, __ATOMIC_ACQUIRE); }  // safe from any thread
@@ -68,6 +77,8 @@ class Frame : public Control {
   void restore();
   void close();
   void activate();
+  // Docks the window to `edge`, or puts it back where it was when it is docked there already (Dock::None also frees it).
+  void dock(Dock edge);
 
   // Where a point (frame coordinates) lies: a button, the title bar, a border, the client area.
   Part part_at(int32_t x, int32_t y) const;
@@ -87,6 +98,8 @@ class Frame : public Control {
 
   bool button_enabled(Part button) const;
   void draw_button(Painter& painter, Part button);
+  static bool is_dock_part(Part part) { return part >= Part::DockLeft && part <= Part::DockBottom; }
+  static Dock dock_of(Part part) { return static_cast<Dock>(static_cast<uint8_t>(part) - static_cast<uint8_t>(Part::DockLeft) + 1); }
 
   String title_;
   Handler closed_;
@@ -96,6 +109,7 @@ class Frame : public Control {
   Rect2D restore_bounds_;
   bool can_minimize_ = true, can_maximize_ = true, can_close_ = true, resizable_ = true;
   bool escape_closes_ = false;
+  Dock docked_ = Dock::None;
   bool active_ = false, modal_ = false;
   // Mouse interaction in progress.
   Part pressed_ = Part::None;  // a title bar button held down

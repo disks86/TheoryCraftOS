@@ -45,6 +45,8 @@ class WindowManager : public Control {
   void minimize(Frame* frame);
   void maximize(Frame* frame);  // toggles with the restored size
   void restore(Frame* frame);
+  // Docks the window to a half of the area (see Frame::dock). The same edge again, or Dock::None, puts it back.
+  void dock(Frame* frame, Frame::Dock edge);
 
   Frame* active() const { return active_; }
   uint32_t window_count() const { return static_cast<uint32_t>(order_.count()); }
@@ -60,6 +62,7 @@ class WindowManager : public Control {
   void refresh();                 // enabled flags, active window, focus scope after any change
   Frame* top_usable() const;      // the topmost visible, enabled window
   void keep_inside(Frame* frame);
+  Rect2D dock_bounds(Frame::Dock edge) const;
 
   List<Frame*> order_;  // creation order
   Frame* active_ = nullptr;

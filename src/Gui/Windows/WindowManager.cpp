@@ -80,7 +80,8 @@ bool WindowManager::remove_window(Frame* frame) {
   frame->active_ = false;
   frame->set_enabled(true);
   frame->pressed_ = frame->dragging_ = Frame::Part::None;
-  if (frame->state_ == Frame::State::Maximized) frame->set_bounds(frame->restore_bounds_);
+  if (frame->state_ == Frame::State::Maximized || frame->docked_ != Frame::Dock::None) frame->set_bounds(frame->restore_bounds_);
+  frame->docked_ = Frame::Dock::None;
   frame->state_ = Frame::State::Normal;
   frame->set_visible(true);
   if (active_ == frame) active_ = nullptr;
@@ -155,7 +156,8 @@ void WindowManager::maximize(Frame* frame) {
     frame->state_ = Frame::State::Normal;
     frame->set_bounds(frame->restore_bounds_);
   } else {
-    frame->restore_bounds_ = frame->bounds();
+    if (frame->docked_ == Frame::Dock::None) frame->restore_bounds_ = frame->bounds();   // (docked: the size from before stays)
+    frame->docked_ = Frame::Dock::None;
     frame->state_ = Frame::State::Maximized;
     frame->set_bounds({0, 0, bounds_.width, bounds_.height});
   }
@@ -167,17 +169,47 @@ void WindowManager::restore(Frame* frame) {
   if (!frame || frame->manager_ != this) return;
   if (frame->state_ == Frame::State::Minimized) {
     activate(frame);
-  } else if (frame->state_ == Frame::State::Maximized) {
+  } else if (frame->state_ == Frame::State::Maximized || frame->docked_ != Frame::Dock::None) {
     frame->state_ = Frame::State::Normal;
+    frame->docked_ = Frame::Dock::None;
     frame->set_bounds(frame->restore_bounds_);
     invalidate();
   }
+}
+
+Rect2D WindowManager::dock_bounds(Frame::Dock edge) const {
+  const uint32_t w = bounds_.width, h = bounds_.height, half_w = w / 2, half_h = h / 2;
+  switch (edge) {
+    case Frame::Dock::Left: return {0, 0, half_w, h};
+    case Frame::Dock::Right: return {static_cast<int32_t>(half_w), 0, w - half_w, h};
+    case Frame::Dock::Top: return {0, 0, w, half_h};
+    default: return {0, static_cast<int32_t>(half_h), w, h - half_h};
+  }
+}
+
+void WindowManager::dock(Frame* frame, Frame::Dock edge) {
+  UiGuard lock(this);
+  if (!frame || frame->manager_ != this || !frame->dock_enabled() || bounds_.width == 0 || bounds_.height == 0) return;
+  if (edge == Frame::Dock::None || edge == frame->docked_) {   // put it back
+    if (frame->docked_ != Frame::Dock::None) restore(frame);
+    return;
+  }
+  if (frame->state_ == Frame::State::Minimized) activate(frame);
+  if (frame->state_ == Frame::State::Maximized) {   // the size from before the maximizing stays the one to go back to
+    frame->state_ = Frame::State::Normal;
+  } else if (frame->docked_ == Frame::Dock::None) {
+    frame->restore_bounds_ = frame->bounds();
+  }
+  frame->docked_ = edge;
+  frame->set_bounds(dock_bounds(edge));
+  activate(frame);
 }
 
 void WindowManager::layout() {
   for (uint32_t i = 0; i < child_count(); ++i) {
     Frame* f = as_frame(child(i));
     if (f->state() == Frame::State::Maximized) f->set_bounds({0, 0, bounds_.width, bounds_.height});
+    else if (f->docked() != Frame::Dock::None) f->set_bounds(dock_bounds(f->docked()));
     else keep_inside(f);
   }
   Control::layout();
