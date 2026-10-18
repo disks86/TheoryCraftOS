@@ -24,7 +24,7 @@ namespace gui {
 
 Window::Window(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, const Theme& theme,
                const graphics::Extent2D& size)
-    : Control(allocator), renderer_(renderer), theme_(theme), title_(allocator), drag_text_(allocator), drop_text_(allocator), pending_(allocator) {
+    : Control(allocator), renderer_(renderer), theme_(theme), title_(allocator), drag_text_(allocator), drag_label_(allocator), drop_text_(allocator), pending_(allocator) {
   attach(this);  // (no children yet)
   bounds_ = {0, 0, size.width, size.height};
 }
@@ -76,7 +76,7 @@ void Window::render() {
     if (drag_source_) {
       // The dragged item follows the pointer: its name in a small box.
       painter.renderer().reset_clip();
-      const StringView name = drag_text_.view().substr(drag_text_.view().rfind('/') + 1);
+      const StringView name = drag_label_.empty() ? drag_text_.view().substr(drag_text_.view().rfind('/') + 1) : drag_label_.view();
       const int32_t w = Painter::text_width(name) + 8, h = Painter::kGlyphHeight + 4;
       const int32_t bx = cursor_.x + 14, by = cursor_.y + 14;
       painter.fill({bx - 1, by - 1, static_cast<uint32_t>(w + 2), static_cast<uint32_t>(h + 2)}, theme_.dark);
@@ -255,9 +255,9 @@ void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed
   target->on_mouse_down(a);
 }
 
-bool Window::begin_drag(Control* source, StringView text) {
+bool Window::begin_drag(Control* source, StringView text, StringView label) {
   UiGuard lock(this);
-  if (drag_source_ || !source || captured_ != source || text.empty() || !drag_text_.assign(text)) return false;
+  if (drag_source_ || !source || captured_ != source || text.empty() || !drag_text_.assign(text) || !drag_label_.assign(label)) return false;
   drag_source_ = source;
   mark_dirty();
   return true;
@@ -266,17 +266,20 @@ bool Window::begin_drag(Control* source, StringView text) {
 void Window::cancel_drag() {
   UiGuard lock(this);
   if (!drag_source_) return;
+  Control* source = drag_source_;
   drag_source_ = nullptr;
   drag_text_.clear();
   mark_dirty();
+  source->on_drag_ended(false, -1, -1);
 }
 
 void Window::finish_drag(int32_t x, int32_t y) {
-  const Control* source = drag_source_;
+  Control* source = drag_source_;
   drag_source_ = nullptr;
   Point origin;
+  bool dropped = false;
   for (Control* c = target_at(x, y, &origin); c; c = c->parent_) {
-    if (!c->effectively_enabled()) return;   // behind a modal window, say
+    if (!c->effectively_enabled()) break;   // behind a modal window, say
     const Point o = c->window_origin();
     if (!c->accepts_drop(drag_text_.view(), x - o.x, y - o.y, source)) continue;
     if (!drop_text_.assign(drag_text_.view())) break;
@@ -284,9 +287,11 @@ void Window::finish_drag(int32_t x, int32_t y) {
     drop_source_ = source;
     drop_point_ = {x - o.x, y - o.y};
     dispatch({&Window::run_drop, this}, *c);
+    dropped = true;
     break;
   }
   drag_text_.clear();
+  if (source) source->on_drag_ended(dropped, x, y);
 }
 
 void Window::run_drop(void* window, Control& target) {
@@ -429,7 +434,10 @@ void Window::control_removed(Control* control) {
   if (focus_ && is_inside(control, focus_)) set_focus(nullptr);
   if (hover_ && is_inside(control, hover_)) hover_ = nullptr;
   if (captured_ && is_inside(control, captured_)) captured_ = nullptr;
-  if (drag_source_ && is_inside(control, drag_source_)) cancel_drag();
+  if (drag_source_ && is_inside(control, drag_source_)) {
+    drag_source_ = nullptr;
+    drag_text_.clear();
+  }
   if (drop_target_ && is_inside(control, drop_target_)) drop_target_ = nullptr;
   if (popup_owner_ && is_inside(control, popup_owner_)) close_popup();
 }

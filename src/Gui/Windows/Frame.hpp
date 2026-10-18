@@ -22,6 +22,9 @@
 // one active and does what the buttons ask. Each button can be disabled: it is then drawn greyed and
 // ignores clicks (a dialog disables minimize and maximize).
 //
+// A frame can also be a tab of a TabFrame (a window that holds several frames, one shown at a time): it then has no title bar, border or
+// buttons of its own, only its client area, which fills the tab area of the host. Everything that works on the window - minimize, maximize,
+// dock, activate, state(), active(), manager() - then means the host window (close() closes just the tab); host() tells which one.
 // The title bar drags the window; the borders resize it (unless set_resizable(false)). Four more buttons left of those dock the window to a
 // half of the desktop area - the left or right half, or the upper or lower one - and pressing the one of the edge the window is docked at
 // puts it back. They are drawn for windows that can be maximized and resized. Moving or resizing a docked window frees it; maximizing it
@@ -33,6 +36,7 @@
 namespace gui {
 
 class WindowManager;
+class TabFrame;
 
 class Frame : public Control {
  public:
@@ -46,7 +50,12 @@ class Frame : public Control {
 
   explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator) {}
 
-  void set_title(StringView title) { UiGuard lock(this); title_.assign(title); invalidate(); }
+  void set_title(StringView title) {
+    UiGuard lock(this);
+    title_.assign(title);
+    invalidate();
+    if (host_) host_changed_title();
+  }
   StringView title() const { return title_.view(); }
 
   // The three title bar buttons (all enabled by default), and whether the borders resize.
@@ -63,12 +72,22 @@ class Frame : public Control {
   // removed from its manager.
   void on_closed(Handler handler) { UiGuard lock(this); closed_ = handler; }
 
-  State state() const { return state_; }
+  State state() const;
   // The half of the desktop the window is docked to (None: free).
   Dock docked() const { return docked_; }
   // Whether the dock buttons show: the window can be maximized and resized.
   bool dock_enabled() const { return can_maximize_ && resizable_; }
-  bool active() const { return active_; }
+  bool active() const;
+  // The tabbed window this frame is a tab of (nullptr: it is a window of its own).
+  Frame* host() const;
+  bool embedded() const { return host_ != nullptr; }
+  // This frame as a tabbed window (nullptr: it is not one).
+  virtual TabFrame* as_tabs() { return nullptr; }
+  // A number the program that made the frame can give it to tell the kinds of windows apart (a new tab opens a window of the same kind).
+  void set_app_kind(uint8_t kind) { app_kind_ = kind; }
+  uint8_t app_kind() const { return app_kind_; }
+  // The size the frame had as a window of its own (before it became a tab); empty if it has not been a tab yet.
+  Rect2D home_bounds() const { return home_; }
   bool modal() const { return modal_; }
   WindowManager* manager() const { return __atomic_load_n(&manager_, __ATOMIC_ACQUIRE); }  // safe from any thread
   // What the manager does for the buttons; no-ops while the frame is not in a manager.
@@ -93,8 +112,21 @@ class Frame : public Control {
   void on_mouse_up(const MouseArgs& args) override;
   bool on_key(const KeyArgs& args) override;
 
+ protected:
+  // Told when the manager the frame is in changes (a window manager added or removed it): a tabbed window passes that on to its tabs.
+  virtual void manager_changed() {}
+  // Told when the window manager closes the frame (after it was taken out): a tabbed window closes its tabs.
+  virtual void window_closed(Window* /*window*/) {}
+  // A tab changed its title / the host is asked to...
+  virtual void tab_title_changed(Frame* /*tab*/) {}
+
+  // The tab-side hooks of TabFrame; the closed handler of a frame is run the way the window manager runs it.
+  void run_closed_handler(Window* window);
+
  private:
   friend class WindowManager;
+  friend class TabFrame;
+  void host_changed_title();
 
   bool button_enabled(Part button) const;
   void draw_button(Painter& painter, Part button);
@@ -110,6 +142,9 @@ class Frame : public Control {
   bool can_minimize_ = true, can_maximize_ = true, can_close_ = true, resizable_ = true;
   bool escape_closes_ = false;
   Dock docked_ = Dock::None;
+  TabFrame* host_ = nullptr;
+  uint8_t app_kind_ = 0;
+  Rect2D home_;
   bool active_ = false, modal_ = false;
   // Mouse interaction in progress.
   Part pressed_ = Part::None;  // a title bar button held down

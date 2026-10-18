@@ -155,6 +155,9 @@ class Control {
   // the drag started in (it may be this one). on_drop() runs on the handler thread (see Handler), like a fired handler.
   virtual bool accepts_drop(StringView /*text*/, int32_t /*x*/, int32_t /*y*/, const Control* /*source*/) const { return false; }
   virtual void on_drop(StringView /*text*/, int32_t /*x*/, int32_t /*y*/, const Control* /*source*/) {}
+  // Called on the control a drag started in when the button was released (dropped: some control took it) or Escape cancelled it (x and y are -1).
+  // (x, y) is the pointer in window coordinates. Runs on the input thread under the UI lock.
+  virtual void on_drag_ended(bool /*dropped*/, int32_t /*x*/, int32_t /*y*/) {}
 
   // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
   Control* hit_test(int32_t x, int32_t y);

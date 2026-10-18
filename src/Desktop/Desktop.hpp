@@ -46,6 +46,7 @@
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Gui/Windows/Frame.hpp"
+#include "Gui/Windows/TabFrame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
 
@@ -66,6 +67,8 @@ uint32_t format_date_time(const DateTime& time, char* out);
 class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
+  // What gui::Frame::app_kind() says about a program's windows.
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -98,7 +101,7 @@ class Desktop {
     media_player_.set_services(mixer, codecs, clock);
   }
   // Opens the media player, or brings it forward (restoring it if minimized).
-  void open_media_player();
+  void open_media_player(gui::TabFrame* into = nullptr);
   // The Open and Save As dialog that the text editor and Paint share.
   FileDialog& file_dialog() { return file_dialog_; }
   // The color and print dialogs the programs share.
@@ -108,21 +111,21 @@ class Desktop {
   void set_print_service(IPrintService* service) { print_dialog_.set_print_service(service); }
   // Opens a paint window: the first one is paint() (when that is closed), further ones are made as needed and go away when closed.
   // Returns the window (nullptr if memory ran out).
-  Paint* open_paint();
+  Paint* open_paint(gui::TabFrame* into = nullptr);
   Notepad& notepad() { return notepad_; }
   // Opens a terminal window: the first one is terminal() (when that is closed), further ones are made as needed and go away when closed.
-  Terminal* open_terminal();
+  Terminal* open_terminal(gui::TabFrame* into = nullptr);
   Terminal& terminal() { return terminal_; }
   uint32_t terminal_count() const;
   // Opens a text editor window: the first one is notepad() (when that is closed), further ones are made as needed and go away when closed.
-  Notepad* open_text_editor();
+  Notepad* open_text_editor(gui::TabFrame* into = nullptr);
   TaskManager& task_manager() { return task_manager_; }
   // The machine's figures for the task manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { task_manager_.set_monitor(monitor); }
   // Opens the task manager, or brings it forward (restoring it if minimized); it refreshes once a second meanwhile.
   void open_task_manager();
   // Opens a file explorer window: the first one is explorer() (when that is closed), further ones are made as needed and go away when closed.
-  FileExplorer* open_explorer();
+  FileExplorer* open_explorer(gui::TabFrame* into = nullptr);
   // Opens what `path` names the way a double click in a file explorer would: a folder in a file explorer (an open one, else a new one), a
   // picture in Paint, a sound or video in the media player, anything else in a text editor. False if it does not exist.
   bool open_path(StringView path);
@@ -182,7 +185,12 @@ class Desktop {
 
   // Windows beyond the first of their kind (the members below): made when asked for, destroyed from pump() once they are closed.
   template <class T>
-  T* open_instance(T& first, List<UniquePointer<T>>& extras, void (Desktop::*setup)(T&));
+  T* open_instance(T& first, List<UniquePointer<T>>& extras, void (Desktop::*setup)(T&), gui::TabFrame* into);
+  gui::TabFrame* new_host();
+  // Puts the program window `tab` in a tab of `into`, or of a new window.
+  bool place(gui::Frame* tab, gui::TabFrame* into);
+  static void on_new_tab(void* self, gui::Control& sender);
+  static void on_tab_torn_off(void* self, gui::Control& sender);
   void setup_explorer(FileExplorer& explorer);
   void setup_notepad(Notepad& notepad);
   void setup_paint(Paint& paint);
@@ -224,6 +232,7 @@ class Desktop {
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;
   List<UniquePointer<Terminal>> extra_terminals_;
+  List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;
   ClockSource clock_source_ = nullptr;
   void* clock_context_ = nullptr;

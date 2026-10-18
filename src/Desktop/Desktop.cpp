@@ -55,7 +55,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       extra_explorers_(allocator),
       extra_notepads_(allocator),
       extra_paints_(allocator),
-      extra_terminals_(allocator) {
+      extra_terminals_(allocator),
+      hosts_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
   taskbar_.set_dock(DockStyle::Bottom);
@@ -107,6 +108,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   shutdown_dialog_.set_texts("Shut Down", "Shut down TheoryCraftOS now?", "Running services will be stopped.", "Shut Down", "Cancel");
   shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
 
+  media_player_.set_app_kind(kAppMedia);
   media_player_.set_notices(&notice_dialog_);
   media_player_.set_file_dialog(&file_dialog_);
   file_dialog_.set_notices(&notice_dialog_);
@@ -148,6 +150,14 @@ bool Desktop::on_shortcut(void* self, const KeyArgs& args) {
     d->windows_.cycle(!(args.modifiers & hardware::modifier::kShift));
     return true;
   }
+  if (args.usage == key::kTab && (args.modifiers & hardware::modifier::kControl)) {   // Ctrl+Tab: the next tab, whatever the focused program does with it
+    if (Frame* active = d->windows_.active())
+      if (TabFrame* tabs = active->as_tabs()) {
+        tabs->select_next(!(args.modifiers & hardware::modifier::kShift));
+        return true;
+      }
+    return false;
+  }
   if (args.usage == key::kLeftGui || args.usage == key::kRightGui) {
     d->start_.toggle_menu();
     return true;
@@ -172,6 +182,7 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
 }
 
 void Desktop::setup_explorer(FileExplorer& explorer) {
+  explorer.set_app_kind(kAppExplorer);
   explorer.set_notices(&notice_dialog_);
   explorer.set_clock(&now_us_);
   explorer.on_file_opened({&Desktop::on_explorer_file, this});
@@ -181,6 +192,7 @@ void Desktop::setup_explorer(FileExplorer& explorer) {
 }
 
 void Desktop::setup_notepad(Notepad& notepad) {
+  notepad.set_app_kind(kAppEditor);
   notepad.set_notices(&notice_dialog_);
   notepad.set_file_dialog(&file_dialog_);
   notepad.set_print_dialog(&print_dialog_);
@@ -188,6 +200,7 @@ void Desktop::setup_notepad(Notepad& notepad) {
 }
 
 void Desktop::setup_terminal(Terminal& terminal) {
+  terminal.set_app_kind(kAppTerminal);
   terminal.set_notices(&notice_dialog_);
   terminal.set_file_dialog(&file_dialog_);
   terminal.on_new_terminal({&Desktop::on_new_terminal, this});
@@ -196,6 +209,7 @@ void Desktop::setup_terminal(Terminal& terminal) {
 }
 
 void Desktop::setup_paint(Paint& paint) {
+  paint.set_app_kind(kAppPaint);
   paint.set_notices(&notice_dialog_);
   paint.set_file_dialog(&file_dialog_);
   paint.set_print_dialog(&print_dialog_);
@@ -206,7 +220,7 @@ void Desktop::setup_paint(Paint& paint) {
 // The first window of a kind is a member of the desktop; when it is already open the next ones are made on the heap, each a little
 // lower and to the right of the last so that they do not hide each other, and are destroyed (reap_closed) after they are closed.
 template <class T>
-T* Desktop::open_instance(T& first, List<UniquePointer<T>>& extras, void (Desktop::*setup)(T&)) {
+T* Desktop::open_instance(T& first, List<UniquePointer<T>>& extras, void (Desktop::*setup)(T&), TabFrame* into) {
   T* target = nullptr;
   window_.locked([&] {
     if (!first.manager()) {
@@ -218,15 +232,81 @@ T* Desktop::open_instance(T& first, List<UniquePointer<T>>& extras, void (Deskto
       if (!fresh) return;
       target = fresh.get();
       (this->*setup)(*target);
-      const Rect2D at = first.bounds();
+      const Rect2D at = first.home_bounds().width ? first.home_bounds() : first.bounds();
       const int32_t step = static_cast<int32_t>(open % 8) * 24;
       target->set_bounds({at.x + step, at.y + step, at.width, at.height});
       target->on_closed({&Desktop::on_extra_closed, this});
-      if (!extras.push_back(util::move(fresh))) return;
+      if (!extras.push_back(util::move(fresh))) {
+        target = nullptr;
+        return;
+      }
     }
-    if (!windows_.add_window(target)) target = nullptr;
+    if (!place(target, into)) target = nullptr;
   });
   return target;
+}
+
+TabFrame* Desktop::new_host() {
+  UniquePointer<TabFrame> fresh = UniquePointer<TabFrame>::make(allocator_, allocator_);
+  if (!fresh) return nullptr;
+  TabFrame* host = fresh.get();
+  host->on_new_tab({&Desktop::on_new_tab, this});
+  host->on_tab_torn_off({&Desktop::on_tab_torn_off, this});
+  host->on_closed({&Desktop::on_extra_closed, this});
+  if (!hosts_.push_back(util::move(fresh))) return nullptr;
+  return host;
+}
+
+bool Desktop::place(Frame* tab, TabFrame* into) {
+  bool placed = false;
+  window_.locked([&] {
+    if (into) {
+      placed = into->add_tab(tab);
+      return;
+    }
+    TabFrame* host = new_host();
+    if (!host) return;
+    const Rect2D b = tab->home_bounds().width ? tab->home_bounds() : tab->bounds();
+    host->set_bounds({b.x, b.y, b.width, b.height + static_cast<uint32_t>(TabFrame::kStripHeight)});
+    if (!host->add_tab(tab)) return;
+    placed = windows_.add_window(host);
+    if (!placed) host->remove_tab(tab);
+  });
+  return placed;
+}
+
+// The "+" of a tab strip: another tab of the program the window shows.
+void Desktop::on_new_tab(void* self, Control& sender) {
+  auto* d = static_cast<Desktop*>(self);
+  TabFrame* host = static_cast<TabFrame*>(&sender);
+  const uint8_t kind = host->selected() ? host->selected()->app_kind() : static_cast<uint8_t>(kAppExplorer);
+  switch (kind) {
+    case kAppEditor: d->open_text_editor(host); break;
+    case kAppPaint: d->open_paint(host); break;
+    case kAppTerminal: d->open_terminal(host); break;
+    case kAppMedia: d->open_media_player(host); break;
+    default: d->open_explorer(host); break;
+  }
+}
+
+// A tab was dragged out of its window onto the desktop: it gets a window of its own where the pointer was let go.
+void Desktop::on_tab_torn_off(void* self, Control& sender) {
+  auto* d = static_cast<Desktop*>(self);
+  TabFrame* host = static_cast<TabFrame*>(&sender);
+  d->window_.locked([&] {
+    Frame* tab = host->torn_tab();
+    if (!tab || tab->host() != host || host->tab_count() < 2) return;
+    const Point at = host->torn_point();
+    const Rect2D size = host->bounds();
+    host->remove_tab(tab);
+    TabFrame* fresh = d->new_host();
+    if (fresh) {
+      fresh->set_bounds({at.x - 60, at.y - 12, size.width, size.height});
+      if (fresh->add_tab(tab) && d->windows_.add_window(fresh)) return;
+      fresh->remove_tab(tab);
+    }
+    host->add_tab(tab);   // (no memory: it stays where it was)
+  });
 }
 
 void Desktop::on_extra_closed(void* self, Control&) { __atomic_store_n(&static_cast<Desktop*>(self)->reap_needed_, true, __ATOMIC_RELEASE); }
@@ -241,10 +321,11 @@ void Desktop::reap_closed() {
     sweep(extra_notepads_);
     sweep(extra_paints_);
     sweep(extra_terminals_);
+    sweep(hosts_);
   });
 }
 
-FileExplorer* Desktop::open_explorer() { return open_instance(explorer_, extra_explorers_, &Desktop::setup_explorer); }
+FileExplorer* Desktop::open_explorer(TabFrame* into) { return open_instance(explorer_, extra_explorers_, &Desktop::setup_explorer, into); }
 
 void Desktop::refresh_explorers() {
   window_.locked([&] {
@@ -279,9 +360,9 @@ void Desktop::open_task_manager() {
   }
 }
 
-Notepad* Desktop::open_text_editor() { return open_instance(notepad_, extra_notepads_, &Desktop::setup_notepad); }
+Notepad* Desktop::open_text_editor(TabFrame* into) { return open_instance(notepad_, extra_notepads_, &Desktop::setup_notepad, into); }
 
-Terminal* Desktop::open_terminal() { return open_instance(terminal_, extra_terminals_, &Desktop::setup_terminal); }
+Terminal* Desktop::open_terminal(TabFrame* into) { return open_instance(terminal_, extra_terminals_, &Desktop::setup_terminal, into); }
 
 uint32_t Desktop::terminal_count() const {
   uint32_t n = terminal_.manager() ? 1 : 0;
@@ -292,7 +373,7 @@ uint32_t Desktop::terminal_count() const {
 void Desktop::on_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
 void Desktop::on_new_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
 
-Paint* Desktop::open_paint() { return open_instance(paint_, extra_paints_, &Desktop::setup_paint); }
+Paint* Desktop::open_paint(TabFrame* into) { return open_instance(paint_, extra_paints_, &Desktop::setup_paint, into); }
 
 Notepad* Desktop::editor_for(StringView path) {
   Notepad* found = nullptr;
@@ -328,9 +409,11 @@ Paint* Desktop::paint_for(StringView path) {
   return found;
 }
 
-void Desktop::open_media_player() {
-  if (media_player_.manager()) media_player_.activate();
-  else windows_.add_window(&media_player_);
+void Desktop::open_media_player(TabFrame* into) {
+  window_.locked([&] {
+    if (media_player_.manager()) media_player_.activate();
+    else place(&media_player_, into);
+  });
 }
 
 void Desktop::open_about() {

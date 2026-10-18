@@ -18,6 +18,7 @@
 
 #include "Gui/Windows/Frame.hpp"
 #include "Gui/Window.hpp"
+#include "Gui/Windows/TabFrame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -27,32 +28,58 @@ namespace {
 constexpr int32_t kCorner = 18;  // how far along an edge a corner grip reaches
 }
 
+Frame* Frame::host() const { return host_; }
+Frame::State Frame::state() const { return host_ ? host_->state_ : state_; }
+bool Frame::active() const { return host_ ? host_->active_ && host_->selected() == this : active_; }
+void Frame::host_changed_title() { host_->tab_title_changed(this); }
+
+void Frame::run_closed_handler(Window* window) {
+  const Handler closed = closed_;
+  if (!closed) return;
+  if (window) window->dispatch(closed, *this);
+  else closed(*this);
+}
+
 void Frame::minimize() {
   UiGuard lock(this);
-  if (manager_) manager_->minimize(this);
+  if (host_) host_->minimize();
+  else if (manager_) manager_->minimize(this);
 }
 void Frame::maximize() {
   UiGuard lock(this);
-  if (manager_) manager_->maximize(this);
+  if (host_) host_->maximize();
+  else if (manager_) manager_->maximize(this);
 }
 void Frame::restore() {
   UiGuard lock(this);
-  if (manager_) manager_->restore(this);
+  if (host_) host_->restore();
+  else if (manager_) manager_->restore(this);
 }
 void Frame::close() {
   UiGuard lock(this);
-  if (manager_) manager_->close_window(this);
+  if (host_) host_->close_tab(this);
+  else if (manager_) manager_->close_window(this);
 }
 void Frame::dock(Dock edge) {
   UiGuard lock(this);
-  if (manager_) manager_->dock(this, edge);
+  if (host_) host_->dock(edge);
+  else if (manager_) manager_->dock(this, edge);
 }
 void Frame::activate() {
   UiGuard lock(this);
-  if (manager_) manager_->activate(this);
+  if (host_) {
+    host_->select_tab(this);
+    host_->activate();
+  } else if (manager_) {
+    manager_->activate(this);
+  }
 }
 
 Rect2D Frame::client_rect() const {
+  if (host_) {   // a tab: the whole area, inside the padding
+    const int32_t pw = static_cast<int32_t>(bounds_.width) - padding().left - padding().right, ph = static_cast<int32_t>(bounds_.height) - padding().top - padding().bottom;
+    return {padding().left, padding().top, static_cast<uint32_t>(pw > 0 ? pw : 0), static_cast<uint32_t>(ph > 0 ? ph : 0)};
+  }
   const int32_t top = kBorder + kTitleHeight + 1;
   const int32_t w = static_cast<int32_t>(bounds_.width) - 2 * kBorder, h = static_cast<int32_t>(bounds_.height) - top - kBorder;
   return {kBorder + padding().left, top + padding().top,
@@ -82,6 +109,7 @@ bool Frame::button_enabled(Part button) const {
 Frame::Part Frame::part_at(int32_t x, int32_t y) const {
   const int32_t w = static_cast<int32_t>(bounds_.width), h = static_cast<int32_t>(bounds_.height);
   if (x < 0 || y < 0 || x >= w || y >= h) return Part::None;
+  if (host_) return Part::Client;
   static const Part kButtons[7] = {Part::Close, Part::Maximize, Part::Minimize, Part::DockLeft, Part::DockRight, Part::DockTop, Part::DockBottom};
   for (Part b : kButtons) {
     if (is_dock_part(b) && !dock_enabled()) continue;
@@ -164,6 +192,10 @@ void Frame::draw_button(Painter& painter, Part button) {
 
 void Frame::paint(Painter& painter) {
   const Theme& t = painter.theme();
+  if (host_) {   // a tab has only its surface
+    painter.fill({0, 0, bounds_.width, bounds_.height}, t.face);
+    return;
+  }
   const Rect2D all{0, 0, bounds_.width, bounds_.height};
   painter.fill(all, t.face);
   painter.bevel(all, false);

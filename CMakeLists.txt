@@ -327,6 +327,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/JpegEncoder.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp
+  src/Gui/Windows/TabFrame.cpp
   src/Gui/Windows/WindowManager.cpp
   src/Gui/Windows/WindowSwitcher.cpp
   src/Gui/MessageDialog.cpp

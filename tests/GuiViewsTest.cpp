@@ -4034,6 +4034,10 @@ static void test_application_context_menus() {
   CHECK(a.live == 0);
 }
 
+// Where a program's window is: the tabbed window around it (a program is a tab of one), or the frame itself.
+static void put(Frame* f, const Rect2D& r) { (f->host() ? f->host() : f)->set_bounds(r); }
+static void put(Frame& f, const Rect2D& r) { put(&f, r); }
+
 // Several windows of one program, and files dragged from one file explorer to another and onto an editor.
 static Point item_point(allocators::IAllocator& a, desktop::FileExplorer& e, const char* name) {
   for (uint32_t i = 0; i < e.view().item_count(); ++i) {
@@ -4062,15 +4066,15 @@ static void test_desktop_multiple_windows() {
     // Every Start menu entry opens one more window; closing the extra ones destroys them.
     desktop::FileExplorer* ex1 = d.open_explorer();
     CHECK(ex1 == &d.explorer() && d.explorer_count() == 1);
-    ex1->set_bounds({0, 0, 380, 250});
+    put(ex1, {0, 0, 380, 250});
     desktop::FileExplorer* ex2 = d.open_explorer();
     CHECK(ex2 && ex2 != ex1 && d.explorer_count() == 2 && d.windows().window_count() == 2);
-    ex2->set_bounds({400, 0, 380, 250});
+    put(ex2, {400, 0, 380, 250});
     CHECK(ex2->open_folder("/dest"));
-    d.open_text_editor()->set_bounds({0, 270, 300, 300});
+    put(d.open_text_editor(), {0, 270, 300, 300});
     desktop::Notepad* second = d.open_text_editor();
     CHECK(second != &d.notepad() && d.text_editor_count() == 2);
-    second->set_bounds({310, 270, 300, 300});
+    put(second, {310, 270, 300, 300});
     w.layout();
 
     // Drag a.txt from the first explorer over to the second one: it moves into /dest, and both lists show it.
@@ -4188,9 +4192,9 @@ static void test_copy_progress() {
     d.set_file_system(&fs);
     Window& w = d.window();
     desktop::FileExplorer* ex1 = d.open_explorer();
-    ex1->set_bounds({0, 0, 380, 250});
+    put(ex1, {0, 0, 380, 250});
     desktop::FileExplorer* ex2 = d.open_explorer();
-    ex2->set_bounds({400, 0, 380, 250});
+    put(ex2, {400, 0, 380, 250});
     CHECK(ex1->open_folder("/top") && ex2->open_folder("/dest"));
     w.layout();
 
@@ -4239,8 +4243,8 @@ static void test_terminal() {
     CHECK(t == &d.terminal() && d.terminal_count() == 1);
     desktop::Terminal* other = d.open_terminal();
     CHECK(other != t && d.terminal_count() == 2);
-    other->set_bounds({0, 320, 300, 200});
-    t->set_bounds({400, 0, 380, 300});
+    put(other, {0, 320, 300, 200});
+    put(t, {400, 0, 380, 300});
     w.layout();
 
     // Commands, typed with the keyboard on the line; the prompt shows the folder.
@@ -4290,7 +4294,7 @@ static void test_terminal() {
     // A folder dragged from a file explorer to the terminal becomes the current folder; a file puts its path on the line.
     t->shell().change_directory("/");
     desktop::FileExplorer* ex = d.open_explorer();
-    ex->set_bounds({0, 0, 380, 300});
+    put(ex, {0, 0, 380, 300});
     CHECK(ex->open_folder("/docs"));
     make_file(fs, "/docs/note.txt", "n");
     ex->refresh();
@@ -4387,7 +4391,7 @@ static void test_desktop_shortcuts() {
     Frame* e = &d.notepad();
     Frame* p = &d.paint();
     Frame* x = &d.explorer();
-    CHECK(m.active() == x);
+    CHECK(m.active() == x->host());
     auto press = [&](uint8_t usage, uint8_t modifiers) {
       KeyArgs k;
       k.usage = usage;
@@ -4396,20 +4400,20 @@ static void test_desktop_shortcuts() {
     };
     const uint8_t alt = hardware::modifier::kLeftAlt, shift = hardware::modifier::kLeftShift;
     press(hardware::key::kTab, alt);
-    CHECK(m.active() == e && m.stacking_index(e) == 2);
+    CHECK(m.active() == e->host() && m.stacking_index(e->host()) == 2);
     press(hardware::key::kTab, alt);
-    CHECK(m.active() == p);
+    CHECK(m.active() == p->host());
     press(hardware::key::kTab, alt);
-    CHECK(m.active() == x);                                   // all the way round
+    CHECK(m.active() == x->host());                                   // all the way round
     press(hardware::key::kTab, alt | shift);
-    CHECK(m.active() == p);                                   // backwards: the window behind the front one
+    CHECK(m.active() == p->host());                                   // backwards: the window behind the front one
     press(hardware::key::kTab, alt | shift);
-    CHECK(m.active() == e);
+    CHECK(m.active() == e->host());
     // A minimized window is brought back by going forwards to it.
     e->minimize();
     CHECK(e->state() == Frame::State::Minimized);
     for (int i = 0; i < 3 && e->state() == Frame::State::Minimized; ++i) press(hardware::key::kTab, alt);
-    CHECK(e->state() == Frame::State::Normal && m.active() == e);
+    CHECK(e->state() == Frame::State::Normal && m.active() == e->host());
     // Tab without Alt is still an ordinary key.
     Frame* before = m.active();
     press(hardware::key::kTab, 0);
@@ -4441,7 +4445,7 @@ static void test_terminal_links() {
     d.set_file_system(&fs);
     Window& w = d.window();
     desktop::Terminal* t = d.open_terminal();
-    t->set_bounds({300, 0, 480, 500});
+    put(t, {300, 0, 480, 500});
     t->view().clear();
     w.layout();
     t->run("cd docs");
@@ -4473,7 +4477,7 @@ static void test_terminal_links() {
     click(w, p.x, p.y);
     CHECK(d.explorer_count() == 1 && d.explorer().path().equals("/docs/deep"));
     // An absolute path with punctuation behind it, and a quoted one. (The explorer is moved aside: it opened over the terminal.)
-    d.explorer().set_bounds({0, 520, 200, 80});
+    put(d.explorer(), {0, 520, 200, 80});
     w.layout();
     p = point_of("/docs/deep,");
     click(w, p.x, p.y);
@@ -4484,7 +4488,7 @@ static void test_terminal_links() {
     click(w, p.x, p.y);
     CHECK(d.paint_count() == 1);
     if (d.notice_dialog().showing()) d.notice_dialog().ok_button().click();   // (the file is not a real picture)
-    d.paint().set_bounds({0, 520, 200, 80});
+    put(d.paint(), {0, 520, 200, 80});
     t->run("cd ..");
     w.layout();
     p = point_of("/docs/a.txt");
@@ -4499,6 +4503,167 @@ static void test_terminal_links() {
     w.mouse_move(p.x + 40, p.y);
     w.mouse_button(p.x + 40, p.y, MouseButton::Left, false);
     CHECK(d.text_editor_count() == 0);
+  }
+  CHECK(a.live == 0);
+}
+
+// Every program is a tab of a tabbed window: "+" opens another tab, tabs are dragged between windows and out of them, closed, and reordered.
+static Point tab_point(Frame* host, uint32_t index, int32_t dx = 20) {
+  auto* h = static_cast<gui::TabFrame*>(host);
+  const Rect2D r = h->tab_rect(index);
+  const Point o = h->window_origin();
+  return {o.x + r.x + dx, o.y + r.y + static_cast<int32_t>(r.height) / 2};
+}
+
+static void test_tabs() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+
+    // A program opens in a window with one tab; the window's title is the tab's.
+    desktop::Notepad* n1 = d.open_text_editor();
+    auto* h1 = static_cast<gui::TabFrame*>(n1->host());
+    CHECK(h1 && n1->embedded() && h1->tab_count() == 1 && h1->selected() == n1 && m.window_count() == 1);
+    CHECK(h1->title().equals(n1->title()) && n1->manager() == &m && n1->state() == Frame::State::Normal && n1->active());
+    put(h1, {20, 20, 480, 300});
+    w.layout();
+
+    // The tab fills the area under the strip.
+    CHECK(n1->bounds().y >= gui::TabFrame::kStripHeight && n1->visible());
+
+    // Editing changes the title: the tab strip and the window follow.
+    d.notepad().editor().set_text("x");
+    d.notepad().open_file("/nothing");   // fails with a notice, harmless
+    if (d.notice_dialog().showing()) d.notice_dialog().ok_button().click();
+    make_file(fs, "/f.txt", "file");
+    CHECK(d.notepad().open_file("/f.txt") && h1->title().equals(d.notepad().title()));
+
+    // "+": a second text editor tab in the same window; the new one is selected, the old one hidden.
+    const Rect2D plus = h1->new_tab_button_rect();
+    const Point po = h1->window_origin();
+    click(w, po.x + plus.x + 8, po.y + plus.y + 6);
+    CHECK(h1->tab_count() == 2 && m.window_count() == 1 && d.text_editor_count() == 2);
+    desktop::Notepad* n2 = static_cast<desktop::Notepad*>(h1->tab_at(1));
+    CHECK(n2 != n1 && h1->selected() == n2 && n2->visible() && !n1->visible() && n2->app_kind() == n1->app_kind());
+    CHECK(h1->title().equals(n2->title()));
+    // Clicking the first tab shows it again.
+    Point tp = tab_point(h1, 0);
+    click(w, tp.x, tp.y);
+    CHECK(h1->selected() == n1 && n1->visible() && !n2->visible());
+    // Ctrl+T and Ctrl+Tab.
+    KeyArgs ct;
+    ct.usage = hardware::key::kA + 19;
+    ct.modifiers = hardware::modifier::kLeftControl;
+    w.set_focus(&n1->editor());
+    w.key(ct);
+    CHECK(h1->tab_count() == 3);
+    KeyArgs next;
+    next.usage = hardware::key::kTab;
+    next.modifiers = hardware::modifier::kLeftControl;
+    w.key(next);
+    CHECK(h1->selected() == h1->tab_at(0));
+
+    // Dragging the third tab out of the window onto the desktop makes a window of its own.
+    Frame* third = h1->tab_at(2);
+    tp = tab_point(h1, 2);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    w.mouse_move(tp.x + 100, tp.y + 300);
+    CHECK(w.dragging());
+    w.mouse_button(tp.x + 100, tp.y + 300, MouseButton::Left, false);
+    CHECK(m.window_count() == 2 && h1->tab_count() == 2 && third->host() && third->host() != h1);
+    auto* h2 = static_cast<gui::TabFrame*>(third->host());
+    CHECK(h2->tab_count() == 1 && h2->selected() == third && h2->manager() == &m && third->manager() == &m);
+    put(h2, {520, 20, 440, 300});
+    w.layout();
+
+    // A window with a single tab cannot be torn off: nothing happens (the window itself is dragged by its title bar).
+    tp = tab_point(h2, 0);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    w.mouse_move(tp.x + 20, tp.y + 200);
+    w.mouse_button(tp.x + 20, tp.y + 200, MouseButton::Left, false);
+    CHECK(m.window_count() == 2 && h2->tab_count() == 1);
+
+    // Dropping a tab on another window's strip moves it there, at the place it was let go.
+    Frame* moved = h1->tab_at(1);
+    tp = tab_point(h1, 1);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    Point strip = tab_point(h2, 0, 4);   // the left half of the only tab: before it
+    w.mouse_move(strip.x + 30, strip.y);
+    w.mouse_move(strip.x, strip.y);
+    CHECK(w.dragging());
+    w.mouse_button(strip.x, strip.y, MouseButton::Left, false);
+    CHECK(h1->tab_count() == 1 && h2->tab_count() == 2 && h2->tab_at(0) == moved && h2->tab_at(1) == third && h2->selected() == moved);
+    CHECK(moved->host() == h2 && moved->manager() == &m && h2->title().equals(moved->title()));
+
+    // Reordering inside a strip.
+    tp = tab_point(h2, 0);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    const Point end = tab_point(h2, 1, 120);
+    w.mouse_move(end.x, end.y);
+    w.mouse_button(end.x, end.y, MouseButton::Left, false);
+    CHECK(h2->tab_at(0) == third && h2->tab_at(1) == moved);
+
+    // Moving the last tab of a window into another closes the emptied window.
+    Frame* only = h1->tab_at(0);
+    tp = tab_point(h1, 0);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    strip = tab_point(h2, 1, 100);
+    w.mouse_move(strip.x + 40, strip.y);
+    w.mouse_move(strip.x, strip.y);
+    w.mouse_button(strip.x, strip.y, MouseButton::Left, false);
+    CHECK(h2->tab_count() == 3 && only->host() == h2 && m.window_count() == 1 && h1->manager() == nullptr);
+
+    // Escape cancels a drag.
+    tp = tab_point(h2, 1);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    w.mouse_move(tp.x, tp.y + 250);
+    CHECK(w.dragging());
+    KeyArgs esc;
+    esc.usage = hardware::key::kEscape;
+    w.key(esc);
+    w.mouse_button(tp.x, tp.y + 250, MouseButton::Left, false);
+    CHECK(h2->tab_count() == 3 && m.window_count() == 1);
+
+    // Closing: the close button of a tab, then the last tab closes the window; extra editors are cleaned up.
+    d.step(1000000);
+    while (h2->tab_count() > 1) {
+      const Rect2D c = h2->close_rect(h2->tab_count() - 1);
+      const Point o = h2->window_origin();
+      click(w, o.x + c.x + 5, o.y + c.y + 5);
+    }
+    CHECK(h2->tab_count() == 1 && m.window_count() == 1);
+    Frame* last = h2->tab_at(0);
+    const Rect2D c = h2->close_rect(0);
+    const Point o = h2->window_origin();
+    click(w, o.x + c.x + 5, o.y + c.y + 5);
+    CHECK(m.window_count() == 0 && last->host() == nullptr && last->manager() == nullptr);
+    d.step(2000000);
+    CHECK(d.text_editor_count() == 0);
+    // Everything can be opened again afterwards.
+    CHECK(d.open_text_editor() && d.text_editor_count() == 1 && m.window_count() == 1);
+
+    // Closing a window closes its tabs; a program closing itself (File > Close) closes only its tab.
+    gui::TabFrame* h3 = static_cast<gui::TabFrame*>(d.open_terminal()->host());
+    d.open_terminal(h3);
+    CHECK(h3->tab_count() == 2 && d.terminal_count() == 2);
+    h3->tab_at(1)->close();
+    CHECK(h3->tab_count() == 1 && d.terminal_count() == 1);
+    d.open_terminal(h3);
+    h3->close();
+    CHECK(h3->manager() == nullptr && d.terminal_count() == 0 && h3->tab_count() == 0);
+    d.step(3000000);
+    CHECK(d.terminal_count() == 0);
   }
   CHECK(a.live == 0);
 }
@@ -4523,7 +4688,7 @@ static void test_window_switcher_menu() {
     // Right-clicking a button opens the menu of that window.
     Point p = button_point(0);
     right_click(w, p.x, p.y);
-    CHECK(sw.window_menu().open() && sw.menu_frame() == &d.notepad());
+    CHECK(sw.window_menu().open() && sw.menu_frame() == d.notepad().host());
     CHECK(!sw.window_menu().find_item("Restore")->enabled() && sw.window_menu().find_item("Minimize")->enabled() && sw.window_menu().find_item("Maximize")->enabled() &&
           sw.window_menu().find_item("Close")->enabled());
     w.close_popup();
@@ -4532,9 +4697,9 @@ static void test_window_switcher_menu() {
     right_click(w, p.x, p.y);
     CHECK(sw.window_menu().find_item("Restore")->enabled() && !sw.window_menu().find_item("Minimize")->enabled());
     w.close_popup();
-    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Restore") && d.notepad().state() == Frame::State::Normal && d.windows().active() == &d.notepad());
+    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Restore") && d.notepad().state() == Frame::State::Normal && d.windows().active() == d.notepad().host());
     p = button_point(1);
-    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Maximize") && d.paint().state() == Frame::State::Maximized && sw.menu_frame() == &d.paint());
+    CHECK(choose_context(w, sw.window_menu(), p.x, p.y, "Maximize") && d.paint().state() == Frame::State::Maximized && sw.menu_frame() == d.paint().host());
     right_click(w, p.x, p.y);
     CHECK(sw.window_menu().find_item("Restore")->enabled() && !sw.window_menu().find_item("Maximize")->enabled());
     w.close_popup();
@@ -4586,6 +4751,7 @@ int main() {
   test_terminal_links();
   test_dock_buttons();
   test_desktop_shortcuts();
+  test_tabs();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

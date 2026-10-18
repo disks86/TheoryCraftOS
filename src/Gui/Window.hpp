@@ -113,10 +113,11 @@ class Window final : public Control {
   // part of the text. When the button is released the controls under the pointer are asked accept_drop() (the nearest first) and the
   // first that says yes gets on_drop(). Escape cancels. Only one drag at a time; false if one is running or `source` is not the
   // control that holds the mouse.
-  bool begin_drag(Control* source, StringView text);
+  // `label` is what the pointer shows (default: the last part of `text`, after the final '/').
+  bool begin_drag(Control* source, StringView text, StringView label = StringView());
   bool dragging() const { return drag_source_ != nullptr; }
   StringView drag_text() const { return drag_text_.view(); }
-  void cancel_drag();
+  void cancel_drag();   // (the source is told, see Control::on_drag_ended)
 
   // --- Focus. Tab / Shift+Tab move it through focusable controls in tree order.
   Control* focus() const { return focus_; }
@@ -168,7 +169,7 @@ class Window final : public Control {
   KeyFilter key_filter_ = nullptr;
   void* key_filter_context_ = nullptr;
   Control* drag_source_ = nullptr;
-  String drag_text_;
+  String drag_text_, drag_label_;
   Control* drop_target_ = nullptr;   // the drop waiting for the handler thread
   const Control* drop_source_ = nullptr;
   String drop_text_;

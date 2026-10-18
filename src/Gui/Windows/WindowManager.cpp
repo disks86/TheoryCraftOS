@@ -58,6 +58,7 @@ bool WindowManager::add_window(Frame* frame, bool modal) {
     return false;
   }
   __atomic_store_n(&frame->manager_, this, __ATOMIC_RELEASE);
+  frame->manager_changed();
   frame->modal_ = modal;
   frame->state_ = Frame::State::Normal;
   frame->set_visible(true);
@@ -76,6 +77,7 @@ bool WindowManager::remove_window(Frame* frame) {
     }
   remove(frame);
   __atomic_store_n(&frame->manager_, static_cast<WindowManager*>(nullptr), __ATOMIC_RELEASE);
+  frame->manager_changed();
   frame->modal_ = false;
   frame->active_ = false;
   frame->set_enabled(true);
@@ -95,6 +97,7 @@ void WindowManager::close_window(Frame* frame) {
   const Handler closed = frame->closed_;
   Window* w = window();
   remove_window(frame);
+  frame->window_closed(w);
   if (!closed) return;
   if (w) w->dispatch(closed, *frame);
   else closed(*frame);
