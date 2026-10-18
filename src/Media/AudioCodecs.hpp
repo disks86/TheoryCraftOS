@@ -33,6 +33,7 @@ namespace media {
 //         fixed predictors with Rice coding, adaptive stereo, 16-bit.
 //   MPEG audio  decode only: Layer III (MP3), Layer II (MP2) and Layer I, MPEG-1, 2 and 2.5, mono and stereo.
 //   Ogg Vorbis  decode only: floor 1 streams (all current encoders), mono and stereo (more channels keep the front pair).
+//   MIDI files are not decoded here: they are played by a synthesizer (see Midi/MidiStream.hpp and open_audio_stream()).
 // Not provided: AAC and Opus.
 bool decode_wav(ConstByteView data, AudioData* out);
 bool encode_wav(const AudioData& audio, ByteBuffer* out);

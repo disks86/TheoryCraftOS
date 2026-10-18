@@ -100,6 +100,8 @@ class Desktop {
   void set_media_services(audio::AudioMixer* mixer, hardware::SystemVideoCodecs* codecs, const hardware::IClock* clock) {
     media_player_.set_services(mixer, codecs, clock);
   }
+  // The machine's MIDI output hardware for the media player to play MIDI files on (nullptr: none, they are synthesized in software).
+  void set_midi_output(midi::IMidiSink* output) { media_player_.set_midi_output(output); }
   // Opens the media player, or brings it forward (restoring it if minimized).
   void open_media_player(gui::TabFrame* into = nullptr);
   // The Open and Save As dialog that the text editor and Paint share.

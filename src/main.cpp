@@ -22,6 +22,7 @@
 #include "Allocators/ThreadSafeAllocator.hpp"
 #include "Hardware/Bus/Pci/PciBar.hpp"
 #include "Hardware/MmioMapper.hpp"
+#include "Hardware/MidiDevice/X86MidiPortIo.hpp"
 #include "Kernel/Paging.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
@@ -473,7 +474,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     for (uint8_t f = 1; f <= static_cast<uint8_t>(media::ImageFormat::Webp); ++f) images.text(" ").text(media::image_format_name(static_cast<media::ImageFormat>(f)));
     Entry sounds(Level::Ok, "Media");
     sounds.text("sound:");
-    for (uint8_t f = 1; f <= static_cast<uint8_t>(media::AudioFileFormat::Mp4); ++f) sounds.text(" ").text(media::audio_format_name(static_cast<media::AudioFileFormat>(f)));
+    for (uint8_t f = 1; f <= static_cast<uint8_t>(media::AudioFileFormat::Midi); ++f) sounds.text(" ").text(media::audio_format_name(static_cast<media::AudioFileFormat>(f)));
     Entry movies(Level::Ok, "Media");
     movies.text("video: AVI (Motion JPEG, raw, H.264), MP4/MOV (H.264), GIF, APNG, Y4M; JPEG on ").text(media_codecs.jpeg_accelerated() ? "a video engine, else the CPU" : "the CPU");
   }
@@ -694,6 +695,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
+    // MIDI files go to MIDI hardware when the machine has an MPU-401 port; otherwise the media player synthesizes them.
+    hardware::X86MidiPortIo midi_ports;
+    hardware::Mpu401Output midi_usual(midi_ports, hardware::Mpu401Output::kUsualBase);   // (0x300, the other base, is a network card's)
+    if (midi_usual.initialize()) {
+      desktop.set_midi_output(&midi_usual);
+      Entry(Level::Ok, "MIDI").text("MPU-401 output at port 0x330");
+    } else {
+      Entry(Level::Info, "MIDI").text("no MIDI hardware found; MIDI files are synthesized in software");
+    }
     desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());
     explorer_files.set_notifier(on_storage_change, &desktop);

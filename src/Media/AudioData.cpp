@@ -32,6 +32,7 @@ const char* audio_format_name(AudioFileFormat format) {
     case AudioFileFormat::Mp3: return "MP3";
     case AudioFileFormat::Aac: return "AAC";
     case AudioFileFormat::Mp4: return "MP4";
+    case AudioFileFormat::Midi: return "MIDI";
     case AudioFileFormat::Unknown: break;
   }
   return "unknown";
@@ -45,6 +46,7 @@ AudioFileFormat detect_audio_format(ConstByteView d) {
     return true;
   };
   if (starts("RIFF", 0) && starts("WAVE", 8)) return AudioFileFormat::Wav;
+  if (starts("MThd", 0) || (starts("RIFF", 0) && starts("RMID", 8))) return AudioFileFormat::Midi;
   if (starts("FORM", 0) && (starts("AIFF", 8) || starts("AIFC", 8))) return AudioFileFormat::Aiff;
   if (starts(".snd", 0)) return AudioFileFormat::Au;
   if (starts("fLaC", 0)) return AudioFileFormat::Flac;

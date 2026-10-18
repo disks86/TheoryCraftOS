@@ -45,6 +45,7 @@ bool AudioPlayer::open(IPcmSource* source) {
   bool notify = false;
   {
     kernel::ScopedMutex guard(mutex_);
+    if (source_) source_->playback_paused();
     if (stream_) stream_->close();  // the old sound is cut off
     stream_ = mixer_.open_stream(format);
     if (!stream_) {
@@ -99,6 +100,7 @@ void AudioPlayer::pause() {
   {
     kernel::ScopedMutex guard(mutex_);
     if (state_ != PlayerState::Playing) return;
+    if (source_) source_->playback_paused();
     // What was fed but not yet heard is thrown away, and the position goes back to where we were.
     if (stream_) {
       const uint64_t queued = frame_size_ ? stream_->queued_bytes() / frame_size_ : 0;
@@ -115,6 +117,7 @@ void AudioPlayer::stop() {
   {
     kernel::ScopedMutex guard(mutex_);
     if (!source_) return;
+    source_->playback_paused();
     if (stream_) stream_->flush();
     next_frame_ = 0;
     change_state(PlayerState::Stopped, &notify);

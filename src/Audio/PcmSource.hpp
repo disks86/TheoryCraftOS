@@ -30,6 +30,8 @@ class IPcmSource {
   virtual uint64_t frame_count() const = 0;
   // Copies whole frames starting at `frame` into `out`; returns the bytes copied (0 at or past the end).
   virtual uint32_t read(uint64_t frame, ByteView out) = 0;
+  // The player stopped or paused (it will not read for a while): a source that drives hardware silences it here. Called with the player locked.
+  virtual void playback_paused() {}
 
  protected:
   constexpr IPcmSource() = default;

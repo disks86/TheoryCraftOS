@@ -24,7 +24,7 @@
 
 namespace media {
 
-enum class AudioFileFormat : uint8_t { Unknown, Wav, Aiff, Au, Flac, Vorbis, Mp3, Aac, Mp4 };
+enum class AudioFileFormat : uint8_t { Unknown, Wav, Aiff, Au, Flac, Vorbis, Mp3, Aac, Mp4, Midi };
 const char* audio_format_name(AudioFileFormat format);
 constexpr uint32_t audio_format_bit(AudioFileFormat format) { return 1u << static_cast<uint8_t>(format); }
 AudioFileFormat detect_audio_format(ConstByteView data);

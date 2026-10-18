@@ -31,7 +31,7 @@ using filesystem::OpenMode;
 using filesystem::Status;
 
 namespace {
-const char kMediaExtensions[] = "wav;aif;aiff;au;flac;ogg;mp3;aac;m4a;avi;mp4;m4v;mov;gif;apng;webp;y4m";
+const char kMediaExtensions[] = "wav;aif;aiff;au;flac;ogg;mp3;aac;m4a;mid;midi;kar;rmi;avi;mp4;m4v;mov;gif;apng;webp;y4m";
 const FileDialog::Filter kFilters[] = {{"Media files", kMediaExtensions}, {"All files", "*"}};
 }  // namespace
 
@@ -164,6 +164,7 @@ bool MediaPlayer::open_file(StringView path) {
   set_title(title.view());
   message.append("Playing ");
   message.append(path);
+  if (kind_ == Kind::Audio && playing_midi_) message.append(playing_midi_hardware_ ? " (on the MIDI hardware)" : " (synthesized)");
   status_.set_text(message.view());
   return true;
 }
@@ -189,7 +190,14 @@ bool MediaPlayer::open_source() {
     }
   }
   if (format != media::AudioFileFormat::Unknown) {
-    sound_ = media::open_audio_stream(source, allocator());
+    playing_midi_hardware_ = playing_midi_ = false;
+    if (format == media::AudioFileFormat::Midi) {
+      playing_midi_ = true;   // on the MIDI hardware if the machine has some, else synthesized
+      playing_midi_hardware_ = midi_output_ != nullptr;
+      sound_ = midi::open_midi_stream(source, allocator(), midi_output_);
+    } else {
+      sound_ = media::open_audio_stream(source, allocator());
+    }
     if (sound_) {
       if (!audio_player_) {
         notify(NoticeKind::Error, "No audio output is available.");

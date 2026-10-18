@@ -281,6 +281,10 @@ add_executable(BOOTX64
   src/Media/AudioData.cpp
   src/Media/AudioCodecs.cpp
   src/Media/AudioStreaming.cpp
+  src/Midi/MidiFile.cpp
+  src/Midi/MidiStream.cpp
+  src/Midi/SoftwareSynth.cpp
+  src/Hardware/MidiDevice/Mpu401.cpp
   src/Media/Audio/Pcm.cpp
   src/Media/Audio/Wav.cpp
   src/Media/Audio/Aiff.cpp

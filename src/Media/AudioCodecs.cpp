@@ -32,6 +32,7 @@ bool decode_audio(ConstByteView data, AudioData* out, AudioFileFormat* detected)
     case AudioFileFormat::Mp3: return decode_mp3(data, out);
     case AudioFileFormat::Aac: return decode_aac(data, out);
     case AudioFileFormat::Mp4: return decode_mp4_audio(data, out);
+    case AudioFileFormat::Midi:   // not a recording: it is played by synthesizing (see Midi/MidiStream.hpp)
     case AudioFileFormat::Unknown: break;
   }
   out->clear();
@@ -47,6 +48,7 @@ bool encode_audio(const AudioData& audio, AudioFileFormat format, ByteBuffer* ou
     case AudioFileFormat::Vorbis:
     case AudioFileFormat::Mp3:
     case AudioFileFormat::Aac:
+    case AudioFileFormat::Midi:
     case AudioFileFormat::Mp4: break;  // decode only
     case AudioFileFormat::Unknown: break;
   }

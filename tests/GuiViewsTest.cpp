@@ -1784,6 +1784,47 @@ static void test_media_player() {
         sound_player.close_media();
         CHECK(sound_player.kind() == desktop::MediaPlayer::Kind::None && sound_player.audio_player()->state() == audio::PlayerState::Empty);
       }
+      // A MIDI file: played by the software synthesizer, or on the MIDI hardware when the machine has some.
+      {
+        static const uint8_t kSong[] = {'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0, 'M', 'T', 'r', 'k', 0, 0, 0, 13,
+                                        0x00, 0x90, 0x3C, 0x64, 0x83, 0x60, 0x80, 0x3C, 0x00, 0x00, 0xFF, 0x2F, 0x00};
+        UniquePointer<filesystem::IFile> file;
+        uint64_t written = 0;
+        CHECK(fs.open_file("/song.mid", filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok &&
+              file->write(0, ConstByteView(kSong, sizeof kSong), &written) == filesystem::Status::Ok);
+        file.reset();
+        CHECK(desktop::MediaPlayer::is_media_name("tune.MID") && desktop::MediaPlayer::is_media_name("tune.midi") && desktop::MediaPlayer::is_media_name("x.kar"));
+        CHECK(sound_player.open_file("/song.mid") && sound_player.kind() == desktop::MediaPlayer::Kind::Audio && !notices.showing());
+        CHECK(sound_player.status_label().text().equals("Playing /song.mid (synthesized)") && sound_player.audio_player()->duration() >= 48000);
+        int loud = 0;
+        for (int i = 0; i < 40; ++i) {
+          sound_player.audio_player()->update();
+          mixer.pump();
+          device.play_all();
+        }
+        CHECK(sound_player.audio_player()->position() > 1000);
+        sound_player.close_media();
+        struct Sink final : midi::IMidiSink {
+          int notes = 0, silences = 0;
+          void send(uint8_t status, uint8_t d1, uint8_t) override {
+            if ((status & 0xF0) == 0x90) ++notes;
+            if ((status & 0xF0) == 0xB0 && d1 == 123) ++silences;
+          }
+          void reset() override {}
+        } hardware;
+        sound_player.set_midi_output(&hardware);
+        CHECK(sound_player.open_file("/song.mid") && sound_player.status_label().text().equals("Playing /song.mid (on the MIDI hardware)"));
+        for (int i = 0; i < 40; ++i) {
+          sound_player.audio_player()->update();
+          mixer.pump();
+          device.play_all();
+        }
+        CHECK(hardware.notes == 1);
+        sound_player.close_media();
+        CHECK(hardware.silences >= 16);
+        sound_player.set_midi_output(nullptr);
+        (void)loud;
+      }
       mgr.remove_window(&sound_player);
       mixer.pump();
     }

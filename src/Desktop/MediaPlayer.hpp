@@ -18,7 +18,7 @@
 
 // The media player: a window that plays sound and video files. File > Open (Ctrl+O) picks a file in the shared FileDialog; it is
 // recognised by what it contains (not by its name) and starts playing. The file is not read into memory: sound and video are read from it and
-// decoded a little at a time while they play (only the pictures that are decoded whole - GIF, animated PNG and WebP, a still picture - are read in full). Sound files (WAV, AIFF, AU, FLAC, Ogg Vorbis, MP3, AAC, M4A) get an
+// decoded a little at a time while they play (only the pictures that are decoded whole - GIF, animated PNG and WebP, a still picture - are read in full). Sound files (WAV, AIFF, AU, FLAC, Ogg Vorbis, MP3, AAC, M4A, MIDI) get an
 // AudioPlayerControl - play/pause, stop, seek, volume and a level meter - and video files (AVI, MP4 / MOV with H.264, GIF, animated PNG and
 // WebP, Y4M) get a VideoPlayerControl with the picture over the same kind of bar. Problems (no audio output, a file that cannot be decoded)
 // appear in the notice dialog. The machine's sound mixer, video codecs and clock are handed over with set_services(); without them
@@ -39,6 +39,7 @@
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Media/AudioStreaming.hpp"
+#include "Midi/MidiStream.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Video/VideoPlayer.hpp"
 
@@ -51,6 +52,9 @@ class MediaPlayer : public gui::Frame {
 
   // The machine's sound mixer (nullptr: no sound), video codecs and clock (nullptr: no video). They must outlive the player. Call once, before use.
   void set_services(audio::AudioMixer* mixer, hardware::SystemVideoCodecs* codecs, const hardware::IClock* clock);
+  // The machine's MIDI output hardware (nullptr: none). MIDI files are played on it when there is one - the notes are sent to it as the
+  // song plays - and otherwise by the software synthesizer. It must outlive the player.
+  void set_midi_output(midi::IMidiSink* output) { midi_output_ = output; }
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
@@ -103,6 +107,8 @@ class MediaPlayer : public gui::Frame {
   UniquePointer<video::VideoPlayer> video_player_;
   UniquePointer<gui::AudioPlayerControl> audio_control_;
   UniquePointer<gui::VideoPlayerControl> video_control_;
+  midi::IMidiSink* midi_output_ = nullptr;
+  bool playing_midi_ = false, playing_midi_hardware_ = false;
   String path_;
   Kind kind_ = Kind::None;
 };
