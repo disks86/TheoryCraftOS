@@ -22,6 +22,8 @@
 
 namespace hardware {
 
+class IMonitorSource;
+
 struct DisplayMode {
   uint32_t width;   // pixels
   uint32_t height;  // pixels
@@ -60,6 +62,10 @@ class IGraphicsProcessingUnit : public IHardware {
   // Makes everything drawn so far visible. Direct framebuffers show drawing at once; a GPU that
   // keeps its screen in separate memory (virtio-gpu) copies the changes over here.
   virtual void present() {}
+
+  // The connectors and monitors of this device (see Hardware/Monitor); nullptr for a device that tells nothing about them. The monitor layer
+  // (SystemMonitors) then treats the whole screen as one display.
+  virtual IMonitorSource* monitor_source() { return nullptr; }
 
   // --- Text rendering with a fixed-size font.
   virtual uint32_t glyph_width() const = 0;

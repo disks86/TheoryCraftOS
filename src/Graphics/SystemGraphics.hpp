@@ -47,6 +47,10 @@ class SystemGraphics {
   // if out of memory.
   IRenderer2D* renderer_2d();
 
+  // Throws the 2D renderer away; the next renderer_2d() builds one for the display's size as it is then (after the display was resized for several
+  // monitors). Nothing may be using the old renderer.
+  void reset_renderer();
+
   // The display GPU everything is shown on.
   hardware::IGraphicsProcessingUnit* display() { return display_; }
 

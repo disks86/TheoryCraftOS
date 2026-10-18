@@ -27,6 +27,7 @@
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Desktop/Desktop.hpp"
+#include "FakeMonitors.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -1060,6 +1061,111 @@ static void test_clock() {
   CHECK(a.live == 0);
 }
 
+// Two monitors: the taskbar on the primary one, windows maximize, dock and open on the monitor they are on, dialogs open where you are working,
+// the pointer stays on the monitors, and a monitor pulled out takes its windows to the one that is left.
+static void test_desktop_monitors() {
+  TestAllocator a;
+  {
+    using namespace fakemon;
+    FakeSource src;
+    src.add("DP-1", dell_edid());
+    src.add("HDMI-1", small_edid(), true, hardware::ConnectorType::Hdmi);
+    FakeGpu gpu;
+    gpu.source = &src;
+    hardware::SystemMonitors sm(&gpu, a);
+    sm.initialize();
+    CHECK(sm.apply() && sm.desktop_width() == 4480 && sm.desktop_height() == 1440);
+    Screen screen(a, 4480, 1440);   // (the surface the display now has)
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+    d.set_monitors(&sm);
+    gui::Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+    w.layout();
+    const int32_t bar = desktop::Desktop::kTaskbarHeight;
+    CHECK(m.area_count() == 2 && m.area(0).x == 0 && m.area(0).width == 2560 && m.area(0).height == 1440 - static_cast<uint32_t>(bar));
+    CHECK(m.area(1).x == 2560 && m.area(1).width == 1920 && m.area(1).height == 1080);
+    // The taskbar is at the bottom of the primary monitor only.
+    CHECK(d.start_button().window_origin().x < 20 && d.start_button().window_origin().y >= 1440 - bar && d.start_button().window_origin().y < 1440);
+    CHECK(w.hit_test(3000, 1070) != nullptr && w.hit_test(3000, 1070) != &d.start_button());
+
+    // A window opens on the primary monitor, maximizes to its work area, and moves and maximizes on the other one.
+    desktop::FileExplorer* e = d.open_explorer();
+    gui::Frame* host = e->host();
+    CHECK(host && host->bounds().x < 2560);
+    host->maximize();
+    CHECK(host->bounds().x == 0 && host->bounds().y == 0 && host->bounds().width == 2560 && host->bounds().height == 1440 - static_cast<uint32_t>(bar));
+    host->maximize();   // back
+    host->set_bounds({2700, 100, 600, 400});
+    host->maximize();
+    CHECK(host->bounds().x == 2560 && host->bounds().y == 0 && host->bounds().width == 1920 && host->bounds().height == 1080);
+    host->maximize();
+    CHECK(host->bounds().x == 2700 && host->bounds().width == 600);
+    host->dock(gui::Frame::Dock::Left);
+    CHECK(host->bounds().x == 2560 && host->bounds().width == 960 && host->bounds().height == 1080);
+    host->dock(gui::Frame::Dock::Bottom);
+    CHECK(host->bounds().x == 2560 && host->bounds().y == 540 && host->bounds().width == 1920 && host->bounds().height == 540);
+    host->dock(gui::Frame::Dock::Bottom);   // (back to where it was)
+    CHECK(host->bounds().x == 2700);
+
+    // New windows and dialogs come up on the monitor of the window in use.
+    d.open_paint();
+    CHECK(d.paint().host() && d.paint().host()->bounds().x >= 2560);
+    d.ask_shut_down();
+    CHECK(d.shutdown_dialog().bounds().x >= 2560 && d.shutdown_dialog().bounds().x < 4480);
+    d.shutdown_dialog().close();
+
+    // The pointer goes from one monitor to the other, and stops at the edge of the picture where no monitor is.
+    CHECK(d.pointer().x == 2240 && d.pointer().y == 720);
+    mouse.move(800, 0, 0);
+    mouse.move(0, 500, 0);
+    d.pump(0);
+    CHECK(d.pointer().x == 3040 && d.pointer().y == 1079);
+    mouse.move(-1000, 0, 0);
+    d.pump(0);
+    CHECK(d.pointer().x == 2040 && d.pointer().y == 1079);   // back onto the first monitor, still at that height
+
+    // Display settings: the two monitors, their details; swapping them changes the places and the work areas; another primary moves the taskbar.
+    d.open_display_settings();
+    desktop::DisplaySettings& ds = d.display_settings();
+    CHECK(ds.list().item_count() == 2 && ds.selected_monitor() && ds.selected_monitor()->id() == 0);
+    String line(a);
+    line.assign(ds.info_line(1).text());
+    CHECK(line.view().find(StringView("Dell")) != StringView::npos);
+    CHECK(ds.info_line(2).text().find(StringView("27.1 inch")) != StringView::npos || ds.info_line(2).text().find(StringView("27.2 inch")) != StringView::npos);
+    CHECK(!ds.left_button().enabled() && ds.right_button().enabled() && !ds.primary_button().enabled());
+    CHECK(ds.move_selected(1));
+    CHECK(sm.layout().at(0).id == 1 && sm.layout().at(1).id == 0 && src.last.size() == 2 && src.last[0].connector == 1 && src.last[1].x == 1920);
+    CHECK(m.area(0).x == 1920 && m.area(0).width == 2560 && m.area(1).x == 0 && m.area(1).width == 1920);
+    ds.list().select_item(1);
+    CHECK(ds.selected_monitor()->id() == 1);
+    CHECK(ds.make_primary());
+    CHECK(sm.layout().primary()->id == 1 && m.area(0).x == 0 && m.area(0).width == 1920 && m.area(0).height == 1080 - static_cast<uint32_t>(bar));
+    CHECK(d.start_button().window_origin().x < 20 && d.start_button().window_origin().y >= 1080 - bar && d.start_button().window_origin().y < 1080);
+    CHECK(!ds.move_selected(-1));   // (it is first already)
+
+    // A monitor pulled out: its windows go to the one that is left, and the pointer can no longer go there.
+    gui::Frame* paint_host = d.paint().host();
+    paint_host->set_bounds({2300, 200, 500, 300});   // on the Dell now at x 1920.. (second slot)
+    src.connectors[0].info.connected = false;
+    src.changed = true;
+    d.pump(1000000);
+    CHECK(m.area_count() == 1 && sm.layout().enabled_count() == 1);
+    m.layout();
+    CHECK(paint_host->bounds().x + static_cast<int32_t>(paint_host->bounds().width) > 0 && paint_host->bounds().x < 1920);
+    mouse.move(3000, 0, 0);
+    d.pump(1000000);
+    CHECK(d.pointer().x == 1919);
+    // Plugged in again: it is back.
+    src.connectors[0].info.connected = true;
+    src.changed = true;
+    d.pump(2000000);
+    CHECK(m.area_count() == 2 && sm.layout().enabled_count() == 2);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_desktop() {
   TestAllocator a;
   {
@@ -1105,6 +1211,7 @@ static void test_desktop() {
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Paint
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Media Player
     d.step(5500000);
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Display Settings
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);
@@ -1202,6 +1309,7 @@ int main() {
   test_input_pump();
   test_select_all_from_keyboard();
   test_desktop();
+  test_desktop_monitors();
   test_clock();
   test_windows();
   test_modal_and_dialog();

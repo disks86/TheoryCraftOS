@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/FramebufferGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
+#include "Hardware/Monitor/IMonitorSource.hpp"
 
 namespace hardware {
 
@@ -27,7 +28,10 @@ namespace hardware {
 // works on any display hardware but only offers the modes the firmware lists
 // (32-bit RGB/BGR ones). The vendor GPU classes build on this until they
 // grow native drivers.
-class UefiGopGpu : public FramebufferGpu {
+//
+// It is also the monitor source of the framebuffer: one connector, the display the firmware set up, with the EDID the firmware read from it
+// (the EDID active / discovered protocols) when it has one.
+class UefiGopGpu : public FramebufferGpu, public IMonitorSource {
  public:
   static constexpr uint32_t kMaxModes = 64;
 
@@ -41,6 +45,11 @@ class UefiGopGpu : public FramebufferGpu {
   bool mode_info(uint32_t index, DisplayMode* out) const override;
   uint32_t current_mode() const override { return current_; }
   bool set_mode(uint32_t index) override;
+  IMonitorSource* monitor_source() override { return this; }
+
+  uint32_t connector_count() const override { return 1; }
+  bool connector_info(uint32_t connector, ConnectorInfo* out) const override;
+  uint32_t read_edid(uint32_t connector, ByteView out) override;
 
  private:
   bool apply_current_mode();

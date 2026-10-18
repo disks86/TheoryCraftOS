@@ -50,6 +50,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       paint_(allocator),
       terminal_(allocator),
       media_player_(allocator),
+      display_settings_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
       extra_explorers_(allocator),
@@ -74,6 +75,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
+  start_.menu().add_item("Display Settings...", {&Desktop::on_display_settings, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -137,6 +139,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.add(&taskbar_);
   window_.add(&surface_);
   window_.show_cursor(mouse != nullptr);
+  display_settings_.on_changed({&Desktop::on_settings_changed, this});
+  input_.set_confine(&Desktop::confine_pointer, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
 }
@@ -267,7 +271,9 @@ bool Desktop::place(Frame* tab, TabFrame* into) {
     TabFrame* host = new_host();
     if (!host) return;
     const Rect2D b = tab->home_bounds().width ? tab->home_bounds() : tab->bounds();
-    host->set_bounds({b.x, b.y, b.width, b.height + static_cast<uint32_t>(TabFrame::kStripHeight)});
+    Rect2D where{0, 0, 0, 0};
+    if (windows_.area_count() > 0) where = windows_.dialog_area();   // several monitors: it opens on the one in use
+    host->set_bounds({b.x + where.x, b.y + where.y, b.width, b.height + static_cast<uint32_t>(TabFrame::kStripHeight)});
     if (!host->add_tab(tab)) return;
     placed = windows_.add_window(host);
     if (!placed) host->remove_tab(tab);
@@ -416,6 +422,97 @@ void Desktop::open_media_player(TabFrame* into) {
   });
 }
 
+void Desktop::open_display_settings() {
+  window_.locked([&] {
+    display_settings_.refresh();
+    if (display_settings_.manager()) display_settings_.activate();
+    else windows_.add_window(&display_settings_);
+  });
+}
+
+void Desktop::on_display_settings(void* self, Control&) { static_cast<Desktop*>(self)->open_display_settings(); }
+void Desktop::on_settings_changed(void* self, Control&) { static_cast<Desktop*>(self)->monitors_changed(); }
+
+// --- Monitors ---------------------------------------------------------------------------------------
+
+void Desktop::set_monitors(hardware::SystemMonitors* monitors) {
+  monitors_ = monitors;
+  display_settings_.set_monitors(monitors);
+  monitors_changed();
+}
+
+void Desktop::monitors_changed() {
+  if (!monitors_) return;
+  window_.locked([&] {
+    using hardware::MonitorRect;
+    const hardware::MonitorLayout& layout = monitors_->layout();
+    const bool several = layout.count() > 1;
+    // The pointer may be on any monitor that is there.
+    {
+      kernel::ScopedMutex guard(pointer_lock_);
+      monitor_rect_count_ = 0;
+      for (uint32_t i = 0; i < layout.count(); ++i)
+        if (layout.at(i).enabled) monitor_rects_[monitor_rect_count_++] = layout.at(i).rect;
+    }
+    if (!several) {
+      display_settings_.refresh();
+      return;
+    }
+    if (!taskbar_in_surface_) {   // the taskbar is placed by hand, above the windows (the docked arrangement is for one screen)
+      window_.remove(&taskbar_);
+      taskbar_.set_dock(DockStyle::None);
+      surface_.add(&taskbar_);
+      taskbar_in_surface_ = true;
+    }
+    const hardware::MonitorSlot* primary = layout.primary();
+    gui::Rect2D regions[hardware::MonitorLayout::kMaxMonitors], areas[hardware::MonitorLayout::kMaxMonitors];
+    uint32_t count = 0;
+    auto to_rect = [](const MonitorRect& r) { return gui::Rect2D{r.x, r.y, r.width, r.height}; };
+    if (primary) {
+      regions[count] = to_rect(primary->rect);
+      areas[count] = regions[count];
+      areas[count].height = areas[count].height > static_cast<uint32_t>(kTaskbarHeight) ? areas[count].height - static_cast<uint32_t>(kTaskbarHeight) : 0;
+      taskbar_.set_bounds({primary->rect.x, primary->rect.bottom() - kTaskbarHeight, primary->rect.width, static_cast<uint32_t>(kTaskbarHeight)});
+      ++count;
+    }
+    for (uint32_t i = 0; i < layout.count(); ++i) {
+      const hardware::MonitorSlot& s = layout.at(i);
+      if (!s.enabled || &s == primary) continue;
+      regions[count] = to_rect(s.rect);
+      areas[count] = regions[count];
+      ++count;
+    }
+    surface_.set_regions(regions, count);
+    windows_.set_areas(areas, count);
+    display_settings_.refresh();
+  });
+}
+
+// Keeps the pointer on a monitor. (Runs on the thread that delivers input.)
+void Desktop::confine_pointer(void* self, int32_t* x, int32_t* y) {
+  auto* d = static_cast<Desktop*>(self);
+  kernel::ScopedMutex guard(d->pointer_lock_);
+  const uint32_t n = d->monitor_rect_count_;
+  if (n == 0) return;
+  int32_t best = -1;
+  uint64_t best_distance = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const hardware::MonitorRect& r = d->monitor_rects_[i];
+    if (r.contains(*x, *y)) return;
+    const int32_t cx = *x < r.x ? r.x : *x >= r.right() ? r.right() - 1 : *x;
+    const int32_t cy = *y < r.y ? r.y : *y >= r.bottom() ? r.bottom() - 1 : *y;
+    const int64_t dx = int64_t{*x} - cx, dy = int64_t{*y} - cy;
+    const uint64_t distance = static_cast<uint64_t>(dx * dx + dy * dy);
+    if (best < 0 || distance < best_distance) {
+      best = static_cast<int32_t>(i);
+      best_distance = distance;
+    }
+  }
+  const hardware::MonitorRect& r = d->monitor_rects_[best];
+  *x = *x < r.x ? r.x : *x >= r.right() ? r.right() - 1 : *x;
+  *y = *y < r.y ? r.y : *y >= r.bottom() ? r.bottom() - 1 : *y;
+}
+
 void Desktop::open_about() {
   if (about_.manager()) about_.activate();
   else windows_.add_window(&about_);
@@ -556,6 +653,10 @@ void Desktop::pump(uint64_t uptime_us) {
     }
   }
   const uint64_t second = uptime_us / 1000000;
+  if (monitors_ && second != polled_monitors_second_) {
+    polled_monitors_second_ = second;
+    if (monitors_->poll()) monitors_changed();
+  }
   if (second != polled_second_) {
     polled_second_ = second;
     if (task_manager_.manager()) task_manager_.update(uptime_us);

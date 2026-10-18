@@ -132,8 +132,8 @@ bool NoticeDialog::show(WindowManager& manager, NoticeKind kind, StringView mess
   for (uint32_t i = 0; i < kMaxLines; ++i) lines_[i].set_size(0, static_cast<int32_t>(i) < shown_lines ? kLineHeight : 0);
 
   const int32_t w = kWidth, h = kFrameOverhead + shown_lines * kLineHeight + kButtonHeight + 8;
-  const int32_t area_w = static_cast<int32_t>(manager.bounds().width), area_h = static_cast<int32_t>(manager.bounds().height);
-  set_bounds({(area_w - w) / 2 > 0 ? (area_w - w) / 2 : 0, (area_h - h) / 3 > 0 ? (area_h - h) / 3 : 0, static_cast<uint32_t>(w),
+  const int32_t area_w = static_cast<int32_t>(manager.dialog_area().width), area_h = static_cast<int32_t>(manager.dialog_area().height);
+  set_bounds({manager.dialog_area().x + ((area_w - w) / 2 > 0 ? (area_w - w) / 2 : 0), manager.dialog_area().y + ((area_h - h) / 3 > 0 ? (area_h - h) / 3 : 0), static_cast<uint32_t>(w),
               static_cast<uint32_t>(h)});
   if (showing()) {  // already open: the new text replaces the old
     if (Window* win = window()) win->layout();

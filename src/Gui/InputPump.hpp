@@ -38,6 +38,13 @@ class InputPump {
     window_.mouse_move(x_, y_);  // the cursor starts in the middle, not at the corner
   }
 
+  // A function that keeps the pointer where it may be (on a monitor, when the screen is several): given the position the pointer is about to be at,
+  // it moves it to the nearest allowed place. The window's own edge always limits it too.
+  using Confine = void (*)(void* context, int32_t* x, int32_t* y);
+  void set_confine(Confine confine, void* context) {
+    confine_ = confine;
+    confine_context_ = context;
+  }
   // Delivers everything the devices have right now; returns how many events there were.
   uint32_t pump();
   Point cursor() const { return {x_, y_}; }
@@ -47,6 +54,8 @@ class InputPump {
   hardware::IKeyboard* keyboard_;
   hardware::IMouse* mouse_;
   int32_t x_ = 0, y_ = 0;
+  Confine confine_ = nullptr;
+  void* confine_context_ = nullptr;
   uint8_t buttons_ = 0;
   uint8_t modifiers_ = 0;  // held after the last key event delivered
 };

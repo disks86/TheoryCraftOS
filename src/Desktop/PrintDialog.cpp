@@ -272,9 +272,9 @@ bool PrintDialog::show(WindowManager& manager, Kind kind, StringView title, Hand
   preview_.set_page(0);
   load_printers();
   on_closed(result);
-  const int32_t area_w = static_cast<int32_t>(manager.bounds().width), area_h = static_cast<int32_t>(manager.bounds().height);
+  const int32_t area_w = static_cast<int32_t>(manager.dialog_area().width), area_h = static_cast<int32_t>(manager.dialog_area().height);
   const int32_t w = kWidth < area_w ? kWidth : area_w, h = kHeight < area_h ? kHeight : area_h;
-  set_bounds({(area_w - w) / 2 > 0 ? (area_w - w) / 2 : 0, (area_h - h) / 3 > 0 ? (area_h - h) / 3 : 0, static_cast<uint32_t>(w), static_cast<uint32_t>(h)});
+  set_bounds({manager.dialog_area().x + ((area_w - w) / 2 > 0 ? (area_w - w) / 2 : 0), manager.dialog_area().y + ((area_h - h) / 3 > 0 ? (area_h - h) / 3 : 0), static_cast<uint32_t>(w), static_cast<uint32_t>(h)});
   if (!manager.add_window(this, /*modal=*/true)) return false;
   if (Window* win = window()) {
     win->layout();

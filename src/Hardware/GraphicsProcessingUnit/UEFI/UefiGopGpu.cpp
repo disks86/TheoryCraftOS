@@ -65,6 +65,33 @@ bool UefiGopGpu::mode_info(uint32_t index, DisplayMode* out) const {
   return true;
 }
 
+bool UefiGopGpu::connector_info(uint32_t connector, ConnectorInfo* out) const {
+  if (connector != 0 || !out) return false;
+  *out = ConnectorInfo();
+  out->connected = gop_ != nullptr;
+  out->type = ConnectorType::Unknown;   // (the firmware does not say which connector it is)
+  const char name[] = "Display-0";
+  for (uint32_t i = 0; i < sizeof name; ++i) out->name[i] = name[i];
+  out->preferred_width = width();
+  out->preferred_height = height();
+  return true;
+}
+
+// The firmware keeps the EDID it is using (active; it may be one it was given) and the one it read from the display (discovered).
+uint32_t UefiGopGpu::read_edid(uint32_t connector, ByteView out) {
+  efi::BootServices* bs = st_ ? st_->boot_services : nullptr;
+  if (connector != 0 || !bs) return 0;
+  const efi::Guid* guids[2] = {&efi::kEdidActiveGuid, &efi::kEdidDiscoveredGuid};
+  for (const efi::Guid* guid : guids) {
+    efi::EdidProtocol* edid = nullptr;
+    if (bs->locate_protocol(guid, nullptr, reinterpret_cast<void**>(&edid)) != efi::kSuccess || !edid || !edid->edid || edid->size_of_edid < 128) continue;
+    const uint32_t n = edid->size_of_edid < out.size() ? edid->size_of_edid : static_cast<uint32_t>(out.size());
+    for (uint32_t i = 0; i < n; ++i) out[i] = edid->edid[i];
+    return n;
+  }
+  return 0;
+}
+
 bool UefiGopGpu::set_mode(uint32_t index) {
   if (!gop_ || index >= mode_count_) return false;
   if (gop_->set_mode(gop_, gop_mode_[index]) != efi::kSuccess) return false;

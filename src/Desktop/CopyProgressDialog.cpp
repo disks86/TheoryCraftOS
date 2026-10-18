@@ -99,8 +99,8 @@ bool CopyProgressDialog::start(WindowManager& manager, filesystem::IFileSystem& 
   bar_.set_maximum(0);
   bar_.set_value(0);
   cancel_button_.set_enabled(true);
-  const int32_t area_w = static_cast<int32_t>(manager.bounds().width), area_h = static_cast<int32_t>(manager.bounds().height);
-  set_bounds({(area_w - kWidth) / 2 > 0 ? (area_w - kWidth) / 2 : 0, (area_h - kHeight) / 3 > 0 ? (area_h - kHeight) / 3 : 0,
+  const int32_t area_w = static_cast<int32_t>(manager.dialog_area().width), area_h = static_cast<int32_t>(manager.dialog_area().height);
+  set_bounds({manager.dialog_area().x + ((area_w - kWidth) / 2 > 0 ? (area_w - kWidth) / 2 : 0), manager.dialog_area().y + ((area_h - kHeight) / 3 > 0 ? (area_h - kHeight) / 3 : 0),
               static_cast<uint32_t>(kWidth), static_cast<uint32_t>(kHeight)});
   if (!manager.add_window(this)) {
     __atomic_store_n(&busy_, false, __ATOMIC_RELEASE);

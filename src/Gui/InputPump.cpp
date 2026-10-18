@@ -54,6 +54,7 @@ uint32_t InputPump::pump() {
     }
     x = x < 0 ? 0 : x > max_x ? max_x : x;
     y = y < 0 ? 0 : y > max_y ? max_y : y;
+    if (confine_) confine_(confine_context_, &x, &y);
     // Press and release at the position the pointer had when the button changed, after moving there.
     if (x != x_ || y != y_) {
       x_ = x;

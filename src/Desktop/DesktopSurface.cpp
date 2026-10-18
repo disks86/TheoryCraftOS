@@ -21,11 +21,18 @@
 namespace desktop {
 
 void DesktopSurface::paint(gui::Painter& painter) {
-  painter.fill({0, 0, bounds().width, bounds().height}, painter.theme().desktop);
-  // A quiet watermark in the corner.
   const StringView name = "TheoryCraftOS";
-  painter.text(static_cast<int32_t>(bounds().width) - gui::Painter::text_width(name) - 16,
-               static_cast<int32_t>(bounds().height) - 32, name, 0xFF40A0A0);
+  const uint32_t mark = 0xFF40A0A0;
+  if (regions_.count() == 0) {
+    painter.fill({0, 0, bounds().width, bounds().height}, painter.theme().desktop);
+    // A quiet watermark in the corner.
+    painter.text(static_cast<int32_t>(bounds().width) - gui::Painter::text_width(name) - 16, static_cast<int32_t>(bounds().height) - 32, name, mark);
+    return;
+  }
+  painter.fill({0, 0, bounds().width, bounds().height}, 0xFF000000u);
+  for (uint64_t i = 0; i < regions_.count(); ++i) painter.fill(regions_[i], painter.theme().desktop);
+  const gui::Rect2D& primary = regions_[0];
+  painter.text(primary.x + static_cast<int32_t>(primary.width) - gui::Painter::text_width(name) - 16, primary.y + static_cast<int32_t>(primary.height) - 32, name, mark);
 }
 
 }  // namespace desktop

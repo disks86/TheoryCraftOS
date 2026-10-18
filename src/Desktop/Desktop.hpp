@@ -25,6 +25,7 @@
 // power-off once the desktop loop returns.
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
+#include "Desktop/DisplaySettings.hpp"
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/FileDialog.hpp"
@@ -49,6 +50,7 @@
 #include "Gui/Windows/TabFrame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
+#include "Hardware/Monitor/SystemMonitors.hpp"
 
 namespace desktop {
 
@@ -139,6 +141,16 @@ class Desktop {
   uint32_t paint_count() const;
   // Opens the About window, or brings it forward (restoring it if minimized).
   void open_about();
+  // --- Monitors. Tells the desktop about the monitors it is shown on (nullptr: one screen, the default). The display must already show the layout
+  // (SystemMonitors::apply()), so that the surface the desktop draws on is the size of the layout's bounds. `monitors` must outlive the desktop.
+  void set_monitors(hardware::SystemMonitors* monitors);
+  // The layout of `monitors` changed (a monitor came or went, or the order was changed): the taskbar, work areas and pointer limits are redone.
+  void monitors_changed();
+  DisplaySettings& display_settings() { return display_settings_; }
+  // Where the pointer is (window coordinates).
+  gui::Point pointer() const { return input_.cursor(); }
+  // Opens the display settings window, or brings it forward.
+  void open_display_settings();
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
   void ask_shut_down();
   StringView clock_text() const { return clock_.text(); }
@@ -182,6 +194,9 @@ class Desktop {
   static void on_task_manager(void* self, gui::Control&);
   static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
+  static void on_display_settings(void* self, gui::Control&);
+  static void on_settings_changed(void* self, gui::Control&);
+  static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
 
@@ -227,6 +242,7 @@ class Desktop {
   Paint paint_;
   Terminal terminal_;
   MediaPlayer media_player_;
+  DisplaySettings display_settings_;
   gui::Frame about_;
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;
@@ -236,6 +252,12 @@ class Desktop {
   List<UniquePointer<Terminal>> extra_terminals_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;
+  hardware::SystemMonitors* monitors_ = nullptr;
+  bool taskbar_in_surface_ = false;
+  kernel::Mutex pointer_lock_;
+  hardware::MonitorRect monitor_rects_[hardware::MonitorLayout::kMaxMonitors];   // the monitors the pointer may be on (enabled ones)
+  uint32_t monitor_rect_count_ = 0;
+  uint64_t polled_monitors_second_ = ~0ull;
   ClockSource clock_source_ = nullptr;
   void* clock_context_ = nullptr;
   void (*diagnostic_)(StringView) = nullptr;

@@ -31,6 +31,7 @@
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
+#include "Hardware/Monitor/SystemMonitors.hpp"
 #include "BootLog.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/SystemGraphics.hpp"
@@ -354,6 +355,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   Entry(Level::Ok, pci.name()).dec(pci.device_count()).text(" devices");
 
+  // The monitors the display device has (their EDIDs tell what they are) and how they are arranged on the desktop. The layout is applied
+  // just before the desktop starts, so that the boot console stays a plain screen.
+  hardware::SystemMonitors monitors(gpu, shared_allocator);
+  if (gpu) {
+    monitors.initialize();
+    for (uint32_t i = 0; i < monitors.count(); ++i) {
+      const hardware::Monitor& m = monitors.monitor(i);
+      Entry e(m.connected() ? Level::Ok : Level::Info, "Monitor");
+      e.text(m.name());
+      if (m.connector_name()[0]) e.text(" on ").text(m.connector_name());
+      if (m.connected()) e.text(", ").dec(m.current_mode().width).text("x").dec(m.current_mode().height);
+      else e.text(", not connected");
+      if (m.edid() && m.width_mm()) e.text(", ").dec(m.width_mm()).text("x").dec(m.height_mm()).text(" mm");
+      if (!m.edid() && m.connected() && monitors.multi_display()) e.text(", no EDID");
+    }
+  }
+
 #ifdef TCOS_SELFTESTS
   console::puts("Containers:\n");
   if (!run_container_demo(allocator)) console::puts("container self-check failed\n");
@@ -663,6 +681,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
 
   // The desktop: runs until Shut Down is chosen from the Start menu (or, with no display, until a key).
+  // Several monitors: the display becomes one surface as big as all of them side by side, and the renderer is built again for that size.
+  if (gpu && monitors.layout().count() > 1) {
+    if (monitors.apply()) {
+      system_graphics.reset_renderer();
+      Entry(Level::Ok, "Monitors").dec(monitors.layout().enabled_count()).text(" monitors, desktop ").dec(monitors.desktop_width()).text("x").dec(monitors.desktop_height());
+    } else {
+      Entry(Level::Warning, "Monitors").text("the display device cannot show the monitors separately; using one");
+    }
+  }
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer) {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
@@ -712,6 +739,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
+    desktop.set_monitors(&monitors);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
     desktop.set_midi_output(&usb_midi);
     desktop.set_clipboard(&clipboard);
@@ -747,6 +775,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // Orderly shutdown, back on the console. Services stop before the hardware under them, and storage
   // is flushed before the devices are handed back to the firmware.
   if (gpu) {
+    if (monitors.layout().count() > 1) monitors.show_single_display();   // the console is a screen of one monitor
     console::use_gpu(gpu);
     console::puts("TheoryCraftOS: shutting down\n");
   }

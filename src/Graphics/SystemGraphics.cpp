@@ -66,6 +66,20 @@ IRenderer2D* SystemGraphics::renderer_2d() {
   return software_2d_ = new (memory) SoftwareRenderer2D(backbuffer_, display_);
 }
 
+void SystemGraphics::reset_renderer() {
+  if (software_2d_) {
+    software_2d_->~SoftwareRenderer2D();
+    allocator_.deallocate(software_2d_);
+    software_2d_ = nullptr;
+    release_view(allocator_, backbuffer_.pixels);
+  }
+  if (device_2d_) {
+    device_2d_->~DeviceRenderer2D();
+    allocator_.deallocate(device_2d_);
+    device_2d_ = nullptr;
+  }
+}
+
 SystemGraphics::~SystemGraphics() {
   if (software_2d_) {
     software_2d_->~SoftwareRenderer2D();

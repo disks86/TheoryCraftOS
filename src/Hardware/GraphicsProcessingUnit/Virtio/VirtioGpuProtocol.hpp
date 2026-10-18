@@ -39,6 +39,7 @@ enum CommandType : uint32_t {
   kCmdResourceDetachBacking,
   kCmdGetCapsetInfo,
   kCmdGetCapset,
+  kCmdGetEdid,
   kCmdCtxCreate = 0x0200,
   kCmdCtxDestroy,
   kCmdCtxAttachResource,
@@ -51,6 +52,7 @@ enum CommandType : uint32_t {
   kRespOkDisplayInfo,
   kRespOkCapsetInfo,
   kRespOkCapset,
+  kRespOkEdid,
 };
 
 constexpr uint32_t kFlagFence = 1u << 0;
@@ -118,6 +120,10 @@ struct ResourceAttachBacking {
   MemEntry entry;  // one contiguous run
 };
 
+struct GetDisplayInfo {
+  ControlHeader header;
+};
+
 struct DisplayOne {
   Rect rect;
   uint32_t enabled, flags;
@@ -126,6 +132,17 @@ struct DisplayOne {
 struct RespDisplayInfo {
   ControlHeader header;
   DisplayOne modes[16];
+};
+
+struct GetEdid {
+  ControlHeader header;
+  uint32_t scanout, padding;
+};
+
+struct RespEdid {
+  ControlHeader header;
+  uint32_t size, padding;
+  uint8_t edid[1024];
 };
 
 struct GetCapsetInfo {

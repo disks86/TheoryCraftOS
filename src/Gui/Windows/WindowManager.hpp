@@ -21,6 +21,10 @@
 // and activates it. The manager keeps a second list in creation order for the taskbar's window
 // switcher. Windows are positioned freely inside the manager's area (the desktop above the taskbar).
 //
+// Several monitors: the manager can be told the work areas of the monitors it spreads over (set_areas(), the primary monitor's first; without
+// any, the whole manager is the one area). Maximizing, docking and tiling then work on the area a window is mostly on, a window is kept on some
+// area, and dialogs open in the area of the active window (or the primary one).
+//
 // Modal windows: while one is open every other window is disabled (ignores input, drawn inactive,
 // skipped by Tab), and the modal stays on top.
 #pragma once
@@ -31,7 +35,7 @@ namespace gui {
 
 class WindowManager : public Control {
  public:
-  explicit WindowManager(allocators::IAllocator& allocator) : Control(allocator), order_(allocator) {}
+  explicit WindowManager(allocators::IAllocator& allocator) : Control(allocator), order_(allocator), areas_(allocator) {}
 
   // Adds a window on top of the others and activates it. Its bounds (relative to the manager) are
   // used as given, kept inside the area. False if it is already managed or memory ran out.
@@ -48,6 +52,16 @@ class WindowManager : public Control {
   // Alt+Tab: brings the window at the bottom of the stack to the front and activates it (restoring it if minimized), so repeating it goes through
   // all of them; backwards, the window in front goes to the bottom. Does nothing while a modal window is open.
   void cycle(bool forward);
+
+  // The work areas (in the manager's coordinates), the primary's first. Windows are moved to fit; nothing is lost when the list changes.
+  void set_areas(const Rect2D* areas, uint32_t count);
+  uint32_t area_count() const { return static_cast<uint32_t>(areas_.count()); }
+  // The area `index` (the whole manager if none are set).
+  Rect2D area(uint32_t index) const;
+  // The area that most of the window is on (or is nearest to).
+  Rect2D area_for(const Frame* frame) const;
+  // Where dialogs go: the area of the active window, else the primary area.
+  Rect2D dialog_area() const;
 
   void activate(Frame* frame);  // raises it (restoring it first if minimized) and makes it active
   void minimize(Frame* frame);
@@ -70,10 +84,12 @@ class WindowManager : public Control {
   void refresh();                 // enabled flags, active window, focus scope after any change
   Frame* top_usable() const;      // the topmost visible, enabled window
   void keep_inside(Frame* frame);
-  Rect2D dock_bounds(Frame::Dock edge) const;
-  Rect2D tile_bounds(uint32_t slot, uint32_t count) const;
+  Rect2D dock_bounds(Frame::Dock edge, const Rect2D& area) const;
+  Rect2D tile_bounds(uint32_t slot, uint32_t count, const Rect2D& area) const;
+  Rect2D area_of_rect(const Rect2D& r) const;
 
   List<Frame*> order_;  // creation order
+  List<Rect2D> areas_;
   Frame* active_ = nullptr;
 };
 

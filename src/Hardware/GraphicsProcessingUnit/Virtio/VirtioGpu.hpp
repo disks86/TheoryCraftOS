@@ -22,6 +22,7 @@
 #include "Hardware/GraphicsProcessingUnit/FramebufferGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpuProtocol.hpp"
+#include "Hardware/Monitor/IMonitorSource.hpp"
 #include "Kernel/Sync.hpp"
 
 namespace hardware {
@@ -32,7 +33,10 @@ namespace hardware {
 // and flushes it. When the host offers virgl (virtio-gpu-gl*: QEMU renders with
 // the host's OpenGL), it also creates a 3D context; VirglDevice
 // (Graphics/Graphics3D/Virgl) uses that through execute() for GPU-accelerated 3D.
-class VirtioGpu : public FramebufferGpu {
+//
+// A virtio-gpu has several scanouts (QEMU's max_outputs), each a monitor. As a monitor source it reports them, reads their EDID when the host offers
+// it (the EDID feature), and can show one big screen resource on all of them at once, a rectangle of it on each (apply_layout()).
+class VirtioGpu : public FramebufferGpu, public IMonitorSource {
  public:
   static constexpr uint16_t kPciVendor = kVirtioPciVendor;
   static constexpr uint16_t kPciDeviceId = virtio_gpu::kPciDevice;
@@ -49,6 +53,15 @@ class VirtioGpu : public FramebufferGpu {
   uint32_t current_mode() const override { return current_; }
   bool set_mode(uint32_t index) override;
   void present() override;
+  IMonitorSource* monitor_source() override { return this; }
+
+  // --- IMonitorSource
+  uint32_t connector_count() const override;
+  bool connector_info(uint32_t connector, ConnectorInfo* out) const override;
+  uint32_t read_edid(uint32_t connector, ByteView out) override;
+  bool refresh_connectors() override;
+  bool supports_multiple_displays() const override { return ready_; }
+  bool apply_layout(const ScanoutPlacement* placements, uint32_t count, uint32_t desktop_width, uint32_t desktop_height) override;
 
   // --- For the 3D device ------------------------------------------------------
   // True if the host renders 3D for us (virgl negotiated, capset present, context created).
@@ -78,6 +91,8 @@ class VirtioGpu : public FramebufferGpu {
   static constexpr uint64_t kResponseBytes = 4096;
 
   bool setup_3d();
+  bool read_display_info();
+  bool show_layout(uint32_t id);
   bool create_screen(uint32_t width, uint32_t height);
   void release_screen();
 
@@ -94,6 +109,16 @@ class VirtioGpu : public FramebufferGpu {
   uint64_t fence_ = 0;
   bool in_flight_ = false;  // a command timed out and the device still holds its buffers
   uint32_t timeouts_ = 0;
+
+  struct Output {
+    bool enabled = false;
+    uint32_t width = 0, height = 0;
+  };
+  Output outputs_[IMonitorSource::kMaxConnectors];
+  uint32_t output_count_ = 1;
+  ScanoutPlacement layout_[IMonitorSource::kMaxConnectors];   // what the scanouts show, when the screen is shared out among several monitors
+  uint32_t layout_count_ = 0;
+  uint32_t used_scanouts_ = 0;                                // bit mask of the scanouts that were given a resource
 
   bool has_3d_ = false;
   uint32_t next_resource_ = 1;

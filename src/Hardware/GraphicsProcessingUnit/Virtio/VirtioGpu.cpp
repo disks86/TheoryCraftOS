@@ -90,7 +90,7 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
 bool VirtioGpu::initialize() {
   if (!pci_ || !allocator_ || device_.vendor_id != kPciVendor || device_.device_id != kPciDeviceId) return false;
   transport_ = new (transport_storage_) VirtioPciDevice(*pci_, device_, *allocator_, st_);
-  transport_->request_features(kFeatureVirgl);
+  transport_->request_features(kFeatureVirgl | kFeatureEdid);
   if (!transport_->initialize() || !transport_->setup_queue(0, &control_) || !transport_->start()) {
     transport_->shutdown();
     transport_ = nullptr;
@@ -103,6 +103,11 @@ bool VirtioGpu::initialize() {
     return false;
   }
   ready_ = true;
+  output_count_ = 0;
+  for (int i = 0; i < 4; ++i) output_count_ |= uint32_t{transport_->read_config8(8 + i)} << (8 * i);   // num_scanouts
+  if (output_count_ == 0) output_count_ = 1;
+  if (output_count_ > IMonitorSource::kMaxConnectors) output_count_ = IMonitorSource::kMaxConnectors;
+  read_display_info();   // (which outputs have a display, and its size)
 
   if (!set_mode(kDefaultMode)) {
     shutdown();
@@ -168,9 +173,33 @@ bool VirtioGpu::create_screen(uint32_t width, uint32_t height) {
   return true;
 }
 
+// Points the scanouts at resource `id`: each monitor of the layout at its rectangle of it; scanouts that had a resource and are not in the layout
+// are switched off.
+bool VirtioGpu::show_layout(uint32_t id) {
+  uint32_t shown = 0;
+  for (uint32_t i = 0; i < layout_count_; ++i) {
+    const ScanoutPlacement& p = layout_[i];
+    SetScanout scanout{header(kCmdSetScanout), {p.x, p.y, p.width, p.height}, p.connector, id};
+    if (!command(as_bytes(scanout))) return false;
+    shown |= 1u << p.connector;
+  }
+  for (uint32_t s = 0; s < IMonitorSource::kMaxConnectors; ++s)
+    if ((used_scanouts_ & ~shown) & (1u << s)) {
+      SetScanout off{header(kCmdSetScanout), {0, 0, 0, 0}, s, 0};
+      command(as_bytes(off));
+    }
+  used_scanouts_ = shown;
+  return true;
+}
+
 bool VirtioGpu::show_resource(uint32_t id, uint32_t width, uint32_t height) {
-  SetScanout scanout{header(kCmdSetScanout), {0, 0, width, height}, 0, id};
-  if (!command(as_bytes(scanout))) return false;
+  if (layout_count_ > 0) {
+    if (!show_layout(id)) return false;
+  } else {
+    SetScanout scanout{header(kCmdSetScanout), {0, 0, width, height}, 0, id};
+    if (!command(as_bytes(scanout))) return false;
+    used_scanouts_ = 1;
+  }
   shown_resource_ = id;
   ResourceFlush flush{header(kCmdResourceFlush), {0, 0, width, height}, id, 0};
   return command(as_bytes(flush));
@@ -186,9 +215,98 @@ bool VirtioGpu::mode_info(uint32_t index, DisplayMode* out) const {
 
 bool VirtioGpu::set_mode(uint32_t index) {
   if (!ready_ || index >= kModeCount) return false;
-  if (!create_screen(kModes[index].width, kModes[index].height)) return false;
+  const uint32_t old_layout = layout_count_;
+  layout_count_ = 0;   // a mode is a screen for one display
+  if (!create_screen(kModes[index].width, kModes[index].height)) {
+    layout_count_ = old_layout;
+    return false;
+  }
   current_ = index;
   return true;
+}
+
+// --- Monitors ---------------------------------------------------------------------------------------
+
+bool VirtioGpu::read_display_info() {
+  if (!ready_) return false;
+  GetDisplayInfo request{header(kCmdGetDisplayInfo)};
+  RespDisplayInfo info{};
+  if (execute(as_bytes(request), ByteView(reinterpret_cast<uint8_t*>(&info), sizeof(info))) != kRespOkDisplayInfo) return false;
+  for (uint32_t i = 0; i < IMonitorSource::kMaxConnectors; ++i) {
+    outputs_[i].enabled = info.modes[i].enabled != 0;
+    outputs_[i].width = info.modes[i].rect.width;
+    outputs_[i].height = info.modes[i].rect.height;
+  }
+  return true;
+}
+
+uint32_t VirtioGpu::connector_count() const { return output_count_; }
+
+bool VirtioGpu::connector_info(uint32_t connector, ConnectorInfo* out) const {
+  if (connector >= output_count_ || !out) return false;
+  *out = ConnectorInfo();
+  const Output& o = outputs_[connector];
+  out->connected = o.enabled || (connector == 0 && !o.width);   // (the first one is there even before the host said anything)
+  out->type = ConnectorType::Virtual;
+  const char prefix[] = "Virtual-";
+  uint32_t n = 0;
+  for (; prefix[n]; ++n) out->name[n] = prefix[n];
+  if (connector >= 10) out->name[n++] = static_cast<char>('0' + connector / 10);
+  out->name[n++] = static_cast<char>('0' + connector % 10);
+  out->name[n] = 0;
+  out->preferred_width = o.width;
+  out->preferred_height = o.height;
+  return true;
+}
+
+uint32_t VirtioGpu::read_edid(uint32_t connector, ByteView out) {
+  if (!ready_ || connector >= output_count_ || !transport_ || !(transport_->accepted_features() & kFeatureEdid)) return 0;
+  GetEdid request{header(kCmdGetEdid), connector, 0};
+  RespEdid response{};
+  if (execute(as_bytes(request), ByteView(reinterpret_cast<uint8_t*>(&response), sizeof(response))) != kRespOkEdid) return 0;
+  uint32_t n = response.size < sizeof response.edid ? response.size : sizeof response.edid;
+  if (n > out.size()) n = static_cast<uint32_t>(out.size());
+  for (uint32_t i = 0; i < n; ++i) out[i] = response.edid[i];
+  return n;
+}
+
+bool VirtioGpu::refresh_connectors() {
+  Output before[IMonitorSource::kMaxConnectors];
+  for (uint32_t i = 0; i < IMonitorSource::kMaxConnectors; ++i) before[i] = outputs_[i];
+  if (!read_display_info()) return false;
+  for (uint32_t i = 0; i < output_count_; ++i)
+    if (before[i].enabled != outputs_[i].enabled) return true;   // (a size change of the host window is not a change of monitors)
+  return false;
+}
+
+// Replaces the screen by one of the desktop's size and shows on each monitor its rectangle of it.
+bool VirtioGpu::apply_layout(const ScanoutPlacement* placements, uint32_t count, uint32_t desktop_width, uint32_t desktop_height) {
+  if (!ready_ || !placements || count == 0 || count > IMonitorSource::kMaxConnectors) return false;
+  if (desktop_width == 0 || desktop_height == 0 || desktop_width > 16384 || desktop_height > 16384 || uint64_t{desktop_width} * desktop_height > (64u << 20)) return false;
+  for (uint32_t i = 0; i < count; ++i) {
+    const ScanoutPlacement& p = placements[i];
+    if (p.connector >= output_count_ || p.width == 0 || p.height == 0 || uint64_t{p.x} + p.width > desktop_width || uint64_t{p.y} + p.height > desktop_height) return false;
+  }
+  ScanoutPlacement old[IMonitorSource::kMaxConnectors];
+  const uint32_t old_count = layout_count_;
+  for (uint32_t i = 0; i < old_count; ++i) old[i] = layout_[i];
+  for (uint32_t i = 0; i < count; ++i) layout_[i] = placements[i];
+  layout_count_ = count;
+  bool ok;
+  if (desktop_width == width() && desktop_height == height() && screen_resource_) {   // the same screen, shared out differently
+    ok = show_layout(screen_resource_);
+    if (ok) {
+      ResourceFlush flush{header(kCmdResourceFlush), {0, 0, desktop_width, desktop_height}, screen_resource_, 0};
+      command(as_bytes(flush));
+    }
+  } else {
+    ok = create_screen(desktop_width, desktop_height);
+  }
+  if (!ok) {
+    for (uint32_t i = 0; i < old_count; ++i) layout_[i] = old[i];
+    layout_count_ = old_count;
+  }
+  return ok;
 }
 
 void VirtioGpu::present() {
