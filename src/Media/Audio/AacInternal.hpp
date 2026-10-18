@@ -37,6 +37,8 @@ class AacDecoder {
 
   // `sampling_index` as in ADTS and AudioSpecificConfig (0 = 96 kHz ... 11 = 8 kHz).
   bool init(uint32_t sampling_index);
+  // Forgets the previous block (the overlap of the transform): the next block is decoded as if it began the stream.
+  void reset();
   uint32_t sample_rate() const;
   // Output channels of the last decoded block: 1 or 2 (the front pair of a larger layout).
   uint32_t channels() const;

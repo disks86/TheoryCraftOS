@@ -45,6 +45,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       task_manager_(allocator),
       notepad_(allocator),
       paint_(allocator),
+      media_player_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)} {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
@@ -62,6 +63,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Task Manager", {&Desktop::on_task_manager, this});
   start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
+  start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -96,6 +98,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   shutdown_dialog_.set_texts("Shut Down", "Shut down TheoryCraftOS now?", "Running services will be stopped.", "Shut Down", "Cancel");
   shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
 
+  media_player_.set_notices(&notice_dialog_);
+  media_player_.set_file_dialog(&file_dialog_);
   notepad_.set_notices(&notice_dialog_);
   paint_.set_notices(&notice_dialog_);
   explorer_.set_notices(&notice_dialog_);
@@ -154,6 +158,11 @@ void Desktop::open_paint() {
   else windows_.add_window(&paint_);
 }
 
+void Desktop::open_media_player() {
+  if (media_player_.manager()) media_player_.activate();
+  else windows_.add_window(&media_player_);
+}
+
 void Desktop::open_about() {
   if (about_.manager()) about_.activate();
   else windows_.add_window(&about_);
@@ -163,12 +172,18 @@ void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 
 void Desktop::on_task_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_task_manager(); }
 void Desktop::on_paint(void* self, Control&) { static_cast<Desktop*>(self)->open_paint(); }
+void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self)->open_media_player(); }
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
 void Desktop::on_explorer_file(void* self, Control&) {
   auto* d = static_cast<Desktop*>(self);
   if (Paint::is_picture_name(d->explorer_.opened_file())) {  // pictures open in Paint, everything else as text
     d->paint_.open_file(d->explorer_.opened_file());
     d->open_paint();
+    return;
+  }
+  if (MediaPlayer::is_media_name(d->explorer_.opened_file())) {   // sound and video open in the media player
+    d->open_media_player();
+    d->media_player_.open_file(d->explorer_.opened_file());
     return;
   }
   d->notepad_.open_file(d->explorer_.opened_file());

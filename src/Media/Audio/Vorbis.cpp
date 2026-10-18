@@ -22,6 +22,9 @@
 // stream is read, the rest of the file is ignored), Ogg page checksums (not verified).
 #include "Math/FloatMath.hpp"
 #include "Media/AudioCodecs.hpp"
+#include "Media/AudioStreaming.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Utility/Move.hpp"
 #include "Media/Audio/Mdct.hpp"
 
 namespace media {
@@ -297,6 +300,18 @@ class Decoder {
     allocator_.deallocate(classes_);
   }
   bool decode(ConstByteView data, AudioData* out);
+
+  // Packet by packet (for the streaming reader): headers, then audio packets; the sound they give is collected in pcm().
+  bool packet(ConstByteView p) { return on_packet(p); }
+  bool ready() const { return state_ == 3; }
+  uint32_t rate() const { return rate_; }
+  uint32_t output_channels() const { return out_channels_; }
+  ByteBuffer& pcm() { return pcm_; }
+  // Forget the previous block: the next audio packet only primes the transform (it gives no sound).
+  void restart_overlap() {
+    have_previous_ = false;
+    previous_n_ = 0;
+  }
 
  private:
   bool on_packet(ConstByteView packet);
@@ -890,6 +905,199 @@ bool decode_vorbis(ConstByteView data, AudioData* out) {
   if (decoder.decode(data, out)) return true;
   out->clear();
   return false;
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// Streaming: the pages of the Ogg file are indexed (where each is and the sample position its last packet ends at), then decoded a page
+// at a time. The sound a page gives is placed by those positions, so a restart in the middle of the stream lands in the right place.
+
+namespace {
+
+class VorbisStream final : public StreamingPcmSource {
+ public:
+  VorbisStream(IByteSource& source, allocators::IAllocator& allocator)
+      : source_(source), allocator_(allocator), window_(source, allocator), decoder_(allocator), partial_(allocator), pcm_(allocator), pages_(allocator) {}
+
+  bool init() {
+    if (!scan_pages()) return false;
+    // Decode from the start until the headers are through: that tells the format.
+    next_page_ = 0;
+    uint64_t guard = 0;
+    while (!decoder_.ready() && next_page_ < pages_.count() && guard++ < 64) {
+      if (!decode_page(next_page_++)) return false;
+    }
+    if (!decoder_.ready() || decoder_.output_channels() == 0) return false;
+    format_.sample_rate = decoder_.rate();
+    format_.channels = static_cast<uint8_t>(decoder_.output_channels());
+    format_.type = audio::SampleType::S16;
+    // The length is where the last page ends.
+    int64_t last = 0;
+    for (uint64_t i = pages_.count(); i > 0; --i)
+      if (pages_[i - 1].granule > 0) {
+        last = pages_[i - 1].granule;
+        break;
+      }
+    frames_ = static_cast<uint64_t>(last);
+    restart(0);
+    return frames_ > 0 && format_.valid();
+  }
+
+ protected:
+  bool refill(uint64_t frame) override {
+    // Back to the start, or to a place a couple of pages before the page that ends after `frame`, if that is not where the decoding is.
+    if (!known_ || frame < abs_pos_ || frame - abs_pos_ > 262144) {
+      uint64_t q = 0;
+      while (q + 1 < pages_.count() && (pages_[q].granule < 0 || static_cast<uint64_t>(pages_[q].granule) <= frame)) ++q;
+      uint64_t r = q > 2 ? q - 2 : 0;
+      while (r > 0 && pages_[r].continued) --r;
+      restart(r);
+    }
+    for (;;) {
+      if (next_page_ >= pages_.count()) return false;
+      pcm_.clear();
+      uint64_t first = 0;
+      if (!decode_next(&first)) return false;
+      const uint64_t have = pcm_.size() / format_.frame_size();
+      if (have == 0) continue;
+      if (first + have <= frame) continue;   // all before the place wanted
+      if (first > frame) {   // the place wanted was the start of a block that only primed the transform: begin earlier
+        if (restart_page_ == 0) return false;
+        uint64_t r = restart_page_ - 1;
+        while (r > 0 && pages_[r].continued) --r;
+        restart(r);
+        continue;
+      }
+      uint64_t usable = have;
+      if (first + usable > frames_) usable = first < frames_ ? frames_ - first : 0;
+      if (usable == 0) return false;
+      set_window(first, pcm_.view().first(usable * format_.frame_size()));
+      return true;
+    }
+  }
+
+ private:
+  struct Page {
+    uint64_t offset = 0;
+    int64_t granule = -1;
+    bool continued = false;
+  };
+
+  static uint32_t le32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (uint32_t{p[3]} << 24); }
+
+  bool scan_pages() {
+    uint64_t pos = 0;
+    uint32_t serial = 0;
+    bool have_serial = false;
+    while (pos + 27 <= source_.size()) {
+      const ConstByteView v = window_.from(pos);
+      if (v.size() < 27) break;
+      if (v[0] != 'O' || v[1] != 'g' || v[2] != 'g' || v[3] != 'S') {   // lost sync: look for the next page
+        uint64_t skip = 1;
+        while (skip + 4 <= v.size() && !(v[skip] == 'O' && v[skip + 1] == 'g' && v[skip + 2] == 'g' && v[skip + 3] == 'S')) ++skip;
+        pos += skip;
+        continue;
+      }
+      const uint32_t segments = v[26];
+      if (v.size() < 27 + segments) break;
+      uint64_t total = 0;
+      for (uint32_t i = 0; i < segments; ++i) total += v[27 + i];
+      const uint64_t size = 27 + segments + total;
+      if (pos + size > source_.size()) break;
+      const uint32_t page_serial = le32(v.data() + 14);
+      if (!have_serial) {
+        serial = page_serial;
+        have_serial = true;
+      }
+      if (page_serial == serial) {
+        Page page;
+        page.offset = pos;
+        const uint64_t g = le32(v.data() + 6) | (uint64_t{le32(v.data() + 10)} << 32);
+        page.granule = g == 0xFFFFFFFFFFFFFFFFull ? -1 : static_cast<int64_t>(g);
+        page.continued = (v[5] & 1) != 0;
+        if (!pages_.push_back(page)) return false;
+        if (v[5] & 4) break;   // end of stream
+      }
+      pos += size;
+    }
+    return pages_.count() > 0;
+  }
+
+  // Starts decoding at page `r` (which begins with a packet) with the transform's memory cleared.
+  void restart(uint64_t r) {
+    decoder_.restart_overlap();
+    partial_.clear();
+    next_page_ = r;
+    restart_page_ = r;
+    known_ = r == 0;
+    abs_pos_ = 0;
+  }
+
+  // Decodes the next page; the sound it gives is left in pcm_, *first being the position of its first frame.
+  bool decode_next(uint64_t* first) {
+    uint64_t pages_used = 0;
+    while (next_page_ < pages_.count()) {
+      const uint64_t before = pcm_.size();
+      const uint64_t index = next_page_++;
+      ++pages_used;
+      if (!decode_page(index)) return false;
+      const uint64_t frame_size = format_.frame_size();
+      const uint64_t n = (pcm_.size() - before) / frame_size;
+      const int64_t granule = pages_[index].granule;
+      if (!known_) {   // the first page after a restart: the end of its sound is at the page's position
+        if (granule < 0 || pcm_.size() == 0) continue;   // (no sound or no position yet: carry on to the next page and place them together)
+        const uint64_t total = pcm_.size() / frame_size;
+        abs_pos_ = static_cast<uint64_t>(granule) >= total ? static_cast<uint64_t>(granule) - total : 0;
+        known_ = true;
+      }
+      *first = abs_pos_;
+      abs_pos_ += pcm_.size() / frame_size;
+      (void)n;
+      return true;
+    }
+    return false;
+  }
+
+  // Feeds the packets that end in the page to the decoder; the sound goes to the decoder's buffer, which is then moved to pcm_.
+  bool decode_page(uint64_t index) {
+    const Page& page = pages_[index];
+    const ConstByteView v = window_.from(page.offset);
+    if (v.size() < 27) return false;
+    const uint32_t segments = v[26];
+    uint64_t at = 27 + segments;
+    if (v.size() < at) return false;
+    for (uint32_t s = 0; s < segments; ++s) {
+      const uint32_t len = v[27 + s];
+      if (at + len > v.size()) return false;
+      if (!partial_.append(v.subview(at, len))) return false;
+      at += len;
+      if (len < 255) {
+        if (!decoder_.packet(partial_.view())) return false;
+        partial_.clear();
+      }
+    }
+    ByteBuffer& out = decoder_.pcm();
+    if (out.size() && !pcm_.append(out.view())) return false;
+    out.clear();
+    return true;
+  }
+
+  IByteSource& source_;
+  allocators::IAllocator& allocator_;
+  SourceWindow window_;
+  Decoder decoder_;
+  ByteBuffer partial_, pcm_;
+  List<Page> pages_;
+  uint64_t next_page_ = 0, abs_pos_ = 0, restart_page_ = 0;
+  bool known_ = true;   // abs_pos_ is the position of the next sound the decoder gives
+};
+
+}  // namespace
+
+UniquePointer<audio::IPcmSource> open_vorbis_stream(IByteSource& source, allocators::IAllocator& allocator) {
+  UniquePointer<VorbisStream> stream = UniquePointer<VorbisStream>::make(allocator, source, allocator);
+  if (!stream || !stream->init()) return UniquePointer<audio::IPcmSource>();
+  return UniquePointer<audio::IPcmSource>(util::move(stream));
 }
 
 }  // namespace media

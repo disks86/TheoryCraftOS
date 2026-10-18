@@ -19,6 +19,7 @@
 #include "Video/VideoPlayer.hpp"
 #include "Hardware/VideoCodec/ColorConvert.hpp"
 #include "Media/AudioCodecs.hpp"
+#include "Media/AudioStreaming.hpp"
 #include "Media/ImageCodecs.hpp"
 #include "Media/VideoFiles.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -34,17 +35,21 @@ VideoPlayer::~VideoPlayer() {
 
 // Drops everything of the open file (the decoder, the sound, the picture).
 void VideoPlayer::release() {
-  audio_player_.reset();  // before the source and samples it plays from
-  audio_source_.reset();
-  release_view(allocator_, audio_samples_);
+  audio_player_.reset();  // before the sound it plays
+  audio_stream_.reset();
   decoder_.reset();
-  decoded_audio_.clear();
   seq_clear();
   mp4_.clear();
   mp4_track_ = nullptr;
+  source_ = nullptr;
+  packet_.clear();
   images_.clear();
   frame_starts_.clear();
   image_mode_ = false;
+  y4m_mode_ = false;
+  y4m_frames_ = 0;
+  y4m_head_.clear();
+  y4m_frame_.clear();
   state_ = VideoState::Empty;
   have_picture_ = false;
   width_ = height_ = 0;
@@ -63,6 +68,11 @@ OpenResult VideoPlayer::open(ConstByteView avi) {
   kernel::ScopedMutex guard(mutex_);
   release();
   if (!file_.open(avi)) return OpenResult::NotAvi;
+  return finish_avi();
+}
+
+// The rest of opening an AVI file whose headers and tables file_ has read.
+OpenResult VideoPlayer::finish_avi() {
   const AviVideoInfo& info = file_.video();
   if (!info.supported || info.width == 0 || info.height == 0) return OpenResult::NoDecoder;
 
@@ -95,47 +105,41 @@ OpenResult VideoPlayer::open(ConstByteView avi) {
   return OpenResult::Ok;
 }
 
-// The sound of an AVI file: all its audio chunks gathered into one run (decoded first, for the compressed kinds), played by
-// an AudioPlayer. Without a mixer, or if anything fails, the video plays silently.
+// The sound of an AVI file: its audio chunks, read and decoded as they play, through an AudioPlayer. Without a mixer, or if anything fails,
+// the video plays silently.
 void VideoPlayer::open_audio() {
   const AviAudioInfo& info = file_.audio();
   if (!mixer_ || !info.present || info.bytes == 0) return;
-  audio::IPcmSource* source = nullptr;
-  if (info.tag == 1) {
-    audio_samples_ = allocate_view<uint8_t>(allocator_, info.bytes);
-    if (audio_samples_.empty()) return;
-    const uint64_t bytes = file_.copy_audio(audio_samples_);
-    audio_source_ = UniquePointer<audio::MemoryPcmSource>::make(allocator_, ConstByteView(audio_samples_).first(bytes), info.format);
-    source = audio_source_.get();
-  } else {
-    // Wrap the compressed bytes in a WAV file (the stream's own format header, then the data) and let the WAV decoder do it.
-    ByteView packed = allocate_view<uint8_t>(allocator_, info.bytes);
-    if (packed.empty()) return;
-    const uint64_t got = file_.copy_audio(packed);
-    ByteBuffer wav(allocator_);
-    const bool built = wav.put_tag("RIFF") && wav.put32(static_cast<uint32_t>(4 + 8 + info.wave_format.size() + 8 + got)) && wav.put_tag("WAVE") &&
-                       wav.put_tag("fmt ") && wav.put32(static_cast<uint32_t>(info.wave_format.size())) && wav.append(info.wave_format) &&
-                       ((info.wave_format.size() & 1) == 0 || wav.put8(0)) && wav.put_tag("data") && wav.put32(static_cast<uint32_t>(got)) &&
-                       wav.append(ConstByteView(packed).first(got));
-    release_view(allocator_, packed);
-    if (!built || !media::decode_wav(wav.view(), &decoded_audio_)) return;
-    source = decoded_audio_.source();
-  }
-  start_audio(source);
+  audio_stream_ = media::open_wave_data_stream(file_.audio_source(), info.wave_format, allocator_);
+  if (audio_stream_) start_audio(audio_stream_.get());
 }
 
 void VideoPlayer::start_audio(audio::IPcmSource* source) {
   audio_player_ = UniquePointer<audio::AudioPlayer>::make(allocator_, *mixer_, allocator_);
-  if (!source || !audio_player_ || !audio_player_->open(source)) {
+  if (!source || !audio_player_ || !audio_player_->open(source)) {   // play without sound
     audio_player_.reset();
-    audio_source_.reset();
-    decoded_audio_.clear();
-    release_view(allocator_, audio_samples_);  // play without sound
+    audio_stream_.reset();
   }
 }
 
 // Decodes frame `index` into the picture. False if the decoder gave nothing (the old picture stays).
 bool VideoPlayer::decode_frame(uint32_t index) {
+  if (y4m_mode_) {   // read the frame, wrap it in a one-frame Y4M file and let the Y4M decoder make the picture
+    if (index >= y4m_frames_ || !source_) return false;
+    packet_.clear();
+    if (!packet_.append(y4m_head_.view()) || !packet_.put_tag("FRAM") || !packet_.put16('E' | ('\n' << 8))) return false;
+    const uint64_t at = packet_.size();
+    if (!packet_.put_zeros(y4m_frame_bytes_)) return false;
+    if (source_->read(y4m_first_ + uint64_t{index} * y4m_step_, ByteView(const_cast<uint8_t*>(packet_.view().data()) + at, y4m_frame_bytes_)) != y4m_frame_bytes_) return false;
+    if (!media::decode_y4m(packet_.view(), &y4m_frame_) || y4m_frame_.frame_count() != 1) return false;
+    ArrayView<uint32_t> pixels = y4m_frame_.frame(0);
+    if (pixels.size() * 4 != display_.plane(0).size()) return false;
+    __builtin_memcpy(display_.plane(0).data(), pixels.data(), pixels.size() * 4);
+    current_frame_ = index;
+    ++decoded_;
+    ++serial_;
+    return true;
+  }
   if (image_mode_) {
     ArrayView<uint32_t> pixels = images_.frame(index);
     if (pixels.empty()) return false;
@@ -201,6 +205,14 @@ void VideoPlayer::show_frame(uint32_t target) {
 }
 
 uint32_t VideoPlayer::frame_at_time(int64_t time_us) const {
+  if (y4m_mode_) {
+    if (y4m_frames_ == 0 || time_us <= 0) return 0;
+    uint64_t i = static_cast<uint64_t>(time_us) * y4m_rate_num_ / (1000000 * y4m_rate_den_);
+    if (i >= y4m_frames_) i = y4m_frames_ - 1;
+    while (i + 1 < y4m_frames_ && y4m_start_us(i + 1) <= time_us) ++i;
+    while (i > 0 && y4m_start_us(i) > time_us) --i;
+    return static_cast<uint32_t>(i);
+  }
   if (!image_mode_ && !seq_mode()) return file_.frame_at_time(time_us);
   const List<int64_t>& starts = image_mode_ ? frame_starts_ : seq_times_;
   const uint64_t n = image_mode_ ? images_.frame_count() : seq_dec_of_rank_.count();
@@ -229,10 +241,10 @@ void VideoPlayer::seq_clear() {
 
 bool VideoPlayer::seq_packet(uint32_t decode_index, VideoPacket* packet) const {
   if (seq_source_ == SeqSource::Avi) return file_.frame(decode_index, packet);
-  if (seq_source_ != SeqSource::Mp4 || !mp4_track_) return false;
-  const ConstByteView sample = mp4_.sample(*mp4_track_, decode_index);
-  if (sample.empty()) return false;
-  packet->data = sample;
+  if (seq_source_ != SeqSource::Mp4 || !mp4_track_ || !source_) return false;
+  packet_.clear();
+  if (!mp4_.read_sample(*source_, *mp4_track_, decode_index, &packet_) || packet_.size() == 0) return false;
+  packet->data = packet_.view();
   packet->pts_us = 0;
   packet->keyframe = seq_sync_[decode_index] != 0;
   return true;
@@ -379,7 +391,10 @@ OpenResult VideoPlayer::open_images() {
 OpenResult VideoPlayer::open_media(ConstByteView data) {
   const media::VideoFileFormat format = media::detect_video_file(data);
   if (format == media::VideoFileFormat::Avi) return open(data);
-  if (format == media::VideoFileFormat::Mp4) return open_mp4(data);
+  if (format == media::VideoFileFormat::Mp4) {
+    memory_.reset(data);
+    return open_mp4(memory_);
+  }
   kernel::ScopedMutex guard(mutex_);
   release();
   // GIF, APNG and Y4M are videos; any other picture format opens as a video of one frame.
@@ -390,15 +405,145 @@ OpenResult VideoPlayer::open_media(ConstByteView data) {
   return result;
 }
 
-// An MP4 / MOV file: its H.264 video track, and its audio track (AAC or MP3) decoded up front.
-OpenResult VideoPlayer::open_mp4(ConstByteView data) {
+OpenResult VideoPlayer::open_media(media::IByteSource& source) {
+  uint8_t head[16] = {};
+  const uint64_t got = source.read(0, ByteView(head));
+  const media::VideoFileFormat format = media::detect_video_file(ConstByteView(head, got));
+  if (format == media::VideoFileFormat::Avi) {
+    kernel::ScopedMutex guard(mutex_);
+    release();
+    if (!file_.open(source)) return OpenResult::NotAvi;
+    source_ = &source;
+    const OpenResult result = finish_avi();
+    if (result != OpenResult::Ok) source_ = nullptr;
+    return result;
+  }
+  if (format == media::VideoFileFormat::Mp4) return open_mp4(source);
+  if (format == media::VideoFileFormat::Y4m) {
+    OpenResult result = OpenResult::Unsupported;
+    if (open_y4m_stream(source, &result)) return result;   // (else it is read whole, below)
+  }
+  // The rest are decoded up front: the file is read whole, decoded, and let go. (Only pictures, though: anything else is not read at all.)
+  uint8_t more[64] = {};
+  const uint64_t more_got = source.read(0, ByteView(more));
+  if (format == media::VideoFileFormat::Unknown && media::detect_image_format(ConstByteView(more, more_got)) == media::ImageFormat::Unknown) return OpenResult::Unsupported;
+  if (source.size() == 0 || source.size() > kMaxInMemoryBytes) return OpenResult::Unsupported;
+  ByteView whole = allocate_view<uint8_t>(allocator_, source.size());
+  if (whole.empty()) return OpenResult::OutOfMemory;
+  OpenResult result = OpenResult::Unsupported;
+  if (source.read(0, whole) == whole.size()) result = open_media(ConstByteView(whole));
+  release_view(allocator_, whole);
+  return result;
+}
+
+// A Y4M file whose frames are all the same size, read a frame at a time. False (nothing opened) if it is not laid out that way - frames with
+// parameters, a chroma format the decoder lacks - and the file should be read whole instead.
+bool VideoPlayer::open_y4m_stream(media::IByteSource& source, OpenResult* result) {
+  uint8_t line[1024];
+  const uint64_t got = source.read(0, ByteView(line));
+  uint64_t end = 0;
+  while (end < got && line[end] != '\n') ++end;
+  if (end >= got) return false;
+  uint64_t width = 0, height = 0, num = 25, den = 1;
+  enum { C420, C422, C444, Mono } chroma = C420;
+  auto number = [&](uint64_t* at, uint64_t* value) {
+    uint64_t v = 0, digits = 0;
+    while (*at < end && line[*at] >= '0' && line[*at] <= '9' && digits < 9) v = v * 10 + (line[(*at)++] - '0'), ++digits;
+    *value = v;
+    return digits > 0;
+  };
+  for (uint64_t at = 9; at < end;) {
+    if (line[at] != ' ') return false;
+    ++at;
+    if (at >= end) return false;
+    const uint8_t key = line[at++];
+    if (key == 'W') {
+      if (!number(&at, &width)) return false;
+    } else if (key == 'H') {
+      if (!number(&at, &height)) return false;
+    } else if (key == 'F') {
+      if (!number(&at, &num) || at >= end || line[at++] != ':' || !number(&at, &den)) return false;
+    } else if (key == 'I') {
+      if (at >= end || (line[at] != 'p' && line[at] != '?')) return false;
+      ++at;
+    } else {
+      const uint64_t start = at;
+      while (at < end && line[at] != ' ') ++at;
+      if (key == 'C') {
+        const uint64_t n = at - start;
+        if (n >= 3 && line[start] == '4' && line[start + 1] == '2' && line[start + 2] == '0') chroma = C420;
+        else if (n >= 3 && line[start] == '4' && line[start + 1] == '2' && line[start + 2] == '2') chroma = C422;
+        else if (n == 3 && line[start] == '4' && line[start + 1] == '4' && line[start + 2] == '4') chroma = C444;
+        else if (n == 4 && line[start] == 'm' && line[start + 1] == 'o') chroma = Mono;
+        else return false;
+      }
+    }
+  }
+  if (width == 0 || height == 0 || width > 65535 || height > 65535 || num == 0 || den == 0) return false;
+  const uint64_t cw = chroma == C444 ? width : (width + 1) / 2;
+  const uint64_t ch = chroma == C420 ? (height + 1) / 2 : height;
+  const uint64_t data_bytes = chroma == Mono ? width * height : width * height + 2 * cw * ch;
+  const uint64_t first = end + 1, step = 6 + data_bytes;
+  if (source.size() < first + step) return false;
+  const uint64_t frames = (source.size() - first) / step;
+  // Every frame must begin with a plain "FRAME" line: look at the second and the last.
+  const uint64_t probes[3] = {0, 1, frames - 1};
+  for (uint64_t f : probes) {
+    uint8_t mark[6];
+    if (f >= frames) continue;
+    if (source.read(first + f * step, ByteView(mark)) != 6 || __builtin_memcmp(mark, "FRAME\n", 6) != 0) return false;
+  }
   kernel::ScopedMutex guard(mutex_);
   release();
-  if (!mp4_.open(data)) return OpenResult::Unsupported;
+  if (!y4m_head_.append(ConstByteView(line, end + 1))) return false;
+  y4m_first_ = first + 6;   // (frames are read from their data, behind the "FRAME" line: stepping by `step`)
+  y4m_frame_bytes_ = data_bytes;
+  y4m_step_ = step;
+  y4m_frames_ = frames;
+  y4m_rate_num_ = num;
+  y4m_rate_den_ = den;
+  source_ = &source;
+  if (!display_.allocate({static_cast<uint32_t>(width), static_cast<uint32_t>(height), PixelFormat::Bgra8888})) {
+    release();
+    *result = OpenResult::OutOfMemory;
+    return true;
+  }
+  y4m_mode_ = true;
+  width_ = static_cast<uint32_t>(width);
+  height_ = static_cast<uint32_t>(height);
+  surface_.pixels = ArrayView<uint32_t>(reinterpret_cast<uint32_t*>(display_.plane(0).data()), width * height);
+  surface_.width = width_;
+  surface_.height = height_;
+  surface_.pitch = width_;
+  duration_us_ = y4m_start_us(frames);
+  current_frame_ = 0;
+  if (!decode_frame(0)) {
+    release();
+    *result = OpenResult::NoDecoder;
+    return true;
+  }
+  have_picture_ = true;
+  state_ = VideoState::Stopped;
+  *result = OpenResult::Ok;
+  return true;
+}
+
+// An MP4 / MOV file: its H.264 video track read sample by sample, and its audio track (AAC or MP3) decoded as it plays.
+OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
+  kernel::ScopedMutex guard(mutex_);
+  release();
+  if (!mp4_.open(source)) return OpenResult::Unsupported;
+  source_ = &source;
   const media::Mp4Track* track = mp4_.find(media::Mp4TrackKind::Video);
-  if (!track) return OpenResult::Unsupported;
+  if (!track) {
+    release();
+    return OpenResult::Unsupported;
+  }
   const uint32_t avc1 = 0x61766331, avc3 = 0x61766333;
-  if ((track->codec != avc1 && track->codec != avc3) || track->config.empty()) return OpenResult::NoDecoder;
+  if ((track->codec != avc1 && track->codec != avc3) || track->config.empty()) {
+    release();
+    return OpenResult::NoDecoder;
+  }
   DecoderConfig config;
   config.codec = VideoCodec::H264;
   config.width = track->width;
@@ -406,7 +551,10 @@ OpenResult VideoPlayer::open_mp4(ConstByteView data) {
   config.output = PixelFormat::Bgra8888;
   config.codec_config = track->config;
   decoder_ = codecs_.create_decoder(config);
-  if (!decoder_) return OpenResult::NoDecoder;
+  if (!decoder_) {
+    release();
+    return OpenResult::NoDecoder;
+  }
   if (!seq_build_mp4(*track)) {
     release();
     return OpenResult::OutOfMemory;
@@ -420,7 +568,10 @@ OpenResult VideoPlayer::open_mp4(ConstByteView data) {
     return OpenResult::NoDecoder;
   }
   have_picture_ = true;
-  if (mixer_ && media::decode_mp4_audio(data, &decoded_audio_)) start_audio(decoded_audio_.source());
+  if (mixer_) {
+    audio_stream_ = media::open_mp4_audio_stream(source, allocator_);
+    if (audio_stream_) start_audio(audio_stream_.get());
+  }
   state_ = VideoState::Stopped;
   return OpenResult::Ok;
 }

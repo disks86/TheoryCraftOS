@@ -18,7 +18,7 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager", "Text Editor", "Paint"
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager", "Text Editor", "Paint", "Media Player",
 // and "About" (ordinary windows) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
 // power-off once the desktop loop returns.
@@ -28,6 +28,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/TaskManager.hpp"
@@ -84,9 +85,17 @@ class Desktop {
     explorer_.set_file_system(fs);
     notepad_.set_file_system(fs);
     paint_.set_file_system(fs);
+    media_player_.set_file_system(fs);
     file_dialog_.set_file_system(fs);
   }
   Paint& paint() { return paint_; }
+  MediaPlayer& media_player() { return media_player_; }
+  // The machine's sound mixer, video codecs and clock for the media player (any may be nullptr). They must outlive the desktop.
+  void set_media_services(audio::AudioMixer* mixer, hardware::SystemVideoCodecs* codecs, const hardware::IClock* clock) {
+    media_player_.set_services(mixer, codecs, clock);
+  }
+  // Opens the media player, or brings it forward (restoring it if minimized).
+  void open_media_player();
   // The Open and Save As dialog that the text editor and Paint share.
   FileDialog& file_dialog() { return file_dialog_; }
   // The color and print dialogs the programs share.
@@ -137,6 +146,7 @@ class Desktop {
 
  private:
   static void on_paint(void* self, gui::Control&);
+  static void on_media_player(void* self, gui::Control&);
   static void on_text_editor(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
   static void on_task_manager(void* self, gui::Control&);
@@ -166,6 +176,7 @@ class Desktop {
   TaskManager task_manager_;
   Notepad notepad_;
   Paint paint_;
+  MediaPlayer media_player_;
   gui::Frame about_;
   gui::Label about_lines_[3];
   ClockSource clock_source_ = nullptr;

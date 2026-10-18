@@ -211,6 +211,7 @@ add_executable(BOOTX64
   src/Desktop/TaskManager.cpp
   src/Desktop/Notepad.cpp
   src/Desktop/Paint.cpp
+  src/Desktop/MediaPlayer.cpp
   src/SystemMonitor.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
@@ -261,6 +262,7 @@ add_executable(BOOTX64
   src/Media/Image/WebpLossy.cpp
   src/Media/AudioData.cpp
   src/Media/AudioCodecs.cpp
+  src/Media/AudioStreaming.cpp
   src/Media/Audio/Pcm.cpp
   src/Media/Audio/Wav.cpp
   src/Media/Audio/Aiff.cpp

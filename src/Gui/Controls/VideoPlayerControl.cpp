@@ -22,36 +22,49 @@
 namespace gui {
 
 namespace {
-constexpr int32_t kPad = 4, kRow1 = 2, kRow2 = 30, kRowHeight = 24;
+constexpr int32_t kPad = 4, kRow1 = 2, kRow2 = 30, kRowHeight = 24, kLabelWidth = 64;
 }
 
 VideoPlayerControl::VideoPlayerControl(allocators::IAllocator& allocator, video::VideoPlayer& player)
     : Control(allocator),
       player_(player),
       view_(allocator),
+      rewind_(allocator),
       play_(allocator),
+      pause_(allocator),
       stop_(allocator),
-      time_(allocator),
+      forward_(allocator),
+      position_(allocator),
+      length_(allocator),
       volume_label_(allocator),
+      combined_(allocator),
       seek_(allocator),
       volume_(allocator),
       loop_(allocator) {
   view_.set_fit_enlarges(true);
+  rewind_.set_text("<<");
   play_.set_text("Play");
+  pause_.set_text("Pause");
   stop_.set_text("Stop");
-  time_.set_text("00:00 / 00:00");
+  forward_.set_text(">>");
+  position_.set_text("00:00");
+  length_.set_text("00:00");
+  combined_.assign("00:00 / 00:00");
   volume_label_.set_text("Vol");
   loop_.set_text("Loop");
   seek_.set_range(0, 1000);
   seek_.set_step(10, 100);
   volume_.set_range(0, 100);
   volume_.set_step(5, 20);
+  rewind_.on_click(Handler::immediate(&VideoPlayerControl::rewind_clicked, this));
   play_.on_click(Handler::immediate(&VideoPlayerControl::play_clicked, this));
+  pause_.on_click(Handler::immediate(&VideoPlayerControl::pause_clicked, this));
   stop_.on_click(Handler::immediate(&VideoPlayerControl::stop_clicked, this));
+  forward_.on_click(Handler::immediate(&VideoPlayerControl::forward_clicked, this));
   seek_.on_value_changed(Handler::immediate(&VideoPlayerControl::seek_changed, this));
   volume_.on_value_changed(Handler::immediate(&VideoPlayerControl::volume_changed, this));
   loop_.on_changed(Handler::immediate(&VideoPlayerControl::loop_changed, this));
-  Control* parts[8] = {&view_, &play_, &stop_, &time_, &seek_, &loop_, &volume_label_, &volume_};
+  Control* parts[12] = {&view_, &rewind_, &play_, &pause_, &stop_, &forward_, &position_, &seek_, &length_, &loop_, &volume_label_, &volume_};
   for (Control* c : parts) add(c);
   refresh();
 }
@@ -63,9 +76,28 @@ VideoPlayerControl::~VideoPlayerControl() {
 
 void VideoPlayerControl::play_clicked(void* self, Control&) {
   VideoPlayerControl* c = static_cast<VideoPlayerControl*>(self);
-  if (c->player_.playing()) c->player_.pause();
-  else c->player_.play();
+  c->player_.play();
   c->refresh();
+}
+
+void VideoPlayerControl::pause_clicked(void* self, Control&) {
+  VideoPlayerControl* c = static_cast<VideoPlayerControl*>(self);
+  c->player_.pause();
+  c->refresh();
+}
+
+void VideoPlayerControl::rewind_clicked(void* self, Control&) { static_cast<VideoPlayerControl*>(self)->rewind(); }
+void VideoPlayerControl::forward_clicked(void* self, Control&) { static_cast<VideoPlayerControl*>(self)->fast_forward(); }
+
+void VideoPlayerControl::rewind() {
+  const int64_t skip = int64_t{kSkipSeconds} * 1000000, position = player_.position_us();
+  player_.seek(position > skip ? position - skip : 0);
+  refresh();
+}
+
+void VideoPlayerControl::fast_forward() {
+  player_.seek(player_.position_us() + int64_t{kSkipSeconds} * 1000000);   // (clamped to the length)
+  refresh();
 }
 
 void VideoPlayerControl::stop_clicked(void* self, Control&) {
@@ -129,10 +161,11 @@ void VideoPlayerControl::refresh() {
   update_picture();
   const int64_t duration = player_.duration_us(), position = loaded ? player_.position_us() : 0;
   updating_ = true;
-  const StringView play_text = state == video::VideoState::Playing ? "Pause" : "Play";
-  if (!play_.text().equals(play_text)) play_.set_text(play_text);
-  play_.set_enabled(loaded);
+  play_.set_enabled(loaded && state != video::VideoState::Playing);
+  pause_.set_enabled(state == video::VideoState::Playing);
   stop_.set_enabled(loaded);
+  rewind_.set_enabled(loaded && duration > 0);
+  forward_.set_enabled(loaded && duration > 0);
   seek_.set_enabled(loaded && duration > 0);
   if (!seek_.dragging()) seek_.set_value(duration > 0 ? static_cast<int32_t>(position * 1000 / duration) : 0);
   const bool has_audio = player_.has_audio();
@@ -141,16 +174,14 @@ void VideoPlayerControl::refresh() {
   if (loop_.checked() != player_.looping()) loop_.set_checked(player_.looping());
   updating_ = false;
 
-  char now[16], total[16], text[40];
+  char now[16], total[16];
   const uint32_t a = format_clock(static_cast<uint64_t>(position / 1000000), now);
   const uint32_t b = format_clock(static_cast<uint64_t>(duration / 1000000), total);
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < a; ++i) text[n++] = now[i];
-  text[n++] = ' ';
-  text[n++] = '/';
-  text[n++] = ' ';
-  for (uint32_t i = 0; i < b; ++i) text[n++] = total[i];
-  if (!time_.text().equals(StringView(text, n))) time_.set_text(StringView(text, n));
+  if (!position_.text().equals(StringView(now, a))) position_.set_text(StringView(now, a));
+  if (!length_.text().equals(StringView(total, b))) length_.set_text(StringView(total, b));
+  combined_.assign(StringView(now, a));
+  combined_.append(" / ");
+  combined_.append(StringView(total, b));
 }
 
 void VideoPlayerControl::layout() {
@@ -158,12 +189,19 @@ void VideoPlayerControl::layout() {
   const int32_t bar_top = h > kBarHeight ? h - kBarHeight : 0;
   view_.set_bounds({0, 0, static_cast<uint32_t>(w), static_cast<uint32_t>(bar_top)});
   const int32_t row1 = bar_top + kRow1, row2 = bar_top + kRow2;
-  seek_.set_bounds({kPad, row1, static_cast<uint32_t>(w - 2 * kPad > 0 ? w - 2 * kPad : 0), kRowHeight});
-  play_.set_bounds({kPad, row2, 64, kRowHeight});
-  stop_.set_bounds({kPad + 68, row2, 56, kRowHeight});
-  time_.set_bounds({kPad + 130, row2, 112, kRowHeight});
-  loop_.set_bounds({kPad + 246, row2, 70, kRowHeight});
-  const int32_t vol_x = kPad + 320;
+  const int32_t seek_w = w - 2 * kPad - 2 * kLabelWidth;
+  position_.set_bounds({kPad, row1, kLabelWidth, kRowHeight});
+  seek_.set_bounds({kPad + kLabelWidth, row1, static_cast<uint32_t>(seek_w > 0 ? seek_w : 0), kRowHeight});
+  length_.set_bounds({w - kPad - kLabelWidth, row1, kLabelWidth, kRowHeight});
+  int32_t x = kPad;
+  Button* buttons[5] = {&rewind_, &play_, &pause_, &stop_, &forward_};
+  const int32_t widths[5] = {36, 52, 56, 52, 36};
+  for (int i = 0; i < 5; ++i) {
+    buttons[i]->set_bounds({x, row2, static_cast<uint32_t>(widths[i]), kRowHeight});
+    x += widths[i] + 4;
+  }
+  loop_.set_bounds({x + 8, row2, 70, kRowHeight});
+  const int32_t vol_x = x + 84;
   volume_label_.set_bounds({vol_x, row2, 32, kRowHeight});
   volume_.set_bounds({vol_x + 32, row2, static_cast<uint32_t>(w - vol_x - 32 - kPad > 40 ? w - vol_x - 32 - kPad : 40), kRowHeight});
   Control::layout();

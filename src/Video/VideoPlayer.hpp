@@ -25,7 +25,8 @@
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 #include "Kernel/Sync.hpp"
 #include "Kernel/Thread.hpp"
-#include "Media/AudioData.hpp"
+#include "Media/AudioStreaming.hpp"
+#include "Media/ByteSource.hpp"
 #include "Media/Image.hpp"
 #include "Media/Mp4.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -43,7 +44,7 @@ enum class OpenResult : uint8_t {
   OutOfMemory,
 };
 
-// Plays an AVI file held in memory (or, with open_media(), an MP4 / MOV file with H.264 video, or a GIF, APNG, animated WebP or Y4M file -
+// Plays an AVI file (or, with open_media(), an MP4 / MOV file with H.264 video, or a GIF, APNG, animated WebP or Y4M file -
 // decoded up front into frames that carry their own durations, and silent): the picture through a video decoder session from the machine's codec devices,
 // the sound (if the file has PCM audio and a mixer is given) through an audio::AudioPlayer. The sound is the clock
 // while it plays - the picture follows it, skipping frames when decoding falls behind - and with no sound the picture
@@ -55,7 +56,7 @@ class VideoPlayer {
   VideoPlayer(const hardware::IClock& clock, hardware::SystemVideoCodecs& codecs, allocators::IAllocator& allocator,
               audio::AudioMixer* mixer = nullptr)
       : clock_(clock), codecs_(codecs), allocator_(allocator), mixer_(mixer), file_(allocator), images_(allocator), frame_starts_(allocator),
-        decoded_audio_(allocator), mp4_(allocator), seq_dec_of_rank_(allocator), seq_rank_of_dec_(allocator),
+        packet_(allocator), mp4_(allocator), y4m_head_(allocator), y4m_frame_(allocator), seq_dec_of_rank_(allocator), seq_rank_of_dec_(allocator),
         seq_times_(allocator), seq_sync_(allocator), display_(allocator) {}
   ~VideoPlayer();
   VideoPlayer(const VideoPlayer&) = delete;
@@ -64,6 +65,11 @@ class VideoPlayer {
   // Opens `avi` (borrowed: it must outlive the player or the next open()/close()), replacing what was open. The first
   // picture is decoded at once, so a stopped or paused player shows something.
   OpenResult open(ConstByteView avi);
+  // Opens a video file from a source - an AVI or MP4 / MOV file is read from it a frame at a time while it plays (and so is its sound), so the
+  // file is never held in memory; the formats that are decoded up front (GIF, APNG, WebP, Y4M, a still picture) are read in whole (at most
+  // kMaxInMemoryBytes) and then forgotten. The source must outlive the player or the next open()/close().
+  OpenResult open_media(media::IByteSource& source);
+  static constexpr uint64_t kMaxInMemoryBytes = 256ull << 20;
   // Opens any video file this OS reads, by looking at it: AVI as open(), GIF/APNG/WebP/Y4M as frames in memory. `data` is
   // borrowed for AVI only (the other formats are decoded into the player). A still picture opens as a one-frame video.
   OpenResult open_media(ConstByteView data);
@@ -86,7 +92,7 @@ class VideoPlayer {
   uint32_t frame_height() const { return height_; }
   uint32_t current_frame() const { return current_frame_; }
   uint32_t frame_count() const {
-    return image_mode_ ? images_.frame_count() : seq_mode() ? static_cast<uint32_t>(seq_dec_of_rank_.count()) : file_.frame_count();
+    return y4m_mode_ ? static_cast<uint32_t>(y4m_frames_) : image_mode_ ? images_.frame_count() : seq_mode() ? static_cast<uint32_t>(seq_dec_of_rank_.count()) : file_.frame_count();
   }
   // The picture now to be shown (nullptr when nothing is open). The pixels may change at the next update(): copy or
   // draw under no concurrent update, or re-read it when picture_serial() changes.
@@ -117,7 +123,10 @@ class VideoPlayer {
   bool seq_mode() const { return seq_source_ != SeqSource::None; }
   uint32_t frame_at_time(int64_t time_us) const;
   OpenResult open_images();
-  OpenResult open_mp4(ConstByteView data);
+  OpenResult open_mp4(media::IByteSource& source);
+  OpenResult finish_avi();
+  bool open_y4m_stream(media::IByteSource& source, OpenResult* result);
+  int64_t y4m_start_us(uint64_t frame) const { return static_cast<int64_t>((frame * 1000 * y4m_rate_den_ / y4m_rate_num_) * 1000); }
   bool show_decoded(const hardware::VideoFrame& frame);
   bool seq_show(uint32_t target);
   bool seq_packet(uint32_t decode_index, hardware::VideoPacket* packet) const;
@@ -139,7 +148,14 @@ class VideoPlayer {
   AviFile file_;
   media::Image images_;            // the frames of a GIF/APNG/Y4M file
   List<int64_t> frame_starts_;     // when each frame of images_ starts (microseconds), and the end after the last
-  media::AudioData decoded_audio_; // a compressed AVI soundtrack, decoded
+  media::MemoryByteSource memory_;   // a file given as memory
+  media::IByteSource* source_ = nullptr;   // where the open AVI / MP4 file is read from
+  mutable ByteBuffer packet_;        // the packet being decoded, when it had to be read from the file
+  // A Y4M file read frame by frame: every frame is the same size, so frame i is found by arithmetic.
+  bool y4m_mode_ = false;
+  ByteBuffer y4m_head_;              // the stream header line
+  media::Image y4m_frame_;           // the frame being shown, decoded
+  uint64_t y4m_first_ = 0, y4m_frame_bytes_ = 0, y4m_step_ = 0, y4m_frames_ = 0, y4m_rate_num_ = 1, y4m_rate_den_ = 1;
   bool image_mode_ = false;
   // Streams whose pictures come out of the decoder later than they go in (H.264): packets are fed in decode order, and
   // the pictures come back in display order, each display position being a "frame" for the player.
@@ -157,8 +173,7 @@ class VideoPlayer {
   UniquePointer<hardware::IVideoDecoder> decoder_;
   hardware::VideoFrameBuffer display_;
   graphics::Surface surface_;
-  ByteView audio_samples_;
-  UniquePointer<audio::MemoryPcmSource> audio_source_;
+  UniquePointer<audio::IPcmSource> audio_stream_;   // the sound, decoded as it plays (reads from source_)
   UniquePointer<audio::AudioPlayer> audio_player_;
 
   VideoState state_ = VideoState::Empty;

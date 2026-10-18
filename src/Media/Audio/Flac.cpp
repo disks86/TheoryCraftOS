@@ -17,6 +17,8 @@
  */
 
 #include "Media/Audio/Pcm.hpp"
+#include "Media/AudioStreaming.hpp"
+#include "Utility/Move.hpp"
 
 namespace media {
 
@@ -200,6 +202,89 @@ bool decode_subframe(BitReader& r, uint32_t block, uint32_t bits, int64_t* out) 
 }
 }  // namespace
 
+// A frame header, checked against its CRC-8.
+struct FrameHeader {
+  uint32_t block = 0, channel_code = 0, bits = 0;
+  uint64_t number = 0;       // the frame number (fixed block size) or the first sample's number (variable)
+  bool variable = false;
+  uint64_t header_bytes = 0;
+};
+
+bool parse_frame_header(ConstByteView data, const StreamInfo& info, uint32_t max_block, FrameHeader* h) {
+  BitReader r{data, 0};
+  if (r.read(14) != 0x3FFE) return false;
+  r.read(1);
+  h->variable = r.read(1) != 0;
+  const uint32_t block_code = r.read(4), rate_code = r.read(4), channel_code = r.read(4), size_code = r.read(3);
+  r.read(1);
+  if (!read_utf8_number(r, &h->number)) return false;
+  uint32_t block = 0;
+  if (block_code == 1) block = 192;
+  else if (block_code >= 2 && block_code <= 5) block = 576u << (block_code - 2);
+  else if (block_code == 6) block = r.read(8) + 1;
+  else if (block_code == 7) block = r.read(16) + 1;
+  else if (block_code >= 8) block = 256u << (block_code - 8);
+  if (rate_code == 12) r.read(8);
+  else if (rate_code == 13 || rate_code == 14) r.read(16);
+  else if (rate_code == 15) return false;
+  static const uint32_t kSizes[8] = {0, 8, 12, 0, 16, 20, 24, 32};
+  const uint32_t bits = size_code == 0 ? info.bits : kSizes[size_code];
+  if (bits == 0 || block == 0 || block > max_block || channel_code > 10) return false;
+  h->header_bytes = r.bit_position / 8;
+  const uint32_t stored_crc = r.read(8);
+  if (r.failed || crc8(data.subview(0, h->header_bytes)) != stored_crc) return false;
+  h->header_bytes = r.bit_position / 8;
+  h->block = block;
+  h->channel_code = channel_code;
+  h->bits = bits;
+  return true;
+}
+
+// Decodes the frame that starts at data[0] into `pcm` (appended as 16-bit samples, two channels at most). `store` holds
+// max_block * info.channels values. *bytes is the length of the frame.
+bool decode_frame(ConstByteView data, const StreamInfo& info, int64_t* store, uint32_t max_block, ByteBuffer* pcm, FrameHeader* h, uint64_t* bytes) {
+  if (!parse_frame_header(data, info, max_block, h)) return false;
+  const uint32_t block = h->block, channel_code = h->channel_code, bits = h->bits;
+  const uint32_t out_channels = info.channels > 1 ? 2 : 1;
+  const uint32_t channels = channel_code < 8 ? channel_code + 1 : 2;
+  if (channels != info.channels) return false;
+  ArrayView<int64_t> channel_data[8];
+  for (uint32_t c = 0; c < channels; ++c) channel_data[c] = ArrayView<int64_t>(store + uint64_t{c} * max_block, block);
+  BitReader r{data, h->header_bytes * 8};
+  bool ok = true;
+  for (uint32_t c = 0; c < channels && ok; ++c) {
+    uint32_t channel_bits = bits;
+    if ((channel_code == 8 && c == 1) || (channel_code == 9 && c == 0) || (channel_code == 10 && c == 1)) ++channel_bits;  // the side channel
+    ok = decode_subframe(r, block, channel_bits, channel_data[c].data());
+  }
+  if (!ok) return false;
+  r.align();
+  const uint64_t frame_bytes = r.bit_position / 8;
+  const uint32_t crc = r.read(16);
+  if (r.failed || crc16(data.subview(0, frame_bytes)) != crc) return false;
+  *bytes = frame_bytes + 2;
+
+  // Undo the stereo decorrelation.
+  if (channel_code == 8) {
+    for (uint32_t i = 0; i < block; ++i) channel_data[1][i] = channel_data[0][i] - channel_data[1][i];
+  } else if (channel_code == 9) {
+    for (uint32_t i = 0; i < block; ++i) channel_data[0][i] += channel_data[1][i];
+  } else if (channel_code == 10) {
+    for (uint32_t i = 0; i < block; ++i) {
+      const int64_t mid = channel_data[0][i] * 2 + (channel_data[1][i] & 1), side = channel_data[1][i];
+      channel_data[0][i] = (mid + side) >> 1;
+      channel_data[1][i] = (mid - side) >> 1;
+    }
+  }
+  for (uint32_t i = 0; i < block && ok; ++i)
+    for (uint32_t c = 0; c < out_channels; ++c) {
+      const int64_t v = channel_data[c][i];
+      const int64_t scaled = bits > 16 ? v >> (bits - 16) : v * (int64_t{1} << (16 - bits));
+      ok = pcm->put16(static_cast<uint16_t>(static_cast<int16_t>(scaled > 32767 ? 32767 : scaled < -32768 ? -32768 : scaled)));
+    }
+  return ok;
+}
+
 bool decode_flac(ConstByteView data, AudioData* out) {
   out->clear();
   if (data.size() < 8 + 34 || detect_audio_format(data) != AudioFileFormat::Flac) return false;
@@ -233,78 +318,17 @@ bool decode_flac(ConstByteView data, AudioData* out) {
   // The frames.
   ByteBuffer pcm(allocator);
   const uint32_t out_channels = info.channels > 1 ? 2 : 1;
-  ArrayView<int64_t> channel_data[8];
   const uint32_t max_block = 65536;
   ArrayView<int64_t> store = allocate_view<int64_t>(allocator, uint64_t{max_block} * info.channels);
   if (store.empty()) return false;
   bool ok = true;
   uint64_t frames_done = 0;
   while (ok && at + 6 < data.size()) {
-    const uint64_t frame_start = at;
-    BitReader r{data.subview(at), 0};
-    if (r.read(14) != 0x3FFE) { ok = false; break; }
-    r.read(1);
-    const uint32_t variable = r.read(1);
-    (void)variable;
-    const uint32_t block_code = r.read(4), rate_code = r.read(4), channel_code = r.read(4), size_code = r.read(3);
-    r.read(1);
-    uint64_t number;
-    if (!read_utf8_number(r, &number)) { ok = false; break; }
-    uint32_t block = 0;
-    if (block_code == 1) block = 192;
-    else if (block_code >= 2 && block_code <= 5) block = 576u << (block_code - 2);
-    else if (block_code == 6) block = r.read(8) + 1;
-    else if (block_code == 7) block = r.read(16) + 1;
-    else if (block_code >= 8) block = 256u << (block_code - 8);
-    uint32_t rate = info.rate;
-    static const uint32_t kRates[16] = {0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000, 0, 0, 0, 0};
-    if (rate_code == 12) rate = r.read(8) * 1000;
-    else if (rate_code == 13) rate = r.read(16);
-    else if (rate_code == 14) rate = r.read(16) * 10;
-    else if (rate_code == 15) { ok = false; break; }
-    else if (rate_code != 0) rate = kRates[rate_code];
-    static const uint32_t kSizes[8] = {0, 8, 12, 0, 16, 20, 24, 32};
-    uint32_t bits = size_code == 0 ? info.bits : kSizes[size_code];
-    if (bits == 0 || block == 0 || block > max_block || channel_code > 10) { ok = false; break; }
-    (void)rate;
-    const uint64_t header_bytes = r.bit_position / 8;
-    const uint32_t stored_crc = r.read(8);
-    if (r.failed || crc8(data.subview(frame_start, header_bytes)) != stored_crc) { ok = false; break; }
-
-    const uint32_t channels = channel_code < 8 ? channel_code + 1 : 2;
-    if (channels != info.channels) { ok = false; break; }
-    for (uint32_t c = 0; c < channels; ++c) channel_data[c] = store.subview(uint64_t{c} * max_block, block);
-    for (uint32_t c = 0; c < channels && ok; ++c) {
-      uint32_t channel_bits = bits;
-      if ((channel_code == 8 && c == 1) || (channel_code == 9 && c == 0) || (channel_code == 10 && c == 1)) ++channel_bits;  // the side channel
-      ok = decode_subframe(r, block, channel_bits, channel_data[c].data());
-    }
-    if (!ok) break;
-    r.align();
-    const uint64_t frame_bytes = r.bit_position / 8;
-    const uint32_t crc = r.read(16);
-    if (r.failed || crc16(data.subview(frame_start, frame_bytes)) != crc) { ok = false; break; }
-    at = frame_start + frame_bytes + 2;
-
-    // Undo the stereo decorrelation.
-    if (channel_code == 8) {
-      for (uint32_t i = 0; i < block; ++i) channel_data[1][i] = channel_data[0][i] - channel_data[1][i];
-    } else if (channel_code == 9) {
-      for (uint32_t i = 0; i < block; ++i) channel_data[0][i] += channel_data[1][i];
-    } else if (channel_code == 10) {
-      for (uint32_t i = 0; i < block; ++i) {
-        const int64_t mid = channel_data[0][i] * 2 + (channel_data[1][i] & 1), side = channel_data[1][i];
-        channel_data[0][i] = (mid + side) >> 1;
-        channel_data[1][i] = (mid - side) >> 1;
-      }
-    }
-    for (uint32_t i = 0; i < block && ok; ++i)
-      for (uint32_t c = 0; c < out_channels; ++c) {
-        const int64_t v = channel_data[c][i];
-        const int64_t scaled = bits > 16 ? v >> (bits - 16) : v * (int64_t{1} << (16 - bits));
-        ok = pcm.put16(static_cast<uint16_t>(static_cast<int16_t>(scaled > 32767 ? 32767 : scaled < -32768 ? -32768 : scaled)));
-      }
-    frames_done += block;
+    FrameHeader header;
+    uint64_t bytes = 0;
+    if (!decode_frame(data.subview(at), info, store.data(), max_block, &pcm, &header, &bytes)) { ok = false; break; }
+    at += bytes;
+    frames_done += header.block;
   }
   release_view(allocator, store);
   if (!ok || frames_done == 0) return false;
@@ -579,6 +603,225 @@ bool encode_flac(const AudioData& audio, ByteBuffer* out) {
   for (int i = 0; i < 4; ++i) h.write(0, 32);  // no MD5 signature
   if (!h.ok) return false;
   return out->put_tag("fLaC") && out->put8(0x80) && out->put8(0) && out->put8(0) && out->put8(34) && out->append(header.view()) && out->append(body.view());
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// Streaming: the file is read through a window and decoded a frame at a time.
+
+namespace {
+
+class FlacStream final : public StreamingPcmSource {
+ public:
+  FlacStream(IByteSource& source, allocators::IAllocator& allocator) : source_(source), allocator_(allocator), pcm_(allocator), seek_table_(allocator) {}
+  ~FlacStream() {
+    release_view(allocator_, store_);
+    release_view(allocator_, window_);
+  }
+
+  bool init() {
+    uint8_t magic[4];
+    if (!read_exact(source_, 0, ByteView(magic)) || __builtin_memcmp(magic, "fLaC", 4) != 0) return false;
+    uint64_t at = 4;
+    bool have_info = false, last = false;
+    while (!last) {
+      uint8_t h[4];
+      if (!read_exact(source_, at, ByteView(h))) return false;
+      last = h[0] & 0x80;
+      const uint32_t type = h[0] & 0x7F, length = (uint32_t{h[1]} << 16) | (uint32_t{h[2]} << 8) | h[3];
+      at += 4;
+      if (at + length > source_.size()) return false;
+      if (type == 0) {
+        if (length < 34) return false;
+        uint8_t body[34];
+        if (!read_exact(source_, at, ByteView(body))) return false;
+        BitReader r{ConstByteView(body, 34), 0};
+        info_.min_block = r.read(16);
+        info_.max_block = r.read(16);
+        r.read(24);
+        r.read(24);
+        info_.rate = r.read(20);
+        info_.channels = r.read(3) + 1;
+        info_.bits = r.read(5) + 1;
+        info_.total = (uint64_t{r.read(4)} << 32) | r.read(32);
+        have_info = true;
+      } else if (type == 3 && length <= (1u << 20) && length % 18 == 0) {   // SEEKTABLE: 18 bytes a point
+        if (seek_table_.put_zeros(length) && !read_exact(source_, at, ByteView(const_cast<uint8_t*>(seek_table_.view().data()), length))) return false;
+      }
+      at += length;
+    }
+    if (!have_info || info_.rate == 0 || info_.bits < 4 || info_.max_block < 16) return false;
+    frames_start_ = at;
+    max_block_ = info_.max_block;
+    store_ = allocate_view<int64_t>(allocator_, uint64_t{max_block_} * info_.channels);
+    window_ = allocate_view<uint8_t>(allocator_, kWindowBytes);
+    if (store_.empty() || window_.empty()) return false;
+    format_.sample_rate = info_.rate;
+    format_.channels = static_cast<uint8_t>(info_.channels > 1 ? 2 : 1);
+    format_.type = audio::SampleType::S16;
+    frames_ = info_.total ? info_.total : find_total();
+    cur_ = frames_start_;
+    next_sample_ = 0;
+    return frames_ > 0 && format_.valid();
+  }
+
+ protected:
+  bool refill(uint64_t frame) override {
+    if (frame < next_sample_ || frame - next_sample_ > (uint64_t{1} << 20)) {
+      if (!seek(frame)) return false;
+    }
+    uint64_t window_start = 0;
+    bool have = false;
+    for (int attempt = 0; attempt < 2 && !have; ++attempt) {
+      while (next_sample_ <= frame || !have) {
+        if (next_sample_ >= frames_ && frame >= frames_) return false;
+        const uint64_t start = next_sample_;
+        pcm_.clear();
+        uint32_t block = 0;
+        if (!decode_frame_here(&block)) break;
+        if (start + block > frame) {
+          window_start = start;
+          have = true;
+          break;
+        }
+      }
+      if (!have && attempt == 0) {   // the place found by searching was wrong: start again from the beginning and decode forward
+        cur_ = frames_start_;
+        next_sample_ = 0;
+      }
+    }
+    if (!have) return false;
+    while (pcm_.size() / format_.frame_size() < 4096 && next_sample_ < frames_) {   // a little more, so that playing on does not refill every frame
+      uint32_t block = 0;
+      if (!decode_frame_here(&block)) break;
+    }
+    set_window(window_start, pcm_.view());
+    return true;
+  }
+
+ private:
+  static constexpr uint32_t kWindowBytes = 262144, kNeedBytes = 131072;
+
+  // The bytes from `at` on, at least kNeedBytes of them unless the file ends sooner.
+  ConstByteView bytes_from(uint64_t at) {
+    if (at >= source_.size()) return ConstByteView();
+    if (!(at >= window_pos_ && at < window_pos_ + window_len_ && (at + kNeedBytes <= window_pos_ + window_len_ || window_pos_ + window_len_ >= source_.size()))) {
+      window_pos_ = at;
+      window_len_ = source_.read(at, window_);
+    }
+    if (at < window_pos_ || at >= window_pos_ + window_len_) return ConstByteView();
+    return ConstByteView(window_).subview(at - window_pos_, window_pos_ + window_len_ - at);
+  }
+
+  // Decodes the frame at cur_ and appends it to pcm_.
+  bool decode_frame_here(uint32_t* block) {
+    const ConstByteView v = bytes_from(cur_);
+    if (v.size() < 6) return false;
+    FrameHeader h;
+    uint64_t bytes = 0;
+    if (!decode_frame(v, info_, store_.data(), max_block_, &pcm_, &h, &bytes)) return false;
+    cur_ += bytes;
+    next_sample_ += h.block;
+    *block = h.block;
+    return true;
+  }
+
+  // The first frame header at or after `from` (before `limit`).
+  bool find_header(uint64_t from, uint64_t limit, uint64_t* at, FrameHeader* h) {
+    uint64_t pos = from;
+    while (pos < limit && pos + 16 <= source_.size()) {
+      const ConstByteView v = bytes_from(pos);
+      if (v.size() < 16) return false;
+      const uint64_t scan = v.size() - 15 < limit - pos ? v.size() - 15 : limit - pos;
+      for (uint64_t i = 0; i < scan; ++i) {
+        if (v[i] == 0xFF && (v[i + 1] & 0xFE) == 0xF8 && parse_frame_header(v.subview(i), info_, max_block_, h)) {
+          *at = pos + i;
+          return true;
+        }
+      }
+      pos += scan;
+    }
+    return false;
+  }
+
+  uint64_t sample_of(const FrameHeader& h) const { return h.variable ? h.number : h.number * info_.min_block; }
+
+  bool seek(uint64_t frame) {
+    cur_ = frames_start_;
+    next_sample_ = 0;
+    if (seek_table_.size() >= 18) {   // the last point at or before the frame
+      const uint8_t* t = seek_table_.view().data();
+      for (uint64_t i = 0; i + 18 <= seek_table_.size(); i += 18) {
+        uint64_t sample = 0, offset = 0;
+        for (int k = 0; k < 8; ++k) sample = (sample << 8) | t[i + k], offset = (offset << 8) | t[i + 8 + k];
+        if (sample == 0xFFFFFFFFFFFFFFFFull) break;   // a placeholder
+        if (sample > frame) break;
+        if (frames_start_ + offset < source_.size()) {
+          cur_ = frames_start_ + offset;
+          next_sample_ = sample;
+        }
+      }
+      return true;
+    }
+    // No seek table: look for frames by halving the part of the file that holds the place.
+    uint64_t lo = frames_start_, lo_sample = 0, hi = source_.size();
+    while (hi - lo > 65536) {
+      const uint64_t mid = lo + (hi - lo) / 2;
+      FrameHeader h;
+      uint64_t pos = 0;
+      if (!find_header(mid, hi, &pos, &h)) {
+        hi = mid;
+        continue;
+      }
+      const uint64_t sample = sample_of(h);
+      if (sample <= frame) {
+        lo = pos;
+        lo_sample = sample;
+      } else {
+        hi = mid;
+      }
+    }
+    cur_ = lo;
+    next_sample_ = lo_sample;
+    return true;
+  }
+
+  // The length of a file whose header does not say: the last frame, found from the end.
+  uint64_t find_total() {
+    const uint64_t size = source_.size();
+    uint64_t from = size > 262144 ? size - 262144 : frames_start_;
+    FrameHeader h;
+    uint64_t pos = 0, best = 0;
+    while (from < size && find_header(from, size, &pos, &h)) {
+      cur_ = pos;
+      pcm_.clear();
+      FrameHeader d;
+      uint64_t bytes = 0;
+      const ConstByteView v = bytes_from(pos);
+      if (decode_frame(v, info_, store_.data(), max_block_, &pcm_, &d, &bytes) && pos + bytes + 6 >= size) best = sample_of(d) + d.block;
+      from = pos + 1;
+    }
+    pcm_.clear();
+    return best;
+  }
+
+  IByteSource& source_;
+  allocators::IAllocator& allocator_;
+  StreamInfo info_;
+  ByteBuffer pcm_, seek_table_;
+  ArrayView<int64_t> store_;
+  ByteView window_;
+  uint64_t window_pos_ = 0, window_len_ = 0;
+  uint64_t frames_start_ = 0, cur_ = 0, next_sample_ = 0;
+  uint32_t max_block_ = 0;
+};
+
+}  // namespace
+
+UniquePointer<audio::IPcmSource> open_flac_stream(IByteSource& source, allocators::IAllocator& allocator) {
+  UniquePointer<FlacStream> stream = UniquePointer<FlacStream>::make(allocator, source, allocator);
+  if (!stream || !stream->init()) return UniquePointer<audio::IPcmSource>();
+  return UniquePointer<audio::IPcmSource>(util::move(stream));
 }
 
 }  // namespace media

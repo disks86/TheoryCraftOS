@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -66,6 +66,8 @@ for t in "${WANTED[@]}"; do
     MediaTest) build_and_run MediaTest tests/MediaTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
                  src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
                  src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp ;;
+    StreamingTest) build_and_run StreamingTest tests/StreamingTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
+                     src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp ;;
     PartitionTest) build_and_run PartitionTest tests/PartitionTest.cpp tests/KernelStubs.cpp src/Hardware/StorageDevice/Partition/PartitionScanner.cpp ;;
     FileSystemTest) build_and_run FileSystemTest tests/FileSystemTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                       src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp ;;

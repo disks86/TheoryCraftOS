@@ -18,6 +18,8 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Media/ByteSource.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace media {
@@ -55,6 +57,9 @@ class Mp4File {
   Mp4File& operator=(const Mp4File&) = delete;
 
   bool open(ConstByteView file);
+  // Reads a file through a source: only the movie box (the tables that say where the samples are) is read, into memory kept until clear();
+  // the samples stay in the source and are read with read_sample().
+  bool open(IByteSource& source);
   void clear();
   uint32_t track_count() const { return count_; }
   const Mp4Track& track(uint32_t index) const { return tracks_[index]; }
@@ -62,11 +67,16 @@ class Mp4File {
   const Mp4Track* find(Mp4TrackKind kind) const;
   // The bytes of one sample (empty if it is out of the file).
   ConstByteView sample(const Mp4Track& track, uint32_t index) const;
+  // Appends one sample read from `source` to `out`. False if it is outside the source or memory ran out.
+  bool read_sample(IByteSource& source, const Mp4Track& track, uint32_t index, ByteBuffer* out) const;
 
  private:
   static constexpr uint32_t kMaxTracks = 8;
   allocators::IAllocator& allocator_;
+  bool parse(ConstByteView file);
+
   ConstByteView file_;
+  ByteView moov_;   // the movie box, when the file is read through a source
   Mp4Track tracks_[kMaxTracks];
   uint32_t count_ = 0;
 };

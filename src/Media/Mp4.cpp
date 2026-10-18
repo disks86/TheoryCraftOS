@@ -275,12 +275,50 @@ void Mp4File::clear() {
     tracks_[i] = Mp4Track();
   }
   count_ = 0;
+  release_view(allocator_, moov_);
+  moov_ = ByteView();
+  file_ = ConstByteView();
 }
 
 bool Mp4File::open(ConstByteView file) {
   clear();
   file_ = file;
   if (!looks_like_mp4(file)) return false;
+  return parse(file);
+}
+
+bool Mp4File::open(IByteSource& source) {
+  clear();
+  uint8_t head[16];
+  if (source.read(0, ByteView(head)) < 12 || !looks_like_mp4(ConstByteView(head, 16))) return false;
+  // Walk the top-level boxes by their headers to the movie box.
+  for (uint64_t at = 0; at + 8 <= source.size();) {
+    uint8_t h[16] = {};
+    const uint64_t got = source.read(at, ByteView(h));
+    if (got < 8) return false;
+    uint64_t size = be32(ConstByteView(h, 16), 0), header = 8;
+    const uint32_t type = be32(ConstByteView(h, 16), 4);
+    if (size == 1) {
+      if (got < 16) return false;
+      size = be64(ConstByteView(h, 16), 8);
+      header = 16;
+    } else if (size == 0) {
+      size = source.size() - at;
+    }
+    if (size < header || at + size > source.size()) return false;
+    if (type == fourcc("moov")) {
+      if (size > (uint64_t{1} << 30)) return false;
+      moov_ = allocate_view<uint8_t>(allocator_, size);
+      if (moov_.empty() || source.read(at, moov_) != size) return false;
+      file_ = ConstByteView(moov_);
+      return parse(file_);
+    }
+    at += size;
+  }
+  return false;
+}
+
+bool Mp4File::parse(ConstByteView file) {
   Box top;
   for (uint64_t at = 0; read_box(file, at, file.size(), &top); at = top.end) {
     if (top.type != fourcc("moov")) continue;
@@ -311,6 +349,17 @@ const Mp4Track* Mp4File::find(Mp4TrackKind kind) const {
   for (uint32_t i = 0; i < count_; ++i)
     if (tracks_[i].kind == kind) return &tracks_[i];
   return nullptr;
+}
+
+
+bool Mp4File::read_sample(IByteSource& source, const Mp4Track& t, uint32_t index, ByteBuffer* out) const {
+  if (index >= t.sample_count) return false;
+  const uint64_t off = t.offsets[index], size = t.sizes[index];
+  if (off > source.size() || size > source.size() - off) return false;
+  if (size == 0) return true;
+  const uint64_t at = out->size();
+  if (!out->put_zeros(size)) return false;
+  return source.read(off, ByteView(const_cast<uint8_t*>(out->view().data()) + at, size)) == size;
 }
 
 ConstByteView Mp4File::sample(const Mp4Track& t, uint32_t index) const {

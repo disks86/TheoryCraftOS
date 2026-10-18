@@ -29,6 +29,9 @@
 #include "Media/Audio/AacInternal.hpp"
 #include "Media/Audio/Mdct.hpp"
 #include "Media/AudioCodecs.hpp"
+#include "Media/AudioStreaming.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Utility/Move.hpp"
 
 namespace media {
 namespace aac {
@@ -167,6 +170,10 @@ class Decoder {
   // damaged or uses a tool that is not supported.
   bool decode_block(ConstByteView data, int16_t* pcm);
   uint32_t channels() const { return out_channels_; }
+  void reset_state() {
+    for (ChannelState& st : states_) st = ChannelState();
+    random_ = 0x1F2E3D4C;
+  }
 
  private:
   bool parse_ics_info(Bits& b, IcsInfo* ics);
@@ -735,6 +742,9 @@ bool AacDecoder::init(uint32_t sampling_index) {
   impl_ = UniquePointer<aac::Decoder>::make(allocator_, allocator_);
   return impl_ && impl_->init(sampling_index);
 }
+void AacDecoder::reset() {
+  if (impl_) impl_->reset_state();
+}
 uint32_t AacDecoder::sample_rate() const { return impl_ ? impl_->sample_rate() : 0; }
 uint32_t AacDecoder::channels() const { return impl_ ? impl_->channels() : 0; }
 bool AacDecoder::decode_block(ConstByteView block, int16_t* pcm) { return impl_ && impl_->decode_block(block, pcm); }
@@ -818,6 +828,136 @@ bool decode_aac(ConstByteView data, AudioData* out) {
   if (!out->create(format, frames)) return false;
   __builtin_memcpy(out->samples().data(), pcm.view().data(), frames * channels * 2);
   return true;
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// Streaming: ADTS frames are found through a window of the file and decoded one at a time.
+
+namespace {
+
+class AacStream final : public StreamingPcmSource {
+ public:
+  static constexpr uint32_t kIndexEvery = 32, kPrimeFrames = 2;
+
+  AacStream(IByteSource& source, allocators::IAllocator& allocator) : source_(source), allocator_(allocator), window_(source, allocator), decoder_(allocator), pcm_(allocator), index_(allocator) {}
+
+  bool init() {
+    uint64_t counted = 0, at = 0, frame_at = 0;
+    uint32_t header = 0, length = 0, index = 0;
+    while (next_frame(at, &frame_at, &header, &length, &index)) {
+      at = frame_at + length;
+      if (rate_ == 0) {
+        if (!decoder_.init(index)) return false;
+        rate_ = decoder_.sample_rate();
+        sampling_index_ = index;
+      } else if (kSampleRates()[index] != rate_) {
+        continue;
+      }
+      if (counted % kIndexEvery == 0 && !index_.push_back(frame_at)) return false;
+      ++counted;
+    }
+    if (rate_ == 0 || counted == 0) return false;
+    // The channel count is what the first block decodes to.
+    cur_at_ = index_[0];
+    cur_frame_ = 0;
+    int16_t block[2048];
+    if (!decode_next(block)) return false;
+    channels_ = decoder_.channels();
+    counted_ = counted;
+    frames_ = counted * 1024;
+    format_.sample_rate = rate_;
+    format_.channels = static_cast<uint8_t>(channels_);
+    format_.type = audio::SampleType::S16;
+    restart(0);
+    return channels_ >= 1 && channels_ <= 2 && format_.valid();
+  }
+
+ protected:
+  bool refill(uint64_t frame) override {
+    const uint64_t k = frame / 1024;
+    if (k < cur_frame_ || k - cur_frame_ > 256) restart(k > kPrimeFrames ? k - kPrimeFrames : 0);
+    int16_t block[2048];
+    while (cur_frame_ < k)
+      if (!decode_next(block)) return false;
+    pcm_.clear();
+    uint32_t got = 0;
+    for (; got < 4 && cur_frame_ < counted_; ++got) {
+      if (!decode_next(block)) break;
+      if (!pcm_.append(ConstByteView(reinterpret_cast<const uint8_t*>(block), uint64_t{1024} * channels_ * 2))) return false;
+    }
+    if (got == 0) return false;
+    set_window(k * 1024, pcm_.view());
+    return true;
+  }
+
+ private:
+  static const uint32_t* kSampleRates() { return aac::kSampleRates; }
+
+  // Goes back to the remembered place at or before frame `target` with the decoder's memory cleared.
+  void restart(uint64_t target) {
+    const uint64_t slot = target / kIndexEvery;
+    decoder_.reset();
+    cur_frame_ = slot * kIndexEvery;
+    cur_at_ = index_[slot];
+  }
+
+  // The next ADTS frame at or after `pos`: one the decoder can use (AAC-LC, one raw data block).
+  bool next_frame(uint64_t pos, uint64_t* at, uint32_t* header, uint32_t* length, uint32_t* index) {
+    for (;;) {
+      const ConstByteView v = window_.from(pos);
+      if (v.size() < 7) return false;
+      for (uint64_t i = 0; i + 7 <= v.size(); ++i) {
+        uint32_t h, len, idx, profile;
+        if (!adts_header(v, i, &h, &len, &idx, &profile) || i + len > v.size()) continue;
+        if (profile != 1 || (v[i + 6] & 3) != 0) {
+          i += len - 1;   // (not AAC-LC, or several blocks in one frame: not played)
+          continue;
+        }
+        *at = pos + i;
+        *header = h;
+        *length = len;
+        *index = idx;
+        return true;
+      }
+      if (v.size() < 131072) return false;
+      pos += v.size() - 8192;
+    }
+  }
+
+  // Decodes the frame at cur_at_ (of the stream's sampling rate); a frame that cannot be decoded is silence.
+  bool decode_next(int16_t* block) {
+    for (;;) {
+      uint64_t at = 0;
+      uint32_t header = 0, length = 0, index = 0;
+      if (!next_frame(cur_at_, &at, &header, &length, &index)) return false;
+      cur_at_ = at + length;
+      if (aac::kSampleRates[index] != rate_) continue;
+      const ConstByteView v = window_.from(at);
+      if (v.size() < length) return false;
+      if (!decoder_.decode_block(v.subview(header, length - header), block))
+        for (int i = 0; i < 2048; ++i) block[i] = 0;
+      ++cur_frame_;
+      return true;
+    }
+  }
+
+  IByteSource& source_;
+  allocators::IAllocator& allocator_;
+  SourceWindow window_;
+  AacDecoder decoder_;
+  ByteBuffer pcm_;
+  List<uint64_t> index_;
+  uint32_t rate_ = 0, channels_ = 0, sampling_index_ = 0;
+  uint64_t counted_ = 0, cur_frame_ = 0, cur_at_ = 0;
+};
+
+}  // namespace
+
+UniquePointer<audio::IPcmSource> open_aac_stream(IByteSource& source, allocators::IAllocator& allocator) {
+  UniquePointer<AacStream> stream = UniquePointer<AacStream>::make(allocator, source, allocator);
+  if (!stream || !stream->init()) return UniquePointer<audio::IPcmSource>();
+  return UniquePointer<audio::IPcmSource>(util::move(stream));
 }
 
 }  // namespace media

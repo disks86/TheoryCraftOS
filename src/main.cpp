@@ -581,6 +581,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemFileSystem explorer_files(shared_allocator, storage);
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
+    desktop.set_media_services(mixer.get(), &video_codecs, &clock);
     desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());
     explorer_files.set_notifier(on_storage_change, &desktop);

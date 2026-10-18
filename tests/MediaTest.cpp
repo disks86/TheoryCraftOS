@@ -356,6 +356,21 @@ static void test_y4m() {
   CHECK(decode_y4m(ntsc.view(), &back) && back.frame_count() == 30 && back.total_duration_ms() == 1001);
 }
 
+// A byte source over memory that records how much is read from it at a time.
+struct CountingSource final : media::IByteSource {
+  explicit CountingSource(ConstByteView d) : inner(d) {}
+  uint64_t size() const override { return inner.size(); }
+  uint64_t read(uint64_t offset, ByteView out) override {
+    ++reads;
+    const uint64_t got = inner.read(offset, out);
+    bytes += got;
+    if (got > biggest) biggest = got;
+    return got;
+  }
+  media::MemoryByteSource inner;
+  uint64_t reads = 0, bytes = 0, biggest = 0;
+};
+
 struct FakeClock final : hardware::IClock {
   uint64_t now = 0;
   const char* name() const override { return "fake clock"; }
@@ -542,6 +557,32 @@ static void test_player_media() {
     for (uint32_t& p : y.frame(f)) p = f ? 0xFF2020F0u : 0xFFF02020u;
   ByteBuffer y4m(a);
   CHECK(encode_y4m(y, &y4m) && player.open_media(y4m.view()) == video::OpenResult::Ok && player.frame_count() == 2 && player.duration_us() == 100000);
+  // A longer Y4M clip read frame by frame from a source: the same pictures and times as when it is decoded whole.
+  {
+    Image clip(a), whole(a);
+    CHECK(clip.create(33, 21, 40));
+    for (uint32_t f = 0; f < 40; ++f) {
+      clip.set_delay_ms(f, 40);
+      for (uint32_t i = 0; i < clip.frame(f).size(); ++i) clip.frame(f)[i] = 0xFF000000u | ((f * 6 + i) & 255) << 16 | ((i * 3) & 255) << 8 | 90;
+    }
+    ByteBuffer file(a);
+    CHECK(encode_y4m(clip, &file) && decode_y4m(file.view(), &whole) && whole.frame_count() == 40);
+    CountingSource source(file.view());
+    CHECK(player.open_media(source) == video::OpenResult::Ok && player.frame_count() == 40 && player.frame_width() == 33 && player.duration_us() == 1600000);
+    CHECK(source.bytes < file.size() / 5);
+    const uint32_t picks[5] = {0, 17, 39, 3, 4};
+    for (uint32_t f : picks) {
+      player.seek(int64_t{f} * 40000 + 7000);
+      const graphics::Surface* sf = player.picture();
+      bool same = player.current_frame() == f;
+      for (uint32_t y = 0; y < 21 && same; ++y)
+        for (uint32_t x = 0; x < 33; ++x)
+          if (sf->row(y)[x] != whole.frame(f)[y * 33 + x]) same = false;
+      CHECK(same);
+    }
+    CHECK(source.bytes < file.size() / 5 * 2);
+    player.close();
+  }
   File still("tests/data/rgb.png");
   CHECK(player.open_media(still.view()) == video::OpenResult::Ok && player.frame_count() == 1 && player.frame_width() == 40);
   const uint8_t junk[40] = {1, 2, 3};
@@ -834,6 +875,27 @@ static void test_h264_player() {
     CHECK(!player.playing());
     player.close();
   }
+  // The same files read through a source, a piece at a time: the same pictures.
+  for (const auto& c : cases) {
+    char path[160];
+    snprintf(path, sizeof path, "tests/data/%s", c.name);
+    File file(path);
+    if (!file.data) continue;
+    H264Run expect;
+    CHECK(h264_decode_file(a, file.view(), &expect, true));
+    CountingSource source(file.view());
+    CHECK(player.open_media(source) == video::OpenResult::Ok && player.frame_count() == c.frames);
+    const uint32_t order[] = {3, 4, 2, 7, 0, c.frames - 1, 5};
+    for (uint32_t f : order) {
+      player.seek(int64_t{f} * c.frame_us + 5000);
+      const graphics::Surface* sf = player.picture();
+      uint64_t h = kFnvBasis;
+      for (uint32_t y = 0; y < sf->height; ++y) h = fnv(h, reinterpret_cast<const uint8_t*>(sf->row(y)), uint64_t{sf->width} * 4);
+      CHECK(player.current_frame() == f && h == expect.frame_hash[f]);
+    }
+    CHECK(source.reads > 3);
+    player.close();
+  }
   // The MP4's AAC soundtrack plays through a mixer: 0.6 s at 22.05 kHz, give or take the codec's priming.
   {
     File mp4("tests/data/h264_bframes.mp4");
@@ -845,6 +907,9 @@ static void test_h264_player() {
     CHECK(with_sound.audio()->duration() > 22050 * 55 / 100 && with_sound.audio()->duration() < 22050 * 65 / 100);
     with_sound.seek(240000);
     CHECK(with_sound.current_frame() == 6);
+    with_sound.close();
+    CountingSource source(mp4.view());
+    CHECK(with_sound.open_media(source) == video::OpenResult::Ok && with_sound.has_audio() && with_sound.audio()->duration() > 22050 * 55 / 100);
     with_sound.close();
   }
   // An MP4 without H.264 video (an audio file) is not a video.

@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "Audio/AudioPlayer.hpp"
+#include "Media/AudioStreaming.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/AudioPlayerControl.hpp"
 #include "Gui/Color.hpp"
@@ -35,6 +36,7 @@
 #include "Desktop/Desktop.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileDialog.hpp"
+#include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/TaskManager.hpp"
@@ -689,15 +691,15 @@ static void test_player_control() {
 
     // Play: the button turns into Pause, the slider and the clock move, the meter shows the sound.
     click_center(w, panel.play_button());
-    CHECK(player.playing() && panel.play_button().text().equals("Pause"));
+    CHECK(player.playing() && !panel.play_button().enabled() && panel.pause_button().enabled());
     step(12);
     CHECK(panel.seek_slider().value() > 0);
     CHECK(panel.meter().level() > 50);   // a loud tone
     w.render();
 
     // Pause keeps the place.
-    click_center(w, panel.play_button());
-    CHECK(player.state() == audio::PlayerState::Paused && panel.play_button().text().equals("Play"));
+    click_center(w, panel.pause_button());
+    CHECK(player.state() == audio::PlayerState::Paused && panel.play_button().enabled() && !panel.pause_button().enabled());
     const uint64_t at = player.position();
     step(5);
     CHECK(player.position() == at);
@@ -715,6 +717,13 @@ static void test_player_control() {
     click_center(w, panel.stop_button());
     CHECK(player.state() == audio::PlayerState::Stopped && player.position() == 0 && panel.seek_slider().value() == 0);
     CHECK(panel.time_text().equals("00:00 / 00:02"));
+    CHECK(panel.position_label().text().equals("00:00") && panel.length_label().text().equals("00:02"));
+
+    // Fast forward skips ahead (here: to the end of the short clip), rewind goes back (to the start).
+    click_center(w, panel.forward_button());
+    CHECK(player.position() >= player.duration() - 1 && panel.position_label().text().equals("00:02"));
+    click_center(w, panel.rewind_button());
+    CHECK(player.position() == 0 && panel.position_label().text().equals("00:00"));
 
     // The volume slider changes the player's volume; changes made through the player show on the slider.
     const Point vol = panel.volume_slider().window_origin();
@@ -729,12 +738,12 @@ static void test_player_control() {
     player.play();
     for (int i = 0; i < 40 && player.playing(); ++i) step(1);
     panel.refresh();
-    CHECK(player.state() == audio::PlayerState::Stopped && panel.time_text().equals("00:02 / 00:02") && panel.play_button().text().equals("Play"));
+    CHECK(player.state() == audio::PlayerState::Stopped && panel.time_text().equals("00:02 / 00:02") && panel.play_button().enabled() && !panel.pause_button().enabled());
     CHECK(panel.seek_slider().value() == 1000);
 
     player.close();
     panel.refresh();
-    CHECK(!panel.play_button().enabled() && panel.time_text().equals("00:00 / 00:00"));
+    CHECK(!panel.play_button().enabled() && !panel.rewind_button().enabled() && panel.time_text().equals("00:00 / 00:00"));
   }
   mixer.pump();   // the closed stream is let go
   CHECK(mixer.stream_count() == 0);
@@ -830,15 +839,15 @@ static void test_video_control() {
 
     // Play: the button says Pause, the picture and the slider follow the sound.
     click_center(w, panel.play_button());
-    CHECK(player.playing() && panel.play_button().text().equals("Pause"));
+    CHECK(player.playing() && !panel.play_button().enabled() && panel.pause_button().enabled());
     step(12);
     CHECK(panel.seek_slider().value() > 0);
     w.render();
     const int red = (int)((screen.px(cx, cy) >> 16) & 0xFF);
     CHECK(red >= 5 + 10 * (int)player.current_frame() - 6 && red <= 5 + 10 * (int)player.current_frame() + 6 && player.current_frame() > 0);
 
-    click_center(w, panel.play_button());   // pause
-    CHECK(player.state() == video::VideoState::Paused && panel.play_button().text().equals("Play"));
+    click_center(w, panel.pause_button());
+    CHECK(player.state() == video::VideoState::Paused && panel.play_button().enabled() && !panel.pause_button().enabled());
     const int64_t at = player.position_us();
     step(5);
     CHECK(player.position_us() == at);
@@ -858,6 +867,13 @@ static void test_video_control() {
     CHECK(player.state() == video::VideoState::Stopped && player.position_us() == 0 && panel.seek_slider().value() == 0);
     w.render();
     CHECK(near((int)((screen.px(cx, cy) >> 16) & 0xFF), 5, 6));
+
+    CHECK(panel.position_label().text().equals("00:00") && panel.length_label().text().equals("00:02"));
+    // Fast forward and rewind skip by ten seconds, stopping at the end and the start of the short clip.
+    click_center(w, panel.forward_button());
+    CHECK(player.position_us() >= player.duration_us() - 200000 && panel.position_label().text().equals("00:02"));
+    click_center(w, panel.rewind_button());
+    CHECK(player.position_us() == 0 && panel.position_label().text().equals("00:00"));
 
     // Volume and loop.
     const Point vol = panel.volume_slider().window_origin();
@@ -1450,6 +1466,76 @@ static void test_text_editor() {
     ed.set_max_length(10);
     CHECK(!ed.insert_text("0123456789"));
     CHECK(!ed.set_text("this is longer than ten"));
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_media_player() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/note.txt", "this is not media at all, just words");
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    gui::NoticeDialog notices(a);
+    desktop::MediaPlayer mp(a);
+    mp.set_notices(&notices);
+    CHECK(mgr.add_window(&mp));
+    w.layout();
+    CHECK(mp.title().equals("Media Player") && mp.kind() == desktop::MediaPlayer::Kind::None);
+    CHECK(desktop::MediaPlayer::is_media_name("Song.MP3") && desktop::MediaPlayer::is_media_name("clip.mp4") && !desktop::MediaPlayer::is_media_name("notes.txt"));
+    // Without storage, or with a file that is not media, the player says so in the notice dialog.
+    CHECK(!mp.open_file("/note.txt") && notices.showing() && notices.kind() == gui::NoticeKind::Error);
+    notices.close();
+    mp.set_file_system(&fs);
+    CHECK(!mp.open_file("/missing.wav") && notices.showing() && notices.message().first(11).equals("Cannot open"));
+    notices.close();
+    CHECK(!mp.open_file("/note.txt") && notices.showing() && mp.kind() == desktop::MediaPlayer::Kind::None);
+    notices.close();
+    mgr.remove_window(&mp);
+    // With a sound mixer: sound files of two kinds are played from the file, a piece at a time.
+    {
+      FakeDevice device;
+      audio::AudioMixer mixer(device, a);
+      CHECK(mixer.initialize());
+      desktop::MediaPlayer sound_player(a);
+      sound_player.set_notices(&notices);
+      sound_player.set_services(&mixer, nullptr, nullptr);
+      sound_player.set_file_system(&fs);
+      CHECK(mgr.add_window(&sound_player));
+      w.layout();
+      media::AudioData tone(a);
+      audio::StreamFormat format;
+      format.sample_rate = 8000;
+      format.channels = 1;
+      CHECK(tone.create(format, 16000));
+      for (uint64_t i = 0; i < 16000; ++i) tone.samples()[i] = static_cast<int16_t>((i % 80) * 300 - 12000);
+      ByteBuffer wav(a), flac(a);
+      CHECK(media::encode_wav(tone, &wav) && media::encode_flac(tone, &flac));
+      const struct { const char* path; ConstByteView bytes; } files[2] = {{"/tone.wav", wav.view()}, {"/tone.flac", flac.view()}};
+      for (const auto& f : files) {
+        UniquePointer<filesystem::IFile> file;
+        uint64_t written = 0;
+        CHECK(fs.open_file(f.path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok && file->write(0, f.bytes, &written) == filesystem::Status::Ok);
+        file.reset();
+        CHECK(sound_player.open_file(f.path) && sound_player.kind() == desktop::MediaPlayer::Kind::Audio && !notices.showing());
+        CHECK(sound_player.audio_player()->duration() == 16000 && sound_player.audio_player()->playing());
+        for (int i = 0; i < 20; ++i) {
+          sound_player.audio_player()->update();
+          mixer.pump();
+          device.play_all();
+        }
+        CHECK(sound_player.audio_player()->position() > 1000);
+        sound_player.close_media();
+        CHECK(sound_player.kind() == desktop::MediaPlayer::Kind::None && sound_player.audio_player()->state() == audio::PlayerState::Empty);
+      }
+      mgr.remove_window(&sound_player);
+      mixer.pump();
+    }
   }
   CHECK(a.live == 0);
 }
@@ -3791,6 +3877,7 @@ int main() {
   test_task_manager();
   test_text_editor();
   test_notepad();
+  test_media_player();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");
   return 0;

@@ -358,12 +358,71 @@ static void test_player_with_audio() {
   }
 }
 
+// A byte source over memory that counts what is read from it.
+struct CountingSource final : media::IByteSource {
+  explicit CountingSource(ConstByteView d) : inner(d) {}
+  uint64_t size() const override { return inner.size(); }
+  uint64_t read(uint64_t offset, ByteView out) override {
+    ++reads;
+    const uint64_t got = inner.read(offset, out);
+    bytes += got;
+    if (got > biggest) biggest = got;
+    return got;
+  }
+  media::MemoryByteSource inner;
+  uint64_t reads = 0, bytes = 0, biggest = 0;
+};
+
+// A long clip played from a source: the file is read a piece at a time (never all of it), with the right picture and sound at each place.
+static void test_player_streams() {
+  TestAllocator a;
+  {
+    NoPci pci;
+    hardware::SystemVideoCodecs codecs(pci, a);
+    codecs.initialize();
+    FakeClock clock;
+    FakeDevice device;
+    audio::AudioMixer mixer(device, a);
+    CHECK(mixer.initialize());
+    AviWriter writer(a);
+    CHECK(make_clip(a, writer, 600, true));   // a minute at 10 fps, with sound
+    CountingSource source(writer.file());
+    VideoPlayer player(clock, codecs, a, &mixer);
+    CHECK(player.open_media(source) == OpenResult::Ok);
+    CHECK(player.frame_count() == 600 && player.duration_us() == 60000000 && player.has_audio());
+    CHECK(player.audio()->duration() == 8000ull * 60);
+    CHECK(source.bytes * 3 < writer.file().size());   // just the headers, the index and the first picture so far
+    const uint32_t order[] = {3, 599, 100, 101, 5, 333};
+    for (uint32_t f : order) {
+      player.seek(int64_t{f} * 100000 + 20000);
+      CHECK(player.current_frame() == f);
+      CHECK(near(red_of_picture(player.picture()), (10 * f + 5) & 255, 6) || ((10 * f + 5) & 255) < 20);
+    }
+    // Playing: the clock moves the pictures, the sound is fed from the file as it goes.
+    player.seek(0);
+    CHECK(player.play());
+    for (int i = 0; i < 20; ++i) {
+      clock.now += 100000;
+      player.update();
+      mixer.pump();
+      device.play_all();
+    }
+    CHECK(player.current_frame() > 0 && player.audio()->position() > 0);
+    CHECK(source.bytes < writer.file().size());   // a bit more than a few seconds' worth
+    CHECK(source.biggest <= 65536);
+    player.close();
+    mixer.pump();
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_avi_roundtrip();
   test_avi_keyframes();
   test_player_no_audio();
   test_player_formats();
   test_player_with_audio();
+  test_player_streams();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("video player tests passed\n");
   return 0;

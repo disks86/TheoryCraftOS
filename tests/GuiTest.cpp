@@ -1102,6 +1102,7 @@ static void test_desktop() {
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Task Manager
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Text Editor
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Paint
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Media Player
     d.step(5500000);
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...

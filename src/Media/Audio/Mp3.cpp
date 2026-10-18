@@ -25,6 +25,8 @@
 // and LAME tags for gapless trimming, assembling the result) is this project's own.
 // Layers I and II decode too. Not handled: free-format bitrates; the CRC is skipped, not checked.
 #include "Media/AudioCodecs.hpp"
+#include "Media/AudioStreaming.hpp"
+#include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace media {
@@ -1012,6 +1014,36 @@ bool find_frame(ConstByteView d, uint64_t from, uint64_t* at, uint32_t* size) {
 uint32_t be32(ConstByteView d, uint64_t at) { return (uint32_t{d[at]} << 24) | (uint32_t{d[at + 1]} << 16) | (uint32_t{d[at + 2]} << 8) | d[at + 3]; }
 }  // namespace
 
+// The Xing / Info frame an encoder puts first: no sound, but a frame count, and (LAME) the encoder delay and padding.
+struct XingInfo {
+  uint32_t tag_frames = 0, delay = 0, padding = 0;
+  bool lame = false;
+};
+
+// `h` is a frame of `frame_size` bytes with `ch` channels. False if it is an ordinary frame.
+bool parse_xing(const uint8_t* h, uint32_t frame_size, uint32_t ch, XingInfo* out) {
+  const uint64_t side = hdr_is_mpeg1(h) ? (ch == 1 ? 17 : 32) : (ch == 1 ? 9 : 17);
+  const uint64_t tag = 4 + (hdr_is_crc(h) ? 2 : 0) + side;
+  if (tag + 8 > frame_size) return false;
+  const bool xing = h[tag] == 'X' && h[tag + 1] == 'i' && h[tag + 2] == 'n' && h[tag + 3] == 'g';
+  const bool info = h[tag] == 'I' && h[tag + 1] == 'n' && h[tag + 2] == 'f' && h[tag + 3] == 'o';
+  if (!xing && !info) return false;
+  auto be = [&](uint64_t at) { return (uint32_t{h[at]} << 24) | (uint32_t{h[at + 1]} << 16) | (uint32_t{h[at + 2]} << 8) | h[at + 3]; };
+  const uint32_t flags = be(tag + 4);
+  uint64_t p = tag + 8;
+  if (flags & 1) { out->tag_frames = p + 4 <= frame_size ? be(p) : 0; p += 4; }
+  if (flags & 2) p += 4;
+  if (flags & 4) p += 100;
+  if (flags & 8) p += 4;
+  // The LAME extension (written by LAME and by ffmpeg's wrapper of it): a 9-byte encoder string, then (21 bytes in) the encoder delay and padding as two 12-bit numbers.
+  if (p + 24 <= frame_size && h[p] == 'L' && ((h[p + 1] == 'A' && h[p + 2] == 'M' && h[p + 3] == 'E') || (h[p + 1] == 'a' && h[p + 2] == 'v' && (h[p + 3] == 'c' || h[p + 3] == 'f')))) {
+    out->delay = (uint32_t{h[p + 21]} << 4) | (h[p + 22] >> 4);
+    out->padding = (uint32_t{h[p + 22] & 0x0Fu} << 8) | h[p + 23];
+    out->lame = true;
+  }
+  return true;
+}
+
 bool decode_mp3(ConstByteView data, AudioData* out) {
   out->clear();
   if (detect_audio_format(data) != AudioFileFormat::Mp3) return false;
@@ -1039,22 +1071,12 @@ bool decode_mp3(ConstByteView data, AudioData* out) {
       channels = ch;
       samples_per_frame = hdr_frame_samples(h);
       // A leading Xing/Info frame carries no sound: its tag may hold the frame count and the LAME encoder delay and padding.
-      const uint64_t side = hdr_is_mpeg1(h) ? (ch == 1 ? 17 : 32) : (ch == 1 ? 9 : 17);
-      const uint64_t tag = frame_at + 4 + (hdr_is_crc(h) ? 2 : 0) + side;
-      if (tag + 8 <= frame_at + frame_size && ((data[tag] == 'X' && data[tag + 1] == 'i' && data[tag + 2] == 'n' && data[tag + 3] == 'g') ||
-                                               (data[tag] == 'I' && data[tag + 1] == 'n' && data[tag + 2] == 'f' && data[tag + 3] == 'o'))) {
-        const uint32_t flags = be32(data, tag + 4);
-        uint64_t p = tag + 8;
-        if (flags & 1) { tag_frames = p + 4 <= data.size() ? be32(data, p) : 0; p += 4; }
-        if (flags & 2) p += 4;
-        if (flags & 4) p += 100;
-        if (flags & 8) p += 4;
-        // The LAME extension (written by LAME and by ffmpeg's wrapper of it): a 9-byte encoder string, then (21 bytes in) the encoder delay and padding as two 12-bit numbers.
-        if (p + 24 <= frame_at + frame_size && data[p] == 'L' && ((data[p + 1] == 'A' && data[p + 2] == 'M' && data[p + 3] == 'E') || (data[p + 1] == 'a' && data[p + 2] == 'v' && (data[p + 3] == 'c' || data[p + 3] == 'f')))) {
-          encoder_delay = (uint32_t{data[p + 21]} << 4) | (data[p + 22] >> 4);
-          encoder_padding = (uint32_t{data[p + 22] & 0x0Fu} << 8) | data[p + 23];
-          lame = true;
-        }
+      XingInfo xing;
+      if (parse_xing(h, frame_size, ch, &xing)) {
+        tag_frames = xing.tag_frames;
+        encoder_delay = xing.delay;
+        encoder_padding = xing.padding;
+        lame = xing.lame;
         first = false;
         continue;
       }
@@ -1081,6 +1103,200 @@ bool decode_mp3(ConstByteView data, AudioData* out) {
   if (frames == 0 || !out->create(format, frames)) return false;
   __builtin_memcpy(out->samples().data(), pcm.view().data() + skip * channels * 2, frames * channels * 2);
   return true;
+}
+
+
+// MPEG audio frames (no tags) decoded one for one: a frame that cannot be decoded (its bit reservoir is not there yet) is silence, so that
+// the sound stays as long as the frames say.
+bool decode_mp3_frames(ConstByteView data, AudioData* out) {
+  out->clear();
+  allocators::IAllocator& allocator = out->allocator();
+  UniquePointer<Mp3Decoder> decoder = UniquePointer<Mp3Decoder>::make(allocator);
+  if (!decoder) return false;
+  ByteBuffer pcm(allocator);
+  uint32_t rate = 0, channels = 0, spf = 0;
+  int16_t frame_pcm[1152 * 2];
+  uint64_t at = 0, frame_at;
+  uint32_t frame_size;
+  bool ok = true;
+  while (ok && find_frame(data, at, &frame_at, &frame_size)) {
+    const uint8_t* h = data.data() + frame_at;
+    at = frame_at + frame_size;
+    const uint32_t hz = hdr_sample_rate_hz(h), ch = hdr_is_mono(h) ? 1 : 2;
+    if (rate == 0) {
+      rate = hz;
+      channels = ch;
+      spf = hdr_frame_samples(h);
+    }
+    if (hz != rate || ch != channels) continue;
+    for (int16_t& v : frame_pcm) v = 0;
+    const int n = decoder->decode_frame(h, static_cast<int>(frame_size), frame_pcm);
+    ok = pcm.append(ConstByteView(reinterpret_cast<const uint8_t*>(frame_pcm), uint64_t{n > 0 ? static_cast<uint32_t>(n) : spf} * channels * 2));
+  }
+  decoder.reset();
+  if (!ok || rate == 0) return false;
+  audio::StreamFormat format;
+  format.sample_rate = rate;
+  format.channels = static_cast<uint8_t>(channels);
+  const uint64_t frames = pcm.size() / (channels * 2);
+  if (frames == 0 || !out->create(format, frames)) return false;
+  __builtin_memcpy(out->samples().data(), pcm.view().data(), frames * channels * 2);
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// Streaming: frame headers are found through a window of the file, one frame at a time is decoded.
+
+namespace {
+
+class Mp3Stream final : public StreamingPcmSource {
+ public:
+  static constexpr uint32_t kIndexEvery = 32;   // one remembered place per this many frames
+  static constexpr uint32_t kPrimeFrames = 8;   // frames decoded before the first one wanted after a jump: the bit reservoir and the overlap get their state back
+
+  Mp3Stream(IByteSource& source, allocators::IAllocator& allocator) : source_(source), allocator_(allocator), window_(source, allocator), pcm_(allocator), index_(allocator) {}
+
+  bool init() {
+    uint8_t id3[10];
+    uint64_t at = 0;
+    if (read_exact(source_, 0, ByteView(id3)) && id3[0] == 'I' && id3[1] == 'D' && id3[2] == '3') {   // skip an ID3v2 tag
+      at = 10 + ((uint64_t{id3[6] & 0x7Fu} << 21) | (uint64_t{id3[7] & 0x7Fu} << 14) | (uint64_t{id3[8] & 0x7Fu} << 7) | (id3[9] & 0x7Fu));
+      if (id3[5] & 0x10) at += 10;
+    }
+    decoder_ = UniquePointer<Mp3Decoder>::make(allocator_);
+    if (!decoder_) return false;
+    // One pass over the headers: the format, the number of frames and a place to start from every kIndexEvery frames.
+    bool first = true, lame = false;
+    uint32_t tag_frames = 0, delay = 0, padding = 0;
+    uint64_t counted = 0, frame_at = 0;
+    uint32_t frame_size = 0;
+    while (next_frame(at, &frame_at, &frame_size)) {
+      const ConstByteView v = window_.from(frame_at);
+      if (v.size() < frame_size) return false;
+      const uint8_t* h = v.data();
+      at = frame_at + frame_size;
+      const uint32_t hz = hdr_sample_rate_hz(h), ch = hdr_is_mono(h) ? 1 : 2;
+      if (first) {
+        rate_ = hz;
+        channels_ = ch;
+        spf_ = hdr_frame_samples(h);
+        first = false;
+        XingInfo xing;
+        if (parse_xing(h, frame_size, ch, &xing)) {
+          tag_frames = xing.tag_frames;
+          delay = xing.delay;
+          padding = xing.padding;
+          lame = xing.lame;
+          continue;
+        }
+      }
+      if (hz != rate_ || ch != channels_) continue;
+      if (counted % kIndexEvery == 0 && !index_.push_back(frame_at)) return false;
+      ++counted;
+    }
+    if (rate_ == 0 || counted == 0) return false;
+    uint64_t frames = counted * spf_;
+    if (lame && tag_frames > 0) {   // gapless playback: drop the encoder's delay at the start and padding at the end
+      skip_ = uint64_t{delay} + 529;
+      uint64_t end = uint64_t{tag_frames} * spf_ + 529;
+      end = end > padding ? end - padding : 0;
+      if (end < frames) frames = end;
+      if (skip_ >= frames) skip_ = 0;
+    }
+    frames_ = frames - skip_;
+    counted_ = counted;
+    format_.sample_rate = rate_;
+    format_.channels = static_cast<uint8_t>(channels_);
+    format_.type = audio::SampleType::S16;
+    cur_frame_ = 0;
+    cur_at_ = index_[0];
+    return frames_ > 0 && format_.valid();
+  }
+
+ protected:
+  bool refill(uint64_t frame) override {
+    const uint64_t raw = frame + skip_, k = raw / spf_;
+    if (k < cur_frame_ || k - cur_frame_ > 256) {   // a jump: back to a remembered place a few frames before, and decode on from there
+      const uint64_t prime = k > kPrimeFrames ? k - kPrimeFrames : 0;
+      const uint64_t slot = prime / kIndexEvery;
+      decoder_->reset();
+      cur_frame_ = slot * kIndexEvery;
+      cur_at_ = index_[slot];
+    }
+    while (cur_frame_ < k) {   // (frames before the one wanted are decoded and dropped)
+      if (!decode_one(nullptr)) return false;
+    }
+    pcm_.clear();
+    uint32_t got = 0;
+    const uint64_t first_raw = k * spf_;
+    for (; got < 4 && cur_frame_ < counted_; ++got)
+      if (!decode_one(&pcm_)) break;
+    if (got == 0) return false;
+    uint64_t drop = skip_ > first_raw ? skip_ - first_raw : 0;   // the encoder's delay
+    uint64_t have = pcm_.size() / format_.frame_size();
+    if (drop >= have) return false;
+    uint64_t first = first_raw + drop - skip_;
+    have -= drop;
+    if (first + have > frames_) have = first < frames_ ? frames_ - first : 0;
+    if (have == 0) return false;
+    set_window(first, pcm_.view().subview(drop * format_.frame_size(), have * format_.frame_size()));
+    return true;
+  }
+
+ private:
+  // The next frame at or after `pos`.
+  bool next_frame(uint64_t pos, uint64_t* at, uint32_t* size) {
+    for (;;) {
+      const ConstByteView v = window_.from(pos);
+      if (v.size() < 4) return false;
+      uint64_t rel;
+      uint32_t sz;
+      if (find_frame(v, 0, &rel, &sz)) {
+        *at = pos + rel;
+        *size = sz;
+        return true;
+      }
+      if (v.size() < 131072) return false;   // the end of the file
+      pos += v.size() - 2048;
+    }
+  }
+
+  // Decodes the frame at cur_at_ (the next one of the stream's format) into `out` if given; a frame that cannot be decoded is silence.
+  bool decode_one(ByteBuffer* out) {
+    uint64_t at = 0;
+    uint32_t size = 0;
+    for (;;) {
+      if (!next_frame(cur_at_, &at, &size)) return false;
+      const ConstByteView v = window_.from(at);
+      if (v.size() < size) return false;
+      cur_at_ = at + size;
+      if (hdr_sample_rate_hz(v.data()) != rate_ || (hdr_is_mono(v.data()) ? 1u : 2u) != channels_) continue;
+      int16_t pcm[1152 * 2] = {};
+      const int n = decoder_->decode_frame(v.data(), static_cast<int>(size), pcm);
+      ++cur_frame_;
+      if (out) return out->append(ConstByteView(reinterpret_cast<const uint8_t*>(pcm), uint64_t{spf_} * channels_ * 2));
+      return true;
+      (void)n;
+    }
+  }
+
+  IByteSource& source_;
+  allocators::IAllocator& allocator_;
+  SourceWindow window_;
+  UniquePointer<Mp3Decoder> decoder_;
+  ByteBuffer pcm_;
+  List<uint64_t> index_;
+  uint32_t rate_ = 0, channels_ = 0, spf_ = 0;
+  uint64_t skip_ = 0, counted_ = 0;
+  uint64_t cur_frame_ = 0, cur_at_ = 0;   // the next frame to decode and where to look for it
+};
+
+}  // namespace
+
+UniquePointer<audio::IPcmSource> open_mp3_stream(IByteSource& source, allocators::IAllocator& allocator) {
+  UniquePointer<Mp3Stream> stream = UniquePointer<Mp3Stream>::make(allocator, source, allocator);
+  if (!stream || !stream->init()) return UniquePointer<audio::IPcmSource>();
+  return UniquePointer<audio::IPcmSource>(util::move(stream));
 }
 
 }  // namespace media
