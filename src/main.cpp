@@ -126,15 +126,17 @@ static void on_storage_change(void* context, StringView text) {
   static_cast<desktop::Desktop*>(context)->explorer().refresh();
 }
 
-// File > Eject in the file explorer: safely remove the drive holding a volume. The answer is what the status bar says.
+// File > Eject in the file explorer: safely remove the drive holding a volume. The answer is what the notice dialog says.
 struct EjectContext {
   SystemFileSystem* files;
   FixedString<192> message;
 };
-static const char* on_eject(void* context, StringView volume) {
+static const char* on_eject(void* context, StringView volume, bool* succeeded) {
   auto* c = static_cast<EjectContext*>(context);
   c->message.assign(volume);
-  switch (c->files->eject(volume)) {
+  const SystemFileSystem::EjectStatus status = c->files->eject(volume);
+  *succeeded = status == SystemFileSystem::EjectStatus::Ok;
+  switch (status) {
     case SystemFileSystem::EjectStatus::Ok: c->message.append(" can be removed safely"); break;
     case SystemFileSystem::EjectStatus::InUse: c->message.append(" is in use: close its files and folders first"); break;
     case SystemFileSystem::EjectStatus::NotEjectable: c->message.append(" cannot be ejected"); break;

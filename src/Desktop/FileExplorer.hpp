@@ -27,6 +27,7 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Menu.hpp"
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Kernel/Sync.hpp"
 
@@ -54,11 +55,13 @@ class FileExplorer : public gui::Frame {
   StringView opened_file() const { return opened_file_.view(); }
 
   // Ejecting a drive (File > Eject): the volume called `volume` - the selected folder when the explorer shows the root, else the volume the
-  // current folder is on. The function does it and returns what the status bar should say (a static string or one that stays valid until the
+  // current folder is on. The function does it, clears *succeeded if it failed, and returns what a notice should say (a static string or one that stays valid until the
   // next call; null for nothing); the explorer refreshes afterwards. Runs on the thread that fired the menu item.
-  using EjectFunction = const char* (*)(void* context, StringView volume);
+  using EjectFunction = const char* (*)(void* context, StringView volume, bool* succeeded);   // *succeeded is true on entry
   void set_eject_handler(EjectFunction function, void* context) { eject_ = function; eject_context_ = context; }
   bool eject_selected();
+  // The dialog that warnings, information and errors are shown in (nullptr: the status bar says them instead). It must outlive the explorer.
+  void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
   StringView path() const { return path_.view(); }
   gui::ListView& view() { return view_; }
@@ -95,6 +98,10 @@ class FileExplorer : public gui::Frame {
   bool load(StringView path);   // (with navigation_ held)
   void activate_selected();
   void update_status();
+  // Warnings, information and errors go to the notice dialog (or the status bar when there is none to show it in).
+  void notify(gui::NoticeKind kind, StringView text) {
+    if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) status_.set_text(text);
+  }
 
   gui::MenuBar menu_;
   gui::ContextMenu list_menu_, address_menu_;
@@ -110,6 +117,7 @@ class FileExplorer : public gui::Frame {
   String scratch_;
   String opened_file_;
   gui::Handler file_opened_;
+  gui::NoticeDialog* notices_ = nullptr;
   EjectFunction eject_ = nullptr;
   void* eject_context_ = nullptr;
 };

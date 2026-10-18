@@ -1018,7 +1018,7 @@ struct EjectProbe {
   int calls = 0;
   const char* answer = "ejected";
 };
-static const char* probe_eject(void* context, StringView volume) {
+static const char* probe_eject(void* context, StringView volume, bool*) {
   EjectProbe* p = static_cast<EjectProbe*>(context);
   ++p->calls;
   const uint64_t n = volume.size() < sizeof p->volume - 1 ? volume.size() : sizeof p->volume - 1;
@@ -1439,6 +1439,14 @@ static void test_notepad() {
     CHECK(np.title().equals("Text Editor - t.txt") && np.status_label().text().equals("Opened /t.txt"));
     CHECK(!np.open_file("/nope") && np.status_label().text().equals("Cannot open /nope: not found") && np.editor().text().equals("a\nb\n"));
     CHECK(!np.open_file("/dir"));
+    // With a notice dialog the error opens in it instead of going to the status bar.
+    {
+      gui::NoticeDialog notices(a);
+      np.set_notices(&notices);
+      CHECK(!np.open_file("/gone") && notices.showing() && notices.kind() == gui::NoticeKind::Error && notices.message().equals("Cannot open /gone: not found"));
+      notices.close();
+      np.set_notices(nullptr);
+    }
 
     // Unsaved changes are only thrown away when the command is repeated.
     w.set_focus(&np.editor());

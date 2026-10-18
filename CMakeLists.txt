@@ -310,6 +310,7 @@ add_executable(BOOTX64
   src/Gui/Windows/WindowManager.cpp
   src/Gui/Windows/WindowSwitcher.cpp
   src/Gui/MessageDialog.cpp
+  src/Gui/NoticeDialog.cpp
   src/Graphics/Graphics3D/Software/SoftwareDevice.cpp
   src/Hardware/x86_64/port.S
 )

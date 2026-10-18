@@ -195,7 +195,7 @@ bool FileExplorer::go_up() {
 
 bool FileExplorer::eject_selected() {
   if (!fs_ || !eject_) {
-    status_.set_text("Nothing here can be ejected");
+    notify(gui::NoticeKind::Information, "Nothing here can be ejected");
     return false;
   }
   String volume(allocator());
@@ -204,7 +204,7 @@ bool FileExplorer::eject_selected() {
     if (path_.size() <= 1) {   // the root lists the drives: the selected one
       const int32_t item = view_.selected_item();
       if (item < 0 || view_.item_icon(static_cast<uint32_t>(item)) != ItemIcon::Folder) {
-        status_.set_text("Select a drive to eject");
+        notify(gui::NoticeKind::Warning, "Select a drive to eject");
         return false;
       }
       view_.item_text(static_cast<uint32_t>(item), 0, &volume);
@@ -215,9 +215,10 @@ bool FileExplorer::eject_selected() {
       volume.assign(StringView(p.data() + 1, end - 1));
     }
   }
-  const char* message = eject_(eject_context_, volume.view());
+  bool succeeded = true;
+  const char* message = eject_(eject_context_, volume.view(), &succeeded);
   refresh();   // (the drive is gone from the root, and a folder on it from the view)
-  if (message) status_.set_text(message);
+  if (message) notify(succeeded ? gui::NoticeKind::Information : gui::NoticeKind::Error, message);
   return true;
 }
 
@@ -233,7 +234,7 @@ void FileExplorer::activate_selected() {
     fire(file_opened_);
     return;
   }
-  if (!open_folder(child.view())) status_.set_text("The folder could not be opened");
+  if (!open_folder(child.view())) notify(gui::NoticeKind::Error, "The folder could not be opened");
 }
 
 void FileExplorer::update_status() {
@@ -296,7 +297,7 @@ void FileExplorer::on_navigate(void* self, Control&) {
     String message(e->allocator());
     message.append("Cannot open ");
     message.append(target.view());
-    e->status_.set_text(message.view());
+    e->notify(gui::NoticeKind::Error, message.view());
   }
 }
 

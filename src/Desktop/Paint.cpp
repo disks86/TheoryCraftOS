@@ -352,12 +352,12 @@ void Paint::on_tool_changed(void* self, Control&) {  // the canvas switched tool
 void Paint::copy_to_clipboard(bool cut) {
   const bool ok = cut ? canvas_.cut_selection() : canvas_.copy_selection();
   if (ok) say(cut ? "Cut to the clipboard." : canvas_.has_selection() ? "Copied the selection." : "Copied the whole picture.");
-  else say(cut ? "Select something to cut first." : "Cannot copy.");
+  else notify(gui::NoticeKind::Warning, cut ? "Select something to cut first." : "Cannot copy.");
 }
 
 void Paint::paste_from_clipboard() {
   if (canvas_.paste()) say("Pasted. Drag it into place; Enter sets it down, Escape takes it back.");
-  else say("Nothing to paste: the clipboard has no picture.");
+  else notify(gui::NoticeKind::Warning, "Nothing to paste: the clipboard has no picture.");
 }
 
 void Paint::on_cut(void* self, Control&) { static_cast<Paint*>(self)->copy_to_clipboard(true); }
@@ -437,7 +437,7 @@ bool Paint::may_discard() {
     return true;
   }
   discard_armed_ = true;
-  say("Unsaved changes - repeat the command to discard them, or press Save.");
+  notify(gui::NoticeKind::Warning, "Unsaved changes - repeat the command to discard them, or press Save.");
   return false;
 }
 
@@ -451,13 +451,13 @@ void Paint::on_secondary_color(void* self, Control&) { static_cast<Paint*>(self)
 
 void Paint::ask_print() {
   if (!print_dialog_ || !manager()) {
-    say("No print dialog available.");
+    notify(gui::NoticeKind::Error, "No print dialog available.");
     return;
   }
   canvas_.commit_floating();  // a picture still being placed is part of what is printed
   print_surface_ = canvas_.surface();
   print_dialog_->set_picture(&print_surface_);   // for the preview
-  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Picture, "Print", {&Paint::on_print_picked, this})) say("The print dialog is busy.");
+  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Picture, "Print", {&Paint::on_print_picked, this})) notify(gui::NoticeKind::Warning, "The print dialog is busy.");
 }
 
 void Paint::on_print_picked(void* self, Control&) {
@@ -471,19 +471,19 @@ void Paint::on_print_picked(void* self, Control&) {
     String message(p->allocator());
     message.append("Cannot print: ");
     message.append(error.view());
-    p->say(message.view());
+    p->notify(gui::NoticeKind::Error, message.view());
   }
 }
 
 void Paint::ask_color(bool secondary) {
   if (!color_dialog_ || !manager()) {
-    say("No color dialog available.");
+    notify(gui::NoticeKind::Error, "No color dialog available.");
     return;
   }
   choosing_secondary_ = secondary;
   if (!color_dialog_->show(*manager(), secondary ? "Secondary Color" : "Primary Color", secondary ? palette_.secondary() : palette_.primary(),
                            {&Paint::on_color_picked_by_dialog, this}))
-    say("The color dialog is busy.");
+    notify(gui::NoticeKind::Warning, "The color dialog is busy.");
 }
 
 void Paint::on_color_picked_by_dialog(void* self, Control&) {
@@ -502,21 +502,21 @@ constexpr uint32_t kPictureFilterCount = sizeof kPictureFilters / sizeof kPictur
 
 void Paint::ask_open() {
   if (!dialog_ || !manager()) {
-    say("No file dialog available.");
+    notify(gui::NoticeKind::Error, "No file dialog available.");
     return;
   }
   if (!may_discard()) return;
   if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kPictureFilters, kPictureFilterCount, path_.view(), {&Paint::on_open_picked, this}))
-    say("The file dialog is busy.");
+    notify(gui::NoticeKind::Warning, "The file dialog is busy.");
 }
 
 void Paint::ask_save_as() {
   if (!dialog_ || !manager()) {
-    say("No file dialog available.");
+    notify(gui::NoticeKind::Error, "No file dialog available.");
     return;
   }
   if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kPictureFilters, kPictureFilterCount, path_.view(), {&Paint::on_save_picked, this}))
-    say("The file dialog is busy.");
+    notify(gui::NoticeKind::Warning, "The file dialog is busy.");
 }
 
 void Paint::on_open_picked(void* self, Control&) {
@@ -532,7 +532,7 @@ void Paint::on_save_picked(void* self, Control&) {
 bool Paint::new_picture(uint32_t width, uint32_t height) {
   if (!may_discard()) return false;
   if (!canvas_.new_image(width, height)) {
-    say("Cannot make a picture of that size.");
+    notify(gui::NoticeKind::Error, "Cannot make a picture of that size.");
     return false;
   }
   path_.clear();
@@ -545,11 +545,11 @@ bool Paint::new_picture(uint32_t width, uint32_t height) {
 bool Paint::open_file(StringView requested) {
   String path(allocator());
   if (!normalize(requested, &path) || path.empty()) {
-    say("Enter the path of a picture to open.");
+    notify(gui::NoticeKind::Warning, "Enter the path of a picture to open.");
     return false;
   }
   if (!fs_) {
-    say("No storage available.");
+    notify(gui::NoticeKind::Error, "No storage available.");
     return false;
   }
   if (!may_discard()) return false;
@@ -558,7 +558,7 @@ bool Paint::open_file(StringView requested) {
 
 bool Paint::read_picture(StringView path) {
   if (!fs_) {
-    say("No storage available.");
+    notify(gui::NoticeKind::Error, "No storage available.");
     return false;
   }
   UniquePointer<IFile> file;
@@ -569,12 +569,12 @@ bool Paint::read_picture(StringView path) {
     message.append(path);
     message.append(": ");
     message.append(describe_status(status));
-    say(message.view());
+    notify(gui::NoticeKind::Error, message.view());
     return false;
   }
   const uint64_t size = file->size();
   if (size == 0 || size > kMaxFileBytes) {
-    say(size ? "The file is too large to open." : "The file is empty.");
+    notify(gui::NoticeKind::Error, size ? "The file is too large to open." : "The file is empty.");
     return false;
   }
   ArrayView<uint8_t> bytes = allocate_view<uint8_t>(allocator(), size);
@@ -585,12 +585,12 @@ bool Paint::read_picture(StringView path) {
   const bool decoded = status == Status::Ok && got == size && media::decode_image(ConstByteView(bytes.data(), got), &image);
   release_view(allocator(), bytes);
   if (!decoded) {
-    say(status == Status::Ok ? "That is not a picture this program can read." : "The file could not be read.");
+    notify(gui::NoticeKind::Error, status == Status::Ok ? "That is not a picture this program can read." : "The file could not be read.");
     return false;
   }
   if (image.width() > DrawingCanvas::kMaxSide || image.height() > DrawingCanvas::kMaxSide ||
       !canvas_.set_pixels(image.frame(0).data(), image.width(), image.height())) {
-    say("The picture is too large to edit (limit 4096 x 4096).");
+    notify(gui::NoticeKind::Error, "The picture is too large to edit (limit 4096 x 4096).");
     return false;
   }
   path_.assign(path);
@@ -609,7 +609,7 @@ bool Paint::save_file(StringView requested) {
   String path(allocator());
   if (!normalize(requested.empty() ? path_.view() : requested, &path) || path.empty()) {
     if (dialog_ && manager()) ask_save_as();   // nowhere to save to yet: the same as Save As
-    else say("Enter a path to save to.");
+    else notify(gui::NoticeKind::Warning, "Enter a path to save to.");
     return false;
   }
   return write_picture(path.view());
@@ -619,7 +619,7 @@ bool Paint::write_picture(StringView requested) {
   String path(allocator());
   if (!path.assign(requested)) return false;
   if (!fs_) {
-    say("No storage available.");
+    notify(gui::NoticeKind::Error, "No storage available.");
     return false;
   }
   media::ImageFormat format = format_of_name(path.view());
@@ -632,12 +632,12 @@ bool Paint::write_picture(StringView requested) {
   ByteBuffer encoded(allocator());
   const ArrayView<const uint32_t> pixels = canvas_.pixels();
   if (!image.create(canvas_.image_width(), canvas_.image_height())) {
-    say("Out of memory.");
+    notify(gui::NoticeKind::Error, "Out of memory.");
     return false;
   }
   image.frame(0).copy_from(pixels);
   if (!media::encode_image(image, format, 90, &encoded)) {
-    say("The picture could not be encoded.");
+    notify(gui::NoticeKind::Error, "The picture could not be encoded.");
     return false;
   }
   UniquePointer<IFile> file;
@@ -652,7 +652,7 @@ bool Paint::write_picture(StringView requested) {
     message.append(path.view());
     message.append(": ");
     message.append(describe_status(status));
-    say(message.view());
+    notify(gui::NoticeKind::Error, message.view());
     return false;
   }
   fs_->flush();

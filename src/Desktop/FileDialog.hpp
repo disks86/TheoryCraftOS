@@ -32,6 +32,7 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/MessageDialog.hpp"
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 
 namespace desktop {
@@ -51,6 +52,8 @@ class FileDialog : public gui::Frame {
 
   // The filesystem to pick from (nullptr: none). It must outlive the dialog.
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
+  // The dialog that problems with the typed name are shown in (nullptr: the message line at the bottom says them instead). It must outlive this dialog.
+  void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
   // Double clicks in the list are measured with this clock (see ListView::set_clock); without one only Enter opens a folder or takes a file.
   void set_clock(const uint64_t* now_us) { list_.set_clock(now_us); }
 
@@ -93,7 +96,10 @@ class FileDialog : public gui::Frame {
   static void on_cancel(void* self, gui::Control&);
   static void on_replace_answer(void* self, gui::Control&);
   void finish(StringView path);
-  void say(StringView text) { message_.set_text(text); }
+  // An error for the user (empty text clears the message line); it goes to the notice dialog, or the message line when there is none.
+  void say(StringView text) {
+    if (text.empty() || !gui::NoticeDialog::post(notices_, manager(), gui::NoticeKind::Error, text)) message_.set_text(text);
+  }
   StringView current_extensions() const;
   bool join(StringView name, String* out) const;
 
@@ -105,6 +111,7 @@ class FileDialog : public gui::Frame {
   gui::DropDown type_;
   gui::Button ok_, cancel_;
   gui::MessageDialog replace_;
+  gui::NoticeDialog* notices_ = nullptr;
   filesystem::IFileSystem* fs_ = nullptr;
   Mode mode_ = Mode::Open;
   Filter filters_[kMaxFilters] = {};

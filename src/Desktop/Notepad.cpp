@@ -137,15 +137,15 @@ void Notepad::on_print(void* self, Control&) { static_cast<Notepad*>(self)->ask_
 
 void Notepad::ask_print() {
   if (!print_dialog_ || !manager()) {
-    say("No print dialog available.");
+    notify(gui::NoticeKind::Error, "No print dialog available.");
     return;
   }
   if (editor_.text().empty()) {
-    say("There is nothing to print.");
+    notify(gui::NoticeKind::Information, "There is nothing to print.");
     return;
   }
   print_dialog_->set_text(editor_.text());   // for the preview and the page count
-  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Text, "Print", {&Notepad::on_print_picked, this})) say("The print dialog is busy.");
+  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Text, "Print", {&Notepad::on_print_picked, this})) notify(gui::NoticeKind::Warning, "The print dialog is busy.");
 }
 
 void Notepad::on_print_picked(void* self, Control&) {
@@ -159,7 +159,7 @@ void Notepad::on_print_picked(void* self, Control&) {
     String message(n->allocator());
     message.append("Cannot print: ");
     message.append(error.view());
-    n->say(message.view());
+    n->notify(gui::NoticeKind::Error, message.view());
   }
 }
 
@@ -169,7 +169,7 @@ bool Notepad::may_discard() {
     return true;
   }
   discard_armed_ = true;
-  say("Unsaved changes - repeat the command to discard them, or press Save.");
+  notify(gui::NoticeKind::Warning, "Unsaved changes - repeat the command to discard them, or press Save.");
   return false;
 }
 
@@ -189,21 +189,21 @@ const FileDialog::Filter kTextFilters[] = {{"Text files", "txt;md;log;cfg;ini;cs
 
 void Notepad::ask_open() {
   if (!dialog_ || !manager()) {
-    say("No file dialog available.");
+    notify(gui::NoticeKind::Error, "No file dialog available.");
     return;
   }
   if (!may_discard()) return;
   if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kTextFilters, 2, path_.view(), {&Notepad::on_open_picked, this}))
-    say("The file dialog is busy.");
+    notify(gui::NoticeKind::Warning, "The file dialog is busy.");
 }
 
 void Notepad::ask_save_as() {
   if (!dialog_ || !manager()) {
-    say("No file dialog available.");
+    notify(gui::NoticeKind::Error, "No file dialog available.");
     return;
   }
   if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kTextFilters, 2, path_.view(), {&Notepad::on_save_picked, this}))
-    say("The file dialog is busy.");
+    notify(gui::NoticeKind::Warning, "The file dialog is busy.");
 }
 
 void Notepad::on_open_picked(void* self, Control&) {
@@ -219,11 +219,11 @@ void Notepad::on_save_picked(void* self, Control&) {
 bool Notepad::open_file(StringView requested) {
   String path(allocator());
   if (!normalize(requested, &path) || path.empty()) {
-    say("Enter the path of a file to open.");
+    notify(gui::NoticeKind::Warning, "Enter the path of a file to open.");
     return false;
   }
   if (!fs_) {
-    say("No storage available.");
+    notify(gui::NoticeKind::Error, "No storage available.");
     return false;
   }
   if (!may_discard()) return false;
@@ -232,7 +232,7 @@ bool Notepad::open_file(StringView requested) {
 
 bool Notepad::read_into_editor(StringView path) {
   if (!fs_) {
-    say("No storage available.");
+    notify(gui::NoticeKind::Error, "No storage available.");
     return false;
   }
   UniquePointer<IFile> file;
@@ -243,12 +243,12 @@ bool Notepad::read_into_editor(StringView path) {
     message.append(path);
     message.append(": ");
     message.append(describe_status(status));
-    say(message.view());
+    notify(gui::NoticeKind::Error, message.view());
     return false;
   }
   const uint64_t size = file->size();
   if (size > kMaxFileBytes) {
-    say("The file is too large to edit (limit 1 MiB).");
+    notify(gui::NoticeKind::Error, "The file is too large to edit (limit 1 MiB).");
     return false;
   }
   ArrayView<uint8_t> bytes = allocate_view<uint8_t>(allocator(), size ? size : 1);
@@ -261,7 +261,7 @@ bool Notepad::read_into_editor(StringView path) {
     if (bytes[i] != '\r') ok = text.push_back(static_cast<char>(bytes[i]));
   release_view(allocator(), bytes);
   if (!ok) {
-    say(status == Status::Ok ? "Out of memory." : "The file could not be read.");
+    notify(gui::NoticeKind::Error, status == Status::Ok ? "Out of memory." : "The file could not be read.");
     return false;
   }
   editor_.set_text(text.view());
@@ -281,7 +281,7 @@ bool Notepad::save_file(StringView requested) {
   String path(allocator());
   if (!normalize(requested.empty() ? path_.view() : requested, &path) || path.empty()) {
     if (dialog_ && manager()) ask_save_as();   // nowhere to save to yet: the same as Save As
-    else say("Enter a path to save to.");
+    else notify(gui::NoticeKind::Warning, "Enter a path to save to.");
     return false;
   }
   return write_from_editor(path.view());
@@ -289,7 +289,7 @@ bool Notepad::save_file(StringView requested) {
 
 bool Notepad::write_from_editor(StringView path) {
   if (!fs_) {
-    say("No storage available.");
+    notify(gui::NoticeKind::Error, "No storage available.");
     return false;
   }
   UniquePointer<IFile> file;
@@ -306,7 +306,7 @@ bool Notepad::write_from_editor(StringView path) {
     message.append(path);
     message.append(": ");
     message.append(describe_status(status));
-    say(message.view());
+    notify(gui::NoticeKind::Error, message.view());
     return false;
   }
   fs_->flush();

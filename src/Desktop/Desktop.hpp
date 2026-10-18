@@ -36,6 +36,7 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/InputPump.hpp"
 #include "Gui/MessageDialog.hpp"
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/RenderLoop.hpp"
 #include "Gui/Window.hpp"
 #include "Gui/Windows/Frame.hpp"
@@ -73,6 +74,8 @@ class Desktop {
   gui::WindowManager& windows() { return windows_; }
   gui::WindowSwitcher& switcher() { return switcher_; }
   gui::MessageDialog& shutdown_dialog() { return shutdown_dialog_; }
+  // The dialog the programs show warnings, information and errors in.
+  gui::NoticeDialog& notice_dialog() { return notice_dialog_; }
   gui::Frame& about_window() { return about_; }
   gui::Frame& explorer_window() { return explorer_; }
   FileExplorer& explorer() { return explorer_; }
@@ -155,6 +158,7 @@ class Desktop {
   gui::Panel tray_;
   gui::Label clock_;
   gui::MessageDialog shutdown_dialog_;
+  gui::NoticeDialog notice_dialog_;
   FileDialog file_dialog_;
   ColorDialog color_dialog_;
   PrintDialog print_dialog_;

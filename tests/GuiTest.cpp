@@ -33,6 +33,7 @@
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/InputPump.hpp"
 #include "Gui/MessageDialog.hpp"
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
@@ -890,6 +891,62 @@ static void test_modal_and_dialog() {
   CHECK(a.live == 0);
 }
 
+static void test_notice_dialog() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    // Wrapping: whole words, at most four lines, "..." when text is left out, long words broken.
+    {
+      String storage(a);
+      StringView lines[NoticeDialog::kMaxLines];
+      CHECK(NoticeDialog::wrap("short", lines, 4, &storage) == 1 && lines[0].equals("short"));
+      CHECK(NoticeDialog::wrap("", lines, 4, &storage) == 0);
+      CHECK(NoticeDialog::wrap("Cannot save /documents/report.txt: the drive is full or write protected", lines, 4, &storage) == 2);
+      CHECK(lines[0].equals("Cannot save /documents/report.txt: the") && lines[1].equals("drive is full or write protected"));
+      CHECK(NoticeDialog::wrap("one\ntwo", lines, 4, &storage) == 2 && lines[0].equals("one") && lines[1].equals("two"));
+      String longword(a);
+      for (int i = 0; i < 50; ++i) longword.push_back('x');
+      CHECK(NoticeDialog::wrap(longword.view(), lines, 4, &storage) == 2 && lines[0].size() == 40 && lines[1].size() == 10);
+      String huge(a);
+      for (int i = 0; i < 40; ++i) huge.append("word ");
+      CHECK(NoticeDialog::wrap(huge.view(), lines, 4, &storage) == 4 && lines[3].size() <= 40 && lines[3].substr(lines[3].size() - 3).equals("..."));
+    }
+    Frame doc(a);
+    doc.set_title("Document");
+    doc.set_bounds({50, 50, 300, 200});
+    mgr.add_window(&doc);
+    NoticeDialog notice(a);
+    struct Dismissed { int calls = 0; static void fn(void* c, Control&) { ++static_cast<Dismissed*>(c)->calls; } } dismissed;
+    notice.on_dismissed({&Dismissed::fn, &dismissed});
+    CHECK(!NoticeDialog::post(nullptr, &mgr, NoticeKind::Error, "x") && !NoticeDialog::post(&notice, nullptr, NoticeKind::Error, "x"));
+    CHECK(NoticeDialog::post(&notice, &mgr, NoticeKind::Error, "Cannot open /a: not found") && notice.showing() && notice.modal() && mgr.has_modal());
+    w.layout();
+    CHECK(notice.title().equals("Error") && notice.kind() == NoticeKind::Error && notice.line_label(0).text().equals("Cannot open /a: not found"));
+    CHECK(!notice.minimize_enabled() && !notice.maximize_enabled() && !doc.enabled() && w.focus() == &notice.ok_button());
+    // A second notice while it is open replaces the text.
+    CHECK(notice.show(mgr, NoticeKind::Warning, "Be careful") && mgr.window_count() == 2);
+    CHECK(notice.title().equals("Warning") && notice.line_label(0).text().equals("Be careful"));
+    w.render();
+    // OK dismisses it and re-enables what was under it.
+    click_center(w, notice.ok_button());
+    CHECK(!notice.showing() && dismissed.calls == 1 && !mgr.has_modal() && doc.enabled());
+    // Enter and Escape dismiss it too.
+    CHECK(notice.show(mgr, NoticeKind::Information, "Done") && notice.title().equals("Information"));
+    press(w, key::kEnter);
+    CHECK(!notice.showing() && dismissed.calls == 2);
+    CHECK(notice.show(mgr, NoticeKind::Error, "Again"));
+    press(w, key::kEscape);
+    CHECK(!notice.showing() && dismissed.calls == 3);
+    mgr.remove_window(&doc);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_switcher() {
   TestAllocator a;
   {
@@ -1146,6 +1203,7 @@ int main() {
   test_clock();
   test_windows();
   test_modal_and_dialog();
+  test_notice_dialog();
   test_switcher();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui: all checks passed\n");

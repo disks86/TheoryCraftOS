@@ -24,8 +24,8 @@
 // the shared FileDialog, Save writes to the file the picture came from (or asks like Save As when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Z, Ctrl+Y and Ctrl+A
 // do what their menu items do. Cut, Copy and Paste (Ctrl+X, Ctrl+C, Ctrl+V) use the system clipboard: the selection made with the
 // Select tool (the whole picture when nothing is selected) goes onto it as a picture, and a picture on it is pasted as a floating
-// selection to drag into place. A command that would throw away unsaved changes does nothing the first time (the status
-// line says so) and goes ahead when it is repeated.
+// selection to drag into place. Warnings and errors appear in the shared NoticeDialog. A command that would throw away unsaved changes does nothing the first time (a
+// warning says so) and goes ahead when it is repeated.
 #pragma once
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/FileDialog.hpp"
@@ -40,6 +40,7 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/ToolStrip.hpp"
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 
 namespace desktop {
@@ -58,10 +59,12 @@ class Paint : public gui::Frame {
   // The dialog that Print uses, and the one that Options > Primary / Secondary Color use (nullptr: none, they then say so). They must outlive the window.
   void set_print_dialog(PrintDialog* dialog) { print_dialog_ = dialog; }
   void set_color_dialog(ColorDialog* dialog) { color_dialog_ = dialog; }
+  // The dialog that warnings, information and errors are shown in (nullptr: the status line says them instead). It must outlive the window.
+  void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
   // Starts a blank white picture. False (nothing changes) while there are unsaved changes the user has not agreed to lose.
   bool new_picture(uint32_t width = kNewWidth, uint32_t height = kNewHeight);
-  // Loads the picture at `path`; false if it cannot be read or decoded (the status line says why) or unsaved changes are in the way.
+  // Loads the picture at `path`; false if it cannot be read or decoded (an error dialog says why) or unsaved changes are in the way.
   bool open_file(StringView path);
   // Saves to `path` (the toolbar's path when empty). False if that fails.
   bool save_file(StringView path = StringView());
@@ -132,6 +135,10 @@ class Paint : public gui::Frame {
   bool read_picture(StringView path);
   bool write_picture(StringView path);
   void say(StringView text) { status_.set_text(text); }
+  // Warnings, information and errors go to the notice dialog (or the status line when there is none to show it in).
+  void notify(gui::NoticeKind kind, StringView text) {
+    if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) say(text);
+  }
   void update_state();
   void update_position();
 
@@ -149,6 +156,7 @@ class Paint : public gui::Frame {
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
   PrintDialog* print_dialog_ = nullptr;
+  gui::NoticeDialog* notices_ = nullptr;
   ColorDialog* color_dialog_ = nullptr;
   bool choosing_secondary_ = false;
   graphics::Surface print_surface_;   // the picture the print dialog previews (it borrows it)
