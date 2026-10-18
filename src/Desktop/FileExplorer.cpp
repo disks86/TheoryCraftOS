@@ -133,6 +133,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   view_.on_item_activated({&FileExplorer::on_activated, this});
   view_.on_item_renamed({&FileExplorer::on_renamed, this});
   view_.on_selection_changed({&FileExplorer::on_selection, this});
+  view_.set_drag_source(&FileExplorer::on_drag_item, this);
 
   add(&menu_);
   add(&toolbar_);
@@ -552,6 +553,132 @@ void FileExplorer::on_copy_address(void* self, Control&) {
 void FileExplorer::on_view_list(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::List); }
 void FileExplorer::on_view_icons(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::Icons); }
 void FileExplorer::on_view_details(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::Details); }
+// --- Drag and drop
+
+bool FileExplorer::on_drag_item(void* self, int32_t item, String* text) {
+  auto* e = static_cast<FileExplorer*>(self);
+  const ItemIcon icon = e->view_.item_icon(static_cast<uint32_t>(item));
+  if (icon == ItemIcon::Drive || (e->path_.size() <= 1 && icon != ItemIcon::File)) return false;   // the volumes and mounted folders of the root stay
+  String name(e->allocator());
+  e->view_.item_text(static_cast<uint32_t>(item), 0, &name);
+  return text->assign(e->path_.view()) && (e->path_.size() <= 1 || text->push_back('/')) && text->append(name.view());
+}
+
+bool FileExplorer::accepts_drop(StringView text, int32_t, int32_t, const Control*) const {
+  return fs_ && !text.empty() && text[0] == '/';
+}
+
+void FileExplorer::on_drop(StringView text, int32_t x, int32_t y, const Control*) {
+  // Dropped on a folder of the list: into that folder. Otherwise into the folder shown.
+  String folder(allocator());
+  folder.assign(path_.view());
+  const Point mine = window_origin(), theirs = view_.window_origin();
+  const int32_t item = view_.item_at_point(x + mine.x - theirs.x, y + mine.y - theirs.y);
+  if (item >= 0 && view_.item_icon(static_cast<uint32_t>(item)) == ItemIcon::Folder) {
+    String name(allocator());
+    view_.item_text(static_cast<uint32_t>(item), 0, &name);
+    if (path_.size() > 1) folder.push_back('/');
+    folder.append(name.view());
+  }
+  move_into(text, folder.view());
+}
+
+bool FileExplorer::move_into(StringView source, StringView folder) {
+  if (!fs_) {
+    notify(NoticeKind::Error, "No storage available.");
+    return false;
+  }
+  const uint64_t slash = source.rfind('/');
+  if (slash == StringView::npos || slash + 1 >= source.size()) return false;
+  const StringView name = source.substr(slash + 1);
+  const StringView source_parent = slash == 0 ? StringView("/") : source.substr(0, slash);
+  if (source_parent.equals(folder)) return true;   // already there
+  String target(allocator());
+  target.assign(folder);
+  if (folder.size() > 1) target.push_back('/');
+  target.append(name);
+  String message(allocator());
+  auto fail = [&](StringView why) {
+    message.clear();
+    message.append("Cannot move ");
+    message.append(name);
+    message.append(": ");
+    message.append(why);
+    notify(NoticeKind::Error, message.view());
+    return false;
+  };
+  if (folder.size() >= source.size() && folder.substr(0, source.size()).equals(source) &&
+      (folder.size() == source.size() || folder[source.size()] == '/'))
+    return fail("a folder cannot be moved into itself.");
+  if (folder.size() <= 1) return fail("the list of drives cannot be changed.");
+  DirectoryEntry taken;
+  if (fs_->stat(target.view(), &taken) != Status::NotFound) return fail("an item of that name is already in the folder.");
+  Status status = fs_->rename(source, target.view());
+  if (status == Status::Unsupported) {   // another volume: copy, then remove the original
+    status = copy_tree(source, target.view(), 0);
+    if (status == Status::Ok) status = remove_tree(source, 0);
+  }
+  fs_->flush();
+  fire(files_changed_);
+  refresh();
+  if (status != Status::Ok) return fail(describe_status(status));
+  return true;
+}
+
+Status FileExplorer::copy_tree(StringView from, StringView to, uint32_t depth) {
+  DirectoryEntry entry;
+  Status status = fs_->stat(from, &entry);
+  if (status != Status::Ok) return status;
+  if (entry.type == NodeType::Directory) {
+    if (depth > 32) return Status::InvalidPath;
+    status = fs_->create_directory(to);
+    if (status != Status::Ok) return status;
+    List<DirectoryEntry> children(allocator());
+    status = read_sorted_directory(*fs_, from, &children);
+    if (status != Status::Ok) return status;
+    for (const DirectoryEntry& child : children) {
+      String a(allocator()), b(allocator());
+      a.assign(from);
+      a.push_back('/');
+      a.append(child.name.view());
+      b.assign(to);
+      b.push_back('/');
+      b.append(child.name.view());
+      status = copy_tree(a.view(), b.view(), depth + 1);
+      if (status != Status::Ok) return status;
+    }
+    return Status::Ok;
+  }
+  UniquePointer<IFile> in, out;
+  status = fs_->open_file(from, OpenMode::Read, &in);
+  if (status != Status::Ok) return status;
+  status = fs_->open_file(to, OpenMode::CreateTruncate, &out);
+  if (status != Status::Ok) return status;
+  uint8_t buffer[8192];
+  for (uint64_t offset = 0, got = 1; got > 0; offset += got) {
+    status = in->read(offset, ByteView(buffer, sizeof buffer), &got);
+    if (status != Status::Ok) return status;
+    if (got == 0) break;
+    uint64_t put = 0;
+    status = out->write(offset, ConstByteView(buffer, got), &put);
+    if (status != Status::Ok) return status;
+  }
+  return out->flush();
+}
+
+void FileExplorer::copy_settings_from(const FileExplorer& o) {
+  login_ = o.login_;
+  login_context_ = o.login_context_;
+  nfs_login_ = o.nfs_login_;
+  nfs_login_context_ = o.nfs_login_context_;
+  sftp_login_ = o.sftp_login_;
+  sftp_login_context_ = o.sftp_login_context_;
+  ftps_login_ = o.ftps_login_;
+  ftps_login_context_ = o.ftps_login_context_;
+  eject_ = o.eject_;
+  eject_context_ = o.eject_context_;
+}
+
 void FileExplorer::on_open_item(void* self, Control&) { static_cast<FileExplorer*>(self)->activate_selected(); }
 void FileExplorer::on_copy_path(void* self, Control&) { static_cast<FileExplorer*>(self)->copy_selected_path(); }
 bool FileExplorer::new_folder() { return create_new(true); }

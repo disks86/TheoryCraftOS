@@ -24,7 +24,8 @@ using namespace gui;
 
 Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
                  hardware::IMouse* mouse)
-    : window_(allocator, renderer, theme_, renderer.extent()),
+    : allocator_(allocator),
+      window_(allocator, renderer, theme_, renderer.extent()),
       input_(window_, keyboard, mouse),
       render_loop_(window_),
       surface_(allocator),
@@ -47,7 +48,10 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       paint_(allocator),
       media_player_(allocator),
       about_(allocator),
-      about_lines_{Label(allocator), Label(allocator), Label(allocator)} {
+      about_lines_{Label(allocator), Label(allocator), Label(allocator)},
+      extra_explorers_(allocator),
+      extra_notepads_(allocator),
+      extra_paints_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
   taskbar_.set_dock(DockStyle::Bottom);
@@ -100,18 +104,11 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
 
   media_player_.set_notices(&notice_dialog_);
   media_player_.set_file_dialog(&file_dialog_);
-  notepad_.set_notices(&notice_dialog_);
-  paint_.set_notices(&notice_dialog_);
-  explorer_.set_notices(&notice_dialog_);
   file_dialog_.set_notices(&notice_dialog_);
-  notepad_.set_file_dialog(&file_dialog_);
-  paint_.set_file_dialog(&file_dialog_);
-  notepad_.set_print_dialog(&print_dialog_);
-  paint_.set_print_dialog(&print_dialog_);
-  paint_.set_color_dialog(&color_dialog_);
-  explorer_.set_clock(&now_us_);
   file_dialog_.set_clock(&now_us_);
-  explorer_.on_file_opened({&Desktop::on_explorer_file, this});
+  setup_notepad(notepad_);
+  setup_paint(paint_);
+  setup_explorer(explorer_);
 
   about_.set_title("About TheoryCraftOS");
   about_.set_bounds({140, 90, 400, 170});
@@ -134,9 +131,107 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.layout();
 }
 
-void Desktop::open_explorer() {
-  if (explorer_.manager()) explorer_.activate();
-  else windows_.add_window(&explorer_);
+void Desktop::set_file_system(filesystem::IFileSystem* fs) {
+  window_.locked([&] {
+    fs_ = fs;
+    explorer_.set_file_system(fs);
+    notepad_.set_file_system(fs);
+    paint_.set_file_system(fs);
+    for (auto& e : extra_explorers_) e->set_file_system(fs);
+    for (auto& n : extra_notepads_) n->set_file_system(fs);
+    for (auto& p : extra_paints_) p->set_file_system(fs);
+  });
+  media_player_.set_file_system(fs);
+  file_dialog_.set_file_system(fs);
+}
+
+void Desktop::setup_explorer(FileExplorer& explorer) {
+  explorer.set_notices(&notice_dialog_);
+  explorer.set_clock(&now_us_);
+  explorer.on_file_opened({&Desktop::on_explorer_file, this});
+  explorer.on_files_changed({&Desktop::on_files_changed, this});
+  explorer.set_file_system(fs_);
+}
+
+void Desktop::setup_notepad(Notepad& notepad) {
+  notepad.set_notices(&notice_dialog_);
+  notepad.set_file_dialog(&file_dialog_);
+  notepad.set_print_dialog(&print_dialog_);
+  notepad.set_file_system(fs_);
+}
+
+void Desktop::setup_paint(Paint& paint) {
+  paint.set_notices(&notice_dialog_);
+  paint.set_file_dialog(&file_dialog_);
+  paint.set_print_dialog(&print_dialog_);
+  paint.set_color_dialog(&color_dialog_);
+  paint.set_file_system(fs_);
+}
+
+// The first window of a kind is a member of the desktop; when it is already open the next ones are made on the heap, each a little
+// lower and to the right of the last so that they do not hide each other, and are destroyed (reap_closed) after they are closed.
+template <class T>
+T* Desktop::open_instance(T& first, List<UniquePointer<T>>& extras, void (Desktop::*setup)(T&)) {
+  T* target = nullptr;
+  window_.locked([&] {
+    if (!first.manager()) {
+      target = &first;
+    } else {
+      uint32_t open = 1;
+      for (auto& e : extras) open += e->manager() ? 1 : 0;
+      UniquePointer<T> fresh = UniquePointer<T>::make(allocator_, allocator_);
+      if (!fresh) return;
+      target = fresh.get();
+      (this->*setup)(*target);
+      const Rect2D at = first.bounds();
+      const int32_t step = static_cast<int32_t>(open % 8) * 24;
+      target->set_bounds({at.x + step, at.y + step, at.width, at.height});
+      target->on_closed({&Desktop::on_extra_closed, this});
+      if (!extras.push_back(util::move(fresh))) return;
+    }
+    if (!windows_.add_window(target)) target = nullptr;
+  });
+  return target;
+}
+
+void Desktop::on_extra_closed(void* self, Control&) { __atomic_store_n(&static_cast<Desktop*>(self)->reap_needed_, true, __ATOMIC_RELEASE); }
+
+void Desktop::reap_closed() {
+  window_.locked([&] {
+    auto sweep = [](auto& pool) {
+      for (uint64_t i = pool.count(); i > 0; --i)
+        if (!pool[i - 1]->manager()) pool.remove_at(i - 1);
+    };
+    sweep(extra_explorers_);
+    sweep(extra_notepads_);
+    sweep(extra_paints_);
+  });
+}
+
+FileExplorer* Desktop::open_explorer() { return open_instance(explorer_, extra_explorers_, &Desktop::setup_explorer); }
+
+void Desktop::refresh_explorers() {
+  window_.locked([&] {
+    if (explorer_.manager()) explorer_.refresh();
+    for (auto& e : extra_explorers_)
+      if (e->manager()) e->refresh();
+  });
+}
+
+uint32_t Desktop::explorer_count() const {
+  uint32_t n = explorer_.manager() ? 1 : 0;
+  for (const auto& e : extra_explorers_) n += e->manager() ? 1 : 0;
+  return n;
+}
+uint32_t Desktop::text_editor_count() const {
+  uint32_t n = notepad_.manager() ? 1 : 0;
+  for (const auto& e : extra_notepads_) n += e->manager() ? 1 : 0;
+  return n;
+}
+uint32_t Desktop::paint_count() const {
+  uint32_t n = paint_.manager() ? 1 : 0;
+  for (const auto& e : extra_paints_) n += e->manager() ? 1 : 0;
+  return n;
 }
 
 void Desktop::open_task_manager() {
@@ -148,14 +243,42 @@ void Desktop::open_task_manager() {
   }
 }
 
-void Desktop::open_text_editor() {
-  if (notepad_.manager()) notepad_.activate();
-  else windows_.add_window(&notepad_);
+Notepad* Desktop::open_text_editor() { return open_instance(notepad_, extra_notepads_, &Desktop::setup_notepad); }
+
+Paint* Desktop::open_paint() { return open_instance(paint_, extra_paints_, &Desktop::setup_paint); }
+
+Notepad* Desktop::editor_for(StringView path) {
+  Notepad* found = nullptr;
+  window_.locked([&] {
+    Notepad* empty = nullptr;
+    auto look = [&](Notepad& n) {
+      if (!n.manager()) return;
+      if (n.path().equals(path)) found = &n;
+      else if (!empty && n.path().empty() && !n.editor().modified() && n.editor().text().empty()) empty = &n;
+    };
+    look(notepad_);
+    for (auto& e : extra_notepads_) look(*e);
+    if (!found) found = empty ? empty : open_text_editor();
+    if (found) found->activate();
+  });
+  return found;
 }
 
-void Desktop::open_paint() {
-  if (paint_.manager()) paint_.activate();
-  else windows_.add_window(&paint_);
+Paint* Desktop::paint_for(StringView path) {
+  Paint* found = nullptr;
+  window_.locked([&] {
+    Paint* blank = nullptr;
+    auto look = [&](Paint& p) {
+      if (!p.manager()) return;
+      if (p.path().equals(path)) found = &p;
+      else if (!blank && p.path().empty() && !p.canvas().modified()) blank = &p;
+    };
+    look(paint_);
+    for (auto& e : extra_paints_) look(*e);
+    if (!found) found = blank ? blank : open_paint();
+    if (found) found->activate();
+  });
+  return found;
 }
 
 void Desktop::open_media_player() {
@@ -174,21 +297,21 @@ void Desktop::on_task_manager(void* self, Control&) { static_cast<Desktop*>(self
 void Desktop::on_paint(void* self, Control&) { static_cast<Desktop*>(self)->open_paint(); }
 void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self)->open_media_player(); }
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
-void Desktop::on_explorer_file(void* self, Control&) {
+void Desktop::on_explorer_file(void* self, Control& sender) {
   auto* d = static_cast<Desktop*>(self);
-  if (Paint::is_picture_name(d->explorer_.opened_file())) {  // pictures open in Paint, everything else as text
-    d->paint_.open_file(d->explorer_.opened_file());
-    d->open_paint();
+  const StringView file = static_cast<FileExplorer&>(sender).opened_file();   // (only explorers fire this)
+  if (Paint::is_picture_name(file)) {  // pictures open in Paint, everything else as text
+    if (Paint* paint = d->paint_for(file)) paint->open_file(file);
     return;
   }
-  if (MediaPlayer::is_media_name(d->explorer_.opened_file())) {   // sound and video open in the media player
+  if (MediaPlayer::is_media_name(file)) {   // sound and video open in the media player
     d->open_media_player();
-    d->media_player_.open_file(d->explorer_.opened_file());
+    d->media_player_.open_file(file);
     return;
   }
-  d->notepad_.open_file(d->explorer_.opened_file());
-  d->open_text_editor();
+  if (Notepad* editor = d->editor_for(file)) editor->open_file(file);
 }
+void Desktop::on_files_changed(void* self, Control&) { static_cast<Desktop*>(self)->refresh_explorers(); }
 void Desktop::on_explorer(void* self, Control&) { static_cast<Desktop*>(self)->open_explorer(); }
 void Desktop::on_about(void* self, Control&) { static_cast<Desktop*>(self)->open_about(); }
 void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->ask_shut_down(); }
@@ -245,6 +368,7 @@ bool Desktop::step(uint64_t uptime_us) {
 void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   input_.pump();
+  if (__atomic_exchange_n(&reap_needed_, false, __ATOMIC_ACQ_REL)) reap_closed();
   // Watchdog: a changed window that the render thread has not redrawn for seconds means that thread (or
   // whatever it is waiting for - the GPU, the UI lock) is stuck. Say so where it can be read afterwards.
   if (render_loop_.running() && diagnostic_) {

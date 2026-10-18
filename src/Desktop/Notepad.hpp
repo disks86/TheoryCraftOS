@@ -74,6 +74,9 @@ class Notepad : public gui::Frame {
   gui::Label& status_label() { return status_; }
   gui::Label& position_label() { return position_; }
 
+  // A file dragged here from a file explorer is opened (just like File > Open).
+  bool accepts_drop(StringView text, int32_t, int32_t, const gui::Control*) const override { return fs_ && !text.empty() && text[0] == '/'; }
+  void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { open_file(text); }
   bool on_key(const gui::KeyArgs& args) override;
 
  private:

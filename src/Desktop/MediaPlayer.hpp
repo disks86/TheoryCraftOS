@@ -75,6 +75,9 @@ class MediaPlayer : public gui::Frame {
   audio::AudioPlayer* audio_player() { return audio_player_.get(); }
   video::VideoPlayer* video_player() { return video_player_.get(); }
 
+  // A sound or video file dragged here from a file explorer is opened (just like File > Open).
+  bool accepts_drop(StringView text, int32_t, int32_t, const gui::Control*) const override { return fs_ && is_media_name(text); }
+  void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { open_file(text); }
   bool on_key(const gui::KeyArgs& args) override;
 
  private:

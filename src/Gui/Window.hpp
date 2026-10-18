@@ -100,6 +100,16 @@ class Window final : public Control {
   void mouse_wheel(int32_t x, int32_t y, int32_t delta);
   void key(const KeyArgs& args);  // a key press (or repeat)
 
+  // --- Drag and drop between controls (also in different windows of the manager). A control that sees the mouse move far enough
+  // with the button held calls begin_drag() with what it carries (`text`, e.g. a file's full path); the pointer then shows the last
+  // part of the text. When the button is released the controls under the pointer are asked accept_drop() (the nearest first) and the
+  // first that says yes gets on_drop(). Escape cancels. Only one drag at a time; false if one is running or `source` is not the
+  // control that holds the mouse.
+  bool begin_drag(Control* source, StringView text);
+  bool dragging() const { return drag_source_ != nullptr; }
+  StringView drag_text() const { return drag_text_.view(); }
+  void cancel_drag();
+
   // --- Focus. Tab / Shift+Tab move it through focusable controls in tree order.
   Control* focus() const { return focus_; }
   void set_focus(Control* control);
@@ -127,6 +137,8 @@ class Window final : public Control {
   Control* target_at(int32_t x, int32_t y, Point* origin);
   void deliver_move(Control* target, const Point& origin, int32_t x, int32_t y);
   static bool is_inside(const Control* ancestor, const Control* c);
+  void finish_drag(int32_t x, int32_t y);
+  static void run_drop(void* window, Control& target);
   uint32_t collect_focusable(Control* from, Control** out, uint32_t count, uint32_t capacity);
 
   struct Pending {
@@ -145,6 +157,12 @@ class Window final : public Control {
   Control* captured_ = nullptr;
   Control* popup_ = nullptr;
   Control* popup_owner_ = nullptr;
+  Control* drag_source_ = nullptr;
+  String drag_text_;
+  Control* drop_target_ = nullptr;   // the drop waiting for the handler thread
+  const Control* drop_source_ = nullptr;
+  String drop_text_;
+  Point drop_point_;
   kernel::Clipboard* clipboard_ = nullptr;
   Point cursor_;
   bool cursor_visible_ = false;

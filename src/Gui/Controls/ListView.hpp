@@ -92,9 +92,16 @@ class ListView : public Control {
   // Without a clock only Enter activates.
   void set_clock(const uint64_t* now_us) { UiGuard lock(this); clock_ = now_us; }
 
+  // --- Dragging items out (see Window::begin_drag). Pressing an item and moving the mouse a few pixels asks the function what the item
+  // carries; it returns false (the item cannot be dragged) or fills *text. Runs under the UI lock on the input thread.
+  using DragSource = bool (*)(void* context, int32_t item, String* text);
+  void set_drag_source(DragSource source, void* context) { UiGuard lock(this); drag_source_ = source; drag_context_ = context; }
+
   // --- Geometry (for painting and tests)
   Rect2D body_rect() const;    // where the items are
   Rect2D header_rect() const;  // details view only
+  // The item at a point (this control's coordinates), -1 for none.
+  int32_t item_at_point(int32_t x, int32_t y) const { return item_at(x, y); }
   // Where an item is, in this control's coordinates (scrolled); false if it does not exist.
   bool item_rect(uint32_t item, Rect2D* out) const;
   int32_t scroll_x() const { return scroll_x_; }
@@ -170,6 +177,9 @@ class ListView : public Control {
   int32_t rename_item_ = -1;
   String rename_result_;
   const uint64_t* clock_ = nullptr;
+  DragSource drag_source_ = nullptr;
+  void* drag_context_ = nullptr;
+  int32_t press_item_ = -1, press_x_ = 0, press_y_ = 0;   // the item the left button went down on, until it is released or dragged
   int32_t last_click_item_ = -1;
   uint64_t last_click_us_ = 0;
   String text_;  // scratch for painting

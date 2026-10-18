@@ -91,6 +91,9 @@ class Paint : public gui::Frame {
   gui::Label& position_label() { return position_; }
   gui::Label& zoom_label() { return zoom_label_; }
 
+  // A file dragged here from a file explorer is opened (just like File > Open).
+  bool accepts_drop(StringView text, int32_t, int32_t, const gui::Control*) const override { return fs_ && is_picture_name(text); }
+  void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { open_file(text); }
   bool on_key(const gui::KeyArgs& args) override;
 
  private:

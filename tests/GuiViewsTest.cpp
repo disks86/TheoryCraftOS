@@ -4031,6 +4031,101 @@ static void test_application_context_menus() {
   CHECK(a.live == 0);
 }
 
+// Several windows of one program, and files dragged from one file explorer to another and onto an editor.
+static Point item_point(allocators::IAllocator& a, desktop::FileExplorer& e, const char* name) {
+  for (uint32_t i = 0; i < e.view().item_count(); ++i) {
+    String text(a);
+    e.view().item_text(i, 0, &text);
+    Rect2D row;
+    if (text.view().equals(name) && e.view().item_rect(i, &row)) {
+      const Point o = e.view().window_origin();
+      return {o.x + row.x + 30, o.y + row.y + 5};
+    }
+  }
+  return {-1, -1};
+}
+
+static void test_desktop_multiple_windows() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/a.txt", "dragged");
+    CHECK(fs.create_directory("/dest") == filesystem::Status::Ok);
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+
+    // Every Start menu entry opens one more window; closing the extra ones destroys them.
+    desktop::FileExplorer* ex1 = d.open_explorer();
+    CHECK(ex1 == &d.explorer() && d.explorer_count() == 1);
+    ex1->set_bounds({0, 0, 380, 250});
+    desktop::FileExplorer* ex2 = d.open_explorer();
+    CHECK(ex2 && ex2 != ex1 && d.explorer_count() == 2 && d.windows().window_count() == 2);
+    ex2->set_bounds({400, 0, 380, 250});
+    CHECK(ex2->open_folder("/dest"));
+    d.open_text_editor()->set_bounds({0, 270, 300, 300});
+    desktop::Notepad* second = d.open_text_editor();
+    CHECK(second != &d.notepad() && d.text_editor_count() == 2);
+    second->set_bounds({310, 270, 300, 300});
+    w.layout();
+
+    // Drag a.txt from the first explorer over to the second one: it moves into /dest, and both lists show it.
+    const Point from = item_point(a, *ex1, "a.txt");
+    CHECK(from.x >= 0);
+    w.mouse_move(from.x, from.y);
+    w.mouse_button(from.x, from.y, MouseButton::Left, true);
+    w.mouse_move(from.x + 3, from.y);
+    CHECK(!w.dragging());                                  // too short for a drag yet
+    w.mouse_move(500, 150);
+    CHECK(w.dragging() && w.drag_text().equals("/a.txt"));
+    w.mouse_button(500, 150, MouseButton::Left, false);
+    CHECK(!w.dragging());
+    filesystem::DirectoryEntry entry;
+    CHECK(fs.stat("/dest/a.txt", &entry) == filesystem::Status::Ok && fs.stat("/a.txt", &entry) == filesystem::Status::NotFound);
+    CHECK(item_point(a, *ex1, "a.txt").x < 0 && item_point(a, *ex2, "a.txt").x >= 0);
+
+    // Escape cancels a drag; dropping on a place that takes nothing does nothing.
+    const Point back = item_point(a, *ex2, "a.txt");
+    w.mouse_move(back.x, back.y);
+    w.mouse_button(back.x, back.y, MouseButton::Left, true);
+    w.mouse_move(back.x, back.y + 40);
+    CHECK(w.dragging());
+    KeyArgs esc;
+    esc.usage = hardware::key::kEscape;
+    w.key(esc);
+    CHECK(!w.dragging());
+    w.mouse_button(back.x, back.y + 40, MouseButton::Left, false);
+    CHECK(fs.stat("/dest/a.txt", &entry) == filesystem::Status::Ok);
+
+    // Dropped on the second text editor, the file opens there and nowhere else.
+    w.mouse_move(back.x, back.y);
+    w.mouse_button(back.x, back.y, MouseButton::Left, true);
+    w.mouse_move(450, 400);
+    CHECK(w.dragging());
+    w.mouse_button(450, 400, MouseButton::Left, false);
+    CHECK(second->path().equals("/dest/a.txt") && second->editor().text().equals("dragged") && d.notepad().path().empty());
+
+    // A folder cannot be dropped into itself, and a name that is taken is not overwritten.
+    CHECK(!ex1->move_into("/dest", "/dest"));
+    make_file(fs, "/a.txt", "other");
+    CHECK(!ex1->move_into("/a.txt", "/dest") && fs.stat("/a.txt", &entry) == filesystem::Status::Ok);
+
+    // Opening a file from an explorer uses an editor that is empty, or opens a new one when all hold something.
+    d.step(1000000);
+    CHECK(d.text_editor_count() == 2);
+    ex2->close();
+    second->close();
+    d.step(2000000);
+    CHECK(d.explorer_count() == 1 && d.text_editor_count() == 1);
+    CHECK(d.notice_dialog().showing());       // (the refused moves above said why) - besides it only the first explorer and editor remain
+    CHECK(d.windows().window_count() == 3);
+    CHECK(d.open_text_editor() != &d.notepad());
+    CHECK(d.text_editor_count() == 2);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4108,6 +4203,7 @@ int main() {
   test_list_copy();
   test_file_dialog();
   test_desktop_file_dialog();
+  test_desktop_multiple_windows();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

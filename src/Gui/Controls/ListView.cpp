@@ -561,6 +561,9 @@ void ListView::on_mouse_down(const MouseArgs& args) {
     return;
   }
   select_item(item);
+  press_item_ = item;
+  press_x_ = args.x;
+  press_y_ = args.y;
   const uint64_t now = clock_ ? __atomic_load_n(clock_, __ATOMIC_RELAXED) : 0;
   if (clock_ && item == last_click_item_ && now - last_click_us_ <= kDoubleClickUs) {
     last_click_item_ = -1;
@@ -573,9 +576,20 @@ void ListView::on_mouse_down(const MouseArgs& args) {
 
 void ListView::on_mouse_move(const MouseArgs& args) {
   if (resizing_ >= 0) set_column_width(static_cast<uint32_t>(resizing_), resize_origin_width_ + args.x - resize_origin_x_);
+  if (press_item_ < 0 || !drag_source_) return;
+  const int32_t dx = args.x - press_x_, dy = args.y - press_y_;
+  if (dx * dx + dy * dy < 6 * 6) return;
+  const int32_t item = press_item_;
+  press_item_ = -1;
+  String text(allocator());
+  if (!drag_source_(drag_context_, item, &text) || !window() || !window()->begin_drag(this, text.view())) return;
+  last_click_item_ = -1;   // a drag is not the first half of a double click
 }
 
-void ListView::on_mouse_up(const MouseArgs&) { resizing_ = -1; }
+void ListView::on_mouse_up(const MouseArgs&) {
+  resizing_ = -1;
+  press_item_ = -1;
+}
 
 void ListView::on_mouse_wheel(const MouseArgs& args) {
   const int32_t direction = args.wheel > 0 ? -1 : args.wheel < 0 ? 1 : 0;

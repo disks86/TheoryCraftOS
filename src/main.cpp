@@ -129,7 +129,7 @@ static void on_storage_change(void* context, StringView text) {
   console::debug_puts("Storage: ");
   console::debug_puts(text);
   console::debug_puts("\n");
-  static_cast<desktop::Desktop*>(context)->explorer().refresh();
+  static_cast<desktop::Desktop*>(context)->refresh_explorers();
 }
 
 // File > Eject in the file explorer: safely remove the drive holding a volume. The answer is what the notice dialog says.

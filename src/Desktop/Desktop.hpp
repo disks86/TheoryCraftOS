@@ -19,7 +19,8 @@
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
 // upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager", "Text Editor", "Paint", "Media Player",
-// and "About" (ordinary windows) and "Shut Down...", which asks for confirmation in a modal dialog and then only
+// and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
+// and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
 // power-off once the desktop loop returns.
 #pragma once
@@ -40,6 +41,8 @@
 #include "Gui/NoticeDialog.hpp"
 #include "Gui/RenderLoop.hpp"
 #include "Gui/Window.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
@@ -81,13 +84,7 @@ class Desktop {
   gui::Frame& explorer_window() { return explorer_; }
   FileExplorer& explorer() { return explorer_; }
   // The filesystem the file explorer browses (nullptr: none). It must outlive the desktop.
-  void set_file_system(filesystem::IFileSystem* fs) {
-    explorer_.set_file_system(fs);
-    notepad_.set_file_system(fs);
-    paint_.set_file_system(fs);
-    media_player_.set_file_system(fs);
-    file_dialog_.set_file_system(fs);
-  }
+  void set_file_system(filesystem::IFileSystem* fs);
   Paint& paint() { return paint_; }
   MediaPlayer& media_player() { return media_player_; }
   // The machine's sound mixer, video codecs and clock for the media player (any may be nullptr). They must outlive the desktop.
@@ -103,18 +100,25 @@ class Desktop {
   PrintDialog& print_dialog() { return print_dialog_; }
   // The printers the print dialog offers and sends jobs to (nullptr: none). It must outlive the desktop.
   void set_print_service(IPrintService* service) { print_dialog_.set_print_service(service); }
-  // Opens the paint program, or brings it forward (restoring it if minimized).
-  void open_paint();
+  // Opens a paint window: the first one is paint() (when that is closed), further ones are made as needed and go away when closed.
+  // Returns the window (nullptr if memory ran out).
+  Paint* open_paint();
   Notepad& notepad() { return notepad_; }
-  // Opens the text editor, or brings it forward (restoring it if minimized).
-  void open_text_editor();
+  // Opens a text editor window: the first one is notepad() (when that is closed), further ones are made as needed and go away when closed.
+  Notepad* open_text_editor();
   TaskManager& task_manager() { return task_manager_; }
   // The machine's figures for the task manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { task_manager_.set_monitor(monitor); }
   // Opens the task manager, or brings it forward (restoring it if minimized); it refreshes once a second meanwhile.
   void open_task_manager();
-  // Opens the file explorer window, or brings it forward (restoring it if minimized).
-  void open_explorer();
+  // Opens a file explorer window: the first one is explorer() (when that is closed), further ones are made as needed and go away when closed.
+  FileExplorer* open_explorer();
+  // Reads the folder of every open file explorer again (files moved in one show up in the other).
+  void refresh_explorers();
+  // How many windows of each kind are open right now.
+  uint32_t explorer_count() const;
+  uint32_t text_editor_count() const;
+  uint32_t paint_count() const;
   // Opens the About window, or brings it forward (restoring it if minimized).
   void open_about();
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
@@ -149,12 +153,26 @@ class Desktop {
   static void on_media_player(void* self, gui::Control&);
   static void on_text_editor(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
+  static void on_files_changed(void* self, gui::Control&);
+  static void on_extra_closed(void* self, gui::Control&);
   static void on_task_manager(void* self, gui::Control&);
   static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
 
+  // Windows beyond the first of their kind (the members below): made when asked for, destroyed from pump() once they are closed.
+  template <class T>
+  T* open_instance(T& first, List<UniquePointer<T>>& extras, void (Desktop::*setup)(T&));
+  void setup_explorer(FileExplorer& explorer);
+  void setup_notepad(Notepad& notepad);
+  void setup_paint(Paint& paint);
+  void reap_closed();
+  // The text editor / paint window to open a file in: the one that already shows it, an open empty one, or a new one.
+  Notepad* editor_for(StringView path);
+  Paint* paint_for(StringView path);
+
+  allocators::IAllocator& allocator_;
   gui::Theme theme_;
   gui::Window window_;
   gui::InputPump input_;
@@ -179,6 +197,11 @@ class Desktop {
   MediaPlayer media_player_;
   gui::Frame about_;
   gui::Label about_lines_[3];
+  filesystem::IFileSystem* fs_ = nullptr;
+  List<UniquePointer<FileExplorer>> extra_explorers_;
+  List<UniquePointer<Notepad>> extra_notepads_;
+  List<UniquePointer<Paint>> extra_paints_;
+  bool reap_needed_ = false;
   ClockSource clock_source_ = nullptr;
   void* clock_context_ = nullptr;
   void (*diagnostic_)(StringView) = nullptr;

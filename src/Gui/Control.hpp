@@ -150,6 +150,12 @@ class Control {
   // Called just before the menu opens for a click at (x, y) of this control: a list selects the item under the pointer.
   virtual void prepare_context_menu(int32_t /*x*/, int32_t /*y*/) {}
 
+  // --- Drag and drop (see Window::begin_drag). The window offers a dropped item - `text`, e.g. the path of a file - to the control under the
+  // pointer and then to each control around it, until one accepts. (x, y) is the pointer in this control's coordinates, `source` the control
+  // the drag started in (it may be this one). on_drop() runs on the handler thread (see Handler), like a fired handler.
+  virtual bool accepts_drop(StringView /*text*/, int32_t /*x*/, int32_t /*y*/, const Control* /*source*/) const { return false; }
+  virtual void on_drop(StringView /*text*/, int32_t /*x*/, int32_t /*y*/, const Control* /*source*/) {}
+
   // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
   Control* hit_test(int32_t x, int32_t y);
 

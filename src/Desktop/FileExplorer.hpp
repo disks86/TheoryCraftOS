@@ -105,6 +105,18 @@ class FileExplorer : public gui::Frame {
   // The dialog that warnings, information and errors are shown in (nullptr: the status bar says them instead). It must outlive the explorer.
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
+  // --- Drag and drop. Files and folders can be dragged out of the list and dropped on another explorer (or on this one): onto a folder of the
+  // list they move into it, anywhere else into the folder that is shown. Between two volumes they are copied and then removed. A drop that
+  // changed something fires the handler set with on_files_changed - the desktop uses it to refresh every explorer, as the other explorer
+  // (the one the item came from) now shows something stale.
+  void on_files_changed(gui::Handler handler) { files_changed_ = handler; }
+  // Moves the file or folder at `source` (a full path) into the folder `folder`. False (with a notice) if that fails.
+  bool move_into(StringView source, StringView folder);
+  // Copies the settings the windows share - the login handlers, the eject function - from another explorer.
+  void copy_settings_from(const FileExplorer& other);
+  bool accepts_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) const override;
+  void on_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) override;
+
   StringView path() const { return path_.view(); }
   gui::ListView& view() { return view_; }
   gui::BreadcrumbBar& address_bar() { return address_; }
@@ -152,6 +164,8 @@ class FileExplorer : public gui::Frame {
   static void on_refresh_menu(void* self, gui::Control&);
   static void on_address_menu(void* self, gui::Control&);
   bool copy_selected_path();
+  static bool on_drag_item(void* self, int32_t item, String* text);
+  Status copy_tree(StringView from, StringView to, uint32_t depth);
   static void on_activated(void* self, gui::Control&);
   static void on_selection(void* self, gui::Control&);
   bool load(StringView path);   // (with navigation_ held)
@@ -175,7 +189,7 @@ class FileExplorer : public gui::Frame {
   String path_;
   String scratch_;
   String opened_file_;
-  gui::Handler file_opened_;
+  gui::Handler file_opened_, files_changed_;
   gui::NoticeDialog* notices_ = nullptr;
   gui::MessageDialog delete_dialog_;
   String delete_path_;   // what the dialog asks about
