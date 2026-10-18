@@ -41,10 +41,23 @@ class IMidiSink {
   virtual void send(uint8_t status, uint8_t data1, uint8_t data2) = 0;
   // Silences everything and puts every channel back to its start values.
   virtual void reset() = 0;
+  // Sends on what send() has collected (a USB device takes its messages in batches). A sink that sends at once does nothing.
+  virtual void flush() {}
 
  protected:
   constexpr IMidiSink() = default;
   ~IMidiSink() = default;
+};
+
+// A sink for the notes that is real hardware, which may come and go (a USB synthesizer is plugged in and pulled out).
+class IMidiOutput : public IMidiSink {
+ public:
+  // True while there is something to send to that makes sound. A song is played on the hardware only when this is true when it starts.
+  virtual bool available() const = 0;
+
+ protected:
+  constexpr IMidiOutput() = default;
+  ~IMidiOutput() = default;
 };
 
 // Sounds that are playing stop (all sound off, all notes off on every channel), without touching the programs and volumes.
@@ -53,6 +66,7 @@ inline void silence(IMidiSink& sink) {
     sink.send(static_cast<uint8_t>(0xB0 | channel), kControllerAllSoundOff, 0);
     sink.send(static_cast<uint8_t>(0xB0 | channel), kControllerAllNotesOff, 0);
   }
+  sink.flush();
 }
 
 }  // namespace midi

@@ -70,6 +70,7 @@ void MidiPcmSource::seek_to(uint64_t frame) {
     const uint8_t kind = e.status & 0xF0;
     if (kind != 0x80 && kind != 0x90) apply(e);
   }
+  if (sink_) sink_->flush();
   cursor_ = frame;
 }
 
@@ -98,6 +99,7 @@ uint32_t MidiPcmSource::read(uint64_t frame, ByteView out) {
     }
     done += n;
   }
+  if (sink_) sink_->flush();
   cursor_ = frame + want;
   return static_cast<uint32_t>(want * 4);
 }

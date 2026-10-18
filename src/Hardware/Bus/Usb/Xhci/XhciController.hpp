@@ -64,6 +64,7 @@ class XhciController final : public IXhciController {
   bool start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                           uint8_t interval) override;
   bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) override;
+  bool start_bulk_in_stream(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
   bool start_bulk_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) override;
   bool bulk_transfer(uint32_t port, uint8_t endpoint_address, ByteView data, uint32_t* transferred) override;
   bool reset_bulk_endpoint(uint32_t port, uint8_t endpoint_address) override;
@@ -163,6 +164,7 @@ class XhciController final : public IXhciController {
   void handle_event(const xhci::Trb& event);
   void pump_events();
   void arm_endpoint(Device& d, InterruptEndpoint& e);
+  bool start_in_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval, bool bulk);
   void release_device(Device& d);
 
   bool dma_reachable(const void* p) const;

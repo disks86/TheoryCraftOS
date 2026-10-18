@@ -76,6 +76,14 @@ class IUsbHostController : public IHardware {
   // the endpoint and returns true. Never blocks.
   virtual bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) = 0;
 
+  // A bulk IN endpoint that is received from without waiting (USB MIDI input: the device sends when a key is pressed, which may be never):
+  // started like an interrupt IN endpoint, and read with poll_interrupt_in(), which hands out what has arrived and never blocks. The controller
+  // keeps one transfer of `max_packet` bytes queued at all times. Controllers that cannot do this refuse (the default); the others are xHCI and EHCI.
+  virtual bool start_bulk_in_stream(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+    (void)port; (void)endpoint_address; (void)max_packet;
+    return false;
+  }
+
   // --- Bulk endpoints (mass storage and the like).
   // Configures a bulk endpoint of an enumerated device (IN when bit 7 of the
   // address is set). Repeating the call for a running endpoint is a no-op.

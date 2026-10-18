@@ -1804,7 +1804,8 @@ static void test_media_player() {
         }
         CHECK(sound_player.audio_player()->position() > 1000);
         sound_player.close_media();
-        struct Sink final : midi::IMidiSink {
+        struct Sink final : midi::IMidiOutput {
+          bool available() const override { return true; }
           int notes = 0, silences = 0;
           void send(uint8_t status, uint8_t d1, uint8_t) override {
             if ((status & 0xF0) == 0x90) ++notes;

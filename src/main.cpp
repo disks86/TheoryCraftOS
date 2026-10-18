@@ -23,6 +23,7 @@
 #include "Hardware/Bus/Pci/PciBar.hpp"
 #include "Hardware/MmioMapper.hpp"
 #include "Hardware/MidiDevice/X86MidiPortIo.hpp"
+#include "Hardware/MidiDevice/Usb/UsbMidiService.hpp"
 #include "Kernel/Paging.hpp"
 #include "CPUScheduler/Scheduler.hpp"
 #include "console.hpp"
@@ -644,6 +645,23 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
   wait_for_key(st, input, faults || warnings ? 15000000 : 1500000);
 
+  // MIDI (set up before the desktop, which is gone first: songs on the hardware are silenced when the player closes): an MPU-401 port if the machine has one, and the USB MIDI devices (keyboards, controllers, synthesizers). A song is played on the hardware
+  // that makes sound when there is some, else synthesized by the media player; what a keyboard plays goes to the same hardware or, with none, to
+  // a software synthesizer through the mixer.
+  hardware::X86MidiPortIo midi_ports;
+  hardware::Mpu401Output midi_usual(midi_ports, hardware::Mpu401Output::kUsualBase);   // (0x300, the other base, is a network card's)
+  hardware::UsbMidiService usb_midi(&usb, mixer.get(), shared_allocator);
+  if (midi_usual.initialize()) {
+    usb_midi.set_fallback_output(&midi_usual);
+    Entry(Level::Ok, "MIDI").text("MPU-401 output at port 0x330");
+  }
+  if (!usb_midi.start()) Entry(Level::Warning, "MIDI").text("could not start the USB MIDI service; keyboards plugged in later are not seen");
+  for (uint32_t i = 0; i < usb_midi.device_count(); ++i) {
+    hardware::UsbMidiService::DeviceInfo info;
+    if (usb_midi.device_info(i, &info))
+      Entry(Level::Ok, "MIDI").text(info.name).text(info.input ? (info.output ? ": keys and output" : ": keys") : ": output").text(info.synthesizer ? ", a synthesizer" : "");
+  }
+
   // The desktop: runs until Shut Down is chosen from the Start menu (or, with no display, until a key).
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer) {
@@ -695,15 +713,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
-    // MIDI files go to MIDI hardware when the machine has an MPU-401 port; otherwise the media player synthesizes them.
-    hardware::X86MidiPortIo midi_ports;
-    hardware::Mpu401Output midi_usual(midi_ports, hardware::Mpu401Output::kUsualBase);   // (0x300, the other base, is a network card's)
-    if (midi_usual.initialize()) {
-      desktop.set_midi_output(&midi_usual);
-      Entry(Level::Ok, "MIDI").text("MPU-401 output at port 0x330");
-    } else {
-      Entry(Level::Info, "MIDI").text("no MIDI hardware found; MIDI files are synthesized in software");
-    }
+    desktop.set_midi_output(&usb_midi);
     desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());
     explorer_files.set_notifier(on_storage_change, &desktop);

@@ -39,7 +39,7 @@ class IMidiPortIo {
   ~IMidiPortIo() = default;
 };
 
-class Mpu401Output final : public midi::IMidiSink {
+class Mpu401Output final : public midi::IMidiOutput {
  public:
   static constexpr uint16_t kUsualBase = 0x330;
   static constexpr uint32_t kSpinLimit = 200000;   // status reads to wait for the interface
@@ -49,6 +49,7 @@ class Mpu401Output final : public midi::IMidiSink {
   // Resets the interface and puts it in UART mode; false if no MPU-401 answers at the base (nothing is changed then).
   bool initialize();
   bool present() const { return present_; }
+  bool available() const override { return present_; }
   uint16_t base() const { return base_; }
 
   void send(uint8_t status, uint8_t data1, uint8_t data2) override;

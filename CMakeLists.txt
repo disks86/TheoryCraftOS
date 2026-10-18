@@ -285,6 +285,10 @@ add_executable(BOOTX64
   src/Midi/MidiStream.cpp
   src/Midi/SoftwareSynth.cpp
   src/Hardware/MidiDevice/Mpu401.cpp
+  src/Hardware/MidiDevice/Usb/UsbMidiDescriptors.cpp
+  src/Hardware/MidiDevice/Usb/UsbMidiDevice.cpp
+  src/Hardware/MidiDevice/Usb/UsbMidiService.cpp
+  src/Midi/LiveSynth.cpp
   src/Media/Audio/Pcm.cpp
   src/Media/Audio/Wav.cpp
   src/Media/Audio/Aiff.cpp

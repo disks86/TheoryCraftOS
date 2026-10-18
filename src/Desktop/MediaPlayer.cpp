@@ -193,8 +193,8 @@ bool MediaPlayer::open_source() {
     playing_midi_hardware_ = playing_midi_ = false;
     if (format == media::AudioFileFormat::Midi) {
       playing_midi_ = true;   // on the MIDI hardware if the machine has some, else synthesized
-      playing_midi_hardware_ = midi_output_ != nullptr;
-      sound_ = midi::open_midi_stream(source, allocator(), midi_output_);
+      playing_midi_hardware_ = midi_output_ && midi_output_->available();
+      sound_ = midi::open_midi_stream(source, allocator(), playing_midi_hardware_ ? midi_output_ : nullptr);
     } else {
       sound_ = media::open_audio_stream(source, allocator());
     }

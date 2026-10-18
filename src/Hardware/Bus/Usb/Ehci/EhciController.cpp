@@ -421,6 +421,16 @@ EhciController::Endpoint* EhciController::find_endpoint(Device& d, uint8_t addre
 
 bool EhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
                                         uint8_t /*interval: every frame is polled*/) {
+  return start_in_queue(port, endpoint_address, max_packet, true);
+}
+
+// A bulk IN endpoint with one transfer always waiting: its queue head sits in the asynchronous schedule, where the controller tries it again and
+// again until the device has something to say (read with poll_interrupt_in(), like the interrupt ones).
+bool EhciController::start_bulk_in_stream(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+  return start_in_queue(port, endpoint_address, max_packet, false);
+}
+
+bool EhciController::start_in_queue(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, bool periodic) {
   kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !(endpoint_address & 0x80) || !max_packet) return false;
   Device& d = devices_[port];
@@ -445,11 +455,12 @@ bool EhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
   }
   e->address = endpoint_address;
   e->max_packet = max_packet;
-  e->interrupt = true;
-  e->qh->capabilities |= 0x01;  // start-split mask: micro-frame 0 of every frame
+  e->interrupt = true;   // (read like one)
+  if (periodic) e->qh->capabilities |= 0x01;  // start-split mask: micro-frame 0 of every frame
   fill_qtd(e->qtd, kTokenPidIn, address_of(e->buffer.data()), max_packet, 0, true);
   e->qh->overlay.next = low(address_of(e->qtd));  // armed before the head becomes visible
-  link_periodic(e->qh);
+  if (periodic) link_periodic(e->qh);
+  else link_async(e->qh);
   e->active = true;
   return true;
 }

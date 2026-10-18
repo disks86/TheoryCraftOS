@@ -10,7 +10,7 @@ cxx=${CXX:-g++}
 flags="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I src -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-variable"
 
 # The GUI has player controls, which bring the audio player (and with it the mixer), the video player and the codecs along.
-media="src/Media/*.cpp src/Media/Audio/*.cpp src/Media/Image/*.cpp src/Midi/*.cpp"
+media="src/Media/*.cpp src/Media/Audio/*.cpp src/Media/Image/*.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp"
 gui_audio="src/Hardware/Printer/PrinterTypes.cpp src/Hardware/Printer/TextLayout.cpp src/Hardware/Printer/Halftone.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp $media"
 
 build_and_run() {
@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest UsbMidiTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -68,6 +68,9 @@ for t in "${WANTED[@]}"; do
                  src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp ;;
     MidiTest) build_and_run MidiTest tests/MidiTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp src/Hardware/MidiDevice/Mpu401.cpp ;;
+    UsbMidiTest) build_and_run UsbMidiTest tests/UsbMidiTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp \
+                   src/Midi/LiveSynth.cpp src/Math/FloatMath.cpp src/Hardware/MidiDevice/Usb/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp \
+                   src/Audio/AudioPlayer.cpp ;;
     StreamingTest) build_and_run StreamingTest tests/StreamingTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
                      src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp ;;
     PartitionTest) build_and_run PartitionTest tests/PartitionTest.cpp tests/KernelStubs.cpp src/Hardware/StorageDevice/Partition/PartitionScanner.cpp ;;

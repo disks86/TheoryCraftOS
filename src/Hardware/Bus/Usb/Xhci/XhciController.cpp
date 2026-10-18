@@ -526,8 +526,16 @@ void XhciController::arm_endpoint(Device& d, InterruptEndpoint& e) {
   ring_doorbell(d.slot, e.context_id);
 }
 
-bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet,
-                                        uint8_t interval) {
+bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) {
+  return start_in_endpoint(port, endpoint_address, max_packet, interval, false);
+}
+
+// A bulk IN endpoint kept armed like an interrupt one (the packets are read with poll_interrupt_in()).
+bool XhciController::start_bulk_in_stream(uint32_t port, uint8_t endpoint_address, uint16_t max_packet) {
+  return start_in_endpoint(port, endpoint_address, max_packet, 0, true);
+}
+
+bool XhciController::start_in_endpoint(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval, bool bulk) {
   kernel::ScopedMutex lock_guard(lock_);
   if (port >= ports_ || !devices_[port].present || !(endpoint_address & 0x80)) return false;
   Device& d = devices_[port];
@@ -570,12 +578,12 @@ bool XhciController::start_interrupt_in(uint32_t port, uint8_t endpoint_address,
     if (n > 15) n = 15;
   }
   const ArrayView<uint32_t> ep = context_at(d.input_context, dci + 1);
-  ep[0] = n << 16;
-  ep[1] = (3u << 1) | (7u << 3) | (uint32_t{max_packet} << 16);  // CErr 3, interrupt IN
+  ep[0] = bulk ? 0 : n << 16;
+  ep[1] = (3u << 1) | ((bulk ? 6u : 7u) << 3) | (uint32_t{max_packet} << 16);  // CErr 3, bulk IN or interrupt IN
   const uint64_t ring = e->ring.address() | e->ring.cycle();
   ep[2] = static_cast<uint32_t>(ring);
   ep[3] = static_cast<uint32_t>(ring >> 32);
-  ep[4] = (uint32_t{max_packet} << 16) | max_packet;  // max ESIT payload, average TRB length
+  ep[4] = bulk ? 4096u : (uint32_t{max_packet} << 16) | max_packet;  // (interrupt:) max ESIT payload, average TRB length
 
   Trb completion;
   if (!run_command(reinterpret_cast<uint64_t>(d.input_context.data()),
