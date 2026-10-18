@@ -21,11 +21,22 @@
 
 namespace filesystem {
 
+namespace {
+// Does the path name the root itself ("/", "//", "/./")?
+bool names_root(StringView path) {
+  StringView rest = path, component;
+  while (next_component(&rest, &component))
+    if (!is_dot(component)) return false;
+  return true;
+}
+}  // namespace
+
 struct MountTable::Entry {
   FixedString<kMaxName + 1> name;
   uint32_t owner = 0;
   SharedPointer<IVolume> volume;
   bool gone = false;   // unmounted (set once, read from any thread)
+  bool root = false;   // this volume is what "/" shows (see MountTable::set_root)
 
   bool usable() const { return !__atomic_load_n(&gone, __ATOMIC_ACQUIRE) && volume->present(); }
 };
@@ -62,20 +73,39 @@ class MountTable::MountedDirectory final : public IDirectory {
   UniquePointer<IDirectory> inner_;
 };
 
-// The list of volumes, as it was when the folder was opened.
+// The root folder as it was when it was opened: the root volume's own entries (if there is one) and then the other volumes as folders.
 class MountTable::RootDirectory final : public IDirectory {
  public:
   Status next(DirectoryEntry* entry) override {
+    while (inner_) {
+      const Status status = inner_->next(entry);
+      if (status != Status::Ok) {
+        if (status == Status::EndOfDirectory) break;
+        return status;
+      }
+      bool hidden = false;   // a volume's folder wins over an entry of the root volume with the same name
+      for (uint32_t i = 0; i < count_; ++i) hidden |= names_[i].view().equals_ignore_case(entry->name.view());
+      if (!hidden) return Status::Ok;
+    }
     if (index_ >= count_) return Status::EndOfDirectory;
     *entry = DirectoryEntry();
     entry->name.assign(names_[index_++].view());
     entry->type = NodeType::Directory;
     return Status::Ok;
   }
-  void rewind() override { index_ = 0; }
+  void rewind() override {
+    index_ = 0;
+    if (inner_) inner_->rewind();
+  }
   bool add(StringView name) { return count_ < kMaxMounts && names_[count_++].assign(name); }
+  void set_inner(SharedPointer<Entry> entry, UniquePointer<IDirectory> inner) {
+    entry_ = util::move(entry);
+    inner_ = util::move(inner);
+  }
 
  private:
+  SharedPointer<Entry> entry_;   // (declared first: destroyed last, after the handle that uses the volume)
+  UniquePointer<IDirectory> inner_;
   FixedString<kMaxName + 1> names_[kMaxMounts];
   uint32_t count_ = 0, index_ = 0;
 };
@@ -90,6 +120,34 @@ SharedPointer<MountTable::Entry> MountTable::find(StringView name) const {
   for (const SharedPointer<Entry>& e : entries_.view())
     if (e->name.view().equals_ignore_case(name)) return e;
   return SharedPointer<Entry>();
+}
+
+// The volume a path's first component names: the root volume is not one (its name is not a folder of "/").
+SharedPointer<MountTable::Entry> MountTable::find_folder(StringView name) const {
+  for (const SharedPointer<Entry>& e : entries_.view())
+    if (!e->root && e->name.view().equals_ignore_case(name)) return e;
+  return SharedPointer<Entry>();
+}
+
+SharedPointer<MountTable::Entry> MountTable::root_entry() const {
+  for (const SharedPointer<Entry>& e : entries_.view())
+    if (e->root) return e;
+  return SharedPointer<Entry>();
+}
+
+bool MountTable::set_root(StringView name) {
+  kernel::ScopedMutex guard(mutex_);
+  SharedPointer<Entry> entry = find(name);
+  if (!entry) return false;
+  for (SharedPointer<Entry>& e : entries_.view()) e->root = false;
+  entry->root = true;
+  changed();
+  return true;
+}
+
+bool MountTable::has_root() const {
+  kernel::ScopedMutex guard(mutex_);
+  return static_cast<bool>(root_entry());
 }
 
 bool MountTable::mount(StringView name, SharedPointer<IVolume> volume, uint32_t owner, FixedString<kMaxName + 1>* assigned) {
@@ -197,22 +255,29 @@ Status MountTable::resolve(StringView path, SharedPointer<Entry>* entry, StringV
     found = true;
     break;
   }
-  *is_root = !found;
-  if (!found) return Status::Ok;
-  if (component.equals("..")) return Status::InvalidPath;
+  *is_root = false;
+  if (found && component.equals("..")) return Status::InvalidPath;
   {
     kernel::ScopedMutex guard(mutex_);
-    *entry = find(component);
+    if (found) *entry = find_folder(component);
+    if (!*entry) *entry = root_entry();   // not a volume's folder: it is in the root volume, if there is one
+    else {
+      *rest = remaining.empty() ? StringView("/") : remaining;
+      return Status::Ok;
+    }
   }
-  if (!*entry) return Status::NotFound;
-  *rest = remaining.empty() ? StringView("/") : remaining;
+  if (!*entry) {
+    *is_root = !found;
+    return found ? Status::NotFound : Status::Ok;
+  }
+  *rest = found ? path : StringView("/");
   return Status::Ok;
 }
 
 FileSystemInfo MountTable::info() const {
   FileSystemInfo info;
   info.type_name.assign("mounts");
-  info.read_only = true;
+  info.read_only = !has_root();
   return info;
 }
 
@@ -222,7 +287,7 @@ Status MountTable::open_file(StringView path, OpenMode mode, UniquePointer<IFile
   bool root;
   const Status resolved = resolve(path, &entry, &rest, &root);
   if (resolved != Status::Ok) return resolved;
-  if (root) return Status::IsADirectory;
+  if (root || names_root(path)) return Status::IsADirectory;
   if (!entry->usable()) return Status::NoMedia;
   UniquePointer<IFile> inner;
   const Status status = entry->volume->file_system().open_file(rest, mode, &inner);
@@ -239,12 +304,20 @@ Status MountTable::open_directory(StringView path, UniquePointer<IDirectory>* di
   bool root;
   const Status resolved = resolve(path, &entry, &rest, &root);
   if (resolved != Status::Ok) return resolved;
-  if (root) {
+  if (root || names_root(path)) {   // the root: the root volume's entries (if any) and a folder for every other volume
     UniquePointer<RootDirectory> listing = UniquePointer<RootDirectory>::make(allocator_);
     if (!listing) return Status::OutOfMemory;
+    if (entry) {
+      if (!entry->usable()) return Status::NoMedia;
+      UniquePointer<IDirectory> inner;
+      const Status status = entry->volume->file_system().open_directory("/", &inner);
+      if (status != Status::Ok) return status;
+      listing->set_inner(entry, util::move(inner));
+    }
     {
       kernel::ScopedMutex guard(mutex_);
-      for (const SharedPointer<Entry>& e : entries_.view()) listing->add(e->name.view());
+      for (const SharedPointer<Entry>& e : entries_.view())
+        if (!e->root) listing->add(e->name.view());
     }
     *directory = UniquePointer<IDirectory>(util::move(listing));
     return Status::Ok;
@@ -272,7 +345,7 @@ Status MountTable::stat(StringView path, DirectoryEntry* out) {
   }
   if (!entry->usable()) return Status::NoMedia;
   const Status status = entry->volume->file_system().stat(rest, out);
-  if (status == Status::Ok && rest.equals("/")) out->name.assign(entry->name.view());   // the volume's folder is called by the name it is mounted under
+  if (status == Status::Ok && rest.equals("/") && !entry->root) out->name.assign(entry->name.view());   // the volume's folder is called by the name it is mounted under
   return status;
 }
 

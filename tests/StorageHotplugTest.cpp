@@ -194,6 +194,57 @@ static SharedPointer<CountedVolume> volume_with(allocators::IAllocator& a, const
   return v;
 }
 
+// A root volume: "/" shows its contents plus a folder for each other volume, and the top of the tree can be written.
+static void test_mount_root_volume() {
+  TestAllocator alloc;
+  {
+    MountTable table(alloc);
+    SharedPointer<CountedVolume> data = volume_with(alloc, "/docs/a.txt", "data");
+    write_file(data->ram, "/notes.txt", "notes");
+    data->ram.create_directory("/EFI");   // hidden behind the EFI volume's folder
+    SharedPointer<CountedVolume> boot = volume_with(alloc, "/docs/a.txt", "boot");
+    FixedString<MountTable::kMaxName + 1> data_name, boot_name;
+    CHECK(table.mount("DATA", SharedPointer<IVolume>(data), 1, &data_name) && table.mount("EFI", SharedPointer<IVolume>(boot), 2, &boot_name));
+    data.reset();
+    boot.reset();
+    CHECK(!table.has_root() && table.info().read_only);
+    CHECK(!table.set_root("Nothing") && table.set_root("data") && table.has_root() && !table.info().read_only);
+    std::vector<std::string> root = list(table, "/");
+    CHECK(root.size() == 3 && has(root, "docs") && has(root, "notes.txt") && has(root, "EFI") && !has(root, "DATA"));
+    CHECK(read_text(table, "/notes.txt") == "notes" && read_text(table, "/docs/a.txt") == "data" && read_text(table, "/EFI/docs/a.txt") == "boot");
+    CHECK(read_text(table, "/DATA/notes.txt").empty());   // (the root volume's name is not a folder)
+    DirectoryEntry entry;
+    CHECK_STATUS(table.stat("/", &entry), Status::Ok);
+    CHECK(entry.type == NodeType::Directory && entry.name.empty());
+    CHECK_STATUS(table.stat("/EFI", &entry), Status::Ok);
+    CHECK(entry.name.view().equals("EFI"));
+    // the top of the tree is writable now
+    UniquePointer<IFile> file;
+    uint64_t n = 0;
+    CHECK_STATUS(table.create_directory("/Projects"), Status::Ok);
+    CHECK_STATUS(table.create_directory("/Projects"), Status::AlreadyExists);
+    CHECK_STATUS(table.create_directory("/EFI"), Status::AlreadyExists);
+    CHECK_STATUS(table.open_file("/new.txt", OpenMode::CreateTruncate, &file), Status::Ok);
+    CHECK_STATUS(file->write(0, ConstByteView(reinterpret_cast<const uint8_t*>("xyz"), 3), &n), Status::Ok);
+    file.reset();
+    CHECK(read_text(table, "/new.txt") == "xyz" && has(list(table, "/"), "new.txt") && has(list(table, "/"), "Projects"));
+    CHECK_STATUS(table.rename("/new.txt", "/Projects/moved.txt"), Status::Ok);
+    CHECK(read_text(table, "/Projects/moved.txt") == "xyz");
+    CHECK_STATUS(table.rename("/Projects/moved.txt", "/EFI/x.txt"), Status::Unsupported);   // between volumes
+    CHECK_STATUS(table.remove("/Projects/moved.txt"), Status::Ok);
+    CHECK_STATUS(table.remove("/Projects"), Status::Ok);
+    CHECK_STATUS(table.remove("/"), Status::Unsupported);
+    CHECK_STATUS(table.remove("/EFI"), Status::Unsupported);
+    CHECK_STATUS(table.open_file("/", OpenMode::Read, &file), Status::IsADirectory);
+    CHECK_STATUS(table.stat("/missing", &entry), Status::NotFound);
+    // losing the root volume leaves the folders of the others
+    CHECK(table.unmount("DATA") && !table.has_root());
+    root = list(table, "/");
+    CHECK(root.size() == 1 && has(root, "EFI"));
+  }
+  CHECK(CountedVolume::alive == 0);
+}
+
 static void test_mount_table() {
   TestAllocator alloc;
   {
@@ -437,6 +488,7 @@ int main() {
   test_storage_hotplug();
   test_yank_in_the_middle();
   test_mount_table();
+  test_mount_root_volume();
   test_system_file_system();
   test_boot_time_devices();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

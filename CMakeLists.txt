@@ -376,6 +376,8 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
     -drive if=pflash,format=raw,file=${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     -drive format=raw,file=fat:rw:${ESP_DIR}
+    # A persistent writable FAT32 disk (the `data` target creates it); it appears in the file explorer as "DATA".
+    -drive if=none,id=data,format=raw,file=${CMAKE_BINARY_DIR}/data.img -device virtio-blk-pci,drive=data
     # OS debug output (port 0x402) goes to this terminal and debugcon.log.
     -chardev stdio,id=dbg,logfile=${CMAKE_BINARY_DIR}/debugcon.log,signal=off
     -device isa-debugcon,iobase=0x402,chardev=dbg
@@ -385,18 +387,30 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OVMF_VARS} ${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     COMMAND chmod u+w ${CMAKE_BINARY_DIR}/OVMF_VARS.fd)
 
+  find_program(QEMU_IMG qemu-img)
+  find_program(MKFS_FAT mkfs.fat)
+  if(QEMU_IMG AND MKFS_FAT)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/data.img
+      COMMAND ${QEMU_IMG} create -f raw ${CMAKE_BINARY_DIR}/data.img 256M
+      COMMAND ${MKFS_FAT} -F 32 -n DATA ${CMAKE_BINARY_DIR}/data.img)
+  else()
+    message(WARNING "qemu-img or mkfs.fat not found: no data disk for the run targets")
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/data.img COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR}/data.img)
+  endif()
+  add_custom_target(data DEPENDS ${CMAKE_BINARY_DIR}/data.img)
+
   # `cmake --build build --target run`
   add_custom_target(run COMMAND ${QEMU_COMMON}
-    DEPENDS esp vars USES_TERMINAL)
+    DEPENDS esp vars data USES_TERMINAL)
   # Same, with a virtio-gpu 3D device: QEMU renders through the host's OpenGL (virgl).
   add_custom_target(run-gl COMMAND ${QEMU_COMMON} -vga none -device virtio-gpu-gl-pci -display gtk,gl=on,show-cursor=off
-    DEPENDS esp vars USES_TERMINAL)
+    DEPENDS esp vars data USES_TERMINAL)
   # Starts the gdbstub on :1234 (-s) without halting; use with TCOS_DEBUG_WAIT.
   add_custom_target(debug COMMAND ${QEMU_COMMON} -s
-    DEPENDS esp vars USES_TERMINAL)
+    DEPENDS esp vars data USES_TERMINAL)
   # Freeze the CPU at reset until gdb connects (-S).
   add_custom_target(debug-halted COMMAND ${QEMU_COMMON} -s -S
-    DEPENDS esp vars USES_TERMINAL)
+    DEPENDS esp vars data USES_TERMINAL)
 else()
   message(WARNING "qemu-system-x86_64 or OVMF firmware not found; run/debug targets disabled")
 endif()

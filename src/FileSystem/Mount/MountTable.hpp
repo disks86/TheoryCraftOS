@@ -45,7 +45,10 @@ class IVolume {
 //   - unmount() / unmount_owner() take one away. Anything already open on it keeps working as far as the data is cached by its
 //     filesystem and otherwise fails with Status::NoMedia; the volume itself is freed when the last handle is closed;
 //   - a volume whose present() turns false answers NoMedia before it is unmounted.
-// The root and the volume folders cannot be created, removed or renamed through this filesystem. Safe from any thread.
+// One volume can be made the root volume (set_root): "/" then shows its contents, with a folder for each of the other volumes added
+// (a volume's folder hides an entry of the same name in the root volume), and everything outside those folders lives on the root
+// volume - so there files and folders can be created, removed and renamed at the top. Without a root volume the root and the volume folders
+// cannot be created, removed or renamed through this filesystem. Safe from any thread.
 class MountTable final : public IFileSystem {
  public:
   static constexpr uint32_t kMaxMounts = 32;
@@ -59,6 +62,10 @@ class MountTable final : public IFileSystem {
   bool unmount(StringView name);
   // Unmounts everything mounted with `owner`; returns how many.
   uint32_t unmount_owner(uint32_t owner);
+
+  // Makes the volume called `name` the root volume. False if there is no such volume. It stops being the root when it is unmounted.
+  bool set_root(StringView name);
+  bool has_root() const;
 
   // True if something is open on a volume mounted with `owner` (a file or folder handle, or a call in progress): it cannot be taken away
   // politely.
@@ -86,9 +93,12 @@ class MountTable final : public IFileSystem {
   class MountedDirectory;
   class RootDirectory;
 
-  // The volume a path starts in and the rest of the path within it ("/" when the path names the volume's folder). Null for the root.
+  // The volume a path starts in and the rest of the path within it ("/" when the path names the volume's folder). Without a root volume the
+  // path "/" has no volume (*is_root); with one it is in the root volume.
   Status resolve(StringView path, SharedPointer<Entry>* entry, StringView* rest, bool* is_root) const;
   SharedPointer<Entry> find(StringView name) const;   // (locked)
+  SharedPointer<Entry> find_folder(StringView name) const;   // (locked) a volume other than the root volume
+  SharedPointer<Entry> root_entry() const;                   // (locked)
   void changed() { __atomic_add_fetch(&changes_, 1, __ATOMIC_ACQ_REL); }
 
   allocators::IAllocator& allocator_;

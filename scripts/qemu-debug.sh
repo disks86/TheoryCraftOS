@@ -26,6 +26,13 @@ BUILD=${BUILD_DIR:-$(for d in build cmake-build-debug; do [ -f "$d/CMakeCache.tx
 CMAKE=$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$BUILD/CMakeCache.txt")
 [ -n "${NO_BUILD:-}" ] || "$CMAKE" --build "$BUILD" --target esp vars
 [ -n "${NO_BUILD:-}" ] || rm -f "$BUILD/debugcon.log"
+# A persistent, writable data disk (FAT32, volume "DATA"), created on first use. It shows up in the file explorer next to the boot disk,
+# whose contents QEMU only fakes (fat:rw: is a host folder presented as a disk, not something to keep files on).
+DATA_IMG=${DATA_IMG:-$BUILD/data.img}
+if [ ! -f "$DATA_IMG" ]; then
+  qemu-img create -f raw "$DATA_IMG" "${DATA_SIZE:-256M}" >/dev/null
+  mkfs.fat -F 32 -n DATA "$DATA_IMG" >/dev/null
+fi
 # QEMU_GPU: std (default, Bochs VGA), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).
 case ${QEMU_GPU:-std} in
   gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,show-cursor=off" ;;
@@ -37,5 +44,6 @@ exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=n
   -drive if=pflash,format=raw,readonly=on,file="$(sed -n 's/^OVMF_CODE:FILEPATH=//p' "$BUILD/CMakeCache.txt")" \
   -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
   -drive format=raw,file=fat:rw:"$BUILD/esp" \
+  -drive if=none,id=data,format=raw,file="$DATA_IMG" -device virtio-blk-pci,drive=data \
   -chardev stdio,id=dbg,logfile="$BUILD/debugcon.log",signal=off \
   -device isa-debugcon,iobase=0x402,chardev=dbg -serial null

@@ -239,7 +239,7 @@ static void test_ram() {
 
 // A storage device over a byte array.
 struct MemDisk final : hardware::IStorageDevice {
-  MemDisk(const uint8_t* image, uint64_t length, uint32_t block) : block_size(block) {
+  MemDisk(const uint8_t* image, uint64_t length, uint32_t block, bool writable = false) : block_size(block), can_write(writable) {
     blocks = (length + block - 1) / block;
     data = static_cast<uint8_t*>(calloc(blocks, block));
     memcpy(data, image, length);
@@ -248,16 +248,20 @@ struct MemDisk final : hardware::IStorageDevice {
   const char* name() const override { return "memdisk"; }
   bool initialize() override { return true; }
   void shutdown() override {}
-  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = true; return i; }
+  hardware::StorageInfo info() const override { hardware::StorageInfo i; i.block_count = blocks; i.block_size = block_size; i.read_only = !can_write; return i; }
   hardware::StorageStatistics statistics() const override { return {}; }
   bool read(uint64_t lba, ByteView buffer) override {
     if (buffer.size() % block_size || lba + buffer.size() / block_size > blocks) return false;
     memcpy(buffer.data(), data + lba * block_size, buffer.size());
     return true;
   }
-  bool write(uint64_t, ConstByteView) override { return false; }
+  bool write(uint64_t lba, ConstByteView buffer) override {
+    if (!can_write || buffer.size() % block_size || lba + buffer.size() / block_size > blocks) return false;
+    memcpy(data + lba * block_size, buffer.data(), buffer.size());
+    return true;
+  }
   bool flush() override { return true; }
-  uint8_t* data; uint64_t blocks; uint32_t block_size;
+  uint8_t* data; uint64_t blocks; uint32_t block_size; bool can_write;
 };
 
 // Builds small FAT images the way mkfs and a driver would lay them out.
@@ -535,6 +539,179 @@ static void test_fat_offset() {
   CHECK(a.live == 0);
 }
 
+
+// Writing: create, grow, shrink, rename, remove, long names, directories that outgrow a cluster, a full disk, and a remount that finds it all.
+static void test_fat_write(FatImage::Kind kind, uint32_t block, const char* label) {
+  TestAllocator a;
+  {
+    FatImage im(kind);
+    static const uint16_t existing_long[] = {'Q','u','a','r','t','e','r','l','y',' ','R','e','p','o','r','t',' ','2','0','2','6','.','t','x','t', 0};
+    im.file(im.root, "HELLO   TXT", nullptr, reinterpret_cast<const uint8_t*>("hello fat"), 9);
+    im.file(im.root, "QUARTE~1TXT", existing_long, reinterpret_cast<const uint8_t*>("old"), 3);
+    MemDisk disk(im.img, im.total * 512ull, block, true);
+    UniquePointer<IFileSystem> fsp;
+    CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &fsp), Status::Ok);
+    if (!fsp) { printf("  (%s: mount failed, skipping)\n", label); return; }
+    IFileSystem& fs = *fsp;
+    CHECK(!fs.info().read_only);
+    const uint64_t free_at_start = fs.info().free_bytes;
+    CHECK(free_at_start > 0);
+
+    uint8_t pattern[6000];
+    for (uint32_t i = 0; i < sizeof pattern; ++i) pattern[i] = static_cast<uint8_t>(i * 13 + 5);
+    uint8_t buf[8192]; uint64_t n = 0, len = 0;
+    char l[2048];
+
+    // Create and write; a short lower-case name keeps its case, the listing shows it as given.
+    UniquePointer<IFile> f;
+    CHECK_STATUS(fs.open_file("/new.txt", OpenMode::Read, &f), Status::NotFound);
+    CHECK_STATUS(fs.open_file("/new.txt", OpenMode::CreateOrOpen, &f), Status::Ok);
+    CHECK(f && f->size() == 0);
+    CHECK_STATUS(f->write(0, bytes_of("hello world"), &n), Status::Ok); CHECK(n == 11 && f->size() == 11);
+    CHECK_STATUS(f->write(6, bytes_of("WORLD!!"), &n), Status::Ok); CHECK(n == 7 && f->size() == 13);
+    f.reset();
+    CHECK(read_all(fs, "/NEW.TXT", buf, sizeof buf, &len) && len == 13 && !memcmp(buf, "hello WORLD!!", 13));
+    DirectoryEntry e;
+    CHECK_STATUS(fs.stat("/new.txt", &e), Status::Ok); CHECK(e.name.equals("new.txt") && e.size == 13);
+
+    // A write that starts past the end leaves zeros in the gap; a multi-cluster file reads back whole.
+    CHECK_STATUS(fs.open_file("/big.bin", OpenMode::CreateTruncate, &f), Status::Ok);
+    CHECK_STATUS(f->write(1000, ConstByteView(pattern, sizeof pattern), &n), Status::Ok); CHECK(n == sizeof pattern && f->size() == 1000 + sizeof pattern);
+    CHECK_STATUS(f->read(0, ByteView(buf, 1000), &n), Status::Ok); { bool zeros = n == 1000; for (int i = 0; i < 1000; ++i) zeros &= buf[i] == 0; CHECK(zeros); }
+    CHECK_STATUS(f->read(1000, ByteView(buf, sizeof pattern), &n), Status::Ok); CHECK(n == sizeof pattern && !memcmp(buf, pattern, n));
+    // Shrinking and growing again must not bring back the old bytes.
+    CHECK_STATUS(f->resize(2000), Status::Ok); CHECK(f->size() == 2000);
+    CHECK_STATUS(f->resize(5000), Status::Ok); CHECK(f->size() == 5000);
+    CHECK_STATUS(f->read(1990, ByteView(buf, 20), &n), Status::Ok);
+    { bool ok = n == 20; for (int i = 0; i < 10; ++i) ok &= buf[i] == pattern[990 + i]; for (int i = 10; i < 20; ++i) ok &= buf[i] == 0; CHECK(ok); }
+    CHECK_STATUS(f->resize(0), Status::Ok); CHECK(f->size() == 0);
+    CHECK_STATUS(f->write(0, bytes_of("again"), &n), Status::Ok);
+    f.reset();
+    CHECK(read_all(fs, "/big.bin", buf, sizeof buf, &len) && len == 5 && !memcmp(buf, "again", 5));
+    // CreateTruncate empties an existing file; opening read-only refuses to write.
+    CHECK_STATUS(fs.open_file("/big.bin", OpenMode::CreateTruncate, &f), Status::Ok); CHECK(f->size() == 0); f.reset();
+    CHECK_STATUS(fs.open_file("/hello.txt", OpenMode::Read, &f), Status::Ok);
+    CHECK_STATUS(f->write(0, bytes_of("x"), &n), Status::ReadOnly); CHECK_STATUS(f->resize(0), Status::ReadOnly);
+    f.reset();
+    CHECK_STATUS(fs.open_file("/hello.txt", OpenMode::ReadWrite, &f), Status::Ok);
+    CHECK_STATUS(f->write(0, bytes_of("J"), &n), Status::Ok); f.reset();
+    CHECK(read_all(fs, "/hello.txt", buf, sizeof buf, &len) && len == 9 && !memcmp(buf, "Jello fat", 9));
+    CHECK_STATUS(fs.open_file("/missing", OpenMode::ReadWrite, &f), Status::NotFound);
+    CHECK_STATUS(fs.open_file("/nodir/file", OpenMode::CreateOrOpen, &f), Status::NotFound);
+    CHECK_STATUS(fs.open_file("/new.txt/x", OpenMode::CreateOrOpen, &f), Status::NotADirectory);
+
+    // Long names: mixed case, spaces, many files with the same start (each needs its own ~N alias), non-ASCII.
+    const char* names[] = {"Quarterly Report 2027.txt", "Quarterly Report 2028.txt", "Mixed Case.TXT", "caf\xC3\xA9 \xE2\x82\xAC.txt", "UPPER.TXT", "a.b.c", ".hidden", "Data.Bin"};
+    for (const char* nm : names) {
+      char path[64]; snprintf(path, sizeof path, "/%s", nm);
+      CHECK_STATUS(fs.open_file(path, OpenMode::CreateOrOpen, &f), Status::Ok);
+      CHECK_STATUS(f->write(0, bytes_of(nm), &n), Status::Ok);
+      f.reset();
+    }
+    for (const char* nm : names) {
+      char path[64]; snprintf(path, sizeof path, "/%s", nm);
+      CHECK(read_all(fs, path, buf, sizeof buf, &len) && len == strlen(nm) && !memcmp(buf, nm, len));
+    }
+    CHECK(read_all(fs, "/QUARTERLY REPORT 2026.TXT", buf, sizeof buf, &len) && len == 3);   // the one that was there before
+    list(fs, "/", l, sizeof l);
+    for (const char* nm : names) if (!strstr(l, nm)) { printf("FAILED listing misses %s (%s): %s\n", nm, label, l); ++g_failed; }
+    CHECK_STATUS(fs.open_file("/mixed case.txt", OpenMode::CreateOrOpen, &f), Status::Ok);   // the same name in other case is the same file
+    CHECK(f->size() == strlen("Mixed Case.TXT")); f.reset();
+    CHECK_STATUS(fs.open_file("/bad:name", OpenMode::CreateOrOpen, &f), Status::InvalidPath);
+    CHECK_STATUS(fs.open_file("/trailing.", OpenMode::CreateOrOpen, &f), Status::InvalidPath);
+    CHECK_STATUS(fs.open_file("/../b", OpenMode::CreateOrOpen, &f), Status::InvalidPath);
+
+    // Directories, also one that needs more than a cluster, and files inside them.
+    CHECK_STATUS(fs.create_directory("/docs"), Status::Ok);
+    CHECK_STATUS(fs.create_directory("/docs"), Status::AlreadyExists);
+    CHECK_STATUS(fs.create_directory("/hello.txt"), Status::AlreadyExists);
+    CHECK_STATUS(fs.create_directory("/nope/x"), Status::NotFound);
+    CHECK_STATUS(fs.create_directory("/docs/sub dir"), Status::Ok);
+    list(fs, "/docs", l, sizeof l); CHECK(!strcmp(l, "sub dir/"));
+    list(fs, "/docs/sub dir", l, sizeof l); CHECK(!strcmp(l, ""));
+    for (int i = 0; i < 60; ++i) {
+      char path[64]; snprintf(path, sizeof path, "/docs/sub dir/file number %d.dat", i);
+      CHECK_STATUS(fs.open_file(path, OpenMode::CreateOrOpen, &f), Status::Ok);
+      CHECK_STATUS(f->write(0, ConstByteView(pattern, 100 + i), &n), Status::Ok);
+      f.reset();
+    }
+    { UniquePointer<IDirectory> d; CHECK_STATUS(fs.open_directory("/docs/sub dir", &d), Status::Ok);
+      DirectoryEntry de; int count = 0; while (d->next(&de) == Status::Ok) ++count; CHECK(count == 60); }
+    CHECK(read_all(fs, "/docs/sub dir/file number 59.dat", buf, sizeof buf, &len) && len == 159 && !memcmp(buf, pattern, 159));
+
+    // Remove: not while it has contents or is open; free space comes back.
+    CHECK_STATUS(fs.remove("/docs/sub dir"), Status::NotEmpty);
+    CHECK_STATUS(fs.remove("/nothing"), Status::NotFound);
+    CHECK_STATUS(fs.remove("/"), Status::InvalidPath);
+    CHECK_STATUS(fs.open_file("/new.txt", OpenMode::Read, &f), Status::Ok);
+    CHECK_STATUS(fs.remove("/new.txt"), Status::Busy);
+    CHECK_STATUS(fs.rename("/new.txt", "/renamed.txt"), Status::Busy);
+    f.reset();
+    CHECK_STATUS(fs.remove("/new.txt"), Status::Ok);
+    CHECK_STATUS(fs.stat("/new.txt", &e), Status::NotFound);
+
+    // Rename: in place, across directories, a directory with its contents, onto a taken name, into itself.
+    CHECK_STATUS(fs.rename("/hello.txt", "/Greeting Text.txt"), Status::Ok);
+    CHECK_STATUS(fs.stat("/hello.txt", &e), Status::NotFound);
+    CHECK(read_all(fs, "/greeting text.txt", buf, sizeof buf, &len) && len == 9 && !memcmp(buf, "Jello fat", 9));
+    CHECK_STATUS(fs.rename("/Greeting Text.txt", "/docs/greet.txt"), Status::Ok);
+    CHECK(read_all(fs, "/docs/greet.txt", buf, sizeof buf, &len) && len == 9);
+    CHECK_STATUS(fs.rename("/docs/greet.txt", "/docs/GREET.txt"), Status::Ok);        // only the case changes
+    list(fs, "/docs", l, sizeof l); CHECK(strstr(l, "GREET.txt") && !strstr(l, "greet.txt"));
+    CHECK_STATUS(fs.rename("/docs/greet.txt", "/docs/sub dir/file number 1.dat"), Status::AlreadyExists);
+    CHECK_STATUS(fs.rename("/docs", "/docs/sub dir/inner"), Status::InvalidArgument);
+    CHECK_STATUS(fs.rename("/docs/sub dir", "/moved"), Status::Ok);
+    CHECK_STATUS(fs.stat("/docs/sub dir", &e), Status::NotFound);
+    CHECK(read_all(fs, "/moved/file number 7.dat", buf, sizeof buf, &len) && len == 107);
+    CHECK_STATUS(fs.rename("/nothing", "/x"), Status::NotFound);
+    CHECK_STATUS(fs.rename("/moved", "/nodir/x"), Status::NotFound);
+    for (int i = 0; i < 60; ++i) {
+      char path[64]; snprintf(path, sizeof path, "/moved/file number %d.dat", i);
+      CHECK_STATUS(fs.remove(path), Status::Ok);
+    }
+    CHECK_STATUS(fs.remove("/moved"), Status::Ok);
+
+    // A remount sees everything (the changes are on the device), and both copies of the FAT agree.
+    f.reset();
+    fsp.reset();
+    {
+      const uint32_t fat_bytes = im.fat_sectors * 512;
+      CHECK(!memcmp(disk.data + im.reserved * 512, disk.data + im.reserved * 512 + fat_bytes, fat_bytes));
+      UniquePointer<IFileSystem> again;
+      CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &again), Status::Ok);
+      if (again) {
+        CHECK(read_all(*again, "/Mixed Case.TXT", buf, sizeof buf, &len) && len == strlen("Mixed Case.TXT"));
+        CHECK(read_all(*again, "/docs/greet.txt", buf, sizeof buf, &len) && len == 9 && !memcmp(buf, "Jello fat", 9));
+        CHECK_STATUS(again->stat("/moved", &e), Status::NotFound);
+        list(*again, "/docs", l, sizeof l); CHECK(!strcmp(l, "GREET.txt"));
+        // Clean up what this test made and the free space is what it was (nothing leaked).
+        CHECK_STATUS(again->remove("/docs/GREET.txt"), Status::Ok);
+        CHECK_STATUS(again->remove("/docs"), Status::Ok);
+        for (const char* nm : names) { char path[64]; snprintf(path, sizeof path, "/%s", nm); CHECK_STATUS(again->remove(path), Status::Ok); }
+        CHECK_STATUS(again->remove("/big.bin"), Status::Ok);
+        CHECK_STATUS(again->remove("/Quarterly Report 2026.txt"), Status::Ok);
+        CHECK_STATUS(again->remove("/hello.txt"), Status::NotFound);
+        CHECK(again->info().free_bytes > free_at_start - 3 * 4096);   // (the three files the image started with, and what they take)
+        // A full disk: the write fails and the clusters it took come back.
+        const uint64_t before = again->info().free_bytes;
+        const uint64_t too_big = before + 4096;
+        uint8_t* huge = static_cast<uint8_t*>(calloc(1, too_big));
+        UniquePointer<IFile> w;
+        CHECK_STATUS(again->open_file("/huge.bin", OpenMode::CreateTruncate, &w), Status::Ok);
+        CHECK_STATUS(w->write(0, ConstByteView(huge, too_big), &n), Status::NoSpace);
+        CHECK(w->size() == 0 && again->info().free_bytes == before);
+        w.reset();
+        free(huge);
+        CHECK_STATUS(again->remove("/huge.bin"), Status::Ok);
+        CHECK(again->info().free_bytes == before);
+        CHECK_STATUS(again->flush(), Status::Ok);
+      }
+    }
+    CHECK(a.live == 0);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_paths();
   test_ram();
@@ -544,6 +721,12 @@ int main() {
   test_fat(FatImage::F12, 2048, "FAT12/2048");
   test_fat(FatImage::F16, 2048, "FAT16/2048");
   test_fat(FatImage::F32, 2048, "FAT32/2048");
+  test_fat_write(FatImage::F12, 512, "FAT12 write");
+  test_fat_write(FatImage::F16, 512, "FAT16 write");
+  test_fat_write(FatImage::F32, 512, "FAT32 write");
+  test_fat_write(FatImage::F12, 2048, "FAT12/2048 write");
+  test_fat_write(FatImage::F16, 2048, "FAT16/2048 write");
+  test_fat_write(FatImage::F32, 2048, "FAT32/2048 write");
   test_fat_bad();
   test_fat_offset();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

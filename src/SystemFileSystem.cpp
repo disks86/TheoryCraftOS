@@ -96,11 +96,18 @@ uint32_t SystemFileSystem::mount_device(uint32_t id, const SharedPointer<IStorag
     if (!volume->mount(allocator_, whole ? 0 : partitions[i].first_block, whole ? 0 : partitions[i].block_count, whole ? 0 : partitions[i].index, whole))
       continue;
     const FileSystemInfo info = volume->file_system().info();
+    DirectoryEntry efi;   // a volume with an EFI folder is a boot partition
+    const bool boot_volume = volume->file_system().stat("/EFI", &efi) == Status::Ok && efi.type == NodeType::Directory;
     String name(allocator_);
     if (!info.label.view().trimmed().empty()) name.assign(info.label.view().trimmed());
-    else name.assign(device->info().removable ? "Removable disk" : "Disk");
+    else name.assign(boot_volume ? "EFI" : device->info().removable ? "Removable disk" : "Disk");
     FixedString<MountTable::kMaxName + 1> assigned;
-    if (table_.mount(name.view(), SharedPointer<IVolume>(volume), id, &assigned)) ++mounted;
+    if (table_.mount(name.view(), SharedPointer<IVolume>(volume), id, &assigned)) {
+      ++mounted;
+      // The first writable volume that is built into the machine and is not a boot partition is what "/" shows; the others are folders in it.
+      if (!table_.has_root() && !boot_volume && !device->info().removable && !device->info().read_only && !info.read_only)
+        table_.set_root(assigned.view());
+    }
   }
   return mounted;
 }
