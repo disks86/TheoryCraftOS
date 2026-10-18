@@ -18,6 +18,7 @@
 
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/DirectoryListing.hpp"
+#include "Desktop/FileStatus.hpp"
 #include "Desktop/Format.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -27,6 +28,8 @@ namespace desktop {
 using namespace gui;
 using filesystem::DirectoryEntry;
 using filesystem::IDirectory;
+using filesystem::IFile;
+using filesystem::OpenMode;
 using filesystem::NodeType;
 using filesystem::Status;
 
@@ -58,6 +61,10 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   if (Menu* file = menu_.add_menu("File")) {
     file->add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
     file->add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
+    file->add_item("Rename", {&FileExplorer::on_rename_menu, this}, "F2");
+    file->add_item("New Folder", {&FileExplorer::on_new_folder, this});
+    file->add_item("New File", {&FileExplorer::on_new_file, this});
+    file->add_separator();
     file->add_item("Eject", {&FileExplorer::on_eject_menu, this});
     file->add_separator();
     file->add_item("Close", {&FileExplorer::on_close_window, this});
@@ -77,6 +84,10 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   // The context menus.
   ctx_open_ = list_menu_.add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
   ctx_copy_ = list_menu_.add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
+  list_menu_.add_separator();
+  ctx_rename_ = list_menu_.add_item("Rename", {&FileExplorer::on_rename_menu, this}, "F2");
+  list_menu_.add_item("New Folder", {&FileExplorer::on_new_folder, this});
+  list_menu_.add_item("New File", {&FileExplorer::on_new_file, this});
   list_menu_.add_separator();
   ctx_list_ = list_menu_.add_item("List", {&FileExplorer::on_view_list, this});
   ctx_icons_ = list_menu_.add_item("Icons", {&FileExplorer::on_view_icons, this});
@@ -106,6 +117,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   view_.set_dock(DockStyle::Fill);
   view_.set_copy_enabled(false);  // Ctrl+C copies the item's path instead (see on_key)
   view_.on_item_activated({&FileExplorer::on_activated, this});
+  view_.on_item_renamed({&FileExplorer::on_renamed, this});
   view_.on_selection_changed({&FileExplorer::on_selection, this});
 
   add(&menu_);
@@ -274,6 +286,10 @@ bool FileExplorer::copy_selected_path() {
 
 bool FileExplorer::on_key(const KeyArgs& args) {
   if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 2) return copy_selected_path();   // Ctrl+C
+  if (args.usage == hardware::key::kF1 + 1) {  // F2
+    rename_selected();
+    return true;
+  }
   if (args.usage == hardware::key::kF1 + 4) {  // F5
     refresh();
     return true;
@@ -307,6 +323,7 @@ void FileExplorer::on_list_menu_opening(void* self, Control&) {
   const bool selected = e->view_.selected_item() >= 0;
   e->ctx_open_->set_enabled(selected);
   e->ctx_copy_->set_enabled(selected);
+  e->ctx_rename_->set_enabled(selected);
   e->ctx_up_->set_enabled(e->path_.size() > 1);
   e->ctx_list_->set_checked(e->view_.view_mode() == ViewMode::List);
   e->ctx_icons_->set_checked(e->view_.view_mode() == ViewMode::Icons);
@@ -323,6 +340,131 @@ void FileExplorer::on_view_icons(void* self, Control&) { static_cast<FileExplore
 void FileExplorer::on_view_details(void* self, Control&) { static_cast<FileExplorer*>(self)->set_view_mode(ViewMode::Details); }
 void FileExplorer::on_open_item(void* self, Control&) { static_cast<FileExplorer*>(self)->activate_selected(); }
 void FileExplorer::on_copy_path(void* self, Control&) { static_cast<FileExplorer*>(self)->copy_selected_path(); }
+bool FileExplorer::new_folder() { return create_new(true); }
+bool FileExplorer::new_file() { return create_new(false); }
+
+bool FileExplorer::create_new(bool folder) {
+  if (!fs_) {
+    notify(gui::NoticeKind::Error, "No storage available.");
+    return false;
+  }
+  const StringView base = folder ? StringView("New Folder") : StringView("New File");
+  const StringView extension = folder ? StringView() : StringView(".txt");
+  String name(allocator()), full(allocator());
+  Status status = Status::Ok;
+  for (uint32_t n = 1; n < 1000; ++n) {
+    name.assign(base);
+    if (n > 1) {
+      name.push_back(' ');
+      name.append_uint(n);
+    }
+    name.append(extension);
+    full.assign(path_.view());
+    if (path_.size() > 1) full.push_back('/');
+    full.append(name.view());
+    DirectoryEntry taken;
+    if (fs_->stat(full.view(), &taken) == Status::NotFound) break;
+    if (n == 999) {
+      notify(gui::NoticeKind::Error, "There are too many items called New in this folder.");
+      return false;
+    }
+  }
+  if (folder) {
+    status = fs_->create_directory(full.view());
+  } else {
+    UniquePointer<IFile> file;
+    status = fs_->open_file(full.view(), OpenMode::CreateTruncate, &file);
+  }
+  if (status != Status::Ok) {
+    String message(allocator());
+    message.append(folder ? "Cannot create the folder here: " : "Cannot create the file here: ");
+    message.append(describe_status(status));
+    notify(gui::NoticeKind::Error, message.view());
+    return false;
+  }
+  fs_->flush();
+  refresh();
+  for (uint32_t i = 0; i < view_.item_count(); ++i) {   // select what was made
+    String text(allocator());
+    view_.item_text(i, 0, &text);
+    if (text.view().equals(name.view())) {
+      view_.select_item(static_cast<int32_t>(i));
+      view_.begin_rename();   // the name can be typed right away
+      break;
+    }
+  }
+  return true;
+}
+
+bool FileExplorer::rename_selected() { return view_.begin_rename(); }
+
+bool FileExplorer::rename_item(StringView from, StringView to) {
+  String target(allocator());
+  target.assign(to);
+  // Trim blanks around the new name.
+  uint64_t begin = 0, end = target.size();
+  while (begin < end && target[begin] == ' ') ++begin;
+  while (end > begin && target[end - 1] == ' ') --end;
+  String name(allocator());
+  name.assign(target.view().substr(begin, end - begin));
+  if (name.view().equals(from)) return true;   // unchanged
+  if (name.empty()) {
+    notify(gui::NoticeKind::Warning, "Enter a name.");
+    return false;
+  }
+  if (name.view().find('/') != StringView::npos) {
+    notify(gui::NoticeKind::Error, "A name cannot contain a slash.");
+    return false;
+  }
+  if (!fs_) {
+    notify(gui::NoticeKind::Error, "No storage available.");
+    return false;
+  }
+  String old_path(allocator()), new_path(allocator());
+  for (int which = 0; which < 2; ++which) {
+    String& out = which == 0 ? old_path : new_path;
+    out.assign(path_.view());
+    if (path_.size() > 1) out.push_back('/');
+    out.append(which == 0 ? from : name.view());
+  }
+  const Status status = fs_->rename(old_path.view(), new_path.view());
+  if (status != Status::Ok) {
+    String message(allocator());
+    message.append("Cannot rename ");
+    message.append(from);
+    message.append(": ");
+    message.append(describe_status(status));
+    notify(gui::NoticeKind::Error, message.view());
+    return false;
+  }
+  fs_->flush();
+  refresh();
+  for (uint32_t i = 0; i < view_.item_count(); ++i) {
+    String text(allocator());
+    view_.item_text(i, 0, &text);
+    if (text.view().equals(name.view())) {
+      view_.select_item(static_cast<int32_t>(i));
+      break;
+    }
+  }
+  return true;
+}
+
+void FileExplorer::on_rename_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->rename_selected(); }
+
+void FileExplorer::on_renamed(void* self, Control&) {
+  auto* e = static_cast<FileExplorer*>(self);
+  const int32_t item = e->view_.renamed_item();
+  if (item < 0) return;
+  String from(e->allocator()), to(e->allocator());
+  e->view_.item_text(static_cast<uint32_t>(item), 0, &from);
+  to.assign(e->view_.renamed_text());
+  e->rename_item(from.view(), to.view());
+}
+
+void FileExplorer::on_new_folder(void* self, Control&) { static_cast<FileExplorer*>(self)->new_folder(); }
+void FileExplorer::on_new_file(void* self, Control&) { static_cast<FileExplorer*>(self)->new_file(); }
+
 void FileExplorer::on_eject_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->eject_selected(); }
 void FileExplorer::on_close_window(void* self, Control&) { static_cast<FileExplorer*>(self)->close(); }
 void FileExplorer::on_up_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->go_up(); }

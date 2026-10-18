@@ -33,6 +33,11 @@ inline const char* describe_status(filesystem::Status status) {
     case Status::InvalidPath: return "invalid path";
     case Status::OutOfMemory: return "out of memory";
     case Status::IoError: return "storage error";
+    case Status::AlreadyExists: return "that name is already used";
+    case Status::Busy: return "it is in use";
+    case Status::NotEmpty: return "the folder is not empty";
+    case Status::Unsupported: return "not possible here";
+    case Status::NoMedia: return "the drive is gone";
     default: return "failed";
   }
 }

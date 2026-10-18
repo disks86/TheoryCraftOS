@@ -1163,6 +1163,32 @@ static void test_file_explorer() {
     CHECK(ex.refresh() && ex.path().equals("/docs") && ex.view().item_count() == 1);
     CHECK(fs.remove("/docs/note.md") == filesystem::Status::Ok && fs.remove("/docs") == filesystem::Status::Ok);
     CHECK(ex.refresh() && ex.path().equals("/") && ex.view().item_count() == 5);
+    // New Folder / New File: unique names, the new item is selected
+    {
+      filesystem::DirectoryEntry made;
+      CHECK(ex.new_folder() && fs.stat("/New Folder", &made) == filesystem::Status::Ok && made.type == filesystem::NodeType::Directory);
+      CHECK(ex.new_folder() && fs.stat("/New Folder 2", &made) == filesystem::Status::Ok);
+      CHECK(ex.new_file() && fs.stat("/New File.txt", &made) == filesystem::Status::Ok && made.type == filesystem::NodeType::File && made.size == 0);
+      CHECK(ex.new_file() && fs.stat("/New File 2.txt", &made) == filesystem::Status::Ok);
+      CHECK(ex.view().item_count() == 9 && ex.view().selected_item() >= 0);
+      // The new item's name is open for editing; typing a name and pressing Enter renames it.
+      CHECK(ex.view().renaming());
+      ex.view().rename_box().set_text("Projects");
+      press(w, key::kEnter);
+      CHECK(!ex.view().renaming() && fs.stat("/Projects", &made) == filesystem::Status::Ok && fs.stat("/New File 2.txt", &made) == filesystem::Status::NotFound);
+      CHECK(ex.view().selected_item() >= 0);
+      // Escape drops an edit; a taken or empty name is refused and nothing changes.
+      CHECK(ex.rename_selected() && ex.view().renaming());
+      ex.view().rename_box().set_text("zzz");
+      press(w, key::kEscape);
+      CHECK(!ex.view().renaming() && fs.stat("/zzz", &made) == filesystem::Status::NotFound);
+      CHECK(!ex.rename_item("Projects", "New Folder 2") && !ex.rename_item("Projects", "") && !ex.rename_item("Projects", "a/b"));
+      CHECK(ex.rename_item("Projects", "Projects") && ex.rename_item("Projects", "  Work  ") && fs.stat("/Work", &made) == filesystem::Status::Ok);
+      CHECK(fs.rename("/Work", "/New File 2.txt") == filesystem::Status::Ok);
+      CHECK(fs.remove("/New Folder") == filesystem::Status::Ok && fs.remove("/New Folder 2") == filesystem::Status::Ok);
+      CHECK(fs.remove("/New File.txt") == filesystem::Status::Ok && fs.remove("/New File 2.txt") == filesystem::Status::Ok);
+      CHECK(ex.refresh() && ex.view().item_count() == 5);
+    }
     // File > Eject: the selected folder at the root, else the folder of the path's first component; the answer goes to the status bar
     {
       EjectProbe probe;

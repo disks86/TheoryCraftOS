@@ -23,12 +23,13 @@
 //  - Icons: large icons with the name below, in a grid that wraps to the width; scrolls vertically.
 // Every item has a text cell per column (the first is its name) and an icon. One item is selected: click it, or use the
 // arrow keys (along the way the items are laid out), Home/End; Enter - or a second click on the selected item
-// within a double-click interval - activates it. Ctrl+C copies the selected item's cells (tab separated) to the clipboard. The mouse wheel scrolls.
+// within a double-click interval - activates it. begin_rename() puts a text box over the selected item's name; Enter (or clicking elsewhere) keeps the new name and fires the rename handler, Escape drops it. Ctrl+C copies the selected item's cells (tab separated) to the clipboard. The mouse wheel scrolls.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/GridModel.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
+#include "Gui/Controls/TextBox.hpp"
 
 namespace gui {
 
@@ -77,6 +78,16 @@ class ListView : public Control {
   void on_selection_changed(Handler handler) { UiGuard lock(this); selection_changed_ = handler; }
   // Fired by Enter or a double click on the selected item.
   void on_item_activated(Handler handler) { UiGuard lock(this); activated_ = handler; }
+  // --- Renaming. The list only edits the text: the program decides whether the name is acceptable (see on_item_renamed) and reloads the items.
+  // Starts editing the selected item's name; false if nothing is selected or the list is not in a window.
+  bool begin_rename();
+  void cancel_rename();
+  bool renaming() const { return renaming_; }
+  TextBox& rename_box() { return rename_; }
+  // Fired when an edit is accepted; renamed_item() is the item that was edited and renamed_text() the new text.
+  void on_item_renamed(Handler handler) { UiGuard lock(this); renamed_ = handler; }
+  int32_t renamed_item() const { return rename_item_; }
+  StringView renamed_text() const { return rename_result_.view(); }
   // The time (microseconds) that double clicks are measured with; the pointed-to value is read on every click.
   // Without a clock only Enter activates.
   void set_clock(const uint64_t* now_us) { UiGuard lock(this); clock_ = now_us; }
@@ -105,6 +116,18 @@ class ListView : public Control {
   Size default_size() const override { return {320, 200}; }
 
  private:
+  // The text box shown while renaming; hands Enter, Escape and losing the focus to the list.
+  class RenameBox final : public TextBox {
+   public:
+    RenameBox(allocators::IAllocator& allocator, ListView& owner) : TextBox(allocator), owner_(owner) {}
+    bool on_key(const KeyArgs& args) override;
+    void on_focus_changed(bool focused) override;
+
+   private:
+    ListView& owner_;
+  };
+
+  void commit_rename();
   struct Column {
     String title;
     int32_t width;
@@ -141,7 +164,11 @@ class ListView : public Control {
   bool show_v_ = false, show_h_ = false;
   bool syncing_ = false, copy_enabled_ = true;
   ScrollBar vscroll_, hscroll_;
-  Handler selection_changed_, activated_;
+  Handler selection_changed_, activated_, renamed_;
+  RenameBox rename_;
+  bool renaming_ = false;
+  int32_t rename_item_ = -1;
+  String rename_result_;
   const uint64_t* clock_ = nullptr;
   int32_t last_click_item_ = -1;
   uint64_t last_click_us_ = 0;

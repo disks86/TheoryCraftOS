@@ -18,6 +18,7 @@
 
 #include "Gui/Controls/ListView.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Gui/Window.hpp"
 #include "Kernel/Clipboard.hpp"
 
 namespace gui {
@@ -63,6 +64,8 @@ ListView::ListView(allocators::IAllocator& allocator)
       columns_(allocator),
       vscroll_(allocator, Orientation::Vertical),
       hscroll_(allocator, Orientation::Horizontal),
+      rename_(allocator, *this),
+      rename_result_(allocator),
       text_(allocator) {
   vscroll_.on_value_changed(Handler::immediate(&ListView::vertical_changed, this));
   hscroll_.on_value_changed(Handler::immediate(&ListView::horizontal_changed, this));
@@ -70,6 +73,8 @@ ListView::ListView(allocators::IAllocator& allocator)
   hscroll_.set_step(16);
   add(&vscroll_);
   add(&hscroll_);
+  add(&rename_);
+  rename_.set_visible(false);
   vscroll_.set_visible(false);
   hscroll_.set_visible(false);
 }
@@ -135,8 +140,82 @@ int32_t ListView::add_item(const StringView* cells, uint32_t count, ItemIcon ico
   return row;
 }
 
+bool ListView::RenameBox::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter) {
+    owner_.commit_rename();
+    return true;
+  }
+  if (args.usage == hardware::key::kEscape) {
+    owner_.cancel_rename();
+    return true;
+  }
+  return TextBox::on_key(args);
+}
+
+void ListView::RenameBox::on_focus_changed(bool focused) {
+  if (!focused) owner_.commit_rename();
+}
+
+bool ListView::begin_rename() {
+  UiGuard lock(this);
+  Window* w = window();
+  Rect2D cell;
+  if (renaming_ || !w || selected_ < 0 || !item_rect(static_cast<uint32_t>(selected_), &cell)) return false;
+  ensure_visible(static_cast<uint32_t>(selected_));
+  item_rect(static_cast<uint32_t>(selected_), &cell);
+  int32_t x, y, width;
+  constexpr int32_t kBoxHeight = 22;
+  if (mode_ == ViewMode::Icons) {
+    x = cell.x;
+    width = static_cast<int32_t>(cell.width);
+    y = cell.y + 4 + kLargeIcon + 2;
+  } else {
+    x = cell.x + kSmallIcon + 3;
+    width = mode_ == ViewMode::Details ? columns_[0].width - kSmallIcon - 4 : static_cast<int32_t>(cell.width) - kSmallIcon - 4;
+    y = cell.y + (kRowHeight - kBoxHeight) / 2;
+  }
+  if (width < 120) width = 120;
+  rename_item_ = selected_;
+  model_.cell_text(static_cast<uint32_t>(selected_), 0, &text_);
+  rename_.set_text(text_.view());
+  rename_.select_all();
+  rename_.set_bounds({x, y, static_cast<uint32_t>(width), static_cast<uint32_t>(kBoxHeight)});
+  renaming_ = true;
+  rename_.set_visible(true);
+  w->set_focus(&rename_);
+  invalidate();
+  return true;
+}
+
+void ListView::cancel_rename() {
+  UiGuard lock(this);
+  if (!renaming_) return;
+  renaming_ = false;
+  rename_.set_visible(false);
+  if (Window* w = window()) w->set_focus(this);
+  invalidate();
+}
+
+void ListView::commit_rename() {
+  UiGuard lock(this);
+  if (!renaming_) return;
+  rename_result_.assign(rename_.text());
+  const bool had_focus = rename_.focused();
+  renaming_ = false;
+  rename_.set_visible(false);
+  if (had_focus) {
+    if (Window* w = window()) w->set_focus(this);
+  }
+  invalidate();
+  fire(renamed_);
+}
+
 void ListView::clear_items() {
   UiGuard lock(this);
+  if (renaming_) {   // (the items are going away: nothing to rename)
+    renaming_ = false;
+    rename_.set_visible(false);
+  }
   model_.clear();
   icons_.clear();
   scroll_x_ = scroll_y_ = 0;

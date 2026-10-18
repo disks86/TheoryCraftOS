@@ -60,6 +60,15 @@ class FileExplorer : public gui::Frame {
   using EjectFunction = const char* (*)(void* context, StringView volume, bool* succeeded);   // *succeeded is true on entry
   void set_eject_handler(EjectFunction function, void* context) { eject_ = function; eject_context_ = context; }
   bool eject_selected();
+  // File > New Folder / New File (also in the list's context menu): makes "New Folder" / "New File.txt" in the current folder - or "New Folder 2",
+  // "New Folder 3", ... if the name is taken - and selects it. False (with a notice) if it could not be made, e.g. in the read-only root.
+  bool new_folder();
+  bool new_file();
+  // File > Rename (F2, or Rename in the list's context menu): the selected item's name becomes a text box; Enter renames it. False if
+  // nothing is selected. rename_item() does the renaming itself: `from` and `to` are names in the current folder; false (with a notice)
+  // if it fails, e.g. because the name is taken or this place cannot be changed.
+  bool rename_selected();
+  bool rename_item(StringView from, StringView to);
   // The dialog that warnings, information and errors are shown in (nullptr: the status bar says them instead). It must outlive the explorer.
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
@@ -88,6 +97,11 @@ class FileExplorer : public gui::Frame {
   static void on_open_item(void* self, gui::Control&);
   static void on_copy_path(void* self, gui::Control&);
   static void on_eject_menu(void* self, gui::Control&);
+  static void on_new_folder(void* self, gui::Control&);
+  static void on_new_file(void* self, gui::Control&);
+  static void on_rename_menu(void* self, gui::Control&);
+  static void on_renamed(void* self, gui::Control&);
+  bool create_new(bool folder);
   static void on_close_window(void* self, gui::Control&);
   static void on_up_menu(void* self, gui::Control&);
   static void on_refresh_menu(void* self, gui::Control&);
@@ -105,7 +119,7 @@ class FileExplorer : public gui::Frame {
 
   gui::MenuBar menu_;
   gui::ContextMenu list_menu_, address_menu_;
-  gui::MenuItem *ctx_open_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
+  gui::MenuItem *ctx_open_ = nullptr, *ctx_rename_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
   gui::Panel toolbar_, status_bar_;
   gui::BreadcrumbBar address_;
   gui::Label status_;
