@@ -35,6 +35,7 @@ TerminalView::TerminalView(allocators::IAllocator& allocator)
       submitted_(allocator),
       saved_input_(allocator),
       scratch_(allocator),
+      clicked_link_(allocator),
       history_(allocator),
       scroll_bar_(allocator, Orientation::Vertical),
       clipboard_(allocator) {
@@ -47,6 +48,7 @@ TerminalView::TerminalView(allocators::IAllocator& allocator)
 
 void TerminalView::write(StringView text) {
   UiGuard lock(this);
+  hover_line_ = -1;   // (lines move when the output grows)
   for (uint64_t i = 0; i < text.size(); ++i) {
     const char c = text[i];
     String& current = lines_[lines_.count() - 1];
@@ -81,6 +83,7 @@ void TerminalView::clear() {
   lines_.push_back(String(allocator()));
   column_ = 0;
   scrolled_ = 0;
+  hover_line_ = -1;
   invalidate();
 }
 
@@ -246,6 +249,124 @@ void TerminalView::scroll_to_end() {
 
 void TerminalView::on_mouse_wheel(const MouseArgs& args) { scroll_by(args.wheel > 0 ? 3 : args.wheel < 0 ? -3 : 0); }
 
+// --- Links ------------------------------------------------------------------------------------------
+
+void TerminalView::compose(uint64_t line, String* out) const {
+  out->assign(lines_[line].view());
+  if (line + 1 == lines_.count()) {
+    out->append(prompt_.view());
+    out->append(input_.view());
+  }
+}
+
+bool TerminalView::locate(int32_t x, int32_t y, uint64_t* line, uint64_t* offset) const {
+  if (x < kMargin || y < kMargin || columns_ == 0) return false;
+  const uint32_t col = static_cast<uint32_t>((x - kMargin) / Painter::kGlyphWidth), screen_row = static_cast<uint32_t>((y - kMargin) / kLineHeight);
+  if (col >= columns_ || screen_row >= rows_) return false;
+  const uint32_t total = total_rows();
+  const uint32_t first = total > rows_ + scrolled_ ? total - rows_ - scrolled_ : 0;
+  const uint32_t target = first + screen_row;
+  uint32_t row = 0;
+  for (uint64_t i = 0; i < lines_.count(); ++i) {
+    const bool is_live = i + 1 == lines_.count();
+    const uint64_t length = lines_[i].size() + (is_live ? prompt_.size() + input_.size() : 0);
+    const uint32_t n = rows_of(length, is_live);
+    if (target < row + n) {
+      const uint64_t at = static_cast<uint64_t>(target - row) * columns_ + col;
+      if (at >= length) return false;
+      *line = i;
+      *offset = at;
+      return true;
+    }
+    row += n;
+  }
+  return false;
+}
+
+bool TerminalView::link_at(int32_t x, int32_t y, uint64_t* line, uint64_t* from, uint64_t* to, String* word) const {
+  uint64_t at;
+  if (!link_checker_ || !locate(x, y, line, &at)) return false;
+  String text(allocator());
+  compose(*line, &text);
+  const StringView s = text.view();
+  auto blank = [](char c) { return c == ' ' || c == '\t'; };
+  if (blank(s[at])) return false;
+  uint64_t begin = 0, end = 0;
+  bool quoted = false;
+  // Inside a pair of quotes: the whole text between them.
+  char quote = 0;
+  uint64_t open_at = 0;
+  for (uint64_t i = 0; i < s.size(); ++i) {
+    if (!quote && (s[i] == '"' || s[i] == '\'')) {
+      quote = s[i];
+      open_at = i;
+    } else if (quote && s[i] == quote) {
+      if (at > open_at && at < i) {
+        begin = open_at + 1;
+        end = i;
+        quoted = true;
+        break;
+      }
+      quote = 0;
+    }
+  }
+  if (!quoted) {
+    begin = at;
+    end = at + 1;
+    while (begin > 0 && !blank(s[begin - 1])) --begin;
+    while (end < s.size() && !blank(s[end])) ++end;
+    // Brackets, quotes and punctuation around a word are not part of it.
+    while (begin < end && (s[begin] == '(' || s[begin] == '[' || s[begin] == '"' || s[begin] == '\'')) ++begin;
+    while (end > begin && (s[end - 1] == ')' || s[end - 1] == ']' || s[end - 1] == '>' || s[end - 1] == ':' || s[end - 1] == ',' ||
+                           s[end - 1] == ';' || s[end - 1] == '"' || s[end - 1] == '\''))
+      --end;
+    if (at < begin || at >= end) return false;
+  }
+  if (begin >= end) return false;
+  word->assign(s.substr(begin, end - begin));
+  if (!link_checker_(link_context_, word->view())) return false;
+  *from = begin;
+  *to = end;
+  return true;
+}
+
+void TerminalView::clear_hover() {
+  if (hover_line_ < 0) return;
+  hover_line_ = -1;
+  invalidate();
+}
+
+void TerminalView::on_mouse_down(const MouseArgs& args) {
+  press_x_ = args.button == MouseButton::Left ? args.x : -1;
+  press_y_ = args.y;
+}
+
+void TerminalView::on_mouse_move(const MouseArgs& args) {
+  UiGuard lock(this);
+  uint64_t line, from, to;
+  String word(allocator());
+  if (link_at(args.x, args.y, &line, &from, &to, &word)) {
+    if (hover_line_ != static_cast<int64_t>(line) || hover_from_ != from || hover_to_ != to) {
+      hover_line_ = static_cast<int64_t>(line);
+      hover_from_ = from;
+      hover_to_ = to;
+      invalidate();
+    }
+  } else {
+    clear_hover();
+  }
+}
+
+void TerminalView::on_mouse_up(const MouseArgs& args) {
+  UiGuard lock(this);
+  const bool click = press_x_ >= 0 && args.button == MouseButton::Left && args.x - press_x_ < 4 && press_x_ - args.x < 4 && args.y - press_y_ < 4 &&
+                     press_y_ - args.y < 4;
+  press_x_ = -1;
+  uint64_t line, from, to;
+  if (!click || !link_at(args.x, args.y, &line, &from, &to, &clicked_link_)) return;
+  fire(link_handler_);
+}
+
 // --- Painting ---------------------------------------------------------------------------------------
 
 void TerminalView::paint(Painter& painter) {
@@ -276,7 +397,15 @@ void TerminalView::paint(Painter& painter) {
         const uint64_t from = static_cast<uint64_t>(r) * cols;
         if (from < content.size()) {
           const uint64_t len = content.size() - from < cols ? content.size() - from : cols;
-          painter.text(kMargin, kMargin + static_cast<int32_t>(visual - first) * kLineHeight, content.substr(from, len), kForeground);
+          const int32_t y = kMargin + static_cast<int32_t>(visual - first) * kLineHeight;
+          painter.text(kMargin, y, content.substr(from, len), kForeground);
+          if (static_cast<int64_t>(i) == hover_line_) {   // the link under the pointer is underlined
+            const uint64_t a = hover_from_ > from ? hover_from_ : from, b = hover_to_ < from + len ? hover_to_ : from + len;
+            if (a < b)
+              painter.fill({kMargin + static_cast<int32_t>(a - from) * Painter::kGlyphWidth, y + kLineHeight - 2,
+                            static_cast<uint32_t>((b - a) * Painter::kGlyphWidth), 1},
+                           kForeground);
+          }
         }
       }
     }

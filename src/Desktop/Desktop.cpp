@@ -191,6 +191,7 @@ void Desktop::setup_terminal(Terminal& terminal) {
   terminal.set_notices(&notice_dialog_);
   terminal.set_file_dialog(&file_dialog_);
   terminal.on_new_terminal({&Desktop::on_new_terminal, this});
+  terminal.on_open_path({&Desktop::on_terminal_path, this});
   terminal.set_file_system(fs_);
 }
 
@@ -345,17 +346,44 @@ void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
 void Desktop::on_explorer_file(void* self, Control& sender) {
   auto* d = static_cast<Desktop*>(self);
-  const StringView file = static_cast<FileExplorer&>(sender).opened_file();   // (only explorers fire this)
+  d->open_file(static_cast<FileExplorer&>(sender).opened_file());   // (only explorers fire this)
+}
+
+void Desktop::open_file(StringView file) {
   if (Paint::is_picture_name(file)) {  // pictures open in Paint, everything else as text
-    if (Paint* paint = d->paint_for(file)) paint->open_file(file);
+    if (Paint* paint = paint_for(file)) paint->open_file(file);
     return;
   }
   if (MediaPlayer::is_media_name(file)) {   // sound and video open in the media player
-    d->open_media_player();
-    d->media_player_.open_file(file);
+    open_media_player();
+    media_player_.open_file(file);
     return;
   }
-  if (Notepad* editor = d->editor_for(file)) editor->open_file(file);
+  if (Notepad* editor = editor_for(file)) editor->open_file(file);
+}
+
+bool Desktop::open_path(StringView path) {
+  if (!fs_) return false;
+  filesystem::DirectoryEntry entry;
+  const bool root = path.equals("/");
+  if (!root && fs_->stat(path, &entry) != filesystem::Status::Ok) return false;
+  if (!root && entry.type != filesystem::NodeType::Directory) {
+    open_file(path);
+    return true;
+  }
+  FileExplorer* target = nullptr;
+  window_.locked([&] {
+    if (explorer_.manager()) target = &explorer_;
+    for (auto& e : extra_explorers_)
+      if (!target && e->manager()) target = e.get();
+    if (!target) target = open_explorer();
+    if (target) target->activate();
+  });
+  return target && target->open_folder(path);
+}
+
+void Desktop::on_terminal_path(void* self, Control& sender) {
+  static_cast<Desktop*>(self)->open_path(static_cast<Terminal&>(sender).opened_path());
 }
 Desktop::~Desktop() {
   copy_progress_.cancel();

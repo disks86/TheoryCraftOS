@@ -64,6 +64,17 @@ class TerminalView : public Control {
   // The line that was submitted last.
   StringView submitted() const { return submitted_.view(); }
 
+  // --- Links. With a link checker set, a word of the output (or of the line being typed) that the checker accepts - say a path that exists - is
+  // underlined while the pointer is over it, and a click on it fires the link handler; clicked_link() is the word, without the quotes, brackets
+  // and punctuation around it. A word between double or single quotes is taken whole, blanks included. The checker runs under the UI lock on the
+  // input thread, each time the pointer moves to another word.
+  using LinkChecker = bool (*)(void* context, StringView word);
+  void set_link_checker(LinkChecker checker, void* context) { UiGuard lock(this); link_checker_ = checker; link_context_ = context; }
+  void on_link_clicked(Handler handler) { UiGuard lock(this); link_handler_ = handler; }
+  StringView clicked_link() const { return clicked_link_.view(); }
+  // The word at a point of this control (its coordinates) as [from, to) of its logical line; false if there is none (or the checker refuses it).
+  bool link_at(int32_t x, int32_t y, uint64_t* line, uint64_t* from, uint64_t* to, String* word) const;
+
   // --- View
   uint32_t columns() const { return columns_; }
   uint32_t rows() const { return rows_; }
@@ -75,6 +86,10 @@ class TerminalView : public Control {
   void layout() override;
   void paint(Painter& painter) override;
   void on_mouse_wheel(const MouseArgs& args) override;
+  void on_mouse_down(const MouseArgs& args) override;
+  void on_mouse_move(const MouseArgs& args) override;
+  void on_mouse_up(const MouseArgs& args) override;
+  void on_mouse_leave() override { UiGuard lock(this); clear_hover(); }
   bool on_key(const KeyArgs& args) override;
 
  private:
@@ -84,6 +99,9 @@ class TerminalView : public Control {
   void scroll_by(int32_t rows);
   void sync_scroll_bar();
   static void scroll_changed(void* self, Control&);
+  bool locate(int32_t x, int32_t y, uint64_t* line, uint64_t* offset) const;
+  void compose(uint64_t line, String* out) const;   // a logical line as shown: the live one with the prompt and the input
+  void clear_hover();
   void remember(StringView line);
   void recall(int32_t direction);
 
@@ -98,6 +116,13 @@ class TerminalView : public Control {
   bool syncing_ = false;
   ScrollBar scroll_bar_;
   Handler submitted_handler_;
+  LinkChecker link_checker_ = nullptr;
+  void* link_context_ = nullptr;
+  Handler link_handler_;
+  String clicked_link_;
+  int64_t hover_line_ = -1;           // the word under the pointer that can be clicked: line, [from, to)
+  uint64_t hover_from_ = 0, hover_to_ = 0;
+  int32_t press_x_ = -1, press_y_ = -1;
   String clipboard_;          // used when the window has no system clipboard
 };
 

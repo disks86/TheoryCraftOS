@@ -123,6 +123,9 @@ class Desktop {
   void open_task_manager();
   // Opens a file explorer window: the first one is explorer() (when that is closed), further ones are made as needed and go away when closed.
   FileExplorer* open_explorer();
+  // Opens what `path` names the way a double click in a file explorer would: a folder in a file explorer (an open one, else a new one), a
+  // picture in Paint, a sound or video in the media player, anything else in a text editor. False if it does not exist.
+  bool open_path(StringView path);
   // Reads the folder of every open file explorer again (files moved in one show up in the other).
   void refresh_explorers();
   // How many windows of each kind are open right now.
@@ -167,6 +170,8 @@ class Desktop {
   static void on_new_terminal(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
   static void on_files_changed(void* self, gui::Control&);
+  static void on_terminal_path(void* self, gui::Control&);
+  void open_file(StringView file);
   static void on_copy_finished(void* self, gui::Control&);
   static void on_extra_closed(void* self, gui::Control&);
   static void on_task_manager(void* self, gui::Control&);

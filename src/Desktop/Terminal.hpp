@@ -40,6 +40,10 @@ class Terminal : public gui::Frame {
   // The dialog that Save Output As uses (nullptr: none). It must outlive the terminal.
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
+  // A path in the output that exists - absolute, or relative to the current folder - can be clicked; this fires with opened_path() set to its full
+  // path (the desktop opens a folder in a file explorer and a file in the program for it).
+  void on_open_path(gui::Handler handler) { open_path_ = handler; }
+  StringView opened_path() const { return opened_path_.view(); }
   // Fired by File > New Terminal; the desktop opens another window.
   void on_new_terminal(gui::Handler handler) { new_terminal_ = handler; }
 
@@ -68,6 +72,8 @@ class Terminal : public gui::Frame {
   static void on_paste(void* self, gui::Control&);
   static void on_clear(void* self, gui::Control&);
   static void on_submitted(void* self, gui::Control&);
+  static bool is_link(void* self, StringView word);
+  static void on_link(void* self, gui::Control&);
   static void on_save_picked(void* self, gui::Control&);
   static void host_write(void* self, StringView text);
   static void host_clear(void* self);
@@ -81,7 +87,8 @@ class Terminal : public gui::Frame {
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
   gui::NoticeDialog* notices_ = nullptr;
-  gui::Handler new_terminal_;
+  gui::Handler new_terminal_, open_path_;
+  String opened_path_;
 };
 
 }  // namespace desktop

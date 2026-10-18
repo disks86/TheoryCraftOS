@@ -4428,6 +4428,81 @@ static void test_desktop_shortcuts() {
   CHECK(a.live == 0);
 }
 
+// Clicking a path in the terminal's output opens a folder in a file explorer and a file in the program for it.
+static void test_terminal_links() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok && fs.create_directory("/docs/deep") == filesystem::Status::Ok);
+    make_file(fs, "/docs/a.txt", "alpha");
+    make_file(fs, "/docs/pic.bmp", "x");
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    desktop::Terminal* t = d.open_terminal();
+    t->set_bounds({300, 0, 480, 500});
+    t->view().clear();
+    w.layout();
+    t->run("cd docs");
+    t->run("ls");
+    t->run("echo see /docs/deep, or \"/docs/a.txt\" plain");
+    w.layout();
+    // The click point of the first occurrence of `text` in the output (nothing is scrolled: it all fits).
+    auto point_of = [&](const char* text) {
+      for (uint32_t i = 0; i < t->view().line_count(); ++i) {
+        const uint64_t at = t->view().line(i).find(StringView(text));
+        if (at == StringView::npos) continue;
+        const Point o = t->view().window_origin();
+        return Point{o.x + gui::TerminalView::kMargin + static_cast<int32_t>(at) * 8 + 4, o.y + gui::TerminalView::kMargin + static_cast<int32_t>(i) * 16 + 6};
+      }
+      return Point{-1, -1};
+    };
+    // Words that are no path do nothing, and nothing is underlined for them.
+    Point p = point_of("plain");
+    CHECK(p.x >= 0);
+    click(w, p.x, p.y);
+    CHECK(d.explorer_count() == 0 && d.text_editor_count() == 0);
+    // A folder in the output of ls (relative to the current folder) opens in a file explorer at that folder.
+    p = point_of("deep/");
+    CHECK(p.x >= 0);
+    w.mouse_move(p.x, p.y);
+    uint64_t line, from, to;
+    String word(a);
+    CHECK(t->view().link_at(p.x - t->view().window_origin().x, p.y - t->view().window_origin().y, &line, &from, &to, &word) && word.view().equals("deep/"));
+    click(w, p.x, p.y);
+    CHECK(d.explorer_count() == 1 && d.explorer().path().equals("/docs/deep"));
+    // An absolute path with punctuation behind it, and a quoted one. (The explorer is moved aside: it opened over the terminal.)
+    d.explorer().set_bounds({0, 520, 200, 80});
+    w.layout();
+    p = point_of("/docs/deep,");
+    click(w, p.x, p.y);
+    CHECK(d.explorer_count() == 1 && d.explorer().path().equals("/docs/deep"));
+    // A picture opens in Paint (a relative name counts from the folder the terminal is in now).
+    p = point_of("pic.bmp");
+    CHECK(p.x >= 0);
+    click(w, p.x, p.y);
+    CHECK(d.paint_count() == 1);
+    if (d.notice_dialog().showing()) d.notice_dialog().ok_button().click();   // (the file is not a real picture)
+    d.paint().set_bounds({0, 520, 200, 80});
+    t->run("cd ..");
+    w.layout();
+    p = point_of("/docs/a.txt");
+    CHECK(p.x >= 0);
+    click(w, p.x + 8, p.y);
+    CHECK(d.text_editor_count() == 1 && d.notepad().path().equals("/docs/a.txt") && d.notepad().editor().text().equals("alpha"));
+    // Dragging across text is not a click.
+    d.notepad().close();
+    p = point_of("/docs/a.txt");
+    w.mouse_move(p.x, p.y);
+    w.mouse_button(p.x, p.y, MouseButton::Left, true);
+    w.mouse_move(p.x + 40, p.y);
+    w.mouse_button(p.x + 40, p.y, MouseButton::Left, false);
+    CHECK(d.text_editor_count() == 0);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4508,6 +4583,7 @@ int main() {
   test_desktop_multiple_windows();
   test_copy_progress();
   test_terminal();
+  test_terminal_links();
   test_dock_buttons();
   test_desktop_shortcuts();
   test_spin_box();

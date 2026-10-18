@@ -29,7 +29,7 @@ using filesystem::NodeType;
 using filesystem::OpenMode;
 using filesystem::Status;
 
-Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(allocator), view_(allocator), shell_(allocator) {
+Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(allocator), view_(allocator), shell_(allocator), opened_path_(allocator) {
   set_title("Terminal");
   set_bounds({100, 80, 600, 380});
   set_padding(Insets::all(4));
@@ -52,6 +52,8 @@ Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(
 
   view_.set_dock(DockStyle::Fill);
   view_.on_submit({&Terminal::on_submitted, this});
+  view_.set_link_checker(&Terminal::is_link, this);
+  view_.on_link_clicked({&Terminal::on_link, this});
   add(&menu_);
   add(&view_);   // Fill goes last
 
@@ -91,6 +93,23 @@ void Terminal::on_submitted(void* self, Control&) {
   line.assign(t->view_.submitted());   // (already echoed by the view)
   t->shell_.execute(line.view());
   t->refresh_prompt();
+}
+
+// A word is a link if it looks like a path (it has a slash or a dot) and names something that exists.
+bool Terminal::is_link(void* self, StringView word) {
+  auto* t = static_cast<Terminal*>(self);
+  if (!t->fs_ || (word.find('/') == StringView::npos && word.find('.') == StringView::npos)) return false;
+  String path(t->allocator());
+  if (!t->shell_.resolve(word, &path)) return false;
+  if (path.view().equals("/")) return true;
+  DirectoryEntry entry;
+  return t->fs_->stat(path.view(), &entry) == Status::Ok;
+}
+
+void Terminal::on_link(void* self, Control&) {
+  auto* t = static_cast<Terminal*>(self);
+  if (!t->shell_.resolve(t->view_.clicked_link(), &t->opened_path_)) return;
+  t->fire(t->open_path_);
 }
 
 void Terminal::run(StringView line) {
