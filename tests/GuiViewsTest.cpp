@@ -4800,6 +4800,84 @@ static void test_tile_button() {
   CHECK(a.live == 0);
 }
 
+// The mouse wheel over the tab strip goes through the tabs; over the taskbar's window buttons through the windows.
+static void test_wheel_switching() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+    desktop::Notepad* n1 = d.open_text_editor();
+    auto* h1 = static_cast<gui::TabFrame*>(n1->host());
+    d.open_text_editor(h1);
+    d.open_text_editor(h1);
+    put(h1, {20, 20, 480, 300});
+    w.layout();
+    CHECK(h1->tab_count() == 3 && h1->selected() == h1->tab_at(2));
+    const Point o = h1->window_origin();
+    const Rect2D strip = h1->strip_rect();
+    const int32_t sx = o.x + strip.x + 30, sy = o.y + strip.y + 10;
+    w.mouse_move(sx, sy);
+    w.mouse_wheel(sx, sy, 1);   // up: the previous tab
+    CHECK(h1->selected() == h1->tab_at(1));
+    w.mouse_wheel(sx, sy, 1);
+    CHECK(h1->selected() == h1->tab_at(0));
+    w.mouse_wheel(sx, sy, 1);   // (stops at the first)
+    CHECK(h1->selected() == h1->tab_at(0));
+    w.mouse_wheel(sx, sy, -1);
+    w.mouse_wheel(sx, sy, -1);
+    w.mouse_wheel(sx, sy, -1);
+    CHECK(h1->selected() == h1->tab_at(2));
+    // Over the page of a tab the wheel is the page's.
+    const Point body = {o.x + 100, o.y + strip.y + strip.height + 30};
+    w.mouse_wheel(body.x, body.y, 1);
+    CHECK(h1->selected() == h1->tab_at(2));
+
+    // Windows: three more, then the wheel over the taskbar.
+    d.open_paint();
+    d.open_explorer();
+    w.layout();
+    gui::WindowSwitcher& sw = d.switcher();
+    CHECK(sw.button_count() == 3);   // (the text editors share a window)
+    const Point so = sw.window_origin();
+    const int32_t wx = so.x + 20, wy = so.y + 8;
+    Frame* first = sw.frame_at(0);
+    Frame* second = sw.frame_at(1);
+    Frame* third = sw.frame_at(2);
+    CHECK(m.active() == third);
+    w.mouse_move(wx, wy);
+    w.mouse_wheel(wx, wy, 1);
+    CHECK(m.active() == second);
+    w.mouse_wheel(wx, wy, 1);
+    CHECK(m.active() == first);
+    w.mouse_wheel(wx, wy, 1);
+    CHECK(m.active() == first);          // the first one is the end
+    w.mouse_wheel(wx, wy, -1);
+    CHECK(m.active() == second && m.stacking_index(second) == 2);
+    w.mouse_wheel(wx, wy, -1);
+    w.mouse_wheel(wx, wy, -1);
+    CHECK(m.active() == third);
+    // A minimized window is brought back by scrolling to it; with the window in front minimized the wheel starts from the end it came from.
+    first->minimize();
+    third->minimize();
+    second->minimize();
+    CHECK(m.active() != first && m.active() != second && m.active() != third);
+    w.mouse_wheel(wx, wy, -1);
+    CHECK(m.active() == first && first->state() == Frame::State::Normal);
+    // Not while a dialog wants an answer.
+    d.ask_shut_down();
+    const Frame* before = m.active();
+    CHECK(m.has_modal());
+    w.mouse_wheel(wx, wy, -1);
+    w.mouse_wheel(wx, wy, 1);
+    CHECK(m.active() == before && m.has_modal());
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4883,6 +4961,7 @@ int main() {
   test_terminal_links();
   test_dock_buttons();
   test_tile_button();
+  test_wheel_switching();
   test_desktop_shortcuts();
   test_tabs();
   test_spin_box();

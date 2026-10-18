@@ -19,7 +19,8 @@
 // The taskbar's window switcher: one button per window (dialogs are left out), in the order the windows were
 // created. The active window's button is pressed in; clicking it minimizes that window, clicking any
 // other button restores (if needed), raises and activates its window. Ignores clicks while a modal
-// window is open. A right click on a button opens that window's menu: Restore, Minimize, Maximize, Close.
+// window is open. The mouse wheel over the buttons goes through the windows: down to the next one, up to the previous one, each activated (and restored if
+// minimized); it stops at the first and last. A right click on a button opens that window's menu: Restore, Minimize, Maximize, Close.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
@@ -46,6 +47,7 @@ class WindowSwitcher : public Control {
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
+  void on_mouse_wheel(const MouseArgs& args) override;
 
  private:
   int32_t button_at(int32_t x, int32_t y) const;  // -1 = none

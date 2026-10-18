@@ -130,4 +130,19 @@ void WindowSwitcher::on_mouse_up(const MouseArgs& args) {
   else manager_.activate(f);
 }
 
+void WindowSwitcher::on_mouse_wheel(const MouseArgs& args) {
+  if (args.wheel == 0 || manager_.has_modal()) return;
+  const int32_t count = static_cast<int32_t>(button_count());
+  if (count == 0) return;
+  int32_t current = -1;   // the button of the window in front (none when it is minimized or nothing is active)
+  for (int32_t i = 0; i < count; ++i)
+    if (frame_at(static_cast<uint32_t>(i)) == manager_.active()) current = i;
+  if (current >= 0 && manager_.active()->state() == Frame::State::Minimized) current = -1;
+  int32_t target;
+  if (current < 0) target = args.wheel < 0 ? 0 : count - 1;
+  else target = current + (args.wheel < 0 ? 1 : -1);
+  if (target < 0 || target >= count) return;
+  if (Frame* f = frame_at(static_cast<uint32_t>(target))) manager_.activate(f);
+}
+
 }  // namespace gui

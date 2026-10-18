@@ -139,11 +139,18 @@ void TabFrame::select_tab(Frame* tab) {
   apply_selection();
 }
 
-void TabFrame::step_selection(int32_t direction) {
+void TabFrame::step_selection(int32_t direction, bool wrap) {
   const int32_t n = static_cast<int32_t>(tabs_.count());
   if (n < 2) return;
   const int32_t at = index_of(selected_);
-  select_tab(tabs_[static_cast<uint64_t>(((at < 0 ? 0 : at) + direction + n) % n)]);
+  int32_t target = (at < 0 ? 0 : at) + direction;
+  if (!wrap && (target < 0 || target >= n)) return;
+  select_tab(tabs_[static_cast<uint64_t>((target + n) % n)]);
+}
+
+void TabFrame::on_mouse_wheel(const MouseArgs& args) {
+  if (args.wheel == 0 || !enabled() || !contains(strip_rect(), args.x, args.y)) return;
+  step_selection(args.wheel < 0 ? 1 : -1, false);
 }
 
 // Shows the selected tab only, moves the focus into it, and takes over its title.

@@ -21,6 +21,7 @@
 // title. Tabs are Frames that are not windows of their own (see Frame): the host adds them as children, shows one at a time, and tells them
 // what manager they are in, so dialogs that a tab opens find the desktop.
 //
+//   - The mouse wheel over the strip goes through the tabs (down: the next one, up: the previous one; it stops at the ends).
 //   - Clicking a tab selects it, its close button closes it (the last tab closes the window), "+" fires on_new_tab (the program decides what
 //     a new tab holds), Ctrl+T does the same, Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous tab.
 //   - A tab can be dragged (see Window::begin_drag) by its label: dropped on the strip of this or another tab window it moves there, at the
@@ -76,6 +77,7 @@ class TabFrame : public Frame {
   void on_mouse_down(const MouseArgs& args) override;
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
+  void on_mouse_wheel(const MouseArgs& args) override;
   bool on_key(const KeyArgs& args) override;
   bool accepts_drop(StringView text, int32_t x, int32_t y, const Control* source) const override;
   void on_drop(StringView text, int32_t x, int32_t y, const Control* source) override;
@@ -93,7 +95,7 @@ class TabFrame : public Frame {
 
   void apply_selection();
   int32_t tab_width() const;
-  void step_selection(int32_t direction);
+  void step_selection(int32_t direction, bool wrap = true);
 
   List<Frame*> tabs_;
   Frame* selected_ = nullptr;
