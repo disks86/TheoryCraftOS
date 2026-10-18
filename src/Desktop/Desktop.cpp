@@ -47,12 +47,14 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       task_manager_(allocator),
       notepad_(allocator),
       paint_(allocator),
+      terminal_(allocator),
       media_player_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
       extra_explorers_(allocator),
       extra_notepads_(allocator),
-      extra_paints_(allocator) {
+      extra_paints_(allocator),
+      extra_terminals_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
   taskbar_.set_dock(DockStyle::Bottom);
@@ -67,6 +69,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
   start_.menu().add_item("Task Manager", {&Desktop::on_task_manager, this});
   start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});
+  start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
@@ -109,6 +112,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   file_dialog_.set_clock(&now_us_);
   setup_notepad(notepad_);
   setup_paint(paint_);
+  setup_terminal(terminal_);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
 
@@ -139,9 +143,11 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
     explorer_.set_file_system(fs);
     notepad_.set_file_system(fs);
     paint_.set_file_system(fs);
+    terminal_.set_file_system(fs);
     for (auto& e : extra_explorers_) e->set_file_system(fs);
     for (auto& n : extra_notepads_) n->set_file_system(fs);
     for (auto& p : extra_paints_) p->set_file_system(fs);
+    for (auto& t : extra_terminals_) t->set_file_system(fs);
   });
   media_player_.set_file_system(fs);
   file_dialog_.set_file_system(fs);
@@ -161,6 +167,13 @@ void Desktop::setup_notepad(Notepad& notepad) {
   notepad.set_file_dialog(&file_dialog_);
   notepad.set_print_dialog(&print_dialog_);
   notepad.set_file_system(fs_);
+}
+
+void Desktop::setup_terminal(Terminal& terminal) {
+  terminal.set_notices(&notice_dialog_);
+  terminal.set_file_dialog(&file_dialog_);
+  terminal.on_new_terminal({&Desktop::on_new_terminal, this});
+  terminal.set_file_system(fs_);
 }
 
 void Desktop::setup_paint(Paint& paint) {
@@ -208,6 +221,7 @@ void Desktop::reap_closed() {
     sweep(extra_explorers_);
     sweep(extra_notepads_);
     sweep(extra_paints_);
+    sweep(extra_terminals_);
   });
 }
 
@@ -247,6 +261,17 @@ void Desktop::open_task_manager() {
 }
 
 Notepad* Desktop::open_text_editor() { return open_instance(notepad_, extra_notepads_, &Desktop::setup_notepad); }
+
+Terminal* Desktop::open_terminal() { return open_instance(terminal_, extra_terminals_, &Desktop::setup_terminal); }
+
+uint32_t Desktop::terminal_count() const {
+  uint32_t n = terminal_.manager() ? 1 : 0;
+  for (const auto& e : extra_terminals_) n += e->manager() ? 1 : 0;
+  return n;
+}
+
+void Desktop::on_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
+void Desktop::on_new_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
 
 Paint* Desktop::open_paint() { return open_instance(paint_, extra_paints_, &Desktop::setup_paint); }
 

@@ -18,7 +18,7 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager", "Text Editor", "Paint", "Media Player",
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Task Manager", "Text Editor", "Terminal", "Paint", "Media Player",
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -33,6 +33,7 @@
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
+#include "Desktop/Terminal.hpp"
 #include "Desktop/TaskManager.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
@@ -109,6 +110,10 @@ class Desktop {
   // Returns the window (nullptr if memory ran out).
   Paint* open_paint();
   Notepad& notepad() { return notepad_; }
+  // Opens a terminal window: the first one is terminal() (when that is closed), further ones are made as needed and go away when closed.
+  Terminal* open_terminal();
+  Terminal& terminal() { return terminal_; }
+  uint32_t terminal_count() const;
   // Opens a text editor window: the first one is notepad() (when that is closed), further ones are made as needed and go away when closed.
   Notepad* open_text_editor();
   TaskManager& task_manager() { return task_manager_; }
@@ -157,6 +162,8 @@ class Desktop {
   static void on_paint(void* self, gui::Control&);
   static void on_media_player(void* self, gui::Control&);
   static void on_text_editor(void* self, gui::Control&);
+  static void on_terminal(void* self, gui::Control&);
+  static void on_new_terminal(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
   static void on_files_changed(void* self, gui::Control&);
   static void on_copy_finished(void* self, gui::Control&);
@@ -173,6 +180,7 @@ class Desktop {
   void setup_explorer(FileExplorer& explorer);
   void setup_notepad(Notepad& notepad);
   void setup_paint(Paint& paint);
+  void setup_terminal(Terminal& terminal);
   void reap_closed();
   // The text editor / paint window to open a file in: the one that already shows it, an open empty one, or a new one.
   Notepad* editor_for(StringView path);
@@ -201,6 +209,7 @@ class Desktop {
   TaskManager task_manager_;
   Notepad notepad_;
   Paint paint_;
+  Terminal terminal_;
   MediaPlayer media_player_;
   gui::Frame about_;
   gui::Label about_lines_[3];
@@ -208,6 +217,7 @@ class Desktop {
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;
+  List<UniquePointer<Terminal>> extra_terminals_;
   bool reap_needed_ = false;
   ClockSource clock_source_ = nullptr;
   void* clock_context_ = nullptr;

@@ -213,6 +213,8 @@ add_executable(BOOTX64
   src/Desktop/DesktopSurface.cpp
   src/Desktop/FileExplorer.cpp
   src/Desktop/FileTransfer.cpp
+  src/Desktop/Shell.cpp
+  src/Desktop/Terminal.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
   src/Desktop/FileDialog.cpp
@@ -238,6 +240,7 @@ add_executable(BOOTX64
   src/Gui/Controls/Panel.cpp
   src/Gui/Controls/Label.cpp
   src/Gui/Controls/ProgressBar.cpp
+  src/Gui/Controls/TerminalView.cpp
   src/Gui/Controls/Button.cpp
   src/Gui/Controls/TextBox.cpp
   src/Gui/Controls/DropDown.cpp

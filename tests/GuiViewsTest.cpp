@@ -40,6 +40,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Desktop/Terminal.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/TaskManager.hpp"
 #include "Gui/Controls/TextEditor.hpp"
@@ -4217,6 +4218,107 @@ static void test_copy_progress() {
   CHECK(a.live == 0);
 }
 
+// The terminal: the shell's commands, typing on the command line, and dropping a folder on the window.
+static bool terminal_shows(desktop::Terminal& t, const char* text) {
+  for (uint32_t i = 0; i < t.view().line_count(); ++i)
+    if (t.view().line(i).find(StringView(text)) != StringView::npos) return true;
+  return false;
+}
+
+static void test_terminal() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok && fs.create_directory("/docs/deep") == filesystem::Status::Ok);
+    make_file(fs, "/docs/a.txt", "alpha");
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    desktop::Terminal* t = d.open_terminal();
+    CHECK(t == &d.terminal() && d.terminal_count() == 1);
+    desktop::Terminal* other = d.open_terminal();
+    CHECK(other != t && d.terminal_count() == 2);
+    other->set_bounds({0, 320, 300, 200});
+    t->set_bounds({400, 0, 380, 300});
+    w.layout();
+
+    // Commands, typed with the keyboard on the line; the prompt shows the folder.
+    CHECK(t->view().prompt().equals("/> "));
+    auto type = [&](const char* text) {
+      w.set_focus(&t->view());
+      for (const char* c = text; *c; ++c) {
+        KeyArgs k;
+        k.character = *c;
+        w.key(k);
+      }
+      KeyArgs enter;
+      enter.usage = hardware::key::kEnter;
+      w.key(enter);
+    };
+    type("cd docs");
+    CHECK(t->shell().cwd().equals("/docs") && t->view().prompt().equals("/docs> ") && t->title().equals("Terminal - /docs"));
+    type("ls -l");
+    CHECK(terminal_shows(*t, "deep/") && terminal_shows(*t, "a.txt"));
+    type("cat a.txt");
+    CHECK(terminal_shows(*t, "alpha"));
+    type("mkdir \"two words\"");
+    type("cp a.txt \"two words\"");
+    filesystem::DirectoryEntry entry;
+    CHECK(fs.stat("/docs/two words/a.txt", &entry) == filesystem::Status::Ok);
+    type("mv a.txt deep/b.txt");
+    CHECK(fs.stat("/docs/deep/b.txt", &entry) == filesystem::Status::Ok && fs.stat("/docs/a.txt", &entry) == filesystem::Status::NotFound);
+    type("cd ../docs/deep/..");
+    CHECK(t->shell().cwd().equals("/docs"));
+    type("cd nowhere");
+    CHECK(terminal_shows(*t, "cd: nowhere: not found") && t->shell().cwd().equals("/docs"));
+    type("rm deep");
+    CHECK(terminal_shows(*t, "rm: deep: that is a folder") && fs.stat("/docs/deep", &entry) == filesystem::Status::Ok);
+    type("rm -r deep");
+    CHECK(fs.stat("/docs/deep", &entry) == filesystem::Status::NotFound);
+    type("nonsense");
+    CHECK(terminal_shows(*t, "nonsense: command not found"));
+    // History: Up brings the last command back.
+    KeyArgs up;
+    up.usage = hardware::key::kUp;
+    w.key(up);
+    CHECK(t->view().input().equals("nonsense"));
+    t->view().set_input(StringView());
+    type("clear");
+    CHECK(t->view().line_count() == 1);
+
+    // A folder dragged from a file explorer to the terminal becomes the current folder; a file puts its path on the line.
+    t->shell().change_directory("/");
+    desktop::FileExplorer* ex = d.open_explorer();
+    ex->set_bounds({0, 0, 380, 300});
+    CHECK(ex->open_folder("/docs"));
+    make_file(fs, "/docs/note.txt", "n");
+    ex->refresh();
+    w.layout();
+    const Point folder = item_point(a, *ex, "two words");
+    CHECK(folder.x >= 0);
+    w.mouse_move(folder.x, folder.y);
+    w.mouse_button(folder.x, folder.y, MouseButton::Left, true);
+    w.mouse_move(550, 150);
+    w.mouse_button(550, 150, MouseButton::Left, false);
+    CHECK(t->shell().cwd().equals("/docs/two words") && terminal_shows(*t, "cd \"/docs/two words\""));
+    const Point file = item_point(a, *ex, "note.txt");
+    w.mouse_move(file.x, file.y);
+    w.mouse_button(file.x, file.y, MouseButton::Left, true);
+    w.mouse_move(550, 150);
+    w.mouse_button(550, 150, MouseButton::Left, false);
+    CHECK(t->view().input().equals("/docs/note.txt "));
+
+    // Save Output As writes the screen text to a file; exit closes the window.
+    CHECK(t->save_output("/out.log") && fs.stat("/out.log", &entry) == filesystem::Status::Ok && entry.size > 10);
+    t->view().set_input(StringView());
+    type("exit");
+    d.step(1000000);
+    CHECK(d.terminal_count() == 1);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4296,6 +4398,7 @@ int main() {
   test_desktop_file_dialog();
   test_desktop_multiple_windows();
   test_copy_progress();
+  test_terminal();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();
