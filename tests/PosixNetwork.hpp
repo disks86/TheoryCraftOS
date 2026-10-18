@@ -21,6 +21,7 @@
 #pragma once
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
@@ -30,6 +31,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <string>
 #include "Network/INetworkStack.hpp"
 
 namespace network {
@@ -106,11 +108,42 @@ struct PosixTcpSocket final : ITcpSocket {
   uint16_t remote_port() const override { return remote_port_; }
 };
 
-// Only tcp_open() and now_ms() do anything.
+// Looks names up with the operating system's resolver (blocking, IPv4 only): lookups are finished when query() returns.
+struct PosixResolver final : IDnsResolver {
+  struct Query final : IDnsQuery {
+    DnsStatus result = DnsStatus::NotFound;
+    Ipv4Address found;
+    DnsStatus status() const override { return result; }
+    Ipv4Address address() const override { return found; }
+    uint32_t ttl_seconds() const override { return 60; }
+  };
+  allocators::IAllocator& allocator;
+  explicit PosixResolver(allocators::IAllocator& a) : allocator(a) {}
+  SharedPointer<IDnsQuery> query(StringView name) override {
+    SharedPointer<Query> q = SharedPointer<Query>::make(allocator);
+    std::string host(name.data(), name.size());
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* list = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &list) == 0 && list) {
+      const uint32_t ip = ntohl(reinterpret_cast<sockaddr_in*>(list->ai_addr)->sin_addr.s_addr);
+      q->found = Ipv4Address::make(ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+      q->result = DnsStatus::Resolved;
+    }
+    if (list) freeaddrinfo(list);
+    return SharedPointer<IDnsQuery>(q);
+  }
+  void clear_cache() override {}
+  uint32_t cache_size() const override { return 0; }
+};
+
+// Only tcp_open(), dns() and now_ms() do anything.
 struct PosixNetworkStack final : INetworkStack {
   kernel::RecursiveMutex m;
   allocators::IAllocator& allocator;
-  explicit PosixNetworkStack(allocators::IAllocator& a) : allocator(a) {}
+  PosixResolver resolver;
+  explicit PosixNetworkStack(allocators::IAllocator& a) : allocator(a), resolver(a) {}
   kernel::RecursiveMutex& mutex() override { return m; }
   void poll() override {}
   uint64_t now_ms() const override { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000ull + t.tv_nsec / 1000000; }
@@ -120,7 +153,7 @@ struct PosixNetworkStack final : INetworkStack {
   const IDhcpClient& dhcp() const override { return *static_cast<IDhcpClient*>(nullptr); }
   bool wait_for_address(uint32_t) override { return true; }
   bool resolve(StringView, uint32_t, Ipv4Address*) override { return false; }
-  IDnsResolver& dns() override { return *static_cast<IDnsResolver*>(nullptr); }
+  IDnsResolver& dns() override { return resolver; }
   bool ping(Ipv4Address, uint32_t, uint32_t*) override { return false; }
   SharedPointer<IUdpSocket> udp_open(uint16_t) override { return SharedPointer<IUdpSocket>(); }
   SharedPointer<ITcpSocket> tcp_open() override { return SharedPointer<ITcpSocket>::make_as<PosixTcpSocket>(allocator); }

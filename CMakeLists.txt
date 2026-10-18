@@ -98,6 +98,8 @@ add_executable(BOOTX64
   src/Network/Snmp/SnmpTrap.cpp
   src/Network/Ipp/IppMessage.cpp
   src/Network/Ipp/IppExchange.cpp
+  src/Network/Http/HttpUrl.cpp
+  src/Network/Http/HttpClient.cpp
   src/Network/Mdns/MdnsMessage.cpp
   src/Network/Snmp/SnmpClient.cpp
   src/Crypto/Crypto.cpp
