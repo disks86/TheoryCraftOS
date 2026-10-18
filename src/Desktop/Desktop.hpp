@@ -26,6 +26,7 @@
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
 #include "Desktop/ColorDialog.hpp"
+#include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileExplorer.hpp"
@@ -70,6 +71,8 @@ class Desktop {
           hardware::IMouse* mouse);
   Desktop(const Desktop&) = delete;
   Desktop& operator=(const Desktop&) = delete;
+  // Stops a copy that is still running.
+  ~Desktop();
 
   gui::Window& window() { return window_; }
   // The system clipboard that copy and paste in every window of the desktop use (nullptr: none).
@@ -80,6 +83,8 @@ class Desktop {
   gui::MessageDialog& shutdown_dialog() { return shutdown_dialog_; }
   // The dialog the programs show warnings, information and errors in.
   gui::NoticeDialog& notice_dialog() { return notice_dialog_; }
+  // The window that shows files being moved between volumes and remote shares.
+  CopyProgressDialog& copy_progress() { return copy_progress_; }
   gui::Frame& about_window() { return about_; }
   gui::Frame& explorer_window() { return explorer_; }
   FileExplorer& explorer() { return explorer_; }
@@ -154,6 +159,7 @@ class Desktop {
   static void on_text_editor(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
   static void on_files_changed(void* self, gui::Control&);
+  static void on_copy_finished(void* self, gui::Control&);
   static void on_extra_closed(void* self, gui::Control&);
   static void on_task_manager(void* self, gui::Control&);
   static void on_explorer(void* self, gui::Control&);
@@ -188,6 +194,7 @@ class Desktop {
   gui::MessageDialog shutdown_dialog_;
   gui::NoticeDialog notice_dialog_;
   FileDialog file_dialog_;
+  CopyProgressDialog copy_progress_;
   ColorDialog color_dialog_;
   PrintDialog print_dialog_;
   FileExplorer explorer_;

@@ -20,6 +20,7 @@
 // View menu switches between list, icon and details views. Double-click (or Enter on) a folder opens it, a file is passed on to on_file_opened, the
 // Up button (or Backspace) goes to the parent. The window starts at the root of the filesystem it is given.
 #pragma once
+#include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/CredentialsDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/BreadcrumbBar.hpp"
@@ -110,6 +111,9 @@ class FileExplorer : public gui::Frame {
   // changed something fires the handler set with on_files_changed - the desktop uses it to refresh every explorer, as the other explorer
   // (the one the item came from) now shows something stale.
   void on_files_changed(gui::Handler handler) { files_changed_ = handler; }
+  // The window that shows moves between volumes (and to or from network shares) while they run in the background (nullptr: they are done at once,
+  // in the calling thread, with nothing shown). It must outlive the explorer; whoever sets it also refreshes the explorers when it is done.
+  void set_transfer_dialog(CopyProgressDialog* dialog) { transfers_ = dialog; }
   // Moves the file or folder at `source` (a full path) into the folder `folder`. False (with a notice) if that fails.
   bool move_into(StringView source, StringView folder);
   // Copies the settings the windows share - the login handlers, the eject function - from another explorer.
@@ -165,7 +169,6 @@ class FileExplorer : public gui::Frame {
   static void on_address_menu(void* self, gui::Control&);
   bool copy_selected_path();
   static bool on_drag_item(void* self, int32_t item, String* text);
-  Status copy_tree(StringView from, StringView to, uint32_t depth);
   static void on_activated(void* self, gui::Control&);
   static void on_selection(void* self, gui::Control&);
   bool load(StringView path);   // (with navigation_ held)
@@ -190,6 +193,7 @@ class FileExplorer : public gui::Frame {
   String scratch_;
   String opened_file_;
   gui::Handler file_opened_, files_changed_;
+  CopyProgressDialog* transfers_ = nullptr;
   gui::NoticeDialog* notices_ = nullptr;
   gui::MessageDialog delete_dialog_;
   String delete_path_;   // what the dialog asks about

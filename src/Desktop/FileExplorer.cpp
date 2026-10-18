@@ -19,6 +19,7 @@
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/DirectoryListing.hpp"
 #include "Desktop/FileStatus.hpp"
+#include "Desktop/FileTransfer.hpp"
 #include "Desktop/Format.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -615,7 +616,14 @@ bool FileExplorer::move_into(StringView source, StringView folder) {
   if (fs_->stat(target.view(), &taken) != Status::NotFound) return fail("an item of that name is already in the folder.");
   Status status = fs_->rename(source, target.view());
   if (status == Status::Unsupported) {   // another volume: copy, then remove the original
-    status = copy_tree(source, target.view(), 0);
+    if (transfers_ && manager()) {   // in the background, with a window that shows how far it is
+      if (!transfers_->start(*manager(), *fs_, source, target.view(), /*remove_source=*/true))
+        return fail("another copy is still running.");
+      return true;   // the dialog refreshes the explorers when it is done
+    }
+    FileTransfer transfer(allocator(), *fs_);
+    status = transfer.measure(source);
+    if (status == Status::Ok) status = transfer.copy(source, target.view());
     if (status == Status::Ok) status = remove_tree(source, 0);
   }
   fs_->flush();
@@ -623,47 +631,6 @@ bool FileExplorer::move_into(StringView source, StringView folder) {
   refresh();
   if (status != Status::Ok) return fail(describe_status(status));
   return true;
-}
-
-Status FileExplorer::copy_tree(StringView from, StringView to, uint32_t depth) {
-  DirectoryEntry entry;
-  Status status = fs_->stat(from, &entry);
-  if (status != Status::Ok) return status;
-  if (entry.type == NodeType::Directory) {
-    if (depth > 32) return Status::InvalidPath;
-    status = fs_->create_directory(to);
-    if (status != Status::Ok) return status;
-    List<DirectoryEntry> children(allocator());
-    status = read_sorted_directory(*fs_, from, &children);
-    if (status != Status::Ok) return status;
-    for (const DirectoryEntry& child : children) {
-      String a(allocator()), b(allocator());
-      a.assign(from);
-      a.push_back('/');
-      a.append(child.name.view());
-      b.assign(to);
-      b.push_back('/');
-      b.append(child.name.view());
-      status = copy_tree(a.view(), b.view(), depth + 1);
-      if (status != Status::Ok) return status;
-    }
-    return Status::Ok;
-  }
-  UniquePointer<IFile> in, out;
-  status = fs_->open_file(from, OpenMode::Read, &in);
-  if (status != Status::Ok) return status;
-  status = fs_->open_file(to, OpenMode::CreateTruncate, &out);
-  if (status != Status::Ok) return status;
-  uint8_t buffer[8192];
-  for (uint64_t offset = 0, got = 1; got > 0; offset += got) {
-    status = in->read(offset, ByteView(buffer, sizeof buffer), &got);
-    if (status != Status::Ok) return status;
-    if (got == 0) break;
-    uint64_t put = 0;
-    status = out->write(offset, ConstByteView(buffer, got), &put);
-    if (status != Status::Ok) return status;
-  }
-  return out->flush();
 }
 
 void FileExplorer::copy_settings_from(const FileExplorer& o) {
@@ -677,6 +644,7 @@ void FileExplorer::copy_settings_from(const FileExplorer& o) {
   ftps_login_context_ = o.ftps_login_context_;
   eject_ = o.eject_;
   eject_context_ = o.eject_context_;
+  transfers_ = o.transfers_;
 }
 
 void FileExplorer::on_open_item(void* self, Control&) { static_cast<FileExplorer*>(self)->activate_selected(); }
@@ -815,26 +783,7 @@ bool FileExplorer::delete_selected() {
 }
 
 // Removes a file, or a folder after what is in it. Stops at the first failure.
-Status FileExplorer::remove_tree(StringView path, uint32_t depth) {
-  DirectoryEntry entry;
-  Status status = fs_->stat(path, &entry);
-  if (status != Status::Ok) return status;
-  if (entry.type == NodeType::Directory) {
-    if (depth > 32) return Status::InvalidPath;
-    List<DirectoryEntry> children(allocator());
-    status = read_sorted_directory(*fs_, path, &children);
-    if (status != Status::Ok) return status;
-    for (const DirectoryEntry& child : children) {
-      String full(allocator());
-      full.assign(path);
-      full.push_back('/');
-      full.append(child.name.view());
-      status = remove_tree(full.view(), depth + 1);
-      if (status != Status::Ok) return status;
-    }
-  }
-  return fs_->remove(path);
-}
+Status FileExplorer::remove_tree(StringView path, uint32_t depth) { return FileTransfer::remove_tree(allocator(), *fs_, path, depth); }
 
 void FileExplorer::on_delete_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->delete_selected(); }
 

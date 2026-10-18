@@ -32,6 +32,8 @@
 #include "Kernel/Clipboard.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/FileTransfer.hpp"
+#include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Desktop/PrintDialog.hpp"
@@ -4126,6 +4128,95 @@ static void test_desktop_multiple_windows() {
   CHECK(a.live == 0);
 }
 
+// A filesystem that cannot rename, like two volumes: moving between folders has to copy, which shows the progress window.
+class NoRenameFs final : public filesystem::IFileSystem {
+ public:
+  explicit NoRenameFs(filesystem::IFileSystem& inner) : inner_(inner) {}
+  filesystem::FileSystemInfo info() const override { return inner_.info(); }
+  filesystem::Status open_file(StringView p, filesystem::OpenMode m, UniquePointer<filesystem::IFile>* f) override { return inner_.open_file(p, m, f); }
+  filesystem::Status open_directory(StringView p, UniquePointer<filesystem::IDirectory>* d) override { return inner_.open_directory(p, d); }
+  filesystem::Status stat(StringView p, filesystem::DirectoryEntry* e) override { return inner_.stat(p, e); }
+  filesystem::Status create_directory(StringView p) override { return inner_.create_directory(p); }
+  filesystem::Status remove(StringView p) override { return inner_.remove(p); }
+  filesystem::Status rename(StringView, StringView) override { return filesystem::Status::Unsupported; }
+  filesystem::Status flush() override { return inner_.flush(); }
+
+ private:
+  filesystem::IFileSystem& inner_;
+};
+
+struct ProgressLog {
+  int files = 0, chunks = 0;
+  uint64_t last_done = 0, last_total = 0;
+  static void on_file(void* c, StringView, uint64_t, uint64_t) { ++static_cast<ProgressLog*>(c)->files; }
+  static void on_bytes(void* c, uint64_t done, uint64_t total) {
+    auto* l = static_cast<ProgressLog*>(c);
+    ++l->chunks;
+    l->last_done = done;
+    l->last_total = total;
+  }
+};
+
+static void test_copy_progress() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem ram(a);
+    NoRenameFs fs(ram);
+    CHECK(ram.create_directory("/top") == filesystem::Status::Ok && ram.create_directory("/top/src") == filesystem::Status::Ok);
+    CHECK(ram.create_directory("/dest") == filesystem::Status::Ok);
+    make_file(ram, "/top/src/a.txt", "hello");
+    make_file(ram, "/top/src/b.txt", "world!!");
+    filesystem::DirectoryEntry entry;
+
+    // The transfer engine: measures, reports each file and the bytes, and stops when told to.
+    {
+      desktop::FileTransfer t(a, fs);
+      ProgressLog log;
+      t.set_callbacks(&ProgressLog::on_file, &ProgressLog::on_bytes, &log);
+      CHECK(t.measure("/top/src") == filesystem::Status::Ok && t.files_total() == 2 && t.bytes_total() == 12);
+      CHECK(t.copy("/top/src", "/copy") == filesystem::Status::Ok && log.files == 2 && log.chunks == 2 && log.last_done == 12 && log.last_total == 12);
+      CHECK(fs.stat("/copy/b.txt", &entry) == filesystem::Status::Ok && entry.size == 7);
+      bool stop = true;
+      t.set_cancel_flag(&stop);
+      CHECK(t.copy("/top/src", "/copy2") == desktop::FileTransfer::kCancelled);
+      CHECK(desktop::FileTransfer::remove_tree(a, fs, "/copy") == filesystem::Status::Ok && fs.stat("/copy", &entry) == filesystem::Status::NotFound);
+    }
+
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    desktop::FileExplorer* ex1 = d.open_explorer();
+    ex1->set_bounds({0, 0, 380, 250});
+    desktop::FileExplorer* ex2 = d.open_explorer();
+    ex2->set_bounds({400, 0, 380, 250});
+    CHECK(ex1->open_folder("/top") && ex2->open_folder("/dest"));
+    w.layout();
+
+    // Dragging a folder to the other explorer copies it with the progress window, then removes the original; both explorers are refreshed.
+    const Point from = item_point(a, *ex1, "src");
+    CHECK(from.x >= 0);
+    w.mouse_move(from.x, from.y);
+    w.mouse_button(from.x, from.y, MouseButton::Left, true);
+    w.mouse_move(500, 150);
+    w.mouse_button(500, 150, MouseButton::Left, false);
+    desktop::CopyProgressDialog& progress = d.copy_progress();
+    CHECK(progress.wait_until_idle(1000000) && !progress.busy() && progress.manager() == nullptr);
+    CHECK(progress.result() == filesystem::Status::Ok && progress.message().empty());
+    CHECK(progress.bar().value() == 12 && progress.bar().maximum() == 12 && progress.bar().percent() == 100);
+    CHECK(progress.heading_label().text().first(7).equals("Removin") || progress.heading_label().text().first(6).equals("Moving"));
+    CHECK(fs.stat("/dest/src/b.txt", &entry) == filesystem::Status::Ok && fs.stat("/top/src", &entry) == filesystem::Status::NotFound);
+    CHECK(item_point(a, *ex1, "src").x < 0 && item_point(a, *ex2, "src").x >= 0);
+
+    // A copy that fails reports it in a notice and leaves no half copy behind.
+    CHECK(ram.create_directory("/top/src") == filesystem::Status::Ok);
+    make_file(ram, "/top/src/c.txt", "x");
+    CHECK(!ex1->move_into("/top/src", "/dest") && !d.copy_progress().busy());   // the name is taken
+    CHECK(d.notice_dialog().showing());
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4204,6 +4295,7 @@ int main() {
   test_file_dialog();
   test_desktop_file_dialog();
   test_desktop_multiple_windows();
+  test_copy_progress();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

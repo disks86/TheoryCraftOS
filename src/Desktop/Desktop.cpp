@@ -40,6 +40,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       shutdown_dialog_(allocator),
       notice_dialog_(allocator),
       file_dialog_(allocator),
+      copy_progress_(allocator),
       color_dialog_(allocator),
       print_dialog_(allocator),
       explorer_(allocator),
@@ -109,6 +110,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   setup_notepad(notepad_);
   setup_paint(paint_);
   setup_explorer(explorer_);
+  copy_progress_.on_finished({&Desktop::on_copy_finished, this});
 
   about_.set_title("About TheoryCraftOS");
   about_.set_bounds({140, 90, 400, 170});
@@ -150,6 +152,7 @@ void Desktop::setup_explorer(FileExplorer& explorer) {
   explorer.set_clock(&now_us_);
   explorer.on_file_opened({&Desktop::on_explorer_file, this});
   explorer.on_files_changed({&Desktop::on_files_changed, this});
+  explorer.set_transfer_dialog(&copy_progress_);
   explorer.set_file_system(fs_);
 }
 
@@ -310,6 +313,17 @@ void Desktop::on_explorer_file(void* self, Control& sender) {
     return;
   }
   if (Notepad* editor = d->editor_for(file)) editor->open_file(file);
+}
+Desktop::~Desktop() {
+  copy_progress_.cancel();
+  copy_progress_.wait_until_idle(30000000);
+  window_.wait_for_background(30000000);
+}
+
+void Desktop::on_copy_finished(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->refresh_explorers();
+  if (!d->copy_progress_.message().empty()) d->notice_dialog_.show(d->windows_, NoticeKind::Error, d->copy_progress_.message());
 }
 void Desktop::on_files_changed(void* self, Control&) { static_cast<Desktop*>(self)->refresh_explorers(); }
 void Desktop::on_explorer(void* self, Control&) { static_cast<Desktop*>(self)->open_explorer(); }
