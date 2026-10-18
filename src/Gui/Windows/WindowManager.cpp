@@ -208,8 +208,46 @@ Rect2D WindowManager::dock_bounds(Frame::Dock edge) const {
   }
 }
 
+Rect2D WindowManager::tile_bounds(uint32_t slot, uint32_t count) const {
+  const uint32_t w = bounds_.width, h = bounds_.height, half_w = w / 2, half_h = h / 2;
+  if (count <= 1) return {0, 0, w, h};
+  if (count == 2) return slot == 0 ? Rect2D{0, 0, half_w, h} : Rect2D{static_cast<int32_t>(half_w), 0, w - half_w, h};
+  if (count == 3 && slot == 2) return {0, static_cast<int32_t>(half_h), w, h - half_h};
+  const bool right = slot & 1, lower = slot >= 2;
+  return {right ? static_cast<int32_t>(half_w) : 0, lower ? static_cast<int32_t>(half_h) : 0, right ? w - half_w : half_w, lower ? h - half_h : half_h};
+}
+
+void WindowManager::tile(Frame* origin) {
+  UiGuard lock(this);
+  if (has_modal() || bounds_.width == 0 || bounds_.height == 0) return;
+  if (origin && origin->docked_ == Frame::Dock::Tile) {   // pressed in a tiled window: everything goes back
+    for (uint32_t i = 0; i < child_count(); ++i)
+      if (as_frame(child(i))->docked_ == Frame::Dock::Tile) restore(as_frame(child(i)));
+    return;
+  }
+  Frame* picked[4];
+  uint32_t n = 0;
+  for (uint32_t i = child_count(); i > 0 && n < 4; --i) {
+    Frame* f = as_frame(child(i - 1));
+    if (f->state() == Frame::State::Minimized || !f->visible() || !f->dock_enabled()) continue;
+    picked[n++] = f;
+  }
+  if (n == 0) return;
+  for (uint32_t k = 0; k < n; ++k) {
+    Frame* f = picked[k];
+    if (f->state_ == Frame::State::Maximized) f->state_ = Frame::State::Normal;   // (the size from before is the one to go back to)
+    else if (f->docked_ == Frame::Dock::None) f->restore_bounds_ = f->bounds();
+    f->docked_ = Frame::Dock::Tile;
+    f->tile_slot_ = static_cast<uint8_t>(k);
+    f->tile_count_ = static_cast<uint8_t>(n);
+    f->set_bounds(tile_bounds(k, n));
+  }
+  activate(origin && origin->docked_ == Frame::Dock::Tile ? origin : picked[0]);
+}
+
 void WindowManager::dock(Frame* frame, Frame::Dock edge) {
   UiGuard lock(this);
+  if (edge == Frame::Dock::Tile) return;
   if (!frame || frame->manager_ != this || !frame->dock_enabled() || bounds_.width == 0 || bounds_.height == 0) return;
   if (edge == Frame::Dock::None || edge == frame->docked_) {   // put it back
     if (frame->docked_ != Frame::Dock::None) restore(frame);
@@ -230,6 +268,7 @@ void WindowManager::layout() {
   for (uint32_t i = 0; i < child_count(); ++i) {
     Frame* f = as_frame(child(i));
     if (f->state() == Frame::State::Maximized) f->set_bounds({0, 0, bounds_.width, bounds_.height});
+    else if (f->docked() == Frame::Dock::Tile) f->set_bounds(tile_bounds(f->tile_slot_, f->tile_count_));
     else if (f->docked() != Frame::Dock::None) f->set_bounds(dock_bounds(f->docked()));
     else keep_inside(f);
   }

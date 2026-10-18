@@ -65,6 +65,11 @@ void Frame::dock(Dock edge) {
   if (host_) host_->dock(edge);
   else if (manager_) manager_->dock(this, edge);
 }
+void Frame::tile() {
+  UiGuard lock(this);
+  if (host_) host_->tile();
+  else if (manager_) manager_->tile(this);
+}
 void Frame::activate() {
   UiGuard lock(this);
   if (host_) {
@@ -96,13 +101,15 @@ Rect2D Frame::button_rect(Part button) const {
   if (is_dock_part(button)) {   // left of Minimize, with a gap: Left, Right, Top, Bottom
     const int32_t index = static_cast<int32_t>(button) - static_cast<int32_t>(Part::DockLeft);   // 0..3
     x = min_x - 6 - (4 - index) * kButtonWidth;
+  } else if (button == Part::Tile) {   // and left of those
+    x = min_x - 6 - 5 * kButtonWidth - 4;
   }
   return {x, y, static_cast<uint32_t>(kButtonWidth), static_cast<uint32_t>(kButtonHeight)};
 }
 
 bool Frame::button_enabled(Part button) const {
   if (!enabled()) return false;
-  if (is_dock_part(button)) return dock_enabled();
+  if (is_dock_part(button) || button == Part::Tile) return dock_enabled();
   return button == Part::Minimize ? can_minimize_ : button == Part::Maximize ? can_maximize_ : can_close_;
 }
 
@@ -110,9 +117,9 @@ Frame::Part Frame::part_at(int32_t x, int32_t y) const {
   const int32_t w = static_cast<int32_t>(bounds_.width), h = static_cast<int32_t>(bounds_.height);
   if (x < 0 || y < 0 || x >= w || y >= h) return Part::None;
   if (host_) return Part::Client;
-  static const Part kButtons[7] = {Part::Close, Part::Maximize, Part::Minimize, Part::DockLeft, Part::DockRight, Part::DockTop, Part::DockBottom};
+  static const Part kButtons[8] = {Part::Close, Part::Maximize, Part::Minimize, Part::DockLeft, Part::DockRight, Part::DockTop, Part::DockBottom, Part::Tile};
   for (Part b : kButtons) {
-    if (is_dock_part(b) && !dock_enabled()) continue;
+    if ((is_dock_part(b) || b == Part::Tile) && !dock_enabled()) continue;
     if (contains(button_rect(b), x, y)) return b;
   }
   if (resizable_ && state_ == State::Normal) {
@@ -149,7 +156,7 @@ void Frame::draw_button(Painter& painter, Part button) {
   const Theme& t = painter.theme();
   const Rect2D r = button_rect(button);
   const bool on = button_enabled(button);
-  const bool down = (pressed_ == button && pressed_inside_) || (is_dock_part(button) && dock_of(button) == docked_);
+  const bool down = (pressed_ == button && pressed_inside_) || (is_dock_part(button) && dock_of(button) == docked_) || (button == Part::Tile && docked_ == Dock::Tile);
   const int32_t o = down ? 1 : 0;
   const uint32_t ink = on ? t.text : t.shadow;
   painter.fill(r, t.face);
@@ -181,6 +188,14 @@ void Frame::draw_button(Painter& painter, Part button) {
       else painter.fill({x + 4, y + 7, 8, 3}, ink);
       break;
     }
+    case Part::Tile: {   // a window cut in four
+      painter.outline({x + 3, y + 3, 10, 8}, ink);
+      painter.fill({x + 4, y + 4, 3, 2}, ink);
+      painter.fill({x + 9, y + 4, 3, 2}, ink);
+      painter.fill({x + 4, y + 8, 3, 2}, ink);
+      painter.fill({x + 9, y + 8, 3, 2}, ink);
+      break;
+    }
     default:  // close: a bold X
       painter.line(x + 4, y + 3, x + 11, y + 10, ink);
       painter.line(x + 5, y + 3, x + 12, y + 10, ink);
@@ -202,11 +217,12 @@ void Frame::paint(Painter& painter) {
   const Rect2D bar{kBorder, kBorder, bounds_.width - 2 * kBorder, static_cast<uint32_t>(kTitleHeight)};
   const bool lit = active_ && enabled();
   painter.fill(bar, lit ? t.title : t.inactive_title);
-  const int32_t text_right = button_rect(dock_enabled() ? Part::DockLeft : Part::Minimize).x - 2;
+  const int32_t text_right = button_rect(dock_enabled() ? Part::Tile : Part::Minimize).x - 2;
   painter.push_frame({bar.x, bar.y, static_cast<uint32_t>(text_right > bar.x ? text_right - bar.x : 0), bar.height});
   painter.text(4, (kTitleHeight - Painter::kGlyphHeight) / 2, title_.view(), lit ? t.title_text : t.inactive_title_text);
   painter.pop_frame();
   if (dock_enabled()) {
+    draw_button(painter, Part::Tile);
     draw_button(painter, Part::DockLeft);
     draw_button(painter, Part::DockRight);
     draw_button(painter, Part::DockTop);
@@ -224,7 +240,7 @@ void Frame::on_mouse_down(const MouseArgs& args) {
   grab_x_ = o.x + args.x;
   grab_y_ = o.y + args.y;
   grab_bounds_ = bounds_;
-  if (part == Part::Minimize || part == Part::Maximize || part == Part::Close || is_dock_part(part)) {
+  if (part == Part::Minimize || part == Part::Maximize || part == Part::Close || is_dock_part(part) || part == Part::Tile) {
     if (button_enabled(part)) {
       pressed_ = part;
       pressed_inside_ = true;
@@ -300,6 +316,7 @@ void Frame::on_mouse_up(const MouseArgs& args) {
   else if (pressed == Part::Maximize) maximize();
   else if (pressed == Part::Close) close();
   else if (is_dock_part(pressed)) dock(dock_of(pressed));
+  else if (pressed == Part::Tile) tile();
 }
 
 bool Frame::on_key(const KeyArgs& args) {

@@ -27,7 +27,7 @@
 // dock, activate, state(), active(), manager() - then means the host window (close() closes just the tab); host() tells which one.
 // The title bar drags the window; the borders resize it (unless set_resizable(false)). Four more buttons left of those dock the window to a
 // half of the desktop area - the left or right half, or the upper or lower one - and pressing the one of the edge the window is docked at
-// puts it back. They are drawn for windows that can be maximized and resized. Moving or resizing a docked window frees it; maximizing it
+// puts it back. A sixth button tiles all the windows (up to four, the topmost ones) into a grid, a quarter of the area each. They are drawn for windows that can be maximized and resized. Moving or resizing a docked window frees it; maximizing it
 // and restoring that brings back the size it had before it was docked.
 #pragma once
 #include "Gui/Control.hpp"
@@ -44,9 +44,9 @@ class Frame : public Control {
   static constexpr int32_t kMinWidth = 140, kMinHeight = 60;
 
   enum class State : uint8_t { Normal, Minimized, Maximized };
-  enum class Dock : uint8_t { None, Left, Right, Top, Bottom };
+  enum class Dock : uint8_t { None, Left, Right, Top, Bottom, Tile };
   enum class Part : uint8_t { None, Minimize, Maximize, Close, TitleBar, Client, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight,
-                              DockLeft, DockRight, DockTop, DockBottom };
+                              DockLeft, DockRight, DockTop, DockBottom, Tile };
 
   explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator) {}
 
@@ -98,6 +98,8 @@ class Frame : public Control {
   void activate();
   // Docks the window to `edge`, or puts it back where it was when it is docked there already (Dock::None also frees it).
   void dock(Dock edge);
+  // The tile button: the windows are arranged in a grid (see WindowManager::tile()); pressed again by a tiled window, they all go back.
+  void tile();
 
   // Where a point (frame coordinates) lies: a button, the title bar, a border, the client area.
   Part part_at(int32_t x, int32_t y) const;
@@ -142,6 +144,7 @@ class Frame : public Control {
   bool can_minimize_ = true, can_maximize_ = true, can_close_ = true, resizable_ = true;
   bool escape_closes_ = false;
   Dock docked_ = Dock::None;
+  uint8_t tile_slot_ = 0, tile_count_ = 0;   // the place in the grid while docked_ is Tile
   TabFrame* host_ = nullptr;
   uint8_t app_kind_ = 0;
   Rect2D home_;

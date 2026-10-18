@@ -4710,6 +4710,96 @@ static void test_tabs() {
   CHECK(a.live == 0);
 }
 
+// The tile button arranges the windows in a 2x2 grid; pressed again by a tiled window it puts them all back.
+static void test_tile_button() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    Frame f[6] = {Frame(a), Frame(a), Frame(a), Frame(a), Frame(a), Frame(a)};
+    Frame dialog(a);
+    dialog.set_maximize_enabled(false);
+    for (int i = 0; i < 6; ++i) {
+      f[i].set_bounds({10 + 20 * i, 10 + 15 * i, 300, 200});
+      CHECK(mgr.add_window(&f[i]));
+    }
+    CHECK(mgr.add_window(&dialog));
+    dialog.close();   // (a window that cannot be resized never joins in, whether open or not)
+    CHECK(mgr.add_window(&dialog));
+    w.layout();
+    CHECK(f[0].button_rect(Frame::Part::Tile).x < f[0].button_rect(Frame::Part::DockLeft).x && !dialog.dock_enabled());
+    auto press_tile = [&](Frame& frame) {
+      const Rect2D r = frame.button_rect(Frame::Part::Tile);
+      const Point o = frame.window_origin();
+      click(w, o.x + r.x + r.width / 2, o.y + r.y + r.height / 2);
+    };
+    // Six windows: the four on top (f[5] is the last opened, so the topmost; the dialog stays) are put in the quadrants, top to bottom of the stack
+    // in reading order; the two below are not touched.
+    mgr.activate(&f[5]);
+    press_tile(f[5]);
+    CHECK(f[5].docked() == Frame::Dock::Tile && f[5].bounds().x == 0 && f[5].bounds().y == 0 && f[5].bounds().width == 400 && f[5].bounds().height == 300);
+    CHECK(f[4].docked() == Frame::Dock::Tile && f[4].bounds().x == 400 && f[4].bounds().y == 0 && f[4].bounds().width == 400 && f[4].bounds().height == 300);
+    CHECK(f[3].docked() == Frame::Dock::Tile && f[3].bounds().x == 0 && f[3].bounds().y == 300 && f[3].bounds().width == 400 && f[3].bounds().height == 300);
+    CHECK(f[2].docked() == Frame::Dock::Tile && f[2].bounds().x == 400 && f[2].bounds().y == 300 && f[2].bounds().width == 400 && f[2].bounds().height == 300);
+    CHECK(f[1].docked() == Frame::Dock::None && f[0].docked() == Frame::Dock::None && f[1].bounds().x == 30 && dialog.docked() == Frame::Dock::None);
+    CHECK(mgr.active() == &f[5]);
+    // Pressed again in a tiled window: all of them go back.
+    press_tile(f[5]);
+    CHECK(f[5].docked() == Frame::Dock::None && f[5].bounds().x == 110 && f[5].bounds().y == 85 && f[5].bounds().width == 300);
+    CHECK(f[2].docked() == Frame::Dock::None && f[2].bounds().x == 50 && f[3].bounds().y == 55);
+
+    // Fewer windows: one fills the area, two a half each, three have two quarters over a half. Minimized windows do not count.
+    f[0].minimize();
+    f[1].minimize();
+    f[2].minimize();
+    f[3].minimize();
+    f[4].minimize();
+    mgr.tile(&f[5]);
+    CHECK(f[5].bounds().x == 0 && f[5].bounds().y == 0 && f[5].bounds().width == 800 && f[5].bounds().height == 600);
+    mgr.restore(&f[5]);
+    f[4].restore();
+    mgr.tile(&f[4]);
+    CHECK(f[4].bounds().x == 0 && f[4].bounds().width == 400 && f[4].bounds().height == 600 && f[5].bounds().x == 400 && f[5].bounds().width == 400);
+    mgr.tile(&f[4]);
+    f[3].restore();
+    f[4].activate();
+    mgr.tile(&f[3]);
+    Frame* top_three[3] = {&f[3], &f[4], &f[5]};
+    int quarters = 0, halves = 0;
+    for (Frame* t : top_three) {
+      quarters += t->bounds().width == 400 && t->bounds().height == 300;
+      halves += t->bounds().width == 800 && t->bounds().height == 300;
+    }
+    CHECK(quarters == 2 && halves == 1);
+    mgr.tile(&f[3]);
+
+    // A maximized window is tiled too and goes back to its size from before the maximizing; a docked one likewise.
+    f[5].maximize();
+    f[4].dock(Frame::Dock::Left);
+    mgr.tile(&f[5]);
+    CHECK(f[5].docked() == Frame::Dock::Tile && f[5].state() == Frame::State::Normal);
+    mgr.tile(&f[5]);
+    CHECK(f[5].docked() == Frame::Dock::None && f[5].bounds().width == 300 && f[4].docked() == Frame::Dock::None && f[4].bounds().width == 300);
+
+    // The grid follows the size of the area.
+    mgr.tile(&f[5]);
+    mgr.set_bounds({0, 0, 600, 400});
+    mgr.layout();
+    CHECK(f[5].docked() == Frame::Dock::Tile);
+    uint32_t sum = 0;
+    for (Frame* t : top_three) sum += t->bounds().width;
+    CHECK(sum >= 900 && f[5].bounds().width <= 600);
+    // And it toggles back.
+    mgr.tile(&f[5]);
+    CHECK(f[5].docked() == Frame::Dock::None);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_window_switcher_menu() {
   TestAllocator a;
   {
@@ -4792,6 +4882,7 @@ int main() {
   test_terminal();
   test_terminal_links();
   test_dock_buttons();
+  test_tile_button();
   test_desktop_shortcuts();
   test_tabs();
   test_spin_box();

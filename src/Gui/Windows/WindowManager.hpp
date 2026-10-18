@@ -41,6 +41,10 @@ class WindowManager : public Control {
   // What the close button does: takes the window out, then runs its on_closed handler.
   void close_window(Frame* frame);
 
+  // The tile button: arranges the windows in a grid over the area, a quarter each - the topmost four that are not minimized and can be resized.
+  // Fewer windows share the area (one fills it, two take a half each, three have two quarters over a half). `origin` is the window whose
+  // button was pressed; if it is tiled already the tiled windows all go back to where they were.
+  void tile(Frame* origin);
   // Alt+Tab: brings the window at the bottom of the stack to the front and activates it (restoring it if minimized), so repeating it goes through
   // all of them; backwards, the window in front goes to the bottom. Does nothing while a modal window is open.
   void cycle(bool forward);
@@ -67,6 +71,7 @@ class WindowManager : public Control {
   Frame* top_usable() const;      // the topmost visible, enabled window
   void keep_inside(Frame* frame);
   Rect2D dock_bounds(Frame::Dock edge) const;
+  Rect2D tile_bounds(uint32_t slot, uint32_t count) const;
 
   List<Frame*> order_;  // creation order
   Frame* active_ = nullptr;
