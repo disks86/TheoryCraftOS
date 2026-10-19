@@ -27,7 +27,7 @@ which the IDE shows in its debugger console. QEMU exits with the debugger.
 import os, queue, shutil, socket, subprocess, sys, threading, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PORT = int(os.environ.get("QEMU_GDB_PORT", "1234"))
+PORT = int(os.environ.get("QEMU_GDB_PORT", "2159"))
 
 
 def build_dir():

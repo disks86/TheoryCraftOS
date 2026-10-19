@@ -39,6 +39,14 @@ def call(command, **arguments):
 
 
 call("qmp_capabilities")
+if "--watch" in sys.argv:   # prints every event QEMU sends (STOP, RESUME, GUEST_PANICKED, ...) with the time, until QEMU exits
+    import time
+    while True:
+        line = f.readline()
+        if not line:
+            break
+        print(time.strftime("%H:%M:%S"), line.strip(), flush=True)
+    sys.exit()
 status = call("query-status")
 print("status:", status["status"], "(running)" if status["running"] else "(STOPPED)")
 if not status["running"]:

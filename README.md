@@ -593,7 +593,7 @@ accelerated`. `scripts/qemu-debug.sh` (the CLion QEMU configuration) and `script
 ### Debugging in QEMU
 
 `scripts/gdb-proxy.py` first rebuilds `BOOTX64` (output goes to the debugger console),
-then starts QEMU (frozen at reset, gdbstub on :1234) and
+then starts QEMU (frozen at reset, gdbstub on :2159) and
 bridges gdb to it: `target remote | scripts/gdb-proxy.py`. It rewrites
 software breakpoints to hardware ones, so breakpoints set before OVMF has
 loaded the image still work. OS output appears on gdb's stderr and in

@@ -36,7 +36,7 @@ document tcos-symbols
 Load BOOTX64.efi symbols at the base address the OS logged.
 end
 
-target remote :1234
+target remote :2159
 tcos-symbols
 set var g_debugger_attached = 1
 break kernel_main

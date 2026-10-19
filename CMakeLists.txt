@@ -484,11 +484,11 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     DEPENDS esp vars data USES_TERMINAL)
   add_custom_target(run-gl COMMAND ${QEMU_COMMON} ${QEMU_GL_GPU}
     DEPENDS esp vars data USES_TERMINAL)
-  # Starts the gdbstub on :1234 (-s) without halting; use with TCOS_DEBUG_WAIT.
-  add_custom_target(debug COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -s
+  # Starts the gdbstub on :2159 without halting; use with TCOS_DEBUG_WAIT.
+  add_custom_target(debug COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -gdb tcp:127.0.0.1:2159
     DEPENDS esp vars data USES_TERMINAL)
   # Freeze the CPU at reset until gdb connects (-S).
-  add_custom_target(debug-halted COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -s -S
+  add_custom_target(debug-halted COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -gdb tcp:127.0.0.1:2159 -S
     DEPENDS esp vars data USES_TERMINAL)
 else()
   message(WARNING "qemu-system-x86_64 or OVMF firmware not found; run/debug targets disabled")

@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Build, then run QEMU in the foreground with the gdbstub on :1234.
+# Build, then run QEMU in the foreground. QEMU_GDB=1 opens the gdbstub on :2159 (off by default: QEMU pauses the VM whenever any client connects to it).
 # OS output appears on stdout, so run this from an IDE run tab.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -44,7 +44,7 @@ case $GPU_CHOICE in
   std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,show-cursor=off,show-menubar=off" ;;
   *) echo "unknown QEMU_GPU=$QEMU_GPU (auto, std, virtio, gl)" >&2; exit 2 ;;
 esac
-exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \
+exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} ${QEMU_GDB:+-gdb tcp:127.0.0.1:2159} \
   -qmp unix:"$BUILD/qmp.sock",server=on,wait=off -d guest_errors,unimp -D "$BUILD/qemu-guest.log" \
   -drive if=pflash,format=raw,readonly=on,file="$(sed -n 's/^OVMF_CODE:FILEPATH=//p' "$BUILD/CMakeCache.txt")" \
   -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
