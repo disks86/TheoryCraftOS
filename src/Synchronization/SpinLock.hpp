@@ -70,9 +70,11 @@ class SpinLock {
     if (owner_core_ != cpu_.current_core()) {
       kernel::panic("Unlocking from wrong core", nullptr);
     }
+    // Forget the owner BEFORE letting go: once the lock is free another core can take it and record itself as the owner, and clearing the field after
+    // that would wipe its entry (and its own unlock would then panic with "Unlocking from wrong core").
+    owner_core_ = 0xFFFFFFFF;  // Invalid core id
     __atomic_store_n(&locked_, 0, __ATOMIC_RELEASE);
     kernel::irq_restore(flags);
-    owner_core_ = 0xFFFFFFFF;  // Invalid core id
   }
 
  private:
