@@ -61,7 +61,8 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       memory_value_(allocator),
       info_(allocator),
       tree_(allocator),
-      hardware_menu_(allocator),
+      display_menu_(allocator),
+      adapter_menu_(allocator),
       hardware_info_(allocator),
       cpu_meter_(allocator),
       memory_meter_(allocator),
@@ -140,8 +141,9 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   hardware_info_.set_size(0, 22);
   tree_.set_dock(DockStyle::Fill);
   tree_.on_selection_changed(Handler::immediate(&ComputerManager::on_hardware_selection, this));
-  tree_.set_context_menu(&hardware_menu_);
-  display_settings_item_ = hardware_menu_.add_item("Display Settings...", {&ComputerManager::on_display_settings_item, this});
+  tree_.set_context_menu(&display_menu_);   // (the nodes that have a menu say which; see TreeView)
+  display_settings_item_ = display_menu_.add_item("Display Settings...", {&ComputerManager::on_display_settings_item, this});
+  properties_item_ = adapter_menu_.add_item("Properties...", {&ComputerManager::on_properties_item, this});
   hardware_page_.add(&hardware_info_);
   hardware_page_.add(&tree_);
 
@@ -175,6 +177,14 @@ void ComputerManager::on_display_settings_item(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
   t->fire(t->open_display_settings_);
 }
+void ComputerManager::on_properties_item(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  const int32_t node = t->tree_.selected();
+  HardwareEntry e;
+  if (node < 0 || !t->inventory_ || (t->tree_.node_tag(node) & 0x10000u) || !t->inventory_->entry(t->tree_.node_tag(node), &e)) return;
+  t->properties_adapter_ = e.id;
+  t->fire(t->open_network_properties_);
+}
 void ComputerManager::on_copy_row(void* self, Control&) { static_cast<ComputerManager*>(self)->grid_.copy_selected_row(); }
 void ComputerManager::on_grid_menu_opening(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
@@ -199,9 +209,12 @@ int32_t ComputerManager::hardware_group_node(HardwareGroup group) const { return
 void ComputerManager::rebuild_hardware() {
   UiGuard lock(this);
   const bool first = tree_.node_count() == 0;
-  uint32_t open_mask = 0;
+  uint32_t open_mask = 0, had_mask = 0;   // the groups that were open, and those that were there at all
   for (uint32_t g = 0; g < kHardwareGroupCount; ++g)
-    if (group_nodes_[g] >= 0 && tree_.expanded(group_nodes_[g])) open_mask |= 1u << g;
+    if (group_nodes_[g] >= 0) {
+      had_mask |= 1u << g;
+      if (tree_.expanded(group_nodes_[g])) open_mask |= 1u << g;
+    }
   String selected_name(allocator());
   uint32_t selected_tag = ~0u;
   if (tree_.selected() >= 0) {
@@ -225,11 +238,12 @@ void ComputerManager::rebuild_hardware() {
         if (node < 0) break;
         group_nodes_[g] = node;
       }
-      tree_.add_node(node, e.name, i, g == static_cast<uint32_t>(HardwareGroup::Storage) ? ItemIcon::Drive : ItemIcon::File);
+      const int32_t device = tree_.add_node(node, e.name, i, g == static_cast<uint32_t>(HardwareGroup::Storage) ? ItemIcon::Drive : ItemIcon::File);
+      if (device >= 0 && g == static_cast<uint32_t>(HardwareGroup::Network)) tree_.set_node_menu(device, &adapter_menu_);   // (Properties)
     }
     if (node < 0) continue;
-    if (first || (open_mask & (1u << g))) tree_.set_expanded(node, true);
-    if (g == static_cast<uint32_t>(HardwareGroup::Displays)) tree_.set_node_menu(node, true);   // (the only menu: Display Settings)
+    if (first || !(had_mask & (1u << g)) || (open_mask & (1u << g))) tree_.set_expanded(node, true);   // (a group that turns up is open)
+    if (g == static_cast<uint32_t>(HardwareGroup::Displays)) tree_.set_node_menu(node, &display_menu_);   // (Display Settings)
   }
   // The selection: the same device, or the same group.
   for (uint32_t n = 0; selected_tag != ~0u && n < tree_.node_count(); ++n) {

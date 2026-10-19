@@ -26,6 +26,7 @@
 #pragma once
 #include "Desktop/DesktopSurface.hpp"
 #include "Desktop/DisplaySettings.hpp"
+#include "Desktop/NetworkProperties.hpp"
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/FileDialog.hpp"
@@ -151,6 +152,12 @@ class Desktop {
   gui::Point pointer() const { return input_.cursor(); }
   // The devices of the machine for the computer manager's Hardware tab (nullptr: none). It must outlive the desktop.
   void set_hardware_inventory(IHardwareInventory* inventory) { computer_manager_.set_hardware_inventory(inventory); }
+  // The network adapters' details for the properties window (nullptr: none). It must outlive the desktop.
+  void set_network_details(INetworkDetails* details) { network_properties_.set_details(details); }
+  // Opens the properties window of a network adapter (its number: HardwareEntry::id), or brings it forward showing that adapter. It is reached from
+  // the menu of an adapter in the computer manager's hardware tree.
+  void open_network_properties(uint32_t adapter);
+  NetworkProperties& network_properties() { return network_properties_; }
   // Opens the display settings window, or brings it forward. It is reached from the Displays group of the computer manager's hardware tree.
   void open_display_settings();
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
@@ -197,6 +204,7 @@ class Desktop {
   static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
   static void on_display_settings(void* self, gui::Control&);
+  static void on_network_properties(void* self, gui::Control&);
   static void on_settings_changed(void* self, gui::Control&);
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
@@ -245,6 +253,7 @@ class Desktop {
   Terminal terminal_;
   MediaPlayer media_player_;
   DisplaySettings display_settings_;
+  NetworkProperties network_properties_;
   gui::Frame about_;
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;

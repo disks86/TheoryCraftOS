@@ -22,6 +22,8 @@
 
 namespace hardware {
 
+enum class LinkDuplex : uint8_t { Unknown, Half, Full };
+
 // An Ethernet network interface. It moves raw frames - destination MAC, source
 // MAC, EtherType, payload - and knows nothing about protocols above that.
 // Polled: nothing blocks, and received frames queue up inside the interface
@@ -33,6 +35,10 @@ class INetworkInterface : public IHardware {
   virtual MacAddress mac_address() const = 0;
   // True while a cable is connected / the link is up.
   virtual bool link_up() const = 0;
+  // The speed the link runs at, in megabits per second (10, 100, 1000, ...); 0 when the link is down or the adapter does not say. And whether
+  // it is full duplex (Unknown when the adapter does not say).
+  virtual uint32_t link_speed_mbps() const { return 0; }
+  virtual LinkDuplex link_duplex() const { return LinkDuplex::Unknown; }
 
   // Queues one frame for sending, copying it before returning. Frames shorter
   // than kEthernetMinFrame are padded. False if the frame is empty or longer

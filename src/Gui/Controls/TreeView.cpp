@@ -84,9 +84,9 @@ int32_t TreeView::child_at(int32_t node, uint32_t index) const {
   return child;
 }
 
-void TreeView::set_node_menu(int32_t node, bool has_menu) {
+void TreeView::set_node_menu(int32_t node, ContextMenu* menu) {
   UiGuard lock(this);
-  if (valid(node)) nodes_[static_cast<uint64_t>(node)].menu = has_menu;
+  if (valid(node)) nodes_[static_cast<uint64_t>(node)].menu = menu;
 }
 
 // --- Rows: the nodes that are shown --------------------------------------------------------------------
@@ -285,10 +285,11 @@ bool TreeView::accepts_context_menu(int32_t x, int32_t y) const {
   return valid(node) && nodes_[static_cast<uint64_t>(node)].menu;
 }
 
+// The window opens the control's context menu right after this: it is the one of the node.
 void TreeView::prepare_context_menu(int32_t x, int32_t y) {
-  if (x < 0) return;
-  const int32_t node = node_at(x, y);
-  if (node >= 0) select(node);
+  const int32_t node = x < 0 ? selected_ : node_at(x, y);
+  if (x >= 0 && node >= 0) select(node);
+  if (valid(node) && nodes_[static_cast<uint64_t>(node)].menu) set_context_menu(nodes_[static_cast<uint64_t>(node)].menu);
 }
 
 bool TreeView::on_key(const KeyArgs& args) {

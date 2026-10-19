@@ -232,6 +232,8 @@ add_executable(BOOTX64
   src/Desktop/MediaPlayer.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
+  src/SystemNetworkDetails.cpp
+  src/Desktop/NetworkProperties.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
   src/GuiDemo.cpp

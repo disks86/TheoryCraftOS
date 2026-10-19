@@ -1677,7 +1677,7 @@ static void test_tree_view() {
     Counter chosen;
     menu.add_item("Do it", chosen.handler());
     t.set_context_menu(&menu);
-    t.set_node_menu(g2, true);
+    t.set_node_menu(g2, &menu);
     CHECK(!t.accepts_context_menu(-1, -1) || t.selected() == g2);
     t.select(g1);
     const Point on_g1 = node_point(t, g1), on_g2 = node_point(t, g2);
@@ -1750,18 +1750,21 @@ static void test_hardware_tab() {
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1, 1920x1080, primary");
     inv.list.add(HardwareGroup::Displays, "Monitor B", "HDMI-2, 1280x1024");
     inv.list.add(HardwareGroup::Storage, "Disk X", "8.0 GB");
-    Counter opened;
+    inv.list.add(HardwareGroup::Network, "Fake NIC one", "connected, 1 Gbps", 7);
+    inv.list.add(HardwareGroup::Network, "Fake NIC two", "no link", 8);
+    Counter opened, properties;
     tm.on_open_display_settings(opened.handler());
+    tm.on_open_network_properties(properties.handler());
     CHECK(mgr.add_window(&tm));
     tm.set_hardware_inventory(&inv);
     tm.tabs().select_page(2);
     w.layout();
     TreeView& tree = tm.hardware_tree();
     // The groups that have devices, in a fixed order, all open at first; Network has none.
-    CHECK(tree.child_count(-1) == 4 && tm.hardware_group_node(HardwareGroup::Network) < 0);
+    CHECK(tree.child_count(-1) == 5 && tm.hardware_group_node(HardwareGroup::Network) >= 0 && tm.hardware_group_node(HardwareGroup::Audio) < 0);
     const int32_t displays = tm.hardware_group_node(HardwareGroup::Displays), storage = tm.hardware_group_node(HardwareGroup::Storage);
     CHECK(displays >= 0 && tree.node_text(displays).equals("Displays") && tree.child_count(displays) == 2 && tree.expanded(displays));
-    CHECK(tree.node_text(tree.child_at(displays, 1)).equals("Monitor B") && tree.visible_count() == 4 + 1 + 1 + 2 + 1);
+    CHECK(tree.node_text(tree.child_at(displays, 1)).equals("Monitor B") && tree.visible_count() == 5 + 1 + 1 + 2 + 1 + 2);
     CHECK(tm.tabs().selected_page() == 2 && tm.tabs().page_title(2).equals("Hardware") && tree.visible());
     // The line under the tree tells about the selected device or group.
     tree.select(tree.child_at(displays, 0));
@@ -1772,19 +1775,31 @@ static void test_hardware_tab() {
     CHECK(tm.hardware_info().text().equals("1 device"));
     // Display Settings is in the menu of the Displays group, and of nothing else.
     const Point on_displays = node_point(tree, displays), on_storage = node_point(tree, storage);
-    CHECK(!choose_context(w, tm.hardware_menu(), on_storage.x, on_storage.y, "Display Settings...") && !w.popup() && opened.count == 0);
-    CHECK(choose_context(w, tm.hardware_menu(), on_displays.x, on_displays.y, "Display Settings...") && opened.count == 1);
+    CHECK(!choose_context(w, tm.display_menu(), on_storage.x, on_storage.y, "Display Settings...") && !w.popup() && opened.count == 0);
+    CHECK(choose_context(w, tm.display_menu(), on_displays.x, on_displays.y, "Display Settings...") && opened.count == 1);
     const Point on_monitor = node_point(tree, tree.child_at(displays, 0));
     right_click(w, on_monitor.x, on_monitor.y);
     CHECK(!w.popup() && opened.count == 1);
+    // A network adapter has Properties (and only that); the group of adapters has no menu; the Displays menu still works afterwards.
+    const int32_t network = tm.hardware_group_node(HardwareGroup::Network);
+    const int32_t nic = tree.child_at(network, 1);
+    CHECK(tree.node_text(nic).equals("Fake NIC two") && tree.child_count(network) == 2);
+    const Point on_nic = node_point(tree, nic), on_adapters = node_point(tree, network);
+    CHECK(choose_context(w, tm.adapter_menu(), on_nic.x, on_nic.y, "Properties...") && properties.count == 1 && tm.network_adapter() == 8 && opened.count == 1);
+    const int32_t first_nic = tree.child_at(network, 0);
+    const Point on_first = node_point(tree, first_nic);
+    CHECK(choose_context(w, tm.adapter_menu(), on_first.x, on_first.y, "Properties...") && properties.count == 2 && tm.network_adapter() == 7);
+    right_click(w, on_adapters.x, on_adapters.y);
+    CHECK(!w.popup() && properties.count == 2);
+    CHECK(choose_context(w, tm.display_menu(), on_displays.x, on_displays.y, "Display Settings...") && opened.count == 2);
 
     // A new look at the machine: another monitor, a network adapter; what was closed stays closed and the selection stays on its device.
     tree.set_expanded(storage, false);
     tree.select(tree.child_at(displays, 1));
-    inv.list.add(HardwareGroup::Network, "Fake NIC", "up");
+    inv.list.add(HardwareGroup::Audio, "Fake speaker", "48 kHz");
     inv.changed = true;
     tm.update(1000000);
-    CHECK(tree.child_count(-1) == 5 && tm.hardware_group_node(HardwareGroup::Network) >= 0);
+    CHECK(tree.child_count(-1) == 6 && tm.hardware_group_node(HardwareGroup::Audio) >= 0);
     CHECK(!tree.expanded(tm.hardware_group_node(HardwareGroup::Storage)) && tree.expanded(tm.hardware_group_node(HardwareGroup::Displays)));
     CHECK(tree.selected() >= 0 && tree.node_text(tree.selected()).equals("Monitor B") && tm.hardware_info().text().equals("HDMI-2, 1280x1024"));
     // Nothing changed: the tree is left alone (a user who scrolled or selected keeps it).
@@ -1799,6 +1814,112 @@ static void test_hardware_tab() {
     CHECK(tree.node_count() == 0 && tm.hardware_info().text().find(StringView("No hardware")) != StringView::npos);
     w.render();
     mgr.remove_window(&tm);
+  }
+  CHECK(a.live == 0);
+}
+
+struct FakeNetworkDetails final : desktop::INetworkDetails {
+  desktop::NetworkAdapterInfo info;
+  uint32_t known = 3;
+  int reads = 0;
+  bool adapter(uint32_t id, desktop::NetworkAdapterInfo* out) override {
+    ++reads;
+    if (id != known) return false;
+    *out = info;
+    return true;
+  }
+  static void set_ip(uint8_t* o, uint8_t a, uint8_t b, uint8_t c, uint8_t d) { o[0] = a; o[1] = b; o[2] = c; o[3] = d; }
+  FakeNetworkDetails() {
+    strcpy(info.name, "Fake e1000");
+    const uint8_t mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0xAB};
+    memcpy(info.mac, mac, 6);
+    info.link_up = true;
+    info.speed_mbps = 1000;
+    info.duplex = 2;
+    info.has_stack = info.configured = info.dhcp = true;
+    strcpy(info.dhcp_state, "bound");
+    info.lease_seconds = 86400;
+    set_ip(info.address, 10, 0, 2, 15);
+    set_ip(info.netmask, 255, 255, 255, 0);
+    set_ip(info.gateway, 10, 0, 2, 2);
+    set_ip(info.dns, 10, 0, 2, 3);
+    set_ip(info.dhcp_server, 10, 0, 2, 2);
+    info.frames_sent = 120;
+    info.frames_received = 340;
+  }
+};
+
+// The network adapter properties: link state, speed, and the IP, gateway and DNS the adapter was given.
+static void test_network_properties() {
+  TestAllocator a;
+  {
+    using P = desktop::NetworkProperties;
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    P props(a);
+    FakeNetworkDetails details;
+    CHECK(mgr.add_window(&props));
+    props.update();   // (no source yet)
+    CHECK(props.cell(P::kLink, 1).empty());
+    props.set_details(&details);
+    props.show_adapter(3);
+    w.layout();
+    CHECK(props.adapter() == 3 && props.title().equals("Fake e1000 - Properties") && props.grid().row_count() == P::kRowCount);
+    CHECK(props.cell(P::kLink, 0).equals("Link") && props.cell(P::kLink, 1).equals("Connected"));
+    CHECK(props.cell(P::kSpeed, 1).equals("1 Gbps, full duplex") && props.cell(P::kMac, 1).equals("52:54:00:12:34:AB"));
+    CHECK(props.cell(P::kConfiguration, 1).equals("Automatic (DHCP, bound)"));
+    CHECK(props.cell(P::kAddress, 1).equals("10.0.2.15") && props.cell(P::kMask, 1).equals("255.255.255.0") && props.cell(P::kGateway, 1).equals("10.0.2.2") && props.cell(P::kDns, 1).equals("10.0.2.3"));
+    CHECK(props.cell(P::kDhcpServer, 1).equals("10.0.2.2") && props.cell(P::kLease, 1).equals("24 h 0 min"));
+    CHECK(props.cell(P::kSent, 1).equals("120") && props.cell(P::kReceived, 1).equals("340") && props.cell(P::kDropped, 1).equals("0"));
+    // The link goes down, at 100 Mbps half duplex it comes back, and a manual configuration has no lease.
+    details.info.link_up = false;
+    props.update();
+    CHECK(props.cell(P::kLink, 1).equals("Disconnected") && props.cell(P::kSpeed, 1).equals("-"));
+    details.info.link_up = true;
+    details.info.speed_mbps = 100;
+    details.info.duplex = 1;
+    details.info.dhcp = false;
+    props.update();
+    CHECK(props.cell(P::kSpeed, 1).equals("100 Mbps, half duplex") && props.cell(P::kConfiguration, 1).equals("Manual") && props.cell(P::kLease, 1).equals("-") && props.cell(P::kDhcpServer, 1).equals("-"));
+    details.info.speed_mbps = 0;
+    details.info.duplex = 0;
+    props.update();
+    CHECK(props.cell(P::kSpeed, 1).equals("Not reported by the adapter"));
+    details.info.speed_mbps = 2500;
+    props.update();
+    CHECK(props.cell(P::kSpeed, 1).equals("2.5 Gbps") || props.cell(P::kSpeed, 1).equals("2500 Mbps"));
+    // No address yet (DHCP selecting) and no stack at all.
+    details.info.configured = false;
+    details.info.dhcp = true;
+    strcpy(details.info.dhcp_state, "selecting");
+    memset(details.info.address, 0, 4);
+    memset(details.info.gateway, 0, 4);
+    props.update();
+    CHECK(props.cell(P::kAddress, 1).equals("Not assigned") && props.cell(P::kGateway, 1).equals("Not assigned") && props.cell(P::kConfiguration, 1).equals("Automatic (DHCP, selecting)"));
+    details.info.has_stack = false;
+    props.update();
+    CHECK(props.cell(P::kConfiguration, 1).equals("No network stack on this adapter") && props.cell(P::kDns, 1).equals("Not assigned"));
+    // An adapter that is gone.
+    details.known = 9;
+    props.update();
+    CHECK(props.cell(P::kLink, 1).empty());
+    details.known = 3;
+    props.update();
+    CHECK(props.cell(P::kLink, 1).equals("Connected"));
+    // Copy Row: the selected line goes to the clipboard.
+    kernel::Clipboard clipboard(a);
+    w.set_clipboard(&clipboard);
+    props.grid().select_row(P::kMac);
+    click_center(w, props.copy_button());
+    String copied(a);
+    CHECK(clipboard.get_text(&copied) && copied.view().find(StringView("Hardware address")) != StringView::npos && copied.view().find(StringView("52:54")) != StringView::npos);
+    // Close.
+    props.close();
+    CHECK(!props.manager());
   }
   CHECK(a.live == 0);
 }
@@ -1822,8 +1943,25 @@ static void test_display_settings_entry() {
     const int32_t displays = cm.hardware_group_node(HardwareGroup::Displays);
     CHECK(displays >= 0 && !d.display_settings().manager());
     const Point p = node_point(cm.hardware_tree(), displays);
-    CHECK(choose_context(w, cm.hardware_menu(), p.x, p.y, "Display Settings...") && d.display_settings().manager() != nullptr);
+    CHECK(choose_context(w, cm.display_menu(), p.x, p.y, "Display Settings...") && d.display_settings().manager() != nullptr);
     CHECK(strcmp(cm.title().data(), "Computer Manager") == 0);
+
+    // A network adapter's Properties opens its window, which follows the adapter once a second. (The display settings window is out of the way.)
+    d.display_settings().close();
+    cm.activate();
+    inv.list.add(HardwareGroup::Network, "Fake e1000", "connected", 3);
+    inv.changed = true;
+    FakeNetworkDetails details;
+    d.set_network_details(&details);
+    cm.update(1000000);
+    const int32_t network = cm.hardware_group_node(HardwareGroup::Network);
+    CHECK(network >= 0 && !d.network_properties().manager());
+    const Point q = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 0));
+    CHECK(choose_context(w, cm.adapter_menu(), q.x, q.y, "Properties...") && d.network_properties().manager() != nullptr);
+    CHECK(d.network_properties().adapter() == 3 && d.network_properties().cell(desktop::NetworkProperties::kAddress, 1).equals("10.0.2.15"));
+    details.info.link_up = false;
+    d.step(5000000);
+    CHECK(d.network_properties().cell(desktop::NetworkProperties::kLink, 1).equals("Disconnected"));
   }
   CHECK(a.live == 0);
 }
@@ -5223,6 +5361,7 @@ int main() {
   test_computer_manager();
   test_tree_view();
   test_hardware_tab();
+  test_network_properties();
   test_display_settings_entry();
   test_text_editor();
   test_notepad();

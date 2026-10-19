@@ -71,7 +71,7 @@ const char* usb_class_name(uint8_t device_class) {
 
 }  // namespace
 
-void SystemInventory::add(desktop::HardwareList* list, HardwareGroup group, StringView name) { list->add(group, name, scratch_.view()); }
+void SystemInventory::add(desktop::HardwareList* list, HardwareGroup group, StringView name, uint32_t id) { list->add(group, name, scratch_.view(), id); }
 
 void SystemInventory::collect(desktop::HardwareList* list) {
   String name(allocator_);
@@ -142,8 +142,19 @@ void SystemInventory::collect(desktop::HardwareList* list) {
   if (network_) {
     for (uint32_t i = 0; i < network_->count(); ++i)
       if (hardware::INetworkInterface* n = network_->at(i)) {
-        scratch_.assign("");
-        add(list, HardwareGroup::Network, n->name());
+        scratch_.assign(n->link_up() ? "connected" : "no link");
+        const uint32_t speed = n->link_speed_mbps();
+        if (speed) {
+          scratch_.append(", ");
+          if (speed >= 1000 && speed % 1000 == 0) {
+            scratch_.append_uint(speed / 1000);
+            scratch_.append(" Gbps");
+          } else {
+            scratch_.append_uint(speed);
+            scratch_.append(" Mbps");
+          }
+        }
+        add(list, HardwareGroup::Network, n->name(), i);
       }
   }
   if (audio_) {

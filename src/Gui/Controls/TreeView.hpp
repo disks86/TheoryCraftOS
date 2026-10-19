@@ -20,10 +20,12 @@
 // small box before it that shows "+" when it is closed and "-" when it is open; clicking the box (or Right / Left, Enter or Space on the selected node)
 // opens and closes it. One node is selected: click it, or use Up / Down (through the nodes that are shown), Left (close it, or go to its parent),
 // Right (open it, or go to its first child), Home, End, Page Up and Page Down. The mouse wheel scrolls, and a scroll bar shows when the tree is
-// taller than the control. A right click selects the node under the pointer and opens the control's context menu - but only for nodes marked with
-// set_node_menu(): other nodes have no menu, so one tree can carry different commands for different places.
+// taller than the control. A right click selects the node under the pointer and opens the context menu of that node - set with set_node_menu();
+// a node without one has no menu, so one tree can carry different commands for different places. (The control's own context menu, if any, is
+// what the window finds first and must be set to something - any of the node menus will do - for right clicks to get here.)
 #pragma once
 #include "Gui/Control.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
 #include "ObjectContainer/List.hpp"
@@ -61,7 +63,9 @@ class TreeView : public Control {
   void on_selection_changed(Handler handler) { UiGuard lock(this); selection_changed_ = handler; }
 
   // --- Context menu
-  void set_node_menu(int32_t node, bool has_menu);
+  // The menu a right click on the node opens (nullptr: none). The menu must outlive the tree.
+  void set_node_menu(int32_t node, ContextMenu* menu);
+  ContextMenu* node_menu(int32_t node) const { return valid(node) ? nodes_[static_cast<uint64_t>(node)].menu : nullptr; }
   bool accepts_context_menu(int32_t x, int32_t y) const override;
   void prepare_context_menu(int32_t x, int32_t y) override;
 
@@ -87,7 +91,8 @@ class TreeView : public Control {
     String text;
     int32_t parent = -1;
     uint32_t tag = 0;
-    bool expanded = false, menu = false;
+    bool expanded = false;
+    ContextMenu* menu = nullptr;
     ItemIcon icon = ItemIcon::File;
     int32_t depth = 0;
     int32_t first_child = -1, last_child = -1, next_sibling = -1;   // the children are a chain

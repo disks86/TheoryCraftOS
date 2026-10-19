@@ -51,11 +51,12 @@ bool same_text(const char* a, const char* b) {
 }
 }  // namespace
 
-bool HardwareList::add(HardwareGroup group, StringView name, StringView detail) {
+bool HardwareList::add(HardwareGroup group, StringView name, StringView detail, uint32_t id) {
   HardwareEntry e;
   e.group = group;
   copy_text(e.name, sizeof e.name, name);
   copy_text(e.detail, sizeof e.detail, detail);
+  e.id = id;
   return entries_.push_back(e);
 }
 
@@ -63,7 +64,7 @@ bool HardwareList::same_as(const HardwareList& other) const {
   if (entries_.count() != other.entries_.count()) return false;
   for (uint64_t i = 0; i < entries_.count(); ++i) {
     const HardwareEntry &a = entries_[i], &b = other.entries_[i];
-    if (a.group != b.group || !same_text(a.name, b.name) || !same_text(a.detail, b.detail)) return false;
+    if (a.group != b.group || a.id != b.id || !same_text(a.name, b.name) || !same_text(a.detail, b.detail)) return false;
   }
   return true;
 }

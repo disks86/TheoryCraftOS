@@ -50,6 +50,7 @@ class Rtl8139NetworkInterface final : public INetworkInterface {
 
   MacAddress mac_address() const override { return mac_; }
   bool link_up() const override;
+  uint32_t link_speed_mbps() const override;
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool) override { return true; }  // (the receive configuration already accepts multicast)

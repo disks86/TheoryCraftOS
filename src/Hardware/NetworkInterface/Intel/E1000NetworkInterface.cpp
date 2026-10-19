@@ -31,7 +31,7 @@ constexpr uint32_t kTdbal = 0x3800, kTdbah = 0x3804, kTdlen = 0x3808, kTdh = 0x3
 constexpr uint32_t kMulticastTable = 0x5200, kRal0 = 0x5400, kRah0 = 0x5404;
 
 constexpr uint32_t kCtrlReset = 1u << 26, kCtrlSetLinkUp = 1u << 6, kCtrlAutoSpeed = 1u << 5;
-constexpr uint32_t kStatusLinkUp = 1u << 1;
+constexpr uint32_t kStatusLinkUp = 1u << 1, kStatusFullDuplex = 1u << 0, kStatusSpeedShift = 6, kStatusSpeedMask = 3;
 constexpr uint32_t kRctlEnable = 1u << 1, kRctlMulticastPromiscuous = 1u << 4, kRctlBroadcast = 1u << 15, kRctlStripCrc = 1u << 26;  // 2 KiB buffers: BSIZE = 0
 constexpr uint32_t kTctlEnable = 1u << 1, kTctlPadShortPackets = 1u << 3;
 constexpr uint32_t kTctlCollisionThreshold = 0x0F << 4, kTctlCollisionDistance = 0x40 << 12;
@@ -128,6 +128,18 @@ void E1000NetworkInterface::shutdown() {
 }
 
 bool E1000NetworkInterface::link_up() const { return started_ && (read(kStatus) & kStatusLinkUp); }
+
+// STATUS bits 7:6 give the speed: 00 is 10 Mb/s, 01 is 100 Mb/s, 10 and 11 are 1000 Mb/s.
+uint32_t E1000NetworkInterface::link_speed_mbps() const {
+  if (!link_up()) return 0;
+  const uint32_t speed = (read(kStatus) >> kStatusSpeedShift) & kStatusSpeedMask;
+  return speed == 0 ? 10 : speed == 1 ? 100 : 1000;
+}
+
+LinkDuplex E1000NetworkInterface::link_duplex() const {
+  if (!link_up()) return LinkDuplex::Unknown;
+  return (read(kStatus) & kStatusFullDuplex) ? LinkDuplex::Full : LinkDuplex::Half;
+}
 
 bool E1000NetworkInterface::transmit(ConstByteView frame) {
   kernel::ScopedMutex guard(mutex_);

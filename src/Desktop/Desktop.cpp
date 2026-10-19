@@ -51,6 +51,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       terminal_(allocator),
       media_player_(allocator),
       display_settings_(allocator),
+      network_properties_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
       extra_explorers_(allocator),
@@ -140,6 +141,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.show_cursor(mouse != nullptr);
   display_settings_.on_changed({&Desktop::on_settings_changed, this});
   computer_manager_.on_open_display_settings({&Desktop::on_display_settings, this});
+  computer_manager_.on_open_network_properties({&Desktop::on_network_properties, this});
   input_.set_confine(&Desktop::confine_pointer, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
@@ -430,6 +432,19 @@ void Desktop::open_display_settings() {
   });
 }
 
+void Desktop::open_network_properties(uint32_t adapter) {
+  window_.locked([&] {
+    network_properties_.show_adapter(adapter);
+    if (network_properties_.manager()) network_properties_.activate();
+    else windows_.add_window(&network_properties_);
+  });
+}
+
+void Desktop::on_network_properties(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->open_network_properties(d->computer_manager_.network_adapter());
+}
+
 void Desktop::on_display_settings(void* self, Control&) { static_cast<Desktop*>(self)->open_display_settings(); }
 void Desktop::on_settings_changed(void* self, Control&) { static_cast<Desktop*>(self)->monitors_changed(); }
 
@@ -659,6 +674,7 @@ void Desktop::pump(uint64_t uptime_us) {
   }
   if (second != polled_second_) {
     polled_second_ = second;
+    if (network_properties_.manager()) network_properties_.update();
     if (computer_manager_.manager()) computer_manager_.update(uptime_us);
     DateTime now;
     const bool ok = clock_source_ && clock_source_(clock_context_, &now);

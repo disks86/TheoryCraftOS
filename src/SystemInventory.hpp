@@ -60,7 +60,7 @@ class SystemInventory final : public desktop::IHardwareInventory {
 
  private:
   void collect(desktop::HardwareList* list);
-  void add(desktop::HardwareList* list, desktop::HardwareGroup group, StringView name);   // detail = scratch_
+  void add(desktop::HardwareList* list, desktop::HardwareGroup group, StringView name, uint32_t id = 0);   // detail = scratch_
   allocators::IAllocator& allocator_;
   desktop::HardwareList current_;
   String scratch_;

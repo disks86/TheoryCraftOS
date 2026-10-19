@@ -35,6 +35,7 @@ constexpr uint8_t kCmdBufferEmpty = 1u << 0, kCmdTransmitEnable = 1u << 2, kCmdR
 constexpr uint32_t kTsdOwn = 1u << 13;  // the chip has finished DMAing this slot's buffer
 constexpr uint16_t kRxStatusOk = 1u << 0;
 constexpr uint8_t kMsrLinkInactive = 1u << 2;  // 0 = link is up
+constexpr uint8_t kMsrSpeed10 = 1u << 3;       // 1 = the link runs at 10 Mb/s, 0 = 100 Mb/s
 
 // Receive config: accept our unicast, multicast and broadcast frames; WRAP lets a
 // frame run past the ring's end instead of splitting; no FIFO threshold; DMA bursts unlimited.
@@ -106,6 +107,8 @@ void Rtl8139NetworkInterface::shutdown() {
 }
 
 bool Rtl8139NetworkInterface::link_up() const { return started_ && !(read8(kMsr) & kMsrLinkInactive); }
+
+uint32_t Rtl8139NetworkInterface::link_speed_mbps() const { return link_up() ? ((read8(kMsr) & kMsrSpeed10) ? 10 : 100) : 0; }
 
 bool Rtl8139NetworkInterface::transmit(ConstByteView frame) {
   kernel::ScopedMutex guard(mutex_);

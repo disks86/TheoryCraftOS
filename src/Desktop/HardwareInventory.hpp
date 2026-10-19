@@ -49,6 +49,7 @@ struct HardwareEntry {
   HardwareGroup group = HardwareGroup::System;
   char name[64] = {};
   char detail[96] = {};   // one line about the device: its size, address, state
+  uint32_t id = 0;        // the device's number among those of its kind in its subsystem (a network adapter's number, for its properties)
 };
 
 class HardwareList {
@@ -56,7 +57,7 @@ class HardwareList {
   explicit HardwareList(allocators::IAllocator& allocator) : entries_(allocator) {}
   void clear() { entries_.clear(); }
   // Adds a device (text is cut to fit). False if memory ran out.
-  bool add(HardwareGroup group, StringView name, StringView detail = StringView());
+  bool add(HardwareGroup group, StringView name, StringView detail = StringView(), uint32_t id = 0);
   uint32_t count() const { return static_cast<uint32_t>(entries_.count()); }
   const HardwareEntry& at(uint32_t index) const { return entries_[index]; }
   bool same_as(const HardwareList& other) const;

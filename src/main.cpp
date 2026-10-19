@@ -33,6 +33,7 @@
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 #include "SystemInventory.hpp"
+#include "SystemNetworkDetails.hpp"
 #include "BootLog.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/SystemGraphics.hpp"
@@ -583,6 +584,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (!stacks.add(*network.at(i))) Entry(Level::Warning, "Network").text("could not start a network stack on interface ").dec(i);
     if (stacks.count() > 0) {
       stacks.start_service();  // one thread keeps every stack polled
+#ifndef TCOS_SELFTESTS
+      stacks.start_dhcp();     // (the network self-check does this itself)
+#endif
       Entry(Level::Ok, "Network").text("stacks running on ").dec(stacks.count()).text(" interfaces (DHCP started)");
 #ifdef TCOS_SELFTESTS
       stack_demo = UniquePointer<NetworkStackDemo>::make(shared_allocator, stacks, shared_allocator);
@@ -696,6 +700,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   inventory.set_printers(&printers);
   inventory.set_cameras(&cameras);
   inventory.set_pci(&pci);
+  SystemNetworkDetails network_details(network, stacks);
 
   // The desktop: runs until Shut Down is chosen from the Start menu (or, with no display, until a key).
   // Several monitors: the display becomes one surface as big as all of them side by side, and the renderer is built again for that size.
@@ -758,6 +763,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_print_service(&print_service);
     desktop.set_monitors(&monitors);
     desktop.set_hardware_inventory(&inventory);
+    desktop.set_network_details(&network_details);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
     desktop.set_midi_output(&usb_midi);
     desktop.set_clipboard(&clipboard);
