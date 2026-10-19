@@ -48,6 +48,8 @@ class InputPump {
   // Delivers everything the devices have right now; returns how many events there were.
   uint32_t pump();
   Point cursor() const { return {x_, y_}; }
+  // Puts the pointer somewhere (kept inside the window and the confine function's places): for a window that changed its size.
+  void set_cursor(int32_t x, int32_t y);
 
  private:
   Window& window_;

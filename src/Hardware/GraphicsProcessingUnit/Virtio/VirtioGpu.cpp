@@ -270,6 +270,29 @@ uint32_t VirtioGpu::read_edid(uint32_t connector, ByteView out) {
   return n;
 }
 
+// A virtual display takes any size the guest memory can hold (the host window follows the scanout).
+bool VirtioGpu::mode_available(uint32_t connector, uint32_t width, uint32_t height) const {
+  return connector < output_count_ && width >= 320 && height >= 200 && width <= 8192 && height <= 8192;
+}
+
+// The sizes the driver offers by itself, and the size the host window has.
+uint32_t VirtioGpu::device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const {
+  if (connector >= output_count_) return 0;
+  uint32_t n = 0;
+  auto add = [&](uint32_t w, uint32_t h) {
+    for (uint32_t k = 0; k < n; ++k)
+      if (out[k].width == w && out[k].height == h) return;
+    if (n >= capacity || w == 0 || h == 0) return;
+    out[n] = MonitorMode();
+    out[n].width = w;
+    out[n].height = h;
+    ++n;
+  };
+  add(outputs_[connector].width, outputs_[connector].height);
+  for (const DisplayMode& m : kModes) add(m.width, m.height);
+  return n;
+}
+
 bool VirtioGpu::refresh_connectors() {
   Output before[IMonitorSource::kMaxConnectors];
   for (uint32_t i = 0; i < IMonitorSource::kMaxConnectors; ++i) before[i] = outputs_[i];

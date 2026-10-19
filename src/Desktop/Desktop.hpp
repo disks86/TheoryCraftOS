@@ -145,6 +145,13 @@ class Desktop {
   // --- Monitors. Tells the desktop about the monitors it is shown on (nullptr: one screen, the default). The display must already show the layout
   // (SystemMonitors::apply()), so that the surface the desktop draws on is the size of the layout's bounds. `monitors` must outlive the desktop.
   void set_monitors(hardware::SystemMonitors* monitors);
+  // How the desktop gets the screen changed: applies the monitors' layout to the display hardware and builds the renderer for the desktop's new
+  // size, which it returns (nullptr: it failed and the old renderer stays). Without one, a change of the layout only moves the windows around.
+  using DisplayChanger = graphics::IRenderer2D* (*)(void* context);
+  void set_display_changer(DisplayChanger changer, void* context) { changer_ = changer; changer_context_ = context; }
+  // Makes what was changed in the monitors (their places, resolutions, scales) real: drawing stops for a moment, the display changer runs, the window
+  // takes the new renderer and its size, drawing goes on, and the taskbar and the work areas are redone. False if the changer failed.
+  bool apply_monitor_changes();
   // The layout of `monitors` changed (a monitor came or went, or the order was changed): the taskbar, work areas and pointer limits are redone.
   void monitors_changed();
   DisplaySettings& display_settings() { return display_settings_; }
@@ -205,7 +212,7 @@ class Desktop {
   static void on_about(void* self, gui::Control&);
   static void on_display_settings(void* self, gui::Control&);
   static void on_network_properties(void* self, gui::Control&);
-  static void on_settings_changed(void* self, gui::Control&);
+  static bool apply_changes_thunk(void* self);
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
@@ -252,6 +259,7 @@ class Desktop {
   Paint paint_;
   Terminal terminal_;
   MediaPlayer media_player_;
+  gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"
   DisplaySettings display_settings_;
   NetworkProperties network_properties_;
   gui::Frame about_;
@@ -264,6 +272,8 @@ class Desktop {
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;
   hardware::SystemMonitors* monitors_ = nullptr;
+  DisplayChanger changer_ = nullptr;
+  void* changer_context_ = nullptr;
   bool taskbar_in_surface_ = false;
   kernel::Mutex pointer_lock_;
   hardware::MonitorRect monitor_rects_[hardware::MonitorLayout::kMaxMonitors];   // the monitors the pointer may be on (enabled ones)

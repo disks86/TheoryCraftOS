@@ -1126,24 +1126,43 @@ static void test_desktop_monitors() {
     d.pump(0);
     CHECK(d.pointer().x == 2040 && d.pointer().y == 1079);   // back onto the first monitor, still at that height
 
-    // Display settings: the two monitors, their details; swapping them changes the places and the work areas; another primary moves the taskbar.
+    // Display settings: the two monitors in the picture, their details and lists; dragging one changes the places and the work areas; another primary moves the taskbar.
     d.open_display_settings();
     desktop::DisplaySettings& ds = d.display_settings();
-    CHECK(ds.list().item_count() == 2 && ds.selected_monitor() && ds.selected_monitor()->id() == 0);
+    CHECK(ds.map().box_count() == 2 && ds.selected_monitor() && ds.selected_monitor()->id() == 0 && ds.map().selected() == 0);
     String line(a);
     line.assign(ds.info_line(1).text());
     CHECK(line.view().find(StringView("Dell")) != StringView::npos);
     CHECK(ds.info_line(2).text().find(StringView("27.1 inch")) != StringView::npos || ds.info_line(2).text().find(StringView("27.2 inch")) != StringView::npos);
-    CHECK(!ds.left_button().enabled() && ds.right_button().enabled() && !ds.primary_button().enabled());
-    CHECK(ds.move_selected(1));
-    CHECK(sm.layout().at(0).id == 1 && sm.layout().at(1).id == 0 && src.last.size() == 2 && src.last[0].connector == 1 && src.last[1].x == 1920);
-    CHECK(m.area(0).x == 1920 && m.area(0).width == 2560 && m.area(1).x == 0 && m.area(1).width == 1920);
-    ds.list().select_item(1);
-    CHECK(ds.selected_monitor()->id() == 1);
+    CHECK(ds.resolution_list().item_count() >= 2 && ds.scale_list().item_count() >= 1 && !ds.primary_button().enabled());
+    CHECK(ds.move_monitor(1, -1920, 0));   // dropped to the left of the first one
+    CHECK(sm.layout().find(1) >= 0 && sm.layout().at(static_cast<uint32_t>(sm.layout().find(1))).rect.x == -1920 + 1920);
+    ds.map().select(1);
+    CHECK(ds.selected_monitor()->id() == 1 && ds.primary_button().enabled());
     CHECK(ds.make_primary());
-    CHECK(sm.layout().primary()->id == 1 && m.area(0).x == 0 && m.area(0).width == 1920 && m.area(0).height == 1080 - static_cast<uint32_t>(bar));
-    CHECK(d.start_button().window_origin().x < 20 && d.start_button().window_origin().y >= 1080 - bar && d.start_button().window_origin().y < 1080);
-    CHECK(!ds.move_selected(-1));   // (it is first already)
+    CHECK(sm.layout().primary()->id == 1 && sm.layout().primary()->rect.height == 1080);
+    CHECK(!ds.primary_button().enabled());
+    const hardware::MonitorSlot* prim = sm.layout().primary();
+    CHECK(d.start_button().window_origin().x >= prim->rect.x && d.start_button().window_origin().y < 1080);
+
+    // Apply asks "keep?": reverting, keeping, and the 15 seconds running out.
+    ds.map().select(0);
+    const uint32_t first_width = ds.selected_monitor()->current_mode().width;
+    ds.resolution_list().set_selected_index(ds.resolution_list().selected_index() == 0 ? 1 : 0);
+    CHECK(ds.apply_settings() && ds.asking() && ds.selected_monitor()->current_mode().width != first_width);
+    ds.revert_changes();
+    CHECK(!ds.asking() && ds.selected_monitor()->current_mode().width == first_width);
+    ds.resolution_list().set_selected_index(ds.resolution_list().selected_index() == 0 ? 1 : 0);
+    CHECK(ds.apply_settings() && ds.asking());
+    ds.keep_changes();
+    CHECK(!ds.asking() && ds.selected_monitor()->current_mode().width != first_width);
+    ds.resolution_list().set_selected_index(ds.resolution_list().selected_index() == 0 ? 1 : 0);
+    const uint32_t kept_width = ds.selected_monitor()->current_mode().width;
+    CHECK(ds.apply_settings() && ds.asking() && ds.seconds_left() == 15);
+    for (int i = 0; i < 14; ++i) ds.tick();
+    CHECK(ds.asking() && ds.seconds_left() == 1);
+    ds.tick();
+    CHECK(!ds.asking() && ds.selected_monitor()->current_mode().width == kept_width);
 
     // A monitor pulled out: its windows go to the one that is left, and the pointer can no longer go there.
     gui::Frame* paint_host = d.paint().host();

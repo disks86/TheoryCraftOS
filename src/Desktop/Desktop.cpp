@@ -50,6 +50,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       paint_(allocator),
       terminal_(allocator),
       media_player_(allocator),
+      display_confirm_dialog_(allocator),
       display_settings_(allocator),
       network_properties_(allocator),
       about_(allocator),
@@ -139,7 +140,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   window_.add(&taskbar_);
   window_.add(&surface_);
   window_.show_cursor(mouse != nullptr);
-  display_settings_.on_changed({&Desktop::on_settings_changed, this});
+  display_settings_.set_applier(&Desktop::apply_changes_thunk, this);
+  display_settings_.set_confirm_dialog(&display_confirm_dialog_);
   computer_manager_.on_open_display_settings({&Desktop::on_display_settings, this});
   computer_manager_.on_open_network_properties({&Desktop::on_network_properties, this});
   input_.set_confine(&Desktop::confine_pointer, this);
@@ -446,7 +448,7 @@ void Desktop::on_network_properties(void* self, Control&) {
 }
 
 void Desktop::on_display_settings(void* self, Control&) { static_cast<Desktop*>(self)->open_display_settings(); }
-void Desktop::on_settings_changed(void* self, Control&) { static_cast<Desktop*>(self)->monitors_changed(); }
+bool Desktop::apply_changes_thunk(void* self) { return static_cast<Desktop*>(self)->apply_monitor_changes(); }
 
 // --- Monitors ---------------------------------------------------------------------------------------
 
@@ -454,6 +456,31 @@ void Desktop::set_monitors(hardware::SystemMonitors* monitors) {
   monitors_ = monitors;
   display_settings_.set_monitors(monitors);
   monitors_changed();
+}
+
+bool Desktop::apply_monitor_changes() {
+  if (!monitors_) return false;
+  bool ok = true;
+  if (changer_) {
+    const bool rendering = render_loop_.running();
+    if (rendering) render_loop_.stop();   // (nothing may draw while the renderer is replaced)
+    graphics::IRenderer2D* renderer = changer_(changer_context_);
+    ok = renderer != nullptr;
+    if (ok) window_.set_renderer(*renderer);
+    if (rendering) render_loop_.start();
+  } else {
+    monitors_->reapply();
+  }
+  monitors_changed();
+  // The pointer goes to the middle of the primary monitor if it was left outside the new desktop.
+  const hardware::MonitorSlot* primary = monitors_->layout().primary();
+  const gui::Point at = input_.cursor();
+  if (primary && monitors_->layout().monitor_at(at.x, at.y) < 0)
+    input_.set_cursor(primary->rect.x + static_cast<int32_t>(primary->rect.width / 2), primary->rect.y + static_cast<int32_t>(primary->rect.height / 2));
+  else
+    input_.set_cursor(at.x, at.y);   // (kept inside what is there now)
+  window_.mark_dirty();
+  return ok;
 }
 
 void Desktop::monitors_changed() {
@@ -670,11 +697,12 @@ void Desktop::pump(uint64_t uptime_us) {
   const uint64_t second = uptime_us / 1000000;
   if (monitors_ && second != polled_monitors_second_) {
     polled_monitors_second_ = second;
-    if (monitors_->poll()) monitors_changed();
+    if (monitors_->poll()) apply_monitor_changes();
   }
   if (second != polled_second_) {
     polled_second_ = second;
     if (network_properties_.manager()) network_properties_.update();
+    display_settings_.tick();
     if (computer_manager_.manager()) computer_manager_.update(uptime_us);
     DateTime now;
     const bool ok = clock_source_ && clock_source_(clock_context_, &now);

@@ -92,6 +92,35 @@ uint32_t UefiGopGpu::read_edid(uint32_t connector, ByteView out) {
   return 0;
 }
 
+bool UefiGopGpu::mode_available(uint32_t connector, uint32_t width, uint32_t height) const {
+  if (connector != 0) return false;
+  for (uint32_t i = 0; i < mode_count_; ++i)
+    if (size_[i].width == width && size_[i].height == height) return true;
+  return false;
+}
+
+uint32_t UefiGopGpu::device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const {
+  if (connector != 0) return 0;
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < mode_count_ && n < capacity; ++i) {
+    bool seen = false;
+    for (uint32_t k = 0; k < n; ++k) seen = seen || (out[k].width == size_[i].width && out[k].height == size_[i].height);
+    if (seen) continue;
+    out[n] = MonitorMode();
+    out[n].width = size_[i].width;
+    out[n].height = size_[i].height;
+    ++n;
+  }
+  return n;
+}
+
+bool UefiGopGpu::set_display_mode(uint32_t connector, uint32_t width, uint32_t height) {
+  if (connector != 0) return false;
+  for (uint32_t i = 0; i < mode_count_; ++i)
+    if (size_[i].width == width && size_[i].height == height) return set_mode(i);
+  return false;
+}
+
 bool UefiGopGpu::set_mode(uint32_t index) {
   if (!gop_ || index >= mode_count_) return false;
   if (gop_->set_mode(gop_, gop_mode_[index]) != efi::kSuccess) return false;

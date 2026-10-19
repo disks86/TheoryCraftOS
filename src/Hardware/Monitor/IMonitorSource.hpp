@@ -50,6 +50,26 @@ class IMonitorSource {
   // Looks at the connectors again (monitors plugged in or pulled out); true if anything differs from the last look.
   virtual bool refresh_connectors() { return false; }
 
+  // --- Modes. A monitor's EDID says what it can show; these say what the graphics device can do with it.
+  // True if the device can show the monitor at this size (default: any).
+  virtual bool mode_available(uint32_t connector, uint32_t width, uint32_t height) const {
+    (void)connector; (void)width; (void)height;
+    return true;
+  }
+  // The modes the device itself offers for the monitor on the connector (used for a monitor that gave no EDID); returns how many (default: none).
+  virtual uint32_t device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const {
+    (void)connector; (void)out; (void)capacity;
+    return 0;
+  }
+  // Whether the device can change the refresh rate of the monitor (most cannot: they take the one the firmware picked), and does so.
+  virtual bool can_set_refresh(uint32_t connector) const { (void)connector; return false; }
+  virtual bool set_refresh(uint32_t connector, uint32_t refresh_millihz) { (void)connector; (void)refresh_millihz; return false; }
+  // A device that can show one display only: switches it to width x height now (the screen changes size). False if it has no such mode.
+  virtual bool set_display_mode(uint32_t connector, uint32_t width, uint32_t height) {
+    (void)connector; (void)width; (void)height;
+    return false;
+  }
+
   // True if the device can show separate rectangles of one big picture on separate monitors (apply_layout() works).
   virtual bool supports_multiple_displays() const { return false; }
   // Makes the picture `desktop_width` x `desktop_height` pixels (the display memory is replaced; what was drawn is lost) and shows on each placed

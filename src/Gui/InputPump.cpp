@@ -21,6 +21,16 @@
 
 namespace gui {
 
+void InputPump::set_cursor(int32_t x, int32_t y) {
+  const int32_t max_x = static_cast<int32_t>(window_.bounds().width) - 1, max_y = static_cast<int32_t>(window_.bounds().height) - 1;
+  x = x < 0 ? 0 : x > max_x ? max_x : x;
+  y = y < 0 ? 0 : y > max_y ? max_y : y;
+  if (confine_) confine_(confine_context_, &x, &y);
+  x_ = x;
+  y_ = y;
+  window_.mouse_move(x_, y_);
+}
+
 uint32_t InputPump::pump() {
   uint32_t events = 0;
   hardware::KeyEvent key;

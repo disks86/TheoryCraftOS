@@ -24,7 +24,7 @@ namespace gui {
 
 Window::Window(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, const Theme& theme,
                const graphics::Extent2D& size)
-    : Control(allocator), renderer_(renderer), theme_(theme), title_(allocator), drag_text_(allocator), drag_label_(allocator), drop_text_(allocator), pending_(allocator) {
+    : Control(allocator), renderer_(&renderer), theme_(theme), title_(allocator), drag_text_(allocator), drag_label_(allocator), drop_text_(allocator), pending_(allocator) {
   attach(this);  // (no children yet)
   bounds_ = {0, 0, size.width, size.height};
 }
@@ -61,6 +61,15 @@ void Window::paint(Painter& painter) {
   }
 }
 
+void Window::set_renderer(graphics::IRenderer2D& renderer) {
+  UiGuard lock(this);
+  renderer_ = &renderer;
+  const graphics::Extent2D size = renderer.extent();
+  bounds_ = {0, 0, size.width, size.height};
+  layout();
+  mark_dirty();
+}
+
 void Window::mark_dirty() {
   if (!__atomic_exchange_n(&dirty_, true, __ATOMIC_ACQ_REL)) frame_event_.set();
 }
@@ -70,7 +79,7 @@ void Window::render() {
     UiGuard lock(this);
     __atomic_store_n(&dirty_, false, __ATOMIC_RELEASE);  // changes made while we draw ask for the next frame
     layout();
-    Painter painter(renderer_, theme_);
+    Painter painter(*renderer_, theme_);
     paint_tree(painter);
     if (popup_) popup_->paint_tree(painter);
     if (drag_source_) {
@@ -93,8 +102,8 @@ void Window::render() {
       const CursorShape shape = under ? under->cursor_shape(cursor_.x - origin.x, cursor_.y - origin.y) : CursorShape::Arrow;
       if (shape == CursorShape::Arrow) {
         // A classic arrow: black triangle with a white edge.
-        renderer_.fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
-        renderer_.fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
+        renderer_->fill_triangle({x - 1, y - 1}, {x + 13, y + 11}, {x + 3, y + 13}, theme_.highlight);
+        renderer_->fill_triangle({x, y}, {x + 11, y + 10}, {x + 3, y + 11}, theme_.dark);
       } else if (shape == CursorShape::Crosshair) {
         for (int pass = 0; pass < 2; ++pass) {  // a white outline, then the black cross
           const int32_t reach = pass == 0 ? 8 : 7;
@@ -118,14 +127,14 @@ void Window::render() {
             const float tx = x + s * (9 + grow) * dx, ty = y + s * (9 + grow) * dy;
             const float bx = x + s * 3 * dx, by = y + s * 3 * dy;
             const float w = 4.5f + grow;
-            renderer_.fill_triangle({tx, ty}, {bx + w * px, by + w * py}, {bx - w * px, by - w * py}, color);
+            renderer_->fill_triangle({tx, ty}, {bx + w * px, by + w * py}, {bx - w * px, by - w * py}, color);
           }
           const float half = 1.0f + grow;
           for (float t = -4; t <= 4; t += 1) {
             const float cx = x + t * dx * step, cy = y + t * dy * step;
-            renderer_.fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py - half},
+            renderer_->fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py - half},
                                     {cx + half * px + half, cy + half * py + half}, color);
-            renderer_.fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py + half},
+            renderer_->fill_triangle({cx - half * px - half, cy - half * py - half}, {cx + half * px + half, cy + half * py + half},
                                     {cx - half * px - half, cy - half * py + half}, color);
           }
         }
@@ -133,8 +142,8 @@ void Window::render() {
     }
   }
   // Presenting needs no access to the controls: the UI may change while the frame goes out.
-  renderer_.reset_clip();
-  renderer_.present();
+  renderer_->reset_clip();
+  renderer_->present();
 }
 
 // --- Input -------------------------------------------------------------------

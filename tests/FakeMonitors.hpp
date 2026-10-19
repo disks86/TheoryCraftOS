@@ -105,6 +105,32 @@ struct FakeSource final : IMonitorSource {
   };
   std::vector<Connector> connectors;
   bool multi = true, accepts = true, changed = false;
+  // Modes: sizes the device cannot show, the modes it offers for monitors without EDID, whether it can set a refresh rate, and what it was asked.
+  std::vector<std::pair<uint32_t, uint32_t>> unavailable;
+  std::vector<MonitorMode> offered;
+  bool refresh_settable = false;
+  uint32_t refresh_set = 0;
+  int display_modes_set = 0;
+  uint32_t last_mode_w = 0, last_mode_h = 0;
+  bool mode_available(uint32_t, uint32_t w, uint32_t h) const override {
+    for (const auto& u : unavailable)
+      if (u.first == w && u.second == h) return false;
+    return true;
+  }
+  uint32_t device_modes(uint32_t, MonitorMode* out, uint32_t capacity) const override {
+    uint32_t n = 0;
+    for (const MonitorMode& m : offered)
+      if (n < capacity) out[n++] = m;
+    return n;
+  }
+  bool can_set_refresh(uint32_t) const override { return refresh_settable; }
+  bool set_refresh(uint32_t, uint32_t millihz) override { refresh_set = millihz; return refresh_settable; }
+  bool set_display_mode(uint32_t, uint32_t w, uint32_t h) override {
+    ++display_modes_set;
+    last_mode_w = w;
+    last_mode_h = h;
+    return mode_available(0, w, h);
+  }
   int applies = 0;
   std::vector<ScanoutPlacement> last;
   uint32_t last_w = 0, last_h = 0;
@@ -158,6 +184,17 @@ struct FakeGpu final : IGraphicsProcessingUnit {
   void draw_char(uint32_t, uint32_t, char, uint32_t, uint32_t) override {}
   void draw_text(uint32_t, uint32_t, const char*, uint32_t, uint32_t) override {}
   IMonitorSource* monitor_source() override { return source; }
+  // The pixels blitted to it (as a w x h screen) and how often it was asked to show them.
+  std::vector<uint32_t> screen;
+  int blits = 0, presents = 0;
+  void blit(uint32_t x, uint32_t y, uint32_t bw, uint32_t bh, const uint32_t* pixels, uint32_t pitch) override {
+    ++blits;
+    if (screen.size() != size_t{w} * h) screen.assign(size_t{w} * h, 0);
+    for (uint32_t j = 0; j < bh; ++j)
+      for (uint32_t i = 0; i < bw; ++i)
+        if (x + i < w && y + j < h) screen[size_t{y + j} * w + x + i] = pixels[size_t{j} * pitch + i];
+  }
+  void present() override { ++presents; }
 };
 
 // A 1920x1080 monitor of another make, from the Dell one.

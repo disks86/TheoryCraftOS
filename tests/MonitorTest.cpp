@@ -23,6 +23,7 @@
 #include <string.h>
 #include <vector>
 #include "FakeMonitors.hpp"
+#include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 
 using namespace hardware;
@@ -202,6 +203,206 @@ static void test_layout() {
 
 // --- Finding monitors -----------------------------------------------------------------------------------
 
+// --- Editing the layout: dragging monitors, modes and scales -----------------------------------------------------
+
+static void test_layout_editing() {
+  TestAllocator a;
+  {
+    MonitorLayout l(a);
+    CHECK(l.add(0, 1920, 1080) && l.add(1, 1280, 1024));
+    CHECK(l.at(0).physical_width == 1920 && l.at(0).scale_percent == 100 && MonitorLayout::logical_size(1920, 100) == 1920 && MonitorLayout::logical_size(1920, 200) == 960);
+    // Dropped below the first monitor, near its middle: it goes there, not snapped (its edges are far from the first one's).
+    CHECK(l.place_adjacent(1, 1000, 1500));
+    CHECK(l.at(l.find(1)).rect == MonitorRect({1000, 1080, 1280, 1024}) && l.at(l.find(0)).rect == MonitorRect({0, 0, 1920, 1080}));
+    // Close to the left edge: snapped to line up with it.
+    CHECK(l.place_adjacent(1, 10, 1300));
+    CHECK(l.at(l.find(1)).rect == MonitorRect({0, 1080, 1280, 1024}));
+    // To the right, a little below the top: lined up with the top.
+    CHECK(l.place_adjacent(1, 4000, 10));
+    CHECK(l.at(l.find(1)).rect == MonitorRect({1920, 0, 1280, 1024}));
+    // To the right, lower: where it is let go (still touching).
+    CHECK(l.place_adjacent(1, 4000, 400));
+    CHECK(l.at(l.find(1)).rect == MonitorRect({1920, 400, 1280, 1024}));
+    // To the left and above: the first one moves over (normalizing puts the top left at 0, 0).
+    CHECK(l.place_adjacent(1, -5000, -5));
+    CHECK(l.at(l.find(1)).rect == MonitorRect({0, 0, 1280, 1024}) && l.at(l.find(0)).rect == MonitorRect({1280, 0, 1920, 1080}));
+    // Dropped over the other monitor: it goes to the nearest free place beside it (below, for a drop in the lower half).
+    CHECK(l.place_adjacent(1, 1500, 900));
+    CHECK(l.at(l.find(1)).rect.y == 1080 || l.at(l.find(1)).rect.y + 1024 == 0 + 0 || l.at(l.find(1)).rect.x >= 0);
+    for (uint32_t i = 0; i < l.count(); ++i)
+      for (uint32_t k = i + 1; k < l.count(); ++k) CHECK(l.at(i).rect.overlap(l.at(k).rect) == 0);
+    CHECK(l.connected());
+    CHECK(!l.place_adjacent(77, 0, 0));
+
+    // Three in a row: the middle one cannot leave the others without a bridge.
+    MonitorLayout row(a);
+    CHECK(row.add(0, 1000, 800) && row.add(1, 1000, 800) && row.add(2, 1000, 800));
+    CHECK(row.place_adjacent(1, 1000, 5000) && row.connected());
+    CHECK(row.at(row.find(1)).rect.y <= 799 && row.at(row.find(1)).rect.y >= -799);
+    // A monitor alone can be put anywhere (it is the desktop).
+    MonitorLayout alone(a);
+    CHECK(alone.add(5, 800, 600) && alone.place_adjacent(5, 300, 200) && alone.at(0).rect == MonitorRect({0, 0, 800, 600}));
+    // Disabled monitors do not count for touching.
+    MonitorLayout off(a);
+    CHECK(off.add(0, 1000, 800) && off.add(1, 1000, 800) && off.add(2, 1000, 800) && off.set_enabled(1, false));
+    CHECK(!off.connected());
+    off.repair();
+    CHECK(off.connected());
+
+    // Modes and scales: a monitor at 200 % has half the size on the desktop, and the monitors next to it close up around it.
+    MonitorLayout m(a);
+    CHECK(m.add(0, 3840, 2160) && m.add(1, 1920, 1080));
+    CHECK(m.set_mode(0, 3840, 2160, 200));
+    CHECK(m.at(0).rect == MonitorRect({0, 0, 1920, 1080}) && m.at(0).physical_width == 3840 && m.at(0).scale_percent == 200);
+    CHECK(m.at(1).rect.x == 3840 || m.at(1).rect.x == 1920);   // (it keeps its corner; a gap is closed by the next normalizing and arranging)
+    CHECK(!m.set_mode(0, 3840, 2160, 99) && !m.set_mode(0, 3840, 2160, 401) && !m.set_mode(0, 0, 10, 100) && !m.set_mode(9, 100, 100, 100));
+    // A monitor that grows over its neighbour goes beside it.
+    CHECK(m.set_mode(1, 1920, 1080, 100));
+    CHECK(m.set_mode(0, 3840, 2160, 100));
+    for (uint32_t i = 0; i < m.count(); ++i)
+      for (uint32_t k = i + 1; k < m.count(); ++k) CHECK(m.at(i).rect.overlap(m.at(k).rect) == 0);
+    CHECK(m.connected() && m.at(0).rect.width == 3840);
+    // assign puts a saved layout back.
+    MonitorSlot saved[2] = {m.at(0), m.at(1)};
+    CHECK(m.set_mode(0, 1024, 768, 100));
+    CHECK(m.assign(saved, 2) && m.at(0).rect.width == 3840 && m.count() == 2 && !m.assign(saved, 99));
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_monitor_modes() {
+  TestAllocator a;
+  {
+    FakeSource src;
+    src.add("DP-1", dell_edid());          // native 2560x1440; 1920x1080 at 60 and 50; 1280x720, 1024x768, 800x600, 640x480; 3840x2160 at 60
+    src.add("HDMI-1", small_edid());       // 1920x1080 native and the standard ones
+    FakeGpu gpu;
+    gpu.source = &src;
+    SystemMonitors sm(&gpu, a);
+    sm.initialize();
+    CHECK(sm.apply());
+    // The resolutions on offer: native first, then largest to smallest, each once.
+    MonitorMode modes[64];
+    uint32_t n = sm.compatible_resolutions(0, modes, 64);
+    CHECK(n == 7 && modes[0].width == 2560 && modes[0].height == 1440 && modes[0].preferred);
+    CHECK(modes[1].width == 3840 && modes[2].width == 1920 && modes[3].width == 1280 && modes[4].width == 1024 && modes[5].width == 800 && modes[6].width == 640);
+    CHECK(modes[2].refresh_millihz == 60000);   // (the higher of the two rates of 1920x1080)
+    // The device cannot show 3840x2160: it is not offered.
+    src.unavailable.push_back({3840, 2160});
+    n = sm.compatible_resolutions(0, modes, 64);
+    CHECK(n == 6 && modes[1].width == 1920);
+    // Refresh rates: a device that cannot set one offers the one in use; one that can offers the monitor's rates for that size.
+    uint32_t rates[16];
+    CHECK(!sm.can_set_refresh(0) && sm.compatible_refresh_rates(0, 2560, 1440, rates, 16) == 1 && rates[0] > 59900 && rates[0] < 60000);
+    CHECK(sm.set_resolution(0, 1920, 1080) && sm.monitor(0).current_mode().width == 1920 && sm.monitor(0).current_mode().refresh_millihz == 60000);
+    CHECK(sm.compatible_refresh_rates(0, 1920, 1080, rates, 16) == 1 && rates[0] == 60000);
+    CHECK(!sm.set_refresh(0, 50000) && src.refresh_set == 0);
+    src.refresh_settable = true;
+    CHECK(sm.can_set_refresh(0) && sm.compatible_refresh_rates(0, 1920, 1080, rates, 16) == 2 && rates[0] == 60000 && rates[1] == 50000);
+    CHECK(sm.compatible_refresh_rates(0, 2560, 1440, rates, 16) == 1);
+    CHECK(sm.set_refresh(0, 50000) && src.refresh_set == 50000 && sm.monitor(0).current_mode().refresh_millihz == 50000);
+    CHECK(!sm.set_refresh(0, 75000));
+    // Resolutions: only compatible ones, and the layout follows (the neighbour keeps its size and moves along).
+    CHECK(!sm.set_resolution(0, 3840, 2160) && !sm.set_resolution(0, 1366, 768) && !sm.set_resolution(9, 800, 600));
+    CHECK(sm.layout().at(0).physical_width == 1920 && sm.layout().at(0).rect.width == 1920);
+    // Scales: a 1920x1080 monitor can be scaled until it would be smaller than 640x480.
+    uint32_t scales[8];
+    n = sm.compatible_scales(0, scales, 8);
+    CHECK(n == 5 && scales[0] == 100 && scales[1] == 125 && scales[4] == 200);   // (250 % would leave 768x432: under 480 high)
+    CHECK(sm.set_scale(0, 150) && sm.scale_of(0) == 150 && sm.layout().at(0).rect.width == 1280 && sm.layout().at(0).rect.height == 720);
+    CHECK(!sm.set_scale(0, 400) && !sm.set_scale(0, 130) && sm.scale_of(0) == 150);
+    // A smaller resolution: the scale that no longer fits is lowered to the largest that does.
+    CHECK(sm.set_scale(0, 200) && sm.layout().at(0).rect.width == 960 && sm.layout().at(0).rect.height == 540);
+    CHECK(sm.set_resolution(0, 1280, 720) && sm.scale_of(0) == 150 && sm.layout().at(0).rect.width == 853 && sm.layout().at(0).rect.height == 480);
+    // Where the pixels are on the surface: a row in the order of the places, whatever the places and scales are.
+    CHECK(sm.set_scale(0, 100) && sm.set_resolution(0, 1920, 1080) && sm.move_monitor(1, 100, 1500));   // monitor 1 below monitor 0
+    sm.layout().set_primary(0);
+    ScanoutPlacement p[16];
+    n = sm.physical_placements(p, 16);
+    CHECK(n == 2 && p[0].x == 0 && p[1].x == p[0].width && p[0].y == 0 && p[1].y == 0);
+    CHECK(sm.needs_compositing());
+  }
+  CHECK(a.live == 0);
+}
+
+// --- The compositor ------------------------------------------------------------------------------------
+
+// A desktop picture whose pixel (x, y) is 0xFF000000 | y << 12 | x (up to 4096 wide), to see where each one lands.
+static uint32_t pixel_of(uint32_t x, uint32_t y) { return 0xFF000000u | (y << 12) | x; }
+static std::vector<uint32_t> desktop_picture(uint32_t w, uint32_t h) {
+  std::vector<uint32_t> p(size_t{w} * h);
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) p[size_t{y} * w + x] = pixel_of(x, y);
+  return p;
+}
+
+static void test_monitor_display() {
+  TestAllocator a;
+  {
+    FakeGpu gpu;
+    gpu.w = 1200;
+    gpu.h = 400;
+    MonitorDisplay display(gpu, a);
+    MonitorLayout layout(a);
+    // Two monitors side by side at 100 %: A 800x400, B 400x300. The desktop is 1200x400 and lies on the surface the same way.
+    CHECK(layout.add(0, 800, 400) && layout.add(1, 400, 300));
+    ScanoutPlacement places[2] = {{0, 0, 0, 800, 400}, {1, 800, 0, 400, 300}};
+    CHECK(display.update(layout, places, 2) && !display.scaling() && display.width() == 1200 && display.height() == 400);
+    std::vector<uint32_t> picture = desktop_picture(1200, 400);
+    display.blit(0, 0, 1200, 400, picture.data(), 1200);
+    CHECK(gpu.blits == 2 && gpu.screen[size_t{10} * 1200 + 20] == pixel_of(20, 10) && gpu.screen[size_t{299} * 1200 + 1199] == pixel_of(1199, 299));
+    // A part of the picture lands on the monitor it is on.
+    gpu.blits = 0;
+    display.blit(790, 100, 20, 10, picture.data() + 100 * 1200 + 790, 1200);   // across the edge between the monitors
+    CHECK(gpu.blits == 2 && gpu.screen[size_t{105} * 1200 + 795] == pixel_of(795, 105) && gpu.screen[size_t{105} * 1200 + 805] == pixel_of(805, 105));
+    display.present();
+    CHECK(gpu.presents == 1);
+
+    // Monitor B above A instead of beside it: the desktop is 800x700 (B on top, 400 wide, A under it); the surface is still the row.
+    MonitorLayout stacked(a);
+    CHECK(stacked.add(0, 800, 400) && stacked.add(1, 400, 300) && stacked.place_adjacent(1, 100, -500));
+    CHECK(stacked.at(stacked.find(1)).rect == MonitorRect({100, 0, 400, 300}) && stacked.at(stacked.find(0)).rect == MonitorRect({0, 300, 800, 400}));
+    CHECK(display.update(stacked, places, 2) && display.scaling() && display.width() == 800 && display.height() == 700);
+    gpu.screen.assign(size_t{1200} * 400, 0);
+    std::vector<uint32_t> picture2 = desktop_picture(800, 700);
+    display.blit(0, 0, 800, 700, picture2.data(), 800);
+    CHECK(gpu.screen[size_t{5} * 1200 + 7] == pixel_of(7, 305));                 // monitor A: its row 5 is desktop row 300 + 5
+    CHECK(gpu.screen[size_t{20} * 1200 + 800 + 30] == pixel_of(100 + 30, 20));   // monitor B: desktop x = 100 + column
+    CHECK(gpu.screen[size_t{399} * 1200 + 799] == pixel_of(799, 699));
+
+    // A monitor at 200 %: its 800x400 pixels show a desktop of 400x200, every desktop pixel as a 2x2 block.
+    MonitorLayout scaled(a);
+    CHECK(scaled.add(0, 800, 400) && scaled.set_mode(0, 800, 400, 200) && scaled.at(0).rect.width == 400);
+    ScanoutPlacement one[1] = {{0, 0, 0, 800, 400}};
+    FakeGpu gpu2;
+    gpu2.w = 800;
+    gpu2.h = 400;
+    MonitorDisplay zoom(gpu2, a);
+    CHECK(zoom.update(scaled, one, 1) && zoom.scaling() && zoom.width() == 400 && zoom.height() == 200);
+    std::vector<uint32_t> small = desktop_picture(400, 200);
+    zoom.blit(0, 0, 400, 200, small.data(), 400);
+    CHECK(gpu2.screen[0] == pixel_of(0, 0) && gpu2.screen[1] == pixel_of(0, 0) && gpu2.screen[2] == pixel_of(1, 0) && gpu2.screen[size_t{1} * 800] == pixel_of(0, 0) && gpu2.screen[size_t{2} * 800] == pixel_of(0, 1));
+    CHECK(gpu2.screen[size_t{399} * 800 + 799] == pixel_of(399, 199));
+    // A part of the picture only: just those pixels are drawn (here the desktop pixels 10..12 of row 5 = surface columns 20..25, rows 10, 11).
+    gpu2.screen.assign(size_t{800} * 400, 0);
+    gpu2.blits = 0;
+    zoom.blit(10, 5, 3, 1, small.data() + 5 * 400 + 10, 400);
+    CHECK(gpu2.blits == 2 && gpu2.screen[size_t{10} * 800 + 20] == pixel_of(10, 5) && gpu2.screen[size_t{11} * 800 + 25] == pixel_of(12, 5) && gpu2.screen[size_t{10} * 800 + 19] == 0 && gpu2.screen[size_t{10} * 800 + 26] == 0 && gpu2.screen[size_t{12} * 800 + 20] == 0);
+    // 150 %: a desktop of 533x266; the last surface column shows the last desktop column.
+    CHECK(scaled.set_mode(0, 800, 400, 150));
+    CHECK(zoom.update(scaled, one, 1) && zoom.width() == 533 && zoom.height() == 266);
+    std::vector<uint32_t> mid = desktop_picture(533, 266);
+    zoom.blit(0, 0, 533, 266, mid.data(), 533);
+    CHECK(gpu2.screen[0] == pixel_of(0, 0) && gpu2.screen[1] == pixel_of(0, 0) && gpu2.screen[2] == pixel_of(1, 0) && gpu2.screen[799] == pixel_of(532, 0));
+    // Refused: a monitor that has no place on the surface.
+    ScanoutPlacement none[1] = {{7, 0, 0, 800, 400}};
+    CHECK(!zoom.update(scaled, none, 1) && zoom.width() == 533);
+    // Blitting past the desktop is harmless.
+    zoom.blit(500, 250, 100, 100, mid.data(), 533);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_system_monitors() {
   TestAllocator a;
   {
@@ -243,18 +444,18 @@ static void test_system_monitors() {
     src.connectors[2].info.connected = false;
     src.changed = true;
     CHECK(sm.poll() && sm.generation() > generation && sm.connected_count() == 1 && sm.layout().enabled_count() == 1 && sm.layout().count() == 2);
-    CHECK(src.last.size() == 1 && src.last[0].connector == 0 && src.last_w == 4480 && sm.layout().primary()->id == 0);
+    CHECK(src.last.size() == 1 && src.last[0].connector == 0 && src.last_w == 2560 && sm.desktop_width() == 4480 && sm.layout().primary()->id == 0);
     CHECK(!sm.poll());   // (nothing changed since)
     src.connectors[2].info.connected = true;
     src.changed = true;
     CHECK(sm.poll() && sm.layout().enabled_count() == 2 && src.last.size() == 2 && sm.waiting_for_restart() == 0);
-    // A monitor that was not there at start-up has no room.
+    // A monitor that was not there at start-up is added to the right of the others, and its place stays when it is pulled out.
     src.add("HDMI-3", dell_edid(), true, ConnectorType::Hdmi);
     src.changed = true;
-    CHECK(sm.poll() && sm.count() == 4 && sm.waiting_for_restart() == 1 && sm.layout().count() == 2 && src.last.size() == 2);
+    CHECK(sm.poll() && sm.count() == 4 && sm.waiting_for_restart() == 0 && sm.layout().count() == 3 && src.last.size() == 3 && src.last_w == 2560 + 1920 + 2560);
     src.connectors[3].info.connected = false;
     src.changed = true;
-    CHECK(sm.poll() && sm.waiting_for_restart() == 0);
+    CHECK(sm.poll() && sm.layout().count() == 3 && sm.layout().enabled_count() == 2 && src.last.size() == 2);
 
     // A device that refuses the layout stays a single display, the size it has.
     FakeSource refusing;
@@ -303,6 +504,9 @@ static void test_system_monitors() {
 int main() {
   test_edid();
   test_layout();
+  test_layout_editing();
+  test_monitor_modes();
+  test_monitor_display();
   test_system_monitors();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("monitor tests passed\n");

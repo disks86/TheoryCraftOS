@@ -31,6 +31,7 @@
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
+#include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 #include "SystemInventory.hpp"
 #include "SystemNetworkDetails.hpp"
@@ -703,10 +704,28 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   SystemNetworkDetails network_details(network, stacks);
 
   // The desktop: runs until Shut Down is chosen from the Start menu (or, with no display, until a key).
-  // Several monitors: the display becomes one surface as big as all of them side by side, and the renderer is built again for that size.
-  if (gpu && monitors.layout().count() > 1) {
-    if (monitors.apply()) {
-      system_graphics.reset_renderer();
+  // The monitors become the display: the surface is as big as all of them side by side, and when a monitor shows its picture at another size
+  // (a resolution that is not what the desktop was drawn for, or a scale) the pictures go through MonitorDisplay. Applying again, after a change
+  // in Display Settings or a hot plug, builds the renderer for the new size.
+  struct DisplayPipeline {
+    hardware::SystemMonitors* monitors;
+    graphics::SystemGraphics* graphics;
+    hardware::MonitorDisplay* display;
+    static graphics::IRenderer2D* apply(void* context) {
+      auto* self = static_cast<DisplayPipeline*>(context);
+      if (!self->monitors->apply()) return nullptr;
+      hardware::ScanoutPlacement placements[16];
+      const uint32_t count = self->monitors->physical_placements(placements, 16);
+      const bool compose = self->monitors->needs_compositing() && self->display->update(self->monitors->layout(), placements, count);
+      self->graphics->set_display_override(compose ? self->display : nullptr);
+      self->graphics->reset_renderer();
+      return self->graphics->renderer_2d();
+    }
+  };
+  UniquePointer<hardware::MonitorDisplay> monitor_display = gpu ? UniquePointer<hardware::MonitorDisplay>::make(shared_allocator, *gpu, shared_allocator) : UniquePointer<hardware::MonitorDisplay>();
+  DisplayPipeline display_pipeline{&monitors, &system_graphics, monitor_display.get()};
+  if (gpu && monitor_display && (monitors.layout().count() > 1 || monitors.needs_compositing())) {
+    if (DisplayPipeline::apply(&display_pipeline)) {
       Entry(Level::Ok, "Monitors").dec(monitors.layout().enabled_count()).text(" monitors, desktop ").dec(monitors.desktop_width()).text("x").dec(monitors.desktop_height());
     } else {
       Entry(Level::Warning, "Monitors").text("the display device cannot show the monitors separately; using one");
@@ -762,6 +781,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_monitors(&monitors);
+    desktop.set_display_changer(&DisplayPipeline::apply, &display_pipeline);
     desktop.set_hardware_inventory(&inventory);
     desktop.set_network_details(&network_details);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);

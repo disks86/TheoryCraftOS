@@ -42,8 +42,9 @@ IRenderer2D* SystemGraphics::renderer_2d() {
   if (software_2d_) return software_2d_;
   if (device_2d_) return device_2d_;
   if (!display_) return nullptr;
-  const Extent2D size{display_->width(), display_->height()};
-  if (accelerated()) {
+  hardware::IGraphicsProcessingUnit* target = override_ ? override_ : display_;
+  const Extent2D size{target->width(), target->height()};
+  if (accelerated() && !override_) {
     void* memory = allocator_.allocate(sizeof(DeviceRenderer2D));
     if (memory) {
       DeviceRenderer2D* r = new (memory) DeviceRenderer2D(*gpu_device_, allocator_, size);
@@ -63,7 +64,7 @@ IRenderer2D* SystemGraphics::renderer_2d() {
     return nullptr;
   }
   for (uint32_t& p : backbuffer_.pixels) p = 0;
-  return software_2d_ = new (memory) SoftwareRenderer2D(backbuffer_, display_);
+  return software_2d_ = new (memory) SoftwareRenderer2D(backbuffer_, target);
 }
 
 void SystemGraphics::reset_renderer() {

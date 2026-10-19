@@ -213,6 +213,7 @@ add_executable(BOOTX64
   src/Desktop/DesktopSurface.cpp
   src/Desktop/FileExplorer.cpp
   src/Desktop/DisplaySettings.cpp
+  src/Desktop/MonitorMap.cpp
   src/Desktop/FileTransfer.cpp
   src/Desktop/Shell.cpp
   src/Desktop/Terminal.cpp
@@ -292,6 +293,7 @@ add_executable(BOOTX64
   src/Midi/SoftwareSynth.cpp
   src/Hardware/Monitor/Edid.cpp
   src/Hardware/Monitor/Monitor.cpp
+  src/Hardware/Monitor/MonitorDisplay.cpp
   src/Hardware/Monitor/MonitorLayout.cpp
   src/Hardware/Monitor/SystemMonitors.cpp
   src/Hardware/MidiDevice/Mpu401.cpp

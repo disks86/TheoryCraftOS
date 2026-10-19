@@ -47,6 +47,11 @@ class SystemGraphics {
   // if out of memory.
   IRenderer2D* renderer_2d();
 
+  // Presents the 2D picture through `display` instead of straight to the display device (nullptr: straight again): the monitor compositor, when the
+  // desktop is not laid out like the device's screen. The renderer is a software one then, drawing a picture of the size `display` reports
+  // (call reset_renderer() to get it). It must outlive the renderer.
+  void set_display_override(hardware::IGraphicsProcessingUnit* display) { override_ = display; }
+
   // Throws the 2D renderer away; the next renderer_2d() builds one for the display's size as it is then (after the display was resized for several
   // monitors). Nothing may be using the old renderer.
   void reset_renderer();
@@ -59,6 +64,7 @@ class SystemGraphics {
 
   allocators::IAllocator& allocator_;
   hardware::IGraphicsProcessingUnit* display_;
+  hardware::IGraphicsProcessingUnit* override_ = nullptr;
   SoftwareDevice software_;
   alignas(8) unsigned char virgl_storage_[sizeof(VirglDevice)];
   Surface backbuffer_;

@@ -60,6 +60,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   bool connector_info(uint32_t connector, ConnectorInfo* out) const override;
   uint32_t read_edid(uint32_t connector, ByteView out) override;
   bool refresh_connectors() override;
+  bool mode_available(uint32_t connector, uint32_t width, uint32_t height) const override;
+  uint32_t device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const override;
   bool supports_multiple_displays() const override { return ready_; }
   bool apply_layout(const ScanoutPlacement* placements, uint32_t count, uint32_t desktop_width, uint32_t desktop_height) override;
 

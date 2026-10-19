@@ -17,8 +17,12 @@
  */
 
 // How the monitors are arranged on the desktop: the desktop is one big picture and every monitor shows a rectangle of it. The default
-// arrangement is a row, left to right in connector order, tops aligned; the order can be changed and any monitor made the primary one (the
-// one with the taskbar, where windows and dialogs open). A monitor that is unplugged keeps its place but is disabled, so the picture does
+// arrangement is a row, left to right in connector order, tops aligned; a monitor can be dragged anywhere next to another (place_adjacent()), and
+// any monitor made the primary one (the one with the taskbar, where windows and dialogs open).
+//
+// A monitor has a pixel size - the mode it runs at - and a scale (100 % by default; 200 % makes everything twice as big, the pixel density of the
+// desktop half of the monitor's): its rectangle on the desktop has the size of its pixels divided by the scale, the "logical" size the programs
+// see. Rectangles never overlap and always touch each other, so the pointer can walk from any monitor to any other. A monitor that is unplugged keeps its place but is disabled, so the picture does
 // not change size under the programs - its windows are moved to the monitors that are left.
 #pragma once
 #include "Hardware/Monitor/MonitorTypes.hpp"
@@ -31,6 +35,8 @@ struct MonitorSlot {
   MonitorRect rect;         // where it is on the desktop
   bool primary = false;
   bool enabled = true;      // false: unplugged, its place is kept
+  uint32_t physical_width = 0, physical_height = 0;   // the monitor's mode in pixels; rect is this divided by scale_percent
+  uint32_t scale_percent = 100;
 };
 
 class MonitorLayout {
@@ -60,6 +66,20 @@ class MonitorLayout {
   bool move_to_position(uint32_t id, uint32_t position);
   // Places a monitor anywhere (for arrangements other than a row); call normalize() when done.
   bool set_position(uint32_t id, int32_t x, int32_t y);
+  // The size of the monitor's rectangle for a mode and a scale (never below 1).
+  static uint32_t logical_size(uint32_t pixels, uint32_t scale_percent);
+  // Sets the monitor's mode (in pixels) and scale; its rectangle gets the logical size, keeping its corner, and moves to the nearest free place next
+  // to the others if that makes it overlap one. False if the monitor is not there, a size is 0 or the scale is outside 100..400.
+  bool set_mode(uint32_t id, uint32_t width, uint32_t height, uint32_t scale_percent);
+  // Drops the monitor with its top left as near to (x, y) as it can go: next to another monitor on any side, not over one, keeping all of them
+  // connected, and snapped to line up with the edges of the one it touches when within a few pixels. False (nothing moves) if there is no such place.
+  bool place_adjacent(uint32_t id, int32_t x, int32_t y);
+  // Replaces the whole layout (to go back to one that was saved).
+  bool assign(const MonitorSlot* slots, uint32_t count);
+  // True if the enabled monitors form one piece (each can be reached from the others over touching rectangles).
+  bool connected() const;
+  // After a monitor went away: if the ones that are left fell apart, they are put in a row again.
+  void repair();
   // Moves everything so that the bounding box starts at (0, 0).
   void normalize();
   // Lines the monitors up in a row, in their current left-to-right order, tops aligned.

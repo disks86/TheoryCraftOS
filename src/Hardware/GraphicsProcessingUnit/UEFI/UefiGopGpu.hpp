@@ -50,6 +50,9 @@ class UefiGopGpu : public FramebufferGpu, public IMonitorSource {
   uint32_t connector_count() const override { return 1; }
   bool connector_info(uint32_t connector, ConnectorInfo* out) const override;
   uint32_t read_edid(uint32_t connector, ByteView out) override;
+  bool mode_available(uint32_t connector, uint32_t width, uint32_t height) const override;
+  uint32_t device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const override;
+  bool set_display_mode(uint32_t connector, uint32_t width, uint32_t height) override;
 
  private:
   bool apply_current_mode();

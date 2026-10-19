@@ -41,6 +41,9 @@ class Window final : public Control {
   // Waits for background work, stops the handler thread. Do not destroy a window from inside a handler.
   ~Window();
 
+  // Draws from now on with `renderer` (whose extent becomes the window's size): for a screen that changed its size. Nothing may be rendering
+  // meanwhile (stop the RenderLoop first), and the old renderer may be destroyed afterwards. The controls are laid out again.
+  void set_renderer(graphics::IRenderer2D& renderer);
   // The title bar is drawn when the title is not empty.
   void set_title(StringView title);
   static constexpr int32_t kTitleHeight = 20;
@@ -157,7 +160,7 @@ class Window final : public Control {
   static void handler_main(void* window);
   void run_handlers();
 
-  graphics::IRenderer2D& renderer_;
+  graphics::IRenderer2D* renderer_;
   const Theme& theme_;
   String title_;
   Control* focus_ = nullptr;
