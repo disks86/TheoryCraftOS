@@ -61,8 +61,10 @@ void lock() {
 }
 
 void unlock() {
+  // The flush runs while the lock is still held (depth 1): a GPU driver that logs from it (a command timeout) nests instead of
+  // spinning on a lock this core already owns.
+  if (g_depth == 1) g_graphics.flush();  // a GPU with a separate screen copy needs the finished output pushed over
   if (--g_depth == 0) {
-    g_graphics.flush();  // a GPU with a separate screen copy needs the finished output pushed over
     g_owner = 0;
     g_lock.unlock();
   }
