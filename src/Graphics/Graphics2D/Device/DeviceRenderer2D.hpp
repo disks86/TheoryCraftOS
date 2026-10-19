@@ -95,7 +95,10 @@ class DeviceRenderer2D final : public IRenderer2D {
   IPipeline* blended_ = nullptr;
   IPipeline* opaque_ = nullptr;
   IBuffer* vertices_ = nullptr;
-  IImage* image_ = nullptr;
+  // Double buffered: frames are drawn into images_[back_] and present() shows that image and then draws into the other, so the screen
+  // never shows a half-drawn frame. (Every frame must repaint all of the target: the back image holds the frame before last.)
+  IImage* images_[2] = {};
+  uint32_t back_ = 0;
   ICommandBuffer* commands_ = nullptr;
   ArrayView<ColoredVertex> batch_;  // the mapped vertex buffer
   uint32_t count_ = 0;         // vertices recorded

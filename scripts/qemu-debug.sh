@@ -39,12 +39,13 @@ if [ "$GPU_CHOICE" = auto ]; then
   if qemu-system-x86_64 -device help 2>/dev/null | grep -q 'virtio-gpu-gl-pci'; then GPU_CHOICE=gl; else GPU_CHOICE=std; fi
 fi
 case $GPU_CHOICE in
-  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,show-cursor=off" ;;
-  virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk,show-cursor=off" ;;
-  std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,show-cursor=off" ;;
+  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,show-cursor=off,show-menubar=off" ;;
+  virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk,show-cursor=off,show-menubar=off" ;;
+  std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,show-cursor=off,show-menubar=off" ;;
   *) echo "unknown QEMU_GPU=$QEMU_GPU (auto, std, virtio, gl)" >&2; exit 2 ;;
 esac
 exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \
+  -qmp unix:"$BUILD/qmp.sock",server=on,wait=off -d guest_errors,unimp -D "$BUILD/qemu-guest.log" \
   -drive if=pflash,format=raw,readonly=on,file="$(sed -n 's/^OVMF_CODE:FILEPATH=//p' "$BUILD/CMakeCache.txt")" \
   -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
   -drive format=raw,file=fat:rw:"$BUILD/esp" \

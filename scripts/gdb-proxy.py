@@ -56,11 +56,11 @@ def gpu_arguments():
         devices = subprocess.run(["qemu-system-x86_64", "-device", "help"], capture_output=True, text=True).stdout
         choice = "gl" if "virtio-gpu-gl-pci" in devices else "std"
     if choice == "gl":
-        return ["-vga", "none", "-device", "virtio-gpu-gl-pci"], "gtk,gl=on,show-cursor=off"
+        return ["-vga", "none", "-device", "virtio-gpu-gl-pci"], "gtk,gl=on,show-cursor=off,show-menubar=off"
     if choice == "virtio":
-        return ["-vga", "none", "-device", "virtio-gpu-pci"], "gtk,show-cursor=off"
+        return ["-vga", "none", "-device", "virtio-gpu-pci"], "gtk,show-cursor=off,show-menubar=off"
     if choice == "std":
-        return ["-vga", "none", "-device", "VGA,vgamem_mb=" + os.environ.get("QEMU_VGAMEM", "64")], "gtk,show-cursor=off"
+        return ["-vga", "none", "-device", "VGA,vgamem_mb=" + os.environ.get("QEMU_VGAMEM", "64")], "gtk,show-cursor=off,show-menubar=off"
     sys.exit("unknown QEMU_GPU=%s (auto, std, virtio, gl)" % choice)
 
 
@@ -81,6 +81,9 @@ def start_qemu(build):
         "-device", "virtio-tablet-pci",
         "-display", os.environ.get("QEMU_DISPLAY", display),
         "-gdb", f"tcp:127.0.0.1:{PORT}", "-S",
+        # `scripts/qemu-status.py` asks this socket why the VM is paused.
+        "-qmp", f"unix:{os.path.join(build, 'qmp.sock')},server=on,wait=off",
+        "-d", "guest_errors,unimp", "-D", os.path.join(build, "qemu-guest.log"),
         "-drive", f"if=pflash,format=raw,readonly=on,file={cache(build, 'OVMF_CODE')}",
         "-drive", f"if=pflash,format=raw,file={vars_fd}",
         "-drive", f"format=raw,file=fat:rw:{os.path.join(build, 'esp')}",

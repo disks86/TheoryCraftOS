@@ -38,9 +38,9 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
     opaque_ = device.create_graphics_pipeline(desc);
   }
   vertices_ = device.create_buffer(sizeof(ColoredVertex) * kMaxVertices, kBufferVertex);
-  image_ = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
+  for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
   commands_ = device.create_command_buffer();
-  valid_ = blended_ && opaque_ && vertices_ && image_ && commands_;
+  valid_ = blended_ && opaque_ && vertices_ && images_[0] && images_[1] && commands_;
   if (valid_) {
     batch_ = vertices_->map().cast<ColoredVertex>();
     valid_ = !batch_.empty();
@@ -49,7 +49,8 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
 
 DeviceRenderer2D::~DeviceRenderer2D() {
   if (commands_) device_.destroy_command_buffer(commands_);
-  if (image_) device_.destroy_image(image_);
+  for (IImage* image : images_)
+    if (image) device_.destroy_image(image);
   if (vertices_) device_.destroy_buffer(vertices_);
   if (opaque_) device_.destroy_pipeline(opaque_);
   if (blended_) device_.destroy_pipeline(blended_);
@@ -70,7 +71,7 @@ bool DeviceRenderer2D::submit_pending() {
   vertices_->unmap();
   commands_->begin();
   RenderPassBegin pass;
-  pass.color = image_;
+  pass.color = images_[back_];
   pass.clear_color = false;  // keep what earlier frames and submissions drew
   commands_->begin_render_pass(pass);
   commands_->bind_vertex_buffer(vertices_);
@@ -132,7 +133,7 @@ void DeviceRenderer2D::clear(uint32_t color) {
   count_ = range_start_ = range_count_ = 0;  // the clear wipes whatever was recorded
   commands_->begin();
   RenderPassBegin pass;
-  pass.color = image_;
+  pass.color = images_[back_];
   pass.clear_color_value = unpack_color(color);
   commands_->begin_render_pass(pass);
   commands_->end_render_pass();
@@ -236,9 +237,9 @@ void DeviceRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_
 }
 
 void DeviceRenderer2D::present() {
-  if (submit_pending()) device_.present(image_);
+  if (submit_pending() && device_.present(images_[back_])) back_ ^= 1;
 }
 
-bool DeviceRenderer2D::read_pixels(ArrayView<uint32_t> out) { return submit_pending() && image_ && image_->read_pixels(out); }
+bool DeviceRenderer2D::read_pixels(ArrayView<uint32_t> out) { return submit_pending() && images_[back_] && images_[back_]->read_pixels(out); }
 
 }  // namespace graphics

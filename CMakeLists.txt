@@ -446,6 +446,8 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -chardev stdio,id=dbg,logfile=${CMAKE_BINARY_DIR}/debugcon.log,signal=off
     -device isa-debugcon,iobase=0x402,chardev=dbg
     -serial null
+    # `scripts/qemu-status.py` asks this socket why the VM is paused.
+    -qmp unix:${CMAKE_BINARY_DIR}/qmp.sock,server=on,wait=off
   )
   add_custom_target(vars
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OVMF_VARS} ${CMAKE_BINARY_DIR}/OVMF_VARS.fd
@@ -467,7 +469,7 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
   # The standard VGA card gets 64 MiB of video memory (the default 16 MiB leaves out the largest resolutions).
   set(QEMU_STD_VGA -vga none -device VGA,vgamem_mb=64)
   # The same with a virtio-gpu 3D device: QEMU renders through the host's OpenGL (virgl).
-  set(QEMU_GL_GPU -vga none -device virtio-gpu-gl-pci -display gtk,gl=on,show-cursor=off)
+  set(QEMU_GL_GPU -vga none -device virtio-gpu-gl-pci -display gtk,gl=on,show-cursor=off,show-menubar=off)
   # `run` and `debug` use the 3D device when this QEMU has it (so the 3D test is accelerated), else standard VGA.
   execute_process(COMMAND ${QEMU} -device help OUTPUT_VARIABLE QEMU_DEVICES ERROR_QUIET)
   if(QEMU_DEVICES MATCHES "virtio-gpu-gl-pci")
