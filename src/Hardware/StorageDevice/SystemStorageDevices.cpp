@@ -24,6 +24,7 @@
 #include "Hardware/StorageDevice/UEFI/UefiBlockStorageDevice.hpp"
 #include "Hardware/StorageDevice/Virtio/VirtioBlockDevice.hpp"
 #include "Hardware/StorageDevice/Virtio/VirtioScsiDevice.hpp"
+#include "Hardware/StorageDevice/VMware/PvscsiDevice.hpp"
 
 namespace hardware {
 
@@ -67,6 +68,8 @@ void SystemStorageDevices::find_native(List<UniquePointer<IStorageDevice>>& foun
         add_device<VirtioBlockDevice>(found, allocator_, pci_, d, allocator_, st_);
       else if (d.device_id == kVirtioScsiDevice || d.device_id == kVirtioScsiTransitionalDevice)
         add_controller<VirtioScsiController, VirtioScsiDevice>(found, allocator_, pci_, d, allocator_, st_);
+    } else if (PvscsiController::supports(d)) {
+      add_controller<PvscsiController, PvscsiDevice>(found, allocator_, pci_, d, allocator_, st_);
     } else if (NvmeStorageDevice::supports(d)) {
       add_device<NvmeStorageDevice>(found, allocator_, pci_, d, allocator_, st_);
     } else if (AhciController::supports(d)) {

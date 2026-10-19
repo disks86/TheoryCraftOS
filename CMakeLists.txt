@@ -83,6 +83,9 @@ add_executable(BOOTX64
   src/Hardware/HyperV/HyperVIntegration.cpp
   src/Hardware/HyperV/SystemHyperV.cpp
   src/Hardware/Mouse/VirtualBox/VBoxMouse.cpp
+  src/Hardware/Mouse/VMware/VmwareMouse.cpp
+  src/Hardware/VMware/Backdoor.cpp
+  src/Hardware/VMware/VmwareTools.cpp
   src/Hardware/Guest/PvPanic.cpp
   src/Hardware/Guest/VirtioRng.cpp
   src/Hardware/Guest/VirtioBalloon.cpp
@@ -167,6 +170,7 @@ add_executable(BOOTX64
   src/Hardware/NetworkInterface/SystemNetworkInterfaces.cpp
   src/Hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
   src/Hardware/NetworkInterface/AMD/PcnetNetworkInterface.cpp
+  src/Hardware/NetworkInterface/VMware/Vmxnet3NetworkInterface.cpp
   src/Hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
   src/Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
   src/Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp
@@ -175,6 +179,7 @@ add_executable(BOOTX64
   src/Hardware/StorageDevice/SystemStorageDevices.cpp
   src/Hardware/StorageDevice/Virtio/VirtioBlockDevice.cpp
   src/Hardware/StorageDevice/Virtio/VirtioScsiDevice.cpp
+  src/Hardware/StorageDevice/VMware/PvscsiDevice.cpp
   src/Hardware/StorageDevice/NVMe/NvmeStorageDevice.cpp
   src/Hardware/StorageDevice/Ahci/AhciStorageDevice.cpp
   src/Hardware/StorageDevice/Ide/IdeStorageDevice.cpp
@@ -216,6 +221,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp
   src/Graphics/Graphics2D/Device/DeviceRenderer2D.cpp
   src/Graphics/Graphics3D/BuiltinShaders.cpp

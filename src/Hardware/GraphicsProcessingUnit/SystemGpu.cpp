@@ -50,6 +50,8 @@ SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllo
   if (found) {
     if (QemuStdVgaGpu::supports(d.vendor_id, d.device_id))
       active_ = try_gpu<QemuStdVgaGpu>(storage_, context);
+    else if (d.vendor_id == VmwareSvgaGpu::kPciVendor && d.device_id == VmwareSvgaGpu::kPciDevice)
+      active_ = try_gpu<VmwareSvgaGpu>(storage_, context);
     else if (d.vendor_id == VirtioGpu::kPciVendor && d.device_id == VirtioGpu::kPciDeviceId) {
       active_ = try_gpu<VirtioGpu>(storage_, context);
       virtio_ = active_ != nullptr;

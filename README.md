@@ -441,6 +441,14 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     have never talked to a real Hyper-V. **Not done:** the synthetic network, SCSI, video, keyboard and mouse devices (netvsc/storvsc/hyperv-fb/hid; on a
     generation 2 VM the firmware's drivers still let the UEFI fallbacks reach the disk, network and screen), KVP, VSS, file copy, dynamic memory
     (balloon), the legacy DEC 21140 NIC of generation 1 VMs.
+  - **VMware:** `GraphicsProcessingUnit/VMware/VmwareSvgaGpu` (SVGA II: register ports, framebuffer in BAR 1, UPDATE commands through the FIFO; any size up
+    to the adapter's maximum), `NetworkInterface/VMware/Vmxnet3NetworkInterface` (vmxnet3, one queue pair, polled) and `StorageDevice/VMware/PvscsiDevice`
+    (PVSCSI ring adapter) were run against QEMU's `vmware-svga`, `vmxnet3` and `pvscsi` (the desktop draws, DHCP is exchanged both ways, a disk behind pvscsi is
+    found and sized). `VMware/Backdoor` is the port-0x5658 interface; on it `Mouse/VMware/VmwareMouse` takes the host's absolute pointer (enabled and
+    registered under QEMU's `-machine vmport=on`; the cursor movement itself was not checked) and `VMware/VmwareTools` is the host-command channel
+    (power off/restart, resolution, ping) - written from the open-vm-tools protocol, QEMU has no message channel, so it has never run. **Not done:**
+    VMCI, vmw_balloon, shared folders (HGFS), the clipboard/drag-and-drop channels, the SVGA 3D (SVGA3D/Gallium) device, the LSI Logic adapters, vmxnet2,
+    multiple vmxnet3 queues or offloads; a resize requested by the VMware window reaches the display only through the tools channel (nearest listed mode).
   - `Hardware/Bus/Ps2/` (`I8042Controller`) and `Hardware/Bus/Virtio/` (modern virtio-PCI transport,
     virtqueues, `VirtioInputDevice`); `Bus/Usb/Hid/` has the report-descriptor parser and interface finder.
   - `Hardware/ImageSignalProcessor/`: `IImageSignalProcessor` (raw Bayer frame -> RGB image, settings, frame

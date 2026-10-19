@@ -22,6 +22,7 @@
 #include "Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.hpp"
 #include "Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.hpp"
 #include "Hardware/NetworkInterface/Virtio/VirtioNetworkInterface.hpp"
+#include "Hardware/NetworkInterface/VMware/Vmxnet3NetworkInterface.hpp"
 
 namespace hardware {
 
@@ -50,6 +51,8 @@ void SystemNetworkInterfaces::find_native() {
       try_add<VirtioNetworkInterface>(interfaces_, allocator_, pci_, d, allocator_, st_);
     else if (E1000NetworkInterface::supports(d.vendor_id, d.device_id))
       try_add<E1000NetworkInterface>(interfaces_, allocator_, pci_, d, allocator_, st_);
+    else if (Vmxnet3NetworkInterface::supports(d.vendor_id, d.device_id))
+      try_add<Vmxnet3NetworkInterface>(interfaces_, allocator_, pci_, d, allocator_, st_);
     else if (PcnetNetworkInterface::supports(d.vendor_id, d.device_id))
       try_add<PcnetNetworkInterface>(interfaces_, allocator_, pci_, d, allocator_, st_);
     else if (Rtl8139NetworkInterface::supports(d.vendor_id, d.device_id))

@@ -25,6 +25,8 @@
 #include "Hardware/Keyboard/Virtio/VirtioKeyboard.hpp"
 #include "Hardware/Mouse/Usb/UsbHidMouse.hpp"
 #include "Hardware/Mouse/VirtualBox/VBoxMouse.hpp"
+#include "Hardware/Mouse/VMware/VmwareMouse.hpp"
+#include "Hardware/VMware/Backdoor.hpp"
 #include "Hardware/Mouse/Virtio/VirtioMouse.hpp"
 
 namespace hardware {
@@ -199,9 +201,23 @@ void SystemInput::find_virtualbox() {
   }
 }
 
+// On VMware (or QEMU's vmport) the host hands out the pointer through the backdoor; the PS/2 mouse is then only drained.
+void SystemInput::find_vmware() {
+  if (vmm_ || !Backdoor::probe() || mice_.at(0) != &ps2_mouse_) return;
+  if (auto* m = make<VmwareMouse>(ps2_mouse_)) {
+    if (m->initialize()) {
+      mice_.remove(&ps2_mouse_);
+      mice_.add(m);
+    } else {
+      release_last();
+    }
+  }
+}
+
 void SystemInput::initialize() {
   find_ps2();
   find_virtualbox();
+  find_vmware();
   find_usb();
   find_virtio();
   watcher_.snapshot();   // what was plugged in at start-up has been taken over; later ports are new

@@ -61,6 +61,7 @@
 #include "Media/MediaCodecs.hpp"
 #include "Hardware/Guest/SystemGuestServices.hpp"
 #include "Hardware/HyperV/SystemHyperV.hpp"
+#include "Hardware/VMware/VmwareTools.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
@@ -687,6 +688,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
   }
 
+  // VMware: the host's power and window-size commands over the backdoor message channel (the pointer is taken up with the input devices).
+  hardware::VmwareTools vmware_tools;
+  bool vmware_restart = false;
+  if (hardware::Backdoor::probe()) {
+    Entry(Level::Ok, "VMware").text("backdoor, version ").dec(hardware::Backdoor::version()).text(", product ").dec(hardware::Backdoor::product());
+    if (vmware_tools.start()) Entry(Level::Ok, "VMware").text("tools channel: power commands and window size");
+    else Entry(Level::Info, "VMware").text("the host has no tools message channel; power commands and window size are not followed");
+  }
+
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);
   input.set_vmmdev(guest.virtualbox());
@@ -861,6 +871,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (!threaded) Entry(Level::Warning, "Desktop").text("could not start the render and handler threads; running single-threaded");
     while (!desktop.shutdown_requested()) {
       if (hyperv.take_shutdown_request(&hyperv_restart)) desktop.request_shutdown();   // the Hyper-V manager asked
+      if (vmware_tools.take_shutdown_request(&vmware_restart)) desktop.request_shutdown();   // so did VMware
+      uint32_t tools_width, tools_height;
+      if (vmware_tools.take_resolution(&tools_width, &tools_height)) on_vbox_display_request(&vbox_display, tools_width, tools_height);
       if (threaded) {
         desktop.pump(hardware::uptime_us());
       } else {
@@ -889,6 +902,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   cameras.stop_service();
   guest.stop_service();
   hyperv.stop_service();
+  vmware_tools.stop();
   printers.stop_service();   // (its thread ends before the threads do: joining it afterwards would wait for ever)
   stacks.clear();  // the stacks go before the NICs underneath them
 #ifdef TCOS_SELFTESTS
@@ -922,6 +936,6 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     Entry(Level::Warning, "Shutdown").text("virtio-gpu: ").dec(virtio->timeouts()).text(" commands timed out (the host display was not answering)");
   Entry(Level::Ok, "Shutdown").text("powering off");
 
-  st->runtime_services->reset_system(hyperv_restart ? efi::ResetType::Cold : efi::ResetType::Shutdown, efi::kSuccess, 0, nullptr);
+  st->runtime_services->reset_system((hyperv_restart || vmware_restart) ? efi::ResetType::Cold : efi::ResetType::Shutdown, efi::kSuccess, 0, nullptr);
   for (;;) cpu.halt();
 }

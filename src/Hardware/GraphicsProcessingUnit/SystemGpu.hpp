@@ -21,6 +21,7 @@
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
+#include "Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
 
 namespace hardware {
@@ -42,7 +43,7 @@ class SystemGpu {
 
  private:
   static constexpr unsigned long kSize =
-      GpuMaxOf(GpuMaxOf(sizeof(UefiGopGpu), sizeof(QemuStdVgaGpu)), sizeof(VirtioGpu));
+      GpuMaxOf(GpuMaxOf(GpuMaxOf(sizeof(UefiGopGpu), sizeof(QemuStdVgaGpu)), sizeof(VirtioGpu)), sizeof(VmwareSvgaGpu));
 
   alignas(16) unsigned char storage_[kSize];
   IGraphicsProcessingUnit* active_ = nullptr;

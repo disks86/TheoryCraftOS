@@ -95,6 +95,7 @@ class SystemInput {
   static void service_main(void* self);
   void find_virtio();
   void find_virtualbox();
+  void find_vmware();
 
   VmmDev* vmm_ = nullptr;
   IPciBus& pci_;
