@@ -18,7 +18,7 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Paint", "Media Player",
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Paint", "Media Player", "3D Test",
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -32,6 +32,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Desktop/Paint.hpp"
@@ -99,6 +100,11 @@ class Desktop {
   void set_file_system(filesystem::IFileSystem* fs);
   Paint& paint() { return paint_; }
   MediaPlayer& media_player() { return media_player_; }
+  Graphics3DTest& graphics_test() { return graphics_test_; }
+  // The machine's graphics for the 3D test window (nullptr: it says there is none). They must outlive the desktop.
+  void set_graphics(graphics::SystemGraphics* graphics) { graphics_test_.set_graphics(graphics); }
+  // Opens the 3D test window (a spinning cube with the frame rate and whether the GPU draws it), or brings it forward.
+  void open_graphics_test();
   // The machine's sound mixer, video codecs and clock for the media player (any may be nullptr). They must outlive the desktop.
   void set_media_services(audio::AudioMixer* mixer, hardware::SystemVideoCodecs* codecs, const hardware::IClock* clock) {
     media_player_.set_services(mixer, codecs, clock);
@@ -197,6 +203,7 @@ class Desktop {
  private:
   static void on_paint(void* self, gui::Control&);
   static void on_media_player(void* self, gui::Control&);
+  static void on_graphics_test(void* self, gui::Control&);
   static void on_text_editor(void* self, gui::Control&);
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
@@ -259,6 +266,7 @@ class Desktop {
   Paint paint_;
   Terminal terminal_;
   MediaPlayer media_player_;
+  Graphics3DTest graphics_test_;
   gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"
   DisplaySettings display_settings_;
   NetworkProperties network_properties_;

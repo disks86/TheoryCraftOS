@@ -251,6 +251,7 @@ add_executable(BOOTX64
   src/Desktop/Notepad.cpp
   src/Desktop/Paint.cpp
   src/Desktop/MediaPlayer.cpp
+  src/Desktop/Graphics3DTest.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
   src/SystemNetworkDetails.cpp

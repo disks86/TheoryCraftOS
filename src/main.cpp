@@ -847,6 +847,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_monitors(&monitors);
+    desktop.set_graphics(&system_graphics);
     VBoxDisplayContext vbox_display{&monitors, &desktop};
     guest.set_display_request_handler(on_vbox_display_request, &vbox_display);
     desktop.set_display_changer(&DisplayPipeline::apply, &display_pipeline);

@@ -50,6 +50,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       paint_(allocator),
       terminal_(allocator),
       media_player_(allocator),
+      graphics_test_(allocator),
       display_confirm_dialog_(allocator),
       display_settings_(allocator),
       network_properties_(allocator),
@@ -77,6 +78,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
+  start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
@@ -426,6 +428,13 @@ void Desktop::open_media_player(TabFrame* into) {
   });
 }
 
+void Desktop::open_graphics_test() {
+  window_.locked([&] {
+    if (graphics_test_.manager()) graphics_test_.activate();
+    else windows_.add_window(&graphics_test_);
+  });
+}
+
 void Desktop::open_display_settings() {
   window_.locked([&] {
     display_settings_.refresh();
@@ -565,6 +574,7 @@ void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 void Desktop::on_computer_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_computer_manager(); }
 void Desktop::on_paint(void* self, Control&) { static_cast<Desktop*>(self)->open_paint(); }
 void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self)->open_media_player(); }
+void Desktop::on_graphics_test(void* self, Control&) { static_cast<Desktop*>(self)->open_graphics_test(); }
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
 void Desktop::on_explorer_file(void* self, Control& sender) {
   auto* d = static_cast<Desktop*>(self);

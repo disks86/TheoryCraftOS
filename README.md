@@ -449,6 +449,10 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     (power off/restart, resolution, ping) - written from the open-vm-tools protocol, QEMU has no message channel, so it has never run. **Not done:**
     VMCI, vmw_balloon, shared folders (HGFS), the clipboard/drag-and-drop channels, the SVGA 3D (SVGA3D/Gallium) device, the LSI Logic adapters, vmxnet2,
     multiple vmxnet3 queues or offloads; a resize requested by the VMware window reaches the display only through the tools channel (nearest listed mode).
+  - **3D Test** (Start menu; `Desktop/Graphics3DTest`): a window with a spinning, depth-tested cube drawn on the machine's 3D device, the frame rate, the time the
+    last frame took, and an indicator - green "GPU accelerated - <device>" or amber "Software (CPU) - software rasterizer" - with a check box to switch between the two
+    when a GPU device exists. Frames are drawn from the control's paint (the render thread is the only user of the 3D device) at up to 400x300 and read back to be shown.
+    Under QEMU/virgl (egl-headless) it ran at about 70 FPS accelerated and 26 FPS in software; it also logs the FPS to the debug console every few seconds.
   - **3D acceleration by hypervisor:** QEMU - virgl on virtio-gpu (`VirglDevice`; checked headless with `-device virtio-gpu-gl-pci -display egl-headless`: 3D and 2D
     are reported GPU accelerated). VMware and VirtualBox (its VMSVGA adapter is the same device) - `Graphics3D/Svga/SvgaDevice` drives SVGA3D
     (Direct3D 9 protocol: host surfaces, vs_2_0/ps_2_0 bytecode in `ShaderModuleDesc::d3d9_tokens`, commands through the FIFO, transfers through video
