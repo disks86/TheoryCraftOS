@@ -56,6 +56,7 @@ bool UefiGopGpu::apply_current_mode() {
                   mode->info->horizontal_resolution, mode->info->vertical_resolution,
                   mode->info->pixels_per_scan_line * 4,
                   mode->info->pixel_format == efi::PixelFormat::BlueGreenRedReserved8Bit);
+  set_video_memory_total(mode->frame_buffer_size);
   return true;
 }
 

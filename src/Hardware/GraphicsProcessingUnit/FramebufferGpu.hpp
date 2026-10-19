@@ -38,6 +38,9 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   void blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t* pixels,
             uint32_t pitch_pixels) override;
 
+  // The framebuffer is all the video memory known about unless a subclass says there is more (set_video_memory_total).
+  bool video_memory(uint64_t* total_bytes, uint64_t* used_bytes) const override;
+
   uint32_t glyph_width() const override;
   uint32_t glyph_height() const override;
   void draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg) override;
@@ -51,6 +54,8 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   // `memory` is the whole framebuffer; it must cover height * pitch_bytes bytes or no drawing happens.
   void set_framebuffer(ByteView memory, uint32_t width, uint32_t height, uint32_t pitch_bytes, bool bgr);
   uint32_t pitch_bytes() const { return pitch_; }
+  // The size of the device's video memory when it is more than the visible framebuffer.
+  void set_video_memory_total(uint64_t bytes) { video_total_ = bytes; }
   // The rectangle drawn on since the last call (and clears it); false if nothing was. For GPUs
   // whose screen lives in separate memory and needs the changes copied over.
   bool take_dirty(uint32_t* x, uint32_t* y, uint32_t* w, uint32_t* h);
@@ -64,6 +69,7 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
 
   ByteView memory_;
   uint32_t width_ = 0, height_ = 0, pitch_ = 0;
+  uint64_t video_total_ = 0;
   bool bgr_ = true;
   uint32_t dirty_x0_ = 0, dirty_y0_ = 0, dirty_x1_ = 0, dirty_y1_ = 0;  // empty when x0 >= x1
 };

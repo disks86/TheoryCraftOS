@@ -862,6 +862,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.explorer().set_eject_handler(on_eject, &eject_context);
     if (!explorer_files.start_service()) Entry(Level::Warning, "Storage").text("could not start hot-plug polling; USB sticks plugged in later are not seen");
     SystemMonitor monitor(allocator, shared_allocator);
+    monitor.set_gpu(gpu);
+    monitor.set_pci(&pci);
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);

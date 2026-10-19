@@ -17,6 +17,7 @@
  */
 
 #include "SystemMonitor.hpp"
+#include "Hardware/CentralProcessingUnit/CpuTemperature.hpp"
 #include "Kernel/Thread.hpp"
 #include "Utility/AllocatedView.hpp"
 
@@ -59,4 +60,15 @@ desktop::TaskMemory SystemMonitor::memory() {
     m.free_bytes = heap_.free_bytes();
   });
   return m;
+}
+
+int32_t SystemMonitor::cpu_temperature_millicelsius() { return hardware::cpu_temperature_millicelsius(pci_); }
+
+desktop::TaskGpu SystemMonitor::gpu() {
+  desktop::TaskGpu g;
+  if (!gpu_) return g;
+  g.usage_percent = gpu_->utilization_percent();
+  g.memory_known = gpu_->video_memory(&g.memory_total_bytes, &g.memory_used_bytes);
+  g.temperature_millicelsius = gpu_->temperature_millicelsius();
+  return g;
 }

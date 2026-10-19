@@ -59,6 +59,7 @@ add_executable(BOOTX64
   src/Hardware/CentralProcessingUnit/Hygon/HygonGenerations.cpp
   src/Hardware/CentralProcessingUnit/Zhaoxin/ZhaoxinGenerations.cpp
   src/Hardware/CentralProcessingUnit/SystemCpu.cpp
+  src/Hardware/CentralProcessingUnit/CpuTemperature.cpp
   src/Hardware/CentralProcessingUnit/X86_64Cpu.S
   src/Hardware/IoPort.cpp
   src/Hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp

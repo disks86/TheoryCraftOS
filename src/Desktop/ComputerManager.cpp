@@ -67,6 +67,10 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       cpu_meter_(allocator),
       memory_meter_(allocator),
       grid_(allocator),
+      gpu_row_(allocator),
+      vram_row_(allocator),
+      cpu_temp_row_(allocator),
+      gpu_temp_row_(allocator),
       core_rows_(allocator),
       model_(allocator),
       previous_cores_(allocator),
@@ -74,7 +78,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   buffer_ = allocate_view<TaskThread>(allocator, kMaxThreads);
   for (int32_t& node : group_nodes_) node = -1;
   set_title("Computer Manager");
-  set_bounds({90, 40, 480, 430});
+  set_bounds({90, 40, 480, 520});
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
 
@@ -120,6 +124,10 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     r.row.add(&r.meter);
     performance_page_.add(&r.row);
   }
+  setup_stat_row(gpu_row_, "GPU");
+  setup_stat_row(vram_row_, "VRAM");
+  setup_stat_row(cpu_temp_row_, "CPU Temp");
+  setup_stat_row(gpu_temp_row_, "GPU Temp");
   info_.set_dock(DockStyle::Top);
   info_.set_size(0, 20);
   performance_page_.add(&info_);
@@ -171,6 +179,24 @@ void ComputerManager::on_tab_changed(void* self, Control&) {  // the View menu s
   if (t->hardware_item_) t->hardware_item_->set_checked(t->tabs_.selected_page() == 2);
 }
 void ComputerManager::on_show_processes(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(0); }
+void ComputerManager::setup_stat_row(CoreRow& r, const char* title) {
+  r.row.set_style(PanelStyle::Transparent);
+  r.row.set_dock(DockStyle::Top);
+  r.row.set_size(0, 24);
+  r.title.set_text(title);
+  r.title.set_dock(DockStyle::Left);
+  r.title.set_size(64, 0);
+  r.value.set_dock(DockStyle::Right);
+  r.value.set_size(170, 0);
+  r.value.set_text("n/a");
+  r.meter.set_peak_hold(false);
+  r.meter.set_dock(DockStyle::Fill);
+  r.row.add(&r.title);
+  r.row.add(&r.value);
+  r.row.add(&r.meter);
+  performance_page_.add(&r.row);
+}
+
 void ComputerManager::on_show_performance(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(1); }
 void ComputerManager::on_show_hardware(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(2); }
 void ComputerManager::on_display_settings_item(void* self, Control&) {
@@ -377,6 +403,50 @@ void ComputerManager::update(uint64_t now_us) {
   text.append(" / ");
   text.append(total_text.view());
   memory_value_.set_text(text.view());
+
+  // --- Graphics adapter and temperatures; whatever the machine cannot tell shows as n/a.
+  const TaskGpu gpu = monitor_->gpu();
+  auto show_percent = [&](CoreRow& row, int32_t percent) {
+    row.meter.set_level(percent < 0 ? 0 : percent > 100 ? 100 : percent);
+    text.clear();
+    if (percent < 0) text.assign("n/a");
+    else { text.append_uint(static_cast<uint64_t>(percent)); text.append("%"); }
+    row.value.set_text(text.view());
+  };
+  auto show_temperature = [&](CoreRow& row, int32_t millicelsius) {
+    row.meter.set_level(millicelsius < 0 ? 0 : millicelsius >= 100000 ? 100 : millicelsius / 1000);
+    text.clear();
+    if (millicelsius < 0) {
+      text.assign("n/a");
+    } else {
+      text.append_uint(static_cast<uint64_t>(millicelsius) / 1000);
+      text.push_back('.');
+      text.append_uint(static_cast<uint64_t>(millicelsius) / 100 % 10);
+      text.append(" C");
+    }
+    row.value.set_text(text.view());
+  };
+  show_percent(gpu_row_, gpu.usage_percent);
+  if (gpu.memory_known && !gpu.memory_total_bytes) {   // the adapter knows what is in use but not what there is
+    vram_row_.meter.set_level(0);
+    format_size(gpu.memory_used_bytes, &used_text);
+    text.assign(used_text.view());
+    text.append(" used");
+    vram_row_.value.set_text(text.view());
+  } else if (gpu.memory_known) {
+    vram_row_.meter.set_level(static_cast<int32_t>(gpu.memory_used_bytes * 100 / gpu.memory_total_bytes));
+    format_size(gpu.memory_used_bytes, &used_text);
+    format_size(gpu.memory_total_bytes, &total_text);
+    text.assign(used_text.view());
+    text.append(" / ");
+    text.append(total_text.view());
+    vram_row_.value.set_text(text.view());
+  } else {
+    vram_row_.meter.set_level(0);
+    vram_row_.value.set_text("n/a");
+  }
+  show_temperature(cpu_temp_row_, monitor_->cpu_temperature_millicelsius());
+  show_temperature(gpu_temp_row_, gpu.temperature_millicelsius);
 
   // --- Threads: load since the last call, in tenths of a percent of one core.
   const uint32_t count = monitor_->threads(buffer_.data(), kMaxThreads);

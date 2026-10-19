@@ -21,6 +21,14 @@
 
 namespace hardware {
 
+bool FramebufferGpu::video_memory(uint64_t* total_bytes, uint64_t* used_bytes) const {
+  if (memory_.empty()) return false;
+  const uint64_t used = memory_.size();
+  if (total_bytes) *total_bytes = video_total_ > used ? video_total_ : used;
+  if (used_bytes) *used_bytes = used;
+  return true;
+}
+
 void FramebufferGpu::set_framebuffer(ByteView memory, uint32_t width, uint32_t height, uint32_t pitch_bytes,
                                      bool bgr) {
   const bool fits = pitch_bytes >= uint64_t{width} * 4 && pitch_bytes % 4 == 0 &&

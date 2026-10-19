@@ -372,4 +372,12 @@ void VirtioGpu::shutdown() {
   screen_resource_ = 0;
 }
 
+bool VirtioGpu::video_memory(uint64_t* total_bytes, uint64_t* used_bytes) const {
+  uint64_t screen = 0;
+  if (!FramebufferGpu::video_memory(nullptr, &screen)) return false;
+  if (total_bytes) *total_bytes = 0;
+  if (used_bytes) *used_bytes = screen + __atomic_load_n(&resource_bytes_, __ATOMIC_RELAXED);
+  return true;
+}
+
 }  // namespace hardware

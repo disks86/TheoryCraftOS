@@ -59,6 +59,14 @@ struct TaskMemory {
   uint64_t total_bytes = 0, free_bytes = 0;
 };
 
+// The graphics adapter's figures; a field the adapter cannot tell is left at "unknown".
+struct TaskGpu {
+  int32_t usage_percent = -1;          // 0-100, -1 unknown
+  bool memory_known = false;           // memory_total_bytes 0: the used figure is known, the total is not
+  uint64_t memory_total_bytes = 0, memory_used_bytes = 0;
+  int32_t temperature_millicelsius = -1;   // -1 unknown
+};
+
 // Where the computer manager gets its numbers (the kernel's, in the real system). All counters only grow.
 class ISystemMonitor {
  public:
@@ -69,6 +77,9 @@ class ISystemMonitor {
   // Writes up to `capacity` threads; returns how many.
   virtual uint32_t threads(TaskThread* out, uint32_t capacity) = 0;
   virtual TaskMemory memory() = 0;
+  // The processor's temperature in thousandths of a degree Celsius, or -1 if the machine cannot tell.
+  virtual int32_t cpu_temperature_millicelsius() { return -1; }
+  virtual TaskGpu gpu() { return TaskGpu(); }
 
  protected:
   constexpr ISystemMonitor() = default;
@@ -114,6 +125,15 @@ class ComputerManager : public gui::Frame {
   gui::ContextMenu& grid_menu() { return grid_menu_; }
   // The meter and label of core `index` (one per online core up to kMaxCoresShown; nullptr for others).
   gui::LevelMeter* core_meter(uint32_t index);
+  // The GPU, video memory and temperature rows of the Performance tab.
+  gui::LevelMeter& gpu_meter() { return gpu_row_.meter; }
+  gui::Label& gpu_label() { return gpu_row_.value; }
+  gui::LevelMeter& vram_meter() { return vram_row_.meter; }
+  gui::Label& vram_label() { return vram_row_.value; }
+  gui::LevelMeter& cpu_temp_meter() { return cpu_temp_row_.meter; }
+  gui::Label& cpu_temp_label() { return cpu_temp_row_.value; }
+  gui::LevelMeter& gpu_temp_meter() { return gpu_temp_row_.meter; }
+  gui::Label& gpu_temp_label() { return gpu_temp_row_.value; }
   gui::Label* core_label(uint32_t index);
   // The CPU share (tenths of a percent of one core) of the thread with this id, or -1 if it is not listed.
   int32_t thread_load_tenths(uint64_t id) const;
@@ -149,6 +169,9 @@ class ComputerManager : public gui::Frame {
     gui::LevelMeter meter;
   };
 
+  // Fills `row`'s three parts and docks it at the top of the Performance tab.
+  void setup_stat_row(CoreRow& row, const char* title);
+
   static void on_show_processes(void* self, gui::Control&);
   static void on_show_performance(void* self, gui::Control&);
   static void on_close_window(void* self, gui::Control&);
@@ -178,6 +201,7 @@ class ComputerManager : public gui::Frame {
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
   gui::LevelMeter cpu_meter_, memory_meter_;
   gui::DataGrid grid_;
+  CoreRow gpu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_;
   List<UniquePointer<CoreRow>> core_rows_;
   Model model_;
   ISystemMonitor* monitor_ = nullptr;

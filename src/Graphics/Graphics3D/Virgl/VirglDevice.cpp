@@ -117,6 +117,8 @@ class VirglBuffer final : public IBuffer {
                                  {reinterpret_cast<uint64_t>(memory_.data()), static_cast<uint32_t>(size), 0}};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(attach)) && gpu.command(as_bytes(ctx));
+    gpu.add_resource_bytes(size);
+    accounted_ = size;
   }
   ~VirglBuffer() {
     hardware::VirtioGpu& gpu = device_.gpu();
@@ -126,6 +128,7 @@ class VirglBuffer final : public IBuffer {
       gpu.command(as_bytes(detach));
       gpu.command(as_bytes(unref));
     }
+    gpu.remove_resource_bytes(accounted_);
     release_view(gpu.allocator(), memory_);
   }
   bool valid() const { return ok_; }
@@ -142,6 +145,7 @@ class VirglBuffer final : public IBuffer {
   VirglDevice& device_;
   ByteView memory_;
   uint32_t id_ = 0;
+  uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this buffer
   bool ok_ = false;
 };
 
@@ -158,6 +162,8 @@ class VirglImage final : public IImage {
                             desc.extent.width, desc.extent.height, 1, 1, 0, 0, kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
+    accounted_ = uint64_t{desc.extent.width} * desc.extent.height * 4;   // (every format here is 32 bits per pixel)
+    gpu.add_resource_bytes(accounted_);
     // The surface (a render-target view of the resource) is what the framebuffer state refers to.
     if (ok_ && (desc.usage & (kImageColorAttachment | kImageDepthAttachment))) {
       surface_ = device.new_handle();
@@ -175,6 +181,7 @@ class VirglImage final : public IImage {
       gpu.command(as_bytes(detach));
       gpu.command(as_bytes(unref));
     }
+    gpu.remove_resource_bytes(accounted_);
     release_view(gpu.allocator(), backing_);
   }
   bool valid() const { return ok_; }
@@ -211,6 +218,7 @@ class VirglImage final : public IImage {
   VirglDevice& device_;
   ImageDesc desc_;
   uint32_t id_ = 0, surface_ = 0;
+  uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this image
   ByteView backing_;
   bool ok_ = false;
 };

@@ -1524,6 +1524,10 @@ struct FakeMonitor final : desktop::ISystemMonitor {
     return n;
   }
   desktop::TaskMemory memory() override { return {1ull << 30, free_bytes}; }
+  int32_t cpu_temp = 62500;
+  desktop::TaskGpu gpu_info;
+  int32_t cpu_temperature_millicelsius() override { return cpu_temp; }
+  desktop::TaskGpu gpu() override { return gpu_info; }
 };
 
 static void test_computer_manager() {
@@ -1549,6 +1553,23 @@ static void test_computer_manager() {
     CHECK(tm.info_label().text().equals("Threads: 3   Cores: 2   Uptime: 00:00:01"));
     CHECK(tm.core_meter(0) && tm.core_meter(1) && !tm.core_meter(2) && tm.core_label(0)->text().equals("0%"));
     CHECK(tm.tabs().page_count() == 3 && tm.tabs().page_title(0).equals("Processes") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().page_title(2).equals("Hardware") && tm.tabs().selected_page() == 0);
+
+    // The GPU, its memory and the temperatures: unknown figures read n/a, known ones fill their meters.
+    CHECK(tm.gpu_label().text().equals("n/a") && tm.vram_label().text().equals("n/a") && tm.gpu_temp_label().text().equals("n/a"));
+    CHECK(tm.cpu_temp_label().text().equals("62.5 C") && tm.cpu_temp_meter().level() == 62);
+    mon.gpu_info.usage_percent = 40;
+    mon.gpu_info.memory_known = true;
+    mon.gpu_info.memory_total_bytes = 1ull << 30;
+    mon.gpu_info.memory_used_bytes = 256ull << 20;
+    mon.gpu_info.temperature_millicelsius = 71000;
+    tm.update(1000000);
+    CHECK(tm.gpu_label().text().equals("40%") && tm.gpu_meter().level() == 40);
+    CHECK(tm.vram_label().text().equals("256.0 MB / 1.0 GB") && tm.vram_meter().level() == 25);
+    CHECK(tm.gpu_temp_label().text().equals("71.0 C") && tm.gpu_temp_meter().level() == 71);
+    mon.gpu_info.memory_total_bytes = 0;     // a virtual GPU: used is known, the total is not
+    tm.update(1000000);
+    CHECK(tm.vram_label().text().equals("256.0 MB used") && tm.vram_meter().level() == 0);
+    mon.gpu_info = desktop::TaskGpu();
 
     // One second later: core 0 was 25% busy, core 1 75% busy, and the worker ran 600 of the 1000 ticks.
     mon.core_busy[0] = 250; mon.core_idle[0] = 750;

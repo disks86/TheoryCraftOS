@@ -129,6 +129,7 @@ bool VmwareSvgaGpu::program(uint32_t width, uint32_t height) {
   pitch_ = pitch;
   fb_offset_ = offset;
   set_framebuffer(ByteView(framebuffer_ + offset, uint64_t{pitch} * height), width, height, pitch, true);
+  set_video_memory_total(framebuffer_bytes_);
   mark_all_dirty();
   present();
   return true;

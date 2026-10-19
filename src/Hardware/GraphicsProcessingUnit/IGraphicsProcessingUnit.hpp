@@ -67,6 +67,14 @@ class IGraphicsProcessingUnit : public IHardware {
   // (SystemMonitors) then treats the whole screen as one display.
   virtual IMonitorSource* monitor_source() { return nullptr; }
 
+  // --- Telemetry. Each is for the computer manager and says "unknown" unless the device can tell.
+  // The video memory the device has and how much of it is in use; false if unknown.
+  virtual bool video_memory(uint64_t* total_bytes, uint64_t* used_bytes) const { (void)total_bytes; (void)used_bytes; return false; }
+  // Share of the time the graphics engine is busy, 0-100, or -1 if unknown.
+  virtual int32_t utilization_percent() { return -1; }
+  // The chip's temperature in thousandths of a degree Celsius, or -1 if unknown.
+  virtual int32_t temperature_millicelsius() { return -1; }
+
   // --- Text rendering with a fixed-size font.
   virtual uint32_t glyph_width() const = 0;
   virtual uint32_t glyph_height() const = 0;

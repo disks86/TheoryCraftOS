@@ -70,6 +70,12 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   bool has_3d() const { return has_3d_; }
   uint32_t context_id() const { return kContextId; }
   uint32_t allocate_resource_id() { return next_resource_++; }
+  // Bookkeeping of the 3D resources (buffers and images) the host holds for us, in bytes; the 3D device calls these as it creates and
+  // frees them. Safe from any thread.
+  void add_resource_bytes(uint64_t bytes) { __atomic_fetch_add(&resource_bytes_, bytes, __ATOMIC_RELAXED); }
+  void remove_resource_bytes(uint64_t bytes) { __atomic_fetch_sub(&resource_bytes_, bytes, __ATOMIC_RELAXED); }
+  // Used = the screen plus those resources. The total is the host's, which a guest cannot ask for: reported as 0 (unknown).
+  bool video_memory(uint64_t* total_bytes, uint64_t* used_bytes) const override;
   // Sends one request and waits for the response. `response` (optional) receives the reply
   // (as much as fits). Returns the response type (virtio_gpu::kRespOk... or an error), 0 on failure.
   // The host may stop answering (QEMU's GTK/GL display holds the queue while its window is hidden or
@@ -124,6 +130,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
 
   bool has_3d_ = false;
   uint32_t next_resource_ = 1;
+  uint64_t resource_bytes_ = 0;   // live 3D resources, see add_resource_bytes()
   uint32_t screen_resource_ = 0;  // the 2D framebuffer resource
   uint32_t shown_resource_ = 0;   // what the scanout currently shows
   ByteView backing_;
