@@ -23,6 +23,8 @@
 // Thread-safe Stack (last in, first out). Operations never wait: pop() returns
 // false when the stack is empty, so a consumer polls or is told by other means
 // that work has arrived. See ConcurrentList for what is and is not atomic.
+//
+// WARNING: Do not attempt to acquire the same lock recursively - this can lead to deadlock if the underlying synchronization primitive does not support re-entrancy.
 template <class T>
 class ConcurrentStack : public Synchronized<Stack<T>> {
   using Base = Synchronized<Stack<T>>;
@@ -53,6 +55,8 @@ class ConcurrentStack : public Synchronized<Stack<T>> {
     });
   }
   // Top to bottom, under the lock.
+  // WARNING: Do not attempt to acquire the same lock recursively from within 
+  // this visitor callback as this will cause deadlock.
   template <class Visitor>
   void for_each(Visitor&& visitor) const {
     this->with([&](const Stack<T>& s) {

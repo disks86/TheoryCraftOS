@@ -22,6 +22,13 @@
 
 // Thread-safe BinaryTree (ordered set): every operation takes a SpinLock and
 // values are copied in and out. See ConcurrentList for what is and is not atomic.
+//
+// WARNING: Do not attempt to acquire the same lock recursively - this can lead to deadlock if the underlying synchronization primitive does not support re-entrancy. (e.g., calling 
+// methods on the same ConcurrentBinaryTree from within a callback passed to for_each())
+// as this will cause deadlock.
+// 
+// WARNING: Do not attempt to acquire the same lock recursively from within 
+// any visitor callback passed to for_each() as this will cause deadlock.
 template <class T, class Compare = DefaultLess<T>>
 class ConcurrentBinaryTree : public Synchronized<BinaryTree<T, Compare>> {
   using Inner = BinaryTree<T, Compare>;
@@ -76,6 +83,8 @@ class ConcurrentBinaryTree : public Synchronized<BinaryTree<T, Compare>> {
     return this->with([](const Inner& t) { return t.height(); });
   }
   // In-order (ascending), under the lock.
+  // WARNING: Do not attempt to acquire the same lock recursively from within 
+  // this visitor callback as this will cause deadlock.
   template <class Visitor>
   void for_each(Visitor&& visitor) const {
     this->with([&](const Inner& t) {

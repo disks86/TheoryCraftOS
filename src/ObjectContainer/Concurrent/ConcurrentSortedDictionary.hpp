@@ -23,6 +23,8 @@
 // Thread-safe SortedDictionary: every operation takes a SpinLock and keys and
 // values are copied in and out. update() changes a value in place atomically.
 // See ConcurrentList for what is and is not atomic.
+//
+// WARNING: Do not attempt to acquire the same lock recursively - this can lead to deadlock if the underlying synchronization primitive does not support re-entrancy.
 template <class K, class V, class Less = DefaultLess<K>>
 class ConcurrentSortedDictionary : public Synchronized<SortedDictionary<K, V, Less>> {
   using Inner = SortedDictionary<K, V, Less>;
@@ -75,6 +77,8 @@ class ConcurrentSortedDictionary : public Synchronized<SortedDictionary<K, V, Le
     return this->with([&](const Inner& d) { return copy_entry(d.lower_bound(bound), key, value); });
   }
   // Ascending by key, under the lock.
+  // WARNING: Do not attempt to acquire the same lock recursively from within 
+  // this visitor callback as this will cause deadlock.
   template <class Visitor>
   void for_each(Visitor&& visitor) const {
     this->with([&](const Inner& d) {

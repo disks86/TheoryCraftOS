@@ -22,8 +22,14 @@
 
 // Thread-safe Dictionary: every operation takes a SpinLock, and values are
 // copied in and out (find() fills a caller-owned V). To change a value in place
-// atomically - a counter, say - use update(). See ConcurrentList for what is and
+// atomically - a counter, say - use update
+//
+// WARNING: Do not attempt to acquire the same lock recursively - this can lead to deadlock if the underlying synchronization primitive does not support re-entrancy.(). See ConcurrentList for what is and
 // is not atomic.
+//
+// WARNING: Do not attempt to acquire the same lock recursively (e.g., calling 
+// methods on the same ConcurrentDictionary from within a callback passed to for_each())
+// as this will cause deadlock.
 template <class K, class V, class Hash = DefaultHash<K>, class Equal = DefaultEqual<K>>
 class ConcurrentDictionary : public Synchronized<Dictionary<K, V, Hash, Equal>> {
   using Inner = Dictionary<K, V, Hash, Equal>;
@@ -67,6 +73,8 @@ class ConcurrentDictionary : public Synchronized<Dictionary<K, V, Hash, Equal>> 
     });
   }
   // Calls visitor(const KeyValue&) for every entry, under the lock.
+  // WARNING: Do not attempt to acquire the same lock recursively from within 
+  // this visitor callback as this will cause deadlock.
   template <class Visitor>
   void for_each(Visitor&& visitor) const {
     this->with([&](const Inner& d) {

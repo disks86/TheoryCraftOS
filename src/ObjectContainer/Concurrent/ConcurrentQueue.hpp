@@ -23,6 +23,12 @@
 // Thread-safe Queue (first in, first out): any number of producers and
 // consumers. Operations never wait: dequeue() returns false when the queue is
 // empty. See ConcurrentList for what is and is not atomic.
+//
+// WARNING: Do not attempt to acquire the same lock recursively - this can lead to deadlock if the underlying synchronization primitive does not support re-entrancy.
+//
+// WARNING: Do not attempt to acquire the same lock recursively (e.g., calling 
+// methods on the same ConcurrentQueue from within a callback passed to for_each())
+// as this will cause deadlock.
 template <class T>
 class ConcurrentQueue : public Synchronized<Queue<T>> {
   using Base = Synchronized<Queue<T>>;
@@ -60,6 +66,8 @@ class ConcurrentQueue : public Synchronized<Queue<T>> {
     });
   }
   // Front to back, under the lock.
+  // WARNING: Do not attempt to acquire the same lock recursively from within 
+  // this visitor callback as this will cause deadlock.
   template <class Visitor>
   void for_each(Visitor&& visitor) const {
     this->with([&](const Queue<T>& q) {

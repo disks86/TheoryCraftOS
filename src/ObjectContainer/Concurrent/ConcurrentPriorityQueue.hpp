@@ -22,7 +22,13 @@
 
 // Thread-safe PriorityQueue: any number of producers and consumers; pop() always
 // removes the highest-priority element present at that moment and returns false
-// when empty (it never waits). See ConcurrentList for what is and is not atomic.
+// when empty (it never waits).
+//
+// WARNING: Do not attempt to acquire the same lock recursively - this can lead to deadlock if the underlying synchronization primitive does not support re-entrancy. See ConcurrentList for what is and is not atomic.
+//
+// WARNING: Do not attempt to acquire the same lock recursively (e.g., calling 
+// methods on the same ConcurrentPriorityQueue from within a callback passed to for_each())
+// as this will cause deadlock.
 template <class T, class Less = DefaultLess<T>>
 class ConcurrentPriorityQueue : public Synchronized<PriorityQueue<T, Less>> {
   using Inner = PriorityQueue<T, Less>;
@@ -54,6 +60,8 @@ class ConcurrentPriorityQueue : public Synchronized<PriorityQueue<T, Less>> {
     });
   }
   // In heap order (not sorted), under the lock.
+  // WARNING: Do not attempt to acquire the same lock recursively from within 
+  // this visitor callback as this will cause deadlock.
   template <class Visitor>
   void for_each(Visitor&& visitor) const {
     this->with([&](const Inner& q) {

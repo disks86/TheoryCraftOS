@@ -22,7 +22,9 @@
 
 // Thread-safe LinkedList: every operation takes a SpinLock. Values are copied in
 // and out; see ConcurrentList for what is and is not atomic. For erase-while-
-// walking use access() and the usual cursor loop with the lock held.
+// walking use access() and the usual c
+//
+// WARNING: Do not attempt to acquire the same lock recursively - this can lead to deadlock if the underlying synchronization primitive does not support re-entrancy.ursor loop with the lock held.
 //
 // WARNING: Do not attempt to acquire the same lock recursively (e.g., calling 
 // methods on the same ConcurrentLinkedList from within a callback passed to for_each())
