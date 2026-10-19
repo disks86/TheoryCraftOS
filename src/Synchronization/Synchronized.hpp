@@ -30,6 +30,12 @@
 // A reference or pointer into the value must not be used after the lock is
 // released; copy what you need out first. As with SpinLock, never call back into
 // the same Synchronized from inside `with` or while an Access is alive.
+//
+// WARNING: Do not invoke any operations that might attempt to lock this same
+// container from within a callback passed to with() or access(), as it can create deadlocks.
+// This restriction exists because SpinLock is not re-entrant - taking the same lock
+// twice from the same core leads to deadlock. This class has no internal tracking
+// mechanism to prevent such scenarios, so it must be documented and enforced by users.
 template <class T>
 class Synchronized {
  public:
@@ -70,6 +76,8 @@ class Synchronized {
   }
 
   // Runs `operation(T&)` with the lock held and returns what it returns.
+  // WARNING: Do not invoke any operations that might attempt to lock this same
+  // container from within the callback, as it can create deadlocks.
   template <class Operation>
   decltype(auto) with(Operation&& operation) {
     ScopedLock guard(lock_);

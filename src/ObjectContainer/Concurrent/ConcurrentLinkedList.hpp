@@ -23,6 +23,10 @@
 // Thread-safe LinkedList: every operation takes a SpinLock. Values are copied in
 // and out; see ConcurrentList for what is and is not atomic. For erase-while-
 // walking use access() and the usual cursor loop with the lock held.
+//
+// WARNING: Do not attempt to acquire the same lock recursively (e.g., calling 
+// methods on the same ConcurrentLinkedList from within a callback passed to for_each())
+// as this will cause deadlock.
 template <class T>
 class ConcurrentLinkedList : public Synchronized<LinkedList<T>> {
   using Base = Synchronized<LinkedList<T>>;
@@ -75,6 +79,9 @@ class ConcurrentLinkedList : public Synchronized<LinkedList<T>> {
       return p != nullptr;
     });
   }
+  // Calls visitor(element) for each element, in order, under the lock.
+  // WARNING: Do not attempt to acquire the same lock recursively from within 
+  // this visitor callback as this will cause deadlock.
   template <class Visitor>
   void for_each(Visitor&& visitor) const {
     this->with([&](const LinkedList<T>& l) {
