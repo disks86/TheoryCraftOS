@@ -168,11 +168,13 @@ bool SystemMonitors::apply() {
   const MonitorRect box = layout_.bounds();
   desktop_width_ = box.width;
   desktop_height_ = box.height;
-  if (!source_ || !multi_) {   // one display: the screen as it is
+  if (!source_ || !multi_) {   // one display: the screen, switched to the size the monitor is to show
+    const bool ok = sync_device_mode();
     surface_width_ = gpu_ ? gpu_->width() : 0;
     surface_height_ = gpu_ ? gpu_->height() : 0;
     applied_ = true;
-    return false;
+    ++generation_;
+    return ok;
   }
   applied_ = show();
   if (!applied_) {   // the device refused: it goes on showing one display, the size it has
@@ -187,6 +189,19 @@ bool SystemMonitors::apply() {
   }
   ++generation_;
   return applied_;
+}
+
+// A device that shows one display changes the size of its screen when the monitor is to show another: done here, when the desktop is rebuilt
+// (nothing draws then), not when the setting is chosen. False if the device would not.
+bool SystemMonitors::sync_device_mode() {
+  if (!gpu_ || !source_) return true;
+  for (uint32_t i = 0; i < layout_.count(); ++i) {
+    const MonitorSlot& s = layout_.at(i);
+    if (!s.enabled) continue;
+    if (s.physical_width == gpu_->width() && s.physical_height == gpu_->height()) return true;
+    return source_->set_display_mode(s.id, s.physical_width, s.physical_height);
+  }
+  return true;
 }
 
 bool SystemMonitors::reapply() {
@@ -395,7 +410,6 @@ bool SystemMonitors::set_resolution(uint32_t id, uint32_t width, uint32_t height
   bool ok = false;
   for (uint32_t i = 0; i < count; ++i) ok = ok || (modes[i].width == width && modes[i].height == height);
   if (!ok) return false;
-  if (!multi_ && !source_->set_display_mode(id, width, height)) return false;   // (a one-display device changes its screen now)
   MonitorMode mode = m->current_mode();
   mode.width = width;
   mode.height = height;
@@ -463,7 +477,6 @@ bool SystemMonitors::restore(const State& state) {
   for (uint32_t i = 0; i < state.count; ++i) {
     Monitor* m = find_mutable(state.slots[i].id);
     if (!m) continue;
-    if (!multi_ && source_ && state.slots[i].enabled) ok = source_->set_display_mode(state.slots[i].id, state.modes[i].width, state.modes[i].height) && ok;
     m->set_current_mode(state.modes[i]);
   }
   return ok;

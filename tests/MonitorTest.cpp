@@ -411,7 +411,7 @@ static void test_system_monitors() {
     SystemMonitors m(&plain, a);
     m.initialize();
     CHECK(m.count() == 1 && strcmp(m.monitor(0).name(), "Display") == 0 && m.layout().count() == 1 && m.layout().bounds() == MonitorRect({0, 0, 1024, 768}));
-    CHECK(!m.multi_display() && !m.apply() && m.desktop_width() == 1024 && m.desktop_height() == 768);
+    CHECK(!m.multi_display() && m.apply() && m.desktop_width() == 1024 && m.desktop_height() == 768);
     SystemMonitors none(nullptr, a);
     none.initialize();
     CHECK(none.count() == 0 && none.layout().count() == 0);
@@ -476,8 +476,29 @@ static void test_system_monitors() {
     gpu.source = &single;
     SystemMonitors one(&gpu, a);
     one.initialize();
-    CHECK(one.count() == 2 && one.layout().count() == 1 && !one.multi_display() && !one.apply() && single.applies == 0);
+    CHECK(one.count() == 2 && one.layout().count() == 1 && !one.multi_display() && one.apply() && single.applies == 0);
     CHECK(one.layout().bounds() == MonitorRect({0, 0, 1024, 768}) && one.monitor(0).current_mode().width == 1024 && one.monitor(0).current_mode().height == 768);
+
+    // A device without EDID that switches its one screen: choosing a size only changes the setting; the screen follows when the display is applied.
+    FakeSource vgasrc;
+    vgasrc.add("VGA-1", Bytes());
+    vgasrc.multi = false;
+    for (uint32_t w : {1024u, 1280u, 1920u}) {
+      MonitorMode m;
+      m.width = w;
+      m.height = w == 1024 ? 768 : w == 1280 ? 720 : 1080;
+      vgasrc.offered.push_back(m);
+    }
+    gpu.source = &vgasrc;
+    SystemMonitors vga(&gpu, a);
+    vga.initialize();
+    MonitorMode sizes[8];
+    CHECK(vga.compatible_resolutions(0, sizes, 8) == 3);
+    CHECK(vga.set_resolution(0, 1280, 720) && vgasrc.display_modes_set == 0);
+    CHECK(vga.apply() && vgasrc.display_modes_set == 1 && vgasrc.last_mode_w == 1280 && vgasrc.last_mode_h == 720);
+    CHECK(vga.set_resolution(0, 1920, 1080));
+    vgasrc.unavailable.push_back({1920, 1080});
+    CHECK(!vga.apply());   // the device would not: the caller puts the old setting back
 
     // Too much for the surface: monitors beyond the pixel budget are left out.
     FakeSource big;

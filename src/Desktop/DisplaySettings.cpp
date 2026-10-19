@@ -347,7 +347,7 @@ bool DisplaySettings::move_monitor(uint32_t id, int32_t x, int32_t y) {
 }
 
 bool DisplaySettings::apply_settings() {
-  UiGuard lock(this);
+  // (no UI lock here: making the settings real stops the render thread, which needs it)
   const Monitor* m = selected_monitor();
   if (!m || !monitors_ || asking_) return false;
   const uint32_t id = m->id();
@@ -396,7 +396,6 @@ void DisplaySettings::on_confirm_result(void* self, Control&) {
 }
 
 void DisplaySettings::keep_changes() {
-  UiGuard lock(this);
   if (!asking_) return;
   asking_ = false;
   before_ = hardware::SystemMonitors::State();
@@ -405,7 +404,6 @@ void DisplaySettings::keep_changes() {
 }
 
 void DisplaySettings::revert_changes() {
-  UiGuard lock(this);
   const bool was_asking = asking_;
   asking_ = false;
   if (confirm_ && confirm_->showing()) confirm_->close();
@@ -418,7 +416,6 @@ void DisplaySettings::revert_changes() {
 
 // Once a second while the question is open.
 void DisplaySettings::tick() {
-  UiGuard lock(this);
   if (!asking_) return;
   if (seconds_left_ > 0) --seconds_left_;
   if (seconds_left_ == 0) {

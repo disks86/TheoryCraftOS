@@ -20,15 +20,20 @@
 #include "Hardware/GraphicsProcessingUnit/FramebufferGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
 #include "Hardware/IoPort.hpp"
+#include "Hardware/Monitor/IMonitorSource.hpp"
 
 namespace hardware {
 
 // QEMU's "std" VGA (PCI 1234:1111) via the Bochs VBE interface: real mode
 // setting by programming the dispi registers, with the framebuffer in PCI BAR 0.
-class QemuStdVgaGpu final : public FramebufferGpu {
+//
+// It is also the monitor source of its one display: a connector that is always plugged in, with no EDID, and the modes that fit the card's video
+// memory (QEMU's default is 16 MiB; start QEMU with -device VGA,vgamem_mb=64 for the larger ones).
+class QemuStdVgaGpu final : public FramebufferGpu, public IMonitorSource {
  public:
   static constexpr uint16_t kPciVendor = 0x1234;
   static constexpr uint16_t kPciDevice = 0x1111;
+  static constexpr uint32_t kMaxModes = 24;
 
   explicit QemuStdVgaGpu(const GpuContext& context) : pci_(context.pci), device_(context.device) {}
 
@@ -40,6 +45,14 @@ class QemuStdVgaGpu final : public FramebufferGpu {
   bool mode_info(uint32_t index, DisplayMode* out) const override;
   uint32_t current_mode() const override { return current_; }
   bool set_mode(uint32_t index) override;
+  IMonitorSource* monitor_source() override { return this; }
+
+  uint32_t connector_count() const override { return 1; }
+  bool connector_info(uint32_t connector, ConnectorInfo* out) const override;
+  uint32_t read_edid(uint32_t connector, ByteView out) override { (void)connector; (void)out; return 0; }
+  bool mode_available(uint32_t connector, uint32_t width, uint32_t height) const override;
+  uint32_t device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const override;
+  bool set_display_mode(uint32_t connector, uint32_t width, uint32_t height) override;
 
  private:
   uint16_t read_register(uint16_t index) const;
@@ -49,6 +62,8 @@ class QemuStdVgaGpu final : public FramebufferGpu {
   PciDeviceInfo device_;
   uint8_t* framebuffer_ = nullptr;
   uint32_t current_ = 0;
+  DisplayMode modes_[kMaxModes] = {};   // the sizes that fit the video memory
+  uint32_t mode_count_ = 0;
   IoPort index_port_{0x1CE};
   IoPort data_port_{0x1CF};
 };

@@ -33,11 +33,11 @@ if [ ! -f "$DATA_IMG" ]; then
   qemu-img create -f raw "$DATA_IMG" "${DATA_SIZE:-256M}" >/dev/null
   mkfs.fat -F 32 -n DATA "$DATA_IMG" >/dev/null
 fi
-# QEMU_GPU: std (default, Bochs VGA), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).
+# QEMU_GPU: std (default, Bochs VGA with 64 MiB of video memory so the larger resolutions fit; QEMU_VGAMEM changes it), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).
 case ${QEMU_GPU:-std} in
   gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,show-cursor=off" ;;
   virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk,show-cursor=off" ;;
-  std) GPU_ARGS=""; DISPLAY_ARGS="gtk,show-cursor=off" ;;
+  std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,show-cursor=off" ;;
   *) echo "unknown QEMU_GPU=$QEMU_GPU (std, virtio, gl)" >&2; exit 2 ;;
 esac
 exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} -s \

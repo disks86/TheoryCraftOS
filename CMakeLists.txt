@@ -441,16 +441,18 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
   add_custom_target(data DEPENDS ${CMAKE_BINARY_DIR}/data.img)
 
   # `cmake --build build --target run`
-  add_custom_target(run COMMAND ${QEMU_COMMON}
+  # The standard VGA card gets 64 MiB of video memory (the default 16 MiB leaves out the largest resolutions).
+  set(QEMU_STD_VGA -vga none -device VGA,vgamem_mb=64)
+  add_custom_target(run COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA}
     DEPENDS esp vars data USES_TERMINAL)
   # Same, with a virtio-gpu 3D device: QEMU renders through the host's OpenGL (virgl).
   add_custom_target(run-gl COMMAND ${QEMU_COMMON} -vga none -device virtio-gpu-gl-pci -display gtk,gl=on,show-cursor=off
     DEPENDS esp vars data USES_TERMINAL)
   # Starts the gdbstub on :1234 (-s) without halting; use with TCOS_DEBUG_WAIT.
-  add_custom_target(debug COMMAND ${QEMU_COMMON} -s
+  add_custom_target(debug COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA} -s
     DEPENDS esp vars data USES_TERMINAL)
   # Freeze the CPU at reset until gdb connects (-S).
-  add_custom_target(debug-halted COMMAND ${QEMU_COMMON} -s -S
+  add_custom_target(debug-halted COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA} -s -S
     DEPENDS esp vars data USES_TERMINAL)
 else()
   message(WARNING "qemu-system-x86_64 or OVMF firmware not found; run/debug targets disabled")

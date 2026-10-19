@@ -123,6 +123,7 @@ class SystemMonitors {
   uint32_t best_refresh(const Monitor& monitor, uint32_t width, uint32_t height) const;
   MonitorMode mode_for(const Monitor& monitor) const;
   bool show();
+  bool sync_device_mode();
 
   IGraphicsProcessingUnit* gpu_;
   IMonitorSource* source_ = nullptr;
