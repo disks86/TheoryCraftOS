@@ -33,7 +33,9 @@ class List final : public IObjectContainer<T> {
   explicit List(allocators::IAllocator& allocator) : allocator_(allocator) {}
   ~List() {
     clear();
-    allocator_.deallocate(storage_.data());
+    if (storage_.data()) {
+      allocator_.deallocate(storage_.data());
+    }
   }
 
   uint64_t count() const override { return size_; }
@@ -50,11 +52,17 @@ class List final : public IObjectContainer<T> {
     if (capacity <= storage_.size()) return true;
     T* fresh = container_support::allocate_array<T>(allocator_, capacity);
     if (!fresh) return false;
+    
+    // Move existing elements to new allocation
     for (uint64_t i = 0; i < size_; ++i) {
       new (&fresh[i]) T(container_support::move(storage_[i]));
       storage_[i].~T();
     }
-    allocator_.deallocate(storage_.data());
+    
+    // Deallocate old memory, but only if it's not null
+    if (storage_.data()) {
+      allocator_.deallocate(storage_.data());
+    }
     storage_ = ArrayView<T>(fresh, capacity);
     return true;
   }
@@ -69,7 +77,13 @@ class List final : public IObjectContainer<T> {
   // Removes the element at `index`, shifting later elements down.
   bool remove_at(uint64_t index) {
     if (index >= size_) return false;
-    for (uint64_t i = index; i + 1 < size_; ++i) storage_[i] = container_support::move(storage_[i + 1]);
+    
+    // Move elements to fill the gap
+    for (uint64_t i = index; i + 1 < size_; ++i) {
+      storage_[i] = container_support::move(storage_[i + 1]);
+    }
+    
+    // Destroy the last element 
     storage_[size_ - 1].~T();
     --size_;
     return true;
@@ -78,6 +92,7 @@ class List final : public IObjectContainer<T> {
   // Bounds-checked access; nullptr when out of range.
   T* get(uint64_t index) { return index < size_ ? &storage_[index] : nullptr; }
   const T* get(uint64_t index) const { return index < size_ ? &storage_[index] : nullptr; }
+  
   // Checked access: an index at or above count() stops the OS (bounds_violation)
   // rather than touch memory that holds no element. Use get() if it may be out of range.
   T& operator[](uint64_t index) {
@@ -88,6 +103,7 @@ class List final : public IObjectContainer<T> {
     if (index >= size_) bounds_violation("List::operator[]", index, size_);
     return storage_[index];
   }
+  
   // The elements as a view (valid until the list grows or shrinks).
   ArrayView<T> view() { return storage_.first(size_); }
   ArrayView<const T> view() const { return ArrayView<const T>(storage_).first(size_); }
@@ -109,11 +125,16 @@ class List final : public IObjectContainer<T> {
   template <class U>
   bool emplace_at(uint64_t index, U&& value) {
     if (index > size_) return false;
-    if (size_ == storage_.size() && !reserve(storage_.size() ? storage_.size() * 2 : 8)) return false;
+    
+    // Check for potential double allocation when growing
+    if (size_ == storage_.size() && !reserve(storage_.size() ? storage_.size() * 2 : 8)) 
+      return false;
+      
     // Open a gap: the last element moves into raw memory, the rest assign upward.
     if (index < size_) {
       new (&storage_[size_]) T(container_support::move(storage_[size_ - 1]));
-      for (uint64_t i = size_ - 1; i > index; --i) storage_[i] = container_support::move(storage_[i - 1]);
+      for (uint64_t i = size_ - 1; i > index; --i) 
+        storage_[i] = container_support::move(storage_[i - 1]);
       storage_[index] = static_cast<U&&>(value);
     } else {
       new (&storage_[index]) T(static_cast<U&&>(value));
