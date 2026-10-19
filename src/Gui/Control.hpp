@@ -178,6 +178,10 @@ class Control {
   bool move_child_to_front(Control* child);
   allocators::IAllocator& allocator() const { return allocator_; }
 
+  // Places `child` the way layout() does: no repaint request. (Window::render() lays out every frame; a layout that called set_bounds() would ask for
+  // the next frame each time and the window would never rest.)
+  static void place(Control& child, const Rect2D& bounds) { child.bounds_ = bounds; }
+
   Rect2D bounds_;
 
  private:

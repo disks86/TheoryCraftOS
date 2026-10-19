@@ -385,6 +385,35 @@ static void test_data_grid() {
   CHECK(a.live == 0);
 }
 
+// A window must come to rest: controls that adjust themselves while laying out (the grid's scroll bars) must not ask for the next frame forever,
+// or the render thread would draw non-stop and burn a core to show the same picture.
+static void test_window_rests() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 500, 400);
+    Window w(a, screen.renderer, theme, {500, 400});
+    DataGrid g(a);
+    g.set_bounds({10, 10, 300, 200});
+    w.add(&g);
+    g.add_column("n", 100, Align::Right);
+    g.add_column("n squared", 100, Align::Right);
+    g.add_column("parity", 200);
+    NumbersModel model(1000);
+    g.set_model(&model);
+    CHECK(w.dirty());
+    w.render();
+    CHECK(!w.dirty());   // (the grid's layout touched its scroll bars during that frame)
+    w.render();
+    CHECK(!w.dirty());
+    g.select_row(3);     // a real change asks for a frame, and that frame settles again
+    CHECK(w.dirty());
+    w.render();
+    CHECK(!w.dirty());
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_data_grid_scrolling() {
   TestAllocator a;
   Theme theme;
@@ -5380,6 +5409,7 @@ int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
   test_data_grid();
+  test_window_rests();
   test_data_grid_scrolling();
   test_grid_rendering();
   test_image_view();

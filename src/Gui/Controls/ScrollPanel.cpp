@@ -32,6 +32,7 @@ void ScrollPanel::scroll_to(int32_t offset) { bar_.set_value(offset); }
 
 void ScrollPanel::on_scrolled(void* self, Control&) { static_cast<ScrollPanel*>(self)->layout(); }
 
+// Runs on every frame (Window::render() lays out first), so it asks for a repaint only when something really changed.
 void ScrollPanel::layout() {
   const Rect2D area = client_rect();
   int32_t total = 0;
@@ -41,12 +42,12 @@ void ScrollPanel::layout() {
   }
   content_height_ = total;
   const bool needs_bar = total > static_cast<int32_t>(area.height);
-  bar_.set_visible(needs_bar);
+  if (bar_.visible() != needs_bar) bar_.set_visible(needs_bar);
   const int32_t bar_width = needs_bar ? ScrollBar::kThickness : 0;
   const uint32_t width = area.width > static_cast<uint32_t>(bar_width) ? area.width - static_cast<uint32_t>(bar_width) : 0;
-  bar_.set_metrics(total, static_cast<int32_t>(area.height));   // (keeps the value inside the new range)
+  if (bar_.total() != total || bar_.page() != static_cast<int32_t>(area.height)) bar_.set_metrics(total, static_cast<int32_t>(area.height));   // (keeps the value in range)
   if (needs_bar) {
-    bar_.set_bounds({area.x + static_cast<int32_t>(width), area.y, static_cast<uint32_t>(ScrollBar::kThickness), area.height});
+    place(bar_, {area.x + static_cast<int32_t>(width), area.y, static_cast<uint32_t>(ScrollBar::kThickness), area.height});
     bar_.layout();
   }
   int32_t y = area.y - bar_.value();
@@ -54,7 +55,7 @@ void ScrollPanel::layout() {
     Control* c = child(i);
     if (c == &bar_ || !c->visible()) continue;
     const int32_t h = c->preferred_size().height;
-    c->set_bounds({area.x, y, width, static_cast<uint32_t>(h < 0 ? 0 : h)});
+    place(*c, {area.x, y, width, static_cast<uint32_t>(h < 0 ? 0 : h)});
     y += h;
     c->layout();
   }

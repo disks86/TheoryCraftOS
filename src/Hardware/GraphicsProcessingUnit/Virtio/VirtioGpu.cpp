@@ -72,14 +72,19 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
   control_.post_chain(0, segments, 2);
   transport_->notify(0);
 
-  for (uint64_t waited = 0; !control_.take_used(&index, &length); waited += 100) {
+  // A quick answer (a copy the host already finished) comes within microseconds: look for it by spinning. A slow one (the host drawing a frame, or holding a
+  // flush for its display's refresh) takes milliseconds, and spinning that long is a core at 100% for nothing: after the first look the thread sleeps
+  // (delay_us sleeps from 200 us on, where that is allowed) and checks again.
+  const uint64_t start = uptime_us();
+  while (!control_.take_used(&index, &length)) {
+    const uint64_t waited = uptime_us() - start;
     if (waited >= kCommandTimeoutUs) {
       in_flight_ = true;
       if (__atomic_fetch_add(&timeouts_, 1, __ATOMIC_ACQ_REL) % 16 == 0)
         console::debug_puts("virtio-gpu: the host is not answering (display hidden or busy?); skipping frames\n");
       return 0;
     }
-    delay_us(100);  // sleeps the thread where that is allowed instead of spinning with the core
+    delay_us(waited < kSpinWaitUs ? 10 : 250);
   }
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
   const uint32_t type = reply->type;

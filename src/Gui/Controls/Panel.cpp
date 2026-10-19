@@ -44,8 +44,8 @@ void UniformPanel::layout() {
     Control* c = child(i);
     if (!c->visible()) continue;
     const int64_t size = each + (index < extra ? 1 : 0);
-    c->set_bounds(horizontal ? Rect2D{static_cast<int32_t>(at), area.y, static_cast<uint32_t>(size), area.height}
-                             : Rect2D{area.x, static_cast<int32_t>(at), area.width, static_cast<uint32_t>(size)});
+    place(*c, horizontal ? Rect2D{static_cast<int32_t>(at), area.y, static_cast<uint32_t>(size), area.height}
+                         : Rect2D{area.x, static_cast<int32_t>(at), area.width, static_cast<uint32_t>(size)});
     at += size + spacing_;
     ++index;
     c->layout();

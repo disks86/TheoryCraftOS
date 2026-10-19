@@ -77,8 +77,11 @@ void Window::mark_dirty() {
 void Window::render() {
   {
     UiGuard lock(this);
-    __atomic_store_n(&dirty_, false, __ATOMIC_RELEASE);  // changes made while we draw ask for the next frame
+    // Layout comes first and the flag is cleared after it: controls adjust themselves while laying out (scroll bars, visibility) and so ask for a
+    // repaint, which this frame is about to give. Cleared before, those requests would start another frame, whose layout asks again, and a window
+    // holding a grid or list would repaint non-stop. Changes made while we draw (below) still ask for the next frame.
     layout();
+    __atomic_store_n(&dirty_, false, __ATOMIC_RELEASE);
     Painter painter(*renderer_, theme_);
     paint_tree(painter);
     if (popup_) popup_->paint_tree(painter);

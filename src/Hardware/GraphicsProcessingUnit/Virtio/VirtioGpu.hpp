@@ -92,6 +92,7 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // How many commands timed out so far (the host was not answering).
   uint32_t timeouts() const { return __atomic_load_n(&timeouts_, __ATOMIC_ACQUIRE); }
   static constexpr uint64_t kCommandTimeoutUs = 250000;
+  static constexpr uint64_t kSpinWaitUs = 150;   // how long a command's answer is waited for by spinning before the thread sleeps between looks
 
  private:
   static constexpr uint32_t kContextId = 1;
