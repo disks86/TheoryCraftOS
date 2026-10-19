@@ -50,6 +50,10 @@ class AcpiTables final : public IHardware {
   // its bytes (header included, as long as the header says), or an empty view.
   // The length comes from firmware memory, so it is sanity-checked.
   ConstByteView find(const char (&signature)[5]) const;
+  // The n-th table (counting from 0) with this signature: a machine has one DSDT but many SSDTs.
+  ConstByteView find_nth(const char (&signature)[5], uint32_t n) const;
+  // The DSDT, which no root table lists: the FADT (signature "FACP") points to it. Empty if there is none.
+  ConstByteView dsdt() const;
 
  private:
   efi::SystemTable* st_;

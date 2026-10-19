@@ -22,9 +22,18 @@
 namespace gui {
 
 // A bar made of lit segments that shows how high a level is - an audio signal, a load, a fill. It does
-// not take input. Green up to 70% of the range, yellow up to 90%, red above. With peak hold on (the
-// default) the highest level seen stays marked by one bright segment until reset_peak().
+// not take input. By default green up to 70% of the range, yellow up to 90%, red above (a load: high is bad).
+// set_zones() changes where the colours change and which way they run, so the same meter can show a fill that
+// is good when full (a battery: red when low, green when full) or a temperature with its own limits.
+// With peak hold on (the default) the highest level seen stays marked by one bright segment until reset_peak().
 // Horizontal meters fill to the right, vertical ones upwards.
+enum class MeterZone : uint8_t { Green, Yellow, Red };
+// Which end of the range is the bad one.
+enum class ZoneDirection : uint8_t {
+  HighIsBad,   // green up to the first break, yellow up to the second, red above
+  LowIsBad     // red up to the first break, yellow up to the second, green above
+};
+
 class LevelMeter : public Control {
  public:
   explicit LevelMeter(allocators::IAllocator& allocator, Orientation orientation = Orientation::Horizontal)
@@ -38,6 +47,14 @@ class LevelMeter : public Control {
   void set_range(int32_t minimum, int32_t maximum);
   // Clamped to the range. Raises the peak if it is higher.
   void set_level(int32_t level);
+  // The two breaks are levels in the meter's range (first <= second; swapped if not): a level at a break belongs to the zone below it. A change of range
+  // does not move them (set the zones after the range).
+  void set_zones(ZoneDirection direction, int32_t first_break, int32_t second_break);
+  // Back to green up to 70% of the range, yellow up to 90%, red above, following the range.
+  void use_default_zones() { UiGuard lock(this); custom_zones_ = false; direction_ = ZoneDirection::HighIsBad; invalidate(); }
+  ZoneDirection zone_direction() const { return direction_; }
+  // The zone a level falls in.
+  MeterZone zone_at(int32_t level) const;
   void reset_peak() { UiGuard lock(this); peak_ = level_; invalidate(); }
   void set_peak_hold(bool hold) { UiGuard lock(this); peak_hold_ = hold; invalidate(); }
   bool peak_hold() const { return peak_hold_; }
@@ -60,6 +77,9 @@ class LevelMeter : public Control {
   Orientation orientation_;
   int32_t min_ = 0, max_ = 100, level_ = 0, peak_ = 0;
   bool peak_hold_ = true;
+  bool custom_zones_ = false;
+  ZoneDirection direction_ = ZoneDirection::HighIsBad;
+  int32_t first_break_ = 0, second_break_ = 0;
 };
 
 }  // namespace gui

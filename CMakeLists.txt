@@ -65,6 +65,10 @@ add_executable(BOOTX64
   src/Hardware/RandomAccessMemory/UefiRandomAccessMemory.cpp
   src/Hardware/TextConsole.cpp
   src/Hardware/Acpi/AcpiTables.cpp
+  src/Hardware/Acpi/AmlInterpreter.cpp
+  src/Hardware/Acpi/EmbeddedController.cpp
+  src/Hardware/Acpi/SystemAcpiHost.cpp
+  src/Hardware/Battery/AcpiBattery.cpp
   src/Hardware/Keyboard/KeyCodes.cpp
   src/Hardware/Keyboard/KeyboardBase.cpp
   src/Hardware/Keyboard/CompositeKeyboard.cpp

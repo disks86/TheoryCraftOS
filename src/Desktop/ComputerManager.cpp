@@ -24,6 +24,10 @@
 
 namespace desktop {
 
+namespace {
+constexpr int32_t kTitleWidth = 80;   // wide enough for "CPU Temp" and "GPU Temp" in the 8-pixel font
+}
+
 using namespace gui;
 
 bool ComputerManager::Model::cell_text(uint32_t row, uint32_t column, String* out) const {
@@ -71,6 +75,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       vram_row_(allocator),
       cpu_temp_row_(allocator),
       gpu_temp_row_(allocator),
+      battery_row_(allocator),
       core_rows_(allocator),
       model_(allocator),
       previous_cores_(allocator),
@@ -78,7 +83,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   buffer_ = allocate_view<TaskThread>(allocator, kMaxThreads);
   for (int32_t& node : group_nodes_) node = -1;
   set_title("Computer Manager");
-  set_bounds({90, 40, 480, 520});
+  set_bounds({90, 40, 480, 544});
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
 
@@ -113,7 +118,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     r.row.set_size(0, 24);
     r.title.set_text(r.text);
     r.title.set_dock(DockStyle::Left);
-    r.title.set_size(64, 0);
+    r.title.set_size(kTitleWidth, 0);
     r.value.set_dock(DockStyle::Right);
     r.value.set_size(170, 0);
     r.value.set_text("-");
@@ -128,6 +133,10 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   setup_stat_row(vram_row_, "VRAM");
   setup_stat_row(cpu_temp_row_, "CPU Temp");
   setup_stat_row(gpu_temp_row_, "GPU Temp");
+  setup_stat_row(battery_row_, "Battery");
+  cpu_temp_row_.meter.set_zones(ZoneDirection::HighIsBad, 70, 85);   // degrees Celsius
+  gpu_temp_row_.meter.set_zones(ZoneDirection::HighIsBad, 70, 85);
+  battery_row_.meter.set_zones(ZoneDirection::LowIsBad, 15, 40);     // percent: red when nearly empty, green when well charged
   info_.set_dock(DockStyle::Top);
   info_.set_size(0, 20);
   performance_page_.add(&info_);
@@ -185,7 +194,7 @@ void ComputerManager::setup_stat_row(CoreRow& r, const char* title) {
   r.row.set_size(0, 24);
   r.title.set_text(title);
   r.title.set_dock(DockStyle::Left);
-  r.title.set_size(64, 0);
+  r.title.set_size(kTitleWidth, 0);
   r.value.set_dock(DockStyle::Right);
   r.value.set_size(170, 0);
   r.value.set_text("n/a");
@@ -447,6 +456,26 @@ void ComputerManager::update(uint64_t now_us) {
   }
   show_temperature(cpu_temp_row_, monitor_->cpu_temperature_millicelsius());
   show_temperature(gpu_temp_row_, gpu.temperature_millicelsius);
+
+  const TaskBattery battery = monitor_->battery();
+  if (!battery.present) {
+    battery_row_.meter.set_level(0);
+    battery_row_.value.set_text("No battery");
+  } else if (battery.percent < 0) {
+    battery_row_.meter.set_level(0);
+    battery_row_.value.set_text("n/a");
+  } else {
+    const int32_t percent = battery.percent > 100 ? 100 : battery.percent;
+    battery_row_.meter.set_level(percent);
+    text.clear();
+    text.append_uint(static_cast<uint64_t>(percent));
+    text.append("%");
+    if (battery.state == ChargeState::Charging) text.append(" - Charging");
+    else if (battery.state == ChargeState::Discharging) text.append(" - Discharging");
+    else if (battery.state == ChargeState::Full) text.append(" - Full");
+    else if (battery.state == ChargeState::NotCharging) text.append(" - Not charging");
+    battery_row_.value.set_text(text.view());
+  }
 
   // --- Threads: load since the last call, in tenths of a percent of one core.
   const uint32_t count = monitor_->threads(buffer_.data(), kMaxThreads);

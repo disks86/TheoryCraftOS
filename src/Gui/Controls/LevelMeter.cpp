@@ -45,6 +45,30 @@ void LevelMeter::set_level(int32_t level) {
   invalidate();
 }
 
+void LevelMeter::set_zones(ZoneDirection direction, int32_t first_break, int32_t second_break) {
+  UiGuard lock(this);
+  custom_zones_ = true;
+  direction_ = direction;
+  first_break_ = first_break <= second_break ? first_break : second_break;
+  second_break_ = first_break <= second_break ? second_break : first_break;
+  invalidate();
+}
+
+MeterZone LevelMeter::zone_at(int32_t level) const {
+  int32_t first, second;
+  if (custom_zones_) {
+    first = first_break_;
+    second = second_break_;
+  } else {
+    const int64_t span = int64_t{max_} - min_;
+    first = min_ + static_cast<int32_t>(span * 70 / 100);
+    second = min_ + static_cast<int32_t>(span * 90 / 100);
+  }
+  const MeterZone low = level <= first ? MeterZone::Green : level <= second ? MeterZone::Yellow : MeterZone::Red;   // (high is bad)
+  if (direction_ == ZoneDirection::HighIsBad) return low;
+  return level <= first ? MeterZone::Red : level <= second ? MeterZone::Yellow : MeterZone::Green;
+}
+
 int32_t LevelMeter::segment_count() const {
   const int32_t inner = static_cast<int32_t>(orientation_ == Orientation::Horizontal ? bounds_.width : bounds_.height) - 4;
   return inner > 0 ? (inner + kGap) / (kSegment + kGap) : 0;
@@ -69,12 +93,16 @@ void LevelMeter::paint(Painter& painter) {
   const bool horizontal = orientation_ == Orientation::Horizontal;
   const int32_t thickness = static_cast<int32_t>(horizontal ? bounds_.height : bounds_.width) - 6;
   for (int32_t i = 0; i < n; ++i) {
-    const int32_t share = (i + 1) * 100 / n;  // how far up the range this segment ends
+    // The level at which this segment ends (a share of the range, rounded as before for the default zones).
+    const int64_t span = int64_t{max_} - min_;
+    const int32_t end_level = custom_zones_ ? min_ + static_cast<int32_t>(span * (i + 1) / n) : min_ + static_cast<int32_t>(span * ((i + 1) * 100 / n) / 100);
     const bool is_lit = i < lit || (peak > 0 && i == peak - 1);
     uint32_t color;
-    if (share <= 70) color = is_lit ? kGreen : kGreenDim;
-    else if (share <= 90) color = is_lit ? kYellow : kYellowDim;
-    else color = is_lit ? kRed : kRedDim;
+    switch (zone_at(end_level)) {
+      case MeterZone::Green: color = is_lit ? kGreen : kGreenDim; break;
+      case MeterZone::Yellow: color = is_lit ? kYellow : kYellowDim; break;
+      default: color = is_lit ? kRed : kRedDim; break;
+    }
     if (!enabled()) color = is_lit ? t.shadow : t.dark;
     const int32_t start = 2 + i * (kSegment + kGap);
     if (horizontal) painter.fill({start, 3, static_cast<uint32_t>(kSegment), static_cast<uint32_t>(thickness)}, color);

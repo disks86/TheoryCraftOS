@@ -66,6 +66,8 @@
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
+#include "Hardware/Acpi/SystemAcpiHost.hpp"
+#include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
 #include "SystemPrintService.hpp"
 #include "uefi.hpp"
@@ -864,6 +866,25 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemMonitor monitor(allocator, shared_allocator);
     monitor.set_gpu(gpu);
     monitor.set_pci(&pci);
+    // The battery: only a machine whose ACPI tables describe one runs any AML (a laptop; a desktop or a virtual machine has none).
+    hardware::SystemAcpiHost acpi_host(&pci, paging_ok ? &mmio : nullptr);
+    hardware::AcpiBattery battery(acpi_host, shared_allocator);
+    hardware::AcpiTables acpi_tables(st);
+    if (acpi_tables.initialize()) {
+      const bool has_battery = battery.initialize(acpi_tables);
+      Entry e(battery.tables_faulty() ? Level::Warning : Level::Info, "ACPI");
+      e.dec(battery.object_count()).text(" objects from ").dec(battery.tables_loaded()).text(" table(s)");
+      if (battery.tables_faulty()) e.text("; ").dec(battery.tables_faulty()).text(" stopped at a fault (").text(battery.last_load_error()).text(")");
+      if (has_battery) {
+        monitor.set_battery(&battery);
+        const hardware::BatteryStatus first = battery.read();
+        Entry e2(Level::Ok, "Battery");
+        e2.dec(battery.battery_count()).text(" battery device(s)");
+        if (!first.present) e2.text(", none inserted");
+        else if (first.percent < 0) e2.text(", charge unknown");
+        else e2.text(", ").dec(static_cast<uint32_t>(first.percent)).text("%").text(first.state == hardware::BatteryState::Charging ? ", charging" : first.state == hardware::BatteryState::Discharging ? ", discharging" : first.state == hardware::BatteryState::Full ? ", full" : "");
+      }
+    }
     desktop.set_system_monitor(&monitor);
     desktop.set_clock_source(read_local_time, st);
     desktop.set_diagnostic_output(console::debug_puts);

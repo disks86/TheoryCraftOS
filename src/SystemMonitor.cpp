@@ -72,3 +72,19 @@ desktop::TaskGpu SystemMonitor::gpu() {
   g.temperature_millicelsius = gpu_->temperature_millicelsius();
   return g;
 }
+
+desktop::TaskBattery SystemMonitor::battery() {
+  desktop::TaskBattery b;
+  if (!battery_) return b;
+  const hardware::BatteryStatus status = battery_->read();
+  b.present = status.present;
+  b.percent = status.percent;
+  switch (status.state) {
+    case hardware::BatteryState::Charging: b.state = desktop::ChargeState::Charging; break;
+    case hardware::BatteryState::Discharging: b.state = desktop::ChargeState::Discharging; break;
+    case hardware::BatteryState::Full: b.state = desktop::ChargeState::Full; break;
+    case hardware::BatteryState::NotCharging: b.state = desktop::ChargeState::NotCharging; break;
+    default: b.state = desktop::ChargeState::Unknown; break;
+  }
+  return b;
+}

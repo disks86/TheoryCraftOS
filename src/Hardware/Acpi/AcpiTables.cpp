@@ -69,16 +69,31 @@ bool AcpiTables::initialize() {
   return !root_.empty();
 }
 
-ConstByteView AcpiTables::find(const char (&signature)[5]) const {
+ConstByteView AcpiTables::find(const char (&signature)[5]) const { return find_nth(signature, 0); }
+
+ConstByteView AcpiTables::find_nth(const char (&signature)[5], uint32_t n) const {
   if (root_.size() < sizeof(AcpiTableHeader)) return ConstByteView();
   const uint32_t entry_size = wide_entries_ ? 8 : 4;
   ByteReader entries(root_.dropped(sizeof(AcpiTableHeader)));  // the root table's list of table addresses
   while (entries.remaining() >= entry_size) {
     const uint64_t address = entry_size == 8 ? entries.le64() : entries.le32();
     ConstByteView table = table_at(address);
-    if (table.size() >= 4 && __builtin_memcmp(table.data(), signature, 4) == 0) return table;
+    if (table.size() >= 4 && __builtin_memcmp(table.data(), signature, 4) == 0 && n-- == 0) return table;
   }
   return ConstByteView();
+}
+
+ConstByteView AcpiTables::dsdt() const {
+  const ConstByteView fadt = find("FACP");
+  uint64_t address = 0;
+  if (fadt.size() >= 148) {   // X_DSDT (ACPI 2.0), 8 bytes at offset 140
+    for (int i = 7; i >= 0; --i) address = (address << 8) | fadt[140 + static_cast<uint64_t>(i)];
+  }
+  if (!address && fadt.size() >= 44) {   // DSDT, 4 bytes at offset 40
+    for (int i = 3; i >= 0; --i) address = (address << 8) | fadt[40 + static_cast<uint64_t>(i)];
+  }
+  ConstByteView table = table_at(address);
+  return table.size() >= 4 && __builtin_memcmp(table.data(), "DSDT", 4) == 0 ? table : ConstByteView();
 }
 
 }  // namespace hardware

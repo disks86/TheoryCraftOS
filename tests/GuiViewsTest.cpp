@@ -1526,6 +1526,8 @@ struct FakeMonitor final : desktop::ISystemMonitor {
   desktop::TaskMemory memory() override { return {1ull << 30, free_bytes}; }
   int32_t cpu_temp = 62500;
   desktop::TaskGpu gpu_info;
+  desktop::TaskBattery battery_info;
+  desktop::TaskBattery battery() override { return battery_info; }
   int32_t cpu_temperature_millicelsius() override { return cpu_temp; }
   desktop::TaskGpu gpu() override { return gpu_info; }
 };
@@ -1570,6 +1572,29 @@ static void test_computer_manager() {
     tm.update(1000000);
     CHECK(tm.vram_label().text().equals("256.0 MB used") && tm.vram_meter().level() == 0);
     mon.gpu_info = desktop::TaskGpu();
+
+    // The battery: none, then charging, discharging, full.
+    CHECK(tm.battery_label().text().equals("No battery") && tm.battery_meter().level() == 0);
+    mon.battery_info.present = true;
+    tm.update(1000000);
+    CHECK(tm.battery_label().text().equals("n/a"));
+    mon.battery_info.percent = 85;
+    mon.battery_info.state = desktop::ChargeState::Charging;
+    tm.update(1000000);
+    CHECK(tm.battery_label().text().equals("85% - Charging") && tm.battery_meter().level() == 85);
+    CHECK(tm.battery_meter().zone_at(85) == gui::MeterZone::Green && tm.battery_meter().zone_at(10) == gui::MeterZone::Red && tm.battery_meter().zone_at(30) == gui::MeterZone::Yellow);   // full is good
+    CHECK(tm.cpu_temp_meter().zone_at(60) == gui::MeterZone::Green && tm.cpu_temp_meter().zone_at(90) == gui::MeterZone::Red);
+    mon.battery_info.state = desktop::ChargeState::Discharging;
+    tm.update(1000000);
+    CHECK(tm.battery_label().text().equals("85% - Discharging"));
+    mon.battery_info.state = desktop::ChargeState::NotCharging;
+    tm.update(1000000);
+    CHECK(tm.battery_label().text().equals("85% - Not charging"));
+    mon.battery_info.percent = 100;
+    mon.battery_info.state = desktop::ChargeState::Full;
+    tm.update(1000000);
+    CHECK(tm.battery_label().text().equals("100% - Full"));
+    mon.battery_info = desktop::TaskBattery();
 
     // One second later: core 0 was 25% busy, core 1 75% busy, and the worker ran 600 of the 1000 ticks.
     mon.core_busy[0] = 250; mon.core_idle[0] = 750;

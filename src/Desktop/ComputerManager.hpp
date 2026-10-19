@@ -67,6 +67,14 @@ struct TaskGpu {
   int32_t temperature_millicelsius = -1;   // -1 unknown
 };
 
+// The battery, if the machine has one.
+enum class ChargeState : uint8_t { Unknown, Charging, Discharging, Full, NotCharging };
+struct TaskBattery {
+  bool present = false;
+  int32_t percent = -1;                  // 0-100, -1 unknown
+  ChargeState state = ChargeState::Unknown;
+};
+
 // Where the computer manager gets its numbers (the kernel's, in the real system). All counters only grow.
 class ISystemMonitor {
  public:
@@ -80,6 +88,7 @@ class ISystemMonitor {
   // The processor's temperature in thousandths of a degree Celsius, or -1 if the machine cannot tell.
   virtual int32_t cpu_temperature_millicelsius() { return -1; }
   virtual TaskGpu gpu() { return TaskGpu(); }
+  virtual TaskBattery battery() { return TaskBattery(); }
 
  protected:
   constexpr ISystemMonitor() = default;
@@ -134,6 +143,9 @@ class ComputerManager : public gui::Frame {
   gui::Label& cpu_temp_label() { return cpu_temp_row_.value; }
   gui::LevelMeter& gpu_temp_meter() { return gpu_temp_row_.meter; }
   gui::Label& gpu_temp_label() { return gpu_temp_row_.value; }
+  // The battery row: charge level (meter) and "85% - Charging" (label).
+  gui::LevelMeter& battery_meter() { return battery_row_.meter; }
+  gui::Label& battery_label() { return battery_row_.value; }
   gui::Label* core_label(uint32_t index);
   // The CPU share (tenths of a percent of one core) of the thread with this id, or -1 if it is not listed.
   int32_t thread_load_tenths(uint64_t id) const;
@@ -201,7 +213,7 @@ class ComputerManager : public gui::Frame {
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
   gui::LevelMeter cpu_meter_, memory_meter_;
   gui::DataGrid grid_;
-  CoreRow gpu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_;
+  CoreRow gpu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_, battery_row_;
   List<UniquePointer<CoreRow>> core_rows_;
   Model model_;
   ISystemMonitor* monitor_ = nullptr;

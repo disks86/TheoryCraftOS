@@ -234,6 +234,14 @@ static void test_level_meter() {
     w.add(&m);
     CHECK(m.segment_count() == 14);
     CHECK(m.lit_segments(0) == 0 && m.lit_segments(1) == 1 && m.lit_segments(50) == 7 && m.lit_segments(100) == 14);
+    // Zones: green to 70, yellow to 90, red above - until set_zones() says otherwise.
+    CHECK(m.zone_at(0) == MeterZone::Green && m.zone_at(70) == MeterZone::Green && m.zone_at(71) == MeterZone::Yellow && m.zone_at(90) == MeterZone::Yellow && m.zone_at(91) == MeterZone::Red);
+    m.set_zones(ZoneDirection::LowIsBad, 15, 40);   // a battery
+    CHECK(m.zone_at(0) == MeterZone::Red && m.zone_at(15) == MeterZone::Red && m.zone_at(16) == MeterZone::Yellow && m.zone_at(40) == MeterZone::Yellow && m.zone_at(41) == MeterZone::Green && m.zone_at(100) == MeterZone::Green);
+    m.set_zones(ZoneDirection::HighIsBad, 85, 70);  // swapped breaks are put in order
+    CHECK(m.zone_at(70) == MeterZone::Green && m.zone_at(80) == MeterZone::Yellow && m.zone_at(86) == MeterZone::Red);
+    m.use_default_zones();
+    CHECK(m.zone_direction() == ZoneDirection::HighIsBad && m.zone_at(71) == MeterZone::Yellow);
 
     m.set_level(50);
     w.render();

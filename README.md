@@ -473,7 +473,7 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     firmware's driver (UEFI Simple Network Protocol) for any other NIC. `SystemNetworkInterfaces` finds every
     NIC and picks the driver. `src/NetworkDemo` sends ARP requests to QEMU's user-mode gateway at boot.
     Not covered natively: e1000e/igb, pcnet, ne2k, vmxnet3 (the firmware fallback handles those in QEMU).
-  - `Hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup).
+  - `Hardware/Acpi/`: `AcpiTables` (RSDP -> XSDT/RSDT table lookup, the DSDT through the FADT), `AmlInterpreter` (loads the DSDT/SSDTs into a namespace and runs their AML methods; operation regions go to an `IAmlHost`), `EmbeddedController` (the polling protocol on ports 0x62/0x66) and `SystemAcpiHost` (memory, I/O ports, PCI config and the controller for AML). `Hardware/Battery/AcpiBattery` reads a control-method battery (`PNP0C0A`: `_STA`, `_BST`, `_BIF`/`_BIX`) through it; a machine without one runs no AML. Tested on the host by `tests/AmlTest.cpp` (tables assembled byte by byte, a pretend controller, damaged tables).
   - `Hardware/RandomAccessMemory/`: `IRandomAccessMemory` (implemented by `UefiRandomAccessMemory`).
   - `Hardware/NeuralProcessingUnit/`: `INeuralProcessingUnit` (int8 and float matrix products, activations,
     softmax). `Software/` splits products by rows over every core through the scheduler; `Intel/` (NPU

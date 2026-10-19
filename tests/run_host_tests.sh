@@ -22,10 +22,11 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest AmlTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
+    AmlTest) build_and_run AmlTest tests/AmlTest.cpp tests/KernelStubs.cpp src/Hardware/Acpi/AmlInterpreter.cpp src/Hardware/Acpi/EmbeddedController.cpp src/Hardware/Acpi/AcpiTables.cpp src/Hardware/Battery/AcpiBattery.cpp ;;
     ClipboardTest) build_and_run ClipboardTest tests/ClipboardTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp ;;
     StringTest) build_and_run StringTest tests/StringTest.cpp ;;
     AudioTest) build_and_run AudioTest tests/AudioTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \

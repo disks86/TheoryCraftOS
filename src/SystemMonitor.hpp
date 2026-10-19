@@ -21,6 +21,7 @@
 #include "Allocators/Allocator.hpp"
 #include "Allocators/ThreadSafeAllocator.hpp"
 #include "Desktop/ComputerManager.hpp"
+#include "Hardware/Battery/AcpiBattery.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 
@@ -36,14 +37,18 @@ class SystemMonitor final : public desktop::ISystemMonitor {
   desktop::TaskMemory memory() override;
   int32_t cpu_temperature_millicelsius() override;
   desktop::TaskGpu gpu() override;
+  desktop::TaskBattery battery() override;
 
   // The graphics adapter to report on and the PCI bus (the AMD temperature sensor is behind it); both may be left out.
   void set_gpu(hardware::IGraphicsProcessingUnit* gpu) { gpu_ = gpu; }
   void set_pci(const hardware::IPciBus* pci) { pci_ = pci; }
+  // The batteries, if the machine has any (nullptr: none).
+  void set_battery(hardware::AcpiBattery* battery) { battery_ = battery; }
 
  private:
   allocators::Allocator& heap_;
   allocators::ThreadSafeAllocator& shared_;
   hardware::IGraphicsProcessingUnit* gpu_ = nullptr;
   const hardware::IPciBus* pci_ = nullptr;
+  hardware::AcpiBattery* battery_ = nullptr;
 };
