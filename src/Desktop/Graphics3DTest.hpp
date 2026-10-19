@@ -54,6 +54,8 @@ class CubeView : public gui::Control {
   uint64_t frame_microseconds() const { return frame_us_; }
   uint64_t frames() const { return total_frames_; }
   bool accelerated() const { return active_accelerated_; }
+  // Why the GPU is not in use (empty when it is, or when the check box chose software).
+  const char* software_reason() const { return graphics_ ? graphics_->software_reason() : ""; }
 
   void paint(gui::Painter& painter) override;
 

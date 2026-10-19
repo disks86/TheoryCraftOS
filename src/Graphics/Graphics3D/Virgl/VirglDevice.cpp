@@ -456,8 +456,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   auto emit_scissor = [&]() {
     if (!stream.command(virgl::kSetScissorState, 0, 3)) return;
     stream.put(0);
-    stream.put(scissor.x | (static_cast<uint32_t>(scissor.y) << 16));
-    stream.put((scissor.x + scissor.width) | ((scissor.y + scissor.height) << 16));
+    // Scissor rectangles are counted from the bottom of the target in virgl (GL's window space), while Vulkan's - and ours - count from the top.
+    const uint32_t height = color ? color->extent().height : 0;
+    const uint32_t y0 = height - (scissor.y + scissor.height), y1 = height - scissor.y;
+    stream.put(scissor.x | (y0 << 16));
+    stream.put((scissor.x + scissor.width) | (y1 << 16));
   };
 
   for (uint64_t i = 0; i < recorder.commands().count(); ++i) {

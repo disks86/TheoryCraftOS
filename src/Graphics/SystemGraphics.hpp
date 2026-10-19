@@ -27,6 +27,7 @@
 #include "Graphics/Graphics3D/Svga/SvgaDevice.hpp"
 #include "Graphics/Graphics3D/Virgl/VirglDevice.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
+#include "Utility/FixedString.hpp"
 
 namespace graphics {
 
@@ -40,6 +41,8 @@ class SystemGraphics {
   // The device to render 3D with: accelerated if it passed its self-test, else software.
   IGraphicsDevice& device() { return *active_; }
   bool accelerated() const { return active_ == gpu_device_; }
+  // Why the software device is in use, in a few words ("display adapter has no 3D engine: Bochs VGA", "virgl self-test failed", ...); empty when accelerated.
+  const char* software_reason() const { return reason_; }
   // Always the CPU renderer's device (e.g. to compare against the accelerated one).
   IGraphicsDevice& software_device() { return software_; }
 
@@ -72,6 +75,8 @@ class SystemGraphics {
   alignas(8) unsigned char virgl_storage_[sizeof(VirglDevice)];
   alignas(8) unsigned char svga_storage_[sizeof(SvgaDevice)];
   bool svga_ = false;
+  const char* reason_ = "";
+  FixedString<96> reason_text_;
   Surface backbuffer_;
   SoftwareRenderer2D* software_2d_ = nullptr;
   DeviceRenderer2D* device_2d_ = nullptr;

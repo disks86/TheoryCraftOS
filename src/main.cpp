@@ -425,8 +425,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       Entry(Level::Ok, "Graphics").text("3D: ").text(system_graphics.device().info().name)
           .text(system_graphics.accelerated() ? " (GPU accelerated)" : " (software)").text(", 2D: ").text(renderer->name())
           .text(renderer->accelerated() ? " (GPU accelerated)" : " (software)");
-      if (!system_graphics.accelerated() && system_gpu.virtio_gpu())
-        Entry(Level::Warning, "Graphics").text("virtio-gpu has no 3D engine here (start QEMU with virtio-gpu-gl for acceleration)");
+      if (!system_graphics.accelerated())
+        Entry(system_gpu.virtio_gpu() || system_gpu.vmware_gpu() ? Level::Warning : Level::Info, "Graphics").text("no 3D acceleration: ").text(system_graphics.software_reason());
     }
   }
 

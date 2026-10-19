@@ -48,6 +48,22 @@ def cache(build, key):
     sys.exit(f"{key} missing from CMakeCache.txt")
 
 
+def gpu_arguments():
+    """The display adapter and display backend, from QEMU_GPU like scripts/qemu-debug.sh: auto (the default: gl when this QEMU has
+    virtio-gpu-gl-pci, else std), gl (virgl 3D), virtio (virtio-gpu, 2D) or std (Bochs VGA with 64 MiB of video memory)."""
+    choice = os.environ.get("QEMU_GPU", "auto")
+    if choice == "auto":
+        devices = subprocess.run(["qemu-system-x86_64", "-device", "help"], capture_output=True, text=True).stdout
+        choice = "gl" if "virtio-gpu-gl-pci" in devices else "std"
+    if choice == "gl":
+        return ["-vga", "none", "-device", "virtio-gpu-gl-pci"], "gtk,gl=on,show-cursor=off"
+    if choice == "virtio":
+        return ["-vga", "none", "-device", "virtio-gpu-pci"], "gtk,show-cursor=off"
+    if choice == "std":
+        return ["-vga", "none", "-device", "VGA,vgamem_mb=" + os.environ.get("QEMU_VGAMEM", "64")], "gtk,show-cursor=off"
+    sys.exit("unknown QEMU_GPU=%s (auto, std, virtio, gl)" % choice)
+
+
 def start_qemu(build):
     esp = os.path.join(build, "esp", "EFI", "BOOT")
     os.makedirs(esp, exist_ok=True)
@@ -57,19 +73,20 @@ def start_qemu(build):
         shutil.copy(cache(build, "OVMF_VARS"), vars_fd)
         os.chmod(vars_fd, 0o644)
     log = os.path.join(build, "debugcon.log")
+    gpu, display = gpu_arguments()
     cmd = [
         "qemu-system-x86_64", "-machine", "q35", "-smp", os.environ.get("QEMU_SMP", "4"), "-m", "8G", "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0", "-rtc", "base=localtime",
         # The tablet gives the desktop an absolute pointer: no click-to-grab, and the host pointer maps
         # straight onto the guest's (relative PS/2 grabbing is unreliable under Wayland).
         "-device", "virtio-tablet-pci",
-        "-display", os.environ.get("QEMU_DISPLAY", "gtk,show-cursor=off"),
+        "-display", os.environ.get("QEMU_DISPLAY", display),
         "-gdb", f"tcp:127.0.0.1:{PORT}", "-S",
         "-drive", f"if=pflash,format=raw,readonly=on,file={cache(build, 'OVMF_CODE')}",
         "-drive", f"if=pflash,format=raw,file={vars_fd}",
         "-drive", f"format=raw,file=fat:rw:{os.path.join(build, 'esp')}",
         "-chardev", f"stdio,id=dbg,logfile={log},signal=off",
         "-device", "isa-debugcon,iobase=0x402,chardev=dbg", "-serial", "null",
-    ] + os.environ.get("QEMU_EXTRA", "").split()  # e.g. QEMU_EXTRA="-vga none -device virtio-gpu-gl-pci"
+    ] + gpu + os.environ.get("QEMU_EXTRA", "").split()
     # QEMU's stdout would corrupt the gdb channel: send it to stderr instead.
     return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno())
 

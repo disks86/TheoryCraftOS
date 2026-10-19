@@ -466,16 +466,27 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
   # `cmake --build build --target run`
   # The standard VGA card gets 64 MiB of video memory (the default 16 MiB leaves out the largest resolutions).
   set(QEMU_STD_VGA -vga none -device VGA,vgamem_mb=64)
-  add_custom_target(run COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA}
+  # The same with a virtio-gpu 3D device: QEMU renders through the host's OpenGL (virgl).
+  set(QEMU_GL_GPU -vga none -device virtio-gpu-gl-pci -display gtk,gl=on,show-cursor=off)
+  # `run` and `debug` use the 3D device when this QEMU has it (so the 3D test is accelerated), else standard VGA.
+  execute_process(COMMAND ${QEMU} -device help OUTPUT_VARIABLE QEMU_DEVICES ERROR_QUIET)
+  if(QEMU_DEVICES MATCHES "virtio-gpu-gl-pci")
+    set(QEMU_DEFAULT_GPU ${QEMU_GL_GPU})
+    message(STATUS "QEMU has virtio-gpu-gl: the run and debug targets use virgl 3D (run-std for the standard VGA card)")
+  else()
+    set(QEMU_DEFAULT_GPU ${QEMU_STD_VGA})
+  endif()
+  add_custom_target(run COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU}
     DEPENDS esp vars data USES_TERMINAL)
-  # Same, with a virtio-gpu 3D device: QEMU renders through the host's OpenGL (virgl).
-  add_custom_target(run-gl COMMAND ${QEMU_COMMON} -vga none -device virtio-gpu-gl-pci -display gtk,gl=on,show-cursor=off
+  add_custom_target(run-std COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA}
+    DEPENDS esp vars data USES_TERMINAL)
+  add_custom_target(run-gl COMMAND ${QEMU_COMMON} ${QEMU_GL_GPU}
     DEPENDS esp vars data USES_TERMINAL)
   # Starts the gdbstub on :1234 (-s) without halting; use with TCOS_DEBUG_WAIT.
-  add_custom_target(debug COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA} -s
+  add_custom_target(debug COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -s
     DEPENDS esp vars data USES_TERMINAL)
   # Freeze the CPU at reset until gdb connects (-S).
-  add_custom_target(debug-halted COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA} -s -S
+  add_custom_target(debug-halted COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -s -S
     DEPENDS esp vars data USES_TERMINAL)
 else()
   message(WARNING "qemu-system-x86_64 or OVMF firmware not found; run/debug targets disabled")

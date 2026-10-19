@@ -581,13 +581,14 @@ calling convention - no gnu-efi or lld needed.
 ```sh
 cmake -S . -B build -G Ninja
 cmake --build build              # produces build/esp/EFI/BOOT/BOOTX64.EFI
-cmake --build build --target run # boot in QEMU (OS output on your terminal)
-cmake --build build --target run-gl # same with a virtio-gpu 3D device: QEMU renders through the host GPU (virgl)
+cmake --build build --target run # boot in QEMU (OS output on your terminal); virgl 3D when this QEMU has virtio-gpu-gl, else standard VGA
+cmake --build build --target run-gl # always with a virtio-gpu 3D device: QEMU renders through the host GPU (virgl)
+cmake --build build --target run-std # always with the standard VGA card (software rendering)
 ```
 
 `run-gl` needs QEMU built with virglrenderer and a host OpenGL stack; the OS then reports `Graphics: virgl (virtio-gpu),
-accelerated`. `scripts/qemu-debug.sh` takes `QEMU_GPU=gl` (virgl), `virtio` (virtio-gpu, software rendering) or the default
-`std` (Bochs VGA, software rendering). Without a 3D engine everything falls back to the software renderers.
+accelerated`. `scripts/qemu-debug.sh` (the CLion QEMU configuration) and `scripts/gdb-proxy.py` (its Debug one) takes `QEMU_GPU=gl` (virgl), `virtio` (virtio-gpu, software rendering),
+`std` (Bochs VGA, software rendering) or the default `auto`: `gl` when this QEMU has `virtio-gpu-gl-pci`, else `std`. Without a 3D engine everything falls back to the software renderers.
 
 ### Debugging in QEMU
 

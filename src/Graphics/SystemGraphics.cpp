@@ -27,25 +27,40 @@ SystemGraphics::SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator&
     : allocator_(allocator), display_(gpu.gpu()), software_(allocator, gpu.gpu()) {
   active_ = &software_;
   hardware::VirtioGpu* virtio = gpu.virtio_gpu();
-  if (allow_acceleration && virtio && virtio->has_3d()) {
-    VirglDevice* device = new (virgl_storage_) VirglDevice(*virtio);
-    if (self_test(*device)) {
-      gpu_device_ = device;
-      active_ = device;
-    } else {
-      device->~VirglDevice();
-    }
-  }
   hardware::VmwareSvgaGpu* svga = gpu.vmware_gpu();
-  if (!gpu_device_ && allow_acceleration && svga && svga->has_3d()) {
-    SvgaDevice* device = new (svga_storage_) SvgaDevice(*svga, allocator);
-    if (device->initialize() && self_test(*device) && drawing_test(*device)) {
-      gpu_device_ = device;
-      active_ = device;
-      svga_ = true;
+  if (!allow_acceleration) {
+    reason_ = "acceleration was switched off";
+  } else if (virtio) {
+    if (!virtio->has_3d()) {
+      reason_ = "virtio-gpu without virgl (start QEMU with virtio-gpu-gl and a gl display)";
     } else {
-      device->~SvgaDevice();
+      VirglDevice* device = new (virgl_storage_) VirglDevice(*virtio);
+      if (self_test(*device)) {
+        gpu_device_ = device;
+        active_ = device;
+      } else {
+        device->~VirglDevice();
+        reason_ = "the virgl device failed its self-test";
+      }
     }
+  } else if (svga) {
+    if (!svga->has_3d()) {
+      reason_ = "VMware SVGA adapter without a 3D engine (enable 3D acceleration in the VM settings)";
+    } else {
+      SvgaDevice* device = new (svga_storage_) SvgaDevice(*svga, allocator);
+      if (device->initialize() && self_test(*device) && drawing_test(*device)) {
+        gpu_device_ = device;
+        active_ = device;
+        svga_ = true;
+      } else {
+        device->~SvgaDevice();
+        reason_ = "SVGA3D did not draw the test picture correctly";
+      }
+    }
+  } else {
+    reason_text_.assign("the display adapter has no 3D driver: ");
+    reason_text_.append(display_ ? display_->name() : "none");
+    reason_ = reason_text_.c_str();
   }
 }
 

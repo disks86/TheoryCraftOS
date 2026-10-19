@@ -255,6 +255,13 @@ void CubeView::paint(gui::Painter& painter) {
   }
   painter.text(27, 27, mode.view(), kShadow);
   painter.text(26, 26, mode.view(), indicator);
+  if (!gpu_available() && !failed_) {   // say why, so the machine's setup can be fixed
+    FixedString<128> why;
+    why.assign("No GPU: ");
+    why.append(software_reason());
+    painter.text(9, 45, why.view(), kShadow);
+    painter.text(8, 44, why.view(), kAmber);
+  }
   invalidate();   // the next frame, as soon as the render loop is ready
 }
 
