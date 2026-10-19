@@ -418,6 +418,11 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     `Ps2/` (i8042 keyboard with set-1 decoding, mouse with IntelliMouse wheel), `Usb/` (HID keyboard in boot
     protocol; mouse and tablet through a HID report-descriptor parser) and `Virtio/` (virtio-input keyboard,
     mouse and tablet). `Hardware/SystemInput` finds all of them and exposes one keyboard and one mouse.
+  - `Hardware/Guest/` - the rest of what QEMU offers a guest, brought up by `SystemGuestServices`: `VirtioRng` (virtio-rng, an `IEntropySource`
+    that the SMB/SFTP/FTPS DRBG uses when the CPU has no RDSEED/RDRAND), `VirtioBalloon` (virtio-balloon: a service thread follows the host's
+    `balloon` target, in 256 KiB chunks with a kept page at each end so allocator bookkeeping is never ballooned; capped at 1 GiB) and `PvPanic`
+    (pvpanic on port 0x505: `kernel::panic` tells the host). The `run` targets add all three. Not covered: the QEMU guest agent (virtio-serial),
+    virtio-vsock/fs/9p/console, fw_cfg, vmgenid. Checked by booting under QEMU (balloon inflate/deflate through the monitor); pvpanic's panic path is untested.
   - `Hardware/Bus/Ps2/` (`I8042Controller`) and `Hardware/Bus/Virtio/` (modern virtio-PCI transport,
     virtqueues, `VirtioInputDevice`); `Bus/Usb/Hid/` has the report-descriptor parser and interface finder.
   - `Hardware/ImageSignalProcessor/`: `IImageSignalProcessor` (raw Bayer frame -> RGB image, settings, frame

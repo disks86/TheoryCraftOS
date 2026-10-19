@@ -18,6 +18,7 @@
 
 #include "Kernel/Interrupts.hpp"
 #include "console.hpp"
+#include "Hardware/Guest/PvPanic.hpp"
 #include "Hardware/IoPort.hpp"
 #include "Kernel/Apic.hpp"
 
@@ -178,6 +179,7 @@ void panic(const char* what, const Frame* frame) {
     console::put_hex(frame->rdx);
     console::puts("\n");
   }
+  hardware::PvPanic::notify_panic();  // tell the host before the machine goes quiet
   for (;;) __asm__ volatile("hlt");
 }
 

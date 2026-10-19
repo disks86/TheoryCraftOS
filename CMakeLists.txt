@@ -77,6 +77,10 @@ add_executable(BOOTX64
   src/Hardware/Bus/Virtio/Virtqueue.cpp
   src/Hardware/Bus/Virtio/VirtioPciDevice.cpp
   src/Hardware/Bus/Virtio/VirtioInputDevice.cpp
+  src/Hardware/Guest/PvPanic.cpp
+  src/Hardware/Guest/VirtioRng.cpp
+  src/Hardware/Guest/VirtioBalloon.cpp
+  src/Hardware/Guest/SystemGuestServices.cpp
   src/Hardware/Keyboard/Usb/UsbHidKeyboard.cpp
   src/Hardware/Keyboard/Virtio/VirtioKeyboard.cpp
   src/Hardware/Mouse/Usb/UsbHidMouse.cpp
@@ -412,6 +416,8 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -rtc base=localtime  # the taskbar clock shows local time
     # An absolute pointer for the desktop (no click-to-grab; relative PS/2 grabbing is unreliable under Wayland).
     -device virtio-tablet-pci
+    # Guest services: the host's entropy pool, a memory balloon (`balloon` in the monitor) and the crash notification.
+    -device virtio-rng-pci -device virtio-balloon-pci -device pvpanic
     # An HD Audio controller with a duplex codec; the `none` backend discards the sound (use e.g. `pa` to hear it).
     -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
     -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}

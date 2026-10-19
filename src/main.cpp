@@ -59,6 +59,7 @@
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Media/MediaCodecs.hpp"
+#include "Hardware/Guest/SystemGuestServices.hpp"
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
@@ -642,6 +643,16 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
   for (uint32_t i = 0; i < input.mice().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.mice().at(i)->name());
 
+  // QEMU guest services: the host's entropy pool (virtio-rng), the memory balloon (virtio-balloon), the crash notification (pvpanic).
+  hardware::SystemGuestServices guest(pci, shared_allocator, st);
+  guest.initialize();
+  if (guest.entropy()) Entry(Level::Ok, "Guest").text("virtio-rng: host entropy available");
+  if (guest.balloon()) {
+    Entry(Level::Ok, "Guest").text("virtio-balloon: ").dec(guest.balloon()->target_pages() / 256).text(" MiB requested by the host");
+    if (!guest.start_service()) Entry(Level::Warning, "Guest").text("could not start the balloon service; the host's balloon requests are ignored");
+  }
+  if (hardware::PvPanic::present()) Entry(Level::Ok, "Guest").text("pvpanic: crashes are reported to the host");
+
   // Printers: those on USB are found on the bus (network printers are added by address, by whoever knows it).
   hardware::SystemPrinters printers(shared_allocator);
   printers.discover_usb(usb);
@@ -743,7 +754,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // Network shares (SMB, NFS, SFTP, FTPS): folders of the explorer's tree whose contents are the shares of the servers the user goes to.
     TimingEntropy timing_entropy;
     crypto::CpuEntropySource cpu_entropy;
-    crypto::DrbgRandom smb_random(crypto::CpuEntropySource::available() ? static_cast<crypto::IEntropySource&>(cpu_entropy) : static_cast<crypto::IEntropySource&>(timing_entropy));
+    crypto::IEntropySource& smb_entropy = crypto::CpuEntropySource::available() ? static_cast<crypto::IEntropySource&>(cpu_entropy)
+        : guest.entropy() ? *guest.entropy() : static_cast<crypto::IEntropySource&>(timing_entropy);
+    crypto::DrbgRandom smb_random(smb_entropy);
     network::StackSetNetwork smb_network(stacks);
     network::SmbEnvironment smb_environment;
     smb_environment.random = &smb_random;
@@ -827,6 +840,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   capture_hub.reset();
   mixer.reset();   // the mixer thread ends before its audio device goes
   cameras.stop_service();
+  guest.stop_service();
   printers.stop_service();   // (its thread ends before the threads do: joining it afterwards would wait for ever)
   stacks.clear();  // the stacks go before the NICs underneath them
 #ifdef TCOS_SELFTESTS
@@ -836,6 +850,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   Entry(Level::Ok, "Shutdown").text("threads stopped");
   input.shutdown();
+  guest.shutdown();
   for (uint32_t i = 0; i < storage.count(); ++i) {
     hardware::IStorageDevice& device = *storage.at(i);
     if (device.info().read_only) continue;
