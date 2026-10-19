@@ -433,6 +433,14 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     time sync (the host clock is readable with `VmmDev::host_time_ms` but nothing sets the RTC: it is local time here and the zone is unknown).
     There is no VirtualBox in the test setup and QEMU has no VMMDev: `VmmDev` follows VMMDev.h from memory and has never run, so treat the request
     layouts (the heartbeat in particular) as unverified.
+  - **Hyper-V:** `Hardware/HyperV/` - `HyperV` (CPUID detection, guest OS id, hypercall page, SynIC message/event pages; HvPostMessage / HvSignalEvent),
+    `VmBus` (version negotiation, offers, GPADLs, channel open/close, ring buffers) and `HyperVIntegration` (heartbeat, shutdown/restart - the desktop
+    shuts down and the machine powers off or cold-resets - and time sync, whose host time is kept but does not set the RTC), run by `SystemHyperV` on a
+    thread pinned to the boot core. Checked under QEMU/KVM with `-cpu host,hv-vpindex,hv-synic,...`: the hypercall page and SynIC come up and hypercalls
+    work; QEMU has no VMBus host, so the VMBus protocol, ring buffers and integration components are written from the protocol as documented and
+    have never talked to a real Hyper-V. **Not done:** the synthetic network, SCSI, video, keyboard and mouse devices (netvsc/storvsc/hyperv-fb/hid; on a
+    generation 2 VM the firmware's drivers still let the UEFI fallbacks reach the disk, network and screen), KVP, VSS, file copy, dynamic memory
+    (balloon), the legacy DEC 21140 NIC of generation 1 VMs.
   - `Hardware/Bus/Ps2/` (`I8042Controller`) and `Hardware/Bus/Virtio/` (modern virtio-PCI transport,
     virtqueues, `VirtioInputDevice`); `Bus/Usb/Hid/` has the report-descriptor parser and interface finder.
   - `Hardware/ImageSignalProcessor/`: `IImageSignalProcessor` (raw Bayer frame -> RGB image, settings, frame

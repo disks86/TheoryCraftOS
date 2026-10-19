@@ -78,6 +78,10 @@ add_executable(BOOTX64
   src/Hardware/Bus/Virtio/VirtioPciDevice.cpp
   src/Hardware/Bus/Virtio/VirtioInputDevice.cpp
   src/Hardware/VirtualBox/VmmDev.cpp
+  src/Hardware/HyperV/HyperV.cpp
+  src/Hardware/HyperV/VmBus.cpp
+  src/Hardware/HyperV/HyperVIntegration.cpp
+  src/Hardware/HyperV/SystemHyperV.cpp
   src/Hardware/Mouse/VirtualBox/VBoxMouse.cpp
   src/Hardware/Guest/PvPanic.cpp
   src/Hardware/Guest/VirtioRng.cpp
