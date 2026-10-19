@@ -52,13 +52,21 @@ class VmwareSvgaGpu final : public FramebufferGpu, public IMonitorSource {
   uint32_t device_modes(uint32_t connector, MonitorMode* out, uint32_t capacity) const override;
   bool set_display_mode(uint32_t connector, uint32_t width, uint32_t height) override;
 
+  // --- The 3D engine (SVGA3D), when the host offers one: commands go through the same FIFO.
+  bool has_3d() const;
+  bool command(const uint32_t* words, uint32_t count) { return fifo_write(words, count); }   // false if the FIFO is not set up
+  void wait_idle() { sync(); }
+  // Video memory beyond the picture, free to use as a staging area for transfers to and from host surfaces. `offset` is the position in video
+  // memory (what the guest pointer of a surface transfer names). Null if there is too little.
+  uint8_t* scratch(uint32_t* offset, uint32_t* bytes);
+
  private:
   uint32_t read_register(uint32_t index) const;
   void write_register(uint32_t index, uint32_t value) const;
   bool probe_ports();
   void init_fifo();
   bool program(uint32_t width, uint32_t height);
-  void fifo_write(const uint32_t* words, uint32_t count);
+  bool fifo_write(const uint32_t* words, uint32_t count);
   void sync();
 
   const IPciBus* pci_;
@@ -73,6 +81,7 @@ class VmwareSvgaGpu final : public FramebufferGpu, public IMonitorSource {
   DisplayMode modes_[kMaxModes] = {};
   uint32_t mode_count_ = 0;
   uint32_t current_ = 0;
+  uint32_t pitch_ = 0, fb_offset_ = 0;
 };
 
 }  // namespace hardware

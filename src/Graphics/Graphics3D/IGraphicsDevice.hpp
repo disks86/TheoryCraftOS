@@ -107,6 +107,10 @@ struct ShaderModuleDesc {
   // varyings as GENERIC[n] (fragment stage); push constants are CONST[0..7] (vec4 each).
   // Clip-space z is 0..1 and the first color output is the pixel.
   const char* tgsi = nullptr;
+  // Direct3D 9 shader bytecode (vs_2_0 / ps_2_0 token stream) for the VMware SVGA3D device. A vertex shader writes clip space with +Y up (Direct3D's)
+  // when it takes the c31 constant (1, -1, 1, 1) as a factor of the position; the device supplies it, so that Vulkan's +Y down comes out right.
+  const uint32_t* d3d9_tokens = nullptr;
+  uint32_t d3d9_token_count = 0;
 };
 
 class IShaderModule {

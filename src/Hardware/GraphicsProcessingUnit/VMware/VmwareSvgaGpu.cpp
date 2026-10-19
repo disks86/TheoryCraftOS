@@ -27,7 +27,9 @@ constexpr uint32_t kRegId = 0, kRegEnable = 1, kRegWidth = 2, kRegHeight = 3, kR
                    kRegBytesPerLine = 12, kRegFbOffset = 14, kRegVramSize = 15, kRegFbSize = 16, kRegCapabilities = 17, kRegMemSize = 19,
                    kRegConfigDone = 20, kRegSync = 21, kRegBusy = 22, kRegGuestId = 23;
 constexpr uint32_t kId2 = 0x90000002;
-constexpr uint32_t kCapExtendedFifo = 1u << 15;
+constexpr uint32_t kCap3d = 1u << 14, kCapExtendedFifo = 1u << 15;
+constexpr uint32_t kFifo3dHwVersion = 7;
+constexpr uint32_t kScratchMaxBytes = 8u << 20, kScratchMinBytes = 256u << 10;
 constexpr uint32_t kFifoMin = 0, kFifoMax = 1, kFifoNextCommand = 2, kFifoStop = 3;
 constexpr uint32_t kFifoRegisters = 293;     // the registers at the start of an extended FIFO
 constexpr uint32_t kCommandUpdate = 1;
@@ -124,6 +126,8 @@ bool VmwareSvgaGpu::program(uint32_t width, uint32_t height) {
   const uint32_t pitch = read_register(kRegBytesPerLine), offset = read_register(kRegFbOffset);
   const uint32_t bytes = read_register(kRegFbSize);
   if (pitch < width * 4 || offset + uint64_t{pitch} * height > framebuffer_bytes_ || (bytes && bytes < pitch * height)) return false;
+  pitch_ = pitch;
+  fb_offset_ = offset;
   set_framebuffer(ByteView(framebuffer_ + offset, uint64_t{pitch} * height), width, height, pitch, true);
   mark_all_dirty();
   present();
@@ -136,11 +140,11 @@ void VmwareSvgaGpu::sync() {
 }
 
 // Appends one command to the FIFO ring, waiting for the host to catch up if it is full.
-void VmwareSvgaGpu::fifo_write(const uint32_t* words, uint32_t count) {
-  if (!fifo_ready_) return;
+bool VmwareSvgaGpu::fifo_write(const uint32_t* words, uint32_t count) {
+  if (!fifo_ready_) return false;
   const uint32_t min = fifo_[kFifoMin], max = fifo_[kFifoMax], bytes = count * 4;
   uint32_t next = fifo_[kFifoNextCommand];
-  if (next < min || next >= max) return;   // (corrupt)
+  if (next < min || next >= max) return false;   // (corrupt)
   const uint32_t stop = fifo_[kFifoStop];
   const uint32_t used = next >= stop ? next - stop : (max - min) - (stop - next);
   if (used + bytes >= max - min) sync();   // full: the host drains it
@@ -151,6 +155,21 @@ void VmwareSvgaGpu::fifo_write(const uint32_t* words, uint32_t count) {
   }
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   fifo_[kFifoNextCommand] = next;
+  return true;
+}
+
+bool VmwareSvgaGpu::has_3d() const {
+  return fifo_ready_ && (read_register(kRegCapabilities) & kCap3d) && (read_register(kRegCapabilities) & kCapExtendedFifo) &&
+         fifo_[kFifoMin] > kFifo3dHwVersion * 4 && fifo_[kFifo3dHwVersion] != 0;
+}
+
+uint8_t* VmwareSvgaGpu::scratch(uint32_t* offset, uint32_t* bytes) {
+  const uint64_t start = (uint64_t{fb_offset_} + uint64_t{pitch_} * height() + 4095) & ~uint64_t{4095};
+  if (!framebuffer_ || start >= framebuffer_bytes_ || framebuffer_bytes_ - start < kScratchMinBytes) return nullptr;
+  *offset = static_cast<uint32_t>(start);
+  const uint64_t room = framebuffer_bytes_ - start;
+  *bytes = static_cast<uint32_t>(room < kScratchMaxBytes ? room : kScratchMaxBytes);
+  return framebuffer_ + start;
 }
 
 void VmwareSvgaGpu::present() {

@@ -18,12 +18,13 @@
 
 // Picks the rendering back ends for this machine, the way SystemGpu picks a GPU:
 // the accelerated 3D device if the display GPU has a 3D engine we can drive
-// (virgl on a virtio-gpu, i.e. QEMU with a -gl display), else the software one.
+// (virgl on a virtio-gpu, i.e. QEMU with a -gl display; SVGA3D on a VMware SVGA adapter, i.e. VMware and VirtualBox's VMSVGA), else the software one.
 // Storage is inline because there is no heap-free way to build them elsewhere.
 #pragma once
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#include "Graphics/Graphics3D/Svga/SvgaDevice.hpp"
 #include "Graphics/Graphics3D/Virgl/VirglDevice.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 
@@ -61,12 +62,16 @@ class SystemGraphics {
 
  private:
   bool self_test(IGraphicsDevice& device);
+  // Draws a triangle on the device and looks at the pixel: for back ends whose protocol could not be tried against a real host in advance.
+  bool drawing_test(IGraphicsDevice& device);
 
   allocators::IAllocator& allocator_;
   hardware::IGraphicsProcessingUnit* display_;
   hardware::IGraphicsProcessingUnit* override_ = nullptr;
   SoftwareDevice software_;
   alignas(8) unsigned char virgl_storage_[sizeof(VirglDevice)];
+  alignas(8) unsigned char svga_storage_[sizeof(SvgaDevice)];
+  bool svga_ = false;
   Surface backbuffer_;
   SoftwareRenderer2D* software_2d_ = nullptr;
   DeviceRenderer2D* device_2d_ = nullptr;

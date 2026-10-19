@@ -40,6 +40,8 @@ class SystemGpu {
   IGraphicsProcessingUnit* gpu() { return active_; }
   // The active GPU as a virtio-gpu if it is one (the 3D path needs its command channel), else nullptr.
   VirtioGpu* virtio_gpu() { return virtio_ ? static_cast<VirtioGpu*>(active_) : nullptr; }
+  // The active GPU as a VMware SVGA II adapter if it is one (its 3D engine takes commands through the FIFO), else nullptr.
+  VmwareSvgaGpu* vmware_gpu() { return vmware_ ? static_cast<VmwareSvgaGpu*>(active_) : nullptr; }
 
  private:
   static constexpr unsigned long kSize =
@@ -48,6 +50,7 @@ class SystemGpu {
   alignas(16) unsigned char storage_[kSize];
   IGraphicsProcessingUnit* active_ = nullptr;
   bool virtio_ = false;
+  bool vmware_ = false;
 };
 
 }  // namespace hardware

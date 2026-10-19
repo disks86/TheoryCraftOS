@@ -449,6 +449,13 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     (power off/restart, resolution, ping) - written from the open-vm-tools protocol, QEMU has no message channel, so it has never run. **Not done:**
     VMCI, vmw_balloon, shared folders (HGFS), the clipboard/drag-and-drop channels, the SVGA 3D (SVGA3D/Gallium) device, the LSI Logic adapters, vmxnet2,
     multiple vmxnet3 queues or offloads; a resize requested by the VMware window reaches the display only through the tools channel (nearest listed mode).
+  - **3D acceleration by hypervisor:** QEMU - virgl on virtio-gpu (`VirglDevice`; checked headless with `-device virtio-gpu-gl-pci -display egl-headless`: 3D and 2D
+    are reported GPU accelerated). VMware and VirtualBox (its VMSVGA adapter is the same device) - `Graphics3D/Svga/SvgaDevice` drives SVGA3D
+    (Direct3D 9 protocol: host surfaces, vs_2_0/ps_2_0 bytecode in `ShaderModuleDesc::d3d9_tokens`, commands through the FIFO, transfers through video
+    memory). It is written from the svga3d headers from memory and has never met a host with the engine (QEMU's vmware-svga has none, so there it is not
+    even tried); `SystemGraphics` therefore draws a triangle on it at start-up and keeps it only if the right pixels come back, otherwise the software
+    renderer stays. Known gaps: only the two built-in shaders have bytecode, scissor is not enabled, no textures. Hyper-V has no 3D path a guest can use
+    over the synthetic video device (RemoteFX is gone; GPU partitioning goes through the host's DirectX kernel), so it stays on the software renderer.
   - `Hardware/Bus/Ps2/` (`I8042Controller`) and `Hardware/Bus/Virtio/` (modern virtio-PCI transport,
     virtqueues, `VirtioInputDevice`); `Bus/Usb/Hid/` has the report-descriptor parser and interface finder.
   - `Hardware/ImageSignalProcessor/`: `IImageSignalProcessor` (raw Bayer frame -> RGB image, settings, frame

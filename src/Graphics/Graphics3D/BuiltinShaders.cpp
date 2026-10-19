@@ -55,6 +55,26 @@ constexpr const char kColoredFragmentTgsi[] =
     "DCL OUT[0], COLOR\n"
     "  0: MOV OUT[0], IN[0]\n"
     "  1: END\n";
+
+// The same two shaders as Direct3D 9 bytecode (vs_2_0, ps_2_0). Position comes in as v0, color as v1; the matrix columns are c0..c3, and c31 is
+// the device's (1, -1, 1, 1) that turns Direct3D's +Y up into Vulkan's +Y down.
+constexpr uint32_t kColoredVertexD3d9[] = {
+    0xFFFE0200,                                                   // vs_2_0
+    0x0200001F, 0x80000000, 0x900F0000,                           // dcl_position v0
+    0x0200001F, 0x8000000A, 0x900F0001,                           // dcl_color v1
+    0x03000005, 0x800F0000, 0xA0E40000, 0x90000000,              // mul r0, c0, v0.xxxx
+    0x04000004, 0x800F0000, 0xA0E40001, 0x90550000, 0x80E40000,  // mad r0, c1, v0.yyyy, r0
+    0x04000004, 0x800F0000, 0xA0E40002, 0x90AA0000, 0x80E40000,  // mad r0, c2, v0.zzzz, r0
+    0x03000002, 0x800F0001, 0x80E40000, 0xA0E40003,              // add r1, r0, c3
+    0x03000005, 0xC00F0000, 0x80E40001, 0xA0E4001F,              // mul oPos, r1, c31
+    0x02000001, 0xD00F0000, 0x90E40001,                           // mov oD0, v1
+    0x0000FFFF,                                                   // end
+};
+constexpr uint32_t kColoredFragmentD3d9[] = {
+    0xFFFF0200,                                                   // ps_2_0
+    0x02000001, 0x800F0800, 0x90E40000,                           // mov oC0, v0
+    0x0000FFFF,
+};
 }  // namespace
 
 ShaderModuleDesc colored_vertex_shader() {
@@ -62,6 +82,8 @@ ShaderModuleDesc colored_vertex_shader() {
   d.stage = ShaderStage::Vertex;
   d.vertex_function = colored_vertex;
   d.tgsi = kColoredVertexTgsi;
+  d.d3d9_tokens = kColoredVertexD3d9;
+  d.d3d9_token_count = sizeof kColoredVertexD3d9 / 4;
   return d;
 }
 
@@ -70,6 +92,8 @@ ShaderModuleDesc colored_fragment_shader() {
   d.stage = ShaderStage::Fragment;
   d.fragment_function = colored_fragment;
   d.tgsi = kColoredFragmentTgsi;
+  d.d3d9_tokens = kColoredFragmentD3d9;
+  d.d3d9_token_count = sizeof kColoredFragmentD3d9 / 4;
   return d;
 }
 

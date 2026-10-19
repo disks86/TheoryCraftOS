@@ -226,6 +226,7 @@ add_executable(BOOTX64
   src/Graphics/Graphics2D/Device/DeviceRenderer2D.cpp
   src/Graphics/Graphics3D/BuiltinShaders.cpp
   src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
+  src/Graphics/Graphics3D/Svga/SvgaDevice.cpp
   src/Graphics/SystemGraphics.cpp
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
