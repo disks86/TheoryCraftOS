@@ -23,6 +23,7 @@
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpuProtocol.hpp"
 #include "Hardware/Monitor/IMonitorSource.hpp"
+#include "Kernel/Interrupts.hpp"
 #include "Kernel/Sync.hpp"
 
 namespace hardware {
@@ -47,6 +48,17 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   const char* name() const override { return has_3d_ ? "virtio-gpu (virgl 3D)" : "virtio-gpu"; }
   bool initialize() override;
   void shutdown() override;
+
+  // Has the device announce finished commands with an interrupt (MSI-X) so a thread waiting for the host sleeps until then instead of looking again and
+  // again. Call once the kernel runs (interrupts, the local APIC and the scheduler are needed); until then, and when the device or machine cannot, commands
+  // are waited for by polling. The interrupt is tried out first: a vector that does not arrive is given up on. True if completions are interrupt driven now.
+  bool enable_interrupts();
+  // Back to polling: the device stops sending interrupts and the handler goes. Needed before the kernel stops (its vector means nothing to the firmware's
+  // interrupt table, which comes back then) and harmless at any other time.
+  void disable_interrupts();
+  bool interrupts_enabled() const { return interrupts_; }
+  // Interrupts taken so far (for tests and the boot log).
+  uint32_t interrupt_count() const { return __atomic_load_n(&interrupt_count_, __ATOMIC_ACQUIRE); }
 
   uint32_t mode_count() const override;
   bool mode_info(uint32_t index, DisplayMode* out) const override;
@@ -92,7 +104,8 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   // How many commands timed out so far (the host was not answering).
   uint32_t timeouts() const { return __atomic_load_n(&timeouts_, __ATOMIC_ACQUIRE); }
   static constexpr uint64_t kCommandTimeoutUs = 250000;
-  static constexpr uint64_t kSpinWaitUs = 150;   // how long a command's answer is waited for by spinning before the thread sleeps between looks
+  static constexpr uint64_t kInterruptWaitUs = 2000;   // one sleep for the interrupt; short, so a lost one costs little before the next look
+  static constexpr uint64_t kSpinWaitUs = 50;   // how long a command's answer is waited for by spinning before the thread sleeps between looks
 
  private:
   static constexpr uint32_t kContextId = 1;
@@ -115,6 +128,10 @@ class VirtioGpu : public FramebufferGpu, public IMonitorSource {
   Virtqueue control_;
   ByteView request_, response_;
   kernel::Mutex lock_;
+  kernel::Event completion_{true};   // set by the interrupt handler: a command finished
+  bool interrupts_ = false;
+  uint32_t interrupt_count_ = 0;
+  static kernel::Frame* on_interrupt(kernel::Frame* frame, void* self);
   uint64_t fence_ = 0;
   bool in_flight_ = false;  // a command timed out and the device still holds its buffers
   uint32_t timeouts_ = 0;

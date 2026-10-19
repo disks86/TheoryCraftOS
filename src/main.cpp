@@ -410,6 +410,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // From here on the OS is preemptively multithreaded on every core.
   if (kernel::start(cpu, shared_allocator)) {
     Entry(Level::Ok, "Kernel").text("preemptive threads on ").dec(kernel::core_count()).text(" cores");
+    // The virtio-gpu's commands finish with an interrupt now (the host takes milliseconds for some; a thread waiting for one need not look again and again).
+    if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) {
+      if (virtio->enable_interrupts()) Entry(Level::Ok, "GPU").text("virtio-gpu commands complete by interrupt (MSI-X)");
+      else Entry(Level::Info, "GPU").text("virtio-gpu has no usable interrupt; waiting for commands by polling");
+    }
 #ifdef TCOS_SELFTESTS
     if (!run_kernel_demo(shared_allocator)) console::puts("  kernel self-check incomplete\n");
 #endif
@@ -933,6 +938,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   stack_demo.reset();
 #endif
   Entry(Level::Ok, "Shutdown").text("network stacks stopped");
+  // The virtio-gpu's interrupts end before the kernel does: after that the firmware's interrupt table is back, and a message to our vector would hit it.
+  if (hardware::VirtioGpu* virtio = system_gpu.virtio_gpu()) virtio->disable_interrupts();
   kernel::stop();  // threads end here; the rest of shutdown talks to the firmware
   Entry(Level::Ok, "Shutdown").text("threads stopped");
   input.shutdown();

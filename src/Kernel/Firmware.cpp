@@ -22,13 +22,20 @@
 namespace kernel {
 
 namespace {
+// One hand-off to the service thread. It lives on the caller's stack, and the caller does not leave until the service says the call has run: the lambda
+// the call executes (and everything it captured by reference) is on that stack too.
+struct Request {
+  void (*function)(void*);
+  void* context;
+  uint32_t finished;   // set last by the service, read by the caller (atomically)
+};
+
 struct Service {
   Mutex firmware_lock;    // one firmware call at a time
   Mutex request_lock;     // one hand-off at a time
   Semaphore work{0};
-  Event done{true};
-  void (*function)(void*) = nullptr;
-  void* context = nullptr;
+  Event done{true};       // a hint that some request finished; never proof of it (see firmware_call)
+  Request* request = nullptr;
   uint32_t boot_core = 0;
   bool started = false;
 };
@@ -37,9 +44,13 @@ Service g;
 void service_main(void*) {
   for (;;) {
     g.work.acquire();
+    Request* r = g.request;
+    if (!r) continue;   // (woken with nothing to do: never run an old request again)
+    g.request = nullptr;
     g.firmware_lock.lock();
-    g.function(g.context);
+    r->function(r->context);
     g.firmware_lock.unlock();
+    __atomic_store_n(&r->finished, 1u, __ATOMIC_RELEASE);   // the caller may leave now: r is not touched again
     g.done.set();
   }
 }
@@ -72,10 +83,13 @@ void firmware_call(void (*function)(void*), void* context) {
     return;
   }
   g.request_lock.lock();
-  g.function = function;
-  g.context = context;
+  Request request{function, context, 0};
+  g.request = &request;
   g.work.release();
-  g.done.wait();
+  // The event can be set when no request finished (an earlier completion whose waiter had already gone on leaves it set), so waking up proves nothing:
+  // wait until THIS request says it ran. Leaving earlier would let the service run the call later against a stack frame that is gone, and the firmware
+  // would write its answers (an EFI status such as NOT_READY) over whatever lives there now - a return address, say.
+  while (!__atomic_load_n(&request.finished, __ATOMIC_ACQUIRE)) g.done.wait(1000);
   g.request_lock.unlock();
 }
 

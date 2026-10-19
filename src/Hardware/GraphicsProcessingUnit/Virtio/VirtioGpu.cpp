@@ -18,6 +18,7 @@
 
 #include "Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.hpp"
 #include <new>
+#include "Kernel/Apic.hpp"
 #include "Kernel/Delay.hpp"
 #include "console.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -48,7 +49,17 @@ ControlHeader header(uint32_t type) {
 
 uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
   if (!ready_ || request.size() < sizeof(ControlHeader) || request.size() > request_.size()) return 0;
-  kernel::ScopedMutex guard(lock_);
+  // A caller with interrupts masked (the console draws under its spinlock) must not block on the mutex while another thread has a command out: it looks
+  // for the mutex again instead. (Blocking there is a kernel panic.)
+  if (kernel::irq_enabled() || !kernel::running()) {
+    lock_.lock();
+  } else {
+    while (!lock_.try_lock()) delay_spin_us(20);
+  }
+  struct Release {
+    kernel::Mutex& mutex;
+    ~Release() { mutex.unlock(); }
+  } guard{lock_};
   uint16_t index;
   uint32_t length;
   if (in_flight_) {  // an earlier command never got its answer: the buffers still belong to the device
@@ -84,12 +95,48 @@ uint32_t VirtioGpu::execute(ConstByteView request, ByteView response) {
         console::debug_puts("virtio-gpu: the host is not answering (display hidden or busy?); skipping frames\n");
       return 0;
     }
-    delay_us(waited < kSpinWaitUs ? 10 : 250);
+    if (waited < kSpinWaitUs) delay_us(10);
+    else if (interrupts_ && kernel::running() && kernel::irq_enabled()) completion_.wait(kInterruptWaitUs);   // woken the moment the host answers (a caller with interrupts masked, the console's lock, cannot sleep: it looks again)
+    else delay_us(250);
   }
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
   const uint32_t type = reply->type;
   if (!response.empty()) response.copy_from(ConstByteView(response_).at_most(response.size()));
   return type;
+}
+
+kernel::Frame* VirtioGpu::on_interrupt(kernel::Frame* frame, void* self) {
+  VirtioGpu* gpu = static_cast<VirtioGpu*>(self);
+  kernel::apic::eoi();
+  __atomic_fetch_add(&gpu->interrupt_count_, 1, __ATOMIC_ACQ_REL);
+  gpu->completion_.set();
+  return frame;
+}
+
+bool VirtioGpu::enable_interrupts() {
+  if (interrupts_) return true;
+  if (!ready_ || !transport_ || !kernel::running()) return false;
+  kernel::set_interrupt_handler(kernel::kVectorVirtioGpu, &VirtioGpu::on_interrupt, this);
+  if (!transport_->enable_msix(kernel::kVectorVirtioGpu, kernel::apic::this_apic_id(), 0)) return false;
+  // Try it out: one command that needs an answer; the interrupt for it must arrive. Without it the device or the machine does not deliver (a message
+  // address the interrupt controller ignores, ...) and polling stays.
+  completion_.reset();
+  const uint32_t before = interrupt_count();
+  read_display_info();
+  for (int i = 0; i < 50 && interrupt_count() == before; ++i) delay_us(100);
+  if (interrupt_count() == before) {
+    transport_->disable_msix();
+    return false;
+  }
+  interrupts_ = true;
+  return true;
+}
+
+void VirtioGpu::disable_interrupts() {
+  if (!interrupts_) return;
+  interrupts_ = false;                 // commands are waited for by polling from here on
+  if (transport_) transport_->disable_msix();
+  kernel::set_interrupt_handler(kernel::kVectorVirtioGpu, nullptr, nullptr);
 }
 
 bool VirtioGpu::initialize() {
@@ -356,6 +403,8 @@ void VirtioGpu::present() {
 }
 
 void VirtioGpu::shutdown() {
+  if (interrupts_) kernel::set_interrupt_handler(kernel::kVectorVirtioGpu, nullptr, nullptr);
+  interrupts_ = false;
   if (ready_) {
     ready_ = false;
     if (has_3d_) {

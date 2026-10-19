@@ -56,6 +56,12 @@ class VirtioPciDevice final : public IHardware {
   bool start();
   void notify(uint16_t queue_index);
 
+  // Sends the completions of queue `queue_index` as an MSI-X interrupt: message `vector` to the core with local APIC id `apic_id`. Call after the queue is
+  // set up. False if the device has no MSI-X, the table cannot be reached or the device does not take the vector (then nothing was changed; keep polling).
+  bool enable_msix(uint8_t vector, uint32_t apic_id, uint16_t queue_index);
+  // Back to no interrupts (the queue's vector is dropped, MSI-X is switched off).
+  void disable_msix();
+
   // Device-specific configuration space.
   uint8_t read_config8(uint32_t offset) const;
   void write_config8(uint32_t offset, uint8_t value) const;
@@ -88,6 +94,8 @@ class VirtioPciDevice final : public IHardware {
   uint32_t requested_features_ = 0;
   uint32_t accepted_features_ = 0;
   bool owns_device_ = false;
+  uint16_t msix_capability_ = 0;   // config-space offset while MSI-X is on, else 0
+  uint16_t msix_queue_ = 0;
 };
 
 }  // namespace hardware

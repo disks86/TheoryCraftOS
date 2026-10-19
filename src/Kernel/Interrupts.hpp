@@ -38,6 +38,7 @@ constexpr uint8_t kSelectorCode = 0x08, kSelectorData = 0x10;
 constexpr uint8_t kVectorTimer = 0x40;     // local APIC timer: preemption tick
 constexpr uint8_t kVectorYield = 0x41;     // software interrupt: give up the core
 constexpr uint8_t kVectorWakeup = 0x42;    // inter-processor interrupt: look for work
+constexpr uint8_t kVectorVirtioGpu = 0x50; // MSI-X: the virtio-gpu's command completions
 constexpr uint8_t kVectorSpurious = 0xFF;
 constexpr uint64_t kRflagsInterrupts = 1u << 9;
 

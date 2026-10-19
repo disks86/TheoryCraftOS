@@ -30,8 +30,10 @@ constexpr uint8_t kPciCapabilityVendor = 0x09;
 // Common configuration structure offsets (virtio 1.x, section 4.1.4.3).
 constexpr uint32_t kFeatureSelect = 0x00, kFeature = 0x04;
 constexpr uint32_t kDriverFeatureSelect = 0x08, kDriverFeature = 0x0C;
-constexpr uint32_t kStatus = 0x14;
-constexpr uint32_t kQueueSelect = 0x16, kQueueSize = 0x18, kQueueEnable = 0x1C;
+constexpr uint32_t kMsixConfigVector = 0x10, kStatus = 0x14;
+constexpr uint32_t kQueueSelect = 0x16, kQueueSize = 0x18, kQueueMsixVector = 0x1A, kQueueEnable = 0x1C;
+constexpr uint16_t kNoVector = 0xFFFF;
+constexpr uint8_t kPciCapabilityMsix = 0x11;
 constexpr uint32_t kQueueNotifyOffset = 0x1E;
 constexpr uint32_t kQueueDesc = 0x20, kQueueDriver = 0x28, kQueueDevice = 0x30;
 
@@ -147,6 +149,49 @@ bool VirtioPciDevice::start() {
   return !(common8(kStatus) & 0xC0);  // neither NEEDS_RESET nor FAILED
 }
 
+bool VirtioPciDevice::enable_msix(uint8_t vector, uint32_t apic_id, uint16_t queue_index) {
+  if (msix_capability_ || queue_index >= 8 || apic_id > 0xFF || !common_.address) return false;
+  const uint16_t cap = pci_.find_capability(device_.address, kPciCapabilityMsix);
+  if (!cap) return false;
+  const uint32_t first = pci_.read32(device_.address, cap);   // id, next, message control (high half)
+  const uint32_t table = pci_.read32(device_.address, cap + 4);
+  const uint64_t bar = pci_.memory_bar(device_.address, static_cast<uint8_t>(table & 7));
+  if (!bar) return false;
+  volatile uint32_t* entry = reinterpret_cast<volatile uint32_t*>(bar + (table & ~7u));   // table entry 0: address low, high, data, vector control
+
+  // MSI-X on with the whole function masked while the entry is written, then the entry and the function unmasked.
+  const uint32_t control = first >> 16;
+  pci_.write32(device_.address, cap, (first & 0xFFFF) | ((control | 0xC000u) << 16));
+  entry[3] = 1;                                           // this vector masked
+  entry[0] = 0xFEE00000u | (apic_id << 12);               // fixed delivery to that core, physical destination
+  entry[1] = 0;
+  entry[2] = vector;                                      // edge triggered
+  entry[3] = 0;
+  pci_.write32(device_.address, cap, (first & 0xFFFF) | (((control | 0x8000u) & ~0x4000u) << 16));
+
+  set_common16(kMsixConfigVector, kNoVector);             // no interrupt for configuration changes
+  set_common16(kQueueSelect, queue_index);
+  set_common16(kQueueMsixVector, 0);                      // table entry 0
+  if (common16(kQueueMsixVector) == kNoVector) {          // the device ran out of vectors
+    pci_.write32(device_.address, cap, first);
+    return false;
+  }
+  msix_capability_ = cap;
+  msix_queue_ = queue_index;
+  return true;
+}
+
+void VirtioPciDevice::disable_msix() {
+  if (!msix_capability_) return;
+  if (common_.address) {
+    set_common16(kQueueSelect, msix_queue_);
+    set_common16(kQueueMsixVector, kNoVector);
+  }
+  const uint32_t first = pci_.read32(device_.address, msix_capability_);
+  pci_.write32(device_.address, msix_capability_, first & ~(0xC000u << 16));   // MSI-X off, function unmasked
+  msix_capability_ = 0;
+}
+
 void VirtioPciDevice::notify(uint16_t queue_index) {
   if (queue_index >= 8) return;
   const uint64_t address = notify_.address + uint64_t{queue_notify_offset_[queue_index]} * notify_multiplier_;
@@ -164,6 +209,7 @@ void VirtioPciDevice::write_config8(uint32_t offset, uint8_t value) const {
 }
 
 void VirtioPciDevice::shutdown() {
+  disable_msix();
   if (common_.address) set_common8(kStatus, 0);  // reset: the device stops using our memory
   if (owns_device_) {
     owns_device_ = false;
