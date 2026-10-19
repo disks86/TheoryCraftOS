@@ -129,6 +129,9 @@ class Control {
   virtual void on_mouse_down(const MouseArgs&) {}
   virtual void on_mouse_up(const MouseArgs&) {}
   virtual void on_mouse_wheel(const MouseArgs&) {}
+  // True for a control that does nothing with the wheel itself (a label, a meter, a plain panel): the wheel then goes to its parent, so a scrolling container
+  // scrolls wherever the pointer is over it.
+  virtual bool wheel_to_parent() const { return false; }
   // Return true if the key was used; otherwise it goes to the parent.
   virtual bool on_key(const KeyArgs&) { return false; }
   virtual void on_focus_changed(bool) {}

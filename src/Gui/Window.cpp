@@ -324,9 +324,11 @@ void Window::mouse_wheel(int32_t x, int32_t y, int32_t delta) {
   Point origin;
   Control* target = target_at(x, y, &origin);
   if (!target || !target->effectively_enabled()) return;
+  while (target->wheel_to_parent() && target->parent()) target = target->parent();   // labels, meters and panels hand the wheel up
+  const Point at = target->window_origin();
   MouseArgs a;
-  a.x = x - origin.x;
-  a.y = y - origin.y;
+  a.x = x - at.x;
+  a.y = y - at.y;
   a.wheel = delta;
   target->on_mouse_wheel(a);
   mark_dirty();

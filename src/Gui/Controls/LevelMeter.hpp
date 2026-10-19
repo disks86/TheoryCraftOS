@@ -61,6 +61,7 @@ class LevelMeter : public Control {
   Orientation orientation() const { return orientation_; }
 
   void paint(Painter& painter) override;
+  bool wheel_to_parent() const override { return true; }
 
   static constexpr int32_t kSegment = 6, kGap = 2;  // thickness of a lit block and the dark line between blocks
 

@@ -27,7 +27,9 @@
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DatePicker.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
+#include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/RadioButton.hpp"
+#include "Gui/Controls/ScrollPanel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/Toggle.hpp"
 #include "Gui/Date.hpp"
@@ -281,6 +283,41 @@ static void test_level_meter() {
     w.render();
     CHECK(screen.px(200 + 8, 10 + 120 - 2 - 3) == 0xFF00C000);   // bottom segment lit
     CHECK(screen.px(200 + 8, 10 + 8) == 0xFF400000);             // top segment dark
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_scroll_panel() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    ScrollPanel sp(a);
+    sp.set_bounds({10, 10, 200, 100});
+    w.add(&sp);
+    // Ten rows of 22 pixels do not fit in 100: a scroll bar shows and the rows are narrower by it.
+    Label rows[10] = {Label(a), Label(a), Label(a), Label(a), Label(a), Label(a), Label(a), Label(a), Label(a), Label(a)};
+    for (Label& r : rows) { r.set_size(0, 22); sp.add(&r); }
+    w.layout();
+    CHECK(sp.content_height() == 220 && sp.scroll_bar_visible() && sp.scroll_offset() == 0);
+    CHECK(rows[0].bounds().y == 0 && rows[1].bounds().y == 22 && rows[9].bounds().y == 198 && rows[0].bounds().width == 200 - ScrollBar::kThickness);
+    CHECK(sp.scroll_bar().total() == 220 && sp.scroll_bar().page() == 100);
+    // Scrolling moves the rows; it stops at the end.
+    sp.scroll_to(50);
+    CHECK(sp.scroll_offset() == 50 && rows[0].bounds().y == -50 && rows[3].bounds().y == 16);
+    sp.scroll_to(1000);
+    CHECK(sp.scroll_offset() == 120 && rows[9].bounds().y + 22 == 100);
+    sp.scroll_to(0);
+    // The wheel scrolls from anywhere over the panel, over a label too (which takes no wheel itself).
+    w.mouse_wheel(30, 20, -1);
+    CHECK(sp.scroll_offset() == 66);   // three steps of 22
+    w.mouse_wheel(30, 20, 1);
+    CHECK(sp.scroll_offset() == 0);
+    // Rows that are hidden take no room; when all fit the bar goes away.
+    for (int i = 4; i < 10; ++i) rows[i].set_visible(false);
+    w.layout();
+    CHECK(sp.content_height() == 88 && !sp.scroll_bar_visible() && rows[0].bounds().width == 200);
   }
   CHECK(a.live == 0);
 }
@@ -654,6 +691,7 @@ int main() {
   test_helpers();
   test_slider();
   test_level_meter();
+  test_scroll_panel();
   test_checkbox();
   test_radio();
   test_toggle();

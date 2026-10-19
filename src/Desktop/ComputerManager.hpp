@@ -30,6 +30,7 @@
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
 #include "Gui/Controls/Panel.hpp"
+#include "Gui/Controls/ScrollPanel.hpp"
 #include "Desktop/HardwareInventory.hpp"
 #include "Gui/Controls/TabControl.hpp"
 #include "Gui/Controls/TreeView.hpp"
@@ -98,7 +99,7 @@ class ISystemMonitor {
 class ComputerManager : public gui::Frame {
  public:
   static constexpr uint32_t kMaxThreads = 256;
-  static constexpr uint32_t kMaxCoresShown = 16;
+  static constexpr uint32_t kMaxCoresShown = 256;
 
   explicit ComputerManager(allocators::IAllocator& allocator);
   ~ComputerManager();
@@ -144,6 +145,8 @@ class ComputerManager : public gui::Frame {
   gui::LevelMeter& gpu_temp_meter() { return gpu_temp_row_.meter; }
   gui::Label& gpu_temp_label() { return gpu_temp_row_.value; }
   // The battery row: charge level (meter) and "85% - Charging" (label).
+  // The scrolling area that holds the core rows.
+  gui::ScrollPanel& core_scroll() { return core_scroll_; }
   gui::LevelMeter& battery_meter() { return battery_row_.meter; }
   gui::Label& battery_label() { return battery_row_.value; }
   gui::Label* core_label(uint32_t index);
@@ -201,6 +204,7 @@ class ComputerManager : public gui::Frame {
   gui::MenuItem* copy_row_item_ = nullptr;
   gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr, *hardware_item_ = nullptr;
   gui::TabControl tabs_;
+  gui::ScrollPanel core_scroll_;
   gui::Panel processes_page_, performance_page_, hardware_page_, cpu_row_, memory_row_;
   gui::TreeView tree_;
   gui::ContextMenu display_menu_, adapter_menu_;

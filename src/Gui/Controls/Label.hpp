@@ -29,6 +29,7 @@ class Label : public Control {
   void set_text(StringView text) { UiGuard lock(this); text_.assign(text); invalidate(); }
   StringView text() const { return text_.view(); }
   void paint(Painter& painter) override;
+  bool wheel_to_parent() const override { return true; }
 
  protected:
   Size default_size() const override { return {Painter::text_width(text_.view()) + 8, 22}; }

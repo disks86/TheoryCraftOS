@@ -1499,11 +1499,13 @@ struct FakeMonitor final : desktop::ISystemMonitor {
   bool second_thread = true;
   uint64_t free_bytes = 512ull << 20;
   uint32_t ticks_per_second() const override { return 1000; }
-  uint32_t core_count() const override { return 3; }
+  uint32_t core_total = 3;       // (cores beyond the third are all online and idle)
+  uint32_t core_count() const override { return core_total; }
   bool core(uint32_t i, desktop::TaskCore* out) override {
-    if (i >= 3) return false;
+    if (i >= core_total) return false;
     *out = desktop::TaskCore();
-    out->online = i < 2;
+    out->online = core_total > 3 || i < 2;
+    if (i >= 3) { out->idle_ticks = 1000; return true; }
     out->efficiency = i == 1;
     if (i < 2) { out->busy_ticks = core_busy[i]; out->idle_ticks = core_idle[i]; }
     return true;
@@ -1629,6 +1631,23 @@ static void test_computer_manager() {
     mon.second_thread = false;                  // the worker exits
     tm.update(4000000);
     CHECK(tm.grid().row_count() == 2 && tm.grid().selected_row() == -1 && tm.thread_load_tenths(7) == -1);
+    // A machine with 128 cores: every one gets a row, and the rows scroll in the space the tab has.
+    mon.core_total = 128;
+    tm.update(5000000);
+    tm.tabs().select_page(1);
+    w.layout();
+    w.render();
+    CHECK(tm.core_meter(127) && tm.core_label(127)->text().equals("0%") && tm.core_label(0)->text().equals("0%"));
+    CHECK(tm.core_scroll().content_height() == 128 * 22 && tm.core_scroll().scroll_bar_visible());
+    CHECK(tm.core_scroll().bounds().height < 128 * 22 && tm.core_scroll().bounds().height > 0);
+    tm.core_scroll().scroll_to(1000000);
+    w.layout();
+    CHECK(tm.core_scroll().scroll_offset() == 128 * 22 - static_cast<int32_t>(tm.core_scroll().bounds().height));
+    CHECK(tm.core_meter(127)->bounds().y + static_cast<int32_t>(tm.core_meter(127)->bounds().height) <= static_cast<int32_t>(tm.core_scroll().bounds().height) + 22);
+    tm.core_scroll().scroll_to(0);
+    mon.core_total = 3;
+    tm.update(6000000);
+    tm.tabs().select_page(0);
     w.render();
     mgr.remove_window(&tm);
   }

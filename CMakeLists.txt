@@ -285,6 +285,7 @@ add_executable(BOOTX64
   src/Gui/Controls/ColorPicker.cpp
   src/Gui/Controls/DatePicker.cpp
   src/Gui/Controls/ScrollBar.cpp
+  src/Gui/Controls/ScrollPanel.cpp
   src/Gui/Controls/GridModel.cpp
   src/Gui/Controls/DataGrid.cpp
   src/Gui/Controls/ListView.cpp

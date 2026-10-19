@@ -54,6 +54,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       menu_(allocator),
       grid_menu_(allocator),
       tabs_(allocator),
+      core_scroll_(allocator),
       processes_page_(allocator),
       performance_page_(allocator),
       hardware_page_(allocator),
@@ -140,6 +141,8 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   info_.set_dock(DockStyle::Top);
   info_.set_size(0, 20);
   performance_page_.add(&info_);
+  core_scroll_.set_dock(DockStyle::Fill);   // the cores, one row each, scrolled when there are more than fit
+  performance_page_.add(&core_scroll_);
 
   grid_.add_column("ID", 44, Align::Right);
   grid_.add_column("Thread", 150);
@@ -376,7 +379,7 @@ void ComputerManager::update(uint64_t now_us) {
       row->row.add(&row->value);
       row->row.add(&row->meter);
       row->row.set_visible(false);
-      performance_page_.add(&row->row);
+      core_scroll_.add(&row->row);
       core_rows_.push_back(util::move(row));
     }
     if (i >= core_rows_.count()) continue;

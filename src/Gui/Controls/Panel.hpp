@@ -30,6 +30,7 @@ class Panel : public Control {
   explicit Panel(allocators::IAllocator& allocator) : Control(allocator) {}
   void set_style(PanelStyle style) { UiGuard lock(this); style_ = style; invalidate(); }
   void paint(Painter& painter) override;
+  bool wheel_to_parent() const override { return true; }
 
  private:
   PanelStyle style_ = PanelStyle::Flat;
