@@ -19,7 +19,6 @@
 #pragma once
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Interrupts.hpp"
-#include "Utility/Assert.hpp"
 
 // A mutual-exclusion lock for the cores of this machine. A waiting core spins,
 // calling the CPU's pause() between looks so it does not hammer the cache line
@@ -43,16 +42,16 @@ class SpinLock {
   void lock() {
     const uint64_t flags = kernel::irq_save();
     // Check for recursive locking attempt
-    if (locked_ && owner_core_ == cpu_.core_id()) {
+    if (locked_ && owner_core_ == cpu_.current_core()) {
       // Recursive lock attempt - this would deadlock!
-      util::panic("Recursive spinlock attempt detected");
+      kernel::panic("Recursive spinlock attempt detected", nullptr);
     }
     
     while (__atomic_exchange_n(&locked_, 1, __ATOMIC_ACQUIRE)) {
       // Wait with plain loads until it looks free; only then retry the exchange.
       while (__atomic_load_n(&locked_, __ATOMIC_RELAXED)) cpu_.pause();
     }
-    owner_core_ = cpu_.core_id();
+    owner_core_ = cpu_.current_core();
     saved_flags_ = flags;
   }
   bool try_lock() {
@@ -61,14 +60,16 @@ class SpinLock {
       kernel::irq_restore(flags);
       return false;
     }
-    owner_core_ = cpu_.core_id();
+    owner_core_ = cpu_.current_core();
     saved_flags_ = flags;
     return true;
   }
   void unlock() {
     const uint64_t flags = saved_flags_;
     // Verify that the unlocking core is the same one that locked it
-    util::assertion(owner_core_ == cpu_.core_id(), "Unlocking from wrong core");
+    if (owner_core_ != cpu_.current_core()) {
+      kernel::panic("Unlocking from wrong core", nullptr);
+    }
     __atomic_store_n(&locked_, 0, __ATOMIC_RELEASE);
     kernel::irq_restore(flags);
     owner_core_ = 0xFFFFFFFF;  // Invalid core id
