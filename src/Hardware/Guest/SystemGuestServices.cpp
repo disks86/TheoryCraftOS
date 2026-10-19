@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Guest/SystemGuestServices.hpp"
+#include "Kernel/Delay.hpp"
 #include "Kernel/Thread.hpp"
 
 namespace hardware {
@@ -25,6 +26,11 @@ void SystemGuestServices::initialize() {
   PvPanic::probe();
   PciDeviceInfo d;
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
+    if (d.vendor_id == VmmDev::kPciVendor && d.device_id == VmmDev::kPciDevice && !vmm_) {
+      UniquePointer<VmmDev> vmm = UniquePointer<VmmDev>::make(allocator_, pci_, d, allocator_, st_);
+      if (vmm && vmm->initialize()) vmm_ = util::move(vmm);
+      continue;
+    }
     if (d.vendor_id != kVirtioPciVendor) continue;
     if (!rng_ && (d.device_id == kVirtioRngDevice || d.device_id == kVirtioRngTransitionalDevice)) {
       UniquePointer<VirtioRng> rng = UniquePointer<VirtioRng>::make(allocator_, pci_, d, allocator_, st_);
@@ -40,7 +46,7 @@ void SystemGuestServices::initialize() {
 
 bool SystemGuestServices::start_service() {
   if (service_) return true;
-  if (!balloon_) return false;
+  if (!balloon_ && !vmm_) return false;
   stop_ = false;
   service_ = kernel::spawn(service_main, this, "balloon");
   return service_ != nullptr;
@@ -55,14 +61,26 @@ void SystemGuestServices::stop_service() {
 
 void SystemGuestServices::service_main(void* self) {
   SystemGuestServices* services = static_cast<SystemGuestServices*>(self);
+  uint64_t last_balloon = 0;
   while (!__atomic_load_n(&services->stop_, __ATOMIC_ACQUIRE)) {
-    services->balloon_->service();
-    kernel::sleep_us(500000);
+    const uint64_t now = uptime_us();
+    if (services->balloon_ && now - last_balloon >= 500000) {
+      last_balloon = now;
+      services->balloon_->service();
+    }
+    if (services->vmm_) {
+      services->vmm_->service();
+      uint32_t w, h;
+      if (services->display_handler_ && services->vmm_->take_display_request(&w, &h)) services->display_handler_(services->display_context_, w, h);
+    }
+    kernel::sleep_us(10000);
   }
 }
 
 void SystemGuestServices::shutdown() {
   stop_service();
+  if (vmm_) vmm_->shutdown();
+  vmm_ = UniquePointer<VmmDev>();
   if (balloon_) balloon_->shutdown();
   balloon_ = UniquePointer<VirtioBalloon>();
   if (rng_) rng_->shutdown();

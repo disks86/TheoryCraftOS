@@ -160,6 +160,26 @@ static const char* on_eject(void* context, StringView volume, bool* succeeded) {
 }
 
 // A USB keyboard or mouse was plugged in or pulled out: say so on the debug console, and show the pointer only while there is a mouse.
+// VirtualBox asks for a window size: the nearest resolution the display can show that fits it.
+struct VBoxDisplayContext {
+  hardware::SystemMonitors* monitors;
+  desktop::Desktop* desktop;
+};
+static void on_vbox_display_request(void* context, uint32_t width, uint32_t height) {
+  auto* c = static_cast<VBoxDisplayContext*>(context);
+  const hardware::MonitorSlot* primary = c->monitors->layout().primary();
+  if (!primary) return;
+  hardware::MonitorMode modes[32];
+  const uint32_t count = c->monitors->compatible_resolutions(primary->id, modes, 32);
+  const hardware::MonitorMode* best = nullptr;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (modes[i].width > width || modes[i].height > height) continue;
+    if (!best || uint64_t{modes[i].width} * modes[i].height > uint64_t{best->width} * best->height) best = &modes[i];
+  }
+  if (!best || (best->width == primary->physical_width && best->height == primary->physical_height)) return;
+  if (c->monitors->set_resolution(primary->id, best->width, best->height)) c->desktop->apply_monitor_changes();
+}
+
 struct InputHotplugContext {
   hardware::SystemInput* input;
   desktop::Desktop* desktop;
@@ -635,23 +655,27 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
 #endif
 
+  // Hypervisor guest services. QEMU: the host's entropy pool (virtio-rng), the memory balloon (virtio-balloon), the crash notification (pvpanic).
+  // VirtualBox: its guest device (pointer integration, display size requests, balloon, heartbeat). Before the input devices, which use its pointer.
+  hardware::SystemGuestServices guest(pci, shared_allocator, st);
+  guest.initialize();
+  if (guest.entropy()) Entry(Level::Ok, "Guest").text("virtio-rng: host entropy available");
+  if (guest.balloon()) Entry(Level::Ok, "Guest").text("virtio-balloon: ").dec(guest.balloon()->target_pages() / 256).text(" MiB requested by the host");
+  if (guest.virtualbox()) Entry(Level::Ok, "Guest").text("VirtualBox guest device: pointer integration, display requests, balloon, heartbeat");
+  if (hardware::PvPanic::present()) Entry(Level::Ok, "Guest").text("pvpanic: crashes are reported to the host");
+  if (guest.balloon() || guest.virtualbox()) {
+    // (The service thread follows the host: balloon targets, and VirtualBox's pointer, window size and heartbeat.)
+    if (!guest.start_service()) Entry(Level::Warning, "Guest").text("could not start the guest service; the host's requests are ignored");
+  }
+
   // Input devices: PS/2, USB HID and virtio-input, merged into one keyboard and mouse.
   hardware::SystemInput input(pci, usb, shared_allocator, st);
+  input.set_vmmdev(guest.virtualbox());
   input.initialize();
   Entry(input.keyboards().count() ? Level::Ok : Level::Warning, "Input").dec(input.keyboards().count()).text(" keyboards");
   for (uint32_t i = 0; i < input.keyboards().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.keyboards().at(i)->name());
   Entry(input.mice().count() ? Level::Ok : Level::Warning, "Input").dec(input.mice().count()).text(" mice");
   for (uint32_t i = 0; i < input.mice().count(); ++i) Entry(Level::Info, "Input").text("  ").text(input.mice().at(i)->name());
-
-  // QEMU guest services: the host's entropy pool (virtio-rng), the memory balloon (virtio-balloon), the crash notification (pvpanic).
-  hardware::SystemGuestServices guest(pci, shared_allocator, st);
-  guest.initialize();
-  if (guest.entropy()) Entry(Level::Ok, "Guest").text("virtio-rng: host entropy available");
-  if (guest.balloon()) {
-    Entry(Level::Ok, "Guest").text("virtio-balloon: ").dec(guest.balloon()->target_pages() / 256).text(" MiB requested by the host");
-    if (!guest.start_service()) Entry(Level::Warning, "Guest").text("could not start the balloon service; the host's balloon requests are ignored");
-  }
-  if (hardware::PvPanic::present()) Entry(Level::Ok, "Guest").text("pvpanic: crashes are reported to the host");
 
   // Printers: those on USB are found on the bus (network printers are added by address, by whoever knows it).
   hardware::SystemPrinters printers(shared_allocator);
@@ -794,6 +818,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     SystemPrintService print_service(shared_allocator, printers);
     desktop.set_print_service(&print_service);
     desktop.set_monitors(&monitors);
+    VBoxDisplayContext vbox_display{&monitors, &desktop};
+    guest.set_display_request_handler(on_vbox_display_request, &vbox_display);
     desktop.set_display_changer(&DisplayPipeline::apply, &display_pipeline);
     desktop.set_hardware_inventory(&inventory);
     desktop.set_network_details(&network_details);
@@ -822,6 +848,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       hardware::delay_us(4000);
     }
+    guest.stop_service();  // (VirtualBox's resize requests touch the desktop)
     input.stop_service();  // (its notices touch the desktop)
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user
   } else {

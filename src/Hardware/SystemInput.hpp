@@ -36,6 +36,8 @@
 
 namespace hardware {
 
+class VmmDev;
+
 // Finds every keyboard and mouse the machine has - PS/2, USB HID (behind xHCI
 // root ports) and virtio-input - brings them up and merges them into one
 // keyboard and one mouse. Devices that need memory get it from the allocator.
@@ -60,6 +62,9 @@ class SystemInput {
   // Told when a USB keyboard or mouse was added or removed ("USB HID keyboard: added"), from the thread that polls. May be null.
   using Notifier = void (*)(void* context, StringView text);
   void set_notifier(Notifier notifier, void* context) { notifier_ = notifier; notifier_context_ = context; }
+
+  // The VirtualBox guest device, if there is one: its host-sent pointer position replaces the PS/2 mouse's movement. Call before initialize().
+  void set_vmmdev(VmmDev* vmm) { vmm_ = vmm; }
 
   void initialize();
   // Stops every device and frees what initialize() allocated.
@@ -89,7 +94,9 @@ class SystemInput {
   void notify(const char* name, const char* what);
   static void service_main(void* self);
   void find_virtio();
+  void find_virtualbox();
 
+  VmmDev* vmm_ = nullptr;
   IPciBus& pci_;
   IUsbBus& usb_;
   allocators::IAllocator& allocator_;

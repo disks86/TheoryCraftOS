@@ -33,11 +33,17 @@ class QemuStdVgaGpu final : public FramebufferGpu, public IMonitorSource {
  public:
   static constexpr uint16_t kPciVendor = 0x1234;
   static constexpr uint16_t kPciDevice = 0x1111;
+  // VirtualBox's VBoxVGA (80EE:BEEF) is the same Bochs VBE interface.
+  static constexpr uint16_t kVirtualBoxVendor = 0x80EE;
+  static constexpr uint16_t kVirtualBoxDevice = 0xBEEF;
+  static bool supports(uint16_t vendor, uint16_t device) {
+    return (vendor == kPciVendor && device == kPciDevice) || (vendor == kVirtualBoxVendor && device == kVirtualBoxDevice);
+  }
   static constexpr uint32_t kMaxModes = 24;
 
   explicit QemuStdVgaGpu(const GpuContext& context) : pci_(context.pci), device_(context.device) {}
 
-  const char* name() const override { return "QEMU std VGA"; }
+  const char* name() const override { return device_.vendor_id == kVirtualBoxVendor ? "VirtualBox VGA" : "QEMU std VGA"; }
   bool initialize() override;
   void shutdown() override {}
 

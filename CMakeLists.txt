@@ -77,6 +77,8 @@ add_executable(BOOTX64
   src/Hardware/Bus/Virtio/Virtqueue.cpp
   src/Hardware/Bus/Virtio/VirtioPciDevice.cpp
   src/Hardware/Bus/Virtio/VirtioInputDevice.cpp
+  src/Hardware/VirtualBox/VmmDev.cpp
+  src/Hardware/Mouse/VirtualBox/VBoxMouse.cpp
   src/Hardware/Guest/PvPanic.cpp
   src/Hardware/Guest/VirtioRng.cpp
   src/Hardware/Guest/VirtioBalloon.cpp
@@ -160,6 +162,7 @@ add_executable(BOOTX64
   src/Hardware/Camera/Usb/UvcCamera.cpp
   src/Hardware/NetworkInterface/SystemNetworkInterfaces.cpp
   src/Hardware/NetworkInterface/Virtio/VirtioNetworkInterface.cpp
+  src/Hardware/NetworkInterface/AMD/PcnetNetworkInterface.cpp
   src/Hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
   src/Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
   src/Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp

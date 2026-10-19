@@ -48,7 +48,7 @@ SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllo
   const GpuContext context{st, &pci, d, &allocator};
 
   if (found) {
-    if (d.vendor_id == QemuStdVgaGpu::kPciVendor && d.device_id == QemuStdVgaGpu::kPciDevice)
+    if (QemuStdVgaGpu::supports(d.vendor_id, d.device_id))
       active_ = try_gpu<QemuStdVgaGpu>(storage_, context);
     else if (d.vendor_id == VirtioGpu::kPciVendor && d.device_id == VirtioGpu::kPciDeviceId) {
       active_ = try_gpu<VirtioGpu>(storage_, context);

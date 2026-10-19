@@ -22,6 +22,7 @@
 #include "Hardware/Guest/PvPanic.hpp"
 #include "Hardware/Guest/VirtioBalloon.hpp"
 #include "Hardware/Guest/VirtioRng.hpp"
+#include "Hardware/VirtualBox/VmmDev.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace kernel {
@@ -30,8 +31,9 @@ struct Thread;
 
 namespace hardware {
 
-// What QEMU gives a guest besides disks, network and screen: the host's entropy pool (virtio-rng), the memory
-// balloon (virtio-balloon) and the crash notification (pvpanic). Whichever of them the machine has is brought
+// What a hypervisor gives a guest besides disks, network and screen. QEMU: the host's entropy pool (virtio-rng), the memory
+// balloon (virtio-balloon) and the crash notification (pvpanic). VirtualBox: its guest device (VmmDev: pointer integration, display
+// size requests, balloon, heartbeat). Whichever of them the machine has is brought
 // up by initialize(); the others are simply absent.
 class SystemGuestServices {
  public:
@@ -48,8 +50,14 @@ class SystemGuestServices {
   crypto::IEntropySource* entropy() { return rng_.get(); }
   VirtioBalloon* balloon() { return balloon_.get(); }
   bool pvpanic() const { return PvPanic::present(); }
+  // The VirtualBox guest device, or null elsewhere.
+  VmmDev* virtualbox() { return vmm_.get(); }
 
-  // Follows the host's balloon target in a background thread (only with a balloon device).
+  // Told (from the service thread) when VirtualBox's window is resized and the host asks the guest to follow.
+  using DisplayRequest = void (*)(void* context, uint32_t width, uint32_t height);
+  void set_display_request_handler(DisplayRequest handler, void* context) { display_handler_ = handler; display_context_ = context; }
+
+  // Follows the host in a background thread: the balloon target, and VirtualBox's pointer, display and heartbeat.
   bool start_service();
   void stop_service();
 
@@ -61,6 +69,9 @@ class SystemGuestServices {
   efi::SystemTable* st_;
   UniquePointer<VirtioRng> rng_;
   UniquePointer<VirtioBalloon> balloon_;
+  UniquePointer<VmmDev> vmm_;
+  DisplayRequest display_handler_ = nullptr;
+  void* display_context_ = nullptr;
   kernel::Thread* service_ = nullptr;
   bool stop_ = false;
 };

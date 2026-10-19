@@ -52,7 +52,7 @@ void QemuStdVgaGpu::write_register(uint16_t index, uint16_t value) const {
 }
 
 bool QemuStdVgaGpu::initialize() {
-  if (!pci_ || device_.vendor_id != kPciVendor || device_.device_id != kPciDevice) return false;
+  if (!pci_ || !supports(device_.vendor_id, device_.device_id)) return false;
   if (read_register(kIndexId) < kMinId) return false;
 
   const uint64_t bar0 = pci_->memory_bar(device_.address, 0);

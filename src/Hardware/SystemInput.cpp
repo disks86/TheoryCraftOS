@@ -24,6 +24,7 @@
 #include "Hardware/Keyboard/Usb/UsbHidKeyboard.hpp"
 #include "Hardware/Keyboard/Virtio/VirtioKeyboard.hpp"
 #include "Hardware/Mouse/Usb/UsbHidMouse.hpp"
+#include "Hardware/Mouse/VirtualBox/VBoxMouse.hpp"
 #include "Hardware/Mouse/Virtio/VirtioMouse.hpp"
 
 namespace hardware {
@@ -188,8 +189,19 @@ void SystemInput::find_virtio() {
   }
 }
 
+// With a VirtualBox guest device the PS/2 mouse is wrapped: positions come from the host, buttons from the PS/2 reports.
+void SystemInput::find_virtualbox() {
+  if (!vmm_ || !mice_.at(0)) return;
+  if (mice_.at(0) != &ps2_mouse_) return;
+  if (auto* m = make<VBoxMouse>(*vmm_, ps2_mouse_)) {
+    mice_.remove(&ps2_mouse_);
+    mice_.add(m);
+  }
+}
+
 void SystemInput::initialize() {
   find_ps2();
+  find_virtualbox();
   find_usb();
   find_virtio();
   watcher_.snapshot();   // what was plugged in at start-up has been taken over; later ports are new

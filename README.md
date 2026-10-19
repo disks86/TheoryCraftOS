@@ -423,6 +423,16 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     `balloon` target, in 256 KiB chunks with a kept page at each end so allocator bookkeeping is never ballooned; capped at 1 GiB) and `PvPanic`
     (pvpanic on port 0x505: `kernel::panic` tells the host). The `run` targets add all three. Not covered: the QEMU guest agent (virtio-serial),
     virtio-vsock/fs/9p/console, fw_cfg, vmgenid. Checked by booting under QEMU (balloon inflate/deflate through the monitor); pvpanic's panic path is untested.
+  - **VirtualBox:** `Hardware/VirtualBox/VmmDev` is the guest device (PCI 80EE:CAFE, requests through an I/O port; polled) that the Guest Additions use.
+    It identifies the guest, takes absolute pointer positions (`Mouse/VirtualBox/VBoxMouse` merges them with the emulated PS/2 mouse's buttons; the
+    desktop then needs no mouse capture), passes the host window's size to the display (`SystemGuestServices::set_display_request_handler`; the
+    nearest mode the VGA offers that fits), follows the host's balloon (1 MiB chunks, capped at 1 GiB) and sends the heartbeat. The VBoxVGA adapter is the
+    Bochs VBE interface (`QemuStdVgaGpu` takes 80EE:BEEF), and `NetworkInterface/AMD/PcnetNetworkInterface` drives the default PCnet adapter (tested
+    on QEMU's `pcnet`: DHCP exchange both ways). VirtualBox's e1000, AHCI, NVMe, HD Audio, AC'97, OHCI/xHCI, virtio-* devices were already covered.
+    **Not done:** HGCM (shared folders, shared clipboard, seamless windows, drag and drop), VBoxSVGA/VMSVGA, the LsiLogic/BusLogic SCSI adapters, the host
+    time sync (the host clock is readable with `VmmDev::host_time_ms` but nothing sets the RTC: it is local time here and the zone is unknown).
+    There is no VirtualBox in the test setup and QEMU has no VMMDev: `VmmDev` follows VMMDev.h from memory and has never run, so treat the request
+    layouts (the heartbeat in particular) as unverified.
   - `Hardware/Bus/Ps2/` (`I8042Controller`) and `Hardware/Bus/Virtio/` (modern virtio-PCI transport,
     virtqueues, `VirtioInputDevice`); `Bus/Usb/Hid/` has the report-descriptor parser and interface finder.
   - `Hardware/ImageSignalProcessor/`: `IImageSignalProcessor` (raw Bayer frame -> RGB image, settings, frame
