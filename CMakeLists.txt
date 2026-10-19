@@ -193,6 +193,8 @@ add_executable(BOOTX64
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
   src/Math/FloatMath.cpp
+  src/Math/Vector.hpp
+  src/Math/Matrix.hpp
   src/Hardware/Bus/Pci/LegacyPciBus.cpp
   src/Hardware/Bus/Pcie/EcamPcieBus.cpp
   src/Hardware/Bus/Pci/FirmwareDriverDetach.cpp
