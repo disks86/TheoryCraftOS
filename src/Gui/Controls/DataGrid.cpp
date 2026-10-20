@@ -108,6 +108,26 @@ int32_t DataGrid::add_column(StringView title, int32_t width, Align align) {
   return static_cast<int32_t>(columns_.count()) - 1;
 }
 
+void DataGrid::clear_columns() {
+  UiGuard lock(this);
+  const bool had_selection = selected_ >= 0;
+  columns_.clear();
+  if (model_ == &own_) {
+    own_.clear();
+    own_.set_column_count(0);
+  }
+  order_.clear();
+  sort_column_ = -1;
+  ascending_ = true;
+  selected_ = -1;
+  top_ = 0;
+  scroll_x_ = 0;
+  header_pressed_ = -1;
+  update_scroll_bars();
+  invalidate();
+  if (had_selection) fire(selection_changed_);
+}
+
 void DataGrid::set_column_width(uint32_t column, int32_t width) {
   UiGuard lock(this);
   if (column >= columns_.count()) return;

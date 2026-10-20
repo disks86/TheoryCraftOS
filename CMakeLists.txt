@@ -266,6 +266,7 @@ add_executable(BOOTX64
   src/Desktop/HardwareInventory.cpp
   src/Desktop/Notepad.cpp
   src/Desktop/Spreadsheet.cpp
+  src/Desktop/DatabaseQuery.cpp
   src/Desktop/Paint.cpp
   src/Desktop/MediaPlayer.cpp
   src/Desktop/Graphics3DTest.cpp

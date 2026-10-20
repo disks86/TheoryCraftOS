@@ -40,6 +40,9 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Database/DatabaseManager.hpp"
+#include "Database/TextResultSet.hpp"
+#include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Gui/Controls/SpreadsheetGrid.hpp"
 #include "Desktop/Terminal.hpp"
@@ -2076,7 +2079,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 11);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Terminal, Paint, Media Player, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 12);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Terminal, Paint, Media Player, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -5847,6 +5850,299 @@ static void test_spreadsheet_tabs() {
   CHECK(a.live == 0);
 }
 
+
+// --- Database query application ------------------------------------------------------------------------------
+
+// A database that answers a few statements, and a driver for it: enough to see what the window does with connections, answers and errors.
+struct FakeDbConnection final : database::IConnection {
+  explicit FakeDbConnection(TestAllocator& a) : alloc(a), error(a) {}
+  TestAllocator& alloc;
+  database::DbError error;
+  bool open = true, encrypted_flag = false;
+  std::vector<std::string> log;
+  const char* driver_name() const override { return "fake"; }
+  bool is_open() const override { return open; }
+  StringView server_version() const override { return "fake-1.0"; }
+  bool encrypted() const override { return encrypted_flag; }
+  using IConnection::execute;
+  database::DbStatus execute(StringView sql, ArrayView<const database::DbParam>, UniquePointer<database::IResultSet>* result) override {
+    log.emplace_back(sql.data(), sql.size());
+    if (result) result->reset();
+    error.clear();
+    if (!open) {
+      error.set(database::DbStatus::Closed, "the connection is closed");
+      return database::DbStatus::Closed;
+    }
+    if (sql.equals("SELECT id, name FROM t")) {
+      UniquePointer<database::TextResultSet> rs = UniquePointer<database::TextResultSet>::make(alloc, alloc);
+      rs->add_column("id", database::DbType::Integer);
+      rs->add_column("name", database::DbType::Text);
+      rs->begin_row(); rs->add_cell("1"); rs->add_cell("alpha");
+      rs->begin_row(); rs->add_cell("2"); rs->add_null();
+      rs->begin_row(); rs->add_cell("3"); rs->add_cell("say \"hi\", ok");
+      rs->set_command("SELECT 3", 3);
+      if (result) *result = UniquePointer<database::IResultSet>(util::move(rs));
+      return database::DbStatus::Ok;
+    }
+    if (sql.equals("die")) {
+      open = false;
+      error.set(database::DbStatus::ConnectionLost, "the server closed the connection");
+      return database::DbStatus::ConnectionLost;
+    }
+    if (sql.equals("boom")) {
+      error.set(database::DbStatus::Server, "syntax error at or near \"boom\"");
+      error.sqlstate.assign("42601");
+      error.detail.assign("somewhere");
+      return database::DbStatus::Server;
+    }
+    UniquePointer<database::TextResultSet> rs = UniquePointer<database::TextResultSet>::make(alloc, alloc);
+    rs->set_command("UPDATE 4", 4);
+    if (result) *result = UniquePointer<database::IResultSet>(util::move(rs));
+    return database::DbStatus::Ok;
+  }
+  database::DbStatus begin() override { return execute("BEGIN"); }
+  database::DbStatus commit() override { return execute("COMMIT"); }
+  database::DbStatus rollback() override { return execute("ROLLBACK"); }
+  bool in_transaction() const override { return false; }
+  database::DbStatus ping() override { return database::DbStatus::Ok; }
+  const database::DbError& last_error() const override { return error; }
+  void close() override { open = false; }
+};
+
+struct FakeDbDriver final : database::IDatabaseDriver {
+  explicit FakeDbDriver(TestAllocator& a) : alloc(a) {}
+  TestAllocator& alloc;
+  std::string last_password, last_host, last_database;
+  int connects = 0;
+  FakeDbConnection* last = nullptr;
+  const char* name() const override { return "postgres"; }
+  bool handles_scheme(StringView scheme) const override { return scheme.equals("postgres"); }
+  uint16_t default_port() const override { return 5432; }
+  database::DbStatus connect(const database::ConnectionOptions& o, database::IDatabaseTransport&, UniquePointer<database::IConnection>* c, database::DbError* e) override {
+    last_password.assign(o.password.c_str());
+    last_host.assign(o.host.c_str());
+    last_database.assign(o.database.c_str());
+    if (o.user.view().equals("bad")) {
+      e->set(database::DbStatus::AuthFailed, "password authentication failed");
+      e->sqlstate.assign("28P01");
+      return database::DbStatus::AuthFailed;
+    }
+    ++connects;
+    UniquePointer<FakeDbConnection> fresh = UniquePointer<FakeDbConnection>::make(alloc, alloc);
+    last = fresh.get();
+    *c = UniquePointer<database::IConnection>(util::move(fresh));
+    return database::DbStatus::Ok;
+  }
+};
+
+struct NoTransport final : database::IDatabaseTransport {
+  database::DbStatus open(const database::Endpoint&, const database::TlsProbe*, UniquePointer<stream::IStream>*, bool*, database::DbError*) override {
+    return database::DbStatus::ConnectFailed;
+  }
+};
+
+static void test_database_query() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/in.sql", "SELECT id, name FROM t");
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    kernel::Clipboard clipboard(a);
+    w.set_clipboard(&clipboard);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    gui::NoticeDialog notices(a);
+    uint64_t clock = 0;
+    desktop::DatabaseQuery q(a);
+    q.set_notices(&notices);
+    q.set_clock(&clock);
+    CHECK(mgr.add_window(&q));
+    w.layout();
+    CHECK(q.title().equals("Database - Untitled") && q.connect_button().text().equals("Connect") && !q.connected());
+
+    // Nothing to connect to.
+    q.url_box().set_text("postgres://app@db.test/shop");
+    CHECK(!q.connect() && notices.showing() && notices.message().find(StringView("No databases")) != StringView::npos);
+    notices.close();
+    CHECK(!q.run() && notices.showing() && notices.message().equals("Connect to a database first."));
+    notices.close();
+
+    NoTransport transport;
+    database::DatabaseManager databases(a, &transport);
+    FakeDbDriver driver(a);
+    databases.add_driver(&driver);
+    q.set_databases(&databases);
+    q.set_file_system(&fs);
+
+    // A bad URL, a refused login.
+    q.url_box().set_text("db.test/shop");
+    CHECK(!q.connect() && notices.showing() && notices.message().first(21).equals("The URL is not valid:"));
+    notices.close();
+    q.url_box().set_text("postgres://bad@db.test/shop");
+    CHECK(!q.connect() && !q.connected() && notices.showing() && notices.message().equals("Cannot connect: password authentication failed (28P01)"));
+    notices.close();
+
+    // Connecting; the password box fills in the password the URL lacks.
+    q.url_box().set_text("postgres://app@db.test/shop");
+    q.password_box().set_text("pw");
+    CHECK(q.connect() && q.connected() && driver.last_password == "pw" && driver.last_host == "db.test" && driver.last_database == "shop");
+    CHECK(q.connect_button().text().equals("Disconnect") && q.title().equals("Database - Untitled - db.test/shop") && q.status_label().text().equals("Connected to db.test/shop (server fake-1.0)"));
+    CHECK(q.url_box().text().equals("postgres://app@db.test/shop"));
+
+    // A statement with rows: the table, NULL as NULL, the status line.
+    q.editor().set_text("SELECT id, name FROM t");
+    clock = 1000000;
+    CHECK(q.run() && q.result() && q.result()->row_count() == 3 && q.grid().column_count() == 2 && q.grid().column_title(1).equals("name") && q.grid().row_count() == 3);
+    CHECK(q.status_label().text().equals("SELECT 3") && q.info_label().text().equals("3 rows, 0 ms") && driver.last->log.back() == "SELECT id, name FROM t");
+    q.grid().select_row(1);
+    CHECK(q.grid().copy_selected_row());
+    String copied(a);
+    CHECK(clipboard.get_text(&copied) && copied.view().equals("2\tNULL"));
+    CHECK(q.copy_results() && clipboard.get_text(&copied) && copied.view().equals("id\tname\n1\talpha\n2\t\n3\tsay \"hi\", ok\n"));
+
+    // The selection runs alone; a statement without rows.
+    q.editor().set_text("  SELECT id, name FROM t;\nUPDATE t SET x = 1\n");
+    q.editor().set_caret(2);
+    q.editor().set_caret(24, true);
+    CHECK(q.editor().has_selection() && q.run() && driver.last->log.back() == "SELECT id, name FROM t;" == false);
+    q.editor().set_caret(0);
+    CHECK(q.run() && q.result() && q.result()->column_count() == 0 && q.grid().column_count() == 0 && q.info_label().text().equals("4 rows affected, 0 ms") && q.status_label().text().equals("UPDATE 4"));
+    CHECK(driver.last->log.back().find("UPDATE t SET x = 1") != std::string::npos);
+    q.editor().set_text("   \n ");
+    CHECK(!q.run() && q.status_label().text().first(14).equals("Nothing to run"));
+
+    // F5 and Ctrl+R run it too (from the editor).
+    q.editor().set_text("SELECT id, name FROM t");
+    w.set_focus(&q.editor());
+    const size_t before = driver.last->log.size();
+    press(w, key::kF1 + 4);
+    CHECK(driver.last->log.size() == before + 1 && q.result() && q.result()->row_count() == 3);
+    press(w, key::kA + 17, modifier::kLeftControl);   // Ctrl+R
+    CHECK(driver.last->log.size() == before + 2);
+
+    // The server's error: shown with its code and detail; the table is cleared and the session goes on.
+    q.editor().set_text("boom");
+    CHECK(!q.run() && notices.showing() && notices.message().equals("syntax error at or near \"boom\" (42601): somewhere") && !q.result() && q.grid().column_count() == 0 && q.connected());
+    notices.close();
+
+    // Export and SQL files.
+    q.editor().set_text("SELECT id, name FROM t");
+    CHECK(q.run() && q.export_csv("out.csv"));
+    UniquePointer<filesystem::IFile> f;
+    CHECK(fs.open_file("/out.csv", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() == 38);
+    char got[64] = {};
+    uint64_t n = 0;
+    CHECK(f->read(0, ByteView(reinterpret_cast<uint8_t*>(got), 38), &n) == filesystem::Status::Ok && !strcmp(got, "id,name\n1,alpha\n2,\n3,\"say \"\"hi\"\", ok\"\n"));
+    f.reset();
+    CHECK(q.status_label().text().equals("Exported 3 rows to /out.csv"));
+    w.set_focus(&q.editor());
+    type_char(w, ' ');   // typing marks the text as changed
+    CHECK(q.editor().modified() && q.title().equals("Database - Untitled * - db.test/shop"));
+    CHECK(q.save_file("/q.sql") && q.path().equals("/q.sql") && q.title().equals("Database - q.sql - db.test/shop") && !q.editor().modified());
+    CHECK(q.new_document() && q.editor().text().empty() && q.path().empty());
+    CHECK(q.open_file("in.sql") && q.editor().text().equals("SELECT id, name FROM t") && q.path().equals("/in.sql"));
+    type_char(w, 'x');
+    CHECK(!q.open_file("/q.sql") && notices.showing());   // unsaved changes: a warning, and nothing is thrown away the first time
+    notices.close();
+    CHECK(q.open_file("/q.sql") && q.path().equals("/q.sql") && !q.editor().modified());
+    CHECK(desktop::DatabaseQuery::is_sql_name("/a/b.sql") && desktop::DatabaseQuery::is_sql_name("X.SQL") && !desktop::DatabaseQuery::is_sql_name("a.txt") && !desktop::DatabaseQuery::is_sql_name(".sql"));
+
+    // A connection that dies: the window notices.
+    q.editor().set_text("die");
+    CHECK(!q.run() && !q.connected() && q.connect_button().text().equals("Connect") && notices.showing());
+    notices.close();
+    CHECK(!q.run() && notices.showing() && notices.message().equals("Connect to a database first."));
+    notices.close();
+
+    // Disconnecting with the button; closing the window ends the session.
+    CHECK(q.connect() && driver.connects == 2);
+    q.connect_button().click();
+    CHECK(!q.connected() && q.status_label().text().equals("Disconnected.") && q.connect_button().text().equals("Connect"));
+    CHECK(q.connect() && q.connected());
+    FakeDbConnection* session = driver.last;
+    (void)session;
+    q.close();
+    CHECK(!q.connected());
+    mgr.remove_window(&q);
+    w.set_clipboard(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
+// A query window is a tab like the others: "+" opens another, tabs move between windows, and .sql files open in it.
+static void test_database_query_tabs() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/a.sql", "SELECT 1");
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    NoTransport transport;
+    database::DatabaseManager databases(a, &transport);
+    d.set_databases(&databases);
+    Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+
+    bool in_menu = false;
+    for (uint32_t i = 0; i < d.start_button().menu().item_count(); ++i) in_menu = in_menu || d.start_button().menu().item(i)->text.view().equals("Database");
+    CHECK(in_menu);
+
+    desktop::DatabaseQuery* q1 = d.open_database_query();
+    auto* h1 = static_cast<gui::TabFrame*>(q1->host());
+    CHECK(q1 == &d.database_query() && h1 && q1->embedded() && h1->tab_count() == 1 && d.database_query_count() == 1 && q1->app_kind() == desktop::Desktop::kAppDatabase);
+    put(h1, {20, 20, 600, 420});
+    w.layout();
+    CHECK(q1->connect() == false);   // (no driver for this URL: the dialog says so)
+    if (d.notice_dialog().showing()) d.notice_dialog().ok_button().click();
+
+    // "+": another query tab, not another kind of program.
+    const Rect2D plus = h1->new_tab_button_rect();
+    const Point po = h1->window_origin();
+    click(w, po.x + plus.x + 8, po.y + plus.y + 6);
+    CHECK(h1->tab_count() == 2 && d.database_query_count() == 2);
+    auto* q2 = static_cast<desktop::DatabaseQuery*>(h1->tab_at(1));
+    CHECK(q2 != q1 && q2->app_kind() == desktop::Desktop::kAppDatabase && h1->selected() == q2 && q2->visible() && !q1->visible());
+    q2->editor().set_text("SELECT 2");
+    CHECK(q1->editor().text().empty());
+
+    // Dragged out, it becomes a window of its own and keeps its text.
+    Point tp = tab_point(h1, 1);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    w.mouse_move(tp.x + 100, tp.y + 300);
+    CHECK(w.dragging());
+    w.mouse_button(tp.x + 100, tp.y + 300, MouseButton::Left, false);
+    CHECK(m.window_count() == 2 && h1->tab_count() == 1 && q2->host() && q2->host() != h1 && q2->editor().text().equals("SELECT 2"));
+
+    // Dropped on the strip of a text editor's window it joins it.
+    desktop::Notepad* editor = d.open_text_editor();
+    auto* h3 = static_cast<gui::TabFrame*>(editor->host());
+    put(h3, {20, 450, 500, 230});
+    put(q2, {620, 20, 360, 400});
+    w.layout();
+    tp = tab_point(q2->host(), 0);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    const Point strip = tab_point(h3, 0, 4);
+    w.mouse_move(strip.x + 30, strip.y);
+    w.mouse_move(strip.x, strip.y);
+    CHECK(w.dragging());
+    w.mouse_button(strip.x, strip.y, MouseButton::Left, false);
+    CHECK(h3->tab_count() == 2 && h3->tab_at(0) == q2 && q2->host() == h3 && q2->editor().text().equals("SELECT 2"));
+
+    // A .sql file opens in a query window: an empty one that is open, else a new one.
+    CHECK(d.open_path("/a.sql"));
+    bool found = q1->path().equals("/a.sql") && q1->editor().text().equals("SELECT 1");
+    CHECK(found && d.text_editor_count() == 1 && d.database_query_count() == 2);   // (q1 was empty, so it took the file)
+    d.step(1000000);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -5882,6 +6178,8 @@ int main() {
   test_spreadsheet_grid();
   test_spreadsheet_app();
   test_spreadsheet_tabs();
+  test_database_query();
+  test_database_query_tabs();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

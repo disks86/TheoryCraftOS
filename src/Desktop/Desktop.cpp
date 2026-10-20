@@ -49,6 +49,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       notepad_(allocator),
       paint_(allocator),
       spreadsheet_(allocator),
+      database_query_(allocator),
       terminal_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
@@ -61,6 +62,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       extra_notepads_(allocator),
       extra_paints_(allocator),
       extra_sheets_(allocator),
+      extra_queries_(allocator),
       extra_terminals_(allocator),
       hosts_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
@@ -78,6 +80,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Computer Manager", {&Desktop::on_computer_manager, this});
   start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});
   start_.menu().add_item("Spreadsheet", {&Desktop::on_spreadsheet, this});
+  start_.menu().add_item("Database", {&Desktop::on_database_query, this});
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
@@ -124,6 +127,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   setup_notepad(notepad_);
   setup_paint(paint_);
   setup_spreadsheet(spreadsheet_);
+  setup_database_query(database_query_);
   setup_terminal(terminal_);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
@@ -186,11 +190,13 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
     notepad_.set_file_system(fs);
     paint_.set_file_system(fs);
     spreadsheet_.set_file_system(fs);
+    database_query_.set_file_system(fs);
     terminal_.set_file_system(fs);
     for (auto& e : extra_explorers_) e->set_file_system(fs);
     for (auto& n : extra_notepads_) n->set_file_system(fs);
     for (auto& p : extra_paints_) p->set_file_system(fs);
     for (auto& s : extra_sheets_) s->set_file_system(fs);
+    for (auto& q : extra_queries_) q->set_file_system(fs);
     for (auto& t : extra_terminals_) t->set_file_system(fs);
   });
   media_player_.set_file_system(fs);
@@ -220,6 +226,23 @@ void Desktop::setup_spreadsheet(Spreadsheet& sheet) {
   sheet.set_notices(&notice_dialog_);
   sheet.set_file_dialog(&file_dialog_);
   sheet.set_file_system(fs_);
+}
+
+void Desktop::setup_database_query(DatabaseQuery& query) {
+  query.set_app_kind(kAppDatabase);
+  query.set_notices(&notice_dialog_);
+  query.set_file_dialog(&file_dialog_);
+  query.set_file_system(fs_);
+  query.set_databases(databases_);
+  query.set_clock(&now_us_);
+}
+
+void Desktop::set_databases(database::DatabaseManager* databases) {
+  window_.locked([&] {
+    databases_ = databases;
+    database_query_.set_databases(databases);
+    for (auto& q : extra_queries_) q->set_databases(databases);
+  });
 }
 
 void Desktop::setup_terminal(Terminal& terminal) {
@@ -309,6 +332,7 @@ void Desktop::on_new_tab(void* self, Control& sender) {
     case kAppEditor: d->open_text_editor(host); break;
     case kAppPaint: d->open_paint(host); break;
     case kAppSheet: d->open_spreadsheet(host); break;
+    case kAppDatabase: d->open_database_query(host); break;
     case kAppTerminal: d->open_terminal(host); break;
     case kAppMedia: d->open_media_player(host); break;
     default: d->open_explorer(host); break;
@@ -347,6 +371,7 @@ void Desktop::reap_closed() {
     sweep(extra_notepads_);
     sweep(extra_paints_);
     sweep(extra_sheets_);
+    sweep(extra_queries_);
     sweep(extra_terminals_);
     sweep(hosts_);
   });
@@ -403,6 +428,32 @@ void Desktop::on_new_terminal(void* self, Control&) { static_cast<Desktop*>(self
 Paint* Desktop::open_paint(TabFrame* into) { return open_instance(paint_, extra_paints_, &Desktop::setup_paint, into); }
 
 Spreadsheet* Desktop::open_spreadsheet(TabFrame* into) { return open_instance(spreadsheet_, extra_sheets_, &Desktop::setup_spreadsheet, into); }
+
+DatabaseQuery* Desktop::open_database_query(TabFrame* into) { return open_instance(database_query_, extra_queries_, &Desktop::setup_database_query, into); }
+
+uint32_t Desktop::database_query_count() const {
+  uint32_t n = database_query_.manager() ? 1 : 0;
+  for (const auto& e : extra_queries_) n += e->manager() ? 1 : 0;
+  return n;
+}
+
+// The query window to open a SQL file in: the one that already shows it, an open empty one, or a new one.
+DatabaseQuery* Desktop::database_query_for(StringView path) {
+  DatabaseQuery* found = nullptr;
+  window_.locked([&] {
+    DatabaseQuery* blank = nullptr;
+    auto look = [&](DatabaseQuery& q) {
+      if (!q.manager()) return;
+      if (q.path().equals(path)) found = &q;
+      else if (!blank && q.path().empty() && !q.editor().modified() && q.editor().text().empty()) blank = &q;
+    };
+    look(database_query_);
+    for (auto& e : extra_queries_) look(*e);
+    if (!found) found = blank ? blank : open_database_query();
+    if (found) found->activate();
+  });
+  return found;
+}
 
 uint32_t Desktop::spreadsheet_count() const {
   uint32_t n = spreadsheet_.manager() ? 1 : 0;
@@ -620,6 +671,7 @@ void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self
 void Desktop::on_graphics_test(void* self, Control&) { static_cast<Desktop*>(self)->open_graphics_test(); }
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
 void Desktop::on_spreadsheet(void* self, Control&) { static_cast<Desktop*>(self)->open_spreadsheet(); }
+void Desktop::on_database_query(void* self, Control&) { static_cast<Desktop*>(self)->open_database_query(); }
 void Desktop::on_explorer_file(void* self, Control& sender) {
   auto* d = static_cast<Desktop*>(self);
   d->open_file(static_cast<FileExplorer&>(sender).opened_file());   // (only explorers fire this)
@@ -628,6 +680,10 @@ void Desktop::on_explorer_file(void* self, Control& sender) {
 void Desktop::open_file(StringView file) {
   if (Paint::is_picture_name(file)) {  // pictures open in Paint, everything else as text
     if (Paint* paint = paint_for(file)) paint->open_file(file);
+    return;
+  }
+  if (DatabaseQuery::is_sql_name(file)) {   // SQL files open in the database query window
+    if (DatabaseQuery* query = database_query_for(file)) query->open_file(file);
     return;
   }
   if (Spreadsheet::is_sheet_name(file)) {   // CSV files open in the spreadsheet

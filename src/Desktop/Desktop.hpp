@@ -36,6 +36,7 @@
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Database/DatabaseManager.hpp"
+#include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/Terminal.hpp"
@@ -74,7 +75,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -127,8 +128,12 @@ class Desktop {
   Paint* open_paint(gui::TabFrame* into = nullptr);
   Notepad& notepad() { return notepad_; }
   // The databases programs may connect to (nullptr: none). It must outlive the desktop.
-  void set_databases(database::DatabaseManager* databases) { databases_ = databases; }
+  void set_databases(database::DatabaseManager* databases);
   database::DatabaseManager* databases() const { return databases_; }
+  // Opens a database query window: the first one is database_query() (when that is closed), further ones are made as needed and go away when closed.
+  DatabaseQuery* open_database_query(gui::TabFrame* into = nullptr);
+  DatabaseQuery& database_query() { return database_query_; }
+  uint32_t database_query_count() const;
   // Opens a spreadsheet window: the first one is spreadsheet() (when that is closed), further ones are made as needed and go away when closed.
   Spreadsheet* open_spreadsheet(gui::TabFrame* into = nullptr);
   Spreadsheet& spreadsheet() { return spreadsheet_; }
@@ -215,6 +220,7 @@ class Desktop {
   static void on_graphics_test(void* self, gui::Control&);
   static void on_text_editor(void* self, gui::Control&);
   static void on_spreadsheet(void* self, gui::Control&);
+  static void on_database_query(void* self, gui::Control&);
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
@@ -245,6 +251,7 @@ class Desktop {
   void setup_explorer(FileExplorer& explorer);
   void setup_notepad(Notepad& notepad);
   void setup_spreadsheet(Spreadsheet& sheet);
+  void setup_database_query(DatabaseQuery& query);
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
   void reap_closed();
@@ -252,6 +259,7 @@ class Desktop {
   Notepad* editor_for(StringView path);
   Paint* paint_for(StringView path);
   Spreadsheet* spreadsheet_for(StringView path);
+  DatabaseQuery* database_query_for(StringView path);
 
   allocators::IAllocator& allocator_;
   gui::Theme theme_;
@@ -277,6 +285,7 @@ class Desktop {
   Notepad notepad_;
   Paint paint_;
   Spreadsheet spreadsheet_;
+  DatabaseQuery database_query_;
   Terminal terminal_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
@@ -291,6 +300,7 @@ class Desktop {
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;
   List<UniquePointer<Spreadsheet>> extra_sheets_;
+  List<UniquePointer<DatabaseQuery>> extra_queries_;
   List<UniquePointer<Terminal>> extra_terminals_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;

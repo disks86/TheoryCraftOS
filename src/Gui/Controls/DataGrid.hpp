@@ -41,6 +41,9 @@ class DataGrid : public Control {
 
   // --- Columns. Returns the new column's index, or -1 (not allowed once the grid's own table has rows).
   int32_t add_column(StringView title, int32_t width, Align align = Align::Left);
+  // Removes every column (and, with the grid's own table, its rows), so that a grid can show a table of another shape. The sort, the selection and the
+  // scrolling start again. With a model of your own, call set_model() / model_changed() afterwards.
+  void clear_columns();
   uint32_t column_count() const { return static_cast<uint32_t>(columns_.count()); }
   StringView column_title(uint32_t column) const { return column < columns_.count() ? columns_[column].title.view() : StringView(); }
   int32_t column_width(uint32_t column) const { return column < columns_.count() ? columns_[column].width : 0; }

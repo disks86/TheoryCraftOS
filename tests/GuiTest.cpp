@@ -1227,6 +1227,7 @@ static void test_desktop() {
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Computer Manager
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Text Editor
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Spreadsheet
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Database
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Terminal
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Paint
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Media Player
