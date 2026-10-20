@@ -66,6 +66,7 @@
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
+#include "Database/SystemDatabases.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
@@ -818,6 +819,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         : guest.entropy() ? *guest.entropy() : static_cast<crypto::IEntropySource&>(timing_entropy);
     crypto::DrbgRandom smb_random(smb_entropy);
     network::StackSetNetwork smb_network(stacks);
+    // Databases (PostgreSQL) for the programs that want them, reached over the same interfaces. TLS needs a trust store, which this system does not ship:
+    // connections are plain until one is given (SystemDatabases::transport().set_tls()).
+    database::SystemDatabases databases(shared_allocator, smb_network, &smb_random);
+    desktop.set_databases(&databases.manager());
+    Entry(Level::Info, "Database").dec(databases.manager().driver_count()).text(" driver(s): ").text(databases.manager().driver(0)->name());
     network::SmbEnvironment smb_environment;
     smb_environment.random = &smb_random;
     smb_environment.filetime = smb_filetime;

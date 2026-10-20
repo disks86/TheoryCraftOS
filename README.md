@@ -29,6 +29,17 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   pointer to a base class safely owns a derived object even without a virtual destructor), `Optional<T>`,
   `Variant<Ts...>` (visit, get, emplace) and the small `Move.hpp` helpers. Header-only; no weak pointers.
   `src/UtilityDemo` checks them at boot, with a shared pointer copied concurrently on every core.
+- `src/Database/`: database access that does not depend on the database. Programs get an `IConnection` from the `DatabaseManager` by URL
+  (`postgres://user:password@host:5432/database?sslmode=prefer`), run SQL with `execute(sql, params, &result)` (portable `?` markers that the driver turns
+  into its own, values sent apart from the SQL text), read the answer from an `IResultSet` (typed accessors over the text the server sent) and use
+  `begin()` / `commit()` / `rollback()`. Every call returns a `DbStatus` and the connection keeps a `DbError` (with the SQLSTATE). A driver
+  (`IDatabaseDriver`) is chosen by the URL's scheme and reaches the server through an `IDatabaseTransport`, so tests can supply their own stream;
+  `Net/NetworkTransport` is the one over the OS's stacks (`SystemDatabases` puts the drivers, the transport and the manager together; the desktop
+  hands the manager to programs: `Desktop::databases()`). `Postgres/` speaks protocol 3.0: clear text, MD5 and SCRAM-SHA-256 logins (checked against
+  the RFC 7677 example), simple and extended queries, TLS through the SSLRequest where the system has a TLS configuration (it has no trust store of its
+  own yet, so connections are plain until one is given). Not supported: COPY, prepared statement reuse, binary result formats, SCRAM channel binding,
+  Kerberos / GSSAPI. Tested without a server by `tests/DatabaseTest.cpp` (a pretend server written from the protocol) and over two real stacks by
+  `tests/DatabaseNetworkTest.cpp`; not yet against a real PostgreSQL.
 - `src/Network/`: an IPv4 stack over any `INetworkInterface`, single-threaded and polled (`INetworkStack::poll()`).
   `NetworkStack` does Ethernet framing, ARP (cache + queue of packets awaiting resolution), IPv4 and ICMP echo;
   it owns a `UdpManager`/`UdpSocket` (`IUdpSocket`), a `TcpManager`/`TcpSocket` (`ITcpSocket`: RFC 793 state

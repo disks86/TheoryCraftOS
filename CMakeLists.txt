@@ -208,6 +208,16 @@ add_executable(BOOTX64
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
   src/Math/FloatMath.cpp
   src/Spreadsheet/Sheet.cpp
+  src/Database/DatabaseTypes.cpp
+  src/Database/NumberText.cpp
+  src/Database/TextResultSet.cpp
+  src/Database/ConnectionOptions.cpp
+  src/Database/DatabaseManager.cpp
+  src/Database/SqlText.cpp
+  src/Database/Net/NetworkTransport.cpp
+  src/Database/Postgres/PostgresAuth.cpp
+  src/Database/Postgres/PostgresConnection.cpp
+  src/Database/Postgres/PostgresDriver.cpp
   src/Math/Vector.hpp
   src/Math/Matrix.hpp
   src/Hardware/Bus/Pci/LegacyPciBus.cpp

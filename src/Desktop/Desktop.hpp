@@ -35,6 +35,7 @@
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Database/DatabaseManager.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/Terminal.hpp"
@@ -125,6 +126,9 @@ class Desktop {
   // Returns the window (nullptr if memory ran out).
   Paint* open_paint(gui::TabFrame* into = nullptr);
   Notepad& notepad() { return notepad_; }
+  // The databases programs may connect to (nullptr: none). It must outlive the desktop.
+  void set_databases(database::DatabaseManager* databases) { databases_ = databases; }
+  database::DatabaseManager* databases() const { return databases_; }
   // Opens a spreadsheet window: the first one is spreadsheet() (when that is closed), further ones are made as needed and go away when closed.
   Spreadsheet* open_spreadsheet(gui::TabFrame* into = nullptr);
   Spreadsheet& spreadsheet() { return spreadsheet_; }
@@ -282,6 +286,7 @@ class Desktop {
   gui::Frame about_;
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;
+  database::DatabaseManager* databases_ = nullptr;
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;
