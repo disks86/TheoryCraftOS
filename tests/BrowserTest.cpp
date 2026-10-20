@@ -17,7 +17,7 @@
  */
 
 // Host-side tests for the browser's model: reading HTML into runs (text, white space, entities, headings, lists, links, tables, preformatted text, things
-// that are skipped, damaged markup), fitting the runs into lines, and the address helpers.
+// that are skipped, damaged markup), CSS (colours, selectors, the cascade, boxes), fitting the runs into lines, and the address helpers.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -156,6 +156,163 @@ static void test_title_and_limits() {
   CHECK(a.live == 0);
 }
 
+
+// The run whose text is `text` in a page, or nullptr.
+static const Run* find_run(const HtmlDocument& doc, const char* text) {
+  for (uint64_t i = 0; i < doc.run_count(); ++i)
+    if (doc.run_text(i).equals(text)) return &doc.run(i);
+  return nullptr;
+}
+
+static uint32_t color_of(const char* html, const char* text) {
+  TestAllocator a;
+  HtmlDocument doc(a);
+  doc.parse_html(html);
+  const Run* r = find_run(doc, text);
+  return r ? r->color : 0xDEAD;
+}
+
+static void test_colors() {
+  uint32_t c;
+  CHECK(parse_css_color("red", &c) && c == 0xFFFF0000);
+  CHECK(parse_css_color("  Navy ", &c) && c == 0xFF000080);
+  CHECK(parse_css_color("#f80", &c) && c == 0xFFFF8800);
+  CHECK(parse_css_color("#336699", &c) && c == 0xFF336699);
+  CHECK(parse_css_color("#336699ff", &c) && c == 0xFF336699);
+  CHECK(parse_css_color("#33669900", &c) && c == 0);
+  CHECK(parse_css_color("rgb(10, 20, 30)", &c) && c == 0xFF0A141E);
+  CHECK(parse_css_color("rgb(10 20 30 / 50%)", &c) && c == 0xFF0A141E);
+  CHECK(parse_css_color("rgba(10,20,30,0)", &c) && c == 0);
+  CHECK(parse_css_color("rgb(100%, 0%, 0%)", &c) && c == 0xFFFF0000);
+  CHECK(parse_css_color("hsl(120, 100%, 50%)", &c) && c == 0xFF00FF00);
+  CHECK(parse_css_color("hsl(0, 0%, 100%)", &c) && c == 0xFFFFFFFF);
+  CHECK(parse_css_color("transparent", &c) && c == 0);
+  CHECK(!parse_css_color("notacolor", &c) && !parse_css_color("#12", &c) && !parse_css_color("", &c) && !parse_css_color("rgb(1,2)", &c) && !parse_css_color("inherit", &c));
+}
+
+static void test_css_cascade() {
+  CHECK(color_of("<style>p{color:red}</style><p>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<p style='color: #00f'>x</p>", "x") == 0xFF0000FF);
+  CHECK(color_of("<style>p{color:red} .a{color:blue}</style><p class=a>x</p>", "x") == 0xFF0000FF);
+  CHECK(color_of("<style>.a{color:blue} p{color:red}</style><p class=a>x</p>", "x") == 0xFF0000FF);   // (specificity, not order)
+  CHECK(color_of("<style>p{color:red} p{color:blue}</style><p>x</p>", "x") == 0xFF0000FF);          // (order)
+  CHECK(color_of("<style>#i{color:lime} .a{color:blue}</style><p class=a id=i>x</p>", "x") == 0xFF00FF00);
+  CHECK(color_of("<style>p{color:red}</style><p style='color:blue'>x</p>", "x") == 0xFF0000FF);
+  CHECK(color_of("<style>p{color:red !important}</style><p style='color:blue'>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>p{color:red}</style><p style='color:blue !important'>x</p>", "x") == 0xFF0000FF);
+  // Colour is inherited, and the nearest wins.
+  CHECK(color_of("<style>div{color:red}</style><div><p>x</p></div>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>div{color:red} p{color:blue}</style><div><p>x</p></div>", "x") == 0xFF0000FF);
+  CHECK(color_of("<font color=green>x</font>", "x") == 0xFF008000);
+  // Combinators and the other selectors.
+  CHECK(color_of("<style>div p{color:red}</style><div><span><p>x</p></span></div>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>div>p{color:red}</style><div><span><p>x</p></span></div>", "x") == 0);
+  CHECK(color_of("<style>div>p{color:red}</style><div><p>x</p></div>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>b, i, u{color:red}</style><p><i>x</i></p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>a[href^=http]{color:red}</style><a href='http://x'>x</a><a href='/y'>y</a>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>a[href^=http]{color:red}</style><a href='http://x'>x</a><a href='/y'>y</a>", "y") == 0);
+  CHECK(color_of("<style>[title~=two]{color:red}</style><p title='one two three'>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>a[href$='.pdf']{color:red}</style><a href='f.pdf'>x</a>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>li:first-child{color:red}</style><ul><li>x</li><li>y</li></ul>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>li:first-child{color:red}</style><ul><li>x</li><li>y</li></ul>", "y") == 0);
+  CHECK(color_of("<style>.a.b{color:red}</style><p class='b a c'>x</p><p class=a>y</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>.a.b{color:red}</style><p class='b a c'>x</p><p class=a>y</p>", "y") == 0);
+  CHECK(color_of("<style>*{color:red}</style><p>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>:root{color:red}</style><html><body>x</body></html>", "x") == 0xFFFF0000);
+  // Selectors that cannot apply are left out, and the others around them still work.
+  CHECK(color_of("<style>a:hover{color:red} p::first-line{color:red} li+li{color:red} p:not(.a){color:red} p{color:blue}</style><p>x</p>", "x") == 0xFF0000FF);
+  // @media: screen rules apply, print and narrow ones do not.
+  CHECK(color_of("<style>@media print{p{color:red}} @media screen{p{color:blue}}</style><p>x</p>", "x") == 0xFF0000FF);
+  CHECK(color_of("<style>@media (max-width: 600px){p{color:red}} @media (min-width: 100px){p{color:blue}}</style><p>x</p>", "x") == 0xFF0000FF);
+  CHECK(color_of("<style media=print>p{color:red}</style><p>x</p>", "x") == 0);
+  CHECK(color_of("<style>@import url(a.css); @font-face{font-family:x;src:url(a)} @charset 'x'; p{color:red}</style><p>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>/* p{color:blue} */ p{/* c */color:red;}</style><p>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>p{color:var(--x)} p{color:red}</style><p>x</p>", "x") == 0xFFFF0000);
+  // Damaged stylesheets are survived.
+  CHECK(color_of("<style>p{color:red</style><p>x</p>", "x") <= 0xFFFFFFFFu);
+  CHECK(color_of("<style>}}} p{color red} {color:blue} p{;;:;color:red;;}</style><p>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>p{content:\"}\"; color:red}</style><p>x</p>", "x") == 0xFFFF0000);
+}
+
+static void test_css_boxes() {
+  // Spacing, hiding and alignment change the lines.
+  CHECK(page_is("<style>p{margin:0}</style><p>a</p><p>b</p>", 40, "a\nb"));
+  CHECK(page_is("<style>div{margin-top:32px}</style>a<div>b</div>", 40, "a\n\n\nb"));
+  CHECK(page_is("<style>div{padding:1em 0}</style>a<div>b</div>c", 40, "a\n\nb\n\nc"));
+  CHECK(page_is("<style>div{margin-left:16px}</style><div>b c</div>", 40, "  b c"));
+  CHECK(page_is("<style>ul{margin:0;padding:0}</style><ul><li>a</li></ul>", 40, "* a"));
+  CHECK(page_is("<style>li{list-style:none}</style><ul><li>a</li><li>b</li></ul>", 40, "   a\n   b"));
+  CHECK(page_is("<style>.h{display:none}</style><p>a</p><p class=h>x <b>y</b></p><p>b</p>", 40, "a\n\nb"));
+  CHECK(page_is("<style>.h{display:none} .h .s{display:block}</style>a<div class=h><span class=s>x</span></div>b", 40, "ab"));
+  CHECK(page_is("<style>span{display:block}</style>a<span>b</span>c", 40, "a\nb\nc"));
+  CHECK(page_is("<style>div{display:inline}</style><div>a</div> <div>b</div>", 40, "a b"));
+  CHECK(page_is("<style>.v{visibility:hidden}</style>a<b class=v>x</b>b", 40, "ab"));
+  CHECK(page_is("<div style='text-align:center'>ab</div>", 10, "    ab"));
+  CHECK(page_is("<div style='text-align:right'>ab cd</div>", 10, "     ab cd"));
+  CHECK(page_is("<center>ab</center>", 10, "    ab"));
+  CHECK(page_is("<p align=right>ab</p>", 10, "        ab"));
+  CHECK(page_is("<style>p{text-transform:uppercase}</style><p>Hello world</p>", 40, "HELLO WORLD"));
+  CHECK(page_is("<style>p{white-space:pre}</style><p>a  b\nc</p>", 40, "a  b\nc"));
+  CHECK(page_is("<style>pre{white-space:normal}</style><pre>a  b</pre>", 40, "a b"));
+}
+
+static void test_css_text_styles() {
+  TestAllocator a;
+  {
+    HtmlDocument doc(a);
+    doc.parse_html("<style>.b{font-weight:700} .n{font-weight:normal} .u{text-decoration:underline line-through} a{text-decoration:none}"
+                   " .bg{background:#ccc url(x.png) no-repeat} .blk{display:block;background-color:#123456}</style>"
+                   "<p class=b>bold</p><h1 class=n>plain</h1><p class=u>under</p><a href=/x>link</a><a name=y>nolink</a>"
+                   "<span class=bg>bg</span><div class=blk>block <b>bold</b></div>");
+    CHECK(find_run(doc, "bold") && (find_run(doc, "bold")->flags & kRunBold));
+    CHECK(find_run(doc, "plain") && !(find_run(doc, "plain")->flags & kRunBold) && (find_run(doc, "plain")->flags & kRunHeading));
+    const Run* u = find_run(doc, "under");
+    CHECK(u && (u->flags & kRunUnderline) && (u->flags & kRunStrike));
+    CHECK(find_run(doc, "link") && !(find_run(doc, "link")->flags & kRunUnderline) && find_run(doc, "link")->link == 0);
+    CHECK(find_run(doc, "bg") && find_run(doc, "bg")->background == 0xFFCCCCCC && !(find_run(doc, "bg")->flags & kRunBlockBg));
+    CHECK(find_run(doc, "block ") && find_run(doc, "block ")->background == 0xFF123456 && (find_run(doc, "block ")->flags & kRunBlockBg));
+    CHECK(find_run(doc, "bold") != nullptr && doc.run_count() > 0);
+  }
+  {
+    // Links are underlined unless the page says otherwise; the page background; stylesheets that are linked.
+    HtmlDocument doc(a);
+    doc.parse_html("<html><head><link rel=stylesheet href='/a.css'><link rel='stylesheet' href=b.css media=print><link rel=icon href=i.png>"
+                   "<style>body{background:#000;color:#eee}</style></head><body><a href=x>l</a>t</body></html>");
+    CHECK(doc.page_background() == 0xFF000000 && doc.stylesheet_count() == 1 && doc.stylesheet(0).equals("/a.css"));
+    CHECK(find_run(doc, "l") && (find_run(doc, "l")->flags & kRunUnderline) && find_run(doc, "t") && find_run(doc, "t")->color == 0xFFEEEEEE && find_run(doc, "t")->background == 0);
+    // The stylesheets a caller fetched are read first, the page's own win over them.
+    CHECK(doc.parse_html("<p>x</p><style>p{color:blue}</style>", "p{color:red;background:#eee} p{color:lime}") && find_run(doc, "x")->color == 0xFF0000FF && find_run(doc, "x")->background == 0xFFEEEEEE);
+    CHECK(doc.parse_html("<body bgcolor=#ffffcc><td bgcolor=red>x</td></body>") && doc.page_background() == 0xFFFFFFCC && find_run(doc, "x")->background == 0xFFFF0000);
+  }
+  CHECK(a.live == 0);
+}
+
+// Layout of runs with different breaks and alignment.
+static void test_css_garbage() {
+  TestAllocator a;
+  {
+    HtmlDocument doc(a);
+    // Rules by the thousand, deep nesting and nonsense do not run out of time or memory.
+    String page(a);
+    page.append("<style>");
+    for (int i = 0; i < 12000; ++i) {
+      page.append("div.c");
+      page.append_uint(static_cast<uint64_t>(i));
+      page.append(" > p:first-child{color:red;margin:1px 2px 3px 4px}");
+    }
+    page.append("</style>");
+    for (int i = 0; i < 1000; ++i) page.append("<div class=c1><p>x</p></div>");
+    CHECK(doc.parse_html(page.view()) && doc.run_count() > 0);
+    String deep(a);
+    for (int i = 0; i < 3000; ++i) deep.append("<div>");
+    deep.append("deep");
+    CHECK(doc.parse_html(deep.view()) && find_run(doc, "deep"));
+    CHECK(doc.parse_html("<style>@media{{{{</style><style>a{</style><style>@</style><style>[</style><p>ok</p>") && find_run(doc, "ok"));
+    CHECK(doc.parse_html("<p style='color:;:red;;font-weight'>ok</p><p style=\"margin: 1 2 3 4 5 6\">x</p>") && find_run(doc, "ok"));
+  }
+  CHECK(a.live == 0);
+}
+
 static String resolved(TestAllocator& a, const char* base, const char* ref) {
   String out(a);
   if (!resolve_reference(a, base, ref, &out)) out.assign("(none)");
@@ -204,6 +361,11 @@ int main() {
   test_wrapping();
   test_links();
   test_title_and_limits();
+  test_colors();
+  test_css_cascade();
+  test_css_boxes();
+  test_css_text_styles();
+  test_css_garbage();
   test_addresses();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

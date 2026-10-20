@@ -214,6 +214,7 @@ add_executable(BOOTX64
   src/Database/ConnectionOptions.cpp
   src/Database/DatabaseManager.cpp
   src/Browser/HtmlDocument.cpp
+  src/Browser/Css.cpp
   src/Browser/PageLayout.cpp
   src/Browser/Url.cpp
   src/Browser/HttpPageLoader.cpp

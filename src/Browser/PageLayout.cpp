@@ -42,14 +42,17 @@ class Builder {
     has_ = false;
   }
 
-  // A blank line, unless the page starts here or the last line is blank already.
-  void blank_line() {
+  // Blank lines so that there are `count` of them (but none at the start of the page) between what came before and what comes next.
+  void blank_lines(uint32_t count) {
     end_line();
     if (lines_.count() == 0) return;
-    const uint64_t last = lines_.count() - 1;
-    const uint64_t end = last + 1 < lines_.count() ? lines_[last + 1] : pieces_.count();
-    if (lines_[last] == end) return;   // (no pieces: it is blank)
-    failed_ |= !lines_.push_back(static_cast<uint32_t>(pieces_.count()));
+    uint32_t have = 0;
+    for (uint64_t l = lines_.count(); l > 0; --l) {
+      const uint64_t end = l < lines_.count() ? lines_[l] : pieces_.count();
+      if (lines_[l - 1] != end) break;   // it has pieces: not blank
+      ++have;
+    }
+    for (; have < count && !failed_; ++have) failed_ |= !lines_.push_back(static_cast<uint32_t>(pieces_.count()));
   }
 
   bool has_content() const { return open_ && has_; }
@@ -130,7 +133,7 @@ bool PageLayout::build(const HtmlDocument& doc, uint32_t columns) {
     const uint32_t indent = run.indent;
     const uint8_t breaks = any ? run.breaks : 0;
     if (breaks >= 1) b.end_line();
-    if (breaks >= 2) b.blank_line();
+    if (breaks >= 2) b.blank_lines(breaks - 1u);
     if (run.flags & kRunRule) {
       b.rule(index);
       any = true;
@@ -169,6 +172,18 @@ bool PageLayout::build(const HtmlDocument& doc, uint32_t columns) {
   if (b.failed()) {
     clear();
     return false;
+  }
+  // Lines of centred and right aligned text move over (a line is aligned the way its first piece says).
+  for (uint32_t line = 0; line < lines_.count(); ++line) {
+    const uint32_t first = first_piece(line), end = end_piece(line);
+    if (first == end) continue;
+    const uint8_t align = doc.run(pieces_[first].run).align;
+    if (align == 0) continue;
+    uint32_t right = 0;
+    for (uint32_t p = first; p < end; ++p) right = pieces_[p].column + pieces_[p].length > right ? pieces_[p].column + pieces_[p].length : right;
+    const uint32_t room = columns_ > right ? columns_ - right : 0;
+    const uint32_t shift = align == 1 ? room / 2 : room;
+    for (uint32_t p = first; p < end; ++p) pieces_[p].column += shift;
   }
   return true;
 }

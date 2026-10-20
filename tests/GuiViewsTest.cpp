@@ -6352,6 +6352,7 @@ static void test_web_browser() {
     make_file(fs, "/docs/index.html", "<title>Index</title><p>Local <a href=\"two.html\">two</a> <a href=\"/notes.txt\">notes</a></p>");
     make_file(fs, "/docs/two.html", "<title>Second</title><p>second page</p>");
     make_file(fs, "/notes.txt", "plain  text\nline two");
+    make_file(fs, "/css.html", "<style>body{background:#000080;color:#ffff00} .box{background:#ff0000;display:block} .c{text-align:center}</style><body><p class=box>red block</p><p class=c>mid</p></body>");
     std::string many = "<title>Long</title>";
     for (int i = 0; i < 100; ++i) many += "<p>paragraph " + std::to_string(i) + "</p>";
     make_file(fs, "/long.html", many.c_str());
@@ -6433,6 +6434,17 @@ static void test_web_browser() {
     CHECK(b.accepts_drop("/notes.txt", 0, 0, nullptr) && !b.accepts_drop("x", 0, 0, nullptr));
     b.on_drop("/docs/index.html", 0, 0, nullptr);
     CHECK(b.address().equals("/docs/index.html"));
+
+    // Stylesheets show: the page's background, a block's background across its lines, and coloured text.
+    CHECK(b.navigate("/css.html") && b.page().document()->page_background() == 0xFF000080);
+    w.render();
+    const Point po = b.page().window_origin();
+    CHECK(screen.px(po.x + 300, po.y + 150) == 0xFF000080);       // the page
+    CHECK(screen.px(po.x + 300, po.y + 8) == 0xFFFF0000);         // the block's line, beyond its text
+    bool yellow = false;                                           // the text itself
+    for (int32_t x = 0; x < 120 && !yellow; ++x)
+      for (int32_t y = 0; y < 16 && !yellow; ++y) yellow = screen.px(po.x + x, po.y + y) == 0xFFFFFF00;
+    CHECK(yellow);
 
     // Long pages scroll: wheel, keys and the scroll bar.
     CHECK(b.navigate("/long.html") && b.page().line_count() > b.page().visible_lines() && b.page().scroll_line() == 0);

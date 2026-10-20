@@ -18,7 +18,8 @@
 
 // The web browser: a window with a menu bar (File: Open File, Close; Go: Back, Forward, Reload), a bar with the Back, Forward and Reload buttons, the
 // address box and Go, the page, and a status bar that says what is happening (and where the link under the pointer leads). It shows HTML pages (see
-// browser::HtmlDocument for what is understood - text, headings, lists, tables, links; no pictures, styles or scripts) and plain text, from the web
+// browser::HtmlDocument and browser::StyleSheet for what is understood - text, headings, lists, tables, links, and the CSS that colours, spaces and
+// aligns them, from <style>, style attributes and linked stylesheets; no pictures or scripts) and plain text, from the web
 // (http:// and https://, through the page loader the desktop gives it) and from the system's own volumes (a path such as /docs/index.html).
 // Enter in the address box, or Go, opens what is typed; Ctrl+L goes to the address box, Alt+Left and Alt+Right are Back and Forward, F5 and Ctrl+R
 // reload, Ctrl+O opens a file. Clicking a link opens it; a page that links to another by a relative address works in files as it does on the web.
@@ -45,6 +46,8 @@ class WebBrowser : public gui::Frame {
  public:
   static constexpr uint64_t kMaxFileBytes = 4u << 20;
   static constexpr uint32_t kMaxHistory = 100;
+  static constexpr uint32_t kMaxStyleSheets = 8;
+  static constexpr uint64_t kMaxStyleSheetBytes = 512u << 10;
 
   explicit WebBrowser(allocators::IAllocator& allocator);
 

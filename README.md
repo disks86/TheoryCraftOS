@@ -47,7 +47,8 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   it like any server; `SystemSettings` is the typed key-value face programs use (`get_int("audio", "volume", 80)`, `set_text(...)`; the query window
   keeps its last URL there). Tested by `tests/SystemDatabaseTest.cpp`.
 - **Browser/** the web browser's model, apart from any window: `HtmlDocument` reads HTML into runs of text (headings, paragraphs, lists, tables, links,
-  preformatted text; scripts and styles are dropped; pictures show as their alternative text), `PageLayout` fits them into lines of fixed-width
+  preformatted text; scripts and styles are dropped; pictures show as their alternative text), `StyleSheet` (`Css.hpp`) reads CSS - selectors, the cascade, `!important`, `@media` - and gives each element a `Style`
+  (colours, bold / underline, hiding, alignment, spacing as blank lines and columns) that the runs carry, `PageLayout` fits them into lines of fixed-width
   characters, `Url` resolves links (web addresses and files alike), `IPageLoader` is how a page is fetched and `HttpPageLoader` does it with
   `network::HttpClient` over the network stacks (https is checked against the Mozilla root certificates in `certs/ca-bundle.pem`, built into the image by `Network/Tls/CaBundle.S`;
   a `/certs/ca-bundle.pem` on the system volume is used instead when there is one). The Web Browser application (`Desktop/WebBrowser`, drawing with `Gui/Controls/PageView`) is in the Start menu and is a tab like the

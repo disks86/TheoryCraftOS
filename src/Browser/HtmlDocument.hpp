@@ -26,6 +26,7 @@
 //
 // All of the text lives in one pool and the runs point into it, so a document is a few allocations however long the page is.
 #pragma once
+#include "Browser/Css.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
@@ -38,6 +39,9 @@ enum RunFlag : uint8_t {
   kRunCode = 4,      // code: shown on a shaded background
   kRunPre = 8,       // preformatted: line breaks and spaces stay as they are
   kRunRule = 16,     // a horizontal rule (no text)
+  kRunUnderline = 32,
+  kRunStrike = 64,   // struck through
+  kRunBlockBg = 128, // the background (Run::background) belongs to a block: it fills the lines the text is on
 };
 
 struct Run {
@@ -45,7 +49,10 @@ struct Run {
   uint8_t flags = 0;                 // RunFlag bits
   uint8_t level = 0;                 // 1..6 for headings
   uint8_t indent = 0;                // the column that lines of this run start at
-  uint8_t breaks = 0;                // line breaks before it: 0 follows the text before it, 1 starts a line, 2 leaves a blank line
+  uint8_t breaks = 0;                // line breaks before it: 0 follows the text before it, 1 starts a line, 2 leaves a blank line, 3 two blank lines...
+  uint8_t align = 0;                 // 0 left, 1 centred, 2 right (of the line it is on)
+  uint32_t color = 0;                // text colour 0xAARRGGBB, 0: the default for the kind of text
+  uint32_t background = 0;           // 0: none
   int32_t link = -1;                 // which link it leads to, or -1
 };
 
@@ -54,12 +61,13 @@ class HtmlDocument {
   static constexpr uint64_t kMaxText = 4u << 20;   // the most text kept; a longer page is cut off there
   static constexpr uint64_t kMaxRuns = 250000;
 
-  explicit HtmlDocument(allocators::IAllocator& allocator) : allocator_(allocator), runs_(allocator), links_(allocator), pool_(allocator), title_(allocator) {}
+  explicit HtmlDocument(allocators::IAllocator& allocator) : allocator_(allocator), runs_(allocator), links_(allocator), sheets_(allocator), pool_(allocator), title_(allocator) {}
   HtmlDocument(const HtmlDocument&) = delete;
   HtmlDocument& operator=(const HtmlDocument&) = delete;
 
-  // Replaces the contents with the page in `html`. False if memory ran out (the document is then empty).
-  bool parse_html(StringView html);
+  // Replaces the contents with the page in `html`, styled by the stylesheets in it (<style>, style attributes) and by `extra_css` (the stylesheets
+  // it links to, fetched by the caller; read before the page's own). False if memory ran out (the document is then empty).
+  bool parse_html(StringView html, StringView extra_css = StringView());
   // Replaces the contents with `text`, shown as it is. False if memory ran out.
   bool parse_text(StringView text);
   void clear();
@@ -72,6 +80,11 @@ class HtmlDocument {
   // Where link `index` leads, as written in the page (it may be relative).
   StringView link(uint32_t index) const { return index < links_.count() ? pool_.view().substr(links_[index].offset, links_[index].length) : StringView(); }
   allocators::IAllocator& allocator() const { return allocator_; }
+  // The page's own background (<body> or <html>), 0 if it has none.
+  uint32_t page_background() const { return page_background_; }
+  // The stylesheet files the page links to (<link rel=stylesheet href=...>), as written (they may be relative).
+  uint32_t stylesheet_count() const { return static_cast<uint32_t>(sheets_.count()); }
+  StringView stylesheet(uint32_t index) const { return index < sheets_.count() ? pool_.view().substr(sheets_[index].offset, sheets_[index].length) : StringView(); }
   // True if the page was longer than the limits and the end is missing.
   bool truncated() const { return truncated_; }
 
@@ -80,12 +93,14 @@ class HtmlDocument {
   struct LinkRef {
     uint32_t offset, length;
   };
-  bool add_run(StringView text, uint8_t flags, uint8_t level, uint8_t indent, uint8_t breaks, int32_t link);
+  bool add_run(StringView text, uint8_t flags, uint8_t level, uint8_t indent, uint8_t breaks, int32_t link, uint8_t align, uint32_t color, uint32_t background);
   int32_t add_link(StringView target);
+  bool add_stylesheet(StringView target);
 
   allocators::IAllocator& allocator_;
   List<Run> runs_;
-  List<LinkRef> links_;
+  List<LinkRef> links_, sheets_;
+  uint32_t page_background_ = 0;
   String pool_, title_;
   bool truncated_ = false;
 };

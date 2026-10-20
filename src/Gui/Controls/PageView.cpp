@@ -23,7 +23,8 @@ namespace gui {
 
 namespace {
 constexpr uint32_t kPaper = 0xFFFFFFFFu, kInk = 0xFF000000u, kHeadingInk = 0xFF000080u, kLinkInk = 0xFF0000EEu, kHoverInk = 0xFFCC0000u;
-constexpr uint32_t kCodeShade = 0xFFEAEAEAu, kRuleInk = 0xFF808080u;
+constexpr uint32_t kCodeShade = 0xFFEAEAEAu, kCodeShadeDark = 0xFF303030u, kRuleInk = 0xFF808080u;
+constexpr uint32_t kInkDark = 0xFFE8E8E8u, kLinkInkDark = 0xFF8AB4FFu, kHeadingInkDark = 0xFFB0B0FFu;
 constexpr uint8_t kPageUp = 0x4B, kPageDown = 0x4E, kHome = 0x4A, kEnd = 0x4D, kSpace = hardware::key::kSpace, kUp = hardware::key::kUp, kDown = hardware::key::kDown;
 }  // namespace
 
@@ -170,9 +171,16 @@ bool PageView::on_key(const KeyArgs& args) {
 
 // --- Painting ---------------------------------------------------------------------------------------
 
+// Is the colour dark enough that text on it should be light?
+static bool is_dark(uint32_t color) {
+  const uint32_t r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
+  return (r * 299 + g * 587 + b * 114) / 1000 < 128;
+}
+
 void PageView::paint(Painter& painter) {
   const int32_t usable = static_cast<int32_t>(bounds_.width) - ScrollBar::kThickness;
-  painter.fill({0, 0, bounds_.width, bounds_.height}, kPaper);
+  const uint32_t paper = document_ && document_->page_background() ? document_->page_background() : kPaper;
+  painter.fill({0, 0, bounds_.width, bounds_.height}, paper);
   measure();
   sync_scroll_bar();
   if (!document_) return;
@@ -180,22 +188,36 @@ void PageView::paint(Painter& painter) {
   for (uint32_t row = 0; row < rows_ && top_ + row < lines; ++row) {
     const uint32_t line = top_ + row;
     const int32_t y = static_cast<int32_t>(row) * kLineHeight;
-    for (uint32_t p = layout_.first_piece(line); p < layout_.end_piece(line); ++p) {
+    const uint32_t first = layout_.first_piece(line), end = layout_.end_piece(line);
+    if (first < end) {   // a block with a background of its own is painted across the whole line
+      const browser::Run& lead = document_->run(layout_.piece(first).run);
+      if ((lead.flags & browser::kRunBlockBg) && lead.background) painter.fill({0, y, static_cast<uint32_t>(usable > 0 ? usable : 0), static_cast<uint32_t>(kLineHeight)}, lead.background);
+    }
+    for (uint32_t p = first; p < end; ++p) {
       const browser::Piece& piece = layout_.piece(p);
       const browser::Run& run = document_->run(piece.run);
       const int32_t x = kMargin + static_cast<int32_t>(piece.column) * Painter::kGlyphWidth;
       const int32_t width = static_cast<int32_t>(piece.length) * Painter::kGlyphWidth;
+      const uint32_t ground = run.background ? run.background : paper;   // what the text is on
+      const bool dark = is_dark(ground);
       if (run.flags & browser::kRunRule) {
-        painter.fill({kMargin, y + kLineHeight / 2 - 1, static_cast<uint32_t>(usable > 2 * kMargin ? usable - 2 * kMargin : 1), 2}, kRuleInk);
+        painter.fill({kMargin, y + kLineHeight / 2 - 1, static_cast<uint32_t>(usable > 2 * kMargin ? usable - 2 * kMargin : 1), 2}, run.color ? run.color : kRuleInk);
         continue;
       }
-      if (run.flags & (browser::kRunCode | browser::kRunPre)) painter.fill({x, y, static_cast<uint32_t>(width), static_cast<uint32_t>(kLineHeight)}, kCodeShade);
+      if (run.background && !(run.flags & browser::kRunBlockBg)) painter.fill({x, y, static_cast<uint32_t>(width), static_cast<uint32_t>(kLineHeight)}, run.background);
+      else if (!run.background && (run.flags & (browser::kRunCode | browser::kRunPre))) painter.fill({x, y, static_cast<uint32_t>(width), static_cast<uint32_t>(kLineHeight)}, dark ? kCodeShadeDark : kCodeShade);
       const bool link = run.link >= 0;
-      const uint32_t ink = link ? (run.link == hover_ ? kHoverInk : kLinkInk) : (run.flags & browser::kRunHeading) ? kHeadingInk : kInk;
+      uint32_t ink;
+      if (run.color) ink = run.color;
+      else if (link) ink = run.link == hover_ ? kHoverInk : dark ? kLinkInkDark : kLinkInk;
+      else if (run.flags & browser::kRunHeading) ink = dark ? kHeadingInkDark : kHeadingInk;
+      else ink = dark ? kInkDark : kInk;
+      if (link && run.link == hover_) ink = kHoverInk;
       const StringView text = document_->run_text(piece.run).substr(piece.from, piece.length);
       painter.text(x, y, text, ink);
       if (run.flags & browser::kRunBold) painter.text(x + 1, y, text, ink);
-      if (link) painter.fill({x, y + kLineHeight - 2, static_cast<uint32_t>(width), 1}, ink);
+      if (run.flags & browser::kRunUnderline) painter.fill({x, y + kLineHeight - 2, static_cast<uint32_t>(width), 1}, ink);
+      if (run.flags & browser::kRunStrike) painter.fill({x, y + kLineHeight / 2, static_cast<uint32_t>(width), 1}, ink);
     }
   }
 }

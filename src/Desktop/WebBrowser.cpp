@@ -49,7 +49,7 @@ const char kWelcome[] =
     "<h2>Keys</h2>"
     "<ul><li>Ctrl+L: go to the address box</li><li>Alt+Left, Alt+Right: back and forward</li><li>F5 or Ctrl+R: reload</li>"
     "<li>Ctrl+O: open a file</li><li>Space, Page Up, Page Down: scroll</li></ul>"
-    "<p>This browser shows text, headings, lists, tables and links. It does not show pictures or run scripts.</p>"
+    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them. It does not show pictures or run scripts.</p>"
     "<p>A place to start: <a href=\"http://example.com/\">http://example.com/</a></p>"
     "</body></html>";
 
@@ -451,6 +451,21 @@ void WebBrowser::show(Fetched& page) {
   bool ok = true;
   if (is_html(page.type.view(), page.address.view(), body)) {
     ok = doc->parse_html(body);
+    if (ok && doc->stylesheet_count() > 0) {   // the page links to stylesheets: fetch them and read the page again with them
+      say("Loading styles...");
+      String css(allocator());
+      for (uint32_t i = 0; i < doc->stylesheet_count() && i < kMaxStyleSheets; ++i) {
+        String target(allocator());
+        if (!browser::resolve_reference(allocator(), page.address.view(), doc->stylesheet(i), &target)) continue;
+        Fetched sheet(allocator());
+        sheet.address.assign(target.view());
+        if (fetch(target.view(), &sheet) && sheet.status < 400 && sheet.body.size() <= kMaxStyleSheetBytes) {
+          css.append(StringView(sheet.body.view()));
+          css.push_back('\n');
+        }
+      }
+      if (!css.empty()) ok = doc->parse_html(body, css.view());
+    }
   } else if (is_text(page.type.view(), body)) {
     ok = doc->parse_text(body);
   } else {
