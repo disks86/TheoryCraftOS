@@ -67,6 +67,7 @@
 #include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
 #include "Browser/HttpPageLoader.hpp"
+#include "Network/Tls/CaBundle.hpp"
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
@@ -243,6 +244,12 @@ static uint64_t smb_filetime(void* context) {
   const int64_t days = era * 146097 + doe - 719468;   // since 1970
   const uint64_t seconds = static_cast<uint64_t>(days) * 86400 + t.hour * 3600u + t.minute * 60u + 11644473600ull;
   return seconds * 10000000ull;
+}
+
+// Seconds since 1970 for certificate dates (the local clock; 0 when it cannot be read, which skips the date checks).
+static uint64_t unix_seconds(void* context) {
+  const uint64_t filetime = smb_filetime(context);
+  return filetime ? filetime / 10000000ull - 11644473600ull : 0;
 }
 
 struct SmbLoginContext {
@@ -825,8 +832,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // connections are plain until one is given (SystemDatabases::transport().set_tls()).
     database::SystemDatabases databases(shared_allocator, smb_network, &smb_random);
     desktop.set_databases(&databases.manager());
-    // Web pages for the browser, over the same interfaces. https:// needs a trust store, which this system does not ship: only plain http works
-    // until the loader is given a TLS configuration (HttpPageLoader::set_tls()).
+    // Web pages for the browser, over the same interfaces. https:// is given its trust store once the volumes are mounted (below).
     browser::HttpPageLoader page_loader(stacks, shared_allocator);
     desktop.set_page_loader(&page_loader);
     Entry(Level::Info, "Database").dec(databases.manager().driver_count()).text(" driver(s): ").text(databases.manager().driver(0)->name());
@@ -851,6 +857,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // window can open it too (system://localhost/system). Without a writable root volume it lives in memory for this session.
     database::local::LocalDatabase system_database(shared_allocator, &explorer_files.file_system(), "/databases/system.db");
     system_database.open();
+    // The root certificates for https: the bundle on the system volume (/certs/ca-bundle.pem) or else the one built into the image.
+    crypto::TrustStore web_roots(shared_allocator);
+    network::TlsConfig web_tls;
+    const uint32_t roots = network::load_ca_bundle(web_roots, &explorer_files.file_system(), shared_allocator);
+    web_tls.trust = &web_roots;
+    web_tls.random = &smb_random;
+    web_tls.clock = unix_seconds;
+    web_tls.clock_context = st;
+    page_loader.set_tls(&web_tls);
+    Entry(Level::Info, "Web").dec(roots).text(" trusted root certificates");
+
     database::local::LocalDriver system_driver(shared_allocator);
     system_driver.add_database("system", &system_database);
     databases.manager().add_driver(&system_driver);

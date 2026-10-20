@@ -49,8 +49,8 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
 - **Browser/** the web browser's model, apart from any window: `HtmlDocument` reads HTML into runs of text (headings, paragraphs, lists, tables, links,
   preformatted text; scripts and styles are dropped; pictures show as their alternative text), `PageLayout` fits them into lines of fixed-width
   characters, `Url` resolves links (web addresses and files alike), `IPageLoader` is how a page is fetched and `HttpPageLoader` does it with
-  `network::HttpClient` over the network stacks (https needs a TLS configuration with a trust store, which the system does not ship yet, so only http
-  works for now). The Web Browser application (`Desktop/WebBrowser`, drawing with `Gui/Controls/PageView`) is in the Start menu and is a tab like the
+  `network::HttpClient` over the network stacks (https is checked against the Mozilla root certificates in `certs/ca-bundle.pem`, built into the image by `Network/Tls/CaBundle.S`;
+  a `/certs/ca-bundle.pem` on the system volume is used instead when there is one). The Web Browser application (`Desktop/WebBrowser`, drawing with `Gui/Controls/PageView`) is in the Start menu and is a tab like the
   other programs: dragged between windows, torn off, kept by the session (a web address is only shown again on restore, not fetched).
   The desktop keeps its session there too (`Desktop/SessionStore`, tables `session_windows` and `session_tabs`): as the system shuts down
   `Desktop::save_session()` records every program window - place, size, maximized / docked / minimized, stacking order, the tabs of a tabbed window and

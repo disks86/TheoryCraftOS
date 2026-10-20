@@ -354,7 +354,8 @@ bool WebBrowser::fetch(StringView address, Fetched* page) {
   if (!loader_->fetch(address, &result)) {
     String message(allocator());
     message.append("Cannot open ");
-    message.append(address);
+    message.append(address.size() > 24 ? address.first(24) : address);   // (the notice dialog has room for four short lines)
+    if (address.size() > 24) message.append("...");
     message.append(": ");
     message.append(result.error.empty() ? StringView("the page could not be fetched.") : result.error.view());
     page->error.assign(message.view());

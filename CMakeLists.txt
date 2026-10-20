@@ -217,6 +217,8 @@ add_executable(BOOTX64
   src/Browser/PageLayout.cpp
   src/Browser/Url.cpp
   src/Browser/HttpPageLoader.cpp
+  src/Network/Tls/CaBundle.cpp
+  src/Network/Tls/CaBundle.S
   src/Database/SqlText.cpp
   src/Database/Local/LocalCatalog.cpp
   src/Database/Local/LocalSql.cpp
@@ -410,6 +412,8 @@ add_executable(BOOTX64
 )
 
 target_include_directories(BOOTX64 PRIVATE src)
+# The root certificates built into the image (.incbin looks for the file from the source folder).
+set_source_files_properties(src/Network/Tls/CaBundle.S PROPERTIES COMPILE_OPTIONS "-I${CMAKE_SOURCE_DIR}" OBJECT_DEPENDS ${CMAKE_SOURCE_DIR}/certs/ca-bundle.pem)
 set_target_properties(BOOTX64 PROPERTIES SUFFIX ".efi")
 
 target_compile_options(BOOTX64 PRIVATE

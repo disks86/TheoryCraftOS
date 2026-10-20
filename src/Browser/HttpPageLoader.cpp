@@ -34,7 +34,7 @@ bool HttpPageLoader::fetch(StringView address, PageResult* result) {
   http.add_header("User-Agent", "TheoryCraftOS-Browser/1.0");
   http.add_header("Accept", "text/html,text/plain;q=0.9,*/*;q=0.1");
   if (!http.start(network::HttpMethod::Get, address) || !http.run(timeout_ms_)) {
-    result->error.assign(http.error() == network::HttpError::NoTlsConfiguration ? StringView("Secure (https) pages cannot be opened: no certificates are installed.")
+    result->error.assign(http.error() == network::HttpError::NoTlsConfiguration ? StringView("https needs certificates, which are not installed.")
                                                                                  : StringView(network::http_error_name(http.error())));
     return false;
   }
