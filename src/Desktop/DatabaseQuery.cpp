@@ -236,6 +236,14 @@ void DatabaseQuery::on_connect_clicked(void* self, Control&) {
   else q->connect();
 }
 
+void DatabaseQuery::set_settings(database::local::SystemSettings* settings, StringView default_url) {
+  settings_ = settings;
+  if (!url_.text().empty()) return;
+  String url(allocator());
+  if (!settings || !settings->get_text("database-query", "url", &url)) url.assign(default_url);
+  if (!url.empty()) url_.set_text(url.view());
+}
+
 // --- Connection -----------------------------------------------------------------------------------------------------------------------------------------
 
 bool DatabaseQuery::connect() {
@@ -254,6 +262,7 @@ bool DatabaseQuery::connect() {
     notify(NoticeKind::Warning, message.view());
     return false;
   }
+  const bool url_has_password = !options.password.empty();
   if (options.password.empty() && !password_.text().empty()) options.password.assign(password_.text());
   disconnect();
   say("Connecting...");
@@ -278,6 +287,7 @@ bool DatabaseQuery::connect() {
     server_.append(options.database.view());
   }
   update_connection_state();
+  if (settings_ && !url_has_password) settings_->set_text("database-query", "url", url.view());   // the next window starts here
   String message(allocator());
   message.append("Connected to ");
   message.append(server_.view());

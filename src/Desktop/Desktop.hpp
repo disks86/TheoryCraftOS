@@ -130,6 +130,10 @@ class Desktop {
   // The databases programs may connect to (nullptr: none). It must outlive the desktop.
   void set_databases(database::DatabaseManager* databases);
   database::DatabaseManager* databases() const { return databases_; }
+  // The system settings, where programs keep what they should remember (nullptr: nothing is kept). `database_url` is what the database query
+  // window shows until a connection has been made. It must outlive the desktop.
+  void set_settings(database::local::SystemSettings* settings, StringView database_url = StringView());
+  database::local::SystemSettings* settings() const { return settings_; }
   // Opens a database query window: the first one is database_query() (when that is closed), further ones are made as needed and go away when closed.
   DatabaseQuery* open_database_query(gui::TabFrame* into = nullptr);
   DatabaseQuery& database_query() { return database_query_; }
@@ -296,6 +300,8 @@ class Desktop {
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;
   database::DatabaseManager* databases_ = nullptr;
+  database::local::SystemSettings* settings_ = nullptr;
+  String database_url_;
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;

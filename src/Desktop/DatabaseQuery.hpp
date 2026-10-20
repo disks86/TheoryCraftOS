@@ -27,6 +27,7 @@
 // databases can be reached depends on the drivers in the DatabaseManager it is given.
 #pragma once
 #include "Database/DatabaseManager.hpp"
+#include "Database/Local/SystemSettings.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -50,6 +51,9 @@ class DatabaseQuery : public gui::Frame {
 
   // The databases that can be connected to (nullptr: none, Connect then says so). It must outlive the window.
   void set_databases(database::DatabaseManager* databases) { databases_ = databases; }
+  // The system settings (may be nullptr): the URL of the last database connected to (never with a password) is kept there and shown the next time the
+  // window opens; with none kept yet the box starts with `default_url`.
+  void set_settings(database::local::SystemSettings* settings, StringView default_url = StringView());
   // The filesystem SQL files are opened from and saved to (nullptr: none).
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
@@ -145,6 +149,7 @@ class DatabaseQuery : public gui::Frame {
   uint64_t now() const { return clock_ ? *clock_ : 0; }
 
   database::DatabaseManager* databases_ = nullptr;
+  database::local::SystemSettings* settings_ = nullptr;
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
   gui::NoticeDialog* notices_ = nullptr;

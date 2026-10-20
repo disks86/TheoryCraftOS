@@ -58,6 +58,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       network_properties_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
+      database_url_(allocator),
       extra_explorers_(allocator),
       extra_notepads_(allocator),
       extra_paints_(allocator),
@@ -234,6 +235,7 @@ void Desktop::setup_database_query(DatabaseQuery& query) {
   query.set_file_dialog(&file_dialog_);
   query.set_file_system(fs_);
   query.set_databases(databases_);
+  query.set_settings(settings_, database_url_.view());
   query.set_clock(&now_us_);
 }
 
@@ -242,6 +244,15 @@ void Desktop::set_databases(database::DatabaseManager* databases) {
     databases_ = databases;
     database_query_.set_databases(databases);
     for (auto& q : extra_queries_) q->set_databases(databases);
+  });
+}
+
+void Desktop::set_settings(database::local::SystemSettings* settings, StringView database_url) {
+  window_.locked([&] {
+    settings_ = settings;
+    database_url_.assign(database_url);
+    database_query_.set_settings(settings, database_url_.view());
+    for (auto& q : extra_queries_) q->set_settings(settings, database_url_.view());
   });
 }
 

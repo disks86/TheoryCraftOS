@@ -32,6 +32,8 @@ class IDatabaseDriver {
   virtual bool handles_scheme(StringView scheme) const = 0;
   // The port used when the options have none.
   virtual uint16_t default_port() const = 0;
+  // False for a driver that does not use the network (the database lives in the machine): it can connect when the manager has no transport.
+  virtual bool needs_transport() const { return true; }
   // Connects, logs in and returns the open connection. The transport must stay valid for as long as the connection is used.
   virtual DbStatus connect(const ConnectionOptions& options, IDatabaseTransport& transport, UniquePointer<IConnection>* connection, DbError* error) = 0;
 

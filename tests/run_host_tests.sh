@@ -22,11 +22,13 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest AmlTest SheetTest DatabaseTest DatabaseNetworkTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest AmlTest SheetTest DatabaseTest DatabaseNetworkTest SystemDatabaseTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
     DatabaseTest) build_and_run DatabaseTest tests/DatabaseTest.cpp tests/KernelStubs.cpp src/Database/*.cpp src/Database/Postgres/*.cpp src/Crypto/*.cpp src/Stream/StreamStatus.cpp ;;
+    SystemDatabaseTest) build_and_run SystemDatabaseTest tests/SystemDatabaseTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Database/*.cpp src/Database/Local/*.cpp \
+                          src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp ;;
     DatabaseNetworkTest) build_and_run DatabaseNetworkTest tests/DatabaseNetworkTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Database/*.cpp src/Database/Postgres/*.cpp src/Database/Net/*.cpp \
                            src/Stream/StreamStatus.cpp src/Async/Executor.cpp src/Stream/Tcp/TcpStream.cpp src/FileSystem/FileSystemTypes.cpp src/Network/ServerNetwork.cpp src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                            src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp ;;
@@ -135,11 +137,11 @@ for t in "${WANTED[@]}"; do
     GraphicsTest) build_and_run GraphicsTest tests/GraphicsTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
                     src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp ;;
     GuiTest) build_and_run GuiTest tests/GuiTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
-                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio ;;
+                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Database/Local/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio src/FileSystem/FileSystemTypes.cpp ;;
     GuiControlsTest) build_and_run GuiControlsTest tests/GuiControlsTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
-                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio ;;
+                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Database/Local/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio src/FileSystem/FileSystemTypes.cpp ;;
     GuiViewsTest) build_and_run GuiViewsTest tests/GuiViewsTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp \
-                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio ;;
+                src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Database/Local/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio ;;
     StorageEjectTest) build_and_run StorageEjectTest tests/StorageEjectTest.cpp tests/UsbAudioStubs.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Kernel/Paging.cpp \
                         src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp src/Hardware/Bus/Virtio/VirtioPciDevice.cpp src/Hardware/Bus/Virtio/Virtqueue.cpp \
                         src/Hardware/StorageDevice/StorageDeviceBase.cpp src/Hardware/StorageDevice/SystemStorageDevices.cpp src/Hardware/StorageDevice/*/*.cpp \
@@ -180,7 +182,7 @@ for t in "${WANTED[@]}"; do
       echo "== GuiThreadTest"
       $cxx -std=c++20 -O1 -g -fsanitize=thread -pthread -I src -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-misleading-indentation -Wno-delete-non-virtual-dtor \
         -o "$out/GuiThreadTest" tests/GuiThreadTest.cpp tests/HostThreads.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
-        src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio
+        src/Hardware/Keyboard/KeyCodes.cpp src/Graphics/Graphics2D/Software/*.cpp src/Gui/*.cpp src/Gui/Controls/*.cpp src/Gui/Windows/*.cpp src/Desktop/*.cpp src/Spreadsheet/*.cpp src/Database/*.cpp src/Database/Local/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp tests/DesktopStubs.cpp $gui_audio src/FileSystem/FileSystemTypes.cpp
       "$out/GuiThreadTest" ;;
     *) echo "unknown test $t"; exit 2 ;;
   esac

@@ -20,6 +20,18 @@
 
 namespace database {
 
+namespace {
+// What a driver that needs no network is handed when the manager has no transport.
+class NoTransport final : public IDatabaseTransport {
+ public:
+  DbStatus open(const Endpoint&, const TlsProbe*, UniquePointer<stream::IStream>*, bool*, DbError* error) override {
+    if (error) error->set(DbStatus::ConnectFailed, "no network is available to connect through");
+    return DbStatus::ConnectFailed;
+  }
+};
+NoTransport g_no_transport;   // the driver was not going to use it
+}  // namespace
+
 bool DatabaseManager::add_driver(IDatabaseDriver* driver) {
   if (!driver || find_driver(driver->name())) return false;
   return drivers_.push_back(driver);
@@ -49,11 +61,14 @@ DbStatus DatabaseManager::connect(const ConnectionOptions& options, UniquePointe
     e->detail.assign(options.driver.view());
     return DbStatus::UnknownDriver;
   }
-  if (!transport_) {
-    e->set(DbStatus::ConnectFailed, "no network is available to connect through");
-    return DbStatus::ConnectFailed;
-  }
   connection->reset();
+  if (!transport_) {
+    if (driver->needs_transport()) {
+      e->set(DbStatus::ConnectFailed, "no network is available to connect through");
+      return DbStatus::ConnectFailed;
+    }
+    return driver->connect(options, g_no_transport, connection, e);
+  }
   return driver->connect(options, *transport_, connection, e);
 }
 

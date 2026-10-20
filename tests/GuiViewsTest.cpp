@@ -70,6 +70,8 @@
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Video/AviWriter.hpp"
 #include "Gui/Window.hpp"
+#include "Database/Local/LocalDatabase.hpp"
+#include "Database/Local/SystemSettings.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
 
@@ -6073,6 +6075,71 @@ static void test_database_query() {
 }
 
 // A query window is a tab like the others: "+" opens another, tabs move between windows, and .sql files open in it.
+// The query window opens the system database like any other, and remembers where it was.
+static void test_database_query_system() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    database::local::LocalDatabase system_db(a, &fs, "/databases/system.db");
+    system_db.open();
+    database::local::SystemSettings settings(a, system_db);
+    database::local::LocalDriver driver(a);
+    driver.add_database("system", &system_db);
+    database::DatabaseManager databases(a);   // no network
+    databases.add_driver(&driver);
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    kernel::Clipboard clipboard(a);
+    w.set_clipboard(&clipboard);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    gui::NoticeDialog notices(a);
+    uint64_t clock = 0;
+    {
+      desktop::DatabaseQuery q(a);
+      q.set_notices(&notices);
+      q.set_clock(&clock);
+      q.set_databases(&databases);
+      q.set_settings(&settings, "system://localhost/system");
+      CHECK(mgr.add_window(&q));
+      w.layout();
+      CHECK(q.url_box().text().equals("system://localhost/system"));   // nothing remembered yet: the default
+      CHECK(q.connect() && q.connected() && q.title().equals("Database - Untitled - localhost/system"));
+      q.editor().set_text("SELECT scope, name, value FROM settings WHERE scope = 'database-query'");
+      CHECK(q.run() && q.grid().row_count() == 1 && q.info_label().text().first(5).equals("1 row"));
+      q.editor().set_text("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+      CHECK(q.run() && q.status_label().text().equals("CREATE TABLE"));
+      q.editor().set_text("INSERT INTO notes VALUES (1, 'kept')");
+      CHECK(q.run() && q.status_label().text().equals("INSERT 0 1"));
+      q.editor().set_text("SELECT nope FROM notes");
+      CHECK(!q.run() && notices.showing() && notices.message().find(StringView("42703")) != StringView::npos);
+      notices.close();
+      CHECK(mgr.remove_window(&q));
+    }
+    String remembered(a);
+    CHECK(settings.get_text("database-query", "url", &remembered) && remembered.view().equals("system://localhost/system"));
+    {
+      desktop::DatabaseQuery q(a);   // a window opened later starts where the last one connected
+      q.set_notices(&notices);
+      q.set_databases(&databases);
+      q.set_settings(&settings, "postgres://elsewhere/db");
+      CHECK(q.url_box().text().equals("system://localhost/system"));
+    }
+    // A URL with a password is not remembered.
+    {
+      desktop::DatabaseQuery q(a);
+      q.set_notices(&notices);
+      q.set_databases(&databases);
+      q.set_settings(&settings);
+      q.url_box().set_text("system://me:secret@localhost/system");
+      CHECK(q.connect() && settings.get_text("database-query", "url", &remembered) && !remembered.view().contains("secret"));
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_database_query_tabs() {
   TestAllocator a;
   {
@@ -6180,6 +6247,7 @@ int main() {
   test_spreadsheet_tabs();
   test_database_query();
   test_database_query_tabs();
+  test_database_query_system();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

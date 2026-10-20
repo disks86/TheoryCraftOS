@@ -67,6 +67,7 @@
 #include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
 #include "Database/SystemDatabases.hpp"
+#include "Database/Local/SystemSettings.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
@@ -841,6 +842,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     network::FtpFileSystem ftps(smb_network, shared_allocator, ftp_environment);
     PasswordLoginContext<network::FtpFileSystem> ftps_login{&ftps};
     SystemFileSystem explorer_files(shared_allocator, storage);
+    // The system database: one file on the root volume (/databases/system.db) where the OS and its programs keep their settings; the database query
+    // window can open it too (system://localhost/system). Without a writable root volume it lives in memory for this session.
+    database::local::LocalDatabase system_database(shared_allocator, &explorer_files.file_system(), "/databases/system.db");
+    system_database.open();
+    database::local::LocalDriver system_driver(shared_allocator);
+    system_driver.add_database("system", &system_database);
+    databases.manager().add_driver(&system_driver);
+    database::local::SystemSettings settings(shared_allocator, system_database);
+    const int64_t boots = settings.get_int("system", "boot_count", 0) + 1;
+    settings.set_int("system", "boot_count", boots);
+    desktop.set_settings(&settings, "system://localhost/system");
+    if (system_database.persistent()) Entry(Level::Ok, "Database").text("system database ").text(system_database.path()).text(", boot ").dec(static_cast<uint64_t>(boots));
+    else Entry(Level::Warning, "Database").text("system database is in memory only: ").text(system_database.problem().view());
     if (stacks.count() > 0) {
       SharedPointer<network::NfsVolume> nfs_volume = SharedPointer<network::NfsVolume>::make(shared_allocator, nfs);
       if (nfs_volume && explorer_files.mounts().mount(desktop::FileExplorer::kNfsFolder, SharedPointer<filesystem::IVolume>(nfs_volume), 0xFFFFFFFFu))

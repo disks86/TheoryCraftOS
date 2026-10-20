@@ -214,6 +214,10 @@ add_executable(BOOTX64
   src/Database/ConnectionOptions.cpp
   src/Database/DatabaseManager.cpp
   src/Database/SqlText.cpp
+  src/Database/Local/LocalCatalog.cpp
+  src/Database/Local/LocalSql.cpp
+  src/Database/Local/LocalDatabase.cpp
+  src/Database/Local/SystemSettings.cpp
   src/Database/Net/NetworkTransport.cpp
   src/Database/Postgres/PostgresAuth.cpp
   src/Database/Postgres/PostgresConnection.cpp

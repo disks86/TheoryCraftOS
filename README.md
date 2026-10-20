@@ -40,6 +40,12 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   own yet, so connections are plain until one is given). Not supported: COPY, prepared statement reuse, binary result formats, SCRAM channel binding,
   Kerberos / GSSAPI. Tested without a server by `tests/DatabaseTest.cpp` (a pretend server written from the protocol) and over two real stacks by
   `tests/DatabaseNetworkTest.cpp`; not yet against a real PostgreSQL.
+  `Local/` is the system database: tables kept in memory and saved whole to `/databases/system.db` (written beside the old file and swapped in, with
+  recovery of a half-finished swap and a damaged file set aside), a small SQL subset (`LocalSql.hpp` lists it: CREATE/DROP TABLE, INSERT [OR REPLACE],
+  SELECT with WHERE / ORDER BY / LIMIT and aggregates, UPDATE, DELETE, SHOW TABLES, DESCRIBE), statements that are all-or-nothing and one transaction at a
+  time. The `system` driver (`system://localhost/system`, no network needed) makes it an ordinary `IConnection`, so the Database query application opens
+  it like any server; `SystemSettings` is the typed key-value face programs use (`get_int("audio", "volume", 80)`, `set_text(...)`; the query window
+  keeps its last URL there). Tested by `tests/SystemDatabaseTest.cpp`.
 - `src/Network/`: an IPv4 stack over any `INetworkInterface`, single-threaded and polled (`INetworkStack::poll()`).
   `NetworkStack` does Ethernet framing, ARP (cache + queue of packets awaiting resolution), IPv4 and ICMP echo;
   it owns a `UdpManager`/`UdpSocket` (`IUdpSocket`), a `TcpManager`/`TcpSocket` (`ITcpSocket`: RFC 793 state
