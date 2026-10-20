@@ -35,6 +35,7 @@
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/ComputerManager.hpp"
@@ -72,7 +73,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -124,6 +125,10 @@ class Desktop {
   // Returns the window (nullptr if memory ran out).
   Paint* open_paint(gui::TabFrame* into = nullptr);
   Notepad& notepad() { return notepad_; }
+  // Opens a spreadsheet window: the first one is spreadsheet() (when that is closed), further ones are made as needed and go away when closed.
+  Spreadsheet* open_spreadsheet(gui::TabFrame* into = nullptr);
+  Spreadsheet& spreadsheet() { return spreadsheet_; }
+  uint32_t spreadsheet_count() const;
   // Opens a terminal window: the first one is terminal() (when that is closed), further ones are made as needed and go away when closed.
   Terminal* open_terminal(gui::TabFrame* into = nullptr);
   Terminal& terminal() { return terminal_; }
@@ -205,6 +210,7 @@ class Desktop {
   static void on_media_player(void* self, gui::Control&);
   static void on_graphics_test(void* self, gui::Control&);
   static void on_text_editor(void* self, gui::Control&);
+  static void on_spreadsheet(void* self, gui::Control&);
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
@@ -234,12 +240,14 @@ class Desktop {
   static void on_tab_torn_off(void* self, gui::Control& sender);
   void setup_explorer(FileExplorer& explorer);
   void setup_notepad(Notepad& notepad);
+  void setup_spreadsheet(Spreadsheet& sheet);
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
   void reap_closed();
   // The text editor / paint window to open a file in: the one that already shows it, an open empty one, or a new one.
   Notepad* editor_for(StringView path);
   Paint* paint_for(StringView path);
+  Spreadsheet* spreadsheet_for(StringView path);
 
   allocators::IAllocator& allocator_;
   gui::Theme theme_;
@@ -264,6 +272,7 @@ class Desktop {
   ComputerManager computer_manager_;
   Notepad notepad_;
   Paint paint_;
+  Spreadsheet spreadsheet_;
   Terminal terminal_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
@@ -276,6 +285,7 @@ class Desktop {
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;
+  List<UniquePointer<Spreadsheet>> extra_sheets_;
   List<UniquePointer<Terminal>> extra_terminals_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;

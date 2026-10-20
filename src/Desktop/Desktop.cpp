@@ -48,6 +48,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       computer_manager_(allocator),
       notepad_(allocator),
       paint_(allocator),
+      spreadsheet_(allocator),
       terminal_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
@@ -59,6 +60,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       extra_explorers_(allocator),
       extra_notepads_(allocator),
       extra_paints_(allocator),
+      extra_sheets_(allocator),
       extra_terminals_(allocator),
       hosts_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
@@ -75,6 +77,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
   start_.menu().add_item("Computer Manager", {&Desktop::on_computer_manager, this});
   start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});
+  start_.menu().add_item("Spreadsheet", {&Desktop::on_spreadsheet, this});
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
@@ -120,6 +123,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   file_dialog_.set_clock(&now_us_);
   setup_notepad(notepad_);
   setup_paint(paint_);
+  setup_spreadsheet(spreadsheet_);
   setup_terminal(terminal_);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
@@ -181,10 +185,12 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
     explorer_.set_file_system(fs);
     notepad_.set_file_system(fs);
     paint_.set_file_system(fs);
+    spreadsheet_.set_file_system(fs);
     terminal_.set_file_system(fs);
     for (auto& e : extra_explorers_) e->set_file_system(fs);
     for (auto& n : extra_notepads_) n->set_file_system(fs);
     for (auto& p : extra_paints_) p->set_file_system(fs);
+    for (auto& s : extra_sheets_) s->set_file_system(fs);
     for (auto& t : extra_terminals_) t->set_file_system(fs);
   });
   media_player_.set_file_system(fs);
@@ -207,6 +213,13 @@ void Desktop::setup_notepad(Notepad& notepad) {
   notepad.set_file_dialog(&file_dialog_);
   notepad.set_print_dialog(&print_dialog_);
   notepad.set_file_system(fs_);
+}
+
+void Desktop::setup_spreadsheet(Spreadsheet& sheet) {
+  sheet.set_app_kind(kAppSheet);
+  sheet.set_notices(&notice_dialog_);
+  sheet.set_file_dialog(&file_dialog_);
+  sheet.set_file_system(fs_);
 }
 
 void Desktop::setup_terminal(Terminal& terminal) {
@@ -295,6 +308,7 @@ void Desktop::on_new_tab(void* self, Control& sender) {
   switch (kind) {
     case kAppEditor: d->open_text_editor(host); break;
     case kAppPaint: d->open_paint(host); break;
+    case kAppSheet: d->open_spreadsheet(host); break;
     case kAppTerminal: d->open_terminal(host); break;
     case kAppMedia: d->open_media_player(host); break;
     default: d->open_explorer(host); break;
@@ -332,6 +346,7 @@ void Desktop::reap_closed() {
     sweep(extra_explorers_);
     sweep(extra_notepads_);
     sweep(extra_paints_);
+    sweep(extra_sheets_);
     sweep(extra_terminals_);
     sweep(hosts_);
   });
@@ -386,6 +401,34 @@ void Desktop::on_terminal(void* self, Control&) { static_cast<Desktop*>(self)->o
 void Desktop::on_new_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
 
 Paint* Desktop::open_paint(TabFrame* into) { return open_instance(paint_, extra_paints_, &Desktop::setup_paint, into); }
+
+Spreadsheet* Desktop::open_spreadsheet(TabFrame* into) { return open_instance(spreadsheet_, extra_sheets_, &Desktop::setup_spreadsheet, into); }
+
+uint32_t Desktop::spreadsheet_count() const {
+  uint32_t n = spreadsheet_.manager() ? 1 : 0;
+  for (const auto& e : extra_sheets_) n += e->manager() ? 1 : 0;
+  return n;
+}
+
+// The spreadsheet window to open a file in: the one that already shows it, an open empty one, or a new one.
+Spreadsheet* Desktop::spreadsheet_for(StringView path) {
+  Spreadsheet* found = nullptr;
+  window_.locked([&] {
+    Spreadsheet* blank = nullptr;
+    auto look = [&](Spreadsheet& s) {
+      if (!s.manager()) return;
+      uint32_t columns, rows;
+      s.sheet().used_extent(&columns, &rows);
+      if (s.path().equals(path)) found = &s;
+      else if (!blank && s.path().empty() && !s.sheet().modified() && columns == 0) blank = &s;
+    };
+    look(spreadsheet_);
+    for (auto& e : extra_sheets_) look(*e);
+    if (!found) found = blank ? blank : open_spreadsheet();
+    if (found) found->activate();
+  });
+  return found;
+}
 
 Notepad* Desktop::editor_for(StringView path) {
   Notepad* found = nullptr;
@@ -576,6 +619,7 @@ void Desktop::on_paint(void* self, Control&) { static_cast<Desktop*>(self)->open
 void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self)->open_media_player(); }
 void Desktop::on_graphics_test(void* self, Control&) { static_cast<Desktop*>(self)->open_graphics_test(); }
 void Desktop::on_text_editor(void* self, Control&) { static_cast<Desktop*>(self)->open_text_editor(); }
+void Desktop::on_spreadsheet(void* self, Control&) { static_cast<Desktop*>(self)->open_spreadsheet(); }
 void Desktop::on_explorer_file(void* self, Control& sender) {
   auto* d = static_cast<Desktop*>(self);
   d->open_file(static_cast<FileExplorer&>(sender).opened_file());   // (only explorers fire this)
@@ -584,6 +628,10 @@ void Desktop::on_explorer_file(void* self, Control& sender) {
 void Desktop::open_file(StringView file) {
   if (Paint::is_picture_name(file)) {  // pictures open in Paint, everything else as text
     if (Paint* paint = paint_for(file)) paint->open_file(file);
+    return;
+  }
+  if (Spreadsheet::is_sheet_name(file)) {   // CSV files open in the spreadsheet
+    if (Spreadsheet* sheet = spreadsheet_for(file)) sheet->open_file(file);
     return;
   }
   if (MediaPlayer::is_media_name(file)) {   // sound and video open in the media player

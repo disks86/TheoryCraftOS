@@ -40,6 +40,8 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Desktop/Spreadsheet.hpp"
+#include "Gui/Controls/SpreadsheetGrid.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/ComputerManager.hpp"
@@ -2074,7 +2076,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 9);   // Explorer, Computer Manager, Text Editor, Terminal, Paint, Media Player, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 11);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Terminal, Paint, Media Player, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -5454,6 +5456,397 @@ static void test_window_switcher_menu() {
   CHECK(a.live == 0);
 }
 
+
+// --- Spreadsheet grid and application ------------------------------------------------------------------------
+
+struct FakeSheetView final : gui::ISheetView {
+  uint32_t cols = 10, row_total = 100;
+  uint32_t column_count() const override { return cols; }
+  uint32_t row_count() const override { return row_total; }
+  bool cell_text(uint32_t c, uint32_t r, String* out, bool* right) override {
+    out->clear();
+    out->append("R");
+    out->append_uint(r + 1);
+    out->append("C");
+    out->append_uint(c + 1);
+    *right = c == 1;
+    return true;
+  }
+};
+
+static void test_spreadsheet_grid() {
+  TestAllocator a;
+  {
+    Screen screen(a, 500, 400);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {500, 400});
+    gui::SpreadsheetGrid g(a);
+    FakeSheetView model;
+    g.set_bounds({10, 10, 400, 300});
+    w.add(&g);
+    g.set_model(&model);
+    w.layout();
+    Counter selected, edits, clears, copies, cuts, pastes;
+    g.on_selection_changed(selected.handler());
+    g.on_edit_requested(edits.handler());
+    g.on_clear_requested(clears.handler());
+    g.on_copy_requested(copies.handler());
+    g.on_cut_requested(cuts.handler());
+    g.on_paste_requested(pastes.handler());
+
+    // Geometry: a row header 3 digits wide, 18 pixel rows, 80 pixel columns; both scroll bars (800 pixels of columns, 1800 of rows).
+    CHECK(g.row_header_width() == 36 && g.body_rect().x == 38 && g.body_rect().y == 20);
+    CHECK(g.vertical_scroll_bar().visible() && g.horizontal_scroll_bar().visible());
+    CHECK(g.visible_row_count() == 14 && g.visible_column_count() == 4);
+    CHECK(g.cell_rect(0, 0).x == 38 && g.cell_rect(0, 0).y == 20 && g.cell_rect(0, 0).width == 80 && g.cell_rect(2, 3).x == 38 + 160 && g.cell_rect(2, 3).y == 20 + 54);
+    uint32_t c = 99, r = 99;
+    CHECK(g.cell_at(40, 22, &c, &r) && c == 0 && r == 0 && g.cell_at(38 + 80, 20 + 18, &c, &r) && c == 1 && r == 1);
+    CHECK(!g.cell_at(10, 22, &c, &r) && !g.cell_at(40, 5, &c, &r));
+    CHECK(g.active_column() == 0 && g.active_row() == 0 && g.single_cell_selected());
+
+    // A click selects a cell, a drag a block.
+    auto point = [&](uint32_t col, uint32_t row) {
+      const Rect2D cr = g.cell_rect(col, row);
+      return Point{10 + cr.x + 10, 10 + cr.y + 8};
+    };
+    Point p = point(2, 3);
+    click(w, p.x, p.y);
+    CHECK(g.active_column() == 2 && g.active_row() == 3 && selected.count == 1 && w.focus() == &g);
+    w.mouse_move(p.x, p.y);
+    w.mouse_button(p.x, p.y, MouseButton::Left, true);
+    Point q = point(3, 5);
+    w.mouse_move(q.x, q.y);
+    w.mouse_button(q.x, q.y, MouseButton::Left, false);
+    CHECK(g.active_column() == 3 && g.active_row() == 5 && g.selection_left() == 2 && g.selection_right() == 3 && g.selection_top() == 3 && g.selection_bottom() == 5);
+    CHECK(!g.single_cell_selected());
+
+    // Keys.
+    press(w, key::kRight);
+    CHECK(g.active_column() == 4 && g.single_cell_selected());
+    press(w, key::kTab);
+    CHECK(g.active_column() == 5);
+    press(w, key::kTab, modifier::kLeftShift);
+    CHECK(g.active_column() == 4);
+    press(w, key::kEnter);
+    CHECK(g.active_row() == 6);
+    press(w, key::kEnter, modifier::kLeftShift);
+    CHECK(g.active_row() == 5);
+    press(w, key::kUp);
+    press(w, key::kLeft);
+    CHECK(g.active_column() == 3 && g.active_row() == 4);
+    press(w, key::kDown, modifier::kLeftShift);
+    press(w, key::kRight, modifier::kLeftShift);
+    CHECK(g.selection_left() == 3 && g.selection_right() == 4 && g.selection_top() == 4 && g.selection_bottom() == 5 && g.active_column() == 4);
+    press(w, 0x4A);   // Home
+    CHECK(g.active_column() == 0 && g.single_cell_selected());
+    press(w, 0x4D);   // End
+    CHECK(g.active_column() == 9);
+    press(w, 0x4A, modifier::kLeftControl);   // Ctrl+Home
+    CHECK(g.active_column() == 0 && g.active_row() == 0);
+    press(w, key::kLeft);
+    press(w, key::kUp);
+    CHECK(g.active_column() == 0 && g.active_row() == 0);   // (the edges stop it)
+    press(w, key::kA, modifier::kLeftControl);
+    CHECK(g.selection_left() == 0 && g.selection_right() == 9 && g.selection_top() == 0 && g.selection_bottom() == 99);
+    press(w, key::kRight);   // the active cell is the far corner: moving from there
+    CHECK(g.single_cell_selected() && g.active_column() == 9 && g.active_row() == 99);
+
+    // Scrolling follows the active cell; the bars follow the scrolling.
+    press(w, 0x4A, modifier::kLeftControl);
+    CHECK(g.first_row() == 0 && g.first_column() == 0);
+    for (int i = 0; i < 20; ++i) press(w, key::kDown);
+    CHECK(g.active_row() == 20 && g.first_row() == 20 + 1 - 14 && g.vertical_scroll_bar().value() == static_cast<int32_t>(g.first_row()));
+    for (int i = 0; i < 6; ++i) press(w, key::kRight);
+    CHECK(g.active_column() == 6 && g.first_column() == 6 + 1 - 4 && g.horizontal_scroll_bar().value() == static_cast<int32_t>(g.first_column()));
+    press(w, 0x4A);   // Home goes back to the first column and shows it
+    CHECK(g.first_column() == 0);
+    press(w, 0x4E);   // Page Down: 13 rows
+    CHECK(g.active_row() == 33);
+    press(w, 0x4B);   // Page Up
+    CHECK(g.active_row() == 20);
+    const uint32_t before = g.first_row();
+    w.mouse_wheel(100, 100, -1);
+    CHECK(g.first_row() == before + 3);
+    w.mouse_wheel(100, 100, 1);
+    CHECK(g.first_row() == before);
+    g.vertical_scroll_bar().set_value(0);
+    CHECK(g.first_row() == 0);
+
+    // Typing, F2, Delete and the clipboard keys only ask.
+    press(w, 0x4A, modifier::kLeftControl);
+    type_char(w, 'x');
+    CHECK(edits.count == 1 && g.edit_request_char() == 'x');
+    press(w, key::kF1 + 1);
+    CHECK(edits.count == 2 && g.edit_request_char() == 0);
+    press(w, key::kDelete);
+    press(w, key::kBackspace);
+    CHECK(clears.count == 2);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    press(w, key::kA + 23, modifier::kLeftControl);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(copies.count == 1 && cuts.count == 1 && pastes.count == 1 && edits.count == 2);   // (Ctrl+letters are not typing)
+
+    // Column letters and row numbers select whole columns and rows; the corner everything.
+    const int32_t header_y = 10 + 2 + 9;
+    p = {10 + g.cell_rect(2, 0).x + 20, header_y};
+    click(w, p.x, p.y);
+    CHECK(g.selection_left() == 2 && g.selection_right() == 2 && g.selection_top() == 0 && g.selection_bottom() == 99);
+    p = {10 + 2 + 10, 10 + g.cell_rect(0, 4).y + 8};
+    click(w, p.x, p.y);
+    CHECK(g.selection_top() == 4 && g.selection_bottom() == 4 && g.selection_left() == 0 && g.selection_right() == 9);
+    click(w, 10 + 2 + 10, header_y);
+    CHECK(g.selection_left() == 0 && g.selection_right() == 9 && g.selection_top() == 0 && g.selection_bottom() == 99);
+
+    // Dragging the border at the right of a column letter changes its width.
+    click(w, point(0, 0).x, point(0, 0).y);
+    const int32_t edge = 10 + g.cell_rect(0, 0).x + 80 - 1;
+    w.mouse_move(edge, header_y);
+    w.mouse_button(edge, header_y, MouseButton::Left, true);
+    w.mouse_move(edge + 30, header_y);
+    w.mouse_button(edge + 30, header_y, MouseButton::Left, false);
+    CHECK(g.column_width(0) == 110 && g.column_width(1) == 80 && g.cell_rect(1, 0).x == 38 + 110 && g.single_cell_selected());
+    g.set_column_width(0, 5);
+    CHECK(g.column_width(0) == gui::SpreadsheetGrid::kMinColumnWidth);
+    g.set_column_width(0, 80);
+
+    // What is painted: the heavy frame of the active cell, the cells' text, and the text being typed in the active cell (at its left; the model's
+    // cell is a number and sits at the right).
+    g.select(1, 1);
+    w.render();
+    const Rect2D ar = g.cell_rect(1, 1);
+    CHECK(screen.px(10 + ar.x - 1, 10 + ar.y + 8) == theme.text && screen.px(10 + ar.x, 10 + ar.y + 8) == theme.text);   // the left edge, two pixels thick
+    auto has_ink = [&](const Rect2D& cr, int32_t from, int32_t to) {
+      for (int32_t y = cr.y + 2; y < cr.y + static_cast<int32_t>(cr.height) - 2; ++y)
+        for (int32_t x = cr.x + from; x < cr.x + to; ++x)
+          if (screen.px(10 + x, 10 + y) == theme.text) return true;
+      return false;
+    };
+    CHECK(has_ink(g.cell_rect(0, 3), 4, 76) && has_ink(g.cell_rect(1, 3), 4, 76));
+    CHECK(!has_ink(ar, 4, 12) && has_ink(ar, 40, 76));   // the number is at the right
+    g.set_edit_text("typing");
+    w.render();
+    CHECK(g.editing() && has_ink(ar, 4, 12));
+    g.stop_editing();
+    w.render();
+    CHECK(!g.editing() && !has_ink(ar, 4, 12));
+    model.cols = 3;
+    g.model_changed();
+    CHECK(!g.horizontal_scroll_bar().visible());
+    g.select(2, 2);
+    model.cols = 2;
+    g.model_changed();
+    CHECK(g.active_column() == 1);
+  }
+  CHECK(a.live == 0);
+}
+
+// How a cell of the spreadsheet application shows.
+static bool shows(TestAllocator& a, desktop::Spreadsheet& sp, uint32_t column, uint32_t row, const char* expected) {
+  String out(a);
+  sp.sheet().display(column, row, &out);
+  const bool same = out.view().equals(expected);
+  if (!same) printf("   cell %u,%u shows \"%s\", expected \"%s\"\n", column, row, out.c_str(), expected);
+  return same;
+}
+
+static void test_spreadsheet_app() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/in.csv", "1,2,=A1+B1\r\n\"x,y\",,\r\n");
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    kernel::Clipboard clipboard(a);
+    w.set_clipboard(&clipboard);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::Spreadsheet sp(a);
+    CHECK(mgr.add_window(&sp));
+    w.layout();
+    sp.set_file_system(&fs);
+    gui::SpreadsheetGrid& g = sp.grid();
+    CHECK(sp.title().equals("Spreadsheet - Untitled") && sp.name_label().text().equals("A1") && sp.formula_bar().text().empty());
+
+    // Typing in the grid starts an edit in the formula bar, which shows in the cell; Enter keeps it and moves down.
+    w.set_focus(&g);
+    type_char(w, '5');
+    CHECK(sp.editing() && sp.formula_bar().text().equals("5") && w.focus() == &sp.formula_bar() && g.editing());
+    press(w, key::kEnter);
+    CHECK(!sp.editing() && !g.editing() && w.focus() == &g && g.active_row() == 1 && sp.sheet().text(0, 0).equals("5"));
+    CHECK(sp.title().equals("Spreadsheet - Untitled *") && sp.name_label().text().equals("A2"));
+    type_text(w, "=A1*2");
+    CHECK(sp.editing() && sp.formula_bar().text().equals("=A1*2") && sp.sheet().text(0, 1).empty());   // (not kept yet)
+    press(w, key::kEnter);
+    CHECK(shows(a, sp, 0, 1, "10") && g.active_row() == 2);
+    // Tab keeps and moves right; typing over an old value replaces it.
+    press(w, key::kUp);
+    press(w, key::kUp);
+    type_text(w, "7");
+    press(w, key::kTab);
+    CHECK(sp.sheet().text(0, 0).equals("7") && shows(a, sp, 0, 1, "14") && g.active_column() == 1 && g.active_row() == 0);
+    // Escape drops the edit, and F2 edits what is there.
+    type_text(w, "oops");
+    CHECK(sp.editing());
+    press(w, key::kEscape);
+    CHECK(!sp.editing() && w.focus() == &g && sp.sheet().text(1, 0).empty() && sp.formula_bar().text().empty());
+    press(w, key::kLeft);
+    press(w, key::kF1 + 1);
+    CHECK(sp.editing() && sp.formula_bar().text().equals("7") && w.focus() == &sp.formula_bar());
+    type_text(w, "0");
+    press(w, key::kEnter);
+    CHECK(sp.sheet().text(0, 0).equals("70") && shows(a, sp, 0, 1, "140"));
+    // Clicking another cell while typing keeps the text, in the cell it was typed in.
+    g.select(2, 0);
+    type_text(w, "abc");
+    const Rect2D target = g.cell_rect(3, 3);
+    const Point go = {g.window_origin().x + target.x + 10, g.window_origin().y + target.y + 8};
+    click(w, go.x, go.y);
+    CHECK(!sp.editing() && sp.sheet().text(2, 0).equals("abc") && g.active_column() == 3 && g.active_row() == 3);
+    // Errors show in the cell, and the status bar sums the selection.
+    g.select(0, 0);
+    g.select(0, 1, true);
+    CHECK(sp.summary_label().text().equals("Count: 2   Sum: 210   Avg: 105"));
+    g.select(5, 5);
+    type_text(w, "=1/0");
+    press(w, key::kEnter);
+    CHECK(shows(a, sp, 5, 5, "#DIV/0!"));
+    g.select(5, 5);
+
+    // Copy and paste: formulas move along when pasted somewhere else.
+    g.select(0, 1);
+    press(w, key::kA + 2, modifier::kLeftControl);
+    String clip(a);
+    CHECK(clipboard.get_text(&clip) && clip.view().equals("=A1*2\n"));
+    g.select(1, 3);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(sp.sheet().text(1, 3).equals("=B3*2") && g.selection_left() == 1 && g.selection_right() == 1);
+    // A block: the numbers on the clipboard as text from elsewhere paste as they are.
+    CHECK(clipboard.set_text("p\tq\n1\t2\n"));
+    g.select(4, 7);
+    press(w, key::kA + 21, modifier::kLeftControl);
+    CHECK(sp.sheet().text(4, 7).equals("p") && sp.sheet().text(5, 7).equals("q") && sp.sheet().text(4, 8).equals("1") && sp.sheet().text(5, 8).equals("2") && sp.sheet().text(4, 9).empty());
+    CHECK(g.selection_left() == 4 && g.selection_right() == 5 && g.selection_top() == 7 && g.selection_bottom() == 8);
+    // Cut and Delete.
+    press(w, key::kA + 23, modifier::kLeftControl);
+    CHECK(sp.sheet().text(4, 7).empty() && sp.sheet().text(5, 8).empty() && clipboard.get_text(&clip) && clip.view().equals("p\tq\n1\t2\n"));
+    g.select(0, 0);
+    press(w, key::kDelete);
+    CHECK(sp.sheet().text(0, 0).empty() && shows(a, sp, 0, 1, "0"));
+
+    // Saving writes CSV; opening reads it (and drops what was there).
+    sp.sheet().clear();
+    sp.sheet().set_text(0, 0, "1");
+    sp.sheet().set_text(1, 0, "2");
+    sp.sheet().set_text(2, 0, "=A1+B1");
+    sp.sheet().set_text(0, 1, "x,y");
+    CHECK(sp.save_file("out.csv") && sp.path().equals("/out.csv") && sp.title().equals("Spreadsheet - out.csv") && sp.status_label().text().equals("Saved /out.csv"));
+    UniquePointer<filesystem::IFile> f;
+    CHECK(fs.open_file("/out.csv", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() == 19);
+    char got[32] = {};
+    uint64_t n = 0;
+    CHECK(f->read(0, ByteView(reinterpret_cast<uint8_t*>(got), 19), &n) == filesystem::Status::Ok && !strcmp(got, "1,2,=A1+B1\n\"x,y\",,\n"));
+    f.reset();
+    CHECK(sp.new_document() && sp.sheet().text(0, 0).empty() && sp.path().empty() && sp.title().equals("Spreadsheet - Untitled"));   // (saved: nothing to lose)
+    CHECK(sp.open_file("/in.csv") && shows(a, sp, 2, 0, "3") && sp.sheet().text(0, 1).equals("x,y") && !sp.sheet().modified() && sp.path().equals("/in.csv"));
+    CHECK(sp.name_label().text().equals("A1") && g.active_column() == 0);
+    sp.sheet().set_text(0, 5, "dirty");
+    CHECK(!sp.open_file("/out.csv") && sp.status_label().text().first(13).equals("Unsaved chang"));   // the first time only warns
+    CHECK(sp.open_file("/out.csv") && sp.sheet().text(0, 5).empty());
+    CHECK(!sp.open_file("/nope.csv") && sp.status_label().text().equals("Cannot open /nope.csv: not found"));
+    press(w, key::kA + 14, modifier::kLeftControl);   // Ctrl+O without a dialog
+    CHECK(sp.status_label().text().equals("No file dialog available."));
+    CHECK(desktop::Spreadsheet::is_sheet_name("/a/b.csv") && desktop::Spreadsheet::is_sheet_name("X.CSV") && !desktop::Spreadsheet::is_sheet_name("a.txt") && !desktop::Spreadsheet::is_sheet_name(".csv"));
+    w.render();
+    mgr.remove_window(&sp);
+    w.set_clipboard(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
+// Spreadsheets are tabs like the other programs: "+" opens another, and they move between windows by dragging.
+static void test_spreadsheet_tabs() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/data.csv", "1,2\r\n");
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+
+    desktop::Spreadsheet* s1 = d.open_spreadsheet();
+    auto* h1 = static_cast<gui::TabFrame*>(s1->host());
+    CHECK(s1 == &d.spreadsheet() && h1 && s1->embedded() && h1->tab_count() == 1 && d.spreadsheet_count() == 1 && s1->app_kind() == desktop::Desktop::kAppSheet);
+    put(h1, {20, 20, 560, 380});
+    w.layout();
+    // The Start menu has it.
+    bool in_menu = false;
+    for (uint32_t i = 0; i < d.start_button().menu().item_count(); ++i) in_menu = in_menu || d.start_button().menu().item(i)->text.view().equals("Spreadsheet");
+    CHECK(in_menu);
+
+    // "+": another spreadsheet in a new tab (not some other program).
+    const Rect2D plus = h1->new_tab_button_rect();
+    const Point po = h1->window_origin();
+    click(w, po.x + plus.x + 8, po.y + plus.y + 6);
+    CHECK(h1->tab_count() == 2 && d.spreadsheet_count() == 2);
+    auto* s2 = static_cast<desktop::Spreadsheet*>(h1->tab_at(1));
+    CHECK(s2 != s1 && s2->app_kind() == desktop::Desktop::kAppSheet && h1->selected() == s2 && s2->visible() && !s1->visible());
+    s2->sheet().set_text(0, 0, "second");
+    // The cells of a tab are its own.
+    CHECK(s1->sheet().text(0, 0).empty());
+
+    // Dragging the second tab out of the window makes a window of its own, and the sheet keeps its contents and keeps working.
+    Point tp = tab_point(h1, 1);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    w.mouse_move(tp.x + 100, tp.y + 300);
+    CHECK(w.dragging());
+    w.mouse_button(tp.x + 100, tp.y + 300, MouseButton::Left, false);
+    CHECK(m.window_count() == 2 && h1->tab_count() == 1 && s2->host() && s2->host() != h1 && s2->sheet().text(0, 0).equals("second"));
+    auto* h2 = static_cast<gui::TabFrame*>(s2->host());
+    put(h2, {600, 20, 380, 380});
+    w.layout();
+
+    // And onto the strip of a window with another program in it: spreadsheets and text editors share windows.
+    desktop::Notepad* editor = d.open_text_editor();
+    auto* h3 = static_cast<gui::TabFrame*>(editor->host());
+    put(h3, {20, 420, 500, 250});
+    w.layout();
+    tp = tab_point(h2, 0);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    const Point strip = tab_point(h3, 0, 4);
+    w.mouse_move(strip.x + 30, strip.y);
+    w.mouse_move(strip.x, strip.y);
+    CHECK(w.dragging());
+    w.mouse_button(strip.x, strip.y, MouseButton::Left, false);
+    CHECK(h3->tab_count() == 2 && h3->tab_at(0) == s2 && h3->tab_at(1) == editor && s2->host() == h3 && s2->sheet().text(0, 0).equals("second"));
+    // "+" now follows the program of the selected tab.
+    const Rect2D plus3 = h3->new_tab_button_rect();
+    const Point po3 = h3->window_origin();
+    click(w, po3.x + plus3.x + 8, po3.y + plus3.y + 6);
+    CHECK(h3->tab_count() == 3 && h3->selected() && h3->selected()->app_kind() == desktop::Desktop::kAppSheet);
+
+    // Opening a .csv from an explorer (or the desktop) uses a spreadsheet: an empty one that is open, else a new one.
+    CHECK(d.open_path("/data.csv"));
+    CHECK(d.spreadsheet_count() == 3 || d.spreadsheet_count() == 4);
+    bool found = false;
+    for (uint32_t i = 0; i < h3->tab_count(); ++i) {
+      auto* f = h3->tab_at(i);
+      if (f->app_kind() == desktop::Desktop::kAppSheet && static_cast<desktop::Spreadsheet*>(f)->path().equals("/data.csv")) found = true;
+    }
+    if (s1->path().equals("/data.csv")) found = true;
+    CHECK(found);
+    CHECK(d.text_editor_count() == 1);   // (not opened as text)
+    // Closing the extra spreadsheets frees them.
+    d.step(1000000);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -5486,6 +5879,9 @@ int main() {
   test_wheel_switching();
   test_desktop_shortcuts();
   test_tabs();
+  test_spreadsheet_grid();
+  test_spreadsheet_app();
+  test_spreadsheet_tabs();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

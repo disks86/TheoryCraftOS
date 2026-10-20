@@ -1226,9 +1226,11 @@ static void test_desktop() {
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // File Explorer
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Computer Manager
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Text Editor
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Spreadsheet
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Terminal
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Paint
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Media Player
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // 3D Test
     d.step(5500000);
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // About
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // skips the separator: Shut Down...

@@ -207,6 +207,7 @@ add_executable(BOOTX64
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
   src/Math/FloatMath.cpp
+  src/Spreadsheet/Sheet.cpp
   src/Math/Vector.hpp
   src/Math/Matrix.hpp
   src/Hardware/Bus/Pci/LegacyPciBus.cpp
@@ -254,6 +255,7 @@ add_executable(BOOTX64
   src/Desktop/ComputerManager.cpp
   src/Desktop/HardwareInventory.cpp
   src/Desktop/Notepad.cpp
+  src/Desktop/Spreadsheet.cpp
   src/Desktop/Paint.cpp
   src/Desktop/MediaPlayer.cpp
   src/Desktop/Graphics3DTest.cpp
@@ -295,6 +297,7 @@ add_executable(BOOTX64
   src/Gui/Controls/DrawingCanvas.cpp
   src/Gui/Controls/TabControl.cpp
   src/Gui/Controls/BreadcrumbBar.cpp
+  src/Gui/Controls/SpreadsheetGrid.cpp
   src/Gui/Controls/TextEditor.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
