@@ -1,0 +1,203 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "Gui/Controls/PageView.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
+
+namespace gui {
+
+namespace {
+constexpr uint32_t kPaper = 0xFFFFFFFFu, kInk = 0xFF000000u, kHeadingInk = 0xFF000080u, kLinkInk = 0xFF0000EEu, kHoverInk = 0xFFCC0000u;
+constexpr uint32_t kCodeShade = 0xFFEAEAEAu, kRuleInk = 0xFF808080u;
+constexpr uint8_t kPageUp = 0x4B, kPageDown = 0x4E, kHome = 0x4A, kEnd = 0x4D, kSpace = hardware::key::kSpace, kUp = hardware::key::kUp, kDown = hardware::key::kDown;
+}  // namespace
+
+PageView::PageView(allocators::IAllocator& allocator)
+    : Control(allocator), layout_(allocator), scroll_bar_(allocator, Orientation::Vertical), clicked_link_(allocator), hovered_link_(allocator) {
+  scroll_bar_.on_value_changed(Handler::immediate(&PageView::scroll_changed, this));
+  add(&scroll_bar_);
+}
+
+void PageView::set_document(UniquePointer<browser::HtmlDocument> document) {
+  UiGuard lock(this);
+  document_ = util::move(document);
+  stale_ = true;
+  top_ = 0;
+  hover_ = press_link_ = -1;
+  hovered_link_.clear();
+  measure();
+  sync_scroll_bar();
+  invalidate();
+}
+
+void PageView::measure() {
+  const int32_t w = static_cast<int32_t>(bounds_.width) - ScrollBar::kThickness - 2 * kMargin, h = static_cast<int32_t>(bounds_.height);
+  const uint32_t columns = w >= Painter::kGlyphWidth ? static_cast<uint32_t>(w / Painter::kGlyphWidth) : 1;
+  rows_ = h >= kLineHeight ? static_cast<uint32_t>(h / kLineHeight) : 1;
+  if (stale_ || columns != layout_.columns()) {
+    if (document_) layout_.build(*document_, columns);
+    else layout_.clear();
+    stale_ = false;
+  }
+  const uint32_t lines = layout_.line_count();
+  if (top_ + rows_ > lines) top_ = lines > rows_ ? lines - rows_ : 0;
+}
+
+void PageView::sync_scroll_bar() {
+  syncing_ = true;
+  scroll_bar_.set_metrics(static_cast<int32_t>(layout_.line_count()), static_cast<int32_t>(rows_));
+  scroll_bar_.set_value(static_cast<int32_t>(top_));
+  syncing_ = false;
+}
+
+void PageView::layout() {
+  measure();
+  sync_scroll_bar();
+  const int32_t thick = ScrollBar::kThickness;
+  scroll_bar_.set_bounds({static_cast<int32_t>(bounds_.width) - thick, 0, static_cast<uint32_t>(thick), bounds_.height});
+  Control::layout();
+}
+
+void PageView::scroll_changed(void* self, Control&) {
+  auto* v = static_cast<PageView*>(self);
+  if (v->syncing_) return;
+  v->top_ = static_cast<uint32_t>(v->scroll_bar_.value());
+  v->invalidate();
+}
+
+void PageView::scroll_to_line(uint32_t line) {
+  UiGuard lock(this);
+  const uint32_t lines = layout_.line_count();
+  const uint32_t max_top = lines > rows_ ? lines - rows_ : 0;
+  top_ = line < max_top ? line : max_top;
+  sync_scroll_bar();
+  invalidate();
+}
+
+void PageView::scroll_by(int32_t lines) {
+  UiGuard lock(this);
+  int64_t to = static_cast<int64_t>(top_) + lines;
+  if (to < 0) to = 0;
+  scroll_to_line(static_cast<uint32_t>(to));
+}
+
+// --- Links ------------------------------------------------------------------------------------------
+
+bool PageView::locate(int32_t x, int32_t y, uint32_t* line, uint32_t* column) const {
+  const int32_t usable = static_cast<int32_t>(bounds_.width) - ScrollBar::kThickness;
+  if (x < kMargin || x >= usable || y < 0) return false;
+  const uint32_t l = top_ + static_cast<uint32_t>(y / kLineHeight);
+  if (l >= layout_.line_count()) return false;
+  *line = l;
+  *column = static_cast<uint32_t>((x - kMargin) / Painter::kGlyphWidth);
+  return true;
+}
+
+int32_t PageView::link_index_at(int32_t x, int32_t y) const {
+  uint32_t line, column;
+  if (!document_ || !locate(x, y, &line, &column)) return -1;
+  return layout_.link_at(*document_, line, column);
+}
+
+bool PageView::link_at(int32_t x, int32_t y, String* target) const {
+  UiGuard lock(this);
+  const int32_t link = link_index_at(x, y);
+  if (link < 0) return false;
+  return target->assign(document_->link(static_cast<uint32_t>(link)));
+}
+
+void PageView::set_hover(int32_t link) {
+  if (link == hover_) return;
+  hover_ = link;
+  hovered_link_.assign(link >= 0 && document_ ? document_->link(static_cast<uint32_t>(link)) : StringView());
+  invalidate();
+  fire(hover_handler_);
+}
+
+void PageView::on_mouse_down(const MouseArgs& args) {
+  UiGuard lock(this);
+  press_link_ = args.button == MouseButton::Left ? link_index_at(args.x, args.y) : -1;
+}
+
+void PageView::on_mouse_move(const MouseArgs& args) {
+  UiGuard lock(this);
+  set_hover(link_index_at(args.x, args.y));
+}
+
+void PageView::on_mouse_up(const MouseArgs& args) {
+  UiGuard lock(this);
+  const int32_t pressed = press_link_;
+  press_link_ = -1;
+  if (pressed < 0 || args.button != MouseButton::Left || link_index_at(args.x, args.y) != pressed || !document_) return;
+  clicked_link_.assign(document_->link(static_cast<uint32_t>(pressed)));
+  fire(link_handler_);
+}
+
+void PageView::on_mouse_leave() {
+  UiGuard lock(this);
+  set_hover(-1);
+}
+
+bool PageView::on_key(const KeyArgs& args) {
+  const bool shift = args.modifiers & hardware::modifier::kShift;
+  const int32_t page = rows_ > 1 ? static_cast<int32_t>(rows_) - 1 : 1;
+  switch (args.usage) {
+    case kUp: scroll_by(-1); return true;
+    case kDown: scroll_by(1); return true;
+    case kPageUp: scroll_by(-page); return true;
+    case kPageDown: scroll_by(page); return true;
+    case kSpace: scroll_by(shift ? -page : page); return true;
+    case kHome: scroll_to_line(0); return true;
+    case kEnd: scroll_to_line(layout_.line_count()); return true;
+    default: return false;
+  }
+}
+
+// --- Painting ---------------------------------------------------------------------------------------
+
+void PageView::paint(Painter& painter) {
+  const int32_t usable = static_cast<int32_t>(bounds_.width) - ScrollBar::kThickness;
+  painter.fill({0, 0, bounds_.width, bounds_.height}, kPaper);
+  measure();
+  sync_scroll_bar();
+  if (!document_) return;
+  const uint32_t lines = layout_.line_count();
+  for (uint32_t row = 0; row < rows_ && top_ + row < lines; ++row) {
+    const uint32_t line = top_ + row;
+    const int32_t y = static_cast<int32_t>(row) * kLineHeight;
+    for (uint32_t p = layout_.first_piece(line); p < layout_.end_piece(line); ++p) {
+      const browser::Piece& piece = layout_.piece(p);
+      const browser::Run& run = document_->run(piece.run);
+      const int32_t x = kMargin + static_cast<int32_t>(piece.column) * Painter::kGlyphWidth;
+      const int32_t width = static_cast<int32_t>(piece.length) * Painter::kGlyphWidth;
+      if (run.flags & browser::kRunRule) {
+        painter.fill({kMargin, y + kLineHeight / 2 - 1, static_cast<uint32_t>(usable > 2 * kMargin ? usable - 2 * kMargin : 1), 2}, kRuleInk);
+        continue;
+      }
+      if (run.flags & (browser::kRunCode | browser::kRunPre)) painter.fill({x, y, static_cast<uint32_t>(width), static_cast<uint32_t>(kLineHeight)}, kCodeShade);
+      const bool link = run.link >= 0;
+      const uint32_t ink = link ? (run.link == hover_ ? kHoverInk : kLinkInk) : (run.flags & browser::kRunHeading) ? kHeadingInk : kInk;
+      const StringView text = document_->run_text(piece.run).substr(piece.from, piece.length);
+      painter.text(x, y, text, ink);
+      if (run.flags & browser::kRunBold) painter.text(x + 1, y, text, ink);
+      if (link) painter.fill({x, y + kLineHeight - 2, static_cast<uint32_t>(width), 1}, ink);
+    }
+  }
+}
+
+}  // namespace gui

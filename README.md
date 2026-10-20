@@ -46,6 +46,12 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   time. The `system` driver (`system://localhost/system`, no network needed) makes it an ordinary `IConnection`, so the Database query application opens
   it like any server; `SystemSettings` is the typed key-value face programs use (`get_int("audio", "volume", 80)`, `set_text(...)`; the query window
   keeps its last URL there). Tested by `tests/SystemDatabaseTest.cpp`.
+- **Browser/** the web browser's model, apart from any window: `HtmlDocument` reads HTML into runs of text (headings, paragraphs, lists, tables, links,
+  preformatted text; scripts and styles are dropped; pictures show as their alternative text), `PageLayout` fits them into lines of fixed-width
+  characters, `Url` resolves links (web addresses and files alike), `IPageLoader` is how a page is fetched and `HttpPageLoader` does it with
+  `network::HttpClient` over the network stacks (https needs a TLS configuration with a trust store, which the system does not ship yet, so only http
+  works for now). The Web Browser application (`Desktop/WebBrowser`, drawing with `Gui/Controls/PageView`) is in the Start menu and is a tab like the
+  other programs: dragged between windows, torn off, kept by the session (a web address is only shown again on restore, not fetched).
   The desktop keeps its session there too (`Desktop/SessionStore`, tables `session_windows` and `session_tabs`): as the system shuts down
   `Desktop::save_session()` records every program window - place, size, maximized / docked / minimized, stacking order, the tabs of a tabbed window and
   the file or folder each shows - and the next start's `restore_session()` opens them again; a file that is gone just leaves its tab empty, files on
@@ -551,7 +557,7 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   absolute). Controls do not own their children: whoever creates them keeps them alive while they are in a tree. Not yet:
   submenus, text selection/clipboard, scrolling lists, a mouse cursor sprite beyond the simple arrow, several windows.
   `src/GuiDemo` builds a window with all of it at boot and drives it with synthetic input (typing, choosing, menu items)
-  while checking the results; `tests/GuiTest.cpp` covers layout, the basic controls and the input pump on the host; `tests/GuiViewsTest.cpp` covers the scroll bar, data grid, spreadsheet grid and application (typing, formulas, copy and paste, CSV files, tabs), image view and player control; `tests/SheetTest.cpp` covers the spreadsheet model (numbers, formulas, ranges, cycles, CSV); `tests/GuiControlsTest.cpp` covers the slider, level meter, check box, radio button, toggle, colour and date pickers and their helpers.
+  while checking the results; `tests/GuiTest.cpp` covers layout, the basic controls and the input pump on the host; `tests/GuiViewsTest.cpp` covers the scroll bar, data grid, spreadsheet grid and application (typing, formulas, copy and paste, CSV files, tabs), image view and player control; `tests/SheetTest.cpp` covers the spreadsheet model (numbers, formulas, ranges, cycles, CSV); `tests/BrowserTest.cpp` covers the web browser's model (HTML parsing, line layout, address resolution); `tests/GuiControlsTest.cpp` covers the slider, level meter, check box, radio button, toggle, colour and date pickers and their helpers.
 
 - `src/BootLog.*` is the boot log (`bootlog::Entry(Level, "Subsystem").text(...).dec(...)`; counts warnings and failures; `replay()` redraws
   the lines after a display mode change cleared the screen). `src/Desktop/` is the desktop shell built on the GUI toolkit: `Desktop`

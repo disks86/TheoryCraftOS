@@ -44,6 +44,8 @@
 #include "Database/TextResultSet.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/Spreadsheet.hpp"
+#include "Desktop/WebBrowser.hpp"
+#include "Browser/HtmlDocument.hpp"
 #include "Gui/Controls/SpreadsheetGrid.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/Paint.hpp"
@@ -2081,7 +2083,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 12);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Terminal, Paint, Media Player, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 13);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Paint, Media Player, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -6305,6 +6307,255 @@ static void test_database_query_tabs() {
   CHECK(a.live == 0);
 }
 
+// --- Web browser -----------------------------------------------------------------------------------------------
+
+// Hands out a few canned pages and remembers what was asked for.
+struct FakeLoader final : browser::IPageLoader {
+  std::vector<std::string> asked;
+  bool fetch(StringView address, browser::PageResult* r) override {
+    asked.emplace_back(address.data(), address.size());
+    if (address.equals("http://down.test/")) {
+      r->error.assign("connection refused");
+      return false;
+    }
+    r->status = 200;
+    r->final_address.assign(address);
+    r->content_type.assign("text/html; charset=utf-8");
+    const char* html = "<html><head><title>Plain</title></head><body><p>Page <a href=\"/next\">next</a></p></body></html>";
+    if (address.equals("http://old.test/")) r->final_address.assign("http://new.test/");
+    if (address.equals("http://one.test/next")) html = "<title>Two</title><h1>Two</h1>";
+    if (address.equals("http://missing.test/")) {
+      r->status = 404;
+      html = "<p>gone</p>";
+    }
+    if (address.equals("http://data.test/")) {
+      r->content_type.assign("image/png");
+      html = "\x89PNG\r\n\x1a\n";
+    }
+    r->body.append(ConstByteView(reinterpret_cast<const uint8_t*>(html), strlen(html)));
+    return true;
+  }
+};
+
+static bool run_contains(desktop::WebBrowser& b, const char* text) {
+  const browser::HtmlDocument* doc = b.page().document();
+  for (uint64_t i = 0; doc && i < doc->run_count(); ++i)
+    if (doc->run_text(i).contains(text)) return true;
+  return false;
+}
+
+static void test_web_browser() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok);
+    make_file(fs, "/docs/index.html", "<title>Index</title><p>Local <a href=\"two.html\">two</a> <a href=\"/notes.txt\">notes</a></p>");
+    make_file(fs, "/docs/two.html", "<title>Second</title><p>second page</p>");
+    make_file(fs, "/notes.txt", "plain  text\nline two");
+    std::string many = "<title>Long</title>";
+    for (int i = 0; i < 100; ++i) many += "<p>paragraph " + std::to_string(i) + "</p>";
+    make_file(fs, "/long.html", many.c_str());
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    kernel::Clipboard clipboard(a);
+    w.set_clipboard(&clipboard);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::WebBrowser b(a);
+    FakeLoader loader;
+    CHECK(mgr.add_window(&b));
+    b.set_file_system(&fs);
+    b.set_page_loader(&loader);
+    w.layout();
+
+    // It starts on a welcome page, with nowhere to go back to.
+    CHECK(b.title().equals("Web Browser - Welcome") || b.title().equals("Web Browser"));
+    CHECK(b.address().empty() && !b.can_go_back() && !b.can_go_forward() && !b.back_button().enabled() && !b.forward_button().enabled());
+    CHECK(b.page().line_count() > 5 && run_contains(b, "TheoryCraftOS Web Browser"));
+
+    // Typing an address and pressing Enter opens it.
+    w.set_focus(&b.address_box());
+    b.address_box().set_text("one.test");
+    press(w, key::kEnter);
+    CHECK(loader.asked.size() == 1 && loader.asked[0] == "http://one.test" && b.address().equals("http://one.test") && !b.loading());
+    CHECK(b.title().equals("Web Browser - Plain") && b.address_box().text().equals("http://one.test") && b.status_label().text().equals("Done."));
+    CHECK(run_contains(b, "Page ") && !b.can_go_back());
+
+    // Moving over the link shows where it leads; a click follows it, and the way back opens.
+    const Point origin = b.page().window_origin();
+    const int32_t link_x = origin.x + gui::PageView::kMargin + 6 * 8, link_y = origin.y + 8;
+    w.mouse_move(link_x, link_y);
+    CHECK(b.page().hovered_link().equals("/next") && b.status_label().text().equals("/next"));
+    w.mouse_move(origin.x + 300, origin.y + 200);
+    CHECK(b.page().hovered_link().empty() && b.status_label().text().equals("Done."));
+    click(w, link_x, link_y);
+    CHECK(loader.asked.size() == 2 && loader.asked[1] == "http://one.test/next" && b.address().equals("http://one.test/next") && b.title().equals("Web Browser - Two"));
+    CHECK(b.can_go_back() && !b.can_go_forward() && b.back_button().enabled());
+    click_center(w, b.back_button());
+    CHECK(b.address().equals("http://one.test") && b.can_go_forward() && !b.can_go_back() && b.title().equals("Web Browser - Plain"));
+    click_center(w, b.forward_button());
+    CHECK(b.address().equals("http://one.test/next") && b.can_go_back() && !b.can_go_forward());
+    press(w, key::kLeft, hardware::modifier::kLeftAlt);
+    CHECK(b.address().equals("http://one.test") && b.can_go_forward());
+    press(w, key::kRight, hardware::modifier::kLeftAlt);
+    CHECK(b.address().equals("http://one.test/next"));
+    const size_t before_reload = loader.asked.size();
+    press(w, key::kF1 + 4);   // F5
+    CHECK(loader.asked.size() == before_reload + 1 && b.address().equals("http://one.test/next") && b.can_go_back() && !b.can_go_forward());
+    // Opening something new drops the pages that were ahead.
+    CHECK(choose(w, b.menu_bar(), "Go", "Back"));
+    CHECK(b.navigate("http://old.test/") && b.address().equals("http://new.test/") && !b.can_go_forward());
+
+    // Pages that fail, pages with an error status, and things that are not pages.
+    CHECK(b.navigate("http://down.test/"));
+    CHECK(b.status_label().text().equals("Cannot open http://down.test/: connection refused") && b.address().equals("http://new.test/") && b.address_box().text().equals("http://new.test/"));
+    CHECK(b.navigate("http://missing.test/") && b.status_label().text().equals("HTTP 404: Done.") && run_contains(b, "gone"));
+    CHECK(b.navigate("http://data.test/") && run_contains(b, "cannot be shown") && run_contains(b, "image/png"));
+    const size_t asked = loader.asked.size();
+    CHECK(!b.navigate("ftp://files.test/x") && !b.navigate("   ") && loader.asked.size() == asked);
+    b.set_page_loader(nullptr);
+    CHECK(b.navigate("http://one.test/") && b.status_label().text().contains("no network") && b.address().equals("http://data.test/"));
+    b.set_page_loader(&loader);
+
+    // Files on the system's own volumes: pages (links resolve against the folder), plain text, and files that are not there.
+    CHECK(b.navigate("/docs/index.html") && b.title().equals("Web Browser - Index") && b.address().equals("/docs/index.html") && run_contains(b, "Local"));
+    const Point o2 = b.page().window_origin();
+    click(w, o2.x + gui::PageView::kMargin + 8 * 8, o2.y + 8);   // "two"
+    CHECK(b.address().equals("/docs/two.html") && b.title().equals("Web Browser - Second") && run_contains(b, "second page"));
+    CHECK(b.go_back());
+    click(w, o2.x + gui::PageView::kMargin + 14 * 8, o2.y + 8);   // "notes"
+    CHECK(b.address().equals("/notes.txt") && b.page().document()->run_count() == 1 && b.page().document()->run_text(0).equals("plain  text\nline two"));
+    CHECK(b.navigate("/nothing.html") && b.status_label().text().contains("Cannot open /nothing.html") && b.address().equals("/notes.txt"));
+    CHECK(b.navigate("file:///docs/two.html") && b.address().equals("/docs/two.html"));
+    // A file dragged from an explorer opens.
+    CHECK(b.accepts_drop("/notes.txt", 0, 0, nullptr) && !b.accepts_drop("x", 0, 0, nullptr));
+    b.on_drop("/docs/index.html", 0, 0, nullptr);
+    CHECK(b.address().equals("/docs/index.html"));
+
+    // Long pages scroll: wheel, keys and the scroll bar.
+    CHECK(b.navigate("/long.html") && b.page().line_count() > b.page().visible_lines() && b.page().scroll_line() == 0);
+    w.set_focus(&b.page());
+    press(w, 0x4E);   // Page Down
+    CHECK(b.page().scroll_line() == b.page().visible_lines() - 1);
+    press(w, key::kDown);
+    CHECK(b.page().scroll_line() == b.page().visible_lines());
+    press(w, 0x4D);   // End
+    CHECK(b.page().scroll_line() == b.page().line_count() - b.page().visible_lines());
+    press(w, 0x4A);   // Home
+    CHECK(b.page().scroll_line() == 0);
+    w.mouse_wheel(origin.x + 100, origin.y + 100, -1);
+    CHECK(b.page().scroll_line() == 3);
+    w.render();
+
+    // Ctrl+L goes to the address box, the menu opens files.
+    press(w, key::kA + 11, hardware::modifier::kLeftControl);
+    CHECK(w.focus() == &b.address_box());
+    CHECK(b.page().document() && !b.loading());
+  }
+  CHECK(a.live == 0);
+}
+
+// Browsers are tabs like the other programs: "+" opens another, they are dragged between windows, and a session brings them back.
+static void test_web_browser_tabs() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/page.html", "<title>Page</title>hello");
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    FakeLoader loader;
+    d.set_page_loader(&loader);
+    Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+
+    desktop::WebBrowser* b1 = d.open_web_browser();
+    auto* h1 = static_cast<gui::TabFrame*>(b1->host());
+    CHECK(b1 == &d.web_browser() && h1 && b1->embedded() && h1->tab_count() == 1 && d.web_browser_count() == 1 && b1->app_kind() == desktop::Desktop::kAppBrowser);
+    put(h1, {20, 20, 560, 380});
+    w.layout();
+    bool in_menu = false;
+    for (uint32_t i = 0; i < d.start_button().menu().item_count(); ++i) in_menu = in_menu || d.start_button().menu().item(i)->text.view().equals("Web Browser");
+    CHECK(in_menu);
+    CHECK(b1->navigate("http://one.test/") && loader.asked.size() == 1);
+
+    // "+": another browser in a new tab with a page of its own.
+    const Rect2D plus = h1->new_tab_button_rect();
+    const Point po = h1->window_origin();
+    click(w, po.x + plus.x + 8, po.y + plus.y + 6);
+    CHECK(h1->tab_count() == 2 && d.web_browser_count() == 2);
+    auto* b2 = static_cast<desktop::WebBrowser*>(h1->tab_at(1));
+    CHECK(b2 != b1 && b2->app_kind() == desktop::Desktop::kAppBrowser && h1->selected() == b2 && b2->visible() && !b1->visible() && b2->address().empty());
+    CHECK(b2->navigate("/page.html") && b2->address().equals("/page.html") && b1->address().equals("http://one.test/"));
+    CHECK(h1->title().equals(b2->title()));
+
+    // Dragged out of the window it keeps its page and keeps working.
+    Point tp = tab_point(h1, 1);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    w.mouse_move(tp.x + 100, tp.y + 300);
+    CHECK(w.dragging());
+    w.mouse_button(tp.x + 100, tp.y + 300, MouseButton::Left, false);
+    CHECK(m.window_count() == 2 && h1->tab_count() == 1 && b2->host() && b2->host() != h1 && b2->address().equals("/page.html"));
+    auto* h2 = static_cast<gui::TabFrame*>(b2->host());
+    put(h2, {600, 20, 380, 380});
+    w.layout();
+
+    // And onto the strip of a window with another program in it.
+    desktop::Notepad* editor = d.open_text_editor();
+    auto* h3 = static_cast<gui::TabFrame*>(editor->host());
+    put(h3, {20, 420, 500, 250});
+    w.layout();
+    tp = tab_point(h2, 0);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    const Point strip = tab_point(h3, 0, 4);
+    w.mouse_move(strip.x + 30, strip.y);
+    w.mouse_move(strip.x, strip.y);
+    CHECK(w.dragging());
+    w.mouse_button(strip.x, strip.y, MouseButton::Left, false);
+    CHECK(h3->tab_count() == 2 && h3->tab_at(0) == b2 && h3->tab_at(1) == editor && b2->host() == h3 && b2->address().equals("/page.html"));
+    // "+" follows the program of the selected tab, and a browser dropped on the strip of a browser's window is a browser tab there.
+    const Rect2D plus3 = h3->new_tab_button_rect();
+    const Point po3 = h3->window_origin();
+    click(w, po3.x + plus3.x + 8, po3.y + plus3.y + 6);
+    CHECK(h3->tab_count() == 3 && h3->selected() && h3->selected()->app_kind() == desktop::Desktop::kAppBrowser && d.web_browser_count() == 3);
+
+    // A session keeps the browsers: a local page comes back loaded, a web address is only shown (nothing is fetched at start-up).
+    filesystem::RamFileSystem system_files(a);
+    database::local::LocalDatabase system_db(a, &system_files, "/databases/system.db");
+    system_db.open();
+    database::local::SystemSettings settings(a, system_db);
+    d.set_settings(&settings);
+    CHECK(d.save_session() == 2);
+    {
+      Screen screen2(a, 1000, 700);
+      desktop::Desktop d2(a, screen2.renderer, nullptr, nullptr);
+      d2.set_file_system(&fs);
+      FakeLoader loader2;
+      d2.set_page_loader(&loader2);
+      d2.set_settings(&settings);
+      CHECK(d2.restore_session() == 2 && d2.web_browser_count() == 3 && d2.text_editor_count() == 1);
+      bool local = false, shown_only = false;
+      for (uint32_t i = 0; i < d2.windows().window_count(); ++i) {
+        Frame* f = d2.windows().window_at(i);
+        gui::TabFrame* tabs = f ? f->as_tabs() : nullptr;
+        for (uint32_t t = 0; tabs && t < tabs->tab_count(); ++t) {
+          if (tabs->tab_at(t)->app_kind() != desktop::Desktop::kAppBrowser) continue;
+          auto* br = static_cast<desktop::WebBrowser*>(tabs->tab_at(t));
+          local = local || (br->address().equals("/page.html") && br->title().equals("Web Browser - Page"));
+          shown_only = shown_only || (br->address().empty() && br->address_box().text().equals("http://one.test/"));
+        }
+      }
+      CHECK(local && shown_only && loader2.asked.empty());
+    }
+    d.step(1000000);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -6340,6 +6591,8 @@ int main() {
   test_spreadsheet_grid();
   test_spreadsheet_app();
   test_spreadsheet_tabs();
+  test_web_browser();
+  test_web_browser_tabs();
   test_database_query();
   test_database_query_tabs();
   test_database_query_system();

@@ -37,6 +37,7 @@
 #include "Desktop/Notepad.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
+#include "Desktop/WebBrowser.hpp"
 #include "Desktop/SessionStore.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
@@ -76,7 +77,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -145,6 +146,13 @@ class Desktop {
   DatabaseQuery* open_database_query(gui::TabFrame* into = nullptr);
   DatabaseQuery& database_query() { return database_query_; }
   uint32_t database_query_count() const;
+  // Where the web browser gets web pages from (nullptr: none, web addresses then say so). It must outlive the desktop.
+  void set_page_loader(browser::IPageLoader* loader);
+  browser::IPageLoader* page_loader() const { return page_loader_; }
+  // Opens a web browser window: the first one is web_browser() (when that is closed), further ones are made as needed and go away when closed.
+  WebBrowser* open_web_browser(gui::TabFrame* into = nullptr);
+  WebBrowser& web_browser() { return web_browser_; }
+  uint32_t web_browser_count() const;
   // Opens a spreadsheet window: the first one is spreadsheet() (when that is closed), further ones are made as needed and go away when closed.
   Spreadsheet* open_spreadsheet(gui::TabFrame* into = nullptr);
   Spreadsheet& spreadsheet() { return spreadsheet_; }
@@ -232,6 +240,7 @@ class Desktop {
   static void on_text_editor(void* self, gui::Control&);
   static void on_spreadsheet(void* self, gui::Control&);
   static void on_database_query(void* self, gui::Control&);
+  static void on_web_browser(void* self, gui::Control&);
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
@@ -263,6 +272,7 @@ class Desktop {
   void setup_notepad(Notepad& notepad);
   void setup_spreadsheet(Spreadsheet& sheet);
   void setup_database_query(DatabaseQuery& query);
+  void setup_web_browser(WebBrowser& web);
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
   void reap_closed();
@@ -299,6 +309,7 @@ class Desktop {
   Paint paint_;
   Spreadsheet spreadsheet_;
   DatabaseQuery database_query_;
+  WebBrowser web_browser_;
   Terminal terminal_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
@@ -309,6 +320,7 @@ class Desktop {
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;
   database::DatabaseManager* databases_ = nullptr;
+  browser::IPageLoader* page_loader_ = nullptr;
   database::local::SystemSettings* settings_ = nullptr;
   String database_url_;
   UniquePointer<SessionStore> sessions_;
@@ -317,6 +329,7 @@ class Desktop {
   List<UniquePointer<Paint>> extra_paints_;
   List<UniquePointer<Spreadsheet>> extra_sheets_;
   List<UniquePointer<DatabaseQuery>> extra_queries_;
+  List<UniquePointer<WebBrowser>> extra_browsers_;
   List<UniquePointer<Terminal>> extra_terminals_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;

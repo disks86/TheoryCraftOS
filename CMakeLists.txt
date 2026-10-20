@@ -213,6 +213,10 @@ add_executable(BOOTX64
   src/Database/TextResultSet.cpp
   src/Database/ConnectionOptions.cpp
   src/Database/DatabaseManager.cpp
+  src/Browser/HtmlDocument.cpp
+  src/Browser/PageLayout.cpp
+  src/Browser/Url.cpp
+  src/Browser/HttpPageLoader.cpp
   src/Database/SqlText.cpp
   src/Database/Local/LocalCatalog.cpp
   src/Database/Local/LocalSql.cpp
@@ -271,6 +275,7 @@ add_executable(BOOTX64
   src/Desktop/Notepad.cpp
   src/Desktop/Spreadsheet.cpp
   src/Desktop/DatabaseQuery.cpp
+  src/Desktop/WebBrowser.cpp
   src/Desktop/SessionStore.cpp
   src/Desktop/DesktopSession.cpp
   src/Desktop/Paint.cpp
@@ -315,6 +320,7 @@ add_executable(BOOTX64
   src/Gui/Controls/TabControl.cpp
   src/Gui/Controls/BreadcrumbBar.cpp
   src/Gui/Controls/SpreadsheetGrid.cpp
+  src/Gui/Controls/PageView.cpp
   src/Gui/Controls/TextEditor.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp

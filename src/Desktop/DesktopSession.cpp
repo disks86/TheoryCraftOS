@@ -34,7 +34,7 @@ struct KindName {
 };
 const KindName kKinds[] = {
     {Desktop::kAppExplorer, "explorer"}, {Desktop::kAppEditor, "editor"}, {Desktop::kAppPaint, "paint"},   {Desktop::kAppTerminal, "terminal"},
-    {Desktop::kAppMedia, "media"},       {Desktop::kAppSheet, "sheet"},   {Desktop::kAppDatabase, "database"},
+    {Desktop::kAppMedia, "media"},       {Desktop::kAppSheet, "sheet"},   {Desktop::kAppDatabase, "database"}, {Desktop::kAppBrowser, "browser"},
 };
 
 const char* kind_name(uint8_t kind) {
@@ -89,6 +89,7 @@ StringView tab_path(Frame* tab) {
     case Desktop::kAppPaint: path = static_cast<Paint*>(tab)->path(); break;
     case Desktop::kAppSheet: path = static_cast<Spreadsheet*>(tab)->path(); break;
     case Desktop::kAppDatabase: path = static_cast<DatabaseQuery*>(tab)->path(); break;
+    case Desktop::kAppBrowser: path = static_cast<WebBrowser*>(tab)->address(); break;
     default: break;   // the media player would start playing; a terminal has no file
   }
   return on_network_share(path) ? StringView() : path;
@@ -232,6 +233,12 @@ Frame* Desktop::open_app(uint8_t app, TabFrame* into, StringView path) {
       DatabaseQuery* q = open_database_query(into);
       if (q && is_file) q->open_file(path);
       return q;
+    }
+    case kAppBrowser: {
+      WebBrowser* w = open_web_browser(into);
+      if (w && is_file) w->navigate(path);   // (a web address is only shown: the network may not be up yet, and a restart should not go and fetch pages)
+      else if (w && !path.empty()) w->show_address(path);
+      return w;
     }
     case kAppTerminal: return open_terminal(into);
     case kAppMedia:   // (the file is not played again: the window just comes back)

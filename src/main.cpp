@@ -66,6 +66,7 @@
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
+#include "Browser/HttpPageLoader.hpp"
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
@@ -824,6 +825,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // connections are plain until one is given (SystemDatabases::transport().set_tls()).
     database::SystemDatabases databases(shared_allocator, smb_network, &smb_random);
     desktop.set_databases(&databases.manager());
+    // Web pages for the browser, over the same interfaces. https:// needs a trust store, which this system does not ship: only plain http works
+    // until the loader is given a TLS configuration (HttpPageLoader::set_tls()).
+    browser::HttpPageLoader page_loader(stacks, shared_allocator);
+    desktop.set_page_loader(&page_loader);
     Entry(Level::Info, "Database").dec(databases.manager().driver_count()).text(" driver(s): ").text(databases.manager().driver(0)->name());
     network::SmbEnvironment smb_environment;
     smb_environment.random = &smb_random;
