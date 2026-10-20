@@ -414,6 +414,55 @@ static void test_window_rests() {
   CHECK(a.live == 0);
 }
 
+// The glyphs on a window's title bar buttons: the X of Close is symmetric and sits in the middle of its button, Maximize is a plain box (no second line along
+// its top), Minimize is a bar in the same width as the other glyphs.
+static void test_title_buttons() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 400, 300);
+    Window w(a, screen.renderer, theme, {400, 300});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    Frame f(a);
+    f.set_title("Buttons");
+    f.set_bounds({20, 20, 300, 200});
+    CHECK(mgr.add_window(&f));
+    w.layout();
+    w.render();
+    const int32_t top = f.bounds().y + Frame::kBorder + (Frame::kTitleHeight - Frame::kButtonHeight) / 2;
+    const int32_t close_x = f.bounds().x + static_cast<int32_t>(f.bounds().width) - Frame::kBorder - 2 - Frame::kButtonWidth;
+    const int32_t maximize_x = close_x - 2 - Frame::kButtonWidth, minimize_x = maximize_x - Frame::kButtonWidth;
+    auto ink = [&](int32_t button_x, int32_t dx, int32_t dy) { return screen.px(button_x + dx, top + dy) == theme.text; };
+
+    // Close: ink only inside the 8 x 8 square at (4, 3), the same after turning it left to right and top to bottom, with the strokes meeting in the middle.
+    int32_t count = 0;
+    for (int32_t dy = 2; dy < Frame::kButtonHeight - 2; ++dy) {
+      for (int32_t dx = 2; dx < Frame::kButtonWidth - 2; ++dx) {
+        const bool here = ink(close_x, dx, dy);
+        count += here;
+        if (dx < 4 || dx > 11 || dy < 3 || dy > 10) CHECK(!here);
+        CHECK(here == ink(close_x, 15 - dx, dy));   // mirrored about the middle of the 16 columns
+        CHECK(here == ink(close_x, dx, 13 - dy));   // and of the 14 rows
+      }
+    }
+    CHECK(count > 20 && ink(close_x, 4, 3) && ink(close_x, 11, 3) && ink(close_x, 4, 10) && ink(close_x, 11, 10) && ink(close_x, 7, 6) && ink(close_x, 8, 7));
+
+    // Maximize: a box 10 wide and 8 high. Its second row is only the two sides: no second line under the top edge.
+    for (int32_t dx = 3; dx <= 12; ++dx) CHECK(ink(maximize_x, dx, 3));
+    for (int32_t dx = 4; dx <= 11; ++dx) CHECK(!ink(maximize_x, dx, 4));
+    CHECK(ink(maximize_x, 3, 4) && ink(maximize_x, 12, 4));
+    for (int32_t dx = 3; dx <= 12; ++dx) CHECK(ink(maximize_x, dx, 10));
+
+    // Minimize: a bar of 8 pixels, centred.
+    for (int32_t dx = 4; dx <= 11; ++dx) CHECK(ink(minimize_x, dx, 9) && ink(minimize_x, dx, 10));
+    CHECK(!ink(minimize_x, 3, 9) && !ink(minimize_x, 12, 9));
+    mgr.remove_window(&f);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_data_grid_scrolling() {
   TestAllocator a;
   Theme theme;
@@ -5410,6 +5459,7 @@ int main() {
   test_scroll_bar();
   test_data_grid();
   test_window_rests();
+  test_title_buttons();
   test_data_grid_scrolling();
   test_grid_rendering();
   test_image_view();

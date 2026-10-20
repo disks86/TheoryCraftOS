@@ -164,17 +164,14 @@ void Frame::draw_button(Painter& painter, Part button) {
   const int32_t x = r.x + o, y = r.y + o;
   switch (button) {
     case Part::Minimize:
-      painter.fill({x + 4, y + 9, 7, 2}, ink);
+      painter.fill({x + 4, y + 9, 8, 2}, ink);   // (8 wide, like the other glyphs: centred in the 16-pixel button)
       break;
     case Part::Maximize:
       if (state_ == State::Maximized) {  // the restore glyph: two overlapping boxes
         painter.outline({x + 6, y + 3, 6, 5}, ink);
-        painter.line(x + 6, y + 4, x + 11, y + 4, ink);
         painter.outline({x + 3, y + 5, 6, 5}, ink);
-        painter.line(x + 3, y + 6, x + 8, y + 6, ink);
       } else {
         painter.outline({x + 3, y + 3, 10, 8}, ink);
-        painter.line(x + 4, y + 4, x + 11, y + 4, ink);
       }
       break;
     case Part::DockLeft:   // a window with the docked half filled
@@ -196,11 +193,11 @@ void Frame::draw_button(Painter& painter, Part button) {
       painter.fill({x + 9, y + 8, 3, 2}, ink);
       break;
     }
-    default:  // close: a bold X
-      painter.line(x + 4, y + 3, x + 11, y + 10, ink);
-      painter.line(x + 5, y + 3, x + 12, y + 10, ink);
-      painter.line(x + 11, y + 3, x + 4, y + 10, ink);
-      painter.line(x + 12, y + 3, x + 5, y + 10, ink);
+    default:  // close: a bold X, 8 x 8 pixels in the middle of the button; each stroke is a row of 2 x 2 blocks, so both strokes are alike and the X is symmetric
+      for (int32_t i = 0; i < 7; ++i) {
+        painter.fill({x + 4 + i, y + 3 + i, 2, 2}, ink);
+        painter.fill({x + 10 - i, y + 3 + i, 2, 2}, ink);
+      }
       break;
   }
 }

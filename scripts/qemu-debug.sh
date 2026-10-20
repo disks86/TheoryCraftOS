@@ -33,15 +33,17 @@ if [ ! -f "$DATA_IMG" ]; then
   qemu-img create -f raw "$DATA_IMG" "${DATA_SIZE:-256M}" >/dev/null
   mkfs.fat -F 32 -n DATA "$DATA_IMG" >/dev/null
 fi
+# The window shows the guest's picture pixel for pixel (zoom-to-fit=off): a tiling window manager or a resized window would otherwise stretch it by a
+# fraction and blur and wobble the text.
 # QEMU_GPU: auto (default: gl when this QEMU has virtio-gpu-gl, else std), std (Bochs VGA with 64 MiB of video memory so the larger resolutions fit; QEMU_VGAMEM changes it), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).
 GPU_CHOICE=${QEMU_GPU:-auto}
 if [ "$GPU_CHOICE" = auto ]; then
   if qemu-system-x86_64 -device help 2>/dev/null | grep -q 'virtio-gpu-gl-pci'; then GPU_CHOICE=gl; else GPU_CHOICE=std; fi
 fi
 case $GPU_CHOICE in
-  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,show-cursor=off,show-menubar=off" ;;
-  virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk,show-cursor=off,show-menubar=off" ;;
-  std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,show-cursor=off,show-menubar=off" ;;
+  gl) GPU_ARGS="-vga none -device virtio-gpu-gl-pci"; DISPLAY_ARGS="gtk,gl=on,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
+  virtio) GPU_ARGS="-vga none -device virtio-gpu-pci"; DISPLAY_ARGS="gtk,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
+  std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
   *) echo "unknown QEMU_GPU=$QEMU_GPU (auto, std, virtio, gl)" >&2; exit 2 ;;
 esac
 exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} ${QEMU_GDB:+-gdb tcp:127.0.0.1:2159} \
