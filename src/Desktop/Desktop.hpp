@@ -37,6 +37,7 @@
 #include "Desktop/Notepad.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
+#include "Desktop/SessionStore.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
 #include "Desktop/Terminal.hpp"
@@ -134,6 +135,12 @@ class Desktop {
   // window shows until a connection has been made. It must outlive the desktop.
   void set_settings(database::local::SystemSettings* settings, StringView database_url = StringView());
   database::local::SystemSettings* settings() const { return settings_; }
+  // --- Session. save_session() records the windows that are open - their places and states, the tabs of the tabbed ones, the files and folders they
+  // show - in the system database (it needs the settings: set_settings()); call it as the system shuts down. restore_session() opens them again, the
+  // same way; a file that has gone is skipped, the window opens empty. Call it once at start-up, after the file system and the settings are set and
+  // before the desktop runs. Both return how many windows they dealt with. The setting "desktop"/"restore_session" (true by default) switches it off.
+  uint32_t save_session();
+  uint32_t restore_session();
   // Opens a database query window: the first one is database_query() (when that is closed), further ones are made as needed and go away when closed.
   DatabaseQuery* open_database_query(gui::TabFrame* into = nullptr);
   DatabaseQuery& database_query() { return database_query_; }
@@ -259,6 +266,8 @@ class Desktop {
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
   void reap_closed();
+  // Opens a program window of kind `app` (a kApp... value) in `into` or a window of its own, showing `path` if that still exists.
+  gui::Frame* open_app(uint8_t app, gui::TabFrame* into, StringView path);
   // The text editor / paint window to open a file in: the one that already shows it, an open empty one, or a new one.
   Notepad* editor_for(StringView path);
   Paint* paint_for(StringView path);
@@ -302,6 +311,7 @@ class Desktop {
   database::DatabaseManager* databases_ = nullptr;
   database::local::SystemSettings* settings_ = nullptr;
   String database_url_;
+  UniquePointer<SessionStore> sessions_;
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;

@@ -46,6 +46,10 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   time. The `system` driver (`system://localhost/system`, no network needed) makes it an ordinary `IConnection`, so the Database query application opens
   it like any server; `SystemSettings` is the typed key-value face programs use (`get_int("audio", "volume", 80)`, `set_text(...)`; the query window
   keeps its last URL there). Tested by `tests/SystemDatabaseTest.cpp`.
+  The desktop keeps its session there too (`Desktop/SessionStore`, tables `session_windows` and `session_tabs`): as the system shuts down
+  `Desktop::save_session()` records every program window - place, size, maximized / docked / minimized, stacking order, the tabs of a tabbed window and
+  the file or folder each shows - and the next start's `restore_session()` opens them again; a file that is gone just leaves its tab empty, files on
+  network shares and media files are not reopened. The setting `desktop`/`restore_session` turns it off.
 - `src/Network/`: an IPv4 stack over any `INetworkInterface`, single-threaded and polled (`INetworkStack::poll()`).
   `NetworkStack` does Ethernet framing, ARP (cache + queue of packets awaiting resolution), IPv4 and ICMP echo;
   it owns a `UdpManager`/`UdpSocket` (`IUdpSocket`), a `TcpManager`/`TcpSocket` (`ITcpSocket`: RFC 793 state

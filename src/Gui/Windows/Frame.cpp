@@ -30,6 +30,12 @@ constexpr int32_t kCorner = 18;  // how far along an edge a corner grip reaches
 
 Frame* Frame::host() const { return host_; }
 Frame::State Frame::state() const { return host_ ? host_->state_ : state_; }
+Rect2D Frame::normal_bounds() const {
+  const Frame* f = host_ ? host_ : this;
+  const bool away = f->state_ == State::Maximized || (f->state_ == State::Minimized && f->before_minimize_ == State::Maximized) || f->docked_ != Dock::None;
+  return away ? f->restore_bounds_ : f->bounds();
+}
+Frame::State Frame::state_before_minimize() const { return host_ ? host_->before_minimize_ : before_minimize_; }
 bool Frame::active() const { return host_ ? host_->active_ && host_->selected() == this : active_; }
 void Frame::host_changed_title() { host_->tab_title_changed(this); }
 

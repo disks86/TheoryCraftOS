@@ -6140,6 +6140,101 @@ static void test_database_query_system() {
   CHECK(a.live == 0);
 }
 
+// The windows that were open when the system shut down come back: same places and states, same tabs, same files - and a file that is gone just
+// leaves its tab empty.
+static void test_session_restore() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    make_file(fs, "/a.txt", "alpha");
+    make_file(fs, "/b.txt", "beta");
+    make_file(fs, "/gone.txt", "soon gone");
+    make_file(fs, "/q.sql", "SELECT 1");
+    CHECK(fs.create_directory("/docs") == filesystem::Status::Ok);
+    filesystem::RamFileSystem system_files(a);
+    database::local::LocalDatabase system_db(a, &system_files, "/databases/system.db");
+    system_db.open();
+    database::local::SystemSettings settings(a, system_db);
+    auto same = [](const Rect2D& x, const Rect2D& y) { return x.x == y.x && x.y == y.y && x.width == y.width && x.height == y.height; };
+    const Rect2D notes_at{40, 50, 420, 300}, files_at{300, 100, 400, 350}, query_at{60, 60, 380, 280}, term_at{120, 120, 360, 240}, manager_at{10, 10, 500, 400};
+    {
+      Screen screen(a, 800, 600);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      d.set_settings(&settings);
+      CHECK(d.restore_session() == 0 && d.save_session() == 0);   // nothing is open, nothing was saved
+      desktop::Notepad* n1 = d.open_text_editor();
+      CHECK(n1->open_file("/a.txt"));
+      gui::TabFrame* notes = static_cast<gui::TabFrame*>(n1->host());
+      desktop::Notepad* n2 = d.open_text_editor(notes);
+      CHECK(n2->open_file("/gone.txt"));
+      desktop::Notepad* n3 = d.open_text_editor(notes);
+      CHECK(n3->open_file("/b.txt"));
+      notes->select_tab(n2);
+      notes->set_bounds(notes_at);
+      desktop::FileExplorer* ex = d.open_explorer();
+      CHECK(ex->open_folder("/docs"));
+      ex->host()->set_bounds(files_at);
+      desktop::DatabaseQuery* q = d.open_database_query();
+      CHECK(q->open_file("/q.sql"));
+      q->host()->set_bounds(query_at);
+      q->host()->maximize();
+      desktop::Terminal* t = d.open_terminal();
+      t->host()->set_bounds(term_at);
+      t->host()->minimize();
+      d.open_computer_manager();
+      d.computer_manager().set_bounds(manager_at);
+      d.open_about();   // not a program window: it is not kept
+      ex->activate();
+      CHECK(d.save_session() == 5);
+    }
+    CHECK(fs.remove("/gone.txt") == filesystem::Status::Ok);
+    {
+      Screen screen(a, 800, 600);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      d.set_settings(&settings);
+      CHECK(d.restore_session() == 5);
+      CHECK(d.windows().window_count() == 5 && d.text_editor_count() == 3 && d.explorer_count() == 1 && d.database_query_count() == 1 && d.terminal_count() == 1);
+      CHECK(d.notepad().path().equals("/a.txt") && d.notepad().editor().text().equals("alpha"));
+      gui::TabFrame* notes = static_cast<gui::TabFrame*>(d.notepad().host());
+      CHECK(notes && notes->tab_count() == 3 && same(notes->bounds(), notes_at) && notes->index_of(notes->selected()) == 1);
+      desktop::Notepad* gone = static_cast<desktop::Notepad*>(notes->tab_at(1));
+      desktop::Notepad* b = static_cast<desktop::Notepad*>(notes->tab_at(2));
+      CHECK(gone->path().empty() && gone->editor().text().empty() && b->path().equals("/b.txt") && b->editor().text().equals("beta"));
+      CHECK(d.explorer().path().equals("/docs") && same(d.explorer().host()->bounds(), files_at));
+      CHECK(d.database_query().path().equals("/q.sql") && d.database_query().host()->state() == gui::Frame::State::Maximized && same(d.database_query().host()->normal_bounds(), query_at));
+      CHECK(d.terminal().host()->state() == gui::Frame::State::Minimized && same(d.terminal().host()->normal_bounds(), term_at));
+      CHECK(same(d.computer_manager().bounds(), manager_at) && d.computer_manager().manager());
+      CHECK(d.windows().stacking_index(d.explorer().host()) == d.windows().window_count() - 1);   // the one that was in front is in front
+      CHECK(!d.notice_dialog().showing());
+      // Closing everything and shutting down again keeps an empty session; the setting turns the restoring off.
+      CHECK(d.save_session() == 5);
+    }
+    {
+      Screen screen(a, 800, 600);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      CHECK(settings.set_bool("desktop", "restore_session", false));
+      d.set_settings(&settings);
+      CHECK(d.restore_session() == 0 && d.windows().window_count() == 0);
+      CHECK(settings.set_bool("desktop", "restore_session", true));
+      CHECK(d.restore_session() == 5);
+    }
+    // A broken session (no file system, rows from a newer version) opens what it can and does not stop.
+    {
+      database::local::LocalConnection c(a, system_db);
+      CHECK(c.execute("INSERT INTO session_windows VALUES (99, 'tabs', 0, 0, 5, 5, 'normal', 'normal', 'none', 7)") == database::DbStatus::Ok);
+      CHECK(c.execute("INSERT INTO session_tabs VALUES (99, 0, 'nothing', NULL), (99, 1, 'editor', '/nowhere/x.txt')") == database::DbStatus::Ok);
+      Screen screen(a, 800, 600);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_settings(&settings);   // (no file system at all)
+      CHECK(d.restore_session() == 6 && d.text_editor_count() == 4);   // the five saved windows and the odd one (its tab of a kind nobody knows is skipped)
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_database_query_tabs() {
   TestAllocator a;
   {
@@ -6248,6 +6343,7 @@ int main() {
   test_database_query();
   test_database_query_tabs();
   test_database_query_system();
+  test_session_restore();
   test_spin_box();
   test_color_spectrum();
   test_color_dialog();

@@ -73,6 +73,10 @@ class Frame : public Control {
   void on_closed(Handler handler) { UiGuard lock(this); closed_ = handler; }
 
   State state() const;
+  // Where the window goes back to: its bounds, or - maximized, docked or tiled (or minimized from one of those) - the ones from before.
+  Rect2D normal_bounds() const;
+  // The state a minimized window comes back to (Normal or Maximized).
+  State state_before_minimize() const;
   // The half of the desktop the window is docked to (None: free).
   Dock docked() const { return docked_; }
   // Whether the dock buttons show: the window can be maximized and resized.

@@ -916,6 +916,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // Three threads: this one reads input and the clock (firmware calls must stay on the boot core), a render
     // thread redraws whenever something changed, and a handler thread runs what buttons and menus fire - so a
     // slow click handler can freeze neither the screen nor the pointer.
+    // The windows that were open at the last shutdown come back (files that are gone are skipped).
+    const uint32_t restored = desktop.restore_session();
+    if (restored) Entry(Level::Info, "Desktop").text("restored ").dec(restored).text(" window(s) from the last session");
     const bool threaded = desktop.start();
     if (!threaded) Entry(Level::Warning, "Desktop").text("could not start the render and handler threads; running single-threaded");
     while (!desktop.shutdown_requested()) {
@@ -930,6 +933,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       hardware::delay_us(4000);
     }
+    const uint32_t kept = desktop.save_session();   // what is open now, for the next start
+    Entry(Level::Info, "Desktop").text("saved ").dec(kept).text(" window(s) for the next session");
     guest.stop_service();  // (VirtualBox's resize requests touch the desktop)
     input.stop_service();  // (its notices touch the desktop)
     desktop.stop();  // before anything else draws on the screen: the render thread is the renderer's only user

@@ -250,6 +250,7 @@ void Desktop::set_databases(database::DatabaseManager* databases) {
 void Desktop::set_settings(database::local::SystemSettings* settings, StringView database_url) {
   window_.locked([&] {
     settings_ = settings;
+    sessions_ = settings ? UniquePointer<SessionStore>::make(allocator_, allocator_, settings->database()) : UniquePointer<SessionStore>();
     database_url_.assign(database_url);
     database_query_.set_settings(settings, database_url_.view());
     for (auto& q : extra_queries_) q->set_settings(settings, database_url_.view());

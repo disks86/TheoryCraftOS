@@ -32,7 +32,10 @@ namespace database::local {
 
 class SystemSettings {
  public:
-  SystemSettings(allocators::IAllocator& allocator, LocalDatabase& database) : allocator_(allocator), connection_(allocator, database), error_(allocator) { ensure_table(); }
+  SystemSettings(allocators::IAllocator& allocator, LocalDatabase& database) : allocator_(allocator), database_(database), connection_(allocator, database), error_(allocator) { ensure_table(); }
+
+  // The database the settings are kept in, for programs that keep tables of their own beside them.
+  LocalDatabase& database() { return database_; }
 
   // False when the settings table could not be made.
   bool ready() const { return ready_; }
@@ -56,6 +59,7 @@ class SystemSettings {
   void ensure_table();
 
   allocators::IAllocator& allocator_;
+  LocalDatabase& database_;
   kernel::Mutex mutex_;
   LocalConnection connection_;
   DbError error_;
