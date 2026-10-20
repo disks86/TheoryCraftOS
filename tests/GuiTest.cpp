@@ -32,6 +32,7 @@
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TextBox.hpp"
+#include "Gui/Controls/TextEditor.hpp"
 #include "Gui/InputPump.hpp"
 #include "Gui/MessageDialog.hpp"
 #include "Gui/NoticeDialog.hpp"
@@ -943,6 +944,51 @@ static void test_notice_dialog() {
     CHECK(notice.show(mgr, NoticeKind::Error, "Again"));
     press(w, key::kEscape);
     CHECK(!notice.showing() && dismissed.calls == 3);
+    // A message too long for four lines gets details to scroll through, which fold away, and can be copied whole.
+    {
+      CHECK(notice.show(mgr, NoticeKind::Information, "Short") && !notice.has_details() && !notice.details_button().visible() && !notice.details_editor().visible());
+      notice.close();
+      kernel::Clipboard clipboard(a);
+      w.set_clipboard(&clipboard);
+      String big(a);
+      for (int i = 0; i < 60; ++i) {
+        big.append("Server stack trace line ");
+        big.append_uint(static_cast<uint64_t>(i));
+        big.append(" at System.Runtime.AsyncResult.End\n");
+      }
+      CHECK(notice.show(mgr, NoticeKind::Error, big.view()) && notice.has_details() && notice.details_showing());
+      w.layout();
+      TextEditor& ed = notice.details_editor();
+      CHECK(ed.visible() && notice.details_button().visible() && notice.copy_button().visible() && notice.details_button().text().equals("Hide Details"));
+      CHECK(ed.line_count() >= 60 && ed.text().starts_with("Server stack trace line 0 ") && ed.vertical_scroll_bar().maximum_value() > 0);
+      CHECK(notice.line_label(3).text().ends_with("..."));
+      const Rect2D dialog = notice.bounds();
+      CHECK(dialog.width == static_cast<uint32_t>(NoticeDialog::kWideWidth) && dialog.y + static_cast<int32_t>(dialog.height) <= 600);
+      // The text scrolls.
+      w.mouse_wheel(ed.window_origin().x + 50, ed.window_origin().y + 50, -1);
+      CHECK(ed.top_line() > 0);
+      w.render();
+      // Copy puts the whole message on the clipboard, not what shows.
+      click_center(w, notice.copy_button());
+      String got(a);
+      CHECK(clipboard.get_text(&got) && got.view().equals(big.view()));
+      // Hide Details folds the area away; Show Details brings it back.
+      click_center(w, notice.details_button());
+      CHECK(!notice.details_showing() && !ed.visible() && notice.details_button().text().equals("Show Details") && notice.bounds().height < dialog.height);
+      w.render();
+      click_center(w, notice.details_button());
+      CHECK(notice.details_showing() && ed.visible() && notice.bounds().height == dialog.height);
+      // A long line with no break is cut to the width of the box; a new short message takes the details away again.
+      String line(a);
+      for (int i = 0; i < 400; ++i) line.push_back(i % 9 == 8 ? ' ' : 'x');
+      CHECK(notice.show(mgr, NoticeKind::Error, line.view()) && notice.has_details() && ed.line_count() >= 6 && ed.line_length(0) <= static_cast<uint32_t>(NoticeDialog::kDetailColumns));
+      CHECK(notice.show(mgr, NoticeKind::Error, "ok again") && !notice.has_details() && !ed.visible() && !notice.details_button().visible() && notice.bounds().width == static_cast<uint32_t>(NoticeDialog::kWidth));
+      w.layout();
+      w.render();
+      click_center(w, notice.ok_button());
+      CHECK(!notice.showing());
+      w.set_clipboard(nullptr);
+    }
     mgr.remove_window(&doc);
   }
   CHECK(a.live == 0);
@@ -1228,6 +1274,7 @@ static void test_desktop() {
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Text Editor
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Spreadsheet
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Database
+    kb.push(key::kDown, true); kb.push(key::kDown, false);   // Web Browser
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Terminal
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Paint
     kb.push(key::kDown, true); kb.push(key::kDown, false);   // Media Player
