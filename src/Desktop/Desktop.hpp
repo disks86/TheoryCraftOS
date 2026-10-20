@@ -273,6 +273,7 @@ class Desktop {
   void setup_spreadsheet(Spreadsheet& sheet);
   void setup_database_query(DatabaseQuery& query);
   void setup_web_browser(WebBrowser& web);
+  static uint64_t unix_ms(void* self);
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
   void reap_closed();

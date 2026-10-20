@@ -56,18 +56,33 @@ struct Run {
   int32_t link = -1;                 // which link it leads to, or -1
 };
 
+// What runs the scripts of a page while it is read: the parser hands over each <script> in the order they come, and reads what they wrote with
+// document.write in their place. Implemented by the browser on top of the script engine.
+class IScriptRunner {
+ public:
+  // The text of the index-th <script src=...> of the page (counting them in the order the page names them); empty if it was not fetched.
+  virtual StringView external(uint32_t index) = 0;
+  // Runs one script. What it wrote with document.write is appended to *written.
+  virtual void run(StringView source, String* written) = 0;
+
+ protected:
+  IScriptRunner() = default;
+  ~IScriptRunner() = default;
+};
+
 class HtmlDocument {
  public:
   static constexpr uint64_t kMaxText = 4u << 20;   // the most text kept; a longer page is cut off there
   static constexpr uint64_t kMaxRuns = 250000;
 
-  explicit HtmlDocument(allocators::IAllocator& allocator) : allocator_(allocator), runs_(allocator), links_(allocator), sheets_(allocator), pool_(allocator), title_(allocator) {}
+  explicit HtmlDocument(allocators::IAllocator& allocator) : allocator_(allocator), runs_(allocator), links_(allocator), sheets_(allocator), scripts_(allocator), pool_(allocator), title_(allocator) {}
   HtmlDocument(const HtmlDocument&) = delete;
   HtmlDocument& operator=(const HtmlDocument&) = delete;
 
   // Replaces the contents with the page in `html`, styled by the stylesheets in it (<style>, style attributes) and by `extra_css` (the stylesheets
   // it links to, fetched by the caller; read before the page's own). False if memory ran out (the document is then empty).
-  bool parse_html(StringView html, StringView extra_css = StringView());
+  // With `scripts`, the page's scripts are run as they are met (see IScriptRunner); without, they are only counted (stylesheet_count() style: script_count()).
+  bool parse_html(StringView html, StringView extra_css = StringView(), IScriptRunner* scripts = nullptr);
   // Replaces the contents with `text`, shown as it is. False if memory ran out.
   bool parse_text(StringView text);
   void clear();
@@ -85,6 +100,10 @@ class HtmlDocument {
   // The stylesheet files the page links to (<link rel=stylesheet href=...>), as written (they may be relative).
   uint32_t stylesheet_count() const { return static_cast<uint32_t>(sheets_.count()); }
   StringView stylesheet(uint32_t index) const { return index < sheets_.count() ? pool_.view().substr(sheets_[index].offset, sheets_[index].length) : StringView(); }
+  // The scripts the page loads from files (<script src=...>) as written, and whether it has any script at all (inline ones too).
+  uint32_t script_count() const { return static_cast<uint32_t>(scripts_.count()); }
+  StringView script_source(uint32_t index) const { return index < scripts_.count() ? pool_.view().substr(scripts_[index].offset, scripts_[index].length) : StringView(); }
+  bool has_scripts() const { return has_scripts_; }
   // True if the page was longer than the limits and the end is missing.
   bool truncated() const { return truncated_; }
 
@@ -96,11 +115,13 @@ class HtmlDocument {
   bool add_run(StringView text, uint8_t flags, uint8_t level, uint8_t indent, uint8_t breaks, int32_t link, uint8_t align, uint32_t color, uint32_t background);
   int32_t add_link(StringView target);
   bool add_stylesheet(StringView target);
+  bool add_script_ref(StringView target);
 
   allocators::IAllocator& allocator_;
   List<Run> runs_;
-  List<LinkRef> links_, sheets_;
+  List<LinkRef> links_, sheets_, scripts_;
   uint32_t page_background_ = 0;
+  bool has_scripts_ = false;
   String pool_, title_;
   bool truncated_ = false;
 };

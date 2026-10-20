@@ -46,6 +46,11 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   time. The `system` driver (`system://localhost/system`, no network needed) makes it an ordinary `IConnection`, so the Database query application opens
   it like any server; `SystemSettings` is the typed key-value face programs use (`get_int("audio", "volume", 80)`, `set_text(...)`; the query window
   keeps its last URL there). Tested by `tests/SystemDatabaseTest.cpp`.
+- **Script/** a JavaScript engine (a practical ES5 subset with let / const, arrow functions, template literals, spread and for-of): `Parser` makes a syntax
+  tree, `Compiler` turns it into bytecode (variables are resolved to slots of per-call environments, `finally` is compiled in line), `Vm` runs it on a
+  stack machine with its own mark-and-sweep heap, an instruction budget and a memory limit, and `Builtins` has Object, Array, String, Number, Math, JSON, Date,
+  Error, console and a little of `document`. `Engine` is the interface. Not there: classes, regular expressions, destructuring, generators, async,
+  Map / Set / Promise. Tested by `tests/ScriptTest.cpp` (the language, the built-ins, limits, the collector, damaged and deeply nested programs).
 - **Browser/** the web browser's model, apart from any window: `HtmlDocument` reads HTML into runs of text (headings, paragraphs, lists, tables, links,
   preformatted text; scripts and styles are dropped; pictures show as their alternative text), `StyleSheet` (`Css.hpp`) reads CSS - selectors, the cascade, `!important`, `@media` - and gives each element a `Style`
   (colours, bold / underline, hiding, alignment, spacing as blank lines and columns) that the runs carry, `PageLayout` fits them into lines of fixed-width
@@ -558,7 +563,7 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   absolute). Controls do not own their children: whoever creates them keeps them alive while they are in a tree. Not yet:
   submenus, text selection/clipboard, scrolling lists, a mouse cursor sprite beyond the simple arrow, several windows.
   `src/GuiDemo` builds a window with all of it at boot and drives it with synthetic input (typing, choosing, menu items)
-  while checking the results; `tests/GuiTest.cpp` covers layout, the basic controls and the input pump on the host; `tests/GuiViewsTest.cpp` covers the scroll bar, data grid, spreadsheet grid and application (typing, formulas, copy and paste, CSV files, tabs), image view and player control; `tests/SheetTest.cpp` covers the spreadsheet model (numbers, formulas, ranges, cycles, CSV); `tests/BrowserTest.cpp` covers the web browser's model (HTML parsing, line layout, address resolution); `tests/GuiControlsTest.cpp` covers the slider, level meter, check box, radio button, toggle, colour and date pickers and their helpers.
+  while checking the results; `tests/GuiTest.cpp` covers layout, the basic controls and the input pump on the host; `tests/GuiViewsTest.cpp` covers the scroll bar, data grid, spreadsheet grid and application (typing, formulas, copy and paste, CSV files, tabs), image view and player control; `tests/SheetTest.cpp` covers the spreadsheet model (numbers, formulas, ranges, cycles, CSV); `tests/ScriptTest.cpp` covers the script engine; `tests/BrowserTest.cpp` covers the web browser's model (HTML parsing, line layout, address resolution); `tests/GuiControlsTest.cpp` covers the slider, level meter, check box, radio button, toggle, colour and date pickers and their helpers.
 
 - `src/BootLog.*` is the boot log (`bootlog::Entry(Level, "Subsystem").text(...).dec(...)`; counts warnings and failures; `replay()` redraws
   the lines after a display mode change cleared the screen). `src/Desktop/` is the desktop shell built on the GUI toolkit: `Desktop`

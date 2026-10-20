@@ -38,6 +38,99 @@ struct WebBrowser::Fetched {
   uint32_t status = 0;
 };
 
+// The scripts of one page: runs them in an engine of its own (created when the first one comes), collects what they write and print, and reports.
+class PageScripts final : public browser::IScriptRunner, public script::IHost {
+ public:
+  static constexpr uint32_t kMaxRuns = 60;
+  static constexpr uint64_t kMaxLog = 16 * 1024;
+
+  PageScripts(WebBrowser& owner, allocators::IAllocator& allocator, StringView address, StringView title, List<String>&& externals)
+      : owner_(owner), allocator_(allocator), address_(allocator), title_(allocator), written_(allocator), log_(allocator), first_error_(allocator), externals_(allocator) {
+    address_.assign(address);
+    title_.assign(title);
+    for (uint64_t i = 0; i < externals.count(); ++i) externals_.push_back(util::move(externals[i]));
+  }
+
+  // browser::IScriptRunner
+  StringView external(uint32_t index) override { return index < externals_.count() ? externals_[index].view() : StringView(); }
+  void run(StringView source, String* written) override {
+    if (runs_ >= kMaxRuns) return;
+    ++runs_;
+    if (!start()) return;
+    written_.clear();
+    String error(allocator_);
+    if (!engine_->run(source, &error, nullptr)) note_error(error.view());
+    written->append(written_.view());
+    written_.clear();
+  }
+
+  // After the page is read: the load events and the timers.
+  void finish() {
+    if (!engine_) return;
+    String error(allocator_);
+    uint32_t failed = engine_->fire_event("DOMContentLoaded", &error);
+    failed += engine_->run_timers(100, &error);
+    failed += engine_->fire_event("load", &error);
+    failed += engine_->run_timers(100, &error);
+    for (uint32_t i = 0; i < failed; ++i) note_error(i == 0 ? error.view() : StringView("Error"));
+    written_.clear();   // (anything written now has nowhere to go)
+  }
+
+  uint32_t errors() const { return errors_; }
+  StringView first_error() const { return first_error_.view(); }
+  StringView log() const { return log_.view(); }
+  bool title_changed() const { return title_changed_; }
+  StringView title() const { return title_.view(); }
+
+  // script::IHost
+  void console(int level, StringView text) override {
+    if (log_.size() < kMaxLog) {
+      if (level == 2) log_.append("warning: ");
+      if (level == 3) log_.append("error: ");
+      log_.append(text);
+      log_.push_back('\n');
+    }
+  }
+  void alert(StringView text) override { owner_.notify(gui::NoticeKind::Information, text); }
+  void document_write(StringView text, bool newline) override {
+    written_.append(text);
+    if (newline) written_.push_back('\n');
+  }
+  uint64_t now_ms() override { return owner_.unix_clock_ ? owner_.unix_clock_(owner_.unix_clock_context_) : 0; }
+  StringView location() override { return address_.view(); }
+  StringView title() override { return title_.view(); }
+  void set_title(StringView title) override {
+    title_.assign(title);
+    title_changed_ = true;
+  }
+  StringView user_agent() override { return "Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)"; }
+
+ private:
+  bool start() {
+    if (!engine_) {
+      engine_ = UniquePointer<script::Engine>::make(allocator_, allocator_, this);
+      if (engine_) engine_->set_limits(8000000, 48u << 20);
+    }
+    return engine_ && engine_->ok();
+  }
+  void note_error(StringView text) {
+    if (errors_++ == 0) first_error_.assign(text);
+    if (log_.size() < kMaxLog) {
+      log_.append("script error: ");
+      log_.append(text);
+      log_.push_back('\n');
+    }
+  }
+
+  WebBrowser& owner_;
+  allocators::IAllocator& allocator_;
+  String address_, title_, written_, log_, first_error_;
+  List<String> externals_;
+  UniquePointer<script::Engine> engine_;
+  uint32_t runs_ = 0, errors_ = 0;
+  bool title_changed_ = false;
+};
+
 namespace {
 
 const char kWelcome[] =
@@ -101,6 +194,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       address_(allocator),
       status_(allocator),
       page_(allocator),
+      script_log_(allocator),
       history_(allocator),
       current_(allocator),
       request_target_(allocator),
@@ -448,12 +542,21 @@ void WebBrowser::show(Fetched& page) {
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
+  {
+    UiGuard lock(this);
+    script_log_.clear();
+    script_errors_ = 0;
+  }
   bool ok = true;
+  uint32_t script_errors = 0;
+  bool have_script_title = false;
+  String first_script_error(allocator()), script_title(allocator());
   if (is_html(page.type.view(), page.address.view(), body)) {
     ok = doc->parse_html(body);
-    if (ok && doc->stylesheet_count() > 0) {   // the page links to stylesheets: fetch them and read the page again with them
-      say("Loading styles...");
+    const bool run_scripts = ok && scripts_enabled_ && doc->has_scripts();
+    if (ok && (doc->stylesheet_count() > 0 || run_scripts)) {   // it links to stylesheets or has scripts: fetch what it needs and read the page again
       String css(allocator());
+      if (doc->stylesheet_count() > 0) say("Loading styles...");
       for (uint32_t i = 0; i < doc->stylesheet_count() && i < kMaxStyleSheets; ++i) {
         String target(allocator());
         if (!browser::resolve_reference(allocator(), page.address.view(), doc->stylesheet(i), &target)) continue;
@@ -464,7 +567,37 @@ void WebBrowser::show(Fetched& page) {
           css.push_back('\n');
         }
       }
-      if (!css.empty()) ok = doc->parse_html(body, css.view());
+      if (run_scripts) {
+        List<String> externals(allocator());
+        if (doc->script_count() > 0) say("Loading scripts...");
+        for (uint32_t i = 0; i < doc->script_count() && i < kMaxExternalScripts; ++i) {
+          String text(allocator());
+          String target(allocator());
+          if (browser::resolve_reference(allocator(), page.address.view(), doc->script_source(i), &target)) {
+            Fetched file(allocator());
+            file.address.assign(target.view());
+            if (fetch(target.view(), &file) && file.status < 400 && file.body.size() <= kMaxScriptBytes) text.assign(StringView(file.body.view()));
+          }
+          externals.push_back(util::move(text));
+        }
+        String first_title(allocator());
+        first_title.assign(doc->title());
+        say("Running scripts...");
+        PageScripts scripts(*this, allocator(), page.address.view(), first_title.view(), util::move(externals));
+        ok = doc->parse_html(body, css.view(), &scripts);
+        scripts.finish();
+        script_errors = scripts.errors();
+        first_script_error.assign(scripts.first_error());
+        {
+          UiGuard lock(this);
+          script_log_.assign(scripts.log());
+          script_errors_ = scripts.errors();
+        }
+        if (scripts.title_changed()) script_title.assign(scripts.title());
+        have_script_title = scripts.title_changed();
+      } else if (!css.empty()) {
+        ok = doc->parse_html(body, css.view());
+      }
     }
   } else if (is_text(page.type.view(), body)) {
     ok = doc->parse_text(body);
@@ -479,9 +612,8 @@ void WebBrowser::show(Fetched& page) {
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
-  const StringView title = doc->title();
   String page_title(allocator());
-  page_title.assign(title);
+  page_title.assign(have_script_title && !script_title.empty() ? script_title.view() : doc->title());
   const bool cut = doc->truncated();
   page_.set_document(util::move(doc));
   {
@@ -497,6 +629,13 @@ void WebBrowser::show(Fetched& page) {
     message.append(": ");
   }
   message.append(cut ? "Done (the page is cut off)." : "Done.");
+  if (script_errors > 0) {
+    message.truncate(message.size() - 1);
+    message.append(" - ");
+    message.append_uint(script_errors);
+    message.append(script_errors == 1 ? " script error: " : " script errors; first: ");
+    message.append(first_script_error.view());
+  }
   say(message.view());
 }
 

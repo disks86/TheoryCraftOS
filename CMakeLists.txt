@@ -215,6 +215,12 @@ add_executable(BOOTX64
   src/Database/DatabaseManager.cpp
   src/Browser/HtmlDocument.cpp
   src/Browser/Css.cpp
+  src/Script/Number.cpp
+  src/Script/Parser.cpp
+  src/Script/Compiler.cpp
+  src/Script/Vm.cpp
+  src/Script/Builtins.cpp
+  src/Script/Engine.cpp
   src/Browser/PageLayout.cpp
   src/Browser/Url.cpp
   src/Browser/HttpPageLoader.cpp

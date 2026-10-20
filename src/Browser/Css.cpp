@@ -822,6 +822,7 @@ bool StyleSheet::parse_selector(StringView text, uint32_t rule) {
       any = true;
     }
     if (!any) drop = true;
+    if (compounds_.count() - first_compound >= 32) drop = true;   // (matching recurses once for each: a selector this long is not real)
     if (!drop && ok) ok = compounds_.push_back(compound);
     comb = Combinator::None;
   }

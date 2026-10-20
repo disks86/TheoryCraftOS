@@ -34,6 +34,7 @@
  */
 
 #include "Browser/HtmlDocument.hpp"
+#include "Utility/Move.hpp"
 #include <initializer_list>
 
 namespace browser {
@@ -180,8 +181,16 @@ bool HtmlDocument::add_stylesheet(StringView target) {
   return pool_.append(target) && sheets_.push_back(ref);
 }
 
+bool HtmlDocument::add_script_ref(StringView target) {
+  if (scripts_.count() >= 32 || pool_.size() + target.size() > kMaxText) return true;
+  LinkRef ref{static_cast<uint32_t>(pool_.size()), static_cast<uint32_t>(target.size())};
+  return pool_.append(target) && scripts_.push_back(ref);
+}
+
 void HtmlDocument::clear() {
   page_background_ = 0;
+  has_scripts_ = false;
+  scripts_.clear();
   sheets_.clear();
   runs_.clear();
   links_.clear();
@@ -223,12 +232,21 @@ class HtmlParser {
  public:
   static constexpr uint32_t kMaxDepth = 400;
 
-  HtmlParser(HtmlDocument& doc, allocators::IAllocator& allocator) : doc_(doc), chunk_(allocator), title_(allocator), sheet_(allocator), stack_(allocator), path_(allocator) {}
+  HtmlParser(HtmlDocument& doc, allocators::IAllocator& allocator, IScriptRunner* scripts) : doc_(doc), scripts_(scripts), written_(allocator), chunk_(allocator), title_(allocator), sheet_(allocator), stack_(allocator), path_(allocator) {}
 
   bool run(StringView html, StringView extra_css) {
     html_ = html;
     if (!extra_css.empty()) failed_ |= !sheet_.parse(extra_css);
     collect_styles(html);
+    parse_chunk(html);
+    flush();
+    if (!doc_.title_.assign(title_.view().trimmed())) return false;
+    return !failed_;
+  }
+
+ private:
+  // Reads a piece of the page: the page itself, and what its scripts wrote.
+  void parse_chunk(StringView html) {
     uint64_t i = 0;
     const uint64_t n = html.size();
     while (i < n && !doc_.truncated_ && !failed_) {
@@ -247,12 +265,8 @@ class HtmlParser {
         ++i;
       }
     }
-    flush();
-    if (!doc_.title_.assign(title_.view().trimmed())) return false;
-    return !failed_;
   }
 
- private:
   struct Element {
     Style style;
     int32_t link = -1;
@@ -270,6 +284,7 @@ class HtmlParser {
 
   // One character of page text, with white space collapsed (unless preformatted).
   void put(char c) {
+    if (head_open_ && !in_title_ && !is_space(c)) close_element("head");   // (text in the head starts the body)
     if (hidden() && !in_title_) return;
     if (skip_newline_) {
       skip_newline_ = false;
@@ -411,7 +426,8 @@ class HtmlParser {
       return end >= n || close == StringView::npos ? n : close + 1;
     }
     // Elements whose content is not shown: skipped up to their end tag.
-    if (name_is(name, "script", "svg", "template", "iframe", "select", "textarea", "noscript", "object")) {
+    if (name_is(name, "script")) return script_element(html, attrs, after);
+    if (name_is(name, "svg", "template", "iframe", "select", "textarea", "noscript", "object")) {
       flush();
       String end(doc_.allocator());
       end.append("</");
@@ -423,6 +439,45 @@ class HtmlParser {
     }
     open_element(name, written, attrs);
     return after;
+  }
+
+  // A <script>: counted, and run (when there is a runner) with what it wrote read in its place. Returns the position after it.
+  uint64_t script_element(StringView html, StringView attrs, uint64_t after) {
+    const uint64_t n = html.size();
+    flush();
+    const uint64_t end = find_end_tag(html, after, "</script");
+    const uint64_t close = html.find('>', end);
+    const uint64_t next = end >= n || close == StringView::npos ? n : close + 1;
+    doc_.has_scripts_ = true;
+    StringView type, src;
+    const bool has_type = find_attribute(attrs, "type", &type);
+    const bool has_src = find_attribute(attrs, "src", &src) && !src.empty();
+    String target(doc_.allocator());
+    uint32_t index = 0;
+    if (has_src) {
+      index = external_scripts_++;
+      if (attribute(attrs, "src", &target)) failed_ |= !doc_.add_script_ref(target.view());
+    }
+    const bool javascript = !has_type || type.empty() || type.equals_ignore_case("text/javascript") || type.equals_ignore_case("application/javascript") ||
+                            type.equals_ignore_case("text/ecmascript") || type.equals_ignore_case("application/ecmascript");
+    if (!scripts_ || !javascript || script_depth_ > 3) return next;
+    StringView source = has_src ? scripts_->external(index) : html.substr(after, (end < n ? end : n) - after);
+    if (source.empty()) return next;
+    String written(doc_.allocator());
+    ++script_depth_;
+    scripts_->run(source, &written);
+    if (!written.empty()) {
+      // (kept for as long as the parse goes on: the elements it opens point into it)
+      if (written_.push_back(util::move(written))) {
+        const StringView text = written_[written_.count() - 1].view();
+        collect_styles(text);
+        parse_chunk(text);
+      } else {
+        failed_ = true;
+      }
+    }
+    --script_depth_;
+    return next;
   }
 
   // Reads the <style> elements of the whole page (in order) before the page itself is read.
@@ -480,6 +535,7 @@ class HtmlParser {
     path_.remove_at(last);
     if (e.none && none_ > 0) --none_;
     if (tag_is(e, "title")) in_title_ = false;
+    if (tag_is(e, "head")) head_open_ = false;
     if (e.style.display != Display::Inline && !e.none && !hidden())
       block(static_cast<uint8_t>(1 + e.style.margin_bottom + e.style.padding_bottom));
   }
@@ -514,6 +570,7 @@ class HtmlParser {
 
   // The end tags HTML lets be left out: a new <li> ends the open one, a block ends a paragraph, and so on.
   void auto_close(StringView name) {
+    if (head_open_ && !name_is(name, "title", "meta", "link", "script", "style", "base", "noscript", "head")) close_element("head");   // (anything else starts the body)
     if (name_is(name, "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "dl", "table", "pre", "blockquote", "form", "hr", "section", "article", "header",
                  "footer", "nav", "aside", "address", "figure", "fieldset")) {
       while (stack_.count() > 0 && tag_is(stack_[stack_.count() - 1], "p")) pop_element();
@@ -610,6 +667,7 @@ class HtmlParser {
     if (!hidden() && !e.none && s.display != Display::Inline) block(static_cast<uint8_t>(1 + s.margin_top + s.padding_top));
     failed_ |= !stack_.push_back(e);
     if (e.none) ++none_;
+    if (name_is(name, "head")) head_open_ = true;
     if (name_is(name, "title")) {
       in_title_ = true;
     } else if (name_is(name, "pre")) {
@@ -690,6 +748,9 @@ class HtmlParser {
   }
 
   HtmlDocument& doc_;
+  IScriptRunner* scripts_;
+  uint32_t external_scripts_ = 0, script_depth_ = 0;
+  List<String> written_;
   StringView html_;
   String chunk_, title_;
   StyleSheet sheet_;
@@ -697,13 +758,13 @@ class HtmlParser {
   List<ElementView> path_;
   Style root_;
   uint32_t root_children_ = 0, none_ = 0;
-  bool failed_ = false, ended_space_ = true, in_title_ = false, skip_newline_ = false;
+  bool failed_ = false, ended_space_ = true, in_title_ = false, skip_newline_ = false, head_open_ = false;
   uint8_t pending_ = 0;
 };
 
-bool HtmlDocument::parse_html(StringView html, StringView extra_css) {
+bool HtmlDocument::parse_html(StringView html, StringView extra_css, IScriptRunner* scripts) {
   clear();
-  HtmlParser parser(*this, allocator_);
+  HtmlParser parser(*this, allocator_, scripts);
   if (!parser.run(html, extra_css)) {
     clear();
     return false;

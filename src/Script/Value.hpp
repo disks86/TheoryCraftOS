@@ -1,0 +1,150 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// Values and heap cells of the script engine (a JavaScript subset; see Engine.hpp). A Value is a tagged 16-byte record: undefined, null, a boolean, a
+// double, or a pointer to a heap cell (a string or an object). Cells live in the VM's heap and are freed by its mark-and-sweep collector; a Value that
+// is not reachable from the VM's roots (stack, frames, globals) must not be kept across anything that can run script code.
+#pragma once
+#include <stdint.h>
+#include "Allocators/IAllocator.hpp"
+#include "Utility/StringView.hpp"
+
+namespace script {
+
+struct Cell;
+struct JsString;
+struct JsObject;
+struct Env;
+struct FunctionCode;
+class Vm;
+
+enum class Tag : uint8_t { Undefined, Null, Boolean, Number, String, Object };
+
+struct Value {
+  Tag tag;
+  union {
+    bool boolean;
+    double number;
+    Cell* cell;
+  } u;
+
+  Value() : tag(Tag::Undefined) { u.number = 0; }
+  static Value make_null() {
+    Value v;
+    v.tag = Tag::Null;
+    return v;
+  }
+  static Value make_bool(bool b) {
+    Value v;
+    v.tag = Tag::Boolean;
+    v.u.boolean = b;
+    return v;
+  }
+  static Value make_number(double d) {
+    Value v;
+    v.tag = Tag::Number;
+    v.u.number = d;
+    return v;
+  }
+  static Value make_string(JsString* s) {
+    Value v;
+    v.tag = Tag::String;
+    v.u.cell = reinterpret_cast<Cell*>(s);
+    return v;
+  }
+  static Value make_object(JsObject* o) {
+    Value v;
+    v.tag = Tag::Object;
+    v.u.cell = reinterpret_cast<Cell*>(o);
+    return v;
+  }
+
+  bool is_undefined() const { return tag == Tag::Undefined; }
+  bool is_null() const { return tag == Tag::Null; }
+  bool is_nullish() const { return tag == Tag::Undefined || tag == Tag::Null; }
+  bool is_bool() const { return tag == Tag::Boolean; }
+  bool is_number() const { return tag == Tag::Number; }
+  bool is_string() const { return tag == Tag::String; }
+  bool is_object() const { return tag == Tag::Object; }
+  JsString* as_string() const { return reinterpret_cast<JsString*>(u.cell); }
+  JsObject* as_object() const { return reinterpret_cast<JsObject*>(u.cell); }
+};
+
+enum class CellKind : uint8_t { String, Object, Env };
+
+struct Cell {
+  Cell* next = nullptr;   // the heap's list of every cell
+  CellKind kind;
+  bool marked = false;
+  explicit Cell(CellKind k) : kind(k) {}
+};
+
+// An immutable string of bytes (the page's text is ASCII; other bytes are kept as they are), NUL-terminated after `length`.
+struct JsString : Cell {
+  uint32_t length = 0;
+  uint32_t hash = 0;
+  bool interned = false;   // property names are interned: two equal names are the same cell
+  JsString() : Cell(CellKind::String) {}
+  char* data() { return reinterpret_cast<char*>(this + 1); }
+  const char* data() const { return reinterpret_cast<const char*>(this + 1); }
+  StringView view() const { return StringView(data(), length); }
+};
+
+// The variables of one call of a function (and of the blocks in it): the closures made in it keep the Env alive.
+struct Env : Cell {
+  Env* parent = nullptr;
+  uint32_t count = 0;
+  Env() : Cell(CellKind::Env) {}
+  Value* slots() { return reinterpret_cast<Value*>(this + 1); }
+};
+
+enum class ObjKind : uint8_t { Plain, Array, Function, Native, Bound, Error, Iterator };
+
+enum PropFlag : uint8_t { kEnumerable = 1, kWritable = 2, kDefaultFlags = 3 };
+
+struct Prop {
+  JsString* key;
+  Value value;
+  uint8_t flags;
+};
+
+// Natives return false after throwing (Vm::throw_error); `args` may be shorter than the function asks for.
+using NativeFn = bool (*)(Vm& vm, const Value& this_value, const Value* args, uint32_t argc, Value* result);
+
+struct JsObject : Cell {
+  ObjKind okind = ObjKind::Plain;
+  bool frozen = false;
+  JsObject* proto = nullptr;
+  Prop* props = nullptr;
+  uint32_t prop_count = 0, prop_cap = 0;
+  uint32_t* index = nullptr;   // a hash index over props when there are many of them (slots hold prop number + 1)
+  uint32_t index_cap = 0;
+  // Arrays (elements), bound functions (the bound arguments) and iterators (the keys to visit).
+  Value* items = nullptr;
+  uint32_t length = 0, capacity = 0;
+  // Functions.
+  FunctionCode* code = nullptr;
+  Env* env = nullptr;
+  Value bound_this;       // an arrow function's `this`, a bound function's `this`, an iterator's source
+  JsObject* target = nullptr;   // a bound function's function
+  NativeFn native = nullptr;
+  uint32_t position = 0;  // an iterator's place
+  JsObject() : Cell(CellKind::Object) {}
+};
+
+}  // namespace script

@@ -251,6 +251,19 @@ void Desktop::setup_web_browser(WebBrowser& web) {
   web.set_file_dialog(&file_dialog_);
   web.set_file_system(fs_);
   web.set_page_loader(page_loader_);
+  web.set_clock(&Desktop::unix_ms, this);
+}
+
+// The local time of the taskbar clock as milliseconds since 1970 (what a script's Date.now() says; 0 without a clock).
+uint64_t Desktop::unix_ms(void* self) {
+  auto* d = static_cast<Desktop*>(self);
+  DateTime t;
+  if (!d->clock_source_ || !d->clock_source_(d->clock_context_, &t)) return 0;
+  int64_t y = t.year, m = t.month;
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400, yoe = y - era * 400, doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + t.day - 1, doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  const int64_t days = era * 146097 + doe - 719468;
+  return static_cast<uint64_t>(days * 86400 + t.hour * 3600 + t.minute * 60) * 1000;
 }
 
 void Desktop::set_page_loader(browser::IPageLoader* loader) {

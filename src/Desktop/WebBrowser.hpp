@@ -19,7 +19,8 @@
 // The web browser: a window with a menu bar (File: Open File, Close; Go: Back, Forward, Reload), a bar with the Back, Forward and Reload buttons, the
 // address box and Go, the page, and a status bar that says what is happening (and where the link under the pointer leads). It shows HTML pages (see
 // browser::HtmlDocument and browser::StyleSheet for what is understood - text, headings, lists, tables, links, and the CSS that colours, spaces and
-// aligns them, from <style>, style attributes and linked stylesheets; no pictures or scripts) and plain text, from the web
+// aligns them, from <style>, style attributes and linked stylesheets, and the scripts of the page (see script::Engine; they run while the page is read,
+// write into it with document.write, set its title, and print to the script log; there is no DOM to change afterwards); no pictures) and plain text, from the web
 // (http:// and https://, through the page loader the desktop gives it) and from the system's own volumes (a path such as /docs/index.html).
 // Enter in the address box, or Go, opens what is typed; Ctrl+L goes to the address box, Alt+Left and Alt+Right are Back and Forward, F5 and Ctrl+R
 // reload, Ctrl+O opens a file. Clicking a link opens it; a page that links to another by a relative address works in files as it does on the web.
@@ -29,6 +30,7 @@
 // something while a page is still loading replaces the request that has not started yet.
 #pragma once
 #include "Browser/IPageLoader.hpp"
+#include "Script/Engine.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -48,6 +50,10 @@ class WebBrowser : public gui::Frame {
   static constexpr uint32_t kMaxHistory = 100;
   static constexpr uint32_t kMaxStyleSheets = 8;
   static constexpr uint64_t kMaxStyleSheetBytes = 512u << 10;
+  static constexpr uint32_t kMaxExternalScripts = 12;
+  static constexpr uint64_t kMaxScriptBytes = 1u << 20;
+  // The time of day in milliseconds since 1970 for Date (0 if there is none).
+  using UnixClock = uint64_t (*)(void* context);
 
   explicit WebBrowser(allocators::IAllocator& allocator);
 
@@ -61,6 +67,13 @@ class WebBrowser : public gui::Frame {
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
   // Where web pages come from (nullptr: none, web addresses then say so). It must outlive the window.
   void set_page_loader(browser::IPageLoader* loader) { loader_ = loader; }
+  void set_clock(UnixClock clock, void* context) { unix_clock_ = clock; unix_clock_context_ = context; }
+  // Whether the scripts of pages are run (on by default).
+  void set_scripts_enabled(bool enabled) { scripts_enabled_ = enabled; }
+  bool scripts_enabled() const { return scripts_enabled_; }
+  // What the scripts of the last page printed (console.log and so on, one line each, errors included) and how many of them failed.
+  StringView script_log() const { return script_log_.view(); }
+  uint32_t script_errors() const { return script_errors_; }
 
   // Opens what was typed as an address (see browser::normalize_address). False if it is empty. The page is fetched on the handler thread: when
   // this returns the request is only made (without a handler thread the page is already shown).
@@ -93,6 +106,7 @@ class WebBrowser : public gui::Frame {
  private:
   enum class Request : uint8_t { None, Go, Back, Forward, Reload };
   struct Fetched;
+  friend class PageScripts;
 
   static void on_back(void* self, gui::Control&);
   static void on_forward(void* self, gui::Control&);
@@ -129,6 +143,11 @@ class WebBrowser : public gui::Frame {
   gui::NoticeDialog* notices_ = nullptr;
   browser::IPageLoader* loader_ = nullptr;
   gui::Handler load_handler_;
+  UnixClock unix_clock_ = nullptr;
+  void* unix_clock_context_ = nullptr;
+  bool scripts_enabled_ = true;
+  uint32_t script_errors_ = 0;
+  String script_log_;
   List<String> history_;
   int64_t index_ = -1;
   String current_, request_target_, status_text_;

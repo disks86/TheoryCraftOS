@@ -6328,6 +6328,14 @@ struct FakeLoader final : browser::IPageLoader {
       r->status = 404;
       html = "<p>gone</p>";
     }
+    if (address.equals("http://js.test/")) {
+      html = "<html><head><title>Plain</title><script src=\"/app.js\"></script></head><body><script>document.write('<p>written</p>'); console.log('hi', 1 + 1); "
+             "document.title = 'Scripted: ' + location.href; undefinedFunction();</script><p>text</p></body></html>";
+    }
+    if (address.equals("http://js.test/app.js")) {
+      r->content_type.assign("application/javascript");
+      html = "document.write('<p>from file</p>'); var answer = 6 * 7; document.write('<p>' + answer + '</p>');";
+    }
     if (address.equals("http://data.test/")) {
       r->content_type.assign("image/png");
       html = "\x89PNG\r\n\x1a\n";
@@ -6419,6 +6427,19 @@ static void test_web_browser() {
     b.set_page_loader(nullptr);
     CHECK(b.navigate("http://one.test/") && b.status_label().text().contains("no network") && b.address().equals("http://data.test/"));
     b.set_page_loader(&loader);
+
+    // Scripts: a file the page names and its own, run as it is read; what they write is in the page, the title they set is the page's, a script that
+    // throws is counted and the others carry on, and the log has what they printed.
+    CHECK(b.scripts_enabled() && b.navigate("http://js.test/") && b.address().equals("http://js.test/"));
+    CHECK(b.title().equals("Web Browser - Scripted: http://js.test/"));
+    CHECK(run_contains(b, "from file") && run_contains(b, "42") && run_contains(b, "written") && run_contains(b, "text"));
+    CHECK(b.script_errors() == 1 && b.script_log().contains("hi 2\n") && b.script_log().contains("script error: ReferenceError: undefinedFunction is not defined"));
+    CHECK(b.status_label().text().contains("1 script error: ReferenceError"));
+    b.set_scripts_enabled(false);
+    CHECK(b.navigate("http://js.test/") && !run_contains(b, "written") && !run_contains(b, "from file") && run_contains(b, "text") && b.script_errors() == 0 && b.script_log().empty());
+    CHECK(b.title().equals("Web Browser - Plain"));
+    b.set_scripts_enabled(true);
+    CHECK(b.navigate("http://one.test/") && b.script_errors() == 0 && b.script_log().empty());
 
     // Files on the system's own volumes: pages (links resolve against the folder), plain text, and files that are not there.
     CHECK(b.navigate("/docs/index.html") && b.title().equals("Web Browser - Index") && b.address().equals("/docs/index.html") && run_contains(b, "Local"));

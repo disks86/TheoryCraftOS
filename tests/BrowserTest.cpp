@@ -21,6 +21,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <vector>
 #include "Browser/HtmlDocument.hpp"
 #include "Browser/PageLayout.hpp"
 #include "Browser/Url.hpp"
@@ -308,7 +310,70 @@ static void test_css_garbage() {
     deep.append("deep");
     CHECK(doc.parse_html(deep.view()) && find_run(doc, "deep"));
     CHECK(doc.parse_html("<style>@media{{{{</style><style>a{</style><style>@</style><style>[</style><p>ok</p>") && find_run(doc, "ok"));
+    String long_selector(a);
+    long_selector.append("<style>");
+    for (int i = 0; i < 5000; ++i) long_selector.append("a ");
+    long_selector.append("b{color:red} p{color:blue}</style><p>deep</p>");
+    CHECK(doc.parse_html(long_selector.view()) && find_run(doc, "deep") && find_run(doc, "deep")->color == 0xFF0000FF);
     CHECK(doc.parse_html("<p style='color:;:red;;font-weight'>ok</p><p style=\"margin: 1 2 3 4 5 6\">x</p>") && find_run(doc, "ok"));
+  }
+  CHECK(a.live == 0);
+}
+
+
+// A script runner that records what it is given; a script that starts with "w:" writes the rest into the page.
+struct FakeRunner final : IScriptRunner {
+  std::vector<std::string> ran;
+  StringView external(uint32_t index) override { return index == 0 ? StringView("w:[ext]") : StringView(); }
+  void run(StringView source, String* written) override {
+    ran.push_back(std::string(source.data(), source.size()));
+    if (source.starts_with("w:")) written->append(source.substr(2));
+  }
+};
+
+static bool scripted_page_is(const char* html, uint32_t columns, const char* expected, size_t scripts_run) {
+  TestAllocator a;
+  bool ok;
+  {
+    HtmlDocument doc(a);
+    FakeRunner runner;
+    doc.parse_html(html, StringView(), &runner);
+    String out(a);
+    render(a, doc, columns, &out);
+    ok = out.view().equals(expected) && runner.ran.size() == scripts_run;
+    if (!ok) printf("   page \"%s\" shows \"%s\" after %zu scripts, expected \"%s\" after %zu\n", html, out.c_str(), runner.ran.size(), expected, scripts_run);
+  }
+  return ok && a.live == 0;
+}
+
+static void test_scripts() {
+  CHECK(scripted_page_is("a<script>w:<b>x</b></script>c", 40, "axc", 1));
+  CHECK(scripted_page_is("<p>one</p><script>w:<p>two</p></script><p>three</p>", 40, "one\n\ntwo\n\nthree", 1));
+  CHECK(scripted_page_is("a<script>nothing</script>b", 40, "ab", 1));
+  CHECK(scripted_page_is("a<script src=x.js></script>b", 40, "a[ext]b", 1));
+  CHECK(scripted_page_is("a<script src=x.js>ignored inline</script><script src=y.js></script>b", 40, "a[ext]b", 1));   // (the second has nothing fetched)
+  CHECK(scripted_page_is("a<script type='application/ld+json'>w:no</script>b", 40, "ab", 0));
+  CHECK(scripted_page_is("a<script type='text/javascript'>w:yes</script>b", 40, "ayesb", 1));
+  CHECK(scripted_page_is("a<script>w:<script>w:deep</script></script>b", 40, "adeepb", 2));
+  CHECK(scripted_page_is("a<script>w:<div>open</script>b", 40, "a\nopenb", 1));   // (an element it leaves open stays open: no dangling text)
+  CHECK(scripted_page_is("a<script>w:<style>p{color:red}</style><p>styled</p></script>", 40, "a\n\nstyled", 1));
+  CHECK(scripted_page_is("<script>unclosed", 40, "", 1));
+  CHECK(scripted_page_is("a<script>\nw:x\n", 40, "a", 1));
+  TestAllocator a;
+  {
+    HtmlDocument doc(a);
+    doc.parse_html("<p>a</p><script src='/one.js'></script><script>1</script><script src=two.js async></script>");
+    CHECK(doc.has_scripts() && doc.script_count() == 2 && doc.script_source(0).equals("/one.js") && doc.script_source(1).equals("two.js"));
+    CHECK(doc.parse_html("<p>no scripts</p>") && !doc.has_scripts() && doc.script_count() == 0);
+    // Without a runner nothing is run, and the text of the script is not shown.
+    CHECK(doc.parse_html("a<script>document.write('x')</script>b") && doc.run_count() == 2);
+    String out(a);
+    // A script that runs the page's own text back in at every level is stopped after a few.
+    struct Echo final : IScriptRunner {
+      StringView external(uint32_t) override { return StringView(); }
+      void run(StringView, String* written) override { written->append("<script>go</script>z"); }
+    } echo;
+    CHECK(doc.parse_html("<script>go</script>", StringView(), &echo) && doc.run_count() <= 8);
   }
   CHECK(a.live == 0);
 }
@@ -366,6 +431,7 @@ int main() {
   test_css_boxes();
   test_css_text_styles();
   test_css_garbage();
+  test_scripts();
   test_addresses();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
