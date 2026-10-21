@@ -458,7 +458,7 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
     }
     return false;
   }
-  if (n->is_tag("video")) {
+  if (n->is_tag("video") || n->is_tag("audio")) {
     if (IS("loop") || IS("autoplay") || IS("controls") || IS("defaultMuted") || IS("playsInline") || IS("disablePictureInPicture")) {
       const char* attribute = IS("defaultMuted") ? "muted" : IS("playsInline") ? "playsinline" : IS("disablePictureInPicture") ? "disablepictureinpicture" : IS("loop") ? "loop" : IS("autoplay") ? "autoplay" : "controls";
       *out = bool_value(dom::has_attribute(n, attribute));
@@ -502,7 +502,7 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
 
 HostClass::Set media_set(DomBindings::Impl& c, dom::Node* n, StringView k, const Value& value) {
   Vm& vm = c.vm;
-  if (n->is_tag("video")) {
+  if (n->is_tag("video") || n->is_tag("audio")) {
     if (IS("currentTime")) {
       double d;
       if (!vm.to_number(value, &d)) return HostClass::Set::Threw;
@@ -559,7 +559,7 @@ namespace {
 NATIVE(el_play) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
-  if (!n->is_tag("video")) return vm.throw_error(ErrorKind::TypeError, "play is not a function");
+  if (!n->is_tag("video") && !n->is_tag("audio")) return vm.throw_error(ErrorKind::TypeError, "play is not a function");
   objs(vm).video_play(n->serial);
   *result = make_thenable(impl(vm));
   return true;
@@ -568,14 +568,14 @@ NATIVE(el_play) {
 NATIVE(el_pause) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
-  if (n->is_tag("video")) objs(vm).video_pause(n->serial);
+  if (n->is_tag("video") || n->is_tag("audio")) objs(vm).video_pause(n->serial);
   return true;
 }
 
 NATIVE(el_load) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
-  if (n->is_tag("video")) {
+  if (n->is_tag("video") || n->is_tag("audio")) {
     objs(vm).video_load(n->serial);
     n->owner->touch();   // (the page is drawn again, which fetches it)
   }
@@ -586,7 +586,14 @@ NATIVE(el_can_play_type) {
   String type(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &type)) return false;
   const StringView t = type.view();
-  const bool maybe = t.starts_with("video/mp4") || t.starts_with("video/quicktime") || t.starts_with("video/x-msvideo") || t.starts_with("image/gif");
+  dom::Node* n = this_node(vm, self);
+  bool maybe = t.starts_with("video/mp4") || t.starts_with("video/quicktime") || t.starts_with("video/x-msvideo") || t.starts_with("image/gif");
+  if (n && n->is_tag("audio")) {
+    maybe = false;
+    for (const char* ok : {"audio/mpeg", "audio/mp3", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/ogg", "audio/flac", "audio/wav", "audio/wave", "audio/x-wav", "audio/aiff",
+                           "audio/x-aiff", "audio/basic", "audio/midi", "audio/x-midi"})
+      if (t.starts_with(ok)) maybe = true;
+  }
   *result = str_value(vm, maybe ? (t.contains("codecs") ? "probably" : "maybe") : "");
   return true;
 }

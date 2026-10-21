@@ -135,6 +135,7 @@ class WebBrowser : public gui::Frame {
     bool fetch_text(StringView address, uint64_t limit, String* text) override;
     bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override;
     UniquePointer<browser::IVideoClip> open_video(UniquePointer<ByteBuffer> data) override;
+    UniquePointer<browser::IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override;
     void navigate(StringView address, bool replace) override;
     void set_hash(StringView hash) override;
     void reload() override;

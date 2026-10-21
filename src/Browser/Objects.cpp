@@ -90,6 +90,18 @@ bool supported_video_type(StringView type) {
   return false;
 }
 
+bool supported_audio_type(StringView type) {
+  type = type.trimmed();
+  if (type.empty()) return true;
+  const uint64_t semi = type.find(';');
+  if (semi != StringView::npos) type = type.first(semi).trimmed();
+  for (const char* ok : {"audio/mpeg", "audio/mp3", "audio/mpeg3", "audio/x-mpeg", "audio/mp4", "audio/x-m4a", "audio/m4a", "audio/aac", "audio/aacp", "audio/ogg", "audio/vorbis",
+                         "application/ogg", "audio/flac", "audio/x-flac", "audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave", "audio/aiff", "audio/x-aiff", "audio/basic",
+                         "audio/midi", "audio/x-midi", "audio/mid", "audio/sp-midi"})
+    if (type.equals_ignore_case(ok)) return true;
+  return false;
+}
+
 // srcset: "a.png 1x, b.png 2x" or "s.png 400w, l.png 800w": the one for a display `viewport` pixels wide.
 bool pick_srcset(StringView srcset, int32_t viewport, String* out) {
   struct Candidate {
@@ -454,12 +466,13 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
     slot->serial = n->serial;
   }
   slot->seen = true;
+  slot->audio = n->is_tag("audio");
   slot->controls = dom::has_attribute(n, "controls");
   slot->loop = dom::has_attribute(n, "loop");
   slot->autoplay = dom::has_attribute(n, "autoplay");
   if (dom::has_attribute(n, "muted")) slot->muted = slot->muted || slot->state == 0;
   // the poster
-  const StringView poster = attr(n, "poster").trimmed();
+  const StringView poster = slot->audio ? StringView() : attr(n, "poster").trimmed();
   if (poster.empty()) {
     slot->poster.clear();
     slot->poster_cache = -1;
@@ -484,7 +497,7 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
     for (const dom::Node* c = n->first_child; c; c = c->next) {
       if (!c->is_tag("source")) continue;
       const StringView s = attr(c, "src").trimmed();
-      if (s.empty() || !supported_video_type(attr(c, "type"))) continue;
+      if (s.empty() || !(slot->audio ? supported_audio_type(attr(c, "type")) : supported_video_type(attr(c, "type")))) continue;
       candidate.assign(s);
       break;
     }
@@ -526,7 +539,7 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
       got = env.fetch_bytes(absolute.view(), kMaxVideoBytes, bytes.get());
     }
   }
-  if (got) slot->clip = env.open_video(util::move(bytes));
+  if (got) slot->clip = slot->audio ? env.open_audio(util::move(bytes)) : env.open_video(util::move(bytes));
   if (!slot->clip) {
     slot->state = 2;
     queue(n->serial, "error");
@@ -537,7 +550,7 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
   slot->ended = false;
   slot->clip->set_looping(slot->loop);
   slot->clip->set_volume(slot->volume, slot->muted);
-  slot->picture = allocate_view<uint32_t>(allocator_, uint64_t{slot->clip->width() ? slot->clip->width() : 1} * (slot->clip->height() ? slot->clip->height() : 1));
+  if (!slot->audio) slot->picture = allocate_view<uint32_t>(allocator_, uint64_t{slot->clip->width() ? slot->clip->width() : 1} * (slot->clip->height() ? slot->clip->height() : 1));
   queue(n->serial, "loadstart");
   queue(n->serial, "loadedmetadata");
   queue(n->serial, "loadeddata");
@@ -563,7 +576,7 @@ void PageObjects::sync(dom::Document& doc, IObjectEnvironment& env, StringView b
     dom::Node* n = doc.by_serial(serial);
     if (!n || !n->is_element()) continue;
     if (n->is_tag("img")) sync_image(n, env, base, media, nullptr);
-    else if (n->is_tag("video")) sync_video(n, env, base, media, &video_fetches);
+    else if (n->is_tag("video") || n->is_tag("audio")) sync_video(n, env, base, media, &video_fetches);
   }
   for (uint64_t i = images_.count(); i > 0; --i) {
     if (images_[i - 1]->seen) continue;
@@ -675,6 +688,14 @@ bool PageObjects::object_info(const dom::Node* element, ObjectInfo* out) {
     }
     return true;
   }
+  if (element->is_tag("audio")) {   // (without controls there is nothing to show)
+    if (!dom::has_attribute(element, "controls")) return false;
+    out->kind = ObjectKind::Audio;
+    out->ready = true;
+    out->width = 300;
+    out->height = 32;
+    return true;
+  }
   if (element->is_tag("canvas")) {
     out->kind = ObjectKind::Canvas;
     out->ready = true;
@@ -749,8 +770,8 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
     if (dh == 0) dh = 1;
     draw_scaled(r, cache, src, frame, x + static_cast<int32_t>((w - dw) / 2), y + static_cast<int32_t>((h - dh) / 2), dw, dh, clip, true);
   };
-  bool drawn = false;
-  if (v.clip && v.state == 1 && !v.picture.empty()) {
+  bool drawn = v.audio;   // (no picture to look for)
+  if (!v.audio && v.clip && v.state == 1 && !v.picture.empty()) {
     uint32_t serial = 0;
     const uint32_t cw = v.clip->width();
     if (cw && v.clip->copy_picture(v.picture, cw, &serial)) {
@@ -778,9 +799,9 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
     const int32_t tw = static_cast<int32_t>(StringView(message).size()) * 8;
     if (static_cast<int32_t>(w) > tw && h >= 16) r.draw_text(x + (static_cast<int32_t>(w) - tw) / 2, y + (static_cast<int32_t>(h) - 16) / 2, message, 0xFFB0B0B0u);
   }
-  if (v.controls && h >= 40 && w >= 80) {
-    const int32_t bar = static_cast<int32_t>(h) - 24;
-    r.fill_rect({x, y + bar, w, 24}, 0xC0101010u);
+  if (v.controls && w >= 80 && (v.audio ? h >= 24 : h >= 40)) {
+    const int32_t bar = v.audio ? static_cast<int32_t>(h - 24) / 2 : static_cast<int32_t>(h) - 24;
+    r.fill_rect(v.audio ? Rect2D{x, y, w, h} : Rect2D{x, y + bar, w, 24}, v.audio ? 0xFF202020u : 0xC0101010u);
     const bool playing = v.clip && v.clip->playing();
     if (playing) {
       r.fill_rect({x + 9, y + bar + 6, 4, 12}, 0xFFFFFFFFu);
@@ -824,7 +845,8 @@ void PageObjects::paint_object(graphics::IRenderer2D& r, uint32_t node, ObjectKi
       draw_scaled(r, s->scaled, src, frame, x, y, w, h, clip, false);
       break;
     }
-    case ObjectKind::Video: {
+    case ObjectKind::Video:
+    case ObjectKind::Audio: {
       VideoSlot* v = find_video(node);
       if (v) draw_video(r, *v, x, y, w, h, clip);
       break;
@@ -842,7 +864,7 @@ bool PageObjects::object_clicked(uint32_t serial, int32_t lx, int32_t ly, uint32
   Lock lock(*this);
   VideoSlot* v = find_video(serial);
   if (!v || !v->controls || !v->clip) return false;
-  const bool on_bar = h >= 40 && ly >= static_cast<int32_t>(h) - 24;
+  const bool on_bar = v->audio ? h >= 24 : h >= 40 && ly >= static_cast<int32_t>(h) - 24;
   if (on_bar && lx >= 32) {
     const int32_t track_w = static_cast<int32_t>(w) - 40 - 
         (static_cast<int32_t>(w) > 32 + 13 * 8 + 40 ? 13 * 8 + 8 : 0);

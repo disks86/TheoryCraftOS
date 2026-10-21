@@ -21,6 +21,8 @@
 #include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Audio/AudioPlayer.hpp"
+#include "Media/AudioStreaming.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Video/VideoPlayer.hpp"
 
@@ -74,6 +76,44 @@ class BrowserVideoClip final : public browser::IVideoClip {
   video::VideoPlayer player_;
 };
 
+// A sound of a page (<audio>): the file is decoded as it plays (media::open_audio_stream) and goes through an audio::AudioPlayer on the machine's mixer.
+class BrowserAudioClip final : public browser::IVideoClip {
+ public:
+  BrowserAudioClip(allocators::IAllocator& allocator, audio::AudioMixer& mixer, UniquePointer<ByteBuffer> data)
+      : data_(util::move(data)), source_(data_->view()), player_(mixer, allocator), allocator_(allocator) {}
+  ~BrowserAudioClip() { player_.close(); }
+  bool open() {
+    stream_ = media::open_audio_stream(source_, allocator_);
+    return stream_ && stream_->frame_count() > 0 && player_.open(stream_.get());
+  }
+
+  bool play() override { return player_.play(); }
+  void pause() override { player_.pause(); }
+  void seek(int64_t microseconds) override {
+    if (microseconds < 0) microseconds = 0;
+    player_.seek(static_cast<uint64_t>(microseconds) * player_.sample_rate() / 1000000);
+  }
+  void set_looping(bool looping) override { player_.set_looping(looping); }
+  void set_volume(double volume, bool muted) override {
+    player_.set_volume(static_cast<uint8_t>((volume < 0 ? 0 : volume > 1 ? 1 : volume) * 100 + 0.5));
+    player_.set_muted(muted);
+  }
+  bool playing() override { return player_.playing(); }
+  int64_t position_us() override { return player_.sample_rate() ? static_cast<int64_t>(player_.position() * 1000000 / player_.sample_rate()) : 0; }
+  int64_t duration_us() override { return player_.sample_rate() ? static_cast<int64_t>(player_.duration() * 1000000 / player_.sample_rate()) : 0; }
+  uint32_t width() override { return 0; }
+  uint32_t height() override { return 0; }
+  void update() override { player_.update(); }
+  bool copy_picture(ArrayView<uint32_t>, uint32_t, uint32_t*) override { return false; }
+
+ private:
+  UniquePointer<ByteBuffer> data_;
+  media::MemoryByteSource source_;
+  UniquePointer<audio::IPcmSource> stream_;
+  audio::AudioPlayer player_;
+  allocators::IAllocator& allocator_;
+};
+
 const char kWelcome[] =
     "<html><head><title>Welcome</title></head><body>"
     "<h1>TheoryCraftOS Web Browser</h1>"
@@ -83,7 +123,7 @@ const char kWelcome[] =
     "<h2>Keys</h2>"
     "<ul><li>Ctrl+L: go to the address box</li><li>Alt+Left, Alt+Right: back and forward</li><li>F5 or Ctrl+R: reload</li>"
     "<li>Ctrl+O: open a file</li><li>Space, Page Up, Page Down: scroll</li></ul>"
-    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them, and pictures, videos and canvases.</p>"
+    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them, and pictures, videos, sounds and canvases.</p>"
     "<p>A place to start: <a href=\"http://example.com/\">http://example.com/</a></p>"
     "</body></html>";
 
@@ -737,6 +777,13 @@ bool WebBrowser::Env::fetch_bytes(StringView address, uint64_t limit, ByteBuffer
 UniquePointer<browser::IVideoClip> WebBrowser::Env::open_video(UniquePointer<ByteBuffer> data) {
   if (!owner_.codecs_ || !owner_.clock_ || !data) return UniquePointer<browser::IVideoClip>();
   auto clip = UniquePointer<BrowserVideoClip>::make(owner_.allocator(), owner_.allocator(), *owner_.clock_, *owner_.codecs_, owner_.mixer_, util::move(data));
+  if (!clip || !clip->open()) return UniquePointer<browser::IVideoClip>();
+  return clip;
+}
+
+UniquePointer<browser::IVideoClip> WebBrowser::Env::open_audio(UniquePointer<ByteBuffer> data) {
+  if (!owner_.mixer_ || !data) return UniquePointer<browser::IVideoClip>();
+  auto clip = UniquePointer<BrowserAudioClip>::make(owner_.allocator(), owner_.allocator(), *owner_.mixer_, util::move(data));
   if (!clip || !clip->open()) return UniquePointer<browser::IVideoClip>();
   return clip;
 }

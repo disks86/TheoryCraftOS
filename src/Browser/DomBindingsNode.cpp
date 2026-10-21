@@ -363,7 +363,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     *out = str_value(vm, text.view());
     return true;
   }
-  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("canvas")) && media_get(c, n, k, out)) return true;
+  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("canvas")) && media_get(c, n, k, out)) return true;
   if (IS("type") && !dom::has_attribute(n, "type")) {
     if (n->is_tag("input")) { *out = str_value(vm, "text"); return true; }
     if (n->is_tag("button")) { *out = str_value(vm, "submit"); return true; }
@@ -411,7 +411,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     throw_dom_error(vm, e);
     return HostClass::Set::Threw;
   };
-  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("canvas"))) {
+  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("canvas"))) {
     const HostClass::Set handled = media_set(c, n, k, value);
     if (handled != HostClass::Set::NotHandled) return handled;
   }
@@ -1166,6 +1166,20 @@ NATIVE(image_constructor) {
   return true;
 }
 
+NATIVE(audio_constructor) {
+  DomBindings::Impl& c = impl(vm);
+  dom::Node* audio = c.doc.create_element("audio");
+  if (!audio) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  if (argc > 0 && !args[0].is_undefined()) {
+    String src(vm.allocator());
+    if (!arg_text(vm, args[0], &src)) return false;
+    dom::set_attribute(audio, "src", src.view());
+  }
+  dom::set_attribute(audio, "preload", "auto");
+  *result = node_value(c, audio);
+  return true;
+}
+
 NATIVE(dom_parser_parse) {
   DomBindings::Impl& c = impl(vm);
   String html(vm.allocator());
@@ -1322,6 +1336,12 @@ bool install_nodes(DomBindings::Impl& c) {
     JsObject* image_proto = vm.new_object(c.html_proto);
     vm.define(image, vm.prototype_name(), Value::make_object(image_proto), 0);
     vm.define_named(g, "Image", Value::make_object(image), kWritable);
+  }
+  {   // new Audio(src)
+    JsObject* audio = vm.new_native(audio_constructor, "Audio", 1);
+    JsObject* audio_proto = vm.new_object(c.html_proto);
+    vm.define(audio, vm.prototype_name(), Value::make_object(audio_proto), 0);
+    vm.define_named(g, "Audio", Value::make_object(audio), kWritable);
   }
   {
     JsObject* parser_proto = vm.new_plain();

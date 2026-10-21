@@ -25,6 +25,8 @@
 //   <video>   the file is fetched and handed to the environment to play (IVideoClip: AVI, MP4 / MOV with H.264, GIF, APNG, WebP, Y4M - on the video
 //             hardware where the machine has some); the current picture is drawn, a poster before that, and a control bar when the element asks for
 //             controls. play() / pause() / currentTime / volume and the media events are the script side of the same thing.
+//   <audio>   the same, without a picture: the file (MP3, AAC / M4A, Ogg Vorbis, FLAC, WAV, AIFF, AU, MIDI ...) is handed to the environment to play
+//             (open_audio()); only an element with controls takes room on the page - a bar with play / pause, a position and the time. `new Audio(src)` too.
 //   <canvas>  a CanvasBitmap (see Canvas.hpp), drawn by the renderer the page is shown on - the GPU's when the machine has one.
 //
 // All of it is shared between the thread the page runs on and the one that draws, so every call takes the object lock (a recursive one: scripts hold it
@@ -75,6 +77,8 @@ class IObjectEnvironment {
   virtual bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) = 0;
   // Opens a video file for playing; the clip keeps `data` as long as it needs it. Null if this machine cannot play it.
   virtual UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) { (void)data; return UniquePointer<IVideoClip>(); }
+  // The same for a sound file: a clip whose width() and height() are 0 and that has no picture. Null if this machine cannot play it.
+  virtual UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) { (void)data; return UniquePointer<IVideoClip>(); }
 
  protected:
   IObjectEnvironment() = default;
@@ -196,7 +200,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     int32_t poster_cache = -1;
     UniquePointer<IVideoClip> clip;
     uint8_t state = 0;           // 0 nothing yet, 1 ready, 2 failed
-    bool seen = false, controls = false, loop = false, muted = false, autoplay = false, ended = false, was_playing = false, announced = false, wants_play = false;
+    bool audio = false, seen = false, controls = false, loop = false, muted = false, autoplay = false, ended = false, was_playing = false, announced = false, wants_play = false;
     double volume = 1;
     uint64_t last_timeupdate_ms = 0;
     ArrayView<uint32_t> picture;

@@ -323,12 +323,13 @@ class DocumentRenderer {
       const uint32_t here = s.indent;
       literal(marker.view(), static_cast<uint8_t>(here >= 3 ? here - 3 : 0));
     }
-    if (objects_ && !hidden() && tag_in(n, {"img", "video", "canvas"})) {
+    if (objects_ && !hidden() && tag_in(n, {"img", "video", "audio", "canvas"})) {
       ObjectInfo info;
       if (objects_->object_info(n, &info) && info.kind != ObjectKind::None && (info.ready || info.kind != ObjectKind::Image)) {
         object_run(n, info);
         return false;   // (a video's or canvas's fallback content is not shown)
       }
+      if (n->is_tag("audio")) return false;   // (nor is an audio's: without controls it shows nothing at all)
     }
     if (dom::is_void_tag(n->name.view())) void_action(n);
     return true;

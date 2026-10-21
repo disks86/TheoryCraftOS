@@ -245,6 +245,25 @@ bool inflate(ConstByteView in, ByteBuffer* out, uint64_t max_output, bool raw, u
   return true;
 }
 
+bool inflate_message(ConstByteView in, ByteBuffer* out, uint64_t max_output) {
+  Inflater z{in, 0, 0, 0, out, out->size(), max_output};
+  while (z.position < in.size()) {   // (the data ends at a block boundary: only padding bits can be left)
+    const bool last = z.bits(1) != 0;
+    const uint32_t type = z.bits(2);
+    if (z.failed) return false;
+    bool ok;
+    switch (type) {
+      case 0: ok = z.stored(); break;
+      case 1: ok = z.fixed(); break;
+      case 2: ok = z.dynamic(); break;
+      default: ok = false; break;
+    }
+    if (!ok || z.failed) return false;
+    if (last) return true;
+  }
+  return true;
+}
+
 // ---- Deflate ---------------------------------------------------------------------------
 
 namespace {
@@ -294,20 +313,28 @@ constexpr uint32_t kHashBits = 15, kHashSize = 1u << kHashBits, kWindow = 32768;
 uint32_t hash3(const uint8_t* p) { return ((uint32_t{p[0]} << 10) ^ (uint32_t{p[1]} << 5) ^ p[2]) * 2654435761u >> (32 - kHashBits); }
 }  // namespace
 
-static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, bool raw);
+static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, bool raw, bool sync, uint32_t window = 32768);
+
+bool deflate_message(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, uint32_t window_bits) {
+  if (window_bits < 8) window_bits = 8;
+  if (window_bits > 15) window_bits = 15;
+  if (!deflate_once(in, out, level, allocator, true, true, 1u << window_bits)) return false;
+  out->truncate(out->size() - 4);   // (the 00 00 FF FF that ends a sync flush is left off the wire)
+  return true;
+}
 
 bool deflate(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, bool raw) {
   const uint64_t start = out->size();
-  if (!deflate_once(in, out, level, allocator, raw)) return false;
+  if (!deflate_once(in, out, level, allocator, raw, false)) return false;
   // Data that does not compress (a photograph's noise, already compressed input) is better stored.
   if (level > 0 && out->size() - start > in.size() + 5 * (in.size() / 65535 + 1) + 6) {
     out->truncate(start);
-    return deflate_once(in, out, 0, allocator, raw);
+    return deflate_once(in, out, 0, allocator, raw, false);
   }
   return true;
 }
 
-static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, bool raw) {
+static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, bool raw, bool sync, uint32_t window) {
   if (!raw && !(out->put8(0x78) && out->put8(level <= 1 ? 0x01 : level < 6 ? 0x5E : level == 6 ? 0x9C : 0xDA))) return false;
   BitWriter w{out};
   if (level == 0) {  // stored blocks of up to 65535 bytes
@@ -315,7 +342,7 @@ static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allo
     do {
       const uint64_t n = in.size() - at < 65535 ? in.size() - at : 65535;
       const bool last = at + n >= in.size();
-      w.bits(last ? 1 : 0, 1);
+      w.bits(last && !sync ? 1 : 0, 1);
       w.bits(0, 2);
       w.flush();
       w.ok = w.ok && out->put16(static_cast<uint32_t>(n)) && out->put16(~static_cast<uint32_t>(n) & 0xFFFF) && out->append(in.subview(at, n));
@@ -332,7 +359,7 @@ static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allo
     }
     head.fill(-1);
     const uint32_t max_chain = level == 1 ? 4 : level < 4 ? 16 : level < 7 ? 48 : level == 8 ? 128 : 256;
-    w.bits(1, 1);  // final block
+    w.bits(sync ? 0 : 1, 1);  // final block (not with a sync flush: more follows, or the empty stored block)
     w.bits(1, 2);  // fixed Huffman
     const uint8_t* data = in.data();
     const uint64_t n = in.size();
@@ -351,7 +378,7 @@ static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allo
         int32_t candidate = head[h];
         uint32_t tries = max_chain;
         const uint32_t limit = n - i < 258 ? static_cast<uint32_t>(n - i) : 258;
-        while (candidate >= 0 && tries-- > 0 && i - static_cast<uint64_t>(candidate) <= kWindow) {
+        while (candidate >= 0 && tries-- > 0 && i - static_cast<uint64_t>(candidate) <= window) {
           uint32_t length = 0;
           while (length < limit && data[candidate + length] == data[i + length]) ++length;
           if (length > best_length) {
@@ -375,6 +402,12 @@ static bool deflate_once(ConstByteView in, ByteBuffer* out, uint32_t level, allo
     w.code(0, 7);  // end of block (symbol 256)
     release_view(allocator, head);
     release_view(allocator, chain);
+  }
+  if (sync) {   // the empty stored block that a sync flush ends with: header bits, padding, then 00 00 FF FF
+    w.bits(0, 1);
+    w.bits(0, 2);
+    w.flush();
+    w.ok = w.ok && out->put16(0) && out->put16(0xFFFF);
   }
   w.flush();
   if (!raw) {

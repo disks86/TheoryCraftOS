@@ -288,7 +288,7 @@ void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int
   dom::Node* n = doc_.by_serial(node_serial);
   if (!n) return;
   if (!bindings_) {   // no scripts: a click only follows a link
-    if (object == static_cast<uint8_t>(ObjectKind::Video) && objects_.object_clicked(node_serial, lx, ly, w, h)) return;
+    if ((object == static_cast<uint8_t>(ObjectKind::Video) || object == static_cast<uint8_t>(ObjectKind::Audio)) && objects_.object_clicked(node_serial, lx, ly, w, h)) return;
     for (dom::Node* a = n; a && a->is_element(); a = a->parent) {
       StringView href;
       if (a->is_tag("a") && dom::get_attribute(a, "href", &href) && !href.empty()) {
@@ -305,7 +305,7 @@ void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int
   init.client_y = y;
   init.detail = 1;
   if (bindings_->dispatch(n, "click", init)) {
-    if (object == static_cast<uint8_t>(ObjectKind::Video) && objects_.object_clicked(node_serial, lx, ly, w, h)) {
+    if ((object == static_cast<uint8_t>(ObjectKind::Video) || object == static_cast<uint8_t>(ObjectKind::Audio)) && objects_.object_clicked(node_serial, lx, ly, w, h)) {
       // (the control bar or the picture of a video took it)
     } else {
       bindings_->activate(n);

@@ -38,4 +38,13 @@ bool inflate(ConstByteView in, ByteBuffer* out, uint64_t max_output, bool raw = 
 // code. `level` 0 stores, 1 to 9 search harder. False if memory ran out.
 bool deflate(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, bool raw = false);
 
+// Inflates what deflate_message() makes - or the data of a permessage-deflate message from anyone else, with the 00 00 FF FF of its sync flush put back:
+// raw deflate blocks that need not include a final one, ending where the input ends. Appends to `out`; false if the data is corrupt or would grow past
+// `max_output` bytes.
+bool inflate_message(ConstByteView in, ByteBuffer* out, uint64_t max_output);
+
+// A message for permessage-deflate (RFC 7692): raw deflate data in non-final blocks, ended by the empty stored block of a sync flush, with that block's
+// last four bytes (00 00 FF FF) left off. The receiver puts them back and inflates. `level` as for deflate(); matches reach back at most 2^window_bits bytes.
+bool deflate_message(ConstByteView in, ByteBuffer* out, uint32_t level, allocators::IAllocator& allocator, uint32_t window_bits = 15);
+
 }  // namespace media
