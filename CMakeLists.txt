@@ -223,6 +223,9 @@ add_executable(BOOTX64
   src/Browser/DomBindingsEvents.cpp
   src/Browser/DomBindingsStyle.cpp
   src/Browser/DomBindingsWindow.cpp
+  src/Browser/DomBindingsMedia.cpp
+  src/Browser/Canvas.cpp
+  src/Browser/Objects.cpp
   src/Dom/Dom.cpp
   src/Dom/Selector.cpp
   src/Dom/Entities.cpp

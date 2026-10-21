@@ -105,7 +105,7 @@ bool media_applies(const dom::Node* n, const MediaEnvironment& env) {
 
 class DocumentRenderer {
  public:
-  DocumentRenderer(HtmlDocument& out, const StyleSheet& sheet) : out_(out), sheet_(sheet), chunk_(out.allocator()), stack_(out.allocator()) {}
+  DocumentRenderer(HtmlDocument& out, const StyleSheet& sheet, IObjectSource* objects) : out_(out), sheet_(sheet), objects_(objects), chunk_(out.allocator()), stack_(out.allocator()) {}
 
   bool run(const dom::Document& doc) {
     const dom::Node* root = doc.root();
@@ -323,8 +323,62 @@ class DocumentRenderer {
       const uint32_t here = s.indent;
       literal(marker.view(), static_cast<uint8_t>(here >= 3 ? here - 3 : 0));
     }
+    if (objects_ && !hidden() && tag_in(n, {"img", "video", "canvas"})) {
+      ObjectInfo info;
+      if (objects_->object_info(n, &info) && info.kind != ObjectKind::None && (info.ready || info.kind != ObjectKind::Image)) {
+        object_run(n, info);
+        return false;   // (a video's or canvas's fallback content is not shown)
+      }
+    }
     if (dom::is_void_tag(n->name.view())) void_action(n);
     return true;
+  }
+
+  // A width or height attribute: pixels, or a percentage.
+  static void size_attribute(const dom::Node* n, const char* name, uint32_t* px, uint32_t* pct) {
+    StringView v = attr(n, name).trimmed();
+    if (v.empty()) return;
+    uint64_t value = 0, i = 0;
+    while (i < v.size() && v[i] >= '0' && v[i] <= '9' && value < 100000) value = value * 10 + static_cast<uint64_t>(v[i++] - '0');
+    if (i == 0) return;
+    if (i < v.size() && v[i] == '%') *pct = static_cast<uint32_t>(value > 100 ? 100 : value);
+    else *px = static_cast<uint32_t>(value);
+  }
+
+  // A picture, video or canvas: one run that the layout gives a rectangle of the page.
+  void object_run(const dom::Node* n, const ObjectInfo& info) {
+    flush();
+    const Style& s = cur();
+    uint32_t w = 0, h = 0, pct = 0, ignored = 0;
+    size_attribute(n, "width", &w, &pct);
+    size_attribute(n, "height", &h, &ignored);
+    if (s.width_px) {
+      w = s.width_px;
+      pct = 0;
+    }
+    if (s.width_pct) {
+      pct = s.width_pct;
+      w = 0;
+    }
+    if (s.height_px) h = s.height_px;
+    const uint32_t nw = info.width ? info.width : 300, nh = info.height ? info.height : 150;
+    if (pct) {
+      w = nw;
+      h = nh;
+    } else if (w && h) {
+    } else if (w) {
+      h = static_cast<uint32_t>(static_cast<uint64_t>(nh) * w / nw);
+    } else if (h) {
+      w = static_cast<uint32_t>(static_cast<uint64_t>(nw) * h / nh);
+    } else {
+      w = nw;
+      h = nh;
+    }
+    if (!ended_space_) literal(" ", indent());
+    const uint8_t breaks = out_.runs_.count() == 0 ? 0 : pending_;
+    failed_ |= !out_.add_object(static_cast<uint8_t>(info.kind), w, h, pct, indent(), breaks, cur_link(), s.align, s.background, cur_node());
+    pending_ = 0;
+    ended_space_ = false;
   }
 
   void void_action(const dom::Node* n) {
@@ -364,6 +418,7 @@ class DocumentRenderer {
 
   HtmlDocument& out_;
   const StyleSheet& sheet_;
+  IObjectSource* objects_;
   String chunk_;
   List<Element> stack_;
   Style root_;
@@ -455,7 +510,7 @@ bool render_document(dom::Document& doc, const RenderOptions& options, HtmlDocum
   document_title(doc, &title);
   out->title_.assign(title.view());
   out->truncated_ = doc.full();
-  DocumentRenderer renderer(*out, sheet);
+  DocumentRenderer renderer(*out, sheet, options.objects);
   return renderer.run(doc);
 }
 

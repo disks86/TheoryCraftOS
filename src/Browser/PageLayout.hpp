@@ -18,7 +18,9 @@
 
 // Fits a document's runs into lines of a given number of columns (the screen font has fixed-width characters, so a column is a character). Words
 // wrap at the edge - a word longer than a line is broken - and lines that follow a run start at its indent; preformatted runs keep their line
-// breaks (long lines wrap too). A line is a list of pieces, each part of one run, with the column it starts at; the layout also finds the link
+// breaks (long lines wrap too). A picture, video or canvas (a run with an object) gets a rectangle of whole columns and lines: one that fits in a single line
+// stands in the text like a word, a taller one has lines of its own - a piece for each of its rows (Piece::from is the row), so that scrolling can start
+// anywhere in it. It is shrunk to the width of the line if it is wider. A line is a list of pieces, each part of one run, with the column it starts at; the layout also finds the link
 // at a position.
 #pragma once
 #include "Browser/HtmlDocument.hpp"
@@ -27,9 +29,10 @@ namespace browser {
 
 struct Piece {
   uint32_t run = 0;       // which run of the document
-  uint32_t from = 0;      // where in the run's text the piece starts
-  uint32_t length = 0;
+  uint32_t from = 0;      // where in the run's text the piece starts (for an object: which row of it this piece is)
+  uint32_t length = 0;    // (for an object: the columns it covers)
   uint32_t column = 0;
+  uint16_t px_w = 0, px_h = 0;   // an object: its size on the page in pixels (after fitting it to the line)
 };
 
 class PageLayout {

@@ -252,6 +252,7 @@ void Desktop::setup_web_browser(WebBrowser& web) {
   web.set_file_system(fs_);
   web.set_page_loader(page_loader_);
   web.set_clock(&Desktop::unix_ms, this);
+  web.set_media_services(media_mixer_, media_codecs_, media_clock_);
 }
 
 // The local time of the taskbar clock as milliseconds since 1970 (what a script's Date.now() says; 0 without a clock).

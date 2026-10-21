@@ -32,6 +32,8 @@
 
 namespace browser {
 
+class PageObjects;
+
 // A set of named strings: localStorage and sessionStorage.
 class StorageArea {
  public:
@@ -76,6 +78,8 @@ class IDomHost {
   // Compiles the code of an on* attribute (or a javascript: address) into a function taking `event`. False (with a message sent to console) if it does not
   // compile; the function is not kept alive by this: the caller stores it where the script engine can see it.
   virtual bool compile_handler(StringView code, script::Value* function) = 0;
+  // The pictures, videos and canvases of the page.
+  virtual PageObjects& objects() = 0;
 
  protected:
   IDomHost() = default;

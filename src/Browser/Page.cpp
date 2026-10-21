@@ -39,6 +39,7 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       extra_documents_(allocator),
       scripts_(allocator),
       sheets_(allocator),
+      objects_(allocator),
       style_cache_(allocator) {
   address_.assign(address);
   style_cache_media_ = media;
@@ -225,13 +226,43 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
 
 bool Page::render(HtmlDocument* out) {
   fetch_pending_styles();
+  objects_.set_now(env_.now_ms());
+  objects_.sync(doc_, env_, address_.view(), media_);
   RenderOptions options;
   options.media = media_;
   options.styles = this;
+  options.objects = &objects_;
   const bool ok = render_document(doc_, options, out);
   rendered_version_ = doc_.version();
   rendered_media_ = media_;
+  deliver_object_events();
   return ok;
+}
+
+// Fires what the pictures and videos have to say (load, error, loadedmetadata, ended ...) at their elements.
+void Page::deliver_object_events() {
+  PageObjects::Event e;
+  uint32_t guard = 0;
+  while (guard++ < 600 && objects_.take_event(&e)) {
+    if (!bindings_) continue;
+    dom::Node* n = doc_.by_serial(e.serial);
+    if (!n) continue;
+    EventInit init;
+    init.bubbles = false;
+    init.cancelable = false;
+    bindings_->dispatch(n, e.type, init);
+  }
+  if (bindings_ && bindings_->errors()) {
+    String text(allocator_);
+    bindings_->take_error(&text);
+    note_error(text.view());
+  }
+}
+
+bool Page::step_objects(double now_ms) {
+  objects_.update(static_cast<uint64_t>(now_ms));
+  deliver_object_events();
+  return objects_.take_dirty();
 }
 
 // --- After the page is up ------------------------------------------------------------------------------------------------------
@@ -253,10 +284,11 @@ void Page::set_media(const MediaEnvironment& media) {
   }
 }
 
-void Page::click(uint32_t node_serial, int32_t x, int32_t y) {
+void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int32_t lx, int32_t ly, uint32_t w, uint32_t h) {
   dom::Node* n = doc_.by_serial(node_serial);
   if (!n) return;
   if (!bindings_) {   // no scripts: a click only follows a link
+    if (object == static_cast<uint8_t>(ObjectKind::Video) && objects_.object_clicked(node_serial, lx, ly, w, h)) return;
     for (dom::Node* a = n; a && a->is_element(); a = a->parent) {
       StringView href;
       if (a->is_tag("a") && dom::get_attribute(a, "href", &href) && !href.empty()) {
@@ -272,7 +304,14 @@ void Page::click(uint32_t node_serial, int32_t x, int32_t y) {
   init.client_x = x;
   init.client_y = y;
   init.detail = 1;
-  if (bindings_->dispatch(n, "click", init)) bindings_->activate(n);
+  if (bindings_->dispatch(n, "click", init)) {
+    if (object == static_cast<uint8_t>(ObjectKind::Video) && objects_.object_clicked(node_serial, lx, ly, w, h)) {
+      // (the control bar or the picture of a video took it)
+    } else {
+      bindings_->activate(n);
+    }
+  }
+  deliver_object_events();
   if (bindings_->errors()) {
     String text(allocator_);
     bindings_->take_error(&text);
@@ -295,7 +334,15 @@ bool Page::run_due_timers(double now_ms) {
   return true;
 }
 
-bool Page::next_timer(double* due_ms) { return engine_ && engine_->next_timer(due_ms); }
+bool Page::next_timer(double* due_ms) {
+  bool any = engine_ && engine_->next_timer(due_ms);
+  if (objects_.animating()) {   // (a playing video, an animated picture: the next frame)
+    const double frame = static_cast<double>(env_.now_ms()) + 33;
+    if (!any || frame < *due_ms) *due_ms = frame;
+    any = true;
+  }
+  return any;
+}
 
 int32_t Page::take_scroll_request() {
   const int32_t r = scroll_request_;

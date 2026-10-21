@@ -24,6 +24,7 @@
 #include "Browser/Css.hpp"
 #include "Browser/HtmlDocument.hpp"
 #include "Browser/Media.hpp"
+#include "Browser/ObjectTypes.hpp"
 #include "Dom/Dom.hpp"
 
 namespace browser {
@@ -43,6 +44,7 @@ struct RenderOptions {
   MediaEnvironment media;          // what the display is like: @media and media="" are judged by it
   StringView extra_css;            // a style sheet read before the page's own (the caller's)
   IStyleSource* styles = nullptr;  // linked style sheets (nullptr: none)
+  IObjectSource* objects = nullptr;   // pictures, videos and canvases (nullptr: <img> shows its alternative text, <video> and <canvas> their fallback content)
 };
 
 // Reads the style sheets of the document, in the order they come, into `sheet`.

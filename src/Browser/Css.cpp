@@ -168,7 +168,7 @@ uint8_t to_columns(StringView text) {
 enum Property : uint8_t {
   kNone,
   kColor, kBackgroundColor, kBackground, kFontWeight, kTextDecoration, kTextTransform, kTextAlign, kDisplay, kVisibility, kWhiteSpace,
-  kMargin, kMarginTop, kMarginBottom, kMarginLeft, kPadding, kPaddingTop, kPaddingBottom, kPaddingLeft, kListStyle,
+  kMargin, kMarginTop, kMarginBottom, kMarginLeft, kPadding, kPaddingTop, kPaddingBottom, kPaddingLeft, kListStyle, kWidth, kHeight,
 };
 
 struct PropertyName {
@@ -201,6 +201,8 @@ const PropertyName kProperties[] = {
     {"padding-block-end", kPaddingBottom},
     {"padding-left", kPaddingLeft},
     {"padding-inline-start", kPaddingLeft},
+    {"width", kWidth},
+    {"height", kHeight},
     {"list-style", kListStyle},
     {"list-style-type", kListStyle},
 };
@@ -324,6 +326,26 @@ void apply_property(Property property, StringView value, Style* style) {
       if (value.equals_ignore_case("pre") || value.equals_ignore_case("pre-wrap") || value.equals_ignore_case("break-spaces")) style->pre = true;
       else if (value.equals_ignore_case("normal") || value.equals_ignore_case("nowrap") || value.equals_ignore_case("pre-line")) style->pre = false;
       break;
+    case kWidth:
+    case kHeight: {
+      int64_t v;
+      Unit u;
+      uint32_t px = 0, pct = 0;
+      if (parse_length(value, &v, &u) && v >= 0) {
+        if (u == kUnitPx || u == kUnitNone) px = static_cast<uint32_t>(v / 100);
+        else if (u == kUnitEm) px = static_cast<uint32_t>(v * 16 / 100);
+        else if (u == kUnitPt) px = static_cast<uint32_t>(v * 4 / 3 / 100);
+        else if (u == kUnitPercent) pct = static_cast<uint32_t>(v / 100);
+      }
+      if (px > 8192) px = 8192;
+      if (property == kWidth) {
+        style->width_px = static_cast<uint16_t>(px);
+        style->width_pct = static_cast<uint8_t>(pct > 100 ? 100 : pct);
+      } else {
+        style->height_px = static_cast<uint16_t>(px);
+      }
+      break;
+    }
     case kMargin: {
       uint8_t top = 0, bottom = 0, left = 0;
       box_values(value, true, &top, &bottom, &left);
@@ -397,6 +419,70 @@ void for_each_declaration(StringView text, F each) {
 }
 
 }  // namespace
+
+bool parse_css_color_alpha(StringView text, uint32_t* out) {
+  text = text.trimmed();
+  if (text.empty()) return false;
+  if (text.equals_ignore_case("transparent")) {
+    *out = 0;
+    return true;
+  }
+  if (text[0] == '#') {
+    const StringView digits = text.substr(1);
+    uint32_t v = 0;
+    for (uint64_t i = 0; i < digits.size(); ++i) {
+      const int d = hex_digit(digits[i]);
+      if (d < 0) return false;
+      v = (v << 4) | static_cast<uint32_t>(d);
+    }
+    uint32_t r, g, b, a = 255;
+    if (digits.size() == 3 || digits.size() == 4) {
+      uint32_t k = digits.size() == 4 ? v : (v << 4) | 0xF;
+      r = ((k >> 12) & 0xF) * 17;
+      g = ((k >> 8) & 0xF) * 17;
+      b = ((k >> 4) & 0xF) * 17;
+      a = (k & 0xF) * 17;
+    } else if (digits.size() == 6) {
+      r = (v >> 16) & 0xFF;
+      g = (v >> 8) & 0xFF;
+      b = v & 0xFF;
+    } else if (digits.size() == 8) {
+      r = (v >> 24) & 0xFF;
+      g = (v >> 16) & 0xFF;
+      b = (v >> 8) & 0xFF;
+      a = v & 0xFF;
+    } else {
+      return false;
+    }
+    *out = (a << 24) | (r << 16) | (g << 8) | b;
+    return true;
+  }
+  const uint64_t open = text.find('(');
+  if (open != StringView::npos && text.ends_with(')')) {
+    const StringView function = text.first(open).trimmed();
+    const bool rgb = function.equals_ignore_case("rgb") || function.equals_ignore_case("rgba"), hsl = function.equals_ignore_case("hsl") || function.equals_ignore_case("hsla");
+    if (!rgb && !hsl) return false;
+    int64_t v[4] = {};
+    bool pct[4] = {};
+    const uint32_t n = read_numbers(text.substr(open + 1, text.size() - open - 2), v, pct);
+    if (n < 3) return false;
+    uint32_t rgb_value = rgb ? (channel(v[0], pct[0]) << 16) | (channel(v[1], pct[1]) << 8) | channel(v[2], pct[2]) : hsl_to_rgb(v[0], v[1], v[2]);
+    int64_t alpha = 255;
+    if (n >= 4) {
+      alpha = pct[3] ? v[3] * 255 / 10000 : v[3] * 255 / 100;
+      alpha = alpha < 0 ? 0 : alpha > 255 ? 255 : alpha;
+    }
+    *out = (static_cast<uint32_t>(alpha) << 24) | rgb_value;
+    return true;
+  }
+  for (const NamedColor& c : kNamedColors) {
+    if (text.equals_ignore_case(c.name)) {
+      *out = 0xFF000000u | c.rgb;
+      return true;
+    }
+  }
+  return false;
+}
 
 bool parse_css_color(StringView text, uint32_t* out) {
   text = text.trimmed();

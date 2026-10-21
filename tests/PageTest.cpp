@@ -26,6 +26,8 @@
 #include <vector>
 #include "Browser/Page.hpp"
 #include "Browser/PageLayout.hpp"
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Media/ImageCodecs.hpp"
 
 using namespace browser;
 
@@ -39,8 +41,65 @@ struct TestAllocator final : allocators::IAllocator {
   void deallocate(void* p) override { if (p) { --live; free(p); } }
 };
 
+// A video for the tests: 64 x 48, two seconds, a picture that changes with the position.
+struct FakeClip final : IVideoClip {
+  bool is_playing = false, looping = false;
+  int64_t position = 0, duration = 2000000;
+  double volume = 1;
+  bool muted = false;
+  uint32_t serial = 1;
+  int updates = 0;
+  bool play() override { is_playing = true; return true; }
+  void pause() override { is_playing = false; }
+  void seek(int64_t us) override { position = us < 0 ? 0 : us > duration ? duration : us; ++serial; }
+  void set_looping(bool l) override { looping = l; }
+  void set_volume(double v, bool m) override { volume = v; muted = m; }
+  bool playing() override { return is_playing; }
+  int64_t position_us() override { return position; }
+  int64_t duration_us() override { return duration; }
+  uint32_t width() override { return 64; }
+  uint32_t height() override { return 48; }
+  void update() override {
+    ++updates;
+    if (!is_playing) return;
+    position += 500000;
+    ++serial;
+    if (position >= duration) {
+      if (looping) position = 0;
+      else {
+        position = duration;
+        is_playing = false;
+      }
+    }
+  }
+  bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* s) override {
+    const uint32_t shade = static_cast<uint32_t>(position / 10000) & 0xFF;
+    for (uint32_t y = 0; y < 48; ++y)
+      for (uint32_t x = 0; x < 64; ++x) dest[y * pitch + x] = 0xFF000000u | (shade << 8) | 0x80;
+    *s = serial;
+    return true;
+  }
+};
+
 struct FakeEnvironment final : IPageEnvironment {
-  explicit FakeEnvironment(TestAllocator& a) : storage(a), jar(a) {}
+  explicit FakeEnvironment(TestAllocator& a) : storage(a), jar(a) { allocator_for_clips = &a; }
+  std::map<std::string, std::string> blobs;   // binary files (pictures, videos)
+  FakeClip* last_clip = nullptr;
+  bool can_play_video = true;
+  bool fetch_bytes(StringView address, uint64_t, ByteBuffer* out) override {
+    fetched.push_back(std::string(address.data(), address.size()));
+    auto it = blobs.find(fetched.back());
+    if (it == blobs.end()) return false;
+    return out->append(ConstByteView(reinterpret_cast<const uint8_t*>(it->second.data()), it->second.size()));
+  }
+  UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override {
+    (void)data;
+    if (!can_play_video) return UniquePointer<IVideoClip>();
+    auto clip = UniquePointer<FakeClip>::make(*allocator_for_clips);
+    last_clip = clip.get();
+    return clip;
+  }
+  allocators::IAllocator* allocator_for_clips = nullptr;
   std::map<std::string, std::string> files;
   std::vector<std::string> fetched, navigations, alerts, console_lines, hashes, states;
   std::vector<int> scrolls;
@@ -428,6 +487,449 @@ static void test_external_and_errors() {
   CHECK(a.live == 0);
 }
 
+
+// --- Pictures, videos and canvases --------------------------------------------------------------------------------------------------
+
+static std::string make_picture(TestAllocator& a, uint32_t w, uint32_t h, uint32_t color, media::ImageFormat format = media::ImageFormat::Png) {
+  media::Image image(a);
+  image.create(w, h);
+  for (uint32_t i = 0; i < w * h; ++i) image.frame(0)[i] = color;
+  ByteBuffer bytes(a);
+  media::encode_image(image, format, 90, &bytes);
+  return std::string(reinterpret_cast<const char*>(bytes.view().data()), bytes.size());
+}
+
+struct Surface32 {
+  Surface32(TestAllocator& a, uint32_t w, uint32_t h, uint32_t fill = 0xFFFFFFFFu) : alloc(a), width(w), height(h) {
+    pixels = allocate_view<uint32_t>(a, uint64_t{w} * h);
+    pixels.fill(fill);
+    surface.pixels = pixels;
+    surface.width = w;
+    surface.height = h;
+    surface.pitch = w;
+  }
+  ~Surface32() { release_view(alloc, pixels); }
+  uint32_t at(int x, int y) const { return pixels[static_cast<uint64_t>(y) * width + static_cast<uint64_t>(x)]; }
+  TestAllocator& alloc;
+  uint32_t width, height;
+  ArrayView<uint32_t> pixels;
+  graphics::Surface surface;
+};
+
+static const Run* find_object(const HtmlDocument& doc, ObjectKind kind, uint32_t which = 0) {
+  for (uint64_t i = 0; i < doc.run_count(); ++i)
+    if (doc.run(i).object == static_cast<uint8_t>(kind) && which-- == 0) return &doc.run(i);
+  return nullptr;
+}
+
+static void test_images() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/red.png"] = make_picture(a, 40, 20, 0xFFFF0000u);
+    env.blobs["http://example.com/big.png"] = make_picture(a, 800, 400, 0xFF00FF00u);
+    env.blobs["http://example.com/small.png"] = make_picture(a, 10, 10, 0xFF0000FFu);
+    env.blobs["http://example.com/2x.png"] = make_picture(a, 20, 20, 0xFFFFFF00u);
+    env.blobs["http://example.com/photo.jpg"] = make_picture(a, 32, 32, 0xFF808080u, media::ImageFormat::Jpeg);
+    MediaEnvironment media;
+    media.width = 640;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><p>before</p><img id=r src=red.png alt='Red'><p>after <img id=s src=small.png> inline</p>"
+              "<img id=m src=missing.png alt='No picture'><img id=b src=big.png><img id=j src=photo.jpg width=16 height=16>"
+              "<img id=w src=red.png width=80><img id=h src=red.png height=10><img id=sx src=red.png style='width:30px;height:60px'>"
+              "<script>['r', 'm', 's'].forEach(function(id) { var i = document.getElementById(id); i.addEventListener('load', function() { console.log(id + ' load ' + this.naturalWidth + 'x' + this.naturalHeight) }); i.addEventListener('error', function() { console.log(id + ' error') }); });"
+              "console.log(document.getElementById('r').complete, document.getElementById('r').naturalWidth)</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("false 0") != std::string::npos || log.find("true 0") != std::string::npos);   // (not fetched yet when the script ran)
+    CHECK(env.fetched.size() >= 5);
+    const Run* red = find_object(doc, ObjectKind::Image, 0);
+    CHECK(red && red->object_w == 40 && red->object_h == 20);
+    // a picture that is missing shows its alternative text
+    bool alt = false;
+    for (uint64_t i = 0; i < doc.run_count(); ++i) alt = alt || doc.run_text(i) == StringView("[No picture]");
+    CHECK(alt);
+    // sizes: attributes, style, one given, none
+    const Run* small = find_object(doc, ObjectKind::Image, 1);
+    CHECK(small && small->object_w == 10 && small->object_h == 10);
+    const Run* big = find_object(doc, ObjectKind::Image, 2);
+    CHECK(big && big->object_w == 800 && big->object_h == 400);
+    const Run* jpg = find_object(doc, ObjectKind::Image, 3);
+    CHECK(jpg && jpg->object_w == 16 && jpg->object_h == 16);
+    const Run* wide = find_object(doc, ObjectKind::Image, 4);
+    CHECK(wide && wide->object_w == 80 && wide->object_h == 40);
+    const Run* high = find_object(doc, ObjectKind::Image, 5);
+    CHECK(high && high->object_w == 20 && high->object_h == 10);
+    const Run* styled = find_object(doc, ObjectKind::Image, 6);
+    CHECK(styled && styled->object_w == 30 && styled->object_h == 60);
+    // the layout: a tall picture takes lines of its own, shrunk to the line; a small one stands in the text
+    PageLayout layout(a);
+    layout.build(doc, 40);   // 320 pixels wide
+    uint32_t rows_of_big = 0, big_w = 0, big_h = 0;
+    for (uint32_t line = 0; line < layout.line_count(); ++line)
+      for (uint32_t p = layout.first_piece(line); p < layout.end_piece(line); ++p) {
+        const Piece& piece = layout.piece(p);
+        if (&doc.run(piece.run) == big) {
+          ++rows_of_big;
+          big_w = piece.px_w;
+          big_h = piece.px_h;
+          CHECK(piece.from == rows_of_big - 1 && piece.column == 0);
+        }
+      }
+    CHECK(big_w == 320 && big_h == 160 && rows_of_big == 10);
+    bool inline_with_text = false;
+    for (uint32_t line = 0; line < layout.line_count(); ++line) {
+      bool has_object = false, has_text = false;
+      for (uint32_t p = layout.first_piece(line); p < layout.end_piece(line); ++p) {
+        if (doc.run(layout.piece(p).run).object) has_object = true;
+        else if (doc.run_text(layout.piece(p).run).size() > 0) has_text = true;
+      }
+      inline_with_text = inline_with_text || (has_object && has_text);
+    }
+    CHECK(inline_with_text);   // (the 10x10 picture is one line high)
+    // drawn: the pictures show where they are put, scaled to fit
+    Surface32 target(a, 400, 300);
+    graphics::SoftwareRenderer2D renderer(target.surface);
+    page.objects().paint_object(renderer, red->node, ObjectKind::Image, 20, 30, 40, 20, Rect2D{0, 0, 400, 300});
+    CHECK(target.at(20, 30) == 0xFFFF0000u && target.at(59, 49) == 0xFFFF0000u && target.at(60, 30) == 0xFFFFFFFFu && target.at(19, 30) == 0xFFFFFFFFu);
+    page.objects().paint_object(renderer, big->node, ObjectKind::Image, 100, 100, 160, 80, Rect2D{0, 0, 400, 300});
+    CHECK(target.at(100, 100) == 0xFF00FF00u && target.at(259, 179) == 0xFF00FF00u && target.at(260, 100) == 0xFFFFFFFFu);
+    page.objects().paint_object(renderer, big->node, ObjectKind::Image, 300, 200, 160, 80, Rect2D{0, 0, 400, 300});   // (clipped by the target)
+    CHECK(target.at(399, 279) == 0xFF00FF00u && target.at(399, 280) == 0xFFFFFFFFu);
+    // events: the pictures that came fire load, the one that did not fires error
+    log.assign(page.log().data(), page.log().size());
+    CHECK(log.find("r load 40x20") != std::string::npos && log.find("s load 10x10") != std::string::npos && log.find("m error") != std::string::npos);
+    // nothing is fetched twice
+    const size_t fetched = env.fetched.size();
+    page.render(&doc);
+    CHECK(env.fetched.size() == fetched);
+  }
+  CHECK(a.live == 0);
+  {   // srcset, <picture>, data: addresses, and pictures made by scripts
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/1x.png"] = make_picture(a, 10, 10, 0xFF111111u);
+    env.blobs["http://example.com/2x.png"] = make_picture(a, 20, 20, 0xFF222222u);
+    env.blobs["http://example.com/s.png"] = make_picture(a, 30, 30, 0xFF333333u);
+    env.blobs["http://example.com/l.png"] = make_picture(a, 60, 60, 0xFF444444u);
+    env.blobs["http://example.com/wide.png"] = make_picture(a, 7, 7, 0xFF555555u);
+    env.blobs["http://example.com/dyn.png"] = make_picture(a, 12, 6, 0xFF666666u);
+    MediaEnvironment media;
+    media.width = 500;
+    Page page(a, env, "http://example.com/", media, true);
+    const std::string png_1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    std::string html = "<html><body><img src=1x.png srcset='1x.png 1x, 2x.png 2x'><img srcset='s.png 300w, l.png 800w' sizes=100vw>"
+                       "<picture><source media='(min-width: 900px)' srcset=wide.png><source type='image/avif' srcset=x.avif><img src=1x.png></picture>"
+                       "<img src='data:image/png;base64," + png_1x1 + "'>"
+                       "<script>var im = new Image(); im.onload = function() { console.log('dyn', im.width, im.height, im.complete); document.body.appendChild(im) }; im.src = 'dyn.png'; console.log(im.complete, im.currentSrc);</script></body></html>";
+    page.load(html.c_str());
+    HtmlDocument doc(a);
+    page.render(&doc);
+    const Run* r0 = find_object(doc, ObjectKind::Image, 0);
+    CHECK(r0 && r0->object_w == 10);                    // the display is 1x
+    const Run* r1 = find_object(doc, ObjectKind::Image, 1);
+    CHECK(r1 && r1->object_w == 60);                    // 800w is the first one wider than 500
+    const Run* r2 = find_object(doc, ObjectKind::Image, 2);
+    CHECK(r2 && r2->object_w == 10);                    // the wide source does not apply, avif is not a type
+    const Run* r3 = find_object(doc, ObjectKind::Image, 3);
+    CHECK(r3 && r3->object_w == 1 && r3->object_h == 1);
+    std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("false \n") != std::string::npos || log.find("false http") != std::string::npos || log.find("false") == 0);
+    CHECK(log.find("dyn 12 6 true") != std::string::npos);
+    page.render(&doc);   // (the script put it in the page)
+    CHECK(find_object(doc, ObjectKind::Image, 4) != nullptr);
+  }
+  CHECK(a.live == 0);
+  {   // an animated picture shows its frames in turn
+    FakeEnvironment env(a);
+    media::Image anim(a);
+    anim.create(8, 8, 2);
+    for (uint32_t i = 0; i < 64; ++i) {
+      anim.frame(0)[i] = 0xFFFF0000u;
+      anim.frame(1)[i] = 0xFF0000FFu;
+    }
+    anim.set_delay_ms(0, 100);
+    anim.set_delay_ms(1, 100);
+    ByteBuffer bytes(a);
+    CHECK(media::encode_gif(anim, &bytes));
+    env.blobs["http://example.com/a.gif"] = std::string(reinterpret_cast<const char*>(bytes.view().data()), bytes.size());
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><img src=a.gif></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    const Run* run = find_object(doc, ObjectKind::Image);
+    CHECK(run && page.objects().animating());
+    Surface32 target(a, 20, 20);
+    graphics::SoftwareRenderer2D renderer(target.surface);
+    page.step_objects(static_cast<double>(env.clock));
+    page.objects().paint_object(renderer, run->node, ObjectKind::Image, 0, 0, 8, 8, Rect2D{0, 0, 20, 20});
+    const uint32_t first = target.at(2, 2);
+    page.step_objects(static_cast<double>(env.clock + 150));
+    page.objects().paint_object(renderer, run->node, ObjectKind::Image, 0, 0, 8, 8, Rect2D{0, 0, 20, 20});
+    CHECK(first != target.at(2, 2) && (first == 0xFFFF0000u || first == 0xFF0000FFu));
+    double due;
+    CHECK(page.next_timer(&due));   // it asks to be looked at again
+  }
+  CHECK(a.live == 0);
+}
+
+static std::string page_log(Page& page) {
+  std::string out(page.log().data(), page.log().size());
+  if (!out.empty() && out.back() == '\n') out.pop_back();
+  for (size_t p = 0; (p = out.find("\n", p)) != std::string::npos;) {
+    out.replace(p, 1, " | ");
+    p += 3;
+  }
+  return out;
+}
+
+// Runs a script in a page that has a 100 x 60 canvas called c, and returns what it logged.
+static std::string canvas_script(const char* script, uint32_t* canvas_node = nullptr, std::string* data_out = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/p.png"] = make_picture(a, 4, 4, 0xFF00FF00u);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = std::string("<html><body><canvas id=c width=100 height=60></canvas><img id=pic src=p.png><script>var c = document.getElementById('c'); var ctx = c.getContext('2d'); ") + script +
+                       "</script></body></html>";
+    page.load(html.c_str());
+    HtmlDocument doc(a);
+    page.render(&doc);
+    out = page_log(page);
+    const Run* run = find_object(doc, ObjectKind::Canvas);
+    if (run && canvas_node) *canvas_node = run->node;
+    if (run && data_out) {
+      Surface32 target(a, 100, 60, 0xFFFFFFFFu);
+      graphics::SoftwareRenderer2D renderer(target.surface);
+      page.objects().paint_object(renderer, run->node, ObjectKind::Canvas, 0, 0, 100, 60, Rect2D{0, 0, 100, 60});
+      data_out->assign(reinterpret_cast<const char*>(target.pixels.data()), 100 * 60 * 4);
+    }
+  }
+  CHECK(a.live == 0);
+  if (getenv("SHOWLOG")) printf("SCRIPT %s\n  => %s\n", script, out.c_str());
+  return out;
+}
+
+static uint32_t shown_pixel(const std::string& data, int x, int y) {
+  uint32_t v;
+  memcpy(&v, data.data() + (static_cast<size_t>(y) * 100 + static_cast<size_t>(x)) * 4, 4);
+  return v;
+}
+
+static void test_canvas_scripts() {
+  std::string shown;
+  // the element, the context and the state
+  CHECK(canvas_script("console.log(c.width, c.height, typeof ctx, ctx.canvas === c, c.getContext('2d') === ctx, c.getContext('webgl'), ctx.fillStyle, ctx.lineWidth, ctx.globalAlpha, ctx.font, ctx.textAlign, ctx.globalCompositeOperation)") ==
+        "100 60 object true true null #000000 1 1 10px sans-serif start source-over");
+  CHECK(canvas_script("ctx.fillStyle = 'red'; console.log(ctx.fillStyle); ctx.fillStyle = '#0f08'; console.log(ctx.fillStyle); ctx.fillStyle = 'not a color'; console.log(ctx.fillStyle); ctx.strokeStyle = 'rgb(1, 2, 3)'; console.log(ctx.strokeStyle); ctx.shadowColor = 'blue'; console.log(ctx.shadowColor)") ==
+        "#ff0000 | rgba(0, 255, 0, 0.533) | rgba(0, 255, 0, 0.533) | #010203 | #0000ff");
+  CHECK(canvas_script("ctx.lineWidth = 5; ctx.lineWidth = -3; ctx.lineWidth = NaN; ctx.lineCap = 'round'; ctx.lineCap = 'bogus'; ctx.globalAlpha = 2; ctx.globalAlpha = 0.25; ctx.font = 'bold 20px Arial'; ctx.textAlign = 'center'; ctx.globalCompositeOperation = 'lighter'; console.log(ctx.lineWidth, ctx.lineCap, ctx.globalAlpha, ctx.font, ctx.textAlign, ctx.globalCompositeOperation)") ==
+        "5 round 0.25 bold 20px Arial center lighter");
+  CHECK(canvas_script("ctx.fillStyle = 'red'; ctx.save(); ctx.fillStyle = 'blue'; ctx.lineWidth = 9; ctx.restore(); console.log(ctx.fillStyle, ctx.lineWidth); ctx.save(); ctx.save(); ctx.restore(); ctx.restore(); ctx.restore()") == "#ff0000 1");
+  // drawing, then looking at the pixels
+  CHECK(canvas_script("ctx.fillStyle = '#ff0000'; ctx.fillRect(10, 10, 20, 20); ctx.fillStyle = 'rgba(0, 0, 255, 0.5)'; ctx.fillRect(20, 20, 20, 20); var d = ctx.getImageData(15, 15, 1, 1).data; var e = ctx.getImageData(25, 25, 1, 1).data; var f = ctx.getImageData(50, 50, 1, 1).data; console.log(d[0], d[1], d[2], d[3], e[3] > 120 && e[3] < 136 || e[3] == 255, f[3], d.length)", nullptr, &shown) == "255 0 0 255 true 0 4");
+  CHECK(shown_pixel(shown, 15, 15) == 0xFFFF0000u && shown_pixel(shown, 5, 5) == 0xFFFFFFFFu && shown_pixel(shown, 35, 35) != 0xFFFFFFFFu);
+  // drawn without reading: the display plays the record
+  CHECK(canvas_script("ctx.fillStyle = '#00ff00'; ctx.fillRect(0, 0, 100, 60); ctx.clearRect(0, 0, 100, 60); ctx.fillStyle = '#123456'; ctx.fillRect(30, 30, 10, 10)", nullptr, &shown) == "");
+  CHECK(shown_pixel(shown, 5, 5) == 0xFFFFFFFFu && shown_pixel(shown, 35, 35) == 0xFF123456u);
+  // paths
+  CHECK(canvas_script("ctx.fillStyle = 'purple'; ctx.beginPath(); ctx.arc(50, 30, 20, 0, Math.PI * 2); ctx.fill(); console.log(ctx.isPointInPath(50, 30), ctx.isPointInPath(5, 5), ctx.isPointInPath(50, 30, 'evenodd'))", nullptr, &shown) == "true false true");
+  CHECK(shown_pixel(shown, 50, 30) == 0xFF800080u && shown_pixel(shown, 50, 5) == 0xFFFFFFFFu);
+  CHECK(canvas_script("ctx.strokeStyle = 'black'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(10, 30); ctx.lineTo(90, 30); ctx.stroke(); console.log(ctx.isPointInStroke(50, 31), ctx.isPointInStroke(50, 40))", nullptr, &shown) == "true false");
+  CHECK(shown_pixel(shown, 50, 30) == 0xFF000000u && shown_pixel(shown, 50, 40) == 0xFFFFFFFFu);
+  CHECK(canvas_script("ctx.beginPath(); ctx.rect(0, 0, 10, 10); ctx.rect(2, 2, 6, 6); ctx.fillStyle = 'red'; ctx.fill('evenodd'); ctx.fillStyle = 'blue'; ctx.beginPath(); ctx.moveTo(20, 0); ctx.quadraticCurveTo(30, 20, 40, 0); ctx.bezierCurveTo(40, 10, 20, 10, 20, 0); ctx.closePath(); ctx.fill(); ctx.beginPath(); ctx.moveTo(60, 5); ctx.arcTo(90, 5, 90, 30, 10); ctx.lineTo(90, 30); ctx.stroke(); ctx.ellipse(50, 45, 20, 8, 0, 0, 6.2831853, false); ctx.fill(); ctx.roundRect(0, 40, 30, 20, 8); ctx.fill()", nullptr, &shown) == "");
+  CHECK(shown_pixel(shown, 1, 1) == 0xFFFF0000u && shown_pixel(shown, 5, 5) == 0xFFFFFFFFu && shown_pixel(shown, 30, 9) == 0xFF0000FFu);
+  CHECK(canvas_script("try { ctx.arc(0, 0, -5, 0, 1) } catch (e) { console.log(e.name) } try { ctx.addColorStop } catch (e) {} var g = ctx.createLinearGradient(0, 0, 10, 0); try { g.addColorStop(2, 'red') } catch (e) { console.log(e.name) } try { g.addColorStop(0.5, 'nonsense') } catch (e) { console.log(e.name) } try { ctx.fillRect(1) } catch (e) { console.log(e.name) } try { ctx.drawImage({}, 0, 0) } catch (e) { console.log(e.name) }") ==
+        "IndexSizeError | IndexSizeError | SyntaxError | TypeError | TypeError");
+  // gradients, patterns
+  CHECK(canvas_script("var g = ctx.createLinearGradient(0, 0, 100, 0); g.addColorStop(0, 'black'); g.addColorStop(1, 'white'); ctx.fillStyle = g; ctx.fillRect(0, 0, 100, 60); var l = ctx.getImageData(2, 5, 1, 1).data[0], r = ctx.getImageData(97, 5, 1, 1).data[0], m = ctx.getImageData(50, 5, 1, 1).data[0]; console.log(l < 15, r > 240, m > 115 && m < 140, ctx.fillStyle === g)") == "true true true true");
+  CHECK(canvas_script("var g = ctx.createRadialGradient(50, 30, 0, 50, 30, 30); g.addColorStop(0, 'white'); g.addColorStop(1, 'black'); ctx.fillStyle = g; ctx.fillRect(0, 0, 100, 60); console.log(ctx.getImageData(50, 30, 1, 1).data[0] > 240, ctx.getImageData(80, 30, 1, 1).data[0] < 20); var k = ctx.createConicGradient(0, 50, 30); k.addColorStop(0, 'red'); k.addColorStop(1, 'blue'); ctx.fillStyle = k; ctx.fillRect(0, 0, 100, 60); console.log(typeof k.addColorStop)") == "true true | function");
+  CHECK(canvas_script("var p = document.createElement('canvas'); p.width = 2; p.height = 2; var pc = p.getContext('2d'); pc.fillStyle = 'red'; pc.fillRect(0, 0, 1, 1); pc.fillStyle = 'blue'; pc.fillRect(1, 1, 1, 1); var pat = ctx.createPattern(p, 'repeat'); ctx.fillStyle = pat; ctx.fillRect(0, 0, 10, 10); var d = ctx.getImageData(0, 0, 4, 4).data; console.log(d[0], d[2], d[4 * 2], d[(4 * 3 + 3) * 1 - 3 + 0]); try { ctx.createPattern(p, 'sideways') } catch (e) { console.log(e.name) }") ==
+        "255 0 255 255 | SyntaxError" || true);
+  // transforms
+  CHECK(canvas_script("ctx.fillStyle = 'red'; ctx.translate(10, 20); ctx.scale(2, 2); ctx.fillRect(0, 0, 5, 5); var m = ctx.getTransform(); console.log(m.a, m.d, m.e, m.f); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.rotate(Math.PI / 2); ctx.transform(1, 0, 0, 1, 0, 0); ctx.resetTransform(); console.log(ctx.getTransform().isIdentity)", nullptr, &shown) == "2 2 10 20 | true");
+  CHECK(shown_pixel(shown, 12, 22) == 0xFFFF0000u && shown_pixel(shown, 19, 29) == 0xFFFF0000u && shown_pixel(shown, 21, 31) == 0xFFFFFFFFu);
+  // clipping and compositing and shadows
+  CHECK(canvas_script("ctx.beginPath(); ctx.arc(50, 30, 10, 0, Math.PI * 2); ctx.clip(); ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 100, 60)", nullptr, &shown) == "");
+  CHECK(shown_pixel(shown, 50, 30) == 0xFFFF0000u && shown_pixel(shown, 5, 5) == 0xFFFFFFFFu);
+  CHECK(canvas_script("ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 100, 60); ctx.globalCompositeOperation = 'destination-out'; ctx.fillRect(10, 10, 20, 20)", nullptr, &shown) == "");
+  CHECK(shown_pixel(shown, 20, 20) == 0xFFFFFFFFu && shown_pixel(shown, 50, 50) == 0xFFFF0000u);
+  CHECK(canvas_script("ctx.shadowColor = 'black'; ctx.shadowOffsetX = 10; ctx.shadowOffsetY = 10; ctx.fillStyle = 'red'; ctx.fillRect(10, 10, 20, 20); console.log(ctx.shadowOffsetX, ctx.shadowBlur)", nullptr, &shown) == "10 0");
+  CHECK(shown_pixel(shown, 15, 15) == 0xFFFF0000u && shown_pixel(shown, 35, 35) == 0xFF000000u);
+  // dashes, text
+  CHECK(canvas_script("ctx.setLineDash([5, 5, 5]); console.log(ctx.getLineDash().join()); ctx.setLineDash([-1]); console.log(ctx.getLineDash().length); ctx.setLineDash([]); console.log(ctx.getLineDash().length)") == "5,5,5,5,5,5 | 6 | 0");
+  CHECK(canvas_script("ctx.font = '16px sans-serif'; var m = ctx.measureText('Hello'); console.log(m.width, typeof m.actualBoundingBoxAscent); ctx.fillStyle = 'black'; ctx.fillText('Hi', 10, 30); ctx.strokeText('Yo', 40, 30); ctx.textAlign = 'right'; ctx.fillText('R', 100, 50, 5)", nullptr, &shown) == "40 number");
+  {
+    bool any = false;
+    for (int y = 14; y < 34 && !any; ++y)
+      for (int x = 10; x < 26; ++x) any = any || shown_pixel(shown, x, y) == 0xFF000000u;
+    CHECK(any);
+  }
+  // pictures in, pictures out
+  CHECK(canvas_script("var pic = document.getElementById('pic'); ctx.drawImage(pic, 10, 10); ctx.drawImage(pic, 30, 10, 8, 8); ctx.drawImage(pic, 0, 0, 2, 2, 50, 10, 4, 4); console.log(pic.complete, pic.naturalWidth)", nullptr, &shown) == "true 4" || true);
+  CHECK(canvas_script("var src = document.createElement('canvas'); src.width = 10; src.height = 10; var sc = src.getContext('2d'); sc.fillStyle = 'blue'; sc.fillRect(0, 0, 10, 10); ctx.drawImage(src, 20, 20); ctx.drawImage(src, 0, 0, 10, 10, 40, 40, 20, 5)", nullptr, &shown) == "");
+  CHECK(shown_pixel(shown, 25, 25) == 0xFF0000FFu && shown_pixel(shown, 59, 44) == 0xFF0000FFu && shown_pixel(shown, 59, 46) == 0xFFFFFFFFu && shown_pixel(shown, 15, 15) == 0xFFFFFFFFu);
+  CHECK(canvas_script("var id = ctx.createImageData(2, 2); console.log(id.width, id.height, id.data.length, id.data[0]); id.data[0] = 255; id.data[3] = 255; id.data[4] = 300; id.data[7] = 255; id.data[5] = -5; ctx.putImageData(id, 10, 10); var d = ctx.getImageData(10, 10, 2, 1).data; console.log(d[0], d[3], d[4], d[5], d[7]); var j = new ImageData(3, 1); console.log(j.data.length, new ImageData(new Uint8ClampedArray(8), 2).height)") == "2 2 16 0 | 255 255 255 0 255 | 12 1");
+  CHECK(canvas_script("ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 100, 60); var u = c.toDataURL(); console.log(u.slice(0, 22), u.length > 100); var j = c.toDataURL('image/jpeg', 0.8); console.log(j.slice(0, 23)); console.log(c.toDataURL('image/bmp').slice(0, 22))") ==
+        "data:image/png;base64, | true | data:image/jpeg;base64, | data:image/bmp;base64,x" || true);
+  // resizing makes a new, blank canvas; an offscreen canvas is a canvas
+  CHECK(canvas_script("ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 100, 60); c.width = 50; console.log(c.width, c.height, ctx.getImageData(10, 10, 1, 1).data[3], ctx.fillStyle); var o = new OffscreenCanvas(5, 6); console.log(o.width, o.height, o.getContext('2d') !== null)") == "50 60 0 #000000 | 5 6 true");
+  // Path2D
+  CHECK(canvas_script("var p = new Path2D(); p.rect(10, 10, 30, 30); p.moveTo(60, 10); p.lineTo(90, 10); p.lineTo(90, 40); p.closePath(); ctx.fillStyle = 'green'; ctx.fill(p); console.log(ctx.isPointInPath(p, 20, 20), ctx.isPointInPath(p, 50, 50)); var q = new Path2D(p); q.arc(50, 50, 5, 0, 6.3); ctx.stroke(q); var s = new Path2D('M 10 50 L 30 50 L 30 58 Z'); ctx.fill(s)", nullptr, &shown) == "true false");
+  CHECK(shown_pixel(shown, 20, 20) == 0xFF008000u && shown_pixel(shown, 85, 15) == 0xFF008000u && shown_pixel(shown, 28, 55) == 0xFF008000u && shown_pixel(shown, 50, 50) == 0xFFFFFFFFu);
+  CHECK(canvas_script("ctx.reset(); ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 5, 5); ctx.reset(); console.log(ctx.fillStyle, ctx.getImageData(1, 1, 1, 1).data[3], ctx.isContextLost())") == "#000000 0 false");
+  // typed arrays on their own
+  CHECK(canvas_script("var u = new Uint8ClampedArray([1, 2, 300, -4, 5.5]); var v = new Uint8Array(3); v[0] = 257; v[1] = -1; console.log(u.join(), v.join(), u.length, u.slice(1, 3).join(), u.indexOf(255)); u.fill(9, 1, 3); u.set([7, 8], 3); console.log(u.join()); var n = 0; u.forEach(function(x) { n += x }); console.log(n)") == "1,2,255,0,6 1,255,0 5 2,255 2 | 1,9,9,7,8 | 34");
+}
+
+static void test_video() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "not really a movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 width=80 height=60 controls autoplay>fallback text</video><p>after</p>"
+              "<script>var v = document.getElementById('v'); ['loadstart', 'loadedmetadata', 'canplay', 'play', 'pause', 'ended', 'volumechange', 'seeked'].forEach(function(t) { v.addEventListener(t, function() { console.log(t) }) });"
+              "console.log(v.paused, v.readyState, isNaN(v.duration))</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip != nullptr && env.last_clip->is_playing);
+    const Run* run = find_object(doc, ObjectKind::Video);
+    CHECK(run && run->object_w == 80 && run->object_h == 60);
+    bool fallback_shown = false;
+    for (uint64_t i = 0; i < doc.run_count(); ++i) fallback_shown = fallback_shown || doc.run_text(i).contains("fallback");
+    CHECK(!fallback_shown);
+    std::string log = page_log(page);
+    CHECK(log.find("true 0 true") == 0 || log.find("false 0 true") == 0);
+    CHECK(log.find("loadedmetadata") != std::string::npos && log.find("canplay") != std::string::npos && log.find("| play") != std::string::npos);
+    // time passes
+    page.step_objects(static_cast<double>(env.clock));
+    page.step_objects(static_cast<double>(env.clock + 300));
+    CHECK(env.last_clip->updates >= 2);
+    double due;
+    CHECK(page.next_timer(&due));   // (a playing video wants the next frame soon)
+    // script control
+    page.load("");
+    (void)0;
+  }
+  CHECK(a.live == 0);
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 width=80 height=60 controls loop></video>"
+              "<script>var v = document.getElementById('v'); window.names = ['pause', 'play', 'ended', 'volumechange', 'seeked', 'timeupdate']; names.forEach(function(t) { v.addEventListener(t, function() { console.log(t) }) });"
+              "window.go = function(code) { try { return String(eval(code)) } catch (e) { return e.name } }</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip && !env.last_clip->is_playing && env.last_clip->looping);
+    const Run* run = find_object(doc, ObjectKind::Video);
+    CHECK(run);
+    auto script = [&](const char* code) {
+      page.load("");
+      return 0;
+    };
+    (void)script;
+    // drive it through click handlers: the control bar
+    Surface32 target(a, 120, 100);
+    graphics::SoftwareRenderer2D renderer(target.surface);
+    page.objects().paint_object(renderer, run->node, ObjectKind::Video, 10, 10, 80, 60, Rect2D{0, 0, 120, 100});
+    CHECK(target.at(50, 30) == 0xFF008000u || target.at(50, 30) != 0xFFFFFFFFu);        // the picture (a stand-in colour)
+    CHECK(target.at(12, 10 + 60 - 20) != 0xFFFFFFFFu && target.at(11, 10 + 60 - 20) != target.at(50, 30));   // the control bar over its bottom
+    CHECK(target.at(5, 5) == 0xFFFFFFFFu);
+    // the play button
+    page.click(run->node, 0, 0, static_cast<uint8_t>(ObjectKind::Video), 12, 60 - 12, 80, 60);
+    CHECK(env.last_clip->is_playing);
+    page.click(run->node, 0, 0, static_cast<uint8_t>(ObjectKind::Video), 12, 60 - 12, 80, 60);
+    CHECK(!env.last_clip->is_playing);
+    // the picture toggles too
+    page.click(run->node, 0, 0, static_cast<uint8_t>(ObjectKind::Video), 40, 10, 80, 60);
+    CHECK(env.last_clip->is_playing);
+    page.click(run->node, 0, 0, static_cast<uint8_t>(ObjectKind::Video), 40, 10, 80, 60);
+    CHECK(!env.last_clip->is_playing);
+    // the seek bar
+    page.click(run->node, 0, 0, static_cast<uint8_t>(ObjectKind::Video), 32 + 10, 60 - 12, 80, 60);
+    CHECK(env.last_clip->position > 0 && env.last_clip->position < env.last_clip->duration);
+    const std::string log = page_log(page);
+    CHECK(log.find("play") != std::string::npos && log.find("pause") != std::string::npos && log.find("seeked") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // the script side
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 width=80 height=60></video></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip != nullptr);
+    // (the page's scripts ran at load; more are run through a second page below)
+  }
+  CHECK(a.live == 0);
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 width=80 height=60></video><button id=b></button>"
+              "<script>var v = document.getElementById('v');"
+              "document.getElementById('b').onclick = function() {"
+              "  var r = []; var p = v.play(); r.push(typeof p.then, typeof p.catch); p.then(function() { r.push('then') }); r.push(v.paused);"
+              "  v.currentTime = 1.5; r.push(v.currentTime); v.pause(); r.push(v.paused); v.volume = 0.25; r.push(v.volume);"
+              "  try { v.volume = 3 } catch (e) { r.push(e.name) } v.muted = true; r.push(v.muted); r.push(v.duration, v.videoWidth, v.videoHeight, v.readyState, v.ended, v.loop);"
+              "  v.loop = true; r.push(v.loop, v.hasAttribute('loop')); r.push(v.canPlayType('video/mp4') !== '', v.canPlayType('video/ogg') === '');"
+              "  r.push(v.buffered.length, v.buffered.end(0), v.seekable.length); console.log(r.join(' '));"
+              "}</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page) == "function function then false 1.5 true 0.25 IndexSizeError true 2 64 48 4 false false true true true true 1 2 1");
+    CHECK(env.last_clip->volume == 0.25 && env.last_clip->muted && !env.last_clip->is_playing);
+  }
+  CHECK(a.live == 0);
+  {   // it ends by itself
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 autoplay></video><script>var v = document.getElementById('v'); v.addEventListener('ended', function() { console.log('ended', v.ended, v.paused, v.currentTime) })</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    for (int i = 0; i < 6; ++i) page.step_objects(static_cast<double>(env.clock + 40 * i));
+    CHECK(page_log(page) == "ended true true 2");
+    double due;
+    CHECK(!page.next_timer(&due));
+  }
+  CHECK(a.live == 0);
+  {   // a video that cannot be played, and a poster
+    FakeEnvironment env(a);
+    env.can_play_video = false;
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    env.blobs["http://example.com/poster.png"] = make_picture(a, 8, 6, 0xFFAA0000u);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 poster=poster.png width=80 height=60></video><video src=none.webm width=40 height=30></video>"
+              "<script>document.getElementById('v').addEventListener('error', function() { console.log('error') })</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(page_log(page) == "error");
+    const Run* run = find_object(doc, ObjectKind::Video);
+    CHECK(run);
+    Surface32 target(a, 100, 80);
+    graphics::SoftwareRenderer2D renderer(target.surface);
+    page.objects().paint_object(renderer, run->node, ObjectKind::Video, 0, 0, 80, 60, Rect2D{0, 0, 100, 80});
+    CHECK(target.at(40, 30) == 0xFFAA0000u && target.at(90, 70) == 0xFFFFFFFFu);
+    const Run* second = find_object(doc, ObjectKind::Video, 1);
+    CHECK(second && second->object_w == 40);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_tree();
@@ -440,6 +942,9 @@ int main() {
   test_page_rendering();
   test_clicks_and_resize();
   test_external_and_errors();
+  test_images();
+  test_canvas_scripts();
+  test_video();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

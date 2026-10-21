@@ -20,7 +20,7 @@
 // and Reload buttons, the address box and Go, the page, and a status bar that says what is happening (and where the link under the pointer leads). It
 // shows HTML pages as browser::Page loads them - a document tree (see dom::Document) that scripts can read and change (see browser::DomBindings), styled
 // by CSS from <style>, style attributes and linked stylesheets, with selectors and @media queries answered for the size of the window and the colour
-// scheme, drawn as text, headings, lists, tables and links (no pictures) - and plain text, from the web (http:// and https://, through the page loader the
+// scheme, drawn as text, headings, lists, tables and links, with its pictures (<img>: PNG, JPEG, GIF - animated too -, BMP, WebP lossless and more), videos (<video>: AVI, MP4 / MOV with H.264, GIF, APNG, Y4M, with sound and a control bar, on the machine's video hardware when it has some) and canvases (<canvas> with the 2D context, drawn by the GPU when the machine has one) in the places the layout gives them - and plain text, from the web (http:// and https://, through the page loader the
 // desktop gives it) and from the system's own volumes (a path such as /docs/index.html).
 // A click on the page goes to the page as a click event (and follows a link when no script stops it); timers run from tick(); when a script changes the
 // page, or the window is resized, the page is drawn again where it was scrolled to.
@@ -32,6 +32,9 @@
 #pragma once
 #include "Browser/IPageLoader.hpp"
 #include "Browser/Page.hpp"
+#include "Hardware/Clock/IClock.hpp"
+#include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#include "Audio/AudioMixer.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -57,6 +60,7 @@ class WebBrowser : public gui::Frame {
   using UnixClock = uint64_t (*)(void* context);
 
   explicit WebBrowser(allocators::IAllocator& allocator);
+  ~WebBrowser();
 
   // Does the file name say it is a web page (.html, .htm)?
   static bool is_page_name(StringView name);
@@ -74,6 +78,15 @@ class WebBrowser : public gui::Frame {
   // Whether pages are told the user prefers dark colours (prefers-color-scheme); the page shown follows right away.
   void set_dark(bool dark);
   bool dark() const { return dark_; }
+  // The machine's sound mixer, video codecs and clock, for the <video> elements of pages (any may be nullptr: videos then show their poster and say they cannot
+  // be played). They must outlive the window.
+  void set_media_services(audio::AudioMixer* mixer, hardware::SystemVideoCodecs* codecs, const hardware::IClock* clock) {
+    mixer_ = mixer;
+    codecs_ = codecs;
+    clock_ = clock;
+  }
+  // Is the canvas of the page drawn by the GPU (as of the last time it was shown)?
+  bool canvas_accelerated() const { return canvas_accelerated_; }
   // Called by the desktop's loop with the uptime: runs the timers of the page that are due (on the handler thread).
   void tick(uint64_t uptime_us);
   // The page loaded now (nullptr for text, and before the first page). Use it only from the handler thread.
@@ -120,6 +133,8 @@ class WebBrowser : public gui::Frame {
    public:
     Env(WebBrowser& owner, allocators::IAllocator& allocator) : owner_(owner), storage_(allocator), jar_(allocator) {}
     bool fetch_text(StringView address, uint64_t limit, String* text) override;
+    bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override;
+    UniquePointer<browser::IVideoClip> open_video(UniquePointer<ByteBuffer> data) override;
     void navigate(StringView address, bool replace) override;
     void set_hash(StringView hash) override;
     void reload() override;
@@ -167,8 +182,8 @@ class WebBrowser : public gui::Frame {
   bool post(Request kind, StringView target);
   void run_request();
   void load(Request kind, StringView target);
-  bool fetch(StringView address, Fetched* page);
-  bool fetch_file(StringView path, Fetched* page);
+  bool fetch(StringView address, Fetched* page, uint64_t limit = kMaxFileBytes);
+  bool fetch_file(StringView path, Fetched* page, uint64_t limit = kMaxFileBytes);
   void show(Fetched& page);
   void remember(Request kind, StringView address);
   void update_buttons();
@@ -191,6 +206,10 @@ class WebBrowser : public gui::Frame {
   gui::Handler load_handler_;
   UnixClock unix_clock_ = nullptr;
   void* unix_clock_context_ = nullptr;
+  audio::AudioMixer* mixer_ = nullptr;
+  hardware::SystemVideoCodecs* codecs_ = nullptr;
+  const hardware::IClock* clock_ = nullptr;
+  bool canvas_accelerated_ = false;
   bool scripts_enabled_ = true, dark_ = false;
   gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr;
   gui::Handler node_handler_, resize_handler_, timer_handler_;

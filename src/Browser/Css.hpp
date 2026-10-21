@@ -41,6 +41,8 @@ namespace browser {
 // Colours are 0xAARRGGBB; 0 means "not set". Reads a CSS colour (names, #rgb, #rrggbb, #rgba, #rrggbbaa, rgb(), rgba(), hsl(), transparent). A
 // transparent colour comes back as true with *out == 0. False for anything else (also "inherit" and "currentcolor").
 bool parse_css_color(StringView text, uint32_t* out);
+// The same with the alpha kept (0xAARRGGBB; "transparent" is 0x00000000), for canvases. False for anything else.
+bool parse_css_color_alpha(StringView text, uint32_t* out);
 
 // The value of attribute `name` in the text of a tag (after its tag name), as written (entities are not decoded); false if it has none.
 bool find_attribute(StringView attrs, StringView name, StringView* value);
@@ -63,6 +65,8 @@ struct Style {
   Display display = Display::Inline;
   uint8_t margin_top = 0, margin_bottom = 0, padding_top = 0, padding_bottom = 0;   // blank lines (not inherited)
   uint8_t margin_left = 0, padding_left = 0;                                        // columns (not inherited)
+  uint16_t width_px = 0, height_px = 0;        // width / height in pixels (0: auto), for pictures, videos and canvases (not inherited)
+  uint8_t width_pct = 0;                        // width as a percentage of the line (0: not a percentage)
   bool own_background = false;                 // this element set the background (not inherited)
   uint32_t own_background_color = 0;           // what it set (for the page's background on <body>)
 
@@ -71,6 +75,8 @@ struct Style {
     Style s = *this;
     s.display = Display::Inline;
     s.margin_top = s.margin_bottom = s.padding_top = s.padding_bottom = s.margin_left = s.padding_left = 0;
+    s.width_px = s.height_px = 0;
+    s.width_pct = 0;
     s.own_background = false;
     s.own_background_color = 0;
     return s;

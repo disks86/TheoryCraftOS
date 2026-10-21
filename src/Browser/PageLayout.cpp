@@ -84,6 +84,48 @@ class Builder {
     if (has_) space_ = true;
   }
 
+  // An object of w x h pixels (shrunk to the line if it is wider; `pct` is its width in percent of the line, 0 for w): a word when it is one line high, else
+  // lines of its own.
+  void object(uint32_t run, uint32_t w, uint32_t h, uint32_t pct, uint32_t indent) {
+    const uint32_t start = indent < columns_ - 1 ? indent : columns_ - 1;
+    const uint64_t avail_px = uint64_t{columns_ - start} * 8;
+    uint64_t pw = w, ph = h;
+    if (pct) {
+      pw = avail_px * pct / 100;
+      if (pw == 0) pw = 1;
+      ph = uint64_t{h} * pw / (w ? w : 1);
+    }
+    if (pw > avail_px) {
+      ph = ph * avail_px / pw;
+      pw = avail_px;
+    }
+    if (pw == 0) pw = 1;
+    if (ph == 0) ph = 1;
+    if (ph > 65000) ph = 65000;
+    const uint32_t cols = static_cast<uint32_t>((pw + 7) / 8), rows = static_cast<uint32_t>((ph + 15) / 16);
+    if (rows == 1) {
+      ensure_line(indent);
+      uint32_t gap = has_ && space_ ? 1 : 0;
+      if (has_ && column_ + gap + cols > columns_) {
+        end_line();
+        ensure_line(indent);
+        gap = 0;
+      }
+      push_object(run, 0, cols, column_ + gap, pw, ph);
+      column_ += gap + cols;
+      has_ = true;
+      space_ = false;
+      return;
+    }
+    end_line();
+    for (uint32_t row = 0; row < rows && !failed_ && lines_.count() < PageLayout::kMaxLines; ++row) {
+      ensure_line(indent);
+      push_object(run, row, cols, column_, pw, ph);
+      has_ = true;
+      end_line();
+    }
+  }
+
   void rule(uint32_t run) {
     end_line();
     ensure_line(0);
@@ -93,6 +135,17 @@ class Builder {
   }
 
  private:
+  void push_object(uint32_t run, uint32_t row, uint32_t cols, uint32_t column, uint64_t pw, uint64_t ph) {
+    Piece piece;
+    piece.run = run;
+    piece.from = row;
+    piece.length = cols;
+    piece.column = column;
+    piece.px_w = static_cast<uint16_t>(pw > 65535 ? 65535 : pw);
+    piece.px_h = static_cast<uint16_t>(ph > 65535 ? 65535 : ph);
+    failed_ |= !pieces_.push_back(piece);
+  }
+
   void append(uint32_t run, uint32_t from, uint32_t length, uint32_t column, uint32_t gap) {
     if (pieces_.count() > 0 && lines_.count() > 0 && lines_[lines_.count() - 1] < pieces_.count()) {   // the line has a piece: perhaps this continues it
       Piece& last = pieces_[pieces_.count() - 1];
@@ -137,6 +190,11 @@ bool PageLayout::build(const HtmlDocument& doc, uint32_t columns) {
     if (run.flags & kRunRule) {
       b.rule(index);
       any = true;
+      continue;
+    }
+    if (run.object) {
+      any = true;
+      b.object(index, run.object_w, run.object_h, run.object_pct, indent);
       continue;
     }
     const StringView text = doc.run_text(r);

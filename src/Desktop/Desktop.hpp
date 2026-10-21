@@ -113,6 +113,11 @@ class Desktop {
   // The machine's sound mixer, video codecs and clock for the media player (any may be nullptr). They must outlive the desktop.
   void set_media_services(audio::AudioMixer* mixer, hardware::SystemVideoCodecs* codecs, const hardware::IClock* clock) {
     media_player_.set_services(mixer, codecs, clock);
+    media_mixer_ = mixer;
+    media_codecs_ = codecs;
+    media_clock_ = clock;
+    web_browser_.set_media_services(mixer, codecs, clock);
+    for (uint64_t i = 0; i < extra_browsers_.count(); ++i) extra_browsers_[i]->set_media_services(mixer, codecs, clock);
   }
   // The machine's MIDI output hardware for the media player to play MIDI files on (nullptr: none, they are synthesized in software).
   void set_midi_output(midi::IMidiOutput* output) { media_player_.set_midi_output(output); }
@@ -322,6 +327,9 @@ class Desktop {
   filesystem::IFileSystem* fs_ = nullptr;
   database::DatabaseManager* databases_ = nullptr;
   browser::IPageLoader* page_loader_ = nullptr;
+  audio::AudioMixer* media_mixer_ = nullptr;
+  hardware::SystemVideoCodecs* media_codecs_ = nullptr;
+  const hardware::IClock* media_clock_ = nullptr;
   database::local::SystemSettings* settings_ = nullptr;
   String database_url_;
   UniquePointer<SessionStore> sessions_;

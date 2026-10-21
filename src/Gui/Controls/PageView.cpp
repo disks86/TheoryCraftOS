@@ -128,6 +128,19 @@ uint32_t PageView::node_at(int32_t x, int32_t y) const {
   return piece < 0 ? 0 : document_->run(layout_.piece(static_cast<uint32_t>(piece)).run).node;
 }
 
+bool PageView::object_at(int32_t x, int32_t y, uint32_t* piece_index, int32_t* ox, int32_t* oy) const {
+  uint32_t line, column;
+  if (!document_ || !locate(x, y, &line, &column)) return false;
+  const int64_t p = layout_.piece_at(line, column);
+  if (p < 0) return false;
+  const browser::Piece& piece = layout_.piece(static_cast<uint32_t>(p));
+  if (document_->run(piece.run).object == 0) return false;
+  *piece_index = static_cast<uint32_t>(p);
+  *ox = kMargin + static_cast<int32_t>(piece.column) * Painter::kGlyphWidth;
+  *oy = (static_cast<int32_t>(line) - static_cast<int32_t>(piece.from) - static_cast<int32_t>(top_)) * kLineHeight;
+  return true;
+}
+
 bool PageView::link_at(int32_t x, int32_t y, String* target) const {
   UiGuard lock(this);
   const int32_t link = link_index_at(x, y);
@@ -164,6 +177,17 @@ void PageView::on_mouse_up(const MouseArgs& args) {
     clicked_node_ = pressed_node;
     clicked_x_ = args.x - kMargin;
     clicked_y_ = args.y + static_cast<int32_t>(top_) * kLineHeight;
+    clicked_object_ = 0;
+    uint32_t piece_index;
+    int32_t ox, oy;
+    if (object_at(args.x, args.y, &piece_index, &ox, &oy)) {
+      const browser::Piece& piece = layout_.piece(piece_index);
+      clicked_object_ = document_->run(piece.run).object;
+      clicked_local_x_ = args.x - ox;
+      clicked_local_y_ = args.y - oy;
+      clicked_w_ = piece.px_w;
+      clicked_h_ = piece.px_h;
+    }
     fire(node_handler_);
     return;
   }
@@ -223,6 +247,15 @@ void PageView::paint(Painter& painter) {
       const int32_t width = static_cast<int32_t>(piece.length) * Painter::kGlyphWidth;
       const uint32_t ground = run.background ? run.background : paper;   // what the text is on
       const bool dark = is_dark(ground);
+      if (run.object) {
+        // an object is drawn once, from its first row - or from the first row on the screen when its top has scrolled off
+        if (objects_ && (piece.from == 0 || line == top_)) {
+          const int32_t top = (static_cast<int32_t>(line) - static_cast<int32_t>(piece.from) - static_cast<int32_t>(top_)) * kLineHeight;
+          objects_->paint_object(painter.renderer(), run.node, static_cast<browser::ObjectKind>(run.object), painter.origin_x() + x, painter.origin_y() + top, piece.px_w, piece.px_h,
+                                 painter.clip_rect());
+        }
+        continue;
+      }
       if (run.flags & browser::kRunRule) {
         painter.fill({kMargin, y + kLineHeight / 2 - 1, static_cast<uint32_t>(usable > 2 * kMargin ? usable - 2 * kMargin : 1), 2}, run.color ? run.color : kRuleInk);
         continue;

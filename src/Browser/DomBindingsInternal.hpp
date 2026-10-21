@@ -32,7 +32,9 @@ struct DomBindings::Impl {
 
   script::JsObject *node_proto = nullptr, *element_proto = nullptr, *html_proto = nullptr, *text_proto = nullptr, *comment_proto = nullptr, *document_proto = nullptr,
                    *fragment_proto = nullptr, *event_proto = nullptr, *token_list_proto = nullptr, *style_proto = nullptr, *computed_proto = nullptr,
-                   *storage_proto = nullptr, *location_proto = nullptr, *history_proto = nullptr, *media_query_proto = nullptr, *exception_proto = nullptr;
+                   *storage_proto = nullptr, *location_proto = nullptr, *history_proto = nullptr, *media_query_proto = nullptr, *exception_proto = nullptr,
+                   *canvas_context_proto = nullptr, *gradient_proto = nullptr, *pattern_proto = nullptr, *path2d_proto = nullptr, *typed_array_proto = nullptr,
+                   *image_data_proto = nullptr, *text_metrics_proto = nullptr, *thenable_proto = nullptr, *time_ranges_proto = nullptr;
   script::JsObject* wrappers = nullptr;       // every wrapper made (kept alive)
   script::JsObject* media_lists = nullptr;    // the MediaQueryList objects given out
   script::JsObject* window_listeners = nullptr;
@@ -93,6 +95,10 @@ bool install_nodes(DomBindings::Impl& c);
 bool install_events(DomBindings::Impl& c);
 bool install_window(DomBindings::Impl& c);
 bool install_styles(DomBindings::Impl& c);
+bool install_media(DomBindings::Impl& c);   // <img>, <video>, <canvas>, the 2D context, ImageData, Path2D, typed arrays (DomBindingsMedia.cpp)
+// Properties of <img>, <video> and <canvas> elements; true when handled / Handled when it was.
+bool media_get(DomBindings::Impl& c, dom::Node* element, StringView key, Value* out);
+HostClass::Set media_set(DomBindings::Impl& c, dom::Node* element, StringView key, const Value& value);
 void update_metrics(DomBindings::Impl& c);
 uint32_t media_changed_impl(DomBindings::Impl& c);
 

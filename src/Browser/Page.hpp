@@ -30,6 +30,7 @@
 #include "Browser/DomBindings.hpp"
 #include "Browser/HtmlDocument.hpp"
 #include "Browser/Media.hpp"
+#include "Browser/Objects.hpp"
 #include "Browser/Renderer.hpp"
 #include "Dom/Dom.hpp"
 #include "Script/Engine.hpp"
@@ -38,7 +39,7 @@
 namespace browser {
 
 // What a page asks of the browser it is shown in.
-class IPageEnvironment {
+class IPageEnvironment : public IObjectEnvironment {
  public:
   // The text at an address (a script or a style sheet), at most `limit` bytes. False if it cannot be had.
   virtual bool fetch_text(StringView address, uint64_t limit, String* text) = 0;
@@ -55,6 +56,8 @@ class IPageEnvironment {
   virtual void console(int level, StringView text) = 0;
   virtual StorageArea& local_storage() = 0;
   virtual String& cookie() = 0;
+  // (IObjectEnvironment: fetch_bytes() for pictures and videos, open_video(); pages without pictures need neither)
+  bool fetch_bytes(StringView, uint64_t, ByteBuffer*) override { return false; }
 
  protected:
   IPageEnvironment() = default;
@@ -77,12 +80,20 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool render(HtmlDocument* out);
   // Has the tree changed, or the display (set_media()), since the last render()?
   bool changed() const { return doc_.version() != rendered_version_ || media_ != rendered_media_; }
+  // Did something visible change that is not in the tree (a canvas drawn on, a video frame)? Then the view only needs painting again.
+  bool take_visual_change() { return objects_.take_dirty(); }
 
   // The display changed (the window was resized, the colour scheme was switched): the page's numbers and its matchMedia() lists follow, and `resize`
   // fires. A style sheet's @media rules are read again by the next render().
   void set_media(const MediaEnvironment& media);
-  // A click on a node (Run::node): the click event goes to it and up; if nothing stops it, a link is followed. Without scripts only the link is.
-  void click(uint32_t node_serial, int32_t x, int32_t y);
+  // A click on a node (Run::node): the click event goes to it and up; if nothing stops it, a link is followed. Without scripts only the link is. When the
+  // node is a picture, video or canvas, `object` is its ObjectKind and (lx, ly) where in its w x h rectangle the click was: a video with controls plays or
+  // pauses.
+  void click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object = 0, int32_t lx = 0, int32_t ly = 0, uint32_t w = 0, uint32_t h = 0);
+  // Moves pictures and videos along (animated pictures, playing videos) and fires the events that follow (load, error, timeupdate, ended ...); true if
+  // anything visible changed or an event was fired. Called often while objects().animating().
+  bool step_objects(double now_ms);
+  PageObjects& objects() override { return objects_; }
   // Runs the timers that are due at `now_ms` (the host clock); true if any ran.
   bool run_due_timers(double now_ms);
   // When the next timer is due (host clock); false if none is waiting.
@@ -143,6 +154,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   };
 
   bool start_engine();
+  void deliver_object_events();
   void note_error(StringView text);
   void fetch_pending_styles();
   bool resolve(StringView reference, String* out);
@@ -158,6 +170,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   dom::Document doc_;
   List<UniquePointer<dom::Document>> extra_documents_;
   List<Fetched> scripts_, sheets_;
+  PageObjects objects_;
   uint32_t errors_ = 0;
   uint64_t rendered_version_ = 0;
   bool loading_ = true, engine_failed_ = false;

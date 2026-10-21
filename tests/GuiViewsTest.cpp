@@ -44,6 +44,8 @@
 #include "Database/TextResultSet.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/Spreadsheet.hpp"
+#include <map>
+#include "Media/ImageCodecs.hpp"
 #include "Desktop/WebBrowser.hpp"
 #include "Browser/HtmlDocument.hpp"
 #include "Gui/Controls/SpreadsheetGrid.hpp"
@@ -6312,8 +6314,17 @@ static void test_database_query_tabs() {
 // Hands out a few canned pages and remembers what was asked for.
 struct FakeLoader final : browser::IPageLoader {
   std::vector<std::string> asked;
+  std::map<std::string, std::pair<std::string, std::string>> files;   // address -> (content type, body)
   bool fetch(StringView address, browser::PageResult* r) override {
     asked.emplace_back(address.data(), address.size());
+    auto found = files.find(std::string(address.data(), address.size()));
+    if (found != files.end()) {
+      r->status = 200;
+      r->final_address.assign(address);
+      r->content_type.assign(found->second.first.c_str());
+      r->body.append(ConstByteView(reinterpret_cast<const uint8_t*>(found->second.second.data()), found->second.second.size()));
+      return true;
+    }
     if (address.equals("http://down.test/")) {
       r->error.assign("connection refused");
       return false;
@@ -6523,6 +6534,91 @@ static void test_web_browser() {
   CHECK(a.live == 0);
 }
 
+
+// Pictures, canvases and videos in the browser window: they take their place in the page, are drawn there, follow the scripts, and the video follows the clock.
+static void test_web_browser_media() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::WebBrowser b(a);
+    FakeLoader loader;
+    NoPci pci;
+    hardware::SystemVideoCodecs codecs(pci, a);
+    codecs.initialize();
+    FixedClock clock;
+    b.set_page_loader(&loader);
+    b.set_file_system(&fs);
+    b.set_media_services(nullptr, &codecs, &clock);
+    CHECK(mgr.add_window(&b));
+    w.layout();
+    // the files: a green picture, a two frame animation (red, then blue)
+    {
+      media::Image png(a);
+      png.create(40, 20);
+      for (uint32_t i = 0; i < 40 * 20; ++i) png.frame(0)[i] = 0xFF00AA00u;
+      ByteBuffer bytes(a);
+      CHECK(media::encode_png(png, 6, &bytes));
+      loader.files["http://media.test/green.png"] = {"image/png", std::string(reinterpret_cast<const char*>(bytes.view().data()), bytes.size())};
+      media::Image gif(a);
+      gif.create(16, 16, 2);
+      for (uint32_t i = 0; i < 256; ++i) {
+        gif.frame(0)[i] = 0xFFFF0000u;
+        gif.frame(1)[i] = 0xFF0000FFu;
+      }
+      gif.set_delay_ms(0, 500);
+      gif.set_delay_ms(1, 500);
+      ByteBuffer gif_bytes(a);
+      CHECK(media::encode_gif(gif, &gif_bytes));
+      loader.files["http://media.test/clip.gif"] = {"image/gif", std::string(reinterpret_cast<const char*>(gif_bytes.view().data()), gif_bytes.size())};
+    }
+    loader.files["http://media.test/"] = {"text/html",
+        "<html><head><title>Media</title></head><body><img src=green.png width=40 height=20 alt=green>"
+        "<canvas id=c width=60 height=32></canvas><video src=clip.gif width=32 height=32 autoplay loop></video>"
+        "<script>var ctx = document.getElementById('c').getContext('2d'); ctx.fillStyle = '#ff0000'; ctx.fillRect(4, 4, 20, 10); ctx.fillStyle = '#0000ff'; ctx.beginPath(); ctx.arc(44, 16, 10, 0, 7); ctx.fill();"
+        "document.getElementById('c').addEventListener('click', function(e) { document.title = 'canvas clicked'; });</script></body></html>"};
+    CHECK(b.navigate("http://media.test/") && b.title().equals("Web Browser - Media"));
+    CHECK(b.script_errors() == 0);
+    w.render();
+    const Point po = b.page().window_origin();
+    const int32_t kM = gui::PageView::kMargin;
+    // line 0-1: the picture (40 x 20), line 2-3: the canvas (60 x 32), line 4-5: the video
+    CHECK(screen.px(po.x + kM + 5, po.y + 5) == 0xFF00AA00u && screen.px(po.x + kM + 39, po.y + 19) == 0xFF00AA00u && screen.px(po.x + kM + 41, po.y + 5) == 0xFFFFFFFFu);
+    CHECK(screen.px(po.x + kM + 6, po.y + 32 + 6) == 0xFFFF0000u && screen.px(po.x + kM + 44, po.y + 32 + 16) == 0xFF0000FFu && screen.px(po.x + kM + 2, po.y + 32 + 2) == 0xFFFFFFFFu);
+    CHECK(!b.canvas_accelerated());   // (this screen is drawn by the CPU)
+    const uint32_t first_frame = screen.px(po.x + kM + 8, po.y + 64 + 8);
+    CHECK(first_frame == 0xFFFF0000u || first_frame == 0xFF0000FFu);
+    // the video follows the clock: the timers are run from tick(), half a second moves it to the next picture
+    clock.now += 600000;
+    b.tick(700000);
+    b.tick(740000);
+    w.render();
+    const uint32_t second_frame = screen.px(po.x + kM + 8, po.y + 64 + 8);
+    CHECK(second_frame != first_frame && (second_frame == 0xFFFF0000u || second_frame == 0xFF0000FFu));
+    // a click on the canvas reaches its script
+    click(w, po.x + kM + 30, po.y + 32 + 16);
+    CHECK(b.title().equals("Web Browser - canvas clicked"));
+    // scripts off: the canvas has nothing on it, the picture is still there
+    b.set_scripts_enabled(false);
+    CHECK(b.navigate("http://media.test/"));
+    w.render();
+    CHECK(screen.px(po.x + kM + 5, po.y + 5) == 0xFF00AA00u && screen.px(po.x + kM + 6, po.y + 32 + 6) == 0xFFFFFFFFu);
+    b.set_scripts_enabled(true);
+    // a picture that does not arrive is its alternative text
+    loader.files["http://media.test/broken.html"] = {"text/html", "<html><body><img src=nothing.png alt='no picture here'></body></html>"};
+    CHECK(b.navigate("http://media.test/broken.html"));
+    bool alt = false;
+    for (uint64_t i = 0; b.page().document() && i < b.page().document()->run_count(); ++i) alt = alt || b.page().document()->run_text(i).contains("no picture here");
+    CHECK(alt);
+  }
+  CHECK(a.live == 0);
+}
+
 // Browsers are tabs like the other programs: "+" opens another, they are dragged between windows, and a session brings them back.
 static void test_web_browser_tabs() {
   TestAllocator a;
@@ -6658,6 +6754,7 @@ int main() {
   test_spreadsheet_app();
   test_spreadsheet_tabs();
   test_web_browser();
+  test_web_browser_media();
   test_web_browser_tabs();
   test_database_query();
   test_database_query_tabs();

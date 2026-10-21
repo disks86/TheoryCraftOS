@@ -41,6 +41,10 @@ class Painter {
   void push_frame(const Rect2D& bounds);
   void pop_frame();
   bool clip_empty() const;
+  // Where the current frame's top left is on the render target, and its clip (absolute), for drawing that goes to the renderer directly.
+  int32_t origin_x() const { return frames_[depth_].origin_x; }
+  int32_t origin_y() const { return frames_[depth_].origin_y; }
+  const Rect2D& clip_rect() const { return frames_[depth_].clip; }
 
   void fill(const Rect2D& r, uint32_t color);
   void outline(const Rect2D& r, uint32_t color);

@@ -22,6 +22,7 @@
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Video/VideoPlayer.hpp"
 
 namespace desktop {
 
@@ -40,6 +41,39 @@ struct WebBrowser::Fetched {
 
 namespace {
 
+// A video of a page, played by a video::VideoPlayer (on the machine's video hardware when it has some; its sound goes through the mixer).
+class BrowserVideoClip final : public browser::IVideoClip {
+ public:
+  BrowserVideoClip(allocators::IAllocator& allocator, const hardware::IClock& clock, hardware::SystemVideoCodecs& codecs, audio::AudioMixer* mixer, UniquePointer<ByteBuffer> data)
+      : data_(util::move(data)), source_(data_->view()), player_(clock, codecs, allocator, mixer) {}
+  bool open() { return player_.open_media(source_) == video::OpenResult::Ok; }
+
+  bool play() override { return player_.play(); }
+  void pause() override { player_.pause(); }
+  void seek(int64_t microseconds) override { player_.seek(microseconds); }
+  void set_looping(bool looping) override { player_.set_looping(looping); }
+  void set_volume(double volume, bool muted) override {
+    if (!player_.audio()) return;
+    const double v = muted ? 0 : volume < 0 ? 0 : volume > 1 ? 1 : volume;
+    player_.audio()->set_volume(static_cast<uint8_t>(v * 100 + 0.5));
+  }
+  bool playing() override { return player_.playing(); }
+  int64_t position_us() override { return player_.position_us(); }
+  int64_t duration_us() override { return player_.duration_us(); }
+  uint32_t width() override { return player_.frame_width(); }
+  uint32_t height() override { return player_.frame_height(); }
+  void update() override { player_.update(); }
+  bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* serial) override {
+    if (pitch < player_.frame_width() || dest.size() < uint64_t{pitch} * player_.frame_height()) return false;
+    return player_.copy_picture(dest.data(), pitch, serial);
+  }
+
+ private:
+  UniquePointer<ByteBuffer> data_;
+  media::MemoryByteSource source_;
+  video::VideoPlayer player_;
+};
+
 const char kWelcome[] =
     "<html><head><title>Welcome</title></head><body>"
     "<h1>TheoryCraftOS Web Browser</h1>"
@@ -49,7 +83,7 @@ const char kWelcome[] =
     "<h2>Keys</h2>"
     "<ul><li>Ctrl+L: go to the address box</li><li>Alt+Left, Alt+Right: back and forward</li><li>F5 or Ctrl+R: reload</li>"
     "<li>Ctrl+O: open a file</li><li>Space, Page Up, Page Down: scroll</li></ul>"
-    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them. It does not show pictures.</p>"
+    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them, and pictures, videos and canvases.</p>"
     "<p>A place to start: <a href=\"http://example.com/\">http://example.com/</a></p>"
     "</body></html>";
 
@@ -185,6 +219,11 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   welcome.type.assign("text/html");
   show(welcome);
   say("Type an address and press Enter.");
+}
+
+WebBrowser::~WebBrowser() {
+  UiGuard lock(&page_);
+  page_.set_object_painter(nullptr);
 }
 
 void WebBrowser::say(StringView text) {
@@ -357,8 +396,8 @@ void WebBrowser::load(Request kind, StringView target) {
   show(page);
 }
 
-bool WebBrowser::fetch(StringView address, Fetched* page) {
-  if (browser::is_file_address(address)) return fetch_file(address, page);
+bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit) {
+  if (browser::is_file_address(address)) return fetch_file(address, page, limit);
   if (!loader_) {
     page->error.assign("Web pages cannot be opened: there is no network connection.");
     return false;
@@ -384,7 +423,7 @@ bool WebBrowser::fetch(StringView address, Fetched* page) {
   return true;
 }
 
-bool WebBrowser::fetch_file(StringView path, Fetched* page) {
+bool WebBrowser::fetch_file(StringView path, Fetched* page, uint64_t limit) {
   String name(allocator());
   name.assign(path.starts_with("file://") ? path.substr(7) : path);
   page->address.assign(name.view());
@@ -405,8 +444,8 @@ bool WebBrowser::fetch_file(StringView path, Fetched* page) {
     return false;
   }
   const uint64_t size = file->size();
-  if (size > kMaxFileBytes) {
-    problem.append("the file is too large (limit 4 MiB).");
+  if (size > limit) {
+    problem.append("the file is too large.");
     page->error.assign(problem.view());
     return false;
   }
@@ -461,6 +500,10 @@ void WebBrowser::show(Fetched& page) {
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
+  {
+    UiGuard lock(&page_);
+    page_.set_object_painter(nullptr);
+  }
   live_.reset();   // (the old page and its scripts go before the new one comes)
   {
     UiGuard lock(this);
@@ -480,6 +523,7 @@ void WebBrowser::show(Fetched& page) {
     else {
       say(scripts_enabled_ ? "Reading the page and running its scripts..." : "Reading the page...");
       ok = live_->load(body) && live_->render(doc.get());
+      if (ok) page_.set_object_painter(&live_->objects());
     }
   } else if (is_text(page.type.view(), body)) {
     ok = doc->parse_text(body);
@@ -577,6 +621,11 @@ void WebBrowser::settle() {
     return;
   }
   if (!live_) return;
+  canvas_accelerated_ = live_->objects().accelerated();
+  if (live_->take_visual_change()) {   // (a canvas was drawn on, a video has a new picture: only the view needs painting again)
+    UiGuard lock(&page_);
+    page_.invalidate();
+  }
   if (live_->changed() || defer_scroll_ >= 0) refresh(true);
   else if (live_->errors() != reported_errors_) {
     UiGuard lock(this);
@@ -626,14 +675,17 @@ void WebBrowser::on_timers(void* self, Control&) {
   auto* b = static_cast<WebBrowser*>(self);
   __atomic_store_n(&b->timer_pending_, false, __ATOMIC_RELEASE);
   if (!b->live_) return;
-  b->live_->run_due_timers(static_cast<double>(b->page_clock_ms()));
+  const double now = static_cast<double>(b->page_clock_ms());
+  b->live_->run_due_timers(now);
+  b->live_->step_objects(now);
   b->settle();
 }
 
 void WebBrowser::on_node_click(void* self, Control&) {
   auto* b = static_cast<WebBrowser*>(self);
   if (!b->live_) return;
-  b->live_->click(b->page_.clicked_node(), b->page_.clicked_x(), b->page_.clicked_y());
+  b->live_->click(b->page_.clicked_node(), b->page_.clicked_x(), b->page_.clicked_y(), b->page_.clicked_object(), b->page_.clicked_local_x(), b->page_.clicked_local_y(),
+                  b->page_.clicked_width(), b->page_.clicked_height());
   b->settle();
 }
 
@@ -674,6 +726,20 @@ void WebBrowser::on_toggle_dark(void* self, Control&) {
 }
 
 // --- What a page asks of the window ------------------------------------------------------------------
+
+bool WebBrowser::Env::fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) {
+  Fetched f(owner_.allocator());
+  f.address.assign(address);
+  if (!owner_.fetch(address, &f, limit) || f.status >= 400 || f.body.size() > limit) return false;
+  return out->append(f.body.view());
+}
+
+UniquePointer<browser::IVideoClip> WebBrowser::Env::open_video(UniquePointer<ByteBuffer> data) {
+  if (!owner_.codecs_ || !owner_.clock_ || !data) return UniquePointer<browser::IVideoClip>();
+  auto clip = UniquePointer<BrowserVideoClip>::make(owner_.allocator(), owner_.allocator(), *owner_.clock_, *owner_.codecs_, owner_.mixer_, util::move(data));
+  if (!clip || !clip->open()) return UniquePointer<browser::IVideoClip>();
+  return clip;
+}
 
 bool WebBrowser::Env::fetch_text(StringView address, uint64_t limit, String* text) {
   Fetched f(owner_.allocator());

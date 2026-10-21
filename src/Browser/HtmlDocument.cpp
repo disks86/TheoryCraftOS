@@ -43,6 +43,26 @@ bool HtmlDocument::add_run(StringView text, uint8_t flags, uint8_t level, uint8_
   return pool_.append(text) && runs_.push_back(run);
 }
 
+bool HtmlDocument::add_object(uint8_t kind, uint32_t w, uint32_t h, uint32_t pct, uint8_t indent, uint8_t breaks, int32_t link, uint8_t align, uint32_t background, uint32_t node) {
+  if (runs_.count() >= kMaxRuns) {
+    truncated_ = true;
+    return true;
+  }
+  Run run;
+  run.offset = static_cast<uint32_t>(pool_.size());
+  run.indent = indent;
+  run.breaks = breaks;
+  run.align = align;
+  run.link = link;
+  run.background = background;
+  run.node = node;
+  run.object = kind;
+  run.object_w = static_cast<uint16_t>(w > 8192 ? 8192 : w < 1 ? 1 : w);
+  run.object_h = static_cast<uint16_t>(h > 8192 ? 8192 : h < 1 ? 1 : h);
+  run.object_pct = static_cast<uint8_t>(pct > 100 ? 100 : pct);
+  return runs_.push_back(run);
+}
+
 int32_t HtmlDocument::add_link(StringView target) {
   if (links_.count() >= kMaxRuns || pool_.size() + target.size() > kMaxText) return -1;
   LinkRef ref{static_cast<uint32_t>(pool_.size()), static_cast<uint32_t>(target.size())};

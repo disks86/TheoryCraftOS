@@ -22,6 +22,7 @@
 // written in the page). The view owns the document it shows; set_document() hands it a new one (and returns to the top).
 #pragma once
 #include "Browser/HtmlDocument.hpp"
+#include "Browser/ObjectTypes.hpp"
 #include "Browser/PageLayout.hpp"
 #include "Gui/Control.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
@@ -58,6 +59,20 @@ class PageView : public Control {
   // Fires when the number of columns or rows that fit changes (the window was resized), also the first time it is known.
   void on_resized(Handler handler) { UiGuard lock(this); resize_handler_ = handler; }
 
+  // Who draws the pictures, videos and canvases (nullptr: they are left blank). The painter is asked while the view paints, so it must be taken away
+  // (nullptr) before it goes. After a click on an object, clicked_object() is its kind and clicked_local_x() / _y() and clicked_width() / _height() say where
+  // in its rectangle.
+  void set_object_painter(browser::IObjectPainter* painter) {
+    UiGuard lock(this);
+    objects_ = painter;
+    invalidate();
+  }
+  uint8_t clicked_object() const { return clicked_object_; }
+  int32_t clicked_local_x() const { return clicked_local_x_; }
+  int32_t clicked_local_y() const { return clicked_local_y_; }
+  uint32_t clicked_width() const { return clicked_w_; }
+  uint32_t clicked_height() const { return clicked_h_; }
+
   // --- View
   uint32_t line_count() const { return layout_.line_count(); }
   uint32_t visible_lines() const { return rows_; }
@@ -85,6 +100,8 @@ class PageView : public Control {
   bool locate(int32_t x, int32_t y, uint32_t* line, uint32_t* column) const;
   int32_t link_index_at(int32_t x, int32_t y) const;
   uint32_t node_at(int32_t x, int32_t y) const;
+  // The object under a point: its piece, the rectangle on screen it is shown in (relative to the view).
+  bool object_at(int32_t x, int32_t y, uint32_t* piece, int32_t* ox, int32_t* oy) const;
   void set_hover(int32_t link);
   static void scroll_changed(void* self, Control&);
 
@@ -97,6 +114,10 @@ class PageView : public Control {
   String clicked_link_, hovered_link_;
   Handler link_handler_, hover_handler_, node_handler_, resize_handler_;
   uint32_t press_node_ = 0, clicked_node_ = 0, notified_columns_ = 0, notified_rows_ = 0;
+  browser::IObjectPainter* objects_ = nullptr;
+  uint8_t clicked_object_ = 0;
+  int32_t clicked_local_x_ = 0, clicked_local_y_ = 0;
+  uint32_t clicked_w_ = 0, clicked_h_ = 0;
   int32_t clicked_x_ = 0, clicked_y_ = 0;
 };
 
