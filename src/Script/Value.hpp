@@ -126,6 +126,21 @@ struct Prop {
 // Natives return false after throwing (Vm::throw_error); `args` may be shorter than the function asks for.
 using NativeFn = bool (*)(Vm& vm, const Value& this_value, const Value* args, uint32_t argc, Value* result);
 
+// Objects that stand for something outside the script engine (a document node, a style declaration) answer property reads and writes themselves. The
+// callbacks see every key first; a read that returns true has produced the value, a write returns what it did.
+struct HostClass {
+  const char* name;
+  // Reads a property. True if it is the object's own (then *out is the value); false lets the ordinary properties and the prototype chain answer.
+  bool (*get)(Vm& vm, JsObject* object, JsString* key, Value* out);
+  // Writes a property.
+  enum class Set : uint8_t { NotHandled, Handled, Threw };
+  Set (*set)(Vm& vm, JsObject* object, JsString* key, const Value& value);
+  // Deletes a property; true if it was handled (the result of the delete is then *deleted).
+  bool (*remove)(Vm& vm, JsObject* object, JsString* key, bool* deleted);
+  // Appends the names of the enumerable properties it has (as strings) to `keys`.
+  void (*keys)(Vm& vm, JsObject* object, JsObject* keys);
+};
+
 struct JsObject : Cell {
   ObjKind okind = ObjKind::Plain;
   bool frozen = false;
@@ -144,6 +159,8 @@ struct JsObject : Cell {
   JsObject* target = nullptr;   // a bound function's function
   NativeFn native = nullptr;
   uint32_t position = 0;  // an iterator's place
+  const HostClass* host = nullptr;   // objects that stand for something outside the engine
+  void* host_data = nullptr;
   JsObject() : Cell(CellKind::Object) {}
 };
 

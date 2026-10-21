@@ -1559,41 +1559,31 @@ NATIVE(add_event_listener) {
   return true;
 }
 
-NATIVE(set_timeout) {
-  Value list;
-  if (!vm.get_named(Value::make_object(vm.global()), "__timers", &list) || !list.is_object()) return true;
-  if (!Vm::is_callable(arg_at(args, argc, 0))) return vm.throw_error(ErrorKind::TypeError, "setTimeout needs a function");
+bool timer_native(Vm& vm, const Value* args, uint32_t argc, Value* result, bool repeat) {
+  if (!Vm::is_callable(arg_at(args, argc, 0))) return vm.throw_error(ErrorKind::TypeError, repeat ? "setInterval needs a function" : "setTimeout needs a function");
   double delay = 0;
   if (argc > 1 && !vm.to_number(args[1], &delay)) return false;
-  if (delay != delay || delay < 0) delay = 0;
-  JsObject* entry = vm.new_array(3 + argc);
-  vm.array_push(entry, args[0]);
-  vm.array_push(entry, num_value(delay));
-  vm.array_push(entry, num_value(static_cast<double>(list.as_object()->length + 1)));
-  for (uint32_t i = 2; i < argc; ++i) vm.array_push(entry, args[i]);
-  vm.array_push(list.as_object(), Value::make_object(entry));
-  *result = num_value(static_cast<double>(list.as_object()->length));
+  *result = num_value(vm.add_timer(args[0], delay, repeat ? (delay == delay && delay >= 0 ? delay : 0) : -1, argc > 2 ? args + 2 : nullptr, argc > 2 ? argc - 2 : 0));
   return true;
 }
+NATIVE(set_timeout) { return timer_native(vm, args, argc, result, false); }
+NATIVE(set_interval) { return timer_native(vm, args, argc, result, true); }
 
 NATIVE(clear_timeout) {
-  Value list;
-  if (!vm.get_named(Value::make_object(vm.global()), "__timers", &list) || !list.is_object()) return true;
-  JsObject* l = list.as_object();
-  for (uint32_t i = 0; i < l->length; ++i) {
-    if (l->items[i].is_object() && l->items[i].as_object()->length >= 3 && vm.strict_equals(l->items[i].as_object()->items[2], arg_at(args, argc, 0))) l->items[i] = Value();
-  }
+  double id;
+  if (!arg_number(vm, args, argc, 0, &id)) return false;
+  vm.clear_timer(id);
   return true;
 }
 
 NATIVE(date_now) {
-  *result = num_value(vm.host() ? static_cast<double>(vm.host()->now_ms()) : 0);
+  *result = num_value(vm.clock_ms());
   return true;
 }
 
 NATIVE(date_ctor) {
   JsObject* d = vm.new_plain();
-  double t = vm.host() ? static_cast<double>(vm.host()->now_ms()) : 0;
+  double t = vm.clock_ms();
   if (argc > 0 && args[0].is_number()) t = args[0].u.number;
   vm.define_named(d, "__t", num_value(t), kWritable);
   vm.define(d, vm.intern("__date"), Value::make_bool(true), kWritable);
@@ -1825,7 +1815,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "isFinite", global_is_finite, 1);
   vm.define_native(g, "alert", global_alert, 1);
   vm.define_native(g, "setTimeout", set_timeout, 2);
-  vm.define_native(g, "setInterval", set_timeout, 2);
+  vm.define_native(g, "setInterval", set_interval, 2);
   vm.define_native(g, "clearTimeout", clear_timeout, 1);
   vm.define_native(g, "clearInterval", clear_timeout, 1);
   vm.define_native(g, "addEventListener", add_event_listener, 2);

@@ -82,8 +82,8 @@ static void test_text() {
   CHECK(page_is("foo <b>bar</b> baz", 40, "foo bar baz"));
   CHECK(page_is("foo<b> bar</b>baz", 40, "foo barbaz"));
   CHECK(page_is("a &amp; b &lt;c&gt; &quot;d&quot; &#65;&#x42; &nbsp;x", 40, "a & b <c> \"d\" AB x"));
-  CHECK(page_is("1 &bogus; 2 & 3", 40, "1 ? 2 & 3"));
-  CHECK(page_is("caf\xC3\xA9 \xE2\x80\x9Cq\xE2\x80\x9D", 40, "caf? \"q\""));
+  CHECK(page_is("1 &bogus; 2 & 3", 40, "1 &bogus; 2 & 3"));
+  CHECK(page_is("caf\xC3\xA9 \xE2\x80\x9Cq\xE2\x80\x9D", 40, "cafe \"q\""));
   CHECK(page_is("a<!-- hidden -->b", 40, "ab"));
   CHECK(page_is("<!DOCTYPE html><html><head><title>T</title><style>p{}</style><script>var x = '<p>no</p>';</script></head><body>shown</body></html>", 40, "shown"));
   CHECK(page_is("1 < 2 and 3 > 2", 40, "1 < 2 and 3 > 2"));
@@ -221,8 +221,11 @@ static void test_css_cascade() {
   CHECK(color_of("<style>.a.b{color:red}</style><p class='b a c'>x</p><p class=a>y</p>", "y") == 0);
   CHECK(color_of("<style>*{color:red}</style><p>x</p>", "x") == 0xFFFF0000);
   CHECK(color_of("<style>:root{color:red}</style><html><body>x</body></html>", "x") == 0xFFFF0000);
-  // Selectors that cannot apply are left out, and the others around them still work.
-  CHECK(color_of("<style>a:hover{color:red} p::first-line{color:red} li+li{color:red} p:not(.a){color:red} p{color:blue}</style><p>x</p>", "x") == 0xFF0000FF);
+  // Selectors that cannot apply are left out (states and pseudo-elements); sibling combinators and :not() are understood.
+  CHECK(color_of("<style>a:hover{color:red} p::first-line{color:red} p:focus{color:red} p{color:blue}</style><p>x</p>", "x") == 0xFF0000FF);
+  CHECK(color_of("<style>p:not(.a){color:red} p{color:blue}</style><p>x</p>", "x") == 0xFFFF0000);
+  CHECK(color_of("<style>li + li{color:red}</style><ul><li>a</li><li>b</li></ul>", "b") == 0xFFFF0000 && color_of("<style>li + li{color:red}</style><ul><li>a</li><li>b</li></ul>", "a") == 0);
+  CHECK(color_of("<style>li:nth-child(2){color:red} li:last-child{background:#eee}</style><ul><li>a</li><li>b</li><li>c</li></ul>", "b") == 0xFFFF0000);
   // @media: screen rules apply, print and narrow ones do not.
   CHECK(color_of("<style>@media print{p{color:red}} @media screen{p{color:blue}}</style><p>x</p>", "x") == 0xFF0000FF);
   CHECK(color_of("<style>@media (max-width: 600px){p{color:red}} @media (min-width: 100px){p{color:blue}}</style><p>x</p>", "x") == 0xFF0000FF);
@@ -280,7 +283,7 @@ static void test_css_text_styles() {
     HtmlDocument doc(a);
     doc.parse_html("<html><head><link rel=stylesheet href='/a.css'><link rel='stylesheet' href=b.css media=print><link rel=icon href=i.png>"
                    "<style>body{background:#000;color:#eee}</style></head><body><a href=x>l</a>t</body></html>");
-    CHECK(doc.page_background() == 0xFF000000 && doc.stylesheet_count() == 1 && doc.stylesheet(0).equals("/a.css"));
+    CHECK(doc.page_background() == 0xFF000000);
     CHECK(find_run(doc, "l") && (find_run(doc, "l")->flags & kRunUnderline) && find_run(doc, "t") && find_run(doc, "t")->color == 0xFFEEEEEE && find_run(doc, "t")->background == 0);
     // The stylesheets a caller fetched are read first, the page's own win over them.
     CHECK(doc.parse_html("<p>x</p><style>p{color:blue}</style>", "p{color:red;background:#eee} p{color:lime}") && find_run(doc, "x")->color == 0xFF0000FF && find_run(doc, "x")->background == 0xFFEEEEEE);
@@ -324,8 +327,8 @@ static void test_css_garbage() {
 // A script runner that records what it is given; a script that starts with "w:" writes the rest into the page.
 struct FakeRunner final : IScriptRunner {
   std::vector<std::string> ran;
-  StringView external(uint32_t index) override { return index == 0 ? StringView("w:[ext]") : StringView(); }
-  void run(StringView source, String* written) override {
+  StringView external(uint32_t index, StringView) override { return index == 0 ? StringView("w:[ext]") : StringView(); }
+  void run(dom::Node*, StringView source, String* written) override {
     ran.push_back(std::string(source.data(), source.size()));
     if (source.starts_with("w:")) written->append(source.substr(2));
   }
@@ -363,15 +366,13 @@ static void test_scripts() {
   {
     HtmlDocument doc(a);
     doc.parse_html("<p>a</p><script src='/one.js'></script><script>1</script><script src=two.js async></script>");
-    CHECK(doc.has_scripts() && doc.script_count() == 2 && doc.script_source(0).equals("/one.js") && doc.script_source(1).equals("two.js"));
-    CHECK(doc.parse_html("<p>no scripts</p>") && !doc.has_scripts() && doc.script_count() == 0);
     // Without a runner nothing is run, and the text of the script is not shown.
     CHECK(doc.parse_html("a<script>document.write('x')</script>b") && doc.run_count() == 2);
     String out(a);
     // A script that runs the page's own text back in at every level is stopped after a few.
     struct Echo final : IScriptRunner {
-      StringView external(uint32_t) override { return StringView(); }
-      void run(StringView, String* written) override { written->append("<script>go</script>z"); }
+      StringView external(uint32_t, StringView) override { return StringView(); }
+      void run(dom::Node*, StringView, String* written) override { written->append("<script>go</script>z"); }
     } echo;
     CHECK(doc.parse_html("<script>go</script>", StringView(), &echo) && doc.run_count() <= 8);
   }

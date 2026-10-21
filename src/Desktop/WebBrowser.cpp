@@ -38,99 +38,6 @@ struct WebBrowser::Fetched {
   uint32_t status = 0;
 };
 
-// The scripts of one page: runs them in an engine of its own (created when the first one comes), collects what they write and print, and reports.
-class PageScripts final : public browser::IScriptRunner, public script::IHost {
- public:
-  static constexpr uint32_t kMaxRuns = 60;
-  static constexpr uint64_t kMaxLog = 16 * 1024;
-
-  PageScripts(WebBrowser& owner, allocators::IAllocator& allocator, StringView address, StringView title, List<String>&& externals)
-      : owner_(owner), allocator_(allocator), address_(allocator), title_(allocator), written_(allocator), log_(allocator), first_error_(allocator), externals_(allocator) {
-    address_.assign(address);
-    title_.assign(title);
-    for (uint64_t i = 0; i < externals.count(); ++i) externals_.push_back(util::move(externals[i]));
-  }
-
-  // browser::IScriptRunner
-  StringView external(uint32_t index) override { return index < externals_.count() ? externals_[index].view() : StringView(); }
-  void run(StringView source, String* written) override {
-    if (runs_ >= kMaxRuns) return;
-    ++runs_;
-    if (!start()) return;
-    written_.clear();
-    String error(allocator_);
-    if (!engine_->run(source, &error, nullptr)) note_error(error.view());
-    written->append(written_.view());
-    written_.clear();
-  }
-
-  // After the page is read: the load events and the timers.
-  void finish() {
-    if (!engine_) return;
-    String error(allocator_);
-    uint32_t failed = engine_->fire_event("DOMContentLoaded", &error);
-    failed += engine_->run_timers(100, &error);
-    failed += engine_->fire_event("load", &error);
-    failed += engine_->run_timers(100, &error);
-    for (uint32_t i = 0; i < failed; ++i) note_error(i == 0 ? error.view() : StringView("Error"));
-    written_.clear();   // (anything written now has nowhere to go)
-  }
-
-  uint32_t errors() const { return errors_; }
-  StringView first_error() const { return first_error_.view(); }
-  StringView log() const { return log_.view(); }
-  bool title_changed() const { return title_changed_; }
-  StringView title() const { return title_.view(); }
-
-  // script::IHost
-  void console(int level, StringView text) override {
-    if (log_.size() < kMaxLog) {
-      if (level == 2) log_.append("warning: ");
-      if (level == 3) log_.append("error: ");
-      log_.append(text);
-      log_.push_back('\n');
-    }
-  }
-  void alert(StringView text) override { owner_.notify(gui::NoticeKind::Information, text); }
-  void document_write(StringView text, bool newline) override {
-    written_.append(text);
-    if (newline) written_.push_back('\n');
-  }
-  uint64_t now_ms() override { return owner_.unix_clock_ ? owner_.unix_clock_(owner_.unix_clock_context_) : 0; }
-  StringView location() override { return address_.view(); }
-  StringView title() override { return title_.view(); }
-  void set_title(StringView title) override {
-    title_.assign(title);
-    title_changed_ = true;
-  }
-  StringView user_agent() override { return "Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)"; }
-
- private:
-  bool start() {
-    if (!engine_) {
-      engine_ = UniquePointer<script::Engine>::make(allocator_, allocator_, this);
-      if (engine_) engine_->set_limits(8000000, 48u << 20);
-    }
-    return engine_ && engine_->ok();
-  }
-  void note_error(StringView text) {
-    if (errors_++ == 0) first_error_.assign(text);
-    if (log_.size() < kMaxLog) {
-      log_.append("script error: ");
-      log_.append(text);
-      log_.push_back('\n');
-    }
-  }
-
-  WebBrowser& owner_;
-  allocators::IAllocator& allocator_;
-  String address_, title_, written_, log_, first_error_;
-  List<String> externals_;
-  UniquePointer<script::Engine> engine_;
-  uint32_t runs_ = 0, errors_ = 0;
-  bool title_changed_ = false;
-};
-
 namespace {
 
 const char kWelcome[] =
@@ -142,7 +49,7 @@ const char kWelcome[] =
     "<h2>Keys</h2>"
     "<ul><li>Ctrl+L: go to the address box</li><li>Alt+Left, Alt+Right: back and forward</li><li>F5 or Ctrl+R: reload</li>"
     "<li>Ctrl+O: open a file</li><li>Space, Page Up, Page Down: scroll</li></ul>"
-    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them. It does not show pictures or run scripts.</p>"
+    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them. It does not show pictures.</p>"
     "<p>A place to start: <a href=\"http://example.com/\">http://example.com/</a></p>"
     "</body></html>";
 
@@ -194,6 +101,8 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       address_(allocator),
       status_(allocator),
       page_(allocator),
+      env_(*this, allocator),
+      defer_go_(allocator),
       script_log_(allocator),
       history_(allocator),
       current_(allocator),
@@ -210,6 +119,11 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
     file->add_item("Open File...", {&WebBrowser::on_open, this}, "Ctrl+O");
     file->add_separator();
     file->add_item("Close", {&WebBrowser::on_close, this});
+  }
+  if (Menu* view = menu_.add_menu("View")) {
+    scripts_item_ = view->add_item("Run Scripts", {&WebBrowser::on_toggle_scripts, this});
+    dark_item_ = view->add_item("Dark Colors", {&WebBrowser::on_toggle_dark, this});
+    if (scripts_item_) scripts_item_->set_checked(scripts_enabled_);
   }
   if (Menu* go = menu_.add_menu("Go")) {
     go->add_item("Back", {&WebBrowser::on_back, this}, "Alt+Left");
@@ -253,6 +167,11 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   page_.set_dock(DockStyle::Fill);
   page_.on_link_clicked(Handler::immediate(&WebBrowser::on_link, this));
   page_.on_hover_changed(Handler::immediate(&WebBrowser::on_hover, this));
+  node_handler_ = {&WebBrowser::on_node_click, this};
+  resize_handler_ = {&WebBrowser::on_view_resized, this};
+  timer_handler_ = {&WebBrowser::on_timers, this};
+  page_.on_node_clicked(node_handler_);
+  page_.on_resized(resize_handler_);
 
   add(&menu_);
   add(&toolbar_);
@@ -542,62 +461,25 @@ void WebBrowser::show(Fetched& page) {
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
+  live_.reset();   // (the old page and its scripts go before the new one comes)
   {
     UiGuard lock(this);
     script_log_.clear();
     script_errors_ = 0;
+    reported_errors_ = 0;
+    defer_reload_ = want_go_ = false;
+    defer_history_ = 0;
+    defer_scroll_ = -1;
+    next_due_ms_ = 0;
   }
   bool ok = true;
-  uint32_t script_errors = 0;
-  bool have_script_title = false;
-  String first_script_error(allocator()), script_title(allocator());
   if (is_html(page.type.view(), page.address.view(), body)) {
-    ok = doc->parse_html(body);
-    const bool run_scripts = ok && scripts_enabled_ && doc->has_scripts();
-    if (ok && (doc->stylesheet_count() > 0 || run_scripts)) {   // it links to stylesheets or has scripts: fetch what it needs and read the page again
-      String css(allocator());
-      if (doc->stylesheet_count() > 0) say("Loading styles...");
-      for (uint32_t i = 0; i < doc->stylesheet_count() && i < kMaxStyleSheets; ++i) {
-        String target(allocator());
-        if (!browser::resolve_reference(allocator(), page.address.view(), doc->stylesheet(i), &target)) continue;
-        Fetched sheet(allocator());
-        sheet.address.assign(target.view());
-        if (fetch(target.view(), &sheet) && sheet.status < 400 && sheet.body.size() <= kMaxStyleSheetBytes) {
-          css.append(StringView(sheet.body.view()));
-          css.push_back('\n');
-        }
-      }
-      if (run_scripts) {
-        List<String> externals(allocator());
-        if (doc->script_count() > 0) say("Loading scripts...");
-        for (uint32_t i = 0; i < doc->script_count() && i < kMaxExternalScripts; ++i) {
-          String text(allocator());
-          String target(allocator());
-          if (browser::resolve_reference(allocator(), page.address.view(), doc->script_source(i), &target)) {
-            Fetched file(allocator());
-            file.address.assign(target.view());
-            if (fetch(target.view(), &file) && file.status < 400 && file.body.size() <= kMaxScriptBytes) text.assign(StringView(file.body.view()));
-          }
-          externals.push_back(util::move(text));
-        }
-        String first_title(allocator());
-        first_title.assign(doc->title());
-        say("Running scripts...");
-        PageScripts scripts(*this, allocator(), page.address.view(), first_title.view(), util::move(externals));
-        ok = doc->parse_html(body, css.view(), &scripts);
-        scripts.finish();
-        script_errors = scripts.errors();
-        first_script_error.assign(scripts.first_error());
-        {
-          UiGuard lock(this);
-          script_log_.assign(scripts.log());
-          script_errors_ = scripts.errors();
-        }
-        if (scripts.title_changed()) script_title.assign(scripts.title());
-        have_script_title = scripts.title_changed();
-      } else if (!css.empty()) {
-        ok = doc->parse_html(body, css.view());
-      }
+    media_ = current_media();
+    live_ = UniquePointer<browser::Page>::make(allocator(), allocator(), env_, page.address.view(), media_, scripts_enabled_);
+    if (!live_) ok = false;
+    else {
+      say(scripts_enabled_ ? "Reading the page and running its scripts..." : "Reading the page...");
+      ok = live_->load(body) && live_->render(doc.get());
     }
   } else if (is_text(page.type.view(), body)) {
     ok = doc->parse_text(body);
@@ -609,34 +491,228 @@ void WebBrowser::show(Fetched& page) {
     ok = doc->parse_text(text.view());
   }
   if (!ok) {
+    live_.reset();
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
+  present(util::move(doc), false, page.status);
+  settle();
+}
+
+// Puts a drawn page on the screen, with its title and the state of its scripts in the status bar.
+void WebBrowser::present(UniquePointer<browser::HtmlDocument> doc, bool keep_scroll, uint32_t http_status) {
   String page_title(allocator());
-  page_title.assign(have_script_title && !script_title.empty() ? script_title.view() : doc->title());
+  page_title.assign(live_ && !live_->page_title().empty() ? live_->page_title() : doc->title());
   const bool cut = doc->truncated();
-  page_.set_document(util::move(doc));
+  page_.set_document(util::move(doc), keep_scroll);
+  int32_t scroll = defer_scroll_;
+  defer_scroll_ = -1;
+  if (live_) {
+    const int32_t asked = live_->take_scroll_request();
+    if (asked >= 0) scroll = asked;
+  }
+  if (scroll >= 0) page_.scroll_to_line(static_cast<uint32_t>(scroll));
+  uint32_t errors = 0;
+  String first_error(allocator());
   {
     UiGuard lock(this);
+    if (live_) {
+      script_log_.assign(live_->log());
+      script_errors_ = errors = live_->errors();
+      first_error.assign(live_->first_error());
+    }
     address_.set_text(current_.view());
     update_buttons();
     update_title(page_title.view());
   }
+  if (keep_scroll && errors == reported_errors_) return;   // (drawn again: the status bar keeps what it said, unless there is news)
+  reported_errors_ = errors;
   String message(allocator());
-  if (page.status >= 400) {
+  if (http_status >= 400) {
     message.append("HTTP ");
-    message.append_uint(page.status);
+    message.append_uint(http_status);
     message.append(": ");
   }
   message.append(cut ? "Done (the page is cut off)." : "Done.");
-  if (script_errors > 0) {
+  if (errors > 0) {
     message.truncate(message.size() - 1);
     message.append(" - ");
-    message.append_uint(script_errors);
-    message.append(script_errors == 1 ? " script error: " : " script errors; first: ");
-    message.append(first_script_error.view());
+    message.append_uint(errors);
+    message.append(errors == 1 ? " script error: " : " script errors; first: ");
+    message.append(first_error.view());
   }
   say(message.view());
+}
+
+// Draws the loaded page again (its tree changed, or the display did).
+void WebBrowser::refresh(bool keep_scroll) {
+  if (!live_) return;
+  UniquePointer<browser::HtmlDocument> doc = UniquePointer<browser::HtmlDocument>::make(allocator(), allocator());
+  if (!doc || !live_->render(doc.get())) {
+    notify(NoticeKind::Error, "Out of memory.");
+    return;
+  }
+  present(util::move(doc), keep_scroll, 0);
+}
+
+// After the page ran something (a click, a timer, a new window size): do what it asked of the browser, then draw it again if it changed.
+void WebBrowser::settle() {
+  if (want_go_) {
+    String target(allocator());
+    target.assign(defer_go_.view());
+    want_go_ = false;
+    post(Request::Go, target.view());
+    return;
+  }
+  if (defer_reload_) {
+    defer_reload_ = false;
+    post(Request::Reload, StringView());
+    return;
+  }
+  if (defer_history_ != 0) {
+    const int32_t delta = defer_history_;
+    defer_history_ = 0;
+    if (delta < 0) go_back();
+    else go_forward();
+    return;
+  }
+  if (!live_) return;
+  if (live_->changed() || defer_scroll_ >= 0) refresh(true);
+  else if (live_->errors() != reported_errors_) {
+    UiGuard lock(this);
+    script_log_.assign(live_->log());
+    script_errors_ = live_->errors();
+  }
+  schedule_timers();
+}
+
+void WebBrowser::schedule_timers() {
+  double due = 0;
+  const bool any = live_ && live_->next_timer(&due);
+  __atomic_store_n(&next_due_ms_, any ? static_cast<uint64_t>(due < 1 ? 1 : due) : 0, __ATOMIC_RELEASE);
+}
+
+browser::MediaEnvironment WebBrowser::current_media() {
+  browser::MediaEnvironment m;
+  UiGuard lock(&page_);
+  if (page_.columns() > 0) {
+    m.width = static_cast<int32_t>(page_.columns()) * Painter::kGlyphWidth;
+    m.height = static_cast<int32_t>(page_.visible_lines()) * PageView::kLineHeight;
+  }
+  m.dark = dark_;
+  m.scripting = scripts_enabled_;
+  return m;
+}
+
+uint64_t WebBrowser::page_clock_ms() {
+  const uint64_t up = __atomic_load_n(&uptime_ms_, __ATOMIC_ACQUIRE);
+  if (!unix_clock_) return up + 1;
+  if (!clock_based_) {
+    clock_base_unix_ = unix_clock_(unix_clock_context_);
+    clock_base_up_ = up;
+    clock_based_ = true;
+  }
+  return clock_base_unix_ + (up - clock_base_up_);
+}
+
+void WebBrowser::tick(uint64_t uptime_us) {
+  __atomic_store_n(&uptime_ms_, uptime_us / 1000, __ATOMIC_RELEASE);
+  const uint64_t due = __atomic_load_n(&next_due_ms_, __ATOMIC_ACQUIRE);
+  if (due == 0 || page_clock_ms() < due || __atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) return;
+  fire(timer_handler_);
+}
+
+void WebBrowser::on_timers(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  __atomic_store_n(&b->timer_pending_, false, __ATOMIC_RELEASE);
+  if (!b->live_) return;
+  b->live_->run_due_timers(static_cast<double>(b->page_clock_ms()));
+  b->settle();
+}
+
+void WebBrowser::on_node_click(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->live_) return;
+  b->live_->click(b->page_.clicked_node(), b->page_.clicked_x(), b->page_.clicked_y());
+  b->settle();
+}
+
+// The window changed size (or the colour scheme was switched): the page is told the new viewport.
+void WebBrowser::on_view_resized(void* self, Control&) { static_cast<WebBrowser*>(self)->update_media(); }
+
+void WebBrowser::update_media() {
+  const browser::MediaEnvironment m = current_media();
+  if (m == media_ || !live_) {
+    media_ = m;
+    return;
+  }
+  media_ = m;
+  live_->set_media(m);
+  settle();
+}
+
+void WebBrowser::set_scripts_enabled(bool enabled) {
+  scripts_enabled_ = enabled;
+  if (scripts_item_) scripts_item_->set_checked(enabled);
+}
+
+void WebBrowser::set_dark(bool dark) {
+  dark_ = dark;
+  if (dark_item_) dark_item_->set_checked(dark);
+  fire(resize_handler_);
+}
+
+void WebBrowser::on_toggle_scripts(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  b->set_scripts_enabled(!b->scripts_enabled_);
+  b->reload();
+}
+
+void WebBrowser::on_toggle_dark(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  b->set_dark(!b->dark_);
+}
+
+// --- What a page asks of the window ------------------------------------------------------------------
+
+bool WebBrowser::Env::fetch_text(StringView address, uint64_t limit, String* text) {
+  Fetched f(owner_.allocator());
+  f.address.assign(address);
+  if (!owner_.fetch(address, &f) || f.status >= 400 || f.body.size() > limit) return false;
+  return text->assign(StringView(f.body.view()));
+}
+
+void WebBrowser::Env::navigate(StringView address, bool) {
+  owner_.defer_go_.assign(address);
+  owner_.want_go_ = true;
+}
+
+void WebBrowser::Env::set_hash(StringView hash) { owner_.apply_hash(hash); }
+void WebBrowser::Env::reload() { owner_.defer_reload_ = true; }
+void WebBrowser::Env::history_go(int32_t delta) { owner_.defer_history_ += delta; }
+uint32_t WebBrowser::Env::history_length() { return static_cast<uint32_t>(owner_.history_.count()); }
+
+void WebBrowser::Env::push_state(StringView address, bool replace) {
+  UiGuard lock(&owner_);
+  owner_.remember(replace ? Request::Reload : Request::Go, address);
+  owner_.address_.set_text(owner_.current_.view());
+  owner_.update_buttons();
+}
+
+void WebBrowser::Env::alert(StringView text) { owner_.notify(NoticeKind::Information, text); }
+void WebBrowser::Env::scroll_to(int32_t line) { owner_.defer_scroll_ = line; }
+uint64_t WebBrowser::Env::now_ms() { return owner_.page_clock_ms(); }
+
+// Following a link to "#something" on the page shown: the address changes, the history entry too; "#" and "#top" scroll to the top.
+void WebBrowser::apply_hash(StringView hash) {
+  UiGuard lock(this);
+  String address(allocator());
+  const uint64_t at = current_.view().find('#');
+  address.assign(at == StringView::npos ? current_.view() : current_.view().first(at));
+  if (hash.size() > 1) address.append(hash);
+  remember(Request::Reload, address.view());
+  address_.set_text(current_.view());
+  if (hash.size() <= 1 || hash.equals_ignore_case("#top")) defer_scroll_ = 0;
 }
 
 // --- Keys -------------------------------------------------------------------------------------------

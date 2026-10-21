@@ -34,12 +34,13 @@ PageView::PageView(allocators::IAllocator& allocator)
   add(&scroll_bar_);
 }
 
-void PageView::set_document(UniquePointer<browser::HtmlDocument> document) {
+void PageView::set_document(UniquePointer<browser::HtmlDocument> document, bool keep_scroll) {
   UiGuard lock(this);
   document_ = util::move(document);
   stale_ = true;
-  top_ = 0;
+  if (!keep_scroll) top_ = 0;
   hover_ = press_link_ = -1;
+  press_node_ = 0;
   hovered_link_.clear();
   measure();
   sync_scroll_bar();
@@ -69,6 +70,11 @@ void PageView::sync_scroll_bar() {
 void PageView::layout() {
   measure();
   sync_scroll_bar();
+  if (layout_.columns() != notified_columns_ || rows_ != notified_rows_) {
+    notified_columns_ = layout_.columns();
+    notified_rows_ = rows_;
+    fire(resize_handler_);
+  }
   const int32_t thick = ScrollBar::kThickness;
   scroll_bar_.set_bounds({static_cast<int32_t>(bounds_.width) - thick, 0, static_cast<uint32_t>(thick), bounds_.height});
   Control::layout();
@@ -115,6 +121,13 @@ int32_t PageView::link_index_at(int32_t x, int32_t y) const {
   return layout_.link_at(*document_, line, column);
 }
 
+uint32_t PageView::node_at(int32_t x, int32_t y) const {
+  uint32_t line, column;
+  if (!document_ || !locate(x, y, &line, &column)) return 0;
+  const int64_t piece = layout_.piece_at(line, column);
+  return piece < 0 ? 0 : document_->run(layout_.piece(static_cast<uint32_t>(piece)).run).node;
+}
+
 bool PageView::link_at(int32_t x, int32_t y, String* target) const {
   UiGuard lock(this);
   const int32_t link = link_index_at(x, y);
@@ -133,6 +146,7 @@ void PageView::set_hover(int32_t link) {
 void PageView::on_mouse_down(const MouseArgs& args) {
   UiGuard lock(this);
   press_link_ = args.button == MouseButton::Left ? link_index_at(args.x, args.y) : -1;
+  press_node_ = args.button == MouseButton::Left && node_handler_.function ? node_at(args.x, args.y) : 0;
 }
 
 void PageView::on_mouse_move(const MouseArgs& args) {
@@ -143,7 +157,16 @@ void PageView::on_mouse_move(const MouseArgs& args) {
 void PageView::on_mouse_up(const MouseArgs& args) {
   UiGuard lock(this);
   const int32_t pressed = press_link_;
+  const uint32_t pressed_node = press_node_;
   press_link_ = -1;
+  press_node_ = 0;
+  if (pressed_node != 0 && args.button == MouseButton::Left && node_at(args.x, args.y) == pressed_node) {
+    clicked_node_ = pressed_node;
+    clicked_x_ = args.x - kMargin;
+    clicked_y_ = args.y + static_cast<int32_t>(top_) * kLineHeight;
+    fire(node_handler_);
+    return;
+  }
   if (pressed < 0 || args.button != MouseButton::Left || link_index_at(args.x, args.y) != pressed || !document_) return;
   clicked_link_.assign(document_->link(static_cast<uint32_t>(pressed)));
   fire(link_handler_);

@@ -112,7 +112,7 @@ void Vm::recover() {
     has_exception_ = false;
     exception_ = Value();
     gc_wanted_ = true;
-    if (native_depth_ == 0) collect();
+    if (native_depth_ == 0 && gc_hold_ == 0) collect();
   }
 }
 
@@ -299,6 +299,14 @@ Env* Vm::new_env(uint32_t slots, Env* parent) {
   for (uint32_t i = 0; i < slots; ++i) new (&s[i]) Value();
   link(e, size);
   return e;
+}
+
+JsObject* Vm::new_host_object(JsObject* proto, const HostClass* host, void* data) {
+  JsObject* o = new_object(proto);
+  if (o == sentinel_) return o;
+  o->host = host;
+  o->host_data = data;
+  return o;
 }
 
 JsObject* Vm::new_error(ErrorKind kind, StringView message) {
@@ -574,6 +582,7 @@ bool Vm::array_set_length(JsObject* a, uint32_t length) {
 }
 
 bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
+  if (o->host && o->host->get && o->host->get(*this, o, key, out)) return true;
   if (o->okind == ObjKind::Array) {
     if (key == length_) {
       *out = Value::make_number(o->length);
@@ -611,6 +620,13 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     }
   }
   return false;
+}
+
+bool Vm::get_plain(JsObject* o, JsString* key, Value* out) {
+  const int64_t at = find_prop(o, key);
+  if (at < 0) return false;
+  *out = o->props[at].value;
+  return true;
 }
 
 bool Vm::has_property(JsObject* o, JsString* key) {
@@ -726,6 +742,11 @@ bool Vm::put(const Value& base, JsString* key, const Value& value) {
   }
   if (!base.is_object()) return true;   // (a property of a primitive is lost, as in sloppy mode)
   JsObject* o = base.as_object();
+  if (o->host && o->host->set) {
+    const HostClass::Set r = o->host->set(*this, o, key, value);
+    if (r == HostClass::Set::Threw) return false;
+    if (r == HostClass::Set::Handled) return true;
+  }
   if (o->frozen) return true;
   const int64_t at = find_prop(o, key);
   if (at >= 0) {
@@ -763,6 +784,10 @@ bool Vm::put_member(const Value& base, const Value& key, const Value& value) {
 }
 
 bool Vm::delete_property(JsObject* o, JsString* key) {
+  if (o->host && o->host->remove) {
+    bool deleted = true;
+    if (o->host->remove(*this, o, key, &deleted)) return deleted;
+  }
   if (o->frozen) return false;
   if (o->okind == ObjKind::Array) {
     uint32_t i;
@@ -796,6 +821,7 @@ JsObject* Vm::own_keys(JsObject* o) {
       array_push(keys, Value::make_string(new_string(StringView(text, static_cast<uint64_t>(length)))));
     }
   }
+  if (o->host && o->host->keys) o->host->keys(*this, o, keys);
   for (uint32_t i = 0; i < o->prop_count; ++i)
     if (o->props[i].flags & kEnumerable) array_push(keys, Value::make_string(o->props[i].key));
   return keys;
@@ -1484,7 +1510,7 @@ reload:
       halt("the script ran too long");
       continue;
     }
-    if (gc_wanted_ && native_depth_ == 0) {
+    if (gc_wanted_ && native_depth_ == 0 && gc_hold_ == 0) {
       fp->pc = pc;
       collect();
     }
@@ -1548,6 +1574,11 @@ reload:
       }
       case Opc::SetGlobal: {
         JsString* name = code->constants[static_cast<uint32_t>(in.a)].as_string();
+        if (global_->host && global_->host->set) {
+          const HostClass::Set r = global_->host->set(*this, global_, name, stack_[sp_ - 1]);
+          if (r == HostClass::Set::Threw) THROW_PENDING();
+          if (r == HostClass::Set::Handled) break;
+        }
         define(global_, name, stack_[sp_ - 1], kDefaultFlags);
         break;
       }
@@ -1844,6 +1875,34 @@ reload:
 #undef THROW_PENDING
 #undef CHECK
 #undef PUSH
+}
+
+double Vm::add_timer(const Value& function, double delay_ms, double interval_ms, const Value* args, uint32_t argc) {
+  Value list;
+  if (!get_named(Value::make_object(global()), "__timers", &list) || !list.is_object()) return 0;
+  Value counter;
+  get_named(Value::make_object(global()), "__timer_id", &counter);
+  const double id = (counter.is_number() ? counter.u.number : 0) + 1;
+  define_named(global(), "__timer_id", Value::make_number(id), kWritable);
+  if (delay_ms != delay_ms || delay_ms < 0) delay_ms = 0;
+  if (interval_ms == interval_ms && interval_ms >= 0 && interval_ms < 1) interval_ms = 1;
+  JsObject* entry = new_array(4 + argc);
+  array_push(entry, function);
+  array_push(entry, Value::make_number(clock_ms() + (delay_ms < 1 && interval_ms >= 0 ? 1 : delay_ms)));
+  array_push(entry, Value::make_number(id));
+  array_push(entry, Value::make_number(interval_ms == interval_ms ? interval_ms : -1));
+  for (uint32_t i = 0; i < argc; ++i) array_push(entry, args[i]);
+  array_push(list.as_object(), Value::make_object(entry));
+  return id;
+}
+
+void Vm::clear_timer(double id) {
+  Value list;
+  if (!get_named(Value::make_object(global()), "__timers", &list) || !list.is_object()) return;
+  JsObject* l = list.as_object();
+  for (uint32_t i = 0; i < l->length; ++i) {
+    if (l->items[i].is_object() && l->items[i].as_object()->length >= 3 && l->items[i].as_object()->items[2].is_number() && l->items[i].as_object()->items[2].u.number == id) l->items[i] = Value();
+  }
 }
 
 }  // namespace script

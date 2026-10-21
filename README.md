@@ -50,13 +50,23 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   tree, `Compiler` turns it into bytecode (variables are resolved to slots of per-call environments, `finally` is compiled in line), `Vm` runs it on a
   stack machine with its own mark-and-sweep heap, an instruction budget and a memory limit, and `Builtins` has Object, Array, String, Number, Math, JSON, Date,
   Error, console and a little of `document`. `Engine` is the interface. Not there: classes, regular expressions, destructuring, generators, async,
-  Map / Set / Promise. Tested by `tests/ScriptTest.cpp` (the language, the built-ins, limits, the collector, damaged and deeply nested programs).
-- **Browser/** the web browser's model, apart from any window: `HtmlDocument` reads HTML into runs of text (headings, paragraphs, lists, tables, links,
-  preformatted text; scripts and styles are dropped; pictures show as their alternative text), `StyleSheet` (`Css.hpp`) reads CSS - selectors, the cascade, `!important`, `@media` - and gives each element a `Style`
-  (colours, bold / underline, hiding, alignment, spacing as blank lines and columns) that the runs carry, `PageLayout` fits them into lines of fixed-width
+  Map / Set / Promise. Timers are real (`setTimeout` / `setInterval` run from the host's clock), and host objects let the browser expose the DOM. Tested by `tests/ScriptTest.cpp` (the language, the built-ins, limits, the collector, damaged and deeply nested programs).
+- **Dom/** the document model: `Dom` (a tree of `Node`s - elements, text, comments, fragments - with attributes, the mutation operations, a version counter and
+  serial numbers), `HtmlBuilder` (an HTML tree builder: implied `html` / `head` / `body`, void and raw-text elements, optional end tags, tables, `document.write`
+  re-fed into the parse, scripts run as they are met), `Entities` (named and numeric character references), and `Selector` (selector lists with combinators,
+  attribute operators, `:not` / `:is` / `:where` / `:has`, `:nth-*`, `:first/last/only-*`, `:empty`, `:root`, `:checked` and so on - shared by CSS and
+  `querySelector`). Tested by `tests/DomTest.cpp`.
+- **Browser/** the web browser's model, apart from any window: `Page` owns a loaded page - its `dom::Document`, its style sheets (`<style>` and linked ones, each
+  gated by its `media`), its script `Engine` with the DOM installed (`DomBindings*.cpp`: nodes, attributes, `classList`, `dataset`, `style`, `innerHTML`,
+  `querySelector`, `getComputedStyle`, events with capture / bubble / `preventDefault` / `once`, `on*` handlers and attributes, timers, `matchMedia` with change
+  events, `location`, `history`, `localStorage`, cookies, `DOMParser`), and what happens after the first drawing: clicks, timers, resizes, colour-scheme
+  changes. `Media` answers media queries (types, `and` / `not` / `only` / commas, level 3 and level 4 range syntax, width, height, orientation, resolution,
+  `prefers-color-scheme`, `hover`, `scripting` ...) for a `MediaEnvironment`; `Renderer` turns a document into `HtmlDocument` runs (headings, paragraphs,
+  lists, tables, links, preformatted text; pictures show as their alternative text), `StyleSheet` (`Css.hpp`) reads CSS - selectors, the cascade, `!important`,
+  `@media` - and gives each element a `Style` (colours, bold / underline, hiding, alignment, spacing as blank lines and columns) that the runs carry, `PageLayout` fits them into lines of fixed-width
   characters, `Url` resolves links (web addresses and files alike), `IPageLoader` is how a page is fetched and `HttpPageLoader` does it with
   `network::HttpClient` over the network stacks (https is checked against the Mozilla root certificates in `certs/ca-bundle.pem`, built into the image by `Network/Tls/CaBundle.S`;
-  a `/certs/ca-bundle.pem` on the system volume is used instead when there is one). The Web Browser application (`Desktop/WebBrowser`, drawing with `Gui/Controls/PageView`) is in the Start menu and is a tab like the
+  a `/certs/ca-bundle.pem` on the system volume is used instead when there is one). `tests/PageTest.cpp` and `tests/BrowserTest.cpp` test the page and its scripts without a window. The Web Browser application (`Desktop/WebBrowser`, drawing with `Gui/Controls/PageView`) is in the Start menu and is a tab like the
   other programs: dragged between windows, torn off, kept by the session (a web address is only shown again on restore, not fetched).
   The desktop keeps its session there too (`Desktop/SessionStore`, tables `session_windows` and `session_tabs`): as the system shuts down
   `Desktop::save_session()` records every program window - place, size, maximized / docked / minimized, stacking order, the tabs of a tabbed window and

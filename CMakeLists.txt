@@ -215,6 +215,18 @@ add_executable(BOOTX64
   src/Database/DatabaseManager.cpp
   src/Browser/HtmlDocument.cpp
   src/Browser/Css.cpp
+  src/Browser/Media.cpp
+  src/Browser/Renderer.cpp
+  src/Browser/Page.cpp
+  src/Browser/DomBindings.cpp
+  src/Browser/DomBindingsNode.cpp
+  src/Browser/DomBindingsEvents.cpp
+  src/Browser/DomBindingsStyle.cpp
+  src/Browser/DomBindingsWindow.cpp
+  src/Dom/Dom.cpp
+  src/Dom/Selector.cpp
+  src/Dom/Entities.cpp
+  src/Dom/HtmlBuilder.cpp
   src/Script/Number.cpp
   src/Script/Parser.cpp
   src/Script/Compiler.cpp

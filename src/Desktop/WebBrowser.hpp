@@ -16,21 +16,22 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The web browser: a window with a menu bar (File: Open File, Close; Go: Back, Forward, Reload), a bar with the Back, Forward and Reload buttons, the
-// address box and Go, the page, and a status bar that says what is happening (and where the link under the pointer leads). It shows HTML pages (see
-// browser::HtmlDocument and browser::StyleSheet for what is understood - text, headings, lists, tables, links, and the CSS that colours, spaces and
-// aligns them, from <style>, style attributes and linked stylesheets, and the scripts of the page (see script::Engine; they run while the page is read,
-// write into it with document.write, set its title, and print to the script log; there is no DOM to change afterwards); no pictures) and plain text, from the web
-// (http:// and https://, through the page loader the desktop gives it) and from the system's own volumes (a path such as /docs/index.html).
+// The web browser: a window with a menu bar (File: Open File, Close; Go: Back, Forward, Reload; View: Scripts, Dark Colors), a bar with the Back, Forward
+// and Reload buttons, the address box and Go, the page, and a status bar that says what is happening (and where the link under the pointer leads). It
+// shows HTML pages as browser::Page loads them - a document tree (see dom::Document) that scripts can read and change (see browser::DomBindings), styled
+// by CSS from <style>, style attributes and linked stylesheets, with selectors and @media queries answered for the size of the window and the colour
+// scheme, drawn as text, headings, lists, tables and links (no pictures) - and plain text, from the web (http:// and https://, through the page loader the
+// desktop gives it) and from the system's own volumes (a path such as /docs/index.html).
+// A click on the page goes to the page as a click event (and follows a link when no script stops it); timers run from tick(); when a script changes the
+// page, or the window is resized, the page is drawn again where it was scrolled to.
 // Enter in the address box, or Go, opens what is typed; Ctrl+L goes to the address box, Alt+Left and Alt+Right are Back and Forward, F5 and Ctrl+R
-// reload, Ctrl+O opens a file. Clicking a link opens it; a page that links to another by a relative address works in files as it does on the web.
-// A file dragged here from a file explorer is opened.
+// reload, Ctrl+O opens a file. A file dragged here from a file explorer is opened.
 //
 // Pages are fetched on the window's handler thread (without one - in tests - right away), so the desktop stays alive while a server thinks; opening
-// something while a page is still loading replaces the request that has not started yet.
+// something while a page is still loading replaces the request that has not started yet. Everything that touches the loaded page runs on that thread.
 #pragma once
 #include "Browser/IPageLoader.hpp"
-#include "Script/Engine.hpp"
+#include "Browser/Page.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -68,8 +69,15 @@ class WebBrowser : public gui::Frame {
   // Where web pages come from (nullptr: none, web addresses then say so). It must outlive the window.
   void set_page_loader(browser::IPageLoader* loader) { loader_ = loader; }
   void set_clock(UnixClock clock, void* context) { unix_clock_ = clock; unix_clock_context_ = context; }
-  // Whether the scripts of pages are run (on by default).
-  void set_scripts_enabled(bool enabled) { scripts_enabled_ = enabled; }
+  // Whether the scripts of pages are run (on by default); the next page loaded (or Reload) takes it.
+  void set_scripts_enabled(bool enabled);
+  // Whether pages are told the user prefers dark colours (prefers-color-scheme); the page shown follows right away.
+  void set_dark(bool dark);
+  bool dark() const { return dark_; }
+  // Called by the desktop's loop with the uptime: runs the timers of the page that are due (on the handler thread).
+  void tick(uint64_t uptime_us);
+  // The page loaded now (nullptr for text, and before the first page). Use it only from the handler thread.
+  browser::Page* live_page() { return live_.get(); }
   bool scripts_enabled() const { return scripts_enabled_; }
   // What the scripts of the last page printed (console.log and so on, one line each, errors included) and how many of them failed.
   StringView script_log() const { return script_log_.view(); }
@@ -106,7 +114,32 @@ class WebBrowser : public gui::Frame {
  private:
   enum class Request : uint8_t { None, Go, Back, Forward, Reload };
   struct Fetched;
-  friend class PageScripts;
+
+  // What the page asks of the window.
+  class Env final : public browser::IPageEnvironment {
+   public:
+    Env(WebBrowser& owner, allocators::IAllocator& allocator) : owner_(owner), storage_(allocator), jar_(allocator) {}
+    bool fetch_text(StringView address, uint64_t limit, String* text) override;
+    void navigate(StringView address, bool replace) override;
+    void set_hash(StringView hash) override;
+    void reload() override;
+    void history_go(int32_t delta) override;
+    uint32_t history_length() override;
+    void push_state(StringView address, bool replace) override;
+    void alert(StringView text) override;
+    bool confirm(StringView) override { return false; }
+    void scroll_to(int32_t line) override;
+    uint64_t now_ms() override;
+    void console(int, StringView) override {}
+    browser::StorageArea& local_storage() override { return storage_; }
+    String& cookie() override { return jar_; }
+
+   private:
+    WebBrowser& owner_;
+    browser::StorageArea storage_;
+    String jar_;
+  };
+  friend class Env;
 
   static void on_back(void* self, gui::Control&);
   static void on_forward(void* self, gui::Control&);
@@ -118,6 +151,19 @@ class WebBrowser : public gui::Frame {
   static void on_load(void* self, gui::Control&);
   static void on_link(void* self, gui::Control&);
   static void on_hover(void* self, gui::Control&);
+  static void on_node_click(void* self, gui::Control&);
+  static void on_view_resized(void* self, gui::Control&);
+  static void on_timers(void* self, gui::Control&);
+  static void on_toggle_scripts(void* self, gui::Control&);
+  static void on_toggle_dark(void* self, gui::Control&);
+  void update_media();
+  void settle();                       // after the page ran something: follow what it asked for, draw it again if it changed
+  void refresh(bool keep_scroll);      // draws the loaded page again
+  void present(UniquePointer<browser::HtmlDocument> doc, bool keep_scroll, uint32_t http_status);
+  void schedule_timers();
+  void apply_hash(StringView hash);
+  uint64_t page_clock_ms();
+  browser::MediaEnvironment current_media();
   bool post(Request kind, StringView target);
   void run_request();
   void load(Request kind, StringView target);
@@ -145,7 +191,20 @@ class WebBrowser : public gui::Frame {
   gui::Handler load_handler_;
   UnixClock unix_clock_ = nullptr;
   void* unix_clock_context_ = nullptr;
-  bool scripts_enabled_ = true;
+  bool scripts_enabled_ = true, dark_ = false;
+  gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr;
+  gui::Handler node_handler_, resize_handler_, timer_handler_;
+  Env env_;
+  UniquePointer<browser::Page> live_;
+  browser::MediaEnvironment media_;
+  // what the page asked for while it ran, done when it has returned
+  bool defer_reload_ = false;
+  int32_t defer_history_ = 0, defer_scroll_ = -1;
+  String defer_go_;
+  bool want_go_ = false;
+  uint64_t uptime_ms_ = 0, clock_base_unix_ = 0, clock_base_up_ = 0, next_due_ms_ = 0;
+  bool clock_based_ = false, timer_pending_ = false;
+  uint32_t reported_errors_ = 0;
   uint32_t script_errors_ = 0;
   String script_log_;
   List<String> history_;

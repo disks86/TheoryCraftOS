@@ -506,8 +506,6 @@ void StyleSheet::apply_declarations(StringView text, bool important, Style* styl
 
 void StyleSheet::clear() {
   pool_.clear();
-  tests_.clear();
-  compounds_.clear();
   selectors_.clear();
   declarations_.clear();
   rules_.clear();
@@ -575,20 +573,10 @@ StringView take_block(StringView css, uint64_t* i) {
   return css.substr(start, *i - start);
 }
 
-// Does an @media query apply to a screen of this size and kind?
-bool media_applies(StringView query) {
-  static const char* const kNot[] = {"print", "speech", "max-width", "max-device-width", "max-height", "orientation", "prefers-", "hover: none", "hover:none", "pointer: coarse", "pointer:coarse", "-webkit-min-device-pixel-ratio"};
-  for (const char* n : kNot) {
-    const StringView needle(n);
-    for (uint64_t i = 0; i + needle.size() <= query.size(); ++i)
-      if (query.substr(i, needle.size()).equals_ignore_case(needle)) return false;
-  }
-  return true;
-}
-
 }  // namespace
 
-bool StyleSheet::parse(StringView css) {
+bool StyleSheet::parse(StringView css, const MediaEnvironment& env) {
+  env_ = &env;
   String clean(allocator_);   // without the comments
   for (uint64_t i = 0; i < css.size();) {
     if (css[i] == '/' && i + 1 < css.size() && css[i + 1] == '*') {
@@ -600,7 +588,9 @@ bool StyleSheet::parse(StringView css) {
     }
   }
   uint64_t at = 0;
-  return parse_block(clean.view(), &at, false);
+  const bool ok = parse_block(clean.view(), &at, false);
+  env_ = nullptr;
+  return ok;
 }
 
 bool StyleSheet::parse_block(StringView css, uint64_t* at, bool nested) {
@@ -625,7 +615,8 @@ bool StyleSheet::parse_block(StringView css, uint64_t* at, bool nested) {
         continue;
       }
       const bool container = name.equals_ignore_case("media") || name.equals_ignore_case("supports") || name.equals_ignore_case("layer") || name.equals_ignore_case("document");
-      if (container && (!name.equals_ignore_case("media") || media_applies(prelude))) {
+      const bool applies = !container ? false : name.equals_ignore_case("media") ? media_matches(prelude, *env_) : !prelude.trimmed().starts_with("not");
+      if (applies) {
         ++i;   // (the rules inside are read as if they stood here)
         if (!parse_block(css, &i, true)) return false;
       } else {
@@ -643,20 +634,13 @@ bool StyleSheet::parse_block(StringView css, uint64_t* at, bool nested) {
 
 bool StyleSheet::parse_rule(StringView prelude, StringView body) {
   const uint32_t rule = static_cast<uint32_t>(rules_.count());
-  const uint32_t first_selector = static_cast<uint32_t>(selectors_.count());
   if (!add_declarations(body, rule)) return false;
   if (rules_[rule].declaration_count == 0) {
     rules_.remove_at(rule);
     return true;
   }
-  uint64_t i = 0;
-  while (i <= prelude.size()) {
-    uint64_t start = i;
-    scan_until(prelude, &i, ',', ',');
-    if (!parse_selector(prelude.substr(start, i - start).trimmed(), rule)) return false;
-    ++i;
-  }
-  (void)first_selector;
+  uint32_t added = 0;
+  selectors_.parse(prelude, rule, &added);   // (a selector that is wrong or can never match is left out)
   return true;
 }
 
@@ -679,259 +663,24 @@ bool StyleSheet::add_declarations(StringView body, uint32_t rule) {
   return ok && rules_.push_back(r);
 }
 
-namespace {
-
-// Reads an identifier at *i.
-StringView read_ident(StringView s, uint64_t* i) {
-  const uint64_t start = *i;
-  while (*i < s.size() && is_ident_char(s[*i])) ++*i;
-  return s.substr(start, *i - start);
-}
-
-}  // namespace
-
-// Adds the selector in `text` (one of a list) for `rule`. Selectors that cannot apply here (sibling combinators, pseudo-classes that need the pointer
-// or the future of the page) are skipped without an error.
-bool StyleSheet::parse_selector(StringView text, uint32_t rule) {
-  if (text.empty()) return true;
-  const uint32_t first_compound = static_cast<uint32_t>(compounds_.count());
-  const uint32_t tests_before = static_cast<uint32_t>(tests_.count());
-  uint32_t specificity = 0;
-  Combinator comb = Combinator::None;
-  uint64_t i = 0;
-  const uint64_t n = text.size();
-  bool ok = true, drop = false;
-  while (ok && !drop) {
-    bool space = false;
-    while (i < n && is_space(text[i])) {
-      ++i;
-      space = true;
-    }
-    if (i >= n) break;
-    const char c = text[i];
-    if (c == '>') {
-      if (compounds_.count() == first_compound || comb == Combinator::Child) drop = true;
-      comb = Combinator::Child;
-      ++i;
-      continue;
-    }
-    if (c == '+' || c == '~') {
-      drop = true;
-      break;
-    }
-    if (space && compounds_.count() > first_compound && comb == Combinator::None) comb = Combinator::Descendant;
-    Compound compound;
-    compound.combinator = compounds_.count() == first_compound ? Combinator::None : comb;
-    compound.first_test = static_cast<uint32_t>(tests_.count());
-    compound.test_count = 0;
-    bool any = false;
-    while (i < n && !is_space(text[i]) && text[i] != '>' && text[i] != '+' && text[i] != '~' && ok && !drop) {
-      const char k = text[i];
-      Test t{};
-      bool add = true;
-      if (k == '*') {
-        ++i;
-        add = false;
-      } else if (is_ident_start(k)) {
-        const StringView name = read_ident(text, &i);
-        t.kind = TestKind::Tag;
-        ok = keep(name, &t.name_offset);
-        t.name_length = static_cast<uint32_t>(name.size());
-        specificity += 1;
-      } else if (k == '#' || k == '.') {
-        ++i;
-        const StringView name = read_ident(text, &i);
-        if (name.empty()) drop = true;
-        t.kind = k == '#' ? TestKind::Id : TestKind::Class;
-        ok = ok && keep(name, &t.name_offset);
-        t.name_length = static_cast<uint32_t>(name.size());
-        specificity += k == '#' ? 10000 : 100;
-      } else if (k == '[') {
-        const uint64_t close = text.find(']', i);
-        if (close == StringView::npos) {
-          drop = true;
-          break;
-        }
-        const StringView inside = text.substr(i + 1, close - i - 1);
-        i = close + 1;
-        uint64_t p = 0;
-        while (p < inside.size() && is_space(inside[p])) ++p;
-        const StringView name = read_ident(inside, &p);
-        while (p < inside.size() && is_space(inside[p])) ++p;
-        t.kind = TestKind::Has;
-        StringView value;
-        if (p < inside.size()) {
-          char op = inside[p];
-          if (op == '=') {
-            t.kind = TestKind::Equals;
-            ++p;
-          } else if (p + 1 < inside.size() && inside[p + 1] == '=' && (op == '~' || op == '^' || op == '$' || op == '*')) {
-            t.kind = op == '~' ? TestKind::Includes : op == '^' ? TestKind::Prefix : op == '$' ? TestKind::Suffix : TestKind::Contains;
-            p += 2;
-          } else {
-            drop = true;
-          }
-          while (p < inside.size() && is_space(inside[p])) ++p;
-          if (p < inside.size() && (inside[p] == '"' || inside[p] == '\'')) {
-            const char q = inside[p++];
-            const uint64_t start = p;
-            while (p < inside.size() && inside[p] != q) ++p;
-            value = inside.substr(start, p - start);
-          } else {
-            const uint64_t start = p;
-            while (p < inside.size() && !is_space(inside[p])) ++p;
-            value = inside.substr(start, p - start);
-          }
-        }
-        if (name.empty()) drop = true;
-        ok = ok && keep(name, &t.name_offset) && keep(value, &t.value_offset);
-        t.name_length = static_cast<uint32_t>(name.size());
-        t.value_length = static_cast<uint32_t>(value.size());
-        specificity += 100;
-      } else if (k == ':') {
-        ++i;
-        if (i < n && text[i] == ':') {
-          drop = true;   // (a pseudo-element)
-          break;
-        }
-        const StringView name = read_ident(text, &i);
-        if (i < n && text[i] == '(') {
-          drop = true;
-          break;
-        }
-        specificity += 100;
-        if (name.equals_ignore_case("first-child")) {
-          t.kind = TestKind::FirstChild;
-        } else if (name.equals_ignore_case("link") || name.equals_ignore_case("visited") || name.equals_ignore_case("any-link")) {
-          t.kind = TestKind::Link;
-        } else if (name.equals_ignore_case("root")) {
-          t.kind = TestKind::Tag;
-          ok = keep("html", &t.name_offset);
-          t.name_length = 4;
-        } else {
-          drop = true;
-        }
-      } else {
-        drop = true;   // (an escape or something not understood)
-        break;
-      }
-      if (add && !drop && ok) {
-        ok = tests_.push_back(t);
-        ++compound.test_count;
-      }
-      any = true;
-    }
-    if (!any) drop = true;
-    if (compounds_.count() - first_compound >= 32) drop = true;   // (matching recurses once for each: a selector this long is not real)
-    if (!drop && ok) ok = compounds_.push_back(compound);
-    comb = Combinator::None;
-  }
-  if (compounds_.count() == first_compound || comb == Combinator::Child) drop = true;
-  if (!ok || drop) {
-    while (compounds_.count() > first_compound) compounds_.remove_at(compounds_.count() - 1);
-    while (tests_.count() > tests_before) tests_.remove_at(tests_.count() - 1);
-    return ok;
-  }
-  Selector selector;
-  selector.first_compound = first_compound;
-  selector.compound_count = static_cast<uint32_t>(compounds_.count()) - first_compound;
-  selector.specificity = specificity;
-  selector.rule = rule;
-  return selectors_.push_back(selector);
-}
-
-namespace {
-
-bool has_class(StringView classes, StringView name) {
-  uint64_t i = 0;
-  while (i < classes.size()) {
-    while (i < classes.size() && is_space(classes[i])) ++i;
-    const uint64_t start = i;
-    while (i < classes.size() && !is_space(classes[i])) ++i;
-    if (i > start && classes.substr(start, i - start).equals(name)) return true;
-  }
-  return false;
-}
-
-}  // namespace
-
-bool StyleSheet::compound_matches(const Compound& compound, const ElementView& element) const {
-  for (uint32_t k = 0; k < compound.test_count; ++k) {
-    const Test& t = tests_[compound.first_test + k];
-    const StringView name = text(t.name_offset, t.name_length), value = text(t.value_offset, t.value_length);
-    StringView found;
-    switch (t.kind) {
-      case TestKind::Tag:
-        if (!element.tag.equals_ignore_case(name)) return false;
-        break;
-      case TestKind::Id:
-        if (!element.id.equals(name)) return false;
-        break;
-      case TestKind::Class:
-        if (!has_class(element.classes, name)) return false;
-        break;
-      case TestKind::Has:
-        if (!find_attribute(element.attrs, name, &found)) return false;
-        break;
-      case TestKind::Equals:
-        if (!find_attribute(element.attrs, name, &found) || !found.equals(value)) return false;
-        break;
-      case TestKind::Includes:
-        if (!find_attribute(element.attrs, name, &found) || !has_class(found, value)) return false;
-        break;
-      case TestKind::Prefix:
-        if (!find_attribute(element.attrs, name, &found) || value.empty() || !found.starts_with(value)) return false;
-        break;
-      case TestKind::Suffix:
-        if (!find_attribute(element.attrs, name, &found) || value.empty() || !found.ends_with(value)) return false;
-        break;
-      case TestKind::Contains:
-        if (!find_attribute(element.attrs, name, &found) || value.empty() || !found.contains(value)) return false;
-        break;
-      case TestKind::FirstChild:
-        if (element.index != 0) return false;
-        break;
-      case TestKind::Link:
-        if (!element.tag.equals_ignore_case("a") || !find_attribute(element.attrs, "href", &found)) return false;
-        break;
-    }
-  }
-  return true;
-}
-
-// Does compound `k` of the selector (counting from its first) match path[index], and the ones before it match the elements before that?
-bool StyleSheet::matches(const Selector& selector, uint32_t k, const ElementView* path, uint32_t index) const {
-  const Compound& compound = compounds_[selector.first_compound + k];
-  if (!compound_matches(compound, path[index])) return false;
-  if (k == 0) return true;
-  if (compound.combinator == Combinator::Child) return index > 0 && matches(selector, k - 1, path, index - 1);
-  for (uint32_t j = index; j > 0; --j)
-    if (matches(selector, k - 1, path, j - 1)) return true;
-  return false;
-}
-
-void StyleSheet::apply(const ElementView* path, uint32_t depth, StringView inline_style, Style* style) const {
+void StyleSheet::apply(const dom::Node* element, StringView inline_style, Style* style) const {
   uint32_t matched[kMaxMatches];
   uint32_t count = 0;
-  if (depth > 0) {
-    for (uint64_t s = 0; s < selectors_.count() && count < kMaxMatches; ++s) {
-      const Selector& sel = selectors_[s];
-      if (matches(sel, sel.compound_count - 1, path, depth - 1)) {
-        uint32_t k = count++;   // (kept ordered by specificity, then by where it came from)
-        while (k > 0) {
-          const Selector& before = selectors_[matched[k - 1]];
-          if (before.specificity < sel.specificity || (before.specificity == sel.specificity && before.rule <= sel.rule)) break;
-          matched[k] = matched[k - 1];
-          --k;
-        }
-        matched[k] = static_cast<uint32_t>(s);
-      }
+  for (uint32_t s = 0; s < selectors_.count() && count < kMaxMatches; ++s) {
+    if (!selectors_.matches(s, element)) continue;
+    uint32_t k = count++;   // (kept ordered by specificity, then by where it came from)
+    while (k > 0) {
+      const uint32_t before = matched[k - 1];
+      if (selectors_.specificity(before) < selectors_.specificity(s) || (selectors_.specificity(before) == selectors_.specificity(s) && selectors_.tag(before) <= selectors_.tag(s))) break;
+      matched[k] = matched[k - 1];
+      --k;
     }
+    matched[k] = s;
   }
   for (int pass = 0; pass < 2; ++pass) {
     const bool important = pass == 1;
     for (uint32_t m = 0; m < count; ++m) {
-      const Rule& rule = rules_[selectors_[matched[m]].rule];
+      const Rule& rule = rules_[selectors_.tag(matched[m])];
       for (uint32_t d = 0; d < rule.declaration_count; ++d) {
         const Declaration& decl = declarations_[rule.first_declaration + d];
         if (decl.important == important) apply_property(static_cast<Property>(decl.property), text(decl.value_offset, decl.value_length), style);

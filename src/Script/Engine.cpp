@@ -72,7 +72,13 @@ bool Engine::run(StringView source, String* error, String* result) {
   return ok;
 }
 
-bool Engine::run_here(StringView source, String* error, String* result) {
+bool Engine::evaluate(StringView source, String* error, Value* value) {
+  bool ok = false;
+  on_big_stack([&] { ok = run_here(source, error, nullptr, value); });
+  return ok;
+}
+
+bool Engine::run_here(StringView source, String* error, String* result, Value* out_value) {
   if (!vm_.ok()) {
     error->assign("Error: the script engine could not start");
     return false;
@@ -98,6 +104,7 @@ bool Engine::run_here(StringView source, String* error, String* result) {
     sync_document();
     return false;
   }
+  if (out_value) *out_value = value;
   if (result) {
     result->clear();
     vm_.describe(value, result, 0);
@@ -118,42 +125,68 @@ uint32_t Engine::call_guarded(const Value& fn, const Value* args, uint32_t argc,
 
 uint32_t Engine::run_timers(uint32_t max, String* error) {
   uint32_t failed = 0;
-  on_big_stack([&] { failed = run_timers_here(max, error); });
+  on_big_stack([&] { failed = run_timers_here(1e300, true, max, error); });
   return failed;
 }
 
-uint32_t Engine::run_timers_here(uint32_t max, String* error) {
+uint32_t Engine::run_due_timers(double now_ms, uint32_t max, String* error) {
+  uint32_t failed = 0;
+  on_big_stack([&] { failed = run_timers_here(now_ms, false, max, error); });
+  return failed;
+}
+
+bool Engine::next_timer(double* due_ms) {
+  Value list_value;
+  if (!vm_.get_named(Value::make_object(vm_.global()), "__timers", &list_value) || !list_value.is_object()) return false;
+  JsObject* list = list_value.as_object();
+  bool any = false;
+  for (uint32_t i = 0; i < list->length; ++i) {
+    if (!list->items[i].is_object()) continue;
+    JsObject* e = list->items[i].as_object();
+    if (e->length < 4 || !e->items[1].is_number()) continue;
+    if (!any || e->items[1].u.number < *due_ms) *due_ms = e->items[1].u.number;
+    any = true;
+  }
+  return any;
+}
+
+// Runs the timers whose time has come (all of them in order of their time if `ahead`: the clock is then moved forward to each one).
+uint32_t Engine::run_timers_here(double now_ms, bool ahead, uint32_t max, String* error) {
   uint32_t failed = 0;
   Value list_value;
   if (!vm_.get_named(Value::make_object(vm_.global()), "__timers", &list_value) || !list_value.is_object()) return 0;
   JsObject* list = list_value.as_object();
   for (uint32_t n = 0; n < max; ++n) {
-    // the entry that is due first (entries are [function, delay, id, args...]; delay is the time it is due)
     int64_t best = -1;
     double best_due = 0;
-    for (uint32_t i = 0; i < list->length; ++i) {
+    for (uint32_t i = 0; i < list->length; ++i) {   // the entry that is due first
       if (!list->items[i].is_object()) continue;
       JsObject* e = list->items[i].as_object();
-      if (e->length < 3 || !e->items[1].is_number()) continue;
+      if (e->length < 4 || !e->items[1].is_number()) continue;
       if (best < 0 || e->items[1].u.number < best_due) {
         best = i;
         best_due = e->items[1].u.number;
       }
     }
-    if (best < 0) break;
+    if (best < 0 || (!ahead && best_due > now_ms)) break;
     JsObject* entry = list->items[best].as_object();
     const Value fn = entry->items[0];
-    if (best_due > virtual_time_) virtual_time_ = best_due;
-    List<Value> call_args(allocator_);
-    for (uint32_t i = 3; i < entry->length; ++i) call_args.push_back(entry->items[i]);
-    list->items[best] = Value();
-    const uint32_t before = list->length;
-    failed += call_guarded(fn, call_args.count() ? &call_args[0] : nullptr, static_cast<uint32_t>(call_args.count()), error);
-    for (uint32_t i = before; i < list->length; ++i) {   // timers set by the callback are due after it
-      if (list->items[i].is_object() && list->items[i].as_object()->length >= 2 && list->items[i].as_object()->items[1].is_number())
-        list->items[i].as_object()->items[1].u.number += virtual_time_;
+    const double interval = entry->items[3].is_number() ? entry->items[3].u.number : -1;
+    if (ahead) {   // the clock the script sees moves to the time of the timer
+      const double host_now = vm_.clock_ms() - vm_.skew();
+      if (best_due > host_now + vm_.skew()) vm_.set_skew(best_due - host_now);
     }
+    List<Value> call_args(allocator_);
+    for (uint32_t i = 4; i < entry->length; ++i) call_args.push_back(entry->items[i]);
+    if (interval >= 0) entry->items[1] = Value::make_number((ahead ? best_due : now_ms) + interval);   // an interval comes round again
+    else list->items[best] = Value();
+    failed += call_guarded(fn, call_args.count() ? &call_args[0] : nullptr, static_cast<uint32_t>(call_args.count()), error);
   }
+  // forget the timers that have run (the array would otherwise only grow)
+  uint32_t live = 0;
+  for (uint32_t i = 0; i < list->length; ++i)
+    if (list->items[i].is_object()) list->items[live++] = list->items[i];
+  if (live + 32 < list->length) list->length = live;
   sync_document();
   return failed;
 }

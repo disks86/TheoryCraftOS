@@ -35,8 +35,8 @@ class PageView : public Control {
 
   explicit PageView(allocators::IAllocator& allocator);
 
-  // Shows `document` (nullptr: a blank page).
-  void set_document(UniquePointer<browser::HtmlDocument> document);
+  // Shows `document` (nullptr: a blank page). The view goes back to the top unless `keep_scroll` (the same page drawn again).
+  void set_document(UniquePointer<browser::HtmlDocument> document, bool keep_scroll = false);
   const browser::HtmlDocument* document() const { return document_.get(); }
 
   // --- Links
@@ -47,6 +47,16 @@ class PageView : public Control {
   StringView hovered_link() const { return hovered_link_.view(); }
   // Where the link at a point of this control leads (false if there is none there).
   bool link_at(int32_t x, int32_t y, String* target) const;
+
+  // --- Clicks on the page itself
+  // Fires when the pointer is pressed and released on the same piece of text that came from a node of the page (Run::node); clicked_node() is that node's
+  // serial and clicked_x() / clicked_y() are where, in the page (columns * 8, lines * 16). With such a handler, links are followed by whoever handles it.
+  void on_node_clicked(Handler handler) { UiGuard lock(this); node_handler_ = handler; }
+  uint32_t clicked_node() const { return clicked_node_; }
+  int32_t clicked_x() const { return clicked_x_; }
+  int32_t clicked_y() const { return clicked_y_; }
+  // Fires when the number of columns or rows that fit changes (the window was resized), also the first time it is known.
+  void on_resized(Handler handler) { UiGuard lock(this); resize_handler_ = handler; }
 
   // --- View
   uint32_t line_count() const { return layout_.line_count(); }
@@ -74,6 +84,7 @@ class PageView : public Control {
   void sync_scroll_bar();
   bool locate(int32_t x, int32_t y, uint32_t* line, uint32_t* column) const;
   int32_t link_index_at(int32_t x, int32_t y) const;
+  uint32_t node_at(int32_t x, int32_t y) const;
   void set_hover(int32_t link);
   static void scroll_changed(void* self, Control&);
 
@@ -84,7 +95,9 @@ class PageView : public Control {
   bool stale_ = true, syncing_ = false;
   int32_t hover_ = -1, press_link_ = -1;
   String clicked_link_, hovered_link_;
-  Handler link_handler_, hover_handler_;
+  Handler link_handler_, hover_handler_, node_handler_, resize_handler_;
+  uint32_t press_node_ = 0, clicked_node_ = 0, notified_columns_ = 0, notified_rows_ = 0;
+  int32_t clicked_x_ = 0, clicked_y_ = 0;
 };
 
 }  // namespace gui

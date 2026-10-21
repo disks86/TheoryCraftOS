@@ -1,0 +1,151 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// The document tree of a page: a Document with Elements, Text and Comment nodes, built by the HTML reader, changed by scripts, and read by the renderer
+// and by selectors. The model follows the DOM standard in what matters to a page - nodes with a parent, first / last child and previous / next
+// sibling; elements with a lowercase tag name and attributes; text and comments with data; document fragments; the tree operations (append, insert,
+// remove, replace, clone); textContent, innerHTML and outerHTML in both directions - without what has no use here (namespaces, shadow trees, ranges).
+//
+// A Document owns all of its nodes, attached or not, and frees them together. Every change made through the functions here bumps the document's
+// version(), which is how the browser knows the page has to be drawn again. The script engine hangs its wrapper object for a node on Node::script.
+#pragma once
+#include "ObjectContainer/List.hpp"
+#include "Utility/String.hpp"
+#include "Utility/StringView.hpp"
+
+namespace dom {
+
+class Document;
+
+enum class NodeType : uint8_t { Element = 1, Text = 3, Comment = 8, Document = 9, Fragment = 11 };
+
+struct Attribute {
+  explicit Attribute(allocators::IAllocator& allocator) : name(allocator), value(allocator) {}
+  String name, value;
+};
+
+struct Node {
+  Node(allocators::IAllocator& allocator, NodeType t, Document* d) : type(t), owner(d), name(allocator), data(allocator), attrs(allocator) {}
+
+  NodeType type;
+  Node *parent = nullptr, *first_child = nullptr, *last_child = nullptr, *prev = nullptr, *next = nullptr;
+  Document* owner;
+  uint32_t serial = 0;       // 1, 2, ... in the order the document made its nodes (0 never names a node)
+  String name;               // elements: the lowercase tag name; others: "#text", "#comment", "#document", "#document-fragment"
+  String data;               // text and comments
+  List<Attribute> attrs;     // elements
+  void* script = nullptr;    // the script engine's object for this node
+
+  bool is_element() const { return type == NodeType::Element; }
+  bool is_text() const { return type == NodeType::Text; }
+  bool is_tag(const char* tag) const { return type == NodeType::Element && name.view().equals(tag); }
+};
+
+// What the tree operations say when they refuse.
+enum class DomError : uint8_t { None, HierarchyRequest, NotFound, OutOfMemory, TooManyNodes };
+
+class Document {
+ public:
+  static constexpr uint32_t kMaxNodes = 400000;
+
+  explicit Document(allocators::IAllocator& allocator);
+  ~Document();
+  Document(const Document&) = delete;
+  Document& operator=(const Document&) = delete;
+
+  allocators::IAllocator& allocator() const { return allocator_; }
+  Node* root() const { return root_; }                  // the Document node
+  Node* document_element() const;                       // <html>
+  Node* head() const;
+  Node* body() const;
+  // Makes a node that is not in the tree yet. nullptr when memory or the node limit ran out.
+  Node* create_element(StringView tag);                 // (the name is lowercased)
+  Node* create_text(StringView data);
+  Node* create_comment(StringView data);
+  Node* create_fragment();
+  Node* by_serial(uint32_t serial) const { return serial >= 1 && serial <= nodes_.count() ? nodes_[serial - 1] : nullptr; }
+  uint32_t node_count() const { return static_cast<uint32_t>(nodes_.count()); }
+  // True when the node limit has been reached (the page is then cut off where it was).
+  bool full() const { return nodes_.count() >= kMaxNodes; }
+  // The first element in the tree with that id (the tree order), or nullptr.
+  Node* element_by_id(StringView id) const;
+
+  // Changes through the functions below bump this.
+  uint64_t version() const { return version_; }
+  void touch() { ++version_; }
+
+ private:
+  Node* make(NodeType type, StringView name);
+
+  allocators::IAllocator& allocator_;
+  Node* root_ = nullptr;
+  List<Node*> nodes_;
+  uint64_t version_ = 1;
+};
+
+// --- Tree operations. They follow the standard: a node is first taken out of where it is; a fragment's children go in its place; nothing can be put
+// inside itself or its descendants. `child` of insert_before may be nullptr (append).
+DomError append_child(Node* parent, Node* child);
+DomError insert_before(Node* parent, Node* child, Node* reference);
+DomError remove_child(Node* parent, Node* child);
+DomError replace_child(Node* parent, Node* child, Node* old_child);
+// Takes `node` out of its parent (if it has one).
+void detach(Node* node);
+// A copy (with the children too if `deep`) that is in no tree. nullptr if memory ran out.
+Node* clone_node(Node* node, bool deep);
+
+// Is `node` `ancestor` or inside it?
+bool contains(const Node* ancestor, const Node* node);
+// Is the node in its document's tree (below the Document node)?
+bool is_connected(const Node* node);
+Node* first_element_child(const Node* node);
+Node* last_element_child(const Node* node);
+Node* next_element_sibling(const Node* node);
+Node* previous_element_sibling(const Node* node);
+uint32_t child_element_count(const Node* node);
+// The next node in tree order (depth first, children before siblings) not leaving `root`; nullptr at the end.
+Node* next_in_tree(const Node* node, const Node* root);
+// 1 if `a` comes after `b` in the tree, -1 if before, 0 if the same or in different trees.
+int compare_order(const Node* a, const Node* b);
+
+// --- Attributes (names compared in lowercase).
+bool get_attribute(const Node* element, StringView name, StringView* value);
+bool has_attribute(const Node* element, StringView name);
+// Sets or adds. The attribute name is lowercased.
+DomError set_attribute(Node* element, StringView name, StringView value);
+bool remove_attribute(Node* element, StringView name);
+// The whitespace separated words of the class attribute contain `word`?
+bool has_class(const Node* element, StringView word);
+
+// --- Text and markup
+// All the text below a node (a text node's data), without the comments.
+void text_content(const Node* node, String* out);
+// Replaces the children of an element or fragment with one text node (none for ""); a text or comment node's data is replaced.
+DomError set_text_content(Node* node, StringView text);
+// The markup of the children (innerHTML) or of the node itself (outerHTML).
+void inner_html(const Node* node, String* out);
+void outer_html(const Node* node, String* out);
+// Is this a tag that has no end tag and no children?
+bool is_void_tag(StringView tag);
+// Replaces the children of `element` with what `html` makes (without running scripts in it); an element's tag decides how its text is read (as a
+// <textarea>'s or a <style>'s content is not markup). Returns DomError::None on success.
+DomError set_inner_html(Node* element, StringView html);
+// Makes the nodes `html` describes as the children of a new fragment (scripts in it are not run). nullptr if memory ran out.
+Node* parse_fragment(Document& doc, StringView html, StringView context_tag);
+
+}  // namespace dom

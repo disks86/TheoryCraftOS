@@ -90,6 +90,8 @@ class Vm {
   JsObject* new_native(NativeFn fn, StringView name, uint32_t arity);
   JsObject* new_function(FunctionCode* code, Env* env, const Value& this_value);
   JsObject* new_error(ErrorKind kind, StringView message);
+  // An object whose properties `host` answers for; `data` is its (the host's) own pointer.
+  JsObject* new_host_object(JsObject* proto, const HostClass* host, void* data);
   Env* new_env(uint32_t slots, Env* parent);
 
   // --- Properties. get() and friends accept any base value (primitives use their prototypes); null and undefined throw.
@@ -144,6 +146,23 @@ class Vm {
   JsString* prototype_name() { return prototype_; }
   JsString* name_name() { return name_; }
   JsString* message_name() { return message_; }
+
+  // --- Timers (setTimeout, setInterval, requestAnimationFrame): each is an entry [function, due time, id, interval or -1, arguments...] in an array on the
+  // global object, which Engine runs. Times are in milliseconds of clock_ms(). Returns the id (0 if it could not be made).
+  double add_timer(const Value& function, double delay_ms, double interval_ms, const Value* args, uint32_t argc);
+  void clear_timer(double id);
+  // The time scripts see: the host's clock plus what the engine has skipped over while running timers ahead of their time.
+  double clock_ms() { return (host_ ? static_cast<double>(host_->now_ms()) : 0.0) + skew_ms_; }
+  void set_skew(double skew_ms) { skew_ms_ = skew_ms; }
+  double skew() const { return skew_ms_; }
+
+  // --- For the host that installs objects: a pointer of its own, an own property (no host callbacks, no prototype chain) and a hold on the collector (the
+  // collector does not run while anything holds it: for C++ code that keeps script values in its own variables across calls into scripts).
+  void set_user(void* user) { user_ = user; }
+  void* user() const { return user_; }
+  bool get_plain(JsObject* object, JsString* key, Value* out);
+  void hold_collector() { ++gc_hold_; }
+  void release_collector() { if (gc_hold_ > 0) --gc_hold_; }
 
   // --- Called by the built-ins
   void collect();   // (only safe at the top level of the interpreter: the VM does this itself)
@@ -235,6 +254,9 @@ class Vm {
   uint64_t budget_ = 0, instructions_ = 0;
   uint32_t native_depth_ = 0;
   uint64_t random_state_ = 88172645463325252ull;
+  double skew_ms_ = 0;
+  void* user_ = nullptr;
+  uint32_t gc_hold_ = 0;
 };
 
 // Defines the global functions and objects (Object, Array, String, Math, JSON, console, ...). Called by the Vm constructor.

@@ -847,6 +847,8 @@ bool Desktop::step(uint64_t uptime_us) {
 void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   input_.pump();
+  web_browser_.tick(uptime_us);
+  for (uint64_t i = 0; i < extra_browsers_.count(); ++i) extra_browsers_[i]->tick(uptime_us);
   if (__atomic_exchange_n(&reap_needed_, false, __ATOMIC_ACQ_REL)) reap_closed();
   // Watchdog: a changed window that the render thread has not redrawn for seconds means that thread (or
   // whatever it is waiting for - the GPU, the UI lock) is stuck. Say so where it can be read afterwards.

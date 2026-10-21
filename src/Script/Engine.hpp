@@ -45,14 +45,21 @@ class Engine {
   // threw. `result` (may be null) gets the value of the last expression statement as text.
   bool run(StringView source, String* error, String* result = nullptr);
 
+  // Compiles and runs `source` and hands back the value of its last expression (not kept alive: store it somewhere the script engine can see it at once).
+  bool evaluate(StringView source, String* error, Value* value);
+
   // Runs what setTimeout / setInterval were given (in the order they are due, without waiting; at most `max` of them) and the listeners of an event
   // ("DOMContentLoaded", "load"; also onload). Returns how many threw; *error gets the first message.
   uint32_t run_timers(uint32_t max, String* error);
+  // Runs the timers that are due at `now_ms` of the host's clock (an interval that comes round again waits for the next call). Returns how many threw.
+  uint32_t run_due_timers(double now_ms, uint32_t max, String* error);
+  // When the first timer waiting is due (host clock milliseconds); false if there is none.
+  bool next_timer(double* due_ms);
   uint32_t fire_event(StringView type, String* error);
 
  private:
-  bool run_here(StringView source, String* error, String* result);
-  uint32_t run_timers_here(uint32_t max, String* error);
+  bool run_here(StringView source, String* error, String* result, Value* value = nullptr);
+  uint32_t run_timers_here(double now_ms, bool ahead, uint32_t max, String* error);
   uint32_t fire_event_here(StringView type, String* error);
   void sync_document();
   uint32_t call_guarded(const Value& fn, const Value* args, uint32_t argc, String* error);
@@ -61,7 +68,6 @@ class Engine {
   IHost* host_;
   Vm vm_;
   uint64_t budget_ = 20000000, memory_ = 64u << 20;
-  double virtual_time_ = 0;
 };
 
 }  // namespace script

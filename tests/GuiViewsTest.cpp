@@ -6332,6 +6332,14 @@ struct FakeLoader final : browser::IPageLoader {
       html = "<html><head><title>Plain</title><script src=\"/app.js\"></script></head><body><script>document.write('<p>written</p>'); console.log('hi', 1 + 1); "
              "document.title = 'Scripted: ' + location.href; undefinedFunction();</script><p>text</p></body></html>";
     }
+    if (address.equals("http://dom.test/")) {
+      html = "<html><head><title>Dom</title><style>#out{color:#ff0000} @media (max-width: 300px){.wide{display:none}}</style></head><body><p id=out>start</p>"
+             "<a id=btn href=\"/skip\">go</a><span class=wide>wide</span><script>"
+             "var mq = matchMedia('(prefers-color-scheme: dark)'); document.title = mq.matches ? 'dark' : 'light'; "
+             "mq.addEventListener('change', function() { document.title = mq.matches ? 'dark' : 'light'; });"
+             "document.getElementById('btn').addEventListener('click', function(e) { e.preventDefault(); document.getElementById('out').textContent = 'clicked'; });"
+             "setTimeout(function() { document.getElementById('out').textContent += ' timer'; }, 50);</script></body></html>";
+    }
     if (address.equals("http://js.test/app.js")) {
       r->content_type.assign("application/javascript");
       html = "document.write('<p>from file</p>'); var answer = 6 * 7; document.write('<p>' + answer + '</p>');";
@@ -6440,6 +6448,31 @@ static void test_web_browser() {
     CHECK(b.title().equals("Web Browser - Plain"));
     b.set_scripts_enabled(true);
     CHECK(b.navigate("http://one.test/") && b.script_errors() == 0 && b.script_log().empty());
+
+    // The page is a tree scripts can change: a click reaches its listeners (and preventDefault keeps the link from being followed), timers run from
+    // tick(), the colour scheme is a media query the page watches, and the page is drawn again each time.
+    {
+      CHECK(b.navigate("http://dom.test/") && run_contains(b, "start") && run_contains(b, "wide") && b.title().equals("Web Browser - light"));
+      CHECK(b.page().document()->run(0).color == 0xFFFF0000);
+      const Point od = b.page().window_origin();
+      int32_t link_y = -1;
+      String target(a);
+      for (int32_t y = 0; y < 80 && link_y < 0; y += 8)
+        if (b.page().link_at(gui::PageView::kMargin + 4, y, &target)) link_y = y;
+      CHECK(link_y >= 0);
+      const size_t asked_before = loader.asked.size();
+      click(w, od.x + gui::PageView::kMargin + 4, od.y + link_y);
+      CHECK(run_contains(b, "clicked") && !run_contains(b, "start") && loader.asked.size() == asked_before && b.address().equals("http://dom.test/"));
+      b.tick(10 * 1000);
+      CHECK(!run_contains(b, "timer"));
+      b.tick(500 * 1000);
+      CHECK(run_contains(b, "clicked timer"));
+      b.set_dark(true);
+      CHECK(b.title().equals("Web Browser - dark"));
+      b.set_dark(false);
+      CHECK(b.title().equals("Web Browser - light"));
+      CHECK(b.live_page() && b.live_page()->scripting());
+    }
 
     // Files on the system's own volumes: pages (links resolve against the folder), plain text, and files that are not there.
     CHECK(b.navigate("/docs/index.html") && b.title().equals("Web Browser - Index") && b.address().equals("/docs/index.html") && run_contains(b, "Local"));

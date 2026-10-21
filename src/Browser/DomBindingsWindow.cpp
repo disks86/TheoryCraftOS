@@ -1,0 +1,889 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// The window: location, history, storage, matchMedia, getComputedStyle, animation frames, scrolling, the dialogs, navigator, screen, performance, base64 and URI
+// coding, console extras, and the observers pages create (which never report).
+#include <initializer_list>
+#include "Browser/DomBindingsInternal.hpp"
+#include "Browser/Url.hpp"
+#include "Utility/Move.hpp"
+
+namespace browser {
+namespace bind {
+
+namespace {
+
+#define NATIVE(name) bool name(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result)
+#define IS(text) k.equals(text)
+
+bool resolve_url(Vm& vm, DomBindings::Impl& c, StringView url, String* out) {
+  if (resolve_reference(vm.allocator(), c.host.address(), url, out)) return true;
+  out->assign(url);
+  return true;
+}
+
+// --- location --------------------------------------------------------------------------------------------------------------------
+
+bool location_get(Vm& vm, JsObject*, JsString* key, Value* out) {
+  DomBindings::Impl& c = impl(vm);
+  const StringView k = key->view();
+  if (!(IS("href") || IS("protocol") || IS("host") || IS("hostname") || IS("port") || IS("pathname") || IS("search") || IS("hash") || IS("origin"))) return false;
+  AddressParts p(vm.allocator());
+  split_address(c.host.address(), &p);
+  if (IS("href")) *out = str_value(vm, c.host.address());
+  else if (IS("protocol")) *out = str_value(vm, p.protocol.view());
+  else if (IS("host")) *out = str_value(vm, p.host.view());
+  else if (IS("hostname")) *out = str_value(vm, p.hostname.view());
+  else if (IS("port")) *out = str_value(vm, p.port.view());
+  else if (IS("pathname")) *out = str_value(vm, p.pathname.view());
+  else if (IS("search")) *out = str_value(vm, p.search.view());
+  else if (IS("hash")) *out = str_value(vm, p.hash.view());
+  else *out = str_value(vm, p.origin.view());
+  return true;
+}
+
+HostClass::Set location_set(Vm& vm, JsObject*, JsString* key, const Value& value) {
+  DomBindings::Impl& c = impl(vm);
+  const StringView k = key->view();
+  if (!(IS("href") || IS("protocol") || IS("host") || IS("hostname") || IS("port") || IS("pathname") || IS("search") || IS("hash"))) return HostClass::Set::NotHandled;
+  String text(vm.allocator());
+  if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+  if (IS("href")) {
+    String url(vm.allocator());
+    resolve_url(vm, c, text.view(), &url);
+    c.host.navigate(url.view(), false);
+    return HostClass::Set::Handled;
+  }
+  if (IS("hash")) {
+    String hash(vm.allocator());
+    if (!text.empty() && !text.view().starts_with('#')) hash.push_back('#');
+    hash.append(text.view());
+    c.host.set_hash(hash.view());
+    return HostClass::Set::Handled;
+  }
+  AddressParts p(vm.allocator());
+  split_address(c.host.address(), &p);
+  String url(vm.allocator());
+  if (IS("pathname")) {
+    url.append(p.origin.view());
+    if (!text.view().starts_with('/')) url.push_back('/');
+    url.append(text.view());
+    url.append(p.search.view());
+  } else if (IS("search")) {
+    url.append(p.origin.view());
+    url.append(p.pathname.view());
+    if (!text.empty() && !text.view().starts_with('?')) url.push_back('?');
+    url.append(text.view());
+  } else {
+    // protocol, host, hostname, port: rebuilt from the parts
+    String protocol(vm.allocator()), host(vm.allocator());
+    protocol.assign(p.protocol.view());
+    host.assign(p.host.view());
+    if (IS("protocol")) {
+      protocol.assign(text.view());
+      if (!protocol.view().ends_with(':')) protocol.push_back(':');
+    } else if (IS("host")) {
+      host.assign(text.view());
+    } else if (IS("hostname")) {
+      host.assign(text.view());
+      if (!p.port.empty()) {
+        host.push_back(':');
+        host.append(p.port.view());
+      }
+    } else {
+      host.assign(p.hostname.view());
+      if (!text.empty()) {
+        host.push_back(':');
+        host.append(text.view());
+      }
+    }
+    url.append(protocol.view());
+    url.append("//");
+    url.append(host.view());
+    url.append(p.pathname.view());
+    url.append(p.search.view());
+  }
+  c.host.navigate(url.view(), false);
+  return HostClass::Set::Handled;
+}
+
+const HostClass kLocationClass = {"Location", location_get, location_set, nullptr, nullptr};
+
+NATIVE(location_assign) {
+  DomBindings::Impl& c = impl(vm);
+  String text(vm.allocator()), url(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  resolve_url(vm, c, text.view(), &url);
+  c.host.navigate(url.view(), false);
+  return true;
+}
+
+NATIVE(location_replace) {
+  DomBindings::Impl& c = impl(vm);
+  String text(vm.allocator()), url(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  resolve_url(vm, c, text.view(), &url);
+  c.host.navigate(url.view(), true);
+  return true;
+}
+
+NATIVE(location_reload) {
+  impl(vm).host.reload();
+  return true;
+}
+
+NATIVE(location_to_string) {
+  *result = str_value(vm, impl(vm).host.address());
+  return true;
+}
+
+// --- history ---------------------------------------------------------------------------------------------------------------------
+
+bool history_get(Vm& vm, JsObject*, JsString* key, Value* out) {
+  if (!key->view().equals("length")) return false;
+  *out = num_value(impl(vm).host.history_length());
+  return true;
+}
+
+const HostClass kHistoryClass = {"History", history_get, nullptr, nullptr, nullptr};
+
+NATIVE(history_back) {
+  impl(vm).host.history_go(-1);
+  return true;
+}
+NATIVE(history_forward) {
+  impl(vm).host.history_go(1);
+  return true;
+}
+NATIVE(history_go) {
+  double d = 0;
+  if (argc > 0 && !vm.to_number(args[0], &d)) return false;
+  if (d != d) d = 0;
+  if (d == 0) impl(vm).host.reload();
+  else impl(vm).host.history_go(static_cast<int32_t>(d));
+  return true;
+}
+
+bool state_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, bool replace) {
+  DomBindings::Impl& c = impl(vm);
+  if (!self.is_object()) return true;
+  vm.define_named(self.as_object(), "state", arg_at(args, argc, 0), kWritable);
+  const Value url = arg_at(args, argc, 2);
+  if (!url.is_nullish()) {
+    String text(vm.allocator()), resolved(vm.allocator());
+    if (!arg_text(vm, url, &text)) return false;
+    resolve_url(vm, c, text.view(), &resolved);
+    c.host.push_state(resolved.view(), replace);
+  } else {
+    c.host.push_state(c.host.address(), replace);
+  }
+  return true;
+}
+NATIVE(history_push_state) { return state_impl(vm, self, args, argc, false); }
+NATIVE(history_replace_state) { return state_impl(vm, self, args, argc, true); }
+
+// --- storage ---------------------------------------------------------------------------------------------------------------------
+
+StorageArea* area_of(JsObject* o) { return static_cast<StorageArea*>(o->host_data); }
+
+bool storage_method(StringView k) { return IS("getItem") || IS("setItem") || IS("removeItem") || IS("clear") || IS("key") || IS("constructor") || IS("toString"); }
+
+bool storage_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
+  const StringView k = key->view();
+  if (k.empty() || storage_method(k) || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return false;
+  if (IS("length")) {
+    *out = num_value(area_of(o)->count());
+    return true;
+  }
+  StringView v;
+  if (area_of(o)->get(k, &v)) {
+    *out = str_value(vm, v);
+    return true;
+  }
+  return false;
+}
+
+HostClass::Set storage_set(Vm& vm, JsObject* o, JsString* key, const Value& value) {
+  const StringView k = key->view();
+  if (k.empty() || storage_method(k) || IS("length") || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return HostClass::Set::NotHandled;
+  String text(vm.allocator());
+  if (!arg_text(vm, value.is_undefined() ? str_value(vm, "undefined") : value, &text)) return HostClass::Set::Threw;
+  if (!area_of(o)->set(k, text.view())) {
+    throw_dom(vm, "QuotaExceededError", "The quota has been exceeded.");
+    return HostClass::Set::Threw;
+  }
+  return HostClass::Set::Handled;
+}
+
+bool storage_remove(Vm&, JsObject* o, JsString* key, bool* deleted) {
+  area_of(o)->remove(key->view());
+  *deleted = true;
+  return true;
+}
+
+void storage_keys(Vm& vm, JsObject* o, JsObject* keys) {
+  for (uint32_t i = 0; i < area_of(o)->count(); ++i) vm.array_push(keys, str_value(vm, area_of(o)->key(i)));
+}
+
+const HostClass kStorageClass = {"Storage", storage_get, storage_set, storage_remove, storage_keys};
+
+StorageArea* this_area(Vm& vm, const Value& self) {
+  if (self.is_object() && self.as_object()->host == &kStorageClass) return area_of(self.as_object());
+  vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
+  return nullptr;
+}
+
+NATIVE(storage_get_item) {
+  StorageArea* a = this_area(vm, self);
+  String key(vm.allocator());
+  if (!a || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
+  StringView v;
+  *result = a->get(key.view(), &v) ? str_value(vm, v) : Value::make_null();
+  return true;
+}
+
+NATIVE(storage_set_item) {
+  StorageArea* a = this_area(vm, self);
+  String key(vm.allocator()), value(vm.allocator());
+  if (!a || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
+  JsString* s;
+  if (!vm.to_string(arg_at(args, argc, 1), &s)) return false;
+  value.assign(s->view());
+  if (!a->set(key.view(), value.view())) return throw_dom(vm, "QuotaExceededError", "The quota has been exceeded.");
+  return true;
+}
+
+NATIVE(storage_remove_item) {
+  StorageArea* a = this_area(vm, self);
+  String key(vm.allocator());
+  if (!a || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
+  a->remove(key.view());
+  return true;
+}
+
+NATIVE(storage_clear) {
+  StorageArea* a = this_area(vm, self);
+  if (!a) return false;
+  a->clear();
+  return true;
+}
+
+NATIVE(storage_key) {
+  StorageArea* a = this_area(vm, self);
+  double d;
+  if (!a || !vm.to_number(arg_at(args, argc, 0), &d)) return false;
+  *result = d >= 0 && d < a->count() ? str_value(vm, a->key(static_cast<uint32_t>(d))) : Value::make_null();
+  return true;
+}
+
+// --- Window functions ----------------------------------------------------------------------------------------------------------
+
+NATIVE(win_get_computed_style) {
+  DomBindings::Impl& c = impl(vm);
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  if (!n || !n->is_element()) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'getComputedStyle' on 'Window': parameter 1 is not of type 'Element'.");
+  *result = make_computed_style(c, n);
+  return true;
+}
+
+NATIVE(win_request_animation_frame) {
+  if (!Vm::is_callable(arg_at(args, argc, 0))) return vm.throw_error(ErrorKind::TypeError, "requestAnimationFrame needs a function");
+  const Value stamp = num_value(vm.clock_ms());
+  *result = num_value(vm.add_timer(args[0], 16, -1, &stamp, 1));
+  return true;
+}
+
+NATIVE(win_cancel_animation_frame) {
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  vm.clear_timer(id);
+  return true;
+}
+
+NATIVE(win_queue_microtask) {
+  if (!Vm::is_callable(arg_at(args, argc, 0))) return vm.throw_error(ErrorKind::TypeError, "queueMicrotask needs a function");
+  vm.add_timer(args[0], 0, -1, nullptr, 0);
+  return true;
+}
+
+NATIVE(win_scroll_to) {
+  DomBindings::Impl& c = impl(vm);
+  double top = c.scroll_line * 16.0;
+  const Value a0 = arg_at(args, argc, 0);
+  if (a0.is_object()) {
+    Value v;
+    vm.get_named(a0, "top", &v);
+    if (v.is_number()) top = v.u.number;
+  } else if (argc > 1) {
+    if (!vm.to_number(args[1], &top)) return false;
+  }
+  if (top != top || top < 0) top = 0;
+  c.scroll_line = static_cast<int32_t>(top / 16);
+  c.host.scroll_to(c.scroll_line);
+  update_metrics(c);
+  return true;
+}
+
+NATIVE(win_scroll_by) {
+  DomBindings::Impl& c = impl(vm);
+  double dy = 0;
+  const Value a0 = arg_at(args, argc, 0);
+  if (a0.is_object()) {
+    Value v;
+    vm.get_named(a0, "top", &v);
+    if (v.is_number()) dy = v.u.number;
+  } else if (argc > 1) {
+    if (!vm.to_number(args[1], &dy)) return false;
+  }
+  if (dy != dy) dy = 0;
+  int64_t line = c.scroll_line + static_cast<int64_t>(dy / 16);
+  if (line < 0) line = 0;
+  c.scroll_line = static_cast<int32_t>(line);
+  c.host.scroll_to(c.scroll_line);
+  update_metrics(c);
+  return true;
+}
+
+NATIVE(win_confirm) {
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  *result = bool_value(impl(vm).host.confirm(text.view()));
+  return true;
+}
+
+NATIVE(win_prompt) {
+  *result = Value::make_null();
+  return true;
+}
+
+NATIVE(win_do_nothing) { return true; }
+
+NATIVE(win_structured_clone) {
+  Value json;
+  if (!vm.get_named(Value::make_object(vm.global()), "JSON", &json)) return false;
+  Value text;
+  const Value v = arg_at(args, argc, 0);
+  Value stringify, parse;
+  if (!vm.get_named(json, "stringify", &stringify) || !vm.call(stringify, json, &v, 1, &text)) return false;
+  if (text.is_undefined()) return throw_dom(vm, "DataCloneError", "The object could not be cloned.");
+  if (!vm.get_named(json, "parse", &parse)) return false;
+  return vm.call(parse, json, &text, 1, result);
+}
+
+// --- Base64 and URIs ---------------------------------------------------------------------------------------------------------------
+
+const char kBase64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+NATIVE(win_btoa) {
+  String text(vm.allocator()), out(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  const StringView s = text.view();
+  for (uint64_t i = 0; i < s.size(); i += 3) {
+    const uint32_t b0 = static_cast<uint8_t>(s[i]), b1 = i + 1 < s.size() ? static_cast<uint8_t>(s[i + 1]) : 0, b2 = i + 2 < s.size() ? static_cast<uint8_t>(s[i + 2]) : 0;
+    const uint32_t n = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kBase64[(n >> 18) & 63]);
+    out.push_back(kBase64[(n >> 12) & 63]);
+    out.push_back(i + 1 < s.size() ? kBase64[(n >> 6) & 63] : '=');
+    out.push_back(i + 2 < s.size() ? kBase64[n & 63] : '=');
+  }
+  *result = str_value(vm, out.view());
+  return true;
+}
+
+NATIVE(win_atob) {
+  String text(vm.allocator()), out(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  uint32_t buffer = 0;
+  int bits = 0;
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    const char ch = text[i];
+    if (ch == '=' || ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r') continue;
+    int v = -1;
+    for (int k = 0; k < 64 && v < 0; ++k)
+      if (kBase64[k] == ch) v = k;
+    if (v < 0) return throw_dom(vm, "InvalidCharacterError", "The string to be decoded is not correctly encoded.");
+    buffer = (buffer << 6) | static_cast<uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+    }
+  }
+  *result = str_value(vm, out.view());
+  return true;
+}
+
+bool uri_encode(Vm& vm, const Value* args, uint32_t argc, Value* result, const char* keep) {
+  String text(vm.allocator()), out(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  static const char kHex[] = "0123456789ABCDEF";
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    const char ch = text[i];
+    bool plain = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+    for (const char* p = keep; *p && !plain; ++p) plain = *p == ch;
+    if (plain) {
+      out.push_back(ch);
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[(static_cast<uint8_t>(ch) >> 4) & 15]);
+      out.push_back(kHex[static_cast<uint8_t>(ch) & 15]);
+    }
+  }
+  *result = str_value(vm, out.view());
+  return true;
+}
+NATIVE(win_encode_uri_component) { return uri_encode(vm, args, argc, result, "-_.!~*'()"); }
+NATIVE(win_encode_uri) { return uri_encode(vm, args, argc, result, "-_.!~*'();/?:@&=+$,#"); }
+
+bool uri_decode(Vm& vm, const Value* args, uint32_t argc, Value* result, const char* keep_encoded) {
+  String text(vm.allocator()), out(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  auto hex = [](char ch) { return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1; };
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '%') {
+      out.push_back(text[i]);
+      continue;
+    }
+    if (i + 2 >= text.size() || hex(text[i + 1]) < 0 || hex(text[i + 2]) < 0) return vm.throw_error(ErrorKind::Error, "URIError: URI malformed");
+    const char decoded = static_cast<char>(hex(text[i + 1]) * 16 + hex(text[i + 2]));
+    bool keep = false;
+    for (const char* p = keep_encoded; *p && !keep; ++p) keep = *p == decoded;
+    if (keep) out.append(text.view().substr(i, 3));
+    else out.push_back(decoded);
+    i += 2;
+  }
+  *result = str_value(vm, out.view());
+  return true;
+}
+NATIVE(win_decode_uri_component) { return uri_decode(vm, args, argc, result, ""); }
+NATIVE(win_decode_uri) { return uri_decode(vm, args, argc, result, ";/?:@&=+$,#"); }
+
+// --- performance -----------------------------------------------------------------------------------------------------------------
+
+NATIVE(performance_now) {
+  Value origin;
+  vm.get_named(Value::make_object(vm.global()), "__time_origin", &origin);
+  *result = num_value(vm.clock_ms() - (origin.is_number() ? origin.u.number : 0));
+  return true;
+}
+
+// --- console ---------------------------------------------------------------------------------------------------------------------
+
+void console_text(Vm& vm, const Value* args, uint32_t argc, uint32_t from, String* out) {
+  for (uint32_t i = from; i < argc; ++i) {
+    if (i > from) out->push_back(' ');
+    vm.describe(args[i], out, 0);
+  }
+}
+
+NATIVE(console_assert) {
+  if (argc > 0 && Vm::to_boolean(args[0])) return true;
+  String text(vm.allocator());
+  text.append("Assertion failed");
+  if (argc > 1) {
+    text.append(": ");
+    console_text(vm, args, argc, 1, &text);
+  }
+  if (vm.host()) vm.host()->console(3, text.view());
+  return true;
+}
+
+NATIVE(console_log_like) {
+  String text(vm.allocator());
+  console_text(vm, args, argc, 0, &text);
+  if (vm.host()) vm.host()->console(0, text.view());
+  return true;
+}
+
+NATIVE(console_time) {
+  String label(vm.allocator());
+  arg_text(vm, argc ? args[0] : str_value(vm, "default"), &label);
+  String key(vm.allocator());
+  key.append("__time_");
+  key.append(label.view());
+  vm.define(vm.global(), vm.intern(key.view()), num_value(vm.clock_ms()), 0);
+  return true;
+}
+
+bool console_time_report(Vm& vm, const Value* args, uint32_t argc, bool end) {
+  String label(vm.allocator());
+  arg_text(vm, argc ? args[0] : str_value(vm, "default"), &label);
+  String key(vm.allocator());
+  key.append("__time_");
+  key.append(label.view());
+  Value start;
+  if (!vm.get_plain(vm.global(), vm.intern(key.view()), &start) || !start.is_number()) return true;
+  String text(vm.allocator());
+  text.append(label.view());
+  text.append(": ");
+  text.append_uint(static_cast<uint64_t>(vm.clock_ms() - start.u.number));
+  text.append("ms");
+  if (vm.host()) vm.host()->console(0, text.view());
+  if (end) vm.delete_property(vm.global(), vm.intern(key.view()));
+  return true;
+}
+NATIVE(console_time_end) { return console_time_report(vm, args, argc, true); }
+NATIVE(console_time_log) { return console_time_report(vm, args, argc, false); }
+
+NATIVE(console_count) {
+  String label(vm.allocator());
+  arg_text(vm, argc ? args[0] : str_value(vm, "default"), &label);
+  String key(vm.allocator());
+  key.append("__count_");
+  key.append(label.view());
+  Value n;
+  const double next = (vm.get_plain(vm.global(), vm.intern(key.view()), &n) && n.is_number() ? n.u.number : 0) + 1;
+  vm.define(vm.global(), vm.intern(key.view()), num_value(next), 0);
+  String text(vm.allocator());
+  text.append(label.view());
+  text.append(": ");
+  text.append_uint(static_cast<uint64_t>(next));
+  if (vm.host()) vm.host()->console(0, text.view());
+  return true;
+}
+
+// --- Observers and other things that exist but report nothing ---------------------------------------------------------------------
+
+NATIVE(observer_constructor) {
+  if (self.is_object() && argc > 0) vm.define(self.as_object(), vm.intern("__callback"), args[0], 0);
+  *result = self;
+  return true;
+}
+
+NATIVE(empty_array_native) {
+  *result = Value::make_object(vm.new_array());
+  return true;
+}
+
+// --- matchMedia ---------------------------------------------------------------------------------------------------------------------
+
+NATIVE(win_match_media) {
+  DomBindings::Impl& c = impl(vm);
+  String query(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &query)) return false;
+  JsObject* mql = vm.new_object(c.media_query_proto);
+  const bool matches = media_matches(query.view(), c.host.media());
+  vm.define_named(mql, "media", str_value(vm, media_valid(query.view()) ? query.view() : StringView("not all")));
+  vm.define_named(mql, "matches", bool_value(matches));
+  vm.define_named(mql, "onchange", Value::make_null());
+  vm.define(mql, vm.intern("__q"), str_value(vm, query.view()), 0);
+  vm.array_push(c.media_lists, Value::make_object(mql));
+  *result = Value::make_object(mql);
+  return true;
+}
+
+NATIVE(mql_add_listener) {   // addListener(fn) / addEventListener("change", fn)
+  if (!self.is_object()) return true;
+  JsObject* mql = self.as_object();
+  Value fn = argc > 1 && arg_at(args, argc, 0).is_string() ? args[1] : arg_at(args, argc, 0);
+  if (argc > 1 && arg_at(args, argc, 0).is_string() && !args[0].as_string()->view().equals("change")) return true;
+  if (!Vm::is_callable(fn) && !fn.is_object()) return true;
+  JsString* key = vm.intern("__fns");
+  Value list;
+  if (!vm.get_plain(mql, key, &list) || !list.is_object()) {
+    list = Value::make_object(vm.new_array());
+    vm.define(mql, key, list, 0);
+  }
+  for (uint32_t i = 0; i < list.as_object()->length; ++i)
+    if (vm.strict_equals(list.as_object()->items[i], fn)) return true;
+  vm.array_push(list.as_object(), fn);
+  return true;
+}
+
+NATIVE(mql_remove_listener) {
+  if (!self.is_object()) return true;
+  Value fn = argc > 1 && arg_at(args, argc, 0).is_string() ? args[1] : arg_at(args, argc, 0);
+  Value list;
+  if (!vm.get_plain(self.as_object(), vm.intern("__fns"), &list) || !list.is_object()) return true;
+  JsObject* l = list.as_object();
+  for (uint32_t i = 0; i < l->length; ++i) {
+    if (vm.strict_equals(l->items[i], fn)) {
+      for (uint32_t k = i + 1; k < l->length; ++k) l->items[k - 1] = l->items[k];
+      --l->length;
+      break;
+    }
+  }
+  return true;
+}
+
+NATIVE(mql_dispatch) {
+  *result = bool_value(true);
+  return true;
+}
+
+bool window_set(Vm& vm, JsObject*, JsString* key, const Value& value, HostClass::Set* out) {
+  (void)vm;
+  (void)key;
+  (void)value;
+  *out = HostClass::Set::NotHandled;
+  return true;
+}
+
+HostClass::Set window_set_property(Vm& vm, JsObject* o, JsString* key, const Value& value) {
+  HostClass::Set r;
+  window_set(vm, o, key, value, &r);
+  if (key->view().equals("location")) {
+    DomBindings::Impl& c = impl(vm);
+    String text(vm.allocator()), url(vm.allocator());
+    if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+    resolve_url(vm, c, text.view(), &url);
+    c.host.navigate(url.view(), false);
+    return HostClass::Set::Handled;
+  }
+  return r;
+}
+
+const HostClass kWindowClass = {"Window", nullptr, window_set_property, nullptr, nullptr};
+
+void define_function_global(Vm& vm, const char* name, NativeFn fn, uint32_t arity) { vm.define_native(vm.global(), name, fn, arity); }
+
+}  // namespace
+
+void update_metrics(DomBindings::Impl& c) {
+  Vm& vm = c.vm;
+  JsObject* g = vm.global();
+  const MediaEnvironment& env = c.host.media();
+  vm.define_named(g, "innerWidth", num_value(env.width));
+  vm.define_named(g, "innerHeight", num_value(env.height));
+  vm.define_named(g, "outerWidth", num_value(env.width));
+  vm.define_named(g, "outerHeight", num_value(env.height));
+  vm.define_named(g, "scrollX", num_value(0));
+  vm.define_named(g, "pageXOffset", num_value(0));
+  vm.define_named(g, "scrollY", num_value(c.scroll_line * 16.0));
+  vm.define_named(g, "pageYOffset", num_value(c.scroll_line * 16.0));
+  vm.define_named(g, "devicePixelRatio", num_value(env.resolution_dpi / 96.0));
+  Value screen;
+  if (vm.get_named(Value::make_object(g), "screen", &screen) && screen.is_object()) {
+    const int sw = env.screen_width > 0 ? env.screen_width : env.width, sh = env.screen_height > 0 ? env.screen_height : env.height;
+    vm.define_named(screen.as_object(), "width", num_value(sw));
+    vm.define_named(screen.as_object(), "height", num_value(sh));
+    vm.define_named(screen.as_object(), "availWidth", num_value(sw));
+    vm.define_named(screen.as_object(), "availHeight", num_value(sh));
+  }
+}
+
+uint32_t media_changed_impl(DomBindings::Impl& c) {
+  Vm& vm = c.vm;
+  uint32_t changed = 0;
+  vm.hold_collector();
+  for (uint32_t i = 0; i < c.media_lists->length; ++i) {
+    JsObject* mql = c.media_lists->items[i].as_object();
+    Value q, was;
+    if (!vm.get_plain(mql, vm.intern("__q"), &q) || !q.is_string() || !vm.get_plain(mql, vm.intern("matches"), &was)) continue;
+    const bool now = media_matches(q.as_string()->view(), c.host.media());
+    if (now == Vm::to_boolean(was)) continue;
+    ++changed;
+    vm.define_named(mql, "matches", bool_value(now));
+    // the change event: { type: "change", matches, media }
+    JsObject* e = vm.new_plain();
+    vm.define_named(e, "type", str_value(vm, "change"));
+    vm.define_named(e, "matches", bool_value(now));
+    Value media;
+    vm.get_plain(mql, vm.intern("media"), &media);
+    vm.define_named(e, "media", media);
+    vm.define_named(e, "target", Value::make_object(mql));
+    vm.define_named(e, "currentTarget", Value::make_object(mql));
+    const Value event = Value::make_object(e);
+    Value handler;
+    if (vm.get_plain(mql, vm.intern("onchange"), &handler) && Vm::is_callable(handler)) {
+      Value ignored;
+      if (!vm.call(handler, Value::make_object(mql), &event, 1, &ignored)) {
+        String text(vm.allocator());
+        vm.take_exception(&text);
+        if (c.error_count++ == 0) c.first_error.assign(text.view());
+      }
+    }
+    Value list;
+    if (vm.get_plain(mql, vm.intern("__fns"), &list) && list.is_object()) {
+      List<Value> copy(vm.allocator());
+      for (uint32_t k = 0; k < list.as_object()->length; ++k) copy.push_back(list.as_object()->items[k]);
+      for (uint64_t k = 0; k < copy.count(); ++k) {
+        Value fn = copy[k], self = Value::make_object(mql);
+        if (!Vm::is_callable(fn)) {
+          Value handle;
+          if (!vm.get_named(fn, "handleEvent", &handle) || !Vm::is_callable(handle)) continue;
+          self = fn;
+          fn = handle;
+        }
+        Value ignored;
+        if (!vm.call(fn, self, &event, 1, &ignored)) {
+          String text(vm.allocator());
+          vm.take_exception(&text);
+          if (c.error_count++ == 0) c.first_error.assign(text.view());
+        }
+      }
+    }
+  }
+  vm.release_collector();
+  return changed;
+}
+
+bool install_window(DomBindings::Impl& c) {
+  Vm& vm = c.vm;
+  JsObject* g = vm.global();
+  g->host = &kWindowClass;
+  vm.define_named(g, "__time_origin", num_value(vm.clock_ms()), 0);
+
+  // location and history
+  c.location_proto = nullptr;
+  c.location_proto = vm.new_plain();
+  vm.define_native(c.location_proto, "assign", location_assign, 1);
+  vm.define_native(c.location_proto, "replace", location_replace, 1);
+  vm.define_native(c.location_proto, "reload", location_reload, 0);
+  vm.define_native(c.location_proto, "toString", location_to_string, 0);
+  c.location = vm.new_host_object(c.location_proto, &kLocationClass, &c);
+  vm.define_named(g, "location", Value::make_object(c.location), kWritable);
+  c.history_proto = vm.new_plain();
+  vm.define_native(c.history_proto, "back", history_back, 0);
+  vm.define_native(c.history_proto, "forward", history_forward, 0);
+  vm.define_native(c.history_proto, "go", history_go, 1);
+  vm.define_native(c.history_proto, "pushState", history_push_state, 3);
+  vm.define_native(c.history_proto, "replaceState", history_replace_state, 3);
+  JsObject* history = vm.new_host_object(c.history_proto, &kHistoryClass, &c);
+  vm.define_named(history, "state", Value::make_null(), kWritable);
+  vm.define_named(history, "scrollRestoration", str_value(vm, "auto"), kWritable);
+  vm.define_named(g, "history", Value::make_object(history), kWritable);
+
+  // storage
+  c.storage_proto = vm.new_plain();
+  vm.define_native(c.storage_proto, "getItem", storage_get_item, 1);
+  vm.define_native(c.storage_proto, "setItem", storage_set_item, 2);
+  vm.define_native(c.storage_proto, "removeItem", storage_remove_item, 1);
+  vm.define_native(c.storage_proto, "clear", storage_clear, 0);
+  vm.define_native(c.storage_proto, "key", storage_key, 1);
+  c.local_storage = vm.new_host_object(c.storage_proto, &kStorageClass, &c.host.local_storage());
+  c.session_storage = vm.new_host_object(c.storage_proto, &kStorageClass, &c.host.session_storage());
+  vm.define_named(g, "localStorage", Value::make_object(c.local_storage), kWritable);
+  vm.define_named(g, "sessionStorage", Value::make_object(c.session_storage), kWritable);
+
+  // media queries
+  c.media_query_proto = vm.new_plain();
+  vm.define_native(c.media_query_proto, "addListener", mql_add_listener, 1);
+  vm.define_native(c.media_query_proto, "removeListener", mql_remove_listener, 1);
+  vm.define_native(c.media_query_proto, "addEventListener", mql_add_listener, 2);
+  vm.define_native(c.media_query_proto, "removeEventListener", mql_remove_listener, 2);
+  vm.define_native(c.media_query_proto, "dispatchEvent", mql_dispatch, 1);
+  define_function_global(vm, "matchMedia", win_match_media, 1);
+
+  // functions of the window
+  define_function_global(vm, "getComputedStyle", win_get_computed_style, 2);
+  define_function_global(vm, "requestAnimationFrame", win_request_animation_frame, 1);
+  define_function_global(vm, "cancelAnimationFrame", win_cancel_animation_frame, 1);
+  define_function_global(vm, "queueMicrotask", win_queue_microtask, 1);
+  define_function_global(vm, "scrollTo", win_scroll_to, 2);
+  define_function_global(vm, "scroll", win_scroll_to, 2);
+  define_function_global(vm, "scrollBy", win_scroll_by, 2);
+  define_function_global(vm, "confirm", win_confirm, 1);
+  define_function_global(vm, "prompt", win_prompt, 2);
+  for (const char* name : {"open", "close", "focus", "blur", "print", "stop", "moveTo", "resizeTo", "postMessage"}) define_function_global(vm, name, win_do_nothing, 0);
+  define_function_global(vm, "structuredClone", win_structured_clone, 1);
+  define_function_global(vm, "btoa", win_btoa, 1);
+  define_function_global(vm, "atob", win_atob, 1);
+  define_function_global(vm, "encodeURIComponent", win_encode_uri_component, 1);
+  define_function_global(vm, "encodeURI", win_encode_uri, 1);
+  define_function_global(vm, "decodeURIComponent", win_decode_uri_component, 1);
+  define_function_global(vm, "decodeURI", win_decode_uri, 1);
+  vm.define_named(g, "name", str_value(vm, ""), kWritable);
+  vm.define_named(g, "status", str_value(vm, ""), kWritable);
+  vm.define_named(g, "closed", bool_value(false), kWritable);
+  vm.define_named(g, "length", num_value(0), kWritable);
+  vm.define_named(g, "opener", Value::make_null(), kWritable);
+  vm.define_named(g, "top", Value::make_object(g), kWritable);
+  vm.define_named(g, "parent", Value::make_object(g), kWritable);
+  vm.define_named(g, "frames", Value::make_object(g), kWritable);
+  vm.define_named(g, "frameElement", Value::make_null(), kWritable);
+  vm.define_named(g, "isSecureContext", bool_value(false), kWritable);
+  vm.define_named(g, "onload", Value::make_null(), kWritable);
+
+  // screen, navigator, performance
+  JsObject* screen = vm.new_plain();
+  vm.define_named(screen, "colorDepth", num_value(24));
+  vm.define_named(screen, "pixelDepth", num_value(24));
+  JsObject* orientation = vm.new_plain();
+  vm.define_named(orientation, "type", str_value(vm, "landscape-primary"));
+  vm.define_named(orientation, "angle", num_value(0));
+  vm.define_named(screen, "orientation", Value::make_object(orientation));
+  vm.define_named(g, "screen", Value::make_object(screen), kWritable);
+  Value navigator;
+  if (vm.get_named(Value::make_object(g), "navigator", &navigator) && navigator.is_object()) {
+    JsObject* n = navigator.as_object();
+    vm.define_named(n, "platform", str_value(vm, "TheoryCraftOS"));
+    vm.define_named(n, "vendor", str_value(vm, ""));
+    vm.define_named(n, "onLine", bool_value(true));
+    vm.define_named(n, "cookieEnabled", bool_value(true));
+    vm.define_named(n, "hardwareConcurrency", num_value(1));
+    vm.define_named(n, "doNotTrack", Value::make_null());
+    JsObject* languages = vm.new_array();
+    vm.array_push(languages, str_value(vm, "en-US"));
+    vm.define_named(n, "languages", Value::make_object(languages));
+  }
+  JsObject* performance = vm.new_plain();
+  vm.define_native(performance, "now", performance_now, 0);
+  vm.define_native(performance, "mark", win_do_nothing, 1);
+  vm.define_native(performance, "measure", win_do_nothing, 1);
+  vm.define_native(performance, "getEntriesByName", empty_array_native, 1);
+  vm.define_native(performance, "getEntriesByType", empty_array_native, 1);
+  vm.define_named(performance, "timeOrigin", num_value(vm.clock_ms()));
+  vm.define_named(g, "performance", Value::make_object(performance), kWritable);
+
+  // console extras
+  Value console;
+  if (vm.get_named(Value::make_object(g), "console", &console) && console.is_object()) {
+    JsObject* o = console.as_object();
+    vm.define_native(o, "assert", console_assert, 2);
+    vm.define_native(o, "dir", console_log_like, 1);
+    vm.define_native(o, "table", console_log_like, 1);
+    vm.define_native(o, "group", console_log_like, 1);
+    vm.define_native(o, "groupCollapsed", console_log_like, 1);
+    vm.define_native(o, "groupEnd", win_do_nothing, 0);
+    vm.define_native(o, "trace", console_log_like, 1);
+    vm.define_native(o, "clear", win_do_nothing, 0);
+    vm.define_native(o, "time", console_time, 1);
+    vm.define_native(o, "timeEnd", console_time_end, 1);
+    vm.define_native(o, "timeLog", console_time_log, 1);
+    vm.define_native(o, "count", console_count, 1);
+  }
+
+  // observers and the like exist but never report
+  for (const char* name : {"MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"}) {
+    JsObject* proto = vm.new_plain();
+    vm.define_native(proto, "observe", win_do_nothing, 1);
+    vm.define_native(proto, "unobserve", win_do_nothing, 1);
+    vm.define_native(proto, "disconnect", win_do_nothing, 0);
+    vm.define_native(proto, "takeRecords", empty_array_native, 0);
+    JsObject* f = vm.new_native(observer_constructor, name, 1);
+    vm.define(f, vm.prototype_name(), Value::make_object(proto), 0);
+    vm.define(proto, vm.intern("constructor"), Value::make_object(f), kWritable);
+    vm.define_named(g, name, Value::make_object(f), kWritable);
+  }
+  update_metrics(c);
+  return !vm.halted();
+}
+
+}  // namespace bind
+
+void DomBindings::set_ready_state(StringView state) {
+  Impl& c = *impl_;
+  vm_.define_named(wrap(c.doc.root()), "readyState", bind::str_value(vm_, state), script::kWritable);
+}
+
+void DomBindings::update_window_metrics() { bind::update_metrics(*impl_); }
+
+uint32_t DomBindings::media_changed() { return bind::media_changed_impl(*impl_); }
+
+}  // namespace browser

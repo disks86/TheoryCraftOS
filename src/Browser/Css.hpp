@@ -30,6 +30,8 @@
 // margin and padding (top and bottom as blank lines - about 16 pixels or one em each - and left as columns of 8 pixels), list-style none. Everything
 // else (sizes, borders, floats, positions, fonts) is read and ignored.
 #pragma once
+#include "Browser/Media.hpp"
+#include "Dom/Selector.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
@@ -75,45 +77,27 @@ struct Style {
   }
 };
 
-// One element as selectors see it: the names are as written in the page.
-struct ElementView {
-  StringView tag, id, classes, attrs;
-  uint32_t index = 0;   // how many elements came before it among its parent's children
-};
-
 class StyleSheet {
  public:
   static constexpr uint32_t kMaxRules = 10000;
 
-  explicit StyleSheet(allocators::IAllocator& allocator) : allocator_(allocator), pool_(allocator), tests_(allocator), compounds_(allocator), selectors_(allocator), declarations_(allocator), rules_(allocator) {}
+  explicit StyleSheet(allocators::IAllocator& allocator) : allocator_(allocator), pool_(allocator), selectors_(allocator), declarations_(allocator), rules_(allocator) {}
   StyleSheet(const StyleSheet&) = delete;
   StyleSheet& operator=(const StyleSheet&) = delete;
 
-  // Adds the rules of a stylesheet (later ones win over earlier ones of the same specificity). False if memory ran out.
-  bool parse(StringView css);
+  // Adds the rules of a stylesheet (later ones win over earlier ones of the same specificity); @media rules apply when `env` satisfies their query. False
+  // if memory ran out.
+  bool parse(StringView css, const MediaEnvironment& env = MediaEnvironment());
   void clear();
   uint32_t rule_count() const { return static_cast<uint32_t>(rules_.count()); }
 
-  // Applies what the sheet says about the element at the end of `path` (the elements from the outermost to the element itself) to `style`, then
-  // `inline_style` (the style attribute) on top. Properties that are not understood are skipped.
-  void apply(const ElementView* path, uint32_t depth, StringView inline_style, Style* style) const;
+  // Applies what the sheet says about the element to `style`, then `inline_style` (the style attribute) on top. Properties that are not understood are
+  // skipped.
+  void apply(const dom::Node* element, StringView inline_style, Style* style) const;
   // Reads declarations ("color: red; font-weight: bold") into `style`; `important` picks which of the normal and !important ones are applied.
   static void apply_declarations(StringView text, bool important, Style* style);
 
  private:
-  enum class Combinator : uint8_t { None, Descendant, Child };
-  enum class TestKind : uint8_t { Tag, Id, Class, Has, Equals, Includes, Prefix, Suffix, Contains, FirstChild, Link };
-  struct Test {
-    TestKind kind;
-    uint32_t name_offset, name_length, value_offset, value_length;
-  };
-  struct Compound {
-    Combinator combinator;   // how it relates to the compound before it
-    uint32_t first_test, test_count;
-  };
-  struct Selector {
-    uint32_t first_compound, compound_count, specificity, rule;
-  };
   struct Declaration {
     uint8_t property;
     bool important;
@@ -125,10 +109,7 @@ class StyleSheet {
 
   bool parse_block(StringView css, uint64_t* at, bool nested);
   bool parse_rule(StringView prelude, StringView body);
-  bool parse_selector(StringView text, uint32_t rule);
   bool add_declarations(StringView body, uint32_t rule);
-  bool matches(const Selector& selector, uint32_t compound, const ElementView* path, uint32_t index) const;
-  bool compound_matches(const Compound& compound, const ElementView& element) const;
   StringView text(uint32_t offset, uint32_t length) const { return pool_.view().substr(offset, length); }
   bool keep(StringView s, uint32_t* offset) {
     *offset = static_cast<uint32_t>(pool_.size());
@@ -137,9 +118,8 @@ class StyleSheet {
 
   allocators::IAllocator& allocator_;
   String pool_;
-  List<Test> tests_;
-  List<Compound> compounds_;
-  List<Selector> selectors_;
+  dom::SelectorSet selectors_;
+  const MediaEnvironment* env_ = nullptr;
   List<Declaration> declarations_;
   List<Rule> rules_;
 };
