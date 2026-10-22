@@ -39,6 +39,12 @@ class IPageLoader {
  public:
   // Fetches `address` (an http:// or https:// address). True if an answer arrived - whatever its status; false (with `error` set) if not.
   virtual bool fetch(StringView address, PageResult* result) = 0;
+  // Sends `body` (of that content type) to `address` with POST - a form with method=post - and takes the page that comes back. The same answer as fetch().
+  virtual bool post(StringView address, StringView content_type, StringView body, PageResult* result) {
+    (void)address; (void)content_type; (void)body;
+    result->error.assign("This browser cannot send forms with POST.");
+    return false;
+  }
 
  protected:
   IPageLoader() = default;

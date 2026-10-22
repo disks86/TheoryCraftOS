@@ -259,7 +259,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (IS("doctype")) { *out = Value::make_null(); return true; }
     if (IS("defaultView")) { *out = Value::make_object(vm.global()); return true; }
     if (IS("location")) { *out = object_value(c.location); return true; }
-    if (IS("activeElement") || IS("scrollingElement")) { *out = node_value(c, IS("activeElement") ? n->owner->body() : n->owner->document_element()); return true; }
+    if (IS("activeElement") || IS("scrollingElement")) { *out = node_value(c, IS("activeElement") ? (c.host.focused() ? c.host.focused() : n->owner->body()) : n->owner->document_element()); return true; }
     if (IS("currentScript")) { *out = node_value(c, c.current_script); return true; }
     if (IS("hidden")) { *out = bool_value(false); return true; }
     if (IS("visibilityState")) { *out = str_value(vm, "visible"); return true; }
@@ -316,6 +316,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (IS("contentEditable")) { *out = str_value(vm, "inherit"); return true; }
   if (IS("draggable") || IS("spellcheck")) { *out = bool_value(false); return true; }
   if (IS("sheet")) { *out = Value::make_null(); return true; }
+  if (element && is_form_element(n) && form_get(c, n, k, out)) return true;
   if (IS("form")) {
     dom::Node* f = nullptr;
     if (is_control(n))
@@ -396,6 +397,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       default: *out = str_value(vm, present ? v : StringView()); return true;
     }
   }
+  if (element && n->is_tag("form") && form_lookup_named(c, n, k, out)) return true;
   return false;
 }
 
@@ -413,6 +415,10 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
   };
   if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("canvas"))) {
     const HostClass::Set handled = media_set(c, n, k, value);
+    if (handled != HostClass::Set::NotHandled) return handled;
+  }
+  if (element && is_form_element(n)) {
+    const HostClass::Set handled = form_set(c, n, k, value);
     if (handled != HostClass::Set::NotHandled) return handled;
   }
   if (IS("textContent") || (element && (IS("innerText") || IS("outerText")))) {

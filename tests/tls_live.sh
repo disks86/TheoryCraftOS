@@ -9,7 +9,7 @@ work=${TMPDIR:-/tmp}/tcos-tls-live
 mkdir -p "$work"
 tool=$work/TlsLive
 g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -I tests -Wall -Wextra -Wno-unused-parameter tests/TlsLive.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-  src/Network/Tls/*.cpp src/Network/Ipp/*.cpp src/Hardware/Printer/IppPrinter.cpp src/Crypto/*.cpp -o "$tool" || exit 1
+  src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Ipp/*.cpp src/Hardware/Printer/IppPrinter.cpp src/Crypto/*.cpp -o "$tool" || exit 1
 
 cd "$work"
 make_ca() { openssl req -x509 -newkey "${@:2}" -nodes -keyout "$1-ca.key" -out "$1-ca.pem" -days 365 -subj "/CN=Test CA $1" \
@@ -59,6 +59,18 @@ for s in ECDHE-ECDSA-AES128-GCM-SHA256 ECDHE-ECDSA-AES256-GCM-SHA384 ECDHE-ECDSA
   run "1.2 suite $s (P-256)" p256 "-www -tls1_2 -cipher $s" "--tls12" "$OK12"
   run "1.2 suite $s (P-384)" p384 "-www -tls1_2 -cipher $s" "--tls12" "$OK12"
 done
+# AES-CBC with an HMAC (the client prefers AEAD suites, so the server is limited to the CBC one; with encrypt-then-MAC when the server has it, and without)
+for s in ECDHE-RSA-AES128-SHA ECDHE-RSA-AES256-SHA ECDHE-RSA-AES128-SHA256 ECDHE-RSA-AES256-SHA384; do
+  run "1.2 suite $s (EtM)"    rsa "-www -tls1_2 -cipher $s" "--tls12" "$OK12.*CBC.*, etm"
+  run "1.2 suite $s (no EtM)" rsa "-www -tls1_2 -no_etm -cipher $s" "--tls12" "$OK12.*CBC.*ems$"
+done
+for s in ECDHE-ECDSA-AES128-SHA ECDHE-ECDSA-AES256-SHA384; do
+  run "1.2 suite $s (P-256)"  p256 "-www -tls1_2 -cipher $s" "--tls12" "$OK12"
+  run "1.2 suite $s (P-384, no EtM)" p384 "-www -tls1_2 -no_etm -cipher $s" "--tls12" "$OK12"
+done
+run "1.2 CBC bigger records (EtM)"    rsa "-WWW -tls1_2 -cipher ECDHE-RSA-AES256-SHA" "--tls12 --get /big.bin --bytes 3000000" "received 3[0-9]{6} bytes"
+run "1.2 CBC bigger records (no EtM)" rsa "-WWW -tls1_2 -no_etm -cipher ECDHE-RSA-AES128-SHA256" "--tls12 --get /big.bin --bytes 3000000" "received 3[0-9]{6} bytes"
+run "1.2 CBC refused when disabled"   rsa "-www -tls1_2 -cipher ECDHE-RSA-AES128-SHA" "--tls12 --no-cbc" "FAILED handshake"
 for g in X25519 P-256 P-384; do
   run "1.3 group $g" rsa "-www -tls1_3 -groups $g" "--tls13" "$OK13"
   run "1.2 group $g" rsa "-www -tls1_2 -groups $g" "--tls12" "$OK12"

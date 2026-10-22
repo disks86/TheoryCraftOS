@@ -23,7 +23,12 @@
 namespace browser {
 
 struct DomBindings::Impl {
-  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()) {}
+  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()) {}
+  struct CustomValidity {
+    explicit CustomValidity(allocators::IAllocator& a) : message(a) {}
+    uint32_t serial = 0;
+    String message;
+  };
 
   script::Vm& vm;
   dom::Document& doc;
@@ -44,6 +49,7 @@ struct DomBindings::Impl {
   dom::Node* current_script = nullptr;
   uint32_t error_count = 0;
   String first_error;
+  List<CustomValidity> custom_validity;   // setCustomValidity() messages of controls
   int32_t scroll_line = 0;
   script::JsString *k_length = nullptr;
 };
@@ -95,6 +101,12 @@ bool install_nodes(DomBindings::Impl& c);
 bool install_events(DomBindings::Impl& c);
 bool install_window(DomBindings::Impl& c);
 bool install_styles(DomBindings::Impl& c);
+bool install_forms(DomBindings::Impl& c);   // <form>, controls, FormData (DomBindingsForm.cpp)
+// Properties of form controls and forms; true when handled / Handled when it was.
+bool form_get(DomBindings::Impl& c, dom::Node* element, StringView key, Value* out);
+HostClass::Set form_set(DomBindings::Impl& c, dom::Node* element, StringView key, const Value& value);
+bool is_form_element(const dom::Node* n);
+bool form_lookup_named(DomBindings::Impl& c, dom::Node* n, StringView key, Value* out);
 bool install_media(DomBindings::Impl& c);   // <img>, <video>, <canvas>, the 2D context, ImageData, Path2D, typed arrays (DomBindingsMedia.cpp)
 // Properties of <img>, <video> and <canvas> elements; true when handled / Handled when it was.
 bool media_get(DomBindings::Impl& c, dom::Node* element, StringView key, Value* out);

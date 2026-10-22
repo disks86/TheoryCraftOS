@@ -51,6 +51,7 @@ const char* http_error_name(HttpError error) {
     case HttpError::Refused: return "stopped by the program";
     case HttpError::Cancelled: return "cancelled";
     case HttpError::OutOfMemory: return "out of memory";
+    case HttpError::WebSocketHandshake: return "WebSocket upgrade refused";
   }
   return "";
 }
@@ -134,7 +135,8 @@ bool gunzip(ConstByteView in, ByteBuffer* out, uint64_t max_output) {
 
 HttpClient::HttpClient(INetworkStack& stack, allocators::IAllocator& allocator)
     : stack_(stack), allocator_(allocator), extra_headers_(allocator), url_(allocator), content_type_(allocator), request_head_(allocator), head_(allocator),
-      reason_(allocator), headers_(allocator), body_(allocator) {}
+      reason_(allocator), headers_(allocator), body_(allocator), ws_key_(allocator), ws_offered_(allocator), ws_protocol_(allocator), ws_close_reason_(allocator),
+      ws_out_(allocator), ws_message_(allocator) {}
 
 HttpClient::~HttpClient() { release_socket(false); }
 
@@ -167,11 +169,21 @@ StringView HttpClient::find_header(StringView block, StringView name) const {
 StringView HttpClient::header(StringView name) const { return find_header(headers_.view(), name); }
 
 void HttpClient::capture_tls() {
+  if (h3_) {
+    const QuicConnection& c = h3_->connection();
+    tls_error_ = c.tls_error();
+    cert_status_ = c.certificate_status();
+    tls_alert_ = c.tls_alert();
+    cipher_suite_ = c.cipher_suite_name();
+    tls_resumed_ = h3_ && h3_->connection().tls_resumed();
+    return;
+  }
   if (!tls_socket_) return;
   tls_error_ = tls_socket_->error();
   cert_status_ = tls_socket_->certificate_status();
   tls_alert_ = tls_socket_->alert_received();
   cipher_suite_ = tls_socket_->cipher_suite_name();
+  tls_resumed_ = tls_socket_->resumed();
 }
 
 void HttpClient::release_socket(bool graceful) {
@@ -182,6 +194,7 @@ void HttpClient::release_socket(bool graceful) {
   }
   socket_ = SharedPointer<ITcpSocket>();
   tls_socket_ = nullptr;
+  h3_ = UniquePointer<Http3Exchange>();
 }
 
 void HttpClient::fail(HttpError error) {
@@ -199,6 +212,9 @@ void HttpClient::cancel() {
 bool HttpClient::start(HttpMethod method, StringView url, ConstByteView body, StringView content_type) {
   cancel();
   release_socket(false);
+  websocket_ = false;
+  ws_reader_ = UniquePointer<WsReader>();
+  ws_closed_ = ws_have_message_ = ws_sent_close_ = ws_deflate_ = false;
   error_ = HttpError::None;
   state_ = HttpState::Idle;
   redirect_count_ = 0;
@@ -206,6 +222,7 @@ bool HttpClient::start(HttpMethod method, StringView url, ConstByteView body, St
   cert_status_ = crypto::CertStatus::Ok;
   tls_alert_ = 0;
   cipher_suite_ = "";
+  tls_resumed_ = false;
   HttpUrl parsed(allocator_);
   if (!parse_http_url(url, &parsed)) {
     error_ = HttpError::BadUrl;
@@ -220,6 +237,74 @@ bool HttpClient::start(HttpMethod method, StringView url, ConstByteView body, St
     state_ = HttpState::Failed;
     return false;
   }
+  return begin_connection();
+}
+
+void HttpClient::fill_random(ByteView out) {
+  crypto::IRandom* source = random_ ? random_ : (has_tls_ ? tls_.random : nullptr);
+  if (source && source->fill(out)) return;
+  // no random source: xorshift seeded from the clock
+  if (fallback_state_ == 0) fallback_state_ = stack_.now_ms() * 0x9E3779B97F4A7C15ull + 0x1234567ull;
+  for (uint64_t i = 0; i < out.size(); ++i) {
+    fallback_state_ ^= fallback_state_ << 13;
+    fallback_state_ ^= fallback_state_ >> 7;
+    fallback_state_ ^= fallback_state_ << 17;
+    out[i] = static_cast<uint8_t>(fallback_state_ >> 24);
+  }
+}
+
+bool HttpClient::start_websocket(StringView url, StringView subprotocols) {
+  cancel();
+  release_socket(false);
+  error_ = HttpError::None;
+  state_ = HttpState::Idle;
+  redirect_count_ = 0;
+  tls_error_ = TlsError::None;
+  cert_status_ = crypto::CertStatus::Ok;
+  tls_alert_ = 0;
+  cipher_suite_ = "";
+  ws_reader_ = UniquePointer<WsReader>();
+  ws_closed_ = ws_have_message_ = ws_sent_close_ = ws_deflate_ = false;
+  ws_close_code_ = 0;
+  ws_close_reason_.clear();
+  ws_protocol_.clear();
+  ws_out_.clear();
+  ws_out_sent_ = 0;
+  ws_message_.clear();
+  // ws:// and wss:// are http:// and https:// as far as connecting goes
+  String converted(allocator_);
+  bool ok = true;
+  if (url.size() >= 5 && url.first(5).equals_ignore_case("ws://")) ok = converted.assign("http://") && converted.append(url.substr(5));
+  else if (url.size() >= 6 && url.first(6).equals_ignore_case("wss://")) ok = converted.assign("https://") && converted.append(url.substr(6));
+  else ok = converted.assign(url);
+  HttpUrl parsed(allocator_);
+  if (!ok || !parse_http_url(converted.view(), &parsed)) {
+    error_ = ok ? HttpError::BadUrl : HttpError::OutOfMemory;
+    state_ = HttpState::Failed;
+    return false;
+  }
+  // the subprotocols must be tokens
+  for (uint64_t i = 0; i < subprotocols.size(); ++i) {
+    const char c = subprotocols[i];
+    if (!is_token_char(c) && c != ',' && c != ' ') {
+      error_ = HttpError::BadUrl;
+      state_ = HttpState::Failed;
+      return false;
+    }
+  }
+  uint8_t key[16];
+  fill_random(ByteView(key, sizeof key));
+  ws_key_.clear();
+  if (!ws_base64(ConstByteView(key, sizeof key), &ws_key_) || !ws_offered_.assign(subprotocols)) {
+    error_ = HttpError::OutOfMemory;
+    state_ = HttpState::Failed;
+    return false;
+  }
+  url_ = util::move(parsed);
+  method_ = HttpMethod::Get;
+  request_body_ = ConstByteView();
+  content_type_.clear();
+  websocket_ = true;
   return begin_connection();
 }
 
@@ -239,6 +324,7 @@ bool HttpClient::begin_connection() {
   line_length_ = 0;
   decoded_ = false;
   sent_ = 0;
+  h3_failed_ = h3_used_ = address_ready_ = false;
   if (url_.https && !has_tls_) {
     error_ = HttpError::NoTlsConfiguration;
     state_ = HttpState::Failed;
@@ -284,6 +370,14 @@ bool HttpClient::build_request() {
   }
   ok = ok && text("\r\n");
   if (!has_extra_header("user-agent")) ok = ok && text("User-Agent: TheoryCraftOS\r\n");
+  if (websocket_) {
+    ok = ok && text("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ") && view(ws_key_.view()) && text("\r\nSec-WebSocket-Version: 13\r\n");
+    if (!ws_offered_.empty()) ok = ok && text("Sec-WebSocket-Protocol: ") && view(ws_offered_.view()) && text("\r\n");
+    if (ws_offer_deflate_) ok = ok && text("Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n");
+    ok = ok && view(extra_headers_.view()) && text("\r\n");
+    request_total_ = request_head_.size();
+    return ok;
+  }
   if (!has_extra_header("accept")) ok = ok && text("Accept: */*\r\n");
   if (!has_extra_header("accept-encoding")) ok = ok && text(sink_ ? "Accept-Encoding: identity\r\n" : "Accept-Encoding: gzip, deflate\r\n");
   ok = ok && text("Connection: close\r\n");
@@ -297,11 +391,215 @@ bool HttpClient::build_request() {
   return ok;
 }
 
+// Opens the TCP connection (wrapped in TLS for https) to address_. False if the request failed.
+bool HttpClient::open_tcp() {
+  if (url_.https) {
+    TlsConfig config = tls_;
+    config.server_name = literal_address_ ? nullptr : url_.host.c_str();
+    config.alpn = "http/1.1";
+    if (session_cache_) config.sessions = session_cache_;
+    SharedPointer<ITcpSocket> socket = SharedPointer<ITcpSocket>::make_as<TlsSocket>(allocator_, stack_, allocator_, config);
+    tls_socket_ = static_cast<TlsSocket*>(socket.get());
+    socket_ = util::move(socket);
+  } else {
+    socket_ = stack_.tcp_open();
+  }
+  if (!socket_) {
+    fail(HttpError::OutOfMemory);
+    return false;
+  }
+  if (!socket_->connect(address_, url_.port)) {
+    fail(HttpError::Connect);
+    return false;
+  }
+  state_ = HttpState::Connecting;
+  return true;
+}
+
+// ---- HTTP/3
+
+namespace {
+
+void lower_into(String* out, StringView text) {
+  for (uint64_t i = 0; i < text.size(); ++i) out->push_back(text[i] >= 'A' && text[i] <= 'Z' ? static_cast<char>(text[i] + 32) : text[i]);
+}
+
+bool connection_specific(StringView name) {
+  return name == "connection" || name == "host" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade" || name == "te";
+}
+
+}  // namespace
+
+// Starts the request over HTTP/3 if the policy and the Alt-Svc cache allow it. True if it has been started (the exchange is in h3_).
+bool HttpClient::try_http3() {
+  if (!url_.https || !has_tls_ || websocket_ || literal_address_ || http3_mode_ == Http3Mode::Off) return false;
+  uint16_t port = url_.port;
+  const bool known = alt_svc_ && alt_svc_->find(url_.host.view(), url_.port, stack_.now_ms(), &port);
+  if (!known) {
+    if (http3_mode_ != Http3Mode::Prefer) return false;
+    port = url_.port;
+    if (alt_svc_ && alt_svc_->is_broken(url_.host.view(), url_.port, stack_.now_ms())) return false;   // (it failed lately)
+  }
+  h3::HeaderList request(allocator_);
+  String authority(allocator_);
+  bool ok = authority.assign(url_.host.view());
+  if (!url_.default_port()) ok = ok && authority.push_back(':') && authority.append_uint(url_.port);
+  const bool with_body = method_ == HttpMethod::Post || method_ == HttpMethod::Put || method_ == HttpMethod::Patch;
+  ok = ok && request.add(":method", http_method_name(method_)) && request.add(":scheme", "https") && request.add(":authority", authority.view()) &&
+       request.add(":path", url_.path.view());
+  if (!has_extra_header("user-agent")) ok = ok && request.add("user-agent", "TheoryCraftOS");
+  if (!has_extra_header("accept")) ok = ok && request.add("accept", "*/*");
+  if (!has_extra_header("accept-encoding")) ok = ok && request.add("accept-encoding", sink_ ? "identity" : "gzip, deflate");
+  if (with_body) {
+    String length(allocator_);
+    if (!content_type_.empty()) ok = ok && request.add("content-type", content_type_.view());
+    ok = ok && length.append_uint(request_body_.size()) && request.add("content-length", length.view());
+  }
+  const StringView block = extra_headers_.view();
+  for (uint64_t at = 0; ok && at < block.size();) {
+    uint64_t end = block.find('\n', at);
+    end = end == StringView::npos ? block.size() : end + 1;
+    StringView line = block.substr(at, end - at);
+    at = end;
+    while (!line.empty() && (line[line.size() - 1] == '\n' || line[line.size() - 1] == '\r')) line = line.first(line.size() - 1);
+    const uint64_t colon = line.find(':');
+    if (colon == StringView::npos) continue;
+    String name(allocator_);
+    lower_into(&name, line.first(colon));
+    if (connection_specific(name.view())) continue;
+    StringView value = line.substr(colon + 1);
+    while (!value.empty() && value[0] == ' ') value = value.substr(1);
+    ok = ok && request.add(name.view(), value);
+  }
+  QuicConfig config;
+  config.tls = tls_;
+  config.tls.server_name = url_.host.c_str();
+  if (session_cache_) config.tls.sessions = session_cache_;
+  config.handshake_timeout_ms = connect_timeout_ms_ < 5000 ? connect_timeout_ms_ : 5000;
+  UniquePointer<Http3Exchange> exchange;
+  if (ok) exchange = UniquePointer<Http3Exchange>::make(allocator_, stack_, allocator_, config);
+  if (!ok || !exchange || !exchange->start(address_, port, url_.host.view(), request, with_body ? request_body_ : ConstByteView())) {
+    h3_failed_ = true;
+    return false;
+  }
+  h3_ = util::move(exchange);
+  h3_port_ = port;
+  state_ = HttpState::Connecting;
+  const uint64_t now = stack_.now_ms();
+  deadline_ms_ = now + connect_timeout_ms_;
+  last_progress_ms_ = now;
+  return true;
+}
+
+// The QUIC attempt is given up before the server has taken the request: the request goes over TCP instead.
+void HttpClient::h3_drop(bool learn_failure) {
+  if (learn_failure && alt_svc_) alt_svc_->mark_broken(url_.host.view(), url_.port, stack_.now_ms());
+  h3_ = UniquePointer<Http3Exchange>();
+  h3_failed_ = true;
+  tls_error_ = TlsError::None;
+  cert_status_ = crypto::CertStatus::Ok;
+  tls_alert_ = 0;
+  cipher_suite_ = "";
+  state_ = HttpState::Resolving;
+  const uint64_t now = stack_.now_ms();
+  deadline_ms_ = now + connect_timeout_ms_;
+  last_progress_ms_ = now;
+}
+
+void HttpClient::learn_alt_svc() {
+  if (!alt_svc_ || !url_.https) return;
+  const StringView value = header("alt-svc");
+  if (!value.empty()) alt_svc_->learn(url_.host.view(), url_.port, value, stack_.now_ms());
+}
+
+// The final head of the answer has arrived: status and headers are taken over and the body is laid out. False once the request has ended (a redirect included).
+bool HttpClient::h3_head() {
+  const h3::HeaderList& fields = h3_->response();
+  status_ = h3_->status();
+  reason_.clear();
+  headers_.clear();
+  for (uint64_t i = 0; i < fields.count(); ++i) {
+    if (!headers_.append(fields.name(i)) || !headers_.append(": ") || !headers_.append(fields.value(i)) || !headers_.append("\r\n")) {
+      fail(HttpError::OutOfMemory);
+      return false;
+    }
+  }
+  body_mode_ = Body::UntilClose;
+  content_length_ = ~uint64_t{0};
+  if (method_ == HttpMethod::Head || status_ == 204 || status_ == 304) {
+    body_mode_ = Body::None;
+  } else if (!header("content-length").empty()) {
+    uint64_t length = 0;
+    if (!parse_decimal(header("content-length"), &length)) {
+      fail(HttpError::Protocol);
+      return false;
+    }
+    content_length_ = length;
+    body_mode_ = length == 0 ? Body::None : Body::Length;
+    if (!sink_ && length > max_body_) {
+      fail(HttpError::TooLarge);
+      return false;
+    }
+  }
+  head_done_ = true;
+  h3_used_ = true;
+  state_ = HttpState::ReceivingBody;
+  learn_alt_svc();
+  if (is_redirect(status_) && max_redirects_ > 0 && !header("location").empty()) {
+    follow_redirect();
+    return false;
+  }
+  return true;
+}
+
+void HttpClient::poll_http3(uint64_t now) {
+  Http3Exchange& x = *h3_;
+  x.poll();
+  const Http3Phase phase = x.phase();
+  if (phase == Http3Phase::Failed) {
+    const Http3Error e = x.error();
+    const bool fall_back = !x.head_ready() && (e == Http3Error::Refused || (e == Http3Error::Connection && (!x.connection().established() || method_ == HttpMethod::Get || method_ == HttpMethod::Head)));
+    if (fall_back) return h3_drop(true);
+    capture_tls();
+    switch (e) {
+      case Http3Error::Connection:
+        return fail(x.connection().error() == QuicError::Tls ? HttpError::Tls : x.connection().error() == QuicError::Timeout ? HttpError::Timeout : HttpError::Connect);
+      case Http3Error::TooLarge: return fail(HttpError::TooLarge);
+      case Http3Error::Internal: return fail(HttpError::OutOfMemory);
+      case Http3Error::Cancelled: return fail(HttpError::Cancelled);
+      default: return fail(HttpError::Protocol);
+    }
+  }
+  if (state_ == HttpState::Connecting && phase != Http3Phase::Connecting) {
+    state_ = HttpState::ReceivingHead;
+    last_progress_ms_ = stack_.now_ms();
+  }
+  if (x.head_ready() && !head_done_ && !h3_head()) return;
+  if (head_done_) {
+    const ConstByteView pending = x.pending_body();
+    if (!pending.empty()) {
+      last_progress_ms_ = stack_.now_ms();
+      if (body_mode_ != Body::None && !emit(pending)) return;
+      x.consume_body(pending.size());
+    }
+    if (phase == Http3Phase::Done && x.pending_body().empty()) {
+      if (body_mode_ == Body::Length && received_ != content_length_) return fail(HttpError::Protocol);
+      return finish();
+    }
+  }
+  // (`now` is older than a progress stamp taken above: see poll())
+  if (busy() && now > last_progress_ms_ && now - last_progress_ms_ > stall_timeout_ms_) fail(HttpError::Timeout);
+}
+
 void HttpClient::poll() {
+  if (state_ == HttpState::Upgraded) {
+    ws_service();
+    return;
+  }
   if (!busy()) return;
   const uint64_t now = stack_.now_ms();
   if (state_ == HttpState::Resolving) {
-    if (!literal_address_) {
+    if (!literal_address_ && !address_ready_) {
       if (!dns_) return fail(HttpError::Resolve);
       const DnsStatus status = dns_->status();
       if (status == DnsStatus::Pending) {
@@ -311,22 +609,12 @@ void HttpClient::poll() {
       if (status != DnsStatus::Resolved) return fail(HttpError::Resolve);
       address_ = dns_->address();
       dns_ = SharedPointer<IDnsQuery>();
+      address_ready_ = true;
     }
-    // Open the connection (wrapped in TLS for https).
-    if (url_.https) {
-      TlsConfig config = tls_;
-      config.server_name = literal_address_ ? nullptr : url_.host.c_str();
-      config.alpn = "http/1.1";
-      SharedPointer<ITcpSocket> socket = SharedPointer<ITcpSocket>::make_as<TlsSocket>(allocator_, stack_, allocator_, config);
-      tls_socket_ = static_cast<TlsSocket*>(socket.get());
-      socket_ = util::move(socket);
-    } else {
-      socket_ = stack_.tcp_open();
-    }
-    if (!socket_) return fail(HttpError::OutOfMemory);
-    if (!socket_->connect(address_, url_.port)) return fail(HttpError::Connect);
-    state_ = HttpState::Connecting;
+    if (!h3_failed_ && try_http3()) return;
+    if (!open_tcp()) return;
   }
+  if (h3_) return poll_http3(now);
   if (state_ == HttpState::Connecting) {
     if (socket_->failed()) return fail(tls_socket_ ? HttpError::Tls : HttpError::Connect);
     if (now > deadline_ms_) return fail(HttpError::Timeout);
@@ -351,7 +639,8 @@ void HttpClient::poll() {
   if (state_ == HttpState::Sending || state_ == HttpState::ReceivingHead || state_ == HttpState::ReceivingBody) {
     if (!pump_receive()) return;
   }
-  if (busy() && now - last_progress_ms_ > stall_timeout_ms_) fail(HttpError::Timeout);
+  // (`now` was read before pump_receive() stamped last_progress_ms_ with a later time, so the difference can be negative: it must not wrap around)
+  if (busy() && now > last_progress_ms_ && now - last_progress_ms_ > stall_timeout_ms_) fail(HttpError::Timeout);
 }
 
 // Reads what has arrived. False once the request has ended (done, failed, or moved on to a redirect).
@@ -408,6 +697,16 @@ bool HttpClient::feed_head(ConstByteView data) {
     }
     head_.truncate(end);
     if (!parse_head()) return false;
+    if (websocket_) {   // the answer to the upgrade request: the switch, or a refusal
+      if (status_ == 101) {
+        accept_upgrade(rest.view());
+        return false;   // (reading goes on in poll(), in the Upgraded state)
+      }
+      if (status_ >= 200) {
+        fail(HttpError::WebSocketHandshake);
+        return false;
+      }
+    }
     if (status_ >= 100 && status_ < 200) {   // an interim answer: forget it, the real one follows
       head_.clear();
       if (rest.size() == 0) return true;
@@ -416,6 +715,7 @@ bool HttpClient::feed_head(ConstByteView data) {
     }
     head_done_ = true;
     state_ = HttpState::ReceivingBody;
+    learn_alt_svc();
     if (is_redirect(status_) && max_redirects_ > 0 && !header("location").empty()) {
       follow_redirect();
       return false;
@@ -462,9 +762,12 @@ bool HttpClient::parse_head() {
     fail(HttpError::OutOfMemory);
     return false;
   }
-  if (status == 101) {   // a protocol switch: nothing here speaks anything else
-    fail(HttpError::Protocol);
-    return false;
+  if (status == 101) {   // a protocol switch: only a WebSocket upgrade asks for one
+    if (!websocket_) {
+      fail(HttpError::Protocol);
+      return false;
+    }
+    return true;
   }
   if (status < 200) return true;   // interim
   // How the body is laid out.
@@ -694,7 +997,204 @@ bool HttpClient::run(uint32_t timeout_ms) {
     }
     kernel::sleep_us(100);
   }
-  return state_ == HttpState::Done;
+  return state_ == HttpState::Done || state_ == HttpState::Upgraded;
+}
+
+// ---- WebSockets
+
+// The server said 101: checks the handshake (RFC 6455 4.2.2), then the connection carries frames. `rest` is what came after the head.
+bool HttpClient::accept_upgrade(ConstByteView rest) {
+  String expected(allocator_);
+  bool ok = ws_accept_value(ws_key_.view(), &expected);
+  if (!ok) {
+    fail(HttpError::OutOfMemory);
+    return false;
+  }
+  const StringView accept = header("sec-websocket-accept");
+  ok = header("upgrade").equals_ignore_case("websocket") && list_has(header("connection"), "upgrade") && accept.equals(expected.view());
+  // the subprotocol must be one that was offered
+  const StringView protocol = header("sec-websocket-protocol");
+  if (ok && !protocol.empty()) {
+    ok = list_has(ws_offered_.view(), protocol);
+    if (ok) ok = ws_protocol_.assign(protocol);
+  }
+  // the extension: none, or permessage-deflate that was offered, without context takeover in either direction (the only way messages are handled)
+  const StringView extensions = header("sec-websocket-extensions");
+  bool deflate = false;
+  if (ok && !extensions.empty()) {
+    const uint64_t semi = extensions.find(';');
+    const StringView name = trim_blanks(semi == StringView::npos ? extensions : extensions.first(semi));
+    ok = ws_offer_deflate_ && name.equals("permessage-deflate") && extensions.find(',') == StringView::npos;
+    if (ok) {
+      bool server_no_takeover = false;
+      uint64_t at = semi;
+      ws_deflate_window_ = 15;
+      while (ok && at != StringView::npos) {
+        const uint64_t next = extensions.find(';', at + 1);
+        const StringView param = trim_blanks(extensions.substr(at + 1, (next == StringView::npos ? extensions.size() : next) - at - 1));
+        const uint64_t eq = param.find('=');
+        const StringView pname = trim_blanks(eq == StringView::npos ? param : param.first(eq));
+        uint64_t bits = 0;
+        const bool has_value = eq != StringView::npos && parse_decimal(trim_blanks(param.substr(eq + 1)), &bits);
+        if (pname.equals("server_no_context_takeover") && eq == StringView::npos) server_no_takeover = true;
+        else if (pname.equals("client_no_context_takeover") && eq == StringView::npos) {}
+        else if (pname.equals("server_max_window_bits") && has_value && bits >= 8 && bits <= 15) {}   // (a smaller window of the server's is no trouble to inflate)
+        else if (pname.equals("client_max_window_bits") && has_value && bits >= 8 && bits <= 15) ws_deflate_window_ = static_cast<uint32_t>(bits);
+        else ok = false;   // something unknown
+        at = next;
+      }
+      ok = ok && server_no_takeover;
+      deflate = ok;
+    }
+  }
+  if (!ok) {
+    fail(HttpError::WebSocketHandshake);
+    return false;
+  }
+  ws_reader_ = UniquePointer<WsReader>::make(allocator_, allocator_);
+  if (!ws_reader_) {
+    fail(HttpError::OutOfMemory);
+    return false;
+  }
+  ws_reader_->set_max_message(max_body_);
+  ws_reader_->set_deflate(deflate);
+  ws_deflate_ = deflate;
+  head_done_ = true;
+  state_ = HttpState::Upgraded;
+  last_progress_ms_ = stack_.now_ms();
+  return rest.empty() || ws_reader_->feed(rest);
+}
+
+bool HttpClient::ws_queue(WsOpcode opcode, ConstByteView payload) {
+  if (state_ != HttpState::Upgraded || ws_closed_ || ws_sent_close_) return false;
+  if (ws_out_.size() - ws_out_sent_ > (16u << 20)) return false;   // the connection is not keeping up
+  uint8_t mask[4];
+  fill_random(ByteView(mask, 4));
+  const bool data = opcode == WsOpcode::Text || opcode == WsOpcode::Binary;
+  bool ok;
+  if (data && ws_deflate_) {
+    ByteBuffer packed(allocator_);
+    ok = media::deflate_message(payload, &packed, 6, allocator_, ws_deflate_window_) && ws_build_frame(opcode, true, true, packed.view(), mask, &ws_out_);
+  } else {
+    ok = ws_build_frame(opcode, true, false, payload, mask, &ws_out_);
+  }
+  if (!ok) return false;
+  ws_flush();
+  return true;
+}
+
+bool HttpClient::ws_send_text(StringView text) {
+  return ws_queue(WsOpcode::Text, ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+}
+bool HttpClient::ws_send_binary(ConstByteView data) { return ws_queue(WsOpcode::Binary, data); }
+bool HttpClient::ws_ping(ConstByteView payload) { return payload.size() <= 125 && ws_queue(WsOpcode::Ping, payload); }
+
+bool HttpClient::ws_close(uint16_t code, StringView reason) {
+  if (state_ != HttpState::Upgraded || ws_closed_ || ws_sent_close_) return false;
+  ByteBuffer payload(allocator_);
+  if (!ws_close_payload(code, reason, &payload)) return false;
+  if (!ws_queue(WsOpcode::Close, payload.view())) return false;
+  ws_sent_close_ = true;
+  ws_close_deadline_ = stack_.now_ms() + 5000;
+  ws_flush();
+  return true;
+}
+
+void HttpClient::ws_flush() {
+  while (socket_ && ws_out_sent_ < ws_out_.size()) {
+    const uint32_t n = socket_->send(ws_out_.view().subview(ws_out_sent_));
+    if (n == 0) break;
+    ws_out_sent_ += n;
+    last_progress_ms_ = stack_.now_ms();
+  }
+  if (ws_out_sent_ == ws_out_.size() && ws_out_sent_ > 0) {
+    ws_out_.clear();
+    ws_out_sent_ = 0;
+  }
+}
+
+// The WebSocket is over: nothing more will arrive; the connection is closed once what is queued has gone out.
+void HttpClient::ws_finish(uint16_t code) {
+  if (ws_closed_) return;
+  ws_closed_ = true;
+  ws_close_code_ = code;
+}
+
+void HttpClient::ws_service() {
+  if (!socket_) return;
+  const uint64_t now = stack_.now_ms();
+  ws_flush();
+  if (!ws_closed_) {
+    // take in what the server sent, but not more than can be dealt with
+    // (a message waiting to be taken holds the rest back - unless this side has started closing: then what arrives is dropped, so the close can finish)
+    while ((!ws_have_message_ || ws_sent_close_) && ws_reader_->buffered() < (1u << 20)) {
+      uint8_t buffer[2048];
+      const uint32_t n = socket_->receive(ByteView(buffer, sizeof buffer));
+      if (n == 0) break;
+      last_progress_ms_ = now;
+      if (!ws_reader_->feed(ConstByteView(buffer, n))) {
+        ws_finish(kWsInternalError);
+        break;
+      }
+    }
+    while (!ws_closed_ && (!ws_have_message_ || ws_sent_close_)) {
+      const WsEvent e = ws_reader_->next();
+      if (e.kind == WsEvent::Kind::None) break;
+      if (e.kind == WsEvent::Kind::Message) {
+        if (ws_sent_close_) continue;
+        ws_message_.clear();
+        if (!ws_message_.append(e.payload)) {
+          ws_finish(kWsInternalError);
+          break;
+        }
+        ws_message_text_ = e.text;
+        ws_have_message_ = true;
+      } else if (e.kind == WsEvent::Kind::Ping) {
+        ByteBuffer copy(allocator_);
+        if (!ws_sent_close_ && copy.append(e.payload)) ws_queue(WsOpcode::Pong, copy.view());
+      } else if (e.kind == WsEvent::Kind::Close) {
+        ws_close_reason_.clear();
+        ws_close_reason_.assign(StringView(reinterpret_cast<const char*>(e.payload.data()), e.payload.size()));
+        if (!ws_sent_close_) {   // answer it with the same code
+          ByteBuffer payload(allocator_);
+          if (e.code != kWsNoStatus && ws_close_payload(e.code, StringView(), &payload)) ws_queue(WsOpcode::Close, payload.view());
+          else ws_queue(WsOpcode::Close, ConstByteView());
+          ws_sent_close_ = true;
+        }
+        ws_finish(e.code);
+      } else if (e.kind == WsEvent::Kind::Failure) {
+        if (!ws_sent_close_) {
+          ByteBuffer payload(allocator_);
+          if (ws_close_payload(e.code, StringView(), &payload)) ws_queue(WsOpcode::Close, payload.view());
+          ws_sent_close_ = true;
+        }
+        ws_finish(e.code);
+      }
+    }
+    if (!ws_closed_ && (!ws_have_message_ || ws_sent_close_) && (socket_->failed() || (socket_->peer_closed() && socket_->available() == 0))) ws_finish(kWsAbnormal);
+    if (!ws_closed_ && ws_sent_close_ && now > ws_close_deadline_) ws_finish(kWsAbnormal);
+  }
+  ws_flush();
+  // closed: let go of the connection when everything queued has been handed over (or the peer is gone, or we have waited long enough)
+  if (ws_closed_ && !ws_have_message_) {
+    const bool drained = ws_out_sent_ >= ws_out_.size();
+    if (drained || socket_->failed() || now > ws_close_deadline_ + 2000) {
+      release_socket(true);
+      state_ = HttpState::Done;
+    }
+  }
+}
+
+bool HttpClient::ws_receive(WebSocketMessage* message) {
+  if (state_ == HttpState::Upgraded) ws_service();
+  if (!ws_have_message_) return false;
+  message->text = ws_message_text_;
+  message->data.clear();
+  if (!message->data.append(ws_message_.view())) return false;
+  ws_have_message_ = false;
+  ws_message_.clear();
+  if (state_ == HttpState::Upgraded) ws_service();
+  return true;
 }
 
 }  // namespace network

@@ -73,6 +73,16 @@ class PageView : public Control {
   uint32_t clicked_width() const { return clicked_w_; }
   uint32_t clicked_height() const { return clicked_h_; }
 
+  // --- Keys for the page's forms
+  // With a capture mode, keys go to the page (a control being typed in) before the view scrolls with them: kCaptureTab takes Tab only (it focuses the first
+  // control), kCaptureAll takes every key but those held with Control or Alt. A taken key is queued and the handler fired; take_key() reads the queue, and
+  // scroll_key() does what the view does with a key that the page did not want.
+  enum : uint8_t { kCaptureNone = 0, kCaptureTab = 1, kCaptureAll = 2 };
+  void on_key_pressed(Handler handler) { UiGuard lock(this); key_handler_ = handler; }
+  void set_capture_keys(uint8_t mode) { UiGuard lock(this); capture_ = mode; }
+  bool take_key(KeyArgs* out);
+  bool scroll_key(const KeyArgs& args);
+
   // --- View
   uint32_t line_count() const { return layout_.line_count(); }
   uint32_t visible_lines() const { return rows_; }
@@ -112,7 +122,9 @@ class PageView : public Control {
   bool stale_ = true, syncing_ = false;
   int32_t hover_ = -1, press_link_ = -1;
   String clicked_link_, hovered_link_;
-  Handler link_handler_, hover_handler_, node_handler_, resize_handler_;
+  Handler link_handler_, hover_handler_, node_handler_, resize_handler_, key_handler_;
+  uint8_t capture_ = kCaptureNone, queued_ = 0;
+  KeyArgs queue_[16];
   uint32_t press_node_ = 0, clicked_node_ = 0, notified_columns_ = 0, notified_rows_ = 0;
   browser::IObjectPainter* objects_ = nullptr;
   uint8_t clicked_object_ = 0;

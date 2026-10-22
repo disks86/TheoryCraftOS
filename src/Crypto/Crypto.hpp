@@ -71,12 +71,15 @@ void md4(ConstByteView data, uint8_t out[16]);
 // (at most 32) from `key`, `label` and `context` (both used as given, a zero byte between them, the length in bits at the end).
 bool kdf_hmac_sha256(ConstByteView key, ConstByteView label, ConstByteView context, ByteView out);
 
-// AES with 128-, 192- or 256-bit keys: encryption of one block, and CFB-128 (NIST SP 800-38A) which needs nothing else.
+// AES with 128-, 192- or 256-bit keys: one block either way, and the CBC and CFB-128 modes (NIST SP 800-38A).
 class Aes {
  public:
   // Key of 16, 24 or 32 bytes; false for any other length.
   bool set_key(ConstByteView key);
   void encrypt_block(const uint8_t in[16], uint8_t out[16]) const;
+  void decrypt_block(const uint8_t in[16], uint8_t out[16]) const;
+  // CBC over whole 16-byte blocks, in place (a final partial block is left alone); no padding is added or checked.
+  void cbc(const uint8_t iv[16], ByteView data, bool decrypt) const;
   // Encrypts or decrypts `data` in place in CFB-128 mode with the 16-byte `iv`; any length.
   void cfb128(const uint8_t iv[16], ByteView data, bool decrypt) const;
 

@@ -19,6 +19,8 @@
 #include "Browser/Renderer.hpp"
 #include <initializer_list>
 #include "Dom/Entities.hpp"
+#include "Dom/Form.hpp"
+#include "Utility/Move.hpp"
 
 namespace browser {
 
@@ -42,7 +44,7 @@ StringView attr(const dom::Node* n, const char* name) {
 // The defaults of an element's kind (what a browser's own style sheet and the page's old-style attributes say).
 void ua_defaults(const dom::Node* n, Style* s) {
   StringView value;
-  if (tag_in(n, {"head", "title", "meta", "link", "base", "script", "style", "noscript", "template", "textarea", "select", "datalist", "iframe", "object", "svg",
+  if (tag_in(n, {"head", "title", "meta", "link", "base", "script", "style", "noscript", "template", "datalist", "iframe", "object", "svg",
                  "area", "param", "source", "track", "dialog", "noembed", "noframes"}))
     s->display = Display::None;
   if (tag_in(n, {"div", "section", "article", "header", "footer", "nav", "main", "aside", "address", "center", "details", "summary", "caption", "thead", "tbody",
@@ -105,7 +107,8 @@ bool media_applies(const dom::Node* n, const MediaEnvironment& env) {
 
 class DocumentRenderer {
  public:
-  DocumentRenderer(HtmlDocument& out, const StyleSheet& sheet, IObjectSource* objects) : out_(out), sheet_(sheet), objects_(objects), chunk_(out.allocator()), stack_(out.allocator()) {}
+  DocumentRenderer(HtmlDocument& out, const StyleSheet& sheet, const RenderOptions& options)
+      : out_(out), sheet_(sheet), objects_(options.objects), options_(options), chunk_(out.allocator()), stack_(out.allocator()) {}
 
   bool run(const dom::Document& doc) {
     const dom::Node* root = doc.root();
@@ -331,8 +334,255 @@ class DocumentRenderer {
       }
       if (n->is_tag("audio")) return false;   // (nor is an audio's: without controls it shows nothing at all)
     }
+    if (!hidden() && tag_in(n, {"input", "textarea", "select", "button", "progress", "meter"})) {
+      control(n);
+      return false;   // (what is inside a control is its value, not page text)
+    }
     if (dom::is_void_tag(n->name.view())) void_action(n);
     return true;
+  }
+
+  // --- Forms
+  static constexpr uint32_t kFieldBg = 0xFFF0F0F0u, kFocusBg = 0xFFDCE8FFu, kButtonBg = 0xFFD4D4D4u, kInk = 0xFF202020u, kGrayInk = 0xFF808080u, kListBg = 0xFFF6F6F6u,
+                            kPickedBg = 0xFFBCD4F8u;
+
+  static uint32_t number_attr(const dom::Node* n, const char* name, uint32_t fallback, uint32_t lo, uint32_t hi) {
+    uint64_t v;
+    if (!attr(n, name).trimmed().parse_uint(&v) || v == 0) return fallback;
+    return static_cast<uint32_t>(v < lo ? lo : v > hi ? hi : v);
+  }
+
+  // Printable ASCII of a value (the screen has no more), at most `limit` bytes.
+  static void shown(StringView v, bool mask, String* out) {
+    for (uint64_t i = 0; i < v.size();) {
+      const uint8_t c = static_cast<uint8_t>(v[i]);
+      if (c < 0x80) {
+        out->push_back(mask ? '*' : c >= 32 && c < 127 ? static_cast<char>(c) : ' ');
+        ++i;
+        continue;
+      }
+      const char* look = mask ? "*" : dom::ascii_look_alike(dom::next_code_point(v, &i));
+      if (mask) ++i;
+      out->append(look ? StringView(look) : StringView("?"));
+    }
+  }
+
+  static void pad(String* s, uint64_t width) {
+    while (s->size() < width) s->push_back(' ');
+  }
+
+  // One piece of a control: a run of its own that a click on goes to `owner`.
+  void control_run(const dom::Node* owner, StringView text, uint32_t color, uint32_t background, bool bold, bool new_line) {
+    flush();
+    if (text.empty()) return;
+    const Style& s = cur();
+    if (!new_line && !ended_space_) literal(" ", indent());
+    const uint8_t breaks = out_.runs_.count() == 0 ? 0 : new_line ? (pending_ > 1 ? pending_ : 1) : pending_;
+    failed_ |= !out_.add_run(text, static_cast<uint8_t>(kRunPre | (bold ? kRunBold : 0)), 0, indent(), breaks, -1, s.align, color, background, owner->serial);
+    pending_ = 0;
+    ended_space_ = false;
+  }
+
+  void control(const dom::Node* n) {
+    const bool focused = options_.focus == n->serial, disabled = dom::is_disabled(n);
+    const uint32_t ink = disabled ? kGrayInk : kInk, field_bg = focused ? kFocusBg : kFieldBg;
+    String text(out_.allocator()), value(out_.allocator());
+    if (n->is_tag("input")) {
+      const dom::InputType t = dom::input_type(n);
+      switch (t) {
+        case dom::InputType::Hidden: return;
+        case dom::InputType::Checkbox:
+          control_run(n, dom::is_checked(n) ? "[x]" : "[ ]", ink, focused ? kFocusBg : 0, false, false);
+          break;
+        case dom::InputType::Radio:
+          control_run(n, dom::is_checked(n) ? "(*)" : "( )", ink, focused ? kFocusBg : 0, false, false);
+          break;
+        case dom::InputType::Submit:
+        case dom::InputType::Reset:
+        case dom::InputType::Button:
+        case dom::InputType::Image: {
+          dom::get_value(n, &value);
+          if (t == dom::InputType::Image) value.assign(attr(n, "alt").empty() ? StringView("Submit") : attr(n, "alt"));
+          else if (value.empty() && !dom::has_attribute(n, "value")) value.assign(t == dom::InputType::Submit ? "Submit" : t == dom::InputType::Reset ? "Reset" : "");
+          text.append("[ ");
+          shown(value.view(), false, &text);
+          text.append(" ]");
+          control_run(n, text.view(), ink, focused ? kFocusBg : kButtonBg, true, false);
+          break;
+        }
+        case dom::InputType::File:
+          control_run(n, "[ Choose File ] No file chosen", kGrayInk, kButtonBg, false, false);
+          break;
+        case dom::InputType::Color: {
+          dom::get_value(n, &value);
+          uint32_t rgb = 0;
+          for (uint64_t i = 1; i < value.size(); ++i) {
+            const char c = value[i];
+            rgb = rgb << 4 | static_cast<uint32_t>(c <= '9' ? c - '0' : c - 'a' + 10);
+          }
+          const uint32_t luma = (((rgb >> 16) & 255) * 299 + ((rgb >> 8) & 255) * 587 + (rgb & 255) * 114) / 1000;
+          text.append("[");
+          shown(value.view(), false, &text);
+          text.append("]");
+          control_run(n, text.view(), luma < 128 ? 0xFFFFFFFFu : 0xFF000000u, 0xFF000000u | rgb, false, false);
+          break;
+        }
+        case dom::InputType::Range: {
+          dom::get_value(n, &value);
+          double lo = 0, hi = 100, v = 50;
+          dom::parse_number(attr(n, "min").trimmed(), &lo);
+          dom::parse_number(attr(n, "max").trimmed(), &hi);
+          dom::parse_number(value.view(), &v);
+          const uint32_t width = 14;
+          uint32_t at = hi > lo ? static_cast<uint32_t>((v - lo) / (hi - lo) * (width - 1) + 0.5) : 0;
+          if (at >= width) at = width - 1;
+          text.append("[<");
+          for (uint32_t i = 0; i < width; ++i) text.push_back(i == at ? 'o' : '-');
+          text.append("> ");
+          shown(value.view(), false, &text);
+          text.append("]");
+          control_run(n, text.view(), ink, field_bg, false, false);
+          break;
+        }
+        default: {   // a field of text
+          dom::get_value(n, &value);
+          const uint32_t cols = number_attr(n, "size", 20, 4, 60);
+          String content(out_.allocator());
+          shown(value.view(), t == dom::InputType::Password, &content);
+          const bool placeholder = content.empty() && !focused && !attr(n, "placeholder").empty();
+          if (placeholder) shown(attr(n, "placeholder"), false, &content);
+          if (focused) content.push_back('|');
+          if (content.size() > cols) content.assign(focused ? content.view().substr(content.size() - cols) : content.view().first(cols));
+          pad(&content, cols);
+          text.append("[");
+          text.append(content.view());
+          text.append("]");
+          control_run(n, text.view(), placeholder ? kGrayInk : ink, field_bg, false, false);
+          break;
+        }
+      }
+    } else if (n->is_tag("textarea")) {
+      dom::get_value(n, &value);
+      const uint32_t cols = number_attr(n, "cols", 24, 4, 80), rows = number_attr(n, "rows", 3, 1, 20);
+      List<String> lines(out_.allocator());
+      String line(out_.allocator());
+      const bool placeholder = value.empty() && !focused && !attr(n, "placeholder").empty();
+      const StringView source = placeholder ? attr(n, "placeholder") : value.view();
+      for (uint64_t i = 0; i < source.size(); ++i) {
+        const char c = source[i];
+        if (c == '\n' || line.size() >= cols) {
+          failed_ |= !lines.push_back(util::move(line));
+          line = String(out_.allocator());
+          if (c == '\n') continue;
+        }
+        const uint8_t u = static_cast<uint8_t>(c);
+        line.push_back(u >= 32 && u < 127 ? c : '?');
+      }
+      failed_ |= !lines.push_back(util::move(line));
+      if (lines.count() == 0) lines.push_back(String(out_.allocator()));
+      if (focused) lines[lines.count() - 1].push_back('|');
+      const uint64_t first = focused && lines.count() > rows ? lines.count() - rows : 0;
+      for (uint64_t r = 0; r < rows; ++r) {
+        String row(out_.allocator());
+        row.push_back('[');
+        String body(out_.allocator());
+        if (first + r < lines.count()) body.assign(lines[first + r].view());
+        if (body.size() > cols) body.assign(body.view().first(cols));
+        pad(&body, cols);
+        row.append(body.view());
+        row.push_back(']');
+        control_run(n, row.view(), placeholder ? kGrayInk : ink, field_bg, false, r > 0);
+      }
+    } else if (n->is_tag("button")) {
+      dom::text_content(n, &value);
+      bool space = true;
+      for (uint64_t i = 0; i < value.size();) {   // (the label, with white space collapsed)
+        const char c = value[i];
+        if (is_space(c)) {
+          if (!space) text.push_back(' ');
+          space = true;
+          ++i;
+        } else if (static_cast<uint8_t>(c) < 0x80) {
+          text.push_back(c);
+          space = false;
+          ++i;
+        } else {
+          const char* look = dom::ascii_look_alike(dom::next_code_point(value.view(), &i));
+          text.append(look ? StringView(look) : StringView("?"));
+          space = false;
+        }
+      }
+      while (text.size() && text[text.size() - 1] == ' ') text.truncate(text.size() - 1);
+      String label(out_.allocator());
+      label.append("[ ");
+      label.append(text.view());
+      label.append(" ]");
+      control_run(n, label.view(), ink, focused ? kFocusBg : kButtonBg, true, false);
+    } else if (n->is_tag("select")) {
+      List<dom::Node*> options(out_.allocator());
+      dom::select_options(n, &options);
+      const int32_t chosen = dom::selected_index(n);
+      const bool list = dom::select_is_list(n), open = options_.open_select == n->serial;
+      uint64_t width = 4;
+      List<String> labels(out_.allocator());
+      for (uint64_t i = 0; i < options.count(); ++i) {
+        String raw(out_.allocator()), label(out_.allocator());
+        dom::option_text(options[i], &raw);
+        shown(raw.view(), false, &label);
+        if (label.size() > 40) label.truncate(40);
+        if (label.size() > width) width = label.size();
+        labels.push_back(util::move(label));
+      }
+      if (!list) {
+        String box(out_.allocator());
+        box.push_back('[');
+        String shown_text(out_.allocator());
+        if (chosen >= 0) shown_text.assign(labels[static_cast<uint64_t>(chosen)].view());
+        pad(&shown_text, width);
+        box.append(shown_text.view());
+        box.append(open ? " ^]" : " v]");
+        control_run(n, box.view(), ink, field_bg, false, false);
+      }
+      if (list || open) {
+        const bool multiple = dom::has_attribute(n, "multiple");
+        const uint64_t shown_rows = options.count();
+        for (uint64_t i = 0; i < shown_rows && i < 24; ++i) {
+          const bool on = multiple ? dom::is_checked(options[i]) : static_cast<int32_t>(i) == chosen;
+          String row(out_.allocator());
+          row.append(multiple ? (on ? "[x] " : "[ ] ") : (on ? "(*) " : "( ) "));
+          row.append(labels[i].view());
+          pad(&row, width + 4);
+          control_run(options[i], row.view(), dom::is_disabled(options[i]) ? kGrayInk : ink, on ? kPickedBg : kListBg, false, true);
+        }
+      }
+    } else if (n->is_tag("progress") || n->is_tag("meter")) {
+      double v = 0, hi = 1, lo = 0;
+      const bool known = dom::parse_number(attr(n, "value").trimmed(), &v);
+      if (n->is_tag("meter")) {
+        dom::parse_number(attr(n, "min").trimmed(), &lo);
+        if (!dom::parse_number(attr(n, "max").trimmed(), &hi)) hi = 1;
+      } else if (!dom::parse_number(attr(n, "max").trimmed(), &hi) || hi <= 0) {
+        hi = 1;
+      }
+      const uint32_t width = 12;
+      text.push_back('[');
+      uint32_t filled = 0;
+      if (known && hi > lo) filled = static_cast<uint32_t>((v < lo ? 0 : v > hi ? 1 : (v - lo) / (hi - lo)) * width + 0.5);
+      for (uint32_t i = 0; i < width; ++i) text.push_back(!known && n->is_tag("progress") ? '.' : i < filled ? '#' : '-');
+      text.push_back(']');
+      if (known && n->is_tag("progress") && hi > lo) {
+        text.push_back(' ');
+        text.append_uint(static_cast<uint64_t>((v < 0 ? 0 : v > hi ? 1 : v / hi) * 100 + 0.5));
+        text.push_back('%');
+      }
+      control_run(n, text.view(), ink, kFieldBg, false, false);
+    }
+    if (options_.invalid_node == n->serial && !options_.invalid_text.empty()) {
+      String note(out_.allocator());
+      note.append("! ");
+      shown(options_.invalid_text, false, &note);
+      control_run(n, note.view(), 0xFFC00000u, 0, true, false);
+    }
   }
 
   // A width or height attribute: pixels, or a percentage.
@@ -420,6 +670,7 @@ class DocumentRenderer {
   HtmlDocument& out_;
   const StyleSheet& sheet_;
   IObjectSource* objects_;
+  const RenderOptions& options_;
   String chunk_;
   List<Element> stack_;
   Style root_;
@@ -511,7 +762,7 @@ bool render_document(dom::Document& doc, const RenderOptions& options, HtmlDocum
   document_title(doc, &title);
   out->title_.assign(title.view());
   out->truncated_ = doc.full();
-  DocumentRenderer renderer(*out, sheet, options.objects);
+  DocumentRenderer renderer(*out, sheet, options);
   return renderer.run(doc);
 }
 

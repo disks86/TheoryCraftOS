@@ -125,7 +125,7 @@ class WebBrowser : public gui::Frame {
   bool on_key(const gui::KeyArgs& args) override;
 
  private:
-  enum class Request : uint8_t { None, Go, Back, Forward, Reload };
+  enum class Request : uint8_t { None, Go, Back, Forward, Reload, Submit };
   struct Fetched;
 
   // What the page asks of the window.
@@ -137,6 +137,7 @@ class WebBrowser : public gui::Frame {
     UniquePointer<browser::IVideoClip> open_video(UniquePointer<ByteBuffer> data) override;
     UniquePointer<browser::IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override;
     void navigate(StringView address, bool replace) override;
+    void navigate_post(StringView address, StringView content_type, StringView body) override;
     void set_hash(StringView hash) override;
     void reload() override;
     void history_go(int32_t delta) override;
@@ -168,6 +169,7 @@ class WebBrowser : public gui::Frame {
   static void on_link(void* self, gui::Control&);
   static void on_hover(void* self, gui::Control&);
   static void on_node_click(void* self, gui::Control&);
+  static void on_form_key(void* self, gui::Control&);
   static void on_view_resized(void* self, gui::Control&);
   static void on_timers(void* self, gui::Control&);
   static void on_toggle_scripts(void* self, gui::Control&);
@@ -183,7 +185,10 @@ class WebBrowser : public gui::Frame {
   bool post(Request kind, StringView target);
   void run_request();
   void load(Request kind, StringView target);
+  bool post_form(StringView target, StringView content_type, StringView body);
   bool fetch(StringView address, Fetched* page, uint64_t limit = kMaxFileBytes);
+  bool fetch_post(StringView address, Fetched* page);
+  void update_key_capture();
   bool fetch_file(StringView path, Fetched* page, uint64_t limit = kMaxFileBytes);
   void show(Fetched& page);
   void remember(Request kind, StringView address);
@@ -213,7 +218,7 @@ class WebBrowser : public gui::Frame {
   bool canvas_accelerated_ = false;
   bool scripts_enabled_ = true, dark_ = false;
   gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr;
-  gui::Handler node_handler_, resize_handler_, timer_handler_;
+  gui::Handler node_handler_, resize_handler_, timer_handler_, key_handler_;
   Env env_;
   UniquePointer<browser::Page> live_;
   browser::MediaEnvironment media_;
@@ -221,7 +226,8 @@ class WebBrowser : public gui::Frame {
   bool defer_reload_ = false;
   int32_t defer_history_ = 0, defer_scroll_ = -1;
   String defer_go_;
-  bool want_go_ = false;
+  bool want_go_ = false, want_post_ = false;
+  String defer_type_, defer_body_, request_type_, request_body_;
   uint64_t uptime_ms_ = 0, clock_base_unix_ = 0, clock_base_up_ = 0, next_due_ms_ = 0;
   bool clock_based_ = false, timer_pending_ = false;
   uint32_t reported_errors_ = 0;

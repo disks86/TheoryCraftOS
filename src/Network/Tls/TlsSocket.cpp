@@ -17,112 +17,17 @@
  */
 
 #include "Network/Tls/TlsSocket.hpp"
+#include "Network/Tls/TlsSession.hpp"
 #include "Crypto/Ecc.hpp"
+#include "Network/Tls/TlsCertificate.hpp"
+#include "Network/Tls/TlsWire.hpp"
 
 namespace network {
 
 using namespace crypto;
 using namespace tls;
 
-namespace {
-
-// ---- wire helpers
-
-struct Reader {
-  const uint8_t* p;
-  uint32_t n;
-  bool ok = true;
-  explicit Reader(ConstByteView v) : p(v.data()), n(static_cast<uint32_t>(v.size())) {}
-  uint8_t u8() {
-    if (n < 1) { ok = false; return 0; }
-    --n;
-    return *p++;
-  }
-  uint16_t u16() {
-    const uint32_t hi = u8();
-    return static_cast<uint16_t>(hi << 8 | u8());
-  }
-  uint32_t u24() {
-    const uint32_t hi = u8();
-    const uint32_t mid = u8();
-    return hi << 16 | mid << 8 | u8();
-  }
-  ConstByteView take(uint32_t len) {
-    if (n < len) { ok = false; return ConstByteView(); }
-    ConstByteView v(p, len);
-    p += len;
-    n -= len;
-    return v;
-  }
-  bool done() const { return ok && n == 0; }
-};
-
-struct Writer {
-  uint8_t* p;
-  uint32_t cap;
-  uint32_t n = 0;
-  bool ok = true;
-  Writer(uint8_t* buffer, uint32_t capacity) : p(buffer), cap(capacity) {}
-  void u8(uint32_t v) {
-    if (n + 1 > cap) { ok = false; return; }
-    p[n++] = static_cast<uint8_t>(v);
-  }
-  void u16(uint32_t v) { u8(v >> 8); u8(v); }
-  void u24(uint32_t v) { u8(v >> 16); u8(v >> 8); u8(v); }
-  void bytes(const uint8_t* b, uint32_t len) {
-    if (n + len > cap) { ok = false; return; }
-    for (uint32_t i = 0; i < len; ++i) p[n + i] = b[i];
-    n += len;
-  }
-  uint32_t mark16() { const uint32_t at = n; u16(0); return at; }
-  uint32_t mark24() { const uint32_t at = n; u24(0); return at; }
-  void end16(uint32_t at) {
-    if (!ok) return;
-    const uint32_t len = n - at - 2;
-    p[at] = static_cast<uint8_t>(len >> 8);
-    p[at + 1] = static_cast<uint8_t>(len);
-  }
-  void end24(uint32_t at) {
-    if (!ok) return;
-    const uint32_t len = n - at - 3;
-    p[at] = static_cast<uint8_t>(len >> 16);
-    p[at + 1] = static_cast<uint8_t>(len >> 8);
-    p[at + 2] = static_cast<uint8_t>(len);
-  }
-};
-
-constexpr uint8_t kHsClientHello = 1, kHsServerHello = 2, kHsNewSessionTicket = 4, kHsEncryptedExtensions = 8, kHsCertificate = 11, kHsServerKeyExchange = 12,
-                  kHsCertificateRequest = 13, kHsServerHelloDone = 14, kHsCertificateVerify = 15, kHsClientKeyExchange = 16, kHsFinished = 20, kHsKeyUpdate = 24, kHsMessageHash = 254;
-constexpr uint16_t kExtServerName = 0, kExtGroups = 10, kExtPointFormats = 11, kExtSigAlgs = 13, kExtAlpn = 16, kExtEms = 23, kExtVersions = 43, kExtCookie = 44, kExtKeyShare = 51, kExtRenegotiation = 0xff01;
-constexpr uint16_t kGroupX25519 = 0x001d, kGroupP256 = 0x0017, kGroupP384 = 0x0018;
-constexpr uint8_t kAlertCloseNotify = 0, kAlertUnexpected = 10, kAlertBadMac = 20, kAlertOverflow = 22, kAlertHandshakeFailure = 40, kAlertBadCertificate = 42, kAlertUnsupportedCertificate = 43,
-                  kAlertCertificateExpired = 45, kAlertCertificateUnknown = 46, kAlertIllegalParameter = 47, kAlertUnknownCa = 48, kAlertDecode = 50, kAlertDecrypt = 51, kAlertProtocolVersion = 70,
-                  kAlertInsufficientSecurity = 71, kAlertInternal = 80, kAlertNoRenegotiation = 100, kAlertMissingExtension = 109, kAlertUnsupportedExtension = 110;
-const uint8_t kHelloRetryMagic[32] = {0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
-                                      0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c};
-
-// signature schemes
-constexpr uint16_t kSigEcdsaP256 = 0x0403, kSigEcdsaP384 = 0x0503, kSigPssSha256 = 0x0804, kSigPssSha384 = 0x0805, kSigPssSha512 = 0x0806,
-                   kSigPkcs1Sha256 = 0x0401, kSigPkcs1Sha384 = 0x0501, kSigPkcs1Sha512 = 0x0601;
-
-bool group_supported(uint16_t g) { return g == kGroupX25519 || g == kGroupP256 || g == kGroupP384; }
-EcCurve curve_of(uint16_t g) { return g == kGroupP256 ? EcCurve::P256 : EcCurve::P384; }
-
-uint32_t length_of(const char* s) {
-  uint32_t n = 0;
-  while (s && s[n]) ++n;
-  return n;
-}
-
-HashKind scheme_hash(uint16_t s) {
-  switch (s) {
-    case kSigEcdsaP384: case kSigPssSha384: case kSigPkcs1Sha384: return HashKind::Sha384;
-    case kSigPssSha512: case kSigPkcs1Sha512: return HashKind::Sha512;
-    default: return HashKind::Sha256;
-  }
-}
-
-}  // namespace
+using namespace tlswire;
 
 struct TlsSocket::Handshake {
   struct Share {
@@ -153,6 +58,9 @@ struct TlsSocket::Handshake {
   bool cert_requested = false;
   bool saw_certificate = false;
   bool sent_ccs = false;
+  // resumption: the ticket taken from the cache, whether it was offered and whether the server took it
+  TlsTicket ticket;
+  bool have_ticket = false, psk_offered = false, psk_accepted = false;
   // TLS 1.3
   uint8_t handshake_secret[48] = {}, master_secret[48] = {}, client_hs_secret[48] = {}, server_hs_secret[48] = {};
   // TLS 1.2
@@ -185,6 +93,9 @@ TlsSocket::TlsSocket(INetworkStack& stack, allocators::IAllocator& allocator, co
 
 TlsSocket::~TlsSocket() {
   if (state_ == St::Open && !sent_close_) close();
+  for (uint8_t& b : resumption_master_) b = 0;
+  for (uint8_t& b : client_traffic_secret_) b = 0;
+  for (uint8_t& b : server_traffic_secret_) b = 0;
 }
 
 // ------------------------------------------------------------------------------------------------ ITcpSocket
@@ -409,11 +320,7 @@ bool TlsSocket::handle_record(uint8_t type, uint8_t* payload, uint32_t length) {
     }
     if (state_ != St::ChangeCipherSpec12 || handshake_pos_ != handshake_data_.size()) { fail(TlsError::Protocol, kAlertUnexpected); return false; }
     // switch to the server's keys
-    const CipherSuite* s = suite_;
-    uint8_t block[2 * 32 + 2 * 12];
-    const uint32_t key_len = aead_key_size(s->aead), iv_len = s->aead == AeadKind::ChaCha20Poly1305 ? 12 : 4;
-    tls12_prf(s->hash, ConstByteView(hs_->master_secret, 48), "key expansion", ConstByteView(hs_->server_random, 32), ConstByteView(hs_->client_random, 32), ByteView(block, 2 * key_len + 2 * iv_len));
-    if (!read_.set_keys(s->aead, false, block + key_len, block + 2 * key_len + iv_len, iv_len)) { fail(TlsError::Internal, kAlertInternal); return false; }
+    if (!set_keys_12(read_, false)) { fail(TlsError::Internal, kAlertInternal); return false; }
     state_ = St::Finished12;
     return true;
   }
@@ -493,6 +400,9 @@ bool TlsSocket::start_handshake() {
   hs_ = UniquePointer<Handshake>::make(allocator_, allocator_);
   if (!hs_ || !in_.reserve(32 * 1024) || !out_.reserve(40 * 1024)) { fail(TlsError::Internal, 0); return false; }
   if (!config_.random->fill(ByteView(hs_->client_random, 32)) || !config_.random->fill(ByteView(hs_->session_id, 32))) { fail(TlsError::Internal, 0); return false; }
+  if (config_.allow_tls13 && config_.sessions && config_.server_name && config_.server_name[0]) {
+    hs_->have_ticket = config_.sessions->take(config_.server_name, false, stack_.now_ms(), &hs_->ticket) && tls::find_suite(hs_->ticket.suite_id) != nullptr;
+  }
   // key shares: X25519 and P-256
   if (config_.allow_tls13) {
     Handshake::Share& x = hs_->shares[0];
@@ -513,7 +423,7 @@ bool TlsSocket::start_handshake() {
 }
 
 bool TlsSocket::build_client_hello(bool retry) {
-  uint8_t buffer[1100];
+  uint8_t buffer[1100 + kMaxTicketBytes + 160];
   Writer w(buffer, sizeof buffer);
   w.u8(kHsClientHello);
   const uint32_t length_mark = w.mark24();
@@ -534,6 +444,16 @@ bool TlsSocket::build_client_hello(bool retry) {
     w.u16(0xc02f);
     w.u16(0xc02c);
     w.u16(0xc030);
+    if (config_.allow_cbc_suites) {   // (last: only for servers with nothing better)
+      w.u16(0xc027);
+      w.u16(0xc023);
+      w.u16(0xc028);
+      w.u16(0xc024);
+      w.u16(0xc013);
+      w.u16(0xc009);
+      w.u16(0xc014);
+      w.u16(0xc00a);
+    }
   }
   w.end16(suites_mark);
   w.u8(1);
@@ -568,6 +488,10 @@ bool TlsSocket::build_client_hello(bool retry) {
   if (config_.allow_tls12) {
     w.u16(kExtEms);
     w.u16(0);
+    if (config_.allow_cbc_suites) {
+      w.u16(kExtEncryptThenMac);
+      w.u16(0);
+    }
     w.u16(kExtRenegotiation);
     w.u16(1);
     w.u8(0);
@@ -606,9 +530,30 @@ bool TlsSocket::build_client_hello(bool retry) {
       w.bytes(hs_->cookie, hs_->cookie_length);
     }
   }
+  // resumption: the pre_shared_key extension, which has to be the last one; its binder is made once the message is complete. (After a HelloRetryRequest the
+  // ticket is not offered again.)
+  uint32_t binder_length = 0;
+  hs_->psk_offered = false;
+  if (config_.allow_tls13 && config_.sessions) w.n += tls::write_psk_modes(w.p + w.n, w.cap - w.n);   // (so that the server sends tickets)
+  if (config_.allow_tls13 && !retry && hs_->have_ticket) {
+    const CipherSuite* ticket_suite = tls::find_suite(hs_->ticket.suite_id);
+    const uint32_t n = tls::write_pre_shared_key(hs_->ticket, ticket_suite->hash, stack_.now_ms(), w.p + w.n, w.cap - w.n);
+    if (n) {
+      w.n += n;
+      hs_->psk_offered = true;
+      binder_length = hash_size(ticket_suite->hash);
+    }
+  }
   w.end16(ext_mark);
   w.end24(length_mark);
   if (!w.ok) { fail(TlsError::Internal, kAlertInternal); return false; }
+  if (binder_length) {   // the binder covers the message up to the binders list (2 bytes of length, 1 of binder length, the binder)
+    const CipherSuite* ticket_suite = tls::find_suite(hs_->ticket.suite_id);
+    if (!tls::psk_binder(ticket_suite->hash, ConstByteView(hs_->ticket.psk, hs_->ticket.psk_length), ConstByteView(buffer, w.n - binder_length - 3), buffer + w.n - binder_length)) {
+      fail(TlsError::Internal, kAlertInternal);
+      return false;
+    }
+  }
   if (!send_handshake(buffer, w.n)) { fail(TlsError::Internal, kAlertInternal); return false; }
   flush();
   return true;
@@ -623,7 +568,7 @@ bool TlsSocket::handle_message(uint8_t type, ConstByteView body, ConstByteView w
       if (type != kHsEncryptedExtensions) break;
       if (!on_encrypted_extensions(body)) return false;
       transcript_add(whole);
-      state_ = St::CertificateOrRequest13;
+      state_ = hs_->psk_accepted ? St::Finished13 : St::CertificateOrRequest13;   // (a resumed handshake has no certificate)
       return true;
     case St::CertificateOrRequest13:
       if (type == kHsCertificateRequest) {
@@ -703,7 +648,8 @@ bool TlsSocket::on_server_hello(ConstByteView body, ConstByteView whole) {
   if (!r.ok || sid_length > 32) { fail(TlsError::Protocol, kAlertDecode); return false; }
   uint16_t selected_version = 0, key_share_group = 0;
   ConstByteView key_share_data, cookie;
-  bool have_key_share = false, have_ems = false, have_reneg = false;
+  bool have_key_share = false, have_ems = false, have_reneg = false, have_psk = false, have_etm = false;
+  uint16_t psk_selected = 0;
   char alpn_chosen[32] = {};
   if (r.n > 0) {
     const uint16_t ext_length = r.u16();
@@ -732,7 +678,9 @@ bool TlsSocket::on_server_hello(ConstByteView body, ConstByteView whole) {
           if (!d.done()) { fail(TlsError::Protocol, kAlertDecode); return false; }
           break;
         }
+        case kExtPreSharedKey: psk_selected = d.u16(); have_psk = true; if (!d.done()) { fail(TlsError::Protocol, kAlertDecode); return false; } break;
         case kExtEms: have_ems = true; break;
+        case kExtEncryptThenMac: have_etm = true; if (d.n != 0) { fail(TlsError::Protocol, kAlertDecode); return false; } break;
         case kExtRenegotiation: have_reneg = true; if (!(d.n == 1 && d.u8() == 0)) { fail(TlsError::Protocol, kAlertHandshakeFailure); return false; } break;
         case kExtAlpn: {
           d.u16();
@@ -758,6 +706,10 @@ bool TlsSocket::on_server_hello(ConstByteView body, ConstByteView whole) {
       return on_hello_retry_request(body, whole, suite_id, key_share_group, cookie);
     }
     if (!have_key_share || !hs_->share_count) { fail(TlsError::Protocol, kAlertMissingExtension); return false; }
+    if (have_psk) {   // the server took the ticket: it must be the one offered, and for a suite with the same hash
+      if (!hs_->psk_offered || psk_selected != 0 || tls::find_suite(hs_->ticket.suite_id)->hash != suite->hash) { fail(TlsError::Protocol, kAlertIllegalParameter); return false; }
+      hs_->psk_accepted = true;
+    }
     suite_ = suite;
     tls13_ = true;
     hs_->selected_group = key_share_group;
@@ -798,9 +750,11 @@ bool TlsSocket::on_server_hello(ConstByteView body, ConstByteView whole) {
     if (equal_constant_time(random.data() + 24, kDowngrade, 7) && (random[31] == 0 || random[31] == 1)) { fail(TlsError::Protocol, kAlertIllegalParameter); return false; }
   }
   if (config_.require_extended_master_secret && !have_ems) { fail(TlsError::Unsupported, kAlertHandshakeFailure); return false; }
+  if (suite->cbc() && !config_.allow_cbc_suites) { fail(TlsError::Protocol, kAlertIllegalParameter); return false; }   // (it was not offered)
   suite_ = suite;
   tls13_ = false;
   ems_ = have_ems;
+  etm_ = have_etm && suite->cbc();
   for (uint32_t i = 0; i < 32; ++i) hs_->server_random[i] = random[i];
   for (uint32_t i = 0; i < sizeof alpn_selected_; ++i) alpn_selected_[i] = alpn_chosen[i];
   transcript_add(whole);
@@ -868,7 +822,8 @@ bool TlsSocket::derive_handshake_keys_13(ConstByteView shared) {
   const uint32_t hl = hash_size(h);
   uint8_t zeros[kMaxHashSize] = {0}, early[kMaxHashSize], derived[kMaxHashSize], empty[kMaxHashSize], th[kMaxHashSize];
   hash(h, ConstByteView(), empty);
-  hkdf_extract(h, ConstByteView(), ConstByteView(zeros, hl), early);
+  if (hs_->psk_accepted) tls::early_secret(h, ConstByteView(hs_->ticket.psk, hs_->ticket.psk_length), early);
+  else hkdf_extract(h, ConstByteView(), ConstByteView(zeros, hl), early);
   if (!derive_secret(h, ConstByteView(early, hl), "derived", ConstByteView(empty, hl), derived)) { fail(TlsError::Internal, kAlertInternal); return false; }
   hkdf_extract(h, ConstByteView(derived, hl), shared, hs_->handshake_secret);
   transcript_hash(th);
@@ -904,80 +859,19 @@ bool TlsSocket::on_encrypted_extensions(ConstByteView body) {
 }
 
 bool TlsSocket::on_certificate(ConstByteView body, bool tls13) {
-  Reader r(body);
-  if (tls13) {
-    const uint8_t context = r.u8();
-    r.take(context);
-  }
-  const uint32_t list_length = r.u24();
-  Reader list(r.take(list_length));
-  if (!r.done()) { fail(TlsError::Protocol, kAlertDecode); return false; }
-  ConstByteView certs[10];
-  uint32_t count = 0;
-  while (list.n > 0) {
-    const uint32_t cl = list.u24();
-    const ConstByteView cert = list.take(cl);
-    if (tls13) list.take(list.u16());
-    if (!list.ok || cl == 0) { fail(TlsError::Protocol, kAlertDecode); return false; }
-    if (count == 10) { cert_status_ = CertStatus::ChainTooLong; fail(TlsError::Certificate, kAlertBadCertificate); return false; }
-    certs[count++] = cert;
-  }
-  if (count == 0) { cert_status_ = CertStatus::NoCertificates; fail(TlsError::Certificate, tls13 ? kAlertCertificateUnknown : kAlertHandshakeFailure); return false; }
-  Certificate leaf;
-  if (config_.verify_certificates) {
-    TrustStore empty(allocator_);
-    VerifyOptions o;
-    o.now = config_.clock ? config_.clock(config_.clock_context) : 0;
-    o.hostname = config_.server_name;
-    if (!o.hostname) o.ipv4 = config_.server_ipv4 ? config_.server_ipv4 : inner_->remote_address().value();
-    if (!o.hostname && o.ipv4 == 0 && !config_.skip_hostname_check) {   // nothing to check the certificate against: refuse rather than trust any host
-      cert_status_ = CertStatus::HostnameMismatch;
-      fail(TlsError::Certificate, kAlertBadCertificate);
-      return false;
-    }
-    if (config_.skip_hostname_check) {
-      o.hostname = nullptr;
-      o.ipv4 = 0;
-    }
-    o.min_rsa_bits = config_.min_rsa_bits;
-    o.allow_sha1 = config_.allow_sha1_certificates;
-    const CertStatus status = verify_chain(certs, count, config_.trust ? *config_.trust : empty, o, &leaf);
-    cert_status_ = status;
-    if (status != CertStatus::Ok) {
-      fail(TlsError::Certificate, status == CertStatus::Expired || status == CertStatus::NotYetValid ? kAlertCertificateExpired : status == CertStatus::UntrustedRoot ? kAlertUnknownCa :
-           status == CertStatus::UnsupportedAlgorithm || status == CertStatus::UnknownCriticalExtension ? kAlertUnsupportedCertificate : status == CertStatus::WeakKey ? kAlertInsufficientSecurity : kAlertBadCertificate);
-      return false;
-    }
-  } else if (parse_certificate(certs[0], &leaf) != CertStatus::Ok) {
-    cert_status_ = CertStatus::Malformed;
-    fail(TlsError::Certificate, kAlertBadCertificate);
+  CertificateProblem problem;
+  if (!check_server_certificate(allocator_, config_, inner_->remote_address().value(), body, tls13, suite_ ? suite_->auth : SuiteAuth::Any, &hs_->leaf, &problem)) {
+    cert_status_ = problem.status;
+    fail(problem.error, problem.alert);
     return false;
   }
-  // the key must suit the connection
-  if (leaf.key_type == KeyType::Unsupported || (leaf.has_key_usage && !(leaf.key_usage & Certificate::kDigitalSignature))) { cert_status_ = CertStatus::UnsupportedAlgorithm; fail(TlsError::Certificate, kAlertUnsupportedCertificate); return false; }
-  if (!tls13 && ((suite_->auth == SuiteAuth::Rsa) != (leaf.key_type == KeyType::Rsa))) { cert_status_ = CertStatus::UnsupportedAlgorithm; fail(TlsError::Certificate, kAlertUnsupportedCertificate); return false; }
-  hs_->leaf.clear();
-  if (!hs_->leaf.append(certs[0])) { fail(TlsError::Internal, kAlertInternal); return false; }
+  cert_status_ = CertStatus::Ok;
   hs_->saw_certificate = true;
   return true;
 }
 
 bool TlsSocket::verify_signature_with_leaf(uint16_t scheme, const uint8_t* content, uint32_t content_length, ConstByteView signature, bool tls13) {
-  Certificate leaf;
-  if (parse_certificate(hs_->leaf.view(), &leaf) != CertStatus::Ok) return false;
-  bool ecdsa = false, pss = false;
-  switch (scheme) {
-    // TLS 1.3 ties the ECDSA scheme to the curve; TLS 1.2 only names the hash, so any EC key will do
-    case kSigEcdsaP256: ecdsa = true; if (tls13 ? leaf.key_type != KeyType::EcP256 : (leaf.key_type != KeyType::EcP256 && leaf.key_type != KeyType::EcP384)) return false; break;
-    case kSigEcdsaP384: ecdsa = true; if (tls13 ? leaf.key_type != KeyType::EcP384 : (leaf.key_type != KeyType::EcP256 && leaf.key_type != KeyType::EcP384)) return false; break;
-    case kSigPssSha256: case kSigPssSha384: case kSigPssSha512: pss = true; if (leaf.key_type != KeyType::Rsa) return false; break;
-    case kSigPkcs1Sha256: case kSigPkcs1Sha384: case kSigPkcs1Sha512: if (tls13 || leaf.key_type != KeyType::Rsa) return false; break;
-    default: return false;
-  }
-  const HashKind h = scheme_hash(scheme);
-  uint8_t digest[kMaxHashSize];
-  hash(h, ConstByteView(content, content_length), digest);
-  return verify_digest_signature(leaf, ecdsa, pss ? RsaPadding::Pss : RsaPadding::Pkcs1V15, h, digest, signature);
+  return verify_leaf_signature(hs_->leaf.view(), scheme, ConstByteView(content, content_length), signature, tls13);
 }
 
 bool TlsSocket::on_certificate_verify(ConstByteView body) {
@@ -1022,6 +916,10 @@ bool TlsSocket::on_finished_13(ConstByteView body, ConstByteView whole) {
   uint8_t finished[4 + kMaxHashSize] = {kHsFinished, 0, 0, static_cast<uint8_t>(hl)};
   hmac(h, ConstByteView(key, hl), ConstByteView(th, hl), finished + 4);
   if (!send_handshake(finished, 4 + hl)) { fail(TlsError::Internal, kAlertInternal); return false; }
+  // the resumption master secret covers everything up to our Finished; tickets sent later are made from it
+  transcript_hash(th);
+  have_resumption_ = tls::resumption_master_secret(h, ConstByteView(hs_->master_secret, hl), ConstByteView(th, hl), resumption_master_);
+  resumed_ = hs_->psk_accepted;
   // switch to the application keys
   if (!set_traffic_keys(write_, client_traffic_secret_) || !set_traffic_keys(read_, server_traffic_secret_)) { fail(TlsError::Internal, kAlertInternal); return false; }
   finish_handshake();
@@ -1094,11 +992,8 @@ bool TlsSocket::on_server_hello_done() {
   }
   for (uint8_t& b : shared) b = 0;
   // keys
-  uint8_t block[2 * 32 + 2 * 12];
-  const uint32_t key_len = aead_key_size(s->aead), iv_len = s->aead == AeadKind::ChaCha20Poly1305 ? 12 : 4;
-  tls12_prf(s->hash, ConstByteView(hs_->master_secret, 48), "key expansion", ConstByteView(hs_->server_random, 32), ConstByteView(hs_->client_random, 32), ByteView(block, 2 * key_len + 2 * iv_len));
   const uint8_t ccs = 1;
-  if (!send_record(kChangeCipherSpec, ConstByteView(&ccs, 1)) || !write_.set_keys(s->aead, false, block, block + 2 * key_len, iv_len)) { fail(TlsError::Internal, kAlertInternal); return false; }
+  if (!send_record(kChangeCipherSpec, ConstByteView(&ccs, 1)) || !set_keys_12(write_, true)) { fail(TlsError::Internal, kAlertInternal); return false; }
   uint8_t th[kMaxHashSize];
   transcript_hash(th);
   uint8_t finished[4 + 12] = {kHsFinished, 0, 0, 12};
@@ -1107,6 +1002,27 @@ bool TlsSocket::on_server_hello_done() {
   state_ = St::ChangeCipherSpec12;
   flush();
   return true;
+}
+
+// The key block of the connection (RFC 5246 6.3): for the AEAD suites the two keys and the two implicit IVs, for CBC the two MAC keys and the two keys.
+bool TlsSocket::set_keys_12(RecordProtection& side, bool client_write) {
+  const CipherSuite* s = suite_;
+  uint8_t block[2 * 48 + 2 * 32 + 2 * 12];
+  const uint32_t key_len = aead_key_size(s->aead);
+  if (s->cbc()) {
+    const uint32_t mac_len = hash_size(s->mac);
+    tls12_prf(s->hash, ConstByteView(hs_->master_secret, 48), "key expansion", ConstByteView(hs_->server_random, 32), ConstByteView(hs_->client_random, 32), ByteView(block, 2 * mac_len + 2 * key_len));
+    const uint8_t* mac_key = block + (client_write ? 0 : mac_len);
+    const uint8_t* key = block + 2 * mac_len + (client_write ? 0 : key_len);
+    const bool ok = side.set_cbc_keys(s->aead, s->mac, key, mac_key, etm_, config_.random);
+    for (uint8_t& b : block) b = 0;
+    return ok;
+  }
+  const uint32_t iv_len = s->aead == AeadKind::ChaCha20Poly1305 ? 12 : 4;
+  tls12_prf(s->hash, ConstByteView(hs_->master_secret, 48), "key expansion", ConstByteView(hs_->server_random, 32), ConstByteView(hs_->client_random, 32), ByteView(block, 2 * key_len + 2 * iv_len));
+  const bool ok = client_write ? side.set_keys(s->aead, false, block, block + 2 * key_len, iv_len) : side.set_keys(s->aead, false, block + key_len, block + 2 * key_len + iv_len, iv_len);
+  for (uint8_t& b : block) b = 0;
+  return ok;
 }
 
 bool TlsSocket::on_finished_12(ConstByteView body) {
@@ -1149,7 +1065,14 @@ bool TlsSocket::on_post_handshake(uint8_t type, ConstByteView body) {
     fail(TlsError::Protocol, kAlertUnexpected);
     return false;
   }
-  if (type == kHsNewSessionTicket) return true;   // no resumption
+  if (type == kHsNewSessionTicket) {
+    if (config_.sessions && have_resumption_ && config_.server_name && suite_) {
+      UniquePointer<TlsTicket> ticket = UniquePointer<TlsTicket>::make(allocator_);
+      if (ticket && tls::make_ticket(suite_->hash, suite_->id, ConstByteView(resumption_master_, hash_size(suite_->hash)), body, config_.server_name, false, stack_.now_ms(), ticket.get()))
+        config_.sessions->store(*ticket);
+    }
+    return true;
+  }
   if (type == kHsKeyUpdate) {
     if (body.size() != 1 || body[0] > 1) { fail(TlsError::Protocol, kAlertDecode); return false; }
     if (!update_keys_13(false)) { fail(TlsError::Internal, kAlertInternal); return false; }

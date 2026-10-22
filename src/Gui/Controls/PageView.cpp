@@ -202,6 +202,29 @@ void PageView::on_mouse_leave() {
 }
 
 bool PageView::on_key(const KeyArgs& args) {
+  {
+    UiGuard lock(this);
+    const bool held = args.modifiers & (hardware::modifier::kControl | hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt);
+    const bool wanted = capture_ == kCaptureAll ? !held : capture_ == kCaptureTab && args.usage == hardware::key::kTab;
+    if (wanted && key_handler_.function && queued_ < 16) {
+      queue_[queued_++] = args;
+      fire(key_handler_);
+      return true;
+    }
+  }
+  return scroll_key(args);
+}
+
+bool PageView::take_key(KeyArgs* out) {
+  UiGuard lock(this);
+  if (queued_ == 0) return false;
+  *out = queue_[0];
+  for (uint8_t i = 1; i < queued_; ++i) queue_[i - 1] = queue_[i];
+  --queued_;
+  return true;
+}
+
+bool PageView::scroll_key(const KeyArgs& args) {
   const bool shift = args.modifiers & hardware::modifier::kShift;
   const int32_t page = rows_ > 1 ? static_cast<int32_t>(rows_) - 1 : 1;
   switch (args.usage) {

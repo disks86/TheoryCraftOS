@@ -85,6 +85,8 @@ struct ScriptSocket final : ITcpSocket {
   std::string sent, answer;
   size_t pos = 0, piece = 1 << 20;
   bool connected = false, refuse = false, answered = false, never_answer = false, keep_open = false;
+  const uint64_t* polls = nullptr;   // when set, only one piece is handed out for each poll of the stack
+  uint64_t served_at = ~uint64_t{0};
   uint16_t port = 0;
   Ipv4Address remote;
   TcpState state() const override { return connected ? TcpState::Established : TcpState::SynSent; }
@@ -111,6 +113,10 @@ struct ScriptSocket final : ITcpSocket {
   uint32_t receive(ByteView buffer) override {
     maybe_answer();
     if (pos >= answer.size()) return 0;
+    if (polls) {
+      if (served_at == *polls) return 0;
+      served_at = *polls;
+    }
     size_t n = answer.size() - pos;
     if (n > piece) n = piece;
     if (n > buffer.size()) n = buffer.size();
@@ -161,12 +167,18 @@ struct ScriptStack final : INetworkStack {
   std::vector<std::string> requests;
   size_t piece = 1 << 20;
   bool refuse = false, never_answer = false, keep_open = false;
-  uint64_t ms = 1000;
+  mutable uint64_t ms = 1000;
+  uint64_t polls = 0;
+  bool one_per_poll = false;
+  bool ticking = false;   // every look at the clock moves it on (a clock that changes while a poll is in progress)
   uint32_t sockets = 0;
   explicit ScriptStack(allocators::IAllocator& a) : alloc(a), resolver(a) { resolver.names["example.com"] = Ipv4Address::make(93, 184, 216, 34); resolver.names["other.org"] = Ipv4Address::make(10, 9, 8, 7); }
   kernel::RecursiveMutex& mutex() override { return m; }
-  void poll() override { ms += 1; }
-  uint64_t now_ms() const override { return ms; }
+  void poll() override {
+    ms += 1;
+    ++polls;
+  }
+  uint64_t now_ms() const override { return ticking ? ++ms : ms; }
   IpConfiguration configuration() const override { return {}; }
   void configure(const IpConfiguration&) override {}
   void start_dhcp() override {}
@@ -184,6 +196,7 @@ struct ScriptStack final : INetworkStack {
     s->refuse = refuse;
     s->never_answer = never_answer;
     s->keep_open = keep_open;
+    if (one_per_poll) s->polls = &polls;
     ++sockets;
     return SharedPointer<ITcpSocket>(s);
   }
@@ -208,6 +221,22 @@ static std::string chunked(const std::string& body, size_t size) {
 
 static bool fetch(ScriptStack& stack, HttpClient& http, HttpMethod m, const char* url, ConstByteView body = ConstByteView(), const char* type = "") {
   return http.start(m, url, body, type) && http.run(60000);
+}
+
+// The time of the last progress is taken later than the `now` of the poll that takes it; the stall check must not read that as a huge stall.
+static void test_clock_moves_during_poll() {
+  TestAllocator a;
+  {
+    ScriptStack stack(a);
+    stack.ticking = true;
+    stack.one_per_poll = true;
+    stack.piece = 700;
+    std::string body(60000, 'x');
+    stack.server = [&](const std::string&) { return response("200 OK", "Content-Type: text/plain\r\n", body); };
+    HttpClient http(stack, a);
+    CHECK(fetch(stack, http, HttpMethod::Get, "http://example.com/big") && http.status() == 200 && http.body().size() == body.size());
+  }
+  CHECK(g_live == 0);
 }
 
 static void test_requests_and_framing() {
@@ -509,6 +538,7 @@ static void test_over_the_network() {
 int main() {
   test_urls();
   test_requests_and_framing();
+  test_clock_moves_during_poll();
   test_errors_and_limits();
   test_redirects();
   test_compression();

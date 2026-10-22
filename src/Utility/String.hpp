@@ -33,6 +33,7 @@
 class String {
  public:
   explicit String(allocators::IAllocator& allocator) : allocator_(&allocator) {}
+  allocators::IAllocator& allocator() const { return *allocator_; }
   String(String&& other) : allocator_(other.allocator_), storage_(other.storage_), size_(other.size_) {
     other.storage_ = ArrayView<char>();
     other.size_ = 0;

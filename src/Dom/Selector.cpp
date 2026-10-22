@@ -17,6 +17,7 @@
  */
 
 #include "Dom/Selector.hpp"
+#include "Dom/Form.hpp"
 
 namespace dom {
 
@@ -486,6 +487,14 @@ class SelectorSet::Reader {
     else if (n.equals("checked")) t->kind = TestKind::Checked;
     else if (n.equals("disabled")) t->kind = TestKind::Disabled;
     else if (n.equals("enabled")) t->kind = TestKind::Enabled;
+    else if (n.equals("focus") || n.equals("focus-within") || n.equals("focus-visible")) t->kind = TestKind::Focus;
+    else if (n.equals("required")) t->kind = TestKind::Required;
+    else if (n.equals("optional")) t->kind = TestKind::Optional;
+    else if (n.equals("read-only")) t->kind = TestKind::ReadOnly;
+    else if (n.equals("read-write")) t->kind = TestKind::ReadWrite;
+    else if (n.equals("valid")) t->kind = TestKind::Valid;
+    else if (n.equals("invalid")) t->kind = TestKind::Invalid;
+    else if (n.equals("placeholder-shown")) t->kind = TestKind::PlaceholderShown;
     else if (n.equals("before") || n.equals("after") || n.equals("first-line") || n.equals("first-letter")) *applies = false;   // (old pseudo-element syntax)
     else *applies = false;   // hover, focus, active, visited, target and the rest: states a page being read does not have
     return true;
@@ -637,8 +646,27 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
     case TestKind::Root: return node->parent && node->parent->type == NodeType::Document;
     case TestKind::Scope: return scope ? node == scope : (node->parent && node->parent->type == NodeType::Document);
     case TestKind::Link: return (node->is_tag("a") || node->is_tag("area") || node->is_tag("link")) && has_attribute(node, "href");
-    case TestKind::Checked:
-      return (node->is_tag("input") && has_attribute(node, "checked")) || (node->is_tag("option") && has_attribute(node, "selected"));
+    case TestKind::Checked: {
+      if (node->is_tag("input")) {
+        const InputType it = input_type(node);
+        return (it == InputType::Checkbox || it == InputType::Radio) && is_checked(node);
+      }
+      return node->is_tag("option") && is_checked(node);
+    }
+    case TestKind::Focus: return (node->form_state & kFormFocused) != 0;
+    case TestKind::Required: return is_submittable(node) && has_attribute(node, "required");
+    case TestKind::Optional: return is_submittable(node) && !has_attribute(node, "required");
+    case TestKind::ReadOnly: return !((node->is_tag("textarea") || node->is_tag("input")) && is_text_field(node->is_tag("input") ? input_type(node) : InputType::Text) &&
+                                     !is_read_only(node) && !is_disabled(node));
+    case TestKind::ReadWrite: return (node->is_tag("textarea") || node->is_tag("input")) && is_text_field(node->is_tag("input") ? input_type(node) : InputType::Text) && !is_read_only(node) && !is_disabled(node);
+    case TestKind::Valid: return will_validate(node) && validity(node) == 0;
+    case TestKind::Invalid: return will_validate(node) && validity(node) != 0;
+    case TestKind::PlaceholderShown: {
+      if (!(node->is_tag("textarea") || (node->is_tag("input") && is_text_field(input_type(node)))) || !has_attribute(node, "placeholder")) return false;
+      String v(node->owner->allocator());
+      get_value(node, &v);
+      return v.empty();
+    }
     case TestKind::Disabled: return is_form_control(node->name.view()) && has_attribute(node, "disabled");
     case TestKind::Enabled: return is_form_control(node->name.view()) && !has_attribute(node, "disabled");
     case TestKind::Not: return !match_inner(t, node, scope);

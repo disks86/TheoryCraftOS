@@ -56,6 +56,9 @@ class IPageEnvironment : public IObjectEnvironment {
   virtual void console(int level, StringView text) = 0;
   virtual StorageArea& local_storage() = 0;
   virtual String& cookie() = 0;
+  // A form was submitted with method=post: the page at `address` is the answer to `body` (of that content type). Without this, the browser has no way to
+  // post, and the form is sent as a GET.
+  virtual void navigate_post(StringView address, StringView content_type, StringView body) { (void)content_type; (void)body; navigate(address, false); }
   // (IObjectEnvironment: fetch_bytes() for pictures and videos, open_video(); pages without pictures need neither)
   bool fetch_bytes(StringView, uint64_t, ByteBuffer*) override { return false; }
 
@@ -94,6 +97,16 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // anything visible changed or an event was fired. Called often while objects().animating().
   bool step_objects(double now_ms);
   PageObjects& objects() override { return objects_; }
+
+  // --- Forms
+  // The keys a form control understands. `modifiers`: 1 shift, 2 control, 4 alt.
+  enum class FormKey : uint8_t { Character, Enter, Backspace, Delete, Tab, Escape, Left, Right, Up, Down, Home, End };
+  // A key pressed while the page has the focus. True if a control took it (typing, Tab, Enter ...); false if the view should do what it does with it
+  // (scroll). With nothing focused only Tab is taken (it focuses the first control).
+  bool key(FormKey key, char character, uint8_t modifiers);
+  // Is a control focused (a key goes to it)? Does the page have any control to step to?
+  bool has_focus() const { return focus_ != 0; }
+  bool has_controls();
   // Runs the timers that are due at `now_ms` (the host clock); true if any ran.
   bool run_due_timers(double now_ms);
   // When the next timer is due (host clock); false if none is waiting.
@@ -139,6 +152,14 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   String& cookie() override { return env_.cookie(); }
   bool compile_handler(StringView code, script::Value* function) override;
 
+  // --- IDomHost: forms
+  dom::Node* focused() override;
+  void set_focus(dom::Node* control) override;
+  bool activate_control(dom::Node* node) override;
+  void submit_form(dom::Node* form, dom::Node* submitter, bool interactive) override;
+  void reset_form(dom::Node* form) override;
+  bool report_validity(dom::Node* control) override;
+
   // --- dom::IScriptRunner
   StringView external(uint32_t index, StringView src) override;
   void run(dom::Node* script, StringView source, String* written) override;
@@ -155,6 +176,17 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
 
   bool start_engine();
   void deliver_object_events();
+  // Forms
+  void press_focus(dom::Node* node);
+  bool fire(dom::Node* target, StringView type, bool bubbles = true, bool cancelable = false, dom::Node* submitter = nullptr);
+  void send_form(dom::Node* form, dom::Node* submitter);
+  void input_changed(dom::Node* control, bool final_change);
+  void move_focus(int32_t direction);
+  void toggle_list(dom::Node* select);
+  void choose_option(dom::Node* option);
+  bool press_key(dom::Node* n, FormKey key, char character, uint8_t modifiers);
+  void flush_errors();
+  static bool custom_error(void* context, const dom::Node* control);
   void note_error(StringView text);
   void fetch_pending_styles();
   bool resolve(StringView reference, String* out);
@@ -175,6 +207,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint64_t rendered_version_ = 0;
   bool loading_ = true, engine_failed_ = false;
   int32_t scroll_request_ = -1;
+  uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
+  uint64_t controls_version_ = 0;
+  bool controls_cached_ = false;
+  String focus_value_, invalid_text_;                         // (what the focused control held when it got the focus; what to tell about the invalid one)
   // the style sheets as of now, for getComputedStyle
   StyleSheet style_cache_;
   uint64_t style_cache_version_ = 0;

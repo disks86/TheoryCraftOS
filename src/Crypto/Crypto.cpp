@@ -301,7 +301,7 @@ bool equal_constant_time(const uint8_t* a, const uint8_t* b, uint32_t n) {
 namespace {
 
 struct AesTables {
-  uint8_t sbox[256];
+  uint8_t sbox[256], inverse[256];
   AesTables() {
     // The S-box: multiplicative inverse in GF(2^8) followed by the affine transformation.
     uint8_t p = 1, q = 1;
@@ -315,6 +315,7 @@ struct AesTables {
       sbox[p] = static_cast<uint8_t>(x ^ 0x63);
     } while (p != 1);
     sbox[0] = 0x63;
+    for (int i = 0; i < 256; ++i) inverse[sbox[i]] = static_cast<uint8_t>(i);
   }
   static uint8_t rol8(uint8_t v, int n) { return static_cast<uint8_t>((v << n) | (v >> (8 - n))); }
 };
@@ -325,6 +326,17 @@ const AesTables& aes_tables() {
 }
 
 inline uint8_t xtime(uint8_t x) { return static_cast<uint8_t>((x << 1) ^ ((x & 0x80) ? 0x1B : 0)); }
+
+// Multiplication in GF(2^8), for the inverse MixColumns; the multiplier is a constant (9, 11, 13, 14), so the loop does not depend on secret data.
+inline uint8_t gmul(uint8_t x, uint8_t y) {
+  uint8_t result = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (y & 1) result ^= x;
+    x = xtime(x);
+    y >>= 1;
+  }
+  return result;
+}
 
 }  // namespace
 
@@ -389,6 +401,58 @@ void Aes::encrypt_block(const uint8_t in[16], uint8_t out[16]) const {
     add_round_key(round);
   }
   for (int i = 0; i < 16; ++i) out[i] = s[i];
+}
+
+void Aes::decrypt_block(const uint8_t in[16], uint8_t out[16]) const {
+  const AesTables& t = aes_tables();
+  uint8_t s[16];
+  auto add_round_key = [&](uint32_t round) {
+    for (int c = 0; c < 4; ++c) {
+      const uint32_t k = round_keys_[round * 4 + c];
+      s[c * 4] ^= static_cast<uint8_t>(k >> 24);
+      s[c * 4 + 1] ^= static_cast<uint8_t>(k >> 16);
+      s[c * 4 + 2] ^= static_cast<uint8_t>(k >> 8);
+      s[c * 4 + 3] ^= static_cast<uint8_t>(k);
+    }
+  };
+  for (int i = 0; i < 16; ++i) s[i] = in[i];
+  add_round_key(rounds_);
+  for (uint32_t round = rounds_; round >= 1; --round) {
+    // InvShiftRows, then InvSubBytes
+    uint8_t b[16];
+    for (int c = 0; c < 4; ++c)
+      for (int row = 0; row < 4; ++row) b[((c + row) & 3) * 4 + row] = s[c * 4 + row];
+    for (int i = 0; i < 16; ++i) s[i] = t.inverse[b[i]];
+    add_round_key(round - 1);
+    if (round > 1) {   // InvMixColumns (not after the first round key)
+      for (int c = 0; c < 4; ++c) {
+        const uint8_t a0 = s[c * 4], a1 = s[c * 4 + 1], a2 = s[c * 4 + 2], a3 = s[c * 4 + 3];
+        s[c * 4] = static_cast<uint8_t>(gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9));
+        s[c * 4 + 1] = static_cast<uint8_t>(gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13));
+        s[c * 4 + 2] = static_cast<uint8_t>(gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11));
+        s[c * 4 + 3] = static_cast<uint8_t>(gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14));
+      }
+    }
+  }
+  for (int i = 0; i < 16; ++i) out[i] = s[i];
+}
+
+void Aes::cbc(const uint8_t iv[16], ByteView data, bool decrypt) const {
+  uint8_t chain[16], next[16], block[16];
+  for (int i = 0; i < 16; ++i) chain[i] = iv[i];
+  for (uint64_t pos = 0; pos + 16 <= data.size(); pos += 16) {
+    uint8_t* p = data.data() + pos;
+    if (decrypt) {
+      for (int i = 0; i < 16; ++i) next[i] = p[i];   // (the ciphertext chains into the next block)
+      decrypt_block(p, block);
+      for (int i = 0; i < 16; ++i) p[i] = static_cast<uint8_t>(block[i] ^ chain[i]);
+      for (int i = 0; i < 16; ++i) chain[i] = next[i];
+    } else {
+      for (int i = 0; i < 16; ++i) block[i] = static_cast<uint8_t>(p[i] ^ chain[i]);
+      encrypt_block(block, p);
+      for (int i = 0; i < 16; ++i) chain[i] = p[i];
+    }
+  }
 }
 
 void Aes::cfb128(const uint8_t iv[16], ByteView data, bool decrypt) const {

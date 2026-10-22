@@ -50,6 +50,7 @@ struct Node {
   String data;               // text and comments
   List<Attribute> attrs;     // elements
   void* script = nullptr;    // the script engine's object for this node
+  uint8_t form_state = 0;    // elements: what the user (or a script) changed in a form control, and whether it is focused (FormState bits, Form.hpp)
 
   bool is_element() const { return type == NodeType::Element; }
   bool is_text() const { return type == NodeType::Text; }

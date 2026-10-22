@@ -225,10 +225,9 @@ bool DomBindings::install() {
   c.wrappers = vm_.new_array();
   c.media_lists = vm_.new_array();
   c.window_listeners = vm_.new_plain();
-  Value global = Value::make_object(vm_.global());
   vm_.define_named(vm_.global(), "__wrappers", Value::make_object(c.wrappers), 0);
   vm_.define_named(vm_.global(), "__media_lists", Value::make_object(c.media_lists), 0);
-  return bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && !vm_.halted();
+  return bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_forms(c) && !vm_.halted();
 }
 
 bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& init) {
@@ -242,6 +241,16 @@ bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& 
 }
 
 void DomBindings::set_current_script(dom::Node* script) { impl_->current_script = script; }
+
+bool DomBindings::custom_validity(const dom::Node* control, String* message) {
+  for (uint64_t i = 0; i < impl_->custom_validity.count(); ++i) {
+    const auto& c = impl_->custom_validity[i];
+    if (c.serial != control->serial || c.message.empty()) continue;
+    if (message) message->assign(c.message.view());
+    return true;
+  }
+  return false;
+}
 
 uint32_t DomBindings::errors() const { return impl_->error_count; }
 

@@ -17,7 +17,7 @@
  */
 
 // Command-line client for trying TlsSocket against real servers (`openssl s_server`, or anything on the network):
-//   TlsLive host port [--ipps-print TEXT] [--name N] [--ca file.pem] [--insecure] [--tls12] [--tls13] [--alpn p] [--request TEXT] [--no-clock] [--ems]
+//   TlsLive host port [--ipps-print TEXT] [--name N] [--ca file.pem] [--insecure] [--tls12] [--tls13] [--alpn p] [--request TEXT] [--no-clock] [--ems] [--no-cbc]
 // Connects, shuts the handshake through, sends the request (default "GET / HTTP/1.0"), prints what came back. Exit 0 on success,
 // 1 if the handshake or the exchange failed (the TLS error is printed), 2 for bad arguments.
 #include <stdio.h>
@@ -88,6 +88,7 @@ int main(int argc, char** argv) {
     else if (a == "--dump-plain" && i + 1 < argc) plain_file = argv[++i];
     else if (a == "--no-clock") config.clock = nullptr;
     else if (a == "--ems") config.require_extended_master_secret = true;
+    else if (a == "--no-cbc") config.allow_cbc_suites = false;
     else if (a == "--echo" && i + 1 < argc) echo_bytes = strtoul(argv[++i], nullptr, 10);
     else if (a == "--ipps-print" && i + 1 < argc) ipps_text = argv[++i];
     else if (a == "--hold" && i + 1 < argc) hold_seconds = strtoul(argv[++i], nullptr, 10);
@@ -138,7 +139,8 @@ int main(int argc, char** argv) {
     printf("FAILED handshake: tls error %d, alert %u, certificate status \"%s\"\n", (int)tls.error(), tls.alert_received(), crypto::cert_status_name(tls.certificate_status()));
     return 1;
   }
-  printf("handshake ok: version 0x%04x, %s, alpn \"%s\"%s\n", tls.protocol_version(), tls.cipher_suite_name(), tls.alpn_selected(), tls.extended_master_secret() ? ", ems" : "");
+  printf("handshake ok: version 0x%04x, %s, alpn \"%s\"%s%s%s\n", tls.protocol_version(), tls.cipher_suite_name(), tls.alpn_selected(), tls.extended_master_secret() ? ", ems" : "",
+         tls.encrypt_then_mac() ? ", etm" : "", tls.resumed() ? ", resumed" : "");
   if (echo_bytes) {   // send a pattern, expect the same back (interleaved, as an echo server needs)
     std::vector<uint8_t> data(echo_bytes), back;
     for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>((i * 131 + (i >> 8)) & 0xff);

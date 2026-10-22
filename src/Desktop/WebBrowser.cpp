@@ -177,6 +177,10 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       page_(allocator),
       env_(*this, allocator),
       defer_go_(allocator),
+      defer_type_(allocator),
+      defer_body_(allocator),
+      request_type_(allocator),
+      request_body_(allocator),
       script_log_(allocator),
       history_(allocator),
       current_(allocator),
@@ -244,7 +248,9 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   node_handler_ = {&WebBrowser::on_node_click, this};
   resize_handler_ = {&WebBrowser::on_view_resized, this};
   timer_handler_ = {&WebBrowser::on_timers, this};
+  key_handler_ = {&WebBrowser::on_form_key, this};
   page_.on_node_clicked(node_handler_);
+  page_.on_key_pressed(key_handler_);
   page_.on_resized(resize_handler_);
 
   add(&menu_);
@@ -367,6 +373,18 @@ bool WebBrowser::reload() {
 }
 
 // Makes a request and has the handler thread carry it out (the latest request wins).
+bool WebBrowser::post_form(StringView target, StringView content_type, StringView body) {
+  {
+    UiGuard lock(this);
+    request_ = Request::Submit;
+    request_target_.assign(target);
+    request_type_.assign(content_type);
+    request_body_.assign(body);
+  }
+  fire(load_handler_);
+  return true;
+}
+
 bool WebBrowser::post(Request kind, StringView target) {
   {
     UiGuard lock(this);
@@ -406,6 +424,7 @@ void WebBrowser::load(Request kind, StringView target) {
         address.assign(history_[static_cast<uint64_t>(index_ + 1)].view());
         break;
       case Request::Reload: address.assign(current_.empty() ? target : current_.view()); break;
+      case Request::Submit: address.assign(target); break;
       default: return;
     }
     loading_ = true;
@@ -417,7 +436,9 @@ void WebBrowser::load(Request kind, StringView target) {
   say(message.view());
   Fetched page(allocator());
   page.address.assign(address.view());
-  const bool ok = fetch(address.view(), &page);
+  bool ok;
+  if (kind == Request::Submit) ok = fetch_post(address.view(), &page);
+  else ok = fetch(address.view(), &page);
   if (!ok) {
     {
       UiGuard lock(this);
@@ -450,6 +471,36 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit) {
     if (address.size() > 24) message.append("...");
     message.append(": ");
     message.append(result.error.empty() ? StringView("the page could not be fetched.") : result.error.view());
+    page->error.assign(message.view());
+    return false;
+  }
+  if (!result.final_address.empty()) page->address.assign(result.final_address.view());
+  page->type.assign(result.content_type.view());
+  page->status = result.status;
+  if (!page->body.append(result.body.view())) {
+    page->error.assign("Out of memory.");
+    return false;
+  }
+  return true;
+}
+
+// A form sent with POST: the answer is the page that is shown (only web addresses can be posted to).
+bool WebBrowser::fetch_post(StringView address, Fetched* page) {
+  String type(allocator()), body(allocator());
+  {
+    UiGuard lock(this);
+    type.assign(request_type_.view());
+    body.assign(request_body_.view());
+  }
+  if (!browser::is_web_address(address) || !loader_) {
+    page->error.assign(loader_ ? "A form can only be sent to a web address." : "Web pages cannot be opened: there is no network connection.");
+    return false;
+  }
+  browser::PageResult result(allocator());
+  if (!loader_->post(address, type.view(), body.view(), &result)) {
+    String message(allocator());
+    message.append("Cannot send the form: ");
+    message.append(result.error.empty() ? StringView("the server did not answer.") : result.error.view());
     page->error.assign(message.view());
     return false;
   }
@@ -550,7 +601,7 @@ void WebBrowser::show(Fetched& page) {
     script_log_.clear();
     script_errors_ = 0;
     reported_errors_ = 0;
-    defer_reload_ = want_go_ = false;
+    defer_reload_ = want_go_ = want_post_ = false;
     defer_history_ = 0;
     defer_scroll_ = -1;
     next_due_ms_ = 0;
@@ -641,6 +692,15 @@ void WebBrowser::refresh(bool keep_scroll) {
 
 // After the page ran something (a click, a timer, a new window size): do what it asked of the browser, then draw it again if it changed.
 void WebBrowser::settle() {
+  if (want_post_) {
+    String target(allocator()), type(allocator()), body(allocator());
+    target.assign(defer_go_.view());
+    type.assign(defer_type_.view());
+    body.assign(defer_body_.view());
+    want_post_ = false;
+    post_form(target.view(), type.view(), body.view());
+    return;
+  }
   if (want_go_) {
     String target(allocator());
     target.assign(defer_go_.view());
@@ -666,6 +726,7 @@ void WebBrowser::settle() {
     UiGuard lock(&page_);
     page_.invalidate();
   }
+  update_key_capture();
   if (live_->changed() || defer_scroll_ >= 0) refresh(true);
   else if (live_->errors() != reported_errors_) {
     UiGuard lock(this);
@@ -673,6 +734,50 @@ void WebBrowser::settle() {
     script_errors_ = live_->errors();
   }
   schedule_timers();
+}
+
+// Keys go to the page while a control has the focus (and Tab is the page's whenever it has a control to step to).
+void WebBrowser::update_key_capture() {
+  if (!live_) {
+    page_.set_capture_keys(PageView::kCaptureNone);
+    return;
+  }
+  const uint8_t mode = live_->has_focus() ? PageView::kCaptureAll : live_->has_controls() ? PageView::kCaptureTab : PageView::kCaptureNone;
+  page_.set_capture_keys(mode);
+}
+
+void WebBrowser::on_form_key(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  namespace key = hardware::key;
+  KeyArgs args;
+  while (b->page_.take_key(&args)) {
+    if (!b->live_) {
+      b->page_.scroll_key(args);
+      continue;
+    }
+    using Key = browser::Page::FormKey;
+    Key k = Key::Character;
+    switch (args.usage) {
+      case key::kEnter: k = Key::Enter; break;
+      case key::kBackspace: k = Key::Backspace; break;
+      case key::kDelete: k = Key::Delete; break;
+      case key::kTab: k = Key::Tab; break;
+      case key::kEscape: k = Key::Escape; break;
+      case key::kLeft: k = Key::Left; break;
+      case key::kRight: k = Key::Right; break;
+      case key::kUp: k = Key::Up; break;
+      case key::kDown: k = Key::Down; break;
+      case 0x4A: k = Key::Home; break;
+      case 0x4D: k = Key::End; break;
+      default: break;
+    }
+    const uint8_t mods = (args.modifiers & hardware::modifier::kShift ? 1 : 0);
+    bool taken;
+    if (k == Key::Character && (args.character < 32 || args.character > 126)) taken = false;
+    else taken = b->live_->key(k, args.character, mods);
+    if (!taken) b->page_.scroll_key(args);
+  }
+  b->settle();
 }
 
 void WebBrowser::schedule_timers() {
@@ -798,6 +903,13 @@ bool WebBrowser::Env::fetch_text(StringView address, uint64_t limit, String* tex
 void WebBrowser::Env::navigate(StringView address, bool) {
   owner_.defer_go_.assign(address);
   owner_.want_go_ = true;
+}
+
+void WebBrowser::Env::navigate_post(StringView address, StringView content_type, StringView body) {
+  owner_.defer_go_.assign(address);
+  owner_.defer_type_.assign(content_type);
+  owner_.defer_body_.assign(body);
+  owner_.want_post_ = true;
 }
 
 void WebBrowser::Env::set_hash(StringView hash) { owner_.apply_hash(hash); }

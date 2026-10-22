@@ -205,7 +205,19 @@ void fill_event(DomBindings::Impl& c, JsObject* e, StringView type, const EventI
   vm.define_named(e, "button", num_value(init.button));
   vm.define_named(e, "buttons", num_value(0));
   vm.define_named(e, "which", num_value(init.button + 1));
-  for (const char* k : {"ctrlKey", "shiftKey", "altKey", "metaKey"}) vm.define_named(e, k, bool_value(false));
+  vm.define_named(e, "ctrlKey", bool_value(init.ctrl));
+  vm.define_named(e, "shiftKey", bool_value(init.shift));
+  vm.define_named(e, "altKey", bool_value(init.alt));
+  vm.define_named(e, "metaKey", bool_value(false));
+  if (init.key[0]) {
+    vm.define_named(e, "key", str_value(vm, init.key));
+    vm.define_named(e, "code", str_value(vm, init.key));
+    vm.define_named(e, "keyCode", num_value(init.key_code));
+    vm.define_named(e, "which", num_value(init.key_code));
+    vm.define_named(e, "charCode", num_value(0));
+    vm.define_named(e, "repeat", bool_value(false));
+  }
+  if (type.equals("submit")) vm.define_named(e, "submitter", node_value(c, init.submitter));
 }
 
 // new Event(type, init) and the like: `this` is the object the constructor call made.
@@ -477,6 +489,7 @@ bool install_events(DomBindings::Impl& c) {
 void DomBindings::activate(dom::Node* node) {
   Impl& c = *impl_;
   using namespace bind;
+  if (node && c.host.activate_control(node)) return;   // (a form control, a label, an option)
   // the nearest link
   for (dom::Node* n = node; n && n->is_element(); n = n->parent) {
     StringView href;
@@ -502,32 +515,6 @@ void DomBindings::activate(dom::Node* node) {
         c.host.navigate(target.view(), false);
       }
       return;
-    }
-  }
-  // a check box or radio button
-  if (node && node->is_tag("input")) {
-    StringView type;
-    dom::get_attribute(node, "type", &type);
-    if (type.equals_ignore_case("checkbox") || type.equals_ignore_case("radio")) {
-      if (dom::has_attribute(node, "disabled")) return;
-      if (type.equals_ignore_case("checkbox")) {
-        if (dom::has_attribute(node, "checked")) dom::remove_attribute(node, "checked");
-        else dom::set_attribute(node, "checked", "");
-      } else {
-        StringView name;
-        if (dom::get_attribute(node, "name", &name) && !name.empty()) {   // the others of its group are cleared
-          for (dom::Node* d = c.doc.root()->first_child; d; d = dom::next_in_tree(d, c.doc.root())) {
-            StringView n2, t2;
-            if (d != node && d->is_tag("input") && dom::get_attribute(d, "name", &n2) && n2.equals(name) && dom::get_attribute(d, "type", &t2) && t2.equals_ignore_case("radio"))
-              dom::remove_attribute(d, "checked");
-          }
-        }
-        dom::set_attribute(node, "checked", "");
-      }
-      EventInit init;
-      init.cancelable = false;
-      dispatch(node, "input", init);
-      dispatch(node, "change", init);
     }
   }
 }

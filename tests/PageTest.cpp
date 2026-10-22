@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 #include "Browser/Page.hpp"
+#include "Dom/Form.hpp"
 #include "Browser/PageLayout.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Media/ImageCodecs.hpp"
@@ -57,8 +58,9 @@ struct FakeClip final : IVideoClip {
   bool playing() override { return is_playing; }
   int64_t position_us() override { return position; }
   int64_t duration_us() override { return duration; }
-  uint32_t width() override { return 64; }
-  uint32_t height() override { return 48; }
+  bool sound_only = false;   // an <audio>: no picture
+  uint32_t width() override { return sound_only ? 0 : 64; }
+  uint32_t height() override { return sound_only ? 0 : 48; }
   void update() override {
     ++updates;
     if (!is_playing) return;
@@ -73,6 +75,7 @@ struct FakeClip final : IVideoClip {
     }
   }
   bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* s) override {
+    if (sound_only) return false;
     const uint32_t shade = static_cast<uint32_t>(position / 10000) & 0xFF;
     for (uint32_t y = 0; y < 48; ++y)
       for (uint32_t x = 0; x < 64; ++x) dest[y * pitch + x] = 0xFF000000u | (shade << 8) | 0x80;
@@ -99,6 +102,14 @@ struct FakeEnvironment final : IPageEnvironment {
     last_clip = clip.get();
     return clip;
   }
+  UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override {
+    (void)data;
+    if (!can_play_video) return UniquePointer<IVideoClip>();
+    auto clip = UniquePointer<FakeClip>::make(*allocator_for_clips);
+    clip->sound_only = true;
+    last_clip = clip.get();
+    return clip;
+  }
   allocators::IAllocator* allocator_for_clips = nullptr;
   std::map<std::string, std::string> files;
   std::vector<std::string> fetched, navigations, alerts, console_lines, hashes, states;
@@ -114,6 +125,10 @@ struct FakeEnvironment final : IPageEnvironment {
     if (it == files.end()) return false;
     text->assign(StringView(it->second.data(), it->second.size()));
     return true;
+  }
+  std::vector<std::string> posts;
+  void navigate_post(StringView a, StringView type, StringView body) override {
+    posts.push_back(std::string(a.data(), a.size()) + " [" + std::string(type.data(), type.size()) + "] " + std::string(body.data(), body.size()));
   }
   void navigate(StringView a, bool replace) override { navigations.push_back(std::string(a.data(), a.size()) + (replace ? " (replace)" : "")); }
   void set_hash(StringView h) override { hashes.push_back(std::string(h.data(), h.size())); }
@@ -194,8 +209,8 @@ static void test_tree() {
 static void test_attributes() {
   CHECK(js("<a id=a href='/x?y=1' class='c1 c2' data-foo-bar=7 title=T>l</a>", "var a = document.getElementById('a'); console.log(a.getAttribute('href'), a.href, a.className, a.title, a.hasAttribute('data-foo-bar'), a.getAttribute('nope'), a.attributes.length, a.attributes[0].name, a.attributes[0].value)", "/x?y=1 http://example.com/x?y=1 c1 c2 T true null 5 id a"));
   CHECK(js("<div id=d></div>", "var d = document.getElementById('d'); d.setAttribute('Data-X', '1'); d.setAttribute('title', 5); d.id = 'e'; d.className = 'k'; d.hidden = true; console.log(d.outerHTML, d.getAttributeNames().join()); d.removeAttribute('title'); d.hidden = false; d.toggleAttribute('open'); console.log(d.outerHTML)", "<div id=\"e\" data-x=\"1\" title=\"5\" class=\"k\" hidden=\"\"></div> id,data-x,title,class,hidden | <div id=\"e\" data-x=\"1\" class=\"k\" open=\"\"></div>"));
-  CHECK(js("<input id=i type=checkbox checked value=v>", "var i = document.getElementById('i'); console.log(i.type, i.checked, i.value, i.disabled); i.checked = false; i.disabled = true; i.value = 'w'; console.log(i.outerHTML)", "checkbox true v false | <input id=\"i\" type=\"checkbox\" value=\"w\" disabled=\"\">"));
-  CHECK(js("<input id=i><button id=b></button><textarea id=t>x<y</textarea>", "var t = document.getElementById('t'); console.log(document.getElementById('i').type, document.getElementById('b').type, t.value); t.value = 'new'; console.log(t.textContent)", "text submit x<y | new"));
+  CHECK(js("<input id=i type=checkbox checked value=v>", "var i = document.getElementById('i'); console.log(i.type, i.checked, i.value, i.disabled); i.checked = false; i.disabled = true; i.value = 'w'; console.log(i.outerHTML)", "checkbox true v false | <input id=\"i\" type=\"checkbox\" checked=\"\" value=\"w\" disabled=\"\">"));
+  CHECK(js("<input id=i><button id=b></button><textarea id=t>x<y</textarea>", "var t = document.getElementById('t'); console.log(document.getElementById('i').type, document.getElementById('b').type, t.value); t.value = 'new'; console.log(t.textContent)", "text submit x<y | x<y"));
   CHECK(js("<img id=i width=20 height=5 src=a.png alt=A>", "var i = document.getElementById('i'); console.log(i.width, i.height, i.src, i.alt, i.tabIndex); i.width = 30; console.log(i.getAttribute('width'))", "20 5 http://example.com/dir/a.png A -1 | 30"));
   CHECK(js("<div id=d data-a-b=1 data-c=2></div>", "var d = document.getElementById('d'); console.log(d.dataset.aB, d.dataset.c, d.dataset.nothing, Object.keys(d.dataset).join()); d.dataset.newOne = 'x'; delete d.dataset.c; console.log(d.outerHTML)", "1 2 undefined aB,c | <div id=\"d\" data-a-b=\"1\" data-new-one=\"x\"></div>"));
   CHECK(js("<p id=p class='a  b'>x</p>", "var p = document.getElementById('p'); var l = p.classList; console.log(l.length, l.contains('a'), l[1], l.value, l.item(5)); l.add('c', 'a'); l.remove('b'); console.log(p.className, l.toggle('d'), l.toggle('d'), l.toggle('e', true), l.toggle('e', true), p.className); l.replace('a', 'z'); console.log(p.className, String(l)); try { l.add('x y') } catch (e) { console.log(e.name) } try { l.add('') } catch (e) { console.log(e.name) }", "2 true b a  b null | a c true false true true a c e | z c e z c e | InvalidCharacterError | SyntaxError"));
@@ -930,6 +945,290 @@ static void test_video() {
   CHECK(a.live == 0);
 }
 
+static void test_audio() {
+  TestAllocator a;
+  {   // with controls: a bar on the page; without: nothing; the fallback text is never shown
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/s.mp3"] = "not really a song";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><audio id=a src=s.mp3 controls autoplay>fallback text</audio><audio>hidden fallback</audio><p>after</p>"
+              "<script>var a = document.getElementById('a'); ['loadedmetadata', 'canplay', 'play', 'pause', 'ended'].forEach(function(t) { a.addEventListener(t, function() { console.log(t) }) });"
+              "console.log(a.paused, a.readyState, isNaN(a.duration))</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip != nullptr && env.last_clip->is_playing);
+    const Run* bar = find_object(doc, ObjectKind::Audio);
+    CHECK(bar && bar->object_w == 300 && bar->object_h == 32);
+    CHECK(find_object(doc, ObjectKind::Audio, 1) == nullptr);
+    bool fallback_shown = false;
+    for (uint64_t i = 0; i < doc.run_count(); ++i) fallback_shown = fallback_shown || doc.run_text(i).contains("fallback");
+    CHECK(!fallback_shown);
+    const std::string log = page_log(page);
+    CHECK(log.find("loadedmetadata") != std::string::npos && log.find("canplay") != std::string::npos && log.find("| play") != std::string::npos);
+    page.step_objects(static_cast<double>(env.clock));
+    CHECK(env.last_clip->updates >= 1);
+    // a click on the bar pauses
+    page.click(bar->node, 0, 0, static_cast<uint8_t>(ObjectKind::Audio), 10, 16, 300, 32);
+    CHECK(!env.last_clip->is_playing);
+  }
+  CHECK(a.live == 0);
+  {   // script: new Audio(), play(), properties, canPlayType
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/s.ogg"] = "song";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><audio id=a src=s.ogg></audio><button id=b></button>"
+              "<script>document.getElementById('b').addEventListener('click', function() {"
+              "  var a = document.getElementById('a'), r = []; a.volume = 0.5; a.loop = true; a.currentTime = 1;"
+              "  r.push(a.volume, a.loop, a.currentTime, a.duration, a.readyState, a instanceof HTMLElement);"
+              "  r.push(a.canPlayType('audio/mpeg') !== '', a.canPlayType('video/mp4') === '');"
+              "  var n = new Audio('t.mp3'); r.push(n.tagName, n.getAttribute('src'), typeof n.play);"
+              "  console.log(r.join(' ')) })</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip && !env.last_clip->is_playing);
+    CHECK(find_object(doc, ObjectKind::Audio) == nullptr);
+    CHECK(find_object(doc, ObjectKind::Video) == nullptr);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page) == "0.5 true 1 2 4 true true true AUDIO t.mp3 function");
+  }
+  CHECK(a.live == 0);
+  {   // a sound that cannot be played
+    FakeEnvironment env(a);
+    env.can_play_video = false;
+    env.blobs["http://example.com/s.mp3"] = "song";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><audio id=a src=s.mp3 controls></audio><script>document.getElementById('a').addEventListener('error', function() { console.log('error') })</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(page_log(page) == "error");
+  }
+  CHECK(a.live == 0);
+}
+
+
+// --- Forms ------------------------------------------------------------------------------------------------------------------------
+
+static uint32_t serial_of(Page& page, const char* id) {
+  dom::Node* n = page.document().element_by_id(id);
+  return n ? n->serial : 0;
+}
+
+static void type_text(Page& page, const char* text) {
+  for (const char* p = text; *p; ++p) page.key(Page::FormKey::Character, *p, 0);
+}
+
+static void test_forms() {
+  TestAllocator a;
+  const char* kForm =
+      "<html><body><form id=f action=/search method=get>"
+      "<input id=q name=q size=10 placeholder=Search maxlength=12>"
+      "<input id=c type=checkbox name=c value=yes> <input id=r1 type=radio name=r value=a checked> <input id=r2 type=radio name=r value=b>"
+      "<select id=s name=s><option value=1>One<option value=2 selected>Two<option value=3>Three</select>"
+      "<textarea id=t name=t rows=2 cols=8>hello</textarea>"
+      "<input id=go type=submit name=go value=Go><input type=reset id=rs value=Clear><input type=hidden name=h value=secret>"
+      "</form></body></html>";
+  {   // looks
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/dir/page.html", media, true);
+    page.load(kForm);
+    const std::string text = page_text(page, 60);
+    CHECK(text.find("[Search    ]") != std::string::npos);
+    CHECK(text.find("[ ]") != std::string::npos && text.find("(*)") != std::string::npos && text.find("( )") != std::string::npos);
+    CHECK(text.find("[Two v]") == std::string::npos && text.find("[Two   v]") != std::string::npos);
+    CHECK(text.find("[hello   ]") != std::string::npos);
+    CHECK(text.find("[ Go ]") != std::string::npos && text.find("[ Clear ]") != std::string::npos);
+    CHECK(text.find("secret") == std::string::npos);
+  }
+  {   // clicks and typing; the form is sent with GET
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/dir/page.html", media, true);
+    page.load(std::string(kForm).replace(std::string(kForm).find("</form>"), 7, "</form><script>var log = []; ['input','change','focus','blur','submit'].forEach(function(t){ document.getElementById('f').addEventListener(t, function(e){ log.push(t + ':' + e.target.id) }, true) }); document.getElementById('f').addEventListener('submit', function(e){ console.log(log.join(',')) });</script>").c_str());
+    CHECK(!page.has_focus());
+    page.click(serial_of(page, "q"), 0, 0);
+    CHECK(page.has_focus());
+    type_text(page, "hi there and more");   // (maxlength 12)
+    page.key(Page::FormKey::Backspace, 0, 0);
+    dom::Node* q = page.document().element_by_id("q");
+    String v(a);
+    dom::get_value(q, &v);
+    CHECK(v.view().equals("hi there an"));
+    CHECK(page_text(page, 60).find("[ there an|]") != std::string::npos);
+    page.click(serial_of(page, "c"), 0, 0);   // check the box (the field loses the focus: change)
+    CHECK(dom::is_checked(page.document().element_by_id("c")));
+    page.click(serial_of(page, "r2"), 0, 0);
+    CHECK(!dom::is_checked(page.document().element_by_id("r1")) && dom::is_checked(page.document().element_by_id("r2")));
+    // the list opens, an option is chosen
+    page.click(serial_of(page, "s"), 0, 0);
+    std::string open = page_text(page, 60);
+    CHECK(open.find("( ) One") != std::string::npos && open.find("(*) Two") != std::string::npos && open.find("( ) Three") != std::string::npos);
+    dom::Node* s = page.document().element_by_id("s");
+    List<dom::Node*> options(a);
+    dom::select_options(s, &options);
+    page.click(options[2]->serial, 0, 0);
+    CHECK(dom::selected_index(s) == 2);
+    CHECK(page_text(page, 60).find("( ) One") == std::string::npos);   // (closed again)
+    page.click(serial_of(page, "t"), 0, 0);
+    page.key(Page::FormKey::Enter, 0, 0);
+    type_text(page, "x y");
+    page.click(serial_of(page, "go"), 0, 0);
+    CHECK(env.navigations.size() == 1);
+    CHECK(env.navigations.size() == 1 && env.navigations[0] == "http://example.com/search?q=hi+there+an&c=yes&r=b&s=3&t=hello%0D%0Ax+y&go=Go&h=secret");
+    const std::string log = page_log(page);
+    CHECK(log.find("input:q") != std::string::npos && log.find("change:c") != std::string::npos && log.find("change:r2") != std::string::npos &&
+          log.find("change:s") != std::string::npos && log.find("submit:f") != std::string::npos);
+    // reset goes back to the markup
+    page.click(serial_of(page, "rs"), 0, 0);
+    dom::get_value(q, &v);
+    CHECK(v.empty() && !dom::is_checked(page.document().element_by_id("c")) && dom::is_checked(page.document().element_by_id("r1")) && dom::selected_index(s) == 1);
+  }
+  {   // Enter in a field sends the form; POST goes to the environment; a script can stop it
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f action=/login method=post><input id=u name=user><input type=password id=p name=pw><button name=b value=1>Go</button></form>"
+              "<form id=g action=/stop><input id=x name=x></form><script>document.getElementById('g').addEventListener('submit', function(e) { e.preventDefault(); console.log('stopped') })</script></body></html>");
+    page.click(serial_of(page, "u"), 0, 0);
+    type_text(page, "bob");
+    page.key(Page::FormKey::Tab, 0, 0);
+    type_text(page, "s3 cret&");
+    CHECK(page_text(page).find("[********|") != std::string::npos);
+    page.key(Page::FormKey::Enter, 0, 0);
+    CHECK(env.posts.size() == 1 && env.posts[0] == "http://example.com/login [application/x-www-form-urlencoded] user=bob&pw=s3+cret%26&b=1");
+    page.click(serial_of(page, "x"), 0, 0);
+    page.key(Page::FormKey::Enter, 0, 0);
+    CHECK(page_log(page) == "stopped" && env.navigations.empty());
+  }
+  {   // multipart and plain text
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f method=post enctype=multipart/form-data><input name=a value=1><input name=b value='x\"y'><input type=submit id=s></form>"
+              "<form id=g method=post enctype=text/plain><input name=a value=1><input type=submit id=s2></form></body></html>");
+    page.click(serial_of(page, "s"), 0, 0);
+    CHECK(env.posts.size() == 1 && env.posts[0].find("[multipart/form-data; boundary=----TheoryCraftOSFormBoundary7MA4YWxkTrZu0gW]") != std::string::npos &&
+          env.posts[0].find("name=\"a\"\r\n\r\n1\r\n") != std::string::npos && env.posts[0].find("name=\"b\"\r\n\r\nx\"y\r\n") != std::string::npos);
+    page.click(serial_of(page, "s2"), 0, 0);
+    CHECK(env.posts.size() == 2 && env.posts[1] == "http://example.com/ [text/plain] a=1\r\n");
+  }
+  {   // constraints
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f action=/ok><input id=e type=email name=e required><input id=n type=number name=n min=1 max=5><input id=z name=z pattern='[A-Z]{2}[0-9]+'>"
+              "<button id=b>Send</button></form></body></html>");
+    page.click(serial_of(page, "b"), 0, 0);
+    CHECK(env.navigations.empty());
+    CHECK(page_text(page, 80).find("! Please fill out this field.") != std::string::npos);
+    CHECK(page.has_focus());
+    type_text(page, "nobody");
+    CHECK(page_text(page, 80).find("! ") == std::string::npos);   // (the note goes away when the user types)
+    page.click(serial_of(page, "b"), 0, 0);
+    CHECK(env.navigations.empty() && page_text(page, 80).find("! Please include an '@' in the email address.") != std::string::npos);
+    type_text(page, "@x.org");
+    page.click(serial_of(page, "n"), 0, 0);
+    type_text(page, "9");
+    page.click(serial_of(page, "b"), 0, 0);
+    CHECK(env.navigations.empty() && page_text(page, 80).find("less than or equal to 5") != std::string::npos);
+    page.key(Page::FormKey::Backspace, 0, 0);
+    type_text(page, "3");
+    page.click(serial_of(page, "z"), 0, 0);
+    type_text(page, "abc");
+    page.click(serial_of(page, "b"), 0, 0);
+    CHECK(env.navigations.empty() && page_text(page, 80).find("Please match the requested format.") != std::string::npos);
+    for (int i = 0; i < 3; ++i) page.key(Page::FormKey::Backspace, 0, 0);
+    type_text(page, "AB12");
+    page.click(serial_of(page, "b"), 0, 0);
+    CHECK(env.navigations.size() == 1 && env.navigations[0] == "http://example.com/ok?e=nobody%40x.org&n=3&z=AB12");
+  }
+  {   // novalidate and formnovalidate skip the checks
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f novalidate><input name=e required><button id=b>Send</button></form>"
+              "<form id=g><input name=e required><button id=c formnovalidate>Send</button></form></body></html>");
+    page.click(serial_of(page, "b"), 0, 0);
+    page.click(serial_of(page, "c"), 0, 0);
+    CHECK(env.navigations.size() == 2);
+  }
+  {   // scripts: values, the form object, FormData, validity, reset, submit
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f action=/go><input id=i name=inp value=start><input id=c type=checkbox name=chk checked><select id=s name=sel><option>A<option value=b>B</select>"
+              "<textarea id=t name=txt>text</textarea><input id=n type=number name=num value=4 step=2><input id=r name=rng type=range min=0 max=10 value=3><button id=bt type=button>x</button></form>"
+              "<script>"
+              "var f = document.getElementById('f'), i = f.inp, r = [];"
+              "r.push(f.elements.length, f.elements.inp === i, f.length, i.form === f, f.method, f.enctype);"
+              "i.value = 'changed'; r.push(i.value, i.defaultValue, i.getAttribute('value'));"
+              "f.chk.checked = false; r.push(f.chk.checked, f.chk.defaultChecked, f.chk.value);"
+              "r.push(f.sel.value, f.sel.selectedIndex, f.sel.options.length, f.sel.options[1].value); f.sel.value = 'b'; r.push(f.sel.selectedIndex, f.sel.options[1].selected);"
+              "r.push(f.txt.value, f.txt.type, f.sel.type, f.bt.type, f.num.type);"
+              "f.num.stepUp(); r.push(f.num.value, f.num.valueAsNumber); f.num.value = 'abc'; r.push('[' + f.num.value + ']');"
+              "r.push(f.rng.value);"
+              "var fd = new FormData(f); r.push(fd.get('inp'), fd.has('chk'), fd.getAll('sel').join(), fd.get('missing'));"
+              "fd.append('extra', 'x'); fd.set('inp', 'again'); r.push(fd.get('inp'), fd.entries().length);"
+              "var seen = []; fd.forEach(function(v, k) { seen.push(k + '=' + v) }); r.push(seen.join('&'));"
+              "f.reset(); r.push(i.value, f.chk.checked, f.sel.selectedIndex);"
+              "i.setCustomValidity('nope'); r.push(i.validity.customError, i.validationMessage, f.checkValidity(), i.willValidate); i.setCustomValidity(''); r.push(f.checkValidity());"
+              "i.required = true; i.value = ''; r.push(i.validity.valueMissing, i.validity.valid, i.validationMessage);"
+              "console.log(r.join(' '))"
+              "</script></body></html>");
+    CHECK(page_log(page) ==
+          "7 true 7 true get application/x-www-form-urlencoded changed start start false true on A 0 2 b 1 true text textarea select-one button number 6 6 [] 3 "
+          "changed false b  again 6 inp=again&sel=b&txt=text&num=&rng=3&extra=x"
+          " start true 0 true nope false true true true false Please fill out this field.");
+  }
+  {   // script-driven submit and requestSubmit
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f action=/s><input name=a value=1 required><input name=b value=''><button id=bt name=btn value=v>x</button></form>"
+              "<button id=run></button><script>"
+              "var f = document.getElementById('f'); f.addEventListener('submit', function(e) { console.log('submit ' + e.submitter.id); e.preventDefault() });"
+              "document.getElementById('run').addEventListener('click', function() { f.requestSubmit(document.getElementById('bt')); f.submit(); f.querySelector('[name=a]').value = ''; console.log(f.checkValidity(), f.reportValidity()) });"
+              "</script></body></html>");
+    page.click(serial_of(page, "run"), 0, 0);
+    CHECK(page_log(page) == "submit bt | false false");
+    CHECK(env.navigations.size() == 1 && env.navigations[0] == "http://example.com/s?a=1&b=");   // (submit() skips the event, and the button is not in it)
+  }
+  {   // without scripts a form still works
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, false);
+    page.load("<html><body><form action=/plain><input id=q name=q><input type=checkbox id=c name=c><label id=l for=c>tick</label><input type=submit id=go></form></body></html>");
+    page.click(serial_of(page, "q"), 0, 0);
+    type_text(page, "no js");
+    page.click(serial_of(page, "l"), 0, 0);
+    CHECK(dom::is_checked(page.document().element_by_id("c")));
+    page.click(serial_of(page, "go"), 0, 0);
+    CHECK(env.navigations.size() == 1 && env.navigations[0] == "http://example.com/plain?q=no+js&c=on");
+  }
+  {   // focus: Tab steps through the controls, Escape leaves, focus() and activeElement
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form><input id=a><input id=b disabled><input id=c><textarea id=d></textarea></form><button id=bt>go</button><script>document.getElementById('bt').addEventListener('click', function() { document.getElementById('c').focus() })</script>"
+              "<style>#a:focus{color:red}</style></body></html>");
+    CHECK(page.has_controls() && !page.has_focus());
+    CHECK(page.key(Page::FormKey::Tab, 0, 0));
+    CHECK(page.focused() && page.focused()->serial == serial_of(page, "a"));
+    page.key(Page::FormKey::Tab, 0, 0);
+    CHECK(page.focused()->serial == serial_of(page, "c"));
+    page.key(Page::FormKey::Tab, 0, 1);
+    CHECK(page.focused()->serial == serial_of(page, "a"));
+    page.key(Page::FormKey::Escape, 0, 0);
+    CHECK(!page.has_focus());
+    CHECK(!page.key(Page::FormKey::Character, 'x', 0));   // (nothing focused: the view scrolls)
+    page.click(serial_of(page, "bt"), 0, 0);
+    CHECK(page.focused() && page.focused()->serial == serial_of(page, "c"));
+  }
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_tree();
@@ -945,6 +1244,8 @@ int main() {
   test_images();
   test_canvas_scripts();
   test_video();
+  test_audio();
+  test_forms();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

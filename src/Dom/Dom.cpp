@@ -209,6 +209,10 @@ Node* clone_node(Node* node, bool deep) {
       if (copy)
         for (uint64_t i = 0; i < node->attrs.count(); ++i)
           if (set_attribute(copy, node->attrs[i].name.view(), node->attrs[i].value.view()) != DomError::None) return nullptr;
+      if (copy) {   // (a copy of a control keeps what was typed into it, not the focus)
+        copy->form_state = node->form_state & ~0x08;
+        if (node->form_state & 1) copy->data.assign(node->data.view());
+      }
       break;
     case NodeType::Text: copy = doc.create_text(node->data.view()); break;
     case NodeType::Comment: copy = doc.create_comment(node->data.view()); break;

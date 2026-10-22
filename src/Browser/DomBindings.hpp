@@ -80,6 +80,19 @@ class IDomHost {
   virtual bool compile_handler(StringView code, script::Value* function) = 0;
   // The pictures, videos and canvases of the page.
   virtual PageObjects& objects() = 0;
+  // --- Forms (what is not in the tree: the focus, the open list, the submission)
+  virtual dom::Node* focused() = 0;
+  // Moves the focus to a control (nullptr: nowhere); blur / focus / change events follow.
+  virtual void set_focus(dom::Node* control) = 0;
+  // What a click does to a control, a label or an option (checks a box, presses a button, opens a list ...). True if the node was one of those.
+  virtual bool activate_control(dom::Node* node) = 0;
+  // Submits a form. `interactive`: as a click on a submit button does (the constraints are checked, `submit` fires and may stop it); otherwise as
+  // form.submit() does (it just goes). Reports a constraint that is broken with `invalid` events and a message by the control.
+  virtual void submit_form(dom::Node* form, dom::Node* submitter, bool interactive) = 0;
+  // form.reset(): a cancelable `reset` event, then every control goes back to its markup.
+  virtual void reset_form(dom::Node* form) = 0;
+  // Shows what is wrong with a control (reportValidity()); true if nothing is.
+  virtual bool report_validity(dom::Node* control) = 0;
 
  protected:
   IDomHost() = default;
@@ -90,6 +103,12 @@ struct EventInit {
   bool bubbles = true, cancelable = true;
   double detail = 0, client_x = 0, client_y = 0;
   int button = 0;
+  // Keyboard events: key ("a", "Enter", "Backspace" ...; empty for other events), keyCode, and the modifiers held.
+  char key[16] = {0};
+  double key_code = 0;
+  bool ctrl = false, shift = false, alt = false;
+  // A submit event: the button that was pressed (nullptr: none).
+  dom::Node* submitter = nullptr;
 };
 
 class DomBindings {
@@ -108,6 +127,8 @@ class DomBindings {
   // What a click on a node does when no listener stopped it: follows a link, toggles a check box. (Called by element.click() and by the browser after
   // dispatch(node, "click") returned true.)
   void activate(dom::Node* node);
+  // What setCustomValidity() was given for a control ("" if nothing).
+  bool custom_validity(const dom::Node* control, String* message);
   // The element whose script is running now (document.currentScript).
   void set_current_script(dom::Node* script);
   // document.readyState, and the window's numbers (innerWidth ...) from the media environment.

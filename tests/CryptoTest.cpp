@@ -123,6 +123,29 @@ int main() {
     aes.encrypt_block(pt.data(), out);
     CHECK(hex(out, 16) == "8ea2b7ca516745bfeafc49904b496089");
     CHECK(!aes.set_key(view(unhex("0001020304"))));
+    // and back (FIPS-197 C.1 - C.3 read the other way)
+    const char* keys[3] = {"000102030405060708090a0b0c0d0e0f", "000102030405060708090a0b0c0d0e0f1011121314151617", "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"};
+    const char* cts[3] = {"69c4e0d86a7b0430d8cdb78070b4c55a", "dda97ca4864cdfe06eaf70a0ec0d7191", "8ea2b7ca516745bfeafc49904b496089"};
+    for (int i = 0; i < 3; ++i) {
+      CHECK(aes.set_key(view(unhex(keys[i]))));
+      std::vector<uint8_t> ct = unhex(cts[i]);
+      aes.decrypt_block(ct.data(), out);
+      CHECK(hex(out, 16) == "00112233445566778899aabbccddeeff");
+    }
+    // CBC, NIST SP 800-38A F.2.1 / F.2.2 (AES-128) and F.2.5 / F.2.6 (AES-256)
+    const std::vector<uint8_t> iv = unhex("000102030405060708090a0b0c0d0e0f");
+    const std::string plain = "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710";
+    const struct { const char* key; const char* cipher; } cbc[2] = {
+        {"2b7e151628aed2a6abf7158809cf4f3c", "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b273bed6b8e3c1743b7116e69e222295163ff1caa1681fac09120eca307586e1a7"},
+        {"603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4", "f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d39f23369a9d9bacfa530e26304231461b2eb05e2c39be9fcda6c19078c6a9d1b"}};
+    for (const auto& c : cbc) {
+      CHECK(aes.set_key(view(unhex(c.key))));
+      std::vector<uint8_t> data = unhex(plain.c_str());
+      aes.cbc(iv.data(), ByteView(data.data(), data.size()), false);
+      CHECK(hex(data.data(), data.size()) == c.cipher);
+      aes.cbc(iv.data(), ByteView(data.data(), data.size()), true);
+      CHECK(hex(data.data(), data.size()) == plain);
+    }
   }
   // DES: the classic example (Stallings / FIPS 81)
   {

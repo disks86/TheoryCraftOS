@@ -10,7 +10,7 @@ work=${TMPDIR:-/tmp}/tcos-http-live
 mkdir -p "$work"
 tool=$work/HttpLive
 g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -I tests -Wall -Wextra -Wno-unused-parameter tests/HttpLive.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-  src/Network/Http/*.cpp src/Network/Tls/*.cpp src/Network/Dns/*.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Checksum.cpp src/Crypto/*.cpp src/Media/Zlib.cpp -o "$tool" || exit 1
+  src/Network/Http/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Tls/Tls13Client.cpp src/Network/Quic/*.cpp src/Network/Dns/*.cpp src/Crypto/*.cpp src/Media/Zlib.cpp -o "$tool" || exit 1
 
 cd "$work"
 make_ca() { openssl req -x509 -newkey "${@:2}" -nodes -keyout "$1-ca.key" -out "$1-ca.pem" -days 365 -subj "/CN=Test CA $1" \
@@ -95,6 +95,7 @@ for c in rsa p256; do
   P=http://localhost:$pp; T=https://localhost:$tp; CA="--ca $c-ca.pem"
   run "$c http plain"            'status 200, 18 body bytes, 0 redirects.*\nhello from python|status 200, 18 body bytes' $P/plain
   run "$c https plain"           'status 200, 18 body bytes, 0 redirects' $T/plain $CA
+  run "$c https resumes a session" 'TLS session resumed' $T/plain $CA --repeat 2
   run "$c https by address"      'status 200, 18 body bytes' https://127.0.0.1:$tp/plain $CA
   run "$c https chunked"         'status 200, 50000 body bytes' $T/chunked $CA --quiet
   run "$c http chunked"          'status 200, 50000 body bytes' $P/chunked --quiet

@@ -155,7 +155,134 @@ static Outcome run(const TlsVector& v, const std::vector<uint8_t>& stream, HeapA
   return o;
 }
 
+
+// ---- TLS 1.2 AES-CBC records (the cipher suites of servers that have no AEAD): against records made by an independent implementation (Python's hmac and
+// cryptography), round trips of every length, and records that were damaged
+
+namespace {
+
+struct FixedIv final : crypto::IRandom {
+  uint8_t next = 0xa0;
+  bool fill(ByteView out) override {
+    for (uint64_t i = 0; i < out.size(); ++i) out[i] = next++;
+    return true;
+  }
+};
+
+std::string hex_of(const uint8_t* p, size_t n) {
+  std::string out;
+  char b[3];
+  for (size_t i = 0; i < n; ++i) {
+    snprintf(b, sizeof b, "%02x", p[i]);
+    out += b;
+  }
+  return out;
+}
+
+void test_cbc_records() {
+  const char* text = "hello world, this is a TLS record";
+  const ConstByteView plain(reinterpret_cast<const uint8_t*>(text), strlen(text));
+  uint8_t key[32], mac_key[48];
+  for (int i = 0; i < 32; ++i) key[i] = static_cast<uint8_t>(i);
+  for (int i = 0; i < 48; ++i) mac_key[i] = static_cast<uint8_t>(0x10 + i);
+  const struct {
+    const char* name;
+    tls::AeadKind kind;
+    crypto::HashKind mac;
+    bool etm;
+    const char* record;
+  } kats[] = {
+      {"sha1 mac-then-encrypt", tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha1, false,
+       "1703030050a0a1a2a3a4a5a6a7a8a9aaabacadaeafcac502260009a8a5332d88008b7e0bb3cc47fc2f15c463ba5f157b64f219fcaf70e5d03c2dcc3d14300cb956e05bcb0eddf7e2a77f920a930e582f2f81f4b15c"},
+      {"sha1 encrypt-then-mac", tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha1, true,
+       "1703030054a0a1a2a3a4a5a6a7a8a9aaabacadaeafcac502260009a8a5332d88008b7e0bb3cc47fc2f15c463ba5f157b64f219fcafa5b5e76aa0dca494f3d6ad5d3ddc090fc01afae189ecb6727313e0dbf8336e8d4320b40c"},
+      {"sha256 mac-then-encrypt", tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha256, false,
+       "1703030060a0a1a2a3a4a5a6a7a8a9aaabacadaeafcac502260009a8a5332d88008b7e0bb3cc47fc2f15c463ba5f157b64f219fcaf5abb60061ba43030b4f77aec7a2e284f6d50ee0970447b9bc68a94e51602ec094b8f76c06035a7ca23b893eb837dcaea"},
+      {"sha384 encrypt-then-mac (AES-256)", tls::AeadKind::Aes256Cbc, crypto::HashKind::Sha384, true,
+       "1703030070a0a1a2a3a4a5a6a7a8a9aaabacadaeaf5218e8f47adb6dded5498b9df62b4c5a1a0e518f0c88228f3f5970d9ba82c71b16f7c787b95a1044f8c179e2fd659f9d11801ff3a5a731a737c0ffcec911d77ed9ace5da27bd8c86d718427d4dfbc720b6c201825842fe675314177c3edc5b23"}};
+  for (const auto& kat : kats) {
+    FixedIv iv;
+    tls::RecordProtection w, r;
+    CHECK(w.set_cbc_keys(kat.kind, kat.mac, key, mac_key, kat.etm, &iv) && r.set_cbc_keys(kat.kind, kat.mac, key, mac_key, kat.etm, &iv));
+    uint8_t out[1024];
+    const uint32_t n = w.seal(tls::kApplicationData, plain, out, sizeof out);
+    CHECK(n > 0 && hex_of(out, n) == kat.record);
+    ConstByteView got;
+    uint8_t type = 0;
+    CHECK(n > 5 && r.open(tls::kApplicationData, out + 5, n - 5, &got, &type) && type == tls::kApplicationData && got.size() == plain.size() && memcmp(got.data(), text, got.size()) == 0);
+  }
+  // every length, both directions of every mode, several records in a row (the sequence number is part of the MAC)
+  const struct { tls::AeadKind kind; crypto::HashKind mac; } modes[] = {{tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha1},
+                                                                         {tls::AeadKind::Aes256Cbc, crypto::HashKind::Sha256},
+                                                                         {tls::AeadKind::Aes256Cbc, crypto::HashKind::Sha384}};
+  for (const auto& m : modes)
+    for (int etm = 0; etm < 2; ++etm) {
+      FixedIv iv;
+      tls::RecordProtection w, r;
+      CHECK(w.set_cbc_keys(m.kind, m.mac, key, mac_key, etm, &iv) && r.set_cbc_keys(m.kind, m.mac, key, mac_key, etm, &iv));
+      std::vector<uint8_t> data(tls::kMaxPlaintext);
+      for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>(i * 7 + 3);
+      for (uint32_t length = 0; length <= 100 || length == 255 || length == 4096 || length == tls::kMaxPlaintext; length = length < 100 ? length + 1 : (length == 100 ? 255 : (length == 255 ? 4096 : (length == 4096 ? tls::kMaxPlaintext : tls::kMaxPlaintext + 1)))) {
+        std::vector<uint8_t> out(tls::kRecordHeader + tls::kMaxPlaintext + 512);
+        const uint32_t n = w.seal(tls::kHandshake, ConstByteView(data.data(), length), out.data(), static_cast<uint32_t>(out.size()));
+        ConstByteView got;
+        uint8_t type = 0;
+        CHECK(n >= tls::kRecordHeader + 32 && out[0] == tls::kHandshake && (out[3] * 256u + out[4]) == n - 5);
+        CHECK(r.open(tls::kHandshake, out.data() + 5, n - 5, &got, &type) && got.size() == length && memcmp(got.data(), data.data(), length) == 0);
+      }
+    }
+  // damage: every single bit of a record is flipped, and the record cut short at every length; nothing is accepted (and nothing is read outside the record)
+  for (int etm = 0; etm < 2; ++etm) {
+    FixedIv iv;
+    tls::RecordProtection w;
+    CHECK(w.set_cbc_keys(tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha256, key, mac_key, etm, &iv));
+    uint8_t record[512];
+    const uint32_t n = w.seal(tls::kApplicationData, plain, record, sizeof record);
+    for (uint32_t bit = 0; bit < (n - 5) * 8; ++bit) {
+      std::vector<uint8_t> copy(record + 5, record + n);
+      copy[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+      FixedIv unused;
+      tls::RecordProtection r;
+      CHECK(r.set_cbc_keys(tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha256, key, mac_key, etm, &unused));
+      ConstByteView got;
+      uint8_t type = 0;
+      CHECK(!r.open(tls::kApplicationData, copy.data(), static_cast<uint32_t>(copy.size()), &got, &type));
+    }
+    for (uint32_t length = 0; length < n - 5; ++length) {
+      std::vector<uint8_t> copy(record + 5, record + 5 + length);
+      FixedIv unused;
+      tls::RecordProtection r;
+      r.set_cbc_keys(tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha256, key, mac_key, etm, &unused);
+      ConstByteView got;
+      uint8_t type = 0;
+      CHECK(!r.open(tls::kApplicationData, copy.data(), length, &got, &type));
+    }
+    // the wrong content type, a record out of order (a different sequence number)
+    {
+      std::vector<uint8_t> copy(record + 5, record + n);
+      FixedIv unused;
+      tls::RecordProtection r;
+      r.set_cbc_keys(tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha256, key, mac_key, etm, &unused);
+      ConstByteView got;
+      uint8_t type = 0;
+      CHECK(!r.open(tls::kHandshake, copy.data(), static_cast<uint32_t>(copy.size()), &got, &type));
+      uint8_t skip[16];
+      FixedIv iv2;
+      tls::RecordProtection w2, r2;
+      w2.set_cbc_keys(tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha256, key, mac_key, etm, &iv2);
+      r2.set_cbc_keys(tls::AeadKind::Aes128Cbc, crypto::HashKind::Sha256, key, mac_key, etm, &iv2);
+      (void)skip;
+      uint8_t first[512], second[512];
+      const uint32_t n1 = w2.seal(tls::kApplicationData, plain, first, sizeof first), n2 = w2.seal(tls::kApplicationData, plain, second, sizeof second);
+      CHECK(!r2.open(tls::kApplicationData, second + 5, n2 - 5, &got, &type) && n1 > 0);   // the second one first: wrong sequence number
+    }
+  }
+}
+
+}  // namespace
+
 int main() {
+  test_cbc_records();
   HeapAllocator alloc;
   for (const TlsVector& v : kTlsVectors) {
     const std::vector<uint8_t> stream = unhex(v.server_stream), plain = unhex(v.plaintext);

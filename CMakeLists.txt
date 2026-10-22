@@ -118,6 +118,8 @@ add_executable(BOOTX64
   src/Network/Ipp/IppExchange.cpp
   src/Network/Http/HttpUrl.cpp
   src/Network/Http/HttpClient.cpp
+  src/Network/Http/WebSocket.cpp
+  src/Network/Http/AltSvc.cpp
   src/Network/Smb/Ntlm.cpp
   src/Network/Smb/SmbConnection.cpp
   src/Network/ServerNetwork.cpp
@@ -140,6 +142,18 @@ add_executable(BOOTX64
   src/Crypto/X509.cpp
   src/Network/Tls/TlsKeys.cpp
   src/Network/Tls/TlsSocket.cpp
+  src/Network/Tls/TlsCertificate.cpp
+  src/Network/Tls/TlsSession.cpp
+  src/Network/Tls/Tls13Client.cpp
+  src/Network/Quic/QuicCommon.cpp
+  src/Network/Quic/QuicCrypto.cpp
+  src/Network/Quic/QuicStreams.cpp
+  src/Network/Quic/QuicConnection.cpp
+  src/Network/Quic/QuicRecovery.cpp
+  src/Network/Quic/QuicSend.cpp
+  src/Network/Quic/QuicStreamApi.cpp
+  src/Network/Quic/Qpack.cpp
+  src/Network/Quic/Http3.cpp
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
   src/Network/Udp/UdpManager.cpp
@@ -224,10 +238,12 @@ add_executable(BOOTX64
   src/Browser/DomBindingsStyle.cpp
   src/Browser/DomBindingsWindow.cpp
   src/Browser/DomBindingsMedia.cpp
+  src/Browser/DomBindingsForm.cpp
   src/Browser/Canvas.cpp
   src/Browser/Objects.cpp
   src/Dom/Dom.cpp
   src/Dom/Selector.cpp
+  src/Dom/Form.cpp
   src/Dom/Entities.cpp
   src/Dom/HtmlBuilder.cpp
   src/Script/Number.cpp

@@ -27,6 +27,8 @@
 
 namespace network {
 
+class TlsSessionCache;
+
 enum class TlsError : uint8_t {
   None,
   Transport,      // the TCP connection failed or closed before the handshake was done
@@ -54,18 +56,23 @@ struct TlsConfig {
   void* clock_context = nullptr;
   crypto::IRandom* random = nullptr;           // required (must outlive the socket)
   bool allow_tls12 = true, allow_tls13 = true;
+  // TLS 1.2 suites with AES-CBC and an HMAC, tried only after the AEAD ones (and with encrypt-then-MAC, RFC 7366, when the server has it): for servers - old
+  // printers and file servers - that offer nothing else.
+  bool allow_cbc_suites = true;
   bool require_extended_master_secret = false; // TLS 1.2: refuse servers that do not do RFC 7627
   uint32_t min_rsa_bits = 2048;
   bool allow_sha1_certificates = false;
   uint32_t handshake_timeout_ms = 30000;
   const char* alpn = nullptr;                  // one application protocol to offer ("http/1.1", "ipp"); copied
+  // TLS 1.3 session tickets are kept in it and offered when the same server is connected to again (see TlsSession.hpp); must outlive the socket. null: no resumption.
+  TlsSessionCache* sessions = nullptr;
 };
 
 // A TLS client connection that looks like a TCP socket: everything that takes an ITcpSocket (the print transports, HTTP, ...) can be given a
 // TlsSocket instead. Over an inner TCP connection, polled like it: the handshake and the record layer advance whenever one of the calls below
 // is made while the network stack is being polled. is_connected() (and state() == Established) only turn true once the handshake is done and
 // the server's certificate was accepted; send() before that returns 0. TLS 1.2 and 1.3 with ECDHE (X25519, P-256, P-384) and AEAD suites
-// (AES-GCM, ChaCha20-Poly1305); client certificates, session resumption, 0-RTT, renegotiation and SSL 3.0 / TLS 1.0 / 1.1 are not supported.
+// (AES-GCM, ChaCha20-Poly1305, and AES-CBC with HMAC for TLS 1.2 servers that have nothing better); client certificates, 0-RTT, renegotiation and SSL 3.0 / TLS 1.0 / 1.1 are not supported.
 class TlsSocket final : public ITcpSocket {
  public:
   // `inner` is an existing connection (connected or connecting); leave it empty and call connect() to have the socket opened for you.
@@ -100,7 +107,10 @@ class TlsSocket final : public ITcpSocket {
   uint16_t protocol_version() const { return tls13_ ? 0x0304 : 0x0303; }   // meaningful once the handshake is done
   const char* cipher_suite_name() const { return suite_ ? suite_->name : ""; }
   const char* alpn_selected() const { return alpn_selected_; }
+  // The handshake was a resumption: the certificate was not sent again (server_certificate() is empty).
+  bool resumed() const { return resumed_; }
   bool extended_master_secret() const { return ems_; }
+  bool encrypt_then_mac() const { return etm_; }   // TLS 1.2 CBC: the MAC covers the ciphertext
   // The server's certificate (DER) once the handshake is done: what a program that pins certificates compares.
   ConstByteView server_certificate() const { return server_certificate_.view(); }
 
@@ -134,6 +144,7 @@ class TlsSocket final : public ITcpSocket {
   bool on_certificate(ConstByteView body, bool tls13);
   bool on_certificate_verify(ConstByteView body);
   bool on_finished_13(ConstByteView body, ConstByteView whole);
+  bool set_keys_12(tls::RecordProtection& side, bool client_write);
   bool on_server_key_exchange(ConstByteView body);
   bool on_server_hello_done();
   bool on_finished_12(ConstByteView body);
@@ -160,11 +171,13 @@ class TlsSocket final : public ITcpSocket {
   UniquePointer<Handshake> hs_;
   ByteBuffer server_certificate_;
   const tls::CipherSuite* suite_ = nullptr;
-  bool tls13_ = false, ems_ = false;
+  bool tls13_ = false, ems_ = false, etm_ = false;
   char alpn_selected_[32] = {};
   tls::RecordProtection read_, write_;
   // after the handshake (TLS 1.3 key updates)
   uint8_t client_traffic_secret_[48] = {}, server_traffic_secret_[48] = {};
+  uint8_t resumption_master_[48] = {};   // TLS 1.3: what the tickets the server sends later are made from
+  bool have_resumption_ = false, resumed_ = false;
 
   // record input
   uint8_t rx_[tls::kRecordHeader + tls::kMaxRecordPayload + 64];

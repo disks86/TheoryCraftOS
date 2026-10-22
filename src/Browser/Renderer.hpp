@@ -44,12 +44,17 @@ struct RenderOptions {
   MediaEnvironment media;          // what the display is like: @media and media="" are judged by it
   StringView extra_css;            // a style sheet read before the page's own (the caller's)
   IStyleSource* styles = nullptr;  // linked style sheets (nullptr: none)
+  // The state of the page's forms that is not in the tree: which control has the focus (a node serial, 0 for none), which drop-down list is open, and the
+  // control that broke a constraint when a form was submitted, with what to tell about it.
+  uint32_t focus = 0, open_select = 0, invalid_node = 0;
+  StringView invalid_text;
   IObjectSource* objects = nullptr;   // pictures, videos and canvases (nullptr: <img> shows its alternative text, <video> and <canvas> their fallback content)
 };
 
 // Reads the style sheets of the document, in the order they come, into `sheet`.
 bool collect_style_sheets(dom::Document& doc, const RenderOptions& options, StyleSheet* sheet);
 
+// (Forms are drawn as text: [ a field ], [ Button ], [x] a box, (*) a radio button, [ a list v ], the controls of a form being text that can be clicked.)
 // Renders the whole page into `out` (replacing what it had). False if memory ran out.
 bool render_document(dom::Document& doc, const RenderOptions& options, HtmlDocument* out);
 

@@ -24,6 +24,7 @@
 #include <vector>
 #include "Browser/Media.hpp"
 #include "Dom/Entities.hpp"
+#include "Dom/Form.hpp"
 #include "Dom/HtmlBuilder.hpp"
 #include "Dom/Selector.hpp"
 
@@ -388,6 +389,23 @@ static void test_media_queries() {
   }
 }
 
+static void test_forms() {
+  // the regular expressions of pattern=""
+  CHECK(dom::regex_match("[A-Z]{2}[0-9]+", "AB123") && !dom::regex_match("[A-Z]{2}[0-9]+", "AB") && !dom::regex_match("[A-Z]{2}[0-9]+", "xAB1"));
+  CHECK(dom::regex_match("a|bc", "bc") && !dom::regex_match("a|bc", "abc") && dom::regex_match("(ab)+c?", "ababc") && dom::regex_match("(?:ab)*", ""));
+  CHECK(dom::regex_match("\\d{3}-\\d{4}", "555-1234") && !dom::regex_match("\\d{3}-\\d{4}", "55-1234") && dom::regex_match("[^a-c]+", "xyz") && !dom::regex_match("[^a-c]+", "xbz"));
+  CHECK(dom::regex_match(".*@.*\\.com", "me@site.com") && dom::regex_match("\\w+\\s\\w+", "two words") && dom::regex_match("a{2,3}", "aaa") && !dom::regex_match("a{2,3}", "aaaa"));
+  CHECK(dom::regex_match("(", "anything") && dom::regex_match("(a*)*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"));   // (unreadable or too costly: matches)
+  double d = 0;
+  CHECK(dom::parse_number("-12.5e1", &d) && d == -125 && dom::parse_number(".5", &d) && d == 0.5 && !dom::parse_number("1.", &d) && !dom::parse_number("", &d) && !dom::parse_number("+1", &d));
+  TestAllocator a;
+  String text(a);
+  dom::format_number(0.1 + 0.2, &text);
+  CHECK(text.view().equals("0.3"));
+  dom::format_number(-42, &text);
+  CHECK(text.view().equals("-42"));
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_builder();
@@ -396,6 +414,7 @@ int main() {
   test_selectors();
   test_entities();
   test_media_queries();
+  test_forms();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

@@ -17,7 +17,7 @@
  */
 
 // Command-line HTTP(S) client for trying HttpClient against real servers, on the machine's own sockets:
-//   HttpLive URL [--ca file.pem] [--insecure] [--head] [--post TEXT] [--header "Name: value"] [--max-redirects N] [--max-body N] [--sink] [--quiet]
+//   HttpLive URL [--ca file.pem] [--insecure] [--head] [--post TEXT] [--post-size N] [--header "Name: value"] [--max-redirects N] [--max-body N] [--sink] [--quiet] [--http3 off|auto|prefer] [--repeat N]
 // Fetches the URL and prints "status NNN, N body bytes, M redirects, final URL", then the body (unless --quiet). Exit 0 if the request
 // completed (whatever the status), 1 if it failed (the error, and for TLS the details, are printed), 2 for bad arguments.
 #include <stdio.h>
@@ -25,7 +25,7 @@
 #include <string.h>
 #include <string>
 #include <time.h>
-#include "PosixNetwork.hpp"
+#include "HostNetwork.hpp"
 #include "Crypto/Crypto.hpp"
 #include "Network/Http/HttpClient.hpp"
 
@@ -57,7 +57,7 @@ static bool count_sink(void* context, ConstByteView data) {
 int main(int argc, char** argv) {
   if (argc < 2) { fprintf(stderr, "usage: HttpLive URL [options]\n"); return 2; }
   HeapAllocator alloc;
-  PosixNetworkStack stack(alloc);
+  hostnet::HostNetworkStack stack(alloc);
   UrandomEntropy urandom;
   crypto::DrbgRandom rng(urandom);
   if (!rng.initialize()) { fprintf(stderr, "no entropy\n"); return 2; }
@@ -66,6 +66,12 @@ int main(int argc, char** argv) {
   tls.clock = wall_clock;
   crypto::TrustStore trust(alloc);
   HttpClient http(stack, alloc);
+  AltSvcCache alt_svc(alloc);
+  TlsSessionCache sessions(alloc);
+  http.set_session_cache(&sessions);
+  http.set_alt_svc_cache(&alt_svc);
+  http.set_http3(Http3Mode::Off);
+  uint32_t repeat = 1;
   HttpMethod method = HttpMethod::Get;
   std::string post;
   bool quiet = false, sink = false;
@@ -88,6 +94,9 @@ int main(int argc, char** argv) {
     } else if (a == "--post" && i + 1 < argc) {
       method = HttpMethod::Post;
       post = argv[++i];
+    } else if (a == "--post-size" && i + 1 < argc) {   // a body of that many 'x'
+      method = HttpMethod::Post;
+      post.assign(strtoull(argv[++i], nullptr, 10), 'x');
     } else if (a == "--header" && i + 1 < argc) {
       const std::string h = argv[++i];
       const size_t colon = h.find(':');
@@ -96,6 +105,11 @@ int main(int argc, char** argv) {
       http.set_max_redirects(static_cast<uint32_t>(atoi(argv[++i])));
     } else if (a == "--max-body" && i + 1 < argc) {
       http.set_max_body(strtoull(argv[++i], nullptr, 10));
+    } else if (a == "--http3" && i + 1 < argc) {
+      const std::string m = argv[++i];
+      http.set_http3(m == "prefer" ? Http3Mode::Prefer : m == "auto" ? Http3Mode::Auto : Http3Mode::Off);
+    } else if (a == "--repeat" && i + 1 < argc) {
+      repeat = static_cast<uint32_t>(atoi(argv[++i]));
     } else if (a == "--sink") {
       sink = true;
     } else if (a == "--quiet") {
@@ -108,7 +122,13 @@ int main(int argc, char** argv) {
   tls.trust = &trust;
   http.set_tls(&tls);
   if (sink) http.set_body_sink(count_sink, &sunk);
-  const bool ok = http.start(method, argv[1], ConstByteView(reinterpret_cast<const uint8_t*>(post.data()), post.size()), "text/plain") && http.run(30000);
+  bool ok = false;
+  for (uint32_t round = 0; round < repeat; ++round) {   // (the same cache serves each round: an Alt-Svc header seen in one is used by the next)
+    sunk = 0;
+    ok = http.start(method, argv[1], ConstByteView(reinterpret_cast<const uint8_t*>(post.data()), post.size()), "text/plain") && http.run(30000);
+    if (!ok) break;
+    if (round + 1 < repeat) printf("round %u: http3 %d resumed %d\n", round + 1, (int)http.used_http3(), (int)http.tls_resumed());
+  }
   if (!ok) {
     printf("FAILED: %s", http_error_name(http.error()));
     if (http.error() == HttpError::Tls) printf(" (tls error %d, alert %u, certificate \"%s\")", (int)http.tls_error(), http.tls_alert(), crypto::cert_status_name(http.certificate_status()));
@@ -119,6 +139,8 @@ int main(int argc, char** argv) {
   http.url().assign_text(&final_url);
   printf("status %u, %llu body bytes, %u redirects, %s%s\n", http.status(), (unsigned long long)(sink ? sunk : http.body().size()), http.redirects(), final_url.c_str(),
          http.body_was_decoded() ? ", decoded" : "");
+  if (http.used_http3()) printf("over HTTP/3\n");
+  if (http.tls_resumed()) printf("TLS session resumed\n");
   if (!quiet && !sink) fwrite(http.body().data(), 1, http.body().size(), stdout);
   return 0;
 }

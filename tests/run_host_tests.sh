@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest AmlTest SheetTest DomTest CanvasTest BrowserTest PageTest ScriptTest DatabaseTest DatabaseNetworkTest SystemDatabaseTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest AmlTest SheetTest DomTest CanvasTest BrowserTest PageTest ScriptTest DatabaseTest DatabaseNetworkTest SystemDatabaseTest StringTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest WebSocketTest QuicTest Http3Test SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     ArrayViewTest) build_and_run ArrayViewTest tests/ArrayViewTest.cpp ;;
@@ -31,7 +31,7 @@ for t in "${WANTED[@]}"; do
                           src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp ;;
     DatabaseNetworkTest) build_and_run DatabaseNetworkTest tests/DatabaseNetworkTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Database/*.cpp src/Database/Postgres/*.cpp src/Database/Net/*.cpp \
                            src/Stream/StreamStatus.cpp src/Async/Executor.cpp src/Stream/Tcp/TcpStream.cpp src/FileSystem/FileSystemTypes.cpp src/Network/ServerNetwork.cpp src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
-                           src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp ;;
+                           src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Crypto/*.cpp ;;
     DomTest) build_and_run DomTest tests/DomTest.cpp tests/KernelStubs.cpp src/Dom/*.cpp src/Browser/Media.cpp ;;
     PageTest) build_and_run PageTest tests/PageTest.cpp tests/KernelStubs.cpp src/Browser/Page.cpp src/Browser/Objects.cpp src/Browser/Canvas.cpp src/Browser/DomBindings*.cpp src/Kernel/Sync.cpp src/Media/Image.cpp src/Media/ImageCodecs.cpp src/Media/Zlib.cpp src/Media/Image/*.cpp src/Hardware/VideoCodec/Software/JpegDecoder.cpp src/Hardware/VideoCodec/Software/JpegEncoder.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/ColorConvert.cpp src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Browser/HtmlDocument.cpp src/Browser/Renderer.cpp src/Browser/Media.cpp src/Browser/Css.cpp src/Browser/PageLayout.cpp src/Browser/Url.cpp src/Dom/*.cpp src/Network/Http/HttpUrl.cpp src/Script/*.cpp src/Math/FloatMath.cpp ;;
     CanvasTest) build_and_run CanvasTest tests/CanvasTest.cpp tests/KernelStubs.cpp src/Browser/Canvas.cpp src/Browser/Css.cpp src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Math/FloatMath.cpp src/Dom/*.cpp src/Browser/Media.cpp ;;
@@ -116,7 +116,13 @@ for t in "${WANTED[@]}"; do
     HttpTest) build_and_run HttpTest tests/HttpTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                 src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                 src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp \
-                src/Network/Http/*.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp src/Media/Zlib.cpp ;;
+                src/Network/Http/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Tls/Tls13Client.cpp src/Network/Quic/*.cpp src/Crypto/*.cpp src/Media/Zlib.cpp ;;
+    WebSocketTest) build_and_run WebSocketTest tests/WebSocketTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Dns/*.cpp src/Network/Http/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Tls/Tls13Client.cpp src/Network/Quic/*.cpp \
+                src/Crypto/*.cpp src/Media/Zlib.cpp ;;
+    Http3Test) build_and_run Http3Test tests/Http3Test.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Quic/Qpack.cpp src/Network/Http/AltSvc.cpp ;;
+    QuicTest) build_and_run QuicTest tests/QuicTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Quic/*.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Tls/Tls13Client.cpp src/Crypto/*.cpp ;;
+    InteropTool) build_and_run InteropTool tests/InteropTool.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Dns/*.cpp src/Network/Http/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Tls/Tls13Client.cpp src/Network/Quic/*.cpp \
+                src/Crypto/*.cpp src/Media/Zlib.cpp ;;
     SmbTest) build_and_run SmbTest tests/SmbTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/FileSystem/FileSystemTypes.cpp src/Network/Smb/*.cpp src/Network/ServerNetwork.cpp \
                 src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp \
                 src/Crypto/*.cpp ;;
@@ -124,19 +130,19 @@ for t in "${WANTED[@]}"; do
                 src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     SshFtpTest) build_and_run SshFtpTest tests/SshFtpTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/FileSystem/FileSystemTypes.cpp src/Network/Ssh/*.cpp src/Network/Sftp/*.cpp src/Network/Ftp/*.cpp \
                 src/Network/ServerNetwork.cpp src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp \
-                src/Network/Dns/*.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp ;;
+                src/Network/Dns/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Crypto/*.cpp ;;
     CryptoTest) build_and_run CryptoTest tests/CryptoTest.cpp tests/KernelStubs.cpp src/Crypto/*.cpp ;;
     # (without the address sanitizer: this test maps memory above 4 GiB, which the sanitizer reserves for its shadow)
     AllocatorTest) echo "== AllocatorTest"; $cxx ${flags/address,undefined/undefined} tests/AllocatorTest.cpp tests/KernelStubs.cpp src/Allocators/Allocator.cpp -o "$out/AllocatorTest" && "$out/AllocatorTest" ;;
     PagingTest) build_and_run PagingTest tests/PagingTest.cpp tests/KernelStubs.cpp src/Kernel/Paging.cpp ;;
     MmioTest) build_and_run MmioTest tests/MmioTest.cpp tests/KernelStubs.cpp src/Kernel/Paging.cpp src/Hardware/MmioMapper.cpp src/Hardware/Bus/Pci/PciBar.cpp ;;
     X509Test) build_and_run X509Test tests/X509Test.cpp tests/KernelStubs.cpp src/Crypto/*.cpp ;;
-    TlsReplayTest) build_and_run TlsReplayTest tests/TlsReplayTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Tls/*.cpp src/Crypto/*.cpp ;;
+    TlsReplayTest) build_and_run TlsReplayTest tests/TlsReplayTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Crypto/*.cpp ;;
     SnmpTest) build_and_run SnmpTest tests/SnmpTest.cpp tests/KernelStubs.cpp src/Crypto/*.cpp src/Network/Snmp/SnmpMessage.cpp src/Network/Snmp/SnmpUsm.cpp ;;
-    PrinterTest) build_and_run PrinterTest tests/PrinterTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/SystemPrintService.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
+    PrinterTest) build_and_run PrinterTest tests/PrinterTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/SystemPrintService.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
                    src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                    src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
-    PrinterHotplugTest) build_and_run PrinterHotplugTest tests/PrinterHotplugTest.cpp tests/UsbAudioStubs.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
+    PrinterHotplugTest) build_and_run PrinterHotplugTest tests/PrinterHotplugTest.cpp tests/UsbAudioStubs.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
                           src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp \
                           src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     GraphicsTest) build_and_run GraphicsTest tests/GraphicsTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
@@ -180,7 +186,7 @@ for t in "${WANTED[@]}"; do
       echo "== PrinterHotplugThreadTest"
       $cxx -std=c++20 -O1 -g -fsanitize=thread -pthread -I src -I tests -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-misleading-indentation -Wno-delete-non-virtual-dtor \
         -o "$out/PrinterHotplugThreadTest" tests/PrinterHotplugThreadTest.cpp tests/HostThreads.cpp tests/UsbAudioStubs.cpp \
-        src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/*.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
+        src/Hardware/Printer/*.cpp src/Hardware/Printer/Brother/*.cpp src/Hardware/Printer/Usb/*.cpp src/Network/Snmp/*.cpp src/Network/Ipp/*.cpp src/Network/Tls/TlsSocket.cpp src/Network/Tls/TlsKeys.cpp src/Network/Tls/TlsCertificate.cpp src/Network/Tls/TlsSession.cpp src/Network/Mdns/*.cpp src/Crypto/*.cpp \
         src/Network/Checksum.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackSet.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp
       "$out/PrinterHotplugThreadTest" ;;
     GuiThreadTest)  # real threads, checked with ThreadSanitizer (cannot be combined with the address sanitizer)

@@ -55,7 +55,7 @@ class SelectorSet {
  private:
   enum class Combinator : uint8_t { None, Descendant, Child, Adjacent, Sibling };
   enum class TestKind : uint8_t {
-    Tag, Id, Class, Attr, FirstChild, LastChild, OnlyChild, FirstOfType, LastOfType, OnlyOfType, Nth, Empty, Root, Scope, Link, Checked, Disabled, Enabled,
+    Tag, Id, Class, Attr, FirstChild, LastChild, OnlyChild, FirstOfType, LastOfType, OnlyOfType, Nth, Empty, Root, Scope, Link, Checked, Disabled, Enabled, Focus, Required, Optional, ReadOnly, ReadWrite, Valid, Invalid, PlaceholderShown,
     Not, Is, Has, Never,
   };
   enum class AttrOp : uint8_t { Exists, Equals, Includes, Dash, Prefix, Suffix, Contains };

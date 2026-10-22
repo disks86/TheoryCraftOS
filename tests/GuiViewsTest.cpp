@@ -6313,7 +6313,16 @@ static void test_database_query_tabs() {
 
 // Hands out a few canned pages and remembers what was asked for.
 struct FakeLoader final : browser::IPageLoader {
-  std::vector<std::string> asked;
+  std::vector<std::string> asked, posted;   // posted: "address [content type] body"
+  bool post(StringView address, StringView content_type, StringView body, browser::PageResult* r) override {
+    posted.push_back(std::string(address.data(), address.size()) + " [" + std::string(content_type.data(), content_type.size()) + "] " + std::string(body.data(), body.size()));
+    r->status = 200;
+    r->final_address.assign(address);
+    r->content_type.assign("text/html");
+    const char* html = "<html><head><title>Posted</title></head><body><p>thanks</p></body></html>";
+    r->body.append(ConstByteView(reinterpret_cast<const uint8_t*>(html), strlen(html)));
+    return true;
+  }
   std::map<std::string, std::pair<std::string, std::string>> files;   // address -> (content type, body)
   bool fetch(StringView address, browser::PageResult* r) override {
     asked.emplace_back(address.data(), address.size());
@@ -6619,6 +6628,57 @@ static void test_web_browser_media() {
   CHECK(a.live == 0);
 }
 
+// Forms in the browser window: a click focuses a field, keys type into it, Enter sends the form (POST here), Tab moves on, and the page scrolls with the
+// keys again when nothing is focused.
+static void test_web_form() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::WebBrowser b(a);
+    FakeLoader loader;
+    b.set_page_loader(&loader);
+    b.set_file_system(&fs);
+    CHECK(mgr.add_window(&b));
+    w.layout();
+    loader.files["http://form.test/"] = {"text/html",
+        "<html><head><title>Form</title></head><body><form action=/submit method=post><input name=user size=8> <input type=checkbox name=ok> <button>Go</button></form>"
+        "<p>one</p><p>two</p></body></html>"};
+    CHECK(b.navigate("http://form.test/") && b.title().equals("Web Browser - Form"));
+    CHECK(run_contains(b, "[        ]") && run_contains(b, "[ Go ]"));
+    const Point po = b.page().window_origin();
+    const int32_t kM = gui::PageView::kMargin;
+    // Tab focuses the first field (the page view has the keyboard focus after a click on the page)
+    click(w, po.x + kM + 300, po.y + 150);
+    press(w, key::kTab);
+    CHECK(run_contains(b, "[|       ]"));
+    type_char(w, 'b');
+    type_char(w, 'o');
+    type_char(w, 'b');
+    CHECK(run_contains(b, "[bob|    ]"));
+    press(w, key::kBackspace);
+    type_char(w, 'b');
+    // Tab to the box, Space checks it
+    press(w, key::kTab);
+    type_char(w, ' ');
+    CHECK(run_contains(b, "[x]"));
+    // a click on the button sends the form
+    click(w, po.x + kM + 16 * 8, po.y + 8);
+    CHECK(loader.posted.size() == 1 && loader.posted[0] == "http://form.test/submit [application/x-www-form-urlencoded] user=bob&ok=on");
+    CHECK(b.title().equals("Web Browser - Posted") && run_contains(b, "thanks"));
+    // with nothing focused the keys scroll the page again
+    press(w, key::kEscape);
+    press(w, key::kDown);
+    CHECK(b.page().scroll_line() == 0 || b.page().scroll_line() == 1);
+  }
+  CHECK(a.live == 0);
+}
+
 // Browsers are tabs like the other programs: "+" opens another, they are dragged between windows, and a session brings them back.
 static void test_web_browser_tabs() {
   TestAllocator a;
@@ -6754,6 +6814,7 @@ int main() {
   test_spreadsheet_app();
   test_spreadsheet_tabs();
   test_web_browser();
+  test_web_form();
   test_web_browser_media();
   test_web_browser_tabs();
   test_database_query();

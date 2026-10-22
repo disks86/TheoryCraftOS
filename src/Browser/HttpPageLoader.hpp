@@ -17,7 +17,8 @@
  */
 
 // The system's page loader: HTTP and HTTPS over the machine's network stacks (see network::HttpClient). A request goes out of the first interface
-// that has an address. https:// needs a TLS configuration with a trust store (set_tls()); without one an https address fails, saying so.
+// that has an address. https:// needs a TLS configuration with a trust store (set_tls()); without one an https address fails, saying so. Servers that announce
+// HTTP/3 are reached over QUIC from then on, and TLS sessions are resumed from tickets (both are remembered by the loader).
 #pragma once
 #include "Browser/IPageLoader.hpp"
 #include "Network/Http/HttpClient.hpp"
@@ -29,7 +30,7 @@ class HttpPageLoader final : public IPageLoader {
  public:
   static constexpr uint64_t kMaxPageBytes = 4u << 20;
 
-  HttpPageLoader(network::NetworkStackSet& stacks, allocators::IAllocator& allocator) : stacks_(stacks), allocator_(allocator) {}
+  HttpPageLoader(network::NetworkStackSet& stacks, allocators::IAllocator& allocator) : stacks_(stacks), allocator_(allocator), sessions_(allocator), alt_svc_(allocator) {}
 
   // Lets https:// addresses through (copied; what it points to must outlive the loader). nullptr: plain http only.
   void set_tls(const network::TlsConfig* config) {
@@ -39,13 +40,17 @@ class HttpPageLoader final : public IPageLoader {
   void set_timeout_ms(uint32_t timeout_ms) { timeout_ms_ = timeout_ms; }
 
   bool fetch(StringView address, PageResult* result) override;
+  bool post(StringView address, StringView content_type, StringView body, PageResult* result) override;
 
  private:
+  bool send(network::HttpMethod method, StringView address, StringView content_type, StringView body, PageResult* result);
   network::NetworkStackSet& stacks_;
   allocators::IAllocator& allocator_;
   network::TlsConfig tls_;
   bool has_tls_ = false;
   uint32_t timeout_ms_ = 30000;
+  network::TlsSessionCache sessions_;   // TLS tickets: later requests to the same server resume the session
+  network::AltSvcCache alt_svc_;   // servers that announced HTTP/3: later requests to them go over QUIC (see HttpClient)
 };
 
 }  // namespace browser
