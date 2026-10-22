@@ -790,7 +790,7 @@ bool install_window(DomBindings::Impl& c) {
   define_function_global(vm, "scrollBy", win_scroll_by, 2);
   define_function_global(vm, "confirm", win_confirm, 1);
   define_function_global(vm, "prompt", win_prompt, 2);
-  for (const char* name : {"open", "close", "focus", "blur", "print", "stop", "moveTo", "resizeTo", "postMessage"}) define_function_global(vm, name, win_do_nothing, 0);
+  for (const char* name : {"open", "close", "focus", "blur", "print", "stop", "moveTo", "resizeTo"}) define_function_global(vm, name, win_do_nothing, 0);
   define_function_global(vm, "structuredClone", win_structured_clone, 1);
   define_function_global(vm, "btoa", win_btoa, 1);
   define_function_global(vm, "atob", win_atob, 1);

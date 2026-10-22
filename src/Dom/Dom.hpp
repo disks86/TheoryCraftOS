@@ -50,6 +50,8 @@ struct Node {
   String data;               // text and comments
   List<Attribute> attrs;     // elements
   void* script = nullptr;    // the script engine's object for this node
+  Node* content = nullptr;   // <template>: the fragment that holds what is inside it (it is not part of the page)
+  uint16_t caret = 0xFFFF, anchor = 0xFFFF;   // a text control: where the caret is and the other end of the selection (0xFFFF: at the end)
   uint8_t form_state = 0;    // elements: what the user (or a script) changed in a form control, and whether it is focused (FormState bits, Form.hpp)
 
   bool is_element() const { return type == NodeType::Element; }
@@ -146,6 +148,10 @@ bool is_void_tag(StringView tag);
 // Replaces the children of `element` with what `html` makes (without running scripts in it); an element's tag decides how its text is read (as a
 // <textarea>'s or a <style>'s content is not markup). Returns DomError::None on success.
 DomError set_inner_html(Node* element, StringView html);
+// The content of a <template> (made empty if it has none yet): the nodes inside a template are not in the tree of the page, they are in this fragment.
+Node* template_content(Node* tmpl);
+// Moves what is inside every <template> of the document into its content (done once a page has been read).
+void adopt_template_contents(Document& doc);
 // Makes the nodes `html` describes as the children of a new fragment (scripts in it are not run). nullptr if memory ran out.
 Node* parse_fragment(Document& doc, StringView html, StringView context_tag);
 

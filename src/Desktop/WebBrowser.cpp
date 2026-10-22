@@ -314,6 +314,59 @@ void WebBrowser::on_open_picked(void* self, Control&) {
   if (b->dialog_->accepted()) b->navigate(b->dialog_->selected_path());
 }
 
+namespace {
+const FileDialog::Filter kAnyFile[] = {{"All files", "*"}};
+
+// What kind of file a name says it is (for the type a form sends with it).
+const char* type_of_name(StringView name) {
+  const uint64_t dot = name.rfind('.');
+  const StringView ext = dot == StringView::npos ? StringView() : name.substr(dot + 1);
+  static const struct {
+    const char* ext;
+    const char* type;
+  } kTypes[] = {{"txt", "text/plain"}, {"html", "text/html"}, {"htm", "text/html"}, {"css", "text/css"}, {"js", "text/javascript"}, {"json", "application/json"},
+                {"xml", "application/xml"}, {"csv", "text/csv"}, {"png", "image/png"}, {"jpg", "image/jpeg"}, {"jpeg", "image/jpeg"}, {"gif", "image/gif"},
+                {"bmp", "image/bmp"}, {"webp", "image/webp"}, {"svg", "image/svg+xml"}, {"pdf", "application/pdf"}, {"zip", "application/zip"}, {"wav", "audio/wav"},
+                {"mp3", "audio/mpeg"}, {"mp4", "video/mp4"}};
+  for (const auto& t : kTypes)
+    if (ext.equals_ignore_case(t.ext)) return t.type;
+  return "application/octet-stream";
+}
+}  // namespace
+
+// A file input was clicked: the file dialog opens, and what is picked goes back to the input.
+void WebBrowser::ask_file(uint32_t node_serial) {
+  if (!dialog_ || !manager()) return;
+  pending_file_node_ = node_serial;
+  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Choose File", kAnyFile, 1, StringView(), {&WebBrowser::on_file_picked, this})) notify(NoticeKind::Warning, "The file dialog is busy.");
+}
+
+void WebBrowser::on_file_picked(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->dialog_->accepted() || !b->fs_ || !b->live_) return;
+  String path(b->allocator());
+  path.assign(b->dialog_->selected_path());
+  UniquePointer<IFile> file;
+  if (b->fs_->open_file(path.view(), OpenMode::Read, &file) != Status::Ok) return;
+  const uint64_t size = file->size();
+  if (size > (16u << 20)) {
+    b->notify(NoticeKind::Warning, "That file is too large to send.");
+    return;
+  }
+  ByteBuffer bytes(b->allocator());
+  ArrayView<uint8_t> chunk = allocate_view<uint8_t>(b->allocator(), size ? size : 1);
+  uint64_t got = 0;
+  const Status status = chunk.empty() ? Status::OutOfMemory : size ? file->read(0, chunk.first(size), &got) : Status::Ok;
+  file.reset();
+  const bool ok = status == Status::Ok && bytes.append(ConstByteView(chunk.data(), got));
+  release_view(b->allocator(), chunk);
+  if (!ok) return;
+  const uint64_t slash = path.view().rfind('/');
+  const StringView name = slash == StringView::npos ? path.view() : path.view().substr(slash + 1);
+  b->live_->file_chosen(b->pending_file_node_, name, type_of_name(name), bytes.view());
+  b->settle();
+}
+
 void WebBrowser::on_link(void* self, Control&) {
   auto* b = static_cast<WebBrowser*>(self);
   String target(b->allocator());
@@ -742,7 +795,7 @@ void WebBrowser::update_key_capture() {
     page_.set_capture_keys(PageView::kCaptureNone);
     return;
   }
-  const uint8_t mode = live_->has_focus() ? PageView::kCaptureAll : live_->has_controls() ? PageView::kCaptureTab : PageView::kCaptureNone;
+  const uint8_t mode = live_->has_focus() || live_->has_modal() ? PageView::kCaptureAll : live_->has_controls() ? PageView::kCaptureTab : PageView::kCaptureNone;
   page_.set_capture_keys(mode);
 }
 
@@ -771,10 +824,13 @@ void WebBrowser::on_form_key(void* self, Control&) {
       case 0x4D: k = Key::End; break;
       default: break;
     }
-    const uint8_t mods = (args.modifiers & hardware::modifier::kShift ? 1 : 0);
+    const bool control = args.modifiers & hardware::modifier::kControl;
+    char character = args.character;
+    if (control && args.usage >= key::kA && args.usage < key::kA + 26) character = static_cast<char>('a' + (args.usage - key::kA));   // (Ctrl+A ... Ctrl+Z)
+    const uint8_t mods = static_cast<uint8_t>((args.modifiers & hardware::modifier::kShift ? 1 : 0) | (control ? 2 : 0));
     bool taken;
-    if (k == Key::Character && (args.character < 32 || args.character > 126)) taken = false;
-    else taken = b->live_->key(k, args.character, mods);
+    if (k == Key::Character && (character < 32 || character > 126)) taken = false;
+    else taken = b->live_->key(k, character, mods);
     if (!taken) b->page_.scroll_key(args);
   }
   b->settle();
@@ -904,6 +960,20 @@ void WebBrowser::Env::navigate(StringView address, bool) {
   owner_.defer_go_.assign(address);
   owner_.want_go_ = true;
 }
+
+bool WebBrowser::Env::clipboard_get(String* text) {
+  gui::Window* w = owner_.window();
+  kernel::Clipboard* clip = w ? w->clipboard() : nullptr;
+  return clip && clip->get_text(text);
+}
+
+void WebBrowser::Env::clipboard_set(StringView text) {
+  gui::Window* w = owner_.window();
+  kernel::Clipboard* clip = w ? w->clipboard() : nullptr;
+  if (clip) clip->set_text(text);
+}
+
+void WebBrowser::Env::pick_file(uint32_t node_serial, bool) { owner_.ask_file(node_serial); }
 
 void WebBrowser::Env::navigate_post(StringView address, StringView content_type, StringView body) {
   owner_.defer_go_.assign(address);

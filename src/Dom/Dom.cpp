@@ -209,6 +209,10 @@ Node* clone_node(Node* node, bool deep) {
       if (copy)
         for (uint64_t i = 0; i < node->attrs.count(); ++i)
           if (set_attribute(copy, node->attrs[i].name.view(), node->attrs[i].value.view()) != DomError::None) return nullptr;
+      if (copy && node->is_tag("template")) {
+        copy->content = node->content ? clone_node(node->content, deep) : doc.create_fragment();
+        if (!copy->content) return nullptr;
+      }
       if (copy) {   // (a copy of a control keeps what was typed into it, not the focus)
         copy->form_state = node->form_state & ~0x08;
         if (node->form_state & 1) copy->data.assign(node->data.view());
@@ -425,7 +429,7 @@ void serialize(const Node* n, String* out, uint32_t depth) {
       }
       out->push_back('>');
       if (is_void_tag(n->name.view())) return;
-      for (const Node* c = n->first_child; c; c = c->next) serialize(c, out, depth + 1);
+      for (const Node* c = n->content ? n->content->first_child : n->first_child; c; c = c->next) serialize(c, out, depth + 1);
       out->append("</");
       out->append(n->name.view());
       out->push_back('>');
@@ -442,7 +446,7 @@ void serialize(const Node* n, String* out, uint32_t depth) {
 void inner_html(const Node* node, String* out) {
   out->clear();
   if (node->type == NodeType::Text || node->type == NodeType::Comment) return;
-  for (const Node* c = node->first_child; c; c = c->next) serialize(c, out, 0);
+  for (const Node* c = node->content ? node->content->first_child : node->first_child; c; c = c->next) serialize(c, out, 0);
 }
 
 void outer_html(const Node* node, String* out) {

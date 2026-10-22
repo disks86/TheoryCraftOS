@@ -205,7 +205,10 @@ bool PageView::on_key(const KeyArgs& args) {
   {
     UiGuard lock(this);
     const bool held = args.modifiers & (hardware::modifier::kControl | hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt);
-    const bool wanted = capture_ == kCaptureAll ? !held : capture_ == kCaptureTab && args.usage == hardware::key::kTab;
+    // (Control with A, C, V or X is the page's too: select all and the clipboard in a field)
+    const bool edit_shortcut = (args.modifiers & hardware::modifier::kControl) && !(args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) &&
+                               (args.usage == hardware::key::kA || args.usage == hardware::key::kA + 2 || args.usage == hardware::key::kA + 21 || args.usage == hardware::key::kA + 23);
+    const bool wanted = capture_ == kCaptureAll ? (!held || edit_shortcut) : capture_ == kCaptureTab && args.usage == hardware::key::kTab;
     if (wanted && key_handler_.function && queued_ < 16) {
       queue_[queued_++] = args;
       fire(key_handler_);

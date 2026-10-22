@@ -20,9 +20,50 @@
 #include "Browser/Url.hpp"
 #include "Dom/Form.hpp"
 #include "Dom/HtmlBuilder.hpp"
+#include "Browser/Objects.hpp"
 #include "Utility/Move.hpp"
 
 namespace browser {
+
+// What a page in a frame asks of the browser: what it can have it asks the page around it for; going somewhere moves the frame.
+class Page::FrameEnv final : public IPageEnvironment {
+ public:
+  FrameEnv(Page& owner, uint32_t serial) : owner_(owner), serial_(serial) {}
+  bool fetch_text(StringView address, uint64_t limit, String* text) override { return owner_.env_.fetch_text(address, limit, text); }
+  bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override { return owner_.env_.fetch_bytes(address, limit, out); }
+  UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override { return owner_.env_.open_video(util::move(data)); }
+  UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override { return owner_.env_.open_audio(util::move(data)); }
+  void navigate(StringView address, bool) override { owner_.frame_navigate(serial_, address); }
+  void navigate_post(StringView address, StringView type, StringView body) override { owner_.env_.navigate_post(address, type, body); }
+  bool clipboard_get(String* text) override { return owner_.env_.clipboard_get(text); }
+  void clipboard_set(StringView text) override { owner_.env_.clipboard_set(text); }
+  void pick_file(uint32_t node_serial, bool multiple) override { owner_.frame_pick_file(serial_, node_serial, multiple); }
+  void set_hash(StringView) override {}
+  void reload() override {}
+  void history_go(int32_t) override {}
+  uint32_t history_length() override { return 1; }
+  void push_state(StringView, bool) override {}
+  void alert(StringView text) override { owner_.env_.alert(text); }
+  bool confirm(StringView text) override { return owner_.env_.confirm(text); }
+  void scroll_to(int32_t) override {}
+  uint64_t now_ms() override { return owner_.env_.now_ms(); }
+  void console(int level, StringView text) override { owner_.env_.console(level, text); }
+  StorageArea& local_storage() override { return owner_.env_.local_storage(); }
+  String& cookie() override { return owner_.env_.cookie(); }
+
+ private:
+  Page& owner_;
+  uint32_t serial_;
+};
+
+struct Page::Frame {
+  Frame(Page& owner, uint32_t node_serial, allocators::IAllocator& a) : serial(node_serial), key(a), doc(a), env(owner, node_serial) {}
+  uint32_t serial;
+  String key;
+  HtmlDocument doc;
+  FrameEnv env;
+  UniquePointer<Page> page;
+};
 
 Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, StringView address, const MediaEnvironment& media, bool scripts)
     : allocator_(allocator),
@@ -41,6 +82,8 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       scripts_(allocator),
       sheets_(allocator),
       objects_(allocator),
+      frames_(allocator),
+      messages_(allocator),
       focus_value_(allocator),
       invalid_text_(allocator),
       style_cache_(allocator) {
@@ -235,12 +278,14 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
 
 bool Page::render(HtmlDocument* out) {
   fetch_pending_styles();
+  sync_frames();
   objects_.set_now(env_.now_ms());
   objects_.sync(doc_, env_, address_.view(), media_);
   RenderOptions options;
   options.media = media_;
   options.styles = this;
   options.objects = &objects_;
+  options.frames = this;
   options.focus = focus_;
   options.open_select = open_select_;
   options.invalid_node = invalid_node_;
@@ -273,6 +318,10 @@ void Page::deliver_object_events() {
 }
 
 bool Page::step_objects(double now_ms) {
+  bool moved = false;
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page) moved |= frames_[i]->page->step_objects(now_ms);
+  (void)moved;
   objects_.update(static_cast<uint64_t>(now_ms));
   deliver_object_events();
   return objects_.take_dirty();
@@ -298,8 +347,22 @@ void Page::set_media(const MediaEnvironment& media) {
 }
 
 void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int32_t lx, int32_t ly, uint32_t w, uint32_t h) {
+  if (node_serial >> 24) {   // in a frame: its page takes it
+    const uint64_t frame = (node_serial >> 24) - 1;
+    if (frame < frames_.count() && frames_[frame]->page) {
+      if (focus_) set_focus(nullptr);
+      for (uint64_t i = 0; i < frames_.count(); ++i)
+        if (i != frame && frames_[i]->page && frames_[i]->page->has_focus()) frames_[i]->page->blur();
+      frames_[frame]->page->click(node_serial & 0xFFFFFF, x, y, object, lx, ly, w, h);
+    }
+    return;
+  }
   dom::Node* n = doc_.by_serial(node_serial);
   if (!n) return;
+  if (dom::Node* modal = modal_dialog())
+    if (!dom::contains(modal, n)) return;   // (the page behind a modal dialog does not take clicks)
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page && frames_[i]->page->has_focus()) frames_[i]->page->blur();
   press_focus(n);
   if (!bindings_) {   // no scripts: a click only follows a link
     if ((object == static_cast<uint8_t>(ObjectKind::Video) || object == static_cast<uint8_t>(ObjectKind::Audio)) && objects_.object_clicked(node_serial, lx, ly, w, h)) return;
@@ -335,9 +398,16 @@ void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int
 }
 
 bool Page::run_due_timers(double now_ms) {
-  if (!engine_) return false;
+  bool any_frame = false;
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page) any_frame |= frames_[i]->page->run_due_timers(now_ms);
+  if (!messages_.empty()) {
+    deliver_messages();
+    any_frame = true;
+  }
+  if (!engine_) return any_frame;
   double due;
-  if (!engine_->next_timer(&due) || due > now_ms) return false;
+  if (!engine_->next_timer(&due) || due > now_ms) return any_frame;
   String error(allocator_);
   engine_->run_due_timers(now_ms, 50, &error);
   if (!error.empty()) note_error(error.view());
@@ -351,6 +421,17 @@ bool Page::run_due_timers(double now_ms) {
 
 bool Page::next_timer(double* due_ms) {
   bool any = engine_ && engine_->next_timer(due_ms);
+  for (uint64_t i = 0; i < frames_.count(); ++i) {
+    double due;
+    if (frames_[i]->page && frames_[i]->page->next_timer(&due) && (!any || due < *due_ms)) {
+      *due_ms = due;
+      any = true;
+    }
+  }
+  if (!messages_.empty()) {   // (a message waits to be delivered: now)
+    *due_ms = 1;
+    any = true;
+  }
   if (objects_.animating()) {   // (a playing video, an animated picture: the next frame)
     const double frame = static_cast<double>(env_.now_ms()) + 33;
     if (!any || frame < *due_ms) *due_ms = frame;
@@ -413,6 +494,80 @@ bool Page::compile_handler(StringView code, script::Value* function) {
 
 // --- Forms -----------------------------------------------------------------------------------------------------------------------
 
+// The open modal dialog (the first), or nullptr.
+dom::Node* Page::modal_dialog() {
+  for (uint32_t serial = 1; serial <= doc_.node_count(); ++serial) {
+    dom::Node* d = doc_.by_serial(serial);
+    if (d && d->is_tag("dialog") && (d->form_state & dom::kFormModal) && dom::has_attribute(d, "open") && dom::is_connected(d)) return d;
+  }
+  return nullptr;
+}
+
+void Page::show_dialog(dom::Node* dialog, bool modal) {
+  if (!dialog->is_tag("dialog") || dom::has_attribute(dialog, "open")) return;
+  dom::set_attribute(dialog, "open", "");
+  if (modal) dialog->form_state |= dom::kFormModal;
+  else dialog->form_state &= static_cast<uint8_t>(~dom::kFormModal);
+  dom::Node* target = nullptr;
+  for (dom::Node* d = dialog->first_child; d && !target; d = dom::next_in_tree(d, dialog))
+    if (d->is_element() && dom::is_focusable(d) && (dom::has_attribute(d, "autofocus") || !target)) target = d;
+  if (modal || target) set_focus(target);
+  doc_.touch();
+}
+
+void Page::close_dialog_text(dom::Node* dialog, StringView value) {
+  if (!dialog->is_tag("dialog") || !dom::has_attribute(dialog, "open")) return;
+  dom::remove_attribute(dialog, "open");
+  dialog->form_state &= static_cast<uint8_t>(~dom::kFormModal);
+  if (!value.empty()) dialog->data.assign(value);
+  if (dom::Node* f = focused())
+    if (dom::contains(dialog, f)) set_focus(nullptr);
+  doc_.touch();
+  fire(dialog, "close", false);
+  flush_errors();
+}
+
+void Page::close_dialog(dom::Node* dialog, const char* return_value) { close_dialog_text(dialog, return_value ? StringView(return_value) : StringView()); }
+
+void Page::toggle_details(dom::Node* details) {
+  const bool opening = !dom::has_attribute(details, "open");
+  if (opening) {
+    StringView name;
+    if (dom::get_attribute(details, "name", &name) && !name.empty()) {   // (details of one group: one is open)
+      for (uint32_t serial = 1; serial <= doc_.node_count(); ++serial) {
+        dom::Node* d = doc_.by_serial(serial);
+        StringView other;
+        if (d && d != details && d->is_tag("details") && dom::has_attribute(d, "open") && dom::get_attribute(d, "name", &other) && other.equals(name)) {
+          dom::remove_attribute(d, "open");
+          fire(d, "toggle", false);
+        }
+      }
+    }
+    dom::set_attribute(details, "open", "");
+  } else {
+    dom::remove_attribute(details, "open");
+  }
+  doc_.touch();
+  fire(details, "toggle", false);
+  flush_errors();
+}
+
+// Text pasted into a field: one line for a single-line field, filtered for a number field.
+void Page::paste_text(dom::Node* control, StringView text) {
+  String clean(allocator_);
+  const dom::InputType t = control->is_tag("input") ? dom::input_type(control) : dom::InputType::Text;
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    char c = text[i];
+    if (c == '\r') continue;
+    if (c == '\n' && !control->is_tag("textarea")) c = ' ';
+    if (static_cast<uint8_t>(c) < 32 && c != '\n') continue;
+    if (static_cast<uint8_t>(c) > 126) c = '?';
+    if (t == dom::InputType::Number && !((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')) continue;
+    clean.push_back(c);
+  }
+  if (!clean.empty() && dom::replace_selection(control, clean.view(), true)) input_changed(control, false);
+}
+
 void Page::flush_errors() {
   if (bindings_ && bindings_->errors()) {
     String text(allocator_);
@@ -445,6 +600,8 @@ dom::Node* Page::focused() {
 }
 
 bool Page::has_controls() {
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page && frames_[i]->page->has_controls()) return true;
   if (controls_version_ == doc_.version()) return controls_cached_;
   controls_version_ = doc_.version();
   controls_cached_ = false;
@@ -469,6 +626,7 @@ void Page::set_focus(dom::Node* control) {
     fire(old, "focusout", true);
   }
   if (next) {
+    next->caret = next->anchor = 0xFFFF;
     next->form_state |= dom::kFormFocused;
     focus_ = next->serial;
     dom::get_value(next, &focus_value_);
@@ -499,6 +657,17 @@ void Page::toggle_list(dom::Node* select) {
 }
 
 void Page::choose_option(dom::Node* option) {
+  if (option->parent && option->parent->is_tag("datalist")) {   // a suggestion: the field takes it
+    dom::Node* input = focused();
+    if (input) {
+      String v(allocator_);
+      dom::option_value(option, &v);
+      dom::set_value(input, v.view(), true);
+      input->form_state |= dom::kFormEdited;
+      input_changed(input, true);
+    }
+    return;
+  }
   dom::Node* select = option->parent;
   while (select && !select->is_tag("select")) select = select->parent;
   if (!select || dom::is_disabled(option) || dom::is_disabled(select)) return;
@@ -521,6 +690,10 @@ void Page::choose_option(dom::Node* option) {
 void Page::press_focus(dom::Node* node) {
   for (dom::Node* p = node; p && p->is_element(); p = p->parent) {
     if (p->is_tag("option") || p->is_tag("label")) return;
+    if (p->is_tag("summary") && dom::is_focusable(p)) {
+      set_focus(p);
+      return;
+    }
     if (dom::is_listed_control(p) && !p->is_tag("fieldset") && !p->is_tag("output")) {
       set_focus(p);
       return;
@@ -533,7 +706,8 @@ void Page::press_focus(dom::Node* node) {
 bool Page::activate_control(dom::Node* node) {
   dom::Node* c = nullptr;
   for (dom::Node* p = node; p && p->is_element(); p = p->parent) {
-    if ((dom::is_listed_control(p) && !p->is_tag("fieldset") && !p->is_tag("output")) || p->is_tag("option") || p->is_tag("label")) {
+    if ((dom::is_listed_control(p) && !p->is_tag("fieldset") && !p->is_tag("output")) || p->is_tag("option") || p->is_tag("label") ||
+        (p->is_tag("summary") && p->parent && p->parent->is_tag("details"))) {
       c = p;
       break;
     }
@@ -542,6 +716,10 @@ bool Page::activate_control(dom::Node* node) {
   if (!c) {
     if (focus_) set_focus(nullptr);
     return false;
+  }
+  if (c->is_tag("summary")) {
+    toggle_details(c->parent);
+    return true;
   }
   if (c->is_tag("label")) {
     dom::Node* target = nullptr;
@@ -573,7 +751,20 @@ bool Page::activate_control(dom::Node* node) {
   }
   if (c->is_tag("input")) {
     const dom::InputType t = dom::input_type(c);
+    if (t == dom::InputType::File) {
+      env_.pick_file(c->serial, dom::has_attribute(c, "multiple"));
+      return true;
+    }
+    if (t == dom::InputType::Color) {
+      String v(allocator_), next(allocator_);
+      dom::get_value(c, &v);
+      dom::next_color(v.view(), 1, &next);
+      dom::set_value(c, next.view(), true);
+      input_changed(c, true);
+      return true;
+    }
     if (t == dom::InputType::Checkbox) {
+      c->form_state &= static_cast<uint8_t>(~dom::kFormIndeterminate);
       dom::set_checked(c, !dom::is_checked(c));
       input_changed(c, true);
       return true;
@@ -672,7 +863,14 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
   pick("formmethod", "method", &method);
   const bool has_action = pick("formaction", "action", &action) && !action.trimmed().empty();
   pick("formenctype", "enctype", &enctype);
-  if (method.trimmed().equals_ignore_case("dialog")) return;
+  if (method.trimmed().equals_ignore_case("dialog")) {   // the dialog the form is in closes, with the value of the button that was pressed
+    dom::Node* dialog = form->parent;
+    while (dialog && !dialog->is_tag("dialog")) dialog = dialog->parent;
+    String value(allocator_);
+    if (submitter) dom::get_value(submitter, &value);
+    if (dialog) close_dialog_text(dialog, value.view());
+    return;
+  }
   const bool post = method.trimmed().equals_ignore_case("post");
   List<dom::Entry> entries(allocator_);
   if (!dom::form_entries(form, submitter, &entries)) return;
@@ -717,8 +915,9 @@ void Page::send_form(dom::Node* form, dom::Node* submitter) {
 // Tab and Shift+Tab: the next control (or the one before), and out of the form after the last one.
 void Page::move_focus(int32_t direction) {
   List<dom::Node*> order(allocator_);
+  dom::Node* modal = modal_dialog();
   for (dom::Node* n = doc_.root(); n; n = dom::next_in_tree(n, doc_.root()))
-    if (n->is_element() && dom::is_focusable(n)) order.push_back(n);
+    if (n->is_element() && dom::is_focusable(n) && (!modal || dom::contains(modal, n))) order.push_back(n);
   if (order.count() == 0) return;
   int64_t at = -1;
   for (uint64_t i = 0; i < order.count(); ++i)
@@ -732,8 +931,17 @@ void Page::move_focus(int32_t direction) {
 }
 
 bool Page::key(FormKey k, char character, uint8_t modifiers) {
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page && frames_[i]->page->has_focus()) return frames_[i]->page->key(k, character, modifiers);
   dom::Node* n = focused();
   if (!n) {
+    if (k == FormKey::Escape) {
+      if (dom::Node* modal = modal_dialog()) {
+        if (fire(modal, "cancel", false, true)) close_dialog_text(modal, StringView());
+        return true;
+      }
+      return false;
+    }
     if (k != FormKey::Tab) return false;
     move_focus((modifiers & 1) ? -1 : 1);
     return true;
@@ -786,9 +994,12 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
     return true;
   }
   if (k == FormKey::Escape) {
+    dom::Node* modal = open_select_ ? nullptr : modal_dialog();
     if (open_select_) {
       open_select_ = 0;
       doc_.touch();
+    } else if (modal) {
+      if (fire(modal, "cancel", false, true)) close_dialog_text(modal, StringView());
     } else {
       set_focus(nullptr);
     }
@@ -799,41 +1010,45 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
     const dom::InputType t = n->is_tag("input") ? dom::input_type(n) : dom::InputType::Text;
     if (dom::is_text_field(t)) {
       const bool editable = !dom::is_read_only(n);
-      if (k == FormKey::Character && !ctrl && !alt) {
-        if (!editable || static_cast<uint8_t>(ch) < 32 || static_cast<uint8_t>(ch) > 126) return true;
-        if (t == dom::InputType::Number && !(ch >= '0' && ch <= '9') && ch != '.' && ch != '-' && ch != '+' && ch != 'e' && ch != 'E') return true;
+      const bool textarea = n->is_tag("textarea");
+      auto filtered = [&](char c) { return t != dom::InputType::Number || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'; };
+      if (k == FormKey::Character && ctrl && !alt) {   // the clipboard, and select all
+        uint32_t s, e, caret;
+        dom::get_selection(n, &s, &e, &caret);
         String v(allocator_);
         dom::get_value(n, &v);
-        uint64_t max;
-        StringView limit;
-        if (dom::get_attribute(n, "maxlength", &limit) && limit.trimmed().parse_uint(&max) && v.size() >= max) return true;
-        v.push_back(ch);
-        dom::set_value(n, v.view(), false);
-        n->form_state |= dom::kFormEdited;
-        input_changed(n, false);
+        if (ch == 'a' || ch == 'A') {
+          dom::set_selection(n, 0, static_cast<uint32_t>(v.size()));
+        } else if ((ch == 'c' || ch == 'C' || ch == 'x' || ch == 'X') && s < e) {
+          if (t != dom::InputType::Password) env_.clipboard_set(v.view().substr(s, e - s));
+          if ((ch == 'x' || ch == 'X') && editable && t != dom::InputType::Password && dom::delete_selection(n, 1)) input_changed(n, false);
+        } else if ((ch == 'v' || ch == 'V') && editable) {
+          String clip(allocator_);
+          if (env_.clipboard_get(&clip)) paste_text(n, clip.view());
+        }
+        doc_.touch();
         return true;
       }
-      if (k == FormKey::Backspace) {
-        String v(allocator_);
-        dom::get_value(n, &v);
-        if (editable && v.size() > 0) {
-          v.truncate(v.size() - 1);
-          dom::set_value(n, v.view(), false);
-          n->form_state |= dom::kFormEdited;
-          input_changed(n, false);
-        }
+      if (k == FormKey::Character && !alt) {
+        if (!editable || static_cast<uint8_t>(ch) < 32 || static_cast<uint8_t>(ch) > 126 || !filtered(ch)) return true;
+        if (dom::replace_selection(n, StringView(&ch, 1), true)) input_changed(n, false);
+        return true;
+      }
+      if (k == FormKey::Backspace || k == FormKey::Delete) {
+        if (editable && dom::delete_selection(n, k == FormKey::Backspace ? -1 : 1)) input_changed(n, false);
+        return true;
+      }
+      if (k == FormKey::Left || k == FormKey::Right) {
+        dom::move_caret(n, k == FormKey::Left ? -1 : 1, shift);
+        return true;
+      }
+      if (k == FormKey::Home || k == FormKey::End) {
+        dom::move_caret(n, k == FormKey::Home ? INT32_MIN : INT32_MAX, shift);
         return true;
       }
       if (k == FormKey::Enter) {
-        if (n->is_tag("textarea")) {
-          if (editable) {
-            String v(allocator_);
-            dom::get_value(n, &v);
-            v.push_back('\n');
-            dom::set_value(n, v.view(), false);
-            n->form_state |= dom::kFormEdited;
-            input_changed(n, false);
-          }
+        if (textarea) {
+          if (editable && dom::replace_selection(n, "\n", true)) input_changed(n, false);
           return true;
         }
         String now(allocator_);
@@ -860,13 +1075,63 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
         return true;
       }
       if (k == FormKey::Up || k == FormKey::Down) {
-        if (t == dom::InputType::Number) {
+        if (textarea) {   // (a line up or down, at the same place in it)
+          String v(allocator_);
+          dom::get_value(n, &v);
+          uint32_t s, e, caret;
+          dom::get_selection(n, &s, &e, &caret);
+          uint64_t line_start = caret;
+          while (line_start > 0 && v[line_start - 1] != '\n') --line_start;
+          const uint64_t column = caret - line_start;
+          int64_t target = caret;
+          if (k == FormKey::Up) {
+            if (line_start == 0) target = 0;
+            else {
+              uint64_t prev_start = line_start - 1;
+              while (prev_start > 0 && v[prev_start - 1] != '\n') --prev_start;
+              const uint64_t prev_len = line_start - 1 - prev_start;
+              target = static_cast<int64_t>(prev_start + (column < prev_len ? column : prev_len));
+            }
+          } else {
+            uint64_t line_end = caret;
+            while (line_end < v.size() && v[line_end] != '\n') ++line_end;
+            if (line_end >= v.size()) target = static_cast<int64_t>(v.size());
+            else {
+              uint64_t next_end = line_end + 1;
+              while (next_end < v.size() && v[next_end] != '\n') ++next_end;
+              const uint64_t next_len = next_end - (line_end + 1);
+              target = static_cast<int64_t>(line_end + 1 + (column < next_len ? column : next_len));
+            }
+          }
+          dom::move_caret(n, static_cast<int32_t>(target - static_cast<int64_t>(caret)), shift);
+          return true;
+        }
+        if (t == dom::InputType::Number || t == dom::InputType::Date || t == dom::InputType::Time || t == dom::InputType::DateTimeLocal || t == dom::InputType::Month ||
+            t == dom::InputType::Week) {
           if (editable && dom::step_value(n, k == FormKey::Up ? 1 : -1)) input_changed(n, true);
           return true;
         }
-        return n->is_tag("textarea");
+        return false;
       }
-      return k == FormKey::Delete || k == FormKey::Left || k == FormKey::Right || k == FormKey::Home || k == FormKey::End;
+      return false;
+    }
+    if (t == dom::InputType::Color) {
+      if (space || k == FormKey::Enter || k == FormKey::Up || k == FormKey::Down || k == FormKey::Left || k == FormKey::Right) {
+        String v(allocator_), next(allocator_);
+        dom::get_value(n, &v);
+        dom::next_color(v.view(), (k == FormKey::Up || k == FormKey::Left) ? -1 : 1, &next);
+        dom::set_value(n, next.view(), true);
+        input_changed(n, true);
+        return true;
+      }
+      return false;
+    }
+    if (t == dom::InputType::File) {
+      if (space || k == FormKey::Enter) {
+        env_.pick_file(n->serial, dom::has_attribute(n, "multiple"));
+        return true;
+      }
+      return false;
     }
     if (t == dom::InputType::Range) {
       int32_t steps = 0;
@@ -926,6 +1191,13 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
     }
     return false;
   }
+  if (n->is_tag("summary")) {
+    if (space || k == FormKey::Enter) {
+      if (fire(n, "click", true, true)) activate_control(n);
+      return true;
+    }
+    return false;
+  }
   if (n->is_tag("select")) {
     if (k == FormKey::Enter || space) {
       if (!dom::select_is_list(n)) toggle_list(n);
@@ -947,6 +1219,180 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
     if (k == FormKey::Home || k == FormKey::End) return true;
   }
   return false;
+}
+
+
+// --- Frames ------------------------------------------------------------------------------------------------------------------------
+
+bool Page::changed() const {
+  if (doc_.version() != rendered_version_ || media_ != rendered_media_) return true;
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page && frames_[i]->page->changed()) return true;
+  return false;
+}
+
+bool Page::has_focus() const {
+  if (focus_ != 0) return true;
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page && frames_[i]->page->has_focus()) return true;
+  return false;
+}
+
+const HtmlDocument* Page::frame_document(const dom::Node* iframe, uint32_t* tag) {
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->serial == iframe->serial && frames_[i]->page) {
+      *tag = static_cast<uint32_t>(i) + 1;
+      return &frames_[i]->doc;
+    }
+  return nullptr;
+}
+
+// A file input of a frame was clicked: the browser is asked with the serial tagged by the frame's number, so that the file comes back to it.
+void Page::frame_pick_file(uint32_t frame_serial, uint32_t node_serial, bool multiple) {
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->serial == frame_serial) env_.pick_file((static_cast<uint32_t>(i + 1) << 24) | node_serial, multiple);
+}
+
+void Page::file_chosen(uint32_t node_serial, StringView name, StringView type, ConstByteView bytes) {
+  if (node_serial >> 24) {
+    const uint64_t frame = (node_serial >> 24) - 1;
+    if (frame < frames_.count() && frames_[frame]->page) frames_[frame]->page->file_chosen(node_serial & 0xFFFFFF, name, type, bytes);
+    return;
+  }
+  dom::Node* n = doc_.by_serial(node_serial);
+  if (!n || !n->is_tag("input") || dom::input_type(n) != dom::InputType::File) return;
+  dom::add_file(n, name, type, bytes, !dom::has_attribute(n, "multiple"));
+  input_changed(n, true);
+  flush_errors();
+}
+
+// Following a link in a frame: the frame shows the page.
+void Page::frame_navigate(uint32_t frame_serial, StringView address) {
+  dom::Node* n = doc_.by_serial(frame_serial);
+  if (!n) return;
+  dom::remove_attribute(n, "srcdoc");
+  dom::set_attribute(n, "src", address);
+  doc_.touch();
+}
+
+// Makes the pages of the <iframe>s that are new or whose address changed, draws those that changed, forgets those that are gone.
+void Page::sync_frames() {
+  List<dom::Node*> found(allocator_);
+  for (uint32_t serial = 1; serial <= doc_.node_count() && found.count() < 8; ++serial) {
+    dom::Node* n = doc_.by_serial(serial);
+    if (n && n->is_tag("iframe") && dom::is_connected(n)) found.push_back(n);
+  }
+  for (uint64_t i = frames_.count(); i > 0; --i) {
+    bool still = false;
+    for (uint64_t k = 0; k < found.count(); ++k) still = still || found[k]->serial == frames_[i - 1]->serial;
+    if (!still) frames_.remove_at(i - 1);
+  }
+  List<uint32_t> loaded(allocator_);
+  for (uint64_t k = 0; k < found.count(); ++k) {
+    dom::Node* n = found[k];
+    String key(allocator_), html(allocator_), address(allocator_);
+    StringView srcdoc, src;
+    if (dom::get_attribute(n, "srcdoc", &srcdoc)) {
+      key.assign("srcdoc:");
+      key.append(srcdoc);
+    } else if (dom::get_attribute(n, "src", &src) && !src.trimmed().empty() && !src.trimmed().equals_ignore_case("about:blank")) {
+      if (src.trimmed().starts_with("data:")) key.assign(src.trimmed());
+      else if (!resolve(src.trimmed(), &key)) key.assign("about:blank");
+    } else {
+      key.assign("about:blank");
+    }
+    Frame* f = nullptr;
+    for (uint64_t i = 0; i < frames_.count(); ++i)
+      if (frames_[i]->serial == n->serial) f = frames_[i].get();
+    if (f && f->key.view().equals(key.view())) {
+      if (f->page && f->page->changed()) f->page->render(&f->doc);
+      continue;
+    }
+    if (depth_ >= 3) continue;
+    if (!f) {
+      auto fresh = UniquePointer<Frame>::make(allocator_, *this, n->serial, allocator_);
+      if (!fresh || !frames_.push_back(util::move(fresh))) continue;
+      f = frames_[frames_.count() - 1].get();
+    }
+    f->page.reset();
+    f->key.assign(key.view());
+    if (key.view().starts_with("srcdoc:")) {
+      html.assign(srcdoc);
+      address.assign(address_.view());
+    } else if (key.view().starts_with("data:")) {
+      ByteBuffer bytes(allocator_);
+      String type(allocator_);
+      address.assign(address_.view());
+      if (decode_data_url(allocator_, key.view(), &bytes, &type)) html.assign(StringView(bytes.view()));
+    } else if (key.view().equals("about:blank")) {
+      address.assign("about:blank");
+    } else {
+      address.assign(key.view());
+      if (!env_.fetch_text(key.view(), 1u << 20, &html)) html.assign("<p>This frame could not be loaded.</p>");
+    }
+    StringView sandbox;
+    const bool sandboxed = dom::get_attribute(n, "sandbox", &sandbox) && !sandbox.contains("allow-scripts");
+    MediaEnvironment frame_media = media_;
+    if (frame_media.width > 16 * 8 * 2) frame_media.width -= 6 * 8;
+    f->page = UniquePointer<Page>::make(allocator_, allocator_, f->env, address.view(), frame_media, scripts_enabled_ && !sandboxed);
+    if (!f->page) continue;
+    f->page->set_parent(this, n->serial, depth_ + 1);
+    f->page->load(html.view());
+    f->page->render(&f->doc);
+    loaded.push_back(n->serial);
+  }
+  for (uint64_t i = 0; i < loaded.count(); ++i)
+    if (dom::Node* n = doc_.by_serial(loaded[i])) fire(n, "load", false);
+}
+
+// --- Messages ----------------------------------------------------------------------------------------------------------------------
+
+static void origin_of(StringView address, String* out) {
+  out->clear();
+  const uint64_t scheme = address.find("://");
+  if (scheme == StringView::npos) {
+    out->assign("null");
+    return;
+  }
+  uint64_t end = address.find('/', scheme + 3);
+  if (end == StringView::npos) end = address.size();
+  out->assign(address.first(end));
+}
+
+void Page::queue_message(StringView data, StringView origin) {
+  if (messages_.count() >= 64) return;
+  Message m(allocator_);
+  m.data.assign(data);
+  m.origin.assign(origin);
+  messages_.push_back(util::move(m));
+}
+
+void Page::deliver_messages() {
+  while (messages_.count() > 0 && bindings_) {
+    Message m = util::move(messages_[0]);
+    messages_.remove_at(0);
+    EventInit init;
+    init.bubbles = false;
+    init.cancelable = false;
+    init.message_data = m.data.view();
+    init.message_origin = m.origin.view();
+    bindings_->dispatch(nullptr, "message", init);
+  }
+  messages_.clear();
+  flush_errors();
+}
+
+void Page::post_message(int32_t target, StringView data) {
+  String origin(allocator_);
+  origin_of(address_.view(), &origin);
+  if (target < 0) {
+    queue_message(data, origin.view());
+  } else if (target == 0) {
+    if (parent_) parent_->queue_message(data, origin.view());
+  } else {
+    for (uint64_t i = 0; i < frames_.count(); ++i)
+      if (frames_[i]->serial == static_cast<uint32_t>(target) && frames_[i]->page) frames_[i]->page->queue_message(data, origin.view());
+  }
 }
 
 }  // namespace browser

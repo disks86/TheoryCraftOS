@@ -26,7 +26,7 @@ namespace browser {
 
 using graphics::Rect2D;
 
-enum class ObjectKind : uint8_t { None = 0, Image = 1, Video = 2, Canvas = 3, Audio = 4 };   // (an Audio is the control bar of an <audio controls>)
+enum class ObjectKind : uint8_t { None = 0, Image = 1, Video = 2, Canvas = 3, Audio = 4, Svg = 5 };   // (an Audio is the control bar of an <audio controls>)
 
 struct ObjectInfo {
   ObjectKind kind = ObjectKind::None;

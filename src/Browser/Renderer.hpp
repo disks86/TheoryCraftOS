@@ -40,6 +40,17 @@ class IStyleSource {
   ~IStyleSource() = default;
 };
 
+// The pages of the <iframe>s of a page, drawn already.
+class IFrameSource {
+ public:
+  // The drawn page of an <iframe> element (nullptr: it has none), and the tag its nodes carry in the runs (a node serial with the number of the frame in its top byte).
+  virtual const HtmlDocument* frame_document(const dom::Node* iframe, uint32_t* tag) = 0;
+
+ protected:
+  IFrameSource() = default;
+  ~IFrameSource() = default;
+};
+
 struct RenderOptions {
   MediaEnvironment media;          // what the display is like: @media and media="" are judged by it
   StringView extra_css;            // a style sheet read before the page's own (the caller's)
@@ -48,6 +59,7 @@ struct RenderOptions {
   // control that broke a constraint when a form was submitted, with what to tell about it.
   uint32_t focus = 0, open_select = 0, invalid_node = 0;
   StringView invalid_text;
+  IFrameSource* frames = nullptr;     // the pages of <iframe>s (nullptr: <iframe> shows nothing)
   IObjectSource* objects = nullptr;   // pictures, videos and canvases (nullptr: <img> shows its alternative text, <video> and <canvas> their fallback content)
 };
 

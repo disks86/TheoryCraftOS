@@ -59,6 +59,11 @@ class IPageEnvironment : public IObjectEnvironment {
   // A form was submitted with method=post: the page at `address` is the answer to `body` (of that content type). Without this, the browser has no way to
   // post, and the form is sent as a GET.
   virtual void navigate_post(StringView address, StringView content_type, StringView body) { (void)content_type; (void)body; navigate(address, false); }
+  // The clipboard, for Ctrl+C / X / V in a text field. (False / nothing without one.)
+  virtual bool clipboard_get(String* text) { (void)text; return false; }
+  virtual void clipboard_set(StringView text) { (void)text; }
+  // The user clicked a file input (the node with that serial): let them choose; Page::file_chosen() is called for each file they pick. (Nothing without a file dialog.)
+  virtual void pick_file(uint32_t node_serial, bool multiple) { (void)node_serial; (void)multiple; }
   // (IObjectEnvironment: fetch_bytes() for pictures and videos, open_video(); pages without pictures need neither)
   bool fetch_bytes(StringView, uint64_t, ByteBuffer*) override { return false; }
 
@@ -67,7 +72,7 @@ class IPageEnvironment : public IObjectEnvironment {
   ~IPageEnvironment() = default;
 };
 
-class Page final : public script::IHost, public IDomHost, public dom::IScriptRunner, public IStyleSource {
+class Page final : public script::IHost, public IDomHost, public dom::IScriptRunner, public IStyleSource, public IFrameSource {
  public:
   static constexpr uint32_t kMaxExternalScripts = 12, kMaxStyleSheets = 8;
   static constexpr uint64_t kMaxScriptBytes = 1u << 20, kMaxStyleSheetBytes = 512u << 10;
@@ -82,7 +87,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // Fetches the style sheets the page links to that have not been fetched, and draws the page into `out`.
   bool render(HtmlDocument* out);
   // Has the tree changed, or the display (set_media()), since the last render()?
-  bool changed() const { return doc_.version() != rendered_version_ || media_ != rendered_media_; }
+  bool changed() const;
   // Did something visible change that is not in the tree (a canvas drawn on, a video frame)? Then the view only needs painting again.
   bool take_visual_change() { return objects_.take_dirty(); }
 
@@ -98,6 +103,20 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool step_objects(double now_ms);
   PageObjects& objects() override { return objects_; }
 
+  // A file the user picked for the file input with that node serial (the top byte says which frame): its name, type and bytes.
+  void file_chosen(uint32_t node_serial, StringView name, StringView type, ConstByteView bytes);
+
+  // --- Frames
+  // This page is the content of the <iframe> with that node serial in `parent` (set before load()). Frames are nested up to 3 deep, 8 to a page.
+  void set_parent(Page* parent, uint32_t frame_serial, uint32_t depth) {
+    parent_ = parent;
+    frame_serial_ = frame_serial;
+    depth_ = depth;
+  }
+  void blur() { set_focus(nullptr); }
+  // --- IFrameSource
+  const HtmlDocument* frame_document(const dom::Node* iframe, uint32_t* tag) override;
+
   // --- Forms
   // The keys a form control understands. `modifiers`: 1 shift, 2 control, 4 alt.
   enum class FormKey : uint8_t { Character, Enter, Backspace, Delete, Tab, Escape, Left, Right, Up, Down, Home, End };
@@ -105,8 +124,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // (scroll). With nothing focused only Tab is taken (it focuses the first control).
   bool key(FormKey key, char character, uint8_t modifiers);
   // Is a control focused (a key goes to it)? Does the page have any control to step to?
-  bool has_focus() const { return focus_ != 0; }
+  bool has_focus() const;
   bool has_controls();
+  // Is a modal <dialog> open (the rest of the page does not take clicks or keys)?
+  bool has_modal() { return modal_dialog() != nullptr; }
   // Runs the timers that are due at `now_ms` (the host clock); true if any ran.
   bool run_due_timers(double now_ms);
   // When the next timer is due (host clock); false if none is waiting.
@@ -159,6 +180,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void submit_form(dom::Node* form, dom::Node* submitter, bool interactive) override;
   void reset_form(dom::Node* form) override;
   bool report_validity(dom::Node* control) override;
+  void post_message(int32_t target, StringView data) override;
+  bool in_frame() override { return parent_ != nullptr; }
+  void show_dialog(dom::Node* dialog, bool modal) override;
+  void close_dialog(dom::Node* dialog, const char* return_value) override;
 
   // --- dom::IScriptRunner
   StringView external(uint32_t index, StringView src) override;
@@ -177,7 +202,19 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool start_engine();
   void deliver_object_events();
   // Forms
+  struct Frame;
+  class FrameEnv;
+  friend class FrameEnv;
+  void sync_frames();
+  void frame_navigate(uint32_t frame_serial, StringView address);
+  void frame_pick_file(uint32_t frame_serial, uint32_t node_serial, bool multiple);
+  void paste_text(dom::Node* control, StringView text);
+  void queue_message(StringView data, StringView origin);
+  void deliver_messages();
   void press_focus(dom::Node* node);
+  dom::Node* modal_dialog();
+  void toggle_details(dom::Node* details);
+  void close_dialog_text(dom::Node* dialog, StringView value);
   bool fire(dom::Node* target, StringView type, bool bubbles = true, bool cancelable = false, dom::Node* submitter = nullptr);
   void send_form(dom::Node* form, dom::Node* submitter);
   void input_changed(dom::Node* control, bool final_change);
@@ -208,6 +245,14 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool loading_ = true, engine_failed_ = false;
   int32_t scroll_request_ = -1;
   uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
+  struct Message {
+    explicit Message(allocators::IAllocator& a) : data(a), origin(a) {}
+    String data, origin;
+  };
+  List<UniquePointer<Frame>> frames_;
+  List<Message> messages_;
+  Page* parent_ = nullptr;
+  uint32_t frame_serial_ = 0, depth_ = 0;
   uint64_t controls_version_ = 0;
   bool controls_cached_ = false;
   String focus_value_, invalid_text_;                         // (what the focused control held when it got the focus; what to tell about the invalid one)

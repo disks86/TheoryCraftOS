@@ -241,6 +241,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsForm.cpp
   src/Browser/Canvas.cpp
   src/Browser/Objects.cpp
+  src/Browser/Svg.cpp
   src/Dom/Dom.cpp
   src/Dom/Selector.cpp
   src/Dom/Form.cpp

@@ -138,6 +138,9 @@ class WebBrowser : public gui::Frame {
     UniquePointer<browser::IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override;
     void navigate(StringView address, bool replace) override;
     void navigate_post(StringView address, StringView content_type, StringView body) override;
+    bool clipboard_get(String* text) override;
+    void clipboard_set(StringView text) override;
+    void pick_file(uint32_t node_serial, bool multiple) override;
     void set_hash(StringView hash) override;
     void reload() override;
     void history_go(int32_t delta) override;
@@ -164,6 +167,8 @@ class WebBrowser : public gui::Frame {
   static void on_go(void* self, gui::Control&);
   static void on_open(void* self, gui::Control&);
   static void on_open_picked(void* self, gui::Control&);
+  static void on_file_picked(void* self, gui::Control&);
+  void ask_file(uint32_t node_serial);
   static void on_close(void* self, gui::Control&);
   static void on_load(void* self, gui::Control&);
   static void on_link(void* self, gui::Control&);
@@ -227,6 +232,7 @@ class WebBrowser : public gui::Frame {
   int32_t defer_history_ = 0, defer_scroll_ = -1;
   String defer_go_;
   bool want_go_ = false, want_post_ = false;
+  uint32_t pending_file_node_ = 0;   // the file input a picked file is for
   String defer_type_, defer_body_, request_type_, request_body_;
   uint64_t uptime_ms_ = 0, clock_base_unix_ = 0, clock_base_up_ = 0, next_due_ms_ = 0;
   bool clock_based_ = false, timer_pending_ = false;

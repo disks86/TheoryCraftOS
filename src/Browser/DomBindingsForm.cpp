@@ -39,6 +39,11 @@ double nan_value() {
   return d;
 }
 
+StringView attr_of(const dom::Node* n, const char* name) {
+  StringView v;
+  return dom::get_attribute(n, name, &v) ? v : StringView();
+}
+
 dom::ValidityHooks hooks_for(DomBindings::Impl& c, bool (**fn)(void*, const dom::Node*)) {
   (void)fn;
   dom::ValidityHooks h;
@@ -46,6 +51,8 @@ dom::ValidityHooks hooks_for(DomBindings::Impl& c, bool (**fn)(void*, const dom:
   h.context = &c;
   return h;
 }
+
+NATIVE(el_post_message);
 
 Value make_validity(DomBindings::Impl& c, dom::Node* n) {
   Vm& vm = c.vm;
@@ -137,7 +144,7 @@ Value elements_value(DomBindings::Impl& c, dom::Node* form) {
 
 bool is_form_element(const dom::Node* n) {
   return n->is_element() && (dom::is_listed_control(n) || n->is_tag("form") || n->is_tag("option") || n->is_tag("label") || n->is_tag("progress") || n->is_tag("meter") ||
-                             n->is_tag("optgroup") || n->is_tag("legend"));
+                             n->is_tag("optgroup") || n->is_tag("legend") || n->is_tag("dialog") || n->is_tag("iframe"));
 }
 
 bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
@@ -169,6 +176,28 @@ bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
     if (IS("acceptCharset")) {
       StringView v;
       *out = str_value(vm, dom::get_attribute(n, "accept-charset", &v) ? v : StringView());
+      return true;
+    }
+    return false;
+  }
+  if (n->is_tag("iframe")) {
+    if (IS("contentWindow")) {
+      JsObject* w = vm.new_plain();
+      vm.define_native(w, "postMessage", el_post_message, 2);
+      vm.define_named(w, "__target", num_value(n->serial), kWritable);
+      vm.define_named(w, "closed", bool_value(false));
+      *out = Value::make_object(w);
+      return true;
+    }
+    if (IS("contentDocument")) {   // (the page of a frame has a script engine of its own: its document is not reachable from here)
+      *out = Value::make_null();
+      return true;
+    }
+    return false;
+  }
+  if (n->is_tag("dialog")) {
+    if (IS("returnValue")) {
+      *out = str_value(vm, n->data.view());
       return true;
     }
     return false;
@@ -303,18 +332,37 @@ bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
     return true;
   }
   if ((IS("selectionStart") || IS("selectionEnd")) && (input || textarea)) {
-    String v(a);
-    dom::get_value(n, &v);
-    *out = num_value(static_cast<double>(v.size()));
+    uint32_t s, e, caret;
+    dom::get_selection(n, &s, &e, &caret);
+    *out = num_value(IS("selectionStart") ? s : e);
     return true;
   }
   if (IS("selectionDirection") && (input || textarea)) { *out = str_value(vm, "none"); return true; }
   if (input) {
     if (IS("checked")) { *out = bool_value(dom::is_checked(n)); return true; }
     if (IS("defaultChecked")) { *out = bool_value(dom::has_attribute(n, "checked")); return true; }
-    if (IS("indeterminate")) { *out = bool_value(false); return true; }
-    if (IS("files")) { *out = Value::make_object(vm.new_array()); return true; }
-    if (IS("list")) { *out = Value::make_null(); return true; }
+    if (IS("indeterminate")) { *out = bool_value(n->form_state & dom::kFormIndeterminate); return true; }
+    if (IS("files")) {
+      JsObject* list = vm.new_array();
+      if (dom::input_type(n) == dom::InputType::File) {
+        StringView name, type, bytes;
+        for (uint32_t i = 0; dom::file_at(n, i, &name, &type, &bytes); ++i) {
+          JsObject* f = vm.new_plain();
+          vm.define_named(f, "name", str_value(vm, name));
+          vm.define_named(f, "type", str_value(vm, type));
+          vm.define_named(f, "size", num_value(static_cast<double>(bytes.size())));
+          vm.define_named(f, "lastModified", num_value(0));
+          vm.array_push(list, Value::make_object(f));
+        }
+      }
+      *out = Value::make_object(list);
+      return true;
+    }
+    if (IS("list")) {
+      const dom::Node* l = n->owner->element_by_id(attr_of(n, "list"));
+      *out = node_value(c, l && l->is_tag("datalist") ? const_cast<dom::Node*>(l) : nullptr);
+      return true;
+    }
     if (IS("valueAsNumber")) {
       String v(a);
       dom::get_value(n, &v);
@@ -375,6 +423,14 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* n, StringView k, const 
     }
     return HostClass::Set::NotHandled;
   }
+  if (n->is_tag("dialog")) {
+    if (IS("returnValue")) {
+      if (!text_arg()) return HostClass::Set::Threw;
+      n->data.assign(text.view());
+      return HostClass::Set::Handled;
+    }
+    return HostClass::Set::NotHandled;
+  }
   if (n->is_tag("option")) {
     if (IS("selected")) {
       dom::Node* s = n->parent;
@@ -416,7 +472,7 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* n, StringView k, const 
   }
   if (!dom::is_listed_control(n)) return HostClass::Set::NotHandled;
   if (IS("form") || IS("willValidate") || IS("validity") || IS("validationMessage") || IS("labels") || IS("textLength") || IS("selectionDirection") || IS("files") ||
-      IS("list") || IS("indeterminate") || IS("selectionStart") || IS("selectionEnd") || IS("length") || IS("selectedOptions") || IS("elements") || IS("valueAsDate"))
+      IS("list") || IS("length") || IS("selectedOptions") || IS("elements") || IS("valueAsDate"))
     return HostClass::Set::Handled;
   if (IS("type")) {
     if (!text_arg()) return HostClass::Set::Threw;
@@ -438,6 +494,10 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* n, StringView k, const 
       return HostClass::Set::Threw;
     }
     n->form_state &= static_cast<uint8_t>(~dom::kFormEdited);
+    if (n->is_tag("input") && dom::input_type(n) == dom::InputType::File) {
+      dom::clear_files(n);
+      return HostClass::Set::Handled;
+    }
     dom::set_value(n, text.view());
     return HostClass::Set::Handled;
   }
@@ -457,6 +517,22 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* n, StringView k, const 
   }
   if (IS("checked")) {
     if (n->is_tag("input")) dom::set_checked(n, Vm::to_boolean(value));
+    return HostClass::Set::Handled;
+  }
+  if (IS("indeterminate")) {
+    if (Vm::to_boolean(value)) n->form_state |= dom::kFormIndeterminate;
+    else n->form_state &= static_cast<uint8_t>(~dom::kFormIndeterminate);
+    n->owner->touch();
+    return HostClass::Set::Handled;
+  }
+  if ((IS("selectionStart") || IS("selectionEnd")) && (n->is_tag("input") || n->is_tag("textarea"))) {
+    double d;
+    if (!vm.to_number(value, &d)) return HostClass::Set::Threw;
+    uint32_t s, e, caret;
+    dom::get_selection(n, &s, &e, &caret);
+    const uint32_t v = d > 0 ? static_cast<uint32_t>(d) : 0;
+    if (IS("selectionStart")) dom::set_selection(n, v, e < v ? v : e);
+    else dom::set_selection(n, s > v ? v : s, v);
     return HostClass::Set::Handled;
   }
   if (IS("defaultChecked")) {
@@ -603,6 +679,85 @@ NATIVE(el_step_down) {
   return true;
 }
 
+// window.postMessage, parent.postMessage and contentWindow.postMessage: `this` says where it goes.
+NATIVE(el_post_message) {
+  DomBindings::Impl& c = impl(vm);
+  String data(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &data)) return false;
+  Value target;
+  int32_t where = -1;
+  if (self.is_object() && vm.get_named(self, "__target", &target) && target.is_number()) where = static_cast<int32_t>(target.u.number);
+  c.host.post_message(where, data.view());
+  (void)result;
+  return true;
+}
+
+NATIVE(el_dialog_show) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return false;
+  if (!n->is_tag("dialog")) return vm.throw_error(ErrorKind::TypeError, "show is not a function");
+  impl(vm).host.show_dialog(n, false);
+  return true;
+}
+
+NATIVE(el_dialog_show_modal) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return false;
+  if (!n->is_tag("dialog")) return vm.throw_error(ErrorKind::TypeError, "showModal is not a function");
+  if (dom::has_attribute(n, "open")) return throw_dom(vm, "InvalidStateError", "The element already has an 'open' attribute, and therefore cannot be opened modally.");
+  impl(vm).host.show_dialog(n, true);
+  return true;
+}
+
+NATIVE(el_dialog_close) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return false;
+  if (!n->is_tag("dialog")) return vm.throw_error(ErrorKind::TypeError, "close is not a function");
+  String value(vm.allocator());
+  const bool given = argc > 0 && !args[0].is_undefined();
+  if (given && !arg_text(vm, args[0], &value)) return false;
+  impl(vm).host.close_dialog(n, given ? value.c_str() : nullptr);
+  return true;
+}
+
+NATIVE(el_select_text) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return false;
+  if (n->is_tag("input") || n->is_tag("textarea")) {
+    String v(vm.allocator());
+    dom::get_value(n, &v);
+    if (dom::is_focusable(n)) impl(vm).host.set_focus(n);
+    dom::set_selection(n, 0, static_cast<uint32_t>(v.size()));
+  }
+  return true;
+}
+
+NATIVE(el_set_selection_range) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return false;
+  double a = 0, b = 0;
+  if (argc > 0 && !vm.to_number(args[0], &a)) return false;
+  if (argc > 1 && !vm.to_number(args[1], &b)) return false;
+  if (n->is_tag("input") || n->is_tag("textarea")) dom::set_selection(n, a > 0 ? static_cast<uint32_t>(a) : 0, b > 0 ? static_cast<uint32_t>(b) : 0);
+  return true;
+}
+
+// setRangeText(text) replaces the selection; setRangeText(text, start, end) a range.
+NATIVE(el_set_range_text) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return false;
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  if (!(n->is_tag("input") || n->is_tag("textarea"))) return true;
+  if (argc >= 3) {
+    double a = 0, b = 0;
+    if (!vm.to_number(args[1], &a) || !vm.to_number(args[2], &b)) return false;
+    dom::set_selection(n, a > 0 ? static_cast<uint32_t>(a) : 0, b > 0 ? static_cast<uint32_t>(b) : 0);
+  }
+  dom::replace_selection(n, text.view(), false);
+  return true;
+}
+
 NATIVE(el_nothing) {
   (void)vm; (void)self; (void)args; (void)argc; (void)result;
   return true;
@@ -640,7 +795,18 @@ NATIVE(formdata_constructor) {
     dom::Node* submitter = argc > 1 ? node_of(args[1]) : nullptr;
     List<dom::Entry> list(vm.allocator());
     if (!dom::form_entries(form, submitter, &list)) return vm.throw_error(ErrorKind::Error, "out of memory");
-    for (uint64_t i = 0; i < list.count(); ++i) vm.array_push(entries, pair(vm, vm.new_string(list[i].name.view()), str_value(vm, list[i].value.view())));
+    for (uint64_t i = 0; i < list.count(); ++i) {
+      Value v = str_value(vm, list[i].value.view());
+      if (list[i].file) {   // (a file is an object with its name, type and size)
+        JsObject* f = vm.new_plain();
+        vm.define_named(f, "name", str_value(vm, list[i].filename.view()));
+        vm.define_named(f, "type", str_value(vm, list[i].content_type.view()));
+        vm.define_named(f, "size", num_value(static_cast<double>(list[i].value.size())));
+        vm.define_named(f, "lastModified", num_value(0));
+        v = Value::make_object(f);
+      }
+      vm.array_push(entries, pair(vm, vm.new_string(list[i].name.view()), v));
+    }
   }
   (void)c;
   *result = self;
@@ -808,10 +974,21 @@ bool install_forms(DomBindings::Impl& c) {
   vm.define_native(ep, "setCustomValidity", el_set_custom_validity, 1);
   vm.define_native(ep, "focus", el_focus, 0);
   vm.define_native(ep, "blur", el_blur, 0);
-  vm.define_native(ep, "select", el_focus, 0);
-  vm.define_native(ep, "setSelectionRange", el_nothing, 2);
-  vm.define_native(ep, "setRangeText", el_nothing, 1);
+  vm.define_native(ep, "select", el_select_text, 0);
+  vm.define_native(ep, "setSelectionRange", el_set_selection_range, 2);
+  vm.define_native(ep, "setRangeText", el_set_range_text, 1);
   vm.define_native(ep, "showPicker", el_nothing, 0);
+  vm.define_native(vm.global(), "postMessage", el_post_message, 2);
+  if (c.host.in_frame()) {   // a page in a frame: window.parent and window.top are the page around it
+    JsObject* parent = vm.new_plain();
+    vm.define_native(parent, "postMessage", el_post_message, 2);
+    vm.define_named(parent, "__target", num_value(0), kWritable);
+    vm.define_named(vm.global(), "parent", Value::make_object(parent), kWritable);
+    vm.define_named(vm.global(), "top", Value::make_object(parent), kWritable);
+  }
+  vm.define_native(ep, "show", el_dialog_show, 0);
+  vm.define_native(ep, "showModal", el_dialog_show_modal, 0);
+  vm.define_native(ep, "close", el_dialog_close, 0);
   vm.define_native(ep, "stepUp", el_step_up, 0);
   vm.define_native(ep, "stepDown", el_step_down, 0);
 

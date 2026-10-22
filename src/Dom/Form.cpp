@@ -268,9 +268,15 @@ bool is_read_only(const Node* control) {
 
 bool is_focusable(const Node* n) {
   if (!n->is_element()) return false;
+  if (n->is_tag("summary")) {   // the first summary of a <details> opens and closes it
+    if (!n->parent || !n->parent->is_tag("details")) return false;
+    for (const Node* c = n->parent->first_child; c; c = c->next)
+      if (c->is_tag("summary")) return c == n;
+    return false;
+  }
   if (n->is_tag("input")) {
     const InputType t = input_type(n);
-    if (t == InputType::Hidden || t == InputType::File || t == InputType::Color) return false;
+    if (t == InputType::Hidden) return false;
   } else if (!(n->is_tag("button") || n->is_tag("select") || n->is_tag("textarea"))) {
     return false;
   }
@@ -361,7 +367,14 @@ void get_value(const Node* n, String* out) {
         out->assign(get_attribute(n, "value", &v) ? v : StringView("on"));
         return;
       }
-      case InputType::File: return;
+      case InputType::File: {
+        StringView name, type, bytes;
+        if (file_at(n, 0, &name, &type, &bytes)) {
+          out->assign("C:\\fakepath\\");
+          out->append(name);
+        }
+        return;
+      }
       case InputType::Hidden:
       case InputType::Button:
       case InputType::Submit:
@@ -425,6 +438,7 @@ bool set_value(Node* n, StringView value, bool do_sanitize) {
     else s.assign(value);
     if (!n->data.assign(s.view())) return false;
     n->form_state |= kFormValueDirty;
+    n->caret = n->anchor = 0xFFFF;
     n->owner->touch();
     return true;
   }
@@ -433,6 +447,7 @@ bool set_value(Node* n, StringView value, bool do_sanitize) {
     normalize_newlines(value, false, &s);
     if (!n->data.assign(s.view())) return false;
     n->form_state |= kFormValueDirty;
+    n->caret = n->anchor = 0xFFFF;
     n->owner->touch();
     return true;
   }
@@ -516,6 +531,24 @@ bool form_entries(const Node* form, const Node* submitter, List<Entry>* out) {
         continue;
       }
       if (name.empty()) continue;
+      if (t == InputType::File) {
+        const uint32_t count = file_count(n);
+        for (uint32_t k = 0; k < (count ? count : 1); ++k) {
+          Entry e(a);
+          e.name.assign(name);
+          e.file = true;
+          StringView fname, ftype, bytes;
+          if (count && file_at(n, k, &fname, &ftype, &bytes)) {
+            e.filename.assign(fname);
+            e.content_type.assign(ftype.empty() ? StringView("application/octet-stream") : ftype);
+            e.value.assign(bytes);
+          } else {
+            e.content_type.assign("application/octet-stream");
+          }
+          if (!out->push_back(util::move(e))) return false;
+        }
+        continue;
+      }
       if (t == InputType::Submit || t == InputType::Button || t == InputType::Reset) {
         if (n != submitter || t != InputType::Submit) continue;
       }
@@ -582,7 +615,8 @@ bool encode_urlencoded(const List<Entry>& entries, String* out) {
     normalize_newlines(entries[i].name.view(), true, &tmp);
     if (!url_encode(tmp.view(), out) || !out->push_back('=')) return false;
     tmp.clear();
-    normalize_newlines(entries[i].value.view(), true, &tmp);
+    if (entries[i].file) tmp.assign(entries[i].filename.view());
+    else normalize_newlines(entries[i].value.view(), true, &tmp);
     if (!url_encode(tmp.view(), out)) return false;
   }
   return true;
@@ -603,10 +637,25 @@ bool encode_multipart(const List<Entry>& entries, StringView boundary, String* o
       else if (tmp[k] == '\n') out->append("%0A");
       else out->push_back(tmp[k]);
     }
-    out->append("\"\r\n\r\n");
-    tmp.clear();
-    normalize_newlines(entries[i].value.view(), true, &tmp);
-    out->append(tmp.view());
+    out->push_back('"');
+    if (entries[i].file) {
+      out->append("; filename=\"");
+      for (uint64_t k = 0; k < entries[i].filename.size(); ++k) {
+        const char c = entries[i].filename[k];
+        if (c == '"') out->append("%22");
+        else if (c == '\r' || c == '\n') out->push_back(' ');
+        else out->push_back(c);
+      }
+      out->append("\"\r\nContent-Type: ");
+      out->append(entries[i].content_type.view());
+      out->append("\r\n\r\n");
+      out->append(entries[i].value.view());
+    } else {
+      out->append("\r\n\r\n");
+      tmp.clear();
+      normalize_newlines(entries[i].value.view(), true, &tmp);
+      out->append(tmp.view());
+    }
     if (!out->append("\r\n")) return false;
   }
   out->append("--");
@@ -623,7 +672,8 @@ bool encode_plain(const List<Entry>& entries, String* out) {
     out->append(tmp.view());
     out->push_back('=');
     tmp.clear();
-    normalize_newlines(entries[i].value.view(), true, &tmp);
+    if (entries[i].file) tmp.assign(entries[i].filename.view());
+    else normalize_newlines(entries[i].value.view(), true, &tmp);
     out->append(tmp.view());
     if (!out->append("\r\n")) return false;
   }
@@ -719,6 +769,7 @@ void format_number(double v, String* out) {
 }
 
 bool step_value(Node* n, int32_t steps) {
+  if (n->is_tag("input") && !is_numeric(input_type(n))) return step_date(n, steps);
   if (!n->is_tag("input") || !is_numeric(input_type(n))) return false;
   String current(n->owner->allocator());
   get_value(n, &current);
@@ -735,6 +786,305 @@ bool step_value(Node* n, int32_t steps) {
   format_number(v, &text);
   n->form_state |= kFormEdited;
   return set_value(n, text.view(), false);
+}
+
+// --- Selection -----------------------------------------------------------------------------------------------------------------
+
+void get_selection(const Node* n, uint32_t* start, uint32_t* end, uint32_t* caret) {
+  String v(n->owner->allocator());
+  get_value(n, &v);
+  const uint32_t len = static_cast<uint32_t>(v.size());
+  uint32_t c = n->caret == 0xFFFF || n->caret > len ? len : n->caret;
+  uint32_t an = n->anchor == 0xFFFF || n->anchor > len ? c : n->anchor;
+  *start = c < an ? c : an;
+  *end = c < an ? an : c;
+  *caret = c;
+}
+
+void set_selection(Node* n, uint32_t start, uint32_t end) {
+  if (start > end) start = end;
+  n->anchor = static_cast<uint16_t>(start > 0xFFFE ? 0xFFFE : start);
+  n->caret = static_cast<uint16_t>(end > 0xFFFE ? 0xFFFE : end);
+  n->owner->touch();
+}
+
+bool replace_selection(Node* n, StringView text, bool user) {
+  String v(n->owner->allocator());
+  get_value(n, &v);
+  uint32_t s, e, c;
+  get_selection(n, &s, &e, &c);
+  uint64_t max = 0;
+  const bool limited = user && attr(n, "maxlength").trimmed().parse_uint(&max);
+  if (limited) {
+    const uint64_t room = max + (e - s) > v.size() ? max + (e - s) - v.size() : 0;
+    if (text.size() > room) text = text.first(room);
+  }
+  String joined(n->owner->allocator());
+  joined.append(v.view().first(s));
+  joined.append(text);
+  joined.append(v.view().substr(e));
+  if (!set_value(n, joined.view(), false)) return false;
+  if (user) n->form_state |= kFormEdited;
+  const uint32_t at = s + static_cast<uint32_t>(text.size());
+  n->caret = n->anchor = static_cast<uint16_t>(at > 0xFFFE ? 0xFFFE : at);
+  return true;
+}
+
+bool delete_selection(Node* n, int direction) {
+  uint32_t s, e, c;
+  get_selection(n, &s, &e, &c);
+  if (s == e) {
+    String v(n->owner->allocator());
+    get_value(n, &v);
+    if (direction < 0) {
+      if (s == 0) return false;
+      --s;
+    } else {
+      if (e >= v.size()) return false;
+      ++e;
+    }
+    set_selection(n, s, e);
+  }
+  return replace_selection(n, StringView(), true);
+}
+
+void move_caret(Node* n, int32_t delta, bool extend) {
+  String v(n->owner->allocator());
+  get_value(n, &v);
+  uint32_t s, e, c;
+  get_selection(n, &s, &e, &c);
+  const uint32_t an = n->anchor == 0xFFFF || n->anchor > v.size() ? c : n->anchor;   // (the end that does not move)
+  int64_t target;
+  if (delta == INT32_MIN) target = 0;
+  else if (delta == INT32_MAX) target = static_cast<int64_t>(v.size());
+  else if (!extend && s != e) target = delta < 0 ? s : e;   // (an arrow key leaves the selection at its edge)
+  else target = static_cast<int64_t>(c) + delta;
+  if (target < 0) target = 0;
+  if (target > static_cast<int64_t>(v.size())) target = static_cast<int64_t>(v.size());
+  n->caret = static_cast<uint16_t>(target > 0xFFFE ? 0xFFFE : target);
+  n->anchor = extend ? static_cast<uint16_t>(an > 0xFFFE ? 0xFFFE : an) : n->caret;
+  n->owner->touch();
+}
+
+// --- Files -------------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+void put32(String* out, uint32_t v) {
+  for (int i = 0; i < 4; ++i) out->push_back(static_cast<char>((v >> (8 * i)) & 255));
+}
+
+bool get32(StringView s, uint64_t* at, uint32_t* v) {
+  if (*at + 4 > s.size()) return false;
+  *v = 0;
+  for (int i = 0; i < 4; ++i) *v |= static_cast<uint32_t>(static_cast<uint8_t>(s[*at + i])) << (8 * i);
+  *at += 4;
+  return true;
+}
+
+}  // namespace
+
+// (the files are kept in Node::data as records: name length, name, type length, type, size, bytes)
+bool add_file(Node* n, StringView name, StringView type, ConstByteView bytes, bool replace) {
+  if (replace) n->data.clear();
+  put32(&n->data, static_cast<uint32_t>(name.size()));
+  n->data.append(name);
+  put32(&n->data, static_cast<uint32_t>(type.size()));
+  n->data.append(type);
+  put32(&n->data, static_cast<uint32_t>(bytes.size()));
+  const bool ok = n->data.append(StringView(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+  n->owner->touch();
+  return ok;
+}
+
+bool file_at(const Node* n, uint32_t index, StringView* name, StringView* type, StringView* bytes) {
+  const StringView d = n->data.view();
+  uint64_t at = 0;
+  for (uint32_t i = 0;; ++i) {
+    uint32_t nl, tl, bl;
+    if (!get32(d, &at, &nl) || at + nl > d.size()) return false;
+    const StringView nm = d.substr(at, nl);
+    at += nl;
+    if (!get32(d, &at, &tl) || at + tl > d.size()) return false;
+    const StringView ty = d.substr(at, tl);
+    at += tl;
+    if (!get32(d, &at, &bl) || at + bl > d.size()) return false;
+    const StringView by = d.substr(at, bl);
+    at += bl;
+    if (i == index) {
+      *name = nm;
+      *type = ty;
+      *bytes = by;
+      return true;
+    }
+  }
+}
+
+uint32_t file_count(const Node* n) {
+  StringView a, b, c;
+  uint32_t k = 0;
+  while (file_at(n, k, &a, &b, &c)) ++k;
+  return k;
+}
+
+void clear_files(Node* n) {
+  n->data.clear();
+  n->owner->touch();
+}
+
+// --- Colors and dates --------------------------------------------------------------------------------------------------------
+
+void next_color(StringView current, int direction, String* out) {
+  static const char* const kPalette[] = {"#000000", "#ffffff", "#ff0000", "#00ff00", "#0000ff", "#ffff00", "#00ffff", "#ff00ff", "#808080", "#c0c0c0", "#800000",
+                                         "#008000", "#000080", "#808000", "#008080", "#800080"};
+  const int count = 16;
+  int at = -1;
+  for (int i = 0; i < count; ++i)
+    if (current.equals_ignore_case(kPalette[i])) at = i;
+  int next = at < 0 ? 0 : ((at + direction) % count + count) % count;
+  out->assign(kPalette[next]);
+}
+
+namespace {
+
+int64_t days_from_civil(int64_t y, int64_t m, int64_t d) {
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const int64_t yoe = y - era * 400;
+  const int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+void civil_from_days(int64_t z, int64_t* y, int64_t* m, int64_t* d) {
+  z += 719468;
+  const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const int64_t doe = z - era * 146097;
+  const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  *y = yoe + era * 400;
+  const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const int64_t mp = (5 * doy + 2) / 153;
+  *d = doy - (153 * mp + 2) / 5 + 1;
+  *m = mp + (mp < 10 ? 3 : -9);
+  *y += *m <= 2;
+}
+
+bool is_leap(int64_t y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+int days_in_month(int64_t y, int64_t m) {
+  static const int kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  return m == 2 && is_leap(y) ? 29 : kDays[m - 1];
+}
+
+bool digits(StringView s, uint64_t at, uint64_t n, int64_t* out) {
+  if (at + n > s.size()) return false;
+  int64_t v = 0;
+  for (uint64_t i = 0; i < n; ++i) {
+    if (s[at + i] < '0' || s[at + i] > '9') return false;
+    v = v * 10 + (s[at + i] - '0');
+  }
+  *out = v;
+  return true;
+}
+
+// Monday of ISO week `week` of `year`, as days since 1970-01-01.
+int64_t iso_week_start(int64_t year, int64_t week) {
+  const int64_t jan4 = days_from_civil(year, 1, 4);
+  const int64_t weekday = ((jan4 + 3) % 7 + 7) % 7;   // 0 = Monday
+  return jan4 - weekday + (week - 1) * 7;
+}
+
+bool parse_time(StringView s, uint64_t at, int64_t* minutes, int64_t* seconds) {
+  int64_t h, m, sec = 0;
+  if (!digits(s, at, 2, &h) || at + 2 >= s.size() || s[at + 2] != ':' || !digits(s, at + 3, 2, &m)) return false;
+  uint64_t end = at + 5;
+  if (end < s.size() && s[end] == ':') {
+    if (!digits(s, end + 1, 2, &sec)) return false;
+    end += 3;
+    if (end < s.size() && s[end] == '.') {
+      ++end;
+      while (end < s.size() && s[end] >= '0' && s[end] <= '9') ++end;
+    }
+  }
+  if (end != s.size() || h > 23 || m > 59 || sec > 59) return false;
+  *minutes = h * 60 + m;
+  *seconds = sec;
+  return true;
+}
+
+}  // namespace
+
+bool valid_date_text(InputType t, StringView s) {
+  int64_t y, m, d, w, mi, se;
+  switch (t) {
+    case InputType::Date:
+      return s.size() == 10 && digits(s, 0, 4, &y) && s[4] == '-' && digits(s, 5, 2, &m) && s[7] == '-' && digits(s, 8, 2, &d) && m >= 1 && m <= 12 && d >= 1 && d <= days_in_month(y, m);
+    case InputType::Month: return s.size() == 7 && digits(s, 0, 4, &y) && s[4] == '-' && digits(s, 5, 2, &m) && m >= 1 && m <= 12;
+    case InputType::Week: return s.size() == 8 && digits(s, 0, 4, &y) && s[4] == '-' && s[5] == 'W' && digits(s, 6, 2, &w) && w >= 1 && w <= 53;
+    case InputType::Time: return parse_time(s, 0, &mi, &se);
+    case InputType::DateTimeLocal:
+      return s.size() >= 16 && (s[10] == 'T' || s[10] == ' ') && valid_date_text(InputType::Date, s.first(10)) && parse_time(s, 11, &mi, &se);
+    default: return true;
+  }
+}
+
+bool step_date(Node* n, int32_t steps) {
+  const InputType t = input_type(n);
+  if (t != InputType::Date && t != InputType::Month && t != InputType::Week && t != InputType::Time && t != InputType::DateTimeLocal) return false;
+  String v(n->owner->allocator());
+  get_value(n, &v);
+  if (v.empty()) {   // (from the minimum, else the start of the epoch)
+    v.assign(attr(n, "min").trimmed());
+    if (!valid_date_text(t, v.view())) {
+      v.assign(t == InputType::Date ? "1970-01-01" : t == InputType::Month ? "1970-01" : t == InputType::Week ? "1970-W01" : t == InputType::Time ? "00:00" : "1970-01-01T00:00");
+      steps = steps > 0 ? steps - 1 : steps;
+    }
+  }
+  if (!valid_date_text(t, v.view())) return false;
+  int64_t y = 0, m = 1, d = 1, minutes = 0, seconds = 0;
+  String out(n->owner->allocator());
+  auto put = [&](int64_t value, int width) {
+    String text(n->owner->allocator());
+    text.append_int(value);
+    for (int i = static_cast<int>(text.size()); i < width; ++i) out.push_back('0');
+    out.append(text.view());
+  };
+  if (t == InputType::Date || t == InputType::DateTimeLocal) {
+    digits(v.view(), 0, 4, &y), digits(v.view(), 5, 2, &m), digits(v.view(), 8, 2, &d);
+    if (t == InputType::DateTimeLocal) parse_time(v.view(), 11, &minutes, &seconds);
+    if (t == InputType::Date) {
+      civil_from_days(days_from_civil(y, m, d) + steps, &y, &m, &d);
+    } else {
+      int64_t total = days_from_civil(y, m, d) * 1440 + minutes + steps;
+      int64_t days = total >= 0 ? total / 1440 : -((-total + 1439) / 1440);
+      minutes = total - days * 1440;
+      civil_from_days(days, &y, &m, &d);
+    }
+    put(y, 4), out.push_back('-'), put(m, 2), out.push_back('-'), put(d, 2);
+    if (t == InputType::DateTimeLocal) {
+      out.push_back('T');
+      put(minutes / 60, 2), out.push_back(':'), put(minutes % 60, 2);
+    }
+  } else if (t == InputType::Month) {
+    digits(v.view(), 0, 4, &y), digits(v.view(), 5, 2, &m);
+    int64_t index = y * 12 + (m - 1) + steps;
+    y = index >= 0 ? index / 12 : -((-index + 11) / 12);
+    m = index - y * 12 + 1;
+    put(y, 4), out.push_back('-'), put(m, 2);
+  } else if (t == InputType::Week) {
+    int64_t w;
+    digits(v.view(), 0, 4, &y), digits(v.view(), 6, 2, &w);
+    const int64_t start = iso_week_start(y, w) + 7 * steps;
+    // the ISO year of the date that is Thursday of that week
+    civil_from_days(start + 3, &y, &m, &d);
+    const int64_t first = iso_week_start(y, 1);
+    put(y, 4), out.append("-W"), put((start - first) / 7 + 1, 2);
+  } else {
+    parse_time(v.view(), 0, &minutes, &seconds);
+    minutes = ((minutes + steps) % 1440 + 1440) % 1440;
+    put(minutes / 60, 2), out.push_back(':'), put(minutes % 60, 2);
+  }
+  n->form_state |= kFormEdited;
+  return set_value(n, out.view(), false);
 }
 
 // --- Regular expressions -----------------------------------------------------------------------------------------------------
@@ -1057,7 +1407,7 @@ uint32_t validity(const Node* n, const ValidityHooks* hooks) {
     return flags;
   }
   if (t == InputType::File) {
-    if (required) flags |= kValueMissing;
+    if (required && file_count(n) == 0) flags |= kValueMissing;
     return flags;
   }
   if (t == InputType::Submit || t == InputType::Image) return flags;
@@ -1116,6 +1466,10 @@ uint32_t validity(const Node* n, const ValidityHooks* hooks) {
         if (diff > 1e-7 * (q < 0 ? -q : q < 1 ? 1 : q)) flags |= kStepMismatch;
       }
     } else {   // dates and times compare as text (they are written so that they sort)
+      if (!valid_date_text(t, value.view())) {
+        flags |= kBadInput;
+        return flags;
+      }
       const StringView lo = attr(n, "min").trimmed(), hi = attr(n, "max").trimmed();
       if (!lo.empty() && value.view().compare(lo) < 0) flags |= kRangeUnderflow;
       if (!hi.empty() && value.view().compare(hi) > 0) flags |= kRangeOverflow;

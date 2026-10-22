@@ -127,6 +127,11 @@ struct FakeEnvironment final : IPageEnvironment {
     return true;
   }
   std::vector<std::string> posts;
+  std::string clip;
+  std::vector<uint32_t> picks;
+  bool clipboard_get(String* text) override { text->assign(StringView(clip.data(), clip.size())); return !clip.empty(); }
+  void clipboard_set(StringView text) override { clip.assign(text.data(), text.size()); }
+  void pick_file(uint32_t node, bool) override { picks.push_back(node); }
   void navigate_post(StringView a, StringView type, StringView body) override {
     posts.push_back(std::string(a.data(), a.size()) + " [" + std::string(type.data(), type.size()) + "] " + std::string(body.data(), body.size()));
   }
@@ -336,6 +341,7 @@ static std::string page_text(Page& page, uint32_t columns = 40) {
       const Piece& piece = layout.piece(p);
       while (at < piece.column) { out += ' '; ++at; }
       if (doc.run(piece.run).flags & kRunRule) { out += "---"; at += 3; continue; }
+      if (doc.run(piece.run).object) { out += '#'; at += piece.length; continue; }   // (a picture, video or canvas: one mark per row)
       const StringView t = doc.run_text(piece.run).substr(piece.from, piece.length);
       out += std::string(t.data(), t.size());
       at += piece.length;
@@ -1020,6 +1026,377 @@ static void type_text(Page& page, const char* text) {
   for (const char* p = text; *p; ++p) page.key(Page::FormKey::Character, *p, 0);
 }
 
+static void test_details_and_dialog() {
+  TestAllocator a;
+  {   // details: closed shows the summary; a click opens it, and a click again closes it
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><details id=d><summary id=s>More</summary><p>hidden text</p></details>"
+              "<details name=g id=g1 open><summary>One</summary>first</details><details name=g id=g2><summary>Two</summary>second</details>"
+              "<script>['d','g1','g2'].forEach(function(id) { document.getElementById(id).addEventListener('toggle', function(e) { console.log('toggle ' + id + ' ' + e.target.open) }) })</script></body></html>");
+    std::string text = page_text(page, 40);
+    CHECK(text.find("> More") != std::string::npos && text.find("hidden text") == std::string::npos && text.find("v One") != std::string::npos && text.find("first") != std::string::npos);
+    page.click(serial_of(page, "s"), 0, 0);
+    text = page_text(page, 40);
+    CHECK(text.find("v More") != std::string::npos && text.find("hidden text") != std::string::npos);
+    CHECK(page_log(page) == "toggle d true");
+    page.click(serial_of(page, "s"), 0, 0);
+    CHECK(page_text(page, 40).find("hidden text") == std::string::npos);
+    page.click(page.document().element_by_id("g2")->first_child->serial, 0, 0);   // (the group keeps one open)
+    CHECK(!dom::has_attribute(page.document().element_by_id("g1"), "open") && dom::has_attribute(page.document().element_by_id("g2"), "open"));
+    // keyboard: Tab to a summary, Enter opens it
+    page.key(Page::FormKey::Tab, 0, 0);   // (leaves the last one)
+    page.key(Page::FormKey::Tab, 0, 0);
+    CHECK(page.focused() && page.focused()->serial == serial_of(page, "s"));
+    page.key(Page::FormKey::Enter, 0, 0);
+    CHECK(dom::has_attribute(page.document().element_by_id("d"), "open"));
+  }
+  CHECK(a.live == 0);
+  {   // dialog
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><p id=behind>page text</p><dialog id=d><p>dialog text</p><form method=dialog><button id=ok value=yes>OK</button><button id=no value=no>No</button></form></dialog>"
+              "<button id=open1></button><button id=open2></button><script>var d = document.getElementById('d'); var log = [];"
+              "d.addEventListener('close', function() { console.log('close ' + d.returnValue) }); d.addEventListener('cancel', function() { console.log('cancel') });"
+              "document.getElementById('open1').addEventListener('click', function() { d.show(); console.log(d.open) });"
+              "document.getElementById('open2').addEventListener('click', function() { d.showModal() });"
+              "document.getElementById('behind').addEventListener('click', function() { console.log('behind clicked') });</script></body></html>");
+    CHECK(page_text(page, 40).find("dialog text") == std::string::npos);
+    page.click(serial_of(page, "open1"), 0, 0);
+    std::string text = page_text(page, 40);
+    CHECK(text.find("dialog text") != std::string::npos && text.find("---") != std::string::npos && page_log(page) == "true");
+    page.click(serial_of(page, "ok"), 0, 0);   // (a form with method=dialog closes it, with the button's value)
+    CHECK(page_text(page, 40).find("dialog text") == std::string::npos && page_log(page) == "true | close yes" && env.navigations.empty());
+    page.click(serial_of(page, "open2"), 0, 0);
+    text = page_text(page, 40);
+    CHECK(text.find("dialog text") < text.find("page text"));   // (a modal dialog is drawn first)
+    CHECK(page.has_modal());
+    page.click(serial_of(page, "behind"), 0, 0);   // (the page behind it is inert)
+    CHECK(page_log(page).find("behind clicked") == std::string::npos);
+    page.key(Page::FormKey::Escape, 0, 0);
+    CHECK(!page.has_modal() && page_log(page).find("cancel | close") != std::string::npos);
+    page.click(serial_of(page, "behind"), 0, 0);
+    CHECK(page_log(page).find("behind clicked") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_template() {
+  TestAllocator a;
+  FakeEnvironment env(a);
+  MediaEnvironment media;
+  Page page(a, env, "http://example.com/", media, true);
+  page.load("<html><body><template id=t><li class=x>item</li><script>console.log('never')</script></template><ul id=u></ul><script>"
+            "var t = document.getElementById('t'), u = document.getElementById('u'), r = [];"
+            "r.push(t.content.childNodes.length, t.children.length, t.childNodes.length, document.querySelectorAll('.x').length, t.innerHTML);"
+            "u.appendChild(t.content.cloneNode(true)); u.appendChild(document.importNode(t.content, true));"
+            "r.push(u.children.length, document.querySelectorAll('.x').length, t.content.childNodes.length);"
+            "t.innerHTML = '<b>z</b>'; r.push(t.content.firstChild.tagName, t.outerHTML);"
+            "var made = document.createElement('template'); r.push(made.content.childNodes.length);"
+            "console.log(r.join(' '))</script></body></html>");
+  CHECK(page_log(page) == "2 0 0 0 <li class=\"x\">item</li><script>console.log('never')</script> 4 2 2 B <template id=\"t\"><b>z</b></template> 0");
+  const std::string text = page_text(page, 40);
+  CHECK(text.find("item") != std::string::npos && text.find("never") == std::string::npos);
+}
+
+static uint32_t node_of_text(Page& page, const char* text) {
+  HtmlDocument doc(page.document().allocator());
+  page.render(&doc);
+  for (uint64_t i = 0; i < doc.run_count(); ++i)
+    if (doc.run_text(i).contains(text)) return doc.run(i).node;
+  return 0;
+}
+
+static void test_iframe() {
+  TestAllocator a;
+  {   // srcdoc and src: the page of the frame is drawn between rules
+    FakeEnvironment env(a);
+    env.files["http://example.com/frame.html"] = "<html><body><h1>From a file</h1><p>second <a href=/x>link</a></p></body></html>";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><p>before</p><iframe id=f srcdoc=\"<p>inner text</p><button id=b>Go</button>\"></iframe><iframe id=g src=frame.html>fallback</iframe><p>after</p></body></html>");
+    const std::string text = page_text(page, 60);
+    CHECK(text.find("before") < text.find("inner text") && text.find("inner text") < text.find("From a file") && text.find("From a file") < text.find("after"));
+    CHECK(text.find("[ Go ]") != std::string::npos && text.find("---") != std::string::npos && text.find("fallback") == std::string::npos);
+    CHECK(text.find("second link") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // clicks and typing reach the frame; messages go both ways
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe id=f srcdoc=\"<input id=i><button id=b>Press</button><script>"
+              "document.getElementById('b').addEventListener('click', function() { parent.postMessage('clicked ' + document.getElementById('i').value, '*') });"
+              "window.addEventListener('message', function(e) { parent.postMessage('echo:' + e.data, '*') })</script>\"></iframe><button id=ask>ask</button><script>"
+              "window.addEventListener('message', function(e) { console.log('got ' + e.data + ' ' + (e.origin === 'http://example.com')) });"
+              "document.getElementById('ask').addEventListener('click', function() { document.getElementById('f').contentWindow.postMessage('hello', '*') })</script></body></html>");
+    const uint32_t input = node_of_text(page, "[ ");   // (the first control of the frame)
+    CHECK(input >> 24 == 1);
+    page.click(input, 0, 0);
+    CHECK(page.has_focus());
+    type_text(page, "abc");
+    CHECK(page_text(page, 60).find("[abc|") != std::string::npos);
+    page.click(node_of_text(page, "[ Press ]"), 0, 0);
+    page.run_due_timers(1e18);
+    CHECK(page_log(page) == "got clicked abc true");
+    page.click(serial_of(page, "ask"), 0, 0);
+    CHECK(page.focused() && page.focused()->serial == serial_of(page, "ask"));   // (the focus left the frame)
+    page.run_due_timers(1e18);   // (the message goes to the frame, whose answer comes in the same turn or the next)
+    page.run_due_timers(1e18);
+    CHECK(page_log(page) == "got clicked abc true | got echo:hello true");
+  }
+  CHECK(a.live == 0);
+  {   // a sandboxed frame runs no scripts; contentWindow and window.parent
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe sandbox srcdoc=\"<p>quiet</p><script>parent.postMessage('x', '*')</script>\"></iframe><script>"
+              "window.addEventListener('message', function(e) { console.log('message ' + e.data) });"
+              "console.log(window.parent === window, typeof document.querySelector('iframe').contentWindow.postMessage, document.querySelector('iframe').contentDocument)</script></body></html>");
+    page.run_due_timers(1e18);
+    CHECK(page_log(page) == "true function null");
+    CHECK(page_text(page, 60).find("quiet") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // following a link in a frame moves the frame
+    FakeEnvironment env(a);
+    env.files["http://example.com/next.html"] = "<p>the next page</p>";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe srcdoc=\"<a href='next.html'>go on</a>\"></iframe></body></html>");
+    page.click(node_of_text(page, "go on"), 0, 0);
+    const std::string text = page_text(page, 60);
+    CHECK(env.navigations.empty() && text.find("the next page") != std::string::npos && text.find("go on") == std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
+// Paints the nth svg of a page (w x h) into a surface and gives the pixel at (x, y) of it.
+static uint32_t svg_pixel(TestAllocator& a, Page& page, uint32_t w, uint32_t h, int32_t x, int32_t y, uint32_t which = 0) {
+  HtmlDocument doc(page.document().allocator());
+  page.render(&doc);
+  const Run* run = find_object(doc, ObjectKind::Svg, which);
+  if (!run) return 0x12345678u;
+  Surface32 target(a, w + 2, h + 2);
+  graphics::SoftwareRenderer2D renderer(target.surface);
+  renderer.fill_rect({0, 0, w + 2, h + 2}, 0xFFFFFFFFu);
+  page.objects().paint_object(renderer, run->node, ObjectKind::Svg, 0, 0, w, h, Rect2D{0, 0, w + 2, h + 2});
+  return target.at(x, y);
+}
+
+static void test_svg() {
+  TestAllocator a;
+  MediaEnvironment media;
+  {   // shapes, styles, transforms
+    FakeEnvironment env(a);
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><svg width=40 height=30><rect width=40 height=30 fill=\"#ff0000\"/><circle cx=20 cy=15 r=8 style=\"fill:blue\"/></svg>"
+              "<svg width=40 height=30 viewBox=\"0 0 4 3\"><g transform=\"translate(1 1)\" fill=green><rect width=2 height=1 /></g><polygon points=\"0,3 1,1 2,3\" fill=#ffff00 /></svg>"
+              "<svg width=40 height=30><path d=\"M0 0 H40 V10 H0 Z\" fill=black /><path d=\"M5 20 L35 20\" stroke=#00ff00 stroke-width=6 /><ellipse cx=20 cy=26 rx=10 ry=3 fill=none stroke=red /></svg>"
+              "<p>after</p></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    const Run* first = find_object(doc, ObjectKind::Svg, 0);
+    CHECK(first && first->object_w == 40 && first->object_h == 30);
+    CHECK(svg_pixel(a, page, 40, 30, 3, 3, 0) == 0xFFFF0000u && svg_pixel(a, page, 40, 30, 20, 15, 0) == 0xFF0000FFu && svg_pixel(a, page, 40, 30, 38, 28, 0) == 0xFFFF0000u);
+    CHECK(svg_pixel(a, page, 40, 30, 15, 15, 1) == 0xFF008000u && svg_pixel(a, page, 40, 30, 35, 5, 1) == 0xFFFFFFFFu && svg_pixel(a, page, 40, 30, 10, 28, 1) == 0xFFFFFF00u);
+    CHECK(svg_pixel(a, page, 40, 30, 20, 5, 2) == 0xFF000000u && svg_pixel(a, page, 40, 30, 20, 20, 2) == 0xFF00FF00u && svg_pixel(a, page, 40, 30, 20, 13, 2) == 0xFFFFFFFFu);
+    CHECK(page_text(page, 60).find("after") != std::string::npos);
+  }
+  {   // gradients, rounded rectangles, arcs, use and defs, text
+    FakeEnvironment env(a);
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><svg width=40 height=20><defs><linearGradient id=g x1=0 y1=0 x2=1 y2=0><stop offset=0 stop-color=#ff0000 /><stop offset=1 stop-color=#0000ff /></linearGradient>"
+              "<rect id=box width=10 height=10 fill=#00ff00 /></defs><rect width=40 height=10 fill=\"url(#g)\" /><use href=\"#box\" x=0 y=10 /></svg>"
+              "<svg width=40 height=40><rect width=40 height=40 rx=20 ry=20 fill=#000000 /><path d=\"M10 20 A10 10 0 0 1 30 20\" fill=none stroke=#ff00ff stroke-width=4 /></svg>"
+              "<svg width=60 height=20><text x=2 y=14 font-size=14 fill=#000000>Hi</text></svg></body></html>");
+    const uint32_t left = svg_pixel(a, page, 40, 20, 2, 4, 0), right = svg_pixel(a, page, 40, 20, 37, 4, 0);
+    CHECK(((left >> 16) & 255) > 200 && (left & 255) < 60 && (right & 255) > 190 && ((right >> 16) & 255) < 60);
+    CHECK(svg_pixel(a, page, 40, 20, 5, 15, 0) == 0xFF00FF00u && svg_pixel(a, page, 40, 20, 20, 15, 0) == 0xFFFFFFFFu);
+    CHECK(svg_pixel(a, page, 40, 40, 20, 20, 1) == 0xFF000000u && svg_pixel(a, page, 40, 40, 1, 1, 1) == 0xFFFFFFFFu && svg_pixel(a, page, 40, 40, 20, 10, 1) == 0xFFFF00FFu);
+    bool ink = false;
+    for (int32_t y = 0; y < 20; ++y)
+      for (int32_t x = 0; x < 30; ++x) ink = ink || svg_pixel(a, page, 60, 20, x, y, 2) != 0xFFFFFFFFu;
+    CHECK(ink);
+  }
+  {   // a script changes it; an <img> of an svg file; display none
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/dot.svg"] = "<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"><rect width=\"20\" height=\"20\" fill=\"#0000ff\"/></svg>";
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><svg id=s width=20 height=20><rect id=r width=20 height=20 fill=red /><circle r=5 cx=5 cy=5 display=none /></svg><img src=dot.svg id=i>"
+              "<script>document.getElementById('r').setAttribute('fill', 'lime')</script></body></html>");
+    CHECK(svg_pixel(a, page, 20, 20, 10, 10, 0) == 0xFF00FF00u);
+    HtmlDocument doc(a);
+    page.render(&doc);
+    const Run* img = find_object(doc, ObjectKind::Image, 0);
+    CHECK(img && img->object_w == 20);
+    Surface32 target(a, 22, 22);
+    graphics::SoftwareRenderer2D renderer(target.surface);
+    page.objects().paint_object(renderer, img->node, ObjectKind::Image, 0, 0, 20, 20, Rect2D{0, 0, 22, 22});
+    CHECK(target.at(10, 10) == 0xFF0000FFu);
+  }
+  CHECK(a.live == 0);
+}
+
+static std::string value_of(Page& page, const char* id) {
+  String v(page.document().allocator());
+  dom::get_value(page.document().element_by_id(id), &v);
+  return std::string(v.data(), v.size());
+}
+
+static void test_input_more() {
+  TestAllocator a;
+  MediaEnvironment media;
+  {   // the caret and the selection
+    FakeEnvironment env(a);
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form><input id=t><textarea id=a rows=3 cols=10></textarea><input id=n type=number></form></body></html>");
+    page.click(serial_of(page, "t"), 0, 0);
+    type_text(page, "hello");
+    page.key(Page::FormKey::Left, 0, 0);
+    page.key(Page::FormKey::Left, 0, 0);
+    type_text(page, "X");
+    CHECK(value_of(page, "t") == "helXlo");
+    CHECK(page_text(page, 60).find("[helX|lo") != std::string::npos);
+    page.key(Page::FormKey::Home, 0, 0);
+    page.key(Page::FormKey::Delete, 0, 0);
+    CHECK(value_of(page, "t") == "elXlo");
+    page.key(Page::FormKey::End, 0, 0);
+    page.key(Page::FormKey::Backspace, 0, 0);
+    CHECK(value_of(page, "t") == "elXl");
+    page.key(Page::FormKey::Left, 0, 1);
+    page.key(Page::FormKey::Left, 0, 1);
+    uint32_t s, e, c;
+    dom::get_selection(page.document().element_by_id("t"), &s, &e, &c);
+    CHECK(s == 1 + 1 && e == 4 && c == 2);   // (shift + arrows: "Xl" is selected)
+    CHECK(page_text(page, 60).find("[el") != std::string::npos);
+    type_text(page, "Q");   // (typing replaces the selection)
+    CHECK(value_of(page, "t") == "elQ");
+    page.key(Page::FormKey::Character, 'a', 2);   // Ctrl+A
+    dom::get_selection(page.document().element_by_id("t"), &s, &e, &c);
+    CHECK(s == 0 && e == 3);
+    page.key(Page::FormKey::Character, 'c', 2);
+    CHECK(env.clip == "elQ");
+    page.key(Page::FormKey::Character, 'x', 2);
+    CHECK(value_of(page, "t").empty() && env.clip == "elQ");
+    env.clip = "one\ntwo";
+    page.key(Page::FormKey::Character, 'v', 2);
+    CHECK(value_of(page, "t") == "one two");
+    // a textarea: lines, the caret moves up and down
+    page.click(serial_of(page, "a"), 0, 0);
+    page.key(Page::FormKey::Character, 'v', 2);
+    CHECK(value_of(page, "a") == "one\ntwo");
+    page.key(Page::FormKey::Up, 0, 0);
+    type_text(page, "!");
+    CHECK(value_of(page, "a") == "one!\ntwo");
+    page.key(Page::FormKey::Down, 0, 0);
+    type_text(page, "?");
+    CHECK(value_of(page, "a") == "one!\ntwo?");
+    // a number field takes only what a number is made of
+    page.click(serial_of(page, "n"), 0, 0);
+    type_text(page, "1a2.5");
+    CHECK(value_of(page, "n") == "12.5");
+  }
+  {   // scripts: selection, indeterminate, color, files
+    FakeEnvironment env(a);
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f><input id=t value=abcdef><input id=c type=checkbox><input id=col type=color value=#000000><input id=file type=file name=up></form><script>"
+              "var t = document.getElementById('t'), r = [];"
+              "t.setSelectionRange(1, 3); r.push(t.selectionStart, t.selectionEnd); t.setRangeText('XY'); r.push(t.value, t.selectionStart);"
+              "t.select(); r.push(t.selectionStart, t.selectionEnd, document.activeElement === t); t.selectionStart = 2; r.push(t.selectionStart, t.selectionEnd);"
+              "var c = document.getElementById('c'); c.indeterminate = true; r.push(c.indeterminate);"
+              "console.log(r.join(' '))</script></body></html>");
+    CHECK(page_log(page) == "1 3 aXYdef 3 0 6 true 2 6 true");
+    CHECK(page_text(page, 60).find("[-]") != std::string::npos);
+    page.click(serial_of(page, "c"), 0, 0);
+    CHECK(dom::is_checked(page.document().element_by_id("c")) && !(page.document().element_by_id("c")->form_state & dom::kFormIndeterminate));
+    page.click(serial_of(page, "col"), 0, 0);
+    CHECK(value_of(page, "col") == "#ffffff");
+    page.key(Page::FormKey::Down, 0, 0);
+    CHECK(value_of(page, "col") == "#ff0000");
+    // a file input
+    page.click(serial_of(page, "file"), 0, 0);
+    CHECK(env.picks.size() == 1 && env.picks[0] == serial_of(page, "file"));
+    CHECK(page_text(page, 60).find("No file chosen") != std::string::npos);
+    const char bytes[] = "hello\0file";
+    page.file_chosen(env.picks[0], "note.txt", "text/plain", ConstByteView(reinterpret_cast<const uint8_t*>(bytes), 10));
+    CHECK(page_text(page, 60).find("note.txt") != std::string::npos && value_of(page, "file") == "C:\\fakepath\\note.txt");
+    dom::Node* form = page.document().element_by_id("f");
+    List<dom::Entry> entries(a);
+    CHECK(dom::form_entries(form, nullptr, &entries) && entries.count() >= 1);
+    bool found = false;
+    for (uint64_t i = 0; i < entries.count(); ++i)
+      if (entries[i].file && entries[i].name.view().equals("up") && entries[i].filename.view().equals("note.txt") && entries[i].value.size() == 10 && entries[i].content_type.view().equals("text/plain")) found = true;
+    CHECK(found);
+    String body(a);
+    CHECK(dom::encode_multipart(entries, "BOUND", &body) && body.view().contains("filename=\"note.txt\"\r\nContent-Type: text/plain\r\n\r\nhello"));
+    CHECK(dom::encode_urlencoded(entries, &body) && body.view().contains("up=note.txt"));
+  }
+  {   // dates and times
+    FakeEnvironment env(a);
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><form id=f action=/d><input id=d type=date value=2024-02-28 max=2024-03-01><input id=m type=month value=2024-12><input id=w type=week value=2024-W52>"
+              "<input id=t type=time value=23:59><input id=l type=datetime-local value=2024-12-31T23:59><button id=b>go</button></form></body></html>");
+    page.click(serial_of(page, "d"), 0, 0);
+    page.key(Page::FormKey::Up, 0, 0);
+    CHECK(value_of(page, "d") == "2024-02-29");
+    page.key(Page::FormKey::Up, 0, 0);
+    CHECK(value_of(page, "d") == "2024-03-01");
+    page.key(Page::FormKey::Up, 0, 0);
+    CHECK(value_of(page, "d") == "2024-03-02");
+    page.click(serial_of(page, "b"), 0, 0);
+    CHECK(env.navigations.empty() && page_text(page, 80).find("less than or equal to 2024-03-01") != std::string::npos);
+    page.click(serial_of(page, "m"), 0, 0);
+    page.key(Page::FormKey::Up, 0, 0);
+    CHECK(value_of(page, "m") == "2025-01");
+    page.click(serial_of(page, "w"), 0, 0);
+    page.key(Page::FormKey::Up, 0, 0);
+    CHECK(value_of(page, "w") == "2025-W01");
+    page.key(Page::FormKey::Down, 0, 0);
+    page.key(Page::FormKey::Down, 0, 0);
+    CHECK(value_of(page, "w") == "2024-W51");
+    page.click(serial_of(page, "t"), 0, 0);
+    page.key(Page::FormKey::Up, 0, 0);
+    CHECK(value_of(page, "t") == "00:00");
+    page.click(serial_of(page, "l"), 0, 0);
+    page.key(Page::FormKey::Up, 0, 0);
+    CHECK(value_of(page, "l") == "2025-01-01T00:00");
+    // typing something that is not a date
+    page.click(serial_of(page, "d"), 0, 0);
+    for (int i = 0; i < 10; ++i) page.key(Page::FormKey::Backspace, 0, 0);
+    type_text(page, "tomorrow");
+    page.click(serial_of(page, "b"), 0, 0);
+    CHECK(env.navigations.empty() && page.document().element_by_id("d")->form_state & dom::kFormFocused);
+  }
+  {   // a datalist offers values as the user types; a click takes one
+    FakeEnvironment env(a);
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><input id=f list=fruit><datalist id=fruit><option value=apple><option value=apricot label=Sweet><option value=banana></datalist><script>"
+              "console.log(document.getElementById('f').list.id)</script></body></html>");
+    CHECK(page_log(page) == "fruit");
+    page.click(serial_of(page, "f"), 0, 0);
+    type_text(page, "ap");
+    std::string text = page_text(page, 60);
+    CHECK(text.find("apple") != std::string::npos && text.find("apricot - Sweet") != std::string::npos && text.find("banana") == std::string::npos);
+    page.click(node_of_text(page, "apricot"), 0, 0);
+    CHECK(value_of(page, "f") == "apricot" && page_text(page, 60).find("apple") == std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_table_wrap() {
+  TestAllocator a;
+  FakeEnvironment env(a);
+  MediaEnvironment media;
+  media.width = 16 * 8;
+  media.height = 400;
+  Page page(a, env, "http://example.com/", media, true);
+  page.load("<html><body><table><tr><td>one two three four</td><td>x</td></tr></table></body></html>");
+  CHECK(page_text(page, 16) == "one two      | x\nthree four   |");
+}
+
 static void test_forms() {
   TestAllocator a;
   const char* kForm =
@@ -1246,6 +1623,12 @@ int main() {
   test_video();
   test_audio();
   test_forms();
+  test_table_wrap();
+  test_details_and_dialog();
+  test_template();
+  test_iframe();
+  test_svg();
+  test_input_more();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

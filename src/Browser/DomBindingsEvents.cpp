@@ -217,6 +217,13 @@ void fill_event(DomBindings::Impl& c, JsObject* e, StringView type, const EventI
     vm.define_named(e, "charCode", num_value(0));
     vm.define_named(e, "repeat", bool_value(false));
   }
+  if (type.equals("message")) {
+    vm.define_named(e, "data", str_value(vm, init.message_data));
+    vm.define_named(e, "origin", str_value(vm, init.message_origin));
+    vm.define_named(e, "lastEventId", str_value(vm, ""));
+    vm.define_named(e, "source", Value::make_null());
+    vm.define_named(e, "ports", Value::make_object(vm.new_array()));
+  }
   if (type.equals("submit")) vm.define_named(e, "submitter", node_value(c, init.submitter));
 }
 

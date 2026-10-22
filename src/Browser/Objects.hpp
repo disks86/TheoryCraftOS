@@ -33,6 +33,7 @@
 // across a sequence of calls through Lock).
 #pragma once
 #include "Browser/Canvas.hpp"
+#include "Browser/Svg.hpp"
 #include "Browser/ObjectTypes.hpp"
 #include "Browser/Media.hpp"
 #include "Dom/Dom.hpp"
@@ -209,6 +210,13 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     Scaled scaled, poster_scaled;
     int64_t position_us = 0;
   };
+  struct SvgSlot {
+    SvgSlot() = default;
+    uint32_t serial = 0, width = 0, height = 0;
+    uint64_t version = 0;       // the version of the document it was drawn for
+    bool seen = false;
+    UniquePointer<CanvasBitmap> bitmap;
+  };
   struct CanvasSlot {
     CanvasSlot() = default;
     uint32_t serial = 0;
@@ -219,6 +227,8 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   ImageSlot* find_image(uint32_t serial);
   VideoSlot* find_video(uint32_t serial);
   CanvasSlot* find_canvas(uint32_t serial);
+  SvgSlot* find_svg(uint32_t serial);
+  void sync_svg(dom::Document& doc, dom::Node* n);
   CanvasSlot* find_canvas_slot(uint32_t serial);
   int32_t load_image_url(IObjectEnvironment& env, StringView url, bool* failed);
   void sync_image(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched);
@@ -237,6 +247,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   List<UniquePointer<ImageSlot>> images_;
   List<UniquePointer<VideoSlot>> videos_;
   List<UniquePointer<CanvasSlot>> canvases_;
+  List<UniquePointer<SvgSlot>> svgs_;
   List<Event> events_;
   uint64_t canvas_pixels_ = 0, now_ms_ = 0;
   uint32_t fetched_images_ = 0;

@@ -58,6 +58,7 @@ struct Run {
   uint32_t node = 0;                 // the serial of the element the text is in (dom::Node::serial), 0 for none
   // A picture, video or canvas instead of text: object is an ObjectKind (0: none); object_w x object_h pixels is the size it asks for (the layout fits it
   // in the line), or object_pct percent of the width of the page's lines when that is not 0 (then the height follows from the shape of object_w x object_h).
+  uint8_t exact = 0;                 // 1: the text is placed as it is (spaces kept, line breaks at \n) without being shaded like code: table cells
   uint8_t object = 0, object_pct = 0;
   uint16_t object_w = 0, object_h = 0;
 };

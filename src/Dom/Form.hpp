@@ -40,6 +40,8 @@ enum FormStateBit : uint8_t {
   kFormCheckedDirty = 2,   // the checkedness / selectedness was changed (kFormChecked is it)
   kFormChecked = 4,
   kFormFocused = 8,
+  kFormIndeterminate = 64, // a checkbox in neither state
+  kFormModal = 32,         // a <dialog> opened with showModal()
   kFormEdited = 16,        // the user typed in it (that is what makes maxlength / minlength count)
 };
 
@@ -84,16 +86,40 @@ void select_all_off(Node* select);
 void reset_control(Node* control);
 void reset_form(Node* form);
 
+// --- Text selection (a text field or textarea; positions are bytes of the value)
+// The selection and where the caret is, kept within the text. start <= end; the caret is one of them.
+void get_selection(const Node* control, uint32_t* start, uint32_t* end, uint32_t* caret);
+void set_selection(Node* control, uint32_t start, uint32_t end);   // the caret goes to the end of it
+// Replaces the selection with `text` (inserts it at the caret if nothing is selected); the caret goes after it. The user typed it (maxlength counts).
+bool replace_selection(Node* control, StringView text, bool user = true);
+// Backspace (direction -1) and Delete (+1): removes the selection, else the character before / after the caret.
+bool delete_selection(Node* control, int direction);
+// Moves the caret by `delta` characters (INT32_MIN: to the start, INT32_MAX: to the end); `extend` keeps the other end of the selection where it was.
+void move_caret(Node* control, int32_t delta, bool extend);
+
+// --- Files (a file input holds what was chosen: name, type and bytes)
+bool add_file(Node* input, StringView name, StringView type, ConstByteView bytes, bool replace);
+uint32_t file_count(const Node* input);
+bool file_at(const Node* input, uint32_t index, StringView* name, StringView* type, StringView* bytes);
+void clear_files(Node* input);
+
 // --- Submission
 struct Entry {
-  explicit Entry(allocators::IAllocator& a) : name(a), value(a) {}
-  String name, value;
+  explicit Entry(allocators::IAllocator& a) : name(a), value(a), filename(a), content_type(a) {}
+  String name, value;   // (a file: value is its bytes)
+  bool file = false;
+  String filename, content_type;
 };
 // What submitting `form` with `submitter` (a button, or nullptr) sends. False if memory ran out.
 bool form_entries(const Node* form, const Node* submitter, List<Entry>* out);
 bool encode_urlencoded(const List<Entry>& entries, String* out);                              // name=value&name=value, as application/x-www-form-urlencoded
 bool encode_multipart(const List<Entry>& entries, StringView boundary, String* out);          // multipart/form-data
-bool encode_plain(const List<Entry>& entries, String* out);                                   // text/plain
+bool encode_plain(const List<Entry>& entries, String* out);
+// The colors a color input steps through, and the one after (before) `current`.
+void next_color(StringView current, int direction, String* out);
+// Date and time fields: the value `steps` steps (days, months, weeks, minutes) away; false if the field is not one of those or the value is not valid.
+bool step_date(Node* input, int32_t steps);
+bool valid_date_text(InputType type, StringView text);                                   // text/plain
 bool url_encode(StringView text, String* out);                                                // one component (space is "+")
 
 // --- Validity

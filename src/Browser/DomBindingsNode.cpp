@@ -64,7 +64,7 @@ const ReflectedAttribute kReflected[] = {
     {"span", "span", Reflect::Int}, {"min", "min", Reflect::Str}, {"max", "max", Reflect::Str}, {"step", "step", Reflect::Str}, {"pattern", "pattern", Reflect::Str},
     {"autocomplete", "autocomplete", Reflect::Str}, {"media", "media", Reflect::Str}, {"role", "role", Reflect::Str}, {"srcset", "srcset", Reflect::Str},
     {"label", "label", Reflect::Str}, {"scope", "scope", Reflect::Str}, {"headers", "headers", Reflect::Str}, {"enctype", "enctype", Reflect::Str},
-    {"noValidate", "novalidate", Reflect::Bool}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::Str},
+    {"noValidate", "novalidate", Reflect::Bool}, {"srcdoc", "srcdoc", Reflect::Str}, {"sandbox", "sandbox", Reflect::Str}, {"allow", "allow", Reflect::Str}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::Str},
 };
 
 const ReflectedAttribute* find_reflected(StringView js) {
@@ -316,6 +316,10 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (IS("contentEditable")) { *out = str_value(vm, "inherit"); return true; }
   if (IS("draggable") || IS("spellcheck")) { *out = bool_value(false); return true; }
   if (IS("sheet")) { *out = Value::make_null(); return true; }
+  if (element && IS("content") && n->is_tag("template")) {
+    *out = node_value(c, dom::template_content(n));
+    return true;
+  }
   if (element && is_form_element(n) && form_get(c, n, k, out)) return true;
   if (IS("form")) {
     dom::Node* f = nullptr;

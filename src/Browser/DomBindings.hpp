@@ -91,6 +91,12 @@ class IDomHost {
   virtual void submit_form(dom::Node* form, dom::Node* submitter, bool interactive) = 0;
   // form.reset(): a cancelable `reset` event, then every control goes back to its markup.
   virtual void reset_form(dom::Node* form) = 0;
+  // <dialog>: show(), showModal() and close(returnValue) (nullptr: leave the return value as it was); `close` fires when it was open.
+  virtual void show_dialog(dom::Node* dialog, bool modal) = 0;
+  virtual void close_dialog(dom::Node* dialog, const char* return_value) = 0;
+  // Frames: window.postMessage() (target -1), parent.postMessage() (0) and iframe.contentWindow.postMessage() (the serial of the <iframe>). Is this page in a frame?
+  virtual void post_message(int32_t target, StringView data) = 0;
+  virtual bool in_frame() = 0;
   // Shows what is wrong with a control (reportValidity()); true if nothing is.
   virtual bool report_validity(dom::Node* control) = 0;
 
@@ -109,6 +115,8 @@ struct EventInit {
   bool ctrl = false, shift = false, alt = false;
   // A submit event: the button that was pressed (nullptr: none).
   dom::Node* submitter = nullptr;
+  // A message event: what was sent and where from.
+  StringView message_data, message_origin;
 };
 
 class DomBindings {

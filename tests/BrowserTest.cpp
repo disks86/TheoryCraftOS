@@ -72,6 +72,40 @@ static bool page_is(const char* html, uint32_t columns, const char* expected) {
   return ok && a.live == 0;
 }
 
+static void test_tables() {
+  // columns line up, the last one is not padded
+  CHECK(page_is("<table><tr><td>a</td><td>longer</td></tr><tr><td>bbb</td><td>c</td></tr></table>", 40, "a   | longer\nbbb | c"));
+  // headers are centred; the header, body and foot come in that order wherever they are written
+  CHECK(page_is("<table><tfoot><tr><td>f</td></tr></tfoot><tbody><tr><td>b</td></tr></tbody><thead><tr><th>head</th></tr></thead></table>", 40, "head\nb\nf"));
+  CHECK(page_is("<table><tr><th>ab</th><th>cd</th></tr><tr><td>xxxxxx</td><td>y</td></tr></table>", 40, "  ab   | cd\nxxxxxx | y"));
+  // colspan and rowspan
+  CHECK(page_is("<table><tr><td colspan=2>wide cell</td></tr><tr><td>a</td><td>b</td></tr></table>", 40, "wide cell\na | b"));
+  CHECK(page_is("<table><tr><td rowspan=2>x</td><td>1</td></tr><tr><td>2</td></tr></table>", 40, "x | 1\n  | 2"));
+  // a caption is above the table
+  CHECK(page_is("<table><caption>Title</caption><tr><td>a</td></tr></table>", 9, "  Title\n\na"));
+  // a border draws the lines
+  CHECK(page_is("<table border=1><tr><td>a</td><td>bb</td></tr><tr><td>c</td><td>d</td></tr></table>", 40,
+                "+---+----+\n| a | bb |\n+---+----+\n| c | d  |\n+---+----+"));
+  // valign
+  CHECK(page_is("<table><tr><td>1<br>2<br>3</td><td valign=middle>m</td><td valign=bottom>b</td></tr></table>", 40, "1 |   |\n2 | m |\n3 |   | b"));
+  // links and bold inside cells keep what they are
+  {
+    TestAllocator a;
+    HtmlDocument doc(a);
+    doc.parse_html("<table><tr><td><a href=/x>go</a></td><td><b>bold</b> text</td></tr></table>");
+    bool link = false, bold = false;
+    for (uint64_t i = 0; i < doc.run_count(); ++i) {
+      if (doc.run_text(i).equals("go") && doc.run(i).link >= 0 && doc.link(static_cast<uint32_t>(doc.run(i).link)).equals("/x")) link = true;
+      if (doc.run_text(i).equals("bold") && (doc.run(i).flags & kRunBold)) bold = true;
+    }
+    CHECK(link && bold);
+  }
+  // a nested table
+  CHECK(page_is("<table><tr><td><table><tr><td>a</td><td>b</td></tr></table></td><td>c</td></tr></table>", 40, "a | b | c"));
+  // pictures in a cell: the table flows as it did
+  CHECK(page_is("<table><tr><td>1</td><td>2</td></tr></table>", 40, "1 | 2"));
+}
+
 static void test_text() {
   CHECK(page_is("hello", 40, "hello"));
   CHECK(page_is("  hello \n\t world  ", 40, "hello world"));
@@ -423,6 +457,7 @@ static void test_addresses() {
 
 int main() {
   test_text();
+  test_tables();
   test_blocks();
   test_wrapping();
   test_links();

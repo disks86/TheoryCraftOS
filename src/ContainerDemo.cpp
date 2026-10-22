@@ -17,6 +17,7 @@
  */
 
 #include "ContainerDemo.hpp"
+#include "ObjectContainer/Array.hpp"
 #include "ObjectContainer/BinaryTree.hpp"
 #include "ObjectContainer/Dictionary.hpp"
 #include "ObjectContainer/LinkedList.hpp"
@@ -49,6 +50,19 @@ bool run_container_demo(allocators::Allocator& allocator) {
     // 1 + 4 + ... + 100^2 = 338350, minus 50^2 (the 51st entry, index 50 after the insert), plus -1
     ok &= list.count() == 100 && sum == 338350 - 2500 - 1;
     report("list (100 squares, insert, remove)", ok);
+    all_ok &= ok;
+  }
+  {
+    Array<int, 8> array;  // no allocator: the elements live inside it
+    bool ok = array.count() == 8 && array[7] == 0;
+    array.fill(3);
+    array[2] = 10;
+    int64_t sum = 0;
+    for (int value : array) sum += value;
+    ok &= sum == 7 * 3 + 10 && array.view().size() == 8 && array.get(8) == nullptr;
+    array.clear();
+    ok &= array.count() == 8 && array.back() == 0;
+    report("fixed array (fill, index, iterate, clear)", ok);
     all_ok &= ok;
   }
   {

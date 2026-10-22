@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include "Dom/Entities.hpp"
 #include "Dom/Form.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "Utility/Move.hpp"
 
 namespace browser {
@@ -44,8 +45,8 @@ StringView attr(const dom::Node* n, const char* name) {
 // The defaults of an element's kind (what a browser's own style sheet and the page's old-style attributes say).
 void ua_defaults(const dom::Node* n, Style* s) {
   StringView value;
-  if (tag_in(n, {"head", "title", "meta", "link", "base", "script", "style", "noscript", "template", "datalist", "iframe", "object", "svg",
-                 "area", "param", "source", "track", "dialog", "noembed", "noframes"}))
+  if (tag_in(n, {"head", "title", "meta", "link", "base", "script", "style", "noscript", "template", "datalist", "object",
+                 "area", "param", "source", "track", "noembed", "noframes"}))
     s->display = Display::None;
   if (tag_in(n, {"div", "section", "article", "header", "footer", "nav", "main", "aside", "address", "center", "details", "summary", "caption", "thead", "tbody",
                  "tfoot", "fieldset", "dt", "dd", "legend", "tr", "body", "html", "menu", "dir", "figcaption", "hgroup", "search", "optgroup"}))
@@ -71,7 +72,7 @@ void ua_defaults(const dom::Node* n, Style* s) {
   if (tag_in(n, {"pre", "listing", "xmp"})) s->pre = true;
   if (tag_in(n, {"u", "ins"})) s->underline = true;
   if (tag_in(n, {"s", "strike", "del"})) s->strike = true;
-  if (tag_in(n, {"center"})) s->align = 1;
+  if (tag_in(n, {"center", "caption", "th"})) s->align = 1;
   if (tag_in(n, {"a"}) && dom::has_attribute(n, "href")) s->underline = true;
   if (dom::has_attribute(n, "hidden")) s->display = Display::None;
   if (dom::get_attribute(n, "align", &value)) {
@@ -112,6 +113,13 @@ class DocumentRenderer {
 
   bool run(const dom::Document& doc) {
     const dom::Node* root = doc.root();
+    modal_pass_ = true;   // open modal dialogs come first
+    for (uint32_t serial = 1; serial <= doc.node_count() && !failed_; ++serial) {
+      const dom::Node* d = doc.by_serial(serial);
+      if (d && d->is_tag("dialog") && (d->form_state & dom::kFormModal) && dom::has_attribute(d, "open") && dom::is_connected(d)) walk(d);
+    }
+    flush();
+    modal_pass_ = false;
     const dom::Node* n = root->first_child;
     while (n && !out_.truncated_ && !failed_) {
       const bool descend = enter(n);
@@ -249,6 +257,11 @@ class DocumentRenderer {
     const uint64_t last = stack_.count() - 1;
     const Element e = stack_[last];
     stack_.remove_at(last);
+    if (e.node->is_tag("dialog") && !hidden()) {
+      block(2);
+      failed_ |= !out_.add_run(StringView(), kRunRule, 0, 0, pending_, -1, 0, 0, 0, e.node->serial);
+      pending_ = 0;
+    }
     if (e.style.display != Display::Inline && !hidden()) block(static_cast<uint8_t>(1 + e.style.margin_bottom + e.style.padding_bottom));
   }
 
@@ -262,6 +275,8 @@ class DocumentRenderer {
     flush();
     Style s = derive_style(cur(), n, sheet_);
     if (s.display == Display::None) return false;
+    if (n->is_tag("iframe") && !options_.frames) return false;
+    if (n->is_tag("dialog") && (!dom::has_attribute(n, "open") || ((n->form_state & dom::kFormModal) && !modal_pass_))) return false;   // (an open modal dialog is drawn first, apart)
     const bool is_body = tag_in(n, {"body", "html"});
     if (s.own_background) {
       if (is_body) {
@@ -281,6 +296,36 @@ class DocumentRenderer {
     }
     if (!hidden() && s.display != Display::Inline) block(static_cast<uint8_t>(1 + s.margin_top + s.padding_top));
     failed_ |= !stack_.push_back(e);
+    if (n->is_tag("dialog") && !hidden()) {
+      Style& ds = stack_[stack_.count() - 1].style;
+      if (!ds.own_background) {
+        ds.background = 0xFFEEEEEEu;
+        ds.background_block = true;
+      }
+      ds.margin_left = static_cast<uint8_t>(ds.margin_left + 2);
+      ds.indent = static_cast<uint8_t>(ds.indent + 2 < kMaxIndent ? ds.indent + 2 : kMaxIndent);
+      block(2);
+      failed_ |= !out_.add_run(StringView(), kRunRule, 0, 0, out_.runs_.count() == 0 ? 0 : pending_, -1, 0, 0, 0, n->serial);
+      pending_ = 0;
+      block(1);
+    } else if (n->is_tag("details") && !hidden()) {
+      if (!dom::has_attribute(n, "open")) {
+        const dom::Node* summary = nullptr;
+        for (const dom::Node* c = n->first_child; c && !summary; c = c->next)
+          if (c->is_tag("summary")) summary = c;
+        if (summary) walk(summary);
+        else literal("> Details", indent());
+        return false;
+      }
+    } else if (n->is_tag("summary") && !hidden() && n->parent && n->parent->is_tag("details")) {
+      const dom::Node* first = nullptr;
+      for (const dom::Node* c = n->parent->first_child; c && !first; c = c->next)
+        if (c->is_tag("summary")) first = c;
+      if (first == n) {
+        if (!ended_space_) literal(" ", indent());
+        literal(dom::has_attribute(n->parent, "open") ? "v " : "> ", indent());
+      }
+    }
     if (tag_in(n, {"tr"})) {
       stack_[stack_.count() - 1].items = 0;
     } else if (tag_in(n, {"td", "th"})) {
@@ -326,7 +371,7 @@ class DocumentRenderer {
       const uint32_t here = s.indent;
       literal(marker.view(), static_cast<uint8_t>(here >= 3 ? here - 3 : 0));
     }
-    if (objects_ && !hidden() && tag_in(n, {"img", "video", "audio", "canvas"})) {
+    if (objects_ && !hidden() && tag_in(n, {"img", "video", "audio", "canvas", "svg"})) {
       ObjectInfo info;
       if (objects_->object_info(n, &info) && info.kind != ObjectKind::None && (info.ready || info.kind != ObjectKind::Image)) {
         object_run(n, info);
@@ -338,12 +383,483 @@ class DocumentRenderer {
       control(n);
       return false;   // (what is inside a control is its value, not page text)
     }
+    if (n->is_tag("iframe")) {
+      if (!hidden()) frame_content(n);
+      return false;   // (the text inside an iframe is for browsers that have none)
+    }
+    if (!hidden() && n->is_tag("table") && table_depth_ < 5 && render_table(n)) return false;   // (the table is drawn: its rows and cells are not visited again)
     if (dom::is_void_tag(n->name.view())) void_action(n);
     return true;
   }
 
+  // An <iframe>: its page is drawn between two rules, a little in from the left.
+  void frame_content(const dom::Node* n) {
+    uint32_t tag = 0;
+    const HtmlDocument* d = options_.frames->frame_document(n, &tag);
+    if (!d) return;
+    block(2);
+    failed_ |= !out_.add_run(StringView(), kRunRule, 0, 0, out_.runs_.count() == 0 ? 0 : pending_, -1, 0, 0, 0, n->serial);
+    pending_ = 0;
+    List<int32_t> links(out_.allocator());
+    for (uint32_t i = 0; i < d->link_count(); ++i) links.push_back(-2);
+    bool first = true;
+    for (uint64_t i = 0; i < d->run_count() && !failed_; ++i) {
+      const Run& r = d->run(i);
+      const uint32_t indent_here = r.indent + indent() + 2 < kMaxIndent ? r.indent + indent() + 2 : kMaxIndent;
+      const uint8_t breaks = first ? 1 : r.breaks;
+      first = false;
+      const uint32_t node = r.node ? (tag << 24) | r.node : 0;
+      if (r.flags & kRunRule) {
+        failed_ |= !out_.add_run(StringView(), kRunRule, 0, static_cast<uint8_t>(indent_here), breaks, -1, 0, r.color, 0, node);
+        continue;
+      }
+      int32_t link = -1;
+      if (r.link >= 0 && static_cast<uint32_t>(r.link) < links.count()) {
+        if (links[static_cast<uint32_t>(r.link)] == -2) links[static_cast<uint32_t>(r.link)] = out_.add_link(d->link(static_cast<uint32_t>(r.link)));
+        link = links[static_cast<uint32_t>(r.link)];
+      }
+      if (r.object) {   // (a picture, video or canvas of the frame shows as what it is)
+        failed_ |= !out_.add_run(r.object == 2 ? "[video]" : r.object == 3 ? "[canvas]" : r.object == 4 ? "[audio]" : "[image]", 0, 0, static_cast<uint8_t>(indent_here), breaks, link, 0, 0,
+                                 r.background, node);
+        continue;
+      }
+      const StringView text = d->run_text(i);
+      if (text.empty()) continue;
+      failed_ |= !out_.add_run(text, r.flags, r.level, static_cast<uint8_t>(indent_here), breaks, link, r.align, r.color, r.background, node);
+      out_.runs_[out_.runs_.count() - 1].exact = r.exact;
+    }
+    block(2);
+    failed_ |= !out_.add_run(StringView(), kRunRule, 0, 0, pending_, -1, 0, 0, 0, n->serial);
+    pending_ = 0;
+    block(1);
+  }
+
+  // Visits a node and what is below it (the cells of a table are drawn this way).
+  void walk(const dom::Node* n) {
+    const bool descend = enter(n);
+    if (descend)
+      for (const dom::Node* c = n->first_child; c && !failed_; c = c->next) walk(c);
+    if (stack_.count() && stack_[stack_.count() - 1].node == n) pop_element();
+  }
+
+  // --- Tables
+  // A table is a grid of cells that are drawn on their own, one after the other, then fitted together: the columns take the width of what is in them (all
+  // of the page's width, if there is not enough, with the text of the cells wrapped), colspan and rowspan join cells, thead comes first and tfoot last, the
+  // caption is above, and a border attribute draws the lines.
+  struct Seg {
+    explicit Seg(allocators::IAllocator& a) : text(a) {}
+    String text;
+    uint8_t flags = 0, level = 0;
+    uint32_t color = 0, background = 0, node = 0;
+    int32_t link = -1;
+  };
+  struct Cell {
+    explicit Cell(allocators::IAllocator& a) : segs(a), line_end(a), link_map(a) {}
+    const dom::Node* node = nullptr;
+    uint32_t row = 0, col = 0, rowspan = 1, colspan = 1, natural = 0, min_word = 0, width = 0;
+    Style style;
+    uint8_t valign = 0;   // 0 top, 1 middle, 2 bottom
+    UniquePointer<HtmlDocument> doc;
+    List<Seg> segs;
+    List<uint32_t> line_end;   // line i is segs[line_end[i - 1] .. line_end[i])
+    List<int32_t> link_map;    // the cell's links, as links of the page (-2: not added yet)
+    uint32_t lines() const { return static_cast<uint32_t>(line_end.count()); }
+  };
+  static constexpr uint32_t kMaxTableColumns = 24, kMaxTableRows = 400, kMaxTableCells = 2000;
+
+  Style style_in_table(const dom::Node* n, const dom::Node* table, const Style& table_style) {
+    Style s = derive_style(n->parent == table ? table_style : style_in_table(n->parent, table, table_style), n, sheet_);
+    if (s.own_background) s.background = s.own_background_color;
+    s.background_block = false;
+    return s;
+  }
+
+  uint32_t seg_line_width(const Cell& c, uint32_t line) const {
+    uint32_t w = 0;
+    for (uint64_t i = line ? c.line_end[line - 1] : 0; i < c.line_end[line]; ++i) w += static_cast<uint32_t>(c.segs[i].text.size());
+    return w;
+  }
+
+  // Fits the text of a cell (drawn into its own document) into lines `width` columns wide.
+  bool wrap_cell(Cell& c, uint32_t width) {
+    allocators::IAllocator& a = out_.allocator();
+    c.segs.clear();
+    c.line_end.clear();
+    const HtmlDocument& d = *c.doc;
+    uint64_t line_start = 0;
+    uint32_t used = 0;
+    bool first_content = true, carry_space = false;
+    auto has = [&]() { return c.segs.count() > line_start; };
+    auto close_line = [&]() {
+      failed_ |= !c.line_end.push_back(static_cast<uint32_t>(c.segs.count()));
+      line_start = c.segs.count();
+      used = 0;
+    };
+    auto make_seg = [&](const Run& run, StringView text, bool plain) {
+      Seg s(a);
+      s.text.assign(text);
+      if (!plain) {
+        s.flags = static_cast<uint8_t>(run.flags & ~(kRunBlockBg | kRunPre));
+        s.level = run.level;
+        s.color = run.color;
+        s.background = run.background;
+        s.node = run.node;
+        if (run.link >= 0) {
+          const uint32_t l = static_cast<uint32_t>(run.link);
+          if (l < c.link_map.count()) {
+            if (c.link_map[l] == -2) c.link_map[l] = out_.add_link(d.link(l));
+            s.link = c.link_map[l];
+          }
+        }
+      } else {
+        s.node = run.node;
+      }
+      failed_ |= !c.segs.push_back(util::move(s));
+    };
+    int64_t last_run = -1;
+    for (uint64_t r = 0; r < d.run_count() && !failed_; ++r) {
+      const Run& run = d.run(r);
+      const StringView text = d.run_text(r);
+      if (run.object || text.empty()) continue;
+      if (run.breaks >= 1 && has()) close_line();
+      if (run.breaks >= 2 && !first_content) close_line();
+      first_content = false;
+      if ((run.flags & kRunPre) || run.exact) {
+        uint64_t i = 0;
+        bool first = true;
+        while (i <= text.size()) {
+          uint64_t end = text.find('\n', i);
+          if (end == StringView::npos) end = text.size();
+          if (!first) close_line();
+          StringView part = text.substr(i, end - i);
+          if (part.size() > width) part = part.first(width);
+          if (!part.empty()) make_seg(run, part, false);
+          used += static_cast<uint32_t>(part.size());
+          first = false;
+          i = end + 1;
+        }
+        last_run = static_cast<int64_t>(r);
+        carry_space = false;
+        continue;
+      }
+      bool space_before = carry_space;
+      uint64_t i = 0;
+      while (i < text.size()) {
+        if (text[i] == ' ') {
+          space_before = true;
+          ++i;
+          continue;
+        }
+        uint64_t end = i;
+        while (end < text.size() && text[end] != ' ') ++end;
+        StringView word = text.substr(i, end - i);
+        i = end;
+        while (!word.empty()) {
+          const uint32_t chunk = static_cast<uint32_t>(word.size() > width ? width : word.size());
+          const bool gap = has() && space_before;
+          if (has() && used + (gap ? 1 : 0) + chunk > width) {
+            close_line();
+            space_before = false;
+          }
+          if (has() && space_before) {
+            if (last_run == static_cast<int64_t>(r)) {
+              c.segs[c.segs.count() - 1].text.push_back(' ');
+            } else {
+              make_seg(run, " ", true);
+            }
+            ++used;
+          }
+          if (has() && last_run == static_cast<int64_t>(r)) c.segs[c.segs.count() - 1].text.append(word.first(chunk));
+          else make_seg(run, word.first(chunk), false);
+          used += chunk;
+          last_run = static_cast<int64_t>(r);
+          space_before = false;
+          word = word.substr(chunk);
+          if (!word.empty()) close_line();
+        }
+      }
+      carry_space = text[text.size() - 1] == ' ' || (text.size() && space_before && has());
+      last_run = static_cast<int64_t>(r);
+    }
+    if (has() || c.line_end.count() == 0) close_line();
+    return !failed_;
+  }
+
+  // The pieces of the table line being made; when it is finished the spaces at its end are dropped and the pieces become runs.
+  struct LinePiece {
+    explicit LinePiece(allocators::IAllocator& a) : text(a) {}
+    String text;
+    uint8_t flags = 0, level = 0;
+    uint32_t color = 0, background = 0, node = 0;
+    int32_t link = -1;
+  };
+
+  void table_piece(List<LinePiece>& line, StringView text, uint8_t flags, uint8_t level, uint32_t color, uint32_t background, int32_t link, uint32_t node) {
+    if (text.empty()) return;
+    LinePiece p(out_.allocator());
+    p.text.assign(text);
+    p.flags = flags;
+    p.level = level;
+    p.color = color;
+    p.background = background;
+    p.link = link;
+    p.node = node;
+    failed_ |= !line.push_back(util::move(p));
+  }
+
+  void table_spaces(List<LinePiece>& line, uint32_t n, uint32_t background, uint32_t node) {
+    if (n == 0) return;
+    String pad(out_.allocator());
+    for (uint32_t i = 0; i < n; ++i) pad.push_back(' ');
+    table_piece(line, pad.view(), 0, 0, 0, background, -1, node);
+  }
+
+  void table_line(List<LinePiece>& line, bool trim) {
+    while (trim && line.count() > 0) {
+      LinePiece& last = line[line.count() - 1];
+      while (last.text.size() > 0 && last.text[last.text.size() - 1] == ' ') last.text.truncate(last.text.size() - 1);
+      if (last.text.size() > 0) break;
+      line.remove_at(line.count() - 1);
+    }
+    for (uint64_t i = 0; i < line.count(); ++i) {
+      const LinePiece& p = line[i];
+      const uint8_t breaks = i == 0 ? (out_.runs_.count() == 0 ? 0 : pending_ > 1 ? pending_ : 1) : 0;
+      failed_ |= !out_.add_run(p.text.view(), p.flags, p.level, indent(), breaks, p.link, 0, p.color, p.background, p.node);
+      out_.runs_[out_.runs_.count() - 1].exact = 1;
+    }
+    if (line.count() == 0) {   // (an empty line still takes its place)
+      failed_ |= !out_.add_run(" ", 0, 0, indent(), out_.runs_.count() == 0 ? 0 : pending_ > 1 ? pending_ : 1, -1, 0, 0, 0, 0);
+      out_.runs_[out_.runs_.count() - 1].exact = 1;
+    }
+    pending_ = 0;
+    ended_space_ = false;
+    line.clear();
+  }
+
+  bool render_table(const dom::Node* table) {
+    allocators::IAllocator& a = out_.allocator();
+    const Style table_style = cur();
+    // the rows, in the order they are drawn
+    const dom::Node* caption = nullptr;
+    List<const dom::Node*> head(a), body(a), foot(a), rows(a);
+    for (const dom::Node* c = table->first_child; c; c = c->next) {
+      if (!c->is_element()) continue;
+      if (c->is_tag("caption") && !caption) caption = c;
+      else if (c->is_tag("tr")) body.push_back(c);
+      else if (c->is_tag("thead") || c->is_tag("tbody") || c->is_tag("tfoot")) {
+        List<const dom::Node*>& into = c->is_tag("thead") ? head : c->is_tag("tfoot") ? foot : body;
+        for (const dom::Node* r = c->first_child; r; r = r->next)
+          if (r->is_tag("tr")) into.push_back(r);
+      }
+    }
+    for (List<const dom::Node*>* list : {&head, &body, &foot})
+      for (uint64_t i = 0; i < list->count(); ++i) rows.push_back((*list)[i]);
+    if (rows.count() == 0 || rows.count() > kMaxTableRows) return false;
+    // the cells, each in the first free place of its row
+    List<UniquePointer<Cell>> cells(a);
+    List<int32_t> occupied(a);
+    for (uint64_t i = 0; i < rows.count() * kMaxTableColumns; ++i) occupied.push_back(0);
+    uint32_t ncols = 0;
+    for (uint32_t r = 0; r < rows.count(); ++r) {
+      uint32_t col = 0;
+      for (const dom::Node* c = rows[r]->first_child; c; c = c->next) {
+        if (!(c->is_tag("td") || c->is_tag("th"))) continue;
+        while (col < kMaxTableColumns && occupied[r * kMaxTableColumns + col] != 0) ++col;
+        if (col >= kMaxTableColumns || cells.count() >= kMaxTableCells) break;
+        auto cell = UniquePointer<Cell>::make(a, a);
+        if (!cell) return false;
+        cell->node = c;
+        cell->row = r;
+        cell->col = col;
+        uint64_t v;
+        if (attr(c, "colspan").trimmed().parse_uint(&v) && v > 1) cell->colspan = static_cast<uint32_t>(v > kMaxTableColumns ? kMaxTableColumns : v);
+        if (attr(c, "rowspan").trimmed().parse_uint(&v) && v > 1) cell->rowspan = static_cast<uint32_t>(v > 64 ? 64 : v);
+        if (col + cell->colspan > kMaxTableColumns) cell->colspan = kMaxTableColumns - col;
+        if (r + cell->rowspan > rows.count()) cell->rowspan = static_cast<uint32_t>(rows.count()) - r;
+        const int32_t id = static_cast<int32_t>(cells.count()) + 1;
+        for (uint32_t y = 0; y < cell->rowspan; ++y)
+          for (uint32_t x = 0; x < cell->colspan; ++x) occupied[(r + y) * kMaxTableColumns + col + x] = id;
+        col += cell->colspan;
+        if (col > ncols) ncols = col;
+        const StringView va = attr(c, "valign").trimmed();
+        cell->valign = va.equals_ignore_case("middle") ? 1 : va.equals_ignore_case("bottom") ? 2 : 0;
+        cells.push_back(util::move(cell));
+      }
+    }
+    if (cells.count() == 0 || ncols == 0) return false;
+    // each cell is drawn into a document of its own
+    for (uint64_t i = 0; i < cells.count(); ++i) {
+      Cell& c = *cells[i];
+      c.doc = UniquePointer<HtmlDocument>::make(a, a);
+      if (!c.doc) return false;
+      DocumentRenderer sub(*c.doc, sheet_, options_);
+      sub.root_ = style_in_table(c.node->parent, table, table_style);
+      sub.table_depth_ = table_depth_ + 1;
+      sub.walk(c.node);
+      sub.flush();
+      if (sub.failed_) return false;
+      c.style = style_in_table(c.node, table, table_style);
+      for (uint64_t k = 0; k < c.doc->run_count(); ++k)
+        if (c.doc->run(k).object) return false;   // (a picture in a cell cannot be fitted into text columns: the table is left to flow)
+      for (uint32_t k = 0; k < c.doc->link_count(); ++k) c.link_map.push_back(-2);
+      if (!wrap_cell(c, 0x7FFFFFFF)) return false;
+      for (uint32_t l = 0; l < c.lines(); ++l) c.natural = seg_line_width(c, l) > c.natural ? seg_line_width(c, l) : c.natural;
+      for (uint64_t k = 0; k < c.doc->run_count(); ++k) {
+        const Run& run = c.doc->run(k);
+        const StringView t = c.doc->run_text(k);
+        uint64_t word = 0;
+        for (uint64_t j = 0; j <= t.size(); ++j) {
+          const bool cut = j == t.size() || t[j] == ' ' || ((run.flags & kRunPre) && t[j] == '\n') || (run.exact && t[j] == '\n');
+          if (cut) {
+            if (word > c.min_word) c.min_word = static_cast<uint32_t>(word);
+            word = 0;
+          } else {
+            ++word;
+          }
+        }
+      }
+    }
+    // the widths of the columns
+    StringView border_value;
+    const bool grid = dom::get_attribute(table, "border", &border_value) && !border_value.trimmed().empty() && !border_value.trimmed().equals("0");
+    const uint32_t page_columns = options_.media.width > 0 ? static_cast<uint32_t>(options_.media.width) / 8 : 80;
+    const uint32_t frame = grid ? ncols * 3 + 1 : (ncols - 1) * 3;
+    const uint32_t room = page_columns > indent() + frame + ncols ? page_columns - indent() - frame : ncols;
+    List<uint32_t> natural(a), minimum(a), width(a);
+    for (uint32_t c = 0; c < ncols; ++c) {
+      natural.push_back(1);
+      minimum.push_back(1);
+      width.push_back(1);
+    }
+    for (uint64_t i = 0; i < cells.count(); ++i)
+      if (cells[i]->colspan == 1) {
+        const Cell& c = *cells[i];
+        if (c.natural > natural[c.col]) natural[c.col] = c.natural;
+        if (c.min_word > minimum[c.col]) minimum[c.col] = c.min_word;
+      }
+    for (uint64_t i = 0; i < cells.count(); ++i) {
+      const Cell& c = *cells[i];
+      if (c.colspan == 1) continue;
+      uint32_t have_nat = 0, have_min = 0;
+      for (uint32_t x = 0; x < c.colspan; ++x) have_nat += natural[c.col + x], have_min += minimum[c.col + x];
+      have_nat += 3 * (c.colspan - 1);
+      have_min += 3 * (c.colspan - 1);
+      if (c.natural > have_nat) natural[c.col + c.colspan - 1] += c.natural - have_nat;
+      if (c.min_word > have_min) minimum[c.col + c.colspan - 1] += c.min_word - have_min;
+    }
+    uint32_t total_nat = 0, total_min = 0;
+    for (uint32_t c = 0; c < ncols; ++c) total_nat += natural[c], total_min += minimum[c];
+    for (uint32_t c = 0; c < ncols; ++c) width[c] = natural[c];
+    if (total_nat > room) {
+      uint32_t extra = room > total_min ? room - total_min : 0, flexible = total_nat - total_min;
+      for (uint32_t c = 0; c < ncols; ++c) {
+        const uint32_t want = natural[c] - minimum[c];
+        const uint32_t give = flexible ? static_cast<uint32_t>(static_cast<uint64_t>(extra) * want / flexible) : 0;
+        width[c] = minimum[c] + (give > want ? want : give);
+      }
+    }
+    // the cells are fitted into their widths and the rows get their heights
+    List<uint32_t> height(a);
+    for (uint64_t r = 0; r < rows.count(); ++r) height.push_back(1);
+    for (uint64_t i = 0; i < cells.count(); ++i) {
+      Cell& c = *cells[i];
+      c.width = 3 * (c.colspan - 1);
+      for (uint32_t x = 0; x < c.colspan; ++x) c.width += width[c.col + x];
+      if (!wrap_cell(c, c.width ? c.width : 1)) return false;
+      if (c.rowspan == 1 && c.lines() > height[c.row]) height[c.row] = c.lines();
+    }
+    for (uint64_t i = 0; i < cells.count(); ++i) {
+      const Cell& c = *cells[i];
+      if (c.rowspan == 1) continue;
+      uint32_t have = grid ? c.rowspan - 1 : 0;
+      for (uint32_t y = 0; y < c.rowspan; ++y) have += height[c.row + y];
+      if (c.lines() > have) height[c.row + c.rowspan - 1] += c.lines() - have;
+    }
+    List<uint32_t> top(a);   // the first line of each row (a rule above it is not counted)
+    uint32_t y = grid ? 1 : 0;
+    for (uint64_t r = 0; r < rows.count(); ++r) {
+      top.push_back(y);
+      y += height[r] + (grid ? 1 : 0);
+    }
+    const uint32_t total_lines = y;
+    // --- drawing
+    if (caption) {
+      walk(caption);
+      block(1);
+    }
+    block(2);
+    const uint32_t table_node = table->serial;
+    List<LinePiece> line_pieces(a);
+    for (uint32_t line = 0; line < total_lines && !failed_; ++line) {
+      // is this line a rule (between rows)? `below` is the row under it
+      bool rule = false;
+      uint32_t row = 0, below = 0;
+      for (uint32_t r = 0; r < rows.count(); ++r) {
+        if (grid && line + 1 == top[r]) {
+          rule = true;
+          below = r;
+        }
+        if (line >= top[r] && line < top[r] + height[r]) row = r;
+      }
+      if (grid && line + 1 == total_lines) {
+        rule = true;
+        below = static_cast<uint32_t>(rows.count());
+      }
+      if (rule) {
+        String text(a);
+        text.push_back('+');
+        for (uint32_t c = 0; c < ncols; ++c) {
+          bool continues = false;   // (a cell that goes on across this rule)
+          if (below > 0 && below < rows.count()) {
+            const int32_t u = occupied[(below - 1) * kMaxTableColumns + c], d = occupied[below * kMaxTableColumns + c];
+            continues = u != 0 && u == d;
+          }
+          for (uint32_t i = 0; i < width[c] + 2; ++i) text.push_back(continues ? ' ' : '-');
+          text.push_back('+');
+        }
+        table_piece(line_pieces, text.view(), 0, 0, 0, 0, -1, table_node);
+        table_line(line_pieces, false);
+        continue;
+      }
+      if (grid) table_piece(line_pieces, "| ", 0, 0, 0, 0, -1, table_node);
+      for (uint32_t c = 0; c < ncols && !failed_;) {
+        const int32_t id = occupied[row * kMaxTableColumns + c];
+        if (id == 0) {
+          table_spaces(line_pieces, width[c], 0, table_node);
+          ++c;
+        } else {
+          const Cell& cell = *cells[static_cast<uint64_t>(id - 1)];
+          const uint32_t span_lines = top[cell.row + cell.rowspan - 1] + height[cell.row + cell.rowspan - 1] - top[cell.row];
+          const uint32_t free_lines = span_lines > cell.lines() ? span_lines - cell.lines() : 0;
+          const uint32_t offset = cell.valign == 1 ? free_lines / 2 : cell.valign == 2 ? free_lines : 0;
+          const int64_t at = static_cast<int64_t>(line) - top[cell.row] - offset;
+          const uint32_t bg = cell.style.background;
+          if (at >= 0 && at < cell.lines()) {
+            const uint32_t used = seg_line_width(cell, static_cast<uint32_t>(at));
+            const uint32_t room_left = cell.width > used ? cell.width - used : 0;
+            const uint32_t before = cell.style.align == 1 ? room_left / 2 : cell.style.align == 2 ? room_left : 0;
+            table_spaces(line_pieces, before, bg, cell.node->serial);
+            for (uint64_t i = at ? cell.line_end[static_cast<uint32_t>(at) - 1] : 0; i < cell.line_end[static_cast<uint32_t>(at)]; ++i) {
+              const Seg& sg = cell.segs[i];
+              table_piece(line_pieces, sg.text.view(), sg.flags, sg.level, sg.color, sg.background ? sg.background : bg, sg.link, sg.node ? sg.node : cell.node->serial);
+            }
+            table_spaces(line_pieces, room_left - before, bg, cell.node->serial);
+          } else {
+            table_spaces(line_pieces, cell.width, bg, cell.node->serial);
+          }
+          c += cell.colspan;
+        }
+        if (c < ncols) table_piece(line_pieces, " | ", 0, 0, 0, 0, -1, table_node);
+      }
+      if (grid) table_piece(line_pieces, " |", 0, 0, 0, 0, -1, table_node);
+      table_line(line_pieces, !grid);
+    }
+    block(2);
+    return !failed_;
+  }
+
   // --- Forms
-  static constexpr uint32_t kFieldBg = 0xFFF0F0F0u, kFocusBg = 0xFFDCE8FFu, kButtonBg = 0xFFD4D4D4u, kInk = 0xFF202020u, kGrayInk = 0xFF808080u, kListBg = 0xFFF6F6F6u,
+  static constexpr uint32_t kFieldBg = 0xFFF0F0F0u, kFocusBg = 0xFFDCE8FFu, kButtonBg = 0xFFD4D4D4u, kSelectionBg = 0xFF3060C0u, kInk = 0xFF202020u, kGrayInk = 0xFF808080u, kListBg = 0xFFF6F6F6u,
                             kPickedBg = 0xFFBCD4F8u;
 
   static uint32_t number_attr(const dom::Node* n, const char* name, uint32_t fallback, uint32_t lo, uint32_t hi) {
@@ -367,17 +883,53 @@ class DocumentRenderer {
     }
   }
 
+  // One character on the screen for each byte of a value (what the caret and the selection count in): the printable ones, '*' for a password, '?' for the rest.
+  static void one_for_one(StringView v, bool mask, String* out) {
+    for (uint64_t i = 0; i < v.size(); ++i) {
+      const uint8_t c = static_cast<uint8_t>(v[i]);
+      out->push_back(mask ? '*' : c >= 32 && c < 127 ? static_cast<char>(c) : '?');
+    }
+  }
+
+  // The values of a <datalist> that fit what has been typed, as lines under the field (a click on one takes it).
+  void suggestions(const dom::Node* input, StringView typed) {
+    const dom::Node* list = input->owner->element_by_id(attr(input, "list"));
+    if (!list || !list->is_tag("datalist")) return;
+    uint32_t shown_count = 0;
+    for (const dom::Node* o = list->first_child; o && shown_count < 6; o = dom::next_in_tree(o, list)) {
+      if (!o->is_tag("option") || dom::is_disabled(o)) continue;
+      String value(out_.allocator()), label(out_.allocator()), line(out_.allocator());
+      dom::option_value(o, &value);
+      StringView l;
+      if (dom::get_attribute(o, "label", &l) && !l.empty()) label.assign(l);
+      bool fits = typed.empty();
+      for (uint64_t k = 0; !fits && k + typed.size() <= value.size(); ++k) fits = value.view().substr(k, typed.size()).equals_ignore_case(typed);
+      for (uint64_t k = 0; !fits && k + typed.size() <= label.size(); ++k) fits = label.view().substr(k, typed.size()).equals_ignore_case(typed);
+      if (!fits || value.view().equals(typed)) continue;
+      line.append("  ");
+      one_for_one(value.view(), false, &line);
+      if (!label.empty()) {
+        line.append(" - ");
+        one_for_one(label.view(), false, &line);
+      }
+      pad(&line, 22);
+      control_run(o, line.view(), kInk, kListBg, false, true);
+      ++shown_count;
+    }
+  }
+
   static void pad(String* s, uint64_t width) {
     while (s->size() < width) s->push_back(' ');
   }
 
   // One piece of a control: a run of its own that a click on goes to `owner`.
-  void control_run(const dom::Node* owner, StringView text, uint32_t color, uint32_t background, bool bold, bool new_line) {
+  // `join`: the text goes on right after the one before it (the pieces of one field).
+  void control_run(const dom::Node* owner, StringView text, uint32_t color, uint32_t background, bool bold, bool new_line, bool join = false) {
     flush();
     if (text.empty()) return;
     const Style& s = cur();
-    if (!new_line && !ended_space_) literal(" ", indent());
-    const uint8_t breaks = out_.runs_.count() == 0 ? 0 : new_line ? (pending_ > 1 ? pending_ : 1) : pending_;
+    if (!new_line && !join && !ended_space_) literal(" ", indent());
+    const uint8_t breaks = join ? 0 : out_.runs_.count() == 0 ? 0 : new_line ? (pending_ > 1 ? pending_ : 1) : pending_;
     failed_ |= !out_.add_run(text, static_cast<uint8_t>(kRunPre | (bold ? kRunBold : 0)), 0, indent(), breaks, -1, s.align, color, background, owner->serial);
     pending_ = 0;
     ended_space_ = false;
@@ -392,7 +944,7 @@ class DocumentRenderer {
       switch (t) {
         case dom::InputType::Hidden: return;
         case dom::InputType::Checkbox:
-          control_run(n, dom::is_checked(n) ? "[x]" : "[ ]", ink, focused ? kFocusBg : 0, false, false);
+          control_run(n, (n->form_state & dom::kFormIndeterminate) ? "[-]" : dom::is_checked(n) ? "[x]" : "[ ]", ink, focused ? kFocusBg : 0, false, false);
           break;
         case dom::InputType::Radio:
           control_run(n, dom::is_checked(n) ? "(*)" : "( )", ink, focused ? kFocusBg : 0, false, false);
@@ -411,7 +963,19 @@ class DocumentRenderer {
           break;
         }
         case dom::InputType::File:
-          control_run(n, "[ Choose File ] No file chosen", kGrayInk, kButtonBg, false, false);
+        {
+          const uint32_t count = dom::file_count(n);
+          control_run(n, "[ Choose File ]", ink, focused ? kFocusBg : kButtonBg, false, false);
+          String names(out_.allocator());
+          if (count == 0) names.append(" No file chosen");
+          for (uint32_t k = 0; k < count; ++k) {
+            StringView name, type, bytes;
+            dom::file_at(n, k, &name, &type, &bytes);
+            names.append(k ? ", " : " ");
+            one_for_one(name, false, &names);
+          }
+          control_run(n, names.view(), count ? ink : kGrayInk, 0, false, false, true);
+        }
           break;
         case dom::InputType::Color: {
           dom::get_value(n, &value);
@@ -448,16 +1012,41 @@ class DocumentRenderer {
           dom::get_value(n, &value);
           const uint32_t cols = number_attr(n, "size", 20, 4, 60);
           String content(out_.allocator());
-          shown(value.view(), t == dom::InputType::Password, &content);
+          one_for_one(value.view(), t == dom::InputType::Password, &content);
           const bool placeholder = content.empty() && !focused && !attr(n, "placeholder").empty();
-          if (placeholder) shown(attr(n, "placeholder"), false, &content);
-          if (focused) content.push_back('|');
-          if (content.size() > cols) content.assign(focused ? content.view().substr(content.size() - cols) : content.view().first(cols));
+          if (placeholder) one_for_one(attr(n, "placeholder"), false, &content);
+          uint32_t sel_start = 0, sel_end = 0, caret = 0;
+          if (focused) dom::get_selection(n, &sel_start, &sel_end, &caret);
+          const bool selection = focused && sel_start < sel_end;
+          if (focused && !selection) {   // (the caret is a bar between two characters)
+            String with(out_.allocator());
+            with.append(content.view().first(caret));
+            with.push_back('|');
+            with.append(content.view().substr(caret));
+            content.assign(with.view());
+          }
+          uint32_t shift = 0;
+          if (content.size() > cols) {
+            shift = focused && caret + 1 > cols ? caret + 1 - cols : 0;
+            content.assign(content.view().substr(shift, cols));
+          }
           pad(&content, cols);
-          text.append("[");
-          text.append(content.view());
-          text.append("]");
-          control_run(n, text.view(), placeholder ? kGrayInk : ink, field_bg, false, false);
+          const uint32_t lo = selection ? (sel_start > shift ? sel_start - shift : 0) : 0, hi = selection ? (sel_end > shift ? sel_end - shift : 0) : 0;
+          const uint32_t gray = placeholder ? kGrayInk : ink;
+          if (selection && lo < hi && lo < content.size()) {   // the selected text is shown on its own colour
+            const uint64_t end = hi < content.size() ? hi : content.size();
+            control_run(n, "[", gray, field_bg, false, false);
+            control_run(n, content.view().first(lo), gray, field_bg, false, false, true);
+            control_run(n, content.view().substr(lo, end - lo), 0xFFFFFFFFu, kSelectionBg, false, false, true);
+            control_run(n, content.view().substr(end), gray, field_bg, false, false, true);
+            control_run(n, "]", gray, field_bg, false, false, true);
+          } else {
+            text.append("[");
+            text.append(content.view());
+            text.append("]");
+            control_run(n, text.view(), gray, field_bg, false, false);
+          }
+          if (focused && n->is_tag("input") && !attr(n, "list").empty()) suggestions(n, value.view());
           break;
         }
       }
@@ -468,7 +1057,21 @@ class DocumentRenderer {
       String line(out_.allocator());
       const bool placeholder = value.empty() && !focused && !attr(n, "placeholder").empty();
       const StringView source = placeholder ? attr(n, "placeholder") : value.view();
-      for (uint64_t i = 0; i < source.size(); ++i) {
+      uint32_t sel_start = 0, sel_end = 0, caret = 0;
+      if (focused) dom::get_selection(n, &sel_start, &sel_end, &caret);
+      uint64_t caret_line = 0, caret_col = 0;
+      bool caret_seen = false;
+      for (uint64_t i = 0; i <= source.size(); ++i) {
+        if (focused && i == caret && !caret_seen) {
+          caret_seen = true;
+          if (line.size() >= cols && i < source.size() && source[i] != '\n') {   // (the caret starts the next line)
+            failed_ |= !lines.push_back(util::move(line));
+            line = String(out_.allocator());
+          }
+          caret_line = lines.count();
+          caret_col = line.size();
+        }
+        if (i == source.size()) break;
         const char c = source[i];
         if (c == '\n' || line.size() >= cols) {
           failed_ |= !lines.push_back(util::move(line));
@@ -479,15 +1082,20 @@ class DocumentRenderer {
         line.push_back(u >= 32 && u < 127 ? c : '?');
       }
       failed_ |= !lines.push_back(util::move(line));
-      if (lines.count() == 0) lines.push_back(String(out_.allocator()));
-      if (focused) lines[lines.count() - 1].push_back('|');
-      const uint64_t first = focused && lines.count() > rows ? lines.count() - rows : 0;
+      if (focused && caret_line < lines.count()) {
+        String with(out_.allocator());
+        with.append(lines[caret_line].view().first(caret_col));
+        with.push_back('|');
+        with.append(lines[caret_line].view().substr(caret_col));
+        lines[caret_line].assign(with.view());
+      }
+      const uint64_t first = focused && caret_line >= rows ? caret_line - rows + 1 : 0;
       for (uint64_t r = 0; r < rows; ++r) {
         String row(out_.allocator());
         row.push_back('[');
         String body(out_.allocator());
         if (first + r < lines.count()) body.assign(lines[first + r].view());
-        if (body.size() > cols) body.assign(body.view().first(cols));
+        if (body.size() > cols + 1) body.assign(body.view().first(cols + 1));
         pad(&body, cols);
         row.append(body.view());
         row.push_back(']');
@@ -675,6 +1283,8 @@ class DocumentRenderer {
   List<Element> stack_;
   Style root_;
   bool failed_ = false, ended_space_ = true;
+  uint32_t table_depth_ = 0;
+  bool modal_pass_ = false;
   uint8_t pending_ = 0;
 };
 

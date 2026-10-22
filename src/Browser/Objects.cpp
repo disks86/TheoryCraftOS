@@ -75,7 +75,7 @@ bool supported_image_type(StringView type) {
   if (type.empty()) return true;
   if (!type.starts_with("image/")) return false;
   const StringView sub = type.substr(6);
-  for (const char* ok : {"png", "apng", "jpeg", "jpg", "pjpeg", "gif", "bmp", "x-bmp", "x-ms-bmp", "webp", "tiff", "x-tga", "x-targa", "qoi", "x-portable-pixmap", "x-portable-graymap", "x-portable-bitmap", "x-portable-anymap", "vnd.mozilla.apng"})
+  for (const char* ok : {"png", "apng", "jpeg", "jpg", "pjpeg", "gif", "bmp", "x-bmp", "x-ms-bmp", "webp", "tiff", "x-tga", "x-targa", "qoi", "x-portable-pixmap", "x-portable-graymap", "x-portable-bitmap", "x-portable-anymap", "vnd.mozilla.apng", "svg+xml"})
     if (sub.equals_ignore_case(ok)) return true;
   return false;
 }
@@ -283,7 +283,7 @@ bool decode_data_url(allocators::IAllocator& allocator, StringView url, ByteBuff
 }
 
 PageObjects::PageObjects(allocators::IAllocator& allocator)
-    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), events_(allocator) {}
+    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator) {}
 
 PageObjects::~PageObjects() {
   for (uint64_t i = 0; i < images_.count(); ++i) release_scaled(&images_[i]->scaled);
@@ -305,6 +305,39 @@ PageObjects::ImageSlot* PageObjects::find_image(uint32_t serial) {
     if (images_[i]->serial == serial) return images_[i].get();
   return nullptr;
 }
+PageObjects::SvgSlot* PageObjects::find_svg(uint32_t serial) {
+  for (uint64_t i = 0; i < svgs_.count(); ++i)
+    if (svgs_[i]->serial == serial) return svgs_[i].get();
+  return nullptr;
+}
+
+// An <svg> of the page: drawn again whenever the document has changed.
+void PageObjects::sync_svg(dom::Document& doc, dom::Node* n) {
+  for (const dom::Node* p = n->parent; p; p = p->parent)
+    if (p->is_tag("svg")) return;   // (inside another svg: that one draws it)
+  if (!dom::is_connected(n)) return;
+  SvgSlot* slot = find_svg(n->serial);
+  if (!slot) {
+    auto fresh = UniquePointer<SvgSlot>::make(allocator_);
+    if (!fresh || !svgs_.push_back(util::move(fresh))) return;
+    slot = svgs_[svgs_.count() - 1].get();
+    slot->serial = n->serial;
+  }
+  slot->seen = true;
+  if (slot->version == doc.version() && slot->bitmap) return;
+  uint32_t w, h;
+  svg_natural_size(n, &w, &h);
+  if (uint64_t{w} * h > 4u << 20) return;
+  auto bitmap = UniquePointer<CanvasBitmap>::make(allocator_, allocator_, w, h);
+  if (!bitmap || !bitmap->valid()) return;
+  draw_svg(n, bitmap.get());
+  slot->bitmap = util::move(bitmap);
+  slot->width = w;
+  slot->height = h;
+  slot->version = doc.version();
+  dirty_ = true;
+}
+
 PageObjects::VideoSlot* PageObjects::find_video(uint32_t serial) {
   for (uint64_t i = 0; i < videos_.count(); ++i)
     if (videos_[i]->serial == serial) return videos_[i].get();
@@ -384,7 +417,9 @@ int32_t PageObjects::load_image_url(IObjectEnvironment& env, StringView url, boo
   } else {
     got = env.fetch_bytes(url, kMaxImageBytes, &bytes);
   }
-  if (got && media::decode_image(bytes.view(), &entry->image)) {
+  bool decoded = got && media::decode_image(bytes.view(), &entry->image);
+  if (!decoded && got) decoded = rasterize_svg(allocator_, StringView(bytes.view()), &entry->image);   // (an SVG file is drawn once, at its own size)
+  if (decoded) {
     const uint64_t pixels = uint64_t{entry->image.width()} * entry->image.height();
     if (pixels > kMaxImagePixels) {
       entry->image.clear();
@@ -571,13 +606,17 @@ void PageObjects::sync(dom::Document& doc, IObjectEnvironment& env, StringView b
   Lock lock(*this);
   for (uint64_t i = 0; i < images_.count(); ++i) images_[i]->seen = false;
   for (uint64_t i = 0; i < videos_.count(); ++i) videos_[i]->seen = false;
+  for (uint64_t i = 0; i < svgs_.count(); ++i) svgs_[i]->seen = false;
   uint32_t video_fetches = 0;
   for (uint32_t serial = 1; serial <= doc.node_count(); ++serial) {
     dom::Node* n = doc.by_serial(serial);
     if (!n || !n->is_element()) continue;
     if (n->is_tag("img")) sync_image(n, env, base, media, nullptr);
     else if (n->is_tag("video") || n->is_tag("audio")) sync_video(n, env, base, media, &video_fetches);
+    else if (n->is_tag("svg")) sync_svg(doc, n);
   }
+  for (uint64_t i = svgs_.count(); i > 0; --i)
+    if (!svgs_[i - 1]->seen) svgs_.remove_at(i - 1);
   for (uint64_t i = images_.count(); i > 0; --i) {
     if (images_[i - 1]->seen) continue;
     release_scaled(&images_[i - 1]->scaled);
@@ -686,6 +725,12 @@ bool PageObjects::object_info(const dom::Node* element, ObjectInfo* out) {
       out->width = 300;
       out->height = 150;
     }
+    return true;
+  }
+  if (element->is_tag("svg")) {
+    out->kind = ObjectKind::Svg;
+    out->ready = true;
+    svg_natural_size(element, &out->width, &out->height);
     return true;
   }
   if (element->is_tag("audio")) {   // (without controls there is nothing to show)
@@ -849,6 +894,11 @@ void PageObjects::paint_object(graphics::IRenderer2D& r, uint32_t node, ObjectKi
     case ObjectKind::Audio: {
       VideoSlot* v = find_video(node);
       if (v) draw_video(r, *v, x, y, w, h, clip);
+      break;
+    }
+    case ObjectKind::Svg: {
+      SvgSlot* s = find_svg(node);
+      if (s && s->bitmap) s->bitmap->paint(r, x, y, w, h, clip);
       break;
     }
     case ObjectKind::Canvas: {

@@ -415,7 +415,12 @@ class TreeBuilder {
     if (!el) return after;
     read_attributes(attrs, el);
     insert(el);
-    const bool is_void = is_void_tag(name);
+    bool is_void = is_void_tag(name);
+    if (!is_void && attrs.trimmed().ends_with('/')) {   // <rect ... /> in an svg is closed in place
+      bool in_svg = name.equals("svg");
+      for (uint64_t i = 0; i < open_.count() && !in_svg; ++i) in_svg = open_[i]->is_tag("svg");
+      is_void = in_svg;
+    }
     // raw text and character data elements: their content, then the end tag
     if (!is_void && (is_raw_text(name) || is_rcdata(name))) {
       const uint64_t end = find_end_tag(html, after, name);
@@ -453,6 +458,8 @@ class TreeBuilder {
     const bool javascript = !has_type || type.empty() || type.equals_ignore_case("text/javascript") || type.equals_ignore_case("application/javascript") ||
                             type.equals_ignore_case("text/ecmascript") || type.equals_ignore_case("application/ecmascript");
     if (!scripts_ || fragment_ || !javascript || script_depth_ > 3) return;
+    for (const Node* p = script->parent; p; p = p->parent)
+      if (p->is_tag("template")) return;   // (what is in a template is inert)
     String inline_text(doc_.allocator());
     text_content(script, &inline_text);
     const StringView source = has_src ? scripts_->external(index, src) : inline_text.view();
@@ -483,24 +490,54 @@ class TreeBuilder {
 
 }  // namespace
 
+static void move_into_content(Node* t) {
+  while (t->first_child) {
+    Node* c = t->first_child;
+    remove_child(t, c);
+    append_child(t->content, c);
+  }
+}
+
+Node* template_content(Node* tmpl) {
+  if (!tmpl->content) {
+    tmpl->content = tmpl->owner->create_fragment();
+    if (!tmpl->content) return nullptr;
+  }
+  move_into_content(tmpl);   // (what has been read into the template so far, when a script asks while the page is being read)
+  return tmpl->content;
+}
+
+void adopt_template_contents(Document& doc) {
+  for (uint32_t serial = 1; serial <= doc.node_count(); ++serial) {
+    Node* t = doc.by_serial(serial);
+    if (t && t->is_tag("template")) template_content(t);
+  }
+}
+
 bool build_document(Document& doc, StringView html, IScriptRunner* scripts) {
   TreeBuilder builder(doc, scripts, nullptr, StringView());
-  return builder.run(html);
+  const bool ok = builder.run(html);
+  adopt_template_contents(doc);
+  return ok;
 }
 
 Node* parse_fragment(Document& doc, StringView html, StringView context_tag) {
   Node* fragment = doc.create_fragment();
   if (!fragment) return nullptr;
   TreeBuilder builder(doc, nullptr, fragment, context_tag);
-  return builder.run(html) ? fragment : nullptr;
+  const bool ok = builder.run(html);
+  adopt_template_contents(doc);
+  return ok ? fragment : nullptr;
 }
 
 DomError set_inner_html(Node* element, StringView html) {
   if (element->type != NodeType::Element && element->type != NodeType::Fragment) return DomError::HierarchyRequest;
   Node* fragment = parse_fragment(*element->owner, html, element->name.view());
   if (!fragment) return DomError::OutOfMemory;
-  while (element->first_child) remove_child(element, element->first_child);
-  return append_child(element, fragment);
+  Node* target = element->is_tag("template") ? template_content(element) : element;   // (a template's markup is its content)
+  if (!target) return DomError::OutOfMemory;
+  while (target->first_child) remove_child(target, target->first_child);
+  return append_child(target, fragment);
 }
 
 }  // namespace dom

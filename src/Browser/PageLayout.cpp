@@ -200,7 +200,7 @@ bool PageLayout::build(const HtmlDocument& doc, uint32_t columns) {
     const StringView text = doc.run_text(r);
     if (text.empty()) continue;
     any = true;
-    if (run.flags & kRunPre) {
+    if ((run.flags & kRunPre) || run.exact) {
       uint64_t i = 0;
       bool first = true;
       while (i <= text.size() && !b.failed() && lines_.count() < kMaxLines) {
