@@ -94,7 +94,9 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       state_json_(allocator),
       focus_value_(allocator),
       invalid_text_(allocator),
-      style_cache_(allocator) {
+      style_cache_(allocator),
+      sockets_(allocator),
+      workers_(allocator) {
   address_.assign(address);
   style_cache_media_ = media;
   hub_id_ = env_.page_hub().add_page();
@@ -1482,6 +1484,233 @@ void Page::cookie_set(StringView text) {
   WebUrl url(allocator_);
   if (!WebUrl::parse(allocator_, address_.view(), nullptr, &url) || !(url.scheme.equals("http") || url.scheme.equals("https"))) return;
   env_.cookies().store(text, url, env_.now_ms(), true);
+}
+
+// --- Web Workers: a script engine of its own, without the document
+
+struct Page::WorkerRuntime final : script::IHost {
+  struct Event {
+    explicit Event(allocators::IAllocator& a) : text(a) {}
+    uint32_t kind = 0;
+    String text;
+  };
+  WorkerRuntime(Page& owner, uint32_t worker_id) : page(owner), id(worker_id), url(owner.allocator_), name(owner.allocator_), inbox(owner.allocator_), events(owner.allocator_) {}
+  Page& page;
+  uint32_t id;
+  UniquePointer<script::Engine> engine;
+  String url, name;
+  List<String> inbox;      // messages for the worker, serialized
+  List<Event> events;      // what it said: messages, errors, its closing
+  bool closed = false;
+  void add_event(uint32_t kind, StringView text) {
+    Event e(page.allocator_);
+    e.kind = kind;
+    e.text.assign(text);
+    events.push_back(util::move(e));
+  }
+  // script::IHost
+  void console(int level, StringView text) override {
+    String line(page.allocator_);
+    line.append("[worker] ");
+    line.append(text);
+    page.env_.console(level, line.view());
+  }
+  void alert(StringView) override {}
+  void document_write(StringView, bool) override {}
+  uint64_t now_ms() override { return page.env_.now_ms(); }
+  StringView location() override { return url.view(); }
+  StringView title() override { return StringView(); }
+  void set_title(StringView) override {}
+  StringView user_agent() override { return "Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)"; }
+};
+
+uint32_t Page::worker_start(StringView source, StringView url, StringView name, String* error) {
+  if (workers_.count() >= 8) {
+    error->assign("Too many workers are running.");
+    return 0;
+  }
+  auto runtime = UniquePointer<WorkerRuntime>::make(allocator_, *this, next_worker_);
+  if (!runtime) {
+    error->assign("Out of memory.");
+    return 0;
+  }
+  runtime->url.assign(url);
+  runtime->name.assign(name);
+  runtime->engine = UniquePointer<script::Engine>::make(allocator_, allocator_, static_cast<script::IHost*>(runtime.get()));
+  if (!runtime->engine || !runtime->engine->ok()) {
+    error->assign("Out of memory.");
+    return 0;
+  }
+  runtime->engine->set_limits(4000000, 24u << 20);
+  script::Vm& vm = runtime->engine->vm();
+  vm.set_user(runtime.get());
+  using script::Value;
+  vm.define_native(vm.global(), "__out", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {
+    (void)result;
+    script::JsString* text;
+    if (argc > 0 && v.to_string(args[0], &text)) static_cast<WorkerRuntime*>(v.user())->add_event(0, text->view());
+    return true;
+  }, 1);
+  vm.define_native(vm.global(), "__worker_close", [](script::Vm& v, const Value&, const Value*, uint32_t, Value*) {
+    WorkerRuntime* w = static_cast<WorkerRuntime*>(v.user());
+    if (!w->closed) {
+      w->closed = true;
+      w->add_event(2, StringView());
+    }
+    return true;
+  }, 0);
+  vm.define_native(vm.global(), "__worker_fail", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value*) {
+    script::JsString* text;
+    if (argc > 0 && v.to_string(args[0], &text)) static_cast<WorkerRuntime*>(v.user())->add_event(1, text->view());
+    return true;
+  }, 1);
+  vm.define_native(vm.global(), "__worker_fetch", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {
+    script::JsString* address;
+    *result = Value::make_null();
+    if (argc == 0 || !v.to_string(args[0], &address)) return true;
+    WorkerRuntime* w = static_cast<WorkerRuntime*>(v.user());
+    String text(w->page.allocator_);
+    if (w->page.env_.fetch_text(address->view(), 1u << 20, &text)) *result = Value::make_string(v.new_string(text.view()));
+    return true;
+  }, 1);
+  vm.define_named(vm.global(), "__worker_url", Value::make_string(vm.new_string(url)), 0);
+  vm.define_named(vm.global(), "__worker_name", Value::make_string(vm.new_string(name)), 0);
+  String problem(allocator_);
+  if (!runtime->engine->run_library(worker_prelude(), &problem)) {
+    error->assign(problem.view());
+    return 0;
+  }
+  const uint32_t id = next_worker_++;
+  runtime->id = id;
+  if (!workers_.push_back(util::move(runtime))) {
+    error->assign("Out of memory.");
+    return 0;
+  }
+  WorkerRuntime* started = workers_[workers_.count() - 1].get();
+  String result(allocator_);
+  if (!started->engine->run(source, &problem, &result)) started->add_event(1, problem.view());   // (an error in the script is the worker's error event)
+  return id;
+}
+
+void Page::worker_post(uint32_t id, StringView message) {
+  for (uint64_t i = 0; i < workers_.count(); ++i) {
+    WorkerRuntime* w = workers_[i].get();
+    if (w->id != id || w->closed || w->inbox.count() > 1000) continue;
+    String text(allocator_);
+    text.assign(message);
+    w->inbox.push_back(util::move(text));
+  }
+}
+
+void Page::worker_terminate(uint32_t id) {
+  for (uint64_t i = 0; i < workers_.count(); ++i)
+    if (workers_[i]->id == id) {
+      workers_.remove_at(i);
+      return;
+    }
+}
+
+void Page::worker_pump() {
+  for (uint64_t i = 0; i < workers_.count(); ++i) {
+    WorkerRuntime* w = workers_[i].get();
+    if (w->closed) continue;
+    String problem(allocator_), ignored(allocator_);
+    for (uint32_t guard = 0; guard < 100 && w->inbox.count() > 0 && !w->closed; ++guard) {   // the messages for the worker
+      script::Vm& vm = w->engine->vm();
+      vm.define_named(vm.global(), "__inbox", script::Value::make_string(vm.new_string(w->inbox[0].view())), script::kWritable);
+      w->inbox.remove_at(0);
+      problem.clear();
+      if (!w->engine->run("__deliver()", &problem, &ignored)) w->add_event(1, problem.view());
+    }
+    if (w->closed) continue;
+    problem.clear();
+    w->engine->run_due_timers(static_cast<double>(env_.now_ms()), 50, &problem);
+    if (!problem.empty()) w->add_event(1, problem.view());
+  }
+}
+
+bool Page::worker_next_event(uint32_t* id, uint32_t* kind, String* text) {
+  for (uint64_t i = 0; i < workers_.count(); ++i) {
+    WorkerRuntime* w = workers_[i].get();
+    if (w->events.count() == 0) continue;
+    *id = w->id;
+    *kind = w->events[0].kind;
+    text->assign(w->events[0].text.view());
+    w->events.remove_at(0);
+    return true;
+  }
+  return false;
+}
+
+IWebSocket* Page::socket_of(uint32_t id) {
+  for (uint64_t i = 0; i < sockets_.count(); ++i)
+    if (sockets_[i].id == id) return sockets_[i].socket.get();
+  return nullptr;
+}
+
+uint32_t Page::ws_open(StringView url, StringView protocols, String* error) {
+  if (sockets_.count() >= 64) {
+    error->assign("Too many WebSockets are open.");
+    return 0;
+  }
+  String origin(allocator_);
+  page_origin(&origin);
+  UniquePointer<IWebSocket> opened = env_.open_websocket(url, protocols, origin.view(), error);
+  if (!opened) return 0;
+  Socket s;
+  s.id = next_socket_++;
+  s.socket = util::move(opened);
+  const uint32_t id = s.id;
+  if (!sockets_.push_back(util::move(s))) {
+    error->assign("Out of memory.");
+    return 0;
+  }
+  return id;
+}
+
+int Page::ws_state(uint32_t id) {
+  IWebSocket* ws = socket_of(id);
+  if (!ws) return 3;
+  ws->poll();
+  switch (ws->state()) {
+    case IWebSocket::State::Connecting: return 0;
+    case IWebSocket::State::Open: return 1;
+    case IWebSocket::State::Closing: return 2;
+    default: return 3;
+  }
+}
+
+bool Page::ws_send(uint32_t id, bool text, ConstByteView data) {
+  IWebSocket* ws = socket_of(id);
+  return ws && ws->send(text, data);
+}
+
+void Page::ws_close(uint32_t id, uint16_t code, StringView reason) {
+  if (IWebSocket* ws = socket_of(id)) ws->close(code, reason);
+}
+
+bool Page::ws_receive(uint32_t id, bool* text, ByteBuffer* data) {
+  IWebSocket* ws = socket_of(id);
+  if (!ws) return false;
+  ws->poll();
+  return ws->receive(text, data);
+}
+
+void Page::ws_info(uint32_t id, String* protocol, uint16_t* code, String* reason, bool* opened) {
+  IWebSocket* ws = socket_of(id);
+  if (!ws) return;
+  protocol->assign(ws->protocol());
+  *code = ws->close_code();
+  reason->assign(ws->close_reason());
+  *opened = ws->opened();
+}
+
+void Page::ws_release(uint32_t id) {
+  for (uint64_t i = 0; i < sockets_.count(); ++i)
+    if (sockets_[i].id == id) {
+      sockets_.remove_at(i);
+      return;
+    }
 }
 
 void Page::page_origin(String* out) {

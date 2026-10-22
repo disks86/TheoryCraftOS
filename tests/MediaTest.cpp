@@ -27,6 +27,7 @@
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/VideoCodec/ColorConvert.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Media/Audio/AacInternal.hpp"
 #include "Media/Mp4.hpp"
 #include "Media/MediaCodecs.hpp"
 #include "Media/Zlib.hpp"
@@ -126,12 +127,12 @@ static void test_fixtures() {
     if (!ok) { printf("FAILED fixture %s\n", name); ++g_failed; }
   }
   fclose(m);
-  CHECK(count >= 73);
-  {  // Ogg Opus shares the container with Vorbis but is a different codec: not Vorbis, not decoded.
+  CHECK(count >= 79);
+  {  // Ogg Opus shares the container with Vorbis but is a different codec: detected as Opus, decoded at 48 kHz.
     File opus("tests/data/opus.ogg");
     AudioData au(a);
     AudioFileFormat f = AudioFileFormat::Vorbis;
-    CHECK(opus.data && !decode_audio(opus.view(), &au, &f) && f == AudioFileFormat::Unknown);
+    CHECK(opus.data && decode_audio(opus.view(), &au, &f) && f == AudioFileFormat::Opus && au.format().sample_rate == 48000 && au.format().channels == 2);
   }
   CHECK(a.live == 0);
 }
@@ -274,11 +275,124 @@ static void test_audio_roundtrip() {
   CHECK(decode_mulaw(0xFF) == 0 && decode_alaw(0xD5) == 8 && decode_mulaw(0x00) == -32124);
 }
 
+// Music-like test sound: a few tones with vibrato and an envelope, some noise, and a left/right balance that makes the pair correlated.
+static void make_music(AudioData* au, uint32_t rate, uint32_t channels, uint32_t frames) {
+  audio::StreamFormat f;
+  f.sample_rate = rate;
+  f.channels = static_cast<uint8_t>(channels);
+  CHECK(au->create(f, frames));
+  uint32_t seed = 7;
+  for (uint32_t i = 0; i < frames; ++i) {
+    const double t = (double)i / rate;
+    const double env = 0.6 + 0.4 * sin(2 * 3.14159265 * 2.0 * t);
+    seed = seed * 1664525 + 1013904223;
+    const double noise = ((seed >> 16) & 0xFF) / 255.0 - 0.5;
+    const double a = sin(2 * 3.14159265 * 440 * t + 3 * sin(2 * 3.14159265 * 5 * t)), b = sin(2 * 3.14159265 * 1250 * t), c = sin(2 * 3.14159265 * (rate / 8.0) * t);
+    for (uint32_t ch = 0; ch < channels; ++ch) {
+      const double v = env * (6000 * a + (ch ? 1500 : 3000) * b + 800 * c) + 400 * noise;
+      au->samples()[i * channels + ch] = (int16_t)v;
+    }
+  }
+}
+
+// The decoded sound lags the original by the transform delay; the signal-to-noise ratio is over the part where both exist.
+static double aac_snr(const AudioData& src, const AudioData& dec) {
+  const uint64_t delay = AacEncoder::delay_frames();
+  const uint32_t ch = src.format().channels;
+  double sig = 0, noise = 0;
+  for (uint64_t i = 2048; i + delay + 2048 < src.frame_count() && i + delay < dec.frame_count(); ++i)
+    for (uint32_t c = 0; c < ch; ++c) {
+      const double x = src.samples()[i * ch + c], y = dec.samples()[(i + delay) * ch + c];
+      sig += x * x;
+      noise += (x - y) * (x - y);
+    }
+  return noise == 0 ? 99 : 10 * log10(sig / noise);
+}
+
+static void test_aac_encode() {
+  TestAllocator a;
+  struct Case { uint32_t rate, channels, bitrate; double min_snr; };
+  const Case cases[] = {{44100, 2, 128000, 26}, {44100, 1, 64000, 19}, {48000, 2, 96000, 21}, {22050, 2, 48000, 22}, {8000, 1, 24000, 26}, {96000, 2, 256000, 25}, {32000, 1, 48000, 20}};
+  for (const Case& c : cases) {
+    AudioData src(a), dec(a);
+    make_music(&src, c.rate, c.channels, c.rate * 3);
+    ByteBuffer out(a);
+    CHECK(encode_aac(src, c.bitrate, &out));
+    CHECK(looks_like_adts(out.view()));
+    if (const char* dir = getenv("AAC_DUMP")) {  // for checking the streams with other decoders
+      char path[256];
+      snprintf(path, sizeof path, "%s/aac_%u_%u.aac", dir, c.rate, c.channels);
+      if (FILE* f = fopen(path, "wb")) { fwrite(out.view().data(), 1, out.size(), f); fclose(f); }
+      snprintf(path, sizeof path, "%s/aac_%u_%u.raw", dir, c.rate, c.channels);
+      if (FILE* f = fopen(path, "wb")) { fwrite(src.bytes().data(), 1, src.bytes().size(), f); fclose(f); }
+    }
+    AudioFileFormat detected = AudioFileFormat::Unknown;
+    CHECK(decode_audio(out.view(), &dec, &detected) && detected == AudioFileFormat::Aac);
+    CHECK(dec.format().channels == c.channels && dec.format().sample_rate == c.rate);
+    CHECK(dec.frame_count() == ((src.frame_count() + 1023) / 1024 + 1) * 1024);
+    const double snr = aac_snr(src, dec);
+    const double bps = (double)out.size() * 8 * c.rate / (double)dec.frame_count();  // over the blocks, the priming block included
+    printf("  aac %u Hz x%u at %u: SNR %.1f dB, %.0f bit/s\n", c.rate, c.channels, c.bitrate, snr, bps);
+    CHECK(snr >= c.min_snr);
+    CHECK(bps < c.bitrate * 1.06 && bps > c.bitrate * 0.9);  // the average holds the target
+  }
+  {  // the default rate through encode_audio(), and the resulting stream detected and played back
+    AudioData src(a), dec(a);
+    make_music(&src, 44100, 2, 44100);
+    ByteBuffer out(a);
+    CHECK(encode_audio(src, AudioFileFormat::Aac, &out) && decode_audio(out.view(), &dec));
+    CHECK(aac_snr(src, dec) > 24);
+    CHECK(kEncodableAudioFormats & audio_format_bit(AudioFileFormat::Aac));
+  }
+  {  // silence, a very short sound and full-scale noise are all valid input
+    AudioData silent(a), one(a), loud(a), dec(a);
+    make_music(&silent, 44100, 2, 5000);
+    for (int16_t& v : silent.samples()) v = 0;
+    make_music(&one, 44100, 1, 1);
+    make_music(&loud, 44100, 2, 30000);
+    uint32_t seed = 3;
+    for (int16_t& v : loud.samples()) { seed = seed * 1664525 + 1013904223; v = (int16_t)(seed >> 16); }
+    for (AudioData* s : {&silent, &one, &loud}) {
+      ByteBuffer out(a);
+      CHECK(encode_aac(*s, 128000, &out) && decode_aac(out.view(), &dec) && dec.frame_count() >= s->frame_count());
+    }
+    ByteBuffer out(a);
+    CHECK(encode_aac(silent, 128000, &out) && out.size() < 5 * 9 * 8);  // a handful of bytes per block
+    CHECK(decode_aac(out.view(), &dec));
+    bool all_zero = true;
+    for (int16_t v : dec.samples()) all_zero = all_zero && v == 0;
+    CHECK(all_zero);
+  }
+  {  // what cannot be encoded
+    AudioData odd_rate(a), empty(a);
+    make_music(&odd_rate, 12345, 1, 4000);
+    ByteBuffer out(a);
+    CHECK(!encode_aac(odd_rate, 64000, &out) && out.size() == 0);
+    CHECK(!encode_aac(empty, 64000, &out));
+  }
+  {  // blocks and the AudioSpecificConfig
+    AacEncoder enc(a);
+    CHECK(!enc.init(44100, 3, 0) && !enc.init(12345, 2, 0));
+    CHECK(enc.init(44100, 2, 128000) && enc.sampling_index() == 4 && enc.channels() == 2);
+    ByteBuffer cfg(a), blk(a);
+    CHECK(enc.audio_specific_config(&cfg) && cfg.size() == 2);
+    uint32_t object = 0, index = 0, chans = 0;
+    CHECK(parse_audio_specific_config(cfg.view(), &object, &index, &chans) && object == 2 && index == 4 && chans == 2);
+    int16_t pcm[2048] = {};
+    CHECK(!enc.encode_block(ArrayView<const int16_t>(pcm, 100), &blk));  // not a whole block
+    CHECK(enc.encode_block(ArrayView<const int16_t>(pcm, 2048), &blk) && blk.size() > 0);
+    AacDecoder dec(a);
+    int16_t out_pcm[2048];
+    CHECK(dec.init(4) && dec.decode_block(blk.view(), out_pcm) && dec.channels() == 2);
+  }
+  CHECK(a.live == 0);
+}
+
 // Damaged and random input must be refused or decoded, never crash or read out of bounds (the sanitizers watch).
 static void test_fuzz() {
   TestAllocator a;
   const char* names[] = {"rgb.png", "rgba16.png", "anim.apng", "rgb.jpg", "progressive.jpg", "rle8.bmp", "rgba32.bmp", "anim.gif", "interlaced.gif", "rgba.qoi", "rgb.ppm",
-                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "lossy.webp", "lossy_alpha.webp", "anim.webp", "anim_lossy.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg", "stereo.mp3", "mono.mp3", "lsf.mp2", "layer1.mp1", "stereo.aac", "mono.m4a", "stereo.mov", "mp3.mp4"};
+                         "rgba.pam", "rgb.tga", "rgb_lzw.tif", "tiled.tif", "planar.tif", "big.webp", "pal.webp", "lossy.webp", "lossy_alpha.webp", "anim.webp", "anim_lossy.webp", "pcm16.wav", "ima.wav", "adpcm_ms.wav", "s24.aiff", "ulaw.aifc", "s16.au", "best.flac", "s32.flac", "stereo.ogg", "mono.ogg", "opus_silk_wb_mono.opus", "opus_silk_wb_stereo_60.opus", "opus_hybrid_stereo.opus", "opus_celt_stereo_10.opus", "opus.ogg", "stereo.mp3", "mono.mp3", "lsf.mp2", "layer1.mp1", "stereo.aac", "mono.m4a", "stereo.mov", "mp3.mp4"};
   uint32_t seed = 2024;
   auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
   for (const char* name : names) {
@@ -925,6 +1039,7 @@ int main() {
   test_image_roundtrip();
   test_zlib();
   test_audio_roundtrip();
+  test_aac_encode();
   test_y4m();
   test_acceleration_and_fallback();
   test_media_front_door_audio_video();

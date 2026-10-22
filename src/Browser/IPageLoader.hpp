@@ -22,6 +22,7 @@
 #pragma once
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace browser {
 
@@ -57,8 +58,38 @@ struct NetResponse {
   bool opaque = false;
 };
 
+// A WebSocket connection made for a page (see IPageLoader::open_websocket). The page calls poll() often and reads what has arrived.
+class IWebSocket {
+ public:
+  enum class State : uint8_t { Connecting, Open, Closing, Closed };
+  virtual void poll() = 0;
+  virtual State state() const = 0;
+  virtual bool send(bool text, ConstByteView data) = 0;
+  virtual void close(uint16_t code, StringView reason) = 0;
+  // The next message (text: UTF-8 text, otherwise binary); false when none has arrived.
+  virtual bool receive(bool* text, ByteBuffer* data) = 0;
+  virtual StringView protocol() const = 0;   // the subprotocol the server chose
+  virtual uint16_t close_code() const = 0;   // 1006 when the connection ended without a close handshake
+  virtual StringView close_reason() const = 0;
+  virtual bool opened() const = 0;           // the upgrade succeeded at some time
+
+ protected:
+  IWebSocket() = default;
+  ~IWebSocket() = default;
+};
+
 class IPageLoader {
  public:
+  // Opens a WebSocket to `url` (ws://, wss://, http://, https://) offering the comma separated `protocols`; `origin` is sent as the Origin header. Null with
+  // *error set when it cannot be done. The connection is made while the page polls it.
+  virtual UniquePointer<IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
+    (void)url;
+    (void)protocols;
+    (void)origin;
+    error->assign("This browser cannot open WebSockets.");
+    return UniquePointer<IWebSocket>();
+  }
+
   // One exchange: the request goes out and the answer that comes back is returned as it is - a redirect is not followed (the caller does that, with the right
   // cookies and checks). True if an answer arrived, whatever its status. The default asks fetch() / post(), which follow redirects themselves.
   virtual bool exchange(const NetRequest& request, NetResponse* response) {

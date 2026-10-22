@@ -399,6 +399,17 @@ class DocumentRenderer {
     if (!hidden() && n->is_tag("table") && table_depth_ < 5 && render_table(n)) return false;   // (the table is drawn: its rows and cells are not visited again)
     if (dom::is_void_tag(n->name.view())) void_action(n);
     if (!hidden()) pseudo_content(n, PseudoElement::Before);
+    if (!hidden() && n->shadow) {   // a shadow host shows its shadow tree in place of its children
+      for (const dom::Node* c = n->shadow->first_child; c && !failed_; c = c->next) walk(c);
+      return false;
+    }
+    if (!hidden() && n->is_tag("slot")) {   // a slot shows the nodes that were assigned to it (its own children when there are none)
+      List<dom::Node*> assigned(out_.allocator());
+      if (dom::slot_assigned_nodes(n, &assigned) && assigned.count() > 0) {
+        for (uint64_t i = 0; i < assigned.count() && !failed_; ++i) walk(assigned[i]);
+        return false;
+      }
+    }
     return true;
   }
 

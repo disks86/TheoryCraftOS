@@ -70,6 +70,14 @@ class IPageEnvironment : public IObjectEnvironment {
     response->error.assign("This browser cannot make requests.");
     return false;
   }
+  // A WebSocket for a page (see IPageLoader::open_websocket).
+  virtual UniquePointer<IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
+    (void)url;
+    (void)protocols;
+    (void)origin;
+    error->assign("This browser cannot open WebSockets.");
+    return UniquePointer<IWebSocket>();
+  }
   // A form was submitted with method=post: the page at `address` is the answer to `body` (of that content type). Without this, the browser has no way to
   // post, and the form is sent as a GET.
   virtual void navigate_post(StringView address, StringView content_type, StringView body) { (void)content_type; (void)body; navigate(address, false); }
@@ -203,6 +211,18 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void cookie_set(StringView text) override;
   bool http_request(const FetchOptions& options, NetResponse* response) override { return env_.http_request(options, response); }
   void page_origin(String* out) override;
+  uint32_t ws_open(StringView url, StringView protocols, String* error) override;
+  int ws_state(uint32_t id) override;
+  bool ws_send(uint32_t id, bool text, ConstByteView data) override;
+  void ws_close(uint32_t id, uint16_t code, StringView reason) override;
+  bool ws_receive(uint32_t id, bool* text, ByteBuffer* data) override;
+  void ws_info(uint32_t id, String* protocol, uint16_t* code, String* reason, bool* opened) override;
+  void ws_release(uint32_t id) override;
+  uint32_t worker_start(StringView source, StringView url, StringView name, String* error) override;
+  void worker_post(uint32_t id, StringView message) override;
+  void worker_terminate(uint32_t id) override;
+  void worker_pump() override;
+  bool worker_next_event(uint32_t* id, uint32_t* kind, String* text) override;
   bool compile_handler(StringView code, script::Value* function) override;
 
   // --- IDomHost: forms
@@ -319,6 +339,16 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   StyleSheet style_cache_;
   uint32_t pointer_node_ = 0;
   bool pointer_pressed_ = false;
+  struct Socket {
+    uint32_t id = 0;
+    UniquePointer<IWebSocket> socket;
+  };
+  List<Socket> sockets_;
+  struct WorkerRuntime;
+  List<UniquePointer<WorkerRuntime>> workers_;
+  uint32_t next_worker_ = 1;
+  uint32_t next_socket_ = 1;
+  IWebSocket* socket_of(uint32_t id);
   uint64_t style_cache_version_ = 0;
   MediaEnvironment style_cache_media_;
   bool style_cache_valid_ = false;

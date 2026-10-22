@@ -167,6 +167,7 @@ class WebBrowser : public gui::Frame {
     uint64_t tab_id() override { return tab_; }
     browser::CookieJar& cookies() override;
     bool http_request(const browser::FetchOptions& options, browser::NetResponse* response) override;
+    UniquePointer<browser::IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) override;
 
    private:
     WebBrowser& owner_;

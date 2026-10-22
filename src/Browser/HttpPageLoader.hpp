@@ -40,6 +40,7 @@ class HttpPageLoader final : public IPageLoader {
   void set_timeout_ms(uint32_t timeout_ms) { timeout_ms_ = timeout_ms; }
 
   bool exchange(const NetRequest& request, NetResponse* response) override;
+  UniquePointer<IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) override;
   bool fetch(StringView address, PageResult* result) override;
   bool post(StringView address, StringView content_type, StringView body, PageResult* result) override;
 

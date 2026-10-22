@@ -114,6 +114,42 @@ struct FakeNet final : IPageLoader {
   }
 };
 
+// A WebSocket that echoes: it needs two polls to open, answers every message with "echo:" in front, and closes with the code it was given.
+struct FakeSocket final : IWebSocket {
+  explicit FakeSocket(allocators::IAllocator& a) : inbox(a), proto(a), reason(a) {}
+  int polls = 0;
+  bool closing = false, done = false, fail_to_open = false;
+  uint16_t code = 1006;
+  std::vector<std::pair<bool, std::string>> queue;
+  ByteBuffer inbox;
+  String proto, reason;
+  void poll() override { ++polls; }
+  State state() const override { return done ? State::Closed : closing ? State::Closing : (polls < 2 ? State::Connecting : (fail_to_open ? State::Closed : State::Open)); }
+  bool send(bool text, ConstByteView data) override {
+    if (state() != State::Open) return false;
+    std::string body(reinterpret_cast<const char*>(data.data()), data.size());
+    queue.push_back({text, text ? "echo:" + body : body});
+    return true;
+  }
+  void close(uint16_t c, StringView r) override {
+    code = c;
+    reason.assign(r);
+    done = true;
+  }
+  bool receive(bool* text, ByteBuffer* data) override {
+    if (queue.empty() || state() != State::Open) return false;
+    *text = queue.front().first;
+    data->clear();
+    data->append(ConstByteView(reinterpret_cast<const uint8_t*>(queue.front().second.data()), queue.front().second.size()));
+    queue.erase(queue.begin());
+    return true;
+  }
+  StringView protocol() const override { return proto.view(); }
+  uint16_t close_code() const override { return code; }
+  StringView close_reason() const override { return reason.view(); }
+  bool opened() const override { return !fail_to_open; }
+};
+
 struct FakeEnvironment final : IPageEnvironment {
   explicit FakeEnvironment(TestAllocator& a) : local_hub(a), session_hub(a), hub(a), jar(a) { allocator_for_clips = &a; }
   std::map<std::string, std::string> blobs;   // binary files (pictures, videos)
@@ -141,6 +177,18 @@ struct FakeEnvironment final : IPageEnvironment {
     return clip;
   }
   allocators::IAllocator* allocator_for_clips = nullptr;
+  std::vector<std::string> socket_urls;
+  UniquePointer<IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) override {
+    socket_urls.push_back(std::string(url.data(), url.size()) + " [" + std::string(protocols.data(), protocols.size()) + "] " + std::string(origin.data(), origin.size()));
+    if (url.contains("refused")) {
+      error->assign("connection refused");
+      return UniquePointer<IWebSocket>();
+    }
+    auto socket = UniquePointer<FakeSocket>::make(*allocator_for_clips, *allocator_for_clips);
+    if (url.contains("fails")) socket->fail_to_open = true;
+    if (!protocols.empty()) socket->proto.assign(protocols.first(protocols.find(',') == StringView::npos ? protocols.size() : protocols.find(',')));
+    return UniquePointer<IWebSocket>(static_cast<UniquePointer<FakeSocket>&&>(socket));
+  }
   std::map<std::string, std::string> files;
   std::vector<std::string> fetched, navigations, alerts, console_lines, hashes, states;
   std::vector<int> scrolls;
@@ -1733,6 +1781,27 @@ static bool async_is(const char* script, const char* expected, const std::functi
   return true;
 }
 
+static void test_shadow_rendering() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><x-card><span slot=title>Title</span><p>Body</p></x-card><script>var h = document.querySelector('x-card'); var r = h.attachShadow({ mode: 'open' });"
+              "r.innerHTML = '<style>:host { color: blue } div { color: red }</style><h1><slot name=title></slot></h1><div><slot></slot></div>';</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    int title = -1, body = -1;
+    for (uint64_t i = 0; i < doc.run_count(); ++i) {
+      if (doc.run_text(i).equals("Title")) title = static_cast<int>(i);
+      if (doc.run_text(i).equals("Body")) body = static_cast<int>(i);
+    }
+    CHECK(title >= 0 && body >= 0 && title < body);
+    CHECK(title >= 0 && doc.run(static_cast<uint64_t>(title)).color == 0xFF0000FF);   // (the span inherits :host { color: blue } through the slot)
+    CHECK(body >= 0 && doc.run(static_cast<uint64_t>(body)).color == 0xFFFF0000);
+  }
+}
+
 static void test_url() {
   CHECK(js("", "var u = new URL('../x?y=1&z=a%20b#top', 'http://user:pw@a.example:8080/b/c/d'); console.log(u.href, u.origin, u.protocol, u.username, u.password, u.host, u.hostname, u.port, u.pathname, u.search, u.hash)",
            "http://user:pw@a.example:8080/b/x?y=1&z=a%20b#top http://a.example:8080 http: user pw a.example:8080 a.example 8080 /b/x ?y=1&z=a%20b #top"));
@@ -2017,6 +2086,70 @@ static void test_messaging() {
   CHECK(async_is("addEventListener('message', function (e) { var d = e.data; console.log(e.type, e.origin, e.source === window, e.ports.length, e.lastEventId === '', d.a.length, d.a[1].b, d.d instanceof Date, d.d.getTime(), 'u' in d, d.u, isNaN(d.n), 1 / d.z, d.s, d === msg, e instanceof MessageEvent) });"
                   "var msg = { a: [1, { b: 2 }], d: new Date(5), u: undefined, n: NaN, z: -0, s: 'ü' }; postMessage(msg, '*'); console.log('posted');",
                   "posted | message https://app.example true 0 true 2 2 true 5 true undefined true -Infinity \xC3\xBC false true"));
+  // MutationObserver
+  CHECK(async_is("var log = []; var d = document.createElement('div'); document.body.appendChild(d);"
+                 "var mo = new MutationObserver(function (records, observer) { records.forEach(function (r) { log.push(r.type + ':' + r.target.nodeName + ':' + (r.attributeName || '') + ':' + r.addedNodes.length + r.removedNodes.length + ':' + r.oldValue); }); log.push(observer === mo); });"
+                 "mo.observe(d, { childList: true, attributes: true, attributeOldValue: true, characterData: true, subtree: true });"
+                 "d.setAttribute('a', '1'); d.setAttribute('a', '2'); var p = document.createElement('p'); d.appendChild(p); p.textContent = 'x'; d.removeChild(p);"
+                 "setTimeout(function () { console.log(log.join('|')); }, 5);",
+                 "attributes:DIV:a:00:null|attributes:DIV:a:00:1|childList:DIV::10:null|childList:P::10:null|childList:DIV::01:null|true", nullptr, "https://app.example/"));
+  CHECK(async_is("var n = 0; var d = document.createElement('div'); var mo = new MutationObserver(function () { n++; }); mo.observe(d, { attributes: true, attributeFilter: ['keep'] });"
+                 "d.setAttribute('skip', 1); d.setAttribute('keep', 1); var recs = mo.takeRecords(); mo.disconnect(); d.setAttribute('keep', 2); setTimeout(function () { console.log(n, recs.length); }, 5);", "0 1", nullptr, "https://app.example/"));
+  CHECK(async_is("var n = 0; var host = document.createElement('div'); var inner = document.createElement('span'); host.appendChild(inner); var mo = new MutationObserver(function (r) { n += r.length; });"
+                 "mo.observe(host, { childList: true }); inner.appendChild(document.createElement('b')); host.appendChild(document.createElement('i')); setTimeout(function () { console.log(n); }, 5);", "1", nullptr, "https://app.example/"));
+  CHECK(async_is("var r = ''; try { new MutationObserver(function () {}).observe(document.body, {}); } catch (e) { r = e.name; } console.log(r);", "TypeError", nullptr, "https://app.example/"));
+  // custom elements
+  CHECK(async_is("var log = [];"
+                 "class Greeter extends HTMLElement { static get observedAttributes() { return ['name']; } constructor() { super(); log.push('ctor'); } connectedCallback() { log.push('connected:' + this.getAttribute('name')); } disconnectedCallback() { log.push('disconnected'); }"
+                 "attributeChangedCallback(n, o, v) { log.push('attr:' + n + ':' + o + ':' + v); } hello() { return 'hi ' + this.getAttribute('name'); } }"
+                 "customElements.define('x-greeter', Greeter);"
+                 "var el = document.createElement('x-greeter'); log.push(el instanceof Greeter, el instanceof HTMLElement, el.hello === Greeter.prototype.hello);"
+                 "el.setAttribute('name', 'bob'); document.body.appendChild(el); el.setAttribute('name', 'al'); document.body.removeChild(el);"
+                 "setTimeout(function () { console.log(log.join('|')); }, 5);",
+                 "ctor|true|true|true|attr:name:null:bob|connected:bob|attr:name:bob:al|disconnected", nullptr, "https://app.example/"));
+  CHECK(async_is("var log = []; document.body.innerHTML = '<x-late id=a>one</x-late><x-late id=b></x-late>';"
+                 "customElements.define('x-late', class extends HTMLElement { connectedCallback() { log.push('up:' + this.id); } greet() { return 'hello'; } });"
+                 "log.push(document.getElementById('a').greet(), customElements.get('x-late') !== undefined, customElements.get('nope'));"
+                 "setTimeout(function () { console.log(log.join('|')); }, 5);", "up:a|up:b|hello|true|", nullptr, "https://app.example/"));
+  CHECK(async_is("class W extends HTMLElement { constructor() { super(); this.textContent = 'built'; } } customElements.define('x-w', W); var w = new W(); document.body.appendChild(w);"
+                 "console.log(w.tagName, w.textContent, document.body.lastChild === w, w.isConnected, document.querySelector('x-w') === w);", "X-W built true true true", nullptr, "https://app.example/"));
+  CHECK(async_is("var r = []; try { customElements.define('nodash', class extends HTMLElement {}); } catch (e) { r.push(e.name); } customElements.define('x-once', class extends HTMLElement {});"
+                 "try { customElements.define('x-once', class extends HTMLElement {}); } catch (e) { r.push(e.name); } customElements.whenDefined('x-soon').then(function (c) { r.push(typeof c); console.log(r.join()); });"
+                 "customElements.define('x-soon', class extends HTMLElement {});", "SyntaxError,NotSupportedError,function", nullptr, "https://app.example/"));
+  // shadow trees
+  CHECK(async_is("var host = document.createElement('div'); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<p id=in>inside</p><slot></slot>';"
+                 "document.body.appendChild(host); console.log(host.shadowRoot === root, root.host === host, root.mode, root.querySelector('#in').textContent, document.querySelector('#in'), root instanceof ShadowRoot, root instanceof DocumentFragment, host.childNodes.length);",
+                 "true true open inside null true true 0", nullptr, "https://app.example/"));
+  CHECK(async_is("var h = document.createElement('div'); var r = h.attachShadow({ mode: 'closed' }); var e = []; console.log(h.shadowRoot, r.mode); try { h.attachShadow({ mode: 'open' }); } catch (x) { e.push(x.name); } try { document.createElement('p').attachShadow({}); } catch (x) { e.push(x.name); } console.log(e.join());",
+                 "null closed | InvalidStateError,TypeError", nullptr, "https://app.example/"));
+  CHECK(async_is("var host = document.createElement('div'); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<slot name=a></slot><slot></slot>';"
+                 "host.innerHTML = '<b slot=a>one</b><i>two</i><u slot=a>three</u>text'; var slots = root.querySelectorAll('slot');"
+                 "console.log(slots[0].assignedNodes().length, slots[0].assignedElements().map(function (n) { return n.tagName; }).join(), slots[1].assignedNodes().length, host.firstChild.slot);", "2 B,U 2 a", nullptr, "https://app.example/"));
+  CHECK(async_is("var clicks = []; var host = document.createElement('div'); document.body.appendChild(host); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<button id=b>go</button>';"
+                 "document.addEventListener('click', function (e) { clicks.push('document'); }); host.addEventListener('click', function () { clicks.push('host'); }); root.getElementById('b').addEventListener('click', function () { clicks.push('button'); });"
+                 "root.getElementById('b').click(); console.log(clicks.join());", "button,host,document", nullptr, "https://app.example/"));
+  // Web Workers
+  CHECK(async_is("var src = 'onmessage = function (e) { postMessage({ doubled: e.data.n * 2, tag: typeof self, name: self.name }); };'; var w = new Worker(URL.createObjectURL(new Blob([src])), { name: 'calc' });"
+                 "w.onmessage = function (e) { console.log(e.data.doubled, e.data.tag, e.data.name, e instanceof MessageEvent); w.terminate(); }; w.postMessage({ n: 21 });", "42 object calc true", nullptr, "https://app.example/"));
+  CHECK(async_is("var src = 'addEventListener(\"message\", function (e) { postMessage([e.data instanceof Map, e.data.get(\"k\"), new Date(0).getTime()]); });'; var w = new Worker(URL.createObjectURL(new Blob([src])));"
+                 "w.addEventListener('message', function (e) { console.log(JSON.stringify(e.data)); w.terminate(); }); w.postMessage(new Map([['k', [1, undefined, NaN]]]));", "[true,[1,null,null],0]", nullptr, "https://app.example/"));
+  CHECK(async_is("var src = 'throw new Error(\"worker broke\");'; var w = new Worker(URL.createObjectURL(new Blob([src]))); w.onerror = function (e) { console.log('error:', e.message); w.terminate(); };", "error: Error: worker broke", nullptr, "https://app.example/"));
+  CHECK(async_is("var w = new Worker(URL.createObjectURL(new Blob(['onmessage = function (e) { postMessage(\"first\"); close(); };']))); var got = []; w.onmessage = function (e) { got.push(e.data); }; w.postMessage(1); w.postMessage(2);"
+                 "setTimeout(function () { console.log(got.join(), typeof w.terminate); }, 80);", "first function", nullptr, "https://app.example/"));
+  CHECK(async_is("var r = []; try { new Worker('https://other.example/w.js'); } catch (e) { r.push(e.name); } try { new Worker(); } catch (e) { r.push(e.name); } console.log(r.join());", "SecurityError,TypeError", nullptr, "https://app.example/"));
+  CHECK(async_is("var src = 'var n = 0; onmessage = function () { n++; postMessage(n + \":\" + (typeof importScripts) + \":\" + typeof Promise + \":\" + [1, 2, 3].map(function (x) { return x * 2; }).join(\"\")); };'; var w = new Worker(URL.createObjectURL(new Blob([src])));"
+                 "var seen = []; w.onmessage = function (e) { seen.push(e.data); if (seen.length === 2) { console.log(seen.join('|')); w.terminate(); } }; w.postMessage(0); w.postMessage(0);", "1:function:function:246|2:function:function:246", nullptr, "https://app.example/"));
+  // WebSocket
+  CHECK(async_is("var log = []; var ws = new WebSocket('wss://sock.example/echo', ['chat', 'v2']); log.push(ws.readyState); ws.onopen = function () { log.push('open:' + ws.readyState + ':' + ws.protocol); ws.send('hi'); ws.send(new Uint8Array([1, 2])); };"
+                 "ws.onmessage = function (e) { log.push(typeof e.data === 'string' ? e.data : (e.data instanceof Blob ? 'blob' : 'other')); if (log.length >= 4) ws.close(1000, 'bye'); };"
+                 "ws.onclose = function (e) { log.push('close:' + e.code + ':' + e.wasClean + ':' + ws.readyState); console.log(log.join('|')); };", "0|open:1:chat|echo:hi|blob|close:1000:true:3", nullptr, "https://app.example/"));
+  CHECK(async_is("var ws = new WebSocket('wss://sock.example/echo'); ws.binaryType = 'arraybuffer'; ws.onopen = function () { ws.send(new Uint8Array([7, 8, 9])); }; ws.onmessage = function (e) { console.log(e.data instanceof ArrayBuffer, e.data.byteLength, e.origin); ws.close(); };", "true 3 https://sock.example", nullptr, "https://app.example/"));
+  CHECK(async_is("var log = []; var ws = new WebSocket('wss://refused.example/'); ws.onerror = function () { log.push('error'); }; ws.onclose = function (e) { log.push('close:' + e.code + ':' + e.wasClean); console.log(log.join()); };", "error,close:1006:false", nullptr, "https://app.example/"));
+  CHECK(async_is("var log = []; var ws = new WebSocket('wss://fails.example/'); ws.onopen = function () { log.push('open'); }; ws.onerror = function () { log.push('error'); }; ws.onclose = function (e) { log.push('close:' + e.code); console.log(log.join()); };", "error,close:1006", nullptr, "https://app.example/"));
+  CHECK(async_is("var r = []; try { new WebSocket('ftp://x/'); } catch (e) { r.push(e.name); } try { new WebSocket('ws://x/#frag'); } catch (e) { r.push(e.name); } try { new WebSocket('ws://insecure.example/'); } catch (e) { r.push(e.name); } try { var w = new WebSocket('wss://sock.example/'); w.send('early'); } catch (e) { r.push(e.name); } try { w.close(1234); } catch (e) { r.push(e.name); } console.log(r.join());",
+                 "SyntaxError,SyntaxError,SecurityError,InvalidStateError,InvalidAccessError", nullptr, "https://app.example/"));
+  CHECK(async_is("var ws = new WebSocket('wss://sock.example/'); console.log(WebSocket.CONNECTING, WebSocket.OPEN, WebSocket.CLOSING, WebSocket.CLOSED, ws.CLOSED, ws.url, ws.readyState, ws.extensions === '', ws instanceof EventTarget);", "0 1 2 3 3 wss://sock.example/ 0 true true", nullptr, "https://app.example/"));
+  CHECK(async_is("var log = []; var ws = new WebSocket('wss://sock.example/'); ws.addEventListener('open', function () { log.push('open'); ws.close(); log.push('state' + ws.readyState); }); ws.addEventListener('close', function (e) { log.push('closed' + e.code); console.log(log.join()); });", "open,state2,closed1000", nullptr, "https://app.example/"));
   // unhandled rejections, the error event and idle callbacks
   CHECK(async_is("window.addEventListener('unhandledrejection', function (e) { console.log('ur', e.reason, e.promise instanceof Promise, typeof e.preventDefault); e.preventDefault(); }); Promise.reject('boom');", "ur boom true function"));
   CHECK(async_is("window.onunhandledrejection = function (e) { console.log('on', e.reason.message); e.preventDefault(); }; (async function () { throw new Error('inner'); })();", "on inner"));
@@ -2130,6 +2263,7 @@ int main(int argc, char** argv) {
   test_selectors_js();
   test_events();
   test_timers_and_window();
+  test_shadow_rendering();
   test_url();
   test_search_params();
   test_headers();

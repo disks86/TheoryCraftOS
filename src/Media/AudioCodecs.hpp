@@ -32,9 +32,11 @@ namespace media {
 //   FLAC  decode: all of the format (1-8 channels, 4-32 bits, fixed and LPC predictors, all stereo modes, CRC-checked). encode:
 //         fixed predictors with Rice coding, adaptive stereo, 16-bit.
 //   MPEG audio  decode only: Layer III (MP3), Layer II (MP2) and Layer I, MPEG-1, 2 and 2.5, mono and stereo.
+//   Ogg Opus    decode: SILK, CELT and hybrid, mono and stereo, 48 kHz (see OpusInternal.hpp).
 //   Ogg Vorbis  decode only: floor 1 streams (all current encoders), mono and stereo (more channels keep the front pair).
 //   MIDI files are not decoded here: they are played by a synthesizer (see Midi/MidiStream.hpp and open_audio_stream()).
-// Not provided: AAC and Opus.
+//   AAC   decode: AAC-LC in ADTS and in MP4 (see decode_aac()). encode: AAC-LC to ADTS, mono or stereo (see AacEncoder.cpp).
+// Not provided: Opus in other containers (WebM), surround Opus.
 bool decode_wav(ConstByteView data, AudioData* out);
 bool encode_wav(const AudioData& audio, ByteBuffer* out);
 bool decode_aiff(ConstByteView data, AudioData* out);
@@ -44,12 +46,16 @@ bool encode_au(const AudioData& audio, ByteBuffer* out);
 bool decode_flac(ConstByteView data, AudioData* out);
 bool encode_flac(const AudioData& audio, ByteBuffer* out);
 bool decode_vorbis(ConstByteView data, AudioData* out);
+bool decode_opus(ConstByteView data, AudioData* out);  // an Ogg Opus file (mono or stereo), at 48 kHz
 bool decode_mp3(ConstByteView data, AudioData* out);
 bool decode_aac(ConstByteView data, AudioData* out);  // an ADTS stream (.aac)
 bool looks_like_adts(ConstByteView data);
+// AAC-LC at `bitrate_bps` on average (0 picks a default for the rate and channel count), as an ADTS stream. The decoded sound starts 1024
+// frames after the original: that is the transform delay of the format. Mono or stereo at one of the standard's 13 sampling rates.
+bool encode_aac(const AudioData& audio, uint32_t bitrate_bps, ByteBuffer* out);
 bool decode_mp4_audio(ConstByteView data, AudioData* out);  // the first audio track of an MP4/M4A/MOV file: AAC-LC or MP3
 
-constexpr uint32_t kEncodableAudioFormats = 0x1E;
+constexpr uint32_t kEncodableAudioFormats = 0x9E;
 
 bool decode_audio(ConstByteView data, AudioData* out, AudioFileFormat* detected = nullptr);
 bool encode_audio(const AudioData& audio, AudioFileFormat format, ByteBuffer* out);

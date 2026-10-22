@@ -116,11 +116,11 @@ struct Env : Cell {
 // A Promise keeps its state in `position` (kPromiseState bits; kPromiseHandled once a reaction was attached), its value or reason in `bound_this` and its
 // reactions in `items` (three values each: what to call if it is fulfilled, if it is rejected, and the promise that follows). A Coroutine is a suspended
 // async function (host_data points to its saved frame, see Vm.cpp). A native function may keep values of its own in `items`.
-enum class ObjKind : uint8_t { Plain, Array, Function, Native, Bound, Error, Iterator, Promise, Coroutine };
+enum class ObjKind : uint8_t { Plain, Array, Function, Native, Bound, Error, Iterator, Promise, Coroutine, RegExp, TypedArray, Proxy, BigInt };   // (a BigInt keeps its sign and its decimal digits in the hidden properties __neg and __mag; the arithmetic is in script, see Stdlib.cpp)   // (a Proxy keeps its target in `target` and its handler in `bound_this`; a revoked one has no target)
 
 enum PromiseBits : uint32_t { kPromisePending = 0, kPromiseFulfilled = 1, kPromiseRejected = 2, kPromiseState = 3, kPromiseHandled = 4 };
 
-enum PropFlag : uint8_t { kEnumerable = 1, kWritable = 2, kDefaultFlags = 3 };
+enum PropFlag : uint8_t { kEnumerable = 1, kWritable = 2, kDefaultFlags = 3, kAccessor = 4 };   // (an accessor's value is a two element array: getter, setter)
 
 struct Prop {
   JsString* key;

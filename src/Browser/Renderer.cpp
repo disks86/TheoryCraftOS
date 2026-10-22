@@ -343,8 +343,12 @@ void DocumentRenderer::pseudo_content(const dom::Node* n, PseudoElement which) {
 
 bool collect_style_sheets(dom::Document& doc, const RenderOptions& options, StyleSheet* sheet) {
   if (!options.extra_css.empty() && !sheet->parse(options.extra_css, options.media)) return false;
-  for (const dom::Node* n = doc.root(); n; n = dom::next_in_tree(n, doc.root())) {
+  List<const dom::Node*> roots(doc.allocator());   // the document, then the shadow trees found in it (their style elements apply too)
+  roots.push_back(doc.root());
+  for (uint64_t r = 0; r < roots.count() && r < 200; ++r)
+  for (const dom::Node* n = roots[r]; n; n = dom::next_in_tree(n, roots[r])) {
     if (!n->is_element()) continue;
+    if (n->shadow) roots.push_back(n->shadow);
     if (n->is_tag("style")) {
       StringView type;
       if (!media_applies(n, options.media)) continue;

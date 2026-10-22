@@ -25,6 +25,7 @@
 // version(), which is how the browser knows the page has to be drawn again. The script engine hangs its wrapper object for a node on Node::script.
 #pragma once
 #include "ObjectContainer/List.hpp"
+#include "Utility/Move.hpp"
 #include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
 
@@ -54,6 +55,9 @@ struct Node {
   List<Attribute> attrs;     // elements
   void* script = nullptr;    // the script engine's object for this node
   Node* content = nullptr;   // <template>: the fragment that holds what is inside it (it is not part of the page)
+  Node* shadow = nullptr;    // elements: the shadow root (a fragment) that is drawn in place of the children
+  Node* shadow_host = nullptr;   // a shadow root: the element it belongs to
+  bool shadow_closed = false;    // a shadow root made with mode "closed
   uint16_t caret = 0xFFFF, anchor = 0xFFFF;   // a text control: where the caret is and the other end of the selection (0xFFFF: at the end)
   uint8_t form_state = 0;    // elements: what the user (or a script) changed in a form control, and whether it is focused (FormState bits, Form.hpp)
   uint8_t ui_state = 0;      // elements: kUiHover while the pointer is over it (or a descendant), kUiActive while it is pressed
@@ -61,6 +65,20 @@ struct Node {
   bool is_element() const { return type == NodeType::Element; }
   bool is_text() const { return type == NodeType::Text; }
   bool is_tag(const char* tag) const { return type == NodeType::Element && name.view().equals(tag); }
+};
+
+// A change made to the tree, kept while someone wants to know (MutationObserver, custom elements): see Document::set_recording().
+struct Mutation {
+  enum class Kind : uint8_t { ChildList, Attributes, CharacterData };
+  explicit Mutation(allocators::IAllocator& allocator) : attribute(allocator), old_value(allocator), watchers(allocator) {}
+  Kind kind = Kind::ChildList;
+  Node* target = nullptr;                 // the parent (child list), the element (attributes), the text or comment (character data)
+  Node *previous = nullptr, *next = nullptr;   // child list: the siblings of the nodes that were added or removed
+  Node *added = nullptr, *removed = nullptr;   // child list: the node that went in or out (one record for each)
+  String attribute;                        // attributes: the (lowercase) name
+  String old_value;                        // attributes and character data: what it was
+  bool had_old_value = false;              // attributes: false if the attribute was added
+  String watchers;                         // the serials (comma separated) of the watched nodes that were this target or above it when the change was made
 };
 
 // What the tree operations say when they refuse.
@@ -96,6 +114,25 @@ class Document {
   uint64_t version() const { return version_; }
   void touch() { ++version_; }
 
+  // While recording, every change to the tree is also written to a log (at most kMaxLog entries; later ones are lost). `hook` is called when the log goes
+  // from empty to not empty. take_log() moves the log out.
+  static constexpr uint32_t kMaxLog = 20000;
+  void set_recording(bool on, void (*hook)(void*) = nullptr, void* context = nullptr) {
+    recording_ = on;
+    if (hook) hook_ = hook;
+    if (context) hook_context_ = context;
+  }
+  bool recording() const { return recording_; }
+  // Nodes somebody observes (a MutationObserver's targets): each record says which of them it happened in.
+  void watch(Node* node) {
+    for (uint64_t i = 0; i < watched_.count(); ++i)
+      if (watched_[i] == node) return;
+    watched_.push_back(node);
+  }
+  void unwatch_all() { watched_.clear(); }
+  void record(Mutation&& m);
+  List<Mutation>& log() { return log_; }
+
  private:
   Node* make(NodeType type, StringView name);
 
@@ -103,6 +140,11 @@ class Document {
   Node* root_ = nullptr;
   List<Node*> nodes_;
   uint64_t version_ = 1;
+  List<Mutation> log_;
+  List<Node*> watched_;
+  bool recording_ = false;
+  void (*hook_)(void*) = nullptr;
+  void* hook_context_ = nullptr;
 };
 
 // --- Tree operations. They follow the standard: a node is first taken out of where it is; a fragment's children go in its place; nothing can be put
@@ -118,8 +160,13 @@ Node* clone_node(Node* node, bool deep);
 
 // Is `node` `ancestor` or inside it?
 bool contains(const Node* ancestor, const Node* node);
-// Is the node in its document's tree (below the Document node)?
+// Is the node in its document's tree (below the Document node; a shadow tree counts through its host)?
 bool is_connected(const Node* node);
+// The node an event goes to after this one: the parent, or the host for the top of a shadow tree.
+inline Node* event_parent(const Node* node) { return node->parent ? node->parent : node->shadow_host; }
+// The children of a shadow host that go in `slot` (a <slot> in a shadow tree): the ones whose slot attribute is the slot's name (text goes in the slot that has no
+// name). False if the slot is not in a shadow tree.
+bool slot_assigned_nodes(const Node* slot, List<Node*>* out);
 Node* first_element_child(const Node* node);
 Node* last_element_child(const Node* node);
 Node* next_element_sibling(const Node* node);

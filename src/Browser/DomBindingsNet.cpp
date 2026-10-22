@@ -19,6 +19,8 @@
 // The network and text natives of the DOM bindings: URL (a host object over WebUrl), the requests behind fetch() and XMLHttpRequest (the page's JavaScript side is
 // in WebPrelude.cpp), and the helpers for bytes and UTF-8 text that Blob, TextEncoder, TextDecoder and URLSearchParams use.
 #include "Browser/DomBindingsInternal.hpp"
+#include "Script/TypedArray.hpp"
+#include "Utility/ByteText.hpp"
 #include "Browser/WebUrl.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -199,6 +201,118 @@ NATIVE(net_send) {
   if (!vm.get_named(Value::make_object(vm.global()), "__net_run", &runner)) return false;
   const Value task_args[2] = {args[0], args[1]};
   *result = num_value(vm.add_timer(runner, 0, -1, task_args, 2));
+  return true;
+}
+
+// --- WebSockets: __ws_open(url, protocols) -> id (0: not made, with the reason in __ws_error), __ws_state(id), __ws_send(id, data), __ws_close(id, code, reason),
+// __ws_receive(id) -> null | string | byte array, __ws_info(id) -> [protocol, code, reason, opened], __ws_release(id)
+NATIVE(ws_open) {
+  String url(vm.allocator()), protocols(vm.allocator()), error(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &url) || !arg_text(vm, arg_at(args, argc, 1), &protocols)) return false;
+  const uint32_t id = impl(vm).host.ws_open(url.view(), protocols.view(), &error);
+  vm.define_named(vm.global(), "__ws_error", str_value(vm, error.view()), 0);
+  *result = num_value(id);
+  return true;
+}
+NATIVE(ws_state) {
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  *result = num_value(impl(vm).host.ws_state(static_cast<uint32_t>(id)));
+  return true;
+}
+NATIVE(ws_send) {
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  const Value data = arg_at(args, argc, 1);
+  bool ok;
+  if (data.is_string()) {
+    const StringView text = data.as_string()->view();
+    ok = impl(vm).host.ws_send(static_cast<uint32_t>(id), true, text_as_bytes(text));
+  } else {
+    ArrayView<uint8_t> bytes;
+    if (!typed_array_bytes(data, &bytes)) return vm.throw_error(ErrorKind::TypeError, "WebSocket.send needs a string or binary data");
+    ok = impl(vm).host.ws_send(static_cast<uint32_t>(id), false, ConstByteView(bytes.data(), bytes.size()));
+  }
+  *result = bool_value(ok);
+  return true;
+}
+NATIVE(ws_close) {
+  double id, code = 1000;
+  String reason(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &id) || (argc > 1 && !vm.to_number(args[1], &code)) || (argc > 2 && !arg_text(vm, args[2], &reason))) return false;
+  impl(vm).host.ws_close(static_cast<uint32_t>(id), static_cast<uint16_t>(code), reason.view());
+  return true;
+}
+NATIVE(ws_receive) {
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  bool text = false;
+  ByteBuffer data(vm.allocator());
+  *result = Value::make_null();
+  if (!impl(vm).host.ws_receive(static_cast<uint32_t>(id), &text, &data)) return true;
+  const StringView bytes = bytes_as_text(data.view());
+  *result = text ? str_value(vm, bytes) : Value::make_object(make_byte_array(impl(vm), bytes));
+  return true;
+}
+NATIVE(ws_info) {
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  String protocol(vm.allocator()), reason(vm.allocator());
+  uint16_t code = 1006;
+  bool opened = false;
+  impl(vm).host.ws_info(static_cast<uint32_t>(id), &protocol, &code, &reason, &opened);
+  JsObject* a = vm.new_array(4);
+  vm.array_push(a, str_value(vm, protocol.view()));
+  vm.array_push(a, num_value(code));
+  vm.array_push(a, str_value(vm, reason.view()));
+  vm.array_push(a, bool_value(opened));
+  *result = Value::make_object(a);
+  return true;
+}
+NATIVE(ws_release) {
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  impl(vm).host.ws_release(static_cast<uint32_t>(id));
+  return true;
+}
+
+// --- Web Workers: __worker_start(source, url, name) -> id (0: not started, the reason in __worker_error), __worker_post(id, text), __worker_terminate(id),
+// __worker_pump() -> [[id, kind, text] ...] (kind 0 message, 1 error, 2 closed)
+NATIVE(worker_start) {
+  String source(vm.allocator()), url(vm.allocator()), name(vm.allocator()), error(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &source) || !arg_text(vm, arg_at(args, argc, 1), &url) || !arg_text(vm, arg_at(args, argc, 2), &name)) return false;
+  const uint32_t id = impl(vm).host.worker_start(source.view(), url.view(), name.view(), &error);
+  vm.define_named(vm.global(), "__worker_error", str_value(vm, error.view()), 0);
+  *result = num_value(id);
+  return true;
+}
+NATIVE(worker_post) {
+  double id;
+  String text(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &id) || !arg_text(vm, arg_at(args, argc, 1), &text)) return false;
+  impl(vm).host.worker_post(static_cast<uint32_t>(id), text.view());
+  return true;
+}
+NATIVE(worker_terminate) {
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  impl(vm).host.worker_terminate(static_cast<uint32_t>(id));
+  return true;
+}
+NATIVE(worker_pump) {
+  DomBindings::Impl& c = impl(vm);
+  c.host.worker_pump();
+  JsObject* out = vm.new_array();
+  *result = Value::make_object(out);
+  uint32_t id, kind, guard = 0;
+  String text(vm.allocator());
+  while (guard++ < 500 && c.host.worker_next_event(&id, &kind, &text)) {
+    JsObject* entry = vm.new_array(3);
+    vm.array_push(entry, num_value(id));
+    vm.array_push(entry, num_value(kind));
+    vm.array_push(entry, str_value(vm, text.view()));
+    vm.array_push(out, Value::make_object(entry));
+  }
   return true;
 }
 
@@ -425,6 +539,17 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__form_decode", net_form_decode, 1);
   vm.define_native(g, "__url_resolve", url_resolve, 2);
   vm.define_native(g, "__run_hook", run_hook, 1);
+  vm.define_native(g, "__worker_start", worker_start, 3);
+  vm.define_native(g, "__worker_post", worker_post, 2);
+  vm.define_native(g, "__worker_terminate", worker_terminate, 1);
+  vm.define_native(g, "__worker_pump", worker_pump, 0);
+  vm.define_native(g, "__ws_open", ws_open, 2);
+  vm.define_native(g, "__ws_state", ws_state, 1);
+  vm.define_native(g, "__ws_send", ws_send, 2);
+  vm.define_native(g, "__ws_close", ws_close, 3);
+  vm.define_native(g, "__ws_receive", ws_receive, 1);
+  vm.define_native(g, "__ws_info", ws_info, 1);
+  vm.define_native(g, "__ws_release", ws_release, 1);
   vm.define_native(g, "__window_id", win_window_id, 0);
   vm.define_native(g, "__parent_window_id", win_parent_window_id, 0);
   vm.define_native(g, "__top_window_id", win_top_window_id, 0);

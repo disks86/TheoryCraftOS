@@ -23,7 +23,7 @@
 // sound file this OS reads or cannot be decoded. The source gives the same sound as decode_audio() would, and can be read at any frame:
 // frames after the last one read are decoded in order, anywhere else the decoder first finds its way back to that place.
 //   WAV (PCM, float, A-law, mu-law, IMA and Microsoft ADPCM), AIFF / AIFF-C, AU   straight from the file, converted a window at a time
-//   FLAC, MP3 (and MP2 / MP1), AAC (ADTS), Ogg Vorbis, M4A / MP4 / MOV (AAC-LC or MP3)   decoded one frame or packet at a time
+//   FLAC, MP3 (and MP2 / MP1), AAC (ADTS), Ogg Vorbis, Ogg Opus, M4A / MP4 / MOV (AAC-LC or MP3)   decoded one frame or packet at a time
 // The source reads from `source` whenever it is read, so `source` (and what it reads) must outlive it.
 #pragma once
 #include "Allocators/IAllocator.hpp"
@@ -44,6 +44,7 @@ UniquePointer<audio::IPcmSource> open_flac_stream(IByteSource& source, allocator
 UniquePointer<audio::IPcmSource> open_mp3_stream(IByteSource& source, allocators::IAllocator& allocator);
 UniquePointer<audio::IPcmSource> open_aac_stream(IByteSource& source, allocators::IAllocator& allocator);
 UniquePointer<audio::IPcmSource> open_vorbis_stream(IByteSource& source, allocators::IAllocator& allocator);
+UniquePointer<audio::IPcmSource> open_opus_stream(IByteSource& source, allocators::IAllocator& allocator);
 UniquePointer<audio::IPcmSource> open_mp4_audio_stream(IByteSource& source, allocators::IAllocator& allocator);
 
 // Sound that is stored as WAVE data - PCM, float, A-law, mu-law, IMA or Microsoft ADPCM - in `data` (a run of `data.size()` bytes in

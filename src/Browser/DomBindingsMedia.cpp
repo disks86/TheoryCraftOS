@@ -25,6 +25,8 @@
 #include "Browser/Objects.hpp"
 #include "Browser/Url.hpp"
 #include "Media/ImageCodecs.hpp"
+#include "Script/TypedArray.hpp"
+#include "Utility/ByteText.hpp"
 #include "Utility/Move.hpp"
 
 namespace browser {
@@ -64,258 +66,14 @@ bool need_args(Vm& vm, uint32_t argc, uint32_t n, const char* function) {
 
 JsString* key_of(Vm& vm, const char* name) { return vm.intern(name); }
 
-// --- Byte arrays: Uint8ClampedArray and Uint8Array. The bytes live in a string cell (so the collector owns them); the object answers index reads and writes.
+// --- Byte arrays: the script engine's Uint8ClampedArray and Uint8Array (Script/TypedArray.hpp); these helpers make and read them.
 
-JsString* array_buffer(JsObject* o) { return static_cast<JsString*>(o->host_data); }
-// The bytes of a byte array (they live in a string cell).
-ArrayView<uint8_t> bytes_of(JsString* b) { return ArrayView<uint8_t>(reinterpret_cast<uint8_t*>(b->data()), b->length); }
-
-bool parse_index(StringView k, uint32_t* out) {
-  if (k.empty() || k.size() > 10) return false;
-  uint64_t v = 0;
-  for (uint64_t i = 0; i < k.size(); ++i) {
-    if (k[i] < '0' || k[i] > '9') return false;
-    v = v * 10 + static_cast<uint64_t>(k[i] - '0');
-  }
-  if (k.size() > 1 && k[0] == '0') return false;
-  *out = static_cast<uint32_t>(v);
-  return v < 0xFFFFFFFFull;
-}
-
-bool bytes_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
-  (void)vm;
-  const StringView k = key->view();
-  JsString* b = array_buffer(o);
-  uint32_t i;
-  if (parse_index(k, &i)) {
-    *out = i < b->length ? num_value(bytes_of(b)[i]) : Value();
-    return true;
-  }
-  if (IS("length") || IS("byteLength")) {
-    *out = num_value(b->length);
-    return true;
-  }
-  if (IS("byteOffset")) {
-    *out = num_value(0);
-    return true;
-  }
-  if (IS("BYTES_PER_ELEMENT")) {
-    *out = num_value(1);
-    return true;
-  }
-  return false;
-}
-
-uint8_t clamp_byte(double d) {
-  if (!(d > 0)) return 0;
-  if (d >= 255) return 255;
-  // round half to even, like the typed array does
-  double f = static_cast<double>(static_cast<int>(d));
-  const double diff = d - f;
-  if (diff > 0.5 || (diff == 0.5 && (static_cast<int>(f) & 1))) f += 1;
-  return static_cast<uint8_t>(f);
-}
-
-uint8_t wrap_byte(double d) {
-  if (!finite(d)) return 0;
-  const double m = d - 256.0 * static_cast<double>(static_cast<int64_t>(d / 256.0));
-  const int64_t v = static_cast<int64_t>(m);
-  return static_cast<uint8_t>(v < 0 ? v + 256 : v);
-}
-
-HostClass::Set bytes_set_impl(Vm& vm, JsObject* o, JsString* key, const Value& value, bool clamped) {
-  uint32_t i;
-  if (!parse_index(key->view(), &i)) return key->view().equals("length") ? HostClass::Set::Handled : HostClass::Set::NotHandled;
-  double d;
-  if (!vm.to_number(value, &d)) return HostClass::Set::Threw;
-  JsString* b = array_buffer(o);
-  if (i < b->length) bytes_of(b)[i] = clamped ? clamp_byte(d) : wrap_byte(d);
-  return HostClass::Set::Handled;
-}
-
-HostClass::Set clamped_set(Vm& vm, JsObject* o, JsString* key, const Value& value) { return bytes_set_impl(vm, o, key, value, true); }
-HostClass::Set wrapped_set(Vm& vm, JsObject* o, JsString* key, const Value& value) { return bytes_set_impl(vm, o, key, value, false); }
-
-void bytes_keys(Vm& vm, JsObject* o, JsObject* keys) {
-  JsString* b = array_buffer(o);
-  const uint32_t n = b->length < 4096 ? b->length : 4096;
-  for (uint32_t i = 0; i < n; ++i) {
-    String s(vm.allocator());
-    s.append_uint(i);
-    vm.array_push(keys, Value::make_string(vm.intern(s.view())));
-  }
-}
-
-const HostClass kClampedClass = {"Uint8ClampedArray", bytes_get, clamped_set, nullptr, bytes_keys};
-const HostClass kBytesClass = {"Uint8Array", bytes_get, wrapped_set, nullptr, bytes_keys};
-
-bool is_bytes(const Value& v) { return v.is_object() && (v.as_object()->host == &kClampedClass || v.as_object()->host == &kBytesClass); }
+bool is_bytes(const Value& v) { return is_typed_array(v); }
 
 // A byte array of `length` zeros (or of `bytes`).
-JsObject* make_bytes(DomBindings::Impl& c, StringView bytes, bool clamped) {
-  Vm& vm = c.vm;
-  JsString* buffer = vm.new_string(bytes);
-  JsObject* o = vm.new_host_object(c.typed_array_proto, clamped ? &kClampedClass : &kBytesClass, buffer);
-  vm.define(o, key_of(vm, "__buf"), Value::make_string(buffer), 0);
-  return o;
-}
+JsObject* make_bytes(DomBindings::Impl& c, StringView bytes, bool clamped) { return new_typed_array(c.vm, clamped ? ArrayKind::Uint8Clamped : ArrayKind::Uint8, bytes); }
 
-JsObject* make_zero_bytes(DomBindings::Impl& c, uint64_t length, bool clamped) {
-  String zeros(c.vm.allocator());
-  if (length > 0 && !zeros.append(StringView("\0", 1))) return nullptr;
-  zeros.clear();
-  for (uint64_t i = 0; i < length; ++i)
-    if (!zeros.push_back('\0')) return nullptr;
-  return make_bytes(c, zeros.view(), clamped);
-}
-
-bool bytes_construct(Vm& vm, const Value* args, uint32_t argc, Value* result, bool clamped) {
-  DomBindings::Impl& c = impl(vm);
-  const Value a = arg_at(args, argc, 0);
-  JsObject* o = nullptr;
-  if (a.is_number() || a.is_nullish()) {
-    const double n = a.is_number() ? a.u.number : 0;
-    if (!(n >= 0) || n > 64.0 * 1024 * 1024) return vm.throw_error(ErrorKind::RangeError, "Invalid typed array length");
-    o = make_zero_bytes(c, static_cast<uint64_t>(n), clamped);
-  } else if (is_bytes(a)) {
-    JsString* b = array_buffer(a.as_object());
-    o = make_bytes(c, b->view(), clamped);
-  } else if (a.is_object()) {
-    Value len;
-    if (!vm.get(a, vm.length_name(), &len)) return false;
-    double n = 0;
-    if (!vm.to_number(len, &n)) return false;
-    if (!(n >= 0) || n > 64.0 * 1024 * 1024) return vm.throw_error(ErrorKind::RangeError, "Invalid typed array length");
-    o = make_zero_bytes(c, static_cast<uint64_t>(n), clamped);
-    if (o) {
-      JsString* b = array_buffer(o);
-      for (uint32_t i = 0; i < b->length; ++i) {
-        Value item;
-        if (!vm.get_member(a, num_value(i), &item)) return false;
-        double d;
-        if (!vm.to_number(item, &d)) return false;
-        bytes_of(b)[i] = clamped ? clamp_byte(d) : wrap_byte(d);
-      }
-    }
-  }
-  if (!o) return vm.throw_error(ErrorKind::TypeError, "Failed to construct a typed array");
-  *result = Value::make_object(o);
-  return true;
-}
-
-NATIVE(clamped_constructor) { (void)self; return bytes_construct(vm, args, argc, result, true); }
-NATIVE(bytes_constructor) { (void)self; return bytes_construct(vm, args, argc, result, false); }
-
-JsObject* bytes_self(Vm& vm, const Value& self) {
-  if (!is_bytes(self)) {
-    vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
-    return nullptr;
-  }
-  return self.as_object();
-}
-
-NATIVE(bytes_set) {
-  JsObject* o = bytes_self(vm, self);
-  if (!o) return false;
-  const Value src = arg_at(args, argc, 0);
-  double offset = 0;
-  if (argc > 1 && !vm.to_number(args[1], &offset)) return false;
-  if (!(offset >= 0)) return vm.throw_error(ErrorKind::RangeError, "offset is out of bounds");
-  Value len;
-  if (!vm.get(src, vm.length_name(), &len)) return false;
-  double n;
-  if (!vm.to_number(len, &n)) return false;
-  JsString* b = array_buffer(o);
-  if (offset + n > b->length) return vm.throw_error(ErrorKind::RangeError, "offset is out of bounds");
-  const bool clamped = o->host == &kClampedClass;
-  for (uint32_t i = 0; i < static_cast<uint32_t>(n); ++i) {
-    Value item;
-    if (!vm.get_member(src, num_value(i), &item)) return false;
-    double d;
-    if (!vm.to_number(item, &d)) return false;
-    bytes_of(b)[static_cast<uint32_t>(offset) + i] = clamped ? clamp_byte(d) : wrap_byte(d);
-  }
-  return true;
-}
-
-NATIVE(bytes_fill) {
-  JsObject* o = bytes_self(vm, self);
-  if (!o) return false;
-  double v = 0, from = 0, to;
-  JsString* b = array_buffer(o);
-  to = b->length;
-  if (!arg_number(vm, args, argc, 0, &v)) return false;
-  if (argc > 1 && !args[1].is_nullish() && !vm.to_number(args[1], &from)) return false;
-  if (argc > 2 && !args[2].is_nullish() && !vm.to_number(args[2], &to)) return false;
-  if (from < 0) from += b->length;
-  if (to < 0) to += b->length;
-  if (from < 0) from = 0;
-  if (to > b->length) to = b->length;
-  const uint8_t byte = o->host == &kClampedClass ? clamp_byte(v) : wrap_byte(v);
-  for (double i = from; i < to; i += 1) bytes_of(b)[static_cast<uint32_t>(i)] = byte;
-  *result = self;
-  return true;
-}
-
-NATIVE(bytes_slice) {
-  JsObject* o = bytes_self(vm, self);
-  if (!o) return false;
-  JsString* b = array_buffer(o);
-  double from = 0, to = b->length;
-  if (argc > 0 && !args[0].is_nullish() && !vm.to_number(args[0], &from)) return false;
-  if (argc > 1 && !args[1].is_nullish() && !vm.to_number(args[1], &to)) return false;
-  if (from < 0) from += b->length;
-  if (to < 0) to += b->length;
-  if (from < 0) from = 0;
-  if (to > b->length) to = b->length;
-  if (to < from) to = from;
-  *result = Value::make_object(make_bytes(impl(vm), b->view().substr(static_cast<uint64_t>(from), static_cast<uint64_t>(to - from)), o->host == &kClampedClass));
-  return true;
-}
-
-NATIVE(bytes_for_each) {
-  JsObject* o = bytes_self(vm, self);
-  if (!o) return false;
-  const Value fn = arg_at(args, argc, 0);
-  if (!Vm::is_callable(fn)) return vm.throw_error(ErrorKind::TypeError, "forEach needs a function");
-  JsString* b = array_buffer(o);
-  for (uint32_t i = 0; i < b->length; ++i) {
-    const Value call_args[3] = {num_value(bytes_of(b)[i]), num_value(i), self};
-    Value ignored;
-    if (!vm.call(fn, arg_at(args, argc, 1), call_args, 3, &ignored)) return false;
-  }
-  return true;
-}
-
-NATIVE(bytes_join) {
-  JsObject* o = bytes_self(vm, self);
-  if (!o) return false;
-  String sep(vm.allocator());
-  if (!arg_text(vm, argc > 0 && !args[0].is_undefined() ? args[0] : str_value(vm, ","), &sep)) return false;
-  JsString* b = array_buffer(o);
-  String out(vm.allocator());
-  for (uint32_t i = 0; i < b->length; ++i) {
-    if (i) out.append(sep.view());
-    out.append_uint(bytes_of(b)[i]);
-  }
-  *result = str_value(vm, out.view());
-  return true;
-}
-
-NATIVE(bytes_index_of) {
-  JsObject* o = bytes_self(vm, self);
-  if (!o) return false;
-  double v;
-  if (!arg_number(vm, args, argc, 0, &v)) return false;
-  JsString* b = array_buffer(o);
-  *result = num_value(-1);
-  for (uint32_t i = 0; i < b->length; ++i)
-    if (bytes_of(b)[i] == v) {
-      *result = num_value(i);
-      break;
-    }
-  return true;
-}
+JsObject* make_zero_bytes(DomBindings::Impl& c, uint64_t length, bool clamped) { return new_zero_typed_array(c.vm, clamped ? ArrayKind::Uint8Clamped : ArrayKind::Uint8, length); }
 
 // --- ImageData: { width, height, data, colorSpace }
 
@@ -326,10 +84,12 @@ NATIVE(image_data_constructor) {
   double w = 0, h = 0;
   if (is_bytes(arg_at(args, argc, 0))) {
     if (!arg_number(vm, args, argc, 1, &w)) return false;
-    JsString* b = array_buffer(args[0].as_object());
-    if (!(w >= 1) || b->length % 4 != 0 || (b->length / 4) % static_cast<uint32_t>(w) != 0)
+    ArrayView<uint8_t> view;
+    typed_array_bytes(args[0], &view);
+    const uint64_t byte_count = view.size();
+    if (!(w >= 1) || byte_count % 4 != 0 || (byte_count / 4) % static_cast<uint32_t>(w) != 0)
       return throw_dom(vm, "InvalidStateError", "The input data length is not a multiple of (4 * width).");
-    h = static_cast<double>(b->length / 4) / w;
+    h = static_cast<double>(byte_count / 4) / w;
     if (argc > 2 && !args[2].is_undefined() && !vm.to_number(args[2], &h)) return false;
     data = args[0].as_object();
   } else {
@@ -357,10 +117,10 @@ bool read_image_data(Vm& vm, const Value& v, uint32_t* w, uint32_t* h, List<uint
   if (!(dw >= 1) || !(dh >= 1) || !is_bytes(dv) || dw * dh > 16.0 * 1024 * 1024) return vm.throw_error(ErrorKind::TypeError, "parameter 1 is not of type 'ImageData'.");
   *w = static_cast<uint32_t>(dw);
   *h = static_cast<uint32_t>(dh);
-  JsString* b = array_buffer(dv.as_object());
-  if (b->length < uint64_t{*w} * *h * 4) return vm.throw_error(ErrorKind::TypeError, "parameter 1 is not of type 'ImageData'.");
+  ArrayView<uint8_t> d;
+  typed_array_bytes(dv, &d);
+  if (d.size() < uint64_t{*w} * *h * 4) return vm.throw_error(ErrorKind::TypeError, "parameter 1 is not of type 'ImageData'.");
   if (!pixels->reserve(uint64_t{*w} * *h)) return vm.throw_error(ErrorKind::RangeError, "Out of memory");
-  const ArrayView<uint8_t> d = bytes_of(b);
   for (uint64_t i = 0; i < uint64_t{*w} * *h; ++i)
     pixels->push_back((uint32_t{d[i * 4 + 3]} << 24) | (uint32_t{d[i * 4]} << 16) | (uint32_t{d[i * 4 + 1]} << 8) | d[i * 4 + 2]);
   return true;
@@ -2013,20 +1773,7 @@ bool install_media(DomBindings::Impl& c) {
     return f;
   };
 
-  // byte arrays
-  c.typed_array_proto = vm.new_plain();
-  vm.define_native(c.typed_array_proto, "set", bytes_set, 1);
-  vm.define_native(c.typed_array_proto, "fill", bytes_fill, 1);
-  vm.define_native(c.typed_array_proto, "slice", bytes_slice, 2);
-  vm.define_native(c.typed_array_proto, "subarray", bytes_slice, 2);
-  vm.define_native(c.typed_array_proto, "forEach", bytes_for_each, 1);
-  vm.define_native(c.typed_array_proto, "join", bytes_join, 1);
-  vm.define_native(c.typed_array_proto, "indexOf", bytes_index_of, 1);
-  make_class("Uint8ClampedArray", clamped_constructor, c.typed_array_proto, 1);
-  {
-    JsObject* plain = vm.new_object(c.typed_array_proto);
-    make_class("Uint8Array", bytes_constructor, plain, 1);
-  }
+  c.typed_array_proto = vm.new_plain();   // (the byte arrays themselves are the engine's)
 
   c.image_data_proto = vm.new_plain();
   make_class("ImageData", image_data_constructor, c.image_data_proto, 2);
@@ -2083,9 +1830,9 @@ bool install_media(DomBindings::Impl& c) {
 JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes) { return make_bytes(c, bytes, false); }
 
 bool byte_array_bytes(const Value& v, StringView* out) {
-  if (!is_bytes(v)) return false;
-  JsString* b = array_buffer(v.as_object());
-  *out = b->view();
+  ArrayView<uint8_t> bytes;
+  if (!is_bytes(v) || !typed_array_bytes(v, &bytes)) return false;
+  *out = bytes_as_text(ConstByteView(bytes.data(), bytes.size()));
   return true;
 }
 

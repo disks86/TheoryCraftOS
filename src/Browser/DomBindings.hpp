@@ -120,6 +120,34 @@ class IDomHost {
   // BroadcastChannel: a message (serialized) for the other pages of the origin.
   virtual void broadcast(StringView channel, StringView payload) = 0;
   virtual bool in_frame() = 0;
+  // WebSockets. ws_open() returns the id of a connection (0 and *error set when it cannot be made); the page drives it with ws_poll() and reads with
+  // ws_state() (0 connecting, 1 open, 2 closing, 3 closed) and ws_receive().
+  virtual uint32_t ws_open(StringView url, StringView protocols, String* error) {
+    (void)url;
+    (void)protocols;
+    error->assign("This browser cannot open WebSockets.");
+    return 0;
+  }
+  virtual int ws_state(uint32_t id) { (void)id; return 3; }
+  virtual bool ws_send(uint32_t id, bool text, ConstByteView data) { (void)id; (void)text; (void)data; return false; }
+  virtual void ws_close(uint32_t id, uint16_t code, StringView reason) { (void)id; (void)code; (void)reason; }
+  virtual bool ws_receive(uint32_t id, bool* text, ByteBuffer* data) { (void)id; (void)text; (void)data; return false; }
+  virtual void ws_info(uint32_t id, String* protocol, uint16_t* code, String* reason, bool* opened) { (void)id; (void)protocol; (void)code; (void)reason; (void)opened; }
+  virtual void ws_release(uint32_t id) { (void)id; }
+  // Web Workers: a worker is a script engine of its own that the page owns. worker_start() runs `source` in it (0 and *error set when that cannot be done);
+  // worker_post() hands it a message (serialized); worker_pump() lets it run (messages in, timers) and collects what it says, which worker_next_event() gives
+  // one at a time: kind 0 a message (text), 1 an uncaught error (text), 2 the worker closed itself.
+  virtual uint32_t worker_start(StringView source, StringView url, StringView name, String* error) {
+    (void)source;
+    (void)url;
+    (void)name;
+    error->assign("This browser cannot run workers.");
+    return 0;
+  }
+  virtual void worker_post(uint32_t id, StringView message) { (void)id; (void)message; }
+  virtual void worker_terminate(uint32_t id) { (void)id; }
+  virtual void worker_pump() {}
+  virtual bool worker_next_event(uint32_t* id, uint32_t* kind, String* text) { (void)id; (void)kind; (void)text; return false; }
   // Shows what is wrong with a control (reportValidity()); true if nothing is.
   virtual bool report_validity(dom::Node* control) = 0;
 

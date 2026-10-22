@@ -412,7 +412,7 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
   // the path from the target out to the window
   List<dom::Node*> nodes(vm.allocator());
   if (!target_is_window)
-    for (dom::Node* n = target; n; n = n->parent) nodes.push_back(n);
+    for (dom::Node* n = target; n && nodes.count() < 4096; n = dom::event_parent(n)) nodes.push_back(n);
   JsObject* path = vm.new_array(static_cast<uint32_t>(nodes.count()) + 1);
   if (object_target) vm.array_push(path, Value::make_object(object_target));   // (a script object that is an event target: it is the whole path)
   for (uint64_t i = 0; i < nodes.count(); ++i) vm.array_push(path, node_value(c, nodes[i]));

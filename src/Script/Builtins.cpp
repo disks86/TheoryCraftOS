@@ -19,10 +19,15 @@
 // The global functions and objects scripts find: Object, Function, Array, String, Number, Boolean, Math, JSON, Error and its kinds, Date (a little),
 // console, document (write, title, a few stubs that find nothing), window / location / navigator, timers, and the parse and test functions.
 // Promise has its core here (the constructor, resolve, reject, then, catch); all, allSettled, race, any and finally are written in script (see Engine.cpp).
-// Not here: regular expressions, Map and Set, Symbol, the DOM.
+// Regular expressions are in RegExp.cpp, typed arrays in TypedArray.cpp; Map, Set and the rest of the standard library are written in script (Engine.cpp,
+// Stdlib.cpp). Not here: the DOM.
 #include <initializer_list>
 #include "Math/FloatMath.hpp"
 #include "Script/Number.hpp"
+#include "Script/Ast.hpp"
+#include "Script/Compiler.hpp"
+#include "Script/RegExp.hpp"
+#include "Script/TypedArray.hpp"
 #include "Script/Vm.hpp"
 
 namespace script {
@@ -178,10 +183,238 @@ NATIVE(object_define_property) {
   if (!target.is_object() || !desc.is_object()) return vm.throw_error(ErrorKind::TypeError, "Object.defineProperty called on non-object");
   JsString* key;
   if (!vm.to_property_key(arg_at(args, argc, 1), &key)) return false;
-  Value value, enumerable, writable;
-  if (!vm.get_named(desc, "value", &value) || !vm.get_named(desc, "enumerable", &enumerable) || !vm.get_named(desc, "writable", &writable)) return false;
+  Value value, enumerable, writable, getter, setter;
+  if (!vm.get_named(desc, "value", &value) || !vm.get_named(desc, "enumerable", &enumerable) || !vm.get_named(desc, "writable", &writable) || !vm.get_named(desc, "get", &getter) ||
+      !vm.get_named(desc, "set", &setter))
+    return false;
+  if (!getter.is_undefined() || !setter.is_undefined()) {
+    if ((!getter.is_undefined() && !Vm::is_callable(getter)) || (!setter.is_undefined() && !Vm::is_callable(setter)))
+      return vm.throw_error(ErrorKind::TypeError, "Getter must be a function");
+    vm.define_accessor(target.as_object(), key, getter, setter, Vm::to_boolean(enumerable) ? kEnumerable : 0);
+    *result = target;
+    return true;
+  }
   vm.define(target.as_object(), key, value, static_cast<uint8_t>((Vm::to_boolean(enumerable) ? kEnumerable : 0) | (Vm::to_boolean(writable) ? kWritable : 0)));
   *result = target;
+  return true;
+}
+
+NATIVE(object_define_properties) {
+  const Value target = arg_at(args, argc, 0), props = arg_at(args, argc, 1);
+  if (!target.is_object() || !props.is_object()) return vm.throw_error(ErrorKind::TypeError, "Object.defineProperties called on non-object");
+  JsObject* keys = vm.own_keys(props.as_object());
+  for (uint32_t i = 0; i < keys->length; ++i) {
+    Value desc;
+    if (!vm.get(props, keys->items[i].as_string(), &desc)) return false;
+    const Value call_args[3] = {target, keys->items[i], desc};
+    Value ignored;
+    if (!object_define_property(vm, Value(), call_args, 3, &ignored)) return false;
+  }
+  *result = target;
+  return true;
+}
+
+NATIVE(object_get_own_property_descriptor) {
+  const Value target = arg_at(args, argc, 0);
+  if (!target.is_object()) {
+    *result = Value();
+    return true;
+  }
+  JsString* key;
+  if (!vm.to_property_key(arg_at(args, argc, 1), &key)) return false;
+  Value value;
+  uint8_t flags;
+  if (!vm.own_property(target.as_object(), key, &value, &flags)) {
+    *result = Value();
+    return true;
+  }
+  JsObject* d = vm.new_plain();
+  if (flags & kAccessor) {
+    const bool pair = value.is_object() && value.as_object()->length >= 2;
+    vm.define_named(d, "get", pair ? value.as_object()->items[0] : Value());
+    vm.define_named(d, "set", pair ? value.as_object()->items[1] : Value());
+  } else {
+    vm.define_named(d, "value", value);
+    vm.define_named(d, "writable", Value::make_bool((flags & kWritable) != 0 && !target.as_object()->frozen));
+  }
+  vm.define_named(d, "enumerable", Value::make_bool((flags & kEnumerable) != 0));
+  vm.define_named(d, "configurable", Value::make_bool(!target.as_object()->frozen));
+  *result = Value::make_object(d);
+  return true;
+}
+
+NATIVE(object_get_own_property_names) {
+  const Value target = arg_at(args, argc, 0);
+  if (!target.is_object()) {
+    *result = Value::make_object(vm.new_array());
+    return true;
+  }
+  *result = Value::make_object(vm.own_names(target.as_object()));
+  return true;
+}
+
+NATIVE(object_set_prototype_of) {
+  const Value target = arg_at(args, argc, 0), proto = arg_at(args, argc, 1);
+  if (target.is_object() && (proto.is_object() || proto.is_null())) {
+    for (JsObject* p = proto.is_object() ? proto.as_object() : nullptr; p; p = p->proto)
+      if (p == target.as_object()) return vm.throw_error(ErrorKind::TypeError, "Cyclic __proto__ value");
+    target.as_object()->proto = proto.is_object() ? proto.as_object() : nullptr;
+  }
+  *result = target;
+  return true;
+}
+
+// --- Classes (the parser turns `class` into a function and calls of these) -----------------------------------------------
+
+// __class(constructor, parent): the constructor's prototype, chained to the parent's (and the constructor to the parent, for statics). Returns the prototype.
+NATIVE(class_setup) {
+  const Value ctor = arg_at(args, argc, 0), parent = arg_at(args, argc, 1);
+  if (!ctor.is_object()) return vm.throw_error(ErrorKind::TypeError, "Class constructor is not a function");
+  Value proto;
+  if (!vm.get_named(ctor, "prototype", &proto)) return false;
+  if (!proto.is_object()) return vm.throw_error(ErrorKind::TypeError, "Class has no prototype");
+  if (argc > 1 && !parent.is_undefined()) {
+    if (parent.is_null()) {
+      proto.as_object()->proto = nullptr;
+    } else if (!Vm::is_callable(parent)) {
+      String message(vm.allocator());
+      message.append("Class extends value ");
+      vm.describe(parent, &message, 0);
+      message.append(" is not a constructor or null");
+      return vm.throw_error(ErrorKind::TypeError, message.view());
+    } else {
+      Value parent_proto;
+      if (!vm.get_named(parent, "prototype", &parent_proto)) return false;
+      proto.as_object()->proto = parent_proto.is_object() ? parent_proto.as_object() : nullptr;
+      ctor.as_object()->proto = parent.as_object();
+    }
+  }
+  vm.define(proto.as_object(), vm.intern("constructor"), ctor, kWritable);
+  *result = proto;
+  return true;
+}
+
+// __def(target, key, value, kind): 0 method (not enumerable), 1 getter, 2 setter, 3 a hidden data property (private fields).
+NATIVE(class_define) {
+  const Value target = arg_at(args, argc, 0), value = arg_at(args, argc, 2);
+  JsString* key;
+  double kind = 0;
+  if (!target.is_object() || !vm.to_property_key(arg_at(args, argc, 1), &key) || !vm.to_number(arg_at(args, argc, 3), &kind)) return false;
+  JsObject* t = target.as_object();
+  if (kind == 1) vm.define_accessor(t, key, value, Value(), 0);
+  else if (kind == 2) vm.define_accessor(t, key, Value(), value, 0);
+  else vm.define(t, key, value, kWritable);
+  *result = Value();
+  return true;
+}
+
+// __super_init(parent, this, ...args): super(...args). A parent that is a built-in (Error ...) answers with an object of its own: what it made is copied onto `this`.
+NATIVE(class_super_init) {
+  const Value parent = arg_at(args, argc, 0), self_value = arg_at(args, argc, 1);
+  if (!Vm::is_callable(parent)) return vm.throw_error(ErrorKind::TypeError, "Super constructor is not a constructor");
+  if (self_value.is_object() && self_value.as_object()->host && parent.as_object()->okind == ObjKind::Native) {   // a class that extends a built-in of the page (HTMLElement): the object is made already
+    *result = Value();
+    return true;
+  }
+  Value made;
+  vm.mark_super_call();
+  const bool called = vm.call(parent, self_value, argc > 2 ? args + 2 : nullptr, argc > 2 ? argc - 2 : 0, &made);
+  if (!called) return false;
+  if (made.is_object() && self_value.is_object() && made.as_object() != self_value.as_object() && made.as_object()->okind != ObjKind::Array) {
+    JsObject* from = made.as_object();
+    JsObject* names = vm.own_names(from);
+    for (uint32_t i = 0; i < names->length; ++i) {
+      Value value;
+      uint8_t flags;
+      JsString* name = names->items[i].as_string();
+      if (!vm.own_property(from, name, &value, &flags) || (flags & kAccessor)) continue;
+      vm.define(self_value.as_object(), name, value, flags);
+    }
+  }
+  *result = Value();
+  return true;
+}
+
+// --- Destructuring (the parser turns patterns into calls of these) -------------------------------------------------------
+
+// __to_array(iterable, n): the first n values (all when n < 0); an array is used as it is.
+NATIVE(destructure_to_array) {
+  const Value v = arg_at(args, argc, 0);
+  double n = -1;
+  if (argc > 1 && !vm.to_number(args[1], &n)) return false;
+  if (v.is_object() && v.as_object()->okind == ObjKind::Array) {
+    *result = v;
+    return true;
+  }
+  if (v.is_nullish()) {
+    String message(vm.allocator());
+    message.append(v.is_null() ? "null" : "undefined");
+    message.append(" is not iterable");
+    return vm.throw_error(ErrorKind::TypeError, message.view());
+  }
+  JsObject* out = vm.new_array();
+  *result = Value::make_object(out);
+  return vm.iterate_into(out, v, n < 0 ? -1 : static_cast<int64_t>(n));
+}
+
+NATIVE(destructure_require_object) {
+  const Value v = arg_at(args, argc, 0);
+  if (v.is_nullish()) {
+    String message(vm.allocator());
+    message.append("Cannot destructure '");
+    message.append(v.is_null() ? "null" : "undefined");
+    message.append("' as it is ");
+    message.append(v.is_null() ? "null" : "undefined");
+    message.append(".");
+    return vm.throw_error(ErrorKind::TypeError, message.view());
+  }
+  *result = v;
+  return true;
+}
+
+// __rest(object, keys): a new object with the own enumerable properties of `object` that are not in `keys`.
+NATIVE(destructure_rest) {
+  const Value source = arg_at(args, argc, 0), keys = arg_at(args, argc, 1);
+  JsObject* out = vm.new_plain();
+  *result = Value::make_object(out);
+  if (!source.is_object()) return true;
+  JsObject* names = vm.own_keys(source.as_object());
+  for (uint32_t i = 0; i < names->length; ++i) {
+    JsString* name = names->items[i].as_string();
+    bool skip = false;
+    if (keys.is_object())
+      for (uint32_t k = 0; k < keys.as_object()->length && !skip; ++k) {
+        JsString* other;
+        if (!vm.to_string(keys.as_object()->items[k], &other)) return false;
+        skip = other->view().equals(name->view());
+      }
+    if (skip) continue;
+    Value value;
+    if (!vm.get(source, name, &value)) return false;
+    vm.define(out, name, value);
+  }
+  return true;
+}
+
+// __bigint_new(negative, digits): a BigInt object (the arithmetic is in script)
+NATIVE(bigint_new) {
+  JsString* digits;
+  if (!vm.to_string(arg_at(args, argc, 1), &digits)) return false;
+  *result = Value::make_object(vm.new_bigint(Vm::to_boolean(arg_at(args, argc, 0)), digits->view()));
+  return true;
+}
+
+// --- Generators ----------------------------------------------------------------------------------------------------------
+
+NATIVE(generator_next) { return vm.generator_resume(self, 0, arg_at(args, argc, 0), result); }
+NATIVE(generator_throw) { return vm.generator_resume(self, 1, arg_at(args, argc, 0), result); }
+NATIVE(generator_return) { return vm.generator_resume(self, 2, arg_at(args, argc, 0), result); }
+NATIVE(return_this) {
+  *result = self;
+  return true;
+}
+NATIVE(generator_to_string) {
+  *result = str_value(vm, "[object Generator]");
   return true;
 }
 
@@ -193,7 +426,26 @@ NATIVE(object_has_own_property) {
   return true;
 }
 
+// __template(cooked, raw): the strings array a tag function gets
+NATIVE(template_object) {
+  const Value cooked = arg_at(args, argc, 0), raw = arg_at(args, argc, 1);
+  if (cooked.is_object() && raw.is_object()) vm.define_named(cooked.as_object(), "raw", raw, 0);
+  *result = cooked;
+  return true;
+}
+
 NATIVE(object_to_string) {
+  if (self.is_object()) {   // [Symbol.toStringTag]
+    Value tag;
+    if (vm.get_named(self, "@@toStringTag", &tag) && tag.is_string()) {
+      String text(vm.allocator());
+      text.append("[object ");
+      text.append(tag.as_string()->view());
+      text.push_back(']');
+      *result = str_value(vm, text.view());
+      return true;
+    }
+  }
   *result = str_value(vm, self.is_undefined() ? "[object Undefined]" : self.is_null() ? "[object Null]" : self.is_object() && self.as_object()->okind == ObjKind::Array ? "[object Array]" : "[object Object]");
   return true;
 }
@@ -254,7 +506,38 @@ NATIVE(array_ctor) {
 
 NATIVE(array_is_array) {
   const Value v = arg_at(args, argc, 0);
-  *result = Value::make_bool(v.is_object() && v.as_object()->okind == ObjKind::Array);
+  JsObject* o = v.is_object() ? v.as_object() : nullptr;
+  for (int depth = 0; o && o->okind == ObjKind::Proxy && depth < 16; ++depth) o = o->target;   // (a proxy of an array is one)
+  *result = Value::make_bool(o && o->okind == ObjKind::Array);
+  return true;
+}
+
+// --- Proxy ---------------------------------------------------------------------------------------------------------------
+
+NATIVE(proxy_constructor) {
+  if (!self.is_object() || self.as_object()->okind != ObjKind::Plain) return vm.throw_error(ErrorKind::TypeError, "Constructor Proxy requires 'new'");
+  const Value target = arg_at(args, argc, 0), handler = arg_at(args, argc, 1);
+  if (!target.is_object() || !handler.is_object()) return vm.throw_error(ErrorKind::TypeError, "Cannot create proxy with a non-object as target or handler");
+  *result = Value::make_object(vm.new_proxy(target.as_object(), handler));
+  return true;
+}
+
+NATIVE(proxy_revoke_function) {
+  const JsObject* me = vm.current_native();
+  if (me->length > 0 && me->items[0].is_object()) Vm::revoke_proxy(me->items[0].as_object());
+  return true;
+}
+
+NATIVE(proxy_revocable) {
+  const Value target = arg_at(args, argc, 0), handler = arg_at(args, argc, 1);
+  if (!target.is_object() || !handler.is_object()) return vm.throw_error(ErrorKind::TypeError, "Cannot create proxy with a non-object as target or handler");
+  JsObject* proxy = vm.new_proxy(target.as_object(), handler);
+  const Value proxy_value = Value::make_object(proxy);
+  JsObject* revoke = vm.new_native_with(proxy_revoke_function, "", 0, &proxy_value, 1);
+  JsObject* r = vm.new_plain();
+  vm.define_named(r, "proxy", proxy_value);
+  vm.define_named(r, "revoke", Value::make_object(revoke));
+  *result = Value::make_object(r);
   return true;
 }
 
@@ -644,6 +927,39 @@ NATIVE(string_from_char_code) {
   return true;
 }
 
+NATIVE(string_from_code_point) {
+  String text(vm.allocator());
+  for (uint32_t i = 0; i < argc; ++i) {
+    double d;
+    if (!vm.to_number(args[i], &d)) return false;
+    if (!(d >= 0 && d <= 0x10FFFF) || d != static_cast<double>(static_cast<uint32_t>(d))) {
+      String message(vm.allocator());
+      message.append("Invalid code point ");
+      JsString* shown;
+      if (vm.to_string(args[i], &shown)) message.append(shown->view());
+      return vm.throw_error(ErrorKind::RangeError, message.view());
+    }
+    const uint32_t cp = static_cast<uint32_t>(d);
+    if (cp < 0x80) {
+      text.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      text.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      text.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      text.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      text.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      text.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+      text.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+      text.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      text.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+  *result = str_value(vm, text.view());
+  return true;
+}
+
 NATIVE(string_char_at) {
   JsString* s;
   int64_t i;
@@ -798,7 +1114,7 @@ NATIVE(string_split) {
     vm.array_push(out, Value::make_string(s));
     return true;
   }
-  if (sep.is_object()) return vm.throw_error(ErrorKind::TypeError, "split with a regular expression is not supported");
+  if (regexp_is(sep)) return regexp_split(vm, s, sep, limit, result);
   JsString* d;
   if (!vm.to_string(sep, &d)) return false;
   if (d->length == 0) {
@@ -822,7 +1138,7 @@ NATIVE(string_split) {
 bool replace_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result, bool all) {
   JsString *s, *pattern;
   if (!this_string(vm, self, &s)) return false;
-  if (arg_at(args, argc, 0).is_object()) return vm.throw_error(ErrorKind::TypeError, "replace with a regular expression is not supported");
+  if (regexp_is(arg_at(args, argc, 0))) return regexp_replace(vm, s, args[0], arg_at(args, argc, 1), all, result);
   if (!arg_string(vm, args, argc, 0, &pattern)) return false;
   const Value replacement = arg_at(args, argc, 1);
   JsString* fixed = nullptr;
@@ -853,6 +1169,24 @@ bool replace_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, V
   if (pos < s->length) out.append(s->view().substr(pos));
   *result = str_value(vm, out.view());
   return true;
+}
+NATIVE(string_match) {
+  JsString* s;
+  Value re;
+  if (!this_string(vm, self, &s) || !regexp_from_argument(vm, arg_at(args, argc, 0), "", &re)) return false;
+  return regexp_match(vm, s, re, result);
+}
+NATIVE(string_match_all) {
+  JsString* s;
+  Value re;
+  if (!this_string(vm, self, &s) || !regexp_from_argument(vm, arg_at(args, argc, 0), "g", &re)) return false;
+  return regexp_match_all(vm, s, re, result);
+}
+NATIVE(string_search) {
+  JsString* s;
+  Value re;
+  if (!this_string(vm, self, &s) || !regexp_from_argument(vm, arg_at(args, argc, 0), "", &re)) return false;
+  return regexp_search(vm, s, re, result);
 }
 NATIVE(string_replace) { return replace_impl(vm, self, args, argc, result, false); }
 NATIVE(string_replace_all) { return replace_impl(vm, self, args, argc, result, true); }
@@ -1193,7 +1527,13 @@ template <int Kind>
 bool error_ctor(Vm& vm, const Value&, const Value* args, uint32_t argc, Value* result) {
   JsString* message = vm.empty_string();
   if (argc > 0 && !args[0].is_undefined() && !vm.to_string(args[0], &message)) return false;
-  *result = Value::make_object(vm.new_error(static_cast<ErrorKind>(Kind), message->view()));
+  JsObject* error = vm.new_error(static_cast<ErrorKind>(Kind), message->view());
+  *result = Value::make_object(error);
+  if (argc > 1 && args[1].is_object()) {   // new Error(message, { cause })
+    Value cause;
+    if (!vm.get_named(args[1], "cause", &cause)) return false;
+    if (vm.has_property(args[1].as_object(), vm.intern("cause"))) vm.define_named(error, "cause", cause, kWritable);
+  }
   return true;
 }
 
@@ -1783,11 +2123,60 @@ NATIVE(add_event_listener) {
   return true;
 }
 
+// Source text compiled and run as a program of its own (in the global scope): what eval() and the Function constructor do.
+bool run_source(Vm& vm, StringView source, Value* result) {
+  Arena arena(vm.allocator());
+  String message(vm.allocator());
+  Node* program = parse_program(source, arena, &message);
+  if (!program) return vm.throw_error(ErrorKind::SyntaxError, message.view());
+  FunctionCode* code = nullptr;
+  if (!compile_program(vm, program, &code, &message)) return vm.throw_error(ErrorKind::SyntaxError, message.view());
+  JsObject* fn = vm.new_function(code, nullptr, Value());
+  return vm.call(Value::make_object(fn), Value::make_object(vm.global()), nullptr, 0, result);
+}
+
+NATIVE(global_eval) {
+  const Value code = arg_at(args, argc, 0);
+  if (!code.is_string()) {
+    *result = code;
+    return true;
+  }
+  return run_source(vm, code.as_string()->view(), result);
+}
+
+// new Function("a", "b", "return a + b")
+NATIVE(function_constructor) {
+  String source(vm.allocator());
+  source.append("(function anonymous(");
+  for (uint32_t i = 0; i + 1 < argc; ++i) {
+    JsString* p;
+    if (!vm.to_string(args[i], &p)) return false;
+    if (i > 0) source.push_back(',');
+    source.append(p->view());
+  }
+  source.append("\n) {\n");
+  if (argc > 0) {
+    JsString* body;
+    if (!vm.to_string(args[argc - 1], &body)) return false;
+    source.append(body->view());
+  }
+  source.append("\n})");
+  return run_source(vm, source.view(), result);
+}
+
 bool timer_native(Vm& vm, const Value* args, uint32_t argc, Value* result, bool repeat) {
-  if (!Vm::is_callable(arg_at(args, argc, 0))) return vm.throw_error(ErrorKind::TypeError, repeat ? "setInterval needs a function" : "setTimeout needs a function");
+  Value callback = arg_at(args, argc, 0);
+  if (callback.is_string()) {   // setTimeout("code()", 10): the text is compiled once and run as a program each time
+    String source(vm.allocator());
+    source.append("(function () {\n");
+    source.append(callback.as_string()->view());
+    source.append("\n})");
+    if (!run_source(vm, source.view(), &callback)) return false;
+  }
+  if (!Vm::is_callable(callback)) return vm.throw_error(ErrorKind::TypeError, repeat ? "setInterval needs a function" : "setTimeout needs a function");
   double delay = 0;
   if (argc > 1 && !vm.to_number(args[1], &delay)) return false;
-  *result = num_value(vm.add_timer(args[0], delay, repeat ? (delay == delay && delay >= 0 ? delay : 0) : -1, argc > 2 ? args + 2 : nullptr, argc > 2 ? argc - 2 : 0));
+  *result = num_value(vm.add_timer(callback, delay, repeat ? (delay == delay && delay >= 0 ? delay : 0) : -1, argc > 2 ? args + 2 : nullptr, argc > 2 ? argc - 2 : 0));
   return true;
 }
 NATIVE(set_timeout) { return timer_native(vm, args, argc, result, false); }
@@ -1937,10 +2326,29 @@ bool install_builtins(Vm& vm) {
   vm.define_native(object, "isFrozen", object_is_frozen, 1);
   vm.define_native(object, "getPrototypeOf", object_get_prototype_of, 1);
   vm.define_native(object, "defineProperty", object_define_property, 3);
+  vm.define_native(object, "defineProperties", object_define_properties, 2);
+  vm.define_native(object, "getOwnPropertyDescriptor", object_get_own_property_descriptor, 2);
+  vm.define_native(object, "getOwnPropertyNames", object_get_own_property_names, 1);
+  vm.define_native(object, "setPrototypeOf", object_set_prototype_of, 2);
   vm.define_native(vm.object_proto(), "hasOwnProperty", object_has_own_property, 1);
+  JsObject* generator_proto = vm.new_plain();   // what the objects made by generator functions inherit from
+  vm.define_native(generator_proto, "next", generator_next, 1);
+  vm.define_native(generator_proto, "throw", generator_throw, 1);
+  vm.define_native(generator_proto, "return", generator_return, 1);
+  vm.define_native(generator_proto, "toString", generator_to_string, 0);
+  vm.define(generator_proto, vm.intern("@@iterator"), Value::make_object(vm.new_native(return_this, "[Symbol.iterator]", 0)), kWritable);
+  vm.define_named(g, "__generator_proto", Value::make_object(generator_proto), 0);
+  vm.define_native(g, "__template", template_object, 2);
+  vm.define_native(g, "__bigint_new", bigint_new, 2);
+  vm.define_native(g, "__to_array", destructure_to_array, 2);
+  vm.define_native(g, "__req_object", destructure_require_object, 1);
+  vm.define_native(g, "__rest", destructure_rest, 2);
+  vm.define_native(g, "__class", class_setup, 2);
+  vm.define_native(g, "__def", class_define, 4);
+  vm.define_native(g, "__super_init", class_super_init, 2);
   vm.define_native(vm.object_proto(), "toString", object_to_string, 0);
   vm.define_native(vm.object_proto(), "valueOf", object_value_of, 0);
-  make_ctor("Function", object_ctor, 1, vm.function_proto());
+  make_ctor("Function", function_constructor, 1, vm.function_proto());
   vm.define_native(vm.function_proto(), "call", function_call, 1);
   vm.define_native(vm.function_proto(), "apply", function_apply, 2);
   vm.define_native(vm.function_proto(), "bind", function_bind, 1);
@@ -1979,6 +2387,7 @@ bool install_builtins(Vm& vm) {
   // String
   JsObject* string = make_ctor("String", string_ctor, 1, vm.string_proto());
   vm.define_native(string, "fromCharCode", string_from_char_code, 1);
+  vm.define_native(string, "fromCodePoint", string_from_code_point, 1);
   JsObject* sp = vm.string_proto();
   vm.define_native(sp, "charAt", string_char_at, 1);
   vm.define_native(sp, "at", string_at, 1);
@@ -1998,6 +2407,9 @@ bool install_builtins(Vm& vm) {
   vm.define_native(sp, "trimEnd", string_trim_end, 0);
   vm.define_native(sp, "split", string_split, 2);
   vm.define_native(sp, "replace", string_replace, 2);
+  vm.define_native(sp, "match", string_match, 1);
+  vm.define_native(sp, "matchAll", string_match_all, 1);
+  vm.define_native(sp, "search", string_search, 1);
   vm.define_native(sp, "replaceAll", string_replace_all, 2);
   vm.define_native(sp, "repeat", string_repeat, 1);
   vm.define_native(sp, "padStart", string_pad_start, 2);
@@ -2038,6 +2450,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "isNaN", global_is_nan, 1);
   vm.define_native(g, "isFinite", global_is_finite, 1);
   vm.define_native(g, "alert", global_alert, 1);
+  vm.define_native(g, "eval", global_eval, 1);
   vm.define_native(g, "setTimeout", set_timeout, 2);
   vm.define_native(g, "setInterval", set_interval, 2);
   vm.define_native(g, "clearTimeout", clear_timeout, 1);
@@ -2171,6 +2584,12 @@ bool install_builtins(Vm& vm) {
   vm.define_named(navigator, "userAgent", str_value(vm, vm.host() ? vm.host()->user_agent() : StringView()), kDefaultFlags);
   vm.define_named(navigator, "language", str_value(vm, "en-US"), kDefaultFlags);
   global_value("navigator", Value::make_object(navigator));
+  if (!install_regexp(vm) || !install_typed_arrays(vm)) return false;
+  {
+    JsObject* proxy = vm.new_native(proxy_constructor, "Proxy", 2);
+    vm.define_native(proxy, "revocable", proxy_revocable, 2);
+    vm.define_named(vm.global(), "Proxy", Value::make_object(proxy), kWritable);
+  }
   return !vm.halted();
 }
 

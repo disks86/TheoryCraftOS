@@ -261,6 +261,9 @@ add_executable(BOOTX64
   src/Script/Compiler.cpp
   src/Script/Vm.cpp
   src/Script/Builtins.cpp
+  src/Script/RegExp.cpp
+  src/Script/TypedArray.cpp
+  src/Script/Stdlib.cpp
   src/Script/Engine.cpp
   src/Browser/PageLayout.cpp
   src/Browser/Url.cpp
@@ -413,6 +416,11 @@ add_executable(BOOTX64
   src/Media/Audio/Vorbis.cpp
   src/Media/Audio/Mp3.cpp
   src/Media/Audio/Aac.cpp
+  src/Media/Audio/AacEncoder.cpp
+  src/Media/Audio/Opus.cpp
+  src/Media/Audio/OpusCelt.cpp
+  src/Media/Audio/OpusFile.cpp
+  src/Media/Audio/OpusSilk.cpp
   src/Media/Audio/Mp4Audio.cpp
   src/Media/Mp4.cpp
   src/Media/VideoFiles.cpp
@@ -443,10 +451,15 @@ add_executable(BOOTX64
   src/Hardware/Printer/Usb/UsbPrinter.cpp
   src/Hardware/VideoCodec/Software/JpegDecoder.cpp
   src/Hardware/VideoCodec/Software/H264Syntax.cpp
+  src/Hardware/VideoCodec/Software/H264Encoder.cpp
   src/Hardware/VideoCodec/Software/H264Macroblock.cpp
   src/Hardware/VideoCodec/Software/H264Cabac.cpp
   src/Hardware/VideoCodec/Software/H264Predict.cpp
   src/Hardware/VideoCodec/Software/H264Deblock.cpp
+  src/Hardware/VideoCodec/Software/Vp9.cpp
+  src/Hardware/VideoCodec/Software/Vp9Syntax.cpp
+  src/Hardware/VideoCodec/Software/Vp9Recon.cpp
+  src/Hardware/VideoCodec/Software/Vp9LoopFilter.cpp
   src/Hardware/VideoCodec/Software/JpegEncoder.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp

@@ -50,13 +50,20 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   case-insensitive / multiline / dot-all / UTF-8 flags; no lookbehind). One compiler and one backtracking matcher serve both front ends: `regex::compile<"...">()` builds the
   program while the C++ is compiled (fixed tables, no allocator, usable in `static_assert`; a bad pattern is a compile error) and `regex::Regex` compiles text at run time from an
   `IAllocator`. Searches run under step and stack limits (`Result::StepLimit` / `StackLimit` instead of a hang). Tested by `tests/RegexTest.cpp`.
-- **Script/** a JavaScript engine (a practical ES5 subset with let / const, arrow functions, template literals, spread and for-of): `Parser` makes a syntax
-  tree, `Compiler` turns it into bytecode (variables are resolved to slots of per-call environments, `finally` is compiled in line), `Vm` runs it on a
-  stack machine with its own mark-and-sweep heap, an instruction budget and a memory limit, and `Builtins` has Object, Array, String, Number, Math, JSON, Date,
-  Error, console and a little of `document`. `Engine` is the interface. Promises are native (`then` / `catch` / `finally`, `all` / `allSettled` / `race` / `any` /
-  `withResolvers`, a microtask queue that drains after each task, unhandled rejections reported) and `async` functions / `await` run as coroutines. `JSON` is
-  strict (V8-style error messages, reviver, replacer function or array, `toJSON`, cycle detection). Not there: classes, regular expressions, destructuring,
-  getters / setters, generators, Map / Set; strings are bytes (UTF-8), so `.length` counts bytes. Timers are real (`setTimeout` / `setInterval` run from the host's clock), and host objects let the browser expose the DOM. Tested by `tests/ScriptTest.cpp` (the language, the built-ins, limits, the collector, damaged and deeply nested programs).
+- **Script/** a JavaScript engine (ES2022 and a little more): `Parser` makes a syntax tree (classes, destructuring and tagged templates are turned into plain
+  code there), `Compiler` turns it into bytecode (variables are resolved to slots of per-call environments, `finally` is compiled in line), `Vm` runs it on a
+  stack machine with its own mark-and-sweep heap, an instruction budget and a memory limit, and `Builtins` has Object, Function (also `new Function` and
+  `eval`), Array, String, Number, Math, JSON, Error (with `cause`), console and a little of `document`. The language has `let` / `const`, arrow functions,
+  template literals, spread, for-of, default parameters, destructuring, classes (`extends`, `super`, static members, fields, `#private` names, accessors), getters
+  and setters, generators, async generators and `for await`, `Proxy` and `Reflect`, regular expressions (`RegExp.cpp` on top of `src/Regex`, with `match` / `matchAll` / `replace` / `split` /
+  `search`), `Symbol` (a symbol is a string that starts with `@@`, so `typeof` says "string"), `BigInt` (arbitrary precision), `Map` / `Set` / `WeakMap` / `WeakSet` / `WeakRef`, typed arrays,
+  `ArrayBuffer` and `DataView` (`TypedArray.cpp`), `Date` (parsing, UTC and local accessors; the local time zone is UTC) and `Intl` (English number, date,
+  plural, relative time and list formats, with a few other locales' orders), written in script in `Stdlib.cpp` and `Engine.cpp`. `Engine` is the interface.
+  Promises are native (`then` / `catch` / `finally`, `all` / `allSettled` / `race` / `any` / `withResolvers`, a microtask queue that drains after each task,
+  unhandled rejections reported) and `async` functions / `await` run as coroutines. `JSON` is strict (V8-style error messages, reviver, replacer function or
+  array, `toJSON`, cycle detection). `BigInt` is an object kind whose arithmetic is written in script (`Stdlib.cpp`). Not there: `with`; strings are bytes (UTF-8), so `.length` counts bytes. Timers are
+  real (`setTimeout` / `setInterval` run from the host's clock, nested ones are held back to 4 ms, a string is compiled once), and host objects let the browser
+  expose the DOM. Tested by `tests/ScriptTest.cpp` (the language, the built-ins, limits, the collector, damaged and deeply nested programs).
 - **Browser/ web platform:** `WebUrl` is the WHATWG URL parser behind `URL` and `URLSearchParams` (special schemes, IPv4 / IPv6, punycode, percent-encode sets, the
   setters); `CookieJar` keeps cookies the way RFC 6265bis says (`Domain`, `Path`, `Secure`, `HttpOnly`, `SameSite`, `Max-Age` / `Expires`, `__Host-` / `__Secure-`
   prefixes) for `document.cookie` and for requests; `Fetcher` sits between a page and `IPageLoader::exchange` (cookies, redirects, CORS with preflight, mixed
@@ -64,7 +71,11 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   `FileReader` / `TextEncoder` / `AbortController` / `structuredClone` / `MessageChannel` / `BroadcastChannel` that is written in JavaScript on top of a few
   native functions; `PageHub` shares `localStorage` between the pages of an origin (with `storage` events) and carries `postMessage` and `BroadcastChannel`
   between windows; `SessionHistory` holds the entries behind `history` (`pushState` / `replaceState` / `go`, `popstate`, `hashchange`, scroll restoration).
-  `requestIdleCallback`, `unhandledrejection` and `error` events are there too. Tests: `UrlTest`, `CookieTest`, `FetcherTest`, `HistoryTest`, `PageTest`.
+  `requestIdleCallback`, `unhandledrejection` and `error` events are there too. `WebSocket` runs over `HttpClient`'s WebSocket support (through
+  `IPageLoader::open_websocket`, polled by a timer of the page). The DOM script in `WebPrelude.cpp` adds `Range` / `Selection`, `TreeWalker` / `NodeIterator`,
+  attribute nodes, `MutationObserver` (the document logs its changes while somebody observes) and custom elements (`customElements.define`, the lifecycle
+  callbacks, `new MyElement()`, upgrades); shadow trees (`attachShadow`, `<slot>`, `:host`, the shadow tree's own `<style>`) are drawn in place of their host's
+  children, and each kind of element has its own interface (`el instanceof HTMLInputElement`). Tests: `UrlTest`, `CookieTest`, `FetcherTest`, `HistoryTest`, `PageTest`.
 - **Browser/ CSS and boxes:** `Css` reads custom properties and `var()`, `calc()` / `min()` / `max()` / `clamp()`, the shorthands, `inherit` / `initial` /
   `unset`, `@supports` / `@layer` / `@container` / `@media`, `::before` / `::after` / `::marker`, `:hover` / `:active` / `:focus-within` (the pointer is tracked by
   `PageView` and `Page::set_pointer`). `RendererBoxes` draws boxes into character cells: borders (`+ - | : # = .`), padding, margins, `width` / `height` with
@@ -245,11 +256,13 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   range). `Software/SoftwareVideoCodec` really decodes and encodes **Motion JPEG** (`Jpeg.hpp`: a baseline JPEG decoder - any
   sampling up to 2x2, restart markers, several scans - using the IJG accurate integer DCT, bit-exact with a reference decoder
   on 4:4:4 and grey, and an encoder with per-picture optimal Huffman tables, quality 1-100, 4:2:0) and **raw** I420/NV12/BGRA
-  frames, and decodes **H.264 / AVC** (`H264.hpp`, see below). The vendor classes `NVIDIA/NvidiaVideoEngine` (NVDEC/NVENC), `AMD/AmdVcnVideoEngine` (VCN) and
+  frames, and decodes and encodes **H.264 / AVC** (`H264.hpp` and `H264Encoder.hpp`, see below). The vendor classes `NVIDIA/NvidiaVideoEngine` (NVDEC/NVENC), `AMD/AmdVcnVideoEngine` (VCN) and
   `Intel/IntelMediaVideoEngine` (Quick Sync) are what `SystemVideoCodecs` creates for a display controller of that vendor: they
   report `info().hardware_engine` but `accelerated` stays false - this OS does not drive those engines, so their sessions run on
-  the CPU, and **H.265, VP9 and AV1 are not available** (and H.264 can only be decoded, not encoded) until a native driver exists
-  (that is where it goes). Not covered: arithmetic JPEG, capture devices.
+  the CPU, and **H.265, VP9 and AV1 are not available** until a native driver exists (that is where it goes: the GPU classes are
+  still UEFI-framebuffer wrappers, so there is no register access, firmware or command submission for an engine to stand on).
+  When a driver reports `accelerated` for a codec, `SystemVideoCodecs` already offers it first and falls back to the CPU sessions.
+  Not covered: arithmetic JPEG, capture devices.
   The H.264 decoder (`H264*.cpp`, about 3,700 lines, integer only) covers Baseline, Main and High profile 8-bit 4:2:0 progressive video:
   CAVLC and CABAC, I/P/B slices, 4x4 and 8x8 transforms, quantisation matrices, intra 4x4/8x8/16x16, quarter-sample motion with
   multiple reference frames, spatial and temporal direct prediction, explicit and implicit weighted prediction, long-term
@@ -260,7 +273,14 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   (transform bypass), bit depths above 8 and 4:2:2/4:4:4. It was checked bit for bit against ffmpeg on x264 streams (CAVLC and CABAC,
   B pyramids, weighted prediction, both direct modes, 8x8 transform, quantisation matrices, slices, constrained intra, noise at
   QP 8, odd sizes, open GOP, intra refresh) and on OpenH264 streams (long-term references, reordering), and fuzzed under ASAN/UBSAN.
-  `tests/VideoCodecTest.cpp` includes a fuzz run of the JPEG decoder under ASAN/UBSAN.
+  The H.264 encoder (`H264Encoder.cpp`, about 1,100 lines) writes Baseline profile streams: CAVLC, I and P pictures (an IDR every
+  `keyframe_interval` pictures, SPS/PPS in front of it), Intra16x16 macroblocks (DC / vertical / horizontal, chroma DC / horizontal /
+  vertical), P 16x16 with a diamond search over whole-pixel vectors, skipped macroblocks with the standard's inferred vectors, one
+  fixed quantiser from `quality`, full-range VUI. Deblocking is switched off in the stream so the encoder's reconstruction is the
+  decoder's output exactly (the test decodes every picture with `H264Decoder` and compares bit for bit); `avcc()` gives the record for
+  an MP4 muxer. Not done: B pictures, CABAC, sub-pixel motion, smaller partitions, Intra4x4, rate control, multiple slices. Streams were
+  decoded with ffmpeg and came out identical to this decoder's output. `tests/VideoCodecTest.cpp` also fuzzes the JPEG decoder and
+  feeds truncated and bit-flipped encoder streams to the decoder under ASAN/UBSAN.
 - `src/Hardware/Camera/`: cameras. `ICamera` (polled: `start(width, height, fps)` or `start_mode()`, `pump()` services the hardware, `read_frame()`
   copies the newest unread picture into a `VideoFrameBuffer` in any pixel format; brightness, contrast, saturation and sharpness as 0..100)
   and `SystemCameras` (finds the cameras; `start_service()` runs `pump()` every 4 ms from the "camera" thread, which `main` starts when a camera
@@ -382,7 +402,12 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
     FFT-based IMDCT; within one 16-bit step of ffmpeg's output; floor type 0 and chained streams are not handled), AAC-LC (ADTS `.aac`,
     and the audio of MP4 / M4A / MOV files through the `Mp4` container reader: all of ISO 14496-3's LC tools - long and short blocks,
     window shapes, M/S and intensity stereo, PNS, TNS, pulse data - decoded to the front channel pair, within two 16-bit steps of ffmpeg's output; Main, LTP, SBR/HE-AAC and
-    fragmented MP4 are not handled; MP3 inside MP4 works too). Encoders write 16-bit PCM (WAV/AIFF/AU) and FLAC. **Not provided: Opus, HEVC/VP9/AV1 video.**
+    fragmented MP4 are not handled; MP3 inside MP4 works too). Encoders write 16-bit PCM (WAV/AIFF/AU), FLAC and **AAC-LC**
+    (`encode_aac()` / `AacEncoder`: ADTS or raw blocks for an MP4 muxer, mono or stereo at the standard's 13 rates, long blocks with
+    the sine window, forward MDCT, Huffman codebooks 1-11 with escapes, per-band mid/side, scalefactors from band levels and a bit
+    reservoir that holds the average to the requested bitrate within about 1%; no block switching, TNS or psychoacoustic model, so
+    transients smear; the sound starts 1024 frames late, the format's transform delay; ffmpeg decodes the streams and matches this
+    decoder, and at equal size the SNR on test material is level with ffmpeg's own AAC encoder). **Not provided: Opus, HEVC/VP9/AV1 video.**
   - Video files: `VideoFiles` reads GIF, APNG, animated WebP and Y4M (4:2:0/4:2:2/4:4:4/mono) as frames with their own durations, which
     `VideoPlayer::open_media()` plays (AVI as before, now also with A-law, mu-law and ADPCM soundtracks and H.264 video; MP4 / MOV
     with H.264; a still picture opens as a one-frame video).

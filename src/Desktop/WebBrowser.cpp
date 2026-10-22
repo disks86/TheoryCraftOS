@@ -1030,6 +1030,14 @@ bool WebBrowser::Env::http_request(const browser::FetchOptions& options, browser
   return browser::fetch_resource(owner_.allocator(), *owner_.loader_, owner_.jar(), options, response);
 }
 
+UniquePointer<browser::IWebSocket> WebBrowser::Env::open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
+  if (!owner_.loader_) {
+    error->assign("There is no network connection.");
+    return UniquePointer<browser::IWebSocket>();
+  }
+  return owner_.loader_->open_websocket(url, protocols, origin, error);
+}
+
 UniquePointer<browser::IVideoClip> WebBrowser::Env::open_video(UniquePointer<ByteBuffer> data) {
   if (!owner_.codecs_ || !owner_.clock_ || !data) return UniquePointer<browser::IVideoClip>();
   auto clip = UniquePointer<BrowserVideoClip>::make(owner_.allocator(), owner_.allocator(), *owner_.clock_, *owner_.codecs_, owner_.mixer_, util::move(data));

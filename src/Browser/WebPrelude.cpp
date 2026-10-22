@@ -29,6 +29,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   var typeError = function (what, message) { return new TypeError("Failed to " + what + ": " + message); };
   var lower = function (s) { return String(s).toLowerCase(); };
   var isObject = function (v) { return v !== null && typeof v === 'object'; };
+  var __utf8_bytes_length = function (text) { return text.length; };   // (strings are bytes in this engine)
 
   // ---------------------------------------------------------------------------------------------------------------- URLSearchParams
   function parseQuery(list, text) {
@@ -1162,6 +1163,172 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (idleHandles[id] !== undefined) { clearTimeout(idleHandles[id]); delete idleHandles[id]; }
   });
 
+  // ------------------------------------------------------------------------------------------------------------------- WebSocket
+  function CloseEvent(type, init) {
+    if (!(this instanceof CloseEvent)) throw typeError("construct 'CloseEvent'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    var e = new Event(type, init);
+    init = init || {};
+    e.wasClean = !!init.wasClean; e.code = init.code | 0; e.reason = init.reason === undefined ? '' : String(init.reason);
+    Object.setPrototypeOf(e, CloseEvent.prototype);
+    return e;
+  }
+  CloseEvent.prototype = Object.create(Event.prototype);
+  method(CloseEvent.prototype, 'constructor', CloseEvent);
+  hide(g, 'CloseEvent', CloseEvent);
+  function WebSocket(url, protocols) {
+    if (!(this instanceof WebSocket)) throw typeError("construct 'WebSocket'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (arguments.length < 1) throw typeError("construct 'WebSocket'", "1 argument required, but only 0 present.");
+    var parsed;
+    try { parsed = new URL(String(url), location.href); } catch (e) { throw new DOMException("Failed to construct 'WebSocket': The URL '" + url + "' is invalid.", 'SyntaxError'); }
+    var scheme = parsed.protocol;
+    if (scheme === 'http:') scheme = 'ws:'; else if (scheme === 'https:') scheme = 'wss:';
+    if (scheme !== 'ws:' && scheme !== 'wss:') throw new DOMException("Failed to construct 'WebSocket': The URL's scheme must be either 'ws' or 'wss'. '" + parsed.protocol.slice(0, -1) + "' is not allowed.", 'SyntaxError');
+    if (parsed.hash) throw new DOMException("Failed to construct 'WebSocket': The URL contains a fragment identifier ('" + parsed.hash + "'). Fragment identifiers are not allowed in WebSocket URLs.", 'SyntaxError');
+    if (location.protocol === 'https:' && scheme === 'ws:' && parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1')
+      throw new DOMException("Failed to construct 'WebSocket': An insecure WebSocket connection may not be initiated from a page loaded over HTTPS.", 'SecurityError');
+    var list = protocols === undefined ? [] : (typeof protocols === 'string' ? [protocols] : Array.prototype.slice.call(protocols).map(String));
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] === '' || /[\u0000- \u007f()<>@,;:\\"\/\[\]?={}]/.test(list[i])) throw new DOMException("Failed to construct 'WebSocket': The subprotocol '" + list[i] + "' is invalid.", 'SyntaxError');
+      if (list.indexOf(list[i]) !== i) throw new DOMException("Failed to construct 'WebSocket': The subprotocol '" + list[i] + "' is duplicated.", 'SyntaxError');
+    }
+    this.url = scheme + parsed.href.slice(parsed.protocol.length);
+    this.readyState = 0; this.bufferedAmount = 0; this.extensions = ''; this.protocol = ''; this.binaryType = 'blob';
+    this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+    var self = this, id = __ws_open(this.url, list.join(', '));
+    hide(this, '__id', id);
+    if (!id) {   // it could not be started: the failure is told after the script that asked
+      var reason = __ws_error;
+      setTimeout(function () { socketEnded(self, false, 1006, ''); }, 0);
+      return;
+    }
+    hide(this, '__timer', setInterval(function () { pump(self); }, 10));
+  }
+  WebSocket.prototype = Object.create(EventTarget.prototype);
+  method(WebSocket.prototype, 'constructor', WebSocket);
+  WebSocket.CONNECTING = WebSocket.prototype.CONNECTING = 0; WebSocket.OPEN = WebSocket.prototype.OPEN = 1;
+  WebSocket.CLOSING = WebSocket.prototype.CLOSING = 2; WebSocket.CLOSED = WebSocket.prototype.CLOSED = 3;
+  function socketEnded(ws, opened, code, reason) {
+    if (ws.readyState === 3) return;
+    ws.readyState = 3;
+    if (ws.__timer) { clearInterval(ws.__timer); ws.__timer = 0; }
+    if (!opened) ws.dispatchEvent(new Event('error'));
+    ws.dispatchEvent(new CloseEvent('close', { wasClean: opened && code !== 1006, code: code, reason: reason }));
+    if (ws.__id) __ws_release(ws.__id);
+  }
+  function pump(ws) {
+    if (ws.readyState === 3) return;
+    var id = ws.__id, state = __ws_state(id);
+    if (ws.readyState === 0 && state >= 1 && (state < 3 || __ws_info(id)[3])) {
+      ws.readyState = state === 1 ? 1 : 2;
+      ws.protocol = __ws_info(id)[0];
+      ws.dispatchEvent(new Event('open'));
+    }
+    var data, guard = 0;
+    while (ws.readyState !== 3 && guard++ < 100 && (data = __ws_receive(id)) !== null) {
+      if (typeof data !== 'string') {
+        if (ws.binaryType === 'arraybuffer') data = data.buffer;
+        else data = new Blob([data]);
+      }
+      ws.dispatchEvent(new MessageEvent('message', { data: data, origin: new URL(ws.url.replace(/^ws/, 'http')).origin, lastEventId: '', source: null, ports: [] }));
+    }
+    if (ws.readyState === 1 && state === 2) ws.readyState = 2;
+    if (state === 3) {
+      var info = __ws_info(id);
+      socketEnded(ws, info[3], info[1], info[2]);
+    }
+  }
+  method(WebSocket.prototype, 'send', function (data) {
+    if (this.readyState === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError');
+    if (this.readyState !== 1) return;
+    var self = this;
+    if (data instanceof Blob) { data.arrayBuffer().then(function (buffer) { if (self.readyState === 1) __ws_send(self.__id, new Uint8Array(buffer)); }); return; }
+    if (typeof data === 'string') { __ws_send(this.__id, data); return; }
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) { __ws_send(this.__id, data instanceof ArrayBuffer ? new Uint8Array(data) : data); return; }
+    __ws_send(this.__id, String(data));
+  });
+  method(WebSocket.prototype, 'close', function (code, reason) {
+    if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999))
+      throw new DOMException("Failed to execute 'close' on 'WebSocket': The code must be either 1000, or between 3000 and 4999. " + code + ' is neither.', 'InvalidAccessError');
+    reason = reason === undefined ? '' : String(reason);
+    if (__utf8_bytes_length(reason) > 123) throw new DOMException("Failed to execute 'close' on 'WebSocket': The message must not be greater than 123 bytes.", 'SyntaxError');
+    if (this.readyState >= 2) return;
+    this.readyState = 2;
+    if (this.__id) __ws_close(this.__id, code === undefined ? 1000 : code, reason);
+  });
+  hide(g, 'WebSocket', WebSocket);
+
+  // ------------------------------------------------------------------------------------------------------------------- Worker
+  var workers = {};
+  function Worker(url, options) {
+    if (!(this instanceof Worker)) throw typeError("construct 'Worker'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (arguments.length < 1) throw typeError("construct 'Worker'", "1 argument required, but only 0 present.");
+    var address;
+    try { address = new URL(String(url), location.href); } catch (e) { throw new DOMException("Failed to construct 'Worker': Script at '" + url + "' cannot be accessed from origin '" + location.origin + "'.", 'SyntaxError'); }
+    if (address.protocol !== 'blob:' && address.protocol !== 'data:' && address.origin !== location.origin)
+      throw new DOMException("Failed to construct 'Worker': Script at '" + address.href + "' cannot be accessed from origin '" + location.origin + "'.", 'SecurityError');
+    this.onmessage = null; this.onerror = null; this.onmessageerror = null;
+    hide(this, '__id', 0);
+    hide(this, '__pending', []);
+    hide(this, '__dead', false);
+    hide(this, '__timer', 0);
+    var self = this, name = options && options.name !== undefined ? String(options.name) : '';
+    var source = address.protocol === 'blob:' ? (blobUrls[address.href] ? blobUrls[address.href].text() : Promise.reject(new Error('The blob is gone'))) : fetch(address.href).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); });
+    source.then(function (text) {
+      if (self.__dead) return;
+      var id = __worker_start(text, address.href, name);
+      if (!id) { fail(self, __worker_error || 'The worker could not be started'); return; }
+      self.__id = id;
+      workers[id] = self;
+      self.__pending.forEach(function (m) { __worker_post(id, m); });
+      self.__pending.length = 0;
+      self.__timer = setInterval(pumpWorkers, 5);
+    }).catch(function (e) { fail(self, e && e.message ? e.message : String(e)); });
+  }
+  Worker.prototype = Object.create(EventTarget.prototype);
+  method(Worker.prototype, 'constructor', Worker);
+  function fail(worker, message) {
+    if (worker.__dead) return;
+    var e = new Event('error', { cancelable: true });
+    e.message = String(message); e.filename = ''; e.lineno = 0; e.colno = 0; e.error = null;
+    worker.dispatchEvent(e);
+  }
+  method(Worker.prototype, 'postMessage', function (message) {
+    if (arguments.length < 1) throw typeError("execute 'postMessage' on 'Worker'", "1 argument required, but only 0 present.");
+    if (this.__dead) return;
+    var text = __wire_encode(message);
+    if (this.__id) __worker_post(this.__id, text); else this.__pending.push(text);
+  });
+  method(Worker.prototype, 'terminate', function () {
+    if (this.__dead) return;
+    this.__dead = true;
+    if (this.__id) { __worker_terminate(this.__id); delete workers[this.__id]; }
+    if (this.__timer) { clearInterval(this.__timer); this.__timer = 0; }
+  });
+  var pumping = false;
+  function pumpWorkers() {
+    if (pumping) return;
+    pumping = true;
+    try {
+      var events = __worker_pump();
+      for (var i = 0; i < events.length; i++) {
+        var id = events[i][0], kind = events[i][1], text = events[i][2], worker = workers[id];
+        if (!worker || worker.__dead) continue;
+        if (kind === 0) {
+          var data;
+          try { data = __wire_decode(text); } catch (e) { worker.dispatchEvent(new MessageEvent('messageerror', { data: null })); continue; }
+          worker.dispatchEvent(new MessageEvent('message', { data: data, origin: '', lastEventId: '', source: null, ports: [] }));
+        } else if (kind === 1) {
+          fail(worker, text);
+        } else {
+          worker.terminate();
+        }
+      }
+    } finally { pumping = false; }
+    var any = false;
+    for (var k in workers) any = true;
+  }
+  hide(g, 'Worker', Worker);
+
   // ------------------------------------------------------------------------------------------------------------------- BroadcastChannel
   var channels = {};
   function BroadcastChannel(name) {
@@ -1805,12 +1972,214 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   if (doc.timeline === undefined) hide(doc, 'timeline', { currentTime: 0 });
   if (doc.designMode === undefined) doc.designMode = 'off';
   if (doc.dir === undefined) doc.dir = '';
+
+  // ------------------------------------------------------------------------------------------------------------------ MutationObserver
+  var observers = [];   // every observer that observes something
+  function MutationObserver(callback) {
+    if (!(this instanceof MutationObserver)) throw new TypeError("Failed to construct 'MutationObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (typeof callback !== 'function') throw new TypeError("Failed to construct 'MutationObserver': The callback provided as parameter 1 is not a function.");
+    hide(this, '__callback', callback);
+    hide(this, '__targets', []);
+    hide(this, '__queue', []);
+  }
+  method(MutationObserver.prototype, 'observe', function (target, options) {
+    if (!target || typeof target.nodeType !== 'number') throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
+    options = options || {};
+    var o = { childList: !!options.childList, subtree: !!options.subtree, attributes: options.attributes, characterData: options.characterData,
+              attributeOldValue: !!options.attributeOldValue, characterDataOldValue: !!options.characterDataOldValue, attributeFilter: options.attributeFilter };
+    if (o.attributes === undefined && (o.attributeOldValue || o.attributeFilter !== undefined)) o.attributes = true;
+    if (o.characterData === undefined && o.characterDataOldValue) o.characterData = true;
+    o.attributes = !!o.attributes; o.characterData = !!o.characterData;
+    if (!o.childList && !o.attributes && !o.characterData)
+      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    if (o.attributeOldValue && !o.attributes) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+    for (var i = 0; i < this.__targets.length; i++) if (this.__targets[i].node === target) { this.__targets[i].options = o; return; }
+    this.__targets.push({ node: target, options: o });
+    if (observers.indexOf(this) < 0) observers.push(this);
+    __mutations_on();
+    __watch_node(target);
+  });
+  method(MutationObserver.prototype, 'disconnect', function () {
+    this.__targets.length = 0;
+    this.__queue.length = 0;
+    var at = observers.indexOf(this);
+    if (at >= 0) observers.splice(at, 1);
+  });
+  method(MutationObserver.prototype, 'takeRecords', function () { processLog(); var q = this.__queue.slice(); this.__queue.length = 0; return q; });
+  hide(g, 'MutationObserver', MutationObserver);
+  function MutationRecord() { throw new TypeError('Illegal constructor'); }
+  hide(g, 'MutationRecord', MutationRecord);
+
+  function reportError(e) {
+    try { setTimeout(function () { throw e; }, 0); } catch (ignored) { }
+  }
+  function deliver(record) {
+    for (var i = 0; i < observers.length; i++) {
+      var observer = observers[i];
+      for (var t = 0; t < observer.__targets.length; t++) {
+        var reg = observer.__targets[t], o = reg.options;
+        var applies = reg.node === record.target || (o.subtree && record.watchers.indexOf(reg.node) >= 0);
+        if (!applies) continue;
+        if (record.type === 'childList' && !o.childList) continue;
+        if (record.type === 'attributes' && (!o.attributes || (o.attributeFilter && o.attributeFilter.indexOf(record.attributeName) < 0))) continue;
+        if (record.type === 'characterData' && !o.characterData) continue;
+        var copy = Object.create(MutationRecord.prototype);
+        copy.type = record.type; copy.target = record.target; copy.addedNodes = record.addedNodes; copy.removedNodes = record.removedNodes;
+        copy.previousSibling = record.previousSibling; copy.nextSibling = record.nextSibling; copy.attributeName = record.attributeName;
+        copy.attributeNamespace = null;
+        copy.oldValue = (record.type === 'attributes' && o.attributeOldValue) || (record.type === 'characterData' && o.characterDataOldValue) ? record.oldValue : null;
+        observer.__queue.push(copy);
+        break;   // (an observer gets a record once)
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------ custom elements
+  var definitions = {}, waiting = {};
+  function validName(name) {
+    if (name.indexOf('-') < 1 || name !== name.toLowerCase() || !/^[a-z]/.test(name)) return false;
+    return ['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph'].indexOf(name) < 0;
+  }
+  function upgrade(el) {
+    var def = definitions[el.localName];
+    if (!def || el.__ce !== undefined) return;
+    Object.defineProperty(el, '__ce', { value: 1, writable: true });
+    Object.setPrototypeOf(el, def.ctor.prototype);
+    try { def.ctor.call(el); } catch (e) { reportError(e); }
+    for (var i = 0; i < def.observed.length; i++) {
+      var a = def.observed[i];
+      if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a)]);
+    }
+    if (el.isConnected) callback(el, 'connectedCallback', []);
+  }
+  function callback(el, name, args) {
+    var fn = el[name];
+    if (typeof fn !== 'function') return;
+    try { fn.apply(el, args); } catch (e) { reportError(e); }
+  }
+  function eachElement(node, fn) {
+    if (node.nodeType === 1) fn(node);
+    for (var c = node.firstChild; c; c = c.nextSibling) eachElement(c, fn);
+  }
+  function reactions(record) {
+    if (record.type === 'childList') {
+      for (var i = 0; i < record.addedNodes.length; i++) eachElement(record.addedNodes[i], function (el) {
+        if (definitions[el.localName] && el.__ce === undefined && el.isConnected) upgrade(el);
+        else if (el.__ce !== undefined && el.isConnected) callback(el, 'connectedCallback', []);
+      });
+      for (var j = 0; j < record.removedNodes.length; j++) eachElement(record.removedNodes[j], function (el) {
+        if (el.__ce !== undefined && !el.isConnected) callback(el, 'disconnectedCallback', []);
+      });
+    } else if (record.type === 'attributes') {
+      var el = record.target, def = definitions[el.localName];
+      if (def && el.__ce !== undefined && def.observed.indexOf(record.attributeName) >= 0)
+        callback(el, 'attributeChangedCallback', [record.attributeName, record.oldValue, el.getAttribute(record.attributeName)]);
+    }
+  }
+  // The changes since the last time: custom element reactions run, observers get their records queued.
+  function processLog() {
+    var records = __take_mutations();
+    for (var i = 0; i < records.length; i++) {
+      var r = records[i];
+      if (r.target.nodeType === 1 || r.type === 'childList') reactions(r);
+      deliver(r);
+    }
+  }
+  hide(g, '__process_mutations', processLog);
+  hide(g, '__deliver_mutations', function () {
+    processLog();
+    for (var o = 0; o < observers.length; o++) {
+      var observer = observers[o];
+      if (observer.__queue.length === 0) continue;
+      var queue = observer.__queue.slice();
+      observer.__queue.length = 0;
+      try { observer.__callback.call(observer, queue, observer); } catch (e) { reportError(e); }
+    }
+  });
+  function CustomElementRegistry() { throw new TypeError('Illegal constructor'); }
+  var registry = Object.create(CustomElementRegistry.prototype);
+  method(CustomElementRegistry.prototype, 'define', function (name, ctor, options) {
+    name = String(name);
+    if (typeof ctor !== 'function') throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': The callback provided as parameter 2 is not a function.");
+    if (!validName(name)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + name + '" is not a valid custom element name', 'SyntaxError');
+    if (definitions[name]) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + '" has already been used with this registry', 'NotSupportedError');
+    for (var other in definitions) if (definitions[other].ctor === ctor) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': this constructor has already been used with this registry", 'NotSupportedError');
+    var observed = [];
+    var list = ctor.observedAttributes;
+    if (list) for (var i = 0; i < list.length; i++) observed.push(String(list[i]));
+    definitions[name] = { ctor: ctor, observed: observed };
+    __register_tag(name, ctor.prototype);
+    __mutations_on();
+    var found = doc.querySelectorAll(name);
+    for (var k = 0; k < found.length; k++) upgrade(found[k]);
+    if (waiting[name]) { waiting[name].forEach(function (resolve) { resolve(ctor); }); delete waiting[name]; }
+  });
+  method(CustomElementRegistry.prototype, 'get', function (name) { var d = definitions[String(name)]; return d ? d.ctor : undefined; });
+  method(CustomElementRegistry.prototype, 'getName', function (ctor) { for (var n in definitions) if (definitions[n].ctor === ctor) return n; return null; });
+  method(CustomElementRegistry.prototype, 'whenDefined', function (name) {
+    name = String(name);
+    if (!validName(name)) return Promise.reject(new DOMException("Failed to execute 'whenDefined' on 'CustomElementRegistry': \"" + name + '" is not a valid custom element name', 'SyntaxError'));
+    if (definitions[name]) return Promise.resolve(definitions[name].ctor);
+    return new Promise(function (resolve) { (waiting[name] = waiting[name] || []).push(resolve); });
+  });
+  method(CustomElementRegistry.prototype, 'upgrade', function (root) { eachElement(root, function (el) { if (definitions[el.localName]) upgrade(el); }); });
+  hide(g, 'CustomElementRegistry', CustomElementRegistry);
+  hide(g, 'customElements', registry);
+  var nativeCreate = DP.createElement;
+  method(DP, 'createElement', function (name, options) {
+    var el = nativeCreate.call(this, name, options);
+    if (definitions[el.localName]) upgrade(el);
+    return el;
+  });
+}(this));
+)JSPRELUDE";
+
+
+const char kWorkerPrelude[] = R"JSPRELUDE((function (g) {
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true }); };
+  var listeners = { message: [], messageerror: [], error: [] };
+  var start = Date.now();
+  g.self = g;
+  g.name = __worker_name;
+  g.onmessage = null; g.onmessageerror = null; g.onerror = null;
+  var m = /^([a-z][a-z0-9+.-]*:)(?:\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(__worker_url) || [];
+  g.location = { href: __worker_url, protocol: m[1] || '', host: m[2] || '', hostname: (m[2] || '').replace(/:\d+$/, ''), origin: m[2] ? (m[1] + '//' + m[2]) : 'null', pathname: m[3] || '', search: m[4] || '', hash: m[5] || '', toString: function () { return __worker_url; } };
+  g.performance = { now: function () { return Date.now() - start; }, timeOrigin: start };
+  g.navigator = { userAgent: navigator.userAgent, language: 'en-US', languages: ['en-US'], hardwareConcurrency: 1, onLine: true };
+  g.postMessage = function (message) { if (arguments.length < 1) throw new TypeError("Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present."); __out(__wire_encode(message)); };
+  g.close = function () { __worker_close(); };
+  g.addEventListener = function (type, fn) { if (listeners[type] && typeof fn === 'function' && listeners[type].indexOf(fn) < 0) listeners[type].push(fn); };
+  g.removeEventListener = function (type, fn) { var l = listeners[type], i = l ? l.indexOf(fn) : -1; if (i >= 0) l.splice(i, 1); };
+  g.dispatchEvent = function (event) {
+    var handler = g['on' + event.type];
+    if (typeof handler === 'function') handler.call(g, event);
+    var l = listeners[event.type] ? listeners[event.type].slice() : [];
+    for (var i = 0; i < l.length; i++) l[i].call(g, event);
+    return true;
+  };
+  g.importScripts = function () {
+    for (var i = 0; i < arguments.length; i++) {
+      var url = String(arguments[i]);
+      var base = __worker_url.slice(0, __worker_url.lastIndexOf('/') + 1);
+      if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = url.charAt(0) === '/' ? g.location.origin + url : base + url;
+      var source = __worker_fetch(url);
+      if (source === null) throw new Error("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '" + url + "' failed to load.");
+      (0, eval)(source);
+    }
+  };
+  hide(g, '__deliver', function () {
+    var text = g.__inbox, data;
+    try { data = __wire_decode(text); } catch (e) { g.dispatchEvent({ type: 'messageerror', data: null, target: g }); return; }
+    try { g.dispatchEvent({ type: 'message', data: data, origin: '', lastEventId: '', source: null, ports: [], target: g }); }
+    catch (e) { __worker_fail(String(e && e.message !== undefined ? (e.name || 'Error') + ': ' + e.message : e)); }
+  });
 }(this));
 )JSPRELUDE";
 
 }  // namespace
 
 const char* web_prelude() { return kPrelude; }
+const char* worker_prelude() { return kWorkerPrelude; }
 const char* dom_prelude() { return kDomPrelude; }
 
 }  // namespace browser

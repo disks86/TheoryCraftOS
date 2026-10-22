@@ -174,7 +174,7 @@ JsObject* DomBindings::wrap(dom::Node* node) {
     case dom::NodeType::Text: proto = c.text_proto; break;
     case dom::NodeType::Comment: proto = c.comment_proto; break;
     case dom::NodeType::Document: proto = c.document_proto; break;
-    case dom::NodeType::Fragment: proto = c.fragment_proto; break;
+    case dom::NodeType::Fragment: proto = node->shadow_host && c.shadow_root_proto ? c.shadow_root_proto : c.fragment_proto; break;
     default:
       if (node->is_element() && c.tag_protos) {
         Value tagged;

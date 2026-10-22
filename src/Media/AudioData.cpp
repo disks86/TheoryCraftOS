@@ -31,6 +31,7 @@ const char* audio_format_name(AudioFileFormat format) {
     case AudioFileFormat::Vorbis: return "Ogg Vorbis";
     case AudioFileFormat::Mp3: return "MP3";
     case AudioFileFormat::Aac: return "AAC";
+    case AudioFileFormat::Opus: return "Ogg Opus";
     case AudioFileFormat::Mp4: return "MP4";
     case AudioFileFormat::Midi: return "MIDI";
     case AudioFileFormat::Unknown: break;
@@ -58,12 +59,14 @@ AudioFileFormat detect_audio_format(ConstByteView d) {
   if (d.size() >= 10 && d[0] == 'I' && d[1] == 'D' && d[2] == '3' && d[3] < 0xFF) return AudioFileFormat::Mp3;
   if (d.size() >= 4 && d[0] == 0xFF && (d[1] & 0xE0) == 0xE0 && ((d[1] >> 1) & 3) != 0 && ((d[1] >> 3) & 3) != 1 && (d[2] >> 4) != 15 && (d[2] >> 4) != 0 && ((d[2] >> 2) & 3) != 3)
     return AudioFileFormat::Mp3;
-  // Ogg holds many codecs: only a first packet that is a Vorbis identification header counts (the first page's lacing table is
+  // Ogg holds many codecs: only a first packet that is a Vorbis identification header or an OpusHead counts (the first page's lacing table is
   // 27 bytes in, then the packet).
   if (starts("OggS", 0) && d.size() > 27 + 7) {
     const uint32_t body = 27 + d[26];
     if (d.size() >= body + 7 && d[body] == 1 && d[body + 1] == 'v' && d[body + 2] == 'o' && d[body + 3] == 'r' && d[body + 4] == 'b' && d[body + 5] == 'i' && d[body + 6] == 's')
       return AudioFileFormat::Vorbis;
+    if (d.size() >= body + 8 && d[body] == 'O' && d[body + 1] == 'p' && d[body + 2] == 'u' && d[body + 3] == 's' && d[body + 4] == 'H' && d[body + 5] == 'e' && d[body + 6] == 'a' && d[body + 7] == 'd')
+      return AudioFileFormat::Opus;
   }
   return AudioFileFormat::Unknown;
 }

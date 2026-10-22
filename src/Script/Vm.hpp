@@ -82,6 +82,8 @@ class Vm {
 
   // --- Strings and objects
   JsString* new_string(StringView text);
+  // A string of `length` zero bytes (the storage of an ArrayBuffer).
+  JsString* new_bytes(uint32_t length);
   JsString* intern(StringView text);
   JsString* concat(JsString* a, JsString* b);
   JsObject* new_object(JsObject* proto);
@@ -106,6 +108,8 @@ class Vm {
   bool delete_property(JsObject* object, JsString* key);
   // Sets a property directly (replacing one that is there), with the given flags.
   void define(JsObject* object, JsString* key, const Value& value, uint8_t flags = kDefaultFlags);
+  // A property with a getter and / or a setter (undefined: leave that part as it is). `flags` may carry kEnumerable.
+  void define_accessor(JsObject* object, JsString* key, const Value& getter, const Value& setter, uint8_t flags = kEnumerable);
   void define_named(JsObject* object, StringView name, const Value& value, uint8_t flags = kDefaultFlags) { define(object, intern(name), value, flags); }
   void define_native(JsObject* object, StringView name, NativeFn fn, uint32_t arity);
   bool array_push(JsObject* array, const Value& value);
@@ -117,10 +121,32 @@ class Vm {
   bool array_set_length(JsObject* array, uint32_t length);
   // The own enumerable property names of an object (array indices first), as strings in a new array.
   JsObject* own_keys(JsObject* object);
-  static bool is_callable(const Value& v) { return v.is_object() && (v.as_object()->okind == ObjKind::Function || v.as_object()->okind == ObjKind::Native || v.as_object()->okind == ObjKind::Bound); }
+  // Appends the values an iterable gives to `array`, at most `max` of them (negative: all). False if it is not iterable or an iterator threw.
+  bool iterate_into(JsObject* array, const Value& iterable, int64_t max);
+  // Every own property name (also the ones that are not enumerable), and the value and attributes of one own property (a getter / setter is not called).
+  JsObject* own_names(JsObject* object);
+  bool own_property(JsObject* object, JsString* key, Value* value, uint8_t* flags);
+  static bool callable_object(const JsObject* o) {
+    for (int depth = 0; o && depth < 16; ++depth) {
+      if (o->okind == ObjKind::Function || o->okind == ObjKind::Native || o->okind == ObjKind::Bound) return true;
+      if (o->okind != ObjKind::Proxy) return false;
+      o = o->target;   // (a proxy can be called when what it stands for can)
+    }
+    return false;
+  }
+  static bool is_callable(const Value& v) { return v.is_object() && callable_object(v.as_object()); }
+  // Proxy: new Proxy(target, handler). The traps (get, set, has, deleteProperty, ownKeys, apply, construct) are asked; what has none goes to the target.
+  JsObject* new_proxy(JsObject* target, const Value& handler);
+  // BigInt: arbitrary precision integers, objects of kind BigInt (see Stdlib.cpp for the arithmetic; the operators call it).
+  static bool is_bigint(const Value& v) { return v.is_object() && v.as_object()->okind == ObjKind::BigInt; }
+  JsObject* new_bigint(bool negative, StringView digits);
+  bool bigint_parts(const Value& v, bool* negative, StringView* digits);
+  static void revoke_proxy(JsObject* proxy) { proxy->target = nullptr; }
 
   // --- Conversions
   bool to_primitive(const Value& v, bool prefer_string, Value* out);
+  // hint: 0 default (the + operator, ==), 1 string, 2 number; an object's [Symbol.toPrimitive] is asked first
+  bool to_primitive_hint(const Value& v, int hint, Value* out);
   bool to_string(const Value& v, JsString** out);
   bool to_number(const Value& v, double* out);
   static bool to_boolean(const Value& v);
@@ -204,6 +230,22 @@ class Vm {
   void halt(StringView reason);
   // After a script was stopped (limits) or threw: clears the stack so that the next script can run.
   void recover();
+  // The next function frame is a parent constructor called by super(...) (see new.target).
+  void mark_super_call() { super_pending_ = true; }
+  // The host can ask for a call of `hook` as soon as the native function (or host property write) that is running has returned: request_epilogue().
+  void set_epilogue(void (*hook)(void*), void* user) {
+    epilogue_ = hook;
+    epilogue_user_ = user;
+  }
+  void request_epilogue() { epilogue_pending_ = true; }
+  // Lets the host make the object `new` starts with (a custom element class makes a document node): given the prototype, an object or nullptr for the usual one.
+  void set_construct_hook(JsObject* (*hook)(void* user, JsObject* proto), void* user) {
+    construct_hook_ = hook;
+    construct_user_ = user;
+  }
+  // generator.next(value) / .throw(error) / .return(value): the object { value, done }. False if the generator threw.
+  bool generator_resume(const Value& generator, int mode, const Value& input, Value* result);
+  static bool is_generator_object(const Value& v);
   bool halted() const { return halted_; }
 
  private:
@@ -217,6 +259,7 @@ class Vm {
     uint32_t base;           // the stack slot the callee was in; the result replaces everything from here
     uint32_t handlers;       // how many handlers there were when the call started
     bool construct;
+    bool via_super;          // the frame is a parent class constructor that super(...) called: new.target is the class of `this`
     Value construct_this;
     JsObject* coroutine;     // the async function this frame is running (its state is saved here at an `await`)
   };
@@ -263,6 +306,9 @@ class Vm {
   Coroutine* coroutine_of(JsObject* co) const;
   bool start_async(JsObject* function, const Value& this_value, const Value* args, uint32_t argc, uint32_t base, Value* result);
   bool run_coroutine(JsObject* co, bool start, bool throwing, const Value& input);
+  bool start_generator(JsObject* function, const Value& this_value, const Value* args, uint32_t argc, Value* result);
+  // Runs a generator up to its next yield (mode 0 next, 1 throw; 2 return ends it): false if it threw.
+  bool run_generator(JsObject* co, bool start, int mode, const Value& input, Value* value, bool* done);
   void async_wait(JsObject* co, const Value& awaited);
   // promises
   void promise_settle(JsObject* promise, uint32_t state, const Value& value);
@@ -282,6 +328,27 @@ class Vm {
   List<Cell*> gray_;
   List<FunctionCode*> codes_;
   bool halted_ = false, gc_wanted_ = false;
+  Value receiver_;                       // the object a property is being read from, while get() looks for it (what a getter sees as `this`)
+  bool has_receiver_ = false, getter_failed_ = false;
+  bool super_pending_ = false;
+  void (*epilogue_)(void*) = nullptr;
+  void* epilogue_user_ = nullptr;
+  bool epilogue_pending_ = false, in_epilogue_ = false;
+  void run_epilogue();
+  JsObject* (*construct_hook_)(void*, JsObject*) = nullptr;
+  void* construct_user_ = nullptr;
+  JsObject* new_instance(JsObject* proto);
+  bool accessor_value(const Value& pair, Value* out);
+  bool bigint_operation(const char* op, const Value& a, const Value& b, Value* out);
+  bool proxy_parts(JsObject* proxy, const char* operation, JsObject** target, Value* handler);
+  bool proxy_trap(JsObject* proxy, const char* name, JsObject** target, Value* handler, Value* trap);
+  bool proxy_get(JsObject* proxy, JsString* key, const Value& receiver, Value* out);
+  bool proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver);
+  bool proxy_has(JsObject* proxy, JsString* key, bool* out);
+  bool proxy_delete(JsObject* proxy, JsString* key, bool* out);
+  JsObject* proxy_keys(JsObject* proxy, bool all);
+  bool proxy_call(JsObject* proxy, const Value& this_value, const Value* args, uint32_t argc, Value* result, bool construct);
+  bool call_setter(const Value& pair, const Value& receiver, const Value& value);
   String halt_reason_;
   // roots
   Value* stack_ = nullptr;

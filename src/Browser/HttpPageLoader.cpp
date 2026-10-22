@@ -18,8 +18,90 @@
 
 #include "Browser/HttpPageLoader.hpp"
 #include "Browser/Fetcher.hpp"
+#include "Utility/ByteText.hpp"
 
 namespace browser {
+
+namespace {
+
+// A WebSocket over an HttpClient that is driven by poll().
+class HttpWebSocket final : public IWebSocket {
+ public:
+  HttpWebSocket(network::INetworkStack& stack, allocators::IAllocator& allocator) : http_(stack, allocator), allocator_(allocator) {}
+  network::HttpClient& client() { return http_; }
+
+  void poll() override {
+    if (finished_) return;
+    http_.poll();
+    if (http_.state() == network::HttpState::Upgraded) opened_ = true;
+    if (http_.state() == network::HttpState::Failed || http_.ws_closed()) finished_ = true;
+  }
+  State state() const override {
+    if (finished_) return State::Closed;
+    if (http_.state() == network::HttpState::Upgraded) return closing_ ? State::Closing : State::Open;
+    return State::Connecting;
+  }
+  bool send(bool text, ConstByteView data) override {
+    if (state() != State::Open) return false;
+    if (text) return http_.ws_send_text(bytes_as_text(data));
+    return http_.ws_send_binary(data);
+  }
+  void close(uint16_t code, StringView reason) override {
+    if (finished_ || closing_) return;
+    closing_ = true;
+    if (http_.state() == network::HttpState::Upgraded) {
+      http_.ws_close(code, reason);
+    } else {
+      http_.cancel();
+      finished_ = true;
+    }
+  }
+  bool receive(bool* text, ByteBuffer* data) override {
+    network::WebSocketMessage m(allocator_);
+    if (!http_.ws_receive(&m)) return false;
+    *text = m.text;
+    data->clear();
+    data->append(m.data.view());
+    return true;
+  }
+  StringView protocol() const override { return http_.ws_protocol(); }
+  uint16_t close_code() const override { return opened_ && http_.ws_closed() ? http_.ws_close_code() : static_cast<uint16_t>(1006); }
+  StringView close_reason() const override { return opened_ ? http_.ws_close_reason() : StringView(); }
+  bool opened() const override { return opened_; }
+
+ private:
+  network::HttpClient http_;
+  allocators::IAllocator& allocator_;
+  bool opened_ = false, closing_ = false, finished_ = false;
+};
+
+}  // namespace
+
+UniquePointer<IWebSocket> HttpPageLoader::open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
+  network::INetworkStack* stack = nullptr;
+  for (uint32_t i = 0; i < stacks_.count() && !stack; ++i)
+    if (!stacks_.at(i)->configuration().address.is_unspecified()) stack = stacks_.at(i);
+  if (!stack) {
+    error->assign("There is no network connection.");
+    return UniquePointer<IWebSocket>();
+  }
+  auto socket = UniquePointer<HttpWebSocket>::make(allocator_, *stack, allocator_);
+  if (!socket) {
+    error->assign("Out of memory.");
+    return UniquePointer<IWebSocket>();
+  }
+  network::HttpClient& http = socket->client();
+  if (has_tls_) http.set_tls(&tls_);
+  http.set_session_cache(&sessions_);
+  http.set_websocket_compression(true);
+  http.add_header("User-Agent", "Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)");
+  if (!origin.empty()) http.add_header("Origin", origin);
+  if (!http.start_websocket(url, protocols)) {
+    error->assign(StringView(network::http_error_name(http.error())));
+    return UniquePointer<IWebSocket>();
+  }
+  return UniquePointer<IWebSocket>(static_cast<UniquePointer<HttpWebSocket>&&>(socket));
+}
 
 bool HttpPageLoader::send(network::HttpMethod method, StringView address, StringView content_type, StringView body, PageResult* result) {
   network::INetworkStack* stack = nullptr;
@@ -36,7 +118,7 @@ bool HttpPageLoader::send(network::HttpMethod method, StringView address, String
   http.set_max_body(kMaxPageBytes);
   http.add_header("User-Agent", "TheoryCraftOS-Browser/1.0");
   http.add_header("Accept", "text/html,text/plain;q=0.9,*/*;q=0.1");
-  if (!http.start(method, address, ConstByteView(reinterpret_cast<const uint8_t*>(body.data()), body.size()), content_type) || !http.run(timeout_ms_)) {
+  if (!http.start(method, address, text_as_bytes(body), content_type) || !http.run(timeout_ms_)) {
     result->error.assign(http.error() == network::HttpError::NoTlsConfiguration ? StringView("https needs certificates, which are not installed.")
                                                                                  : StringView(network::http_error_name(http.error())));
     return false;

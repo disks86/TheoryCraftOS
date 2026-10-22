@@ -461,9 +461,9 @@ class SelectorSet::Reader {
         ++pos_;
         return true;
       }
-      if (n.equals("not") || n.equals("is") || n.equals("where") || n.equals("matches") || n.equals("-webkit-any") || n.equals("-moz-any") || n.equals("has")) {
+      if (n.equals("not") || n.equals("is") || n.equals("where") || n.equals("matches") || n.equals("-webkit-any") || n.equals("-moz-any") || n.equals("has") || n.equals("host")) {
         const bool has = n.equals("has");
-        t->kind = n.equals("not") ? TestKind::Not : has ? TestKind::Has : TestKind::Is;
+        t->kind = n.equals("not") ? TestKind::Not : has ? TestKind::Has : n.equals("host") ? TestKind::HostIs : TestKind::Is;
         // the specificity inside counts (the most specific), except for :where()
         const uint64_t selectors_before = set_.selectors_.count();
         uint32_t first, count;
@@ -498,6 +498,7 @@ class SelectorSet::Reader {
     else if (n.equals("empty")) t->kind = TestKind::Empty;
     else if (n.equals("root")) t->kind = TestKind::Root;
     else if (n.equals("scope")) t->kind = TestKind::Scope;
+    else if (n.equals("host")) t->kind = TestKind::Host;
     else if (n.equals("link") || n.equals("any-link")) t->kind = TestKind::Link;
     else if (n.equals("checked")) t->kind = TestKind::Checked;
     else if (n.equals("disabled")) t->kind = TestKind::Disabled;
@@ -701,6 +702,8 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
     case TestKind::Enabled: return is_form_control(node->name.view()) && !has_attribute(node, "disabled");
     case TestKind::Not: return !match_inner(t, node, scope);
     case TestKind::Is: return match_inner(t, node, scope);
+    case TestKind::Host: return node->shadow != nullptr;
+    case TestKind::HostIs: return node->shadow != nullptr && match_inner(t, node, scope);
     case TestKind::Has: {
       // (approximately: some descendant, child or following sibling is one of the selectors on its own)
       for (uint32_t i = 0; i < t.ref_count; ++i) {

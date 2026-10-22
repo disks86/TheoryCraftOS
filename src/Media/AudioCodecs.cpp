@@ -29,6 +29,7 @@ bool decode_audio(ConstByteView data, AudioData* out, AudioFileFormat* detected)
     case AudioFileFormat::Au: return decode_au(data, out);
     case AudioFileFormat::Flac: return decode_flac(data, out);
     case AudioFileFormat::Vorbis: return decode_vorbis(data, out);
+    case AudioFileFormat::Opus: return decode_opus(data, out);
     case AudioFileFormat::Mp3: return decode_mp3(data, out);
     case AudioFileFormat::Aac: return decode_aac(data, out);
     case AudioFileFormat::Mp4: return decode_mp4_audio(data, out);
@@ -45,9 +46,10 @@ bool encode_audio(const AudioData& audio, AudioFileFormat format, ByteBuffer* ou
     case AudioFileFormat::Aiff: return encode_aiff(audio, out);
     case AudioFileFormat::Au: return encode_au(audio, out);
     case AudioFileFormat::Flac: return encode_flac(audio, out);
+    case AudioFileFormat::Aac: return encode_aac(audio, 0, out);
     case AudioFileFormat::Vorbis:
+    case AudioFileFormat::Opus:
     case AudioFileFormat::Mp3:
-    case AudioFileFormat::Aac:
     case AudioFileFormat::Midi:
     case AudioFileFormat::Mp4: break;  // decode only
     case AudioFileFormat::Unknown: break;

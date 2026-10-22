@@ -23,8 +23,11 @@
 #include <string.h>
 #include <math.h>
 #include "Hardware/VideoCodec/ColorConvert.hpp"
+#include "Hardware/VideoCodec/Software/H264.hpp"
+#include "Hardware/VideoCodec/Software/H264Encoder.hpp"
 #include "Hardware/VideoCodec/Software/Jpeg.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaVideoEngine.hpp"
 #include "Utility/Crc32.hpp"
@@ -354,7 +357,7 @@ static void test_sessions() {
   {
     SoftwareVideoCodec device(a);
     CHECK(device.initialize() && !device.info().hardware_engine && !device.info().accelerated);
-    CHECK(device.can_decode(VideoCodec::Mjpeg) && device.can_encode(VideoCodec::Raw) && device.can_decode(VideoCodec::H264) && !device.can_encode(VideoCodec::H264) && !device.can_decode(VideoCodec::Hevc) && !device.can_encode(VideoCodec::Av1));
+    CHECK(device.can_decode(VideoCodec::Mjpeg) && device.can_encode(VideoCodec::Raw) && device.can_decode(VideoCodec::H264) && device.can_encode(VideoCodec::H264) && !device.can_decode(VideoCodec::Hevc) && !device.can_encode(VideoCodec::Av1));
     DecoderConfig h264;
     h264.codec = VideoCodec::H264;
     CHECK(device.create_decoder(h264));  // an Annex B stream: the parameter sets come with the pictures
@@ -473,7 +476,7 @@ static void test_system_list() {
     CHECK(system.at(0)->info().hardware_engine && !system.at(0)->info().accelerated && strstr(system.at(0)->name(), "NVIDIA"));
     CHECK(!system.at(1)->info().hardware_engine && strcmp(system.at(1)->name(), "Software video codec") == 0);
     CHECK(system.at(2) == nullptr);
-    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264)));
+    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Vp9)));
     DecoderConfig dc;
     dc.codec = VideoCodec::Mjpeg;
     CHECK(system.create_decoder(dc));
@@ -490,6 +493,374 @@ static void test_system_list() {
   CHECK(a.live == 0);
 }
 
+// A moving I420 picture for the H.264 encoder: smooth waves and a square, moved `t` pixels to the right.
+static void make_moving_i420(VideoFrameBuffer& b, uint32_t w, uint32_t h, int t) {
+  CHECK(b.allocate({w, h, PixelFormat::I420}));
+  auto clip = [](double v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); };
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      const int sx = (int)x - 2 * t;
+      double v = 128 + 60 * sin(sx / 13.0) + 40 * sin(y / 11.0);
+      if (sx > 20 && sx < 36 && y > 12 && y < 28) v += 70;
+      b.plane(0)[y * w + x] = clip(v);
+    }
+  for (uint32_t y = 0; y < h / 2; ++y)
+    for (uint32_t x = 0; x < w / 2; ++x) {
+      b.plane(1)[y * (w / 2) + x] = clip(128 + 40 * sin(((int)x - t) / 9.0));
+      b.plane(2)[y * (w / 2) + x] = clip(128 + 40 * cos(y / 7.0));
+    }
+}
+
+static bool same_i420(const VideoFrame& a, const VideoFrame& b) {
+  if (a.format.width != b.format.width || a.format.height != b.format.height) return false;
+  for (uint32_t p = 0; p < 3; ++p)
+    for (uint32_t y = 0; y < a.format.plane_height(p); ++y)
+      if (memcmp(a.plane[p] + (size_t)y * a.stride[p], b.plane[p] + (size_t)y * b.stride[p], a.format.plane_width(p)) != 0) return false;
+  return true;
+}
+
+static double psnr_luma(const VideoFrame& a, const VideoFrame& b) {
+  double sum = 0;
+  for (uint32_t y = 0; y < a.format.height; ++y)
+    for (uint32_t x = 0; x < a.format.width; ++x) {
+      const int d = (int)a.plane[0][(size_t)y * a.stride[0] + x] - (int)b.plane[0][(size_t)y * b.stride[0] + x];
+      sum += d * d;
+    }
+  const double mse = sum / ((double)a.format.width * a.format.height);
+  return mse == 0 ? 99 : 10 * log10(255.0 * 255.0 / mse);
+}
+
+// Encodes `frames` moving pictures, decodes the stream with the decoder and checks every decoded picture against
+// the encoder's own reconstruction, bit for bit. Returns the stream size.
+static uint64_t h264_roundtrip(TestAllocator& a, uint32_t w, uint32_t h, uint32_t quality, uint32_t key_interval, int frames, double min_psnr, bool avcc_mode = false) {
+  H264Encoder enc(a);
+  CHECK(enc.configure(w, h, 25, 1, quality, key_interval));
+  H264Decoder dec(a);
+  ByteBuffer avcc(a);
+  if (avcc_mode) {
+    CHECK(enc.avcc(&avcc) && dec.configure(avcc.view()));
+  }
+  uint64_t total = 0;
+  VideoFrameBuffer src(a);
+  for (int t = 0; t < frames; ++t) {
+    make_moving_i420(src, w, h, t);
+    ByteBuffer out(a);
+    bool key = false;
+    CHECK(enc.encode(src.frame(t * 40000, true), false, &out, &key));
+    CHECK(key == (t % (key_interval ? key_interval : 1) == 0));
+    total += out.size();
+    ConstByteView au = out.view();
+    ByteBuffer prefixed(a);
+    if (avcc_mode) {  // the same NAL units, length-prefixed instead of start-code separated, and without the parameter sets
+      uint64_t i = 0;
+      while (i + 4 <= au.size()) {
+        uint64_t j = i + 4;
+        while (j + 4 <= au.size() && !(au[j] == 0 && au[j + 1] == 0 && au[j + 2] == 0 && au[j + 3] == 1)) ++j;
+        if (j + 4 > au.size()) j = au.size();
+        const uint8_t type = au[i + 4] & 31;
+        if (type != 7 && type != 8) {
+          const uint64_t len = j - i - 4;
+          prefixed.put8((uint8_t)(len >> 24)); prefixed.put8((uint8_t)(len >> 16)); prefixed.put8((uint8_t)(len >> 8)); prefixed.put8((uint8_t)len);
+          prefixed.append(au.subview(i + 4, len));
+        }
+        i = j;
+      }
+      au = prefixed.view();
+    }
+    CHECK(dec.decode(au, t * 40000));
+    VideoFrame got, rec;
+    CHECK(dec.receive(&got));
+    CHECK(enc.reconstruction(&rec));
+    CHECK(got.format.width == w && got.format.height == h);
+    CHECK(same_i420(got, rec));
+    CHECK(got.limited_range == false);
+    VideoFrame in = src.frame();
+    const double p = psnr_luma(in, got);
+    if (p < min_psnr) printf("  frame %d: luma PSNR %.2f dB (< %.1f)\n", t, p, min_psnr);
+    CHECK(p >= min_psnr);
+    if (const char* dump = getenv("H264_DUMP")) {
+      FILE* f = fopen(dump, t == 0 ? "wb" : "ab");
+      if (f) { fwrite(out.view().data(), 1, out.size(), f); fclose(f); }
+    }
+  }
+  return total;
+}
+
+static void test_h264_encode() {
+  TestAllocator a;
+  {
+    // Sizes that are and are not a multiple of the macroblock size, I-only and with P pictures.
+    const uint64_t small = h264_roundtrip(a, 64, 48, 85, 1, 6, 30);
+    const uint64_t p_frames = h264_roundtrip(a, 64, 48, 85, 6, 6, 30);
+    CHECK(p_frames < small);  // P pictures are smaller than keyframes
+    h264_roundtrip(a, 50, 34, 85, 4, 8, 28);
+    h264_roundtrip(a, 176, 144, 60, 10, 12, 27);
+    h264_roundtrip(a, 176, 144, 100, 10, 4, 38);
+    h264_roundtrip(a, 16, 16, 75, 3, 5, 25);
+    h264_roundtrip(a, 2, 2, 75, 1, 2, 0);
+    h264_roundtrip(a, 96, 64, 80, 5, 7, 28, true);  // length-prefixed NAL units and an avcC record
+    CHECK(h264_roundtrip(a, 176, 144, 90, 30, 10, 30) > 0);
+  }
+  CHECK(a.live == 0);
+  {
+    H264Encoder enc(a);
+    CHECK(!enc.configure(0, 16, 25, 1, 75, 1));
+    CHECK(!enc.configure(17, 16, 25, 1, 75, 1));  // odd sizes cannot be cropped exactly
+    CHECK(!enc.configure(16, 16, 0, 1, 75, 1));
+    CHECK(!enc.configure(32768, 16, 25, 1, 75, 1));
+    ByteBuffer out(a);
+    bool key;
+    VideoFrameBuffer wrong(a);
+    make_moving_i420(wrong, 32, 32, 0);
+    CHECK(enc.configure(16, 16, 25, 1, 75, 1));
+    CHECK(!enc.encode(wrong.frame(), false, &out, &key));  // wrong size
+  }
+  CHECK(a.live == 0);
+  {
+    // Through a device session: Bgra8888 pictures in, packets out, decoded again.
+    SoftwareVideoCodec device(a);
+    CHECK(device.initialize());
+    EncoderConfig ec;
+    ec.codec = VideoCodec::H264; ec.width = 80; ec.height = 60; ec.input = PixelFormat::Bgra8888; ec.quality = 85; ec.keyframe_interval = 4;
+    UniquePointer<IVideoEncoder> enc = device.create_encoder(ec);
+    CHECK(enc && enc->codec() == VideoCodec::H264);
+    DecoderConfig dc;
+    dc.codec = VideoCodec::H264; dc.output = PixelFormat::Bgra8888;
+    UniquePointer<IVideoDecoder> dec = device.create_decoder(dc);
+    CHECK(dec);
+    VideoFrameBuffer picture(a);
+    make_picture(picture, 80, 60);
+    for (int i = 0; i < 6; ++i) {
+      VideoPacket packet;
+      CHECK(!enc->receive(&packet));
+      CHECK(enc->submit(picture.frame(i * 40000, true)) == SubmitResult::Accepted);
+      CHECK(enc->submit(picture.frame(i * 40000, true)) == SubmitResult::Full);
+      CHECK(enc->receive(&packet) && packet.data.size() > 4 && packet.pts_us == i * 40000 && packet.keyframe == (i % 4 == 0));
+      CHECK(dec->submit(packet) == SubmitResult::Accepted);
+      VideoFrame out;
+      CHECK(dec->receive(&out));
+      CHECK(out.format.pixel_format == PixelFormat::Bgra8888 && out.pts_us == i * 40000);
+      const double p = psnr_bgra(picture.frame(), out);
+      CHECK(p > 28);
+    }
+    CHECK(enc->statistics().packets == 6 && enc->statistics().frames == 6);
+    VideoFrameBuffer wrong(a);
+    CHECK(wrong.allocate({40, 30, PixelFormat::Bgra8888}));
+    CHECK(enc->submit(wrong.frame()) == SubmitResult::Invalid);
+    EncoderConfig odd = ec;
+    odd.width = 81;
+    CHECK(!device.create_encoder(odd));
+  }
+  CHECK(a.live == 0);
+}
+
+// Corrupt streams from the encoder must not upset the decoder: truncations and bit flips of every packet.
+static void test_h264_encode_robustness() {
+  TestAllocator a;
+  H264Encoder enc(a);
+  CHECK(enc.configure(48, 32, 25, 1, 70, 3));
+  VideoFrameBuffer src(a);
+  ByteBuffer stream(a);
+  uint64_t starts[6];
+  for (int t = 0; t < 6; ++t) {
+    make_moving_i420(src, 48, 32, t);
+    bool key;
+    starts[t] = stream.size();
+    CHECK(enc.encode(src.frame(), false, &stream, &key));
+  }
+  const uint64_t n = stream.size();
+  uint32_t rng = 12345;
+  for (int round = 0; round < 120; ++round) {
+    ByteBuffer copy(a);
+    copy.append(stream.view());
+    ByteView w = copy.writable_view();
+    rng = rng * 1664525u + 1013904223u;
+    if (round % 3 == 0) {
+      copy.truncate(rng % n);
+    } else {
+      for (int k = 0; k < 1 + round % 4; ++k) {
+        rng = rng * 1664525u + 1013904223u;
+        w[(rng >> 8) % n] ^= (uint8_t)(1u << (rng & 7));
+      }
+    }
+    H264Decoder dec(a);
+    VideoFrame f;
+    for (int t = 0; t < 6; ++t) {
+      const uint64_t from = starts[t], to = t + 1 < 6 ? starts[t + 1] : copy.size();
+      if (from >= copy.size()) break;
+      dec.decode(copy.view().subview(from, (to < copy.size() ? to : copy.size()) - from), t);
+      while (dec.receive(&f)) {}
+    }
+    dec.flush();
+    while (dec.receive(&f)) {}
+  }
+  (void)starts;
+}
+
+// ---- VP9 ---------------------------------------------------------------------------------------------------------------------------
+
+// The packets of an IVF file.
+struct IvfFile {
+  unsigned char* data = nullptr;
+  long size = 0;
+  long first = 32;
+  explicit IvfFile(const char* name) {
+    char path[160];
+    snprintf(path, sizeof path, "tests/data/%s", name);
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = static_cast<unsigned char*>(malloc(size));
+    if (fread(data, 1, size, f) != static_cast<size_t>(size)) { free(data); data = nullptr; }
+    fclose(f);
+  }
+  ~IvfFile() { free(data); }
+  // The next packet at *pos (start with 32).
+  static bool next(const unsigned char* d, long n, long* pos, ConstByteView* packet) {
+    if (*pos + 12 > n) return false;
+    const unsigned long sz = d[*pos] | d[*pos + 1] << 8 | d[*pos + 2] << 16 | static_cast<unsigned long>(d[*pos + 3]) << 24;
+    if (static_cast<long>(sz) > n - *pos - 12) return false;
+    *packet = ConstByteView(d + *pos + 12, sz);
+    *pos += 12 + sz;
+    return true;
+  }
+};
+
+static unsigned long long fnv64(unsigned long long h, const uint8_t* p, size_t n) {
+  for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+  return h;
+}
+
+// Decodes every packet of an IVF image with a Vp9Decoder; the FNV-64 of the pictures (8-bit I420, tight rows).
+static bool vp9_decode(allocators::IAllocator& a, const unsigned char* d, long n, unsigned* frames, unsigned* width, unsigned* height, unsigned long long* hash, bool keep_going) {
+  hardware::Vp9Decoder dec(a);
+  *frames = 0;
+  *hash = 0xcbf29ce484222325ull;
+  long pos = 32;
+  ConstByteView pk;
+  bool ok = true;
+  while (IvfFile::next(d, n, &pos, &pk)) {
+    if (!dec.decode(pk, *frames)) {
+      ok = false;
+      if (!keep_going) break;
+    }
+    hardware::VideoFrame f;
+    if (dec.receive(&f)) {
+      if (*frames == 0) { *width = f.format.width; *height = f.format.height; }
+      for (uint32_t p = 0; p < 3; ++p)
+        for (uint32_t y = 0; y < f.format.plane_height(p); ++y) *hash = fnv64(*hash, f.plane[p] + static_cast<size_t>(y) * f.stride[p], f.format.plane_width(p));
+      ++*frames;
+    }
+  }
+  return ok;
+}
+
+// The streams made by libvpx (see tests/data/make_vp9_fixtures.py) decode to the pictures libvpx and ffmpeg make from them: every profile, tiles,
+// lossless, segmentation, hidden frames and references of another size.
+static void test_vp9() {
+  TestAllocator a;
+  FILE* m = fopen("tests/data/manifest_vp9.txt", "r");
+  CHECK(m != nullptr);
+  if (!m) return;
+  char kind[16], name[96];
+  unsigned w, h, frames;
+  unsigned long long hash;
+  int count = 0;
+  while (fscanf(m, "%15s %95s %u %u %u %llx", kind, name, &w, &h, &frames, &hash) == 6) {
+    IvfFile file(name);
+    if (!file.data) { printf("missing fixture %s\n", name); ++g_failed; continue; }
+    unsigned got_frames = 0, got_w = 0, got_h = 0;
+    unsigned long long got_hash = 0;
+    CHECK(vp9_decode(a, file.data, file.size, &got_frames, &got_w, &got_h, &got_hash, false));
+    if (got_frames != frames || got_w != w || got_h != h || got_hash != hash) {
+      printf("VP9 fixture %s: got %u frames %ux%u hash %016llx, wanted %u frames %ux%u hash %016llx\n", name, got_frames, got_w, got_h, got_hash, frames, w, h, hash);
+      ++g_failed;
+    }
+    ++count;
+  }
+  fclose(m);
+  CHECK(count >= 11);
+  CHECK(a.live == 0);
+
+  // Through a codec session: pictures come out in the format asked for, one per packet.
+  {
+    hardware::SoftwareVideoCodec device(a);
+    CHECK(device.can_decode(hardware::VideoCodec::Vp9) && !device.can_encode(hardware::VideoCodec::Vp9));
+    hardware::DecoderConfig config;
+    config.codec = hardware::VideoCodec::Vp9;
+    config.output = hardware::PixelFormat::Bgra8888;
+    UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+    CHECK(dec != nullptr);
+    IvfFile file("vp9_inter.ivf");
+    CHECK(file.data != nullptr);
+    if (dec && file.data) {
+      long pos = 32;
+      ConstByteView pk;
+      uint32_t n = 0;
+      while (IvfFile::next(file.data, file.size, &pos, &pk)) {
+        hardware::VideoPacket packet;
+        packet.data = pk;
+        packet.pts_us = n * 100000;
+        CHECK(dec->submit(packet) == hardware::SubmitResult::Accepted);
+        packet.data = pk;
+        CHECK(dec->submit(packet) == hardware::SubmitResult::Full);  // the picture has not been taken yet
+        hardware::VideoFrame f;
+        CHECK(dec->receive(&f) && f.format.width == 95 && f.format.height == 63 && f.format.pixel_format == hardware::PixelFormat::Bgra8888 && f.pts_us == n * 100000);
+        CHECK(f.keyframe == (n == 0));
+        ++n;
+      }
+      CHECK(n == 14);
+      CHECK(dec->output_format().width == 95 && dec->statistics().frames == 14 && dec->statistics().errors == 0);
+      // Garbage is refused, and after a reset the decoder waits for a key frame.
+      const uint8_t noise[16] = {0x91, 2, 3, 4, 5, 6, 7, 8};
+      hardware::VideoPacket junk;
+      junk.data = ConstByteView(noise, sizeof noise);
+      CHECK(dec->submit(junk) == hardware::SubmitResult::Invalid);
+      dec->reset();
+      pos = 32;
+      IvfFile::next(file.data, file.size, &pos, &pk);
+      IvfFile::next(file.data, file.size, &pos, &pk);  // the second packet is an inter frame
+      hardware::VideoPacket second;
+      second.data = pk;
+      hardware::VideoFrame f;
+      CHECK(dec->submit(second) == hardware::SubmitResult::Invalid);
+      CHECK(!dec->receive(&f));
+    }
+  }
+  CHECK(a.live == 0);
+}
+
+// Truncated and damaged copies of the VP9 fixtures must neither crash nor leak.
+static void test_vp9_robustness() {
+  TestAllocator a;
+  const char* names[] = {"vp9_intra.ivf", "vp9_inter.ivf", "vp9_tiles.ivf", "vp9_lossless.ivf", "vp9_segments.ivf", "vp9_444.ivf", "vp9_10bit.ivf", "vp9_422.ivf"};
+  uint32_t seed = 99;
+  auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
+  for (const char* name : names) {
+    IvfFile file(name);
+    CHECK(file.data != nullptr);
+    if (!file.data) continue;
+    for (int round = 0; round < 24; ++round) {
+      unsigned char* copy = static_cast<unsigned char*>(malloc(file.size));
+      memcpy(copy, file.data, file.size);
+      long len = file.size;
+      switch (round % 4) {
+        case 0: len = 32 + rnd() % (file.size - 32); break;                                                                  // truncated
+        case 1: for (int k = 0; k < 4; ++k) copy[32 + rnd() % (file.size - 32)] ^= 1 << (rnd() % 8); break;                 // bit flips
+        case 2: for (int k = 0; k < 12; ++k) copy[32 + rnd() % (file.size - 32)] = static_cast<uint8_t>(rnd()); break;      // noise
+        default: for (int k = 0; k < 3; ++k) copy[32 + rnd() % (file.size < 400 ? file.size - 32 : 400)] = static_cast<uint8_t>(rnd()); break;  // headers
+      }
+      unsigned frames, w, h;
+      unsigned long long hash;
+      vp9_decode(a, copy, len, &frames, &w, &h, &hash, true);
+      free(copy);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_formats();
   test_convert();
@@ -498,6 +869,10 @@ int main() {
   test_jpeg_robustness();
   test_sessions();
   test_system_list();
+  test_h264_encode();
+  test_h264_encode_robustness();
+  test_vp9();
+  test_vp9_robustness();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("video codec tests passed\n");
   return 0;

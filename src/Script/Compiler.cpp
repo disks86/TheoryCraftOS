@@ -293,6 +293,7 @@ class Compiler {
     cur_ = &fs;
     fs.code->is_arrow = (fn->flags & kFlagArrow) != 0;
     fs.code->is_async = (fn->flags & kFlagAsync) != 0;
+    fs.code->is_generator = (fn->flags & kFlagGenerator) != 0 && !(fn->flags & kFlagArrow);
     fs.code->name = fn->text.empty() ? nullptr : vm_.intern(fn->text);
     uint32_t params = 0;
     for (Node* p = fn->list; p; p = p->next) {
@@ -325,6 +326,11 @@ class Compiler {
       emit(Opc::SetVar, static_cast<int32_t>(index), 0, p->line);
       emit(Opc::Pop);
       patch(skip);
+    }
+    if (fs.code->is_generator) {   // calling a generator function runs it up to here (the parameters are bound); the first next() goes on
+      emit(Opc::PushUndef);
+      emit(Opc::Yield);
+      emit(Opc::Pop);
     }
     if (fn->flags & kFlagExprBody) {
       expression(fn->a);
@@ -744,7 +750,10 @@ class Compiler {
         }
         return;
       }
-      case NodeKind::Ident: load_name(n->text, n->line); return;
+      case NodeKind::Ident:
+        if (n->text.equals("new.target")) emit(Opc::NewTarget);
+        else load_name(n->text, n->line);
+        return;
       case NodeKind::This: emit(Opc::PushThis); return;
       case NodeKind::Null: emit(Opc::PushNull); return;
       case NodeKind::True: emit(Opc::PushTrue); return;
@@ -767,6 +776,16 @@ class Compiler {
           if (p->kind == NodeKind::Spread) {
             expression(p->a);
             emit(Opc::ObjectSpread);
+          } else if (p->flags & (kFlagGetter | kFlagSetter)) {
+            const uint8_t which = (p->flags & kFlagGetter) ? 1 : 2;
+            if (p->flags & kFlagComputed) {
+              expression(p->b);
+              expression(p->a);
+              emit(Opc::DefineAccessorElem, 0, which, p->line);
+            } else {
+              expression(p->a);
+              emit(Opc::DefineAccessor, static_cast<int32_t>(constant_string(p->text)), which, p->line);
+            }
           } else if (p->flags & kFlagComputed) {
             expression(p->b);
             expression(p->a);
@@ -914,6 +933,29 @@ class Compiler {
         emit(Opc::PushUndef);
         return;
       case Op::Await: expression(n->a); emit(Opc::Await, 0, 0, n->line); return;
+      case Op::Yield:
+        if (!(n->flags & kFlagDelegate)) {
+          if (n->a) expression(n->a);
+          else emit(Opc::PushUndef);
+          emit(Opc::Yield, 0, 0, n->line);
+          return;
+        }
+        {   // yield* iterable: every value it gives is given on
+          expression(n->a);
+          emit(Opc::ForOfStart);
+          const uint32_t it = new_slot();
+          emit(Opc::SetVar, static_cast<int32_t>(it), 0, n->line);
+          emit(Opc::Pop);
+          const uint32_t top = pos();
+          emit(Opc::GetVar, static_cast<int32_t>(it), 0, n->line);
+          const uint32_t to_end = emit(Opc::IterNext);
+          emit(Opc::Yield, 0, 0, n->line);
+          emit(Opc::Pop);
+          emit(Opc::Jump, static_cast<int32_t>(top));
+          patch(to_end);
+          emit(Opc::PushUndef);
+        }
+        return;
       case Op::Not: expression(n->a); emit(Opc::Not); return;
       case Op::Neg: expression(n->a); emit(Opc::Neg, 0, 0, n->line); return;
       case Op::Plus: expression(n->a); emit(Opc::Plus, 0, 0, n->line); return;
@@ -1034,6 +1076,9 @@ class Compiler {
     if (is_new) {
       expression(callee);
       emit(Opc::PushUndef);
+    } else if ((callee->kind == NodeKind::Member || callee->kind == NodeKind::Index) && (callee->flags & kFlagSuper)) {   // super.method(...): looked up on the parent, called on `this`
+      expression(callee);
+      emit(Opc::PushThis);
     } else if (callee->kind == NodeKind::Member) {
       expression(callee->a);
       if (callee->flags & kFlagOptional) {

@@ -74,3 +74,9 @@ audiotol mono.m4a 11025 1 22528 mono.m4a.ref
 audiotol stereo.mov 11025 2 22528 stereo.mov.ref
 audiotol mp3.mp4 22050 2 44399 mp3.mp4.ref
 audiotol layer1.mp1 48000 2 7680 layer1.mp1.ref
+audiotol opus_silk_nb_mono.opus 48000 1 19200 opus_silk_nb_mono.opus.ref
+audiotol opus_silk_wb_mono.opus 48000 1 19200 opus_silk_wb_mono.opus.ref
+audiotol opus_silk_wb_stereo_60.opus 48000 2 19200 opus_silk_wb_stereo_60.opus.ref
+audiotol opus_hybrid_stereo.opus 48000 2 19200 opus_hybrid_stereo.opus.ref
+audiotol opus_celt_mono.opus 48000 1 19200 opus_celt_mono.opus.ref
+audiotol opus_celt_stereo_10.opus 48000 2 19200 opus_celt_stereo_10.opus.ref

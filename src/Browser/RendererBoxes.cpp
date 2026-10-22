@@ -621,9 +621,29 @@ bool DocumentRenderer::draw_text_item(const dom::Node* text, const Style& inside
 
 // --- Flexbox ----------------------------------------------------------------------------------------
 
+// What a container shows as its children: a shadow host shows its shadow tree, a slot is replaced by the nodes assigned to it (or by its own children).
+static void effective_children(allocators::IAllocator& a, const dom::Node* container, List<const dom::Node*>* out, uint32_t depth) {
+  const dom::Node* first = container->shadow ? container->shadow->first_child : container->first_child;
+  for (const dom::Node* c = first; c && out->count() < 2000; c = c->next) {
+    if (c->is_tag("slot") && depth < 8) {
+      List<dom::Node*> assigned(a);
+      if (dom::slot_assigned_nodes(c, &assigned) && assigned.count() > 0) {
+        for (uint64_t i = 0; i < assigned.count(); ++i) out->push_back(assigned[i]);
+      } else {
+        effective_children(a, c, out, depth + 1);
+      }
+      continue;
+    }
+    out->push_back(c);
+  }
+}
+
 bool DocumentRenderer::collect_items(const dom::Node* container, const Style& inside, List<UniquePointer<Item>>* items, List<const dom::Node*>* out_of_flow, uint32_t depth) {
   allocators::IAllocator& a = out_.allocator();
-  for (const dom::Node* c = container->first_child; c && items->count() < 400; c = c->next) {
+  List<const dom::Node*> children(a);
+  effective_children(a, container, &children, 0);
+  for (uint64_t ci = 0; ci < children.count() && items->count() < 400; ++ci) {
+    const dom::Node* c = children[ci];
     if (c->type == dom::NodeType::Text) {
       bool blank = true;
       for (const char ch : c->data.view()) blank = blank && is_space(ch);

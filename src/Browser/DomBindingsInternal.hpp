@@ -39,7 +39,7 @@ struct DomBindings::Impl {
                    *fragment_proto = nullptr, *event_proto = nullptr, *token_list_proto = nullptr, *style_proto = nullptr, *computed_proto = nullptr,
                    *storage_proto = nullptr, *location_proto = nullptr, *history_proto = nullptr, *media_query_proto = nullptr, *exception_proto = nullptr,
                    *canvas_context_proto = nullptr, *gradient_proto = nullptr, *pattern_proto = nullptr, *path2d_proto = nullptr, *typed_array_proto = nullptr,
-                   *image_data_proto = nullptr, *text_metrics_proto = nullptr, *thenable_proto = nullptr, *time_ranges_proto = nullptr;
+                   *image_data_proto = nullptr, *text_metrics_proto = nullptr, *thenable_proto = nullptr, *time_ranges_proto = nullptr, *shadow_root_proto = nullptr;
   script::JsObject* tag_protos = nullptr;     // tag name -> the prototype of its interface (HTMLInputElement.prototype ...)
   script::JsObject* wrappers = nullptr;       // every wrapper made (kept alive)
   script::JsObject* media_lists = nullptr;    // the MediaQueryList objects given out

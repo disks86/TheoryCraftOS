@@ -229,6 +229,7 @@ int main() {
   for (const char* name : lossless) check_stream(name);
   check_stream("stereo.aac", 0, 0.2);
   for (const char* name : {"mono.ogg", "stereo.ogg"}) check_stream(name);
+  for (const char* name : {"opus_silk_nb_mono.opus", "opus_silk_wb_stereo_60.opus", "opus_hybrid_stereo.opus", "opus_celt_mono.opus", "opus_celt_stereo_10.opus", "opus.ogg"}) check_stream(name, 0, 0.2);
   check_stream("mono.m4a", 0, 0.2);
   check_stream("stereo.mov", 0, 0.2);
   check_stream("mp3.mp4");

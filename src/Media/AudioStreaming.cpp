@@ -384,6 +384,7 @@ UniquePointer<audio::IPcmSource> open_audio_stream(IByteSource& source, allocato
     case AudioFileFormat::Au: return open_au_stream(source, allocator);
     case AudioFileFormat::Flac: return open_flac_stream(source, allocator);
     case AudioFileFormat::Vorbis: return open_vorbis_stream(source, allocator);
+    case AudioFileFormat::Opus: return open_opus_stream(source, allocator);
     case AudioFileFormat::Mp3: return open_mp3_stream(source, allocator);
     case AudioFileFormat::Aac: return open_aac_stream(source, allocator);
     case AudioFileFormat::Mp4: return open_mp4_audio_stream(source, allocator);

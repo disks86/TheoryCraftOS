@@ -17,6 +17,7 @@
  */
 
 #include "Script/Engine.hpp"
+#include "Script/Stdlib.hpp"
 #include "Script/Ast.hpp"
 #include "Kernel/Thread.hpp"
 #include "Script/Compiler.hpp"
@@ -112,6 +113,7 @@ const char kCollections[] = R"JSLIB((function (g) {
     if (value === undefined) return 'u';
     if (value === null) return 'l';
     if (t === 'symbol') return 'y' + String(value);
+    if (t === 'bigint') return 'g' + String(value);
     var id = value.__oid;
     if (id === undefined) {
       id = nextId++;
@@ -322,6 +324,100 @@ const char kCollections[] = R"JSLIB((function (g) {
     return out;
   });
   if (!Array.of) def(Array, 'of', function () { var out = []; for (var i = 0; i < arguments.length; i++) out.push(arguments[i]); return out; });
+  // Typed arrays: the methods that walk the elements (the natives are in TypedArray.cpp)
+  (function () {
+    var T = g.__typed_array_proto;
+    var kinds = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array'];
+    function relative(i, n) { i = Math.trunc(i) || 0; return i < 0 ? Math.max(n + i, 0) : Math.min(i, n); }
+    function same(a, n) { return new a.constructor(n); }
+    function need(fn) { if (typeof fn !== 'function') throw new TypeError(String(fn) + ' is not a function'); }
+    def(T, 'forEach', function (fn, thisArg) { need(fn); for (var i = 0; i < this.length; i++) fn.call(thisArg, this[i], i, this); });
+    def(T, 'map', function (fn, thisArg) { need(fn); var out = same(this, this.length); for (var i = 0; i < this.length; i++) out[i] = fn.call(thisArg, this[i], i, this); return out; });
+    def(T, 'filter', function (fn, thisArg) {
+      need(fn);
+      var kept = [];
+      for (var i = 0; i < this.length; i++) if (fn.call(thisArg, this[i], i, this)) kept.push(this[i]);
+      var out = same(this, kept.length);
+      for (var j = 0; j < kept.length; j++) out[j] = kept[j];
+      return out;
+    });
+    def(T, 'reduce', function (fn, init) {
+      need(fn);
+      var i = 0, acc;
+      if (arguments.length > 1) acc = init;
+      else { if (this.length === 0) throw new TypeError('Reduce of empty array with no initial value'); acc = this[0]; i = 1; }
+      for (; i < this.length; i++) acc = fn(acc, this[i], i, this);
+      return acc;
+    });
+    def(T, 'reduceRight', function (fn, init) {
+      need(fn);
+      var i = this.length - 1, acc;
+      if (arguments.length > 1) acc = init;
+      else { if (this.length === 0) throw new TypeError('Reduce of empty array with no initial value'); acc = this[i]; i--; }
+      for (; i >= 0; i--) acc = fn(acc, this[i], i, this);
+      return acc;
+    });
+    def(T, 'some', function (fn, thisArg) { need(fn); for (var i = 0; i < this.length; i++) if (fn.call(thisArg, this[i], i, this)) return true; return false; });
+    def(T, 'every', function (fn, thisArg) { need(fn); for (var i = 0; i < this.length; i++) if (!fn.call(thisArg, this[i], i, this)) return false; return true; });
+    def(T, 'find', function (fn, thisArg) { need(fn); for (var i = 0; i < this.length; i++) if (fn.call(thisArg, this[i], i, this)) return this[i]; return undefined; });
+    def(T, 'findIndex', function (fn, thisArg) { need(fn); for (var i = 0; i < this.length; i++) if (fn.call(thisArg, this[i], i, this)) return i; return -1; });
+    def(T, 'findLast', function (fn, thisArg) { need(fn); for (var i = this.length - 1; i >= 0; i--) if (fn.call(thisArg, this[i], i, this)) return this[i]; return undefined; });
+    def(T, 'findLastIndex', function (fn, thisArg) { need(fn); for (var i = this.length - 1; i >= 0; i--) if (fn.call(thisArg, this[i], i, this)) return i; return -1; });
+    def(T, 'indexOf', function (v, from) { for (var i = relative(from, this.length); i < this.length; i++) if (this[i] === v) return i; return -1; });
+    def(T, 'lastIndexOf', function (v, from) {
+      var i = arguments.length > 1 ? (from < 0 ? this.length + from : Math.min(from, this.length - 1)) : this.length - 1;
+      for (; i >= 0; i--) if (this[i] === v) return i;
+      return -1;
+    });
+    def(T, 'includes', function (v, from) {
+      for (var i = relative(from, this.length); i < this.length; i++) if (this[i] === v || (v !== v && this[i] !== this[i])) return true;
+      return false;
+    });
+    def(T, 'join', function (sep) {
+      sep = sep === undefined ? ',' : String(sep);
+      var out = '';
+      for (var i = 0; i < this.length; i++) out += (i ? sep : '') + this[i];
+      return out;
+    });
+    def(T, 'toString', function () { return this.join(','); });
+    def(T, 'toLocaleString', function () { return this.join(','); });
+    def(T, 'reverse', function () {
+      for (var i = 0, j = this.length - 1; i < j; i++, j--) { var t = this[i]; this[i] = this[j]; this[j] = t; }
+      return this;
+    });
+    def(T, 'sort', function (compare) {
+      if (compare !== undefined) need(compare);
+      var items = [];
+      for (var i = 0; i < this.length; i++) items.push(this[i]);
+      items.sort(compare || function (a, b) { return a < b ? -1 : a > b ? 1 : (a === 0 && b === 0 ? (1 / a < 1 / b ? -1 : 1 / a > 1 / b ? 1 : 0) : (a !== a ? (b !== b ? 0 : 1) : (b !== b ? -1 : 0))); });
+      for (var j = 0; j < items.length; j++) this[j] = items[j];
+      return this;
+    });
+    def(T, 'at', function (i) { i = Math.trunc(i) || 0; if (i < 0) i += this.length; return this[i]; });
+    def(T, 'copyWithin', function (target, start, end) {
+      var n = this.length, to = relative(target, n), from = relative(start, n), last = end === undefined ? n : relative(end, n);
+      var count = Math.min(last - from, n - to), copy = [];
+      for (var i = 0; i < count; i++) copy.push(this[from + i]);
+      for (var j = 0; j < count; j++) this[to + j] = copy[j];
+      return this;
+    });
+    def(T, 'with', function (index, value) { var out = this.slice(); index = Math.trunc(index) || 0; if (index < 0) index += this.length; if (index < 0 || index >= this.length) throw new RangeError('Invalid typed array index'); out[index] = value; return out; });
+    def(T, 'toReversed', function () { return this.slice().reverse(); });
+    def(T, 'toSorted', function (compare) { return this.slice().sort(compare); });
+    function* walk(a, kind) { for (var i = 0; i < a.length; i++) yield kind === 0 ? i : kind === 1 ? a[i] : [i, a[i]]; }
+    def(T, 'keys', function () { return walk(this, 0); });
+    def(T, 'values', function () { return walk(this, 1); });
+    def(T, 'entries', function () { return walk(this, 2); });
+    def(T, ITER, T.values);
+    kinds.forEach(function (name) {
+      var ctor = g[name];
+      def(ctor, 'from', function (source, mapFn, thisArg) {
+        var items = Array.from(source, mapFn, thisArg);
+        return new this(items);
+      });
+      def(ctor, 'of', function () { var items = []; for (var i = 0; i < arguments.length; i++) items.push(arguments[i]); return new this(items); });
+    });
+  }());
   // Object helpers and Reflect
   if (!Object.is) def(Object, 'is', function (a, b) { return a === b ? (a !== 0 || 1 / a === 1 / b) : (a !== a && b !== b); });
   if (!Object.fromEntries) def(Object, 'fromEntries', function (iterable) { var o = {}; for (var e of iterable) o[e[0]] = e[1]; return o; });
@@ -361,6 +457,8 @@ Engine::Engine(allocators::IAllocator& allocator, IHost* host) : allocator_(allo
   on_big_stack([&] {
     run_here(kPrelude, &error, nullptr, nullptr, false);
     run_here(kCollections, &error, nullptr, nullptr, false);
+    run_here(stdlib_source(), &error, nullptr, nullptr, false);
+    if (!error.empty() && host_) host_->console(3, error.view());
   });
 }
 
@@ -499,7 +597,11 @@ uint32_t Engine::run_timers_here(double now_ms, bool ahead, uint32_t max, String
     for (uint32_t i = 4; i < entry->length; ++i) call_args.push_back(entry->items[i]);
     if (interval >= 0) entry->items[1] = Value::make_number((ahead ? best_due : now_ms) + interval);   // an interval comes round again
     else list->items[best] = Value();
+    Value level;
+    vm_.get_named(Value::make_object(entry), "n", &level);
+    vm_.define_named(vm_.global(), "__timer_level", level.is_number() ? level : Value::make_number(0), 0);   // (the timers this one starts are one level deeper)
     failed += call_guarded(fn, call_args.count() ? &call_args[0] : nullptr, static_cast<uint32_t>(call_args.count()), error);
+    vm_.define_named(vm_.global(), "__timer_level", Value::make_number(0), 0);
   }
   // forget the timers that have run (the array would otherwise only grow)
   uint32_t live = 0;

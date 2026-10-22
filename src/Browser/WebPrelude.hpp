@@ -24,6 +24,8 @@ namespace browser {
 
 // The source text of the script.
 const char* web_prelude();
+// What a Web Worker's script engine runs before the worker's own script: self, postMessage, onmessage, close, importScripts ...
+const char* worker_prelude();
 // The DOM interfaces that are written in JavaScript (Range, Selection, TreeWalker, NodeIterator, NodeFilter, Attr nodes, CharacterData methods, Option, XMLSerializer ...).
 const char* dom_prelude();
 

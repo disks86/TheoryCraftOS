@@ -16,9 +16,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The lexer and the recursive-descent parser. The language is a practical subset of ECMAScript 5 with some of ES2015 - let / const, arrow functions,
-// template literals, spread, for-of, default parameters, ?? and ?., async functions and await - and left out: classes, regular expression literals,
-// destructuring, generators, getters and setters, labels on blocks, `with`, `eval`.
+// The lexer and the recursive-descent parser. The language is ECMAScript 5 with most of what came after: let / const, arrow functions, template literals
+// (also tagged), spread, for-of, default parameters, destructuring (declarations, assignments, parameters, for-of heads, catch), classes (extends, super,
+// static members, fields, private names as properties whose name starts with #, accessors), getters and setters, generators (function*, yield, yield*),
+// regular expression literals, ?? ?. and the logical assignments (&&= ||= ??=), numeric separators, new.target, async functions and await. Classes,
+// destructuring, tagged templates, async generators and for await are turned into plain code here (see class_body(), destructure(), tagged_template(),
+// wrap_async_generator(), lower_for_await()); a BigInt literal is a call of BigInt(). Left out: `with`.
+#include <initializer_list>
+#include <new>
 #include "Script/Ast.hpp"
 #include "Script/Number.hpp"
 
@@ -30,7 +35,7 @@ enum class T : uint8_t {
   Eof, Number, String, Ident, Backtick,
   LParen, RParen, LBrace, RBrace, LBracket, RBracket, Semi, Comma, Dot, Ellipsis, Question, QuestionDot, Colon, Arrow,
   Assign, PlusAssign, MinusAssign, StarAssign, SlashAssign, PercentAssign, StarStarAssign, ShlAssign, ShrAssign, UShrAssign, AmpAssign, PipeAssign, CaretAssign,
-  Plus, Minus, Star, Slash, Percent, StarStar, Inc, Dec, Amp, Pipe, Caret, Tilde, Bang, Shl, Shr, UShr, AmpAmp, PipePipe, QQ,
+  Plus, Minus, Star, Slash, Percent, StarStar, Inc, Dec, Amp, Pipe, Caret, Tilde, Bang, Shl, Shr, UShr, AmpAmp, PipePipe, QQ, AmpAmpAssign, PipePipeAssign, QQAssign,
   Eq, Ne, StrictEq, StrictNe, Lt, Gt, Le, Ge,
 };
 
@@ -40,6 +45,7 @@ struct Token {
   double number = 0;
   bool newline_before = false;
   uint32_t line = 1;
+  bool bigint = false;    // a number written 123n (text holds its digits)
 };
 
 bool is_ident_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' || static_cast<uint8_t>(c) >= 0x80; }
@@ -194,8 +200,9 @@ class Parser {
       return;
     }
     const char c = peek();
-    if (is_ident_start(c)) {
+    if (is_ident_start(c) || (c == '#' && is_ident_start(peek(1)))) {   // (#name: a private member, kept as a property whose name starts with #)
       const uint64_t start = pos_;
+      ++pos_;
       while (is_ident_part(peek())) ++pos_;
       t.kind = T::Ident;
       t.text = src_.substr(start, pos_ - start);
@@ -230,30 +237,53 @@ class Parser {
     cur_ = t;
   }
 
+  // A number's text without the _ separators (a copy in the arena when there are any).
+  StringView without_separators(StringView text) {
+    if (!text.contains('_')) return text;
+    String clean(arena_.allocator());
+    for (const char c : text)
+      if (c != '_') clean.push_back(c);
+    return arena_.copy(clean.view());
+  }
+
   void lex_number(Token* t) {
     const uint64_t start = pos_;
     t->kind = T::Number;
     if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X' || peek(1) == 'o' || peek(1) == 'O' || peek(1) == 'b' || peek(1) == 'B')) {
       pos_ += 2;
-      while (hex_value(peek()) >= 0) ++pos_;
+      while (hex_value(peek()) >= 0 || (peek() == '_' && hex_value(peek(1)) >= 0)) ++pos_;
       double v = 0;
-      if (!string_to_number(src_.substr(start, pos_ - start), &v)) fail("Invalid number");
+      if (!string_to_number(without_separators(src_.substr(start, pos_ - start)), &v)) fail("Invalid number");
       t->number = v;
+      if (peek() == 'n') {   // 0xFFn
+        t->bigint = true;
+        t->text = without_separators(src_.substr(start, pos_ - start));
+        ++pos_;
+      }
       return;
     }
-    while (is_digit(peek())) ++pos_;
+    auto digits = [&] { while (is_digit(peek()) || (peek() == '_' && is_digit(peek(1)))) ++pos_; };   // (1_000_000)
+    digits();
     if (peek() == '.') {
       ++pos_;
-      while (is_digit(peek())) ++pos_;
+      digits();
     }
     if (peek() == 'e' || peek() == 'E') {
       const uint64_t save = pos_;
       ++pos_;
       if (peek() == '+' || peek() == '-') ++pos_;
       if (!is_digit(peek())) pos_ = save;
-      while (is_digit(peek())) ++pos_;
+      digits();
     }
-    StringView text = src_.substr(start, pos_ - start);
+    StringView text = without_separators(src_.substr(start, pos_ - start));
+    if (peek() == 'n' && !text.contains('.') && !text.contains('e') && !text.contains('E')) {   // 123n
+      t->bigint = true;
+      t->text = text;
+      ++pos_;
+      double ignored = 0;
+      parse_decimal(text, &ignored);
+      return;
+    }
     double v = 0;
     if (text.ends_with('.')) text = text.without_suffix(1);
     if (!parse_decimal(text, &v)) fail("Invalid number");
@@ -267,7 +297,7 @@ class Parser {
       T kind;
     };
     static const P kPuncts[] = {
-        {">>>=", T::UShrAssign}, {"...", T::Ellipsis}, {"===", T::StrictEq}, {"!==", T::StrictNe}, {"**=", T::StarStarAssign}, {"<<=", T::ShlAssign},
+        {">>>=", T::UShrAssign}, {"&&=", T::AmpAmpAssign}, {"||=", T::PipePipeAssign}, {"?\?=", T::QQAssign}, {"...", T::Ellipsis}, {"===", T::StrictEq}, {"!==", T::StrictNe}, {"**=", T::StarStarAssign}, {"<<=", T::ShlAssign},
         {">>=", T::ShrAssign},   {">>>", T::UShr},     {"=>", T::Arrow},      {"==", T::Eq},        {"!=", T::Ne},        {"<=", T::Le},
         {">=", T::Ge},           {"&&", T::AmpAmp},    {"||", T::PipePipe},   {"??", T::QQ},        {"?.", T::QuestionDot}, {"++", T::Inc},
         {"--", T::Dec},          {"+=", T::PlusAssign}, {"-=", T::MinusAssign}, {"*=", T::StarAssign}, {"/=", T::SlashAssign}, {"%=", T::PercentAssign},
@@ -281,7 +311,7 @@ class Parser {
       const StringView text(p.text);
       if (src_.substr(pos_).starts_with(text)) {
         if (p.kind == T::QuestionDot && is_digit(peek(2))) continue;   // (a ? .5 : x)
-        // A "/" here is a division or an operator; regular expression literals are not supported.
+        // (a "/" where an operand is wanted starts a regular expression: see regex_literal())
         pos_ += text.size();
         t->kind = p.kind;
         return;
@@ -395,7 +425,7 @@ class Parser {
       if (w.equals("throw")) return throw_statement();
       if (w.equals("try")) return try_statement();
       if (w.equals("switch")) return switch_statement();
-      if (w.equals("class")) return null_fail("Classes are not supported");
+      if (w.equals("class")) return class_declaration();
       if (w.equals("debugger")) {
         next();
         consume_semicolon();
@@ -427,7 +457,7 @@ class Parser {
   bool let_declaration_ahead() {
     const Mark m = mark();
     next();
-    const bool yes = cur_.kind == T::Ident && !reserved(cur_.text);
+    const bool yes = (cur_.kind == T::Ident && !reserved(cur_.text)) || cur_.kind == T::LBracket || cur_.kind == T::LBrace;
     rewind(m);
     return yes;
   }
@@ -453,6 +483,33 @@ class Parser {
     next();
     Node** tail = &n->list;
     do {
+      if (is(T::LBracket) || is(T::LBrace)) {   // let [a, b] = ... / const { x, y } = ...
+        Node* pattern = is(T::LBracket) ? array_literal() : object_literal();
+        if (!pattern) return nullptr;
+        Node* value = nullptr;
+        if (accept(T::Assign)) {
+          value = assignment(no_in);
+          if (!value) return nullptr;
+        } else if (!(no_in && (is_word("of") || is_word("in")))) {
+          return null_fail("Missing initializer in destructuring declaration");
+        }
+        if (!value) {   // for (const [k, v] of x): the loop gives a value to a name of its own, the pattern is unpacked in the body
+          Node* d = make(NodeKind::Declarator);
+          if (!d) return nullptr;
+          d->text = temp_name("%f");
+          d->b = pattern;
+          *tail = d;
+          tail = &d->next;
+          continue;
+        }
+        Sink sink;
+        if (!destructure(pattern, value, false, &sink)) return nullptr;
+        if (sink.head) {
+          *tail = sink.head;
+          tail = sink.tail;
+        }
+        continue;
+      }
       if (!is(T::Ident) || reserved(cur_.text)) return null_fail("Unexpected token");
       Node* d = make(NodeKind::Declarator);
       if (!d) return nullptr;
@@ -529,6 +586,11 @@ class Parser {
   Node* for_statement() {
     const uint32_t line = cur_.line;
     next();
+    bool for_await = false;
+    if (is_word("await") && (in_async_ || in_async_generator_)) {
+      for_await = true;
+      next();
+    }
     if (!expect(T::LParen, "Unexpected token")) return nullptr;
     Node* init = nullptr;
     if (!is(T::Semi)) {
@@ -550,7 +612,23 @@ class Parser {
         n->b = is_of ? assignment(false) : expression(false);
         if (!n->b || !expect(T::RParen, "Unexpected token")) return nullptr;
         n->d = statement();
-        return n->d ? n : nullptr;
+        if (!n->d) return nullptr;
+        if (init->kind == NodeKind::Var && init->list->b) {   // for (const [k, v] of x): the pattern is unpacked at the top of the body
+          Node* source = make(NodeKind::Ident);
+          Node* v = make(NodeKind::Var);
+          Node* body = make(NodeKind::Block);
+          if (!source || !v || !body) return nullptr;
+          source->text = init->list->text;
+          Sink sink;
+          if (!destructure(init->list->b, source, false, &sink)) return nullptr;
+          v->var_kind = init->var_kind;
+          v->list = sink.head;
+          v->next = n->d;
+          body->list = v;
+          n->d = body;
+          init->list->b = nullptr;
+        }
+        return for_await ? lower_for_await(n, init) : n;
       }
     }
     Node* n = arena_.make(NodeKind::For, line);
@@ -569,6 +647,74 @@ class Parser {
     if (!expect(T::RParen, "Unexpected token")) return nullptr;
     n->d = statement();
     return n->d ? n : nullptr;
+  }
+
+  // `await x` where an await is allowed (in an async generator it is a yield, see unary_inner())
+  Node* make_await(Node* operand) {
+    Node* a = make(NodeKind::Unary);
+    if (!a || !operand) return nullptr;
+    if (in_async_generator_) {
+      a->op = Op::Yield;
+      a->a = new_call(new_ident("__aw"), {operand});
+      return a->a ? a : nullptr;
+    }
+    a->op = Op::Await;
+    a->a = operand;
+    return a;
+  }
+
+  // for await (target of iterable) body  becomes
+  //   { const it = __async_iter(iterable); for (;;) { const r = await it.next(); if (r.done) break; target = r.value; body } }
+  Node* lower_for_await(Node* loop, Node* target) {
+    const StringView iterator = temp_name("%i"), step = temp_name("%r");
+    Node* block_node = make(NodeKind::Block);
+    Node* for_node = make(NodeKind::For);
+    Node* body = make(NodeKind::Block);
+    Node* guard = make(NodeKind::If);
+    Node* stop = make(NodeKind::Break);
+    Node* done = new_member(new_ident(step), "done");
+    Node* next_call = new_call(new_member(new_ident(iterator), "next"), {});
+    Node* awaited = make_await(next_call);
+    if (!block_node || !for_node || !body || !guard || !stop || !done || !awaited) return nullptr;
+    guard->a = done;
+    guard->b = stop;
+    Node* make_iterator = new_var(iterator, new_call(new_ident("__async_iter"), {loop->b}));
+    Node* read_step = new_var(step, awaited);
+    if (!make_iterator || !read_step) return nullptr;
+    read_step->var_kind = VarKind::Const;
+    make_iterator->var_kind = VarKind::Const;
+    Node* value = new_member(new_ident(step), "value");
+    Node* bind = nullptr;
+    if (target->kind == NodeKind::Var) {
+      Node* d = target->list;
+      if (d->b) {   // a pattern: unpacked from the value
+        Sink sink;
+        if (!destructure(d->b, value, false, &sink)) return nullptr;
+        bind = make(NodeKind::Var);
+        if (!bind) return nullptr;
+        bind->var_kind = target->var_kind;
+        bind->list = sink.head;
+      } else {
+        bind = new_var(d->text, value);
+        if (bind) bind->var_kind = target->var_kind;
+      }
+    } else {
+      Node* assign = make(NodeKind::Assign);
+      if (!assign) return nullptr;
+      assign->op = Op::Assign;
+      assign->a = target;
+      assign->b = value;
+      bind = new_statement(assign);
+    }
+    if (!bind) return nullptr;
+    read_step->next = guard;
+    guard->next = bind;
+    bind->next = loop->d;
+    body->list = read_step;
+    for_node->d = body;
+    make_iterator->next = for_node;
+    block_node->list = make_iterator;
+    return block_node;
   }
 
   Node* return_statement() {
@@ -612,17 +758,41 @@ class Parser {
     if (!n) return nullptr;
     n->a = block();
     if (!n->a) return nullptr;
+    Node* catch_pattern = nullptr;
     if (accept_word("catch")) {
       if (accept(T::LParen)) {
-        if (!is(T::Ident) || reserved(cur_.text)) return null_fail("Unexpected token");
+        Node* pattern = nullptr;
+        if (is(T::LBracket) || is(T::LBrace)) {
+          pattern = is(T::LBracket) ? array_literal() : object_literal();
+          if (!pattern) return nullptr;
+        } else if (!is(T::Ident) || reserved(cur_.text)) {
+          return null_fail("Unexpected token");
+        }
         n->b = make(NodeKind::Ident);
         if (!n->b) return nullptr;
-        n->b->text = cur_.text;
-        next();
-        if (!expect(T::RParen, "Destructuring in catch is not supported")) return nullptr;
+        if (pattern) {
+          n->b->text = temp_name("%e");
+        } else {
+          n->b->text = cur_.text;
+          next();
+        }
+        if (!expect(T::RParen, "Unexpected token")) return nullptr;
+        catch_pattern = pattern;
       }
       n->c = block();
       if (!n->c) return nullptr;
+      if (catch_pattern) {   // catch ({ message }): unpacked first thing in the handler
+        Node* source = make(NodeKind::Ident);
+        Node* v = make(NodeKind::Var);
+        if (!source || !v) return nullptr;
+        source->text = n->b->text;
+        Sink sink;
+        if (!destructure(catch_pattern, source, false, &sink)) return nullptr;
+        v->var_kind = VarKind::Let;
+        v->list = sink.head;
+        v->next = n->c->list;
+        n->c->list = v;
+      }
     }
     if (accept_word("finally")) {
       n->d = block();
@@ -670,53 +840,113 @@ class Parser {
     if (!f) return nullptr;
     if (is_async) f->flags |= kFlagAsync;
     next();   // `function`
+    const bool generator = accept(T::Star);
+    if (generator) f->flags |= kFlagGenerator;
     if (is(T::Ident) && !reserved(cur_.text)) {
       f->text = cur_.text;
       next();
     }
     if (expression) f->flags |= kFlagExpression;
     if (!parameters(f)) return nullptr;
-    f->a = function_body(is_async);
+    f->a = function_body(is_async, generator);
+    if (f->a && is_async && generator) wrap_async_generator(f);
     return f->a ? f : nullptr;
+  }
+
+  // async function* f(a) { body }  becomes  function f(a) { return __async_gen((function* () { body }).apply(this, arguments)); }: the body is a plain
+  // generator (an `await` in it was made a yield), and the driver in the standard library turns it into an async iterator.
+  bool wrap_async_generator(Node* f) {
+    Node* inner = make(NodeKind::Function);
+    Node* body = make(NodeKind::Block);
+    Node* ret = make(NodeKind::Return);
+    Node* self = make(NodeKind::This);
+    if (!inner || !body || !ret || !self) return false;
+    inner->flags = kFlagGenerator | kFlagExpression;
+    inner->a = f->a;
+    Node* apply = new_call(new_member(inner, "apply"), {self, new_ident("arguments")});
+    Node* wrapped = apply ? new_call(new_ident("__async_gen"), {apply}) : nullptr;
+    if (!wrapped) return false;
+    ret->a = wrapped;
+    body->list = ret;
+    f->a = body;
+    f->flags &= static_cast<uint8_t>(~(kFlagAsync | kFlagGenerator));
+    return true;
   }
 
   bool parameters(Node* f) {
     if (!expect(T::LParen, "Unexpected token")) return false;
     Node** tail = &f->list;
+    Node* prologue = nullptr;   // the statements that unpack the parameters that are patterns
+    Node** prologue_tail = &prologue;
     while (!is(T::RParen) && !is(T::Eof)) {
       bool rest = false;
       if (accept(T::Ellipsis)) rest = true;
-      if (!is(T::Ident) || reserved(cur_.text)) {
+      Node* pattern = nullptr;
+      if (is(T::LBracket) || is(T::LBrace)) {   // function f({ a, b }, [c, d]) - the parameter has a name of its own, the pattern is unpacked first thing in the body
+        pattern = is(T::LBracket) ? array_literal() : object_literal();
+        if (!pattern) return false;
+      } else if (!is(T::Ident) || reserved(cur_.text)) {
         fail("Unexpected token");
         return false;
       }
       Node* p = make(NodeKind::Ident);
       if (!p) return false;
-      p->text = cur_.text;
-      next();
+      if (pattern) {
+        p->text = temp_name("%p");
+      } else {
+        p->text = cur_.text;
+        next();
+      }
       if (accept(T::Assign)) {
         p->a = assignment(false);
         if (!p->a) return false;
       }
       *tail = p;
       tail = &p->next;
+      if (pattern) {
+        Node* source = make(NodeKind::Ident);
+        if (!source) return false;
+        source->text = p->text;
+        Sink sink;
+        if (!destructure(pattern, source, false, &sink)) return false;
+        Node* v = make(NodeKind::Var);
+        if (!v) return false;
+        v->var_kind = VarKind::Let;
+        v->list = sink.head;
+        *prologue_tail = v;
+        prologue_tail = &v->next;
+      }
       if (rest) {
         f->flags |= kFlagRest;
         break;
       }
       if (!accept(T::Comma)) break;
     }
-    return expect(T::RParen, "Unexpected token");
+    if (!expect(T::RParen, "Unexpected token")) return false;
+    pending_prologue_ = prologue;
+    return true;
   }
 
-  Node* function_body(bool is_async = false) {
+  Node* function_body(bool is_async = false, bool is_generator = false) {
     if (!is(T::LBrace)) return null_fail("Unexpected token");
-    const bool saved = in_function_, saved_async = in_async_;
+    Node* prologue = pending_prologue_;
+    pending_prologue_ = nullptr;
+    const bool saved = in_function_, saved_async = in_async_, saved_generator = in_generator_, saved_async_generator = in_async_generator_;
     in_function_ = true;
     in_async_ = is_async;
+    in_generator_ = is_generator;
+    in_async_generator_ = is_async && is_generator;   // (await becomes a yield the driver of the async generator understands)
     Node* b = block();
     in_function_ = saved;
     in_async_ = saved_async;
+    in_generator_ = saved_generator;
+    in_async_generator_ = saved_async_generator;
+    if (b && prologue) {
+      Node* last = prologue;
+      while (last->next) last = last->next;
+      last->next = b->list;
+      b->list = prologue;
+    }
     return b;
   }
 
@@ -762,13 +992,31 @@ class Parser {
     if (is(T::LBrace)) {
       f->a = function_body(is_async);
     } else {
+      Node* prologue = pending_prologue_;
+      pending_prologue_ = nullptr;
       f->flags |= kFlagExprBody;
-      const bool saved = in_function_, saved_async = in_async_;
+      const bool saved = in_function_, saved_async = in_async_, saved_generator = in_generator_, saved_async_generator = in_async_generator_;
       in_function_ = true;
       in_async_ = is_async;
+      in_generator_ = false;
+      in_async_generator_ = false;
       f->a = assignment(false);
       in_function_ = saved;
       in_async_ = saved_async;
+      in_generator_ = saved_generator;
+      in_async_generator_ = saved_async_generator;
+      if (f->a && prologue) {   // (parameters that are patterns: the expression becomes a block that unpacks them and returns the value)
+        Node* block_node = make(NodeKind::Block);
+        Node* ret = make(NodeKind::Return);
+        if (!block_node || !ret) return nullptr;
+        ret->a = f->a;
+        Node* last = prologue;
+        while (last->next) last = last->next;
+        last->next = ret;
+        block_node->list = prologue;
+        f->a = block_node;
+        f->flags &= static_cast<uint8_t>(~kFlagExprBody);
+      }
     }
     return f->a ? f : nullptr;
   }
@@ -809,6 +1057,33 @@ class Parser {
     }
   }
 
+  // A copy of a simple expression (names, members, literals) - the target of a logical assignment is evaluated twice.
+  Node* clone_target(const Node* n, uint32_t depth) {
+    if (!n || depth > 16) return nullptr;
+    Node* c = nullptr;
+    switch (n->kind) {
+      case NodeKind::Ident:
+      case NodeKind::This:
+      case NodeKind::Number:
+      case NodeKind::String:
+        c = make(n->kind);
+        if (!c) return nullptr;
+        c->text = n->text;
+        c->number = n->number;
+        return c;
+      case NodeKind::Member:
+      case NodeKind::Index:
+        c = make(n->kind);
+        if (!c) return nullptr;
+        c->text = n->text;
+        c->flags = n->flags;
+        c->a = clone_target(n->a, depth + 1);
+        if (n->kind == NodeKind::Index) c->b = clone_target(n->b, depth + 1);
+        return c->a && (n->kind == NodeKind::Member || c->b) ? c : nullptr;
+      default: return nullptr;
+    }
+  }
+
   Node* assignment(bool no_in) {
     Depth guard(*this);
     return guard.ok ? assignment_inner(no_in) : nullptr;
@@ -816,6 +1091,20 @@ class Parser {
 
   Node* assignment_inner(bool no_in) {
     if (failed_) return nullptr;
+    if (in_generator_ && is_word("yield")) {   // yield, yield value, yield* iterable
+      Node* y = make(NodeKind::Unary);
+      if (!y) return nullptr;
+      y->op = Op::Yield;
+      next();
+      if (accept(T::Star)) y->flags |= kFlagDelegate;
+      const bool operand = !(cur_.newline_before && !(y->flags & kFlagDelegate)) && !is(T::RParen) && !is(T::RBracket) && !is(T::RBrace) && !is(T::Comma) && !is(T::Semi) &&
+                           !is(T::Colon) && !is(T::Eof);
+      if (operand || (y->flags & kFlagDelegate)) {
+        y->a = assignment(no_in);
+        if (!y->a) return nullptr;
+      }
+      return y;
+    }
     // Async arrow functions: `async x => ...` and `async (...) => ...`.
     if (is_word("async")) {
       const Mark m = mark();
@@ -849,8 +1138,31 @@ class Parser {
     }
     Node* left = conditional(no_in);
     if (!left) return nullptr;
+    if (cur_.kind == T::AmpAmpAssign || cur_.kind == T::PipePipeAssign || cur_.kind == T::QQAssign) {   // a ||= b  is  a || (a = b)
+      const Op logical = cur_.kind == T::AmpAmpAssign ? Op::And : cur_.kind == T::PipePipeAssign ? Op::Or : Op::Nullish;
+      if (left->kind != NodeKind::Ident && left->kind != NodeKind::Member && left->kind != NodeKind::Index) return null_fail("Invalid left-hand side in assignment");
+      Node* target = clone_target(left, 0);
+      if (!target) return null_fail("Unsupported left-hand side of a logical assignment");
+      Node* node = make(NodeKind::Logical);
+      Node* assign = make(NodeKind::Assign);
+      if (!node || !assign) return nullptr;
+      next();
+      assign->op = Op::Assign;
+      assign->a = target;
+      assign->b = assignment(no_in);
+      if (!assign->b) return nullptr;
+      node->op = logical;
+      node->a = left;
+      node->b = assign;
+      return node;
+    }
     Op op;
     if (assign_op(cur_.kind, &op)) {
+      if (op == Op::Assign && (left->kind == NodeKind::ArrayLit || left->kind == NodeKind::ObjectLit)) {   // [a, b] = value
+        next();
+        Node* value = assignment(no_in);
+        return value ? destructuring_assignment(left, value) : nullptr;
+      }
       if (left->kind != NodeKind::Ident && left->kind != NodeKind::Member && left->kind != NodeKind::Index) return null_fail("Invalid left-hand side in assignment");
       Node* n = make(NodeKind::Assign);
       if (!n) return nullptr;
@@ -965,6 +1277,16 @@ class Parser {
       }
       default: break;
     }
+    if (op == Op::Await && in_async_generator_) {   // in an async generator `await x` is `yield __aw(x)`: the driver waits for x and resumes the generator
+      Node* y = make(NodeKind::Unary);
+      if (!y) return nullptr;
+      next();
+      Node* operand = unary();
+      if (!operand) return nullptr;
+      y->op = Op::Yield;
+      y->a = new_call(new_ident("__aw"), {operand});
+      return y->a ? y : nullptr;
+    }
     if (op != Op::None) {
       Node* n = make(NodeKind::Unary);
       if (!n) return nullptr;
@@ -1013,8 +1335,650 @@ class Parser {
     return expect(T::RParen, "Unexpected token");
   }
 
+  // --- Destructuring
+  // A pattern is read as an expression (an array or object literal, with defaults as assignments) and then taken apart into a list of simple steps: a
+  // temporary for each value that is used more than once, and a declarator (or an assignment) for each name. `declare` tells whether the names are declared by
+  // the list (let / const / var: the steps are Declarator nodes) or already exist (the steps are statements).
+  struct Sink {
+    Node* head = nullptr;
+    Node** tail = &head;
+    void push(Node* n) {
+      *tail = n;
+      tail = &n->next;
+    }
+  };
+
+  StringView temp_name(const char* prefix) {
+    String name(arena_.allocator());
+    name.append(prefix);
+    name.append_uint(temp_counter_++);
+    return arena_.copy(name.view());
+  }
+
+  Node* void_zero() {
+    Node* u = make(NodeKind::Unary);
+    Node* zero = make(NodeKind::Number);
+    if (!u || !zero) return nullptr;
+    u->op = Op::Void;
+    u->a = zero;
+    return u;
+  }
+
+  bool bind_temp(StringView name, Node* value, bool declare, Sink* sink) {
+    Node* d = make(NodeKind::Declarator);
+    if (!d || !value) return false;
+    d->text = name;
+    d->a = value;
+    if (declare) {   // the pieces of a statement list
+      Node* v = make(NodeKind::Var);
+      if (!v) return false;
+      v->var_kind = VarKind::Let;
+      v->list = d;
+      sink->push(v);
+    } else {
+      sink->push(d);
+    }
+    return true;
+  }
+
+  bool bind_target(Node* target, Node* value, bool statements, Sink* sink) {
+    if (!value) return false;
+    if (!statements) {
+      if (target->kind != NodeKind::Ident) {
+        fail("Invalid destructuring assignment target");
+        return false;
+      }
+      Node* d = make(NodeKind::Declarator);
+      if (!d) return false;
+      d->text = target->text;
+      d->a = value;
+      sink->push(d);
+      return true;
+    }
+    Node* assign = make(NodeKind::Assign);
+    Node* statement = make(NodeKind::ExprStmt);
+    if (!assign || !statement) return false;
+    assign->op = Op::Assign;
+    assign->a = target;
+    assign->b = value;
+    statement->a = assign;
+    sink->push(statement);
+    return true;
+  }
+
+  // Takes `pattern` apart, given the expression `value` (which is evaluated once). `statements`: assign to existing targets instead of declaring names.
+  bool destructure(Node* pattern, Node* value, bool statements, Sink* sink) {
+    Depth guard(*this);
+    if (!guard.ok || !pattern || !value) return false;
+    switch (pattern->kind) {
+      case NodeKind::Ident:
+      case NodeKind::Member:
+      case NodeKind::Index: return bind_target(pattern, value, statements, sink);
+      case NodeKind::Assign: {   // target = default
+        if (pattern->op != Op::Assign) break;
+        const StringView tmp = temp_name("%t");
+        if (!bind_temp(tmp, value, statements, sink)) return false;
+        Node* cond = make(NodeKind::Conditional);
+        Node* test = make(NodeKind::Binary);
+        Node* a = new_ident(tmp);
+        Node* b = new_ident(tmp);
+        Node* zero = void_zero();
+        if (!cond || !test || !a || !b || !zero) return false;
+        test->op = Op::StrictEq;
+        test->a = a;
+        test->b = zero;
+        cond->a = test;
+        cond->b = pattern->b;
+        cond->c = b;
+        return destructure(pattern->a, cond, statements, sink);
+      }
+      case NodeKind::ArrayLit: {
+        const StringView t = temp_name("%t");
+        int64_t wanted = 0;
+        bool has_rest = false;
+        for (Node* e = pattern->list; e; e = e->next) {
+          if (e->kind == NodeKind::Spread) has_rest = true;
+          else ++wanted;
+        }
+        Node* count = number_node(has_rest ? -1 : static_cast<double>(wanted));
+        Node* call = new_call(new_ident("__to_array"), {value, count});
+        if (!call || !bind_temp(t, call, statements, sink)) return false;
+        uint32_t index = 0;
+        for (Node* e = pattern->list; e; e = e->next, ++index) {
+          Node* element = nullptr;
+          if (e->kind == NodeKind::Spread) {
+            Node* slice = new_call(new_member(new_ident(t), "slice"), {number_node(index)});
+            if (!slice || !destructure(e->a, slice, statements, sink)) return false;
+            continue;
+          }
+          if (e->kind == NodeKind::Ident && e->text.equals("undefined")) continue;   // a hole
+          element = make(NodeKind::Index);
+          if (!element) return false;
+          element->a = new_ident(t);
+          element->b = number_node(index);
+          if (!element->a || !element->b) return false;
+          Node* detached = e;
+          Node* saved_next = detached->next;
+          detached->next = nullptr;
+          const bool ok = destructure(detached, element, statements, sink);
+          detached->next = saved_next;
+          if (!ok) return false;
+        }
+        return true;
+      }
+      case NodeKind::ObjectLit: {
+        const StringView t = temp_name("%t");
+        Node* call = new_call(new_ident("__req_object"), {value});
+        if (!call || !bind_temp(t, call, statements, sink)) return false;
+        Node* keys = make(NodeKind::ArrayLit);   // the names taken so far, for a rest element
+        Node** key_tail = &keys->list;
+        if (!keys) return false;
+        for (Node* p = pattern->list; p; p = p->next) {
+          if (p->kind == NodeKind::Spread) {
+            Node* rest = new_call(new_ident("__rest"), {new_ident(t), keys});
+            return rest && destructure(p->a, rest, statements, sink);
+          }
+          Node* source;
+          Node* key_for_rest;
+          if (p->flags & kFlagComputed) {
+            const StringView kt = temp_name("%t");
+            if (!bind_temp(kt, p->b, statements, sink)) return false;
+            source = make(NodeKind::Index);
+            if (!source) return false;
+            source->a = new_ident(t);
+            source->b = new_ident(kt);
+            key_for_rest = new_ident(kt);
+          } else {
+            source = new_member(new_ident(t), p->text);
+            key_for_rest = new_string(p->text);
+          }
+          if (!source || !key_for_rest) return false;
+          *key_tail = key_for_rest;
+          key_tail = &key_for_rest->next;
+          Node* target = p->a;
+          if (p->c) {   // { name = default }
+            Node* with_default = make(NodeKind::Assign);
+            if (!with_default) return false;
+            with_default->op = Op::Assign;
+            with_default->a = p->a;
+            with_default->b = p->c;
+            target = with_default;
+          }
+          if (!destructure(target, source, statements, sink)) return false;
+        }
+        return true;
+      }
+      default: break;
+    }
+    fail("Invalid destructuring assignment target");
+    return false;
+  }
+
+  // [a, b] = value as an expression: an arrow function that takes the value and assigns the pieces runs at once, and gives the value back.
+  Node* destructuring_assignment(Node* pattern, Node* value) {
+    Node* fn = make(NodeKind::Function);
+    Node* body = make(NodeKind::Block);
+    Node* param = make(NodeKind::Ident);
+    if (!fn || !body || !param) return nullptr;
+    const StringView whole = temp_name("%a");
+    param->text = whole;
+    Node* source = new_ident(whole);
+    Sink sink;
+    if (!source || !destructure(pattern, source, true, &sink)) return nullptr;
+    Node* ret = make(NodeKind::Return);
+    Node* result = new_ident(whole);
+    if (!ret || !result) return nullptr;
+    ret->a = result;
+    sink.push(ret);
+    body->list = sink.head;
+    fn->flags |= kFlagArrow;
+    fn->list = param;
+    fn->a = body;
+    return new_call(fn, {value});
+  }
+
+  // --- Classes
+  // `class` is turned into ordinary code: a function expression called at once, which makes the constructor function, chains the prototypes with __class(), puts
+  // the methods on with __def() (getters and setters too), sets the static fields and returns the constructor. `super` is the variable %S of that function.
+  Node* new_ident(StringView name) {
+    Node* n = make(NodeKind::Ident);
+    if (n) n->text = name;
+    return n;
+  }
+  Node* new_string(StringView text) {
+    Node* n = make(NodeKind::String);
+    if (n) n->text = text;
+    return n;
+  }
+  Node* new_member(Node* object, StringView name) {
+    Node* n = make(NodeKind::Member);
+    if (!n) return nullptr;
+    n->a = object;
+    n->text = name;
+    return n;
+  }
+  // callee(arguments...): the arguments are given as a null terminated array of nodes
+  Node* new_call(Node* callee, std::initializer_list<Node*> arguments) {
+    Node* n = make(NodeKind::Call);
+    if (!n || !callee) return nullptr;
+    n->a = callee;
+    Node** tail = &n->list;
+    for (Node* a : arguments) {
+      if (!a) return nullptr;
+      *tail = a;
+      tail = &a->next;
+    }
+    return n;
+  }
+  Node* new_statement(Node* expression) {
+    if (!expression) return nullptr;
+    Node* n = make(NodeKind::ExprStmt);
+    if (n) n->a = expression;
+    return n;
+  }
+  Node* new_var(StringView name, Node* init) {
+    Node* v = make(NodeKind::Var);
+    Node* d = make(NodeKind::Declarator);
+    if (!v || !d || !init) return nullptr;
+    v->var_kind = VarKind::Var;
+    d->text = name;
+    d->a = init;
+    v->list = d;
+    return v;
+  }
+
+  struct ClassMember {
+    Node* key = nullptr;       // a String node, or the computed key expression
+    Node* value = nullptr;     // the function, or the field's initializer (null: none)
+    bool is_static = false, is_field = false, computed = false, is_private = false, is_block = false;   // is_block: static { ... }
+    uint8_t accessor = 0;      // 1 getter, 2 setter
+    ClassMember* next = nullptr;
+  };
+
+  Node* class_declaration() {
+    next();   // `class`
+    if (!is(T::Ident) || reserved(cur_.text)) return null_fail("Unexpected token");
+    const StringView name = cur_.text;
+    Node* value = class_body(name);
+    if (!value) return nullptr;
+    Node* v = make(NodeKind::Var);
+    Node* d = make(NodeKind::Declarator);
+    if (!v || !d) return nullptr;
+    v->var_kind = VarKind::Let;
+    d->text = name;
+    d->a = value;
+    v->list = d;
+    return v;
+  }
+
+  Node* class_expression() {
+    next();   // `class`
+    StringView name;
+    if (is(T::Ident) && !reserved(cur_.text) && !is_word("extends")) name = cur_.text;
+    return class_body(name);
+  }
+
+  // At the class name (or at `extends` / `{` for a class without one).
+  Node* class_body(StringView name) {
+    if (!name.empty()) next();
+    Node* parent = nullptr;
+    if (is_word("extends")) {
+      next();
+      parent = call_or_member();
+      if (!parent) return nullptr;
+    }
+    if (!expect(T::LBrace, "Unexpected token")) return nullptr;
+    const StringView saved_super = class_super_;
+    const bool saved_static = class_static_;
+    class_super_ = parent ? StringView("%S") : StringView();
+    const StringView cname = name.empty() ? StringView("%C") : name;
+    Node* constructor = nullptr;
+    ClassMember* first = nullptr;
+    ClassMember** tail = &first;
+    while (!is(T::RBrace) && !is(T::Eof) && !failed_) {
+      if (accept(T::Semi)) continue;
+      void* mem = arena_.allocate(sizeof(ClassMember));
+      if (!mem) return null_fail("Out of memory");
+      ClassMember* m = new (mem) ClassMember();
+      Node* holder = make(NodeKind::Property);   // (property_name() fills a Property node)
+      if (!holder) return nullptr;
+      bool word = false;
+      bool async_method = false, generator_method = false;
+      if (is_word("static")) {
+        const Mark mk = mark();
+        next();
+        if (is(T::LParen) || is(T::Assign) || is(T::Semi) || is(T::RBrace)) rewind(mk);   // a member that is called "static"
+        else m->is_static = true;
+      }
+      if (m->is_static && is(T::LBrace)) {   // static { ... }: runs when the class is made, with `this` the class
+        class_static_ = true;
+        Node* f = make(NodeKind::Function);
+        if (!f) return nullptr;
+        f->flags |= kFlagExpression;
+        f->a = function_body(false, false);
+        class_static_ = saved_static;
+        if (!f->a) return nullptr;
+        m->is_block = true;
+        m->value = f;
+        *tail = m;
+        tail = &m->next;
+        continue;
+      }
+      if (accept(T::Star)) generator_method = true;
+      if (!property_name(holder, &word)) return nullptr;
+      if (word && !(holder->flags & kFlagComputed) && holder->text.equals("async") && !cur_.newline_before && !is(T::LParen) && !is(T::Assign) && !is(T::Semi) && !is(T::RBrace)) {
+        async_method = true;
+        if (accept(T::Star)) generator_method = true;
+        if (!property_name(holder, &word)) return nullptr;
+      } else if (word && !(holder->flags & kFlagComputed) && (holder->text.equals("get") || holder->text.equals("set")) && !is(T::LParen) && !is(T::Assign) && !is(T::Semi) &&
+                 !is(T::RBrace)) {
+        m->accessor = holder->text.equals("get") ? 1 : 2;
+        if (!property_name(holder, &word)) return nullptr;
+      }
+      m->computed = (holder->flags & kFlagComputed) != 0;
+      m->is_private = !m->computed && !holder->text.empty() && holder->text[0] == '#';
+      m->key = m->computed ? holder->b : new_string(holder->text);
+      if (!m->key) return nullptr;
+      class_static_ = m->is_static;
+      if (is(T::LParen)) {   // a method (or the constructor)
+        Node* f = make(NodeKind::Function);
+        if (!f) return nullptr;
+        f->text = m->computed ? StringView() : holder->text;
+        if (async_method) f->flags |= kFlagAsync;
+        if (generator_method) f->flags |= kFlagGenerator;
+        if (!parameters(f)) return nullptr;
+        f->a = function_body(async_method, generator_method);
+        if (!f->a) return nullptr;
+        if (async_method && generator_method) wrap_async_generator(f);
+        m->value = f;
+        if (!m->is_static && !m->accessor && !m->computed && holder->text.equals("constructor")) {
+          constructor = f;
+          class_static_ = saved_static;
+          continue;
+        }
+      } else {   // a field: name = value;
+        m->is_field = true;
+        if (accept(T::Assign)) {
+          const bool saved_fn = in_function_;
+          in_function_ = true;
+          m->value = assignment(false);
+          in_function_ = saved_fn;
+          if (!m->value) return nullptr;
+        }
+        consume_semicolon();
+      }
+      class_static_ = saved_static;
+      *tail = m;
+      tail = &m->next;
+    }
+    class_super_ = saved_super;
+    class_static_ = saved_static;
+    if (!expect(T::RBrace, "Unexpected token")) return nullptr;
+
+    // the constructor: its own, or an empty one (a derived class passes its arguments on)
+    Node* ctor = constructor;
+    if (!ctor) {
+      ctor = make(NodeKind::Function);
+      Node* body = make(NodeKind::Block);
+      if (!ctor || !body) return nullptr;
+      ctor->a = body;
+      if (parent) {
+        Node* rest = new_ident("args");
+        Node* spread = make(NodeKind::Spread);
+        if (!rest || !spread) return nullptr;
+        spread->a = new_ident("args");
+        Node* self = make(NodeKind::This);
+        if (!spread->a || !self) return nullptr;
+        ctor->list = rest;
+        ctor->flags |= kFlagRest;
+        body->list = new_statement(new_call(new_ident("__super_init"), {new_ident("%S"), self, spread}));
+        if (!body->list) return nullptr;
+      }
+    }
+    ctor->text = cname;
+    ctor->flags |= kFlagExpression;
+    // the instance fields go in first (after super(...) in a derived class)
+    Node* fields = nullptr;
+    Node** field_tail = &fields;
+    for (ClassMember* m = first; m; m = m->next) {
+      if (m->is_block || !m->is_field || m->is_static) continue;
+      Node* self = make(NodeKind::This);
+      if (!self) return nullptr;
+      Node* init = m->value ? m->value : make(NodeKind::Ident);
+      if (init && !m->value) init->text = "undefined";
+      Node* statement;
+      if (m->is_private) {
+        Node* self2 = make(NodeKind::This);
+        statement = new_statement(new_call(new_ident("__def"), {self2, m->key, init, number_node(3)}));
+      } else {
+        Node* target = make(m->computed ? NodeKind::Index : NodeKind::Member);
+        Node* assign = make(NodeKind::Assign);
+        if (!target || !assign) return nullptr;
+        target->a = self;
+        if (m->computed) target->b = m->key;
+        else target->text = m->key->text;
+        assign->op = Op::Assign;
+        assign->a = target;
+        assign->b = init;
+        statement = new_statement(assign);
+      }
+      if (!statement) return nullptr;
+      *field_tail = statement;
+      field_tail = &statement->next;
+    }
+    if (fields) {
+      Node** at = &ctor->a->list;
+      if (parent) {   // after the statement that calls super
+        for (Node** p = &ctor->a->list; *p; p = &(*p)->next) {
+          Node* s = *p;
+          if (s->kind == NodeKind::ExprStmt && s->a && s->a->kind == NodeKind::Call && s->a->a && s->a->a->kind == NodeKind::Ident && s->a->a->text.equals("__super_init")) {
+            at = &s->next;
+            break;
+          }
+        }
+      }
+      *field_tail = *at;
+      *at = fields;
+    }
+
+    // the function that builds the class
+    Node* wrapper = make(NodeKind::Function);
+    Node* body = make(NodeKind::Block);
+    if (!wrapper || !body) return nullptr;
+    wrapper->flags |= kFlagExpression;
+    wrapper->a = body;
+    Node** out = &body->list;
+    auto add = [&](Node* statement) -> bool {
+      if (!statement) return false;
+      *out = statement;
+      out = &statement->next;
+      return true;
+    };
+    if (parent && !add(new_var("%S", parent))) return nullptr;
+    if (!add(new_var(cname, ctor))) return nullptr;
+    Node* parent_ref = parent ? new_ident("%S") : make(NodeKind::Ident);
+    if (!parent) parent_ref->text = "undefined";
+    if (!add(new_var("%P", new_call(new_ident("__class"), {new_ident(cname), parent_ref})))) return nullptr;
+    for (ClassMember* m = first; m; m = m->next) {
+      if (m->is_block) {
+        if (!add(new_statement(new_call(new_member(m->value, "call"), {new_ident(cname)})))) return nullptr;
+        continue;
+      }
+      if (m->is_field && !m->is_static) continue;
+      Node* target = new_ident(m->is_static ? cname : StringView("%P"));
+      if (m->is_field) {   // static field
+        Node* init = m->value ? m->value : new_ident("undefined");
+        Node* statement;
+        if (m->is_private) {
+          statement = new_statement(new_call(new_ident("__def"), {target, m->key, init, number_node(3)}));
+        } else {
+          Node* member = make(m->computed ? NodeKind::Index : NodeKind::Member);
+          Node* assign = make(NodeKind::Assign);
+          if (!member || !assign) return nullptr;
+          member->a = target;
+          if (m->computed) member->b = m->key;
+          else member->text = m->key->text;
+          assign->op = Op::Assign;
+          assign->a = member;
+          assign->b = init;
+          statement = new_statement(assign);
+        }
+        if (!add(statement)) return nullptr;
+        continue;
+      }
+      if (!add(new_statement(new_call(new_ident("__def"), {target, m->key, m->value, number_node(m->accessor)})))) return nullptr;
+    }
+    Node* ret = make(NodeKind::Return);
+    if (!ret) return nullptr;
+    ret->a = new_ident(cname);
+    if (!add(ret)) return nullptr;
+    Node* call = make(NodeKind::Call);
+    if (!call) return nullptr;
+    call->a = wrapper;
+    return call;
+  }
+
+  Node* number_node(double v) {
+    Node* n = make(NodeKind::Number);
+    if (n) n->number = v;
+    return n;
+  }
+
+  // super(...), super.name, super[expr]
+  Node* super_expression() {
+    if (class_super_.empty()) return null_fail("'super' keyword unexpected here");
+    next();   // `super`
+    Node* self = make(NodeKind::This);
+    if (!self) return nullptr;
+    if (is(T::LParen)) {
+      Node* call = make(NodeKind::Call);
+      if (!call) return nullptr;
+      call->a = new_ident("__super_init");
+      Node* parent = new_ident(class_super_);
+      if (!call->a || !parent) return nullptr;
+      parent->next = self;
+      call->list = parent;
+      if (!is(T::LParen)) return null_fail("Unexpected token");
+      Node* args = make(NodeKind::Call);   // (its argument list is read into a scratch call, then appended after `this`)
+      if (!args || !arguments(args)) return nullptr;
+      self->next = args->list;
+      return call;
+    }
+    Node* base = class_static_ ? new_ident(class_super_) : new_member(new_ident(class_super_), "prototype");
+    if (!base) return nullptr;
+    if (accept(T::Dot)) {
+      if (!is(T::Ident)) return null_fail("Unexpected token");
+      Node* m = new_member(base, cur_.text);
+      if (!m) return nullptr;
+      m->flags |= kFlagSuper;
+      next();
+      return m;
+    }
+    if (accept(T::LBracket)) {
+      Node* index = make(NodeKind::Index);
+      if (!index) return nullptr;
+      index->a = base;
+      index->b = expression(false);
+      if (!index->b || !expect(T::RBracket, "Unexpected token")) return nullptr;
+      index->flags |= kFlagSuper;
+      return index;
+    }
+    return null_fail("'super' keyword unexpected here");
+  }
+
+  // /pattern/flags - read again from the "/" that was taken for a division, since an operand is what is wanted here. It becomes `new RegExp("pattern", "flags")`.
+  Node* regex_literal() {
+    uint64_t at = prev_end_ + 1;
+    bool in_class = false;
+    while (at < src_.size()) {
+      const char c = src_[at];
+      if (c == '\n' || c == '\r') break;
+      if (c == '\\') {
+        at += 2;
+        continue;
+      }
+      if (c == '[') in_class = true;
+      else if (c == ']') in_class = false;
+      else if (c == '/' && !in_class) break;
+      ++at;
+    }
+    if (at >= src_.size() || src_[at] != '/') return null_fail("Invalid regular expression: missing /");
+    const StringView body = src_.substr(prev_end_ + 1, at - prev_end_ - 1);
+    uint64_t end = at + 1;
+    while (end < src_.size() && is_ident_part(src_[end])) ++end;
+    const StringView flags = src_.substr(at + 1, end - at - 1);
+    Node* n = make(NodeKind::New);
+    Node* callee = make(NodeKind::Ident);
+    Node* pattern = make(NodeKind::String);
+    Node* options = make(NodeKind::String);
+    if (!n || !callee || !pattern || !options) return nullptr;
+    callee->text = "RegExp";
+    pattern->text = arena_.copy(body);
+    options->text = arena_.copy(flags);
+    pattern->next = options;
+    n->a = callee;
+    n->list = pattern;
+    pos_ = end;
+    next();
+    return n;
+  }
+
+  // tag`text ${value} more`: tag(strings, value), the strings array carrying .raw
+  Node* tagged_template(Node* tag) {
+    Node* raw_chunks = nullptr;
+    Node* tpl = template_literal(&raw_chunks);
+    if (!tpl) return nullptr;
+    Node* cooked = make(NodeKind::ArrayLit);
+    Node* raw = make(NodeKind::ArrayLit);
+    Node* helper = make(NodeKind::Call);
+    Node* helper_name = make(NodeKind::Ident);
+    Node* call = make(NodeKind::Call);
+    if (!cooked || !raw || !helper || !helper_name || !call) return nullptr;
+    helper_name->text = "__template";
+    Node** cooked_tail = &cooked->list;
+    Node* expressions = nullptr;
+    Node** expression_tail = &expressions;
+    bool is_string = true;
+    for (Node* item = tpl->list; item;) {
+      Node* following = item->next;
+      item->next = nullptr;
+      if (is_string) {
+        *cooked_tail = item;
+        cooked_tail = &item->next;
+      } else {
+        *expression_tail = item;
+        expression_tail = &item->next;
+      }
+      is_string = !is_string;
+      item = following;
+    }
+    raw->list = raw_chunks;
+    helper->a = helper_name;
+    helper->list = cooked;
+    cooked->next = raw;
+    call->a = tag;
+    call->list = helper;
+    helper->next = expressions;
+    // the strings array comes from the helper call
+    return call;
+  }
+
   Node* call_or_member() {
     Node* e;
+    if (is_word("new")) {
+      const Mark after_new = mark();
+      next();
+      if (is(T::Dot)) {   // new.target
+        next();
+        if (!is_word("target")) return null_fail("Unexpected token");
+        next();
+        Node* target = make(NodeKind::Ident);
+        if (!target) return nullptr;
+        target->text = "new.target";
+        return members(target, true);
+      }
+      rewind(after_new);
+    }
     if (is_word("new")) {
       Node* n = make(NodeKind::New);
       if (!n) return nullptr;
@@ -1088,7 +2052,9 @@ class Parser {
         if (!arguments(c)) return nullptr;
         e = c;
       } else if (is(T::Backtick) && calls) {
-        return null_fail("Tagged templates are not supported");
+        Node* c = tagged_template(e);
+        if (!c) return nullptr;
+        e = c;
       } else {
         return e;
       }
@@ -1098,6 +2064,14 @@ class Parser {
   Node* primary() {
     switch (cur_.kind) {
       case T::Number: {
+        if (cur_.bigint) {   // 10n  is  BigInt("10")
+          Node* literal = make(NodeKind::String);
+          if (!literal) return nullptr;
+          literal->text = cur_.text;
+          Node* call = new_call(new_ident("BigInt"), {literal});
+          next();
+          return call;
+        }
         Node* n = make(NodeKind::Number);
         if (!n) return nullptr;
         n->number = cur_.number;
@@ -1122,11 +2096,13 @@ class Parser {
       case T::LBrace: return object_literal();
       case T::Ident: break;
       case T::Slash:
-      case T::SlashAssign: return null_fail("Regular expression literals are not supported");
+      case T::SlashAssign: return regex_literal();
       default: return null_fail("Unexpected token");
     }
     const StringView w = cur_.text;
     if (w.equals("function")) return function_rest(true);
+    if (w.equals("class")) return class_expression();
+    if (w.equals("super")) return super_expression();
     if (w.equals("async") && async_function_ahead()) {
       next();   // `async`
       return function_rest(true, true);
@@ -1183,6 +2159,33 @@ class Parser {
     return expect(T::RBracket, "Unexpected token") ? n : nullptr;
   }
 
+  // A property name in an object literal or class body: a word, a string, a number or [computed]. Sets p->text (or p->b and kFlagComputed); *word tells it was an identifier.
+  bool property_name(Node* p, bool* word) {
+    *word = false;
+    p->flags &= static_cast<uint8_t>(~kFlagComputed);
+    if (is(T::LBracket)) {
+      next();
+      p->flags |= kFlagComputed;
+      p->b = assignment(false);
+      return p->b && expect(T::RBracket, "Unexpected token");
+    }
+    if (is(T::Ident) || is(T::String)) {
+      *word = is(T::Ident);
+      p->text = cur_.text;
+      next();
+      return true;
+    }
+    if (is(T::Number)) {
+      String number(arena_.allocator());   // (the number as a property name: its text)
+      number_to_string(cur_.number, &number);
+      p->text = arena_.copy(number.view());
+      next();
+      return true;
+    }
+    fail("Unexpected token");
+    return false;
+  }
+
   Node* object_literal() {
     Node* n = make(NodeKind::ObjectLit);
     if (!n) return nullptr;
@@ -1200,29 +2203,28 @@ class Parser {
         p = make(NodeKind::Property);
         if (!p) return nullptr;
         bool word = false, method_async = false;
-        if (is(T::LBracket)) {
-          next();
-          p->flags |= kFlagComputed;
-          p->b = assignment(false);
-          if (!p->b || !expect(T::RBracket, "Unexpected token")) return nullptr;
-        } else if (is(T::Ident) || is(T::String)) {
-          word = is(T::Ident);
-          p->text = cur_.text;
-          next();
-          if (word && p->text.equals("async") && !cur_.newline_before && (is(T::Ident) || is(T::String)) ) {   // async name() { ... }
-            method_async = true;
-            p->text = cur_.text;
-            next();
-          }
-        } else if (is(T::Number)) {
-          String number(arena_.allocator());   // (the number as a property name: its text)
-          number_to_string(cur_.number, &number);
-          p->text = arena_.copy(number.view());
-          next();
-        } else {
-          return null_fail("Unexpected token");
+        uint8_t accessor = 0;   // 1: get name() {}, 2: set name(v) {}
+        bool generator = accept(T::Star);   // *name() { ... }
+        if (!property_name(p, &word)) return nullptr;
+        if (word && !(p->flags & kFlagComputed) && p->text.equals("async") && !cur_.newline_before && (is(T::Ident) || is(T::String) || is(T::Star) || is(T::LBracket))) {   // async name() { ... }
+          method_async = true;
+          if (accept(T::Star)) generator = true;
+          if (!property_name(p, &word)) return nullptr;
+        } else if (word && !(p->flags & kFlagComputed) && (p->text.equals("get") || p->text.equals("set")) &&
+                   (is(T::Ident) || is(T::String) || is(T::Number) || is(T::LBracket))) {   // get name() { ... } / set name(v) { ... }
+          accessor = p->text.equals("get") ? 1 : 2;
+          if (!property_name(p, &word)) return nullptr;
         }
-        if (accept(T::Colon)) {
+        if (accessor) {
+          Node* f = make(NodeKind::Function);
+          if (!f) return nullptr;
+          f->text = p->text;
+          if (!parameters(f)) return nullptr;
+          f->a = function_body(false);
+          if (!f->a) return nullptr;
+          p->a = f;
+          p->flags |= accessor == 1 ? kFlagGetter : kFlagSetter;
+        } else if (accept(T::Colon)) {
           p->a = assignment(false);
           if (!p->a) return nullptr;
         } else if (is(T::LParen)) {   // a method: name() { ... }
@@ -1230,9 +2232,11 @@ class Parser {
           if (!f) return nullptr;
           f->text = p->text;
           if (method_async) f->flags |= kFlagAsync;
+          if (generator) f->flags |= kFlagGenerator;
           if (!parameters(f)) return nullptr;
-          f->a = function_body(method_async);
+          f->a = function_body(method_async, generator);
           if (!f->a) return nullptr;
+          if (method_async && generator) wrap_async_generator(f);
           p->a = f;
         } else if (word && !(p->flags & kFlagComputed) && !reserved(p->text)) {   // shorthand: { name }
           p->flags |= kFlagShorthand;
@@ -1240,6 +2244,10 @@ class Parser {
           if (!id) return nullptr;
           id->text = p->text;
           p->a = id;
+          if (accept(T::Assign)) {   // { name = default }: only meaningful in a destructuring pattern
+            p->c = assignment(false);
+            if (!p->c) return nullptr;
+          }
         } else {
           return null_fail("Unexpected token");
         }
@@ -1252,13 +2260,15 @@ class Parser {
   }
 
   // `...${expr}...`: pos_ is after the backtick. The result's list alternates a String node and an expression, starting and ending with a String.
-  Node* template_literal() {
+  Node* template_literal(Node** raw_chunks = nullptr) {
     Node* n = make(NodeKind::Template);
     if (!n) return nullptr;
     Node** tail = &n->list;
+    Node** raw_tail = raw_chunks;
     for (;;) {
       scratch_.clear();
       bool expression_follows = false;
+      const uint64_t chunk_start = pos_;
       for (;;) {
         if (at_end()) return null_fail("Unterminated template literal");
         const char c = peek();
@@ -1286,6 +2296,17 @@ class Parser {
       chunk->text = arena_.copy(scratch_.view());
       *tail = chunk;
       tail = &chunk->next;
+      if (raw_tail) {   // the text as it was written (line ends as \n)
+        Node* raw_chunk = make(NodeKind::String);
+        if (!raw_chunk) return nullptr;
+        String raw_text(arena_.allocator());
+        const uint64_t chunk_end = pos_ - (expression_follows ? 2 : 1);
+        for (uint64_t i = chunk_start; i < chunk_end; ++i)
+          if (src_[i] != '\r') raw_text.push_back(src_[i]);
+        raw_chunk->text = arena_.copy(raw_text.view());
+        *raw_tail = raw_chunk;
+        raw_tail = &raw_chunk->next;
+      }
       if (!expression_follows) break;
       next();   // the first token of the expression
       Node* e = expression(false);
@@ -1306,7 +2327,11 @@ class Parser {
   uint64_t pos_ = 0, prev_end_ = 0;
   uint32_t line_ = 1;
   Token cur_;
-  bool failed_ = false, in_function_ = false, in_async_ = false;
+  bool failed_ = false, in_function_ = false, in_async_ = false, in_generator_ = false, in_async_generator_ = false;
+  Node* pending_prologue_ = nullptr;   // the statements that unpack the parameters of the function whose body comes next
+  uint32_t temp_counter_ = 0;
+  StringView class_super_;     // while a class body is parsed: the variable that holds its parent ("%S"), empty for a class without one
+  bool class_static_ = false;  // ... and whether the member being parsed is static
   uint32_t depth_ = 0;
 };
 

@@ -41,7 +41,7 @@ enum class Op : uint8_t {
   And, Or, Nullish,
   Not, BitNot, Neg, Plus, TypeOf, Void, Delete, Await,
   Inc, Dec,
-  Assign,
+  Assign, Yield,
 };
 
 enum NodeFlag : uint8_t {
@@ -54,6 +54,11 @@ enum NodeFlag : uint8_t {
   kFlagRest = 4,         // Function: the last parameter is ...rest
   kFlagExpression = 8,   // Function: a function expression (its own name is visible inside)
   kFlagAsync = 16,       // Function: async
+  kFlagGenerator = 32,   // Function: function* (the same bit as the Property flags: they are on other kinds of node)
+  kFlagDelegate = 1,     // Unary Yield: yield* (the same bit as kFlagPrefix)
+  kFlagGetter = 32,      // Property: get name() { ... }
+  kFlagSetter = 64,      // Property: set name(v) { ... }
+  kFlagSuper = 128,      // Member / Index: super.name (the object the method is looked up on is the prototype of the parent class; `this` stays the receiver)
 };
 
 enum class VarKind : uint8_t { Var, Let, Const };

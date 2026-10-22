@@ -36,7 +36,7 @@ void lowercase_into(StringView in, String* out) {
 
 // --- Document ----------------------------------------------------------------------------------------------------
 
-Document::Document(allocators::IAllocator& allocator) : allocator_(allocator), nodes_(allocator) { root_ = make(NodeType::Document, "#document"); }
+Document::Document(allocators::IAllocator& allocator) : allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) { root_ = make(NodeType::Document, "#document"); }
 
 Document::~Document() {
   for (uint64_t i = 0; i < nodes_.count(); ++i) {
@@ -109,6 +109,18 @@ Node* Document::element_by_id(StringView id) const {
   return nullptr;
 }
 
+void Document::record(Mutation&& m) {
+  if (!recording_ || log_.count() >= kMaxLog) return;
+  for (uint64_t i = 0; i < watched_.count(); ++i) {
+    if (!contains(watched_[i], m.target)) continue;
+    if (!m.watchers.empty()) m.watchers.push_back(',');
+    m.watchers.append_uint(watched_[i]->serial);
+  }
+  const bool first = log_.count() == 0;
+  log_.push_back(util::move(m));
+  if (first && hook_) hook_(hook_context_);
+}
+
 // --- Tree --------------------------------------------------------------------------------------------------------
 
 namespace {
@@ -120,6 +132,15 @@ void touch(Node* n) {
 void unlink(Node* node) {
   Node* p = node->parent;
   if (!p) return;
+  if (p->owner && p->owner->recording()) {
+    Mutation m(p->owner->allocator());
+    m.kind = Mutation::Kind::ChildList;
+    m.target = p;
+    m.previous = node->prev;
+    m.next = node->next;
+    m.removed = node;
+    p->owner->record(util::move(m));
+  }
   if (node->prev) node->prev->next = node->next;
   else p->first_child = node->next;
   if (node->next) node->next->prev = node->prev;
@@ -136,6 +157,15 @@ void link_before(Node* parent, Node* node, Node* reference) {
   else parent->first_child = node;
   if (reference) reference->prev = node;
   else parent->last_child = node;
+  if (parent->owner && parent->owner->recording()) {
+    Mutation m(parent->owner->allocator());
+    m.kind = Mutation::Kind::ChildList;
+    m.target = parent;
+    m.previous = node->prev;
+    m.next = node->next;
+    m.added = node;
+    parent->owner->record(util::move(m));
+  }
 }
 
 bool can_have_children(const Node* n) { return n->type == NodeType::Element || n->type == NodeType::Document || n->type == NodeType::Fragment; }
@@ -148,10 +178,30 @@ bool contains(const Node* ancestor, const Node* node) {
   return false;
 }
 
+bool slot_assigned_nodes(const Node* slot, List<Node*>* out) {
+  const Node* root = slot;
+  while (root->parent) root = root->parent;
+  if (!root->shadow_host) return false;
+  StringView name;
+  get_attribute(slot, "name", &name);
+  for (Node* c = root->shadow_host->first_child; c; c = c->next) {
+    StringView wanted;
+    if (c->is_element()) get_attribute(c, "slot", &wanted);
+    else if (!(c->is_text() && !c->data.empty())) continue;
+    if (wanted.equals(name)) out->push_back(c);
+  }
+  return true;
+}
+
 bool is_connected(const Node* node) {
   const Node* n = node;
-  while (n->parent) n = n->parent;
-  return n->type == NodeType::Document;
+  for (uint32_t guard = 0; guard < 64; ++guard) {   // (a shadow tree is connected when its host is)
+    while (n->parent) n = n->parent;
+    if (n->type == NodeType::Document) return true;
+    if (!n->shadow_host) return false;
+    n = n->shadow_host;
+  }
+  return false;
 }
 
 void detach(Node* node) {
@@ -317,15 +367,34 @@ bool get_attribute(const Node* e, StringView name, StringView* value) {
 
 bool has_attribute(const Node* e, StringView name) { return find_attr(e, name) >= 0; }
 
+namespace {
+void record_attribute(Node* e, StringView name, const String* old_value) {
+  if (!e->owner || !e->owner->recording()) return;
+  Mutation m(e->owner->allocator());
+  m.kind = Mutation::Kind::Attributes;
+  m.target = e;
+  lowercase_into(name, &m.attribute);
+  if (old_value) {
+    m.old_value.assign(old_value->view());
+    m.had_old_value = true;
+  }
+  e->owner->record(util::move(m));
+}
+}  // namespace
+
 DomError set_attribute(Node* e, StringView name, StringView value) {
   const int64_t i = find_attr(e, name);
   if (i >= 0) {
+    String old(e->owner->allocator());
+    old.assign(e->attrs[static_cast<uint64_t>(i)].value.view());
     if (!e->attrs[static_cast<uint64_t>(i)].value.assign(value)) return DomError::OutOfMemory;
+    record_attribute(e, name, &old);
   } else {
     if (name.empty()) return DomError::HierarchyRequest;
     Attribute a(e->owner->allocator());
     lowercase_into(name, &a.name);
     if (!a.value.assign(value) || !e->attrs.push_back(util::move(a))) return DomError::OutOfMemory;
+    record_attribute(e, name, nullptr);
   }
   touch(e);
   return DomError::None;
@@ -334,7 +403,10 @@ DomError set_attribute(Node* e, StringView name, StringView value) {
 bool remove_attribute(Node* e, StringView name) {
   const int64_t i = find_attr(e, name);
   if (i < 0) return false;
+  String old(e->owner->allocator());
+  old.assign(e->attrs[static_cast<uint64_t>(i)].value.view());
   e->attrs.remove_at(static_cast<uint64_t>(i));
+  record_attribute(e, name, &old);
   touch(e);
   return true;
 }
@@ -366,6 +438,14 @@ void text_content(const Node* node, String* out) {
 
 DomError set_text_content(Node* node, StringView text) {
   if (node->type == NodeType::Text || node->type == NodeType::Comment) {
+    if (node->owner && node->owner->recording()) {
+      Mutation m(node->owner->allocator());
+      m.kind = Mutation::Kind::CharacterData;
+      m.target = node;
+      m.old_value.assign(node->data.view());
+      m.had_old_value = true;
+      node->owner->record(util::move(m));
+    }
     if (!node->data.assign(text)) return DomError::OutOfMemory;
     touch(node);
     return DomError::None;

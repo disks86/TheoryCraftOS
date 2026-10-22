@@ -231,6 +231,16 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (IS("previousElementSibling")) { *out = node_value(c, dom::previous_element_sibling(n)); return true; }
     if (IS("nextElementSibling")) { *out = node_value(c, dom::next_element_sibling(n)); return true; }
   }
+  if (element && IS("shadowRoot")) { *out = n->shadow && !n->shadow->shadow_closed ? node_value(c, n->shadow) : Value::make_null(); return true; }
+  if (element && IS("slot")) {
+    StringView slot;
+    *out = str_value(vm, dom::get_attribute(n, "slot", &slot) ? slot : StringView());
+    return true;
+  }
+  if (n->shadow_host) {   // a shadow root
+    if (IS("host")) { *out = node_value(c, n->shadow_host); return true; }
+    if (IS("mode")) { *out = str_value(vm, n->shadow_closed ? "closed" : "open"); return true; }
+  }
   if (n->is_text() && IS("wholeText")) { *out = str_value(vm, n->data.view()); return true; }
   if (n->is_text() && IS("length")) { *out = num_value(static_cast<double>(n->data.size())); return true; }
   if (n->is_text() && IS("data")) { *out = str_value(vm, n->data.view()); return true; }
@@ -468,7 +478,15 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     }
     return HostClass::Set::NotHandled;
   }
+  if (!element && n->shadow_host && IS("innerHTML")) {   // shadowRoot.innerHTML = ...
+    if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+    return done(dom::set_inner_html(n, text.view()));
+  }
   if (!element) return HostClass::Set::NotHandled;
+  if (IS("slot")) {
+    if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+    return done(dom::set_attribute(n, "slot", text.view()));
+  }
   if (IS("innerHTML")) {
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     return done(dom::set_inner_html(n, text.view()));
@@ -976,7 +994,6 @@ NATIVE(el_true) {
 
 NATIVE(do_nothing) { return true; }
 
-NATIVE(el_attach_shadow) { return throw_dom(vm, "NotSupportedError", "Shadow trees are not supported."); }
 
 NATIVE(collection_item) {
   double d;
@@ -1074,7 +1091,16 @@ NATIVE(doc_get_by_id) {
   dom::Node* d = this_node(vm, self);
   String id(vm.allocator());
   if (!d || !arg_text(vm, arg_at(args, argc, 0), &id)) return false;
-  *result = node_value(impl(vm), d->owner->element_by_id(id.view()));
+  dom::Node* found = nullptr;
+  if (d->type == dom::NodeType::Fragment) {   // (a fragment or a shadow root looks in itself)
+    for (dom::Node* n = d->first_child; n && !found; n = dom::next_in_tree(n, d)) {
+      StringView value;
+      if (n->is_element() && dom::get_attribute(n, "id", &value) && value.equals(id.view())) found = n;
+    }
+  } else {
+    found = d->owner->element_by_id(id.view());
+  }
+  *result = node_value(impl(vm), found);
   return true;
 }
 
@@ -1210,9 +1236,169 @@ JsObject* make_class(DomBindings::Impl& c, const char* name, NativeFn ctor, JsOb
 
 const HostClass kNodeHostClass = {"Node", node_get, node_set, nullptr, nullptr};
 
+// --- Shadow trees
+
+// element.attachShadow({ mode })
+NATIVE(el_attach_shadow) {
+  dom::Node* n = this_node(vm, self);
+  if (!n || !n->is_element()) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
+  const Value init = arg_at(args, argc, 0);
+  Value mode;
+  if (!init.is_object() || !vm.get_named(init, "mode", &mode) || !mode.is_string() || !(mode.as_string()->view().equals("open") || mode.as_string()->view().equals("closed")))
+    return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'attachShadow' on 'Element': The provided value is not a valid enum value of type ShadowRootMode.");
+  if (n->shadow) return throw_dom(vm, "InvalidStateError", "Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.");
+  dom::Node* root = n->owner->create_fragment();
+  if (!root) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  root->shadow_host = n;
+  root->shadow_closed = mode.as_string()->view().equals("closed");
+  n->shadow = root;
+  n->owner->touch();
+  *result = node_value(impl(vm), root);
+  return true;
+}
+
+NATIVE(slot_assigned_nodes) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
+  List<dom::Node*> nodes(vm.allocator());
+  dom::slot_assigned_nodes(n, &nodes);
+  JsObject* out = vm.new_array(static_cast<uint32_t>(nodes.count()));
+  for (uint64_t i = 0; i < nodes.count(); ++i) vm.array_push(out, node_value(impl(vm), nodes[i]));
+  *result = Value::make_object(out);
+  return true;
+}
+
+NATIVE(slot_assigned_elements) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
+  List<dom::Node*> nodes(vm.allocator());
+  dom::slot_assigned_nodes(n, &nodes);
+  JsObject* out = vm.new_array(static_cast<uint32_t>(nodes.count()));
+  for (uint64_t i = 0; i < nodes.count(); ++i)
+    if (nodes[i]->is_element()) vm.array_push(out, node_value(impl(vm), nodes[i]));
+  *result = Value::make_object(out);
+  return true;
+}
+
+// --- Mutation records and custom elements: the script side is in WebPrelude.cpp (the DOM script)
+
+void mutation_hook(void* context) {
+  DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
+  Value fn;
+  if (c.vm.get_named(Value::make_object(c.vm.global()), "__deliver_mutations", &fn) && Vm::is_callable(fn)) c.vm.enqueue_microtask(fn);
+  c.vm.request_epilogue();   // (custom element reactions run as soon as the call that made the change is over)
+}
+
+void mutation_epilogue(void* context) {
+  DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
+  Value fn;
+  Value ignored;
+  if (c.vm.get_named(Value::make_object(c.vm.global()), "__process_mutations", &fn) && Vm::is_callable(fn)) c.vm.call(fn, Value(), nullptr, 0, &ignored);
+}
+
+NATIVE(watch_node) {
+  (void)self;
+  (void)result;
+  DomBindings::Impl& c = impl(vm);
+  dom::Node* n = DomBindings::unwrap(arg_at(args, argc, 0));
+  if (n) c.doc.watch(n);
+  return true;
+}
+
+NATIVE(mutations_on) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  (void)result;
+  DomBindings::Impl& c = impl(vm);
+  c.doc.set_recording(true, mutation_hook, &c);
+  vm.set_epilogue(mutation_epilogue, &c);
+  return true;
+}
+
+// __take_mutations(): the changes since the last call, as an array of { type, target, addedNodes, removedNodes, previousSibling, nextSibling, attributeName, oldValue }
+NATIVE(take_mutations) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  DomBindings::Impl& c = impl(vm);
+  List<dom::Mutation>& log = c.doc.log();
+  JsObject* out = vm.new_array(static_cast<uint32_t>(log.count()));
+  *result = Value::make_object(out);
+  auto node_or_null = [&](dom::Node* n) { return n ? node_value(c, n) : Value::make_null(); };
+  for (uint64_t i = 0; i < log.count(); ++i) {
+    const dom::Mutation& m = log[i];
+    JsObject* r = vm.new_plain();
+    const char* type = m.kind == dom::Mutation::Kind::ChildList ? "childList" : m.kind == dom::Mutation::Kind::Attributes ? "attributes" : "characterData";
+    vm.define_named(r, "type", str_value(vm, type));
+    vm.define_named(r, "target", node_or_null(m.target));
+    JsObject* added = vm.new_array(1);
+    JsObject* removed = vm.new_array(1);
+    if (m.added) vm.array_push(added, node_or_null(m.added));
+    if (m.removed) vm.array_push(removed, node_or_null(m.removed));
+    vm.define_named(r, "addedNodes", Value::make_object(added));
+    vm.define_named(r, "removedNodes", Value::make_object(removed));
+    vm.define_named(r, "previousSibling", node_or_null(m.previous));
+    vm.define_named(r, "nextSibling", node_or_null(m.next));
+    vm.define_named(r, "attributeName", m.kind == dom::Mutation::Kind::Attributes ? str_value(vm, m.attribute.view()) : Value::make_null());
+    vm.define_named(r, "attributeNamespace", Value::make_null());
+    vm.define_named(r, "oldValue", m.had_old_value ? str_value(vm, m.old_value.view()) : Value::make_null());
+    JsObject* watchers = vm.new_array(2);   // the observed nodes this happened in
+    uint64_t at = 0;
+    while (at < m.watchers.size()) {
+      uint64_t end = at, serial = 0;
+      while (end < m.watchers.size() && m.watchers[end] != ',') serial = serial * 10 + static_cast<uint64_t>(m.watchers[end++] - '0');
+      if (dom::Node* w = c.doc.by_serial(static_cast<uint32_t>(serial))) vm.array_push(watchers, node_or_null(w));
+      at = end + 1;
+    }
+    vm.define_named(r, "watchers", Value::make_object(watchers));
+    vm.array_push(out, Value::make_object(r));
+  }
+  log.clear();
+  return true;
+}
+
+// __register_tag(name, prototype): elements with that tag name get this prototype (a custom element)
+NATIVE(register_tag) {
+  (void)self;
+  DomBindings::Impl& c = impl(vm);
+  JsString* name;
+  if (!vm.to_string(arg_at(args, argc, 0), &name) || !arg_at(args, argc, 1).is_object()) return false;
+  vm.define(c.tag_protos, vm.intern(name->view()), args[1], 0);
+  *result = Value();
+  return true;
+}
+
+// `new MyElement()` for a class that extends HTMLElement: a document node whose tag was registered for a prototype in the chain
+JsObject* construct_element(void* user, JsObject* proto) {
+  DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(user);
+  if (!c.tag_protos || !proto) return nullptr;
+  for (JsObject* p = proto; p && p != c.html_proto; p = p->proto) {
+    for (uint32_t i = 0; i < c.tag_protos->prop_count; ++i) {
+      if (!c.tag_protos->props[i].value.is_object() || c.tag_protos->props[i].value.as_object() != p) continue;
+      const StringView tag = c.tag_protos->props[i].key->view();
+      if (tag.find('-') == StringView::npos) continue;
+      dom::Node* e = c.doc.create_element(tag);
+      if (!e) return nullptr;
+      JsObject* w = c.owner.wrap(e);
+      if (w) {
+        w->proto = proto;
+        c.vm.define_named(w, "__ce", Value::make_number(1), 0);   // (the constructor that is about to run is the upgrade)
+      }
+      return w;
+    }
+  }
+  return nullptr;
+}
+
 bool install_nodes(DomBindings::Impl& c) {
   Vm& vm = c.vm;
   JsObject* g = vm.global();
+  vm.define_native(g, "__mutations_on", mutations_on, 0);
+  vm.define_native(g, "__watch_node", watch_node, 1);
+  vm.define_native(g, "__take_mutations", take_mutations, 0);
+  vm.define_native(g, "__register_tag", register_tag, 2);
+  vm.set_construct_hook(construct_element, &c);
   vm.define_native(g, "__collection_item", collection_item, 1);
   vm.define_native(g, "__collection_named", collection_named, 1);
   {   // (they are used as values: kept, but not shown)
@@ -1280,7 +1466,6 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(ep, "scrollIntoView", do_nothing, 0);
   vm.define_native(ep, "scrollTo", do_nothing, 0);
   vm.define_native(ep, "scrollBy", do_nothing, 0);
-  vm.define_native(ep, "attachShadow", el_attach_shadow, 1);
   vm.define_native(ep, "getElementsByName", node_get_by_name, 1);
 
   JsObject* dp = c.document_proto;
@@ -1314,6 +1499,7 @@ bool install_nodes(DomBindings::Impl& c) {
     vm.define_named(np, k.name, num_value(k.value), 0);
   }
   make_class(c, "EventTarget", event_target_constructor, event_target);
+  vm.define_native(ep, "attachShadow", el_attach_shadow, 1);
   make_class(c, "Element", illegal_constructor, ep);
   make_class(c, "HTMLElement", illegal_constructor, c.html_proto);
   {   // one interface for each kind of element, so instanceof tells an <input> from a <div>
@@ -1350,6 +1536,13 @@ bool install_nodes(DomBindings::Impl& c) {
         at = end + 1;
       }
     }
+    {   // <slot>: assignedNodes() / assignedElements()
+      Value slot;
+      if (vm.get_plain(c.tag_protos, vm.intern("slot"), &slot) && slot.is_object()) {
+        vm.define_native(slot.as_object(), "assignedNodes", slot_assigned_nodes, 1);
+        vm.define_native(slot.as_object(), "assignedElements", slot_assigned_elements, 1);
+      }
+    }
     for (const char* tag : {"audio", "video"}) {
       JsObject* proto = vm.new_object(media);
       make_class(c, tag[0] == 'a' ? "HTMLAudioElement" : "HTMLVideoElement", illegal_constructor, proto);
@@ -1361,6 +1554,8 @@ bool install_nodes(DomBindings::Impl& c) {
   make_class(c, "Document", illegal_constructor, dp);
   make_class(c, "HTMLDocument", illegal_constructor, dp);
   make_class(c, "DocumentFragment", illegal_constructor, c.fragment_proto);
+  c.shadow_root_proto = vm.new_object(c.fragment_proto);
+  make_class(c, "ShadowRoot", illegal_constructor, c.shadow_root_proto);
   {
     JsObject* image = vm.new_native(image_constructor, "Image", 2);
     JsObject* image_proto = vm.new_object(c.html_proto);

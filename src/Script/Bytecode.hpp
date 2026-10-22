@@ -26,7 +26,7 @@ namespace script {
 
 enum class Opc : uint8_t {
   // constants
-  PushUndef, PushNull, PushTrue, PushFalse, PushNum, PushStr, PushInt, PushThis,
+  PushUndef, PushNull, PushTrue, PushFalse, PushNum, PushStr, PushInt, PushThis, NewTarget,
   // the stack
   Pop, Dup, Dup2, DupX1, DupX2, Swap,
   // variables: GetVar/SetVar b = how many functions out, a = slot (SetVar leaves the value on the stack); globals by name constant a
@@ -41,13 +41,15 @@ enum class Opc : uint8_t {
   // jumps (a = target); the Keep forms leave the value when they jump and drop it when they do not
   Jump, JumpIfFalse, JumpIfTrue, JumpIfFalseKeep, JumpIfTrueKeep, JumpIfNotNullishKeep,
   // functions and objects
-  Closure, Return, Throw, NewObject, DefineProp, DefineElem, NewArray, ArrayPush, ArraySpread, ObjectSpread,
+  Closure, Return, Throw, NewObject, DefineProp, DefineElem, DefineAccessor, DefineAccessorElem, NewArray, ArrayPush, ArraySpread, ObjectSpread,
   // loops over keys / values: Start turns [value] into [iterator]; IterNext (a = where to go at the end) takes [iterator] and gives [value]
   ForInStart, ForOfStart, IterNext,
   // exceptions: TryBegin (a = the handler) starts catching; TryEnd stops; the handler is entered with the exception on the stack
   TryBegin, TryEnd,
   // async functions: [value] -> (the function is suspended until the value is settled; then the result, or a throw, takes the place of the value)
   Await,
+  // generators: [value] -> (the generator is suspended; the value goes to whoever called next(); the argument of the next next() takes its place)
+  Yield,
 };
 
 struct Instr {
@@ -67,7 +69,7 @@ struct FunctionCode {
   uint32_t param_count = 0;
   int32_t arguments_slot = -1;          // where `arguments` goes, if the function uses it
   int32_t self_slot = -1;               // where a named function expression finds itself
-  bool is_arrow = false, has_rest = false, is_async = false;
+  bool is_arrow = false, has_rest = false, is_async = false, is_generator = false;
   JsString* name = nullptr;
 };
 

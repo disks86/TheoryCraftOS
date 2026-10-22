@@ -1,0 +1,11 @@
+vp9 vp9_intra.ivf 64 48 3 444a040ee40d0dc8
+vp9 vp9_inter.ivf 95 63 14 3819934b68a3acf6
+vp9 vp9_tiles.ivf 520 72 4 9de50d1d5b749e7b
+vp9 vp9_lossless.ivf 48 32 4 e3f3b2233b2d03c5
+vp9 vp9_segments.ivf 128 80 12 ff71e02c36d3c03f
+vp9 vp9_444.ivf 90 54 6 03ca984abe7aff87
+vp9 vp9_422.ivf 90 54 6 3ccbc15c5ce13f9a
+vp9 vp9_440.ivf 90 54 6 0df9998a98255da7
+vp9 vp9_10bit.ivf 90 54 6 8629785a47beb457
+vp9 vp9_12bit_444.ivf 90 54 6 55266d12ca5366ef
+vp9 vp9_scaled.ivf 640 360 180 67f165c921255a4d

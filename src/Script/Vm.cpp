@@ -17,6 +17,8 @@
  */
 
 #include "Script/Vm.hpp"
+#include "Script/RegExp.hpp"
+#include "Script/TypedArray.hpp"
 #include <initializer_list>
 #include <new>
 #include "Math/FloatMath.hpp"
@@ -48,6 +50,7 @@ struct Vm::Coroutine {
   List<Value> stack;             // the values the frame had on the stack
   List<Handler> handlers;        // its try handlers (their `stack` counts from the frame's base)
   bool running = false;
+  bool generator = false, done = false;   // a generator object (it is the coroutine itself), and whether it has finished
 };
 
 // --- Construction ------------------------------------------------------------------------------------------------
@@ -171,6 +174,7 @@ void Vm::free_cell(Cell* cell) {
         co->~Coroutine();
         allocator_.deallocate(co);
       }
+      if (o->okind == ObjKind::RegExp && o->host_data) regexp_release(allocator_, o->host_data);
       allocator_.deallocate(o->props);
       allocator_.deallocate(o->index);
       allocator_.deallocate(o->items);
@@ -194,6 +198,22 @@ JsString* Vm::new_string(StringView text) {
   d[text.size()] = 0;
   s->hash = hash_text(text);
   link(s, sizeof(JsString) + text.size() + 1);
+  return s;
+}
+
+JsString* Vm::new_bytes(uint32_t length) {
+  if (length == 0) return empty_;
+  void* mem = allocator_.allocate(sizeof(JsString) + uint64_t{length} + 1);
+  if (!mem) {
+    halt("out of memory");
+    return empty_;
+  }
+  JsString* s = new (mem) JsString();
+  s->length = length;
+  char* d = s->data();
+  for (uint32_t i = 0; i <= length; ++i) d[i] = 0;
+  s->hash = 0;
+  link(s, sizeof(JsString) + uint64_t{length} + 1);
   return s;
 }
 
@@ -284,6 +304,188 @@ JsObject* Vm::new_object(JsObject* proto) {
   o->proto = proto;
   link(o, sizeof(JsObject));
   return o;
+}
+
+// --- BigInt --------------------------------------------------------------------------------------------------------------
+
+JsObject* Vm::new_bigint(bool negative, StringView digits) {
+  Value proto;
+  get_plain(global_, intern("__bigint_proto"), &proto);
+  JsObject* b = new_object(proto.is_object() ? proto.as_object() : object_proto_);
+  b->okind = ObjKind::BigInt;
+  uint64_t skip = 0;
+  while (skip + 1 < digits.size() && digits[skip] == '0') ++skip;
+  const StringView clean = digits.substr(skip);
+  const bool zero = clean.empty() || clean.equals("0");
+  define_named(b, "__neg", Value::make_bool(negative && !zero), 0);
+  define_named(b, "__mag", Value::make_string(new_string(zero ? StringView("0") : clean)), 0);
+  return b;
+}
+
+bool Vm::bigint_parts(const Value& v, bool* negative, StringView* digits) {
+  Value neg, mag;
+  if (!is_bigint(v) || !get_plain(v.as_object(), intern("__neg"), &neg) || !get_plain(v.as_object(), intern("__mag"), &mag) || !mag.is_string()) return false;
+  *negative = neg.is_bool() && neg.u.boolean;
+  *digits = mag.as_string()->view();
+  return true;
+}
+
+// An operator with a BigInt in it: the library in script (Stdlib.cpp) does the work.
+bool Vm::bigint_operation(const char* op, const Value& a, const Value& b, Value* out) {
+  Value fn;
+  if (!get_named(Value::make_object(global_), "__bigint_op", &fn) || !is_callable(fn)) return throw_error(ErrorKind::TypeError, "BigInt is not available");
+  const Value call_args[3] = {Value::make_string(intern(op)), a, b};
+  return call(fn, Value(), call_args, 3, out);
+}
+
+// --- Proxy ---------------------------------------------------------------------------------------------------------------
+
+JsObject* Vm::new_proxy(JsObject* target, const Value& handler) {
+  JsObject* p = new_object(target->proto);
+  p->okind = ObjKind::Proxy;
+  p->target = target;
+  p->bound_this = handler;
+  return p;
+}
+
+bool Vm::proxy_parts(JsObject* proxy, const char* operation, JsObject** target, Value* handler) {
+  if (!proxy->target) {
+    String message(allocator_);
+    message.append("Cannot perform '");
+    message.append(operation);
+    message.append("' on a proxy that has been revoked");
+    return throw_error(ErrorKind::TypeError, message.view());
+  }
+  *target = proxy->target;
+  *handler = proxy->bound_this;
+  return true;
+}
+
+// The trap called `name` of the proxy (undefined: there is none, the target answers).
+bool Vm::proxy_trap(JsObject* proxy, const char* name, JsObject** target, Value* handler, Value* trap) {
+  if (!proxy_parts(proxy, name, target, handler)) return false;
+  *trap = Value();
+  if (!get(*handler, intern(name), trap)) return false;
+  if (trap->is_nullish()) {
+    *trap = Value();
+    return true;
+  }
+  if (!is_callable(*trap)) {
+    String message(allocator_);
+    message.append("proxy trap '");
+    message.append(name);
+    message.append("' is not a function");
+    return throw_error(ErrorKind::TypeError, message.view());
+  }
+  return true;
+}
+
+bool Vm::proxy_get(JsObject* proxy, JsString* key, const Value& receiver, Value* out) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "get", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) return get(Value::make_object(target), key, out);
+  const Value call_args[3] = {Value::make_object(target), Value::make_string(key), receiver};
+  return call(trap, handler, call_args, 3, out);
+}
+
+bool Vm::proxy_set(JsObject* proxy, JsString* key, const Value& value, const Value& receiver) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "set", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) return put(Value::make_object(target), key, value);
+  const Value call_args[4] = {Value::make_object(target), Value::make_string(key), value, receiver};
+  Value ignored;
+  return call(trap, handler, call_args, 4, &ignored);
+}
+
+bool Vm::proxy_has(JsObject* proxy, JsString* key, bool* out) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "has", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) {
+    *out = has_property(target, key);
+    return true;
+  }
+  const Value call_args[2] = {Value::make_object(target), Value::make_string(key)};
+  Value r;
+  if (!call(trap, handler, call_args, 2, &r)) return false;
+  *out = to_boolean(r);
+  return true;
+}
+
+bool Vm::proxy_delete(JsObject* proxy, JsString* key, bool* out) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "deleteProperty", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) {
+    *out = delete_property(target, key);
+    return true;
+  }
+  const Value call_args[2] = {Value::make_object(target), Value::make_string(key)};
+  Value r;
+  if (!call(trap, handler, call_args, 2, &r)) return false;
+  *out = to_boolean(r);
+  return true;
+}
+
+JsObject* Vm::proxy_keys(JsObject* proxy, bool all) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, "ownKeys", &target, &handler, &trap)) return new_array();
+  if (trap.is_undefined()) return all ? own_names(target) : own_keys(target);
+  const Value call_args[1] = {Value::make_object(target)};
+  Value r;
+  JsObject* keys = new_array();
+  if (!call(trap, handler, call_args, 1, &r) || !r.is_object()) return keys;
+  for (uint32_t i = 0; i < r.as_object()->length; ++i) {
+    JsString* name;
+    if (!to_string(r.as_object()->items[i], &name)) return keys;
+    if (all) {
+      array_push(keys, Value::make_string(name));
+      continue;
+    }
+    // for Object.keys only the enumerable ones count: those the target has (or that it does not know of at all)
+    Value ignored;
+    uint8_t flags = kDefaultFlags;
+    if (!own_property(target, name, &ignored, &flags) || (flags & kEnumerable)) array_push(keys, Value::make_string(name));
+  }
+  return keys;
+}
+
+bool Vm::proxy_call(JsObject* proxy, const Value& this_value, const Value* args, uint32_t argc, Value* result, bool construct) {
+  JsObject* target;
+  Value handler, trap;
+  if (!proxy_trap(proxy, construct ? "construct" : "apply", &target, &handler, &trap)) return false;
+  if (trap.is_undefined()) return construct ? call_value(Value::make_object(target), Value(), args, argc, result, true) : call(Value::make_object(target), this_value, args, argc, result);
+  JsObject* list = new_array(argc);
+  for (uint32_t i = 0; i < argc; ++i) array_push(list, args[i]);
+  if (construct) {
+    const Value call_args[3] = {Value::make_object(target), Value::make_object(list), Value::make_object(proxy)};
+    if (!call(trap, handler, call_args, 3, result)) return false;
+    if (!result->is_object()) return throw_error(ErrorKind::TypeError, "proxy [[Construct]] must return an object");
+    return true;
+  }
+  const Value call_args[3] = {Value::make_object(target), this_value, Value::make_object(list)};
+  return call(trap, handler, call_args, 3, result);
+}
+
+void Vm::run_epilogue() {
+  if (!epilogue_ || in_epilogue_ || halted_) {
+    epilogue_pending_ = false;
+    return;
+  }
+  epilogue_pending_ = false;
+  in_epilogue_ = true;
+  epilogue_(epilogue_user_);
+  in_epilogue_ = false;
+}
+
+JsObject* Vm::new_instance(JsObject* proto) {
+  if (construct_hook_) {
+    if (JsObject* made = construct_hook_(construct_user_, proto)) return made;
+  }
+  return new_object(proto);
 }
 
 JsObject* Vm::new_array(uint32_t capacity) {
@@ -571,6 +773,21 @@ void Vm::define(JsObject* o, JsString* key, const Value& value, uint8_t flags) {
   }
 }
 
+void Vm::define_accessor(JsObject* o, JsString* key, const Value& getter, const Value& setter, uint8_t flags) {
+  if (o == sentinel_ || halted_) return;
+  const int64_t at = find_prop(o, key);
+  JsObject* pair = nullptr;
+  if (at >= 0 && (o->props[at].flags & kAccessor) && o->props[at].value.is_object()) pair = o->props[at].value.as_object();
+  if (!pair) {
+    pair = new_array(2);
+    array_push(pair, Value());
+    array_push(pair, Value());
+  }
+  if (!getter.is_undefined()) pair->items[0] = getter;
+  if (!setter.is_undefined()) pair->items[1] = setter;
+  define(o, key, Value::make_object(pair), static_cast<uint8_t>((flags & kEnumerable) | kAccessor));
+}
+
 void Vm::define_native(JsObject* o, StringView name, NativeFn fn, uint32_t arity) {
   JsObject* f = new_native(fn, name, arity);
   define(o, intern(name), Value::make_object(f), kWritable);   // (not enumerable)
@@ -643,6 +860,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
   }
   const int64_t at = find_prop(o, key);
   if (at >= 0) {
+    if (o->props[at].flags & kAccessor) return accessor_value(o->props[at].value, out);
     *out = o->props[at].value;
     return true;
   }
@@ -657,13 +875,47 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     }
     if (key == prototype_ && o->okind == ObjKind::Function && !o->code->is_arrow) {   // made when first looked at
       JsObject* proto = new_plain();
-      define(proto, constructor_, Value::make_object(o), kWritable);
+      if (o->code->is_generator) {   // the objects a generator function makes inherit from the generator prototype
+        Value generator_proto;
+        if (get_plain(global_, intern("__generator_proto"), &generator_proto) && generator_proto.is_object()) proto->proto = generator_proto.as_object();
+      } else {
+        define(proto, constructor_, Value::make_object(o), kWritable);
+      }
       define(o, prototype_, Value::make_object(proto), kWritable);
       *out = Value::make_object(proto);
       return true;
     }
   }
   return false;
+}
+
+// The value of an accessor property: what its getter returns for the object being read (nothing is called when no read is going on: hasOwnProperty ...).
+bool Vm::accessor_value(const Value& pair, Value* out) {
+  *out = Value();
+  if (!has_receiver_ || !pair.is_object() || pair.as_object()->length < 2) return true;
+  const Value getter = pair.as_object()->items[0];
+  if (!is_callable(getter)) return true;
+  const Value receiver = receiver_;
+  has_receiver_ = false;   // (what the getter reads is its own business)
+  const bool ok = call(getter, receiver, nullptr, 0, out);
+  has_receiver_ = true;
+  receiver_ = receiver;
+  if (!ok) getter_failed_ = true;
+  return true;
+}
+
+bool Vm::call_setter(const Value& pair, const Value& receiver, const Value& value) {
+  if (!pair.is_object() || pair.as_object()->length < 2) return true;
+  const Value setter = pair.as_object()->items[1];
+  if (!is_callable(setter)) return true;   // (a property with only a getter ignores a write, as in sloppy mode)
+  Value ignored;
+  const bool saved_has = has_receiver_;
+  const Value saved = receiver_;
+  has_receiver_ = false;
+  const bool ok = call(setter, receiver, &value, 1, &ignored);
+  has_receiver_ = saved_has;
+  receiver_ = saved;
+  return ok;
 }
 
 bool Vm::get_plain(JsObject* o, JsString* key, Value* out) {
@@ -675,8 +927,13 @@ bool Vm::get_plain(JsObject* o, JsString* key, Value* out) {
 
 bool Vm::has_property(JsObject* o, JsString* key) {
   Value ignored;
-  for (JsObject* p = o; p; p = p->proto)
+  for (JsObject* p = o; p; p = p->proto) {
+    if (p->okind == ObjKind::Proxy) {
+      bool found = false;
+      return proxy_has(p, key, &found) && found;
+    }
     if (get_own(p, key, &ignored)) return true;
+  }
   return false;
 }
 
@@ -711,9 +968,24 @@ bool Vm::get(const Value& base, JsString* key, Value* out) {
     case Tag::Boolean: o = boolean_proto_; break;
     case Tag::Object: o = base.as_object(); break;
   }
+  if (o && o->okind == ObjKind::Proxy) return proxy_get(o, key, base, out);
+  const Value saved_receiver = receiver_;
+  const bool saved_has = has_receiver_;
+  receiver_ = base;
+  has_receiver_ = true;
   for (; o; o = o->proto) {
-    if (get_own(o, key, out)) return true;
+    if (get_own(o, key, out)) {
+      receiver_ = saved_receiver;
+      has_receiver_ = saved_has;
+      if (getter_failed_) {
+        getter_failed_ = false;
+        return false;
+      }
+      return true;
+    }
   }
+  receiver_ = saved_receiver;
+  has_receiver_ = saved_has;
   *out = Value();
   return true;
 }
@@ -752,6 +1024,10 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
       *out = i < o->length ? o->items[i] : Value();
       return true;
     }
+    if (o->okind == ObjKind::TypedArray) {
+      typed_array_get(o, i, out);
+      return true;
+    }
   } else if (base.is_string() && key.is_number() && array_index(key, &i)) {
     JsString* s = base.as_string();
     *out = i < s->length ? Value::make_string(new_string(StringView(s->data() + i, 1))) : Value();
@@ -786,16 +1062,27 @@ bool Vm::put(const Value& base, JsString* key, const Value& value) {
   }
   if (!base.is_object()) return true;   // (a property of a primitive is lost, as in sloppy mode)
   JsObject* o = base.as_object();
+  if (o->okind == ObjKind::Proxy) return proxy_set(o, key, value, base);
   if (o->host && o->host->set) {
     const HostClass::Set r = o->host->set(*this, o, key, value);
     if (r == HostClass::Set::Threw) return false;
-    if (r == HostClass::Set::Handled) return true;
+    if (r == HostClass::Set::Handled) {
+      if (epilogue_pending_) run_epilogue();
+      return true;
+    }
   }
   if (o->frozen) return true;
   const int64_t at = find_prop(o, key);
   if (at >= 0) {
+    if (o->props[at].flags & kAccessor) return call_setter(o->props[at].value, base, value);
     if (o->props[at].flags & kWritable) o->props[at].value = value;
     return true;
+  }
+  for (JsObject* p = o->proto; p; p = p->proto) {   // a setter further up the chain takes the write
+    const int64_t up = find_prop(p, key);
+    if (up < 0) continue;
+    if (p->props[up].flags & kAccessor) return call_setter(p->props[up].value, base, value);
+    break;
   }
   define(o, key, value);
   return true;
@@ -805,6 +1092,7 @@ bool Vm::put_member(const Value& base, const Value& key, const Value& value) {
   uint32_t i;
   if (base.is_object() && array_index(key, &i)) {
     JsObject* o = base.as_object();
+    if (o->okind == ObjKind::TypedArray) return typed_array_put(*this, o, i, value);
     if (o->okind == ObjKind::Array && !o->frozen) {
       if (i < o->length) {
         o->items[i] = value;
@@ -828,6 +1116,10 @@ bool Vm::put_member(const Value& base, const Value& key, const Value& value) {
 }
 
 bool Vm::delete_property(JsObject* o, JsString* key) {
+  if (o->okind == ObjKind::Proxy) {
+    bool deleted = false;
+    return proxy_delete(o, key, &deleted) && deleted;
+  }
   if (o->host && o->host->remove) {
     bool deleted = true;
     if (o->host->remove(*this, o, key, &deleted)) return deleted;
@@ -849,6 +1141,7 @@ bool Vm::delete_property(JsObject* o, JsString* key) {
 }
 
 JsObject* Vm::own_keys(JsObject* o) {
+  if (o->okind == ObjKind::Proxy) return proxy_keys(o, false);
   JsObject* keys = new_array(o->prop_count + (o->okind == ObjKind::Array ? o->length : 0));
   if (o->okind == ObjKind::Array) {
     for (uint32_t i = 0; i < o->length; ++i) {
@@ -871,6 +1164,30 @@ JsObject* Vm::own_keys(JsObject* o) {
   return keys;
 }
 
+JsObject* Vm::own_names(JsObject* o) {
+  if (o->okind == ObjKind::Proxy) return proxy_keys(o, true);
+  JsObject* names = own_keys(o);
+  if (o->okind == ObjKind::Array) array_push(names, Value::make_string(length_));
+  for (uint32_t i = 0; i < o->prop_count; ++i)
+    if (!(o->props[i].flags & kEnumerable)) array_push(names, Value::make_string(o->props[i].key));
+  return names;
+}
+
+bool Vm::own_property(JsObject* o, JsString* key, Value* value, uint8_t* flags) {
+  const int64_t at = find_prop(o, key);
+  if (at >= 0) {
+    *value = o->props[at].value;
+    *flags = o->props[at].flags;
+    return true;
+  }
+  const bool saved = has_receiver_;
+  has_receiver_ = false;
+  const bool found = get_own(o, key, value);
+  has_receiver_ = saved;
+  *flags = key == length_ ? kWritable : kDefaultFlags;
+  return found;
+}
+
 // --- Conversions -------------------------------------------------------------------------------------------------
 
 bool Vm::to_boolean(const Value& v) {
@@ -880,15 +1197,35 @@ bool Vm::to_boolean(const Value& v) {
     case Tag::Boolean: return v.u.boolean;
     case Tag::Number: return v.u.number == v.u.number && v.u.number != 0;
     case Tag::String: return v.as_string()->length > 0;
-    default: return true;
+    default: {
+      if (is_bigint(v)) {   // 0n is false
+        const JsObject* o = v.as_object();
+        for (uint32_t i = 0; i < o->prop_count; ++i)
+          if (o->props[i].key->view().equals("__mag") && o->props[i].value.is_string()) return !o->props[i].value.as_string()->view().equals("0");
+      }
+      return true;
+    }
   }
 }
 
-bool Vm::to_primitive(const Value& v, bool prefer_string, Value* out) {
+bool Vm::to_primitive(const Value& v, bool prefer_string, Value* out) { return to_primitive_hint(v, prefer_string ? 1 : 2, out); }
+
+bool Vm::to_primitive_hint(const Value& v, int hint, Value* out) {
   if (!v.is_object()) {
     *out = v;
     return true;
   }
+  Value exotic;
+  if (!get(v, intern("@@toPrimitive"), &exotic)) return false;
+  if (is_callable(exotic)) {
+    const Value hint_text = Value::make_string(new_string(hint == 0 ? "default" : hint == 1 ? "string" : "number"));
+    Value result;
+    if (!call(exotic, v, &hint_text, 1, &result)) return false;
+    if (result.is_object()) return throw_error(ErrorKind::TypeError, "Cannot convert object to primitive value");
+    *out = result;
+    return true;
+  }
+  const bool prefer_string = hint == 1;
   JsString* order[2] = {prefer_string ? to_string_ : value_of_, prefer_string ? value_of_ : to_string_};
   for (JsString* name : order) {
     Value method;
@@ -917,6 +1254,15 @@ bool Vm::to_string(const Value& v, JsString** out) {
       return true;
     }
     default: {
+      bool negative;
+      StringView digits;
+      if (is_bigint(v) && bigint_parts(v, &negative, &digits)) {   // String(10n)
+        String text(allocator_);
+        if (negative) text.push_back('-');
+        text.append(digits);
+        *out = new_string(text.view());
+        return true;
+      }
       Value prim;
       if (!to_primitive(v, true, &prim)) return false;
       return to_string(prim, out);
@@ -937,6 +1283,14 @@ bool Vm::to_number(const Value& v, double* out) {
       return true;
     }
     default: {
+      bool negative;
+      StringView digits;
+      if (is_bigint(v) && bigint_parts(v, &negative, &digits)) {   // Number(10n)
+        double d = 0;
+        string_to_number(digits, &d);
+        *out = negative ? -d : d;
+        return true;
+      }
       Value prim;
       if (!to_primitive(v, false, &prim)) return false;
       return to_number(prim, out);
@@ -967,7 +1321,7 @@ StringView Vm::type_of(const Value& v) {
     case Tag::Boolean: return "boolean";
     case Tag::Number: return "number";
     case Tag::String: return "string";
-    default: return is_callable(v) ? "function" : "object";
+    default: return is_bigint(v) ? "bigint" : is_callable(v) ? "function" : "object";
   }
 }
 
@@ -979,22 +1333,32 @@ bool Vm::strict_equals(const Value& a, const Value& b) {
     case Tag::Boolean: return a.u.boolean == b.u.boolean;
     case Tag::Number: return a.u.number == b.u.number;
     case Tag::String: return a.as_string() == b.as_string() || (a.as_string()->length == b.as_string()->length && a.as_string()->view().equals(b.as_string()->view()));
-    default: return a.u.cell == b.u.cell;
+    default: {
+      if (a.u.cell == b.u.cell) return true;
+      bool na, nb;
+      StringView da, db;
+      return is_bigint(a) && is_bigint(b) && bigint_parts(a, &na, &da) && bigint_parts(b, &nb, &db) && na == nb && da.equals(db);   // (BigInts of the same value are equal)
+    }
   }
 }
 
 bool Vm::loose_equals(const Value& a, const Value& b) {
+  if (is_bigint(a) != is_bigint(b)) {
+    Value r;
+    if (!bigint_operation("==", a, b, &r)) return false;
+    return to_boolean(r);
+  }
   if (a.tag == b.tag) return strict_equals(a, b);
   if (a.is_nullish() && b.is_nullish()) return true;
   if (a.is_nullish() || b.is_nullish()) return false;
   if (a.is_object() && !b.is_object()) {
     Value p;
-    if (!to_primitive(a, false, &p)) return false;
+    if (!to_primitive_hint(a, 0, &p)) return false;
     return loose_equals(p, b);
   }
   if (b.is_object() && !a.is_object()) {
     Value p;
-    if (!to_primitive(b, false, &p)) return false;
+    if (!to_primitive_hint(b, 0, &p)) return false;
     return loose_equals(a, p);
   }
   double x, y;
@@ -1025,6 +1389,20 @@ void Vm::describe(const Value& v, String* out, uint32_t depth) {
     case Tag::Boolean: out->append(v.u.boolean ? "true" : "false"); return;
   }
   JsObject* o = v.as_object();
+  if (o->okind == ObjKind::BigInt) {
+    bool negative;
+    StringView digits;
+    if (bigint_parts(v, &negative, &digits)) {
+      if (negative) out->push_back('-');
+      out->append(digits);
+      out->push_back('n');
+      return;
+    }
+  }
+  if (o->okind == ObjKind::TypedArray) {
+    typed_array_describe(*this, o, out, depth);
+    return;
+  }
   if (is_callable(v)) {
     Value name;
     get_own(o, name_, &name);
@@ -1067,7 +1445,8 @@ void Vm::describe(const Value& v, String* out, uint32_t depth) {
     first = false;
     out->append(o->props[i].key->view());
     out->append(": ");
-    describe(o->props[i].value, out, depth + 1);
+    if (o->props[i].flags & kAccessor) out->append("[Getter/Setter]");
+    else describe(o->props[i].value, out, depth + 1);
   }
   out->push_back('}');
 }
@@ -1182,6 +1561,33 @@ bool Vm::has_in(const Value& key, const Value& object, bool* out) {
 }
 
 bool Vm::binary_op(Opc op, const Value& a, const Value& b, Value* out) {
+  if (is_bigint(a) || is_bigint(b)) {
+    const char* name = nullptr;
+    switch (op) {
+      case Opc::Add: name = "+"; break;
+      case Opc::Sub: name = "-"; break;
+      case Opc::Mul: name = "*"; break;
+      case Opc::Div: name = "/"; break;
+      case Opc::Mod: name = "%"; break;
+      case Opc::Pow: name = "**"; break;
+      case Opc::BitAnd: name = "&"; break;
+      case Opc::BitOr: name = "|"; break;
+      case Opc::BitXor: name = "^"; break;
+      case Opc::Shl: name = "<<"; break;
+      case Opc::Shr: name = ">>"; break;
+      case Opc::UShr: name = ">>>"; break;
+      case Opc::Lt: name = "<"; break;
+      case Opc::Gt: name = ">"; break;
+      case Opc::Le: name = "<="; break;
+      case Opc::Ge: name = ">="; break;
+      case Opc::Eq: name = "=="; break;
+      case Opc::Ne: name = "!="; break;
+      case Opc::StrictEq: name = "==="; break;
+      case Opc::StrictNe: name = "!=="; break;
+      default: break;
+    }
+    if (name) return bigint_operation(name, a, b, out);
+  }
   if (a.is_number() && b.is_number()) {
     const double x = a.u.number, y = b.u.number;
     switch (op) {
@@ -1199,7 +1605,7 @@ bool Vm::binary_op(Opc op, const Value& a, const Value& b, Value* out) {
   switch (op) {
     case Opc::Add: {
       Value pa, pb;
-      if (!to_primitive(a, false, &pa) || !to_primitive(b, false, &pb)) return false;
+      if (!to_primitive_hint(a, 0, &pa) || !to_primitive_hint(b, 0, &pb)) return false;
       if (pa.is_string() || pb.is_string()) {
         JsString *sa, *sb;
         if (!to_string(pa, &sa) || !to_string(pb, &sb)) return false;
@@ -1383,6 +1789,20 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
   return false;
 }
 
+bool Vm::iterate_into(JsObject* array, const Value& iterable, int64_t max) {
+  if (max == 0) return true;
+  Value it_value;
+  if (!make_iterator(iterable, false, &it_value)) return false;
+  JsObject* it = it_value.as_object();
+  Value item;
+  int64_t taken = 0;
+  while (iterator_next(it, &item)) {
+    if (!array_push(array, item)) break;
+    if (max > 0 && ++taken >= max) break;
+  }
+  return !has_exception_;
+}
+
 bool Vm::spread_into(JsObject* array, const Value& iterable) {
   Value it_value;
   if (!make_iterator(iterable, false, &it_value)) return false;
@@ -1441,6 +1861,8 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   f.base = base;
   f.handlers = static_cast<uint32_t>(handlers_.count());
   f.construct = construct;
+  f.via_super = super_pending_;
+  super_pending_ = false;
   f.construct_this = construct_this;
   f.coroutine = nullptr;
   if (!frames_.push_back(f)) return throw_error(ErrorKind::RangeError, "out of memory");
@@ -1488,6 +1910,10 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     self = b->bound_this;
     fn = Value::make_object(b->target);
   }
+  if (fn.is_object() && fn.as_object()->okind == ObjKind::Proxy && is_callable(fn)) {
+    if (total == 0) return proxy_call(fn.as_object(), self, nullptr, 0, result, construct);
+    return proxy_call(fn.as_object(), self, all, total, result, construct);
+  }
   if (!is_callable(fn)) {
     String message(allocator_);
     describe(fn, &message, 1);
@@ -1510,7 +1936,7 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
       sp_ = base;
       return false;
     }
-    created = Value::make_object(new_object(proto.is_object() ? proto.as_object() : object_proto_));
+    created = Value::make_object(new_instance(proto.is_object() ? proto.as_object() : object_proto_));
     stack_[base + 1] = created;
     this_for_call = created;
   }
@@ -1526,15 +1952,26 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     --native_depth_;
     sp_ = base;
     if (!ok) return false;
+    if (epilogue_pending_) {
+      pinned_ = r;   // (the result is kept while the epilogue runs script)
+      run_epilogue();
+      r = pinned_;
+      pinned_ = Value();
+    }
     *result = construct && !r.is_object() ? created : r;
     return true;
   }
-  if (construct && (f->code->is_arrow || f->code->is_async)) {
+  if (construct && (f->code->is_arrow || f->code->is_async || f->code->is_generator)) {
     sp_ = base;
     return throw_error(ErrorKind::TypeError, "function is not a constructor");
   }
   if (f->code->is_async) {
     const bool started = start_async(f, this_for_call, a, total, base, result);
+    sp_ = base;
+    return started;
+  }
+  if (f->code->is_generator) {
+    const bool started = start_generator(f, this_for_call, a, total, result);
     sp_ = base;
     return started;
   }
@@ -1631,6 +2068,17 @@ reload:
       case Opc::PushStr: PUSH(code->constants[static_cast<uint32_t>(in.a)]); break;
       case Opc::PushInt: PUSH(Value::make_number(in.a)); break;
       case Opc::PushThis: PUSH(fp->this_value); break;
+      case Opc::NewTarget: {
+        Value target;
+        if (fp->construct && fp->callee) {
+          target = Value::make_object(fp->callee);
+        } else if (fp->via_super && fp->this_value.is_object()) {   // (a parent constructor run by super(...): the class that `new` named)
+          get(fp->this_value, intern("constructor"), &target);
+          if (!is_callable(target)) target = Value();
+        }
+        PUSH(target);
+        break;
+      }
       case Opc::Pop: --sp_; break;
       case Opc::Dup: PUSH(stack_[sp_ - 1]); break;
       case Opc::Dup2: {
@@ -1783,13 +2231,13 @@ reload:
           args = arg_array->items;
           argc = arg_array->length;
         }
-        if (callee.is_object() && callee.as_object()->okind == ObjKind::Function && !callee.as_object()->code->is_async && !(is_new && callee.as_object()->code->is_arrow)) {
+        if (callee.is_object() && callee.as_object()->okind == ObjKind::Function && !callee.as_object()->code->is_async && !callee.as_object()->code->is_generator && !(is_new && callee.as_object()->code->is_arrow)) {
           JsObject* f = callee.as_object();
           Value this_for_call = self, created;
           if (is_new) {
             Value proto;
             CHECK(get(callee, prototype_, &proto));
-            created = Value::make_object(new_object(proto.is_object() ? proto.as_object() : object_proto_));
+            created = Value::make_object(new_instance(proto.is_object() ? proto.as_object() : object_proto_));
             this_for_call = created;
             stack_[base + 1] = created;   // (kept reachable)
           }
@@ -1804,7 +2252,7 @@ reload:
           if (is_new) {
             Value proto;
             CHECK(get(callee, prototype_, &proto));
-            created = Value::make_object(new_object(proto.is_object() ? proto.as_object() : object_proto_));
+            created = Value::make_object(new_instance(proto.is_object() ? proto.as_object() : object_proto_));
             this_for_call = created;
             stack_[base + 1] = created;
           }
@@ -1817,6 +2265,12 @@ reload:
           const bool ok = callee.as_object()->native(*this, this_for_call, args, argc, &result);
           --native_depth_;
           CHECK(ok);
+          if (epilogue_pending_) {
+            pinned_ = result;
+            run_epilogue();
+            result = pinned_;
+            pinned_ = Value();
+          }
           if (is_new && !result.is_object()) result = created;
         } else {
           // bound functions and things that are not functions: the general path
@@ -1842,6 +2296,12 @@ reload:
       }
       case Opc::Not: stack_[sp_ - 1] = Value::make_bool(!to_boolean(stack_[sp_ - 1])); break;
       case Opc::Neg: {
+        if (is_bigint(stack_[sp_ - 1])) {
+          Value r;
+          CHECK(bigint_operation("neg", stack_[sp_ - 1], Value(), &r));
+          stack_[sp_ - 1] = r;
+          break;
+        }
         double d;
         CHECK(to_number(stack_[sp_ - 1], &d));
         stack_[sp_ - 1] = Value::make_number(-d);
@@ -1849,12 +2309,22 @@ reload:
       }
       case Opc::Plus:
       case Opc::ToNumber: {
+        if (is_bigint(stack_[sp_ - 1])) {
+          if (in.op == Opc::Plus) CHECK(throw_error(ErrorKind::TypeError, "Cannot convert a BigInt value to a number"));   // +10n
+          break;   // (x++ keeps the BigInt for the old value; the update itself is done by Inc)
+        }
         double d;
         CHECK(to_number(stack_[sp_ - 1], &d));
         stack_[sp_ - 1] = Value::make_number(d);
         break;
       }
       case Opc::BitNot: {
+        if (is_bigint(stack_[sp_ - 1])) {
+          Value r;
+          CHECK(bigint_operation("~", stack_[sp_ - 1], Value(), &r));
+          stack_[sp_ - 1] = r;
+          break;
+        }
         int32_t i;
         CHECK(to_int32(stack_[sp_ - 1], &i));
         stack_[sp_ - 1] = Value::make_number(~i);
@@ -1862,6 +2332,12 @@ reload:
       }
       case Opc::Inc:
       case Opc::Dec: {
+        if (is_bigint(stack_[sp_ - 1])) {
+          Value r;
+          CHECK(bigint_operation(in.op == Opc::Inc ? "inc" : "dec", stack_[sp_ - 1], Value(), &r));
+          stack_[sp_ - 1] = r;
+          break;
+        }
         double d;
         CHECK(to_number(stack_[sp_ - 1], &d));
         stack_[sp_ - 1] = Value::make_number(in.op == Opc::Inc ? d + 1 : d - 1);
@@ -1929,6 +2405,19 @@ reload:
         sp_ -= 2;
         break;
       }
+      case Opc::DefineAccessor: {   // [obj, fn] -> [obj]   (b: 1 getter, 2 setter)
+        JsString* k = code->constants[static_cast<uint32_t>(in.a)].as_string();
+        define_accessor(stack_[sp_ - 2].as_object(), k, in.b == 1 ? stack_[sp_ - 1] : Value(), in.b == 2 ? stack_[sp_ - 1] : Value());
+        --sp_;
+        break;
+      }
+      case Opc::DefineAccessorElem: {   // [obj, key, fn] -> [obj]
+        JsString* k;
+        CHECK(to_property_key(stack_[sp_ - 2], &k));
+        define_accessor(stack_[sp_ - 3].as_object(), k, in.b == 1 ? stack_[sp_ - 1] : Value(), in.b == 2 ? stack_[sp_ - 1] : Value());
+        sp_ -= 2;
+        break;
+      }
       case Opc::NewArray: PUSH(Value::make_object(new_array())); break;
       case Opc::ArrayPush:
         array_push(stack_[sp_ - 2].as_object(), stack_[sp_ - 1]);
@@ -1978,7 +2467,8 @@ reload:
       case Opc::TryEnd:
         if (handlers_.count() > 0) handlers_.remove_at(handlers_.count() - 1);
         break;
-      case Opc::Await: {
+      case Opc::Await:
+      case Opc::Yield: {
         // The async function stops here: its frame, the values it has on the stack and its handlers are saved in its coroutine, and the VM goes back to
         // whoever started or resumed it (run_coroutine), which waits for the value to settle.
         Coroutine* saved = fp->coroutine ? coroutine_of(fp->coroutine) : nullptr;
@@ -2295,6 +2785,7 @@ bool Vm::run_coroutine(JsObject* co, bool start, bool throwing, const Value& inp
     f.base = base;
     f.handlers = static_cast<uint32_t>(handlers_.count());
     f.construct = false;
+    f.via_super = false;
     f.coroutine = co;
     for (uint64_t i = 0; i < s->stack.count(); ++i) stack_[sp_++] = s->stack[i];
     const uint32_t index = static_cast<uint32_t>(frames_.count());
@@ -2340,6 +2831,122 @@ bool Vm::run_coroutine(JsObject* co, bool start, bool throwing, const Value& inp
   return true;
 }
 
+bool Vm::is_generator_object(const Value& v) {
+  if (!v.is_object() || v.as_object()->okind != ObjKind::Coroutine || !v.as_object()->host_data) return false;
+  return static_cast<Coroutine*>(v.as_object()->host_data)->generator;
+}
+
+// Calling a generator function: the frame is made and run up to the first thing it does (see the start of a generator in the compiler), then the generator
+// object - the coroutine itself - is the result.
+bool Vm::start_generator(JsObject* function, const Value& this_value, const Value* args, uint32_t argc, Value* result) {
+  if (sp_ + 4 >= kStackValues) return throw_error(ErrorKind::RangeError, "Maximum call stack size exceeded");
+  void* mem = allocator_.allocate(sizeof(Coroutine));
+  JsObject* co = new_object(nullptr);
+  if (!mem || co == sentinel_) {
+    if (mem) allocator_.deallocate(mem);
+    return throw_error(ErrorKind::RangeError, "out of memory");
+  }
+  co->okind = ObjKind::Coroutine;
+  Coroutine* state = new (mem) Coroutine(allocator_);
+  state->generator = true;
+  co->host_data = state;
+  stack_[sp_++] = Value::make_object(co);   // (kept reachable)
+  Value proto;
+  if (get(Value::make_object(function), prototype_, &proto) && proto.is_object()) co->proto = proto.as_object();
+  if (async_depth_ >= 100) return throw_error(ErrorKind::RangeError, "Maximum call stack size exceeded");
+  if (!push_frame(function, this_value, args, argc, sp_, false, Value())) return false;
+  frames_[frames_.count() - 1].coroutine = co;
+  Value ignored;
+  bool done = false;
+  if (!run_generator(co, true, 0, Value(), &ignored, &done)) return false;
+  *result = Value::make_object(co);
+  return true;
+}
+
+bool Vm::run_generator(JsObject* co, bool start, int mode, const Value& input, Value* value, bool* done) {
+  Coroutine* s = coroutine_of(co);
+  *done = false;
+  *value = Value();
+  if (!s) return true;
+  if (!start) {
+    if (frames_.count() >= kMaxFrames || sp_ + s->stack.count() + 4 >= kStackValues || async_depth_ >= 100) return throw_error(ErrorKind::RangeError, "Maximum call stack size exceeded");
+    const uint32_t base = sp_;
+    Frame f;
+    f.code = s->code;
+    f.pc = s->pc;
+    f.env = s->env;
+    f.this_value = s->this_value;
+    f.callee = s->callee;
+    f.base = base;
+    f.handlers = static_cast<uint32_t>(handlers_.count());
+    f.construct = false;
+    f.via_super = false;
+    f.coroutine = co;
+    for (uint64_t i = 0; i < s->stack.count(); ++i) stack_[sp_++] = s->stack[i];
+    const uint32_t index = static_cast<uint32_t>(frames_.count());
+    for (uint64_t i = 0; i < s->handlers.count(); ++i) handlers_.push_back(Handler{s->handlers[i].pc, s->handlers[i].stack + base, index, s->handlers[i].env});
+    frames_.push_back(f);
+    if (mode == 0) stack_[sp_++] = input;
+    s->stack.clear();
+    s->handlers.clear();
+  }
+  const uint32_t entry = static_cast<uint32_t>(frames_.count() - 1);
+  const uint32_t resume_sp = frames_[entry].base;
+  s->running = true;
+  ++async_depth_;
+  suspended_ = false;
+  bool ok;
+  if (!start && mode == 1) {
+    throw_value(input);
+    ok = unwind(entry) && execute(entry);
+  } else {
+    ok = execute(entry);
+  }
+  --async_depth_;
+  s->running = false;
+  sp_ = resume_sp;
+  if (ok) {
+    if (suspended_) {   // a yield
+      suspended_ = false;
+      *value = await_value_;
+      await_value_ = Value();
+      return true;
+    }
+    *value = last_result_;
+    last_result_ = Value();
+    *done = true;
+    s->done = true;
+    return true;
+  }
+  s->done = true;
+  return false;   // (it threw: the exception is pending)
+}
+
+bool Vm::generator_resume(const Value& generator, int mode, const Value& input, Value* result) {
+  if (!is_generator_object(generator)) return throw_error(ErrorKind::TypeError, "next method called on incompatible receiver");
+  JsObject* co = generator.as_object();
+  Coroutine* s = coroutine_of(co);
+  Value value;
+  bool done = false;
+  if (s->running) return throw_error(ErrorKind::TypeError, "Generator is already running");
+  if (s->done || mode == 2) {
+    s->done = true;
+    if (mode == 1) {
+      throw_value(input);
+      return false;
+    }
+    value = mode == 2 ? input : Value();
+    done = true;
+  } else if (!run_generator(co, false, mode, input, &value, &done)) {
+    return false;
+  }
+  JsObject* r = new_plain();
+  define_named(r, "value", value);
+  define_named(r, "done", Value::make_bool(done));
+  *result = Value::make_object(r);
+  return true;
+}
+
 void Vm::async_wait(JsObject* co, const Value& awaited) {
   JsObject* p = promise_resolved(awaited);
   promise_then(p, Value::make_object(co), Value::make_object(co), nullptr);
@@ -2354,6 +2961,13 @@ double Vm::add_timer(const Value& function, double delay_ms, double interval_ms,
   const double id = (counter.is_number() ? counter.u.number : 0) + 1;
   define_named(global(), "__timer_id", Value::make_number(id), kWritable);
   if (delay_ms != delay_ms || delay_ms < 0) delay_ms = 0;
+  Value level_value;
+  get_named(Value::make_object(global()), "__timer_level", &level_value);
+  const double level = (level_value.is_number() ? level_value.u.number : 0) + 1;   // timers started by timers: from the sixth level on, no sooner than 4 ms
+  if (level > 5) {
+    if (delay_ms < 4) delay_ms = 4;
+    if (interval_ms == interval_ms && interval_ms >= 0 && interval_ms < 4) interval_ms = 4;
+  }
   if (interval_ms == interval_ms && interval_ms >= 0 && interval_ms < 1) interval_ms = 1;
   JsObject* entry = new_array(4 + argc);
   array_push(entry, function);
@@ -2361,6 +2975,7 @@ double Vm::add_timer(const Value& function, double delay_ms, double interval_ms,
   array_push(entry, Value::make_number(id));
   array_push(entry, Value::make_number(interval_ms == interval_ms ? interval_ms : -1));
   for (uint32_t i = 0; i < argc; ++i) array_push(entry, args[i]);
+  define_named(entry, "n", Value::make_number(level), 0);
   array_push(list.as_object(), Value::make_object(entry));
   return id;
 }
