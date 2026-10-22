@@ -503,6 +503,28 @@ static void test_css_flex_grid() {
                   "head\nside      main"));
 }
 
+static void test_css_generated_content() {
+  CHECK(layout_is("<style>.q::before{content:'> '} .q::after{content:' <'}</style><p class=q>quote</p>", 40, "> quote <"));
+  CHECK(layout_is("<style>body{counter-reset:sec} h2{counter-increment:sec} h2::before{content:counter(sec) '. '}</style><h2>One</h2><h2>Two</h2>", 40, "1. One\n\n2. Two"));
+  CHECK(layout_is("<style>a::after{content:' (' attr(href) ')'}</style><a href='x.html'>link</a>", 40, "link (x.html)"));
+  CHECK(layout_is("<style>ol{list-style-type:upper-roman}</style><ol><li>a<li>b</ol>", 40, "I. a\nII. b"));
+  CHECK(layout_is("<style>ol{list-style-type:lower-alpha}</style><ol><li>a<li>b</ol>", 40, "a. a\nb. b"));
+  CHECK(layout_is("<style>p::before{content:'x'}</style><p style='display:none'>hidden</p>", 40, ""));
+}
+
+static void test_css_more_layout() {
+  CHECK(layout_is("<div style='columns:2'>one two three four five six seven eight nine ten eleven twelve</div>", 30,
+                  "one two three   nine ten\nfour five six   eleven twelve\nseven eight"));
+  CHECK(layout_is("<div style='display:table'><div style='display:table-row'><div style='display:table-cell'>a</div><div style='display:table-cell'>bb</div></div>"
+                  "<div style='display:table-row'><div style='display:table-cell'>ccc</div><div style='display:table-cell'>d</div></div></div>", 30, "a  bb\ncccd"));
+  CHECK(layout_is("<p style='text-transform:capitalize'>hello big-world x</p>", 20, "Hello Big-World X"));
+  CHECK(layout_is("<div><span style='display:inline-block;width:40px;border:1px solid'>a</span> <span style='display:inline-block;width:40px;border:1px solid'>b</span></div>", 30,
+                  "+-----+ +-----+\n|a    | |b    |\n+-----+ +-----+"));
+  CHECK(layout_is("<div style='float:left;width:40px;border:1px solid'>L</div><p>text wraps beside the float for a while until it ends here</p><p>second</p>", 30,
+                  "+-----+ text wraps beside the\n|L    | float for a while\n+-----+ until it ends here\n\nsecond"));
+  CHECK(layout_is("<div style='float:right;width:40px'>R</div>left text goes here<div style='clear:both'>cleared</div>", 30, "left text goes here      R\ncleared"));
+}
+
 static void test_css_box_model() {
   // borders and padding draw a box
   CHECK(layout_is("<div style='border:1px solid'>hi</div>", 12, "+----------+\n|hi        |\n+----------+"));
@@ -543,6 +565,8 @@ int main() {
   test_css_garbage();
   test_css_box_model();
   test_css_flex_grid();
+  test_css_generated_content();
+  test_css_more_layout();
   test_scripts();
   test_addresses();
   if (g_failed) {

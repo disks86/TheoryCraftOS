@@ -24,5 +24,7 @@ namespace browser {
 
 // The source text of the script.
 const char* web_prelude();
+// The DOM interfaces that are written in JavaScript (Range, Selection, TreeWalker, NodeIterator, NodeFilter, Attr nodes, CharacterData methods, Option, XMLSerializer ...).
+const char* dom_prelude();
 
 }  // namespace browser

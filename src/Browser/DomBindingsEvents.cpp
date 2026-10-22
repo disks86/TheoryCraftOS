@@ -26,6 +26,21 @@
 namespace browser {
 namespace bind {
 
+void fire_error_event(DomBindings::Impl& c, StringView text) {
+  if (c.in_error_event) return;
+  Vm& vm = c.vm;
+  Value hook;
+  if (!vm.get_named(Value::make_object(vm.global()), "__window_error", &hook) || !Vm::is_callable(hook)) return;
+  c.in_error_event = true;
+  const Value arg = Value::make_string(vm.new_string(text));
+  Value ignored;
+  if (!vm.call(hook, Value(), &arg, 1, &ignored)) {
+    String dropped(vm.allocator());
+    vm.take_exception(&dropped);
+  }
+  c.in_error_event = false;
+}
+
 namespace {
 
 #define NATIVE(name) bool name(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result)
@@ -261,6 +276,7 @@ void report_error(DomBindings::Impl& c, StringView what) {
   String text(vm.allocator());
   vm.take_exception(&text);
   if (c.error_count++ == 0) c.first_error.assign(text.view());
+  fire_error_event(c, text.view());
   if (vm.host()) {
     String line(vm.allocator());
     line.append("Uncaught ");
@@ -511,6 +527,7 @@ void DomBindings::activate(dom::Node* node) {
             String text(vm_.allocator());
             vm_.take_exception(&text);
             if (c.error_count++ == 0) c.first_error.assign(text.view());
+            fire_error_event(c, text.view());
           }
         }
         vm_.release_collector();

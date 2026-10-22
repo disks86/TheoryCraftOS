@@ -119,6 +119,11 @@ bool Page::start_engine() {
         prelude_error.insert(0, "The web platform script failed: ");
         env_.console(3, prelude_error.view());
       }
+      prelude_error.clear();
+      if (!engine_->run_library(dom_prelude(), &prelude_error)) {
+        prelude_error.insert(0, "The DOM script failed: ");
+        env_.console(3, prelude_error.view());
+      }
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
       return true;
     }
@@ -359,6 +364,21 @@ void Page::set_media(const MediaEnvironment& media) {
     bindings_->take_error(&text);
     note_error(text.view());
   }
+}
+
+void Page::set_pointer(uint32_t node_serial, bool pressed) {
+  if (node_serial >> 24) {   // in a frame: its page takes it
+    const uint64_t frame = (node_serial >> 24) - 1;
+    if (frame < frames_.count() && frames_[frame]->page) frames_[frame]->page->set_pointer(node_serial & 0xFFFFFF, pressed);
+    node_serial = 0;
+  }
+  if (node_serial == pointer_node_ && pressed == pointer_pressed_) return;
+  for (dom::Node* n = doc_.by_serial(pointer_node_); n; n = n->parent) n->ui_state = 0;
+  pointer_node_ = node_serial;
+  pointer_pressed_ = pressed;
+  for (dom::Node* n = doc_.by_serial(node_serial); n; n = n->parent)
+    n->ui_state = static_cast<uint8_t>(dom::kUiHover | (pressed ? dom::kUiActive : 0));
+  if (style_sheet().uses_pointer_state()) doc_.touch();
 }
 
 void Page::click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object, int32_t lx, int32_t ly, uint32_t w, uint32_t h) {

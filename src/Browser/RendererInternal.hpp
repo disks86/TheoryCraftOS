@@ -38,7 +38,7 @@ Style derive_style(const Style& parent, const dom::Node* n, const StyleSheet& sh
 class DocumentRenderer {
  public:
   DocumentRenderer(HtmlDocument& out, const StyleSheet& sheet, const RenderOptions& options)
-      : out_(out), sheet_(sheet), objects_(options.objects), options_(options), chunk_(out.allocator()), stack_(out.allocator()) {
+      : out_(out), sheet_(sheet), objects_(options.objects), options_(options), chunk_(out.allocator()), stack_(out.allocator()), counters_(out.allocator()), pending_row_(out.allocator()) {
     container_cols_ = options.media.width >= 64 ? static_cast<uint32_t>(options.media.width) / 8 : 80;
     root_.content_px = static_cast<int32_t>(container_cols_) * 8;
   }
@@ -72,7 +72,7 @@ class DocumentRenderer {
         if (cur == root) break;
       }
     }
-    flush();
+    finish();
     return !failed_;
   }
 
@@ -145,6 +145,16 @@ class DocumentRenderer {
 
   // Turns the text collected since the last tag into a run in the current style.
   void flush() {
+    if (row_active_ && !chunk_.empty()) {
+      bool blank = true;
+      for (uint64_t k = 0; k < chunk_.size() && blank; ++k) blank = chunk_[k] == ' ' || chunk_[k] == '\n' || chunk_[k] == '\t';
+      if (blank) {   // (a space between two inline boxes is the gap between them)
+        row_gap_ = true;
+        chunk_.clear();
+        return;
+      }
+      flush_row();
+    }
     if (chunk_.empty()) return;
     const Style& s = cur();
     StringView text = chunk_.view();
@@ -156,6 +166,7 @@ class DocumentRenderer {
         char c = text[k];
         if (s.transform == 1 && c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
         if (s.transform == 2 && c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+        if (s.transform == 3 && c >= 'a' && c <= 'z' && (k == 0 ? ended_space_ || out_.runs_.count() == 0 || pending_ > 0 : text[k - 1] == ' ' || text[k - 1] == '-')) c = static_cast<char>(c - 32);
         failed_ |= !transformed.push_back(c);
       }
       text = transformed.view();
@@ -167,8 +178,65 @@ class DocumentRenderer {
     chunk_.clear();
   }
 
+  // "1. ", "b. ", "iv. " or "* " - the marker of a list item
+  static void list_marker(uint8_t type, bool ordered, uint32_t number, String* out) {
+    if (type == 0 || type == 1 || type == 2 || type == 8) type = ordered ? 3 : 0;
+    if (type == 0 && !ordered) {
+      out->append("* ");
+      return;
+    }
+    format_counter(number, type, out);
+    out->append(". ");
+  }
+
+  // A counter value in a list style (3 decimal, 4 lower-alpha, 5 upper-alpha, 6 lower-roman, 7 upper-roman, 9 decimal-leading-zero; others are decimal).
+  static void format_counter(int64_t value, uint8_t type, String* out) {
+    if (type == 4 || type == 5) {
+      if (value < 1) {
+        out->append_uint(static_cast<uint64_t>(value < 0 ? -value : value));
+        return;
+      }
+      char letters[16];
+      uint32_t n = 0;
+      uint64_t v = static_cast<uint64_t>(value);
+      while (v > 0 && n < sizeof(letters)) {
+        --v;
+        letters[n++] = static_cast<char>((type == 4 ? 'a' : 'A') + v % 26);
+        v /= 26;
+      }
+      while (n > 0) out->push_back(letters[--n]);
+      return;
+    }
+    if ((type == 6 || type == 7) && value > 0 && value < 4000) {
+      static const struct {
+        uint32_t v;
+        const char* s;
+      } kRoman[] = {{1000, "m"}, {900, "cm"}, {500, "d"}, {400, "cd"}, {100, "c"}, {90, "xc"}, {50, "l"}, {40, "xl"}, {10, "x"}, {9, "ix"}, {5, "v"}, {4, "iv"}, {1, "i"}};
+      uint32_t v = static_cast<uint32_t>(value);
+      for (const auto& r : kRoman)
+        while (v >= r.v) {
+          for (const char* c = r.s; *c; ++c) out->push_back(type == 7 ? static_cast<char>(*c - 32) : *c);
+          v -= r.v;
+        }
+      return;
+    }
+    if (value < 0) out->push_back('-');
+    const uint64_t magnitude = static_cast<uint64_t>(value < 0 ? -value : value);
+    if (type == 9 && magnitude < 10) out->push_back('0');
+    out->append_uint(magnitude);
+  }
+
+  // Ends the line of inline boxes that is being gathered (see render_box).
+  void flush_row();
+  void finish() {
+    flush();
+    flush_row();
+    flush();
+  }
+
   void block(uint8_t breaks) {
     flush();
+    if (row_active_) flush_row();
     if (breaks > pending_) pending_ = breaks;
     ended_space_ = true;
   }
@@ -176,6 +244,7 @@ class DocumentRenderer {
   // Text that is not in the page: a list marker, a table divider, an image's description.
   void literal(StringView text, uint8_t at_indent) {
     flush();
+    if (row_active_) flush_row();
     if (text.empty() || hidden()) return;
     const Style& s = cur();
     const uint8_t breaks = out_.runs_.count() == 0 ? 0 : pending_;
@@ -186,9 +255,12 @@ class DocumentRenderer {
 
   void pop_element() {
     flush();
+    if (row_active_) flush_row();
     const uint64_t last = stack_.count() - 1;
+    if (!hidden() && stack_[last].node->is_element()) pseudo_content(stack_[last].node, PseudoElement::After);
     const Element e = stack_[last];
     stack_.remove_at(last);
+    while (counters_.count() && counters_[counters_.count() - 1].depth >= last) counters_.remove_at(counters_.count() - 1);
     if (e.node->is_tag("dialog") && !hidden()) {
       block(2);
       failed_ |= !out_.add_run(StringView(), kRunRule, 0, 0, pending_, -1, 0, 0, 0, e.node->serial);
@@ -199,6 +271,10 @@ class DocumentRenderer {
 
   // Starts a node; returns whether its children are to be visited (display none is not shown, children and all).
   bool enter(const dom::Node* n) {
+    if (skip_left_ > 0 && n->parent == skip_parent_) {   // (taken into a float's group already)
+      --skip_left_;
+      return false;
+    }
     if (n->type == dom::NodeType::Text) {
       text(n);
       return false;
@@ -233,6 +309,7 @@ class DocumentRenderer {
     }
     if (!hidden() && s.display != Display::Inline) block(static_cast<uint8_t>(1 + s.margin_top + s.padding_top));
     failed_ |= !stack_.push_back(e);
+    update_counters(n, s);
     if (n->is_tag("dialog") && !hidden()) {
       Style& ds = stack_[stack_.count() - 1].style;
       if (!ds.own_background) {
@@ -299,12 +376,7 @@ class DocumentRenderer {
           break;
         }
       }
-      if (ordered) {
-        marker.append_uint(number);
-        marker.append(". ");
-      } else {
-        marker.append("* ");
-      }
+      list_marker(s.list_type, ordered, number, &marker);
       const uint32_t here = s.indent;
       literal(marker.view(), static_cast<uint8_t>(here >= 3 ? here - 3 : 0));
     }
@@ -326,6 +398,7 @@ class DocumentRenderer {
     }
     if (!hidden() && n->is_tag("table") && table_depth_ < 5 && render_table(n)) return false;   // (the table is drawn: its rows and cells are not visited again)
     if (dom::is_void_tag(n->name.view())) void_action(n);
+    if (!hidden()) pseudo_content(n, PseudoElement::Before);
     return true;
   }
 
@@ -1218,6 +1291,18 @@ class DocumentRenderer {
   const RenderOptions& options_;
   String chunk_;
   List<Element> stack_;
+  struct Counter {
+    explicit Counter(allocators::IAllocator& a) : name(a) {}
+    String name;
+    int64_t value = 0;
+    uint64_t depth = 0;   // the index in stack_ of the element that made it
+  };
+  List<Counter> counters_;
+  uint32_t quote_depth_ = 0;
+  void update_counters(const dom::Node* n, const Style& s);
+  void pseudo_content(const dom::Node* n, PseudoElement which);
+  bool eval_content(const dom::Node* n, StringView content, String* out);
+  void counter_text(StringView name, StringView style, StringView separator, bool all, String* out) const;
   Style root_;
   // --- Boxes (RendererBoxes.cpp): elements with borders, sizes, flexbox or grid layout are drawn into a box of their own - lines of cells - and put on the page.
   static constexpr uint32_t kMaxBoxDepth = 6;
@@ -1243,6 +1328,7 @@ class DocumentRenderer {
       return ok;
     }
   };
+  static LinePiece copy_piece(allocators::IAllocator& a, const LinePiece& from);
   struct Edges {   // the borders and the padding of a box, in cells
     uint32_t border_left = 0, border_right = 0, border_top = 0, border_bottom = 0;
     uint32_t padding_left = 0, padding_right = 0, padding_top = 0, padding_bottom = 0;
@@ -1297,6 +1383,13 @@ class DocumentRenderer {
   bool layout_grid(const dom::Node* n, const Style& s, uint32_t content_cols, uint32_t content_lines, Raster* out);
   bool layout_columns(const dom::Node* n, const Style& s, uint32_t content_cols, Raster* out);
   bool failed_ = false, ended_space_ = true;
+  Raster pending_row_;                       // inline boxes side by side, not yet drawn
+  bool row_active_ = false, row_gap_ = false;
+  uint32_t row_left_ = 0;
+  const dom::Node* skip_parent_ = nullptr;   // the next skip_left_ children of this node were drawn already
+  uint32_t skip_left_ = 0;
+  bool join_rasters(Raster& left, Raster& right, uint32_t gap);
+  bool float_group(const dom::Node* n, const Style& s, Raster& box, uint32_t avail);
   uint32_t table_depth_ = 0;
   bool modal_pass_ = false;
   uint8_t pending_ = 0;

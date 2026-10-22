@@ -49,6 +49,11 @@ class PageView : public Control {
   // Where the link at a point of this control leads (false if there is none there).
   bool link_at(int32_t x, int32_t y, String* target) const;
 
+  // Fires when the pointer moves on to another node of the page (or is pressed or released on it); pointer_node() is its serial (0 off every node).
+  void on_pointer_changed(Handler handler) { UiGuard lock(this); pointer_handler_ = handler; }
+  uint32_t pointer_node() const { return pointer_node_; }
+  bool pointer_pressed() const { return pointer_pressed_; }
+
   // --- Clicks on the page itself
   // Fires when the pointer is pressed and released on the same piece of text that came from a node of the page (Run::node); clicked_node() is that node's
   // serial and clicked_x() / clicked_y() are where, in the page (columns * 8, lines * 16). With such a handler, links are followed by whoever handles it.
@@ -122,6 +127,10 @@ class PageView : public Control {
   bool stale_ = true, syncing_ = false;
   int32_t hover_ = -1, press_link_ = -1;
   String clicked_link_, hovered_link_;
+  uint32_t pointer_node_ = 0;
+  bool pointer_pressed_ = false;
+  Handler pointer_handler_;
+  void set_pointer(uint32_t node, bool pressed);
   Handler link_handler_, hover_handler_, node_handler_, resize_handler_, key_handler_;
   uint8_t capture_ = kCaptureNone, queued_ = 0;
   KeyArgs queue_[16];

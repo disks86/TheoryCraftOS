@@ -283,6 +283,24 @@ static void test_style() {
   CHECK(js("<style>p { color: red; margin-top: 32px } .b { font-weight: bold; display: none }</style><p id=p class=b>x</p><i id=i style='color:blue'>y</i>",
            "var c = getComputedStyle(document.getElementById('p')); console.log(c.color, c.display, c.fontWeight, c.marginTop, c.getPropertyValue('font-weight'), getComputedStyle(document.getElementById('i')).color, getComputedStyle(document.getElementById('i')).display, getComputedStyle(document.body).display)",
            "rgb(255, 0, 0) none 700 32px 700 rgb(0, 0, 255) inline block") || true);
+  CHECK(js("<style>#b{display:flex;flex-direction:column;justify-content:center;gap:16px;width:200px;border:2px solid red;padding:8px;position:relative;float:left}</style><div id=b>x</div>",
+           "var c = getComputedStyle(document.getElementById('b')); console.log(c.display, c.flexDirection, c.justifyContent, c.columnGap, c.width, c.borderTopWidth, c.borderTopStyle, c.paddingLeft, c.position, c.cssFloat, c.getPropertyValue('flex-direction'), c.getPropertyValue('border-top-color'))",
+           "flex column center 16px 200px 2px solid 8px relative left column rgb(255, 0, 0)"));
+  // interfaces: instanceof by kind of element, TreeWalker, NodeIterator, Range, Selection, attribute nodes, CharacterData
+  CHECK(js("<input id=i><div id=d></div><a id=a href=x>l</a><h2 id=h></h2>", "var i = document.getElementById('i'), d = document.getElementById('d'); console.log(i instanceof HTMLInputElement, i instanceof HTMLElement, i instanceof Element, i instanceof Node, i instanceof HTMLDivElement, d instanceof HTMLDivElement, document.getElementById('a') instanceof HTMLAnchorElement, document.getElementById('h') instanceof HTMLHeadingElement)",
+           "true true true true false true true true"));
+  CHECK(js("<ul id=u><li>a<li>b<li><b>c</b></ul>", "var w = document.createTreeWalker(document.getElementById('u'), NodeFilter.SHOW_ELEMENT); var tags = []; var n; while ((n = w.nextNode())) tags.push(n.tagName); console.log(tags.join(), w.currentNode.tagName, w.previousNode().tagName, w.parentNode().tagName)", "LI,LI,LI,B B LI UL"));
+  CHECK(js("<div id=r><p>one</p><p>two</p></div>", "var it = document.createNodeIterator(document.getElementById('r'), NodeFilter.SHOW_TEXT); var t = [], n; while ((n = it.nextNode())) t.push(n.data); console.log(t.join('+'), it.previousNode().data)", "one+two two"));
+  CHECK(js("<div id=r><p>one</p><p>two</p></div>", "var w = document.createTreeWalker(document.getElementById('r'), NodeFilter.SHOW_ALL, { acceptNode: function (n) { return n.nodeName === 'P' ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT; } }); var c = 0; while (w.nextNode()) c++; console.log(c)", "0"));
+  CHECK(js("<p id=p>Hello <b>big</b> world</p>", "var p = document.getElementById('p'); var r = document.createRange(); r.setStart(p.firstChild, 2); r.setEnd(p.lastChild, 3); console.log(r.toString(), r.collapsed, r.commonAncestorContainer === p, r.startOffset, r.endOffset)", "llo big wo false true 2 3"));
+  CHECK(js("<p id=p>Hello <b>big</b> world</p>", "var p = document.getElementById('p'); var r = document.createRange(); r.selectNodeContents(p); var f = r.cloneContents(); console.log(f.childNodes.length, p.childNodes.length, r.toString())", "3 3 Hello big world"));
+  CHECK(js("<p id=p>Hello <b>big</b> world</p>", "var p = document.getElementById('p'); var r = document.createRange(); r.setStart(p.firstChild, 3); r.setEnd(p.lastChild, 3); var f = r.extractContents(); console.log(p.innerHTML, '|', f.childNodes.length, r.collapsed)", "Helrld | 3 true"));
+  CHECK(js("<p id=p>abcdef</p>", "var p = document.getElementById('p'); var r = document.createRange(); r.setStart(p.firstChild, 2); r.setEnd(p.firstChild, 4); r.deleteContents(); console.log(p.textContent); var s = document.createElement('i'); s.textContent = 'X'; r.insertNode(s); console.log(p.innerHTML)", "abef | ab<i>X</i>ef"));
+  CHECK(js("<p id=p>abcdef</p>", "var p = document.getElementById('p'); var s = getSelection(); var r = document.createRange(); r.selectNodeContents(p); s.addRange(r); console.log(s.rangeCount, s.toString(), s.type, s.anchorNode === p); s.removeAllRanges(); console.log(s.rangeCount, s.type)", "1 abcdef Range true | 0 None"));
+  CHECK(js("<p id=p a=1>x</p>", "var p = document.getElementById('p'); var a = p.getAttributeNode('a'); console.log(a.name, a.value, a.ownerElement === p, a instanceof Attr, p.getAttributeNode('zz'), p.getAttributeNS(null, 'a'), p.isEqualNode(p.cloneNode(true)), p.isEqualNode(document.body))", "a 1 true true null 1 true false"));
+  CHECK(js("<p id=p>abcdef</p>", "var t = document.getElementById('p').firstChild; t.appendData('!'); t.insertData(0, '>'); t.deleteData(1, 2); t.replaceData(0, 1, '<'); console.log(t.data, t.substringData(1, 2))", "<cdef! cd"));
+  CHECK(js("<select id=s></select>", "var o = new Option('Label', 'v1', false, true); document.getElementById('s').appendChild(o); console.log(o.textContent, o.value, o instanceof HTMLOptionElement, o.selected, document.getElementById('s').value)", "Label v1 true true v1"));
+  CHECK(js("<div id=d>x</div>", "var d = document.getElementById('d'); console.log(d.onclick, window.onerror, typeof new XMLSerializer().serializeToString(d), new XMLSerializer().serializeToString(d), document.implementation.createHTMLDocument('t').title, history instanceof History, new Map([[1, 2]]).get(1))", "null null string <div id=\"d\">x</div> t true 2"));
   CHECK(js("<p id=p>x</p>", "var p = document.getElementById('p'); console.log(getComputedStyle(p).color, getComputedStyle(p).display, getComputedStyle(p).marginTop, getComputedStyle(p).textAlign)", "rgb(0, 0, 0) block 16px left"));
   CHECK(is("<html><body><p id=p>x</p><script>console.log(getComputedStyle(document.getElementById('p')).color)</script></body></html>", "rgb(232, 232, 232)") == false || true);
   CHECK(js("<p>x</p>", "console.log(CSS.escape('a.b#c'), CSS.escape('1a'), typeof CSS.supports)", "a\\.b\\#c \\31 a function"));
@@ -449,6 +467,26 @@ static void test_page_rendering() {
     dark.dark = true;
     page.set_media(dark);
     CHECK(page.changed());
+  }
+  {   // :hover and :active follow the pointer
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><head><style>.b { color: red } .b:hover { color: blue } .b:active { color: lime }</style></head><body><div><span class=b>x</span></div><p>other</p></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(doc.run(0).color == 0xFFFF0000 && !page.changed());
+    const uint32_t over = doc.run(0).node;
+    page.set_pointer(over, false);
+    CHECK(page.changed());
+    page.render(&doc);
+    CHECK(doc.run(0).color == 0xFF0000FF);
+    page.set_pointer(over, true);
+    page.render(&doc);
+    CHECK(doc.run(0).color == 0xFF00FF00);
+    page.set_pointer(0, false);
+    page.render(&doc);
+    CHECK(doc.run(0).color == 0xFFFF0000);
   }
   {   // linked style sheets are fetched, and ones scripts add too
     FakeEnvironment env(a);
@@ -1979,6 +2017,11 @@ static void test_messaging() {
   CHECK(async_is("addEventListener('message', function (e) { var d = e.data; console.log(e.type, e.origin, e.source === window, e.ports.length, e.lastEventId === '', d.a.length, d.a[1].b, d.d instanceof Date, d.d.getTime(), 'u' in d, d.u, isNaN(d.n), 1 / d.z, d.s, d === msg, e instanceof MessageEvent) });"
                   "var msg = { a: [1, { b: 2 }], d: new Date(5), u: undefined, n: NaN, z: -0, s: 'ü' }; postMessage(msg, '*'); console.log('posted');",
                   "posted | message https://app.example true 0 true 2 2 true 5 true undefined true -Infinity \xC3\xBC false true"));
+  // unhandled rejections, the error event and idle callbacks
+  CHECK(async_is("window.addEventListener('unhandledrejection', function (e) { console.log('ur', e.reason, e.promise instanceof Promise, typeof e.preventDefault); e.preventDefault(); }); Promise.reject('boom');", "ur boom true function"));
+  CHECK(async_is("window.onunhandledrejection = function (e) { console.log('on', e.reason.message); e.preventDefault(); }; (async function () { throw new Error('inner'); })();", "on inner"));
+  CHECK(async_is("window.addEventListener('error', function (e) { console.log('err', typeof e.message); }); document.body.addEventListener('click', function () { throw new Error('x'); }); document.body.click();", "err string | error: Uncaught Error: x (in click) | script error: Error: x"));
+  CHECK(async_is("var order = []; var id = requestIdleCallback(function (d) { order.push('idle:' + d.didTimeout + typeof d.timeRemaining()); }); var gone = requestIdleCallback(function () { order.push('NO'); }); cancelIdleCallback(gone); setTimeout(function () { console.log(order.join()); }, 50);", "idle:falsenumber"));
   CHECK(async_is("var got = []; onmessage = function (e) { got.push(e.data) }; postMessage(1, '*'); postMessage('two'); postMessage([3], { targetOrigin: '*' }); postMessage(null, '/'); setTimeout(function () { console.log(JSON.stringify(got)) }, 10);", "[1,\"two\",[3],null]"));
   CHECK(async_is("var got = 0; onmessage = function () { got++ }; postMessage('x', 'https://other.example'); postMessage('x', 'https://app.example'); postMessage('y', 'https://app.example:443/path'); try { postMessage('x', 'not an origin') } catch (e) { console.log(e.name) } setTimeout(function () { console.log(got) }, 10);", "SyntaxError | 2"));
   CHECK(async_is("try { postMessage(function () {}, '*') } catch (e) { console.log(e.name, e.code) } try { postMessage({ f: function () {} }, '*') } catch (e) { console.log(e.name) } try { postMessage(document.body, '*') } catch (e) { console.log(e.name) } try { postMessage() } catch (e) { console.log(e.name) }", "DataCloneError 25 | DataCloneError | DataCloneError | TypeError"));

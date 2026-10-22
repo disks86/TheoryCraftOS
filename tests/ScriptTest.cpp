@@ -537,6 +537,27 @@ static void test_promises() {
   }
 }
 
+static void test_collections() {
+  CHECK(is("var m = new Map(); m.set('a', 1).set('b', 2); m.set('a', 3); [m.size, m.get('a'), m.has('b'), m.has('c'), m.get('c')].join()", "2,3,true,false,"));
+  CHECK(is("var m = new Map([[1, 'x'], [2, 'y']]); var out = []; for (var e of m) out.push(e[0] + e[1]); out.join()", "1x,2y"));
+  CHECK(is("var o = {}, p = {}; var m = new Map(); m.set(o, 'o').set(p, 'p').set(NaN, 'n').set(0, 'z'); [m.get(o), m.get(p), m.get({}), m.get(NaN), m.get(-0)].join()", "o,p,,n,z"));
+  CHECK(is("var m = new Map([['a', 1], ['b', 2], ['c', 3]]); m.delete('b'); var k = []; m.forEach(function (v, key) { k.push(key + v); }); k.join() + ' ' + m.size", "a1,c3 2"));
+  CHECK(is("var m = new Map([['a', 1], ['b', 2], ['c', 3]]); var seen = []; for (var e of m) { seen.push(e[0]); if (e[0] === 'a') m.delete('b'); } seen.join()", "a,c"));
+  CHECK(is("var m = new Map([['a', 1]]); var seen = []; for (var e of m) { seen.push(e[0]); if (seen.length < 3) m.set('k' + seen.length, 0); } seen.join()", "a,k1,k2"));
+  CHECK(is("var m = new Map([['a', 1]]); m.clear(); [m.size, m.has('a')].join()", "0,false"));
+  CHECK(is("var m = new Map([['a', 1], ['b', 2]]); Array.from(m.keys()).join() + '|' + Array.from(m.values()).join() + '|' + Array.from(m.entries()).join(';')", "a,b|1,2|a,1;b,2"));
+  CHECK(is("var s = new Set([1, 2, 2, 3, 1]); [s.size, s.has(2), s.has(9)].join() + ' ' + Array.from(s).join()", "3,true,false 1,2,3"));
+  CHECK(is("var s = new Set(); s.add('x').add('y'); s.delete('x'); [s.size, Array.from(s).join()].join(' ')", "1 y"));
+  CHECK(is("var s = new Set([1, 2, 3]); var t = new Set([2, 3, 4]); Array.from(s.union(t)).join() + '|' + Array.from(s.intersection(t)).join() + '|' + Array.from(s.difference(t)).join()", "1,2,3,4|2,3|1"));
+  CHECK(is("var r = 'no'; try { Map(); } catch (e) { r = e instanceof TypeError ? 'type' : 'other'; } r", "type"));
+  CHECK(is("var big = new Map(); for (var i = 0; i < 3000; i++) big.set('k' + i, i); for (var j = 0; j < 2990; j++) big.delete('k' + j); [big.size, big.get('k2995'), big.has('k5')].join()", "10,2995,false"));
+  CHECK(is("var w = new WeakMap(); var k = {}; w.set(k, 5); [w.get(k), w.has(k), w.has({}), w.delete(k), w.has(k)].join()", "5,true,false,true,false"));
+  CHECK(is("var w = new WeakSet(); var k = {}; w.add(k); [w.has(k), w.has({})].join()", "true,false"));
+  CHECK(is("var r = ''; try { new WeakMap().set(1, 2); } catch (e) { r = e.message; } r", "Invalid value used as weak map key"));
+  CHECK(is("var r = Reflect.construct(Array, [3]); [r.length, Reflect.has({a: 1}, 'a'), Reflect.get({a: 4}, 'a'), Reflect.ownKeys({x: 1, y: 2}).join(), Object.is(NaN, NaN), Object.is(0, -0)].join()", "3,true,4,x,y,true,false"));
+  CHECK(is("JSON.stringify(Object.fromEntries(new Map([['a', 1], ['b', 2]])))", "{\"a\":1,\"b\":2}"));
+}
+
 static void test_async_functions() {
   CHECK(after("var log = []; async function f(x) { log.push('f1'); var y = await x; log.push('f2:' + y); return y * 2; } f(21).then(v => log.push('r' + v)); log.push('after');", "log.join()", "f1,after,f2:21,r42"));
   CHECK(is("async function f() {} typeof f() + ',' + (f() instanceof Promise)", "object,true"));
@@ -615,6 +636,7 @@ int main() {
   test_host_integration();
   test_json();
   test_promises();
+  test_collections();
   test_async_functions();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

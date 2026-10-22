@@ -792,6 +792,7 @@ uint32_t media_changed_impl(DomBindings::Impl& c) {
         String text(vm.allocator());
         vm.take_exception(&text);
         if (c.error_count++ == 0) c.first_error.assign(text.view());
+        fire_error_event(c, text.view());
       }
     }
     Value list;
@@ -811,6 +812,7 @@ uint32_t media_changed_impl(DomBindings::Impl& c) {
           String text(vm.allocator());
           vm.take_exception(&text);
           if (c.error_count++ == 0) c.first_error.assign(text.view());
+        fire_error_event(c, text.view());
         }
       }
     }

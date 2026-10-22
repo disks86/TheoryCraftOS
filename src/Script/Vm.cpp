@@ -2198,6 +2198,17 @@ void Vm::report_rejections() {
     JsObject* p = rejections_->items[i].as_object();
     if (p->position & kPromiseHandled) continue;
     p->position |= kPromiseHandled;
+    Value hook;
+    if (get_named(Value::make_object(global()), "__unhandled_rejection", &hook) && is_callable(hook)) {   // the page may handle (and prevent) it: window "unhandledrejection"
+      const Value hook_args[2] = {Value::make_object(p), p->bound_this};
+      Value prevented;
+      if (call(hook, Value(), hook_args, 2, &prevented)) {
+        if (to_boolean(prevented)) continue;
+      } else {
+        Value ignored;
+        take_exception_value(&ignored);
+      }
+    }
     if (!host_) continue;
     String line(allocator_);
     line.append("Uncaught (in promise) ");

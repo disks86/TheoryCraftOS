@@ -341,6 +341,71 @@ NATIVE(computed_item) {
 
 Value make_style_object(DomBindings::Impl& c, dom::Node* element) { return Value::make_object(c.vm.new_host_object(c.style_proto, &kStyleClass, element)); }
 
+namespace {
+
+void fixed_px(int32_t px100, String* out) {
+  if (px100 < 0) {
+    out->push_back('-');
+    px100 = -px100;
+  }
+  out->append_uint(static_cast<uint32_t>(px100 / 100));
+  if (px100 % 100) {
+    out->push_back('.');
+    out->push_back(static_cast<char>('0' + (px100 % 100) / 10));
+    if (px100 % 10) out->push_back(static_cast<char>('0' + px100 % 10));
+  }
+  out->append("px");
+}
+
+void length_text(const Length& l, String* out) {
+  switch (l.kind) {
+    case Length::Px: fixed_px(l.px100, out); break;
+    case Length::MinContent: out->append("min-content"); break;
+    case Length::MaxContent: out->append("max-content"); break;
+    case Length::FitContent: out->append("fit-content"); break;
+    case Length::None: out->append("none"); break;
+    default: out->append("auto"); break;
+  }
+}
+
+const char* place_text(Place p) {
+  switch (p) {
+    case Place::Start: return "start";
+    case Place::End: return "end";
+    case Place::Center: return "center";
+    case Place::Stretch: return "stretch";
+    case Place::Baseline: return "baseline";
+    case Place::SpaceBetween: return "space-between";
+    case Place::SpaceAround: return "space-around";
+    case Place::SpaceEvenly: return "space-evenly";
+    case Place::FlexStart: return "flex-start";
+    case Place::FlexEnd: return "flex-end";
+    case Place::Left: return "left";
+    case Place::Right: return "right";
+    case Place::Auto: return "auto";
+    default: return "normal";
+  }
+}
+
+const char* border_style_text(BorderStyle b) {
+  switch (b) {
+    case BorderStyle::Hidden: return "hidden";
+    case BorderStyle::Dotted: return "dotted";
+    case BorderStyle::Dashed: return "dashed";
+    case BorderStyle::Solid: return "solid";
+    case BorderStyle::Double: return "double";
+    case BorderStyle::Groove: return "groove";
+    case BorderStyle::Ridge: return "ridge";
+    case BorderStyle::Inset: return "inset";
+    case BorderStyle::Outset: return "outset";
+    default: return "none";
+  }
+}
+
+const char* overflow_text(Overflow o) { return o == Overflow::Hidden ? "hidden" : o == Overflow::Scroll ? "scroll" : o == Overflow::Auto ? "auto" : "visible"; }
+
+}  // namespace
+
 Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   Vm& vm = c.vm;
   JsObject* o = vm.new_object(c.computed_proto);
@@ -348,52 +413,138 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   const bool known = element && element->is_element() && c.host.computed_style(element, &s);
   auto set = [&](const char* name, StringView value) { vm.define_named(o, name, str_value(vm, value)); };
   String t(vm.allocator());
-  if (known) {
-    const bool dark = c.host.media().dark;
-    rgb_text(s.color ? s.color : (dark ? 0xE8E8E8 : 0x000000), &t);
-    set("color", t.view());
-    t.clear();
-    if (s.background) rgb_text(s.background, &t);
-    else t.assign("rgba(0, 0, 0, 0)");
-    set("backgroundColor", t.view());
-    set("display", s.display == Display::None ? "none" : s.display == Display::Block ? "block" : s.display == Display::ListItem ? "list-item" : "inline");
-    set("visibility", s.hidden ? "hidden" : "visible");
-    set("fontWeight", s.bold ? "700" : "400");
-    set("textAlign", s.align == 1 ? "center" : s.align == 2 ? "right" : "left");
-    set("textDecoration", s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none");
-    set("textDecorationLine", s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none");
-    set("textTransform", s.transform == 1 ? "uppercase" : s.transform == 2 ? "lowercase" : "none");
-    set("whiteSpace", s.pre ? "pre" : "normal");
-    set("listStyleType", s.list_none ? "none" : "disc");
-    const struct {
-      const char* name;
-      uint32_t px;
-    } kBox[] = {{"marginTop", s.margin_top * 16u}, {"marginBottom", s.margin_bottom * 16u}, {"marginLeft", s.margin_left * 8u}, {"paddingTop", s.padding_top * 16u},
-                {"paddingBottom", s.padding_bottom * 16u}, {"paddingLeft", s.padding_left * 8u}};
-    for (const auto& b : kBox) {
-      t.clear();
-      px_text(b.px, &t);
-      set(b.name, t.view());
-    }
-  } else {
+  if (!known) {
     set("display", "");
+    return Value::make_object(o);
   }
-  for (const char* k : {"marginRight", "paddingRight", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth", "top", "left", "right", "bottom"}) set(k, "0px");
-  set("width", "auto");
-  set("height", "auto");
-  set("position", "static");
-  set("float", "none");
-  set("cssFloat", "none");
-  set("overflow", "visible");
-  set("opacity", "1");
-  set("zIndex", "auto");
+  const bool dark = c.host.media().dark;
+  const uint32_t text_color = s.color ? s.color : (dark ? 0xE8E8E8 : 0x000000);
+  rgb_text(text_color, &t);
+  set("color", t.view());
+  t.clear();
+  if (s.background) rgb_text(s.background, &t);
+  else t.assign("rgba(0, 0, 0, 0)");
+  set("backgroundColor", t.view());
+  t.clear();
+  const char* display = s.display == Display::None ? "none" : s.contents ? "contents" : "inline";
+  if (s.display != Display::None && !s.contents) {
+    switch (s.layout) {
+      case Layout::Flex: display = s.inline_box ? "inline-flex" : "flex"; break;
+      case Layout::Grid: display = s.inline_box ? "inline-grid" : "grid"; break;
+      case Layout::Table: display = s.inline_box ? "inline-table" : "table"; break;
+      case Layout::TableRowGroup: display = "table-row-group"; break;
+      case Layout::TableRow: display = "table-row"; break;
+      case Layout::TableCell: display = "table-cell"; break;
+      case Layout::TableCaption: display = "table-caption"; break;
+      default: display = s.display == Display::ListItem ? "list-item" : s.display == Display::Block ? (s.inline_box ? "inline-block" : "block") : "inline"; break;
+    }
+  }
+  set("display", display);
+  set("visibility", s.hidden ? "hidden" : "visible");
+  set("fontWeight", s.bold ? "700" : "400");
+  set("fontStyle", s.italic ? "italic" : "normal");
+  set("textAlign", s.justify ? "justify" : s.align == 1 ? "center" : s.align == 2 ? "right" : "left");
+  const char* decoration = s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none";
+  set("textDecoration", decoration);
+  set("textDecorationLine", decoration);
+  set("textTransform", s.transform == 1 ? "uppercase" : s.transform == 2 ? "lowercase" : s.transform == 3 ? "capitalize" : "none");
+  static const char* const kWhite[] = {"normal", "nowrap", "pre", "pre-wrap", "pre-line", "break-spaces"};
+  set("whiteSpace", kWhite[s.white_space < 6 ? s.white_space : 0]);
+  static const char* const kList[] = {"disc", "circle", "square", "decimal", "lower-alpha", "upper-alpha", "lower-roman", "upper-roman", "none", "decimal-leading-zero"};
+  set("listStyleType", s.list_none ? "none" : kList[s.list_type < 10 ? s.list_type : 0]);
+  t.clear();
+  fixed_px(static_cast<int32_t>(s.font_px) * 100, &t);
+  set("fontSize", t.view());
+  t.clear();
+  fixed_px(s.line_height_px100 >= 0 ? s.line_height_px100 : 1600, &t);
+  set("lineHeight", t.view());
+  set("fontFamily", s.code ? "monospace" : "monospace");
+  set("verticalAlign", s.vertical_align == 1 ? "top" : s.vertical_align == 2 ? "middle" : s.vertical_align == 3 ? "bottom" : "baseline");
+  // the box
+  static const char* const kMargin[4] = {"marginTop", "marginRight", "marginBottom", "marginLeft"};
+  static const char* const kPadding[4] = {"paddingTop", "paddingRight", "paddingBottom", "paddingLeft"};
+  static const char* const kWidth[4] = {"borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth"};
+  static const char* const kStyle[4] = {"borderTopStyle", "borderRightStyle", "borderBottomStyle", "borderLeftStyle"};
+  static const char* const kColor[4] = {"borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor"};
+  static const char* const kInset[4] = {"top", "right", "bottom", "left"};
+  for (int i = 0; i < 4; ++i) {
+    t.clear();
+    length_text(s.margin[i], &t);
+    set(kMargin[i], t.view());
+    t.clear();
+    length_text(s.padding[i], &t);
+    set(kPadding[i], t.view());
+    t.clear();
+    fixed_px(s.border_style[i] == BorderStyle::None || s.border_style[i] == BorderStyle::Hidden ? 0 : s.border_px100[i], &t);
+    set(kWidth[i], t.view());
+    set(kStyle[i], border_style_text(s.border_style[i]));
+    t.clear();
+    rgb_text(s.border_color[i] ? s.border_color[i] : text_color, &t);
+    set(kColor[i], t.view());
+    t.clear();
+    length_text(s.inset[i], &t);
+    set(kInset[i], t.view());
+  }
+  const struct {
+    const char* name;
+    const Length* length;
+  } kSizes[] = {{"width", &s.width}, {"height", &s.height}, {"minWidth", &s.min_width}, {"minHeight", &s.min_height}, {"maxWidth", &s.max_width}, {"maxHeight", &s.max_height},
+                {"flexBasis", &s.flex_basis}, {"rowGap", &s.row_gap}, {"columnGap", &s.column_gap}};
+  for (const auto& z : kSizes) {
+    t.clear();
+    length_text(*z.length, &t);
+    if (t.view().equals("auto") && (z.name[0] == 'r' || z.name[0] == 'c')) t.assign("normal");
+    set(z.name, t.view());
+  }
+  set("boxSizing", s.sizing == BoxSizing::BorderBox ? "border-box" : "content-box");
+  static const char* const kPosition[] = {"static", "relative", "absolute", "fixed", "sticky"};
+  set("position", kPosition[static_cast<int>(s.position)]);
+  const char* side = s.float_side == Float::Left ? "left" : s.float_side == Float::Right ? "right" : "none";
+  set("float", side);
+  set("cssFloat", side);
+  set("clear", s.clear == Clear::Left ? "left" : s.clear == Clear::Right ? "right" : s.clear == Clear::Both ? "both" : "none");
+  set("overflowX", overflow_text(s.overflow_x));
+  set("overflowY", overflow_text(s.overflow_y));
+  set("overflow", s.overflow_x == s.overflow_y ? overflow_text(s.overflow_x) : "visible");
+  set("opacity", s.opaque_zero ? "0" : "1");
+  t.clear();
+  if (s.z_index == 0 && s.position == Position::Static) t.assign("auto");
+  else {
+    if (s.z_index < 0) t.push_back('-');
+    t.append_uint(static_cast<uint32_t>(s.z_index < 0 ? -static_cast<int64_t>(s.z_index) : s.z_index));
+  }
+  set("zIndex", t.view());
   set("cursor", "auto");
-  set("boxSizing", "content-box");
-  set("fontSize", "16px");
-  set("fontStyle", "normal");
-  set("fontFamily", "monospace");
-  set("lineHeight", "16px");
-  set("verticalAlign", "baseline");
+  // flex and grid
+  static const char* const kDirection[] = {"row", "row-reverse", "column", "column-reverse"};
+  set("flexDirection", kDirection[static_cast<int>(s.flex_direction)]);
+  set("flexWrap", s.flex_wrap == FlexWrap::Wrap ? "wrap" : s.flex_wrap == FlexWrap::WrapReverse ? "wrap-reverse" : "nowrap");
+  set("justifyContent", place_text(s.justify_content));
+  set("alignItems", place_text(s.align_items));
+  set("alignContent", place_text(s.align_content));
+  set("alignSelf", place_text(s.align_self));
+  set("justifyItems", place_text(s.justify_items));
+  set("justifySelf", place_text(s.justify_self));
+  t.clear();
+  t.append_uint(static_cast<uint32_t>(s.flex_grow_x100 / 100));
+  if (s.flex_grow_x100 % 100) {
+    t.push_back('.');
+    t.append_uint(static_cast<uint32_t>(s.flex_grow_x100 % 100));
+  }
+  set("flexGrow", t.view());
+  t.clear();
+  t.append_uint(static_cast<uint32_t>(s.flex_shrink_x100 / 100));
+  if (s.flex_shrink_x100 % 100) {
+    t.push_back('.');
+    t.append_uint(static_cast<uint32_t>(s.flex_shrink_x100 % 100));
+  }
+  set("flexShrink", t.view());
+  t.clear();
+  if (s.order < 0) t.push_back('-');
+  t.append_uint(static_cast<uint32_t>(s.order < 0 ? -static_cast<int64_t>(s.order) : s.order));
+  set("order", t.view());
+  set("gridTemplateColumns", s.grid_template_columns.empty() ? "none" : "");
+  set("gridTemplateRows", s.grid_template_rows.empty() ? "none" : "");
   return Value::make_object(o);
 }
 

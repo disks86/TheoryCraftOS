@@ -1912,6 +1912,7 @@ bool supports_condition(StringView text) {
 }  // namespace
 
 void StyleSheet::clear() {
+  pointer_state_ = false;
   pool_.clear();
   selectors_.clear();
   declarations_.clear();
@@ -2026,6 +2027,7 @@ bool StyleSheet::parse_block(StringView css, uint64_t* at, bool nested) {
 }
 
 bool StyleSheet::parse_rule(StringView prelude, StringView body) {
+  if (prelude.contains(":hover") || prelude.contains(":active") || prelude.contains(":focus-within")) pointer_state_ = true;
   const uint32_t rule = static_cast<uint32_t>(rules_.count());
   if (!add_declarations(body, rule)) return false;
   if (rules_[rule].declaration_count == 0) {

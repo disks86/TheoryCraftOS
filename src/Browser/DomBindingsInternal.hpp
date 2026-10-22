@@ -40,6 +40,7 @@ struct DomBindings::Impl {
                    *storage_proto = nullptr, *location_proto = nullptr, *history_proto = nullptr, *media_query_proto = nullptr, *exception_proto = nullptr,
                    *canvas_context_proto = nullptr, *gradient_proto = nullptr, *pattern_proto = nullptr, *path2d_proto = nullptr, *typed_array_proto = nullptr,
                    *image_data_proto = nullptr, *text_metrics_proto = nullptr, *thenable_proto = nullptr, *time_ranges_proto = nullptr;
+  script::JsObject* tag_protos = nullptr;     // tag name -> the prototype of its interface (HTMLInputElement.prototype ...)
   script::JsObject* wrappers = nullptr;       // every wrapper made (kept alive)
   script::JsObject* media_lists = nullptr;    // the MediaQueryList objects given out
   script::JsObject* window_listeners = nullptr;
@@ -48,6 +49,7 @@ struct DomBindings::Impl {
   script::JsObject* session_storage = nullptr;
   dom::Node* current_script = nullptr;
   uint32_t error_count = 0;
+  bool in_error_event = false;
   String first_error;
   List<CustomValidity> custom_validity;   // setCustomValidity() messages of controls
   int32_t scroll_line = 0;
@@ -134,5 +136,8 @@ Value make_dataset(DomBindings::Impl& c, dom::Node* element);
 // The camel-case name of a CSS property and back ("backgroundColor" <-> "background-color").
 void css_name_from_js(StringView js, String* out);
 void js_name_from_css(StringView css, String* out);
+// Fires `error` on the window for an uncaught exception in an event handler, hook or timer (text: what the exception said).
+void fire_error_event(DomBindings::Impl& c, StringView text);
 }  // namespace bind
+
 }  // namespace browser

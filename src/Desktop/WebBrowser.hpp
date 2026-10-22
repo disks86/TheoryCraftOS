@@ -188,6 +188,7 @@ class WebBrowser : public gui::Frame {
   static void on_link(void* self, gui::Control&);
   static void on_hover(void* self, gui::Control&);
   static void on_node_click(void* self, gui::Control&);
+  static void on_pointer(void* self, gui::Control&);
   static void on_form_key(void* self, gui::Control&);
   static void on_view_resized(void* self, gui::Control&);
   static void on_timers(void* self, gui::Control&);
@@ -247,7 +248,7 @@ class WebBrowser : public gui::Frame {
   bool canvas_accelerated_ = false;
   bool scripts_enabled_ = true, dark_ = false;
   gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr;
-  gui::Handler node_handler_, resize_handler_, timer_handler_, key_handler_;
+  gui::Handler pointer_handler_, node_handler_, resize_handler_, timer_handler_, key_handler_;
   Env env_;
   UniquePointer<browser::Page> live_;
   browser::MediaEnvironment media_;

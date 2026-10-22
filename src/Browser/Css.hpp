@@ -251,6 +251,8 @@ class StyleSheet {
   bool parse(StringView css, const MediaEnvironment& env = MediaEnvironment());
   void clear();
   uint32_t rule_count() const { return static_cast<uint32_t>(rules_.count()); }
+  // Does a rule depend on the pointer (:hover, :active, :focus-within)? Then the page is drawn again when the pointer moves on to another element.
+  bool uses_pointer_state() const { return pointer_state_; }
 
   // Applies what the sheet says about the element to `style` (which starts as the parent's inherited style with the defaults of the element's kind), then
   // `inline_style` (the style attribute) on top. `parent` is the parent's style: what the keyword `inherit` copies and the font size that em means. With a
@@ -295,6 +297,7 @@ class StyleSheet {
   friend struct CssApply;
 
   allocators::IAllocator& allocator_;
+  bool pointer_state_ = false;
   String pool_;
   dom::SelectorSet selectors_;
   const MediaEnvironment* env_ = nullptr;

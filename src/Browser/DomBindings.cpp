@@ -175,7 +175,12 @@ JsObject* DomBindings::wrap(dom::Node* node) {
     case dom::NodeType::Comment: proto = c.comment_proto; break;
     case dom::NodeType::Document: proto = c.document_proto; break;
     case dom::NodeType::Fragment: proto = c.fragment_proto; break;
-    default: break;
+    default:
+      if (node->is_element() && c.tag_protos) {
+        Value tagged;
+        if (vm_.get_plain(c.tag_protos, vm_.intern(node->name.view()), &tagged) && tagged.is_object()) proto = tagged.as_object();
+      }
+      break;
   }
   JsObject* w = vm_.new_host_object(proto, &bind::kNodeHostClass, node);
   node->script = w;
@@ -225,6 +230,7 @@ bool DomBindings::call_hook(StringView name, const HookArg* args, uint32_t count
     String text(vm_.allocator());
     vm_.take_exception(&text);
     if (c.error_count++ == 0) c.first_error.assign(text.view());
+        bind::fire_error_event(c, text.view());
     if (vm_.host()) {
       String line(vm_.allocator());
       line.append("Uncaught ");

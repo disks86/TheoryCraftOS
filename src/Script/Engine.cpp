@@ -98,13 +98,270 @@ const char kPrelude[] =
     "  };\n"
     "})();\n";
 
+// Map, Set, WeakMap, WeakSet, WeakRef and Reflect, written in the language itself.
+const char kCollections[] = R"JSLIB((function (g) {
+  var ITER = Symbol.iterator;
+  var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true }); };
+  var nextId = 1;
+  // The key of a value in a Map or Set: primitives by type and text, objects by an id they carry (SameValueZero: NaN is NaN, -0 is 0).
+  function keyOf(map, value) {
+    var t = typeof value;
+    if (t === 'string') return 's' + value;
+    if (t === 'number') return 'n' + value;
+    if (t === 'boolean') return value ? 'bt' : 'bf';
+    if (value === undefined) return 'u';
+    if (value === null) return 'l';
+    if (t === 'symbol') return 'y' + String(value);
+    var id = value.__oid;
+    if (id === undefined) {
+      id = nextId++;
+      try { Object.defineProperty(value, '__oid', { value: id }); } catch (e) { return 'x' + (map.__loose.push(value) - 1); }
+    }
+    return 'o' + id;
+  }
+  function Table() {
+    this.keys = []; this.values = []; this.alive = []; this.index = {}; this.live = 0; this.dead = 0; this.iterators = []; this.loose = [];
+  }
+  function find(table, value) {
+    var t = typeof value;
+    if (t === 'object' || t === 'function') {
+      if (value === null) return table.index['l'];
+      if (value.__oid === undefined) {
+        for (var i = 0; i < table.loose.length; i++) if (table.loose[i] === value) return table.index['x' + i];
+        try { Object.defineProperty(value, '__oid', { value: nextId++ }); } catch (e) { return undefined; }
+      }
+      return table.index['o' + value.__oid];
+    }
+    return table.index[keyOf(table, value)];
+  }
+  function put(table, key, value) {
+    if (key === 0) key = 0;
+    var at = find(table, key);
+    if (at !== undefined) { table.values[at] = value; return; }
+    var name;
+    var t = typeof key;
+    if ((t === 'object' || t === 'function') && key !== null && key.__oid === undefined) {
+      try { Object.defineProperty(key, '__oid', { value: nextId++ }); name = 'o' + key.__oid; }
+      catch (e) { name = 'x' + table.loose.length; table.loose.push(key); }
+    } else if ((t === 'object' || t === 'function') && key !== null) {
+      name = 'o' + key.__oid;
+    } else {
+      name = keyOf(table, key);
+    }
+    table.index[name] = table.keys.length;
+    table.keys.push(key); table.values.push(value); table.alive.push(true); table.names = table.names || []; table.names.push(name);
+    table.live++;
+  }
+  function remove(table, key) {
+    var at = find(table, key);
+    if (at === undefined) return false;
+    delete table.index[table.names[at]];
+    table.alive[at] = false; table.keys[at] = undefined; table.values[at] = undefined;
+    table.live--; table.dead++;
+    if (table.dead > 1024 && table.dead > 2 * table.live) compact(table);
+    return true;
+  }
+  function compact(table) {
+    var keys = [], values = [], alive = [], names = [], remap = [], index = {};
+    for (var i = 0; i < table.keys.length; i++) {
+      remap.push(keys.length);
+      if (!table.alive[i]) continue;
+      index[table.names[i]] = keys.length;
+      keys.push(table.keys[i]); values.push(table.values[i]); alive.push(true); names.push(table.names[i]);
+    }
+    remap.push(keys.length);
+    for (var j = 0; j < table.iterators.length; j++) table.iterators[j].at = remap[Math.min(table.iterators[j].at, remap.length - 1)];
+    table.keys = keys; table.values = values; table.alive = alive; table.names = names; table.index = index; table.dead = 0;
+  }
+  function clearTable(table) {
+    for (var j = 0; j < table.iterators.length; j++) table.iterators[j].at = 0;
+    table.keys = []; table.values = []; table.alive = []; table.names = []; table.index = {}; table.live = 0; table.dead = 0; table.loose = [];
+  }
+  function iterator(owner, kind, name) {
+    var it = { at: 0, done: false };
+    var table = owner.__t;
+    table.iterators.push(it);
+    var result = {
+      next: function () {
+        if (!it.done) {
+          while (it.at < table.keys.length && !table.alive[it.at]) it.at++;
+          if (it.at < table.keys.length) {
+            var i = it.at++;
+            return { value: kind === 0 ? table.keys[i] : kind === 1 ? table.values[i] : [table.keys[i], table.values[i]], done: false };
+          }
+          it.done = true;
+          var pos = table.iterators.indexOf(it);
+          if (pos >= 0) table.iterators.splice(pos, 1);
+        }
+        return { value: undefined, done: true };
+      }
+    };
+    def(result, ITER, function () { return this; });
+    def(result, 'toString', function () { return '[object ' + name + ']'; });
+    return result;
+  }
+  function needNew(self, ctor, name) { if (!(self instanceof ctor)) throw new TypeError("Constructor " + name + " requires 'new'"); }
+  function Map(iterable) {
+    needNew(this, Map, 'Map');
+    def(this, '__t', new Table());
+    this.size = 0;
+    if (iterable !== undefined && iterable !== null) {
+      var self = this;
+      for (var entry of iterable) {
+        if (entry === null || (typeof entry !== 'object' && typeof entry !== 'function')) throw new TypeError('Iterator value ' + String(entry) + ' is not an entry object');
+        self.set(entry[0], entry[1]);
+      }
+    }
+  }
+  var MP = Map.prototype;
+  def(MP, 'get', function (k) { var at = find(this.__t, k); return at === undefined ? undefined : this.__t.values[at]; });
+  def(MP, 'set', function (k, v) { put(this.__t, k, v); this.size = this.__t.live; return this; });
+  def(MP, 'has', function (k) { return find(this.__t, k) !== undefined; });
+  def(MP, 'delete', function (k) { var r = remove(this.__t, k); this.size = this.__t.live; return r; });
+  def(MP, 'clear', function () { clearTable(this.__t); this.size = 0; });
+  def(MP, 'forEach', function (fn, thisArg) {
+    if (typeof fn !== 'function') throw new TypeError(String(fn) + ' is not a function');
+    var it = iterator(this, 2, 'Map Iterator'), step;
+    while (!(step = it.next()).done) fn.call(thisArg, step.value[1], step.value[0], this);
+  });
+  def(MP, 'keys', function () { return iterator(this, 0, 'Map Iterator'); });
+  def(MP, 'values', function () { return iterator(this, 1, 'Map Iterator'); });
+  def(MP, 'entries', function () { return iterator(this, 2, 'Map Iterator'); });
+  def(MP, ITER, MP.entries);
+  def(MP, 'toString', function () { return '[object Map]'; });
+  def(g, 'Map', Map);
+
+  function Set(iterable) {
+    needNew(this, Set, 'Set');
+    def(this, '__t', new Table());
+    this.size = 0;
+    if (iterable !== undefined && iterable !== null) for (var v of iterable) this.add(v);
+  }
+  var SP = Set.prototype;
+  def(SP, 'add', function (v) { put(this.__t, v, v); this.size = this.__t.live; return this; });
+  def(SP, 'has', function (v) { return find(this.__t, v) !== undefined; });
+  def(SP, 'delete', function (v) { var r = remove(this.__t, v); this.size = this.__t.live; return r; });
+  def(SP, 'clear', function () { clearTable(this.__t); this.size = 0; });
+  def(SP, 'forEach', function (fn, thisArg) {
+    if (typeof fn !== 'function') throw new TypeError(String(fn) + ' is not a function');
+    var it = iterator(this, 0, 'Set Iterator'), step;
+    while (!(step = it.next()).done) fn.call(thisArg, step.value, step.value, this);
+  });
+  def(SP, 'values', function () { return iterator(this, 0, 'Set Iterator'); });
+  def(SP, 'keys', SP.values);
+  def(SP, 'entries', function () {
+    var it = iterator(this, 0, 'Set Iterator');
+    var inner = it.next;
+    it.next = function () { var s = inner(); return s.done ? s : { value: [s.value, s.value], done: false }; };
+    return it;
+  });
+  def(SP, ITER, SP.values);
+  def(SP, 'toString', function () { return '[object Set]'; });
+  def(SP, 'union', function (other) { var r = new Set(this); for (var v of other.keys()) r.add(v); return r; });
+  def(SP, 'intersection', function (other) { var r = new Set(); for (var v of this) if (other.has(v)) r.add(v); return r; });
+  def(SP, 'difference', function (other) { var r = new Set(); for (var v of this) if (!other.has(v)) r.add(v); return r; });
+  def(SP, 'symmetricDifference', function (other) { var r = new Set(this); for (var v of other.keys()) { if (this.has(v)) r.delete(v); else r.add(v); } return r; });
+  def(SP, 'isSubsetOf', function (other) { for (var v of this) if (!other.has(v)) return false; return true; });
+  def(SP, 'isSupersetOf', function (other) { for (var v of other.keys()) if (!this.has(v)) return false; return true; });
+  def(SP, 'isDisjointFrom', function (other) { for (var v of this) if (other.has(v)) return false; return true; });
+  def(g, 'Set', Set);
+
+  // Weak collections keep their entries on the key itself, so they go when the key does.
+  var weakId = 1;
+  function weakKey(key, what) {
+    if (key === null || (typeof key !== 'object' && typeof key !== 'function')) throw new TypeError('Invalid value used ' + what);
+    return key;
+  }
+  function WeakMap(iterable) {
+    needNew(this, WeakMap, 'WeakMap');
+    def(this, '__p', '__wm' + weakId++);
+    if (iterable !== undefined && iterable !== null) for (var e of iterable) this.set(e[0], e[1]);
+  }
+  var WMP = WeakMap.prototype;
+  def(WMP, 'get', function (k) { return k !== null && (typeof k === 'object' || typeof k === 'function') && this.__p in k ? k[this.__p] : undefined; });
+  def(WMP, 'set', function (k, v) {
+    weakKey(k, 'as weak map key');
+    if (this.__p in k) k[this.__p] = v;
+    else Object.defineProperty(k, this.__p, { value: v, writable: true, configurable: true });
+    return this;
+  });
+  def(WMP, 'has', function (k) { return k !== null && (typeof k === 'object' || typeof k === 'function') && this.__p in k; });
+  def(WMP, 'delete', function (k) { if (!WMP.has.call(this, k)) return false; delete k[this.__p]; return true; });
+  def(WMP, 'toString', function () { return '[object WeakMap]'; });
+  def(g, 'WeakMap', WeakMap);
+  function WeakSet(iterable) {
+    needNew(this, WeakSet, 'WeakSet');
+    def(this, '__p', '__ws' + weakId++);
+    if (iterable !== undefined && iterable !== null) for (var v of iterable) this.add(v);
+  }
+  var WSP = WeakSet.prototype;
+  def(WSP, 'add', function (k) { weakKey(k, 'in weak set'); if (!(this.__p in k)) Object.defineProperty(k, this.__p, { value: true, writable: true, configurable: true }); return this; });
+  def(WSP, 'has', function (k) { return k !== null && (typeof k === 'object' || typeof k === 'function') && this.__p in k; });
+  def(WSP, 'delete', function (k) { if (!WSP.has.call(this, k)) return false; delete k[this.__p]; return true; });
+  def(WSP, 'toString', function () { return '[object WeakSet]'; });
+  def(g, 'WeakSet', WeakSet);
+  function WeakRef(target) { needNew(this, WeakRef, 'WeakRef'); weakKey(target, 'as WeakRef target'); def(this, '__target', target); }
+  def(WeakRef.prototype, 'deref', function () { return this.__target; });
+  def(g, 'WeakRef', WeakRef);
+  function FinalizationRegistry(callback) { needNew(this, FinalizationRegistry, 'FinalizationRegistry'); }
+  def(FinalizationRegistry.prototype, 'register', function () {});
+  def(FinalizationRegistry.prototype, 'unregister', function () { return false; });
+  def(g, 'FinalizationRegistry', FinalizationRegistry);
+
+  // Array.from / Array.of
+  if (!Array.from) def(Array, 'from', function (source, mapFn, thisArg) {
+    if (source === null || source === undefined) throw new TypeError(String(source) + ' is not iterable');
+    if (mapFn !== undefined && typeof mapFn !== 'function') throw new TypeError(String(mapFn) + ' is not a function');
+    var out = [], i = 0;
+    if (typeof source !== 'string' && typeof source[ITER] === 'function') {
+      for (var v of source) { out.push(mapFn ? mapFn.call(thisArg, v, i) : v); i++; }
+    } else {
+      var n = source.length >>> 0;
+      for (; i < n; i++) out.push(mapFn ? mapFn.call(thisArg, source[i], i) : source[i]);
+    }
+    return out;
+  });
+  if (!Array.of) def(Array, 'of', function () { var out = []; for (var i = 0; i < arguments.length; i++) out.push(arguments[i]); return out; });
+  // Object helpers and Reflect
+  if (!Object.is) def(Object, 'is', function (a, b) { return a === b ? (a !== 0 || 1 / a === 1 / b) : (a !== a && b !== b); });
+  if (!Object.fromEntries) def(Object, 'fromEntries', function (iterable) { var o = {}; for (var e of iterable) o[e[0]] = e[1]; return o; });
+  var Reflect = {
+    apply: function (f, self, args) { return f.apply(self, args); },
+    construct: function (F, args) {
+      var a = args || [];
+      switch (a.length) {
+        case 0: return new F();
+        case 1: return new F(a[0]);
+        case 2: return new F(a[0], a[1]);
+        case 3: return new F(a[0], a[1], a[2]);
+        case 4: return new F(a[0], a[1], a[2], a[3]);
+        case 5: return new F(a[0], a[1], a[2], a[3], a[4]);
+        default: return new F(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+      }
+    },
+    defineProperty: function (o, k, d) { try { Object.defineProperty(o, k, d); return true; } catch (e) { return false; } },
+    deleteProperty: function (o, k) { return delete o[k]; },
+    get: function (o, k) { return o[k]; },
+    set: function (o, k, v) { o[k] = v; return true; },
+    has: function (o, k) { return k in o; },
+    getPrototypeOf: function (o) { return Object.getPrototypeOf(o); },
+    ownKeys: function (o) { return Object.keys(o); },
+    isExtensible: function (o) { return !Object.isFrozen(o); }
+  };
+  def(g, 'Reflect', Reflect);
+}(this));
+)JSLIB";
+
 }  // namespace
 
 Engine::Engine(allocators::IAllocator& allocator, IHost* host) : allocator_(allocator), host_(host), vm_(allocator, host) {
   vm_.set_memory_limit(memory_);
   vm_.set_instruction_budget(budget_);
   String error(allocator_);
-  on_big_stack([&] { run_here(kPrelude, &error, nullptr, nullptr, false); });
+  on_big_stack([&] {
+    run_here(kPrelude, &error, nullptr, nullptr, false);
+    run_here(kCollections, &error, nullptr, nullptr, false);
+  });
 }
 
 void Engine::set_limits(uint64_t instructions, uint64_t memory_bytes) {

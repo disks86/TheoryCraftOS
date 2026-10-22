@@ -1120,6 +1120,48 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     g.dispatchEvent(new MessageEvent('message', { data: data, origin: origin, lastEventId: '', source: windowProxy(sourceId), ports: arrivedPorts(parseIds(idsCsv), found) }));
   });
 
+  // ------------------------------------------------------------------------------------------------------------------- unhandled rejections, idle callbacks
+  function PromiseRejectionEvent(type, init) {
+    if (!(this instanceof PromiseRejectionEvent)) throw typeError("construct 'PromiseRejectionEvent'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (arguments.length < 2 || init === null || typeof init !== 'object' || !('promise' in init)) throw typeError("construct 'PromiseRejectionEvent'", "required member promise is undefined.");
+    var e = new Event(type, init);
+    e.promise = init.promise;
+    e.reason = init.reason;
+    return e;
+  }
+  hide(g, 'PromiseRejectionEvent', PromiseRejectionEvent);
+  hide(g, '__unhandled_rejection', function (promise, reason) {
+    var e = new Event('unhandledrejection', { cancelable: true });
+    e.promise = promise;
+    e.reason = reason;
+    g.dispatchEvent(e);
+    return e.defaultPrevented === true;
+  });
+  hide(g, '__window_error', function (text) {
+    var e = new Event('error', { cancelable: true });
+    e.message = String(text);
+    e.filename = String(g.location && g.location.href || '');
+    e.lineno = 0;
+    e.colno = 0;
+    e.error = null;
+    g.dispatchEvent(e);
+  });
+  var idleHandles = {}, idleNext = 1;
+  hide(g, 'requestIdleCallback', function (callback, options) {
+    if (typeof callback !== 'function') throw typeError("execute 'requestIdleCallback' on 'Window'", 'The callback provided as parameter 1 is not a function.');
+    var id = idleNext++, started = Date.now();
+    var timeout = options && typeof options.timeout === 'number' && options.timeout > 0 ? options.timeout : 0;
+    idleHandles[id] = setTimeout(function () {
+      delete idleHandles[id];
+      var elapsed = Date.now() - started;
+      callback({ didTimeout: timeout > 0 && elapsed >= timeout, timeRemaining: function () { return Math.max(0, 50 - (Date.now() - started - elapsed)); } });
+    }, 1);
+    return id;
+  });
+  hide(g, 'cancelIdleCallback', function (id) {
+    if (idleHandles[id] !== undefined) { clearTimeout(idleHandles[id]); delete idleHandles[id]; }
+  });
+
   // ------------------------------------------------------------------------------------------------------------------- BroadcastChannel
   var channels = {};
   function BroadcastChannel(name) {
@@ -1170,8 +1212,605 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
 }(this));
 )JSPRELUDE";
 
+
+const char kDomPrelude[] = R"JSPRELUDE((function (g) {
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true }); };
+  var method = function (proto, name, fn) { Object.defineProperty(proto, name, { value: fn, writable: true }); };
+  var illegal = function (name) { var f = function () { throw new TypeError('Illegal constructor'); }; Object.defineProperty(f, 'name', { value: name }); return f; };
+  var EP = Element.prototype, NP = Node.prototype, TP = Text.prototype, DP = Document.prototype;
+  var doc = document;
+  var indexOf = function (node) { var i = 0; for (var c = node.parentNode.firstChild; c && c !== node; c = c.nextSibling) i++; return i; };
+  var nodeLength = function (node) { return node.nodeType === 3 || node.nodeType === 8 ? node.data.length : node.childNodes.length; };
+  var isInclusiveAncestor = function (a, b) { for (var n = b; n; n = n.parentNode) if (n === a) return true; return false; };
+  var dom = function (message, name) { return new DOMException(message, name); };
+
+  // ------------------------------------------------------------------------------------------------------------------ event handler properties
+  ['onclick', 'ondblclick', 'onmousedown', 'onmouseup', 'onmousemove', 'onmouseover', 'onmouseout', 'onmouseenter', 'onmouseleave', 'oncontextmenu', 'onwheel', 'onkeydown', 'onkeyup',
+   'onkeypress', 'oninput', 'onchange', 'onfocus', 'onblur', 'onsubmit', 'onreset', 'oninvalid', 'onselect', 'onscroll', 'onload', 'onerror', 'onabort', 'ondrag', 'ondragstart', 'ondragend',
+   'ondragover', 'ondragenter', 'ondragleave', 'ondrop', 'ontouchstart', 'ontouchend', 'ontouchmove', 'ontouchcancel', 'onpointerdown', 'onpointerup', 'onpointermove', 'onpointerover',
+   'onpointerout', 'onpointerenter', 'onpointerleave', 'onpointercancel', 'ontransitionend', 'onanimationend', 'oncopy', 'oncut', 'onpaste', 'oncanplay', 'onplay', 'onpause', 'onended',
+   'ontimeupdate', 'onvolumechange', 'ontoggle', 'onauxclick', 'ongotpointercapture', 'onlostpointercapture'].forEach(function (name) { Object.defineProperty(EP, name, { value: null, writable: true }); });
+  ['onerror', 'onresize', 'onhashchange', 'onpopstate', 'onmessage', 'onmessageerror', 'onstorage', 'onbeforeunload', 'onunload', 'ononline', 'onoffline', 'onfocus', 'onblur', 'onpageshow',
+   'onpagehide', 'onunhandledrejection', 'onrejectionhandled', 'onlanguagechange', 'onclick', 'onkeydown', 'onkeyup', 'oninput', 'onchange', 'onsubmit', 'onscroll', 'onwheel'].forEach(function (name) {
+    if (g[name] === undefined) g[name] = null;
+  });
+  if (doc.onreadystatechange === undefined) doc.onreadystatechange = null;
+
+  // ------------------------------------------------------------------------------------------------------------------ Node extras
+  function sameAttributes(a, b) {
+    var an = a.getAttributeNames(), bn = b.getAttributeNames();
+    if (an.length !== bn.length) return false;
+    for (var i = 0; i < an.length; i++) if (a.getAttribute(an[i]) !== b.getAttribute(an[i])) return false;
+    return true;
+  }
+  method(NP, 'isEqualNode', function (other) {
+    if (other === null || other === undefined) return false;
+    if (this === other) return true;
+    if (this.nodeType !== other.nodeType) return false;
+    if (this.nodeType === 1) {
+      if (this.localName !== other.localName || this.namespaceURI !== other.namespaceURI || !sameAttributes(this, other)) return false;
+    } else if (this.nodeType === 3 || this.nodeType === 8) {
+      if (this.data !== other.data) return false;
+    }
+    var a = this.firstChild, b = other.firstChild;
+    while (a && b) { if (!a.isEqualNode(b)) return false; a = a.nextSibling; b = b.nextSibling; }
+    return !a && !b;
+  });
+  method(NP, 'lookupNamespaceURI', function (prefix) { return prefix === null || prefix === '' ? (this.nodeType === 1 ? this.namespaceURI : null) : (prefix === 'xml' ? 'http://www.w3.org/XML/1998/namespace' : null); });
+  method(NP, 'lookupPrefix', function () { return null; });
+  method(NP, 'isDefaultNamespace', function (ns) { return (ns === null || ns === '') ? !this.namespaceURI : this.namespaceURI === ns; });
+
+  // ------------------------------------------------------------------------------------------------------------------ attributes as nodes
+  function Attr() { throw new TypeError('Illegal constructor'); }
+  hide(g, 'Attr', Attr);
+  function makeAttr(name, value, owner, ns) {
+    var a = Object.create(Attr.prototype);
+    a.name = name; a.localName = name.indexOf(':') >= 0 ? name.slice(name.indexOf(':') + 1) : name; a.prefix = name.indexOf(':') >= 0 ? name.slice(0, name.indexOf(':')) : null;
+    a.namespaceURI = ns || null; a.value = String(value); a.nodeValue = a.value; a.textContent = a.value; a.ownerElement = owner || null; a.specified = true; a.nodeType = 2; a.nodeName = name;
+    return a;
+  }
+  method(Attr.prototype, 'toString', function () { return '[object Attr]'; });
+  method(EP, 'getAttributeNode', function (name) { return this.hasAttribute(name) ? makeAttr(String(name).toLowerCase(), this.getAttribute(name), this) : null; });
+  method(EP, 'getAttributeNodeNS', function (ns, name) { return this.hasAttribute(name) ? makeAttr(name, this.getAttribute(name), this, ns) : null; });
+  method(EP, 'setAttributeNode', function (attr) {
+    var old = this.getAttributeNode(attr.name);
+    this.setAttribute(attr.name, attr.value);
+    attr.ownerElement = this;
+    return old;
+  });
+  method(EP, 'setAttributeNodeNS', EP.setAttributeNode);
+  method(EP, 'removeAttributeNode', function (attr) {
+    if (!this.hasAttribute(attr.name)) throw dom("Failed to execute 'removeAttributeNode' on 'Element': The node provided is not an attribute of this element.", 'NotFoundError');
+    var old = this.getAttributeNode(attr.name);
+    this.removeAttribute(attr.name);
+    return old;
+  });
+  method(EP, 'getAttributeNS', function (ns, name) { return this.getAttribute(name); });
+  method(EP, 'setAttributeNS', function (ns, qname, value) { this.setAttribute(qname, value); });
+  method(EP, 'removeAttributeNS', function (ns, name) { this.removeAttribute(name); });
+  method(EP, 'hasAttributeNS', function (ns, name) { return this.hasAttribute(name); });
+  method(DP, 'createAttribute', function (name) { return makeAttr(String(name).toLowerCase(), '', null); });
+  method(DP, 'createAttributeNS', function (ns, name) { return makeAttr(String(name), '', null, ns); });
+
+  // ------------------------------------------------------------------------------------------------------------------ CharacterData
+  var CD = [TP, Comment.prototype];
+  CD.forEach(function (P) {
+    method(P, 'substringData', function (offset, count) {
+      if (offset > this.data.length) throw dom("Failed to execute 'substringData' on 'CharacterData': The offset " + offset + ' is greater than the node\'s length (' + this.data.length + ').', 'IndexSizeError');
+      return this.data.substr(offset, count);
+    });
+    method(P, 'replaceData', function (offset, count, text) {
+      if (offset > this.data.length) throw dom("Failed to execute 'replaceData' on 'CharacterData': The offset " + offset + ' is greater than the node\'s length (' + this.data.length + ').', 'IndexSizeError');
+      this.data = this.data.slice(0, offset) + String(text) + this.data.slice(offset + count);
+    });
+    method(P, 'appendData', function (text) { this.data = this.data + String(text); });
+    method(P, 'insertData', function (offset, text) { this.replaceData(offset, 0, text); });
+    method(P, 'deleteData', function (offset, count) { this.replaceData(offset, count, ''); });
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------ NodeFilter, TreeWalker, NodeIterator
+  var NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 4294967295, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8, SHOW_ENTITY_REFERENCE: 16, SHOW_ENTITY: 32, SHOW_PROCESSING_INSTRUCTION: 64,
+    SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, SHOW_NOTATION: 2048
+  };
+  hide(g, 'NodeFilter', NodeFilter);
+  function accepts(walker, node) {
+    var bit = Math.pow(2, node.nodeType - 1);
+    if (Math.floor(walker.whatToShow / bit) % 2 !== 1) return 3;
+    var f = walker.filter;
+    if (!f) return 1;
+    if (walker.__active) throw dom('The filter is already running.', 'InvalidStateError');
+    walker.__active = true;
+    try { return (typeof f === 'function' ? f(node) : f.acceptNode(node)) | 0; } finally { walker.__active = false; }
+  }
+  function TreeWalker() { throw new TypeError('Illegal constructor'); }
+  hide(g, 'TreeWalker', TreeWalker);
+  var TW = TreeWalker.prototype;
+  function children(w, first) {
+    var node = first ? w.currentNode.firstChild : w.currentNode.lastChild;
+    while (node) {
+      var r = accepts(w, node);
+      if (r === 1) { w.currentNode = node; return node; }
+      if (r === 3) { var child = first ? node.firstChild : node.lastChild; if (child) { node = child; continue; } }
+      while (node) {
+        var sib = first ? node.nextSibling : node.previousSibling;
+        if (sib) { node = sib; break; }
+        var p = node.parentNode;
+        if (!p || p === w.root || p === w.currentNode) return null;
+        node = p;
+      }
+    }
+    return null;
+  }
+  function siblings(w, next) {
+    var node = w.currentNode;
+    if (node === w.root) return null;
+    while (true) {
+      var sib = next ? node.nextSibling : node.previousSibling;
+      while (sib) {
+        node = sib;
+        var r = accepts(w, node);
+        if (r === 1) { w.currentNode = node; return node; }
+        sib = next ? node.firstChild : node.lastChild;
+        if (r === 2 || !sib) sib = next ? node.nextSibling : node.previousSibling;
+      }
+      node = node.parentNode;
+      if (!node || node === w.root) return null;
+      if (accepts(w, node) === 1) return null;
+    }
+  }
+  method(TW, 'parentNode', function () {
+    var node = this.currentNode;
+    while (node && node !== this.root) {
+      node = node.parentNode;
+      if (node && accepts(this, node) === 1) { this.currentNode = node; return node; }
+    }
+    return null;
+  });
+  method(TW, 'firstChild', function () { return children(this, true); });
+  method(TW, 'lastChild', function () { return children(this, false); });
+  method(TW, 'nextSibling', function () { return siblings(this, true); });
+  method(TW, 'previousSibling', function () { return siblings(this, false); });
+  method(TW, 'nextNode', function () {
+    var node = this.currentNode, result = 1;
+    while (true) {
+      while (result !== 2 && node.firstChild) {
+        node = node.firstChild;
+        result = accepts(this, node);
+        if (result === 1) { this.currentNode = node; return node; }
+      }
+      var sibling = null, temp = node;
+      while (temp) {
+        if (temp === this.root) return null;
+        sibling = temp.nextSibling;
+        if (sibling) { node = sibling; break; }
+        temp = temp.parentNode;
+      }
+      if (!sibling) return null;
+      result = accepts(this, node);
+      if (result === 1) { this.currentNode = node; return node; }
+    }
+  });
+  method(TW, 'previousNode', function () {
+    var node = this.currentNode;
+    while (node !== this.root) {
+      var sibling = node.previousSibling;
+      while (sibling) {
+        node = sibling;
+        var result = accepts(this, node);
+        while (result !== 2 && node.lastChild) { node = node.lastChild; result = accepts(this, node); }
+        if (result === 1) { this.currentNode = node; return node; }
+        sibling = node.previousSibling;
+      }
+      if (node === this.root || !node.parentNode) return null;
+      node = node.parentNode;
+      if (accepts(this, node) === 1) { this.currentNode = node; return node; }
+    }
+    return null;
+  });
+  method(TW, 'toString', function () { return '[object TreeWalker]'; });
+  function filterArg(filter) { return filter === undefined ? null : filter; }
+  method(DP, 'createTreeWalker', function (root, whatToShow, filter) {
+    if (!root || typeof root.nodeType !== 'number') throw new TypeError("Failed to execute 'createTreeWalker' on 'Document': parameter 1 is not of type 'Node'.");
+    var w = Object.create(TW);
+    w.root = root; w.whatToShow = whatToShow === undefined ? 4294967295 : whatToShow >>> 0; w.filter = filterArg(filter); w.currentNode = root;
+    hide(w, '__active', false);
+    return w;
+  });
+  function NodeIterator() { throw new TypeError('Illegal constructor'); }
+  hide(g, 'NodeIterator', NodeIterator);
+  var NI = NodeIterator.prototype;
+  function following(node, root) {
+    if (node.firstChild) return node.firstChild;
+    while (node) {
+      if (node === root) return null;
+      if (node.nextSibling) return node.nextSibling;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function preceding(node, root) {
+    if (node === root) return null;
+    var s = node.previousSibling;
+    if (!s) return node.parentNode;
+    while (s.lastChild) s = s.lastChild;
+    return s;
+  }
+  function iterate(it, next) {
+    var node = it.referenceNode, before = it.pointerBeforeReferenceNode;
+    while (true) {
+      if (next) {
+        if (!before) { node = following(node, it.root); if (!node) return null; } else before = false;
+      } else {
+        if (before) { node = preceding(node, it.root); if (!node) return null; } else before = true;
+      }
+      if (accepts(it, node) === 1) break;
+    }
+    it.referenceNode = node; it.pointerBeforeReferenceNode = before;
+    return node;
+  }
+  method(NI, 'nextNode', function () { return iterate(this, true); });
+  method(NI, 'previousNode', function () { return iterate(this, false); });
+  method(NI, 'detach', function () {});
+  method(NI, 'toString', function () { return '[object NodeIterator]'; });
+  method(DP, 'createNodeIterator', function (root, whatToShow, filter) {
+    if (!root || typeof root.nodeType !== 'number') throw new TypeError("Failed to execute 'createNodeIterator' on 'Document': parameter 1 is not of type 'Node'.");
+    var it = Object.create(NI);
+    it.root = root; it.whatToShow = whatToShow === undefined ? 4294967295 : whatToShow >>> 0; it.filter = filterArg(filter); it.referenceNode = root; it.pointerBeforeReferenceNode = true;
+    hide(it, '__active', false);
+    return it;
+  });
+
+  // ------------------------------------------------------------------------------------------------------------------ Range
+  function cmpPoints(a, ao, b, bo) {
+    if (a === b) return ao < bo ? -1 : ao > bo ? 1 : 0;
+    var pos = a.compareDocumentPosition(b);
+    if (pos & 4) {
+      if (pos & 16) {
+        var c = b;
+        while (c.parentNode !== a) c = c.parentNode;
+        return indexOf(c) < ao ? 1 : -1;
+      }
+      return -1;
+    }
+    return -cmpPoints(b, bo, a, ao);
+  }
+  function rangeRoot(node) { while (node.parentNode) node = node.parentNode; return node; }
+  function checkOffset(node, offset, what) {
+    if (node.nodeType === 10) throw dom("Failed to execute '" + what + "' on 'Range': The node provided is a doctype.", 'InvalidNodeTypeError');
+    if (offset > nodeLength(node)) throw dom("Failed to execute '" + what + "' on 'Range': The offset " + offset + ' is larger than the node\'s length (' + nodeLength(node) + ').', 'IndexSizeError');
+  }
+  function Range() {
+    if (!(this instanceof Range)) throw new TypeError("Failed to construct 'Range': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    this.startContainer = doc; this.startOffset = 0; this.endContainer = doc; this.endOffset = 0;
+    this.collapsed = true; this.commonAncestorContainer = doc;
+  }
+  hide(g, 'Range', Range);
+  var RP = Range.prototype;
+  Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.END_TO_START = 3;
+  function refresh(r) {
+    r.collapsed = r.startContainer === r.endContainer && r.startOffset === r.endOffset;
+    var n = r.startContainer;
+    while (n && !isInclusiveAncestor(n, r.endContainer)) n = n.parentNode;
+    r.commonAncestorContainer = n || r.startContainer;
+  }
+  method(RP, 'setStart', function (node, offset) {
+    checkOffset(node, offset, 'setStart');
+    this.startContainer = node; this.startOffset = offset;
+    if (rangeRoot(this.endContainer) !== rangeRoot(node) || cmpPoints(node, offset, this.endContainer, this.endOffset) > 0) { this.endContainer = node; this.endOffset = offset; }
+    refresh(this);
+  });
+  method(RP, 'setEnd', function (node, offset) {
+    checkOffset(node, offset, 'setEnd');
+    this.endContainer = node; this.endOffset = offset;
+    if (rangeRoot(this.startContainer) !== rangeRoot(node) || cmpPoints(node, offset, this.startContainer, this.startOffset) < 0) { this.startContainer = node; this.startOffset = offset; }
+    refresh(this);
+  });
+  method(RP, 'setStartBefore', function (node) { this.setStart(node.parentNode, indexOf(node)); });
+  method(RP, 'setStartAfter', function (node) { this.setStart(node.parentNode, indexOf(node) + 1); });
+  method(RP, 'setEndBefore', function (node) { this.setEnd(node.parentNode, indexOf(node)); });
+  method(RP, 'setEndAfter', function (node) { this.setEnd(node.parentNode, indexOf(node) + 1); });
+  method(RP, 'collapse', function (toStart) {
+    if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; } else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
+    refresh(this);
+  });
+  method(RP, 'selectNode', function (node) {
+    if (!node.parentNode) throw dom("Failed to execute 'selectNode' on 'Range': the given Node has no parent.", 'InvalidNodeTypeError');
+    var p = node.parentNode, i = indexOf(node);
+    this.startContainer = p; this.startOffset = i; this.endContainer = p; this.endOffset = i + 1; refresh(this);
+  });
+  method(RP, 'selectNodeContents', function (node) {
+    this.startContainer = node; this.startOffset = 0; this.endContainer = node; this.endOffset = nodeLength(node); refresh(this);
+  });
+  method(RP, 'cloneRange', function () {
+    var r = new Range();
+    r.startContainer = this.startContainer; r.startOffset = this.startOffset; r.endContainer = this.endContainer; r.endOffset = this.endOffset; refresh(r);
+    return r;
+  });
+  method(RP, 'detach', function () {});
+  method(RP, 'compareBoundaryPoints', function (how, other) {
+    var a, ao, b, bo;
+    if (how === 0) { a = this.startContainer; ao = this.startOffset; b = other.startContainer; bo = other.startOffset; }
+    else if (how === 1) { a = this.endContainer; ao = this.endOffset; b = other.startContainer; bo = other.startOffset; }
+    else if (how === 2) { a = this.endContainer; ao = this.endOffset; b = other.endContainer; bo = other.endOffset; }
+    else if (how === 3) { a = this.startContainer; ao = this.startOffset; b = other.endContainer; bo = other.endOffset; }
+    else throw dom("Failed to execute 'compareBoundaryPoints' on 'Range': The comparison method provided must be one of 'START_TO_START', 'START_TO_END', 'END_TO_END', or 'END_TO_START'.", 'NotSupportedError');
+    return cmpPoints(a, ao, b, bo);
+  });
+  method(RP, 'comparePoint', function (node, offset) {
+    checkOffset(node, offset, 'comparePoint');
+    if (cmpPoints(node, offset, this.startContainer, this.startOffset) < 0) return -1;
+    if (cmpPoints(node, offset, this.endContainer, this.endOffset) > 0) return 1;
+    return 0;
+  });
+  method(RP, 'isPointInRange', function (node, offset) {
+    if (rangeRoot(node) !== rangeRoot(this.startContainer)) return false;
+    checkOffset(node, offset, 'isPointInRange');
+    return cmpPoints(node, offset, this.startContainer, this.startOffset) >= 0 && cmpPoints(node, offset, this.endContainer, this.endOffset) <= 0;
+  });
+  method(RP, 'intersectsNode', function (node) {
+    if (rangeRoot(node) !== rangeRoot(this.startContainer)) return false;
+    var p = node.parentNode;
+    if (!p) return true;
+    var i = indexOf(node);
+    return cmpPoints(p, i, this.endContainer, this.endOffset) < 0 && cmpPoints(p, i + 1, this.startContainer, this.startOffset) > 0;
+  });
+  function textOf(range) {
+    var out = '', sc = range.startContainer, ec = range.endContainer;
+    if (sc === ec && sc.nodeType === 3) return sc.data.slice(range.startOffset, range.endOffset);
+    var root = range.commonAncestorContainer;
+    var w = doc.createTreeWalker(root, 4);
+    var n = root.nodeType === 3 ? root : w.nextNode();
+    while (n) {
+      if (cmpPoints(n, n.data.length, sc, range.startOffset) > 0 && cmpPoints(n, 0, ec, range.endOffset) < 0) {
+        var from = n === sc ? range.startOffset : 0, to = n === ec ? range.endOffset : n.data.length;
+        out += n.data.slice(from, to);
+      }
+      n = root.nodeType === 3 ? null : w.nextNode();
+    }
+    return out;
+  }
+  method(RP, 'toString', function () { return textOf(this); });
+  // cloneContents / extractContents / deleteContents after the algorithm of the DOM standard
+  function contents(range, mode) {
+    var frag = doc.createDocumentFragment();
+    if (range.collapsed) return frag;
+    var sc = range.startContainer, so = range.startOffset, ec = range.endContainer, eo = range.endOffset;
+    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8)) {
+      var clone = sc.cloneNode(false);
+      clone.data = sc.data.slice(so, eo);
+      frag.appendChild(clone);
+      if (mode !== 'clone') sc.replaceData(so, eo - so, '');
+      return frag;
+    }
+    var common = sc;
+    while (!isInclusiveAncestor(common, ec)) common = common.parentNode;
+    var firstPartial = null, lastPartial = null;
+    if (!isInclusiveAncestor(sc, ec)) { firstPartial = sc; while (firstPartial.parentNode !== common) firstPartial = firstPartial.parentNode; }
+    if (!isInclusiveAncestor(ec, sc)) { lastPartial = ec; while (lastPartial.parentNode !== common) lastPartial = lastPartial.parentNode; }
+    var contained = [];
+    for (var c = common.firstChild; c; c = c.nextSibling) {
+      if (cmpPoints(c.parentNode, indexOf(c), sc, so) >= 0 && cmpPoints(c.parentNode, indexOf(c) + 1, ec, eo) <= 0) contained.push(c);
+    }
+    var newNode, newOffset;
+    if (isInclusiveAncestor(sc, ec)) { newNode = sc; newOffset = so; }
+    else { var ref = sc; while (ref.parentNode && !isInclusiveAncestor(ref.parentNode, ec)) ref = ref.parentNode; newNode = ref.parentNode; newOffset = indexOf(ref) + 1; }
+    function sub(n1, o1, n2, o2) { var r = new Range(); r.startContainer = n1; r.startOffset = o1; r.endContainer = n2; r.endOffset = o2; refresh(r); return r; }
+    if (firstPartial) {
+      if (firstPartial.nodeType === 3 || firstPartial.nodeType === 8) {
+        var cl = sc.cloneNode(false); cl.data = sc.data.slice(so); frag.appendChild(cl);
+        if (mode !== 'clone') sc.replaceData(so, sc.data.length - so, '');
+      } else {
+        var cl2 = firstPartial.cloneNode(false); frag.appendChild(cl2);
+        cl2.appendChild(contents(sub(sc, so, firstPartial, nodeLength(firstPartial)), mode));
+      }
+    }
+    contained.forEach(function (n) {
+      if (mode === 'clone') frag.appendChild(n.cloneNode(true));
+      else frag.appendChild(n);
+    });
+    if (lastPartial) {
+      if (lastPartial.nodeType === 3 || lastPartial.nodeType === 8) {
+        var cl3 = ec.cloneNode(false); cl3.data = ec.data.slice(0, eo); frag.appendChild(cl3);
+        if (mode !== 'clone') ec.replaceData(0, eo, '');
+      } else {
+        var cl4 = lastPartial.cloneNode(false); frag.appendChild(cl4);
+        cl4.appendChild(contents(sub(lastPartial, 0, ec, eo), mode));
+      }
+    }
+    if (mode !== 'clone') { range.startContainer = newNode; range.startOffset = newOffset; range.endContainer = newNode; range.endOffset = newOffset; refresh(range); }
+    return frag;
+  }
+  method(RP, 'cloneContents', function () { return contents(this, 'clone'); });
+  method(RP, 'extractContents', function () { return contents(this, 'extract'); });
+  method(RP, 'deleteContents', function () { contents(this, 'extract'); });
+  method(RP, 'insertNode', function (node) {
+    var sc = this.startContainer, ref, parent;
+    if (sc.nodeType === 3) { ref = sc.splitText(this.startOffset); parent = sc.parentNode; }
+    else { ref = sc.childNodes[this.startOffset] || null; parent = sc; }
+    if (node === ref) ref = ref.nextSibling;
+    if (node.parentNode) node.parentNode.removeChild(node);
+    var count = node.nodeType === 11 ? node.childNodes.length : 1;
+    parent.insertBefore(node, ref);
+    var idx = ref ? indexOf(ref) : parent.childNodes.length;
+    if (this.collapsed) { this.endContainer = parent; this.endOffset = idx; refresh(this); }
+    else if (this.endContainer === parent) { this.endOffset += count; refresh(this); }
+  });
+  method(RP, 'surroundContents', function (parent) {
+    var frag = this.extractContents();
+    while (parent.firstChild) parent.removeChild(parent.firstChild);
+    this.insertNode(parent);
+    parent.appendChild(frag);
+    this.selectNode(parent);
+  });
+  method(RP, 'createContextualFragment', function (html) {
+    var t = doc.createElement('template');
+    t.innerHTML = html;
+    return t.content;
+  });
+  method(RP, 'getBoundingClientRect', function () { return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }; });
+  method(RP, 'getClientRects', function () { return []; });
+  method(DP, 'createRange', function () { var r = new Range(); r.startContainer = doc; r.endContainer = doc; return r; });
+
+  // ------------------------------------------------------------------------------------------------------------------ Selection
+  function Selection() { throw new TypeError('Illegal constructor'); }
+  hide(g, 'Selection', Selection);
+  var SP = Selection.prototype;
+  var selection = Object.create(SP);
+  var current = null;
+  function syncSelection() {
+    var r = current;
+    selection.rangeCount = r ? 1 : 0;
+    selection.anchorNode = r ? r.startContainer : null; selection.anchorOffset = r ? r.startOffset : 0;
+    selection.focusNode = r ? r.endContainer : null; selection.focusOffset = r ? r.endOffset : 0;
+    selection.isCollapsed = r ? r.collapsed : true;
+    selection.type = !r ? 'None' : r.collapsed ? 'Caret' : 'Range';
+  }
+  syncSelection();
+  method(SP, 'getRangeAt', function (i) { if (!current || i !== 0) throw dom("Failed to execute 'getRangeAt' on 'Selection': " + i + ' is not a valid index.', 'IndexSizeError'); return current; });
+  method(SP, 'addRange', function (r) { if (!current) { current = r; syncSelection(); } });
+  method(SP, 'removeRange', function (r) { if (current === r) { current = null; syncSelection(); } });
+  method(SP, 'removeAllRanges', function () { current = null; syncSelection(); });
+  method(SP, 'empty', SP.removeAllRanges);
+  method(SP, 'collapse', function (node, offset) {
+    if (node === null) { current = null; syncSelection(); return; }
+    var r = new Range(); r.setStart(node, offset || 0); r.collapse(true); current = r; syncSelection();
+  });
+  method(SP, 'setPosition', SP.collapse);
+  method(SP, 'collapseToStart', function () { if (!current) throw dom("Failed to execute 'collapseToStart' on 'Selection': there is no selection.", 'InvalidStateError'); current.collapse(true); syncSelection(); });
+  method(SP, 'collapseToEnd', function () { if (!current) throw dom("Failed to execute 'collapseToEnd' on 'Selection': there is no selection.", 'InvalidStateError'); current.collapse(false); syncSelection(); });
+  method(SP, 'extend', function (node, offset) { if (!current) throw dom("Failed to execute 'extend' on 'Selection': This Selection object doesn't have any Ranges.", 'InvalidStateError'); current.setEnd(node, offset || 0); syncSelection(); });
+  method(SP, 'setBaseAndExtent', function (an, ao, fn, fo) { var r = new Range(); r.setStart(an, ao); r.setEnd(fn, fo); current = r; syncSelection(); });
+  method(SP, 'selectAllChildren', function (node) { var r = new Range(); r.selectNodeContents(node); current = r; syncSelection(); });
+  method(SP, 'containsNode', function (node, partial) {
+    if (!current) return false;
+    var r = new Range(); r.selectNode(node);
+    if (partial) return current.intersectsNode(node);
+    return current.compareBoundaryPoints(0, r) <= 0 && current.compareBoundaryPoints(2, r) >= 0;
+  });
+  method(SP, 'deleteFromDocument', function () { if (current) { current.deleteContents(); syncSelection(); } });
+  method(SP, 'toString', function () { return current ? current.toString() : ''; });
+  method(SP, 'modify', function () {});
+  hide(g, 'getSelection', function () { return selection; });
+  method(DP, 'getSelection', function () { return selection; });
+
+  // ------------------------------------------------------------------------------------------------------------------ DOMImplementation, XMLSerializer, Option
+  function escapeText(t) { return t.split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;'); }
+  var implementation = {
+    hasFeature: function () { return true; },
+    createHTMLDocument: function (title) {
+      var d = new DOMParser().parseFromString('<!DOCTYPE html><html><head>' + (title === undefined ? '' : '<title>' + escapeText(String(title)) + '</title>') + '</head><body></body></html>', 'text/html');
+      return d;
+    },
+    createDocument: function (ns, name) { return new DOMParser().parseFromString(name ? '<' + name + '></' + name + '>' : '', 'application/xml'); },
+    createDocumentType: function (name, publicId, systemId) { return { nodeType: 10, name: name, publicId: publicId, systemId: systemId }; }
+  };
+  try { if (doc.implementation === undefined) hide(doc, 'implementation', implementation); } catch (e) { }
+  function XMLSerializer() {}
+  hide(g, 'XMLSerializer', XMLSerializer);
+  method(XMLSerializer.prototype, 'serializeToString', function (node) {
+    if (!node) throw new TypeError("Failed to execute 'serializeToString' on 'XMLSerializer': parameter 1 is not of type 'Node'.");
+    if (node.nodeType === 9) return node.documentElement ? node.documentElement.outerHTML : '';
+    if (node.nodeType === 11) { var s = ''; for (var c = node.firstChild; c; c = c.nextSibling) s += this.serializeToString(c); return s; }
+    if (node.nodeType === 3) return escapeText(String(node.data));
+    if (node.nodeType === 8) return '<!--' + node.data + '-->';
+    return node.outerHTML;
+  });
+  function Option(text, value, defaultSelected, selected) {
+    var o = doc.createElement('option');
+    if (text !== undefined) o.textContent = String(text);
+    if (value !== undefined) o.setAttribute('value', String(value));
+    if (defaultSelected) o.setAttribute('selected', '');
+    if (selected !== undefined) o.selected = !!selected;
+    return o;
+  }
+  Option.prototype = g.HTMLOptionElement.prototype;
+  hide(g, 'Option', Option);
+  function CompositionEvent(type, init) {
+    var e = new UIEvent(type, init);
+    e.data = init && init.data !== undefined ? String(init.data) : '';
+    return e;
+  }
+  CompositionEvent.prototype = UIEvent.prototype;
+  hide(g, 'CompositionEvent', CompositionEvent);
+
+  // ------------------------------------------------------------------------------------------------------------------ interfaces of objects that exist already
+  function alias(name, sample) {
+    if (g[name] !== undefined || sample === null || sample === undefined) return;
+    var f = illegal(name);
+    f.prototype = Object.getPrototypeOf(sample);
+    hide(g, name, f);
+  }
+  var probe = doc.createElement('div');
+  alias('DOMTokenList', probe.classList);
+  alias('CSSStyleDeclaration', probe.style);
+  alias('History', g.history);
+  alias('Location', g.location);
+  alias('Navigator', g.navigator);
+  alias('Storage', g.localStorage);
+
+  // ------------------------------------------------------------------------------------------------------------------ small objects pages poke at
+  if (g.screenX === undefined) { g.screenX = 0; g.screenY = 0; g.screenLeft = 0; g.screenTop = 0; }
+  if (g.origin === undefined) g.origin = location.origin;
+  if (g.crypto === undefined) {
+    hide(g, 'crypto', {
+      getRandomValues: function (array) {
+        var max = array.BYTES_PER_ELEMENT === 4 ? 4294967296 : array.BYTES_PER_ELEMENT === 2 ? 65536 : 256;
+        for (var i = 0; i < array.length; i++) array[i] = Math.floor(Math.random() * max);
+        return array;
+      },
+      randomUUID: function () {
+        var template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx', out = '';
+        for (var i = 0; i < template.length; i++) {
+          var c = template.charAt(i);
+          if (c !== 'x' && c !== 'y') { out += c; continue; }
+          var r = Math.floor(Math.random() * 16);
+          out += (c === 'x' ? r : (r & 3) | 8).toString(16);
+        }
+        return out;
+      }
+    });
+  }
+  var resolved = function (v) { return Promise.resolve(v); };
+  method(EP, 'animate', function (keyframes, options) {
+    var anim = { currentTime: 0, playState: 'finished', pending: false, finished: resolved(null), ready: resolved(null), onfinish: null, oncancel: null,
+                 play: function () {}, pause: function () {}, cancel: function () { if (typeof anim.oncancel === 'function') anim.oncancel(); }, finish: function () {}, reverse: function () {},
+                 addEventListener: function () {}, removeEventListener: function () {} };
+    setTimeout(function () { if (typeof anim.onfinish === 'function') anim.onfinish({ type: 'finish', target: anim }); }, 0);
+    return anim;
+  });
+  method(EP, 'getAnimations', function () { return []; });
+  method(EP, 'setPointerCapture', function () {});
+  method(EP, 'releasePointerCapture', function () {});
+  method(EP, 'hasPointerCapture', function () { return false; });
+  method(EP, 'requestFullscreen', function () { return Promise.reject(new TypeError('Fullscreen is not supported')); });
+  method(EP, 'requestPointerLock', function () {});
+  if (doc.fullscreenElement === undefined) { hide(doc, 'fullscreenElement', null); hide(doc, 'fullscreenEnabled', false); }
+  method(DP, 'exitFullscreen', function () { return Promise.reject(new TypeError('Document not active')); });
+  method(DP, 'elementsFromPoint', function () { return []; });
+  method(DP, 'execCommand', function () { return false; });
+  method(DP, 'queryCommandSupported', function () { return false; });
+  method(DP, 'queryCommandEnabled', function () { return false; });
+  method(DP, 'queryCommandState', function () { return false; });
+  method(DP, 'startViewTransition', function (callback) {
+    var done = Promise.resolve().then(function () { return typeof callback === 'function' ? callback() : undefined; });
+    return { ready: done, finished: done, updateCallbackDone: done, skipTransition: function () {} };
+  });
+  if (doc.fonts === undefined) {
+    hide(doc, 'fonts', { ready: resolved(null), status: 'loaded', size: 0, check: function () { return true; }, load: function () { return resolved([]); },
+                         add: function () {}, delete: function () { return false; }, clear: function () {}, forEach: function () {}, has: function () { return false; },
+                         addEventListener: function () {}, removeEventListener: function () {} });
+  }
+  if (doc.timeline === undefined) hide(doc, 'timeline', { currentTime: 0 });
+  if (doc.designMode === undefined) doc.designMode = 'off';
+  if (doc.dir === undefined) doc.dir = '';
+}(this));
+)JSPRELUDE";
+
 }  // namespace
 
 const char* web_prelude() { return kPrelude; }
+const char* dom_prelude() { return kDomPrelude; }
 
 }  // namespace browser

@@ -1316,6 +1316,46 @@ bool install_nodes(DomBindings::Impl& c) {
   make_class(c, "EventTarget", event_target_constructor, event_target);
   make_class(c, "Element", illegal_constructor, ep);
   make_class(c, "HTMLElement", illegal_constructor, c.html_proto);
+  {   // one interface for each kind of element, so instanceof tells an <input> from a <div>
+    static const struct {
+      const char* interface;
+      const char* tags;   // space separated
+    } kInterfaces[] = {
+        {"HTMLAnchorElement", "a"}, {"HTMLAreaElement", "area"}, {"HTMLBaseElement", "base"}, {"HTMLQuoteElement", "blockquote q"}, {"HTMLBodyElement", "body"},
+        {"HTMLBRElement", "br"}, {"HTMLButtonElement", "button"}, {"HTMLCanvasElement", "canvas"}, {"HTMLDListElement", "dl"}, {"HTMLDataElement", "data"},
+        {"HTMLDataListElement", "datalist"}, {"HTMLDetailsElement", "details"}, {"HTMLDialogElement", "dialog"}, {"HTMLDivElement", "div"}, {"HTMLEmbedElement", "embed"},
+        {"HTMLFieldSetElement", "fieldset"}, {"HTMLFormElement", "form"}, {"HTMLHeadingElement", "h1 h2 h3 h4 h5 h6"}, {"HTMLHeadElement", "head"}, {"HTMLHRElement", "hr"},
+        {"HTMLHtmlElement", "html"}, {"HTMLIFrameElement", "iframe"}, {"HTMLImageElement", "img"}, {"HTMLInputElement", "input"}, {"HTMLLabelElement", "label"},
+        {"HTMLLegendElement", "legend"}, {"HTMLLIElement", "li"}, {"HTMLLinkElement", "link"}, {"HTMLMapElement", "map"}, {"HTMLMenuElement", "menu"},
+        {"HTMLMetaElement", "meta"}, {"HTMLMeterElement", "meter"}, {"HTMLModElement", "ins del"}, {"HTMLObjectElement", "object"}, {"HTMLOListElement", "ol"},
+        {"HTMLOptGroupElement", "optgroup"}, {"HTMLOptionElement", "option"}, {"HTMLOutputElement", "output"}, {"HTMLParagraphElement", "p"}, {"HTMLParamElement", "param"},
+        {"HTMLPictureElement", "picture"}, {"HTMLPreElement", "pre"}, {"HTMLProgressElement", "progress"}, {"HTMLScriptElement", "script"}, {"HTMLSelectElement", "select"},
+        {"HTMLSlotElement", "slot"}, {"HTMLSourceElement", "source"}, {"HTMLSpanElement", "span"}, {"HTMLStyleElement", "style"}, {"HTMLTableCaptionElement", "caption"},
+        {"HTMLTableCellElement", "td th"}, {"HTMLTableColElement", "col colgroup"}, {"HTMLTableElement", "table"}, {"HTMLTableRowElement", "tr"},
+        {"HTMLTableSectionElement", "tbody thead tfoot"}, {"HTMLTemplateElement", "template"}, {"HTMLTextAreaElement", "textarea"}, {"HTMLTimeElement", "time"},
+        {"HTMLTitleElement", "title"}, {"HTMLTrackElement", "track"}, {"HTMLUListElement", "ul"}};
+    c.tag_protos = vm.new_plain();
+    vm.define_named(g, "__tag_protos", Value::make_object(c.tag_protos), 0);   // (kept alive; also what the page cannot overwrite)
+    JsObject* media = vm.new_object(c.html_proto);
+    make_class(c, "HTMLMediaElement", illegal_constructor, media);
+    for (const auto& k : kInterfaces) {
+      JsObject* proto = vm.new_object(c.html_proto);
+      make_class(c, k.interface, illegal_constructor, proto);
+      const StringView tags(k.tags);
+      uint64_t at = 0;
+      while (at < tags.size()) {
+        uint64_t end = at;
+        while (end < tags.size() && tags[end] != ' ') ++end;
+        vm.define(c.tag_protos, vm.intern(tags.substr(at, end - at)), Value::make_object(proto), 0);
+        at = end + 1;
+      }
+    }
+    for (const char* tag : {"audio", "video"}) {
+      JsObject* proto = vm.new_object(media);
+      make_class(c, tag[0] == 'a' ? "HTMLAudioElement" : "HTMLVideoElement", illegal_constructor, proto);
+      vm.define(c.tag_protos, vm.intern(tag), Value::make_object(proto), 0);
+    }
+  }
   make_class(c, "Text", illegal_constructor, c.text_proto);
   make_class(c, "Comment", illegal_constructor, c.comment_proto);
   make_class(c, "Document", illegal_constructor, dp);

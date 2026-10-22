@@ -112,6 +112,9 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // node is a picture, video or canvas, `object` is its ObjectKind and (lx, ly) where in its w x h rectangle the click was: a video with controls plays or
   // pauses.
   void click(uint32_t node_serial, int32_t x, int32_t y, uint8_t object = 0, int32_t lx = 0, int32_t ly = 0, uint32_t w = 0, uint32_t h = 0);
+  // The pointer is over the node with that serial (0: over none), pressed or not: the node and its ancestors take :hover (and :active), and the page is drawn again
+  // if a style rule depends on that.
+  void set_pointer(uint32_t node_serial, bool pressed);
   // Moves pictures and videos along (animated pictures, playing videos) and fires the events that follow (load, error, timeupdate, ended ...); true if
   // anything visible changed or an event was fired. Called often while objects().animating().
   bool step_objects(double now_ms);
@@ -314,6 +317,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   String focus_value_, invalid_text_;                         // (what the focused control held when it got the focus; what to tell about the invalid one)
   // the style sheets as of now, for getComputedStyle
   StyleSheet style_cache_;
+  uint32_t pointer_node_ = 0;
+  bool pointer_pressed_ = false;
   uint64_t style_cache_version_ = 0;
   MediaEnvironment style_cache_media_;
   bool style_cache_valid_ = false;

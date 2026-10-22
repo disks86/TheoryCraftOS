@@ -250,10 +250,12 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   page_.on_link_clicked(Handler::immediate(&WebBrowser::on_link, this));
   page_.on_hover_changed(Handler::immediate(&WebBrowser::on_hover, this));
   node_handler_ = {&WebBrowser::on_node_click, this};
+  pointer_handler_ = {&WebBrowser::on_pointer, this};
   resize_handler_ = {&WebBrowser::on_view_resized, this};
   timer_handler_ = {&WebBrowser::on_timers, this};
   key_handler_ = {&WebBrowser::on_form_key, this};
   page_.on_node_clicked(node_handler_);
+  page_.on_pointer_changed(pointer_handler_);
   page_.on_key_pressed(key_handler_);
   page_.on_resized(resize_handler_);
 
@@ -943,6 +945,13 @@ void WebBrowser::on_timers(void* self, Control&) {
   const double now = static_cast<double>(b->page_clock_ms());
   b->live_->run_due_timers(now);
   b->live_->step_objects(now);
+  b->settle();
+}
+
+void WebBrowser::on_pointer(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->live_) return;
+  b->live_->set_pointer(b->page_.pointer_node(), b->page_.pointer_pressed());
   b->settle();
 }
 

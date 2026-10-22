@@ -103,6 +103,244 @@ bool media_applies(const dom::Node* n, const MediaEnvironment& env) {
 
 }  // namespace
 
+namespace {
+
+// The next whitespace separated word of a declaration value.
+bool next_value_word(StringView text, uint64_t* at, StringView* word) {
+  uint64_t i = *at;
+  while (i < text.size() && is_space(text[i])) ++i;
+  if (i >= text.size()) return false;
+  const uint64_t start = i;
+  while (i < text.size() && !is_space(text[i])) ++i;
+  *word = text.substr(start, i - start);
+  *at = i;
+  return true;
+}
+
+bool word_int(StringView w, int64_t* out) {
+  if (w.empty()) return false;
+  uint64_t i = 0;
+  bool negative = false;
+  if (w[0] == '-' || w[0] == '+') negative = w[i++] == '-';
+  if (i >= w.size()) return false;
+  int64_t v = 0;
+  for (; i < w.size(); ++i) {
+    if (w[i] < '0' || w[i] > '9') return false;
+    v = v * 10 + (w[i] - '0');
+    if (v > 1000000) v = 1000000;
+  }
+  *out = negative ? -v : v;
+  return true;
+}
+
+uint8_t counter_style_of(StringView name) {
+  if (name.equals_ignore_case("lower-alpha") || name.equals_ignore_case("lower-latin")) return 4;
+  if (name.equals_ignore_case("upper-alpha") || name.equals_ignore_case("upper-latin")) return 5;
+  if (name.equals_ignore_case("lower-roman")) return 6;
+  if (name.equals_ignore_case("upper-roman")) return 7;
+  if (name.equals_ignore_case("decimal-leading-zero")) return 9;
+  return 3;
+}
+
+}  // namespace
+
+// counter-reset and counter-increment of an element that was just opened.
+void DocumentRenderer::update_counters(const dom::Node* n, const Style& s) {
+  (void)n;
+  if (hidden() || stack_.count() == 0) return;
+  const uint64_t depth = stack_.count() - 1;
+  for (int pass = 0; pass < 2; ++pass) {
+    const StringView text = sheet_.text(pass == 0 ? s.counter_reset : s.counter_increment);
+    uint64_t at = 0;
+    StringView word;
+    bool have = next_value_word(text, &at, &word);
+    while (have && !failed_) {
+      if (word.equals_ignore_case("none")) {
+        have = next_value_word(text, &at, &word);
+        continue;
+      }
+      StringView name = word;
+      int64_t amount = pass == 0 ? 0 : 1;
+      have = next_value_word(text, &at, &word);
+      int64_t parsed;
+      if (have && word_int(word, &parsed)) {
+        amount = parsed;
+        have = next_value_word(text, &at, &word);
+      }
+      if (pass == 0) {
+        if (counters_.count() > 200) continue;
+        Counter c(out_.allocator());
+        c.name.assign(name);
+        c.value = amount;
+        c.depth = depth;
+        failed_ |= !counters_.push_back(util::move(c));
+        continue;
+      }
+      int64_t found = -1;
+      for (uint64_t i = counters_.count(); i > 0 && found < 0; --i)
+        if (counters_[i - 1].name.view().equals(name)) found = static_cast<int64_t>(i - 1);
+      if (found < 0) {
+        if (counters_.count() > 200) continue;
+        Counter c(out_.allocator());
+        c.name.assign(name);
+        c.depth = depth;
+        failed_ |= !counters_.push_back(util::move(c));
+        found = static_cast<int64_t>(counters_.count() - 1);
+      }
+      counters_[static_cast<uint64_t>(found)].value += amount;
+    }
+  }
+}
+
+void DocumentRenderer::counter_text(StringView name, StringView style, StringView separator, bool all, String* out) const {
+  const uint8_t type = counter_style_of(style);
+  int64_t shown = 0;
+  bool any = false;
+  for (uint64_t i = 0; i < counters_.count(); ++i) {
+    if (!counters_[i].name.view().equals(name)) continue;
+    if (all) {
+      if (any) out->append(separator);
+      format_counter(counters_[i].value, type, out);
+    }
+    shown = counters_[i].value;
+    any = true;
+  }
+  if (!all) format_counter(shown, type, out);
+  else if (!any) format_counter(0, type, out);
+}
+
+// The text of a `content` value: strings, attr(), counter(), counters(), quotes.
+bool DocumentRenderer::eval_content(const dom::Node* n, StringView content, String* out) {
+  uint64_t i = 0;
+  uint32_t guard = 0;
+  while (i < content.size() && ++guard < 200) {
+    while (i < content.size() && is_space(content[i])) ++i;
+    if (i >= content.size()) break;
+    const char c = content[i];
+    if (c == '"' || c == '\'') {
+      ++i;
+      while (i < content.size() && content[i] != c) {
+        if (content[i] != '\\') {
+          out->push_back(content[i++]);
+          continue;
+        }
+        ++i;
+        if (i >= content.size()) break;
+        uint32_t cp = 0, digits = 0;
+        while (i < content.size() && digits < 6 && ((content[i] >= '0' && content[i] <= '9') || (content[i] >= 'a' && content[i] <= 'f') || (content[i] >= 'A' && content[i] <= 'F'))) {
+          const char h = content[i++];
+          cp = cp * 16 + static_cast<uint32_t>(h <= '9' ? h - '0' : (h | 32) - 'a' + 10);
+          ++digits;
+        }
+        if (digits == 0) {
+          if (content[i] == '\n') ++i;
+          else out->push_back(content[i++]);
+          continue;
+        }
+        if (i < content.size() && is_space(content[i])) ++i;
+        if (cp == 0xA) out->push_back(' ');
+        else if (cp < 0x80) out->push_back(static_cast<char>(cp));
+        else if (const char* look = dom::ascii_look_alike(cp)) out->append(look);
+        else out->push_back('?');
+      }
+      if (i < content.size()) ++i;
+      continue;
+    }
+    if (c == '/') break;   // (alternative text for screen readers follows)
+    uint64_t start = i;
+    while (i < content.size() && !is_space(content[i]) && content[i] != '(') ++i;
+    const StringView word = content.substr(start, i - start);
+    if (i < content.size() && content[i] == '(') {
+      ++i;
+      const uint64_t arg_start = i;
+      int depth = 1;
+      char quote = 0;
+      while (i < content.size() && depth > 0) {
+        const char d = content[i];
+        if (quote) {
+          if (d == quote) quote = 0;
+        } else if (d == '"' || d == '\'') {
+          quote = d;
+        } else if (d == '(') {
+          ++depth;
+        } else if (d == ')') {
+          --depth;
+        }
+        ++i;
+      }
+      const StringView args = content.substr(arg_start, i - arg_start - (depth == 0 ? 1 : 0));
+      // the comma separated arguments, quotes removed
+      StringView parts[3];
+      uint32_t count = 0;
+      uint64_t k = 0, part_start = 0;
+      quote = 0;
+      for (; k <= args.size() && count < 3; ++k) {
+        const char d = k < args.size() ? args[k] : ',';
+        if (quote) {
+          if (d == quote) quote = 0;
+          continue;
+        }
+        if (d == '"' || d == '\'') quote = d;
+        else if (d == ',') {
+          StringView part = args.substr(part_start, k - part_start).trimmed();
+          if (part.size() >= 2 && (part[0] == '"' || part[0] == '\'')) part = part.substr(1, part.size() - 2);
+          parts[count++] = part;
+          part_start = k + 1;
+        }
+      }
+      if (word.equals_ignore_case("attr")) {
+        StringView value;
+        if (count > 0 && n && dom::get_attribute(n, parts[0], &value)) out->append(value);
+      } else if (word.equals_ignore_case("counter")) {
+        if (count > 0) counter_text(parts[0], count > 1 ? parts[1] : StringView(), StringView(), false, out);
+      } else if (word.equals_ignore_case("counters")) {
+        if (count > 1) counter_text(parts[0], count > 2 ? parts[2] : StringView(), parts[1], true, out);
+      }
+      continue;
+    }
+    if (word.equals_ignore_case("open-quote")) {
+      out->push_back(quote_depth_ % 2 == 0 ? '"' : '\'');
+      ++quote_depth_;
+    } else if (word.equals_ignore_case("close-quote")) {
+      if (quote_depth_ > 0) --quote_depth_;
+      out->push_back(quote_depth_ % 2 == 0 ? '"' : '\'');
+    } else if (word.equals_ignore_case("no-open-quote")) {
+      ++quote_depth_;
+    } else if (word.equals_ignore_case("no-close-quote")) {
+      if (quote_depth_ > 0) --quote_depth_;
+    }
+    if (i == start) ++i;
+  }
+  return !out->empty() || content.size() > 0;
+}
+
+// ::before and ::after: the generated text is drawn in the style the rules for it give.
+void DocumentRenderer::pseudo_content(const dom::Node* n, PseudoElement which) {
+  if (!sheet_.has_pseudo(n, which)) return;
+  Style ps = cur().inherit();
+  sheet_.apply(n, StringView(), cur(), &ps, which);
+  if (!ps.has_content || ps.display == Display::None) return;
+  String text(out_.allocator());
+  if (!eval_content(n, sheet_.text(ps.content), &text)) return;
+  const bool blockish = ps.display != Display::Inline;
+  if (text.empty() && !blockish) return;
+  const uint32_t indent_here = static_cast<uint32_t>(cur().indent) + ps.margin_left + ps.padding_left;
+  ps.indent = static_cast<uint8_t>(indent_here < kMaxIndent ? indent_here : kMaxIndent);
+  if (ps.own_background) {
+    ps.background = ps.own_background_color;
+    ps.background_block = blockish;
+  }
+  Element e;
+  e.style = ps;
+  e.node = n;
+  e.link = cur_link();
+  failed_ |= !stack_.push_back(e);
+  if (blockish) block(static_cast<uint8_t>(1 + ps.margin_top + ps.padding_top));
+  if (!text.empty()) literal(text.view(), ps.indent);
+  if (blockish) block(static_cast<uint8_t>(1 + ps.margin_bottom + ps.padding_bottom));
+  stack_.remove_at(stack_.count() - 1);
+}
+
 bool collect_style_sheets(dom::Document& doc, const RenderOptions& options, StyleSheet* sheet) {
   if (!options.extra_css.empty() && !sheet->parse(options.extra_css, options.media)) return false;
   for (const dom::Node* n = doc.root(); n; n = dom::next_in_tree(n, doc.root())) {

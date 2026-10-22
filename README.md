@@ -53,8 +53,25 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
 - **Script/** a JavaScript engine (a practical ES5 subset with let / const, arrow functions, template literals, spread and for-of): `Parser` makes a syntax
   tree, `Compiler` turns it into bytecode (variables are resolved to slots of per-call environments, `finally` is compiled in line), `Vm` runs it on a
   stack machine with its own mark-and-sweep heap, an instruction budget and a memory limit, and `Builtins` has Object, Array, String, Number, Math, JSON, Date,
-  Error, console and a little of `document`. `Engine` is the interface. Not there: classes, regular expressions, destructuring, generators, async,
-  Map / Set / Promise. Timers are real (`setTimeout` / `setInterval` run from the host's clock), and host objects let the browser expose the DOM. Tested by `tests/ScriptTest.cpp` (the language, the built-ins, limits, the collector, damaged and deeply nested programs).
+  Error, console and a little of `document`. `Engine` is the interface. Promises are native (`then` / `catch` / `finally`, `all` / `allSettled` / `race` / `any` /
+  `withResolvers`, a microtask queue that drains after each task, unhandled rejections reported) and `async` functions / `await` run as coroutines. `JSON` is
+  strict (V8-style error messages, reviver, replacer function or array, `toJSON`, cycle detection). Not there: classes, regular expressions, destructuring,
+  getters / setters, generators, Map / Set; strings are bytes (UTF-8), so `.length` counts bytes. Timers are real (`setTimeout` / `setInterval` run from the host's clock), and host objects let the browser expose the DOM. Tested by `tests/ScriptTest.cpp` (the language, the built-ins, limits, the collector, damaged and deeply nested programs).
+- **Browser/ web platform:** `WebUrl` is the WHATWG URL parser behind `URL` and `URLSearchParams` (special schemes, IPv4 / IPv6, punycode, percent-encode sets, the
+  setters); `CookieJar` keeps cookies the way RFC 6265bis says (`Domain`, `Path`, `Secure`, `HttpOnly`, `SameSite`, `Max-Age` / `Expires`, `__Host-` / `__Secure-`
+  prefixes) for `document.cookie` and for requests; `Fetcher` sits between a page and `IPageLoader::exchange` (cookies, redirects, CORS with preflight, mixed
+  content, `data:` addresses, `AbortSignal`); `WebPrelude` is the part of `fetch` / `Headers` / `Request` / `Response` / `XMLHttpRequest` / `Blob` / `File` /
+  `FileReader` / `TextEncoder` / `AbortController` / `structuredClone` / `MessageChannel` / `BroadcastChannel` that is written in JavaScript on top of a few
+  native functions; `PageHub` shares `localStorage` between the pages of an origin (with `storage` events) and carries `postMessage` and `BroadcastChannel`
+  between windows; `SessionHistory` holds the entries behind `history` (`pushState` / `replaceState` / `go`, `popstate`, `hashchange`, scroll restoration).
+  `requestIdleCallback`, `unhandledrejection` and `error` events are there too. Tests: `UrlTest`, `CookieTest`, `FetcherTest`, `HistoryTest`, `PageTest`.
+- **Browser/ CSS and boxes:** `Css` reads custom properties and `var()`, `calc()` / `min()` / `max()` / `clamp()`, the shorthands, `inherit` / `initial` /
+  `unset`, `@supports` / `@layer` / `@container` / `@media`, `::before` / `::after` / `::marker`, `:hover` / `:active` / `:focus-within` (the pointer is tracked by
+  `PageView` and `Page::set_pointer`). `RendererBoxes` draws boxes into character cells: borders (`+ - | : # = .`), padding, margins, `width` / `height` with
+  `min-` / `max-`, `box-sizing`, `overflow`, flexbox (direction, wrap, grow / shrink / basis, `justify-content`, `align-*`, `order`, gaps, auto margins), grid
+  (`repeat()` / `minmax()` / `fr`, `auto-fill` / `auto-fit`, named lines and areas, spans, auto-placement with `dense`, alignment), `display: table*`, `columns`,
+  inline-blocks side by side, floats (the content after a float is drawn beside it), generated content with `counter()` / `counters()` / `attr()` and list
+  styles (decimal, alpha, roman). A cell is 8 x 16 pixels, so lengths are rounded to cells. `getComputedStyle` reports the computed values.
 - **Dom/** the document model: `Dom` (a tree of `Node`s - elements, text, comments, fragments - with attributes, the mutation operations, a version counter and
   serial numbers), `HtmlBuilder` (an HTML tree builder: implied `html` / `head` / `body`, void and raw-text elements, optional end tags, tables, `document.write`
   re-fed into the parse, scripts run as they are met), `Entities` (named and numeric character references), and `Selector` (selector lists with combinators,

@@ -156,8 +156,16 @@ void PageView::set_hover(int32_t link) {
   fire(hover_handler_);
 }
 
+void PageView::set_pointer(uint32_t node, bool pressed) {
+  if (node == pointer_node_ && pressed == pointer_pressed_) return;
+  pointer_node_ = node;
+  pointer_pressed_ = pressed;
+  if (pointer_handler_.function) fire(pointer_handler_);
+}
+
 void PageView::on_mouse_down(const MouseArgs& args) {
   UiGuard lock(this);
+  if (args.button == MouseButton::Left) set_pointer(pointer_node_ ? pointer_node_ : node_at(args.x, args.y), true);
   press_link_ = args.button == MouseButton::Left ? link_index_at(args.x, args.y) : -1;
   press_node_ = args.button == MouseButton::Left && node_handler_.function ? node_at(args.x, args.y) : 0;
 }
@@ -165,12 +173,14 @@ void PageView::on_mouse_down(const MouseArgs& args) {
 void PageView::on_mouse_move(const MouseArgs& args) {
   UiGuard lock(this);
   set_hover(link_index_at(args.x, args.y));
+  set_pointer(node_at(args.x, args.y), pointer_pressed_);
 }
 
 void PageView::on_mouse_up(const MouseArgs& args) {
   UiGuard lock(this);
   const int32_t pressed = press_link_;
   const uint32_t pressed_node = press_node_;
+  set_pointer(pointer_node_, false);
   press_link_ = -1;
   press_node_ = 0;
   if (pressed_node != 0 && args.button == MouseButton::Left && node_at(args.x, args.y) == pressed_node) {
@@ -199,6 +209,7 @@ void PageView::on_mouse_up(const MouseArgs& args) {
 void PageView::on_mouse_leave() {
   UiGuard lock(this);
   set_hover(-1);
+  set_pointer(0, false);
 }
 
 bool PageView::on_key(const KeyArgs& args) {

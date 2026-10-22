@@ -66,6 +66,18 @@ DocumentRenderer::Edges DocumentRenderer::edges_of(const Style& s) const {
   return e;
 }
 
+DocumentRenderer::LinePiece DocumentRenderer::copy_piece(allocators::IAllocator& a, const LinePiece& from) {
+  LinePiece p(a);
+  p.text.assign(from.text.view());
+  p.flags = from.flags;
+  p.level = from.level;
+  p.color = from.color;
+  p.background = from.background;
+  p.node = from.node;
+  p.link = from.link;
+  return p;
+}
+
 bool DocumentRenderer::wants_box(const dom::Node* n, const Style& s) const {
   if (s.display == Display::None || s.display == Display::ListItem) return false;
   if (s.display == Display::Inline && !s.inline_box) return false;
@@ -77,6 +89,7 @@ bool DocumentRenderer::wants_box(const dom::Node* n, const Style& s) const {
   const bool sized = !s.width.is_auto() || s.max_width.is_px() || (s.min_width.is_px() && s.min_width.px100 > 0) || s.height.is_px() || (s.min_height.is_px() && s.min_height.px100 > 0) ||
                      s.max_height.is_px();
   if (s.layout == Layout::Flex || s.layout == Layout::Grid || s.layout == Layout::Table) return true;
+  if (s.float_side != Float::None) return true;
   if (s.column_count > 0 || s.column_width.is_px()) return true;
   if (s.inline_box) return border || sized || e.padding_left || e.padding_right || e.padding_top || e.padding_bottom || cols_of(s.margin[1]) || cols_of(s.margin[3]);
   if (border || sized) return true;
@@ -202,7 +215,7 @@ bool DocumentRenderer::draw_content(const dom::Node* n, const Style& inside, uin
   sub.modal_pass_ = modal_pass_;
   sub.measuring_ = measuring_;
   sub.walk(n);
-  sub.flush();
+  sub.finish();
   if (sub.failed_) return false;
   used_boxes_ = true;
   return fit_document(*doc, content_cols, inside.background_block ? inside.background : (inside.own_background ? inside.own_background_color : 0), out);
@@ -347,7 +360,7 @@ bool DocumentRenderer::build_box(const dom::Node* n, const Style& s, uint32_t av
   Raster content(a);
   bool done = false;
   if (s.layout == Layout::Flex) done = layout_flex(n, s, content_cols, content_lines, &content);
-  else if (s.layout == Layout::Grid) done = layout_grid(n, s, content_cols, content_lines, &content);
+  else if (s.layout == Layout::Grid || s.layout == Layout::Table) done = layout_grid(n, s, content_cols, content_lines, &content);
   else if (s.column_count > 0 || s.column_width.is_px()) done = layout_columns(n, s, content_cols, &content);
   if (!done) {
     if (failed_) return false;
@@ -374,7 +387,7 @@ bool DocumentRenderer::measure_box(const dom::Node* n, const Style& s, uint32_t 
   allocators::IAllocator& a = out_.allocator();
   const bool saved = measuring_;
   measuring_ = true;
-  if (s.layout == Layout::Flex || s.layout == Layout::Grid) {   // (a container is measured by laying it out: its items go side by side)
+  if (s.layout == Layout::Flex || s.layout == Layout::Grid || s.layout == Layout::Table) {   // (a container is measured by laying it out: its items go side by side)
     Raster r(a);
     const uint32_t saved_min = measured_min_, saved_max = measured_max_;
     const bool ok = s.layout == Layout::Flex ? layout_flex(n, s, kWide, 0, &r) : layout_grid(n, s, kWide, 0, &r);
@@ -406,7 +419,7 @@ bool DocumentRenderer::measure_box(const dom::Node* n, const Style& s, uint32_t 
     sub.modal_pass_ = modal_pass_;
     sub.measuring_ = true;
     sub.walk(n);
-    sub.flush();
+    sub.finish();
     ok = !sub.failed_;
     if (ok) {
       Raster r(a);
@@ -464,10 +477,128 @@ bool DocumentRenderer::render_box(const dom::Node* n, const Style& s) {
     else if (parent.align == 2) left += spare;
     if (s.float_side == Float::Right) left = avail - box.width;
   }
+  used_boxes_ = true;
+  if (s.float_side != Float::None && avail > box.width + ml + mr + 8 && n->parent && float_group(n, s, box, avail)) return !failed_;
+  if (s.inline_box && s.float_side == Float::None) {   // inline boxes share a line while they fit
+    const uint32_t gap = (row_gap_ ? 1u : 0u) + ml;
+    if (row_active_ && row_left_ + pending_row_.width + gap + box.width + mr <= avail) {
+      if (!join_rasters(pending_row_, box, gap)) return false;
+      row_gap_ = false;
+      ended_space_ = false;
+      return !failed_;
+    }
+    if (row_active_) flush_row();
+    flush();
+    failed_ |= !pending_row_.take(box);
+    row_left_ = left;
+    row_active_ = true;
+    row_gap_ = false;
+    ended_space_ = false;
+    return !failed_;
+  }
+  if (row_active_) flush_row();
   block(static_cast<uint8_t>(1 + lines_of(s.margin[0], 6)));
   emit_raster(box, left, 0);
   block(static_cast<uint8_t>(1 + lines_of(s.margin[2], 6)));
-  used_boxes_ = true;
+  ended_space_ = true;
+  return !failed_;
+}
+
+void DocumentRenderer::flush_row() {
+  if (!row_active_) return;
+  row_active_ = false;
+  block(1);
+  emit_raster(pending_row_, row_left_, 0);
+  pending_row_.clear();
+  block(1);
+  ended_space_ = true;
+}
+
+// Puts `right` after `left` on the same lines (the shorter one is padded with blanks below), `gap` columns apart. The result is in `left`.
+bool DocumentRenderer::join_rasters(Raster& left, Raster& right, uint32_t gap) {
+  allocators::IAllocator& a = out_.allocator();
+  Raster joined(a);
+  const uint32_t lines = left.lines() > right.lines() ? left.lines() : right.lines();
+  auto spaces = [&](uint32_t n_cols) {
+    if (n_cols == 0) return;
+    LinePiece p(a);
+    for (uint32_t k = 0; k < n_cols; ++k) p.text.push_back(' ');
+    failed_ |= !joined.pieces.push_back(util::move(p));
+  };
+  auto side = [&](Raster& r, uint32_t line) {
+    uint32_t used = 0;
+    if (line < r.lines())
+      for (uint32_t k = line ? r.ends[line - 1] : 0; k < r.ends[line]; ++k) {
+        used += static_cast<uint32_t>(r.pieces[k].text.size());
+        failed_ |= !joined.pieces.push_back(util::move(r.pieces[k]));
+      }
+    if (used < r.width) spaces(r.width - used);
+  };
+  for (uint32_t line = 0; line < lines && !failed_; ++line) {
+    side(left, line);
+    spaces(gap);
+    side(right, line);
+    failed_ |= !joined.ends.push_back(static_cast<uint32_t>(joined.pieces.count()));
+  }
+  joined.width = left.width + gap + right.width;
+  left.clear();
+  right.clear();
+  failed_ |= !left.take(joined);
+  return !failed_;
+}
+
+// A float: the content after it (up to a clear) is drawn beside it, in the width that is left.
+bool DocumentRenderer::float_group(const dom::Node* n, const Style& s, Raster& box, uint32_t avail) {
+  allocators::IAllocator& a = out_.allocator();
+  const uint32_t ml = cols_of(s.margin[3]), mr = cols_of(s.margin[1]);
+  const uint32_t taken = box.width + ml + mr + 1;
+  const uint32_t rest_w = avail - taken;
+  UniquePointer<HtmlDocument> doc = UniquePointer<HtmlDocument>::make(a, a);
+  if (!doc) return false;
+  DocumentRenderer sub(*doc, sheet_, options_);
+  sub.root_ = cur().inherit();
+  sub.root_.indent = 0;
+  sub.root_.content_px = static_cast<int32_t>(rest_w) * 8;
+  sub.container_cols_ = rest_w;
+  sub.box_depth_ = box_depth_ + 1;
+  sub.table_depth_ = table_depth_;
+  sub.modal_pass_ = modal_pass_;
+  uint32_t consumed = 0;
+  for (const dom::Node* c = n->next; c && !failed_ && consumed < 400; c = c->next) {
+    if (c->is_element()) {
+      const Style cs = derive_style(cur(), c, sheet_);
+      if (cs.clear != Clear::None && cs.display != Display::None) break;
+    }
+    ++consumed;
+    sub.walk(c);
+    if (consumed >= 64) break;
+    if (c->is_element() || (c->type == dom::NodeType::Text && !c->data.view().trimmed().empty())) {   // the float ends when what is beside it is as tall as it
+      Raster probe(a);
+      sub.flush();
+      if (fit_document(*doc, rest_w, 0, &probe) && probe.lines() >= box.lines()) break;
+    }
+  }
+  sub.finish();
+  if (sub.failed_) return false;
+  Raster rest(a);
+  if (!fit_document(*doc, rest_w, 0, &rest)) return false;
+  skip_parent_ = n->parent;
+  skip_left_ = consumed;
+  if (row_active_) flush_row();
+  block(static_cast<uint8_t>(1 + lines_of(s.margin[0], 6)));
+  Raster whole(a);
+  if (rest.lines() == 0) {
+    failed_ |= !whole.take(box);
+  } else if (s.float_side == Float::Right) {
+    rest.width = rest_w;
+    if (!join_rasters(rest, box, 1 + ml)) return false;
+    failed_ |= !whole.take(rest);
+  } else {
+    if (!join_rasters(box, rest, 1 + mr)) return false;
+    failed_ |= !whole.take(box);
+  }
+  emit_raster(whole, s.float_side == Float::Right ? 0 : ml, 0);
+  block(static_cast<uint8_t>(1 + lines_of(s.margin[2], 6)));
   ended_space_ = true;
   return !failed_;
 }
@@ -483,7 +614,7 @@ bool DocumentRenderer::draw_text_item(const dom::Node* text, const Style& inside
   sub.root_.content_px = static_cast<int32_t>(width) * 8;
   sub.container_cols_ = width;
   sub.walk(text);
-  sub.flush();
+  sub.finish();
   if (sub.failed_) return false;
   return fit_document(*doc, width, 0, out);
 }
@@ -558,7 +689,7 @@ bool DocumentRenderer::prepare_item(Item* item, const Style& inside, uint32_t co
     sub.root_.indent = 0;
     sub.container_cols_ = kWide;
     sub.walk(item->node);
-    sub.flush();
+    sub.finish();
     if (sub.failed_) return false;
     uint32_t widest = 0, word = 0;
     for (uint64_t k = 0; k < doc->run_count(); ++k) {
@@ -2039,6 +2170,51 @@ bool DocumentRenderer::layout_grid(const dom::Node* container, const Style& s, u
   return !failed_;
 }
 
-bool DocumentRenderer::layout_columns(const dom::Node*, const Style&, uint32_t, Raster*) { return false; }
+// columns / column-count / column-width: the content is laid out at the width of one column, then dealt out over the columns, evenly.
+bool DocumentRenderer::layout_columns(const dom::Node* n, const Style& s, uint32_t content_cols, Raster* out) {
+  allocators::IAllocator& a = out_.allocator();
+  const uint32_t gap = s.column_gap.is_px() ? cols_of(s.column_gap) : 2;
+  uint32_t count = s.column_count > 0 ? s.column_count : 0;
+  if (s.column_width.is_px()) {
+    const uint32_t want = cols_of(s.column_width) < 1 ? 1 : cols_of(s.column_width);
+    const uint32_t fit = (content_cols + gap) / (want + gap);
+    if (count == 0 || fit < count) count = fit;
+  }
+  if (count > 20) count = 20;
+  if (count < 2) return false;
+  while (count > 1 && content_cols < gap * (count - 1) + count) --count;
+  if (count < 2) return false;
+  const uint32_t column_w = (content_cols - gap * (count - 1)) / count;
+  const Style inside = inside_style(s, column_w);
+  Raster flow(a);
+  if (!draw_content(n, inside, column_w, &flow)) return false;
+  const uint32_t total = flow.lines();
+  const uint32_t per = total == 0 ? 0 : (total + count - 1) / count;
+  out->clear();
+  out->width = content_cols;
+  auto spaces = [&](uint32_t n_cols) {
+    if (n_cols == 0) return;
+    LinePiece p(a);
+    for (uint32_t k = 0; k < n_cols; ++k) p.text.push_back(' ');
+    failed_ |= !out->pieces.push_back(util::move(p));
+  };
+  for (uint32_t row = 0; row < per && !failed_; ++row) {
+    for (uint32_t c = 0; c < count; ++c) {
+      const uint32_t line = c * per + row;
+      uint32_t used = 0;
+      if (line < total) {
+        for (uint32_t k = line ? flow.ends[line - 1] : 0; k < flow.ends[line]; ++k) {
+          used += static_cast<uint32_t>(flow.pieces[k].text.size());
+          failed_ |= !out->pieces.push_back(copy_piece(a, flow.pieces[k]));
+        }
+      }
+      if (used < column_w) spaces(column_w - used);
+      if (c + 1 < count) spaces(gap);
+    }
+    failed_ |= !out->ends.push_back(static_cast<uint32_t>(out->pieces.count()));
+  }
+  if (per == 0) failed_ |= !out->ends.push_back(static_cast<uint32_t>(out->pieces.count()));
+  return !failed_;
+}
 
 }  // namespace browser
