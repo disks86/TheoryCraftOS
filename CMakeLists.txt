@@ -246,6 +246,7 @@ add_executable(BOOTX64
   src/Dom/Form.cpp
   src/Dom/Entities.cpp
   src/Dom/HtmlBuilder.cpp
+  src/Regex/Regex.cpp
   src/Script/Number.cpp
   src/Script/Parser.cpp
   src/Script/Compiler.cpp

@@ -61,7 +61,7 @@ class ArrayView {
   constexpr T* end() const { return data_ + size_; }
 
   // Checked element access.
-  T& operator[](uint64_t index) const {
+  constexpr T& operator[](uint64_t index) const {
     if (index >= size_) bounds_violation("ArrayView::operator[]", index, size_);
     return data_[index];
   }

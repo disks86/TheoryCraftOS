@@ -51,7 +51,7 @@ class StringView {
   constexpr const char* end() const { return data_ + size_; }
 
   // Checked access: an index at or past the end stops the OS.
-  char operator[](uint64_t index) const {
+  constexpr char operator[](uint64_t index) const {
     if (index >= size_) bounds_violation("StringView::operator[]", index, size_);
     return data_[index];
   }
@@ -142,7 +142,7 @@ class StringView {
     return true;
   }
 
-  bool equals(StringView other) const {
+  constexpr bool equals(StringView other) const {
     if (size_ != other.size_) return false;
     for (uint64_t i = 0; i < size_; ++i)
       if (data_[i] != other.data_[i]) return false;

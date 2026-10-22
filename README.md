@@ -46,6 +46,10 @@ releases the hardware and powers off. A boot with warnings or failures waits (up
   time. The `system` driver (`system://localhost/system`, no network needed) makes it an ordinary `IConnection`, so the Database query application opens
   it like any server; `SystemSettings` is the typed key-value face programs use (`get_int("audio", "volume", 80)`, `set_text(...)`; the query window
   keeps its last URL there). Tested by `tests/SystemDatabaseTest.cpp`.
+- **Regex/** a regular expression engine (ECMAScript-like syntax: classes, groups and named groups, backreferences, lazy quantifiers, `{n,m}`, lookahead, anchors, `\b`,
+  case-insensitive / multiline / dot-all / UTF-8 flags; no lookbehind). One compiler and one backtracking matcher serve both front ends: `regex::compile<"...">()` builds the
+  program while the C++ is compiled (fixed tables, no allocator, usable in `static_assert`; a bad pattern is a compile error) and `regex::Regex` compiles text at run time from an
+  `IAllocator`. Searches run under step and stack limits (`Result::StepLimit` / `StackLimit` instead of a hang). Tested by `tests/RegexTest.cpp`.
 - **Script/** a JavaScript engine (a practical ES5 subset with let / const, arrow functions, template literals, spread and for-of): `Parser` makes a syntax
   tree, `Compiler` turns it into bytecode (variables are resolved to slots of per-call environments, `finally` is compiled in line), `Vm` runs it on a
   stack machine with its own mark-and-sweep heap, an instruction budget and a memory limit, and `Builtins` has Object, Array, String, Number, Math, JSON, Date,
