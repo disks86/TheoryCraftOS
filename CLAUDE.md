@@ -1,5 +1,18 @@
 # TheoryCraftOS
 
+## Memory safety
+
+Write new code so that memory errors cannot happen, not so that they are unlikely:
+
+- Own memory with containers and smart pointers: `UniquePointer`/`SharedPointer`, `ByteBuffer`, `String`, and the `ObjectContainer` types, all allocator-backed. Never write `new`, `delete`, `malloc` or `free` in application code. Reuse an existing class before adding one.
+- Pass memory around as `ArrayView`/`ConstByteView`, `StringView`, `ByteReader` and `ByteWriter`, not as a pointer plus a length. A raw pointer is acceptable only as a non-owning, non-null reference to a single object, or at a hardware or ABI boundary (MMIO, DMA descriptors, the JS cell layout).
+- Use the bounds-checked accessors (`operator[]`, `subview()`, `first()`). Use `try_get()`, `try_subview()` or `ByteReader` where the input is untrusted, and handle failure.
+- Prefer range-based `for` loops. Use an index loop only when the index itself is needed (parallel arrays, offsets, reverse or strided walks).
+- Check arithmetic on sizes and offsets that come from input before using it (`n > limit - size` instead of `size + n > limit`). Growth loops must not be able to wrap.
+- Do not use `const_cast` to write into a buffer you own. Add a writable accessor instead, such as `ByteBuffer::writable_view()`. Do not use C string or memory functions (`strcpy`, `sprintf`, raw `memcpy`); use the view `copy_from`/`fill` methods.
+- Keep every `reinterpret_cast` in one small helper with a comment saying why it is safe (alignment, lifetime), and don't scatter casts through logic code.
+- New decoders and parsers need truncation and bit-flip cases in their host tests. Run them with `tests/run_host_tests.sh <TestName>`, which builds with ASan and UBSan, and fix any sanitizer report.
+
 ## Delegating routine work to a local model
 
 When possible, use Ollama with the `qwen3-coder-next` model (the `mcp__ollama__*` tools, e.g. `generate` or `chat`) for routine work:

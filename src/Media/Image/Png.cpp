@@ -173,7 +173,7 @@ bool decode_image_data(const Header& h, uint32_t width, uint32_t height, const P
   }
   ByteBuffer raw(allocator);
   if (!inflate(compressed, &raw, expected + 16) || raw.size() < expected) return false;
-  uint8_t* data = const_cast<uint8_t*>(raw.view().data());
+  uint8_t* data = raw.writable_view().data();
   const uint32_t bpp = h.bits_per_pixel() / 8 ? h.bits_per_pixel() / 8 : 1;
   if (!h.interlace) {
     if (!unfilter(data, height, h.row_bytes(width), bpp)) return false;

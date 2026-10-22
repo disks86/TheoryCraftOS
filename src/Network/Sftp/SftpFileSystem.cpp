@@ -492,7 +492,7 @@ Status SftpFileSystem::ensure_connected(Server& server) {
     if (length < 5 || length > kMaxReply || head[4] != kVersion) return Status::Network;
     ByteBuffer rest(allocator_);
     if (!rest.put_zeros(length - 1)) return Status::OutOfMemory;
-    s = ssh->receive(const_cast<uint8_t*>(rest.view().data()), static_cast<uint32_t>(length - 1));
+    s = ssh->receive(rest.writable_view().data(), static_cast<uint32_t>(length - 1));
     if (s != Status::Ok) return s;
     SshReader r(rest.view());
     if (r.u32() < 3) return Status::Unsupported;
@@ -530,7 +530,7 @@ Status SftpFileSystem::read_reply(Server& server, uint32_t* id, uint8_t* type, B
   reply->clear();
   if (length == 5) return Status::Ok;
   if (!reply->put_zeros(length - 5)) return Status::OutOfMemory;
-  return server.ssh->receive(const_cast<uint8_t*>(reply->view().data()), length - 5);
+  return server.ssh->receive(reply->writable_view().data(), length - 5);
 }
 
 Status SftpFileSystem::call(Server& server, uint8_t type, ConstByteView body, uint8_t* reply_type, ByteBuffer* reply, bool retry) {

@@ -802,7 +802,7 @@ bool Decoder::audio_packet(Bits& b) {
     if (emit) {
       for (uint32_t o = 0; o < out_channels_; ++o) {
         if (c != front_[o]) continue;
-        int16_t* dst = reinterpret_cast<int16_t*>(const_cast<uint8_t*>(pcm_.view().data()) + pcm_mark);
+        int16_t* dst = reinterpret_cast<int16_t*>(pcm_.writable_view().data() + pcm_mark);
         for (uint32_t i = 0; i < emit; ++i) {
           float v = acc[i] * kScale;
           v = v < -32768.0f ? -32768.0f : v > 32767.0f ? 32767.0f : v;

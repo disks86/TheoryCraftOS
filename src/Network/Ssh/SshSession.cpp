@@ -176,11 +176,11 @@ Status SshSession::send_packet(ConstByteView payload) {
   w.u8(static_cast<uint8_t>(padding));
   w.raw(payload);
   if (!w.ok() || !packet.put_zeros(padding)) return Status::OutOfMemory;
-  if (!random_.fill(ByteView(const_cast<uint8_t*>(packet.view().data()) + packet.size() - padding, padding))) return Status::IoError;
+  if (!random_.fill(ByteView(packet.writable_view().data() + packet.size() - padding, padding))) return Status::IoError;
   uint8_t sequence[4] = {static_cast<uint8_t>(out_.sequence >> 24), static_cast<uint8_t>(out_.sequence >> 16), static_cast<uint8_t>(out_.sequence >> 8),
                          static_cast<uint8_t>(out_.sequence)};
   uint8_t mac[kMaxHashSize];
-  ByteView bytes(const_cast<uint8_t*>(packet.view().data()), packet.size());
+  ByteView bytes(packet.writable_view().data(), packet.size());
   if (out_.active) {
     ByteBuffer macdata(allocator_);
     if (out_.etm) {
@@ -214,7 +214,7 @@ Status SshSession::receive_packet(ByteBuffer* payload) {
       return Status::Network;
     }
     if (!body.put_zeros(length)) return Status::OutOfMemory;
-    s = read_exact(const_cast<uint8_t*>(body.view().data()), length);
+    s = read_exact(body.writable_view().data(), length);
     if (s != Status::Ok) return s;
   } else if (in_.etm) {
     Status s = read_exact(first, 4);
@@ -225,7 +225,7 @@ Status SshSession::receive_packet(ByteBuffer* payload) {
       return Status::Network;
     }
     if (!body.put_zeros(length)) return Status::OutOfMemory;
-    s = read_exact(const_cast<uint8_t*>(body.view().data()), length);
+    s = read_exact(body.writable_view().data(), length);
     if (s != Status::Ok) return s;
     s = read_exact(mac, in_.mac_length);
     if (s != Status::Ok) return s;
@@ -236,7 +236,7 @@ Status SshSession::receive_packet(ByteBuffer* payload) {
       fail();
       return Status::Network;
     }
-    in_.crypt(ByteView(const_cast<uint8_t*>(body.view().data()), body.size()));
+    in_.crypt(ByteView(body.writable_view().data(), body.size()));
   } else {
     Status s = read_exact(first, 16);
     if (s != Status::Ok) return s;
@@ -248,9 +248,9 @@ Status SshSession::receive_packet(ByteBuffer* payload) {
     }
     if (!body.append(ConstByteView(first + 4, 12)) || !body.put_zeros(length - 12)) return Status::OutOfMemory;
     if (length > 12) {
-      s = read_exact(const_cast<uint8_t*>(body.view().data()) + 12, length - 12);
+      s = read_exact(body.writable_view().data() + 12, length - 12);
       if (s != Status::Ok) return s;
-      in_.crypt(ByteView(const_cast<uint8_t*>(body.view().data()) + 12, length - 12));
+      in_.crypt(ByteView(body.writable_view().data() + 12, length - 12));
     }
     s = read_exact(mac, in_.mac_length);
     if (s != Status::Ok) return s;

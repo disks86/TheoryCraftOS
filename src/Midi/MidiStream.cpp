@@ -109,7 +109,7 @@ UniquePointer<audio::IPcmSource> open_midi_stream(media::IByteSource& source, al
   const uint64_t size = source.size();
   if (size < 14 || size > kMaxMidiFileBytes) return none;
   ByteBuffer file(allocator);
-  if (!file.put_zeros(size) || !media::read_exact(source, 0, ByteView(const_cast<uint8_t*>(file.view().data()), size))) return none;
+  if (!file.put_zeros(size) || !media::read_exact(source, 0, ByteView(file.writable_view().data(), size))) return none;
   UniquePointer<Sequence> sequence = UniquePointer<Sequence>::make(allocator, allocator);
   if (!sequence || !sequence->parse(file.view())) return none;
   UniquePointer<MidiPcmSource> stream = UniquePointer<MidiPcmSource>::make(allocator, allocator, util::move(sequence), hardware);

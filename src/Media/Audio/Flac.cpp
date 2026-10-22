@@ -646,7 +646,7 @@ class FlacStream final : public StreamingPcmSource {
         info_.total = (uint64_t{r.read(4)} << 32) | r.read(32);
         have_info = true;
       } else if (type == 3 && length <= (1u << 20) && length % 18 == 0) {   // SEEKTABLE: 18 bytes a point
-        if (seek_table_.put_zeros(length) && !read_exact(source_, at, ByteView(const_cast<uint8_t*>(seek_table_.view().data()), length))) return false;
+        if (seek_table_.put_zeros(length) && !read_exact(source_, at, ByteView(seek_table_.writable_view().data(), length))) return false;
       }
       at += length;
     }

@@ -137,7 +137,7 @@ class WaveBlockStream final : public StreamingPcmSource {
       return false;
     const uint64_t at = wav_.size();
     if (!wav_.put_zeros(bytes)) return false;
-    ByteView dest(const_cast<uint8_t*>(wav_.view().data()) + at, bytes);
+    ByteView dest(wav_.writable_view().data() + at, bytes);
     if (!read_exact(data_, first_block * block_, dest)) return false;
     return decode_wav(wav_.view(), &chunk_);
   }
@@ -375,7 +375,7 @@ UniquePointer<audio::IPcmSource> open_audio_stream(IByteSource& source, allocato
   const uint64_t head_size = source.size() < 16384 ? source.size() : 16384;
   ByteBuffer head(allocator);
   if (head_size == 0 || !head.put_zeros(head_size)) return none;
-  if (!read_exact(source, 0, ByteView(const_cast<uint8_t*>(head.view().data()), head_size))) return none;
+  if (!read_exact(source, 0, ByteView(head.writable_view().data(), head_size))) return none;
   const AudioFileFormat format = detect_audio_format(head.view());
   if (detected) *detected = format;
   switch (format) {

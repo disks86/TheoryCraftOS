@@ -40,7 +40,7 @@ uint32_t le16(const uint8_t* p) { return static_cast<uint32_t>(p[0] | (p[1] << 8
 uint64_t le64(const uint8_t* p) { return uint64_t{le32(p)} | (uint64_t{le32(p + 4)} << 32); }
 
 bool put64(ByteBuffer* b, uint64_t v) { return b->put32(static_cast<uint32_t>(v)) && b->put32(static_cast<uint32_t>(v >> 32)); }
-uint8_t* writable(ByteBuffer& b) { return const_cast<uint8_t*>(b.view().data()); }
+uint8_t* writable(ByteBuffer& b) { return b.writable_view().data(); }
 
 // ---- SPNEGO (RFC 4178), just enough to carry NTLMSSP: DER lengths and the two token shapes.
 bool der_length(ByteBuffer* b, uint64_t n) {

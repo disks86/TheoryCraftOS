@@ -275,7 +275,7 @@ bool AviFile::open(media::IByteSource& source) {
     if (tag_is(ConstByteView(h, 12), 0, "LIST") && length >= 4) {
       if (tag_is(ConstByteView(h, 12), 8, "hdrl")) {
         if (length - 4 > (16u << 20) || !headers_.put_zeros(length - 4) ||
-            cache.read(body + 4, ByteView(const_cast<uint8_t*>(headers_.view().data()), length - 4)) != length - 4)
+            cache.read(body + 4, ByteView(headers_.writable_view().data(), length - 4)) != length - 4)
           return false;
         have_headers = parse_headers(headers_.view()) || have_headers;
       } else if (tag_is(ConstByteView(h, 12), 8, "movi")) {
@@ -339,7 +339,7 @@ bool AviFile::frame(uint32_t index, VideoPacket* packet) const {
     packet->data = memory_.data().subview(c.offset, c.size);
   } else {
     scratch_.clear();
-    if (!scratch_.put_zeros(c.size) || source_->read(c.offset, ByteView(const_cast<uint8_t*>(scratch_.view().data()), c.size)) != c.size) return false;
+    if (!scratch_.put_zeros(c.size) || source_->read(c.offset, ByteView(scratch_.writable_view().data(), c.size)) != c.size) return false;
     packet->data = scratch_.view();
   }
   packet->pts_us = frame_time_us(index);

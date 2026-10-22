@@ -130,7 +130,7 @@ bool VideoPlayer::decode_frame(uint32_t index) {
     if (!packet_.append(y4m_head_.view()) || !packet_.put_tag("FRAM") || !packet_.put16('E' | ('\n' << 8))) return false;
     const uint64_t at = packet_.size();
     if (!packet_.put_zeros(y4m_frame_bytes_)) return false;
-    if (source_->read(y4m_first_ + uint64_t{index} * y4m_step_, ByteView(const_cast<uint8_t*>(packet_.view().data()) + at, y4m_frame_bytes_)) != y4m_frame_bytes_) return false;
+    if (source_->read(y4m_first_ + uint64_t{index} * y4m_step_, ByteView(packet_.writable_view().data() + at, y4m_frame_bytes_)) != y4m_frame_bytes_) return false;
     if (!media::decode_y4m(packet_.view(), &y4m_frame_) || y4m_frame_.frame_count() != 1) return false;
     ArrayView<uint32_t> pixels = y4m_frame_.frame(0);
     if (pixels.size() * 4 != display_.plane(0).size()) return false;

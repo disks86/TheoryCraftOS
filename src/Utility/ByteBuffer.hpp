@@ -32,12 +32,14 @@ class ByteBuffer {
 
   uint64_t size() const { return size_; }
   ConstByteView view() const { return ConstByteView(storage_).first(size_); }
+  // The bytes written so far, for reading a packet or file straight into the buffer (after put_zeros, say).
+  ByteView writable_view() { return storage_.first(size_); }
   void clear() { size_ = 0; }
   // Drops everything after the first `size` bytes.
   void truncate(uint64_t size) { if (size < size_) size_ = size; }
 
   bool append(ConstByteView bytes) {
-    if (!reserve(size_ + bytes.size())) return false;
+    if (bytes.size() > UINT64_MAX - size_ || !reserve(size_ + bytes.size())) return false;
     if (!bytes.empty()) storage_.subview(size_, bytes.size()).copy_from(bytes);
     size_ += bytes.size();
     return true;
@@ -57,7 +59,7 @@ class ByteBuffer {
     return append(ConstByteView(b, 4));
   }
   bool put_zeros(uint64_t count) {
-    if (!reserve(size_ + count)) return false;
+    if (count > UINT64_MAX - size_ || !reserve(size_ + count)) return false;
     storage_.subview(size_, count).fill(0);
     size_ += count;
     return true;
@@ -70,7 +72,7 @@ class ByteBuffer {
   }
   // Overwrites four bytes already written.
   bool patch32(uint64_t offset, uint32_t v) {
-    if (offset + 4 > size_) return false;
+    if (offset > size_ || size_ - offset < 4) return false;
     for (int i = 0; i < 4; ++i) storage_[offset + i] = static_cast<uint8_t>(v >> (8 * i));
     return true;
   }
@@ -79,7 +81,10 @@ class ByteBuffer {
   bool reserve(uint64_t needed) {
     if (needed <= storage_.size()) return true;
     uint64_t capacity = storage_.empty() ? 1024 : storage_.size();
-    while (capacity < needed) capacity *= 2;
+    while (capacity < needed) {
+      if (capacity > UINT64_MAX / 2) return false;
+      capacity *= 2;
+    }
     ByteView bigger = allocate_view<uint8_t>(allocator_, capacity);
     if (bigger.empty()) return false;
     if (size_) bigger.first(size_).copy_from(ConstByteView(storage_).first(size_));

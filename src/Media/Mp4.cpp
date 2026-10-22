@@ -359,7 +359,7 @@ bool Mp4File::read_sample(IByteSource& source, const Mp4Track& t, uint32_t index
   if (size == 0) return true;
   const uint64_t at = out->size();
   if (!out->put_zeros(size)) return false;
-  return source.read(off, ByteView(const_cast<uint8_t*>(out->view().data()) + at, size)) == size;
+  return source.read(off, ByteView(out->writable_view().data() + at, size)) == size;
 }
 
 ConstByteView Mp4File::sample(const Mp4Track& t, uint32_t index) const {

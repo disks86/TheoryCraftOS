@@ -99,7 +99,7 @@ Status RpcClient::receive_record(ByteBuffer* record) {
     const uint64_t at = record->size();
     if (!record->put_zeros(length)) return Status::OutOfMemory;
     if (length) {
-      s = receive_exact(const_cast<uint8_t*>(record->view().data()) + at, length);
+      s = receive_exact(record->writable_view().data() + at, length);
       if (s != Status::Ok) return s;
     }
     if (word & 0x80000000u) return Status::Ok;

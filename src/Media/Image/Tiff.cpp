@@ -214,7 +214,7 @@ bool decode_tiff(ConstByteView data, Image* out) {
       if (!ok) break;
       // Missing data (a short last strip, or a truncated chunk) reads as zero.
       if (raw.size() < chunk_bytes && !raw.put_zeros(chunk_bytes - raw.size())) { ok = false; break; }
-      uint8_t* bytes = const_cast<uint8_t*>(raw.view().data());
+      uint8_t* bytes = raw.writable_view().data();
       const uint32_t cx = tiled ? (c % across) * chunk_w : 0, cy = (tiled ? c / across : c) * chunk_h;
       const uint32_t rows = cy + chunk_h > height ? height - cy : chunk_h;
       const uint32_t cols = cx + chunk_w > width ? width - cx : chunk_w;
