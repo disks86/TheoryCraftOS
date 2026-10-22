@@ -50,6 +50,9 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       paint_(allocator),
       spreadsheet_(allocator),
       database_query_(allocator),
+      cookie_jar_(allocator),
+      local_storage_(allocator),
+      page_hub_(allocator),
       web_browser_(allocator),
       terminal_(allocator),
       media_player_(allocator),
@@ -251,6 +254,8 @@ void Desktop::setup_web_browser(WebBrowser& web) {
   web.set_file_dialog(&file_dialog_);
   web.set_file_system(fs_);
   web.set_page_loader(page_loader_);
+  web.set_cookie_jar(&cookie_jar_);
+  web.set_shared_hubs(&local_storage_, &page_hub_);
   web.set_clock(&Desktop::unix_ms, this);
   web.set_media_services(media_mixer_, media_codecs_, media_clock_);
 }

@@ -156,6 +156,39 @@ class Vm {
   void set_skew(double skew_ms) { skew_ms_ = skew_ms; }
   double skew() const { return skew_ms_; }
 
+  // --- Promises and microtasks. A promise settles once; what is attached to it with promise_then() runs as a microtask. Microtasks run when the outermost
+  // call into the VM (run(), call()) has finished, before control goes back to the host - that is when `await` continues and `then` callbacks run.
+  JsObject* promise_proto() { return promise_proto_; }
+  JsObject* new_promise();
+  static bool is_promise(const Value& v) { return v.is_object() && v.as_object()->okind == ObjKind::Promise; }
+  // The state of a promise: 0 pending, 1 fulfilled, 2 rejected; `value` gets the result or the reason.
+  static uint32_t promise_state(const JsObject* p) { return p->position & kPromiseState; }
+  static Value promise_value(const JsObject* p) { return p->bound_this; }
+  // Resolves it with a value (a promise or a thenable is followed), fulfils it or rejects it. Does nothing if it has settled.
+  void promise_resolve(JsObject* promise, const Value& value);
+  void promise_fulfill(JsObject* promise, const Value& value);
+  void promise_reject(JsObject* promise, const Value& reason);
+  // Attaches callbacks (functions, or undefined to pass the result on); `derived` (may be null) is settled with what they return.
+  void promise_then(JsObject* promise, const Value& on_fulfilled, const Value& on_rejected, JsObject* derived);
+  // A promise already resolved with `value` (`value` itself if it is a promise).
+  JsObject* promise_resolved(const Value& value);
+  // The `resolve` / `reject` function of a promise; `shared` is a plain object that the pair of them share (once one has been called, the other does nothing).
+  JsObject* resolving_function(JsObject* promise, JsObject* shared, bool reject);
+  // Takes the pending exception as a value (and clears it).
+  void take_exception_value(Value* out) {
+    *out = exception_;
+    has_exception_ = false;
+    exception_ = Value();
+  }
+  // Runs `function` (no arguments) after the current script.
+  void enqueue_microtask(const Value& function);
+  // Runs the queued microtasks now (what the outermost call does by itself).
+  void run_microtasks();
+  bool microtasks_pending() const { return micro_ && micro_head_ < micro_->length; }
+  // A native function that keeps values of its own: they are in current_native()->items while it runs (read them before calling anything else).
+  JsObject* new_native_with(NativeFn fn, StringView name, uint32_t arity, const Value* data, uint32_t count);
+  JsObject* current_native() { return current_native_; }
+
   // --- For the host that installs objects: a pointer of its own, an own property (no host callbacks, no prototype chain) and a hold on the collector (the
   // collector does not run while anything holds it: for C++ code that keeps script values in its own variables across calls into scripts).
   void set_user(void* user) { user_ = user; }
@@ -185,6 +218,7 @@ class Vm {
     uint32_t handlers;       // how many handlers there were when the call started
     bool construct;
     Value construct_this;
+    JsObject* coroutine;     // the async function this frame is running (its state is saved here at an `await`)
   };
   struct Handler {
     uint32_t pc;
@@ -224,6 +258,18 @@ class Vm {
   bool spread_into(JsObject* array, const Value& iterable);
   bool lookup_global(JsString* name, Value* out);
   bool push(const Value& v);
+  // async functions
+  struct Coroutine;
+  Coroutine* coroutine_of(JsObject* co) const;
+  bool start_async(JsObject* function, const Value& this_value, const Value* args, uint32_t argc, uint32_t base, Value* result);
+  bool run_coroutine(JsObject* co, bool start, bool throwing, const Value& input);
+  void async_wait(JsObject* co, const Value& awaited);
+  // promises
+  void promise_settle(JsObject* promise, uint32_t state, const Value& value);
+  void promise_job(const Value& handler, const Value& argument, const Value& derived, uint32_t kind);
+  void enqueue_job(const Value& handler, const Value& argument, const Value& derived, uint32_t kind);
+  void report_rejections();
+  void checkpoint();
 
   allocators::IAllocator& allocator_;
   IHost* host_;
@@ -248,6 +294,11 @@ class Vm {
   JsObject *global_ = nullptr, *object_proto_ = nullptr, *array_proto_ = nullptr, *function_proto_ = nullptr, *string_proto_ = nullptr, *number_proto_ = nullptr,
            *boolean_proto_ = nullptr, *error_proto_ = nullptr, *iterator_proto_ = nullptr, *sentinel_ = nullptr;
   JsObject* error_protos_[5] = {};
+  JsObject *promise_proto_ = nullptr, *micro_ = nullptr, *rejections_ = nullptr, *current_native_ = nullptr;
+  uint32_t micro_head_ = 0;
+  bool draining_ = false, suspended_ = false;
+  uint32_t async_depth_ = 0;
+  Value await_value_, pinned_;
   JsString *empty_ = nullptr, *length_ = nullptr, *prototype_ = nullptr, *name_ = nullptr, *message_ = nullptr, *constructor_ = nullptr, *to_string_ = nullptr,
            *value_of_ = nullptr, *undefined_text_ = nullptr, *null_text_ = nullptr, *true_text_ = nullptr, *false_text_ = nullptr;
   // limits

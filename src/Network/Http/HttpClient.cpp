@@ -31,6 +31,7 @@ const char* http_method_name(HttpMethod method) {
     case HttpMethod::Put: return "PUT";
     case HttpMethod::Delete: return "DELETE";
     case HttpMethod::Patch: return "PATCH";
+    case HttpMethod::Options: return "OPTIONS";
   }
   return "GET";
 }

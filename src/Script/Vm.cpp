@@ -36,10 +36,25 @@ const char* const kErrorNames[5] = {"Error", "TypeError", "RangeError", "Referen
 
 }  // namespace
 
+// An async function that is waiting at an `await`: what its frame looked like then.
+struct Vm::Coroutine {
+  explicit Coroutine(allocators::IAllocator& allocator) : stack(allocator), handlers(allocator) {}
+  FunctionCode* code = nullptr;
+  uint32_t pc = 0;
+  Env* env = nullptr;
+  Value this_value;
+  JsObject* callee = nullptr;
+  JsObject* promise = nullptr;   // the promise the call returned
+  List<Value> stack;             // the values the frame had on the stack
+  List<Handler> handlers;        // its try handlers (their `stack` counts from the frame's base)
+  bool running = false;
+};
+
 // --- Construction ------------------------------------------------------------------------------------------------
 
 Vm::Vm(allocators::IAllocator& allocator, IHost* host)
     : allocator_(allocator), host_(host), gray_(allocator), codes_(allocator), halt_reason_(allocator), frames_(allocator), handlers_(allocator) {
+  frames_.reserve(kMaxFrames + 8);   // (the interpreter keeps pointers to frames: the list must never move them)
   stack_ = static_cast<Value*>(allocator_.allocate(sizeof(Value) * kStackValues));
   interned_cap_ = 1024;
   interned_ = static_cast<JsString**>(allocator_.allocate(sizeof(JsString*) * interned_cap_));
@@ -67,6 +82,9 @@ Vm::Vm(allocators::IAllocator& allocator, IHost* host)
   iterator_proto_ = new_object(object_proto_);
   sentinel_ = new_object(object_proto_);
   global_ = new_object(object_proto_);
+  promise_proto_ = new_object(object_proto_);
+  micro_ = new_array();
+  rejections_ = new_array();
   error_protos_[0] = error_proto_;
   for (int i = 1; i < 5; ++i) error_protos_[i] = new_object(error_proto_);
   ok_ = empty_ && global_ && error_protos_[4] && install_builtins(*this);
@@ -107,6 +125,12 @@ void Vm::recover() {
     sp_ = 0;
   }
   if (halted_ && ok_) {
+    if (micro_) micro_->length = 0;
+    if (rejections_) rejections_->length = 0;
+    micro_head_ = 0;
+    draining_ = false;
+    suspended_ = false;
+    async_depth_ = 0;
     halted_ = false;
     halt_reason_.clear();
     has_exception_ = false;
@@ -142,6 +166,11 @@ void Vm::free_cell(Cell* cell) {
     case CellKind::Env: allocator_.deallocate(cell); break;
     case CellKind::Object: {
       JsObject* o = static_cast<JsObject*>(cell);
+      if (o->okind == ObjKind::Coroutine && o->host_data) {
+        Coroutine* co = static_cast<Coroutine*>(o->host_data);
+        co->~Coroutine();
+        allocator_.deallocate(co);
+      }
       allocator_.deallocate(o->props);
       allocator_.deallocate(o->index);
       allocator_.deallocate(o->items);
@@ -360,6 +389,15 @@ void Vm::trace() {
       mark(o->env);
       mark(o->target);
       mark_value(o->bound_this);
+      if (o->okind == ObjKind::Coroutine && o->host_data) {
+        Coroutine* co = static_cast<Coroutine*>(o->host_data);
+        mark(co->env);
+        mark_value(co->this_value);
+        mark(co->callee);
+        mark(co->promise);
+        for (uint64_t i = 0; i < co->stack.count(); ++i) mark_value(co->stack[i]);
+        for (uint64_t i = 0; i < co->handlers.count(); ++i) mark(co->handlers[i].env);
+      }
     }
   }
 }
@@ -399,10 +437,16 @@ void Vm::collect() {
     mark_value(f.this_value);
     mark(f.callee);
     mark_value(f.construct_this);
+    mark(f.coroutine);
   }
   for (uint64_t i = 0; i < handlers_.count(); ++i) mark(handlers_[i].env);
   mark_value(exception_);
   mark_value(last_result_);
+  mark_value(await_value_);
+  mark_value(pinned_);
+  mark(promise_proto_);
+  mark(micro_);
+  mark(rejections_);
   for (JsObject* o : {global_, object_proto_, function_proto_, array_proto_, string_proto_, number_proto_, boolean_proto_, error_proto_, iterator_proto_, sentinel_}) mark(o);
   for (int i = 0; i < 5; ++i) mark(error_protos_[i]);
   for (JsString* s : {empty_, length_, prototype_, name_, message_, constructor_, to_string_, value_of_, undefined_text_, null_text_, true_text_, false_text_}) mark(s);
@@ -1266,7 +1310,27 @@ bool Vm::make_iterator(const Value& v, bool for_in, Value* out) {
     *out = Value::make_object(it);
     return true;
   }
-  if (!(v.is_string() || (v.is_object() && v.as_object()->okind == ObjKind::Array))) {
+  if (v.is_object() && v.as_object()->okind != ObjKind::Array) {
+    // an object with an [Symbol.iterator]() method (the key is "@@iterator"): arrays and strings it returns are walked directly, anything else is an
+    // iterator whose next() is called for each value
+    Value method;
+    if (!get(v, intern("@@iterator"), &method)) return false;
+    if (is_callable(method)) {
+      Value made;
+      if (!call_value(method, v, nullptr, 0, &made, false)) return false;
+      if (made.is_string() || (made.is_object() && made.as_object()->okind == ObjKind::Array)) {
+        it->bound_this = made;
+      } else if (made.is_object()) {
+        it->bound_this = made;
+        it->frozen = true;   // (an iterator object whose next() is called)
+      } else {
+        return throw_error(ErrorKind::TypeError, "Result of the Symbol.iterator method is not an object");
+      }
+      *out = Value::make_object(it);
+      return true;
+    }
+  }
+  if (!(it->bound_this.is_string() || (it->bound_this.is_object() && it->bound_this.as_object()->okind == ObjKind::Array))) {
     String message(allocator_);
     describe(v, &message, 1);
     message.append(" is not iterable");
@@ -1280,6 +1344,18 @@ bool Vm::make_iterator(const Value& v, bool for_in, Value* out) {
 
 bool Vm::iterator_next(JsObject* it, Value* out) {
   const Value& src = it->bound_this;
+  if (it->frozen) {   // an iterator object: call its next()
+    Value next, step, done;
+    if (!get_named(src, "next", &next)) return false;
+    if (!call_value(next, src, nullptr, 0, &step, false)) return false;
+    if (!step.is_object()) {
+      throw_error(ErrorKind::TypeError, "Iterator result is not an object");
+      return false;
+    }
+    if (!get_named(step, "done", &done)) return false;
+    if (to_boolean(done)) return false;
+    return get_named(step, "value", out);
+  }
   if (it->target) {   // for-in: a list of keys
     JsObject* keys = it->target;
     if (it->position < keys->length) {
@@ -1315,7 +1391,7 @@ bool Vm::spread_into(JsObject* array, const Value& iterable) {
   while (iterator_next(it, &item)) {
     if (!array_push(array, item)) break;
   }
-  return true;
+  return !has_exception_;
 }
 
 // --- Calls and the interpreter -----------------------------------------------------------------------------------
@@ -1366,6 +1442,7 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   f.handlers = static_cast<uint32_t>(handlers_.count());
   f.construct = construct;
   f.construct_this = construct_this;
+  f.coroutine = nullptr;
   if (!frames_.push_back(f)) return throw_error(ErrorKind::RangeError, "out of memory");
   return true;
 }
@@ -1444,6 +1521,7 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     }
     ++native_depth_;
     Value r;
+    current_native_ = f;
     const bool ok = f->native(*this, this_for_call, a, total, &r);
     --native_depth_;
     sp_ = base;
@@ -1451,9 +1529,14 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     *result = construct && !r.is_object() ? created : r;
     return true;
   }
-  if (construct && f->code->is_arrow) {
+  if (construct && (f->code->is_arrow || f->code->is_async)) {
     sp_ = base;
     return throw_error(ErrorKind::TypeError, "function is not a constructor");
+  }
+  if (f->code->is_async) {
+    const bool started = start_async(f, this_for_call, a, total, base, result);
+    sp_ = base;
+    return started;
   }
   const uint32_t entry = static_cast<uint32_t>(frames_.count());
   if (!push_frame(f, this_for_call, a, total, base, construct, created)) {
@@ -1468,8 +1551,26 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
   return true;
 }
 
-bool Vm::call(const Value& function, const Value& this_value, const Value* args, uint32_t argc, Value* result) { return call_value(function, this_value, args, argc, result, false); }
-bool Vm::construct(const Value& function, const Value* args, uint32_t argc, Value* result) { return call_value(function, Value(), args, argc, result, true); }
+bool Vm::call(const Value& function, const Value& this_value, const Value* args, uint32_t argc, Value* result) {
+  const bool ok = call_value(function, this_value, args, argc, result, false);
+  if (ok) {
+    pinned_ = *result;
+    checkpoint();
+    *result = pinned_;
+    pinned_ = Value();
+  }
+  return ok;
+}
+bool Vm::construct(const Value& function, const Value* args, uint32_t argc, Value* result) {
+  const bool ok = call_value(function, Value(), args, argc, result, true);
+  if (ok) {
+    pinned_ = *result;
+    checkpoint();
+    *result = pinned_;
+    pinned_ = Value();
+  }
+  return ok;
+}
 
 bool Vm::run(FunctionCode* code, Value* result) {
   if (!ok_ || halted_) return false;
@@ -1477,7 +1578,12 @@ bool Vm::run(FunctionCode* code, Value* result) {
   JsObject* fn = new_function(code, nullptr, Value());
   Value r;
   const bool ok = call_value(Value::make_object(fn), Value::make_object(global_), nullptr, 0, &r, false);
-  if (ok) *result = r;
+  if (ok) {
+    pinned_ = r;
+    checkpoint();
+    *result = pinned_;
+    pinned_ = Value();
+  }
   return ok;
 }
 
@@ -1677,7 +1783,7 @@ reload:
           args = arg_array->items;
           argc = arg_array->length;
         }
-        if (callee.is_object() && callee.as_object()->okind == ObjKind::Function && !(is_new && callee.as_object()->code->is_arrow)) {
+        if (callee.is_object() && callee.as_object()->okind == ObjKind::Function && !callee.as_object()->code->is_async && !(is_new && callee.as_object()->code->is_arrow)) {
           JsObject* f = callee.as_object();
           Value this_for_call = self, created;
           if (is_new) {
@@ -1707,6 +1813,7 @@ reload:
             THROW_PENDING();
           }
           ++native_depth_;
+          current_native_ = callee.as_object();
           const bool ok = callee.as_object()->native(*this, this_for_call, args, argc, &result);
           --native_depth_;
           CHECK(ok);
@@ -1857,6 +1964,7 @@ reload:
         Value v;
         if (iterator_next(it, &v)) stack_[sp_ - 1] = v;
         else {
+          if (has_exception_) THROW_PENDING();
           --sp_;
           pc = static_cast<uint32_t>(in.a);
         }
@@ -1870,12 +1978,362 @@ reload:
       case Opc::TryEnd:
         if (handlers_.count() > 0) handlers_.remove_at(handlers_.count() - 1);
         break;
+      case Opc::Await: {
+        // The async function stops here: its frame, the values it has on the stack and its handlers are saved in its coroutine, and the VM goes back to
+        // whoever started or resumed it (run_coroutine), which waits for the value to settle.
+        Coroutine* saved = fp->coroutine ? coroutine_of(fp->coroutine) : nullptr;
+        if (!saved || frames_.count() != entry_depth + 1) {
+          throw_error(ErrorKind::SyntaxError, "await is only valid in async functions");
+          THROW_PENDING();
+        }
+        const Value awaited = stack_[sp_ - 1];
+        --sp_;
+        saved->code = fp->code;
+        saved->pc = pc;
+        saved->env = fp->env;
+        saved->this_value = fp->this_value;
+        saved->callee = fp->callee;
+        saved->stack.clear();
+        saved->handlers.clear();
+        bool fits = true;
+        for (uint32_t i = fp->base; i < sp_ && fits; ++i) fits = saved->stack.push_back(stack_[i]);
+        for (uint64_t i = fp->handlers; i < handlers_.count() && fits; ++i) fits = saved->handlers.push_back(Handler{handlers_[i].pc, handlers_[i].stack - fp->base, 0, handlers_[i].env});
+        if (!fits) {
+          halt("out of memory");
+          continue;
+        }
+        while (handlers_.count() > fp->handlers) handlers_.remove_at(handlers_.count() - 1);
+        sp_ = fp->base;
+        frames_.remove_at(frames_.count() - 1);
+        await_value_ = awaited;
+        suspended_ = true;
+        return true;
+      }
     }
   }
 #undef THROW_PENDING
 #undef CHECK
 #undef PUSH
 }
+
+// --- Promises, microtasks and async functions ---------------------------------------------------------------------------
+
+namespace {
+
+// The functions a promise is resolved or rejected with (`resolve` and `reject` of the executor). Their data: [promise, shared flag object].
+bool resolving_native(Vm& vm, const Value&, const Value* args, uint32_t argc, Value* result, bool reject) {
+  JsObject* self = vm.current_native();
+  JsObject* promise = self->items[0].as_object();
+  JsObject* shared = self->items[1].as_object();
+  *result = Value();
+  if (shared->position) return true;
+  shared->position = 1;
+  const Value v = argc > 0 ? args[0] : Value();
+  if (reject) vm.promise_reject(promise, v);
+  else vm.promise_resolve(promise, v);
+  return true;
+}
+bool resolve_function(Vm& vm, const Value& t, const Value* args, uint32_t argc, Value* result) { return resolving_native(vm, t, args, argc, result, false); }
+bool reject_function(Vm& vm, const Value& t, const Value* args, uint32_t argc, Value* result) { return resolving_native(vm, t, args, argc, result, true); }
+
+}  // namespace
+
+JsObject* Vm::new_native_with(NativeFn fn, StringView name, uint32_t arity, const Value* data, uint32_t count) {
+  JsObject* f = new_native(fn, name, arity);
+  if (f == sentinel_) return f;
+  if (count && ensure_items(f, count)) {
+    for (uint32_t i = 0; i < count; ++i) f->items[i] = data[i];
+    f->length = count;
+  }
+  return f;
+}
+
+JsObject* Vm::new_promise() {
+  JsObject* p = new_object(promise_proto_);
+  p->okind = ObjKind::Promise;
+  return p;
+}
+
+JsObject* Vm::resolving_function(JsObject* promise, JsObject* shared, bool reject) {
+  const Value data[2] = {Value::make_object(promise), Value::make_object(shared)};
+  return new_native_with(reject ? reject_function : resolve_function, "", 1, data, 2);
+}
+
+void Vm::promise_settle(JsObject* promise, uint32_t state, const Value& value) {
+  if (promise_state(promise) != kPromisePending) return;
+  promise->position = (promise->position & ~kPromiseState) | state;
+  promise->bound_this = value;
+  // the reactions that were waiting
+  const uint32_t count = promise->length;
+  Value* items = promise->items;
+  List<Value> copy(allocator_);
+  for (uint32_t i = 0; i < count; ++i) copy.push_back(items[i]);
+  promise->length = 0;
+  for (uint32_t i = 0; i + 2 < count; i += 3) {
+    enqueue_job(state == kPromiseFulfilled ? copy[i] : copy[i + 1], value, copy[i + 2], state == kPromiseFulfilled ? 0 : 1);
+  }
+  if (state == kPromiseRejected && !(promise->position & kPromiseHandled) && rejections_) array_push(rejections_, Value::make_object(promise));
+}
+
+void Vm::promise_fulfill(JsObject* promise, const Value& value) { promise_settle(promise, kPromiseFulfilled, value); }
+void Vm::promise_reject(JsObject* promise, const Value& reason) { promise_settle(promise, kPromiseRejected, reason); }
+
+void Vm::promise_resolve(JsObject* promise, const Value& value) {
+  if (promise_state(promise) != kPromisePending) return;
+  if (value.is_object() && value.as_object() == promise) {
+    promise_reject(promise, Value::make_object(new_error(ErrorKind::TypeError, "Chaining cycle detected for promise")));
+    return;
+  }
+  if (!value.is_object()) {
+    promise_fulfill(promise, value);
+    return;
+  }
+  Value then;
+  if (!get_named(value, "then", &then)) {
+    const Value reason = exception_;
+    has_exception_ = false;
+    exception_ = Value();
+    promise_reject(promise, reason);
+    return;
+  }
+  if (!is_callable(then)) {
+    promise_fulfill(promise, value);
+    return;
+  }
+  enqueue_job(then, value, Value::make_object(promise), 3);
+}
+
+void Vm::promise_then(JsObject* promise, const Value& on_fulfilled, const Value& on_rejected, JsObject* derived) {
+  const Value derived_value = derived ? Value::make_object(derived) : Value();
+  const uint32_t state = promise_state(promise);
+  promise->position |= kPromiseHandled;
+  if (state == kPromisePending) {
+    if (!ensure_items(promise, promise->length + 3)) return;
+    promise->items[promise->length++] = on_fulfilled;
+    promise->items[promise->length++] = on_rejected;
+    promise->items[promise->length++] = derived_value;
+    return;
+  }
+  enqueue_job(state == kPromiseFulfilled ? on_fulfilled : on_rejected, promise->bound_this, derived_value, state == kPromiseFulfilled ? 0 : 1);
+}
+
+JsObject* Vm::promise_resolved(const Value& value) {
+  if (is_promise(value)) return value.as_object();
+  JsObject* p = new_promise();
+  promise_resolve(p, value);
+  return p;
+}
+
+void Vm::enqueue_job(const Value& handler, const Value& argument, const Value& derived, uint32_t kind) {
+  if (!micro_ || !ensure_items(micro_, micro_->length + 4)) return;
+  micro_->items[micro_->length++] = handler;
+  micro_->items[micro_->length++] = argument;
+  micro_->items[micro_->length++] = derived;
+  micro_->items[micro_->length++] = Value::make_number(kind);
+  if (micro_->length > (1u << 22)) halt("too many promise callbacks");
+}
+
+void Vm::enqueue_microtask(const Value& function) { enqueue_job(function, Value(), Value(), 2); }
+
+void Vm::promise_job(const Value& handler, const Value& argument, const Value& derived, uint32_t kind) {
+  JsObject* target = derived.is_object() ? derived.as_object() : nullptr;
+  if (kind == 2) {   // queueMicrotask
+    Value ignored;
+    if (!call_value(handler, Value(), nullptr, 0, &ignored, false) && !halted_) {
+      String text(allocator_);
+      take_exception(&text);
+      if (host_) {
+        String line(allocator_);
+        line.append("Uncaught ");
+        line.append(text.view());
+        host_->console(3, line.view());
+      }
+    }
+    return;
+  }
+  if (kind == 3) {   // a promise that was resolved with a thenable follows it
+    JsObject* shared = new_plain();
+    JsObject* resolve = resolving_function(target, shared, false);
+    JsObject* reject = resolving_function(target, shared, true);
+    const Value fn_args[2] = {Value::make_object(resolve), Value::make_object(reject)};
+    Value ignored;
+    if (!call_value(handler, argument, fn_args, 2, &ignored, false) && !halted_) {
+      const Value reason = exception_;
+      has_exception_ = false;
+      exception_ = Value();
+      if (!shared->position) {
+        shared->position = 1;
+        promise_reject(target, reason);
+      }
+    }
+    return;
+  }
+  const bool rejected = kind == 1;
+  if (handler.is_object() && handler.as_object()->okind == ObjKind::Coroutine) {
+    run_coroutine(handler.as_object(), false, rejected, argument);
+    return;
+  }
+  if (!is_callable(handler)) {   // no callback: the result passes through
+    if (target) {
+      if (rejected) promise_reject(target, argument);
+      else promise_resolve(target, argument);
+    }
+    return;
+  }
+  Value r;
+  if (call_value(handler, Value(), &argument, 1, &r, false)) {
+    if (target) promise_resolve(target, r);
+  } else if (!halted_) {
+    const Value reason = exception_;
+    has_exception_ = false;
+    exception_ = Value();
+    if (target) promise_reject(target, reason);
+  }
+}
+
+void Vm::report_rejections() {
+  if (!rejections_) return;
+  for (uint32_t i = 0; i < rejections_->length; ++i) {
+    if (!rejections_->items[i].is_object()) continue;
+    JsObject* p = rejections_->items[i].as_object();
+    if (p->position & kPromiseHandled) continue;
+    p->position |= kPromiseHandled;
+    if (!host_) continue;
+    String line(allocator_);
+    line.append("Uncaught (in promise) ");
+    describe(p->bound_this, &line, 0);
+    host_->console(3, line.view());
+  }
+  rejections_->length = 0;
+}
+
+void Vm::run_microtasks() {
+  if (draining_ || !micro_) return;
+  draining_ = true;
+  while (micro_head_ + 4 <= micro_->length && !halted_) {
+    // (the job stays in the queue, where the collector sees it, until it has run)
+    const Value handler = micro_->items[micro_head_], argument = micro_->items[micro_head_ + 1], derived = micro_->items[micro_head_ + 2];
+    const uint32_t kind = micro_->items[micro_head_ + 3].is_number() ? static_cast<uint32_t>(micro_->items[micro_head_ + 3].u.number) : 2;
+    promise_job(handler, argument, derived, kind);
+    micro_head_ += 4;
+    if (micro_head_ >= micro_->length) {
+      micro_->length = 0;
+      micro_head_ = 0;
+    } else if (micro_head_ >= 4096 && micro_head_ * 2 >= micro_->length) {
+      const uint32_t rest = micro_->length - micro_head_;
+      for (uint32_t i = 0; i < rest; ++i) micro_->items[i] = micro_->items[micro_head_ + i];
+      micro_->length = rest;
+      micro_head_ = 0;
+    }
+  }
+  if (halted_) {
+    micro_->length = 0;
+    micro_head_ = 0;
+  }
+  draining_ = false;
+  report_rejections();
+}
+
+void Vm::checkpoint() {
+  if (frames_.count() == 0 && native_depth_ == 0 && !draining_ && micro_ && micro_head_ < micro_->length) run_microtasks();
+  else if (frames_.count() == 0 && native_depth_ == 0 && !draining_ && rejections_ && rejections_->length) report_rejections();
+}
+
+Vm::Coroutine* Vm::coroutine_of(JsObject* co) const { return co && co->okind == ObjKind::Coroutine ? static_cast<Coroutine*>(co->host_data) : nullptr; }
+
+bool Vm::start_async(JsObject* function, const Value& this_value, const Value* args, uint32_t argc, uint32_t base, Value* result) {
+  (void)base;
+  if (sp_ + 4 >= kStackValues) return throw_error(ErrorKind::RangeError, "Maximum call stack size exceeded");
+  JsObject* promise = new_promise();
+  stack_[sp_++] = Value::make_object(promise);   // (kept reachable)
+  void* mem = allocator_.allocate(sizeof(Coroutine));
+  JsObject* co = new_object(nullptr);
+  if (!mem || co == sentinel_) {
+    if (mem) allocator_.deallocate(mem);
+    return throw_error(ErrorKind::RangeError, "out of memory");
+  }
+  co->okind = ObjKind::Coroutine;
+  Coroutine* state = new (mem) Coroutine(allocator_);
+  state->promise = promise;
+  co->host_data = state;
+  stack_[sp_++] = Value::make_object(co);
+  if (async_depth_ >= 100) return throw_error(ErrorKind::RangeError, "Maximum call stack size exceeded");
+  if (!push_frame(function, this_value, args, argc, sp_, false, Value())) return false;
+  frames_[frames_.count() - 1].coroutine = co;
+  if (!run_coroutine(co, true, false, Value())) return false;
+  *result = Value::make_object(promise);
+  return true;
+}
+
+bool Vm::run_coroutine(JsObject* co, bool start, bool throwing, const Value& input) {
+  Coroutine* s = coroutine_of(co);
+  if (!s || s->running) return true;
+  JsObject* promise = s->promise;
+  if (!start) {
+    if (frames_.count() >= kMaxFrames || sp_ + s->stack.count() + 4 >= kStackValues || async_depth_ >= 100) {
+      promise_reject(promise, Value::make_object(new_error(ErrorKind::RangeError, "Maximum call stack size exceeded")));
+      return true;
+    }
+    const uint32_t base = sp_;
+    Frame f;
+    f.code = s->code;
+    f.pc = s->pc;
+    f.env = s->env;
+    f.this_value = s->this_value;
+    f.callee = s->callee;
+    f.base = base;
+    f.handlers = static_cast<uint32_t>(handlers_.count());
+    f.construct = false;
+    f.coroutine = co;
+    for (uint64_t i = 0; i < s->stack.count(); ++i) stack_[sp_++] = s->stack[i];
+    const uint32_t index = static_cast<uint32_t>(frames_.count());
+    for (uint64_t i = 0; i < s->handlers.count(); ++i) handlers_.push_back(Handler{s->handlers[i].pc, s->handlers[i].stack + base, index, s->handlers[i].env});
+    frames_.push_back(f);
+    if (!throwing) stack_[sp_++] = input;
+    s->stack.clear();
+    s->handlers.clear();
+  }
+  const uint32_t entry = static_cast<uint32_t>(frames_.count() - 1);
+  const uint32_t resume_sp = frames_[entry].base;
+  s->running = true;
+  ++async_depth_;
+  suspended_ = false;
+  bool ok;
+  if (!start && throwing) {
+    throw_value(input);
+    ok = unwind(entry) && execute(entry);
+  } else {
+    ok = execute(entry);
+  }
+  --async_depth_;
+  s->running = false;
+  sp_ = resume_sp;
+  if (ok) {
+    if (suspended_) {
+      suspended_ = false;
+      const Value awaited = await_value_;
+      await_value_ = Value();
+      async_wait(co, awaited);
+    } else {
+      const Value r = last_result_;
+      last_result_ = Value();
+      promise_resolve(promise, r);
+    }
+    return true;
+  }
+  if (halted_) return false;
+  const Value reason = exception_;
+  has_exception_ = false;
+  exception_ = Value();
+  promise_reject(promise, reason);
+  return true;
+}
+
+void Vm::async_wait(JsObject* co, const Value& awaited) {
+  JsObject* p = promise_resolved(awaited);
+  promise_then(p, Value::make_object(co), Value::make_object(co), nullptr);
+}
+
 
 double Vm::add_timer(const Value& function, double delay_ms, double interval_ms, const Value* args, uint32_t argc) {
   Value list;

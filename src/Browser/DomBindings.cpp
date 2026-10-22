@@ -25,63 +25,29 @@ namespace browser {
 
 using namespace script;
 
-// --- StorageArea -------------------------------------------------------------------------------------------------
-
-bool StorageArea::get(StringView key, StringView* value) const {
-  for (uint64_t i = 0; i < keys_.count(); ++i) {
-    if (keys_[i].view().equals(key)) {
-      *value = values_[i].view();
-      return true;
-    }
-  }
-  return false;
-}
-
-bool StorageArea::set(StringView key, StringView value) {
-  uint64_t total = key.size() + value.size();
-  int64_t at = -1;
-  for (uint64_t i = 0; i < keys_.count(); ++i) {
-    if (keys_[i].view().equals(key)) {
-      at = static_cast<int64_t>(i);
-      continue;
-    }
-    total += keys_[i].size() + values_[i].size();
-  }
-  if (total > (5u << 20) || (at < 0 && keys_.count() >= 10000)) return false;   // (the storage limit: about 5 MB)
-  if (at >= 0) return values_[static_cast<uint64_t>(at)].assign(value);
-  String k(allocator_), v(allocator_);
-  if (!k.assign(key) || !v.assign(value)) return false;
-  return keys_.push_back(util::move(k)) && values_.push_back(util::move(v));
-}
-
-bool StorageArea::remove(StringView key) {
-  for (uint64_t i = 0; i < keys_.count(); ++i) {
-    if (keys_[i].view().equals(key)) {
-      keys_.remove_at(i);
-      values_.remove_at(i);
-      return true;
-    }
-  }
-  return false;
-}
-
 namespace bind {
 
 // --- Helpers -----------------------------------------------------------------------------------------------------
+
+int dom_exception_code(StringView name) {
+  static const struct {
+    const char* name;
+    int code;
+  } kCodes[] = {{"IndexSizeError", 1}, {"HierarchyRequestError", 3}, {"WrongDocumentError", 4}, {"InvalidCharacterError", 5}, {"NoModificationAllowedError", 7},
+                {"NotFoundError", 8}, {"NotSupportedError", 9}, {"InUseAttributeError", 10}, {"InvalidStateError", 11}, {"SyntaxError", 12}, {"InvalidModificationError", 13},
+                {"NamespaceError", 14}, {"InvalidAccessError", 15}, {"TypeMismatchError", 17}, {"SecurityError", 18}, {"NetworkError", 19}, {"AbortError", 20},
+                {"URLMismatchError", 21}, {"QuotaExceededError", 22}, {"TimeoutError", 23}, {"InvalidNodeTypeError", 24}, {"DataCloneError", 25}};
+  for (const auto& k : kCodes)
+    if (name.equals(k.name)) return k.code;
+  return 0;
+}
 
 bool throw_dom(Vm& vm, const char* name, StringView message) {
   DomBindings::Impl& c = impl(vm);
   JsObject* e = vm.new_error(ErrorKind::Error, message);
   if (c.exception_proto) e->proto = c.exception_proto;
   vm.define_named(e, "name", str_value(vm, name), kWritable);
-  static const struct {
-    const char* name;
-    int code;
-  } kCodes[] = {{"IndexSizeError", 1}, {"HierarchyRequestError", 3}, {"WrongDocumentError", 4}, {"InvalidCharacterError", 5}, {"NoModificationAllowedError", 7},
-                {"NotFoundError", 8}, {"NotSupportedError", 9}, {"InvalidStateError", 11}, {"SyntaxError", 12}, {"InvalidAccessError", 15}, {"QuotaExceededError", 22}};
-  int code = 0;
-  for (const auto& k : kCodes)
-    if (StringView(name).equals(k.name)) code = k.code;
+  const int code = dom_exception_code(name);
   vm.define_named(e, "code", num_value(code), kWritable);
   return vm.throw_value(Value::make_object(e));
 }
@@ -227,7 +193,7 @@ bool DomBindings::install() {
   c.window_listeners = vm_.new_plain();
   vm_.define_named(vm_.global(), "__wrappers", Value::make_object(c.wrappers), 0);
   vm_.define_named(vm_.global(), "__media_lists", Value::make_object(c.media_lists), 0);
-  return bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_forms(c) && !vm_.halted();
+  return bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_forms(c) && bind::install_net(c) && !vm_.halted();
 }
 
 bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& init) {
@@ -238,6 +204,51 @@ bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& 
   bind::dispatch_event(c, target, target == nullptr, event, &prevented);
   vm_.release_collector();
   return !prevented;
+}
+
+bool DomBindings::call_hook(StringView name, const HookArg* args, uint32_t count) {
+  Impl& c = *impl_;
+  Value fn;
+  if (!vm_.get_named(Value::make_object(vm_.global()), name, &fn) || !Vm::is_callable(fn)) return false;
+  List<Value> values(vm_.allocator());   // (the arguments are copied onto the VM's stack by the call, before anything can collect them)
+  for (uint32_t i = 0; i < count; ++i) {
+    switch (args[i].kind) {
+      case HookArg::Kind::Null: values.push_back(Value::make_null()); break;
+      case HookArg::Kind::Bool: values.push_back(Value::make_bool(args[i].boolean)); break;
+      case HookArg::Kind::Number: values.push_back(Value::make_number(args[i].number)); break;
+      case HookArg::Kind::String: values.push_back(Value::make_string(vm_.new_string(args[i].text))); break;
+    }
+  }
+  Value ignored;
+  const bool ok = vm_.call(fn, Value::make_object(vm_.global()), count ? &values[0] : nullptr, count, &ignored);
+  if (!ok) {
+    String text(vm_.allocator());
+    vm_.take_exception(&text);
+    if (c.error_count++ == 0) c.first_error.assign(text.view());
+    if (vm_.host()) {
+      String line(vm_.allocator());
+      line.append("Uncaught ");
+      line.append(text.view());
+      vm_.host()->console(3, line.view());
+    }
+  }
+  return ok;
+}
+
+void DomBindings::schedule_hook(StringView name, const HookArg* args, uint32_t count) {
+  Value runner;
+  if (!vm_.get_named(Value::make_object(vm_.global()), "__run_hook", &runner)) return;
+  List<Value> values(vm_.allocator());
+  values.push_back(Value::make_string(vm_.new_string(name)));
+  for (uint32_t i = 0; i < count; ++i) {
+    switch (args[i].kind) {
+      case HookArg::Kind::Null: values.push_back(Value::make_null()); break;
+      case HookArg::Kind::Bool: values.push_back(Value::make_bool(args[i].boolean)); break;
+      case HookArg::Kind::Number: values.push_back(Value::make_number(args[i].number)); break;
+      case HookArg::Kind::String: values.push_back(Value::make_string(vm_.new_string(args[i].text))); break;
+    }
+  }
+  vm_.add_timer(runner, 0, -1, &values[0], static_cast<uint32_t>(values.count()));
 }
 
 void DomBindings::set_current_script(dom::Node* script) { impl_->current_script = script; }

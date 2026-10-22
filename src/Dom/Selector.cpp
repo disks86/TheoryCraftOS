@@ -69,6 +69,7 @@ void SelectorSet::clear() {
 
 uint32_t SelectorSet::tag(uint32_t i) const { return selectors_[tops_[i]].tag; }
 uint32_t SelectorSet::specificity(uint32_t i) const { return selectors_[tops_[i]].specificity; }
+uint8_t SelectorSet::pseudo(uint32_t i) const { return selectors_[tops_[i]].pseudo; }
 
 // --- Reading selectors -------------------------------------------------------------------------------------------
 
@@ -87,6 +88,7 @@ class SelectorSet::Reader {
   }
 
  private:
+  uint8_t pseudo_element_ = 0;   // the pseudo-element the selector being read ends in (1 ::before, 2 ::after, 3 ::marker)
   bool end() const { return pos_ >= text_.size(); }
   char cur() const { return pos_ < text_.size() ? text_[pos_] : '\0'; }
   void skip_space() {
@@ -192,6 +194,7 @@ class SelectorSet::Reader {
   // One complex selector. Returns false for a syntax error; *usable is false when it is fine but can never match (it is dropped).
   bool complex(bool inner, bool relative, bool* usable, uint32_t* index) {
     List<Compound> mine(set_.alloc_);   // (put in the set when the selector is complete: a :not() inside adds compounds of its own meanwhile)
+    pseudo_element_ = 0;
     uint32_t specificity = 0;
     Combinator comb = Combinator::None;
     bool have_combinator = false, drop = false, syntax = true;
@@ -243,6 +246,7 @@ class SelectorSet::Reader {
     s.specificity = specificity;
     s.tag = tag_;
     s.inner = inner;
+    s.pseudo = inner ? 0 : pseudo_element_;
     set_.selectors_.push_back(s);
     *index = static_cast<uint32_t>(set_.selectors_.count() - 1);
     *usable = true;
@@ -424,8 +428,19 @@ class SelectorSet::Reader {
     if (cur() == ':') {   // a pseudo-element
       ++pos_;
       if (!ident()) return false;
-      if (cur() == '(') skip_parens();
-      *applies = false;
+      String element_name(set_.alloc_);
+      for (uint64_t i = 0; i < scratch_.size(); ++i) element_name.push_back(lower(scratch_[i]));
+      const bool known = element_name.equals("before") || element_name.equals("after") || element_name.equals("marker");
+      if (cur() == '(') {
+        ++pos_;
+        skip_parens_body();
+        *applies = false;
+      } else if (known) {
+        pseudo_element_ = element_name.equals("before") ? 1 : element_name.equals("after") ? 2 : 3;
+        t->kind = TestKind::Always;
+      } else {
+        *applies = false;
+      }
       *specificity += 1;
       return true;
     }
@@ -487,7 +502,8 @@ class SelectorSet::Reader {
     else if (n.equals("checked")) t->kind = TestKind::Checked;
     else if (n.equals("disabled")) t->kind = TestKind::Disabled;
     else if (n.equals("enabled")) t->kind = TestKind::Enabled;
-    else if (n.equals("focus") || n.equals("focus-within") || n.equals("focus-visible")) t->kind = TestKind::Focus;
+    else if (n.equals("focus") || n.equals("focus-visible")) t->kind = TestKind::Focus;
+    else if (n.equals("focus-within")) t->kind = TestKind::FocusWithin;
     else if (n.equals("required")) t->kind = TestKind::Required;
     else if (n.equals("optional")) t->kind = TestKind::Optional;
     else if (n.equals("read-only")) t->kind = TestKind::ReadOnly;
@@ -495,8 +511,13 @@ class SelectorSet::Reader {
     else if (n.equals("valid")) t->kind = TestKind::Valid;
     else if (n.equals("invalid")) t->kind = TestKind::Invalid;
     else if (n.equals("placeholder-shown")) t->kind = TestKind::PlaceholderShown;
-    else if (n.equals("before") || n.equals("after") || n.equals("first-line") || n.equals("first-letter")) *applies = false;   // (old pseudo-element syntax)
-    else *applies = false;   // hover, focus, active, visited, target and the rest: states a page being read does not have
+    else if (n.equals("before") || n.equals("after")) {   // (the old pseudo-element syntax)
+      pseudo_element_ = n.equals("before") ? 1 : 2;
+      t->kind = TestKind::Always;
+      *specificity -= 99;
+    } else if (n.equals("hover")) t->kind = TestKind::Hover;
+    else if (n.equals("active")) t->kind = TestKind::Active;
+    else *applies = false;   // visited, target, first-line and the rest: states a page being read does not have
     return true;
   }
 
@@ -540,9 +561,10 @@ bool SelectorSet::parse(StringView text, uint32_t tag, uint32_t* added, bool for
 
 // --- Matching ----------------------------------------------------------------------------------------------------
 
-bool SelectorSet::matches(uint32_t i, const Node* element, const Node* scope) const {
+bool SelectorSet::matches(uint32_t i, const Node* element, const Node* scope, bool with_pseudo) const {
   if (!element || !element->is_element() || i >= tops_.count()) return false;
   const Selector& s = selectors_[tops_[i]];
+  if (s.pseudo && !with_pseudo) return false;
   return match_chain(s, s.compound_count - 1, element, scope);
 }
 
@@ -654,6 +676,14 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
       return node->is_tag("option") && is_checked(node);
     }
     case TestKind::Focus: return (node->form_state & kFormFocused) != 0;
+    case TestKind::FocusWithin:
+      if (node->form_state & kFormFocused) return true;
+      for (const Node* d = next_in_tree(node, node); d; d = next_in_tree(d, node))
+        if (d->is_element() && (d->form_state & kFormFocused)) return true;
+      return false;
+    case TestKind::Hover: return (node->ui_state & kUiHover) != 0;
+    case TestKind::Active: return (node->ui_state & kUiActive) != 0;
+    case TestKind::Always: return true;
     case TestKind::Required: return is_submittable(node) && has_attribute(node, "required");
     case TestKind::Optional: return is_submittable(node) && !has_attribute(node, "required");
     case TestKind::ReadOnly: return !((node->is_tag("textarea") || node->is_tag("input")) && is_text_field(node->is_tag("input") ? input_type(node) : InputType::Text) &&

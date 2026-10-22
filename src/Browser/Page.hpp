@@ -27,8 +27,10 @@
 //   page.click(serial, x, y);           // a click on the node a run came from (see Run::node)
 //   if (page.changed()) page.render(&document);
 #pragma once
+#include "Browser/CookieJar.hpp"
 #include "Browser/DomBindings.hpp"
 #include "Browser/HtmlDocument.hpp"
+#include "Browser/PageHub.hpp"
 #include "Browser/Media.hpp"
 #include "Browser/Objects.hpp"
 #include "Browser/Renderer.hpp"
@@ -48,14 +50,26 @@ class IPageEnvironment : public IObjectEnvironment {
   virtual void reload() = 0;
   virtual void history_go(int32_t delta) = 0;
   virtual uint32_t history_length() = 0;
-  virtual void push_state(StringView address, bool replace) = 0;
+  // history.pushState() / replaceState() from the page (the browser adds or changes the history entry), and the state of the entry the page is on (JSON text).
+  virtual void push_state(StringView address, StringView state_json, bool has_state, bool replace) = 0;
+  virtual bool history_state(String* json) { (void)json; return false; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t line) = 0;
   virtual uint64_t now_ms() = 0;                 // milliseconds since 1970 (0 without a clock)
   virtual void console(int level, StringView text) = 0;
-  virtual StorageArea& local_storage() = 0;
-  virtual String& cookie() = 0;
+  // Web Storage: the hub of localStorage (all origins, all windows) and the one of this tab's sessionStorage; and what the pages share to talk to each other.
+  virtual StorageHub& local_storage_hub() = 0;
+  virtual StorageHub& session_storage_hub() = 0;
+  virtual PageHub& page_hub() = 0;
+  virtual uint64_t tab_id() { return 1; }   // (tells the pages of one tab from those of another: they share a sessionStorage)
+  // The cookies of the browser (shared by all its pages), and the network for fetch() and XMLHttpRequest.
+  virtual CookieJar& cookies() = 0;
+  virtual bool http_request(const FetchOptions& options, NetResponse* response) {
+    (void)options;
+    response->error.assign("This browser cannot make requests.");
+    return false;
+  }
   // A form was submitted with method=post: the page at `address` is the answer to `body` (of that content type). Without this, the browser has no way to
   // post, and the form is sent as a GET.
   virtual void navigate_post(StringView address, StringView content_type, StringView body) { (void)content_type; (void)body; navigate(address, false); }
@@ -106,12 +120,22 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   // A file the user picked for the file input with that node serial (the top byte says which frame): its name, type and bytes.
   void file_chosen(uint32_t node_serial, StringView name, StringView type, ConstByteView bytes);
 
+  // --- History
+  // The state (JSON text) that the history entry this page was opened at carries: set before load(), when the browser goes back or forward to a page that was
+  // left with pushState().
+  void set_history_state(StringView json, bool has_state);
+  // The browser went to another entry of this same document (Back / Forward between pushState() entries, or fragment changes): the address and state are those of that
+  // entry, and `popstate` (and `hashchange`, if only the fragment differs) fire.
+  void traverse(StringView address, StringView state_json, bool has_state);
+
   // --- Frames
+  Page* root() { return parent_ ? parent_->root() : this; }
   // This page is the content of the <iframe> with that node serial in `parent` (set before load()). Frames are nested up to 3 deep, 8 to a page.
   void set_parent(Page* parent, uint32_t frame_serial, uint32_t depth) {
     parent_ = parent;
     frame_serial_ = frame_serial;
     depth_ = depth;
+    window_id_ = parent->frame_window_id(frame_serial);
   }
   void blur() { set_focus(nullptr); }
   // --- IFrameSource
@@ -163,14 +187,19 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void reload() override { env_.reload(); }
   void history_go(int32_t delta) override { env_.history_go(delta); }
   uint32_t history_length() override { return env_.history_length(); }
-  void push_state(StringView address, bool replace) override;
+  void push_state(StringView address, StringView state_json, bool has_state, bool replace) override;
+  bool history_state(String* json) override;
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t line) override;
   bool computed_style(const dom::Node* element, Style* out) override;
   dom::Document* parse_document(StringView html) override;
-  StorageArea& local_storage() override { return env_.local_storage(); }
-  StorageArea& session_storage() override { return session_; }
-  String& cookie() override { return env_.cookie(); }
+  StorageArea& local_storage() override { return env_.local_storage_hub().area(storage_origin()); }
+  StorageArea& session_storage() override { return env_.session_storage_hub().area(storage_origin()); }
+  void storage_changed(bool session, const String* key, const String* old_value, const String* new_value) override;
+  void cookie_get(String* out) override;
+  void cookie_set(StringView text) override;
+  bool http_request(const FetchOptions& options, NetResponse* response) override { return env_.http_request(options, response); }
+  void page_origin(String* out) override;
   bool compile_handler(StringView code, script::Value* function) override;
 
   // --- IDomHost: forms
@@ -180,7 +209,15 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void submit_form(dom::Node* form, dom::Node* submitter, bool interactive) override;
   void reset_form(dom::Node* form) override;
   bool report_validity(dom::Node* control) override;
-  void post_message(int32_t target, StringView data) override;
+  uint32_t window_id() override { return window_id_; }
+  uint32_t parent_window_id() override { return parent_ ? parent_->window_id_ : 0; }
+  uint32_t top_window_id() override { return root()->window_id_; }
+  uint32_t frame_window_id(uint32_t iframe_serial) override;
+  bool post_window_message(uint32_t target_window, StringView target_origin, StringView payload, StringView ports) override;
+  uint32_t new_port_pair() override;
+  void move_port(uint32_t port, uint32_t window) override;
+  void post_port_message(uint32_t port, StringView payload, StringView ports) override;
+  void broadcast(StringView channel, StringView payload) override;
   bool in_frame() override { return parent_ != nullptr; }
   void show_dialog(dom::Node* dialog, bool modal) override;
   void close_dialog(dom::Node* dialog, const char* return_value) override;
@@ -209,8 +246,14 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void frame_navigate(uint32_t frame_serial, StringView address);
   void frame_pick_file(uint32_t frame_serial, uint32_t node_serial, bool multiple);
   void paste_text(dom::Node* control, StringView text);
-  void queue_message(StringView data, StringView origin);
+  // Messages for this window (from windows and message ports) wait here until the next turn of the event loop.
+  void queue_window_message(StringView payload, StringView origin, uint32_t source, StringView ports);
+  void queue_port_message(uint32_t port, StringView payload, StringView ports);
   void deliver_messages();
+  void poll_hub();
+  Page* find_window(uint32_t id);
+  const String& storage_origin();   // the key of this page's Web Storage (its origin; for a file, the file)
+  void claim_ports(StringView ports, uint32_t window);
   void press_focus(dom::Node* node);
   dom::Node* modal_dialog();
   void toggle_details(dom::Node* details);
@@ -235,7 +278,6 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool scripts_enabled_;
   MediaEnvironment media_, rendered_media_;
   String address_, log_, first_error_, title_text_, written_;
-  StorageArea session_;
   dom::Document doc_;
   List<UniquePointer<dom::Document>> extra_documents_;
   List<Fetched> scripts_, sheets_;
@@ -246,13 +288,27 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   int32_t scroll_request_ = -1;
   uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
   struct Message {
-    explicit Message(allocators::IAllocator& a) : data(a), origin(a) {}
-    String data, origin;
+    explicit Message(allocators::IAllocator& a) : payload(a), origin(a), ports(a) {}
+    bool to_port = false;
+    uint32_t port = 0, source = 0;
+    String payload, origin, ports;
+  };
+  struct PortHome {
+    uint32_t port, window;
   };
   List<UniquePointer<Frame>> frames_;
   List<Message> messages_;
   Page* parent_ = nullptr;
   uint32_t frame_serial_ = 0, depth_ = 0;
+  uint32_t window_id_ = 1, next_window_id_ = 2;           // (the top page numbers the windows of its frames)
+  List<PortHome> frame_windows_;                           // (the window number of each <iframe>, by the node's serial, made when first asked for)
+  uint32_t next_port_ = 1;
+  List<PortHome> port_homes_;                              // (kept by the top page: which window each message port is in)
+  uint32_t hub_id_ = 0;
+  uint64_t hub_seen_ = 0;
+  String storage_origin_;
+  String state_json_;           // history.state: the state of the entry this page is on, as JSON
+  bool has_state_ = false;
   uint64_t controls_version_ = 0;
   bool controls_cached_ = false;
   String focus_value_, invalid_text_;                         // (what the focused control held when it got the focus; what to tell about the invalid one)

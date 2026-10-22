@@ -306,7 +306,7 @@ static void test_builtins() {
   CHECK(is("JSON.stringify({ a: undefined, b: function() {}, c: 'x\"y' })", "{\"c\":\"x\\\"y\"}"));
   CHECK(is("JSON.stringify({ a: [1, 2] }, null, 2)", "{\n  \"a\": [\n    1,\n    2\n  ]\n}"));
   CHECK(is("var o = JSON.parse('{\"a\":[1,2,{\"b\":null}],\"c\":\"x\\\\ny\",\"d\":-1.5e2,\"e\":true}'); o.a[1] + o.c.length + o.d + o.e + o.a[2].b", "-144"));
-  CHECK(is("JSON.parse('[1,')", "ERR: SyntaxError: Unexpected token in JSON at position 3"));
+  CHECK(is("JSON.parse('[1,')", "ERR: SyntaxError: Unexpected end of JSON input"));
   CHECK(is("JSON.stringify('a')", "\"a\""));
   CHECK(is("var d = new Date(86400000 * 365); d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate()", "1971-0-1"));
   CHECK(is("new Date(0).toISOString()", "1970-01-01T00:00:00.000Z"));
@@ -460,6 +460,146 @@ static void test_host_integration() {
   CHECK(a.live == 0);
 }
 
+// Runs `setup`, lets the microtasks it queued run, and then evaluates `check` in the same engine.
+static std::string eval_after(const char* setup, const char* check, std::vector<std::string>* console = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    TestHost host;
+    Engine e(a, &host);
+    String error(a), result(a);
+    if (!e.run(setup, &error, &result)) out = std::string("ERR: ") + error.c_str();
+    else if (e.run(check, &error, &result)) out = std::string(result.c_str());
+    else out = std::string("ERR: ") + error.c_str();
+    if (console) *console = host.console_lines;
+  }
+  if (a.live != 0) {
+    printf("   leak (%d cells) after: %s\n", a.live, setup);
+    ++g_failed;
+  }
+  return out;
+}
+
+static bool after(const char* setup, const char* check, const char* expected) {
+  const std::string got = eval_after(setup, check);
+  if (got != expected) {
+    printf("   %s\n   then %s\n   gives   %s\n   expects %s\n", setup, check, got.c_str(), expected);
+    return false;
+  }
+  return true;
+}
+
+static void test_promises() {
+  // callbacks run after the script, in order
+  CHECK(after("var log = []; Promise.resolve(1).then(v => log.push('a' + v)); log.push('sync');", "log.join()", "sync,a1"));
+  CHECK(after("var log = []; new Promise(r => { log.push('exec'); r(5); }).then(v => log.push(v)); log.push('after');", "log.join()", "exec,after,5"));
+  CHECK(after("var log = []; Promise.resolve(1).then(v => v + 1).then(v => v * 10).then(v => log.push(v));", "log.join()", "20"));
+  CHECK(after("var log = []; Promise.reject(new Error('no')).catch(e => log.push(e.message));", "log.join()", "no"));
+  CHECK(after("var log = []; Promise.resolve().then(() => { throw new Error('boom'); }).then(() => log.push('skipped')).catch(e => log.push('caught ' + e.message));", "log.join()", "caught boom"));
+  CHECK(after("var log = []; new Promise(() => { throw new TypeError('in executor'); }).catch(e => log.push(e.name));", "log.join()", "TypeError"));
+  CHECK(after("var log = []; new Promise((res, rej) => { res(1); rej(2); res(3); }).then(v => log.push(v), e => log.push('e' + e));", "log.join()", "1"));
+  CHECK(after("var log = []; Promise.resolve(1).finally(() => log.push('fin')).then(v => log.push(v));", "log.join()", "fin,1"));
+  CHECK(after("var log = []; Promise.reject(7).finally(() => log.push('fin')).catch(e => log.push('e' + e));", "log.join()", "fin,e7"));
+  // a promise resolved with a promise or a thenable follows it
+  CHECK(after("var log = []; Promise.resolve(Promise.resolve('inner')).then(v => log.push(v)); new Promise(r => r({ then: function (ok) { ok('thenable'); } })).then(v => log.push(v));", "log.join()", "inner,thenable"));
+  CHECK(after("var log = []; var p = new Promise(r => setTimeout(() => r('late'), 5)); p.then(v => log.push(v));", "log.join()", ""));
+  CHECK(after("var p = Promise.resolve(); var q = p.then(() => q);  var log = []; q.catch(e => log.push(e.name));", "log.join()", "TypeError"));
+  CHECK(is("typeof Promise + ',' + (Promise.resolve(1) instanceof Promise) + ',' + typeof Promise.resolve(1).then", "function,true,function"));
+  CHECK(is("var p = Promise.resolve(3); Promise.resolve(p) === p", "true"));
+  // combinators
+  CHECK(after("var log = []; Promise.all([1, Promise.resolve(2), new Promise(r => r(3))]).then(v => log.push(v.join('+')));", "log.join()", "1+2+3"));
+  CHECK(after("var log = []; Promise.all([1, Promise.reject('x'), 3]).catch(e => log.push('rejected ' + e)); Promise.all([]).then(v => log.push('empty ' + v.length));", "log.join()", "empty 0,rejected x"));
+  CHECK(after("var log = []; Promise.allSettled([1, Promise.reject('x')]).then(v => log.push(v[0].status + ':' + v[0].value + ' ' + v[1].status + ':' + v[1].reason));", "log.join()", "fulfilled:1 rejected:x"));
+  CHECK(after("var log = []; Promise.race([new Promise(() => {}), Promise.resolve('fast')]).then(v => log.push(v));", "log.join()", "fast"));
+  CHECK(after("var log = []; Promise.any([Promise.reject(1), Promise.resolve(2)]).then(v => log.push(v)); Promise.any([Promise.reject(1)]).catch(e => log.push(e.name + e.errors.length));", "log.join()", "2,AggregateError1"));
+  CHECK(after("var log = []; var d = Promise.withResolvers(); d.promise.then(v => log.push(v)); d.resolve('done');", "log.join()", "done"));
+  // timers are macrotasks: microtasks run before the next timer
+  {
+    TestAllocator a;
+    {
+      TestHost host;
+      Engine e(a, &host);
+      String error(a), result(a);
+      CHECK(e.run("var log = []; setTimeout(() => log.push('timer1'), 0); setTimeout(() => { log.push('timer2'); Promise.resolve().then(() => log.push('micro-in-timer2')); }, 0); setTimeout(() => log.push('timer3'), 0); Promise.resolve().then(() => log.push('micro'));", &error, &result));
+      CHECK(e.run_timers(10, &error) == 0);
+      CHECK(e.run("log.join()", &error, &result) && std::string(result.c_str()) == "micro,timer1,timer2,micro-in-timer2,timer3");
+    }
+    CHECK(a.live == 0);
+  }
+  // an unhandled rejection is reported; a handled one is not
+  {
+    std::vector<std::string> console;
+    eval_after("Promise.reject(new Error('lost'));", "1", &console);
+    CHECK(console.size() == 1 && console[0] == "3:Uncaught (in promise) Error: lost");
+    console.clear();
+    eval_after("var p = Promise.reject(new Error('seen')); p.catch(function () {});", "1", &console);
+    CHECK(console.empty());
+  }
+}
+
+static void test_async_functions() {
+  CHECK(after("var log = []; async function f(x) { log.push('f1'); var y = await x; log.push('f2:' + y); return y * 2; } f(21).then(v => log.push('r' + v)); log.push('after');", "log.join()", "f1,after,f2:21,r42"));
+  CHECK(is("async function f() {} typeof f() + ',' + (f() instanceof Promise)", "object,true"));
+  CHECK(after("var log = []; var f = async () => { await null; return 'arrow'; }; f().then(v => log.push(v)); var g = async x => x + 1; g(1).then(v => log.push(v)); var h = async function (a, b) { return await a + b; }; h(1, 2).then(v => log.push(v));", "log.join()", "2,arrow,3"));
+  CHECK(after("var log = []; var o = { async m(x) { return await x + 1; } }; o.m(1).then(v => log.push(v));", "log.join()", "2"));
+  // errors: thrown inside, rejections awaited, try / catch / finally around await
+  CHECK(after("var log = []; async function f() { throw new Error('bad'); } f().catch(e => log.push(e.message));", "log.join()", "bad"));
+  CHECK(after("var log = []; async function f() { try { await Promise.reject(new Error('r')); log.push('no'); } catch (e) { log.push('caught ' + e.message); } finally { log.push('finally'); } return 'ok'; } f().then(v => log.push(v));", "log.join()", "caught r,finally,ok"));
+  CHECK(after("var log = []; async function f() { try { await 1; throw new Error('after await'); } catch (e) { log.push(e.message); await null; log.push('still'); } } f();", "log.join()", "after await,still"));
+  CHECK(after("var log = []; async function f() { try { return await Promise.resolve('v'); } finally { await null; log.push('cleanup'); } } f().then(v => log.push(v));", "log.join()", "cleanup,v"));
+  CHECK(after("var log = []; async function f() { await undefinedFunction(); } f().catch(e => log.push(e.name));", "log.join()", "ReferenceError"));
+  // await in loops and expressions; the values on the stack survive
+  CHECK(after("var log = []; async function f() { var sum = 0; for (var i = 0; i < 5; i++) { sum += await i; } return sum; } f().then(v => log.push(v));", "log.join()", "10"));
+  CHECK(after("var log = []; async function f() { for (var x of [1, 2, 3]) { log.push(await x * 10); } } f();", "log.join()", "10,20,30"));
+  CHECK(after("var log = []; function add(a, b, c) { return a + b + c; } async function f() { return add(1, await 2, await 3) + [await 4, 5].length; } f().then(v => log.push(v));", "log.join()", "8"));
+  CHECK(after("var log = []; async function f() { var o = { a: await 1, b: [await 2, await 3] }; return o.a + o.b[0] + o.b[1]; } f().then(v => log.push(v));", "log.join()", "6"));
+  CHECK(after("var log = []; async function f() { var s = ''; var i = 0; while (true) { if (i++ > 3) break; s += await i; } return s; } f().then(v => log.push(v));", "log.join()", "1234"));
+  // nesting and ordering
+  CHECK(after("var log = []; async function inner() { log.push('inner'); await null; log.push('inner2'); return 'i'; } async function outer() { log.push('outer'); var v = await inner(); log.push('got ' + v); } outer(); log.push('sync');", "log.join()", "outer,inner,sync,inner2,got i"));
+  CHECK(after("var log = []; async function a() { await null; log.push('a'); } async function b() { await null; log.push('b'); } a(); b(); Promise.resolve().then(() => log.push('p'));", "log.join()", "a,b,p"));
+  CHECK(after("var log = []; async function f() { var r = await Promise.all([1, 2, 3].map(async x => { await null; return x * x; })); return r.join('-'); } f().then(v => log.push(v));", "log.join()", "1-4-9"));
+  CHECK(after("var log = []; var o = { n: 5, f: async function () { await null; return this.n; } }; o.f().then(v => log.push(v)); var q = { n: 6, g: function () { return (async () => { await null; return this.n; })(); } }; q.g().then(v => log.push(v));", "log.join()", "5,6"));
+  CHECK(after("var log = []; async function f() { await new Promise(r => setTimeout(r, 10)); log.push('slept'); } f();", "log.join()", ""));
+  // await is an ordinary name outside async functions; an async function is not a constructor
+  CHECK(is("var await = 3; await + 1", "4"));
+  CHECK(is("var async = 2; async + 1", "3"));
+  CHECK(is("async function f() {} try { new f(); 'no'; } catch (e) { e.name; }", "TypeError"));
+  // many awaits, with garbage made in between
+  CHECK(after("var log = []; async function f() { var keep = []; for (var i = 0; i < 3000; i++) { keep.push({ i: i, pad: [i, i + 1, 'x' + i] }); await i; } return keep.length + ':' + keep[2999].pad[2]; } f().then(v => log.push(v));", "log.join()", "3000:x2999"));
+  CHECK(after("var log = []; async function f(n) { if (n === 0) return 0; return 1 + await f(n - 1); } f(40).then(v => log.push(v));", "log.join()", "40"));
+  CHECK(after("var log = []; async function f(n) { if (n === 0) return 0; return 1 + await f(n - 1); } f(5000).catch(e => log.push(e.name));", "log.join()", "RangeError"));
+}
+
+static void test_json() {
+  CHECK(is("JSON.stringify(JSON.parse('{\"a\":[1,2,{\"b\":null}],\"c\":\"x\\\\u0041\\\\n\",\"d\":1.5e3,\"e\":true}'))", "{\"a\":[1,2,{\"b\":null}],\"c\":\"xA\\n\",\"d\":1500,\"e\":true}"));
+  // strict grammar
+  CHECK(is("var r = []; ['[1,2,', '{\"a\":1,}', '01', '\"\\\\x\"', 'tru', '1 2', '+1', '.5', '1.', '1e', '[1,]', '{\"a\" 1}', 'NaN', 'undefined', '', '[', '{\"a\":}', '\"a\\nb\"'].forEach(function (t) { try { JSON.parse(t); r.push('accepted ' + t); } catch (e) { if (e.name !== 'SyntaxError') r.push('wrong ' + e.name); } }); r.join('|')", ""));
+  CHECK(is("try { JSON.parse('{\"a\":1,}'); } catch (e) { e.message }", "Unexpected token } in JSON at position 7"));
+  CHECK(is("try { JSON.parse('[1,2,'); } catch (e) { e.message }", "Unexpected end of JSON input"));
+  CHECK(is("JSON.parse(' [ ] ').length + JSON.parse('\"\\\\ud83d\\\\ude00\"').length", "4"));
+  CHECK(is("JSON.parse('-0') === 0 && JSON.parse('1E2') === 100 && JSON.parse('0.5e-1') === 0.05", "true"));
+  CHECK(is("JSON.parse('{\"a\":1,\"a\":2}').a", "2"));
+  // reviver
+  CHECK(is("JSON.stringify(JSON.parse('{\"a\":1,\"b\":[1,2],\"c\":\"s\"}', function (k, v) { return typeof v === 'number' ? v + 1 : v; }))", "{\"a\":2,\"b\":[2,3],\"c\":\"s\"}"));
+  CHECK(is("JSON.stringify(JSON.parse('{\"a\":1,\"b\":2}', function (k, v) { return k === 'a' ? undefined : v; }))", "{\"b\":2}"));
+  CHECK(is("var seen = []; JSON.parse('{\"a\":{\"b\":1}}', function (k, v) { seen.push(k); return v; }); seen.join()", "b,a,"));
+  // stringify
+  CHECK(is("JSON.stringify({ a: 1, b: [1, { c: 2 }], d: 'x' }, null, 2)", "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    {\n      \"c\": 2\n    }\n  ],\n  \"d\": \"x\"\n}"));
+  CHECK(is("JSON.stringify([1, [2]], null, '--')", "[\n--1,\n--[\n----2\n--]\n]"));
+  CHECK(is("JSON.stringify({ a: 1, b: 2, c: 3 }, ['c', 'a'])", "{\"c\":3,\"a\":1}"));
+  CHECK(is("JSON.stringify({ a: 1, b: 'x' }, function (k, v) { return typeof v === 'number' ? v * 2 : v; })", "{\"a\":2,\"b\":\"x\"}"));
+  CHECK(is("JSON.stringify({ toJSON: function () { return { t: 1 }; } })", "{\"t\":1}"));
+  CHECK(is("JSON.stringify({ d: new Date(0) })", "{\"d\":\"1970-01-01T00:00:00.000Z\"}"));
+  CHECK(is("JSON.stringify([undefined, function () {}, NaN, Infinity, -0])", "[null,null,null,null,0]"));
+  CHECK(is("JSON.stringify({ a: undefined, b: function () {}, c: 1 })", "{\"c\":1}"));
+  CHECK(is("JSON.stringify(undefined) === undefined && JSON.stringify(function () {}) === undefined && JSON.stringify(null) === 'null'", "true"));
+  CHECK(is("JSON.stringify('a\"b\\\\c\\n\\u0001')", "\"a\\\"b\\\\c\\n\\u0001\""));
+  CHECK(is("var a = {}; a.self = a; try { JSON.stringify(a); } catch (e) { e.name + ': ' + e.message; }", "TypeError: Converting circular structure to JSON"));
+  CHECK(is("var shared = { x: 1 }; JSON.stringify({ a: shared, b: shared })", "{\"a\":{\"x\":1},\"b\":{\"x\":1}}"));
+  CHECK(is("var deep = []; for (var i = 0; i < 100; i++) deep = [deep]; JSON.stringify(deep).length", "202"));
+  CHECK(is("var s = ''; for (var i = 0; i < 600; i++) s += '['; try { JSON.parse(s); } catch (e) { e.name; }", "SyntaxError"));
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_expressions();
@@ -473,6 +613,9 @@ int main() {
   test_damaged_programs();
   test_deep_programs();
   test_host_integration();
+  test_json();
+  test_promises();
+  test_async_functions();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

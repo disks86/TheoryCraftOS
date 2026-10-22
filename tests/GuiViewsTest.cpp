@@ -6416,8 +6416,8 @@ static void test_web_browser() {
     w.set_focus(&b.address_box());
     b.address_box().set_text("one.test");
     press(w, key::kEnter);
-    CHECK(loader.asked.size() == 1 && loader.asked[0] == "http://one.test" && b.address().equals("http://one.test") && !b.loading());
-    CHECK(b.title().equals("Web Browser - Plain") && b.address_box().text().equals("http://one.test") && b.status_label().text().equals("Done."));
+    CHECK(loader.asked.size() == 1 && loader.asked[0] == "http://one.test/" && b.address().equals("http://one.test/") && !b.loading());
+    CHECK(b.title().equals("Web Browser - Plain") && b.address_box().text().equals("http://one.test/") && b.status_label().text().equals("Done."));
     CHECK(run_contains(b, "Page ") && !b.can_go_back());
 
     // Moving over the link shows where it leads; a click follows it, and the way back opens.
@@ -6431,11 +6431,11 @@ static void test_web_browser() {
     CHECK(loader.asked.size() == 2 && loader.asked[1] == "http://one.test/next" && b.address().equals("http://one.test/next") && b.title().equals("Web Browser - Two"));
     CHECK(b.can_go_back() && !b.can_go_forward() && b.back_button().enabled());
     click_center(w, b.back_button());
-    CHECK(b.address().equals("http://one.test") && b.can_go_forward() && !b.can_go_back() && b.title().equals("Web Browser - Plain"));
+    CHECK(b.address().equals("http://one.test/") && b.can_go_forward() && !b.can_go_back() && b.title().equals("Web Browser - Plain"));
     click_center(w, b.forward_button());
     CHECK(b.address().equals("http://one.test/next") && b.can_go_back() && !b.can_go_forward());
     press(w, key::kLeft, hardware::modifier::kLeftAlt);
-    CHECK(b.address().equals("http://one.test") && b.can_go_forward());
+    CHECK(b.address().equals("http://one.test/") && b.can_go_forward());
     press(w, key::kRight, hardware::modifier::kLeftAlt);
     CHECK(b.address().equals("http://one.test/next"));
     const size_t before_reload = loader.asked.size();

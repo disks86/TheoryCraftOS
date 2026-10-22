@@ -44,6 +44,8 @@ class Engine {
   // Compiles and runs a script. False with *error ("TypeError: x is not a function", "SyntaxError: ... (line 3)") if it could not be compiled or
   // threw. `result` (may be null) gets the value of the last expression statement as text.
   bool run(StringView source, String* error, String* result = nullptr);
+  // The same for library code that the host runs before the page's scripts: the document is not looked at afterwards (reading its title would build parts of it).
+  bool run_library(StringView source, String* error);
 
   // Compiles and runs `source` and hands back the value of its last expression (not kept alive: store it somewhere the script engine can see it at once).
   bool evaluate(StringView source, String* error, Value* value);
@@ -58,7 +60,7 @@ class Engine {
   uint32_t fire_event(StringView type, String* error);
 
  private:
-  bool run_here(StringView source, String* error, String* result, Value* value = nullptr);
+  bool run_here(StringView source, String* error, String* result, Value* value = nullptr, bool sync = true);
   uint32_t run_timers_here(double now_ms, bool ahead, uint32_t max, String* error);
   uint32_t fire_event_here(StringView type, String* error);
   void sync_document();

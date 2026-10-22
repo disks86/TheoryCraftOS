@@ -18,7 +18,8 @@
 
 // The global functions and objects scripts find: Object, Function, Array, String, Number, Boolean, Math, JSON, Error and its kinds, Date (a little),
 // console, document (write, title, a few stubs that find nothing), window / location / navigator, timers, and the parse and test functions.
-// Not here: regular expressions, Map and Set, Symbol, Promise, the DOM.
+// Promise has its core here (the constructor, resolve, reject, then, catch); all, allSettled, race, any and finally are written in script (see Engine.cpp).
+// Not here: regular expressions, Map and Set, Symbol, the DOM.
 #include <initializer_list>
 #include "Math/FloatMath.hpp"
 #include "Script/Number.hpp"
@@ -1203,9 +1204,80 @@ NATIVE(error_to_string) {
   return true;
 }
 
+// --- Promise -------------------------------------------------------------------------------------------------------
+
+NATIVE(promise_ctor) {
+  if (!self.is_object() || self.as_object()->okind != ObjKind::Plain || self.as_object()->proto != vm.promise_proto()) return vm.throw_error(ErrorKind::TypeError, "Promise constructor cannot be invoked without 'new'");
+  const Value executor = arg_at(args, argc, 0);
+  if (!Vm::is_callable(executor)) return vm.throw_error(ErrorKind::TypeError, "Promise resolver is not a function");
+  JsObject* promise = self.as_object();
+  promise->okind = ObjKind::Promise;
+  promise->position = 0;
+  promise->bound_this = Value();
+  JsObject* shared = vm.new_plain();   // (its `position` says that the promise has been resolved or rejected: only the first call counts)
+  const Value fns[2] = {Value::make_object(vm.resolving_function(promise, shared, false)), Value::make_object(vm.resolving_function(promise, shared, true))};
+  Value ignored;
+  if (!vm.call(executor, Value(), fns, 2, &ignored)) {
+    if (vm.halted()) return false;
+    Value reason;
+    vm.take_exception_value(&reason);
+    if (!shared->position) {
+      shared->position = 1;
+      vm.promise_reject(promise, reason);
+    }
+  }
+  *result = self;
+  return true;
+}
+
+NATIVE(promise_static_resolve) {
+  *result = Value::make_object(vm.promise_resolved(arg_at(args, argc, 0)));
+  return true;
+}
+
+NATIVE(promise_static_reject) {
+  JsObject* p = vm.new_promise();
+  vm.promise_reject(p, arg_at(args, argc, 0));
+  *result = Value::make_object(p);
+  return true;
+}
+
+NATIVE(promise_then) {
+  if (!Vm::is_promise(self)) return vm.throw_error(ErrorKind::TypeError, "Promise.prototype.then called on a value that is not a promise");
+  JsObject* derived = vm.new_promise();
+  vm.promise_then(self.as_object(), arg_at(args, argc, 0), arg_at(args, argc, 1), derived);
+  *result = Value::make_object(derived);
+  return true;
+}
+
+NATIVE(promise_catch) {
+  Value then;
+  if (!vm.get_named(self, "then", &then)) return false;
+  const Value a[2] = {Value(), arg_at(args, argc, 0)};
+  return vm.call(then, self, a, 2, result);
+}
+
+// --- Symbol (just enough for Symbol.iterator: a symbol is a string that begins "@@") ------------------------------------------
+
+NATIVE(symbol_function) {
+  static uint32_t counter = 0;
+  String text(vm.allocator());
+  text.append("@@");
+  JsString* description;
+  if (argc > 0 && !args[0].is_undefined()) {
+    if (!vm.to_string(args[0], &description)) return false;
+    text.append(description->view());
+  }
+  text.push_back('#');
+  text.append_uint(++counter);
+  *result = str_value(vm, text.view());
+  return true;
+}
+
 // --- JSON -----------------------------------------------------------------------------------------------------------
 
 void json_quote(StringView s, String* out) {
+  static const char kHex[] = "0123456789abcdef";
   out->push_back('"');
   for (uint64_t i = 0; i < s.size(); ++i) {
     const char c = s[i];
@@ -1218,8 +1290,7 @@ void json_quote(StringView s, String* out) {
       case '\b': out->append("\\b"); break;
       case '\f': out->append("\\f"); break;
       default:
-        if (static_cast<uint8_t>(c) < 0x20) {
-          static const char kHex[] = "0123456789abcdef";
+        if (static_cast<uint8_t>(c) < 0x20 || c == 0x7F) {
           out->append("\\u00");
           out->push_back(kHex[(c >> 4) & 15]);
           out->push_back(kHex[c & 15]);
@@ -1231,108 +1302,156 @@ void json_quote(StringView s, String* out) {
   out->push_back('"');
 }
 
-// Writes `v`; false (nothing written) when it has no JSON form (undefined, a function). A throw is `*threw`.
-bool json_write(Vm& vm, const Value& v, StringView gap, uint32_t depth, String* out, bool* threw) {
-  if (depth > 40) {
-    *threw = true;
-    vm.throw_error(ErrorKind::TypeError, "Converting circular structure to JSON");
+// JSON.stringify's state: the gap, the replacer (a function, or a list of the names allowed) and the objects being written (to find a cycle).
+struct JsonWriter {
+  Vm& vm;
+  String gap, indent;
+  Value replacer_function;
+  JsObject* allowed = nullptr;   // an array of names, or null
+  List<JsObject*> stack;
+  String out;
+  explicit JsonWriter(Vm& v) : vm(v), gap(v.allocator()), indent(v.allocator()), stack(v.allocator()), out(v.allocator()) {}
+
+  bool circular(JsObject* o) {
+    for (uint64_t i = 0; i < stack.count(); ++i)
+      if (stack[i] == o) return true;
     return false;
   }
-  switch (v.tag) {
-    case Tag::Undefined: return false;
-    case Tag::Null: out->append("null"); return true;
-    case Tag::Boolean: out->append(v.u.boolean ? "true" : "false"); return true;
-    case Tag::Number: {
-      if (v.u.number != v.u.number || v.u.number == kInf || v.u.number == -kInf) {
-        out->append("null");
-      } else {
-        String t(vm.allocator());
-        number_to_string(v.u.number, &t);
-        out->append(t.view());
+
+  // Writes holder[key] (`value` is what it holds). False with *wrote == false when it has no JSON form; false with a pending exception on a throw.
+  bool write(const Value& holder, JsString* key, Value value, bool* wrote) {
+    *wrote = false;
+    if (value.is_object()) {   // toJSON
+      Value to_json;
+      if (!vm.get_named(value, "toJSON", &to_json)) return false;
+      if (Vm::is_callable(to_json)) {
+        const Value k = Value::make_string(key);
+        if (!vm.call(to_json, value, &k, 1, &value)) return false;
       }
-      return true;
     }
-    case Tag::String: json_quote(v.as_string()->view(), out); return true;
-    case Tag::Object: break;
+    if (Vm::is_callable(replacer_function)) {
+      const Value call_args[2] = {Value::make_string(key), value};
+      if (!vm.call(replacer_function, holder, call_args, 2, &value)) return false;
+    }
+    switch (value.tag) {
+      case Tag::Undefined: return true;
+      case Tag::Null: out.append("null"); *wrote = true; return true;
+      case Tag::Boolean: out.append(value.u.boolean ? "true" : "false"); *wrote = true; return true;
+      case Tag::Number:
+        if (value.u.number != value.u.number || value.u.number == kInf || value.u.number == -kInf) {
+          out.append("null");
+        } else {
+          String t(vm.allocator());
+          number_to_string(value.u.number == 0 ? 0.0 : value.u.number, &t);
+          out.append(t.view());
+        }
+        *wrote = true;
+        return true;
+      case Tag::String: json_quote(value.as_string()->view(), &out); *wrote = true; return true;
+      case Tag::Object: break;
+    }
+    if (Vm::is_callable(value)) return true;
+    JsObject* o = value.as_object();
+    if (circular(o)) return vm.throw_error(ErrorKind::TypeError, "Converting circular structure to JSON");
+    if (stack.count() > 512) return vm.throw_error(ErrorKind::RangeError, "JSON nesting is too deep");
+    stack.push_back(o);
+    const uint64_t saved_indent = indent.size();
+    indent.append(gap.view());
+    bool ok = o->okind == ObjKind::Array ? write_array(value) : write_object(value);
+    indent.truncate(saved_indent);
+    stack.remove_at(stack.count() - 1);
+    *wrote = ok;
+    return ok;
   }
-  if (Vm::is_callable(v)) return false;
-  JsObject* o = v.as_object();
-  String indent(vm.allocator());
-  for (uint32_t i = 0; i <= depth; ++i) indent.append(gap);
-  String outer(vm.allocator());
-  for (uint32_t i = 0; i < depth; ++i) outer.append(gap);
-  if (o->okind == ObjKind::Array) {
+
+  bool write_array(const Value& array) {
+    JsObject* o = array.as_object();
     if (o->length == 0) {
-      out->append("[]");
+      out.append("[]");
       return true;
     }
-    out->push_back('[');
+    out.push_back('[');
     for (uint32_t i = 0; i < o->length; ++i) {
-      if (i) out->push_back(',');
+      if (i) out.push_back(',');
       if (!gap.empty()) {
-        out->push_back('\n');
-        out->append(indent.view());
+        out.push_back('\n');
+        out.append(indent.view());
       }
-      if (!json_write(vm, o->items[i], gap, depth + 1, out, threw)) {
-        if (*threw) return false;
-        out->append("null");
-      }
+      String name(vm.allocator());
+      name.append_uint(i);
+      bool wrote;
+      if (!write(array, vm.intern(name.view()), i < o->length ? o->items[i] : Value(), &wrote)) return false;
+      if (!wrote) out.append("null");
     }
     if (!gap.empty()) {
-      out->push_back('\n');
-      out->append(outer.view());
+      out.push_back('\n');
+      out.append(indent.view().first(indent.size() - gap.size()));
     }
-    out->push_back(']');
+    out.push_back(']');
     return true;
   }
-  JsObject* keys = vm.own_keys(o);
-  out->push_back('{');
-  bool first = true;
-  for (uint32_t i = 0; i < keys->length; ++i) {
-    Value item;
-    if (!vm.get(v, keys->items[i].as_string(), &item)) {
-      *threw = true;
-      return false;
+
+  bool write_object(const Value& object) {
+    JsObject* keys = allowed ? allowed : vm.own_keys(object.as_object());
+    out.push_back('{');
+    bool first = true;
+    for (uint32_t i = 0; i < keys->length; ++i) {
+      JsString* key = keys->items[i].as_string();
+      Value item;
+      if (!vm.get(object, key, &item)) return false;
+      const uint64_t mark = out.size();
+      if (!first) out.push_back(',');
+      if (!gap.empty()) {
+        out.push_back('\n');
+        out.append(indent.view());
+      }
+      json_quote(key->view(), &out);
+      out.push_back(':');
+      if (!gap.empty()) out.push_back(' ');
+      bool wrote;
+      if (!write(object, key, item, &wrote)) return false;
+      if (!wrote) out.truncate(mark);
+      else first = false;
     }
-    if (item.is_undefined() || Vm::is_callable(item)) continue;
-    if (!first) out->push_back(',');
-    first = false;
-    if (!gap.empty()) {
-      out->push_back('\n');
-      out->append(indent.view());
+    if (!first && !gap.empty()) {
+      out.push_back('\n');
+      out.append(indent.view().first(indent.size() - gap.size()));
     }
-    json_quote(keys->items[i].as_string()->view(), out);
-    out->push_back(':');
-    if (!gap.empty()) out->push_back(' ');
-    if (!json_write(vm, item, gap, depth + 1, out, threw)) {
-      if (*threw) return false;
-      out->append("null");
-    }
+    out.push_back('}');
+    return true;
   }
-  if (!first && !gap.empty()) {
-    out->push_back('\n');
-    out->append(outer.view());
-  }
-  out->push_back('}');
-  return true;
-}
+};
 
 NATIVE(json_stringify) {
-  String gap(vm.allocator());
+  JsonWriter w(vm);
+  const Value replacer = arg_at(args, argc, 1);
+  if (Vm::is_callable(replacer)) {
+    w.replacer_function = replacer;
+  } else if (replacer.is_object() && replacer.as_object()->okind == ObjKind::Array) {
+    JsObject* names = vm.new_array();
+    for (uint32_t i = 0; i < replacer.as_object()->length; ++i) {
+      const Value item = replacer.as_object()->items[i];
+      if (!item.is_string() && !item.is_number()) continue;
+      JsString* name;
+      if (!vm.to_string(item, &name)) return false;
+      name = vm.intern(name->view());
+      bool seen = false;
+      for (uint32_t k = 0; k < names->length; ++k) seen = seen || names->items[k].as_string() == name;
+      if (!seen) vm.array_push(names, Value::make_string(name));
+    }
+    w.allowed = names;
+  }
   const Value g = arg_at(args, argc, 2);
   if (g.is_number()) {
-    for (int i = 0; i < static_cast<int>(g.u.number) && i < 10; ++i) gap.push_back(' ');
+    for (int i = 0; i < static_cast<int>(g.u.number) && i < 10; ++i) w.gap.push_back(' ');
   } else if (g.is_string()) {
-    gap.assign(g.as_string()->view().first(g.as_string()->length < 10 ? g.as_string()->length : 10));
+    w.gap.assign(g.as_string()->view().first(g.as_string()->length < 10 ? g.as_string()->length : 10));
   }
-  String out(vm.allocator());
-  bool threw = false;
-  if (!json_write(vm, arg_at(args, argc, 0), gap.view(), 0, &out, &threw)) {
-    if (threw) return false;
-    *result = Value();
-    return true;
-  }
-  *result = str_value(vm, out.view());
+  JsObject* holder = vm.new_plain();
+  vm.define_named(holder, "", arg_at(args, argc, 0));
+  bool wrote;
+  if (!w.write(Value::make_object(holder), vm.empty_string(), arg_at(args, argc, 0), &wrote)) return false;
+  *result = wrote ? str_value(vm, w.out.view()) : Value();
   return true;
 }
 
@@ -1348,68 +1467,144 @@ class JsonReader {
   }
 
  private:
+  // The messages are the ones browsers give: where the text stopped making sense, and what was there.
   bool fail() {
     String message(vm_.allocator());
-    message.append("Unexpected token in JSON at position ");
-    message.append_uint(pos_);
+    if (pos_ >= text_.size()) {
+      message.append("Unexpected end of JSON input");
+    } else {
+      const char c = text_[pos_];
+      if (c == '"') message.append("Unexpected string in JSON at position ");
+      else if ((c >= '0' && c <= '9') || c == '-') message.append("Unexpected number in JSON at position ");
+      else {
+        message.append("Unexpected token ");
+        message.push_back(c);
+        message.append(" in JSON at position ");
+      }
+      message.append_uint(pos_);
+    }
     return vm_.throw_error(ErrorKind::SyntaxError, message.view());
   }
   void skip() {
     while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\t' || text_[pos_] == '\n' || text_[pos_] == '\r')) ++pos_;
   }
+  static void utf8(uint32_t cp, String* out) {
+    if (cp < 0x80) {
+      out->push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      out->push_back(static_cast<char>(0xF0 | (cp >> 18)));
+      out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+  bool hex4(uint32_t* cp) {
+    *cp = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (pos_ >= text_.size()) return fail();
+      const char h = text_[pos_];
+      const int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+      if (d < 0) return fail();
+      *cp = *cp * 16 + static_cast<uint32_t>(d);
+      ++pos_;
+    }
+    return true;
+  }
   bool string(String* out) {
-    ++pos_;
-    while (pos_ < text_.size() && text_[pos_] != '"') {
-      char c = text_[pos_++];
-      if (c == '\\') {
-        if (pos_ >= text_.size()) return fail();
-        c = text_[pos_++];
-        switch (c) {
-          case 'n': out->push_back('\n'); break;
-          case 't': out->push_back('\t'); break;
-          case 'r': out->push_back('\r'); break;
-          case 'b': out->push_back('\b'); break;
-          case 'f': out->push_back('\f'); break;
-          case 'u': {
-            uint32_t cp = 0;
-            for (int i = 0; i < 4; ++i) {
-              if (pos_ >= text_.size()) return fail();
-              const char h = text_[pos_++];
-              const int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
-              if (d < 0) return fail();
-              cp = cp * 16 + static_cast<uint32_t>(d);
-            }
-            if (cp < 0x80) out->push_back(static_cast<char>(cp));
-            else if (cp < 0x800) {
-              out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
-              out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            } else {
-              out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
-              out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-              out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            }
-            break;
-          }
-          default: out->push_back(c); break;
-        }
-      } else {
+    ++pos_;   // the opening quote
+    for (;;) {
+      if (pos_ >= text_.size()) return fail();
+      char c = text_[pos_];
+      if (c == '"') {
+        ++pos_;
+        return true;
+      }
+      if (static_cast<uint8_t>(c) < 0x20) return fail();   // (a control character must be escaped)
+      ++pos_;
+      if (c != '\\') {
         out->push_back(c);
+        continue;
+      }
+      if (pos_ >= text_.size()) return fail();
+      c = text_[pos_];
+      switch (c) {
+        case '"': case '\\': case '/': out->push_back(c); ++pos_; break;
+        case 'n': out->push_back('\n'); ++pos_; break;
+        case 't': out->push_back('\t'); ++pos_; break;
+        case 'r': out->push_back('\r'); ++pos_; break;
+        case 'b': out->push_back('\b'); ++pos_; break;
+        case 'f': out->push_back('\f'); ++pos_; break;
+        case 'u': {
+          ++pos_;
+          uint32_t cp;
+          if (!hex4(&cp)) return false;
+          if (cp >= 0xD800 && cp < 0xDC00 && pos_ + 1 < text_.size() && text_[pos_] == '\\' && text_[pos_ + 1] == 'u') {   // a surrogate pair is one character
+            const uint64_t before = pos_;
+            pos_ += 2;
+            uint32_t low;
+            if (!hex4(&low)) return false;
+            if (low >= 0xDC00 && low < 0xE000) cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+            else pos_ = before;
+          }
+          utf8(cp, out);
+          break;
+        }
+        default: return fail();
       }
     }
-    if (pos_ >= text_.size()) return fail();
-    ++pos_;
+  }
+  bool literal(const char* word, uint64_t length) {
+    if (!text_.substr(pos_).starts_with(word)) return false;
+    pos_ += length;
+    return true;
+  }
+  // number = [-] int [. digits] [e [+-] digits], where int is 0 or a digit 1-9 and more digits.
+  bool number(Value* out) {
+    const uint64_t start = pos_;
+    auto digit = [&](uint64_t at) { return at < text_.size() && text_[at] >= '0' && text_[at] <= '9'; };
+    if (text_[pos_] == '-') ++pos_;
+    if (!digit(pos_)) return fail();
+    if (text_[pos_] == '0') {
+      ++pos_;
+    } else {
+      while (digit(pos_)) ++pos_;
+    }
+    if (pos_ < text_.size() && text_[pos_] == '.') {
+      ++pos_;
+      if (!digit(pos_)) return fail();
+      while (digit(pos_)) ++pos_;
+    }
+    if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
+      ++pos_;
+      if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
+      if (!digit(pos_)) return fail();
+      while (digit(pos_)) ++pos_;
+    }
+    double d;
+    if (!string_to_number(text_.substr(start, pos_ - start), &d)) {
+      pos_ = start;
+      return fail();
+    }
+    *out = num_value(d);
     return true;
   }
   bool value(Value* out, uint32_t depth) {
-    if (depth > 64 || pos_ >= text_.size()) return fail();
+    if (depth > 512 || pos_ >= text_.size()) return fail();
     const char c = text_[pos_];
     if (c == '{') {
       JsObject* o = vm_.new_plain();
+      *out = Value::make_object(o);   // (no script runs while parsing: nothing can collect it)
       ++pos_;
       skip();
       if (pos_ < text_.size() && text_[pos_] == '}') {
         ++pos_;
-        *out = Value::make_object(o);
         return true;
       }
       for (;;) {
@@ -1431,20 +1626,18 @@ class JsonReader {
         }
         if (pos_ < text_.size() && text_[pos_] == '}') {
           ++pos_;
-          break;
+          return true;
         }
         return fail();
       }
-      *out = Value::make_object(o);
-      return true;
     }
     if (c == '[') {
       JsObject* a = vm_.new_array();
+      *out = Value::make_object(a);
       ++pos_;
       skip();
       if (pos_ < text_.size() && text_[pos_] == ']') {
         ++pos_;
-        *out = Value::make_object(a);
         return true;
       }
       for (;;) {
@@ -1459,12 +1652,10 @@ class JsonReader {
         }
         if (pos_ < text_.size() && text_[pos_] == ']') {
           ++pos_;
-          break;
+          return true;
         }
         return fail();
       }
-      *out = Value::make_object(a);
-      return true;
     }
     if (c == '"') {
       String s(vm_.allocator());
@@ -1472,19 +1663,11 @@ class JsonReader {
       *out = str_value(vm_, s.view());
       return true;
     }
-    if (text_.substr(pos_).starts_with("true")) { pos_ += 4; *out = Value::make_bool(true); return true; }
-    if (text_.substr(pos_).starts_with("false")) { pos_ += 5; *out = Value::make_bool(false); return true; }
-    if (text_.substr(pos_).starts_with("null")) { pos_ += 4; *out = Value::make_null(); return true; }
-    const uint64_t start = pos_;
-    if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
-    while (pos_ < text_.size() && ((text_[pos_] >= '0' && text_[pos_] <= '9') || text_[pos_] == '.' || text_[pos_] == 'e' || text_[pos_] == 'E' || text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
-    double d;
-    if (pos_ == start || !string_to_number(text_.substr(start, pos_ - start), &d)) {
-      pos_ = start;
-      return fail();
-    }
-    *out = num_value(d);
-    return true;
+    if (c == 't' && literal("true", 4)) { *out = Value::make_bool(true); return true; }
+    if (c == 'f' && literal("false", 5)) { *out = Value::make_bool(false); return true; }
+    if (c == 'n' && literal("null", 4)) { *out = Value::make_null(); return true; }
+    if (c == '-' || (c >= '0' && c <= '9')) return number(out);
+    return fail();
   }
 
   Vm& vm_;
@@ -1492,11 +1675,52 @@ class JsonReader {
   uint64_t pos_ = 0;
 };
 
+// The reviver walk of JSON.parse: the children first, then holder[key] itself, each replaced by what the reviver returns (undefined removes it).
+bool json_revive(Vm& vm, const Value& reviver, const Value& holder, JsString* key, Value* out, uint32_t depth) {
+  Value value;
+  if (!vm.get(holder, key, &value)) return false;
+  if (value.is_object() && depth < 512) {
+    JsObject* o = value.as_object();
+    if (o->okind == ObjKind::Array) {
+      for (uint32_t i = 0; i < o->length; ++i) {
+        String name(vm.allocator());
+        name.append_uint(i);
+        JsString* k = vm.intern(name.view());
+        Value revived;
+        if (!json_revive(vm, reviver, value, k, &revived, depth + 1)) return false;
+        if (i >= o->length) break;
+        if (revived.is_undefined()) o->items[i] = Value();
+        else o->items[i] = revived;
+      }
+    } else {
+      JsObject* keys = vm.own_keys(o);
+      for (uint32_t i = 0; i < keys->length; ++i) {
+        JsString* k = keys->items[i].as_string();
+        Value revived;
+        if (!json_revive(vm, reviver, value, k, &revived, depth + 1)) return false;
+        if (revived.is_undefined()) vm.delete_property(o, k);
+        else vm.define(o, k, revived);
+      }
+    }
+  }
+  const Value call_args[2] = {Value::make_string(key), value};
+  return vm.call(reviver, holder, call_args, 2, out);
+}
+
 NATIVE(json_parse) {
   JsString* s;
   if (!arg_string(vm, args, argc, 0, &s)) return false;
   JsonReader reader(vm, s->view());
-  return reader.parse(result);
+  Value parsed;
+  if (!reader.parse(&parsed)) return false;
+  const Value reviver = arg_at(args, argc, 1);
+  if (!Vm::is_callable(reviver)) {
+    *result = parsed;
+    return true;
+  }
+  JsObject* holder = vm.new_plain();
+  vm.define_named(holder, "", parsed);
+  return json_revive(vm, reviver, Value::make_object(holder), vm.empty_string(), result, 0);
 }
 
 // --- console, document, timers, Date ---------------------------------------------------------------------------------
@@ -1857,6 +2081,23 @@ bool install_builtins(Vm& vm) {
   vm.define_native(math, "random", math_random, 0);
   vm.define_native(math, "hypot", math_hypot, 2);
 
+  // Symbol
+  JsObject* symbol = vm.new_native(symbol_function, "Symbol", 0);
+  global_value("Symbol", Value::make_object(symbol));
+  for (const char* name : {"iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag", "species"}) {
+    String well_known(vm.allocator());
+    well_known.append("@@");
+    well_known.append(name);
+    vm.define_named(symbol, name, str_value(vm, well_known.view()), 0);
+  }
+
+  // Promise
+  JsObject* promise = make_ctor("Promise", promise_ctor, 1, vm.promise_proto());
+  vm.define_native(promise, "resolve", promise_static_resolve, 1);
+  vm.define_native(promise, "reject", promise_static_reject, 1);
+  vm.define_native(vm.promise_proto(), "then", promise_then, 2);
+  vm.define_native(vm.promise_proto(), "catch", promise_catch, 1);
+
   // JSON
   JsObject* json = vm.new_plain();
   global_value("JSON", Value::make_object(json));
@@ -1901,6 +2142,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(date_proto, "getSeconds", date_seconds, 0);
   vm.define_native(date_proto, "getMilliseconds", date_milliseconds, 0);
   vm.define_native(date_proto, "toISOString", date_to_iso, 0);
+  vm.define_native(date_proto, "toJSON", date_to_iso, 0);
   vm.define_native(date_proto, "toString", date_to_iso, 0);
   vm.define_named(g, "__date_proto", Value::make_object(date_proto), 0);
 

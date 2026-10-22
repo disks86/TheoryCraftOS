@@ -21,6 +21,7 @@
 #include <initializer_list>
 #include "Browser/DomBindingsInternal.hpp"
 #include "Browser/Url.hpp"
+#include "Browser/WebUrl.hpp"
 #include "Utility/Move.hpp"
 
 namespace browser {
@@ -154,9 +155,35 @@ NATIVE(location_to_string) {
 
 // --- history ---------------------------------------------------------------------------------------------------------------------
 
-bool history_get(Vm& vm, JsObject*, JsString* key, Value* out) {
-  if (!key->view().equals("length")) return false;
-  *out = num_value(impl(vm).host.history_length());
+// history.state: the state of the entry the page is on, parsed from its JSON text (the same object each time until the entry changes).
+bool history_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
+  if (key->view().equals("length")) {
+    *out = num_value(impl(vm).host.history_length());
+    return true;
+  }
+  if (!key->view().equals("state")) return false;
+  String json(vm.allocator());
+  if (!impl(vm).host.history_state(&json)) {
+    *out = Value::make_null();
+    return true;
+  }
+  Value cached_text, cached_value;
+  if (vm.get_plain(o, vm.intern("__sj"), &cached_text) && cached_text.is_string() && cached_text.as_string()->view().equals(json.view()) && vm.get_plain(o, vm.intern("__sv"), &cached_value)) {
+    *out = cached_value;
+    return true;
+  }
+  Value parse, parsed;
+  const Value text = str_value(vm, json.view());
+  if (!vm.get_named(Value::make_object(vm.global()), "__deserialize", &parse) || !Vm::is_callable(parse) || !vm.call(parse, Value(), &text, 1, &parsed)) {
+    if (vm.has_exception()) {
+      String ignored(vm.allocator());
+      vm.take_exception(&ignored);
+    }
+    parsed = Value::make_null();
+  }
+  vm.define(o, vm.intern("__sj"), text, kWritable);
+  vm.define(o, vm.intern("__sv"), parsed, kWritable);
+  *out = parsed;
   return true;
 }
 
@@ -179,19 +206,40 @@ NATIVE(history_go) {
   return true;
 }
 
+// pushState(state, title, url) and replaceState: the state is serialized (to text, so that the entry can outlive the page and the state can hold dates, nested
+// objects ...), the address must be of the same origin as the page.
 bool state_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, bool replace) {
   DomBindings::Impl& c = impl(vm);
   if (!self.is_object()) return true;
-  vm.define_named(self.as_object(), "state", arg_at(args, argc, 0), kWritable);
+  Value serialize, text;
+  const Value state = arg_at(args, argc, 0);
+  bool has_state = !state.is_undefined();
+  String json(vm.allocator());
+  if (has_state) {
+    if (!vm.get_named(Value::make_object(vm.global()), "__serialize", &serialize) || !Vm::is_callable(serialize)) return vm.throw_error(ErrorKind::TypeError, "history state cannot be saved");
+    if (!vm.call(serialize, Value(), &state, 1, &text)) return false;
+    if (!arg_text(vm, text, &json)) return false;
+    if (json.size() > (2u << 20)) return throw_dom(vm, "DataCloneError", "Failed to execute 'pushState' on 'History': The state object is too large.");
+  }
+  String resolved(vm.allocator());
   const Value url = arg_at(args, argc, 2);
   if (!url.is_nullish()) {
-    String text(vm.allocator()), resolved(vm.allocator());
-    if (!arg_text(vm, url, &text)) return false;
-    resolve_url(vm, c, text.view(), &resolved);
-    c.host.push_state(resolved.view(), replace);
+    String target(vm.allocator());
+    if (!arg_text(vm, url, &target)) return false;
+    WebUrl base(vm.allocator()), next(vm.allocator());
+    if (WebUrl::parse(vm.allocator(), c.host.address(), nullptr, &base)) {
+      if (!WebUrl::parse(vm.allocator(), target.view(), &base, &next)) return throw_dom(vm, "SecurityError", "Failed to execute 'pushState' on 'History': A history state object with URL cannot be created.");
+      const bool same_origin = base.is_file() ? (next.is_file() && base.path.equals(next.path.view())) : base.same_origin(next);
+      if (!same_origin || !next.username.equals(base.username.view()) || !next.password.equals(base.password.view()))
+        return throw_dom(vm, "SecurityError", "Failed to execute 'pushState' on 'History': A history state object with a URL of another origin cannot be created.");
+      next.serialize(&resolved);
+    } else {
+      resolve_url(vm, c, target.view(), &resolved);
+    }
   } else {
-    c.host.push_state(c.host.address(), replace);
+    resolved.assign(c.host.address());
   }
+  c.host.push_state(resolved.view(), json.view(), has_state, replace);
   return true;
 }
 NATIVE(history_push_state) { return state_impl(vm, self, args, argc, false); }
@@ -202,6 +250,27 @@ NATIVE(history_replace_state) { return state_impl(vm, self, args, argc, true); }
 StorageArea* area_of(JsObject* o) { return static_cast<StorageArea*>(o->host_data); }
 
 bool storage_method(StringView k) { return IS("getItem") || IS("setItem") || IS("removeItem") || IS("clear") || IS("key") || IS("constructor") || IS("toString"); }
+
+// Tells the other pages of the origin that a key changed (key null: the whole area was cleared).
+void storage_notify(Vm& vm, JsObject* o, const String* key, const String* old_value, const String* new_value) {
+  DomBindings::Impl& c = impl(vm);
+  c.host.storage_changed(o == c.session_storage, key, old_value, new_value);
+}
+
+// Sets a value and reports the change, if it is one. False after throwing (the quota).
+bool storage_put(Vm& vm, JsObject* o, StringView key, StringView value) {
+  StorageArea* a = area_of(o);
+  StringView existing;
+  String old_copy(vm.allocator()), key_copy(vm.allocator()), value_copy(vm.allocator());
+  const bool had = a->get(key, &existing);
+  if (had) old_copy.assign(existing);
+  if (had && old_copy.view().equals(value)) return true;
+  if (!a->set(key, value)) return throw_dom(vm, "QuotaExceededError", "Failed to execute 'setItem' on 'Storage': Setting the value exceeded the quota.");
+  key_copy.assign(key);
+  value_copy.assign(value);
+  storage_notify(vm, o, &key_copy, had ? &old_copy : nullptr, &value_copy);
+  return true;
+}
 
 bool storage_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   const StringView k = key->view();
@@ -223,15 +292,23 @@ HostClass::Set storage_set(Vm& vm, JsObject* o, JsString* key, const Value& valu
   if (k.empty() || storage_method(k) || IS("length") || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return HostClass::Set::NotHandled;
   String text(vm.allocator());
   if (!arg_text(vm, value.is_undefined() ? str_value(vm, "undefined") : value, &text)) return HostClass::Set::Threw;
-  if (!area_of(o)->set(k, text.view())) {
-    throw_dom(vm, "QuotaExceededError", "The quota has been exceeded.");
-    return HostClass::Set::Threw;
-  }
-  return HostClass::Set::Handled;
+  return storage_put(vm, o, k, text.view()) ? HostClass::Set::Handled : HostClass::Set::Threw;
 }
 
-bool storage_remove(Vm&, JsObject* o, JsString* key, bool* deleted) {
-  area_of(o)->remove(key->view());
+// Removes a key and reports it.
+void storage_drop(Vm& vm, JsObject* o, StringView key) {
+  StorageArea* a = area_of(o);
+  StringView existing;
+  if (!a->get(key, &existing)) return;
+  String old_copy(vm.allocator()), key_copy(vm.allocator());
+  old_copy.assign(existing);
+  key_copy.assign(key);
+  a->remove(key);
+  storage_notify(vm, o, &key_copy, &old_copy, nullptr);
+}
+
+bool storage_remove(Vm& vm, JsObject* o, JsString* key, bool* deleted) {
+  storage_drop(vm, o, key->view());
   *deleted = true;
   return true;
 }
@@ -242,52 +319,61 @@ void storage_keys(Vm& vm, JsObject* o, JsObject* keys) {
 
 const HostClass kStorageClass = {"Storage", storage_get, storage_set, storage_remove, storage_keys};
 
-StorageArea* this_area(Vm& vm, const Value& self) {
-  if (self.is_object() && self.as_object()->host == &kStorageClass) return area_of(self.as_object());
+JsObject* this_storage(Vm& vm, const Value& self) {
+  if (self.is_object() && self.as_object()->host == &kStorageClass) return self.as_object();
   vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
   return nullptr;
 }
 
 NATIVE(storage_get_item) {
-  StorageArea* a = this_area(vm, self);
+  JsObject* o = this_storage(vm, self);
   String key(vm.allocator());
-  if (!a || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
+  if (!o || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
   StringView v;
-  *result = a->get(key.view(), &v) ? str_value(vm, v) : Value::make_null();
+  *result = area_of(o)->get(key.view(), &v) ? str_value(vm, v) : Value::make_null();
   return true;
 }
 
 NATIVE(storage_set_item) {
-  StorageArea* a = this_area(vm, self);
+  JsObject* o = this_storage(vm, self);
   String key(vm.allocator()), value(vm.allocator());
-  if (!a || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
+  if (!o) return false;
+  if (argc < 2) {
+    String message(vm.allocator());
+    message.append("Failed to execute 'setItem' on 'Storage': 2 arguments required, but only ");
+    message.append_uint(argc);
+    message.append(" present.");
+    return vm.throw_error(ErrorKind::TypeError, message.view());
+  }
+  if (!arg_text(vm, args[0], &key)) return false;
   JsString* s;
-  if (!vm.to_string(arg_at(args, argc, 1), &s)) return false;
+  if (!vm.to_string(args[1], &s)) return false;
   value.assign(s->view());
-  if (!a->set(key.view(), value.view())) return throw_dom(vm, "QuotaExceededError", "The quota has been exceeded.");
-  return true;
+  return storage_put(vm, o, key.view(), value.view());
 }
 
 NATIVE(storage_remove_item) {
-  StorageArea* a = this_area(vm, self);
+  JsObject* o = this_storage(vm, self);
   String key(vm.allocator());
-  if (!a || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
-  a->remove(key.view());
+  if (!o || !arg_text(vm, arg_at(args, argc, 0), &key)) return false;
+  storage_drop(vm, o, key.view());
   return true;
 }
 
 NATIVE(storage_clear) {
-  StorageArea* a = this_area(vm, self);
-  if (!a) return false;
-  a->clear();
+  JsObject* o = this_storage(vm, self);
+  if (!o) return false;
+  const bool had_any = area_of(o)->count() > 0;
+  area_of(o)->clear();
+  if (had_any) storage_notify(vm, o, nullptr, nullptr, nullptr);
   return true;
 }
 
 NATIVE(storage_key) {
-  StorageArea* a = this_area(vm, self);
+  JsObject* o = this_storage(vm, self);
   double d;
-  if (!a || !vm.to_number(arg_at(args, argc, 0), &d)) return false;
-  *result = d >= 0 && d < a->count() ? str_value(vm, a->key(static_cast<uint32_t>(d))) : Value::make_null();
+  if (!o || !vm.to_number(arg_at(args, argc, 0), &d)) return false;
+  *result = d >= 0 && d < area_of(o)->count() ? str_value(vm, area_of(o)->key(static_cast<uint32_t>(d))) : Value::make_null();
   return true;
 }
 
@@ -317,7 +403,7 @@ NATIVE(win_cancel_animation_frame) {
 
 NATIVE(win_queue_microtask) {
   if (!Vm::is_callable(arg_at(args, argc, 0))) return vm.throw_error(ErrorKind::TypeError, "queueMicrotask needs a function");
-  vm.add_timer(args[0], 0, -1, nullptr, 0);
+  vm.enqueue_microtask(args[0]);
   return true;
 }
 
@@ -755,7 +841,6 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(c.history_proto, "pushState", history_push_state, 3);
   vm.define_native(c.history_proto, "replaceState", history_replace_state, 3);
   JsObject* history = vm.new_host_object(c.history_proto, &kHistoryClass, &c);
-  vm.define_named(history, "state", Value::make_null(), kWritable);
   vm.define_named(history, "scrollRestoration", str_value(vm, "auto"), kWritable);
   vm.define_named(g, "history", Value::make_object(history), kWritable);
 
@@ -766,6 +851,12 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(c.storage_proto, "removeItem", storage_remove_item, 1);
   vm.define_native(c.storage_proto, "clear", storage_clear, 0);
   vm.define_native(c.storage_proto, "key", storage_key, 1);
+  {
+    JsObject* storage_ctor = vm.new_native([](Vm& v, const Value&, const Value*, uint32_t, Value*) { return v.throw_error(ErrorKind::TypeError, "Illegal constructor"); }, "Storage", 0);
+    vm.define(storage_ctor, vm.prototype_name(), Value::make_object(c.storage_proto), 0);
+    vm.define(c.storage_proto, vm.intern("constructor"), Value::make_object(storage_ctor), kWritable);
+    vm.define_named(g, "Storage", Value::make_object(storage_ctor), kWritable);
+  }
   c.local_storage = vm.new_host_object(c.storage_proto, &kStorageClass, &c.host.local_storage());
   c.session_storage = vm.new_host_object(c.storage_proto, &kStorageClass, &c.host.session_storage());
   vm.define_named(g, "localStorage", Value::make_object(c.local_storage), kWritable);

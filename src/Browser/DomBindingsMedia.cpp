@@ -2080,5 +2080,14 @@ bool install_media(DomBindings::Impl& c) {
   return !vm.halted();
 }
 
+JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes) { return make_bytes(c, bytes, false); }
+
+bool byte_array_bytes(const Value& v, StringView* out) {
+  if (!is_bytes(v)) return false;
+  JsString* b = array_buffer(v.as_object());
+  *out = b->view();
+  return true;
+}
+
 }  // namespace bind
 }  // namespace browser

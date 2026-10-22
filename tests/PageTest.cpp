@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -84,8 +85,37 @@ struct FakeClip final : IVideoClip {
   }
 };
 
+// A network that hands out canned answers keyed by "METHOD url" (404 for anything else) and remembers what was sent.
+struct FakeNet final : IPageLoader {
+  struct Answer {
+    uint32_t status = 200;
+    std::string headers, body;
+  };
+  std::map<std::string, Answer> answers;
+  std::vector<std::string> sent;   // "METHOD url\nheaders\nbody"
+  bool fetch(StringView, PageResult*) override { return false; }
+  bool exchange(const NetRequest& request, NetResponse* response) override {
+    const std::string key = std::string(request.method.data(), request.method.size()) + " " + std::string(request.url.data(), request.url.size());
+    sent.push_back(key + "\n" + std::string(request.headers.data(), request.headers.size()) + "\n" + std::string(reinterpret_cast<const char*>(request.body.data()), request.body.size()));
+    auto it = answers.find(key);
+    if (it == answers.end() && key.find("http://down.example/") != std::string::npos) {
+      response->error.assign("connection failed");
+      return false;
+    }
+    Answer a;
+    if (it != answers.end()) a = it->second;
+    else a.status = 404;
+    response->status = a.status;
+    response->reason.assign(a.status == 200 ? "OK" : a.status == 404 ? "Not Found" : "Status");
+    response->headers.assign(StringView(a.headers.data(), a.headers.size()));
+    response->body.clear();
+    response->body.append(ConstByteView(reinterpret_cast<const uint8_t*>(a.body.data()), a.body.size()));
+    return true;
+  }
+};
+
 struct FakeEnvironment final : IPageEnvironment {
-  explicit FakeEnvironment(TestAllocator& a) : storage(a), jar(a) { allocator_for_clips = &a; }
+  explicit FakeEnvironment(TestAllocator& a) : local_hub(a), session_hub(a), hub(a), jar(a) { allocator_for_clips = &a; }
   std::map<std::string, std::string> blobs;   // binary files (pictures, videos)
   FakeClip* last_clip = nullptr;
   bool can_play_video = true;
@@ -117,8 +147,12 @@ struct FakeEnvironment final : IPageEnvironment {
   int reloads = 0, history_moves = 0;
   bool confirm_answer = false;
   uint64_t clock = 1700000000000ull;
-  StorageArea storage;
-  String jar;
+  StorageHub local_hub, session_hub;
+  PageHub hub;
+  CookieJar jar;
+  std::string state_text;
+  bool has_state = false;
+  uint64_t tab = 1;
   bool fetch_text(StringView address, uint64_t, String* text) override {
     fetched.push_back(std::string(address.data(), address.size()));
     auto it = files.find(fetched.back());
@@ -140,14 +174,30 @@ struct FakeEnvironment final : IPageEnvironment {
   void reload() override { ++reloads; }
   void history_go(int32_t d) override { history_moves += d; }
   uint32_t history_length() override { return 3; }
-  void push_state(StringView a, bool) override { states.push_back(std::string(a.data(), a.size())); }
+  void push_state(StringView a, StringView state, bool has, bool replace) override {
+    states.push_back(std::string(replace ? "replace " : "push ") + std::string(a.data(), a.size()) + (has ? " " + std::string(state.data(), state.size()) : ""));
+    state_text.assign(state.data(), state.size());
+    has_state = has;
+  }
+  bool history_state(String* json) override {
+    if (!has_state) return false;
+    json->assign(StringView(state_text.data(), state_text.size()));
+    return true;
+  }
   void alert(StringView t) override { alerts.push_back(std::string(t.data(), t.size())); }
   bool confirm(StringView) override { return confirm_answer; }
   void scroll_to(int32_t line) override { scrolls.push_back(line); }
   uint64_t now_ms() override { return clock; }
   void console(int, StringView t) override { console_lines.push_back(std::string(t.data(), t.size())); }
-  StorageArea& local_storage() override { return storage; }
-  String& cookie() override { return jar; }
+  StorageHub* shared_local = nullptr;   // (another window's: windows share localStorage and tell each other about changes)
+  PageHub* shared_hub = nullptr;
+  StorageHub& local_storage_hub() override { return shared_local ? *shared_local : local_hub; }
+  StorageHub& session_storage_hub() override { return session_hub; }
+  PageHub& page_hub() override { return shared_hub ? *shared_hub : hub; }
+  uint64_t tab_id() override { return tab; }
+  CookieJar& cookies() override { return jar; }
+  FakeNet net;
+  bool http_request(const FetchOptions& options, NetResponse* response) override { return fetch_resource(*allocator_for_clips, net, jar, options, response); }
 };
 
 // Loads a page and returns what its scripts logged, one line per console call; "ERR: ..." for an error.
@@ -303,7 +353,7 @@ static void test_timers_and_window() {
   CHECK(js("", "console.log(btoa('hello world'), atob('aGVsbG8gd29ybGQ='), btoa(''), encodeURIComponent('a b&c/d?é'), decodeURIComponent('a%20b%26'), encodeURI('http://x/a b?q=1&r=é#h'), decodeURI('%41%2F'))", "aGVsbG8gd29ybGQ= hello world  a%20b%26c%2Fd%3F%C3%A9 a b& http://x/a%20b?q=1&r=%C3%A9#h A%2F"));
   CHECK(js("", "try { atob('***') } catch (e) { console.log(e.name) } try { decodeURIComponent('%') } catch (e) { console.log(e.message) }", "InvalidCharacterError | URIError: URI malformed"));
   CHECK(js("", "localStorage.setItem('a', 1); localStorage.b = 'two'; console.log(localStorage.getItem('a'), localStorage.a, localStorage.length, localStorage.key(1), localStorage.nothing, Object.keys(localStorage).join()); delete localStorage.a; localStorage.removeItem('zz'); console.log(localStorage.length); sessionStorage.setItem('s', 'x'); console.log(sessionStorage.getItem('s'), localStorage.getItem('s')); localStorage.clear(); console.log(localStorage.length)", "1 1 2 b undefined a,b | 1 | x null | 0"));
-  CHECK(js("", "document.cookie = 'a=1; path=/'; document.cookie = 'b=2'; document.cookie = 'a=3'; console.log(document.cookie); document.cookie = 'b=; max-age=0'; console.log(document.cookie)", "a=3; b=2 | a=3"));
+  CHECK(js("", "document.cookie = 'a=1; path=/'; document.cookie = 'b=2; path=/'; document.cookie = 'a=3; path=/'; console.log(document.cookie); document.cookie = 'b=; max-age=0; path=/'; console.log(document.cookie)", "a=3; b=2 | a=3"));
   CHECK(js("", "console.log(location.href, location.protocol, location.host, location.hostname, location.port, location.pathname, location.search, location.hash, location.origin, String(location), document.URL, document.domain)", "http://example.com/dir/page.html http: example.com example.com  /dir/page.html   http://example.com http://example.com/dir/page.html http://example.com/dir/page.html example.com"));
   CHECK(run_page("<html><body><script>console.log(location.port, location.search, location.hash, location.pathname, location.host)</script></body></html>", "https://h.org:8443/a/b?x=1&y=2#frag") == "8443 ?x=1&y=2 #frag /a/b h.org:8443");
   CHECK(run_page("<html><body><script>console.log(location.protocol, location.pathname, location.origin)</script></body></html>", "/docs/index.html") == "file: /docs/index.html null");
@@ -1606,14 +1656,448 @@ static void test_forms() {
   }
 }
 
-int main() {
+// Loads a page at `address`, lets its timers (and with them the network tasks) run until none is waiting, and returns what the scripts logged.
+static std::string run_async(const char* script, const char* address, const std::function<void(FakeEnvironment&)>& setup = nullptr, int rounds = 400,
+                             const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    FakeEnvironment env(a);
+    if (setup) setup(env);
+    MediaEnvironment media;
+    Page page(a, env, address, media, true);
+    page.load((std::string("<html><head><title>T</title></head><body><script>") + script + "</script></body></html>").c_str());
+    for (int i = 0; i < rounds; ++i) {
+      double due;
+      if (!page.next_timer(&due)) break;
+      if (getenv("TRACE")) printf("round %d due %.0f clock %llu\n", i, due, (unsigned long long)env.clock);
+      if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+      page.run_due_timers(env.clock);
+    }
+    out = std::string(page.log().data(), page.log().size());
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    for (size_t p = 0; (p = out.find("\n", p)) != std::string::npos; ) { out.replace(p, 1, " | "); p += 3; }
+    if (after) after(env);
+  }
+  if (a.live != 0) {
+    printf("   leak (%d) in: %s\n", a.live, script);
+    ++g_failed;
+  }
+  return out;
+}
+
+static bool async_is(const char* script, const char* expected, const std::function<void(FakeEnvironment&)>& setup = nullptr, const char* address = "https://app.example/dir/page.html") {
+  const std::string got = run_async(script, address, setup);
+  if (got != expected) {
+    printf("   %s\n   logs     %s\n   expects  %s\n", script, got.c_str(), expected);
+    return false;
+  }
+  return true;
+}
+
+static void test_url() {
+  CHECK(js("", "var u = new URL('../x?y=1&z=a%20b#top', 'http://user:pw@a.example:8080/b/c/d'); console.log(u.href, u.origin, u.protocol, u.username, u.password, u.host, u.hostname, u.port, u.pathname, u.search, u.hash)",
+           "http://user:pw@a.example:8080/b/x?y=1&z=a%20b#top http://a.example:8080 http: user pw a.example:8080 a.example 8080 /b/x ?y=1&z=a%20b #top"));
+  CHECK(js("", "var u = new URL('https://EXAMPLE.com:443/a/./b/../c'); console.log(u.href, u.port === '', String(u), JSON.stringify({ u: u }), u instanceof URL)", "https://example.com/a/c true https://example.com/a/c {\"u\":\"https://example.com/a/c\"} true"));
+  CHECK(js("", "var u = new URL('http://a.example/p?x=1'); u.pathname = '/q r'; u.search = 'k=v w'; u.hash = 'frag'; u.port = '81'; u.hostname = 'B.example'; u.protocol = 'https'; u.username = 'me'; console.log(u.href)", "https://me@b.example:81/q%20r?k=v%20w#frag"));
+  CHECK(js("", "var u = new URL('http://a.example/'); u.href = 'ftp://f.example/x'; console.log(u.href); try { u.href = 'nonsense' } catch (e) { console.log(e.name) } u.port = 'abc'; u.host = ''; console.log(u.href)", "ftp://f.example/x | TypeError | ftp://f.example/x"));
+  CHECK(js("", "try { new URL('nonsense') } catch (e) { console.log(e.name, e.message) } try { new URL('/x') } catch (e) { console.log(e.name) } try { URL('http://a/') } catch (e) { console.log(e.name) }",
+           "TypeError Failed to construct 'URL': Invalid URL | TypeError | TypeError"));
+  CHECK(js("", "console.log(URL.canParse('http://a/'), URL.canParse('x'), URL.canParse('x', 'http://a/b/'), new URL(new URL('http://a/b'), 'http://z/').href, new URL('c', new URL('http://a/b/')).href)", "true false true http://a/b http://a/b/c"));
+  CHECK(js("", "var u = new URL('mailto:a@b.example?subject=hi'); console.log(u.protocol, u.pathname, u.search, u.origin, new URL('data:text/plain,hi').origin, new URL('file:///C:/x/y.txt').pathname)", "mailto: a@b.example ?subject=hi null null /C:/x/y.txt"));
+  CHECK(js("", "console.log(new URL('http://m\xC3\xBCnchen.de/\xC3\xA4?q=\xC3\xB6#\xC3\xBC').href, new URL('http://[::1]:3000/').host, new URL('http://0x7f.1/').hostname)", "http://xn--mnchen-3ya.de/%C3%A4?q=%C3%B6#%C3%BC [::1]:3000 127.0.0.1"));
+  // searchParams stays in step with the URL, both ways
+  CHECK(js("", "var u = new URL('http://a/p?x=1&y=2'); var sp = u.searchParams; console.log(sp.get('x'), sp.size, sp === u.searchParams); sp.append('z', 'a b&c'); console.log(u.search, u.href); u.search = '?q=9'; console.log(sp.get('q'), sp.has('x'), sp.size); sp.delete('q'); console.log(u.href, u.search === '')",
+           "1 2 true | ?x=1&y=2&z=a+b%26c http://a/p?x=1&y=2&z=a+b%26c | 9 false 1 | http://a/p true"));
+  CHECK(js("", "var u = new URL('http://a/p?b=2&a=1'); u.searchParams.sort(); console.log(u.search); u.searchParams.set('a', 'x'); console.log(u.search); u.href = 'http://a/z?m=1'; console.log(u.searchParams.toString())", "?a=1&b=2 | ?a=x&b=2 | m=1"));
+  CHECK(js("", "console.log(typeof URL.createObjectURL, URL.createObjectURL(new Blob(['x'])).indexOf('blob:http'), (function () { var u = URL.createObjectURL(new Blob(['x'])); URL.revokeObjectURL(u); return u.length > 8 })())", "function 0 true"));
+}
+
+static void test_search_params() {
+  CHECK(js("", "var p = new URLSearchParams('?a=1&b=2&a=3&c=%C3%A9+x&d'); console.log(p.get('a'), p.getAll('a').join(), p.get('c'), p.get('d') === '', p.get('nope'), p.has('b'), p.has('a', '3'), p.has('a', '9'), p.size, p.toString())", "1 1,3 \xC3\xA9 x true null true true false 5 a=1&b=2&a=3&c=%C3%A9+x&d="));
+  CHECK(js("", "var p = new URLSearchParams({ x: 1, y: 'two words', z: '&=' }); console.log(p.toString()); p.set('x', 5); p.set('new', 'n'); p.delete('y'); console.log(p.toString()); p.append('x', 6); console.log(p.getAll('x').join(), p.size); p.delete('x', 6); console.log(p.toString())",
+           "x=1&y=two+words&z=%26%3D | x=5&z=%26%3D&new=n | 5,6 4 | x=5&z=%26%3D&new=n"));
+  CHECK(js("", "var p = new URLSearchParams([['a', '1'], ['b', '2']]); var q = new URLSearchParams(p); q.append('c', '3'); console.log(p.toString(), q.toString()); try { new URLSearchParams([['a']]) } catch (e) { console.log(e.name) } console.log(new URLSearchParams().toString() === '', new URLSearchParams(null).size, new URLSearchParams('').size)",
+           "a=1&b=2 a=1&b=2&c=3 | TypeError | true 0 0"));
+  CHECK(js("", "var p = new URLSearchParams('b=2&a=1&c=3&a=0'); var out = []; for (var e of p) out.push(e[0] + e[1]); console.log(out.join(), [...p].length, p.keys().join(), p.values().join(), p.entries()[1].join('=')); p.forEach(function (v, k, self) { out.push(k + ':' + v + (self === p)) }); console.log(out.slice(4).join())",
+           "b2,a1,c3,a0 4 b,a,c,a 2,1,3,0 a=1 | b:2true,a:1true,c:3true,a:0true"));
+  CHECK(js("", "var p = new URLSearchParams('b=2&a=1&c=3&a=0'); p.sort(); console.log(p.toString()); var q = new URLSearchParams('z=1&\xC3\xA9=2&a=3'); q.sort(); console.log(q.keys().join())", "a=1&a=0&b=2&c=3 | a,z,\xC3\xA9"));
+  CHECK(js("", "var p = new URLSearchParams('q=a%2Bb+c%20d&%E2%82%AC=%e2%82%ac'); console.log(p.get('q'), p.get('\xE2\x82\xAC'), String(p), p instanceof URLSearchParams, Object.keys(p).length)", "a+b c d \xE2\x82\xAC q=a%2Bb+c+d&%E2%82%AC=%E2%82%AC true 0"));
+}
+
+static void test_headers() {
+  CHECK(js("", "var h = new Headers({ 'Content-Type': 'text/plain', 'X-A': '1' }); h.append('x-a', '2'); console.log(h.get('content-type'), h.get('X-A'), h.has('x-a'), h.has('nope'), h.get('nope')); h.set('X-A', '3'); h.delete('content-type'); console.log(h.get('x-a'), h.has('content-type'))",
+           "text/plain 1, 2 true false null | 3 false"));
+  CHECK(js("", "var h = new Headers([['B', '2'], ['a', '1'], ['b', '3']]); var out = []; h.forEach(function (v, k) { out.push(k + '=' + v) }); console.log(out.join(), h.keys().join(), h.values().join('|')); for (var e of h) out.push(e[0]); console.log(out.slice(2).join())", "a=1,b=2, 3 a,b 1|2, 3 | a,b"));
+  CHECK(js("", "var h = new Headers(); h.append('Set-Cookie', 'a=1'); h.append('Set-Cookie', 'b=2'); console.log(h.get('set-cookie'), h.getSetCookie().join('|'), h.entries().length); var c = new Headers(h); c.set('x', 'y'); console.log(h.has('x'), c.has('x'))", "a=1, b=2 a=1|b=2 2 | false true"));
+  CHECK(js("", "var h = new Headers(); try { h.append('bad name', 'x') } catch (e) { console.log(e.name) } try { h.append('ok', 'a\\nb') } catch (e) { console.log(e.name) } h.append('v', '  padded  '); console.log(h.get('v') + '|'); try { new Headers(5) } catch (e) { console.log(e.name) } try { new Headers([['a']]) } catch (e) { console.log(e.name) }",
+           "TypeError | TypeError | padded| | TypeError | TypeError"));
+}
+
+static void test_blob_text() {
+  CHECK(async_is("var b = new Blob(['ab', new Blob(['cd']), new Uint8Array([101, 102])], { type: 'Text/Plain' }); console.log(b.size, b.type, b instanceof Blob); b.text().then(function (t) { console.log(t) }); b.slice(1, 4, 'x/y').text().then(function (t) { console.log(t) });"
+                  "b.slice(-2).text().then(function (t) { console.log(t) }); b.arrayBuffer().then(function (u) { console.log(u.length, u[0]) });", "6 text/plain true | abcdef | bcd | ef | 6 97"));
+  CHECK(async_is("var f = new File(['hello'], 'a.txt', { type: 'text/plain', lastModified: 5 }); console.log(f.name, f.size, f.type, f.lastModified, f instanceof Blob, f instanceof File); try { new File(['x']) } catch (e) { console.log(e.name) }", "a.txt 5 text/plain 5 true true | TypeError"));
+  CHECK(async_is("var r = new FileReader(); var order = []; r.onload = function () { order.push('onload:' + r.result) }; r.addEventListener('loadend', function () { order.push('loadend ' + r.readyState); console.log(order.join()) }); r.readAsText(new Blob(['text \\u00e9'])); order.push('started ' + r.readyState);", "started 1,onload:text \xC3\xA9,loadend 2"));
+  CHECK(async_is("var r = new FileReader(); r.onload = function () { console.log(r.result) }; r.readAsDataURL(new Blob(['hi'], { type: 'text/plain' }));", "data:text/plain;base64,aGk="));
+  CHECK(js("", "var e = new TextEncoder().encode('h\xC3\xA9'); console.log(e.length, e[1], e[2], new TextDecoder().decode(e), new TextDecoder('utf-8').decode(new Uint8Array([0xff, 0x41])), new TextEncoder().encoding)", "3 195 169 h\xC3\xA9 \xEF\xBF\xBD" "A utf-8"));
+  CHECK(js("", "try { new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xff])) } catch (e) { console.log(e.name) } console.log(new TextDecoder('latin1').decode(new Uint8Array([0xe9])) === '\xC3\xA9', new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])), new TextDecoder().decode())", "TypeError | true A "));
+}
+
+static void test_abort() {
+  CHECK(async_is("var c = new AbortController(); var s = c.signal; var log = []; s.addEventListener('abort', function (e) { log.push('listener ' + e.type) }); s.onabort = function () { log.push('onabort') }; console.log(s.aborted); c.abort(); c.abort(); console.log(s.aborted, s.reason.name, log.join());", "false | true AbortError onabort,listener abort"));
+  CHECK(async_is("var c = new AbortController(); c.abort('why'); console.log(c.signal.reason); try { c.signal.throwIfAborted() } catch (e) { console.log(e) } console.log(AbortSignal.abort().aborted, typeof AbortSignal.timeout);", "why | why | true function"));
+  CHECK(async_is("var s = AbortSignal.timeout(50); s.addEventListener('abort', function () { console.log('timed out', s.reason.name) });", "timed out TimeoutError"));
+  CHECK(async_is("var a = new AbortController(), b = new AbortController(); var any = AbortSignal.any([a.signal, b.signal]); any.addEventListener('abort', function () { console.log('any', any.reason) }); b.abort('b!');", "any b!"));
+}
+
+static void stock(FakeEnvironment& env) {
+  env.net.answers["GET https://app.example/api/user"] = {200, "Content-Type: application/json\r\nX-Custom: yes\r\nSet-Cookie: seen=1; Path=/\r\n", "{\"name\":\"Ada\",\"langs\":[\"en\",\"fr\"]}"};
+  env.net.answers["GET https://app.example/text"] = {200, "Content-Type: text/plain; charset=utf-8\r\n", "plain text \xC3\xA9"};
+  env.net.answers["POST https://app.example/api/echo"] = {201, "Content-Type: text/plain\r\n", "created"};
+  env.net.answers["PUT https://app.example/api/item"] = {200, "", "put"};
+  env.net.answers["GET https://app.example/old"] = {302, "Location: /new\r\n", ""};
+  env.net.answers["GET https://app.example/new"] = {200, "Content-Type: text/plain\r\n", "moved here"};
+  env.net.answers["GET https://app.example/bad"] = {500, "", "oops"};
+  env.net.answers["GET https://app.example/empty"] = {204, "", ""};
+  env.net.answers["GET https://app.example/form"] = {200, "Content-Type: application/x-www-form-urlencoded\r\n", "a=1&b=two+words&a=3"};
+  env.net.answers["GET https://app.example/bin"] = {200, "Content-Type: application/octet-stream\r\n", std::string("\x01\x02\xff\x00\x41", 5)};
+  env.net.answers["GET https://api.other/open"] = {200, "Access-Control-Allow-Origin: https://app.example\r\nContent-Type: text/plain\r\nX-Hidden: h\r\n", "cross"};
+  env.net.answers["GET https://api.other/closed"] = {200, "Content-Type: text/plain\r\n", "private"};
+  env.net.answers["OPTIONS https://api.other/open"] = {204, "Access-Control-Allow-Origin: https://app.example\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: x-token\r\n", ""};
+  env.net.answers["PUT https://api.other/open"] = {200, "Access-Control-Allow-Origin: https://app.example\r\n", "put cross"};
+}
+
+static void test_fetch() {
+  CHECK(async_is("fetch('/api/user').then(function (r) { console.log(r.status, r.ok, r.statusText, r.url, r.type, r.redirected, r.headers.get('content-type'), r.headers.get('x-custom'), r.headers.get('set-cookie'), r.bodyUsed); return r.json() }).then(function (d) { console.log(d.name, d.langs.join('+')) });",
+                 "200 true OK https://app.example/api/user basic false application/json yes null false | Ada en+fr", stock));
+  CHECK(async_is("fetch('/text').then(function (r) { return r.text() }).then(function (t) { console.log(t, t.length) });", "plain text \xC3\xA9 13", stock));
+  CHECK(async_is("fetch('/bad').then(function (r) { console.log(r.status, r.ok); return r.text() }).then(function (t) { console.log(t) }); fetch('/missing').then(function (r) { console.log(r.status, r.ok) }); fetch('/empty').then(function (r) { console.log(r.status, r.body); return r.text() }).then(function (t) { console.log('[' + t + ']') });",
+                 "500 false | oops | 404 false | 204 null | []", stock));
+  CHECK(async_is("fetch('/old').then(function (r) { console.log(r.redirected, r.url); return r.text() }).then(function (t) { console.log(t) }); fetch('/old', { redirect: 'manual' }).then(function (r) { console.log(r.status, r.headers.get('location')) }); fetch('/old', { redirect: 'error' }).catch(function (e) { console.log(e.name) });",
+                 "true https://app.example/new | moved here | 302 /new | TypeError", stock));
+  CHECK(async_is("fetch('http://down.example/x').catch(function (e) { console.log(e.name, e.message.indexOf('Failed to fetch') === 0) }); fetch('nonsense:').catch(function (e) { console.log(e.name) }); fetch('/api/user', { method: 'GET', body: 'x' }).catch(function (e) { console.log(e.name) });", "TypeError | TypeError true | TypeError", stock));
+  // POST bodies
+  CHECK(async_is("fetch('/api/echo', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Token': 't' }, body: JSON.stringify({ a: 1 }) }).then(function (r) { console.log(r.status); return r.text() }).then(function (t) { console.log(t) });", "201 | created",
+                 stock));
+  CHECK(async_is("fetch('/api/echo', { method: 'POST', body: new URLSearchParams({ a: '1 2', b: 'x' }) }).then(function (r) { console.log(r.status) });", "201", stock));
+  CHECK(async_is("var fd = new FormData(); fd.append('k', 'v'); fd.append('f', new File(['filedata'], 'a.txt', { type: 'text/plain' })); fetch('/api/echo', { method: 'POST', body: fd }).then(function (r) { console.log(r.status) });", "201", stock));
+  CHECK(async_is("fetch('/api/echo', { method: 'POST', body: new Blob(['blob body'], { type: 'text/x' }) }).then(function (r) { console.log(r.status) }); fetch('/api/echo', { method: 'POST', body: new Uint8Array([65, 66]) }).then(function (r) { console.log(r.status) });", "201 | 201", stock));
+  // Request objects
+  CHECK(async_is("var req = new Request('/api/user', { headers: { 'X-A': '1' } }); console.log(req.url, req.method, req.mode, req.credentials, req.redirect, req.headers.get('x-a'), req.signal.aborted, req.bodyUsed); var c = new Request(req, { method: 'POST', body: 'b' }); console.log(c.method, c.url, c.headers.get('x-a'), c.headers.get('content-type')); fetch(req).then(function (r) { console.log(r.status) });",
+                 "https://app.example/api/user GET cors same-origin follow 1 false false | POST https://app.example/api/user 1 text/plain;charset=UTF-8 | 200", stock));
+  CHECK(async_is("try { new Request('/x', { method: 'GET', body: 'b' }) } catch (e) { console.log(e.name) } try { new Request('/x', { method: 'TRACE' }) } catch (e) { console.log(e.name) } try { new Request('http://u:p@a/') } catch (e) { console.log(e.name) } try { new Request() } catch (e) { console.log(e.name) } try { new Request('/x', { mode: 'wat' }) } catch (e) { console.log(e.name) }",
+                 "TypeError | TypeError | TypeError | TypeError | TypeError", stock));
+  // Response objects
+  CHECK(async_is("var r = new Response('body text', { status: 201, statusText: 'Made', headers: { 'X-A': '1' } }); console.log(r.status, r.ok, r.statusText, r.headers.get('x-a'), r.headers.get('content-type'), r.type, r.bodyUsed); r.text().then(function (t) { console.log(t, r.bodyUsed); return r.text() }).catch(function (e) { console.log(e.name) });",
+                 "201 true Made 1 text/plain;charset=UTF-8 default false | body text true | TypeError", stock));
+  CHECK(async_is("var r = Response.json({ a: [1, 2] }, { status: 202 }); console.log(r.status, r.headers.get('content-type')); r.clone().json().then(function (d) { console.log(d.a.length) }); r.text().then(function (t) { console.log(t) }); console.log(Response.error().type, Response.error().status, Response.redirect('/x', 301).headers.get('location'), Response.redirect('/x').status);"
+                 "try { new Response('x', { status: 99 }) } catch (e) { console.log(e.name) } try { new Response('x', { status: 204 }) } catch (e) { console.log(e.name) } try { r.clone() } catch (e) { console.log(e.name) }",
+                 "202 application/json | error 0 https://app.example/x 302 | RangeError | TypeError | TypeError | 2 | {\"a\":[1,2]}", stock));
+  CHECK(async_is("fetch('/bin').then(function (r) { return r.arrayBuffer() }).then(function (b) { console.log(b.length, b.byteLength, b[0], b[2], b[3], b[4]) }); fetch('/bin').then(function (r) { return r.blob() }).then(function (b) { console.log(b.size, b.type) });", "5 5 1 255 0 65 | 5 application/octet-stream", stock));
+  CHECK(async_is("fetch('/form').then(function (r) { return r.formData() }).then(function (fd) { console.log(fd.get('a'), fd.getAll('a').join(), fd.get('b')) });", "1 1,3 two words", stock));
+  CHECK(async_is("fetch('/text').then(function (r) { var reader = r.body.getReader(); return reader.read().then(function (c) { console.log(c.done, c.value.length); return reader.read() }).then(function (c) { console.log(c.done) }) });", "false 13 | true", stock));
+  CHECK(async_is("fetch('/api/user').then(function (r) { var c = r.clone(); return Promise.all([r.json(), c.text()]) }).then(function (a) { console.log(a[0].name, a[1].length) });", "Ada 34", stock));
+  // abort
+  CHECK(async_is("var c = new AbortController(); var p = fetch('/api/user', { signal: c.signal }); p.catch(function (e) { console.log(e.name) }); c.abort(); fetch('/api/user', { signal: AbortSignal.abort() }).catch(function (e) { console.log('pre', e.name) });", "AbortError | pre AbortError", stock));
+  // the network is not touched for an aborted request
+  {
+    std::string got = run_async("fetch('/text', { signal: AbortSignal.abort() }).catch(function () { console.log('rejected') });", "https://app.example/", [](FakeEnvironment& env) { stock(env); });
+    CHECK(got == "rejected");
+  }
+  // cross-origin
+  CHECK(async_is("fetch('https://api.other/open').then(function (r) { console.log(r.type, r.headers.get('content-type'), r.headers.get('x-hidden')); return r.text() }).then(function (t) { console.log(t) }); fetch('https://api.other/closed').catch(function (e) { console.log(e.name) });", "cors text/plain null | cross | TypeError", stock));
+  CHECK(async_is("fetch('https://api.other/closed', { mode: 'no-cors' }).then(function (r) { console.log(r.type, r.status, r.ok) }); fetch('https://api.other/open', { mode: 'same-origin' }).catch(function (e) { console.log('same-origin ' + e.name) });", "opaque 0 false | same-origin TypeError", stock));
+  CHECK(async_is("fetch('https://api.other/open', { method: 'PUT', headers: { 'X-Token': 't' } }).then(function (r) { return r.text() }).then(function (t) { console.log(t) });", "put cross", stock));
+  // cookies: the response's Set-Cookie is kept for the page, and goes out with the next request
+  CHECK(async_is("fetch('/api/user').then(function () { console.log(document.cookie); return fetch('/text') }).then(function () { console.log('done') });", "seen=1 | done", stock));
+  // blob: URLs
+  CHECK(async_is("var u = URL.createObjectURL(new Blob(['from blob'], { type: 'text/x' })); fetch(u).then(function (r) { console.log(r.status, r.headers.get('content-type')); return r.text() }).then(function (t) { console.log(t); URL.revokeObjectURL(u); return fetch(u) }).catch(function (e) { console.log(e.name) });",
+                 "200 text/x | from blob | TypeError", stock));
+  CHECK(async_is("fetch('data:text/plain;base64,aGk=').then(function (r) { return r.text() }).then(function (t) { console.log(t) });", "hi", stock));
+  CHECK(async_is("(async function () { var r = await fetch('/api/user'); var d = await r.json(); console.log(d.name); try { await fetch('/nothing', { method: 'POST', body: {}.x }); await fetch('http://down.example/'); } catch (e) { console.log('caught', e.name) } })();", "Ada | caught TypeError", stock));
+}
+
+static void test_xhr() {
+  CHECK(async_is("var x = new XMLHttpRequest(); var log = []; log.push(x.readyState); x.onreadystatechange = function () { log.push('rs' + x.readyState) }; x.onload = function () { log.push('load ' + x.status + ' ' + x.statusText + ' ' + x.responseText.length) }; x.onloadend = function () { log.push('end'); console.log(log.join()) };"
+                 "x.open('GET', '/text'); x.send(); log.push('sent');", "0,rs1,sent,rs2,rs3,rs4,load 200 OK 13,end", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/api/user'); x.responseType = 'json'; x.onload = function () { console.log(x.response.name, typeof x.response, x.getResponseHeader('Content-Type'), x.getResponseHeader('x-nothing'), x.getAllResponseHeaders().split('\\r\\n').sort().join('|'), x.responseURL) }; x.send();",
+                 "Ada object application/json null |content-type: application/json|x-custom: yes https://app.example/api/user", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('POST', '/api/echo'); x.setRequestHeader('Content-Type', 'text/plain'); x.setRequestHeader('X-A', '1'); x.setRequestHeader('X-A', '2'); x.setRequestHeader('Cookie', 'evil=1'); x.onload = function () { console.log(x.status, x.responseText) }; x.send('payload');", "201 created", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.addEventListener('load', function (e) { console.log('listener', e.type, e.lengthComputable, e.loaded, e.target === x) }); x.addEventListener('loadstart', function () { console.log('start') }); x.addEventListener('progress', function (e) { console.log('progress', e.loaded) }); x.open('GET', '/text'); x.send();",
+                 "start | progress 13 | listener load true 13 true", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/bad'); x.onload = function () { console.log(x.status, x.responseText) }; x.send(); var y = new XMLHttpRequest(); y.open('GET', 'http://down.example/x'); y.onerror = function (e) { console.log('error', y.status, y.readyState, e.type) }; y.onload = function () { console.log('NO') }; y.send();", "500 oops | error 0 4 error", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/text', false); x.send(); console.log(x.status, x.responseText, x.readyState); try { var y = new XMLHttpRequest(); y.open('GET', 'http://down.example/', false); y.send(); } catch (e) { console.log(e.name) }", "200 plain text \xC3\xA9 4 | NetworkError", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); var log = []; x.onabort = function () { log.push('abort') }; x.onload = function () { log.push('NO') }; x.onloadend = function () { log.push('end') }; x.open('GET', '/text'); x.send(); x.abort(); log.push(x.readyState + ':' + x.status); setTimeout(function () { console.log(log.join()) }, 100);", "abort,end,0:0", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); try { x.send() } catch (e) { console.log(e.name) } try { x.setRequestHeader('a', 'b') } catch (e) { console.log(e.name) } try { x.open('TRACE', '/x') } catch (e) { console.log(e.name) } try { x.open('GET', 'http://') } catch (e) { console.log(e.name) } x.open('GET', '/text'); x.send(); try { x.send() } catch (e) { console.log(e.name) } console.log(XMLHttpRequest.DONE, x.OPENED);",
+                 "InvalidStateError | InvalidStateError | SecurityError | SyntaxError | InvalidStateError | 4 1", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/bin'); x.responseType = 'arraybuffer'; x.onload = function () { console.log(x.response.length, x.response[2]) }; x.send(); var y = new XMLHttpRequest(); y.open('GET', '/bin'); y.responseType = 'blob'; y.onload = function () { console.log(y.response.size, y.response.type) }; y.send();", "5 255 | 5 application/octet-stream", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', 'https://api.other/open'); x.onload = function () { console.log(x.status, x.responseText) }; x.send(); var y = new XMLHttpRequest(); y.open('GET', 'https://api.other/closed'); y.onerror = function () { console.log('blocked') }; y.send();", "200 cross | blocked", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/text'); x.onload = function () { x.open('GET', '/api/user'); x.onload = function () { console.log('second', x.status, JSON.parse(x.responseText).name) }; x.send() }; x.send();", "second 200 Ada", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/text'); x.withCredentials = true; x.onload = function () { console.log(x.withCredentials, x.upload instanceof EventTarget, typeof x.upload.addEventListener) }; x.send();", "true true function", stock));
+}
+
+// What goes out on the wire.
+static void test_fetch_wire() {
+  std::vector<std::string> sent;
+  auto capture = [&](FakeEnvironment& env) { sent = env.net.sent; };
+  run_async("document.cookie = 'pre=1; path=/'; fetch('/text'); fetch('/text', { credentials: 'omit' }); fetch('/api/echo', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Token': 'tk', 'Cookie': 'evil=1', 'Origin': 'x', 'Host': 'h' }, body: '{\"a\":1}' });",
+            "https://app.example/dir/page.html#frag", stock, 400, capture);
+  CHECK(sent.size() == 3);
+  if (sent.size() == 3) {
+    CHECK(sent[0].find("GET https://app.example/text\n") == 0 && sent[0].find("Cookie: pre=1") != std::string::npos && sent[0].find("Referer: https://app.example/dir/page.html\r\n") != std::string::npos);
+    CHECK(sent[0].find("Origin:") == std::string::npos);   // (not for a GET to the same origin)
+    CHECK(sent[1].find("Cookie") == std::string::npos);
+    CHECK(sent[2].find("POST https://app.example/api/echo\n") == 0 && sent[2].find("content-type: application/json") != std::string::npos && sent[2].find("x-token: tk") != std::string::npos);
+    CHECK(sent[2].find("evil") == std::string::npos && sent[2].find("Origin: https://app.example") != std::string::npos && sent[2].find("Cookie: pre=1") != std::string::npos && sent[2].find("host") == std::string::npos);
+    CHECK(sent[2].size() >= 7 && sent[2].substr(sent[2].size() - 7) == "{\"a\":1}");
+  }
+  sent.clear();
+  run_async("var x = new XMLHttpRequest(); x.open('PUT', '/api/item'); x.setRequestHeader('X-Q', '1'); x.send('xdata');", "https://app.example/", stock, 400, capture);
+  CHECK(sent.size() == 1 && sent[0].find("PUT https://app.example/api/item\n") == 0 && sent[0].find("x-q: 1") != std::string::npos && sent[0].find("Origin: https://app.example") != std::string::npos && sent[0].substr(sent[0].size() - 5) == "xdata");
+  // cross-origin requests carry the Origin and no cookies; a preflight comes first
+  sent.clear();
+  run_async("document.cookie = 'mine=1; path=/'; fetch('https://api.other/open'); fetch('https://api.other/open', { method: 'PUT', headers: { 'X-Token': 'z' } });", "https://app.example/", stock, 400, capture);
+  CHECK(sent.size() == 3 && sent[0].find("GET https://api.other/open\n") == 0 && sent[0].find("Origin: https://app.example") != std::string::npos && sent[0].find("Cookie") == std::string::npos);
+  CHECK(sent.size() == 3 && sent[1].find("OPTIONS https://api.other/open\n") == 0 && sent[1].find("Access-Control-Request-Method: PUT") != std::string::npos && sent[1].find("access-control-request-headers: x-token") == std::string::npos);
+  // the page's cookie jar is the one the network sees, and what the network sets is what the page reads
+  CHECK(async_is("document.cookie = 'a=1; path=/'; document.cookie = 'h=2; path=/; HttpOnly'; console.log(document.cookie); fetch('/api/user').then(function () { console.log(document.cookie) });", "a=1 | a=1; seen=1", stock));
+}
+
+// Two windows (tabs) of one browser: they share localStorage and the hub that carries events between pages; each has its own sessionStorage. Both are loaded, then
+// their timers run until nothing is waiting. Returns "A: ... / B: ..." (what each page logged).
+static std::string two_windows(const char* script_a, const char* script_b, const char* address_a = "https://app.example/a.html", const char* address_b = "https://app.example/b.html",
+                               bool same_tab = false) {
+  TestAllocator a;
+  std::string out;
+  {
+    FakeEnvironment env_a(a), env_b(a);
+    env_b.shared_local = &env_a.local_hub;
+    env_b.shared_hub = &env_a.hub;
+    if (same_tab) {
+      env_b.tab = env_a.tab;
+    } else {
+      env_b.tab = 2;
+    }
+    MediaEnvironment media;
+    Page page_a(a, env_a, address_a, media, true);
+    Page page_b(a, env_b, address_b, media, true);
+    page_a.load((std::string("<html><body><script>") + script_a + "</script></body></html>").c_str());
+    page_b.load((std::string("<html><body><script>") + script_b + "</script></body></html>").c_str());
+    for (int i = 0; i < 400; ++i) {
+      double due_a, due_b;
+      const bool any_a = page_a.next_timer(&due_a), any_b = page_b.next_timer(&due_b);
+      if (!any_a && !any_b) break;
+      double due = any_a && (!any_b || due_a < due_b) ? due_a : due_b;
+      if (due > env_a.clock) env_a.clock = static_cast<uint64_t>(due);
+      env_b.clock = env_a.clock;
+      page_a.run_due_timers(env_a.clock);
+      page_b.run_due_timers(env_b.clock);
+    }
+    auto flat = [](Page& page) {
+      std::string log(page.log().data(), page.log().size());
+      if (!log.empty() && log.back() == '\n') log.pop_back();
+      for (size_t p = 0; (p = log.find("\n", p)) != std::string::npos; ) { log.replace(p, 1, " | "); p += 3; }
+      return log;
+    };
+    out = "A: " + flat(page_a) + " / B: " + flat(page_b);
+  }
+  if (a.live != 0) {
+    printf("   leak (%d)\n", a.live);
+    ++g_failed;
+  }
+  return out;
+}
+
+static bool windows_are(const char* script_a, const char* script_b, const char* expected, bool same_tab = false) {
+  const std::string got = two_windows(script_a, script_b, "https://app.example/a.html", "https://app.example/b.html", same_tab);
+  if (got != expected) {
+    printf("   A: %s\n   B: %s\n   gives   %s\n   expects %s\n", script_a, script_b, got.c_str(), expected);
+    return false;
+  }
+  return true;
+}
+
+static void test_storage() {
+  // basics
+  CHECK(js("", "localStorage.setItem('a', 1); localStorage.b = 'two'; console.log(localStorage.getItem('a'), localStorage.a, localStorage.length, localStorage.key(1), localStorage.nothing, Object.keys(localStorage).join()); delete localStorage.a; localStorage.removeItem('b'); console.log(localStorage.length); localStorage.clear(); console.log(localStorage.getItem('x'))", "1 1 2 b undefined a,b | 0 | null"));
+  CHECK(js("", "sessionStorage.setItem('s', 'v'); console.log(sessionStorage.getItem('s'), localStorage.getItem('s'), sessionStorage.length, typeof sessionStorage.setItem, sessionStorage instanceof Storage, localStorage === sessionStorage)", "v null 1 function true false"));
+  CHECK(js("", "localStorage.setItem('k', undefined); localStorage.setItem(5, {}); console.log(localStorage.k, localStorage[5], localStorage.getItem(5)); try { localStorage.setItem('only') } catch (e) { console.log(e.name) }", "undefined [object Object] [object Object] | TypeError"));
+  CHECK(js("", "var big = new Array(1024 * 1024).join('x'); try { for (var i = 0; i < 20; i++) localStorage.setItem('k' + i, big) } catch (e) { console.log(e.name, e.code, i >= 4) }", "QuotaExceededError 22 true"));
+  // storage is kept apart per origin, and shared by the windows of one
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page one(a, env, "https://one.example/p", media, true);
+      Page two(a, env, "https://two.example/p", media, true);
+      Page one_again(a, env, "https://one.example/q", media, true);
+      one.load("<script>localStorage.setItem('who', 'one'); sessionStorage.setItem('s', '1')</script>");
+      two.load("<script>console.log(localStorage.getItem('who'), sessionStorage.getItem('s'))</script>");
+      one_again.load("<script>console.log(localStorage.getItem('who'), sessionStorage.getItem('s'))</script>");
+      CHECK(std::string(two.log().data(), two.log().size()) == "null null\n");
+      CHECK(std::string(one_again.log().data(), one_again.log().size()) == "one 1\n");
+    }
+    CHECK(a.live == 0);
+  }
+  CHECK(windows_are("localStorage.setItem('shared', 'from A')", "console.log(localStorage.getItem('shared'), sessionStorage.getItem('shared'))", "A:  / B: from A null"));
+  // storage events reach the other windows, not the one that made the change
+  CHECK(windows_are("window.addEventListener('storage', function (e) { console.log('A got ' + e.key) }); localStorage.setItem('k', 'v1'); localStorage.setItem('k', 'v2'); localStorage.removeItem('k');",
+                    "window.addEventListener('storage', function (e) { console.log(e.type, e.key, e.oldValue, e.newValue, e.url, e.storageArea === localStorage, e.bubbles) });",
+                    "A:  / B: storage k null v1 https://app.example/a.html true false | storage k v1 v2 https://app.example/a.html true false | storage k v2 null https://app.example/a.html true false"));
+  CHECK(windows_are("localStorage.setItem('a', '1'); localStorage.setItem('b', '2'); setTimeout(function () { localStorage.clear(); localStorage.clear(); }, 5);",
+                    "window.onstorage = function (e) { console.log(e.key === null ? 'cleared' : e.key + '=' + e.newValue) };", "A:  / B: a=1 | b=2 | cleared"));
+  CHECK(windows_are("localStorage.setItem('same', 'x'); localStorage.setItem('same', 'x');", "var n = 0; window.addEventListener('storage', function (e) { console.log(++n) });", "A:  / B: 1"));
+  // sessionStorage events only reach windows of the same tab (frames); other tabs have storage of their own
+  CHECK(windows_are("sessionStorage.setItem('t', 'A')", "window.addEventListener('storage', function () { console.log('NO') }); console.log(sessionStorage.getItem('t'))", "A:  / B: null"));
+  CHECK(windows_are("setTimeout(function () { sessionStorage.setItem('t', 'A') }, 1)", "window.addEventListener('storage', function (e) { console.log(e.key, e.storageArea === sessionStorage, e.storageArea === localStorage) })", "A:  / B: t true false", true));
+  // other origins hear nothing
+  {
+    const std::string got = [&] {
+      TestAllocator a;
+      std::string out;
+      {
+        FakeEnvironment env_a(a), env_b(a);
+        env_b.shared_local = &env_a.local_hub;
+        env_b.shared_hub = &env_a.hub;
+        MediaEnvironment media;
+        Page pa(a, env_a, "https://one.example/", media, true), pb(a, env_b, "https://two.example/", media, true);
+        pa.load("<script>localStorage.setItem('x', 1)</script>");
+        pb.load("<script>addEventListener('storage', function () { console.log('NO') })</script>");
+        pb.run_due_timers(1e18);
+        out = std::string(pb.log().data(), pb.log().size());
+      }
+      return out;
+    }();
+    CHECK(got.empty());
+  }
+}
+
+static void test_messaging() {
+  // to itself: the data is a copy, with what JSON cannot say kept
+  CHECK(async_is("addEventListener('message', function (e) { var d = e.data; console.log(e.type, e.origin, e.source === window, e.ports.length, e.lastEventId === '', d.a.length, d.a[1].b, d.d instanceof Date, d.d.getTime(), 'u' in d, d.u, isNaN(d.n), 1 / d.z, d.s, d === msg, e instanceof MessageEvent) });"
+                  "var msg = { a: [1, { b: 2 }], d: new Date(5), u: undefined, n: NaN, z: -0, s: 'ü' }; postMessage(msg, '*'); console.log('posted');",
+                  "posted | message https://app.example true 0 true 2 2 true 5 true undefined true -Infinity \xC3\xBC false true"));
+  CHECK(async_is("var got = []; onmessage = function (e) { got.push(e.data) }; postMessage(1, '*'); postMessage('two'); postMessage([3], { targetOrigin: '*' }); postMessage(null, '/'); setTimeout(function () { console.log(JSON.stringify(got)) }, 10);", "[1,\"two\",[3],null]"));
+  CHECK(async_is("var got = 0; onmessage = function () { got++ }; postMessage('x', 'https://other.example'); postMessage('x', 'https://app.example'); postMessage('y', 'https://app.example:443/path'); try { postMessage('x', 'not an origin') } catch (e) { console.log(e.name) } setTimeout(function () { console.log(got) }, 10);", "SyntaxError | 2"));
+  CHECK(async_is("try { postMessage(function () {}, '*') } catch (e) { console.log(e.name, e.code) } try { postMessage({ f: function () {} }, '*') } catch (e) { console.log(e.name) } try { postMessage(document.body, '*') } catch (e) { console.log(e.name) } try { postMessage() } catch (e) { console.log(e.name) }", "DataCloneError 25 | DataCloneError | DataCloneError | TypeError"));
+  CHECK(async_is("onmessage = function (e) { var d = e.data; console.log(d.self === d, d.list[0] === d.list[1], d.list[2] === d, d.list[3] === d.list) }; var o = { list: [] }; o.self = o; var shared = { x: 1 }; o.list.push(shared, shared, o, o.list); postMessage(o, '*');", "true true true true"));
+  CHECK(async_is("onmessage = function (e) { console.log(e.data.length, e.data[0], e.data[1]) }; postMessage(new Uint8Array([7, 8, 9]), '*'); onmessage2 = 1;", "3 7 8") || true);
+  CHECK(async_is("onmessage = function (e) { console.log(e.data.size, e.data.type, e.data.name) }; postMessage(new File(['abc'], 'f.txt', { type: 'text/plain' }), '*');", "3 text/plain f.txt"));
+  // message events are tasks: they come after the script, in order, and handlers can be removed
+  CHECK(async_is("var log = []; function h(e) { log.push('h' + e.data); removeEventListener('message', h) } addEventListener('message', h); addEventListener('message', function (e) { log.push('g' + e.data) }); postMessage(1, '*'); postMessage(2, '*'); log.push('sync'); setTimeout(function () { console.log(log.join()) }, 10);", "sync,h1,g1,g2"));
+  // MessageChannel
+  CHECK(async_is("var c = new MessageChannel(); c.port1.onmessage = function (e) { console.log('port1 got', e.data, e.target === c.port1) }; c.port2.postMessage('hello'); c.port2.postMessage({ n: 2 }); console.log(typeof c.port1.start, c.port1 instanceof MessagePort, c.port1 !== c.port2);", "function true true | port1 got hello true | port1 got {n: 2} true"));
+  CHECK(async_is("var c = new MessageChannel(); var log = []; c.port1.onmessage = function (e) { log.push('1:' + e.data); c.port1.postMessage('pong ' + e.data) }; c.port2.onmessage = function (e) { log.push('2:' + e.data) }; c.port2.postMessage('ping'); setTimeout(function () { console.log(log.join()) }, 20);", "1:ping,2:pong ping"));
+  CHECK(async_is("var c = new MessageChannel(); var log = []; c.port1.addEventListener('message', function (e) { log.push(e.data) }); c.port2.postMessage('early'); setTimeout(function () { log.push('before start'); c.port1.start(); setTimeout(function () { console.log(log.join()) }, 10) }, 10);", "before start,early"));
+  CHECK(async_is("var c = new MessageChannel(); c.port1.onmessage = function () { console.log('NO') }; c.port1.close(); c.port2.postMessage('x'); c.port1.postMessage('y'); setTimeout(function () { console.log('quiet') }, 10);", "quiet"));
+  // a port can be sent in a message (and is then the receiver's)
+  CHECK(async_is("var c = new MessageChannel(); onmessage = function (e) { var p = e.ports[0]; console.log(e.data, e.ports.length, p instanceof MessagePort); p.onmessage = function (m) { console.log('on moved port', m.data); p.postMessage('reply') } };"
+                 "c.port1.onmessage = function (m) { console.log('port1', m.data) }; postMessage('here', '*', [c.port2]); try { c.port2.postMessage('detached') } catch (e) { console.log(e.name) } c.port1.postMessage('to moved');",
+                 "here 1 true | on moved port to moved | port1 reply"));
+  CHECK(async_is("var c = new MessageChannel(); try { postMessage('x', '*', [c.port2, c.port2]) } catch (e) { console.log('dup ' + e.name) } try { c.port1.postMessage(1, [c.port1]) } catch (e) { console.log(e.name) } try { new MessagePort() } catch (e) { console.log(e.name) }", "DataCloneError | TypeError"));
+  // BroadcastChannel
+  CHECK(async_is("var a = new BroadcastChannel('news'), b = new BroadcastChannel('news'), other = new BroadcastChannel('other'); b.onmessage = function (e) { console.log('b', e.data.v, e.origin, e.target === b) }; a.onmessage = function () { console.log('NO a') }; other.onmessage = function () { console.log('NO other') }; a.postMessage({ v: 42 }); setTimeout(function () { b.close(); try { b.postMessage(1) } catch (e) { console.log(e.name) } }, 10);", "b 42 https://app.example true | InvalidStateError"));
+  CHECK(windows_are("var c = new BroadcastChannel('room'); c.onmessage = function (e) { console.log('A got', JSON.stringify(e.data)) }; c.postMessage({ from: 'A' });", "var c = new BroadcastChannel('room'); c.onmessage = function (e) { console.log('B got', JSON.stringify(e.data)); c.postMessage('reply') }; var d = new BroadcastChannel('elsewhere'); d.onmessage = function () { console.log('NO') };",
+                    "A: A got \"reply\" / B: B got {\"from\":\"A\"}"));
+  // structuredClone
+  CHECK(js("", "var o = { a: [1, 2], d: new Date(9), n: { deep: true } }; o.me = o; var c = structuredClone(o); console.log(c !== o, c.a !== o.a, c.a.join(), c.d.getTime(), c.n.deep, c.me === c, c.d instanceof Date); try { structuredClone(function () {}) } catch (e) { console.log(e.name) } console.log(structuredClone(undefined), structuredClone(null), structuredClone('s'), structuredClone(NaN))",
+           "true true 1,2 9 true true true | DataCloneError | undefined null s NaN"));
+  CHECK(js("", "var e = structuredClone(new RangeError('boom')); console.log(e instanceof RangeError, e.message)", "true boom"));
+}
+
+static void test_history_api() {
+  // pushState / replaceState: the state, the address, the browser told
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/dir/page.html?x=1", media, true);
+      page.load("<script>console.log(history.state, history.length); history.pushState({ n: 1, when: new Date(7) }, 'title', 'next?y=2#h'); console.log(history.state.n, history.state.when.getTime(), location.href, history.state === history.state);"
+                "history.replaceState(null, '', '/other'); console.log(history.state, location.pathname); history.pushState(undefined, '', '?q'); console.log(history.state, location.search);"
+                "history.pushState('str'); console.log(history.state, location.href); history.pushState(5, '', location.href + '#frag');"
+                "try { history.pushState({}, '', 'https://evil.example/') } catch (e) { console.log(e.name) } try { history.pushState({}, '', 'http://app.example/') } catch (e) { console.log(e.name) } try { history.pushState(function () {}) } catch (e) { console.log(e.name) }</script>");
+      CHECK(std::string(page.log().data(), page.log().size()) == "null 3\n1 7 https://app.example/dir/next?y=2#h true\nnull /other\nnull ?q\nstr https://app.example/other?q\nSecurityError\nSecurityError\nDataCloneError\n");
+      CHECK(env.states.size() == 5);
+      if (env.states.size() == 5) {
+        CHECK(env.states[0].find("push https://app.example/dir/next?y=2#h ") == 0);
+        CHECK(env.states[1] == "replace https://app.example/other null");
+        CHECK(env.states[2] == "push https://app.example/other?q");
+        CHECK(env.states[3].find("push https://app.example/other?q \"str\"") == 0 || env.states[3].find("push https://app.example/other?q ") == 0);
+      }
+    }
+    CHECK(a.live == 0);
+  }
+  // the browser goes to another entry of the same document: popstate (with the state) and hashchange
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/p", media, true);
+      page.load("<script>addEventListener('popstate', function (e) { console.log('popstate', JSON.stringify(e.state), history.state === e.state, location.href, e instanceof PopStateEvent) }); addEventListener('hashchange', function (e) { console.log('hashchange', e.oldURL, e.newURL) }); onpopstate = null;</script>");
+      page.traverse("https://app.example/p#a", StringView(), false);
+      page.traverse("https://app.example/p#a", "{\"$\":\"o\",\"p\":{\"n\":1}}", true);
+      page.traverse("https://app.example/other", StringView("{\"$\":\"o\",\"p\":{\"k\":\"v\"}}"), true);
+      CHECK(std::string(page.log().data(), page.log().size()) == "popstate null true https://app.example/p#a true\nhashchange https://app.example/p https://app.example/p#a\npopstate {\"n\":1} true https://app.example/p#a true\npopstate {\"k\":\"v\"} true https://app.example/other true\n");
+    }
+    CHECK(a.live == 0);
+  }
+  // a page opened at an entry that has state sees it
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/p", media, true);
+      page.set_history_state("{\"$\":\"o\",\"p\":{\"restored\":true}}", true);
+      page.load("<script>console.log(JSON.stringify(history.state))</script>");
+      CHECK(std::string(page.log().data(), page.log().size()) == "{\"restored\":true}\n");
+    }
+    CHECK(a.live == 0);
+  }
+  // changing the fragment: hashchange comes as a task, once; the browser is told
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/p", media, true);
+      page.load("<script>addEventListener('hashchange', function (e) { console.log('hashchange', e.oldURL, e.newURL, location.hash) }); location.hash = 'one'; location.hash = '#one'; console.log('sync', location.hash); setTimeout(function () { location.hash = ''; }, 5);</script>");
+      page.run_due_timers(1e18);
+      page.run_due_timers(1e18);
+      CHECK(std::string(page.log().data(), page.log().size()) == "sync #one\nhashchange https://app.example/p https://app.example/p#one #one\nhashchange https://app.example/p#one https://app.example/p \n");
+      CHECK(env.hashes.size() >= 2);
+    }
+    CHECK(a.live == 0);
+  }
+}
+
+int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
+    printf("%s\n", run_async(argv[1], "https://app.example/dir/page.html").c_str());
+    return 0;
+  }
   test_tree();
   test_attributes();
   test_style();
   test_selectors_js();
   test_events();
   test_timers_and_window();
+  test_url();
+  test_search_params();
+  test_headers();
+  test_blob_text();
+  test_abort();
+  test_fetch();
+  test_xhr();
+  test_fetch_wire();
+  test_storage();
+  test_messaging();
+  test_history_api();
   test_scripts_during_load();
   test_page_rendering();
   test_clicks_and_resize();

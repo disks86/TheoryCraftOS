@@ -22,8 +22,10 @@
 // Understood: type, universal, #id, .class, attribute tests ([a], [a=b], ~=, |=, ^=, $=, *=, with an `i` flag), the descendant, child (>), adjacent (+)
 // and general sibling (~) combinators, selector lists, and the pseudo-classes :first-child, :last-child, :only-child, :first-of-type, :last-of-type,
 // :only-of-type, :nth-child(an+b), :nth-last-child, :nth-of-type, :nth-last-of-type, :empty, :root, :scope, :link, :any-link, :checked, :disabled,
-// :enabled, :not(), :is(), :where() and :has() (which looks at descendants / children / following siblings, approximately). :hover, :focus, :active,
-// :visited, :target and the other states that need a user or a history never match; pseudo-elements (::before ...) make a selector never match.
+// :enabled, :not(), :is(), :where() and :has() (which looks at descendants / children / following siblings, approximately), :hover and :active (the pointer
+// states a page keeps in Node::ui_state), :focus and :focus-within. :visited, :target and the other states that need a history never match. The pseudo-elements
+// ::before, ::after and ::marker (and the old :before, :after) are remembered with the selector (pseudo()), and such a selector matches the element they belong
+// to only when asked to ignore that; the other pseudo-elements make a selector never match.
 #pragma once
 #include "Dom/Dom.hpp"
 
@@ -48,7 +50,10 @@ class SelectorSet {
   // The i-th of them in the order added: its tag and its specificity (ids x 10000 + classes etc. x 100 + types).
   uint32_t tag(uint32_t i) const;
   uint32_t specificity(uint32_t i) const;
-  bool matches(uint32_t i, const Node* element, const Node* scope = nullptr) const;
+  // 0 for an ordinary selector, 1 for ::before, 2 for ::after, 3 for ::marker (the element it matches is the one the pseudo-element belongs to).
+  uint8_t pseudo(uint32_t i) const;
+  // Does the i-th selector match? A selector with a pseudo-element matches only with `with_pseudo` (the style rules ask this way).
+  bool matches(uint32_t i, const Node* element, const Node* scope = nullptr, bool with_pseudo = false) const;
   // Does any selector match?
   bool matches_any(const Node* element, const Node* scope = nullptr) const;
 
@@ -56,7 +61,7 @@ class SelectorSet {
   enum class Combinator : uint8_t { None, Descendant, Child, Adjacent, Sibling };
   enum class TestKind : uint8_t {
     Tag, Id, Class, Attr, FirstChild, LastChild, OnlyChild, FirstOfType, LastOfType, OnlyOfType, Nth, Empty, Root, Scope, Link, Checked, Disabled, Enabled, Focus, Required, Optional, ReadOnly, ReadWrite, Valid, Invalid, PlaceholderShown,
-    Not, Is, Has, Never,
+    Not, Is, Has, Never, Always, Hover, Active, FocusWithin,
   };
   enum class AttrOp : uint8_t { Exists, Equals, Includes, Dash, Prefix, Suffix, Contains };
   struct Test {
@@ -74,6 +79,7 @@ class SelectorSet {
   struct Selector {
     uint32_t first_compound, compound_count, specificity, tag;
     bool inner;
+    uint8_t pseudo;
   };
   class Reader;
   friend class Reader;

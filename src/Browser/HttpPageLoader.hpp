@@ -28,7 +28,7 @@ namespace browser {
 
 class HttpPageLoader final : public IPageLoader {
  public:
-  static constexpr uint64_t kMaxPageBytes = 4u << 20;
+  static constexpr uint64_t kMaxPageBytes = 4u << 20, kMaxFetchBytes = 16u << 20;
 
   HttpPageLoader(network::NetworkStackSet& stacks, allocators::IAllocator& allocator) : stacks_(stacks), allocator_(allocator), sessions_(allocator), alt_svc_(allocator) {}
 
@@ -39,6 +39,7 @@ class HttpPageLoader final : public IPageLoader {
   }
   void set_timeout_ms(uint32_t timeout_ms) { timeout_ms_ = timeout_ms; }
 
+  bool exchange(const NetRequest& request, NetResponse* response) override;
   bool fetch(StringView address, PageResult* result) override;
   bool post(StringView address, StringView content_type, StringView body, PageResult* result) override;
 

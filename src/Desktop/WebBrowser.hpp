@@ -31,6 +31,8 @@
 // something while a page is still loading replaces the request that has not started yet. Everything that touches the loaded page runs on that thread.
 #pragma once
 #include "Browser/IPageLoader.hpp"
+#include "Browser/PageHub.hpp"
+#include "Browser/SessionHistory.hpp"
 #include "Browser/Page.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
@@ -72,6 +74,14 @@ class WebBrowser : public gui::Frame {
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
   // Where web pages come from (nullptr: none, web addresses then say so). It must outlive the window.
   void set_page_loader(browser::IPageLoader* loader) { loader_ = loader; }
+  // The cookies the browser keeps, to share between its windows (without one, the window keeps its own).
+  void set_cookie_jar(browser::CookieJar* jar) { shared_jar_ = jar; }
+  browser::CookieJar& jar() { return shared_jar_ ? *shared_jar_ : own_jar_; }
+  // The localStorage of the browser and the hub that carries events between its pages, to share between its windows (without them the window keeps its own).
+  void set_shared_hubs(browser::StorageHub* local, browser::PageHub* hub) {
+    shared_local_ = local;
+    shared_hub_ = hub;
+  }
   void set_clock(UnixClock clock, void* context) { unix_clock_ = clock; unix_clock_context_ = context; }
   // Whether the scripts of pages are run (on by default); the next page loaded (or Reload) takes it.
   void set_scripts_enabled(bool enabled);
@@ -102,8 +112,8 @@ class WebBrowser : public gui::Frame {
   bool go_back();
   bool go_forward();
   bool reload();
-  bool can_go_back() const { return index_ > 0; }
-  bool can_go_forward() const { return index_ + 1 < static_cast<int64_t>(history_.count()); }
+  bool can_go_back() const { return history_.can_go(-1); }
+  bool can_go_forward() const { return history_.can_go(1); }
   // Puts an address in the address box without opening it (a restored session shows it so; the user presses Go).
   void show_address(StringView address);
   // The address of the page shown ("" before the first one).
@@ -131,7 +141,7 @@ class WebBrowser : public gui::Frame {
   // What the page asks of the window.
   class Env final : public browser::IPageEnvironment {
    public:
-    Env(WebBrowser& owner, allocators::IAllocator& allocator) : owner_(owner), storage_(allocator), jar_(allocator) {}
+    Env(WebBrowser& owner, allocators::IAllocator& allocator);
     bool fetch_text(StringView address, uint64_t limit, String* text) override;
     bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override;
     UniquePointer<browser::IVideoClip> open_video(UniquePointer<ByteBuffer> data) override;
@@ -145,19 +155,23 @@ class WebBrowser : public gui::Frame {
     void reload() override;
     void history_go(int32_t delta) override;
     uint32_t history_length() override;
-    void push_state(StringView address, bool replace) override;
+    void push_state(StringView address, StringView state_json, bool has_state, bool replace) override;
     void alert(StringView text) override;
     bool confirm(StringView) override { return false; }
     void scroll_to(int32_t line) override;
     uint64_t now_ms() override;
     void console(int, StringView) override {}
-    browser::StorageArea& local_storage() override { return storage_; }
-    String& cookie() override { return jar_; }
+    browser::StorageHub& local_storage_hub() override;
+    browser::StorageHub& session_storage_hub() override { return session_; }
+    browser::PageHub& page_hub() override;
+    uint64_t tab_id() override { return tab_; }
+    browser::CookieJar& cookies() override;
+    bool http_request(const browser::FetchOptions& options, browser::NetResponse* response) override;
 
    private:
     WebBrowser& owner_;
-    browser::StorageArea storage_;
-    String jar_;
+    browser::StorageHub session_;   // this tab's sessionStorage
+    uint64_t tab_;
   };
   friend class Env;
 
@@ -191,12 +205,15 @@ class WebBrowser : public gui::Frame {
   void run_request();
   void load(Request kind, StringView target);
   bool post_form(StringView target, StringView content_type, StringView body);
-  bool fetch(StringView address, Fetched* page, uint64_t limit = kMaxFileBytes);
+  // `subresource`: a style sheet, script or picture that a page asked for (otherwise the page itself is being opened).
+  bool fetch(StringView address, Fetched* page, uint64_t limit = kMaxFileBytes, bool subresource = false);
   bool fetch_post(StringView address, Fetched* page);
   void update_key_capture();
   bool fetch_file(StringView path, Fetched* page, uint64_t limit = kMaxFileBytes);
   void show(Fetched& page);
   void remember(Request kind, StringView address);
+  // Back / Forward to an entry of the document that is shown: nothing is loaded, the page gets a popstate.
+  bool traverse_in_place(int32_t delta);
   void update_buttons();
   void update_title(StringView page_title);
   void say(StringView text);
@@ -214,6 +231,13 @@ class WebBrowser : public gui::Frame {
   FileDialog* dialog_ = nullptr;
   gui::NoticeDialog* notices_ = nullptr;
   browser::IPageLoader* loader_ = nullptr;
+  browser::CookieJar* shared_jar_ = nullptr;
+  browser::StorageHub* shared_local_ = nullptr;
+  browser::PageHub* shared_hub_ = nullptr;
+  browser::StorageHub own_local_;
+  browser::PageHub own_hub_;
+  int32_t request_delta_ = 0;       // how far Back / Forward goes in the history
+  uint32_t document_ = 0;           // the number of the document shown (it changes whenever a page is loaded)
   gui::Handler load_handler_;
   UnixClock unix_clock_ = nullptr;
   void* unix_clock_context_ = nullptr;
@@ -239,8 +263,8 @@ class WebBrowser : public gui::Frame {
   uint32_t reported_errors_ = 0;
   uint32_t script_errors_ = 0;
   String script_log_;
-  List<String> history_;
-  int64_t index_ = -1;
+  browser::SessionHistory history_;
+  browser::CookieJar own_jar_;   // (the cookies, when the window is not given a jar to share)
   String current_, request_target_, status_text_;
   Request request_ = Request::None;
   bool loading_ = false;

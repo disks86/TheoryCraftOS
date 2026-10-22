@@ -231,6 +231,7 @@ add_executable(BOOTX64
   src/Browser/Css.cpp
   src/Browser/Media.cpp
   src/Browser/Renderer.cpp
+  src/Browser/RendererBoxes.cpp
   src/Browser/Page.cpp
   src/Browser/DomBindings.cpp
   src/Browser/DomBindingsNode.cpp
@@ -239,6 +240,13 @@ add_executable(BOOTX64
   src/Browser/DomBindingsWindow.cpp
   src/Browser/DomBindingsMedia.cpp
   src/Browser/DomBindingsForm.cpp
+  src/Browser/DomBindingsNet.cpp
+  src/Browser/WebPrelude.cpp
+  src/Browser/WebUrl.cpp
+  src/Browser/CookieJar.cpp
+  src/Browser/Fetcher.cpp
+  src/Browser/PageHub.cpp
+  src/Browser/SessionHistory.cpp
   src/Browser/Canvas.cpp
   src/Browser/Objects.cpp
   src/Browser/Svg.cpp

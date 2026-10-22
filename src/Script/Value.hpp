@@ -113,7 +113,12 @@ struct Env : Cell {
   Value* slots() { return reinterpret_cast<Value*>(this + 1); }
 };
 
-enum class ObjKind : uint8_t { Plain, Array, Function, Native, Bound, Error, Iterator };
+// A Promise keeps its state in `position` (kPromiseState bits; kPromiseHandled once a reaction was attached), its value or reason in `bound_this` and its
+// reactions in `items` (three values each: what to call if it is fulfilled, if it is rejected, and the promise that follows). A Coroutine is a suspended
+// async function (host_data points to its saved frame, see Vm.cpp). A native function may keep values of its own in `items`.
+enum class ObjKind : uint8_t { Plain, Array, Function, Native, Bound, Error, Iterator, Promise, Coroutine };
+
+enum PromiseBits : uint32_t { kPromisePending = 0, kPromiseFulfilled = 1, kPromiseRejected = 2, kPromiseState = 3, kPromiseHandled = 4 };
 
 enum PropFlag : uint8_t { kEnumerable = 1, kWritable = 2, kDefaultFlags = 3 };
 

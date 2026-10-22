@@ -252,7 +252,12 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       *out = str_value(vm, parts.hostname.view());
       return true;
     }
-    if (IS("cookie")) { *out = str_value(vm, c.host.cookie().view()); return true; }
+    if (IS("cookie")) {
+      String jar(vm.allocator());
+      c.host.cookie_get(&jar);
+      *out = str_value(vm, jar.view());
+      return true;
+    }
     if (IS("characterSet") || IS("charset") || IS("inputEncoding")) { *out = str_value(vm, "UTF-8"); return true; }
     if (IS("contentType")) { *out = str_value(vm, "text/html"); return true; }
     if (IS("compatMode")) { *out = str_value(vm, "CSS1Compat"); return true; }
@@ -453,39 +458,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     }
     if (IS("cookie")) {
       if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
-      // name=value; attributes: the pair is kept (an expired one removes it)
-      String& jar = c.host.cookie();
-      const uint64_t semi = text.view().find(';');
-      const StringView pair = (semi == StringView::npos ? text.view() : text.view().first(semi)).trimmed();
-      const uint64_t eq = pair.find('=');
-      if (eq == StringView::npos || eq == 0) return HostClass::Set::Handled;
-      const StringView name = pair.first(eq).trimmed();
-      const bool expired = text.view().find("max-age=0") != StringView::npos || text.view().find("max-age=-") != StringView::npos || text.view().find("1970") != StringView::npos;
-      String rebuilt(vm.allocator());
-      bool replaced = false;
-      uint64_t i = 0;
-      while (i < jar.size()) {
-        uint64_t end = jar.view().find(';', i);
-        if (end == StringView::npos) end = jar.size();
-        const StringView entry = jar.view().substr(i, end - i).trimmed();
-        i = end + 1;
-        const uint64_t e2 = entry.find('=');
-        if (e2 != StringView::npos && entry.first(e2).equals(name)) {
-          replaced = true;
-          if (expired) continue;
-          if (!rebuilt.empty()) rebuilt.append("; ");
-          rebuilt.append(pair);
-          continue;
-        }
-        if (entry.empty()) continue;
-        if (!rebuilt.empty()) rebuilt.append("; ");
-        rebuilt.append(entry);
-      }
-      if (!replaced && !expired) {
-        if (!rebuilt.empty()) rebuilt.append("; ");
-        rebuilt.append(pair);
-      }
-      jar.assign(rebuilt.view());
+      c.host.cookie_set(text.view());
       return HostClass::Set::Handled;
     }
     if (IS("location")) {
@@ -1158,6 +1131,13 @@ NATIVE(doc_has_focus) {
 
 NATIVE(illegal_constructor) { return vm.throw_error(ErrorKind::TypeError, "Illegal constructor"); }
 
+// new EventTarget(): an object that has listeners and can be dispatched to (and the base of the script classes that are event targets).
+NATIVE(event_target_constructor) {
+  if (!self.is_object() || self.as_object() == vm.global() || node_of(self)) return vm.throw_error(ErrorKind::TypeError, "Failed to construct 'EventTarget': Please use the 'new' operator.");
+  *result = self;
+  return true;
+}
+
 NATIVE(image_constructor) {
   DomBindings::Impl& c = impl(vm);
   dom::Node* img = c.doc.create_element("img");
@@ -1212,7 +1192,7 @@ NATIVE(exception_constructor) {
   else name.assign("Error");
   vm.define_named(e, "message", str_value(vm, message.view()), kWritable);
   vm.define_named(e, "name", str_value(vm, name.view()), kWritable);
-  vm.define_named(e, "code", num_value(0), kWritable);
+  vm.define_named(e, "code", num_value(dom_exception_code(name.view())), kWritable);
   *result = self;
   return true;
 }
@@ -1333,7 +1313,7 @@ bool install_nodes(DomBindings::Impl& c) {
     vm.define_named(node_ctor, k.name, num_value(k.value), 0);
     vm.define_named(np, k.name, num_value(k.value), 0);
   }
-  make_class(c, "EventTarget", illegal_constructor, event_target);
+  make_class(c, "EventTarget", event_target_constructor, event_target);
   make_class(c, "Element", illegal_constructor, ep);
   make_class(c, "HTMLElement", illegal_constructor, c.html_proto);
   make_class(c, "Text", illegal_constructor, c.text_proto);

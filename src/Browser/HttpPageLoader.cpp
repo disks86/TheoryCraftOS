@@ -17,6 +17,7 @@
  */
 
 #include "Browser/HttpPageLoader.hpp"
+#include "Browser/Fetcher.hpp"
 
 namespace browser {
 
@@ -45,6 +46,53 @@ bool HttpPageLoader::send(network::HttpMethod method, StringView address, String
   result->content_type.assign(http.header("content-type"));
   result->body.clear();
   return result->body.append(http.body());
+}
+
+bool HttpPageLoader::exchange(const NetRequest& request, NetResponse* response) {
+  network::HttpMethod method;
+  if (request.method.equals("GET")) method = network::HttpMethod::Get;
+  else if (request.method.equals("HEAD")) method = network::HttpMethod::Head;
+  else if (request.method.equals("POST")) method = network::HttpMethod::Post;
+  else if (request.method.equals("PUT")) method = network::HttpMethod::Put;
+  else if (request.method.equals("DELETE")) method = network::HttpMethod::Delete;
+  else if (request.method.equals("PATCH")) method = network::HttpMethod::Patch;
+  else if (request.method.equals("OPTIONS")) method = network::HttpMethod::Options;
+  else {
+    response->error.assign("This browser cannot send that kind of request.");
+    return false;
+  }
+  network::INetworkStack* stack = nullptr;
+  for (uint32_t i = 0; i < stacks_.count() && !stack; ++i)
+    if (!stacks_.at(i)->configuration().address.is_unspecified()) stack = stacks_.at(i);
+  if (!stack) {
+    response->error.assign("There is no network connection.");
+    return false;
+  }
+  network::HttpClient http(*stack, allocator_);
+  if (has_tls_) http.set_tls(&tls_);
+  http.set_alt_svc_cache(&alt_svc_);
+  http.set_session_cache(&sessions_);
+  http.set_max_body(kMaxFetchBytes);
+  http.set_max_redirects(0);   // (the caller follows redirects: it has to send the right cookies on each hop)
+  http.add_header("User-Agent", "Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)");
+  StringView content_type;
+  for_each_header(request.headers, [&](StringView name, StringView value) {
+    if (name.equals_ignore_case("content-type")) content_type = value;
+    else http.add_header(name, value);
+  });
+  const uint32_t timeout = request.timeout_ms ? request.timeout_ms : timeout_ms_;
+  if (!http.start(method, request.url, request.body, content_type) || !http.run(timeout)) {
+    response->error.assign(http.error() == network::HttpError::NoTlsConfiguration ? StringView("https needs certificates, which are not installed.")
+                                                                                   : StringView(network::http_error_name(http.error())));
+    return false;
+  }
+  response->status = http.status();
+  response->reason.assign(http.reason());
+  response->url.clear();
+  http.url().assign_text(&response->url);
+  response->headers.assign(http.header_block());
+  response->body.clear();
+  return response->body.append(http.body());
 }
 
 bool HttpPageLoader::fetch(StringView address, PageResult* result) { return send(network::HttpMethod::Get, address, StringView(), StringView(), result); }

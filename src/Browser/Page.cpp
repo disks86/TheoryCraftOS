@@ -18,6 +18,7 @@
 
 #include "Browser/Page.hpp"
 #include "Browser/Url.hpp"
+#include "Browser/WebPrelude.hpp"
 #include "Dom/Form.hpp"
 #include "Dom/HtmlBuilder.hpp"
 #include "Browser/Objects.hpp"
@@ -42,14 +43,18 @@ class Page::FrameEnv final : public IPageEnvironment {
   void reload() override {}
   void history_go(int32_t) override {}
   uint32_t history_length() override { return 1; }
-  void push_state(StringView, bool) override {}
+  void push_state(StringView, StringView, bool, bool) override {}
   void alert(StringView text) override { owner_.env_.alert(text); }
   bool confirm(StringView text) override { return owner_.env_.confirm(text); }
   void scroll_to(int32_t) override {}
   uint64_t now_ms() override { return owner_.env_.now_ms(); }
   void console(int level, StringView text) override { owner_.env_.console(level, text); }
-  StorageArea& local_storage() override { return owner_.env_.local_storage(); }
-  String& cookie() override { return owner_.env_.cookie(); }
+  StorageHub& local_storage_hub() override { return owner_.env_.local_storage_hub(); }
+  StorageHub& session_storage_hub() override { return owner_.env_.session_storage_hub(); }
+  PageHub& page_hub() override { return owner_.env_.page_hub(); }
+  uint64_t tab_id() override { return owner_.env_.tab_id(); }
+  CookieJar& cookies() override { return owner_.env_.cookies(); }
+  bool http_request(const FetchOptions& options, NetResponse* response) override { return owner_.env_.http_request(options, response); }
 
  private:
   Page& owner_;
@@ -76,7 +81,6 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       first_error_(allocator),
       title_text_(allocator),
       written_(allocator),
-      session_(allocator),
       doc_(allocator),
       extra_documents_(allocator),
       scripts_(allocator),
@@ -84,11 +88,17 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       objects_(allocator),
       frames_(allocator),
       messages_(allocator),
+      port_homes_(allocator),
+      frame_windows_(allocator),
+      storage_origin_(allocator),
+      state_json_(allocator),
       focus_value_(allocator),
       invalid_text_(allocator),
       style_cache_(allocator) {
   address_.assign(address);
   style_cache_media_ = media;
+  hub_id_ = env_.page_hub().add_page();
+  hub_seen_ = env_.page_hub().serial();
 }
 
 Page::~Page() {
@@ -104,6 +114,11 @@ bool Page::start_engine() {
     engine_->set_limits(8000000, 48u << 20);
     bindings_ = UniquePointer<DomBindings>::make(allocator_, engine_->vm(), doc_, static_cast<IDomHost&>(*this));
     if (bindings_ && bindings_->install()) {
+      String prelude_error(allocator_);
+      if (!engine_->run_library(web_prelude(), &prelude_error)) {   // (fetch, XMLHttpRequest, URLSearchParams ... : the page still works without them)
+        prelude_error.insert(0, "The web platform script failed: ");
+        env_.console(3, prelude_error.view());
+      }
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
       return true;
     }
@@ -401,6 +416,10 @@ bool Page::run_due_timers(double now_ms) {
   bool any_frame = false;
   for (uint64_t i = 0; i < frames_.count(); ++i)
     if (frames_[i]->page) any_frame |= frames_[i]->page->run_due_timers(now_ms);
+  if (env_.page_hub().pending(hub_id_, storage_origin(), hub_seen_)) {
+    poll_hub();
+    any_frame = true;
+  }
   if (!messages_.empty()) {
     deliver_messages();
     any_frame = true;
@@ -428,7 +447,7 @@ bool Page::next_timer(double* due_ms) {
       any = true;
     }
   }
-  if (!messages_.empty()) {   // (a message waits to be delivered: now)
+  if (!messages_.empty() || env_.page_hub().pending(hub_id_, storage_origin(), hub_seen_)) {   // (a message waits to be delivered: now)
     *due_ms = 1;
     any = true;
   }
@@ -452,23 +471,58 @@ void Page::scroll_to(int32_t line) {
 }
 
 void Page::set_hash(StringView hash) {
-  String base(allocator_);
+  String base(allocator_), before(allocator_);
+  before.assign(address_.view());
   const uint64_t at = address_.view().find('#');
   base.assign(at == StringView::npos ? address_.view() : address_.view().first(at));
   if (hash.size() > 1) base.append(hash);
+  if (base.view().equals(before.view())) {
+    env_.set_hash(hash);
+    return;
+  }
   address_.assign(base.view());
   env_.set_hash(hash);
-  if (bindings_) {
-    EventInit plain;
-    plain.cancelable = false;
-    plain.bubbles = false;
-    bindings_->dispatch(nullptr, "hashchange", plain);
+  if (bindings_) {   // hashchange comes as a task of its own, after the script that changed the fragment has finished
+    const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(before.view()), DomBindings::HookArg::of(address_.view())};
+    bindings_->schedule_hook("__fire_hashchange", args, 2);
   }
 }
 
-void Page::push_state(StringView address, bool replace) {
+void Page::push_state(StringView address, StringView state_json, bool has_state, bool replace) {
   address_.assign(address);
-  env_.push_state(address, replace);
+  state_json_.assign(state_json);
+  has_state_ = has_state;
+  env_.push_state(address, state_json, has_state, replace);
+}
+
+bool Page::history_state(String* json) {
+  if (!has_state_) return false;
+  json->assign(state_json_.view());
+  return true;
+}
+
+void Page::set_history_state(StringView json, bool has_state) {
+  state_json_.assign(json);
+  has_state_ = has_state;
+}
+
+void Page::traverse(StringView address, StringView state_json, bool has_state) {
+  String before(allocator_);
+  before.assign(address_.view());
+  address_.assign(address);
+  state_json_.assign(state_json);
+  has_state_ = has_state;
+  if (!bindings_) return;
+  bindings_->call_hook("__fire_popstate", nullptr, 0);
+  const StringView old_hash = before.view().find('#') == StringView::npos ? StringView() : before.view().substr(before.view().find('#'));
+  const StringView new_hash = address.find('#') == StringView::npos ? StringView() : address.substr(address.find('#'));
+  const StringView old_base = before.view().find('#') == StringView::npos ? before.view() : before.view().first(before.view().find('#'));
+  const StringView new_base = address.find('#') == StringView::npos ? address : address.first(address.find('#'));
+  if (old_base.equals(new_base) && !old_hash.equals(new_hash)) {
+    const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(before.view()), DomBindings::HookArg::of(address)};
+    bindings_->call_hook("__fire_hashchange", args, 2);
+  }
+  flush_errors();
 }
 
 dom::Document* Page::parse_document(StringView html) {
@@ -1347,52 +1401,215 @@ void Page::sync_frames() {
 
 // --- Messages ----------------------------------------------------------------------------------------------------------------------
 
-static void origin_of(StringView address, String* out) {
-  out->clear();
-  const uint64_t scheme = address.find("://");
-  if (scheme == StringView::npos) {
-    out->assign("null");
-    return;
+// --- Windows, message ports, broadcasts and storage events ---------------------------------------------------------------------------
+
+namespace {
+
+// Calls `visit` with each number of a comma separated list ("1,2,3").
+template <class F>
+void each_number(StringView list, F&& visit) {
+  StringView rest = list, token;
+  while (rest.next_token(',', &token)) {
+    uint32_t v = 0;
+    bool ok = !token.empty();
+    for (const char c : token) {
+      if (c < '0' || c > '9') ok = false;
+      else v = v * 10 + static_cast<uint32_t>(c - '0');
+    }
+    if (ok) visit(v);
   }
-  uint64_t end = address.find('/', scheme + 3);
-  if (end == StringView::npos) end = address.size();
-  out->assign(address.first(end));
 }
 
-void Page::queue_message(StringView data, StringView origin) {
-  if (messages_.count() >= 64) return;
+}  // namespace
+
+Page* Page::find_window(uint32_t id) {
+  if (window_id_ == id) return this;
+  for (uint64_t i = 0; i < frames_.count(); ++i) {
+    if (!frames_[i]->page) continue;
+    if (Page* p = frames_[i]->page->find_window(id)) return p;
+  }
+  return nullptr;
+}
+
+uint32_t Page::frame_window_id(uint32_t iframe_serial) {
+  for (uint64_t i = 0; i < frame_windows_.count(); ++i)
+    if (frame_windows_[i].port == iframe_serial) return frame_windows_[i].window;   // (the same number each time, also before the frame has been loaded)
+  const uint32_t id = root()->next_window_id_++;
+  frame_windows_.push_back(PortHome{iframe_serial, id});
+  return id;
+}
+
+const String& Page::storage_origin() {
+  if (storage_origin_.empty()) {
+    WebUrl url(allocator_);
+    if (WebUrl::parse(allocator_, address_.view(), nullptr, &url) && !url.is_file()) {
+      url.origin(&storage_origin_);
+    } else {
+      storage_origin_.assign("file://");   // (a page from the file system has an opaque origin; its storage is kept apart per file)
+      storage_origin_.append(address_.view());
+    }
+  }
+  return storage_origin_;
+}
+
+void Page::cookie_get(String* out) {
+  WebUrl url(allocator_);
+  if (!WebUrl::parse(allocator_, address_.view(), nullptr, &url) || !(url.scheme.equals("http") || url.scheme.equals("https"))) return;
+  env_.cookies().header_for(url, env_.now_ms(), CookieJar::Site::SameSite, true, out);
+}
+
+void Page::cookie_set(StringView text) {
+  WebUrl url(allocator_);
+  if (!WebUrl::parse(allocator_, address_.view(), nullptr, &url) || !(url.scheme.equals("http") || url.scheme.equals("https"))) return;
+  env_.cookies().store(text, url, env_.now_ms(), true);
+}
+
+void Page::page_origin(String* out) {
+  WebUrl url(allocator_);
+  if (WebUrl::parse(allocator_, address_.view(), nullptr, &url)) url.origin(out);
+  else out->append("null");
+}
+
+void Page::claim_ports(StringView ports, uint32_t window) {
+  Page* top = root();
+  each_number(ports, [&](uint32_t id) { top->move_port(id, window); });
+}
+
+bool Page::post_window_message(uint32_t target_window, StringView target_origin, StringView payload, StringView ports) {
+  Page* target = root()->find_window(target_window);
+  if (!target) return false;
+  String mine(allocator_), theirs(allocator_);
+  page_origin(&mine);
+  target->page_origin(&theirs);
+  if (target_origin.equals("/")) {
+    if (!theirs.equals(mine.view())) return true;   // (a message for the wrong origin is dropped without a word)
+  } else if (!target_origin.equals("*")) {
+    WebUrl wanted(allocator_);
+    String wanted_origin(allocator_);
+    if (!WebUrl::parse(allocator_, target_origin, nullptr, &wanted)) return false;
+    wanted.origin(&wanted_origin);
+    if (!theirs.equals(wanted_origin.view())) return true;
+  }
+  claim_ports(ports, target->window_id_);
+  target->queue_window_message(payload, mine.view(), window_id_, ports);
+  return true;
+}
+
+void Page::queue_window_message(StringView payload, StringView origin, uint32_t source, StringView ports) {
+  if (messages_.count() >= 256) return;
   Message m(allocator_);
-  m.data.assign(data);
+  m.payload.assign(payload);
   m.origin.assign(origin);
+  m.source = source;
+  m.ports.assign(ports);
   messages_.push_back(util::move(m));
+}
+
+void Page::queue_port_message(uint32_t port, StringView payload, StringView ports) {
+  if (messages_.count() >= 256) return;
+  Message m(allocator_);
+  m.to_port = true;
+  m.port = port;
+  m.payload.assign(payload);
+  m.ports.assign(ports);
+  messages_.push_back(util::move(m));
+}
+
+uint32_t Page::new_port_pair() {
+  Page* top = root();
+  const uint32_t first = top->next_port_;
+  top->next_port_ += 2;
+  top->port_homes_.push_back(PortHome{first, window_id_});
+  top->port_homes_.push_back(PortHome{first + 1, window_id_});
+  return first;
+}
+
+void Page::move_port(uint32_t port, uint32_t window) {
+  Page* top = root();
+  for (uint64_t i = 0; i < top->port_homes_.count(); ++i) {
+    if (top->port_homes_[i].port == port) {
+      top->port_homes_[i].window = window;
+      return;
+    }
+  }
+  top->port_homes_.push_back(PortHome{port, window});
+}
+
+void Page::post_port_message(uint32_t port, StringView payload, StringView ports) {
+  Page* top = root();
+  for (uint64_t i = 0; i < top->port_homes_.count(); ++i) {
+    if (top->port_homes_[i].port != port) continue;
+    Page* target = top->find_window(top->port_homes_[i].window);
+    if (!target) return;
+    claim_ports(ports, target->window_id_);
+    target->queue_port_message(port, payload, ports);
+    return;
+  }
+}
+
+void Page::broadcast(StringView channel, StringView payload) {
+  HubEvent e(allocator_);
+  e.kind = HubEvent::Kind::Broadcast;
+  e.source = hub_id_;
+  e.origin.assign(storage_origin());
+  e.name.assign(channel);
+  e.first.assign(payload);
+  env_.page_hub().post(util::move(e));
+}
+
+void Page::storage_changed(bool session, const String* key, const String* old_value, const String* new_value) {
+  HubEvent e(allocator_);
+  e.kind = HubEvent::Kind::Storage;
+  e.source = hub_id_;
+  e.group = session ? env_.tab_id() : 0;
+  e.origin.assign(storage_origin());
+  if (key) e.name.assign(key->view());
+  e.key_null = key == nullptr;
+  if (old_value) e.first.assign(old_value->view());
+  e.old_null = old_value == nullptr;
+  if (new_value) e.second.assign(new_value->view());
+  e.new_null = new_value == nullptr;
+  e.url.assign(address_.view());
+  env_.page_hub().post(util::move(e));
+}
+
+// The events other pages made for this one: storage changes and broadcast messages.
+void Page::poll_hub() {
+  if (!bindings_) {
+    hub_seen_ = env_.page_hub().serial();
+    return;
+  }
+  HubEvent e(allocator_);
+  while (env_.page_hub().next(hub_id_, storage_origin(), &hub_seen_, &e)) {
+    using Arg = DomBindings::HookArg;
+    if (e.kind == HubEvent::Kind::Storage) {
+      if (e.group != 0 && e.group != env_.tab_id()) continue;   // (another tab's sessionStorage)
+      const Arg args[5] = {Arg::of(e.group != 0), e.key_null ? Arg::null() : Arg::of(e.name.view()), e.old_null ? Arg::null() : Arg::of(e.first.view()),
+                           e.new_null ? Arg::null() : Arg::of(e.second.view()), Arg::of(e.url.view())};
+      bindings_->call_hook("__storage_event", args, 5);
+    } else {
+      const Arg args[2] = {Arg::of(e.name.view()), Arg::of(e.first.view())};
+      bindings_->call_hook("__bc_incoming", args, 2);
+    }
+  }
+  flush_errors();
 }
 
 void Page::deliver_messages() {
   while (messages_.count() > 0 && bindings_) {
     Message m = util::move(messages_[0]);
     messages_.remove_at(0);
-    EventInit init;
-    init.bubbles = false;
-    init.cancelable = false;
-    init.message_data = m.data.view();
-    init.message_origin = m.origin.view();
-    bindings_->dispatch(nullptr, "message", init);
+    using Arg = DomBindings::HookArg;
+    if (m.to_port) {
+      const Arg args[3] = {Arg::of(static_cast<double>(m.port)), Arg::of(m.payload.view()), Arg::of(m.ports.view())};
+      bindings_->call_hook("__port_deliver", args, 3);
+    } else {
+      const Arg args[4] = {Arg::of(m.payload.view()), Arg::of(m.origin.view()), Arg::of(static_cast<double>(m.source)), Arg::of(m.ports.view())};
+      bindings_->call_hook("__fire_message", args, 4);
+    }
   }
   messages_.clear();
   flush_errors();
-}
-
-void Page::post_message(int32_t target, StringView data) {
-  String origin(allocator_);
-  origin_of(address_.view(), &origin);
-  if (target < 0) {
-    queue_message(data, origin.view());
-  } else if (target == 0) {
-    if (parent_) parent_->queue_message(data, origin.view());
-  } else {
-    for (uint64_t i = 0; i < frames_.count(); ++i)
-      if (frames_[i]->serial == static_cast<uint32_t>(target) && frames_[i]->page) frames_[i]->page->queue_message(data, origin.view());
-  }
 }
 
 }  // namespace browser

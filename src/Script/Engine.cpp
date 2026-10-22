@@ -44,11 +44,67 @@ void on_big_stack(F&& job) {
   job();
 }
 
+// The parts of the standard library that are easiest to write in the language itself. Run once for each engine, before any page script.
+const char kPrelude[] =
+    "(function () {\n"
+    "  var P = Promise;\n"
+    "  function list(iterable) { var a = []; for (var x of iterable) a.push(x); return a; }\n"
+    "  P.all = function (iterable) {\n"
+    "    return new P(function (resolve, reject) {\n"
+    "      var items = list(iterable), left = items.length, out = [];\n"
+    "      if (left === 0) { resolve(out); return; }\n"
+    "      items.forEach(function (item, i) {\n"
+    "        out.push(undefined);\n"
+    "        P.resolve(item).then(function (v) { out[i] = v; if (--left === 0) resolve(out); }, reject);\n"
+    "      });\n"
+    "    });\n"
+    "  };\n"
+    "  P.allSettled = function (iterable) {\n"
+    "    return new P(function (resolve) {\n"
+    "      var items = list(iterable), left = items.length, out = [];\n"
+    "      if (left === 0) { resolve(out); return; }\n"
+    "      items.forEach(function (item, i) {\n"
+    "        out.push(undefined);\n"
+    "        P.resolve(item).then(function (v) { out[i] = { status: 'fulfilled', value: v }; if (--left === 0) resolve(out); },\n"
+    "                             function (e) { out[i] = { status: 'rejected', reason: e }; if (--left === 0) resolve(out); });\n"
+    "      });\n"
+    "    });\n"
+    "  };\n"
+    "  P.race = function (iterable) {\n"
+    "    return new P(function (resolve, reject) {\n"
+    "      list(iterable).forEach(function (item) { P.resolve(item).then(resolve, reject); });\n"
+    "    });\n"
+    "  };\n"
+    "  P.any = function (iterable) {\n"
+    "    return new P(function (resolve, reject) {\n"
+    "      var items = list(iterable), left = items.length, errors = [];\n"
+    "      function fail() { var e = new Error('All promises were rejected'); e.name = 'AggregateError'; e.errors = errors; reject(e); }\n"
+    "      if (left === 0) { fail(); return; }\n"
+    "      items.forEach(function (item, i) {\n"
+    "        errors.push(undefined);\n"
+    "        P.resolve(item).then(resolve, function (e) { errors[i] = e; if (--left === 0) fail(); });\n"
+    "      });\n"
+    "    });\n"
+    "  };\n"
+    "  P.withResolvers = function () {\n"
+    "    var r = {};\n"
+    "    r.promise = new P(function (resolve, reject) { r.resolve = resolve; r.reject = reject; });\n"
+    "    return r;\n"
+    "  };\n"
+    "  P.prototype.finally = function (f) {\n"
+    "    if (typeof f !== 'function') return this.then(f, f);\n"
+    "    return this.then(function (v) { return P.resolve(f()).then(function () { return v; }); },\n"
+    "                     function (e) { return P.resolve(f()).then(function () { throw e; }); });\n"
+    "  };\n"
+    "})();\n";
+
 }  // namespace
 
 Engine::Engine(allocators::IAllocator& allocator, IHost* host) : allocator_(allocator), host_(host), vm_(allocator, host) {
   vm_.set_memory_limit(memory_);
   vm_.set_instruction_budget(budget_);
+  String error(allocator_);
+  on_big_stack([&] { run_here(kPrelude, &error, nullptr, nullptr, false); });
 }
 
 void Engine::set_limits(uint64_t instructions, uint64_t memory_bytes) {
@@ -72,13 +128,19 @@ bool Engine::run(StringView source, String* error, String* result) {
   return ok;
 }
 
+bool Engine::run_library(StringView source, String* error) {
+  bool ok = false;
+  on_big_stack([&] { ok = run_here(source, error, nullptr, nullptr, false); });
+  return ok;
+}
+
 bool Engine::evaluate(StringView source, String* error, Value* value) {
   bool ok = false;
   on_big_stack([&] { ok = run_here(source, error, nullptr, value); });
   return ok;
 }
 
-bool Engine::run_here(StringView source, String* error, String* result, Value* out_value) {
+bool Engine::run_here(StringView source, String* error, String* result, Value* out_value, bool sync) {
   if (!vm_.ok()) {
     error->assign("Error: the script engine could not start");
     return false;
@@ -101,7 +163,7 @@ bool Engine::run_here(StringView source, String* error, String* result, Value* o
   Value value;
   if (!vm_.run(code, &value)) {
     vm_.take_exception(error);
-    sync_document();
+    if (sync) sync_document();
     return false;
   }
   if (out_value) *out_value = value;
@@ -109,7 +171,7 @@ bool Engine::run_here(StringView source, String* error, String* result, Value* o
     result->clear();
     vm_.describe(value, result, 0);
   }
-  sync_document();
+  if (sync) sync_document();
   return true;
 }
 
@@ -186,7 +248,7 @@ uint32_t Engine::run_timers_here(double now_ms, bool ahead, uint32_t max, String
   uint32_t live = 0;
   for (uint32_t i = 0; i < list->length; ++i)
     if (list->items[i].is_object()) list->items[live++] = list->items[i];
-  if (live + 32 < list->length) list->length = live;
+  list->length = live;   // (the entries that moved up are not left behind: they would run again)
   sync_document();
   return failed;
 }

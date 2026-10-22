@@ -56,7 +56,7 @@
 
 namespace network {
 
-enum class HttpMethod : uint8_t { Get, Head, Post, Put, Delete, Patch };
+enum class HttpMethod : uint8_t { Get, Head, Post, Put, Delete, Patch, Options };
 const char* http_method_name(HttpMethod method);
 
 // Upgraded: a WebSocket is open (or closing); it is not "busy", the program drives it with the ws_ functions and poll().
@@ -176,6 +176,8 @@ class HttpClient {
   // --- The answer
   uint32_t status() const { return status_; }                 // 200, 404, ...; 0 until the head has arrived
   StringView reason() const { return reason_.view(); }
+  // Every header line of the answer, as "Name: value\r\n" (several lines of one name stay several).
+  StringView header_block() const { return headers_.view(); }
   // The first header called `name` (any case), without surrounding blanks; empty if there is none.
   StringView header(StringView name) const;
   ConstByteView body() const { return body_.view(); }

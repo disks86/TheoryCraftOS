@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/WebBrowser.hpp"
+#include "Browser/Fetcher.hpp"
 #include "Browser/Url.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
@@ -175,6 +176,8 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       address_(allocator),
       status_(allocator),
       page_(allocator),
+      own_local_(allocator),
+      own_hub_(allocator),
       env_(*this, allocator),
       defer_go_(allocator),
       defer_type_(allocator),
@@ -183,6 +186,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       request_body_(allocator),
       script_log_(allocator),
       history_(allocator),
+      own_jar_(allocator),
       current_(allocator),
       request_target_(allocator),
       status_text_(allocator) {
@@ -416,8 +420,17 @@ bool WebBrowser::navigate(StringView typed) {
   return post(Request::Go, address.view());
 }
 
-bool WebBrowser::go_back() { return can_go_back() && post(Request::Back, StringView()); }
-bool WebBrowser::go_forward() { return can_go_forward() && post(Request::Forward, StringView()); }
+bool WebBrowser::go_back() {
+  if (!can_go_back()) return false;
+  request_delta_ = -1;
+  return post(Request::Back, StringView());
+}
+
+bool WebBrowser::go_forward() {
+  if (!can_go_forward()) return false;
+  request_delta_ = 1;
+  return post(Request::Forward, StringView());
+}
 
 bool WebBrowser::reload() {
   String address(allocator());
@@ -464,23 +477,31 @@ void WebBrowser::run_request() {
 
 void WebBrowser::load(Request kind, StringView target) {
   String address(allocator());
+  bool in_place = false;
   {
     UiGuard lock(this);
     switch (kind) {
       case Request::Go: address.assign(target); break;
       case Request::Back:
-        if (index_ <= 0) return;
-        address.assign(history_[static_cast<uint64_t>(index_ - 1)].view());
+      case Request::Forward: {
+        if (!history_.can_go(request_delta_)) return;
+        const browser::SessionHistory::Entry& entry = history_.at(static_cast<uint32_t>(history_.index() + request_delta_));
+        if (live_ && entry.document != 0 && entry.document == document_) {   // an entry of the document that is shown: the page is not loaded again
+          in_place = true;
+          break;
+        }
+        address.assign(entry.address.view());
         break;
-      case Request::Forward:
-        if (index_ + 1 >= static_cast<int64_t>(history_.count())) return;
-        address.assign(history_[static_cast<uint64_t>(index_ + 1)].view());
-        break;
+      }
       case Request::Reload: address.assign(current_.empty() ? target : current_.view()); break;
       case Request::Submit: address.assign(target); break;
       default: return;
     }
-    loading_ = true;
+    if (!in_place) loading_ = true;
+  }
+  if (in_place) {
+    traverse_in_place(request_delta_);
+    return;
   }
   String message(allocator());
   message.append("Loading ");
@@ -510,14 +531,20 @@ void WebBrowser::load(Request kind, StringView target) {
   show(page);
 }
 
-bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit) {
+bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit, bool subresource) {
   if (browser::is_file_address(address)) return fetch_file(address, page, limit);
   if (!loader_) {
     page->error.assign("Web pages cannot be opened: there is no network connection.");
     return false;
   }
-  browser::PageResult result(allocator());
-  if (!loader_->fetch(address, &result)) {
+  browser::FetchOptions options;
+  options.url = address;
+  options.mode = subresource ? browser::FetchOptions::Mode::Subresource : browser::FetchOptions::Mode::Navigate;
+  options.credentials = browser::FetchOptions::Credentials::Include;
+  options.headers = "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1\r\n";
+  options.now_ms = page_clock_ms();
+  browser::NetResponse result(allocator());
+  if (!browser::fetch_resource(allocator(), *loader_, jar(), options, &result)) {
     String message(allocator());
     message.append("Cannot open ");
     message.append(address.size() > 24 ? address.first(24) : address);   // (the notice dialog has room for four short lines)
@@ -527,8 +554,10 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit) {
     page->error.assign(message.view());
     return false;
   }
-  if (!result.final_address.empty()) page->address.assign(result.final_address.view());
-  page->type.assign(result.content_type.view());
+  if (!result.url.empty()) page->address.assign(result.url.view());
+  StringView type;
+  browser::header_value(result.headers.view(), "Content-Type", &type);
+  page->type.assign(type);
   page->status = result.status;
   if (!page->body.append(result.body.view())) {
     page->error.assign("Out of memory.");
@@ -537,7 +566,6 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit) {
   return true;
 }
 
-// A form sent with POST: the answer is the page that is shown (only web addresses can be posted to).
 bool WebBrowser::fetch_post(StringView address, Fetched* page) {
   String type(allocator()), body(allocator());
   {
@@ -549,16 +577,30 @@ bool WebBrowser::fetch_post(StringView address, Fetched* page) {
     page->error.assign(loader_ ? "A form can only be sent to a web address." : "Web pages cannot be opened: there is no network connection.");
     return false;
   }
-  browser::PageResult result(allocator());
-  if (!loader_->post(address, type.view(), body.view(), &result)) {
+  browser::FetchOptions options;
+  String headers(allocator());
+  headers.append("Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1\r\nContent-Type: ");
+  headers.append(type.view());
+  headers.append("\r\n");
+  options.method = "POST";
+  options.url = address;
+  options.headers = headers.view();
+  options.body = body.view().bytes();
+  options.mode = browser::FetchOptions::Mode::Navigate;
+  options.credentials = browser::FetchOptions::Credentials::Include;
+  options.now_ms = page_clock_ms();
+  browser::NetResponse result(allocator());
+  if (!browser::fetch_resource(allocator(), *loader_, jar(), options, &result)) {
     String message(allocator());
     message.append("Cannot send the form: ");
     message.append(result.error.empty() ? StringView("the server did not answer.") : result.error.view());
     page->error.assign(message.view());
     return false;
   }
-  if (!result.final_address.empty()) page->address.assign(result.final_address.view());
-  page->type.assign(result.content_type.view());
+  if (!result.url.empty()) page->address.assign(result.url.view());
+  StringView result_type;
+  browser::header_value(result.headers.view(), "Content-Type", &result_type);
+  page->type.assign(result_type);
   page->status = result.status;
   if (!page->body.append(result.body.view())) {
     page->error.assign("Out of memory.");
@@ -609,31 +651,51 @@ bool WebBrowser::fetch_file(StringView path, Fetched* page, uint64_t limit) {
 
 // Keeps the page just loaded in the history (as a new entry, or as the one Back / Forward / Reload went to).
 void WebBrowser::remember(Request kind, StringView address) {
+  ++document_;   // (a new document is on its way: the entries that belonged to the one it replaces answer to it from now on)
   switch (kind) {
     case Request::Back:
-      if (index_ > 0) --index_;
+    case Request::Forward: {
+      const uint32_t previous = history_.current() ? history_.current()->document : 0;
+      history_.go(request_delta_);
+      history_.replace_current(address, document_);
+      if (previous) history_.renumber_document(previous, document_);
       break;
-    case Request::Forward:
-      if (index_ + 1 < static_cast<int64_t>(history_.count())) ++index_;
-      break;
+    }
     default: {
-      const bool same = index_ >= 0 && history_[static_cast<uint64_t>(index_)].view().equals(address);
-      if (kind == Request::Reload && index_ >= 0) {
-        history_[static_cast<uint64_t>(index_)].assign(address);
+      const bool same = history_.current() && history_.current()->address.view().equals(address);
+      if (kind == Request::Reload && history_.current()) {
+        const uint32_t previous = history_.current()->document;
+        history_.replace_current(address, document_);
+        if (previous) history_.renumber_document(previous, document_);
       } else if (!same) {
-        while (static_cast<int64_t>(history_.count()) > index_ + 1) history_.remove_at(history_.count() - 1);
-        String entry(allocator());
-        entry.assign(address);
-        if (history_.push_back(util::move(entry))) ++index_;
-        if (history_.count() > kMaxHistory) {
-          history_.remove_at(0);
-          --index_;
-        }
+        history_.navigate(address, document_);
+      } else {
+        history_.replace_current(address, document_);
       }
       break;
     }
   }
   current_.assign(address);
+}
+
+// Back or Forward to an entry that belongs to the document on the screen (pushState() and fragment entries): the address changes, the page is told, nothing is fetched.
+bool WebBrowser::traverse_in_place(int32_t delta) {
+  String address(allocator()), state(allocator());
+  bool has_state;
+  {
+    UiGuard lock(this);
+    if (!live_ || !history_.go(delta)) return false;
+    const browser::SessionHistory::Entry& entry = *history_.current();
+    address.assign(entry.address.view());
+    state.assign(entry.state.view());
+    has_state = entry.has_state;
+    current_.assign(address.view());
+    address_.set_text(current_.view());
+    update_buttons();
+  }
+  live_->traverse(address.view(), state.view(), has_state);
+  settle();
+  return true;
 }
 
 // Shows a fetched page: as HTML, as text, or a note that it cannot be shown.
@@ -665,6 +727,7 @@ void WebBrowser::show(Fetched& page) {
     live_ = UniquePointer<browser::Page>::make(allocator(), allocator(), env_, page.address.view(), media_, scripts_enabled_);
     if (!live_) ok = false;
     else {
+      if (history_.current() && history_.current()->has_state) live_->set_history_state(history_.current()->state.view(), true);
       say(scripts_enabled_ ? "Reading the page and running its scripts..." : "Reading the page...");
       ok = live_->load(body) && live_->render(doc.get());
       if (ok) page_.set_object_painter(&live_->objects());
@@ -769,8 +832,9 @@ void WebBrowser::settle() {
   if (defer_history_ != 0) {
     const int32_t delta = defer_history_;
     defer_history_ = 0;
-    if (delta < 0) go_back();
-    else go_forward();
+    if (!history_.can_go(delta)) return;
+    request_delta_ = delta;
+    post(delta < 0 ? Request::Back : Request::Forward, StringView());
     return;
   }
   if (!live_) return;
@@ -931,8 +995,30 @@ void WebBrowser::on_toggle_dark(void* self, Control&) {
 bool WebBrowser::Env::fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) {
   Fetched f(owner_.allocator());
   f.address.assign(address);
-  if (!owner_.fetch(address, &f, limit) || f.status >= 400 || f.body.size() > limit) return false;
+  if (!owner_.fetch(address, &f, limit, true) || f.status >= 400 || f.body.size() > limit) return false;
   return out->append(f.body.view());
+}
+
+namespace {
+uint64_t next_tab_id() {
+  static uint64_t counter = 0;
+  return __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED);
+}
+}  // namespace
+
+WebBrowser::Env::Env(WebBrowser& owner, allocators::IAllocator& allocator) : owner_(owner), session_(allocator), tab_(next_tab_id()) {}
+
+browser::StorageHub& WebBrowser::Env::local_storage_hub() { return owner_.shared_local_ ? *owner_.shared_local_ : owner_.own_local_; }
+browser::PageHub& WebBrowser::Env::page_hub() { return owner_.shared_hub_ ? *owner_.shared_hub_ : owner_.own_hub_; }
+
+browser::CookieJar& WebBrowser::Env::cookies() { return owner_.jar(); }
+
+bool WebBrowser::Env::http_request(const browser::FetchOptions& options, browser::NetResponse* response) {
+  if (!owner_.loader_) {
+    response->error.assign("There is no network connection.");
+    return false;
+  }
+  return browser::fetch_resource(owner_.allocator(), *owner_.loader_, owner_.jar(), options, response);
 }
 
 UniquePointer<browser::IVideoClip> WebBrowser::Env::open_video(UniquePointer<ByteBuffer> data) {
@@ -952,7 +1038,7 @@ UniquePointer<browser::IVideoClip> WebBrowser::Env::open_audio(UniquePointer<Byt
 bool WebBrowser::Env::fetch_text(StringView address, uint64_t limit, String* text) {
   Fetched f(owner_.allocator());
   f.address.assign(address);
-  if (!owner_.fetch(address, &f) || f.status >= 400 || f.body.size() > limit) return false;
+  if (!owner_.fetch(address, &f, WebBrowser::kMaxFileBytes, true) || f.status >= 400 || f.body.size() > limit) return false;
   return text->assign(StringView(f.body.view()));
 }
 
@@ -985,11 +1071,12 @@ void WebBrowser::Env::navigate_post(StringView address, StringView content_type,
 void WebBrowser::Env::set_hash(StringView hash) { owner_.apply_hash(hash); }
 void WebBrowser::Env::reload() { owner_.defer_reload_ = true; }
 void WebBrowser::Env::history_go(int32_t delta) { owner_.defer_history_ += delta; }
-uint32_t WebBrowser::Env::history_length() { return static_cast<uint32_t>(owner_.history_.count()); }
+uint32_t WebBrowser::Env::history_length() { return owner_.history_.count(); }
 
-void WebBrowser::Env::push_state(StringView address, bool replace) {
+void WebBrowser::Env::push_state(StringView address, StringView state_json, bool has_state, bool replace) {
   UiGuard lock(&owner_);
-  owner_.remember(replace ? Request::Reload : Request::Go, address);
+  owner_.history_.push_state(address, state_json, has_state, replace);
+  owner_.current_.assign(address);
   owner_.address_.set_text(owner_.current_.view());
   owner_.update_buttons();
 }
@@ -1005,8 +1092,12 @@ void WebBrowser::apply_hash(StringView hash) {
   const uint64_t at = current_.view().find('#');
   address.assign(at == StringView::npos ? current_.view() : current_.view().first(at));
   if (hash.size() > 1) address.append(hash);
-  remember(Request::Reload, address.view());
+  if (!address.view().equals(current_.view())) {   // (a new entry of the same document; the same fragment again changes nothing)
+    history_.push_fragment(address.view());
+    current_.assign(address.view());
+  }
   address_.set_text(current_.view());
+  update_buttons();
   if (hash.size() <= 1 || hash.equals_ignore_case("#top")) defer_scroll_ = 0;
 }
 

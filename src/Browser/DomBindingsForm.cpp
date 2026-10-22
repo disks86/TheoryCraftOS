@@ -52,7 +52,6 @@ dom::ValidityHooks hooks_for(DomBindings::Impl& c, bool (**fn)(void*, const dom:
   return h;
 }
 
-NATIVE(el_post_message);
 
 Value make_validity(DomBindings::Impl& c, dom::Node* n) {
   Vm& vm = c.vm;
@@ -181,12 +180,18 @@ bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
     return false;
   }
   if (n->is_tag("iframe")) {
-    if (IS("contentWindow")) {
-      JsObject* w = vm.new_plain();
-      vm.define_native(w, "postMessage", el_post_message, 2);
-      vm.define_named(w, "__target", num_value(n->serial), kWritable);
-      vm.define_named(w, "closed", bool_value(false));
-      *out = Value::make_object(w);
+    if (IS("contentWindow")) {   // (a stand-in for the window of the page in the frame: postMessage goes to it; made by the page's built-in script)
+      const uint32_t id = c.host.frame_window_id(n->serial);
+      Value make;
+      *out = Value::make_null();
+      if (id && vm.get_named(Value::make_object(vm.global()), "__window_proxy", &make) && Vm::is_callable(make)) {
+        const Value arg = num_value(id);
+        if (!vm.call(make, Value(), &arg, 1, out)) {
+          String ignored(vm.allocator());
+          vm.take_exception(&ignored);
+          *out = Value::make_null();
+        }
+      }
       return true;
     }
     if (IS("contentDocument")) {   // (the page of a frame has a script engine of its own: its document is not reachable from here)
@@ -679,19 +684,6 @@ NATIVE(el_step_down) {
   return true;
 }
 
-// window.postMessage, parent.postMessage and contentWindow.postMessage: `this` says where it goes.
-NATIVE(el_post_message) {
-  DomBindings::Impl& c = impl(vm);
-  String data(vm.allocator());
-  if (!arg_text(vm, arg_at(args, argc, 0), &data)) return false;
-  Value target;
-  int32_t where = -1;
-  if (self.is_object() && vm.get_named(self, "__target", &target) && target.is_number()) where = static_cast<int32_t>(target.u.number);
-  c.host.post_message(where, data.view());
-  (void)result;
-  return true;
-}
-
 NATIVE(el_dialog_show) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
@@ -978,14 +970,6 @@ bool install_forms(DomBindings::Impl& c) {
   vm.define_native(ep, "setSelectionRange", el_set_selection_range, 2);
   vm.define_native(ep, "setRangeText", el_set_range_text, 1);
   vm.define_native(ep, "showPicker", el_nothing, 0);
-  vm.define_native(vm.global(), "postMessage", el_post_message, 2);
-  if (c.host.in_frame()) {   // a page in a frame: window.parent and window.top are the page around it
-    JsObject* parent = vm.new_plain();
-    vm.define_native(parent, "postMessage", el_post_message, 2);
-    vm.define_named(parent, "__target", num_value(0), kWritable);
-    vm.define_named(vm.global(), "parent", Value::make_object(parent), kWritable);
-    vm.define_named(vm.global(), "top", Value::make_object(parent), kWritable);
-  }
   vm.define_native(ep, "show", el_dialog_show, 0);
   vm.define_native(ep, "showModal", el_dialog_show_modal, 0);
   vm.define_native(ep, "close", el_dialog_close, 0);

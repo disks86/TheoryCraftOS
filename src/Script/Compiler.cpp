@@ -292,6 +292,7 @@ class Compiler {
     function_level_count_ = 0;
     cur_ = &fs;
     fs.code->is_arrow = (fn->flags & kFlagArrow) != 0;
+    fs.code->is_async = (fn->flags & kFlagAsync) != 0;
     fs.code->name = fn->text.empty() ? nullptr : vm_.intern(fn->text);
     uint32_t params = 0;
     for (Node* p = fn->list; p; p = p->next) {
@@ -912,6 +913,7 @@ class Compiler {
         emit(Opc::Pop);
         emit(Opc::PushUndef);
         return;
+      case Op::Await: expression(n->a); emit(Opc::Await, 0, 0, n->line); return;
       case Op::Not: expression(n->a); emit(Opc::Not); return;
       case Op::Neg: expression(n->a); emit(Opc::Neg, 0, 0, n->line); return;
       case Op::Plus: expression(n->a); emit(Opc::Plus, 0, 0, n->line); return;

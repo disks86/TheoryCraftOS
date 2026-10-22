@@ -39,7 +39,7 @@ enum class Op : uint8_t {
   Add, Sub, Mul, Div, Mod, Pow, BitAnd, BitOr, BitXor, Shl, Shr, UShr,
   Eq, Ne, StrictEq, StrictNe, Lt, Gt, Le, Ge, In, InstanceOf,
   And, Or, Nullish,
-  Not, BitNot, Neg, Plus, TypeOf, Void, Delete,
+  Not, BitNot, Neg, Plus, TypeOf, Void, Delete, Await,
   Inc, Dec,
   Assign,
 };
@@ -53,6 +53,7 @@ enum NodeFlag : uint8_t {
   kFlagExprBody = 2,     // Function: arrow with an expression as its body
   kFlagRest = 4,         // Function: the last parameter is ...rest
   kFlagExpression = 8,   // Function: a function expression (its own name is visible inside)
+  kFlagAsync = 16,       // Function: async
 };
 
 enum class VarKind : uint8_t { Var, Let, Const };

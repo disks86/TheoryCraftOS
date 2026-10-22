@@ -26,6 +26,7 @@
 // are zero), the network (XMLHttpRequest, fetch), observers that report (MutationObserver and the like exist but never fire), forms as controls, canvas.
 #pragma once
 #include "Browser/Css.hpp"
+#include "Browser/Fetcher.hpp"
 #include "Browser/Media.hpp"
 #include "Dom/Dom.hpp"
 #include "Script/Vm.hpp"
@@ -64,7 +65,9 @@ class IDomHost {
   virtual void reload() = 0;
   virtual void history_go(int32_t delta) = 0;
   virtual uint32_t history_length() = 0;
-  virtual void push_state(StringView address, bool replace) = 0;
+  // history.pushState() / replaceState(): the address, and the state as JSON text (`has_state` false: none). history.state reads the entry the page is on.
+  virtual void push_state(StringView address, StringView state_json, bool has_state, bool replace) = 0;
+  virtual bool history_state(String* json) = 0;
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t line) = 0;
@@ -72,9 +75,17 @@ class IDomHost {
   virtual bool computed_style(const dom::Node* element, Style* out) = 0;
   // A new document made from html text (DOMParser); owned by the host. nullptr if memory ran out.
   virtual dom::Document* parse_document(StringView html) = 0;
+  // The Web Storage of the page's origin. After a change that is visible (a new value, a removed key, a cleared area) the other pages of the origin are told.
   virtual StorageArea& local_storage() = 0;
   virtual StorageArea& session_storage() = 0;
-  virtual String& cookie() = 0;
+  virtual void storage_changed(bool session, const String* key, const String* old_value, const String* new_value) = 0;
+  // document.cookie: what scripts of this page can read, and what a script's assignment does (the cookie jar of the browser, for this page's address).
+  virtual void cookie_get(String* out) = 0;
+  virtual void cookie_set(StringView text) = 0;
+  // fetch() and XMLHttpRequest: sends a request (cookies, redirects and the cross-origin rules included; see Fetcher.hpp). False (with response->error) if it failed.
+  virtual bool http_request(const FetchOptions& options, NetResponse* response) = 0;
+  // The origin of the page ("https://example.com", or "null" for a file or a page without an address).
+  virtual void page_origin(String* out) = 0;
   // Compiles the code of an on* attribute (or a javascript: address) into a function taking `event`. False (with a message sent to console) if it does not
   // compile; the function is not kept alive by this: the caller stores it where the script engine can see it.
   virtual bool compile_handler(StringView code, script::Value* function) = 0;
@@ -94,8 +105,20 @@ class IDomHost {
   // <dialog>: show(), showModal() and close(returnValue) (nullptr: leave the return value as it was); `close` fires when it was open.
   virtual void show_dialog(dom::Node* dialog, bool modal) = 0;
   virtual void close_dialog(dom::Node* dialog, const char* return_value) = 0;
-  // Frames: window.postMessage() (target -1), parent.postMessage() (0) and iframe.contentWindow.postMessage() (the serial of the <iframe>). Is this page in a frame?
-  virtual void post_message(int32_t target, StringView data) = 0;
+  // Windows and messages. Every page of a tab (the page itself and its frames) has a window number. A message (already serialized) goes to the window with that
+  // number if the target origin allows ("*" for any, "/" for the sender's own, otherwise an origin) as a task; `ports` lists the ids of the message ports that
+  // go with it (comma separated).
+  virtual uint32_t window_id() = 0;
+  virtual uint32_t parent_window_id() = 0;   // 0: none
+  virtual uint32_t top_window_id() = 0;
+  virtual uint32_t frame_window_id(uint32_t iframe_serial) = 0;   // the window of the page in that <iframe> (0: none)
+  virtual bool post_window_message(uint32_t target_window, StringView target_origin, StringView payload, StringView ports) = 0;
+  // Message ports: a pair of ids is made (the second is the first plus one); a port lives in the window that has it; a message to a port goes to its window.
+  virtual uint32_t new_port_pair() = 0;
+  virtual void move_port(uint32_t port, uint32_t window) = 0;
+  virtual void post_port_message(uint32_t port, StringView payload, StringView ports) = 0;
+  // BroadcastChannel: a message (serialized) for the other pages of the origin.
+  virtual void broadcast(StringView channel, StringView payload) = 0;
   virtual bool in_frame() = 0;
   // Shows what is wrong with a control (reportValidity()); true if nothing is.
   virtual bool report_validity(dom::Node* control) = 0;
@@ -128,6 +151,22 @@ class DomBindings {
 
   // Defines everything on the global object. False if memory ran out.
   bool install();
+
+  // Calls a global function that the page's built-in scripts define (a "hook") with these arguments: how the browser delivers the events that are made out of
+  // script values (a message with its data, a storage change). False if there is no such function or it threw (counted like a listener that threw).
+  struct HookArg {
+    enum class Kind : uint8_t { Null, Bool, Number, String } kind = Kind::Null;
+    bool boolean = false;
+    double number = 0;
+    StringView text;
+    static HookArg null() { return HookArg(); }
+    static HookArg of(bool b) { HookArg a; a.kind = Kind::Bool; a.boolean = b; return a; }
+    static HookArg of(double n) { HookArg a; a.kind = Kind::Number; a.number = n; return a; }
+    static HookArg of(StringView s) { HookArg a; a.kind = Kind::String; a.text = s; return a; }
+  };
+  bool call_hook(StringView name, const HookArg* args, uint32_t count);
+  // The same, as a task of its own: it runs when the event loop gets to it (the next timer turn), not now.
+  void schedule_hook(StringView name, const HookArg* args, uint32_t count);
 
   // Fires an event of that type at a node (nullptr: the window); true unless a listener called preventDefault(). Listeners that throw are counted and
   // the first message kept (take_error()).

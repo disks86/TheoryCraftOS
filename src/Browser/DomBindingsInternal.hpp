@@ -69,6 +69,8 @@ inline Value num_value(double d) { return Value::make_number(d); }
 inline Value bool_value(bool b) { return Value::make_bool(b); }
 inline Value object_value(JsObject* o) { return o ? Value::make_object(o) : Value::make_null(); }
 
+// The legacy code of a DOMException name ("NotFoundError" -> 8; 0 for names without one).
+int dom_exception_code(StringView name);
 // Throws a DOMException (an Error with that name); returns false for the natives to return.
 bool throw_dom(Vm& vm, const char* name, StringView message);
 // The error a DomError stands for.
@@ -107,6 +109,10 @@ bool form_get(DomBindings::Impl& c, dom::Node* element, StringView key, Value* o
 HostClass::Set form_set(DomBindings::Impl& c, dom::Node* element, StringView key, const Value& value);
 bool is_form_element(const dom::Node* n);
 bool form_lookup_named(DomBindings::Impl& c, dom::Node* n, StringView key, Value* out);
+bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest's natives, byte and text helpers (DomBindingsNet.cpp)
+// Uint8Array objects (DomBindingsMedia.cpp): a new one holding these bytes, and the bytes of one (a view into the array; false for anything else).
+JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes);
+bool byte_array_bytes(const Value& v, StringView* out);
 bool install_media(DomBindings::Impl& c);   // <img>, <video>, <canvas>, the 2D context, ImageData, Path2D, typed arrays (DomBindingsMedia.cpp)
 // Properties of <img>, <video> and <canvas> elements; true when handled / Handled when it was.
 bool media_get(DomBindings::Impl& c, dom::Node* element, StringView key, Value* out);
@@ -115,7 +121,8 @@ void update_metrics(DomBindings::Impl& c);
 uint32_t media_changed_impl(DomBindings::Impl& c);
 
 // Events (DomBindingsEvents.cpp).
-bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented);
+// (`object_target`: a script object that is the target, instead of a node or the window)
+bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented, JsObject* object_target = nullptr);
 Value make_event(DomBindings::Impl& c, StringView type, const EventInit& init, JsObject* proto = nullptr);
 
 // Styles (DomBindingsStyle.cpp).

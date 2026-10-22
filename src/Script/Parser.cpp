@@ -17,8 +17,8 @@
  */
 
 // The lexer and the recursive-descent parser. The language is a practical subset of ECMAScript 5 with some of ES2015 - let / const, arrow functions,
-// template literals, spread, for-of, default parameters, ?? and ?. - and left out: classes, regular expression literals, destructuring, generators,
-// async functions, getters and setters, labels on blocks, `with`, `eval`.
+// template literals, spread, for-of, default parameters, ?? and ?., async functions and await - and left out: classes, regular expression literals,
+// destructuring, generators, getters and setters, labels on blocks, `with`, `eval`.
 #include "Script/Ast.hpp"
 #include "Script/Number.hpp"
 
@@ -381,7 +381,11 @@ class Parser {
         if (n) consume_semicolon();
         return n;
       }
-      if (w.equals("function")) return function_declaration();
+      if (w.equals("function")) return function_declaration(false);
+      if (w.equals("async") && async_function_ahead()) {
+        next();   // `async`
+        return function_declaration(true);
+      }
       if (w.equals("if")) return if_statement();
       if (w.equals("for")) return for_statement();
       if (w.equals("while")) return while_statement();
@@ -464,8 +468,17 @@ class Parser {
     return n;
   }
 
-  Node* function_declaration() {
-    Node* f = function_rest(false);
+  // Is `async` (the current token) followed by `function` on the same line?
+  bool async_function_ahead() {
+    const Mark m = mark();
+    next();
+    const bool yes = is_word("function") && !cur_.newline_before;
+    rewind(m);
+    return yes;
+  }
+
+  Node* function_declaration(bool is_async) {
+    Node* f = function_rest(false, is_async);
     if (!f) return nullptr;
     if (f->text.empty()) return null_fail("Function statements require a function name");
     Node* n = make(NodeKind::FunctionDecl);
@@ -652,9 +665,10 @@ class Parser {
 
   // --- Functions
   // After `function` (the keyword is the current token): [name] (params) { body }.
-  Node* function_rest(bool expression) {
+  Node* function_rest(bool expression, bool is_async = false) {
     Node* f = make(NodeKind::Function);
     if (!f) return nullptr;
+    if (is_async) f->flags |= kFlagAsync;
     next();   // `function`
     if (is(T::Ident) && !reserved(cur_.text)) {
       f->text = cur_.text;
@@ -662,7 +676,7 @@ class Parser {
     }
     if (expression) f->flags |= kFlagExpression;
     if (!parameters(f)) return nullptr;
-    f->a = function_body();
+    f->a = function_body(is_async);
     return f->a ? f : nullptr;
   }
 
@@ -695,12 +709,14 @@ class Parser {
     return expect(T::RParen, "Unexpected token");
   }
 
-  Node* function_body() {
+  Node* function_body(bool is_async = false) {
     if (!is(T::LBrace)) return null_fail("Unexpected token");
-    const bool saved = in_function_;
+    const bool saved = in_function_, saved_async = in_async_;
     in_function_ = true;
+    in_async_ = is_async;
     Node* b = block();
     in_function_ = saved;
+    in_async_ = saved_async;
     return b;
   }
 
@@ -728,10 +744,11 @@ class Parser {
     return yes;
   }
 
-  Node* arrow_function(bool from_parens) {
+  Node* arrow_function(bool from_parens, bool is_async = false) {
     Node* f = make(NodeKind::Function);
     if (!f) return nullptr;
     f->flags |= kFlagArrow;
+    if (is_async) f->flags |= kFlagAsync;
     if (from_parens) {
       if (!parameters(f)) return nullptr;
     } else {
@@ -743,13 +760,15 @@ class Parser {
     }
     if (!expect(T::Arrow, "Unexpected token")) return nullptr;
     if (is(T::LBrace)) {
-      f->a = function_body();
+      f->a = function_body(is_async);
     } else {
       f->flags |= kFlagExprBody;
-      const bool saved = in_function_;
+      const bool saved = in_function_, saved_async = in_async_;
       in_function_ = true;
+      in_async_ = is_async;
       f->a = assignment(false);
       in_function_ = saved;
+      in_async_ = saved_async;
     }
     return f->a ? f : nullptr;
   }
@@ -797,6 +816,27 @@ class Parser {
 
   Node* assignment_inner(bool no_in) {
     if (failed_) return nullptr;
+    // Async arrow functions: `async x => ...` and `async (...) => ...`.
+    if (is_word("async")) {
+      const Mark m = mark();
+      next();
+      if (!cur_.newline_before) {
+        if (is(T::Ident) && !reserved(cur_.text)) {
+          next();
+          const bool arrow = is(T::Arrow) && !cur_.newline_before;
+          rewind(m);
+          if (arrow) {
+            next();   // `async`
+            return arrow_function(false, true);
+          }
+        } else if (is(T::LParen) && arrow_ahead()) {
+          rewind(m);
+          next();   // `async`
+          return arrow_function(true, true);
+        }
+      }
+      rewind(m);
+    }
     // Arrow functions: `x => ...` and `(...) => ...`.
     if (is(T::Ident) && !reserved(cur_.text)) {
       const Mark m = mark();
@@ -909,6 +949,7 @@ class Parser {
         if (cur_.text.equals("typeof")) op = Op::TypeOf;
         else if (cur_.text.equals("void")) op = Op::Void;
         else if (cur_.text.equals("delete")) op = Op::Delete;
+        else if (in_async_ && cur_.text.equals("await")) op = Op::Await;
         break;
       case T::Inc:
       case T::Dec: {
@@ -1086,6 +1127,10 @@ class Parser {
     }
     const StringView w = cur_.text;
     if (w.equals("function")) return function_rest(true);
+    if (w.equals("async") && async_function_ahead()) {
+      next();   // `async`
+      return function_rest(true, true);
+    }
     if (w.equals("this")) {
       Node* n = make(NodeKind::This);
       next();
@@ -1154,7 +1199,7 @@ class Parser {
       } else {
         p = make(NodeKind::Property);
         if (!p) return nullptr;
-        bool word = false;
+        bool word = false, method_async = false;
         if (is(T::LBracket)) {
           next();
           p->flags |= kFlagComputed;
@@ -1164,6 +1209,11 @@ class Parser {
           word = is(T::Ident);
           p->text = cur_.text;
           next();
+          if (word && p->text.equals("async") && !cur_.newline_before && (is(T::Ident) || is(T::String)) ) {   // async name() { ... }
+            method_async = true;
+            p->text = cur_.text;
+            next();
+          }
         } else if (is(T::Number)) {
           String number(arena_.allocator());   // (the number as a property name: its text)
           number_to_string(cur_.number, &number);
@@ -1179,8 +1229,9 @@ class Parser {
           Node* f = make(NodeKind::Function);
           if (!f) return nullptr;
           f->text = p->text;
+          if (method_async) f->flags |= kFlagAsync;
           if (!parameters(f)) return nullptr;
-          f->a = function_body();
+          f->a = function_body(method_async);
           if (!f->a) return nullptr;
           p->a = f;
         } else if (word && !(p->flags & kFlagComputed) && !reserved(p->text)) {   // shorthand: { name }
@@ -1255,7 +1306,7 @@ class Parser {
   uint64_t pos_ = 0, prev_end_ = 0;
   uint32_t line_ = 1;
   Token cur_;
-  bool failed_ = false, in_function_ = false;
+  bool failed_ = false, in_function_ = false, in_async_ = false;
   uint32_t depth_ = 0;
 };
 

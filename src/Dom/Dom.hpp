@@ -39,6 +39,9 @@ struct Attribute {
   String name, value;
 };
 
+// Bits of Node::ui_state.
+enum UiState : uint8_t { kUiHover = 1, kUiActive = 2 };
+
 struct Node {
   Node(allocators::IAllocator& allocator, NodeType t, Document* d) : type(t), owner(d), name(allocator), data(allocator), attrs(allocator) {}
 
@@ -53,6 +56,7 @@ struct Node {
   Node* content = nullptr;   // <template>: the fragment that holds what is inside it (it is not part of the page)
   uint16_t caret = 0xFFFF, anchor = 0xFFFF;   // a text control: where the caret is and the other end of the selection (0xFFFF: at the end)
   uint8_t form_state = 0;    // elements: what the user (or a script) changed in a form control, and whether it is focused (FormState bits, Form.hpp)
+  uint8_t ui_state = 0;      // elements: kUiHover while the pointer is over it (or a descendant), kUiActive while it is pressed
 
   bool is_element() const { return type == NodeType::Element; }
   bool is_text() const { return type == NodeType::Text; }

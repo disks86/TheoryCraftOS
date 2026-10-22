@@ -315,6 +315,9 @@ class Desktop {
   Paint paint_;
   Spreadsheet spreadsheet_;
   DatabaseQuery database_query_;
+  browser::CookieJar cookie_jar_;   // the web browser's cookies, shared by all its windows
+  browser::StorageHub local_storage_;   // and its localStorage (of every origin),
+  browser::PageHub page_hub_;            // and what its pages tell each other (storage changes, broadcasts)
   WebBrowser web_browser_;
   Terminal terminal_;
   MediaPlayer media_player_;

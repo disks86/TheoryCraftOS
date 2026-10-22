@@ -121,10 +121,10 @@ NATIVE(dispatch_event_native) {
   if (!event.is_object()) return vm.throw_error(ErrorKind::TypeError, "parameter 1 is not of type 'Event'.");
   dom::Node* node = node_of(self);
   const bool window = !node && (self.is_nullish() || (self.is_object() && self.as_object() == vm.global()));
-  if (!node && !window) return vm.throw_error(ErrorKind::TypeError, "dispatchEvent is only supported on the window and on nodes.");
+  if (!node && !window && !self.is_object()) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
   bool prevented = false;
   vm.hold_collector();
-  const bool ok = dispatch_event(c, node, window, event, &prevented);
+  const bool ok = dispatch_event(c, node, window, event, &prevented, !node && !window ? self.as_object() : nullptr);
   vm.release_collector();
   *result = bool_value(!prevented);
   return ok;
@@ -383,7 +383,7 @@ Value make_event(DomBindings::Impl& c, StringView type, const EventInit& init, J
   return Value::make_object(e);
 }
 
-bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented) {
+bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented, JsObject* object_target) {
   Vm& vm = c.vm;
   JsObject* e = event.as_object();
   String type(vm.allocator());
@@ -398,6 +398,7 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
   if (!target_is_window)
     for (dom::Node* n = target; n; n = n->parent) nodes.push_back(n);
   JsObject* path = vm.new_array(static_cast<uint32_t>(nodes.count()) + 1);
+  if (object_target) vm.array_push(path, Value::make_object(object_target));   // (a script object that is an event target: it is the whole path)
   for (uint64_t i = 0; i < nodes.count(); ++i) vm.array_push(path, node_value(c, nodes[i]));
   // (the window is on the path of events that go through the document, but not of load, which is the window's)
   const bool to_window = target_is_window || (nodes.count() && nodes[nodes.count() - 1]->type == dom::NodeType::Document);

@@ -295,10 +295,11 @@ static void test_selectors() {
     TestAllocator a;
     SelectorSet set(a);
     uint32_t added;
-    CHECK(set.parse("p, .a, #i, a.b:hover, ul li:first-child, [x] > p::before, :not(#a), :where(#a), :is(.a, #b)", 7, &added) && added == 7);
-    CHECK(set.specificity(0) == 1 && set.specificity(1) == 100 && set.specificity(2) == 10000 && set.specificity(3) == 102);
-    CHECK(set.specificity(4) == 10000 && set.specificity(5) == 0 && set.specificity(6) == 10000);
+    CHECK(set.parse("p, .a, #i, a.b:hover, ul li:first-child, [x] > p::before, :not(#a), :where(#a), :is(.a, #b)", 7, &added) && added == 9);   // (:hover and ::before are selectors now)
+    CHECK(set.specificity(0) == 1 && set.specificity(1) == 100 && set.specificity(2) == 10000 && set.specificity(3) == 201);
+    CHECK(set.specificity(4) == 102 && set.specificity(5) == 102 && set.specificity(6) == 10000 && set.specificity(7) == 0 && set.specificity(8) == 10000);
     CHECK(set.tag(0) == 7);
+    CHECK(set.pseudo(0) == 0 && set.pseudo(5) == 1);   // (the ::before selector matches nothing unless asked for the pseudo-element)
   }
   // Selectors keep working after the tree changes.
   {

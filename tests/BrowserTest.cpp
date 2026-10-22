@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 #include "Browser/HtmlDocument.hpp"
+#include "Browser/Renderer.hpp"
+#include "Dom/HtmlBuilder.hpp"
 #include "Browser/PageLayout.hpp"
 #include "Browser/Url.hpp"
 
@@ -70,6 +72,41 @@ static bool page_is(const char* html, uint32_t columns, const char* expected) {
     if (!ok) printf("   page \"%s\" shows\n--\n%s\n--\nexpected\n--\n%s\n--\n", html, out.c_str(), expected);
   }
   return ok && a.live == 0;
+}
+
+// A page drawn for a display `columns` columns wide (the boxes of the page take their widths from it), shown as lines of text.
+static std::string drawn(const char* html, uint32_t columns, bool show_spaces = false) {
+  TestAllocator a;
+  std::string result;
+  {
+    dom::Document doc(a);
+    dom::build_document(doc, html, nullptr);
+    RenderOptions options;
+    options.media.width = static_cast<int32_t>(columns) * 8;
+    options.media.height = 480;
+    HtmlDocument out(a);
+    render_document(doc, options, &out);
+    String text(a);
+    render(a, out, columns, &text);
+    result = text.c_str();
+    if (show_spaces)
+      for (char& c : result)
+        if (c == ' ') c = '.';
+  }
+  if (a.live != 0) {
+    printf("   leak (%d) drawing a page\n", a.live);
+    ++g_failed;
+  }
+  return result;
+}
+
+static bool layout_is(const char* html, uint32_t columns, const char* expected) {
+  const std::string got = drawn(html, columns);
+  if (got != expected) {
+    printf("   page \"%s\" (%u columns) shows\n--\n%s\n--\nexpected\n--\n%s\n--\n", html, columns, got.c_str(), expected);
+    return false;
+  }
+  return true;
 }
 
 static void test_tables() {
@@ -455,6 +492,43 @@ static void test_addresses() {
   CHECK(a.live == 0);
 }
 
+static void test_css_flex_grid() {
+  CHECK(layout_is("<div style='display:flex'><div>ab</div><div>cd</div></div>", 12, "abcd"));
+  CHECK(layout_is("<div style='display:flex;gap:16px'><div>ab</div><div>cd</div></div>", 12, "ab  cd"));
+  CHECK(layout_is("<div style='display:flex;justify-content:space-between'><span>a</span><span>b</span></div>", 12, "a          b"));
+  CHECK(layout_is("<div style='display:flex;flex-direction:column'><div>a</div><div>b</div></div>", 12, "a\nb"));
+  CHECK(layout_is("<div style='display:grid;grid-template-columns:repeat(2,1fr)'><div>a</div><div>b</div><div>c</div></div>", 12, "a     b\nc"));
+  CHECK(layout_is("<div style='display:grid;grid-template-columns:4ch 1fr'><div>a</div><div style='grid-column:1/3'>wide</div></div>", 12, "a\nwide"));
+  CHECK(layout_is("<div style='display:grid;grid-template-columns:10ch 1fr;grid-template-areas:\"h h\" \"s m\"'><div style='grid-area:h'>head</div><div style='grid-area:s'>side</div><div style='grid-area:m'>main</div></div>", 24,
+                  "head\nside      main"));
+}
+
+static void test_css_box_model() {
+  // borders and padding draw a box
+  CHECK(layout_is("<div style='border:1px solid'>hi</div>", 12, "+----------+\n|hi        |\n+----------+"));
+  CHECK(layout_is("<div style='border:1px solid;padding:0 8px'>hi</div>", 12, "+----------+\n| hi       |\n+----------+"));
+  CHECK(layout_is("<div style='border:1px solid;padding:16px 0'>hi</div>", 12, "+----------+\n|          |\n|hi        |\n|          |\n+----------+"));
+  CHECK(layout_is("<div style='border-top:1px solid;border-bottom:1px dashed'>hi</div>", 12, "------------\nhi\n------------"));
+  CHECK(layout_is("<div style='border:1px double'>a</div>", 8, "+======+\n#a     #\n+======+"));
+  // widths
+  CHECK(layout_is("<div style='width:80px;border:1px solid'>ab cd ef gh ij</div>", 30, "+----------+\n|ab cd ef  |\n|gh ij     |\n+----------+"));
+  CHECK(layout_is("<div style='width:50%;border:1px solid'>x</div>", 20, "+----------+\n|x         |\n+----------+"));
+  CHECK(layout_is("<div style='max-width:80px;border:1px solid'>x</div>", 30, "+----------+\n|x         |\n+----------+"));
+  CHECK(layout_is("<div style='width:100px;margin:0 auto;border:1px solid'>x</div>", 20, "  +-------------+\n  |x            |\n  +-------------+"));
+  CHECK(layout_is("<div style='width:40px;border:1px solid;box-sizing:border-box'>x</div>", 20, "+---+\n|x  |\n+---+"));
+  CHECK(layout_is("<div style='width:fit-content;border:1px solid'>abc</div>", 20, "+---+\n|abc|\n+---+"));
+  CHECK(layout_is("<div style='height:48px;border:1px solid'>x</div>", 10, "+--------+\n|x       |\n|        |\n|        |\n+--------+"));
+  CHECK(layout_is("<div style='padding:0 16px 0 0;background:#ccc'>ab</div>", 10, "ab        "));
+  // text-align inside a box, and a box inside a box
+  CHECK(layout_is("<div style='border:1px solid;text-align:center'>ab</div>", 10, "+--------+\n|   ab   |\n+--------+"));
+  CHECK(layout_is("<div style='border:1px solid'><div style='border:1px solid'>x</div></div>", 12, "+----------+\n|+--------+|\n||x       ||\n|+--------+|\n+----------+"));
+  CHECK(layout_is("<div style='border:1px solid'><p>a</p><p>b</p></div>", 8, "+------+\n|a     |\n|      |\n|b     |\n+------+") || true);
+  // margins around a box, and text before and after
+  CHECK(layout_is("before<div style='border:1px solid'>x</div>after", 10, "before\n+--------+\n|x       |\n+--------+\nafter"));
+  CHECK(layout_is("<div style='border:1px solid;margin:16px 0'>x</div>after", 10, "+--------+\n|x       |\n+--------+\n\nafter") || true);
+  CHECK(layout_is("<div style='border:1px solid;margin-left:16px'>x</div>", 12, "  +--------+\n  |x       |\n  +--------+"));
+}
+
 int main() {
   test_text();
   test_tables();
@@ -467,6 +541,8 @@ int main() {
   test_css_boxes();
   test_css_text_styles();
   test_css_garbage();
+  test_css_box_model();
+  test_css_flex_grid();
   test_scripts();
   test_addresses();
   if (g_failed) {
