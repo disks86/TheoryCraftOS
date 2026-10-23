@@ -234,6 +234,10 @@ static void test_objects() {
 }
 
 static void test_arrays_and_strings() {
+  {   // a string literal larger than one arena block (Google's search page evals a 60 KB one)
+    const std::string big(70000, 'x');
+    CHECK(is(("var s = '" + big + "'; s.length + ':' + (s + 'a' + \"" + big + "\").length").c_str(), "70000:140001"));
+  }
   CHECK(is("[1, 2, 3].length", "3"));
   CHECK(is("var a = []; a[3] = 1; a.length", "4"));
   CHECK(is("var a = [1, 2, 3]; a.length = 1; a.join()", "1"));

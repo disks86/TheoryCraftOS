@@ -18,6 +18,7 @@
 
 // The syntax tree the parser builds and the compiler reads, and the arena it lives in (all of a program's nodes are freed together).
 #pragma once
+#include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
@@ -105,9 +106,18 @@ class Arena {
     return StringView(mem, text.size());
   }
   void* allocate(uint64_t size) {
+    if (size > UINT64_MAX - 15) return nullptr;
     size = (size + 15) & ~uint64_t{15};
+    if (size > kBlock) {   // (a long string literal: a block of its own, so the current block keeps its room)
+      void* big = allocator_.allocate(size);
+      if (!big) return nullptr;
+      if (!blocks_.push_back(big)) {
+        allocator_.deallocate(big);
+        return nullptr;
+      }
+      return big;
+    }
     if (!current_ || used_ + size > kBlock) {
-      if (size > kBlock) return nullptr;
       current_ = static_cast<char*>(allocator_.allocate(kBlock));
       if (!current_ || !blocks_.push_back(current_)) return nullptr;
       used_ = 0;
