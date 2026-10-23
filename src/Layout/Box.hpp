@@ -93,6 +93,7 @@ struct Box {
   bool establishes_bfc = false;      // starts its own block formatting context (floats and overflow do not escape; margins do not collapse through)
   LayoutUnit natural_width, natural_height;   // Replaced: the size it has by itself (0 when it has none)
   bool has_natural_width = false, has_natural_height = false;
+  bool fill_width = false;           // Replaced: with no width of its own (an svg that only has a shape) it is as wide as its containing block
   uint8_t object_kind = 0;           // Replaced: a browser::ObjectKind (0: not a picture, video or canvas: an iframe or a form control)
 
   // --- tables (TableFixup.cpp sets them from the DOM; Table.cpp lays the table out)

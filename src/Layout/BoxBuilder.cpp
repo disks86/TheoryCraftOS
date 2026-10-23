@@ -240,7 +240,7 @@ class Builder {
   bool build_replaced(const dom::Node* n, const Style& s, BoxId parent) {
     ObjectKind kind = ObjectKind::None;
     int64_t natural_w = 0, natural_h = 0;
-    bool has_w = false, has_h = false;
+    bool has_w = false, has_h = false, shape_only = false;
     if (tag_in(n, {"img", "video", "audio", "canvas", "svg"}) && options_.objects) {
       browser::ObjectInfo info;
       if (options_.objects->object_info(n, &info) && info.kind != ObjectKind::None && (info.ready || info.kind != ObjectKind::Image)) {
@@ -249,6 +249,7 @@ class Builder {
         natural_h = info.height;
         has_w = info.width != 0;
         has_h = info.height != 0;
+        shape_only = info.shape_only;
       } else if (n->is_tag("img")) {   // a picture that is not there: its alternative text, if it has some
         StringView alt;
         if (dom::get_attribute(n, "alt", &alt) && !alt.empty()) {
@@ -291,6 +292,7 @@ class Builder {
     b.natural_height = LayoutUnit::from_px(natural_h);
     b.has_natural_width = has_w;
     b.has_natural_height = has_h;
+    b.fill_width = shape_only;
     // the width and height attributes say what the style does not
     int64_t attr = 0;
     if (b.style.width.is_auto() && pixel_attribute(n, "width", &attr)) b.style.width = Length::px(static_cast<int32_t>(attr > 100000 ? 100000 : attr) * 100);

@@ -32,6 +32,7 @@ struct ObjectInfo {
   ObjectKind kind = ObjectKind::None;
   uint32_t width = 0, height = 0;   // the natural size in pixels
   bool ready = false;               // the picture is there (an image that is not shows its alternative text)
+  bool shape_only = false;          // the size above is a guess that keeps the shape: the object is as wide as its container when the page gives no width (an svg with only a viewBox)
 };
 
 // What the renderer asks about an element that may be an object.
@@ -47,8 +48,8 @@ class IObjectSource {
 // What the page view asks for when a run is an object.
 class IObjectPainter {
  public:
-  // Draws the object of the element with this serial into the rectangle (absolute coordinates) on `r`; nothing outside `clip` may change, and `r`'s clip is
-  // `clip` again afterwards.
+  // Draws the object of the element with this serial into the rectangle (absolute coordinates) on `r`; nothing outside `clip` may change, and the painter must leave `r`'s
+  // clip (set_clip and the pushed entries) as it found it: `clip` is only the part to draw, not a clip to install.
   virtual void paint_object(graphics::IRenderer2D& r, uint32_t node, ObjectKind kind, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) = 0;
 
   // CSS url() pictures: background-image layers and list-style-image markers. `url` is the address as the style wrote it (unquoted, not resolved: the page

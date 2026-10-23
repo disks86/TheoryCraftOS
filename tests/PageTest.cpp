@@ -30,6 +30,7 @@
 #include "Browser/PageLayout.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Media/ImageCodecs.hpp"
+#include "Paint/DisplayPainter.hpp"
 
 using namespace browser;
 
@@ -2293,6 +2294,39 @@ static void test_history_api() {
   }
 }
 
+// A page drawn as pixels: a picture does not change the clip of what is drawn after it, and an svg that only has a shape is as wide as its container.
+static void test_picture_paint() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/red.png"] = make_picture(a, 40, 20, 0xFFFF0000u);
+    MediaEnvironment media;
+    media.width = 200;
+    media.height = 100;
+    font::FontSet fonts(a);
+    fonts.add_bundled_fonts();
+    Page page(a, env, "http://example.com/", media, false);
+    page.load("<style>body{margin:0}</style><img src=red.png style='display:block'><div style='height:30px;background:#00f'></div>"
+              "<div style='width:40px'><svg viewBox='0 0 24 24'><rect width='24' height='24' fill='#0f0'/></svg></div>");
+    PagePicture picture(a);
+    CHECK(page.render_picture(&picture, fonts));
+    media::Image image(a);
+    image.create(200, 100);
+    graphics::Surface surface = image.surface(0);
+    graphics::SoftwareRenderer2D renderer(surface, nullptr, &a);
+    renderer.set_blend(graphics::BlendMode::Replace);
+    renderer.fill_rect(graphics::Rect2D{0, 0, 200, 100}, 0xFFFFFFFFu);
+    paint::DisplayPainter painter(a, fonts, &page.objects());
+    painter.paint(renderer, picture.list, 0, 0, graphics::Rect2D{0, 0, 200, 100});
+    auto px = [&](uint32_t x, uint32_t y) { return image.frame(0)[y * 200 + x] & 0x00FFFFFFu; };
+    CHECK(px(10, 10) == 0xFF0000u);    // the picture
+    CHECK(px(150, 35) == 0x0000FFu);   // what follows it, outside its rectangle
+    CHECK(px(38, 88) == 0x00FF00u);    // the svg fills the 40 pixels of its container, not the 300 of its default
+    CHECK(px(60, 70) == 0xFFFFFFu);
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
@@ -2322,6 +2356,7 @@ int main(int argc, char** argv) {
   test_clicks_and_resize();
   test_external_and_errors();
   test_images();
+  test_picture_paint();
   test_canvas_scripts();
   test_video();
   test_audio();

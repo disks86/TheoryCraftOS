@@ -33,7 +33,7 @@
 namespace browser {
 
 // The size an <svg> asks for: its width and height attributes (pixels), else the shape of its viewBox at 300 wide, else 300 x 150.
-void svg_natural_size(const dom::Node* svg, uint32_t* width, uint32_t* height);
+void svg_natural_size(const dom::Node* svg, uint32_t* width, uint32_t* height, bool* shape_only = nullptr);
 // Draws the content of the <svg> onto `bitmap` (blank, any size): the viewBox is fitted into the bitmap. False if memory ran out.
 bool draw_svg(const dom::Node* svg, CanvasBitmap* bitmap);
 // Does this file look like an SVG (an <svg> element within its first bytes)?

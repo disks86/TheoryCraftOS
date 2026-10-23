@@ -794,11 +794,12 @@ bool parse_view_box(const dom::Node* svg, double* v) {
 
 }  // namespace
 
-void svg_natural_size(const dom::Node* svg, uint32_t* width, uint32_t* height) {
+void svg_natural_size(const dom::Node* svg, uint32_t* width, uint32_t* height, bool* shape_only) {
   double w = 0, h = 0, vb[4];
   const bool has_w = read_length(attr(svg, "width"), 300, &w) && !attr(svg, "width").trimmed().ends_with('%') && w > 0;
   const bool has_h = read_length(attr(svg, "height"), 150, &h) && !attr(svg, "height").trimmed().ends_with('%') && h > 0;
   const bool box = parse_view_box(svg, vb);
+  if (shape_only) *shape_only = !has_w && !has_h && box && vb[2] > 0;
   if (!has_w && !has_h) {
     w = box ? vb[2] : 300;
     h = box ? vb[3] : 150;

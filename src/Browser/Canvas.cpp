@@ -1004,7 +1004,6 @@ void CanvasBitmap::replay(graphics::IRenderer2D& r, int32_t ox, int32_t oy, cons
                    static_cast<int32_t>(cx0), static_cast<int32_t>(cy0));
     }
   }
-  r.set_clip(view);
 }
 
 void CanvasBitmap::flatten() {
@@ -1074,7 +1073,6 @@ void CanvasBitmap::paint(graphics::IRenderer2D& dest, int32_t x, int32_t y, uint
   s.pitch = w;
   dest.draw_image(s, {static_cast<int32_t>(vx0 - x), static_cast<int32_t>(vy0 - y), static_cast<uint32_t>(vx1 - vx0), static_cast<uint32_t>(vy1 - vy0)}, static_cast<int32_t>(vx0),
                   static_cast<int32_t>(vy0));
-  dest.set_clip(clip);
 }
 
 // --- Painting spans -----------------------------------------------------------------------------------------------------------------

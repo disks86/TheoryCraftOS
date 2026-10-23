@@ -730,7 +730,7 @@ bool PageObjects::object_info(const dom::Node* element, ObjectInfo* out) {
   if (element->is_tag("svg")) {
     out->kind = ObjectKind::Svg;
     out->ready = true;
-    svg_natural_size(element, &out->width, &out->height);
+    svg_natural_size(element, &out->width, &out->height, &out->shape_only);
     return true;
   }
   if (element->is_tag("audio")) {   // (without controls there is nothing to show)
@@ -795,7 +795,6 @@ void PageObjects::draw_scaled(graphics::IRenderer2D& r, Scaled& cache, const Ima
   r.set_blend(graphics::BlendMode::Alpha);
   r.draw_image(s, {static_cast<int32_t>(vx0 - x), static_cast<int32_t>(vy0 - y), static_cast<uint32_t>(vx1 - vx0), static_cast<uint32_t>(vy1 - vy0)}, static_cast<int32_t>(vx0),
                static_cast<int32_t>(vy0));
-  r.set_clip(clip);
 }
 
 void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {
@@ -873,7 +872,6 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
     }
     if (show_time) r.draw_text(x + static_cast<int32_t>(w) - text_w - 6, y + bar + 4, text.data(), 0xFFFFFFFFu);
   }
-  r.set_clip(clip);
 }
 
 void PageObjects::paint_object(graphics::IRenderer2D& r, uint32_t node, ObjectKind kind, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {

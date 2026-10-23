@@ -130,6 +130,9 @@ void LayoutContext::size_replaced(const Box& b, LayoutUnit* width, LayoutUnit* h
     h = ratio ? w.scaled(b.natural_height.raw(), b.natural_width.raw()) : b.has_natural_height ? b.natural_height : LayoutUnit();
   } else if (has_h) {
     w = ratio ? h.scaled(b.natural_width.raw(), b.natural_height.raw()) : b.has_natural_width ? b.natural_width : LayoutUnit();
+  } else if (b.fill_width && ratio && b.cb_width_known) {   // (only a shape, no size: as wide as the containing block, as tall as the shape says)
+    w = max(b.cb_width - b.margin.horizontal() - b.border.horizontal() - b.padding.horizontal(), LayoutUnit());
+    h = w.scaled(b.natural_height.raw(), b.natural_width.raw());
   } else {
     w = b.has_natural_width ? b.natural_width : LayoutUnit();
     h = b.has_natural_height ? b.natural_height : LayoutUnit();
