@@ -514,7 +514,25 @@ void adopt_template_contents(Document& doc) {
   }
 }
 
+// True if the page starts with a doctype (white space and comments may come before it).
+static bool starts_with_doctype(StringView html) {
+  uint64_t at = 0;
+  for (;;) {
+    while (at < html.size() && is_space(html[at])) ++at;
+    if (html.substr(at).starts_with("<!--")) {
+      const uint64_t end = html.find("-->", at + 4);
+      if (end == StringView::npos) return false;
+      at = end + 3;
+      continue;
+    }
+    break;
+  }
+  const StringView rest = html.substr(at);
+  return rest.size() >= 9 && rest.substr(0, 9).equals_ignore_case("<!doctype");
+}
+
 bool build_document(Document& doc, StringView html, IScriptRunner* scripts) {
+  doc.quirks_mode = !starts_with_doctype(html);
   TreeBuilder builder(doc, scripts, nullptr, StringView());
   const bool ok = builder.run(html);
   adopt_template_contents(doc);

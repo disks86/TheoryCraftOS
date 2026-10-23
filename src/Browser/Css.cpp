@@ -910,6 +910,13 @@ struct CssApply {
     return true;
   }
 
+  // A colour for a border: `transparent` is kept apart from the text colour (0).
+  bool parse_border_color(StringView v, uint32_t* out) const {
+    if (!parse_color(v, out)) return false;
+    if (*out == 0 && !eq(v.trimmed(), "currentcolor")) *out = kTransparentBorder;
+    return true;
+  }
+
   bool parse_color(StringView v, uint32_t* out) const {
     if (eq(v.trimmed(), "currentcolor")) { *out = style->color; return true; }
     return parse_css_color(v, out);
@@ -1007,7 +1014,7 @@ struct CssApply {
       uint32_t c;
       if (border_style_of(part, &bs)) bstyle = bs;
       else if (border_width_of(part, &w)) width = w;
-      else if (parse_color(part, &c)) color = c;
+      else if (parse_border_color(part, &c)) color = c;
     }
     for (int i = side_first; i < side_first + side_count; ++i) {
       style->border_px100[i] = width;
@@ -1364,7 +1371,7 @@ void CssApply::apply_value(Prop p, StringView value) {
       break;
     }
     case pBorderTopColor: case pBorderRightColor: case pBorderBottomColor: case pBorderLeftColor:
-      if (parse_color(value, &c)) style->border_color[p - pBorderTopColor] = c;
+      if (parse_border_color(value, &c)) style->border_color[p - pBorderTopColor] = c;
       break;
     case pFlex: {
       if (eq(value, "none")) { style->flex_grow_x100 = 0; style->flex_shrink_x100 = 0; style->flex_basis = Length(); break; }

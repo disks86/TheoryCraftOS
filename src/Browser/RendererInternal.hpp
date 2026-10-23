@@ -283,6 +283,9 @@ class DocumentRenderer {
     flush();
     Style s = derive_style(cur(), n, sheet_);
     if (s.display == Display::None) return false;
+    // (a box clipped to a pixel or two shows nothing: the "skip to content" links and screen-reader-only text of many pages)
+    if (n != box_root_ && ((s.overflow_x != Overflow::Visible && s.width.is_px() && s.width.px100 <= 200) || (s.overflow_y != Overflow::Visible && s.height.is_px() && s.height.px100 <= 200)))
+      return false;
     if (n->is_tag("iframe") && !options_.frames) return false;
     if (n->is_tag("dialog") && (!dom::has_attribute(n, "open") || ((n->form_state & dom::kFormModal) && !modal_pass_))) return false;   // (an open modal dialog is drawn first, apart)
     const bool is_body = tag_in(n, {"body", "html"});
@@ -351,7 +354,7 @@ class DocumentRenderer {
           break;
         }
       if (cell > 0 && !hidden()) {
-        chunk_.append(" | ");
+        chunk_.append("  ");
         ended_space_ = true;
       }
     } else if (tag_in(n, {"li"}) && s.display == Display::ListItem && !s.list_none && !hidden()) {
@@ -744,7 +747,13 @@ class DocumentRenderer {
     StringView border_value;
     const bool grid = dom::get_attribute(table, "border", &border_value) && !border_value.trimmed().empty() && !border_value.trimmed().equals("0");
     const uint32_t page_columns = container_cols_;
-    const uint32_t frame = grid ? ncols * 3 + 1 : (ncols - 1) * 3;
+    // Between columns: a bordered table has its rules (" | "); otherwise the columns are only set apart by blanks, none when the page took the spacing
+    // and padding off the table (cellspacing=0 cellpadding=0, as layout tables do).
+    StringView spacing, padding;
+    const bool packed = dom::get_attribute(table, "cellspacing", &spacing) && spacing.trimmed().equals("0") && dom::get_attribute(table, "cellpadding", &padding) &&
+                        padding.trimmed().equals("0");
+    const uint32_t gap = grid ? 3 : packed ? 0 : 2;
+    const uint32_t frame = grid ? ncols * 3 + 1 : (ncols - 1) * gap;
     const uint32_t room = page_columns > indent() + frame + ncols ? page_columns - indent() - frame : ncols;
     List<uint32_t> natural(a), minimum(a), width(a);
     for (uint32_t c = 0; c < ncols; ++c) {
@@ -763,8 +772,8 @@ class DocumentRenderer {
       if (c.colspan == 1) continue;
       uint32_t have_nat = 0, have_min = 0;
       for (uint32_t x = 0; x < c.colspan; ++x) have_nat += natural[c.col + x], have_min += minimum[c.col + x];
-      have_nat += 3 * (c.colspan - 1);
-      have_min += 3 * (c.colspan - 1);
+      have_nat += gap * (c.colspan - 1);
+      have_min += gap * (c.colspan - 1);
       if (c.natural > have_nat) natural[c.col + c.colspan - 1] += c.natural - have_nat;
       if (c.min_word > have_min) minimum[c.col + c.colspan - 1] += c.min_word - have_min;
     }
@@ -784,7 +793,7 @@ class DocumentRenderer {
     for (uint64_t r = 0; r < rows.count(); ++r) height.push_back(1);
     for (uint64_t i = 0; i < cells.count(); ++i) {
       Cell& c = *cells[i];
-      c.width = 3 * (c.colspan - 1);
+      c.width = gap * (c.colspan - 1);
       for (uint32_t x = 0; x < c.colspan; ++x) c.width += width[c.col + x];
       if (!wrap_cell(c, c.width ? c.width : 1)) return false;
       if (c.rowspan == 1 && c.lines() > height[c.row]) height[c.row] = c.lines();
@@ -870,7 +879,10 @@ class DocumentRenderer {
           }
           c += cell.colspan;
         }
-        if (c < ncols) table_piece(line_pieces, " | ", 0, 0, 0, 0, -1, table_node);
+        if (c < ncols) {
+          if (grid) table_piece(line_pieces, " | ", 0, 0, 0, 0, -1, table_node);
+          else table_spaces(line_pieces, gap, 0, table_node);
+        }
       }
       if (grid) table_piece(line_pieces, " |", 0, 0, 0, 0, -1, table_node);
       table_line(line_pieces, !grid);
@@ -1389,6 +1401,7 @@ class DocumentRenderer {
   bool collect_items(const dom::Node* container, const Style& inside, List<UniquePointer<Item>>* items, List<const dom::Node*>* out_of_flow, uint32_t depth);
   bool prepare_item(Item* item, const Style& inside, uint32_t content_cols);
   bool draw_text_item(const dom::Node* text, const Style& inside, uint32_t width, Raster* out);
+  uint32_t extent_ = 0;   // the widest line a box was put on this page with, its padding on the right counted (what measuring a container reads)
   uint32_t measured_min_ = 0, measured_max_ = 0;   // what a flex or grid layout found when it was measuring
   bool layout_flex(const dom::Node* n, const Style& s, uint32_t content_cols, uint32_t content_lines, Raster* out);
   bool layout_grid(const dom::Node* n, const Style& s, uint32_t content_cols, uint32_t content_lines, Raster* out);

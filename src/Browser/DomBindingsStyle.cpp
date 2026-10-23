@@ -479,7 +479,8 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     set(kWidth[i], t.view());
     set(kStyle[i], border_style_text(s.border_style[i]));
     t.clear();
-    rgb_text(s.border_color[i] ? s.border_color[i] : text_color, &t);
+    if (s.border_color[i] == kTransparentBorder) t.append("rgba(0, 0, 0, 0)");
+    else rgb_text(s.border_color[i] ? s.border_color[i] : text_color, &t);
     set(kColor[i], t.view());
     t.clear();
     length_text(s.inset[i], &t);

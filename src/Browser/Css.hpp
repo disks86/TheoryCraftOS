@@ -99,6 +99,9 @@ struct TextRef {
 constexpr uint32_t kMaxCustomScopes = 20000;
 
 // What the text of an element looks like and the box it makes. Children start from their parent's style (see inherit()).
+// What border_color holds for `transparent` (0 means the text colour; no real colour has an alpha of 0).
+constexpr uint32_t kTransparentBorder = 1;
+
 struct Style {
   // --- inherited
   uint32_t color = 0;         // text colour (inherited)
@@ -142,7 +145,7 @@ struct Style {
   Length padding[4];
   int32_t border_px100[4] = {0, 0, 0, 0};
   BorderStyle border_style[4] = {BorderStyle::None, BorderStyle::None, BorderStyle::None, BorderStyle::None};
-  uint32_t border_color[4] = {0, 0, 0, 0};     // 0: the text colour
+  uint32_t border_color[4] = {0, 0, 0, 0};     // 0: the text colour, kTransparentBorder: none (the border takes room but shows nothing)
   BoxSizing sizing = BoxSizing::ContentBox;
   Position position = Position::Static;
   Float float_side = Float::None;

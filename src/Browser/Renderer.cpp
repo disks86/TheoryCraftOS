@@ -66,6 +66,7 @@ void ua_defaults(const dom::Node* n, Style* s) {
   if (tag_in(n, {"u", "ins"})) s->underline = true;
   if (tag_in(n, {"s", "strike", "del"})) s->strike = true;
   if (tag_in(n, {"center", "caption", "th"})) s->align = 1;
+  if (n->is_tag("table") && n->owner && n->owner->quirks_mode) s->align = 0;   // (in quirks mode a table does not pass on the text alignment it is in)
   if (tag_in(n, {"a"}) && dom::has_attribute(n, "href")) s->underline = true;
   if (dom::has_attribute(n, "hidden")) s->display = Display::None;
   if (dom::get_attribute(n, "align", &value)) {

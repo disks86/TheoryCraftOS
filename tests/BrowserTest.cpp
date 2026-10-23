@@ -110,21 +110,24 @@ static bool layout_is(const char* html, uint32_t columns, const char* expected) 
 }
 
 static void test_tables() {
+  // columns are only set apart by blanks (none when the page took the spacing and padding off); the rules belong to bordered tables
+  CHECK(page_is("<table cellspacing=0 cellpadding=0><tr><td>ab</td><td>cd</td></tr></table>", 40, "abcd"));
+  CHECK(page_is("<table border=1><tr><td>a</td><td>b</td></tr></table>", 40, "+---+---+\n| a | b |\n+---+---+"));
   // columns line up, the last one is not padded
-  CHECK(page_is("<table><tr><td>a</td><td>longer</td></tr><tr><td>bbb</td><td>c</td></tr></table>", 40, "a   | longer\nbbb | c"));
+  CHECK(page_is("<table><tr><td>a</td><td>longer</td></tr><tr><td>bbb</td><td>c</td></tr></table>", 40, "a    longer\nbbb  c"));
   // headers are centred; the header, body and foot come in that order wherever they are written
   CHECK(page_is("<table><tfoot><tr><td>f</td></tr></tfoot><tbody><tr><td>b</td></tr></tbody><thead><tr><th>head</th></tr></thead></table>", 40, "head\nb\nf"));
-  CHECK(page_is("<table><tr><th>ab</th><th>cd</th></tr><tr><td>xxxxxx</td><td>y</td></tr></table>", 40, "  ab   | cd\nxxxxxx | y"));
+  CHECK(page_is("<table><tr><th>ab</th><th>cd</th></tr><tr><td>xxxxxx</td><td>y</td></tr></table>", 40, "  ab    cd\nxxxxxx  y"));
   // colspan and rowspan
-  CHECK(page_is("<table><tr><td colspan=2>wide cell</td></tr><tr><td>a</td><td>b</td></tr></table>", 40, "wide cell\na | b"));
-  CHECK(page_is("<table><tr><td rowspan=2>x</td><td>1</td></tr><tr><td>2</td></tr></table>", 40, "x | 1\n  | 2"));
+  CHECK(page_is("<table><tr><td colspan=2>wide cell</td></tr><tr><td>a</td><td>b</td></tr></table>", 40, "wide cell\na  b"));
+  CHECK(page_is("<table><tr><td rowspan=2>x</td><td>1</td></tr><tr><td>2</td></tr></table>", 40, "x  1\n   2"));
   // a caption is above the table
   CHECK(page_is("<table><caption>Title</caption><tr><td>a</td></tr></table>", 9, "  Title\n\na"));
   // a border draws the lines
   CHECK(page_is("<table border=1><tr><td>a</td><td>bb</td></tr><tr><td>c</td><td>d</td></tr></table>", 40,
                 "+---+----+\n| a | bb |\n+---+----+\n| c | d  |\n+---+----+"));
   // valign
-  CHECK(page_is("<table><tr><td>1<br>2<br>3</td><td valign=middle>m</td><td valign=bottom>b</td></tr></table>", 40, "1 |   |\n2 | m |\n3 |   | b"));
+  CHECK(page_is("<table><tr><td>1<br>2<br>3</td><td valign=middle>m</td><td valign=bottom>b</td></tr></table>", 40, "1\n2  m\n3     b"));
   // links and bold inside cells keep what they are
   {
     TestAllocator a;
@@ -138,9 +141,9 @@ static void test_tables() {
     CHECK(link && bold);
   }
   // a nested table
-  CHECK(page_is("<table><tr><td><table><tr><td>a</td><td>b</td></tr></table></td><td>c</td></tr></table>", 40, "a | b | c"));
+  CHECK(page_is("<table><tr><td><table><tr><td>a</td><td>b</td></tr></table></td><td>c</td></tr></table>", 40, "a  b  c"));
   // pictures in a cell: the table flows as it did
-  CHECK(page_is("<table><tr><td>1</td><td>2</td></tr></table>", 40, "1 | 2"));
+  CHECK(page_is("<table><tr><td>1</td><td>2</td></tr></table>", 40, "1  2"));
 }
 
 static void test_text() {
@@ -173,7 +176,7 @@ static void test_blocks() {
   CHECK(page_is("a<hr>b", 40, "a\n\n---\n\nb"));
   CHECK(page_is("a<blockquote>q</blockquote>b", 40, "a\n\n    q\n\nb"));
   CHECK(page_is("<pre>\n  x = 1;\n\n  y = 2;\n</pre>after", 40, "  x = 1;\n\n  y = 2;\n\nafter"));
-  CHECK(page_is("<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>", 40, "A | B\n1 | 2"));
+  CHECK(page_is("<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>", 40, "A  B\n1  2"));
   CHECK(page_is("<p>x</p><script>1</script><noscript>no</noscript><p>y</p>", 40, "x\n\ny"));
 }
 
@@ -520,6 +523,19 @@ static void test_css_more_layout() {
   CHECK(layout_is("<p style='text-transform:capitalize'>hello big-world x</p>", 20, "Hello Big-World X"));
   CHECK(layout_is("<div><span style='display:inline-block;width:40px;border:1px solid'>a</span> <span style='display:inline-block;width:40px;border:1px solid'>b</span></div>", 30,
                   "+-----+ +-----+\n|a    | |b    |\n+-----+ +-----+"));
+  // a centred inline-block (Google's "Sign in" button) is as wide as its text, not as wide as the line
+  CHECK(layout_is("<div><a style='display:inline-block;border:1px solid;text-align:center'>Sign in</a></div>", 40, "+-------+\n|Sign in|\n+-------+"));
+  // an inline-block with margins inside a flex item keeps the width of its text (its right margin may hang out of the item)
+  CHECK(layout_is("<div style='display:flex'><div><a style='display:inline-block;border:1px solid;margin:0 16px 0 10px'>Sign in</a></div></div>", 40, " +-------+\n |Sign in|\n +-------+"));
+  // a box with padding only on the right is as wide as its content plus that padding when a flex item is measured, so its inline boxes stay on one line
+  CHECK(layout_is("<style>.i{display:inline-block;padding-left:8px}</style><div style='display:flex'><div><div style='padding-right:16px'><span class=i>ab</span><span class=i>cd</span></div></div></div>", 40,
+                  " ab cd"));
+  // a float does not apply to the items of a flex container
+  CHECK(layout_is("<div style='display:flex'><div>ab</div><div style='float:right'>cd</div></div>", 40, "abcd"));
+  // <body> is a box like any other: a width limit and automatic margins centre it
+  CHECK(layout_is("<!doctype html><body style='margin:0;max-width:96px;margin-left:auto;margin-right:auto;text-align:center'>hi", 40, "                   hi"));
+  // without a doctype a table does not take the text alignment of the <center> it is in; with one it does
+  CHECK(layout_is("<center><table><tr><td>abc</td></tr><tr><td>d</td></tr></table></center>", 20, "abc\nd"));
   CHECK(layout_is("<div style='float:left;width:40px;border:1px solid'>L</div><p>text wraps beside the float for a while until it ends here</p><p>second</p>", 30,
                   "+-----+ text wraps beside the\n|L    | float for a while\n+-----+ until it ends here\n\nsecond"));
   CHECK(layout_is("<div style='float:right;width:40px'>R</div>left text goes here<div style='clear:both'>cleared</div>", 30, "left text goes here      R\ncleared"));

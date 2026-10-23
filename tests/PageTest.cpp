@@ -1530,7 +1530,7 @@ static void test_table_wrap() {
   media.height = 400;
   Page page(a, env, "http://example.com/", media, true);
   page.load("<html><body><table><tr><td>one two three four</td><td>x</td></tr></table></body></html>");
-  CHECK(page_text(page, 16) == "one two      | x\nthree four   |");
+  CHECK(page_text(page, 16) == "one two three  x\nfour");
 }
 
 static void test_forms() {

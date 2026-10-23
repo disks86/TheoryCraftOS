@@ -95,6 +95,8 @@ class Document {
 
   allocators::IAllocator& allocator() const { return allocator_; }
   Node* root() const { return root_; }                  // the Document node
+  // True for a page read without a doctype: it is laid out the way old pages expect (a table does not take its text alignment from what it is in).
+  bool quirks_mode = false;
   Node* document_element() const;                       // <html>
   Node* head() const;
   Node* body() const;

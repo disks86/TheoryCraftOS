@@ -81,7 +81,7 @@ DocumentRenderer::LinePiece DocumentRenderer::copy_piece(allocators::IAllocator&
 bool DocumentRenderer::wants_box(const dom::Node* n, const Style& s) const {
   if (s.display == Display::None || s.display == Display::ListItem) return false;
   if (s.display == Display::Inline && !s.inline_box) return false;
-  if (tag_in(n, {"html", "body", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup", "col", "img", "video", "audio", "canvas", "svg", "input", "textarea",
+  if (tag_in(n, {"html", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup", "col", "img", "video", "audio", "canvas", "svg", "input", "textarea",
                  "select", "button", "progress", "meter", "iframe", "br", "hr", "option", "optgroup", "dialog", "details", "summary"}))
     return false;
   const Edges e = edges_of(s);
@@ -159,7 +159,7 @@ bool DocumentRenderer::fit_document(const HtmlDocument& d, uint32_t width, uint3
         lp.color = run.color;
         used = width;
       } else if (run.object) {
-        const char* label = run.object == 2 ? "[video]" : run.object == 3 ? "[canvas]" : run.object == 4 ? "[audio]" : "[image]";
+        const char* label = run.object == 2 ? "[video]" : run.object == 3 ? "[canvas]" : run.object == 4 ? "[audio]" : run.object == 5 ? "" : "[image]";   // (an icon drawn by an <svg> inside a box has no text to stand in for it)
         if (piece.from == 0) lp.text.assign(label);
         while (lp.text.size() < piece.length) lp.text.push_back(' ');
         if (lp.text.size() > piece.length) lp.text.truncate(piece.length);
@@ -237,8 +237,9 @@ void DocumentRenderer::decorate(Raster* r, const Style& s, const Edges& e, uint3
   };
   auto edge_piece = [&](char c, uint32_t count, int side) {
     LinePiece p(a);
-    for (uint32_t i = 0; i < count; ++i) p.text.push_back(c);
-    p.color = s.border_color[side] ? s.border_color[side] : ink;
+    const bool invisible = s.border_color[side] == kTransparentBorder;   // (a transparent border is room, not lines)
+    for (uint32_t i = 0; i < count; ++i) p.text.push_back(invisible ? ' ' : c);
+    p.color = s.border_color[side] && !invisible ? s.border_color[side] : ink;
     return p;
   };
   auto close = [&]() { failed_ |= !out.ends.push_back(static_cast<uint32_t>(out.pieces.count())); };
@@ -295,7 +296,12 @@ void DocumentRenderer::emit_raster(Raster& r, uint32_t left, uint32_t break_befo
   List<LinePiece> row(a);
   for (uint32_t line = 0; line < r.lines() && !failed_; ++line) {
     if (left > 0) table_spaces(row, left, 0, 0);
-    for (uint32_t i = line ? r.ends[line - 1] : 0; i < r.ends[line]; ++i) failed_ |= !row.push_back(util::move(r.pieces[i]));
+    uint32_t drawn = left;
+    for (uint32_t i = line ? r.ends[line - 1] : 0; i < r.ends[line]; ++i) {
+      drawn += static_cast<uint32_t>(r.pieces[i].text.size());
+      failed_ |= !row.push_back(util::move(r.pieces[i]));
+    }
+    if (drawn > extent_) extent_ = drawn;   // (before the blanks at the end go: a box's right padding is part of its width)
     // plain spaces at the end go (shaded or coloured ones stay: they are the box)
     while (row.count() > 0) {
       LinePiece& last = row[row.count() - 1];
@@ -312,7 +318,9 @@ void DocumentRenderer::emit_raster(Raster& r, uint32_t left, uint32_t break_befo
 bool DocumentRenderer::build_box(const dom::Node* n, const Style& s, uint32_t avail, uint32_t outer_width, uint32_t min_outer_lines, Raster* out) {
   const Edges e = edges_of(s);
   const uint32_t ml = cols_of(s.margin[3]), mr = cols_of(s.margin[1]);
-  const uint32_t room = avail > ml + mr + 1 ? avail - ml - mr : 1;
+  // (an inline box may hang its right margin out of a container that was measured without it: the container's width is the text's, the margin is blank)
+  const uint32_t right_margin = s.inline_box ? 0 : mr;
+  const uint32_t room = avail > ml + right_margin + 1 ? avail - ml - right_margin : 1;
   uint32_t outer = outer_width;
   const uint32_t horizontal = e.horizontal();
   auto outer_of = [&](const Length& l) -> uint32_t {   // a width as an outer width
@@ -403,13 +411,17 @@ bool DocumentRenderer::measure_box(const dom::Node* n, const Style& s, uint32_t 
   const uint32_t wide = kWide;
   UniquePointer<HtmlDocument> doc = UniquePointer<HtmlDocument>::make(a, a);
   Style inside = inside_style(s, wide);
+  inside.align = 0;   // (centred or right-aligned lines are padded out to the wide measuring width, which would make every box as wide as that)
+  inside.justify = false;
   bool ok = true;
-  uint32_t longest_line = 0, longest_word = 0;
+  uint32_t longest_line = 0, longest_word = 0, extent = 0;
   if (!doc) ok = false;
   else {
     DocumentRenderer sub(*doc, sheet_, options_);
     sub.root_ = cur().inherit();
     sub.root_.indent = 0;
+    sub.root_.align = 0;
+    sub.root_.justify = false;
     sub.root_.content_px = static_cast<int32_t>(wide) * 8;
     sub.container_cols_ = wide;
     sub.box_root_ = n;
@@ -421,6 +433,7 @@ bool DocumentRenderer::measure_box(const dom::Node* n, const Style& s, uint32_t 
     sub.walk(n);
     sub.finish();
     ok = !sub.failed_;
+    extent = sub.extent_;
     if (ok) {
       Raster r(a);
       ok = fit_document(*doc, wide * 4, 0, &r);   // (so wide that nothing is padded)
@@ -449,6 +462,7 @@ bool DocumentRenderer::measure_box(const dom::Node* n, const Style& s, uint32_t 
   }
   measuring_ = saved;
   if (!ok) return false;
+  if (extent > longest_line) longest_line = extent;
   *max_content = longest_line < 1 ? 1 : longest_line > avail ? avail : longest_line;
   *min_content = longest_word < 1 ? 1 : longest_word > *max_content ? *max_content : longest_word;
   return true;
@@ -678,6 +692,8 @@ bool DocumentRenderer::collect_items(const dom::Node* container, const Style& in
       item->style.background_block = cs.display != Display::Inline;
     }
     if (item->style.display == Display::Inline) item->style.display = Display::Block;   // (items are blockified)
+    item->style.float_side = Float::None;   // (a float does not apply to the item of a flex or grid container)
+    item->style.clear = Clear::None;
     failed_ |= !items->push_back(util::move(item));
   }
   return !failed_;
