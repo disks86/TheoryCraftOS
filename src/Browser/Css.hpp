@@ -249,6 +249,8 @@ class StyleSheet {
   // Adds the rules of a stylesheet (later ones win over earlier ones of the same specificity); @media rules apply when `env` satisfies their query. False
   // if memory ran out.
   bool parse(StringView css, const MediaEnvironment& env = MediaEnvironment());
+  // The rules read from now on belong to a shadow tree (the serial of its root; 0: the document): they apply to what is in that tree, and to its host through :host.
+  void set_scope(uint32_t shadow_root_serial) { scope_ = shadow_root_serial; }
   void clear();
   uint32_t rule_count() const { return static_cast<uint32_t>(rules_.count()); }
   // Does a rule depend on the pointer (:hover, :active, :focus-within)? Then the page is drawn again when the pointer moves on to another element.
@@ -280,6 +282,7 @@ class StyleSheet {
   };
   struct Rule {
     uint32_t first_declaration, declaration_count, order;
+    uint32_t scope = 0;   // 0: a rule of the document; otherwise the serial of the shadow root whose <style> it came from
   };
   struct Scope {
     uint32_t parent;           // the scope this one adds to
@@ -298,6 +301,8 @@ class StyleSheet {
 
   allocators::IAllocator& allocator_;
   bool pointer_state_ = false;
+  uint32_t scope_ = 0;
+  bool rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope) const;
   String pool_;
   dom::SelectorSet selectors_;
   const MediaEnvironment* env_ = nullptr;

@@ -19,6 +19,8 @@
 #include "Browser/Page.hpp"
 #include "Browser/Url.hpp"
 #include "Browser/WebPrelude.hpp"
+#include "Script/TypedArray.hpp"
+#include "Utility/ByteText.hpp"
 #include "Dom/Form.hpp"
 #include "Dom/HtmlBuilder.hpp"
 #include "Browser/Objects.hpp"
@@ -1571,6 +1573,18 @@ uint32_t Page::worker_start(StringView source, StringView url, StringView name, 
     WorkerRuntime* w = static_cast<WorkerRuntime*>(v.user());
     String text(w->page.allocator_);
     if (w->page.env_.fetch_text(address->view(), 1u << 20, &text)) *result = Value::make_string(v.new_string(text.view()));
+    return true;
+  }, 1);
+  vm.define_native(vm.global(), "__bytes_to_string", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {   // (TextDecoder)
+    ArrayView<uint8_t> bytes;
+    if (argc == 0 || !script::typed_array_bytes(args[0], &bytes)) return v.throw_error(script::ErrorKind::TypeError, "The provided value is not a byte array.");
+    *result = Value::make_string(v.new_string(bytes_as_text(ConstByteView(bytes.data(), bytes.size()))));
+    return true;
+  }, 1);
+  vm.define_native(vm.global(), "__string_to_bytes", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {   // (TextEncoder)
+    script::JsString* text;
+    if (argc == 0 || !v.to_string(args[0], &text)) return false;
+    *result = Value::make_object(script::new_typed_array(v, script::ArrayKind::Uint8, text->view()));
     return true;
   }, 1);
   vm.define_named(vm.global(), "__worker_url", Value::make_string(vm.new_string(url)), 0);

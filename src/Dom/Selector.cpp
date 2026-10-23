@@ -70,6 +70,7 @@ void SelectorSet::clear() {
 uint32_t SelectorSet::tag(uint32_t i) const { return selectors_[tops_[i]].tag; }
 uint32_t SelectorSet::specificity(uint32_t i) const { return selectors_[tops_[i]].specificity; }
 uint8_t SelectorSet::pseudo(uint32_t i) const { return selectors_[tops_[i]].pseudo; }
+bool SelectorSet::uses_host(uint32_t i) const { return selectors_[tops_[i]].host; }
 
 // --- Reading selectors -------------------------------------------------------------------------------------------
 
@@ -556,7 +557,10 @@ class SelectorSet::Reader {
 bool SelectorSet::parse(StringView text, uint32_t tag, uint32_t* added, bool forgiving) {
   Reader reader(*this, text, tag);
   bool syntax = true;
+  const uint64_t before = tops_.count();
   const bool ok = reader.top(added, &syntax, forgiving);
+  if (text.contains(":host"))
+    for (uint64_t i = before; i < tops_.count(); ++i) selectors_[tops_[i]].host = true;
   return ok && syntax;
 }
 

@@ -203,7 +203,7 @@ void fill_event(DomBindings::Impl& c, JsObject* e, StringView type, const EventI
   vm.define_named(e, "srcElement", Value::make_null());
   vm.define_named(e, "bubbles", bool_value(init.bubbles));
   vm.define_named(e, "cancelable", bool_value(init.cancelable));
-  vm.define_named(e, "composed", bool_value(false));
+  vm.define_named(e, "composed", bool_value(trusted));   // (events the browser makes cross the borders of shadow trees; the ones scripts make do not unless they say so)
   vm.define_named(e, "defaultPrevented", bool_value(false));
   vm.define_named(e, "eventPhase", num_value(0));
   vm.define_named(e, "isTrusted", bool_value(trusted));
@@ -352,6 +352,26 @@ bool invoke(DomBindings::Impl& c, dom::Node* node, JsObject* current, StringView
   JsObject* e = event.as_object();
   vm.define_named(e, "currentTarget", Value::make_object(current));
   vm.define_named(e, "eventPhase", num_value(phase == Phase::Capture ? 1 : phase == Phase::Bubble ? 3 : 2));
+  {   // what a listener outside a shadow tree sees as the target is the host of the tree the event came from
+    Value original;
+    if (vm.get_plain(e, vm.intern("__orig"), &original)) {
+      dom::Node* t = DomBindings::unwrap(original);
+      dom::Node* seen = t;
+      for (int guard = 0; seen && guard < 16; ++guard) {
+        dom::Node* root = seen;
+        while (root->parent) root = root->parent;
+        if (root->shadow_host && !(node && dom::contains(root, node))) seen = root->shadow_host;
+        else break;
+      }
+      if (t && seen != t) {
+        vm.define_named(e, "target", node_value(c, seen));
+        vm.define_named(e, "srcElement", node_value(c, seen));
+      } else if (t) {
+        vm.define_named(e, "target", original);
+        vm.define_named(e, "srcElement", original);
+      }
+    }
+  }
   // the handler property / attribute runs with the non-capturing listeners
   if (phase == Phase::Target || phase == Phase::Bubble) {
     Value handler;
@@ -409,10 +429,16 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
     report_error(c, "dispatchEvent");
     return true;
   }
-  // the path from the target out to the window
+  // the path from the target out to the window (an event that is not composed stops at the root of the shadow tree it started in)
+  Value composed_value;
+  vm.get_named(event, "composed", &composed_value);
+  const bool composed = Vm::to_boolean(composed_value);
   List<dom::Node*> nodes(vm.allocator());
   if (!target_is_window)
-    for (dom::Node* n = target; n && nodes.count() < 4096; n = dom::event_parent(n)) nodes.push_back(n);
+    for (dom::Node* n = target; n && nodes.count() < 4096; n = dom::event_parent(n)) {
+      nodes.push_back(n);
+      if (!composed && !n->parent && n->shadow_host) break;
+    }
   JsObject* path = vm.new_array(static_cast<uint32_t>(nodes.count()) + 1);
   if (object_target) vm.array_push(path, Value::make_object(object_target));   // (a script object that is an event target: it is the whole path)
   for (uint64_t i = 0; i < nodes.count(); ++i) vm.array_push(path, node_value(c, nodes[i]));
@@ -420,6 +446,7 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
   const bool to_window = target_is_window || (nodes.count() && nodes[nodes.count() - 1]->type == dom::NodeType::Document);
   if (to_window) vm.array_push(path, Value::make_object(vm.global()));
   vm.define(e, vm.intern("__path"), Value::make_object(path), 0);
+  vm.define(e, vm.intern("__orig"), path->length ? path->items[0] : Value::make_null(), 0);
   vm.define(e, vm.intern("__stop"), bool_value(false), 0);
   vm.define(e, vm.intern("__stopi"), bool_value(false), 0);
   vm.define_named(e, "target", path->length ? path->items[0] : Value::make_null());
@@ -448,6 +475,10 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
   }
   vm.define_named(e, "currentTarget", Value::make_null());
   vm.define_named(e, "eventPhase", num_value(0));
+  if (path->length) {
+    vm.define_named(e, "target", path->items[0]);
+    vm.define_named(e, "srcElement", path->items[0]);
+  }
   Value dp;
   vm.get_named(event, "defaultPrevented", &dp);
   *prevented = Vm::to_boolean(dp);

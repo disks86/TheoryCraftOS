@@ -52,6 +52,7 @@ class SelectorSet {
   uint32_t specificity(uint32_t i) const;
   // 0 for an ordinary selector, 1 for ::before, 2 for ::after, 3 for ::marker (the element it matches is the one the pseudo-element belongs to).
   uint8_t pseudo(uint32_t i) const;
+  bool uses_host(uint32_t i) const;
   // Does the i-th selector match? A selector with a pseudo-element matches only with `with_pseudo` (the style rules ask this way).
   bool matches(uint32_t i, const Node* element, const Node* scope = nullptr, bool with_pseudo = false) const;
   // Does any selector match?
@@ -80,6 +81,7 @@ class SelectorSet {
     uint32_t first_compound, compound_count, specificity, tag;
     bool inner;
     uint8_t pseudo;
+    bool host = false;   // written with :host (it is meant for the host of a shadow tree)
   };
   class Reader;
   friend class Reader;

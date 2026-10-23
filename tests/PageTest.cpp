@@ -1800,6 +1800,24 @@ static void test_shadow_rendering() {
     CHECK(title >= 0 && doc.run(static_cast<uint64_t>(title)).color == 0xFF0000FF);   // (the span inherits :host { color: blue } through the slot)
     CHECK(body >= 0 && doc.run(static_cast<uint64_t>(body)).color == 0xFFFF0000);
   }
+  {   // the styles of the document do not reach into a shadow tree, and the styles of a shadow tree stay in it
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><head><style>p { color: red } .mark { color: lime }</style></head><body><p>outside</p><x-box></x-box><script>var r = document.querySelector('x-box').attachShadow({ mode: 'open' });"
+              "r.innerHTML = '<style>.mark { color: blue }</style><p>inside</p><span class=mark>marked</span>';</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    int outside = -1, inside = -1, marked = -1;
+    for (uint64_t i = 0; i < doc.run_count(); ++i) {
+      if (doc.run_text(i).equals("outside")) outside = static_cast<int>(i);
+      if (doc.run_text(i).equals("inside")) inside = static_cast<int>(i);
+      if (doc.run_text(i).equals("marked")) marked = static_cast<int>(i);
+    }
+    CHECK(outside >= 0 && doc.run(static_cast<uint64_t>(outside)).color == 0xFFFF0000);
+    CHECK(inside >= 0 && doc.run(static_cast<uint64_t>(inside)).color == 0);                   // (p { color: red } of the page does not apply)
+    CHECK(marked >= 0 && doc.run(static_cast<uint64_t>(marked)).color == 0xFF0000FF);          // (.mark of the shadow tree, not the page's)
+  }
 }
 
 static void test_url() {
@@ -2128,6 +2146,21 @@ static void test_messaging() {
   CHECK(async_is("var clicks = []; var host = document.createElement('div'); document.body.appendChild(host); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<button id=b>go</button>';"
                  "document.addEventListener('click', function (e) { clicks.push('document'); }); host.addEventListener('click', function () { clicks.push('host'); }); root.getElementById('b').addEventListener('click', function () { clicks.push('button'); });"
                  "root.getElementById('b').click(); console.log(clicks.join());", "button,host,document", nullptr, "https://app.example/"));
+  // crypto.subtle
+  CHECK(async_is("function hex(buffer) { return Array.from(new Uint8Array(buffer)).map(function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join(''); }"
+                 "crypto.subtle.digest('SHA-256', new TextEncoder().encode('abc')).then(function (d) { console.log(hex(d)); return crypto.subtle.digest({ name: 'sha-1' }, new TextEncoder().encode('abc')); }).then(function (d) { console.log(hex(d)); });",
+                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad | a9993e364706816aba3e25717850c26c9cd0d89d", nullptr, "https://app.example/"));
+  CHECK(async_is("function hex(buffer) { return Array.from(new Uint8Array(buffer)).map(function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join(''); }"
+                 "var enc = new TextEncoder(); crypto.subtle.importKey('raw', enc.encode('key'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']).then(function (key) {"
+                 "return crypto.subtle.sign('HMAC', key, enc.encode('The quick brown fox jumps over the lazy dog')).then(function (mac) { console.log(hex(mac)); return crypto.subtle.verify('HMAC', key, mac, enc.encode('The quick brown fox jumps over the lazy dog')); }); }).then(function (ok) { console.log(ok); });",
+                 "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8 | true", nullptr, "https://app.example/"));
+  CHECK(async_is("var a = crypto.getRandomValues(new Uint8Array(16)); var r = ''; try { crypto.subtle.digest('MD5', new Uint8Array(1)).catch(function (e) { console.log(a.length, e.name, crypto.randomUUID().length, typeof crypto.subtle.encrypt); }); } catch (e) { r = e.name; }", "16 NotSupportedError 36 undefined", nullptr, "https://app.example/"));
+  // IndexedDB
+  CHECK(async_is("var open = indexedDB.open('shop', 1); open.onupgradeneeded = function () { var db = open.result; var s = db.createObjectStore('items', { keyPath: 'id' }); s.createIndex('byName', 'name', { unique: false }); s.add({ id: 1, name: 'pen' }); s.add({ id: 2, name: 'ink' }); };"
+                 "open.onsuccess = function () { var db = open.result; var tx = db.transaction('items', 'readwrite'); var st = tx.objectStore('items'); st.put({ id: 3, name: 'cap' }); var all = st.getAll(); var by = st.index('byName').get('ink');"
+                 "tx.oncomplete = function () { console.log(db.name, db.version, all.result.length, by.result.id, db.objectStoreNames.contains('items')); }; };", "shop 1 3 2 true", nullptr, "https://app.example/"));
+  CHECK(async_is("var open = indexedDB.open('c', 1); open.onupgradeneeded = function () { var s = open.result.createObjectStore('n', { autoIncrement: true }); s.add('a'); s.add('b'); s.add('c'); };"
+                 "open.onsuccess = function () { var seen = []; var cur = open.result.transaction('n').objectStore('n').openCursor(IDBKeyRange.lowerBound(2)); cur.onsuccess = function () { var c = cur.result; if (c) { seen.push(c.key + c.value); c.continue(); } else console.log(seen.join()); }; };", "2b,3c", nullptr, "https://app.example/"));
   // Web Workers
   CHECK(async_is("var src = 'onmessage = function (e) { postMessage({ doubled: e.data.n * 2, tag: typeof self, name: self.name }); };'; var w = new Worker(URL.createObjectURL(new Blob([src])), { name: 'calc' });"
                  "w.onmessage = function (e) { console.log(e.data.doubled, e.data.tag, e.data.name, e instanceof MessageEvent); w.terminate(); }; w.postMessage({ n: 21 });", "42 object calc true", nullptr, "https://app.example/"));
@@ -2136,9 +2169,18 @@ static void test_messaging() {
   CHECK(async_is("var src = 'throw new Error(\"worker broke\");'; var w = new Worker(URL.createObjectURL(new Blob([src]))); w.onerror = function (e) { console.log('error:', e.message); w.terminate(); };", "error: Error: worker broke", nullptr, "https://app.example/"));
   CHECK(async_is("var w = new Worker(URL.createObjectURL(new Blob(['onmessage = function (e) { postMessage(\"first\"); close(); };']))); var got = []; w.onmessage = function (e) { got.push(e.data); }; w.postMessage(1); w.postMessage(2);"
                  "setTimeout(function () { console.log(got.join(), typeof w.terminate); }, 80);", "first function", nullptr, "https://app.example/"));
+  CHECK(async_is("var src = 'onmessage = function (e) { var bytes = new TextEncoder().encode(e.data); postMessage([bytes.length, new TextDecoder().decode(bytes), btoa(\"hello\"), atob(\"aGVsbG8=\"), typeof fetch]); };'; var w = new Worker(URL.createObjectURL(new Blob([src])));"
+                 "w.onmessage = function (e) { console.log(JSON.stringify(e.data)); w.terminate(); }; w.postMessage('héllo');", "[6,\"héllo\",\"aGVsbG8=\",\"hello\",\"function\"]", nullptr, "https://app.example/"));
   CHECK(async_is("var r = []; try { new Worker('https://other.example/w.js'); } catch (e) { r.push(e.name); } try { new Worker(); } catch (e) { r.push(e.name); } console.log(r.join());", "SecurityError,TypeError", nullptr, "https://app.example/"));
   CHECK(async_is("var src = 'var n = 0; onmessage = function () { n++; postMessage(n + \":\" + (typeof importScripts) + \":\" + typeof Promise + \":\" + [1, 2, 3].map(function (x) { return x * 2; }).join(\"\")); };'; var w = new Worker(URL.createObjectURL(new Blob([src])));"
                  "var seen = []; w.onmessage = function (e) { seen.push(e.data); if (seen.length === 2) { console.log(seen.join('|')); w.terminate(); } }; w.postMessage(0); w.postMessage(0);", "1:function:function:246|2:function:function:246", nullptr, "https://app.example/"));
+  // shadow trees: events and styles
+  CHECK(async_is("var host = document.createElement('div'); document.body.appendChild(host); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<button id=b>go</button>'; var b = root.getElementById('b'); var seen = [];"
+                 "document.addEventListener('click', function (e) { seen.push('doc:' + (e.target === host)); }); host.addEventListener('click', function (e) { seen.push('host:' + (e.target === host)); }); root.addEventListener('click', function (e) { seen.push('root:' + (e.target === b)); }); b.addEventListener('click', function (e) { seen.push('btn:' + (e.target === b)); });"
+                 "b.click(); console.log(seen.join());", "btn:true,root:true,host:true,doc:true", nullptr, "https://app.example/"));
+  CHECK(async_is("var host = document.createElement('div'); document.body.appendChild(host); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<i id=i></i>'; var seen = [];"
+                 "host.addEventListener('ping', function () { seen.push('host'); }); root.addEventListener('ping', function () { seen.push('root'); }); document.addEventListener('ping', function () { seen.push('doc'); });"
+                 "root.getElementById('i').dispatchEvent(new Event('ping', { bubbles: true })); root.getElementById('i').dispatchEvent(new Event('ping', { bubbles: true, composed: true })); console.log(seen.join());", "root,root,host,doc", nullptr, "https://app.example/"));
   // WebSocket
   CHECK(async_is("var log = []; var ws = new WebSocket('wss://sock.example/echo', ['chat', 'v2']); log.push(ws.readyState); ws.onopen = function () { log.push('open:' + ws.readyState + ':' + ws.protocol); ws.send('hi'); ws.send(new Uint8Array([1, 2])); };"
                  "ws.onmessage = function (e) { log.push(typeof e.data === 'string' ? e.data : (e.data instanceof Blob ? 'blob' : 'other')); if (log.length >= 4) ws.close(1000, 'bye'); };"

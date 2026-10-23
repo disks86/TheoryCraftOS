@@ -19,6 +19,7 @@
 // The network and text natives of the DOM bindings: URL (a host object over WebUrl), the requests behind fetch() and XMLHttpRequest (the page's JavaScript side is
 // in WebPrelude.cpp), and the helpers for bytes and UTF-8 text that Blob, TextEncoder, TextDecoder and URLSearchParams use.
 #include "Browser/DomBindingsInternal.hpp"
+#include "Crypto/Crypto.hpp"
 #include "Script/TypedArray.hpp"
 #include "Utility/ByteText.hpp"
 #include "Browser/WebUrl.hpp"
@@ -201,6 +202,39 @@ NATIVE(net_send) {
   if (!vm.get_named(Value::make_object(vm.global()), "__net_run", &runner)) return false;
   const Value task_args[2] = {args[0], args[1]};
   *result = num_value(vm.add_timer(runner, 0, -1, task_args, 2));
+  return true;
+}
+
+// --- crypto.subtle: __crypto_hash(kind, bytes) and __crypto_hmac(kind, key, bytes) give the digest as a byte array (kind 1 SHA-1, 2 SHA-256, 3 SHA-384, 4 SHA-512)
+bool crypto_kind(Vm& vm, const Value& v, crypto::HashKind* kind) {
+  double d;
+  if (!vm.to_number(v, &d)) return false;
+  switch (static_cast<int>(d)) {
+    case 1: *kind = crypto::HashKind::Sha1; return true;
+    case 2: *kind = crypto::HashKind::Sha256; return true;
+    case 3: *kind = crypto::HashKind::Sha384; return true;
+    case 4: *kind = crypto::HashKind::Sha512; return true;
+  }
+  return vm.throw_error(ErrorKind::TypeError, "Unrecognized hash algorithm");
+}
+NATIVE(crypto_hash) {
+  crypto::HashKind kind;
+  ArrayView<uint8_t> data;
+  if (!crypto_kind(vm, arg_at(args, argc, 0), &kind)) return false;
+  if (!typed_array_bytes(arg_at(args, argc, 1), &data)) return vm.throw_error(ErrorKind::TypeError, "The data must be an ArrayBuffer or a view of one");
+  uint8_t out[crypto::kMaxHashSize];
+  crypto::hash(kind, ConstByteView(data.data(), data.size()), out);
+  *result = Value::make_object(make_byte_array(impl(vm), bytes_as_text(ConstByteView(out, crypto::hash_size(kind)))));
+  return true;
+}
+NATIVE(crypto_hmac) {
+  crypto::HashKind kind;
+  ArrayView<uint8_t> key, data;
+  if (!crypto_kind(vm, arg_at(args, argc, 0), &kind)) return false;
+  if (!typed_array_bytes(arg_at(args, argc, 1), &key) || !typed_array_bytes(arg_at(args, argc, 2), &data)) return vm.throw_error(ErrorKind::TypeError, "The key and the data must be ArrayBuffers or views of one");
+  uint8_t out[crypto::kMaxHashSize];
+  crypto::hmac(kind, ConstByteView(key.data(), key.size()), ConstByteView(data.data(), data.size()), out);
+  *result = Value::make_object(make_byte_array(impl(vm), bytes_as_text(ConstByteView(out, crypto::hash_size(kind)))));
   return true;
 }
 
@@ -543,6 +577,8 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__worker_post", worker_post, 2);
   vm.define_native(g, "__worker_terminate", worker_terminate, 1);
   vm.define_native(g, "__worker_pump", worker_pump, 0);
+  vm.define_native(g, "__crypto_hash", crypto_hash, 2);
+  vm.define_native(g, "__crypto_hmac", crypto_hmac, 3);
   vm.define_native(g, "__ws_open", ws_open, 2);
   vm.define_native(g, "__ws_state", ws_state, 1);
   vm.define_native(g, "__ws_send", ws_send, 2);

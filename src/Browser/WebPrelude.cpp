@@ -1921,8 +1921,61 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   if (g.screenX === undefined) { g.screenX = 0; g.screenY = 0; g.screenLeft = 0; g.screenTop = 0; }
   if (g.origin === undefined) g.origin = location.origin;
   if (g.crypto === undefined) {
+    var HASHES = { 'SHA-1': 1, 'SHA-256': 2, 'SHA-384': 3, 'SHA-512': 4 };
+    function hashKind(algorithm) {
+      var name = typeof algorithm === 'string' ? algorithm : algorithm && (typeof algorithm.name === 'string' ? algorithm.name : null);
+      var kind = name === null ? undefined : HASHES[name.toUpperCase()];
+      if (!kind) throw new DOMException('Unrecognized name.', 'NotSupportedError');
+      return kind;
+    }
+    function bytesOf(data) {
+      if (data instanceof ArrayBuffer) return new Uint8Array(data);
+      if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      throw new TypeError("Failed to execute on 'SubtleCrypto': parameter 2 is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    }
+    function CryptoKey() { throw new TypeError('Illegal constructor'); }
+    hide(g, 'CryptoKey', CryptoKey);
+    function SubtleCrypto() { throw new TypeError('Illegal constructor'); }
+    var subtle = Object.create(SubtleCrypto.prototype);
+    hide(g, 'SubtleCrypto', SubtleCrypto);
+    method(SubtleCrypto.prototype, 'digest', function (algorithm, data) {
+      try { return Promise.resolve(__crypto_hash(hashKind(algorithm), bytesOf(data)).buffer); } catch (e) { return Promise.reject(e); }
+    });
+    method(SubtleCrypto.prototype, 'importKey', function (format, keyData, algorithm, extractable, usages) {
+      try {
+        if (format !== 'raw') throw new DOMException('Only raw keys are supported.', 'NotSupportedError');
+        var name = typeof algorithm === 'string' ? algorithm : algorithm.name;
+        if (String(name).toUpperCase() !== 'HMAC') throw new DOMException('Unsupported algorithm ' + name, 'NotSupportedError');
+        var key = Object.create(CryptoKey.prototype);
+        key.type = 'secret'; key.extractable = !!extractable; key.algorithm = { name: 'HMAC', hash: { name: typeof algorithm.hash === 'string' ? algorithm.hash : algorithm.hash.name }, length: bytesOf(keyData).length * 8 };
+        key.usages = Array.from(usages || []);
+        hide(key, '__bytes', new Uint8Array(bytesOf(keyData)));
+        hide(key, '__hash', hashKind(algorithm.hash));
+        return Promise.resolve(key);
+      } catch (e) { return Promise.reject(e); }
+    });
+    method(SubtleCrypto.prototype, 'sign', function (algorithm, key, data) {
+      try {
+        if (!key || key.__bytes === undefined) throw new DOMException('The key is not usable for signing.', 'InvalidAccessError');
+        return Promise.resolve(__crypto_hmac(key.__hash, key.__bytes, bytesOf(data)).buffer);
+      } catch (e) { return Promise.reject(e); }
+    });
+    method(SubtleCrypto.prototype, 'verify', function (algorithm, key, signature, data) {
+      return this.sign(algorithm, key, data).then(function (mac) {
+        var a = new Uint8Array(mac), b = bytesOf(signature), same = a.length === b.length;
+        for (var i = 0; i < a.length && same; i++) same = a[i] === b[i];
+        return same;
+      });
+    });
+    method(SubtleCrypto.prototype, 'exportKey', function (format, key) {
+      if (!key || key.__bytes === undefined || !key.extractable) return Promise.reject(new DOMException('The key is not extractable.', 'InvalidAccessError'));
+      return Promise.resolve(new Uint8Array(key.__bytes).buffer);
+    });
     hide(g, 'crypto', {
+      subtle: subtle,
       getRandomValues: function (array) {
+        if (!ArrayBuffer.isView(array) || array instanceof Float32Array || array instanceof Float64Array) throw new DOMException("The data argument must be an integer-type TypedArray.", 'TypeMismatchError');
+        if (array.byteLength > 65536) throw new DOMException('The ArrayBufferView\'s byte length (' + array.byteLength + ') exceeds the number of bytes of entropy available via this API (65536).', 'QuotaExceededError');
         var max = array.BYTES_PER_ELEMENT === 4 ? 4294967296 : array.BYTES_PER_ELEMENT === 2 ? 65536 : 256;
         for (var i = 0; i < array.length; i++) array[i] = Math.floor(Math.random() * max);
         return array;
@@ -2125,6 +2178,447 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   method(CustomElementRegistry.prototype, 'upgrade', function (root) { eachElement(root, function (el) { if (definitions[el.localName]) upgrade(el); }); });
   hide(g, 'CustomElementRegistry', CustomElementRegistry);
   hide(g, 'customElements', registry);
+  // ------------------------------------------------------------------------------------------------------------------ IndexedDB
+  // The databases of the origin are kept as text in localStorage (so that pages of the origin share them), worked on as objects while a page uses them. A
+  // transaction is a queue of requests that are answered one after the other, each as a task of its own; it completes when the queue is empty.
+  if (g.indexedDB === undefined) (function () {
+    var def = hide;
+    var PREFIX = '__idb__';
+    var open = {};   // name -> the database as it is in memory
+    function store() { try { return g.localStorage; } catch (e) { return null; } }
+    function load(name) {
+      var ls = store(), text = ls ? ls.getItem(PREFIX + name) : null;
+      if (text === null) return null;
+      try { return __wire_decode(text); } catch (e) { return null; }
+    }
+    function save(db) { var ls = store(); if (ls) try { ls.setItem(PREFIX + db.name, __wire_encode(db)); } catch (e) { } }
+    function dataError(message) { return new DOMException(message, 'DataError'); }
+    function typeOrder(k) { return Array.isArray(k) ? 5 : typeof k === 'string' ? 4 : k instanceof Date ? 2 : typeof k === 'number' ? 1 : ArrayBuffer.isView(k) || k instanceof ArrayBuffer ? 3 : 0; }
+    function valid(k) {
+      if (typeof k === 'number') return k === k;
+      if (typeof k === 'string' || k instanceof Date) return !(k instanceof Date) || k.getTime() === k.getTime();
+      if (Array.isArray(k)) return k.every(valid);
+      return k instanceof ArrayBuffer || ArrayBuffer.isView(k);
+    }
+    function compare(a, b) {
+      var ta = typeOrder(a), tb = typeOrder(b);
+      if (ta !== tb) return ta < tb ? -1 : 1;
+      if (ta === 1) return a < b ? -1 : a > b ? 1 : 0;
+      if (ta === 2) return a.getTime() < b.getTime() ? -1 : a.getTime() > b.getTime() ? 1 : 0;
+      if (ta === 4) return a < b ? -1 : a > b ? 1 : 0;
+      if (ta === 3) { var x = new Uint8Array(a.buffer || a), y = new Uint8Array(b.buffer || b); for (var i = 0; i < M.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1; return x.length < y.length ? -1 : x.length > y.length ? 1 : 0; }
+      for (var j = 0; j < M.min(a.length, b.length); j++) { var c = compare(a[j], b[j]); if (c) return c; }
+      return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
+    }
+    var M = Math;
+    function keyAt(path, value) {
+      if (Array.isArray(path)) { var out = []; for (var i = 0; i < path.length; i++) { var k = keyAt(path[i], value); if (k === undefined) return undefined; out.push(k); } return out; }
+      if (path === '') return value;
+      var cur = value, parts = String(path).split('.');
+      for (var p = 0; p < parts.length; p++) { if (cur === null || cur === undefined) return undefined; cur = cur[parts[p]]; }
+      return cur;
+    }
+    function setKeyAt(path, value, key) {
+      var parts = String(path).split('.'), cur = value;
+      for (var i = 0; i < parts.length - 1; i++) { if (cur[parts[i]] === undefined) cur[parts[i]] = {}; cur = cur[parts[i]]; }
+      cur[parts[parts.length - 1]] = key;
+    }
+    function find(records, key) {   // [index, found]
+      var lo = 0, hi = records.length;
+      while (lo < hi) { var mid = (lo + hi) >> 1, c = compare(records[mid].key, key); if (c < 0) lo = mid + 1; else hi = mid; }
+      return [lo, lo < records.length && compare(records[lo].key, key) === 0];
+    }
+    function clone(v) { return __wire_decode(__wire_encode(v)); }
+
+    function IDBKeyRange() { throw new TypeError('Illegal constructor'); }
+    function range(lower, upper, lowerOpen, upperOpen) { var r = Object.create(IDBKeyRange.prototype); r.lower = lower; r.upper = upper; r.lowerOpen = !!lowerOpen; r.upperOpen = !!upperOpen; return r; }
+    def(IDBKeyRange, 'only', function (v) { if (!valid(v)) throw dataError('The parameter is not a valid key.'); return range(v, v, false, false); });
+    def(IDBKeyRange, 'lowerBound', function (v, open) { if (!valid(v)) throw dataError('The parameter is not a valid key.'); return range(v, undefined, open, true); });
+    def(IDBKeyRange, 'upperBound', function (v, open) { if (!valid(v)) throw dataError('The parameter is not a valid key.'); return range(undefined, v, true, open); });
+    def(IDBKeyRange, 'bound', function (l, u, lo, uo) {
+      if (!valid(l) || !valid(u)) throw dataError('The parameter is not a valid key.');
+      if (compare(l, u) > 0 || (compare(l, u) === 0 && (lo || uo))) throw dataError('The lower key is greater than the upper key.');
+      return range(l, u, lo, uo);
+    });
+    def(IDBKeyRange.prototype, 'includes', function (k) {
+      if (this.lower !== undefined) { var c = compare(k, this.lower); if (c < 0 || (c === 0 && this.lowerOpen)) return false; }
+      if (this.upper !== undefined) { var d = compare(k, this.upper); if (d > 0 || (d === 0 && this.upperOpen)) return false; }
+      return true;
+    });
+    def(g, 'IDBKeyRange', IDBKeyRange);
+    function toRange(query) {
+      if (query === undefined || query === null) return null;
+      if (query instanceof IDBKeyRange) return query;
+      if (!valid(query)) throw dataError('The parameter is not a valid key.');
+      return range(query, query, false, false);
+    }
+
+    function IDBRequest() { throw new TypeError('Illegal constructor'); }
+    IDBRequest.prototype = Object.create(EventTarget.prototype);
+    def(IDBRequest.prototype, 'constructor', IDBRequest);
+    def(g, 'IDBRequest', IDBRequest);
+    function IDBOpenDBRequest() { throw new TypeError('Illegal constructor'); }
+    IDBOpenDBRequest.prototype = Object.create(IDBRequest.prototype);
+    def(g, 'IDBOpenDBRequest', IDBOpenDBRequest);
+    function newRequest(source, transaction, proto) {
+      var r = Object.create(proto || IDBRequest.prototype);
+      r.result = undefined; r.error = null; r.source = source; r.transaction = transaction; r.readyState = 'pending';
+      r.onsuccess = null; r.onerror = null;
+      return r;
+    }
+    function fire(target, type, init) {
+      var e = new Event(type, init || {});
+      target.dispatchEvent(e);
+      return e;
+    }
+
+    function IDBTransaction() { throw new TypeError('Illegal constructor'); }
+    IDBTransaction.prototype = Object.create(EventTarget.prototype);
+    def(IDBTransaction.prototype, 'constructor', IDBTransaction);
+    def(g, 'IDBTransaction', IDBTransaction);
+    function newTransaction(connection, names, mode) {
+      var t = Object.create(IDBTransaction.prototype);
+      t.db = connection; t.mode = mode; t.error = null; t.durability = 'default'; t.objectStoreNames = list(names);
+      t.oncomplete = null; t.onabort = null; t.onerror = null;
+      Object.defineProperty(t, '__queue', { value: [], writable: true });
+      Object.defineProperty(t, '__state', { value: { active: true, finished: false, running: false, wrote: false } });
+      Object.defineProperty(t, '__stores', { value: names });
+      return t;
+    }
+    function list(names) { var l = names.slice(); l.contains = function (n) { return names.indexOf(n) >= 0; }; l.item = function (i) { return names[i] === undefined ? null : names[i]; }; return l; }
+    function schedule(t) {
+      if (t.__state.running || t.__state.finished) return;
+      t.__state.running = true;
+      setTimeout(function () { t.__state.running = false; next(t); }, 0);
+    }
+    function next(t) {
+      if (t.__state.finished) return;
+      var job = t.__queue.shift();
+      if (!job) { finish(t); return; }
+      var request = job.request;
+      try {
+        request.result = job.run();
+        request.readyState = 'done';
+        t.__state.active = true;
+        var e = fire(request, 'success');
+      } catch (error) {
+        request.readyState = 'done';
+        request.error = error;
+        t.__state.active = true;
+        var f = new Event('error', { bubbles: true, cancelable: true });
+        request.dispatchEvent(f);
+        if (!f.defaultPrevented) { t.error = error; abort(t, error); return; }
+      }
+      schedule(t);
+    }
+    function finish(t) {
+      if (t.__state.finished) return;
+      t.__state.finished = true; t.__state.active = false;
+      if (t.__state.wrote) save(t.db.__data);
+      fire(t, 'complete');
+      t.db.__activeTransactions--;
+    }
+    function abort(t, error) {
+      if (t.__state.finished) return;
+      t.__state.finished = true; t.__state.active = false;
+      if (t.__restore) t.__restore();
+      t.error = error || null;
+      t.__queue.length = 0;
+      fire(t, 'abort');
+      t.db.__activeTransactions--;
+    }
+    def(IDBTransaction.prototype, 'abort', function () { if (this.__state.finished) throw new DOMException('The transaction has already completed or aborted.', 'InvalidStateError'); abort(this, null); });
+    def(IDBTransaction.prototype, 'commit', function () {});
+    def(IDBTransaction.prototype, 'objectStore', function (name) {
+      if (this.__state.finished) throw new DOMException("Failed to execute 'objectStore' on 'IDBTransaction': The transaction has finished.", 'InvalidStateError');
+      if (this.__stores.indexOf(name) < 0 || !this.db.__data.stores[name]) throw new DOMException("Failed to execute 'objectStore' on 'IDBTransaction': The specified object store was not found.", 'NotFoundError');
+      return newObjectStore(this, name);
+    });
+    function enqueue(t, source, run, write) {
+      if (t.__state.finished) throw new DOMException('The transaction has finished.', 'TransactionInactiveError');
+      if (write && t.mode === 'readonly') throw new DOMException('The transaction is read-only.', 'ReadOnlyError');
+      var request = newRequest(source, t);
+      if (write) t.__state.wrote = true;
+      t.__queue.push({ request: request, run: run });
+      schedule(t);
+      return request;
+    }
+
+    function IDBObjectStore() { throw new TypeError('Illegal constructor'); }
+    function IDBIndex() { throw new TypeError('Illegal constructor'); }
+    function IDBCursor() { throw new TypeError('Illegal constructor'); }
+    function IDBCursorWithValue() { throw new TypeError('Illegal constructor'); }
+    IDBCursorWithValue.prototype = Object.create(IDBCursor.prototype);
+    def(g, 'IDBObjectStore', IDBObjectStore); def(g, 'IDBIndex', IDBIndex); def(g, 'IDBCursor', IDBCursor); def(g, 'IDBCursorWithValue', IDBCursorWithValue);
+    function newObjectStore(t, name) {
+      var s = Object.create(IDBObjectStore.prototype), data = t.db.__data.stores[name];
+      s.name = name; s.keyPath = data.keyPath; s.autoIncrement = data.autoIncrement; s.transaction = t; s.indexNames = list(Object.keys(data.indexes));
+      Object.defineProperty(s, '__data', { value: data });
+      return s;
+    }
+    function recordsOf(source) { return source.__index ? source.__index : null; }
+    function indexRows(store, indexName) {   // [{ key: indexKey, primaryKey, value }] sorted
+      var def_ = store.__data.indexes[indexName], rows = [];
+      store.__data.records.forEach(function (rec) {
+        var k = keyAt(def_.keyPath, rec.value);
+        if (k === undefined) return;
+        var keys = def_.multiEntry && Array.isArray(k) ? k.filter(valid) : (valid(k) ? [k] : []);
+        keys.forEach(function (ik) { rows.push({ key: ik, primaryKey: rec.key, value: rec.value }); });
+      });
+      rows.sort(function (a, b) { return compare(a.key, b.key) || compare(a.primaryKey, b.primaryKey); });
+      return rows;
+    }
+    function checkKey(store, value, key, adding) {
+      var data = store.__data, result = key;
+      if (data.keyPath !== null) {
+        if (key !== undefined) throw dataError('The object store uses in-line keys and the key parameter was provided.');
+        result = keyAt(data.keyPath, value);
+        if (result === undefined) {
+          if (!data.autoIncrement) throw dataError('Evaluating the object store\'s key path did not yield a value.');
+          result = data.nextKey++;
+          if (typeof value === 'object' && value !== null && !Array.isArray(data.keyPath)) setKeyAt(data.keyPath, value, result);
+        } else if (typeof result === 'number' && data.autoIncrement && result >= data.nextKey) data.nextKey = M.floor(result) + 1;
+      } else if (result === undefined) {
+        if (!data.autoIncrement) throw dataError('The object store uses out-of-line keys and has no key generator and the key parameter was not provided.');
+        result = data.nextKey++;
+      } else if (typeof result === 'number' && data.autoIncrement && result >= data.nextKey) data.nextKey = M.floor(result) + 1;
+      if (!valid(result)) throw dataError('The parameter is not a valid key.');
+      return result;
+    }
+    function put(store, value, key, adding) {
+      var t = store.transaction, copy = clone(value), data = store.__data;
+      var k = checkKey(store, copy, key, adding);
+      return enqueue(t, store, function () {
+        var at = find(data.records, k);
+        if (at[1] && adding) throw new DOMException('Unable to add key: a record with the key already exists.', 'ConstraintError');
+        // unique indexes
+        Object.keys(data.indexes).forEach(function (n) {
+          var d = data.indexes[n]; if (!d.unique) return;
+          var ik = keyAt(d.keyPath, copy);
+          if (ik === undefined) return;
+          data.records.forEach(function (rec) { if (compare(rec.key, k) !== 0 && compare(keyAt(d.keyPath, rec.value), ik) === 0) throw new DOMException('Unable to add key: a record with the index key already exists.', 'ConstraintError'); });
+        });
+        if (at[1]) data.records[at[0]] = { key: k, value: copy }; else data.records.splice(at[0], 0, { key: k, value: copy });
+        return k;
+      }, true);
+    }
+    var SP_ = IDBObjectStore.prototype;
+    def(SP_, 'add', function (value, key) { return put(this, value, key, true); });
+    def(SP_, 'put', function (value, key) { return put(this, value, key, false); });
+    def(SP_, 'get', function (query) {
+      var data = this.__data, r = toRange(query);
+      if (r === null) throw dataError('The parameter is not a valid key.');
+      return enqueue(this.transaction, this, function () { for (var i = 0; i < data.records.length; i++) if (r.includes(data.records[i].key)) return clone(data.records[i].value); return undefined; });
+    });
+    def(SP_, 'getKey', function (query) {
+      var data = this.__data, r = toRange(query);
+      if (r === null) throw dataError('The parameter is not a valid key.');
+      return enqueue(this.transaction, this, function () { for (var i = 0; i < data.records.length; i++) if (r.includes(data.records[i].key)) return data.records[i].key; return undefined; });
+    });
+    function gather(store, query, count, wantKeys) {
+      var data = store.__data, r = toRange(query);
+      return enqueue(store.transaction, store, function () {
+        var out = [];
+        for (var i = 0; i < data.records.length && (count === undefined || out.length < count); i++) if (!r || r.includes(data.records[i].key)) out.push(wantKeys ? data.records[i].key : clone(data.records[i].value));
+        return out;
+      });
+    }
+    def(SP_, 'getAll', function (query, count) { return gather(this, query, count, false); });
+    def(SP_, 'getAllKeys', function (query, count) { return gather(this, query, count, true); });
+    def(SP_, 'count', function (query) { var data = this.__data, r = toRange(query); return enqueue(this.transaction, this, function () { var n = 0; data.records.forEach(function (rec) { if (!r || r.includes(rec.key)) n++; }); return n; }); });
+    def(SP_, 'delete', function (query) {
+      var data = this.__data, r = toRange(query);
+      if (r === null) throw dataError('The parameter is not a valid key.');
+      return enqueue(this.transaction, this, function () { data.records = data.records.filter(function (rec) { return !r.includes(rec.key); }); return undefined; }, true);
+    });
+    def(SP_, 'clear', function () { var data = this.__data; return enqueue(this.transaction, this, function () { data.records = []; return undefined; }, true); });
+    def(SP_, 'index', function (name) {
+      if (!this.__data.indexes[name]) throw new DOMException("Failed to execute 'index' on 'IDBObjectStore': The specified index was not found.", 'NotFoundError');
+      var i = Object.create(IDBIndex.prototype), d = this.__data.indexes[name];
+      i.name = name; i.objectStore = this; i.keyPath = d.keyPath; i.unique = d.unique; i.multiEntry = d.multiEntry;
+      return i;
+    });
+    def(SP_, 'createIndex', function (name, keyPath, options) {
+      if (this.transaction.mode !== 'versionchange') throw new DOMException("Failed to execute 'createIndex' on 'IDBObjectStore': The database is not running a version change transaction.", 'InvalidStateError');
+      if (this.__data.indexes[name]) throw new DOMException("Failed to execute 'createIndex' on 'IDBObjectStore': An index with the specified name already exists.", 'ConstraintError');
+      this.__data.indexes[name] = { keyPath: keyPath, unique: !!(options && options.unique), multiEntry: !!(options && options.multiEntry) };
+      this.transaction.__state.wrote = true;
+      return this.index(name);
+    });
+    def(SP_, 'deleteIndex', function (name) { delete this.__data.indexes[name]; this.transaction.__state.wrote = true; });
+    function cursorFor(source, rows, query, direction, withValue, update) {
+      var r = toRange(query), t = source.transaction || source.objectStore.transaction;
+      direction = direction || 'next';
+      var request = null;
+      request = enqueue(t, source, function () {
+        var list_ = rows().filter(function (row) { return !r || r.includes(row.key); });
+        if (direction === 'prev' || direction === 'prevunique') list_.reverse();
+        if (direction === 'nextunique' || direction === 'prevunique') list_ = list_.filter(function (row, i) { return i === 0 || compare(row.key, list_[i - 1].key) !== 0; });
+        if (list_.length === 0) return null;
+        var position = 0;
+        var cursor = Object.create(withValue ? IDBCursorWithValue.prototype : IDBCursor.prototype);
+        function show() { var row = list_[position]; cursor.key = row.key; cursor.primaryKey = row.primaryKey; if (withValue) cursor.value = clone(row.value); }
+        cursor.source = source; cursor.direction = direction; show();
+        def(cursor, '__req', request);
+        def(cursor, '__move', function (steps, key) {
+          if (!this.__req) throw new DOMException('The cursor is not active.', 'InvalidStateError');
+          var req = this.__req;
+          req.readyState = 'pending';
+          t.__queue.push({ request: req, run: function () {
+            position += steps;
+            if (key !== undefined) while (position < list_.length && compare(list_[position].key, key) < 0) position++;
+            if (position >= list_.length) return null;
+            show();
+            return cursor;
+          } });
+          schedule(t);
+        });
+        def(cursor, 'continue', function (key) { this.__move(1, key); });
+        def(cursor, 'advance', function (n) { if (n < 1) throw new TypeError("Failed to execute 'advance' on 'IDBCursor': A count argument with value 0 (zero) was supplied, must be greater than 0."); this.__move(n); });
+        def(cursor, 'update', function (value) {
+          if (source.__data === undefined && source.objectStore === undefined) throw new DOMException('Cannot update.', 'InvalidStateError');
+          var store = source.__data ? source : source.objectStore;
+          return put(store, value, store.__data.keyPath === null ? cursor.primaryKey : undefined, false);
+        });
+        def(cursor, 'delete', function () { var store = source.__data ? source : source.objectStore; return store.delete(cursor.primaryKey); });
+        return cursor;
+      });
+      return request;
+    }
+    function bindRequest(request, cursor) { return request; }
+    def(SP_, 'openCursor', function (query, direction) {
+      var self = this, req = cursorFor(this, function () { return self.__data.records.map(function (rec) { return { key: rec.key, primaryKey: rec.key, value: rec.value }; }); }, query, direction, true);
+      attachCursorRequest(req); return req;
+    });
+    def(SP_, 'openKeyCursor', function (query, direction) {
+      var self = this, req = cursorFor(this, function () { return self.__data.records.map(function (rec) { return { key: rec.key, primaryKey: rec.key, value: rec.value }; }); }, query, direction, false);
+      attachCursorRequest(req); return req;
+    });
+    // the request of a cursor is answered again for every step: the cursor remembers it
+    function attachCursorRequest(req) {
+      Object.defineProperty(req, '__cursorRequest', { value: true });
+      var desc = Object.getOwnPropertyDescriptor;
+    }
+    var IP_ = IDBIndex.prototype;
+    function indexOf(i) { return indexRows(i.objectStore, i.name); }
+    def(IP_, 'get', function (query) { var self = this, r = toRange(query); return enqueue(this.objectStore.transaction, this, function () { var rows = indexOf(self); for (var k = 0; k < rows.length; k++) if (r.includes(rows[k].key)) return clone(rows[k].value); return undefined; }); });
+    def(IP_, 'getKey', function (query) { var self = this, r = toRange(query); return enqueue(this.objectStore.transaction, this, function () { var rows = indexOf(self); for (var k = 0; k < rows.length; k++) if (r.includes(rows[k].key)) return rows[k].primaryKey; return undefined; }); });
+    def(IP_, 'getAll', function (query, count) { var self = this, r = toRange(query); return enqueue(this.objectStore.transaction, this, function () { var out = []; indexOf(self).forEach(function (row) { if ((!r || r.includes(row.key)) && (count === undefined || out.length < count)) out.push(clone(row.value)); }); return out; }); });
+    def(IP_, 'getAllKeys', function (query, count) { var self = this, r = toRange(query); return enqueue(this.objectStore.transaction, this, function () { var out = []; indexOf(self).forEach(function (row) { if ((!r || r.includes(row.key)) && (count === undefined || out.length < count)) out.push(row.primaryKey); }); return out; }); });
+    def(IP_, 'count', function (query) { var self = this, r = toRange(query); return enqueue(this.objectStore.transaction, this, function () { var n = 0; indexOf(self).forEach(function (row) { if (!r || r.includes(row.key)) n++; }); return n; }); });
+    def(IP_, 'openCursor', function (query, direction) { var self = this; return cursorFor(this, function () { return indexOf(self); }, query, direction, true); });
+    def(IP_, 'openKeyCursor', function (query, direction) { var self = this; return cursorFor(this, function () { return indexOf(self); }, query, direction, false); });
+
+    function IDBDatabase() { throw new TypeError('Illegal constructor'); }
+    IDBDatabase.prototype = Object.create(EventTarget.prototype);
+    def(IDBDatabase.prototype, 'constructor', IDBDatabase);
+    def(g, 'IDBDatabase', IDBDatabase);
+    def(g, 'IDBFactory', function IDBFactory() { throw new TypeError('Illegal constructor'); });
+    function connect(data) {
+      var db = Object.create(IDBDatabase.prototype);
+      db.name = data.name; db.version = data.version; db.onversionchange = null; db.onclose = null; db.onabort = null; db.onerror = null;
+      Object.defineProperty(db, '__data', { value: data, writable: true });
+      Object.defineProperty(db, '__activeTransactions', { value: 0, writable: true });
+      Object.defineProperty(db, '__closed', { value: false, writable: true });
+      db.objectStoreNames = list(Object.keys(data.stores));
+      return db;
+    }
+    function refreshNames(db) { db.objectStoreNames = list(Object.keys(db.__data.stores)); }
+    var DP_ = IDBDatabase.prototype;
+    def(DP_, 'close', function () { this.__closed = true; });
+    def(DP_, 'transaction', function (names, mode) {
+      if (this.__closed) throw new DOMException("Failed to execute 'transaction' on 'IDBDatabase': The database connection is closing.", 'InvalidStateError');
+      names = Array.isArray(names) ? names.map(String) : [String(names)];
+      for (var i = 0; i < names.length; i++) if (!this.__data.stores[names[i]]) throw new DOMException("Failed to execute 'transaction' on 'IDBDatabase': One of the specified object stores was not found.", 'NotFoundError');
+      if (names.length === 0) throw new DOMException("Failed to execute 'transaction' on 'IDBDatabase': The storeNames parameter was empty.", 'InvalidAccessError');
+      var t = newTransaction(this, names, mode || 'readonly');
+      this.__activeTransactions++;
+      schedule(t);
+      return t;
+    });
+    def(DP_, 'createObjectStore', function (name, options) {
+      var t = this.__upgrade;
+      if (!t) throw new DOMException("Failed to execute 'createObjectStore' on 'IDBDatabase': The database is not running a version change transaction.", 'InvalidStateError');
+      name = String(name);
+      if (this.__data.stores[name]) throw new DOMException("Failed to execute 'createObjectStore' on 'IDBDatabase': An object store with the specified name already exists.", 'ConstraintError');
+      var keyPath = options && options.keyPath !== undefined && options.keyPath !== null ? options.keyPath : null;
+      if (keyPath !== null && options.autoIncrement && (keyPath === '' || Array.isArray(keyPath))) throw new DOMException('autoIncrement requires a key path that is neither empty nor an array.', 'InvalidAccessError');
+      this.__data.stores[name] = { keyPath: keyPath, autoIncrement: !!(options && options.autoIncrement), nextKey: 1, records: [], indexes: {} };
+      refreshNames(this);
+      t.__stores.push(name);
+      t.objectStoreNames = list(t.__stores);
+      t.__state.wrote = true;
+      return newObjectStore(t, name);
+    });
+    def(DP_, 'deleteObjectStore', function (name) {
+      if (!this.__upgrade) throw new DOMException("Failed to execute 'deleteObjectStore' on 'IDBDatabase': The database is not running a version change transaction.", 'InvalidStateError');
+      if (!this.__data.stores[name]) throw new DOMException("Failed to execute 'deleteObjectStore' on 'IDBDatabase': The specified object store was not found.", 'NotFoundError');
+      delete this.__data.stores[name];
+      refreshNames(this);
+      this.__upgrade.__state.wrote = true;
+    });
+
+    var factory = Object.create(g.IDBFactory.prototype);
+    def(g.IDBFactory.prototype, 'open', function (name, version) {
+      name = String(name);
+      if (version !== undefined && (typeof version !== 'number' || version < 1 || version !== M.floor(version))) throw new TypeError("Failed to execute 'open' on 'IDBFactory': The version provided must be a positive integer.");
+      var request = newRequest(null, null, IDBOpenDBRequest.prototype);
+      request.onupgradeneeded = null; request.onblocked = null;
+      setTimeout(function () {
+        var stored = open[name] || load(name), created = false;
+        if (!stored) { stored = { name: name, version: 0, stores: {} }; created = true; }
+        var target = version === undefined ? (stored.version || 1) : version;
+        if (target < stored.version) { request.error = new DOMException('The requested version (' + target + ') is less than the existing version (' + stored.version + ').', 'VersionError'); request.readyState = 'done'; fire(request, 'error', { bubbles: true, cancelable: true }); return; }
+        open[name] = stored;
+        var db = connect(stored);
+        request.result = db;
+        if (target > stored.version) {
+          var old = stored.version, snapshot = clone(stored);
+          stored.version = target; db.version = target;
+          var t = newTransaction(db, [], 'versionchange');
+          db.__upgrade = t;
+          t.__restore = function () { open[name] = snapshot; db.__closed = true; };
+          request.transaction = t;
+          db.__activeTransactions++;
+          var upgrade = new Event('upgradeneeded');
+          upgrade.oldVersion = old; upgrade.newVersion = target;
+          request.readyState = 'done';
+          request.dispatchEvent(upgrade);
+          t.__state.wrote = true;
+          t.addEventListener('complete', function () { db.__upgrade = null; request.readyState = 'done'; request.result = db; fire(request, 'success'); });
+          t.addEventListener('abort', function () { request.error = new DOMException('The upgrade transaction was aborted.', 'AbortError'); request.result = undefined; fire(request, 'error', { bubbles: true, cancelable: true }); });
+          schedule(t);
+        } else {
+          request.readyState = 'done';
+          fire(request, 'success');
+        }
+      }, 0);
+      return request;
+    });
+    def(g.IDBFactory.prototype, 'deleteDatabase', function (name) {
+      name = String(name);
+      var request = newRequest(null, null, IDBOpenDBRequest.prototype);
+      request.onupgradeneeded = null; request.onblocked = null;
+      setTimeout(function () {
+        var existing = open[name] || load(name);
+        delete open[name];
+        var ls = store(); if (ls) ls.removeItem(PREFIX + name);
+        request.result = undefined; request.readyState = 'done';
+        var e = new Event('success'); e.oldVersion = existing ? existing.version : 0; e.newVersion = null;
+        request.dispatchEvent(e);
+      }, 0);
+      return request;
+    });
+    def(g.IDBFactory.prototype, 'databases', function () {
+      var names = {}, ls = store();
+      Object.keys(open).forEach(function (n) { names[n] = open[n].version; });
+      if (ls) for (var i = 0; i < ls.length; i++) { var k = ls.key(i); if (k && k.indexOf(PREFIX) === 0) { var n2 = k.slice(PREFIX.length); if (names[n2] === undefined) { var d = load(n2); if (d) names[n2] = d.version; } } }
+      return Promise.resolve(Object.keys(names).map(function (n) { return { name: n, version: names[n] }; }));
+    });
+    def(g.IDBFactory.prototype, 'cmp', function (a, b) { if (!valid(a) || !valid(b)) throw dataError('The parameter is not a valid key.'); return compare(a, b); });
+    def(g, 'indexedDB', factory);
+  }());
+
   var nativeCreate = DP.createElement;
   method(DP, 'createElement', function (name, options) {
     var el = nativeCreate.call(this, name, options);
@@ -2166,6 +2660,57 @@ const char kWorkerPrelude[] = R"JSPRELUDE((function (g) {
       if (source === null) throw new Error("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '" + url + "' failed to load.");
       (0, eval)(source);
     }
+  };
+  // what workers expect to find
+  function TextEncoder() { this.encoding = 'utf-8'; }
+  TextEncoder.prototype.encode = function (text) { return __string_to_bytes(text === undefined ? '' : String(text)); };
+  g.TextEncoder = TextEncoder;
+  function TextDecoder(label) { this.encoding = 'utf-8'; this.fatal = false; this.ignoreBOM = false; }
+  TextDecoder.prototype.decode = function (input) {
+    if (input === undefined) return '';
+    var bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : (ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : null);
+    if (!bytes) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) bytes = bytes.subarray(3);
+    return __bytes_to_string(bytes);
+  };
+  g.TextDecoder = TextDecoder;
+  var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  g.btoa = function (text) {
+    text = String(text);
+    var out = '';
+    for (var i = 0; i < text.length; i += 3) {
+      var a = text.charCodeAt(i), b = text.charCodeAt(i + 1), c = text.charCodeAt(i + 2);
+      if (a > 255 || b > 255 || c > 255) throw new Error("Failed to execute 'btoa' on 'WorkerGlobalScope': The string to be encoded contains characters outside of the Latin1 range.");
+      out += B64.charAt(a >> 2) + B64.charAt(((a & 3) << 4) | ((b || 0) >> 4)) + (i + 1 < text.length ? B64.charAt(((b & 15) << 2) | ((c || 0) >> 6)) : '=') + (i + 2 < text.length ? B64.charAt(c & 63) : '=');
+    }
+    return out;
+  };
+  g.atob = function (text) {
+    text = String(text).replace(/[\t\n\f\r ]/g, '');
+    if (text.length % 4 === 1 || /[^A-Za-z0-9+\/=]/.test(text)) throw new Error("Failed to execute 'atob' on 'WorkerGlobalScope': The string to be decoded is not correctly encoded.");
+    var bytes = [];
+    for (var i = 0; i < text.length; i += 4) {
+      var n = [0, 1, 2, 3].map(function (k) { var ch = text.charAt(i + k); return ch === '' || ch === '=' ? -1 : B64.indexOf(ch); });
+      bytes.push((n[0] << 2) | (n[1] >> 4));
+      if (n[2] >= 0) bytes.push(((n[1] & 15) << 4) | (n[2] >> 2));
+      if (n[3] >= 0) bytes.push(((n[2] & 3) << 6) | n[3]);
+    }
+    return bytes.map(function (b) { return String.fromCharCode(b); }).join('');
+  };
+  // fetch() for a worker: the answer is had at once (only GET, only text), and comes as a promise
+  g.fetch = function (resource) {
+    var url = typeof resource === 'string' ? resource : resource && resource.url ? resource.url : String(resource);
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = url.charAt(0) === '/' ? g.location.origin + url : __worker_url.slice(0, __worker_url.lastIndexOf('/') + 1) + url;
+    var text = __worker_fetch(url);
+    if (text === null) return Promise.reject(new TypeError('Failed to fetch'));
+    var response = {
+      ok: true, status: 200, statusText: 'OK', url: url, type: 'basic', redirected: false, headers: { get: function () { return null; }, has: function () { return false; } }, bodyUsed: false,
+      text: function () { return Promise.resolve(text); },
+      json: function () { try { return Promise.resolve(JSON.parse(text)); } catch (e) { return Promise.reject(e); } },
+      arrayBuffer: function () { return Promise.resolve(__string_to_bytes(text).buffer); },
+      clone: function () { return response; }
+    };
+    return Promise.resolve(response);
   };
   hide(g, '__deliver', function () {
     var text = g.__inbox, data;

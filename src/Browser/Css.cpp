@@ -1913,6 +1913,7 @@ bool supports_condition(StringView text) {
 
 void StyleSheet::clear() {
   pointer_state_ = false;
+  scope_ = 0;
   pool_.clear();
   selectors_.clear();
   declarations_.clear();
@@ -2044,6 +2045,7 @@ bool StyleSheet::add_declarations(StringView body, uint32_t rule) {
   r.first_declaration = static_cast<uint32_t>(declarations_.count());
   r.declaration_count = 0;
   r.order = rule;
+  r.scope = scope_;
   bool ok = true;
   for_each_declaration(body, [&](StringView name, StringView value, bool important) {
     const Prop p = property_from_name(name);
@@ -2063,9 +2065,26 @@ bool StyleSheet::add_declarations(StringView body, uint32_t rule) {
   return ok && rules_.push_back(r);
 }
 
+// The shadow root an element is in (0: the document's tree) and the one it hosts.
+static void element_scopes(const dom::Node* element, uint32_t* in_scope, uint32_t* hosted) {
+  const dom::Node* top = element;
+  while (top->parent) top = top->parent;
+  *in_scope = top->shadow_host ? top->serial : 0;
+  *hosted = element->shadow ? element->shadow->serial : 0;
+}
+
+// A rule applies to what is in its own tree (the document's rules to the document's elements, a shadow tree's to that shadow tree's), and the rules of a shadow
+// tree written with :host to its host.
+bool StyleSheet::rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope) const {
+  const uint32_t scope = rules_[selectors_.tag(selector)].scope;
+  return scope == element_scope || (scope != 0 && scope == host_scope && selectors_.uses_host(selector));
+}
+
 bool StyleSheet::has_pseudo(const dom::Node* element, PseudoElement pseudo) const {
+  uint32_t element_scope, host_scope;
+  element_scopes(element, &element_scope, &host_scope);
   for (uint32_t s = 0; s < selectors_.count(); ++s)
-    if (selectors_.pseudo(s) == static_cast<uint8_t>(pseudo) && selectors_.matches(s, element, nullptr, true)) return true;
+    if (selectors_.pseudo(s) == static_cast<uint8_t>(pseudo) && rule_applies(s, element_scope, host_scope) && selectors_.matches(s, element, nullptr, true)) return true;
   return false;
 }
 
@@ -2112,8 +2131,10 @@ uint32_t StyleSheet::add_scope(const Scope& scope, uint32_t fallback) const {
 void StyleSheet::apply(const dom::Node* element, StringView inline_style, const Style& parent, Style* style, PseudoElement pseudo) const {
   uint32_t matched[kMaxMatches];
   uint32_t count = 0;
+  uint32_t element_scope, host_scope;
+  element_scopes(element, &element_scope, &host_scope);
   for (uint32_t s = 0; s < selectors_.count() && count < kMaxMatches; ++s) {
-    if (selectors_.pseudo(s) != static_cast<uint8_t>(pseudo) || !selectors_.matches(s, element, nullptr, true)) continue;
+    if (selectors_.pseudo(s) != static_cast<uint8_t>(pseudo) || !rule_applies(s, element_scope, host_scope) || !selectors_.matches(s, element, nullptr, true)) continue;
     uint32_t k = count++;   // (kept ordered by specificity, then by where it came from)
     while (k > 0) {
       const uint32_t before = matched[k - 1];
