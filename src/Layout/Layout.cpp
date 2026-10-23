@@ -160,7 +160,7 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
     content_width = request.content_width;
   } else if (resolve_in(s.width, b, false, &specified_width)) {
     content_width = clamp_content_width(b, s.sizing == BoxSizing::BorderBox ? max(specified_width - bp_h, LayoutUnit()) : specified_width);
-  } else if (request.shrink || keyword_width) {
+  } else if (request.shrink || keyword_width || s.layout == browser::Layout::Table) {   // (a table is as wide as its columns, up to the room there is)
     LayoutUnit mn, mx;
     intrinsic_widths(id, &mn, &mx);
     const LayoutUnit available = (request.shrink ? request.available : cb_width) - b.margin.horizontal() - bp_h;
@@ -238,11 +238,11 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
     children.empty = b.lines.count() == 0;
     if (b.lines.count() > 0 && s.overflow_x == Overflow::Visible && s.overflow_y == Overflow::Visible) {
       const LineInfo& last = b.lines[b.lines.count() - 1];
-      b.baseline = b.content_top() + last.y + last.baseline;
+      b.baseline = last.y + last.baseline;   // (LineInfo::y is already relative to the border box)
       b.has_baseline = true;
     }
   } else if (s.layout == browser::Layout::Flex || s.layout == browser::Layout::Grid || s.layout == browser::Layout::Table || s.column_count > 0 || s.column_width.is_px()) {
-    const bool known = child_cb_height_known_ && !height_auto;
+    const bool known = child_cb_height_known_ && (!height_auto || request.has_forced_height);
     const LayoutUnit given = known ? child_cb_height_ : LayoutUnit();
     if (s.layout == browser::Layout::Flex) children = layout_flex(id, content_width, known, given);
     else if (s.layout == browser::Layout::Grid) children = layout_grid(id, content_width, known, given);
@@ -270,7 +270,11 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   child_cb_height_known_ = saved_cb_known;
   child_cb_height_ = saved_cb_height;
   if (!replaced) {
-    if (!height_auto) content_height = s.sizing == BoxSizing::BorderBox ? max(specified_height - bp_v, LayoutUnit()) : specified_height;
+    if (!height_auto) {
+      const LayoutUnit given = s.sizing == BoxSizing::BorderBox ? max(specified_height - bp_v, LayoutUnit()) : specified_height;
+      // (the height of a table or a table cell is the least it has: they grow with their rows and content)
+      content_height = s.layout == browser::Layout::Table || s.layout == browser::Layout::TableCell ? max(content_height, given) : given;
+    }
     if (request.has_forced_height && height_auto) content_height = request.forced_height;
     content_height = clamp_content_height(b, content_height);
   }

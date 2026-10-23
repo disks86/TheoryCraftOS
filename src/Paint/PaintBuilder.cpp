@@ -18,6 +18,8 @@
 
 #include "Paint/PaintBuilder.hpp"
 #include "Dom/Form.hpp"
+#include "Paint/Raster.hpp"
+#include "Paint/Tiling.hpp"
 
 namespace paint {
 
@@ -49,11 +51,25 @@ uint32_t with_alpha(uint32_t color, uint32_t alpha_scale_255) {
   return (color & 0x00FFFFFFu) | (a << 24);
 }
 
+// An ancestor between a stacking context and a context inside it that clips (overflow other than visible) but is no context itself: what it clips is painted
+// by the context above, so the clip has to be put around it again.
+struct ClipRef {
+  BoxId id = kNoBox;
+  LayoutUnit ax, ay;
+  bool positioned = false;   // (a clip of a positioned box also holds absolutely positioned descendants)
+};
+constexpr uint32_t kMaxClipRefs = 6;
+struct ClipChain {
+  ClipRef refs[kMaxClipRefs];
+  uint32_t count = 0;
+};
+
 struct Entry {
   BoxId id = kNoBox;
   LayoutUnit ax, ay;
   int32_t z = 0;
   uint32_t order = 0;
+  ClipChain clips;
 };
 
 class Builder {
@@ -110,7 +126,7 @@ class Builder {
   static bool makes_context(const Box& b) {
     const Style& s = b.style;
     return (s.position != browser::Position::Static && !s.z_index_auto) || s.opacity_x1000 < 1000 || !s.transform_value.empty() || !s.translate.empty() || !s.rotate.empty() ||
-           !s.scale.empty();
+           !s.scale.empty() || !s.filter.empty() || !s.clip_path.empty();
   }
   // Is it painted in the positioned layer of its stacking context (as a unit)? Every positioned box is, and so is every context.
   static bool is_context(const Box& b) { return makes_context(b) || b.style.position != browser::Position::Static; }
@@ -118,17 +134,26 @@ class Builder {
   static bool clips(const Box& b) { return b.style.overflow_x != browser::Overflow::Visible || b.style.overflow_y != browser::Overflow::Visible; }
 
   // Finds the stacking contexts below `id` that are not inside a float or an inline-block or another context: they are painted by this context.
-  void gather(BoxId id, LayoutUnit ax, LayoutUnit ay, List<Entry>* out) {
+  void gather(BoxId id, LayoutUnit ax, LayoutUnit ay, List<Entry>* out, const ClipChain& chain) {
     const Box& b = tree_.box(id);
     for (uint64_t i = 0; i < b.children.count(); ++i) {
       const BoxId cid = b.children[i];
       const Box& c = tree_.box(cid);
       if (c.kind == BoxKind::Text || c.kind == BoxKind::LineBreak || c.kind == BoxKind::Marker) continue;
       if (c.kind == BoxKind::Inline) {
-        gather(cid, ax, ay, out);
+        gather(cid, ax, ay, out, chain);
         continue;
       }
       const LayoutUnit cx = ax + c.x, cy = ay + c.y;
+      // what a clip of this box holds, for the boxes inside it
+      ClipChain inside = chain;
+      if (clips(c) && inside.count < kMaxClipRefs) {
+        inside.refs[inside.count].id = cid;
+        inside.refs[inside.count].ax = cx;
+        inside.refs[inside.count].ay = cy;
+        inside.refs[inside.count].positioned = c.style.position != browser::Position::Static || !c.style.transform_value.empty();
+        ++inside.count;
+      }
       if (is_context(c)) {
         Entry e;
         e.id = cid;
@@ -136,20 +161,33 @@ class Builder {
         e.ay = cy;
         e.z = c.style.z_index;
         e.order = order_++;
+        // the clips of the boxes between: they hold everything but a fixed box and an absolute one whose containing block is outside the clipping box
+        if (c.style.position != browser::Position::Fixed) {
+          for (uint32_t k = 0; k < chain.count; ++k)
+            if (c.style.position != browser::Position::Absolute || chain.refs[k].positioned) e.clips.refs[e.clips.count++] = chain.refs[k];
+        }
         failed_ |= !out->push_back(e);
         // a positioned box without a z-index does not make a stacking context: the positioned boxes inside it belong to this one, too
-        if (!makes_context(c)) gather(cid, cx, cy, out);
+        if (!makes_context(c)) gather(cid, cx, cy, out, inside);
         continue;
       }
       if (c.floated || c.kind == BoxKind::InlineBlock || (c.kind == BoxKind::Replaced && c.is_inline_level())) continue;   // (painted as units, with what is in them)
-      gather(cid, cx, cy, out);
+      gather(cid, cx, cy, out, inside);
     }
+  }
+
+  // A context found below `clips`: painted inside them.
+  void paint_entry(const Entry& e) {
+    for (uint32_t k = 0; k < e.clips.count; ++k) push_clip(tree_.box(e.clips.refs[k].id), e.clips.refs[k].ax, e.clips.refs[k].ay);
+    paint_context(e.id, e.ax, e.ay);
+    for (uint32_t k = 0; k < e.clips.count; ++k) pop_clip();
   }
 
   void paint_context(BoxId id, LayoutUnit ax, LayoutUnit ay) {
     const Box& b = tree_.box(id);
     if (b.style.opaque_zero || depth_ > 120) return;
     ++depth_;
+    const Effects effects = open_effects(b, ax, ay);   // transform, clip-path and filter: the groups around the box and what is in it
     const bool layer = b.style.opacity_x1000 < 1000 && b.kind != BoxKind::Root;
     if (layer) {
       Op op;
@@ -162,7 +200,7 @@ class Builder {
     const bool clipped = b.kind != BoxKind::Root && push_clip(b, ax, ay);
 
     List<Entry> contexts(allocator());
-    if (b.kind == BoxKind::Root || makes_context(b) || b.floated || b.kind == BoxKind::InlineBlock || b.kind == BoxKind::Replaced) gather(id, ax, ay, &contexts);   // (otherwise the context above paints them)
+    if (b.kind == BoxKind::Root || makes_context(b) || b.floated || b.kind == BoxKind::InlineBlock || b.kind == BoxKind::Replaced) gather(id, ax, ay, &contexts, ClipChain());   // (otherwise the context above paints them)
     // order: z-index (stable, so tree order among equals)
     for (uint64_t i = 1; i < contexts.count(); ++i) {
       for (uint64_t j = i; j > 0 && contexts[j - 1].z > contexts[j].z; --j) {
@@ -172,12 +210,12 @@ class Builder {
       }
     }
     for (uint64_t i = 0; i < contexts.count(); ++i)
-      if (contexts[i].z < 0) paint_context(contexts[i].id, contexts[i].ax, contexts[i].ay);
+      if (contexts[i].z < 0) paint_entry(contexts[i]);
     walk(id, ax, ay, 0);   // the backgrounds and borders of blocks
     walk(id, ax, ay, 1);   // floats
     walk(id, ax, ay, 2);   // inline content
     for (uint64_t i = 0; i < contexts.count(); ++i)
-      if (contexts[i].z >= 0) paint_context(contexts[i].id, contexts[i].ax, contexts[i].ay);
+      if (contexts[i].z >= 0) paint_entry(contexts[i]);
 
     if (clipped) pop_clip();
     paint_outline(id, ax, ay);
@@ -186,7 +224,239 @@ class Builder {
       op.kind = OpKind::PopLayer;
       add(op);
     }
+    close_effects(effects);
     --depth_;
+  }
+
+  // --- transforms, filters and clip-path: groups around a stacking context
+  static constexpr uint64_t kNoOp = ~uint64_t{0};
+  struct Effects {
+    uint64_t transform_op = kNoOp, filter_op = kNoOp;
+    bool clip_path = false;
+    int32_t filter_grow = 0;
+  };
+
+  static IRect union_of(const IRect& a, const IRect& b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    IRect r;
+    r.x = a.x < b.x ? a.x : b.x;
+    r.y = a.y < b.y ? a.y : b.y;
+    r.width = (a.right() > b.right() ? a.right() : b.right()) - r.x;
+    r.height = (a.bottom() > b.bottom() ? a.bottom() : b.bottom()) - r.y;
+    return r;
+  }
+
+  // What the operations from `begin` on can draw (a transform inside counts as its transformed bounds).
+  IRect content_bounds(uint64_t begin) const {
+    IRect bounds;
+    const uint64_t end = out_.count();
+    for (uint64_t i = begin; i < end; ++i) {
+      const Op& op = out_.op(i);
+      switch (op.kind) {
+        case OpKind::PushTransform: {
+          bounds = union_of(bounds, transformed_bounds(out_.transform(op.data), op.rect));
+          const uint64_t close = out_.group_end(i);
+          i = close < end ? close : end;
+          break;
+        }
+        case OpKind::PushFilter:
+        case OpKind::FillRect:
+        case OpKind::Border:
+        case OpKind::Gradient:
+        case OpKind::Text:
+        case OpKind::Object:
+        case OpKind::Shadow:
+        case OpKind::Image: bounds = union_of(bounds, op.rect); break;
+        default: break;
+      }
+    }
+    return bounds;
+  }
+
+  static IRect grow_rect(const IRect& r, int32_t by) {
+    IRect out = r;
+    out.x -= by;
+    out.y -= by;
+    out.width += 2 * by;
+    out.height += 2 * by;
+    return out;
+  }
+
+  Effects open_effects(const Box& b, LayoutUnit ax, LayoutUnit ay) {
+    Effects e;
+    if (b.kind == BoxKind::Root || !options_.sheet) return e;
+    const Style& s = b.style;
+    const double w = static_cast<double>(b.width.to_px100()) / 100.0, h = static_cast<double>(b.height.to_px100()) / 100.0;
+    const double px = static_cast<double>(ax.to_px100()) / 100.0, py = static_cast<double>(ay.to_px100()) / 100.0;
+    if (!s.transform_value.empty() || !s.translate.empty() || !s.rotate.empty() || !s.scale.empty()) {
+      double m[16];
+      if (options_.sheet->transform_matrix(s, w, h, m, true)) {
+        Affine local;   // (the 3D parts are flattened: the matrix's x and y columns and its translation)
+        local.a = m[0];
+        local.b = m[1];
+        local.c = m[4];
+        local.d = m[5];
+        local.e = m[12];
+        local.f = m[13];
+        const Affine page = Affine::translation(px, py) * local * Affine::translation(-px, -py);
+        Op op;
+        op.kind = OpKind::PushTransform;
+        failed_ |= !out_.add_transform(page, &op.data);
+        e.transform_op = out_.count();
+        add(op);
+      }
+    }
+    if (!s.clip_path.empty()) {
+      browser::ClipPath cp;
+      ClipShape shape;
+      if (options_.sheet->clip_path(s, &cp) && build_shape(b, cp, px, py, w, h, &shape)) {
+        Op op;
+        op.kind = OpKind::PushClipPath;
+        op.rect = shape_bounds(shape);
+        failed_ |= !out_.add_shape(shape, &op.data);
+        add(op);
+        e.clip_path = true;
+      }
+    }
+    if (!s.filter.empty()) {
+      List<browser::FilterFunction> fns(allocator());
+      FilterData data;
+      if (options_.sheet->filters(s.filter, s, &fns)) {
+        for (uint64_t i = 0; i < fns.count() && data.count < kMaxFilterSteps; ++i) {
+          const browser::FilterFunction& f = fns[i];
+          if (f.kind == browser::FilterFunction::Url) continue;
+          FilterStep step;
+          step.kind = static_cast<FilterStep::Kind>(f.kind);
+          step.amount = static_cast<float>(f.amount);
+          if (f.kind == browser::FilterFunction::Blur) {
+            if (step.amount <= 0.0f) continue;
+            e.filter_grow += blur_reach(step.amount) + 1;
+          } else if (f.kind == browser::FilterFunction::DropShadow) {
+            step.dx = static_cast<float>(f.shadow.x_px100) / 100.0f;
+            step.dy = static_cast<float>(f.shadow.y_px100) / 100.0f;
+            step.blur = static_cast<float>(f.shadow.blur_px100 > 0 ? f.shadow.blur_px100 : 0) / 100.0f;
+            step.color = f.shadow.current_color ? ink_of(s) : f.shadow.color;
+            const float ox = step.dx < 0 ? -step.dx : step.dx, oy = step.dy < 0 ? -step.dy : step.dy;
+            e.filter_grow += static_cast<int32_t>(ox > oy ? ox : oy) + blur_reach(step.blur / 2.0f) + 2;
+          }
+          data.steps[data.count++] = step;
+        }
+      }
+      if (data.count > 0) {
+        Op op;
+        op.kind = OpKind::PushFilter;
+        failed_ |= !out_.add_filter(data, &op.data);
+        e.filter_op = out_.count();
+        add(op);
+      }
+    }
+    return e;
+  }
+
+  void close_effects(const Effects& e) {
+    if (e.filter_op != kNoOp) {
+      out_.mutable_op(e.filter_op).rect = grow_rect(content_bounds(e.filter_op + 1), e.filter_grow);
+      Op op;
+      op.kind = OpKind::PopFilter;
+      add(op);
+    }
+    if (e.clip_path) pop_clip();
+    if (e.transform_op != kNoOp) {
+      out_.mutable_op(e.transform_op).rect = content_bounds(e.transform_op + 1);
+      Op op;
+      op.kind = OpKind::PopTransform;
+      add(op);
+    }
+  }
+
+  // The clip-path shape in page coordinates (the reference box defaults to the border box). False for the shapes that are not supported (path(), url()).
+  bool build_shape(const Box& b, const browser::ClipPath& cp, double px, double py, double w, double h, ClipShape* out) const {
+    using browser::ClipPath;
+    if (cp.kind == ClipPath::None || cp.kind == ClipPath::Path || cp.kind == ClipPath::Url) return false;
+    double rx = px, ry = py, rw = w, rh = h;   // the reference box
+    if (cp.reference_box == browser::BackgroundBox::PaddingBox || cp.reference_box == browser::BackgroundBox::ContentBox) {
+      rx += static_cast<double>(b.border.left.to_px100()) / 100.0;
+      ry += static_cast<double>(b.border.top.to_px100()) / 100.0;
+      rw -= static_cast<double>(b.border.horizontal().to_px100()) / 100.0;
+      rh -= static_cast<double>(b.border.vertical().to_px100()) / 100.0;
+      if (cp.reference_box == browser::BackgroundBox::ContentBox) {
+        rx = px + static_cast<double>(b.content_left().to_px100()) / 100.0;
+        ry = py + static_cast<double>(b.content_top().to_px100()) / 100.0;
+        rw = static_cast<double>(b.content_width().to_px100()) / 100.0;
+        rh = static_cast<double>(b.content_height().to_px100()) / 100.0;
+      }
+    }
+    if (rw < 0) rw = 0;
+    if (rh < 0) rh = 0;
+    const int32_t w100 = static_cast<int32_t>(rw * 100), h100 = static_cast<int32_t>(rh * 100);
+    auto fx = [&](const browser::Dimension& d) { return static_cast<float>(d.resolve(w100)) / 100.0f; };
+    auto fy = [&](const browser::Dimension& d) { return static_cast<float>(d.resolve(h100)) / 100.0f; };
+    *out = ClipShape();
+    const float frx = static_cast<float>(rx), fry = static_cast<float>(ry), frw = static_cast<float>(rw), frh = static_cast<float>(rh);
+    switch (cp.kind) {
+      case ClipPath::Box:
+        out->x = frx; out->y = fry; out->width = frw; out->height = frh;
+        out->radii = radii_of(b);
+        return true;
+      case ClipPath::Inset: {
+        const float top = fy(cp.inset[0]), right = fx(cp.inset[1]), bottom = fy(cp.inset[2]), left = fx(cp.inset[3]);
+        out->x = frx + left;
+        out->y = fry + top;
+        out->width = frw - left - right;
+        out->height = frh - top - bottom;
+        if (out->width < 0) out->width = 0;
+        if (out->height < 0) out->height = 0;
+        graphics::CornerRadii& r = out->radii;
+        r.tl_x = fx(cp.round[0].h); r.tl_y = fy(cp.round[0].v);
+        r.tr_x = fx(cp.round[1].h); r.tr_y = fy(cp.round[1].v);
+        r.br_x = fx(cp.round[2].h); r.br_y = fy(cp.round[2].v);
+        r.bl_x = fx(cp.round[3].h); r.bl_y = fy(cp.round[3].v);
+        return true;
+      }
+      case ClipPath::Circle:
+      case ClipPath::Ellipse: {
+        const float cx = frx + static_cast<float>(cp.center_x.resolve(w100)) / 100.0f, cy = fry + static_cast<float>(cp.center_y.resolve(h100)) / 100.0f;
+        const float to_left = cx - frx, to_right = frx + frw - cx, to_top = cy - fry, to_bottom = fry + frh - cy;
+        const float near_x = to_left < to_right ? to_left : to_right, near_y = to_top < to_bottom ? to_top : to_bottom;
+        const float far_x = to_left > to_right ? to_left : to_right, far_y = to_top > to_bottom ? to_top : to_bottom;
+        float radius_x, radius_y;
+        if (cp.kind == ClipPath::Circle) {
+          float r;
+          if (cp.radius_x.is_auto()) {
+            r = cp.radius_far ? (far_x > far_y ? far_x : far_y) : (near_x < near_y ? near_x : near_y);
+          } else if (cp.radius_x.kind == browser::Dimension::Percent) {   // (a percentage of sqrt((w^2 + h^2) / 2))
+            const float norm = static_cast<float>(fmath::sqrt(static_cast<double>(frw * frw + frh * frh) / 2.0));
+            r = norm * static_cast<float>(cp.radius_x.x100) / 10000.0f;
+          } else {
+            r = static_cast<float>(cp.radius_x.x100) / 100.0f;
+          }
+          radius_x = radius_y = r;
+        } else {
+          radius_x = cp.radius_x.is_auto() ? (cp.radius_far ? far_x : near_x) : fx(cp.radius_x);
+          radius_y = cp.radius_y.is_auto() ? (cp.radius_far ? far_y : near_y) : fy(cp.radius_y);
+        }
+        if (radius_x < 0) radius_x = 0;
+        if (radius_y < 0) radius_y = 0;
+        out->x = cx - radius_x;
+        out->y = cy - radius_y;
+        out->width = 2 * radius_x;
+        out->height = 2 * radius_y;
+        out->radii = graphics::CornerRadii{radius_x, radius_y, radius_x, radius_y, radius_x, radius_y, radius_x, radius_y};
+        return true;
+      }
+      case ClipPath::Polygon:
+        if (cp.point_count < 3) return false;
+        out->polygon = true;
+        out->evenodd = cp.evenodd;
+        out->point_count = cp.point_count < kMaxClipPoints ? cp.point_count : kMaxClipPoints;
+        for (uint32_t i = 0; i < out->point_count; ++i) {
+          out->points[i].x = frx + fx(cp.points_x[i]);
+          out->points[i].y = fry + fy(cp.points_y[i]);
+        }
+        return true;
+      default: return false;
+    }
   }
 
   // phase 0: block backgrounds, 1: floats, 2: inline content
@@ -218,6 +488,7 @@ class Builder {
       const bool clipped = push_clip(c, cx, cy);
       walk(cid, cx, cy, phase);
       if (clipped) pop_clip();
+      if (phase == 2) paint_outline(cid, cx, cy);   // (a box that is no stacking context has its outline over its content)
     }
   }
 
@@ -286,7 +557,7 @@ class Builder {
     const graphics::CornerRadii radii = radii_of(b);
     if (rect.empty() && b.kind != BoxKind::Replaced) return;
     add_hit(b, rect);
-    if (!s.box_shadow.empty() && options_.sheet) paint_shadows(b, rect, radii);
+    if (!s.box_shadow.empty() && options_.sheet) paint_shadows(b, ax, ay, rect, radii, false);
     const bool skip_bg = id == skip_background_of_;
     if (!skip_bg) {
       if (s.own_background && (s.background_argb >> 24) != 0) {
@@ -299,41 +570,57 @@ class Builder {
       }
       if (!s.background_image.empty() && options_.sheet) paint_background_layers(b, ax, ay, rect, radii);
     }
+    if (!s.box_shadow.empty() && options_.sheet) paint_shadows(b, ax, ay, rect, radii, true);
     paint_border(b, rect, radii);
     if (b.kind == BoxKind::Replaced) paint_replaced(id, ax, ay);
   }
 
-  void paint_shadows(const Box& b, const IRect& rect, const graphics::CornerRadii& radii) {
+  // The radii of the padding edge: the outer radii less the border widths.
+  graphics::CornerRadii padding_radii(const Box& b) const {
+    graphics::CornerRadii r = radii_of(b);
+    const float bl = static_cast<float>(b.border.left.to_px100()) / 100.0f, br = static_cast<float>(b.border.right.to_px100()) / 100.0f;
+    const float bt = static_cast<float>(b.border.top.to_px100()) / 100.0f, bb = static_cast<float>(b.border.bottom.to_px100()) / 100.0f;
+    auto less = [](float v, float d) { return v > d ? v - d : 0.0f; };
+    r.tl_x = less(r.tl_x, bl); r.tl_y = less(r.tl_y, bt);
+    r.tr_x = less(r.tr_x, br); r.tr_y = less(r.tr_y, bt);
+    r.br_x = less(r.br_x, br); r.br_y = less(r.br_y, bb);
+    r.bl_x = less(r.bl_x, bl); r.bl_y = less(r.bl_y, bb);
+    return r;
+  }
+
+  static int32_t px100_to_int(int32_t v) { return (v + (v >= 0 ? 50 : -50)) / 100; }
+
+  // box-shadow: the outer shadows go under the background, the inset ones over it. The first shadow of the list is on top.
+  void paint_shadows(const Box& b, LayoutUnit ax, LayoutUnit ay, const IRect& rect, const graphics::CornerRadii& radii, bool inset) {
     List<browser::Shadow> shadows(allocator());
     if (!options_.sheet->shadows(b.style.box_shadow, b.style, &shadows)) return;
-    for (uint64_t i = shadows.count(); i > 0; --i) {   // (the first shadow is on top)
+    for (uint64_t i = shadows.count(); i > 0; --i) {
       const browser::Shadow& sh = shadows[i - 1];
-      if (sh.inset) continue;
-      const uint32_t color = sh.current_color ? ink_of(b.style) : sh.color;
-      if ((color >> 24) == 0) continue;
-      const int32_t spread = static_cast<int32_t>((sh.spread_px100 + (sh.spread_px100 >= 0 ? 50 : -50)) / 100);
-      const int32_t blur = static_cast<int32_t>((sh.blur_px100 + 50) / 100);
-      const int32_t dx = static_cast<int32_t>((sh.x_px100 + (sh.x_px100 >= 0 ? 50 : -50)) / 100), dy = static_cast<int32_t>((sh.y_px100 + (sh.y_px100 >= 0 ? 50 : -50)) / 100);
-      // a blur is a few rings of falling opacity around the shadow's shape
-      const int32_t rings = blur <= 0 ? 0 : (blur > 8 ? 8 : blur);
-      for (int32_t ring = rings; ring >= 0; --ring) {
-        const int32_t grow = spread + (rings ? (ring * blur) / (2 * rings) : 0) - (rings ? blur / 4 : 0);
-        Op op;
-        op.kind = OpKind::FillRect;
-        op.rect.x = rect.x + dx - grow;
-        op.rect.y = rect.y + dy - grow;
-        op.rect.width = rect.width + 2 * grow;
-        op.rect.height = rect.height + 2 * grow;
-        if (op.rect.empty()) continue;
-        op.color = with_alpha(color, rings ? 255u / static_cast<uint32_t>(rings + 1) : 255u);
-        graphics::CornerRadii r = radii;
-        if (grow > 0) {
-          const float g = static_cast<float>(grow);
-          r.tl_x += g; r.tl_y += g; r.tr_x += g; r.tr_y += g; r.br_x += g; r.br_y += g; r.bl_x += g; r.bl_y += g;
-        }
-        op.radii = r;
-        add(op);
+      if (sh.inset != inset) continue;
+      ShadowData d;
+      d.color = sh.current_color ? ink_of(b.style) : sh.color;
+      if ((d.color >> 24) == 0) continue;
+      d.inset = inset;
+      d.dx = px100_to_int(sh.x_px100);
+      d.dy = px100_to_int(sh.y_px100);
+      d.spread = px100_to_int(sh.spread_px100);
+      d.blur = sh.blur_px100 > 0 ? static_cast<float>(sh.blur_px100) / 100.0f : 0.0f;
+      Op op;
+      op.kind = OpKind::Shadow;
+      const int32_t reach = blur_reach(d.blur / 2.0f) + 1;
+      if (inset) {
+        d.box = snap(ax + b.border.left, ay + b.border.top, b.width - b.border.horizontal(), b.height - b.border.vertical());
+        d.radii = padding_radii(b);
+        op.rect = d.box;
+      } else {
+        d.box = rect;
+        d.radii = radii;
+        const int32_t grow = (d.spread > 0 ? d.spread : 0) + reach;
+        op.rect = IRect{rect.x + d.dx - grow, rect.y + d.dy - grow, rect.width + 2 * grow, rect.height + 2 * grow};
       }
+      if (op.rect.empty()) continue;
+      failed_ |= !out_.add_shadow(d, &op.data);
+      add(op);
     }
   }
 
@@ -393,6 +680,7 @@ class Builder {
   bool build_gradient(const browser::Gradient& g, const Style& style, const IRect& area, GradientData* out) {
     const float w = static_cast<float>(area.width), h = static_cast<float>(area.height);
     out->stop_count = 0;
+    out->repeating = g.repeating;
     // the positions of the stops along the line, in pixels once the line is known: work out `length` first
     float length = 1.0f;
     if (g.kind == browser::Gradient::Linear) {
@@ -416,7 +704,7 @@ class Builder {
       length = (dx < 0 ? -dx : dx) * w + (dy < 0 ? -dy : dy) * h;
       if (length < 1.0f) length = 1.0f;
       const float cx = static_cast<float>(area.x) + w / 2, cy = static_cast<float>(area.y) + h / 2;
-      out->radial = false;
+      out->kind = GradientData::Linear;
       out->from = {cx - dx * length / 2, cy - dy * length / 2};
       out->to = {cx + dx * length / 2, cy + dy * length / 2};
     } else if (g.kind == browser::Gradient::Radial) {
@@ -443,19 +731,35 @@ class Builder {
       }
       if (rx < 0.5f) rx = 0.5f;
       if (ry < 0.5f) ry = 0.5f;
-      out->radial = true;
+      out->kind = GradientData::Radial;
       out->center = {cx, cy};
       out->radii = {rx, ry};
       length = rx;   // (stop positions in pixels are along the horizontal radius)
     } else {
-      return false;   // conic gradients are not drawn yet
+      // conic: the stops are in turns, the sweep starts at the angle (clockwise from the top) around the centre
+      out->kind = GradientData::Conic;
+      out->center = {static_cast<float>(area.x) + static_cast<float>(g.center_x.resolve(static_cast<int32_t>(w * 100))) / 100.0f,
+                     static_cast<float>(area.y) + static_cast<float>(g.center_y.resolve(static_cast<int32_t>(h * 100))) / 100.0f};
+      // (the style's default angle is 180 for every gradient kind: a conic gradient without `from` starts at the top)
+      const int32_t angle_x100 = g.angle_x100 == 18000 ? 0 : g.angle_x100;
+      out->start_angle = static_cast<float>(static_cast<double>(angle_x100) / 100.0 * 3.14159265358979323846 / 180.0);
+      length = 1.0f;
     }
     // the stops: positions in pixels (or percent of the length), the missing ones spread evenly, never going back
     float pos[browser::kMaxGradientStops];
-    bool given[browser::kMaxGradientStops];
+    float hint_pos[browser::kMaxGradientStops];   // the colour hint after a stop, in the same unit as pos (NaN-free: has_hint says whether)
+    bool given[browser::kMaxGradientStops], has_hint[browser::kMaxGradientStops];
     uint32_t n = 0;
     for (uint32_t i = 0; i < g.stop_count && n < browser::kMaxGradientStops && n < graphics::kMaxGradientStops; ++i) {
-      if (g.stops[i].hint) continue;
+      if (g.stops[i].hint) {
+        if (n > 0 && !g.stops[i].position.is_auto()) {
+          has_hint[n - 1] = true;
+          hint_pos[n - 1] = dim_px(g.stops[i].position, length);
+        }
+        continue;
+      }
+      has_hint[n] = false;
+      hint_pos[n] = 0.0f;
       given[n] = !g.stops[i].position.is_auto();
       pos[n] = given[n] ? dim_px(g.stops[i].position, length) : 0.0f;
       out->stops[n].color = g.stops[i].current_color ? ink_of(style) : g.stops[i].color;
@@ -476,6 +780,12 @@ class Builder {
       i = j - 1;
     }
     for (uint32_t i = 0; i < n; ++i) out->stops[i].offset = length > 0 ? pos[i] / length : 0.0f;
+    for (uint32_t i = 0; i < graphics::kMaxGradientStops; ++i) out->hints[i] = -1.0f;
+    for (uint32_t i = 0; i + 1 < n; ++i) {
+      if (!has_hint[i] || pos[i + 1] <= pos[i]) continue;
+      float u = (hint_pos[i] - pos[i]) / (pos[i + 1] - pos[i]);
+      out->hints[i] = u < 0.0f ? 0.0f : u > 1.0f ? 1.0f : u;   // (0 and 1 are a hard transition: the painter treats them as none)
+    }
     out->stop_count = n;
     return true;
   }
@@ -486,7 +796,7 @@ class Builder {
     // the first layer is on top, so paint from the last
     for (uint64_t li = layers.count(); li > 0; --li) {
       const browser::BackgroundLayer& layer = layers[li - 1];
-      if (layer.image != browser::BackgroundLayer::GradientImage) continue;   // (url() images wait for the picture loader)
+      if (layer.image != browser::BackgroundLayer::GradientImage && layer.image != browser::BackgroundLayer::Url) continue;   // (image-set() and the like are not drawn)
       // the positioning area (padding box by default) and the clip (border box by default)
       IRect origin = border_rect;
       auto inset_by = [&](browser::BackgroundBox box) {
@@ -500,6 +810,33 @@ class Builder {
       origin = inset_by(layer.origin);
       const IRect clip = inset_by(layer.clip == browser::BackgroundBox::Text ? browser::BackgroundBox::BorderBox : layer.clip);
       if (clip.empty() || origin.empty()) continue;
+      const bool same_as_border = clip.x == border_rect.x && clip.y == border_rect.y && clip.width == border_rect.width && clip.height == border_rect.height;
+      if (layer.image == browser::BackgroundLayer::Url) {   // a picture: the painter asks the object painter for its size and draws the tiles
+        if (layer.url.empty()) continue;
+        ImageLayerData d;
+        d.origin = origin;
+        d.clip = clip;
+        d.size_mode = static_cast<ImageLayerData::SizeMode>(layer.size_mode);
+        if (layer.size_mode == browser::BackgroundLayer::Explicit) {
+          d.size_w = layer.size_w.is_auto() ? -1.0f : dim_px(layer.size_w, static_cast<float>(origin.width));
+          d.size_h = layer.size_h.is_auto() ? -1.0f : dim_px(layer.size_h, static_cast<float>(origin.height));
+        }
+        d.pos_x_percent_x100 = layer.position_x.percent_x100;
+        d.pos_x_px100 = layer.position_x.px100;
+        d.pos_y_percent_x100 = layer.position_y.percent_x100;
+        d.pos_y_px100 = layer.position_y.px100;
+        d.repeat_x = static_cast<uint8_t>(layer.repeat_x);
+        d.repeat_y = static_cast<uint8_t>(layer.repeat_y);
+        Op op;
+        op.kind = OpKind::Image;
+        op.rect = clip;
+        op.radii = same_as_border ? radii : graphics::CornerRadii();
+        failed_ |= !out_.add_image(d, &op.data);
+        failed_ |= !out_.add_text(layer.url, &op.text_offset);
+        op.text_length = static_cast<uint32_t>(layer.url.size());
+        add(op);
+        continue;
+      }
       // the size of one tile
       int32_t tw = origin.width, th = origin.height;
       if (layer.size_mode == browser::BackgroundLayer::Explicit) {
@@ -507,39 +844,31 @@ class Builder {
         if (!layer.size_h.is_auto()) th = static_cast<int32_t>(dim_px(layer.size_h, static_cast<float>(origin.height)) + 0.5f);
       }
       if (tw <= 0 || th <= 0) continue;
-      const int32_t ox = origin.x + layer.position_x.resolve((origin.width - tw) * 100) / 100;
-      const int32_t oy = origin.y + layer.position_y.resolve((origin.height - th) * 100) / 100;
-      const bool repeat_x = layer.repeat_x != browser::RepeatMode::NoRepeat, repeat_y = layer.repeat_y != browser::RepeatMode::NoRepeat;
-      // the tiles that touch the clip area (a limited number)
-      int32_t first_x = ox, first_y = oy;
-      if (repeat_x && tw > 0) first_x = ox - ((ox - clip.x + tw - 1) / tw) * tw;
-      if (repeat_y && th > 0) first_y = oy - ((oy - clip.y + th - 1) / th) * th;
+      const TileAxis ax_tiles = lay_out_tiles(origin.x, origin.width, clip.x, clip.right(), tw, layer.position_x.percent_x100, layer.position_x.px100, static_cast<uint8_t>(layer.repeat_x));
+      const TileAxis ay_tiles = lay_out_tiles(origin.y, origin.height, clip.y, clip.bottom(), th, layer.position_y.percent_x100, layer.position_y.px100, static_cast<uint8_t>(layer.repeat_y));
       uint32_t tiles = 0;
-      for (int32_t y = first_y; y < clip.bottom() && tiles < 400; y += th) {
-        for (int32_t x = first_x; x < clip.right() && tiles < 400; x += tw) {
+      for (int32_t j = 0; j < ay_tiles.count && tiles < 400; ++j) {
+        for (int32_t i = 0; i < ax_tiles.count && tiles < 400; ++i) {
           IRect tile;
-          tile.x = x;
-          tile.y = y;
-          tile.width = tw;
-          tile.height = th;
+          tile.x = ax_tiles.first + i * ax_tiles.pitch;
+          tile.y = ay_tiles.first + j * ay_tiles.pitch;
+          tile.width = ax_tiles.size;
+          tile.height = ay_tiles.size;
           const IRect visible = tile.intersection(clip);
-          if (!visible.empty()) {
-            GradientData data;
-            if (build_gradient(layer.gradient, b.style, tile, &data)) {
-              uint32_t index = 0;
-              failed_ |= !out_.add_gradient(data, &index);
-              Op op;
-              op.kind = OpKind::Gradient;
-              op.rect = visible;
-              op.gradient = index;
-              op.radii = (visible.x == border_rect.x && visible.y == border_rect.y && visible.width == border_rect.width && visible.height == border_rect.height) ? radii : graphics::CornerRadii();
-              add(op);
-            }
-            ++tiles;
+          if (visible.empty()) continue;
+          GradientData data;
+          if (build_gradient(layer.gradient, b.style, tile, &data)) {
+            uint32_t index = 0;
+            failed_ |= !out_.add_gradient(data, &index);
+            Op op;
+            op.kind = OpKind::Gradient;
+            op.rect = visible;
+            op.gradient = index;
+            op.radii = (visible.x == border_rect.x && visible.y == border_rect.y && visible.width == border_rect.width && visible.height == border_rect.height) ? radii : graphics::CornerRadii();
+            add(op);
           }
-          if (!repeat_x) break;
+          ++tiles;
         }
-        if (!repeat_y) break;
       }
     }
   }
@@ -571,7 +900,7 @@ class Builder {
     op.rect = snap(x, y, width, height);
     op.color = color;
     op.node = node;
-    op.font = measurer_.handle_for(s);
+    failed_ |= !out_.add_font(measurer_.query_for(s), &op.font);
     op.text_x64 = x.raw();
     op.baseline = (y + m.ascent).round();
     const font::ShapeOptions so = measurer_.shape_options(s);
@@ -582,9 +911,35 @@ class Builder {
     if (thickness < 1) thickness = 1;
     op.decoration_thickness = thickness;
     op.decoration_offset = (s.font_px + 7) / 8 + 1;
+    op.strike_offset = (s.font_px * 3 + 5) / 10;
     failed_ |= !out_.add_text(text, &op.text_offset);
     op.text_length = static_cast<uint32_t>(text.size());
+    if (!s.text_shadow.empty() && options_.sheet) emit_text_shadows(s, op);
     add(op);
+  }
+
+  // text-shadow: the run again, shifted, in the shadow's colour and blurred; the first shadow of the list is on top so the last one goes first.
+  void emit_text_shadows(const Style& s, const Op& text_op) {
+    List<browser::Shadow> shadows(allocator());
+    if (!options_.sheet->shadows(s.text_shadow, s, &shadows)) return;
+    for (uint64_t i = shadows.count(); i > 0; --i) {
+      const browser::Shadow& sh = shadows[i - 1];
+      Op op = text_op;
+      op.color = sh.current_color ? text_op.color : sh.color;
+      if ((op.color >> 24) == 0) continue;
+      op.node = 0;   // (a shadow is not something the pointer finds)
+      const int32_t dx = px100_to_int(sh.x_px100), dy = px100_to_int(sh.y_px100);
+      op.blur = sh.blur_px100 > 0 ? static_cast<float>(sh.blur_px100) / 100.0f : 0.0f;
+      op.text_x64 += dx * 64;
+      op.baseline += dy;
+      op.decoration_color = 0;
+      const int32_t reach = op.blur > 0.0f ? blur_reach(op.blur / 2.0f) + 2 : 0;   // (the painter takes this growth off again to place the decorations)
+      op.rect.x += dx - reach;
+      op.rect.y += dy - reach;
+      op.rect.width += 2 * reach;
+      op.rect.height += 2 * reach;
+      add(op);
+    }
   }
 
   void paint_lines(BoxId id, LayoutUnit ax, LayoutUnit ay) {
@@ -646,7 +1001,37 @@ class Builder {
     const layout::TextMetrics tm = measurer_.metrics(m.style);
     if (li.inline_content && li.lines.count() > 0) baseline_y = ay + li.lines[0].y + li.lines[0].baseline - tm.ascent;
     else baseline_y = ay + m.y;
+    if (options_.sheet && !m.style.list_style_image.empty()) {   // list-style-image: url(): the picture stands in the marker's box, at its right edge, centred on the line
+      const StringView url = url_in(options_.sheet->text(m.style.list_style_image));
+      if (!url.empty()) {
+        ImageLayerData d;
+        d.origin = d.clip = snap(ax + m.x, baseline_y, m.width, tm.height());
+        d.pos_x_percent_x100 = 10000;
+        d.pos_y_percent_x100 = 5000;
+        d.repeat_x = d.repeat_y = kNoRepeat;
+        Op op;
+        op.kind = OpKind::Image;
+        op.rect = d.clip;
+        failed_ |= !out_.add_image(d, &op.data);
+        failed_ |= !out_.add_text(url, &op.text_offset);
+        op.text_length = static_cast<uint32_t>(url.size());
+        add(op);
+        return;
+      }
+    }
     emit_text(m, m.text.view(), ax + m.x, baseline_y, m.width, tm.height(), 0, m.style.color ? m.style.color : kDefaultInk);
+  }
+
+  // The address in `url(...)` (unquoted); empty if the text is not a url() (a gradient marker is not drawn).
+  static StringView url_in(StringView value) {
+    const uint64_t at = value.find("url(");
+    if (at == StringView::npos) return StringView();
+    StringView inner = value.substr(at + 4);
+    const uint64_t close = inner.find(')');
+    if (close == StringView::npos) return StringView();
+    inner = inner.first(close).trimmed();
+    if (inner.size() >= 2 && (inner[0] == '"' || inner[0] == '\'') && inner[inner.size() - 1] == inner[0]) inner = inner.substr(1, inner.size() - 2);
+    return inner;
   }
 
   // --- pictures, controls and frames

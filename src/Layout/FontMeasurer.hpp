@@ -35,6 +35,8 @@ class FontMeasurer final : public ITextMeasurer {
 
   // The font a style asks for (cached: styles of a page are few).
   font::FontHandle handle_for(const browser::Style& style);
+  // What handle_for() asks the font set for (the family text points into the style sheet).
+  font::FontQuery query_for(const browser::Style& style) const;
   font::ShapeOptions shape_options(const browser::Style& style) const;
 
  private:

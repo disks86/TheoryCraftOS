@@ -156,8 +156,14 @@ class LayoutContext {
   // height of the content. The box starts a formatting context of its own, so no margins collapse through it. Until they are written they lay the
   // children out as blocks.
   ChildrenResult layout_flex(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
+  // The widths a flex container takes (for intrinsic_widths): the sum of its items' for a row, the largest for a column.
+  void flex_intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUnit* max_content);
   ChildrenResult layout_grid(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
+  // The widths a grid container takes (for intrinsic_widths): its columns sized under a min-content and a max-content constraint.
+  void grid_intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUnit* max_content);
   ChildrenResult layout_table(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
+  // The widths a table takes (for intrinsic_widths): its columns and the spacing between them; its own borders and padding are not in them.
+  void table_intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUnit* max_content);
   ChildrenResult layout_columns(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
 
   // --- Inline.cpp
@@ -183,6 +189,9 @@ class LayoutContext {
   LayoutUnit origin_x_, origin_y_;           // the border box of the box being laid out, in that context's coordinates
 
   friend struct InlineCollector;
+  friend struct TableLayouter;   // Table.cpp
+  friend struct FlexLayout;   // Flex.cpp
+  friend struct GridLayout;   // Grid.cpp
 };
 
 

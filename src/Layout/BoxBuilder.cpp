@@ -17,6 +17,7 @@
  */
 
 #include "Layout/BoxBuilder.hpp"
+#include "Layout/Table.hpp"
 #include <initializer_list>
 
 namespace browser {
@@ -183,6 +184,7 @@ class Builder {
     if (!n->is_element() || makes_no_box(n)) return;
     Style s = browser::derive_style(parent_style, n, sheet_);
     if (s.display == Display::None) return;
+    apply_table_presentation(n, parent_style, sheet_, &s);   // (<table>, <tr>, <td> ... are table boxes: TableFixup.cpp)
     if (s.contents) {   // display: contents: no box of its own, its children are the parent's
       build_children(n, s, parent, depth);
       return;
@@ -215,6 +217,7 @@ class Builder {
     b.establishes_bfc = out_of_flow || floated || kind == BoxKind::InlineBlock || s.overflow_x != Overflow::Visible || s.overflow_y != Overflow::Visible ||
                         s.layout == Layout::Flex || s.layout == Layout::Grid || s.layout == Layout::Table || s.column_count > 0;
     failed_ |= !tree_.append(parent, id);
+    read_table_attributes(n, &b);
     if (n->is_tag("hr")) {   // (the line of a rule: a box with a border and nothing in it)
       Style& hs = tree_.box(id).style;
       hs.display = Display::Block;
@@ -230,6 +233,7 @@ class Builder {
     if (s.display == Display::ListItem && !s.list_none) add_marker(n, s, id);
     build_children(n, s, id, depth + 1);
     finalize(id);
+    failed_ |= !finish_table(tree_, id);
   }
 
   // A picture, video, canvas, svg, iframe or form control: a box with a size of its own and nothing inside it. False for anything else.
@@ -330,13 +334,29 @@ class Builder {
 
   // Arranges the children of a box that has all of them: block containers hold blocks or inline content, not both.
   void finalize(BoxId id) {
+    List<BoxId> table_cells(allocator());   // anonymous cells made for loose content in a table (TableFixup.cpp)
+    failed_ |= !fixup_table_parts(tree_, id, &table_cells);
+    for (uint64_t i = 0; i < table_cells.count(); ++i) finalize(table_cells[i]);
+    // The items of a flex container are blockified (an inline, inline-block or picture child is an item of its own; a float does not apply),
+    // and text becomes anonymous items, so a flex container never lays out inline content itself.
+    const bool flex = (tree_.box(id).style.layout == Layout::Flex || tree_.box(id).style.layout == Layout::Grid) && tree_.box(id).kind != BoxKind::Inline;   // (and a grid container's)
+    if (flex) {
+      for (uint64_t i = 0; i < tree_.box(id).children.count(); ++i) {
+        Box& c = tree_.box(tree_.box(id).children[i]);
+        if (c.kind == BoxKind::Marker || c.kind == BoxKind::Text || c.kind == BoxKind::LineBreak || c.out_of_flow) continue;
+        c.floated = false;
+        if (c.kind == BoxKind::Inline || c.kind == BoxKind::InlineBlock) c.kind = BoxKind::Block;
+        if (c.kind == BoxKind::Replaced) c.style.display = Display::Block;
+        c.establishes_bfc = true;
+      }
+    }
     bool has_block = false;
     for (uint64_t i = 0; i < tree_.box(id).children.count(); ++i) {
       const Box& c = tree_.box(tree_.box(id).children[i]);
       if (c.is_block_level() && !c.out_of_flow && !c.floated) has_block = true;
     }
     Box& b = tree_.box(id);
-    if (!has_block) {
+    if (!has_block && !flex) {
       b.inline_content = true;
       return;
     }
@@ -353,6 +373,7 @@ class Builder {
         Style& as = tree_.box(anon).style;
         as.display = Display::Block;
         tree_.box(anon).inline_content = true;
+        tree_.box(anon).establishes_bfc = flex;   // (an item of a flex or grid container)
         tree_.box(anon).parent = id;
         for (uint64_t i = 0; i < run.count(); ++i) failed_ |= !tree_.append(anon, run[i]);
         failed_ |= !arranged.push_back(anon);

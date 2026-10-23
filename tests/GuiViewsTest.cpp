@@ -6373,11 +6373,32 @@ struct FakeLoader final : browser::IPageLoader {
   }
 };
 
-static bool run_contains(desktop::WebBrowser& b, const char* text) {
-  const browser::HtmlDocument* doc = b.page().document();
-  for (uint64_t i = 0; doc && i < doc->run_count(); ++i)
-    if (doc->run_text(i).contains(text)) return true;
-  return false;
+// What the page shows is a display list now: the text it paints, where, and in what colour.
+static const paint::Op* find_text_op(desktop::WebBrowser& b, const char* text) {
+  const browser::PagePicture* picture = b.page().picture();
+  for (uint64_t i = 0; picture && i < picture->list.count(); ++i) {
+    const paint::Op& op = picture->list.op(i);
+    if (op.kind == paint::OpKind::Text && picture->list.text(op).contains(text)) return &op;
+  }
+  return nullptr;
+}
+static bool run_contains(desktop::WebBrowser& b, const char* text) { return find_text_op(b, text) != nullptr; }
+// The centre of the first text that contains `text`, in the coordinates of the window the browser is in (scrolled to the top).
+static bool text_point(desktop::WebBrowser& b, const char* text, int32_t* x, int32_t* y) {
+  const paint::Op* op = find_text_op(b, text);
+  if (!op) return false;
+  const Point o = b.page().window_origin();
+  *x = o.x + op->rect.x + op->rect.width / 2;
+  *y = o.y + op->rect.y + op->rect.height / 2 - b.page().scroll_y();
+  return true;
+}
+// The rectangles of the pictures, videos and canvases of the page, in order.
+static int object_rects(desktop::WebBrowser& b, paint::IRect* out, int max) {
+  const browser::PagePicture* picture = b.page().picture();
+  int n = 0;
+  for (uint64_t i = 0; picture && i < picture->list.count() && n < max; ++i)
+    if (picture->list.op(i).kind == paint::OpKind::Object) out[n++] = picture->list.op(i).rect;
+  return n;
 }
 
 static void test_web_browser() {
@@ -6410,7 +6431,7 @@ static void test_web_browser() {
     // It starts on a welcome page, with nowhere to go back to.
     CHECK(b.title().equals("Web Browser - Welcome") || b.title().equals("Web Browser"));
     CHECK(b.address().empty() && !b.can_go_back() && !b.can_go_forward() && !b.back_button().enabled() && !b.forward_button().enabled());
-    CHECK(b.page().line_count() > 5 && run_contains(b, "TheoryCraftOS Web Browser"));
+    CHECK(b.page().picture() && b.page().picture()->height() > 80 && run_contains(b, "TheoryCraftOS Web Browser"));
 
     // Typing an address and pressing Enter opens it.
     w.set_focus(&b.address_box());
@@ -6422,7 +6443,8 @@ static void test_web_browser() {
 
     // Moving over the link shows where it leads; a click follows it, and the way back opens.
     const Point origin = b.page().window_origin();
-    const int32_t link_x = origin.x + gui::PageView::kMargin + 6 * 8, link_y = origin.y + 8;
+    int32_t link_x = 0, link_y = 0;
+    CHECK(text_point(b, "next", &link_x, &link_y));
     w.mouse_move(link_x, link_y);
     CHECK(b.page().hovered_link().equals("/next") && b.status_label().text().equals("/next"));
     w.mouse_move(origin.x + 300, origin.y + 200);
@@ -6473,15 +6495,11 @@ static void test_web_browser() {
     // tick(), the colour scheme is a media query the page watches, and the page is drawn again each time.
     {
       CHECK(b.navigate("http://dom.test/") && run_contains(b, "start") && run_contains(b, "wide") && b.title().equals("Web Browser - light"));
-      CHECK(b.page().document()->run(0).color == 0xFFFF0000);
-      const Point od = b.page().window_origin();
-      int32_t link_y = -1;
-      String target(a);
-      for (int32_t y = 0; y < 80 && link_y < 0; y += 8)
-        if (b.page().link_at(gui::PageView::kMargin + 4, y, &target)) link_y = y;
-      CHECK(link_y >= 0);
+      CHECK(find_text_op(b, "start") && find_text_op(b, "start")->color == 0xFFFF0000);
+      int32_t link_px = 0, link_py = 0;
+      CHECK(text_point(b, "go", &link_px, &link_py));
       const size_t asked_before = loader.asked.size();
-      click(w, od.x + gui::PageView::kMargin + 4, od.y + link_y);
+      click(w, link_px, link_py);
       CHECK(run_contains(b, "clicked") && !run_contains(b, "start") && loader.asked.size() == asked_before && b.address().equals("http://dom.test/"));
       b.tick(10 * 1000);
       CHECK(!run_contains(b, "timer"));
@@ -6496,12 +6514,14 @@ static void test_web_browser() {
 
     // Files on the system's own volumes: pages (links resolve against the folder), plain text, and files that are not there.
     CHECK(b.navigate("/docs/index.html") && b.title().equals("Web Browser - Index") && b.address().equals("/docs/index.html") && run_contains(b, "Local"));
-    const Point o2 = b.page().window_origin();
-    click(w, o2.x + gui::PageView::kMargin + 8 * 8, o2.y + 8);   // "two"
+    int32_t cx = 0, cy = 0;
+    CHECK(text_point(b, "two", &cx, &cy));
+    click(w, cx, cy);   // "two"
     CHECK(b.address().equals("/docs/two.html") && b.title().equals("Web Browser - Second") && run_contains(b, "second page"));
     CHECK(b.go_back());
-    click(w, o2.x + gui::PageView::kMargin + 14 * 8, o2.y + 8);   // "notes"
-    CHECK(b.address().equals("/notes.txt") && b.page().document()->run_count() == 1 && b.page().document()->run_text(0).equals("plain  text\nline two"));
+    CHECK(text_point(b, "notes", &cx, &cy));
+    click(w, cx, cy);   // "notes"
+    CHECK(b.address().equals("/notes.txt") && run_contains(b, "plain  text") && run_contains(b, "line two"));
     CHECK(b.navigate("/nothing.html") && b.status_label().text().contains("Cannot open /nothing.html") && b.address().equals("/notes.txt"));
     CHECK(b.navigate("file:///docs/two.html") && b.address().equals("/docs/two.html"));
     // A file dragged from an explorer opens.
@@ -6510,35 +6530,36 @@ static void test_web_browser() {
     CHECK(b.address().equals("/docs/index.html"));
 
     // Stylesheets show: the page's background, a block's background across its lines, and coloured text.
-    CHECK(b.navigate("/css.html") && b.page().document()->page_background() == 0xFF000080);
+    CHECK(b.navigate("/css.html") && b.page().picture() && b.page().picture()->list.background() == 0xFF000080);
     w.render();
     const Point po = b.page().window_origin();
     CHECK(screen.px(po.x + 300, po.y + 150) == 0xFF000080);       // the page
-    CHECK(screen.px(po.x + 300, po.y + 8) == 0xFFFF0000);         // the block's line, beyond its text
+    CHECK(screen.px(po.x + 300, po.y + 24) == 0xFFFF0000);        // the block, beyond its text
     bool yellow = false;                                           // the text itself
-    for (int32_t x = 0; x < 120 && !yellow; ++x)
-      for (int32_t y = 0; y < 16 && !yellow; ++y) yellow = screen.px(po.x + x, po.y + y) == 0xFFFFFF00;
+    for (int32_t x = 0; x < 160 && !yellow; ++x)
+      for (int32_t y = 0; y < 48 && !yellow; ++y) yellow = (screen.px(po.x + x, po.y + y) & 0xFFFFFF00u) == 0xFFFFFF00u && (screen.px(po.x + x, po.y + y) & 0xFF) < 0x60;
     CHECK(yellow);
 
     // Long pages scroll: wheel, keys and the scroll bar.
-    CHECK(b.navigate("/long.html") && b.page().line_count() > b.page().visible_lines() && b.page().scroll_line() == 0);
+    CHECK(b.navigate("/long.html") && b.page().picture() && b.page().picture()->height() > b.page().viewport_height() && b.page().scroll_y() == 0);
+    const int32_t screen_step = b.page().viewport_height() - 40;
     w.set_focus(&b.page());
     press(w, 0x4E);   // Page Down
-    CHECK(b.page().scroll_line() == b.page().visible_lines() - 1);
+    CHECK(b.page().scroll_y() == screen_step);
     press(w, key::kDown);
-    CHECK(b.page().scroll_line() == b.page().visible_lines());
+    CHECK(b.page().scroll_y() == screen_step + 40);
     press(w, 0x4D);   // End
-    CHECK(b.page().scroll_line() == b.page().line_count() - b.page().visible_lines());
+    CHECK(b.page().scroll_y() == b.page().picture()->height() - b.page().viewport_height());
     press(w, 0x4A);   // Home
-    CHECK(b.page().scroll_line() == 0);
+    CHECK(b.page().scroll_y() == 0);
     w.mouse_wheel(origin.x + 100, origin.y + 100, -1);
-    CHECK(b.page().scroll_line() == 3);
+    CHECK(b.page().scroll_y() == 48);
     w.render();
 
     // Ctrl+L goes to the address box, the menu opens files.
     press(w, key::kA + 11, hardware::modifier::kLeftControl);
     CHECK(w.focus() == &b.address_box());
-    CHECK(b.page().document() && !b.loading());
+    CHECK(b.page().picture() && !b.loading());
   }
   CHECK(a.live == 0);
 }
@@ -6595,35 +6616,35 @@ static void test_web_browser_media() {
     CHECK(b.script_errors() == 0);
     w.render();
     const Point po = b.page().window_origin();
-    const int32_t kM = gui::PageView::kMargin;
-    // line 0-1: the picture (40 x 20), line 2-3: the canvas (60 x 32), line 4-5: the video
-    CHECK(screen.px(po.x + kM + 5, po.y + 5) == 0xFF00AA00u && screen.px(po.x + kM + 39, po.y + 19) == 0xFF00AA00u && screen.px(po.x + kM + 41, po.y + 5) == 0xFFFFFFFFu);
-    CHECK(screen.px(po.x + kM + 6, po.y + 32 + 6) == 0xFFFF0000u && screen.px(po.x + kM + 44, po.y + 32 + 16) == 0xFF0000FFu && screen.px(po.x + kM + 2, po.y + 32 + 2) == 0xFFFFFFFFu);
+    // the picture (40 x 20), the canvas (60 x 32) and the video (32 x 32) sit side by side in one line
+    paint::IRect obj[4];
+    CHECK(object_rects(b, obj, 4) == 3 && obj[0].width == 40 && obj[0].height == 20 && obj[1].width == 60 && obj[1].height == 32 && obj[2].width == 32 && obj[2].height == 32);
+    CHECK(screen.px(po.x + obj[0].x + 5, po.y + obj[0].y + 5) == 0xFF00AA00u && screen.px(po.x + obj[0].x + 39, po.y + obj[0].y + 19) == 0xFF00AA00u);
+    CHECK(screen.px(po.x + obj[1].x + 6, po.y + obj[1].y + 6) == 0xFFFF0000u && screen.px(po.x + obj[1].x + 44, po.y + obj[1].y + 16) == 0xFF0000FFu &&
+          screen.px(po.x + obj[1].x + 2, po.y + obj[1].y + 2) == 0xFFFFFFFFu);
     CHECK(!b.canvas_accelerated());   // (this screen is drawn by the CPU)
-    const uint32_t first_frame = screen.px(po.x + kM + 8, po.y + 64 + 8);
+    const uint32_t first_frame = screen.px(po.x + obj[2].x + 8, po.y + obj[2].y + 8);
     CHECK(first_frame == 0xFFFF0000u || first_frame == 0xFF0000FFu);
     // the video follows the clock: the timers are run from tick(), half a second moves it to the next picture
     clock.now += 600000;
     b.tick(700000);
     b.tick(740000);
     w.render();
-    const uint32_t second_frame = screen.px(po.x + kM + 8, po.y + 64 + 8);
+    const uint32_t second_frame = screen.px(po.x + obj[2].x + 8, po.y + obj[2].y + 8);
     CHECK(second_frame != first_frame && (second_frame == 0xFFFF0000u || second_frame == 0xFF0000FFu));
     // a click on the canvas reaches its script
-    click(w, po.x + kM + 30, po.y + 32 + 16);
+    click(w, po.x + obj[1].x + 30, po.y + obj[1].y + 16);
     CHECK(b.title().equals("Web Browser - canvas clicked"));
     // scripts off: the canvas has nothing on it, the picture is still there
     b.set_scripts_enabled(false);
     CHECK(b.navigate("http://media.test/"));
     w.render();
-    CHECK(screen.px(po.x + kM + 5, po.y + 5) == 0xFF00AA00u && screen.px(po.x + kM + 6, po.y + 32 + 6) == 0xFFFFFFFFu);
+    CHECK(object_rects(b, obj, 4) == 3 && screen.px(po.x + obj[0].x + 5, po.y + obj[0].y + 5) == 0xFF00AA00u && screen.px(po.x + obj[1].x + 6, po.y + obj[1].y + 6) == 0xFFFFFFFFu);
     b.set_scripts_enabled(true);
     // a picture that does not arrive is its alternative text
     loader.files["http://media.test/broken.html"] = {"text/html", "<html><body><img src=nothing.png alt='no picture here'></body></html>"};
     CHECK(b.navigate("http://media.test/broken.html"));
-    bool alt = false;
-    for (uint64_t i = 0; b.page().document() && i < b.page().document()->run_count(); ++i) alt = alt || b.page().document()->run_text(i).contains("no picture here");
-    CHECK(alt);
+    CHECK(run_contains(b, "no picture here"));
   }
   CHECK(a.live == 0);
 }
@@ -6650,31 +6671,31 @@ static void test_web_form() {
         "<html><head><title>Form</title></head><body><form action=/submit method=post><input name=user size=8> <input type=checkbox name=ok> <button>Go</button></form>"
         "<p>one</p><p>two</p></body></html>"};
     CHECK(b.navigate("http://form.test/") && b.title().equals("Web Browser - Form"));
-    CHECK(run_contains(b, "[        ]") && run_contains(b, "[ Go ]"));
+    CHECK(run_contains(b, "Go"));
     const Point po = b.page().window_origin();
-    const int32_t kM = gui::PageView::kMargin;
     // Tab focuses the first field (the page view has the keyboard focus after a click on the page)
-    click(w, po.x + kM + 300, po.y + 150);
+    click(w, po.x + 300, po.y + 150);
     press(w, key::kTab);
-    CHECK(run_contains(b, "[|       ]"));
+    CHECK(b.live_page() && b.live_page()->has_focus());
     type_char(w, 'b');
     type_char(w, 'o');
     type_char(w, 'b');
-    CHECK(run_contains(b, "[bob|    ]"));
+    CHECK(run_contains(b, "bob"));
     press(w, key::kBackspace);
     type_char(w, 'b');
     // Tab to the box, Space checks it
     press(w, key::kTab);
     type_char(w, ' ');
-    CHECK(run_contains(b, "[x]"));
     // a click on the button sends the form
-    click(w, po.x + kM + 16 * 8, po.y + 8);
+    int32_t gx = 0, gy = 0;
+    CHECK(text_point(b, "Go", &gx, &gy));
+    click(w, gx, gy);
     CHECK(loader.posted.size() == 1 && loader.posted[0] == "http://form.test/submit [application/x-www-form-urlencoded] user=bob&ok=on");
     CHECK(b.title().equals("Web Browser - Posted") && run_contains(b, "thanks"));
     // with nothing focused the keys scroll the page again
     press(w, key::kEscape);
     press(w, key::kDown);
-    CHECK(b.page().scroll_line() == 0 || b.page().scroll_line() == 1);
+    CHECK(b.page().scroll_y() == 0 || b.page().scroll_y() == 40);
   }
   CHECK(a.live == 0);
 }

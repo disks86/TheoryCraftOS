@@ -266,6 +266,21 @@ add_executable(BOOTX64
   src/Script/Stdlib.cpp
   src/Script/Engine.cpp
   src/Browser/PageLayout.cpp
+  src/Layout/BoxBuilder.cpp
+  src/Layout/Layout.cpp
+  src/Layout/Inline.cpp
+  src/Layout/Intrinsic.cpp
+  src/Layout/Positioned.cpp
+  src/Layout/FontMeasurer.cpp
+  src/Layout/Flex.cpp
+  src/Layout/Grid.cpp
+  src/Layout/Table.cpp
+  src/Layout/Multicol.cpp
+  src/Paint/PaintBuilder.cpp
+  src/Paint/DisplayPainter.cpp
+  src/Paint/HitTest.cpp
+  src/Paint/Raster.cpp
+  src/Paint/PainterEffects.cpp
   src/Browser/Url.cpp
   src/Browser/HttpPageLoader.cpp
   src/Network/Tls/CaBundle.cpp

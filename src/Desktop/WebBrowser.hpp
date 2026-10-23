@@ -198,7 +198,8 @@ class WebBrowser : public gui::Frame {
   void update_media();
   void settle();                       // after the page ran something: follow what it asked for, draw it again if it changed
   void refresh(bool keep_scroll);      // draws the loaded page again
-  void present(UniquePointer<browser::HtmlDocument> doc, bool keep_scroll, uint32_t http_status);
+  void present(UniquePointer<browser::PagePicture> picture, bool keep_scroll, uint32_t http_status);
+  font::FontSet& layout_fonts();
   void schedule_timers();
   void apply_hash(StringView hash);
   uint64_t page_clock_ms();
@@ -239,6 +240,7 @@ class WebBrowser : public gui::Frame {
   browser::StorageHub own_local_;
   browser::PageHub own_hub_;
   int32_t request_delta_ = 0;       // how far Back / Forward goes in the history
+  UniquePointer<font::FontSet> layout_fonts_;   // the fonts the page is measured with (on the handler thread; the view paints with a set of its own)
   uint32_t document_ = 0;           // the number of the document shown (it changes whenever a page is loaded)
   gui::Handler load_handler_;
   UnixClock unix_clock_ = nullptr;

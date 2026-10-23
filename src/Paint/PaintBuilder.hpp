@@ -22,8 +22,10 @@
 // pictures as units); the positioned boxes with z-index 0 or auto in tree order; the contexts with a positive z-index. overflow other than
 // visible clips what is inside a box to its padding box (rounded with border-radius); opacity below 1 draws a box and what is in it as one group.
 //
-// Not painted yet: transforms, filters, background-image urls, inset shadows, blurred shadows beyond a soft approximation, conic and repeating
-// gradients, outlines' offsets, selection and the caret.
+// Beyond that: box-shadow (blurred, spread, inset) and text-shadow, transform (2D; 3D is flattened) and filter as groups of operations, clip-path
+// basic shapes, conic / repeating gradients with colour hints, url() background layers (the painter asks the object painter), list-style-image,
+// outlines with offsets and every border style. Not painted: backdrop-filter, mask, background-clip: text, clip-path path() and url(), filter url(),
+// background-attachment, selection and the caret.
 #pragma once
 #include "Dom/Dom.hpp"
 #include "Layout/Box.hpp"

@@ -409,7 +409,7 @@ NATIVE(win_queue_microtask) {
 
 NATIVE(win_scroll_to) {
   DomBindings::Impl& c = impl(vm);
-  double top = c.scroll_line * 16.0;
+  double top = c.scroll_line;   // (pixels: the field keeps its old name)
   const Value a0 = arg_at(args, argc, 0);
   if (a0.is_object()) {
     Value v;
@@ -419,7 +419,7 @@ NATIVE(win_scroll_to) {
     if (!vm.to_number(args[1], &top)) return false;
   }
   if (top != top || top < 0) top = 0;
-  c.scroll_line = static_cast<int32_t>(top / 16);
+  c.scroll_line = top > 100000000 ? 100000000 : static_cast<int32_t>(top);
   c.host.scroll_to(c.scroll_line);
   update_metrics(c);
   return true;
@@ -437,8 +437,9 @@ NATIVE(win_scroll_by) {
     if (!vm.to_number(args[1], &dy)) return false;
   }
   if (dy != dy) dy = 0;
-  int64_t line = c.scroll_line + static_cast<int64_t>(dy / 16);
+  int64_t line = c.scroll_line + static_cast<int64_t>(dy);
   if (line < 0) line = 0;
+  if (line > 100000000) line = 100000000;
   c.scroll_line = static_cast<int32_t>(line);
   c.host.scroll_to(c.scroll_line);
   update_metrics(c);
@@ -750,8 +751,8 @@ void update_metrics(DomBindings::Impl& c) {
   vm.define_named(g, "outerHeight", num_value(env.height));
   vm.define_named(g, "scrollX", num_value(0));
   vm.define_named(g, "pageXOffset", num_value(0));
-  vm.define_named(g, "scrollY", num_value(c.scroll_line * 16.0));
-  vm.define_named(g, "pageYOffset", num_value(c.scroll_line * 16.0));
+  vm.define_named(g, "scrollY", num_value(c.scroll_line));
+  vm.define_named(g, "pageYOffset", num_value(c.scroll_line));
   vm.define_named(g, "devicePixelRatio", num_value(env.resolution_dpi / 96.0));
   Value screen;
   if (vm.get_named(Value::make_object(g), "screen", &screen) && screen.is_object()) {

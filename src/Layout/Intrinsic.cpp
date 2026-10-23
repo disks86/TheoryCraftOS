@@ -87,6 +87,12 @@ void LayoutContext::intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUn
       }
       lo = max(lo, chunk);
     }
+  } else if (b.style.layout == browser::Layout::Table) {
+    table_intrinsic_widths(id, &lo, &hi);
+  } else if (b.style.layout == browser::Layout::Flex) {
+    flex_intrinsic_widths(id, &lo, &hi);
+  } else if (b.style.layout == browser::Layout::Grid) {
+    grid_intrinsic_widths(id, &lo, &hi);
   } else {
     for (uint64_t i = 0; i < b.children.count(); ++i) {
       const BoxId cid = b.children[i];
@@ -102,7 +108,7 @@ void LayoutContext::intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUn
       cmax = clamp_content_width(c, cmax);
       const LayoutUnit extra = bp + c.margin.horizontal();
       lo = max(lo, cmin + extra);
-      hi = max(hi, cmax + extra);
+      hi = max(hi, (c.style.layout == browser::Layout::TableCaption ? cmin : cmax) + extra);   // (a caption does not make its table wider, it wraps)
     }
   }
   if (hi < lo) hi = lo;

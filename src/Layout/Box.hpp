@@ -95,6 +95,10 @@ struct Box {
   bool has_natural_width = false, has_natural_height = false;
   uint8_t object_kind = 0;           // Replaced: a browser::ObjectKind (0: not a picture, video or canvas: an iframe or a form control)
 
+  // --- tables (TableFixup.cpp sets them from the DOM; Table.cpp lays the table out)
+  uint16_t colspan = 1, rowspan = 1;   // cells: the colspan and rowspan attributes (rowspan 0: down to the end of the row group)
+  uint8_t group_role = 0;              // row groups: 1 thead (laid out first), 2 tfoot (last)
+
   // --- the containing block as layout last saw it: what percentages of the box's lengths are of (not known while only intrinsic sizes are worked out)
   LayoutUnit cb_width, cb_height;
   bool cb_width_known = false, cb_height_known = false;

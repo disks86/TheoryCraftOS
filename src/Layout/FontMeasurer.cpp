@@ -29,6 +29,20 @@ font::Fixed fixed_from_px100(int32_t px100) {
 
 }  // namespace
 
+font::FontQuery FontMeasurer::query_for(const browser::Style& style) const {
+  font::FontQuery query;
+  StringView families = sheet_ ? sheet_->text(style.font_family) : StringView();
+  if (families.empty() && style.code) families = StringView("monospace");   // (code, pre, kbd and samp use the monospace font unless the page says otherwise)
+  query.families = families;
+  query.weight = style.font_weight ? style.font_weight : (style.bold ? 700 : 400);
+  query.style = style.italic ? font::FontStyle::Italic : font::FontStyle::Normal;
+  const uint16_t stretch = static_cast<uint16_t>(style.font_stretch_x10 / 10);
+  query.stretch = stretch ? stretch : 100;
+  query.size = font::fixed_from_px(style.font_px ? style.font_px : 16);
+  query.default_generic = font::GenericFamily::Serif;
+  return query;
+}
+
 font::FontHandle FontMeasurer::handle_for(const browser::Style& style) {
   const uint16_t stretch = static_cast<uint16_t>(style.font_stretch_x10 / 10);
   // a direct-mapped cache keyed by what picks a font: where the family text is, weight, stretch, size, italic, and the monospace default of <code>
@@ -38,16 +52,7 @@ font::FontHandle FontMeasurer::handle_for(const browser::Style& style) {
   if (e.used && e.family_offset == style.font_family.offset && e.family_length == style.font_family.length && e.weight == style.font_weight &&
       e.stretch == stretch && e.size == style.font_px && e.italic == style.italic && e.code == style.code)
     return e.handle;
-  font::FontQuery query;
-  StringView families = sheet_ ? sheet_->text(style.font_family) : StringView();
-  if (families.empty() && style.code) families = StringView("monospace");   // (code, pre, kbd and samp use the monospace font unless the page says otherwise)
-  query.families = families;
-  query.weight = style.font_weight ? style.font_weight : (style.bold ? 700 : 400);
-  query.style = style.italic ? font::FontStyle::Italic : font::FontStyle::Normal;
-  query.stretch = stretch ? stretch : 100;
-  query.size = font::fixed_from_px(style.font_px ? style.font_px : 16);
-  query.default_generic = font::GenericFamily::Serif;
-  e.handle = fonts_.match(query);
+  e.handle = fonts_.match(query_for(style));
   e.used = true;
   e.family_offset = style.font_family.offset;
   e.family_length = style.font_family.length;

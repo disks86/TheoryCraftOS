@@ -24,6 +24,9 @@
 #include "Browser/HtmlDocument.hpp"
 #include "Browser/ObjectTypes.hpp"
 #include "Browser/PageLayout.hpp"
+#include "Browser/PagePicture.hpp"
+#include "Font/FontSet.hpp"
+#include "Paint/HitTest.hpp"
 #include "Gui/Control.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -35,10 +38,25 @@ class PageView : public Control {
   static constexpr int32_t kMargin = 8, kLineHeight = 16;
 
   explicit PageView(allocators::IAllocator& allocator);
+  ~PageView();
 
   // Shows `document` (nullptr: a blank page). The view goes back to the top unless `keep_scroll` (the same page drawn again).
   void set_document(UniquePointer<browser::HtmlDocument> document, bool keep_scroll = false);
   const browser::HtmlDocument* document() const { return document_.get(); }
+
+  // --- The page as pixels (what the browser uses). Shows a picture made by browser::Page::render_picture(): it is drawn at its size in CSS pixels, scrolls by
+  // pixels, and what is under the pointer is found in it. Showing a picture replaces the document, and the other way round. The picture is laid out for
+  // viewport_width() (the control's width less the scroll bar), which fires the resize handler whenever it or viewport_height() changes.
+  void set_picture(UniquePointer<browser::PagePicture> picture, bool keep_scroll = false);
+  const browser::PagePicture* picture() const { return picture_.get(); }
+  bool shows_picture() const { return picture_mode_; }
+  int32_t viewport_width() const { return viewport_w_; }
+  int32_t viewport_height() const { return viewport_h_; }
+  int32_t scroll_y() const { return scroll_y_; }
+  void scroll_to_y(int32_t y);
+  void scroll_by_y(int32_t dy);
+  // The serial of the link element the pointer is on or that was clicked (0: none).
+  uint32_t hovered_link_node() const { return hovered_link_node_; }
 
   // --- Links
   void on_link_clicked(Handler handler) { UiGuard lock(this); link_handler_ = handler; }
@@ -118,8 +136,16 @@ class PageView : public Control {
   // The object under a point: its piece, the rectangle on screen it is shown in (relative to the view).
   bool object_at(int32_t x, int32_t y, uint32_t* piece, int32_t* ox, int32_t* oy) const;
   void set_hover(int32_t link);
+  void set_hover_node(uint32_t link_node);
+  bool hit(int32_t x, int32_t y, paint::HitResult* result) const;   // the picture's thing at a point of this control
   static void scroll_changed(void* self, Control&);
 
+  UniquePointer<browser::PagePicture> picture_;
+  UniquePointer<font::FontSet> fonts_;   // the painter's fonts (made with the first picture): the page was measured with another set, on another thread
+  bool picture_mode_ = false;
+  int32_t scroll_y_ = 0, viewport_w_ = 1, viewport_h_ = 1, notified_w_ = 0, notified_h_ = 0;
+  uint32_t hovered_link_node_ = 0;
+  int32_t cursor_x_ = -1, cursor_y_ = -1;
   UniquePointer<browser::HtmlDocument> document_;
   browser::PageLayout layout_;
   ScrollBar scroll_bar_;

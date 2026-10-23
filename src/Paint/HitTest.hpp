@@ -30,6 +30,7 @@ struct HitResult {
   uint8_t cursor = 0;       // a browser::Cursor: what the element asks for (0 auto)
   bool text = false;        // the point is on text
   bool object = false;      // the point is on a picture, video or canvas
+  IRect rect;               // where the thing found is, in page pixels (for an object: its rectangle, to tell where in it the click was)
 };
 
 // Looks for what is at page position (x, y). `doc` finds the element a text belongs to and the link around it (nullptr: neither is looked for).

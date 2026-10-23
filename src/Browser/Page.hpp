@@ -31,10 +31,12 @@
 #include "Browser/DomBindings.hpp"
 #include "Browser/HtmlDocument.hpp"
 #include "Browser/PageHub.hpp"
+#include "Browser/PagePicture.hpp"
 #include "Browser/Media.hpp"
 #include "Browser/Objects.hpp"
 #include "Browser/Renderer.hpp"
 #include "Dom/Dom.hpp"
+#include "Font/FontSet.hpp"
 #include "Script/Engine.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -55,7 +57,7 @@ class IPageEnvironment : public IObjectEnvironment {
   virtual bool history_state(String* json) { (void)json; return false; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
-  virtual void scroll_to(int32_t line) = 0;
+  virtual void scroll_to(int32_t y) = 0;   // the page asked for a vertical position, in CSS pixels
   virtual uint64_t now_ms() = 0;                 // milliseconds since 1970 (0 without a clock)
   virtual void console(int level, StringView text) = 0;
   // Web Storage: the hub of localStorage (all origins, all windows) and the one of this tab's sessionStorage; and what the pages share to talk to each other.
@@ -108,6 +110,9 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool load(StringView html);
   // Fetches the style sheets the page links to that have not been fetched, and draws the page into `out`.
   bool render(HtmlDocument* out);
+  // The same as render(), as pixels: lays the page out for the display's width in CSS pixels (media().width) with `fonts` and builds what is painted into `out`.
+  // `fonts` is for this thread's measuring: the painter uses a font set of its own.
+  bool render_picture(PagePicture* out, font::FontSet& fonts);
   // Has the tree changed, or the display (set_media()), since the last render()?
   bool changed() const;
   // Did something visible change that is not in the tree (a canvas drawn on, a video frame)? Then the view only needs painting again.
@@ -167,7 +172,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool run_due_timers(double now_ms);
   // When the next timer is due (host clock); false if none is waiting.
   bool next_timer(double* due_ms);
-  // Where the page is scrolled to (a script called scrollTo): the line it asked for, or -1 if it did not since the last call.
+  // Where the page is scrolled to (a script called scrollTo): the vertical position in pixels it asked for, or -1 if it did not since the last call.
   int32_t take_scroll_request();
 
   dom::Document& document() { return doc_; }
@@ -201,7 +206,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void push_state(StringView address, StringView state_json, bool has_state, bool replace) override;
   bool history_state(String* json) override;
   bool confirm(StringView text) override { return env_.confirm(text); }
-  void scroll_to(int32_t line) override;
+  void scroll_to(int32_t y) override;
   bool computed_style(const dom::Node* element, Style* out) override;
   const StyleSheet* computed_style_sheet() override { return &style_sheet(); }
   dom::Document* parse_document(StringView html) override;

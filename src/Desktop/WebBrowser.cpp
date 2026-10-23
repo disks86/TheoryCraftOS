@@ -700,11 +700,32 @@ bool WebBrowser::traverse_in_place(int32_t delta) {
   return true;
 }
 
+font::FontSet& WebBrowser::layout_fonts() {
+  if (!layout_fonts_) {
+    layout_fonts_ = UniquePointer<font::FontSet>::make(allocator(), allocator());
+    layout_fonts_->add_bundled_fonts();
+  }
+  return *layout_fonts_;
+}
+
+// A plain text file shown as a page: its text in a <pre>.
+static void text_as_html(StringView text, String* out) {
+  out->append("<!doctype html><meta charset=utf-8><body style='margin:8px'><pre style='margin:0;white-space:pre-wrap;overflow-wrap:break-word;font-size:13px'>");
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (c == '<') out->append("&lt;");
+    else if (c == '>') out->append("&gt;");
+    else if (c == '&') out->append("&amp;");
+    else out->push_back(c);
+  }
+  out->append("</pre>");
+}
+
 // Shows a fetched page: as HTML, as text, or a note that it cannot be shown.
 void WebBrowser::show(Fetched& page) {
   const StringView body(page.body.view());
-  UniquePointer<browser::HtmlDocument> doc = UniquePointer<browser::HtmlDocument>::make(allocator(), allocator());
-  if (!doc) {
+  UniquePointer<browser::PagePicture> picture = UniquePointer<browser::PagePicture>::make(allocator(), allocator());
+  if (!picture) {
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
@@ -723,48 +744,56 @@ void WebBrowser::show(Fetched& page) {
     defer_scroll_ = -1;
     next_due_ms_ = 0;
   }
-  bool ok = true;
-  if (is_html(page.type.view(), page.address.view(), body)) {
-    media_ = current_media();
-    live_ = UniquePointer<browser::Page>::make(allocator(), allocator(), env_, page.address.view(), media_, scripts_enabled_);
-    if (!live_) ok = false;
-    else {
-      if (history_.current() && history_.current()->has_state) live_->set_history_state(history_.current()->state.view(), true);
-      say(scripts_enabled_ ? "Reading the page and running its scripts..." : "Reading the page...");
-      ok = live_->load(body) && live_->render(doc.get());
-      if (ok) page_.set_object_painter(&live_->objects());
+  // Text and files that cannot be shown are pages too: a <pre> of the text, a line of explanation
+  String synthetic(allocator());
+  StringView html = body;
+  bool scripts = scripts_enabled_;
+  if (!is_html(page.type.view(), page.address.view(), body)) {
+    scripts = false;
+    if (is_text(page.type.view(), body)) {
+      text_as_html(body, &synthetic);
+    } else {
+      String note(allocator());
+      note.append("This kind of file (");
+      note.append(page.type.empty() ? StringView("unknown type") : page.type.view());
+      note.append(") cannot be shown.");
+      text_as_html(note.view(), &synthetic);
     }
-  } else if (is_text(page.type.view(), body)) {
-    ok = doc->parse_text(body);
-  } else {
-    String text(allocator());
-    text.append("This kind of file (");
-    text.append(page.type.empty() ? StringView("unknown type") : page.type.view());
-    text.append(") cannot be shown.");
-    ok = doc->parse_text(text.view());
+    html = synthetic.view();
+  }
+  bool ok = true;
+  media_ = current_media();
+  live_ = UniquePointer<browser::Page>::make(allocator(), allocator(), env_, page.address.view(), media_, scripts);
+  if (!live_) ok = false;
+  else {
+    if (history_.current() && history_.current()->has_state) live_->set_history_state(history_.current()->state.view(), true);
+    if (scripts) say("Reading the page and running its scripts...");
+    else say("Reading the page...");
+    ok = live_->load(html) && live_->render_picture(picture.get(), layout_fonts());
+    if (ok) page_.set_object_painter(&live_->objects());
   }
   if (!ok) {
     live_.reset();
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
-  present(util::move(doc), false, page.status);
+  present(util::move(picture), false, page.status);
   settle();
 }
 
 // Puts a drawn page on the screen, with its title and the state of its scripts in the status bar.
-void WebBrowser::present(UniquePointer<browser::HtmlDocument> doc, bool keep_scroll, uint32_t http_status) {
+void WebBrowser::present(UniquePointer<browser::PagePicture> picture, bool keep_scroll, uint32_t http_status) {
   String page_title(allocator());
-  page_title.assign(live_ && !live_->page_title().empty() ? live_->page_title() : doc->title());
-  const bool cut = doc->truncated();
-  page_.set_document(util::move(doc), keep_scroll);
+  if (live_) page_title.assign(live_->page_title());
+  const bool cut = false;
+  page_.set_picture(util::move(picture), keep_scroll);
   int32_t scroll = defer_scroll_;
   defer_scroll_ = -1;
   if (live_) {
     const int32_t asked = live_->take_scroll_request();
     if (asked >= 0) scroll = asked;
   }
-  if (scroll >= 0) page_.scroll_to_line(static_cast<uint32_t>(scroll));
+  if (scroll >= 0) page_.scroll_to_y(scroll);
   uint32_t errors = 0;
   String first_error(allocator());
   {
@@ -800,12 +829,12 @@ void WebBrowser::present(UniquePointer<browser::HtmlDocument> doc, bool keep_scr
 // Draws the loaded page again (its tree changed, or the display did).
 void WebBrowser::refresh(bool keep_scroll) {
   if (!live_) return;
-  UniquePointer<browser::HtmlDocument> doc = UniquePointer<browser::HtmlDocument>::make(allocator(), allocator());
-  if (!doc || !live_->render(doc.get())) {
+  UniquePointer<browser::PagePicture> picture = UniquePointer<browser::PagePicture>::make(allocator(), allocator());
+  if (!picture || !live_->render_picture(picture.get(), layout_fonts())) {
     notify(NoticeKind::Error, "Out of memory.");
     return;
   }
-  present(util::move(doc), keep_scroll, 0);
+  present(util::move(picture), keep_scroll, 0);
 }
 
 // After the page ran something (a click, a timer, a new window size): do what it asked of the browser, then draw it again if it changed.
@@ -911,9 +940,9 @@ void WebBrowser::schedule_timers() {
 browser::MediaEnvironment WebBrowser::current_media() {
   browser::MediaEnvironment m;
   UiGuard lock(&page_);
-  if (page_.columns() > 0) {
-    m.width = static_cast<int32_t>(page_.columns()) * Painter::kGlyphWidth;
-    m.height = static_cast<int32_t>(page_.visible_lines()) * PageView::kLineHeight;
+  if (page_.viewport_width() > 1) {   // (the view has been laid out: the page gets its size in CSS pixels)
+    m.width = page_.viewport_width();
+    m.height = page_.viewport_height();
   }
   m.dark = dark_;
   m.scripting = scripts_enabled_;

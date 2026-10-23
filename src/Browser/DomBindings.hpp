@@ -70,7 +70,7 @@ class IDomHost {
   virtual bool history_state(String* json) = 0;
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
-  virtual void scroll_to(int32_t line) = 0;
+  virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
   // The style of an element as it is drawn now (false if the page cannot say).
   virtual bool computed_style(const dom::Node* element, Style* out) = 0;
   // The style sheet that computed_style() worked against: what the TextRefs of a Style point into, and the readers for list valued properties (font-family,

@@ -51,6 +51,13 @@ class IObjectPainter {
   // `clip` again afterwards.
   virtual void paint_object(graphics::IRenderer2D& r, uint32_t node, ObjectKind kind, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) = 0;
 
+  // CSS url() pictures: background-image layers and list-style-image markers. `url` is the address as the style wrote it (unquoted, not resolved: the page
+  // resolves it against its base address). The defaults draw nothing, so painters written before this still work.
+  // The natural size of the picture in pixels; false if it is not (yet) available, in which case the layer is not drawn.
+  virtual bool background_image_size(StringView url, int32_t* width, int32_t* height) { return false; }
+  // Draws the picture stretched over the rectangle (x, y, w, h) (one tile of the layer); nothing outside `clip` may change (push it with push_clip_rect and pop it).
+  virtual void paint_background_image(graphics::IRenderer2D& r, StringView url, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {}
+
  protected:
   IObjectPainter() = default;
   ~IObjectPainter() = default;

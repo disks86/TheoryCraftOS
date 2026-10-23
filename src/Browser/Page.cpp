@@ -17,6 +17,10 @@
  */
 
 #include "Browser/Page.hpp"
+#include "Layout/BoxBuilder.hpp"
+#include "Layout/FontMeasurer.hpp"
+#include "Layout/Layout.hpp"
+#include "Paint/PaintBuilder.hpp"
 #include "Browser/Url.hpp"
 #include "Browser/WebPrelude.hpp"
 #include "Script/TypedArray.hpp"
@@ -321,6 +325,40 @@ bool Page::render(HtmlDocument* out) {
   return ok;
 }
 
+bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
+  fetch_pending_styles();
+  sync_frames();
+  objects_.set_now(env_.now_ms());
+  objects_.sync(doc_, env_, address_.view(), media_);
+  style_sheet();
+  style_cache_.set_viewport(media_.width, media_.height);
+  layout::BuildOptions build;
+  build.objects = &objects_;
+  layout::FontMeasurer measurer(fonts, &style_cache_);
+  bool ok = layout::build_box_tree(doc_, style_cache_, build, &out->tree);
+  if (ok) {
+    layout::LayoutOptions layout_options;
+    layout_options.viewport_width = layout::LayoutUnit::from_px(media_.width);
+    layout_options.viewport_height = layout::LayoutUnit::from_px(media_.height);
+    layout_options.measurer = &measurer;
+    layout_options.sheet = &style_cache_;
+    ok = layout::layout_tree(out->tree, layout_options);
+  }
+  if (ok) {
+    paint::PaintOptions paint_options;
+    paint_options.measurer = &measurer;
+    paint_options.sheet = &style_cache_;
+    paint_options.doc = &doc_;
+    ok = paint::build_display_list(out->tree, paint_options, &out->list);
+  }
+  out->document = &doc_;
+  out->viewport_width = media_.width;
+  rendered_version_ = doc_.version();
+  rendered_media_ = media_;
+  deliver_object_events();
+  return ok;
+}
+
 // Fires what the pictures and videos have to say (load, error, loadedmetadata, ended ...) at their elements.
 void Page::deliver_object_events() {
   PageObjects::Event e;
@@ -489,9 +527,9 @@ int32_t Page::take_scroll_request() {
   return r;
 }
 
-void Page::scroll_to(int32_t line) {
-  scroll_request_ = line;
-  env_.scroll_to(line);
+void Page::scroll_to(int32_t y) {
+  scroll_request_ = y;
+  env_.scroll_to(y);
 }
 
 void Page::set_hash(StringView hash) {
