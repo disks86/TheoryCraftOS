@@ -275,6 +275,7 @@ add_executable(BOOTX64
   src/Layout/Flex.cpp
   src/Layout/Grid.cpp
   src/Layout/Table.cpp
+  src/Layout/TableFixup.cpp
   src/Layout/Multicol.cpp
   src/Paint/PaintBuilder.cpp
   src/Paint/DisplayPainter.cpp
