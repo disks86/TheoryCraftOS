@@ -350,13 +350,312 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
 
   var blobUrls = {}, blobCounter = 0;
   URL.createObjectURL = function (blob) {
-    if (!(blob instanceof Blob)) throw typeError("execute 'createObjectURL' on 'URL'", "Overload resolution failed.");
     var origin = location.origin === 'null' ? 'null' : location.origin;
+    if (typeof g.MediaSource === 'function' && blob instanceof g.MediaSource) {   // a MediaSource: the address is for a <video> or <audio> to play it
+      var address = 'blob:' + origin + '/' + (++blobCounter) + '-' + Date.now();
+      if (!__mse_register_url(address, blob.__id)) throw new DOMException("Failed to execute 'createObjectURL' on 'URL': The MediaSource is not usable.", 'InvalidStateError');
+      return address;
+    }
+    if (!(blob instanceof Blob)) throw typeError("execute 'createObjectURL' on 'URL'", "Overload resolution failed.");
     var url = 'blob:' + origin + '/' + (++blobCounter) + '-' + Date.now();
     blobUrls[url] = blob;
     return url;
   };
-  URL.revokeObjectURL = function (url) { delete blobUrls[String(url)]; };
+  URL.revokeObjectURL = function (url) { url = String(url); delete blobUrls[url]; __mse_revoke_url(url); };
+
+  // ------------------------------------------------------------------------------------------------------------ Media Source Extensions
+  // MediaSource, SourceBuffer and SourceBufferList; the bytes, the frames and the ranges are the engine's (DomBindingsMse.cpp, Media/Mse.hpp). Appending is done
+  // when appendBuffer() is called (so a full buffer throws at once, as the standard has it); the events follow as tasks of their own.
+  var mseObjects = {};
+  var mseError = function (message, name) { return new DOMException(message, name); };
+  var accessor = function (proto, name, get, set) { Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  var mseFire = function (target, type) { target.dispatchEvent(new Event(type)); };
+  var mseLater = function (fn) { setTimeout(fn, 0); };
+
+  function SourceBufferList() { throw new TypeError('Illegal constructor'); }
+  SourceBufferList.prototype = Object.create(EventTarget.prototype);
+  method(SourceBufferList.prototype, 'constructor', SourceBufferList);
+  accessor(SourceBufferList.prototype, 'length', function () { return this.__items.length; });
+  method(SourceBufferList.prototype, 'item', function (index) { return this.__items[index >>> 0] || null; });
+  method(SourceBufferList.prototype, ITER, function () { return this.__items[ITER](); });
+  var newBufferList = function () {
+    var list = Object.create(SourceBufferList.prototype);
+    hide(list, '__items', []);
+    list.onaddsourcebuffer = null;
+    list.onremovesourcebuffer = null;
+    return list;
+  };
+  var listAdd = function (list, buffer) { list.__items.push(buffer); list[list.__items.length - 1] = buffer; };
+  var listRemove = function (list, buffer) {
+    var at = list.__items.indexOf(buffer);
+    if (at < 0) return false;
+    list.__items.splice(at, 1);
+    delete list[list.__items.length];
+    for (var i = 0; i < list.__items.length; i++) list[i] = list.__items[i];
+    return true;
+  };
+
+  function MediaSource() {
+    if (!(this instanceof MediaSource)) throw typeError("construct 'MediaSource'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    var id = __mse_create();
+    if (!id) throw mseError("Failed to construct 'MediaSource': There are too many MediaSource objects.", 'QuotaExceededError');
+    hide(this, '__id', id);
+    hide(this, '__buffers', newBufferList());
+    hide(this, '__active', newBufferList());
+    this.onsourceopen = null;
+    this.onsourceended = null;
+    this.onsourceclose = null;
+    mseObjects[id] = this;
+  }
+  MediaSource.prototype = Object.create(EventTarget.prototype);
+  method(MediaSource.prototype, 'constructor', MediaSource);
+  MediaSource.isTypeSupported = function (type) {
+    if (arguments.length < 1) throw typeError("execute 'isTypeSupported' on 'MediaSource'", "1 argument required, but only 0 present.");
+    return __mse_supported(String(type));
+  };
+  MediaSource.canConstructInDedicatedWorker = false;
+  accessor(MediaSource.prototype, 'readyState', function () { var s = __mse_state(this.__id); return s === 1 ? 'open' : s === 2 ? 'ended' : 'closed'; });
+  accessor(MediaSource.prototype, 'sourceBuffers', function () { return this.__buffers; });
+  accessor(MediaSource.prototype, 'activeSourceBuffers', function () { return this.__active; });
+  var anyUpdating = function (ms) {
+    for (var i = 0; i < ms.__buffers.__items.length; i++) if (ms.__buffers.__items[i].__updating) return true;
+    return false;
+  };
+  accessor(MediaSource.prototype, 'duration', function () { return __mse_duration(this.__id); }, function (value) {
+    value = Number(value);
+    if (value !== value) throw typeError("set the 'duration' property on 'MediaSource'", "The provided double value is non-finite.");
+    if (value < 0) throw typeError("set the 'duration' property on 'MediaSource'", "The value provided (" + value + ") is outside the range [0, Infinity].");
+    if (__mse_state(this.__id) !== 1) throw mseError("Failed to set the 'duration' property on 'MediaSource': The MediaSource's readyState is not 'open'.", 'InvalidStateError');
+    if (anyUpdating(this)) throw mseError("Failed to set the 'duration' property on 'MediaSource': The 'updating' attribute is true on one or more of this MediaSource's SourceBuffers.", 'InvalidStateError');
+    if (!__mse_set_duration(this.__id, value)) throw mseError("Failed to set the 'duration' property on 'MediaSource': Setting duration to a value lower than the highest presentation timestamp of any buffered coded frames is not allowed.", 'InvalidStateError');
+  });
+  method(MediaSource.prototype, 'addSourceBuffer', function (type) {
+    if (arguments.length < 1) throw typeError("execute 'addSourceBuffer' on 'MediaSource'", "1 argument required, but only 0 present.");
+    type = String(type);
+    if (type === '') throw typeError("execute 'addSourceBuffer' on 'MediaSource'", "The type provided ('') is empty.");
+    if (!__mse_supported(type)) throw mseError("Failed to execute 'addSourceBuffer' on 'MediaSource': The type provided ('" + type + "') is unsupported.", 'NotSupportedError');
+    var number = __mse_add_buffer(this.__id, type);
+    if (number === -1) throw mseError("Failed to execute 'addSourceBuffer' on 'MediaSource': The MediaSource's readyState is not 'open'.", 'InvalidStateError');
+    if (number < 0) throw mseError("Failed to execute 'addSourceBuffer' on 'MediaSource': This MediaSource has reached the limit of SourceBuffer objects it can handle. No additional SourceBuffer objects may be added.", 'QuotaExceededError');
+    var buffer = Object.create(SourceBuffer.prototype);
+    hide(buffer, '__id', number);
+    hide(buffer, '__source', this);
+    hide(buffer, '__updating', false);
+    hide(buffer, '__job', 0);
+    hide(buffer, '__tracks', null);
+    buffer.onupdatestart = buffer.onupdate = buffer.onupdateend = buffer.onerror = buffer.onabort = null;
+    listAdd(this.__buffers, buffer);
+    listAdd(this.__active, buffer);
+    var self = this;
+    mseLater(function () { mseFire(self.__buffers, 'addsourcebuffer'); });
+    return buffer;
+  });
+  method(MediaSource.prototype, 'removeSourceBuffer', function (buffer) {
+    if (arguments.length < 1) throw typeError("execute 'removeSourceBuffer' on 'MediaSource'", "1 argument required, but only 0 present.");
+    if (!(buffer instanceof SourceBuffer)) throw typeError("execute 'removeSourceBuffer' on 'MediaSource'", "parameter 1 is not of type 'SourceBuffer'.");
+    if (this.__buffers.__items.indexOf(buffer) < 0) throw mseError("Failed to execute 'removeSourceBuffer' on 'MediaSource': The SourceBuffer provided is not contained in this MediaSource.", 'NotFoundError');
+    dropBuffer(this, buffer, true);
+  });
+  // Takes a SourceBuffer out (removeSourceBuffer(), or the MediaSource closing).
+  var dropBuffer = function (ms, buffer, native) {
+    if (buffer.__updating) {
+      buffer.__job++;
+      buffer.__updating = false;
+      mseFire(buffer, 'abort');
+      mseFire(buffer, 'updateend');
+    }
+    if (native) __mse_remove_buffer(ms.__id, buffer.__id);
+    listRemove(ms.__buffers, buffer);
+    listRemove(ms.__active, buffer);
+    buffer.__source = null;
+    mseLater(function () { mseFire(ms.__buffers, 'removesourcebuffer'); });
+  };
+  var endNames = { network: 2, decode: 3 };
+  method(MediaSource.prototype, 'endOfStream', function (error) {
+    var code = 0;
+    if (error !== undefined) {
+      error = String(error);
+      if (!(error in endNames)) throw typeError("execute 'endOfStream' on 'MediaSource'", "The provided value '" + error + "' is not a valid enum value of type EndOfStreamError.");
+      code = endNames[error];
+    }
+    if (__mse_state(this.__id) !== 1) throw mseError("Failed to execute 'endOfStream' on 'MediaSource': The MediaSource's readyState is not 'open'.", 'InvalidStateError');
+    if (anyUpdating(this)) throw mseError("Failed to execute 'endOfStream' on 'MediaSource': The 'updating' attribute is true on one or more of this MediaSource's SourceBuffers.", 'InvalidStateError');
+    __mse_end_of_stream(this.__id, code);
+    var self = this;
+    mseLater(function () { mseFire(self, 'sourceended'); });
+  });
+  method(MediaSource.prototype, 'setLiveSeekableRange', function (start, end) {
+    if (arguments.length < 2) throw typeError("execute 'setLiveSeekableRange' on 'MediaSource'", "2 arguments required, but only " + arguments.length + " present.");
+    start = Number(start); end = Number(end);
+    if (__mse_state(this.__id) !== 1) throw mseError("Failed to execute 'setLiveSeekableRange' on 'MediaSource': The MediaSource's readyState is not 'open'.", 'InvalidStateError');
+    if (!(start >= 0) || !(end >= start)) throw typeError("execute 'setLiveSeekableRange' on 'MediaSource'", "The start must be a non-negative number and not greater than the end.");
+    __mse_live_range(this.__id, start, end);
+  });
+  method(MediaSource.prototype, 'clearLiveSeekableRange', function () {
+    if (__mse_state(this.__id) !== 1) throw mseError("Failed to execute 'clearLiveSeekableRange' on 'MediaSource': The MediaSource's readyState is not 'open'.", 'InvalidStateError');
+    __mse_live_range(this.__id, NaN, 0);
+  });
+  // What the browser has to say about a MediaSource: an element took it (sourceopen), or let go (sourceclose).
+  hide(g, '__mse_event', function (source, type) {
+    var ms = mseObjects[source];
+    if (!ms) return;
+    if (type === 'sourceclose') {
+      var items = ms.__buffers.__items.slice();
+      for (var i = 0; i < items.length; i++) dropBuffer(ms, items[i], false);
+    }
+    mseFire(ms, type);
+  });
+
+  function SourceBuffer() { throw new TypeError('Illegal constructor'); }
+  SourceBuffer.prototype = Object.create(EventTarget.prototype);
+  method(SourceBuffer.prototype, 'constructor', SourceBuffer);
+  var bufferName = function (what) { return "Failed to " + what + " on 'SourceBuffer': "; };
+  var usable = function (buffer, what) {
+    if (!buffer.__source) throw mseError(bufferName(what) + "This SourceBuffer has been removed from the parent media source.", 'InvalidStateError');
+  };
+  var idle = function (buffer, what) {
+    usable(buffer, what);
+    if (buffer.__updating) throw mseError(bufferName(what) + "This SourceBuffer is still processing an 'appendBuffer' or 'remove' operation.", 'InvalidStateError');
+  };
+  // An ended MediaSource that is appended to or changed opens again.
+  var reopenSource = function (ms) {
+    if (__mse_state(ms.__id) === 2) {
+      __mse_reopen(ms.__id);
+      mseLater(function () { mseFire(ms, 'sourceopen'); });
+    }
+  };
+  accessor(SourceBuffer.prototype, 'updating', function () { return this.__updating; });
+  accessor(SourceBuffer.prototype, 'buffered', function () {
+    usable(this, "get the 'buffered' property");
+    return __mse_buffered(this.__id);
+  });
+  accessor(SourceBuffer.prototype, 'mode', function () { return __mse_get(this.__id, 0) === 1 ? 'sequence' : 'segments'; }, function (value) {
+    value = String(value);
+    if (value !== 'segments' && value !== 'sequence') return;
+    idle(this, "set the 'mode' property");
+    reopenSource(this.__source);
+    if (!__mse_set(this.__id, 0, value === 'sequence' ? 1 : 0)) throw typeError("set the 'mode' property on 'SourceBuffer'", "The mode '" + value + "' is not supported for the byte stream format of this SourceBuffer.");
+  });
+  accessor(SourceBuffer.prototype, 'timestampOffset', function () { return __mse_get(this.__id, 1); }, function (value) {
+    value = Number(value);
+    if (value !== value || value === Infinity || value === -Infinity) throw typeError("set the 'timestampOffset' property on 'SourceBuffer'", "The provided double value is non-finite.");
+    idle(this, "set the 'timestampOffset' property");
+    reopenSource(this.__source);
+    __mse_set(this.__id, 1, value);
+  });
+  accessor(SourceBuffer.prototype, 'appendWindowStart', function () { return __mse_get(this.__id, 2); }, function (value) {
+    value = Number(value);
+    idle(this, "set the 'appendWindowStart' property");
+    if (value !== value) throw typeError("set the 'appendWindowStart' property on 'SourceBuffer'", "The provided double value is non-finite.");
+    if (value < 0 || value >= __mse_get(this.__id, 3)) throw typeError("set the 'appendWindowStart' property on 'SourceBuffer'", "The value provided (" + value + ") is outside the range [0, " + __mse_get(this.__id, 3) + ").");
+    __mse_set(this.__id, 2, value);
+  });
+  accessor(SourceBuffer.prototype, 'appendWindowEnd', function () { return __mse_get(this.__id, 3); }, function (value) {
+    value = Number(value);
+    idle(this, "set the 'appendWindowEnd' property");
+    if (value !== value) throw typeError("set the 'appendWindowEnd' property on 'SourceBuffer'", "The provided double value is non-finite.");
+    if (value <= __mse_get(this.__id, 2)) throw typeError("set the 'appendWindowEnd' property on 'SourceBuffer'", "The value provided (" + value + ") is less than or equal to the start (" + __mse_get(this.__id, 2) + ").");
+    __mse_set(this.__id, 3, value);
+  });
+  // The tracks the initialization segments announced, as lists to look through (the tracks themselves cannot be switched).
+  var trackList = function (buffer, kind) {
+    var tracks = __mse_tracks(buffer.__id), list = [];
+    for (var i = 0; i + 1 < tracks.length; i += 2) {
+      if (tracks[i] !== kind) continue;
+      list.push(kind === 0 ? { id: String(tracks[i + 1]), kind: 'main', label: '', language: '', selected: true, sourceBuffer: buffer }
+                           : { id: String(tracks[i + 1]), kind: 'main', label: '', language: '', enabled: true, sourceBuffer: buffer });
+    }
+    hide(list, 'getTrackById', function (id) { for (var k = 0; k < list.length; k++) if (list[k].id === String(id)) return list[k]; return null; });
+    return list;
+  };
+  accessor(SourceBuffer.prototype, 'videoTracks', function () { return trackList(this, 0); });
+  accessor(SourceBuffer.prototype, 'audioTracks', function () { return trackList(this, 1); });
+  accessor(SourceBuffer.prototype, 'textTracks', function () { var list = []; hide(list, 'getTrackById', function () { return null; }); return list; });
+
+  // Runs an operation as the standard's updating cycle: updating is true, updatestart, the work, then update (or error / abort) and updateend.
+  var cycle = function (buffer, work) {
+    buffer.__updating = true;
+    var job = ++buffer.__job;
+    mseLater(function () {
+      if (buffer.__job !== job) return;
+      mseFire(buffer, 'updatestart');
+      mseLater(function () {
+        if (buffer.__job !== job) return;
+        var failed = work();
+        buffer.__updating = false;
+        mseFire(buffer, failed ? 'error' : 'update');
+        mseFire(buffer, 'updateend');
+        if (failed && buffer.__source) {
+          var ms = buffer.__source;
+          if (__mse_state(ms.__id) === 1) {   // (the append error algorithm: the stream is over, with a decode error)
+            __mse_end_of_stream(ms.__id, 3);
+            mseLater(function () { mseFire(ms, 'sourceended'); });
+          }
+        }
+      });
+    });
+  };
+  method(SourceBuffer.prototype, 'appendBuffer', function (data) {
+    if (arguments.length < 1) throw typeError("execute 'appendBuffer' on 'SourceBuffer'", "1 argument required, but only 0 present.");
+    if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) throw typeError("execute 'appendBuffer' on 'SourceBuffer'", "The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    idle(this, "execute 'appendBuffer'");
+    var ms = this.__source;
+    if (__mse_source_error(ms.__id) !== 0) throw mseError(bufferName("execute 'appendBuffer'") + "The HTMLMediaElement.error attribute is not null.", 'InvalidStateError');
+    reopenSource(ms);
+    var result = __mse_append(this.__id, data);
+    if (result === 1 || result === 3) throw mseError(bufferName("execute 'appendBuffer'") + "The SourceBuffer is full, and cannot free space to append additional buffers.", 'QuotaExceededError');
+    cycle(this, function () { return result === 2 || result === 4; });
+  });
+  method(SourceBuffer.prototype, 'remove', function (start, end) {
+    if (arguments.length < 2) throw typeError("execute 'remove' on 'SourceBuffer'", arguments.length + " arguments required, but only " + arguments.length + " present.");
+    start = Number(start); end = Number(end);
+    idle(this, "execute 'remove'");
+    var duration = __mse_duration(this.__source.__id);
+    if (duration !== duration) throw typeError("execute 'remove' on 'SourceBuffer'", "The duration is NaN.");
+    if (!(start >= 0) || start > duration) throw typeError("execute 'remove' on 'SourceBuffer'", "The start provided (" + start + ") is outside the range [0, " + duration + "].");
+    if (!(end > start)) throw typeError("execute 'remove' on 'SourceBuffer'", "The end provided (" + end + ") is less than or equal to the start (" + start + ").");
+    reopenSource(this.__source);
+    var self = this;
+    cycle(this, function () { __mse_remove(self.__id, start, end); return false; });
+  });
+  method(SourceBuffer.prototype, 'abort', function () {
+    usable(this, "execute 'abort'");
+    if (__mse_state(this.__source.__id) !== 1) throw mseError(bufferName("execute 'abort'") + "The parent media source's readyState is not 'open'.", 'InvalidStateError');
+    if (this.__updating) {
+      this.__job++;
+      this.__updating = false;
+      mseFire(this, 'abort');
+      mseFire(this, 'updateend');
+    }
+    __mse_abort(this.__id);
+  });
+  method(SourceBuffer.prototype, 'changeType', function (type) {
+    if (arguments.length < 1) throw typeError("execute 'changeType' on 'SourceBuffer'", "1 argument required, but only 0 present.");
+    type = String(type);
+    if (type === '') throw typeError("execute 'changeType' on 'SourceBuffer'", "The type provided ('') is empty.");
+    if (!__mse_supported(type)) throw mseError(bufferName("execute 'changeType'") + "The type provided ('" + type + "') is unsupported.", 'NotSupportedError');
+    idle(this, "execute 'changeType'");
+    reopenSource(this.__source);
+    if (__mse_change_type(this.__id, type) !== 0) throw mseError(bufferName("execute 'changeType'") + "The type provided ('" + type + "') is not compatible with this SourceBuffer's byte stream format.", 'NotSupportedError');
+  });
+  hide(g, 'MediaSource', MediaSource);
+  hide(g, 'SourceBuffer', SourceBuffer);
+  hide(g, 'SourceBufferList', SourceBufferList);
+
+  // navigator.mediaCapabilities: what players ask before choosing a rendition. What can be played is what a SourceBuffer takes.
+  if (g.navigator && !g.navigator.mediaCapabilities) {
+    hide(g.navigator, 'mediaCapabilities', {
+      decodingInfo: function (config) {
+        return new Promise(function (resolve, reject) {
+          var entry = config && (config.video || config.audio);
+          if (!entry || typeof entry.contentType !== 'string') { reject(new TypeError("Failed to execute 'decodingInfo' on 'MediaCapabilities': The configuration dictionary has neither a video nor an audio member.")); return; }
+          var ok = (config.type === 'media-source' || config.type === 'file') && __mse_supported(entry.contentType);
+          if (ok && config.video && config.audio) ok = __mse_supported(config.audio.contentType);
+          resolve({ supported: ok, smooth: ok, powerEfficient: false });
+        });
+      }
+    });
+  }
 
   // ---------------------------------------------------------------------------------------------------------------------------- FileReader
   function FileReader() {
@@ -1396,7 +1695,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
    'onkeypress', 'oninput', 'onchange', 'onfocus', 'onblur', 'onsubmit', 'onreset', 'oninvalid', 'onselect', 'onscroll', 'onload', 'onerror', 'onabort', 'ondrag', 'ondragstart', 'ondragend',
    'ondragover', 'ondragenter', 'ondragleave', 'ondrop', 'ontouchstart', 'ontouchend', 'ontouchmove', 'ontouchcancel', 'onpointerdown', 'onpointerup', 'onpointermove', 'onpointerover',
    'onpointerout', 'onpointerenter', 'onpointerleave', 'onpointercancel', 'ontransitionend', 'onanimationend', 'oncopy', 'oncut', 'onpaste', 'oncanplay', 'onplay', 'onpause', 'onended',
-   'ontimeupdate', 'onvolumechange', 'ontoggle', 'onauxclick', 'ongotpointercapture', 'onlostpointercapture'].forEach(function (name) { Object.defineProperty(EP, name, { value: null, writable: true }); });
+   'ontimeupdate', 'onvolumechange', 'onloadstart', 'onloadedmetadata', 'onloadeddata', 'oncanplaythrough', 'onplaying', 'onwaiting', 'onseeking', 'onseeked', 'ondurationchange', 'onratechange', 'onprogress', 'onsuspend', 'onstalled', 'onemptied', 'ontoggle', 'onauxclick', 'ongotpointercapture', 'onlostpointercapture'].forEach(function (name) { Object.defineProperty(EP, name, { value: null, writable: true }); });
   ['onerror', 'onresize', 'onhashchange', 'onpopstate', 'onmessage', 'onmessageerror', 'onstorage', 'onbeforeunload', 'onunload', 'ononline', 'onoffline', 'onfocus', 'onblur', 'onpageshow',
    'onpagehide', 'onunhandledrejection', 'onrejectionhandled', 'onlanguagechange', 'onclick', 'onkeydown', 'onkeyup', 'oninput', 'onchange', 'onsubmit', 'onscroll', 'onwheel'].forEach(function (name) {
     if (g[name] === undefined) g[name] = null;

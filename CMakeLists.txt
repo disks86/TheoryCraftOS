@@ -239,6 +239,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsStyle.cpp
   src/Browser/DomBindingsWindow.cpp
   src/Browser/DomBindingsMedia.cpp
+  src/Browser/DomBindingsMse.cpp
   src/Browser/DomBindingsForm.cpp
   src/Browser/DomBindingsNet.cpp
   src/Browser/WebPrelude.cpp
@@ -250,6 +251,7 @@ add_executable(BOOTX64
   src/Browser/SessionHistory.cpp
   src/Browser/Canvas.cpp
   src/Browser/Objects.cpp
+  src/Browser/MseClip.cpp
   src/Browser/Svg.cpp
   src/Dom/Dom.cpp
   src/Dom/Selector.cpp
@@ -450,6 +452,9 @@ add_executable(BOOTX64
   src/Media/Audio/OpusSilk.cpp
   src/Media/Audio/Mp4Audio.cpp
   src/Media/Mp4.cpp
+  src/Media/MseParsers.cpp
+  src/Media/MseBuffer.cpp
+  src/Media/MseHub.cpp
   src/Media/VideoFiles.cpp
   src/Media/MediaCodecs.cpp
   src/Video/AviFile.cpp

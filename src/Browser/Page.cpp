@@ -390,6 +390,11 @@ void Page::deliver_object_events() {
   uint32_t guard = 0;
   while (guard++ < 600 && objects_.take_event(&e)) {
     if (!bindings_) continue;
+    if (e.source != 0) {   // a MediaSource (sourceopen, sourceclose): the built-in script holds the object
+      const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(static_cast<double>(e.source)), DomBindings::HookArg::of(StringView(e.type))};
+      bindings_->call_hook("__mse_event", args, 2);
+      continue;
+    }
     dom::Node* n = doc_.by_serial(e.serial);
     if (!n) continue;
     EventInit init;

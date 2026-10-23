@@ -17,6 +17,7 @@
  */
 
 #include "Browser/Objects.hpp"
+#include "Browser/MseClip.hpp"
 #include <initializer_list>
 #include "Browser/Url.hpp"
 #include "Media/ImageCodecs.hpp"
@@ -283,7 +284,7 @@ bool decode_data_url(allocators::IAllocator& allocator, StringView url, ByteBuff
 }
 
 PageObjects::PageObjects(allocators::IAllocator& allocator)
-    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator) {}
+    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator), mse_(allocator) {}
 
 PageObjects::~PageObjects() {
   for (uint64_t i = 0; i < images_.count(); ++i) release_scaled(&images_[i]->scaled);
@@ -355,10 +356,24 @@ void PageObjects::queue(uint32_t serial, const char* type) {
 
 bool PageObjects::take_event(Event* out) {
   Lock lock(*this);
-  if (events_.count() == 0) return false;
+  if (events_.count() == 0) {
+    media::MseHub::Event e;
+    if (!mse_.take_event(&e)) return false;
+    *out = Event();
+    out->type = e.type;
+    out->source = e.source;
+    return true;
+  }
   *out = events_[0];
   events_.remove_at(0);
   return true;
+}
+
+int64_t PageObjects::mse_playhead(uint32_t source) {
+  media::MseSource* s = mse_.find(source);
+  if (!s || s->element == 0) return 0;
+  VideoSlot* v = find_video(s->element);
+  return v && v->clip ? v->clip->position_us() : 0;
 }
 
 bool PageObjects::take_dirty() {
@@ -490,6 +505,122 @@ void PageObjects::sync_image(dom::Node* n, IObjectEnvironment& env, StringView b
 
 // --- Videos -----------------------------------------------------------------------------------------------------------------------
 
+void PageObjects::release_mse(VideoSlot& v) {
+  if (v.mse_source == 0) return;
+  v.clip = UniquePointer<IVideoClip>();   // (the clip lets go of its files)
+  v.mse_clip = nullptr;
+  mse_.detach(v.mse_source);
+  v.mse_source = 0;
+  v.last_ready = 0;
+  v.loaded_data = v.waiting_sent = false;
+  v.last_duration_us = -2;
+  v.last_progress = -1;
+}
+
+// The size of the picture buffer follows the picture of a clip that is fed while it plays (its first picture is not there at the start).
+void PageObjects::ensure_picture(VideoSlot& v) {
+  if (v.audio || !v.clip) return;
+  const uint64_t w = v.clip->width() ? v.clip->width() : 1, h = v.clip->height() ? v.clip->height() : 1;
+  if (v.picture.size() == w * h) return;
+  release_view(allocator_, v.picture);
+  v.picture = allocate_view<uint32_t>(allocator_, w * h);
+  v.have_picture = false;
+  v.picture_serial = 0xFFFFFFFFu;
+  release_scaled(&v.scaled);
+}
+
+void PageObjects::attach_mse(VideoSlot& v, dom::Node* n, uint32_t source, StringView address, IObjectEnvironment& env) {
+  release_mse(v);
+  v.url.assign(address);
+  v.clip = UniquePointer<IVideoClip>();
+  v.have_picture = false;
+  v.picture_serial = 0xFFFFFFFFu;
+  v.ended = v.seeking = v.throttled = false;
+  v.played_end_us = 0;
+  v.error_code = 0;
+  release_scaled(&v.scaled);
+  if (!mse_.attach(source, n->serial)) {   // (it plays in another element already)
+    v.state = 2;
+    v.error_code = 4;
+    v.wants_play = v.play_pending = false;
+    queue(n->serial, "error");
+    return;
+  }
+  auto clip = UniquePointer<MseClip>::make(allocator_, allocator_, mse_, source, &env);
+  if (!clip) {
+    mse_.detach(source);
+    v.state = 2;
+    v.error_code = 3;
+    queue(n->serial, "error");
+    return;
+  }
+  v.mse_clip = clip.get();
+  v.mse_source = source;
+  v.clip = util::move(clip);
+  v.state = 1;
+  v.last_ready = 0;
+  v.loaded_data = v.waiting_sent = false;
+  v.last_duration_us = -2;
+  v.last_progress = -1;
+  v.clip->set_volume(v.volume, v.muted);
+  apply_rate(v);
+  if (v.pending_seek_us >= 0) {
+    v.clip->seek(v.pending_seek_us);
+    v.pending_seek_us = -1;
+  }
+  ensure_picture(v);
+  queue(n->serial, "loadstart");
+  if (v.autoplay || v.wants_play) {
+    const bool announced = v.play_pending;
+    v.clip->play();
+    v.was_playing = true;
+    v.wants_play = true;
+    reanchor(v);
+    if (!announced) queue(n->serial, "play");
+    v.play_pending = true;   // ("playing" comes when there is enough data)
+  }
+  dirty_ = true;
+}
+
+// What a clip that is fed while it plays says about itself, as the events of the media element algorithms.
+void PageObjects::watch_dynamic(VideoSlot& v) {
+  IVideoClip& c = *v.clip;
+  const int64_t duration = c.duration_us();
+  if (duration != v.last_duration_us) {
+    if (!(v.last_duration_us == -2 && duration == -1)) queue(v.serial, "durationchange");
+    v.last_duration_us = duration;
+  }
+  const uint8_t ready = c.ready_state();
+  if (ready != v.last_ready) {
+    const uint8_t before = v.last_ready;
+    if (before < 1 && ready >= 1) queue(v.serial, "loadedmetadata");
+    if (!v.loaded_data && ready >= 2) {
+      queue(v.serial, "loadeddata");
+      v.loaded_data = true;
+    }
+    if (before < 3 && ready >= 3) {
+      queue(v.serial, "canplay");
+      if (v.play_pending || v.waiting_sent) queue(v.serial, "playing");
+      v.play_pending = v.waiting_sent = false;
+    }
+    if (before < 4 && ready >= 4) queue(v.serial, "canplaythrough");
+    if (before >= 3 && ready < 3 && (v.wants_play || slot_playing(v)) && !v.ended && !v.seeking) {
+      queue(v.serial, "waiting");
+      v.waiting_sent = true;
+    }
+    v.last_ready = ready;
+  }
+  double pairs[VideoState::kMaxRanges * 2];
+  const uint32_t count = c.buffered(ArrayView<double>(pairs, VideoState::kMaxRanges * 2));
+  double signature = static_cast<double>(count);
+  for (uint32_t i = 0; i < count; ++i) signature += pairs[i * 2] * 3 + pairs[i * 2 + 1];
+  if (signature != v.last_progress) {
+    if (v.last_progress >= 0) queue(v.serial, "progress");
+    v.last_progress = signature;
+  }
+  ensure_picture(v);
+}
+
 PageObjects::VideoSlot* PageObjects::ensure_video(uint32_t serial) {
   if (VideoSlot* v = find_video(serial)) return v;
   if (videos_.count() >= kMaxVideos) return nullptr;
@@ -545,6 +676,7 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
   if (candidate.empty()) {
     if (slot->state != 0 || slot->clip) {
       if (slot->clip) queue(n->serial, "emptied");
+      release_mse(*slot);
       slot->clip = UniquePointer<IVideoClip>();
       slot->state = 0;
       slot->url.clear();
@@ -555,14 +687,25 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
     return;
   }
   String absolute(allocator_);
-  const bool resolved = candidate.view().starts_with("data:") ? absolute.assign(candidate.view()) : resolve_reference(allocator_, base, candidate.view(), &absolute);
+  const bool resolved = candidate.view().starts_with("data:") || candidate.view().starts_with("blob:") ? absolute.assign(candidate.view()) : resolve_reference(allocator_, base, candidate.view(), &absolute);
+  if (resolved && absolute.view().starts_with("blob:")) {   // maybe a MediaSource
+    const uint32_t source = mse_.source_for_url(absolute.view());
+    if (source != 0 && !(slot->mse_source == source && slot->url.view().equals(absolute.view()) && slot->state != 0)) {
+      if (slot->clip) queue(n->serial, "emptied");
+      if (slot->clip || slot->state != 0) slot->rate = slot->default_rate;
+      attach_mse(*slot, n, source, absolute.view(), env);
+      return;
+    }
+  }
   if (resolved && slot->url.view().equals(absolute.view()) && slot->state != 0) {
+    if (slot->mse_clip) slot->mse_clip->set_environment(&env);
     if (slot->clip) slot->clip->set_looping(slot->loop);
     return;
   }
   if (*fetched >= 4) return;   // (a few big downloads per drawing of the page)
   ++*fetched;
   if (slot->clip) queue(n->serial, "emptied");
+  release_mse(*slot);
   if (slot->clip || slot->state != 0) {   // (another file than the one it had: what the old one left is gone; a script's settings from before it was fetched stay)
     slot->ended = slot->seeking = slot->throttled = false;
     slot->played_end_us = 0;
@@ -661,6 +804,7 @@ void PageObjects::sync(dom::Document& doc, IObjectEnvironment& env, StringView b
   }
   for (uint64_t i = videos_.count(); i > 0; --i) {
     if (videos_[i - 1]->seen) continue;
+    release_mse(*videos_[i - 1]);
     release_scaled(&videos_[i - 1]->scaled);
     release_scaled(&videos_[i - 1]->poster_scaled);
     release_view(allocator_, videos_[i - 1]->picture);
@@ -697,13 +841,23 @@ void PageObjects::update(uint64_t now_ms) {
     VideoSlot& v = *videos_[i];
     if (!v.clip) continue;
     v.clip->update();
-    if (v.seeking) {   // (the seek has been made: the clip had its turn to show the new place)
+    if (v.seeking && (!v.clip->dynamic() || v.clip->ready_state() >= 2)) {   // (the seek has been made: the clip had its turn to show the new place)
       v.seeking = false;
       queue(v.serial, "seeked");
       queue(v.serial, "timeupdate");
       dirty_ = true;
     }
     follow_clock(v);
+    if (v.clip->dynamic()) {
+      watch_dynamic(v);
+      if (const uint8_t code = v.clip->error()) {
+        if (!v.error_code) {
+          v.error_code = code;
+          v.wants_play = v.play_pending = false;
+          queue(v.serial, "error");
+        }
+      }
+    }
     const bool playing = slot_playing(v);
     if (playing) {
       const int64_t at = v.clip->position_us();
@@ -902,7 +1056,8 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
                       {static_cast<float>(x + 21), static_cast<float>(y + bar + 12)}, 0xFFFFFFFFu);
     }
     String text(allocator_);
-    const double duration = v.clip ? static_cast<double>(v.clip->duration_us()) / 1e6 : 0;
+    double duration = v.clip ? static_cast<double>(v.clip->duration_us()) / 1e6 : 0;
+    if (duration < 0 || duration > 1e9) duration = 0;   // (not known, or a stream with no end)
     const double current = v.clip ? static_cast<double>(v.clip->position_us()) / 1e6 : 0;
     format_time(current, &text);
     text.append(" / ");
@@ -966,7 +1121,7 @@ bool PageObjects::object_clicked(uint32_t serial, int32_t lx, int32_t ly, uint32
     if (track_w > 8 && lx <= 32 + track_w) {
       const double fraction = static_cast<double>(lx - 32) / track_w;
       const double duration = static_cast<double>(v->clip->duration_us());
-      seek_slot(*v, static_cast<int64_t>(fraction * duration));
+      if (duration > 0 && duration < 9e15) seek_slot(*v, static_cast<int64_t>(fraction * duration));
       return true;
     }
     return false;
@@ -1075,7 +1230,26 @@ void PageObjects::video_state(uint32_t serial, VideoState* out) {
   out->rate = v->rate;
   out->default_rate = v->default_rate;
   out->error_code = v->error_code;
-  if (out->ready) {
+  if (v->clip && v->state == 1 && v->clip->dynamic()) {   // a media source: what it says is what there is
+    out->dynamic = true;
+    out->ready_state = v->clip->ready_state();
+    out->ready = out->ready_state >= 1;
+    out->paused = !(v->wants_play || slot_playing(*v));
+    out->current_time = static_cast<double>(v->clip->position_us()) / 1e6;
+    const int64_t duration = v->clip->duration_us();
+    out->duration = duration < 0 ? -1 : duration == INT64_MAX ? __builtin_huge_val() : static_cast<double>(duration) / 1e6;
+    out->played_end = static_cast<double>(v->played_end_us) / 1e6;
+    if (out->played_end < out->current_time) out->played_end = out->current_time;
+    out->width = out->ready ? v->clip->width() : 0;
+    out->height = out->ready ? v->clip->height() : 0;
+    out->network_state = out->ready ? 1 : 2;
+    if (const uint8_t code = v->clip->error()) out->error_code = code;
+    double pairs[VideoState::kMaxRanges * 2];
+    out->buffered_count = v->clip->buffered(ArrayView<double>(pairs, VideoState::kMaxRanges * 2));
+    for (uint32_t i = 0; i < out->buffered_count * 2; ++i) out->buffered_ranges[i] = pairs[i];
+    out->seekable_count = v->clip->seekable(ArrayView<double>(pairs, VideoState::kMaxRanges * 2));
+    for (uint32_t i = 0; i < out->seekable_count * 2; ++i) out->seekable_ranges[i] = pairs[i];
+  } else if (out->ready) {
     out->paused = !(v->wants_play || slot_playing(*v));
     out->current_time = static_cast<double>(v->clip->position_us()) / 1e6;
     out->duration = static_cast<double>(v->clip->duration_us()) / 1e6;
@@ -1174,7 +1348,12 @@ bool PageObjects::play_slot(VideoSlot& v) {
       return false;
     }
     if (was_paused) queue(v.serial, "play");
-    queue(v.serial, "playing");
+    if (v.clip->dynamic() && v.clip->ready_state() < 3) {
+      queue(v.serial, "waiting");
+      v.play_pending = true;   // ("playing" is fired by watch_dynamic() when there is data to play)
+    } else {
+      queue(v.serial, "playing");
+    }
   }
   v.was_playing = true;
   reanchor(v);
@@ -1290,6 +1469,7 @@ void PageObjects::video_load(uint32_t serial) {
   VideoSlot* v = find_video(serial);
   if (!v) return;
   if (v->clip || v->state != 0) queue(serial, "emptied");
+  release_mse(*v);
   v->clip = UniquePointer<IVideoClip>();
   v->state = 0;
   v->url.clear();

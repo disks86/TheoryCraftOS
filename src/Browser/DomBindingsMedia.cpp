@@ -172,11 +172,12 @@ NATIVE(thenable_finally) {
 Value make_thenable(DomBindings::Impl& c) { return Value::make_object(c.vm.new_object(c.thenable_proto)); }
 
 // A TimeRanges: one range, 0 to `end` (none when `end` is 0).
-bool range_index(Vm& vm, const Value& self, const Value* args, uint32_t argc, const char* function) {
+bool range_index(Vm& vm, const Value& self, uint32_t* index_out, const Value* args, uint32_t argc, const char* function) {
   if (!need_args(vm, argc, 1, function)) return false;
   double index, length;
   Value l;
   if (!arg_number(vm, args, argc, 0, &index) || !vm.get_named(self, "length", &l) || !vm.to_number(l, &length)) return false;
+  if (index_out) *index_out = index >= 0 && index < 4294967295.0 ? static_cast<uint32_t>(index) : 0;
   if (!(index >= 0 && index < length)) {
     String m(vm.allocator());
     m.append("Failed to execute '");
@@ -190,18 +191,18 @@ bool range_index(Vm& vm, const Value& self, const Value* args, uint32_t argc, co
   }
   return true;
 }
-NATIVE(ranges_start) {
-  if (!range_index(vm, self, args, argc, "start")) return false;
-  *result = num_value(0);
-  return true;
+// (the boundaries are properties of their own, __s0, __e0, __s1 ...)
+bool range_edge(Vm& vm, const Value& self, const Value* args, uint32_t argc, const char* function, char which, Value* result) {
+  uint32_t index = 0;
+  if (!range_index(vm, self, &index, args, argc, function)) return false;
+  String name(vm.allocator());
+  name.append("__");
+  name.push_back(which);
+  name.append_uint(index);
+  return vm.get_named(self, name.view(), result);
 }
-NATIVE(ranges_end) {
-  if (!range_index(vm, self, args, argc, "end")) return false;
-  Value e;
-  if (!vm.get_named(self, "__end", &e)) return false;
-  *result = e;
-  return true;
-}
+NATIVE(ranges_start) { return range_edge(vm, self, args, argc, "start", 's', result); }
+NATIVE(ranges_end) { return range_edge(vm, self, args, argc, "end", 'e', result); }
 
 // element.error: a MediaError (the code is what MediaError.MEDIA_ERR_* says).
 Value make_media_error(DomBindings::Impl& c, uint32_t code) {
@@ -212,11 +213,29 @@ Value make_media_error(DomBindings::Impl& c, uint32_t code) {
   return Value::make_object(o);
 }
 
-Value make_ranges(DomBindings::Impl& c, double end) {
-  JsObject* o = c.vm.new_object(c.time_ranges_proto);
-  c.vm.define_named(o, "length", num_value(end > 0 ? 1 : 0));
-  c.vm.define(o, key_of(c.vm, "__end"), num_value(end), 0);
+}  // namespace
+
+Value make_time_ranges(DomBindings::Impl& c, const double* pairs, uint32_t count) {
+  Vm& vm = c.vm;
+  JsObject* o = vm.new_object(c.time_ranges_proto);
+  vm.define_named(o, "length", num_value(count));
+  for (uint32_t i = 0; i < count; ++i) {
+    String start(vm.allocator()), end(vm.allocator());
+    start.append("__s");
+    start.append_uint(i);
+    end.append("__e");
+    end.append_uint(i);
+    vm.define(o, vm.intern(start.view()), num_value(pairs[i * 2]), 0);
+    vm.define(o, vm.intern(end.view()), num_value(pairs[i * 2 + 1]), 0);
+  }
   return Value::make_object(o);
+}
+
+namespace {
+
+Value make_ranges(DomBindings::Impl& c, double end) {
+  const double pair[2] = {0, end};
+  return make_time_ranges(c, pair, end > 0 ? 1 : 0);
 }
 
 // --- Element properties --------------------------------------------------------------------------------------------------------------
@@ -255,7 +274,7 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
     PageObjects::VideoState st;
     objs(vm).video_state(n->serial, &st);
     if (IS("currentTime")) { *out = num_value(st.current_time); return true; }
-    if (IS("duration")) { *out = num_value(st.ready ? st.duration : nan_value()); return true; }
+    if (IS("duration")) { *out = num_value(st.ready && st.duration >= 0 ? st.duration : nan_value()); return true; }
     if (IS("paused")) { *out = bool_value(st.paused); return true; }
     if (IS("ended")) { *out = bool_value(st.ended); return true; }
     if (IS("seeking")) { *out = bool_value(st.seeking); return true; }
@@ -277,6 +296,10 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
       return true;
     }
     if (IS("preservesPitch")) { *out = bool_value(true); return true; }
+    if (st.dynamic && (IS("buffered") || IS("seekable"))) {
+      *out = IS("buffered") ? make_time_ranges(c, st.buffered_ranges, st.buffered_count) : make_time_ranges(c, st.seekable_ranges, st.seekable_count);
+      return true;
+    }
     if (IS("buffered") || IS("seekable")) { *out = make_ranges(c, st.buffered_end); return true; }
     if (IS("played")) { *out = make_ranges(c, st.played_end); return true; }
     if (IS("currentSrc")) {
@@ -1880,6 +1903,7 @@ bool install_media(DomBindings::Impl& c) {
 
   c.image_data_proto = vm.new_plain();
   make_class("ImageData", image_data_constructor, c.image_data_proto, 2);
+  make_class("TimeRanges", [](Vm& v, const Value&, const Value*, uint32_t, Value*) { return v.throw_error(ErrorKind::TypeError, "Illegal constructor"); }, c.time_ranges_proto, 0);
   c.text_metrics_proto = vm.new_plain();
   make_class("TextMetrics", [](Vm& v, const Value&, const Value*, uint32_t, Value*) { return v.throw_error(ErrorKind::TypeError, "Illegal constructor"); }, c.text_metrics_proto, 0);
 
