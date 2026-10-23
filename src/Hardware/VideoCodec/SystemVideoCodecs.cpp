@@ -24,9 +24,9 @@
 namespace hardware {
 
 namespace {
-template <class T>
-void try_add(List<UniquePointer<IVideoCodecDevice>>& list, allocators::IAllocator& allocator) {
-  UniquePointer<T> device = UniquePointer<T>::make(allocator, allocator);
+template <class T, class... Args>
+void try_add(List<UniquePointer<IVideoCodecDevice>>& list, allocators::IAllocator& allocator, Args... args) {
+  UniquePointer<T> device = UniquePointer<T>::make(allocator, allocator, args...);
   if (!device) return;
   if (!device->initialize()) {
     device->shutdown();
@@ -42,7 +42,7 @@ void SystemVideoCodecs::initialize() {
     if (d.class_code != kPciClassDisplay) continue;
     if (d.vendor_id == NvidiaVideoEngine::kPciVendor) try_add<NvidiaVideoEngine>(devices_, allocator_);
     else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_);
-    else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) try_add<IntelMediaVideoEngine>(devices_, allocator_);
+    else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) try_add<IntelMediaVideoEngine>(devices_, allocator_, d.device_id);
   }
   try_add<SoftwareVideoCodec>(devices_, allocator_);
 }

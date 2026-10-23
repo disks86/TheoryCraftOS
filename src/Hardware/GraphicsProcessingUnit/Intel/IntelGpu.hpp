@@ -17,20 +17,26 @@
  */
 
 #pragma once
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
 
 namespace hardware {
 
-// Intel display controller (PCI vendor 0x8086). Modes and the framebuffer still
+// Intel display controller (PCI vendor 0x8086), identified by device ID down to its architecture (UHD 6xx, Iris Xe, Arc,
+// Xe2, Xe3; see IntelGpuGenerations.hpp). Modes and the framebuffer still
 // come from the firmware (UEFI GOP); native mode setting for these parts is
 // future work, and this class is where it will go.
 class IntelGpu final : public UefiGopGpu {
  public:
   static constexpr uint16_t kPciVendor = 0x8086;
 
-  explicit IntelGpu(const GpuContext& context) : UefiGopGpu(context) {}
+  explicit IntelGpu(const GpuContext& context) : UefiGopGpu(context), info_(intel_gpu_identify(context.device.device_id)) {}
 
-  const char* name() const override { return "Intel graphics (UEFI framebuffer)"; }
+  const char* name() const override { return info_.name; }
+  const IntelGpuInfo& generation() const { return info_; }
+
+ private:
+  IntelGpuInfo info_;
 };
 
 }  // namespace hardware

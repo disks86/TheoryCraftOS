@@ -323,6 +323,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/Hardware/GraphicsProcessingUnit/SystemGpu.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp

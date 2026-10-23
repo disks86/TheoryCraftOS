@@ -1,0 +1,108 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// Host-side tests for the Intel CPU generation rules (9th-gen Core and newer) and the Intel GPU architecture table. Includes the
+// lookup with every family/model/stepping at the edges of a range, and every possible 16-bit GPU device ID (the table must never
+// read out of range, and an ID is either one architecture or Unknown).
+#include <stdio.h>
+#include <string.h>
+#include "Hardware/CentralProcessingUnit/Intel/IntelGenerations.hpp"
+#include "Hardware/CentralProcessingUnit/X86_64Cpu.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
+
+using namespace hardware;
+
+// The CPU classes call these assembly routines; the identity tests never do.
+extern "C" {
+void tcos_halt() {}
+void tcos_pause() {}
+void tcos_breakpoint() {}
+void tcos_disable_interrupts() {}
+void tcos_enable_interrupts() {}
+uint64_t tcos_rdtsc() { return 0; }
+}
+
+static int g_failed = 0;
+#define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
+
+static const char* cpu_name(uint32_t family, uint32_t model, uint32_t stepping) {
+  alignas(X86_64Cpu) unsigned char storage[sizeof(X86_64Cpu)];
+  ICentralProcessingUnit* cpu = create_intel_generation(storage, nullptr, {family, model, stepping});
+  return cpu ? cpu->name() : nullptr;
+}
+
+static bool cpu_is(uint32_t family, uint32_t model, uint32_t stepping, const char* expected) {
+  const char* n = cpu_name(family, model, stepping);
+  return n && strcmp(n, expected) == 0;
+}
+
+static void test_cpu() {
+  CHECK(cpu_is(6, 0x9E, 0xC, "Intel Coffee Lake Refresh") && cpu_is(6, 0x9E, 0xD, "Intel Coffee Lake Refresh"));
+  CHECK(cpu_name(6, 0x9E, 0xB) == nullptr);  // 8th gen: not a generation this table names
+  CHECK(cpu_is(6, 0x8E, 0xC, "Intel Comet Lake") && cpu_is(6, 0xA5, 0x2, "Intel Comet Lake") && cpu_is(6, 0xA6, 0x0, "Intel Comet Lake"));
+  CHECK(cpu_is(6, 0x7E, 0x5, "Intel Ice Lake (client)") && cpu_is(6, 0x7D, 0x1, "Intel Ice Lake (client)"));
+  CHECK(cpu_is(6, 0x6A, 0x6, "Intel Ice Lake-SP"));  // the Xeon keeps its own model
+  CHECK(cpu_is(6, 0x8C, 0x1, "Intel Tiger Lake") && cpu_is(6, 0x8D, 0x1, "Intel Tiger Lake"));
+  CHECK(cpu_is(6, 0xA7, 0x1, "Intel Rocket Lake"));
+  CHECK(cpu_is(6, 0x97, 0x2, "Intel Alder Lake") && cpu_is(6, 0x9A, 0x3, "Intel Alder Lake"));
+  CHECK(cpu_is(6, 0xBE, 0x0, "Intel Alder Lake-N / Twin Lake"));
+  CHECK(cpu_is(6, 0xB7, 0x1, "Intel Raptor Lake") && cpu_is(6, 0xBA, 0x2, "Intel Raptor Lake") && cpu_is(6, 0xBF, 0x5, "Intel Raptor Lake"));
+  CHECK(cpu_is(6, 0xAA, 0x4, "Intel Meteor Lake") && cpu_is(6, 0xAC, 0x1, "Intel Meteor Lake"));
+  CHECK(cpu_is(6, 0xC6, 0x2, "Intel Arrow Lake") && cpu_is(6, 0xC5, 0x1, "Intel Arrow Lake") && cpu_is(6, 0xB5, 0x0, "Intel Arrow Lake"));
+  CHECK(cpu_is(6, 0xBD, 0x1, "Intel Lunar Lake"));
+  CHECK(cpu_is(6, 0xCC, 0x0, "Intel Panther Lake") && cpu_is(6, 0xD5, 0x0, "Intel Wildcat Lake"));
+  CHECK(cpu_is(18, 0x01, 0x0, "Intel Nova Lake") && cpu_is(18, 0x03, 0x0, "Intel Nova Lake"));
+  CHECK(cpu_is(6, 0x96, 0x1, "Intel Tremont") && cpu_is(6, 0x9C, 0x0, "Intel Tremont") && cpu_is(6, 0x8A, 0x1, "Intel Lakefield"));
+  // Models the table must keep: the older generations and the neighbouring server parts did not move.
+  CHECK(cpu_is(6, 0x5E, 0x3, "Intel Skylake (client)") && cpu_is(6, 0xAF, 0x1, "Intel Sierra Forest") && cpu_is(19, 0x01, 0x0, "Intel Diamond Rapids"));
+  // Nothing outside the Intel families matches, and every signature is answered without reading out of range.
+  CHECK(cpu_name(5, 0xA7, 0x1) == nullptr && cpu_name(0xF, 0xA7, 0x1) == nullptr);
+  for (uint32_t family = 0; family < 32; ++family)
+    for (uint32_t model = 0; model < 256; ++model)
+      for (uint32_t stepping = 0; stepping < 16; ++stepping) (void)cpu_name(family, model, stepping);
+}
+
+static void test_gpu() {
+  using A = IntelGpuArchitecture;
+  CHECK(intel_gpu_identify(0x3E92).architecture == A::Gen9_5 && intel_gpu_identify(0x9BC8).architecture == A::Gen9_5);
+  CHECK(intel_gpu_identify(0x8A52).architecture == A::Gen11 && intel_gpu_identify(0x4E55).architecture == A::Gen11);
+  CHECK(intel_gpu_identify(0x9A49).architecture == A::XeLp && intel_gpu_identify(0x4C8A).architecture == A::XeLp);
+  CHECK(intel_gpu_identify(0x4680).architecture == A::XeLp && intel_gpu_identify(0xA780).architecture == A::XeLp);
+  CHECK(intel_gpu_identify(0x56A0).architecture == A::XeHpg && intel_gpu_identify(0x56A0).discrete);
+  CHECK(intel_gpu_identify(0x7D55).architecture == A::XeLpg && !intel_gpu_identify(0x7D55).discrete);
+  CHECK(intel_gpu_identify(0x64A0).architecture == A::Xe2 && intel_gpu_identify(0xE20B).architecture == A::Xe2 && intel_gpu_identify(0xE20B).discrete);
+  CHECK(intel_gpu_identify(0xB080).architecture == A::Xe3);
+  CHECK(intel_gpu_identify(0x0BD5).architecture == A::XeHpc);
+  CHECK(intel_gpu_identify(0x0000).architecture == A::Unknown && intel_gpu_identify(0xFFFF).architecture == A::Unknown);
+  // Media engine: AV1 decode arrives with Xe-LP, AV1 encode with Arc.
+  CHECK(!intel_gpu_identify(0x3E92).media_av1_decode && intel_gpu_identify(0x9A49).media_av1_decode && !intel_gpu_identify(0x9A49).media_av1_encode);
+  CHECK(intel_gpu_identify(0x56A0).media_av1_encode && intel_gpu_identify(0xE20B).media_av1_encode);
+  // Every device ID gives a name and an architecture/name pair that agree.
+  for (uint32_t id = 0; id <= 0xFFFF; ++id) {
+    const IntelGpuInfo info = intel_gpu_identify(static_cast<uint16_t>(id));
+    CHECK(info.name != nullptr && (info.architecture != A::Unknown || (!info.discrete && !info.media_hevc && !info.media_vp9)));
+  }
+}
+
+int main() {
+  test_cpu();
+  test_gpu();
+  if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
+  printf("IntelGenerationTest passed\n");
+  return 0;
+}

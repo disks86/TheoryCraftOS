@@ -18,27 +18,43 @@
 
 #include "Hardware/CentralProcessingUnit/Intel/IntelGenerations.hpp"
 #include "Hardware/CentralProcessingUnit/GenerationTable.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelAlderLakeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelArrowLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelBroadwellCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelCascadeLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelClearwaterForestCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelCoffeeLakeRefreshCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelCometLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelConroeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelCooperLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelDenvertonCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelDiamondRapidsCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelGracemontCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelGraniteRapidsCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelHaswellCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelIceLakeClientCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelIceLakeServerCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelIvyBridgeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelKnightsMillCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelLakefieldCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelLunarLakeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelMeteorLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelNehalemCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelNovaLakeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelPantherLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelPenrynCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelRaptorLakeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelRocketLakeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelSandyBridgeCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelSapphireRapidsCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelSierraForestCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelSkylakeClientCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelSkylakeServerCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelSnowRidgeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelTigerLakeCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelTremontCpu.hpp"
 #include "Hardware/CentralProcessingUnit/Intel/IntelWestmereCpu.hpp"
+#include "Hardware/CentralProcessingUnit/Intel/IntelWildcatLakeCpu.hpp"
 
 namespace hardware {
 
@@ -84,6 +100,31 @@ constexpr GenerationRule kRules[] = {
     rule<IntelSierraForestCpu>(6, 0xAF, 0xAF),
     rule<IntelClearwaterForestCpu>(6, 0xDD, 0xDD),
     rule<IntelDiamondRapidsCpu>(19, 0x01, 0x01),
+    // Client parts from Skylake's successors on. Steppings separate the 8th, 9th and 10th generations that share a model.
+    rule<IntelCoffeeLakeRefreshCpu>(6, 0x9E, 0x9E, 0xC, 0xD),
+    rule<IntelCometLakeCpu>(6, 0x8E, 0x8E, 0xC, 0xD),
+    rule<IntelCometLakeCpu>(6, 0xA5, 0xA6),
+    rule<IntelIceLakeClientCpu>(6, 0x7D, 0x7E),
+    rule<IntelLakefieldCpu>(6, 0x8A, 0x8A),
+    rule<IntelTremontCpu>(6, 0x96, 0x96),
+    rule<IntelTremontCpu>(6, 0x9C, 0x9C),
+    rule<IntelTigerLakeCpu>(6, 0x8C, 0x8D),
+    rule<IntelRocketLakeCpu>(6, 0xA7, 0xA7),
+    rule<IntelAlderLakeCpu>(6, 0x97, 0x97),
+    rule<IntelAlderLakeCpu>(6, 0x9A, 0x9A),
+    rule<IntelGracemontCpu>(6, 0xBE, 0xBE),
+    rule<IntelRaptorLakeCpu>(6, 0xB7, 0xB7),
+    rule<IntelRaptorLakeCpu>(6, 0xBA, 0xBA),
+    rule<IntelRaptorLakeCpu>(6, 0xBF, 0xBF),
+    rule<IntelMeteorLakeCpu>(6, 0xAA, 0xAA),
+    rule<IntelMeteorLakeCpu>(6, 0xAC, 0xAC),
+    rule<IntelArrowLakeCpu>(6, 0xB5, 0xB5),
+    rule<IntelArrowLakeCpu>(6, 0xC5, 0xC6),
+    rule<IntelLunarLakeCpu>(6, 0xBD, 0xBD),
+    rule<IntelPantherLakeCpu>(6, 0xCC, 0xCC),
+    rule<IntelWildcatLakeCpu>(6, 0xD5, 0xD5),
+    rule<IntelNovaLakeCpu>(18, 0x01, 0x01),
+    rule<IntelNovaLakeCpu>(18, 0x03, 0x03),
 };
 }  // namespace
 
