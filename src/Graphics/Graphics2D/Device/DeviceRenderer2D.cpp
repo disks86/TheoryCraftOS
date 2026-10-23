@@ -17,13 +17,15 @@
  */
 
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
+#include "Graphics/Graphics2D/Raster2D.hpp"
 #include "Hardware/GraphicsProcessingUnit/Font8x16.hpp"
+#include "Utility/AllocatedView.hpp"
 
 namespace graphics {
 
 DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocator& allocator, Extent2D extent)
     : device_(device), allocator_(allocator), extent_(extent) {
-  clip_ = {0, 0, extent.width, extent.height};
+  clip_ = base_clip_ = {0, 0, extent.width, extent.height};
   vs_ = device.create_shader_module(colored_vertex_shader());
   fs_ = device.create_shader_module(colored_fragment_shader());
   GraphicsPipelineDesc desc;
@@ -101,11 +103,16 @@ bool DeviceRenderer2D::submit_pending() {
 }
 
 void DeviceRenderer2D::triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color) {
-  if (!valid_) return;
-  if (count_ + 3 > kMaxVertices) submit_pending();
-  const Vec4 c = unpack_color(color);
   const float xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
-  for (int i = 0; i < 3; ++i) batch_[count_++] = {{xs[i], ys[i], 0}, {c.x, c.y, c.z, c.w}};
+  const Vec4 c = unpack_color(color);
+  const Vec4 cs[3] = {c, c, c};
+  triangle_colors(xs, ys, cs);
+}
+
+void DeviceRenderer2D::triangle_colors(const float* xs, const float* ys, const Vec4* colors) {
+  if (!valid_ || clip_.width == 0 || clip_.height == 0) return;  // (nothing can show through an empty scissor)
+  if (count_ + 3 > kMaxVertices) submit_pending();
+  for (int i = 0; i < 3; ++i) batch_[count_++] = {{xs[i], ys[i], 0}, {colors[i].x, colors[i].y, colors[i].z, colors[i].w * opacity_}};
 }
 
 void DeviceRenderer2D::quad(float x0, float y0, float x1, float y1, uint32_t color) {
@@ -113,14 +120,22 @@ void DeviceRenderer2D::quad(float x0, float y0, float x1, float y1, uint32_t col
   triangle(x0, y0, x1, y1, x0, y1, color);
 }
 
-void DeviceRenderer2D::set_clip(const Rect2D& clip) {
+void DeviceRenderer2D::apply_clip() {
   close_range();  // what is recorded belongs to the old clip
-  clip_ = clip;
+  Rect2D r = base_clip_;
+  for (uint32_t i = 0; i < clip_depth_; ++i) r = raster::intersect(r, clip_stack_[i]);
+  if (clip_overflow_) r.width = r.height = 0;  // fail closed
+  clip_ = r;
+}
+
+void DeviceRenderer2D::set_clip(const Rect2D& clip) {
+  base_clip_ = raster::intersect(clip, {0, 0, extent_.width, extent_.height});
+  apply_clip();
 }
 
 void DeviceRenderer2D::reset_clip() {
-  close_range();
-  clip_ = {0, 0, extent_.width, extent_.height};
+  base_clip_ = {0, 0, extent_.width, extent_.height};
+  apply_clip();
 }
 
 void DeviceRenderer2D::set_blend(BlendMode mode) {
@@ -211,7 +226,7 @@ void DeviceRenderer2D::draw_image(const Surface& s, const Rect2D& rect, int32_t 
       while (i + run < rect.width && rect.x + static_cast<int64_t>(i + run) < s.width &&
              s.decode(s.row(static_cast<uint32_t>(sy))[rect.x + i + run]) == pixel)
         ++run;
-      fill_rect({x + static_cast<int32_t>(i), y + static_cast<int32_t>(j), run, 1}, pixel);
+      fill_rect({raster::saturate_i32(int64_t{x} + i), raster::saturate_i32(int64_t{y} + j), run, 1}, pixel);
       i += run;
     }
   }
@@ -234,6 +249,369 @@ void DeviceRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_
       }
     }
   }
+}
+
+// ---- Pixel-engine primitives -----------------------------------------------------------------------------
+
+bool DeviceRenderer2D::coverage_color(uint32_t color, uint32_t cov, uint32_t* out) const {
+  if (blend_ == BlendMode::Replace) {  // no anti-aliasing: half coverage or more is a whole pixel
+    if (cov < 128) return false;
+    *out = color;
+    return true;
+  }
+  if (cov == 0) return false;
+  *out = cov == 255 ? color : raster::scale_alpha(color, cov);
+  return true;
+}
+
+namespace {
+// Collects what raster::rrect_rows reports into as few rectangles as possible: equal solid runs on adjacent
+// rows become one rectangle, equal neighbouring partial pixels one run.
+struct RectSink {
+  DeviceRenderer2D& r;
+  uint32_t color;
+  Rect2D clip;
+  bool has_rect = false, has_run = false;
+  int32_t rx0 = 0, rx1 = 0, ry0 = 0, ry1 = 0;
+  int32_t px0 = 0, px1 = 0, py = 0;
+  uint32_t pcolor = 0, pcov = 0;
+
+  void flush_rect() {
+    if (has_rect) r.fill_rect({rx0, ry0, static_cast<uint32_t>(rx1 - rx0), static_cast<uint32_t>(ry1 - ry0)}, color);
+    has_rect = false;
+  }
+  void flush_run() {
+    if (has_run) r.fill_rect({px0, py, static_cast<uint32_t>(px1 - px0), 1}, pcolor);
+    has_run = false;
+  }
+  void solid(int32_t y, int32_t xa, int32_t xb) {
+    xa = raster::max_i(xa, clip.x);
+    xb = raster::min_i(xb, raster::saturate_i32(int64_t{clip.x} + clip.width));
+    if (xa >= xb) return;
+    if (has_rect && xa == rx0 && xb == rx1 && y == ry1) {
+      ++ry1;
+      return;
+    }
+    flush_rect();
+    has_rect = true;
+    rx0 = xa, rx1 = xb, ry0 = y, ry1 = y + 1;
+  }
+  void pixel(int32_t x, int32_t y, uint32_t cov) {
+    if (x < clip.x || x >= raster::saturate_i32(int64_t{clip.x} + clip.width)) return;
+    if (has_run && y == py && x == px1 && cov == pcov) {
+      ++px1;
+      return;
+    }
+    flush_run();
+    uint32_t c;
+    if (!r.coverage_color(color, cov, &c)) return;
+    has_run = true;
+    px0 = x, px1 = x + 1, py = y, pcolor = c, pcov = cov;
+  }
+  void finish() {
+    flush_rect();
+    flush_run();
+  }
+};
+}  // namespace
+
+void DeviceRenderer2D::fill_rounded_rect(const Rect2D& rect, const CornerRadii& radii, uint32_t color) {
+  if (!valid_ || !rect.width || !rect.height) return;
+  const raster::RRect rr = raster::RRect::make(rect, radii);
+  RectSink sink{*this, color, clip_};
+  raster::rrect_rows(rr, nullptr, clip_.y, raster::saturate_i32(int64_t{clip_.y} + clip_.height), sink);
+  sink.finish();
+}
+
+void DeviceRenderer2D::stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) {
+  if (!valid_ || !outer.width || !outer.height) return;
+  const raster::RRect rr = raster::RRect::make(outer, radii);
+  const raster::RRect hole = raster::RRect::inset(rr, widths);
+  RectSink sink{*this, color, clip_};
+  raster::rrect_rows(rr, &hole, clip_.y, raster::saturate_i32(int64_t{clip_.y} + clip_.height), sink);
+  sink.finish();
+}
+
+void DeviceRenderer2D::draw_mask(const MaskView& mask, const Rect2D& rect, int32_t x, int32_t y, uint32_t color) {
+  if (!valid_ || !mask.valid()) return;
+  const int64_t sx0 = rect.x > 0 ? rect.x : 0, sy0 = rect.y > 0 ? rect.y : 0;
+  const int64_t sx1 = raster::min_i(raster::saturate_i32(int64_t{rect.x} + rect.width), raster::saturate_i32(mask.width));
+  const int64_t sy1 = raster::min_i(raster::saturate_i32(int64_t{rect.y} + rect.height), raster::saturate_i32(mask.height));
+  const int64_t ddx = int64_t{x} - rect.x, ddy = int64_t{y} - rect.y;
+  const int64_t dx0 = raster::max_i(raster::saturate_i32(sx0 + ddx), clip_.x), dx1 = raster::min_i(raster::saturate_i32(sx1 + ddx), raster::saturate_i32(int64_t{clip_.x} + clip_.width));
+  const int64_t dy0 = raster::max_i(raster::saturate_i32(sy0 + ddy), clip_.y), dy1 = raster::min_i(raster::saturate_i32(sy1 + ddy), raster::saturate_i32(int64_t{clip_.y} + clip_.height));
+  if (dx0 >= dx1 || dy0 >= dy1) return;
+  const uint64_t n = static_cast<uint64_t>(dx1 - dx0);
+  for (int64_t dy = dy0; dy < dy1; ++dy) {
+    const ConstByteView cov = mask.coverage.subview(static_cast<uint64_t>(dy - ddy) * mask.pitch + static_cast<uint64_t>(dx0 - ddx), n);
+    for (uint64_t i = 0; i < n;) {
+      uint64_t j = i + 1;
+      while (j < n && cov[j] == cov[i]) ++j;  // a run of equal coverage is one rectangle
+      uint32_t c;
+      if (coverage_color(color, cov[i], &c))
+        fill_rect({static_cast<int32_t>(dx0 + static_cast<int64_t>(i)), static_cast<int32_t>(dy), static_cast<uint32_t>(j - i), 1}, c);
+      i = j;
+    }
+  }
+}
+
+void DeviceRenderer2D::draw_image_scaled(const Surface& source, const RectF& src, const Rect2D& dest, ImageFilter filter) {
+  if (!valid_ || !dest.width || !dest.height) return;
+  const raster::SampleBounds bounds = raster::sample_bounds(source, src);
+  if (bounds.empty()) return;
+  const Rect2D area = raster::intersect(dest, clip_);
+  if (!area.width || !area.height) return;
+  const float step_x = src.width / static_cast<float>(dest.width), step_y = src.height / static_cast<float>(dest.height);
+  const int64_t col0 = int64_t{area.x} - dest.x, row0 = int64_t{area.y} - dest.y;
+  for (uint32_t j = 0; j < area.height; ++j) {
+    const float sy = src.y + (static_cast<float>(row0 + j) + 0.5f) * step_y;
+    uint32_t run_start = 0, run_color = 0;
+    for (uint32_t i = 0; i <= area.width; ++i) {
+      uint32_t argb = 0;
+      if (i < area.width) {
+        const float sx = src.x + (static_cast<float>(col0 + i) + 0.5f) * step_x;
+        argb = filter == ImageFilter::Nearest ? raster::sample_nearest(source, bounds, sx, sy) : raster::sample_bilinear(source, bounds, sx, sy);
+      }
+      if (i > 0 && (i == area.width || argb != run_color))  // end of a run of equal pixels
+        fill_rect({area.x + static_cast<int32_t>(run_start), area.y + static_cast<int32_t>(j), i - run_start, 1}, run_color);
+      if (i == 0 || argb != run_color) run_start = i, run_color = argb;
+    }
+  }
+}
+
+namespace {
+struct Pt {
+  float x, y;
+};
+// Keeps the part of the convex polygon `in` where plane(p) = sign * (a * x + b * y + c) >= 0.
+uint32_t clip_polygon(const Pt* in, uint32_t n, float a, float b, float c, Pt* out) {
+  uint32_t m = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const Pt p = in[i], q = in[(i + 1) % n];
+    const float dp = a * p.x + b * p.y + c, dq = a * q.x + b * q.y + c;
+    if (dp >= 0) out[m++] = p;
+    if ((dp >= 0) != (dq >= 0)) {
+      const float k = dp / (dp - dq);
+      out[m++] = {p.x + (q.x - p.x) * k, p.y + (q.y - p.y) * k};
+    }
+  }
+  return m;
+}
+
+// Breakpoints of a gradient in (lo, hi): every stop offset in range, plus subdivisions of segments whose alpha
+// changes (the GPU would interpolate straight alpha; the CPU does premultiplied, which differs only there).
+uint32_t gradient_breakpoints(const raster::GradientPrep& g, float lo, float hi, float* out) {
+  uint32_t n = 0;
+  out[n++] = lo;
+  for (uint32_t i = 0; i < g.count; ++i) {
+    if (g.offset[i] > lo && g.offset[i] < hi) out[n++] = g.offset[i];
+    if (i + 1 < g.count && (g.color[i] >> 24) != (g.color[i + 1] >> 24)) {
+      for (uint32_t k = 1; k < 8; ++k) {
+        const float t = g.offset[i] + (g.offset[i + 1] - g.offset[i]) * (static_cast<float>(k) / 8.0f);
+        if (t > lo && t < hi) out[n++] = t;
+      }
+    }
+  }
+  out[n++] = hi;
+  return n;
+}
+constexpr uint32_t kMaxBreakpoints = kMaxGradientStops * 8 + 2;
+}  // namespace
+
+void DeviceRenderer2D::fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) {
+  raster::GradientPrep g;
+  if (!valid_ || !g.build(stops)) return;
+  const Rect2D area = raster::intersect(rect, clip_);
+  if (!area.width || !area.height) return;
+  const float dx = to.x - from.x, dy = to.y - from.y, len2 = dx * dx + dy * dy;
+  if (!(len2 > 1e-12f) || g.count == 1) {
+    fill_rect(area, g.color[g.count - 1]);
+    return;
+  }
+  const float inv = 1.0f / len2, tx = dx * inv, ty = dy * inv;
+  const float x0 = static_cast<float>(area.x), y0 = static_cast<float>(area.y);
+  const float x1 = x0 + static_cast<float>(area.width), y1 = y0 + static_cast<float>(area.height);
+  const Pt corners[4] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
+  float tmin = 1e30f, tmax = -1e30f;
+  for (const Pt& p : corners) {
+    const float t = (p.x - from.x) * tx + (p.y - from.y) * ty;
+    tmin = t < tmin ? t : tmin;
+    tmax = t > tmax ? t : tmax;
+  }
+  float bp[kMaxBreakpoints];
+  const uint32_t n = gradient_breakpoints(g, tmin, tmax, bp);
+  const float c0 = -(from.x * tx + from.y * ty);  // t(p) = tx * x + ty * y + c0
+  for (uint32_t i = 0; i + 1 < n; ++i) {
+    const float lo = bp[i], hi = bp[i + 1];
+    if (!(hi > lo)) continue;
+    const uint32_t seg = g.segment_of((lo + hi) * 0.5f);
+    Pt a[8], b[8];
+    uint32_t m = clip_polygon(corners, 4, tx, ty, c0 - lo, a);   // t >= lo
+    m = clip_polygon(a, m, -tx, -ty, hi - c0, b);                // t <= hi
+    if (m < 3) continue;
+    Vec4 col[8];
+    for (uint32_t k = 0; k < m; ++k) {
+      const float t = raster::clampf(tx * b[k].x + ty * b[k].y + c0, lo, hi);
+      col[k] = unpack_color(g.color_in_segment(seg, t));
+    }
+    for (uint32_t k = 1; k + 1 < m; ++k) {
+      const float xs[3] = {b[0].x, b[k].x, b[k + 1].x}, ys[3] = {b[0].y, b[k].y, b[k + 1].y};
+      const Vec4 cs[3] = {col[0], col[k], col[k + 1]};
+      triangle_colors(xs, ys, cs);
+    }
+  }
+}
+
+void DeviceRenderer2D::fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) {
+  raster::GradientPrep g;
+  if (!valid_ || !g.build(stops)) return;
+  const Rect2D area = raster::intersect(rect, clip_);
+  if (!area.width || !area.height) return;
+  if (!(radii.x > 0) || !(radii.y > 0) || g.count == 1) {
+    fill_rect(area, g.color[g.count - 1]);
+    return;
+  }
+  const float x0 = static_cast<float>(area.x), y0 = static_cast<float>(area.y);
+  const float xs_[2] = {x0, x0 + static_cast<float>(area.width)}, ys_[2] = {y0, y0 + static_cast<float>(area.height)};
+  float tmax = 0;
+  for (float cx : xs_)
+    for (float cy : ys_) {
+      const float u = (cx - center.x) / radii.x, v = (cy - center.y) / radii.y;
+      const float t = raster::sqrt_f(u * u + v * v);
+      tmax = t > tmax ? t : tmax;
+    }
+  if (!(tmax > 0)) {
+    fill_rect(area, g.color[0]);
+    return;
+  }
+  float bp[kMaxBreakpoints];
+  const uint32_t n = gradient_breakpoints(g, 0.0f, tmax, bp);
+  const float rmax = (radii.x > radii.y ? radii.x : radii.y) * tmax;
+  uint32_t segments = 16 + static_cast<uint32_t>(raster::clampf(rmax / 8.0f, 0.0f, 112.0f));
+  float cs_[129], sn_[129];  // 16 + 112 = 128 segments at most
+  for (uint32_t k = 0; k <= segments; ++k) {
+    const double angle = 6.28318530717958647692 * k / segments;
+    cs_[k] = static_cast<float>(fmath::cos(angle));
+    sn_[k] = static_cast<float>(fmath::sin(angle));
+  }
+  // Rings are circumscribed polygons so the outermost one covers the whole rectangle.
+  const float grow = static_cast<float>(1.0 / fmath::cos(3.14159265358979323846 / segments));
+  const Rect2D saved_clip = clip_;
+  close_range();
+  clip_ = area;  // the rings overshoot the rectangle; the scissor trims them
+  for (uint32_t i = 0; i + 1 < n; ++i) {
+    const float lo = bp[i], hi = bp[i + 1];
+    if (!(hi > lo)) continue;
+    const uint32_t seg = g.segment_of((lo + hi) * 0.5f);
+    const Vec4 c_lo = unpack_color(g.color_in_segment(seg, lo)), c_hi = unpack_color(g.color_in_segment(seg, hi));
+    for (uint32_t k = 0; k < segments; ++k) {
+      const float hx0 = center.x + radii.x * hi * grow * cs_[k], hy0 = center.y + radii.y * hi * grow * sn_[k];
+      const float hx1 = center.x + radii.x * hi * grow * cs_[k + 1], hy1 = center.y + radii.y * hi * grow * sn_[k + 1];
+      if (lo <= 0) {
+        const float xs[3] = {center.x, hx0, hx1}, ys[3] = {center.y, hy0, hy1};
+        const Vec4 cs[3] = {c_lo, c_hi, c_hi};
+        triangle_colors(xs, ys, cs);
+      } else {
+        const float lx0 = center.x + radii.x * lo * grow * cs_[k], ly0 = center.y + radii.y * lo * grow * sn_[k];
+        const float lx1 = center.x + radii.x * lo * grow * cs_[k + 1], ly1 = center.y + radii.y * lo * grow * sn_[k + 1];
+        const float xa[3] = {lx0, hx0, hx1}, ya[3] = {ly0, hy0, hy1};
+        const Vec4 ca[3] = {c_lo, c_hi, c_hi};
+        triangle_colors(xa, ya, ca);
+        const float xb[3] = {lx0, hx1, lx1}, yb[3] = {ly0, hy1, ly1};
+        const Vec4 cb[3] = {c_lo, c_hi, c_lo};
+        triangle_colors(xb, yb, cb);
+      }
+    }
+  }
+  close_range();
+  clip_ = saved_clip;
+}
+
+bool DeviceRenderer2D::push_clip_rect(const Rect2D& rect) {
+  if (clip_depth_ >= kMaxClipDepth) {
+    ++clip_overflow_;
+    apply_clip();
+    return false;
+  }
+  clip_stack_[clip_depth_++] = raster::intersect(rect, {0, 0, extent_.width, extent_.height});
+  apply_clip();
+  return true;
+}
+
+// There is no stencil or coverage mask in the triangle pipeline: the bounding rectangle has to do.
+bool DeviceRenderer2D::push_clip_rounded_rect(const Rect2D& rect, const CornerRadii& radii) {
+  const raster::RRect rr = raster::RRect::make(rect, radii);
+  bool square = true;
+  for (int i = 0; i < 4; ++i) square = square && rr.rx[i] == 0;
+  const bool ok = push_clip_rect(rect);
+  return ok && square;
+}
+
+bool DeviceRenderer2D::push_clip_mask(const MaskView& mask, int32_t x, int32_t y) {
+  if (!mask.valid()) {
+    push_clip_rect({0, 0, 0, 0});
+    return false;
+  }
+  push_clip_rect({x, y, mask.width, mask.height});
+  return false;
+}
+
+void DeviceRenderer2D::pop_clip() {
+  if (clip_overflow_) --clip_overflow_;
+  else if (clip_depth_) --clip_depth_;
+  apply_clip();
+}
+
+bool DeviceRenderer2D::push_layer(const Rect2D& bounds, uint8_t opacity) {
+  if (layer_depth_ >= kMaxLayerDepth) {
+    ++layer_overflow_;
+    return false;
+  }
+  layer_clip_depth_[layer_depth_] = clip_depth_;
+  layer_clip_overflow_[layer_depth_] = clip_overflow_;
+  layer_opacity_[layer_depth_++] = opacity_;
+  opacity_ *= static_cast<float>(opacity) / 255.0f;
+  (void)bounds;  // (no offscreen target: nothing is isolated, so the bounds clip nothing)
+  return opacity == 255;
+}
+
+void DeviceRenderer2D::pop_layer() {
+  if (layer_overflow_) {
+    --layer_overflow_;
+    return;
+  }
+  if (!layer_depth_) return;
+  --layer_depth_;
+  opacity_ = layer_opacity_[layer_depth_];
+  clip_depth_ = layer_clip_depth_[layer_depth_];  // clips pushed inside the layer end with it
+  clip_overflow_ = layer_clip_overflow_[layer_depth_];
+  apply_clip();
+}
+
+bool DeviceRenderer2D::copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) {
+  if (!valid_) return false;
+  const Rect2D src = raster::intersect(source, {0, 0, extent_.width, extent_.height});
+  if (!src.width || !src.height) return true;
+  if (!submit_pending() || !images_[back_]) return false;
+  ArrayView<uint32_t> frame = allocate_view<uint32_t>(allocator_, uint64_t{extent_.width} * extent_.height);
+  if (frame.empty()) return false;
+  bool ok = images_[back_]->read_pixels(frame);
+  if (ok) {
+    Surface snapshot;
+    snapshot.pixels = frame;
+    snapshot.width = snapshot.pitch = extent_.width;
+    snapshot.height = extent_.height;
+    const BlendMode blend = blend_;
+    const float opacity = opacity_;
+    set_blend(BlendMode::Replace);
+    opacity_ = 1.0f;
+    draw_image(snapshot, src, raster::saturate_i32(int64_t{dest_x} + src.x - source.x), raster::saturate_i32(int64_t{dest_y} + src.y - source.y));
+    opacity_ = opacity;
+    set_blend(blend);
+    close_range();  // the rectangles reference nothing in `snapshot`, but keep the modes tidy
+  }
+  release_view(allocator_, frame);
+  return ok;
 }
 
 void DeviceRenderer2D::present() {

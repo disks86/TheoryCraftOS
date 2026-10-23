@@ -404,6 +404,103 @@ const char* border_style_text(BorderStyle b) {
 
 const char* overflow_text(Overflow o) { return o == Overflow::Hidden ? "hidden" : o == Overflow::Scroll ? "scroll" : o == Overflow::Auto ? "auto" : "visible"; }
 
+// A number with up to 3 decimals ("0.5", "1", "12.25").
+void number_text(double v, String* out) {
+  const bool negative = v < 0;
+  if (negative) v = -v;
+  if (v > 1e12) v = 1e12;
+  int64_t milli = static_cast<int64_t>(v * 1000 + 0.5);
+  if (negative && milli != 0) out->push_back('-');
+  out->append_uint(static_cast<uint64_t>(milli / 1000));
+  if (milli % 1000) {
+    out->push_back('.');
+    out->push_back(static_cast<char>('0' + (milli / 100) % 10));
+    if (milli % 100) {
+      out->push_back(static_cast<char>('0' + (milli / 10) % 10));
+      if (milli % 10) out->push_back(static_cast<char>('0' + milli % 10));
+    }
+  }
+}
+
+// "rgb(1, 2, 3)" or "rgba(1, 2, 3, 0.5)".
+void color_text(uint32_t argb, String* out) {
+  const uint32_t alpha = argb >> 24;
+  if (alpha == 255) {
+    out->append("rgb(");
+  } else {
+    out->append("rgba(");
+  }
+  out->append_uint((argb >> 16) & 0xFF);
+  out->append(", ");
+  out->append_uint((argb >> 8) & 0xFF);
+  out->append(", ");
+  out->append_uint(argb & 0xFF);
+  if (alpha != 255) {
+    out->append(", ");
+    number_text(alpha / 255.0, out);
+  }
+  out->push_back(')');
+}
+
+void dimension_text(const Dimension& d, String* out) {
+  if (d.kind == Dimension::Auto) out->append("auto");
+  else if (d.kind == Dimension::Percent) {
+    number_text(d.x100 / 100.0, out);
+    out->push_back('%');
+  } else {
+    fixed_px(d.x100, out);
+  }
+}
+
+void axis_text(const AxisPos& a, String* out) {
+  if (a.px100 == 0) {
+    number_text(a.percent_x100 / 100.0, out);
+    out->push_back('%');
+  } else if (a.percent_x100 == 0) {
+    fixed_px(a.px100, out);
+  } else {
+    out->append("calc(");
+    number_text(a.percent_x100 / 100.0, out);
+    out->append(a.px100 < 0 ? "% - " : "% + ");
+    fixed_px(a.px100 < 0 ? -a.px100 : a.px100, out);
+    out->push_back(')');
+  }
+}
+
+void shadows_text(const StyleSheet& sheet, TextRef list, const Style& s, bool text_shadow, allocators::IAllocator& a, String* out) {
+  List<Shadow> shadows(a);
+  if (list.empty() || !sheet.shadows(list, s, &shadows) || shadows.count() == 0) {
+    out->append("none");
+    return;
+  }
+  for (uint64_t i = 0; i < shadows.count(); ++i) {
+    const Shadow& sh = shadows[i];
+    if (i) out->append(", ");
+    color_text(sh.current_color ? (s.color ? s.color : 0xFF000000u) : sh.color, out);
+    out->push_back(' ');
+    fixed_px(sh.x_px100, out);
+    out->push_back(' ');
+    fixed_px(sh.y_px100, out);
+    out->push_back(' ');
+    fixed_px(sh.blur_px100, out);
+    if (!text_shadow) {
+      out->push_back(' ');
+      fixed_px(sh.spread_px100, out);
+      if (sh.inset) out->append(" inset");
+    }
+  }
+}
+
+const char* cursor_text(Cursor c) {
+  static const char* const kNames[] = {"auto", "default", "none", "context-menu", "help", "pointer", "progress", "wait", "cell", "crosshair", "text", "vertical-text", "alias", "copy",
+                                       "move", "no-drop", "not-allowed", "grab", "grabbing", "all-scroll", "col-resize", "row-resize", "n-resize", "e-resize", "s-resize",
+                                       "w-resize", "ne-resize", "nw-resize", "se-resize", "sw-resize", "ew-resize", "ns-resize", "nesw-resize", "nwse-resize", "zoom-in", "zoom-out"};
+  const uint32_t i = static_cast<uint32_t>(c);
+  return i < sizeof(kNames) / sizeof(kNames[0]) ? kNames[i] : "auto";
+}
+
+const char* overscroll_text(OverscrollBehavior o) { return o == OverscrollBehavior::Contain ? "contain" : o == OverscrollBehavior::None ? "none" : "auto"; }
+
 }  // namespace
 
 Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
@@ -440,8 +537,10 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     }
   }
   set("display", display);
-  set("visibility", s.hidden ? "hidden" : "visible");
-  set("fontWeight", s.bold ? "700" : "400");
+  set("visibility", s.visibility == Visibility::Hidden ? "hidden" : s.visibility == Visibility::Collapse ? "collapse" : "visible");
+  t.clear();
+  t.append_uint(s.font_weight);
+  set("fontWeight", t.view());
   set("fontStyle", s.italic ? "italic" : "normal");
   set("textAlign", s.justify ? "justify" : s.align == 1 ? "center" : s.align == 2 ? "right" : "left");
   const char* decoration = s.underline && s.strike ? "underline line-through" : s.underline ? "underline" : s.strike ? "line-through" : "none";
@@ -458,7 +557,11 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   t.clear();
   fixed_px(s.line_height_px100 >= 0 ? s.line_height_px100 : 1600, &t);
   set("lineHeight", t.view());
-  set("fontFamily", s.code ? "monospace" : "monospace");
+  const StyleSheet* sheet = c.host.computed_style_sheet();
+  {
+    StringView family = sheet ? sheet->text(s.font_family) : StringView();
+    set("fontFamily", family.empty() ? StringView("monospace") : family);
+  }
   set("verticalAlign", s.vertical_align == 1 ? "top" : s.vertical_align == 2 ? "middle" : s.vertical_align == 3 ? "bottom" : "baseline");
   // the box
   static const char* const kMargin[4] = {"marginTop", "marginRight", "marginBottom", "marginLeft"};
@@ -507,7 +610,9 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   set("overflowX", overflow_text(s.overflow_x));
   set("overflowY", overflow_text(s.overflow_y));
   set("overflow", s.overflow_x == s.overflow_y ? overflow_text(s.overflow_x) : "visible");
-  set("opacity", s.opaque_zero ? "0" : "1");
+  t.clear();
+  number_text(s.opacity_x1000 / 1000.0, &t);
+  set("opacity", t.view());
   t.clear();
   if (s.z_index == 0 && s.position == Position::Static) t.assign("auto");
   else {
@@ -515,7 +620,7 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     t.append_uint(static_cast<uint32_t>(s.z_index < 0 ? -static_cast<int64_t>(s.z_index) : s.z_index));
   }
   set("zIndex", t.view());
-  set("cursor", "auto");
+  set("cursor", cursor_text(s.cursor));
   // flex and grid
   static const char* const kDirection[] = {"row", "row-reverse", "column", "column-reverse"};
   set("flexDirection", kDirection[static_cast<int>(s.flex_direction)]);
@@ -546,6 +651,177 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   set("order", t.view());
   set("gridTemplateColumns", s.grid_template_columns.empty() ? "none" : "");
   set("gridTemplateRows", s.grid_template_rows.empty() ? "none" : "");
+  // the pixel engine's properties
+  allocators::IAllocator& alloc = vm.allocator();
+  auto text_of = [&](TextRef ref, const char* fallback) { StringView v = sheet ? sheet->text(ref) : StringView(); return v.empty() ? StringView(fallback) : v; };
+  t.clear();
+  number_text(s.font_stretch_x10 / 10.0, &t);
+  t.push_back('%');
+  set("fontStretch", t.view());
+  {
+    const uint16_t v = s.font_variant;
+    const char* caps = v & kVariantSmallCaps ? "small-caps" : v & kVariantAllSmallCaps ? "all-small-caps" : v & kVariantPetiteCaps ? "petite-caps" : v & kVariantAllPetiteCaps ? "all-petite-caps"
+                       : v & kVariantUnicase ? "unicase" : v & kVariantTitlingCaps ? "titling-caps" : "normal";
+    set("fontVariantCaps", caps);
+    set("fontVariant", caps);
+    t.clear();
+    static const struct { uint16_t bit; const char* name; } kNumeric[] = {{kVariantLiningNums, "lining-nums"}, {kVariantOldstyleNums, "oldstyle-nums"}, {kVariantProportionalNums, "proportional-nums"},
+                                                                         {kVariantTabularNums, "tabular-nums"}, {kVariantDiagonalFractions, "diagonal-fractions"},
+                                                                         {kVariantStackedFractions, "stacked-fractions"}, {kVariantOrdinal, "ordinal"}, {kVariantSlashedZero, "slashed-zero"}};
+    for (const auto& n : kNumeric)
+      if (v & n.bit) {
+        if (!t.empty()) t.push_back(' ');
+        t.append(n.name);
+      }
+    set("fontVariantNumeric", t.empty() ? StringView("normal") : t.view());
+    set("fontVariantLigatures", v & kVariantNoLigatures ? "none" : "normal");
+  }
+  t.clear();
+  if (s.letter_spacing_px100 == 0) t.append("normal");
+  else fixed_px(s.letter_spacing_px100, &t);
+  set("letterSpacing", t.view());
+  t.clear();
+  if (s.word_spacing_px100 == 0) t.append("normal");
+  else fixed_px(s.word_spacing_px100, &t);
+  set("wordSpacing", t.view());
+  {
+    static const char* const kCorner[4] = {"borderTopLeftRadius", "borderTopRightRadius", "borderBottomRightRadius", "borderBottomLeftRadius"};
+    String all(alloc);
+    for (int i = 0; i < 4; ++i) {
+      t.clear();
+      dimension_text(s.radius[i].h, &t);
+      if (s.radius[i].v.kind != s.radius[i].h.kind || s.radius[i].v.x100 != s.radius[i].h.x100) {
+        t.push_back(' ');
+        dimension_text(s.radius[i].v, &t);
+      }
+      set(kCorner[i], t.view());
+      if (i) all.push_back(' ');
+      all.append(t.view());
+    }
+    set("borderRadius", all.view());
+  }
+  if (sheet) {
+    t.clear();
+    shadows_text(*sheet, s.box_shadow, s, false, alloc, &t);
+    set("boxShadow", t.view());
+    t.clear();
+    shadows_text(*sheet, s.text_shadow, s, true, alloc, &t);
+    set("textShadow", t.view());
+  } else {
+    set("boxShadow", "none");
+    set("textShadow", "none");
+  }
+  set("backgroundImage", text_of(s.background_image, "none"));
+  set("backgroundSize", text_of(s.background_size, "auto"));
+  set("backgroundPosition", text_of(s.background_position, "0% 0%"));
+  set("backgroundRepeat", text_of(s.background_repeat, "repeat"));
+  set("backgroundClip", text_of(s.background_clip, "border-box"));
+  set("backgroundOrigin", text_of(s.background_origin, "padding-box"));
+  set("backgroundAttachment", text_of(s.background_attachment, "scroll"));
+  // transform: the matrix of the transform functions (translate, rotate and scale first), or the text
+  {
+    double m[16];
+    t.clear();
+    if (sheet && sheet->transform_matrix(s, 0, 0, m, false)) {
+      const bool flat = m[2] == 0 && m[3] == 0 && m[6] == 0 && m[7] == 0 && m[8] == 0 && m[9] == 0 && m[10] == 1 && m[11] == 0 && m[14] == 0 && m[15] == 1;
+      t.append(flat ? "matrix(" : "matrix3d(");
+      const int order2d[6] = {0, 1, 4, 5, 12, 13};
+      for (int i = 0; i < (flat ? 6 : 16); ++i) {
+        if (i) t.append(", ");
+        number_text(m[flat ? order2d[i] : i], &t);
+      }
+      t.push_back(')');
+    } else {
+      t.append("none");
+    }
+    set("transform", t.view());
+  }
+  set("translate", text_of(s.translate, "none"));
+  set("rotate", text_of(s.rotate, "none"));
+  set("scale", text_of(s.scale, "none"));
+  t.clear();
+  axis_text(s.transform_origin_x, &t);
+  t.push_back(' ');
+  axis_text(s.transform_origin_y, &t);
+  if (s.transform_origin_z_px100) {
+    t.push_back(' ');
+    fixed_px(s.transform_origin_z_px100, &t);
+  }
+  set("transformOrigin", t.view());
+  t.clear();
+  fixed_px(s.outline_style == BorderStyle::None ? 0 : s.outline_width_px100, &t);
+  set("outlineWidth", t.view());
+  set("outlineStyle", s.outline_auto ? "auto" : border_style_text(s.outline_style));
+  t.clear();
+  if (s.outline_color == kTransparentBorder) t.append("rgba(0, 0, 0, 0)");
+  else rgb_text(s.outline_color ? s.outline_color : text_color, &t);
+  set("outlineColor", t.view());
+  t.clear();
+  fixed_px(s.outline_offset_px100, &t);
+  set("outlineOffset", t.view());
+  set("pointerEvents", s.pointer_events == PointerEvents::None ? "none" : "auto");
+  {
+    static const char* const kSelect[] = {"auto", "none", "text", "all", "contain"};
+    set("userSelect", kSelect[static_cast<int>(s.user_select) < 5 ? static_cast<int>(s.user_select) : 0]);
+  }
+  t.clear();
+  if (s.aspect_auto) t.append("auto");
+  if (s.aspect_ratio_x1000) {
+    if (!t.empty()) t.push_back(' ');
+    number_text(s.aspect_ratio_x1000 / 1000.0, &t);
+    t.append(" / 1");
+  } else if (!s.aspect_auto) {
+    t.append("auto");
+  }
+  set("aspectRatio", t.view());
+  {
+    static const char* const kFit[] = {"fill", "contain", "cover", "none", "scale-down"};
+    set("objectFit", kFit[static_cast<int>(s.object_fit) < 5 ? static_cast<int>(s.object_fit) : 0]);
+  }
+  t.clear();
+  axis_text(s.object_position_x, &t);
+  t.push_back(' ');
+  axis_text(s.object_position_y, &t);
+  set("objectPosition", t.view());
+  set("listStyleImage", text_of(s.list_style_image, "none"));
+  t.clear();
+  fixed_px(s.column_rule_style == BorderStyle::None ? 0 : s.column_rule_width_px100, &t);
+  set("columnRuleWidth", t.view());
+  set("columnRuleStyle", border_style_text(s.column_rule_style));
+  t.clear();
+  if (s.column_rule_color == kTransparentBorder) t.append("rgba(0, 0, 0, 0)");
+  else rgb_text(s.column_rule_color ? s.column_rule_color : text_color, &t);
+  set("columnRuleColor", t.view());
+  set("transitionProperty", text_of(s.transition_property, "all"));
+  set("transitionDuration", text_of(s.transition_duration, "0s"));
+  set("transitionTimingFunction", text_of(s.transition_timing, "ease"));
+  set("transitionDelay", text_of(s.transition_delay, "0s"));
+  set("transitionBehavior", text_of(s.transition_behavior, "normal"));
+  set("animationName", text_of(s.animation_name, "none"));
+  set("animationDuration", text_of(s.animation_duration, "0s"));
+  set("animationTimingFunction", text_of(s.animation_timing, "ease"));
+  set("animationDelay", text_of(s.animation_delay, "0s"));
+  set("animationIterationCount", text_of(s.animation_iteration_count, "1"));
+  set("animationDirection", text_of(s.animation_direction, "normal"));
+  set("animationFillMode", text_of(s.animation_fill_mode, "none"));
+  set("animationPlayState", text_of(s.animation_play_state, "running"));
+  set("filter", text_of(s.filter, "none"));
+  set("backdropFilter", text_of(s.backdrop_filter, "none"));
+  set("clipPath", text_of(s.clip_path, "none"));
+  {
+    static const char* const kWriting[] = {"horizontal-tb", "vertical-rl", "vertical-lr", "sideways-rl", "sideways-lr"};
+    set("writingMode", kWriting[static_cast<int>(s.writing_mode) < 5 ? static_cast<int>(s.writing_mode) : 0]);
+    set("direction", s.direction == Direction::Rtl ? "rtl" : "ltr");
+    set("colorScheme", s.color_scheme == ColorScheme::Dark ? "dark" : s.color_scheme == ColorScheme::Light ? "light" : s.color_scheme == ColorScheme::LightDark ? "light dark" : "normal");
+  }
+  set("scrollSnapType", text_of(s.scroll_snap_type, "none"));
+  set("scrollSnapAlign", text_of(s.scroll_snap_align, "none"));
+  set("scrollSnapStop", s.scroll_snap_stop_always ? "always" : "normal");
+  set("overscrollBehaviorX", overscroll_text(s.overscroll_x));
+  set("overscrollBehaviorY", overscroll_text(s.overscroll_y));
+  set("scrollBehavior", s.scroll_smooth ? "smooth" : "auto");
+  set("containerType", s.container_type == 1 ? "inline-size" : s.container_type == 2 ? "size" : "normal");
+  set("containerName", text_of(s.container_name, "none"));
   return Value::make_object(o);
 }
 

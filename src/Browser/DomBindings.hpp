@@ -73,6 +73,9 @@ class IDomHost {
   virtual void scroll_to(int32_t line) = 0;
   // The style of an element as it is drawn now (false if the page cannot say).
   virtual bool computed_style(const dom::Node* element, Style* out) = 0;
+  // The style sheet that computed_style() worked against: what the TextRefs of a Style point into, and the readers for list valued properties (font-family,
+  // box-shadow, transform ...). nullptr if the host has none.
+  virtual const StyleSheet* computed_style_sheet() { return nullptr; }
   // A new document made from html text (DOMParser); owned by the host. nullptr if memory ran out.
   virtual dom::Document* parse_document(StringView html) = 0;
   // The Web Storage of the page's origin. After a change that is visible (a new value, a removed key, a cleared area) the other pages of the origin are told.

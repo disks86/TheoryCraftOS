@@ -203,6 +203,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t line) override;
   bool computed_style(const dom::Node* element, Style* out) override;
+  const StyleSheet* computed_style_sheet() override { return &style_sheet(); }
   dom::Document* parse_document(StringView html) override;
   StorageArea& local_storage() override { return env_.local_storage_hub().area(storage_origin()); }
   StorageArea& session_storage() override { return env_.session_storage_hub().area(storage_origin()); }

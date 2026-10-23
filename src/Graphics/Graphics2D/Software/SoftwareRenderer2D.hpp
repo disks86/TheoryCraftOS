@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Allocators/IAllocator.hpp"
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 
@@ -25,19 +26,26 @@ namespace graphics {
 // CPU rasterizer over a Surface. present() copies the surface to the display
 // GPU (if one was given) and asks it to show the frame. Never fails: this is
 // the renderer every machine can run.
+//
+// Rounded clips and layers need scratch memory: give the constructor an allocator, or they degrade (the
+// push functions return false: rounded and mask clips to their rectangle, layers to no group opacity).
 class SoftwareRenderer2D final : public IRenderer2D {
  public:
-  explicit SoftwareRenderer2D(const Surface& target, hardware::IGraphicsProcessingUnit* display = nullptr)
-      : target_(target), display_(display) {
+  explicit SoftwareRenderer2D(const Surface& target, hardware::IGraphicsProcessingUnit* display = nullptr,
+                              allocators::IAllocator* allocator = nullptr)
+      : target_(target), cur_(target), display_(display), allocator_(allocator) {
     reset_clip();
   }
+  ~SoftwareRenderer2D();
+  SoftwareRenderer2D(const SoftwareRenderer2D&) = delete;
+  SoftwareRenderer2D& operator=(const SoftwareRenderer2D&) = delete;
 
   const char* name() const override { return "software 2D renderer"; }
   bool accelerated() const override { return false; }
   Extent2D extent() const override { return {target_.width, target_.height}; }
 
   void set_clip(const Rect2D& clip) override;
-  void reset_clip() override { clip_ = {0, 0, target_.width, target_.height}; }
+  void reset_clip() override;
   void set_blend(BlendMode mode) override { blend_ = mode; }
 
   void clear(uint32_t color) override;
@@ -49,17 +57,69 @@ class SoftwareRenderer2D final : public IRenderer2D {
   void fill_triangle(Vec2 a, Vec2 b, Vec2 c, uint32_t color) override;
   void draw_image(const Surface& source, const Rect2D& source_rect, int32_t x, int32_t y) override;
   void draw_text(int32_t x, int32_t y, const char* text, uint32_t color) override;
+
+  void fill_rounded_rect(const Rect2D& rect, const CornerRadii& radii, uint32_t color) override;
+  void stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) override;
+  void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) override;
+  void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
+  void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
+  void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
+  bool push_clip_rect(const Rect2D& rect) override;
+  bool push_clip_rounded_rect(const Rect2D& rect, const CornerRadii& radii) override;
+  bool push_clip_mask(const MaskView& mask, int32_t x, int32_t y) override;
+  void pop_clip() override;
+  bool push_layer(const Rect2D& bounds, uint8_t opacity) override;
+  void pop_layer() override;
+  bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
   void present() override;
 
   const Surface& target() const { return target_; }
 
  private:
+  // One pushed clip: its bounds and the coverage mask in force (owned, or inherited from the entry below).
+  struct ClipEntry {
+    Rect2D bounds;
+    ArrayView<uint8_t> mask;
+    Rect2D mask_rect;
+    bool owns_mask = false;
+  };
+  // One open layer. `real` layers draw into their own surface; the others only restrict drawing to `bounds`.
+  struct LayerEntry {
+    Surface surface;        // the layer's pixels (real layers)
+    Surface saved_surface;  // what was being drawn to
+    int32_t saved_ox = 0, saved_oy = 0;
+    Rect2D saved_base_clip;
+    uint32_t saved_floor = 0, saved_overflow = 0;
+    Rect2D bounds;
+    uint32_t opacity = 255;
+    bool real = false;
+  };
+
+  Rect2D current_bounds() const { return {ox_, oy_, cur_.width, cur_.height}; }
+  void update_clip();
+  bool push_clip_entry(const ClipEntry& entry);
+  void release_clip_entry(ClipEntry& entry);
+  uint32_t mask_cov(int32_t x, int32_t y) const;
+  ArrayView<uint32_t> row_span(int32_t y, int32_t x0, int32_t x1) const;  // [x0, x1) on row y, canvas coordinates; must be inside the target
+  void blend_stored(uint32_t& destination, uint32_t argb) const;
+  void store_px(uint32_t& destination, int32_t x, int32_t y, uint32_t argb) const;  // clip mask aware, no bounds checks
+  void put_px(int32_t x, int32_t y, uint32_t argb, uint32_t coverage);  // inside the clip rectangle already
   void plot(int32_t x, int32_t y, uint32_t color);  // clipped, blended
   void span(int32_t y, int32_t x0, int32_t x1, uint32_t color);  // [x0, x1) on row y
 
-  Surface target_;
+  Surface target_;  // what present() shows
+  Surface cur_;     // what is drawn to: target_ or the innermost layer
+  int32_t ox_ = 0, oy_ = 0;  // canvas position of cur_'s top left
   hardware::IGraphicsProcessingUnit* display_;
-  Rect2D clip_;
+  allocators::IAllocator* allocator_;
+  Rect2D base_clip_;  // set_clip()
+  Rect2D clip_;       // effective: base_clip_ and the pushed entries
+  ArrayView<uint8_t> mask_;  // effective coverage mask (empty: none), laid out over mask_rect_
+  Rect2D mask_rect_;
+  ClipEntry clips_[kMaxClipDepth];
+  uint32_t clip_depth_ = 0, clip_floor_ = 0, clip_overflow_ = 0;
+  LayerEntry layers_[kMaxLayerDepth];
+  uint32_t layer_depth_ = 0, layer_overflow_ = 0;
   BlendMode blend_ = BlendMode::Alpha;
 };
 

@@ -293,6 +293,16 @@ add_executable(BOOTX64
   src/Hardware/Bus/Usb/Xhci/XhciRing.cpp
   src/Hardware/Bus/SystemPciBus.cpp
   src/Hardware/GraphicsProcessingUnit/Font8x16.cpp
+  src/Font/TrueType.cpp
+  src/Font/WoffDecode.cpp
+  src/Font/GlyphRaster.cpp
+  src/Font/GlyphCache.cpp
+  src/Font/FontSet.cpp
+  src/Font/Shaper.cpp
+  src/Font/FontDataSans.cpp
+  src/Font/FontDataSerif.cpp
+  src/Font/FontDataMono.cpp
+  src/Font/FontDataFallback.cpp
   src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/Hardware/GraphicsProcessingUnit/SystemGpu.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp

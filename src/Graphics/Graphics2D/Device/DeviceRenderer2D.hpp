@@ -36,6 +36,12 @@ namespace graphics {
 // keeps the slow part - talking to a GPU that may take its time - out of the window's UI lock, which is held
 // while the controls paint.
 //
+// The pixel-engine primitives are built from triangles too. Rounded rectangles, their borders and masks are
+// pixel exact with the CPU renderer (solid parts are rectangles, curved edges are per-pixel coverage runs);
+// gradients are triangles with per-vertex colors. Documented approximations (the push calls return false):
+// rounded and mask clips scissor to their bounding rectangle, and layers have no offscreen target, so group
+// opacity is applied to each shape (overlapping shapes show through each other). copy_rect reads the frame back.
+//
 // Differences from the CPU renderer: lines are one-pixel-wide quads and circles
 // are polygons, so their pixels are not identical; draw_image costs one rectangle
 // per run of equal pixels (there are no textures yet), so keep images small.
@@ -66,7 +72,23 @@ class DeviceRenderer2D final : public IRenderer2D {
   void fill_triangle(Vec2 a, Vec2 b, Vec2 c, uint32_t color) override;
   void draw_image(const Surface& source, const Rect2D& source_rect, int32_t x, int32_t y) override;
   void draw_text(int32_t x, int32_t y, const char* text, uint32_t color) override;
+  void fill_rounded_rect(const Rect2D& rect, const CornerRadii& radii, uint32_t color) override;
+  void stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) override;
+  void draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) override;
+  void draw_image_scaled(const Surface& source, const RectF& source_rect, const Rect2D& dest, ImageFilter filter) override;
+  void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override;
+  void fill_radial_gradient(const Rect2D& rect, Vec2 center, Vec2 radii, ArrayView<const GradientStop> stops) override;
+  bool push_clip_rect(const Rect2D& rect) override;
+  bool push_clip_rounded_rect(const Rect2D& rect, const CornerRadii& radii) override;
+  bool push_clip_mask(const MaskView& mask, int32_t x, int32_t y) override;
+  void pop_clip() override;
+  bool push_layer(const Rect2D& bounds, uint8_t opacity) override;
+  void pop_layer() override;
+  bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
   void present() override;
+
+  // The color to draw for a pixel with `cov` (0..255) coverage; false: draw nothing (used by the rounded-rect helpers).
+  bool coverage_color(uint32_t color, uint32_t cov, uint32_t* out) const;
 
   // Draws what is batched, then copies the image to `out` (extent.width * extent.height, 0xAARRGGBB).
   bool read_pixels(ArrayView<uint32_t> out);
@@ -82,6 +104,8 @@ class DeviceRenderer2D final : public IRenderer2D {
     BlendMode blend;
   };
 
+  void triangle_colors(const float* xs, const float* ys, const Vec4* colors);  // three vertices, own colors
+  void apply_clip();     // clip_ from base_clip_ and the pushed rectangles
   void triangle(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t color);
   void quad(float x0, float y0, float x1, float y1, uint32_t color);  // axis-aligned, corners
   void close_range();   // ends the run in progress (when the clip or blend mode changes)
@@ -105,7 +129,15 @@ class DeviceRenderer2D final : public IRenderer2D {
   uint32_t range_start_ = 0;   // where the run in progress began
   Range ranges_[kMaxRanges];
   uint32_t range_count_ = 0;
-  Rect2D clip_;
+  Rect2D clip_;       // effective scissor
+  Rect2D base_clip_;  // set_clip()
+  Rect2D clip_stack_[kMaxClipDepth];
+  uint32_t clip_depth_ = 0, clip_overflow_ = 0;
+  float opacity_ = 1.0f;  // product of the open layers' opacities, applied to every vertex color
+  float layer_opacity_[kMaxLayerDepth];
+  uint32_t layer_clip_depth_[kMaxLayerDepth] = {};  // clip stack depth at each push_layer (pop_layer drops what was pushed since)
+  uint32_t layer_clip_overflow_[kMaxLayerDepth] = {};
+  uint32_t layer_depth_ = 0, layer_overflow_ = 0;
   BlendMode blend_ = BlendMode::Alpha;
   bool valid_ = false;
 };
