@@ -198,7 +198,7 @@ bool DomBindings::install() {
   c.window_listeners = vm_.new_plain();
   vm_.define_named(vm_.global(), "__wrappers", Value::make_object(c.wrappers), 0);
   vm_.define_named(vm_.global(), "__media_lists", Value::make_object(c.media_lists), 0);
-  return bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_forms(c) && bind::install_net(c) && !vm_.halted();
+  return bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_mse(c) && bind::install_forms(c) && bind::install_net(c) && !vm_.halted();
 }
 
 bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& init) {

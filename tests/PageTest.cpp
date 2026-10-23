@@ -167,8 +167,11 @@ struct FakeEnvironment final : IPageEnvironment {
     if (it == blobs.end()) return false;
     return out->append(ConstByteView(reinterpret_cast<const uint8_t*>(it->second.data()), it->second.size()));
   }
+  int opened_video = 0, opened_audio = 0;
+  std::string last_video_data, last_audio_data;   // what the last clip was opened on
   UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override {
-    (void)data;
+    ++opened_video;
+    if (data) last_video_data.assign(reinterpret_cast<const char*>(data->view().data()), data->size());
     if (!can_play_video) return UniquePointer<IVideoClip>();
     auto clip = UniquePointer<FakeClip>::make(*allocator_for_clips);
     clip->native_rate = clips_play_at_any_rate;
@@ -176,7 +179,8 @@ struct FakeEnvironment final : IPageEnvironment {
     return clip;
   }
   UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override {
-    (void)data;
+    ++opened_audio;
+    if (data) last_audio_data.assign(reinterpret_cast<const char*>(data->view().data()), data->size());
     if (!can_play_video) return UniquePointer<IVideoClip>();
     auto clip = UniquePointer<FakeClip>::make(*allocator_for_clips);
     clip->sound_only = true;
@@ -1327,6 +1331,281 @@ static void test_media_api() {
     CHECK(env.last_clip && env.last_clip->is_playing && env.last_clip->position >= 1000000);
     page.click(page.document().element_by_id("b")->serial, 0, 0);
     CHECK(page_log(page) == "0 0 true 1.5 true false NotSupportedError true false 1");
+  }
+  CHECK(a.live == 0);
+}
+
+// --- Media Source Extensions ------------------------------------------------------------------------------------------------------
+
+// The fixtures are served to the page, which fetches them as an application would.
+static void mse_serve(FakeEnvironment& env, const char* name) {
+  std::string data;
+  FILE* f = fopen((std::string("tests/data/") + name).c_str(), "rb");
+  if (f) {
+    int c;
+    while ((c = fgetc(f)) != EOF) data.push_back(static_cast<char>(c));
+    fclose(f);
+  }
+  env.net.answers[std::string("GET http://example.com/") + name] = {200, "Content-Type: video/mp4\r\n", data};
+}
+
+// Lets the page's timers (the network, the events of the media source) and the objects run for a number of rounds.
+static void mse_pump(Page& page, FakeEnvironment& env, int rounds) {
+  for (int i = 0; i < rounds; ++i) {
+    double due;
+    if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
+    page.run_due_timers(static_cast<double>(env.clock));
+    page.step_objects(static_cast<double>(env.clock));
+  }
+}
+
+// The script that fetches files and calls `then` with a Uint8Array of each.
+static const char* kLoad = "function load(names, then) { Promise.all(names.map(function (n) { return fetch(n).then(function (r) { return r.arrayBuffer() }) })).then(function (all) { then.apply(null, all.map(function (b) { return new Uint8Array(b) })) }) }";
+
+static void test_mse() {
+  TestAllocator a;
+  const char* kTypes = "video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"";
+  // the events a <video> reports, in the order they come
+  const std::string watch = std::string("var ev = []; ['loadstart','durationchange','loadedmetadata','loadeddata','progress','canplay','canplaythrough','play','playing','pause','waiting','seeking','seeked','ended','error','emptied'].forEach(function(t) { v.addEventListener(t, function() { ev.push(t) }) });");
+  {   // the API without playing: types, states, errors, the cycle of events of an append, ranges
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><script>var DATA = " + muxed + "; var v = document.getElementById('v'); var log = [];" + watch +
+        "var u8 = __string_to_bytes(DATA);"
+        "log.push(typeof MediaSource, MediaSource.isTypeSupported('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"'), MediaSource.isTypeSupported('video/webm; codecs=\"vp9\"'), MediaSource.isTypeSupported('audio/mpeg'), u8.length);"
+        "var ms = new MediaSource(); log.push(ms.readyState, ms.duration, ms.sourceBuffers.length, ms instanceof EventTarget);"
+        "try { ms.addSourceBuffer('video/mp4') } catch (e) { log.push(e.name) }"
+        "var sb;"
+        "ms.addEventListener('sourceopen', function() {"
+        "  log.push('open', ms.readyState);"
+        "  try { ms.addSourceBuffer('video/webm') } catch (e) { log.push(e.name) } try { ms.addSourceBuffer('') } catch (e) { log.push(e.name) }"
+        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
+        "  log.push(ms.sourceBuffers.length, ms.sourceBuffers[0] === sb, sb.mode, sb.updating, sb.timestampOffset, sb.appendWindowStart, sb.appendWindowEnd, sb.buffered.length);"
+        "  ['updatestart','update','updateend','error','abort'].forEach(function(t) { sb.addEventListener(t, function() { log.push('sb:' + t + ':' + sb.updating) }) });"
+        "  sb.appendBuffer(u8);"
+        "  log.push('appended', sb.updating);"
+        "  try { sb.appendBuffer(u8) } catch (e) { log.push(e.name) } try { sb.remove(0, 1) } catch (e) { log.push(e.name) } try { sb.timestampOffset = 1 } catch (e) { log.push(e.name) }"
+        "  try { ms.duration = 5 } catch (e) { log.push(e.name) } try { ms.endOfStream() } catch (e) { log.push(e.name) }"
+        "});"
+        "document.getElementById('b').onclick = function() {"
+        "  console.log('PRE ' + log.join(' ') + ' | ' + ev.join() + ' | ' + sb.buffered.length + ' ' + __mse_get(sb.__id, 4) + ' ' + __mse_get(sb.__id, 5) + ' ' + __mse_get(sb.__id, 6));"
+        "  var r = [sb.updating, sb.buffered.length, sb.buffered.start(0).toFixed(2), sb.buffered.end(0).toFixed(2), ms.duration.toFixed(2), v.duration.toFixed(2), v.readyState, v.networkState, v.videoWidth, v.videoHeight,"
+        "           v.buffered.length, v.buffered.end(0).toFixed(2), v.seekable.length, v.seekable.end(0).toFixed(2)];"
+        "  r.push(sb.mode); sb.mode = 'sequence'; r.push(sb.mode); sb.mode = 'segments'; r.push(sb.mode);"
+        "  sb.timestampOffset = 2; r.push(sb.timestampOffset); sb.timestampOffset = 0;"
+        "  try { sb.appendWindowStart = 5 } catch (e) { r.push(e.name) } try { sb.appendWindowEnd = 0 } catch (e) { r.push(e.name) } try { sb.appendWindowStart = -1 } catch (e) { r.push(e.name) }"
+        "  sb.appendWindowEnd = 100; r.push(sb.appendWindowEnd); sb.appendWindowEnd = Infinity;"
+        "  try { ms.duration = NaN } catch (e) { r.push(e.name) } try { ms.duration = 1 } catch (e) { r.push(e.name) } ms.duration = 600; r.push(ms.duration, v.duration);"
+        "  try { sb.remove(-1, 2) } catch (e) { r.push(e.name) } try { sb.remove(2, 1) } catch (e) { r.push(e.name) } try { sb.appendBuffer(5) } catch (e) { r.push(e.name) }"
+        "  r.push(sb.videoTracks.length, sb.audioTracks.length, sb.textTracks.length, sb.audioTracks[0].kind, sb.videoTracks.getTrackById('1') !== null);"
+        "  log.push(r.join(' '));"
+        "  console.log(log.join(' ') + ' | ' + ev.join());"
+        "};"
+        "v.src = URL.createObjectURL(ms);</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 6);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    const std::string out = page_log(page);
+    std::fprintf(stderr, "DBGMSE %s\nERR(%u) %.*s\n", out.c_str(), page.errors(), (int)page.first_error().size(), page.first_error().data());
+    // before the append: the state of a source that is not yet open, the errors
+    CHECK(out.find("function true false true ") == 0);
+    CHECK(out.find("closed NaN 0 true InvalidStateError ") != std::string::npos);                 // (addSourceBuffer needs an open source)
+    CHECK(out.find("open open NotSupportedError TypeError 1 true segments false 0 0 Infinity 0 appended true InvalidStateError InvalidStateError InvalidStateError InvalidStateError InvalidStateError") != std::string::npos);
+    CHECK(out.find("sb:updatestart:true sb:update:false sb:updateend:false") != std::string::npos);
+    CHECK(out.find("false 1 0.08 2.08 2.08 2.08 ") != std::string::npos);                         // buffered, duration of both
+    CHECK(out.find(" 96 64 1 2.08 1 2.08 segments sequence segments 2 ") != std::string::npos);
+    CHECK(out.find("InvalidStateError") != std::string::npos);
+    CHECK(out.find(" TypeError TypeError TypeError 100 ") != std::string::npos);                    // the append window checks
+    CHECK(out.find(" TypeError InvalidStateError 600 600 ") != std::string::npos);                  // duration: NaN, below the buffered end, then 600
+    CHECK(out.find(" TypeError TypeError TypeError 1 1 0 main true") != std::string::npos);         // remove(-1, 2), remove(2, 1), appendBuffer(5), the tracks
+    // the element: it opened, knew the duration, had data
+    CHECK(out.find("| loadstart,durationchange,loadedmetadata,loadeddata,progress,canplay,durationchange") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // playing from start to end, with the data all there; the ranges, the files opened for the players
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><script>var DATA = " + muxed + "; var v = document.getElementById('v');" + watch +
+        "var ms = new MediaSource(), sb;"
+        "ms.addEventListener('sourceopen', function() {"
+        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
+        "  sb.addEventListener('updateend', function() { if (ms.readyState === 'open') ms.endOfStream() });"
+        "  sb.appendBuffer(__string_to_bytes(DATA));"
+        "});"
+        "ms.addEventListener('sourceended', function() { ev.push('sourceended:' + ms.readyState + ':' + ms.duration.toFixed(2)) });"
+        "v.addEventListener('ended', function() { console.log(ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.paused + ' ' + v.ended) });"
+        "document.getElementById('b').onclick = function() { v.play().then(function() { ev.push('promise') }) };"
+        "v.src = URL.createObjectURL(ms);</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 5);
+    CHECK(env.opened_video == 0);   // (nothing is opened until the playhead needs it? no: the data is there, so the file is)
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 25);
+    const std::string out = page_log(page);
+    CHECK(out.find("loadstart,durationchange,loadedmetadata,loadeddata,progress,canplay,durationchange,sourceended:ended:2.08,canplaythrough,play,playing") != std::string::npos);
+    CHECK(out.find(",pause,ended 2.08 true true") != std::string::npos);
+    CHECK(env.opened_video >= 1 && env.last_video_data.size() > 30000 && env.last_video_data.compare(4, 8, "ftypisom") == 0);
+    CHECK(env.opened_audio == 0);   // (video and sound in one file: one clip)
+  }
+  CHECK(a.live == 0);
+  {   // data that comes while playing: the playhead meets the end of what there is, waits, and goes on when more is appended
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v width=96 height=64 autoplay></video><button id=b></button><button id=e></button><script>var DATA = " + muxed + "; var v = document.getElementById('v');" + watch +
+        "var ms = new MediaSource(), sb;"
+        "ms.addEventListener('sourceopen', function() {"
+        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
+        "  sb.appendBuffer(__string_to_bytes(DATA.slice(0, 18485)));"
+        "});"
+        "document.getElementById('b').onclick = function() { sb.appendBuffer(__string_to_bytes(DATA.slice(18485))) };"
+        "document.getElementById('e').onclick = function() { console.log(ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.readyState + ' ' + v.paused + ' ' + sb.buffered.end(0).toFixed(2) + ' ' + v.buffered.length) };"
+        "v.src = URL.createObjectURL(ms);</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 12);   // (plays to the end of the first second and waits there)
+    CHECK(env.opened_video == 1 && env.last_clip && !env.last_clip->is_playing);
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    const std::string waiting = page_log(page);
+    CHECK(waiting.find("canplay") != std::string::npos && waiting.find(",play,") != std::string::npos && waiting.find(",waiting") != std::string::npos);
+    CHECK(waiting.find(" false ") != std::string::npos);   // (not paused: it is waiting)
+    CHECK(waiting.find(",ended") == std::string::npos);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 6);
+    CHECK(env.opened_video == 2 && env.last_clip && env.last_clip->is_playing);   // (a fresh file with the second second in it, playing)
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    const std::string again = page_log(page);
+    CHECK(again.find(",waiting") != std::string::npos && again.rfind("playing") > again.find("waiting"));
+  }
+  CHECK(a.live == 0);
+  {   // seeking inside the data and into a gap, remove(), and the source closing
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><button id=c></button><button id=e></button><script>var DATA = " + muxed + "; var v = document.getElementById('v');" + watch +
+        "var ms = new MediaSource(), sb, closed = [];"
+        "ms.addEventListener('sourceopen', function() {"
+        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
+        "  sb.timestampOffset = 0;"
+        "  sb.appendBuffer(__string_to_bytes(DATA));"
+        "});"
+        "ms.addEventListener('sourceclose', function() { closed.push('sourceclose:' + ms.readyState + ':' + ms.sourceBuffers.length + ':' + ms.duration) });"
+        "document.getElementById('b').onclick = function() { v.currentTime = 1.5 };"
+        "document.getElementById('c').onclick = function() { sb.remove(0, 1.2) };"
+        "document.getElementById('e').onclick = function() { console.log(ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.seeking + ' ' + v.readyState + ' ' + sb.buffered.length + ' ' + (sb.buffered.length ? sb.buffered.start(0).toFixed(2) : '-') + ' ' + sb.updating + ' ' + closed.join()) };"
+        "v.src = URL.createObjectURL(ms);</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 5);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 4);
+    page.click(page.document().element_by_id("c")->serial, 0, 0);
+    mse_pump(page, env, 4);
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    const std::string out = page_log(page);
+    CHECK(out.find(",seeking,seeked") != std::string::npos);
+    CHECK(out.find(" 1.50 false ") != std::string::npos);                       // (the seek is done: the data was there)
+    CHECK(out.find(" 1 1.04 false ") != std::string::npos);                     // (remove(0, 1.2) took the first key frame's group, the rest starts at the second)
+    // the element lets go of the source
+    page.document().element_by_id("v")->owner->touch();
+  }
+  CHECK(a.live == 0);
+  {   // bytes that are not a stream: error, updateend, the source ends with a decode error, the element has an error
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v></video><button id=b></button><script>var v = document.getElementById('v'); var ev = [];"
+        "var ms = new MediaSource(), sb;"
+        "ms.addEventListener('sourceopen', function() {"
+        "  sb = ms.addSourceBuffer('video/mp4');"
+        "  ['updatestart','update','updateend','error'].forEach(function(t) { sb.addEventListener(t, function() { ev.push(t) }) });"
+        "  sb.appendBuffer(new Uint8Array([0, 0, 0, 20, 109, 111, 111, 118, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]));"
+        "});"
+        "ms.addEventListener('sourceended', function() { ev.push('sourceended') });"
+        "v.addEventListener('error', function() { ev.push('element-error:' + v.error.code) });"
+        "document.getElementById('b').onclick = function() { try { sb.appendBuffer(new Uint8Array(4)) } catch (e) { ev.push(e.name) } console.log(ev.join() + ' ' + ms.readyState) };"
+        "v.src = URL.createObjectURL(ms);</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 6);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    const std::string out = page_log(page);
+    CHECK(out.find("updatestart,error,updateend,sourceended,element-error:3,InvalidStateError ended") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // separate buffers for the picture and the sound: each is its own file, on its own player; the ranges are what both have
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><script>var V = " + js_file("tests/data/mse_video.mp4") + ", A = " + js_file("tests/data/mse_audio.mp4") +
+        "; var v = document.getElementById('v'); var ms = new MediaSource(), vb, ab;"
+        "ms.addEventListener('sourceopen', function() {"
+        "  vb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e\"'); ab = ms.addSourceBuffer('audio/mp4; codecs=\"mp4a.40.2\"');"
+        "  vb.appendBuffer(__string_to_bytes(V));"
+        "  vb.addEventListener('updateend', function() { ab.appendBuffer(__string_to_bytes(A)) }, { once: true });"
+        "});"
+        "document.getElementById('b').onclick = function() {"
+        "  console.log(ms.sourceBuffers.length, ms.activeSourceBuffers.length, vb.buffered.end(0).toFixed(2), ab.buffered.end(0).toFixed(2), v.buffered.length, v.buffered.start(0).toFixed(2), v.buffered.end(0).toFixed(2), v.readyState, v.videoWidth);"
+        "  v.play(); };"
+        "v.src = URL.createObjectURL(ms);</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 8);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 4);
+    CHECK(page_log(page).find("2 2 2.08 2.02 1 0.08 2.02 ") == 0);
+    CHECK(env.opened_video == 1 && env.opened_audio == 1);
+    CHECK(env.last_video_data.size() > 15000 && env.last_audio_data.size() > 15000 && env.last_audio_data.compare(4, 8, "ftypisom") == 0);
+  }
+  CHECK(a.live == 0);
+  {   // MPEG audio into an <audio>, and `new Audio(url)` for a source nobody put in the page
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><audio id=v></audio><button id=b></button><script>var M = " + js_file("tests/data/mse_audio.mp3") + "; var v = document.getElementById('v'); var ms = new MediaSource(), sb, log = [];"
+        "ms.addEventListener('sourceopen', function() {"
+        "  sb = ms.addSourceBuffer('audio/mpeg'); log.push(sb.mode);"
+        "  sb.appendBuffer(__string_to_bytes(M));"
+        "  sb.addEventListener('updateend', function() { sb.appendBuffer(__string_to_bytes(M)) }, { once: true });"
+        "});"
+        "document.getElementById('b').onclick = function() { log.push(sb.buffered.length, sb.buffered.end(0).toFixed(1), v.duration.toFixed(1), v.readyState); console.log(log.join(' ')) };"
+        "v.src = URL.createObjectURL(ms);</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 8);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page) == "sequence 1 2.1 2.1 3");
+    // (the file for the player is the MPEG frames: it starts with a frame header)
+    mse_pump(page, env, 3);
+    CHECK(env.opened_audio >= 1 && env.last_audio_data.size() > 16000 && static_cast<uint8_t>(env.last_audio_data[0]) == 0xFF);
+  }
+  CHECK(a.live == 0);
+  {   // `new Audio(blob url)` with no element in the page, a revoked address, a source used twice
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><button id=b></button><script>var M = " + js_file("tests/data/mse_audio.mp3") + "; var ms = new MediaSource(), au, sb, log = [];"
+        "ms.addEventListener('sourceopen', function() { sb = ms.addSourceBuffer('audio/mpeg'); sb.appendBuffer(__string_to_bytes(M)) });"
+        "var url = URL.createObjectURL(ms); au = new Audio(url); URL.revokeObjectURL(url);"
+        "document.getElementById('b').onclick = function() { log.push(ms.readyState, au.readyState, au.duration.toFixed(1)); var again = new Audio(); try { again.src = URL.createObjectURL(ms) } catch (e) { log.push(e.name) } console.log(log.join(' ')) };"
+        "</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 8);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page).find("open ") == 0);
   }
   CHECK(a.live == 0);
 }
@@ -2540,6 +2819,7 @@ int main(int argc, char** argv) {
   test_video();
   test_audio();
   test_media_api();
+  test_mse();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

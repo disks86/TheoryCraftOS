@@ -43,12 +43,15 @@
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
 #include "Kernel/Sync.hpp"
 #include "Media/Image.hpp"
+#include "Media/Mse.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace browser {
+
+class MseClip;
 
 // A video the environment is playing for a page.
 class IVideoClip {
@@ -62,6 +65,7 @@ class IVideoClip {
   virtual bool set_rate(double rate) { return rate == 1; }
   virtual bool playing() = 0;
   virtual int64_t position_us() = 0;
+  // The length in microseconds; -1 if it is not known (NaN to script), INT64_MAX for a stream that does not end (Infinity).
   virtual int64_t duration_us() = 0;
   virtual uint32_t width() = 0;
   virtual uint32_t height() = 0;
@@ -70,6 +74,17 @@ class IVideoClip {
   // Copies the current picture (width() x height(), 0xAARRGGBB, `pitch` pixels per row, so `dest` needs pitch * height() pixels) and says which picture it
   // is; false if there is none or `dest` is too small.
   virtual bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* serial) = 0;
+
+  // --- For a clip that is fed while it plays (a media source); a file that is all there needs none of this.
+  // Do its readiness and ranges change by themselves? The page then watches them and fires the events (loadedmetadata, canplay, waiting, progress ...).
+  virtual bool dynamic() { return false; }
+  // HAVE_NOTHING 0 .. HAVE_ENOUGH_DATA 4.
+  virtual uint8_t ready_state() { return 4; }
+  // The buffered and the seekable time ranges, as start and end seconds one after the other (at most pairs.size() / 2); how many ranges there are.
+  virtual uint32_t buffered(ArrayView<double> pairs) { (void)pairs; return 0; }
+  virtual uint32_t seekable(ArrayView<double> pairs) { (void)pairs; return 0; }
+  // A MediaError code (2 network, 3 decode, 4 not supported) if the clip cannot go on, else 0.
+  virtual uint8_t error() { return 0; }
 
  protected:
   IVideoClip() = default;
@@ -122,8 +137,9 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   struct Event {
     uint32_t serial = 0;
     const char* type = "";
+    uint32_t source = 0;   // not 0: the event is for the MediaSource with that number (sourceopen, sourceclose), `serial` is not used
   };
-  // The next event to fire at an element (load, error, loadedmetadata, play, pause, ended, timeupdate ...); false when there is none.
+  // The next event to fire at an element (load, error, loadedmetadata, play, pause, ended, timeupdate ...) or a MediaSource; false when there is none.
   bool take_event(Event* out);
   // Moves the videos along (the host clock, in ms); queues the events that follow.
   void update(uint64_t now_ms);
@@ -164,10 +180,19 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   CanvasBitmap* existing_canvas(uint32_t serial);
 
   // --- Videos (script side)
+  // --- Media sources (the MediaSource and SourceBuffer objects of script work on this; the element plays what they hold)
+  media::MseHub& mse() { return mse_; }
+  // Where playback is for the element a media source is attached to (microseconds; 0 if it is not attached to one).
+  int64_t mse_playhead(uint32_t source);
+
   struct VideoState {
     bool known = false, ready = false, paused = true, ended = false, loop = false, muted = false, seeking = false;
     double current_time = 0, duration = 0, volume = 1, rate = 1, default_rate = 1;
     double buffered_end = 0, played_end = 0;   // seconds; the buffered and seekable range is 0 to buffered_end, the played one 0 to played_end
+    static constexpr uint32_t kMaxRanges = 16;
+    double buffered_ranges[kMaxRanges * 2], seekable_ranges[kMaxRanges * 2];   // start, end seconds; a media source says which (else: 0 to buffered_end)
+    uint32_t buffered_count = 0, seekable_count = 0;
+    bool dynamic = false;
     uint32_t width = 0, height = 0;
     uint8_t ready_state = 0;     // HAVE_NOTHING 0 .. HAVE_ENOUGH_DATA 4
     uint8_t network_state = 0;   // NETWORK_EMPTY 0, IDLE 1, LOADING 2, NO_SOURCE 3
@@ -216,6 +241,12 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     uint8_t state = 0;           // 0 nothing yet, 1 ready, 2 failed
     bool audio = false, seen = false, controls = false, loop = false, muted = false, autoplay = false, ended = false, was_playing = false, announced = false, wants_play = false;
     bool has_source = false;     // the element names a file (it may not be fetched yet)
+    uint32_t mse_source = 0;     // the MediaSource it plays (its address is a blob: one made from one)
+    MseClip* mse_clip = nullptr;   // (the clip, when it is that kind)
+    uint8_t last_ready = 0;      // (a clip that is fed while it plays) what readyState was at the last update, and what has been announced
+    bool loaded_data = false, waiting_sent = false;
+    int64_t last_duration_us = -2;
+    double last_progress = -1;
     bool seeking = false;        // a seek was made; "seeked" follows at the next update()
     bool play_pending = false;   // "play" was fired while the file was still on its way; "playing" is owed
     bool emulate_rate = false;   // the clip cannot play at `rate`: update() keeps it on time by seeking
@@ -262,6 +293,10 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void apply_rate(VideoSlot& v);
   void apply_volume(VideoSlot& v);
   void reanchor(VideoSlot& v);
+  void attach_mse(VideoSlot& v, dom::Node* n, uint32_t source, StringView address, IObjectEnvironment& env);
+  void release_mse(VideoSlot& v);
+  void watch_dynamic(VideoSlot& v);
+  void ensure_picture(VideoSlot& v);
   void follow_clock(VideoSlot& v);
   static bool slot_playing(const VideoSlot& v) { return v.clip && (v.clip->playing() || v.throttled); }
   bool choose_source(const dom::Node* img, const MediaEnvironment& media, String* out);
@@ -280,6 +315,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   List<UniquePointer<CanvasSlot>> canvases_;
   List<UniquePointer<SvgSlot>> svgs_;
   List<Event> events_;
+  media::MseHub mse_;
   uint64_t canvas_pixels_ = 0, now_ms_ = 0;
   uint32_t fetched_images_ = 0;
   bool dirty_ = false, accelerated_ = false;
