@@ -30,6 +30,8 @@ struct H264Slice {
   uint64_t nal_size = 0;         // bytes, header byte and emulation prevention bytes included - what an engine reads
   uint64_t data_bit_offset = 0;  // where slice_data() starts, in bits from nal_offset, counted in the bytes as stored (header byte and
                                  // emulation prevention bytes included)
+  uint64_t header_bits = 0;      // where slice_data() starts, in bits from the start of the NAL unit with the emulation prevention bytes taken out (the header
+                                 // byte counts as 8): the form engines that undo the emulation prevention themselves want
   bool starts_picture = false;   // the first slice of a new picture
   h264::SliceHeader header;
 };
@@ -53,6 +55,7 @@ class H264StreamParser {
   void reset() { have_prev_ = false; }
 
   // The parameter sets a slice refers to; nullptr if there are none (cannot happen for a slice parse() returned).
+  const h264::ParameterSets* parameter_sets() const { return sets_.get(); }
   const h264::Sps* sps_for(const h264::SliceHeader& header) const;
   const h264::Pps* pps_for(const h264::SliceHeader& header) const;
 

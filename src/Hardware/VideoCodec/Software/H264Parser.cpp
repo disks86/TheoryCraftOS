@@ -98,6 +98,7 @@ bool H264StreamParser::parse(ConstByteView access_unit, List<H264Slice>* slices)
     if (!sps) return;
     slice.nal_offset = static_cast<uint64_t>(nal - base);
     slice.nal_size = size;
+    slice.header_bits = br.position() + 8;
     slice.data_bit_offset = stored_bit_offset(nal, size, br.position());
     slice.starts_picture = !have_prev_ || h264::ParameterSets::new_picture(*sps, prev_, slice.header);
     prev_ = slice.header;

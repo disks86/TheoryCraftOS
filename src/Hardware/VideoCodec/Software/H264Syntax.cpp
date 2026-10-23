@@ -429,14 +429,11 @@ bool ParameterSets::parse_pps(BitReader& br) {
   return true;
 }
 
-// Builds LevelScale for the active parameter sets (8.5.9).
-void Core::compute_scaling() {
-  const Sps& s = *sp_;
-  const Pps& p = *pp_;
-  uint8_t w4[6][16], w8[2][64];
+// The scaling lists in force for a picture using `pps`, after the fall-back rules (8.5.6): flat 16 where the stream sends none.
+void ParameterSets::effective_scaling(const Sps& s, const Pps& p, uint8_t w4[6][16], uint8_t w8[2][64]) const {
   if (p.scaling_matrix_present) {
     ScalingRaw raw = {};
-    const uint8_t pr = ps_.raw_present[p.id], pd = ps_.raw_default[p.id];
+    const uint8_t pr = raw_present[p.id], pd = raw_default[p.id];
     for (int i = 0; i < 8; ++i) {
       raw.present[i] = (pr >> i) & 1;
       raw.use_default[i] = (pd >> i) & 1;
@@ -452,6 +449,12 @@ void Core::compute_scaling() {
     for (int i = 0; i < 2; ++i)
       for (int k = 0; k < 64; ++k) w8[i][k] = s.list8[i][k];
   }
+}
+
+// Builds LevelScale for the active parameter sets (8.5.9).
+void Core::compute_scaling() {
+  uint8_t w4[6][16], w8[2][64];
+  ps_.effective_scaling(*sp_, *pp_, w4, w8);
   static const int v4[6][3] = {{10, 16, 13}, {11, 18, 14}, {13, 20, 16}, {14, 23, 18}, {16, 25, 20}, {18, 29, 23}};
   static const int v8[6][6] = {{20, 18, 32, 19, 25, 24}, {22, 19, 35, 21, 28, 26}, {26, 23, 42, 24, 33, 31},
                                {28, 25, 45, 26, 35, 33}, {32, 28, 51, 30, 40, 38}, {36, 32, 58, 34, 46, 43}};
