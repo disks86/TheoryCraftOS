@@ -190,6 +190,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       current_(allocator),
       request_target_(allocator),
       status_text_(allocator),
+      worker_(allocator),
       prefetcher_(allocator, &WebBrowser::prefetch_one, this) {
   set_bounds({100, 50, 680, 480});
   set_padding(Insets::all(4));
@@ -255,10 +256,10 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   resize_handler_ = {&WebBrowser::on_view_resized, this};
   timer_handler_ = {&WebBrowser::on_timers, this};
   key_handler_ = {&WebBrowser::on_form_key, this};
-  page_.on_node_clicked(node_handler_);
-  page_.on_pointer_changed(pointer_handler_);
-  page_.on_key_pressed(key_handler_);
-  page_.on_resized(resize_handler_);
+  page_.on_node_clicked(Handler::immediate(&WebBrowser::route_node, this));
+  page_.on_pointer_changed(Handler::immediate(&WebBrowser::route_pointer, this));
+  page_.on_key_pressed(Handler::immediate(&WebBrowser::route_key, this));
+  page_.on_resized(Handler::immediate(&WebBrowser::route_resize, this));
 
   add(&menu_);
   add(&toolbar_);
@@ -275,6 +276,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
 }
 
 WebBrowser::~WebBrowser() {
+  worker_.stop();   // (the page's thread ends first: it must not touch the controls below while they are taken down)
   UiGuard lock(&page_);
   page_.set_object_painter(nullptr);
 }
@@ -450,7 +452,7 @@ bool WebBrowser::post_form(StringView target, StringView content_type, StringVie
     request_type_.assign(content_type);
     request_body_.assign(body);
   }
-  fire(load_handler_);
+  queue(load_handler_, *this, true);
   return true;
 }
 
@@ -460,7 +462,7 @@ bool WebBrowser::post(Request kind, StringView target) {
     request_ = kind;
     request_target_.assign(target);
   }
-  fire(load_handler_);
+  queue(load_handler_, *this, true);
   return true;
 }
 
@@ -967,7 +969,7 @@ void WebBrowser::tick(uint64_t uptime_us) {
   __atomic_store_n(&uptime_ms_, uptime_us / 1000, __ATOMIC_RELEASE);
   const uint64_t due = __atomic_load_n(&next_due_ms_, __ATOMIC_ACQUIRE);
   if (due == 0 || page_clock_ms() < due || __atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) return;
-  fire(timer_handler_);
+  queue(timer_handler_, *this, true);
 }
 
 void WebBrowser::on_timers(void* self, Control&) {
@@ -1017,7 +1019,7 @@ void WebBrowser::set_scripts_enabled(bool enabled) {
 void WebBrowser::set_dark(bool dark) {
   dark_ = dark;
   if (dark_item_) dark_item_->set_checked(dark);
-  fire(resize_handler_);
+  queue(resize_handler_, *this, true);
 }
 
 void WebBrowser::on_toggle_scripts(void* self, Control&) {

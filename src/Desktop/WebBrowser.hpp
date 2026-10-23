@@ -39,6 +39,7 @@
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Audio/AudioMixer.hpp"
 #include "Desktop/FileDialog.hpp"
+#include "Desktop/HandlerThread.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -251,6 +252,13 @@ class WebBrowser : public gui::Frame {
   UniquePointer<font::FontSet> layout_fonts_;   // the fonts the page is measured with (on the handler thread; the view paints with a set of its own)
   uint32_t document_ = 0;           // the number of the document shown (it changes whenever a page is loaded)
   gui::Handler load_handler_;
+  // The page's work (loading, scripts, timers, clicks and keys on it) runs on a thread of the browser's own, not on the window's handler thread that the whole
+  // desktop shares. The page controls fire immediate handlers that only queue the real ones here.
+  void queue(const gui::Handler& handler, gui::Control& sender, bool coalesce) { worker_.post(handler, sender, coalesce); }
+  static void route_node(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->node_handler_, s, false); }
+  static void route_pointer(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->pointer_handler_, s, true); }
+  static void route_resize(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->resize_handler_, s, true); }
+  static void route_key(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->key_handler_, s, false); }
   UnixClock unix_clock_ = nullptr;
   void* unix_clock_context_ = nullptr;
   audio::AudioMixer* mixer_ = nullptr;
@@ -280,6 +288,7 @@ class WebBrowser : public gui::Frame {
   String current_, request_target_, status_text_;
   Request request_ = Request::None;
   bool loading_ = false;
+  HandlerThread worker_;                     // (before the prefetcher: stopped after it)
   browser::ResourcePrefetcher prefetcher_;   // (last: its threads end before anything they use is destroyed)
 };
 

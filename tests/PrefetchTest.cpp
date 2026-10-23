@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Host-side tests for the page's background downloads: the scan of a page's HTML for what it will ask for, and the ResourcePrefetcher (parallel, bounded,
+// Host-side tests for the page's background downloads (and the browser's own handler thread): the scan of a page's HTML for what it will ask for, and the ResourcePrefetcher (parallel, bounded,
 // cancellable, and it never waits behind work that has not started). Real threads (tests/HostThreads.cpp).
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +25,7 @@
 #include <vector>
 #include "Browser/ResourcePrefetcher.hpp"
 #include "Browser/ResourceScan.hpp"
+#include "Desktop/HandlerThread.hpp"
 
 using namespace browser;
 
@@ -214,6 +215,69 @@ static void test_shutdown_waits() {
   CHECK(__atomic_load_n(&fake.active, __ATOMIC_ACQUIRE) == 0);
 }
 
+
+struct Log {
+  std::vector<int> order;
+  kernel::Mutex mutex;
+  kernel::Thread* thread = nullptr;
+  bool gate_closed = false;
+  uint32_t running = 0, max_running = 0;
+};
+
+static void log_handler(void* context, gui::Control&) {
+  Log& log = *static_cast<Log*>(context);
+  __atomic_add_fetch(&log.running, 1, __ATOMIC_ACQ_REL);
+  uint32_t seen = __atomic_load_n(&log.max_running, __ATOMIC_ACQUIRE);
+  const uint32_t now = __atomic_load_n(&log.running, __ATOMIC_ACQUIRE);
+  while (now > seen && !__atomic_compare_exchange_n(&log.max_running, &seen, now, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+  while (__atomic_load_n(&log.gate_closed, __ATOMIC_ACQUIRE)) kernel::sleep_us(300);
+  kernel::ScopedMutex lock(log.mutex);
+  log.order.push_back(static_cast<int>(log.order.size()));
+  log.thread = kernel::current_thread();
+  __atomic_sub_fetch(&log.running, 1, __ATOMIC_ACQ_REL);
+}
+
+static void test_handler_thread() {
+  MallocAllocator a;
+  alignas(8) static char fake_control[64];   // (a sender is only passed along, never used)
+  gui::Control& sender = *reinterpret_cast<gui::Control*>(fake_control);
+  Log log;
+  log.gate_closed = true;
+  {
+    desktop::HandlerThread worker(a);
+    const gui::Handler h{&log_handler, &log, false};
+    const uint64_t start = now_ms();
+    for (int i = 0; i < 5; ++i) worker.post(h, sender, false);
+    CHECK(now_ms() - start < 500);   // (posting does not wait for the handler, which is held up here)
+    kernel::sleep_us(20000);
+    CHECK(__atomic_load_n(&log.running, __ATOMIC_ACQUIRE) == 1);   // (one at a time)
+    __atomic_store_n(&log.gate_closed, false, __ATOMIC_RELEASE);
+    while (true) {
+      kernel::ScopedMutex lock(log.mutex);
+      if (log.order.size() == 5) break;
+      kernel::sleep_us(500);
+    }
+    CHECK(log.thread != kernel::current_thread());   // (not the caller's thread)
+    CHECK(__atomic_load_n(&log.max_running, __ATOMIC_ACQUIRE) == 1);
+  }
+  {   // coalescing and the bound
+    Log held;
+    held.gate_closed = true;
+    desktop::HandlerThread worker(a);
+    const gui::Handler h{&log_handler, &held, false};
+    worker.post(h, sender, true);   // starts and blocks in the handler
+    while (__atomic_load_n(&held.running, __ATOMIC_ACQUIRE) == 0) kernel::sleep_us(300);
+    for (int i = 0; i < 10; ++i) worker.post(h, sender, true);   // (only one of them waits)
+    for (int i = 0; i < 1000; ++i) worker.post(h, sender, false);   // (the queue is bounded)
+    __atomic_store_n(&held.gate_closed, false, __ATOMIC_RELEASE);
+    worker.stop();   // (drops what waits, waits for what runs)
+    CHECK(held.order.size() >= 1 && held.order.size() <= 2 + desktop::HandlerThread::kMaxQueued);
+    CHECK(__atomic_load_n(&held.running, __ATOMIC_ACQUIRE) == 0);
+    worker.post(h, sender, false);   // (after stop: ignored)
+    CHECK(held.order.size() <= 2 + desktop::HandlerThread::kMaxQueued);
+  }
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_scan();
@@ -221,6 +285,7 @@ int main() {
   test_queued_is_not_waited_for();
   test_failures_cancel_budget();
   test_shutdown_waits();
+  test_handler_thread();
   if (g_failed) {
     printf("%d prefetch checks failed\n", g_failed);
     return 1;
