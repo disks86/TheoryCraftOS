@@ -513,10 +513,9 @@ bool install_events(DomBindings::Impl& c) {
   vm.define_native(tp, "dispatchEvent", dispatch_event_native, 1);
   vm.define_native(c.element_proto, "click", el_click, 0);
   vm.define_native(c.document_proto, "createEvent", doc_create_event, 1);
-  // the window is an event target too: the global functions
-  vm.define_native(g, "addEventListener", add_event_listener, 2);
-  vm.define_native(g, "removeEventListener", remove_event_listener, 2);
-  vm.define_native(g, "dispatchEvent", dispatch_event_native, 1);
+  // The window is an event target too: it inherits these through Window.prototype. (The bare script engine gave the global stand-ins of its own: they go.)
+  vm.delete_property(g, vm.intern("addEventListener"));
+  vm.delete_property(g, vm.intern("removeEventListener"));
 
   c.event_proto = vm.new_plain();
   vm.define_native(c.event_proto, "preventDefault", event_prevent_default, 0);

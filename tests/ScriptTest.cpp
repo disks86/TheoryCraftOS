@@ -234,6 +234,10 @@ static void test_objects() {
 }
 
 static void test_arrays_and_strings() {
+  // a global that is a getter on the window is read by its bare name too (YouTube defines Polymer that way), and `typeof` sees it
+  CHECK(is("var store = {x: 7}; Object.defineProperty(this, 'Acc', {get: function () { return store; }, set: function (v) { store = v; }, configurable: true}); Acc.x + ':' + typeof Acc + ':' + typeof NoSuchGlobal", "7:object:undefined"));
+  // errors have a stack (pages' error reporters read its length)
+  CHECK(is("var e = new TypeError('boom'); typeof e.stack + ':' + (e.stack.indexOf('TypeError: boom') === 0) + ':' + Object.keys(e).length", "string:true:0"));
   {   // a string literal larger than one arena block (Google's search page evals a 60 KB one)
     const std::string big(70000, 'x');
     CHECK(is(("var s = '" + big + "'; s.length + ':' + (s + 'a' + \"" + big + "\").length").c_str(), "70000:140001"));

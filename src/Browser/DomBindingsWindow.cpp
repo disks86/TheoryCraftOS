@@ -933,6 +933,18 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(performance, "getEntriesByName", empty_array_native, 1);
   vm.define_native(performance, "getEntriesByType", empty_array_native, 1);
   vm.define_named(performance, "timeOrigin", num_value(vm.clock_ms()));
+  {   // performance.timing (the old Navigation Timing API that pages still read): every moment is when the page started
+    JsObject* timing = vm.new_plain();
+    for (const char* name : {"navigationStart", "unloadEventStart", "unloadEventEnd", "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart", "domainLookupEnd",
+                             "connectStart", "connectEnd", "secureConnectionStart", "requestStart", "responseStart", "responseEnd", "domLoading", "domInteractive",
+                             "domContentLoadedEventStart", "domContentLoadedEventEnd", "domComplete", "loadEventStart", "loadEventEnd"})
+      vm.define_named(timing, name, num_value(vm.clock_ms()));
+    vm.define_named(performance, "timing", Value::make_object(timing));
+    JsObject* navigation = vm.new_plain();
+    vm.define_named(navigation, "type", num_value(0));
+    vm.define_named(navigation, "redirectCount", num_value(0));
+    vm.define_named(performance, "navigation", Value::make_object(navigation));
+  }
   vm.define_named(g, "performance", Value::make_object(performance), kWritable);
 
   // console extras

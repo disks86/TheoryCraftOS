@@ -299,6 +299,7 @@ class Vm {
   bool make_iterator(const Value& v, bool for_in, Value* out);
   bool iterator_next(JsObject* it, Value* out);
   bool spread_into(JsObject* array, const Value& iterable);
+  bool has_global(JsString* name);
   bool lookup_global(JsString* name, Value* out);
   bool push(const Value& v);
   // async functions
@@ -335,6 +336,8 @@ class Vm {
   void* epilogue_user_ = nullptr;
   bool epilogue_pending_ = false, in_epilogue_ = false;
   void run_epilogue();
+  template <class F>
+  void keeping(Value* v, F&& run);
   JsObject* (*construct_hook_)(void*, JsObject*) = nullptr;
   void* construct_user_ = nullptr;
   JsObject* new_instance(JsObject* proto);
@@ -357,6 +360,7 @@ class Vm {
   List<Handler> handlers_;
   Value exception_;
   bool has_exception_ = false;
+  uint32_t throw_line_ = 0;   // the source line an exception was thrown from (kept for debugging builds: TCOS_ERROR_LINES prints it)
   Value last_result_;
   JsObject *global_ = nullptr, *object_proto_ = nullptr, *array_proto_ = nullptr, *function_proto_ = nullptr, *string_proto_ = nullptr, *number_proto_ = nullptr,
            *boolean_proto_ = nullptr, *error_proto_ = nullptr, *iterator_proto_ = nullptr, *sentinel_ = nullptr;
@@ -365,7 +369,7 @@ class Vm {
   uint32_t micro_head_ = 0;
   bool draining_ = false, suspended_ = false;
   uint32_t async_depth_ = 0;
-  Value await_value_, pinned_;
+  Value await_value_;
   JsString *empty_ = nullptr, *length_ = nullptr, *prototype_ = nullptr, *name_ = nullptr, *message_ = nullptr, *constructor_ = nullptr, *to_string_ = nullptr,
            *value_of_ = nullptr, *undefined_text_ = nullptr, *null_text_ = nullptr, *true_text_ = nullptr, *false_text_ = nullptr;
   // limits

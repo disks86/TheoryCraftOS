@@ -1412,8 +1412,9 @@ bool install_nodes(DomBindings::Impl& c) {
   c.node_proto = vm.new_object(event_target);
   c.element_proto = vm.new_object(c.node_proto);
   c.html_proto = vm.new_object(c.element_proto);
-  c.text_proto = vm.new_object(c.node_proto);
-  c.comment_proto = vm.new_object(c.node_proto);
+  c.character_data_proto = vm.new_object(c.node_proto);   // (CharacterData: what Text and Comment are)
+  c.text_proto = vm.new_object(c.character_data_proto);
+  c.comment_proto = vm.new_object(c.character_data_proto);
   c.document_proto = vm.new_object(c.node_proto);
   c.fragment_proto = vm.new_object(c.node_proto);
   vm.define_named(g, "__event_target_proto", Value::make_object(event_target), 0);
@@ -1501,6 +1502,13 @@ bool install_nodes(DomBindings::Impl& c) {
   make_class(c, "EventTarget", event_target_constructor, event_target);
   vm.define_native(ep, "attachShadow", el_attach_shadow, 1);
   make_class(c, "Element", illegal_constructor, ep);
+  make_class(c, "SVGElement", illegal_constructor, vm.new_object(ep));
+  make_class(c, "HTMLUnknownElement", illegal_constructor, vm.new_object(c.html_proto));
+  {   // `window` is a Window, which is an EventTarget: addEventListener and the rest are inherited, as pages that patch Window.prototype expect
+    JsObject* window_proto = vm.new_object(event_target);
+    make_class(c, "Window", illegal_constructor, window_proto);
+    g->proto = window_proto;
+  }
   make_class(c, "HTMLElement", illegal_constructor, c.html_proto);
   {   // one interface for each kind of element, so instanceof tells an <input> from a <div>
     static const struct {
@@ -1549,7 +1557,10 @@ bool install_nodes(DomBindings::Impl& c) {
       vm.define(c.tag_protos, vm.intern(tag), Value::make_object(proto), 0);
     }
   }
+  make_class(c, "CharacterData", illegal_constructor, c.character_data_proto);
   make_class(c, "Text", illegal_constructor, c.text_proto);
+  make_class(c, "CDATASection", illegal_constructor, vm.new_object(c.text_proto));
+  make_class(c, "ProcessingInstruction", illegal_constructor, vm.new_object(c.character_data_proto));
   make_class(c, "Comment", illegal_constructor, c.comment_proto);
   make_class(c, "Document", illegal_constructor, dp);
   make_class(c, "HTMLDocument", illegal_constructor, dp);

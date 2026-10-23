@@ -366,6 +366,13 @@ static void test_selectors_js() {
 }
 
 static void test_events() {
+  // the interfaces the web components polyfill reads, and what `window` is
+  CHECK(js("", "var t = document.createTextNode('x'), c = document.createComment('y'); console.log(t instanceof CharacterData, c instanceof CharacterData, t instanceof Text, CharacterData.prototype === Object.getPrototypeOf(Text.prototype), typeof CDATASection, typeof ProcessingInstruction, typeof SVGElement, typeof HTMLUnknownElement)", "true true true true function function function function"));
+  CHECK(js("", "console.log(typeof Window, window instanceof Window, Object.getPrototypeOf(window) === Window.prototype, window instanceof EventTarget, typeof Window.prototype.addEventListener, Object.prototype.hasOwnProperty.call(window, 'addEventListener'))", "function true true true function false"));
+  CHECK(js("", "var hit = 0; window.addEventListener('ping', function () { hit++; }); window.dispatchEvent(new Event('ping')); addEventListener('ping', function () { hit++; }); dispatchEvent(new Event('ping')); console.log(hit)", "3"));
+  CHECK(js("", "console.log(typeof performance.timing.navigationStart, typeof performance.timing.responseStart, typeof performance.navigation.type, performance.getEntriesByType('navigation').length)", "number number number 0"));
+  // a native called from a mutation callback's epilogue does not lose the result of the native that is running (the VM kept it in one shared slot)
+  CHECK(js("<div id=d></div>", "var s = document.createTextNode(''); new MutationObserver(function () {}).observe(s, {characterData: true}); var r = __take_mutations(); s.textContent = 'a'; document.getElementById('d').appendChild(document.createElement('b')); var r2 = __take_mutations(); console.log(typeof r, typeof r2, Array.isArray(r2))", "object object true"));
   CHECK(js("<div id=a><p id=b><i id=c>x</i></p></div>",
            "var log = []; function h(n) { return function(e) { log.push(n + ':' + e.currentTarget.id + ':' + e.eventPhase + (e.target.id ? ':' + e.target.id : '')) } }\n"
            "var a = document.getElementById('a'), b = document.getElementById('b'), c = document.getElementById('c');\n"

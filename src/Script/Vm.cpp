@@ -17,6 +17,9 @@
  */
 
 #include "Script/Vm.hpp"
+#ifdef TCOS_ERROR_LINES
+#include <stdio.h>
+#endif
 #include "Script/RegExp.hpp"
 #include "Script/TypedArray.hpp"
 #include <initializer_list>
@@ -544,7 +547,35 @@ JsObject* Vm::new_error(ErrorKind kind, StringView message) {
   JsObject* e = new_object(error_protos_[static_cast<int>(kind)]);
   e->okind = ObjKind::Error;
   define(e, message_, Value::make_string(new_string(message)), kWritable);
+  {   // error.stack: pages (and their error reporters) read it; there is no call stack to give, only the first line
+    static const char* const kNames[5] = {"Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError"};
+    String stack(allocator_);
+    stack.append(kNames[static_cast<int>(kind)]);
+    if (!message.empty()) {
+      stack.append(": ");
+      stack.append(message);
+    }
+    stack.append("\n    at <anonymous>");
+    define(e, intern("stack"), Value::make_string(new_string(stack.view())), kWritable);
+  }
   return e;
+}
+
+// Runs `run` (which may run script) while `*v` is kept alive. The value goes on the value stack: the script may call natives that do the same, so a single
+// shared slot would be overwritten by the inner call and the outer one would get back `undefined`.
+template <class F>
+void Vm::keeping(Value* v, F&& run) {
+  if (sp_ >= kStackValues) {
+    run();
+    return;
+  }
+  const uint32_t at = sp_;
+  stack_[sp_++] = *v;
+  run();
+  if (sp_ > at) {
+    *v = stack_[at];
+    sp_ = at;
+  }
 }
 
 bool Vm::throw_error(ErrorKind kind, StringView message) {
@@ -645,7 +676,6 @@ void Vm::collect() {
   mark_value(exception_);
   mark_value(last_result_);
   mark_value(await_value_);
-  mark_value(pinned_);
   mark(promise_proto_);
   mark(micro_);
   mark(rejections_);
@@ -1459,6 +1489,10 @@ void Vm::take_exception(String* text) {
   } else {
     describe(exception_, text, 0);
   }
+#ifdef TCOS_ERROR_LINES
+  fprintf(stderr, "[js error at line %u] %s\n", throw_line_, text->c_str());
+#endif
+  throw_line_ = 0;
   has_exception_ = false;
   exception_ = Value();
 }
@@ -1822,9 +1856,19 @@ bool Vm::push(const Value& v) {
   return true;
 }
 
+// Is there a global called `name`? (Without calling a getter that defines it: get_own() gives undefined for an accessor when no receiver is set.)
+bool Vm::has_global(JsString* name) {
+  const bool saved_has = has_receiver_;
+  has_receiver_ = false;
+  bool found = false;
+  Value ignored;
+  for (JsObject* o = global_; o && !found; o = o->proto) found = get_own(o, name, &ignored);
+  has_receiver_ = saved_has;
+  return found;
+}
+
 bool Vm::lookup_global(JsString* name, Value* out) {
-  for (JsObject* o = global_; o; o = o->proto)
-    if (get_own(o, name, out)) return true;
+  if (has_global(name)) return get(Value::make_object(global_), name, out);   // (read the way `window.name` is: a getter on the window is called)
   String message(allocator_);
   message.append(name->view());
   message.append(" is not defined");
@@ -1870,6 +1914,20 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
 }
 
 bool Vm::unwind(uint32_t entry_depth) {
+#ifdef TCOS_ERROR_LINES
+  if (throw_line_ == 0 && frames_.count() > 0) {
+    const Frame& top = frames_[frames_.count() - 1];
+    const uint32_t* line = top.pc > 0 ? top.code->lines.get(top.pc - 1) : nullptr;
+    if (line) {
+      throw_line_ = *line;
+      for (uint64_t i = frames_.count(); i > 0; --i) {   // (a call stack, innermost first)
+        const Frame& f = frames_[i - 1];
+        const uint32_t* l = f.pc > 0 ? f.code->lines.get(f.pc - 1) : nullptr;
+        fprintf(stderr, "    at %.*s (line %u)\n", f.code->name ? (int)f.code->name->length : 1, f.code->name ? f.code->name->data() : "?", l ? *l : 0);
+      }
+    }
+  }
+#endif
   while (handlers_.count() > 0 && handlers_[handlers_.count() - 1].frame >= entry_depth) {
     const Handler h = handlers_[handlers_.count() - 1];
     handlers_.remove_at(handlers_.count() - 1);
@@ -1881,6 +1939,7 @@ bool Vm::unwind(uint32_t entry_depth) {
     stack_[sp_++] = exception_;
     has_exception_ = false;
     exception_ = Value();
+    throw_line_ = 0;
     return true;
   }
   if (frames_.count() > entry_depth) {
@@ -1953,10 +2012,7 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
     sp_ = base;
     if (!ok) return false;
     if (epilogue_pending_) {
-      pinned_ = r;   // (the result is kept while the epilogue runs script)
-      run_epilogue();
-      r = pinned_;
-      pinned_ = Value();
+      keeping(&r, [this] { run_epilogue(); });   // (the result is kept while the epilogue runs script)
     }
     *result = construct && !r.is_object() ? created : r;
     return true;
@@ -1991,20 +2047,14 @@ bool Vm::call_value(const Value& function, const Value& this_value, const Value*
 bool Vm::call(const Value& function, const Value& this_value, const Value* args, uint32_t argc, Value* result) {
   const bool ok = call_value(function, this_value, args, argc, result, false);
   if (ok) {
-    pinned_ = *result;
-    checkpoint();
-    *result = pinned_;
-    pinned_ = Value();
+    keeping(result, [this] { checkpoint(); });
   }
   return ok;
 }
 bool Vm::construct(const Value& function, const Value* args, uint32_t argc, Value* result) {
   const bool ok = call_value(function, Value(), args, argc, result, true);
   if (ok) {
-    pinned_ = *result;
-    checkpoint();
-    *result = pinned_;
-    pinned_ = Value();
+    keeping(result, [this] { checkpoint(); });
   }
   return ok;
 }
@@ -2016,17 +2066,15 @@ bool Vm::run(FunctionCode* code, Value* result) {
   Value r;
   const bool ok = call_value(Value::make_object(fn), Value::make_object(global_), nullptr, 0, &r, false);
   if (ok) {
-    pinned_ = r;
-    checkpoint();
-    *result = pinned_;
-    pinned_ = Value();
+    keeping(&r, [this] { checkpoint(); });
+    *result = r;
   }
   return ok;
 }
 
 bool Vm::execute(uint32_t entry_depth) {
 #define THROW_PENDING() \
-  do { if (!unwind(entry_depth)) return false; goto reload; } while (0)
+  do { fp->pc = pc; if (!unwind(entry_depth)) return false; goto reload; } while (0)
 #define CHECK(expr) do { if (!(expr)) THROW_PENDING(); } while (0)
 #define PUSH(v) do { const Value pushed_ = (v); if (sp_ >= kStackValues) { throw_error(ErrorKind::RangeError, "Maximum call stack size exceeded"); THROW_PENDING(); } stack_[sp_] = pushed_; ++sp_; } while (0)
   FunctionCode* code;
@@ -2139,8 +2187,8 @@ reload:
       case Opc::TypeofGlobal: {
         JsString* name = code->constants[static_cast<uint32_t>(in.a)].as_string();
         Value v;
-        bool found = false;
-        for (JsObject* o = global_; o && !found; o = o->proto) found = get_own(o, name, &v);
+        const bool found = has_global(name);
+        if (found) CHECK(get(Value::make_object(global_), name, &v));
         PUSH(Value::make_string(intern(found ? type_of(v) : StringView("undefined"))));
         break;
       }
@@ -2266,10 +2314,7 @@ reload:
           --native_depth_;
           CHECK(ok);
           if (epilogue_pending_) {
-            pinned_ = result;
-            run_epilogue();
-            result = pinned_;
-            pinned_ = Value();
+            keeping(&result, [this] { run_epilogue(); });
           }
           if (is_new && !result.is_object()) result = created;
         } else {
