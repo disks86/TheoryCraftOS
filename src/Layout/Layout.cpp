@@ -51,8 +51,25 @@ bool LayoutContext::run() {
   return !failed_;
 }
 
-LayoutContext::AutoMargins LayoutContext::resolve_edges(Box& b, LayoutUnit cb_width) {
-  (void)cb_width;   // (percentages of the containing block's width come with the Length work)
+bool LayoutContext::resolve_with(const Length& l, const Style& style, LayoutUnit base, bool known, LayoutUnit* out) const {
+  if (l.has_percent()) {
+    if (!known) return false;   // a percentage of something not known acts as auto
+    int32_t px100 = 0;
+    if (l.expr && options_.sheet && options_.sheet->resolve_length_in(l, style, static_cast<int32_t>(base.to_px100()), &px100)) {
+      *out = LayoutUnit::from_px100(px100);
+      return true;
+    }
+    *out = LayoutUnit::from_px100(l.resolve(static_cast<int32_t>(base.to_px100())));
+    return true;
+  }
+  if (!l.is_px()) return false;
+  *out = LayoutUnit::from_px100(l.px100);
+  return true;
+}
+
+LayoutContext::AutoMargins LayoutContext::resolve_edges(Box& b, LayoutUnit cb_width, bool cb_known) {
+  b.cb_width = cb_width;
+  b.cb_width_known = cb_known;
   const Style& s = b.style;
   AutoMargins autos;
   auto border = [&](int i) {
@@ -63,34 +80,37 @@ LayoutContext::AutoMargins LayoutContext::resolve_edges(Box& b, LayoutUnit cb_wi
   b.border.right = border(1);
   b.border.bottom = border(2);
   b.border.left = border(3);
-  b.padding.top = max(length_or(s.padding[0], LayoutUnit()), LayoutUnit());
-  b.padding.right = max(length_or(s.padding[1], LayoutUnit()), LayoutUnit());
-  b.padding.bottom = max(length_or(s.padding[2], LayoutUnit()), LayoutUnit());
-  b.padding.left = max(length_or(s.padding[3], LayoutUnit()), LayoutUnit());
+  // (the percentages of paddings and margins, vertical ones too, are of the containing block's width)
+  b.padding.top = max(resolve_or(s.padding[0], b, false, LayoutUnit()), LayoutUnit());
+  b.padding.right = max(resolve_or(s.padding[1], b, false, LayoutUnit()), LayoutUnit());
+  b.padding.bottom = max(resolve_or(s.padding[2], b, false, LayoutUnit()), LayoutUnit());
+  b.padding.left = max(resolve_or(s.padding[3], b, false, LayoutUnit()), LayoutUnit());
   autos.top = s.margin[0].is_auto();
   autos.right = s.margin[1].is_auto();
   autos.bottom = s.margin[2].is_auto();
   autos.left = s.margin[3].is_auto();
-  b.margin.top = length_or(s.margin[0], LayoutUnit());
-  b.margin.right = length_or(s.margin[1], LayoutUnit());
-  b.margin.bottom = length_or(s.margin[2], LayoutUnit());
-  b.margin.left = length_or(s.margin[3], LayoutUnit());
+  b.margin.top = resolve_or(s.margin[0], b, false, LayoutUnit());
+  b.margin.right = resolve_or(s.margin[1], b, false, LayoutUnit());
+  b.margin.bottom = resolve_or(s.margin[2], b, false, LayoutUnit());
+  b.margin.left = resolve_or(s.margin[3], b, false, LayoutUnit());
   return autos;
 }
 
 LayoutUnit LayoutContext::clamp_content_width(const Box& b, LayoutUnit width) const {
   const Style& s = b.style;
   const LayoutUnit edges = s.sizing == BoxSizing::BorderBox ? b.border.horizontal() + b.padding.horizontal() : LayoutUnit();
-  if (s.max_width.is_px()) width = min(width, max(LayoutUnit::from_px100(s.max_width.px100) - edges, LayoutUnit()));
-  if (s.min_width.is_px()) width = max(width, max(LayoutUnit::from_px100(s.min_width.px100) - edges, LayoutUnit()));
+  LayoutUnit limit;
+  if (resolve_in(s.max_width, b, false, &limit)) width = min(width, max(limit - edges, LayoutUnit()));
+  if (resolve_in(s.min_width, b, false, &limit)) width = max(width, max(limit - edges, LayoutUnit()));
   return max(width, LayoutUnit());
 }
 
 LayoutUnit LayoutContext::clamp_content_height(const Box& b, LayoutUnit height) const {
   const Style& s = b.style;
   const LayoutUnit edges = s.sizing == BoxSizing::BorderBox ? b.border.vertical() + b.padding.vertical() : LayoutUnit();
-  if (s.max_height.is_px()) height = min(height, max(LayoutUnit::from_px100(s.max_height.px100) - edges, LayoutUnit()));
-  if (s.min_height.is_px()) height = max(height, max(LayoutUnit::from_px100(s.min_height.px100) - edges, LayoutUnit()));
+  LayoutUnit limit;
+  if (resolve_in(s.max_height, b, true, &limit)) height = min(height, max(limit - edges, LayoutUnit()));
+  if (resolve_in(s.min_height, b, true, &limit)) height = max(height, max(limit - edges, LayoutUnit()));
   return max(height, LayoutUnit());
 }
 
@@ -100,10 +120,11 @@ void LayoutContext::size_replaced(const Box& b, LayoutUnit* width, LayoutUnit* h
   const Style& s = b.style;
   const LayoutUnit h_edges = s.sizing == BoxSizing::BorderBox ? b.border.horizontal() + b.padding.horizontal() : LayoutUnit();
   const LayoutUnit v_edges = s.sizing == BoxSizing::BorderBox ? b.border.vertical() + b.padding.vertical() : LayoutUnit();
-  const bool has_w = s.width.is_px(), has_h = s.height.is_px();
+  LayoutUnit w, h;
+  const bool has_w = resolve_in(s.width, b, false, &w), has_h = resolve_in(s.height, b, true, &h);
   const bool ratio = b.has_natural_width && b.has_natural_height && b.natural_width > LayoutUnit() && b.natural_height > LayoutUnit();
-  LayoutUnit w = has_w ? max(LayoutUnit::from_px100(s.width.px100) - h_edges, LayoutUnit()) : LayoutUnit();
-  LayoutUnit h = has_h ? max(LayoutUnit::from_px100(s.height.px100) - v_edges, LayoutUnit()) : LayoutUnit();
+  w = has_w ? max(w - h_edges, LayoutUnit()) : LayoutUnit();
+  h = has_h ? max(h - v_edges, LayoutUnit()) : LayoutUnit();
   if (has_w && has_h) {
   } else if (has_w) {
     h = ratio ? w.scaled(b.natural_height.raw(), b.natural_width.raw()) : b.has_natural_height ? b.natural_height : LayoutUnit();
@@ -121,6 +142,8 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   BlockOutcome outcome;
   Box& b = tree_.box(id);
   const Style& s = b.style;
+  b.cb_height = request.cb_height;
+  b.cb_height_known = request.cb_height_known;
   const AutoMargins autos = resolve_edges(b, cb_width);
   const LayoutUnit bp_h = b.border.horizontal() + b.padding.horizontal();
   const LayoutUnit bp_v = b.border.vertical() + b.padding.vertical();
@@ -128,16 +151,15 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
 
   // --- the width (CSS 2.1 sections 10.3.3 and 10.3.5)
   LayoutUnit content_width;
-  LayoutUnit replaced_height;
+  LayoutUnit replaced_height, specified_width;
   const bool keyword_width = s.width.kind == Length::MinContent || s.width.kind == Length::MaxContent || s.width.kind == Length::FitContent;
   if (replaced) {
     size_replaced(b, &content_width, &replaced_height);
     if (request.forced) content_width = request.content_width;
   } else if (request.forced) {
     content_width = request.content_width;
-  } else if (s.width.is_px()) {
-    const LayoutUnit specified = LayoutUnit::from_px100(s.width.px100);
-    content_width = clamp_content_width(b, s.sizing == BoxSizing::BorderBox ? max(specified - bp_h, LayoutUnit()) : specified);
+  } else if (resolve_in(s.width, b, false, &specified_width)) {
+    content_width = clamp_content_width(b, s.sizing == BoxSizing::BorderBox ? max(specified_width - bp_h, LayoutUnit()) : specified_width);
   } else if (request.shrink || keyword_width) {
     LayoutUnit mn, mx;
     intrinsic_widths(id, &mn, &mx);
@@ -185,12 +207,28 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   }
 
   // --- the content
-  const bool height_auto = !s.height.is_px();
-  const LayoutUnit min_height = s.min_height.is_px() ? LayoutUnit::from_px100(s.min_height.px100) : LayoutUnit();
+  LayoutUnit specified_height;
+  const bool height_auto = !resolve_in(s.height, b, true, &specified_height);
+  const LayoutUnit min_height = resolve_or(s.min_height, b, true, LayoutUnit());
   const bool can_collapse_top = !b.establishes_bfc && !replaced && b.border.top.is_zero() && b.padding.top.is_zero();
   const bool can_collapse_bottom = !b.establishes_bfc && !replaced && b.border.bottom.is_zero() && b.padding.bottom.is_zero() && height_auto && min_height.is_zero();
   LayoutUnit content_height;
   ChildrenResult children;
+  // what the children's percentage heights are of: this box's height when it is given (the initial containing block for the root)
+  const bool saved_cb_known = child_cb_height_known_;
+  const LayoutUnit saved_cb_height = child_cb_height_;
+  if (b.kind == BoxKind::Root) {
+    child_cb_height_known_ = true;
+    child_cb_height_ = options_.viewport_height;
+  } else if (!height_auto && !replaced) {
+    child_cb_height_known_ = true;
+    child_cb_height_ = s.sizing == BoxSizing::BorderBox ? max(specified_height - bp_v, LayoutUnit()) : specified_height;
+  } else if (request.has_forced_height) {
+    child_cb_height_known_ = true;
+    child_cb_height_ = request.forced_height;
+  } else {
+    child_cb_height_known_ = false;
+  }
   b.baseline = LayoutUnit();
   b.has_baseline = false;
   if (replaced) {
@@ -203,6 +241,14 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
       b.baseline = b.content_top() + last.y + last.baseline;
       b.has_baseline = true;
     }
+  } else if (s.layout == browser::Layout::Flex || s.layout == browser::Layout::Grid || s.layout == browser::Layout::Table || s.column_count > 0 || s.column_width.is_px()) {
+    const bool known = child_cb_height_known_ && !height_auto;
+    const LayoutUnit given = known ? child_cb_height_ : LayoutUnit();
+    if (s.layout == browser::Layout::Flex) children = layout_flex(id, content_width, known, given);
+    else if (s.layout == browser::Layout::Grid) children = layout_grid(id, content_width, known, given);
+    else if (s.layout == browser::Layout::Table) children = layout_table(id, content_width, known, given);
+    else children = layout_columns(id, content_width, known, given);
+    content_height = children.height;
   } else {
     children = layout_block_children(id, content_width, can_collapse_top, can_collapse_bottom);
     content_height = children.height;
@@ -221,11 +267,10 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   floats_ = saved_floats;
   origin_x_ = saved_x;
   origin_y_ = saved_y;
+  child_cb_height_known_ = saved_cb_known;
+  child_cb_height_ = saved_cb_height;
   if (!replaced) {
-    if (!height_auto) {
-      const LayoutUnit specified = LayoutUnit::from_px100(s.height.px100);
-      content_height = s.sizing == BoxSizing::BorderBox ? max(specified - bp_v, LayoutUnit()) : specified;
-    }
+    if (!height_auto) content_height = s.sizing == BoxSizing::BorderBox ? max(specified_height - bp_v, LayoutUnit()) : specified_height;
     if (request.has_forced_height && height_auto) content_height = request.forced_height;
     content_height = clamp_content_height(b, content_height);
   }
@@ -243,18 +288,20 @@ BlockOutcome LayoutContext::layout_block(BoxId id, LayoutUnit cb_width, const Wi
   return outcome;
 }
 
-MarginPair LayoutContext::estimate_top_margin(BoxId id) {
+MarginPair LayoutContext::estimate_top_margin(BoxId id, LayoutUnit cb_width) {
   MarginPair m;
   const Box& b = tree_.box(id);
   const Style& s = b.style;
-  m.add(length_or(s.margin[0], LayoutUnit()));
+  LayoutUnit v;
+  if (resolve_with(s.margin[0], s, cb_width, true, &v)) m.add(v);
   if (b.establishes_bfc || b.kind == BoxKind::Replaced || b.inline_content) return m;
   const bool border = s.border_style[0] != BorderStyle::None && s.border_style[0] != BorderStyle::Hidden && s.border_px100[0] > 0;
-  if (border || length_or(s.padding[0], LayoutUnit()) != LayoutUnit()) return m;
+  LayoutUnit padding;
+  if (border || (resolve_with(s.padding[0], s, cb_width, true, &padding) && padding != LayoutUnit())) return m;
   for (uint64_t i = 0; i < b.children.count(); ++i) {
     const Box& c = tree_.box(b.children[i]);
     if (c.kind == BoxKind::Marker || c.floated || c.out_of_flow) continue;
-    if (c.is_block_level()) m.add(estimate_top_margin(b.children[i]));
+    if (c.is_block_level()) m.add(estimate_top_margin(b.children[i], b.content_width()));
     break;
   }
   return m;
@@ -265,6 +312,8 @@ void LayoutContext::place_float(BoxId float_id, BoxId container, LayoutUnit y) {
   WidthRequest request;
   request.shrink = true;
   request.available = width;
+  request.cb_height_known = child_cb_height_known_;
+  request.cb_height = child_cb_height_;
   layout_block(float_id, width, request);
   Box& f = tree_.box(float_id);
   const Box& cont = tree_.box(container);
@@ -305,7 +354,7 @@ ChildrenResult LayoutContext::layout_block_children(BoxId id, LayoutUnit content
     }
     // where the box will be, as far as can be told before it is laid out: its top edge after the margins that collapse into it
     MarginPair margin = pending;
-    margin.add(estimate_top_margin(child_id));
+    margin.add(estimate_top_margin(child_id, content_width));
     LayoutUnit y_local = (first && collapse_top) ? cursor : cursor + margin.sum();
     bool cleared = false;
     if (child.style.clear != browser::Clear::None) {   // clearance: the top edge goes below the floats it clears
@@ -326,7 +375,8 @@ ChildrenResult LayoutContext::layout_block_children(BoxId id, LayoutUnit content
         LayoutUnit l, r;
         floats_->band(content_top + y_local, LayoutUnit::from_raw(1), content_left, content_left + content_width, &l, &r);
         if (r - l >= content_width) break;
-        if (!child.style.width.is_px() || atomic_outer_width(child_id, true) <= r - l) {
+        LayoutUnit given;
+        if (!resolve_with(child.style.width, child.style, content_width, true, &given) || atomic_outer_width(child_id, true) <= r - l) {
           width_for_child = r - l;
           shift = l - content_left;
           break;
@@ -340,6 +390,8 @@ ChildrenResult LayoutContext::layout_block_children(BoxId id, LayoutUnit content
       }
     }
     WidthRequest request;
+    request.cb_height_known = child_cb_height_known_;
+    request.cb_height = child_cb_height_;
     request.bfc_x = content_left + shift;
     request.bfc_y = content_top + y_local;
     const BlockOutcome o = layout_block(child_id, width_for_child, request);

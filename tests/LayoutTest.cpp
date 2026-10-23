@@ -24,6 +24,7 @@
 #include "Browser/Renderer.hpp"
 #include "Dom/HtmlBuilder.hpp"
 #include "Layout/BoxBuilder.hpp"
+#include "Layout/FontMeasurer.hpp"
 #include "Layout/Layout.hpp"
 
 using namespace layout;
@@ -39,6 +40,7 @@ struct TestAllocator final : allocators::IAllocator {
 };
 
 static TestAllocator g_alloc;
+static font::FontSet* g_fonts = nullptr;   // the bundled fonts (made in main)
 
 // Every <img> is 100x50 and ready.
 struct FakeObjects final : browser::IObjectSource {
@@ -57,11 +59,12 @@ struct Laid {
   dom::Document doc;
   browser::StyleSheet sheet;
   BoxTree tree;
-  FixedWidthMeasurer measurer;
+  FixedWidthMeasurer fixed_measurer;
+  UniquePointer<FontMeasurer> font_measurer;
   FakeObjects objects;
   bool ok = false;
 
-  explicit Laid(const char* html, int width = 800) : doc(g_alloc), sheet(g_alloc), tree(g_alloc) {
+  explicit Laid(const char* html, int width = 800, bool real_fonts = false) : doc(g_alloc), sheet(g_alloc), tree(g_alloc) {
     dom::build_document(doc, html, nullptr);
     browser::RenderOptions render;
     render.media.width = width;
@@ -73,7 +76,9 @@ struct Laid {
     LayoutOptions options;
     options.viewport_width = LayoutUnit::from_px(width);
     options.viewport_height = LayoutUnit::from_px(600);
-    options.measurer = &measurer;
+    if (real_fonts) font_measurer = UniquePointer<FontMeasurer>::make(g_alloc, *g_fonts, &sheet);
+    options.measurer = real_fonts ? static_cast<ITextMeasurer*>(font_measurer.get()) : &fixed_measurer;
+    options.sheet = &sheet;
     ok = build_box_tree(doc, sheet, build, &tree) && layout_tree(tree, options);
   }
   // The box of the element with this id (kNoBox if there is none).
@@ -386,6 +391,67 @@ static void test_positioning() {
   CHECK(i.abs_x("k") == 0 && i.at("k").out_of_flow && !i.at("k").floated);
 }
 
+static void test_percentages() {
+  // widths, margins and paddings are of the containing block's width, nested ones of their own parent's
+  Laid a(page("<div id=p style='width:200px'><div id=c style='width:50%;height:10px'></div></div><div id=d style='width:50%;height:10px'></div>").c_str());
+  CHECK(px(a.at("c").width) == 100 && px(a.at("d").width) == 400);
+  Laid b(page("<div style='width:200px'><div id=c style='padding:10%;margin-left:5%;height:10px'></div></div>").c_str());
+  CHECK(px(b.at("c").width) == 190 - 0 && b.abs_x("c") == 10 && px(b.at("c").height) == 10 + 40);   // 5% margin, 10% padding on every side (of 200px)
+  // percentage heights need a given height above; without one they act as auto
+  Laid c(page("<div style='height:200px'><div id=k style='height:50%'></div></div><div><div id=n style='height:50%'>x</div></div>").c_str());
+  CHECK(px(c.at("k").height) == 100 && px(c.at("n").height) == 16);
+  // html and body at 100% fill the viewport
+  Laid d(page("<div id=k style='height:100%'></div>", "html,body{height:100%}").c_str());
+  CHECK(px(d.at("k").height) == 600);
+  // min and max in percent
+  Laid e(page("<div id=a style='width:10%;min-width:25%;height:5px'></div><div id=b style='max-width:25%;height:5px'></div>").c_str());
+  CHECK(px(e.at("a").width) == 200 && px(e.at("b").width) == 200);
+  // calc() with a percentage
+  Laid f(page("<div id=a style='width:calc(100% - 20px);height:5px'></div><div id=b style='width:min(50%, 100px);height:5px'></div>").c_str());
+  CHECK(px(f.at("a").width) == 780 && px(f.at("b").width) == 100);
+  // insets of positioned boxes are percentages of the containing block
+  Laid g(page("<div style='position:relative;width:400px;height:200px'><div id=k style='position:absolute;left:10%;top:50%;width:20%;height:10%'></div></div>").c_str());
+  CHECK(g.abs_x("k") == 40 && g.abs_y("k") == 100 && px(g.at("k").width) == 80 && px(g.at("k").height) == 20);
+  // a picture's percentage width keeps its shape
+  Laid h(page("<div style='width:300px'><img id=i style='width:50%'></div>").c_str());
+  CHECK(px(h.at("i").width) == 150 && px(h.at("i").height) == 75);
+  // text-indent in percent
+  Laid i(page("<div id=a style='width:200px;text-indent:10%'>ab</div>").c_str());
+  CHECK(px(i.at("a").fragments[0].x) == 20);
+  // a percentage width inside a shrink-to-fit box (a cycle) acts as auto: the box is as wide as its content
+  Laid j(page("<div style='width:500px'><span id=s style='display:inline-block'><div style='width:50%'>abcd</div></span></div>").c_str());
+  CHECK(px(j.at("s").width) == 32);
+}
+
+static void test_real_fonts() {
+  const std::string css_sans = "div{font-family:sans-serif}";
+  auto laid = [&](const char* body, int width = 800) { return std::string(kReset) + "<style>" + css_sans + "</style>" + body + std::string(width ? "" : ""); };
+  // proportional text: narrow letters take less room than wide ones
+  Laid a(laid("<div><span id=n>iiiiiiii</span> <span id=w>mmmmmmmm</span></div><div id=m style='width:400px;font-family:monospace'>iiiiiiii mmmmmmmm</div>").c_str(), 800, true);
+  CHECK(a.ok);
+  const Box& d0 = a.tree.box(a.tree.box(a.box("n")).parent);
+  CHECK(d0.lines.count() == 1 && d0.fragments.count() >= 3);
+  CHECK(d0.fragments[0].width < d0.fragments[d0.fragments.count() - 1].width);   // "iiiiiiii" is narrower than "mmmmmmmm"
+  // a monospaced font gives every letter the same width
+  const Box& mono = a.at("m");
+  CHECK(mono.fragments.count() == 1 && px(mono.lines[0].width) % 17 >= 0);
+  // the height of a line is the font's: about 1.15 em for the sans, so a 16px line is 18 or 19px and a 32px line twice that
+  Laid b(laid("<div id=a>x</div><div id=b style='font-size:32px'>x</div>").c_str(), 800, true);
+  CHECK(px(b.at("a").height) >= 17 && px(b.at("a").height) <= 19);
+  CHECK(px(b.at("b").height) >= 36 && px(b.at("b").height) <= 38);
+  // bold is wider than regular, and wrapping follows the real widths
+  Laid c(laid("<div><span id=r>Hamburgefonstiv</span></div><div><b id=bd>Hamburgefonstiv</b></div>").c_str(), 800, true);
+  CHECK(c.at("r").children.count() == 1);
+  Laid w1(laid("<div id=a style='display:inline-block'>Hamburgefonstiv</div>").c_str(), 800, true);
+  Laid w2(laid("<div id=a style='display:inline-block;font-weight:700'>Hamburgefonstiv</div>").c_str(), 800, true);
+  CHECK(w2.at("a").width > w1.at("a").width);
+  Laid w3(laid("<div id=a style='width:60px'>aa bb cc dd ee ff gg hh</div>").c_str(), 800, true);
+  CHECK(w3.at("a").lines.count() >= 4 && px(w3.at("a").lines[0].width) <= 60);
+  // non-ASCII text keeps its characters (the fallback fonts have them)
+  Laid x(laid("<div id=a style='display:inline-block'>caf\xC3\xA9 \xCE\xB1\xCE\xB2</div>").c_str(), 800, true);
+  CHECK(x.at("a").width > LayoutUnit());
+}
+
 static void test_robustness() {
   // deep nesting and empty pages do not crash; a page with no body still lays out
   std::string deep;
@@ -400,6 +466,10 @@ static void test_robustness() {
 }
 
 int main() {
+  {
+  font::FontSet fonts(g_alloc);
+  fonts.add_bundled_fonts();
+  g_fonts = &fonts;
   test_block_stacking_and_sizes();
   test_margin_collapsing();
   test_inline_layout();
@@ -409,7 +479,11 @@ int main() {
   test_intrinsic_sizes();
   test_floats();
   test_positioning();
+  test_percentages();
+  test_real_fonts();
   test_robustness();
+  g_fonts = nullptr;
+  }
   CHECK(g_alloc.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

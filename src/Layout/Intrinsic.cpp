@@ -32,7 +32,7 @@ void LayoutContext::intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUn
     *max_content = b.max_content;
     return;
   }
-  resolve_edges(b, LayoutUnit());
+  resolve_edges(b, LayoutUnit(), false);
   LayoutUnit lo, hi;
   if (b.kind == BoxKind::Replaced) {
     LayoutUnit w, h;
@@ -92,14 +92,12 @@ void LayoutContext::intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUn
       const BoxId cid = b.children[i];
       Box& c = tree_.box(cid);
       if (c.kind == BoxKind::Marker || c.out_of_flow) continue;
-      resolve_edges(c, LayoutUnit());
+      resolve_edges(c, LayoutUnit(), false);
       LayoutUnit cmin, cmax;
       intrinsic_widths(cid, &cmin, &cmax);
       const LayoutUnit bp = c.border.horizontal() + c.padding.horizontal();
-      if (c.style.width.is_px()) {
-        const LayoutUnit specified = LayoutUnit::from_px100(c.style.width.px100);
-        cmin = cmax = c.style.sizing == BoxSizing::BorderBox ? max(specified - bp, LayoutUnit()) : specified;
-      }
+      LayoutUnit specified;
+      if (resolve_in(c.style.width, c, false, &specified)) cmin = cmax = c.style.sizing == BoxSizing::BorderBox ? max(specified - bp, LayoutUnit()) : specified;
       cmin = clamp_content_width(c, cmin);
       cmax = clamp_content_width(c, cmax);
       const LayoutUnit extra = bp + c.margin.horizontal();
@@ -117,14 +115,13 @@ void LayoutContext::intrinsic_widths(BoxId id, LayoutUnit* min_content, LayoutUn
 
 LayoutUnit LayoutContext::atomic_outer_width(BoxId id, bool max_content) {
   Box& b = tree_.box(id);
-  resolve_edges(b, LayoutUnit());
+  resolve_edges(b, LayoutUnit(), false);
   const LayoutUnit bp = b.border.horizontal() + b.padding.horizontal();
   LayoutUnit w;
   if (b.kind == BoxKind::Replaced) {
     LayoutUnit h;
     size_replaced(b, &w, &h);
-  } else if (b.style.width.is_px()) {
-    const LayoutUnit specified = LayoutUnit::from_px100(b.style.width.px100);
+  } else if (LayoutUnit specified; resolve_in(b.style.width, b, false, &specified)) {
     w = clamp_content_width(b, b.style.sizing == BoxSizing::BorderBox ? max(specified - bp, LayoutUnit()) : specified);
   } else {
     LayoutUnit mn, mx;

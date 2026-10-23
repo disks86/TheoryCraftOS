@@ -1411,7 +1411,7 @@ uint32_t longhands_of(Prop p, Prop* out) {
 void copy_property(Prop p, const Style& from, Style* to) {
   switch (p) {
     case pColor: to->color = from.color; break;
-    case pBackgroundColor: to->own_background = from.own_background; to->own_background_color = from.own_background_color; break;
+    case pBackgroundColor: to->own_background = from.own_background; to->own_background_color = from.own_background_color; to->background_argb = from.background_argb; break;
     case pFontSize: to->font_px = from.font_px; break;
     case pFontWeight: to->bold = from.bold; to->font_weight = from.font_weight; break;
     case pFontStyle: to->italic = from.italic; break;
@@ -1434,7 +1434,7 @@ void copy_property(Prop p, const Style& from, Style* to) {
     case pRight: to->inset[1] = from.inset[1]; break;
     case pBottom: to->inset[2] = from.inset[2]; break;
     case pLeft: to->inset[3] = from.inset[3]; break;
-    case pZIndex: to->z_index = from.z_index; break;
+    case pZIndex: to->z_index = from.z_index; to->z_index_auto = from.z_index_auto; break;
     case pFloat: to->float_side = from.float_side; break;
     case pClear: to->clear = from.clear; break;
     case pOverflowX: to->overflow_x = from.overflow_x; break;
@@ -2890,6 +2890,13 @@ struct CssApply {
     return ctx;
   }
 
+  // The colour with its alpha kept (for the pixel engine's backgrounds).
+  bool parse_color_alpha(StringView v, uint32_t* out) const {
+    if (eq(v.trimmed(), "currentcolor")) { *out = style->color; return true; }
+    if (is_modern_color_function(v.trimmed())) return color_value(v, color_context(), 0, out);
+    return parse_css_color_alpha(v, out);
+  }
+
   bool parse_color(StringView v, uint32_t* out) const {
     if (eq(v.trimmed(), "currentcolor")) { *out = style->color; return true; }
     if (is_modern_color_function(v.trimmed())) {
@@ -3206,6 +3213,7 @@ void CssApply::apply_value(Prop p, StringView value) {
       if (parse_color(value, &c)) {
         style->own_background = true;
         style->own_background_color = c;
+        style->background_argb = parse_color_alpha(value, &c) ? c : style->own_background_color;
       }
       break;
     case pBackground: {
@@ -3221,6 +3229,8 @@ void CssApply::apply_value(Prop p, StringView value) {
         if (parse_color(part, &c)) {
           style->own_background = true;
           style->own_background_color = c;
+          uint32_t argb;
+          style->background_argb = parse_color_alpha(part, &argb) ? argb : c;
           found = true;
         }
       }
@@ -3228,9 +3238,11 @@ void CssApply::apply_value(Prop p, StringView value) {
         // (no colour given: the background colour goes back to transparent)
         style->own_background = true;
         style->own_background_color = 0;
+        style->background_argb = 0;
       } else if (!found) {
         style->own_background = true;
         style->own_background_color = 0;
+        style->background_argb = 0;
       }
       break;
     }
@@ -3352,8 +3364,8 @@ void CssApply::apply_value(Prop p, StringView value) {
     case pInset: four_sides(value, pTop, true); break;
     case pZIndex: {
       double n;
-      if (eq(value, "auto")) style->z_index = 0;
-      else if (evaluate_number(value, eval, &n)) style->z_index = static_cast<int32_t>(n);
+      if (eq(value, "auto")) { style->z_index = 0; style->z_index_auto = true; }
+      else if (evaluate_number(value, eval, &n)) { style->z_index = static_cast<int32_t>(n); style->z_index_auto = false; }
       break;
     }
     case pFloat:

@@ -109,6 +109,9 @@ class LayoutContext {
     // The content height is given (an absolutely positioned box with top and bottom and an auto height).
     bool has_forced_height = false;
     LayoutUnit forced_height;
+    // The height of the containing block when it is definite (what a percentage height is of).
+    bool cb_height_known = false;
+    LayoutUnit cb_height;
   };
   struct AutoMargins {
     bool top = false, right = false, bottom = false, left = false;
@@ -117,7 +120,7 @@ class LayoutContext {
   // --- Layout.cpp
   BlockOutcome layout_block(BoxId id, LayoutUnit cb_width, const WidthRequest& request);
   ChildrenResult layout_block_children(BoxId id, LayoutUnit content_width, bool collapse_top, bool collapse_bottom);
-  AutoMargins resolve_edges(Box& box, LayoutUnit cb_width);
+  AutoMargins resolve_edges(Box& box, LayoutUnit cb_width, bool cb_known = true);
   void size_replaced(const Box& box, LayoutUnit* width, LayoutUnit* height) const;
   void place_marker(BoxId item);
   // Lays out a floated box shrink-to-fit inside the container `container` and puts it as high as the float rules allow, not above `y` (in the
@@ -125,7 +128,7 @@ class LayoutContext {
   void place_float(BoxId float_id, BoxId container, LayoutUnit y);
   // The margin the box's top edge will have once it is collapsed with its first child's and so on down (a cheap guess made before the box is laid
   // out, so that the floats inside it can be placed at the right height).
-  MarginPair estimate_top_margin(BoxId id);
+  MarginPair estimate_top_margin(BoxId id, LayoutUnit cb_width);
   // Positioning (CSS 2.1 section 9.3): relative boxes move after they are placed; absolute and fixed boxes are laid out when their containing block
   // (the nearest positioned ancestor, or the viewport) is done.
   void apply_relative(Box& box);
@@ -133,8 +136,29 @@ class LayoutContext {
   void layout_absolutes(BoxId containing_block);
   void layout_absolute(const PendingAbsolute& pending);
   LayoutUnit offset_in(BoxId from, BoxId ancestor, bool horizontal) const;
+  // A length worked out against what its percentages are of (`base`, if `known`). False for auto, the keywords, and a percentage of something not
+  // known (it then acts as auto).
+  bool resolve_with(const browser::Length& length, const browser::Style& style, LayoutUnit base, bool known, LayoutUnit* out) const;
+  // The same for a box's own lengths: widths, margins, paddings and left/right of the box's containing block width; heights and top/bottom of its height.
+  bool resolve_in(const browser::Length& length, const Box& box, bool vertical, LayoutUnit* out) const {
+    return resolve_with(length, box.style, vertical ? box.cb_height : box.cb_width, vertical ? box.cb_height_known : box.cb_width_known, out);
+  }
+  LayoutUnit resolve_or(const browser::Length& length, const Box& box, bool vertical, LayoutUnit fallback) const {
+    LayoutUnit v;
+    return resolve_in(length, box, vertical, &v) ? v : fallback;
+  }
   LayoutUnit clamp_content_width(const Box& box, LayoutUnit width) const;
   LayoutUnit clamp_content_height(const Box& box, LayoutUnit height) const;
+
+  // --- Flex.cpp, Grid.cpp, Table.cpp, Multicol.cpp: how a box lays out its children when it is not an ordinary block. Each is called from layout_block with the
+  // box's content width (its borders, padding and own width worked out) and, when the height is given, that height (height_known); it positions the
+  // children (their x, y relative to the box's border box, as layout_block_children does), sets the baseline of the box if it has one, and returns the
+  // height of the content. The box starts a formatting context of its own, so no margins collapse through it. Until they are written they lay the
+  // children out as blocks.
+  ChildrenResult layout_flex(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
+  ChildrenResult layout_grid(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
+  ChildrenResult layout_table(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
+  ChildrenResult layout_columns(BoxId id, LayoutUnit content_width, bool height_known, LayoutUnit height);
 
   // --- Inline.cpp
   // Lays out the inline content of a block container into lines; returns the height of the lines.
@@ -153,13 +177,13 @@ class LayoutContext {
   ITextMeasurer& measurer_;
   bool failed_ = false;
   List<PendingAbsolute> pending_abs_;
+  bool child_cb_height_known_ = false;       // the height of the box being laid out, when it is definite: what its children's percentage heights are of
+  LayoutUnit child_cb_height_;
   FloatContext* floats_ = nullptr;           // the floats of the block formatting context being laid out
   LayoutUnit origin_x_, origin_y_;           // the border box of the box being laid out, in that context's coordinates
 
   friend struct InlineCollector;
 };
 
-// A length in pixels, or `fallback` for auto and the keywords (percentages come with the style work: until then Length holds none).
-inline LayoutUnit length_or(const browser::Length& l, LayoutUnit fallback) { return l.is_px() ? LayoutUnit::from_px100(l.px100) : fallback; }
 
 }  // namespace layout

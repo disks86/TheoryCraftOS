@@ -31,8 +31,11 @@ void LayoutContext::apply_relative(Box& b) {
   if (b.style.position != Position::Relative && b.style.position != Position::Sticky) return;
   if (b.style.position == Position::Sticky) return;   // (a sticky box sits where the flow puts it until scrolling is involved)
   const browser::Style& s = b.style;
-  const LayoutUnit dx = s.inset[3].is_px() ? length_or(s.inset[3], LayoutUnit()) : s.inset[1].is_px() ? -length_or(s.inset[1], LayoutUnit()) : LayoutUnit();
-  const LayoutUnit dy = s.inset[0].is_px() ? length_or(s.inset[0], LayoutUnit()) : s.inset[2].is_px() ? -length_or(s.inset[2], LayoutUnit()) : LayoutUnit();
+  LayoutUnit v, dx, dy;
+  if (resolve_in(s.inset[3], b, false, &v)) dx = v;
+  else if (resolve_in(s.inset[1], b, false, &v)) dx = -v;
+  if (resolve_in(s.inset[0], b, true, &v)) dy = v;
+  else if (resolve_in(s.inset[2], b, true, &v)) dy = -v;
   b.x += dx;
   b.y += dy;
 }
@@ -99,16 +102,20 @@ void LayoutContext::layout_absolute(const PendingAbsolute& pending) {
   const LayoutUnit static_x = pending.static_x + offset_in(pending.container, pending.containing_block, true);
   const LayoutUnit static_y = pending.static_y + offset_in(pending.container, pending.containing_block, false);
 
-  const bool left_auto = !s.inset[3].is_px(), right_auto = !s.inset[1].is_px(), top_auto = !s.inset[0].is_px(), bottom_auto = !s.inset[2].is_px();
-  const LayoutUnit left = length_or(s.inset[3], LayoutUnit()), right = length_or(s.inset[1], LayoutUnit());
-  const LayoutUnit top = length_or(s.inset[0], LayoutUnit()), bottom = length_or(s.inset[2], LayoutUnit());
+  // (insets are percentages of the containing block's padding box)
+  LayoutUnit left, right, top, bottom;
+  const bool left_auto = !resolve_with(s.inset[3], s, cb_w, true, &left), right_auto = !resolve_with(s.inset[1], s, cb_w, true, &right);
+  const bool top_auto = !resolve_with(s.inset[0], s, cb_h, true, &top), bottom_auto = !resolve_with(s.inset[2], s, cb_h, true, &bottom);
 
+  p.cb_height = cb_h;
+  p.cb_height_known = true;
   AutoMargins autos = resolve_edges(p, cb_w);
   const LayoutUnit bp_h = p.border.horizontal() + p.padding.horizontal();
   const LayoutUnit bp_v = p.border.vertical() + p.padding.vertical();
   const LayoutUnit fixed_ml = autos.left ? LayoutUnit() : p.margin.left, fixed_mr = autos.right ? LayoutUnit() : p.margin.right;
   const LayoutUnit fixed_mt = autos.top ? LayoutUnit() : p.margin.top, fixed_mb = autos.bottom ? LayoutUnit() : p.margin.bottom;
-  const bool width_auto = !s.width.is_px() && !replaced;
+  LayoutUnit specified_width, specified_height;
+  const bool width_auto = !resolve_with(s.width, s, cb_w, true, &specified_width) && !replaced;
 
   // the width (CSS 2.1 section 10.3.7)
   WidthRequest request;
@@ -117,8 +124,7 @@ void LayoutContext::layout_absolute(const PendingAbsolute& pending) {
     LayoutUnit h;
     size_replaced(p, &request.content_width, &h);
   } else if (!width_auto) {
-    const LayoutUnit specified = LayoutUnit::from_px100(s.width.px100);
-    request.content_width = clamp_content_width(p, s.sizing == BoxSizing::BorderBox ? max(specified - bp_h, LayoutUnit()) : specified);
+    request.content_width = clamp_content_width(p, s.sizing == BoxSizing::BorderBox ? max(specified_width - bp_h, LayoutUnit()) : specified_width);
   } else if (!left_auto && !right_auto) {
     request.content_width = clamp_content_width(p, max(cb_w - left - right - fixed_ml - fixed_mr - bp_h, LayoutUnit()));
   } else {
@@ -128,11 +134,13 @@ void LayoutContext::layout_absolute(const PendingAbsolute& pending) {
     request.content_width = clamp_content_width(p, min(max(mn, available), mx));
   }
   // the height: both top and bottom given and the height auto makes the box as high as the room between them
-  const bool height_auto = !s.height.is_px() && !replaced;
+  const bool height_auto = !resolve_with(s.height, s, cb_h, true, &specified_height) && !replaced;
   if (height_auto && !top_auto && !bottom_auto) {
     request.has_forced_height = true;
     request.forced_height = max(cb_h - top - bottom - fixed_mt - fixed_mb - bp_v, LayoutUnit());
   }
+  request.cb_height_known = true;
+  request.cb_height = cb_h;
   layout_block(pending.box, cb_w, request);
   autos = resolve_edges(p, cb_w);   // (layout_block's own pass zeroed the auto margins; they are decided here)
 

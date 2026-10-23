@@ -79,6 +79,7 @@ void ua_defaults(const dom::Node* n, Style* s) {
   if (tag_in(n, {"body", "html", "table", "tr", "td", "th"}) && dom::get_attribute(n, "bgcolor", &value) && parse_css_color(value, &color)) {
     s->own_background = true;
     s->own_background_color = color;
+    s->background_argb = color;
   }
 }
 

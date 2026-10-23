@@ -275,6 +275,7 @@ struct Style {
   uint8_t width_pct = 0;                        // width as a percentage of the line (0: not a percentage)
   bool own_background = false;                 // this element set the background
   uint32_t own_background_color = 0;           // what it set (for the page's background on <body>)
+  uint32_t background_argb = 0;                // the same colour with its alpha kept (own_background_color shows a colour that is mostly transparent as none): what the pixel engine paints
   bool opaque_zero = false;                    // opacity: 0 (nothing is seen, the space is kept)
 
   // the box
@@ -292,6 +293,7 @@ struct Style {
   bool text_ellipsis = false;
   uint8_t vertical_align = 0;                  // 0 baseline, 1 top, 2 middle, 3 bottom
   int32_t z_index = 0;
+  bool z_index_auto = true;                    // z-index: auto (a positioned box with an integer z-index, 0 included, makes a stacking context; with auto it does not)
   Length inset[4];            // top, right, bottom, left
   // flex and grid
   FlexDirection flex_direction = FlexDirection::Row;
@@ -328,6 +330,7 @@ struct Style {
     s.width_pct = 0;
     s.own_background = false;
     s.own_background_color = 0;
+    s.background_argb = 0;
     s.opaque_zero = false;
     s.width = s.height = s.min_width = s.min_height = Length();
     s.max_width = s.max_height = Length::of(Length::None);
@@ -347,6 +350,7 @@ struct Style {
     s.text_ellipsis = false;
     s.vertical_align = 0;
     s.z_index = 0;
+    s.z_index_auto = true;
     s.flex_direction = FlexDirection::Row;
     s.flex_wrap = FlexWrap::NoWrap;
     s.justify_content = s.align_items = s.align_content = s.justify_items = Place::Normal;

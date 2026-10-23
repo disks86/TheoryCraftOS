@@ -282,7 +282,9 @@ LayoutUnit LayoutContext::layout_inline_content(BoxId id, LayoutUnit content_wid
   }
   const WhiteSpace ws(style);
   const uint64_t n = tokens.count();
-  const LayoutUnit indent = LayoutUnit::from_px100(style.text_indent_px100);
+  // (a percentage text-indent is of the container's own content width)
+  LayoutUnit indent = LayoutUnit::from_px100(style.text_indent_px100);
+  if (style.text_indent.has_percent()) resolve_with(style.text_indent, style, content_width, true, &indent);
   // the container's content box in the coordinates of the block formatting context (where floats are kept)
   const LayoutUnit content_left = origin_x_ + c.content_left();
   const LayoutUnit content_top = origin_y_ + c.content_top();

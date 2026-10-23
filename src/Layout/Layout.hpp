@@ -32,6 +32,7 @@ struct LayoutOptions {
   LayoutUnit viewport_width = LayoutUnit::from_px(800);
   LayoutUnit viewport_height = LayoutUnit::from_px(600);
   ITextMeasurer* measurer = nullptr;   // required
+  const browser::StyleSheet* sheet = nullptr;   // for lengths that are expressions (min(50%, 400px)); without it their absolute part is used
 };
 
 // Lays out the whole tree. The root box is as wide as the viewport and as high as the page. False if memory ran out or no measurer was given.
