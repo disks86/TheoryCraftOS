@@ -60,7 +60,7 @@ struct Thread {
   WaitList joiners;
 };
 
-constexpr uint32_t kDefaultStackBytes = 64 * 1024;
+constexpr uint32_t kDefaultStackBytes = 8 * 1024 * 1024;   // (what Linux gives a thread; reading a big web page and running its scripts is deep)
 
 using ThreadFunction = void (*)(void* argument);
 
