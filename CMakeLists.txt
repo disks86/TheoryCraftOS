@@ -485,6 +485,7 @@ add_executable(BOOTX64
   src/Hardware/Printer/Usb/UsbPrinter.cpp
   src/Hardware/VideoCodec/Software/JpegDecoder.cpp
   src/Hardware/VideoCodec/Software/H264Syntax.cpp
+  src/Hardware/VideoCodec/Software/H264Parser.cpp
   src/Hardware/VideoCodec/Software/H264Encoder.cpp
   src/Hardware/VideoCodec/Software/H264Macroblock.cpp
   src/Hardware/VideoCodec/Software/H264Cabac.cpp

@@ -264,6 +264,58 @@ struct MbCtx {
   int8_t alpha_off, beta_off;
 };
 
+// The sequence and picture parameter sets seen so far, and the parsing of them and of slice headers (which depend on them). Shared by the
+// decoder (Core) and by H264StreamParser, which hands the parsed syntax to a hardware decode engine.
+class ParameterSets {
+ public:
+  Sps sps[32];
+  Pps pps[256];
+  uint8_t raw_present[256] = {};  // per PPS: which scaling lists it sent (bit per list)
+  uint8_t raw_default[256] = {};  // per PPS: which of those say "use the default"
+
+  bool parse_sps(BitReader& br);
+  bool parse_pps(BitReader& br);
+  bool parse_slice_header(BitReader& br, SliceHeader* sh) const;
+  // 7.4.1.2.4: does slice `b` start a new picture after slice `a`? (`sps` is the active sequence parameter set.)
+  static bool new_picture(const Sps& sps, const SliceHeader& a, const SliceHeader& b);
+};
+
+// Removes the emulation prevention bytes of a NAL unit (not its header byte) into `out`, which must hold `size` bytes. Returns the length.
+uint64_t remove_emulation_prevention(const uint8_t* nal, uint64_t size, uint8_t* out);
+
+// Calls `visit(const uint8_t* nal, uint64_t size)` for every NAL unit in `data`: length-prefixed (`nal_length_size` 1-4) or, when it is 0, Annex B.
+template <class F>
+void for_each_nal(ConstByteView data, int nal_length_size, F&& visit) {
+  const uint8_t* d = data.data();
+  const uint64_t n = data.size();
+  if (nal_length_size > 0) {
+    uint64_t pos = 0;
+    while (pos + static_cast<uint64_t>(nal_length_size) <= n) {
+      uint64_t len = 0;
+      for (int i = 0; i < nal_length_size; ++i) len = (len << 8) | d[pos + static_cast<uint64_t>(i)];
+      pos += static_cast<uint64_t>(nal_length_size);
+      if (len == 0 || len > n - pos) break;
+      visit(d + pos, len);
+      pos += len;
+    }
+    return;
+  }
+  auto find_start = [&](uint64_t from) -> uint64_t {
+    for (uint64_t k = from; k + 3 <= n; ++k)
+      if (d[k] == 0 && d[k + 1] == 0 && d[k + 2] == 1) return k;
+    return n;
+  };
+  uint64_t i = find_start(0);
+  while (i < n) {
+    const uint64_t begin = i + 3;
+    const uint64_t next = find_start(begin);
+    uint64_t end = next;
+    while (end > begin && d[end - 1] == 0) --end;  // trailing_zero_8bits and the zero of a four-byte start code
+    if (end > begin) visit(d + begin, end - begin);
+    i = next;
+  }
+}
+
 class Core {
  public:
   explicit Core(allocators::IAllocator& allocator) : allocator_(allocator) {}
@@ -280,9 +332,6 @@ class Core {
  private:
   // --- H264Syntax.cpp
   bool handle_nal(const uint8_t* nal, uint64_t size, int64_t pts);
-  bool parse_sps(BitReader& br);
-  bool parse_pps(BitReader& br);
-  bool parse_slice_header(BitReader& br, SliceHeader* sh);
   bool new_picture(const SliceHeader& a, const SliceHeader& b) const;
   bool start_picture(const SliceHeader& sh, int64_t pts);
   void finish_picture();
@@ -371,10 +420,7 @@ class Core {
 
   allocators::IAllocator& allocator_;
 
-  Sps sps_[32];
-  Pps pps_[256];
-  uint8_t pps_raw_present_[256] = {};
-  uint8_t pps_raw_default_[256] = {};
+  ParameterSets ps_;
   const Sps* sp_ = nullptr;   // the active sequence parameter set
   const Pps* pp_ = nullptr;
   int nal_length_size_ = 0;   // 0: Annex B

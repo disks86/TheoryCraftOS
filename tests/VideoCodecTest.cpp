@@ -25,6 +25,7 @@
 #include "Hardware/VideoCodec/ColorConvert.hpp"
 #include "Hardware/VideoCodec/Software/H264.hpp"
 #include "Hardware/VideoCodec/Software/H264Encoder.hpp"
+#include "Hardware/VideoCodec/Software/H264Parser.hpp"
 #include "Hardware/VideoCodec/Software/Jpeg.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
@@ -491,6 +492,88 @@ static void test_system_list() {
     CHECK(!system.create_encoder(ec));
     system.shutdown();
     CHECK(system.count() == 0);
+  }
+  CHECK(a.live == 0);
+}
+
+static void make_moving_i420(VideoFrameBuffer& b, uint32_t w, uint32_t h, int t);
+
+// The H.264 stream parser: the syntax of a stream the encoder made, without decoding a picture.
+static void test_h264_parser() {
+  TestAllocator a;
+  {
+    H264Encoder enc(a);
+    CHECK(enc.configure(64, 48, 25, 1, 85, 3));  // a keyframe every third picture
+    ByteBuffer stream(a);
+    VideoFrameBuffer picture(a);
+    std::vector<uint64_t> ends;
+    for (int t = 0; t < 7; ++t) {
+      make_moving_i420(picture, 64, 48, t);
+      bool key;
+      CHECK(enc.encode(picture.frame(), false, &stream, &key));
+      ends.push_back(stream.size());
+    }
+    H264StreamParser parser(a);
+    List<H264Slice> slices(a);
+    uint64_t begin = 0;
+    for (size_t i = 0; i < ends.size(); ++i) {
+      const ConstByteView unit = stream.view().subview(begin, ends[i] - begin);
+      begin = ends[i];
+      CHECK(parser.parse(unit, &slices));
+      CHECK(slices.count() == 1 && slices[0].starts_picture);  // one slice per picture, each a new picture
+      const H264Slice& s = slices[0];
+      CHECK(s.header.idr() == (i % 3 == 0) && s.header.type == (i % 3 == 0 ? h264::kSliceI : h264::kSliceP));
+      const h264::Sps* sps = parser.sps_for(s.header);
+      const h264::Pps* pps = parser.pps_for(s.header);
+      CHECK(sps && pps && sps->mb_w == 4 && sps->mb_h == 3 && !pps->cabac);
+      CHECK(s.nal_offset < unit.size() && s.nal_size <= unit.size() - s.nal_offset);
+      CHECK(s.data_bit_offset > 8 && s.data_bit_offset <= s.nal_size * 8);
+      CHECK(s.header.slice_qp >= 0 && s.header.slice_qp <= 51);
+    }
+    // The same slices split across calls, or fed twice, keep the picture boundaries: a second slice of the same picture does not start one.
+    parser.reset();
+    CHECK(parser.parse(stream.view().subview(0, ends[0]), &slices) && slices[0].starts_picture);
+    CHECK(parser.parse(stream.view().subview(0, ends[0]), &slices) && slices.count() == 1 && slices[0].starts_picture == false);
+  }
+  CHECK(a.live == 0);
+  {
+    // Emulation prevention: payload bit positions are shifted by the 0x03 bytes stored before them.
+    const uint8_t nal[] = {0x65, 0x00, 0x00, 0x03, 0x01, 0xAA, 0x00, 0x00, 0x03, 0x00, 0xBB};
+    // payload (header removed): 00 00 01 AA 00 00 00 BB
+    CHECK(H264StreamParser::stored_bit_offset(nal, sizeof nal, 0) == 8);
+    CHECK(H264StreamParser::stored_bit_offset(nal, sizeof nal, 16) == 8 * 4);              // payload byte 2 (0x01) is stored at index 4
+    CHECK(H264StreamParser::stored_bit_offset(nal, sizeof nal, 8 * 3 + 3) == 8 * 5 + 3);  // 0xAA at index 5
+    CHECK(H264StreamParser::stored_bit_offset(nal, sizeof nal, 8 * 6) == 8 * 9);              // payload byte 6 (the 00 after the second 0x03) is stored at index 9
+    CHECK(H264StreamParser::stored_bit_offset(nal, sizeof nal, 8 * 7) == 8 * 10);             // 0xBB
+  }
+  {
+    // Truncated and bit-flipped streams must come out as a refusal or as slices inside the data, never as a crash.
+    H264Encoder enc(a);
+    CHECK(enc.configure(48, 32, 25, 1, 80, 2));
+    ByteBuffer stream(a);
+    VideoFrameBuffer picture(a);
+    for (int t = 0; t < 3; ++t) {
+      make_moving_i420(picture, 48, 32, t);
+      bool key;
+      CHECK(enc.encode(picture.frame(), false, &stream, &key));
+    }
+    const uint64_t size = stream.size();
+    for (uint64_t cut = 0; cut <= size; ++cut) {
+      H264StreamParser parser(a);
+      List<H264Slice> slices(a);
+      parser.parse(stream.view().first(cut), &slices);
+      for (const H264Slice& s : slices) CHECK(s.nal_offset + s.nal_size <= cut && s.data_bit_offset <= s.nal_size * 8);
+    }
+    for (uint64_t byte = 0; byte < size; ++byte)
+      for (int bit = 0; bit < 8; bit += 3) {
+        ByteBuffer copy(a);
+        CHECK(copy.append(stream.view()));
+        copy.writable_view()[byte] ^= static_cast<uint8_t>(1u << bit);
+        H264StreamParser parser(a);
+        List<H264Slice> slices(a);
+        parser.parse(copy.view(), &slices);
+        for (const H264Slice& s : slices) CHECK(s.nal_offset + s.nal_size <= size && s.data_bit_offset <= s.nal_size * 8);
+      }
   }
   CHECK(a.live == 0);
 }
@@ -963,6 +1046,7 @@ int main() {
   test_system_list();
   test_intel_media_engine();
   test_intel_system();
+  test_h264_parser();
   test_h264_encode();
   test_h264_encode_robustness();
   test_vp9();

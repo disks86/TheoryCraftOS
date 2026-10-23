@@ -239,7 +239,7 @@ void resolve_scaling(const ScalingRaw& raw, bool rule_a, const uint8_t (*seq4)[1
 
 }  // namespace
 
-bool Core::parse_sps(BitReader& br) {
+bool ParameterSets::parse_sps(BitReader& br) {
   Sps s;
   s.profile_idc = static_cast<int>(br.u(8));
   br.u(8);
@@ -286,8 +286,10 @@ bool Core::parse_sps(BitReader& br) {
   }
   s.max_num_ref_frames = static_cast<int>(br.ue());
   s.gaps_allowed = br.u(1) != 0;
-  const int w = static_cast<int>(br.ue()) + 1;
-  const int hmap = static_cast<int>(br.ue()) + 1;
+  const uint32_t w_minus1 = br.ue(), h_minus1 = br.ue();
+  if (w_minus1 >= 1024 || h_minus1 >= 1024) return false;  // checked before the arithmetic below: the values come from the stream
+  const int w = static_cast<int>(w_minus1) + 1;
+  const int hmap = static_cast<int>(h_minus1) + 1;
   s.frame_mbs_only = br.u(1) != 0;
   if (!s.frame_mbs_only) s.mbaff = br.u(1) != 0;
   s.direct_8x8_inference = br.u(1) != 0;
@@ -298,10 +300,15 @@ bool Core::parse_sps(BitReader& br) {
   if (w < 1 || s.mb_h < 1 || static_cast<int64_t>(w) * s.mb_h > kMaxMbs || w > 1024 || s.mb_h > 1024) return false;
   if (br.u(1)) {
     const int unit_x = 2, unit_y = 2 * (s.frame_mbs_only ? 1 : 2);
-    s.crop_l = static_cast<int>(br.ue()) * unit_x;
-    s.crop_r = static_cast<int>(br.ue()) * unit_x;
-    s.crop_t = static_cast<int>(br.ue()) * unit_y;
-    s.crop_b = static_cast<int>(br.ue()) * unit_y;
+    uint32_t crop[4];
+    for (uint32_t& c : crop) {
+      c = br.ue();
+      if (c > 16384) return false;  // no larger than the picture can be
+    }
+    s.crop_l = static_cast<int>(crop[0]) * unit_x;
+    s.crop_r = static_cast<int>(crop[1]) * unit_x;
+    s.crop_t = static_cast<int>(crop[2]) * unit_y;
+    s.crop_b = static_cast<int>(crop[3]) * unit_y;
     if (s.crop_l + s.crop_r >= w * 16 || s.crop_t + s.crop_b >= s.mb_h * 16) return false;
   }
   if (br.u(1)) {  // VUI
@@ -364,11 +371,11 @@ bool Core::parse_sps(BitReader& br) {
   if (frames < 1) frames = 1;
   s.dpb_frames = frames;
   s.valid = true;
-  sps_[s.id] = s;
+  sps[s.id] = s;
   return true;
 }
 
-bool Core::parse_pps(BitReader& br) {
+bool ParameterSets::parse_pps(BitReader& br) {
   Pps p;
   p.id = static_cast<int>(br.ue());
   p.sps_id = static_cast<int>(br.ue());
@@ -411,14 +418,14 @@ bool Core::parse_pps(BitReader& br) {
   for (int i = 0; i < 2; ++i)
     for (int k = 0; k < 64; ++k) p.list8[i][k] = raw.use_default[6 + i] ? 0 : raw.l8[i][k];
   // Remember presence and "use default" in the otherwise unused first bytes of a side table.
-  pps_raw_present_[p.id] = 0;
-  pps_raw_default_[p.id] = 0;
+  raw_present[p.id] = 0;
+  raw_default[p.id] = 0;
   for (int i = 0; i < 8; ++i) {
-    if (raw.present[i]) pps_raw_present_[p.id] |= static_cast<uint8_t>(1u << i);
-    if (raw.use_default[i]) pps_raw_default_[p.id] |= static_cast<uint8_t>(1u << i);
+    if (raw.present[i]) raw_present[p.id] |= static_cast<uint8_t>(1u << i);
+    if (raw.use_default[i]) raw_default[p.id] |= static_cast<uint8_t>(1u << i);
   }
   p.valid = true;
-  pps_[p.id] = p;
+  pps[p.id] = p;
   return true;
 }
 
@@ -429,7 +436,7 @@ void Core::compute_scaling() {
   uint8_t w4[6][16], w8[2][64];
   if (p.scaling_matrix_present) {
     ScalingRaw raw = {};
-    const uint8_t pr = pps_raw_present_[p.id], pd = pps_raw_default_[p.id];
+    const uint8_t pr = ps_.raw_present[p.id], pd = ps_.raw_default[p.id];
     for (int i = 0; i < 8; ++i) {
       raw.present[i] = (pr >> i) & 1;
       raw.use_default[i] = (pd >> i) & 1;
@@ -498,36 +505,9 @@ bool Core::decode(ConstByteView data, int64_t pts_us) {
   returned_ = nullptr;
   build_vlc();
   bool any = false;
-  const uint8_t* d = data.data();
-  const uint64_t n = data.size();
-  if (nal_length_size_ > 0) {
-    uint64_t pos = 0;
-    while (pos + static_cast<uint64_t>(nal_length_size_) <= n) {
-      uint64_t len = 0;
-      for (int i = 0; i < nal_length_size_; ++i) len = (len << 8) | d[pos + static_cast<uint64_t>(i)];
-      pos += static_cast<uint64_t>(nal_length_size_);
-      if (len == 0 || pos + len > n) break;
-      if (handle_nal(d + pos, len, pts_us)) any = true;
-      pos += len;
-    }
-  } else {
-    // Annex B: find the start codes.
-    uint64_t i = 0;
-    auto find_start = [&](uint64_t from) -> uint64_t {
-      for (uint64_t k = from; k + 3 <= n; ++k)
-        if (d[k] == 0 && d[k + 1] == 0 && d[k + 2] == 1) return k;
-      return n;
-    };
-    i = find_start(0);
-    while (i < n) {
-      const uint64_t begin = i + 3;
-      uint64_t next = find_start(begin);
-      uint64_t end = next;
-      while (end > begin && d[end - 1] == 0) --end;  // trailing_zero_8bits and the zero of a four-byte start code
-      if (end > begin && handle_nal(d + begin, end - begin, pts_us)) any = true;
-      i = next;
-    }
-  }
+  for_each_nal(data, nal_length_size_, [&](const uint8_t* nal, uint64_t size) {
+    if (handle_nal(nal, size, pts_us)) any = true;
+  });
   finish_picture();
   return any;
 }
@@ -537,28 +517,17 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
   const int ref_idc = (nal[0] >> 5) & 3;
   const int type = nal[0] & 31;
   if (type != 1 && type != 5 && type != 7 && type != 8) return false;
-  // Remove the emulation prevention bytes.
   if (rbsp_.size() < size && !rbsp_.alloc(allocator_, size + 64)) return false;
   uint8_t* out = rbsp_.data();
-  uint64_t n = 0;
-  int zeros = 0;
-  for (uint64_t i = 1; i < size; ++i) {
-    const uint8_t b = nal[i];
-    if (zeros >= 2 && b == 3) {
-      zeros = 0;
-      continue;
-    }
-    out[n++] = b;
-    zeros = b == 0 ? zeros + 1 : 0;
-  }
+  const uint64_t n = remove_emulation_prevention(nal, size, out);
   BitReader br;
   br.init(out, n);
-  if (type == 7) return parse_sps(br);
-  if (type == 8) return parse_pps(br);
+  if (type == 7) return ps_.parse_sps(br);
+  if (type == 8) return ps_.parse_pps(br);
   SliceHeader sh;
   sh.nal_unit_type = type;
   sh.nal_ref_idc = ref_idc;
-  if (!parse_slice_header(br, &sh)) return false;
+  if (!ps_.parse_slice_header(br, &sh)) return false;
   if (sh.redundant_pic_cnt > 0) return false;
   if (waiting_for_idr_ && !sh.idr()) {
     // A stream can also start with a recovery point (an I picture); accept a plain I slice.
@@ -580,20 +549,37 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
 }
 
 // 7.4.1.2.4
-bool Core::new_picture(const SliceHeader& a, const SliceHeader& b) const {
+bool ParameterSets::new_picture(const Sps& sps, const SliceHeader& a, const SliceHeader& b) {
   if (a.frame_num != b.frame_num || a.pps_id != b.pps_id) return true;
   if ((a.nal_ref_idc == 0) != (b.nal_ref_idc == 0)) return true;
   if (a.idr() != b.idr()) return true;
   if (b.idr() && a.idr_pic_id != b.idr_pic_id) return true;
-  if (sp_->poc_type == 0) {
+  if (sps.poc_type == 0) {
     if (a.poc_lsb != b.poc_lsb || a.delta_poc_bottom != b.delta_poc_bottom) return true;
-  } else if (sp_->poc_type == 1) {
+  } else if (sps.poc_type == 1) {
     if (a.delta_poc[0] != b.delta_poc[0] || a.delta_poc[1] != b.delta_poc[1]) return true;
   }
   return false;
 }
 
-bool Core::parse_slice_header(BitReader& br, SliceHeader* sh) {
+bool Core::new_picture(const SliceHeader& a, const SliceHeader& b) const { return ParameterSets::new_picture(*sp_, a, b); }
+
+uint64_t remove_emulation_prevention(const uint8_t* nal, uint64_t size, uint8_t* out) {
+  uint64_t n = 0;
+  int zeros = 0;
+  for (uint64_t i = 1; i < size; ++i) {
+    const uint8_t b = nal[i];
+    if (zeros >= 2 && b == 3) {
+      zeros = 0;
+      continue;
+    }
+    out[n++] = b;
+    zeros = b == 0 ? zeros + 1 : 0;
+  }
+  return n;
+}
+
+bool ParameterSets::parse_slice_header(BitReader& br, SliceHeader* sh) const {
   sh->first_mb = static_cast<int>(br.ue());
   uint32_t t = br.ue();
   if (t > 9) return false;
@@ -601,10 +587,10 @@ bool Core::parse_slice_header(BitReader& br, SliceHeader* sh) {
   if (t > 2) return false;  // SP and SI slices
   sh->type = t == 0 ? kSliceP : t == 1 ? kSliceB : kSliceI;
   sh->pps_id = static_cast<int>(br.ue());
-  if (sh->pps_id > 255 || !pps_[sh->pps_id].valid) return false;
-  const Pps& p = pps_[sh->pps_id];
-  if (!sps_[p.sps_id].valid) return false;
-  const Sps& s = sps_[p.sps_id];
+  if (sh->pps_id > 255 || !pps[sh->pps_id].valid) return false;
+  const Pps& p = pps[sh->pps_id];
+  if (!sps[p.sps_id].valid) return false;
+  const Sps& s = sps[p.sps_id];
   sh->frame_num = static_cast<int>(br.u(s.log2_max_frame_num));
   if (!s.frame_mbs_only) {
     sh->field_pic = br.u(1) != 0;
@@ -755,8 +741,8 @@ Picture* Core::find_free_slot() {
 }
 
 bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
-  const Pps& p = pps_[sh.pps_id];
-  const Sps& s = sps_[p.sps_id];
+  const Pps& p = ps_.pps[sh.pps_id];
+  const Sps& s = ps_.sps[p.sps_id];
   if (sp_ == nullptr || mb_w_ != s.mb_w || mb_h_ != s.mb_h) {
     if (sp_ == nullptr && !sh.idr() && sh.type != kSliceI) return false;
     bump_output(true);
