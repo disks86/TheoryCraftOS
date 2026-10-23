@@ -21,6 +21,7 @@
 #include "Layout/FontMeasurer.hpp"
 #include "Layout/Layout.hpp"
 #include "Paint/PaintBuilder.hpp"
+#include "Browser/ResourceScan.hpp"
 #include "Browser/Url.hpp"
 #include "Browser/WebPrelude.hpp"
 #include "Script/TypedArray.hpp"
@@ -155,7 +156,17 @@ bool Page::resolve(StringView reference, String* out) { return resolve_reference
 
 // --- Loading -----------------------------------------------------------------------------------------------------------------
 
+// Asks the environment to start downloading what the page's HTML names, so the scripts and style sheets arrive while the page is read.
+void Page::prefetch_resources(StringView html) {
+  scan_resources(html, [this](ResourceKind kind, StringView reference) {
+    if (kind == ResourceKind::Script && !scripts_enabled_) return;
+    String address(allocator_);
+    if (resolve(reference, &address) && (address.view().starts_with("http://") || address.view().starts_with("https://"))) env_.prefetch(address.view());
+  });
+}
+
 bool Page::load(StringView html) {
+  prefetch_resources(html);
   loading_ = true;
   const bool ok = dom::build_document(doc_, html, scripts_enabled_ ? static_cast<dom::IScriptRunner*>(this) : nullptr);
   loading_ = false;
@@ -264,20 +275,34 @@ bool Page::fetched_already(const dom::Node* link) const {
 }
 
 // Fetches the sheets that <link rel=stylesheet> elements name and that were not fetched yet (the ones scripts added too).
+// The href of a <link rel=stylesheet> element that was not fetched yet (false for any other node).
+bool Page::pending_style_link(const dom::Node* n, StringView* href) const {
+  StringView rel;
+  if (!n->is_tag("link") || !dom::get_attribute(n, "rel", &rel) || !dom::get_attribute(n, "href", href) || href->empty()) return false;
+  bool stylesheet = false;
+  uint64_t i = 0;
+  while (i < rel.size()) {
+    while (i < rel.size() && rel[i] == ' ') ++i;
+    const uint64_t start = i;
+    while (i < rel.size() && rel[i] != ' ') ++i;
+    if (rel.substr(start, i - start).equals_ignore_case("stylesheet")) stylesheet = true;
+  }
+  return stylesheet && !fetched_already(n);
+}
+
 void Page::fetch_pending_styles() {
+  // First ask for every sheet (they download side by side), then collect them in order.
+  uint64_t requested = sheets_.count();
+  for (const dom::Node* n = doc_.root(); n && requested < kMaxStyleSheets; n = dom::next_in_tree(n, doc_.root())) {
+    StringView href;
+    String address(allocator_);
+    if (!pending_style_link(n, &href)) continue;
+    ++requested;
+    if (resolve(href, &address)) env_.prefetch(address.view());
+  }
   for (const dom::Node* n = doc_.root(); n; n = dom::next_in_tree(n, doc_.root())) {
-    if (!n->is_tag("link") || sheets_.count() >= kMaxStyleSheets) continue;
-    StringView rel, href;
-    if (!dom::get_attribute(n, "rel", &rel) || !dom::get_attribute(n, "href", &href) || href.empty()) continue;
-    bool stylesheet = false;
-    uint64_t i = 0;
-    while (i < rel.size()) {
-      while (i < rel.size() && rel[i] == ' ') ++i;
-      const uint64_t start = i;
-      while (i < rel.size() && rel[i] != ' ') ++i;
-      if (rel.substr(start, i - start).equals_ignore_case("stylesheet")) stylesheet = true;
-    }
-    if (!stylesheet || fetched_already(n)) continue;
+    StringView href;
+    if (sheets_.count() >= kMaxStyleSheets || !pending_style_link(n, &href)) continue;
     Fetched f(allocator_);
     f.serial = n->serial;
     if (resolve(href, &f.address)) env_.fetch_text(f.address.view(), kMaxStyleSheetBytes, &f.text);

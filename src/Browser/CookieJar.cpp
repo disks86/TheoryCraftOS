@@ -195,6 +195,7 @@ bool CookieJar::path_matches(StringView request_path, StringView cookie_path) {
 }
 
 bool CookieJar::store(StringView set_cookie, const WebUrl& url, uint64_t now_ms, bool from_script) {
+  kernel::ScopedMutex lock(mutex_);
   if (set_cookie.size() > kMaxCookieBytes + kMaxAttributeBytes * 4) return false;
   StringView rest = set_cookie, pair;
   const uint64_t semi = set_cookie.find(';');
@@ -339,17 +340,24 @@ void CookieJar::enforce_limits(StringView host) {
 }
 
 void CookieJar::remove_expired(uint64_t now_ms) {
+  kernel::ScopedMutex lock(mutex_);
+  remove_expired_locked(now_ms);
+}
+
+void CookieJar::remove_expired_locked(uint64_t now_ms) {
   for (uint64_t i = cookies_.count(); i > 0; --i)
     if (cookies_[i - 1].expires_ms >= 0 && cookies_[i - 1].expires_ms <= static_cast<int64_t>(now_ms)) cookies_.remove_at(i - 1);
 }
 
 void CookieJar::remove_host(StringView host) {
+  kernel::ScopedMutex lock(mutex_);
   for (uint64_t i = cookies_.count(); i > 0; --i)
     if (domain_matches(host, cookies_[i - 1].domain.view()) || domain_matches(cookies_[i - 1].domain.view(), host)) cookies_.remove_at(i - 1);
 }
 
 void CookieJar::header_for(const WebUrl& url, uint64_t now_ms, Site site, bool for_script, String* out) {
-  remove_expired(now_ms);
+  kernel::ScopedMutex lock(mutex_);
+  remove_expired_locked(now_ms);
   const bool secure_origin = secure_url(url);
   const StringView host = url.host.view();
   const StringView path = url.path.empty() ? StringView("/") : url.path.view();

@@ -189,7 +189,8 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       own_jar_(allocator),
       current_(allocator),
       request_target_(allocator),
-      status_text_(allocator) {
+      status_text_(allocator),
+      prefetcher_(allocator, &WebBrowser::prefetch_one, this) {
   set_bounds({100, 50, 680, 480});
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
@@ -545,6 +546,7 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit, bool s
   options.credentials = browser::FetchOptions::Credentials::Include;
   options.headers = "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1\r\n";
   options.now_ms = page_clock_ms();
+  if (subresource) options.timeout_ms = kSubresourceTimeoutMs;
   browser::NetResponse result(allocator());
   if (!browser::fetch_resource(allocator(), *loader_, jar(), options, &result)) {
     String message(allocator());
@@ -733,6 +735,7 @@ void WebBrowser::show(Fetched& page) {
     UiGuard lock(&page_);
     page_.set_object_painter(nullptr);
   }
+  prefetcher_.cancel_all();   // (what the old page was getting is of no use now)
   live_.reset();   // (the old page and its scripts go before the new one comes)
   {
     UiGuard lock(this);
@@ -1030,11 +1033,38 @@ void WebBrowser::on_toggle_dark(void* self, Control&) {
 
 // --- What a page asks of the window ------------------------------------------------------------------
 
-bool WebBrowser::Env::fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) {
-  Fetched f(owner_.allocator());
+bool WebBrowser::Env::fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) { return owner_.fetch_subresource(address, limit, out); }
+
+// The answer for a subresource: a download that was started ahead of time is used (and waited for, up to the time limit); anything else is fetched here.
+bool WebBrowser::fetch_subresource(StringView address, uint64_t limit, ByteBuffer* body) {
+  ByteBuffer got(allocator());
+  switch (prefetcher_.take(address, kSubresourceTimeoutMs + 2000, &got)) {
+    case browser::ResourcePrefetcher::Result::Hit: break;
+    case browser::ResourcePrefetcher::Result::Failed: return false;
+    case browser::ResourcePrefetcher::Result::Miss: {
+      Fetched f(allocator());
+      f.address.assign(address);
+      if (!fetch(address, &f, kMaxFileBytes, true) || f.status >= 400) return false;
+      if (!got.append(f.body.view())) return false;
+      break;
+    }
+  }
+  return got.size() <= limit && body->append(got.view());
+}
+
+// Runs on a download thread: fetches like fetch_subresource() would, without the prefetcher.
+bool WebBrowser::prefetch_one(void* self, StringView address, ByteBuffer* body) {
+  auto* b = static_cast<WebBrowser*>(self);
+  Fetched f(b->allocator());
   f.address.assign(address);
-  if (!owner_.fetch(address, &f, limit, true) || f.status >= 400 || f.body.size() > limit) return false;
-  return out->append(f.body.view());
+  if (!b->fetch(address, &f, kMaxFileBytes, true) || f.status >= 400) return false;
+  return body->append(f.body.view());
+}
+
+void WebBrowser::Env::prefetch(StringView address) {
+  if (!owner_.loader_ || !(address.starts_with("http://") || address.starts_with("https://"))) return;
+  owner_.page_clock_ms();   // (sets the clock up here, on this thread, before download threads read it)
+  owner_.prefetcher_.request(address);
 }
 
 namespace {
@@ -1082,10 +1112,9 @@ UniquePointer<browser::IVideoClip> WebBrowser::Env::open_audio(UniquePointer<Byt
 }
 
 bool WebBrowser::Env::fetch_text(StringView address, uint64_t limit, String* text) {
-  Fetched f(owner_.allocator());
-  f.address.assign(address);
-  if (!owner_.fetch(address, &f, WebBrowser::kMaxFileBytes, true) || f.status >= 400 || f.body.size() > limit) return false;
-  return text->assign(StringView(f.body.view()));
+  ByteBuffer body(owner_.allocator());
+  if (!owner_.fetch_subresource(address, limit, &body)) return false;
+  return text->assign(StringView(body.view()));
 }
 
 void WebBrowser::Env::navigate(StringView address, bool) {

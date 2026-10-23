@@ -32,6 +32,7 @@
 #pragma once
 #include "Browser/IPageLoader.hpp"
 #include "Browser/PageHub.hpp"
+#include "Browser/ResourcePrefetcher.hpp"
 #include "Browser/SessionHistory.hpp"
 #include "Browser/Page.hpp"
 #include "Hardware/Clock/IClock.hpp"
@@ -58,6 +59,9 @@ class WebBrowser : public gui::Frame {
   static constexpr uint64_t kMaxStyleSheetBytes = 512u << 10;
   static constexpr uint32_t kMaxExternalScripts = 12;
   static constexpr uint64_t kMaxScriptBytes = 1u << 20;
+  // A script, style sheet or picture that does not come within this long is given up (the page goes on without it); downloads started ahead of time are waited
+  // for no longer than this either.
+  static constexpr uint32_t kSubresourceTimeoutMs = 15000;
   // The time of day in milliseconds since 1970 for Date (0 if there is none).
   using UnixClock = uint64_t (*)(void* context);
 
@@ -144,6 +148,7 @@ class WebBrowser : public gui::Frame {
     Env(WebBrowser& owner, allocators::IAllocator& allocator);
     bool fetch_text(StringView address, uint64_t limit, String* text) override;
     bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override;
+    void prefetch(StringView address) override;
     UniquePointer<browser::IVideoClip> open_video(UniquePointer<ByteBuffer> data) override;
     UniquePointer<browser::IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override;
     void navigate(StringView address, bool replace) override;
@@ -213,6 +218,9 @@ class WebBrowser : public gui::Frame {
   bool fetch_post(StringView address, Fetched* page);
   void update_key_capture();
   bool fetch_file(StringView path, Fetched* page, uint64_t limit = kMaxFileBytes);
+  // The answer for a script, style sheet or picture: from the downloads started ahead of time when they have it, else fetched now. False if it cannot be had.
+  bool fetch_subresource(StringView address, uint64_t limit, ByteBuffer* body);
+  static bool prefetch_one(void* self, StringView address, ByteBuffer* body);   // (runs on a download thread)
   void show(Fetched& page);
   void remember(Request kind, StringView address);
   // Back / Forward to an entry of the document that is shown: nothing is loaded, the page gets a popstate.
@@ -272,6 +280,7 @@ class WebBrowser : public gui::Frame {
   String current_, request_target_, status_text_;
   Request request_ = Request::None;
   bool loading_ = false;
+  browser::ResourcePrefetcher prefetcher_;   // (last: its threads end before anything they use is destroyed)
 };
 
 }  // namespace desktop

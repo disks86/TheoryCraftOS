@@ -47,6 +47,9 @@ class IPageEnvironment : public IObjectEnvironment {
  public:
   // The text at an address (a script or a style sheet), at most `limit` bytes. False if it cannot be had.
   virtual bool fetch_text(StringView address, uint64_t limit, String* text) = 0;
+  // The page is going to ask for `address` (a script, style sheet or picture) soon: start getting it, without waiting. Optional; what it does not do the later
+  // fetch_text() / fetch_bytes() does.
+  virtual void prefetch(StringView address) { (void)address; }
   virtual void navigate(StringView address, bool replace) = 0;
   virtual void set_hash(StringView hash) = 0;
   virtual void reload() = 0;
@@ -298,6 +301,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   static bool custom_error(void* context, const dom::Node* control);
   void note_error(StringView text);
   void fetch_pending_styles();
+  bool pending_style_link(const dom::Node* link, StringView* href) const;
+  void prefetch_resources(StringView html);
   bool resolve(StringView reference, String* out);
   bool fetched_already(const dom::Node* link) const;
   const StyleSheet& style_sheet();

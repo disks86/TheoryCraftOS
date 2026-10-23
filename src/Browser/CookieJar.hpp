@@ -28,6 +28,7 @@
 //   jar.header_for(url, now_ms, CookieJar::Site::SameSite, /*for_script*/ false, &header);   // "sid=abc"
 #pragma once
 #include "Browser/WebUrl.hpp"
+#include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
 
@@ -63,7 +64,12 @@ class CookieJar {
   void header_for(const WebUrl& url, uint64_t now_ms, Site site, bool for_script, String* out);
   // Throws out the cookies that have expired.
   void remove_expired(uint64_t now_ms);
-  void clear() { cookies_.clear(); }
+  void clear() {
+    kernel::ScopedMutex lock(mutex_);
+    cookies_.clear();
+  }
+  // count() and at() are for the thread that shows the cookies; store(), header_for(), remove_expired(), remove_host() and clear() may be called from several threads
+  // at once (the browser's download threads set and send cookies while the page runs).
   uint32_t count() const { return static_cast<uint32_t>(cookies_.count()); }
   const Cookie& at(uint32_t index) const { return cookies_[index]; }
   // Removes all cookies of a host (and its subdomains).
@@ -78,8 +84,10 @@ class CookieJar {
   static bool domain_matches(StringView host, StringView domain);
   static bool path_matches(StringView request_path, StringView cookie_path);
   void enforce_limits(StringView host);
+  void remove_expired_locked(uint64_t now_ms);
 
   allocators::IAllocator& allocator_;
+  kernel::Mutex mutex_;   // guards cookies_ and next_order_
   List<Cookie> cookies_;
   uint64_t next_order_ = 1;
 };

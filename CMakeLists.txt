@@ -246,6 +246,7 @@ add_executable(BOOTX64
   src/Browser/CookieJar.cpp
   src/Browser/Fetcher.cpp
   src/Browser/PageHub.cpp
+  src/Browser/ResourcePrefetcher.cpp
   src/Browser/SessionHistory.cpp
   src/Browser/Canvas.cpp
   src/Browser/Objects.cpp
