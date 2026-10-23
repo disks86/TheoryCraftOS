@@ -18,6 +18,8 @@
 
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
+#include "Hardware/Mmio.hpp"
+#include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 
 namespace hardware {
@@ -31,8 +33,16 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   static constexpr uint16_t kPciVendor = 0x8086;
 
   // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown).
-  explicit IntelMediaVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0)
-      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), gpu_(intel_gpu_identify(gpu_device_id)) {}
+  // `registers` is the GPU's register BAR (at least IntelMediaEngineHw::kRegisterWindow bytes), or an empty window to skip looking at the hardware.
+  explicit IntelMediaVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& registers = MmioRegion())
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), gpu_(intel_gpu_identify(gpu_device_id)), registers_(registers) {}
+
+  // Looks at the video boxes (which exist, which wake up). The sessions stay on the CPU either way: nothing submits work to a box yet.
+  bool initialize() override {
+    status_ = IntelMediaEngineHw::probe(registers_, gpu_.architecture);
+    return true;
+  }
+  const IntelMediaEngineStatus& engine_status() const { return status_; }
 
   const char* name() const override { return "Intel media engine (Quick Sync) (software path)"; }
   const IntelGpuInfo& gpu() const { return gpu_; }
@@ -53,6 +63,8 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   }
 
   IntelGpuInfo gpu_;
+  MmioRegion registers_;
+  IntelMediaEngineStatus status_;
 };
 
 }  // namespace hardware

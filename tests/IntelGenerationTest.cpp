@@ -20,10 +20,13 @@
 // lookup with every family/model/stepping at the edges of a range, and every possible 16-bit GPU device ID (the table must never
 // read out of range, and an ID is either one architecture or Unknown).
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "Hardware/CentralProcessingUnit/Intel/IntelGenerations.hpp"
 #include "Hardware/CentralProcessingUnit/X86_64Cpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
+#include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
+#include <vector>
 
 using namespace hardware;
 
@@ -99,9 +102,52 @@ static void test_gpu() {
   }
 }
 
+// A pretend register BAR: plain memory the test fills with what the hardware would show.
+struct FakeRegisters {
+  std::vector<uint32_t> words = std::vector<uint32_t>(IntelMediaEngineHw::kRegisterWindow / 4, 0);
+  MmioRegion region() { return MmioRegion(reinterpret_cast<uint64_t>(words.data()), words.size() * 4); }
+  uint32_t& at(uint32_t offset) { return words[offset / 4]; }
+};
+
+static void test_media_engine() {
+  using A = IntelGpuArchitecture;
+  CHECK(IntelMediaEngineHw::supported(A::Gen9_5) && IntelMediaEngineHw::supported(A::XeLp));
+  CHECK(!IntelMediaEngineHw::supported(A::XeLpg) && !IntelMediaEngineHw::supported(A::Xe2) && !IntelMediaEngineHw::supported(A::Unknown));
+
+  // Gen9.5: one box; it acknowledges when the ack bit is set, and the request is withdrawn afterwards.
+  FakeRegisters g9;
+  g9.at(0x0D88) = 1;
+  IntelMediaEngineStatus s = IntelMediaEngineHw::probe(g9.region(), A::Gen9_5);
+  CHECK(s.probed && s.vdbox_present == 1 && s.vdbox_awake == 1 && s.vdbox_count() == 1);
+  CHECK(g9.at(0xA270) == 0x00010000);
+  g9.at(0x0D88) = 0;  // never acknowledges
+  s = IntelMediaEngineHw::probe(g9.region(), A::Gen9_5);
+  CHECK(s.probed && s.vdbox_present == 1 && s.vdbox_awake == 0 && g9.at(0xA270) == 0x00010000);
+
+  // Xe-LP: boxes 0 and 2 exist; the fuse can disable one of them; box 1 and 3 are never touched.
+  FakeRegisters lp;
+  lp.at(0x0D50) = lp.at(0x0D58) = 1;
+  s = IntelMediaEngineHw::probe(lp.region(), A::XeLp);
+  CHECK(s.vdbox_present == 0x5 && s.vdbox_awake == 0x5 && s.vdbox_count() == 2);
+  CHECK(lp.at(0xA540) == 0x00010000 && lp.at(0xA548) == 0x00010000 && lp.at(0xA544) == 0 && lp.at(0xA54C) == 0);
+  lp.at(0x9140) = 0x4;  // VCS2 fused off
+  s = IntelMediaEngineHw::probe(lp.region(), A::XeLp);
+  CHECK(s.vdbox_present == 0x1 && s.vdbox_awake == 0x1);
+  lp.at(0x9140) = 0xFFFFFF05;  // bits outside the fuse field are ignored
+  s = IntelMediaEngineHw::probe(lp.region(), A::XeLp);
+  CHECK(s.vdbox_present == 0 && s.vdbox_count() == 0);
+
+  // Unsupported generations and short windows read nothing.
+  CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeLpg).probed);
+  CHECK(!IntelMediaEngineHw::probe(MmioRegion(), A::XeLp).probed);
+  alignas(4) static uint32_t small[16] = {};
+  CHECK(!IntelMediaEngineHw::probe(MmioRegion(reinterpret_cast<uint64_t>(small), sizeof small), A::XeLp).probed);
+}
+
 int main() {
   test_cpu();
   test_gpu();
+  test_media_engine();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("IntelGenerationTest passed\n");
   return 0;

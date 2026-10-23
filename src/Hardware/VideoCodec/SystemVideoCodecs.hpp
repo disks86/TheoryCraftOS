@@ -19,6 +19,7 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/IVideoCodecDevice.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -29,9 +30,22 @@ namespace hardware {
 // AMD, Intel), and the software codec, which is always last and always there. Sessions are asked for with
 // create_decoder() / create_encoder(), which try the devices in order and use the first that serves the codec
 // (a device that really accelerates it would come first; today all of them run on the CPU).
+// Gets a device's registers mapped (MmioMapper does it on the real machine; a test hands out plain memory).
+class IRegisterMapper {
+ public:
+  virtual bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) = 0;
+
+ protected:
+  constexpr IRegisterMapper() = default;
+  ~IRegisterMapper() = default;
+};
+
 class SystemVideoCodecs {
  public:
   SystemVideoCodecs(const IPciBus& pci, allocators::IAllocator& allocator) : pci_(pci), allocator_(allocator), devices_(allocator) {}
+
+  // With a mapper, initialize() maps the register BAR of Intel GPUs and looks at their video engines; without one it only names them.
+  void set_mmio(IRegisterMapper* mapper) { mmio_ = mapper; }
 
   void initialize();
   void shutdown();
@@ -50,8 +64,11 @@ class SystemVideoCodecs {
   UniquePointer<IVideoEncoder> create_encoder(const EncoderConfig& config);
 
  private:
+  MmioRegion intel_registers(const PciDeviceInfo& d) const;
+
   const IPciBus& pci_;
   allocators::IAllocator& allocator_;
+  IRegisterMapper* mmio_ = nullptr;
   List<UniquePointer<IVideoCodecDevice>> devices_;
 };
 

@@ -512,6 +512,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Video codecs: a device per GPU video engine found (not driven yet: its sessions run on the CPU) and the software codec.
   hardware::SystemVideoCodecs video_codecs(pci, shared_allocator);
+  struct MmioRegisterMapper final : hardware::IRegisterMapper {
+    hardware::MmioMapper& mapper;
+    explicit MmioRegisterMapper(hardware::MmioMapper& m) : mapper(m) {}
+    bool map_registers(uint64_t physical, uint64_t length, hardware::MmioRegion* region) override { return mapper.ensure_mapped(physical, length, region); }
+  } register_mapper(mmio);
+  video_codecs.set_mmio(paging_ok ? &register_mapper : nullptr);  // Intel GPUs: look at the video boxes (sessions still run on the CPU)
   video_codecs.initialize();
   for (uint32_t i = 0; i < video_codecs.count(); ++i) {
     hardware::IVideoCodecDevice& codec_device = *video_codecs.at(i);

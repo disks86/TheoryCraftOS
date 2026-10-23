@@ -29,7 +29,9 @@
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaVideoEngine.hpp"
+#include <vector>
 #include "Utility/Crc32.hpp"
 
 using namespace hardware;
@@ -493,6 +495,79 @@ static void test_system_list() {
   CHECK(a.live == 0);
 }
 
+// An Intel GPU on the bus, and a mapper that hands out plain memory as its registers.
+struct IntelPci final : IPciBus {
+  uint16_t device_id; bool memory_decode; uint64_t bar0 = 0x1000;
+  IntelPci(uint16_t id, bool decode) : device_id(id), memory_decode(decode) {}
+  const char* name() const override { return "fake intel pci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 1; }
+  bool pci_device(uint32_t index, PciDeviceInfo* out) const override {
+    if (index != 0) return false;
+    *out = {{0, 2, 0}, 0x8086, device_id, kPciClassDisplay, 0, 0};
+    return true;
+  }
+  uint32_t read32(PciAddress, uint16_t offset) const override { return offset == 0x04 && memory_decode ? 2 : 0; }
+  void write32(PciAddress, uint16_t, uint32_t) const override {}
+  uint64_t memory_bar(PciAddress, uint8_t) const override { return bar0; }
+  uint16_t find_capability(PciAddress, uint8_t) const override { return 0; }
+};
+
+struct FakeRegisterMapper final : IRegisterMapper {
+  std::vector<uint32_t> words = std::vector<uint32_t>(IntelMediaEngineHw::kRegisterWindow / 4, 0);
+  int calls = 0;
+  bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) override {
+    ++calls;
+    if (physical != 0x1000 || length > words.size() * 4) return false;
+    *region = MmioRegion(reinterpret_cast<uint64_t>(words.data()), words.size() * 4);
+    return true;
+  }
+};
+
+static IntelMediaVideoEngine* intel_engine(SystemVideoCodecs& system) { return static_cast<IntelMediaVideoEngine*>(system.at(0)); }
+
+static void test_intel_system() {
+  TestAllocator a;
+  {
+    IntelPci pci(0x9A49, true);  // Tiger Lake, memory decoding on
+    FakeRegisterMapper mapper;
+    mapper.words[0x0D50 / 4] = 1;
+    SystemVideoCodecs system(pci, a);
+    system.set_mmio(&mapper);
+    system.initialize();
+    CHECK(system.count() == 2 && strstr(system.at(0)->name(), "Intel") && mapper.calls == 1);
+    CHECK(intel_engine(system)->engine_status().probed && intel_engine(system)->engine_status().vdbox_count() == 1);
+    system.shutdown();
+  }
+  {
+    IntelPci pci(0x9A49, false);  // memory decoding off: the registers are not touched
+    FakeRegisterMapper mapper;
+    SystemVideoCodecs system(pci, a);
+    system.set_mmio(&mapper);
+    system.initialize();
+    CHECK(mapper.calls == 0 && !intel_engine(system)->engine_status().probed);
+    system.shutdown();
+  }
+  {
+    IntelPci pci(0x7D55, true);  // Meteor Lake: no known register layout
+    FakeRegisterMapper mapper;
+    SystemVideoCodecs system(pci, a);
+    system.set_mmio(&mapper);
+    system.initialize();
+    CHECK(mapper.calls == 0 && !intel_engine(system)->engine_status().probed);
+    system.shutdown();
+  }
+  {
+    IntelPci pci(0x9A49, true);  // no mapper at all
+    SystemVideoCodecs system(pci, a);
+    system.initialize();
+    CHECK(system.count() == 2 && !intel_engine(system)->engine_status().probed);
+    system.shutdown();
+  }
+  CHECK(a.live == 0);
+}
+
 // A moving I420 picture for the H.264 encoder: smooth waves and a square, moved `t` pixels to the right.
 static void make_moving_i420(VideoFrameBuffer& b, uint32_t w, uint32_t h, int t) {
   CHECK(b.allocate({w, h, PixelFormat::I420}));
@@ -861,6 +936,23 @@ static void test_vp9_robustness() {
   CHECK(a.live == 0);
 }
 
+// The Intel media engine device: a software codec that has looked at (pretend) hardware registers and says what it found.
+static void test_intel_media_engine() {
+  TestAllocator heap;
+  std::vector<uint32_t> words(IntelMediaEngineHw::kRegisterWindow / 4, 0);
+  const MmioRegion registers(reinterpret_cast<uint64_t>(words.data()), words.size() * 4);
+  words[0x0D50 / 4] = 1;  // box 0 acknowledges its power request
+  IntelMediaVideoEngine engine(heap, 0x9A49, registers);  // Tiger Lake
+  CHECK(engine.initialize() && engine.info().hardware_engine && !engine.info().accelerated);
+  CHECK(engine.engine_status().probed && engine.engine_status().vdbox_count() == 1);
+  CHECK(engine.engine_decode_codecs() & codec_mask(VideoCodec::Av1));
+  CHECK(engine.can_decode(VideoCodec::H264));  // sessions still run in software
+  IntelMediaVideoEngine blind(heap, 0x9A49);   // no registers: nothing is read
+  CHECK(blind.initialize() && !blind.engine_status().probed);
+  IntelMediaVideoEngine meteor(heap, 0x7D55, registers);  // media on a separate tile: not probed
+  CHECK(meteor.initialize() && !meteor.engine_status().probed);
+}
+
 int main() {
   test_formats();
   test_convert();
@@ -869,6 +961,8 @@ int main() {
   test_jpeg_robustness();
   test_sessions();
   test_system_list();
+  test_intel_media_engine();
+  test_intel_system();
   test_h264_encode();
   test_h264_encode_robustness();
   test_vp9();

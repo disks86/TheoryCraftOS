@@ -36,13 +36,26 @@ void try_add(List<UniquePointer<IVideoCodecDevice>>& list, allocators::IAllocato
 }
 }  // namespace
 
+// The register window of an Intel GPU, if it is safe to touch: a generation whose media registers are known, memory decoding switched on (the
+// firmware did that for its display), and a register BAR the firmware assigned. Empty otherwise.
+MmioRegion SystemVideoCodecs::intel_registers(const PciDeviceInfo& d) const {
+  constexpr uint16_t kPciCommand = 0x04;
+  constexpr uint32_t kMemorySpace = 1u << 1;
+  MmioRegion region;
+  if (!mmio_ || !IntelMediaEngineHw::supported(intel_gpu_identify(d.device_id).architecture)) return region;
+  if (!(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return region;
+  const uint64_t base = pci_.memory_bar(d.address, 0);
+  if (base == 0 || !mmio_->map_registers(base, IntelMediaEngineHw::kRegisterWindow, &region)) return MmioRegion();
+  return region;
+}
+
 void SystemVideoCodecs::initialize() {
   PciDeviceInfo d;
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassDisplay) continue;
     if (d.vendor_id == NvidiaVideoEngine::kPciVendor) try_add<NvidiaVideoEngine>(devices_, allocator_);
     else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_);
-    else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) try_add<IntelMediaVideoEngine>(devices_, allocator_, d.device_id);
+    else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) try_add<IntelMediaVideoEngine>(devices_, allocator_, d.device_id, intel_registers(d));
   }
   try_add<SoftwareVideoCodec>(devices_, allocator_);
 }

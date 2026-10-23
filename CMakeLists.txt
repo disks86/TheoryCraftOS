@@ -465,6 +465,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/VideoFrameBuffer.cpp
   src/Hardware/VideoCodec/ColorConvert.cpp
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
+  src/Hardware/VideoCodec/Intel/IntelMediaEngineHw.cpp
   src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
   src/Hardware/Printer/PrinterTypes.cpp
   src/Hardware/Printer/Halftone.cpp
