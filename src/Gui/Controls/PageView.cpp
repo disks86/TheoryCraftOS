@@ -47,10 +47,12 @@ void PageView::set_picture(UniquePointer<browser::PagePicture> picture, bool kee
     if (fonts_) fonts_->add_bundled_fonts();
   }
   if (!keep_scroll) scroll_y_ = 0;
-  hover_ = press_link_ = -1;
+  hover_ = -1;
   hovered_link_node_ = 0;
-  press_node_ = 0;
   hovered_link_.clear();
+  // (the same page drawn again - the press itself changed how it looks, as :active does - keeps the press: its node serials still mean the same, and the click is
+  // decided when the button comes up)
+  if (!keep_scroll) press_link_ = -1, press_node_ = 0;
   measure();
   sync_scroll_bar();
   invalidate();
