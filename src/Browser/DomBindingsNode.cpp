@@ -1531,7 +1531,16 @@ bool install_nodes(DomBindings::Impl& c) {
     c.tag_protos = vm.new_plain();
     vm.define_named(g, "__tag_protos", Value::make_object(c.tag_protos), 0);   // (kept alive; also what the page cannot overwrite)
     JsObject* media = vm.new_object(c.html_proto);
-    make_class(c, "HTMLMediaElement", illegal_constructor, media);
+    JsObject* media_class = make_class(c, "HTMLMediaElement", illegal_constructor, media);
+    {   // HTMLMediaElement.NETWORK_EMPTY ... HAVE_ENOUGH_DATA (on the class and on every element)
+      const struct { const char* name; uint32_t value; } kStates[] = {{"NETWORK_EMPTY", 0}, {"NETWORK_IDLE", 1}, {"NETWORK_LOADING", 2}, {"NETWORK_NO_SOURCE", 3},
+                                                                     {"HAVE_NOTHING", 0}, {"HAVE_METADATA", 1}, {"HAVE_CURRENT_DATA", 2}, {"HAVE_FUTURE_DATA", 3},
+                                                                     {"HAVE_ENOUGH_DATA", 4}};
+      for (const auto& state : kStates) {
+        vm.define_named(media_class, state.name, Value::make_number(state.value), 0);
+        vm.define_named(media, state.name, Value::make_number(state.value), 0);
+      }
+    }
     for (const auto& k : kInterfaces) {
       JsObject* proto = vm.new_object(c.html_proto);
       make_class(c, k.interface, illegal_constructor, proto);

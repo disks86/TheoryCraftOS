@@ -48,8 +48,8 @@ struct TestAllocator final : allocators::IAllocator {
 struct FakeClip final : IVideoClip {
   bool is_playing = false, looping = false;
   int64_t position = 0, duration = 2000000;
-  double volume = 1;
-  bool muted = false;
+  double volume = 1, rate = 1;
+  bool muted = false, native_rate = false;   // (native_rate: this clip plays at other speeds itself)
   uint32_t serial = 1;
   int updates = 0;
   bool play() override { is_playing = true; return true; }
@@ -57,6 +57,11 @@ struct FakeClip final : IVideoClip {
   void seek(int64_t us) override { position = us < 0 ? 0 : us > duration ? duration : us; ++serial; }
   void set_looping(bool l) override { looping = l; }
   void set_volume(double v, bool m) override { volume = v; muted = m; }
+  bool set_rate(double r) override {
+    if (!native_rate) return r == 1;
+    rate = r;
+    return true;
+  }
   bool playing() override { return is_playing; }
   int64_t position_us() override { return position; }
   int64_t duration_us() override { return duration; }
@@ -66,7 +71,7 @@ struct FakeClip final : IVideoClip {
   void update() override {
     ++updates;
     if (!is_playing) return;
-    position += 500000;
+    position += static_cast<int64_t>(500000 * (native_rate ? rate : 1));
     ++serial;
     if (position >= duration) {
       if (looping) position = 0;
@@ -155,7 +160,7 @@ struct FakeEnvironment final : IPageEnvironment {
   explicit FakeEnvironment(TestAllocator& a) : local_hub(a), session_hub(a), hub(a), jar(a) { allocator_for_clips = &a; }
   std::map<std::string, std::string> blobs;   // binary files (pictures, videos)
   FakeClip* last_clip = nullptr;
-  bool can_play_video = true;
+  bool can_play_video = true, clips_play_at_any_rate = false;
   bool fetch_bytes(StringView address, uint64_t, ByteBuffer* out) override {
     fetched.push_back(std::string(address.data(), address.size()));
     auto it = blobs.find(fetched.back());
@@ -166,6 +171,7 @@ struct FakeEnvironment final : IPageEnvironment {
     (void)data;
     if (!can_play_video) return UniquePointer<IVideoClip>();
     auto clip = UniquePointer<FakeClip>::make(*allocator_for_clips);
+    clip->native_rate = clips_play_at_any_rate;
     last_clip = clip.get();
     return clip;
   }
@@ -1020,6 +1026,7 @@ static void test_video() {
     // the seek bar
     page.click(run->node, 0, 0, static_cast<uint8_t>(ObjectKind::Video), 32 + 10, 60 - 12, 80, 60);
     CHECK(env.last_clip->position > 0 && env.last_clip->position < env.last_clip->duration);
+    page.step_objects(static_cast<double>(env.clock));   // (seeked follows the seek by one step)
     const std::string log = page_log(page);
     CHECK(log.find("play") != std::string::npos && log.find("pause") != std::string::npos && log.find("seeked") != std::string::npos);
   }
@@ -1044,7 +1051,7 @@ static void test_video() {
     page.load("<html><body><video id=v src=m.mp4 width=80 height=60></video><button id=b></button>"
               "<script>var v = document.getElementById('v');"
               "document.getElementById('b').onclick = function() {"
-              "  var r = []; var p = v.play(); r.push(typeof p.then, typeof p.catch); p.then(function() { r.push('then') }); r.push(v.paused);"
+              "  var r = []; var p = v.play(); r.push(typeof p.then, typeof p.catch); p.then(function() { console.log('then') }); r.push(v.paused);"
               "  v.currentTime = 1.5; r.push(v.currentTime); v.pause(); r.push(v.paused); v.volume = 0.25; r.push(v.volume);"
               "  try { v.volume = 3 } catch (e) { r.push(e.name) } v.muted = true; r.push(v.muted); r.push(v.duration, v.videoWidth, v.videoHeight, v.readyState, v.ended, v.loop);"
               "  v.loop = true; r.push(v.loop, v.hasAttribute('loop')); r.push(v.canPlayType('video/mp4') !== '', v.canPlayType('video/ogg') === '');"
@@ -1053,7 +1060,7 @@ static void test_video() {
     HtmlDocument doc(a);
     page.render(&doc);
     page.click(page.document().element_by_id("b")->serial, 0, 0);
-    CHECK(page_log(page) == "function function then false 1.5 true 0.25 IndexSizeError true 2 64 48 4 false false true true true true 1 2 1");
+    CHECK(page_log(page) == "function function false 1.5 true 0.25 IndexSizeError true 2 64 48 4 false false true true true true 1 2 1 | then");
     CHECK(env.last_clip->volume == 0.25 && env.last_clip->muted && !env.last_clip->is_playing);
   }
   CHECK(a.live == 0);
@@ -1158,6 +1165,171 @@ static void test_audio() {
   CHECK(a.live == 0);
 }
 
+
+// The media element API: events, ready and network state, seeking, volume, mute, rate, ranges, errors. (Events reach the element after the script that
+// caused them has returned, so the scripts here read them from a later click.)
+static void test_media_api() {
+  TestAllocator a;
+  const char* kLog = "var ev = []; ['loadstart','durationchange','loadedmetadata','loadeddata','progress','canplay','canplaythrough','suspend','play','playing','pause','seeking','seeked',"
+                     "'timeupdate','ended','volumechange','ratechange','waiting','emptied','error'].forEach(function(t) { v.addEventListener(t, function() { ev.push(t) }) });"
+                     "document.getElementById('e').onclick = function() { console.log(ev.join()); ev.length = 0 };";
+  {   // the state of a video that is there, the constants, the events of opening it
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v src=m.mp4 width=80 height=60></video><button id=b></button><button id=e></button><script>var v = document.getElementById('v');";
+    html += kLog;
+    html += "document.getElementById('b').onclick = function() {"
+            "  var r = [v.readyState, v.networkState, v.error, v.seeking, v.playbackRate, v.defaultPlaybackRate, v.preload, v.srcObject, v.paused, v.ended];"
+            "  r.push(HTMLMediaElement.HAVE_ENOUGH_DATA, v.HAVE_METADATA, HTMLMediaElement.NETWORK_NO_SOURCE, MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED);"
+            "  r.push(v instanceof HTMLMediaElement, v instanceof HTMLVideoElement);"
+            "  v.currentTime = 1; r.push(v.seeking, v.currentTime); v.fastSeek(0.5); r.push(v.currentTime);"
+            "  try { v.currentTime = Infinity } catch (e) { r.push(e.name) } try { v.currentTime = NaN } catch (e) { r.push(e.name) }"
+            "  v.currentTime = 99; r.push(v.currentTime); v.currentTime = -4; r.push(v.currentTime);"
+            "  v.volume = 0.5; v.volume = 0.5; v.muted = true; v.muted = true; v.muted = false;"
+            "  try { v.buffered.end(1) } catch (e) { r.push(e.name) } try { v.buffered.start(-1) } catch (e) { r.push(e.name) }"
+            "  r.push(v.buffered.start(0), v.buffered.end(0), v.played.length, v.seekable.end(0));"
+            "  v.preload = 'none'; r.push(v.preload, v.getAttribute('preload'));"
+            "  console.log(r.join(' ')) };</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    page.click(page.document().element_by_id("e")->serial, 0, 0);   // (the events of opening it, in the order the standard has them)
+    CHECK(page_log(page) == "loadstart,durationchange,loadedmetadata,loadeddata,progress,canplay,canplaythrough,suspend");
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page).substr(page_log(page).find(" | ") + 3) ==
+          "4 1  false 1 1 metadata  true false 4 1 3 4 true true true 1 0.5 TypeError TypeError 2 0 IndexSizeError IndexSizeError 0 2 0 2 none none");
+    page.step_objects(static_cast<double>(env.clock));
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    CHECK(page_log(page).find(" | seeking,seeking,seeking,seeking,volumechange,volumechange,volumechange,seeked,timeupdate") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // opening, playing, the end
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v src=m.mp4 autoplay></video><button id=e></button><script>var v = document.getElementById('v');";
+    html += kLog;
+    html += "v.addEventListener('ended', function() { console.log(ev.join()) });</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    for (int i = 0; i < 6; ++i) page.step_objects(static_cast<double>(env.clock + 300 * i));
+    CHECK(page_log(page).rfind("loadstart,durationchange,loadedmetadata,loadeddata,progress,canplay,canplaythrough,suspend,play,playing,timeupdate", 0) == 0);
+    CHECK(page_log(page).find(",pause,ended") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // seeked follows the seek by a step; pause fires
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v src=m.mp4></video><button id=b></button><button id=e></button><script>var v = document.getElementById('v');";
+    html += kLog;
+    html += "document.getElementById('b').onclick = function() { ev.length = 0; v.play(); v.currentTime = 1; console.log(v.seeking); v.pause() };</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page) == "true");
+    page.step_objects(static_cast<double>(env.clock));
+    CHECK(env.last_clip->position == 1000000);
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    CHECK(page_log(page) == "true | play,playing,seeking,timeupdate,pause,seeked,timeupdate");
+  }
+  CHECK(a.live == 0);
+  {   // a file that cannot be played: error, networkState, play() rejects
+    FakeEnvironment env(a);
+    env.can_play_video = false;
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4></video><video id=w></video><button id=b></button><script>var v = document.getElementById('v'), w = document.getElementById('w');"
+              "document.getElementById('b').onclick = function() {"
+              "  console.log(v.error.code, v.error.message !== '', v.networkState, v.readyState, w.networkState, w.error, isNaN(v.duration), v.buffered.length);"
+              "  v.play().catch(function(e) { console.log('v', e.name) }); w.play().catch(function(e) { console.log('w', e.name) }) };</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page) == "4 true 3 0 0 null true 0 | v NotSupportedError | w NotSupportedError");
+  }
+  CHECK(a.live == 0);
+  {   // playbackRate: what is allowed, ratechange, defaultPlaybackRate and load()
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = "<html><body><video id=v src=m.mp4 autoplay></video><button id=b></button><button id=e></button><script>var v = document.getElementById('v');";
+    html += kLog;
+    html += "document.getElementById('b').onclick = function() { ev.length = 0; var r = [];"
+            "  v.playbackRate = 2; v.playbackRate = 2; r.push(v.playbackRate);"
+            "  try { v.playbackRate = 17 } catch (e) { r.push(e.name) } try { v.playbackRate = -1 } catch (e) { r.push(e.name) } try { v.playbackRate = 0.01 } catch (e) { r.push(e.name) }"
+            "  try { v.playbackRate = NaN } catch (e) { r.push(e.name) } r.push(v.playbackRate);"
+            "  v.defaultPlaybackRate = 3; r.push(v.defaultPlaybackRate, v.playbackRate); v.load(); r.push(v.playbackRate);"
+            "  console.log(r.join(' ')) };</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip && env.last_clip->is_playing);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page) == "2 NotSupportedError NotSupportedError NotSupportedError TypeError 2 3 2 3");
+    page.step_objects(static_cast<double>(env.clock));
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    CHECK(page_log(page).find(" | ratechange,ratechange,emptied,ratechange") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // the rate reaches the clip, or the page follows the clock; set before the page was drawn, too
+    for (int native = 0; native < 2; ++native) {
+      FakeEnvironment env(a);
+      env.clips_play_at_any_rate = native != 0;
+      env.blobs["http://example.com/m.mp4"] = "movie";
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      page.load("<html><body><video id=v src=m.mp4></video><script>var v = document.getElementById('v'); v.playbackRate = 4; v.volume = 0.5;</script></body></html>");
+      HtmlDocument doc(a);
+      page.render(&doc);
+      CHECK(env.last_clip && env.last_clip->rate == (native ? 4.0 : 1.0));
+      CHECK(env.last_clip->muted == !native);   // (a clip kept on time by seeking is silent)
+      CHECK(env.last_clip->volume == 0.5);
+    }
+    // 0.5 on a clip that cannot: it waits for the clock instead of running ahead
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 autoplay></video><script>var v = document.getElementById('v'); v.playbackRate = 0.5;</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip->is_playing);
+    page.step_objects(static_cast<double>(env.clock));        // (the clip runs 500 ms ahead of a clock that has not moved)
+    page.step_objects(static_cast<double>(env.clock + 1));
+    CHECK(!env.last_clip->is_playing);                        // waiting
+    page.step_objects(static_cast<double>(env.clock + 1100));   // (0.5 x 1100 ms = 550 ms: the clip may go on)
+    CHECK(env.last_clip->is_playing);
+    page.step_objects(static_cast<double>(env.clock + 40000));  // (long past the end)
+    page.step_objects(static_cast<double>(env.clock + 40001));
+    CHECK(!env.last_clip->is_playing && env.last_clip->position == env.last_clip->duration);
+  }
+  CHECK(a.live == 0);
+  {   // currentTime and play() before there is a file; play() of an element whose file is not drawn yet waits for it
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v preload=none></video><audio id=w src=m.mp4></audio><button id=b></button><script>var v = document.getElementById('v'); var r = [v.networkState, v.readyState, v.paused];"
+              "v.currentTime = 1.5; r.push(v.currentTime); v.play().catch(function(e) { r.push(e.name) }); r.push(v.paused);"
+              "var w = document.getElementById('w'); w.currentTime = 1; w.play(); r.push(w.paused);"
+              "document.getElementById('b').onclick = function() { v.src = 'm.mp4'; r.push(v.currentSrc !== ''); r.push(w.paused, w.currentTime); console.log(r.join(' ')) };</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    CHECK(env.last_clip && env.last_clip->is_playing && env.last_clip->position >= 1000000);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    CHECK(page_log(page) == "0 0 true 1.5 true false NotSupportedError true false 1");
+  }
+  CHECK(a.live == 0);
+}
 
 // --- Forms ------------------------------------------------------------------------------------------------------------------------
 
@@ -2367,6 +2539,7 @@ int main(int argc, char** argv) {
   test_canvas_scripts();
   test_video();
   test_audio();
+  test_media_api();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

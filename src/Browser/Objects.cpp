@@ -490,16 +490,20 @@ void PageObjects::sync_image(dom::Node* n, IObjectEnvironment& env, StringView b
 
 // --- Videos -----------------------------------------------------------------------------------------------------------------------
 
+PageObjects::VideoSlot* PageObjects::ensure_video(uint32_t serial) {
+  if (VideoSlot* v = find_video(serial)) return v;
+  if (videos_.count() >= kMaxVideos) return nullptr;
+  auto fresh = UniquePointer<VideoSlot>::make(allocator_, allocator_);
+  if (!fresh || !videos_.push_back(util::move(fresh))) return nullptr;
+  VideoSlot* slot = videos_[videos_.count() - 1].get();
+  slot->serial = serial;
+  return slot;
+}
+
 void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched) {
   (void)media;
-  VideoSlot* slot = find_video(n->serial);
-  if (!slot) {
-    if (videos_.count() >= kMaxVideos) return;
-    auto fresh = UniquePointer<VideoSlot>::make(allocator_, allocator_);
-    if (!fresh || !videos_.push_back(util::move(fresh))) return;
-    slot = videos_[videos_.count() - 1].get();
-    slot->serial = n->serial;
-  }
+  VideoSlot* slot = ensure_video(n->serial);
+  if (!slot) return;
   slot->seen = true;
   slot->audio = n->is_tag("audio");
   slot->controls = dom::has_attribute(n, "controls");
@@ -537,12 +541,16 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
       break;
     }
   }
+  slot->has_source = !candidate.empty();
   if (candidate.empty()) {
     if (slot->state != 0 || slot->clip) {
+      if (slot->clip) queue(n->serial, "emptied");
       slot->clip = UniquePointer<IVideoClip>();
       slot->state = 0;
       slot->url.clear();
       slot->have_picture = false;
+      slot->error_code = 0;
+      slot->ended = slot->seeking = slot->throttled = false;
     }
     return;
   }
@@ -554,13 +562,22 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
   }
   if (*fetched >= 4) return;   // (a few big downloads per drawing of the page)
   ++*fetched;
+  if (slot->clip) queue(n->serial, "emptied");
+  if (slot->clip || slot->state != 0) {   // (another file than the one it had: what the old one left is gone; a script's settings from before it was fetched stay)
+    slot->ended = slot->seeking = slot->throttled = false;
+    slot->played_end_us = 0;
+    slot->rate = slot->default_rate;
+  }
   slot->url.assign(resolved ? absolute.view() : candidate.view());
   slot->clip = UniquePointer<IVideoClip>();
+  slot->error_code = 0;
   slot->have_picture = false;
   slot->picture_serial = 0xFFFFFFFFu;
   release_scaled(&slot->scaled);
   if (!resolved) {
     slot->state = 2;
+    slot->error_code = 4;   // MEDIA_ERR_SRC_NOT_SUPPORTED
+    slot->wants_play = slot->play_pending = false;
     queue(n->serial, "error");
     return;
   }
@@ -577,6 +594,8 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
   if (got) slot->clip = slot->audio ? env.open_audio(util::move(bytes)) : env.open_video(util::move(bytes));
   if (!slot->clip) {
     slot->state = 2;
+    slot->error_code = 4;   // MEDIA_ERR_SRC_NOT_SUPPORTED
+    slot->wants_play = slot->play_pending = false;
     queue(n->serial, "error");
     dirty_ = true;
     return;
@@ -584,16 +603,34 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
   slot->state = 1;
   slot->ended = false;
   slot->clip->set_looping(slot->loop);
-  slot->clip->set_volume(slot->volume, slot->muted);
-  if (!slot->audio) slot->picture = allocate_view<uint32_t>(allocator_, uint64_t{slot->clip->width() ? slot->clip->width() : 1} * (slot->clip->height() ? slot->clip->height() : 1));
+  apply_volume(*slot);
+  apply_rate(*slot);
+  if (slot->pending_seek_us >= 0) {   // (currentTime was set before the file was there)
+    const int64_t duration = slot->clip->duration_us();
+    slot->clip->seek(duration > 0 && slot->pending_seek_us > duration ? duration : slot->pending_seek_us);
+    slot->pending_seek_us = -1;
+  }
+  if (!slot->audio) {
+    release_view(allocator_, slot->picture);
+    slot->picture = allocate_view<uint32_t>(allocator_, uint64_t{slot->clip->width() ? slot->clip->width() : 1} * (slot->clip->height() ? slot->clip->height() : 1));
+  }
+  // (the whole file is in memory: it is buffered from the start, and nothing is left to wait for)
   queue(n->serial, "loadstart");
+  if (slot->clip->duration_us() > 0) queue(n->serial, "durationchange");
   queue(n->serial, "loadedmetadata");
   queue(n->serial, "loadeddata");
+  queue(n->serial, "progress");
   queue(n->serial, "canplay");
+  queue(n->serial, "canplaythrough");
+  queue(n->serial, "suspend");
   if (slot->autoplay || slot->wants_play) {
+    const bool announced = slot->play_pending;   // ("play" was fired when play() was called)
     if (slot->clip->play()) {
       slot->was_playing = true;
-      queue(n->serial, "play");
+      slot->wants_play = true;
+      slot->play_pending = false;
+      reanchor(*slot);
+      if (!announced) queue(n->serial, "play");
       queue(n->serial, "playing");
     }
   }
@@ -660,8 +697,17 @@ void PageObjects::update(uint64_t now_ms) {
     VideoSlot& v = *videos_[i];
     if (!v.clip) continue;
     v.clip->update();
-    const bool playing = v.clip->playing();
+    if (v.seeking) {   // (the seek has been made: the clip had its turn to show the new place)
+      v.seeking = false;
+      queue(v.serial, "seeked");
+      queue(v.serial, "timeupdate");
+      dirty_ = true;
+    }
+    follow_clock(v);
+    const bool playing = slot_playing(v);
     if (playing) {
+      const int64_t at = v.clip->position_us();
+      if (at > v.played_end_us) v.played_end_us = at;
       dirty_ = true;
       if (now_ms >= v.last_timeupdate_ms + 250) {
         v.last_timeupdate_ms = now_ms;
@@ -674,6 +720,7 @@ void PageObjects::update(uint64_t now_ms) {
       if (duration <= 0 || v.clip->position_us() >= duration - 150000) {
         v.ended = true;
         v.wants_play = false;
+        v.throttled = false;
         queue(v.serial, "timeupdate");
         queue(v.serial, "pause");
         queue(v.serial, "ended");
@@ -687,7 +734,7 @@ void PageObjects::update(uint64_t now_ms) {
 bool PageObjects::animating() {
   Lock lock(*this);
   for (uint64_t i = 0; i < videos_.count(); ++i)
-    if (videos_[i]->clip && videos_[i]->clip->playing()) return true;
+    if (slot_playing(*videos_[i])) return true;
   for (uint64_t i = 0; i < images_.count(); ++i)
     if (images_[i]->state == 1 && images_[i]->cache >= 0 && cache_[static_cast<uint64_t>(images_[i]->cache)]->image.frame_count() > 1) return true;
   return false;
@@ -846,7 +893,7 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
   if (v.controls && w >= 80 && (v.audio ? h >= 24 : h >= 40)) {
     const int32_t bar = v.audio ? static_cast<int32_t>(h - 24) / 2 : static_cast<int32_t>(h) - 24;
     r.fill_rect(v.audio ? Rect2D{x, y, w, h} : Rect2D{x, y + bar, w, 24}, v.audio ? 0xFF202020u : 0xC0101010u);
-    const bool playing = v.clip && v.clip->playing();
+    const bool playing = slot_playing(v);
     if (playing) {
       r.fill_rect({x + 9, y + bar + 6, 4, 12}, 0xFFFFFFFFu);
       r.fill_rect({x + 16, y + bar + 6, 4, 12}, 0xFFFFFFFFu);
@@ -919,31 +966,13 @@ bool PageObjects::object_clicked(uint32_t serial, int32_t lx, int32_t ly, uint32
     if (track_w > 8 && lx <= 32 + track_w) {
       const double fraction = static_cast<double>(lx - 32) / track_w;
       const double duration = static_cast<double>(v->clip->duration_us());
-      v->clip->seek(static_cast<int64_t>(fraction * duration));
-      v->ended = false;
-      queue(serial, "seeking");
-      queue(serial, "seeked");
-      queue(serial, "timeupdate");
-      dirty_ = true;
+      seek_slot(*v, static_cast<int64_t>(fraction * duration));
       return true;
     }
     return false;
   }
-  if (v->clip->playing()) {
-    v->clip->pause();
-    v->was_playing = false;
-    v->wants_play = false;
-    queue(serial, "pause");
-  } else {
-    if (v->ended) v->clip->seek(0);
-    v->ended = false;
-    if (v->clip->play()) {
-      v->was_playing = true;
-      v->wants_play = true;
-      queue(serial, "play");
-      queue(serial, "playing");
-    }
-  }
+  if (slot_playing(*v)) pause_slot(*v);
+  else play_slot(*v);
   dirty_ = true;
   return true;
 }
@@ -1042,76 +1071,192 @@ void PageObjects::video_state(uint32_t serial, VideoState* out) {
   out->muted = v->muted;
   out->volume = v->volume;
   out->ended = v->ended;
+  out->seeking = v->seeking;
+  out->rate = v->rate;
+  out->default_rate = v->default_rate;
+  out->error_code = v->error_code;
   if (out->ready) {
-    out->paused = !v->clip->playing();
+    out->paused = !(v->wants_play || slot_playing(*v));
     out->current_time = static_cast<double>(v->clip->position_us()) / 1e6;
     out->duration = static_cast<double>(v->clip->duration_us()) / 1e6;
+    out->buffered_end = out->duration;
+    out->played_end = static_cast<double>(v->played_end_us) / 1e6;
+    if (out->played_end < out->current_time) out->played_end = out->current_time;
     out->width = v->clip->width();
     out->height = v->clip->height();
+    out->ready_state = 4;
+    out->network_state = 1;
   } else {
     out->paused = !v->wants_play;
+    if (v->pending_seek_us > 0) out->current_time = static_cast<double>(v->pending_seek_us) / 1e6;
+    out->ready_state = 0;
+    out->network_state = v->state == 2 ? 3 : v->has_source ? 2 : 0;
   }
 }
 
-bool PageObjects::video_play(uint32_t serial) {
-  Lock lock(*this);
-  VideoSlot* v = find_video(serial);
-  if (!v) return false;
-  v->wants_play = true;
-  if (!v->clip) return true;   // (plays as soon as it is there)
-  if (v->ended) v->clip->seek(0);
-  v->ended = false;
-  if (!v->clip->playing()) {
-    if (!v->clip->play()) return false;
-    queue(serial, "play");
-    queue(serial, "playing");
+// The speed the clip plays at, and the sound it makes while it is made to keep up by seeking (that would only crackle).
+void PageObjects::apply_rate(VideoSlot& v) {
+  if (!v.clip) return;
+  v.emulate_rate = !v.clip->set_rate(v.rate);
+  if (!v.emulate_rate && v.throttled) {
+    v.throttled = false;
+    v.clip->play();
   }
-  v->was_playing = true;
+  apply_volume(v);
+  reanchor(v);
+}
+
+void PageObjects::apply_volume(VideoSlot& v) {
+  if (v.clip) v.clip->set_volume(v.volume, v.muted || (v.emulate_rate && v.rate != 1));
+}
+
+void PageObjects::reanchor(VideoSlot& v) {
+  v.anchor_ms = now_ms_;
+  v.anchor_us = v.clip ? v.clip->position_us() : 0;
+}
+
+// A clip that cannot play at the page's playbackRate is kept on time: where it should be is how far the host clock has gone since the anchor, times the
+// rate. Ahead of that it waits (paused for a moment); behind it, it is moved on.
+void PageObjects::follow_clock(VideoSlot& v) {
+  if (!v.clip || !v.emulate_rate || !(v.wants_play || slot_playing(v)) || v.ended) return;
+  if (v.anchor_ms == 0) {   // (nothing has told the clock yet)
+    reanchor(v);
+    return;
+  }
+  const int64_t elapsed_us = now_ms_ > v.anchor_ms ? static_cast<int64_t>(now_ms_ - v.anchor_ms) * 1000 : 0;
+  int64_t target = v.anchor_us + static_cast<int64_t>(static_cast<double>(elapsed_us) * v.rate);
+  const int64_t duration = v.clip->duration_us();
+  if (duration > 0 && target >= duration) {
+    if (v.loop) {
+      target %= duration;
+      v.anchor_us = target;
+      v.anchor_ms = now_ms_;
+      v.clip->seek(target);
+    } else {   // the end: the clip stops there, which update() takes as the end of the file
+      v.clip->seek(duration);
+      v.clip->pause();
+      v.throttled = false;
+    }
+    return;
+  }
+  const int64_t ahead = v.clip->position_us() - target;
+  if (ahead > 40000) {
+    if (!v.throttled && v.clip->playing()) {
+      v.clip->pause();
+      v.throttled = true;
+    }
+  } else {
+    if (v.throttled) {
+      v.throttled = false;
+      v.clip->play();
+    }
+    if (ahead < -120000) v.clip->seek(target);
+  }
+}
+
+bool PageObjects::play_slot(VideoSlot& v) {
+  if (v.state == 2 || (!v.clip && !v.has_source)) return false;
+  const bool was_paused = !v.wants_play && !slot_playing(v);
+  v.wants_play = true;
+  if (!v.clip) {   // still on its way: it plays as soon as it is there
+    if (was_paused) {
+      queue(v.serial, "play");
+      queue(v.serial, "waiting");
+      v.play_pending = true;
+    }
+    return true;
+  }
+  if (v.ended) seek_slot(v, 0);
+  v.ended = false;
+  if (!slot_playing(v)) {
+    if (!v.clip->play()) {
+      v.wants_play = false;
+      return false;
+    }
+    if (was_paused) queue(v.serial, "play");
+    queue(v.serial, "playing");
+  }
+  v.was_playing = true;
+  reanchor(v);
   dirty_ = true;
   return true;
+}
+
+void PageObjects::pause_slot(VideoSlot& v) {
+  const bool was_playing = v.wants_play || slot_playing(v);
+  v.wants_play = false;
+  v.was_playing = false;
+  v.play_pending = false;
+  v.throttled = false;
+  if (v.clip && v.clip->playing()) v.clip->pause();
+  if (was_playing) {
+    queue(v.serial, "timeupdate");
+    queue(v.serial, "pause");
+    dirty_ = true;
+  }
+}
+
+void PageObjects::seek_slot(VideoSlot& v, int64_t microseconds) {
+  if (microseconds < 0) microseconds = 0;
+  if (!v.clip) {
+    v.pending_seek_us = microseconds;
+    return;
+  }
+  const int64_t duration = v.clip->duration_us();
+  if (duration > 0 && microseconds > duration) microseconds = duration;
+  v.clip->seek(microseconds);
+  v.ended = false;
+  v.seeking = true;
+  queue(v.serial, "seeking");
+  reanchor(v);
+  if (v.throttled) {   // (picks up again from the new place)
+    v.throttled = false;
+    v.clip->play();
+  }
+  dirty_ = true;
+}
+
+bool PageObjects::video_play(uint32_t serial, bool audio, bool has_source) {
+  Lock lock(*this);
+  VideoSlot* v = ensure_video(serial);
+  if (!v) return false;
+  v->audio = audio;
+  if (has_source) v->has_source = true;
+  return play_slot(*v);
 }
 
 void PageObjects::video_pause(uint32_t serial) {
   Lock lock(*this);
   VideoSlot* v = find_video(serial);
-  if (!v) return;
-  v->wants_play = false;
-  v->was_playing = false;
-  if (v->clip && v->clip->playing()) {
-    v->clip->pause();
-    queue(serial, "pause");
-    dirty_ = true;
-  }
+  if (v) pause_slot(*v);
 }
 
 void PageObjects::video_seek(uint32_t serial, double seconds) {
   Lock lock(*this);
-  VideoSlot* v = find_video(serial);
-  if (!v || !v->clip || seconds != seconds) return;
-  if (seconds < 0) seconds = 0;
-  v->clip->seek(static_cast<int64_t>(seconds * 1e6));
-  v->ended = false;
-  queue(serial, "seeking");
-  queue(serial, "seeked");
-  queue(serial, "timeupdate");
-  dirty_ = true;
+  VideoSlot* v = ensure_video(serial);
+  if (!v || seconds != seconds) return;
+  // (kept inside what an int64_t of microseconds holds; seek_slot() clamps to the duration)
+  if (seconds > 9e9) seconds = 9e9;
+  seek_slot(*v, seconds < 0 ? 0 : static_cast<int64_t>(seconds * 1e6));
 }
 
 void PageObjects::video_set_volume(uint32_t serial, double volume) {
   Lock lock(*this);
-  VideoSlot* v = find_video(serial);
+  VideoSlot* v = ensure_video(serial);
   if (!v) return;
-  v->volume = volume < 0 ? 0 : volume > 1 ? 1 : volume;
-  if (v->clip) v->clip->set_volume(v->volume, v->muted);
+  const double clamped = volume < 0 ? 0 : volume > 1 ? 1 : volume;
+  if (clamped == v->volume) return;
+  v->volume = clamped;
+  apply_volume(*v);
   queue(serial, "volumechange");
 }
 
 void PageObjects::video_set_muted(uint32_t serial, bool muted) {
   Lock lock(*this);
-  VideoSlot* v = find_video(serial);
-  if (!v) return;
+  VideoSlot* v = ensure_video(serial);
+  if (!v || v->muted == muted) return;
   v->muted = muted;
-  if (v->clip) v->clip->set_volume(v->volume, v->muted);
+  apply_volume(*v);
   queue(serial, "volumechange");
 }
 
@@ -1123,15 +1268,40 @@ void PageObjects::video_set_loop(uint32_t serial, bool loop) {
   if (v->clip) v->clip->set_looping(loop);
 }
 
+void PageObjects::video_set_rate(uint32_t serial, double rate) {
+  Lock lock(*this);
+  VideoSlot* v = ensure_video(serial);
+  if (!v || rate != rate || rate < 0 || rate > 16 || rate == v->rate) return;
+  v->rate = rate;
+  apply_rate(*v);
+  queue(serial, "ratechange");
+}
+
+void PageObjects::video_set_default_rate(uint32_t serial, double rate) {
+  Lock lock(*this);
+  VideoSlot* v = ensure_video(serial);
+  if (!v || rate != rate || rate < 0 || rate > 16 || rate == v->default_rate) return;
+  v->default_rate = rate;
+  queue(serial, "ratechange");
+}
+
 void PageObjects::video_load(uint32_t serial) {
   Lock lock(*this);
   VideoSlot* v = find_video(serial);
   if (!v) return;
+  if (v->clip || v->state != 0) queue(serial, "emptied");
   v->clip = UniquePointer<IVideoClip>();
   v->state = 0;
   v->url.clear();
   v->have_picture = false;
-  v->ended = false;
+  v->ended = v->seeking = v->throttled = v->wants_play = v->was_playing = v->play_pending = false;
+  v->error_code = 0;
+  v->pending_seek_us = -1;
+  v->played_end_us = 0;
+  if (v->rate != v->default_rate) {
+    v->rate = v->default_rate;
+    queue(serial, "ratechange");
+  }
   dirty_ = true;
 }
 

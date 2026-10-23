@@ -24,7 +24,10 @@
 //             error events are queued for the page to fire.
 //   <video>   the file is fetched and handed to the environment to play (IVideoClip: AVI, MP4 / MOV with H.264, GIF, APNG, WebP, Y4M - on the video
 //             hardware where the machine has some); the current picture is drawn, a poster before that, and a control bar when the element asks for
-//             controls. play() / pause() / currentTime / volume and the media events are the script side of the same thing.
+//             controls. play() / pause() / currentTime / volume / muted / playbackRate and the media events are the script side of the same thing: the
+//             element's readyState, networkState, error, seeking, buffered / seekable / played ranges follow what the file and the clip are doing. The
+//             file is fetched whole (fetch_bytes), so it is buffered from the moment it opens; a clip that cannot play at another speed is made to by
+//             seeking (with its sound muted), see update().
 //   <audio>   the same, without a picture: the file (MP3, AAC / M4A, Ogg Vorbis, FLAC, WAV, AIFF, AU, MIDI ...) is handed to the environment to play
 //             (open_audio()); only an element with controls takes room on the page - a bar with play / pause, a position and the time. `new Audio(src)` too.
 //   <canvas>  a CanvasBitmap (see Canvas.hpp), drawn by the renderer the page is shown on - the GPU's when the machine has one.
@@ -55,6 +58,8 @@ class IVideoClip {
   virtual void seek(int64_t microseconds) = 0;
   virtual void set_looping(bool looping) = 0;
   virtual void set_volume(double volume, bool muted) = 0;
+  // Plays at `rate` times the normal speed; false if this clip only plays at normal speed (it does for 1). The page then follows the clock itself by seeking.
+  virtual bool set_rate(double rate) { return rate == 1; }
   virtual bool playing() = 0;
   virtual int64_t position_us() = 0;
   virtual int64_t duration_us() = 0;
@@ -160,17 +165,25 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
 
   // --- Videos (script side)
   struct VideoState {
-    bool known = false, ready = false, paused = true, ended = false, loop = false, muted = false;
-    double current_time = 0, duration = 0, volume = 1;
+    bool known = false, ready = false, paused = true, ended = false, loop = false, muted = false, seeking = false;
+    double current_time = 0, duration = 0, volume = 1, rate = 1, default_rate = 1;
+    double buffered_end = 0, played_end = 0;   // seconds; the buffered and seekable range is 0 to buffered_end, the played one 0 to played_end
     uint32_t width = 0, height = 0;
+    uint8_t ready_state = 0;     // HAVE_NOTHING 0 .. HAVE_ENOUGH_DATA 4
+    uint8_t network_state = 0;   // NETWORK_EMPTY 0, IDLE 1, LOADING 2, NO_SOURCE 3
+    uint8_t error_code = 0;      // MediaError.code, 0 for none
   };
   void video_state(uint32_t serial, VideoState* out);
-  bool video_play(uint32_t serial);
+  // False if there is nothing that could play (no source, or one that failed): play() then rejects with NotSupportedError.
+  // (`audio` and `has_source` say what the element is and whether it names a file: they are known to the script before the page has been through sync().)
+  bool video_play(uint32_t serial, bool audio, bool has_source);
   void video_pause(uint32_t serial);
-  void video_seek(uint32_t serial, double seconds);
+  void video_seek(uint32_t serial, double seconds);   // clamped to 0 .. duration; the position is kept for a file that has not opened yet
   void video_set_volume(uint32_t serial, double volume);
   void video_set_muted(uint32_t serial, bool muted);
   void video_set_loop(uint32_t serial, bool loop);
+  void video_set_rate(uint32_t serial, double rate);           // playbackRate, 0 .. 16 (the caller checks)
+  void video_set_default_rate(uint32_t serial, double rate);   // defaultPlaybackRate: what playbackRate is after load()
   void video_load(uint32_t serial);   // fetch again
 
  private:
@@ -202,7 +215,15 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     UniquePointer<IVideoClip> clip;
     uint8_t state = 0;           // 0 nothing yet, 1 ready, 2 failed
     bool audio = false, seen = false, controls = false, loop = false, muted = false, autoplay = false, ended = false, was_playing = false, announced = false, wants_play = false;
-    double volume = 1;
+    bool has_source = false;     // the element names a file (it may not be fetched yet)
+    bool seeking = false;        // a seek was made; "seeked" follows at the next update()
+    bool play_pending = false;   // "play" was fired while the file was still on its way; "playing" is owed
+    bool emulate_rate = false;   // the clip cannot play at `rate`: update() keeps it on time by seeking
+    bool throttled = false;      // (emulating a rate below 1) the clip is paused for a moment to let the clock catch up
+    uint8_t error_code = 0;
+    double volume = 1, rate = 1, default_rate = 1;
+    int64_t pending_seek_us = -1, played_end_us = 0, anchor_us = 0;
+    uint64_t anchor_ms = 0;      // the host clock and the clip's position when it last started playing, or changed speed or place
     uint64_t last_timeupdate_ms = 0;
     ArrayView<uint32_t> picture;
     uint32_t picture_serial = 0xFFFFFFFFu;
@@ -226,6 +247,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
 
   ImageSlot* find_image(uint32_t serial);
   VideoSlot* find_video(uint32_t serial);
+  VideoSlot* ensure_video(uint32_t serial);   // (a script can set the volume or the rate of an element before the page has been drawn: the slot is made then)
   CanvasSlot* find_canvas(uint32_t serial);
   SvgSlot* find_svg(uint32_t serial);
   void sync_svg(dom::Document& doc, dom::Node* n);
@@ -233,6 +255,15 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   int32_t load_image_url(IObjectEnvironment& env, StringView url, bool* failed);
   void sync_image(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched);
   void sync_video(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched);
+  // The media element algorithms; the script side and the control bar both go through them, so the events are the same.
+  bool play_slot(VideoSlot& v);
+  void pause_slot(VideoSlot& v);
+  void seek_slot(VideoSlot& v, int64_t microseconds);
+  void apply_rate(VideoSlot& v);
+  void apply_volume(VideoSlot& v);
+  void reanchor(VideoSlot& v);
+  void follow_clock(VideoSlot& v);
+  static bool slot_playing(const VideoSlot& v) { return v.clip && (v.clip->playing() || v.throttled); }
   bool choose_source(const dom::Node* img, const MediaEnvironment& media, String* out);
   void queue(uint32_t serial, const char* type);
   void draw_scaled(graphics::IRenderer2D& r, Scaled& cache, const ImageSource& src, uint32_t frame, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip,

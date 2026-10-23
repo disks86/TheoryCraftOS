@@ -140,7 +140,7 @@ void base64_encode(ConstByteView bytes, String* out) {
   }
 }
 
-// --- Thenables: play() returns something that .then() and .catch() work on (there are no promises) -----------------------------------
+// --- Thenables: what canvas.toBlob() and img.decode() hand back, something that .then() and .catch() work on -------------------------
 
 NATIVE(thenable_then) {
   const Value fn = arg_at(args, argc, 0);
@@ -171,17 +171,45 @@ NATIVE(thenable_finally) {
 
 Value make_thenable(DomBindings::Impl& c) { return Value::make_object(c.vm.new_object(c.thenable_proto)); }
 
-// A TimeRanges: one range, 0 to `end`.
+// A TimeRanges: one range, 0 to `end` (none when `end` is 0).
+bool range_index(Vm& vm, const Value& self, const Value* args, uint32_t argc, const char* function) {
+  if (!need_args(vm, argc, 1, function)) return false;
+  double index, length;
+  Value l;
+  if (!arg_number(vm, args, argc, 0, &index) || !vm.get_named(self, "length", &l) || !vm.to_number(l, &length)) return false;
+  if (!(index >= 0 && index < length)) {
+    String m(vm.allocator());
+    m.append("Failed to execute '");
+    m.append(function);
+    m.append("' on 'TimeRanges': The index provided (");
+    m.append_uint(index >= 0 && index < 4294967295.0 ? static_cast<uint64_t>(index) : 0);
+    m.append(") is greater than or equal to the maximum bound (");
+    m.append_uint(static_cast<uint64_t>(length));
+    m.append(").");
+    return throw_dom(vm, "IndexSizeError", m.view());
+  }
+  return true;
+}
 NATIVE(ranges_start) {
-  (void)vm; (void)self; (void)args; (void)argc;
+  if (!range_index(vm, self, args, argc, "start")) return false;
   *result = num_value(0);
   return true;
 }
 NATIVE(ranges_end) {
+  if (!range_index(vm, self, args, argc, "end")) return false;
   Value e;
   if (!vm.get_named(self, "__end", &e)) return false;
   *result = e;
   return true;
+}
+
+// element.error: a MediaError (the code is what MediaError.MEDIA_ERR_* says).
+Value make_media_error(DomBindings::Impl& c, uint32_t code) {
+  Vm& vm = c.vm;
+  JsObject* o = vm.new_object(c.media_error_proto);
+  vm.define_named(o, "code", num_value(code));
+  vm.define_named(o, "message", str_value(vm, code == 4 ? "MEDIA_ELEMENT_ERROR: Format error" : "MEDIA_ELEMENT_ERROR: Media error"));
+  return Value::make_object(o);
 }
 
 Value make_ranges(DomBindings::Impl& c, double end) {
@@ -230,18 +258,27 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
     if (IS("duration")) { *out = num_value(st.ready ? st.duration : nan_value()); return true; }
     if (IS("paused")) { *out = bool_value(st.paused); return true; }
     if (IS("ended")) { *out = bool_value(st.ended); return true; }
-    if (IS("seeking")) { *out = bool_value(false); return true; }
+    if (IS("seeking")) { *out = bool_value(st.seeking); return true; }
     if (IS("volume")) { *out = num_value(st.volume); return true; }
     if (IS("muted")) { *out = bool_value(st.muted); return true; }
-    if (IS("readyState")) { *out = num_value(st.ready ? 4 : 0); return true; }
-    if (IS("networkState")) { *out = num_value(st.ready ? 1 : st.known ? 3 : 0); return true; }
+    if (IS("readyState")) { *out = num_value(st.ready_state); return true; }
+    if (IS("networkState")) { *out = num_value(st.network_state); return true; }
     if (IS("videoWidth")) { *out = num_value(st.width); return true; }
     if (IS("videoHeight")) { *out = num_value(st.height); return true; }
-    if (IS("playbackRate") || IS("defaultPlaybackRate")) { *out = num_value(1); return true; }
-    if (IS("error")) { *out = Value::make_null(); return true; }
+    if (IS("playbackRate")) { *out = num_value(st.rate); return true; }
+    if (IS("defaultPlaybackRate")) { *out = num_value(st.default_rate); return true; }
+    if (IS("error")) { *out = st.error_code ? make_media_error(c, st.error_code) : Value::make_null(); return true; }
+    if (IS("srcObject")) { *out = Value::make_null(); return true; }
+    if (IS("preload")) {
+      StringView p;
+      const bool given = dom::get_attribute(n, "preload", &p);
+      p = p.trimmed();
+      *out = str_value(vm, !given ? "metadata" : p.equals_ignore_case("none") ? "none" : p.equals_ignore_case("metadata") ? "metadata" : "auto");
+      return true;
+    }
     if (IS("preservesPitch")) { *out = bool_value(true); return true; }
-    if (IS("buffered") || IS("seekable")) { *out = make_ranges(c, st.ready ? st.duration : 0); return true; }
-    if (IS("played")) { *out = make_ranges(c, st.ready ? st.current_time : 0); return true; }
+    if (IS("buffered") || IS("seekable")) { *out = make_ranges(c, st.buffered_end); return true; }
+    if (IS("played")) { *out = make_ranges(c, st.played_end); return true; }
     if (IS("currentSrc")) {
       StringView src;
       String abs(vm.allocator());
@@ -266,7 +303,32 @@ HostClass::Set media_set(DomBindings::Impl& c, dom::Node* n, StringView k, const
     if (IS("currentTime")) {
       double d;
       if (!vm.to_number(value, &d)) return HostClass::Set::Threw;
+      if (!finite(d)) {
+        vm.throw_error(ErrorKind::TypeError, "Failed to set the 'currentTime' property on 'HTMLMediaElement': The provided double value is non-finite.");
+        return HostClass::Set::Threw;
+      }
       objs(vm).video_seek(n->serial, d);
+      return HostClass::Set::Handled;
+    }
+    if (IS("playbackRate") || IS("defaultPlaybackRate")) {
+      double d;
+      if (!vm.to_number(value, &d)) return HostClass::Set::Threw;
+      if (!finite(d)) {
+        vm.throw_error(ErrorKind::TypeError, "The provided double value is non-finite.");
+        return HostClass::Set::Threw;
+      }
+      if (d < 0 || d > 16 || (d > 0 && d < 0.0625)) {   // (what the player can be made to do: 1/16 to 16 times the speed, or stopped)
+        throw_dom(vm, "NotSupportedError", "The provided playback rate is not in the supported playback range.");
+        return HostClass::Set::Threw;
+      }
+      if (IS("playbackRate")) objs(vm).video_set_rate(n->serial, d);
+      else objs(vm).video_set_default_rate(n->serial, d);
+      return HostClass::Set::Handled;
+    }
+    if (IS("preload")) {
+      String text(vm.allocator());
+      if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+      dom::set_attribute(n, "preload", text.view());
       return HostClass::Set::Handled;
     }
     if (IS("volume")) {
@@ -291,9 +353,9 @@ HostClass::Set media_set(DomBindings::Impl& c, dom::Node* n, StringView k, const
       if (IS("loop")) objs(vm).video_set_loop(n->serial, on);
       return HostClass::Set::Handled;
     }
-    if (IS("playbackRate") || IS("defaultPlaybackRate") || IS("preservesPitch") || IS("currentSrc") || IS("duration") || IS("paused") || IS("ended") || IS("readyState") ||
-        IS("videoWidth") || IS("videoHeight"))
-      return HostClass::Set::Handled;
+    if (IS("preservesPitch") || IS("currentSrc") || IS("duration") || IS("paused") || IS("ended") || IS("readyState") || IS("networkState") || IS("seeking") ||
+        IS("error") || IS("buffered") || IS("seekable") || IS("played") || IS("videoWidth") || IS("videoHeight"))
+      return HostClass::Set::Handled;   // (read-only)
     return HostClass::Set::NotHandled;
   }
   if (n->is_tag("canvas") && (IS("width") || IS("height"))) {
@@ -316,12 +378,40 @@ namespace {
 
 // --- Element methods --------------------------------------------------------------------------------------------------------------
 
+StringView attr_text(const dom::Node* n, const char* name) {
+  StringView v;
+  return dom::get_attribute(n, name, &v) ? v.trimmed() : StringView();
+}
+
 NATIVE(el_play) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
   if (!n->is_tag("video") && !n->is_tag("audio")) return vm.throw_error(ErrorKind::TypeError, "play is not a function");
-  objs(vm).video_play(n->serial);
-  *result = make_thenable(impl(vm));
+  // The promise is settled at once: fulfilled when the element can play (or will, when its file is there), rejected when it has nothing it could play.
+  JsObject* promise = vm.new_promise();
+  if (!promise) return vm.throw_error(ErrorKind::RangeError, "Out of memory");
+  bool has_source = !attr_text(n, "src").empty();
+  for (const dom::Node* child = n->first_child; child && !has_source; child = child->next)
+    if (child->is_tag("source") && !attr_text(child, "src").empty()) has_source = true;
+  if (objs(vm).video_play(n->serial, n->is_tag("audio"), has_source)) {
+    vm.promise_fulfill(promise, Value());
+  } else {
+    throw_dom(vm, "NotSupportedError", "Failed to load because no supported source was found.");
+    Value reason;
+    vm.take_exception_value(&reason);
+    vm.promise_reject(promise, reason);
+  }
+  *result = Value::make_object(promise);
+  return true;
+}
+
+NATIVE(el_fast_seek) {
+  dom::Node* n = this_node(vm, self);
+  if (!n) return false;
+  double d;
+  if (!need_args(vm, argc, 1, "fastSeek") || !arg_number(vm, args, argc, 0, &d)) return false;
+  if (!finite(d)) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'fastSeek' on 'HTMLMediaElement': The provided double value is non-finite.");
+  if (n->is_tag("video") || n->is_tag("audio")) objs(vm).video_seek(n->serial, d);
   return true;
 }
 
@@ -1750,6 +1840,7 @@ bool install_media(DomBindings::Impl& c) {
   vm.define_native(ep, "play", el_play, 0);
   vm.define_native(ep, "pause", el_pause, 0);
   vm.define_native(ep, "load", el_load, 0);
+  vm.define_native(ep, "fastSeek", el_fast_seek, 1);
   vm.define_native(ep, "canPlayType", el_can_play_type, 1);
   vm.define_native(ep, "decode", el_decode, 0);
   vm.define_native(ep, "captureStream", el_capture_stream, 0);
@@ -1761,6 +1852,18 @@ bool install_media(DomBindings::Impl& c) {
   vm.define_native(c.thenable_proto, "then", thenable_then, 1);
   vm.define_native(c.thenable_proto, "catch", thenable_catch, 1);
   vm.define_native(c.thenable_proto, "finally", thenable_finally, 1);
+  c.media_error_proto = vm.new_plain();
+  {
+    JsObject* f = vm.new_native([](Vm& v, const Value&, const Value*, uint32_t, Value*) { return v.throw_error(ErrorKind::TypeError, "Illegal constructor"); }, "MediaError", 0);
+    vm.define(f, vm.prototype_name(), Value::make_object(c.media_error_proto), 0);
+    vm.define(c.media_error_proto, vm.intern("constructor"), Value::make_object(f), kWritable);
+    vm.define_named(g, "MediaError", Value::make_object(f), kWritable);
+    const struct { const char* name; uint32_t value; } kCodes[] = {{"MEDIA_ERR_ABORTED", 1}, {"MEDIA_ERR_NETWORK", 2}, {"MEDIA_ERR_DECODE", 3}, {"MEDIA_ERR_SRC_NOT_SUPPORTED", 4}};
+    for (const auto& code : kCodes) {
+      vm.define_named(f, code.name, num_value(code.value), 0);
+      vm.define_named(c.media_error_proto, code.name, num_value(code.value), 0);
+    }
+  }
   c.time_ranges_proto = vm.new_plain();
   vm.define_native(c.time_ranges_proto, "start", ranges_start, 1);
   vm.define_native(c.time_ranges_proto, "end", ranges_end, 1);
