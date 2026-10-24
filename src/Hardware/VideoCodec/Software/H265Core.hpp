@@ -218,6 +218,13 @@ struct OffloadReference {
   int poc = 0;
   bool is_long = false;
 };
+// A slice segment of the picture for an engine that wants its header: the parsed header (a dependent segment's is that of the independent segment before it, with its own
+// address) and the segment's final reference picture lists as indexes into OffloadPicture::refs (0xFF: no entry).
+struct OffloadSlice {
+  const SliceHeader* header = nullptr;
+  uint8_t list[2][kMaxRefs - 1] = {};
+};
+
 struct OffloadPicture {
   const Sps* sps = nullptr;
   const Pps* pps = nullptr;
@@ -231,6 +238,7 @@ struct OffloadPicture {
   uint8_t st_before[kMaxRefs] = {}, st_after[kMaxRefs] = {}, lt_curr[kMaxRefs] = {};
   uint8_t list[2][kMaxRefs - 1] = {};                 // the first slice's final reference picture lists, as indexes into refs (0xFF: no entry)
   ArrayView<const ConstByteView> slices;              // the NAL units of the picture, header bytes included
+  ArrayView<const OffloadSlice> slice_info;           // one per entry of `slices`
   ByteView plane[3];                                  // I420, the coded size
   int stride[3] = {0, 0, 0};
 };
@@ -249,7 +257,7 @@ class IOffload {
 
 class Core {
  public:
-  explicit Core(allocators::IAllocator& allocator) : allocator_(allocator), slices_(allocator), offload_nals_(allocator) {}
+  explicit Core(allocators::IAllocator& allocator) : allocator_(allocator), slices_(allocator), offload_nals_(allocator), offload_headers_(allocator), offload_info_(allocator) {}
   ~Core() = default;
 
   bool configure(ConstByteView hvcc);
@@ -372,6 +380,8 @@ class Core {
   bool offloaded_ = false;               // the picture being decoded goes to the offload
   int rps_ref_delta_pocs_ = 0;
   List<ConstByteView> offload_nals_;     // the slice NAL units of the picture being collected for the offload
+  List<SliceHeader> offload_headers_;    // their headers
+  List<OffloadSlice> offload_info_;      // built when the picture goes to the offload
   ConstByteView current_nal_;            // the NAL unit being handled
 
   // slice data state

@@ -73,6 +73,21 @@ constexpr uint32_t kMfdVc1BsdObject = mfx_header(2, 2, 1, 8);
 constexpr uint32_t kMfxMpeg2PicState = mfx_header(2, 3, 0, 0);
 constexpr uint32_t kMfdMpeg2BsdObject = mfx_header(2, 3, 1, 8);
 
+// The HCP (HEVC and VP9) pipeline's commands: pipeline 2, opcode 7, the sub-opcode in bits 16-23.
+constexpr uint32_t hcp_header(uint32_t command) { return (3u << 29) | (2u << 27) | (7u << 23) | (command << 16); }
+constexpr uint32_t kHcpPipeModeSelect = hcp_header(0x00);
+constexpr uint32_t kHcpSurfaceState = hcp_header(0x01);
+constexpr uint32_t kHcpPipeBufAddrState = hcp_header(0x02);
+constexpr uint32_t kHcpIndObjBaseAddrState = hcp_header(0x03);
+constexpr uint32_t kHcpQmState = hcp_header(0x04);
+constexpr uint32_t kHcpPicState = hcp_header(0x10);
+constexpr uint32_t kHcpTileState = hcp_header(0x11);
+constexpr uint32_t kHcpRefIdxState = hcp_header(0x12);
+constexpr uint32_t kHcpWeightoffset = hcp_header(0x13);
+constexpr uint32_t kHcpSliceState = hcp_header(0x14);
+constexpr uint32_t kHcpBsdObject = hcp_header(0x20);
+constexpr uint32_t kHcpCodecHevc = 0, kHcpCodecVp9 = 1;
+
 // MI commands for the video ring.
 constexpr uint32_t kMiNoop = 0;
 constexpr uint32_t kMiBatchBufferEnd = 0x0Au << 23;
@@ -239,6 +254,96 @@ struct Vc1BsdJob {
   uint32_t first_row = 0, next_row = 0;
 };
 void emit_vc1_bsd_object(DwordWriter& w, const Vc1BsdJob& job);
+
+// --- HEVC (the HCP pipeline, Gen9 layouts of the reference driver's gen9_mfd.c). 8-bit 4:2:0 only.
+
+constexpr uint32_t kMaxHevcReferenceFrames = 8;   // the engine's frame store: the pictures one picture's slices can refer to
+constexpr uint32_t kMaxHevcRefIdx = 15;
+
+struct HevcPicture {
+  uint32_t width = 0, height = 0;                          // luma samples, as coded (a multiple of the minimum coding block)
+  uint32_t log2_min_cb = 3, log2_ctb = 4, log2_min_tb = 2, log2_max_tb = 5;
+  bool pcm = false, pcm_loop_filter_disabled = false;
+  uint32_t log2_min_pcm = 3, log2_max_pcm = 3, pcm_bit_depth_luma = 8, pcm_bit_depth_chroma = 8;
+  bool strong_intra_smoothing = false, transquant_bypass = false, amp = false, transform_skip = false;
+  bool weighted_pred = false, weighted_bipred = false, sign_data_hiding = false, constrained_intra_pred = false, cu_qp_delta = false, sao = false;
+  bool tiles = false, entropy_coding_sync = false, loop_filter_across_tiles = true;
+  uint32_t log2_parallel_merge_level = 2, diff_cu_qp_delta_depth = 0;
+  int32_t cb_qp_offset = 0, cr_qp_offset = 0;
+  uint32_t max_transform_hierarchy_depth_inter = 0, max_transform_hierarchy_depth_intra = 0;
+  uint32_t num_tile_columns = 1, num_tile_rows = 1;
+  uint32_t column_width[20] = {}, row_height[22] = {};     // in coding tree blocks (the last included)
+};
+
+// Graphics addresses of what a picture uses (0: none). The line and column buffers the engine keeps state in are sized by hevc_buffer_bytes().
+struct HevcBuffers {
+  uint64_t current_picture = 0;
+  uint64_t deblocking_line = 0, deblocking_tile_line = 0, deblocking_tile_column = 0;
+  uint64_t metadata_line = 0, metadata_tile_line = 0, metadata_tile_column = 0;
+  uint64_t sao_line = 0, sao_tile_line = 0, sao_tile_column = 0;
+  uint64_t motion_vector_current = 0;                      // collocated motion vectors this picture leaves
+  uint64_t reference_pictures[kMaxHevcReferenceFrames] = {};
+  uint64_t motion_vector_references[kMaxHevcReferenceFrames] = {};
+  uint64_t bitstream = 0;
+  uint64_t bitstream_bytes = 0;
+  uint32_t mocs = 2;
+};
+
+// The sizes of the buffers an 8-bit picture of `width` x `height` luma samples with coding tree blocks of 1 << log2_ctb needs (the reference driver's formulas).
+struct HevcBufferBytes {
+  uint64_t deblocking_line = 0, deblocking_tile_line = 0, deblocking_tile_column = 0;
+  uint64_t metadata_line = 0, metadata_tile_line = 0, metadata_tile_column = 0;
+  uint64_t sao_line = 0, sao_tile_line = 0, sao_tile_column = 0;
+  uint64_t motion_vector = 0;                              // per picture
+};
+HevcBufferBytes hevc_buffer_bytes(uint32_t width, uint32_t height, uint32_t log2_ctb);
+
+// Scaling lists in the engine's terms: 4x4 (6 x 16), 8x8, 16x16, 32x32 (two: intra, inter) as raster-order bytes, and the DC values of the big ones.
+struct HevcScaling {
+  uint8_t list4x4[6][16] = {}, list8x8[6][64] = {}, list16x16[6][64] = {}, list32x32[2][64] = {};
+  uint8_t dc16x16[6] = {}, dc32x32[2] = {};
+};
+
+// One slice segment.
+struct HevcSlice {
+  uint32_t hor_pos = 0, ver_pos = 0, next_hor_pos = 0, next_ver_pos = 0;   // first coding tree block of this and of the next segment (0, 0 for the last)
+  bool last = false;
+  uint32_t slice_type = 2;                                 // 0 B, 1 P, 2 I
+  int32_t qp = 26, cb_qp_offset = 0, cr_qp_offset = 0;
+  bool temporal_mvp = false, dependent = false, cabac_init = false, mvd_l1_zero = false, collocated_from_l0 = true, low_delay = false;
+  bool sao_luma = false, sao_chroma = false, loop_filter_across_slices = false, deblocking_disabled = false;
+  uint32_t collocated_frame_store = 0;
+  uint32_t max_merge_candidates = 5;
+  uint32_t luma_log2_weight_denom = 0, chroma_log2_weight_denom = 0;
+  int32_t beta_offset_div2 = 0, tc_offset_div2 = 0;
+  uint32_t header_bytes = 0;                               // from the start of the NAL unit (as stored, emulation prevention bytes included) to the slice segment data
+  uint32_t data_offset = 0, data_size = 0;                 // the NAL unit in the bitstream buffer
+};
+
+// Prediction weights of one list, as the slice header codes them (the weight minus 1 << denominator, the offsets).
+struct HevcWeights {
+  int8_t luma_weight[kMaxHevcRefIdx] = {}, luma_offset[kMaxHevcRefIdx] = {};
+  int8_t chroma_weight[kMaxHevcRefIdx][2] = {}, chroma_offset[kMaxHevcRefIdx][2] = {};
+};
+
+// An entry of a reference index list: the frame store the picture is in, whether it is a long-term picture and the order count difference (the current minus the reference).
+constexpr uint32_t hevc_ref_idx_entry(uint32_t frame_store, bool long_term, int32_t poc_delta) {
+  const int32_t d = poc_delta < -128 ? -128 : poc_delta > 127 ? 127 : poc_delta;
+  return (1u << 15) | (long_term ? 1u << 13 : 0u) | (frame_store << 8) | (static_cast<uint32_t>(d) & 0xFF);
+}
+
+void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec);
+void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout);
+void emit_hevc_pipe_buf_addr_state(DwordWriter& w, const HevcBuffers& b);
+void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b);
+void emit_hevc_qm_states(DwordWriter& w, const HevcScaling& s);
+void emit_hevc_pic_state(DwordWriter& w, const HevcPicture& p);
+void emit_hevc_tile_state(DwordWriter& w, const HevcPicture& p);
+// `entries` are hevc_ref_idx_entry() values; only the first min(count, 15) are used.
+void emit_hevc_ref_idx_state(DwordWriter& w, uint32_t list, uint32_t count, const uint32_t entries[kMaxHevcRefIdx]);
+void emit_hevc_weightoffset_state(DwordWriter& w, uint32_t list, uint32_t count, const HevcWeights& weights);
+void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s);
+void emit_hevc_bsd_object(DwordWriter& w, const HevcSlice& s);
 
 }  // namespace intel_mfx
 }  // namespace hardware

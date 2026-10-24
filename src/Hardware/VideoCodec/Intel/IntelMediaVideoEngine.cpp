@@ -48,7 +48,7 @@ bool IntelMediaVideoEngine::initialize() {
     config.ggtt_first_page = setup_.ggtt_first_page;
     if (driver && driver->initialize(config)) {
       driver_ = util::move(driver);
-      info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1);
+      info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0);
     }
   }
   return true;
@@ -65,6 +65,10 @@ UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const Decoder
   }
   if (config.codec == VideoCodec::Mpeg2 && hardware_decode()) {
     UniquePointer<IntelMpeg2Decoder> session = UniquePointer<IntelMpeg2Decoder>::make(allocator_, allocator_, *driver_, config);
+    if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+  }
+  if (config.codec == VideoCodec::Hevc && hardware_decode() && gpu_.media_hevc) {
+    UniquePointer<IntelHevcDecoder> session = UniquePointer<IntelHevcDecoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
   }
   return SoftwareVideoCodec::create_decoder(config);

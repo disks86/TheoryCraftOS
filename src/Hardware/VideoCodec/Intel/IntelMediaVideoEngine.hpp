@@ -21,6 +21,7 @@
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/Intel/IntelAvcSession.hpp"
+#include "Hardware/VideoCodec/Intel/IntelHevcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMpeg2Session.hpp"
 #include "Hardware/VideoCodec/Intel/IntelVc1Session.hpp"
@@ -32,7 +33,7 @@ namespace hardware {
 
 // Intel's media engine in its graphics (Quick Sync Video: the VDBOX/MFX fixed-function blocks): the video decode/encode block that comes with the GPU (PCI vendor 0x8086).
 // It reports that the engine is there (info().hardware_engine) and what a look at it found; sessions run on the CPU through the software codecs unless the engine is driven.
-// With set_hardware() before initialize() (SystemVideoCodecs does it by default, and set_intel_hardware_decode(false) stops it), on a Gen9.5 GPU whose video box answers, H.264, MPEG-2 and VC-1 decoding run on
+// With set_hardware() before initialize() (SystemVideoCodecs does it by default, and set_intel_hardware_decode(false) stops it), on a Gen9.5 GPU whose video box answers, H.264, MPEG-2, VC-1 and H.265 decoding run on
 // the engine (VcsDriver, IntelAvcDecoder) - one session at a time, the others (and every other codec, and encoding) stay on the CPU. That path has only been run against a simulated GPU.
 class IntelMediaVideoEngine final : public SoftwareVideoCodec {
  public:

@@ -29,8 +29,8 @@ namespace hardware {
 // address below 4 GiB with an unmapped gap behind it; they are freed only while the engine is idle and ours (a wedged engine may still be writing).
 class IntelEngineBuffers {
  public:
-  static constexpr uint32_t kMaxSurfaces = 16;
-  static constexpr uint32_t kMaxScratch = 8;
+  static constexpr uint32_t kMaxSurfaces = 17;
+  static constexpr uint32_t kMaxScratch = 12;
   static constexpr uint32_t kMaxMbsPerSide = 256;   // 4096 pixels
 
   IntelEngineBuffers(allocators::IAllocator& allocator, intel_gt::VcsDriver& driver) : allocator_(allocator), driver_(driver) {}

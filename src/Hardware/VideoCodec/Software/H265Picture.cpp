@@ -279,6 +279,7 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   first_header_ = sh;
   pending_hash_.present = false;
   offload_nals_.clear();
+  offload_headers_.clear();
   offloaded_ = offload_ && offload_->accepts(sps, pps);
   return true;
 }
@@ -398,6 +399,20 @@ void Core::run_offload(Picture* p) {
       }
   }
   o.slices = offload_nals_.view();
+  offload_info_.clear();
+  for (uint64_t k = 0; k < offload_headers_.count() && k < slices_.count(); ++k) {
+    OffloadSlice info;
+    info.header = &offload_headers_[k];
+    for (auto& l : info.list)
+      for (uint8_t& e : l) e = 0xFF;
+    for (int l = 0; l < 2; ++l)
+      for (int i = 0; i < offload_headers_[k].num_ref_idx[l] && i < kMaxRefs - 1; ++i) {
+        const Picture* r = slices_[k].ref_pic[l][i];
+        if (r && index_of[r - pics_] >= 0) info.list[l][i] = static_cast<uint8_t>(index_of[r - pics_]);
+      }
+    if (!offload_info_.push_back(info)) break;
+  }
+  o.slice_info = offload_info_.view();
   for (int c = 0; c < 3; ++c) {
     o.plane[c] = ByteView(p->plane[c].data(), p->plane[c].size());
     o.stride[c] = p->stride[c];
