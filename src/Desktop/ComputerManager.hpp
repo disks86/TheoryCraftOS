@@ -68,6 +68,12 @@ struct TaskGpu {
   int32_t temperature_millicelsius = -1;   // -1 unknown
 };
 
+// The neural processing unit, if the machine has a hardware one. busy_us only grows: the time it has spent computing.
+struct TaskNpu {
+  bool present = false;
+  uint64_t busy_us = 0;
+};
+
 // The battery, if the machine has one.
 enum class ChargeState : uint8_t { Unknown, Charging, Discharging, Full, NotCharging };
 struct TaskBattery {
@@ -89,6 +95,7 @@ class ISystemMonitor {
   // The processor's temperature in thousandths of a degree Celsius, or -1 if the machine cannot tell.
   virtual int32_t cpu_temperature_millicelsius() { return -1; }
   virtual TaskGpu gpu() { return TaskGpu(); }
+  virtual TaskNpu npu() { return TaskNpu(); }
   virtual TaskBattery battery() { return TaskBattery(); }
 
  protected:
@@ -138,6 +145,10 @@ class ComputerManager : public gui::Frame {
   // The GPU, video memory and temperature rows of the Performance tab.
   gui::LevelMeter& gpu_meter() { return gpu_row_.meter; }
   gui::Label& gpu_label() { return gpu_row_.value; }
+  // The NPU row of the Performance tab; it shows only while the machine has an NPU.
+  gui::LevelMeter& npu_meter() { return npu_row_.meter; }
+  gui::Label& npu_label() { return npu_row_.value; }
+  bool npu_row_visible() const { return npu_row_.row.visible(); }
   gui::LevelMeter& vram_meter() { return vram_row_.meter; }
   gui::Label& vram_label() { return vram_row_.value; }
   gui::LevelMeter& cpu_temp_meter() { return cpu_temp_row_.meter; }
@@ -217,7 +228,7 @@ class ComputerManager : public gui::Frame {
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;
   gui::LevelMeter cpu_meter_, memory_meter_;
   gui::DataGrid grid_;
-  CoreRow gpu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_, battery_row_;
+  CoreRow gpu_row_, npu_row_, vram_row_, cpu_temp_row_, gpu_temp_row_, battery_row_;
   List<UniquePointer<CoreRow>> core_rows_;
   Model model_;
   ISystemMonitor* monitor_ = nullptr;
@@ -225,6 +236,8 @@ class ComputerManager : public gui::Frame {
   List<Previous> previous_threads_;
   ArrayView<TaskThread> buffer_;
   uint64_t last_us_ = 0;
+  uint64_t previous_npu_busy_us_ = 0;
+  bool had_npu_ = false;
   bool have_previous_ = false;
 };
 

@@ -963,6 +963,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (!explorer_files.start_service()) Entry(Level::Warning, "Storage").text("could not start hot-plug polling; USB sticks plugged in later are not seen");
     SystemMonitor monitor(allocator, shared_allocator);
     monitor.set_gpu(gpu);
+    if (system_npu.hardware_present()) {   // (the software NPU is the CPU: it has no meter of its own)
+      npu.set_clock(&clock);
+      monitor.set_npu(&npu);
+    }
     monitor.set_pci(&pci);
     // The battery: only a machine whose ACPI tables describe one runs any AML (a laptop; a desktop or a virtual machine has none).
     hardware::SystemAcpiHost acpi_host(&pci, paging_ok ? &mmio : nullptr);
