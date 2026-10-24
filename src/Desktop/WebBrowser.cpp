@@ -179,6 +179,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       own_local_(allocator),
       own_hub_(allocator),
       env_(*this, allocator),
+      pip_window_(allocator),
       defer_go_(allocator),
       defer_type_(allocator),
       defer_body_(allocator),
@@ -196,6 +197,8 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
   load_handler_ = {&WebBrowser::on_load, this};
+  pip_handler_ = {&WebBrowser::on_pip_changed, this};
+  pip_window_.on_closed(gui::Handler::immediate(&WebBrowser::route_pip, this));
 
   menu_.set_dock(DockStyle::Top);
   menu_.set_size(0, 22);
@@ -277,6 +280,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
 
 WebBrowser::~WebBrowser() {
   worker_.stop();   // (the page's thread ends first: it must not touch the controls below while they are taken down)
+  pip_window_.dismiss();
   UiGuard lock(&page_);
   page_.set_object_painter(nullptr);
 }
@@ -768,6 +772,9 @@ void WebBrowser::show(Fetched& page) {
   }
   bool ok = true;
   media_ = current_media();
+  apply_fullscreen(false);   // (a page that was fullscreen is gone)
+  pip_window_.dismiss();     // (and a video that was in its own window)
+  defer_fullscreen_ = 0;
   live_ = UniquePointer<browser::Page>::make(allocator(), allocator(), env_, page.address.view(), media_, scripts);
   if (!live_) ok = false;
   else {
@@ -873,6 +880,12 @@ void WebBrowser::settle() {
     post(delta < 0 ? Request::Back : Request::Forward, StringView());
     return;
   }
+  if (defer_fullscreen_ != 0) {
+    const int8_t what = defer_fullscreen_;
+    defer_fullscreen_ = 0;
+    apply_fullscreen(what == 1);
+    if (what == 3 && live_) live_->fullscreen_left();
+  }
   if (!live_) return;
   canvas_accelerated_ = live_->objects().accelerated();
   if (live_->take_visual_change()) {   // (a canvas was drawn on, a video has a new picture: only the view needs painting again)
@@ -967,6 +980,10 @@ uint64_t WebBrowser::page_clock_ms() {
 
 void WebBrowser::tick(uint64_t uptime_us) {
   __atomic_store_n(&uptime_ms_, uptime_us / 1000, __ATOMIC_RELEASE);
+  if (pip_window_.showing()) {   // the picture moves on; a window that was resized is noticed
+    pip_window_.refresh();
+    if (pip_window_.picture_width() != pip_w_ || pip_window_.picture_height() != pip_h_) queue(pip_handler_, *this, true);
+  }
   const uint64_t due = __atomic_load_n(&next_due_ms_, __ATOMIC_ACQUIRE);
   if (due == 0 || page_clock_ms() < due || __atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) return;
   queue(timer_handler_, *this, true);
@@ -1001,6 +1018,7 @@ void WebBrowser::on_node_click(void* self, Control&) {
 void WebBrowser::on_view_resized(void* self, Control&) { static_cast<WebBrowser*>(self)->update_media(); }
 
 void WebBrowser::update_media() {
+  if (defer_fullscreen_ != 0) settle();
   const browser::MediaEnvironment m = current_media();
   if (m == media_ || !live_) {
     media_ = m;
@@ -1160,6 +1178,53 @@ void WebBrowser::Env::push_state(StringView address, StringView state_json, bool
 
 void WebBrowser::Env::alert(StringView text) { owner_.notify(NoticeKind::Information, text); }
 void WebBrowser::Env::scroll_to(int32_t line) { owner_.defer_scroll_ = line; }
+bool WebBrowser::Env::open_pip(uint32_t video_serial, uint32_t width, uint32_t height, browser::PageObjects& objects) {
+  gui::WindowManager* m = owner_.manager();
+  if (!m) return false;
+  owner_.pip_w_ = width;
+  owner_.pip_h_ = height;
+  return owner_.pip_window_.open(*m, &objects, video_serial, width, height);
+}
+void WebBrowser::Env::close_pip() { owner_.pip_window_.dismiss(); }
+
+// The window of the video was closed, or its size changed: the page is told.
+void WebBrowser::on_pip_changed(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->live_ || b->live_->objects().pip() == 0) return;
+  if (!b->pip_window_.showing()) {
+    b->live_->pip_left();
+  } else {
+    const uint32_t w = b->pip_window_.picture_width(), h = b->pip_window_.picture_height();
+    if (w != b->pip_w_ || h != b->pip_h_) {
+      b->pip_w_ = w;
+      b->pip_h_ = h;
+      b->live_->pip_resized(w, h);
+    }
+  }
+  b->settle();
+}
+
+bool WebBrowser::Env::set_fullscreen(bool on) {
+  owner_.defer_fullscreen_ = on ? 1 : 2;
+  return true;
+}
+
+void WebBrowser::apply_fullscreen(bool on) {
+  if (on == fullscreen_) return;
+  fullscreen_ = on;
+  menu_.set_visible(!on);
+  toolbar_.set_visible(!on);
+  status_bar_.set_visible(!on);
+  if (on) {
+    fullscreen_maximized_ = state() != State::Maximized;
+    if (fullscreen_maximized_) maximize();
+  } else if (fullscreen_maximized_) {
+    fullscreen_maximized_ = false;
+    if (state() == State::Maximized) maximize();
+  }
+  UiGuard lock(this);
+  invalidate();
+}
 uint64_t WebBrowser::Env::now_ms() { return owner_.page_clock_ms(); }
 
 // Following a link to "#something" on the page shown: the address changes, the history entry too; "#" and "#top" scroll to the top.
@@ -1184,6 +1249,11 @@ bool WebBrowser::on_key(const KeyArgs& args) {
   namespace key = hardware::key;
   const bool control = args.modifiers & hardware::modifier::kControl;
   const bool alt = args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt);
+  if (args.usage == key::kEscape && fullscreen_) {   // the user leaves fullscreen; the page hears of it
+    defer_fullscreen_ = 3;
+    queue(resize_handler_, *this, true);
+    return true;
+  }
   if (args.usage == key::kEnter && address_.focused()) {
     navigate(address_.text());
     return true;

@@ -1204,13 +1204,19 @@ void PageObjects::draw_cues(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, i
   }
 }
 
-void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {
+void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip, bool pip_view) {
   r.set_blend(graphics::BlendMode::Alpha);
   const int64_t vx0 = x > clip.x ? x : clip.x, vy0 = y > clip.y ? y : clip.y;
   const int64_t vx1 = int64_t{x} + w < int64_t{clip.x} + clip.width ? int64_t{x} + w : int64_t{clip.x} + clip.width;
   const int64_t vy1 = int64_t{y} + h < int64_t{clip.y} + clip.height ? int64_t{y} + h : int64_t{clip.y} + clip.height;
   if (vx1 <= vx0 || vy1 <= vy0) return;
   r.fill_rect({static_cast<int32_t>(vx0), static_cast<int32_t>(vy0), static_cast<uint32_t>(vx1 - vx0), static_cast<uint32_t>(vy1 - vy0)}, 0xFF000000u);
+  if (!pip_view && v.serial == pip_serial_ && !v.audio) {   // the picture is in the window of its own
+    const char* message = "Playing in picture-in-picture";
+    const int32_t tw = static_cast<int32_t>(StringView(message).size()) * 8;
+    if (static_cast<int32_t>(w) > tw && h >= 16) r.draw_text(x + (static_cast<int32_t>(w) - tw) / 2, y + (static_cast<int32_t>(h) - 16) / 2, message, 0xFFB0B0B0u);
+    return;
+  }
   auto fit_draw = [&](Scaled& cache, const ImageSource& src, uint32_t frame) {
     uint32_t dw = w, dh = static_cast<uint32_t>(uint64_t{src.height} * w / src.width);
     if (dh > h) {
@@ -1251,7 +1257,7 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
     if (static_cast<int32_t>(w) > tw && h >= 16) r.draw_text(x + (static_cast<int32_t>(w) - tw) / 2, y + (static_cast<int32_t>(h) - 16) / 2, message, 0xFFB0B0B0u);
   }
   if (!v.audio && v.clip && v.cues.count() != 0) draw_cues(r, v, x, y, w, h);
-  if (v.controls && w >= 80 && (v.audio ? h >= 24 : h >= 40)) {
+  if (v.controls && !pip_view && w >= 80 && (v.audio ? h >= 24 : h >= 40)) {
     const int32_t bar = v.audio ? static_cast<int32_t>(h - 24) / 2 : static_cast<int32_t>(h) - 24;
     r.fill_rect(v.audio ? Rect2D{x, y, w, h} : Rect2D{x, y + bar, w, 24}, v.audio ? 0xFF202020u : 0xC0101010u);
     const bool playing = slot_playing(v);
@@ -1281,6 +1287,22 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
     }
     if (show_time) r.draw_text(x + static_cast<int32_t>(w) - text_w - 6, y + bar + 4, text.data(), 0xFFFFFFFFu);
   }
+}
+
+void PageObjects::paint_pip(graphics::IRenderer2D& r, uint32_t serial, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {
+  Lock lock(*this);
+  accelerated_ = r.accelerated();
+  VideoSlot* v = find_video(serial);
+  if (v) draw_video(r, *v, x, y, w, h, clip, true);
+  else r.fill_rect(clip, 0xFF000000u);
+}
+
+void PageObjects::video_toggle(uint32_t serial) {
+  Lock lock(*this);
+  VideoSlot* v = find_video(serial);
+  if (!v) return;
+  if (slot_playing(*v) || v->wants_play) pause_slot(*v);
+  else play_slot(*v);
 }
 
 void PageObjects::paint_object(graphics::IRenderer2D& r, uint32_t node, ObjectKind kind, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {

@@ -3440,10 +3440,119 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   method(EP, 'setPointerCapture', function () {});
   method(EP, 'releasePointerCapture', function () {});
   method(EP, 'hasPointerCapture', function () { return false; });
-  method(EP, 'requestFullscreen', function () { return Promise.reject(new TypeError('Fullscreen is not supported')); });
   method(EP, 'requestPointerLock', function () {});
-  if (doc.fullscreenElement === undefined) { hide(doc, 'fullscreenElement', null); hide(doc, 'fullscreenEnabled', false); }
-  method(DP, 'exitFullscreen', function () { return Promise.reject(new TypeError('Document not active')); });
+  // --- Fullscreen API. The window hides its own controls and the element covers the viewport (the :fullscreen rule of the page); promises and events are here.
+  var fsFire = function (target, type) { target.dispatchEvent(new Event(type, { bubbles: true, composed: true })); };
+  var fsError = function (el) {
+    setTimeout(function () { fsFire(el, 'fullscreenerror'); }, 0);
+    return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': API can only be initiated by a user gesture or the element cannot be fullscreen."));
+  };
+  var fsRequest = function (options) {
+    var el = this;
+    if (options !== undefined && options !== null && typeof options !== 'object') return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': The provided value is not of type 'FullscreenOptions'."));
+    if (!el.isConnected || !__fs_supported()) return fsError(el);
+    var already = __fs_element() === el;
+    if (!__fs_request(el)) return fsError(el);
+    return new Promise(function (resolve) {
+      setTimeout(function () { if (!already) fsFire(el, 'fullscreenchange'); resolve(); }, 0);
+    });
+  };
+  method(EP, 'requestFullscreen', fsRequest);
+  method(EP, 'webkitRequestFullscreen', fsRequest);
+  method(EP, 'webkitRequestFullScreen', fsRequest);
+  var fsExit = function () {
+    var el = __fs_element();
+    if (!el) return Promise.reject(new TypeError("Failed to execute 'exitFullscreen' on 'Document': Document not active"));
+    __fs_exit();
+    return new Promise(function (resolve) { setTimeout(function () { fsFire(el, 'fullscreenchange'); resolve(); }, 0); });
+  };
+  method(DP, 'exitFullscreen', fsExit);
+  method(DP, 'webkitExitFullscreen', fsExit);
+  method(DP, 'webkitCancelFullScreen', fsExit);
+  var fsAccessor = function (name, get) { Object.defineProperty(DP, name, { get: get, configurable: true, enumerable: true }); };
+  fsAccessor('fullscreenElement', function () { return __fs_element(); });
+  fsAccessor('webkitFullscreenElement', function () { return __fs_element(); });
+  fsAccessor('webkitCurrentFullScreenElement', function () { return __fs_element(); });
+  fsAccessor('fullscreenEnabled', function () { return __fs_supported(); });
+  fsAccessor('webkitFullscreenEnabled', function () { return __fs_supported(); });
+  fsAccessor('fullscreen', function () { return __fs_element() !== null; });
+  fsAccessor('webkitIsFullScreen', function () { return __fs_element() !== null; });
+  if (g.HTMLVideoElement) {
+    method(g.HTMLVideoElement.prototype, 'webkitEnterFullscreen', function () { return fsRequest.call(this); });
+    method(g.HTMLVideoElement.prototype, 'webkitExitFullscreen', function () { return fsExit(); });
+    Object.defineProperty(g.HTMLVideoElement.prototype, 'webkitDisplayingFullscreen', { get: function () { return __fs_element() === this; }, configurable: true, enumerable: true });
+  }
+  // --- Picture-in-Picture API. The browser shows the video in a window of its own; the promises, the window object and the events are here.
+  function PictureInPictureWindow() { throw new TypeError('Illegal constructor'); }
+  PictureInPictureWindow.prototype = Object.create(EventTarget.prototype);
+  method(PictureInPictureWindow.prototype, 'constructor', PictureInPictureWindow);
+  function PictureInPictureEvent(type, init) {
+    if (arguments.length < 2 || !init || !(init.pictureInPictureWindow instanceof PictureInPictureWindow)) throw new TypeError("Failed to construct 'PictureInPictureEvent': required member pictureInPictureWindow is undefined.");
+    var event = new Event(type, init);
+    Object.setPrototypeOf(event, PictureInPictureEvent.prototype);
+    Object.defineProperty(event, 'pictureInPictureWindow', { value: init.pictureInPictureWindow, enumerable: true });
+    return event;
+  }
+  PictureInPictureEvent.prototype = Object.create(Event.prototype);
+  method(PictureInPictureEvent.prototype, 'constructor', PictureInPictureEvent);
+  var pipState = null;   // { video, window }
+  var pipNotice = function (video, type, win) { video.dispatchEvent(new PictureInPictureEvent(type, { bubbles: true, pictureInPictureWindow: win })); };
+  var pipDom = function (message, name) { return new DOMException("Failed to execute 'requestPictureInPicture' on 'HTMLVideoElement': " + message, name); };
+  if (g.HTMLVideoElement) {
+    var VP = g.HTMLVideoElement.prototype;
+    method(VP, 'requestPictureInPicture', function () {
+      var video = this;
+      if (!__pip_supported()) return Promise.reject(pipDom('Picture-in-Picture is not supported.', 'NotSupportedError'));
+      var reply = __pip_request(video);
+      if (reply[0] === 1) return Promise.reject(pipDom('Picture-in-Picture is not supported.', 'NotSupportedError'));
+      if (reply[0] === 2) return Promise.reject(pipDom('The video element has no video to show yet (readyState is HAVE_NOTHING).', 'InvalidStateError'));
+      if (reply[0] === 3) return Promise.reject(pipDom('Picture-in-Picture is disabled for this video (disablePictureInPicture).', 'InvalidStateError'));
+      var previous = pipState, win = pipState && pipState.video === video ? pipState.window : null;
+      if (!win) {
+        win = Object.create(PictureInPictureWindow.prototype);
+        win.onresize = null;
+      }
+      Object.defineProperty(win, 'width', { value: reply[1], configurable: true, enumerable: true });
+      Object.defineProperty(win, 'height', { value: reply[2], configurable: true, enumerable: true });
+      pipState = { video: video, window: win };
+      return new Promise(function (resolve) {
+        setTimeout(function () {
+          if (previous && previous.video !== video) pipNotice(previous.video, 'leavepictureinpicture', previous.window);
+          if (!previous || previous.video !== video) pipNotice(video, 'enterpictureinpicture', win);
+          resolve(win);
+        }, 0);
+      });
+    });
+    var pipDisabled = Object.getOwnPropertyDescriptor(VP, 'disablePictureInPicture');
+    if (!pipDisabled) Object.defineProperty(VP, 'disablePictureInPicture', { get: function () { return this.hasAttribute('disablepictureinpicture'); },
+      set: function (v) { if (v) this.setAttribute('disablepictureinpicture', ''); else this.removeAttribute('disablepictureinpicture'); }, configurable: true, enumerable: true });
+  }
+  method(DP, 'exitPictureInPicture', function () {
+    var state = pipState;
+    if (!state) return Promise.reject(new DOMException("Failed to execute 'exitPictureInPicture' on 'Document': There is no Picture-in-Picture element in this document.", 'InvalidStateError'));
+    pipState = null;
+    __pip_exit();
+    return new Promise(function (resolve) { setTimeout(function () { pipNotice(state.video, 'leavepictureinpicture', state.window); resolve(); }, 0); });
+  });
+  Object.defineProperty(DP, 'pictureInPictureElement', { get: function () { return pipState ? __pip_element() : null; }, configurable: true, enumerable: true });
+  Object.defineProperty(DP, 'pictureInPictureEnabled', { get: function () { return !!__pip_supported(); }, configurable: true, enumerable: true });
+  // The user closed the window, or changed its size.
+  hide(g, '__pip_left', function () {
+    var state = pipState;
+    pipState = null;
+    if (state) setTimeout(function () { pipNotice(state.video, 'leavepictureinpicture', state.window); }, 0);
+  });
+  hide(g, '__pip_resized', function (w, h) {
+    if (!pipState) return;
+    var win = pipState.window;
+    Object.defineProperty(win, 'width', { value: w, configurable: true, enumerable: true });
+    Object.defineProperty(win, 'height', { value: h, configurable: true, enumerable: true });
+    setTimeout(function () { win.dispatchEvent(new Event('resize')); }, 0);
+  });
+  hide(g, 'PictureInPictureWindow', PictureInPictureWindow);
+  hide(g, 'PictureInPictureEvent', PictureInPictureEvent);
+  // The window left fullscreen by itself (Escape): the events follow, as for exitFullscreen().
+  hide(g, '__fs_left', function () { setTimeout(function () { fsFire(g.document, 'fullscreenchange'); }, 0); });
   method(DP, 'elementsFromPoint', function () { return []; });
   method(DP, 'execCommand', function () { return false; });
   method(DP, 'queryCommandSupported', function () { return false; });

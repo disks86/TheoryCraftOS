@@ -316,6 +316,12 @@ const StyleSheet& Page::style_sheet() {
     RenderOptions options;
     options.media = media_;
     options.styles = this;
+    // the element shown fullscreen covers the viewport (read first: the page's own rules, apart from !important ones, win)
+    static const char kFullscreenCss[] =
+        ":fullscreen { background-color: #000; color: #fff; }"
+        ":fullscreen { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100% !important;"
+        " height: 100% !important; max-width: none !important; max-height: none !important; margin: 0 !important; box-sizing: border-box !important; z-index: 2147483647 !important; }";
+    if (fullscreen_serial_ != 0) options.extra_css = StringView(kFullscreenCss);
     collect_style_sheets(doc_, options, &style_cache_);
     style_cache_version_ = doc_.version();
     style_cache_media_ = media_;
@@ -420,6 +426,13 @@ void Page::deliver_object_events() {
 }
 
 bool Page::step_objects(double now_ms) {
+  if (pip_serial_ != 0) {   // the video was taken out of the page: it leaves the window
+    dom::Node* pip = pip_element();
+    if (!pip || !dom::is_connected(pip)) {
+      env_.close_pip();
+      pip_left();
+    }
+  }
   bool moved = false;
   for (uint64_t i = 0; i < frames_.count(); ++i)
     if (frames_[i]->page) moved |= frames_[i]->page->step_objects(now_ms);
@@ -565,6 +578,86 @@ int32_t Page::take_scroll_request() {
   const int32_t r = scroll_request_;
   scroll_request_ = -1;
   return r;
+}
+
+// --- Picture-in-Picture ------------------------------------------------------------------------------------------------------------
+
+dom::Node* Page::pip_element() { return pip_serial_ ? doc_.by_serial(pip_serial_) : nullptr; }
+
+int Page::pip_request(dom::Node* video, uint32_t* width, uint32_t* height) {
+  if (!video || !video->is_tag("video") || !env_.pip_supported()) return 1;
+  if (dom::has_attribute(video, "disablepictureinpicture")) return 3;
+  PageObjects::VideoState st;
+  objects_.video_state(video->serial, &st);
+  if (!st.known || st.ready_state == 0 || !dom::is_connected(video)) return 2;
+  uint32_t w = st.width ? st.width : 320, h = st.height ? st.height : 180;
+  if (w > 320) {   // (a small window: at most 320 pixels wide)
+    h = static_cast<uint32_t>(uint64_t{h} * 320 / w);
+    w = 320;
+  }
+  if (h == 0) h = 1;
+  if (pip_serial_ != 0 && pip_serial_ != video->serial) {   // one window: the video that was in it leaves
+    pip_serial_ = 0;
+    env_.close_pip();
+  }
+  if (pip_serial_ != video->serial && !env_.open_pip(video->serial, w, h, objects_)) return 1;
+  pip_serial_ = video->serial;
+  objects_.set_pip(video->serial);
+  *width = w;
+  *height = h;
+  return 0;
+}
+
+void Page::pip_exit() {
+  if (pip_serial_ == 0) return;
+  pip_serial_ = 0;
+  objects_.set_pip(0);
+  env_.close_pip();
+}
+
+void Page::pip_left() {
+  if (pip_serial_ == 0) return;
+  pip_serial_ = 0;
+  objects_.set_pip(0);
+  if (bindings_) bindings_->call_hook("__pip_left", nullptr, 0);
+}
+
+void Page::pip_resized(uint32_t width, uint32_t height) {
+  if (pip_serial_ == 0 || !bindings_) return;
+  const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(static_cast<double>(width)), DomBindings::HookArg::of(static_cast<double>(height))};
+  bindings_->call_hook("__pip_resized", args, 2);
+}
+
+// --- Fullscreen --------------------------------------------------------------------------------------------------------------------
+
+dom::Node* Page::fullscreen_element() { return fullscreen_serial_ ? doc_.by_serial(fullscreen_serial_) : nullptr; }
+
+void Page::clear_fullscreen() {
+  if (dom::Node* old = fullscreen_element()) old->form_state &= static_cast<uint8_t>(~dom::kFormFullscreen);
+  fullscreen_serial_ = 0;
+  doc_.touch();
+}
+
+bool Page::fullscreen_request(dom::Node* element) {
+  if (!element || !element->is_element() || !dom::is_connected(element) || !env_.fullscreen_supported()) return false;
+  if (fullscreen_serial_ == 0 && !env_.set_fullscreen(true)) return false;
+  if (fullscreen_serial_ != 0) clear_fullscreen();
+  element->form_state |= dom::kFormFullscreen;
+  fullscreen_serial_ = element->serial;
+  doc_.touch();
+  return true;
+}
+
+void Page::fullscreen_exit() {
+  if (fullscreen_serial_ == 0) return;
+  clear_fullscreen();
+  env_.set_fullscreen(false);
+}
+
+void Page::fullscreen_left() {
+  if (fullscreen_serial_ == 0) return;
+  clear_fullscreen();
+  if (bindings_) bindings_->call_hook("__fs_left", nullptr, 0);
 }
 
 void Page::scroll_to(int32_t y) {

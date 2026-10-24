@@ -42,6 +42,7 @@ enum FormStateBit : uint8_t {
   kFormFocused = 8,
   kFormIndeterminate = 64, // a checkbox in neither state
   kFormModal = 32,         // a <dialog> opened with showModal()
+  kFormFullscreen = 128,   // the element that is displayed fullscreen (the Fullscreen API)
   kFormEdited = 16,        // the user typed in it (that is what makes maxlength / minlength count)
 };
 

@@ -71,6 +71,17 @@ class IDomHost {
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
+  // Fullscreen API: can the window do it; the element shown fullscreen (nullptr: none); make an element fullscreen (false if the window would not); leave it.
+  // Picture-in-Picture: can the browser do it; the video shown in the window (nullptr: none); put a video in it (0 done, 1 not supported, 2 invalid state: the video has
+  // nothing to show yet or is not a video, 3 not allowed: disablePictureInPicture; `width` and `height` get the window's size); take it out.
+  virtual bool pip_supported() { return false; }
+  virtual dom::Node* pip_element() { return nullptr; }
+  virtual int pip_request(dom::Node* video, uint32_t* width, uint32_t* height) { (void)video; (void)width; (void)height; return 1; }
+  virtual void pip_exit() {}
+  virtual bool fullscreen_supported() { return false; }
+  virtual dom::Node* fullscreen_element() { return nullptr; }
+  virtual bool fullscreen_request(dom::Node* element) { (void)element; return false; }
+  virtual void fullscreen_exit() {}
   // The style of an element as it is drawn now (false if the page cannot say).
   virtual bool computed_style(const dom::Node* element, Style* out) = 0;
   // The style sheet that computed_style() worked against: what the TextRefs of a Style point into, and the readers for list valued properties (font-family,
