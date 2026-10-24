@@ -241,6 +241,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsMedia.cpp
   src/Browser/DomBindingsMse.cpp
   src/Browser/DomBindingsTracks.cpp
+  src/Browser/DomBindingsDash.cpp
   src/Browser/DomBindingsForm.cpp
   src/Browser/DomBindingsNet.cpp
   src/Browser/WebPrelude.cpp

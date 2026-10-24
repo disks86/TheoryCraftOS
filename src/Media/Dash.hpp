@@ -240,6 +240,29 @@ class DashClient {
   bool ended() const { return ended_; }
   uint64_t throughput_bps() const { return throughput_; }
 
+  // --- For script (the dash.js style API): what can be chosen, and the choice.
+  struct QualityInfo {
+    uint64_t bandwidth = 0;
+    uint32_t width = 0, height = 0;
+    String id, codecs;
+    explicit QualityInfo(allocators::IAllocator& a) : id(a), codecs(a) {}
+  };
+  // The kind of media of stream `s` ("video" or "audio").
+  StringView stream_kind(uint32_t s) const;
+  // The playable representations of the first period's adaptation set of stream `s`, lowest bandwidth first.
+  uint32_t quality_count(uint32_t s) const;
+  bool quality_info(uint32_t s, uint32_t index, QualityInfo* out) const;
+  // The index of the quality the last segment came in (-1 before the first).
+  int32_t current_quality(uint32_t s) const;
+  // Automatic switching (the default) or a quality that is held; an index past the end is the highest.
+  bool auto_switch(uint32_t s) const;
+  void set_auto_switch(uint32_t s, bool on);
+  void set_quality(uint32_t s, uint32_t index);   // holds that quality (turns automatic switching off)
+  // Seconds buffered ahead of `playhead_us` for the stream (0 if none).
+  double buffer_level(uint32_t s, int64_t playhead_us) const;
+  // Goes up whenever a stream's quality changed.
+  uint32_t quality_epoch() const { return quality_epoch_; }
+
  private:
   struct Stream;
   struct CachedSegments;
@@ -265,7 +288,7 @@ class DashClient {
   uint8_t error_ = 0;
   bool ended_ = false;
   uint64_t throughput_ = 0;
-  uint32_t fetched_ = 0, switches_ = 0;
+  uint32_t fetched_ = 0, switches_ = 0, quality_epoch_ = 0;
   uint64_t started_ms_ = 0, last_refresh_ms_ = 0;
   int64_t live_shift_us_ = 0;
   bool live_shift_set_ = false;

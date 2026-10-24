@@ -754,7 +754,10 @@ void PageObjects::start_dash(VideoSlot& v, dom::Node* n, StringView address, IOb
     v.wants_play = v.play_pending = false;
     queue(n->serial, "error");
     dirty_ = true;
+    return;
   }
+  v.dash_epoch = v.dash->quality_epoch();
+  queue(n->serial, "__dash_init");
 }
 
 void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched) {
@@ -1008,6 +1011,10 @@ void PageObjects::update(uint64_t now_ms) {
       dirty_ = true;
     }
     if (v.dash && !v.dash->ended() && v.dash->error() == 0) v.dash->tick(v.clip->position_us());
+    if (v.dash && v.dash->quality_epoch() != v.dash_epoch) {
+      v.dash_epoch = v.dash->quality_epoch();
+      queue(v.serial, "__dash_quality");
+    }
     if (v.dash && v.dash->error() != 0 && !v.error_code) {
       v.error_code = v.dash->error();
       v.wants_play = v.play_pending = false;
@@ -1414,6 +1421,13 @@ CanvasBitmap* PageObjects::canvas(uint32_t serial, uint32_t width, uint32_t heig
   canvas_pixels_ += uint64_t{width} * height;
   dirty_ = true;
   return s->bitmap.get();
+}
+
+media::DashClient* PageObjects::video_dash(uint32_t serial, int64_t* playhead_us) {
+  VideoSlot* v = find_video(serial);
+  if (!v || !v->dash) return nullptr;
+  *playhead_us = v->clip ? v->clip->position_us() : 0;
+  return v->dash.get();
 }
 
 void PageObjects::video_set_cues(uint32_t serial, List<UniquePointer<TrackCue>>&& cues) {

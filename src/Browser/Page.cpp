@@ -400,6 +400,11 @@ void Page::deliver_object_events() {
       bindings_->call_hook("__tt_event", &arg, 1);
       continue;
     }
+    if (StringView(e.type).starts_with("__dash")) {   // a DASH video: its player started or changed quality (script's dashjs-style players hear of it)
+      const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(static_cast<double>(e.serial)), DomBindings::HookArg::of(StringView(e.type))};
+      bindings_->call_hook("__dash_event", args, 2);
+      continue;
+    }
     dom::Node* n = doc_.by_serial(e.serial);
     if (!n) continue;
     EventInit init;

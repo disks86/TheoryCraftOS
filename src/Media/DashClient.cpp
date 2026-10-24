@@ -66,6 +66,8 @@ struct DashClient::Stream {
   uint32_t failures = 0;
   bool done = false;
   bool positioned = false;
+  bool automatic = true;
+  uint32_t forced = 0;   // the quality index held when !automatic
 };
 
 DashClient::DashClient(allocators::IAllocator& allocator, MseHub& hub, uint32_t source, IDashFetcher& fetcher)
@@ -224,6 +226,19 @@ bool DashClient::pick_representation(Stream& s, const DashPeriod& p, uint64_t pe
     if (s.chosen_bandwidth != 0 && r->bandwidth == s.chosen_bandwidth) current = r.get();
   }
   const DashRepresentation* pick = best ? best : lowest;
+  if (!s.automatic) {   // a quality that is held
+    uint32_t index = 0;
+    const DashRepresentation* held = nullptr;
+    for (const auto& r : set->representations.view()) {
+      if (!playable(*set, *r)) continue;
+      held = r.get();
+      if (index++ >= s.forced) break;
+    }
+    if (held) {
+      *out = held;
+      return true;
+    }
+  }
   if (current && pick && pick->bandwidth > current->bandwidth && ahead_us < kUpSwitchAheadUs && allowed < pick->bandwidth * 2) pick = current;   // not yet: the buffer is too thin to risk it
   if (!pick) return false;
   *out = pick;
@@ -321,6 +336,7 @@ void DashClient::tick_stream(Stream& s, int64_t playhead_us) {
     s.init_key.assign(key.view());
     if (s.chosen_bandwidth != 0 && s.chosen_bandwidth != rep->bandwidth) ++switches_;
   }
+  if (s.chosen_bandwidth != rep->bandwidth) ++quality_epoch_;
   if (s.offset_us != offset) {
     buffer->set_timestamp_offset(offset);
     s.offset_us = offset;
@@ -352,6 +368,70 @@ void DashClient::tick_stream(Stream& s, int64_t playhead_us) {
   if (MseSource* source = hub_.find(source_)) hub_.appended(source);
   s.next_us = seg->start_us + seg->duration_us;
   s.failures = 0;
+}
+
+StringView DashClient::stream_kind(uint32_t s) const { return s < streams_.count() ? streams_[s]->kind.view() : StringView(); }
+
+uint32_t DashClient::quality_count(uint32_t s) const {
+  if (s >= streams_.count() || !manifest_) return 0;
+  const DashAdaptationSet* set = set_of(*manifest_->periods[0], *streams_[s]);
+  uint32_t n = 0;
+  if (set)
+    for (const auto& r : set->representations.view()) n += playable(*set, *r) ? 1 : 0;
+  return n;
+}
+
+bool DashClient::quality_info(uint32_t s, uint32_t index, QualityInfo* out) const {
+  if (s >= streams_.count() || !manifest_) return false;
+  const DashAdaptationSet* set = set_of(*manifest_->periods[0], *streams_[s]);
+  if (!set) return false;
+  uint32_t n = 0;
+  for (const auto& r : set->representations.view()) {
+    if (!playable(*set, *r)) continue;
+    if (n++ != index) continue;
+    out->bandwidth = r->bandwidth;
+    out->width = r->width;
+    out->height = r->height;
+    out->id.assign(r->id.view());
+    out->codecs.assign(r->codecs.view());
+    return true;
+  }
+  return false;
+}
+
+int32_t DashClient::current_quality(uint32_t s) const {
+  if (s >= streams_.count() || streams_[s]->chosen_bandwidth == 0 || !manifest_) return -1;
+  const DashAdaptationSet* set = set_of(*manifest_->periods[0], *streams_[s]);
+  if (!set) return -1;
+  int32_t n = 0;
+  for (const auto& r : set->representations.view()) {
+    if (!playable(*set, *r)) continue;
+    if (r->bandwidth == streams_[s]->chosen_bandwidth) return n;
+    ++n;
+  }
+  return -1;
+}
+
+bool DashClient::auto_switch(uint32_t s) const { return s < streams_.count() && streams_[s]->automatic; }
+void DashClient::set_auto_switch(uint32_t s, bool on) {
+  if (s < streams_.count()) streams_[s]->automatic = on;
+}
+void DashClient::set_quality(uint32_t s, uint32_t index) {
+  if (s >= streams_.count()) return;
+  streams_[s]->automatic = false;
+  const uint32_t n = quality_count(s);
+  streams_[s]->forced = index >= n && n > 0 ? n - 1 : index;
+}
+
+double DashClient::buffer_level(uint32_t s, int64_t playhead_us) const {
+  if (s >= streams_.count()) return 0;
+  MseBuffer* buffer = hub_.find_buffer(streams_[s]->buffer);
+  if (!buffer) return 0;
+  List<MseBuffer::Range> ranges(allocator_);
+  buffer->buffered(&ranges);
+  for (const auto& r : ranges.view())
+    if (r.start - kGapToleranceUs <= playhead_us && playhead_us <= r.end) return static_cast<double>(r.end - playhead_us) / 1e6;
+  return 0;
 }
 
 void DashClient::finish_if_done() {
