@@ -81,6 +81,8 @@ class PageView : public Control {
   int32_t clicked_y() const { return clicked_y_; }
   // Fires when the number of columns or rows that fit changes (the window was resized), also the first time it is known.
   void on_resized(Handler handler) { UiGuard lock(this); resize_handler_ = handler; }
+  // Fires when the page is scrolled (the wheel, the scroll bar, the keys or scroll_to_y()); scroll_y() is where it is now.
+  void on_scrolled(Handler handler) { UiGuard lock(this); scroll_handler_ = handler; }
 
   // Who draws the pictures, videos and canvases (nullptr: they are left blank). The painter is asked while the view paints, so it must be taken away
   // (nullptr) before it goes. After a click on an object, clicked_object() is its kind and clicked_local_x() / _y() and clicked_width() / _height() say where
@@ -157,7 +159,7 @@ class PageView : public Control {
   bool pointer_pressed_ = false;
   Handler pointer_handler_;
   void set_pointer(uint32_t node, bool pressed);
-  Handler link_handler_, hover_handler_, node_handler_, resize_handler_, key_handler_;
+  Handler link_handler_, hover_handler_, node_handler_, resize_handler_, key_handler_, scroll_handler_;
   uint8_t capture_ = kCaptureNone, queued_ = 0;
   KeyArgs queue_[16];
   uint32_t press_node_ = 0, clicked_node_ = 0, notified_columns_ = 0, notified_rows_ = 0;

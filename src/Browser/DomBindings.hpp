@@ -88,6 +88,10 @@ class IDomHost {
   virtual void close_window() {}
   virtual StringView referrer() { return StringView(); }
   virtual void scroll_node_into_view(dom::Node* node) { (void)node; }
+  // Where the element is on the page as the last picture laid it out: x, y, width, height of its border box in CSS pixels from the top left of the document. False
+  // if it has no box (display: none, not in the document) or nothing was laid out yet; layout_ready() says whether anything was.
+  virtual bool node_rect(dom::Node* node, double* rect4) { (void)node; (void)rect4; return false; }
+  virtual bool layout_ready() { return false; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
@@ -260,6 +264,8 @@ class DomBindings {
   void set_ready_state(StringView state);
   // document.hidden / visibilityState before any script runs (no event); later changes go through the page's __page_visibility hook.
   void set_hidden(bool hidden);
+  // The page was scrolled (by the user or a script) to this vertical position: window.scrollY follows.
+  void set_scroll(int32_t y);
   void update_window_metrics();
   // Looks at the media queries that matchMedia gave out: those whose answer changed get their change listeners called. Returns how many changed.
   uint32_t media_changed();

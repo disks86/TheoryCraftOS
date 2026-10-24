@@ -7841,6 +7841,186 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     nativeAdd.call(store, 'change', function (e) { if (typeof handler === 'function') handler.call(store, e); });
     defineGetter(g, 'cookieStore', function () { return store; });
   }());
+  // ---------------------------------------------------------------------------------------------------------------------------------- IntersectionObserver
+  // Works in document coordinates from __rect() (the boxes of the last picture); the observers look again after every picture and every scroll.
+  (function () {
+    var active = [];   // observers that have targets
+    var pendingRun = false;
+    var rectClass = function (l, t, r, b) { return new DOMRectReadOnly(l, t, r - l, b - t); };
+    var clientRect = function (rc) { return rectClass(rc.l, rc.t - g.scrollY, rc.r, rc.b - g.scrollY); };
+    var boxOf = function (el) { var r = __rect(el); return r ? { l: r[0], t: r[1], r: r[0] + r[2], b: r[1] + r[3] } : null; };
+    var meet = function (a, b) {   // the overlap of two rectangles (touching edges count); null if there is none
+      var l = Math.max(a.l, b.l), t = Math.max(a.t, b.t), r = Math.min(a.r, b.r), bt = Math.min(a.b, b.b);
+      return l <= r && t <= bt ? { l: l, t: t, r: r, b: bt } : null;
+    };
+    var area = function (a) { return (a.r - a.l) * (a.b - a.t); };
+    var bad = function (msg) { return new SyntaxError("Failed to construct 'IntersectionObserver': " + msg); };
+    var parseMargin = function (text) {
+      var parts = String(text).trim() === '' ? [] : String(text).trim().split(/\s+/);
+      if (parts.length > 4) throw bad('Extra text found at the end of rootMargin.');
+      var vals = parts.map(function (p) {
+        var m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(px|%)$/.exec(p);
+        if (!m) throw bad('rootMargin must be specified in pixels or percent.');
+        return { v: parseFloat(m[1]), pct: m[2] === '%' };
+      });
+      var zero = { v: 0, pct: false };
+      if (vals.length === 0) vals = [zero];
+      var t = vals[0], r = vals.length > 1 ? vals[1] : t, b = vals.length > 2 ? vals[2] : t, l = vals.length > 3 ? vals[3] : r;
+      return [t, r, b, l];
+    };
+    var marginText = function (m) { return m.map(function (x) { return x.v + (x.pct ? '%' : 'px'); }).join(' '); };
+    var viewportBox = function () { return { l: g.scrollX, t: g.scrollY, r: g.scrollX + g.innerWidth, b: g.scrollY + g.innerHeight }; };
+    var clips = function (el, cache) {   // does the element cut off what sticks out of it (overflow other than visible)?
+      var c = cache.get(el);
+      if (c === undefined) {
+        var st = g.getComputedStyle(el);
+        c = st.overflowX !== 'visible' || st.overflowY !== 'visible';
+        cache.set(el, c);
+      }
+      return c;
+    };
+
+    function IntersectionObserverEntry(init) {
+      if (!(this instanceof IntersectionObserverEntry)) throw new TypeError("Failed to construct 'IntersectionObserverEntry': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      if (init === undefined || init === null || typeof init !== 'object') throw new TypeError("Failed to construct 'IntersectionObserverEntry': 1 argument required, but only 0 present.");
+      if (!init.target || typeof init.target.nodeType !== 'number') throw new TypeError("Failed to construct 'IntersectionObserverEntry': Failed to read the 'target' property from 'IntersectionObserverEntryInit': Required member is undefined.");
+      var zero = new DOMRectReadOnly(0, 0, 0, 0);
+      hide(this, '__d', {
+        time: +init.time || 0,
+        rootBounds: init.rootBounds || null,
+        boundingClientRect: init.boundingClientRect || zero,
+        intersectionRect: init.intersectionRect || zero,
+        isIntersecting: !!init.isIntersecting,
+        isVisible: !!init.isVisible,
+        intersectionRatio: +init.intersectionRatio || 0,
+        target: init.target });
+    }
+    ['time', 'rootBounds', 'boundingClientRect', 'intersectionRect', 'isIntersecting', 'isVisible', 'intersectionRatio', 'target'].forEach(function (name) {
+      Object.defineProperty(IntersectionObserverEntry.prototype, name, { get: function () { return this.__d[name]; }, enumerable: true, configurable: true });
+    });
+    method(IntersectionObserverEntry.prototype, 'toJSON', function () {
+      var d = this.__d;
+      return { time: d.time, rootBounds: d.rootBounds && d.rootBounds.toJSON(), boundingClientRect: d.boundingClientRect.toJSON(), intersectionRect: d.intersectionRect.toJSON(),
+               isIntersecting: d.isIntersecting, isVisible: d.isVisible, intersectionRatio: d.intersectionRatio };
+    });
+    Object.defineProperty(IntersectionObserverEntry.prototype, Symbol.toStringTag, { value: 'IntersectionObserverEntry', configurable: true });
+    hide(g, 'IntersectionObserverEntry', IntersectionObserverEntry);
+
+    function IntersectionObserver(callback, options) {
+      if (!(this instanceof IntersectionObserver)) throw new TypeError("Failed to construct 'IntersectionObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'IntersectionObserver': 1 argument required, but only 0 present.");
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'IntersectionObserver': The callback provided as parameter 1 is not a function.");
+      var o = options === undefined || options === null ? {} : options;
+      if (typeof o !== 'object') throw new TypeError("Failed to construct 'IntersectionObserver': The provided value is not of type 'IntersectionObserverInit'.");
+      var root = o.root === undefined ? null : o.root;
+      if (root !== null && !(root && (root.nodeType === 1 || root.nodeType === 9))) throw new TypeError("Failed to construct 'IntersectionObserver': Failed to read the 'root' property from 'IntersectionObserverInit': The provided value is not of type '(Document or Element)'.");
+      var margin = parseMargin(o.rootMargin === undefined ? '0px' : o.rootMargin);
+      var th = o.threshold === undefined ? [0] : (Array.isArray(o.threshold) ? o.threshold.slice() : [o.threshold]);
+      th = th.map(function (v) {
+        var n = Number(v);
+        if (n !== n) throw new TypeError("Failed to construct 'IntersectionObserver': The provided double value is non-finite.");
+        if (n < 0 || n > 1) throw new RangeError("Failed to construct 'IntersectionObserver': Threshold values must be numbers between 0 and 1.");
+        return n;
+      }).sort(function (a, b) { return a - b; });
+      if (th.length === 0) th = [0];
+      var delay = o.delay === undefined ? 0 : Number(o.delay), track = !!o.trackVisibility;
+      if (track && delay < 100) throw new RangeError("Failed to construct 'IntersectionObserver': To enable trackVisibility option, you must also use a delay of at least 100.");
+      hide(this, '__s', { cb: callback, root: root, margin: margin, thresholds: th, delay: delay, track: track, targets: [], queue: [] });
+    }
+    var state = function (obs) { return obs.__s; };
+    Object.defineProperty(IntersectionObserver.prototype, 'root', { get: function () { return state(this).root; }, enumerable: true, configurable: true });
+    Object.defineProperty(IntersectionObserver.prototype, 'rootMargin', { get: function () { return marginText(state(this).margin); }, enumerable: true, configurable: true });
+    Object.defineProperty(IntersectionObserver.prototype, 'thresholds', { get: function () { return Object.freeze(state(this).thresholds.slice()); }, enumerable: true, configurable: true });
+    Object.defineProperty(IntersectionObserver.prototype, 'delay', { get: function () { return state(this).delay; }, enumerable: true, configurable: true });
+    Object.defineProperty(IntersectionObserver.prototype, 'trackVisibility', { get: function () { return state(this).track; }, enumerable: true, configurable: true });
+    Object.defineProperty(IntersectionObserver.prototype, Symbol.toStringTag, { value: 'IntersectionObserver', configurable: true });
+
+    var wake = function () {   // a look soon, for what was just observed (the pictures only come when something changed)
+      if (pendingRun) return;
+      pendingRun = true;
+      setTimeout(function () { pendingRun = false; run(); }, 0);
+    };
+    method(IntersectionObserver.prototype, 'observe', function (target) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': 1 argument required, but only 0 present.");
+      if (!target || target.nodeType !== 1) throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+      var s = state(this);
+      for (var i = 0; i < s.targets.length; i++) if (s.targets[i].target === target) return;
+      s.targets.push({ target: target, index: -1, inter: false });
+      if (active.indexOf(this) < 0) active.push(this);
+      wake();
+    });
+    var release = function (obs) { var s = state(obs); if (s.targets.length === 0) { var i = active.indexOf(obs); if (i >= 0) active.splice(i, 1); } };
+    method(IntersectionObserver.prototype, 'unobserve', function (target) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'unobserve' on 'IntersectionObserver': 1 argument required, but only 0 present.");
+      if (!target || target.nodeType !== 1) throw new TypeError("Failed to execute 'unobserve' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+      var s = state(this);
+      s.targets = s.targets.filter(function (r) { return r.target !== target; });
+      s.queue = s.queue.filter(function (e) { return e.target !== target; });
+      release(this);
+    });
+    method(IntersectionObserver.prototype, 'disconnect', function () { var s = state(this); s.targets = []; s.queue = []; release(this); });
+    method(IntersectionObserver.prototype, 'takeRecords', function () { var s = state(this), q = s.queue; s.queue = []; return q; });
+
+    var rootBox = function (s, cache) {   // the rectangle things are measured against, with the margin; null if the root has no box
+      var box = s.root && s.root.nodeType === 1 ? boxOf(s.root) : viewportBox();
+      if (!box) return null;
+      var w = box.r - box.l, h = box.b - box.t, m = s.margin;
+      var px = function (x, of) { return x.pct ? of * x.v / 100 : x.v; };
+      return { l: box.l - px(m[3], w), t: box.t - px(m[0], h), r: box.r + px(m[1], w), b: box.b + px(m[2], h) };
+    };
+    // One look at a target: the entry it would give now.
+    var measure = function (s, rec, root, cache, time) {
+      var target = rec.target, own = target.isConnected ? boxOf(target) : null;
+      var zero = { l: 0, t: 0, r: 0, b: 0 }, view = own || { l: 0, t: g.scrollY, r: 0, b: g.scrollY };
+      var hit = null;
+      if (own && root) {
+        hit = own;
+        var rootEl = s.root && s.root.nodeType === 1 ? s.root : null, found = !rootEl;
+        for (var p = target.parentNode; p && hit; p = p.parentNode) {
+          if (p === rootEl) { found = true; break; }
+          if (p.nodeType !== 1 || p === document.documentElement || p === document.body && !rootEl) continue;
+          if (clips(p, cache)) { var pb = boxOf(p); hit = pb ? meet(hit, pb) : null; }
+        }
+        if (!found) hit = null;
+        if (hit) hit = meet(hit, root);
+      }
+      var inter = !!hit;
+      var ratio = !own ? 0 : area(own) > 0 ? (hit ? area(hit) / area(own) : 0) : (inter ? 1 : 0);
+      if (ratio > 1) ratio = 1;
+      var th = s.thresholds, idx = 0;
+      if (inter) { idx = th.length; for (var i = 0; i < th.length; i++) if (th[i] > ratio) { idx = i; break; } }
+      return { inter: inter, idx: idx, entry: new IntersectionObserverEntry({
+        time: time,
+        rootBounds: root ? clientRect(root) : null,
+        boundingClientRect: own ? clientRect(own) : new DOMRectReadOnly(0, 0, 0, 0),
+        intersectionRect: hit ? clientRect(hit) : new DOMRectReadOnly(0, 0, 0, 0),
+        isIntersecting: inter, isVisible: false, intersectionRatio: ratio, target: target }) };
+    };
+    var run = function () {
+      if (active.length === 0 || !__layout_ready()) return;
+      var cache = new Map(), time = typeof performance !== 'undefined' ? performance.now() : 0;
+      active.slice().forEach(function (obs) {
+        var s = state(obs), root = rootBox(s, cache);
+        s.targets.forEach(function (rec) {
+          var m = measure(s, rec, root, cache, time);
+          if (m.idx !== rec.index || m.inter !== rec.inter) {
+            rec.index = m.idx;
+            rec.inter = m.inter;
+            s.queue.push(m.entry);
+          }
+        });
+      });
+      active.slice().forEach(function (obs) {
+        var s = state(obs);
+        if (s.queue.length === 0) return;
+        var entries = s.queue;
+        s.queue = [];
+        try { s.cb.call(obs, entries, obs); } catch (e) { setTimeout(function () { throw e; }, 0); }
+      });
+    };
+    hide(g, '__io_run', run);
+    hide(g, 'IntersectionObserver', IntersectionObserver);
+  }());
   // ---------------------------------------------------------------------------------------------------------------------------------- page lifecycle, window.open()
   (function () {
     hide(g, '__fire_pageshow', function () { g.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false })); });

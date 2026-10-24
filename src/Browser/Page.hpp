@@ -36,6 +36,7 @@
 #include "Browser/Objects.hpp"
 #include "Browser/Renderer.hpp"
 #include "Dom/Dom.hpp"
+#include "ObjectContainer/Dictionary.hpp"
 #include "Font/FontSet.hpp"
 #include "Script/Engine.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -213,6 +214,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool before_unload();
   // The page is going away: `visibilitychange` (hidden), `pagehide`, `unload`.
   void unload();
+  // The page was scrolled (by the user or a script): window.scrollY follows, `scroll` fires and intersection observers look again. `y` is in CSS pixels.
+  void set_scroll(int32_t y);
   // The page is shown to the user (true) or not - its tab is in the background, its window minimized: document.hidden / visibilityState follow, `visibilitychange` fires
   // when that changes, and requestAnimationFrame callbacks wait while it is hidden. Frames of the page follow. May be called before load().
   void set_visible(bool visible);
@@ -261,6 +264,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void close_window() override { env_.close_window(); }
   StringView referrer() override { return referrer_.view(); }
   void scroll_node_into_view(dom::Node* node) override;
+  bool node_rect(dom::Node* node, double* rect4) override;
+  bool layout_ready() override { return geometry_ready_; }
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t y) override;
   bool pip_supported() override { return env_.pip_supported(); }
@@ -412,6 +417,13 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   String referrer_;
   bool fragment_pending_ = false;
   bool hidden_ = false;   // see set_visible()
+  struct BoxRect {
+    double x = 0, y = 0, width = 0, height = 0;
+  };
+  Dictionary<uint32_t, BoxRect> geometry_;   // node serial -> its box on the page as the last picture laid it out
+  bool geometry_ready_ = false;
+  int32_t scroll_y_ = 0;
+  void record_geometry(const layout::BoxTree& tree);
   uint32_t scroll_node_ = 0;   // an element scrollIntoView() was called on: its place is worked out when the page is drawn
   uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
   struct Message {

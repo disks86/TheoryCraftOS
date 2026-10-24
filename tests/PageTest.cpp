@@ -3282,6 +3282,49 @@ static void test_navigation() {
     }
     CHECK(a.live == 0);
   }
+  // --- IntersectionObserver, geometry and scrolling
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      media.width = 400;
+      media.height = 300;
+      font::FontSet fonts(a);
+      fonts.add_bundled_fonts();
+      auto watch = [&](const std::string& script, const std::vector<int32_t>& scrolls) {
+        Page page(a, env, "https://app.example/", media, true);
+        page.load((std::string("<body style='margin:0'><div style='height:1000px'></div><div id=t style='height:100px;width:200px'>x</div><div id=c style='height:200px;overflow:hidden;width:100px'><div id=in style='height:50px;margin-top:400px'>y</div></div><div style='height:1500px'></div><script>") + script + "</script>").c_str());
+        PagePicture picture(a);
+        CHECK(page.render_picture(&picture, fonts));
+        page.run_due_timers(1e12);
+        for (int32_t y : scrolls) {
+          page.set_scroll(y);
+          page.run_due_timers(1e12);
+        }
+        return std::string(page.log().data(), page.log().size());
+      };
+      const std::string fmt = "var t = document.getElementById('t'); var show = function (es) { es.forEach(function (e) { console.log(e.target.id, e.isIntersecting, e.intersectionRatio, Math.round(e.boundingClientRect.top), Math.round(e.intersectionRect.height)) }) };";
+      // observed from far away: first a "not intersecting" entry, then in view, then out again; scrollY follows
+      CHECK(watch(fmt + "new IntersectionObserver(show).observe(t); addEventListener('scroll', function () { console.log('scroll', scrollY) })", {800, 0}) ==
+            "t false 0 1000 0\nscroll 800\nt true 1 200 100\nscroll 0\nt false 0 1000 0\n");
+      // thresholds: only when a threshold is crossed; the ratio is the visible part (half of the 100px box: 50px visible at scroll 650 -> 950..1250 sees 1000..1100? no, scroll 700 shows the top 0..)
+      CHECK(watch(fmt + "new IntersectionObserver(show, { threshold: [0, 0.5, 1] }).observe(t)", {750, 760, 850, 1000}) ==
+            "t false 0 1000 0\nt true 0.5 250 50\nt true 1 150 100\n");
+      // rootMargin makes the root bigger; a root element clips; unobserve / disconnect stop it
+      CHECK(watch(fmt + "new IntersectionObserver(show, { rootMargin: '100px 0px' }).observe(t)", {650}) == "t false 0 1000 0\nt true 0.5 350 50\n");
+      CHECK(watch(fmt + "var o = new IntersectionObserver(function (es) { show(es); o.disconnect() }); o.observe(t)", {800}) == "t false 0 1000 0\n");
+      // an element clipped by an ancestor with overflow:hidden is not seen even when it is within the viewport
+      CHECK(watch(fmt + "new IntersectionObserver(show).observe(document.getElementById('in'))", {1250}) == "in false 0 1500 0\n");
+      CHECK(watch("addEventListener('scroll', function () { var r = document.getElementById('t').getBoundingClientRect(); console.log(r.top, r.height, r.width, document.getElementById('t').offsetHeight, scrollY) })", {900}) == "100 100 200 100 900\n");
+      // takeRecords, options and errors
+      CHECK(watch("var o = new IntersectionObserver(function () {}, { root: document.body, rootMargin: '10px', threshold: 1 }); console.log(o.root === document.body, o.rootMargin, o.thresholds.join()); o = new IntersectionObserver(function () {}, { rootMargin: '1% 2px 3px' }); console.log(o.rootMargin);"
+                  "try { new IntersectionObserver(function () {}, { threshold: 2 }) } catch (e) { console.log(e.name) } try { new IntersectionObserver(function () {}, { rootMargin: '5' }) } catch (e) { console.log(e.name) } try { new IntersectionObserver(1) } catch (e) { console.log(e.name) }"
+                  "try { o.observe(5) } catch (e) { console.log(e.name) } var t = document.getElementById('t'); o.observe(t); o.observe(t); console.log(o.takeRecords().length); o.disconnect()", {}) ==
+            "true 10px 10px 10px 10px 1\n1% 2px 3px 2px\nRangeError\nSyntaxError\nTypeError\nTypeError\n0\n");
+    }
+    CHECK(a.live == 0);
+  }
   // --- window.open(), window.close()
   CHECK(nav_is("var w = open('/popup', 'pop'); console.log(typeof w, w.closed, w.name); console.log(open('/n', '_blank', 'noopener') === null, open('about:blank') === null); w.close(); console.log(w.closed); close();", "object false pop | true true | true",
                nullptr, [](FakeEnvironment& env) {

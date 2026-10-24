@@ -460,6 +460,27 @@ NATIVE(win_prompt) {
 
 NATIVE(win_do_nothing) { return true; }
 
+// __rect(element): [x, y, width, height] of its box on the page (CSS pixels from the top left of the document), or null if it has none.
+NATIVE(node_page_rect) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  double r[4];
+  if (!n || !impl(vm).host.node_rect(n, r)) {
+    *result = Value::make_null();
+    return true;
+  }
+  JsObject* a = vm.new_array();
+  for (double v : r) vm.array_push(a, num_value(v));
+  *result = Value::make_object(a);
+  return true;
+}
+
+NATIVE(layout_ready_native) {
+  (void)self; (void)args; (void)argc;
+  *result = bool_value(impl(vm).host.layout_ready());
+  return true;
+}
+
 // --- navigation: what the Navigation API and window.open() need from the browser ----------------------------------------------------
 
 NATIVE(set_hidden) {
@@ -1107,6 +1128,8 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__pip_exit", pip_exit, 0);
   vm.define_native(g, "__pip_element", pip_element, 0);
   vm.define_native(g, "__set_hidden", set_hidden, 1);
+  vm.define_native(g, "__rect", node_page_rect, 1);
+  vm.define_native(g, "__layout_ready", layout_ready_native, 0);
   vm.define_native(g, "__history_entries", history_entries, 0);
   vm.define_native(g, "__nav_state", nav_state, 1);
   vm.define_native(g, "__nav_go_key", nav_go_key, 1);
@@ -1255,7 +1278,7 @@ bool install_window(DomBindings::Impl& c) {
   }
 
   // observers and the like exist but never report
-  for (const char* name : {"MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"}) {
+  for (const char* name : {"MutationObserver", "ResizeObserver", "PerformanceObserver"}) {
     JsObject* proto = vm.new_plain();
     vm.define_native(proto, "observe", win_do_nothing, 1);
     vm.define_native(proto, "unobserve", win_do_nothing, 1);
@@ -1278,6 +1301,11 @@ void DomBindings::set_ready_state(StringView state) {
 }
 
 void DomBindings::set_hidden(bool hidden) { impl_->page_hidden = hidden; }
+
+void DomBindings::set_scroll(int32_t y) {
+  impl_->scroll_line = y < 0 ? 0 : y;
+  bind::update_metrics(*impl_);
+}
 
 void DomBindings::update_window_metrics() { bind::update_metrics(*impl_); }
 
