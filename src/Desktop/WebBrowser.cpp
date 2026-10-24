@@ -286,6 +286,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   node_handler_ = {&WebBrowser::on_node_click, this};
   pointer_handler_ = {&WebBrowser::on_pointer, this};
   resize_handler_ = {&WebBrowser::on_view_resized, this};
+  scroll_handler_ = {&WebBrowser::on_view_scrolled, this};
   timer_handler_ = {&WebBrowser::on_timers, this};
   visibility_handler_ = {&WebBrowser::on_visibility, this};
   key_handler_ = {&WebBrowser::on_form_key, this};
@@ -293,6 +294,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   page_.on_pointer_changed(Handler::immediate(&WebBrowser::route_pointer, this));
   page_.on_key_pressed(Handler::immediate(&WebBrowser::route_key, this));
   page_.on_resized(Handler::immediate(&WebBrowser::route_resize, this));
+  page_.on_scrolled(Handler::immediate(&WebBrowser::route_scroll, this));
 
   add(&menu_);
   add(&toolbar_);
@@ -1148,6 +1150,18 @@ void WebBrowser::on_node_click(void* self, Control&) {
 
 // The window changed size (or the colour scheme was switched): the page is told the new viewport.
 void WebBrowser::on_view_resized(void* self, Control&) { static_cast<WebBrowser*>(self)->update_media(); }
+
+void WebBrowser::on_view_scrolled(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->live_) return;
+  int32_t y;
+  {
+    UiGuard lock(&b->page_);
+    y = b->page_.scroll_y();
+  }
+  b->live_->set_scroll(y);
+  b->settle();
+}
 
 void WebBrowser::update_media() {
   if (defer_fullscreen_ != 0) settle();

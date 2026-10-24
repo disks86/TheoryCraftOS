@@ -62,9 +62,11 @@ void PageView::scroll_to_y(int32_t y) {
   UiGuard lock(this);
   const int32_t content = picture_ ? picture_->height() : 0;
   const int32_t max_y = content > viewport_h_ ? content - viewport_h_ : 0;
+  const int32_t before = scroll_y_;
   scroll_y_ = y < 0 ? 0 : y > max_y ? max_y : y;
   sync_scroll_bar();
   invalidate();
+  if (scroll_y_ != before) fire(scroll_handler_);
 }
 
 void PageView::scroll_by_y(int32_t dy) { scroll_to_y(scroll_y_ + dy); }
@@ -162,8 +164,10 @@ void PageView::scroll_changed(void* self, Control&) {
   auto* v = static_cast<PageView*>(self);
   if (v->syncing_) return;
   if (v->picture_mode_) {
+    const int32_t before = v->scroll_y_;
     v->scroll_y_ = v->scroll_bar_.value();
     v->invalidate();
+    if (v->scroll_y_ != before) v->fire(v->scroll_handler_);
     return;
   }
   v->top_ = static_cast<uint32_t>(v->scroll_bar_.value());

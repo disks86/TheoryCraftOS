@@ -120,7 +120,8 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       invalid_text_(allocator),
       style_cache_(allocator),
       sockets_(allocator),
-      workers_(allocator) {
+      workers_(allocator),
+      geometry_(allocator) {
   address_.assign(address);
   style_cache_media_ = media;
   hub_id_ = env_.page_hub().add_page();
@@ -405,11 +406,17 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
     ok = paint::build_display_list(out->tree, paint_options, &out->list);
   }
   if (ok) resolve_scroll_target(out->tree);
+  if (ok) record_geometry(out->tree);
   out->document = &doc_;
   out->viewport_width = media_.width;
   rendered_version_ = doc_.version();
   rendered_media_ = media_;
   deliver_object_events();
+  if (ok && bindings_) {   // (what is on screen has changed: intersection observers look again)
+    bindings_->call_hook("__ro_run", nullptr, 0);   // (resize observers first, then intersection observers)
+    bindings_->call_hook("__io_run", nullptr, 0);
+    flush_errors();
+  }
   return ok;
 }
 
@@ -711,6 +718,71 @@ bool Page::meta_refresh(double* seconds, String* address) {
 
 void Page::scroll_node_into_view(dom::Node* node) {
   if (node) scroll_node_ = node->serial;
+}
+
+// Remembers where every element's box ended up, in pixels from the top left of the document (the first box of an element is its own; boxes are relative to
+// their parent's border box, so the offsets of the ancestors are added on the way down).
+void Page::record_geometry(const layout::BoxTree& tree) {
+  geometry_.clear();
+  geometry_ready_ = true;
+  if (tree.empty()) return;
+  struct Pending {
+    layout::BoxId id;
+    int64_t x100, y100;   // where the parent's border box is, in hundredths of a pixel
+  };
+  List<Pending> stack(allocator_);
+  stack.push_back({tree.root(), 0, 0});
+  while (stack.count() > 0) {
+    const Pending p = stack[stack.count() - 1];
+    stack.remove_at(stack.count() - 1);
+    const layout::Box& b = tree.box(p.id);
+    const int64_t x = p.x100 + b.x.to_px100(), y = p.y100 + b.y.to_px100();
+    if (b.node != 0 && !geometry_.contains(b.node)) {
+      BoxRect r;
+      r.x = static_cast<double>(x) / 100.0;
+      r.y = static_cast<double>(y) / 100.0;
+      r.width = static_cast<double>(b.width.to_px100()) / 100.0;
+      r.height = static_cast<double>(b.height.to_px100()) / 100.0;
+      if (b.kind != layout::BoxKind::Inline) {   // (an inline box that is not replaced has no content box of its own)
+        const double cw = r.width - static_cast<double>((b.border.horizontal() + b.padding.horizontal()).to_px100()) / 100.0;
+        const double ch = r.height - static_cast<double>((b.border.vertical() + b.padding.vertical()).to_px100()) / 100.0;
+        r.content_width = cw < 0 ? 0 : cw;
+        r.content_height = ch < 0 ? 0 : ch;
+      }
+      r.padding_left = static_cast<double>(b.padding.left.to_px100()) / 100.0;
+      r.padding_top = static_cast<double>(b.padding.top.to_px100()) / 100.0;
+      geometry_.put(b.node, r);
+    }
+    for (uint64_t i = 0; i < b.children.count(); ++i) stack.push_back({b.children[i], x, y});
+  }
+}
+
+bool Page::node_rect(dom::Node* node, double* rect8) {
+  if (!node || !geometry_ready_ || !dom::is_connected(node)) return false;
+  const BoxRect* r = geometry_.find(node->serial);
+  if (!r) return false;
+  rect8[0] = r->x;
+  rect8[1] = r->y;
+  rect8[2] = r->width;
+  rect8[3] = r->height;
+  rect8[4] = r->content_width;
+  rect8[5] = r->content_height;
+  rect8[6] = r->padding_left;
+  rect8[7] = r->padding_top;
+  return true;
+}
+
+void Page::set_scroll(int32_t y) {
+  if (y < 0) y = 0;
+  if (y == scroll_y_) return;
+  scroll_y_ = y;
+  if (!bindings_) return;
+  bindings_->set_scroll(y);
+  EventInit bubbling;
+  bubbling.cancelable = false;
+  bindings_->dispatch(doc_.root(), "scroll", bubbling);
+  bindings_->call_hook("__io_run", nullptr, 0);
+  flush_errors();
 }
 
 // The vertical place the page should be scrolled to: the fragment of the address (an element with that id, or an <a name>; "" and "top" are the top), or the

@@ -335,6 +335,8 @@ class WebBrowser : public gui::Frame {
   static void route_pip(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->pip_handler_, s, true); }
   static void on_pip_changed(void* self, gui::Control&);
   static void route_resize(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->resize_handler_, s, true); }
+  static void route_scroll(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->scroll_handler_, s, true); }
+  static void on_view_scrolled(void* self, gui::Control&);
   static void route_key(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->key_handler_, s, false); }
   UnixClock unix_clock_ = nullptr;
   void* unix_clock_context_ = nullptr;
@@ -345,7 +347,7 @@ class WebBrowser : public gui::Frame {
   bool scripts_enabled_ = true, dark_ = false;
   gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr, *third_party_item_ = nullptr;
   bool block_third_party_ = false;
-  gui::Handler pointer_handler_, node_handler_, resize_handler_, timer_handler_, key_handler_;
+  gui::Handler pointer_handler_, node_handler_, resize_handler_, scroll_handler_, timer_handler_, key_handler_;
   Env env_;
   UniquePointer<browser::Page> live_;
   browser::MediaEnvironment media_;
