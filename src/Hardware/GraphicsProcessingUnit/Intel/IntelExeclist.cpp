@@ -37,37 +37,48 @@ void store(uint32_t& word, uint32_t value) {
 }  // namespace
 
 bool ExeclistPort::enable() {
-  if (status_.size() != kStatusPageDwords || (status_ggtt_ & 4095)) return false;
+  if (!registers_ || status_.size() != kStatusPageDwords || (status_ggtt_ & 4095)) return false;
   // The CSB pointers first (reset_csb_pointers): the hardware starts writing at entry 0, so our head sits one entry before it, and the write pointer we
   // compare against is faked to the last entry until the hardware writes its own.
   constexpr uint32_t kReset = kCsbEntries - 1;
-  registers_.write32(base_ + kRingContextStatusPtr, (0xFFFFu << 16) | (kReset << 8) | kReset);
-  registers_.read32(base_ + kRingContextStatusPtr);
+  registers_->write32(base_ + kRingContextStatusPtr, (0xFFFFu << 16) | (kReset << 8) | kReset);
+  registers_->read32(base_ + kRingContextStatusPtr);
   csb_head_ = kReset;
   store(status_[kCsbWriteDword], kReset);
   for (uint32_t i = 0; i < kCsbEntries * 2; ++i) store(status_[kCsbFirstDword + i], 0xFFFFFFFFu);  // to see that the hardware really writes them
-  registers_.write32(base_ + kRingContextStatusPtr, (0xFFFFu << 16) | (kReset << 8) | kReset);
-  registers_.read32(base_ + kRingContextStatusPtr);
+  registers_->write32(base_ + kRingContextStatusPtr, (0xFFFFu << 16) | (kReset << 8) | kReset);
+  registers_->read32(base_ + kRingContextStatusPtr);
 
   // enable_execlists()
-  registers_.write32(base_ + kRingHwstam, ~0u);
-  registers_.write32(base_ + kRingModeGen7, masked_enable(1u << 15));  // GFX_RUN_LIST_ENABLE
-  registers_.write32(base_ + kRingMiMode, masked_disable(1u << 8));    // not STOP_RING
-  registers_.write32(base_ + kRingHwsPga, status_ggtt_);
-  registers_.read32(base_ + kRingHwsPga);
+  registers_->write32(base_ + kRingHwstam, ~0u);
+  registers_->write32(base_ + kRingModeGen7, masked_enable(1u << 15));  // GFX_RUN_LIST_ENABLE
+  registers_->write32(base_ + kRingMiMode, masked_disable(1u << 8));    // not STOP_RING
+  registers_->write32(base_ + kRingHwsPga, status_ggtt_);
+  registers_->read32(base_ + kRingHwsPga);
   return true;
 }
 
 void ExeclistPort::submit(uint64_t descriptor) {
+  if (!registers_) return;
   // Each element is written as its upper half, then its lower half; the second element (0) starts the load.
-  registers_.write32(base_ + kRingElsp, 0);
-  registers_.write32(base_ + kRingElsp, 0);
-  registers_.write32(base_ + kRingElsp, static_cast<uint32_t>(descriptor >> 32));
-  registers_.write32(base_ + kRingElsp, static_cast<uint32_t>(descriptor));
+  registers_->write32(base_ + kRingElsp, 0);
+  registers_->write32(base_ + kRingElsp, 0);
+  registers_->write32(base_ + kRingElsp, static_cast<uint32_t>(descriptor >> 32));
+  registers_->write32(base_ + kRingElsp, static_cast<uint32_t>(descriptor));
+}
+
+bool ExeclistPort::stop(uint32_t attempts) {
+  if (!registers_) return false;
+  constexpr uint32_t kStopRing = 1u << 8, kModeIdle = 1u << 9;
+  registers_->write32(base_ + kRingMiMode, masked_enable(kStopRing));
+  for (uint32_t i = 0; i < attempts; ++i)
+    if (registers_->read32(base_ + kRingMiMode) & kModeIdle) return true;
+  return false;
 }
 
 ExeclistPort::Events ExeclistPort::poll() {
   Events e;
+  if (status_.size() != kStatusPageDwords) return e;
   uint32_t tail = load(status_[kCsbWriteDword]) & 0x7;
   if (tail >= kCsbEntries || csb_head_ == tail) return e;  // 6 and 7 are not valid pointers
   uint32_t head = csb_head_;

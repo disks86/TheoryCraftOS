@@ -46,6 +46,12 @@ bool Ggtt::clear(uint64_t index, uint64_t count, uint64_t scratch_dma) const {
   return true;
 }
 
+bool Ggtt::write_raw(uint64_t index, uint64_t entry) const {
+  if (!valid() || index >= page_count_) return false;
+  table_.write64((first_page_ + index) * 8, entry);
+  return true;
+}
+
 bool Ggtt::read(uint64_t index, uint64_t* entry) const {
   if (!valid() || index >= page_count_) return false;
   *entry = table_.read64((first_page_ + index) * 8);
@@ -55,6 +61,16 @@ bool Ggtt::read(uint64_t index, uint64_t* entry) const {
 void program_private_pat(const MmioRegion& registers, const PatTable& table) {
   registers.write32(kPrivatePatLow, table.low);
   registers.write32(kPrivatePatHigh, table.high);
+}
+
+void program_private_pat(IRegisterBank& registers, const PatTable& table) {
+  registers.write32(kPrivatePatLow, table.low);
+  registers.write32(kPrivatePatHigh, table.high);
+}
+
+void ggtt_invalidate(IRegisterBank& registers) {
+  registers.write32(kGttFlushRegister, 1);
+  registers.read32(kGttFlushRegister);
 }
 
 void ggtt_invalidate(const MmioRegion& registers) {
@@ -69,6 +85,14 @@ void Ppgtt32::release() {
     if (!d.empty()) { pages_.free_page(d); d = ArrayView<uint64_t>(); }
   if (!scratch_table_.empty()) { pages_.free_page(scratch_table_); scratch_table_ = ArrayView<uint64_t>(); }
   if (!scratch_page_.empty()) { pages_.free_page(scratch_page_); scratch_page_ = ArrayView<uint64_t>(); }
+  ready_ = false;
+}
+
+void Ppgtt32::abandon() {
+  for (ArrayView<uint64_t>& t : tables_) t = ArrayView<uint64_t>();
+  for (ArrayView<uint64_t>& d : directories_) d = ArrayView<uint64_t>();
+  scratch_table_ = ArrayView<uint64_t>();
+  scratch_page_ = ArrayView<uint64_t>();
   ready_ = false;
 }
 
@@ -96,6 +120,13 @@ bool Ppgtt32::map(uint64_t gpu_address, uint64_t dma_address) {
     directories_[dir][pde] = ppgtt_pde(tables_dma_[slot], Caching::Cached);
   }
   tables_[slot][pte] = ppgtt_pte(dma_address, Caching::Cached);
+  return true;
+}
+
+bool Ppgtt32::unmap(uint64_t gpu_address) {
+  if (!ready_ || gpu_address >= (uint64_t{1} << 32) || (gpu_address & (kPageSize - 1))) return false;
+  const uint32_t slot = static_cast<uint32_t>(gpu_address >> 30) * kEntriesPerPage + static_cast<uint32_t>((gpu_address >> 21) & 511);
+  if (!tables_[slot].empty()) tables_[slot][(gpu_address >> 12) & 511] = ppgtt_pte(scratch_dma_, Caching::Cached);
   return true;
 }
 

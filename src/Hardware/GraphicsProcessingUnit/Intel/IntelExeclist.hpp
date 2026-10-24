@@ -18,32 +18,12 @@
 
 #pragma once
 #include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelRegisterBank.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace hardware {
 namespace intel_gt {
-
-// Register access as the engine code sees it. The real one is a window onto the GPU's registers; a test supplies a pretend engine.
-class IRegisterBank {
- public:
-  virtual uint32_t read32(uint64_t offset) = 0;
-  virtual void write32(uint64_t offset, uint32_t value) = 0;
-
- protected:
-  constexpr IRegisterBank() = default;
-  ~IRegisterBank() = default;
-};
-
-class MmioRegisterBank final : public IRegisterBank {
- public:
-  explicit MmioRegisterBank(const MmioRegion& region) : region_(region) {}
-  uint32_t read32(uint64_t offset) override { return region_.read32(offset); }
-  void write32(uint64_t offset, uint32_t value) override { region_.write32(offset, value); }
-
- private:
-  MmioRegion region_;
-};
 
 // Execlist submission of a Gen8 to Gen10 engine: the engine is given the descriptor of a context through the ELSP register and reports what it did through the
 // context status buffer (CSB), six 64-bit entries the GPU writes into the hardware status page. Sequence and constants follow the i915 driver
@@ -71,8 +51,17 @@ class ExeclistPort {
   static constexpr uint32_t kStatusComplete = 1u << 4;
 
   // `status_page` is the CPU's view of the engine's hardware status page, whose graphics address is `status_page_ggtt_address`.
-  ExeclistPort(IRegisterBank& registers, uint32_t engine_base, ArrayView<uint32_t> status_page, uint32_t status_page_ggtt_address)
-      : registers_(registers), base_(engine_base), status_(status_page), status_ggtt_(status_page_ggtt_address) {}
+  ExeclistPort() = default;
+  ExeclistPort(IRegisterBank& registers, uint32_t engine_base, ArrayView<uint32_t> status_page, uint32_t status_page_ggtt_address) {
+    configure(registers, engine_base, status_page, status_page_ggtt_address);
+  }
+  void configure(IRegisterBank& registers, uint32_t engine_base, ArrayView<uint32_t> status_page, uint32_t status_page_ggtt_address) {
+    registers_ = &registers;
+    base_ = engine_base;
+    status_ = status_page;
+    status_ggtt_ = status_page_ggtt_address;
+    csb_head_ = kCsbEntries - 1;
+  }
 
   // Brings the engine into execlist mode: status page address, run-list enable, ring running, interrupts masked (the driver polls), and the CSB pointers back at
   // their start. The caller holds the engine's power well awake.
@@ -88,15 +77,17 @@ class ExeclistPort {
     uint32_t status_or = 0; // every status dword, OR-ed
   };
   Events poll();
+  // Stops the ring (STOP_RING) and waits for the engine to say it is idle. False if it never does: the engine may still be reading memory.
+  bool stop(uint32_t attempts);
 
  private:
   static constexpr uint32_t masked_enable(uint32_t bits) { return (bits << 16) | bits; }
   static constexpr uint32_t masked_disable(uint32_t bits) { return bits << 16; }
 
-  IRegisterBank& registers_;
-  uint32_t base_;
+  IRegisterBank* registers_ = nullptr;
+  uint32_t base_ = 0;
   ArrayView<uint32_t> status_;
-  uint32_t status_ggtt_;
+  uint32_t status_ggtt_ = 0;
   uint32_t csb_head_ = kCsbEntries - 1;
 };
 

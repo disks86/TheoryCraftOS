@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelRegisterBank.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -78,6 +79,8 @@ class Ggtt {
   bool map(uint64_t index, uint64_t dma_address) const;
   // Points every page of `[index, index + count)` at `scratch_dma` (nothing the GPU does there can then fault or reach memory it should not).
   bool clear(uint64_t index, uint64_t count, uint64_t scratch_dma) const;
+  // Writes an entry as it is (to put back what was there). False when the index is outside the range.
+  bool write_raw(uint64_t index, uint64_t entry) const;
   // The entry of page `index`, for checks.
   bool read(uint64_t index, uint64_t* entry) const;
 
@@ -95,10 +98,12 @@ struct PatTable {
 constexpr PatTable gen9_private_pat() { return {0x00030907u, 0x3B2B1B0Bu}; }
 constexpr uint64_t kPrivatePatLow = 0x40E0, kPrivatePatHigh = 0x40E4;
 void program_private_pat(const MmioRegion& registers, const PatTable& table);
+void program_private_pat(IRegisterBank& registers, const PatTable& table);
 
 // Asks the GPU to drop what it cached of the global GTT; needed after changing entries. `registers` is the register BAR (at least 0x102000 bytes).
 constexpr uint64_t kGttFlushRegister = 0x101008;
 void ggtt_invalidate(const MmioRegion& registers);
+void ggtt_invalidate(IRegisterBank& registers);
 
 // Memory for page tables: 4 KiB, zeroed, with the address the GPU uses to reach it.
 class IGpuPageSource {
@@ -121,8 +126,13 @@ class Ppgtt32 {
   Ppgtt32& operator=(const Ppgtt32&) = delete;
 
   bool initialize();
+  // Gives the pages back (only when the GPU can no longer reach them), or - with abandon() - forgets them without freeing, for a GPU that may still be using them.
+  void shutdown() { release(); }
+  void abandon();
   // Maps the page at graphics address `gpu_address` (4 KiB aligned, below 4 GiB) to `dma_address`. False when out of range or out of memory.
   bool map(uint64_t gpu_address, uint64_t dma_address);
+  // Points the page back at the scratch page (a no-op if its table does not exist). False for an address that is out of range or unaligned.
+  bool unmap(uint64_t gpu_address);
   // The address of page directory `n` (0-3), which goes into the context image.
   uint64_t page_directory_dma(uint32_t n) const { return n < 4 ? directories_dma_[n] : 0; }
   // What the hardware would find: the page a graphics address is mapped to (or the scratch page). False for addresses of 4 GiB and more.
