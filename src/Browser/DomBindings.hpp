@@ -71,6 +71,11 @@ class IDomHost {
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
+  // Fullscreen API: can the window do it; the element shown fullscreen (nullptr: none); make an element fullscreen (false if the window would not); leave it.
+  virtual bool fullscreen_supported() { return false; }
+  virtual dom::Node* fullscreen_element() { return nullptr; }
+  virtual bool fullscreen_request(dom::Node* element) { (void)element; return false; }
+  virtual void fullscreen_exit() {}
   // The style of an element as it is drawn now (false if the page cannot say).
   virtual bool computed_style(const dom::Node* element, Style* out) = 0;
   // The style sheet that computed_style() worked against: what the TextRefs of a Style point into, and the readers for list valued properties (font-family,

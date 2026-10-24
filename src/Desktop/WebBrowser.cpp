@@ -768,6 +768,8 @@ void WebBrowser::show(Fetched& page) {
   }
   bool ok = true;
   media_ = current_media();
+  apply_fullscreen(false);   // (a page that was fullscreen is gone)
+  defer_fullscreen_ = 0;
   live_ = UniquePointer<browser::Page>::make(allocator(), allocator(), env_, page.address.view(), media_, scripts);
   if (!live_) ok = false;
   else {
@@ -872,6 +874,12 @@ void WebBrowser::settle() {
     request_delta_ = delta;
     post(delta < 0 ? Request::Back : Request::Forward, StringView());
     return;
+  }
+  if (defer_fullscreen_ != 0) {
+    const int8_t what = defer_fullscreen_;
+    defer_fullscreen_ = 0;
+    apply_fullscreen(what == 1);
+    if (what == 3 && live_) live_->fullscreen_left();
   }
   if (!live_) return;
   canvas_accelerated_ = live_->objects().accelerated();
@@ -1001,6 +1009,7 @@ void WebBrowser::on_node_click(void* self, Control&) {
 void WebBrowser::on_view_resized(void* self, Control&) { static_cast<WebBrowser*>(self)->update_media(); }
 
 void WebBrowser::update_media() {
+  if (defer_fullscreen_ != 0) settle();
   const browser::MediaEnvironment m = current_media();
   if (m == media_ || !live_) {
     media_ = m;
@@ -1160,6 +1169,27 @@ void WebBrowser::Env::push_state(StringView address, StringView state_json, bool
 
 void WebBrowser::Env::alert(StringView text) { owner_.notify(NoticeKind::Information, text); }
 void WebBrowser::Env::scroll_to(int32_t line) { owner_.defer_scroll_ = line; }
+bool WebBrowser::Env::set_fullscreen(bool on) {
+  owner_.defer_fullscreen_ = on ? 1 : 2;
+  return true;
+}
+
+void WebBrowser::apply_fullscreen(bool on) {
+  if (on == fullscreen_) return;
+  fullscreen_ = on;
+  menu_.set_visible(!on);
+  toolbar_.set_visible(!on);
+  status_bar_.set_visible(!on);
+  if (on) {
+    fullscreen_maximized_ = state() != State::Maximized;
+    if (fullscreen_maximized_) maximize();
+  } else if (fullscreen_maximized_) {
+    fullscreen_maximized_ = false;
+    if (state() == State::Maximized) maximize();
+  }
+  UiGuard lock(this);
+  invalidate();
+}
 uint64_t WebBrowser::Env::now_ms() { return owner_.page_clock_ms(); }
 
 // Following a link to "#something" on the page shown: the address changes, the history entry too; "#" and "#top" scroll to the top.
@@ -1184,6 +1214,11 @@ bool WebBrowser::on_key(const KeyArgs& args) {
   namespace key = hardware::key;
   const bool control = args.modifiers & hardware::modifier::kControl;
   const bool alt = args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt);
+  if (args.usage == key::kEscape && fullscreen_) {   // the user leaves fullscreen; the page hears of it
+    defer_fullscreen_ = 3;
+    queue(resize_handler_, *this, true);
+    return true;
+  }
   if (args.usage == key::kEnter && address_.focused()) {
     navigate(address_.text());
     return true;

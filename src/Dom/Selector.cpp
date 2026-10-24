@@ -506,6 +506,7 @@ class SelectorSet::Reader {
     else if (n.equals("enabled")) t->kind = TestKind::Enabled;
     else if (n.equals("focus") || n.equals("focus-visible")) t->kind = TestKind::Focus;
     else if (n.equals("focus-within")) t->kind = TestKind::FocusWithin;
+    else if (n.equals("fullscreen") || n.equals("-webkit-full-screen") || n.equals("-moz-full-screen")) t->kind = TestKind::Fullscreen;
     else if (n.equals("required")) t->kind = TestKind::Required;
     else if (n.equals("optional")) t->kind = TestKind::Optional;
     else if (n.equals("read-only")) t->kind = TestKind::ReadOnly;
@@ -686,6 +687,7 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
       for (const Node* d = next_in_tree(node, node); d; d = next_in_tree(d, node))
         if (d->is_element() && (d->form_state & kFormFocused)) return true;
       return false;
+    case TestKind::Fullscreen: return (node->form_state & kFormFullscreen) != 0;
     case TestKind::Hover: return (node->ui_state & kUiHover) != 0;
     case TestKind::Active: return (node->ui_state & kUiActive) != 0;
     case TestKind::Always: return true;

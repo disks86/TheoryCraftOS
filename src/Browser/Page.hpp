@@ -61,6 +61,10 @@ class IPageEnvironment : public IObjectEnvironment {
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // the page asked for a vertical position, in CSS pixels
+  // The Fullscreen API: can the window go fullscreen, and make it so (true) or put it back (false). Returns whether the window did. The window may also leave
+  // fullscreen by itself (Escape, another page): Page::fullscreen_left() then says so.
+  virtual bool fullscreen_supported() { return false; }
+  virtual bool set_fullscreen(bool on) { (void)on; return false; }
   virtual uint64_t now_ms() = 0;                 // milliseconds since 1970 (0 without a clock)
   virtual void console(int level, StringView text) = 0;
   // Web Storage: the hub of localStorage (all origins, all windows) and the one of this tab's sessionStorage; and what the pages share to talk to each other.
@@ -210,6 +214,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool history_state(String* json) override;
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t y) override;
+  bool fullscreen_supported() override { return env_.fullscreen_supported(); }
+  dom::Node* fullscreen_element() override;
+  bool fullscreen_request(dom::Node* element) override;
+  void fullscreen_exit() override;
   bool computed_style(const dom::Node* element, Style* out) override;
   const StyleSheet* computed_style_sheet() override { return &style_sheet(); }
   dom::Document* parse_document(StringView html) override;
@@ -288,6 +296,12 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void claim_ports(StringView ports, uint32_t window);
   void press_focus(dom::Node* node);
   dom::Node* modal_dialog();
+ public:
+  // The window left fullscreen by itself (the user pressed Escape): the page is told (fullscreenchange).
+  void fullscreen_left();
+ private:
+  void clear_fullscreen();
+  uint32_t fullscreen_serial_ = 0;
   void toggle_details(dom::Node* details);
   void close_dialog_text(dom::Node* dialog, StringView value);
   bool fire(dom::Node* target, StringView type, bool bubbles = true, bool cancelable = false, dom::Node* submitter = nullptr);

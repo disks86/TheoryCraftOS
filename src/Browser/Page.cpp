@@ -316,6 +316,12 @@ const StyleSheet& Page::style_sheet() {
     RenderOptions options;
     options.media = media_;
     options.styles = this;
+    // the element shown fullscreen covers the viewport (read first: the page's own rules, apart from !important ones, win)
+    static const char kFullscreenCss[] =
+        ":fullscreen { background-color: #000; color: #fff; }"
+        ":fullscreen { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100% !important;"
+        " height: 100% !important; max-width: none !important; max-height: none !important; margin: 0 !important; box-sizing: border-box !important; z-index: 2147483647 !important; }";
+    if (fullscreen_serial_ != 0) options.extra_css = StringView(kFullscreenCss);
     collect_style_sheets(doc_, options, &style_cache_);
     style_cache_version_ = doc_.version();
     style_cache_media_ = media_;
@@ -565,6 +571,38 @@ int32_t Page::take_scroll_request() {
   const int32_t r = scroll_request_;
   scroll_request_ = -1;
   return r;
+}
+
+// --- Fullscreen --------------------------------------------------------------------------------------------------------------------
+
+dom::Node* Page::fullscreen_element() { return fullscreen_serial_ ? doc_.by_serial(fullscreen_serial_) : nullptr; }
+
+void Page::clear_fullscreen() {
+  if (dom::Node* old = fullscreen_element()) old->form_state &= static_cast<uint8_t>(~dom::kFormFullscreen);
+  fullscreen_serial_ = 0;
+  doc_.touch();
+}
+
+bool Page::fullscreen_request(dom::Node* element) {
+  if (!element || !element->is_element() || !dom::is_connected(element) || !env_.fullscreen_supported()) return false;
+  if (fullscreen_serial_ == 0 && !env_.set_fullscreen(true)) return false;
+  if (fullscreen_serial_ != 0) clear_fullscreen();
+  element->form_state |= dom::kFormFullscreen;
+  fullscreen_serial_ = element->serial;
+  doc_.touch();
+  return true;
+}
+
+void Page::fullscreen_exit() {
+  if (fullscreen_serial_ == 0) return;
+  clear_fullscreen();
+  env_.set_fullscreen(false);
+}
+
+void Page::fullscreen_left() {
+  if (fullscreen_serial_ == 0) return;
+  clear_fullscreen();
+  if (bindings_) bindings_->call_hook("__fs_left", nullptr, 0);
 }
 
 void Page::scroll_to(int32_t y) {

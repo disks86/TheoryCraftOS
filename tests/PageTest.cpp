@@ -246,6 +246,15 @@ struct FakeEnvironment final : IPageEnvironment {
   void alert(StringView t) override { alerts.push_back(std::string(t.data(), t.size())); }
   bool confirm(StringView) override { return confirm_answer; }
   void scroll_to(int32_t line) override { scrolls.push_back(line); }
+  bool can_fullscreen = true, is_fullscreen = false;
+  int fullscreen_entered = 0, fullscreen_left = 0;
+  bool fullscreen_supported() override { return can_fullscreen; }
+  bool set_fullscreen(bool on) override {
+    if (on && !can_fullscreen) return false;
+    is_fullscreen = on;
+    (on ? fullscreen_entered : fullscreen_left)++;
+    return true;
+  }
   uint64_t now_ms() override { return clock; }
   void console(int, StringView t) override { console_lines.push_back(std::string(t.data(), t.size())); }
   StorageHub* shared_local = nullptr;   // (another window's: windows share localStorage and tell each other about changes)
@@ -3361,6 +3370,75 @@ static void test_dashjs() {
   CHECK(a.live == 0);
 }
 
+static void test_fullscreen() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><div id=a style='width:100px;height:50px'>a</div><div id=b>b</div><button id=go></button><button id=out></button><button id=info></button><script>"
+              "var a = document.getElementById('a'), b = document.getElementById('b'), log = [];"
+              "document.addEventListener('fullscreenchange', function (e) { log.push('doc:' + e.target.id + ':' + (document.fullscreenElement && document.fullscreenElement.id)) });"
+              "a.addEventListener('fullscreenchange', function () { log.push('el') });"
+              "b.addEventListener('fullscreenerror', function () { log.push('b-error') });"
+              "log.push(document.fullscreenEnabled, document.fullscreenElement, document.fullscreen, typeof a.requestFullscreen, typeof document.exitFullscreen);"
+              "document.exitFullscreen().catch(function (e) { log.push('exit:' + e.name) });"
+              "document.getElementById('go').onclick = function () { a.requestFullscreen().then(function () { log.push('entered', a.matches(':fullscreen'), document.fullscreenElement === a, document.webkitFullscreenElement === a, document.fullscreen) }) };"
+              "document.getElementById('out').onclick = function () { document.exitFullscreen().then(function () { log.push('left', document.fullscreenElement, a.matches(':fullscreen')) }) };"
+              "document.getElementById('info').onclick = function () { var d = document.createElement('div'); d.requestFullscreen().catch(function (e) { console.log('detached:' + e.name) }); console.log(log.join(' ')) };"
+              "</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    auto pump = [&](int rounds) {
+      for (int i = 0; i < rounds; ++i) {
+        double due;
+        if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
+        page.run_due_timers(static_cast<double>(env.clock));
+        if (page.changed()) page.render(&doc);
+      }
+    };
+    pump(4);
+    page.click(page.document().element_by_id("go")->serial, 0, 0);
+    pump(6);
+    CHECK(env.is_fullscreen && env.fullscreen_entered == 1);
+    // the element covers the viewport
+    Style st;
+    page.computed_style(page.document().element_by_id("a"), &st);
+    CHECK(st.position == Position::Fixed);
+    page.click(page.document().element_by_id("out")->serial, 0, 0);
+    pump(6);
+    CHECK(!env.is_fullscreen && env.fullscreen_left == 1);
+    // the window leaves by itself
+    page.click(page.document().element_by_id("go")->serial, 0, 0);
+    pump(6);
+    page.fullscreen_left();
+    pump(6);
+    CHECK(page.document().element_by_id("a") && page.fullscreen_element() == nullptr);
+    page.click(page.document().element_by_id("info")->serial, 0, 0);
+    pump(6);
+    const std::string out = page_log(page);
+    CHECK(out.find("true  false function function exit:TypeError ") == 0);
+    CHECK(in_order(out, {"el doc:a:a entered true true true true", "el doc:a:null left  false", "el doc:a:a entered", "doc:undefined:null"}));
+    CHECK(out.find("detached:TypeError") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // a window that cannot do it
+    FakeEnvironment env(a);
+    env.can_fullscreen = false;
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><div id=a>a</div><script>var a = document.getElementById('a'); a.addEventListener('fullscreenerror', function () { console.log('error event') });"
+              "console.log(document.fullscreenEnabled); a.requestFullscreen().catch(function (e) { console.log(e.name, document.fullscreenElement) });</script></body></html>");
+    for (int i = 0; i < 6; ++i) {
+      double due;
+      if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
+      page.run_due_timers(static_cast<double>(env.clock));
+    }
+    CHECK(page_log(page).find("false") == 0 && page_log(page).find("TypeError null") != std::string::npos && page_log(page).find("error event") != std::string::npos && env.fullscreen_entered == 0);
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
@@ -3403,6 +3481,7 @@ int main(int argc, char** argv) {
   test_text_tracks();
   test_dash_page();
   test_dashjs();
+  test_fullscreen();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

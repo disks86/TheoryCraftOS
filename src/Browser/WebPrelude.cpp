@@ -3440,10 +3440,50 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   method(EP, 'setPointerCapture', function () {});
   method(EP, 'releasePointerCapture', function () {});
   method(EP, 'hasPointerCapture', function () { return false; });
-  method(EP, 'requestFullscreen', function () { return Promise.reject(new TypeError('Fullscreen is not supported')); });
   method(EP, 'requestPointerLock', function () {});
-  if (doc.fullscreenElement === undefined) { hide(doc, 'fullscreenElement', null); hide(doc, 'fullscreenEnabled', false); }
-  method(DP, 'exitFullscreen', function () { return Promise.reject(new TypeError('Document not active')); });
+  // --- Fullscreen API. The window hides its own controls and the element covers the viewport (the :fullscreen rule of the page); promises and events are here.
+  var fsFire = function (target, type) { target.dispatchEvent(new Event(type, { bubbles: true, composed: true })); };
+  var fsError = function (el) {
+    setTimeout(function () { fsFire(el, 'fullscreenerror'); }, 0);
+    return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': API can only be initiated by a user gesture or the element cannot be fullscreen."));
+  };
+  var fsRequest = function (options) {
+    var el = this;
+    if (options !== undefined && options !== null && typeof options !== 'object') return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': The provided value is not of type 'FullscreenOptions'."));
+    if (!el.isConnected || !__fs_supported()) return fsError(el);
+    var already = __fs_element() === el;
+    if (!__fs_request(el)) return fsError(el);
+    return new Promise(function (resolve) {
+      setTimeout(function () { if (!already) fsFire(el, 'fullscreenchange'); resolve(); }, 0);
+    });
+  };
+  method(EP, 'requestFullscreen', fsRequest);
+  method(EP, 'webkitRequestFullscreen', fsRequest);
+  method(EP, 'webkitRequestFullScreen', fsRequest);
+  var fsExit = function () {
+    var el = __fs_element();
+    if (!el) return Promise.reject(new TypeError("Failed to execute 'exitFullscreen' on 'Document': Document not active"));
+    __fs_exit();
+    return new Promise(function (resolve) { setTimeout(function () { fsFire(el, 'fullscreenchange'); resolve(); }, 0); });
+  };
+  method(DP, 'exitFullscreen', fsExit);
+  method(DP, 'webkitExitFullscreen', fsExit);
+  method(DP, 'webkitCancelFullScreen', fsExit);
+  var fsAccessor = function (name, get) { Object.defineProperty(DP, name, { get: get, configurable: true, enumerable: true }); };
+  fsAccessor('fullscreenElement', function () { return __fs_element(); });
+  fsAccessor('webkitFullscreenElement', function () { return __fs_element(); });
+  fsAccessor('webkitCurrentFullScreenElement', function () { return __fs_element(); });
+  fsAccessor('fullscreenEnabled', function () { return __fs_supported(); });
+  fsAccessor('webkitFullscreenEnabled', function () { return __fs_supported(); });
+  fsAccessor('fullscreen', function () { return __fs_element() !== null; });
+  fsAccessor('webkitIsFullScreen', function () { return __fs_element() !== null; });
+  if (g.HTMLVideoElement) {
+    method(g.HTMLVideoElement.prototype, 'webkitEnterFullscreen', function () { return fsRequest.call(this); });
+    method(g.HTMLVideoElement.prototype, 'webkitExitFullscreen', function () { return fsExit(); });
+    Object.defineProperty(g.HTMLVideoElement.prototype, 'webkitDisplayingFullscreen', { get: function () { return __fs_element() === this; }, configurable: true, enumerable: true });
+  }
+  // The window left fullscreen by itself (Escape): the events follow, as for exitFullscreen().
+  hide(g, '__fs_left', function () { setTimeout(function () { fsFire(g.document, 'fullscreenchange'); }, 0); });
   method(DP, 'elementsFromPoint', function () { return []; });
   method(DP, 'execCommand', function () { return false; });
   method(DP, 'queryCommandSupported', function () { return false; });
