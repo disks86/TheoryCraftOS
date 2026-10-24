@@ -883,6 +883,16 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       const bool loaded = firmware_device.load_firmware(explorer_files.file_system());
       if (firmware_device.firmware_status()[0]) Entry(loaded ? Level::Ok : Level::Warning, "Firmware").text(firmware_device.name()).text(": ").text(firmware_device.firmware_status());
     }
+    // With the microcode read, work out (from reads of the card and of the firmware's display buffer) where each engine's memory would go. Nothing is written to
+    // a card and no engine is started; the block is only mapped.
+    hardware::VideoEngineEnvironment engine_environment;
+    engine_environment.mapper = paging_ok ? &register_mapper : nullptr;
+    if (gpu) gpu->framebuffer_range(&engine_environment.framebuffer_base, &engine_environment.framebuffer_bytes);
+    for (uint32_t i = 0; i < video_codecs.count(); ++i) {
+      hardware::IVideoCodecDevice& planned_device = *video_codecs.at(i);
+      const bool planned = planned_device.plan_engine(engine_environment);
+      if (planned_device.plan_status()[0]) Entry(planned ? Level::Ok : Level::Warning, "Firmware").text(planned_device.name()).text(": ").text(planned_device.plan_status());
+    }
     // The system database: one file on the root volume (/databases/system.db) where the OS and its programs keep their settings; the database query
     // window can open it too (system://localhost/system). Without a writable root volume it lives in memory for this session.
     database::local::LocalDatabase system_database(shared_allocator, &explorer_files.file_system(), "/databases/system.db");

@@ -85,13 +85,13 @@ MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d, uint6
 }
 
 // The register BAR (BAR 5) of a Radeon card, first page: where MM_INDEX and MM_DATA are. Empty if there is no mapper, decoding is off, or no BAR 5.
-MmioRegion SystemVideoCodecs::amd_registers(const PciDeviceInfo& d) const {
+MmioRegion SystemVideoCodecs::amd_registers(const PciDeviceInfo& d, uint64_t length) const {
   constexpr uint16_t kPciCommand = 0x04;
   constexpr uint32_t kMemorySpace = 1u << 1;
   MmioRegion region;
   if (!mmio_ || !(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return region;
   const uint64_t base = pci_.memory_bar(d.address, 5);
-  if (base == 0 || !mmio_->map_registers(base, AmdMmIndexVramReader::kRegisterWindow, &region)) return MmioRegion();
+  if (base == 0 || !mmio_->map_registers(base, length, &region)) return MmioRegion();
   return region;
 }
 
@@ -104,8 +104,10 @@ void SystemVideoCodecs::add_amd(const PciDeviceInfo& d) {
   device->set_pci_revision(static_cast<uint8_t>(pci_.read32(d.address, 0x08) & 0xFF));   // config space offset 8: revision ID
   if (device->gpu().discrete && AmdMediaEngineHw::supported(device->gpu().architecture)) {
     device->set_memory_bar(bar_size);
-    device->set_registers(amd_registers(d));
+    device->set_registers(amd_registers(d, AmdMmIndexVramReader::kRegisterWindow));
   }
+  // The VCN 1.0 APUs (Raven family): their whole register BAR, from which the engine reads the registers of the memory controller to find where it may go.
+  if (amd_vcn1_firmware_name(d.device_id, 0)) device->set_registers(amd_registers(d, kAmdRavenRegisterBytes));
   if (!device->initialize()) {
     device->shutdown();
     return;

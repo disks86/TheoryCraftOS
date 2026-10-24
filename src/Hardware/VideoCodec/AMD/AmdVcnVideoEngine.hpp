@@ -20,6 +20,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
+#include "Hardware/VideoCodec/AMD/AmdRavenMemory.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
@@ -95,6 +96,59 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     refresh_summary();
     return status;
   }
+  // Finds, with reads only, the memory block and address configuration the start needs (AmdRavenMemory), maps the block, and says in plan_status() where it is
+  // and whether the hardware agrees on the address configuration - or why not. Needs the firmware loaded (its size sets the block size), the register BAR of
+  // the card (set_registers: the 512 KiB BAR 5) and the display buffer of the firmware from the environment. Writes nothing to the card; mapping is all it does.
+  bool plan_engine(const VideoEngineEnvironment& environment) override {
+    planned_ = false;
+    plan_text_.assign("");
+    if (!amd_vcn1_firmware_name(device_id_, revision_)) return false;   // not a VCN 1.0 part: nothing to plan
+    plan_text_.assign("engine memory not planned: ");
+    if (!firmware_.loaded()) { plan_text_.append("no firmware"); return false; }
+    if (registers_.length() < kAmdRavenRegisterBytes) { plan_text_.append("no access to the registers of the card"); return false; }
+    if (!environment.mapper) { plan_text_.append("no way to map memory"); return false; }
+    MmioVcnRegisters registers(registers_);
+    plan_ = amd_plan_vcn1_memory(amd_read_raven_memory_map(registers), device_id_, revision_, AmdVcn1::block_bytes(firmware_), environment.framebuffer_base,
+                                 environment.framebuffer_bytes);
+    if (plan_.result != AmdVcn1Plan::Result::Ok) {
+      plan_text_.append(amd_vcn1_plan_result_name(plan_.result));
+      return false;
+    }
+    if (!amd_map_vcn1_plan(plan_, *environment.mapper, &memory_)) {
+      plan_text_.append("the block at CPU 0x");
+      append_hex(plan_text_, plan_.block_physical);
+      plan_text_.append(" is memory the OS owns or cannot be mapped");
+      return false;
+    }
+    plan_text_.assign("engine memory: block at video memory +");
+    plan_text_.append_uint(plan_.block_offset >> 20);
+    plan_text_.append(" MiB (GPU 0x");
+    append_hex(plan_text_, plan_.block_gpu_address);
+    plan_text_.append(", CPU 0x");
+    append_hex(plan_text_, plan_.block_physical);
+    plan_text_.append("), ");
+    plan_text_.append_uint(plan_.block_bytes >> 10);
+    plan_text_.append(" KiB; gb_addr_config 0x");
+    append_hex(plan_text_, plan_.gb_addr_config);
+    plan_text_.append(plan_.gb_check == AmdGbAddrConfigCheck::Matches ? " (the hardware agrees)" : " (the hardware register is not readable)");
+    planned_ = true;
+    return true;
+  }
+  const char* plan_status() const override { return plan_text_.c_str(); }
+  const AmdVcn1Plan& plan() const { return plan_; }
+  bool engine_planned() const { return planned_; }
+
+  // Starts the engine with what plan_engine found: the planned block, power and clock gating left off (the engine always powered). The DMA of the engine goes to
+  // the planned addresses, so this is only as safe as the plan; nothing in the OS calls it yet. It writes the register BAR of the card.
+  AmdVcn1::Status start_planned_engine(const IClock& clock) {
+    if (!planned_) return AmdVcn1::Status::BadMemory;
+    vcn_registers_ = UniquePointer<MmioVcnRegisters>::make(allocator_, registers_);
+    if (!vcn_registers_) return AmdVcn1::Status::NoMemory;
+    AmdVcn1::Config config;
+    config.gb_addr_config = plan_.gb_addr_config;
+    return start_engine(*vcn_registers_, clock, memory_, config);
+  }
+
   // Puts the engine back to sleep. Safe when it was never started.
   void stop_engine() {
     if (vcn1_) {
@@ -143,6 +197,16 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   }
 
  private:
+  static void append_hex(FixedString<255>& out, uint64_t value) {
+    bool started = false;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+      const uint32_t nibble = static_cast<uint32_t>((value >> shift) & 0xF);
+      if (nibble == 0 && !started && shift != 0) continue;
+      started = true;
+      out.push_back("0123456789ABCDEF"[nibble]);
+    }
+  }
+
   // "<file>: ENC 1.15 DEC 3 revision 9, 369120 bytes of microcode loaded, <what became of the engine>", or why the file is not usable.
   void rebuild_firmware_text() {
     firmware_text_.assign(firmware_name_ ? firmware_name_ : "");
@@ -232,6 +296,11 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   FixedString<200> firmware_text_;
   const char* engine_note_ = "engine not started";
   UniquePointer<AmdVcn1> vcn1_;
+  UniquePointer<MmioVcnRegisters> vcn_registers_;   // the register BAR of the card, kept for the engine while it runs
+  AmdVcn1Plan plan_;
+  AmdVcn1::Memory memory_;
+  bool planned_ = false;
+  FixedString<255> plan_text_;
   MmioRegion registers_;
   uint64_t memory_bar_ = 0;
   PciAddress address_{};

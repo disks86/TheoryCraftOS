@@ -56,6 +56,12 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   uint32_t pitch_bytes() const { return pitch_; }
   // The size of the device's video memory when it is more than the visible framebuffer.
   void set_video_memory_total(uint64_t bytes) override { video_total_ = bytes; }
+  bool framebuffer_range(uint64_t* base, uint64_t* bytes) const override {
+    if (allocation_.empty() || !base || !bytes) return false;
+    *base = reinterpret_cast<uint64_t>(allocation_.data());   // the firmware identity-maps its framebuffer: the virtual address is the physical one
+    *bytes = allocation_.size();
+    return true;
+  }
   // The rectangle drawn on since the last call (and clears it); false if nothing was. For GPUs
   // whose screen lives in separate memory and needs the changes copied over.
   bool take_dirty(uint32_t* x, uint32_t* y, uint32_t* w, uint32_t* h);
@@ -68,6 +74,7 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   ArrayView<uint32_t> row(uint32_t y) const;
 
   ByteView memory_;
+  ByteView allocation_;   // the whole buffer the firmware gave, of which memory_ is the part the mode shows
   uint32_t width_ = 0, height_ = 0, pitch_ = 0;
   uint64_t video_total_ = 0;
   bool bgr_ = true;

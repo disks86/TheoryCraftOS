@@ -77,6 +77,9 @@ class IGraphicsProcessingUnit : public IHardware {
   // Tells the device how much video memory it has, when something other than the device found out (the video engine probe read it off the card). Ignored
   // by a device that already knows.
   virtual void set_video_memory_total(uint64_t bytes) { (void)bytes; }
+  // The display buffer the firmware set up: its address in the CPU's physical address space (the OS runs identity mapped) and the size of the whole allocation,
+  // not only the visible mode. False for a device that has no such buffer. Lets a driver keep clear of memory the firmware is still showing.
+  virtual bool framebuffer_range(uint64_t* base, uint64_t* bytes) const { (void)base; (void)bytes; return false; }
   // Share of the time the graphics engine is busy, 0-100, or -1 if unknown.
   virtual int32_t utilization_percent() { return -1; }
   // The chip's temperature in thousandths of a degree Celsius, or -1 if unknown.

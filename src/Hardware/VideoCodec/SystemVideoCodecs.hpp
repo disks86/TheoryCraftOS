@@ -22,25 +22,12 @@
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelRegisterBank.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
 #include "Hardware/Mmio.hpp"
+#include "Hardware/RegisterMapper.hpp"
 #include "Hardware/VideoCodec/IVideoCodecDevice.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
-
-// Finds every video codec device the machine has: one per GPU that carries a known video engine (NVIDIA,
-// AMD, Intel), and the software codec, which is always last and always there. Sessions are asked for with
-// create_decoder() / create_encoder(), which try the devices in order and use the first that serves the codec
-// (a device that really accelerates it would come first; today all of them run on the CPU).
-// Gets a device's registers mapped (MmioMapper does it on the real machine; a test hands out plain memory).
-class IRegisterMapper {
- public:
-  virtual bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) = 0;
-
- protected:
-  constexpr IRegisterMapper() = default;
-  ~IRegisterMapper() = default;
-};
 
 // Tells how big a memory BAR is (the GPU's video memory aperture, for the AMD probe). Sizing a BAR briefly switches the device's decoding off;
 // the OS has a routine for it (pci_read_bar), and a test hands out a number.
@@ -53,6 +40,10 @@ class IBarSizer {
   ~IBarSizer() = default;
 };
 
+// Finds every video codec device the machine has: one per GPU that carries a known video engine (NVIDIA,
+// AMD, Intel), and the software codec, which is always last and always there. Sessions are asked for with
+// create_decoder() / create_encoder(), which try the devices in order and use the first that serves the codec
+// (a device that really accelerates it would come first; today all of them run on the CPU).
 class SystemVideoCodecs {
  public:
   SystemVideoCodecs(const IPciBus& pci, allocators::IAllocator& allocator) : pci_(pci), allocator_(allocator), devices_(allocator) {}
@@ -87,7 +78,7 @@ class SystemVideoCodecs {
   MmioRegion intel_registers(const PciDeviceInfo& d) const;
   MmioRegion nvidia_registers(const PciDeviceInfo& d) const;
   MmioRegion amd_discovery_window(const PciDeviceInfo& d, uint64_t* bar_size) const;
-  MmioRegion amd_registers(const PciDeviceInfo& d) const;
+  MmioRegion amd_registers(const PciDeviceInfo& d, uint64_t length) const;
   void add_amd(const PciDeviceInfo& d);
   bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out);
   void add_intel(const PciDeviceInfo& d);

@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/IHardware.hpp"
+#include "Hardware/RegisterMapper.hpp"
 #include "Hardware/VideoCodec/IVideoDecoder.hpp"
 #include "Hardware/VideoCodec/IVideoEncoder.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -39,6 +40,14 @@ struct VideoCodecInfo {
   uint32_t decode_codecs = 0;  // codec_mask() bits create_decoder() can serve
   uint32_t encode_codecs = 0;  // and create_encoder()
   uint32_t max_width = 0, max_height = 0;
+};
+
+// What a video engine's driver may use to find its way around the machine once it is up: a way to map physical memory (which refuses memory the OS owns), and
+// where the firmware's display buffer is (video memory in use that must be left alone). Empty fields are "not known".
+struct VideoEngineEnvironment {
+  IRegisterMapper* mapper = nullptr;
+  uint64_t framebuffer_base = 0;
+  uint64_t framebuffer_bytes = 0;
 };
 
 // Something that decodes and encodes video: a hardware engine, or the software fallback that is always
@@ -63,6 +72,10 @@ class IVideoCodecDevice : public IHardware {
   // file and checking it.
   virtual bool load_firmware(filesystem::IFileSystem& file_system) { (void)file_system; return false; }
   virtual const char* firmware_status() const { return ""; }
+  // Works out, without writing to the card, where the engine's memory would go and what address configuration it needs, and maps that memory. True if it did.
+  // plan_status() says what came of it ("" when the device has nothing to plan). Needs the firmware loaded first, since its size sets the size of the block.
+  virtual bool plan_engine(const VideoEngineEnvironment& environment) { (void)environment; return false; }
+  virtual const char* plan_status() const { return ""; }
   virtual uint64_t gpu_memory_bytes() const { return 0; }
 
  protected:

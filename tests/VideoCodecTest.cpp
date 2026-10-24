@@ -1660,6 +1660,135 @@ static void test_amd_vcn_start() {
   CHECK(a.live == 0);
 }
 
+// A mapper that hands out plain memory for any physical range, remembers what was asked, and refuses what lies at or above a limit (memory the OS owns).
+struct AnyRangeMapper final : IRegisterMapper {
+  std::vector<std::vector<uint32_t>> windows;
+  std::vector<std::pair<uint64_t, uint64_t>> asked;
+  uint64_t refuse_from = UINT64_MAX;
+  AnyRangeMapper() { windows.reserve(8); }   // the windows must not move while regions point at them
+  bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) override {
+    asked.push_back({physical, length});
+    if (physical >= refuse_from) return false;
+    windows.emplace_back(length / 4, 0);
+    *region = MmioRegion(reinterpret_cast<uint64_t>(windows.back().data()), length);
+    return true;
+  }
+};
+
+// BAR 5 of a Raven APU as plain memory, with the memory controller's registers holding a 512 MiB carve-out (GPU 0xF400000000, CPU 0xE0000000).
+struct FakeRavenBar {
+  std::vector<uint32_t> words = std::vector<uint32_t>(0x80000 / 4, 0);
+  explicit FakeRavenBar(bool alive = true, uint32_t gb = 0x24000042) {
+    if (alive) {
+      words[0x0D20 + 0x00C3] = 512;                                // RCC_CONFIG_MEMSIZE, MiB
+      words[0x1A000 + 0x082C] = static_cast<uint32_t>(0xF400000000ull >> 24);   // MC_VM_FB_LOCATION_BASE
+      words[0x1A000 + 0x082D] = static_cast<uint32_t>((0xF400000000ull + (512ull << 20) - (1u << 24)) >> 24);   // MC_VM_FB_LOCATION_TOP
+      words[0x2000 + 0x096B] = static_cast<uint32_t>(0xE0000000ull >> 24);       // MC_VM_FB_OFFSET
+      words[0x2000 + 0x063E] = gb;                                  // GB_ADDR_CONFIG
+    } else {
+      for (uint32_t& w : words) w = 0xFFFFFFFFu;                    // a block that is off
+    }
+  }
+  MmioRegion region() { return MmioRegion(reinterpret_cast<uint64_t>(words.data()), words.size() * 4); }
+};
+
+// Finding the memory block and the address configuration of a VCN 1.0 engine: planned from reads, mapped, reported - and what happens when the machine does not
+// look as it should.
+static void test_amd_vcn_plan() {
+  TestAllocator a;
+  HostFirmwareFileSystem fs(a);
+  const uint64_t cpu = 0xE0000000ull, gpu = 0xF400000000ull;
+  {
+    FakeRavenBar bar;
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    raven.set_registers(bar.region());
+    VideoEngineEnvironment env;
+    env.mapper = &mapper; env.framebuffer_base = cpu; env.framebuffer_bytes = 8ull << 20;
+    CHECK(raven.initialize() && !raven.plan_engine(env) && strstr(raven.plan_status(), "no firmware") && mapper.asked.empty());   // the firmware comes first
+    CHECK(raven.load_firmware(fs) && raven.plan_engine(env) && raven.engine_planned());
+    CHECK(strstr(raven.plan_status(), "block at video memory +25 MiB") && strstr(raven.plan_status(), "gb_addr_config 0x24000042") && strstr(raven.plan_status(), "the hardware agrees"));
+    CHECK(strstr(raven.plan_status(), "GPU 0xF401900000") && strstr(raven.plan_status(), "CPU 0xE1900000") && strstr(raven.plan_status(), "1008 KiB"));
+    CHECK(raven.plan().block_gpu_address == gpu + (25ull << 20) && raven.plan().block_physical == cpu + (25ull << 20));
+    CHECK(mapper.asked.size() == 2 && mapper.asked[0].first == cpu + (25ull << 20) && mapper.asked[1].first == cpu + (26ull << 20));
+    // Planning wrote nothing to the card: the register block is exactly as it was.
+    FakeRavenBar pristine;
+    CHECK(bar.words == pristine.words);
+    CHECK(!raven.engine_running() && !raven.info().accelerated);
+    // Starting with the plan: the status register reads IDLE, so the fake VCPU "boots"; the microcode lands in the mapped block and the engine is up.
+    bar.words[0x7E00 + 0x5AF] = 2;   // UVD_STATUS
+    SteppingClock clock;
+    CHECK(raven.start_planned_engine(clock) == AmdVcn1::Status::Ok && raven.engine_running());
+    CHECK(mapper.windows[0][0] == (static_cast<uint32_t>(raven.firmware().ucode()[0]) | raven.firmware().ucode()[1] << 8 | raven.firmware().ucode()[2] << 16 | static_cast<uint32_t>(raven.firmware().ucode()[3]) << 24));
+    // The engine was told where its block is, as the GPU addresses it (0xF401900000): the cache-window registers hold the low and high halves.
+    CHECK(bar.words[0x7E00 + 0x045F] == 0x01900000u && bar.words[0x7E00 + 0x045E] == 0xF4u);   // UVD_LMI_VCPU_CACHE_64BIT_BAR_LOW / _HIGH
+    raven.stop_engine();
+    CHECK(!raven.engine_running());
+  }
+  {   // The registers answer all ones (the block is powered down): no plan, and the log says why.
+    FakeRavenBar off(false);
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    raven.set_registers(off.region());
+    VideoEngineEnvironment env;
+    env.mapper = &mapper; env.framebuffer_base = cpu; env.framebuffer_bytes = 8ull << 20;
+    CHECK(raven.initialize() && raven.load_firmware(fs) && !raven.plan_engine(env) && strstr(raven.plan_status(), "did not answer") && mapper.asked.empty() && !raven.engine_planned());
+    CHECK(raven.start_planned_engine(SteppingClock()) == AmdVcn1::Status::BadMemory);   // nothing planned, nothing started
+  }
+  {   // A framebuffer that is not in the carve-out the registers describe: the registers cannot be about this machine.
+    FakeRavenBar bar;
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    raven.set_registers(bar.region());
+    VideoEngineEnvironment env;
+    env.mapper = &mapper; env.framebuffer_base = 0x80000000ull; env.framebuffer_bytes = 8ull << 20;
+    CHECK(raven.initialize() && raven.load_firmware(fs) && !raven.plan_engine(env) && strstr(raven.plan_status(), "not inside the video memory") && mapper.asked.empty());
+    env.framebuffer_base = 0; env.framebuffer_bytes = 0;
+    CHECK(!raven.plan_engine(env) && strstr(raven.plan_status(), "framebuffer is unknown") && mapper.asked.empty());
+  }
+  {   // A chip whose graphics block reports another address configuration than the variant we took it for.
+    FakeRavenBar bar(true, 0x26013041);
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    raven.set_registers(bar.region());
+    VideoEngineEnvironment env;
+    env.mapper = &mapper; env.framebuffer_base = cpu; env.framebuffer_bytes = 8ull << 20;
+    CHECK(raven.initialize() && raven.load_firmware(fs) && !raven.plan_engine(env) && strstr(raven.plan_status(), "differs") && mapper.asked.empty());
+    // The same hardware on a revision-8 chip (Raven2) is the match.
+    AmdVcnVideoEngine raven2(a, 0x15DD);
+    raven2.set_pci_revision(0x81);
+    raven2.set_registers(bar.region());
+    CHECK(raven2.initialize() && raven2.load_firmware(fs) && raven2.plan_engine(env) && strstr(raven2.plan_status(), "gb_addr_config 0x26013041"));
+  }
+  {   // The mapper refuses the block (it is memory the OS owns): not planned, said so, nothing started.
+    FakeRavenBar bar;
+    AnyRangeMapper mapper;
+    mapper.refuse_from = cpu;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    raven.set_registers(bar.region());
+    VideoEngineEnvironment env;
+    env.mapper = &mapper; env.framebuffer_base = cpu; env.framebuffer_bytes = 8ull << 20;
+    CHECK(raven.initialize() && raven.load_firmware(fs) && !raven.plan_engine(env) && strstr(raven.plan_status(), "memory the OS owns") && !raven.engine_planned());
+    CHECK(raven.start_planned_engine(SteppingClock()) == AmdVcn1::Status::BadMemory);
+    // No mapper at all, and no register access: said so, nothing mapped.
+    VideoEngineEnvironment none;
+    none.framebuffer_base = cpu; none.framebuffer_bytes = 8ull << 20;
+    CHECK(!raven.plan_engine(none) && strstr(raven.plan_status(), "no way to map memory"));
+    AmdVcnVideoEngine blind(a, 0x15DD);
+    CHECK(blind.initialize() && blind.load_firmware(fs) && !blind.plan_engine(env) && strstr(blind.plan_status(), "no access to the registers"));
+  }
+  {   // Not a VCN 1.0 part: nothing to plan, nothing said.
+    FakeRavenBar bar;
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine renoir(a, 0x1636);
+    renoir.set_registers(bar.region());
+    VideoEngineEnvironment env;
+    env.mapper = &mapper; env.framebuffer_base = cpu; env.framebuffer_bytes = 8ull << 20;
+    CHECK(renoir.initialize() && !renoir.plan_engine(env) && renoir.plan_status()[0] == 0 && mapper.asked.empty());
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_amd_discovery_engine() {
   TestAllocator a;
   std::vector<uint32_t> vram = amd_fake_vram();
@@ -1712,6 +1841,7 @@ int main() {
   test_amd_media_engine();
   test_amd_vcn_firmware();
   test_amd_vcn_start();
+  test_amd_vcn_plan();
   test_amd_discovery_engine();
   test_amd_system_window();
   test_amd_card_memory();

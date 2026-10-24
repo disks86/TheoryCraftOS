@@ -35,6 +35,7 @@ void FramebufferGpu::set_framebuffer(ByteView memory, uint32_t width, uint32_t h
                     memory.size() >= uint64_t{height} * pitch_bytes &&
                     reinterpret_cast<uint64_t>(memory.data()) % 4 == 0;
   memory_ = fits ? memory.first(uint64_t{height} * pitch_bytes) : ByteView();
+  allocation_ = fits ? memory : ByteView();
   width_ = fits ? width : 0;
   height_ = fits ? height : 0;
   pitch_ = pitch_bytes;
