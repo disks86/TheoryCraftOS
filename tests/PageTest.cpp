@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include "Browser/Page.hpp"
+#include "Browser/SessionHistory.hpp"
 #include "Dom/Form.hpp"
 #include "Browser/PageLayout.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
@@ -111,6 +112,10 @@ struct FakeNet final : IPageLoader {
     Answer a;
     if (it != answers.end()) a = it->second;
     else a.status = 404;
+    if (request.headers.contains("If-None-Match")) {   // a revalidation: the answer "<key>#304" if the test has one
+      auto not_modified = answers.find(key + "#304");
+      if (not_modified != answers.end()) a = not_modified->second;
+    }
     response->status = a.status;
     response->reason.assign(a.status == 200 ? "OK" : a.status == 404 ? "Not Found" : "Status");
     response->headers.assign(StringView(a.headers.data(), a.headers.size()));
@@ -229,11 +234,62 @@ struct FakeEnvironment final : IPageEnvironment {
     posts.push_back(std::string(a.data(), a.size()) + " [" + std::string(type.data(), type.size()) + "] " + std::string(body.data(), body.size()));
   }
   void navigate(StringView a, bool replace) override { navigations.push_back(std::string(a.data(), a.size()) + (replace ? " (replace)" : "")); }
-  void set_hash(StringView h) override { hashes.push_back(std::string(h.data(), h.size())); }
+  void set_hash(StringView h) override {
+    hashes.push_back(std::string(h.data(), h.size()));
+    if (sim && sim->current()) {
+      std::string base = sim->current()->address.c_str();
+      if (base.find('#') != std::string::npos) base.resize(base.find('#'));
+      if (h.size() > 1) base += std::string(h.data(), h.size());
+      if (base != sim->current()->address.c_str()) sim->push_fragment(StringView(base.data(), base.size()));
+    }
+  }
   void reload() override { ++reloads; }
-  void history_go(int32_t d) override { history_moves += d; }
-  uint32_t history_length() override { return 3; }
+  // A session history standing in for the browser's (set `sim` to use it): entries, the Navigation API's state, and the moves the page asked for.
+  SessionHistory* sim = nullptr;
+  int pending_delta = 0;
+  std::vector<std::string> opens;
+  int closes = 0;
+  bool allow_open = true;
+  bool open_window(StringView a, StringView target, bool noopener) override {
+    opens.push_back(std::string(a.data(), a.size()) + " [" + std::string(target.data(), target.size()) + "]" + (noopener ? " noopener" : ""));
+    return allow_open;
+  }
+  void close_window() override { ++closes; }
+  bool history_entries(String* json, int64_t* index) override {
+    if (!sim || sim->empty()) return false;
+    auto quote = [](const std::string& t) {
+      std::string o = "\"";
+      for (char c : t) {
+        if (c == '"' || c == '\\') o += '\\';
+        o += c;
+      }
+      return o + "\"";
+    };
+    std::string text = "[";
+    for (uint32_t i = 0; i < sim->count(); ++i) {
+      const SessionHistory::Entry& e = sim->at(i);
+      if (i) text += ",";
+      text += "{\"key\":" + std::to_string(e.key) + ",\"id\":" + std::to_string(e.id) + ",\"doc\":" + std::to_string(e.document) + ",\"url\":" + quote(e.address.c_str()) + ",\"nav\":" + (e.has_nav_state ? quote(e.nav_state.c_str()) : std::string("null")) + "}";
+    }
+    text += "]";
+    json->assign(StringView(text.data(), text.size()));
+    *index = sim->index();
+    return true;
+  }
+  void set_navigation_state(StringView json, bool has) override {
+    if (!sim || !sim->current()) return;
+    sim->current()->nav_state.assign(json);
+    sim->current()->has_nav_state = has;
+  }
+  void history_go_to_key(uint64_t key) override {
+    if (!sim) return;
+    const int64_t at = sim->find_key(key);
+    if (at >= 0) pending_delta += static_cast<int>(at - sim->index());
+  }
+  void history_go(int32_t d) override { history_moves += d; pending_delta += d; }
+  uint32_t history_length() override { return sim ? sim->count() : 3; }
   void push_state(StringView a, StringView state, bool has, bool replace) override {
+    if (sim) sim->push_state(a, state, has, replace);
     states.push_back(std::string(replace ? "replace " : "push ") + std::string(a.data(), a.size()) + (has ? " " + std::string(state.data(), state.size()) : ""));
     state_text.assign(state.data(), state.size());
     has_state = has;
@@ -2787,7 +2843,7 @@ static void test_fetch() {
   CHECK(async_is("fetch('/bad').then(function (r) { console.log(r.status, r.ok); return r.text() }).then(function (t) { console.log(t) }); fetch('/missing').then(function (r) { console.log(r.status, r.ok) }); fetch('/empty').then(function (r) { console.log(r.status, r.body); return r.text() }).then(function (t) { console.log('[' + t + ']') });",
                  "500 false | oops | 404 false | 204 null | []", stock));
   CHECK(async_is("fetch('/old').then(function (r) { console.log(r.redirected, r.url); return r.text() }).then(function (t) { console.log(t) }); fetch('/old', { redirect: 'manual' }).then(function (r) { console.log(r.status, r.headers.get('location')) }); fetch('/old', { redirect: 'error' }).catch(function (e) { console.log(e.name) });",
-                 "true https://app.example/new | moved here | 302 /new | TypeError", stock));
+                 "true https://app.example/new | moved here | 0 null | TypeError", stock));
   CHECK(async_is("fetch('http://down.example/x').catch(function (e) { console.log(e.name, e.message.indexOf('Failed to fetch') === 0) }); fetch('nonsense:').catch(function (e) { console.log(e.name) }); fetch('/api/user', { method: 'GET', body: 'x' }).catch(function (e) { console.log(e.name) });", "TypeError | TypeError true | TypeError", stock));
   // POST bodies
   CHECK(async_is("fetch('/api/echo', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Token': 't' }, body: JSON.stringify({ a: 1 }) }).then(function (r) { console.log(r.status); return r.text() }).then(function (t) { console.log(t) });", "201 | created",
@@ -2806,7 +2862,7 @@ static void test_fetch() {
   CHECK(async_is("var r = Response.json({ a: [1, 2] }, { status: 202 }); console.log(r.status, r.headers.get('content-type')); r.clone().json().then(function (d) { console.log(d.a.length) }); r.text().then(function (t) { console.log(t) }); console.log(Response.error().type, Response.error().status, Response.redirect('/x', 301).headers.get('location'), Response.redirect('/x').status);"
                  "try { new Response('x', { status: 99 }) } catch (e) { console.log(e.name) } try { new Response('x', { status: 204 }) } catch (e) { console.log(e.name) } try { r.clone() } catch (e) { console.log(e.name) }",
                  "202 application/json | error 0 https://app.example/x 302 | RangeError | TypeError | TypeError | 2 | {\"a\":[1,2]}", stock));
-  CHECK(async_is("fetch('/bin').then(function (r) { return r.arrayBuffer() }).then(function (b) { console.log(b.length, b.byteLength, b[0], b[2], b[3], b[4]) }); fetch('/bin').then(function (r) { return r.blob() }).then(function (b) { console.log(b.size, b.type) });", "5 5 1 255 0 65 | 5 application/octet-stream", stock));
+  CHECK(async_is("fetch('/bin').then(function (r) { return r.arrayBuffer() }).then(function (b) { var u = new Uint8Array(b); console.log(u.length, b.byteLength, u[0], u[2], u[3], u[4]) }); fetch('/bin').then(function (r) { return r.blob() }).then(function (b) { console.log(b.size, b.type) });", "5 5 1 255 0 65 | 5 application/octet-stream", stock));
   CHECK(async_is("fetch('/form').then(function (r) { return r.formData() }).then(function (fd) { console.log(fd.get('a'), fd.getAll('a').join(), fd.get('b')) });", "1 1,3 two words", stock));
   CHECK(async_is("fetch('/text').then(function (r) { var reader = r.body.getReader(); return reader.read().then(function (c) { console.log(c.done, c.value.length); return reader.read() }).then(function (c) { console.log(c.done) }) });", "false 13 | true", stock));
   CHECK(async_is("fetch('/api/user').then(function (r) { var c = r.clone(); return Promise.all([r.json(), c.text()]) }).then(function (a) { console.log(a[0].name, a[1].length) });", "Ada 34", stock));
@@ -2843,7 +2899,7 @@ static void test_xhr() {
   CHECK(async_is("var x = new XMLHttpRequest(); var log = []; x.onabort = function () { log.push('abort') }; x.onload = function () { log.push('NO') }; x.onloadend = function () { log.push('end') }; x.open('GET', '/text'); x.send(); x.abort(); log.push(x.readyState + ':' + x.status); setTimeout(function () { console.log(log.join()) }, 100);", "abort,end,0:0", stock));
   CHECK(async_is("var x = new XMLHttpRequest(); try { x.send() } catch (e) { console.log(e.name) } try { x.setRequestHeader('a', 'b') } catch (e) { console.log(e.name) } try { x.open('TRACE', '/x') } catch (e) { console.log(e.name) } try { x.open('GET', 'http://') } catch (e) { console.log(e.name) } x.open('GET', '/text'); x.send(); try { x.send() } catch (e) { console.log(e.name) } console.log(XMLHttpRequest.DONE, x.OPENED);",
                  "InvalidStateError | InvalidStateError | SecurityError | SyntaxError | InvalidStateError | 4 1", stock));
-  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/bin'); x.responseType = 'arraybuffer'; x.onload = function () { console.log(x.response.length, x.response[2]) }; x.send(); var y = new XMLHttpRequest(); y.open('GET', '/bin'); y.responseType = 'blob'; y.onload = function () { console.log(y.response.size, y.response.type) }; y.send();", "5 255 | 5 application/octet-stream", stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/bin'); x.responseType = 'arraybuffer'; x.onload = function () { var u = new Uint8Array(x.response); console.log(u.length, u[2]) }; x.send(); var y = new XMLHttpRequest(); y.open('GET', '/bin'); y.responseType = 'blob'; y.onload = function () { console.log(y.response.size, y.response.type) }; y.send();", "5 255 | 5 application/octet-stream", stock));
   CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', 'https://api.other/open'); x.onload = function () { console.log(x.status, x.responseText) }; x.send(); var y = new XMLHttpRequest(); y.open('GET', 'https://api.other/closed'); y.onerror = function () { console.log('blocked') }; y.send();", "200 cross | blocked", stock));
   CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/text'); x.onload = function () { x.open('GET', '/api/user'); x.onload = function () { console.log('second', x.status, JSON.parse(x.responseText).name) }; x.send() }; x.send();", "second 200 Ada", stock));
   CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/text'); x.withCredentials = true; x.onload = function () { console.log(x.withCredentials, x.upload instanceof EventTarget, typeof x.upload.addEventListener) }; x.send();", "true true function", stock));
@@ -2984,6 +3040,267 @@ static void test_storage() {
     }();
     CHECK(got.empty());
   }
+}
+
+static void test_cookies_web() {
+  // public suffixes cannot be named by Domain; the host's own registrable domain can
+  CHECK(async_is("document.cookie = 'a=1; domain=example'; document.cookie = 'b=2; domain=co.uk'; document.cookie = 'c=3; domain=app.example'; console.log(document.cookie);", "c=3", nullptr, "https://app.example/"));
+  CHECK(async_is("document.cookie = 'a=1; domain=github.io; path=/'; document.cookie = 'b=2; domain=me.github.io; path=/'; console.log(document.cookie);", "b=2", nullptr, "https://me.github.io/"));
+  // Cookie Store API
+  CHECK(async_is("cookieStore.set('a', '1').then(function () { return cookieStore.set({ name: 'b', value: '2', path: '/', sameSite: 'lax' }) }).then(function () { return cookieStore.get('a') }).then(function (c) { console.log(c.name, c.value, c.path, c.secure, c.sameSite, c.partitioned); return cookieStore.getAll() }).then(function (l) { console.log(l.length, document.cookie) });",
+                 "a 1 / true strict false | 2 a=1; b=2", nullptr, "https://app.example/dir/page.html"));
+  CHECK(async_is("document.cookie = 'x=1; path=/'; document.cookie = 'y=2; path=/'; cookieStore.delete('x').then(function () { console.log(document.cookie); return cookieStore.get('x') }).then(function (c) { console.log(c); return cookieStore.getAll({ name: 'y' }) }).then(function (l) { console.log(l.length, l[0].value); return cookieStore.get('nothing') }).then(function (c) { console.log(c) });",
+                 "y=2 | null | 1 2 | null", nullptr, "https://app.example/"));
+  CHECK(async_is("cookieStore.set({ name: '__Host-id', value: 'v' }).then(function () { console.log(document.cookie); return cookieStore.set('bad;name', 'v') }).catch(function (e) { console.log(e.name); return cookieStore.set({ name: 'p', value: 'v', partitioned: true }) }).then(function () { return cookieStore.get('p') }).then(function (c) { console.log(c.partitioned, c.secure) });",
+                 "__Host-id=v | TypeError | true true", nullptr, "https://app.example/"));
+  CHECK(async_is("var seen = []; cookieStore.addEventListener('change', function (e) { seen.push(e.changed.length + ':' + e.deleted.length) }); cookieStore.set('q', '1').then(function () { return new Promise(function (r) { setTimeout(r, 600) }) }).then(function () { return cookieStore.delete('q') }).then(function () { return new Promise(function (r) { setTimeout(r, 600) }) }).then(function () { console.log(seen.join()) });",
+                 "1:0,0:1", nullptr, "https://app.example/"));
+  // Clear-Site-Data: "cookies" clears the origin's cookies
+  CHECK(async_is("document.cookie = 'k=1; path=/'; console.log(document.cookie); fetch('/logout').then(function () { console.log(document.cookie === '' ? 'empty' : document.cookie) });", "k=1 | empty",
+                 [](FakeEnvironment& env) { env.net.answers["GET https://app.example/logout"] = {200, "Clear-Site-Data: \"cookies\"\r\n", "bye"}; }, "https://app.example/"));
+  // storage keeps what is written through the area and the quota counts keys too
+  CHECK(js("", "localStorage.setItem('k', 'v'); console.log(localStorage.length, JSON.stringify(localStorage), 'k' in localStorage, localStorage.hasOwnProperty('k'), localStorage.getItem('toString'), typeof localStorage.toString)", "1 {\"k\":\"v\"} true true null function"));
+}
+
+// A page on a pretend browser with a real session history (the entries the Navigation API lists): `script` runs, the timers run, the moves the page asked for are
+// carried out the way the browser would (Back / Forward within the document give the page a popstate), then `act` does what the user does.
+static std::string nav_run(const char* script, const char* address, const std::function<void(FakeEnvironment&, Page&, SessionHistory&)>& act = nullptr,
+                           const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    SessionHistory history(a);
+    history.navigate(address, 1);
+    FakeEnvironment env(a);
+    env.sim = &history;
+    MediaEnvironment media;
+    Page page(a, env, address, media, true);
+    auto pump = [&] {
+      for (int i = 0; i < 20 && env.pending_delta; ++i) {
+        const int d = env.pending_delta;
+        env.pending_delta = 0;
+        if (!history.can_go(d)) continue;
+        history.go(d);
+        const SessionHistory::Entry* e = history.current();
+        page.traverse(StringView(e->address.view()), e->state.view(), e->has_state);
+      }
+    };
+    auto run_timers = [&] {
+      for (int i = 0; i < 100; ++i) {
+        pump();
+        double due;
+        if (!page.next_timer(&due)) break;
+        if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+        page.run_due_timers(env.clock);
+      }
+      pump();
+    };
+    page.load((std::string("<html><head><title>T</title></head><body><script>") + script + "</script></body></html>").c_str());
+    run_timers();
+    if (act) {
+      act(env, page, history);
+      run_timers();
+    }
+    out = std::string(page.log().data(), page.log().size());
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    for (size_t p = 0; (p = out.find("\n", p)) != std::string::npos;) {
+      out.replace(p, 1, " | ");
+      p += 3;
+    }
+    if (after) after(env);
+  }
+  if (a.live != 0) {
+    printf("   (leaked %d allocation(s))\n", a.live);
+    return out + " [leak]";
+  }
+  return out;
+}
+
+static bool nav_is(const char* script, const char* expected, const std::function<void(FakeEnvironment&, Page&, SessionHistory&)>& act = nullptr,
+                   const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  const std::string got = nav_run(script, "https://app.example/p/start", act, after);
+  if (got != expected) {
+    printf("   %s\n   gives   %s\n   expects %s\n", script, got.c_str(), expected);
+    return false;
+  }
+  return true;
+}
+
+static void test_navigation() {
+  // an on<event> handler that returns false cancels the event
+  CHECK(js("<a id=l href='#'>x</a>", "var l = document.getElementById('l'); l.onclick = function () { return false }; var e = new MouseEvent('click', { cancelable: true, bubbles: true }); l.dispatchEvent(e); console.log(e.defaultPrevented); l.onclick = function () { return 0 }; var f = new MouseEvent('click', { cancelable: true }); l.dispatchEvent(f); console.log(f.defaultPrevented)", "true | false"));
+  // --- the lifecycle: pageshow after load, beforeunload asks, pagehide / unload say goodbye
+  CHECK(js("", "addEventListener('load', function () { console.log('load', document.readyState) }); addEventListener('pageshow', function (e) { console.log('pageshow', e.persisted, e instanceof PageTransitionEvent) });", "load complete | pageshow false true"));
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      auto asks = [&](const char* script) {
+        Page page(a, env, "https://app.example/", media, true);
+        page.load((std::string("<script>") + script + "</script>").c_str());
+        return page.before_unload();
+      };
+      CHECK(!asks("1"));
+      CHECK(asks("addEventListener('beforeunload', function (e) { e.preventDefault() })"));
+      CHECK(asks("addEventListener('beforeunload', function (e) { e.returnValue = 'sure?' })"));
+      CHECK(!asks("addEventListener('beforeunload', function (e) { e.returnValue = '' })"));
+      CHECK(asks("onbeforeunload = function (e) { e.returnValue = 'x' }"));
+      CHECK(!asks("addEventListener('beforeunload', function () { throw new Error('boom') })"));
+      CHECK(asks("onbeforeunload = function () { return 'Really?' }"));
+      CHECK(!asks("onbeforeunload = function () { }"));
+      Page page(a, env, "https://app.example/", media, true);
+      page.load("<script>document.addEventListener('visibilitychange', function () { console.log('visibilitychange', document.visibilityState, document.hidden) }); addEventListener('pagehide', function (e) { console.log('pagehide', e.persisted, document.visibilityState) }); addEventListener('unload', function () { console.log('unload') }); console.log(document.visibilityState, document.hidden)</script>");
+      page.unload();
+      CHECK(std::string(page.log().data(), page.log().size()) == "visible false\nvisibilitychange hidden true\npagehide false hidden\nunload\n");
+    }
+    CHECK(a.live == 0);
+  }
+  // --- scrollRestoration, the referrer
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/", media, true);
+      page.set_referrer("https://other.example/from");
+      page.load("<script>console.log(history.scrollRestoration, document.referrer); history.scrollRestoration = 'bogus'; console.log(history.scrollRestoration); history.scrollRestoration = 'manual'; console.log(history.scrollRestoration)</script>");
+      CHECK(std::string(page.log().data(), page.log().size()) == "auto https://other.example/from\nauto\nmanual\n");
+      CHECK(page.scroll_restoration_manual());
+    }
+    CHECK(a.live == 0);
+  }
+  // --- <meta http-equiv=refresh>
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      auto refresh = [&](const char* content, const char* expected) {
+        Page page(a, env, "https://app.example/dir/page", media, true);
+        page.load((std::string("<meta http-equiv=refresh content=\"") + content + "\">").c_str());
+        double seconds = -1;
+        String target(a);
+        const bool found = page.meta_refresh(&seconds, &target);
+        std::string got = found ? std::to_string(static_cast<int>(seconds)) + " " + std::string(target.c_str()) : "none";
+        if (got != expected) {
+          printf("   refresh \"%s\" gives %s, expects %s\n", content, got.c_str(), expected);
+          return false;
+        }
+        return true;
+      };
+      CHECK(refresh("5", "5 https://app.example/dir/page"));
+      CHECK(refresh("0; url=/next", "0 https://app.example/next"));
+      CHECK(refresh("3;URL='next?x=1'", "3 https://app.example/dir/next?x=1"));
+      CHECK(refresh("2, https://other.example/", "2 https://other.example/"));
+      CHECK(refresh(" 10 ; url = a.html", "10 https://app.example/dir/a.html"));
+      CHECK(refresh("soon", "none"));
+      CHECK(refresh("5x; url=/a", "none"));
+    }
+    CHECK(a.live == 0);
+  }
+  // --- where the page scrolls to: the fragment, scrollIntoView()
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      font::FontSet fonts(a);
+      fonts.add_bundled_fonts();
+      auto scroll_for = [&](const char* address, const char* script) {
+        Page page(a, env, address, media, true);
+        page.load((std::string("<body style='margin:0'><div style='height:1000px'></div><h1 id=t style='margin:0'>x</h1><div style='height:500px'></div><a name=old>y</a><script>") + script + "</script>").c_str());
+        PagePicture picture(a);
+        CHECK(page.render_picture(&picture, fonts));
+        return page.take_scroll_request();
+      };
+      const int32_t t = scroll_for("https://app.example/p#t", "");
+      CHECK(t >= 1000 && t < 1010);
+      CHECK(scroll_for("https://app.example/p#%74", "") == t);
+      const int32_t old = scroll_for("https://app.example/p#old", "");
+      CHECK(old >= 1500);
+      CHECK(scroll_for("https://app.example/p#nothing", "") == -1);
+      CHECK(scroll_for("https://app.example/p", "") == -1);
+      CHECK(scroll_for("https://app.example/p#top", "") == 0);
+      CHECK(scroll_for("https://app.example/p#", "") == 0);
+      CHECK(scroll_for("https://app.example/p", "document.getElementById('t').scrollIntoView()") == t);
+      // changing the fragment from script scrolls too
+      Page page(a, env, "https://app.example/p", media, true);
+      page.load("<body style='margin:0'><div style='height:1000px'></div><h1 id=t style='margin:0'>x</h1><script>location.hash = '#t'</script>");
+      PagePicture picture(a);
+      CHECK(page.render_picture(&picture, fonts));
+      CHECK(page.take_scroll_request() == t);
+      CHECK(page.take_scroll_request() == -1);
+    }
+    CHECK(a.live == 0);
+  }
+  // --- window.open(), window.close()
+  CHECK(nav_is("var w = open('/popup', 'pop'); console.log(typeof w, w.closed, w.name); console.log(open('/n', '_blank', 'noopener') === null, open('about:blank') === null); w.close(); console.log(w.closed); close();", "object false pop | true true | true",
+               nullptr, [](FakeEnvironment& env) {
+                 CHECK(env.opens.size() == 2);
+                 if (env.opens.size() == 2) CHECK(env.opens[0] == "https://app.example/popup [pop]" && env.opens[1] == "https://app.example/n [_blank] noopener");
+                 CHECK(env.closes == 1);
+               }));
+  CHECK(nav_is("var r = open('/self', '_self'); console.log(r === window)", "true", nullptr, [](FakeEnvironment& env) { CHECK(env.opens.empty()); CHECK(env.navigations.size() == 1); }));
+  // --- the Navigation API
+  CHECK(nav_is("console.log(navigation.entries().length, navigation.currentEntry.url, navigation.currentEntry.index, navigation.canGoBack, navigation.canGoForward, navigation instanceof EventTarget, navigation.transition);"
+               "history.pushState({ a: 1 }, '', '/p/two'); var es = navigation.entries(); console.log(es.length, navigation.currentEntry.url, navigation.currentEntry.index, navigation.canGoBack, navigation.canGoForward, es[0].key !== es[1].key, es[0].sameDocument, es[1].id !== es[0].id);",
+               "1 https://app.example/p/start 0 false false true null | 2 https://app.example/p/two 1 true false true true true"));
+  CHECK(nav_is("navigation.addEventListener('navigate', function (e) { console.log(e.type, e.navigationType, e.canIntercept, e.destination.url, e.hashChange, e.userInitiated, e instanceof NavigateEvent); e.intercept({ handler: function () { console.log('handler'); return new Promise(function (r) { setTimeout(r, 10) }) } }) });"
+               "navigation.addEventListener('currententrychange', function (e) { console.log('change', e.navigationType, e.from.url) });"
+               "navigation.addEventListener('navigatesuccess', function () { console.log('success', location.pathname, navigation.transition) });"
+               "var r = navigation.navigate('/p/next', { state: { n: 1 } }); console.log(navigation.transition === null);"
+               "r.committed.then(function (en) { console.log('committed', en.url, JSON.stringify(en.getState())) }); r.finished.then(function (en) { console.log('finished', en.url, navigation.entries().length) });",
+               "navigate push true https://app.example/p/next false false true | change push https://app.example/p/start | false | handler | committed https://app.example/p/next {\"n\":1} | success /p/next null | finished https://app.example/p/next 2"));
+  CHECK(nav_is("navigation.onnavigate = function (e) { e.preventDefault() }; navigation.addEventListener('navigateerror', function (e) { console.log('error', e.error.name) });"
+               "navigation.navigate('/p/x').committed.catch(function (err) { console.log(err.name, location.pathname, navigation.entries().length) });",
+               "error AbortError | AbortError /p/start 1"));
+  CHECK(nav_is("navigation.onnavigate = function (e) { e.intercept({ handler: function () { throw new Error('nope') } }) }; navigation.onnavigateerror = function (e) { console.log('navigateerror', e.error.message) };"
+               "navigation.navigate('/p/y').finished.catch(function (err) { console.log('rejected', err.message, location.pathname) });",
+               "navigateerror nope | rejected nope /p/y"));
+  // fragment navigation is a same-document navigation without intercepting
+  CHECK(nav_is("navigation.onnavigate = function (e) { console.log(e.navigationType, e.hashChange, e.destination.sameDocument, e.canIntercept) }; navigation.onnavigatesuccess = function () { console.log('success', location.hash) };"
+               "navigation.navigate('#frag').finished.then(function (en) { console.log(en.url, navigation.entries().length) });",
+               "push true true true | success #frag | https://app.example/p/start#frag 2"));
+  CHECK(nav_is("navigation.onnavigate = function (e) { console.log('nav', e.navigationType, e.destination.url, e.canIntercept, e.destination.sameDocument, e.destination.index, e.userInitiated) };"
+               "history.pushState(1, '', '/p/b'); history.pushState(2, '', '/p/c'); console.log(navigation.entries().length);"
+               "navigation.back().finished.then(function (en) { console.log('back done', en.url, location.pathname, history.state, navigation.currentEntry.index, navigation.canGoForward) });",
+               "nav push https://app.example/p/b true true -1 false | nav push https://app.example/p/c true true -1 false | 3 | nav traverse https://app.example/p/b true true 1 false | back done https://app.example/p/b /p/b 1 1 true"));
+  CHECK(nav_is("history.pushState(1, '', '/p/b'); var first = navigation.entries()[0];"
+               "navigation.traverseTo(first.key).finished.then(function (en) { console.log('at', en.url, en.index); return navigation.traverseTo('nope').finished }).catch(function (e) { console.log(e.name); return navigation.back().finished }).catch(function (e) { console.log('no back', e.name) });",
+               "at https://app.example/p/start 0 | InvalidStateError | no back InvalidStateError"));
+  CHECK(nav_is("navigation.back().finished.catch(function (e) { console.log(e.name) }); navigation.forward().finished.catch(function (e) { console.log(e.name) });", "InvalidStateError | InvalidStateError"));
+  // the user presses Back: the page hears of it
+  CHECK(nav_is("history.pushState('s', '', '/p/b'); navigation.onnavigate = function (e) { console.log('nav', e.navigationType, e.userInitiated, e.canIntercept, e.cancelable) }; navigation.oncurrententrychange = function (e) { console.log('change', e.navigationType, e.from.url) }; navigation.onnavigatesuccess = function () { console.log('success', navigation.currentEntry.url) };",
+               "nav traverse true true false | change traverse https://app.example/p/b | success https://app.example/p/start",
+               [](FakeEnvironment&, Page& page, SessionHistory& h) {
+                 h.go(-1);
+                 page.traverse(StringView(h.current()->address.view()), StringView(), false);
+               }));
+  // state of an entry, kept apart from history.state
+  CHECK(nav_is("navigation.updateCurrentEntry({ state: { k: [1, 2] } }); console.log(JSON.stringify(navigation.currentEntry.getState()), history.state);"
+               "navigation.oncurrententrychange = function (e) { console.log('change', e.navigationType, e.from === navigation.currentEntry) }; navigation.updateCurrentEntry({ state: 5 }); console.log(navigation.currentEntry.getState());"
+               "history.pushState('h', '', '/p/z'); console.log(navigation.currentEntry.getState(), navigation.entries()[0].getState());"
+               "try { navigation.updateCurrentEntry({}) } catch (e) { console.log(e.name) }",
+               "{\"k\":[1,2]} null | change null true | 5 | change push false | undefined 5 | TypeError"));
+  // entries that are forgotten say so
+  CHECK(nav_is("history.pushState(0, '', '/p/b'); history.pushState(0, '', '/p/c'); var c = navigation.currentEntry; c.ondispose = function () { console.log('disposed', c.url, c.index) };"
+               "history.back(); setTimeout(function () { history.pushState(0, '', '/p/d'); console.log(navigation.entries().length, navigation.entries().map(function (e) { return e.url.slice(-1) }).join('')) }, 5);",
+               "disposed https://app.example/p/c -1 | 3 tbd"));
+  // location.assign() is a navigation the page can see and stop; one nobody stops goes to the browser
+  CHECK(nav_is("navigation.onnavigate = function (e) { console.log(e.navigationType, e.canIntercept, e.destination.sameDocument) }; location.assign('/p/other'); location.replace('/p/third');", "push true false | replace true false",
+               nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.size() == 2); }));
+  CHECK(nav_is("navigation.onnavigate = function (e) { e.preventDefault() }; location.assign('/p/other'); console.log('stayed');", "stayed", nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.empty()); }));
+  CHECK(nav_is("navigation.onnavigate = function (e) { if (e.canIntercept) e.intercept({ handler: function () { console.log('intercepted', e.destination.url) } }) }; location.assign('/p/spa'); setTimeout(function () { console.log(location.pathname, navigation.entries().length) }, 5);",
+               "intercepted https://app.example/p/spa | /p/spa 2", nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.empty()); }));
+  // other origins' entries are not listed
+  CHECK(nav_is("console.log(navigation.entries().length)", "1"));
+  CHECK(nav_is("navigation.navigate('https://elsewhere.example/').committed.catch(function () {}); console.log(typeof navigation.navigate('/p/q', { history: 'replace' }).finished, navigation.entries().length);"
+               "try { navigation.navigate('/p/q', { history: 'bogus' }) } catch (e) { console.log(e.name) }", "object 1 | TypeError", nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.size() == 2 && env.navigations[0] == "https://elsewhere.example/" && env.navigations[1] == "https://app.example/p/q (replace)"); }));
+  // history.back() and friends go through the same machinery
+  CHECK(nav_is("history.pushState(0, '', '/p/b'); navigation.onnavigate = function (e) { console.log('nav', e.navigationType, e.destination.url); }; navigation.onnavigatesuccess = function () { console.log('done', location.pathname) }; history.back();",
+               "nav traverse https://app.example/p/start | done /p/start"));
+  CHECK(nav_is("history.pushState(0, '', '/p/b'); navigation.onnavigate = function (e) { e.preventDefault(); console.log('stopped') }; history.back(); setTimeout(function () { console.log(location.pathname) }, 5)", "stopped | /p/b"));
 }
 
 static void test_messaging() {
@@ -3593,6 +3910,140 @@ static void test_platform() {
       "Netscape:Gecko:false:0:0:false:false:true | [object Window][object Document][object Location][object Navigator][object NodeList][object HTMLCollection] | battery:1 | cache:hi | clicktrue5 | clip:copied | devices:0 | false | geo:1:true | lbuttontruetrue | lock:l:exclusive | locked:5 | media:NotFoundError | notify:denied:denied | perf:2:measure:true | perm:TypeError | perm:prompt:geolocation | pop:true | quota:true | xtext/plain"));
 }
 
+// --- fetch() and XMLHttpRequest in full ---------------------------------------------------------------------------------------------
+
+static void full_stock(FakeEnvironment& env) {
+  std::string big(200000, 'x');
+  env.net.answers["GET https://app.example/big"] = {200, "Content-Type: text/plain\r\nContent-Length: 200000\r\n", big};
+  env.net.answers["GET https://app.example/latin"] = {200, "Content-Type: text/plain; charset=iso-8859-1\r\n", std::string("caf\xE9")};
+  env.net.answers["GET https://app.example/utf16"] = {200, "Content-Type: text/plain; charset=utf-16le\r\n", std::string("h\0i\0", 4)};
+  env.net.answers["GET https://app.example/xml"] = {200, "Content-Type: application/xml\r\n", "<a><b>1</b><b>2</b></a>"};
+  env.net.answers["GET https://app.example/html"] = {200, "Content-Type: text/html\r\n", "<p id=x>hi</p>"};
+  env.net.answers["GET https://app.example/json"] = {200, "Content-Type: application/json\r\nX-Multi: a\r\nx-multi: b\r\nSet-Cookie: s=1\r\n", "{\"a\":[1,2]}"};
+  env.net.answers["GET https://app.example/cached"] = {200, "Content-Type: text/plain\r\nCache-Control: max-age=60\r\nETag: \"v1\"\r\n", "cached body"};
+  env.net.answers["GET https://app.example/revalidate"] = {200, "Content-Type: text/plain\r\nCache-Control: no-cache\r\nETag: \"v1\"\r\n", "revalidated body"};
+  env.net.answers["GET https://app.example/revalidate#304"] = {304, "ETag: \"v1\"\r\n", ""};
+  env.net.answers["GET https://app.example/nostore"] = {200, "Cache-Control: no-store\r\n", "ns"};
+  env.net.answers["POST https://app.example/echo"] = {200, "Content-Type: text/plain\r\n", "posted"};
+  env.net.answers["PUT https://app.example/cached"] = {200, "", "put"};
+  env.net.answers["GET https://app.example/redir"] = {302, "Location: /json\r\n", ""};
+}
+
+static void test_fetch_xhr_full() {
+  // streams over the network body
+  CHECK(async_is("fetch('/big').then(function (r) { var reader = r.body.getReader(), n = 0, size = 0; var step = function () { return reader.read().then(function (x) { if (x.done) { console.log(n > 1, size, r.bodyUsed, r.body.locked); return } n++; size += x.value.length; return step() }) }; return step() });",
+                 "true 200000 true true", full_stock));
+  CHECK(async_is("fetch('/json').then(function (r) { console.log(r.headers.get('x-multi'), r.headers.get('set-cookie'), r.headers.has('content-type'), r.type, r.url); return r.clone().json().then(function (j) { return r.text().then(function (t) { console.log(j.a.length, t) }) }) });",
+                 "a, b null true basic https://app.example/json | 2 {\"a\":[1,2]}", full_stock));
+  CHECK(async_is("fetch('/big').then(function (r) { return r.body.pipeThrough(new TransformStream({ transform: function (c, ctl) { ctl.enqueue(c.length) } })) }).then(function (s) { var reader = s.getReader(), total = 0; var step = function () { return reader.read().then(function (x) { if (x.done) { console.log(total); return } total += x.value; return step() }) }; return step() });",
+                 "200000", full_stock));
+  // request bodies: streams, headers the page may not set, referrers
+  CHECK(async_is("var rs = new ReadableStream({ start: function (c) { c.enqueue(new TextEncoder().encode('streamed')); c.close() } });"
+                 "fetch('/echo', { method: 'POST', body: rs, duplex: 'half', headers: { 'X-A': '1', 'Cookie': 'no', 'Host': 'no' } }).then(function (r) { return r.text() }).then(function (t) { console.log(t) });",
+                 "posted", full_stock, "https://app.example/dir/page.html"));
+  CHECK(async_is("fetch('/echo', { method: 'POST', body: new ReadableStream() }).catch(function (e) { console.log(e.name) }); fetch('/echo', { method: 'POST', body: 'x', keepalive: true }).then(function (r) { console.log(r.status) });", "TypeError | 200", full_stock));
+  // abort while the body is being read
+  CHECK(async_is("var c = new AbortController(); fetch('/big', { signal: c.signal }).then(function (r) { var reader = r.body.getReader(); reader.read().then(function () { c.abort(); return reader.read() }).then(function () { console.log('no error') }, function (e) { console.log(e.name) }) });", "AbortError", full_stock));
+  // redirect: manual
+  CHECK(async_is("fetch('/redir', { redirect: 'manual' }).then(function (r) { console.log(r.type, r.status, r.url, r.headers.get('location'), r.body) }); fetch('/redir').then(function (r) { console.log(r.type, r.status, r.redirected, r.url) });",
+                 "opaqueredirect 0 https://app.example/redir null null | basic 200 true https://app.example/json", full_stock));
+  // the cache
+  CHECK(async_is("fetch('/cached').then(function (r) { return r.text() }).then(function () { return fetch('/cached') }).then(function (r) { return r.text() }).then(function (t) { console.log(t); return fetch('/cached', { cache: 'reload' }) }).then(function (r) { return r.text() })"
+                 ".then(function () { return fetch('/cached', { cache: 'no-store' }) }).then(function (r) { return r.text() }).then(function () { return fetch('/cached', { cache: 'only-if-cached', mode: 'same-origin' }) }).then(function (r) { console.log(r.status) })"
+                 ".then(function () { return fetch('/cached', { method: 'PUT', body: 'x' }) }).then(function () { return fetch('/cached', { cache: 'only-if-cached', mode: 'same-origin' }) }).then(function (r) { console.log(r.status) });",
+                 "cached body | 200 | 504", full_stock));
+  CHECK(async_is("fetch('/revalidate').then(function (r) { return r.text() }).then(function () { return fetch('/revalidate') }).then(function (r) { return r.text() }).then(function (t) { console.log(t) });", "revalidated body", full_stock, "https://app.example/dir/page.html"));
+  CHECK(async_is("fetch('/nostore').then(function (r) { return r.text() }).then(function () { return fetch('/nostore') }).then(function (r) { return r.text() }).then(function () { return fetch('/nostore', { cache: 'only-if-cached', mode: 'same-origin' }) }).then(function (r) { console.log(r.status) }); try { new Request('/x', { cache: 'only-if-cached' }) } catch (e) { console.log(e.name) }",
+                 "TypeError | 504", full_stock));
+  // integrity
+  CHECK(async_is("var good = 'sha256-sl+4S0dVxVumV+5W1adRv4cHgB5TJPOE+b8I7jl6E74=';"
+                 "fetch('/cached', { integrity: good }).then(function (r) { console.log('ok', r.status); return fetch('/revalidate', { integrity: good }) }).catch(function (e) { console.log(e.name) });"
+                 "fetch('/cached', { integrity: 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ' + good }).then(function (r) { console.log('either', r.status) });",
+                 "ok 200 | either 200 | TypeError", full_stock));
+  // XMLHttpRequest: events, progress, upload, response types
+  CHECK(async_is("var x = new XMLHttpRequest(), log = []; ['readystatechange', 'loadstart', 'progress', 'load', 'loadend', 'error', 'abort', 'timeout'].forEach(function (t) { x.addEventListener(t, function (e) { log.push(t === 'readystatechange' ? 'rs' + x.readyState : t + (e.lengthComputable ? ':' + e.loaded + '/' + e.total : '')) }) });"
+                 "x.open('GET', '/big'); x.onloadend = function () { var dedup = []; log.forEach(function (l) { if (dedup[dedup.length - 1] !== l) dedup.push(l) }); console.log(dedup.length > 6, log[0], log[1], log[2], log[log.length - 3], log[log.length - 2], log[log.length - 1], x.responseText.length, x.getResponseHeader('content-length'), x.status) }; x.send();",
+                 "true rs1 loadstart rs2 progress:200000/200000 rs4 load:200000/200000 200000 200000 200", full_stock));
+  CHECK(async_is("var x = new XMLHttpRequest(), log = []; x.upload.onloadstart = function (e) { log.push('u-start:' + e.total) }; x.upload.onprogress = function (e) { log.push('u-progress:' + e.loaded) }; x.upload.onload = function () { log.push('u-load') }; x.upload.onloadend = function () { log.push('u-end') };"
+                 "x.onloadstart = function () { log.push('start') }; x.onload = function () { log.push('load') }; x.onloadend = function () { console.log(log.join(' ')) }; x.open('POST', '/echo'); x.send('12345');",
+                 "start u-start:5 u-progress:5 u-load u-end load", full_stock));
+  CHECK(async_is("var out = []; var run = function (type, url, done) { var x = new XMLHttpRequest(); x.open('GET', url); x.responseType = type; x.onload = function () { done(x) }; x.send() };"
+                 "run('arraybuffer', '/latin', function (x) { out.push(x.response.byteLength + ':' + (x.response instanceof ArrayBuffer)) });"
+                 "run('blob', '/json', function (x) { out.push(x.response.size + ':' + x.response.type) });"
+                 "run('json', '/json', function (x) { out.push(x.response.a[1]) });"
+                 "run('document', '/html', function (x) { out.push(x.response.getElementById('x').textContent + ':' + (x.responseXML === x.response)) });"
+                 "run('', '/xml', function (x) { out.push(x.responseXML.getElementsByTagName('b').length + x.responseText.length) });"
+                 "run('text', '/xml', function (x) { try { x.responseXML } catch (e) { out.push(e.name) } });"
+                 "run('arraybuffer', '/latin', function (x) { try { x.responseText } catch (e) { out.push(e.name) } });"
+                 "setTimeout(function () { console.log(out.sort().join(' ')) }, 100);",
+                 "11:application/json 2 25 4:true InvalidStateError InvalidStateError hi:true", full_stock));
+  CHECK(async_is("var out = []; var run = function (url, mime, done) { var x = new XMLHttpRequest(); x.open('GET', url); if (mime) x.overrideMimeType(mime); x.onload = function () { done(x.responseText) }; x.send() };"
+                 "run('/latin', null, function (t) { out.push(t === 'caf\\u00e9') }); run('/utf16', null, function (t) { out.push(t) }); run('/latin', 'text/plain; charset=windows-1252', function (t) { out.push('o' + (t === 'caf\\u00e9')) });"
+                 "setTimeout(function () { console.log(out.sort().join(' ')) }, 100);",
+                 "hi otrue true", full_stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/json', false); x.send(); console.log(x.status, x.readyState, x.responseText.length, x.getAllResponseHeaders().split('\\r\\n').filter(Boolean).join('|'));"
+                 "var y = new XMLHttpRequest(); y.open('GET', 'http://down.example/x', false); try { y.send() } catch (e) { console.log(e.name) }"
+                 "var z = new XMLHttpRequest(); z.open('GET', '/json', false); try { z.responseType = 'json' } catch (e) { console.log(e.name) } try { z.timeout = 5 } catch (e) { console.log(e.name) }",
+                 "200 4 11 content-type: application/json|x-multi: a, b | NetworkError | InvalidAccessError | InvalidAccessError", full_stock));
+  CHECK(async_is("var x = new XMLHttpRequest(), log = []; x.onreadystatechange = function () { log.push('rs' + x.readyState) }; x.onabort = function () { log.push('abort') }; x.onloadend = function () { log.push('end') };"
+                 "x.open('GET', '/json'); x.send(); x.abort(); setTimeout(function () { console.log(log.join(' '), x.readyState, x.status) }, 50);"
+                 "var y = new XMLHttpRequest(); try { y.send() } catch (e) { console.log(e.name) } y.open('GET', '/json'); y.send(); try { y.send() } catch (e) { console.log(e.name) } try { y.open } catch (e) { }"
+                 "try { y.withCredentials = true } catch (e) { console.log(e.name) }",
+                 "InvalidStateError | InvalidStateError | InvalidStateError | rs1 rs4 abort end 0 0", full_stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('GET', '/missing-host-failure'); x.onerror = function () { console.log('error', x.status, x.readyState, x.responseText.length) }; x.send();"
+                 "var y = new XMLHttpRequest(); y.open('GET', 'http://down.example/x'); y.onerror = function () { console.log('down', y.status) }; y.upload.onerror = function () { console.log('upload error') }; y.send('body');",
+                 "down 0", full_stock));
+  CHECK(async_is("var x = new XMLHttpRequest(); x.open('POST', '/echo', true, 'user', 'pass'); x.setRequestHeader('X-A', '1'); x.setRequestHeader('x-a', '2'); x.setRequestHeader('Cookie', 'no'); x.send(new URLSearchParams({ k: 'v' }));"
+                 "x.onload = function () { console.log(x.status, x.responseURL) };",
+                 "200 https://app.example/echo", [](FakeEnvironment& env) { full_stock(env); }, "https://app.example/dir/page.html"));
+  // resource timing
+  CHECK(async_is("fetch('/json').then(function (r) { return r.text() }).then(function () { var e = performance.getEntriesByType('resource'); console.log(e.length, e[0].name, e[0].initiatorType, e[0].entryType) });", "1 https://app.example/json fetch resource", full_stock));
+}
+
+static void test_streams() {
+  CHECK(async_is(
+      "var out = [], note = function (label) { return function (v) { out.push(label + '=' + v) } }, bad = function (label) { return function (e) { out.push(label + '!' + (e && e.name || e)) } };"
+      "var collect = function (stream) { var r = stream.getReader(), got = []; var step = function () { return r.read().then(function (x) { if (x.done) return got; got.push(x.value); return step() }) }; return step() };"
+      "var src = function (items) { return new ReadableStream({ start: function (c) { items.forEach(function (i) { c.enqueue(i) }); c.close() } }) };"
+      "collect(src(['a', 'b'])).then(function (v) { note('basic')(v.join()) });"
+      "var n = 0; collect(new ReadableStream({ pull: function (c) { if (n < 3) c.enqueue(n++); else c.close() } })).then(function (v) { note('pull')(v.join()) });"
+      "var pair = src([1, 2]).tee(); Promise.all([collect(pair[0]), collect(pair[1])]).then(function (v) { note('tee')(v[0].join() + '/' + v[1].join()) });"
+      "var locked = new ReadableStream(), reader = locked.getReader(); out.push('locked=' + locked.locked); reader.releaseLock(); out.push('unlocked=' + !locked.locked);"
+      "var cancelled = ''; new ReadableStream({ cancel: function (r) { cancelled = r } }).cancel('why').then(function () { note('cancel')(cancelled) });"
+      "new ReadableStream({ start: function (c) { c.error(new Error('boom')) } }).getReader().read().then(null, function (e) { note('error')(e.message) });"
+      "var seen = []; var ws = new WritableStream({ write: function (c) { seen.push(c) }, close: function () { seen.push('closed') } }); var w = ws.getWriter();"
+      "w.write('x').then(function () { return w.write('y') }).then(function () { return w.close() }).then(function () { note('writable')(seen.join()) });"
+      "var piped = []; src(['p', 'q']).pipeTo(new WritableStream({ write: function (c) { piped.push(c) } })).then(function () { note('pipeTo')(piped.join()) });"
+      "collect(src(['a', 'b']).pipeThrough(new TransformStream({ transform: function (c, ctl) { ctl.enqueue(c.toUpperCase()) } }))).then(function (v) { note('transform')(v.join()) });"
+      "collect(src(['h\\u00e9llo']).pipeThrough(new TextEncoderStream()).pipeThrough(new TextDecoderStream())).then(function (v) { note('text')(v.join() === 'h\\u00e9llo') });"
+      "collect(src([new TextEncoder().encode('hello hello hello')]).pipeThrough(new CompressionStream('gzip')).pipeThrough(new DecompressionStream('gzip'))).then(function (v) { note('gzip')(new TextDecoder().decode(v[0])) });"
+      "collect(src([new TextEncoder().encode('abcabcabc')]).pipeThrough(new CompressionStream('deflate')).pipeThrough(new DecompressionStream('deflate'))).then(function (v) { note('deflate')(new TextDecoder().decode(v[0])) });"
+      "collect(src([new TextEncoder().encode('raw')]).pipeThrough(new CompressionStream('deflate-raw')).pipeThrough(new DecompressionStream('deflate-raw'))).then(function (v) { note('raw')(new TextDecoder().decode(v[0])) });"
+      "collect(src([new Uint8Array([1, 2, 3])]).pipeThrough(new DecompressionStream('gzip'))).then(note('badgzip'), bad('badgzip'));"
+      "try { new CompressionStream('zip') } catch (e) { out.push('format!' + e.name) }"
+      "new Response('hello').body.getReader().read().then(function (x) { note('body')(x.value.length) });"
+      "var r1 = new Response('x'); r1.body.getReader(); r1.text().then(null, bad('lockedtext'));"
+      "new Response(src([new TextEncoder().encode('from stream')])).text().then(note('streamed'));"
+      "var r2 = new Response('twice'), c2 = r2.clone(); Promise.all([r2.text(), c2.text()]).then(function (v) { note('clone')(v.join()) });"
+      "new Request('/x', { method: 'POST', body: src([new TextEncoder().encode('up')]), duplex: 'half' }).text().then(note('reqstream'));"
+      "try { new Request('/x', { method: 'POST', body: new ReadableStream() }) } catch (e) { out.push('duplex!' + e.name) }"
+      "collect(new Blob(['blobby']).stream()).then(function (v) { note('blob')(new TextDecoder().decode(v[0])) });"
+      "var it = src([1, 2]).values(), seq = []; var walk = function () { return it.next().then(function (r) { if (r.done) return seq.join(); seq.push(r.value); return walk() }) }; walk().then(note('iterator'));"
+      "var byob = new ReadableStream({ type: 'bytes', start: function (c) { c.enqueue(new Uint8Array([1, 2, 3, 4])); c.close() } }).getReader({ mode: 'byob' }); byob.read(new Uint8Array(2)).then(function (x) { note('byob')(x.value.length + ':' + x.value[0] + x.value[1]) });"
+      "out.push('strategy=' + new CountQueuingStrategy({ highWaterMark: 3 }).size() + new ByteLengthQueuingStrategy({ highWaterMark: 5 }).size(new Uint8Array(7)));"
+      "ReadableStream.from(['i', 'j']) && collect(ReadableStream.from(['i', 'j'])).then(function (v) { note('from')(v.join()) });"
+      "new Response('ab').arrayBuffer().then(function (b) { note('arraybuffer')((b instanceof ArrayBuffer) + ':' + b.byteLength) });"
+      "out.push('guard=' + Array.from(new Request('/x', { headers: { Cookie: 'x', 'X-Ok': '1', Host: 'h', 'Sec-Test': '1' } }).headers).join(';'));"
+      "out.push('nocors=' + Array.from(new Request('/x', { mode: 'no-cors', headers: { 'X-Custom': '1', Accept: 'x', 'Content-Type': 'text/plain' } }).headers).join(';'));"
+      "try { new Request('/a', { mode: 'navigate' }) } catch (e) { out.push('navigate!' + e.name) }"
+      "out.push('decoders=' + new TextDecoder('utf-16le').decode(new Uint8Array([104, 0, 105, 0])) + new TextDecoder('utf-16be').decode(new Uint8Array([0, 104])) + (new TextDecoder('windows-1252').decode(new Uint8Array([0x80])) === '\\u20ac'));"
+      "var dec = new TextDecoder(), bytes = new TextEncoder().encode('\\u00e9'); out.push('partial=' + (dec.decode(bytes.subarray(0, 1), { stream: true }) === '') + (dec.decode(bytes.subarray(1)) === '\\u00e9'));"
+      "setTimeout(function () { console.log(out.sort().join(' | ')) }, 100);",
+      "arraybuffer=true:2 | badgzip!TypeError | basic=a,b | blob=blobby | body=5 | byob=2:12 | cancel=why | clone=twice,twice | decoders=hi" "h" "true | deflate=abcabcabc | duplex!TypeError | error=boom | format!TypeError"
+      " | from=i,j | guard=x-ok,1 | gzip=hello hello hello | iterator=1,2 | locked=true | lockedtext!TypeError | navigate!TypeError | nocors=accept,x;content-type,text/plain | partial=truetrue"
+      " | pipeTo=p,q | pull=0,1,2 | raw=raw | reqstream=up | strategy=17 | streamed=from stream | tee=1,2/1,2 | text=true | transform=A,B | unlocked=true | writable=x,y,closed"));
+}
+
 int main(int argc, char** argv) {
   if (const char* probe = getenv("PROBE")) {   // runs a script file in a page and prints what it logged (for looking at what an API has)
     std::string script;
@@ -3621,6 +4072,8 @@ int main(int argc, char** argv) {
   test_xhr();
   test_fetch_wire();
   test_storage();
+  test_cookies_web();
+  test_navigation();
   test_messaging();
   test_history_api();
   test_scripts_during_load();
@@ -3644,6 +4097,8 @@ int main(int argc, char** argv) {
   test_fullscreen();
   test_picture_in_picture();
   test_platform();
+  test_fetch_xhr_full();
+  test_streams();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

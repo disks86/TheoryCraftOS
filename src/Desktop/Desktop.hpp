@@ -32,6 +32,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/FileProperties.hpp"
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
@@ -39,6 +40,7 @@
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/WebBrowser.hpp"
+#include "Desktop/BrowserStore.hpp"
 #include "Desktop/SessionStore.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
@@ -135,6 +137,10 @@ class Desktop {
   // Returns the window (nullptr if memory ran out).
   Paint* open_paint(gui::TabFrame* into = nullptr);
   Notepad& notepad() { return notepad_; }
+  FileProperties& file_properties() { return file_properties_; }
+  // Opens the properties window of the file or folder at `path`, or brings it forward showing that one. It is reached from the file explorer's
+  // context menu.
+  void open_file_properties(StringView path);
   // The databases programs may connect to (nullptr: none). It must outlive the desktop.
   void set_databases(database::DatabaseManager* databases);
   database::DatabaseManager* databases() const { return databases_; }
@@ -147,6 +153,10 @@ class Desktop {
   // same way; a file that has gone is skipped, the window opens empty. Call it once at start-up, after the file system and the settings are set and
   // before the desktop runs. Both return how many windows they dealt with. The setting "desktop"/"restore_session" (true by default) switches it off.
   uint32_t save_session();
+  // --- The web browser's data. save_browser_data() writes the cookies that outlive a session and localStorage to the system database; restore_browser_data() reads
+  // them back (call it before the first page is opened). The desktop also saves by itself every half minute when something changed. Both return how many items.
+  uint32_t save_browser_data();
+  uint32_t restore_browser_data();
   uint32_t restore_session();
   // Opens a database query window: the first one is database_query() (when that is closed), further ones are made as needed and go away when closed.
   DatabaseQuery* open_database_query(gui::TabFrame* into = nullptr);
@@ -254,6 +264,7 @@ class Desktop {
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
   static void on_calculator(void* self, gui::Control&);
+  static void on_explorer_properties(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
   static void on_files_changed(void* self, gui::Control&);
@@ -284,6 +295,7 @@ class Desktop {
   void setup_spreadsheet(Spreadsheet& sheet);
   void setup_database_query(DatabaseQuery& query);
   void setup_web_browser(WebBrowser& web);
+  static bool open_script_window(void* self, WebBrowser& from, StringView address);
   static uint64_t unix_ms(void* self);
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
@@ -319,6 +331,7 @@ class Desktop {
   FileExplorer explorer_;
   ComputerManager computer_manager_;
   Notepad notepad_;
+  FileProperties file_properties_;
   Paint paint_;
   Spreadsheet spreadsheet_;
   DatabaseQuery database_query_;
@@ -344,6 +357,9 @@ class Desktop {
   database::local::SystemSettings* settings_ = nullptr;
   String database_url_;
   UniquePointer<SessionStore> sessions_;
+  UniquePointer<BrowserStore> browser_store_;
+  uint64_t saved_cookie_version_ = 0, saved_storage_version_ = 0, last_browser_save_us_ = 0;
+  bool browser_data_restored_ = false;
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;
   List<UniquePointer<Paint>> extra_paints_;

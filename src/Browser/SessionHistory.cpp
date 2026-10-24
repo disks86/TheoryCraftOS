@@ -39,10 +39,32 @@ bool SessionHistory::navigate(StringView address, uint32_t document) {
   Entry e(allocator_);
   if (!e.address.assign(address)) return false;
   e.document = document;
+  stamp(e, false);
   if (!entries_.push_back(util::move(e))) return false;
   ++index_;
   trim();
   return true;
+}
+
+void SessionHistory::replace_navigation(StringView address, uint32_t document) {
+  if (index_ < 0) {
+    navigate(address, document);
+    return;
+  }
+  Entry& e = entries_[static_cast<uint64_t>(index_)];
+  e.address.assign(address);
+  e.document = document;
+  e.state.clear();
+  e.has_state = false;
+  e.nav_state.clear();
+  e.has_nav_state = false;
+  stamp(e, true);
+}
+
+int64_t SessionHistory::find_key(uint64_t key) const {
+  for (uint64_t i = 0; i < entries_.count(); ++i)
+    if (entries_[i].key == key) return static_cast<int64_t>(i);
+  return -1;
 }
 
 void SessionHistory::replace_current(StringView address, uint32_t document) {
@@ -64,6 +86,7 @@ bool SessionHistory::push_state(StringView address, StringView state, bool has_s
     e.address.assign(address);
     e.state.assign(state);
     e.has_state = has_state;
+    stamp(e, true);
     return true;
   }
   while (static_cast<int64_t>(entries_.count()) > index_ + 1) entries_.remove_at(entries_.count() - 1);
@@ -71,6 +94,7 @@ bool SessionHistory::push_state(StringView address, StringView state, bool has_s
   if (!e.address.assign(address) || !e.state.assign(state)) return false;
   e.has_state = has_state;
   e.document = document;
+  stamp(e, false);
   if (!entries_.push_back(util::move(e))) return false;
   ++index_;
   trim();

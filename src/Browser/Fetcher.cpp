@@ -325,7 +325,19 @@ bool fetch_resource(allocators::IAllocator& allocator, IPageLoader& loader, Cook
         headers.append(page_origin.view());
         headers.append("\r\n");
       }
-      if (has_page && !(page.scheme.equals("https") && current.scheme.equals("http"))) {   // the referrer: the whole address within the origin, the origin alone otherwise
+      if (opt.referrer_given) {   // what the page's Request said
+        StringView value = opt.referrer;
+        if (!value.empty() && hop_cross && (opt.referrer_policy.empty() || opt.referrer_policy.equals("strict-origin-when-cross-origin") || opt.referrer_policy.equals("origin-when-cross-origin"))) {
+          const uint64_t scheme_end = value.find("://");
+          const uint64_t path = scheme_end == StringView::npos ? StringView::npos : value.find('/', scheme_end + 3);
+          if (path != StringView::npos) value = value.first(path + 1);   // (the origin and its slash)
+        }
+        if (!value.empty() && has_page && !(page.scheme.equals("https") && current.scheme.equals("http") && !opt.referrer_policy.equals("unsafe-url"))) {
+          headers.append("Referer: ");
+          headers.append(value);
+          headers.append("\r\n");
+        }
+      } else if (has_page && !(page.scheme.equals("https") && current.scheme.equals("http"))) {   // the referrer: the whole address within the origin, the origin alone otherwise
         headers.append("Referer: ");
         if (page.same_origin(current)) {
           WebUrl bare(allocator);
@@ -348,7 +360,8 @@ bool fetch_resource(allocators::IAllocator& allocator, IPageLoader& loader, Cook
         headers.append("\r\n");
       }
     }
-    const bool send_cookies = navigate || opt.mode == FetchOptions::Mode::Subresource || opt.credentials == FetchOptions::Credentials::Include || (opt.credentials == FetchOptions::Credentials::SameOrigin && !hop_cross);
+    const bool third_party = opt.block_third_party_cookies && has_page && !navigate && !same_site(allocator, page, current);
+    const bool send_cookies = !third_party && (navigate || opt.mode == FetchOptions::Mode::Subresource || opt.credentials == FetchOptions::Credentials::Include || (opt.credentials == FetchOptions::Credentials::SameOrigin && !hop_cross));
     if (send_cookies) {
       CookieJar::Site site = CookieJar::Site::SameSite;
       if (has_page && !same_site(allocator, page, current)) site = navigate && method.equals("GET") ? CookieJar::Site::CrossSiteNavigation : CookieJar::Site::CrossSiteRequest;
@@ -465,6 +478,19 @@ bool fetch_resource(allocators::IAllocator& allocator, IPageLoader& loader, Cook
     response->body.clear();
     if (!response->body.append(answer.body.view())) return fail("out of memory");
     current.serialize(&response->url, false);
+    StringView clear;
+    if (header_value(answer.headers.view(), "Clear-Site-Data", &clear) && (current.scheme.equals("https") || current.host.equals("localhost") || current.host.equals("127.0.0.1"))) {
+      // "cookies", "storage", "cache" or "*" (quoted, separated by commas)
+      StringView rest = clear, token;
+      while (rest.next_token(',', &token)) {
+        token = token.trimmed();
+        if (token.starts_with('"') && token.ends_with('"') && token.size() >= 2) token = token.substr(1, token.size() - 2);
+        if (token.equals("cookies") || token.equals("*")) response->clear_site_data |= 1;
+        if (token.equals("storage") || token.equals("*")) response->clear_site_data |= 2;
+        if (token.equals("cache") || token.equals("*")) response->clear_site_data |= 4;
+      }
+      if (response->clear_site_data & 1) cookies.remove_host(current.host.view());
+    }
     return true;
   }
 }

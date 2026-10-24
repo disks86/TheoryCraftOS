@@ -56,6 +56,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       web_browser_(allocator),
       terminal_(allocator),
       calculator_(allocator),
+      file_properties_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
       display_confirm_dialog_(allocator),
@@ -198,6 +199,7 @@ bool Desktop::on_shortcut(void* self, const KeyArgs& args) {
 void Desktop::set_file_system(filesystem::IFileSystem* fs) {
   window_.locked([&] {
     fs_ = fs;
+    file_properties_.set_file_system(fs);
     explorer_.set_file_system(fs);
     notepad_.set_file_system(fs);
     paint_.set_file_system(fs);
@@ -223,6 +225,7 @@ void Desktop::setup_explorer(FileExplorer& explorer) {
   explorer.set_clock(&now_us_);
   explorer.on_file_opened({&Desktop::on_explorer_file, this});
   explorer.on_files_changed({&Desktop::on_files_changed, this});
+  explorer.on_properties({&Desktop::on_explorer_properties, this});
   explorer.set_transfer_dialog(&copy_progress_);
   explorer.set_file_system(fs_);
 }
@@ -262,6 +265,17 @@ void Desktop::setup_web_browser(WebBrowser& web) {
   web.set_shared_hubs(&local_storage_, &page_hub_);
   web.set_clock(&Desktop::unix_ms, this);
   web.set_media_services(media_mixer_, media_codecs_, media_clock_);
+  web.set_open_window_handler(&Desktop::open_script_window, this);
+}
+
+// window.open() of a page: another browser tab next to the page's (or a window of its own), showing the address. It may close itself with window.close().
+bool Desktop::open_script_window(void* self, WebBrowser& from, StringView address) {
+  auto* d = static_cast<Desktop*>(self);
+  Frame* host = from.host();
+  WebBrowser* opened = d->open_web_browser(host ? host->as_tabs() : nullptr);
+  if (!opened) return false;
+  opened->set_opened_by_script(true);
+  return opened->navigate(address);
 }
 
 // The local time of the taskbar clock as milliseconds since 1970 (what a script's Date.now() says; 0 without a clock).
@@ -296,6 +310,7 @@ void Desktop::set_settings(database::local::SystemSettings* settings, StringView
   window_.locked([&] {
     settings_ = settings;
     sessions_ = settings ? UniquePointer<SessionStore>::make(allocator_, allocator_, settings->database()) : UniquePointer<SessionStore>();
+    browser_store_ = settings ? UniquePointer<BrowserStore>::make(allocator_, allocator_, settings->database()) : UniquePointer<BrowserStore>();
     database_url_.assign(database_url);
     database_query_.set_settings(settings, database_url_.view());
     for (auto& q : extra_queries_) q->set_settings(settings, database_url_.view());
@@ -631,6 +646,21 @@ void Desktop::on_network_properties(void* self, Control&) {
   d->open_network_properties(d->computer_manager_.network_adapter());
 }
 
+void Desktop::open_file_properties(StringView path) {
+  window_.locked([&] {
+    file_properties_.show(path);
+    if (file_properties_.manager()) file_properties_.activate();
+    else windows_.add_window(&file_properties_);
+  });
+}
+
+void Desktop::on_explorer_properties(void* self, Control& sender) {
+  auto* d = static_cast<Desktop*>(self);
+  String path(d->allocator_);
+  path.assign(static_cast<FileExplorer&>(sender).properties_path());
+  d->open_file_properties(path.view());
+}
+
 void Desktop::on_display_settings(void* self, Control&) { static_cast<Desktop*>(self)->open_display_settings(); }
 bool Desktop::apply_changes_thunk(void* self) { return static_cast<Desktop*>(self)->apply_monitor_changes(); }
 
@@ -872,6 +902,10 @@ void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   input_.pump();
   web_browser_.tick(uptime_us);
+  if (browser_store_ && browser_data_restored_ && uptime_us - last_browser_save_us_ > 30000000ull) {   // (the data of the browser is saved when it changed, at most every half minute)
+    last_browser_save_us_ = uptime_us;
+    if (cookie_jar_.version() != saved_cookie_version_ || local_storage_.version() != saved_storage_version_) save_browser_data();
+  }
   for (uint64_t i = 0; i < extra_browsers_.count(); ++i) extra_browsers_[i]->tick(uptime_us);
   if (__atomic_exchange_n(&reap_needed_, false, __ATOMIC_ACQ_REL)) reap_closed();
   // Watchdog: a changed window that the render thread has not redrawn for seconds means that thread (or

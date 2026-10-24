@@ -44,9 +44,13 @@ bool StorageArea::set(StringView key, StringView value) {
     total += keys_[i].size() + values_[i].size();
   }
   if (total > (5u << 20) || (at < 0 && keys_.count() >= 10000)) return false;   // (the storage limit: about 5 MB)
-  if (at >= 0) return values_[static_cast<uint64_t>(at)].assign(value);
+  if (at >= 0) {
+    ++version_;
+    return values_[static_cast<uint64_t>(at)].assign(value);
+  }
   String k(allocator_), v(allocator_);
   if (!k.assign(key) || !v.assign(value)) return false;
+  ++version_;
   return keys_.push_back(util::move(k)) && values_.push_back(util::move(v));
 }
 
@@ -55,12 +59,25 @@ bool StorageArea::remove(StringView key) {
     if (keys_[i].view().equals(key)) {
       keys_.remove_at(i);
       values_.remove_at(i);
+      ++version_;
       return true;
     }
   }
   return false;
 }
 
+
+uint64_t StorageArea::bytes() const {
+  uint64_t total = 0;
+  for (uint64_t i = 0; i < keys_.count(); ++i) total += keys_[i].size() + values_[i].size();
+  return total;
+}
+
+uint64_t StorageHub::version() const {
+  uint64_t sum = origins_.count() + clears_;
+  for (uint64_t i = 0; i < origins_.count(); ++i) sum += origins_[i]->area.version();
+  return sum;
+}
 
 StorageArea& StorageHub::area(StringView origin) {
   for (uint64_t i = 0; i < origins_.count(); ++i)

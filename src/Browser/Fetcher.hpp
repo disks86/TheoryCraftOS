@@ -46,6 +46,11 @@ struct FetchOptions {
   uint64_t now_ms = 0;       // for cookie expiry
   uint32_t timeout_ms = 0;
   uint32_t max_redirects = 20;
+  // The Referer the page's Request asked for (its referrer and referrer policy, already applied: "" sends none). Unset: the default of the browser.
+  bool block_third_party_cookies = false;   // cookies of other sites than the page's are neither sent nor kept
+  bool referrer_given = false;
+  StringView referrer;
+  StringView referrer_policy;   // "" is the default (strict-origin-when-cross-origin): a redirect to another origin cuts the address down to the origin
   bool allow_data = true;
 };
 

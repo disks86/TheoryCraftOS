@@ -17,6 +17,7 @@
  */
 
 #include "Browser/CookieJar.hpp"
+#include "Browser/PublicSuffix.hpp"
 #include "Utility/Move.hpp"
 
 namespace browser {
@@ -260,6 +261,8 @@ bool CookieJar::store(StringView set_cookie, const WebUrl& url, uint64_t now_ms,
       cookie.secure = true;
     } else if (name.equals_ignore_case("HttpOnly")) {
       cookie.http_only = true;
+    } else if (name.equals_ignore_case("Partitioned")) {
+      cookie.partitioned = true;
     } else if (name.equals_ignore_case("SameSite")) {
       cookie.same_site = value.equals_ignore_case("Strict") ? 2 : value.equals_ignore_case("None") ? 3 : 1;
     }
@@ -270,15 +273,19 @@ bool CookieJar::store(StringView set_cookie, const WebUrl& url, uint64_t now_ms,
   if (cookie.http_only && from_script) return false;
   if (cookie.secure && !secure_origin) return false;
   if (cookie.same_site == 3 && !cookie.secure) return false;
+  if (cookie.partitioned && !cookie.secure) return false;
   const StringView prefixed = cookie.name.view();
   if (prefixed.starts_with("__Secure-") && !cookie.secure) return false;
   if (prefixed.starts_with("__Host-") && (!cookie.secure || has_domain || !has_path || !path_attr.equals("/"))) return false;
+  if (has_domain && !is_ip_address(host) && is_public_suffix(domain_attr.view())) {
+    if (!domain_attr.view().equals(host)) return false;   // (a Domain that is a public suffix: refused, unless the host is that very name - then it is a host cookie)
+    has_domain = false;
+  }
   if (has_domain) {
     if (is_ip_address(host)) {
       if (!domain_attr.view().equals(host)) return false;
     } else {
       if (!domain_matches(host, domain_attr.view())) return false;
-      if (domain_attr.view().find('.') == StringView::npos && !domain_attr.view().equals(host)) return false;   // ("com": no public suffix list, so a bare label is refused)
     }
     cookie.host_only = false;   // (a Domain attribute makes it a domain cookie, even when it names the host itself)
     cookie.domain.assign(domain_attr.view());
@@ -306,6 +313,7 @@ bool CookieJar::store(StringView set_cookie, const WebUrl& url, uint64_t now_ms,
       cookie.order = old.order;
     }
     cookies_.remove_at(i);
+    bump();
     break;
   }
   if (expired) return true;
@@ -315,6 +323,7 @@ bool CookieJar::store(StringView set_cookie, const WebUrl& url, uint64_t now_ms,
   }
   cookie.accessed = now_ms;
   if (!cookies_.push_back(util::move(cookie))) return false;
+  bump();
   enforce_limits(host);
   return true;
 }
@@ -337,6 +346,7 @@ void CookieJar::enforce_limits(StringView host) {
     drop_oldest(true);
   }
   while (cookies_.count() > kMaxCookies) drop_oldest(false);
+  bump();
 }
 
 void CookieJar::remove_expired(uint64_t now_ms) {
@@ -346,13 +356,94 @@ void CookieJar::remove_expired(uint64_t now_ms) {
 
 void CookieJar::remove_expired_locked(uint64_t now_ms) {
   for (uint64_t i = cookies_.count(); i > 0; --i)
-    if (cookies_[i - 1].expires_ms >= 0 && cookies_[i - 1].expires_ms <= static_cast<int64_t>(now_ms)) cookies_.remove_at(i - 1);
+    if (cookies_[i - 1].expires_ms >= 0 && cookies_[i - 1].expires_ms <= static_cast<int64_t>(now_ms)) {
+      cookies_.remove_at(i - 1);
+      bump();
+    }
+}
+
+void CookieJar::snapshot_persistent(uint64_t now_ms, List<Cookie>* out) {
+  kernel::ScopedMutex lock(mutex_);
+  for (uint64_t i = 0; i < cookies_.count(); ++i) {
+    const Cookie& c = cookies_[i];
+    if (c.expires_ms < 0 || c.expires_ms <= static_cast<int64_t>(now_ms)) continue;
+    Cookie copy(allocator_);
+    copy.name.assign(c.name.view());
+    copy.value.assign(c.value.view());
+    copy.domain.assign(c.domain.view());
+    copy.path.assign(c.path.view());
+    copy.host_only = c.host_only; copy.secure = c.secure; copy.http_only = c.http_only; copy.partitioned = c.partitioned;
+    copy.same_site = c.same_site; copy.expires_ms = c.expires_ms; copy.created = c.created; copy.accessed = c.accessed; copy.order = c.order;
+    out->push_back(util::move(copy));
+  }
+}
+
+bool CookieJar::restore(Cookie&& cookie) {
+  kernel::ScopedMutex lock(mutex_);
+  if (cookies_.count() >= kMaxCookies) return false;
+  if (cookie.order >= next_order_) next_order_ = cookie.order + 1;
+  if (!cookies_.push_back(util::move(cookie))) return false;
+  bump();
+  return true;
+}
+
+void CookieJar::list_for_script(const WebUrl& url, uint64_t now_ms, List<Cookie>* out) {
+  kernel::ScopedMutex lock(mutex_);
+  remove_expired_locked(now_ms);
+  const bool secure_origin = secure_url(url);
+  const StringView host = url.host.view();
+  const StringView path = url.path.empty() ? StringView("/") : url.path.view();
+  List<uint32_t> chosen(allocator_);
+  for (uint64_t i = 0; i < cookies_.count(); ++i) {
+    const Cookie& c = cookies_[i];
+    if (c.host_only ? !c.domain.equals(host) : !domain_matches(host, c.domain.view())) continue;
+    if (!path_matches(path, c.path.view()) || (c.secure && !secure_origin) || c.http_only) continue;
+    chosen.push_back(static_cast<uint32_t>(i));
+  }
+  for (uint64_t a = 1; a < chosen.count(); ++a) {
+    const uint32_t key = chosen[a];
+    uint64_t b = a;
+    while (b > 0) {
+      const Cookie& x = cookies_[chosen[b - 1]];
+      const Cookie& y = cookies_[key];
+      if (!(y.path.size() > x.path.size() || (y.path.size() == x.path.size() && y.order < x.order))) break;
+      chosen[b] = chosen[b - 1];
+      --b;
+    }
+    chosen[b] = key;
+  }
+  for (uint64_t i = 0; i < chosen.count(); ++i) {
+    const Cookie& c = cookies_[chosen[i]];
+    Cookie copy(allocator_);
+    copy.name.assign(c.name.view());
+    copy.value.assign(c.value.view());
+    copy.domain.assign(c.domain.view());
+    copy.path.assign(c.path.view());
+    copy.host_only = c.host_only; copy.secure = c.secure; copy.partitioned = c.partitioned; copy.same_site = c.same_site; copy.expires_ms = c.expires_ms;
+    out->push_back(util::move(copy));
+  }
+}
+
+bool CookieJar::remove_cookie(StringView name, StringView domain, StringView path, bool host_only) {
+  kernel::ScopedMutex lock(mutex_);
+  for (uint64_t i = 0; i < cookies_.count(); ++i) {
+    const Cookie& c = cookies_[i];
+    if (c.name.view().equals(name) && c.domain.view().equals(domain) && c.path.view().equals(path) && c.host_only == host_only) {
+      cookies_.remove_at(i);
+      bump();
+      return true;
+    }
+  }
+  return false;
 }
 
 void CookieJar::remove_host(StringView host) {
   kernel::ScopedMutex lock(mutex_);
   for (uint64_t i = cookies_.count(); i > 0; --i)
-    if (domain_matches(host, cookies_[i - 1].domain.view()) || domain_matches(cookies_[i - 1].domain.view(), host)) cookies_.remove_at(i - 1);
+    if (domain_matches(host, cookies_[i - 1].domain.view()) || domain_matches(cookies_[i - 1].domain.view(), host)) {
+      cookies_.remove_at(i - 1);
+      bump();
+    }
 }
 
 void CookieJar::header_for(const WebUrl& url, uint64_t now_ms, Site site, bool for_script, String* out) {

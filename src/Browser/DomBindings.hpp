@@ -46,13 +46,19 @@ class StorageArea {
   bool set(StringView key, StringView value);
   bool remove(StringView key);
   void clear() {
+    if (keys_.count() != 0) ++version_;
     keys_.clear();
     values_.clear();
   }
+  // Goes up with every change (for whoever saves the storage), and the bytes it holds (keys and values).
+  uint64_t version() const { return version_; }
+  uint64_t bytes() const;
+  StringView value_at(uint32_t i) const { return i < values_.count() ? values_[i].view() : StringView(); }
 
  private:
   allocators::IAllocator& allocator_;
   List<String> keys_, values_;
+  uint64_t version_ = 0;
 };
 
 // What the bindings need from the page they live in.
@@ -68,6 +74,14 @@ class IDomHost {
   // history.pushState() / replaceState(): the address, and the state as JSON text (`has_state` false: none). history.state reads the entry the page is on.
   virtual void push_state(StringView address, StringView state_json, bool has_state, bool replace) = 0;
   virtual bool history_state(String* json) = 0;
+  // The Navigation API's view of the session history (see IPageEnvironment), window.open() and window.close(), document.referrer, and Element.scrollIntoView().
+  virtual bool history_entries(String* json, int64_t* index) { (void)json; (void)index; return false; }
+  virtual void set_navigation_state(StringView json, bool has_state) { (void)json; (void)has_state; }
+  virtual void history_go_to_key(uint64_t key) { (void)key; }
+  virtual bool open_window(StringView address, StringView target, bool noopener) { (void)address; (void)target; (void)noopener; return false; }
+  virtual void close_window() {}
+  virtual StringView referrer() { return StringView(); }
+  virtual void scroll_node_into_view(dom::Node* node) { (void)node; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
@@ -99,6 +113,11 @@ class IDomHost {
   // document.cookie: what scripts of this page can read, and what a script's assignment does (the cookie jar of the browser, for this page's address).
   virtual void cookie_get(String* out) = 0;
   virtual void cookie_set(StringView text) = 0;
+  // The Cookie Store API: the cookies a script of the page can see for `url` (relative to the page; "" for the page itself; only the page's own origin), one per line,
+  // fields separated by tabs: name, value, domain, path, expires (ms since 1970, -1 for a session cookie), secure, sameSite (0 none given, 1 lax, 2 strict, 3 none), partitioned, hostOnly.
+  // And a Set-Cookie string stored as document.cookie would: true if the cookie was kept (or removed an older one).
+  virtual void cookie_details(StringView url, String* out) { (void)url; (void)out; }
+  virtual bool cookie_write(StringView text) { (void)text; return false; }
   // fetch() and XMLHttpRequest: sends a request (cookies, redirects and the cross-origin rules included; see Fetcher.hpp). False (with response->error) if it failed.
   virtual bool http_request(const FetchOptions& options, NetResponse* response) = 0;
   // The origin of the page ("https://example.com", or "null" for a file or a page without an address).
@@ -209,7 +228,8 @@ class DomBindings {
     static HookArg of(double n) { HookArg a; a.kind = Kind::Number; a.number = n; return a; }
     static HookArg of(StringView s) { HookArg a; a.kind = Kind::String; a.text = s; return a; }
   };
-  bool call_hook(StringView name, const HookArg* args, uint32_t count);
+  // `result` (optional) gets the value the function returned as text ("" for undefined and null).
+  bool call_hook(StringView name, const HookArg* args, uint32_t count, String* result = nullptr);
   // The same, as a task of its own: it runs when the event loop gets to it (the next timer turn), not now.
   void schedule_hook(StringView name, const HookArg* args, uint32_t count);
 

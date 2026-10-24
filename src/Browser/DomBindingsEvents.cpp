@@ -376,8 +376,17 @@ bool invoke(DomBindings::Impl& c, dom::Node* node, JsObject* current, StringView
   if (phase == Phase::Target || phase == Phase::Bubble) {
     Value handler;
     if (inline_handler(c, node, current, type, &handler)) {
-      Value ignored;
-      if (!vm.call(handler, Value::make_object(current), &event, 1, &ignored)) report_error(c, type);
+      Value returned;
+      if (!vm.call(handler, Value::make_object(current), &event, 1, &returned)) {
+        report_error(c, type);
+      } else if (!returned.is_nullish() && type != StringView("error")) {   // what an on<type> handler returns: false cancels; for beforeunload any value asks
+        Value cancelable;
+        const bool before_unload = type == StringView("beforeunload");
+        if ((before_unload || (returned.is_bool() && !Vm::to_boolean(returned))) && vm.get_plain(e, vm.intern("cancelable"), &cancelable) && Vm::to_boolean(cancelable)) {
+          vm.define_named(e, "defaultPrevented", bool_value(true));
+          if (before_unload && returned.is_string()) vm.define_named(e, "returnValue", returned);
+        }
+      }
       if (event_flag(vm, e, "__stopi")) return false;
     }
   }

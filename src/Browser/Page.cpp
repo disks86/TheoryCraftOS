@@ -99,6 +99,7 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       frame_windows_(allocator),
       storage_origin_(allocator),
       state_json_(allocator),
+      referrer_(allocator),
       focus_value_(allocator),
       invalid_text_(allocator),
       style_cache_(allocator),
@@ -187,12 +188,14 @@ bool Page::load(StringView html) {
     plain.bubbles = false;
     bindings_->dispatch(doc_.root(), "readystatechange", plain);
     bindings_->dispatch(nullptr, "load", plain);   // (load is the window's)
+    bindings_->call_hook("__fire_pageshow", nullptr, 0);
     if (bindings_->errors()) {
       String text(allocator_);
       bindings_->take_error(&text);
       note_error(text.view());
     }
   }
+  if (address_.view().find('#') != StringView::npos) fragment_pending_ = true;
   for (dom::Node* n = doc_.root(); n; n = dom::next_in_tree(n, doc_.root())) {   // autofocus
     if (n->is_element() && dom::has_attribute(n, "autofocus") && dom::is_focusable(n)) {
       set_focus(n);
@@ -382,6 +385,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
     paint_options.doc = &doc_;
     ok = paint::build_display_list(out->tree, paint_options, &out->list);
   }
+  if (ok) resolve_scroll_target(out->tree);
   out->document = &doc_;
   out->viewport_width = media_.width;
   rendered_version_ = doc_.version();
@@ -580,6 +584,121 @@ int32_t Page::take_scroll_request() {
   return r;
 }
 
+// --- leaving, and where the page scrolls to --------------------------------------------------------------------------------------------
+
+bool Page::before_unload() {
+  if (!bindings_) return false;
+  String result(allocator_);
+  bindings_->call_hook("__page_beforeunload", nullptr, 0, &result);
+  flush_errors();
+  return result.view().equals("1");
+}
+
+void Page::unload() {
+  if (!bindings_) return;
+  bindings_->call_hook("__page_unload", nullptr, 0);
+  flush_errors();
+}
+
+bool Page::scroll_restoration_manual() {
+  if (!bindings_) return false;
+  String result(allocator_);
+  bindings_->call_hook("__scroll_manual", nullptr, 0, &result);
+  return result.view().equals("1");
+}
+
+bool Page::meta_refresh(double* seconds, String* address) {
+  for (dom::Node* n = doc_.root(); n; n = dom::next_in_tree(n, doc_.root())) {
+    StringView equiv, content;
+    if (!n->is_tag("meta") || !dom::get_attribute(n, "http-equiv", &equiv) || !equiv.equals_ignore_case("refresh") || !dom::get_attribute(n, "content", &content)) continue;
+    // "5", "5; url=next.html", "0;next.html": the delay, then separator(s), then an optional "url=" and the address
+    const StringView text = content.trimmed();
+    uint64_t i = 0;
+    double delay = 0;
+    bool digits = false;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9') {
+      if (delay < 1e9) delay = delay * 10 + (text[i] - '0');
+      digits = true;
+      ++i;
+    }
+    if (!digits) continue;
+    if (i < text.size() && text[i] == '.') {   // (a fraction is dropped)
+      ++i;
+      while (i < text.size() && text[i] >= '0' && text[i] <= '9') ++i;
+    }
+    StringView rest = text.substr(i).trimmed();
+    if (!rest.empty() && rest[0] != ';' && rest[0] != ',') continue;
+    if (!rest.empty()) rest = rest.substr(1).trimmed();
+    if (rest.size() >= 3 && rest.first(3).equals_ignore_case("url")) {
+      rest = rest.substr(3).trimmed();
+      if (!rest.empty() && rest[0] == '=') rest = rest.substr(1).trimmed();
+    }
+    if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'')) {
+      const char quote = rest[0];
+      rest = rest.substr(1);
+      const uint64_t end = rest.find(quote);
+      if (end != StringView::npos) rest = rest.first(end);
+    }
+    *seconds = delay;
+    if (rest.empty()) address->assign(address_.view());
+    else if (!resolve(rest, address)) continue;
+    return true;
+  }
+  return false;
+}
+
+void Page::scroll_node_into_view(dom::Node* node) {
+  if (node) scroll_node_ = node->serial;
+}
+
+// The vertical place the page should be scrolled to: the fragment of the address (an element with that id, or an <a name>; "" and "top" are the top), or the
+// element scrollIntoView() was called on. Worked out from the layout just made.
+void Page::resolve_scroll_target(const layout::BoxTree& tree) {
+  dom::Node* target = nullptr;
+  bool top = false;
+  if (scroll_node_) {
+    target = doc_.by_serial(scroll_node_);
+  } else if (fragment_pending_) {
+    const uint64_t at = address_.view().find('#');
+    String name(allocator_);
+    if (at != StringView::npos) {
+      const StringView raw = address_.view().substr(at + 1);
+      for (uint64_t i = 0; i < raw.size(); ++i) {   // (percent escapes are undone)
+        auto hex = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+        if (raw[i] == '%' && i + 2 < raw.size() + 0 && hex(raw[i + 1]) >= 0 && hex(raw[i + 2]) >= 0) {
+          name.push_back(static_cast<char>(hex(raw[i + 1]) * 16 + hex(raw[i + 2])));
+          i += 2;
+        } else {
+          name.push_back(raw[i]);
+        }
+      }
+    }
+    if (name.empty() || name.view().equals_ignore_case("top")) top = true;
+    if (!name.empty()) {
+      target = doc_.element_by_id(name.view());
+      for (dom::Node* n = doc_.root(); !target && n; n = dom::next_in_tree(n, doc_.root())) {
+        StringView value;
+        if (n->is_tag("a") && dom::get_attribute(n, "name", &value) && value.equals(name.view())) target = n;
+      }
+      if (target) top = false;
+    }
+  }
+  fragment_pending_ = false;
+  scroll_node_ = 0;
+  if (!target) {
+    if (top) scroll_request_ = 0;
+    return;
+  }
+  for (uint64_t i = 0; i < tree.count(); ++i) {
+    const layout::Box& b = tree.box(static_cast<layout::BoxId>(i));
+    if (b.node != target->serial) continue;
+    int64_t y = 0;
+    for (layout::BoxId id = static_cast<layout::BoxId>(i); id != layout::kNoBox; id = tree.box(id).parent) y += tree.box(id).y.round();
+    scroll_request_ = y < 0 ? 0 : y > 100000000 ? 100000000 : static_cast<int32_t>(y);
+    return;
+  }
+}
+
 // --- Picture-in-Picture ------------------------------------------------------------------------------------------------------------
 
 dom::Node* Page::pip_element() { return pip_serial_ ? doc_.by_serial(pip_serial_) : nullptr; }
@@ -671,6 +790,7 @@ void Page::set_hash(StringView hash) {
   const uint64_t at = address_.view().find('#');
   base.assign(at == StringView::npos ? address_.view() : address_.view().first(at));
   if (hash.size() > 1) base.append(hash);
+  if (hash.size() > 1) fragment_pending_ = true;
   if (base.view().equals(before.view())) {
     env_.set_hash(hash);
     return;
@@ -679,6 +799,7 @@ void Page::set_hash(StringView hash) {
   env_.set_hash(hash);
   if (bindings_) {   // hashchange comes as a task of its own, after the script that changed the fragment has finished
     const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(before.view()), DomBindings::HookArg::of(address_.view())};
+    bindings_->call_hook("__nav_fragment", args, 2);
     bindings_->schedule_hook("__fire_hashchange", args, 2);
   }
 }
@@ -708,6 +829,10 @@ void Page::traverse(StringView address, StringView state_json, bool has_state) {
   state_json_.assign(state_json);
   has_state_ = has_state;
   if (!bindings_) return;
+  {
+    const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(before.view()), DomBindings::HookArg::of(address)};
+    bindings_->call_hook("__nav_traversed", args, 2);
+  }
   bindings_->call_hook("__fire_popstate", nullptr, 0);
   const StringView old_hash = before.view().find('#') == StringView::npos ? StringView() : before.view().substr(before.view().find('#'));
   const StringView new_hash = address.find('#') == StringView::npos ? StringView() : address.substr(address.find('#'));
@@ -1474,7 +1599,7 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
 // --- Frames ------------------------------------------------------------------------------------------------------------------------
 
 bool Page::changed() const {
-  if (doc_.version() != rendered_version_ || media_ != rendered_media_) return true;
+  if (doc_.version() != rendered_version_ || media_ != rendered_media_ || fragment_pending_ || scroll_node_) return true;
   for (uint64_t i = 0; i < frames_.count(); ++i)
     if (frames_[i]->page && frames_[i]->page->changed()) return true;
   return false;
@@ -1657,6 +1782,44 @@ void Page::cookie_set(StringView text) {
   WebUrl url(allocator_);
   if (!WebUrl::parse(allocator_, address_.view(), nullptr, &url) || !(url.scheme.equals("http") || url.scheme.equals("https"))) return;
   env_.cookies().store(text, url, env_.now_ms(), true);
+}
+
+void Page::cookie_details(StringView target, String* out) {
+  WebUrl page_url(allocator_), url(allocator_);
+  if (!WebUrl::parse(allocator_, address_.view(), nullptr, &page_url) || !(page_url.scheme.equals("http") || page_url.scheme.equals("https"))) return;
+  if (target.empty()) url = static_cast<WebUrl&&>(page_url);
+  else {
+    if (!WebUrl::parse(allocator_, target, &page_url, &url) || !page_url.same_origin(url)) return;
+  }
+  List<CookieJar::Cookie> list(allocator_);
+  env_.cookies().list_for_script(url, env_.now_ms(), &list);
+  for (uint64_t i = 0; i < list.count(); ++i) {
+    const CookieJar::Cookie& c = list[i];
+    out->append(c.name.view());
+    out->push_back('\t');
+    out->append(c.value.view());
+    out->push_back('\t');
+    out->append(c.domain.view());
+    out->push_back('\t');
+    out->append(c.path.view());
+    out->push_back('\t');
+    out->append_int(c.expires_ms);
+    out->push_back('\t');
+    out->append_uint(c.secure ? 1 : 0);
+    out->push_back('\t');
+    out->append_uint(c.same_site);
+    out->push_back('\t');
+    out->append_uint(c.partitioned ? 1 : 0);
+    out->push_back('\t');
+    out->append_uint(c.host_only ? 1 : 0);
+    out->push_back('\n');
+  }
+}
+
+bool Page::cookie_write(StringView text) {
+  WebUrl url(allocator_);
+  if (!WebUrl::parse(allocator_, address_.view(), nullptr, &url) || !(url.scheme.equals("http") || url.scheme.equals("https"))) return false;
+  return env_.cookies().store(text, url, env_.now_ms(), true);
 }
 
 // --- Web Workers: a script engine of its own, without the document

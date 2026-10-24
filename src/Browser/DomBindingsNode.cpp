@@ -312,9 +312,10 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (IS("location")) { *out = object_value(c.location); return true; }
     if (IS("activeElement") || IS("scrollingElement")) { *out = node_value(c, IS("activeElement") ? (c.host.focused() ? c.host.focused() : n->owner->body()) : n->owner->document_element()); return true; }
     if (IS("currentScript")) { *out = node_value(c, c.current_script); return true; }
-    if (IS("hidden")) { *out = bool_value(false); return true; }
-    if (IS("visibilityState")) { *out = str_value(vm, "visible"); return true; }
-    if (IS("referrer") || IS("lastModified")) { *out = str_value(vm, ""); return true; }
+    if (IS("hidden")) { *out = bool_value(c.page_hidden); return true; }
+    if (IS("visibilityState")) { *out = str_value(vm, c.page_hidden ? "hidden" : "visible"); return true; }
+    if (IS("referrer")) { *out = str_value(vm, c.host.referrer()); return true; }
+    if (IS("lastModified")) { *out = str_value(vm, ""); return true; }
     if (IS("forms") || IS("images") || IS("links") || IS("scripts") || IS("anchors") || IS("embeds")) {
       List<dom::Node*> list(vm.allocator());
       for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
@@ -1037,6 +1038,14 @@ NATIVE(el_rect) {
   return true;
 }
 
+NATIVE(el_scroll_into_view) {
+  (void)args; (void)argc;
+  dom::Node* n = node_of(self);
+  if (n && n->is_element()) impl(vm).host.scroll_node_into_view(n);
+  *result = Value();
+  return true;
+}
+
 NATIVE(el_empty_list) {
   *result = Value::make_object(vm.new_array());
   return true;
@@ -1531,7 +1540,7 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(ep, "checkVisibility", el_true, 0);
   vm.define_native(ep, "focus", do_nothing, 0);
   vm.define_native(ep, "blur", do_nothing, 0);
-  vm.define_native(ep, "scrollIntoView", do_nothing, 0);
+  vm.define_native(ep, "scrollIntoView", el_scroll_into_view, 0);
   vm.define_native(ep, "scrollTo", do_nothing, 0);
   vm.define_native(ep, "scrollBy", do_nothing, 0);
   vm.define_native(ep, "getElementsByName", node_get_by_name, 1);

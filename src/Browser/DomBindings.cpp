@@ -229,7 +229,7 @@ bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& 
   return !prevented;
 }
 
-bool DomBindings::call_hook(StringView name, const HookArg* args, uint32_t count) {
+bool DomBindings::call_hook(StringView name, const HookArg* args, uint32_t count, String* result) {
   Impl& c = *impl_;
   Value fn;
   if (!vm_.get_named(Value::make_object(vm_.global()), name, &fn) || !Vm::is_callable(fn)) return false;
@@ -255,6 +255,10 @@ bool DomBindings::call_hook(StringView name, const HookArg* args, uint32_t count
       line.append(text.view());
       vm_.host()->console(3, line.view());
     }
+  } else if (result) {
+    result->clear();
+    JsString* text = nullptr;
+    if (!ignored.is_nullish() && vm_.to_string(ignored, &text) && text) result->assign(text->view());
   }
   return ok;
 }

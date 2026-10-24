@@ -247,6 +247,7 @@ add_executable(BOOTX64
   src/Browser/WebPrelude.cpp
   src/Browser/WebUrl.cpp
   src/Browser/CookieJar.cpp
+  src/Browser/PublicSuffix.cpp
   src/Browser/Fetcher.cpp
   src/Browser/PageHub.cpp
   src/Browser/ResourcePrefetcher.cpp
@@ -354,6 +355,7 @@ add_executable(BOOTX64
   src/Desktop/Shell.cpp
   src/Desktop/Terminal.cpp
   src/Desktop/Calculator.cpp
+  src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
   src/Desktop/FileDialog.cpp
@@ -370,6 +372,7 @@ add_executable(BOOTX64
   src/Desktop/DatabaseQuery.cpp
   src/Desktop/WebBrowser.cpp
   src/Desktop/PictureInPicture.cpp
+  src/Desktop/BrowserStore.cpp
   src/Desktop/SessionStore.cpp
   src/Desktop/DesktopSession.cpp
   src/Desktop/Paint.cpp
