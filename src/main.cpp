@@ -476,7 +476,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // otherwise matrix maths spread over the CPU cores by the scheduler.
   hardware::SystemNeuralProcessingUnit system_npu(pci, cpu, scheduler);
   hardware::INeuralProcessingUnit& npu = system_npu.npu();
-  Entry(Level::Ok, "NPU").text(npu.name()).text(", ").dec(npu.compute_units()).text(" compute units");
+  Entry(Level::Ok, "NPU").text(npu.name()).text(", ").dec(npu.compute_units()).text(" compute units; ").text(system_npu.description());
 #ifdef TCOS_SELFTESTS
   if (!run_npu_demo(npu, shared_allocator)) console::puts("NPU self-check failed\n");
 
@@ -544,6 +544,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
     if (info.hardware_engine && !info.accelerated) e.text(" (engine present, not driven yet)");
     if (codec_device.engine_summary()[0]) Entry(Level::Info, "Video").text("  ").text(codec_device.engine_summary());
+    // The engine probe may have read how much video memory the card has: give it to the display device of the same PCI function, for the computer manager.
+    hardware::PciAddress engine_gpu{}, display_gpu{};
+    if (gpu && codec_device.gpu_memory_bytes() && codec_device.gpu_location(&engine_gpu) && gpu->pci_location(&display_gpu) &&
+        engine_gpu.bus == display_gpu.bus && engine_gpu.device == display_gpu.device && engine_gpu.function == display_gpu.function)
+      gpu->set_video_memory_total(codec_device.gpu_memory_bytes());
   }
 
   // Picture, sound and video files: software codecs for every format, JPEG handed to a video engine first when one really accelerates it.

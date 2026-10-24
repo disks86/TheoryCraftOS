@@ -33,11 +33,21 @@ SystemNeuralProcessingUnit::SystemNeuralProcessingUnit(const IPciBus& pci, ICent
                                                        scheduling::ICPUScheduler& scheduler) {
   PciDeviceInfo d;
   for (uint32_t i = 0; !active_ && pci.pci_device(i, &d); ++i) {
-    if (d.vendor_id == IntelNpu::kPciVendor && IntelNpu::matches(d.device_id))
+    if (d.vendor_id == IntelNpu::kPciVendor && IntelNpu::matches(d.device_id)) {
       active_ = new (storage_) IntelNpu(cpu, scheduler);
-    else if (d.vendor_id == AmdXdnaNpu::kPciVendor && AmdXdnaNpu::matches(d.device_id))
+      description_.assign("Intel NPU (");
+      description_.append(IntelNpu::platform(d.device_id));
+      description_.append(")");
+    } else if (d.vendor_id == AmdXdnaNpu::kPciVendor && AmdXdnaNpu::matches(d.device_id)) {
       active_ = new (storage_) AmdXdnaNpu(cpu, scheduler);
+      description_.assign("AMD NPU (");
+      description_.append(AmdXdnaNpu::platform(d.device_id));
+      description_.append(")");
+    }
   }
+  hardware_present_ = active_ != nullptr;
+  if (hardware_present_) description_.append(", computation on the CPU until a native driver exists");
+  else description_.assign("no NPU hardware found, computation on the CPU");
   if (!active_) active_ = new (storage_) SoftwareNeuralProcessingUnit(cpu, scheduler);
   active_->initialize();
 }

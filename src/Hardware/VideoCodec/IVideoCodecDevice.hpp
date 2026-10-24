@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/IHardware.hpp"
 #include "Hardware/VideoCodec/IVideoDecoder.hpp"
 #include "Hardware/VideoCodec/IVideoEncoder.hpp"
@@ -52,6 +53,10 @@ class IVideoCodecDevice : public IHardware {
   // One line on what the device found out about its hardware (the GPU generation, the video engines the probe saw), for the boot log; empty if it has nothing to say.
   // Valid until the device is shut down.
   virtual const char* engine_summary() const { return ""; }
+  // The GPU this engine belongs to, and how much video memory the probe of its hardware found it has (0 = not found). main hands the size to the display
+  // device of the same PCI function, so the computer manager shows the card's memory and not just the framebuffer the firmware set up.
+  virtual bool gpu_location(PciAddress* out) const { (void)out; return false; }
+  virtual uint64_t gpu_memory_bytes() const { return 0; }
 
  protected:
   constexpr IVideoCodecDevice() = default;

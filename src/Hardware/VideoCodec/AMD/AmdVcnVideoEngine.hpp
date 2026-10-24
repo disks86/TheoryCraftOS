@@ -43,6 +43,15 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   void set_registers(const MmioRegion& registers) { registers_ = registers; }
   void set_memory_bar(uint64_t bytes) { memory_bar_ = bytes; }
   uint64_t memory_bar() const { return memory_bar_; }
+  // Which PCI function the engine belongs to (set by SystemVideoCodecs), so what it learns about the memory can be matched to the display device.
+  void set_pci_address(const PciAddress& address) { address_ = address; has_address_ = true; }
+  bool gpu_location(PciAddress* out) const override {
+    if (!has_address_ || !out) return false;
+    *out = address_;
+    return true;
+  }
+  // The card's video memory (probe_video_memory, or the aperture when it was all of it), or the APU's carve-out; 0 when the table was not read.
+  uint64_t gpu_memory_bytes() const override { return status_.video_memory_bytes ? status_.video_memory_bytes : status_.carve_out_bytes; }
 
   // Reads the GPU's IP discovery table (when given a window and the generation has one). Always succeeds: the engine is there either way.
   bool initialize() override {
@@ -127,6 +136,8 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   MmioRegion discovery_;
   MmioRegion registers_;
   uint64_t memory_bar_ = 0;
+  PciAddress address_{};
+  bool has_address_ = false;
   AmdMediaEngineStatus status_;
   FixedString<120> summary_;
 };

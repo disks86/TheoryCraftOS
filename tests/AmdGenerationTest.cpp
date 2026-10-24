@@ -97,6 +97,7 @@ static void test_gpu() {
 
 static void test_npu() {
   CHECK(AmdXdnaNpu::xdna_generation(0x1502) == 1 && AmdXdnaNpu::xdna_generation(0x17F0) == 2 && AmdXdnaNpu::xdna_generation(0x1234) == 0);
+  CHECK(AmdXdnaNpu::platform(0x1502) && AmdXdnaNpu::platform(0x17F0) && !AmdXdnaNpu::platform(0x1234) && strcmp(AmdXdnaNpu::platform(0x17F0), "XDNA 2, Ryzen AI 300") == 0);
   CHECK(AmdXdnaNpu::matches(0x1502) && AmdXdnaNpu::matches(0x17F0) && !AmdXdnaNpu::matches(0));
 }
 

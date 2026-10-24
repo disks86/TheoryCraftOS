@@ -100,6 +100,7 @@ void SystemVideoCodecs::add_amd(const PciDeviceInfo& d) {
   const MmioRegion window = amd_discovery_window(d, &bar_size);
   UniquePointer<AmdVcnVideoEngine> device = UniquePointer<AmdVcnVideoEngine>::make(allocator_, allocator_, d.device_id, window);
   if (!device) return;
+  device->set_pci_address(d.address);
   if (device->gpu().discrete && AmdMediaEngineHw::supported(device->gpu().architecture)) {
     device->set_memory_bar(bar_size);
     device->set_registers(amd_registers(d));

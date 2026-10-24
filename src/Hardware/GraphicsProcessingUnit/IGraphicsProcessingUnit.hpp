@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/IHardware.hpp"
 
 namespace hardware {
@@ -70,6 +71,12 @@ class IGraphicsProcessingUnit : public IHardware {
   // --- Telemetry. Each is for the computer manager and says "unknown" unless the device can tell.
   // The video memory the device has and how much of it is in use; false if unknown.
   virtual bool video_memory(uint64_t* total_bytes, uint64_t* used_bytes) const { (void)total_bytes; (void)used_bytes; return false; }
+  // Which PCI function this device is, false for one that is not a PCI device (or when it is not known). Lets what a probe of the same function found out
+  // (the size of its video memory) be matched to the device.
+  virtual bool pci_location(PciAddress* out) const { (void)out; return false; }
+  // Tells the device how much video memory it has, when something other than the device found out (the video engine probe read it off the card). Ignored
+  // by a device that already knows.
+  virtual void set_video_memory_total(uint64_t bytes) { (void)bytes; }
   // Share of the time the graphics engine is busy, 0-100, or -1 if unknown.
   virtual int32_t utilization_percent() { return -1; }
   // The chip's temperature in thousandths of a degree Celsius, or -1 if unknown.

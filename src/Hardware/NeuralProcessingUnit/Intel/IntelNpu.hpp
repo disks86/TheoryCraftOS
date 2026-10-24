@@ -32,12 +32,17 @@ class IntelNpu final : public SoftwareNeuralProcessingUnit {
   using SoftwareNeuralProcessingUnit::SoftwareNeuralProcessingUnit;
 
   const char* name() const override { return "Intel NPU (software path)"; }
-  static bool matches(uint16_t device_id) {
-    return device_id == 0x7D1D ||  // Meteor Lake
-           device_id == 0xAD1D ||  // Arrow Lake
-           device_id == 0x643E ||  // Lunar Lake
-           device_id == 0xB03E;    // Panther Lake
+  // The platform an NPU device ID belongs to, or nullptr for a device that is not a known Intel NPU.
+  static const char* platform(uint16_t device_id) {
+    switch (device_id) {
+      case 0x7D1D: return "Meteor Lake";
+      case 0xAD1D: return "Arrow Lake";
+      case 0x643E: return "Lunar Lake";
+      case 0xB03E: return "Panther Lake";
+      default: return nullptr;
+    }
   }
+  static bool matches(uint16_t device_id) { return platform(device_id) != nullptr; }
 };
 
 }  // namespace hardware

@@ -35,9 +35,15 @@ class UefiGopGpu : public FramebufferGpu, public IMonitorSource {
  public:
   static constexpr uint32_t kMaxModes = 64;
 
-  explicit UefiGopGpu(const GpuContext& context) : st_(context.st) {}
+  explicit UefiGopGpu(const GpuContext& context) : st_(context.st), device_(context.device) {}
 
   const char* name() const override { return "UEFI framebuffer"; }
+  // The PCI function the context named (a zeroed context, no PCI display device, has none).
+  bool pci_location(PciAddress* out) const override {
+    if (device_.vendor_id == 0 || !out) return false;
+    *out = device_.address;
+    return true;
+  }
   bool initialize() override;
   void shutdown() override {}
 
@@ -58,6 +64,7 @@ class UefiGopGpu : public FramebufferGpu, public IMonitorSource {
   bool apply_current_mode();
 
   efi::SystemTable* st_;
+  PciDeviceInfo device_;
   efi::GraphicsOutput* gop_ = nullptr;
   uint32_t gop_mode_[kMaxModes] = {};  // our index -> GOP mode number
   DisplayMode size_[kMaxModes] = {};

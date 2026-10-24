@@ -25,6 +25,7 @@
 #include "Hardware/CentralProcessingUnit/Intel/IntelGenerations.hpp"
 #include "Hardware/CentralProcessingUnit/X86_64Cpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
+#include "Hardware/NeuralProcessingUnit/Intel/IntelNpu.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include <vector>
 
@@ -171,10 +172,18 @@ static void test_media_engine() {
   CHECK(!IntelMediaEngineHw::probe(MmioRegion(reinterpret_cast<uint64_t>(small), sizeof small), A::XeLp).probed);
 }
 
+static void test_npu() {
+  CHECK(strcmp(IntelNpu::platform(0x7D1D), "Meteor Lake") == 0 && strcmp(IntelNpu::platform(0xAD1D), "Arrow Lake") == 0);
+  CHECK(strcmp(IntelNpu::platform(0x643E), "Lunar Lake") == 0 && strcmp(IntelNpu::platform(0xB03E), "Panther Lake") == 0);
+  CHECK(IntelNpu::matches(0x7D1D) && !IntelNpu::matches(0x0000) && !IntelNpu::matches(0x1502));   // AMD's device ID is not Intel's
+  for (uint32_t id = 0; id <= 0xFFFF; ++id) CHECK((IntelNpu::platform(static_cast<uint16_t>(id)) != nullptr) == IntelNpu::matches(static_cast<uint16_t>(id)));
+}
+
 int main() {
   test_cpu();
   test_gpu();
   test_media_engine();
+  test_npu();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("IntelGenerationTest passed\n");
   return 0;

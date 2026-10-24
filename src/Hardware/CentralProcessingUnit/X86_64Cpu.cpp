@@ -110,8 +110,10 @@ CoreKind X86_64Cpu::core_kind(uint32_t core) const {
 
 void X86_64Cpu::probe_entry(void* self) {
   auto* cpu = static_cast<X86_64Cpu*>(self);
-  uint32_t core = cpu->current_core();
-  cpu->kinds_[core] = cpu->probe_core_kind();
+  // current_core() answers 0 for a processor past the cores this class keeps (more than kMaxCores): such a core must not record its kind as core 0's.
+  efi::Uintn id = 0;
+  if (!cpu->mp_ || cpu->mp_->who_am_i(cpu->mp_, &id) != efi::kSuccess || id >= cpu->cores_) return;
+  cpu->kinds_[id] = cpu->probe_core_kind();
 }
 
 void X86_64Cpu::run_slot(void* slot) {

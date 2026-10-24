@@ -36,6 +36,14 @@ class AmdXdnaNpu final : public SoftwareNeuralProcessingUnit {
     return device_id == 0x1502 ? 1 : device_id == 0x17F0 ? 2 : 0;
   }
   static bool matches(uint16_t device_id) { return xdna_generation(device_id) != 0; }
+  // The Ryzen parts the generation ships in, or nullptr for a device that is not a known XDNA NPU.
+  static const char* platform(uint16_t device_id) {
+    switch (xdna_generation(device_id)) {
+      case 1: return "XDNA, Ryzen 7040/8040";
+      case 2: return "XDNA 2, Ryzen AI 300";
+      default: return nullptr;
+    }
+  }
 };
 
 }  // namespace hardware

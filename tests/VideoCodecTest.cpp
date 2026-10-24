@@ -1442,6 +1442,11 @@ static void test_amd_card_memory() {
   resizable.set_memory_bar(16368ull << 20);
   CHECK(resizable.initialize() && resizable.engine_status().probed && resizable.engine_status().video_memory_bytes == (16368ull << 20));
   CHECK(strstr(resizable.engine_summary(), "video memory 16368 MiB (all CPU-visible)"));
+  // What the display device is told: the card's memory, matched to the engine by PCI function; nothing when the table was not read.
+  PciAddress where{};
+  CHECK(resizable.gpu_memory_bytes() == (16368ull << 20) && !resizable.gpu_location(&where));
+  resizable.set_pci_address({3, 0, 0});
+  CHECK(resizable.gpu_location(&where) && where.bus == 3 && where.device == 0 && where.function == 0 && !resizable.gpu_location(nullptr));
   // Without a size for the aperture nothing is claimed.
   AmdVcnVideoEngine unsized(a, 0x744C, window);
   CHECK(unsized.initialize() && unsized.engine_status().probed && unsized.engine_status().video_memory_bytes == 0 && !strstr(unsized.engine_summary(), "video memory"));
@@ -1472,6 +1477,8 @@ static void test_amd_system_window() {
     system.initialize();
     const AmdVcnVideoEngine* amd = static_cast<AmdVcnVideoEngine*>(system.at(0));
     CHECK(mapper.calls == 1 && mapper.asked == (4u << 20) && sizer.calls == 1 && amd->engine_status().probed && amd->engine_status().carve_out_bytes == (3u << 20));
+    PciAddress gpu_at{};
+    CHECK(amd->gpu_memory_bytes() == (3u << 20) && amd->gpu_location(&gpu_at) && gpu_at.bus == 0 && gpu_at.device == 2 && gpu_at.function == 0);   // the fake bus puts the GPU at 0:2.0
     system.shutdown();
   }
   {   // A card (Navi 31, 16 GiB, Resizable BAR off or on): only the last 64 KiB of the aperture is read directly, and the register BAR (BAR 5) is mapped for the
@@ -1522,6 +1529,7 @@ static void test_amd_discovery_engine() {
   CHECK(strstr(phoenix.engine_summary(), "Radeon 780M") && strstr(phoenix.engine_summary(), "VCN 4.0.0") && strstr(phoenix.engine_summary(), "shared memory 3 MiB"));
   AmdVcnVideoEngine phoenix_blind(a, 0x15BF);
   CHECK(phoenix_blind.initialize() && !phoenix_blind.engine_status().probed && strstr(phoenix_blind.engine_summary(), "not read"));
+  CHECK(phoenix.gpu_memory_bytes() == (3u << 20) && phoenix_blind.gpu_memory_bytes() == 0);   // an APU reports its carve-out
   CHECK(!strstr(navi31.engine_summary(), "shared memory"));
   CHECK(no_window.initialize() && !no_window.engine_status().probed && no_window.engine_status().vcn_count() == 0);
   CHECK(vega.initialize() && !vega.engine_status().probed);   // Vega has no table: nothing is read

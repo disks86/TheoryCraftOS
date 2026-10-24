@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.hpp"
+#include "Utility/FixedString.hpp"
 
 namespace hardware {
 
@@ -30,11 +31,17 @@ class SystemNeuralProcessingUnit {
                              scheduling::ICPUScheduler& scheduler);
 
   INeuralProcessingUnit& npu() { return *active_; }
+  // One line for the boot log: which NPU hardware was found (vendor and platform) and that the computation still runs on the CPU, or that there is none.
+  const char* description() const { return description_.c_str(); }
+  // True when a hardware NPU is on the bus (its work still runs on the CPU until a native driver exists).
+  bool hardware_present() const { return hardware_present_; }
 
  private:
   // Vendor classes add no data, so the software NPU's size covers them all.
   alignas(16) unsigned char storage_[sizeof(SoftwareNeuralProcessingUnit)];
   INeuralProcessingUnit* active_ = nullptr;
+  FixedString<96> description_;
+  bool hardware_present_ = false;
 };
 
 }  // namespace hardware
