@@ -155,13 +155,14 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (value.indexOf('\0') >= 0 || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) return null;
     return value;
   }
-  function Headers(init) {
+  function Headers(init, guard) {
     if (!(this instanceof Headers)) throw typeError("construct 'Headers'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
     hide(this, '__list', []);
     hide(this, '__immutable', false);
+    hide(this, '__guard', typeof guard === 'string' ? guard : 'none');   // none, request, request-no-cors or response: which headers a page may not set
     if (init === undefined || init === null) return;
     if (init instanceof Headers) {
-      for (var i = 0; i < init.__list.length; i++) this.__list.push([init.__list[i][0], init.__list[i][1]]);
+      for (var i = 0; i < init.__list.length; i++) if (!guarded(this, init.__list[i][0], init.__list[i][1])) this.__list.push([init.__list[i][0], init.__list[i][1]]);
     } else if (Array.isArray(init)) {
       for (var j = 0; j < init.length; j++) {
         if (!Array.isArray(init[j]) || init[j].length !== 2) throw typeError("construct 'Headers'", "Invalid value");
@@ -181,16 +182,34 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (headers.__immutable) throw typeError("execute '" + what + "' on 'Headers'", "Headers are immutable");
     return name;
   }
+  // Is the header one the guard of these headers does not let a page set (silently left out)?
+  function guarded(headers, name, value) {
+    var g2 = headers.__guard;
+    if (g2 === 'request' || g2 === 'request-no-cors') {
+      if (FORBIDDEN_REQUEST.indexOf(name) >= 0 || name.indexOf('proxy-') === 0 || name.indexOf('sec-') === 0) return true;
+      if (g2 === 'request-no-cors') {
+        if (['accept', 'accept-language', 'content-language', 'content-type', 'range'].indexOf(name) < 0) return true;
+        if (value !== undefined && String(value).length > 128) return true;
+        if (name === 'content-type' && value !== undefined && ['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain'].indexOf(String(value).split(';')[0].trim().toLowerCase()) < 0) return true;
+        if (name === 'range' && value !== undefined && !/^bytes=\d*-\d*$/.test(String(value))) return true;
+      }
+    } else if (g2 === 'response') {
+      if (name === 'set-cookie' || name === 'set-cookie2') return true;
+    }
+    return false;
+  }
   method(H, 'append', function (name, value) {
     name = checkHeader('append', this, name);
     var v = cleanValue(value);
     if (v === null) throw typeError("execute 'append' on 'Headers'", "Invalid value");
+    if (guarded(this, lower(name), v)) return;
     this.__list.push([lower(name), v]);
   });
   method(H, 'set', function (name, value) {
     name = lower(checkHeader('set', this, name));
     var v = cleanValue(value);
     if (v === null) throw typeError("execute 'set' on 'Headers'", "Invalid value");
+    if (guarded(this, name, v)) return;
     var out = [], done = false;
     for (var i = 0; i < this.__list.length; i++) {
       if (this.__list[i][0] !== name) { out.push(this.__list[i]); continue; }
@@ -201,6 +220,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   });
   method(H, 'delete', function (name) {
     name = lower(checkHeader('delete', this, name));
+    if (guarded(this, name)) return;
     this.__list = this.__list.filter(function (p) { return p[0] !== name; });
   });
   method(H, 'get', function (name) {
@@ -278,29 +298,76 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     for (var i = 0; i < n; i++) target[i] = bytes[i];
     return { read: text.length, written: n };
   });
+  var CP1252 = [0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178];
+  var ENCODING_LABELS = { 'utf-8': 'utf-8', utf8: 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'unicode11utf8': 'utf-8', 'x-unicode20utf8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le',
+    'unicode': 'utf-16le', 'csunicode': 'utf-16le', 'iso-10646-ucs-2': 'utf-16le', 'unicodefeff': 'utf-16le', 'utf-16be': 'utf-16be', 'unicodefffe': 'utf-16be', latin1: 'windows-1252', ascii: 'windows-1252',
+    'us-ascii': 'windows-1252', 'windows-1252': 'windows-1252', 'iso-8859-1': 'windows-1252', 'iso8859-1': 'windows-1252', 'iso_8859-1': 'windows-1252', 'l1': 'windows-1252', 'cp1252': 'windows-1252',
+    'x-cp1252': 'windows-1252', 'ansi_x3.4-1968': 'windows-1252' };
+  function utf8Of(cp) {
+    if (cp < 0x80) return String.fromCharCode(cp);
+    var b;
+    if (cp < 0x800) b = [0xC0 | (cp >> 6), 0x80 | (cp & 63)];
+    else if (cp < 0x10000) b = [0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)];
+    else b = [0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)];
+    return __bytes_to_string(new Uint8Array(b));
+  }
+  function utf8Incomplete(bytes) {   // how many bytes at the end are the start of a character that is not complete
+    var n = bytes.length;
+    for (var back = 1; back <= 3 && back <= n; back++) {
+      var c = bytes.charCodeAt(n - back);
+      if ((c & 0xC0) === 0x80) continue;
+      var need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+      return need > back ? back : 0;
+    }
+    return 0;
+  }
   function TextDecoder(label, options) {
+    if (!(this instanceof TextDecoder)) throw typeError("construct 'TextDecoder'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
     label = label === undefined ? 'utf-8' : lower(String(label).trim());
-    if (label === 'utf8' || label === 'unicode-1-1-utf-8') label = 'utf-8';
-    if (label === 'latin1' || label === 'ascii' || label === 'us-ascii' || label === 'windows-1252' || label === 'iso-8859-1') label = 'windows-1252';
-    if (label !== 'utf-8' && label !== 'windows-1252') throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
-    this.encoding = label;
+    var encoding = ENCODING_LABELS[label];
+    if (!encoding) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+    hide(this, '__d', { encoding: encoding, pending: '', started: false });
+    this.encoding = encoding;
     this.fatal = !!(options && options.fatal);
     this.ignoreBOM = !!(options && options.ignoreBOM);
   }
-  method(TextDecoder.prototype, 'decode', function (input) {
-    if (input === undefined || input === null) return '';
-    var bytes = __bytes_to_string(input);
-    if (this.encoding === 'windows-1252') {
-      var out = '';
-      for (var i = 0; i < bytes.length; i++) {
-        out += String.fromCharCode(bytes.charCodeAt(i));   // (strings hold UTF-8: a character code becomes its UTF-8 bytes)
+  method(TextDecoder.prototype, 'decode', function (input, options) {
+    var d = this.__d, stream = !!(options && options.stream);
+    var bytes = input === undefined || input === null ? '' : __bytes_to_string(input instanceof ArrayBuffer ? new Uint8Array(input) : input);
+    var data = d.pending + bytes, out = '', i;
+    d.pending = '';
+    if (d.encoding === 'windows-1252') {
+      for (i = 0; i < data.length; i++) { var c = data.charCodeAt(i); out += c >= 0x80 && c <= 0x9F ? utf8Of(CP1252[c - 0x80]) : String.fromCharCode(c); }
+    } else if (d.encoding === 'utf-8') {
+      if (stream) { var cut = utf8Incomplete(data); d.pending = data.slice(data.length - cut); data = data.slice(0, data.length - cut); }
+      if (!d.started && !this.ignoreBOM && data.charCodeAt(0) === 0xEF && data.charCodeAt(1) === 0xBB && data.charCodeAt(2) === 0xBF) data = data.slice(3);
+      out = __utf8_clean(data);
+      if (this.fatal && out !== data) { d.started = false; throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding utf-8"); }
+    } else {   // UTF-16
+      var be = d.encoding === 'utf-16be', pos = 0;
+      if (stream && data.length % 2 === 1) { d.pending = data.slice(data.length - 1); data = data.slice(0, data.length - 1); }
+      if (!d.started && !this.ignoreBOM && data.length >= 2) {
+        var b0 = data.charCodeAt(0), b1 = data.charCodeAt(1);
+        if ((!be && b0 === 0xFF && b1 === 0xFE) || (be && b0 === 0xFE && b1 === 0xFF)) pos = 2;
       }
-      return out;
+      var high = 0, unit = function (at) { return be ? (data.charCodeAt(at) << 8) | data.charCodeAt(at + 1) : (data.charCodeAt(at + 1) << 8) | data.charCodeAt(at); };
+      for (; pos + 1 < data.length; pos += 2) {
+        var u = unit(pos);
+        if (high) {
+          if (u >= 0xDC00 && u <= 0xDFFF) { out += utf8Of(0x10000 + ((high - 0xD800) << 10) + (u - 0xDC00)); high = 0; continue; }
+          if (this.fatal) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding " + d.encoding);
+          out += utf8Of(0xFFFD); high = 0;
+        }
+        if (u >= 0xD800 && u <= 0xDBFF) high = u;
+        else if (u >= 0xDC00 && u <= 0xDFFF) { if (this.fatal) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding " + d.encoding); out += utf8Of(0xFFFD); }
+        else out += utf8Of(u);
+      }
+      if (high) { if (stream) d.pending = (be ? String.fromCharCode(high >> 8) : String.fromCharCode(high & 255)); out += stream ? '' : utf8Of(0xFFFD); }
+      if (!stream && data.length % 2 === 1) out += utf8Of(0xFFFD);
     }
-    if (!this.ignoreBOM && bytes.charCodeAt(0) === 0xEF && bytes.charCodeAt(1) === 0xBB && bytes.charCodeAt(2) === 0xBF) bytes = bytes.slice(3);
-    var clean = __utf8_clean(bytes);
-    if (this.fatal && clean !== bytes) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding utf-8");
-    return clean;
+    if (out.length || bytes.length) d.started = true;
+    if (!stream) d.started = false;
+    return out;
   });
   hide(g, 'TextEncoder', TextEncoder);
   hide(g, 'TextDecoder', TextDecoder);
@@ -1865,26 +1932,718 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   hide(g, 'AbortSignal', AbortSignal);
   hide(g, 'AbortController', AbortController);
 
-  // ---------------------------------------------------------------------------------------------------------------------- bodies and streams
-  // A one-chunk stream over bytes: what `response.body` and `blob.stream()` give.
-  function makeStream(bytes) {
-    var stream = { locked: false };
-    var chunk = bytes.length ? __string_to_bytes(bytes) : null;
-    stream.getReader = function () {
-      if (stream.locked) throw new TypeError("Failed to execute 'getReader' on 'ReadableStream': ReadableStream is locked");
-      stream.locked = true;
-      return {
-        read: function () {
-          if (chunk) { var c = chunk; chunk = null; return Promise.resolve({ done: false, value: c }); }
-          return Promise.resolve({ done: true, value: undefined });
-        },
-        releaseLock: function () { stream.locked = false; },
-        cancel: function () { chunk = null; return Promise.resolve(); },
-        closed: Promise.resolve()
+  // ================================================================ fetch(), Request, Response, XMLHttpRequest and streams
+  var FORBIDDEN_REQUEST = ['accept-charset', 'accept-encoding', 'access-control-request-headers', 'access-control-request-method', 'connection', 'content-length', 'cookie', 'cookie2', 'date', 'dnt', 'expect', 'host', 'keep-alive', 'origin', 'referer', 'set-cookie', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'via'];
+  // ---------------------------------------------------------------------------------------------------------------------- Streams
+  // ReadableStream (default and byte streams, readers, tee, pipeTo, pipeThrough, async iteration), WritableStream, TransformStream, the queuing strategies and the
+  // text and compression streams. Chunks of byte streams are Uint8Arrays.
+  function deferred() {
+    var d = {};
+    d.promise = new Promise(function (resolve, reject) { d.resolve = resolve; d.reject = reject; });
+    return d;
+  }
+  function handled(promise) { promise.then(null, function () { }); return promise; }
+  function streamError(what, message) { return new TypeError("Failed to " + what + ": " + message); }
+  function highWaterMark(strategy, fallback) {
+    var hwm = strategy && strategy.highWaterMark !== undefined ? Number(strategy.highWaterMark) : fallback;
+    if (hwm !== hwm || hwm < 0) throw new RangeError('The strategy is invalid: the highWaterMark is not a non-negative number.');
+    return hwm;
+  }
+  function sizeAlgorithm(strategy) {
+    var size = strategy && strategy.size;
+    if (size !== undefined && typeof size !== 'function') throw new TypeError('The strategy is invalid: size must be a function.');
+    return size || function () { return 1; };
+  }
+  var ASYNC_ITER = typeof Symbol === 'function' && Symbol.asyncIterator ? Symbol.asyncIterator : '@@asyncIterator';
+
+  function CountQueuingStrategy(init) {
+    if (!(this instanceof CountQueuingStrategy)) throw streamError("construct 'CountQueuingStrategy'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (!init || init.highWaterMark === undefined) throw streamError("construct 'CountQueuingStrategy'", "required member highWaterMark is undefined.");
+    this.highWaterMark = Number(init.highWaterMark);
+  }
+  method(CountQueuingStrategy.prototype, 'size', function () { return 1; });
+  function ByteLengthQueuingStrategy(init) {
+    if (!(this instanceof ByteLengthQueuingStrategy)) throw streamError("construct 'ByteLengthQueuingStrategy'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (!init || init.highWaterMark === undefined) throw streamError("construct 'ByteLengthQueuingStrategy'", "required member highWaterMark is undefined.");
+    this.highWaterMark = Number(init.highWaterMark);
+  }
+  method(ByteLengthQueuingStrategy.prototype, 'size', function (chunk) { return chunk.byteLength; });
+  hide(g, 'CountQueuingStrategy', CountQueuingStrategy);
+  hide(g, 'ByteLengthQueuingStrategy', ByteLengthQueuingStrategy);
+
+  // --- readable streams
+  function ReadableStreamDefaultController() { throw new TypeError('Illegal constructor'); }
+  function ReadableByteStreamController() { throw new TypeError('Illegal constructor'); }
+  function ReadableStreamDefaultReader(stream) {
+    if (!(stream instanceof ReadableStream)) throw streamError("construct 'ReadableStreamDefaultReader'", "parameter 1 is not of type 'ReadableStream'.");
+    attachReader(this, stream);
+  }
+  function ReadableStreamBYOBReader(stream) {
+    if (!(stream instanceof ReadableStream)) throw streamError("construct 'ReadableStreamBYOBReader'", "parameter 1 is not of type 'ReadableStream'.");
+    if (!stream.__s.bytes) throw streamError("construct 'ReadableStreamBYOBReader'", 'Cannot construct a ReadableStreamBYOBReader for a stream not constructed with a byte source');
+    attachReader(this, stream);
+  }
+  function attachReader(reader, stream) {
+    var s = stream.__s;
+    if (s.reader) throw streamError("construct 'ReadableStreamDefaultReader'", 'ReadableStream is locked');
+    hide(reader, '__r', { stream: stream, requests: [], closed: deferred() });
+    s.reader = reader;
+    if (s.state === 'closed') reader.__r.closed.resolve(undefined);
+    else if (s.state === 'errored') { handled(reader.__r.closed.promise); reader.__r.closed.reject(s.error); }
+    handled(reader.__r.closed.promise);
+  }
+  function ReadableStream(source, strategy) {
+    if (!(this instanceof ReadableStream)) throw streamError("construct 'ReadableStream'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    source = source === undefined || source === null ? {} : source;
+    var bytes = source.type === 'bytes';
+    if (source.type !== undefined && !bytes) throw new RangeError("Failed to construct 'ReadableStream': Invalid type is specified");
+    var s = { state: 'readable', queue: [], total: 0, hwm: 0, size: null, started: false, pulling: false, pullAgain: false, closeRequested: false, reader: null, error: undefined,
+              bytes: bytes, disturbed: false, source: source, controller: null, byob: [] };
+    hide(this, '__s', s);
+    s.__stream = this;
+    if (bytes) {
+      if (strategy && strategy.size !== undefined) throw new RangeError("Failed to construct 'ReadableStream': The strategy for a byte stream cannot have a size function");
+      s.hwm = highWaterMark(strategy, 0);
+      s.size = function (c) { return c.byteLength; };
+    } else {
+      s.hwm = highWaterMark(strategy, 1);
+      s.size = sizeAlgorithm(strategy);
+    }
+    var controller = Object.create((bytes ? ReadableByteStreamController : ReadableStreamDefaultController).prototype);
+    hide(controller, '__s', s);
+    s.controller = controller;
+    var stream = this;
+    var started = Promise.resolve().then(function () { return typeof source.start === 'function' ? source.start.call(source, controller) : undefined; });
+    started.then(function () { s.started = true; rsPull(stream); }, function (e) { rsError(stream, e); });
+  }
+  function rsDesired(s) { return s.state === 'errored' ? null : s.state === 'closed' ? 0 : s.hwm - s.total; }
+  function rsShouldPull(s) {
+    if (s.state !== 'readable' || s.closeRequested || !s.started) return false;
+    if (s.reader && s.reader.__r.requests.length > 0) return true;
+    return rsDesired(s) > 0;
+  }
+  function rsPull(stream) {
+    var s = stream.__s;
+    if (!rsShouldPull(s)) return;
+    if (s.pulling) { s.pullAgain = true; return; }
+    if (typeof s.source.pull !== 'function') return;
+    s.pulling = true;
+    var result;
+    try { result = s.source.pull.call(s.source, s.controller); } catch (e) { s.pulling = false; rsError(stream, e); return; }
+    Promise.resolve(result).then(function () {
+      s.pulling = false;
+      if (s.pullAgain) { s.pullAgain = false; rsPull(stream); }
+    }, function (e) { rsError(stream, e); });
+  }
+  function rsError(stream, e) {
+    var s = stream.__s;
+    if (s.state !== 'readable') return;
+    s.state = 'errored'; s.error = e; s.queue = []; s.total = 0;
+    if (s.reader) {
+      var r = s.reader.__r;
+      r.requests.forEach(function (req) { req.reject(e); });
+      r.requests = [];
+      handled(r.closed.promise);
+      r.closed.reject(e);
+    }
+    s.byob.forEach(function (req) { req.reject(e); });
+    s.byob = [];
+  }
+  function rsFinishClose(stream) {
+    var s = stream.__s;
+    s.state = 'closed';
+    if (s.reader) {
+      var r = s.reader.__r;
+      r.requests.forEach(function (req) { req.resolve({ value: undefined, done: true }); });
+      r.requests = [];
+      r.closed.resolve(undefined);
+    }
+    s.byob.forEach(function (req) { req.resolve({ value: req.view.subarray(0, 0), done: true }); });
+    s.byob = [];
+  }
+  function rsEnqueue(stream, chunk) {
+    var s = stream.__s;
+    if (s.closeRequested || s.state !== 'readable') throw new TypeError("Failed to execute 'enqueue' on 'ReadableStreamDefaultController': Cannot enqueue a chunk into a " + (s.closeRequested ? 'closed' : s.state) + ' readable stream');
+    if (s.bytes) {
+      if (!isObject(chunk) || !chunk.buffer || typeof chunk.byteLength !== 'number') throw new TypeError("Failed to execute 'enqueue' on 'ReadableByteStreamController': parameter 1 is not of type 'ArrayBufferView'.");
+      if (chunk.byteLength === 0) throw new TypeError("Failed to execute 'enqueue' on 'ReadableByteStreamController': chunk is empty");
+      chunk = new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+      if (s.byob.length) {   // a read into a view of the caller's is waiting
+        var req = s.byob.shift(), n = Math.min(req.view.byteLength, chunk.byteLength);
+        var target = new Uint8Array(req.view.buffer, req.view.byteOffset, n);
+        for (var i = 0; i < n; i++) target[i] = chunk[i];
+        if (n < chunk.byteLength) { var rest = chunk.subarray(n); s.queue.push({ chunk: rest, size: rest.byteLength }); s.total += rest.byteLength; }
+        req.resolve({ value: target, done: false });
+        if (s.closeRequested && s.queue.length === 0) rsFinishClose(stream);
+        rsPull(stream);
+        return;
+      }
+    }
+    if (s.reader && s.reader.__r.requests.length > 0) {
+      s.reader.__r.requests.shift().resolve({ value: chunk, done: false });
+    } else {
+      var size;
+      try { size = Number(s.size(chunk)); if (size !== size || size < 0 || size === Infinity) throw new RangeError('The return value of a queuing strategy\'s size function must be a finite, non-NaN, non-negative number'); }
+      catch (e) { rsError(stream, e); throw e; }
+      s.queue.push({ chunk: chunk, size: size });
+      s.total += size;
+    }
+    rsPull(stream);
+  }
+  function rsRead(stream, reader) {
+    var s = stream.__s, d = deferred();
+    s.disturbed = true;
+    if (s.state === 'closed') d.resolve({ value: undefined, done: true });
+    else if (s.state === 'errored') d.reject(s.error);
+    else if (s.queue.length) {
+      var item = s.queue.shift();
+      s.total -= item.size;
+      if (s.closeRequested && s.queue.length === 0) rsFinishClose(stream);
+      else rsPull(stream);
+      d.resolve({ value: item.chunk, done: false });
+    } else {
+      reader.__r.requests.push(d);
+      rsPull(stream);
+    }
+    return d.promise;
+  }
+  function rsCancel(stream, reason) {
+    var s = stream.__s;
+    s.disturbed = true;
+    if (s.state === 'closed') return Promise.resolve(undefined);
+    if (s.state === 'errored') return Promise.reject(s.error);
+    s.queue = []; s.total = 0;
+    rsFinishClose(stream);
+    var result;
+    try { result = typeof s.source.cancel === 'function' ? s.source.cancel.call(s.source, reason) : undefined; } catch (e) { return Promise.reject(e); }
+    return Promise.resolve(result).then(function () { return undefined; });
+  }
+  var RSP = ReadableStream.prototype;
+  Object.defineProperty(RSP, 'locked', { get: function () { return this.__s.reader !== null; }, enumerable: true, configurable: true });
+  method(RSP, 'cancel', function (reason) {
+    if (this.__s.reader) return Promise.reject(streamError("execute 'cancel' on 'ReadableStream'", 'Cannot cancel a stream that already has a reader'));
+    return rsCancel(this, reason);
+  });
+  method(RSP, 'getReader', function (options) {
+    var mode = options && options.mode;
+    if (mode !== undefined && mode !== 'byob') throw new TypeError("Failed to execute 'getReader' on 'ReadableStream': The provided value '" + mode + "' is not a valid enum value of type ReadableStreamReaderMode.");
+    if (this.__s.reader) throw streamError("execute 'getReader' on 'ReadableStream'", 'ReadableStream is locked');
+    return mode === 'byob' ? new ReadableStreamBYOBReader(this) : new ReadableStreamDefaultReader(this);
+  });
+  function releaseReader(reader) {
+    var r = reader.__r;
+    if (!r || !r.stream) return;
+    var s = r.stream.__s, e = new TypeError('Releasing reader');
+    r.requests.forEach(function (req) { req.reject(e); });
+    r.requests = [];
+    if (s.state === 'readable') { handled(r.closed.promise); r.closed.reject(e); }
+    else { r.closed = deferred(); handled(r.closed.promise); r.closed.reject(e); }
+    s.reader = null;
+    r.stream = null;
+  }
+  [ReadableStreamDefaultReader, ReadableStreamBYOBReader].forEach(function (R) {
+    Object.defineProperty(R.prototype, 'closed', { get: function () { return this.__r.closed.promise; }, enumerable: true, configurable: true });
+    method(R.prototype, 'cancel', function (reason) {
+      if (!this.__r.stream) return Promise.reject(streamError("execute 'cancel' on 'ReadableStreamDefaultReader'", 'This readable stream reader has been released and cannot be used to cancel its previous owner stream'));
+      return rsCancel(this.__r.stream, reason);
+    });
+    method(R.prototype, 'releaseLock', function () { releaseReader(this); });
+  });
+  method(ReadableStreamDefaultReader.prototype, 'read', function () {
+    if (!this.__r.stream) return Promise.reject(streamError("execute 'read' on 'ReadableStreamDefaultReader'", 'This readable stream reader has been released and cannot be used to read from its previous owner stream'));
+    return rsRead(this.__r.stream, this);
+  });
+  method(ReadableStreamBYOBReader.prototype, 'read', function (view) {
+    if (!this.__r.stream) return Promise.reject(streamError("execute 'read' on 'ReadableStreamBYOBReader'", 'This readable stream reader has been released and cannot be used to read from its previous owner stream'));
+    if (!isObject(view) || !view.buffer || typeof view.byteLength !== 'number') return Promise.reject(streamError("execute 'read' on 'ReadableStreamBYOBReader'", "parameter 1 is not of type 'ArrayBufferView'."));
+    if (view.byteLength === 0) return Promise.reject(new TypeError("Failed to execute 'read' on 'ReadableStreamBYOBReader': The view has a length of 0"));
+    var stream = this.__r.stream, s = stream.__s, d = deferred();
+    s.disturbed = true;
+    if (s.state === 'errored') { d.reject(s.error); return d.promise; }
+    if (s.state === 'closed') { d.resolve({ value: new Uint8Array(view.buffer, view.byteOffset, 0), done: true }); return d.promise; }
+    if (s.total > 0) {
+      var item = s.queue[0], n = Math.min(item.chunk.byteLength, view.byteLength), target = new Uint8Array(view.buffer, view.byteOffset, n);
+      for (var i = 0; i < n; i++) target[i] = item.chunk[i];
+      if (n === item.chunk.byteLength) s.queue.shift(); else item.chunk = item.chunk.subarray(n);
+      s.total -= n; item.size = item.chunk ? item.chunk.byteLength : 0;
+      if (s.closeRequested && s.queue.length === 0) rsFinishClose(stream); else rsPull(stream);
+      d.resolve({ value: target, done: false });
+      return d.promise;
+    }
+    d.view = view;
+    s.byob.push(d);
+    rsPull(stream);
+    return d.promise;
+  });
+  Object.defineProperty(ReadableStreamDefaultController.prototype, 'desiredSize', { get: function () { return rsDesired(this.__s); }, enumerable: true, configurable: true });
+  Object.defineProperty(ReadableByteStreamController.prototype, 'desiredSize', { get: function () { return rsDesired(this.__s); }, enumerable: true, configurable: true });
+  [ReadableStreamDefaultController, ReadableByteStreamController].forEach(function (C) {
+    method(C.prototype, 'close', function () {
+      var s = this.__s;
+      if (s.closeRequested || s.state !== 'readable') throw new TypeError("Failed to execute 'close' on '" + (s.bytes ? 'ReadableByteStreamController' : 'ReadableStreamDefaultController') + "': Cannot close a " + (s.closeRequested ? 'closed' : s.state) + ' readable stream');
+      s.closeRequested = true;
+      if (s.queue.length === 0) rsFinishClose(s.__stream);
+    });
+    method(C.prototype, 'enqueue', function (chunk) { rsEnqueue(this.__s.__stream, chunk); });
+    method(C.prototype, 'error', function (e) { rsError(this.__s.__stream, e); });
+  });
+  Object.defineProperty(ReadableByteStreamController.prototype, 'byobRequest', { get: function () {
+    var s = this.__s;
+    if (!s.byob.length) return null;
+    var pending = s.byob[0], stream = s.__stream;
+    var req = { view: new Uint8Array(pending.view.buffer, pending.view.byteOffset, pending.view.byteLength) };
+    req.respond = function (n) {
+      s.byob.shift();
+      pending.resolve({ value: new Uint8Array(pending.view.buffer, pending.view.byteOffset, n), done: false });
+      if (s.closeRequested && s.queue.length === 0) rsFinishClose(stream);
+    };
+    req.respondWithNewView = function (v) { s.byob.shift(); pending.resolve({ value: v, done: false }); };
+    return req;
+  }, enumerable: true, configurable: true });
+  method(RSP, 'tee', function () {
+    if (this.__s.reader) throw streamError("execute 'tee' on 'ReadableStream'", 'ReadableStream is locked');
+    var reader = this.getReader(), canceled = [false, false], reasons = [undefined, undefined], branches = [null, null], reading = false, again = false, source = this;
+    var cancelDone = deferred();
+    var copy = function (chunk) { return chunk instanceof Uint8Array && source.__s.bytes ? new Uint8Array(chunk) : chunk; };
+    var pullBoth = function () {
+      if (reading) { again = true; return Promise.resolve(); }
+      reading = true;
+      return reader.read().then(function (r) {
+        reading = false;
+        if (r.done) {
+          [0, 1].forEach(function (i) { if (!canceled[i] && branches[i].__s.state === 'readable') { try { branches[i].__s.controller.close(); } catch (e) { } } });
+          if (!canceled[0] || !canceled[1]) cancelDone.resolve(undefined);
+          return;
+        }
+        [0, 1].forEach(function (i) { if (!canceled[i] && branches[i].__s.state === 'readable' && !branches[i].__s.closeRequested) { try { branches[i].__s.controller.enqueue(i === 0 ? r.value : copy(r.value)); } catch (e) { } } });
+        if (again) { again = false; return pullBoth(); }
+      }, function (e) {
+        [0, 1].forEach(function (i) { rsError(branches[i], e); });
+        cancelDone.resolve(undefined);
+      });
+    };
+    var cancelBranch = function (i) {
+      return function (reason) {
+        canceled[i] = true; reasons[i] = reason;
+        if (canceled[0] && canceled[1]) reader.cancel([reasons[0], reasons[1]]).then(cancelDone.resolve, cancelDone.reject);
+        return cancelDone.promise;
       };
     };
-    stream.cancel = function () { chunk = null; return Promise.resolve(); };
-    return stream;
+    var make = function (i) { return new ReadableStream({ pull: pullBoth, cancel: cancelBranch(i), type: source.__s.bytes ? 'bytes' : undefined }); };
+    branches[0] = make(0); branches[1] = make(1);
+    handled(reader.closed.then(null, function (e) { [0, 1].forEach(function (i) { rsError(branches[i], e); }); cancelDone.resolve(undefined); }));
+    return branches;
+  });
+  method(RSP, 'pipeTo', function (dest, options) {
+    options = options || {};
+    var source = this;
+    if (!(dest instanceof WritableStream)) return Promise.reject(streamError("execute 'pipeTo' on 'ReadableStream'", "parameter 1 is not of type 'WritableStream'."));
+    if (source.__s.reader) return Promise.reject(streamError("execute 'pipeTo' on 'ReadableStream'", 'ReadableStream is locked'));
+    if (dest.__w.writer) return Promise.reject(streamError("execute 'pipeTo' on 'ReadableStream'", 'WritableStream is locked'));
+    var reader = source.getReader(), writer = dest.getWriter(), signal = options.signal, finished = false, result = deferred(), shuttingDown = false;
+    var readInFlight = Promise.resolve(), lastWrite = Promise.resolve();   // (a chunk that was read is written before the destination is closed)
+    var settled = function () { return readInFlight.then(function () { return lastWrite.then(null, function () { }); }); };
+    var finish = function (error, isError) {
+      if (finished) return;
+      finished = true;
+      reader.releaseLock(); writer.releaseLock();
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (isError) result.reject(error); else result.resolve(undefined);
+    };
+    var shutdown = function (action, error, isError) {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      Promise.resolve().then(action).then(function () { finish(error, isError); }, function (e) { finish(e, true); });
+    };
+    var onAbort = function () {
+      var reason = signal.reason;
+      var actions = [];
+      if (!options.preventAbort) actions.push(function () { return dest.__w.state === 'writable' ? writer.abort(reason) : Promise.resolve(); });
+      if (!options.preventCancel) actions.push(function () { return source.__s.state === 'readable' ? reader.cancel(reason) : Promise.resolve(); });
+      shutdown(function () { return Promise.all(actions.map(function (a) { return a(); })); }, reason, true);
+    };
+    if (signal) { if (signal.aborted) { onAbort(); return result.promise; } signal.addEventListener('abort', onAbort); }
+    var loop = function () {
+      if (finished || shuttingDown) return;
+      writer.ready.then(function () {
+        if (finished || shuttingDown) return;
+        readInFlight = reader.read().then(function (r) {
+          if (shuttingDown || finished) return;
+          if (r.done) return;
+          lastWrite = writer.write(r.value);
+          lastWrite.then(null, function () { });
+          loop();
+        }, function () { });
+      }, function () { });
+    };
+    // errors and closing of either end
+    handled(reader.closed.then(function () {
+      settled().then(function () {   // (the chunks that were read are written first)
+        if (!options.preventClose) shutdown(function () { return dest.__w.state === 'writable' ? writer.close() : Promise.resolve(); }, undefined, false);
+        else shutdown(function () { return Promise.resolve(); }, undefined, false);
+      });
+    }, function (e) {
+      if (!options.preventAbort) shutdown(function () { return writer.abort(e); }, e, true); else shutdown(function () { return Promise.resolve(); }, e, true);
+    }));
+    handled(writer.closed.then(function () {
+      if (shuttingDown) return;
+      var e = new TypeError('the destination writable stream closed before all data could be piped to it');
+      if (!options.preventCancel) shutdown(function () { return reader.cancel(e); }, e, true); else shutdown(function () { return Promise.resolve(); }, e, true);
+    }, function (e) {
+      if (shuttingDown) return;
+      if (!options.preventCancel) shutdown(function () { return reader.cancel(e); }, e, true); else shutdown(function () { return Promise.resolve(); }, e, true);
+    }));
+    loop();
+    return result.promise;
+  });
+  method(RSP, 'pipeThrough', function (pair, options) {
+    if (!pair || !(pair.writable instanceof WritableStream) || !(pair.readable instanceof ReadableStream)) throw streamError("execute 'pipeThrough' on 'ReadableStream'", 'parameter 1 is not of type \'ReadableWritablePair\'.');
+    if (this.__s.reader) throw streamError("execute 'pipeThrough' on 'ReadableStream'", 'ReadableStream is locked');
+    if (pair.writable.__w.writer) throw streamError("execute 'pipeThrough' on 'ReadableStream'", 'WritableStream is locked');
+    handled(this.pipeTo(pair.writable, options));
+    return pair.readable;
+  });
+  function iterator(stream, options) {
+    var reader = stream.getReader(), preventCancel = !!(options && options.preventCancel), ended = false;
+    var it = {
+      next: function () {
+        if (ended) return Promise.resolve({ value: undefined, done: true });
+        return reader.read().then(function (r) { if (r.done) { ended = true; reader.releaseLock(); } return r; }, function (e) { ended = true; reader.releaseLock(); throw e; });
+      },
+      'return': function (value) {
+        if (ended) return Promise.resolve({ value: value, done: true });
+        ended = true;
+        if (preventCancel) { reader.releaseLock(); return Promise.resolve({ value: value, done: true }); }
+        var c = reader.cancel(value);
+        reader.releaseLock();
+        return c.then(function () { return { value: value, done: true }; });
+      }
+    };
+    it[ASYNC_ITER] = function () { return it; };
+    return it;
+  }
+  method(RSP, 'values', function (options) { return iterator(this, options); });
+  method(RSP, ASYNC_ITER, function (options) { return iterator(this, options); });
+  ReadableStream.from = function (iterable) {
+    var it;
+    if (Array.isArray(iterable)) { var list = iterable, at = 0; it = { next: function () { return at < list.length ? { value: list[at++], done: false } : { value: undefined, done: true }; } }; }
+    else if (iterable && typeof iterable[ASYNC_ITER] === 'function') it = iterable[ASYNC_ITER]();
+    else if (iterable && typeof iterable[ITER] === 'function') { var inner = iterable[ITER](); var arr = Array.isArray(inner) ? inner : null; var at = 0; it = arr ? { next: function () { return at < arr.length ? { value: arr[at++], done: false } : { value: undefined, done: true }; } } : inner; }
+    else throw new TypeError("Failed to execute 'from' on 'ReadableStream': The provided value is not iterable");
+    return new ReadableStream({
+      pull: function (controller) { return Promise.resolve(it.next()).then(function (r) { if (r.done) controller.close(); else controller.enqueue(r.value); }); },
+      cancel: function (reason) { return typeof it['return'] === 'function' ? Promise.resolve(it['return'](reason)).then(function () { }) : undefined; }
+    });
+  };
+  hide(g, 'ReadableStream', ReadableStream);
+  hide(g, 'ReadableStreamDefaultReader', ReadableStreamDefaultReader);
+  hide(g, 'ReadableStreamBYOBReader', ReadableStreamBYOBReader);
+  hide(g, 'ReadableStreamDefaultController', ReadableStreamDefaultController);
+  hide(g, 'ReadableByteStreamController', ReadableByteStreamController);
+
+  // --- writable streams
+  function WritableStreamDefaultController() { throw new TypeError('Illegal constructor'); }
+  function WritableStreamDefaultWriter(stream) {
+    if (!(stream instanceof WritableStream)) throw streamError("construct 'WritableStreamDefaultWriter'", "parameter 1 is not of type 'WritableStream'.");
+    var w = stream.__w;
+    if (w.writer) throw streamError("construct 'WritableStreamDefaultWriter'", 'This writable stream writer has been released and cannot be used to write to its previous owner stream');
+    hide(this, '__sw', { stream: stream, ready: deferred(), closed: deferred() });
+    w.writer = this;
+    handled(this.__sw.closed.promise);
+    if (w.state === 'closed') { this.__sw.closed.resolve(undefined); this.__sw.ready.resolve(undefined); }
+    else if (w.state === 'errored') { this.__sw.closed.reject(w.error); this.__sw.ready.reject(w.error); handled(this.__sw.ready.promise); }
+    else if (wsBackpressure(w)) { /* (ready stays pending) */ }
+    else this.__sw.ready.resolve(undefined);
+  }
+  function WritableStream(sink, strategy) {
+    if (!(this instanceof WritableStream)) throw streamError("construct 'WritableStream'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    sink = sink === undefined || sink === null ? {} : sink;
+    if (sink.type !== undefined) throw new RangeError("Failed to construct 'WritableStream': Invalid type is specified");
+    var abortController = new AbortController();
+    var w = { state: 'writable', error: undefined, queue: [], queued: 0, hwm: highWaterMark(strategy, 1), size: sizeAlgorithm(strategy), sink: sink, writer: null, writing: false, started: false, closeRequest: null,
+              abortController: abortController, controller: null, inflightClose: false };
+    hide(this, '__w', w);
+    var controller = Object.create(WritableStreamDefaultController.prototype);
+    hide(controller, '__w', w);
+    w.controller = controller;
+    var stream = this;
+    w.__stream = stream;
+    Promise.resolve().then(function () { return typeof sink.start === 'function' ? sink.start.call(sink, controller) : undefined; }).then(function () { w.started = true; wsAdvance(stream); }, function (e) { wsError(stream, e); });
+  }
+  function wsBackpressure(w) { return w.hwm - w.queued <= 0; }
+  function wsUpdateReady(w) {
+    if (!w.writer || w.state !== 'writable') return;
+    var sw = w.writer.__sw;
+    if (wsBackpressure(w)) { if (sw.readyDone) { sw.ready = deferred(); sw.readyDone = false; } }
+    else { sw.ready.resolve(undefined); sw.readyDone = true; }
+  }
+  function wsError(stream, e) {
+    var w = stream.__w;
+    if (w.state === 'errored' || w.state === 'closed') return;
+    w.state = 'errored'; w.error = e;
+    w.queue.forEach(function (req) { req.reject(e); });
+    w.queue = []; w.queued = 0;
+    if (w.closeRequest) { w.closeRequest.reject(e); w.closeRequest = null; }
+    if (w.writer) {
+      var sw = w.writer.__sw;
+      sw.closed.reject(e);
+      sw.ready.reject(e); handled(sw.ready.promise);
+    }
+  }
+  function wsAdvance(stream) {
+    var w = stream.__w;
+    if (w.writing || !w.started || w.state === 'errored' || w.state === 'closed') return;
+    if (w.queue.length) {
+      var req = w.queue.shift();
+      w.writing = true;
+      var result;
+      try { result = typeof w.sink.write === 'function' ? w.sink.write.call(w.sink, req.chunk, w.controller) : undefined; } catch (e) { w.writing = false; req.reject(e); wsError(stream, e); return; }
+      Promise.resolve(result).then(function () {
+        w.writing = false; w.queued -= req.size; if (w.queued < 0) w.queued = 0;
+        req.resolve(undefined);
+        wsUpdateReady(w);
+        wsAdvance(stream);
+      }, function (e) { w.writing = false; req.reject(e); wsError(stream, e); });
+    } else if (w.closeRequest && !w.inflightClose) {
+      w.inflightClose = true;
+      var close = w.closeRequest, r2;
+      try { r2 = typeof w.sink.close === 'function' ? w.sink.close.call(w.sink) : undefined; } catch (e) { close.reject(e); wsError(stream, e); return; }
+      Promise.resolve(r2).then(function () {
+        w.state = 'closed'; w.closeRequest = null;
+        close.resolve(undefined);
+        if (w.writer) { w.writer.__sw.closed.resolve(undefined); }
+      }, function (e) { close.reject(e); w.closeRequest = null; wsError(stream, e); });
+    }
+  }
+  var WSP = WritableStream.prototype;
+  Object.defineProperty(WSP, 'locked', { get: function () { return this.__w.writer !== null; }, enumerable: true, configurable: true });
+  method(WSP, 'getWriter', function () { return new WritableStreamDefaultWriter(this); });
+  function wsAbort(stream, reason) {
+    var w = stream.__w;
+    if (w.state === 'closed' || w.state === 'errored') return w.state === 'closed' ? Promise.resolve(undefined) : Promise.reject(w.error);
+    w.abortController.abort(reason);
+    var pending = w.queue.slice();
+    wsError(stream, reason);
+    var result;
+    try { result = typeof w.sink.abort === 'function' ? w.sink.abort.call(w.sink, reason) : undefined; } catch (e) { return Promise.reject(e); }
+    return Promise.resolve(result).then(function () { return undefined; });
+  }
+  method(WSP, 'abort', function (reason) {
+    if (this.__w.writer) return Promise.reject(streamError("execute 'abort' on 'WritableStream'", 'Cannot abort a locked stream'));
+    return wsAbort(this, reason);
+  });
+  method(WSP, 'close', function () {
+    if (this.__w.writer) return Promise.reject(streamError("execute 'close' on 'WritableStream'", 'Cannot close a locked stream'));
+    return wsClose(this);
+  });
+  function wsClose(stream) {
+    var w = stream.__w;
+    if (w.state === 'closed' || w.closeRequest) return Promise.reject(new TypeError('Cannot close a closed or closing stream'));
+    if (w.state === 'errored') return Promise.reject(w.error);
+    var d = deferred();
+    w.closeRequest = d;
+    wsAdvance(stream);
+    return d.promise;
+  }
+  Object.defineProperty(WritableStreamDefaultController.prototype, 'signal', { get: function () { return this.__w.abortController.signal; }, enumerable: true, configurable: true });
+  method(WritableStreamDefaultController.prototype, 'error', function (e) { wsError(this.__w.__stream, e); });
+  Object.defineProperty(WritableStreamDefaultWriter.prototype, 'closed', { get: function () { return this.__sw.closed.promise; }, enumerable: true, configurable: true });
+  Object.defineProperty(WritableStreamDefaultWriter.prototype, 'ready', { get: function () { return this.__sw.ready.promise; }, enumerable: true, configurable: true });
+  Object.defineProperty(WritableStreamDefaultWriter.prototype, 'desiredSize', { get: function () {
+    var w = this.__sw.stream && this.__sw.stream.__w;
+    if (!w) throw streamError("read the 'desiredSize' property from 'WritableStreamDefaultWriter'", 'This writable stream writer has been released');
+    return w.state === 'errored' ? null : w.state === 'closed' ? 0 : w.hwm - w.queued;
+  }, enumerable: true, configurable: true });
+  method(WritableStreamDefaultWriter.prototype, 'write', function (chunk) {
+    var stream = this.__sw.stream;
+    if (!stream) return Promise.reject(streamError("execute 'write' on 'WritableStreamDefaultWriter'", 'This writable stream writer has been released and cannot be used to write to its previous owner stream'));
+    var w = stream.__w;
+    if (w.state === 'errored') return Promise.reject(w.error);
+    if (w.state === 'closed' || w.closeRequest) return Promise.reject(new TypeError('Cannot write to a closing or closed stream'));
+    var size = 1;
+    try { size = Number(w.size(chunk)); } catch (e) { wsError(stream, e); return Promise.reject(e); }
+    var d = deferred();
+    d.chunk = chunk; d.size = size;
+    w.queue.push(d); w.queued += size;
+    wsUpdateReady(w);
+    wsAdvance(stream);
+    return d.promise;
+  });
+  method(WritableStreamDefaultWriter.prototype, 'close', function () {
+    var stream = this.__sw.stream;
+    if (!stream) return Promise.reject(streamError("execute 'close' on 'WritableStreamDefaultWriter'", 'This writable stream writer has been released and cannot be used to close its previous owner stream'));
+    return wsClose(stream);
+  });
+  method(WritableStreamDefaultWriter.prototype, 'abort', function (reason) {
+    var stream = this.__sw.stream;
+    if (!stream) return Promise.reject(streamError("execute 'abort' on 'WritableStreamDefaultWriter'", 'This writable stream writer has been released and cannot be used to abort its previous owner stream'));
+    return wsAbort(stream, reason);
+  });
+  method(WritableStreamDefaultWriter.prototype, 'releaseLock', function () {
+    var sw = this.__sw;
+    if (!sw.stream) return;
+    var w = sw.stream.__w, e = new TypeError('Writer was released');
+    handled(sw.closed.promise);
+    if (w.state === 'writable' || w.state === 'erroring') sw.closed.reject(e);
+    handled(sw.ready.promise);
+    if (!sw.readyDone && w.state === 'writable') sw.ready.reject(e);
+    w.writer = null;
+    sw.stream = null;
+  });
+  hide(g, 'WritableStream', WritableStream);
+  hide(g, 'WritableStreamDefaultWriter', WritableStreamDefaultWriter);
+  hide(g, 'WritableStreamDefaultController', WritableStreamDefaultController);
+
+  // --- transform streams
+  function TransformStreamDefaultController() { throw new TypeError('Illegal constructor'); }
+  function TransformStream(transformer, writableStrategy, readableStrategy) {
+    if (!(this instanceof TransformStream)) throw streamError("construct 'TransformStream'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    transformer = transformer === undefined || transformer === null ? {} : transformer;
+    if (transformer.readableType !== undefined || transformer.writableType !== undefined) throw new RangeError("Failed to construct 'TransformStream': Invalid type is specified");
+    var t = { backpressure: true, change: deferred(), transformer: transformer, readable: null, writable: null, controller: null };
+    var controller = Object.create(TransformStreamDefaultController.prototype);
+    hide(controller, '__t', t);
+    t.controller = controller;
+    var setBackpressure = function (b) { if (t.backpressure !== b) { t.backpressure = b; t.change.resolve(undefined); } if (b) t.change = deferred(); };
+    var startPromise = Promise.resolve().then(function () { return typeof transformer.start === 'function' ? transformer.start.call(transformer, controller) : undefined; });
+    t.readable = new ReadableStream({
+      start: function () { return startPromise; },
+      pull: function () { setBackpressure(false); return Promise.resolve(); },
+      cancel: function (reason) { wsError(t.writable, reason); setBackpressure(false); return Promise.resolve(); }
+    }, readableStrategy || { highWaterMark: 0 });
+    t.writable = new WritableStream({
+      start: function () { return startPromise; },
+      write: function (chunk) {
+        var run = function () {
+          if (t.writable.__w.state === 'errored') throw t.writable.__w.error;
+          if (typeof transformer.transform === 'function') return transformer.transform.call(transformer, chunk, controller);
+          controller.enqueue(chunk);
+        };
+        var guarded = function () { try { return run(); } catch (e) { rsError(t.readable, e); throw e; } };
+        return (t.backpressure ? t.change.promise.then(guarded) : Promise.resolve().then(guarded)).then(undefined, function (e) { rsError(t.readable, e); throw e; });
+      },
+      close: function () {
+        return Promise.resolve().then(function () { return typeof transformer.flush === 'function' ? transformer.flush.call(transformer, controller) : undefined; }).then(function () {
+          var rs = t.readable.__s;
+          if (rs.state === 'errored') throw rs.error;
+          if (rs.state === 'readable' && !rs.closeRequested) rs.controller.close();
+        }, function (e) { rsError(t.readable, e); throw e; });
+      },
+      abort: function (reason) { rsError(t.readable, reason); return Promise.resolve(); }
+    }, writableStrategy || { highWaterMark: 1 });
+    hide(this, '__t', t);
+    t.setBackpressure = setBackpressure;
+    t.rs = t.readable.__s;
+    if (rsDesired(t.rs) <= 0) setBackpressure(true);
+  }
+  Object.defineProperty(TransformStream.prototype, 'readable', { get: function () { return this.__t.readable; }, enumerable: true, configurable: true });
+  Object.defineProperty(TransformStream.prototype, 'writable', { get: function () { return this.__t.writable; }, enumerable: true, configurable: true });
+  var TSC = TransformStreamDefaultController.prototype;
+  Object.defineProperty(TSC, 'desiredSize', { get: function () { return rsDesired(this.__t.readable.__s); }, enumerable: true, configurable: true });
+  method(TSC, 'enqueue', function (chunk) {
+    var t = this.__t, rs = t.readable.__s;
+    if (rs.closeRequested || rs.state !== 'readable') throw new TypeError("Failed to execute 'enqueue' on 'TransformStreamDefaultController': Unable to enqueue");
+    rsEnqueue(t.readable, chunk);
+    var pressure = rsDesired(rs) <= 0;
+    if (pressure !== t.backpressure) t.setBackpressure(pressure);
+  });
+  method(TSC, 'error', function (e) { var t = this.__t; rsError(t.readable, e); wsError(t.writable, e); t.setBackpressure(false); });
+  method(TSC, 'terminate', function () {
+    var t = this.__t, rs = t.readable.__s;
+    if (rs.state === 'readable' && !rs.closeRequested) rs.controller.close();
+    wsError(t.writable, new TypeError('The TransformStream has been terminated'));
+    t.setBackpressure(false);
+  });
+  hide(g, 'TransformStream', TransformStream);
+  hide(g, 'TransformStreamDefaultController', TransformStreamDefaultController);
+
+  // --- text and compression streams
+  function TextEncoderStream() {
+    if (!(this instanceof TextEncoderStream)) throw streamError("construct 'TextEncoderStream'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    var ts = new TransformStream({ transform: function (chunk, c) { var text = String(chunk); if (text.length) c.enqueue(__string_to_bytes(text)); } });
+    hide(this, '__ts', ts);
+  }
+  var TextDecoderStream, CompressionStream, DecompressionStream;
+  function defineTransformWrapper(C) {
+    Object.defineProperty(C.prototype, 'readable', { get: function () { return this.__ts.readable; }, enumerable: true, configurable: true });
+    Object.defineProperty(C.prototype, 'writable', { get: function () { return this.__ts.writable; }, enumerable: true, configurable: true });
+  }
+  defineTransformWrapper(TextEncoderStream);
+  Object.defineProperty(TextEncoderStream.prototype, 'encoding', { get: function () { return 'utf-8'; }, enumerable: true, configurable: true });
+  TextDecoderStream = function TextDecoderStream(label, options) {
+    if (!(this instanceof TextDecoderStream)) throw streamError("construct 'TextDecoderStream'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    var decoder = new TextDecoder(label, options);
+    var ts = new TransformStream({
+      transform: function (chunk, c) { var text = decoder.decode(chunk, { stream: true }); if (text.length) c.enqueue(text); },
+      flush: function (c) { var text = decoder.decode(); if (text.length) c.enqueue(text); }
+    });
+    hide(this, '__ts', ts);
+    hide(this, '__d', decoder);
+  };
+  defineTransformWrapper(TextDecoderStream);
+  ['encoding', 'fatal', 'ignoreBOM'].forEach(function (k) { Object.defineProperty(TextDecoderStream.prototype, k, { get: function () { return this.__d[k]; }, enumerable: true, configurable: true }); });
+  var compressionFormat = function (what, format) {
+    format = String(format);
+    if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') throw new TypeError("Failed to construct '" + what + "': Unsupported compression format: '" + format + "'");
+    return format;
+  };
+  CompressionStream = function CompressionStream(format) {
+    if (!(this instanceof CompressionStream)) throw streamError("construct 'CompressionStream'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    format = compressionFormat('CompressionStream', format);
+    var parts = [];
+    hide(this, '__ts', new TransformStream({
+      transform: function (chunk) { if (!(isObject(chunk) && chunk.buffer && typeof chunk.byteLength === 'number')) throw new TypeError('The provided value is not of type \'(ArrayBuffer or ArrayBufferView)\'.'); parts.push(__bytes_to_string(chunk)); },
+      flush: function (c) { var out = __zlib(format, true, parts.join('')); if (out === null) throw new TypeError('Compression failed'); c.enqueue(__string_to_bytes(out)); }
+    }));
+  };
+  defineTransformWrapper(CompressionStream);
+  DecompressionStream = function DecompressionStream(format) {
+    if (!(this instanceof DecompressionStream)) throw streamError("construct 'DecompressionStream'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    format = compressionFormat('DecompressionStream', format);
+    var parts = [];
+    hide(this, '__ts', new TransformStream({
+      transform: function (chunk) { if (!(isObject(chunk) && chunk.buffer && typeof chunk.byteLength === 'number')) throw new TypeError('The provided value is not of type \'(ArrayBuffer or ArrayBufferView)\'.'); parts.push(__bytes_to_string(chunk)); },
+      flush: function (c) { var out = __zlib(format, false, parts.join('')); if (out === null) throw new TypeError('The compressed data is not valid'); if (out.length) c.enqueue(__string_to_bytes(out)); }
+    }));
+  };
+  defineTransformWrapper(DecompressionStream);
+  hide(g, 'TextEncoderStream', TextEncoderStream);
+  hide(g, 'TextDecoderStream', TextDecoderStream);
+  hide(g, 'CompressionStream', CompressionStream);
+  hide(g, 'DecompressionStream', DecompressionStream);
+
+  // A stream over bytes, in chunks: what `response.body` and `blob.stream()` give.
+  var CHUNK = 65536;
+  function makeStream(bytes, signal) {
+    var at = 0;
+    return new ReadableStream({
+      type: 'bytes',
+      start: function (controller) {
+        if (!signal) return;
+        if (signal.aborted) controller.error(signal.reason);
+        else signal.addEventListener('abort', function () { try { controller.error(signal.reason); } catch (e) { } });
+      },
+      pull: function (controller) {
+        if (at >= bytes.length) { controller.close(); return; }
+        var part = bytes.slice(at, at + CHUNK);
+        at += part.length;
+        controller.enqueue(__string_to_bytes(part));
+        if (at >= bytes.length) controller.close();
+      }
+    });
+  }
+  // All the bytes of a stream, as a binary string: a promise.
+  function drain(stream) {
+    var reader = stream.getReader(), parts = [];
+    var step = function () {
+      return reader.read().then(function (r) {
+        if (r.done) { reader.releaseLock(); return parts.join(''); }
+        if (!(isObject(r.value) && typeof r.value.byteLength === 'number')) throw new TypeError('Received a non-Uint8Array chunk');
+        parts.push(__bytes_to_string(r.value));
+        return step();
+      });
+    };
+    return step();
   }
 
   function multipart(formData) {
@@ -1892,7 +2651,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     var body = '';
     var entries = formData.entries();
     for (var i = 0; i < entries.length; i++) {
-      var name = String(entries[i][0]).split('"').join('%22'), value = entries[i][1];
+      var name = String(entries[i][0]).split('\r\n').join('%0D%0A').split('"').join('%22'), value = entries[i][1];
       body += '--' + boundary + '\r\n';
       if (value instanceof Blob) {
         var filename = value instanceof File ? value.name : 'blob';
@@ -1906,15 +2665,21 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     return { bytes: body, type: 'multipart/form-data; boundary=' + boundary };
   }
 
-  // what a body (a string, Blob, bytes, URLSearchParams, FormData) is as bytes, and its content type
+  // what a body (a string, Blob, bytes, URLSearchParams, FormData or ReadableStream) is: its bytes (a binary string; null for a stream), the stream, and its content type
   function extractBody(init) {
-    if (init === undefined || init === null) return { bytes: null, type: null };
-    if (typeof init === 'string') return { bytes: init, type: 'text/plain;charset=UTF-8' };
-    if (init instanceof URLSearchParams) return { bytes: init.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
-    if (init instanceof Blob) return { bytes: init.__bytes, type: init.type || null };
-    if (typeof FormData !== 'undefined' && init instanceof FormData) return multipart(init);
-    if (isObject(init) && typeof init.byteLength === 'number') return { bytes: __bytes_to_string(init), type: null };
-    return { bytes: String(init), type: 'text/plain;charset=UTF-8' };
+    if (init === undefined || init === null) return { bytes: null, type: null, stream: null };
+    if (typeof init === 'string') return { bytes: init, type: 'text/plain;charset=UTF-8', stream: null };
+    if (init instanceof URLSearchParams) return { bytes: init.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8', stream: null };
+    if (init instanceof Blob) return { bytes: init.__bytes, type: init.type || null, stream: null };
+    if (typeof FormData !== 'undefined' && init instanceof FormData) { var m = multipart(init); m.stream = null; return m; }
+    if (init instanceof ReadableStream) {
+      if (init.__s.disturbed || init.__s.reader) throw typeError("construct 'Response'", 'Response body object should not be disturbed or locked');
+      return { bytes: null, type: null, stream: init };
+    }
+    if (init instanceof ArrayBuffer) return { bytes: __bytes_to_string(new Uint8Array(init)), type: null, stream: null };
+    if (isObject(init) && init.buffer && typeof init.byteLength === 'number') return { bytes: __bytes_to_string(new Uint8Array(init.buffer, init.byteOffset, init.byteLength)), type: null, stream: null };
+    if (isObject(init) && typeof init.byteLength === 'number') return { bytes: __bytes_to_string(init), type: null, stream: null };
+    return { bytes: String(init), type: 'text/plain;charset=UTF-8', stream: null };
   }
 
   function parseFormBody(bytes, contentType) {
@@ -1934,18 +2699,19 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       for (var p = 1; p < parts.length; p++) {
         var part = parts[p];
         if (part.slice(0, 2) === '--') break;
+        if (part.slice(0, 2) === '\r\n') part = part.slice(2);
         var split = part.indexOf('\r\n\r\n');
         if (split < 0) continue;
         var head = part.slice(0, split), data = part.slice(split + 4);
         if (data.slice(data.length - 2) === '\r\n') data = data.slice(0, data.length - 2);
         var nameAt = head.indexOf('name="');
         if (nameAt < 0) continue;
-        var name = head.slice(nameAt + 6).split('"')[0];
+        var name = head.slice(nameAt + 6).split('"')[0].split('%22').join('"').split('%0D%0A').join('\r\n');
         var fileAt = head.indexOf('filename="');
         if (fileAt >= 0) {
           var typeAt = head.toLowerCase().indexOf('content-type:');
           var ctype = typeAt >= 0 ? head.slice(typeAt + 13).split('\r\n')[0].trim() : '';
-          fd.append(name, new File([data], head.slice(fileAt + 10).split('"')[0], { type: ctype }));
+          fd.append(name, new File([data], head.slice(fileAt + 10).split('"')[0].split('%22').join('"'), { type: ctype }));
         } else {
           fd.append(name, __utf8_clean(data));
         }
@@ -1955,74 +2721,98 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     throw new TypeError("Failed to fetch: could not parse the body as form data");
   }
 
-  // the body methods Request and Response share
+  // --------------------------------------------------------------------------------------------------------------------- the body mixin of Request and Response
+  // __b: { bytes (binary string, or null), stream (a ReadableStream, made when asked for or given), used }
+  function bodyUsedOf(self) { var b = self.__b; return b.used || !!(b.stream && b.stream.__s.disturbed); }
+  function bodyStreamOf(self) {
+    var b = self.__b;
+    if (b.stream === null && b.bytes !== null) b.stream = makeStream(b.bytes);
+    return b.stream;
+  }
+  function consume(self, what) {
+    var b = self.__b, name = self instanceof Request ? 'Request' : 'Response';
+    if (bodyUsedOf(self)) return Promise.reject(new TypeError("Failed to execute '" + what + "' on '" + name + "': body stream already read"));
+    if (b.stream === null) { b.used = true; return Promise.resolve(b.bytes === null ? '' : b.bytes); }
+    if (b.stream.__s.reader) return Promise.reject(new TypeError("Failed to execute '" + what + "' on '" + name + "': body stream is locked"));
+    b.used = true;
+    return drain(b.stream);
+  }
   function installBody(proto) {
-    var consume = function (self) {
-      if (self.bodyUsed) return Promise.reject(new TypeError("Failed to execute 'body' on '" + (self instanceof Request ? 'Request' : 'Response') + "': body stream already read"));
-      self.bodyUsed = true;
-      return Promise.resolve(self.__bytes === null ? '' : self.__bytes);
-    };
-    method(proto, 'text', function () { return consume(this).then(__utf8_clean); });
-    method(proto, 'json', function () { return consume(this).then(function (b) { return JSON.parse(__utf8_clean(b)); }); });
-    method(proto, 'arrayBuffer', function () { return consume(this).then(__string_to_bytes); });
-    method(proto, 'bytes', function () { return consume(this).then(__string_to_bytes); });
+    Object.defineProperty(proto, 'body', { get: function () { return bodyStreamOf(this); }, enumerable: true, configurable: true });
+    Object.defineProperty(proto, 'bodyUsed', { get: function () { return bodyUsedOf(this); }, enumerable: true, configurable: true });
+    method(proto, 'text', function () { return consume(this, 'text').then(__utf8_clean); });
+    method(proto, 'json', function () { return consume(this, 'json').then(function (b) { return JSON.parse(__utf8_clean(b)); }); });
+    method(proto, 'arrayBuffer', function () { return consume(this, 'arrayBuffer').then(function (b) { return __string_to_bytes(b).buffer; }); });
+    method(proto, 'bytes', function () { return consume(this, 'bytes').then(__string_to_bytes); });
     method(proto, 'blob', function () {
       var type = this.headers.get('content-type') || '';
-      return consume(this).then(function (b) { return new Blob([b], { type: type }); });
+      return consume(this, 'blob').then(function (b) { return new Blob([b], { type: type }); });
     });
     method(proto, 'formData', function () {
       var type = this.headers.get('content-type');
-      return consume(this).then(function (b) { return parseFormBody(b, type); });
+      return consume(this, 'formData').then(function (b) { return parseFormBody(b, type); });
     });
+  }
+  // a copy of the body of `self` for a clone
+  function cloneBody(self) {
+    var b = self.__b;
+    if (b.stream === null) return { bytes: b.bytes, stream: null, used: false };
+    if (bodyUsedOf(self) || b.stream.__s.reader) throw new TypeError("Failed to execute 'clone': body is already used");
+    var pair = b.stream.tee();
+    b.stream = pair[0];
+    return { bytes: b.bytes, stream: pair[1], used: false };
   }
 
   // -------------------------------------------------------------------------------------------------------------------------------- Response
   var NULL_BODY = [101, 204, 205, 304];
   function Response(body, init) {
     if (!(this instanceof Response)) throw typeError("construct 'Response'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (init !== undefined && init !== null && typeof init !== 'object') throw typeError("construct 'Response'", "The provided value is not of type 'ResponseInit'.");
     init = init || {};
     var status = init.status === undefined ? 200 : Number(init.status);
-    if (!(status >= 200 && status <= 599)) throw new RangeError("Failed to construct 'Response': The status provided (" + init.status + ") is outside the range [200, 599].");
-    this.type = 'default';
-    this.url = '';
-    this.redirected = false;
-    this.status = status;
-    this.ok = status >= 200 && status <= 299;
-    this.statusText = init.statusText === undefined ? '' : String(init.statusText);
-    this.headers = new Headers(init.headers);
-    this.bodyUsed = false;
+    if (!(status >= 200 && status <= 599) || status !== Math.floor(status)) throw new RangeError("Failed to construct 'Response': The status provided (" + init.status + ") is outside the range [200, 599].");
+    var statusText = init.statusText === undefined ? '' : String(init.statusText);
+    if (!/^[\t\x20-\x7E\x80-\xFF]*$/.test(statusText) && statusText !== __utf8_clean(statusText)) throw typeError("construct 'Response'", "Invalid statusText");
+    hide(this, '__r', { type: 'default', url: '', redirected: false, status: status, statusText: statusText });
+    hide(this, '__h', new Headers(init.headers, 'response'));
     var b = extractBody(body);
-    if (b.bytes !== null && NULL_BODY.indexOf(status) >= 0) throw typeError("construct 'Response'", "Response with null body status cannot have body");
-    hide(this, '__bytes', b.bytes);
-    if (b.type && !this.headers.has('content-type')) this.headers.set('content-type', b.type);
-    this.body = b.bytes === null ? null : makeStream(b.bytes);
+    if ((b.bytes !== null || b.stream !== null) && NULL_BODY.indexOf(status) >= 0) throw typeError("construct 'Response'", "Response with null body status cannot have body");
+    hide(this, '__b', { bytes: b.bytes, stream: b.stream, used: false });
+    if (b.type && !this.__h.has('content-type')) this.__h.set('content-type', b.type);
   }
   installBody(Response.prototype);
+  [['type', function (r) { return r.type; }], ['url', function (r) { return r.url; }], ['redirected', function (r) { return r.redirected; }], ['status', function (r) { return r.status; }],
+   ['ok', function (r) { return r.status >= 200 && r.status <= 299; }], ['statusText', function (r) { return r.statusText; }]].forEach(function (p) {
+    Object.defineProperty(Response.prototype, p[0], { get: function () { return p[1](this.__r); }, enumerable: true, configurable: true });
+  });
+  Object.defineProperty(Response.prototype, 'headers', { get: function () { return this.__h; }, enumerable: true, configurable: true });
   method(Response.prototype, 'clone', function () {
-    if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
-    var copy = Object.create(Response.prototype);
-    copy.type = this.type; copy.url = this.url; copy.redirected = this.redirected; copy.status = this.status; copy.ok = this.ok;
-    copy.statusText = this.statusText; copy.headers = new Headers(this.headers); copy.bodyUsed = false;
-    hide(copy, '__bytes', this.__bytes);
-    copy.body = this.__bytes === null ? null : makeStream(this.__bytes);
+    if (bodyUsedOf(this)) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
+    var copy = Object.create(Response.prototype), r = this.__r;
+    hide(copy, '__r', { type: r.type, url: r.url, redirected: r.redirected, status: r.status, statusText: r.statusText });
+    hide(copy, '__h', new Headers(this.__h, this.__h.__guard));
+    copy.__h.__immutable = this.__h.__immutable;
+    hide(copy, '__b', cloneBody(this));
     return copy;
   });
-  Response.error = function () {
+  function newResponse(type, status, statusText, headers, bytes, url, redirected) {
     var r = Object.create(Response.prototype);
-    r.type = 'error'; r.url = ''; r.redirected = false; r.status = 0; r.ok = false; r.statusText = ''; r.headers = new Headers(); r.bodyUsed = false;
-    hide(r, '__bytes', null); r.body = null;
+    hide(r, '__r', { type: type, url: url || '', redirected: !!redirected, status: status, statusText: statusText });
+    hide(r, '__h', headers);
+    hide(r, '__b', { bytes: bytes, stream: null, used: false });
     return r;
+  }
+  Response.error = function () {
+    var h = new Headers(); h.__immutable = true;
+    return newResponse('error', 0, '', h, null);
   };
   Response.redirect = function (url, status) {
-    status = status === undefined ? 302 : status;
+    status = status === undefined ? 302 : Number(status);
     if ([301, 302, 303, 307, 308].indexOf(status) < 0) throw new RangeError("Failed to execute 'redirect' on 'Response': Invalid status code");
     var resolved = __url_resolve(String(url), location.href);
     if (resolved === null) throw typeError("execute 'redirect' on 'Response'", "Invalid URL");
-    var r = new Response(null, { status: 200 });
-    r.status = status; r.ok = false;
-    r.headers.set('location', resolved);
-    r.headers.__immutable = true;
-    return r;
+    var h = new Headers(); h.set('location', resolved); h.__immutable = true;
+    return newResponse('default', status, '', h, null);
   };
   Response.json = function (data, init) {
     var text = JSON.stringify(data);
@@ -2032,29 +2822,35 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     return r;
   };
   // a response made from what the network answered
-  function makeResponse(res, request) {
-    var r = Object.create(Response.prototype);
-    var cross = false;
+  function makeResponse(res, request, signal) {
     if (res.opaque) {
-      r.type = 'opaque'; r.status = 0; r.statusText = ''; r.url = ''; r.headers = new Headers(); hide(r, '__bytes', null);
-      r.ok = false; r.redirected = false; r.bodyUsed = false; r.body = null;
-      return r;
+      var oh = new Headers(); oh.__immutable = true;
+      return newResponse('opaque', 0, '', oh, null);
     }
     var bytes = __bytes_to_string(res.body);
-    r.type = request && request.__cross ? 'cors' : 'basic';
-    r.url = res.url; r.redirected = res.redirected; r.status = res.status; r.ok = res.status >= 200 && res.status <= 299;
-    r.statusText = res.statusText; r.headers = Headers.__fromBlock(res.headers); r.headers.__immutable = true; r.bodyUsed = false;
-    hide(r, '__bytes', bytes);
-    r.body = res.status === 204 || res.status === 205 || res.status === 304 ? null : makeStream(bytes);
+    var h = Headers.__fromBlock(res.headers); h.__guard = 'response'; h.__immutable = true;
+    var url = res.url || '', hash = url.indexOf('#');
+    if (hash >= 0) url = url.slice(0, hash);
+    var r = newResponse(request && request.__cross ? 'cors' : 'basic', res.status, res.statusText, h, NULL_BODY.indexOf(res.status) >= 0 ? null : bytes, url, res.redirected);
+    if (signal && r.__b.bytes !== null) {   // the body stream fails when the request is aborted while it is being read
+      r.__b.stream = makeStream(r.__b.bytes, signal);
+    }
     return r;
   }
   hide(g, 'Response', Response);
 
   // --------------------------------------------------------------------------------------------------------------------------------- Request
   var SIMPLE_METHODS = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'];
+  var REFERRER_POLICIES = ['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'];
+  var CACHE_MODES = ['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached'];
+  var enumValue = function (what, value, allowed, type) {
+    if (allowed.indexOf(value) < 0) throw typeError("construct '" + what + "'", "The provided value '" + value + "' is not a valid enum value of type " + type + ".");
+    return value;
+  };
   function Request(input, init) {
     if (!(this instanceof Request)) throw typeError("construct 'Request'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
     if (arguments.length < 1) throw typeError("construct 'Request'", "1 argument required, but only 0 present.");
+    if (init !== undefined && init !== null && typeof init !== 'object') throw typeError("construct 'Request'", "The provided value is not of type 'RequestInit'.");
     init = init || {};
     var src = input instanceof Request ? input : null;
     var url;
@@ -2070,134 +2866,434 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     var upper = m.toUpperCase();
     if (upper === 'CONNECT' || upper === 'TRACE' || upper === 'TRACK') throw typeError("construct 'Request'", "'" + m + "' HTTP method is unsupported.");
     if (SIMPLE_METHODS.indexOf(upper) >= 0) m = upper;
-    this.method = m;
-    this.url = url;
-    this.headers = new Headers(init.headers !== undefined ? init.headers : (src ? src.headers : undefined));
-    this.mode = init.mode !== undefined ? init.mode : (src ? src.mode : 'cors');
-    this.credentials = init.credentials !== undefined ? init.credentials : (src ? src.credentials : 'same-origin');
-    this.cache = init.cache !== undefined ? init.cache : (src ? src.cache : 'default');
-    this.redirect = init.redirect !== undefined ? init.redirect : (src ? src.redirect : 'follow');
-    this.referrer = init.referrer !== undefined ? init.referrer : (src ? src.referrer : 'about:client');
-    this.referrerPolicy = init.referrerPolicy !== undefined ? init.referrerPolicy : (src ? src.referrerPolicy : '');
-    this.integrity = init.integrity !== undefined ? init.integrity : (src ? src.integrity : '');
-    this.keepalive = !!(init.keepalive !== undefined ? init.keepalive : (src && src.keepalive));
-    this.destination = '';
-    this.duplex = 'half';
-    this.bodyUsed = false;
-    if (['cors', 'no-cors', 'same-origin', 'navigate'].indexOf(this.mode) < 0) throw typeError("construct 'Request'", "The provided value '" + this.mode + "' is not a valid enum value of type RequestMode.");
-    if (['omit', 'same-origin', 'include'].indexOf(this.credentials) < 0) throw typeError("construct 'Request'", "The provided value '" + this.credentials + "' is not a valid enum value of type RequestCredentials.");
-    if (['follow', 'error', 'manual'].indexOf(this.redirect) < 0) throw typeError("construct 'Request'", "The provided value '" + this.redirect + "' is not a valid enum value of type RequestRedirect.");
+    var s = {
+      method: m, url: url,
+      mode: enumValue('Request', init.mode !== undefined ? String(init.mode) : (src ? src.mode : 'cors'), ['cors', 'no-cors', 'same-origin', 'navigate'], 'RequestMode'),
+      credentials: enumValue('Request', init.credentials !== undefined ? String(init.credentials) : (src ? src.credentials : 'same-origin'), ['omit', 'same-origin', 'include'], 'RequestCredentials'),
+      cache: enumValue('Request', init.cache !== undefined ? String(init.cache) : (src ? src.cache : 'default'), CACHE_MODES, 'RequestCache'),
+      redirect: enumValue('Request', init.redirect !== undefined ? String(init.redirect) : (src ? src.redirect : 'follow'), ['follow', 'error', 'manual'], 'RequestRedirect'),
+      referrerPolicy: enumValue('Request', init.referrerPolicy !== undefined ? String(init.referrerPolicy) : (src ? src.referrerPolicy : ''), REFERRER_POLICIES, 'ReferrerPolicy'),
+      integrity: init.integrity !== undefined ? String(init.integrity) : (src ? src.integrity : ''),
+      keepalive: !!(init.keepalive !== undefined ? init.keepalive : (src && src.keepalive)),
+      priority: init.priority !== undefined ? enumValue('Request', String(init.priority), ['high', 'low', 'auto'], 'RequestPriority') : 'auto',
+      referrer: 'about:client'
+    };
+    if (s.mode === 'navigate') throw typeError("construct 'Request'", "Cannot construct a Request with a RequestInit whose mode member is set as 'navigate'.");
+    if (s.cache === 'only-if-cached' && s.mode !== 'same-origin') throw typeError("construct 'Request'", "'only-if-cached' can be set only with 'same-origin' mode");
+    // the referrer: "" none, "about:client" the page, or an address of this origin
+    var ref = init.referrer !== undefined ? String(init.referrer) : (src ? src.referrer : 'about:client');
+    if (ref === '') s.referrer = '';
+    else if (ref === 'about:client') s.referrer = 'about:client';
+    else {
+      var rr = __url_resolve(ref, location.href);
+      if (rr === null) throw typeError("construct 'Request'", "Invalid referrer URL: " + ref);
+      var ro = new URL(rr);
+      s.referrer = ro.origin === location.origin ? rr : 'about:client';
+    }
+    hide(this, '__q', s);
+    var guard = s.mode === 'no-cors' ? 'request-no-cors' : 'request';
+    hide(this, '__h', new Headers(init.headers !== undefined ? init.headers : (src ? src.__h : undefined), guard));
     var signal = init.signal !== undefined ? init.signal : (src ? src.signal : null);
+    if (signal !== null && signal !== undefined && !(signal instanceof AbortSignal)) throw typeError("construct 'Request'", "Failed to read the 'signal' property from 'RequestInit': Failed to convert value to 'AbortSignal'.");
     var own = new AbortSignal();
     if (signal) {
       if (signal.aborted) signalAbort(own, signal.reason);
       else signal.addEventListener('abort', function () { signalAbort(own, signal.reason); });
     }
-    this.signal = own;
+    hide(this, '__sig', own);
     var b;
     if (init.body !== undefined && init.body !== null) {
       if (m === 'GET' || m === 'HEAD') throw typeError("construct 'Request'", "Request with GET/HEAD method cannot have body.");
       b = extractBody(init.body);
-      if (b.type && !this.headers.has('content-type')) this.headers.set('content-type', b.type);
+      if (b.stream && init.duplex !== 'half') throw typeError("construct 'Request'", "The `duplex` member must be specified for a request with a streaming body");
+      if (b.type && !this.__h.has('content-type')) this.__h.set('content-type', b.type);
+      b = { bytes: b.bytes, stream: b.stream, used: false };
     } else if (src && init.body === undefined) {
-      if (src.bodyUsed) throw typeError("construct 'Request'", "Cannot construct a Request with a Request object that has already been used.");
-      b = { bytes: src.__bytes };
-      if (src.__bytes !== null) src.bodyUsed = src.bodyUsed;
+      if (bodyUsedOf(src) || (src.__b.stream && src.__b.stream.__s.reader)) throw typeError("construct 'Request'", "Cannot construct a Request with a Request object that has already been used.");
+      if (src.__b.stream !== null) { b = { bytes: src.__b.bytes, stream: src.__b.stream, used: false }; src.__b.used = true; }   // (the body moves to the new request)
+      else b = { bytes: src.__b.bytes, stream: null, used: false };
     } else {
-      b = { bytes: null };
+      b = { bytes: null, stream: null, used: false };
     }
-    hide(this, '__bytes', b.bytes);
+    hide(this, '__b', b);
   }
   installBody(Request.prototype);
+  ['method', 'url', 'mode', 'credentials', 'cache', 'redirect', 'referrerPolicy', 'integrity', 'keepalive', 'priority'].forEach(function (k) {
+    Object.defineProperty(Request.prototype, k, { get: function () { return this.__q[k]; }, enumerable: true, configurable: true });
+  });
+  Object.defineProperty(Request.prototype, 'referrer', { get: function () { return this.__q.referrer; }, enumerable: true, configurable: true });
+  Object.defineProperty(Request.prototype, 'headers', { get: function () { return this.__h; }, enumerable: true, configurable: true });
+  Object.defineProperty(Request.prototype, 'signal', { get: function () { return this.__sig; }, enumerable: true, configurable: true });
+  Object.defineProperty(Request.prototype, 'destination', { get: function () { return ''; }, enumerable: true, configurable: true });
+  Object.defineProperty(Request.prototype, 'duplex', { get: function () { return 'half'; }, enumerable: true, configurable: true });
+  Object.defineProperty(Request.prototype, 'isReloadNavigation', { get: function () { return false; }, enumerable: true, configurable: true });
+  Object.defineProperty(Request.prototype, 'isHistoryNavigation', { get: function () { return false; }, enumerable: true, configurable: true });
   method(Request.prototype, 'clone', function () {
-    if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used");
-    return new Request(this);
+    if (bodyUsedOf(this)) throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used");
+    var copy = Object.create(Request.prototype);
+    hide(copy, '__q', JSON.parse(JSON.stringify(this.__q)));
+    hide(copy, '__h', new Headers(this.__h, this.__h.__guard));
+    var own = new AbortSignal(), original = this.__sig;
+    if (original.aborted) signalAbort(own, original.reason); else original.addEventListener('abort', function () { signalAbort(own, original.reason); });
+    hide(copy, '__sig', own);
+    hide(copy, '__b', cloneBody(this));
+    return copy;
   });
   hide(g, 'Request', Request);
 
-  // ----------------------------------------------------------------------------------------------------------------------------------- fetch
+  // --------------------------------------------------------------------------------------------------------------------------------- the HTTP cache
+  // GET answers are kept in memory, as the Cache-Control, Expires, ETag and Last-Modified headers of the server allow; the cache mode of a request says how it is used.
+  var httpCache = { entries: {}, keys: [] };
+  var CACHEABLE_STATUS = [200, 203, 204, 300, 301, 404, 405, 410, 414, 501];
+  function parseCacheControl(value) {
+    var cc = {};
+    String(value || '').split(',').forEach(function (part) {
+      part = part.trim().toLowerCase();
+      if (!part) return;
+      var eq = part.indexOf('=');
+      cc[eq < 0 ? part : part.slice(0, eq).trim()] = eq < 0 ? true : part.slice(eq + 1).trim().replace(/"/g, '');
+    });
+    return cc;
+  }
+  function dateSeconds(value) { var t = Date.parse(value); return t === t ? t / 1000 : null; }
+  function headerOf(block, name) { var h = Headers.__fromBlock(block); return h.get(name); }
+  function cacheKey(url) { var i = url.indexOf('#'); return i < 0 ? url : url.slice(0, i); }
+  function storeInCache(opts, res) {
+    if (opts.method !== 'GET' || res.opaque || CACHEABLE_STATUS.indexOf(res.status) < 0) return;
+    var h = Headers.__fromBlock(res.headers), cc = parseCacheControl(h.get('cache-control'));
+    if (cc['no-store'] || (opts.requestCacheControl && opts.requestCacheControl['no-store'])) return;
+    var vary = h.get('vary');
+    if (vary !== null && vary.trim() === '*') return;
+    var now = Date.now() / 1000, date = dateSeconds(h.get('date') || '') || now, life = null;
+    if (cc['max-age'] !== undefined) life = Number(cc['max-age']);
+    else if (h.get('expires') !== null) { var ex = dateSeconds(h.get('expires')); life = ex === null ? 0 : ex - date; }
+    else if (h.get('last-modified') !== null) { var lm = dateSeconds(h.get('last-modified')); if (lm !== null && date > lm) life = (date - lm) / 10; }
+    if (life === null || life !== life) life = 0;
+    var etag = h.get('etag'), modified = h.get('last-modified');
+    if (life <= 0 && etag === null && modified === null) return;
+    var body = __bytes_to_string(res.body);
+    if (body.length > 4194304) return;
+    var key = cacheKey(opts.url);
+    var varied = [];
+    if (vary) vary.split(',').forEach(function (n) { n = n.trim().toLowerCase(); if (n) varied.push([n, opts.headersObject[n] === undefined ? null : opts.headersObject[n]]); });
+    var entry = { status: res.status, statusText: res.statusText, url: res.url, redirected: res.redirected, headers: res.headers, body: body, stored: now, life: life, immutable: !!cc.immutable,
+                  noCache: !!cc['no-cache'], etag: etag, modified: modified, vary: varied };
+    if (!httpCache.entries[key]) httpCache.keys.push(key);
+    httpCache.entries[key] = entry;
+    while (httpCache.keys.length > 64) delete httpCache.entries[httpCache.keys.shift()];
+  }
+  function invalidate(url) {
+    var key = cacheKey(url);
+    if (httpCache.entries[key]) { delete httpCache.entries[key]; httpCache.keys.splice(httpCache.keys.indexOf(key), 1); }
+  }
+  function cachedResult(entry) {
+    return { ok: true, status: entry.status, statusText: entry.statusText, url: entry.url, redirected: entry.redirected, opaque: false, headers: entry.headers, body: __string_to_bytes(entry.body), fromCache: true };
+  }
+  function varyMatches(entry, opts) {
+    for (var i = 0; i < entry.vary.length; i++) {
+      var want = entry.vary[i][1], have = opts.headersObject[entry.vary[i][0]];
+      if ((have === undefined ? null : have) !== want) return false;
+    }
+    return true;
+  }
+  // Sends a request through the cache. `opts` as for __net_send, plus cache (the mode); `sync` for the synchronous kind. done(res).
+  function sendRequest(opts, sync, done) {
+    var h = Headers.__fromBlock(opts.headers), headersObject = {};
+    h.__list.forEach(function (p) { headersObject[p[0]] = headersObject[p[0]] === undefined ? p[1] : headersObject[p[0]] + ', ' + p[1]; });
+    opts.headersObject = headersObject;
+    var mode = opts.cache || 'default';
+    var requestCC = parseCacheControl(headersObject['cache-control']);
+    if (mode === 'default' && (headersObject['pragma'] === 'no-cache' || requestCC['no-cache'])) mode = 'no-cache';
+    if (mode === 'default' && (requestCC['no-store'])) mode = 'no-store';
+    opts.requestCacheControl = requestCC;
+    var conditional = headersObject['if-none-match'] !== undefined || headersObject['if-modified-since'] !== undefined || headersObject['range'] !== undefined || opts.credentialsHeader;
+    var usable = opts.method === 'GET' && mode !== 'no-store' && mode !== 'reload' && !conditional;
+    var entry = usable ? httpCache.entries[cacheKey(opts.url)] : undefined;
+    if (entry && !varyMatches(entry, opts)) entry = undefined;
+    var later = function (res) { if (sync) finish(res); else setTimeout(function () { finish(res); }, 0); };
+    var transport = function (o, cb) {
+      if (sync) cb(__net_send_sync(o));
+      else opts.__timer = __net_send(o, cb);
+    };
+    var finish = function (res) {
+      if (res.ok) {
+        if (opts.method === 'GET' && mode !== 'no-store' && !res.fromCache) storeInCache(opts, res);
+        else if (opts.method !== 'GET' && opts.method !== 'HEAD' && opts.method !== 'OPTIONS' && res.status < 400) invalidate(opts.url);
+      }
+      done(res);
+    };
+    if (mode === 'only-if-cached') {
+      if (entry) { later(cachedResult(entry)); return; }
+      later({ ok: true, status: 504, statusText: 'Gateway Timeout', url: opts.url, redirected: false, opaque: false, headers: '', body: __string_to_bytes('') });
+      return;
+    }
+    if (entry) {
+      var age = Date.now() / 1000 - entry.stored, fresh = !entry.noCache && (entry.immutable || age < entry.life);
+      if (mode === 'force-cache' || (mode === 'default' && fresh)) { later(cachedResult(entry)); return; }
+      if (entry.etag !== null || entry.modified !== null) {   // revalidate
+        var extra = (entry.etag !== null ? 'If-None-Match: ' + entry.etag + '\r\n' : '') + (entry.modified !== null && entry.etag === null ? 'If-Modified-Since: ' + entry.modified + '\r\n' : '');
+        var o2 = {}; for (var k in opts) o2[k] = opts[k];
+        o2.headers = opts.headers + extra;
+        transport(o2, function (res) {
+          if (res.ok && res.status === 304) {   // still good: the new headers, the old body
+            var merged = Headers.__fromBlock(entry.headers), fresh304 = Headers.__fromBlock(res.headers);
+            fresh304.__list.forEach(function (p) { if (['content-length', 'content-type', 'content-encoding'].indexOf(p[0]) < 0) merged.set(p[0], p[1]); });
+            entry.headers = merged.__block(); entry.stored = Date.now() / 1000;
+            var cc = parseCacheControl(merged.get('cache-control'));
+            if (cc['max-age'] !== undefined) entry.life = Number(cc['max-age']);
+            finish(cachedResult(entry));
+            return;
+          }
+          finish(res);
+        });
+        return;
+      }
+    }
+    transport(opts, finish);
+  }
+
+  // --------------------------------------------------------------------------------------------------------------------------------- fetch
   function networkError(res) {
     var message = 'Failed to fetch';
     if (res && res.error && res.error !== 'Failed to fetch') message += ' (' + res.error + ')';
     return new TypeError(message);
   }
+  // the Referer the policy allows: "" (none), the origin, or the address (without a fragment and credentials)
+  function referrerFor(request) {
+    var q = request.__q;
+    if (q.referrer === '' || location.protocol === 'file:' || location.protocol === 'about:' || location.protocol === 'data:') return '';
+    var policy = q.referrerPolicy || 'strict-origin-when-cross-origin';
+    var from = q.referrer === 'about:client' ? location.href : q.referrer, fromUrl = new URL(from), target = new URL(q.url);
+    fromUrl.hash = ''; fromUrl.username = ''; fromUrl.password = '';
+    var full = fromUrl.href, origin = fromUrl.origin + '/', same = fromUrl.origin === target.origin;
+    var downgrade = fromUrl.protocol === 'https:' && target.protocol !== 'https:';
+    switch (policy) {
+      case 'no-referrer': return '';
+      case 'origin': return origin;
+      case 'unsafe-url': return full;
+      case 'same-origin': return same ? full : '';
+      case 'origin-when-cross-origin': return same ? full : origin;
+      case 'no-referrer-when-downgrade': return downgrade ? '' : full;
+      case 'strict-origin': return downgrade ? '' : origin;
+      default: return same ? full : (downgrade ? '' : origin);
+    }
+  }
+  // Subresource integrity: sha256-, sha384- or sha512- digests (base64) of the body; the strongest algorithm that is named decides.
+  function checkIntegrity(metadata, bytes) {
+    var list = String(metadata).trim().split(/\s+/).filter(Boolean).map(function (token) {
+      var m = /^(sha256|sha384|sha512)-([A-Za-z0-9+\/_-]+={0,2})(\?.*)?$/.exec(token);
+      return m ? { alg: m[1], hash: m[2].replace(/-/g, '+').replace(/_/g, '/') } : null;
+    }).filter(Boolean);
+    if (!list.length) return Promise.resolve(true);
+    var rank = { sha256: 1, sha384: 2, sha512: 3 }, best = 0;
+    list.forEach(function (e) { if (rank[e.alg] > best) best = rank[e.alg]; });
+    var strongest = list.filter(function (e) { return rank[e.alg] === best; });
+    var name = best === 3 ? 'SHA-512' : best === 2 ? 'SHA-384' : 'SHA-256';
+    return crypto.subtle.digest(name, __string_to_bytes(bytes)).then(function (digest) {
+      var actual = btoa(__bytes_to_string(new Uint8Array(digest)));
+      return strongest.some(function (e) { return e.hash.replace(/=+$/, '') === actual.replace(/=+$/, ''); });
+    });
+  }
+  function recordResource(url, start, bytes, initiator) { if (typeof g.__perf_resource === 'function') g.__perf_resource(url, start, bytes, initiator); }
   function fetch(input, init) {
     return new Promise(function (resolve, reject) {
       var request;
       try { request = new Request(input, init); } catch (e) { reject(e); return; }
-      if (request.signal.aborted) { reject(request.signal.reason); return; }
-      var url = request.url;
-      if (url.slice(0, 5) === 'blob:') {
-        var blob = blobUrls[url];
-        if (!blob) { reject(new TypeError('Failed to fetch (blob URL not found)')); return; }
-        var r = new Response(blob, { status: 200, headers: { 'content-type': blob.type || 'application/octet-stream' } });
-        r.url = url;
-        resolve(r);
-        return;
-      }
-      var finished = false, timer = 0;
+      var signal = request.signal;
+      if (signal.aborted) { if (request.__b.stream) request.__b.stream.cancel(signal.reason).then(null, function () { }); reject(signal.reason); return; }
+      var url = request.url, started = typeof performance !== 'undefined' ? performance.now() : 0;
+      if (request.keepalive && request.__b.stream) { reject(new TypeError('Failed to fetch')); return; }
+      var finished = false;
       var onabort = function () {
         if (finished) return;
         finished = true;
-        if (timer) clearTimeout(timer);
-        reject(request.signal.reason);
+        reject(signal.reason);
       };
-      request.signal.addEventListener('abort', onabort);
-      var bytes = request.__bytes;
-      request.bodyUsed = bytes !== null;
-      timer = __net_send({
-        method: request.method, url: url, headers: request.headers.__block(), body: bytes, mode: request.mode,
-        credentials: request.credentials, redirect: request.redirect
-      }, function (res) {
+      signal.addEventListener('abort', onabort);
+      var fail = function (e) { if (finished) return; finished = true; signal.removeEventListener('abort', onabort); reject(e); };
+      if (url.slice(0, 5) === 'blob:') {
+        var blob = blobUrls[url];
+        if (!blob || request.method !== 'GET') { fail(new TypeError('Failed to fetch (blob URL not found)')); return; }
+        var bh = new Headers(); bh.set('content-type', blob.type || 'application/octet-stream'); bh.set('content-length', String(blob.size));
+        bh.__immutable = true;
+        finished = true; signal.removeEventListener('abort', onabort);
+        resolve(newResponse('basic', 200, 'OK', bh, blob.__bytes, url));
+        return;
+      }
+      var send = function (bytes) {
+        if (request.keepalive && bytes !== null && bytes.length > 65536) { fail(new TypeError('Failed to fetch')); return; }
         if (finished) return;
-        finished = true;
-        request.signal.removeEventListener('abort', onabort);
-        if (!res.ok) { reject(networkError(res)); return; }
-        var loc = new URL(res.opaque ? url : (res.url || url));
-        request.__cross = !res.opaque && loc.origin !== location.origin;
-        if (res.redirected && request.redirect === 'manual') { /* (redirects are only reported as such) */ }
-        resolve(makeResponse(res, request));
-      });
+        request.__b.used = request.__b.used || bytes !== null;
+        var referrer = referrerFor(request);
+        var options = {
+          method: request.method, url: url, headers: request.headers.__block(), body: bytes, mode: request.mode, credentials: request.credentials, redirect: request.redirect,
+          cache: request.cache, referrer: referrer, referrerPolicy: request.referrerPolicy
+        };
+        sendRequest(options, false, function (res) {
+          if (finished) return;
+          if (!res.ok) { fail(networkError(res)); return; }
+          var loc = new URL(res.opaque ? url : (res.url || url));
+          request.__cross = !res.opaque && loc.origin !== location.origin;
+          var response;
+          if (request.redirect === 'manual' && res.status >= 300 && res.status < 400 && res.headers && /(^|\n)location:/i.test(res.headers) && !res.opaque) {
+            var oh = new Headers(); oh.__immutable = true;
+            response = newResponse('opaqueredirect', 0, '', oh, null, request.url);
+          } else {
+            response = makeResponse(res, request, signal);
+          }
+          var settle = function () {
+            if (finished) return;
+            finished = true;
+            signal.removeEventListener('abort', onabort);
+            recordResource(url, started, res.body ? res.body.length : 0, 'fetch');
+            resolve(response);
+          };
+          if (request.integrity && response.type !== 'opaque' && response.type !== 'opaqueredirect') {
+            checkIntegrity(request.integrity, response.__b.bytes === null ? '' : response.__b.bytes).then(function (ok) {
+              if (!ok) fail(new TypeError("Failed to fetch: integrity check failed for '" + url + "'"));
+              else settle();
+            }, function () { fail(new TypeError('Failed to fetch')); });
+          } else settle();
+        });
+      };
+      var b = request.__b;
+      if (b.stream !== null && b.bytes === null) {   // a body that is a stream: read it all, then send
+        if (b.stream.__s.reader || b.stream.__s.disturbed) { fail(new TypeError('Failed to fetch: the request body stream is locked or disturbed')); return; }
+        b.used = true;
+        drain(b.stream).then(send, fail);
+      } else {
+        send(b.bytes);
+      }
     });
   }
   hide(g, 'fetch', fetch);
 
   // ---------------------------------------------------------------------------------------------------------------------- XMLHttpRequest
-  var FORBIDDEN_XHR_HEADERS = ['accept-charset', 'accept-encoding', 'access-control-request-headers', 'access-control-request-method', 'connection', 'content-length',
-    'cookie', 'cookie2', 'date', 'dnt', 'expect', 'host', 'keep-alive', 'origin', 'referer', 'set-cookie', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'via'];
-  function XMLHttpRequestUpload() {}
-  XMLHttpRequestUpload.prototype = Object.create(EventTarget.prototype);
+  function XMLHttpRequestEventTarget() { throw new TypeError('Illegal constructor'); }
+  XMLHttpRequestEventTarget.prototype = Object.create(EventTarget.prototype);
+  method(XMLHttpRequestEventTarget.prototype, 'constructor', XMLHttpRequestEventTarget);
+  function XMLHttpRequestUpload() { throw new TypeError('Illegal constructor'); }
+  XMLHttpRequestUpload.prototype = Object.create(XMLHttpRequestEventTarget.prototype);
+  method(XMLHttpRequestUpload.prototype, 'constructor', XMLHttpRequestUpload);
+  function initHandlers(target) { target.onloadstart = target.onprogress = target.onabort = target.onerror = target.onload = target.ontimeout = target.onloadend = null; }
   function XMLHttpRequest() {
     if (!(this instanceof XMLHttpRequest)) throw typeError("construct 'XMLHttpRequest'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
-    this.readyState = 0;
-    this.status = 0;
-    this.statusText = '';
-    this.response = '';
-    this.responseText = '';
-    this.responseURL = '';
-    this.responseXML = null;
-    this.responseType = '';
-    this.timeout = 0;
-    this.withCredentials = false;
-    this.upload = new XMLHttpRequestUpload();
-    this.onreadystatechange = this.onloadstart = this.onprogress = this.onload = this.onerror = this.onabort = this.ontimeout = this.onloadend = null;
-    hide(this, '__x', { method: 'GET', url: '', async: true, headers: new Headers(), sent: false, done: false, timer: 0, mime: null, responseHeaders: null, generation: 0 });
+    var upload = Object.create(XMLHttpRequestUpload.prototype);
+    initHandlers(upload);
+    initHandlers(this);
+    this.onreadystatechange = null;
+    hide(this, '__x', {
+      state: 0, method: 'GET', url: '', async: true, headers: new Headers(), sendFlag: false, done: false, timer: 0, mime: null, responseHeaders: null, generation: 0, status: 0, statusText: '',
+      responseURL: '', responseType: '', timeout: 0, withCredentials: false, upload: upload, received: '', total: 0, bodyBytes: null, user: null, password: null, errorFlag: false,
+      text: null, objectCache: null, uploadListener: false
+    });
   }
-  XMLHttpRequest.prototype = Object.create(EventTarget.prototype);
+  XMLHttpRequest.prototype = Object.create(XMLHttpRequestEventTarget.prototype);
   method(XMLHttpRequest.prototype, 'constructor', XMLHttpRequest);
   var states = { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 };
   Object.keys(states).forEach(function (k) {
     XMLHttpRequest[k] = states[k];
-    Object.defineProperty(XMLHttpRequest.prototype, k, { value: states[k] });
+    Object.defineProperty(XMLHttpRequest.prototype, k, { value: states[k], enumerable: true });
   });
   var X = XMLHttpRequest.prototype;
-  function xhrFire(xhr, type, loaded, total) {
+  var xprop = function (name, get, set) { Object.defineProperty(X, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  xprop('readyState', function () { return this.__x.state; });
+  xprop('status', function () { return this.__x.status; });
+  xprop('statusText', function () { return this.__x.statusText; });
+  xprop('responseURL', function () { return this.__x.responseURL; });
+  xprop('upload', function () { return this.__x.upload; });
+  xprop('timeout', function () { return this.__x.timeout; }, function (v) {
+    var x = this.__x;
+    if (!x.async && x.state > 0) throw new DOMException("Failed to set the 'timeout' property on 'XMLHttpRequest': Timeouts cannot be set for synchronous requests made from a document.", 'InvalidAccessError');
+    v = Number(v);
+    x.timeout = v !== v || v < 0 ? 0 : Math.floor(v) % 4294967296;
+  });
+  xprop('withCredentials', function () { return this.__x.withCredentials; }, function (v) {
+    var x = this.__x;
+    if ((x.state !== 0 && x.state !== 1) || x.sendFlag) throw new DOMException("Failed to set the 'withCredentials' property on 'XMLHttpRequest': The value may only be set if the object's state is UNSENT or OPENED.", 'InvalidStateError');
+    if (!x.async && x.state === 1) throw new DOMException("Failed to set the 'withCredentials' property on 'XMLHttpRequest': Synchronous requests must not set withCredentials.", 'InvalidAccessError');
+    x.withCredentials = !!v;
+  });
+  xprop('responseType', function () { return this.__x.responseType; }, function (v) {
+    var x = this.__x;
+    v = String(v);
+    if (['', 'arraybuffer', 'blob', 'document', 'json', 'text'].indexOf(v) < 0) return;   // (a value that is not a response type is ignored)
+    if (x.state === 3 || x.state === 4) throw new DOMException("Failed to set the 'responseType' property on 'XMLHttpRequest': The response type cannot be set if the object's state is LOADING or DONE.", 'InvalidStateError');
+    if (!x.async && x.state > 0) throw new DOMException("Failed to set the 'responseType' property on 'XMLHttpRequest': The response type cannot be changed for synchronous requests made from a document.", 'InvalidAccessError');
+    x.responseType = v;
+  });
+  function mimeOf(xhr) {
+    var x = xhr.__x, type = x.mime || (x.responseHeaders && x.responseHeaders.get('content-type')) || '';
+    return String(type);
+  }
+  function mimeEssence(type) { return lower(String(type).split(';')[0].trim()); }
+  function charsetOf(type) {
+    var m = /;\s*charset\s*=\s*"?([^";\s]+)"?/i.exec(String(type));
+    return m ? lower(m[1]) : null;
+  }
+  // the text of a response in the charset the response (or overrideMimeType) names; UTF-8 by default
+  function decodeText(xhr, bytes) {
+    var cs = charsetOf(mimeOf(xhr)) || 'utf-8';
+    try { return new TextDecoder(cs).decode(__string_to_bytes(bytes)); } catch (e) { return new TextDecoder('utf-8').decode(__string_to_bytes(bytes)); }
+  }
+  xprop('responseText', function () {
+    var x = this.__x;
+    if (x.responseType !== '' && x.responseType !== 'text') throw new DOMException("Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text' (was '" + x.responseType + "').", 'InvalidStateError');
+    if (x.state !== 3 && x.state !== 4) return '';
+    if (x.errorFlag) return '';
+    if (x.text === null || x.text.length !== x.received.length) x.text = { length: x.received.length, value: decodeText(this, x.received) };
+    return x.text.value;
+  });
+  function isXmlMime(type) { var e = mimeEssence(type); return e === 'text/xml' || e === 'application/xml' || /\+xml$/.test(e); }
+  xprop('responseXML', function () {
+    var x = this.__x;
+    if (x.responseType !== '' && x.responseType !== 'document') throw new DOMException("Failed to read the 'responseXML' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'document' (was '" + x.responseType + "').", 'InvalidStateError');
+    if (x.state !== 4 || x.errorFlag) return null;
+    return documentOf(this);
+  });
+  function documentOf(xhr) {
+    var x = xhr.__x;
+    if (x.objectCache && x.objectCache.kind === 'document') return x.objectCache.value;
+    var type = mimeOf(xhr), essence = mimeEssence(type), doc = null;
+    if (x.responseType === '' && !isXmlMime(type)) { x.objectCache = { kind: 'document', value: null }; return null; }
+    if (x.responseType === 'document' && essence !== 'text/html' && !isXmlMime(type) && type !== '') essence = 'text/xml';
+    try {
+      var text = decodeText(xhr, x.received);
+      doc = new DOMParser().parseFromString(text, essence === 'text/html' ? 'text/html' : (isXmlMime(type) ? (essence === 'application/xhtml+xml' ? 'application/xhtml+xml' : essence) : 'text/xml'));
+      if (doc && isXmlMime(type) && doc.getElementsByTagName('parsererror').length) doc = null;
+    } catch (e) { doc = null; }
+    x.objectCache = { kind: 'document', value: doc };
+    return doc;
+  }
+  xprop('response', function () {
+    var x = this.__x, type = x.responseType;
+    if (type === '' || type === 'text') {
+      if (x.state !== 3 && x.state !== 4) return '';
+      return this.responseText;
+    }
+    if (x.state !== 4 || x.errorFlag) return null;
+    if (x.objectCache && x.objectCache.kind === type) return x.objectCache.value;
+    var value;
+    if (type === 'json') { try { value = JSON.parse(__utf8_clean(x.received)); } catch (e) { value = null; } }
+    else if (type === 'arraybuffer') value = __string_to_bytes(x.received).buffer;
+    else if (type === 'blob') value = new Blob([x.received], { type: lower(mimeOf(this)).split(';')[0].trim() });
+    else if (type === 'document') value = documentOf(this);
+    x.objectCache = { kind: type, value: value };
+    return value;
+  });
+  function fire(target, type, loaded, total) {
     var event = type === 'readystatechange' ? new Event(type) : new ProgressEvent(type, { lengthComputable: total > 0, loaded: loaded || 0, total: total || 0 });
-    xhr.dispatchEvent(event);
+    target.dispatchEvent(event);
   }
   function setState(xhr, state) {
-    xhr.readyState = state;
-    xhrFire(xhr, 'readystatechange');
+    var x = xhr.__x;
+    if (x.state === state) return;
+    x.state = state;
+    fire(xhr, 'readystatechange');
+  }
+  function resetResponse(xhr) {
+    var x = xhr.__x;
+    x.status = 0; x.statusText = ''; x.responseURL = ''; x.responseHeaders = null; x.received = ''; x.text = null; x.objectCache = null; x.total = 0; x.errorFlag = false;
   }
   method(X, 'open', function (m, url, async, user, password) {
     if (arguments.length < 2) throw typeError("execute 'open' on 'XMLHttpRequest'", "2 arguments required, but only " + arguments.length + " present.");
@@ -2208,137 +3304,189 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     var resolved = __url_resolve(String(url), location.href);
     if (resolved === null) throw new DOMException("Failed to execute 'open' on 'XMLHttpRequest': Invalid URL", 'SyntaxError');
     var x = this.__x;
+    async = async === undefined ? true : !!async;
+    if (!async && (x.timeout !== 0 || x.responseType !== '' || x.withCredentials)) throw new DOMException("Failed to execute 'open' on 'XMLHttpRequest': Synchronous requests must not set a timeout, responseType or withCredentials.", 'InvalidAccessError');
     if (x.timer) clearTimeout(x.timer);
     x.generation++;
     x.method = SIMPLE_METHODS.indexOf(upper) >= 0 ? upper : m;
     x.url = resolved;
-    x.async = async === undefined ? true : !!async;
+    x.async = async;
+    x.user = user === undefined || user === null ? null : String(user);
+    x.password = password === undefined || password === null ? null : String(password);
     x.headers = new Headers();
-    x.sent = false; x.done = false; x.timer = 0; x.responseHeaders = null; x.mime = null;
-    if (!x.async && (this.timeout !== 0 || this.responseType !== '')) throw new DOMException("Failed to execute 'open' on 'XMLHttpRequest': Synchronous requests must not set a timeout or responseType.", 'InvalidAccessError');
-    this.status = 0; this.statusText = ''; this.response = ''; this.responseText = ''; this.responseURL = ''; this.responseXML = null;
-    if (this.readyState !== 1) setState(this, 1); else this.readyState = 1;
+    x.sendFlag = false; x.done = false; x.timer = 0; x.mime = null; x.bodyBytes = null;
+    resetResponse(this);
+    if (x.state !== 1) setState(this, 1);
   });
   method(X, 'setRequestHeader', function (name, value) {
     var x = this.__x;
-    if (this.readyState !== 1 || x.sent) throw new DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
+    if (arguments.length < 2) throw typeError("execute 'setRequestHeader' on 'XMLHttpRequest'", "2 arguments required, but only " + arguments.length + " present.");
+    if (x.state !== 1) throw new DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
+    if (x.sendFlag) throw new DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
     name = String(name);
     if (!validName(name)) throw new DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': '" + name + "' is not a valid HTTP header field name.", 'SyntaxError');
     var v = cleanValue(value);
     if (v === null) throw new DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': '" + value + "' is not a valid HTTP header field value.", 'SyntaxError');
     var lowered = lower(name);
-    if (FORBIDDEN_XHR_HEADERS.indexOf(lowered) >= 0 || lowered.indexOf('proxy-') === 0 || lowered.indexOf('sec-') === 0) return;
+    if (FORBIDDEN_REQUEST.indexOf(lowered) >= 0 || lowered.indexOf('proxy-') === 0 || lowered.indexOf('sec-') === 0) return;
     x.headers.append(lowered, v);   // (a header set twice is combined)
   });
   method(X, 'overrideMimeType', function (mime) {
-    if (this.readyState === 3 || this.readyState === 4) throw new DOMException("Failed to execute 'overrideMimeType' on 'XMLHttpRequest': MimeType cannot be overridden when the state is LOADING or DONE.", 'InvalidStateError');
-    this.__x.mime = String(mime);
+    var x = this.__x;
+    if (arguments.length < 1) throw typeError("execute 'overrideMimeType' on 'XMLHttpRequest'", "1 argument required, but only 0 present.");
+    if (x.state === 3 || x.state === 4) throw new DOMException("Failed to execute 'overrideMimeType' on 'XMLHttpRequest': MimeType cannot be overridden when the state is LOADING or DONE.", 'InvalidStateError');
+    mime = String(mime);
+    x.mime = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+/.test(mime) ? mime : 'application/octet-stream';
   });
-  function xhrFinishError(xhr, kind) {
+  // the request has ended with an error of this kind ('error', 'timeout', 'abort')
+  function terminate(xhr, kind, generation) {
     var x = xhr.__x;
+    if (x.generation !== generation) return;
     x.done = true;
-    xhr.status = 0; xhr.statusText = ''; xhr.response = xhr.responseType === '' || xhr.responseType === 'text' ? '' : null; xhr.responseText = '';
+    x.sendFlag = false;
+    x.errorFlag = true;
+    x.status = 0; x.statusText = ''; x.responseHeaders = null; x.received = ''; x.text = null; x.objectCache = null;
     setState(xhr, 4);
-    xhrFire(xhr, kind);
-    xhrFire(xhr, 'loadend');
+    if (x.generation !== generation) return;
+    if (x.uploadActive) { x.uploadActive = false; fire(x.upload, kind, 0, 0); fire(x.upload, 'loadend', 0, 0); }
+    fire(xhr, kind, 0, 0);
+    fire(xhr, 'loadend', 0, 0);
   }
-  function xhrAnswer(xhr, res, generation) {
+  var XHR_CHUNK = 65536;
+  function deliver(xhr, res, generation) {
     var x = xhr.__x;
     if (x.generation !== generation || x.done) return;
     x.timer = 0;
     if (!res.ok) {
-      if (res.error && res.error.indexOf('timed out') >= 0 && xhr.timeout > 0) xhrFinishError(xhr, 'timeout');
-      else xhrFinishError(xhr, 'error');
-      return;
+      terminate(xhr, res.error && res.error.indexOf('timed out') >= 0 && x.timeout > 0 ? 'timeout' : 'error', generation);
+      return false;
     }
-    xhr.status = res.opaque ? 0 : res.status;
-    xhr.statusText = res.opaque ? '' : res.statusText;
-    xhr.responseURL = res.url;
-    x.responseHeaders = Headers.__fromBlock(res.headers);
+    // the request body went out
+    if (x.uploadActive) {
+      x.uploadActive = false;
+      var n = x.bodyBytes === null ? 0 : x.bodyBytes.length;
+      fire(x.upload, 'progress', n, n);
+      if (x.generation !== generation) return;
+      fire(x.upload, 'load', n, n);
+      fire(x.upload, 'loadend', n, n);
+      if (x.generation !== generation) return;
+    }
+    x.status = res.opaque ? 0 : res.status;
+    x.statusText = res.opaque ? '' : res.statusText;
+    x.responseURL = res.opaque ? '' : String(res.url || x.url).replace(/#.*$/, '');
+    x.responseHeaders = Headers.__fromBlock(res.opaque ? '' : res.headers);
+    var length = x.responseHeaders.get('content-length');
+    x.total = length !== null && /^\d+$/.test(length) ? Number(length) : 0;
+    x.received = '';
     setState(xhr, 2);
     if (x.generation !== generation) return;
-    var bytes = __bytes_to_string(res.body);
-    setState(xhr, 3);
-    if (x.generation !== generation) return;
-    xhrFire(xhr, 'progress', bytes.length, bytes.length);
-    var type = xhr.responseType;
-    var mime = x.mime || (x.responseHeaders.get('content-type') || '');
-    if (type === '' || type === 'text') {
-      xhr.responseText = __utf8_clean(bytes);
-      xhr.response = xhr.responseText;
-    } else if (type === 'json') {
-      try { xhr.response = JSON.parse(__utf8_clean(bytes)); } catch (e) { xhr.response = null; }
-    } else if (type === 'arraybuffer') {
-      xhr.response = __string_to_bytes(bytes);
-    } else if (type === 'blob') {
-      xhr.response = new Blob([bytes], { type: mime });
-    } else if (type === 'document') {
-      var kind = lower(mime).indexOf('html') >= 0 ? 'text/html' : 'text/xml';
-      try { xhr.response = new DOMParser().parseFromString(__utf8_clean(bytes), kind); xhr.responseXML = xhr.response; } catch (e) { xhr.response = null; }
-    }
-    x.done = true;
-    setState(xhr, 4);
-    if (x.generation !== generation) return;
-    xhrFire(xhr, 'load', bytes.length, bytes.length);
-    xhrFire(xhr, 'loadend', bytes.length, bytes.length);
+    var bytes = __bytes_to_string(res.body), chunks = [];
+    for (var at = 0; at < bytes.length; at += XHR_CHUNK) chunks.push(bytes.slice(at, at + XHR_CHUNK));
+    var index = 0;
+    var next = function () {
+      if (x.generation !== generation || x.done) return;
+      if (index < chunks.length) {
+        x.received += chunks[index++];
+        x.text = null;
+        if (x.state !== 3) setState(xhr, 3);
+        if (x.generation !== generation) return;
+        fire(xhr, 'progress', x.received.length, x.total);
+        if (x.generation !== generation) return;
+        if (index < chunks.length && x.async) { x.timer = setTimeout(next, 0); return; }
+        if (index < chunks.length) { next(); return; }
+      }
+      x.done = true;
+      x.sendFlag = false;
+      x.timer = 0;
+      setState(xhr, 4);
+      if (x.generation !== generation) return;
+      fire(xhr, 'load', x.received.length, x.received.length);
+      fire(xhr, 'loadend', x.received.length, x.received.length);
+      recordResource(x.url, x.startedAt, x.received.length, 'xmlhttprequest');
+    };
+    next();
+    return true;
   }
   method(X, 'send', function (body) {
     var x = this.__x;
-    if (this.readyState !== 1 || x.sent) throw new DOMException("Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
+    if (x.state !== 1 || x.sendFlag) throw new DOMException("Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
     var bytes = null;
     if (body !== undefined && body !== null && x.method !== 'GET' && x.method !== 'HEAD') {
-      var b = extractBody(body);
-      if (isObject(body) && body.nodeType === 9) b = { bytes: body.documentElement ? body.documentElement.outerHTML : '', type: 'application/xml;charset=UTF-8' };
-      bytes = b.bytes;
-      if (b.type && !x.headers.has('content-type')) x.headers.set('content-type', b.type);
+      var contentType = null;
+      if (isObject(body) && typeof body.nodeType === 'number' && body.nodeType === 9) {
+        bytes = body.contentType === 'text/html' ? (body.documentElement ? body.documentElement.outerHTML : '') : new XMLSerializer().serializeToString(body);
+        contentType = body.contentType === 'text/html' ? 'text/html;charset=UTF-8' : 'application/xml;charset=UTF-8';
+      } else if (body instanceof ReadableStream) {
+        throw new TypeError("Failed to execute 'send' on 'XMLHttpRequest': Failed to convert value to 'Document'.");
+      } else {
+        var b = extractBody(body);
+        bytes = b.bytes === null ? '' : b.bytes;
+        contentType = b.type;
+      }
+      if (contentType && !x.headers.has('content-type')) x.headers.set('content-type', contentType);
+      else if (contentType && x.headers.has('content-type') && typeof body === 'string') {
+        var existing = x.headers.get('content-type'), cs = /;\s*charset\s*=/i.test(existing);
+        if (cs && !/;\s*charset\s*=\s*utf-8/i.test(existing)) x.headers.set('content-type', existing.replace(/(;\s*charset\s*=\s*)[^;]*/i, '$1UTF-8'));
+      }
     }
-    x.sent = true;
+    x.bodyBytes = bytes;
+    if (x.user !== null && !x.headers.has('authorization')) x.headers.set('authorization', 'Basic ' + btoa((x.user || '') + ':' + (x.password || '')));
+    x.sendFlag = true; x.done = false; x.errorFlag = false;
+    x.startedAt = typeof performance !== 'undefined' ? performance.now() : 0;
     var self = this, generation = x.generation;
     var options = {
-      method: x.method, url: x.url, headers: x.headers.__block(), body: bytes, mode: 'cors',
-      credentials: this.withCredentials ? 'include' : 'same-origin', redirect: 'follow', timeout: this.timeout
+      method: x.method, url: x.url, headers: x.headers.__block(), body: bytes, mode: 'cors', credentials: x.withCredentials ? 'include' : 'same-origin', redirect: 'follow',
+      timeout: x.timeout, cache: 'default', referrer: referrerFor({ __q: { referrer: 'about:client', referrerPolicy: '', url: x.url } }), referrerPolicy: ''
     };
     if (!x.async) {
-      var res = __net_send_sync(options);
-      xhrAnswer(this, res, generation);
-      if (!res.ok) throw new DOMException("Failed to execute 'send' on 'XMLHttpRequest': Failed to load '" + x.url + "'.", 'NetworkError');
+      var answer;
+      sendRequest(options, true, function (res) { answer = res; });
+      fire(this, 'loadstart', 0, 0);
+      var ok = deliver(this, answer, generation);
+      if (!answer.ok) throw new DOMException("Failed to execute 'send' on 'XMLHttpRequest': Failed to load '" + x.url + "'.", 'NetworkError');
       return;
     }
-    xhrFire(this, 'loadstart');
+    fire(this, 'loadstart', 0, 0);
     if (x.generation !== generation) return;
-    x.timer = __net_send(options, function (res) { xhrAnswer(self, res, generation); });
+    if (bytes !== null && bytes.length > 0) {
+      x.uploadActive = true;
+      fire(x.upload, 'loadstart', 0, bytes.length);
+      if (x.generation !== generation) return;
+    } else x.uploadActive = false;
+    sendRequest(options, false, function (res) { deliver(self, res, generation); });
   });
   method(X, 'abort', function () {
     var x = this.__x;
-    var active = (this.readyState === 1 && x.sent) || this.readyState === 2 || this.readyState === 3;
+    var active = (x.state === 1 && x.sendFlag) || x.state === 2 || x.state === 3;
     if (x.timer) clearTimeout(x.timer);
     x.timer = 0;
+    if (active) terminate(this, 'abort', x.generation);
     x.generation++;
-    if (active) {
-      x.done = true;
-      x.sent = false;
-      setState(this, 4);
-      xhrFire(this, 'abort');
-      xhrFire(this, 'loadend');
-    }
-    if (this.readyState === 4) { this.readyState = 0; x.done = false; }
-    this.status = 0; this.statusText = ''; this.response = ''; this.responseText = '';
+    if (x.state === 4) { x.state = 0; x.done = false; }
+    resetResponse(this);
   });
   method(X, 'getResponseHeader', function (name) {
-    var h = this.__x.responseHeaders;
-    if (!h || this.readyState < 2) return null;
-    return h.get(String(name));
+    var x = this.__x, h = x.responseHeaders;
+    if (arguments.length < 1) throw typeError("execute 'getResponseHeader' on 'XMLHttpRequest'", "1 argument required, but only 0 present.");
+    if (!h || x.state < 2 || x.errorFlag) return null;
+    name = String(name);
+    if (!validName(name)) return null;
+    if (lower(name) === 'set-cookie' || lower(name) === 'set-cookie2') return null;
+    return h.get(name);
   });
   method(X, 'getAllResponseHeaders', function () {
-    var h = this.__x.responseHeaders;
-    if (!h || this.readyState < 2) return '';
+    var x = this.__x, h = x.responseHeaders;
+    if (!h || x.state < 2 || x.errorFlag) return '';
+    var names = [];
+    h.__list.forEach(function (p) { if (names.indexOf(p[0]) < 0 && p[0] !== 'set-cookie' && p[0] !== 'set-cookie2') names.push(p[0]); });
+    names.sort();
     var out = '';
-    var entries = h.entries();
-    for (var i = 0; i < entries.length; i++) out += entries[i][0] + ': ' + entries[i][1] + '\r\n';
+    names.forEach(function (n) { out += n + ': ' + h.get(n) + '\r\n'; });
     return out;
   });
   hide(g, 'XMLHttpRequest', XMLHttpRequest);
   hide(g, 'XMLHttpRequestUpload', XMLHttpRequestUpload);
+  hide(g, 'XMLHttpRequestEventTarget', XMLHttpRequestEventTarget);
 
   // ------------------------------------------------------------------------------------------ structured clone (a value as text and back)
   // Values are written as JSON in which everything that JSON cannot say is a tagged object: {"$":"u"} undefined, {"$":"n","v":"NaN"} a number, {"$":"a","e":[..]}
@@ -4957,6 +6105,14 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     [['timing', P.timing], ['navigation', P.navigation]].forEach(function (p) { if (p[1]) defineGetter(Performance.prototype, p[0], function () { return p[1]; }); });
     ['mark', 'measure', 'getEntriesByName', 'getEntriesByType', 'now'].forEach(function (k) { try { delete P[k]; } catch (e) { } });
     hide(g, 'PerformanceObserverEntryList', klass('PerformanceObserverEntryList', null));
+    // the requests the page made (fetch, XMLHttpRequest): resource timing entries
+    hide(g, '__perf_resource', function (url, started, bytes, initiator) {
+      var e = entry(PerformanceResourceTiming, String(url), 'resource', started, Math.max(0, P.now() - started));
+      Object.defineProperty(e, 'initiatorType', { value: initiator, enumerable: true });
+      ['transferSize', 'encodedBodySize', 'decodedBodySize'].forEach(function (k) { Object.defineProperty(e, k, { value: bytes, enumerable: true }); });
+      Object.defineProperty(e, 'nextHopProtocol', { value: 'http/1.1', enumerable: true });
+      if (entries.length < 250) entries.push(e);
+    });
   }());
 
   // ---------------------------------------------------------------------------------------------------------------------------------- document

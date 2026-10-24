@@ -325,7 +325,19 @@ bool fetch_resource(allocators::IAllocator& allocator, IPageLoader& loader, Cook
         headers.append(page_origin.view());
         headers.append("\r\n");
       }
-      if (has_page && !(page.scheme.equals("https") && current.scheme.equals("http"))) {   // the referrer: the whole address within the origin, the origin alone otherwise
+      if (opt.referrer_given) {   // what the page's Request said
+        StringView value = opt.referrer;
+        if (!value.empty() && hop_cross && (opt.referrer_policy.empty() || opt.referrer_policy.equals("strict-origin-when-cross-origin") || opt.referrer_policy.equals("origin-when-cross-origin"))) {
+          const uint64_t scheme_end = value.find("://");
+          const uint64_t path = scheme_end == StringView::npos ? StringView::npos : value.find('/', scheme_end + 3);
+          if (path != StringView::npos) value = value.first(path + 1);   // (the origin and its slash)
+        }
+        if (!value.empty() && has_page && !(page.scheme.equals("https") && current.scheme.equals("http") && !opt.referrer_policy.equals("unsafe-url"))) {
+          headers.append("Referer: ");
+          headers.append(value);
+          headers.append("\r\n");
+        }
+      } else if (has_page && !(page.scheme.equals("https") && current.scheme.equals("http"))) {   // the referrer: the whole address within the origin, the origin alone otherwise
         headers.append("Referer: ");
         if (page.same_origin(current)) {
           WebUrl bare(allocator);
