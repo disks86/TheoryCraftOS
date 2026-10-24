@@ -1094,6 +1094,488 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     });
   }
 
+  // ---------------------------------------------------------------------------------------------------------------------------- Text tracks (WebVTT)
+  // TextTrack, TextTrackList, TextTrackCue, VTTCue, VTTRegion, TrackEvent and the <track> element. The file is parsed by __vtt_parse (Media/WebVtt.cpp); the cues
+  // of the tracks that are not disabled are handed to the page (__tt_publish) so that the player draws the showing ones, and the page says when the active ones
+  // change (__tt_event), which is when "enter", "exit" and "cuechange" fire.
+  var TT_KINDS = ['subtitles', 'captions', 'descriptions', 'chapters', 'metadata'];
+  var TT_MODES = ['disabled', 'hidden', 'showing'];
+  var V_VERTICAL = ['', 'rl', 'lr'], V_LINE_ALIGN = ['start', 'center', 'end'], V_POSITION_ALIGN = ['line-left', 'center', 'line-right', 'auto'];
+  var V_ALIGN = ['start', 'center', 'end', 'left', 'right'];
+  var ttSyntax = function (what, value, type) { return new DOMException("Failed to set the '" + what + "' property on '" + type + "': The provided value '" + value + "' is not a valid enum value.", 'SyntaxError'); };
+  var ttRange = function (what, type) { return new DOMException("Failed to set the '" + what + "' property on '" + type + "': The value provided is outside the allowed range of 0 to 100.", 'IndexSizeError'); };
+  var ttFinite = function (value, what, type) {
+    value = Number(value);
+    if (value !== value || value === Infinity || value === -Infinity) throw typeError("set the '" + what + "' property on '" + type + "'", 'The provided double value is non-finite.');
+    return value;
+  };
+  var ttPercent = function (value, what, type) {
+    value = ttFinite(value, what, type);
+    if (value < 0 || value > 100) throw ttRange(what, type);
+    return value;
+  };
+
+  // --- cues
+  function TextTrackCue() { throw new TypeError('Illegal constructor'); }
+  TextTrackCue.prototype = Object.create(EventTarget.prototype);
+  method(TextTrackCue.prototype, 'constructor', TextTrackCue);
+  var cueChanged = function (cue) { if (cue.__p.track) ttTrackChanged(cue.__p.track); };
+  var cueProp = function (proto, name, type, get, set) {
+    accessor(proto, name, function () { return get(this.__p); }, function (value) { set(this.__p, value, name, type); cueChanged(this); });
+  };
+  cueProp(TextTrackCue.prototype, 'id', 'TextTrackCue', function (p) { return p.id; }, function (p, v) { p.id = String(v); });
+  cueProp(TextTrackCue.prototype, 'startTime', 'TextTrackCue', function (p) { return p.start; }, function (p, v, n, t) { p.start = ttFinite(v, n, t); });
+  cueProp(TextTrackCue.prototype, 'endTime', 'TextTrackCue', function (p) { return p.end; }, function (p, v, n, t) { p.end = ttFinite(v, n, t); });
+  cueProp(TextTrackCue.prototype, 'pauseOnExit', 'TextTrackCue', function (p) { return p.pause; }, function (p, v) { p.pause = !!v; });
+  accessor(TextTrackCue.prototype, 'track', function () { return this.__p.track || null; });
+
+  function VTTCue(startTime, endTime, text) {
+    if (!(this instanceof VTTCue)) throw typeError("construct 'VTTCue'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (arguments.length < 3) throw typeError("construct 'VTTCue'", "3 arguments required, but only " + arguments.length + " present.");
+    hide(this, '__p', { id: '', start: ttFinite(startTime, 'startTime', 'VTTCue'), end: ttFinite(endTime, 'endTime', 'VTTCue'), text: String(text), pause: false, vertical: 0, snap: true,
+                        line: NaN, lineAlign: 0, position: NaN, positionAlign: 3, size: 100, align: 1, region: null, track: null });
+    this.onenter = null;
+    this.onexit = null;
+  }
+  VTTCue.prototype = Object.create(TextTrackCue.prototype);
+  method(VTTCue.prototype, 'constructor', VTTCue);
+  var enumProp = function (name, values) {
+    cueProp(VTTCue.prototype, name, 'VTTCue', function (p) { return values[p[name]]; }, function (p, v, n, t) {
+      var at = values.indexOf(String(v));
+      if (at < 0) throw ttSyntax(n, v, t);
+      p[name] = at;
+    });
+  };
+  enumProp('vertical', V_VERTICAL);
+  enumProp('lineAlign', V_LINE_ALIGN);
+  enumProp('positionAlign', V_POSITION_ALIGN);
+  enumProp('align', V_ALIGN);
+  cueProp(VTTCue.prototype, 'snapToLines', 'VTTCue', function (p) { return p.snap; }, function (p, v) { p.snap = !!v; });
+  cueProp(VTTCue.prototype, 'text', 'VTTCue', function (p) { return p.text; }, function (p, v) { p.text = String(v); });
+  cueProp(VTTCue.prototype, 'line', 'VTTCue', function (p) { return p.line !== p.line ? 'auto' : p.line; }, function (p, v, n, t) { p.line = v === 'auto' ? NaN : ttFinite(v, n, t); });
+  cueProp(VTTCue.prototype, 'position', 'VTTCue', function (p) { return p.position !== p.position ? 'auto' : p.position; }, function (p, v, n, t) { p.position = v === 'auto' ? NaN : ttPercent(v, n, t); });
+  cueProp(VTTCue.prototype, 'size', 'VTTCue', function (p) { return p.size; }, function (p, v, n, t) { p.size = ttPercent(v, n, t); });
+  cueProp(VTTCue.prototype, 'region', 'VTTCue', function (p) { return p.region; }, function (p, v) {
+    if (v !== null && !(v instanceof VTTRegion)) throw typeError("set the 'region' property on 'VTTCue'", "The provided value is not of type 'VTTRegion'.");
+    p.region = v;
+  });
+  method(VTTCue.prototype, 'getCueAsHTML', function () {
+    var holder = g.document.createElement('div'), fragment = g.document.createDocumentFragment();
+    holder.innerHTML = __vtt_html(this.__p.text);
+    while (holder.firstChild) fragment.appendChild(holder.firstChild);
+    return fragment;
+  });
+  // A cue made from what the parser found.
+  var cueFromParsed = function (o, regions) {
+    var cue = new VTTCue(o.start, o.end, o.text), p = cue.__p;
+    p.id = o.id; p.pause = o.pause; p.vertical = o.vertical; p.snap = o.snap; p.line = o.line; p.lineAlign = o.lineAlign;
+    p.position = o.position; p.positionAlign = o.positionAlign; p.size = o.size; p.align = o.align;
+    if (o.region !== '') for (var i = 0; i < regions.length; i++) if (regions[i].__p.id === o.region) p.region = regions[i];
+    return cue;
+  };
+
+  // --- regions
+  function VTTRegion() {
+    if (!(this instanceof VTTRegion)) throw typeError("construct 'VTTRegion'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    hide(this, '__p', { id: '', width: 100, lines: 3, ax: 0, ay: 100, vx: 0, vy: 100, scroll: false, tracks: [] });
+  }
+  method(VTTRegion.prototype, 'constructor', VTTRegion);
+  var regionProp = function (name, key, set, get) {
+    accessor(VTTRegion.prototype, name, get ? function () { return get(this.__p[key]); } : function () { return this.__p[key]; }, function (value) {
+      this.__p[key] = set(value, name);
+      for (var i = 0; i < this.__p.tracks.length; i++) ttTrackChanged(this.__p.tracks[i]);
+    });
+  };
+  regionProp('id', 'id', function (v) { return String(v); });
+  regionProp('width', 'width', function (v, n) { return ttPercent(v, n, 'VTTRegion'); });
+  regionProp('lines', 'lines', function (v, n) { return ttFinite(v, n, 'VTTRegion') >>> 0; });
+  regionProp('regionAnchorX', 'ax', function (v, n) { return ttPercent(v, n, 'VTTRegion'); });
+  regionProp('regionAnchorY', 'ay', function (v, n) { return ttPercent(v, n, 'VTTRegion'); });
+  regionProp('viewportAnchorX', 'vx', function (v, n) { return ttPercent(v, n, 'VTTRegion'); });
+  regionProp('viewportAnchorY', 'vy', function (v, n) { return ttPercent(v, n, 'VTTRegion'); });
+  regionProp('scroll', 'scroll', function (v, n) {
+    v = String(v);
+    if (v !== '' && v !== 'up') throw ttSyntax(n, v, 'VTTRegion');
+    return v === 'up';
+  }, function (b) { return b ? 'up' : ''; });
+  var regionObject = function (r) { return r ? { id: r.__p.id, width: r.__p.width, lines: r.__p.lines, ax: r.__p.ax, ay: r.__p.ay, vx: r.__p.vx, vy: r.__p.vy, scroll: r.__p.scroll } : null; };
+
+  // --- lists
+  function TextTrackCueList() { throw new TypeError('Illegal constructor'); }
+  method(TextTrackCueList.prototype, 'constructor', TextTrackCueList);
+  accessor(TextTrackCueList.prototype, 'length', function () { return this.__items.length; });
+  method(TextTrackCueList.prototype, 'item', function (index) { return this.__items[index >>> 0] || null; });
+  method(TextTrackCueList.prototype, 'getCueById', function (id) {
+    id = String(id);
+    for (var i = 0; id !== '' && i < this.__items.length; i++) if (this.__items[i].__p.id === id) return this.__items[i];
+    return null;
+  });
+  method(TextTrackCueList.prototype, ITER, function () { return this.__items.slice(); });
+  // Makes a list hold these items (and the indexed properties that go with them).
+  var listSet = function (list, items) {
+    for (var i = items.length; i < list.__items.length; i++) delete list[i];
+    list.__items = items;
+    for (var k = 0; k < items.length; k++) list[k] = items[k];
+  };
+  var newCueList = function () { var list = Object.create(TextTrackCueList.prototype); hide(list, '__items', []); return list; };
+
+  function VTTRegionList() { throw new TypeError('Illegal constructor'); }
+  method(VTTRegionList.prototype, 'constructor', VTTRegionList);
+  accessor(VTTRegionList.prototype, 'length', function () { return this.__items.length; });
+  method(VTTRegionList.prototype, 'item', function (index) { return this.__items[index >>> 0] || null; });
+  method(VTTRegionList.prototype, 'getRegionById', function (id) {
+    id = String(id);
+    for (var i = 0; i < this.__items.length; i++) if (this.__items[i].__p.id === id) return this.__items[i];
+    return null;
+  });
+  method(VTTRegionList.prototype, ITER, function () { return this.__items.slice(); });
+  var newRegionList = function () { var list = Object.create(VTTRegionList.prototype); hide(list, '__items', []); return list; };
+
+  // --- tracks
+  function TextTrack() { throw new TypeError('Illegal constructor'); }
+  TextTrack.prototype = Object.create(EventTarget.prototype);
+  method(TextTrack.prototype, 'constructor', TextTrack);
+  var newTrack = function (kind, label, language, element) {
+    var track = Object.create(TextTrack.prototype);
+    hide(track, '__t', { kind: kind, label: label, language: language, element: element, mode: 0, modeSet: false, ready: 0, cues: [], active: [], list: newCueList(), regions: newRegionList(),
+                         media: null, load: 0, src: null, styles: [] });
+    track.oncuechange = null;
+    return track;
+  };
+  var elementAttr = function (el, name) { var v = el.getAttribute(name); return v === null ? '' : v; };
+  accessor(TextTrack.prototype, 'kind', function () {
+    var t = this.__t;
+    if (!t.element) return t.kind;
+    var k = lower(elementAttr(t.element, 'kind'));
+    return k === '' ? 'subtitles' : TT_KINDS.indexOf(k) < 0 ? 'metadata' : k;
+  });
+  accessor(TextTrack.prototype, 'label', function () { return this.__t.element ? elementAttr(this.__t.element, 'label') : this.__t.label; });
+  accessor(TextTrack.prototype, 'language', function () { return this.__t.element ? elementAttr(this.__t.element, 'srclang') : this.__t.language; });
+  accessor(TextTrack.prototype, 'id', function () { return this.__t.element ? elementAttr(this.__t.element, 'id') : ''; });
+  accessor(TextTrack.prototype, 'inBandMetadataTrackDispatchType', function () { return ''; });
+  accessor(TextTrack.prototype, 'mode', function () { return TT_MODES[this.__t.mode]; }, function (value) {
+    var at = TT_MODES.indexOf(String(value));
+    if (at >= 0) ttSetMode(this, at, true);
+  });
+  accessor(TextTrack.prototype, 'cues', function () { return this.__t.mode === 0 ? null : this.__t.list; });
+  accessor(TextTrack.prototype, 'activeCues', function () {
+    if (this.__t.mode === 0) return null;
+    var list = newCueList();
+    listSet(list, ttActiveOf(this));
+    return list;
+  });
+  accessor(TextTrack.prototype, 'regions', function () { return this.__t.mode === 0 ? null : this.__t.regions; });
+  method(TextTrack.prototype, 'addCue', function (cue) {
+    if (arguments.length < 1) throw typeError("execute 'addCue' on 'TextTrack'", '1 argument required, but only 0 present.');
+    if (!(cue instanceof TextTrackCue)) throw typeError("execute 'addCue' on 'TextTrack'", "parameter 1 is not of type 'TextTrackCue'.");
+    var t = this.__t, old = cue.__p.track;
+    if (old === this) return;
+    if (old) old.removeCue(cue);
+    t.cues.push(cue);
+    cue.__p.track = this;
+    ttTrackChanged(this);
+  });
+  method(TextTrack.prototype, 'removeCue', function (cue) {
+    if (arguments.length < 1) throw typeError("execute 'removeCue' on 'TextTrack'", '1 argument required, but only 0 present.');
+    if (!(cue instanceof TextTrackCue)) throw typeError("execute 'removeCue' on 'TextTrack'", "parameter 1 is not of type 'TextTrackCue'.");
+    var t = this.__t, at = t.cues.indexOf(cue);
+    if (at < 0) throw new DOMException("Failed to execute 'removeCue' on 'TextTrack': The specified cue is not listed in the TextTrack's list of cues.", 'NotFoundError');
+    t.cues.splice(at, 1);
+    cue.__p.track = null;
+    var active = t.active.indexOf(cue);
+    if (active >= 0) t.active.splice(active, 1);
+    ttTrackChanged(this);
+  });
+  var ttDropRegion = function (track, at) {
+    var list = track.__t.regions, region = list.__items[at], users = region.__p.tracks, items = list.__items.slice();
+    items.splice(at, 1);
+    listSet(list, items);
+    if (users.indexOf(track) >= 0) users.splice(users.indexOf(track), 1);
+  };
+  method(TextTrack.prototype, 'addRegion', function (region) {
+    if (!(region instanceof VTTRegion)) throw typeError("execute 'addRegion' on 'TextTrack'", "parameter 1 is not of type 'VTTRegion'.");
+    var list = this.__t.regions, items = list.__items;
+    for (var i = 0; i < items.length; i++) if (region.__p.id !== '' && items[i].__p.id === region.__p.id) { ttDropRegion(this, i); break; }
+    var next = list.__items.slice();
+    next.push(region);
+    listSet(list, next);
+    region.__p.tracks.push(this);
+    ttTrackChanged(this);
+  });
+  method(TextTrack.prototype, 'removeRegion', function (region) {
+    if (!(region instanceof VTTRegion)) throw typeError("execute 'removeRegion' on 'TextTrack'", "parameter 1 is not of type 'VTTRegion'.");
+    var at = this.__t.regions.__items.indexOf(region);
+    if (at < 0) throw new DOMException("Failed to execute 'removeRegion' on 'TextTrack': The specified region is not listed in the TextTrack's list of regions.", 'NotFoundError');
+    ttDropRegion(this, at);
+    ttTrackChanged(this);
+  });
+
+  // The cues of a track in the order of the standard: by start time, then end time, then as they were added (a stable sort; mostly sorted already).
+  var ttSort = function (cues) {
+    for (var i = 1; i < cues.length; i++) {
+      var cue = cues[i], p = cue.__p, j = i - 1;
+      while (j >= 0 && (cues[j].__p.start > p.start || (cues[j].__p.start === p.start && cues[j].__p.end > p.end))) { cues[j + 1] = cues[j]; j--; }
+      cues[j + 1] = cue;
+    }
+  };
+  var ttActiveOf = function (track) {
+    var t = track.__t, out = [];
+    if (t.mode === 0 || !t.media) return out;
+    var now = t.media.currentTime;
+    for (var i = 0; i < t.cues.length; i++) if (t.cues[i].__p.start <= now && now < t.cues[i].__p.end) out.push(t.cues[i]);
+    return out;
+  };
+  var ttTrackChanged = function (track) {
+    var t = track.__t;
+    ttSort(t.cues);
+    listSet(t.list, t.cues.slice());
+    if (t.media) ttSchedulePublish(t.media);
+  };
+  var ttSchedulePublish = function (media) {
+    var s = ttOf(media);
+    if (s.queued) return;
+    s.queued = true;
+    setTimeout(function () {
+      s.queued = false;
+      var cues = [];
+      for (var i = 0; i < s.list.__items.length; i++) {
+        var t = s.list.__items[i].__t;
+        if (t.mode === 0) continue;
+        for (var k = 0; k < t.cues.length; k++) {
+          var p = t.cues[k].__p;
+          cues.push({ show: t.mode === 2, start: p.start, end: p.end, id: p.id, text: p.text, vertical: p.vertical, snap: p.snap, line: p.line, lineAlign: p.lineAlign, position: p.position,
+                      positionAlign: p.positionAlign, size: p.size, align: p.align, region: regionObject(p.region) });
+        }
+      }
+      __tt_publish(media, cues);
+    }, 0);
+  };
+  var ttFire = function (target, event) { target.dispatchEvent(event); };
+
+  // --- the tracks of a media element
+  function TextTrackList() { throw new TypeError('Illegal constructor'); }
+  TextTrackList.prototype = Object.create(EventTarget.prototype);
+  method(TextTrackList.prototype, 'constructor', TextTrackList);
+  accessor(TextTrackList.prototype, 'length', function () { return this.__items.length; });
+  method(TextTrackList.prototype, 'item', function (index) { return this.__items[index >>> 0] || null; });
+  method(TextTrackList.prototype, 'getTrackById', function (id) {
+    id = String(id);
+    for (var i = 0; i < this.__items.length; i++) if (this.__items[i].id === id) return this.__items[i];
+    return null;
+  });
+  method(TextTrackList.prototype, ITER, function () { return this.__items.slice(); });
+
+  function TrackEvent(type, init) {
+    var event = new Event(type, init);
+    Object.setPrototypeOf(event, TrackEvent.prototype);
+    var track = init && init.track !== undefined ? init.track : null;
+    if (track !== null && !(track instanceof TextTrack)) throw typeError("construct 'TrackEvent'", "The provided value is not of type '(VideoTrack or AudioTrack or TextTrack)'.");
+    Object.defineProperty(event, 'track', { value: track, enumerable: true });
+    return event;
+  }
+  TrackEvent.prototype = Object.create(Event.prototype);
+  method(TrackEvent.prototype, 'constructor', TrackEvent);
+
+  var ttOf = function (media) {
+    var s = media.__tt;
+    if (!s) {
+      var list = Object.create(TextTrackList.prototype);
+      hide(list, '__items', []);
+      list.onaddtrack = null; list.onremovetrack = null; list.onchange = null;
+      s = { list: list, queued: false };
+      Object.defineProperty(media, '__tt', { value: s });
+    }
+    return s;
+  };
+  var ttAttach = function (media, track) {
+    var list = ttOf(media).list, items = list.__items.slice();
+    track.__t.media = media;
+    items.push(track);
+    listSet(list, items);
+    ttSchedulePublish(media);
+    setTimeout(function () { ttFire(list, new TrackEvent('addtrack', { track: track })); }, 0);
+  };
+  var ttDetach = function (media, track) {
+    var list = ttOf(media).list, items = list.__items.slice(), at = items.indexOf(track);
+    if (at < 0) return;
+    items.splice(at, 1);
+    listSet(list, items);
+    track.__t.media = null;
+    track.__t.active = [];
+    ttSchedulePublish(media);
+    setTimeout(function () { ttFire(list, new TrackEvent('removetrack', { track: track })); }, 0);
+  };
+  var ttSetMode = function (track, mode, byScript) {
+    var t = track.__t;
+    if (byScript) t.modeSet = true;
+    if (t.mode === mode) return;
+    t.mode = mode;
+    if (mode === 0) t.active = [];
+    ttLoad(track);
+    ttTrackChanged(track);
+    if (t.media) {
+      var list = ttOf(t.media).list;
+      setTimeout(function () { ttFire(list, new Event('change')); }, 0);
+    }
+  };
+
+  // --- <track> elements
+  var ttSrc = function (el) {
+    var v = el.getAttribute('src');
+    if (v === null || v === '') return '';
+    try { return new URL(v, g.document.baseURI).href; } catch (e) { return v; }
+  };
+  var ttElementTrack = function (el) {
+    var t = el.__trk;
+    if (!t) {
+      t = newTrack('subtitles', '', '', el);
+      Object.defineProperty(el, '__trk', { value: t });
+    }
+    return t;
+  };
+  // Fetches and reads the file of a <track> whose mode is not "disabled".
+  var ttLoad = function (track) {
+    var t = track.__t, el = t.element;
+    if (!el || t.mode === 0) return;
+    var src = ttSrc(el);
+    if (src === '' || (src === t.src && t.ready !== 0)) return;
+    t.src = src;
+    var id = ++t.load;
+    t.ready = 1;
+    t.cues = [];
+    t.active = [];
+    ttTrackChanged(track);
+    var fail = function () {
+      if (t.load !== id) return;
+      t.ready = 3;
+      ttFire(el, new Event('error'));
+    };
+    g.fetch(src).then(function (response) {
+      if (!response.ok) throw new Error('status');
+      return response.text();
+    }).then(function (text) {
+      if (t.load !== id) return;
+      var parsed = __vtt_parse(text);
+      if (!parsed) { fail(); return; }
+      var regions = [], list = t.regions;
+      listSet(list, []);
+      for (var i = 0; i < parsed.regions.length; i++) {
+        var r = new VTTRegion(), o = parsed.regions[i];
+        r.__p.id = o.id; r.__p.width = o.width; r.__p.lines = o.lines; r.__p.ax = o.ax; r.__p.ay = o.ay; r.__p.vx = o.vx; r.__p.vy = o.vy; r.__p.scroll = o.scroll;
+        r.__p.tracks.push(track);
+        regions.push(r);
+      }
+      listSet(list, regions.slice());
+      t.styles = parsed.styles;
+      t.cues = [];
+      for (var k = 0; k < parsed.cues.length; k++) {
+        var cue = cueFromParsed(parsed.cues[k], regions);
+        cue.__p.track = track;
+        t.cues.push(cue);
+      }
+      t.ready = 2;
+      ttTrackChanged(track);
+      ttFire(el, new Event('load'));
+    }).then(null, fail);
+  };
+  // Makes the text tracks of the <track> children of a media element (and drops those of children that are gone).
+  var ttSync = function (media) {
+    var list = ttOf(media).list, children = media.children, present = [];
+    for (var i = 0; i < children.length; i++) if (lower(children[i].localName || children[i].tagName) === 'track') present.push(children[i]);
+    for (var k = list.__items.length - 1; k >= 0; k--) {
+      var existing = list.__items[k];
+      if (existing.__t.element && present.indexOf(existing.__t.element) < 0) ttDetach(media, existing);
+    }
+    for (var n = 0; n < present.length; n++) {
+      var el = present[n], track = ttElementTrack(el), t = track.__t;
+      if (t.media !== media) {
+        ttAttach(media, track);
+        if (!t.modeSet && el.hasAttribute('default')) {   // (the "default" track is shown, unless another of its kind already is)
+          var kind = track.kind, caption = kind === 'subtitles' || kind === 'captions', shown = false;
+          for (var j = 0; j < list.__items.length; j++) {
+            var other = list.__items[j], ok = other.kind;
+            shown = shown || (other !== track && other.__t.mode === 2 && (ok === 'subtitles' || ok === 'captions') === caption);
+          }
+          if (!shown) ttSetMode(track, caption ? 2 : 1, false);
+        }
+      }
+      if (t.mode !== 0 && ttSrc(el) !== t.src) ttLoad(track);
+    }
+  };
+  // The cues that are active now, for each track: "exit" and "enter" at the cues, "cuechange" at the track and its element.
+  var ttTick = function (media) {
+    var list = ttOf(media).list, now = media.currentTime, pause = false;
+    for (var i = 0; i < list.__items.length; i++) {
+      var track = list.__items[i], t = track.__t, active = ttActiveOf(track), before = t.active, exited = [], entered = [], j;
+      t.active = active;
+      for (j = 0; j < before.length; j++) if (active.indexOf(before[j]) < 0) exited.push(before[j]);
+      for (j = 0; j < active.length; j++) if (before.indexOf(active[j]) < 0) entered.push(active[j]);
+      for (j = 0; j < exited.length; j++) {
+        ttFire(exited[j], new Event('exit'));
+        if (exited[j].__p.pause && !media.paused && exited[j].__p.end <= now) pause = true;
+      }
+      for (j = 0; j < entered.length; j++) ttFire(entered[j], new Event('enter'));
+      if (exited.length !== 0 || entered.length !== 0) {
+        ttFire(track, new Event('cuechange'));
+        if (t.element) ttFire(t.element, new Event('cuechange'));
+      }
+    }
+    if (pause) media.pause();
+  };
+
+  hide(g, '__text_tracks', function (media) {
+    ttSync(media);
+    return ttOf(media).list;
+  });
+  hide(g, '__tt_event', function (serial) {
+    var media = __node_by_serial(serial);
+    if (!media) return;
+    ttSync(media);
+    ttTick(media);
+  });
+  hide(g, '__track_get', function (el, key) {
+    switch (key) {
+      case 'kind': { var k = lower(elementAttr(el, 'kind')); return k === '' ? 'subtitles' : TT_KINDS.indexOf(k) < 0 ? 'metadata' : k; }
+      case 'src': return ttSrc(el);
+      case 'srclang': return elementAttr(el, 'srclang');
+      case 'label': return elementAttr(el, 'label');
+      case 'default': return el.hasAttribute('default');
+      case 'readyState': return ttElementTrack(el).__t.ready;
+      case 'track': return ttElementTrack(el);
+    }
+    return undefined;
+  });
+  hide(g, '__track_set', function (el, key, value) {
+    if (key === 'default') { if (value) el.setAttribute('default', ''); else el.removeAttribute('default'); }
+    else el.setAttribute(key, String(value));
+  });
+  if (g.HTMLMediaElement) {
+    method(g.HTMLMediaElement.prototype, 'addTextTrack', function (kind, label, language) {
+      if (arguments.length < 1) throw typeError("execute 'addTextTrack' on 'HTMLMediaElement'", '1 argument required, but only 0 present.');
+      kind = String(kind);
+      if (TT_KINDS.indexOf(kind) < 0) throw typeError("execute 'addTextTrack' on 'HTMLMediaElement'", "The provided value '" + kind + "' is not a valid enum value of type TextTrackKind.");
+      var track = newTrack(kind, label === undefined ? '' : String(label), language === undefined ? '' : String(language), null);
+      track.__t.mode = 1;
+      track.__t.modeSet = true;
+      track.__t.ready = 2;
+      ttSync(this);
+      ttAttach(this, track);
+      return track;
+    });
+  }
+  if (g.HTMLTrackElement) {
+    var trackConstants = { NONE: 0, LOADING: 1, LOADED: 2, ERROR: 3 };
+    for (var constant in trackConstants) { g.HTMLTrackElement[constant] = trackConstants[constant]; g.HTMLTrackElement.prototype[constant] = trackConstants[constant]; }
+  }
+  hide(g, 'TextTrack', TextTrack);
+  hide(g, 'TextTrackList', TextTrackList);
+  hide(g, 'TextTrackCue', TextTrackCue);
+  hide(g, 'TextTrackCueList', TextTrackCueList);
+  hide(g, 'VTTCue', VTTCue);
+  hide(g, 'VTTRegion', VTTRegion);
+  hide(g, 'VTTRegionList', VTTRegionList);
+  hide(g, 'TrackEvent', TrackEvent);
+
   // ---------------------------------------------------------------------------------------------------------------------------- FileReader
   function FileReader() {
     this.readyState = 0; this.result = null; this.error = null;

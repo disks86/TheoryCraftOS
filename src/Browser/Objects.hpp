@@ -45,6 +45,7 @@
 #include "Media/Image.hpp"
 #include "Media/Eme.hpp"
 #include "Media/Mse.hpp"
+#include "Media/WebVtt.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
@@ -222,6 +223,16 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void video_set_default_rate(uint32_t serial, double rate);   // defaultPlaybackRate: what playbackRate is after load()
   void video_load(uint32_t serial);   // fetch again
 
+  // --- Text tracks (WebVTT): script owns the tracks and their cues; this holds a copy of what is not disabled, to draw the cues of the tracks that are
+  // showing and to tell script when the cues that are active (the position is within start .. end) change.
+  struct TrackCue {
+    explicit TrackCue(allocators::IAllocator& a) : cue(a) {}
+    media::VttCue cue;
+    bool showing = false;   // the track's mode is "showing" (otherwise "hidden": events but no drawing)
+  };
+  // Replaces the cues of the video (in the order they are drawn and numbered).
+  void video_set_cues(uint32_t serial, List<UniquePointer<TrackCue>>&& cues);
+
  private:
   struct Scaled {
     ArrayView<uint32_t> pixels;
@@ -244,11 +255,14 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     Scaled scaled;
   };
   struct VideoSlot {
-    explicit VideoSlot(allocators::IAllocator& a) : url(a), poster(a) {}
+    explicit VideoSlot(allocators::IAllocator& a) : url(a), poster(a), cues(a) {}
     uint32_t serial = 0;
     String url, poster;
     int32_t poster_cache = -1;
     UniquePointer<IVideoClip> clip;
+    List<UniquePointer<TrackCue>> cues;
+    uint64_t active_signature = 0;   // which of the cues were active at the last update()
+    uint64_t track_signature = 0;    // of the <track> children (their serials and attributes), to tell script when they change
     uint8_t state = 0;           // 0 nothing yet, 1 ready, 2 failed
     bool audio = false, seen = false, controls = false, loop = false, muted = false, autoplay = false, ended = false, was_playing = false, announced = false, wants_play = false;
     bool has_source = false;     // the element names a file (it may not be fetched yet)
@@ -316,6 +330,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void queue(uint32_t serial, const char* type);
   void draw_scaled(graphics::IRenderer2D& r, Scaled& cache, const ImageSource& src, uint32_t frame, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip,
                    bool fit);
+  void draw_cues(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h);
   void draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip);
   uint32_t image_frame(const CachedImage& c) const;
   void release_scaled(Scaled* s);

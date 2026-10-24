@@ -115,6 +115,7 @@ bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest'
 // Uint8Array objects (DomBindingsMedia.cpp): a new one holding these bytes, and the bytes of one (a view into the array; false for anything else).
 JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes);
 bool byte_array_bytes(const Value& v, StringView* out);
+bool install_tracks(DomBindings::Impl& c);   // the natives under text tracks and WebVTT (DomBindingsTracks.cpp)
 bool install_mse(DomBindings::Impl& c);    // the natives under MediaSource and SourceBuffer (DomBindingsMse.cpp)
 // A TimeRanges holding `count` ranges, as start and end seconds one after the other in `pairs`.
 Value make_time_ranges(DomBindings::Impl& c, const double* pairs, uint32_t count);

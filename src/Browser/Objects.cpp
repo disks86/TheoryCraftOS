@@ -674,6 +674,25 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
   slot->controls = dom::has_attribute(n, "controls");
   slot->loop = dom::has_attribute(n, "loop");
   slot->autoplay = dom::has_attribute(n, "autoplay");
+  {   // the <track> children: script is told when they come, go or change (it loads them and makes the text tracks)
+    uint64_t signature = 0;
+    for (dom::Node* child = n->first_child; child; child = child->next) {
+      if (!child->is_tag("track")) continue;
+      auto mix = [&signature](StringView text) {
+        for (char c : text) signature = (signature ^ static_cast<uint8_t>(c)) * 1099511628211ull;
+        signature = (signature ^ 0xFF) * 1099511628211ull;
+      };
+      signature = (signature ^ child->serial) * 1099511628211ull;
+      for (const char* name : {"kind", "src", "srclang", "label", "default"}) {
+        StringView value;
+        mix(dom::get_attribute(child, name, &value) ? value : StringView("\x01"));
+      }
+    }
+    if (signature != slot->track_signature) {
+      slot->track_signature = signature;
+      queue(n->serial, "__tt");
+    }
+  }
   if (dom::has_attribute(n, "muted")) slot->muted = slot->muted || slot->state == 0;
   // the poster
   const StringView poster = slot->audio ? StringView() : attr(n, "poster").trimmed();
@@ -884,6 +903,19 @@ void PageObjects::update(uint64_t now_ms) {
       dirty_ = true;
     }
     follow_clock(v);
+    if (v.cues.count() != 0) {
+      const double at = static_cast<double>(v.clip->position_us()) / 1e6;
+      uint64_t signature = 1469598103934665603ull;
+      for (uint64_t c = 0; c < v.cues.count(); ++c) {
+        const media::VttCue& cue = v.cues[c]->cue;
+        if (cue.start <= at && at < cue.end) signature = (signature ^ (c + 1)) * 1099511628211ull;
+      }
+      if (signature != v.active_signature) {
+        v.active_signature = signature;
+        queue(v.serial, "__tt");
+        dirty_ = true;
+      }
+    }
     if (v.clip->dynamic()) {
       watch_dynamic(v);
       if (const uint8_t code = v.clip->error()) {
@@ -1034,6 +1066,26 @@ void PageObjects::draw_scaled(graphics::IRenderer2D& r, Scaled& cache, const Ima
                static_cast<int32_t>(vy0));
 }
 
+// The cues of the showing text tracks that are active now.
+void PageObjects::draw_cues(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h) {
+  const double at = static_cast<double>(v.clip->position_us()) / 1e6;
+  List<const media::VttCue*> active(allocator_);
+  for (const auto& c : v.cues.view())
+    if (c->showing && c->cue.start <= at && at < c->cue.end && !active.push_back(&c->cue)) return;
+  if (active.count() == 0) return;
+  List<UniquePointer<media::VttDrawOp>> ops(allocator_);
+  const bool bar = v.controls && w >= 80 && h >= 40;
+  if (!media::layout_vtt_cues(allocator_, active.view(), w, h, bar ? 24 : 0, &ops)) return;
+  for (const auto& op : ops.view()) {
+    const int32_t ox = x + op->x, oy = y + op->y;
+    if ((op->background >> 24) != 0 && op->width != 0) r.fill_rect({ox, oy, op->width, op->height}, op->background);
+    if (op->text.empty()) continue;
+    r.draw_text(ox, oy, op->text.c_str(), op->color);
+    if (op->flags & media::VttDrawOp::Bold) r.draw_text(ox + 1, oy, op->text.c_str(), op->color);
+    if (op->flags & media::VttDrawOp::Underline) r.fill_rect({ox, oy + 14, op->width, 1}, op->color);
+  }
+}
+
 void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {
   r.set_blend(graphics::BlendMode::Alpha);
   const int64_t vx0 = x > clip.x ? x : clip.x, vy0 = y > clip.y ? y : clip.y;
@@ -1080,6 +1132,7 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
     const int32_t tw = static_cast<int32_t>(StringView(message).size()) * 8;
     if (static_cast<int32_t>(w) > tw && h >= 16) r.draw_text(x + (static_cast<int32_t>(w) - tw) / 2, y + (static_cast<int32_t>(h) - 16) / 2, message, 0xFFB0B0B0u);
   }
+  if (!v.audio && v.clip && v.cues.count() != 0) draw_cues(r, v, x, y, w, h);
   if (v.controls && w >= 80 && (v.audio ? h >= 24 : h >= 40)) {
     const int32_t bar = v.audio ? static_cast<int32_t>(h - 24) / 2 : static_cast<int32_t>(h) - 24;
     r.fill_rect(v.audio ? Rect2D{x, y, w, h} : Rect2D{x, y + bar, w, 24}, v.audio ? 0xFF202020u : 0xC0101010u);
@@ -1250,6 +1303,17 @@ CanvasBitmap* PageObjects::canvas(uint32_t serial, uint32_t width, uint32_t heig
   canvas_pixels_ += uint64_t{width} * height;
   dirty_ = true;
   return s->bitmap.get();
+}
+
+void PageObjects::video_set_cues(uint32_t serial, List<UniquePointer<TrackCue>>&& cues) {
+  Lock lock(*this);
+  VideoSlot* v = ensure_video(serial);
+  if (!v) return;
+  v->cues.clear();
+  for (uint64_t i = 0; i < cues.count(); ++i)
+    if (!v->cues.push_back(util::move(cues[i]))) break;
+  v->active_signature = 0;   // (the next update() says which are active: script asks for that when it sets them)
+  dirty_ = true;
 }
 
 void PageObjects::video_state(uint32_t serial, VideoState* out) {

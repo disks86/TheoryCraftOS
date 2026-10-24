@@ -3198,6 +3198,71 @@ static void test_picture_paint() {
   CHECK(a.live == 0);
 }
 
+
+// --- Text tracks (WebVTT) ---------------------------------------------------------------------------------------------------------
+
+static void test_text_tracks() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    env.net.answers["GET http://example.com/en.vtt"] = {200, "Content-Type: text/vtt\r\n",
+        "WEBVTT\n\nREGION\nid:r\nlines:2\n\n1\n00:00.000 --> 00:00.400\nFirst <b>cue</b>\n\n2\n00:00.600 --> 00:01.400 align:start line:3\nSecond <v Bob>voice</v>\n\n"
+        "00:01.600 --> 00:01.900 region:r\nThird\n"};
+    env.net.answers["GET http://example.com/bad.vtt"] = {200, "", "not vtt"};
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 width=320 height=180 controls><track id=t1 default kind=captions src=en.vtt srclang=en label=English><track id=t2 kind=metadata src=bad.vtt></video>"
+              "<button id=p></button><button id=b></button><script>"
+              "var v = document.getElementById('v'), t1 = document.getElementById('t1'), t2 = document.getElementById('t2'), log = [], tl = v.textTracks, track = tl[0];"
+              "log.push(tl.length, tl[0] === t1.track, tl[1] === t2.track, track.kind, track.label, track.language, track.mode, t2.track.mode, t1.readyState, t2.track.kind, tl instanceof EventTarget, tl.getTrackById('t1') === track);"
+              "log.push(track.cues.length, t1.kind, t1.srclang, t1.default, t1.src);"
+              "var ev = []; track.oncuechange = function () { var c = track.activeCues; ev.push('cc:' + c.length + (c.length ? ':' + c[0].id : '')) };"
+              "t1.addEventListener('load', function () { ev.push('load', track.cues.length, t1.readyState) }); t2.addEventListener('error', function () { ev.push('error', t2.readyState) });"
+              "t1.addEventListener('cuechange', function () { ev.push('elem') }); tl.onaddtrack = function (e) { ev.push('add:' + e.track.kind) };"
+              "t2.track.mode = 'hidden';"
+              "document.getElementById('p').onclick = function () { v.play() };"
+              "document.getElementById('b').onclick = function () {"
+              "  var c = track.cues, o = [];"
+              "  o.push(c.length, c[0].id, c[0].startTime, c[0].endTime, c[0].text, c[1].align, c[1].line, c[2].region && c[2].region.id, c[2].region && c[2].region.lines, c.getCueById('2') === c[1]);"
+              "  o.push(c[0].getCueAsHTML().childNodes.length, c[0].getCueAsHTML().lastChild.tagName, c[1].getCueAsHTML().lastChild.title, track.regions.length, track.regions.getRegionById('r').lines);"
+              "  var added = v.addTextTrack('chapters', 'Chapters', 'en'); var cue = new VTTCue(0.5, 1.5, 'x'); added.addCue(cue);"
+              "  o.push(tl.length, added.mode, added.kind, added.label, added.cues.length, cue.track === added, cue.line, cue.position, cue.size, cue.align, cue.snapToLines, cue.vertical, cue.pauseOnExit);"
+              "  try { cue.size = 101 } catch (e) { o.push(e.name) } try { cue.align = 'bogus' } catch (e) { o.push(e.name) } try { new VTTCue(0, 1) } catch (e) { o.push(e.name) }"
+              "  try { added.removeCue(c[0]) } catch (e) { o.push(e.name) } try { v.addTextTrack('bogus') } catch (e) { o.push(e.name) }"
+              "  cue.line = 5; cue.position = 10; cue.vertical = 'rl'; o.push(cue.line, cue.position, cue.vertical); added.removeCue(cue); o.push(added.cues.length, cue.track);"
+              "  track.mode = 'disabled'; o.push(track.cues, track.activeCues); track.mode = 'showing';"
+              "  console.log(log.join(' ') + ' | ' + o.join(' ') + ' | ' + ev.join(' '));"
+              "};</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    auto pump = [&](int rounds) {
+      for (int i = 0; i < rounds; ++i) {
+        double due;
+        if (page.next_timer(&due)) {
+          if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+          page.run_due_timers(env.clock);
+        }
+        page.render(&doc);
+        page.step_objects(static_cast<double>(env.clock + 40 * i));
+      }
+    };
+    pump(30);
+    page.click(page.document().element_by_id("p")->serial, 0, 0);
+    for (int step = 0; step < 6; ++step) {
+      pump(2);
+      page.step_objects(static_cast<double>(env.clock + 1000 * (step + 1)));
+      page.render(&doc);
+    }
+    pump(10);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    const std::string out = page_log(page);
+    CHECK(out.find("2 true true captions English en showing disabled 1 metadata true true 0 captions en true http://example.com/en.vtt | 3 1 0 0.4 First <b>cue</b> start 3 r 2 true 2 B Bob 1 2 3 hidden chapters Chapters 1 true auto auto 100 center true  false IndexSizeError SyntaxError TypeError NotFoundError TypeError 5 10 rl 0 ") == 0);
+    CHECK(out.find("| add:captions load 3 2 add:metadata error 3 cc:1:1 elem cc:0 elem cc:1:2 elem cc:0 elem") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
@@ -3237,6 +3302,7 @@ int main(int argc, char** argv) {
   test_eme_playback();
   test_blob_media();
   test_webm_page();
+  test_text_tracks();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();
