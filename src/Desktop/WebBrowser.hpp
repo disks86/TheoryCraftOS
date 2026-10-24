@@ -356,7 +356,7 @@ class WebBrowser : public gui::Frame {
   gui::Handler pip_handler_;
   uint32_t pip_w_ = 0, pip_h_ = 0;      // the size of its picture the page was told
   int8_t defer_fullscreen_ = 0;      // 1 enter, 2 leave (the page asked), 3 leave (the window did: Escape, another page)
-  bool fullscreen_ = false, fullscreen_maximized_ = false;
+  bool fullscreen_ = false;
   uint32_t pending_file_node_ = 0;   // the file input a picked file is for
   String defer_type_, defer_body_, request_type_, request_body_;
   uint64_t uptime_ms_ = 0, clock_base_unix_ = 0, clock_base_up_ = 0, next_due_ms_ = 0;

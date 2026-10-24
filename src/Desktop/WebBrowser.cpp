@@ -1014,6 +1014,12 @@ void WebBrowser::on_form_key(void* self, Control&) {
   namespace key = hardware::key;
   KeyArgs args;
   while (b->page_.take_key(&args)) {
+    if (args.usage == key::kEscape && b->fullscreen_) {   // (Escape leaves fullscreen first, wherever the focus is; the page does not get the key)
+      b->apply_fullscreen(false);
+      if (b->live_) b->live_->fullscreen_left();
+      b->settle();
+      continue;
+    }
     if (!b->live_) {
       b->page_.scroll_key(args);
       continue;
@@ -1448,13 +1454,7 @@ void WebBrowser::apply_fullscreen(bool on) {
   menu_.set_visible(!on);
   toolbar_.set_visible(!on);
   status_bar_.set_visible(!on);
-  if (on) {
-    fullscreen_maximized_ = state() != State::Maximized;
-    if (fullscreen_maximized_) maximize();
-  } else if (fullscreen_maximized_) {
-    fullscreen_maximized_ = false;
-    if (state() == State::Maximized) maximize();
-  }
+  set_fullscreen(on);   // (the window: no title bar, border or tab strip, covering the desktop's area)
   UiGuard lock(this);
   invalidate();
 }

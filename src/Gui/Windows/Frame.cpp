@@ -46,6 +46,27 @@ void Frame::run_closed_handler(Window* window) {
   else closed(*this);
 }
 
+bool Frame::fullscreen() const { return host_ ? host_->fullscreen_ : fullscreen_; }
+
+void Frame::set_fullscreen(bool on) {
+  UiGuard lock(this);
+  if (host_) {
+    host_->set_fullscreen(on);
+    return;
+  }
+  if (on == fullscreen_) return;
+  fullscreen_ = on;
+  if (on) {
+    fullscreen_maximized_ = state_ == State::Normal && manager_ != nullptr;
+    if (fullscreen_maximized_) maximize();
+  } else if (fullscreen_maximized_) {
+    fullscreen_maximized_ = false;
+    if (state_ == State::Maximized) restore();
+  }
+  layout();
+  invalidate();
+}
+
 void Frame::minimize() {
   UiGuard lock(this);
   if (host_) host_->minimize();
@@ -91,6 +112,10 @@ Rect2D Frame::client_rect() const {
     const int32_t pw = static_cast<int32_t>(bounds_.width) - padding().left - padding().right, ph = static_cast<int32_t>(bounds_.height) - padding().top - padding().bottom;
     return {padding().left, padding().top, static_cast<uint32_t>(pw > 0 ? pw : 0), static_cast<uint32_t>(ph > 0 ? ph : 0)};
   }
+  if (fullscreen_) {   // nothing but the surface
+    const int32_t fw = static_cast<int32_t>(bounds_.width) - padding().left - padding().right, fh = static_cast<int32_t>(bounds_.height) - padding().top - padding().bottom;
+    return {padding().left, padding().top, static_cast<uint32_t>(fw > 0 ? fw : 0), static_cast<uint32_t>(fh > 0 ? fh : 0)};
+  }
   const int32_t top = kBorder + kTitleHeight + 1;
   const int32_t w = static_cast<int32_t>(bounds_.width) - 2 * kBorder, h = static_cast<int32_t>(bounds_.height) - top - kBorder;
   return {kBorder + padding().left, top + padding().top,
@@ -122,7 +147,7 @@ bool Frame::button_enabled(Part button) const {
 Frame::Part Frame::part_at(int32_t x, int32_t y) const {
   const int32_t w = static_cast<int32_t>(bounds_.width), h = static_cast<int32_t>(bounds_.height);
   if (x < 0 || y < 0 || x >= w || y >= h) return Part::None;
-  if (host_) return Part::Client;
+  if (host_ || fullscreen_) return Part::Client;
   static const Part kButtons[8] = {Part::Close, Part::Maximize, Part::Minimize, Part::DockLeft, Part::DockRight, Part::DockTop, Part::DockBottom, Part::Tile};
   for (Part b : kButtons) {
     if ((is_dock_part(b) || b == Part::Tile) && !dock_enabled()) continue;
@@ -210,7 +235,7 @@ void Frame::draw_button(Painter& painter, Part button) {
 
 void Frame::paint(Painter& painter) {
   const Theme& t = painter.theme();
-  if (host_) {   // a tab has only its surface
+  if (host_ || fullscreen_) {   // a tab (or a window in fullscreen) has only its surface
     painter.fill({0, 0, bounds_.width, bounds_.height}, t.face);
     return;
   }

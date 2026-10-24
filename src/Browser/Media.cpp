@@ -341,7 +341,7 @@ class Evaluator {
     else if (equals_fold(name, "update")) keyword("fast");
     else if (equals_fold(name, "overflow-block") || equals_fold(name, "overflow-inline")) keyword("scroll");
     else if (equals_fold(name, "scan")) keyword("progressive");
-    else if (equals_fold(name, "display-mode")) keyword("browser");
+    else if (equals_fold(name, "display-mode")) keyword(env_.fullscreen ? "fullscreen" : "browser");
     else if (equals_fold(name, "color-gamut")) keyword("srgb");
     else if (equals_fold(name, "dynamic-range") || equals_fold(name, "video-dynamic-range")) keyword("standard");
     return h;

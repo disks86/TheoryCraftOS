@@ -31,12 +31,14 @@ constexpr uint32_t kInactiveTab = 0xFFA8A8A8u;
 // --- Geometry ---------------------------------------------------------------------------------------
 
 Rect2D TabFrame::strip_rect() const {
+  if (fullscreen_) return {0, 0, 0, 0};   // (no strip while a tab is fullscreen)
   const int32_t w = static_cast<int32_t>(bounds_.width) - 2 * kBorder;
   return {kBorder, kBorder + kTitleHeight + 1, static_cast<uint32_t>(w > 0 ? w : 0), static_cast<uint32_t>(kStripHeight)};
 }
 
 Rect2D TabFrame::client_rect() const {
   Rect2D r = Frame::client_rect();
+  if (fullscreen_) return r;
   const uint32_t strip = static_cast<uint32_t>(kStripHeight);
   r.y += kStripHeight;
   r.height = r.height > strip ? r.height - strip : 0;
@@ -197,6 +199,7 @@ void TabFrame::layout() {
 
 void TabFrame::paint(Painter& painter) {
   Frame::paint(painter);
+  if (fullscreen_) return;
   const Theme& t = painter.theme();
   const Rect2D strip = strip_rect();
   painter.fill(strip, t.face);

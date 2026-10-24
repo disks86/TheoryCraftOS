@@ -54,6 +54,21 @@ class Page::FrameEnv final : public IPageEnvironment {
   void alert(StringView text) override { owner_.env_.alert(text); }
   bool confirm(StringView text) override { return owner_.env_.confirm(text); }
   void scroll_to(int32_t) override {}
+  // A frame can go fullscreen when its <iframe> allows it: the <iframe> is then the fullscreen element of the page around it.
+  bool fullscreen_supported() override { return owner_.env_.fullscreen_supported() && owner_.frame_allows_fullscreen(serial_); }
+  bool set_fullscreen(bool on) override {
+    if (on) {
+      const bool ok = owner_.fullscreen_request(owner_.doc_.by_serial(serial_));
+      if (ok) owner_.fire_fullscreen_change(owner_.doc_.by_serial(serial_));
+      return ok;
+    }
+    dom::Node* frame = owner_.doc_.by_serial(serial_);
+    if (frame && owner_.fullscreen_element() == frame) {
+      owner_.fullscreen_exit();
+      owner_.fire_fullscreen_change(frame);
+    }
+    return true;
+  }
   uint64_t now_ms() override { return owner_.env_.now_ms(); }
   void console(int level, StringView text) override { owner_.env_.console(level, text); }
   StorageHub& local_storage_hub() override { return owner_.env_.local_storage_hub(); }
@@ -100,6 +115,7 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       storage_origin_(allocator),
       state_json_(allocator),
       referrer_(allocator),
+      fullscreen_stack_(allocator),
       focus_value_(allocator),
       invalid_text_(allocator),
       style_cache_(allocator),
@@ -324,7 +340,7 @@ const StyleSheet& Page::style_sheet() {
         ":fullscreen { background-color: #000; color: #fff; }"
         ":fullscreen { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100% !important;"
         " height: 100% !important; max-width: none !important; max-height: none !important; margin: 0 !important; box-sizing: border-box !important; z-index: 2147483647 !important; }";
-    if (fullscreen_serial_ != 0) options.extra_css = StringView(kFullscreenCss);
+    if (!fullscreen_stack_.empty()) options.extra_css = StringView(kFullscreenCss);
     collect_style_sheets(doc_, options, &style_cache_);
     style_cache_version_ = doc_.version();
     style_cache_media_ = media_;
@@ -339,6 +355,7 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
 }
 
 bool Page::render(HtmlDocument* out) {
+  prune_fullscreen();
   fetch_pending_styles();
   sync_frames();
   objects_.set_now(env_.now_ms());
@@ -360,6 +377,7 @@ bool Page::render(HtmlDocument* out) {
 }
 
 bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
+  prune_fullscreen();
   fetch_pending_styles();
   sync_frames();
   objects_.set_now(env_.now_ms());
@@ -448,7 +466,9 @@ bool Page::step_objects(double now_ms) {
 
 // --- After the page is up ------------------------------------------------------------------------------------------------------
 
-void Page::set_media(const MediaEnvironment& media) {
+void Page::set_media(const MediaEnvironment& given) {
+  MediaEnvironment media = given;
+  media.fullscreen = !fullscreen_stack_.empty();
   if (media == media_) return;
   media_ = media;
   if (!engine_ || !bindings_) return;
@@ -779,34 +799,107 @@ void Page::pip_resized(uint32_t width, uint32_t height) {
 
 // --- Fullscreen --------------------------------------------------------------------------------------------------------------------
 
-dom::Node* Page::fullscreen_element() { return fullscreen_serial_ ? doc_.by_serial(fullscreen_serial_) : nullptr; }
+dom::Node* Page::fullscreen_element() {
+  while (!fullscreen_stack_.empty()) {
+    dom::Node* n = doc_.by_serial(fullscreen_stack_[fullscreen_stack_.count() - 1]);
+    if (n && dom::is_connected(n)) return n;
+    break;   // (a removed element: prune_fullscreen() deals with it)
+  }
+  return nullptr;
+}
+
+// `fullscreenchange` at an element (the page's script hears it as for its own requests).
+void Page::fire_fullscreen_change(dom::Node* target) {
+  if (!bindings_ || !target) return;
+  const DomBindings::HookArg args[1] = {DomBindings::HookArg::of(target)};
+  bindings_->call_hook("__fs_fire", args, 1);
+}
+
+void Page::sync_fullscreen_media() {
+  const bool on = !fullscreen_stack_.empty();
+  if (media_.fullscreen == on) return;
+  media_.fullscreen = on;
+  doc_.touch();
+  if (bindings_) bindings_->media_changed();   // (display-mode: no resize event: the window's size change brings that)
+}
 
 void Page::clear_fullscreen() {
-  if (dom::Node* old = fullscreen_element()) old->form_state &= static_cast<uint8_t>(~dom::kFormFullscreen);
-  fullscreen_serial_ = 0;
+  for (uint64_t i = 0; i < fullscreen_stack_.count(); ++i)
+    if (dom::Node* n = doc_.by_serial(fullscreen_stack_[i])) n->form_state &= static_cast<uint8_t>(~dom::kFormFullscreen);
+  fullscreen_stack_.clear();
   doc_.touch();
+  sync_fullscreen_media();
 }
 
 bool Page::fullscreen_request(dom::Node* element) {
   if (!element || !element->is_element() || !dom::is_connected(element) || !env_.fullscreen_supported()) return false;
-  if (fullscreen_serial_ == 0 && !env_.set_fullscreen(true)) return false;
-  if (fullscreen_serial_ != 0) clear_fullscreen();
+  if (dom::Node* top = fullscreen_element()) {
+    if (top == element) return true;
+    bool inside = false;   // (only an element inside the fullscreen one can go fullscreen as well)
+    for (dom::Node* n = element->parent; n && !inside; n = n->parent) inside = n == top;
+    if (!inside) return false;
+  } else if (!env_.set_fullscreen(true)) {
+    return false;
+  }
+  if (!fullscreen_stack_.push_back(element->serial)) return false;
   element->form_state |= dom::kFormFullscreen;
-  fullscreen_serial_ = element->serial;
   doc_.touch();
+  sync_fullscreen_media();
   return true;
 }
 
+// exitFullscreen(): the innermost element goes back; the window when it was the last.
 void Page::fullscreen_exit() {
-  if (fullscreen_serial_ == 0) return;
-  clear_fullscreen();
-  env_.set_fullscreen(false);
+  if (fullscreen_stack_.empty()) return;
+  if (dom::Node* n = doc_.by_serial(fullscreen_stack_[fullscreen_stack_.count() - 1])) n->form_state &= static_cast<uint8_t>(~dom::kFormFullscreen);
+  fullscreen_stack_.remove_at(fullscreen_stack_.count() - 1);
+  doc_.touch();
+  if (fullscreen_stack_.empty()) env_.set_fullscreen(false);
+  sync_fullscreen_media();
 }
 
+// The window left fullscreen by itself (Escape): every element goes back.
 void Page::fullscreen_left() {
-  if (fullscreen_serial_ == 0) return;
+  if (fullscreen_stack_.empty()) return;
+  dom::Node* top = doc_.by_serial(fullscreen_stack_[fullscreen_stack_.count() - 1]);
   clear_fullscreen();
-  if (bindings_) bindings_->call_hook("__fs_left", nullptr, 0);
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page) frames_[i]->page->fullscreen_left();
+  if (bindings_) {
+    const DomBindings::HookArg args[1] = {top && dom::is_connected(top) ? DomBindings::HookArg::of(top) : DomBindings::HookArg::null()};
+    bindings_->call_hook("__fs_left", args, 1);
+  }
+}
+
+void Page::prune_fullscreen() {
+  if (fullscreen_stack_.empty()) return;
+  dom::Node* gone = nullptr;
+  bool changed = false;
+  for (uint64_t i = fullscreen_stack_.count(); i-- > 0;) {
+    dom::Node* n = doc_.by_serial(fullscreen_stack_[i]);
+    if (n && dom::is_connected(n)) continue;
+    if (n) n->form_state &= static_cast<uint8_t>(~dom::kFormFullscreen);
+    gone = n;
+    fullscreen_stack_.remove_at(i);
+    changed = true;
+  }
+  if (!changed) return;
+  if (fullscreen_stack_.empty()) env_.set_fullscreen(false);
+  doc_.touch();
+  sync_fullscreen_media();
+  if (bindings_) {
+    (void)gone;
+    const DomBindings::HookArg args[1] = {DomBindings::HookArg::null()};
+    bindings_->call_hook("__fs_left", args, 1);   // (the element is out of the document: the event goes to the document)
+  }
+}
+
+// May the page in this <iframe> use the Fullscreen API? (allowfullscreen, or allow="fullscreen".)
+bool Page::frame_allows_fullscreen(uint32_t frame_serial) {
+  dom::Node* f = doc_.by_serial(frame_serial);
+  if (!f) return false;
+  StringView allow;
+  return dom::has_attribute(f, "allowfullscreen") || (dom::get_attribute(f, "allow", &allow) && allow.contains("fullscreen"));
 }
 
 void Page::scroll_to(int32_t y) {

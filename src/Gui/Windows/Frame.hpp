@@ -99,6 +99,10 @@ class Frame : public Control {
   void maximize();   // or restore, if already maximized
   void restore();
   void close();
+  // Fullscreen: the frame fills the window manager's area with no title bar, border or tab strip (a tab does this for the window that holds it); the state it
+  // had comes back when it is switched off.
+  void set_fullscreen(bool on);
+  bool fullscreen() const;
   void activate();
   // Docks the window to `edge`, or puts it back where it was when it is docked there already (Dock::None also frees it).
   void dock(Dock edge);
@@ -150,6 +154,7 @@ class Frame : public Control {
   Dock docked_ = Dock::None;
   uint8_t tile_slot_ = 0, tile_count_ = 0;   // the place in the grid while docked_ is Tile
   TabFrame* host_ = nullptr;
+  bool fullscreen_ = false, fullscreen_maximized_ = false;
   uint8_t app_kind_ = 0;
   Rect2D home_;
   bool active_ = false, modal_ = false;

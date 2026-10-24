@@ -38,12 +38,13 @@ struct MediaEnvironment {
   bool reduced_motion = false;
   bool scripting = true;
   bool print = false;                     // the media type: print instead of screen
+  bool fullscreen = false;                // display-mode: fullscreen (an element is shown fullscreen)
   int32_t resolution_dpi = 96;
   int32_t color_bits = 8;
 
   bool operator==(const MediaEnvironment& o) const {
     return width == o.width && height == o.height && screen_width == o.screen_width && screen_height == o.screen_height && dark == o.dark &&
-           reduced_motion == o.reduced_motion && scripting == o.scripting && print == o.print && resolution_dpi == o.resolution_dpi && color_bits == o.color_bits;
+           reduced_motion == o.reduced_motion && scripting == o.scripting && print == o.print && fullscreen == o.fullscreen && resolution_dpi == o.resolution_dpi && color_bits == o.color_bits;
   }
   bool operator!=(const MediaEnvironment& o) const { return !(*this == o); }
 };

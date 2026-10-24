@@ -360,12 +360,19 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
  public:
   // The window left fullscreen by itself (the user pressed Escape): the page is told (fullscreenchange).
   void fullscreen_left();
+  bool is_fullscreen() const { return fullscreen_stack_.count() > 0; }
   // The user closed the Picture-in-Picture window / changed its size.
   void pip_left();
   void pip_resized(uint32_t width, uint32_t height);
  private:
   void clear_fullscreen();
-  uint32_t fullscreen_serial_ = 0, pip_serial_ = 0;
+  // Takes out the fullscreen elements that left the document (the window goes back when none is left; `fullscreenchange` follows).
+  void prune_fullscreen();
+  void sync_fullscreen_media();
+  void fire_fullscreen_change(dom::Node* target);
+  bool frame_allows_fullscreen(uint32_t frame_serial);
+  List<uint32_t> fullscreen_stack_;   // the elements shown fullscreen, the innermost last (requestFullscreen() on a descendant of the fullscreen element nests)
+  uint32_t pip_serial_ = 0;
   void toggle_details(dom::Node* details);
   void close_dialog_text(dom::Node* dialog, StringView value);
   bool fire(dom::Node* target, StringView type, bool bubbles = true, bool cancelable = false, dom::Node* submitter = nullptr);

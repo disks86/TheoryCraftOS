@@ -4596,16 +4596,24 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   method(EP, 'hasPointerCapture', function () { return false; });
   method(EP, 'requestPointerLock', function () {});
   // --- Fullscreen API. The window hides its own controls and the element covers the viewport (the :fullscreen rule of the page); promises and events are here.
-  var fsFire = function (target, type) { target.dispatchEvent(new Event(type, { bubbles: true, composed: true })); };
-  var fsError = function (el) {
+  var fsFire = function (target, type) {
+    target.dispatchEvent(new Event(type, { bubbles: true, composed: true }));
+    target.dispatchEvent(new Event('webkit' + type, { bubbles: true, composed: true }));   // (the old name, as the other browsers still send it)
+  };
+  var fsError = function (el, why) {
     setTimeout(function () { fsFire(el, 'fullscreenerror'); }, 0);
-    return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': API can only be initiated by a user gesture or the element cannot be fullscreen."));
+    return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': " + (why || 'API can only be initiated by a user gesture or the element cannot be fullscreen.')));
   };
   var fsRequest = function (options) {
     var el = this;
-    if (options !== undefined && options !== null && typeof options !== 'object') return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': The provided value is not of type 'FullscreenOptions'."));
+    if (options !== undefined && options !== null) {
+      if (typeof options !== 'object') return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': The provided value is not of type 'FullscreenOptions'."));
+      var ui = options.navigationUI === undefined ? 'auto' : String(options.navigationUI);
+      if (ui !== 'auto' && ui !== 'show' && ui !== 'hide') return Promise.reject(new TypeError("Failed to execute 'requestFullscreen' on 'Element': The provided value '" + ui + "' is not a valid enum value of type NavigationUI."));
+    }
     if (!el.isConnected || !__fs_supported()) return fsError(el);
     var already = __fs_element() === el;
+    if (!already && !g.__activeNow()) return fsError(el, 'API can only be initiated by a user gesture.');   // (a click or a key press of the user, a few seconds ago)
     if (!__fs_request(el)) return fsError(el);
     return new Promise(function (resolve) {
       setTimeout(function () { if (!already) fsFire(el, 'fullscreenchange'); resolve(); }, 0);
@@ -4706,7 +4714,8 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   hide(g, 'PictureInPictureWindow', PictureInPictureWindow);
   hide(g, 'PictureInPictureEvent', PictureInPictureEvent);
   // The window left fullscreen by itself (Escape): the events follow, as for exitFullscreen().
-  hide(g, '__fs_left', function () { setTimeout(function () { fsFire(g.document, 'fullscreenchange'); }, 0); });
+  hide(g, '__fs_left', function (node) { setTimeout(function () { fsFire(node || g.document, 'fullscreenchange'); }, 0); });
+  hide(g, '__fs_fire', function (node) { setTimeout(function () { fsFire(node, 'fullscreenchange'); }, 0); });
   method(DP, 'elementsFromPoint', function () { return []; });
   // (document.execCommand() is in the clipboard section below)
   method(DP, 'startViewTransition', function (callback) {
@@ -6185,11 +6194,12 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     put('featurePolicy', function () { return policy; });
     // the handler properties of the document and the window that were not there
     var handlers = ('onabort onanimationcancel onanimationend onanimationiteration onanimationstart onauxclick onbeforeinput onbeforematch onbeforetoggle onblur oncancel oncanplay oncanplaythrough onchange onclick onclose oncontextlost oncontextmenu oncontextrestored oncopy oncuechange oncut ondblclick ondrag ondragend ondragenter ondragleave ondragover ondragstart ondrop ondurationchange onemptied onended onerror onfocus onformdata ongotpointercapture oninput oninvalid onkeydown onkeypress onkeyup onload onloadeddata onloadedmetadata onloadstart onlostpointercapture onmousedown onmouseenter onmouseleave onmousemove onmouseout onmouseover onmouseup onpaste onpause onplay onplaying onpointercancel onpointerdown onpointerenter onpointerleave onpointermove onpointerout onpointerover onpointerrawupdate onpointerup onprogress onratechange onreset onresize onscroll onscrollend onsecuritypolicyviolation onseeked onseeking onselect onselectionchange onselectstart onslotchange onstalled onsubmit onsuspend ontimeupdate ontoggle ontouchcancel ontouchend ontouchmove ontouchstart ontransitioncancel ontransitionend ontransitionrun ontransitionstart onvolumechange onwaiting onwebkitanimationend onwebkitanimationiteration onwebkitanimationstart onwebkittransitionend onwheel').split(' ');
-    var docOnly = 'onfullscreenchange onfullscreenerror onpointerlockchange onpointerlockerror onreadystatechange onvisibilitychange onfreeze onresume onprerenderingchange'.split(' ');
+    var docOnly = 'onwebkitfullscreenchange onwebkitfullscreenerror onpointerlockchange onpointerlockerror onreadystatechange onvisibilitychange onfreeze onresume onprerenderingchange'.split(' ');
     handlers.concat(docOnly).forEach(function (n) { if (doc[n] === undefined) doc[n] = null; });
     var windowOnly = 'onafterprint onbeforeprint onbeforeunload onblur onerror onfocus onhashchange onlanguagechange onmessage onmessageerror onoffline ononline onpagehide onpageshow onpopstate onrejectionhandled onstorage onunhandledrejection onunload ongamepadconnected ongamepaddisconnected ondevicemotion ondeviceorientation ondeviceorientationabsolute onappinstalled onbeforeinstallprompt onpageswap onpagereveal'.split(' ');
     handlers.concat(windowOnly).forEach(function (n) { if (g[n] === undefined) g[n] = null; });
-    handlers.forEach(function (n) { if (!(n in EP)) Object.defineProperty(EP, n, { value: null, writable: true }); });
+    handlers.concat(['onfullscreenchange', 'onfullscreenerror', 'onwebkitfullscreenchange', 'onwebkitfullscreenerror']).forEach(function (n) { if (!(n in EP)) Object.defineProperty(EP, n, { value: null, writable: true }); });
+    ['onfullscreenchange', 'onfullscreenerror'].forEach(function (n) { if (doc[n] === undefined) doc[n] = null; });
     // createProcessingInstruction / createCDATASection: nodes of those types, over the comment and text nodes of the tree
     var CD = g.CharacterData, PIC = g.ProcessingInstruction, CDATA = g.CDATASection;
     var isName = function (s) { return /^[A-Za-z_:\u0080-￿][A-Za-z0-9_:.\-\u0080-￿]*$/.test(s); };
