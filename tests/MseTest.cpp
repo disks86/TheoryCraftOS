@@ -20,11 +20,15 @@
 // (tests/data/make_mse_fixtures.py), the coded frame processing, the buffered ranges, the files written for the players (decoded by the video player),
 // truncated and damaged input, and the hub.
 #include <initializer_list>
+#include <stdlib.h>
 #include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Graphics/GraphicsTypes.hpp"
+#include "Media/AudioStreaming.hpp"
+#include "Media/ByteSource.hpp"
 #include "Media/Eme.hpp"
 #include "Media/Mp4.hpp"
 #include "Media/Mse.hpp"
@@ -127,7 +131,7 @@ static void test_types() {
   CHECK(mse_type_supported("audio/mpeg", &f, &video) && f == MseFormat::Mpeg && !video);
   CHECK(mse_type_supported("audio/mp3", &f, nullptr) && f == MseFormat::Mpeg);
   CHECK(mse_type_supported("audio/aac", &f, nullptr) && f == MseFormat::Adts);
-  CHECK(!mse_type_supported("video/webm; codecs=\"vp9\"", &f, &video));
+  CHECK(!mse_type_supported("video/ogg; codecs=\"theora\"", &f, &video));
   CHECK(!mse_type_supported("video/mp4; codecs=\"hvc1.1.6.L93.B0\"", &f, &video));
   CHECK(!mse_type_supported("video/mp4; codecs=\"avc1.64001e, vp09\"", &f, &video));
   CHECK(!mse_type_supported("audio/mp4; codecs=\"avc1.64001e\"", &f, &video));
@@ -190,13 +194,14 @@ static void test_mp4_stream() {
 static void test_damaged_input() {
   TestAllocator a;
   File muxed("tests/data/mse_muxed.mp4"), mp3("tests/data/mse_audio.mp3"), aac("tests/data/mse_audio.aac");
+  File webm_file("tests/data/mse_webm.webm"), laced_dummy("tests/data/mse_live.webm");
   File cenc("tests/data/eme_cenc.mp4"), cbc1("tests/data/eme_cbc1.mp4"), cbcs("tests/data/eme_cbcs.mp4"), rotate("tests/data/eme_rotate.mp4");
-  CHECK(muxed.ok() && mp3.ok() && aac.ok() && cenc.ok() && cbc1.ok() && cbcs.ok() && rotate.ok());
-  if (!muxed.ok() || !mp3.ok() || !aac.ok() || !cenc.ok() || !cbc1.ok() || !cbcs.ok() || !rotate.ok()) return;
+  CHECK(webm_file.ok() && laced_dummy.ok() && muxed.ok() && mp3.ok() && aac.ok() && cenc.ok() && cbc1.ok() && cbcs.ok() && rotate.ok());
+  if (!webm_file.ok() || !laced_dummy.ok() || !muxed.ok() || !mp3.ok() || !aac.ok() || !cenc.ok() || !cbc1.ok() || !cbcs.ok() || !rotate.ok()) return;
   const struct {
     MseFormat format;
     const File* file;
-  } kStreams[] = {{MseFormat::Mp4, &muxed}, {MseFormat::Mpeg, &mp3}, {MseFormat::Adts, &aac}, {MseFormat::Mp4, &cenc}, {MseFormat::Mp4, &cbc1}, {MseFormat::Mp4, &cbcs}, {MseFormat::Mp4, &rotate}};
+  } kStreams[] = {{MseFormat::Mp4, &muxed}, {MseFormat::Mpeg, &mp3}, {MseFormat::Adts, &aac}, {MseFormat::Mp4, &cenc}, {MseFormat::Mp4, &cbc1}, {MseFormat::Mp4, &cbcs}, {MseFormat::Mp4, &rotate}, {MseFormat::Webm, &webm_file}, {MseFormat::Webm, &laced_dummy}};
   {
   ClearKeyStore keys(a);
   keys.add_key(1, kKid1, kKey1);
@@ -213,7 +218,13 @@ static void test_damaged_input() {
       MseSnapshotPlan plan;
       uint8_t missing[16];
       ByteBuffer out(a);
-      if (b.plan_for(r.count() ? r[0].start : 0, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok) b.snapshot(&plan, &out);
+      if (b.plan_for(r.count() ? r[0].start : 0, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok) {
+        for (uint8_t part = 0; part < 3; ++part) {   // (the whole, the picture, the sound)
+          MseSnapshotPlan p = plan;
+          p.part = part;
+          b.snapshot(&p, &out);
+        }
+      }
     }
     for (uint64_t at = 0; at < size; at += step / 2 + 1) {   // bit flips
       for (uint8_t bit : {uint8_t{0x01}, uint8_t{0x80}, uint8_t{0x55}}) {
@@ -227,7 +238,13 @@ static void test_damaged_input() {
         ByteBuffer out(a);
         List<MseBuffer::Range> r(a);
         b.buffered(&r, b.highest_end());
-        if (r.count() && b.plan_for(r[0].start, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok) b.snapshot(&plan, &out);
+        if (r.count() && b.plan_for(r[0].start, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok) {
+        for (uint8_t part = 0; part < 3; ++part) {   // (the whole, the picture, the sound)
+          MseSnapshotPlan p = plan;
+          p.part = part;
+          b.snapshot(&p, &out);
+        }
+      }
       }
     }
   }
@@ -583,6 +600,210 @@ static void test_encryption() {
   CHECK(a.live == static_cast<int>(live_with_reference));
 }
 
+// --- WebM ----------------------------------------------------------------------------------------------------------------------------------
+
+// EBML elements for hand-made streams: id, size (always as 8 bytes), payload.
+static void ebml(std::string* out, uint32_t id, const std::string& payload) {
+  int n = id > 0xFFFFFF ? 4 : id > 0xFFFF ? 3 : id > 0xFF ? 2 : 1;
+  for (int i = n - 1; i >= 0; --i) out->push_back(static_cast<char>(id >> (8 * i)));
+  out->push_back(static_cast<char>(0x01));
+  for (int i = 6; i >= 0; --i) out->push_back(static_cast<char>(payload.size() >> (8 * i)));
+  *out += payload;
+}
+static std::string ebml_uint(uint64_t v, int bytes = 4) {
+  std::string out;
+  for (int i = bytes - 1; i >= 0; --i) out.push_back(static_cast<char>(v >> (8 * i)));
+  return out;
+}
+
+// A WebM stream with one Opus track (number 1, 20 ms frames) and clusters of laced blocks: kind 1 Xiph, 2 fixed size, 3 EBML lacing, 0 none.
+static std::string laced_webm(int kind) {
+  std::string tracks, entry;
+  ebml(&entry, 0xD7, ebml_uint(1, 1));
+  ebml(&entry, 0x83, ebml_uint(2, 1));
+  ebml(&entry, 0x86, "A_OPUS");
+  ebml(&entry, 0x23E383, ebml_uint(20000000, 4));
+  std::string audio;
+  ebml(&audio, 0x9F, ebml_uint(2, 1));
+  ebml(&entry, 0xE1, audio);
+  std::string head = "OpusHead";
+  head += std::string("\x01\x02\x38\x01\x80\xBB\x00\x00\x00\x00\x00", 11);
+  ebml(&entry, 0x63A2, head);
+  ebml(&tracks, 0xAE, entry);
+  std::string info;
+  ebml(&info, 0x2AD7B1, ebml_uint(1000000, 4));
+  std::string segment;
+  ebml(&segment, 0x1549A966, info);
+  ebml(&segment, 0x1654AE6B, tracks);
+  const std::string frames[3] = {std::string(10, 'a'), std::string(300, 'b'), std::string(7, 'c')};
+  for (int cluster = 0; cluster < 2; ++cluster) {
+    std::string c;
+    ebml(&c, 0xE7, ebml_uint(cluster * 1000, 2));
+    std::string block;
+    block.push_back(static_cast<char>(0x81));   // track 1
+    block += ebml_uint(0, 2);                   // relative time
+    if (kind == 0) {
+      block.push_back(static_cast<char>(0x80));
+      block += frames[0];
+    } else if (kind == 1) {   // Xiph lacing
+      block.push_back(static_cast<char>(0x80 | 0x02));
+      block.push_back(2);
+      block.push_back(10);                                         // 10
+      block.push_back(static_cast<char>(255));                     // 300 = 255 + 45
+      block.push_back(45);
+      block += frames[0] + frames[1] + frames[2];
+    } else if (kind == 2) {   // fixed size: three of 10
+      block.push_back(static_cast<char>(0x80 | 0x04));
+      block.push_back(2);
+      block += std::string(30, 'f');
+    } else {   // EBML lacing: 10, then +290 (300), the last is the rest
+      block.push_back(static_cast<char>(0x80 | 0x06));
+      block.push_back(2);
+      block.push_back(static_cast<char>(0x80 | 10));              // first size as a 1-byte vint
+      const int diff = 290;                                       // 2-byte signed: bias 8191
+      const int raw = diff + 8191;
+      block.push_back(static_cast<char>(0x40 | (raw >> 8)));
+      block.push_back(static_cast<char>(raw & 0xFF));
+      block += frames[0] + frames[1] + frames[2];
+    }
+    ebml(&c, 0xA3, block);
+    ebml(&segment, 0x1F43B675, c);
+  }
+  std::string file, header;
+  ebml(&header, 0x4282, "webm");
+  ebml(&file, 0x1A45DFA3, header);
+  ebml(&file, 0x18538067, segment);
+  return file;
+}
+
+static double picture_difference(const graphics::Surface& surface, const File& reference) {
+  if (!reference.ok() || reference.size != static_cast<long>(surface.width * surface.height * 4)) return 1000;
+  uint64_t total = 0;
+  for (uint32_t y = 0; y < surface.height; ++y)
+    for (uint32_t x = 0; x < surface.width; ++x) {
+      const uint32_t px = surface.pixels[y * surface.pitch + x];
+      const uint8_t* ref = reference.data + (static_cast<uint64_t>(y) * surface.width + x) * 4;
+      total += static_cast<uint64_t>(abs(static_cast<int>(px & 0xFF) - ref[0])) + static_cast<uint64_t>(abs(static_cast<int>((px >> 8) & 0xFF) - ref[1])) +
+               static_cast<uint64_t>(abs(static_cast<int>((px >> 16) & 0xFF) - ref[2]));
+    }
+  return static_cast<double>(total) / (static_cast<double>(surface.width) * surface.height * 3);
+}
+
+static void test_webm() {
+  TestAllocator a;
+  MseFormat f;
+  bool video;
+  CHECK(mse_type_supported("video/webm; codecs=\"vp9, opus\"", &f, &video) && f == MseFormat::Webm && video);
+  CHECK(mse_type_supported("video/webm; codecs=\"vp09.00.10.08\"", &f, &video) && video);
+  CHECK(mse_type_supported("audio/webm; codecs=\"opus\"", &f, &video) && !video && mse_type_supported("audio/webm; codecs=vorbis", &f, &video));
+  CHECK(mse_type_supported("video/webm", &f, &video) && video);
+  CHECK(!mse_type_supported("video/webm; codecs=\"vp8\"", &f, &video) && !mse_type_supported("video/webm; codecs=\"av01.0.04M.08\"", &f, &video));
+  CHECK(!mse_type_supported("audio/webm; codecs=\"vp9\"", &f, &video) && !mse_type_supported("video/webm; codecs=\"vp9, mp4a.40.2\"", &f, &video));
+  File webm("tests/data/mse_webm.webm"), live("tests/data/mse_live.webm"), vp9("tests/data/mse_vp9.webm"), opus("tests/data/mse_opus.webm"), vorbis("tests/data/mse_vorbis.webm");
+  CHECK(webm.ok() && live.ok() && vp9.ok() && opus.ok() && vorbis.ok());
+  if (!webm.ok() || !live.ok() || !vp9.ok() || !opus.ok() || !vorbis.ok()) return;
+  for (const File* file : {&webm, &live}) {   // a stream with sizes, and one without
+    for (uint64_t piece : {uint64_t{1000000}, uint64_t{1}, uint64_t{7}, uint64_t{333}, uint64_t{4096}}) {
+      MseBuffer b(a, MseFormat::Webm, 1);
+      CHECK(b.mode() == MseBuffer::Mode::Segments && b.set_mode(MseBuffer::Mode::Sequence) && b.set_mode(MseBuffer::Mode::Segments));
+      CHECK(append_pieces(b, file->view(), piece) == MseAppend::Ok);
+      CHECK(b.init_received() && b.has_video() && b.width() == 96 && b.height() == 64 && b.track_count() == 2 && b.split_parts());
+      CHECK(range_count(b) == 1 && near(range_start(b, false), 0.0, 0.001) && near(range_end(b, false), 2.0, 0.03));
+      CHECK(near(static_cast<double>(b.highest_end()) / 1e6, 2.02, 0.03));
+    }
+  }
+  CHECK(a.live == 0);
+  {   // the two parts, played by the machine's players
+    MseBuffer b(a, MseFormat::Webm, 1);
+    CHECK(b.append(webm.view(), 0) == MseAppend::Ok);
+    MseSnapshotPlan plan;
+    CHECK(b.plan(500000, &plan) && plan.has_video);   // (from the key frame the playhead is in: at 0.5 s that is the first)
+    // the picture: an MP4 file with the VP9 track
+    MseSnapshotPlan video_plan = plan;
+    video_plan.part = 1;
+    ByteBuffer mp4(a);
+    CHECK(b.snapshot(&video_plan, &mp4) && video_plan.has_video && mp4.size() > 20000);
+    {
+      Mp4File file(a);
+      CHECK(file.open(mp4.view()) && file.track_count() == 1);
+      const Mp4Track* t = file.find(Mp4TrackKind::Video);
+      CHECK(t && t->sample_count == 50 && t->width == 96 && t->height == 64 && t->codec == 0x76703039 && t->sync[0] == 1 && t->sync[25] == 1 && t->sync[1] == 0);
+    }
+    {
+      NoPci pci;
+      hardware::SystemVideoCodecs codecs(pci, a);
+      codecs.initialize();
+      FakeClock clock;
+      video::VideoPlayer player(clock, codecs, a);
+      CHECK(player.open_media(mp4.view()) == video::OpenResult::Ok);
+      CHECK(player.frame_width() == 96 && player.frame_height() == 64 && player.frame_count() == 50 && near(static_cast<double>(player.duration_us()) / 1e6, 2.0, 0.05));
+      File first("tests/data/mse_vp9_0.bgra"), later("tests/data/mse_vp9_30.bgra");
+      CHECK(player.picture() && picture_difference(*player.picture(), first) < 3.0);
+      player.seek(1200000);   // picture 30 of 50 at 25 per second
+      CHECK(player.picture() && picture_difference(*player.picture(), later) < 3.0 && picture_difference(*player.picture(), first) > 6.0);
+    }
+    // the sound: Ogg Opus
+    MseSnapshotPlan sound_plan = plan;
+    sound_plan.part = 2;
+    ByteBuffer ogg(a);
+    CHECK(b.snapshot(&sound_plan, &ogg) && !sound_plan.has_video && ogg.size() > 4000 && memcmp(ogg.view().data(), "OggS", 4) == 0);
+    media::MemoryByteSource source(ogg.view());
+    media::AudioFileFormat detected = media::AudioFileFormat::Unknown;
+    auto stream = media::open_audio_stream(source, a, &detected);
+    CHECK(stream && detected == media::AudioFileFormat::Opus);
+    if (stream) {
+      const double seconds = static_cast<double>(stream->frame_count()) / stream->format().sample_rate;
+      CHECK(near(seconds, 2.0, 0.06));
+      uint8_t pcm[4096];
+      CHECK(stream->read(stream->frame_count() / 2, ByteView(pcm, sizeof pcm)) > 0);
+      bool loud = false;   // (a sine wave: the samples are not all zero)
+      for (uint32_t i = 0; i + 1 < sizeof pcm; i += 2) loud = loud || pcm[i] != 0 || pcm[i + 1] != 0;
+      CHECK(loud);
+    }
+    // plan says where the picture starts and base is the first frame's time
+    CHECK(near(static_cast<double>(video_plan.base_us) / 1e6, 0.0, 0.001) && near(static_cast<double>(sound_plan.base_us) / 1e6, 0.0, 0.03));
+  }
+  CHECK(a.live == 0);
+  {   // a Vorbis sound by itself: no split, one Ogg Vorbis file
+    MseBuffer b(a, MseFormat::Webm, 1);
+    MseSnapshotPlan plan;
+    ByteBuffer ogg(a);
+    CHECK(b.append(vorbis.view(), 0) == MseAppend::Ok && !b.has_video() && !b.split_parts() && b.plan(500000, &plan) && !plan.has_video && b.snapshot(&plan, &ogg));
+    media::MemoryByteSource source(ogg.view());
+    media::AudioFileFormat detected = media::AudioFileFormat::Unknown;
+    auto stream = media::open_audio_stream(source, a, &detected);
+    CHECK(stream && detected == media::AudioFileFormat::Vorbis && near(static_cast<double>(stream->frame_count()) / stream->format().sample_rate, 2.0, 0.1));
+    MseBuffer c(a, MseFormat::Webm, 2);
+    ByteBuffer ogg2(a);
+    CHECK(c.append(opus.view(), 0) == MseAppend::Ok && c.plan(500000, &plan) && c.snapshot(&plan, &ogg2) && memcmp(ogg2.view().data(), "OggS", 4) == 0);
+    // the picture alone is a whole file
+    MseBuffer d(a, MseFormat::Webm, 3);
+    ByteBuffer file(a);
+    CHECK(d.append(vp9.view(), 0) == MseAppend::Ok && d.has_video() && !d.split_parts() && d.plan(500000, &plan) && plan.has_video && d.snapshot(&plan, &file) && file.size() > 20000);
+  }
+  CHECK(a.live == 0);
+  for (int kind = 0; kind < 4; ++kind) {   // lacing: one frame, Xiph, fixed size, EBML
+    const std::string stream = laced_webm(kind);
+    MseBuffer b(a, MseFormat::Webm, 1);
+    CHECK(append_pieces(b, ConstByteView(reinterpret_cast<const uint8_t*>(stream.data()), stream.size()), kind == 3 ? 5 : 1000) == MseAppend::Ok);
+    const double frames_per_block = kind == 0 ? 1 : 3;   // 20 ms each, a block at 0 s and one at 1 s
+    CHECK(range_count(b) == 2 && near(range_end(b, false, 0), frames_per_block * 0.02, 0.001) && near(range_start(b, false, 1), 1.0, 0.001) && near(range_end(b, false, 1), 1.0 + frames_per_block * 0.02, 0.001));
+    MseBuffer c(a, MseFormat::Webm, 2);
+    ByteBuffer out(a);
+    MseSnapshotPlan plan;
+    CHECK(c.append(ConstByteView(reinterpret_cast<const uint8_t*>(stream.data()), stream.size()), 0) == MseAppend::Ok && c.plan(1000000, &plan) && c.snapshot(&plan, &out) && out.size() > 100);
+  }
+  {   // bytes that are no WebM, media before its tracks, a track that is not kept
+    MseBuffer b(a, MseFormat::Webm, 1);
+    const uint8_t junk[] = {0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(b.append(ConstByteView(junk, sizeof junk), 0) == MseAppend::Decode);
+    const std::string stream = laced_webm(0);
+    const size_t cluster = stream.find("\x1F\x43\xB6\x75");
+    CHECK(cluster != std::string::npos && b.append(ConstByteView(reinterpret_cast<const uint8_t*>(stream.data()) + cluster, stream.size() - cluster), 0) == MseAppend::Decode);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_hub() {
   TestAllocator a;
   File video("tests/data/mse_video.mp4"), audio("tests/data/mse_audio.mp4");
@@ -597,7 +818,7 @@ static void test_hub() {
   CHECK(!hub.attach(source, 8) && hub.attach(source, 7));
   MseHub::Event e;
   CHECK(hub.take_event(&e) && e.source == source && StringView(e.type).equals("sourceopen") && !hub.take_event(&e));
-  CHECK(hub.add_buffer(source, "video/webm", &vb) == MseHub::AddResult::NotSupported);
+  CHECK(hub.add_buffer(source, "video/ogg", &vb) == MseHub::AddResult::NotSupported);
   CHECK(hub.add_buffer(source, "video/mp4; codecs=\"avc1.4d401e\"", &vb) == MseHub::AddResult::Ok && hub.add_buffer(source, "audio/mp4; codecs=\"mp4a.40.2\"", &ab) == MseHub::AddResult::Ok && vb != ab);
   MseBuffer* v = hub.find_buffer(vb);
   MseBuffer* s = hub.find_buffer(ab);
@@ -649,6 +870,7 @@ int main() {
   test_damaged_input();
   test_keys();
   test_encryption();
+  test_webm();
   test_hub();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

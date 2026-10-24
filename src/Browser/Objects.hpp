@@ -185,6 +185,11 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   // --- Videos (script side)
   // --- Media sources (the MediaSource and SourceBuffer objects of script work on this; the element plays what they hold)
   media::MseHub& mse() { return mse_; }
+  // --- Blob URLs: URL.createObjectURL(blob) hands the bytes over, so that <img>, <video> and <audio> can show them (bounded; a blob too big is only
+  // left out here, fetch() still reaches it). Revoking the address forgets them; what an element has loaded stays.
+  bool register_blob(StringView url, ConstByteView bytes);
+  void revoke_blob(StringView url);
+
   // --- Encrypted media: the keys of the MediaKeys objects, and which of them an element decrypts with (setMediaKeys(); 0 for none).
   media::EmeHub& eme() { return eme_; }
   void video_set_keys(uint32_t serial, uint32_t keys);
@@ -325,6 +330,15 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   List<Event> events_;
   media::MseHub mse_;
   media::EmeHub eme_;
+  struct BlobEntry {
+    explicit BlobEntry(allocators::IAllocator& a) : url(a), data(a) {}
+    String url;
+    ByteBuffer data;
+  };
+  List<UniquePointer<BlobEntry>> blobs_;
+  uint64_t blob_bytes_ = 0;
+  static constexpr uint64_t kMaxBlobBytes = 128u << 20;
+  bool fetch_blob(StringView url, ByteBuffer* out);   // (a blob: address)
   uint64_t canvas_pixels_ = 0, now_ms_ = 0;
   uint32_t fetched_images_ = 0;
   bool dirty_ = false, accelerated_ = false;

@@ -19,7 +19,8 @@
 // The engine behind the Media Source Extensions: what a page's MediaSource and SourceBuffer objects do with the bytes they are given. No script, no
 // element in here, so it can be tested on its own (tests/MseTest.cpp).
 //
-//   byte stream formats    fragmented MP4 ("video/mp4", "audio/mp4": an initialization segment with the movie box, then moof + mdat pairs; any
+//   byte stream formats    WebM (EBML clusters of VP9 video, Opus and Vorbis sound; blocks with or without lacing; segments and clusters of unknown size, as live
+//                          streams have), fragmented MP4 ("video/mp4", "audio/mp4": an initialization segment with the movie box, then moof + mdat pairs; any
 //                          number of tracks), MPEG audio ("audio/mpeg", "audio/mp3": layers I-III of MPEG-1, 2 and 2.5, ID3 tags skipped) and AAC in
 //                          ADTS ("audio/aac"). A MseParser cuts the bytes into coded frames - in pieces of any size, a segment can be split anywhere.
 //   MseBuffer              a SourceBuffer's frames, kept as the standard's coded frame processing says: timestampOffset and the append window,
@@ -40,7 +41,7 @@
 
 namespace media {
 
-enum class MseFormat : uint8_t { Mp4, Mpeg, Adts };
+enum class MseFormat : uint8_t { Mp4, Mpeg, Adts, Webm };
 enum class MseTrackKind : uint8_t { Video, Audio };
 
 // Which byte stream format a MIME type (with its codecs parameter) names; false if this machine cannot play it. `has_video` is true if the type says a
@@ -84,8 +85,17 @@ struct MseSampleCrypto {
   ConstByteView subsamples;
 };
 
+// What file the machine's players are given for a track (see MseBuffer::snapshot()).
+enum MseContainer : uint8_t {
+  kContainerMp4 = 0,      // an MP4 file (H.264 or VP9 video, AAC or MP3 sound)
+  kContainerRaw = 1,      // the frames one after the other (MPEG audio, ADTS)
+  kContainerOpus = 2,     // Ogg Opus
+  kContainerVorbis = 3,   // Ogg Vorbis
+};
+
 struct MseTrackInfo {
   uint32_t id = 0;
+  uint8_t container = kContainerMp4;
   MseTrackKind kind = MseTrackKind::Audio;
   uint32_t codec = 0;                       // the sample entry's four-character code
   uint32_t timescale = 1000;
@@ -152,6 +162,9 @@ struct MseSnapshotPlan {
   int64_t base_us = 0;                // the time of time 0 in the written file: element time = file time + base_us (set by snapshot())
   bool has_video = false;
   uint32_t width = 0, height = 0;
+  // Which tracks the file has (set before snapshot()): 0 all, 1 the video, 2 the sound. A stream whose sound the machine's video player cannot play
+  // (Opus, Vorbis) is played by two players, one for each part.
+  uint8_t part = 0;
 };
 
 class MseBuffer final : private IMseSink {
@@ -175,6 +188,8 @@ class MseBuffer final : private IMseSink {
   bool has_video() const;
   int64_t init_duration_us() const { return init_duration_us_; }
   uint32_t track_count() const { return slot_count_; }
+  // Does the current stream need a player for the picture and another for the sound (WebM with Opus or Vorbis)?
+  bool split_parts() const;
   // What track `index` is (false if there is no such track).
   bool track_info(uint32_t index, MseTrackKind* kind, uint32_t* id) const;
 
@@ -260,6 +275,7 @@ class MseBuffer final : private IMseSink {
   bool make_room(uint64_t needed, int64_t playhead_us);
   void slot_ranges(uint32_t slot, List<Range>* out) const;
   bool write_mp4(const MseSnapshotPlan& plan, ByteBuffer* out, int64_t* base_us) const;
+  bool write_ogg(const MseSnapshotPlan& plan, MseContainer container, ByteBuffer* out, int64_t* base_us) const;
 
   allocators::IAllocator& allocator_;
   MseFormat format_;

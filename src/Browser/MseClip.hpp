@@ -63,18 +63,19 @@ class MseClip final : public IVideoClip {
   struct Child {
     UniquePointer<IVideoClip> clip;
     uint32_t buffer = 0;
+    uint8_t part = 0;   // 0 the whole file, 1 the picture, 2 the sound (a buffer whose sound the video player cannot play has a child for each)
     int64_t base = 0, start = 0, end = 0;   // element time = file time + base; the range (element time) the file covers
     uint32_t generation = 0;
     uint64_t epoch = 0, appended = 0, key_epoch = 0;
     bool video = false;
     bool started = false;   // play() was called on it (so it stopping means it ran to the end of its file)
   };
-  static constexpr uint32_t kMaxChildren = media::MseHub::kMaxBuffersPerSource;
+  static constexpr uint32_t kMaxChildren = media::MseHub::kMaxBuffersPerSource * 2;
 
-  Child* child_of(uint32_t buffer);
+  Child* child_of(uint32_t buffer, uint8_t part);
   void drop(Child* c);
   void drop_all();
-  bool open_child(media::MseBuffer& buffer, const media::MseSnapshotPlan& plan, Child* into);
+  bool open_child(media::MseBuffer& buffer, uint8_t part, const media::MseSnapshotPlan& plan, Child* into);
   Child* master();
   int64_t limit_of(const Child& c);
   void fail(uint8_t code);

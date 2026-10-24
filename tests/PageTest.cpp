@@ -1388,13 +1388,13 @@ static void test_mse() {
     MediaEnvironment media;
     Page page(a, env, "http://example.com/", media, true);
     std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><script>") + kLoad + "var v = document.getElementById('v'), log = [], ms, sb;" + watch +
-        "log.push(typeof MediaSource, MediaSource.isTypeSupported(" + type + "), MediaSource.isTypeSupported('video/webm; codecs=\"vp9\"'), MediaSource.isTypeSupported('audio/mpeg'));"
+        "log.push(typeof MediaSource, MediaSource.isTypeSupported(" + type + "), MediaSource.isTypeSupported('video/ogg; codecs=\"theora\"'), MediaSource.isTypeSupported('audio/mpeg'));"
         "ms = new MediaSource(); log.push(ms.readyState, ms.duration, ms.sourceBuffers.length, ms instanceof EventTarget);"
         "try { ms.addSourceBuffer('video/mp4') } catch (e) { log.push(e.name) }"
         "load(['mse_muxed.mp4'], function (u8) {"
         "  ms.addEventListener('sourceopen', function() {"
         "    log.push('open', ms.readyState);"
-        "    try { ms.addSourceBuffer('video/webm') } catch (e) { log.push(e.name) } try { ms.addSourceBuffer('') } catch (e) { log.push(e.name) }"
+        "    try { ms.addSourceBuffer('video/ogg') } catch (e) { log.push(e.name) } try { ms.addSourceBuffer('') } catch (e) { log.push(e.name) }"
         "    sb = ms.addSourceBuffer(" + type + ");"
         "    log.push(ms.sourceBuffers.length, ms.sourceBuffers[0] === sb, sb.mode, sb.updating, sb.timestampOffset, sb.appendWindowStart, sb.appendWindowEnd, sb.buffered.length);"
         "    ['updatestart','update','updateend','error','abort'].forEach(function(t) { sb.addEventListener(t, function() { log.push('sb:' + t + ':' + sb.updating) }) });"
@@ -1704,9 +1704,9 @@ static void test_eme() {
         "navigator.requestMediaKeySystemAccess('com.widevine.alpha', good).catch(rejected('widevine'));"
         "navigator.requestMediaKeySystemAccess('org.w3.clearkey', []).catch(rejected('empty'));"
         "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/mp4; codecs=\"avc1.4d401e\"', robustness: 'SW_SECURE_CRYPTO' }] }]).catch(rejected('robustness'));"
-        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/webm; codecs=\"vp9\"' }] }]).catch(rejected('webm'));"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/ogg; codecs=\"theora\"' }] }]).catch(rejected('webm'));"
         "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ distinctiveIdentifier: 'required' }]).catch(rejected('identifier'));"
-        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/webm' }] }, good[0]]).then(function (access) {"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/ogg' }] }, good[0]]).then(function (access) {"
         "  var c = access.getConfiguration();"
         "  log.push('access:' + access.keySystem + ':' + c.initDataTypes + ':' + c.persistentState + ':' + c.sessionTypes + ':' + c.distinctiveIdentifier + ':' + c.videoCapabilities.length + ':' + c.audioCapabilities.length);"
         "  return access.createMediaKeys();"
@@ -1914,6 +1914,76 @@ static void test_eme_playback() {
     CHECK(in_order(out, {"waitingforkey", "|", "playing", "waitingforkey", "canplay", "playing", "ended"}));
   }
   CHECK(a.live == 0);
+}
+
+// --- Blob URLs on media elements -----------------------------------------------------------------------------------------------------
+
+static void test_blob_media() {
+  TestAllocator a;
+  FakeEnvironment env(a);
+  mse_serve(env, "mse_muxed.mp4");
+  mse_serve(env, "anim.gif");
+  MediaEnvironment media;
+  Page page(a, env, "http://example.com/", media, true);
+  std::string html = std::string("<html><body><video id=v></video><img id=i><button id=b></button><script>") + kLoad +
+      "var v = document.getElementById('v'), i = document.getElementById('i'), log = [];"
+      "fetch('mse_muxed.mp4').then(function (r) { return r.blob() }).then(function (blob) {"
+      "  var url = URL.createObjectURL(new Blob([blob], { type: 'video/mp4' }));"
+      "  v.src = url; log.push(url.slice(0, 5), blob.size);"
+      "  setTimeout(function () { URL.revokeObjectURL(url) }, 200);"
+      "});"
+      "fetch('anim.gif').then(function (r) { return r.blob() }).then(function (blob) { i.src = URL.createObjectURL(blob) });"
+      "document.getElementById('b').onclick = function () { log.push(v.readyState, v.duration > 0, v.videoWidth, i.complete, i.naturalWidth > 0); console.log(log.join(' ')) };"
+      "</script></body></html>";
+  page.load(StringView(html.data(), html.size()));
+  HtmlDocument doc(a);
+  page.render(&doc);
+  mse_pump(page, env, 20, &doc);
+  page.click(page.document().element_by_id("b")->serial, 0, 0);
+  CHECK(env.opened_video == 1 && env.last_video_data.size() > 30000);
+  const std::string out = page_log(page);
+  CHECK(out.find("blob: 36838 4 true 64 true true") == 0);
+}
+
+// --- WebM in MediaSource --------------------------------------------------------------------------------------------------------------
+
+static void test_webm_page() {
+  TestAllocator a;
+  FakeEnvironment env(a);
+  mse_serve(env, "mse_webm.webm");
+  MediaEnvironment media;
+  Page page(a, env, "http://example.com/", media, true);
+  std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><button id=e></button><script>") + kLoad +
+      "var v = document.getElementById('v'), ms = new MediaSource(), sb, ev = [], log = [];"
+      "['loadedmetadata','canplay','play','playing','ended','error'].forEach(function (t) { v.addEventListener(t, function () { ev.push(t) }) });"
+      "log.push(MediaSource.isTypeSupported('video/webm; codecs=\"vp9, opus\"'), MediaSource.isTypeSupported('video/webm; codecs=\"vp8\"'), MediaSource.isTypeSupported('audio/webm; codecs=\"vorbis\"'));"
+      "load(['mse_webm.webm'], function (u8) {"
+      "  ms.addEventListener('sourceopen', function () {"
+      "    sb = ms.addSourceBuffer('video/webm; codecs=\"vp9, opus\"');"
+      "    log.push(sb.mode);"
+      "    sb.addEventListener('updateend', function () { if (ms.readyState === 'open') ms.endOfStream() });"
+      "    sb.appendBuffer(u8);"
+      "  });"
+      "  v.src = URL.createObjectURL(ms);"
+      "});"
+      "document.getElementById('b').onclick = function () { v.play() };"
+      "document.getElementById('e').onclick = function () { log.push(sb.buffered.length, sb.buffered.end(0).toFixed(1), v.duration.toFixed(1), v.videoWidth, sb.videoTracks.length, sb.audioTracks.length); console.log(log.join(' ') + ' | ' + ev.join()) };"
+      "try { ms.addSourceBuffer('video/webm; codecs=\"vp8\"') } catch (e) { log.push(e.name) }"
+      "</script></body></html>";
+  page.load(StringView(html.data(), html.size()));
+  HtmlDocument doc(a);
+  page.render(&doc);
+  mse_pump(page, env, 14, &doc);
+  page.click(page.document().element_by_id("b")->serial, 0, 0);
+  mse_pump(page, env, 25, &doc);
+  page.click(page.document().element_by_id("e")->serial, 0, 0);
+  const std::string out = page_log(page);
+  CHECK(out.find("true false true NotSupportedError segments 1 2.0 2.0 64 1 1 | ") == 0 || out.find("true false true NotSupportedError segments 1 2.0 2.0 ") == 0);
+  CHECK(in_order(out, {"loadedmetadata", "canplay", "play", "playing", "ended"}) && out.find("error") == std::string::npos);
+  // the picture and the sound are two files for two players
+  CHECK(env.opened_video == 1 && env.opened_audio == 1);
+  CHECK(env.last_video_data.size() > 20000 && env.last_video_data.compare(4, 8, "ftypisom") == 0);
+  CHECK(env.last_audio_data.size() > 4000 && env.last_audio_data.compare(0, 4, "OggS") == 0);
 }
 
 // --- Forms ------------------------------------------------------------------------------------------------------------------------
@@ -3128,6 +3198,8 @@ int main(int argc, char** argv) {
   test_mse();
   test_eme();
   test_eme_playback();
+  test_blob_media();
+  test_webm_page();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

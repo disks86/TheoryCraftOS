@@ -373,13 +373,13 @@ MseBuffer::MseBuffer(allocators::IAllocator& allocator, MseFormat format, uint32
     : allocator_(allocator), format_(format), id_(id), parser_(make_mse_parser(allocator, format)), inits_(allocator), arena_(UniquePointer<ByteBuffer>::make(allocator, allocator)), aux_(UniquePointer<ByteBuffer>::make(allocator, allocator)), encrypted_(allocator), sent_(allocator),
       range_cache_(allocator) {
   for (int8_t& m : slot_map_) m = -1;
-  if (format != MseFormat::Mp4) mode_ = Mode::Sequence;   // (the formats without timestamps of their own are always in sequence mode)
+  if (format == MseFormat::Mpeg || format == MseFormat::Adts) mode_ = Mode::Sequence;   // (the formats without timestamps of their own are always in sequence mode)
 }
 
 MseBuffer::~MseBuffer() = default;
 
 bool MseBuffer::set_mode(Mode mode) {
-  if (format_ != MseFormat::Mp4 && mode == Mode::Segments) return false;
+  if ((format_ == MseFormat::Mpeg || format_ == MseFormat::Adts) && mode == Mode::Segments) return false;
   if (mode == Mode::Sequence && mode_ != Mode::Sequence) group_start_pending_ = true;
   mode_ = mode;
   return true;
@@ -396,7 +396,8 @@ void MseBuffer::set_timestamp_offset(int64_t offset_us) {
 bool MseBuffer::change_format(MseFormat format) {
   if (format == format_) return true;
   // Another byte stream format: the parser changes, the frames and the init segments stay.
-  if ((format == MseFormat::Mp4) != (format_ == MseFormat::Mp4)) return false;
+  const auto has_init = [](MseFormat f) { return f == MseFormat::Mp4 || f == MseFormat::Webm; };
+  if (has_init(format) != has_init(format_)) return false;
   UniquePointer<IMseParser> parser = make_mse_parser(allocator_, format);
   if (!parser) return false;
   parser_ = util::move(parser);
@@ -419,6 +420,16 @@ bool MseBuffer::has_video() const {
   if (!have_init_ || inits_.count() == 0) return false;
   return inits_[current_generation_]->first_of(MseTrackKind::Video) != nullptr;
 }
+bool MseBuffer::split_parts() const {
+  if (!have_init_ || inits_.count() == 0) return false;
+  bool video = false, other_sound = false;
+  for (const MseTrackInfo& t : inits_[current_generation_]->tracks.view()) {
+    if (t.kind == MseTrackKind::Video) video = true;
+    else if (t.container == kContainerOpus || t.container == kContainerVorbis) other_sound = true;
+  }
+  return video && other_sound;
+}
+
 bool MseBuffer::track_info(uint32_t index, MseTrackKind* kind, uint32_t* id) const {
   if (index >= slot_count_) return false;
   *kind = slots_[index]->kind;
@@ -1039,6 +1050,148 @@ MseDecrypt MseBuffer::decrypt(const IMseKeys& keys, const MseSnapshotPlan& plan,
   return MseDecrypt::Ok;
 }
 
+// --- Ogg: the Opus and Vorbis sound of a WebM stream, in the form the audio player reads -----------------------------------------------------
+
+namespace {
+
+uint32_t ogg_crc(const uint8_t* data, uint64_t n) {
+  static uint32_t table[256];
+  static bool built = false;
+  if (!built) {
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t r = i << 24;
+      for (int k = 0; k < 8; ++k) r = (r & 0x80000000u) ? (r << 1) ^ 0x04C11DB7u : r << 1;
+      table[i] = r;
+    }
+    built = true;
+  }
+  uint32_t crc = 0;
+  for (uint64_t i = 0; i < n; ++i) crc = (crc << 8) ^ table[((crc >> 24) ^ data[i]) & 0xFF];
+  return crc;
+}
+
+void put_le(ByteBuffer* b, uint64_t v, int bytes) {
+  for (int i = 0; i < bytes; ++i) b->put8(static_cast<uint8_t>(v >> (8 * i)));
+}
+
+// One Ogg page of whole packets; false if their segments do not fit in a page.
+bool ogg_page(ByteBuffer* out, uint8_t type, int64_t granule, uint32_t serial, uint32_t sequence, const ConstByteView* packets, uint32_t count) {
+  uint8_t table[255];
+  uint32_t segments = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint64_t size = packets[i].size();
+    const uint64_t full = size / 255;
+    if (segments + full + 1 > 255) return false;
+    for (uint64_t k = 0; k < full; ++k) table[segments++] = 255;
+    table[segments++] = static_cast<uint8_t>(size % 255);
+  }
+  const uint64_t start = out->size();
+  out->append(ConstByteView(reinterpret_cast<const uint8_t*>("OggS"), 4));
+  out->put8(0);
+  out->put8(type);
+  put_le(out, static_cast<uint64_t>(granule), 8);
+  put_le(out, serial, 4);
+  put_le(out, sequence, 4);
+  put_le(out, 0, 4);   // (the checksum, below)
+  out->put8(static_cast<uint8_t>(segments));
+  out->append(ConstByteView(table, segments));
+  for (uint32_t i = 0; i < count; ++i) out->append(packets[i]);
+  const ConstByteView page = out->view().subview(start);
+  const uint32_t crc = ogg_crc(page.data(), page.size());
+  for (int i = 0; i < 4; ++i)
+    if (!out->patch8(start + 22 + i, static_cast<uint8_t>(crc >> (8 * i)))) return false;
+  return true;
+}
+
+}  // namespace
+
+bool MseBuffer::write_ogg(const MseSnapshotPlan& plan, MseContainer container, ByteBuffer* out, int64_t* base_us) const {
+  const MseInit& init = *inits_[plan.generation];
+  const MseTrackInfo* info = nullptr;
+  for (uint64_t k = 0; k < init.tracks.count(); ++k)
+    if (init.tracks[k].kind == MseTrackKind::Audio && init.tracks[k].container == container) info = &init.tracks[k];
+  if (!info) return false;
+  const Slot* slot = nullptr;
+  for (uint32_t s = 0; s < slot_count_; ++s)
+    if (slots_[s]->kind == MseTrackKind::Audio && slots_[s]->id == info->id) slot = slots_[s].get();
+  if (!slot) return false;
+  const ConstByteView priv = init.entry(*info);
+  constexpr uint32_t kSerial = 0x5443534F;
+  uint32_t sequence = 0;
+  // the headers
+  ByteBuffer tags(allocator_);
+  uint32_t pre_skip = 0;
+  if (container == kContainerOpus) {
+    if (priv.size() < 19) return false;
+    pre_skip = priv[10] | (uint32_t{priv[11]} << 8);
+    static const char kVendor[] = "TheoryCraftOS";
+    tags.append(ConstByteView(reinterpret_cast<const uint8_t*>("OpusTags"), 8));
+    put_le(&tags, sizeof kVendor - 1, 4);
+    tags.append(ConstByteView(reinterpret_cast<const uint8_t*>(kVendor), sizeof kVendor - 1));
+    put_le(&tags, 0, 4);
+    if (!ogg_page(out, 0x02, 0, kSerial, sequence++, &priv, 1)) return false;
+    const ConstByteView t = tags.view();
+    if (!ogg_page(out, 0, 0, kSerial, sequence++, &t, 1)) return false;
+  } else {
+    // CodecPrivate of Vorbis: the count of packets less one, the sizes of all but the last (runs of 255), the three header packets
+    ByteReader r(priv);
+    if (r.u8() != 2) return false;
+    uint64_t sizes[2];
+    for (uint64_t& size : sizes) {
+      size = 0;
+      uint8_t b;
+      do {
+        b = r.u8();
+        size += b;
+      } while (b == 255 && r.ok());
+    }
+    if (!r.ok()) return false;
+    const ConstByteView identification = r.take(sizes[0]), comment = r.take(sizes[1]), setup = r.rest();
+    if (!r.ok() || setup.empty()) return false;
+    if (!ogg_page(out, 0x02, 0, kSerial, sequence++, &identification, 1)) return false;
+    const ConstByteView second[2] = {comment, setup};
+    if (!ogg_page(out, 0, 0, kSerial, sequence++, second, 2)) return false;
+  }
+  // the packets: pages of a few at a time, each with the position in samples of the end of its last packet
+  const uint64_t rate = container == kContainerOpus ? 48000 : info->sample_rate;
+  int64_t first = INT64_MAX;
+  for (const Frame& f : slot->frames.view())
+    if (f.generation == plan.generation && f.pts >= plan.start_us && f.pts < plan.end_us && f.pts < first) first = f.pts;
+  if (first == INT64_MAX) return false;
+  ConstByteView group[64];
+  uint32_t in_group = 0;
+  uint64_t group_bytes = 0;
+  int64_t group_end = 0;
+  bool wrote = false;
+  const auto flush = [&](bool last) {
+    if (in_group == 0) return true;
+    const int64_t granule = static_cast<int64_t>(pre_skip) + group_end * static_cast<int64_t>(rate) / 1000000;
+    const bool ok = ogg_page(out, last ? 0x04 : 0, granule, kSerial, sequence++, group, in_group);
+    in_group = 0;
+    group_bytes = 0;
+    wrote = wrote || ok;
+    return ok;
+  };
+  // (frames are in decode order, which for sound is the order they play in)
+  uint64_t remaining = 0;
+  for (const Frame& f : slot->frames.view())
+    if (f.generation == plan.generation && f.pts >= plan.start_us && f.pts < plan.end_us) ++remaining;
+  for (const Frame& f : slot->frames.view()) {
+    if (f.generation != plan.generation || f.pts < plan.start_us || f.pts >= plan.end_us) continue;
+    --remaining;
+    const ConstByteView data = arena_->view().subview(f.offset, f.size);
+    if (in_group == 64 || group_bytes + data.size() > 6000) {
+      if (!flush(false)) return false;
+    }
+    group[in_group++] = data;
+    group_bytes += data.size();
+    group_end = f.pts + f.duration - first;
+    if (remaining == 0 && !flush(true)) return false;
+  }
+  *base_us = first;
+  return wrote;
+}
+
 bool MseBuffer::snapshot(MseSnapshotPlan* plan, ByteBuffer* out) const {
   out->clear();
   if (slot_count_ == 0) return false;
@@ -1047,7 +1200,15 @@ bool MseBuffer::snapshot(MseSnapshotPlan* plan, ByteBuffer* out) const {
       for (const Frame& f : slots_[s]->frames.view())
         if (f.aux != 0 && f.pts >= plan->start_us && f.pts < plan->end_us) return false;
   }
-  if (format_ != MseFormat::Mp4) {
+  // which kind of file, by the first track of the kind the plan is for
+  if (plan->generation >= inits_.count()) return false;
+  const MseInit& init = *inits_[plan->generation];
+  const bool want_video = plan->part == 1 || (plan->part == 0 && plan->has_video);
+  const MseTrackInfo* lead = init.first_of(want_video ? MseTrackKind::Video : MseTrackKind::Audio);
+  if (!lead) return false;
+  plan->has_video = lead->kind == MseTrackKind::Video;
+  if (lead->container == kContainerOpus || lead->container == kContainerVorbis) return write_ogg(*plan, static_cast<MseContainer>(lead->container), out, &plan->base_us);
+  if (lead->container == kContainerRaw) {
     // the frames of the range, one after the other, are the file
     const FrameList& list = slots_[0]->frames;
     int64_t first = INT64_MAX;
@@ -1076,6 +1237,7 @@ bool MseBuffer::write_mp4(const MseSnapshotPlan& plan, ByteBuffer* out, int64_t*
   bool failed = false;
   for (uint32_t s = 0; s < slot_count_ && !failed; ++s) {
     const FrameList& list = slots_[s]->frames;
+    tracks[track_count] = TrackOut();   // (a slot that was skipped left its numbers behind)
     TrackOut& t = tracks[track_count];
     t.slot = s;
     t.indexes = allocate_view<uint32_t>(allocator_, list.size() ? list.size() : 1);
@@ -1105,7 +1267,8 @@ bool MseBuffer::write_mp4(const MseSnapshotPlan& plan, ByteBuffer* out, int64_t*
     for (uint64_t k = 0; k < init.tracks.count(); ++k) {
       if (init.tracks[k].id == slots_[s]->id && init.tracks[k].kind == slots_[s]->kind) t.info = &init.tracks[k];
     }
-    if (!t.info) {
+    // only the tracks this file is for: MP4 can carry H.264, VP9 and AAC / MP3; the part says picture or sound
+    if (!t.info || t.info->container != kContainerMp4 || (plan.part == 1 && t.info->kind != MseTrackKind::Video) || (plan.part == 2 && t.info->kind != MseTrackKind::Audio)) {
       release_view(allocator_, t.indexes);
       continue;
     }

@@ -740,6 +740,412 @@ class Mp4Parser final : public IMseParser {
   uint64_t sinf_size_ = 0;   // (the size of the 'sinf' unprotect() found)
 };
 
+// --- WebM (Matroska): EBML elements ---------------------------------------------------------------------------------------------------------
+
+// The id of an EBML element (1-4 bytes, the length marker kept) and its size (1-8 bytes; `unknown` when all bits are 1, as live streams write). Result: 1 done,
+// 0 more bytes are needed, -1 it is not an element.
+int ebml_header(ConstByteView d, uint32_t* id, uint64_t* size, bool* unknown, uint32_t* length) {
+  if (d.empty()) return 0;
+  uint32_t id_length = 1;
+  while (id_length <= 4 && !(d[0] & (0x80 >> (id_length - 1)))) ++id_length;
+  if (id_length > 4) return -1;
+  if (d.size() < id_length + 1u) return 0;
+  uint32_t value = 0;
+  for (uint32_t i = 0; i < id_length; ++i) value = (value << 8) | d[i];
+  const uint8_t first = d[id_length];
+  uint32_t size_length = 1;
+  while (size_length <= 8 && !(first & (0x80 >> (size_length - 1)))) ++size_length;
+  if (size_length > 8) return -1;
+  if (d.size() < id_length + size_length) return 0;
+  uint64_t v = first & (0xFFu >> size_length);
+  bool all_ones = v == (0xFFu >> size_length);
+  for (uint32_t i = 1; i < size_length; ++i) {
+    v = (v << 8) | d[id_length + i];
+    all_ones = all_ones && d[id_length + i] == 0xFF;
+  }
+  *id = value;
+  *size = v;
+  *unknown = all_ones;
+  *length = id_length + size_length;
+  return 1;
+}
+
+// A variable length integer (a track number, a lace size) at the reader's place; `signed_diff` reads the signed form of EBML lacing.
+bool ebml_vint(ByteReader& r, uint64_t* out, uint32_t* length = nullptr) {
+  uint8_t first;
+  if (!r.peek_u8(0, &first)) return false;
+  uint32_t n = 1;
+  while (n <= 8 && !(first & (0x80 >> (n - 1)))) ++n;
+  if (n > 8) return false;
+  uint64_t v = first & (0xFFu >> n);
+  r.u8();
+  for (uint32_t i = 1; i < n; ++i) v = (v << 8) | r.u8();
+  if (length) *length = n;
+  *out = v;
+  return r.ok();
+}
+
+uint64_t ebml_uint(ConstByteView d) {
+  uint64_t v = 0;
+  for (uint64_t i = 0; i < d.size() && i < 8; ++i) v = (v << 8) | d[i];
+  return v;
+}
+
+double ebml_float(ConstByteView d) {
+  if (d.size() == 4) {
+    const uint32_t bits = static_cast<uint32_t>(ebml_uint(d));
+    float f;
+    __builtin_memcpy(&f, &bits, sizeof f);
+    return f;
+  }
+  if (d.size() == 8) {
+    const uint64_t bits = ebml_uint(d);
+    double f;
+    __builtin_memcpy(&f, &bits, sizeof f);
+    return f;
+  }
+  return 0;
+}
+
+constexpr uint32_t kIdSegment = 0x18538067, kIdCluster = 0x1F43B675, kIdInfo = 0x1549A966, kIdTracks = 0x1654AE6B, kIdTimecode = 0xE7, kIdSimpleBlock = 0xA3,
+                   kIdBlockGroup = 0xA0, kIdBlock = 0xA1, kIdBlockDuration = 0x9B, kIdReferenceBlock = 0xFB, kIdTimecodeScale = 0x2AD7B1, kIdDuration = 0x4489,
+                   kIdTrackEntry = 0xAE, kIdTrackNumber = 0xD7, kIdTrackType = 0x83, kIdCodecId = 0x86, kIdCodecPrivate = 0x63A2, kIdDefaultDuration = 0x23E383,
+                   kIdVideo = 0xE0, kIdAudio = 0xE1, kIdPixelWidth = 0xB0, kIdPixelHeight = 0xBA, kIdSamplingFrequency = 0xB5, kIdChannels = 0x9F,
+                   kIdContentEncodings = 0x6D80;
+
+class WebmParser final : public IMseParser {
+ public:
+  explicit WebmParser(allocators::IAllocator& allocator) : allocator_(allocator), pending_(allocator), tracks_(allocator) {}
+
+  bool append(ConstByteView bytes, IMseSink& sink) override {
+    if (!pending_.append(bytes)) return false;
+    const bool ok = process(sink);
+    if (consumed_ > 0) {
+      ByteView all = pending_.writable_view();
+      const uint64_t left = all.size() - consumed_;
+      if (left) all.first(left).copy_from(all.subview(consumed_));
+      pending_.truncate(left);
+      consumed_ = 0;
+    }
+    if (!ok) {
+      pending_.clear();
+      skip_ = 0;
+    }
+    return ok;
+  }
+  void reset() override {
+    pending_.clear();
+    consumed_ = 0;
+    skip_ = 0;
+    have_cluster_ = false;
+  }
+  uint64_t pending() const override { return pending_.size(); }
+
+ private:
+  struct Track {
+    uint64_t number = 0;
+    MseTrackKind kind = MseTrackKind::Audio;
+    int64_t default_duration_us = 0, last_duration_us = 0;
+  };
+  static constexpr uint64_t kMaxElement = 64u << 20;
+
+  bool process(IMseSink& sink) {
+    for (;;) {
+      if (skip_ > 0) {   // the rest of an element that is not looked at
+        const uint64_t have = pending_.size() - consumed_;
+        const uint64_t take = have < skip_ ? have : skip_;
+        consumed_ += take;
+        skip_ -= take;
+        if (skip_ > 0) return true;
+        continue;
+      }
+      const ConstByteView data = pending_.view().subview(consumed_);
+      uint32_t id, length;
+      uint64_t size;
+      bool unknown;
+      const int h = ebml_header(data, &id, &size, &unknown, &length);
+      if (h == 0) return true;
+      if (h < 0) return false;
+      if (id == kIdSegment || id == kIdCluster) {   // (looked into, not waited for: they can be as long as the stream)
+        consumed_ += length;
+        if (id == kIdCluster) have_cluster_ = false;
+        continue;
+      }
+      const bool looked_at = id == kIdInfo || id == kIdTracks || id == kIdSimpleBlock || id == kIdBlockGroup || id == kIdTimecode;
+      if (!looked_at) {
+        if (unknown) return false;
+        consumed_ += length;
+        skip_ = size;
+        continue;
+      }
+      if (unknown || size > kMaxElement) return false;
+      if (data.size() < length + size) return true;
+      const ConstByteView body = data.subview(length, size);
+      bool ok = true;
+      if (id == kIdInfo) ok = parse_info(body);
+      else if (id == kIdTracks) ok = parse_tracks(body, sink);
+      else if (id == kIdTimecode) {
+        cluster_timecode_ = static_cast<int64_t>(ebml_uint(body));
+        have_cluster_ = true;
+      } else if (id == kIdSimpleBlock) ok = parse_block(body, true, true, -1, sink);
+      else ok = parse_group(body, sink);
+      if (!ok) return false;
+      consumed_ += length + size;
+    }
+  }
+
+  bool parse_info(ConstByteView body) {
+    uint64_t at = 0;
+    double duration = -1;
+    while (at < body.size()) {
+      uint32_t id, length;
+      uint64_t size;
+      bool unknown;
+      if (ebml_header(body.subview(at), &id, &size, &unknown, &length) != 1 || unknown || size > body.size() - at - length) return false;
+      const ConstByteView v = body.subview(at + length, size);
+      if (id == kIdTimecodeScale) scale_ns_ = ebml_uint(v);
+      else if (id == kIdDuration) duration = ebml_float(v);
+      at += length + size;
+    }
+    if (scale_ns_ == 0 || scale_ns_ > 1000000000u) return false;
+    duration_us_ = duration > 0 && duration < 9e12 ? static_cast<int64_t>(duration * static_cast<double>(scale_ns_) / 1000.0) : -1;
+    return true;
+  }
+
+  static bool put_u32(ByteBuffer* b, uint32_t v) {
+    const uint8_t bytes[4] = {static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)};
+    return b->append(ConstByteView(bytes, 4));
+  }
+
+  // The sample description a VP9 track gets in the MP4 file the video player opens: a 'vp09' entry with a 'vpcC' box.
+  static bool vp9_entry(ByteBuffer* out, uint32_t width, uint32_t height) {
+    const uint32_t entry = 8 + 78 + 8 + 12;
+    const uint8_t vpcc[12] = {1, 0, 0, 0, 0, 10, 0x82, 2, 2, 2, 0, 0};   // version 1, profile 0, level 1.0, 8 bit 4:2:0, unspecified colour, no init data
+    if (!put_u32(out, 16 + entry) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("stsd"), 4)) || !put_u32(out, 0) || !put_u32(out, 1)) return false;
+    if (!put_u32(out, entry) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("vp09"), 4)) || !out->put_zeros(6)) return false;
+    const uint8_t head[] = {0, 1};   // data reference index
+    if (!out->append(ConstByteView(head, 2)) || !out->put_zeros(16)) return false;
+    const uint8_t size[] = {static_cast<uint8_t>(width >> 8), static_cast<uint8_t>(width), static_cast<uint8_t>(height >> 8), static_cast<uint8_t>(height)};
+    if (!out->append(ConstByteView(size, 4)) || !put_u32(out, 0x00480000) || !put_u32(out, 0x00480000) || !put_u32(out, 0)) return false;
+    const uint8_t frames[] = {0, 1};
+    if (!out->append(ConstByteView(frames, 2)) || !out->put_zeros(32)) return false;
+    const uint8_t depth[] = {0, 0x18, 0xFF, 0xFF};
+    if (!out->append(ConstByteView(depth, 4))) return false;
+    if (!put_u32(out, 20) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("vpcC"), 4)) || !out->append(ConstByteView(vpcc, 12))) return false;
+    return true;
+  }
+
+  bool parse_tracks(ConstByteView body, IMseSink& sink) {
+    auto init = UniquePointer<MseInit>::make(allocator_, allocator_);
+    if (!init) return false;
+    tracks_.clear();
+    uint64_t at = 0;
+    while (at < body.size()) {
+      uint32_t id, length;
+      uint64_t size;
+      bool unknown;
+      if (ebml_header(body.subview(at), &id, &size, &unknown, &length) != 1 || unknown || size > body.size() - at - length) return false;
+      if (id == kIdTrackEntry && !parse_entry(body.subview(at + length, size), init.get())) return false;
+      at += length + size;
+    }
+    if (init->tracks.count() == 0) return false;   // (nothing in it that can be played)
+    init->duration_us = duration_us_;
+    return sink.init_segment(util::move(init));
+  }
+
+  bool parse_entry(ConstByteView body, MseInit* init) {
+    Track track;
+    uint64_t type = 0;
+    uint32_t width = 0, height = 0, channels = 1;
+    double rate = 8000;
+    ConstByteView codec, priv;
+    bool encrypted = false;
+    uint64_t at = 0;
+    while (at < body.size()) {
+      uint32_t id, length;
+      uint64_t size;
+      bool unknown;
+      if (ebml_header(body.subview(at), &id, &size, &unknown, &length) != 1 || unknown || size > body.size() - at - length) return false;
+      const ConstByteView v = body.subview(at + length, size);
+      if (id == kIdTrackNumber) track.number = ebml_uint(v);
+      else if (id == kIdTrackType) type = ebml_uint(v);
+      else if (id == kIdCodecId) codec = v;
+      else if (id == kIdCodecPrivate) priv = v;
+      else if (id == kIdDefaultDuration) track.default_duration_us = static_cast<int64_t>(ebml_uint(v) / 1000);
+      else if (id == kIdContentEncodings) encrypted = true;
+      else if (id == kIdVideo || id == kIdAudio) {
+        uint64_t p = 0;
+        while (p < v.size()) {
+          uint32_t cid, clen;
+          uint64_t csize;
+          bool cunknown;
+          if (ebml_header(v.subview(p), &cid, &csize, &cunknown, &clen) != 1 || cunknown || csize > v.size() - p - clen) return false;
+          const ConstByteView cv = v.subview(p + clen, csize);
+          if (cid == kIdPixelWidth) width = static_cast<uint32_t>(ebml_uint(cv));
+          else if (cid == kIdPixelHeight) height = static_cast<uint32_t>(ebml_uint(cv));
+          else if (cid == kIdChannels) channels = static_cast<uint32_t>(ebml_uint(cv));
+          else if (cid == kIdSamplingFrequency) rate = ebml_float(cv);
+          p += clen + csize;
+        }
+      }
+      at += length + size;
+    }
+    const auto is = [&](const char* name) { return StringView(reinterpret_cast<const char*>(codec.data()), codec.size()).equals(name); };
+    MseTrackInfo info;
+    info.id = static_cast<uint32_t>(track.number);
+    info.timescale = 1000000;
+    info.entry_offset = init->entries.size();
+    if (type == 1 && is("V_VP9")) {
+      if (width == 0 || height == 0 || width > 16384 || height > 16384) return false;
+      info.kind = MseTrackKind::Video;
+      info.codec = fourcc("vp09");
+      info.container = kContainerMp4;
+      info.width = width;
+      info.height = height;
+      ByteBuffer entry(allocator_);
+      if (!vp9_entry(&entry, width, height) || !init->entries.append(entry.view())) return false;
+      info.entry_size = entry.size();
+    } else if (type == 2 && (is("A_OPUS") || is("A_VORBIS"))) {
+      const bool opus = is("A_OPUS");
+      info.kind = MseTrackKind::Audio;
+      info.codec = opus ? fourcc("Opus") : fourcc("vorb");
+      info.container = opus ? kContainerOpus : kContainerVorbis;
+      info.channels = channels;
+      info.sample_rate = opus ? 48000 : static_cast<uint32_t>(rate);
+      if (info.sample_rate == 0 || channels == 0 || channels > 8) return false;
+      if (opus && priv.size() < 19) {   // (no 'OpusHead': one is made, the way the standard's defaults say)
+        ByteBuffer head(allocator_);
+        const uint8_t bytes[] = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd', 1, static_cast<uint8_t>(channels), 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0};
+        if (!head.append(ConstByteView(bytes, sizeof bytes)) || !init->entries.append(head.view())) return false;
+        info.entry_size = head.size();
+      } else {
+        if (priv.empty() || !init->entries.append(priv)) return false;
+        info.entry_size = priv.size();
+      }
+    } else {
+      return true;   // another track (VP8, AV1, subtitles ...): not kept
+    }
+    if (encrypted) return false;   // (WebM's own encryption is not handled)
+    if (info.id == 0 || init->tracks.count() >= 8) return false;
+    track.kind = info.kind;
+    if (!tracks_.push_back(track) || !init->tracks.push_back(info)) return false;
+    return true;
+  }
+
+  bool parse_group(ConstByteView body, IMseSink& sink) {
+    ConstByteView block;
+    int64_t duration = -1;
+    bool reference = false;
+    uint64_t at = 0;
+    while (at < body.size()) {
+      uint32_t id, length;
+      uint64_t size;
+      bool unknown;
+      if (ebml_header(body.subview(at), &id, &size, &unknown, &length) != 1 || unknown || size > body.size() - at - length) return false;
+      const ConstByteView v = body.subview(at + length, size);
+      if (id == kIdBlock) block = v;
+      else if (id == kIdBlockDuration) duration = static_cast<int64_t>(ebml_uint(v));
+      else if (id == kIdReferenceBlock) reference = true;
+      at += length + size;
+    }
+    if (block.empty()) return true;
+    return parse_block(block, false, !reference, duration, sink);
+  }
+
+  // A block: the track, a time relative to the cluster, flags, and one frame or several laced ones.
+  bool parse_block(ConstByteView body, bool simple, bool key, int64_t duration_units, IMseSink& sink) {
+    if (tracks_.count() == 0 || !have_cluster_) return false;   // (media before the tracks, or before the cluster's time)
+    ByteReader r(body);
+    uint64_t number;
+    if (!ebml_vint(r, &number)) return false;
+    const int16_t relative = static_cast<int16_t>(r.be16());
+    const uint8_t flags = r.u8();
+    if (!r.ok()) return false;
+    uint32_t track_index = 0;
+    bool found = false;
+    for (uint32_t i = 0; i < tracks_.count(); ++i)
+      if (tracks_[i].number == number) {
+        track_index = i;
+        found = true;
+      }
+    if (!found) return true;   // (a track that is not kept)
+    Track& track = tracks_[track_index];
+    if (simple) key = (flags & 0x80) != 0;
+    if (track.kind == MseTrackKind::Audio) key = true;
+    // the frames
+    const uint32_t lacing = (flags >> 1) & 3;
+    ConstByteView frames[256];
+    uint32_t count = 1;
+    if (lacing == 0) {
+      frames[0] = r.rest();
+    } else {
+      count = static_cast<uint32_t>(r.u8()) + 1;
+      uint64_t sizes[256];
+      if (lacing == 1) {   // Xiph: sizes as runs of 255 and a smaller byte, all but the last
+        for (uint32_t i = 0; i + 1 < count; ++i) {
+          uint64_t total = 0;
+          uint8_t b;
+          do {
+            b = r.u8();
+            total += b;
+          } while (b == 255 && r.ok());
+          sizes[i] = total;
+        }
+      } else if (lacing == 3) {   // EBML: the first size, then differences
+        uint64_t first;
+        uint32_t n;
+        if (!ebml_vint(r, &first, &n)) return false;
+        sizes[0] = first;
+        for (uint32_t i = 1; i + 1 < count; ++i) {
+          uint64_t raw;
+          if (!ebml_vint(r, &raw, &n)) return false;
+          const int64_t bias = (int64_t{1} << (7 * n - 1)) - 1;
+          const int64_t size = static_cast<int64_t>(sizes[i - 1]) + (static_cast<int64_t>(raw) - bias);
+          if (size < 0) return false;
+          sizes[i] = static_cast<uint64_t>(size);
+        }
+      }
+      if (!r.ok()) return false;
+      const uint64_t rest = r.remaining();
+      if (lacing == 2) {   // fixed size
+        if (rest % count != 0) return false;
+        for (uint32_t i = 0; i + 1 < count; ++i) sizes[i] = rest / count;
+      }
+      uint64_t used = 0;
+      for (uint32_t i = 0; i + 1 < count; ++i) {
+        if (sizes[i] > rest - used) return false;
+        used += sizes[i];
+      }
+      sizes[count - 1] = rest - used;
+      for (uint32_t i = 0; i < count; ++i) {
+        frames[i] = r.take(sizes[i]);
+        if (!r.ok()) return false;
+      }
+    }
+    // when it is: the cluster's time and the block's, in ticks of the timecode scale
+    const int64_t ticks = cluster_timecode_ + relative;
+    if (ticks > (int64_t{1} << 50) || ticks < -(int64_t{1} << 50)) return false;
+    const int64_t pts = ticks * static_cast<int64_t>(scale_ns_) / 1000;
+    int64_t duration = duration_units >= 0 ? duration_units * static_cast<int64_t>(scale_ns_) / 1000 / count : track.default_duration_us;
+    if (duration <= 0) duration = track.last_duration_us > 0 ? track.last_duration_us : (track.kind == MseTrackKind::Audio ? 20000 : 33333);
+    track.last_duration_us = duration;
+    for (uint32_t i = 0; i < count; ++i) {
+      const int64_t t = pts + static_cast<int64_t>(i) * duration;
+      if (!sink.frame(track_index, t, t, duration, key, frames[i], nullptr)) return false;
+    }
+    return true;
+  }
+
+  allocators::IAllocator& allocator_;
+  ByteBuffer pending_;
+  uint64_t consumed_ = 0, skip_ = 0;
+  List<Track> tracks_;
+  uint64_t scale_ns_ = 1000000;
+  int64_t duration_us_ = -1;
+  int64_t cluster_timecode_ = 0;
+  bool have_cluster_ = false;
+};
+
 // --- MPEG audio and ADTS: a stream of frames with no initialization segment --------------------------------------------------------------------
 
 class FramedAudioParser : public IMseParser {
@@ -803,6 +1209,7 @@ class FramedAudioParser : public IMseParser {
       if (!init) return false;
       MseTrackInfo info;
       info.id = 1;
+      info.container = kContainerRaw;
       info.kind = MseTrackKind::Audio;
       info.codec = codec_;
       info.timescale = f.sample_rate;
@@ -983,6 +1390,14 @@ bool codec_ok(MseFormat format, StringView codec, bool is_video_type, bool* vide
       return true;
     return false;
   }
+  if (format == MseFormat::Webm) {
+    if (codec.equals_ignore_case("vp9") || starts_with_ci(codec, "vp09.")) {   // (VP8 and AV1 have no decoder on this machine)
+      if (!is_video_type) return false;
+      *video = true;
+      return true;
+    }
+    return codec.equals_ignore_case("opus") || codec.equals_ignore_case("vorbis");
+  }
   if (format == MseFormat::Mpeg) return codec.equals_ignore_case("mp3") || codec.equals_ignore_case("mp4a.69") || codec.equals_ignore_case("mp4a.6b");
   return codec.equals_ignore_case("mp4a.40.2") || codec.equals_ignore_case("mp4a.40.5") || codec.equals_ignore_case("mp4a.40.29");
 }
@@ -1005,6 +1420,11 @@ bool mse_type_supported(StringView type, MseFormat* format, bool* has_video) {
     f = MseFormat::Mpeg;
   } else if (main.equals_ignore_case("audio/aac")) {
     f = MseFormat::Adts;
+  } else if (main.equals_ignore_case("video/webm")) {
+    f = MseFormat::Webm;
+    video_type = true;
+  } else if (main.equals_ignore_case("audio/webm")) {
+    f = MseFormat::Webm;
   } else {
     return false;
   }
@@ -1048,6 +1468,7 @@ UniquePointer<IMseParser> make_mse_parser(allocators::IAllocator& allocator, Mse
     case MseFormat::Mp4: return UniquePointer<IMseParser>::make_as<Mp4Parser>(allocator, allocator);
     case MseFormat::Mpeg: return UniquePointer<IMseParser>::make_as<MpegParser>(allocator, allocator);
     case MseFormat::Adts: return UniquePointer<IMseParser>::make_as<AdtsParser>(allocator, allocator);
+    case MseFormat::Webm: return UniquePointer<IMseParser>::make_as<WebmParser>(allocator, allocator);
   }
   return UniquePointer<IMseParser>();
 }

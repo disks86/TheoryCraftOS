@@ -44,7 +44,7 @@ enum class OpenResult : uint8_t {
   OutOfMemory,
 };
 
-// Plays an AVI file (or, with open_media(), an MP4 / MOV file with H.264 video, or a GIF, APNG, animated WebP or Y4M file -
+// Plays an AVI file (or, with open_media(), an MP4 / MOV file with H.264 or VP9 video, or a GIF, APNG, animated WebP or Y4M file -
 // decoded up front into frames that carry their own durations, and silent): the picture through a video decoder session from the machine's codec devices,
 // the sound (if the file has PCM audio and a mixer is given) through an audio::AudioPlayer. The sound is the clock
 // while it plays - the picture follows it, skipping frames when decoding falls behind - and with no sound the picture

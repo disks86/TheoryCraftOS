@@ -379,6 +379,26 @@ NATIVE(mse_source_error) {
   return true;
 }
 
+// URL.createObjectURL(blob): the bytes of the blob for media elements and pictures to load from (false if they are not taken: too many or too big).
+NATIVE(blob_register) {
+  (void)self;
+  String url(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &url)) return false;
+  ArrayView<uint8_t> bytes;
+  if (!typed_array_bytes(arg_at(args, argc, 1), &bytes)) return vm.throw_error(ErrorKind::TypeError, "The bytes of a blob have to be a byte array.");
+  *result = bool_value(objs(vm).register_blob(url.view(), ConstByteView(bytes.data(), bytes.size())));
+  return true;
+}
+
+NATIVE(blob_revoke) {
+  (void)self;
+  String url(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &url)) return false;
+  objs(vm).revoke_blob(url.view());
+  *result = Value();
+  return true;
+}
+
 // --- Encrypted Media Extensions: the keys, and the init data of "encrypted" events -------------------------------------------------------------
 
 // A new key table for a MediaKeys object (its number, 0 if there are too many).
@@ -492,6 +512,8 @@ bool install_mse(DomBindings::Impl& c) {
   vm.define_native(g, "__mse_reopen", mse_reopen, 1);
   vm.define_native(g, "__mse_live_range", mse_live_range, 3);
   vm.define_native(g, "__mse_source_error", mse_source_error, 1);
+  vm.define_native(g, "__blob_register", blob_register, 2);
+  vm.define_native(g, "__blob_revoke", blob_revoke, 1);
   vm.define_native(g, "__mse_encrypted", mse_encrypted, 1);
   vm.define_native(g, "__mse_element", mse_element, 1);
   vm.define_native(g, "__eme_create_keys", eme_create_keys, 0);

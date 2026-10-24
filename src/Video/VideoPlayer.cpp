@@ -528,7 +528,7 @@ bool VideoPlayer::open_y4m_stream(media::IByteSource& source, OpenResult* result
   return true;
 }
 
-// An MP4 / MOV file: its H.264 video track read sample by sample, and its audio track (AAC or MP3) decoded as it plays.
+// An MP4 / MOV file: its H.264 or VP9 video track read sample by sample, and its audio track (AAC or MP3) decoded as it plays.
 OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
   kernel::ScopedMutex guard(mutex_);
   release();
@@ -539,13 +539,14 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
     release();
     return OpenResult::Unsupported;
   }
-  const uint32_t avc1 = 0x61766331, avc3 = 0x61766333;
-  if ((track->codec != avc1 && track->codec != avc3) || track->config.empty()) {
+  const uint32_t avc1 = 0x61766331, avc3 = 0x61766333, vp09 = 0x76703039;
+  const bool vp9 = track->codec == vp09;   // (VP9 streams describe themselves: no configuration record is needed)
+  if (!vp9 && ((track->codec != avc1 && track->codec != avc3) || track->config.empty())) {
     release();
     return OpenResult::NoDecoder;
   }
   DecoderConfig config;
-  config.codec = VideoCodec::H264;
+  config.codec = vp9 ? VideoCodec::Vp9 : VideoCodec::H264;
   config.width = track->width;
   config.height = track->height;
   config.output = PixelFormat::Bgra8888;

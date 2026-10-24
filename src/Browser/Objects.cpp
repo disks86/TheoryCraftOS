@@ -284,7 +284,7 @@ bool decode_data_url(allocators::IAllocator& allocator, StringView url, ByteBuff
 }
 
 PageObjects::PageObjects(allocators::IAllocator& allocator)
-    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator), mse_(allocator), eme_(allocator) {}
+    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator), mse_(allocator), eme_(allocator), blobs_(allocator) {}
 
 PageObjects::~PageObjects() {
   for (uint64_t i = 0; i < images_.count(); ++i) release_scaled(&images_[i]->scaled);
@@ -412,6 +412,31 @@ bool PageObjects::choose_source(const dom::Node* img, const MediaEnvironment& me
 }
 
 // The decoded picture at an address (fetched if it was not yet). The index in cache_, or -1.
+bool PageObjects::register_blob(StringView url, ConstByteView bytes) {
+  Lock lock(*this);
+  if (blobs_.count() >= 256 || bytes.size() > kMaxBlobBytes - blob_bytes_) return false;
+  auto entry = UniquePointer<BlobEntry>::make(allocator_, allocator_);
+  if (!entry || !entry->url.assign(url) || !entry->data.append(bytes) || !blobs_.push_back(util::move(entry))) return false;
+  blob_bytes_ += bytes.size();
+  return true;
+}
+
+void PageObjects::revoke_blob(StringView url) {
+  Lock lock(*this);
+  for (uint64_t i = 0; i < blobs_.count(); ++i) {
+    if (!blobs_[i]->url.view().equals(url)) continue;
+    blob_bytes_ -= blobs_[i]->data.size();
+    blobs_.remove_at(i);
+    return;
+  }
+}
+
+bool PageObjects::fetch_blob(StringView url, ByteBuffer* out) {
+  for (uint64_t i = 0; i < blobs_.count(); ++i)
+    if (blobs_[i]->url.view().equals(url)) return out->append(blobs_[i]->data.view());
+  return false;
+}
+
 int32_t PageObjects::load_image_url(IObjectEnvironment& env, StringView url, bool* failed) {
   *failed = false;
   for (uint64_t i = 0; i < cache_.count(); ++i)
@@ -429,6 +454,8 @@ int32_t PageObjects::load_image_url(IObjectEnvironment& env, StringView url, boo
   if (url.starts_with("data:")) {
     String type(allocator_);
     got = decode_data_url(allocator_, url, &bytes, &type);
+  } else if (url.starts_with("blob:")) {
+    got = fetch_blob(url, &bytes);
   } else {
     got = env.fetch_bytes(url, kMaxImageBytes, &bytes);
   }
@@ -466,7 +493,7 @@ void PageObjects::sync_image(dom::Node* n, IObjectEnvironment& env, StringView b
   }
   String absolute(allocator_);
   bool resolved = true;
-  if (candidate.view().starts_with("data:")) absolute.assign(candidate.view());
+  if (candidate.view().starts_with("data:") || candidate.view().starts_with("blob:")) absolute.assign(candidate.view());
   else resolved = resolve_reference(allocator_, base, candidate.view(), &absolute);
   if (!slot) {
     auto fresh = UniquePointer<ImageSlot>::make(allocator_, allocator_);
@@ -655,7 +682,7 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
     slot->poster_cache = -1;
   } else {
     String abs(allocator_);
-    if (poster.starts_with("data:") ? abs.assign(poster) : resolve_reference(allocator_, base, poster, &abs)) {
+    if (poster.starts_with("data:") || poster.starts_with("blob:") ? abs.assign(poster) : resolve_reference(allocator_, base, poster, &abs)) {
       if (!slot->poster.view().equals(abs.view())) {
         slot->poster.assign(abs.view());
         bool failed;
@@ -737,6 +764,8 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
     if (absolute.view().starts_with("data:")) {
       String type(allocator_);
       got = decode_data_url(allocator_, absolute.view(), bytes.get(), &type);
+    } else if (absolute.view().starts_with("blob:")) {
+      got = fetch_blob(absolute.view(), bytes.get());
     } else {
       got = env.fetch_bytes(absolute.view(), kMaxVideoBytes, bytes.get());
     }

@@ -30,9 +30,9 @@ MseClip::MseClip(allocators::IAllocator& allocator, media::MseHub& hub, uint32_t
 
 MseClip::~MseClip() = default;
 
-MseClip::Child* MseClip::child_of(uint32_t buffer) {
+MseClip::Child* MseClip::child_of(uint32_t buffer, uint8_t part) {
   for (uint32_t i = 0; i < kMaxChildren; ++i)
-    if (used_[i] && children_[i].buffer == buffer) return &children_[i];
+    if (used_[i] && children_[i].buffer == buffer && children_[i].part == part) return &children_[i];
   return nullptr;
 }
 
@@ -167,13 +167,14 @@ bool MseClip::copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* s
   return false;
 }
 
-bool MseClip::open_child(media::MseBuffer& buffer, const media::MseSnapshotPlan& plan, Child* into) {
+bool MseClip::open_child(media::MseBuffer& buffer, uint8_t part, const media::MseSnapshotPlan& plan, Child* into) {
   if (!env_) {
     fail(4);
     return false;
   }
   auto bytes = UniquePointer<ByteBuffer>::make(allocator_, allocator_);
   media::MseSnapshotPlan p = plan;
+  p.part = part;
   if (!bytes || !buffer.snapshot(&p, bytes.get())) {
     fail(3);
     return false;
@@ -186,6 +187,7 @@ bool MseClip::open_child(media::MseBuffer& buffer, const media::MseSnapshotPlan&
   }
   into->clip = util::move(clip);
   into->buffer = buffer.id();
+  into->part = part;
   into->base = p.base_us;
   into->start = p.start_us;
   into->end = p.end_us;
@@ -274,64 +276,70 @@ void MseClip::update() {
       all = false;
       continue;
     }
-    Child* c = child_of(buffer.id());
-    media::MseSnapshotPlan plan;
-    bool have_plan = false, rebuild = false;
-    if (c && c->clip) {
-      if (position_ < c->start - kStartSlack || position_ > c->end) {
-        rebuild = true;   // the playhead has left the file
-      } else if (buffer.appended() != c->appended || buffer.epoch() != c->epoch || (keys_ && keys_->key_epoch() != c->key_epoch)) {
+    const bool split = buffer.split_parts();
+    for (uint32_t i = 0; i < kMaxChildren; ++i)   // (a file for the whole stream, or one for each of picture and sound: whichever this stream needs now)
+      if (used_[i] && children_[i].buffer == buffer.id() && (split ? children_[i].part == 0 : children_[i].part != 0)) drop(&children_[i]);
+    for (uint8_t part_index = 0; part_index < (split ? 2 : 1); ++part_index) {
+      const uint8_t part = split ? static_cast<uint8_t>(part_index + 1) : 0;
+      Child* c = child_of(buffer.id(), part);
+      media::MseSnapshotPlan plan;
+      bool have_plan = false, rebuild = false;
+      if (c && c->clip) {
+        if (position_ < c->start - kStartSlack || position_ > c->end) {
+          rebuild = true;   // the playhead has left the file
+        } else if (buffer.appended() != c->appended || buffer.epoch() != c->epoch || (keys_ && keys_->key_epoch() != c->key_epoch)) {
+          uint8_t missing[16];
+          have_plan = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::Ok;
+          if (!have_plan || buffer.changed_since(c->epoch, position_, c->end)) rebuild = true;
+          else if (plan.generation == c->generation && plan.end_us > c->end + kStartSlack && (c->end - position_ < kRefillAhead || master_stopped)) rebuild = true;
+          else {
+            c->appended = buffer.appended();
+            c->epoch = buffer.epoch();
+            c->key_epoch = keys_ ? keys_->key_epoch() : 0;
+          }
+        }
+      } else {
+        rebuild = true;
+      }
+      if (rebuild) {
         uint8_t missing[16];
-        have_plan = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::Ok;
-        if (!have_plan || buffer.changed_since(c->epoch, position_, c->end)) rebuild = true;
-        else if (plan.generation == c->generation && plan.end_us > c->end + kStartSlack && (c->end - position_ < kRefillAhead || master_stopped)) rebuild = true;
-        else {
-          c->appended = buffer.appended();
-          c->epoch = buffer.epoch();
-          c->key_epoch = keys_ ? keys_->key_epoch() : 0;
-        }
-      }
-    } else {
-      rebuild = true;
-    }
-    if (rebuild) {
-      uint8_t missing[16];
-      if (!have_plan) have_plan = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::Ok;
-      if (!have_plan) {
-        if (c) drop(c);
-        all = false;
-        continue;
-      }
-      if (buffer.has_protected_frames()) {   // (what the playhead is going to see is decrypted before the file is written)
-        const media::MseDecrypt done = keys_ ? buffer.decrypt(*keys_, plan, missing) : media::MseDecrypt::NeedKey;
-        if (done == media::MseDecrypt::Failed) {
-          fail(3);
-          hub_.end_of_stream(source_, 3);
-          return;
-        }
-        if (done == media::MseDecrypt::NeedKey) {
+        if (!have_plan) have_plan = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::Ok;
+        if (!have_plan) {
           if (c) drop(c);
           all = false;
           continue;
         }
-      }
-      if (!c) {
-        for (uint32_t i = 0; i < kMaxChildren && !c; ++i)
-          if (!used_[i]) {
-            c = &children_[i];
-            used_[i] = true;
+        if (buffer.has_protected_frames()) {   // (what the playhead is going to see is decrypted before the file is written)
+          const media::MseDecrypt done = keys_ ? buffer.decrypt(*keys_, plan, missing) : media::MseDecrypt::NeedKey;
+          if (done == media::MseDecrypt::Failed) {
+            fail(3);
+            hub_.end_of_stream(source_, 3);
+            return;
           }
+          if (done == media::MseDecrypt::NeedKey) {
+            if (c) drop(c);
+            all = false;
+            continue;
+          }
+        }
+        if (!c) {
+          for (uint32_t i = 0; i < kMaxChildren && !c; ++i)
+            if (!used_[i]) {
+              c = &children_[i];
+              used_[i] = true;
+            }
+        }
+        if (!c) {
+          all = false;
+          continue;
+        }
+        if (!open_child(buffer, part, plan, c)) {
+          drop(c);
+          return;
+        }
       }
-      if (!c) {
-        all = false;
-        continue;
-      }
-      if (!open_child(buffer, plan, c)) {
-        drop(c);
-        return;
-      }
+      if (!c || !c->clip || position_ < c->start - kStartSlack || position_ > c->end) all = false;
     }
-    if (!c || !c->clip || position_ < c->start - kStartSlack || position_ > c->end) all = false;
   }
   // Is the clip blocked for want of a key? (No file for the playhead because the key is missing; or the end of the file it plays, and what comes next is under a key
   // that is not there.)

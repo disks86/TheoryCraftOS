@@ -359,9 +359,10 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (!(blob instanceof Blob)) throw typeError("execute 'createObjectURL' on 'URL'", "Overload resolution failed.");
     var url = 'blob:' + origin + '/' + (++blobCounter) + '-' + Date.now();
     blobUrls[url] = blob;
+    if (blob.__bytes.length > 0) __blob_register(url, __string_to_bytes(blob.__bytes));   // (for <img>, <video> and <audio>)
     return url;
   };
-  URL.revokeObjectURL = function (url) { url = String(url); delete blobUrls[url]; __mse_revoke_url(url); };
+  URL.revokeObjectURL = function (url) { url = String(url); delete blobUrls[url]; __mse_revoke_url(url); __blob_revoke(url); };
 
   // ------------------------------------------------------------------------------------------------------------ Media Source Extensions
   // MediaSource, SourceBuffer and SourceBufferList; the bytes, the frames and the ranges are the engine's (DomBindingsMse.cpp, Media/Mse.hpp). Appending is done
