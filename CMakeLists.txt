@@ -368,6 +368,7 @@ add_executable(BOOTX64
   src/Desktop/Spreadsheet.cpp
   src/Desktop/DatabaseQuery.cpp
   src/Desktop/WebBrowser.cpp
+  src/Desktop/PictureInPicture.cpp
   src/Desktop/SessionStore.cpp
   src/Desktop/DesktopSession.cpp
   src/Desktop/Paint.cpp

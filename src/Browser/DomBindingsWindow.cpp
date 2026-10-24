@@ -752,6 +752,37 @@ NATIVE(fs_request) {
   *result = bool_value(n && impl(vm).host.fullscreen_request(n));
   return true;
 }
+NATIVE(pip_supported) {
+  (void)self; (void)args; (void)argc;
+  *result = bool_value(impl(vm).host.pip_supported());
+  return true;
+}
+// __pip_request(video): [code, width, height]; the code is 0 when the video is in the window now.
+NATIVE(pip_request) {
+  (void)self;
+  uint32_t w = 0, h = 0;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  const int code = impl(vm).host.pip_request(n, &w, &h);
+  JsObject* out = vm.new_array();
+  if (!out) return vm.throw_error(ErrorKind::RangeError, "Out of memory");
+  vm.array_push(out, num_value(code));
+  vm.array_push(out, num_value(w));
+  vm.array_push(out, num_value(h));
+  *result = Value::make_object(out);
+  return true;
+}
+NATIVE(pip_exit) {
+  (void)self; (void)args; (void)argc;
+  impl(vm).host.pip_exit();
+  *result = Value();
+  return true;
+}
+NATIVE(pip_element) {
+  (void)self; (void)args; (void)argc;
+  *result = node_value(impl(vm), impl(vm).host.pip_element());
+  return true;
+}
+
 NATIVE(fs_exit) {
   (void)self; (void)args; (void)argc;
   impl(vm).host.fullscreen_exit();
@@ -852,6 +883,10 @@ bool install_window(DomBindings::Impl& c) {
   JsObject* g = vm.global();
   g->host = &kWindowClass;
   vm.define_named(g, "__time_origin", num_value(vm.clock_ms()), 0);
+  vm.define_native(g, "__pip_supported", pip_supported, 0);
+  vm.define_native(g, "__pip_request", pip_request, 1);
+  vm.define_native(g, "__pip_exit", pip_exit, 0);
+  vm.define_native(g, "__pip_element", pip_element, 0);
   vm.define_native(g, "__fs_supported", fs_supported, 0);
   vm.define_native(g, "__fs_request", fs_request, 1);
   vm.define_native(g, "__fs_exit", fs_exit, 0);

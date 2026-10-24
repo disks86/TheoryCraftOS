@@ -426,6 +426,13 @@ void Page::deliver_object_events() {
 }
 
 bool Page::step_objects(double now_ms) {
+  if (pip_serial_ != 0) {   // the video was taken out of the page: it leaves the window
+    dom::Node* pip = pip_element();
+    if (!pip || !dom::is_connected(pip)) {
+      env_.close_pip();
+      pip_left();
+    }
+  }
   bool moved = false;
   for (uint64_t i = 0; i < frames_.count(); ++i)
     if (frames_[i]->page) moved |= frames_[i]->page->step_objects(now_ms);
@@ -571,6 +578,54 @@ int32_t Page::take_scroll_request() {
   const int32_t r = scroll_request_;
   scroll_request_ = -1;
   return r;
+}
+
+// --- Picture-in-Picture ------------------------------------------------------------------------------------------------------------
+
+dom::Node* Page::pip_element() { return pip_serial_ ? doc_.by_serial(pip_serial_) : nullptr; }
+
+int Page::pip_request(dom::Node* video, uint32_t* width, uint32_t* height) {
+  if (!video || !video->is_tag("video") || !env_.pip_supported()) return 1;
+  if (dom::has_attribute(video, "disablepictureinpicture")) return 3;
+  PageObjects::VideoState st;
+  objects_.video_state(video->serial, &st);
+  if (!st.known || st.ready_state == 0 || !dom::is_connected(video)) return 2;
+  uint32_t w = st.width ? st.width : 320, h = st.height ? st.height : 180;
+  if (w > 320) {   // (a small window: at most 320 pixels wide)
+    h = static_cast<uint32_t>(uint64_t{h} * 320 / w);
+    w = 320;
+  }
+  if (h == 0) h = 1;
+  if (pip_serial_ != 0 && pip_serial_ != video->serial) {   // one window: the video that was in it leaves
+    pip_serial_ = 0;
+    env_.close_pip();
+  }
+  if (pip_serial_ != video->serial && !env_.open_pip(video->serial, w, h, objects_)) return 1;
+  pip_serial_ = video->serial;
+  objects_.set_pip(video->serial);
+  *width = w;
+  *height = h;
+  return 0;
+}
+
+void Page::pip_exit() {
+  if (pip_serial_ == 0) return;
+  pip_serial_ = 0;
+  objects_.set_pip(0);
+  env_.close_pip();
+}
+
+void Page::pip_left() {
+  if (pip_serial_ == 0) return;
+  pip_serial_ = 0;
+  objects_.set_pip(0);
+  if (bindings_) bindings_->call_hook("__pip_left", nullptr, 0);
+}
+
+void Page::pip_resized(uint32_t width, uint32_t height) {
+  if (pip_serial_ == 0 || !bindings_) return;
+  const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(static_cast<double>(width)), DomBindings::HookArg::of(static_cast<double>(height))};
+  bindings_->call_hook("__pip_resized", args, 2);
 }
 
 // --- Fullscreen --------------------------------------------------------------------------------------------------------------------

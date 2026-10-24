@@ -246,6 +246,12 @@ struct FakeEnvironment final : IPageEnvironment {
   void alert(StringView t) override { alerts.push_back(std::string(t.data(), t.size())); }
   bool confirm(StringView) override { return confirm_answer; }
   void scroll_to(int32_t line) override { scrolls.push_back(line); }
+  bool can_pip = true;
+  int pip_opened = 0, pip_closed = 0;
+  uint32_t pip_w = 0, pip_h = 0, pip_video = 0;
+  bool pip_supported() override { return can_pip; }
+  bool open_pip(uint32_t video, uint32_t w, uint32_t h, PageObjects&) override { ++pip_opened; pip_video = video; pip_w = w; pip_h = h; return can_pip; }
+  void close_pip() override { ++pip_closed; }
   bool can_fullscreen = true, is_fullscreen = false;
   int fullscreen_entered = 0, fullscreen_left = 0;
   bool fullscreen_supported() override { return can_fullscreen; }
@@ -3439,6 +3445,88 @@ static void test_fullscreen() {
   CHECK(a.live == 0);
 }
 
+static void test_picture_in_picture() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4 width=128 height=96 controls></video><video id=w src=m.mp4 disablepictureinpicture></video><button id=go></button><button id=out></button><button id=more></button><script>"
+              "var v = document.getElementById('v'), w = document.getElementById('w'), log = [], pw;"
+              "log.push(document.pictureInPictureEnabled, document.pictureInPictureElement, typeof v.requestPictureInPicture, v.disablePictureInPicture, w.disablePictureInPicture);"
+              "document.exitPictureInPicture().catch(function (e) { log.push('exit:' + e.name) });"
+              "document.addEventListener('enterpictureinpicture', function (e) { log.push('enter:' + e.target.id + ':' + (e.pictureInPictureWindow === pw)) });"
+              "v.addEventListener('leavepictureinpicture', function (e) { log.push('leave:' + (e.pictureInPictureWindow === pw)) });"
+              "document.getElementById('go').onclick = function () { v.requestPictureInPicture().then(function (win) { pw = win; log.push('in', win.width, win.height, document.pictureInPictureElement === v, win instanceof PictureInPictureWindow);"
+              "  win.onresize = function () { log.push('resize', win.width, win.height) } }) };"
+              "document.getElementById('out').onclick = function () { document.exitPictureInPicture().then(function () { log.push('out', document.pictureInPictureElement) }) };"
+              "document.getElementById('more').onclick = function () { w.requestPictureInPicture().catch(function (e) { console.log('disabled:' + e.name) }); console.log(log.join(' ')) };"
+              "</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    auto pump = [&](int rounds) {
+      for (int i = 0; i < rounds; ++i) {
+        double due;
+        if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
+        page.run_due_timers(static_cast<double>(env.clock));
+        if (page.changed()) page.render(&doc);
+        page.step_objects(static_cast<double>(env.clock));
+      }
+    };
+    pump(4);
+    page.click(page.document().element_by_id("go")->serial, 0, 0);
+    pump(6);
+    CHECK(env.pip_opened == 1 && env.pip_w == 64 && env.pip_h == 48 && page.objects().pip() == env.pip_video && page.pip_element() == page.document().element_by_id("v"));
+    // the page shows a note in its place; the window gets the picture
+    const Run* run = find_object(doc, ObjectKind::Video);
+    CHECK(run != nullptr);
+    {
+      Surface32 target(a, 128, 96);
+      graphics::SoftwareRenderer2D renderer(target.surface);
+      page.objects().paint_object(renderer, env.pip_video, ObjectKind::Video, 0, 0, 128, 96, Rect2D{0, 0, 128, 96});
+      CHECK(target.at(2, 2) == 0xFF000000u && target.at(64, 10) == 0xFF000000u);   // (black, with the note)
+      Surface32 window(a, 64, 48);
+      graphics::SoftwareRenderer2D pip_renderer(window.surface);
+      page.objects().paint_pip(pip_renderer, env.pip_video, 0, 0, 64, 48, Rect2D{0, 0, 64, 48});
+      CHECK(window.at(32, 24) != 0xFF000000u);   // the picture
+    }
+    // the window resizes
+    page.pip_resized(100, 75);
+    pump(4);
+    page.click(page.document().element_by_id("out")->serial, 0, 0);
+    pump(6);
+    CHECK(env.pip_closed == 1 && page.objects().pip() == 0 && page.pip_element() == nullptr);
+    // the user closes the window
+    page.click(page.document().element_by_id("go")->serial, 0, 0);
+    pump(6);
+    page.pip_left();
+    pump(6);
+    CHECK(page.pip_element() == nullptr && page.objects().pip() == 0);
+    page.click(page.document().element_by_id("more")->serial, 0, 0);
+    pump(6);
+    const std::string out = page_log(page);
+    CHECK(out.find("true  function false true exit:InvalidStateError") == 0);
+    CHECK(in_order(out, {"enter:v:false in 64 48 true true", "resize 100 75", "leave:true", "out ", "enter:v:false in 64 48 true true", "leave:true", "disabled:InvalidStateError"}));
+  }
+  CHECK(a.live == 0);
+  {   // a browser that cannot
+    FakeEnvironment env(a);
+    env.can_pip = false;
+    env.blobs["http://example.com/m.mp4"] = "movie";
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src=m.mp4></video><script>var v = document.getElementById('v'); console.log(document.pictureInPictureEnabled); v.requestPictureInPicture().catch(function (e) { console.log(e.name) });</script></body></html>");
+    for (int i = 0; i < 6; ++i) {
+      double due;
+      if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
+      page.run_due_timers(static_cast<double>(env.clock));
+    }
+    CHECK(page_log(page) == "false | NotSupportedError");
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
@@ -3482,6 +3570,7 @@ int main(int argc, char** argv) {
   test_dash_page();
   test_dashjs();
   test_fullscreen();
+  test_picture_in_picture();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

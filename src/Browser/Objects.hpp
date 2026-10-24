@@ -224,6 +224,15 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void video_set_rate(uint32_t serial, double rate);           // playbackRate, 0 .. 16 (the caller checks)
   void video_set_default_rate(uint32_t serial, double rate);   // defaultPlaybackRate: what playbackRate is after load()
   void video_load(uint32_t serial);   // fetch again
+  // --- Picture-in-Picture: the video that is shown in a window of its own. The page shows a note in its place; paint_pip() draws the picture for the window.
+  void set_pip(uint32_t serial) {
+    Lock lock(*this);
+    pip_serial_ = serial;
+    dirty_ = true;
+  }
+  uint32_t pip() const { return pip_serial_; }
+  void paint_pip(graphics::IRenderer2D& r, uint32_t serial, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip);
+  void video_toggle(uint32_t serial);   // play or pause (a click on the window)
   // The DASH client playing the element's manifest (null if it plays something else), and where playback is (microseconds).
   media::DashClient* video_dash(uint32_t serial, int64_t* playhead_us);
 
@@ -339,7 +348,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void draw_scaled(graphics::IRenderer2D& r, Scaled& cache, const ImageSource& src, uint32_t frame, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip,
                    bool fit);
   void draw_cues(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h);
-  void draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip);
+  void draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip, bool pip_view = false);
   uint32_t image_frame(const CachedImage& c) const;
   void release_scaled(Scaled* s);
 
@@ -347,6 +356,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   kernel::RecursiveMutex mutex_;
   List<UniquePointer<CachedImage>> cache_;
   List<UniquePointer<ImageSlot>> images_;
+  uint32_t pip_serial_ = 0;
   List<UniquePointer<VideoSlot>> videos_;
   List<UniquePointer<CanvasSlot>> canvases_;
   List<UniquePointer<SvgSlot>> svgs_;

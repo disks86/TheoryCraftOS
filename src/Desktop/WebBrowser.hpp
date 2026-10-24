@@ -47,6 +47,7 @@
 #include "Gui/Controls/PageView.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TextBox.hpp"
+#include "Desktop/PictureInPicture.hpp"
 #include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 
@@ -166,6 +167,9 @@ class WebBrowser : public gui::Frame {
     bool confirm(StringView) override { return false; }
     void scroll_to(int32_t line) override;
     bool fullscreen_supported() override { return true; }
+    bool pip_supported() override { return true; }
+    bool open_pip(uint32_t video_serial, uint32_t width, uint32_t height, browser::PageObjects& objects) override;
+    void close_pip() override;
     bool set_fullscreen(bool on) override;
     uint64_t now_ms() override;
     void console(int, StringView) override {}
@@ -261,6 +265,8 @@ class WebBrowser : public gui::Frame {
   void queue(const gui::Handler& handler, gui::Control& sender, bool coalesce) { worker_.post(handler, sender, coalesce); }
   static void route_node(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->node_handler_, s, false); }
   static void route_pointer(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->pointer_handler_, s, true); }
+  static void route_pip(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->pip_handler_, s, true); }
+  static void on_pip_changed(void* self, gui::Control&);
   static void route_resize(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->resize_handler_, s, true); }
   static void route_key(void* self, gui::Control& s) { auto* b = static_cast<WebBrowser*>(self); b->queue(b->key_handler_, s, false); }
   UnixClock unix_clock_ = nullptr;
@@ -280,6 +286,9 @@ class WebBrowser : public gui::Frame {
   int32_t defer_history_ = 0, defer_scroll_ = -1;
   String defer_go_;
   bool want_go_ = false, want_post_ = false;
+  PictureInPictureWindow pip_window_;   // (the window of a video in Picture-in-Picture)
+  gui::Handler pip_handler_;
+  uint32_t pip_w_ = 0, pip_h_ = 0;      // the size of its picture the page was told
   int8_t defer_fullscreen_ = 0;      // 1 enter, 2 leave (the page asked), 3 leave (the window did: Escape, another page)
   bool fullscreen_ = false, fullscreen_maximized_ = false;
   uint32_t pending_file_node_ = 0;   // the file input a picked file is for
