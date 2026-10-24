@@ -34,13 +34,15 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   static constexpr uint16_t kPciVendor = 0x1002;
 
   // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown).
-  // `discovery` is the last 64 KiB of the GPU's video memory (see AmdMediaEngineHw), or an empty window to skip looking at the hardware.
+  // `discovery` is, for a card, the last 64 KiB of its video memory; for an APU, its memory BAR (see AmdMediaEngineHw); or an empty window to skip looking at the hardware.
   explicit AmdVcnVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& discovery = MmioRegion())
       : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), gpu_(amd_gpu_identify(gpu_device_id)), discovery_(discovery) {}
 
   // Reads the GPU's IP discovery table (when given a window and the generation has one). Always succeeds: the engine is there either way.
   bool initialize() override {
-    status_ = AmdMediaEngineHw::probe(allocator_, discovery_, gpu_.architecture);
+    // An APU's window is its memory BAR (the table is at the end of the carve-out somewhere inside it); a card's is the last 64 KiB of its own memory.
+    status_ = gpu_.discrete ? AmdMediaEngineHw::probe(allocator_, discovery_, gpu_.architecture)
+                            : AmdMediaEngineHw::probe_aperture(allocator_, discovery_, gpu_.architecture);
     summary_.assign(gpu_.name);
     if (status_.probed) {
       const AmdIpDiscoveryInfo& d = status_.discovery;
@@ -56,6 +58,11 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
       summary_.append_uint(d.gc.major);
       summary_.append(".");
       summary_.append_uint(d.gc.minor);
+      if (status_.carve_out_bytes) {
+        summary_.append(", shared memory ");
+        summary_.append_uint(status_.carve_out_bytes >> 20);
+        summary_.append(" MiB");
+      }
     } else {
       summary_.append(", IP discovery table not read");
     }

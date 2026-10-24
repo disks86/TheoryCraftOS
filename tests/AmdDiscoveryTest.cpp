@@ -21,6 +21,8 @@
 // table is either refused or parsed to something that still holds together).
 #include <stdio.h>
 #include <stdlib.h>
+#include <initializer_list>
+#include <utility>
 #include <vector>
 #include "Hardware/VideoCodec/AMD/AmdIpDiscovery.hpp"
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
@@ -172,10 +174,67 @@ static void test_probe() {
   CHECK(!s.probed || !s.discovery.checksum_ok);
 }
 
+// Pretend memory BAR of an APU: `mib` MiB of words, with tables copied in at the given offsets.
+static std::vector<uint32_t> aperture(size_t mib, std::initializer_list<std::pair<size_t, std::vector<uint8_t>>> tables) {
+  std::vector<uint32_t> words(mib * (1u << 20) / 4, 0);
+  for (const auto& entry : tables)
+    for (size_t i = 0; i < entry.second.size(); ++i) words[(entry.first + i) / 4] |= static_cast<uint32_t>(entry.second[i]) << (8 * ((entry.first + i) % 4));
+  return words;
+}
+static MmioRegion window_of(std::vector<uint32_t>& words) { return MmioRegion(reinterpret_cast<uint64_t>(words.data()), words.size() * 4); }
+
+static void test_aperture() {
+  TestAllocator a;
+  constexpr size_t kMiB = 1u << 20, k64K = 64 * 1024;
+  const std::vector<uint8_t> good = build(kNavi31);
+  // An APU with a 3 MiB carve-out inside a 4 MiB aperture: the table is at the end of the carve-out, and the scan says how big the carve-out is.
+  std::vector<uint32_t> bar = aperture(4, {{3 * kMiB - k64K, good}});
+  AmdMediaEngineStatus s = AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna2);
+  CHECK(s.probed && s.carve_out_bytes == 3 * kMiB && s.vcn_count() == 2 && s.discovery.checksum_ok && a.live == 0);
+  // A carve-out as big as the aperture is found at the very end.
+  bar = aperture(4, {{4 * kMiB - k64K, good}});
+  s = AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna3_5);
+  CHECK(s.probed && s.carve_out_bytes == 4 * kMiB);
+  // Two copies: the highest valid one wins; a damaged copy above it is skipped (checksum), and so is one that is only a signature.
+  std::vector<uint8_t> damaged = good;
+  damaged[40] ^= 0x10;
+  const std::vector<uint8_t> bare = {0x07, 0x14, 0x21, 0x28};
+  bar = aperture(8, {{2 * kMiB - k64K, good}, {5 * kMiB - k64K, damaged}, {7 * kMiB - k64K, bare}});
+  s = AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna3);
+  CHECK(s.probed && s.carve_out_bytes == 2 * kMiB);
+  // A table that is not on a MiB boundary (minus 64 KiB), no table at all, all ones, and nothing but a damaged one.
+  bar = aperture(4, {{2 * kMiB - k64K - 4096, good}});
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna2).probed);
+  bar = aperture(4, {});
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna2).probed);
+  for (uint32_t& w : bar) w = 0xFFFFFFFFu;
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna2).probed);
+  bar = aperture(4, {{3 * kMiB - k64K, damaged}});
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna2).probed);
+  // Generations without a table, an empty aperture and one shorter than the table window are not scanned.
+  bar = aperture(4, {{3 * kMiB - k64K, good}});
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Vega).probed && !AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Unknown).probed);
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, MmioRegion(), AmdGpuArchitecture::Rdna2).probed);
+  std::vector<uint32_t> tiny(k64K / 4 - 1, 0);
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, window_of(tiny), AmdGpuArchitecture::Rdna2).probed);
+  // An aperture that is not a whole number of MiB: the partial MiB is not a boundary.
+  std::vector<uint32_t> odd(3 * kMiB / 4 + 1000, 0);
+  for (size_t i = 0; i < good.size(); ++i) odd[(2 * kMiB - k64K + i) / 4] |= static_cast<uint32_t>(good[i]) << (8 * (i % 4));
+  s = AmdMediaEngineHw::probe_aperture(a, window_of(odd), AmdGpuArchitecture::Rdna2);
+  CHECK(s.probed && s.carve_out_bytes == 2 * kMiB);
+  // Memory running out is a miss, not a crash.
+  a.fail = true;
+  bar = aperture(4, {{3 * kMiB - k64K, good}});
+  CHECK(!AmdMediaEngineHw::probe_aperture(a, window_of(bar), AmdGpuArchitecture::Rdna2).probed);
+  a.fail = false;
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_parse();
   test_truncation_and_flips();
   test_probe();
+  test_aperture();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("AmdDiscoveryTest passed\n");
   return 0;

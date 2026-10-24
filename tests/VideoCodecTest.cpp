@@ -586,7 +586,7 @@ static void test_h264_parser() {
 
 // An Intel GPU on the bus, and a mapper that hands out plain memory as its registers.
 struct IntelPci final : IPciBus {
-  uint16_t device_id; bool memory_decode; uint64_t bar0 = 0x1000;
+  uint16_t device_id; bool memory_decode; uint64_t bar0 = 0x1000; uint16_t vendor = 0x8086;
   IntelPci(uint16_t id, bool decode) : device_id(id), memory_decode(decode) {}
   const char* name() const override { return "fake intel pci"; }
   bool initialize() override { return true; }
@@ -594,7 +594,7 @@ struct IntelPci final : IPciBus {
   uint32_t device_count() const override { return 1; }
   bool pci_device(uint32_t index, PciDeviceInfo* out) const override {
     if (index != 0) return false;
-    *out = {{0, 2, 0}, 0x8086, device_id, kPciClassDisplay, 0, 0};
+    *out = {{0, 2, 0}, vendor, device_id, kPciClassDisplay, 0, 0};
     return true;
   }
   uint32_t read32(PciAddress, uint16_t offset) const override { return offset == 0x04 && memory_decode ? 2 : 0; }
@@ -1426,13 +1426,76 @@ static std::vector<uint32_t> amd_fake_vram() {
   return words;
 }
 
+struct FakeBarSizer final : IBarSizer {
+  uint64_t size; int calls = 0;
+  explicit FakeBarSizer(uint64_t bytes) : size(bytes) {}
+  bool bar_size(PciAddress, uint8_t index, uint64_t* out) override { ++calls; if (index != 0) return false; *out = size; return true; }
+};
+
+// SystemVideoCodecs finds the window of an AMD GPU: the end of the memory BAR for a card, the BAR itself (up to the scan limit) for an APU.
+static void test_amd_system_window() {
+  TestAllocator a;
+  std::vector<uint32_t> table = amd_fake_vram();
+  {   // Radeon APU: Ryzen 7040 (Phoenix), 4 MiB BAR with a 3 MiB carve-out
+    IntelPci pci(0x15BF, true); pci.vendor = 0x1002;
+    FakeRegisterMapper mapper(4u << 20);
+    FakeBarSizer sizer(4u << 20);
+    const size_t at = (3u << 20) - AmdMediaEngineHw::kDiscoveryWindow;
+    for (size_t i = 0; i < table.size(); ++i) mapper.words[at / 4 + i] = table[i];
+    SystemVideoCodecs system(pci, a);
+    system.set_mmio(&mapper); system.set_bar_sizer(&sizer);
+    system.initialize();
+    const AmdVcnVideoEngine* amd = static_cast<AmdVcnVideoEngine*>(system.at(0));
+    CHECK(mapper.calls == 1 && mapper.asked == (4u << 20) && sizer.calls == 1 && amd->engine_status().probed && amd->engine_status().carve_out_bytes == (3u << 20));
+    system.shutdown();
+  }
+  {   // A card (Navi 31): only the last 64 KiB of the BAR is mapped
+    IntelPci pci(0x744C, true); pci.vendor = 0x1002;
+    FakeRegisterMapper mapper(AmdMediaEngineHw::kDiscoveryWindow);
+    FakeBarSizer sizer(16ull << 30);   // 16 GiB, Resizable BAR on
+    for (size_t i = 0; i < table.size(); ++i) mapper.words[i] = table[i];
+    pci.bar0 = 0x1000;
+    SystemVideoCodecs system(pci, a);
+    system.set_mmio(&mapper); system.set_bar_sizer(&sizer);
+    system.initialize();
+    CHECK(mapper.calls == 0 || mapper.asked == AmdMediaEngineHw::kDiscoveryWindow);   // (the fake maps only at 0x1000: a card's window is far above it)
+    system.shutdown();
+  }
+  {   // An APU with a huge BAR is mapped only up to the limit; without a sizer or mapper nothing is touched.
+    IntelPci pci(0x1681, true); pci.vendor = 0x1002;
+    FakeRegisterMapper mapper(AmdMediaEngineHw::kApertureScanLimit < (64u << 20) ? 0 : 8u << 20);
+    FakeBarSizer sizer(16ull << 30);
+    SystemVideoCodecs system(pci, a);
+    system.set_mmio(&mapper); system.set_bar_sizer(&sizer);
+    system.initialize();
+    CHECK(mapper.asked == AmdMediaEngineHw::kApertureScanLimit);
+    system.shutdown();
+    FakeRegisterMapper untouched;
+    SystemVideoCodecs bare(pci, a);
+    bare.set_mmio(&untouched);
+    bare.initialize();
+    CHECK(untouched.calls == 0);
+    bare.shutdown();
+  }
+}
+
 static void test_amd_discovery_engine() {
   TestAllocator a;
   std::vector<uint32_t> vram = amd_fake_vram();
   const MmioRegion window(reinterpret_cast<uint64_t>(vram.data()), vram.size() * 4);
   AmdVcnVideoEngine navi31(a, 0x744C, window), no_window(a, 0x744C), vega(a, 0x15DD, window);
   CHECK(navi31.initialize() && navi31.engine_status().probed && navi31.engine_status().vcn_count() == 1 && navi31.engine_status().discovery.vcn.major == 4);
-  CHECK(navi31.engine_status().discovery.gc.major == 11 && navi31.engine_status().discovery.checksum_ok);
+  CHECK(navi31.engine_status().discovery.gc.major == 11 && navi31.engine_status().discovery.checksum_ok && navi31.engine_status().carve_out_bytes == 0);
+  // A Radeon APU (Ryzen 7040, Phoenix): the window is the memory BAR, and the table is at the end of a carve-out inside it.
+  std::vector<uint32_t> bar(4u << 18, 0);   // 4 MiB of words
+  const size_t at = (3u << 20) - AmdMediaEngineHw::kDiscoveryWindow;
+  for (size_t i = 0; i < vram.size() && i < AmdMediaEngineHw::kDiscoveryWindow / 4; ++i) bar[at / 4 + i] = vram[i];
+  AmdVcnVideoEngine phoenix(a, 0x15BF, MmioRegion(reinterpret_cast<uint64_t>(bar.data()), bar.size() * 4));
+  CHECK(phoenix.initialize() && phoenix.engine_status().probed && phoenix.engine_status().carve_out_bytes == (3u << 20) && !phoenix.gpu().discrete);
+  CHECK(strstr(phoenix.engine_summary(), "Radeon 780M") && strstr(phoenix.engine_summary(), "VCN 4.0.0") && strstr(phoenix.engine_summary(), "shared memory 3 MiB"));
+  AmdVcnVideoEngine phoenix_blind(a, 0x15BF);
+  CHECK(phoenix_blind.initialize() && !phoenix_blind.engine_status().probed && strstr(phoenix_blind.engine_summary(), "not read"));
+  CHECK(!strstr(navi31.engine_summary(), "shared memory"));
   CHECK(no_window.initialize() && !no_window.engine_status().probed && no_window.engine_status().vcn_count() == 0);
   CHECK(vega.initialize() && !vega.engine_status().probed);   // Vega has no table: nothing is read
   CHECK(navi31.info().hardware_engine && !navi31.info().accelerated && a.live == 0);
@@ -1466,6 +1529,7 @@ int main() {
   test_intel_arc_engine();
   test_amd_media_engine();
   test_amd_discovery_engine();
+  test_amd_system_window();
   test_nvidia_media_engine();
   test_intel_system();
   test_h264_parser();

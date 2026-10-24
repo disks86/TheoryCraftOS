@@ -28,6 +28,9 @@ namespace hardware {
 struct AmdMediaEngineStatus {
   bool probed = false;            // a valid IP discovery table was read (false: unsupported generation, no window, or no table where it should be)
   AmdIpDiscoveryInfo discovery;
+  // Radeon APUs only (probe_aperture): the size of the part of system memory the firmware set aside as the GPU's video memory. It is where the table was
+  // found, as the table sits in the last 64 KiB of that memory; 0 for a discrete card, whose probe does not learn it.
+  uint64_t carve_out_bytes = 0;
   uint32_t vcn_count() const { return probed ? discovery.vcn_instances : 0; }
 };
 
@@ -46,6 +49,15 @@ class AmdMediaEngineHw {
   // Reads the table from `window` (the last kDiscoveryWindow bytes of video memory as seen through the GPU's memory BAR) and parses it. Reads only
   // as many bytes as the table declares for itself. An empty window, a short one, or one that holds no table gives probed == false.
   static AmdMediaEngineStatus probe(allocators::IAllocator& allocator, const MmioRegion& window, AmdGpuArchitecture architecture);
+
+  // The same for a Radeon APU (Ryzen 6000 and newer: RDNA 2, 3 and 3.5 graphics). An APU has no memory of its own: its "video memory" is a carve-out of system
+  // RAM, a whole number of MiB the BIOS picks (UMA frame buffer size), and the table is in the last 64 KiB of the carve-out - not of the memory BAR, which
+  // may be larger or smaller. `aperture` is the memory BAR from its start (or as much of it as is mapped); the scan looks at every MiB boundary of it, highest
+  // first, for the table's signature, and takes the first one that parses and passes its checksum. The size of the carve-out is the boundary it found.
+  // Reads only; a few thousand reads at most.
+  static AmdMediaEngineStatus probe_aperture(allocators::IAllocator& allocator, const MmioRegion& aperture, AmdGpuArchitecture architecture);
+  // The most of an APU's memory BAR the system maps for the scan.
+  static constexpr uint64_t kApertureScanLimit = 2ull << 30;
 };
 
 }  // namespace hardware

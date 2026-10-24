@@ -41,13 +41,15 @@ bool AmdMediaEngineHw::supported(AmdGpuArchitecture architecture) {
   }
 }
 
-AmdMediaEngineStatus AmdMediaEngineHw::probe(allocators::IAllocator& allocator, const MmioRegion& window, AmdGpuArchitecture architecture) {
+namespace {
+// Reads and parses the table at the start of `window`; `probed` is false if there is none there.
+AmdMediaEngineStatus read_table(allocators::IAllocator& allocator, const MmioRegion& window) {
   AmdMediaEngineStatus status;
-  if (!supported(architecture) || window.length() < kAmdIpDiscoveryHeaderBytes) return status;
+  if (window.length() < kAmdIpDiscoveryHeaderBytes) return status;
   ByteBuffer table(allocator);
   if (!fetch(window, kAmdIpDiscoveryHeaderBytes, table)) return status;
   const uint32_t declared = amd_ip_discovery_declared_size(table.view());
-  if (declared == 0 || declared > window.length() || declared > kDiscoveryWindow) return status;   // no table here
+  if (declared == 0 || declared > window.length() || declared > AmdMediaEngineHw::kDiscoveryWindow) return status;   // no table here
   const uint32_t rounded = (declared + 3) & ~3u;
   if (rounded > window.length()) return status;
   table.clear();
@@ -55,6 +57,27 @@ AmdMediaEngineStatus AmdMediaEngineHw::probe(allocators::IAllocator& allocator, 
   status.discovery = amd_parse_ip_discovery(table.view());
   status.probed = status.discovery.valid;
   return status;
+}
+}  // namespace
+
+AmdMediaEngineStatus AmdMediaEngineHw::probe(allocators::IAllocator& allocator, const MmioRegion& window, AmdGpuArchitecture architecture) {
+  if (!supported(architecture)) return AmdMediaEngineStatus();
+  return read_table(allocator, window);
+}
+
+AmdMediaEngineStatus AmdMediaEngineHw::probe_aperture(allocators::IAllocator& allocator, const MmioRegion& aperture, AmdGpuArchitecture architecture) {
+  constexpr uint64_t kMiB = 1ull << 20;
+  constexpr uint32_t kSignature = 0x28211407;   // the first word of the table
+  if (!supported(architecture) || aperture.length() < kDiscoveryWindow) return AmdMediaEngineStatus();
+  for (uint64_t boundary = aperture.length() / kMiB * kMiB; boundary >= kMiB; boundary -= kMiB) {
+    const uint64_t offset = boundary - kDiscoveryWindow;
+    if (aperture.read32(offset) != kSignature) continue;
+    AmdMediaEngineStatus status = read_table(allocator, aperture.subregion(offset, kDiscoveryWindow));
+    if (!status.probed || !status.discovery.checksum_ok) continue;   // a stale or damaged copy: keep looking lower
+    status.carve_out_bytes = boundary;
+    return status;
+  }
+  return AmdMediaEngineStatus();
 }
 
 }  // namespace hardware

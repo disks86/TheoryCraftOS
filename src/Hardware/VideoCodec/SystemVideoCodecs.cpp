@@ -61,7 +61,7 @@ MmioRegion SystemVideoCodecs::nvidia_registers(const PciDeviceInfo& d) const {
   return region;
 }
 
-// The last 64 KiB of an AMD GPU's video memory, where the IP discovery table is, if it can be reached: a generation that has one, a mapper and a
+// Where the IP discovery table of an AMD GPU can be looked for, if it can be reached (the last 64 KiB of a card's video memory; an APU's whole memory BAR, up to a limit): a generation that has one, a mapper and a
 // sizer, memory decoding switched on, and a memory BAR that covers the whole of video memory (a smaller window - no resizable BAR - cannot show its end,
 // and then the probe finds no table). Empty otherwise.
 MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d) const {
@@ -73,6 +73,12 @@ MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d) const
   const uint64_t base = pci_.memory_bar(d.address, 0);
   uint64_t size = 0;
   if (base == 0 || !bar_sizer_->bar_size(d.address, 0, &size) || size < AmdMediaEngineHw::kDiscoveryWindow || size > UINT64_MAX - base) return region;
+  if (!amd_gpu_identify(d.device_id).discrete) {
+    // A Radeon APU: its video memory is a carve-out of system RAM whose end is not the end of the BAR, so the scan gets the BAR itself (up to the limit).
+    const uint64_t mapped = size < AmdMediaEngineHw::kApertureScanLimit ? size : AmdMediaEngineHw::kApertureScanLimit;
+    if (!mmio_->map_registers(base, mapped, &region)) return MmioRegion();
+    return region;
+  }
   if (!mmio_->map_registers(base + (size - AmdMediaEngineHw::kDiscoveryWindow), AmdMediaEngineHw::kDiscoveryWindow, &region)) return MmioRegion();
   return region;
 }
@@ -101,7 +107,7 @@ void SystemVideoCodecs::initialize() {
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassDisplay) continue;
     if (d.vendor_id == NvidiaVideoEngine::kPciVendor) try_add<NvidiaVideoEngine>(devices_, allocator_, d.device_id, nvidia_registers(d));
-    else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_, d.device_id);
+    else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_, d.device_id, amd_discovery_window(d));
     else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) add_intel(d);
   }
   try_add<SoftwareVideoCodec>(devices_, allocator_);
