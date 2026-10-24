@@ -81,28 +81,38 @@ bool size_ok(uint32_t width, uint32_t height) {
 }
 
 // The header, the indexes and the decode message, the same for every codec; `codec_message_id` and `codec_bytes` name the codec's own message that follows.
+// `dynamic_dpb`: the message layout of the engines that take the picture buffer's description in a message of its own (a third index, the decode message and the
+// dynamic picture buffer message in front of the codec's).
 bool build_common_decode(ByteView out, uint32_t total, uint32_t stream_handle, uint32_t feedback_number, uint32_t stream_type, uint32_t codec_message_id, uint32_t codec_bytes,
-                         uint32_t width, uint32_t height, const DecodeBuffers& b) {
+                         uint32_t width, uint32_t height, const DecodeBuffers& b, bool dynamic_dpb = false) {
+  const uint32_t decode_offset = dynamic_dpb ? kDecodeOffset + kIndex_sizeof : kDecodeOffset;
+  const uint32_t dpb_message_offset = decode_offset + kDecode_sizeof;
+  const uint32_t codec_offset = dynamic_dpb ? dpb_message_offset + kDynamicDpb_sizeof : kAvcOffset;
   if (out.size() < total || width == 0 || height == 0 || width > kMaxWidth || height > kMaxHeight) return false;
   if (b.dpb_bytes > UINT32_MAX || b.context_bytes > UINT32_MAX || b.target.bytes > UINT32_MAX || b.bitstream_bytes > UINT32_MAX - 127) return false;
   Image m(out);
   m.zero(0, total);
   m.u32(kHeader_header_size, kHeaderBytes);
-  m.u32(kHeader_total_size, kAvcOffset);   // (Mesa: the size up to the codec's message, which is not counted)
-  m.u32(kHeader_num_buffers, 2);
+  m.u32(kHeader_total_size, codec_offset);   // (Mesa: the size up to the codec's message, which is not counted)
+  m.u32(kHeader_num_buffers, dynamic_dpb ? 3 : 2);
   m.u32(kHeader_msg_type, kMsgDecode);
   m.u32(kHeader_stream_handle, stream_handle);
   m.u32(kHeader_status_report_feedback_number, feedback_number);
   m.u32(kHeader_index + kIndex_message_id, kMessageDecode);
-  m.u32(kHeader_index + kIndex_offset, kDecodeOffset);
+  m.u32(kHeader_index + kIndex_offset, decode_offset);
   m.u32(kHeader_index + kIndex_size, kDecode_sizeof);
   m.u32(kHeaderBytes + kIndex_message_id, codec_message_id);
-  m.u32(kHeaderBytes + kIndex_offset, kAvcOffset);
+  m.u32(kHeaderBytes + kIndex_offset, codec_offset);
   m.u32(kHeaderBytes + kIndex_size, codec_bytes);
+  if (dynamic_dpb) {
+    m.u32(kHeaderBytes + kIndex_sizeof + kIndex_message_id, kMessageDynamicDpb);
+    m.u32(kHeaderBytes + kIndex_sizeof + kIndex_offset, dpb_message_offset);
+    m.u32(kHeaderBytes + kIndex_sizeof + kIndex_size, kDynamicDpb_sizeof);
+  }
 
-  const uint32_t d = kDecodeOffset;
+  const uint32_t d = decode_offset;
   m.u32(d + kDecode_stream_type, stream_type);
-  m.u32(d + kDecode_decode_flags, 0);
+  m.u32(d + kDecode_decode_flags, dynamic_dpb ? 1 : 0);
   m.u32(d + kDecode_width_in_samples, width);
   m.u32(d + kDecode_height_in_samples, height);
   m.u32(d + kDecode_bsd_size, static_cast<uint32_t>(align_up(b.bitstream_bytes, 128)));
@@ -675,6 +685,124 @@ bool prepare_av1_feedback_and_tables(ByteView buffer, const av1::FrameHeader& hd
   for (uint32_t i = 0; i < 8; ++i)
     for (uint32_t j = 0; j < 8; ++j) m.u16(kItTableOffset + (i * 8 + j) * 2, static_cast<uint16_t>(data[i][j]));
   for (uint32_t i = 0; i < 8; ++i) m.u8(kItTableOffset + 128 + i, mask[i]);
+  return true;
+}
+
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnVp9Probs.inc"
+
+// Where the segmentation data sits in the table behind the message (measured with the compiler from rvcn_dec_vp9_probs_segment_t): after the 2304 bytes the
+// probabilities take (2072 are used), 8 words of feature data, the tree and prediction probabilities, the delta mode, the 8 feature masks.
+constexpr uint32_t kVp9TableProbsBytes = 2304, kVp9TableFeatureData = 2304, kVp9TableTreeProbs = 2336, kVp9TablePredProbs = 2343, kVp9TableAbsDelta = 2346,
+                   kVp9TableFeatureMask = 2347, kVp9TableBytes = 2560;
+static_assert(sizeof(kVp9DefaultProbs) == kVp9Probs_sizeof, "the probability table is a rvcn_dec_vp9_probs_t");
+
+// frame_header_flags of the VP9 message (RDECODE_FRAME_HDR_INFO_VP9_*).
+uint32_t vp9_flags(const vp9::OffloadFrame& f) {
+  uint32_t flags = 0;
+  auto set = [&flags](bool v, uint32_t bit) { if (v) flags |= 1u << bit; };
+  set(!f.info.key_frame, 1);   // (frame_type: 0 for a key frame)
+  set(f.error_resilient, 2);
+  set(f.info.intra_only, 3);
+  set(f.hp_mv, 4);
+  set(f.refresh_frame_context, 5);
+  set(f.frame_parallel, 6);
+  set(f.seg.enabled, 7);
+  set(f.seg.update_map, 8);
+  set(f.seg.temporal_update, 9);
+  set(f.mode_ref_delta_enabled, 11);
+  set(f.mode_ref_delta_update, 12);
+  set(f.use_prev_frame_mvs, 13);
+  return flags;
+}
+}  // namespace
+
+uint32_t vp9_decode_message_bytes() { return kDecodeOffset + kIndex_sizeof + kDecode_sizeof + kDynamicDpb_sizeof + kVp9_sizeof; }
+uint32_t vp9_message_buffer_bytes() { return kItTableOffset + kVp9TableBytes; }
+ConstByteView vp9_default_probabilities() { return ConstByteView(kVp9DefaultProbs); }
+
+Vp9BufferSizes vp9_buffer_sizes(uint32_t width, uint32_t height) {
+  Vp9BufferSizes sizes;
+  if (width == 0 || height == 0 || width > kMaxWidth || height > kMaxHeight) return sizes;
+  sizes.references = kVp9References;
+  // Mesa for the engines before Renoir: pictures of the (32 aligned) size, nine of them; the context holds the default and the saved probabilities (five times 2304)
+  // and the engine's collocated motion data and left-tile pixels, whose sizes do not depend on the picture's.
+  sizes.dpb = align_up(width, 32) * align_up(height, 32) * 3 / 2 * kVp9References;
+  sizes.context = uint64_t{2304} * 5 + uint64_t{32} * 2 * 64 * 64 + uint64_t{9} * 64 * 2 * 64 * 64 + uint64_t{8} * 2 * 4096;
+  return sizes;
+}
+
+bool build_vp9_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const vp9::OffloadFrame& frame, const Vp9Slots& slots, const DecodeBuffers& b) {
+  const vp9::FrameHeaderInfo& info = frame.info;
+  if (info.bit_depth != 8 || info.width <= 0 || info.height <= 0) return false;
+  const uint32_t width = static_cast<uint32_t>(info.width), height = static_cast<uint32_t>(info.height);
+  const uint32_t total = vp9_decode_message_bytes();
+  if (!build_common_decode(out, total, stream_handle, feedback_number, kStreamTypeVp9, kMessageVp9, kVp9_sizeof, width, height, b, /*dynamic_dpb=*/true)) return false;
+  Image m(out);
+  const uint32_t decode_offset = kDecodeOffset + kIndex_sizeof;
+  const uint32_t dpb_offset = decode_offset + kDecode_sizeof;
+  const uint32_t v = dpb_offset + kDynamicDpb_sizeof;
+  // The picture buffer, described for nine pictures of the frame's size (Mesa: dpbArraySize = NUM_VP9_REFS + 1, 32 aligned, chroma at half).
+  const uint32_t luma_pitch = static_cast<uint32_t>(align_up(width, 32)), luma_height = static_cast<uint32_t>(align_up(height, 32));
+  m.u32(dpb_offset + kDynamicDpb_dpbLumaPitch, luma_pitch);
+  m.u32(dpb_offset + kDynamicDpb_dpbLumaAlignedHeight, luma_height);
+  m.u32(dpb_offset + kDynamicDpb_dpbLumaAlignedSize, luma_pitch * luma_height);
+  m.u32(dpb_offset + kDynamicDpb_dpbChromaPitch, luma_pitch >> 1);
+  m.u32(dpb_offset + kDynamicDpb_dpbChromaAlignedHeight, luma_height >> 1);
+  m.u32(dpb_offset + kDynamicDpb_dpbChromaAlignedSize, (luma_pitch >> 1) * (luma_height >> 1) * 2);
+  m.u8(dpb_offset + kDynamicDpb_dpbArraySize, static_cast<uint8_t>(kVp9References));
+  m.u8(dpb_offset + kDynamicDpb_dpbReserved0, 32);
+  m.u32(v + kVp9_frame_header_flags, vp9_flags(frame));
+  m.u8(v + kVp9_frame_context_idx, static_cast<uint8_t>(frame.frame_context_idx));
+  m.u8(v + kVp9_reset_frame_context, static_cast<uint8_t>(frame.reset_frame_context));
+  m.u8(v + kVp9_curr_pic_idx, slots.current);
+  m.u8(v + kVp9_interp_filter, static_cast<uint8_t>(frame.interp_filter));
+  m.u8(v + kVp9_filter_level, static_cast<uint8_t>(frame.filter_level));
+  m.u8(v + kVp9_sharpness_level, static_cast<uint8_t>(frame.sharpness_level));
+  for (uint32_t seg = 0; seg < 8; ++seg)
+    for (uint32_t ref = 0; ref < 4; ++ref)
+      for (uint32_t mode = 0; mode < 2; ++mode) m.u8(v + kVp9_lf_adj_level + seg * 8 + ref * 2 + mode, frame.lf_adj_level[seg][ref][mode]);
+  m.u8(v + kVp9_base_qindex, static_cast<uint8_t>(frame.base_qindex));
+  m.u8(v + kVp9_y_dc_delta_q, static_cast<uint8_t>(frame.y_dc_delta_q));
+  m.u8(v + kVp9_uv_ac_delta_q, static_cast<uint8_t>(frame.uv_ac_delta_q));
+  m.u8(v + kVp9_uv_dc_delta_q, static_cast<uint8_t>(frame.uv_dc_delta_q));
+  m.u8(v + kVp9_log2_tile_cols, static_cast<uint8_t>(frame.log2_tile_cols));
+  m.u8(v + kVp9_log2_tile_rows, static_cast<uint8_t>(frame.log2_tile_rows));
+  m.u8(v + kVp9_chroma_format, 1);
+  for (uint32_t i = 0; i < 8; ++i) m.u8(v + kVp9_ref_frame_map + i, slots.ref_frame_map[i]);
+  for (uint32_t i = 0; i < 3; ++i) {
+    m.u8(v + kVp9_frame_refs + i, frame.ref_slot[i] >= 0 && frame.ref_slot[i] < 8 ? slots.ref_frame_map[frame.ref_slot[i]] : kVp9NoPicture);
+    m.u8(v + kVp9_ref_frame_sign_bias + i, static_cast<uint8_t>(frame.sign_bias[i]));
+  }
+  m.u8(v + kVp9_bit_depth_luma_minus8, 0);
+  m.u8(v + kVp9_bit_depth_chroma_minus8, 0);
+  m.u32(v + kVp9_vp9_frame_size, static_cast<uint32_t>(align_up(b.bitstream_bytes, 128)));
+  m.u32(v + kVp9_compressed_header_size, frame.compressed_header_bytes);
+  m.u32(v + kVp9_uncompressed_header_size, frame.uncompressed_header_bytes);
+  return true;
+}
+
+bool prepare_vp9_feedback_and_tables(ByteView buffer, const vp9::OffloadFrame& frame) {
+  if (buffer.size() < vp9_message_buffer_bytes()) return false;
+  Image m(buffer);
+  m.zero(kFeedbackOffset, kFeedbackBytes);
+  m.u32(kFeedbackOffset + kFeedback_header_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_total_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_num_buffers, 0);
+  m.zero(kItTableOffset, kVp9TableBytes);
+  for (uint32_t i = 0; i < sizeof(kVp9DefaultProbs); ++i) m.u8(kItTableOffset + i, kVp9DefaultProbs[i]);
+  const vp9::Segmentation& seg = frame.seg;
+  if (seg.enabled) {
+    for (uint32_t i = 0; i < 8; ++i) {
+      // alt_quant in the low 16 bits, alt_lf in the next 8, the reference in 4 more (Mesa's packing of the segment features), and which of the four are on.
+      const uint32_t quant = static_cast<uint32_t>(seg.feature_data[i][0]) & 0xFFFF, lf = static_cast<uint32_t>(seg.feature_data[i][1]) & 0xFF, ref = static_cast<uint32_t>(seg.feature_data[i][2]) & 0xF;
+      m.u32(kItTableOffset + kVp9TableFeatureData + i * 4, quant | (lf << 16) | (ref << 24));
+      m.u8(kItTableOffset + kVp9TableFeatureMask + i, static_cast<uint8_t>(seg.feature_mask[i] & 0xF));
+    }
+    for (uint32_t i = 0; i < 7; ++i) m.u8(kItTableOffset + kVp9TableTreeProbs + i, seg.tree_probs[i]);
+    for (uint32_t i = 0; i < 3; ++i) m.u8(kItTableOffset + kVp9TablePredProbs + i, seg.pred_probs[i]);
+    m.u8(kItTableOffset + kVp9TableAbsDelta, seg.abs_delta ? 1 : 0);
+  }
   return true;
 }
 

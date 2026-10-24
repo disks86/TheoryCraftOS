@@ -177,6 +177,7 @@ void Core::reset() {
   prev_frame_idx_ = -1;
   last_width_ = last_height_ = 0;
   frame_type_ = 0;
+  offload_decided_ = offloaded_ = false;
 }
 
 void Core::release_frame(Frame* f) {
@@ -551,6 +552,7 @@ bool Core::read_uncompressed_header(BitReader& rb, uint32_t* header_size, int* s
         const int idx = ref_frame_map_[ref];
         if (idx < 0) return false;
         frame_refs_[i].idx = idx;
+        ref_slots_[i] = ref;
         ref_frame_sign_bias_[LAST_FRAME + i] = rb.bit();
       }
       if (!setup_frame_size_with_refs(rb)) return false;
@@ -1724,6 +1726,92 @@ bool Core::decode_tiles(ConstByteView data) {
   return true;
 }
 
+// The frame is decoded: it takes the reference slots it refreshes, and the state the next frame's header depends on moves on.
+void Core::install_frame() {
+  for (int i = 0; i < REF_FRAMES; ++i) {
+    if (!((refresh_frame_flags_ >> i) & 1)) continue;
+    const int old = ref_frame_map_[i];
+    if (old >= 0) --frames_[old].ref_count;
+    ref_frame_map_[i] = new_fb_idx_;
+    ++frames_[new_fb_idx_].ref_count;
+  }
+  --frames_[new_fb_idx_].ref_count;
+  last_show_frame_ = show_frame_;
+  prev_frame_idx_ = new_fb_idx_;
+  if (seg_.enabled) seg_map_cur_ ^= 1;
+  last_width_ = width_;
+  last_height_ = height_;
+}
+
+// 8-bit 4:2:0 only is offered to the offload; the engine's output of the other formats is not compared with the CPU's here.
+void Core::fill_offload_frame(OffloadFrame* out, ConstByteView data, uint32_t uncompressed_bytes, uint32_t compressed_bytes, bool init_filter_levels) {
+  Frame& f = frames_[new_fb_idx_];
+  OffloadFrame& o = *out;
+  o.info.show_frame = show_frame_;
+  o.info.key_frame = frame_type_ == 0;
+  o.info.intra_only = intra_only_;
+  o.info.width = width_;
+  o.info.height = height_;
+  o.info.bit_depth = bit_depth_;
+  o.info.profile = profile_;
+  o.error_resilient = error_resilient_;
+  o.hp_mv = allow_high_precision_mv_;
+  o.frame_parallel = frame_parallel_decoding_mode_;
+  o.refresh_frame_context = refresh_frame_context_;
+  o.mode_ref_delta_enabled = lf_.mode_ref_delta_enabled;
+  o.mode_ref_delta_update = lf_.mode_ref_delta_update;
+  o.use_prev_frame_mvs = last_show_frame_ && !error_resilient_;
+  o.reset_frame_context = reset_frame_context_;
+  o.frame_context_idx = frame_context_idx_;
+  o.interp_filter = interp_filter_;
+  o.filter_level = lf_.filter_level;
+  o.sharpness_level = lf_.sharpness_level;
+  if (lf_.filter_level) {
+    if (init_filter_levels) loop_filter_frame_init();
+    for (int sg = 0; sg < MAX_SEGMENTS; ++sg)
+      for (int r = 0; r < MAX_REF_FRAMES; ++r)
+        for (int m = 0; m < 2; ++m) o.lf_adj_level[sg][r][m] = lf_lvl_[sg][r][m];
+  }
+  if (!lossless_) {
+    o.base_qindex = base_qindex_;
+    o.y_dc_delta_q = y_dc_delta_q_;
+    o.uv_dc_delta_q = uv_dc_delta_q_;
+    o.uv_ac_delta_q = uv_ac_delta_q_;
+  }
+  o.log2_tile_cols = log2_tile_cols_;
+  o.log2_tile_rows = log2_tile_rows_;
+  o.seg = seg_;
+  for (int i = 0; i < 3; ++i) {
+    o.ref_slot[i] = ref_slots_[i];
+    o.sign_bias[i] = ref_frame_sign_bias_[LAST_FRAME + i];
+  }
+  o.refresh_frame_flags = refresh_frame_flags_;
+  o.uncompressed_header_bytes = uncompressed_bytes;
+  o.compressed_header_bytes = compressed_bytes;
+  o.data = data;
+  for (int p = 0; p < 3; ++p) {
+    o.plane[p] = f.plane[p];
+    o.stride[p] = f.stride[p];
+    o.plane_width[p] = f.crop_w[p];
+    o.plane_height[p] = f.crop_h[p];
+  }
+}
+
+bool Core::decode_frame_offloaded(ConstByteView data, uint32_t uncompressed_bytes, uint32_t compressed_bytes) {
+  Frame& f = frames_[new_fb_idx_];
+  OffloadFrame o;
+  fill_offload_frame(&o, data, uncompressed_bytes, compressed_bytes, true);
+  if (!offload_->decode_frame(o)) {
+    // Damaged or failed: mid-grey, as the CPU shows what it cannot decode.
+    for (int p = 0; p < 3; ++p)
+      for (int y = 0; y < f.crop_h[p]; ++y)
+        for (int x = 0; x < f.crop_w[p]; ++x) f.plane[p][static_cast<uint64_t>(y) * f.stride[p] + static_cast<uint64_t>(x)] = 128;
+    f.corrupted = true;
+  }
+  install_frame();
+  return true;
+}
+
 bool Core::decode_frame(ConstByteView data, int* shown, FrameHeaderInfo* info) {
   *shown = -1;
   *info = FrameHeaderInfo();
@@ -1741,6 +1829,12 @@ bool Core::decode_frame(ConstByteView data, int* shown, FrameHeaderInfo* info) {
   if (header_size == 0) return fail();
   const uint64_t offset = rb.bytes_read();
   if (offset > data.size() || header_size > data.size() - offset) return fail();
+  // A stream is the offload's or ours from its key frame on (an intra-only frame that starts the stream will do): a stream with frames of both could be decoded by neither.
+  if (offload_ && (!offload_decided_ || frame_type_ == 0)) {
+    offloaded_ = offload_->accepts(*info, ss_x_, ss_y_);
+    offload_decided_ = true;
+  }
+  if (offloaded_) return decode_frame_offloaded(data, static_cast<uint32_t>(offset), header_size) ? true : fail();
   use_prev_frame_mvs_ = !error_resilient_ && width_ == last_width_ && height_ == last_height_ && !last_intra_only_ && last_show_frame_ &&
                         last_frame_type_ != 0 && prev_frame_idx_ >= 0 && frames_[prev_frame_idx_].mi_cols == mi_cols_ &&
                         frames_[prev_frame_idx_].mi_rows == mi_rows_;
@@ -1764,20 +1858,12 @@ bool Core::decode_frame(ConstByteView data, int* shown, FrameHeaderInfo* info) {
   }
   if (refresh_frame_context_) frame_contexts_[frame_context_idx_] = fc_;
   if (lf_.filter_level) loop_filter_frame();
-  // Install the picture in the reference slots it refreshes.
-  for (int i = 0; i < REF_FRAMES; ++i) {
-    if (!((refresh_frame_flags_ >> i) & 1)) continue;
-    const int old = ref_frame_map_[i];
-    if (old >= 0) --frames_[old].ref_count;
-    ref_frame_map_[i] = new_fb_idx_;
-    ++frames_[new_fb_idx_].ref_count;
+  if (observer_) {
+    OffloadFrame o;
+    fill_offload_frame(&o, data, static_cast<uint32_t>(offset), header_size, false);
+    observer_->frame_decoded(o);
   }
-  --frames_[new_fb_idx_].ref_count;
-  last_show_frame_ = show_frame_;
-  prev_frame_idx_ = new_fb_idx_;
-  if (seg_.enabled) seg_map_cur_ ^= 1;
-  last_width_ = width_;
-  last_height_ = height_;
+  install_frame();
   return true;
 }
 

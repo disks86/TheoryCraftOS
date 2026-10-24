@@ -24,6 +24,16 @@ namespace hardware {
 
 Vp9Decoder::~Vp9Decoder() {}
 
+void Vp9Decoder::set_frame_observer(vp9::IFrameObserver* observer) {
+  if (!core_) core_ = UniquePointer<vp9::Core>::make(allocator_, allocator_);
+  if (core_) core_->set_frame_observer(observer);
+}
+
+void Vp9Decoder::set_offload(vp9::IOffload* offload) {
+  if (!core_) core_ = UniquePointer<vp9::Core>::make(allocator_, allocator_);
+  if (core_) core_->set_offload(offload);
+}
+
 void Vp9Decoder::reset() {
   if (core_) core_->reset();
   pending_ = false;

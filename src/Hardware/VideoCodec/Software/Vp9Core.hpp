@@ -257,6 +257,52 @@ struct FrameHeaderInfo {
   int width = 0, height = 0, bit_depth = 8, profile = 0;
 };
 
+// A frame handed to another decoder (a hardware engine) instead of being decoded here: what the uncompressed header says, the frame's bytes and the picture to fill.
+// The Core still reads every uncompressed header (frame sizes, loop filter and segmentation parameters, reference slots) and keeps the reference slots and the output;
+// the compressed header, the tiles, the probability adaptation and the loop filter are the offload's.
+struct OffloadFrame {
+  FrameHeaderInfo info;
+  bool error_resilient = false, hp_mv = false, frame_parallel = false, refresh_frame_context = false, mode_ref_delta_enabled = false, mode_ref_delta_update = false;
+  bool use_prev_frame_mvs = false;   // the previous frame was shown and this one is not error resilient (what the engine's flag means)
+  int reset_frame_context = 0, frame_context_idx = 0, interp_filter = 0;
+  int filter_level = 0, sharpness_level = 0;
+  uint8_t lf_adj_level[MAX_SEGMENTS][MAX_REF_FRAMES][2] = {};   // the filter level of each segment, reference and mode (all zero without a loop filter)
+  int base_qindex = 0, y_dc_delta_q = 0, uv_dc_delta_q = 0, uv_ac_delta_q = 0;   // all zero for a lossless frame
+  int log2_tile_cols = 0, log2_tile_rows = 0;
+  Segmentation seg;
+  int ref_slot[3] = {0, 0, 0};       // which of the eight reference slots the last, golden and alt-ref pictures are
+  int sign_bias[3] = {0, 0, 0};
+  int refresh_frame_flags = 0;
+  uint32_t uncompressed_header_bytes = 0, compressed_header_bytes = 0;
+  ConstByteView data;                // the whole frame
+  // The picture to fill (16-bit samples; 8-bit values here): the luma plane and the two chroma planes, cropped to the sizes given.
+  ArrayView<uint16_t> plane[3];
+  uint32_t stride[3] = {0, 0, 0};
+  int plane_width[3] = {0, 0, 0}, plane_height[3] = {0, 0, 0};
+};
+class IOffload {
+ public:
+  // Whether the stream this key (or first intra-only) frame starts can be decoded by the offload; the answer holds until the next key frame. A stream it refuses is
+  // decoded here, whole.
+  virtual bool accepts(const FrameHeaderInfo& info, int ss_x, int ss_y) = 0;
+  // Decodes the frame into the planes. False: the planes are left grey.
+  virtual bool decode_frame(const OffloadFrame& frame) = 0;
+
+ protected:
+  constexpr IOffload() = default;
+  ~IOffload() = default;
+};
+
+// For diagnostics and tests: told of every frame the Core decodes itself (hidden frames included), with the same description the offload gets and the decoded picture.
+class IFrameObserver {
+ public:
+  virtual void frame_decoded(const OffloadFrame& frame) = 0;
+
+ protected:
+  constexpr IFrameObserver() = default;
+  ~IFrameObserver() = default;
+};
+
 class Core {
  public:
   static constexpr int kPoolSize = 12;
@@ -270,6 +316,9 @@ class Core {
   bool decode_frame(ConstByteView data, int* shown, FrameHeaderInfo* info);
   const Frame& frame(int index) const { return frames_[index]; }
   void reset();
+  // Frames are decoded by `offload` from then on, where it accepts the stream (nullptr: here). Set before the first frame.
+  void set_offload(IOffload* offload) { offload_ = offload; offload_decided_ = false; offloaded_ = false; }
+  void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
  private:
   friend struct Vp9Access;
@@ -292,6 +341,9 @@ class Core {
   void read_coef_probs(BoolDecoder& r);
   void diff_update_prob(BoolDecoder& r, uint8_t* p);
   bool decode_tiles(ConstByteView data);
+  bool decode_frame_offloaded(ConstByteView data, uint32_t uncompressed_bytes, uint32_t compressed_bytes);
+  void fill_offload_frame(OffloadFrame* frame, ConstByteView data, uint32_t uncompressed_bytes, uint32_t compressed_bytes, bool init_filter_levels);
+  void install_frame();
   void decode_partition(BoolDecoder& r, int mi_row, int mi_col, int bsize, int n4x4_l2);
   void decode_block(BoolDecoder& r, int mi_row, int mi_col, int bsize, int bwl, int bhl);
   int read_partition(BoolDecoder& r, int mi_row, int mi_col, bool has_rows, bool has_cols, int bsl);
@@ -348,6 +400,10 @@ class Core {
   int reset_frame_context_ = 0, refresh_frame_flags_ = 0;
   bool refresh_frame_context_ = false, frame_parallel_decoding_mode_ = false;
   int frame_context_idx_ = 0;
+  int ref_slots_[3] = {0, 0, 0};   // the reference slots the last, golden and alt-ref pictures were named by
+  IOffload* offload_ = nullptr;
+  IFrameObserver* observer_ = nullptr;
+  bool offload_decided_ = false, offloaded_ = false;
   int width_ = 0, height_ = 0, last_width_ = 0, last_height_ = 0;
   int ss_x_ = 1, ss_y_ = 1, bit_depth_ = 8, color_space_ = 0;
   bool full_range_ = false;

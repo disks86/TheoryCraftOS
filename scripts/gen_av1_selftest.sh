@@ -5,5 +5,5 @@ set -e
 dir=$(mktemp -d)
 ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=64x64:rate=30,noise=alls=12:allf=t+u,format=yuv420p" -frames:v 10 -c:v libaom-av1 \
   -cpu-used 4 -crf 36 -b:v 0 -lag-in-frames 16 -auto-alt-ref 1 -g 30 -tiles 1x1 -aq-mode 0 -f ivf "$dir/selftest.ivf"
-python3 -I scripts/gen_av1_selftest_inc.py "$dir/selftest.ivf" src/Hardware/VideoCodec/AMD/AmdVcnSelfTestAv1Stream.inc
+python3 -I scripts/gen_ivf_selftest_inc.py av1 "$dir/selftest.ivf" src/Hardware/VideoCodec/AMD/AmdVcnSelfTestAv1Stream.inc
 rm -rf "$dir"

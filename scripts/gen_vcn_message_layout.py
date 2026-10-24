@@ -23,12 +23,15 @@ TYPES = [
     ('Av1TileInfo', 'rvcn_dec_av1_tile_info_t'),
     ('Av1', 'rvcn_dec_message_av1_t'),
     ('Av1SegmentFg', 'rvcn_dec_av1_segment_fg_t'),
+    ('Vp9', 'rvcn_dec_message_vp9_t'),
+    ('DynamicDpb', 'rvcn_dec_message_dynamic_dpb_t'),
+    ('Vp9Probs', 'rvcn_dec_vp9_probs_t'),
     ('FeedbackIndex', 'rvcn_dec_feature_index_t'),
     ('Feedback', 'rvcn_dec_feedback_header_t'),
 ]
 
 
-DEPENDENCIES = ['rvcn_dec_transformation_type_e', 'rvcn_dec_film_grain_params_t', 'rvcn_dec_av1_fg_init_buf_t']
+DEPENDENCIES = ['rvcn_dec_vp9_nmv_ctx_mask_t', 'rvcn_dec_vp9_nmv_component_t', 'rvcn_dec_transformation_type_e', 'rvcn_dec_film_grain_params_t', 'rvcn_dec_av1_fg_init_buf_t']
 
 
 def struct_body(text, type_name):

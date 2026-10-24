@@ -27,6 +27,8 @@ namespace hardware {
 
 namespace vp9 {
 class Core;
+class IOffload;
+class IFrameObserver;
 }
 
 // A VP9 decoder on the CPU: profiles 0 to 3 (8-, 10- and 12-bit; 4:2:0, 4:2:2, 4:4:0 and 4:4:4), key, intra-only and inter frames with
@@ -50,6 +52,11 @@ class Vp9Decoder {
   // The size of the pictures; zero until the first frame was decoded.
   VideoFormat output_format() const { return format_; }
   bool ready() const { return pending_; }
+  // Hands the pixel work to something else (a hardware engine, see Vp9Core.hpp): this decoder still reads every uncompressed header, keeps the reference slots and the
+  // output, but the frames of the streams `offload` accepts are decoded by it. Set before decoding.
+  void set_offload(vp9::IOffload* offload);
+  // For diagnostics and tests: told of every frame this decoder decodes itself (see Vp9Core.hpp).
+  void set_frame_observer(vp9::IFrameObserver* observer);
 
  private:
   bool convert(int index);

@@ -21,6 +21,7 @@
 #include "Hardware/VideoCodec/Software/H264.hpp"
 #include "Hardware/VideoCodec/Software/H264Encoder.hpp"
 #include "Hardware/VideoCodec/Software/Av1.hpp"
+#include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 
@@ -218,24 +219,16 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_av1(allocators::IAllocator& allocator
     const uint64_t start = i == 0 ? 0 : kAv1SelfTestEnds[i - 1];
     return stream.subview(start, kAv1SelfTestEnds[i] - start);
   };
-  // The CPU's pictures: one per temporal unit.
-  VideoFrameBuffer expected[kAv1SelfTestPictures] = {VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator),
-                                                     VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator),
-                                                     VideoFrameBuffer(allocator), VideoFrameBuffer(allocator)};
-  {
-    Av1Decoder cpu(allocator);
-    VideoFrame f;
-    for (uint32_t i = 0; i < kAv1SelfTestPictures; ++i) {
-      if (!cpu.decode(packet(i), int64_t{i} * 1000) || !cpu.receive(&f) || !keep_picture(f, &expected[i])) return Result::StreamFailed;
-    }
-  }
-
+  // The CPU decodes the same packets, and for each of them the engine's picture must be the CPU's: one picture per packet.
+  Av1Decoder cpu(allocator);
   DecoderConfig config;
   config.codec = VideoCodec::Av1;
   config.output = PixelFormat::I420;
   AmdVcnAv1Decoder session(allocator, engine, config);
   if (!session.prepare()) return Result::SessionRefused;
   for (uint32_t i = 0; i < kAv1SelfTestPictures; ++i) {
+    VideoFrame expected;
+    if (!cpu.decode(packet(i), int64_t{i} * 1000) || !cpu.receive(&expected)) return Result::StreamFailed;
     VideoPacket p;
     p.data = packet(i);
     p.pts_us = int64_t{i} * 1000;
@@ -243,10 +236,45 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_av1(allocators::IAllocator& allocator
     if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
     VideoFrame f;
     if (!session.receive(&f)) return Result::Mismatch;
-    if (!same_picture(f, expected[i].frame(int64_t{i} * 1000))) return Result::Mismatch;
+    if (!same_picture(f, expected)) return Result::Mismatch;
   }
   if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
-  // The engine must really have done the work: a stream the session passed to the CPU would "pass" too. (Frames shown again by show_existing_frame need no job.)
+  // The engine must really have done the work: a stream the session passed to the CPU would "pass" too.
+  if (session.frames_decoded() == 0) return Result::SessionRefused;
+  return Result::Passed;
+}
+
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestVp9Stream.inc"
+}  // namespace
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_vp9(allocators::IAllocator& allocator, const AmdVcnVp9Decoder::Engine& engine) {
+  const ConstByteView stream(kVp9SelfTestStream);
+  auto packet = [&](uint32_t i) {
+    const uint64_t start = i == 0 ? 0 : kVp9SelfTestEnds[i - 1];
+    return stream.subview(start, kVp9SelfTestEnds[i] - start);
+  };
+  // The CPU decodes the same packets, and for each of them the engine's picture must be the CPU's: one picture per packet.
+  Vp9Decoder cpu(allocator);
+  DecoderConfig config;
+  config.codec = VideoCodec::Vp9;
+  config.output = PixelFormat::I420;
+  AmdVcnVp9Decoder session(allocator, engine, config);
+  if (!session.prepare()) return Result::SessionRefused;
+  for (uint32_t i = 0; i < kVp9SelfTestPictures; ++i) {
+    VideoFrame expected;
+    if (!cpu.decode(packet(i), int64_t{i} * 1000) || !cpu.receive(&expected)) return Result::StreamFailed;
+    VideoPacket p;
+    p.data = packet(i);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
+    VideoFrame f;
+    if (!session.receive(&f)) return Result::Mismatch;
+    if (!same_picture(f, expected)) return Result::Mismatch;
+  }
+  if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
+  // The engine must really have done the work: a stream the session passed to the CPU would "pass" too.
   if (session.frames_decoded() == 0) return Result::SessionRefused;
   return Result::Passed;
 }

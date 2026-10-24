@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/AMD/AmdVcnAv1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnHevcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnVp9Decoder.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace hardware {
@@ -61,6 +62,10 @@ class AmdVcnSelfTest {
   // the above: the reference slot bookkeeping of the AV1 message (which engine picture each reference slot holds, across hidden frames and shown-again ones), the initial
   // entropy contexts, the tile table. Not: tiles, film grain, super-resolution, 10-bit, other sizes.
   static Result run_av1(allocators::IAllocator& allocator, const AmdVcnAv1Decoder::Engine& engine);
+  // The same for VP9: a libvpx stream (64 x 64, ten packets with a hidden alt-ref frame and a frame shown again; AmdVcnSelfTestVp9Stream.inc). What passing proves beyond
+  // the above: the reference slot bookkeeping of the VP9 message, the default probabilities in the context buffer and the table, the compressed header and tiles the
+  // engine finds in the frame it is given. Not: segmentation, tiles, scaled references, intra-only frames, other sizes.
+  static Result run_vp9(allocators::IAllocator& allocator, const AmdVcnVp9Decoder::Engine& engine);
   static const char* result_name(Result result);
 };
 

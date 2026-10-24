@@ -173,6 +173,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     if (!enable_decode(*vcn_registers_, clock, memory_.rings.subregion(0, AmdVcn1::kRingBytes), *mapper_, plan_.work_gpu_address, plan_.work_physical, plan_.work_bytes))
       return false;
     enable_hevc_decode();   // (H.264 works either way)
+    enable_vp9_decode();
     enable_av1_decode();
     return true;
   }
@@ -185,6 +186,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     decode_ready_ = false;
     hevc_ready_ = false;
     av1_ready_ = false;
+    vp9_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     if (vcn1_) {
@@ -235,6 +237,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     decode_ready_ = false;
     hevc_ready_ = false;
     av1_ready_ = false;
+    vp9_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     AmdVcnWorkMemory::Piece ib, fence;
@@ -287,6 +290,38 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     refresh_summary();
     return true;
   }
+  // After enable_decode(): the same for VP9, on engines that have a VP9 decoder (Vega and the VCN parts).
+  bool enable_vp9_decode() {
+    vp9_ready_ = false;
+    if (!ring_ || !gpu_.media_vp9) return false;
+    const AmdVcnSelfTest::Result result = AmdVcnSelfTest::run_vp9(allocator_, decode_engine_);
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("VP9 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+      } else {
+        decode_text_.assign(engine_note_);
+        decode_text_.append("; VP9 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("), VP9 stays on the CPU");
+      }
+      engine_note_ = decode_text_.c_str();
+      rebuild_firmware_text();
+      refresh_summary();
+      return false;
+    }
+    vp9_ready_ = true;
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Vp9);
+    engine_note_ = "engine started; VP9 decode runs on it (self-test passed)";
+    rebuild_firmware_text();
+    refresh_summary();
+    return true;
+  }
   // After enable_decode(): the same for AV1, on engines that have an AV1 decoder (the GPU generation says so); the others never get here with a passing test.
   bool enable_av1_decode() {
     av1_ready_ = false;
@@ -322,11 +357,18 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   bool decode_ready() const { return decode_ready_; }
   bool hevc_ready() const { return hevc_ready_; }
   bool av1_ready() const { return av1_ready_; }
+  bool vp9_ready() const { return vp9_ready_; }
   // What became of the engine, in words (also part of firmware_status() once the firmware is loaded).
   const char* engine_note() const { return engine_note_; }
 
   // H.264 and H.265 go to the engine when they passed their tests and it is free; anything else (and a stream the engine will not take) goes to the CPU.
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::Vp9 && vp9_ready_ && ring_ && !ring_->wedged()) {
+      AmdVcnVp9Decoder::Engine engine = decode_engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdVcnVp9Decoder> session = UniquePointer<AmdVcnVp9Decoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
     if (config.codec == VideoCodec::Av1 && av1_ready_ && ring_ && !ring_->wedged()) {
       AmdVcnAv1Decoder::Engine engine = decode_engine_;
       engine.stream_handle = ++next_stream_handle_;
@@ -496,6 +538,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   bool decode_ready_ = false;
   bool hevc_ready_ = false;
   bool av1_ready_ = false;
+  bool vp9_ready_ = false;
   uint32_t next_stream_handle_ = 1;
   FixedString<200> decode_text_;
   MmioRegion registers_;

@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/Software/H264Core.hpp"
 #include "Hardware/VideoCodec/Software/Av1Core.hpp"
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
+#include "Hardware/VideoCodec/Software/Vp9Core.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace hardware {
@@ -46,8 +47,8 @@ constexpr uint32_t kCmdItScalingTableBuffer = 0x204;
 constexpr uint32_t kCmdContextBuffer = 0x206;
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;       // header msg_type
-constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13, kMessageAv1 = 0x11;   // index message_id
-constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10, kStreamTypeAv1 = 0x13;
+constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13, kMessageVp9 = 0x0E, kMessageDynamicDpb = 0x10, kMessageAv1 = 0x11;   // index message_id
+constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10, kStreamTypeVp9 = 0x11, kStreamTypeAv1 = 0x13;
 constexpr uint32_t kProfileBaseline = 0, kProfileMain = 1, kProfileHigh = 2;
 constexpr uint32_t kArrayModeLinear = 0;
 
@@ -189,6 +190,35 @@ bool prepare_av1_feedback_and_tables(ByteView message_buffer, const av1::FrameHe
 uint32_t av1_context_run_count();
 bool av1_context_run(uint32_t index, uint32_t* offset, ConstByteView* bytes);
 uint64_t av1_context_bytes();   // the four contexts, with their padding
+
+// VP9 ---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+constexpr uint32_t kVp9References = 9;   // the pictures the buffers are sized for: eight reference slots and the one being decoded
+constexpr uint32_t kVp9NoPicture = 0x7F;
+
+struct Vp9BufferSizes {
+  uint64_t context = 0;   // the firmware's work memory (hw_ctxt_size), which starts with the default probabilities
+  uint64_t dpb = 0;
+  uint32_t references = 0;
+};
+// Sizes for pictures of up to `width` x `height` luma samples (Mesa's, for engines before Renoir). 0 sizes when the picture is too big.
+Vp9BufferSizes vp9_buffer_sizes(uint32_t width, uint32_t height);
+// The picture buffer slots the engine is told about: the one this frame is decoded into and, for each of the eight reference slots of the stream, the engine slot of
+// the frame it holds (kVp9NoPicture for none).
+struct Vp9Slots {
+  uint8_t current = 0;
+  uint8_t ref_frame_map[8] = {kVp9NoPicture, kVp9NoPicture, kVp9NoPicture, kVp9NoPicture, kVp9NoPicture, kVp9NoPicture, kVp9NoPicture, kVp9NoPicture};
+};
+uint32_t vp9_decode_message_bytes();   // header, the three indexes, the decode message, the dynamic picture buffer message and the VP9 message
+// Builds the decode message of one 8-bit 4:2:0 frame: false otherwise, and when `out` is too small or a size does not fit the message's fields. The picture buffer is
+// described the way Mesa does for the engines before Navi 21 (a "dynamic" buffer of nine pictures of the frame's size).
+bool build_vp9_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const vp9::OffloadFrame& frame, const Vp9Slots& slots, const DecodeBuffers& buffers);
+// Bytes a message buffer must have for VP9: the message page, the feedback area and the probability and segmentation table behind them.
+uint32_t vp9_message_buffer_bytes();
+// The feedback header, and the table the engine reads next to the message: the default probabilities and the segmentation data of the frame.
+bool prepare_vp9_feedback_and_tables(ByteView message_buffer, const vp9::OffloadFrame& frame);
+// The default probabilities as they start the context buffer.
+ConstByteView vp9_default_probabilities();
 
 // What the firmware wrote into the feedback area after a picture.
 struct Feedback {

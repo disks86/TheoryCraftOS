@@ -910,7 +910,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           // Which codecs run on the engine: each passed its own self-test.
           const uint32_t served = engine_device.info().accelerated_decode_codecs;
           video.text(": engine started, decode runs on it for");
-          const struct { hardware::VideoCodec codec; const char* name; } codecs[] = {{hardware::VideoCodec::H264, " H.264"}, {hardware::VideoCodec::Hevc, " H.265"}, {hardware::VideoCodec::Av1, " AV1"}};
+          const struct { hardware::VideoCodec codec; const char* name; } codecs[] = {{hardware::VideoCodec::H264, " H.264"}, {hardware::VideoCodec::Hevc, " H.265"}, {hardware::VideoCodec::Vp9, " VP9"}, {hardware::VideoCodec::Av1, " AV1"}};
           for (const auto& c : codecs)
             if (served & hardware::codec_mask(c.codec)) video.text(c.name);
           video.text(" (self-tests passed)");
