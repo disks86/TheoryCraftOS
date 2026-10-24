@@ -537,6 +537,11 @@ if(TCOS_SELFTESTS)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_SELFTESTS)
 endif()
 
+option(TCOS_INTEL_VIDEO_DECODE "Run H.264 decoding on the video engine of Gen9.5 Intel GPUs (experimental: only run against a simulated GPU so far)" OFF)
+if(TCOS_INTEL_VIDEO_DECODE)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_VIDEO_DECODE)
+endif()
+
 if(TCOS_DEBUG_WAIT_SECS GREATER 0)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_DEBUG_WAIT=${TCOS_DEBUG_WAIT_SECS})
 endif()

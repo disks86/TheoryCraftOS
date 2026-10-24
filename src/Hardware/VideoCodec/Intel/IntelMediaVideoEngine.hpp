@@ -52,6 +52,16 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   void set_hardware(const HardwareSetup& setup) { setup_ = setup; }
   // Is H.264 decoding running on the engine?
   bool hardware_decode() const { return driver_ && driver_->state() == intel_gt::VcsDriver::State::Ready; }
+  // Why it is or is not: for the boot log.
+  enum class HardwareStatus : uint8_t {
+    NotRequested,       // set_hardware() was not called
+    UnsupportedGpu,     // the driver is for Gen9.5 graphics
+    NoVideoBox,         // the look at the engine found no video box that answers a power request
+    DriverFailed,       // the engine driver could not start (the GPU did not answer, or no memory, or no unused global GTT entries)
+    Running,
+  };
+  HardwareStatus hardware_status() const { return hardware_status_; }
+  const char* status_text() const override;
 
   // Looks at the video boxes (which exist, which wake up) and, if the owner opted in and the generation is known, starts the engine driver.
   bool initialize() override;
@@ -83,6 +93,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   MmioRegion registers_;
   IntelMediaEngineStatus status_;
   HardwareSetup setup_;
+  HardwareStatus hardware_status_ = HardwareStatus::NotRequested;
   UniquePointer<intel_gt::VcsDriver> driver_;
 };
 

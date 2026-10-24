@@ -24,8 +24,13 @@ bool IntelMediaVideoEngine::initialize() {
   status_ = IntelMediaEngineHw::probe(registers_, gpu_.architecture);
   driver_.reset();
   info_.accelerated_decode_codecs = 0;
+  hardware_status_ = HardwareStatus::NotRequested;
   // The driver is for Gen9.5 (the generation whose layouts it follows) and needs a video box that answered the look above.
-  if (setup_.registers && setup_.memory && setup_.ggtt_table.valid() && gpu_.architecture == IntelGpuArchitecture::Gen9_5 && status_.vdbox_count() > 0) {
+  const bool requested = setup_.registers && setup_.memory && setup_.ggtt_table.valid();
+  if (requested && gpu_.architecture != IntelGpuArchitecture::Gen9_5) hardware_status_ = HardwareStatus::UnsupportedGpu;
+  else if (requested && status_.vdbox_count() == 0) hardware_status_ = HardwareStatus::NoVideoBox;
+  else if (requested) {
+    hardware_status_ = HardwareStatus::DriverFailed;
     UniquePointer<intel_gt::VcsDriver> driver = UniquePointer<intel_gt::VcsDriver>::make(allocator_, *setup_.memory);
     intel_gt::VcsDriver::Config config;
     config.registers = setup_.registers;
@@ -34,9 +39,21 @@ bool IntelMediaVideoEngine::initialize() {
     if (driver && driver->initialize(config)) {
       driver_ = util::move(driver);
       info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264);
+      hardware_status_ = HardwareStatus::Running;
     }
   }
   return true;
+}
+
+const char* IntelMediaVideoEngine::status_text() const {
+  switch (hardware_status_) {
+    case HardwareStatus::NotRequested: return status_.probed ? "video box found, decoding on the CPU" : "engine present, decoding on the CPU";
+    case HardwareStatus::UnsupportedGpu: return "engine driver is for Gen9.5 graphics, decoding on the CPU";
+    case HardwareStatus::NoVideoBox: return "no video box answered, decoding on the CPU";
+    case HardwareStatus::DriverFailed: return "engine driver did not start, decoding on the CPU";
+    case HardwareStatus::Running: return "H.264 decoding runs on the engine (experimental)";
+  }
+  return "";
 }
 
 UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const DecoderConfig& config) {

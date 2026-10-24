@@ -517,7 +517,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     explicit MmioRegisterMapper(hardware::MmioMapper& m) : mapper(m) {}
     bool map_registers(uint64_t physical, uint64_t length, hardware::MmioRegion* region) override { return mapper.ensure_mapped(physical, length, region); }
   } register_mapper(mmio);
-  video_codecs.set_mmio(paging_ok ? &register_mapper : nullptr);  // Intel GPUs: look at the video boxes (sessions still run on the CPU)
+  video_codecs.set_mmio(paging_ok ? &register_mapper : nullptr);  // Intel GPUs: look at the video boxes
+#ifdef TCOS_INTEL_VIDEO_DECODE
+  video_codecs.set_intel_hardware_decode(true);  // cmake -DTCOS_INTEL_VIDEO_DECODE=ON: H.264 on the engine of Gen9.5 GPUs (experimental)
+#endif
   video_codecs.initialize();
   for (uint32_t i = 0; i < video_codecs.count(); ++i) {
     hardware::IVideoCodecDevice& codec_device = *video_codecs.at(i);
@@ -531,7 +534,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       e.text(first ? "" : ", ").text(hardware::codec_name(codec)).text(codec_device.can_decode(codec) ? (codec_device.can_encode(codec) ? " dec/enc" : " dec") : " enc");
       first = false;
     }
-    if (info.hardware_engine && !info.accelerated) e.text(" (engine present, not driven yet)");
+    if (info.hardware_engine && !info.accelerated) {
+      const char* status = codec_device.status_text();
+      e.text(" (").text(*status ? status : "engine present, not driven yet").text(")");
+    }
   }
 
   // Picture, sound and video files: software codecs for every format, JPEG handed to a video engine first when one really accelerates it.

@@ -584,6 +584,7 @@ static void test_device() {
       device.set_hardware(setup);
       CHECK(device.initialize());
       CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == codec_mask(VideoCodec::H264) && !device.info().accelerated);
+      CHECK(device.hardware_status() == IntelMediaVideoEngine::HardwareStatus::Running && strstr(device.status_text(), "runs on the engine"));
       std::vector<int64_t> hw_pts, sw_pts;
       {
         UniquePointer<IVideoDecoder> hw = device.create_decoder(i420_config());
@@ -623,13 +624,16 @@ static void test_device() {
     setup.memory = &rig.mem;
     IntelMediaVideoEngine plain(a, 0x3E92, region);
     CHECK(plain.initialize() && !plain.hardware_decode());
+    CHECK(plain.hardware_status() == IntelMediaVideoEngine::HardwareStatus::NotRequested && strstr(plain.status_text(), "CPU"));
     IntelMediaVideoEngine xelp(a, 0x9A49, region);
     xelp.set_hardware(setup);
     CHECK(xelp.initialize() && !xelp.hardware_decode());
+    CHECK(xelp.hardware_status() == IntelMediaVideoEngine::HardwareStatus::UnsupportedGpu && strstr(xelp.status_text(), "Gen9.5"));
     std::vector<uint32_t> silent(0x20000 / 4, 0);
     IntelMediaVideoEngine deaf(a, 0x3E92, MmioRegion(reinterpret_cast<uint64_t>(silent.data()), silent.size() * 4));
     deaf.set_hardware(setup);
     CHECK(deaf.initialize() && !deaf.hardware_decode());
+    CHECK(deaf.hardware_status() == IntelMediaVideoEngine::HardwareStatus::NoVideoBox && strstr(deaf.status_text(), "no video box"));
     UniquePointer<IVideoDecoder> sw = plain.create_decoder(i420_config());
     CHECK(sw != nullptr);
     decode_all(*sw, 14);
