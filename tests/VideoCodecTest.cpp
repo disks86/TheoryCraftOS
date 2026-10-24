@@ -642,7 +642,7 @@ static void test_intel_system() {
     system.shutdown();
   }
   {
-    IntelPci pci(0xB080, true);  // Panther Lake (Xe3): no known register layout
+    IntelPci pci(0x0BD5, true);  // Data Center GPU Max (Xe-HPC): no video engine, no register layout
     FakeRegisterMapper mapper;
     SystemVideoCodecs system(pci, a);
     system.set_mmio(&mapper);
@@ -651,9 +651,9 @@ static void test_intel_system() {
     system.shutdown();
   }
   {
-    // Meteor Lake and Arc Battlemage: the media tile is far into the BAR, so the request covers it (a mapper that cannot give that much leaves the engine unprobed).
+    // Meteor Lake, Arc Battlemage and Panther Lake: the media tile is far into the BAR, so the request covers it (a mapper that cannot give that much leaves the engine unprobed).
     const uint64_t window = IntelMediaEngineHw::register_window(IntelGpuArchitecture::XeLpg);
-    for (uint16_t id : {uint16_t{0x7D55}, uint16_t{0xE20B}}) {
+    for (uint16_t id : {uint16_t{0x7D55}, uint16_t{0xE20B}, uint16_t{0xB080}}) {
       IntelPci pci(id, true);
       FakeRegisterMapper mapper(window);
       const uint64_t base = IntelMediaEngineHw::kMediaTileBase;

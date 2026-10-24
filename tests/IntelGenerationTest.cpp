@@ -113,11 +113,11 @@ static void test_media_engine() {
   using A = IntelGpuArchitecture;
   CHECK(IntelMediaEngineHw::supported(A::Gen9_5) && IntelMediaEngineHw::supported(A::XeLp));
   CHECK(IntelMediaEngineHw::supported(A::XeHpg) && IntelMediaEngineHw::supported(A::XeLpg) && IntelMediaEngineHw::supported(A::Xe2));
-  CHECK(!IntelMediaEngineHw::supported(A::Xe3) && !IntelMediaEngineHw::supported(A::XeHpc) && !IntelMediaEngineHw::supported(A::Unknown));
+  CHECK(IntelMediaEngineHw::supported(A::Xe3) && !IntelMediaEngineHw::supported(A::XeHpc) && !IntelMediaEngineHw::supported(A::Unknown));
   // The register block starts at the BAR for most generations and 0x380000 into it on a standalone media tile; the window to map covers the block.
   CHECK(IntelMediaEngineHw::register_base(A::XeHpg) == 0 && IntelMediaEngineHw::register_base(A::Gen9_5) == 0);
-  CHECK(IntelMediaEngineHw::register_base(A::XeLpg) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe2) == 0x380000);
-  CHECK(IntelMediaEngineHw::register_window(A::XeLp) == 0x20000 && IntelMediaEngineHw::register_window(A::Xe2) == 0x3A0000 && IntelMediaEngineHw::register_window(A::Xe3) == 0);
+  CHECK(IntelMediaEngineHw::register_base(A::XeLpg) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe2) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe3) == 0x380000);
+  CHECK(IntelMediaEngineHw::register_window(A::XeLp) == 0x20000 && IntelMediaEngineHw::register_window(A::Xe2) == 0x3A0000 && IntelMediaEngineHw::register_window(A::Xe3) == 0x3A0000 && IntelMediaEngineHw::register_window(A::XeHpc) == 0);
 
   // Gen9.5: one box; it acknowledges when the ack bit is set, and the request is withdrawn afterwards.
   FakeRegisters g9;
@@ -143,14 +143,15 @@ static void test_media_engine() {
   CHECK(s.vdbox_present == 0 && s.vdbox_count() == 0);
 
   // Unsupported generations and short windows read nothing.
-  // Arc Alchemist (Xe-HPG) reads like Xe-LP. The standalone media tile (Meteor Lake and Arrow Lake graphics, Lunar Lake, Arc Battlemage) is the same
+  // Arc Alchemist (Xe-HPG) reads like Xe-LP. The standalone media tile (Meteor Lake and Arrow Lake graphics, Lunar Lake, Arc Battlemage, Panther Lake) is the same
   // block 0x380000 into the BAR: a BAR that ends before it is refused, and nothing outside the tile is touched.
   FakeRegisters hpg;
   hpg.at(0x0D50) = hpg.at(0x0D58) = 1;
   s = IntelMediaEngineHw::probe(hpg.region(), A::XeHpg);
   CHECK(s.probed && s.vdbox_present == 0x5 && s.vdbox_awake == 0x5);
-  CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeLpg).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe2).probed);   // BAR too short for the tile
-  for (A tile : {A::XeLpg, A::Xe2}) {
+  CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeLpg).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe2).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe3).probed);   // BAR too short for the tile
+  CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeHpc).probed);
+  for (A tile : {A::XeLpg, A::Xe2, A::Xe3}) {
     std::vector<uint32_t> bar(IntelMediaEngineHw::register_window(tile) / 4, 0);
     const uint64_t base = IntelMediaEngineHw::kMediaTileBase;
     bar[(base + 0x0D50) / 4] = bar[(base + 0x0D58) / 4] = 1;   // both boxes acknowledge

@@ -54,13 +54,19 @@ bool IntelMediaEngineHw::supported(IntelGpuArchitecture architecture) {
     case IntelGpuArchitecture::XeLp:
     case IntelGpuArchitecture::XeHpg:
     case IntelGpuArchitecture::XeLpg:
-    case IntelGpuArchitecture::Xe2: return true;
+    case IntelGpuArchitecture::Xe2:
+    case IntelGpuArchitecture::Xe3: return true;
     default: return false;
   }
 }
 
 uint64_t IntelMediaEngineHw::register_base(IntelGpuArchitecture architecture) {
-  return architecture == IntelGpuArchitecture::XeLpg || architecture == IntelGpuArchitecture::Xe2 ? kMediaTileBase : 0;
+  switch (architecture) {
+    case IntelGpuArchitecture::XeLpg:
+    case IntelGpuArchitecture::Xe2:
+    case IntelGpuArchitecture::Xe3: return kMediaTileBase;
+    default: return 0;
+  }
 }
 
 uint64_t IntelMediaEngineHw::register_window(IntelGpuArchitecture architecture) {
