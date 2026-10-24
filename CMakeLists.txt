@@ -492,6 +492,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdVcn1Ring.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnHevcDecoder.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcnAv1Decoder.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnSelfTest.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.cpp
   src/Hardware/VideoCodec/AMD/AmdMediaEngineHw.cpp

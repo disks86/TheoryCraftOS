@@ -228,7 +228,28 @@ struct FakeEnvironment final : IPageEnvironment {
   std::string clip;
   std::vector<uint32_t> picks;
   bool clipboard_get(String* text) override { text->assign(StringView(clip.data(), clip.size())); return !clip.empty(); }
-  void clipboard_set(StringView text) override { clip.assign(text.data(), text.size()); }
+  void clipboard_set(StringView text) override { clip.assign(text.data(), text.size()); clip_html.clear(); clip_png.clear(); }
+  std::string clip_html, clip_png;   // the other formats on the clipboard
+  void clipboard_formats(String* csv) override {
+    std::string f;
+    if (!clip.empty()) f = "text/plain";
+    if (!clip_html.empty()) f += ",text/html";
+    if (!clip_png.empty()) f += (f.empty() ? "" : ",") + std::string("image/png");
+    csv->assign(StringView(f.data(), f.size()));
+  }
+  bool clipboard_read_format(StringView format, String* out) override {
+    const std::string* from = format.equals("text/plain") ? &clip : format.equals("text/html") ? &clip_html : format.equals("image/png") ? &clip_png : nullptr;
+    if (!from || from->empty()) return false;
+    out->assign(StringView(from->data(), from->size()));
+    return true;
+  }
+  bool clipboard_write_items(const ClipboardData& d) override {
+    if (d.has_image && d.image_png.size() < 4) return false;   // (not a picture)
+    clip.assign(d.has_text ? std::string(d.text.data(), d.text.size()) : std::string());
+    clip_html.assign(d.has_html ? std::string(d.html.data(), d.html.size()) : std::string());
+    clip_png.assign(d.has_image ? std::string(d.image_png.data(), d.image_png.size()) : std::string());
+    return true;
+  }
   void pick_file(uint32_t node, bool) override { picks.push_back(node); }
   void navigate_post(StringView a, StringView type, StringView body) override {
     posts.push_back(std::string(a.data(), a.size()) + " [" + std::string(type.data(), type.size()) + "] " + std::string(body.data(), body.size()));
@@ -3303,6 +3324,152 @@ static void test_navigation() {
   CHECK(nav_is("history.pushState(0, '', '/p/b'); navigation.onnavigate = function (e) { e.preventDefault(); console.log('stopped') }; history.back(); setTimeout(function () { console.log(location.pathname) }, 5)", "stopped | /p/b"));
 }
 
+// A page with `head_script` in its <head> and `body` as its body, on the fake browser; `act` plays the user (clicks and keys), then the timers run.
+static std::string clip_run(const char* body, const char* head_script, const std::function<void(FakeEnvironment&, Page&)>& act = nullptr, const char* address = "https://app.example/p",
+                            const std::function<void(FakeEnvironment&)>& setup = nullptr, const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    FakeEnvironment env(a);
+    if (setup) setup(env);
+    MediaEnvironment media;
+    Page page(a, env, address, media, true);
+    auto run_timers = [&](bool all) {
+      for (int i = 0; i < 100; ++i) {
+        double due;
+        if (!page.next_timer(&due) || (!all && due > env.clock)) break;
+        if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+        page.run_due_timers(env.clock);
+      }
+    };
+    page.load((std::string("<html><head><script>") + head_script + "</script></head><body>" + body + "</body></html>").c_str());
+    run_timers(false);   // (what is due now: promises, zero delay timers)
+    if (act) act(env, page);
+    run_timers(true);
+    out = std::string(page.log().data(), page.log().size());
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    for (size_t p = 0; (p = out.find("\n", p)) != std::string::npos;) {
+      out.replace(p, 1, " | ");
+      p += 3;
+    }
+    if (after) after(env);
+  }
+  if (a.live != 0) return out + " [leak]";
+  return out;
+}
+
+static bool clip_is(const char* body, const char* script, const char* expected, const std::function<void(FakeEnvironment&, Page&)>& act = nullptr, const char* address = "https://app.example/p",
+                    const std::function<void(FakeEnvironment&)>& setup = nullptr, const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  const std::string got = clip_run(body, script, act, address, setup, after);
+  if (got != expected) {
+    printf("   %s\n   gives   %s\n   expects %s\n", script, got.c_str(), expected);
+    return false;
+  }
+  return true;
+}
+
+static void test_clipboard() {
+  const auto click_button = [](FakeEnvironment&, Page& page) { page.click(page.document().element_by_id("b")->serial, 1, 1); };
+  const auto ctrl = [](Page& page, char c) { page.key(Page::FormKey::Character, c, 2); };
+  // where it exists, and what it asks for
+  CHECK(clip_is("", "console.log(typeof navigator.clipboard, isSecureContext, typeof ClipboardItem, typeof Clipboard)", "object true function function"));
+  CHECK(clip_is("", "console.log(typeof navigator.clipboard, isSecureContext)", "undefined false", nullptr, "http://example.com/"));
+  CHECK(clip_is("", "console.log(typeof navigator.clipboard, isSecureContext)", "object true", nullptr, "http://localhost:8080/"));
+  CHECK(clip_is("<button id=b>x</button>", "addEventListener('load', function () { var s; navigator.permissions.query({ name: 'clipboard-read' }).then(function (p) { s = p; console.log(p.state) }); navigator.permissions.query({ name: 'clipboard-write' }).then(function (p) { console.log(p.state) });"
+                "console.log(navigator.userActivation.hasBeenActive, navigator.userActivation.isActive);"
+                "document.getElementById('b').addEventListener('click', function () { console.log(navigator.userActivation.hasBeenActive, navigator.userActivation.isActive, s.state) }) });",
+                "false false | prompt | granted | true true granted", click_button));
+  // text
+  CHECK(clip_is("<button id=b>x</button>", "navigator.clipboard.writeText('héllo').then(function () { console.log('written') });"
+                "addEventListener('load', function () { document.getElementById('b').onclick = function () { navigator.clipboard.readText().then(function (t) { console.log('read', t) }) } });"
+                "navigator.clipboard.readText().catch(function (e) { console.log(e.name, e instanceof DOMException) });"
+                "navigator.clipboard.writeText().catch(function (e) { console.log(e.name) });",
+                "written | NotAllowedError true | TypeError | read héllo", click_button, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "h\xC3\xA9llo"); }));
+  CHECK(clip_is("", "navigator.clipboard.writeText('x').then(function () { return navigator.clipboard.writeText('') }).then(function () { console.log('cleared') })", "cleared", nullptr, "https://app.example/p",
+                nullptr, [](FakeEnvironment& env) { CHECK(env.clip.empty()); }));
+  // items: text and html together, a picture, and the checks
+  CHECK(clip_is("<button id=b>x</button>",
+                "var png = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 0, 255, 128, 7]);"
+                "navigator.clipboard.write([new ClipboardItem({ 'text/plain': 'plain', 'text/html': new Blob(['<b>rich</b>'], { type: 'text/html' }) }, { presentationStyle: 'inline' })])"
+                ".then(function () { return navigator.clipboard.write([new ClipboardItem({ 'image/png': Promise.resolve(new Blob([png], { type: 'image/png' })) })]) }).then(function () { console.log('wrote picture') });"
+                "addEventListener('load', function () { document.getElementById('b').onclick = function () { navigator.clipboard.read().then(function (items) { console.log(items.length, items[0].types.join(), items[0].presentationStyle); return items[0].getType('image/png') })"
+                ".then(function (b) { console.log(b.type, b.size); return b.arrayBuffer() }).then(function (ab) { var u = new Uint8Array(ab), o = []; for (var i = 0; i < u.length; i++) o.push(u[i]); console.log(o.join(',')) }) } });",
+                "wrote picture | 1 image/png unspecified | image/png 12 | 137,80,78,71,13,10,26,10,0,255,128,7", click_button, "https://app.example/p", nullptr,
+                [](FakeEnvironment& env) { CHECK(env.clip.empty() && env.clip_png.size() == 12 && (unsigned char)env.clip_png[9] == 255 && (unsigned char)env.clip_png[10] == 128); }));
+  CHECK(clip_is("<button id=b>x</button>",
+                "navigator.clipboard.write([new ClipboardItem({ 'text/plain': 'plain', 'text/html': '<i>x</i>' })]).then(function () { console.log('ok') });"
+                "addEventListener('load', function () { document.getElementById('b').onclick = function () { navigator.clipboard.read().then(function (items) { console.log(items[0].types.join()); return items[0].getType('text/html') }).then(function (b) { return b.text() }).then(function (t) { console.log(t) }) } });",
+                "ok | text/plain,text/html | <i>x</i>", click_button, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "plain" && env.clip_html == "<i>x</i>"); }));
+  CHECK(clip_is("", "var seen = [];"
+                "try { new ClipboardItem() } catch (e) { seen.push(e.name) } try { new ClipboardItem({}) } catch (e) { seen.push(e.name) } try { new ClipboardItem({ 'text/plain': 5 }) } catch (e) { seen.push(e.name) }"
+                "try { new ClipboardItem({ 'text/plain': 'x' }, { presentationStyle: 'bogus' }) } catch (e) { seen.push(e.name) }"
+                "seen.push(ClipboardItem.supports('text/plain'), ClipboardItem.supports('image/png'), ClipboardItem.supports('text/csv'));"
+                "var item = new ClipboardItem({ 'text/plain': 'x' }); item.getType('image/png').catch(function (e) { seen.push(e.name) });"
+                "navigator.clipboard.write([]).then(function () { seen.push('empty ok') });"
+                "navigator.clipboard.write(['x']).catch(function (e) { seen.push('item ' + e.name) });"
+                "navigator.clipboard.write(5).catch(function (e) { seen.push('arg ' + e.name) });"
+                "navigator.clipboard.write([new ClipboardItem({ 'text/csv': 'a,b' })]).catch(function (e) { seen.push('type ' + e.name) });"
+                "navigator.clipboard.write([item, item]).catch(function (e) { seen.push('two ' + e.name) });"
+                "setTimeout(function () { console.log(seen.join(' ')) }, 5);",
+                "TypeError TypeError TypeError TypeError true true false NotFoundError empty ok item TypeError arg TypeError type NotAllowedError two NotAllowedError"));
+  CHECK(clip_is("", "navigator.clipboard.write([new ClipboardItem({ 'image/png': new Blob(['x'], { type: 'image/png' }) })]).catch(function (e) { console.log(e.name) })", "NotAllowedError"));   // (not a picture)
+  // copy, cut and paste in a field: the events, and what a listener may do
+  const char* field = "<input id=f autofocus value='hello world'><button id=b>x</button>";
+  CHECK(clip_is(field, "addEventListener('load', function () { var f = document.getElementById('f'); setTimeout(function () { f.setSelectionRange(0, 5) }, 0);"
+                "document.addEventListener('copy', function (e) { console.log(e.type, e.target.id, e.cancelable, e.bubbles, e.clipboardData instanceof DataTransfer, e.clipboardData.types.length) }) })",
+                "copy f true true true 0", [&](FakeEnvironment&, Page& page) { ctrl(page, 'c'); }, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "hello"); }));
+  CHECK(clip_is(field, "addEventListener('load', function () { var f = document.getElementById('f'); setTimeout(function () { f.setSelectionRange(0, 5) }, 0);"
+                "f.addEventListener('copy', function (e) { e.clipboardData.setData('text/plain', 'custom'); e.clipboardData.setData('text/html', '<u>custom</u>'); e.preventDefault() }) })",
+                "", [&](FakeEnvironment&, Page& page) { ctrl(page, 'c'); }, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "custom" && env.clip_html == "<u>custom</u>"); }));
+  CHECK(clip_is(field, "addEventListener('load', function () { var f = document.getElementById('f'); setTimeout(function () { f.setSelectionRange(6, 11) }, 0);"
+                "f.addEventListener('cut', function (e) { console.log('cut', e.type) }); f.addEventListener('input', function () { console.log('input', f.value) }) })",
+                "cut cut | input hello ", [&](FakeEnvironment&, Page& page) { ctrl(page, 'x'); }, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "world"); }));
+  CHECK(clip_is(field, "addEventListener('load', function () { var f = document.getElementById('f'); setTimeout(function () { f.setSelectionRange(6, 11) }, 0); f.addEventListener('cut', function (e) { e.preventDefault(); e.clipboardData.setData('text/plain', 'mine') });"
+                "f.addEventListener('keyup', function () { console.log(f.value) }) })",
+                "hello world", [&](FakeEnvironment&, Page& page) { ctrl(page, 'x'); }, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "mine"); }));
+  CHECK(clip_is(field, "addEventListener('load', function () { var f = document.getElementById('f'); setTimeout(function () { f.setSelectionRange(5, 5) }, 0);"
+                "f.addEventListener('paste', function (e) { console.log('paste', e.clipboardData.getData('text/plain'), e.clipboardData.getData('text/html'), e.clipboardData.types.join()); e.clipboardData.setData('text/plain', 'ignored') });"
+                "f.addEventListener('keyup', function () { console.log(f.value) }) })",
+                "paste PASTED <b>P</b> text/plain,text/html | helloPASTED world", [&](FakeEnvironment&, Page& page) { ctrl(page, 'v'); }, "https://app.example/p",
+                [](FakeEnvironment& env) { env.clip = "PASTED"; env.clip_html = "<b>P</b>"; }));
+  CHECK(clip_is(field, "addEventListener('load', function () { var f = document.getElementById('f'); setTimeout(function () { f.setSelectionRange(0, 11) }, 0);"
+                "f.addEventListener('paste', function (e) { e.preventDefault(); var t = e.clipboardData.getData('text'); f.value = t.toUpperCase() });"
+                "f.addEventListener('keyup', function () { console.log(f.value) }) })",
+                "SHOUT", [&](FakeEnvironment&, Page& page) { ctrl(page, 'v'); }, "https://app.example/p", [](FakeEnvironment& env) { env.clip = "shout"; }));
+  CHECK(clip_is("<input id=f type=password autofocus value=secret>", "addEventListener('load', function () { var f = document.getElementById('f'); setTimeout(function () { f.select() }, 0); document.addEventListener('copy', function () { console.log('copy event') }) })",
+                "copy event", [&](FakeEnvironment&, Page& page) { ctrl(page, 'c'); }, "https://app.example/p", [](FakeEnvironment& env) { env.clip = "before"; }, [](FakeEnvironment& env) { CHECK(env.clip == "before"); }));
+  CHECK(clip_is("<input id=f autofocus readonly value='ro'>", "addEventListener('load', function () { setTimeout(function () { document.getElementById('f').select() }, 0) })", "",
+                [&](FakeEnvironment&, Page& page) { ctrl(page, 'x'); ctrl(page, 'v'); }, "https://app.example/p", [](FakeEnvironment& env) { env.clip = "zzz"; },
+                [](FakeEnvironment& env) { CHECK(env.clip == "zzz"); }));   // (cut and paste leave a read only field alone)
+  // the page itself: Ctrl+A selects it, Ctrl+C copies what is selected (as text and html)
+  CHECK(clip_is("<p id=p>Hello <b>world</b></p>", "document.addEventListener('copy', function () { console.log('selection:', getSelection().toString(), getSelection().rangeCount) });",
+                "selection: Hello world 1", [&](FakeEnvironment&, Page& page) { ctrl(page, 'a'); ctrl(page, 'c'); }, "https://app.example/p", nullptr,
+                [](FakeEnvironment& env) { CHECK(env.clip == "Hello world" && env.clip_html == "<p id=\"p\">Hello <b>world</b></p>"); }));
+  CHECK(clip_is("<p id=p>Hello world</p>", "", "", [&](FakeEnvironment&, Page& page) { ctrl(page, 'c'); }, "https://app.example/p", [](FakeEnvironment& env) { env.clip = "kept"; },
+                [](FakeEnvironment& env) { CHECK(env.clip == "kept"); }));   // (nothing selected: nothing copied)
+  CHECK(clip_is("<p id=p>Pick me</p>", "addEventListener('load', function () { var r = document.createRange(); r.selectNodeContents(document.getElementById('p')); getSelection().addRange(r) });"
+                "document.addEventListener('copy', function (e) { e.preventDefault(); e.clipboardData.setData('text/plain', 'the page said: ' + getSelection().toString()) });",
+                "", [&](FakeEnvironment&, Page& page) { ctrl(page, 'c'); }, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "the page said: Pick me"); }));
+  CHECK(clip_is("<button id=b>x</button>", "document.addEventListener('paste', function (e) { console.log('page paste', e.target.id, e.clipboardData.getData('text/plain')) });",
+                "page paste b typed", [&](FakeEnvironment&, Page& page) { page.document().element_by_id("b"); page.click(page.document().element_by_id("b")->serial, 1, 1); ctrl(page, 'v'); }, "https://app.example/p",
+                [](FakeEnvironment& env) { env.clip = "typed"; }));
+  // pasting a picture gives the listener a file
+  CHECK(clip_is(field, "addEventListener('load', function () { document.getElementById('f').addEventListener('paste', function (e) { var f = e.clipboardData.files[0]; console.log(e.clipboardData.files.length, f.type, f.size, e.clipboardData.types.join()) }) })",
+                "1 image/png 6 Files", [&](FakeEnvironment&, Page& page) { ctrl(page, 'v'); }, "https://app.example/p", [](FakeEnvironment& env) { env.clip_png = std::string("\x89PNG\x0d\x0a", 6); }));
+  // document.execCommand
+  CHECK(clip_is(field, "addEventListener('load', function () { setTimeout(function () { var f = document.getElementById('f'); f.focus(); f.setSelectionRange(0, 5);"
+                "console.log(document.queryCommandSupported('copy'), document.queryCommandSupported('cut'), document.queryCommandSupported('paste'), document.queryCommandSupported('bold'), document.queryCommandEnabled('copy'), document.queryCommandEnabled('insertText'));"
+                "console.log(document.execCommand('copy'), document.execCommand('paste'), document.execCommand('bold'));"
+                "console.log(document.execCommand('cut'), f.value); console.log(document.execCommand('insertText', false, 'bye'), f.value); f.setSelectionRange(0, 0);"
+                "console.log(document.execCommand('selectAll'), f.selectionStart, f.selectionEnd); console.log(document.execCommand('delete'), f.value); console.log(document.execCommand('forwarddelete'), f.value) }, 0) })",
+                "true true false false true true | true false false | true  world | true bye world | true 0 9 | true  | false ", nullptr, "https://app.example/p", nullptr,
+                [](FakeEnvironment& env) { CHECK(env.clip == "hello"); }));
+  CHECK(clip_is("<p id=p>text</p>", "addEventListener('load', function () { var r = document.createRange(); r.selectNodeContents(document.getElementById('p')); getSelection().addRange(r);"
+                "document.addEventListener('copy', function () { console.log('copy event') });"
+                "console.log(document.execCommand('copy'), document.execCommand('selectAll'), getSelection().toString()) })",
+                "copy event | true true text", nullptr, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.clip == "text"); }));
+}
+
 static void test_messaging() {
   // to itself: the data is a copy, with what JSON cannot say kept
   CHECK(async_is("addEventListener('message', function (e) { var d = e.data; console.log(e.type, e.origin, e.source === window, e.ports.length, e.lastEventId === '', d.a.length, d.a[1].b, d.d instanceof Date, d.d.getTime(), 'u' in d, d.u, isNaN(d.n), 1 / d.z, d.s, d === msg, e instanceof MessageEvent) });"
@@ -3894,7 +4061,7 @@ static void test_platform() {
       "navigator.permissions.query({ name: 'bogus' }).catch(function (e) { out.push('perm:' + e.name) });"
       "navigator.geolocation.getCurrentPosition(function () { }, function (e) { out.push('geo:' + e.code + ':' + (e instanceof GeolocationPositionError)) });"
       "navigator.mediaDevices.enumerateDevices().then(function (l) { out.push('devices:' + l.length) }); navigator.mediaDevices.getUserMedia({ video: true }).catch(function (e) { out.push('media:' + e.name) });"
-      "navigator.clipboard.writeText('copied').then(function () { return navigator.clipboard.readText() }).then(function (t) { out.push('clip:' + t) });"
+      "navigator.clipboard.writeText('copied').then(function () { return navigator.clipboard.readText() }).then(function (t) { out.push('clip:' + t) }, function (e) { out.push('clip:' + e.name) });"
       "navigator.locks.request('l', function (lock) { out.push('lock:' + lock.name + ':' + lock.mode); return 5 }).then(function (v) { out.push('locked:' + v) });"
       "caches.open('c').then(function (c) { return c.put('/a', new Response('hi')).then(function () { return c.match('/a') }) }).then(function (r) { return r.text() }).then(function (t) { out.push('cache:' + t) });"
       "navigator.storage.estimate().then(function (e) { out.push('quota:' + (e.quota > 0)) }); navigator.getBattery().then(function (b) { out.push('battery:' + b.level) });"
@@ -3907,7 +4074,7 @@ static void test_platform() {
       "var e = document.createElement('div'); e.ariaLabel = 'l'; e.role = 'button'; e.inert = true; out.push(e.getAttribute('aria-label') + e.getAttribute('role') + e.hasAttribute('inert') + e.translate);"
       "var pop = document.createElement('div'); pop.popover = 'auto'; document.body.appendChild(pop); pop.showPopover(); out.push('pop:' + pop.matches(':popover-open')); pop.hidePopover(); out.push(pop.matches(':popover-open'));"
       "setTimeout(function () { console.log(out.sort().join(' | ')) }, 50);",
-      "Netscape:Gecko:false:0:0:false:false:true | [object Window][object Document][object Location][object Navigator][object NodeList][object HTMLCollection] | battery:1 | cache:hi | clicktrue5 | clip:copied | devices:0 | false | geo:1:true | lbuttontruetrue | lock:l:exclusive | locked:5 | media:NotFoundError | notify:denied:denied | perf:2:measure:true | perm:TypeError | perm:prompt:geolocation | pop:true | quota:true | xtext/plain"));
+      "Netscape:Gecko:false:0:0:false:false:true | [object Window][object Document][object Location][object Navigator][object NodeList][object HTMLCollection] | battery:1 | cache:hi | clicktrue5 | clip:NotAllowedError | devices:0 | false | geo:1:true | lbuttontruetrue | lock:l:exclusive | locked:5 | media:NotFoundError | notify:denied:denied | perf:2:measure:true | perm:TypeError | perm:prompt:geolocation | pop:true | quota:true | xtext/plain"));
 }
 
 // --- fetch() and XMLHttpRequest in full ---------------------------------------------------------------------------------------------
@@ -4074,6 +4241,7 @@ int main(int argc, char** argv) {
   test_storage();
   test_cookies_web();
   test_navigation();
+  test_clipboard();
   test_messaging();
   test_history_api();
   test_scripts_during_load();

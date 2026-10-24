@@ -20,6 +20,7 @@
 #include "Browser/Fetcher.hpp"
 #include "Browser/Url.hpp"
 #include "Browser/WebUrl.hpp"
+#include "Media/ImageCodecs.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -169,6 +170,7 @@ bool WebBrowser::is_page_name(StringView name) {
 
 WebBrowser::WebBrowser(allocators::IAllocator& allocator)
     : Frame(allocator),
+      rich_html_(allocator),
       menu_(allocator),
       back_menu_(allocator),
       forward_menu_(allocator),
@@ -1285,6 +1287,104 @@ void WebBrowser::Env::clipboard_set(StringView text) {
   gui::Window* w = owner_.window();
   kernel::Clipboard* clip = w ? w->clipboard() : nullptr;
   if (clip) clip->set_text(text);
+}
+
+
+// The text of some html: the tags dropped, the common entities undone, blocks and <br> as line breaks (for a page that gave the clipboard html only).
+static void html_to_text(StringView html, String* out) {
+  out->clear();
+  bool in_tag = false;
+  for (uint64_t i = 0; i < html.size(); ++i) {
+    const char c = html[i];
+    if (in_tag) {
+      if (c == '>') in_tag = false;
+      continue;
+    }
+    if (c == '<') {
+      const StringView rest = html.substr(i + 1);
+      if (rest.starts_with("br") || rest.starts_with("/p") || rest.starts_with("/div") || rest.starts_with("/li") || rest.starts_with("/h")) {
+        if (!out->empty() && out->view()[out->size() - 1] != '\n') out->push_back('\n');
+      }
+      in_tag = true;
+    } else if (c == '&') {
+      const StringView rest = html.substr(i);
+      struct Entity { const char* name; char value; };
+      static const Entity kEntities[] = {{"&lt;", '<'}, {"&gt;", '>'}, {"&amp;", '&'}, {"&quot;", '"'}, {"&#39;", '\''}, {"&nbsp;", ' '}};
+      bool done = false;
+      for (const Entity& e : kEntities) {
+        if (rest.starts_with(e.name)) {
+          out->push_back(e.value);
+          i += StringView(e.name).size() - 1;
+          done = true;
+          break;
+        }
+      }
+      if (!done) out->push_back(c);
+    } else {
+      out->push_back(c);
+    }
+  }
+}
+
+void WebBrowser::Env::clipboard_formats(String* csv) {
+  csv->clear();
+  gui::Window* w = owner_.window();
+  kernel::Clipboard* clip = w ? w->clipboard() : nullptr;
+  if (!clip) return;
+  if (clip->format() == kernel::ClipboardFormat::Text) {
+    csv->assign("text/plain");
+    if (owner_.rich_valid_ && clip->sequence() == owner_.rich_sequence_ && !owner_.rich_html_.empty()) csv->append(",text/html");
+  } else if (clip->format() == kernel::ClipboardFormat::Image) {
+    csv->assign("image/png");
+  }
+}
+
+bool WebBrowser::Env::clipboard_read_format(StringView format, String* bytes) {
+  gui::Window* w = owner_.window();
+  kernel::Clipboard* clip = w ? w->clipboard() : nullptr;
+  if (!clip) return false;
+  if (format.equals("text/plain")) return clip->get_text(bytes);
+  if (format.equals("text/html")) return clip->format() == kernel::ClipboardFormat::Text && owner_.rich_valid_ && clip->sequence() == owner_.rich_sequence_ && !owner_.rich_html_.empty() && bytes->assign(owner_.rich_html_.view());
+  if (format.equals("image/png")) {
+    uint32_t width = 0, height = 0;
+    if (!clip->image_size(&width, &height)) return false;
+    media::Image image(owner_.allocator());
+    if (!image.create(width, height)) return false;
+    ArrayView<uint32_t> pixels = image.frame(0);
+    if (!clip->get_image(pixels.data(), pixels.size())) return false;
+    ByteBuffer png(owner_.allocator());
+    if (!media::encode_png(image, 6, &png)) return false;
+    return bytes->assign(StringView(png.view()));
+  }
+  return false;
+}
+
+bool WebBrowser::Env::clipboard_write_items(const browser::ClipboardData& data) {
+  gui::Window* w = owner_.window();
+  kernel::Clipboard* clip = w ? w->clipboard() : nullptr;
+  if (!clip) return false;
+  bool ok = true;
+  String derived(owner_.allocator());
+  StringView text = data.text;
+  if (data.has_image && !data.has_text && !data.has_html) {
+    media::Image image(owner_.allocator());
+    if (!media::decode_png(data.image_png.bytes(), &image) || image.empty()) return false;
+    ArrayView<uint32_t> pixels = image.frame(0);
+    ok = clip->set_image(pixels.data(), image.width(), image.height());
+  } else if (data.has_text || data.has_html) {
+    if (!data.has_text) {
+      html_to_text(data.html, &derived);
+      text = derived.view();
+    }
+    if (text.empty()) clip->clear();
+    else ok = clip->set_text(text);
+  } else {
+    clip->clear();
+  }
+  owner_.rich_html_.assign(data.has_html ? data.html : StringView());
+  owner_.rich_sequence_ = clip->sequence();
+  owner_.rich_valid_ = ok;
+  return ok;
 }
 
 void WebBrowser::Env::pick_file(uint32_t node_serial, bool) { owner_.ask_file(node_serial); }

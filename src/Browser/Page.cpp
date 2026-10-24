@@ -584,6 +584,36 @@ int32_t Page::take_scroll_request() {
   return r;
 }
 
+// --- the clipboard ----------------------------------------------------------------------------------------------------------------------
+
+bool Page::fire_clipboard(dom::Node* target, StringView type) {
+  if (!bindings_ || !target) return false;
+  const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(target), DomBindings::HookArg::of(type)};
+  String result(allocator_);
+  bindings_->call_hook("__clip_event", args, 2, &result);
+  flush_errors();
+  doc_.touch();
+  return result.view().equals("1");
+}
+
+void Page::page_clipboard_key(dom::Node* target, char key) {
+  if (!bindings_) return;
+  dom::Node* at = target ? target : doc_.body();
+  if (!at) at = doc_.document_element();
+  const char which = key >= 'A' && key <= 'Z' ? static_cast<char>(key + 32) : key;
+  if (which == 'a') {
+    bindings_->call_hook("__select_all", nullptr, 0);
+  } else if (which == 'c') {
+    if (!fire_clipboard(at, "copy")) bindings_->call_hook("__clip_copy_selection", nullptr, 0);
+  } else if (which == 'x') {
+    fire_clipboard(at, "cut");
+  } else {
+    fire_clipboard(at, "paste");
+  }
+  flush_errors();
+  doc_.touch();
+}
+
 // --- leaving, and where the page scrolls to --------------------------------------------------------------------------------------------
 
 bool Page::before_unload() {
@@ -1309,6 +1339,10 @@ bool Page::key(FormKey k, char character, uint8_t modifiers) {
     if (frames_[i]->page && frames_[i]->page->has_focus()) return frames_[i]->page->key(k, character, modifiers);
   dom::Node* n = focused();
   if (!n) {
+    if (k == FormKey::Character && (modifiers & 2) && !(modifiers & 4) && (character == 'a' || character == 'c' || character == 'x' || character == 'v' || character == 'A' || character == 'C' || character == 'X' || character == 'V')) {
+      page_clipboard_key(nullptr, character);
+      return true;
+    }
     if (k == FormKey::Escape) {
       if (dom::Node* modal = modal_dialog()) {
         if (fire(modal, "cancel", false, true)) close_dialog_text(modal, StringView());
@@ -1363,6 +1397,13 @@ bool Page::key(FormKey k, char character, uint8_t modifiers) {
 
 bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
   const bool shift = modifiers & 1, ctrl = modifiers & 2, alt = modifiers & 4;
+  if (k == FormKey::Character && ctrl && !alt && (ch == 'a' || ch == 'c' || ch == 'x' || ch == 'v' || ch == 'A' || ch == 'C' || ch == 'X' || ch == 'V')) {
+    const bool text_field = (n->is_tag("input") && dom::is_text_field(dom::input_type(n))) || n->is_tag("textarea");
+    if (!text_field) {   // (a button or link has focus: the keys work on the page)
+      page_clipboard_key(n, ch);
+      return true;
+    }
+  }
   if (k == FormKey::Tab) {
     move_focus(shift ? -1 : 1);
     return true;
@@ -1393,12 +1434,17 @@ bool Page::press_key(dom::Node* n, FormKey k, char ch, uint8_t modifiers) {
         dom::get_value(n, &v);
         if (ch == 'a' || ch == 'A') {
           dom::set_selection(n, 0, static_cast<uint32_t>(v.size()));
-        } else if ((ch == 'c' || ch == 'C' || ch == 'x' || ch == 'X') && s < e) {
-          if (t != dom::InputType::Password) env_.clipboard_set(v.view().substr(s, e - s));
-          if ((ch == 'x' || ch == 'X') && editable && t != dom::InputType::Password && dom::delete_selection(n, 1)) input_changed(n, false);
-        } else if ((ch == 'v' || ch == 'V') && editable) {
+        } else if (ch == 'c' || ch == 'C' || ch == 'x' || ch == 'X') {
+          const bool cut = ch == 'x' || ch == 'X';
+          const bool handled = fire_clipboard(n, cut ? "cut" : "copy");   // (a script may do it all itself)
+          if (!handled && s < e && (!cut || editable)) {
+            if (t != dom::InputType::Password) env_.clipboard_set(v.view().substr(s, e - s));
+            if (cut && t != dom::InputType::Password && dom::delete_selection(n, 1)) input_changed(n, false);
+          }
+        } else if (ch == 'v' || ch == 'V') {
+          const bool handled = fire_clipboard(n, "paste");
           String clip(allocator_);
-          if (env_.clipboard_get(&clip)) paste_text(n, clip.view());
+          if (!handled && editable && env_.clipboard_get(&clip)) paste_text(n, clip.view());
         }
         doc_.touch();
         return true;

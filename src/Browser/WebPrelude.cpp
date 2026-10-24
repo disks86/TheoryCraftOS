@@ -4708,10 +4708,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   // The window left fullscreen by itself (Escape): the events follow, as for exitFullscreen().
   hide(g, '__fs_left', function () { setTimeout(function () { fsFire(g.document, 'fullscreenchange'); }, 0); });
   method(DP, 'elementsFromPoint', function () { return []; });
-  method(DP, 'execCommand', function () { return false; });
-  method(DP, 'queryCommandSupported', function () { return false; });
-  method(DP, 'queryCommandEnabled', function () { return false; });
-  method(DP, 'queryCommandState', function () { return false; });
+  // (document.execCommand() is in the clipboard section below)
   method(DP, 'startViewTransition', function (callback) {
     var done = Promise.resolve().then(function () { return typeof callback === 'function' ? callback() : undefined; });
     return { ready: done, finished: done, updateCallbackDone: done, skipTransition: function () {} };
@@ -5501,7 +5498,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (statuses[name]) return statuses[name];
       var st = Object.create(PermissionStatus.prototype);
       Object.defineProperty(st, 'name', { value: name, enumerable: true });
-      Object.defineProperty(st, 'state', { get: function () { return granted[name] ? 'granted' : (name === 'notifications' || name === 'push' ? 'denied' : 'prompt'); }, enumerable: true });
+      Object.defineProperty(st, 'state', { get: function () { if (name === 'clipboard-read') return g.__activeNow() ? 'granted' : 'prompt'; return granted[name] ? 'granted' : (name === 'notifications' || name === 'push' ? 'denied' : 'prompt'); }, enumerable: true });
       st.onchange = null;
       return (statuses[name] = st);
     };
@@ -5548,35 +5545,91 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     method(MediaDevices.prototype, 'getDisplayMedia', function () { return Promise.reject(denied('Permission denied')); });
     devices.ondevicechange = null;
     put('mediaDevices', getter(function () { return devices; }));
-    // clipboard (the text of the browser's clipboard)
-    var Clipboard = klass('Clipboard', ET), ClipboardItem = klass('ClipboardItem', null, function (items) {
+    // clipboard: text, html and PNG pictures, as the browser keeps them. Reading needs a user gesture in the last few seconds (a click or a key press of the user),
+    // writing does not.
+    var activeUntil = -1, everActive = false;
+    var activate = function (e) { if (e && e.isTrusted === false) return; activeUntil = Date.now() + 5000; everActive = true; };
+    ['click', 'keydown', 'mousedown', 'pointerdown', 'touchend'].forEach(function (t) { g.addEventListener(t, activate, true); });
+    var isActive = function () { return Date.now() <= activeUntil; };
+    hide(g, '__activeNow', isActive);
+    var secureContext = function () {
+      var l = g.location, h = l.hostname;
+      return l.protocol === 'https:' || l.protocol === 'file:' || h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || /\.localhost$/.test(h);
+    };
+    try { Object.defineProperty(g, 'isSecureContext', { value: secureContext(), enumerable: true, configurable: true }); } catch (e) { }
+    var Clipboard = klass('Clipboard', ET), UserActivation = klass('UserActivation', null);
+    var ClipboardItem = klass('ClipboardItem', null, function (items, options) {
+      if (arguments.length < 1) throw typeErr("construct 'ClipboardItem'", '1 argument required, but only 0 present.');
       if (items === null || typeof items !== 'object') throw typeErr("construct 'ClipboardItem'", 'The provided value is not of type record.');
-      hide(this, '__items', items);
+      var keys = Object.keys(items);
+      if (!keys.length) throw typeErr("construct 'ClipboardItem'", 'At least one entry required');
+      var style = options && options.presentationStyle !== undefined ? String(options.presentationStyle) : 'unspecified';
+      if (['unspecified', 'inline', 'attachment'].indexOf(style) < 0) throw typeErr("construct 'ClipboardItem'", "The provided value '" + style + "' is not a valid enum value of type PresentationStyle.");
+      var copy = {};
+      keys.forEach(function (k) {
+        var v = items[k];
+        if (typeof v === 'string' || v instanceof Blob || (v !== null && typeof v === 'object' && typeof v.then === 'function')) copy[k] = v;
+        else throw typeErr("construct 'ClipboardItem'", "The provided value is not of type '(Promise<(DOMString or Blob)> or DOMString or Blob)'.");
+      });
+      hide(this, '__items', copy); hide(this, '__style', style);
     });
     defineGetter(ClipboardItem.prototype, 'types', function () { return Object.keys(this.__items); });
+    defineGetter(ClipboardItem.prototype, 'presentationStyle', function () { return this.__style; });
     method(ClipboardItem.prototype, 'getType', function (type) {
+      if (arguments.length < 1) return Promise.reject(typeErr("execute 'getType' on 'ClipboardItem'", '1 argument required, but only 0 present.'));
+      type = String(type);
       var v = this.__items[type];
       if (v === undefined) return Promise.reject(new DOMException("Failed to execute 'getType' on 'ClipboardItem': The type '" + type + "' was not found", 'NotFoundError'));
-      return Promise.resolve(v).then(function (x) { return x instanceof Blob ? x : new Blob([String(x)], { type: type }); });
+      return Promise.resolve(v).then(function (x) { return x instanceof Blob && x.type === type ? x : new Blob([x], { type: type }); });
     });
-    ClipboardItem.supports = function (type) { return type === 'text/plain' || type === 'text/html'; };
+    ClipboardItem.supports = function (type) { type = String(type); return type === 'text/plain' || type === 'text/html' || type === 'image/png'; };
+    var notAllowed = function (what, why) { return new DOMException("Failed to execute '" + what + "' on 'Clipboard': " + why, 'NotAllowedError'); };
+    var formatList = function () { var csv = __clipboard_formats(); return csv ? csv.split(',') : []; };
+    var blobOf = function (type) {
+      var raw = __clipboard_read(type);
+      return raw === null ? null : new Blob([type === 'image/png' ? __string_to_bytes(raw) : raw], { type: type });
+    };
     method(Clipboard.prototype, 'writeText', function (text) {
       if (arguments.length < 1) return Promise.reject(typeErr("execute 'writeText' on 'Clipboard'", '1 argument required, but only 0 present.'));
-      __clipboard_set(String(text));
-      return Promise.resolve();
+      var value = String(text);
+      return __clipboard_write(value, null, null) ? Promise.resolve() : Promise.reject(notAllowed('writeText', 'Write permission denied.'));
     });
-    method(Clipboard.prototype, 'readText', function () { var t = __clipboard_get(); return Promise.resolve(t === null ? '' : t); });
-    method(Clipboard.prototype, 'write', function (items) {
-      if (!items || !items.length) return Promise.resolve();
-      var item = items[0];
-      return item.getType('text/plain').then(function (b) { return b.text(); }, function () { return ''; }).then(function (t) { __clipboard_set(t); });
+    method(Clipboard.prototype, 'readText', function () {
+      if (!isActive()) return Promise.reject(notAllowed('readText', 'Read permission denied.'));
+      var t = __clipboard_read('text/plain');
+      return Promise.resolve(t === null ? '' : t);
     });
-    method(Clipboard.prototype, 'read', function () {
-      var t = __clipboard_get();
-      return Promise.resolve(t === null || t === '' ? [] : [new ClipboardItem({ 'text/plain': new Blob([t], { type: 'text/plain' }) })]);
+    method(Clipboard.prototype, 'read', function (options) {
+      if (!isActive()) return Promise.reject(notAllowed('read', 'Read permission denied.'));
+      var formats = formatList(), items = {};
+      formats.forEach(function (f) { var b = blobOf(f); if (b) items[f] = b; });
+      return Promise.resolve(Object.keys(items).length ? [new ClipboardItem(items)] : []);
+    });
+    method(Clipboard.prototype, 'write', function (list) {
+      if (arguments.length < 1) return Promise.reject(typeErr("execute 'write' on 'Clipboard'", '1 argument required, but only 0 present.'));
+      if (list === null || typeof list !== 'object' || typeof list.length !== 'number') return Promise.reject(typeErr("execute 'write' on 'Clipboard'", 'The provided value cannot be converted to a sequence.'));
+      for (var i = 0; i < list.length; i++) if (!(list[i] instanceof ClipboardItem)) return Promise.reject(typeErr("execute 'write' on 'Clipboard'", "Failed to convert value to 'ClipboardItem'."));
+      if (list.length === 0) return Promise.resolve();
+      if (list.length > 1) return Promise.reject(notAllowed('write', 'Support for multiple ClipboardItems is not implemented.'));
+      var item = list[0], types = item.types;
+      for (var j = 0; j < types.length; j++) if (!ClipboardItem.supports(types[j])) return Promise.reject(notAllowed('write', 'Type ' + types[j] + ' does not match the blob\'s type.'));
+      return Promise.all(types.map(function (t) {
+        return item.getType(t).then(function (blob) {
+          if (t === 'image/png') return blob.arrayBuffer().then(function (ab) { return { type: t, data: __bytes_to_string(new Uint8Array(ab)) }; });
+          return blob.text().then(function (text) { return { type: t, data: text }; });
+        });
+      })).then(function (parts) {
+        var text = null, html = null, png = null;
+        parts.forEach(function (p) { if (p.type === 'text/plain') text = p.data; else if (p.type === 'text/html') html = p.data; else png = p.data; });
+        if (!__clipboard_write(text, html, png)) throw notAllowed('write', 'Write permission denied.');
+      });
     });
     var clipboard = Object.create(Clipboard.prototype);
-    put('clipboard', getter(function () { return clipboard; }));
+    put('clipboard', getter(function () { return secureContext() ? clipboard : undefined; }));
+    defineGetter(UserActivation.prototype, 'hasBeenActive', function () { return everActive; });
+    defineGetter(UserActivation.prototype, 'isActive', function () { return isActive(); });
+    var userActivation = Object.create(UserActivation.prototype);
+    put('userActivation', getter(function () { return userActivation; }));
     // storage manager, credentials, locks, wake lock, battery, connection, user agent data, media session, service workers, keyboard
     var StorageManager = klass('StorageManager', null), storage = Object.create(StorageManager.prototype);
     method(StorageManager.prototype, 'estimate', function () { return Promise.resolve({ usage: 0, quota: 134217728 }); });
@@ -5968,6 +6021,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var fmt = function (f) { f = String(f).toLowerCase(); return f === 'text' ? 'text/plain' : f === 'url' ? 'text/uri-list' : f; };
     method(DataTransfer.prototype, 'setData', function (format, data) {
       if (arguments.length < 2) throw typeErr("execute 'setData' on 'DataTransfer'", '2 arguments required, but only ' + arguments.length + ' present.');
+      if (this.__d.mode === 'ro') return;
       format = fmt(format);
       if (this.__d.data[format] === undefined) this.__d.order.push(format);
       this.__d.data[format] = String(data);
@@ -5975,6 +6029,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     method(DataTransfer.prototype, 'getData', function (format) { var v = this.__d.data[fmt(format)]; return v === undefined ? '' : v; });
     method(DataTransfer.prototype, 'clearData', function (format) {
       var d = this.__d;
+      if (d.mode === 'ro') return;
       if (format === undefined) { d.data = {}; d.order = []; return; }
       format = fmt(format);
       if (d.data[format] !== undefined) { delete d.data[format]; d.order.splice(d.order.indexOf(format), 1); }
@@ -8137,6 +8192,106 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (begin(p)) { ongoing = null; transition = null; }
       settle('push', before);
       fire('navigatesuccess');
+    });
+  }());
+
+  // ---------------------------------------------------------------------------------------------------------------------------------- clipboard events and commands
+  (function () {
+    var DP = g.Document.prototype;
+    var isField = function (e) { return !!e && ((e.tagName === 'INPUT' && /^(text|search|url|tel|email|password|number)$/.test(e.type)) || e.tagName === 'TEXTAREA'); };
+    var activeField = function () { var a = document.activeElement; return isField(a) ? a : null; };
+    var fieldSelection = function (f) { var s = f.selectionStart, e = f.selectionEnd; return typeof s === 'number' && typeof e === 'number' && e > s ? f.value.slice(s, e) : ''; };
+    var fill = function (dt) {
+      var csv = __clipboard_formats(), formats = csv ? csv.split(',') : [];
+      formats.forEach(function (f) {
+        var raw = __clipboard_read(f);
+        if (raw === null) return;
+        if (f === 'image/png') dt.__d.files.push(new File([__string_to_bytes(raw)], 'image.png', { type: 'image/png' }));
+        else dt.setData(f, raw);
+      });
+    };
+    // copy / cut / paste: the event, with the data a listener can read (paste) or set (copy, cut). '1' if a listener took over (preventDefault()).
+    hide(g, '__clip_event', function (target, type) {
+      var dt = new DataTransfer();
+      if (type === 'paste') fill(dt);
+      dt.__d.mode = type === 'paste' ? 'ro' : 'rw';
+      var ev = new ClipboardEvent(type, { bubbles: true, cancelable: true, composed: true, clipboardData: dt });
+      (target || document.body || document).dispatchEvent(ev);
+      if (!ev.defaultPrevented) return '';
+      if (type !== 'paste') {
+        var text = dt.__d.data['text/plain'], html = dt.__d.data['text/html'];
+        if (text !== undefined || html !== undefined) __clipboard_write(text === undefined ? null : text, html === undefined ? null : html, null);
+      }
+      return '1';
+    });
+    // the default action of copy: the selected text of a field, or the page's selection as text and html
+    var copySelection = function () {
+      var f = activeField();
+      if (f) {
+        var t = fieldSelection(f);
+        if (f.type === 'password' || t === '') return '';
+        return __clipboard_write(t, null, null) ? '1' : '';
+      }
+      var sel = g.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return '';
+      var div = document.createElement('div');
+      div.appendChild(sel.getRangeAt(0).cloneContents());
+      return __clipboard_write(sel.toString(), div.innerHTML, null) ? '1' : '';
+    };
+    hide(g, '__clip_copy_selection', copySelection);
+    var selectAll = function () {
+      var f = activeField();
+      if (f) { f.select(); return; }
+      if (document.body) g.getSelection().selectAllChildren(document.body);
+    };
+    hide(g, '__select_all', selectAll);
+    var replaceInField = function (f, text) {
+      var s = f.selectionStart, e = f.selectionEnd, v = f.value;
+      f.value = v.slice(0, s) + text + v.slice(e);
+      f.setSelectionRange(s + text.length, s + text.length);
+      f.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    var supported = { copy: 1, cut: 1, selectall: 1, inserttext: 1, delete: 1, forwarddelete: 1, paste: 1 };
+    method(DP, 'queryCommandSupported', function (name) { return supported[String(name).toLowerCase()] === 1 && String(name).toLowerCase() !== 'paste'; });
+    method(DP, 'queryCommandEnabled', function (name) {
+      name = String(name).toLowerCase();
+      var f = activeField();
+      if (name === 'copy') return f ? f.type !== 'password' && fieldSelection(f) !== '' : (g.getSelection().rangeCount > 0 && !g.getSelection().isCollapsed);
+      if (name === 'cut' || name === 'delete' || name === 'forwarddelete') return !!f && !f.readOnly && !f.disabled && fieldSelection(f) !== '';
+      if (name === 'inserttext') return !!f && !f.readOnly && !f.disabled;
+      return name === 'selectall';
+    });
+    method(DP, 'queryCommandState', function () { return false; });
+    method(DP, 'queryCommandValue', function () { return ''; });
+    method(DP, 'queryCommandIndeterm', function () { return false; });
+    method(DP, 'execCommand', function (name, showUi, value) {
+      if (arguments.length < 1) throw typeErr("execute 'execCommand' on 'Document'", '1 argument required, but only 0 present.');
+      name = String(name).toLowerCase();
+      var f = activeField(), target = document.activeElement || document.body;
+      if (name === 'copy') {
+        if (__clip_event(target, 'copy') === '1') return true;
+        return copySelection() === '1';
+      }
+      if (name === 'cut') {
+        if (__clip_event(target, 'cut') === '1') return true;
+        if (!f || f.readOnly || f.disabled || copySelection() !== '1') return false;
+        replaceInField(f, '');
+        return true;
+      }
+      if (name === 'selectall') { selectAll(); return true; }
+      if (name === 'inserttext') {
+        if (!f || f.readOnly || f.disabled) return false;
+        replaceInField(f, String(value === undefined ? '' : value));
+        return true;
+      }
+      if (name === 'delete' || name === 'forwarddelete') {
+        if (!f || f.readOnly || f.disabled) return false;
+        var s = f.selectionStart, e = f.selectionEnd;
+        if (s === e) { if (name === 'delete' ? s === 0 : s === f.value.length) return false; f.setSelectionRange(name === 'delete' ? s - 1 : s, name === 'delete' ? e : e + 1); }
+        replaceInField(f, '');
+        return true;
+      }
+      return false;   // (paste is not for a page to do: it would read the clipboard without being asked)
     });
   }());
 

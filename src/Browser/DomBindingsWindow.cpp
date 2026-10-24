@@ -907,6 +907,50 @@ NATIVE(clipboard_get) {
   *result = impl(vm).host.clipboard_read(&text) ? str_value(vm, text.view()) : Value::make_null();
   return true;
 }
+
+// __clipboard_formats(): the MIME types on the clipboard, comma separated ("" when it is empty).
+NATIVE(clipboard_formats) {
+  (void)self; (void)args; (void)argc;
+  String csv(vm.allocator());
+  impl(vm).host.clipboard_formats(&csv);
+  *result = str_value(vm, csv.view());
+  return true;
+}
+
+// __clipboard_read(format): the bytes of that format as a string, or null.
+NATIVE(clipboard_read_format) {
+  (void)self;
+  String format(vm.allocator()), bytes(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &format)) return false;
+  *result = impl(vm).host.clipboard_read_format(format.view(), &bytes) ? str_value(vm, bytes.view()) : Value::make_null();
+  return true;
+}
+
+// __clipboard_write(text, html, png): each a string or null; false if the browser could not.
+NATIVE(clipboard_write_items) {
+  (void)self;
+  String text(vm.allocator()), html(vm.allocator()), image(vm.allocator());
+  ClipboardData data;
+  const Value t = arg_at(args, argc, 0), h = arg_at(args, argc, 1), i = arg_at(args, argc, 2);
+  if (!t.is_nullish()) {
+    if (!arg_text(vm, t, &text)) return false;
+    data.has_text = true;
+  }
+  if (!h.is_nullish()) {
+    if (!arg_text(vm, h, &html)) return false;
+    data.has_html = true;
+  }
+  if (!i.is_nullish()) {
+    if (!arg_text(vm, i, &image)) return false;
+    data.has_image = true;
+  }
+  data.text = text.view();
+  data.html = html.view();
+  data.image_png = image.view();
+  *result = bool_value(impl(vm).host.clipboard_write_items(data));
+  return true;
+}
+
 NATIVE(clipboard_set) {
   (void)self;
   String text(vm.allocator());
@@ -1055,6 +1099,9 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__cookie_write", cookie_write, 1);
   vm.define_native(g, "__clipboard_get", clipboard_get, 0);
   vm.define_native(g, "__clipboard_set", clipboard_set, 1);
+  vm.define_native(g, "__clipboard_formats", clipboard_formats, 0);
+  vm.define_native(g, "__clipboard_read", clipboard_read_format, 1);
+  vm.define_native(g, "__clipboard_write", clipboard_write_items, 3);
   vm.define_native(g, "__pip_supported", pip_supported, 0);
   vm.define_native(g, "__pip_request", pip_request, 1);
   vm.define_native(g, "__pip_exit", pip_exit, 0);
