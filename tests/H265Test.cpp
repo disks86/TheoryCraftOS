@@ -96,6 +96,10 @@ static void collect(H265Decoder& dec, const std::vector<uint8_t>& ref, Result* r
     *frame_bytes_out = bytes;
     r->width = f.format.width;
     r->height = f.format.height;
+    if (getenv("H265_DUMP")) {
+      char name[200]; snprintf(name, sizeof name, "%s.%d.yuv", getenv("H265_DUMP"), r->frames);
+      if (FILE* o = fopen(name, "wb")) { for (uint32_t pl = 0; pl < 3; ++pl) for (uint32_t y = 0; y < f.format.plane_height(pl); ++y) fwrite(f.plane[pl] + size_t(y) * f.stride[pl], 1, f.format.plane_width(pl), o); fclose(o); }
+    }
     const size_t off = size_t(r->frames) * bytes;
     bool same = off + bytes <= ref.size();
     size_t p = off;
@@ -103,7 +107,7 @@ static void collect(H265Decoder& dec, const std::vector<uint8_t>& ref, Result* r
       for (uint32_t y = 0; y < f.format.plane_height(pl) && same; ++y)
         for (uint32_t x = 0; x < f.format.plane_width(pl); ++x, ++p)
           if (f.plane[pl][size_t(y) * f.stride[pl] + x] != ref[p]) {
-            if (r->first_bad < 0 || r->frames < r->first_bad) {
+            if (getenv("H265_VERBOSE") || r->first_bad < 0 || r->frames < r->first_bad) {
               printf("    frame %d plane %u: first difference at x=%u y=%u: got %u expected %u\n", r->frames, pl, x, y, f.plane[pl][size_t(y) * f.stride[pl] + x], ref[p]);
             }
             same = false;
@@ -130,16 +134,18 @@ static Result decode_stream(allocators::IAllocator& a, const std::vector<uint8_t
   return r;
 }
 
-static const char* const kStreams[] = {"intra", "intra_filt", "ipp", "ipp_filt", "bframes", "weighted", "slices", "ctu64", "tools", "scaling", "wpp", "cutree_off"};
+static const char* const kStreams[] = {"x1", "x2", "x3", "x4", "intra", "intra_filt", "ipp", "ipp_filt", "bframes", "weighted", "slices", "ctu64", "tools", "scaling", "wpp", "cutree_off"};
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   for (const char* name : kStreams) {
     if (argc > 1 && strcmp(argv[1], name) != 0) continue;
+    { char probe[160]; snprintf(probe, sizeof probe, "%s/hevc_%s.h265", getenv("H265_DIR") ? getenv("H265_DIR") : "tests/data", name); FILE* t = fopen(probe, "rb"); if (!t) continue; fclose(t); }
     char path[160];
-    snprintf(path, sizeof path, "tests/data/hevc_%s.h265", name);
+    const char* dir = getenv("H265_DIR") ? getenv("H265_DIR") : "tests/data";
+    snprintf(path, sizeof path, "%s/hevc_%s.h265", dir, name);
     const std::vector<uint8_t> stream = read_file(path);
-    snprintf(path, sizeof path, "tests/data/hevc_%s.yuv", name);
+    snprintf(path, sizeof path, "%s/hevc_%s.yuv", dir, name);
     const std::vector<uint8_t> ref = read_file(path);
     CHECK(!stream.empty() && !ref.empty());
     if (stream.empty() || ref.empty()) continue;

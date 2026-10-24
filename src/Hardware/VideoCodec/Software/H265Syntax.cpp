@@ -404,6 +404,9 @@ bool Core::parse_pps(BitReader& br) {
   p.slice_header_extension_present = br.u(1) != 0;
   // The extensions (range, multilayer, 3D, screen content) are not supported: a stream that uses them is refused when it is decoded.
   if (br.error()) return H265_FALSE;
+#ifdef H265_TRACE_PU
+  fprintf(stderr, "PPS %d: weighted_pred %d bipred %d tskip %d sdh %d cu_qp_delta %d(%d) tiles %d wpp %d dep_slices %d lists_mod %d tq_bypass %d par_merge %d\n", p.id, p.weighted_pred, p.weighted_bipred, p.transform_skip, p.sign_data_hiding, p.cu_qp_delta_enabled, p.diff_cu_qp_delta_depth, p.tiles_enabled, p.entropy_coding_sync, p.dependent_slice_segments, p.lists_modification_present, p.transquant_bypass, p.log2_parallel_merge_level);
+#endif
   p.valid = true;
   pps_[p.id] = p;
   return true;

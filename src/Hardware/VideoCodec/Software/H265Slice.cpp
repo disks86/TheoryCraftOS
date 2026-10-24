@@ -145,6 +145,9 @@ bool Core::decode_slice_data(const SliceHeader& sh, BitReader& br) {
     for (int i = 0; i < sh.num_ref_idx[l]; ++i)
       if (slice_->ref_poc[l][i] > poc_) no_backward_pred_ = false;
 
+#ifdef H265_TRACE_PU
+  fprintf(stderr, "SLICE poc %d type %d addr %d dep %d nref %d,%d tmvp %d col_l0 %d col_idx %d merge %d qp %d denom %d,%d lw0 %d,%d lw1 %d,%d cabac_init %d mvdl1z %d\n", poc_, sh.type, sh.segment_address, sh.dependent_slice_segment, sh.num_ref_idx[0], sh.num_ref_idx[1], sh.temporal_mvp, sh.collocated_from_l0, sh.collocated_ref_idx, sh.max_num_merge_cand, sh.slice_qp, sh.luma_log2_denom, sh.chroma_log2_denom, sh.luma_weight_flag[0][0], sh.luma_weight_flag[0][1], sh.luma_weight_flag[1][0], sh.luma_weight_flag[1][1], sh.cabac_init_flag, sh.mvd_l1_zero);
+#endif
   br_ = &br;
   br.seek(sh.data_bit_offset);
   cabac_.attach(&br);
@@ -427,10 +430,10 @@ void Core::coding_unit(int x0, int y0, int log2_size) {
     }
   }
   cur_part_mode_ = part_mode;
-  mark_cb_edges();
   bool pcm = false;
   if (intra) {
     fill_mode(1);
+    mark_cb_edges();
     if (part_mode == kPart2Nx2N && sps.pcm && log2_size >= sps.log2_min_pcm && log2_size <= sps.log2_max_pcm) pcm = cabac_.terminate() != 0;
     if (pcm) {
       read_pcm(x0, y0, log2_size);
@@ -509,6 +512,7 @@ void Core::coding_unit(int x0, int y0, int log2_size) {
     if (parts == 1) for (int i = 1; i < 4; ++i) intra_luma_modes_[i] = intra_luma_modes_[0];
   } else {
     fill_mode(2);
+    mark_cb_edges();
     for (int y = y0 >> 2; y < (y0 + n_cb) >> 2; ++y)
       for (int x = x0 >> 2; x < (x0 + n_cb) >> 2; ++x) intra_mode_[static_cast<uint64_t>(y) * w4_ + x] = 1;
     const int h2 = n_cb >> 1, q = n_cb >> 2;
