@@ -779,7 +779,7 @@ int main() {
   for (const char* name : streams)
     if (!getenv("ONLY") || !strcmp(getenv("ONLY"), name)) compare_stream(name);
   if (!getenv("ONLY")) {
-    compare_stream("slices", 700, 2);   // (a batch holds the state and one slice or two)
+    compare_stream("slices", 520, 2);   // (a batch holds the state and one slice)
     test_lease_and_config();
     test_hang();
     test_damaged_streams();
