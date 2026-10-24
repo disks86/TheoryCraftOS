@@ -53,8 +53,9 @@ class MmioVcnRegisters final : public IVcnRegisters {
 // wait is in the order the driver makes it; the register numbers are generated from AMD's own headers (see AmdVcn1Registers.inc).
 //
 // What this is NOT: nothing here finds out where in memory the engine may be given a block, what the memory controller's base address is, or the GPU's
-// address configuration - the caller supplies those, and a wrong address makes the engine's DMA hit whatever is there. It does not load firmware through
-// the PSP (the driver's default on Raven), program the JPEG ring, or decode anything. Nothing in the OS calls it yet; see Memory and Config.
+// address configuration - the caller supplies those (AmdRavenMemory reads them), and a wrong address makes the engine's DMA hit whatever is there. It does not load
+// firmware through the PSP (the driver's default on Raven), program the JPEG ring, or decode anything: the decode ring it programs is used by AmdVcn1Ring, and
+// AmdVcnVideoEngine starts it at boot (see Memory and Config).
 class AmdVcn1 {
  public:
   // The microcode is followed by the engine's stack and context windows and one page of data shared with the firmware; the rings are three more pages.

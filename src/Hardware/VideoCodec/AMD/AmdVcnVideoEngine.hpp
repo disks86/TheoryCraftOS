@@ -22,6 +22,10 @@
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/AMD/AmdRavenMemory.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcn1Ring.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnWorkMemory.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Utility/FixedString.hpp"
@@ -29,10 +33,11 @@
 
 namespace hardware {
 
-// AMD's Video Core Next (VCN, earlier UVD/VCE) engine: the video decode/encode block that comes with the GPU (PCI vendor 0x1002). The sessions
-// still run on the CPU, through the software codecs, until a native driver for the engine exists - this class
-// is where it will go, and what it reports now is that the engine is there (info().hardware_engine) and not used
-// (info().accelerated is false). H.264, H.265, VP9 and AV1 will be served here once the engine is driven.
+// AMD's Video Core Next (VCN, earlier UVD/VCE) engine: the video decode/encode block that comes with the GPU (PCI vendor 0x1002). On a VCN 1.0 APU (Ryzen
+// 2000/3000 "Raven") the engine is started with microcode from /firmware, and H.264 sessions run on it - once a self-test (AmdVcnSelfTest: a stream this OS
+// encodes, decoded by the engine and by the CPU, which must agree byte for byte) has passed on the machine. Everything else - other VCN generations, other codecs,
+// encoding, and any session while the engine is not up or failed its test - runs on the CPU through the software codecs, which is what info().accelerated
+// says (false: the device as a whole is not accelerated; info().accelerated_decode_codecs lists what the engine really does).
 class AmdVcnVideoEngine final : public SoftwareVideoCodec {
  public:
   static constexpr uint16_t kPciVendor = 0x1002;
@@ -107,6 +112,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     if (!firmware_.loaded()) { plan_text_.append("no firmware"); return false; }
     if (registers_.length() < kAmdRavenRegisterBytes) { plan_text_.append("no access to the registers of the card"); return false; }
     if (!environment.mapper) { plan_text_.append("no way to map memory"); return false; }
+    mapper_ = environment.mapper;
     MmioVcnRegisters registers(registers_);
     plan_ = amd_plan_vcn1_memory(amd_read_raven_memory_map(registers), device_id_, revision_, AmdVcn1::block_bytes(firmware_), environment.framebuffer_base,
                                  environment.framebuffer_bytes);
@@ -162,14 +168,19 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
       refresh_summary();
       return false;
     }
-    return start_planned_engine(clock) == AmdVcn1::Status::Ok;
+    if (start_planned_engine(clock) != AmdVcn1::Status::Ok) return false;
+    if (!mapper_ || plan_.work_bytes == 0) return true;   // up, idle: no memory to decode in
+    return enable_decode(*vcn_registers_, clock, memory_.rings.subregion(0, AmdVcn1::kRingBytes), *mapper_, plan_.work_gpu_address, plan_.work_physical, plan_.work_bytes);
   }
 
-  // The engine is put back to sleep when the device is shut down.
+  // The engine is put back to sleep when the device is shut down. Every session made by create_decoder() must be closed first.
   void shutdown() override { stop_engine(); }
 
   // Puts the engine back to sleep. Safe when it was never started.
   void stop_engine() {
+    decode_ready_ = false;
+    info_.accelerated_decode_codecs = 0;
+    ring_.reset();
     if (vcn1_) {
       vcn1_->stop();
       vcn1_.reset();
@@ -179,6 +190,77 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     }
   }
   bool engine_running() const { return vcn1_ != nullptr; }
+
+  // Brings up decoding on a running engine: the work memory (video memory past the engine's block, `work_bytes` of it at GPU address `work_gpu` and CPU address
+  // `work_physical`, mapped through `mapper`), the decode ring (the page AmdVcn1 programmed), and the self-test. True when the test passed and H.264 sessions now run
+  // on the engine. On any failure the engine is stopped again and the sessions stay on the CPU; firmware_status() says why. start_hardware() does this with the plan.
+  bool enable_decode(IVcnRegisters& registers, const IClock& clock, const MmioRegion& decode_ring, IRegisterMapper& mapper, uint64_t work_gpu, uint64_t work_physical,
+                     uint64_t work_bytes) {
+    decode_ready_ = false;
+    info_.accelerated_decode_codecs = 0;
+    ring_.reset();
+    const char* why = nullptr;
+    bool tested = false;   // the self-test ran and failed (as opposed to the decode path not being set up)
+    AmdVcnWorkMemory::Piece ib, fence;
+    if (!work_.configure(&mapper, work_gpu, work_physical, work_bytes)) {
+      why = "no room in video memory for decoding";
+    } else if (!work_.allocate(AmdVcn1Ring::kIndirectBufferBytes, AmdVcnWorkMemory::kPage, &ib) ||
+               !work_.allocate(AmdVcn1Ring::kFenceBytes, AmdVcnWorkMemory::kPage, &fence)) {
+      why = "the decode buffers could not be mapped";
+    } else {
+      work_.keep();
+      AmdVcn1Ring::Memory ring_memory;
+      ring_memory.ib_gpu_address = ib.gpu_address;
+      ring_memory.ib = ib.cpu;
+      ring_memory.fence_gpu_address = fence.gpu_address;
+      ring_memory.fence = fence.cpu;
+      ring_memory.ring = decode_ring;
+      ring_ = UniquePointer<AmdVcn1Ring>::make(allocator_, registers, clock, ring_memory);
+      if (!ring_) {
+        why = "out of memory";
+      } else {
+        decode_engine_.ring = ring_.get();
+        decode_engine_.memory = &work_;
+        decode_engine_.stream_handle = 1;
+        const AmdVcnSelfTest::Result result = AmdVcnSelfTest::run(allocator_, decode_engine_);
+        if (result != AmdVcnSelfTest::Result::Passed) {
+          why = AmdVcnSelfTest::result_name(result);
+          tested = true;
+        }
+      }
+    }
+    if (why) {
+      // An engine that cannot be trusted to decode is not left running.
+      decode_text_.assign(tested ? "H.264 self-test failed (" : "decoding not enabled (");
+      decode_text_.append(why);
+      decode_text_.append("); engine stopped");
+      stop_engine();
+      engine_note_ = decode_text_.c_str();
+      rebuild_firmware_text();
+      refresh_summary();
+      return false;
+    }
+    decode_ready_ = true;
+    info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264);
+    engine_note_ = "engine started; H.264 decode runs on it (self-test passed)";
+    rebuild_firmware_text();
+    refresh_summary();
+    return true;
+  }
+  bool decode_ready() const { return decode_ready_; }
+  // What became of the engine, in words (also part of firmware_status() once the firmware is loaded).
+  const char* engine_note() const { return engine_note_; }
+
+  // H.264 goes to the engine when it passed its test and is free; anything else (and an H.264 stream the engine will not take) goes to the CPU.
+  UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::H264 && decode_ready_ && ring_ && !ring_->wedged()) {
+      AmdVcnAvcDecoder::Engine engine = decode_engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdVcnAvcDecoder> session = UniquePointer<AmdVcnAvcDecoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
+    return SoftwareVideoCodec::create_decoder(config);
+  }
   const AmdVcnFirmware& firmware() const { return firmware_; }
   AmdFirmwareStatus firmware_state() const { return firmware_state_; }
 
@@ -321,6 +403,13 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   AmdVcn1::Memory memory_;
   bool planned_ = false;
   FixedString<255> plan_text_;
+  IRegisterMapper* mapper_ = nullptr;
+  AmdVcnWorkMemory work_;
+  UniquePointer<AmdVcn1Ring> ring_;
+  AmdVcnAvcDecoder::Engine decode_engine_;
+  bool decode_ready_ = false;
+  uint32_t next_stream_handle_ = 1;
+  FixedString<200> decode_text_;
   MmioRegion registers_;
   uint64_t memory_bar_ = 0;
   PciAddress address_{};

@@ -67,7 +67,12 @@ bool H264StreamParser::configure(ConstByteView avcc) {
       pos += 2;
       if (len > avcc.size() - pos) return false;
       List<H264Slice> none(allocator_);
-      if (!parse(avcc.subview(pos, len), &none)) return false;  // a parameter set: stored, no slices
+      // A parameter set in an avcC record is a NAL unit behind its own two-byte length, whatever length size the stream's NAL units use.
+      const int stream_length_size = nal_length_size_;
+      nal_length_size_ = 2;
+      const bool parsed = parse(avcc.subview(pos - 2, len + 2), &none);   // a parameter set: stored, no slices
+      nal_length_size_ = stream_length_size;
+      if (!parsed) return false;
       pos += len;
     }
   }
