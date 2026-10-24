@@ -83,7 +83,7 @@ bool size_ok(uint32_t width, uint32_t height) {
 // The header, the indexes and the decode message, the same for every codec; `codec_message_id` and `codec_bytes` name the codec's own message that follows.
 bool build_common_decode(ByteView out, uint32_t total, uint32_t stream_handle, uint32_t feedback_number, uint32_t stream_type, uint32_t codec_message_id, uint32_t codec_bytes,
                          uint32_t width, uint32_t height, const DecodeBuffers& b) {
-  if (out.size() < total || !size_ok(width, height)) return false;
+  if (out.size() < total || width == 0 || height == 0 || width > kMaxWidth || height > kMaxHeight) return false;
   if (b.dpb_bytes > UINT32_MAX || b.context_bytes > UINT32_MAX || b.target.bytes > UINT32_MAX || b.bitstream_bytes > UINT32_MAX - 127) return false;
   Image m(out);
   m.zero(0, total);
@@ -248,7 +248,7 @@ uint64_t bitstream_buffer_bytes(uint32_t width, uint32_t height) {
 
 bool build_avc_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const AvcPictureState& p, const DecodeBuffers& b) {
   const uint32_t total = decode_message_bytes();
-  if (!build_common_decode(out, total, stream_handle, feedback_number, kStreamTypeH264Perf, kMessageAvc, kAvc_sizeof, p.width, p.height, b)) return false;
+  if (!size_ok(p.width, p.height) || !build_common_decode(out, total, stream_handle, feedback_number, kStreamTypeH264Perf, kMessageAvc, kAvc_sizeof, p.width, p.height, b)) return false;
   Image m(out);
   const uint32_t a = kAvcOffset;
   m.u32(a + kAvc_profile, p.profile);
@@ -366,7 +366,7 @@ bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fe
   if (sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 || sps.width <= 0 || sps.height <= 0) return false;
   const uint32_t width = static_cast<uint32_t>(sps.width), height = static_cast<uint32_t>(sps.height);
   const uint32_t total = hevc_decode_message_bytes();
-  if (!build_common_decode(out, total, stream_handle, feedback_number, kStreamTypeH265, kMessageHevc, kHevc_sizeof, width, height, b)) return false;
+  if (!size_ok(width, height) || !build_common_decode(out, total, stream_handle, feedback_number, kStreamTypeH265, kMessageHevc, kHevc_sizeof, width, height, b)) return false;
   Image m(out);
   const uint32_t h = kAvcOffset;
   auto bit = [](bool v, uint32_t n) { return v ? 1u << n : 0u; };
@@ -451,6 +451,230 @@ bool prepare_hevc_feedback_and_tables(ByteView buffer, const h265::Sps& sps, con
   m.u32(kFeedbackOffset + kFeedback_num_buffers, 0);
   m.zero(kItTableOffset, kItTableBytes);
   if (sps.scaling_list_enabled) put_scaling_lists(&m, kItTableOffset, effective_scaling(sps, pps));
+  return true;
+}
+
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnAv1Context.inc"
+
+uint32_t restoration_type_for_engine(av1::RestorationType type) {
+  switch (type) {
+    case av1::RESTORATION_WIENER: return 1;
+    case av1::RESTORATION_SGRPROJ: return 2;
+    case av1::RESTORATION_SWITCHABLE: return 3;
+    default: return 0;
+  }
+}
+
+// frame_header_flags (RDECODE_FRAME_HDR_INFO_AV1_*): one bit per syntax element, at the positions Mesa defines.
+uint32_t av1_flags(const av1::SequenceHeader& seq, const av1::FrameHeader& hdr) {
+  uint32_t f = 0;
+  auto set = [&f](bool v, uint32_t bit) { if (v) f |= 1u << bit; };
+  set(hdr.show_frame, 0);
+  set(hdr.disable_cdf_update, 1);
+  set(hdr.refresh_context, 2);
+  set(hdr.frame_type == av1::FRAME_TYPE_INTRA, 3);
+  set(hdr.allow_intrabc, 4);
+  set(hdr.hp, 5);
+  set(seq.monochrome, 6);
+  set(hdr.skip_mode_enabled, 7);
+  set(hdr.quant.qm, 8);
+  set(seq.filter_intra, 9);
+  set(seq.intra_edge_filter, 10);
+  set(seq.inter_intra, 11);
+  set(seq.masked_compound, 12);
+  set(hdr.warp_motion, 13);
+  set(seq.dual_filter, 14);
+  set(seq.order_hint, 15);
+  set(seq.jnt_comp, 16);
+  set(hdr.use_ref_frame_mvs, 17);
+  set(hdr.allow_screen_content_tools, 18);
+  set(hdr.force_integer_mv, 19);
+  set(hdr.loopfilter.mode_ref_delta_enabled, 20);
+  set(hdr.loopfilter.mode_ref_delta_update, 21);
+  set(hdr.delta.q.present, 22);
+  set(hdr.delta.lf.present, 23);
+  set(hdr.reduced_txtp_set, 24);
+  set(hdr.segmentation.enabled, 25);
+  set(hdr.segmentation.update_map, 26);
+  set(hdr.segmentation.temporal, 27);
+  set(hdr.delta.lf.multi, 28);
+  set(hdr.switchable_motion_mode, 29);   // (what Mesa calls is_motion_mode_switchable)
+  set(hdr.refresh_frame_flags == 0, 30);
+  set(!seq.ref_frame_mvs, 31);
+  return f;
+}
+
+// The engine's segmentation feature data: eight features per segment, in the order of the syntax, and a mask of the ones in use. (The CPU decoder's header keeps the
+// values, not which features were switched on: a value that is not zero, a reference, a skip or a global motion flag count as on.)
+void av1_segment_features(const av1::FrameHeader& hdr, int16_t data[8][8], uint8_t mask[8]) {
+  for (int i = 0; i < 8; ++i) {
+    const av1::SegmentationData& d = hdr.segmentation.seg_data.d[i];
+    const int16_t values[8] = {d.delta_q, d.delta_lf_y_v, d.delta_lf_y_h, d.delta_lf_u, d.delta_lf_v, static_cast<int16_t>(d.ref < 0 ? 0 : d.ref), d.skip, d.globalmv};
+    mask[i] = 0;
+    for (int j = 0; j < 8; ++j) {
+      data[i][j] = values[j];
+      const bool on = j < 5 ? values[j] != 0 : j == 5 ? d.ref >= 0 : values[j] != 0;
+      if (on) mask[i] = static_cast<uint8_t>(mask[i] | (1u << j));
+    }
+  }
+}
+}  // namespace
+
+uint32_t av1_decode_message_bytes() { return kAvcOffset + kAv1_sizeof; }
+uint32_t av1_message_buffer_bytes() { return kItTableOffset + kAv1SegmentFg_sizeof; }
+uint32_t av1_context_run_count() { return kAv1ContextRunCount; }
+uint64_t av1_context_bytes() { return uint64_t{4} * kAv1ContextStride; }
+
+bool av1_context_run(uint32_t index, uint32_t* offset, ConstByteView* bytes) {
+  if (index >= kAv1ContextRunCount) return false;
+  uint64_t start = 0;
+  for (uint32_t i = 0; i < index; ++i) start += kAv1ContextRuns[i][1];
+  *offset = kAv1ContextRuns[index][0];
+  *bytes = ConstByteView(kAv1ContextData).subview(start, kAv1ContextRuns[index][1]);
+  return true;
+}
+
+Av1BufferSizes av1_buffer_sizes(uint32_t max_width, uint32_t max_height) {
+  Av1BufferSizes sizes;
+  if (max_width == 0 || max_height == 0 || max_width > kMaxWidth || max_height > kMaxHeight) return sizes;
+  // Mesa's context buffer: the entropy contexts (nine for the reference slots, four initial ones), the segment and loop-filter line buffers of the engine for 8k wide
+  // pictures, with 64x64 or 128x128 superblocks (the larger of each kind), doubled; none of it depends on the picture's size.
+  const uint64_t hw_context = align_up(kAv1HwFrameContextBytes, 2048);
+  const uint64_t sdb_pitch_64 = align_up(32 * 68, 256), sdb_pitch_128 = align_up(32 * 34, 256);
+  auto bigger = [](uint64_t a, uint64_t b) { return a > b ? a : b; };
+  uint64_t context = (9 + 4) * hw_context + uint64_t{9} * 64 * 34 * 512 + uint64_t{9} * 64 * 34 * 256 * 5;
+  context += (bigger(sdb_pitch_64 * (1728 / 32), sdb_pitch_128 * (3008 / 32)) + bigger(sdb_pitch_64 * (3232 / 32), sdb_pitch_128 * (6208 / 32)) +
+              bigger(sdb_pitch_64 * (1312 / 32), sdb_pitch_128 * (2336 / 32)) + bigger(sdb_pitch_64 * (384 / 32), sdb_pitch_128 * (640 / 32))) * 2 + 68 * 512;
+  sizes.context = context;
+  sizes.references = kAv1References;
+  // (Mesa: 8192 * 4320 * 3 / 2 * references * 3 / 2, the last factor for 10-bit pictures.)
+  sizes.dpb = align_up(max_width, 64) * align_up(max_height, 64) * 3 / 2 * kAv1References * 3 / 2;
+  return sizes;
+}
+
+bool build_av1_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const av1::OffloadFrame& frame, const Av1Slots& slots, const DecodeBuffers& b) {
+  if (!frame.seq || !frame.hdr) return false;
+  const av1::SequenceHeader& seq = *frame.seq;
+  const av1::FrameHeader& hdr = *frame.hdr;
+  if (seq.hbd != 0 || (seq.layout != av1::PIXEL_LAYOUT_I420 && seq.layout != av1::PIXEL_LAYOUT_I400)) return false;
+  if (hdr.film_grain.present || hdr.super_res.enabled || hdr.width[0] != hdr.width[1] || hdr.width[0] <= 0 || hdr.height <= 0) return false;
+  if (frame.tiles.size() > 256 || frame.tiles.size() < uint64_t{hdr.tiling.cols} * hdr.tiling.rows) return false;
+  const uint32_t width = static_cast<uint32_t>(hdr.width[0]), height = static_cast<uint32_t>(hdr.height);
+  const uint32_t total = av1_decode_message_bytes();
+  if (!build_common_decode(out, total, stream_handle, feedback_number, kStreamTypeAv1, kMessageAv1, kAv1_sizeof, width, height, b)) return false;
+  Image m(out);
+  // The decode message's picture fields that differ from H.264/H.265: the picture buffer is 64 aligned and the chroma plane has its own pitch.
+  m.u32(kDecodeOffset + kDecode_db_pitch, static_cast<uint32_t>(align_up(width, 64)));
+  m.u32(kDecodeOffset + kDecode_db_aligned_height, static_cast<uint32_t>(align_up(height, 64)));
+  m.u32(kDecodeOffset + kDecode_db_pitch_uv, b.target.chroma_pitch);
+  const uint32_t a = kAvcOffset;
+  m.u32(a + kAv1_frame_header_flags, av1_flags(seq, hdr));
+  m.u32(a + kAv1_current_frame_id, hdr.frame_id);
+  m.u32(a + kAv1_frame_offset, hdr.frame_offset);
+  m.u8(a + kAv1_profile, seq.profile);
+  m.u8(a + kAv1_is_annexb, 0);
+  m.u8(a + kAv1_frame_type, static_cast<uint8_t>(hdr.frame_type));
+  m.u8(a + kAv1_primary_ref_frame, hdr.primary_ref_frame);
+  m.u8(a + kAv1_curr_pic_idx, slots.current);
+  m.u8(a + kAv1_sb_size, seq.sb128);
+  m.u8(a + kAv1_interp_filter, static_cast<uint8_t>(hdr.subpel_filter_mode));
+  for (uint32_t i = 0; i < 2; ++i) m.u8(a + kAv1_filter_level + i, hdr.loopfilter.level_y[i]);
+  m.u8(a + kAv1_filter_level_u, hdr.loopfilter.level_u);
+  m.u8(a + kAv1_filter_level_v, hdr.loopfilter.level_v);
+  m.u8(a + kAv1_sharpness_level, hdr.loopfilter.sharpness);
+  for (uint32_t i = 0; i < 8; ++i) m.u8(a + kAv1_ref_deltas + i, static_cast<uint8_t>(hdr.loopfilter.mode_ref_deltas.ref_delta[i]));
+  for (uint32_t i = 0; i < 2; ++i) m.u8(a + kAv1_mode_deltas + i, static_cast<uint8_t>(hdr.loopfilter.mode_ref_deltas.mode_delta[i]));
+  m.u8(a + kAv1_base_qindex, hdr.quant.yac);
+  m.u8(a + kAv1_y_dc_delta_q, static_cast<uint8_t>(hdr.quant.ydc_delta));
+  m.u8(a + kAv1_u_dc_delta_q, static_cast<uint8_t>(hdr.quant.udc_delta));
+  m.u8(a + kAv1_v_dc_delta_q, static_cast<uint8_t>(hdr.quant.vdc_delta));
+  m.u8(a + kAv1_u_ac_delta_q, static_cast<uint8_t>(hdr.quant.uac_delta));
+  m.u8(a + kAv1_v_ac_delta_q, static_cast<uint8_t>(hdr.quant.vac_delta));
+  // The quantizer matrix levels carry 0xF0 in their upper half (Mesa); 15 means "none".
+  m.u8(a + kAv1_qm_y, static_cast<uint8_t>((hdr.quant.qm ? hdr.quant.qm_y : 15) | 0xF0));
+  m.u8(a + kAv1_qm_u, static_cast<uint8_t>((hdr.quant.qm ? hdr.quant.qm_u : 15) | 0xF0));
+  m.u8(a + kAv1_qm_v, static_cast<uint8_t>((hdr.quant.qm ? hdr.quant.qm_v : 15) | 0xF0));
+  m.u8(a + kAv1_delta_q_res, static_cast<uint8_t>(1u << hdr.delta.q.res_log2));
+  m.u8(a + kAv1_delta_lf_res, static_cast<uint8_t>(1u << hdr.delta.lf.res_log2));
+  m.u8(a + kAv1_tile_cols, hdr.tiling.cols);
+  m.u8(a + kAv1_tile_rows, hdr.tiling.rows);
+  m.u8(a + kAv1_tx_mode, static_cast<uint8_t>(hdr.txfm_mode));
+  m.u8(a + kAv1_reference_mode, hdr.switchable_comp_refs ? 2 : 0);
+  m.u8(a + kAv1_chroma_format, seq.monochrome ? 0 : 1);
+  m.u32(a + kAv1_tile_size_bytes, 0xFF);
+  m.u32(a + kAv1_context_update_tile_id, hdr.tiling.update);
+  for (uint32_t i = 0; i < 65; ++i) {
+    m.u32(a + kAv1_tile_col_start_sb + i * 4, i <= hdr.tiling.cols ? hdr.tiling.col_start_sb[i] : 0);
+    m.u32(a + kAv1_tile_row_start_sb + i * 4, i <= hdr.tiling.rows ? hdr.tiling.row_start_sb[i] : 0);
+  }
+  m.u32(a + kAv1_max_width, static_cast<uint32_t>(seq.max_width));
+  m.u32(a + kAv1_max_height, static_cast<uint32_t>(seq.max_height));
+  m.u32(a + kAv1_width, width);
+  m.u32(a + kAv1_height, height);
+  m.u32(a + kAv1_superres_upscaled_width, static_cast<uint32_t>(hdr.width[1]));
+  m.u8(a + kAv1_superres_scale_denominator, 8);
+  m.u8(a + kAv1_order_hint_bits, seq.order_hint_n_bits);
+  for (uint32_t i = 0; i < 8; ++i) m.u8(a + kAv1_ref_frame_map + i, slots.ref_frame_map[i]);
+  for (uint32_t i = 0; i < 7; ++i) {
+    const int8_t idx = hdr.refidx[i];
+    m.u8(a + kAv1_frame_refs + i, idx >= 0 && idx < 8 ? slots.ref_frame_map[idx] : kAv1NoPicture);
+  }
+  int16_t feature_data[8][8];
+  uint8_t feature_mask[8];
+  av1_segment_features(hdr, feature_data, feature_mask);
+  for (uint32_t i = 0; i < 8; ++i) {
+    for (uint32_t j = 0; j < 8; ++j) m.i32(a + kAv1_feature_data + (i * 8 + j) * 4, feature_data[i][j]);
+    m.u8(a + kAv1_feature_mask + i, feature_mask[i]);
+  }
+  m.u8(a + kAv1_cdef_damping, hdr.cdef.damping);
+  m.u8(a + kAv1_cdef_bits, hdr.cdef.n_bits);
+  for (uint32_t i = 0; i < 8; ++i) {
+    m.u16(a + kAv1_cdef_strengths + i * 2, hdr.cdef.y_strength[i]);
+    m.u16(a + kAv1_cdef_uv_strengths + i * 2, hdr.cdef.uv_strength[i]);
+  }
+  for (uint32_t i = 0; i < 3; ++i) {
+    const av1::RestorationType type = hdr.restoration.type[i];
+    m.u8(a + kAv1_frame_restoration_type + i, static_cast<uint8_t>(restoration_type_for_engine(type)));
+    const uint32_t log2 = hdr.restoration.unit_size[i != 0];
+    m.u8(a + kAv1_log2_restoration_unit_size_minus5 + i, type != av1::RESTORATION_NONE && log2 >= 5 ? static_cast<uint8_t>(log2 - 5) : 0);
+  }
+  m.u8(a + kAv1_preskip_segid, hdr.segmentation.seg_data.preskip);
+  m.u8(a + kAv1_last_active_segid, static_cast<uint8_t>(hdr.segmentation.seg_data.last_active_segid < 0 ? 0 : hdr.segmentation.seg_data.last_active_segid));
+  uint8_t lossless = 0;
+  for (uint32_t i = 0; i < 8; ++i)
+    if (hdr.segmentation.lossless[i]) lossless = static_cast<uint8_t>(lossless | (1u << i));
+  m.u8(a + kAv1_seg_lossless_flag, lossless);
+  for (uint32_t i = 0; i < 7; ++i) {
+    const uint32_t g = a + kAv1_global_motion + (i + 1) * kAv1Warp_sizeof;
+    m.u32(g + kAv1Warp_wmtype, static_cast<uint32_t>(hdr.gmv[i].type));
+    for (uint32_t k = 0; k < 6; ++k) m.i32(g + kAv1Warp_wmmat + k * 4, hdr.gmv[i].matrix[k]);
+  }
+  uint64_t tile_offset = 0;
+  for (uint64_t i = 0; i < frame.tiles.size(); ++i) {
+    const uint64_t size = frame.tiles[i].data.size();
+    if (tile_offset > UINT32_MAX || size > UINT32_MAX - tile_offset) return false;
+    m.u32(a + kAv1_tile_info + static_cast<uint32_t>(i) * kAv1TileInfo_sizeof + kAv1TileInfo_offset, static_cast<uint32_t>(tile_offset));
+    m.u32(a + kAv1_tile_info + static_cast<uint32_t>(i) * kAv1TileInfo_sizeof + kAv1TileInfo_size, static_cast<uint32_t>(size));
+    tile_offset += size;
+  }
+  return true;
+}
+
+bool prepare_av1_feedback_and_tables(ByteView buffer, const av1::FrameHeader& hdr) {
+  if (buffer.size() < av1_message_buffer_bytes()) return false;
+  Image m(buffer);
+  m.zero(kFeedbackOffset, kFeedbackBytes);
+  m.u32(kFeedbackOffset + kFeedback_header_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_total_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_num_buffers, 0);
+  m.zero(kItTableOffset, kAv1SegmentFg_sizeof);
+  int16_t data[8][8];
+  uint8_t mask[8];
+  av1_segment_features(hdr, data, mask);
+  for (uint32_t i = 0; i < 8; ++i)
+    for (uint32_t j = 0; j < 8; ++j) m.u16(kItTableOffset + (i * 8 + j) * 2, static_cast<uint16_t>(data[i][j]));
+  for (uint32_t i = 0; i < 8; ++i) m.u8(kItTableOffset + 128 + i, mask[i]);
   return true;
 }
 

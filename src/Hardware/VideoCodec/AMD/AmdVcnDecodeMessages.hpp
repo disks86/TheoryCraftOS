@@ -20,6 +20,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/VideoCodec/Software/H264Core.hpp"
+#include "Hardware/VideoCodec/Software/Av1Core.hpp"
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -40,12 +41,13 @@ constexpr uint32_t kCmdDecodingTargetBuffer = 0x002;
 constexpr uint32_t kCmdFeedbackBuffer = 0x003;
 constexpr uint32_t kCmdSessionContextBuffer = 0x005;
 constexpr uint32_t kCmdBitstreamBuffer = 0x100;
+constexpr uint32_t kCmdProbTableBuffer = 0x004;      // (the AV1 segmentation and film grain table, in the place the H.264/H.265 scaling table has)
 constexpr uint32_t kCmdItScalingTableBuffer = 0x204;
 constexpr uint32_t kCmdContextBuffer = 0x206;
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;       // header msg_type
-constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13;   // index message_id
-constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;
+constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13, kMessageAv1 = 0x11;   // index message_id
+constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10, kStreamTypeAv1 = 0x13;
 constexpr uint32_t kProfileBaseline = 0, kProfileMain = 1, kProfileHigh = 2;
 constexpr uint32_t kArrayModeLinear = 0;
 
@@ -154,6 +156,39 @@ HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_
 bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const h265::OffloadPicture& picture, const DecodeBuffers& buffers);
 // The feedback header and the scaling table (all four block sizes; kItTableBytes) of an H.265 picture.
 bool prepare_hevc_feedback_and_tables(ByteView message_buffer, const h265::Sps& sps, const h265::Pps& pps);
+
+// AV1 ---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+constexpr uint32_t kAv1References = 9;   // the pictures the buffers are sized for: eight reference slots and the one being decoded
+constexpr uint32_t kAv1NoPicture = 0x7F;
+
+struct Av1BufferSizes {
+  uint64_t context = 0;   // the firmware's work memory (hw_ctxt_size), which starts with four initial entropy contexts
+  uint64_t dpb = 0;
+  uint32_t references = 0;
+};
+// Sizes for a stream whose frames are at most `max_width` x `max_height` luma samples (the sequence header's maximum). Mesa sizes the picture buffer for 8192 x 4320
+// whatever the stream is; here it follows the stream's own maximum. 0 sizes when the picture is too big.
+Av1BufferSizes av1_buffer_sizes(uint32_t max_width, uint32_t max_height);
+// The picture buffer slots the engine is told about: the one this frame is decoded into and, for each of the eight reference slots of the stream, the engine slot of
+// the frame it holds (kAv1NoPicture for none).
+struct Av1Slots {
+  uint8_t current = 0;
+  uint8_t ref_frame_map[8] = {kAv1NoPicture, kAv1NoPicture, kAv1NoPicture, kAv1NoPicture, kAv1NoPicture, kAv1NoPicture, kAv1NoPicture, kAv1NoPicture};
+};
+uint32_t av1_decode_message_bytes();
+// Builds the decode message (header, indexes, decode message, AV1 message) of one frame. Only 8-bit 4:2:0 or monochrome frames without film grain or
+// super-resolution (the engine's output of those is not compared with the CPU's here): false otherwise, and when `out` is too small. The tile data goes into the
+// bitstream buffer back to back, tile after tile, and the message names where each tile starts and how long it is (`DecodeBuffers::bitstream_bytes` is their sum).
+bool build_av1_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const av1::OffloadFrame& frame, const Av1Slots& slots, const DecodeBuffers& buffers);
+// Bytes a message buffer must have for AV1: the message page, the feedback area and the segmentation / film grain table behind them.
+uint32_t av1_message_buffer_bytes();
+// The feedback header, and the segmentation table (feature data and mask, which the engine reads from the table buffer) of the frame.
+bool prepare_av1_feedback_and_tables(ByteView message_buffer, const av1::FrameHeader& header);
+// The four initial entropy contexts that start the context buffer, as runs of non-zero bytes (everything between is zero). `index` < av1_context_run_count().
+uint32_t av1_context_run_count();
+bool av1_context_run(uint32_t index, uint32_t* offset, ConstByteView* bytes);
+uint64_t av1_context_bytes();   // the four contexts, with their padding
 
 // What the firmware wrote into the feedback area after a picture.
 struct Feedback {

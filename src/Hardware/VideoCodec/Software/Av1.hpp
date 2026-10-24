@@ -26,6 +26,8 @@ namespace hardware {
 
 namespace av1 {
 class Core;
+class IOffload;
+class IFrameObserver;
 }
 
 // An AV1 decoder on the CPU: the Main, High and Professional profiles (8-, 10- and 12-bit; 4:0:0, 4:2:0, 4:2:2 and 4:4:4), every coding tool
@@ -54,6 +56,11 @@ class Av1Decoder {
   // The size of the pictures; zero until the first frame was decoded.
   VideoFormat output_format() const { return format_; }
   bool ready() const { return pending_; }
+  // Hands the pixel work to something else (a hardware engine, see Av1Core.hpp): this decoder still parses every OBU and keeps the reference slots and the output, but
+  // the frames `offload` accepts are decoded by it. Set before decoding.
+  void set_offload(av1::IOffload* offload);
+  // For diagnostics and tests: the observer is told of every frame this decoder decodes itself (see Av1Core.hpp).
+  void set_frame_observer(av1::IFrameObserver* observer);
 
  private:
   bool convert();

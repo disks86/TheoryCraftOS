@@ -320,6 +320,41 @@ void init_quant_tables(const SequenceHeader& seq_hdr, const FrameHeader& frame_h
 
 // ---- the core ---------------------------------------------------------------------------------------------------------------------
 
+// A frame handed to another decoder (a hardware engine) instead of being decoded here: the headers, the tile data and the picture to fill. The Core still parses
+// every OBU, validates the headers and keeps the reference slots and the output; what the offload keeps is what the engine needs per slot.
+struct OffloadFrame {
+  const SequenceHeader* seq = nullptr;
+  const FrameHeader* hdr = nullptr;
+  ArrayView<const TileData> tiles;  // by tile number (row * cols + col)
+  PixelView plane[3];               // the picture to fill: hdr->width[1] x hdr->height luma samples (chroma as the layout says)
+  int width = 0, height = 0;
+};
+class IOffload {
+ public:
+  // Whether this frame (and so, in practice, its sequence) is one the offload can decode. A frame it refuses is decoded here.
+  virtual bool accepts(const SequenceHeader& seq, const FrameHeader& hdr) = 0;
+  // Decodes the frame into the planes and updates the offload's own reference slots as hdr->refresh_frame_flags says. False: the planes are left grey.
+  virtual bool decode_frame(const OffloadFrame& frame) = 0;
+  // A show_existing_frame of slot `idx`; with `refresh_all` (a key frame) every slot now holds that frame.
+  virtual void show_existing(unsigned idx, bool refresh_all) = 0;
+  // A new sequence began: every slot is empty.
+  virtual void new_sequence() = 0;
+
+ protected:
+  constexpr IOffload() = default;
+  ~IOffload() = default;
+};
+
+// For diagnostics and tests: told of every frame the Core decodes itself (hidden frames included), with its headers, its tiles and the picture as it is held.
+class IFrameObserver {
+ public:
+  virtual void frame_decoded(const SequenceHeader& seq, const FrameHeader& hdr, ArrayView<const TileData> tiles, const Picture& picture) = 0;
+
+ protected:
+  constexpr IFrameObserver() = default;
+  ~IFrameObserver() = default;
+};
+
 class Core {
  public:
   explicit Core(allocators::IAllocator& allocator);
@@ -342,6 +377,9 @@ class Core {
   // Valid until the next call of decode_frame / show_existing_frame / reset.
   const Picture* output();
   void clear_output() { out_.reset(); }
+  // Frames are decoded by `offload` from then on, where it accepts them (nullptr: here). Set before the first frame.
+  void set_offload(IOffload* offload) { offload_ = offload; }
+  void set_frame_observer(IFrameObserver* observer) { observer_ = observer; }
 
   // ---- reconstruction (Av1Recon.cpp). dav1d's bd_fn.
   // Intra block (dav1d_recon_b_intra): prediction and residual of luma and chroma, reads the coefficients.
@@ -377,6 +415,7 @@ class Core {
   bool decode_tiles(const ObuParser& parser);
   bool post_filter();
   bool apply_film_grain_to_output();
+  bool decode_frame_offloaded();
   void finish_frame(bool ok);
   void drop_slot(unsigned i);
 
@@ -387,6 +426,8 @@ class Core {
   UniquePointer<TileState> ts_;
   RefSlot refs_[NUM_REF_FRAMES];
   WedgeMasks wedges_;
+  IOffload* offload_ = nullptr;
+  IFrameObserver* observer_ = nullptr;
   SharedPointer<Picture> out_;
   SharedPointer<Picture> grain_;  // the output with film grain applied
   bool grain_valid_ = false;

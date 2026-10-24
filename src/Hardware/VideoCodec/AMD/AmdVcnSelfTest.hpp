@@ -19,6 +19,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnAv1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnHevcDecoder.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -56,6 +57,10 @@ class AmdVcnSelfTest {
   // the engine, and the pictures must be byte for byte the same. What passing proves beyond the above: the reference picture set and slot bookkeeping of the H.265
   // message, 32x32 coding trees with the deblocking filter and SAO the encoder chose, bi-prediction. Not: scaling lists, tiles, slices, weighted prediction, other sizes.
   static Result run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine);
+  // The same for AV1: a libaom stream (64 x 64, ten temporal units with hidden frames and show_existing_frame; AmdVcnSelfTestAv1Stream.inc). What passing proves beyond
+  // the above: the reference slot bookkeeping of the AV1 message (which engine picture each reference slot holds, across hidden frames and shown-again ones), the initial
+  // entropy contexts, the tile table. Not: tiles, film grain, super-resolution, 10-bit, other sizes.
+  static Result run_av1(allocators::IAllocator& allocator, const AmdVcnAv1Decoder::Engine& engine);
   static const char* result_name(Result result);
 };
 

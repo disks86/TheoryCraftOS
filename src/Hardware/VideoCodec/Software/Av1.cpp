@@ -62,6 +62,16 @@ void Av1Decoder::reset() {
   keyframe_ = true;
 }
 
+void Av1Decoder::set_offload(av1::IOffload* offload) {
+  if (!core_) core_ = UniquePointer<av1::Core>::make(allocator_, allocator_);
+  if (core_) core_->set_offload(offload);
+}
+
+void Av1Decoder::set_frame_observer(av1::IFrameObserver* observer) {
+  if (!core_) core_ = UniquePointer<av1::Core>::make(allocator_, allocator_);
+  if (core_) core_->set_frame_observer(observer);
+}
+
 bool Av1Decoder::configure(ConstByteView av1c) {
   // av1C: marker and version, profile and level, flags, delay; then the configuration OBUs.
   if (av1c.size() < 4 || (av1c[0] & 0x80) == 0 || (av1c[0] & 0x7f) != 1) return false;

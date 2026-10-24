@@ -121,6 +121,7 @@ void Core::finish_frame(bool ok) {
 }
 
 void Core::new_sequence() {
+  if (offload_) offload_->new_sequence();
   for (unsigned i = 0; i < NUM_REF_FRAMES; i++) drop_slot(i);
   out_.reset();
   grain_.reset();
@@ -436,7 +437,56 @@ bool Core::post_filter() {
 
 // ---- frames ---------------------------------------------------------------------------------------------------------------------------
 
+// The frame goes to the offload: the picture is made here (all the output and the references need of it is its samples), the engine fills it.
+bool Core::decode_frame_offloaded() {
+  const SequenceHeader* seq = parser_.sequence_header();
+  const FrameHeader* hdr_in = parser_.frame_header();
+  if (!seq || !hdr_in) return false;
+  f_.seq_hdr_store = *seq;
+  f_.frame_hdr_store = *hdr_in;
+  f_.seq_hdr = &f_.seq_hdr_store;
+  f_.frame_hdr = &f_.frame_hdr_store;
+  const FrameHeader& hdr = f_.frame_hdr_store;
+  const int bpc = 8 + 2 * seq->hbd;
+  f_.sr_cur = make_picture(allocator_, seq->layout, bpc, hdr.width[1], hdr.height);
+  bool ok = static_cast<bool>(f_.sr_cur);
+  if (ok) {
+    f_.sr_cur->hdr = hdr;
+    f_.sr_cur->matrix_identity = seq->mtrx == MC_IDENTITY;
+    OffloadFrame o;
+    o.seq = &f_.seq_hdr_store;
+    o.hdr = &f_.frame_hdr_store;
+    o.tiles = parser_.tiles();
+    o.width = hdr.width[1];
+    o.height = hdr.height;
+    for (int p = 0; p < (seq->layout == PIXEL_LAYOUT_I400 ? 1 : 3); ++p) o.plane[p] = f_.sr_cur->plane(p);
+    if (!offload_->decode_frame(o)) {
+      // Damaged or failed: mid-grey, as the CPU shows what it cannot decode.
+      for (int p = 0; p < (seq->layout == PIXEL_LAYOUT_I400 ? 1 : 3); ++p)
+        for (int y = 0; y < f_.sr_cur->plane_height(p); ++y)
+          for (int x = 0; x < f_.sr_cur->plane_width(p); ++x) o.plane[p].at(x, y) = static_cast<Pixel>(1 << (bpc - 1));
+    }
+    for (unsigned i = 0; i < NUM_REF_FRAMES; i++) {
+      if (!(hdr.refresh_frame_flags & (1u << i))) continue;
+      RefSlot& slot = refs_[i];
+      slot.pic = f_.sr_cur;
+      slot.segmap.reset();   // (what the CPU decoder keeps for the next frame, which the engine keeps itself)
+      slot.mvs.reset();
+      slot.cdf.reset();
+    }
+    parser_.ref_update(hdr.refresh_frame_flags, hdr);
+    if (hdr.show_frame) {
+      out_ = f_.sr_cur;
+      grain_valid_ = false;
+    }
+  }
+  finish_frame(ok);
+  return ok;
+}
+
 bool Core::decode_frame() {
+  if (offload_ && parser_.sequence_header() && parser_.frame_header() && offload_->accepts(*parser_.sequence_header(), *parser_.frame_header()))
+    return decode_frame_offloaded();
   bool ok = init_frame(parser_) && decode_tiles(parser_) && post_filter();
   const FrameHeader& hdr = f_.frame_hdr_store;
   if (ok) {
@@ -453,6 +503,7 @@ bool Core::decode_frame() {
       out_ = f_.sr_cur;
       grain_valid_ = false;
     }
+    if (observer_) observer_->frame_decoded(f_.seq_hdr_store, hdr, parser_.tiles(), *f_.sr_cur);
   } else {
     for (unsigned i = 0; i < NUM_REF_FRAMES; i++)
       if (hdr.refresh_frame_flags & (1u << i)) drop_slot(i);
@@ -463,6 +514,7 @@ bool Core::decode_frame() {
 
 bool Core::show_existing_frame(unsigned idx, bool refresh_all) {
   if (idx >= NUM_REF_FRAMES || !refs_[idx].pic) return false;
+  if (offload_) offload_->show_existing(idx, refresh_all);
   out_ = refs_[idx].pic;
   grain_valid_ = false;
   if (refresh_all) {

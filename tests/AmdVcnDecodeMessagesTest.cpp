@@ -398,6 +398,180 @@ static void test_hevc_messages() {
   for (uint32_t i = 0; i < kItTableBytes; ++i) CHECK(t[kItTableOffset + i] == 0);
 }
 
+// The AV1 messages: offsets written out by hand from rvcn_dec_message_av1_t (3576 bytes), values from a made-up frame whose fields are all distinct.
+static void test_av1_messages() {
+  CHECK(av1_decode_message_bytes() == 56 + 188 + 3576 && av1_message_buffer_bytes() == 0x1800 + 20736);
+  av1::SequenceHeader seq = {};
+  av1::FrameHeader hdr = {};
+  seq.profile = 0;
+  seq.max_width = 128;
+  seq.max_height = 96;
+  seq.layout = av1::PIXEL_LAYOUT_I420;
+  seq.sb128 = 1;
+  seq.order_hint = 1;
+  seq.order_hint_n_bits = 7;
+  seq.dual_filter = 1;
+  seq.filter_intra = 1;
+  seq.ref_frame_mvs = 1;
+  hdr.frame_type = av1::FRAME_TYPE_INTER;
+  hdr.width[0] = hdr.width[1] = 120;
+  hdr.height = 90;
+  hdr.frame_offset = 77;
+  hdr.frame_id = 5;
+  hdr.show_frame = 1;
+  hdr.refresh_context = 1;
+  hdr.hp = 1;
+  hdr.use_ref_frame_mvs = 1;
+  hdr.primary_ref_frame = 2;
+  hdr.subpel_filter_mode = av1::FILTER_8TAP_SHARP;
+  hdr.loopfilter.level_y[0] = 11;
+  hdr.loopfilter.level_y[1] = 12;
+  hdr.loopfilter.level_u = 13;
+  hdr.loopfilter.level_v = 14;
+  hdr.loopfilter.sharpness = 3;
+  hdr.loopfilter.mode_ref_deltas.ref_delta[0] = 1;
+  hdr.loopfilter.mode_ref_deltas.ref_delta[7] = -1;
+  hdr.loopfilter.mode_ref_deltas.mode_delta[1] = -2;
+  hdr.quant.yac = 100;
+  hdr.quant.ydc_delta = -1;
+  hdr.quant.udc_delta = 2;
+  hdr.quant.vdc_delta = -3;
+  hdr.quant.uac_delta = 4;
+  hdr.quant.vac_delta = -5;
+  hdr.delta.q.res_log2 = 2;
+  hdr.delta.lf.res_log2 = 1;
+  hdr.tiling.cols = 2;
+  hdr.tiling.rows = 1;
+  hdr.tiling.col_start_sb[0] = 0;
+  hdr.tiling.col_start_sb[1] = 1;
+  hdr.tiling.col_start_sb[2] = 2;
+  hdr.tiling.row_start_sb[1] = 1;
+  hdr.tiling.update = 1;
+  hdr.txfm_mode = av1::TX_SWITCHABLE;
+  hdr.switchable_comp_refs = 1;
+  hdr.refidx[0] = 3;
+  hdr.refidx[6] = 7;
+  hdr.cdef.damping = 5;
+  hdr.cdef.n_bits = 2;
+  hdr.cdef.y_strength[1] = 0x2B;
+  hdr.cdef.uv_strength[2] = 0x11;
+  hdr.restoration.type[0] = av1::RESTORATION_SGRPROJ;
+  hdr.restoration.type[1] = av1::RESTORATION_SWITCHABLE;
+  hdr.restoration.unit_size[0] = 7;
+  hdr.restoration.unit_size[1] = 6;
+  hdr.segmentation.enabled = 1;
+  for (auto& d : hdr.segmentation.seg_data.d) d.ref = -1;   // (the parser marks an unused reference feature so)
+  hdr.segmentation.seg_data.d[2].delta_q = -9;
+  hdr.segmentation.seg_data.d[2].ref = 4;
+  hdr.segmentation.seg_data.d[1].ref = -1;
+  hdr.segmentation.seg_data.preskip = 1;
+  hdr.segmentation.seg_data.last_active_segid = 2;
+  hdr.segmentation.lossless[3] = 1;
+  hdr.gmv[2].type = av1::WM_TYPE_ROT_ZOOM;
+  hdr.gmv[2].matrix[1] = 1234;
+  const uint8_t tile0[3] = {1, 2, 3}, tile1[5] = {4, 5, 6, 7, 8};
+  av1::TileData tiles[2];
+  tiles[0].data = ConstByteView(tile0);
+  tiles[1].data = ConstByteView(tile1);
+  tiles[1].tile_col = 1;
+  av1::OffloadFrame frame;
+  frame.seq = &seq;
+  frame.hdr = &hdr;
+  frame.tiles = ArrayView<const av1::TileData>(tiles, 2);
+  frame.width = 120;
+  frame.height = 90;
+  Av1Slots slots;
+  slots.current = 4;
+  for (uint32_t i = 0; i < 8; ++i) slots.ref_frame_map[i] = static_cast<uint8_t>(i == 3 ? 8 : i == 7 ? 6 : kAv1NoPicture);
+  const Av1BufferSizes sizes = av1_buffer_sizes(128, 96);
+  DecodeBuffers b;
+  b.bitstream_bytes = 8;
+  b.dpb_bytes = sizes.dpb;
+  b.context_bytes = sizes.context;
+  b.target = target_layout(120, 96);
+  std::vector<uint8_t> m(av1_decode_message_bytes(), 0xEE);
+  CHECK(build_av1_decode_message(ByteView(m.data(), m.size()), 5, 42, frame, slots, b));
+  CHECK(word(m, 0) == 40 && word(m, 4) == 244 && word(m, 8) == 2 && word(m, 12) == 1 && word(m, 16) == 5 && word(m, 20) == 42);
+  CHECK(word(m, 40) == 0x11 && word(m, 44) == 244 && word(m, 48) == 3576);
+  CHECK(word(m, 56) == 0x13 && word(m, 64) == 120 && word(m, 68) == 90 && word(m, 56 + 72) == 128 && word(m, 56 + 76) == 128 && word(m, 56 + 164) == b.target.chroma_pitch);
+  const uint32_t a = 244;
+  // flags: show_frame 0, refresh_context 2, hp 5, filter_intra 9, dual_filter 14, order_hint 15, use_ref_frame_mvs 17, segmentation 25
+  CHECK(word(m, a) == ((1u << 0) | (1u << 2) | (1u << 5) | (1u << 9) | (1u << 14) | (1u << 15) | (1u << 17) | (1u << 25) | (1u << 30)));   // (30: no reference slot is refreshed)
+  CHECK(word(m, a + 4) == 5 && word(m, a + 8) == 77);
+  CHECK(m[a + 12] == 0 && m[a + 13] == 0 && m[a + 14] == 1 && m[a + 15] == 2 && m[a + 16] == 4 && m[a + 17] == 1 && m[a + 18] == 2);
+  CHECK(m[a + 19] == 11 && m[a + 20] == 12 && m[a + 21] == 13 && m[a + 22] == 14 && m[a + 23] == 3);
+  CHECK(int8_t(m[a + 24]) == 1 && int8_t(m[a + 31]) == -1 && int8_t(m[a + 33]) == -2);
+  CHECK(m[a + 34] == 100 && int8_t(m[a + 35]) == -1 && int8_t(m[a + 36]) == 2 && int8_t(m[a + 37]) == -3 && int8_t(m[a + 38]) == 4 && int8_t(m[a + 39]) == -5);
+  CHECK(m[a + 40] == 0xFF && m[a + 41] == 0xFF && m[a + 42] == 0xFF);   // no quantizer matrix: level 15 with the 0xF0 Mesa adds
+  CHECK(m[a + 43] == 4 && m[a + 44] == 2 && m[a + 45] == 2 && m[a + 46] == 1 && m[a + 47] == 2 && m[a + 48] == 2 && m[a + 49] == 1);
+  CHECK(word(m, a + 52) == 0xFF && word(m, a + 56) == 1);
+  CHECK(word(m, a + 60) == 0 && word(m, a + 64) == 1 && word(m, a + 68) == 2 && word(m, a + 72) == 0);
+  CHECK(word(m, a + 320) == 0 && word(m, a + 324) == 1 && word(m, a + 580) == 128 && word(m, a + 584) == 96);
+  CHECK(word(m, a + 588) == 120 && word(m, a + 592) == 90 && word(m, a + 596) == 120 && m[a + 600] == 8 && m[a + 601] == 7);
+  CHECK(m[a + 602] == 0x7F && m[a + 605] == 8 && m[a + 609] == 6 && m[a + 606] == 0x7F);
+  CHECK(m[a + 644] == 8 && m[a + 650] == 6 && m[a + 645] == 0x7F);   // frame_refs[i] = ref_frame_map[refidx[i]]: refidx[0] = 3, refidx[6] = 7
+  CHECK(m[a + 658] == 0 && m[a + 659] == 0);
+  CHECK(int32_t(word(m, a + 660 + (2 * 8 + 0) * 4)) == -9 && int32_t(word(m, a + 660 + (2 * 8 + 5) * 4)) == 4);
+  CHECK(m[a + 916 + 2] == ((1u << 0) | (1u << 5)) && m[a + 916 + 1] == 0 && m[a + 916 + 3] == 0);
+  CHECK(m[a + 924] == 5 && m[a + 925] == 2 && m[a + 926 + 2] == 0x2B && m[a + 958 + 4] == 0x11);
+  CHECK(m[a + 990] == 2 && m[a + 991] == 3 && m[a + 992] == 0 && m[a + 993] == 2 && m[a + 994] == 1 && m[a + 995] == 0);   // sgrproj = 2, switchable = 3; unit sizes 2^7, 2^6
+  CHECK(m[a + 996] == 0 && m[a + 998] == 0 && m[a + 1000] == 1 && m[a + 1001] == 2 && m[a + 1002] == (1u << 3));
+  CHECK(word(m, a + 1004) == 0);   // no film grain
+  CHECK(word(m, a + 1176 + 3 * 44) == 2 && int32_t(word(m, a + 1176 + 3 * 44 + 4 + 4)) == 1234);   // global_motion[i + 1]
+  CHECK(word(m, a + 1528) == 0 && word(m, a + 1532) == 3 && word(m, a + 1536) == 3 && word(m, a + 1540) == 5 && word(m, a + 1544) == 0);
+
+  // Refused: 10 bits, film grain, super-resolution, tile tables that do not fit; too small a buffer writes nothing.
+  av1::SequenceHeader ten = seq;
+  ten.hbd = 1;
+  frame.seq = &ten;
+  CHECK(!build_av1_decode_message(ByteView(m.data(), m.size()), 5, 42, frame, slots, b));
+  frame.seq = &seq;
+  hdr.film_grain.present = 1;
+  CHECK(!build_av1_decode_message(ByteView(m.data(), m.size()), 5, 42, frame, slots, b));
+  hdr.film_grain.present = 0;
+  frame.tiles = ArrayView<const av1::TileData>(tiles, 1);
+  CHECK(!build_av1_decode_message(ByteView(m.data(), m.size()), 5, 42, frame, slots, b));   // the header says two tiles
+  frame.tiles = ArrayView<const av1::TileData>(tiles, 2);
+  for (uint32_t size : {0u, 243u, 244u, 3000u, 3819u}) {
+    std::vector<uint8_t> small(size, 0xAB);
+    CHECK(!build_av1_decode_message(ByteView(small.data(), small.size()), 5, 42, frame, slots, b));
+    for (uint8_t v : small) CHECK(v == 0xAB);
+  }
+  CHECK(build_av1_decode_message(ByteView(m.data(), m.size()), 5, 42, frame, slots, b));
+
+  // Buffer sizes (Mesa's formulas): the context does not depend on the picture, the picture buffer is nine pictures of 64 aligned size, with the 10-bit half more.
+  CHECK(sizes.references == 9 && sizes.dpb == 128ull * 128 * 3 / 2 * 9 * 3 / 2);
+  CHECK(av1_buffer_sizes(4096, 2304).context == sizes.context && sizes.context > 30000000 && sizes.context < 60000000);
+  CHECK(av1_buffer_sizes(0, 10).dpb == 0 && av1_buffer_sizes(10, 0).dpb == 0 && av1_buffer_sizes(4097, 16).dpb == 0 && av1_buffer_sizes(16, 2305).dpb == 0);
+
+  // The feedback header and the segmentation table.
+  std::vector<uint8_t> t(av1_message_buffer_bytes(), 0xEE);
+  CHECK(prepare_av1_feedback_and_tables(ByteView(t.data(), t.size()), hdr));
+  CHECK(word(t, kFeedbackOffset) == 44 && word(t, kFeedbackOffset + 4) == 44 && word(t, kFeedbackOffset + 8) == 0);
+  CHECK(t[kItTableOffset + (2 * 8 + 0) * 2] == uint8_t(-9) && t[kItTableOffset + (2 * 8 + 0) * 2 + 1] == 0xFF && t[kItTableOffset + 128 + 2] == ((1u << 0) | (1u << 5)));
+  CHECK(t[kItTableOffset + 256] == 0 && t[av1_message_buffer_bytes() - 1] == 0);   // the film grain part is clear
+  {
+    std::vector<uint8_t> small(av1_message_buffer_bytes() - 1, 0xAB);
+    CHECK(!prepare_av1_feedback_and_tables(ByteView(small.data(), small.size()), hdr));
+  }
+
+  // The initial contexts: runs of non-zero bytes, in order, inside four contexts of 22528 bytes; everything outside is zero.
+  CHECK(av1_context_bytes() == 4 * 22528 && av1_context_run_count() > 100);
+  uint64_t covered = 0, previous_end = 0;
+  for (uint32_t i = 0; i < av1_context_run_count(); ++i) {
+    uint32_t offset = 0;
+    ConstByteView bytes;
+    CHECK(av1_context_run(i, &offset, &bytes) && !bytes.empty() && offset >= previous_end && uint64_t{offset} + bytes.size() <= av1_context_bytes());
+    previous_end = uint64_t{offset} + bytes.size();
+    covered += bytes.size();
+    CHECK(bytes[0] != 0 && bytes[bytes.size() - 1] != 0);
+  }
+  CHECK(covered > 30000 && covered < av1_context_bytes());
+  uint32_t o = 0;
+  ConstByteView bytes;
+  CHECK(!av1_context_run(av1_context_run_count(), &o, &bytes));
+}
+
 int main() {
   test_create_and_destroy();
   test_buffer_sizes();
@@ -405,6 +579,7 @@ int main() {
   test_scaling_order();
   test_feedback_reader();
   test_hevc_messages();
+  test_av1_messages();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("AmdVcnDecodeMessagesTest passed\n");
   return 0;

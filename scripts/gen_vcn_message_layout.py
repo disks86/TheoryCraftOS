@@ -19,9 +19,16 @@ TYPES = [
     ('Decode', 'rvcn_dec_message_decode_t'),
     ('Avc', 'rvcn_dec_message_avc_t'),
     ('Hevc', 'rvcn_dec_message_hevc_t'),
+    ('Av1Warp', 'rvcn_dec_warped_motion_params_t'),
+    ('Av1TileInfo', 'rvcn_dec_av1_tile_info_t'),
+    ('Av1', 'rvcn_dec_message_av1_t'),
+    ('Av1SegmentFg', 'rvcn_dec_av1_segment_fg_t'),
     ('FeedbackIndex', 'rvcn_dec_feature_index_t'),
     ('Feedback', 'rvcn_dec_feedback_header_t'),
 ]
+
+
+DEPENDENCIES = ['rvcn_dec_transformation_type_e', 'rvcn_dec_film_grain_params_t', 'rvcn_dec_av1_fg_init_buf_t']
 
 
 def struct_body(text, type_name):
@@ -65,8 +72,12 @@ def main():
     mvc = re.search(r'typedef struct \{\s*unsigned short viewOrderIndex;.*?\} radeon_mvcElement_t;', text, re.S)
     program.append(mvc.group(0))
     wanted = []
+    # Types the AV1 message is built from, in dependency order (some are anonymous structures or enumerations).
+    for name in DEPENDENCIES:
+        m = re.search(r'typedef (?:struct|enum) (?:\w+ )?\{' + re.escape(struct_body(text, name)) + r'\} ' + re.escape(name) + r';', text, re.S)
+        program.append(m.group(0))
     for tag, name in TYPES:
-        m = re.search(r'typedef struct \w+ \{' + re.escape(struct_body(text, name)) + r'\} ' + re.escape(name) + r';', text, re.S)
+        m = re.search(r'typedef struct (?:\w+ )?\{' + re.escape(struct_body(text, name)) + r'\} ' + re.escape(name) + r';', text, re.S)
         program.append(m.group(0))
         wanted.append((tag, name, fields(struct_body(text, name))))
     program.append('int main(void) {')
