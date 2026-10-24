@@ -353,6 +353,7 @@ add_executable(BOOTX64
   src/Desktop/FileTransfer.cpp
   src/Desktop/Shell.cpp
   src/Desktop/Terminal.cpp
+  src/Desktop/Calculator.cpp
   src/Desktop/CopyProgressDialog.cpp
   src/Desktop/DirectoryListing.cpp
   src/Desktop/FileDialog.cpp

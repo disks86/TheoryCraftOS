@@ -39,6 +39,7 @@
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
+#include "Desktop/Calculator.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Database/TextResultSet.hpp"
@@ -2085,7 +2086,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 13);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Paint, Media Player, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 14);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Paint, Media Player, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -5774,6 +5775,115 @@ static void test_spreadsheet_app() {
   CHECK(a.live == 0);
 }
 
+// The calculator: arithmetic from the keypad and the keyboard, and the same tab behavior as the other programs (Start menu, "+", dragging out and
+// between windows, session).
+static void test_calculator() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    gui::WindowManager& m = d.windows();
+
+    desktop::Calculator& c = d.calculator();
+    auto keys = [&](const char* text) {
+      for (const char* k = text; *k; ++k) {
+        KeyArgs args;
+        args.character = *k;
+        c.on_key(args);
+      }
+    };
+    CHECK(c.display().equals("0"));
+    keys("12+30*2=");
+    CHECK(c.display().equals("84"));
+    keys("/0=");
+    CHECK(c.display().equals("Error"));
+    c.press_clear();
+    keys("1.5+2.25=");
+    CHECK(c.display().equals("3.75"));
+    c.press_clear();
+    keys("7");
+    c.press_negate();
+    CHECK(c.display().equals("-7"));
+    c.press_backspace();
+    CHECK(c.display().equals("0"));
+
+    // The Start menu opens a calculator; a second one opens a second window.
+    desktop::Calculator* c1 = d.open_calculator();
+    CHECK(c1 == &d.calculator() && d.calculator_count() == 1 && c1->app_kind() == desktop::Desktop::kAppCalculator);
+    auto* h1 = static_cast<gui::TabFrame*>(c1->host());
+    CHECK(h1 && c1->embedded() && h1->tab_count() == 1 && h1->title().equals("Calculator"));
+    put(h1, {20, 20, 300, 400});
+    w.layout();
+    // The keypad buttons work with the mouse.
+    c1->press_clear();
+    c1->press_digit('9');
+    CHECK(c1->display().equals("9"));
+
+    // "+": another calculator tab of the same window.
+    const Rect2D plus = h1->new_tab_button_rect();
+    const Point po = h1->window_origin();
+    click(w, po.x + plus.x + 8, po.y + plus.y + 6);
+    CHECK(h1->tab_count() == 2 && d.calculator_count() == 2 && m.window_count() == 1);
+    Frame* second = h1->tab_at(1);
+    CHECK(second->app_kind() == desktop::Desktop::kAppCalculator && h1->selected() == second);
+
+    // Dragging the second tab out of the window gives it a window of its own.
+    Point tp = tab_point(h1, 1);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    w.mouse_move(tp.x + 100, tp.y + 300);
+    CHECK(w.dragging());
+    w.mouse_button(tp.x + 100, tp.y + 300, MouseButton::Left, false);
+    CHECK(m.window_count() == 2 && h1->tab_count() == 1 && second->host() && second->host() != h1);
+    auto* h2 = static_cast<gui::TabFrame*>(second->host());
+    put(h2, {400, 20, 300, 400});
+    w.layout();
+
+    // Dragging it back onto the first window's strip moves it there and closes the emptied window.
+    tp = tab_point(h2, 0);
+    w.mouse_move(tp.x, tp.y);
+    w.mouse_button(tp.x, tp.y, MouseButton::Left, true);
+    const Point strip = tab_point(h1, 0, 100);
+    w.mouse_move(strip.x + 40, strip.y);
+    w.mouse_move(strip.x, strip.y);
+    w.mouse_button(strip.x, strip.y, MouseButton::Left, false);
+    CHECK(h1->tab_count() == 2 && h1->tab_at(1) == second && m.window_count() == 1 && h2->manager() == nullptr);
+    d.step(1000000);
+  }
+  CHECK(a.live == 0);
+}
+
+// The calculator is kept by a session like the other programs.
+static void test_calculator_session() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    database::local::LocalDatabase system_db(a, &fs, "/databases/system.db");
+    system_db.open();
+    database::local::SystemSettings settings(a, system_db);
+    {
+      Screen screen(a, 800, 600);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      d.set_settings(&settings);
+      desktop::Calculator* c1 = d.open_calculator();
+      d.open_calculator(static_cast<gui::TabFrame*>(c1->host()));
+      CHECK(d.save_session() == 1);
+    }
+    {
+      Screen screen(a, 800, 600);
+      desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+      d.set_file_system(&fs);
+      d.set_settings(&settings);
+      CHECK(d.restore_session() == 1 && d.calculator_count() == 2 && d.windows().window_count() == 1);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 // Spreadsheets are tabs like the other programs: "+" opens another, and they move between windows by dragging.
 static void test_spreadsheet_tabs() {
   TestAllocator a;
@@ -6866,6 +6976,8 @@ int main() {
   test_display_settings_entry();
   test_text_editor();
   test_notepad();
+  test_calculator();
+  test_calculator_session();
   test_media_player();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui views: all checks passed\n");

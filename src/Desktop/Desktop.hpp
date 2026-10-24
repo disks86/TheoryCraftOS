@@ -18,7 +18,7 @@
 
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
-// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Paint", "Media Player", "3D Test",
+// upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Paint", "Media Player", "3D Test",
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -34,6 +34,7 @@
 #include "Desktop/FileExplorer.hpp"
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
+#include "Desktop/Calculator.hpp"
 #include "Desktop/Notepad.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
@@ -77,7 +78,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -168,6 +169,10 @@ class Desktop {
   uint32_t terminal_count() const;
   // Opens a text editor window: the first one is notepad() (when that is closed), further ones are made as needed and go away when closed.
   Notepad* open_text_editor(gui::TabFrame* into = nullptr);
+  // Opens a calculator window: the first one is calculator() (when that is closed), further ones are made as needed and go away when closed.
+  Calculator* open_calculator(gui::TabFrame* into = nullptr);
+  Calculator& calculator() { return calculator_; }
+  uint32_t calculator_count() const;
   ComputerManager& computer_manager() { return computer_manager_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
@@ -248,6 +253,7 @@ class Desktop {
   static void on_web_browser(void* self, gui::Control&);
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
+  static void on_calculator(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
   static void on_files_changed(void* self, gui::Control&);
@@ -281,6 +287,7 @@ class Desktop {
   static uint64_t unix_ms(void* self);
   void setup_paint(Paint& paint);
   void setup_terminal(Terminal& terminal);
+  void setup_calculator(Calculator& calculator);
   void reap_closed();
   // Opens a program window of kind `app` (a kApp... value) in `into` or a window of its own, showing `path` if that still exists.
   gui::Frame* open_app(uint8_t app, gui::TabFrame* into, StringView path);
@@ -320,6 +327,7 @@ class Desktop {
   browser::PageHub page_hub_;            // and what its pages tell each other (storage changes, broadcasts)
   WebBrowser web_browser_;
   Terminal terminal_;
+  Calculator calculator_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
   gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"
@@ -343,6 +351,7 @@ class Desktop {
   List<UniquePointer<DatabaseQuery>> extra_queries_;
   List<UniquePointer<WebBrowser>> extra_browsers_;
   List<UniquePointer<Terminal>> extra_terminals_;
+  List<UniquePointer<Calculator>> extra_calculators_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
   bool reap_needed_ = false;
   hardware::SystemMonitors* monitors_ = nullptr;

@@ -36,7 +36,7 @@ void lowercase_into(StringView in, String* out) {
 
 // --- Document ----------------------------------------------------------------------------------------------------
 
-Document::Document(allocators::IAllocator& allocator) : allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) { root_ = make(NodeType::Document, "#document"); }
+Document::Document(allocators::IAllocator& allocator) : content_type(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) { root_ = make(NodeType::Document, "#document"); }
 
 Document::~Document() {
   for (uint64_t i = 0; i < nodes_.count(); ++i) {
@@ -256,9 +256,15 @@ Node* clone_node(Node* node, bool deep) {
   switch (node->type) {
     case NodeType::Element:
       copy = doc.create_element(node->name.view());
-      if (copy)
-        for (uint64_t i = 0; i < node->attrs.count(); ++i)
+      if (copy) {
+        copy->ns_set = node->ns_set;
+        copy->ns.assign(node->ns.view());
+        copy->qname.assign(node->qname.view());
+        for (uint64_t i = 0; i < node->attrs.count(); ++i) {
           if (set_attribute(copy, node->attrs[i].name.view(), node->attrs[i].value.view()) != DomError::None) return nullptr;
+          if (!node->attrs[i].ns.empty() && !copy->attrs[copy->attrs.count() - 1].ns.assign(node->attrs[i].ns.view())) return nullptr;
+        }
+      }
       if (copy && node->is_tag("template")) {
         copy->content = node->content ? clone_node(node->content, deep) : doc.create_fragment();
         if (!copy->content) return nullptr;
@@ -268,8 +274,8 @@ Node* clone_node(Node* node, bool deep) {
         if (node->form_state & 1) copy->data.assign(node->data.view());
       }
       break;
-    case NodeType::Text: copy = doc.create_text(node->data.view()); break;
-    case NodeType::Comment: copy = doc.create_comment(node->data.view()); break;
+    case NodeType::Text: copy = doc.create_text(node->data.view()); if (copy) { copy->dom_type = node->dom_type; if (node->dom_type) copy->name.assign(node->name.view()); } break;
+    case NodeType::Comment: copy = doc.create_comment(node->data.view()); if (copy) { copy->dom_type = node->dom_type; if (node->dom_type) copy->name.assign(node->name.view()); } break;
     case NodeType::Fragment: copy = doc.create_fragment(); break;
     case NodeType::Document: return nullptr;
   }
@@ -493,13 +499,22 @@ void serialize(const Node* n, String* out, uint32_t depth) {
       return;
     }
     case NodeType::Comment:
+      if (n->dom_type == 7) {
+        out->append("<?");
+        out->append(n->name.view());
+        out->push_back(' ');
+        out->append(n->data.view());
+        out->push_back('>');
+        return;
+      }
       out->append("<!--");
       out->append(n->data.view());
       out->append("-->");
       return;
     case NodeType::Element: {
+      const StringView tag = n->qname.empty() ? n->name.view() : n->qname.view();
       out->push_back('<');
-      out->append(n->name.view());
+      out->append(tag);
       for (uint64_t i = 0; i < n->attrs.count(); ++i) {
         out->push_back(' ');
         out->append(n->attrs[i].name.view());
@@ -511,7 +526,7 @@ void serialize(const Node* n, String* out, uint32_t depth) {
       if (is_void_tag(n->name.view())) return;
       for (const Node* c = n->content ? n->content->first_child : n->first_child; c; c = c->next) serialize(c, out, depth + 1);
       out->append("</");
-      out->append(n->name.view());
+      out->append(tag);
       out->push_back('>');
       return;
     }

@@ -360,6 +360,7 @@ bool form_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
           vm.array_push(list, Value::make_object(f));
         }
       }
+      set_interface(vm, list, "FileList");
       *out = Value::make_object(list);
       return true;
     }

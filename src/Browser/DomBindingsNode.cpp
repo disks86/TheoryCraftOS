@@ -36,6 +36,21 @@ namespace {
 char lower_char(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; }
 bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
 
+// The local name of an element: its qualified name without the prefix, as it was written (for elements made with createElementNS); else the lowercase tag.
+StringView local_name_of(const dom::Node* n) {
+  if (n->qname.empty()) return n->name.view();
+  const uint64_t colon = n->qname.view().find(':');
+  return colon == StringView::npos ? n->qname.view() : n->qname.view().substr(colon + 1);
+}
+
+Value upper_value(Vm& vm, StringView s);
+// tagName / nodeName: the qualified name, in capitals for an element of HTML in a page of HTML.
+Value tag_name_value(Vm& vm, const dom::Node* n) {
+  const bool html = !n->ns_set || n->ns.view().equals("http://www.w3.org/1999/xhtml");
+  if (!n->qname.empty()) return html && n->owner->content_type.empty() ? upper_value(vm, n->qname.view()) : Value::make_string(vm.new_string(n->qname.view()));
+  return html && n->owner->content_type.empty() ? upper_value(vm, n->name.view()) : Value::make_string(vm.new_string(n->name.view()));
+}
+
 Value upper_value(Vm& vm, StringView s) {
   String u(vm.allocator());
   for (uint64_t i = 0; i < s.size(); ++i) u.push_back(s[i] >= 'a' && s[i] <= 'z' ? static_cast<char>(s[i] - 32) : s[i]);
@@ -167,12 +182,20 @@ Value attributes_value(DomBindings::Impl& c, dom::Node* n) {
     vm.define_named(a, "name", str_value(vm, n->attrs[i].name.view()));
     vm.define_named(a, "value", str_value(vm, n->attrs[i].value.view()));
     vm.define_named(a, "specified", bool_value(true));
+    {   // namespaceURI, prefix, localName of the attribute
+      const StringView full = n->attrs[i].name.view();
+      const uint64_t colon = full.find(':');
+      vm.define_named(a, "namespaceURI", n->attrs[i].ns.empty() ? Value::make_null() : str_value(vm, n->attrs[i].ns.view()));
+      vm.define_named(a, "prefix", colon == StringView::npos ? Value::make_null() : str_value(vm, full.substr(0, colon)));
+      vm.define_named(a, "localName", str_value(vm, colon == StringView::npos ? full : full.substr(colon + 1)));
+    }
     vm.define_named(a, "ownerElement", node_value(c, n));
     vm.array_push(list, Value::make_object(a));
   }
   Value item;
   vm.get_named(Value::make_object(vm.global()), "__collection_item", &item);
   vm.define_named(list, "item", item, kWritable);
+  set_interface(vm, list, "NamedNodeMap");
   return Value::make_object(list);
 }
 
@@ -183,9 +206,10 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (k.size() < 2 || (k[0] == '_' && k[1] == '_')) return false;
   const bool element = n->is_element(), document = n->type == dom::NodeType::Document, container = is_container(n);
   // --- every node
-  if (IS("nodeType")) { *out = num_value(static_cast<int>(n->type)); return true; }
+  if (IS("nodeType")) { *out = num_value(n->dom_type ? n->dom_type : static_cast<int>(n->type)); return true; }
+  if (IS("target") && n->dom_type == 7) { *out = str_value(vm, n->name.view()); return true; }
   if (IS("nodeName")) {
-    *out = element ? upper_value(vm, n->name.view()) : str_value(vm, n->name.view());
+    *out = element ? tag_name_value(vm, n) : str_value(vm, n->name.view());
     return true;
   }
   if (IS("nodeValue")) {
@@ -210,7 +234,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (IS("childNodes")) {
     List<dom::Node*> list(vm.allocator());
     children_of(n, &list, false);
-    *out = Value::make_object(make_collection(c, list));
+    *out = Value::make_object(make_collection(c, list, false));
     return true;
   }
   if (IS("ownerDocument")) { *out = document ? Value::make_null() : node_value(c, n->owner->root()); return true; }
@@ -269,9 +293,21 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       return true;
     }
     if (IS("characterSet") || IS("charset") || IS("inputEncoding")) { *out = str_value(vm, "UTF-8"); return true; }
-    if (IS("contentType")) { *out = str_value(vm, "text/html"); return true; }
+    if (IS("contentType")) { *out = str_value(vm, n->owner->content_type.empty() ? StringView("text/html") : n->owner->content_type.view()); return true; }
     if (IS("compatMode")) { *out = str_value(vm, "CSS1Compat"); return true; }
-    if (IS("doctype")) { *out = Value::make_null(); return true; }
+    if (IS("doctype")) {   // a page that began with <!DOCTYPE ...> has one: the built-in script makes the object
+      *out = Value::make_null();
+      Value make;
+      if (!n->owner->quirks_mode && n->owner->content_type.empty() && vm.get_named(Value::make_object(vm.global()), "__doctype_of", &make) && Vm::is_callable(make)) {
+        const Value arg = node_value(c, n);
+        if (!vm.call(make, Value(), &arg, 1, out)) {
+          String ignored(vm.allocator());
+          vm.take_exception(&ignored);
+          *out = Value::make_null();
+        }
+      }
+      return true;
+    }
     if (IS("defaultView")) { *out = Value::make_object(vm.global()); return true; }
     if (IS("location")) { *out = object_value(c.location); return true; }
     if (IS("activeElement") || IS("scrollingElement")) { *out = node_value(c, IS("activeElement") ? (c.host.focused() ? c.host.focused() : n->owner->body()) : n->owner->document_element()); return true; }
@@ -279,13 +315,12 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (IS("hidden")) { *out = bool_value(false); return true; }
     if (IS("visibilityState")) { *out = str_value(vm, "visible"); return true; }
     if (IS("referrer") || IS("lastModified")) { *out = str_value(vm, ""); return true; }
-    if (IS("forms") || IS("images") || IS("links") || IS("scripts") || IS("anchors") || IS("embeds") || IS("styleSheets")) {
+    if (IS("forms") || IS("images") || IS("links") || IS("scripts") || IS("anchors") || IS("embeds")) {
       List<dom::Node*> list(vm.allocator());
       for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
         if (!d->is_element()) continue;
         if ((IS("forms") && d->is_tag("form")) || (IS("images") && d->is_tag("img")) || (IS("scripts") && d->is_tag("script")) || (IS("embeds") && d->is_tag("embed")) ||
-            (IS("links") && (d->is_tag("a") || d->is_tag("area")) && dom::has_attribute(d, "href")) || (IS("anchors") && d->is_tag("a") && dom::has_attribute(d, "name")) ||
-            (IS("styleSheets") && d->is_tag("style")))
+            (IS("links") && (d->is_tag("a") || d->is_tag("area")) && dom::has_attribute(d, "href")) || (IS("anchors") && d->is_tag("a") && dom::has_attribute(d, "name")))
           list.push_back(d);
       }
       *out = Value::make_object(make_collection(c, list));
@@ -295,10 +330,18 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   }
   if (!element) return false;
   // --- elements
-  if (IS("tagName")) { *out = upper_value(vm, n->name.view()); return true; }
-  if (IS("localName")) { *out = str_value(vm, n->name.view()); return true; }
-  if (IS("namespaceURI")) { *out = str_value(vm, "http://www.w3.org/1999/xhtml"); return true; }
-  if (IS("prefix")) { *out = Value::make_null(); return true; }
+  if (IS("tagName")) { *out = tag_name_value(vm, n); return true; }
+  if (IS("localName")) { *out = str_value(vm, local_name_of(n)); return true; }
+  if (IS("namespaceURI")) {
+    if (!n->ns_set) *out = str_value(vm, "http://www.w3.org/1999/xhtml");
+    else *out = n->ns.empty() ? Value::make_null() : str_value(vm, n->ns.view());
+    return true;
+  }
+  if (IS("prefix")) {
+    const uint64_t colon = n->qname.view().find(':');
+    *out = colon == StringView::npos ? Value::make_null() : str_value(vm, n->qname.view().substr(0, colon));
+    return true;
+  }
   if (IS("innerHTML")) {
     String html(vm.allocator());
     dom::inner_html(n, &html);
@@ -330,7 +373,19 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (IS("isContentEditable")) { *out = bool_value(false); return true; }
   if (IS("contentEditable")) { *out = str_value(vm, "inherit"); return true; }
   if (IS("draggable") || IS("spellcheck")) { *out = bool_value(false); return true; }
-  if (IS("sheet")) { *out = Value::make_null(); return true; }
+  if (IS("sheet")) {   // the CSSStyleSheet of a <style> or <link rel=stylesheet>: the built-in script makes it
+    *out = Value::make_null();
+    Value make;
+    if (element && (n->is_tag("style") || n->is_tag("link")) && vm.get_named(Value::make_object(vm.global()), "__sheet_of", &make) && Vm::is_callable(make)) {
+      const Value arg = node_value(c, n);
+      if (!vm.call(make, Value(), &arg, 1, out)) {
+        String ignored(vm.allocator());
+        vm.take_exception(&ignored);
+        *out = Value::make_null();
+      }
+    }
+    return true;
+  }
   if (element && IS("content") && n->is_tag("template")) {
     *out = node_value(c, dom::template_content(n));
     return true;
@@ -836,7 +891,7 @@ bool query_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, Val
   if (!n || !arg_text(vm, arg_at(args, argc, 0), &selector)) return false;
   List<dom::Node*> found(vm.allocator());
   if (!select(vm, n, selector.view(), all, &found)) return false;
-  if (all) *result = Value::make_object(make_collection(impl(vm), found));
+  if (all) *result = Value::make_object(make_collection(impl(vm), found, false));
   else *result = found.count() ? node_value(impl(vm), found[0]) : Value::make_null();
   return true;
 }
@@ -1047,13 +1102,25 @@ NATIVE(doc_create_element) {
 
 NATIVE(doc_create_element_ns) {
   dom::Node* d = this_node(vm, self);
-  String qname(vm.allocator());
-  if (!d || !arg_text(vm, arg_at(args, argc, 1), &qname)) return false;
+  String ns(vm.allocator()), qname(vm.allocator());
+  if (!d || !arg_text(vm, arg_at(args, argc, 0), &ns) || !arg_text(vm, arg_at(args, argc, 1), &qname)) return false;
   const uint64_t colon = qname.view().find(':');
   const StringView local = colon == StringView::npos ? qname.view() : qname.view().substr(colon + 1);
-  if (!valid_tag_name(local)) return throw_dom(vm, "InvalidCharacterError", "The tag name provided is not a valid name.");
+  if (!valid_tag_name(local) || (colon != StringView::npos && !valid_tag_name(qname.view().substr(0, colon)))) return throw_dom(vm, "InvalidCharacterError", "The tag name provided is not a valid name.");
+  const Value ns_arg = arg_at(args, argc, 0);
+  const bool has_ns = !ns_arg.is_nullish() && !ns.empty();
+  if (colon != StringView::npos && !has_ns) return throw_dom(vm, "NamespaceError", "The qualified name has a prefix but the namespace is null.");
+  const StringView prefix = colon == StringView::npos ? StringView() : qname.view().substr(0, colon);
+  if (prefix.equals("xml") && !ns.view().equals("http://www.w3.org/XML/1998/namespace")) return throw_dom(vm, "NamespaceError", "The prefix 'xml' is reserved for the XML namespace.");
   dom::Node* e = d->owner->create_element(local);
   if (!e) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  const bool html = has_ns && ns.view().equals("http://www.w3.org/1999/xhtml");
+  const bool xml_doc = !d->owner->content_type.empty();
+  if (!html || xml_doc || colon != StringView::npos) {   // (an element of HTML in a page of HTML is the same as one made by createElement)
+    e->ns_set = true;
+    e->ns.assign(has_ns ? ns.view() : StringView());
+  }
+  if (colon != StringView::npos || xml_doc || !html) e->qname.assign(qname.view());
   *result = node_value(impl(vm), e);
   return true;
 }

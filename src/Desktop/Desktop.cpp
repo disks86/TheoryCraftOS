@@ -55,6 +55,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       page_hub_(allocator),
       web_browser_(allocator),
       terminal_(allocator),
+      calculator_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
       display_confirm_dialog_(allocator),
@@ -70,6 +71,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       extra_queries_(allocator),
       extra_browsers_(allocator),
       extra_terminals_(allocator),
+      extra_calculators_(allocator),
       hosts_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
@@ -89,6 +91,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Database", {&Desktop::on_database_query, this});
   start_.menu().add_item("Web Browser", {&Desktop::on_web_browser, this});
   start_.menu().add_item("Terminal", {&Desktop::on_terminal, this});
+  start_.menu().add_item("Calculator", {&Desktop::on_calculator, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
@@ -137,6 +140,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   setup_database_query(database_query_);
   setup_web_browser(web_browser_);
   setup_terminal(terminal_);
+  setup_calculator(calculator_);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
 
@@ -307,6 +311,8 @@ void Desktop::setup_terminal(Terminal& terminal) {
   terminal.set_file_system(fs_);
 }
 
+void Desktop::setup_calculator(Calculator& calculator) { calculator.set_app_kind(kAppCalculator); }
+
 void Desktop::setup_paint(Paint& paint) {
   paint.set_app_kind(kAppPaint);
   paint.set_notices(&notice_dialog_);
@@ -388,6 +394,7 @@ void Desktop::on_new_tab(void* self, Control& sender) {
     case kAppDatabase: d->open_database_query(host); break;
     case kAppBrowser: d->open_web_browser(host); break;
     case kAppTerminal: d->open_terminal(host); break;
+    case kAppCalculator: d->open_calculator(host); break;
     case kAppMedia: d->open_media_player(host); break;
     default: d->open_explorer(host); break;
   }
@@ -428,6 +435,7 @@ void Desktop::reap_closed() {
     sweep(extra_queries_);
     sweep(extra_browsers_);
     sweep(extra_terminals_);
+    sweep(extra_calculators_);
     sweep(hosts_);
   });
 }
@@ -476,6 +484,16 @@ uint32_t Desktop::terminal_count() const {
   for (const auto& e : extra_terminals_) n += e->manager() ? 1 : 0;
   return n;
 }
+
+Calculator* Desktop::open_calculator(TabFrame* into) { return open_instance(calculator_, extra_calculators_, &Desktop::setup_calculator, into); }
+
+uint32_t Desktop::calculator_count() const {
+  uint32_t n = calculator_.manager() ? 1 : 0;
+  for (const auto& e : extra_calculators_) n += e->manager() ? 1 : 0;
+  return n;
+}
+
+void Desktop::on_calculator(void* self, Control&) { static_cast<Desktop*>(self)->open_calculator(); }
 
 void Desktop::on_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
 void Desktop::on_new_terminal(void* self, Control&) { static_cast<Desktop*>(self)->open_terminal(); }
