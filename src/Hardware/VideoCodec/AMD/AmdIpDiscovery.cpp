@@ -41,10 +41,13 @@ bool checksum_matches(ConstByteView table, uint32_t size, uint16_t expected) {
   return sum == expected;
 }
 
-void count(AmdIpDiscoveryInfo& info, uint16_t hw_id, const AmdIpVersion& version) {
+void count(AmdIpDiscoveryInfo& info, uint16_t hw_id, const AmdIpVersion& version, const AmdIpInstance& instance) {
   switch (hw_id) {
     case kAmdHwIdGc: if (info.gc_instances++ == 0) info.gc = version; break;
-    case kAmdHwIdVcn: if (info.vcn_instances++ == 0) info.vcn = version; break;
+    case kAmdHwIdVcn:
+      if (info.vcn_instances < kAmdMaxVcnInstances) info.vcn_engine[info.vcn_instances] = instance;
+      if (info.vcn_instances++ == 0) info.vcn = version;
+      break;
     case kAmdHwIdSdma0: case kAmdHwIdSdma1: case kAmdHwIdSdma2: case kAmdHwIdSdma3: ++info.sdma_instances; break;
     default: break;
   }
@@ -93,16 +96,22 @@ AmdIpDiscoveryInfo amd_parse_ip_discovery(ConstByteView table) {
     const uint16_t num_ips = in.le16();
     for (uint32_t i = 0; i < num_ips; ++i) {
       const uint16_t hw_id = in.le16();
-      in.skip(1);   // instance number
+      AmdIpInstance instance;
+      instance.instance = in.u8();
       const uint8_t num_base_address = in.u8();
       AmdIpVersion version;
       version.major = in.u8();
       version.minor = in.u8();
       version.revision = in.u8();
       in.skip(1);   // flags (harvest or variant, depending on the list version)
-      in.skip(uint64_t{num_base_address} * base_bytes);
+      for (uint32_t b = 0; b < num_base_address; ++b) {
+        const uint64_t address = wide_base ? in.le64() : in.le32();
+        if (b < kAmdMaxIpBases) instance.base[b] = address;
+      }
+      instance.base_count = num_base_address < kAmdMaxIpBases ? num_base_address : static_cast<uint8_t>(kAmdMaxIpBases);
+      instance.present = true;
       if (!in.ok()) return info;   // an entry that runs past the table: not a table we can trust
-      count(info, hw_id, version);
+      count(info, hw_id, version, instance);
       ++info.ip_count;
     }
   }

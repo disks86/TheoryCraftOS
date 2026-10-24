@@ -28,6 +28,18 @@ struct AmdIpVersion {
   uint8_t major = 0, minor = 0, revision = 0;
 };
 
+// One instance of a block as the table lists it: which instance it is and where its registers start. The base addresses are the "segments" the driver adds
+// a register's offset to (a register's address is base[segment] + offset, in dwords); how many there are and what each is for depends on the block's version.
+constexpr uint32_t kAmdMaxIpBases = 8;
+struct AmdIpInstance {
+  bool present = false;
+  uint8_t instance = 0;                 // the table's instance number (VCN 0, VCN 1)
+  uint8_t base_count = 0;               // base addresses stored (at most kAmdMaxIpBases; the table may list more)
+  uint64_t base[kAmdMaxIpBases] = {};
+};
+
+constexpr uint32_t kAmdMaxVcnInstances = 4;
+
 struct AmdIpDiscoveryInfo {
   bool valid = false;            // a table with the right signatures and a layout that holds together was found
   bool checksum_ok = false;      // the table's own checksum matches (a mismatch is reported, not fatal: the layout checks above still apply)
@@ -38,6 +50,7 @@ struct AmdIpDiscoveryInfo {
   AmdIpVersion gc;
   uint32_t vcn_instances = 0;    // video core next (decode/encode) engines
   AmdIpVersion vcn;              // version of the first instance
+  AmdIpInstance vcn_engine[kAmdMaxVcnInstances];   // the first kAmdMaxVcnInstances of them, in table order: where each one's registers are
   uint32_t sdma_instances = 0;   // DMA engines
 };
 

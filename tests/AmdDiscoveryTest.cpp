@@ -44,6 +44,7 @@ struct Ip {
   uint16_t hw_id;
   uint8_t major, minor, revision;
   uint8_t bases = 2;
+  uint8_t instance = 0;
 };
 
 // Builds a table: the container header, the IP list header, then one die per entry of `dies`.
@@ -65,7 +66,7 @@ static std::vector<uint8_t> build(const std::vector<std::vector<Ip>>& dies, uint
     t[die_table + d * 4 + 2] = static_cast<uint8_t>(at); t[die_table + d * 4 + 3] = static_cast<uint8_t>(at >> 8);
     u16(static_cast<uint32_t>(d)); u16(static_cast<uint32_t>(dies[d].size()));
     for (const Ip& ip : dies[d]) {
-      u16(ip.hw_id); u8(0); u8(ip.bases); u8(ip.major); u8(ip.minor); u8(ip.revision); u8(0);
+      u16(ip.hw_id); u8(ip.instance); u8(ip.bases); u8(ip.major); u8(ip.minor); u8(ip.revision); u8(0);
       for (uint32_t b = 0; b < ip.bases; ++b) { u32(0x1000 * (b + 1)); if (wide && list_version >= 4) u32(0); }
     }
   }
@@ -101,6 +102,31 @@ static void test_parse() {
   // Not a table.
   CHECK(!parse({}).valid && !parse(std::vector<uint8_t>(256, 0)).valid && !parse(std::vector<uint8_t>(256, 0xFF)).valid);
   CHECK(amd_ip_discovery_declared_size(ConstByteView()) == 0);
+}
+
+// Where the engines' registers are: the table lists base addresses per instance, and the parser hands them over (the first ones, bounded).
+static void test_bases() {
+  // Two VCN instances with their own bases (the builder writes 0x1000 * (n + 1) for base n), numbered 0 and 1.
+  AmdIpDiscoveryInfo info = parse(build({{{kAmdHwIdVcn, 4, 0, 0, 3, 0}, {kAmdHwIdVcn, 4, 0, 0, 5, 1}, {kAmdHwIdGc, 11, 0, 0}}}));
+  CHECK(info.valid && info.vcn_instances == 2);
+  CHECK(info.vcn_engine[0].present && info.vcn_engine[0].instance == 0 && info.vcn_engine[0].base_count == 3);
+  CHECK(info.vcn_engine[0].base[0] == 0x1000 && info.vcn_engine[0].base[1] == 0x2000 && info.vcn_engine[0].base[2] == 0x3000 && info.vcn_engine[0].base[3] == 0);
+  CHECK(info.vcn_engine[1].present && info.vcn_engine[1].instance == 1 && info.vcn_engine[1].base_count == 5 && info.vcn_engine[1].base[4] == 0x5000);
+  CHECK(!info.vcn_engine[2].present);
+  // More bases than are kept: the first ones are stored and the entry is still parsed to its end (the next IP is read from the right place).
+  info = parse(build({{{kAmdHwIdVcn, 3, 0, 0, 12, 0}, {kAmdHwIdGc, 10, 3, 0}}}));
+  CHECK(info.valid && info.vcn_engine[0].base_count == kAmdMaxIpBases && info.vcn_engine[0].base[7] == 0x8000 && info.gc_instances == 1 && info.gc.major == 10);
+  // 64-bit bases (list version 4 with the flag) are read as 64-bit values.
+  info = parse(build({{{kAmdHwIdVcn, 5, 0, 0, 2, 0}}}, 4, true));
+  CHECK(info.valid && info.vcn_engine[0].base_count == 2 && info.vcn_engine[0].base[0] == 0x1000 && info.vcn_engine[0].base[1] == 0x2000);
+  // More instances than the array holds: all are counted, the first kAmdMaxVcnInstances are kept.
+  std::vector<Ip> many;
+  for (uint8_t i = 0; i < 6; ++i) many.push_back({kAmdHwIdVcn, 4, 0, 0, 1, i});
+  info = parse(build({many}));
+  CHECK(info.valid && info.vcn_instances == 6 && info.vcn_engine[3].present && info.vcn_engine[3].instance == 3);
+  // A block with no bases has none.
+  info = parse(build({{{kAmdHwIdVcn, 4, 0, 0, 0, 0}}}));
+  CHECK(info.valid && info.vcn_engine[0].present && info.vcn_engine[0].base_count == 0);
 }
 
 static void test_truncation_and_flips() {
@@ -333,6 +359,7 @@ static void test_mm_index_reader() {
 
 int main() {
   test_parse();
+  test_bases();
   test_truncation_and_flips();
   test_probe();
   test_aperture();
