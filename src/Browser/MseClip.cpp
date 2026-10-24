@@ -192,7 +192,9 @@ bool MseClip::open_child(media::MseBuffer& buffer, const media::MseSnapshotPlan&
   into->generation = p.generation;
   into->epoch = buffer.epoch();
   into->appended = buffer.appended();
+  into->key_epoch = keys_ ? keys_->key_epoch() : 0;
   into->video = p.has_video;
+  into->started = false;
   ++picture_serial_;
   into->clip->set_volume(volume_, muted_);
   into->clip->set_rate(rate_);
@@ -214,6 +216,25 @@ void MseClip::sync_children() {
       c.clip->seek(to < 0 ? 0 : to);
     }
   }
+}
+
+// Is there data at the playhead that only a key we do not have would open? (Looked at again only when something that could change the answer did.)
+bool MseClip::blocked_on_key(media::MseSource* source) {
+  uint64_t signature = reinterpret_cast<uintptr_t>(keys_) * 1000003u + (keys_ ? keys_->key_epoch() : 0) * 7919u + static_cast<uint64_t>(position_ / 100000);
+  for (uint64_t b = 0; b < source->buffers.count(); ++b) signature = signature * 31u + source->buffers[b]->appended() + source->buffers[b]->epoch() * 17u;
+  if (probed_ && signature == probe_signature_) return probe_result_;
+  bool blocked = false;
+  for (uint64_t b = 0; b < source->buffers.count() && !blocked; ++b) {
+    media::MseBuffer& buffer = *source->buffers[b];
+    if (!buffer.has_protected_frames()) continue;
+    media::MseSnapshotPlan plan;
+    uint8_t missing[16];
+    blocked = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::NeedKey;
+  }
+  probed_ = true;
+  probe_signature_ = signature;
+  probe_result_ = blocked;
+  return blocked;
 }
 
 void MseClip::update() {
@@ -245,7 +266,7 @@ void MseClip::update() {
   bool all = s->buffers.count() > 0;
   const bool master_stopped = [&]() {
     Child* m = master();
-    return m && !stalled_ && playing_ && !m->clip->playing();
+    return m && m->started && !stalled_ && playing_ && !m->clip->playing();
   }();
   for (uint64_t b = 0; b < s->buffers.count(); ++b) {
     media::MseBuffer& buffer = *s->buffers[b];
@@ -257,26 +278,42 @@ void MseClip::update() {
     media::MseSnapshotPlan plan;
     bool have_plan = false, rebuild = false;
     if (c && c->clip) {
-      if (position_ < c->start - kStartSlack || position_ >= c->end) {
+      if (position_ < c->start - kStartSlack || position_ > c->end) {
         rebuild = true;   // the playhead has left the file
-      } else if (buffer.appended() != c->appended || buffer.epoch() != c->epoch) {
-        have_plan = buffer.plan(position_, &plan);
+      } else if (buffer.appended() != c->appended || buffer.epoch() != c->epoch || (keys_ && keys_->key_epoch() != c->key_epoch)) {
+        uint8_t missing[16];
+        have_plan = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::Ok;
         if (!have_plan || buffer.changed_since(c->epoch, position_, c->end)) rebuild = true;
         else if (plan.generation == c->generation && plan.end_us > c->end + kStartSlack && (c->end - position_ < kRefillAhead || master_stopped)) rebuild = true;
         else {
           c->appended = buffer.appended();
           c->epoch = buffer.epoch();
+          c->key_epoch = keys_ ? keys_->key_epoch() : 0;
         }
       }
     } else {
       rebuild = true;
     }
     if (rebuild) {
-      if (!have_plan) have_plan = buffer.plan(position_, &plan);
+      uint8_t missing[16];
+      if (!have_plan) have_plan = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::Ok;
       if (!have_plan) {
         if (c) drop(c);
         all = false;
         continue;
+      }
+      if (buffer.has_protected_frames()) {   // (what the playhead is going to see is decrypted before the file is written)
+        const media::MseDecrypt done = keys_ ? buffer.decrypt(*keys_, plan, missing) : media::MseDecrypt::NeedKey;
+        if (done == media::MseDecrypt::Failed) {
+          fail(3);
+          hub_.end_of_stream(source_, 3);
+          return;
+        }
+        if (done == media::MseDecrypt::NeedKey) {
+          if (c) drop(c);
+          all = false;
+          continue;
+        }
       }
       if (!c) {
         for (uint32_t i = 0; i < kMaxChildren && !c; ++i)
@@ -294,8 +331,13 @@ void MseClip::update() {
         return;
       }
     }
-    if (!c || !c->clip || position_ < c->start - kStartSlack || position_ >= c->end) all = false;
+    if (!c || !c->clip || position_ < c->start - kStartSlack || position_ > c->end) all = false;
   }
+  // Is the clip blocked for want of a key? (No file for the playhead because the key is missing; or the end of the file it plays, and what comes next is under a key
+  // that is not there.)
+  need_key_ = false;
+  if (!all || (playing_ && [&]() { int64_t limit = INT64_MAX; for (uint32_t i = 0; i < kMaxChildren; ++i) if (used_[i] && children_[i].clip && children_[i].end < limit) limit = children_[i].end; return limit != INT64_MAX && position_ >= limit - 30000; }()))
+    need_key_ = blocked_on_key(s);
   // playing, or waiting for the data to go on
   if (playing_) {
     bool wait = !all;
@@ -316,7 +358,7 @@ void MseClip::update() {
           return;
         }
         wait = true;
-        if (!stalled_ && limit != INT64_MAX && limit > position_) position_ = limit;
+        if (limit != INT64_MAX && position_ >= limit - 30000) position_ = limit;
       }
     }
     stalled_ = wait;
@@ -324,8 +366,10 @@ void MseClip::update() {
       if (!used_[i] || !children_[i].clip) continue;
       if (stalled_) {
         if (children_[i].clip->playing()) children_[i].clip->pause();
+        children_[i].started = false;
       } else if (!children_[i].clip->playing()) {
         children_[i].clip->play();
+        children_[i].started = true;
       }
     }
     if (!stalled_) sync_children();
@@ -338,6 +382,7 @@ uint8_t MseClip::ready_state() {
   bool any_init = false;
   for (uint64_t b = 0; b < s->buffers.count(); ++b) any_init = any_init || s->buffers[b]->init_received();
   if (!any_init) return 0;
+  if (need_key_) return 1;   // (blocked: the data is there, but it cannot be shown)
   List<double> ranges(allocator_);
   hub_.buffered(source_, &ranges);
   const double t = static_cast<double>(position_us()) / 1e6;

@@ -377,7 +377,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   method(SourceBufferList.prototype, 'constructor', SourceBufferList);
   accessor(SourceBufferList.prototype, 'length', function () { return this.__items.length; });
   method(SourceBufferList.prototype, 'item', function (index) { return this.__items[index >>> 0] || null; });
-  method(SourceBufferList.prototype, ITER, function () { return this.__items[ITER](); });
+  method(SourceBufferList.prototype, ITER, function () { return this.__items.slice(); });   // (the iterators of this engine are arrays)
   var newBufferList = function () {
     var list = Object.create(SourceBufferList.prototype);
     hide(list, '__items', []);
@@ -582,6 +582,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       mseLater(function () {
         if (buffer.__job !== job) return;
         var failed = work();
+        if (!failed) mseEncrypted(buffer);
         buffer.__updating = false;
         mseFire(buffer, failed ? 'error' : 'update');
         mseFire(buffer, 'updateend');
@@ -642,6 +643,430 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   hide(g, 'SourceBuffer', SourceBuffer);
   hide(g, 'SourceBufferList', SourceBufferList);
 
+  // ------------------------------------------------------------------------------------------------------------ Encrypted Media Extensions
+  // The one key system a machine without a licensed DRM module can offer is the one the standard defines itself, W3C Clear Key ("org.w3.clearkey"): the license
+  // request is the list of key identifiers wanted, the license is a JSON Web Key Set holding the keys. This is that key system, whole: the objects of the API, the
+  // sessions with their messages and key statuses (also persistent ones, kept in localStorage), and the keys, which go to the table the media decryption looks
+  // them up in (DomBindingsMse.cpp, Media/Eme.hpp). Widevine, PlayReady and FairPlay need modules that are not here, and are refused as unsupported.
+  var CLEARKEY = 'org.w3.clearkey';
+  var W3C_SYSTEM_ID = [0x10, 0x77, 0xef, 0xec, 0xc0, 0xb2, 0x4d, 0x02, 0xac, 0xe3, 0x3c, 0x1e, 0x52, 0xe2, 0xfb, 0x4b];
+  var B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  var emeToken = 0;
+
+  var emeBytesOf = function (data) {   // a copy of an ArrayBuffer's or a view's bytes, or null
+    if (data instanceof ArrayBuffer) return new Uint8Array(new Uint8Array(data));
+    if (ArrayBuffer.isView(data)) return new Uint8Array(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    return null;
+  };
+  var b64uEncode = function (bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i += 3) {
+      var v = (bytes[i] << 16) | ((i + 1 < bytes.length ? bytes[i + 1] : 0) << 8) | (i + 2 < bytes.length ? bytes[i + 2] : 0);
+      out += B64URL.charAt((v >> 18) & 63) + B64URL.charAt((v >> 12) & 63);
+      if (i + 1 < bytes.length) out += B64URL.charAt((v >> 6) & 63);
+      if (i + 2 < bytes.length) out += B64URL.charAt(v & 63);
+    }
+    return out;
+  };
+  var b64uDecode = function (text) {   // base64url (also base64, padded or not) to bytes; null if it is none
+    if (typeof text !== 'string') return null;
+    text = text.replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+    if (text.length % 4 === 1) return null;
+    var out = [], acc = 0, bits = 0;
+    for (var i = 0; i < text.length; i++) {
+      var v = B64URL.indexOf(text.charAt(i));
+      if (v < 0) return null;
+      acc = (acc << 6) | v;
+      bits += 6;
+      if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); acc &= (1 << bits) - 1; }
+    }
+    return new Uint8Array(out);
+  };
+  var emeTextOf = function (bytes) { var s = ''; for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return s; };
+  var bytesOfText = function (text) { var out = new Uint8Array(text.length); for (var i = 0; i < text.length; i++) out[i] = text.charCodeAt(i) & 255; return out; };
+  var sameBytes = function (a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  };
+  var emeDom = function (message, name) { return new DOMException(message, name); };
+  var storageAvailable = function () { try { g.localStorage.getItem('__eme_licenses'); return true; } catch (e) { return false; } };
+  var savedLicenses = function () { try { return JSON.parse(g.localStorage.getItem('__eme_licenses') || '{}') || {}; } catch (e) { return {}; } };
+  var saveLicenses = function (all) { try { g.localStorage.setItem('__eme_licenses', JSON.stringify(all)); } catch (e) {} };
+
+  // The key identifiers an initData asks for: 'keyids' is JSON, 'cenc' is 'pssh' boxes (the W3C common system's version 1 box lists them), 'webm' is one identifier.
+  var kidsOfInitData = function (type, data) {
+    var kids = [], i;
+    if (type === 'webm') { if (data.length === 16) kids.push(data); return kids; }
+    if (type === 'keyids') {
+      var json;
+      try { json = JSON.parse(emeTextOf(data)); } catch (e) { return null; }
+      if (!json || !Array.isArray(json.kids)) return null;
+      for (i = 0; i < json.kids.length; i++) {
+        var kid = b64uDecode(json.kids[i]);
+        if (!kid || kid.length !== 16) return null;
+        kids.push(kid);
+      }
+      return kids;
+    }
+    var at = 0;
+    while (at < data.length) {
+      if (at + 32 > data.length) return null;
+      var size = ((data[at] << 24) | (data[at + 1] << 16) | (data[at + 2] << 8) | data[at + 3]) >>> 0;
+      if (size < 32 || at + size > data.length || emeTextOf(data.subarray(at + 4, at + 8)) !== 'pssh') return null;
+      if (data[at + 8] === 1 && sameBytes(data.subarray(at + 12, at + 28), W3C_SYSTEM_ID)) {
+        var count = ((data[at + 28] << 24) | (data[at + 29] << 16) | (data[at + 30] << 8) | data[at + 31]) >>> 0;
+        if (32 + count * 16 > size) return null;
+        for (i = 0; i < count; i++) kids.push(data.slice(at + 32 + i * 16, at + 48 + i * 16));
+      }
+      at += size;
+    }
+    return kids;
+  };
+
+  function MediaKeyMessageEvent(type, init) {
+    if (arguments.length < 2 || !init || typeof init.messageType !== 'string' || !(init.message instanceof ArrayBuffer || ArrayBuffer.isView(init.message)))
+      throw typeError("construct 'MediaKeyMessageEvent'", "The message and messageType members are required.");
+    var event = new Event(type, init);
+    Object.setPrototypeOf(event, MediaKeyMessageEvent.prototype);
+    Object.defineProperty(event, 'messageType', { value: init.messageType, enumerable: true });
+    Object.defineProperty(event, 'message', { value: init.message instanceof ArrayBuffer ? init.message : emeBytesOf(init.message).buffer, enumerable: true });
+    return event;
+  }
+  MediaKeyMessageEvent.prototype = Object.create(Event.prototype);
+  method(MediaKeyMessageEvent.prototype, 'constructor', MediaKeyMessageEvent);
+  function MediaEncryptedEvent(type, init) {
+    var event = new Event(type, init);
+    Object.setPrototypeOf(event, MediaEncryptedEvent.prototype);
+    var data = init && init.initData ? (init.initData instanceof ArrayBuffer ? init.initData : emeBytesOf(init.initData).buffer) : null;
+    Object.defineProperty(event, 'initDataType', { value: init && init.initDataType !== undefined ? String(init.initDataType) : '', enumerable: true });
+    Object.defineProperty(event, 'initData', { value: data, enumerable: true });
+    return event;
+  }
+  MediaEncryptedEvent.prototype = Object.create(Event.prototype);
+  method(MediaEncryptedEvent.prototype, 'constructor', MediaEncryptedEvent);
+  // "encrypted" at the media element: the init data a SourceBuffer's stream carries.
+  var mseEncrypted = function (buffer) {
+    var list = __mse_encrypted(buffer.__id);
+    if (list.length === 0 || !buffer.__source) return;
+    var element = __mse_element(buffer.__source.__id);
+    if (!element) return;
+    for (var i = 0; i + 1 < list.length; i += 2)
+      element.dispatchEvent(new MediaEncryptedEvent('encrypted', { initDataType: list[i] === 1 ? 'keyids' : 'cenc', initData: list[i + 1].buffer }));
+  };
+
+  // MediaKeyStatusMap: the key identifiers of a session and the state of each.
+  function MediaKeyStatusMap() { throw new TypeError('Illegal constructor'); }
+  var newStatusMap = function () { var map = Object.create(MediaKeyStatusMap.prototype); hide(map, '__entries', []); return map; };
+  var statusIndex = function (map, key) {
+    var bytes = emeBytesOf(key);
+    if (!bytes) throw typeError("execute on 'MediaKeyStatusMap'", "The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    for (var i = 0; i < map.__entries.length; i++) if (sameBytes(map.__entries[i][0], bytes)) return i;
+    return -1;
+  };
+  accessor(MediaKeyStatusMap.prototype, 'size', function () { return this.__entries.length; });
+  method(MediaKeyStatusMap.prototype, 'has', function (key) { return statusIndex(this, key) >= 0; });
+  method(MediaKeyStatusMap.prototype, 'get', function (key) { var i = statusIndex(this, key); return i >= 0 ? this.__entries[i][1] : undefined; });
+  method(MediaKeyStatusMap.prototype, 'entries', function () { return this.__entries.map(function (e) { return [e[0].slice().buffer, e[1]]; }); });
+  method(MediaKeyStatusMap.prototype, 'keys', function () { return this.__entries.map(function (e) { return e[0].slice().buffer; }); });
+  method(MediaKeyStatusMap.prototype, 'values', function () { return this.__entries.map(function (e) { return e[1]; }); });
+  method(MediaKeyStatusMap.prototype, 'forEach', function (callback, thisArg) {
+    if (typeof callback !== 'function') throw typeError("execute 'forEach' on 'MediaKeyStatusMap'", "The callback provided as parameter 1 is not a function.");
+    for (var i = 0; i < this.__entries.length; i++) callback.call(thisArg, this.__entries[i][1], this.__entries[i][0].slice().buffer, this);
+  });
+  method(MediaKeyStatusMap.prototype, ITER, MediaKeyStatusMap.prototype.entries);
+
+  function MediaKeySession() { throw new TypeError('Illegal constructor'); }
+  MediaKeySession.prototype = Object.create(EventTarget.prototype);
+  method(MediaKeySession.prototype, 'constructor', MediaKeySession);
+  var newSession = function (keys, type) {
+    var session = Object.create(MediaKeySession.prototype);
+    hide(session, '__keys', keys);
+    hide(session, '__type', type);
+    hide(session, '__token', ++emeToken);
+    hide(session, '__id', '');
+    hide(session, '__state', 'new');   // new, active, releasing, closed
+    hide(session, '__map', newStatusMap());
+    var resolveClosed;
+    hide(session, '__closed', new Promise(function (resolve) { resolveClosed = resolve; }));
+    hide(session, '__resolveClosed', resolveClosed);
+    session.onmessage = null;
+    session.onkeystatuseschange = null;
+    return session;
+  };
+  accessor(MediaKeySession.prototype, 'sessionId', function () { return this.__id; });
+  accessor(MediaKeySession.prototype, 'expiration', function () { return NaN; });
+  accessor(MediaKeySession.prototype, 'closed', function () { return this.__closed; });
+  accessor(MediaKeySession.prototype, 'keyStatuses', function () { return this.__map; });
+  var sessionMessage = function (session, messageType, text) {
+    var message = bytesOfText(text).buffer;
+    mseLater(function () { session.dispatchEvent(new MediaKeyMessageEvent('message', { messageType: messageType, message: message })); });
+  };
+  var statusChanged = function (session) { mseLater(function () { mseFire(session, 'keystatuseschange'); }); };
+  // sets the status of key ids; true if anything changed
+  var setStatus = function (session, kids, status) {
+    var changed = false;
+    kids.forEach(function (kid) {
+      var at = statusIndex(session.__map, kid);
+      if (at < 0) { session.__map.__entries.push([kid, status]); changed = true; }
+      else if (session.__map.__entries[at][1] !== status) { session.__map.__entries[at][1] = status; changed = true; }
+    });
+    return changed;
+  };
+  var closeSession = function (session) {
+    if (session.__state === 'closed') return;
+    __eme_remove_session(session.__keys.__id, session.__token);
+    session.__state = 'closed';
+    session.__map.__entries.length = 0;
+    var listed = session.__keys.__sessions.indexOf(session);
+    if (listed >= 0) session.__keys.__sessions.splice(listed, 1);
+    session.__resolveClosed('closed-by-application');
+  };
+  var kidList = function (kids) { return kids.map(function (k) { return '"' + b64uEncode(k) + '"'; }).join(','); };
+  var rejectedWith = function (error) { return Promise.reject(error); };
+  var callable = function (session) {
+    if (session.__state === 'closed') return emeDom('The session is already closed.', 'InvalidStateError');
+    if (session.__id === '') return emeDom('The session is not callable.', 'InvalidStateError');
+    return null;
+  };
+
+  method(MediaKeySession.prototype, 'generateRequest', function (initDataType, initData) {
+    var session = this;
+    if (session.__state === 'closed') return rejectedWith(emeDom('The session is already closed.', 'InvalidStateError'));
+    if (session.__id !== '') return rejectedWith(emeDom('The session is already initialized.', 'InvalidStateError'));
+    initDataType = String(initDataType);
+    var data = emeBytesOf(initData);
+    if (!data) return rejectedWith(typeError("execute 'generateRequest' on 'MediaKeySession'", "The provided value is not of type '(ArrayBuffer or ArrayBufferView)'."));
+    if (initDataType === '' || data.length === 0) return rejectedWith(typeError("execute 'generateRequest' on 'MediaKeySession'", "The initData parameter is empty."));
+    if (initDataType !== 'cenc' && initDataType !== 'keyids' && initDataType !== 'webm')
+      return rejectedWith(emeDom("The initialization data type '" + initDataType + "' is not supported by the key system.", 'NotSupportedError'));
+    var kids = kidsOfInitData(initDataType, data);
+    if (kids === null) return rejectedWith(typeError("execute 'generateRequest' on 'MediaKeySession'", "The initialization data provided could not be parsed."));
+    if (kids.length === 0) return rejectedWith(emeDom('The initialization data holds no key identifiers this key system can use.', 'NotSupportedError'));
+    session.__id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    session.__state = 'active';
+    session.__requested = kids;
+    session.__keys.__sessions.push(session);
+    sessionMessage(session, 'license-request', '{"kids":[' + kidList(kids) + '],"type":"' + session.__type + '"}');
+    return Promise.resolve();
+  });
+
+  // The keys of a JSON Web Key Set, checked whole before any is used: [[kid, key], ...] or an error to reject with.
+  var keysOfLicense = function (session, bytes) {
+    var json;
+    try { json = JSON.parse(emeTextOf(bytes)); } catch (e) { return typeError("execute 'update' on 'MediaKeySession'", "The response is not valid JSON."); }
+    if (!json || !Array.isArray(json.keys) || json.keys.length === 0) return typeError("execute 'update' on 'MediaKeySession'", "The response is not a JSON Web Key Set with keys in it.");
+    if (json.type !== undefined && json.type !== session.__type) return typeError("execute 'update' on 'MediaKeySession'", "The license type '" + json.type + "' is not the type of the session.");
+    var out = [];
+    for (var i = 0; i < json.keys.length; i++) {
+      var jwk = json.keys[i];
+      if (!jwk || jwk.kty !== 'oct') return typeError("execute 'update' on 'MediaKeySession'", "Every key has to be of type 'oct'.");
+      var kid = b64uDecode(jwk.kid), key = b64uDecode(jwk.k);
+      if (!kid || kid.length !== 16 || !key || key.length !== 16) return typeError("execute 'update' on 'MediaKeySession'", "A key and its identifier have to be 16 bytes.");
+      out.push([kid, key]);
+    }
+    return out;
+  };
+  var rememberLicense = function (session, pairs) {
+    if (session.__type !== 'persistent-license') return;
+    var all = savedLicenses();
+    var record = all[session.__id] || { keys: [] };
+    pairs.forEach(function (p) {
+      var kid = b64uEncode(p[0]);
+      record.keys = record.keys.filter(function (k) { return k[0] !== kid; });
+      record.keys.push([kid, b64uEncode(p[1])]);
+    });
+    all[session.__id] = record;
+    saveLicenses(all);
+  };
+  method(MediaKeySession.prototype, 'update', function (response) {
+    var session = this;
+    var problem = callable(session);
+    if (problem) return rejectedWith(problem);
+    var bytes = emeBytesOf(response);
+    if (!bytes) return rejectedWith(typeError("execute 'update' on 'MediaKeySession'", "The provided value is not of type '(ArrayBuffer or ArrayBufferView)'."));
+    if (bytes.length === 0) return rejectedWith(typeError("execute 'update' on 'MediaKeySession'", "The response parameter is empty."));
+    if (session.__state === 'releasing') {   // the acknowledgement of a license release: the session is over
+      try { JSON.parse(emeTextOf(bytes)); } catch (e) { return rejectedWith(typeError("execute 'update' on 'MediaKeySession'", "The response is not valid JSON.")); }
+      closeSession(session);
+      return Promise.resolve();
+    }
+    var pairs = keysOfLicense(session, bytes);
+    if (!Array.isArray(pairs)) return rejectedWith(pairs);
+    for (var i = 0; i < pairs.length; i++)
+      if (!__eme_add_key(session.__keys.__id, session.__token, pairs[i][0], pairs[i][1])) return rejectedWith(emeDom('The key table is full.', 'QuotaExceededError'));
+    if (setStatus(session, pairs.map(function (p) { return p[0]; }), 'usable')) statusChanged(session);
+    rememberLicense(session, pairs);
+    return Promise.resolve();
+  });
+  method(MediaKeySession.prototype, 'close', function () {
+    var session = this;
+    if (session.__state === 'closed') return Promise.resolve();
+    if (session.__id === '' && session.__state === 'new') return rejectedWith(emeDom('The session is not callable.', 'InvalidStateError'));
+    closeSession(session);
+    return Promise.resolve();
+  });
+  method(MediaKeySession.prototype, 'remove', function () {
+    var session = this;
+    var problem = callable(session);
+    if (problem) return rejectedWith(problem);
+    var kids = session.__map.__entries.map(function (e) { return e[0]; });
+    if (session.__type === 'persistent-license') {
+      var all = savedLicenses();
+      delete all[session.__id];
+      saveLicenses(all);
+      __eme_remove_session(session.__keys.__id, session.__token);
+      setStatus(session, kids, 'released');
+      session.__state = 'releasing';
+      statusChanged(session);
+      sessionMessage(session, 'license-release', '{"kids":[' + kidList(kids) + ']}');
+      return Promise.resolve();
+    }
+    closeSession(session);
+    return Promise.resolve();
+  });
+  method(MediaKeySession.prototype, 'load', function (sessionId) {
+    var session = this;
+    if (session.__type !== 'persistent-license') return rejectedWith(typeError("execute 'load' on 'MediaKeySession'", "The session is not a persistent one."));
+    sessionId = String(sessionId);
+    if (sessionId === '') return rejectedWith(typeError("execute 'load' on 'MediaKeySession'", "The session ID is empty."));
+    if (session.__state === 'closed') return rejectedWith(emeDom('The session is already closed.', 'InvalidStateError'));
+    if (session.__id !== '') return rejectedWith(emeDom('The session is already initialized.', 'InvalidStateError'));
+    var record = savedLicenses()[sessionId];
+    if (!record || !Array.isArray(record.keys)) return Promise.resolve(false);
+    var kids = [];
+    for (var i = 0; i < record.keys.length; i++) {
+      var kid = b64uDecode(record.keys[i][0]), key = b64uDecode(record.keys[i][1]);
+      if (!kid || !key || kid.length !== 16 || key.length !== 16) return Promise.resolve(false);
+      __eme_add_key(session.__keys.__id, session.__token, kid, key);
+      kids.push(kid);
+    }
+    session.__id = sessionId;
+    session.__state = 'active';
+    session.__keys.__sessions.push(session);
+    if (setStatus(session, kids, 'usable')) statusChanged(session);
+    return Promise.resolve(true);
+  });
+
+  function MediaKeys() { throw new TypeError('Illegal constructor'); }
+  method(MediaKeys.prototype, 'createSession', function (sessionType) {
+    sessionType = sessionType === undefined ? 'temporary' : String(sessionType);
+    if (sessionType !== 'temporary' && sessionType !== 'persistent-license' && sessionType !== 'persistent-usage-record')
+      throw typeError("execute 'createSession' on 'MediaKeys'", "The provided value '" + sessionType + "' is not a valid enum value of type MediaKeySessionType.");
+    if (this.__sessionTypes.indexOf(sessionType) < 0) throw emeDom("The session type '" + sessionType + "' is not supported.", 'NotSupportedError');
+    return newSession(this, sessionType);
+  });
+  method(MediaKeys.prototype, 'setServerCertificate', function (certificate) {
+    if (!emeBytesOf(certificate)) return rejectedWith(typeError("execute 'setServerCertificate' on 'MediaKeys'", "The provided value is not of type '(ArrayBuffer or ArrayBufferView)'."));
+    return Promise.resolve(false);   // (Clear Key has no use for one)
+  });
+  method(MediaKeys.prototype, 'getStatusForPolicy', function (policy) {
+    return Promise.resolve('usable');
+  });
+
+  function MediaKeySystemAccess() { throw new TypeError('Illegal constructor'); }
+  method(MediaKeySystemAccess.prototype, 'getConfiguration', function () { return JSON.parse(JSON.stringify(this.__config)); });
+  method(MediaKeySystemAccess.prototype, 'createMediaKeys', function () {
+    var access = this;
+    return new Promise(function (resolve, reject) {
+      var id = __eme_create_keys();
+      if (!id) { reject(emeDom('There are too many MediaKeys objects.', 'QuotaExceededError')); return; }
+      var keys = Object.create(MediaKeys.prototype);
+      hide(keys, '__id', id);
+      hide(keys, '__sessions', []);
+      hide(keys, '__sessionTypes', access.__config.sessionTypes.slice());
+      hide(keys, '__element', null);
+      resolve(keys);
+    });
+  });
+
+  // The configuration of a request, cut down to what Clear Key does; null if nothing of it is possible.
+  var capabilitiesOf = function (list) {
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var cap = list[i];
+      if (!cap || typeof cap.contentType !== 'string' || !__mse_supported(cap.contentType)) continue;
+      if (cap.robustness !== undefined && cap.robustness !== '') continue;
+      var scheme = cap.encryptionScheme === undefined ? null : cap.encryptionScheme;
+      if (scheme !== null && scheme !== 'cenc' && scheme !== 'cbcs' && scheme !== 'cbcs-1-9') continue;
+      out.push({ contentType: cap.contentType, robustness: '', encryptionScheme: scheme });
+    }
+    return out;
+  };
+  var negotiate = function (config) {
+    if (!isObject(config)) return null;
+    var result = { initDataTypes: [], audioCapabilities: [], videoCapabilities: [], distinctiveIdentifier: 'not-allowed', persistentState: 'not-allowed', sessionTypes: ['temporary'], label: config.label === undefined ? '' : String(config.label) };
+    if (Array.isArray(config.initDataTypes) && config.initDataTypes.length > 0) {
+      result.initDataTypes = config.initDataTypes.map(String).filter(function (t) { return t === 'cenc' || t === 'keyids' || t === 'webm'; });
+      if (result.initDataTypes.length === 0) return null;
+    }
+    if (config.distinctiveIdentifier === 'required') return null;
+    var wantsPersistent = false;
+    if (config.sessionTypes !== undefined) {
+      if (!Array.isArray(config.sessionTypes)) return null;
+      for (var i = 0; i < config.sessionTypes.length; i++) {
+        var type = String(config.sessionTypes[i]);
+        if (type === 'persistent-license') wantsPersistent = true;
+        else if (type !== 'temporary') return null;
+      }
+      result.sessionTypes = config.sessionTypes.map(String);
+    }
+    if (config.persistentState === 'required' || wantsPersistent) {
+      if (config.persistentState === 'not-allowed' || !storageAvailable()) return null;
+      result.persistentState = 'required';
+    }
+    if (Array.isArray(config.audioCapabilities) && config.audioCapabilities.length > 0) {
+      result.audioCapabilities = capabilitiesOf(config.audioCapabilities);
+      if (result.audioCapabilities.length === 0) return null;
+    }
+    if (Array.isArray(config.videoCapabilities) && config.videoCapabilities.length > 0) {
+      result.videoCapabilities = capabilitiesOf(config.videoCapabilities);
+      if (result.videoCapabilities.length === 0) return null;
+    }
+    return result;
+  };
+  var requestAccess = function (keySystem, configs) {
+    if (arguments.length < 2) return rejectedWith(typeError("execute 'requestMediaKeySystemAccess' on 'Navigator'", arguments.length + " arguments required, but only " + arguments.length + " present."));
+    keySystem = String(keySystem);
+    if (!Array.isArray(configs)) return rejectedWith(typeError("execute 'requestMediaKeySystemAccess' on 'Navigator'", "The provided value cannot be converted to a sequence."));
+    if (configs.length === 0) return rejectedWith(typeError("execute 'requestMediaKeySystemAccess' on 'Navigator'", "The supportedConfigurations parameter is empty."));
+    if (keySystem !== CLEARKEY) return rejectedWith(emeDom('Unsupported keySystem or supportedConfigurations.', 'NotSupportedError'));
+    for (var i = 0; i < configs.length; i++) {
+      var accumulated = negotiate(configs[i]);
+      if (!accumulated) continue;
+      var access = Object.create(MediaKeySystemAccess.prototype);
+      hide(access, '__config', accumulated);
+      Object.defineProperty(access, 'keySystem', { value: CLEARKEY, enumerable: true });
+      return Promise.resolve(access);
+    }
+    return rejectedWith(emeDom('Unsupported keySystem or supportedConfigurations.', 'NotSupportedError'));
+  };
+  if (g.navigator && !g.navigator.requestMediaKeySystemAccess) hide(g.navigator, 'requestMediaKeySystemAccess', requestAccess);
+
+  // The media element: setMediaKeys() says which MediaKeys decrypts what it plays.
+  if (g.HTMLMediaElement) {
+    var MP = g.HTMLMediaElement.prototype;
+    accessor(MP, 'mediaKeys', function () { return this.__mediaKeys || null; });
+    method(MP, 'setMediaKeys', function (keys) {
+      var element = this;
+      return new Promise(function (resolve, reject) {
+        if (keys !== null && !(keys instanceof MediaKeys)) { reject(typeError("execute 'setMediaKeys' on 'HTMLMediaElement'", "The provided value is not of type 'MediaKeys'.")); return; }
+        if (keys && keys.__element && keys.__element !== element) { reject(emeDom('The MediaKeys object is in use by another media element.', 'QuotaExceededError')); return; }
+        if (element.__mediaKeys) element.__mediaKeys.__element = null;
+        Object.defineProperty(element, '__mediaKeys', { value: keys, writable: true, configurable: true });
+        if (keys) keys.__element = element;
+        __eme_set_keys(element, keys ? keys.__id : 0);
+        resolve();
+      });
+    });
+  }
+  hide(g, 'MediaKeySystemAccess', MediaKeySystemAccess);
+  hide(g, 'MediaKeys', MediaKeys);
+  hide(g, 'MediaKeySession', MediaKeySession);
+  hide(g, 'MediaKeyStatusMap', MediaKeyStatusMap);
+  hide(g, 'MediaKeyMessageEvent', MediaKeyMessageEvent);
+  hide(g, 'MediaEncryptedEvent', MediaEncryptedEvent);
+
   // navigator.mediaCapabilities: what players ask before choosing a rendition. What can be played is what a SourceBuffer takes.
   if (g.navigator && !g.navigator.mediaCapabilities) {
     hide(g.navigator, 'mediaCapabilities', {
@@ -651,7 +1076,18 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
           if (!entry || typeof entry.contentType !== 'string') { reject(new TypeError("Failed to execute 'decodingInfo' on 'MediaCapabilities': The configuration dictionary has neither a video nor an audio member.")); return; }
           var ok = (config.type === 'media-source' || config.type === 'file') && __mse_supported(entry.contentType);
           if (ok && config.video && config.audio) ok = __mse_supported(config.audio.contentType);
-          resolve({ supported: ok, smooth: ok, powerEfficient: false });
+          var info = { supported: ok, smooth: ok, powerEfficient: false };
+          var ks = config.keySystemConfiguration;
+          if (ok && ks) {   // encrypted: only Clear Key, and the configuration has to be one it can do
+            if (ks.keySystem !== CLEARKEY) { resolve({ supported: false, smooth: false, powerEfficient: false }); return; }
+            var request = { initDataType: ks.initDataType };
+            requestAccess(CLEARKEY, [{ initDataTypes: ks.initDataType ? [ks.initDataType] : [], videoCapabilities: config.video ? [{ contentType: config.video.contentType, robustness: ks.video && ks.video.robustness || '' }] : [], audioCapabilities: config.audio ? [{ contentType: config.audio.contentType, robustness: ks.audio && ks.audio.robustness || '' }] : [], sessionTypes: ks.sessionTypes, persistentState: ks.persistentState, distinctiveIdentifier: ks.distinctiveIdentifier }]).then(function (access) {
+              info.keySystemAccess = access;
+              resolve(info);
+            }, function () { resolve({ supported: false, smooth: false, powerEfficient: false }); });
+            return;
+          }
+          resolve(info);
         });
       }
     });
@@ -1695,7 +2131,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
    'onkeypress', 'oninput', 'onchange', 'onfocus', 'onblur', 'onsubmit', 'onreset', 'oninvalid', 'onselect', 'onscroll', 'onload', 'onerror', 'onabort', 'ondrag', 'ondragstart', 'ondragend',
    'ondragover', 'ondragenter', 'ondragleave', 'ondrop', 'ontouchstart', 'ontouchend', 'ontouchmove', 'ontouchcancel', 'onpointerdown', 'onpointerup', 'onpointermove', 'onpointerover',
    'onpointerout', 'onpointerenter', 'onpointerleave', 'onpointercancel', 'ontransitionend', 'onanimationend', 'oncopy', 'oncut', 'onpaste', 'oncanplay', 'onplay', 'onpause', 'onended',
-   'ontimeupdate', 'onvolumechange', 'onloadstart', 'onloadedmetadata', 'onloadeddata', 'oncanplaythrough', 'onplaying', 'onwaiting', 'onseeking', 'onseeked', 'ondurationchange', 'onratechange', 'onprogress', 'onsuspend', 'onstalled', 'onemptied', 'ontoggle', 'onauxclick', 'ongotpointercapture', 'onlostpointercapture'].forEach(function (name) { Object.defineProperty(EP, name, { value: null, writable: true }); });
+   'ontimeupdate', 'onvolumechange', 'onencrypted', 'onwaitingforkey', 'onloadstart', 'onloadedmetadata', 'onloadeddata', 'oncanplaythrough', 'onplaying', 'onwaiting', 'onseeking', 'onseeked', 'ondurationchange', 'onratechange', 'onprogress', 'onsuspend', 'onstalled', 'onemptied', 'ontoggle', 'onauxclick', 'ongotpointercapture', 'onlostpointercapture'].forEach(function (name) { Object.defineProperty(EP, name, { value: null, writable: true }); });
   ['onerror', 'onresize', 'onhashchange', 'onpopstate', 'onmessage', 'onmessageerror', 'onstorage', 'onbeforeunload', 'onunload', 'ononline', 'onoffline', 'onfocus', 'onblur', 'onpageshow',
    'onpagehide', 'onunhandledrejection', 'onrejectionhandled', 'onlanguagechange', 'onclick', 'onkeydown', 'onkeyup', 'oninput', 'onchange', 'onsubmit', 'onscroll', 'onwheel'].forEach(function (name) {
     if (g[name] === undefined) g[name] = null;

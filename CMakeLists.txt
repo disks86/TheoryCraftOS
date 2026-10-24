@@ -461,6 +461,7 @@ add_executable(BOOTX64
   src/Media/MseParsers.cpp
   src/Media/MseBuffer.cpp
   src/Media/MseHub.cpp
+  src/Media/Eme.cpp
   src/Media/VideoFiles.cpp
   src/Media/MediaCodecs.cpp
   src/Video/AviFile.cpp

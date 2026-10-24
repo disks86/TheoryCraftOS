@@ -18,6 +18,8 @@
 
 // A SourceBuffer's frames: the coded frame processing of the Media Source Extensions, the buffered ranges, and the files written for the players.
 #include "Media/Mse.hpp"
+#include "Crypto/Crypto.hpp"
+#include "Utility/ByteStream.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/Move.hpp"
 
@@ -104,6 +106,164 @@ void sort_ranges(ArrayView<MseBuffer::Range> a) {
 
 }  // namespace
 
+// The protection record of an encrypted frame (kept beside the frame's bytes): scheme, key identifier, IV, pattern, subsamples.
+constexpr uint32_t kAuxHeader = 40;
+
+bool put_aux(ByteBuffer* b, const MseSampleCrypto& c) {
+  uint8_t head[kAuxHeader] = {};
+  head[0] = static_cast<uint8_t>(c.scheme);
+  for (int i = 0; i < 16; ++i) {
+    head[1 + i] = c.kid[i];
+    head[17 + i] = c.iv[i];
+  }
+  head[33] = c.crypt_blocks;
+  head[34] = c.skip_blocks;
+  head[36] = static_cast<uint8_t>(c.subsample_count >> 24);
+  head[37] = static_cast<uint8_t>(c.subsample_count >> 16);
+  head[38] = static_cast<uint8_t>(c.subsample_count >> 8);
+  head[39] = static_cast<uint8_t>(c.subsample_count);
+  return b->append(ConstByteView(head, kAuxHeader)) && b->append(c.subsamples);
+}
+
+struct CryptoRecord {
+  MseScheme scheme = MseScheme::None;
+  uint8_t kid[16] = {};
+  uint8_t iv[16] = {};
+  uint8_t crypt = 0, skip = 0;
+  uint32_t count = 0;
+  ConstByteView subsamples;
+  uint64_t size = 0;   // bytes the record takes
+};
+
+bool get_aux(ConstByteView all, uint32_t aux, CryptoRecord* r) {
+  if (aux == 0) return false;
+  ConstByteView rec;
+  if (!all.try_subview(aux - 1, kAuxHeader, &rec)) return false;
+  r->scheme = static_cast<MseScheme>(rec[0]);
+  for (int i = 0; i < 16; ++i) {
+    r->kid[i] = rec[1 + i];
+    r->iv[i] = rec[17 + i];
+  }
+  r->crypt = rec[33];
+  r->skip = rec[34];
+  r->count = (uint32_t{rec[36]} << 24) | (uint32_t{rec[37]} << 16) | (uint32_t{rec[38]} << 8) | rec[39];
+  if (r->count > 0xFFFF || !all.try_subview(uint64_t{aux} - 1 + kAuxHeader, uint64_t{r->count} * 6, &r->subsamples)) return false;
+  r->size = kAuxHeader + uint64_t{r->count} * 6;
+  return true;
+}
+
+void increment_counter(uint8_t counter[16]) {
+  for (int i = 15; i >= 0; --i)
+    if (++counter[i] != 0) break;
+}
+
+// Decrypts one sample in place, as its scheme says (ISO/IEC 23001-7): the byte ranges of the subsamples that are protected, and in them
+//   cenc  AES-CTR over every byte, the keystream running on from one range to the next
+//   cens  AES-CTR over the blocks the pattern (crypt, skip) picks, a partial block at the end of a range left alone
+//   cbc1  AES-CBC over the whole blocks, the chain running on from one range to the next
+//   cbcs  AES-CBC over the blocks the pattern picks, the chain starting again from the IV at every range
+void decrypt_sample(const crypto::Aes& aes, const CryptoRecord& r, ByteView data) {
+  struct Range {
+    uint64_t start, length;
+  };
+  // the protected ranges
+  uint8_t counter[16];
+  for (int i = 0; i < 16; ++i) counter[i] = r.iv[i];
+  uint8_t stream[16];
+  uint32_t used = 16;   // bytes of `stream` taken
+  uint8_t chain[16];
+  for (int i = 0; i < 16; ++i) chain[i] = r.iv[i];
+  const auto each_range = [&](auto&& fn) {
+    if (r.count == 0) {
+      fn(Range{0, data.size()});
+      return;
+    }
+    ByteReader u(r.subsamples);
+    uint64_t at = 0;
+    for (uint32_t k = 0; k < r.count; ++k) {
+      const uint64_t clear = u.be16();
+      const uint64_t protected_bytes = u.be32();
+      at += clear;
+      if (!u.ok() || at > data.size() || protected_bytes > data.size() - at) return;
+      if (protected_bytes) fn(Range{at, protected_bytes});
+      at += protected_bytes;
+    }
+  };
+  // the runs of whole blocks a pattern picks inside a range: calls fn(start, blocks)
+  const auto each_run = [&](const Range& range, auto&& fn) {
+    const uint64_t blocks = range.length / 16;
+    if (r.crypt == 0 && r.skip == 0) {
+      if (blocks) fn(range.start, blocks);
+      return;
+    }
+    if (r.crypt == 0) return;
+    for (uint64_t b = 0; b < blocks; b += uint64_t{r.crypt} + r.skip) {
+      const uint64_t n = blocks - b < r.crypt ? blocks - b : r.crypt;
+      fn(range.start + b * 16, n);
+    }
+  };
+  switch (r.scheme) {
+    case MseScheme::Cenc:
+      each_range([&](const Range& range) {
+        for (uint64_t i = 0; i < range.length; ++i) {
+          if (used == 16) {
+            aes.encrypt_block(counter, stream);
+            increment_counter(counter);
+            used = 0;
+          }
+          data[range.start + i] ^= stream[used++];
+        }
+      });
+      break;
+    case MseScheme::Cens:
+      each_range([&](const Range& range) {
+        each_run(range, [&](uint64_t start, uint64_t blocks) {
+          for (uint64_t b = 0; b < blocks; ++b) {
+            aes.encrypt_block(counter, stream);
+            increment_counter(counter);
+            for (int i = 0; i < 16; ++i) data[start + b * 16 + i] ^= stream[i];
+          }
+        });
+      });
+      break;
+    case MseScheme::Cbc1:
+      each_range([&](const Range& range) {
+        const uint64_t whole = range.length & ~uint64_t{15};
+        if (!whole) return;
+        uint8_t last[16];
+        for (int i = 0; i < 16; ++i) last[i] = data[range.start + whole - 16 + i];
+        aes.cbc(chain, data.subview(range.start, whole), true);
+        for (int i = 0; i < 16; ++i) chain[i] = last[i];
+      });
+      break;
+    case MseScheme::Cbcs:
+      each_range([&](const Range& range) {
+        for (int i = 0; i < 16; ++i) chain[i] = r.iv[i];
+        each_run(range, [&](uint64_t start, uint64_t blocks) {
+          uint8_t last[16];
+          for (int i = 0; i < 16; ++i) last[i] = data[start + blocks * 16 - 16 + i];
+          aes.cbc(chain, data.subview(start, blocks * 16), true);
+          for (int i = 0; i < 16; ++i) chain[i] = last[i];
+        });
+      });
+      break;
+    default: break;
+  }
+}
+
+// A key identifier as base64url text without padding (what the "keyids" init data of EME uses).
+void base64url(const uint8_t* bytes, uint32_t n, ByteBuffer* out) {
+  static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  for (uint32_t i = 0; i < n; i += 3) {
+    const uint32_t b0 = bytes[i], b1 = i + 1 < n ? bytes[i + 1] : 0, b2 = i + 2 < n ? bytes[i + 2] : 0;
+    const uint32_t v = (b0 << 16) | (b1 << 8) | b2;
+    out->put8(static_cast<uint8_t>(kAlphabet[(v >> 18) & 63]));
+    out->put8(static_cast<uint8_t>(kAlphabet[(v >> 12) & 63]));
+    if (i + 1 < n) out->put8(static_cast<uint8_t>(kAlphabet[(v >> 6) & 63]));
+    if (i + 2 < n) out->put8(static_cast<uint8_t>(kAlphabet[v & 63]));
+  }
+}
+
 // --- MseInit ------------------------------------------------------------------------------------------------------------------------------
 
 ConstByteView MseInit::entry(const MseTrackInfo& track) const {
@@ -122,8 +282,10 @@ bool MseInit::same_as(const MseInit& other) const {
       return false;
     const ConstByteView ea = entry(a), eb = other.entry(b);
     if (ea.size() != eb.size() || (ea.size() && __builtin_memcmp(ea.data(), eb.data(), ea.size()) != 0)) return false;
+    if (__builtin_memcmp(&a.protection, &b.protection, sizeof(MseProtection)) != 0) return false;
   }
-  return true;
+  const ConstByteView pa = pssh.view(), pb = other.pssh.view();
+  return pa.size() == pb.size() && (pa.size() == 0 || __builtin_memcmp(pa.data(), pb.data(), pa.size()) == 0);
 }
 
 const MseTrackInfo* MseInit::first_of(MseTrackKind kind) const {
@@ -208,7 +370,8 @@ struct MseBuffer::Slot {
 // --- The buffer ---------------------------------------------------------------------------------------------------------------------------
 
 MseBuffer::MseBuffer(allocators::IAllocator& allocator, MseFormat format, uint32_t id)
-    : allocator_(allocator), format_(format), id_(id), parser_(make_mse_parser(allocator, format)), inits_(allocator), arena_(UniquePointer<ByteBuffer>::make(allocator, allocator)), range_cache_(allocator) {
+    : allocator_(allocator), format_(format), id_(id), parser_(make_mse_parser(allocator, format)), inits_(allocator), arena_(UniquePointer<ByteBuffer>::make(allocator, allocator)), aux_(UniquePointer<ByteBuffer>::make(allocator, allocator)), encrypted_(allocator), sent_(allocator),
+      range_cache_(allocator) {
   for (int8_t& m : slot_map_) m = -1;
   if (format != MseFormat::Mp4) mode_ = Mode::Sequence;   // (the formats without timestamps of their own are always in sequence mode)
 }
@@ -325,6 +488,32 @@ bool MseBuffer::init_segment(UniquePointer<MseInit> init) {
   }
   if (init->duration_us >= 0) init_duration_us_ = init->duration_us;
   if (generation == inits_.count()) {
+    // protected content: the init data for an "encrypted" event is the 'pssh' boxes, or without them the key identifiers
+    bool any_protected = false;
+    for (const MseTrackInfo& t : init->tracks.view()) any_protected = any_protected || t.protection.is_protected;
+    if (init->pssh.size() > 0) {
+      queue_encrypted(false, init->pssh.view());
+    } else if (any_protected) {
+      ByteBuffer json(allocator_);
+      json.append(ConstByteView(reinterpret_cast<const uint8_t*>("{\"kids\":["), 9));
+      bool first = true;
+      for (uint64_t ti = 0; ti < init->tracks.count(); ++ti) {
+        const MseTrackInfo& t = init->tracks[ti];
+        if (!t.protection.is_protected) continue;
+        bool seen = false;   // (tracks that share a key announce it once)
+        for (uint64_t earlier = 0; earlier < ti; ++earlier)
+          if (init->tracks[earlier].protection.is_protected && __builtin_memcmp(init->tracks[earlier].protection.kid, t.protection.kid, 16) == 0) seen = true;
+        if (seen) continue;
+        if (!first) json.put8(',');
+        first = false;
+        json.put8('"');
+        base64url(t.protection.kid, 16, &json);
+        json.put8('"');
+      }
+      json.put8(']');
+      json.put8('}');
+      queue_encrypted(true, json.view());
+    }
     if (inits_.count() >= 256) return false;
     if (!inits_.push_back(util::move(init))) return false;
   }
@@ -338,7 +527,7 @@ bool MseBuffer::init_segment(UniquePointer<MseInit> init) {
 
 // --- Coded frame processing ---------------------------------------------------------------------------------------------------------------
 
-bool MseBuffer::frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t dur_us, bool sync, ConstByteView data) {
+bool MseBuffer::frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t dur_us, bool sync, ConstByteView data, const MseSampleCrypto* crypto) {
   if (track >= slot_map_count_ || slot_map_[track] < 0) return true;   // (a track that is not kept)
   const uint32_t si = static_cast<uint32_t>(slot_map_[track]);
   Slot& slot = *slots_[si];
@@ -367,7 +556,7 @@ bool MseBuffer::frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t du
       if (!sync) return true;
       slot.need_ra = false;
     }
-    if (!add_frame(si, pts, dts, dur_us, sync, data)) return false;
+    if (!add_frame(si, pts, dts, dur_us, sync, data, crypto)) return false;
     slot.has_last = true;
     slot.last_dts = dts;
     slot.last_dur = dur_us;
@@ -378,7 +567,7 @@ bool MseBuffer::frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t du
   return true;
 }
 
-bool MseBuffer::add_frame(uint32_t si, int64_t pts, int64_t dts, int64_t duration, bool sync, ConstByteView data) {
+bool MseBuffer::add_frame(uint32_t si, int64_t pts, int64_t dts, int64_t duration, bool sync, ConstByteView data, const MseSampleCrypto* crypto) {
   Slot& slot = *slots_[si];
   if (data.size() > UINT32_MAX) return false;
   remove_overlap(si, pts, duration);
@@ -389,6 +578,16 @@ bool MseBuffer::add_frame(uint32_t si, int64_t pts, int64_t dts, int64_t duratio
   }
   arena_used_ += data.size();
   Frame f;
+  f.aux = 0;
+  if (crypto) {
+    const uint64_t at_aux = aux_->size();
+    if (at_aux >= 0xFFFFFFF0u || !put_aux(aux_.get(), *crypto)) {
+      memory_error_ = true;
+      return false;
+    }
+    f.aux = static_cast<uint32_t>(at_aux + 1);
+    ++protected_frames_;
+  }
   f.pts = pts;
   f.dts = dts;
   f.duration = duration;
@@ -400,6 +599,7 @@ bool MseBuffer::add_frame(uint32_t si, int64_t pts, int64_t dts, int64_t duratio
   const uint64_t at = slot.frames.upper_bound_dts(dts);
   if (!slot.frames.insert(at, f)) {
     memory_error_ = true;
+    forget_aux(f);
     return false;
   }
   if (!slot.max_dirty && pts + duration > slot.max_end) slot.max_end = pts + duration;
@@ -447,6 +647,7 @@ void MseBuffer::erase_frames(uint32_t si, uint64_t first, uint64_t last) {
   for (uint64_t i = first; i < last; ++i) {
     const Frame& f = slot.frames[i];
     garbage_ += f.size;
+    forget_aux(f);
     if (f.pts < from) from = f.pts;
     if (f.pts + f.duration > to) to = f.pts + f.duration;
   }
@@ -482,7 +683,7 @@ MseAppend MseBuffer::append(ConstByteView bytes, int64_t playhead_us) {
     if (mode_ == Mode::Sequence) group_start_pending_ = true;
     return memory_error_ ? MseAppend::Memory : MseAppend::Decode;
   }
-  if (garbage_ > (4u << 20) && garbage_ > arena_used_ / 2) compact();
+  if ((garbage_ > (4u << 20) && garbage_ > arena_used_ / 2) || aux_garbage_ > (2u << 20)) compact();
   return MseAppend::Ok;
 }
 
@@ -509,6 +710,53 @@ void MseBuffer::compact() {
   arena_ = util::move(fresh);
   arena_used_ = at;
   garbage_ = 0;
+  // the protection records of the frames that are left
+  if (aux_garbage_ > 0 || protected_frames_ == 0) {
+    auto records = UniquePointer<ByteBuffer>::make(allocator_, allocator_);
+    if (!records) return;
+    for (uint32_t s = 0; s < slot_count_; ++s) {
+      FrameList& list = slots_[s]->frames;
+      for (uint64_t i = 0; i < list.size(); ++i) {
+        CryptoRecord rec;
+        if (list[i].aux == 0 || !get_aux(aux_->view(), list[i].aux, &rec)) continue;
+        const uint64_t where = records->size();
+        if (!records->append(aux_->view().subview(list[i].aux - 1, rec.size))) return;
+        list[i].aux = static_cast<uint32_t>(where + 1);
+      }
+    }
+    aux_ = util::move(records);
+    aux_garbage_ = 0;
+  }
+}
+
+void MseBuffer::forget_aux(const Frame& f) {
+  CryptoRecord rec;
+  if (f.aux == 0 || !get_aux(aux_->view(), f.aux, &rec)) return;
+  aux_garbage_ += rec.size;
+  if (protected_frames_ > 0) --protected_frames_;
+}
+
+void MseBuffer::queue_encrypted(bool keyids, ConstByteView data) {
+  for (const UniquePointer<ByteBuffer>& earlier : sent_.view()) {
+    const ConstByteView e = earlier->view();
+    if (e.size() == data.size() + 1 && e[0] == (keyids ? 1 : 0) && __builtin_memcmp(e.data() + 1, data.data(), data.size()) == 0) return;   // (announced already)
+  }
+  auto note = UniquePointer<ByteBuffer>::make(allocator_, allocator_);
+  auto event = UniquePointer<EncryptedEvent>::make(allocator_, allocator_);
+  if (!note || !event || !note->put8(keyids ? 1 : 0) || !note->append(data) || !event->data.append(data)) return;
+  event->keyids = keyids;
+  if (sent_.count() >= 16) sent_.remove_at(0);
+  sent_.push_back(util::move(note));
+  if (encrypted_.count() < 32) encrypted_.push_back(util::move(event));
+}
+
+void MseBuffer::protection_data(ConstByteView pssh_boxes) { queue_encrypted(false, pssh_boxes); }
+
+bool MseBuffer::take_encrypted(UniquePointer<EncryptedEvent>* out) {
+  if (encrypted_.count() == 0) return false;
+  *out = util::move(encrypted_[0]);
+  encrypted_.remove_at(0);
+  return true;
 }
 
 // --- Removing, evicting -----------------------------------------------------------------------------------------------------------------------
@@ -534,6 +782,7 @@ void MseBuffer::remove(int64_t start_us, int64_t end_us) {
       const Frame f = list[i];
       if (f.pts >= start_us && f.pts < end) {
         garbage_ += f.size;
+        forget_aux(f);
         if (f.pts < from) from = f.pts;
         if (f.pts + f.duration > to) to = f.pts + f.duration;
       } else {
@@ -661,7 +910,9 @@ void MseBuffer::buffered(List<Range>* out, int64_t reach) const {
 
 // --- Snapshots ------------------------------------------------------------------------------------------------------------------------------
 
-bool MseBuffer::plan(int64_t t, MseSnapshotPlan* out) const {
+bool MseBuffer::plan(int64_t t, MseSnapshotPlan* out) const { return plan_for(t, out, nullptr, nullptr) == MsePlan::Ok; }
+
+MsePlan MseBuffer::plan_for(int64_t t, MseSnapshotPlan* out, const IMseKeys* keys, uint8_t* missing_kid) const {
   List<Range> ranges(allocator_);
   buffered(&ranges);
   const Range* found = nullptr;
@@ -671,13 +922,13 @@ bool MseBuffer::plan(int64_t t, MseSnapshotPlan* out) const {
       break;
     }
   }
-  if (!found) return false;
+  if (!found) return MsePlan::NoData;
   const Slot* lead = nullptr;
   for (uint32_t s = 0; s < slot_count_; ++s) {
     if (slots_[s]->frames.size() == 0) continue;
     if (!lead || (slots_[s]->kind == MseTrackKind::Video && lead->kind != MseTrackKind::Video)) lead = slots_[s].get();
   }
-  if (!lead) return false;
+  if (!lead) return MsePlan::NoData;
   const int64_t at = t < found->start ? found->start : t;
   // the generation of the picture at `at`: the frame that covers it, else the first one after
   uint32_t generation = 0;
@@ -694,7 +945,7 @@ bool MseBuffer::plan(int64_t t, MseSnapshotPlan* out) const {
       generation = f.generation;
     }
   }
-  if (!have_generation && next_pts == INT64_MAX) return false;
+  if (!have_generation && next_pts == INT64_MAX) return MsePlan::NoData;
   int64_t start = found->start, end = found->end;
   if (inits_.count() > 1) {
     for (const Frame& f : lead->frames.view()) {
@@ -706,7 +957,38 @@ bool MseBuffer::plan(int64_t t, MseSnapshotPlan* out) const {
       }
     }
   }
-  if (end <= start) return false;
+  if (end <= start) return MsePlan::NoData;
+  // a picture can be decoded from a key frame: start at the one the playhead is in (what comes before it is not needed, and may need keys that are not there)
+  if (lead->kind == MseTrackKind::Video) {
+    int64_t gop = INT64_MIN;
+    for (const Frame& f : lead->frames.view())
+      if (f.sync && f.generation == generation && f.pts <= at && f.pts >= start && f.pts > gop) gop = f.pts;
+    if (gop != INT64_MIN) start = gop;
+  }
+  // encrypted frames: the plan reaches as far as there are keys
+  if (protected_frames_ > 0) {
+    int64_t cut = end;
+    uint8_t first_missing[16] = {};
+    bool any_missing = false;
+    for (uint32_t s = 0; s < slot_count_; ++s) {
+      for (const Frame& f : slots_[s]->frames.view()) {
+        if (f.aux == 0 || f.pts < start || f.pts >= end || f.pts >= cut) continue;
+        CryptoRecord rec;
+        uint8_t key[16];
+        if (!get_aux(aux_->view(), f.aux, &rec)) return MsePlan::NoData;
+        if (keys && keys->key_for(rec.kid, key)) continue;
+        cut = f.pts;
+        any_missing = true;
+        for (int k = 0; k < 16; ++k) first_missing[k] = rec.kid[k];
+      }
+    }
+    if (any_missing) {
+      if (missing_kid)
+        for (int k = 0; k < 16; ++k) missing_kid[k] = first_missing[k];
+      if (cut - start < 200000) return MsePlan::NeedKey;   // (the key for what is at the playhead is not there)
+      end = cut;
+    }
+  }
   out->start_us = start;
   out->end_us = end;
   out->generation = generation;
@@ -720,11 +1002,51 @@ bool MseBuffer::plan(int64_t t, MseSnapshotPlan* out) const {
       out->height = v->height;
     }
   }
-  return true;
+  return MsePlan::Ok;
+}
+
+MseDecrypt MseBuffer::decrypt(const IMseKeys& keys, const MseSnapshotPlan& plan, uint8_t* missing_kid) {
+  if (protected_frames_ == 0) return MseDecrypt::Ok;
+  crypto::Aes aes;
+  uint8_t current_key[16] = {};
+  bool have_key = false;
+  for (uint32_t s = 0; s < slot_count_; ++s) {
+    FrameList& list = slots_[s]->frames;
+    for (uint64_t i = 0; i < list.size(); ++i) {
+      Frame& f = list[i];
+      if (f.aux == 0 || f.pts < plan.start_us || f.pts >= plan.end_us) continue;
+      CryptoRecord rec;
+      uint8_t key[16];
+      if (!get_aux(aux_->view(), f.aux, &rec)) return MseDecrypt::Failed;
+      if (!keys.key_for(rec.kid, key)) {
+        if (missing_kid)
+          for (int k = 0; k < 16; ++k) missing_kid[k] = rec.kid[k];
+        return MseDecrypt::NeedKey;
+      }
+      if (!have_key || __builtin_memcmp(current_key, key, 16) != 0) {
+        if (!aes.set_key(ConstByteView(key, 16))) return MseDecrypt::Failed;
+        for (int k = 0; k < 16; ++k) current_key[k] = key[k];
+        have_key = true;
+      }
+      ByteView bytes = arena_->writable_view();
+      if (f.offset > bytes.size() || f.size > bytes.size() - f.offset) return MseDecrypt::Failed;
+      decrypt_sample(aes, rec, bytes.subview(f.offset, f.size));
+      aux_garbage_ += rec.size;
+      f.aux = 0;   // (in the clear from now on)
+      --protected_frames_;
+    }
+  }
+  return MseDecrypt::Ok;
 }
 
 bool MseBuffer::snapshot(MseSnapshotPlan* plan, ByteBuffer* out) const {
   out->clear();
+  if (slot_count_ == 0) return false;
+  if (protected_frames_ > 0) {   // (nothing encrypted goes into a file: decrypt() first)
+    for (uint32_t s = 0; s < slot_count_; ++s)
+      for (const Frame& f : slots_[s]->frames.view())
+        if (f.aux != 0 && f.pts >= plan->start_us && f.pts < plan->end_us) return false;
+  }
   if (format_ != MseFormat::Mp4) {
     // the frames of the range, one after the other, are the file
     const FrameList& list = slots_[0]->frames;

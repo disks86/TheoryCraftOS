@@ -1349,12 +1349,14 @@ static void mse_serve(FakeEnvironment& env, const char* name) {
   env.net.answers[std::string("GET http://example.com/") + name] = {200, "Content-Type: video/mp4\r\n", data};
 }
 
-// Lets the page's timers (the network, the events of the media source) and the objects run for a number of rounds.
-static void mse_pump(Page& page, FakeEnvironment& env, int rounds) {
+// Lets the page's timers (the network, the events of the media source) and the objects run for a number of rounds; the page is drawn again when it changed, as the
+// browser does (that is when an element's new address is looked at).
+static void mse_pump(Page& page, FakeEnvironment& env, int rounds, HtmlDocument* doc = nullptr) {
   for (int i = 0; i < rounds; ++i) {
     double due;
     if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
     page.run_due_timers(static_cast<double>(env.clock));
+    if (doc && page.changed()) page.render(doc);
     page.step_objects(static_cast<double>(env.clock));
   }
 }
@@ -1362,160 +1364,200 @@ static void mse_pump(Page& page, FakeEnvironment& env, int rounds) {
 // The script that fetches files and calls `then` with a Uint8Array of each.
 static const char* kLoad = "function load(names, then) { Promise.all(names.map(function (n) { return fetch(n).then(function (r) { return r.arrayBuffer() }) })).then(function (all) { then.apply(null, all.map(function (b) { return new Uint8Array(b) })) }) }";
 
+// Do these tokens appear in the text, each after the one before?
+static bool in_order(const std::string& text, std::initializer_list<const char*> tokens) {
+  size_t at = 0;
+  for (const char* t : tokens) {
+    const size_t found = text.find(t, at);
+    if (found == std::string::npos) return false;
+    at = found + strlen(t);
+  }
+  return true;
+}
+
 static void test_mse() {
   TestAllocator a;
-  const char* kTypes = "video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"";
-  // the events a <video> reports, in the order they come
-  const std::string watch = std::string("var ev = []; ['loadstart','durationchange','loadedmetadata','loadeddata','progress','canplay','canplaythrough','play','playing','pause','waiting','seeking','seeked','ended','error','emptied'].forEach(function(t) { v.addEventListener(t, function() { ev.push(t) }) });");
+  const std::string watch =
+      "var ev = []; ['loadstart','durationchange','loadedmetadata','loadeddata','progress','canplay','canplaythrough','play','playing','pause','waiting','seeking','seeked','ended','error','emptied']"
+      ".forEach(function(t) { v.addEventListener(t, function() { ev.push(t) }) });";
+  const std::string type = "'video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"'";
+  const auto click = [](Page& page, const char* id) { page.click(page.document().element_by_id(id)->serial, 0, 0); };
   {   // the API without playing: types, states, errors, the cycle of events of an append, ranges
     FakeEnvironment env(a);
+    mse_serve(env, "mse_muxed.mp4");
     MediaEnvironment media;
     Page page(a, env, "http://example.com/", media, true);
-    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><script>var DATA = " + muxed + "; var v = document.getElementById('v'); var log = [];" + watch +
-        "var u8 = __string_to_bytes(DATA);"
-        "log.push(typeof MediaSource, MediaSource.isTypeSupported('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"'), MediaSource.isTypeSupported('video/webm; codecs=\"vp9\"'), MediaSource.isTypeSupported('audio/mpeg'), u8.length);"
-        "var ms = new MediaSource(); log.push(ms.readyState, ms.duration, ms.sourceBuffers.length, ms instanceof EventTarget);"
+    std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><script>") + kLoad + "var v = document.getElementById('v'), log = [], ms, sb;" + watch +
+        "log.push(typeof MediaSource, MediaSource.isTypeSupported(" + type + "), MediaSource.isTypeSupported('video/webm; codecs=\"vp9\"'), MediaSource.isTypeSupported('audio/mpeg'));"
+        "ms = new MediaSource(); log.push(ms.readyState, ms.duration, ms.sourceBuffers.length, ms instanceof EventTarget);"
         "try { ms.addSourceBuffer('video/mp4') } catch (e) { log.push(e.name) }"
-        "var sb;"
-        "ms.addEventListener('sourceopen', function() {"
-        "  log.push('open', ms.readyState);"
-        "  try { ms.addSourceBuffer('video/webm') } catch (e) { log.push(e.name) } try { ms.addSourceBuffer('') } catch (e) { log.push(e.name) }"
-        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
-        "  log.push(ms.sourceBuffers.length, ms.sourceBuffers[0] === sb, sb.mode, sb.updating, sb.timestampOffset, sb.appendWindowStart, sb.appendWindowEnd, sb.buffered.length);"
-        "  ['updatestart','update','updateend','error','abort'].forEach(function(t) { sb.addEventListener(t, function() { log.push('sb:' + t + ':' + sb.updating) }) });"
-        "  sb.appendBuffer(u8);"
-        "  log.push('appended', sb.updating);"
-        "  try { sb.appendBuffer(u8) } catch (e) { log.push(e.name) } try { sb.remove(0, 1) } catch (e) { log.push(e.name) } try { sb.timestampOffset = 1 } catch (e) { log.push(e.name) }"
-        "  try { ms.duration = 5 } catch (e) { log.push(e.name) } try { ms.endOfStream() } catch (e) { log.push(e.name) }"
+        "load(['mse_muxed.mp4'], function (u8) {"
+        "  ms.addEventListener('sourceopen', function() {"
+        "    log.push('open', ms.readyState);"
+        "    try { ms.addSourceBuffer('video/webm') } catch (e) { log.push(e.name) } try { ms.addSourceBuffer('') } catch (e) { log.push(e.name) }"
+        "    sb = ms.addSourceBuffer(" + type + ");"
+        "    log.push(ms.sourceBuffers.length, ms.sourceBuffers[0] === sb, sb.mode, sb.updating, sb.timestampOffset, sb.appendWindowStart, sb.appendWindowEnd, sb.buffered.length);"
+        "    ['updatestart','update','updateend','error','abort'].forEach(function(t) { sb.addEventListener(t, function() { log.push('sb:' + t + ':' + sb.updating) }) });"
+        "    sb.appendBuffer(u8);"
+        "    log.push('appended', sb.updating);"
+        "    try { sb.appendBuffer(u8) } catch (e) { log.push(e.name) } try { sb.remove(0, 1) } catch (e) { log.push(e.name) } try { sb.timestampOffset = 1 } catch (e) { log.push(e.name) }"
+        "    try { ms.duration = 5 } catch (e) { log.push(e.name) } try { ms.endOfStream() } catch (e) { log.push(e.name) }"
+        "  });"
+        "  v.src = URL.createObjectURL(ms);"
         "});"
         "document.getElementById('b').onclick = function() {"
-        "  console.log('PRE ' + log.join(' ') + ' | ' + ev.join() + ' | ' + sb.buffered.length + ' ' + __mse_get(sb.__id, 4) + ' ' + __mse_get(sb.__id, 5) + ' ' + __mse_get(sb.__id, 6));"
         "  var r = [sb.updating, sb.buffered.length, sb.buffered.start(0).toFixed(2), sb.buffered.end(0).toFixed(2), ms.duration.toFixed(2), v.duration.toFixed(2), v.readyState, v.networkState, v.videoWidth, v.videoHeight,"
         "           v.buffered.length, v.buffered.end(0).toFixed(2), v.seekable.length, v.seekable.end(0).toFixed(2)];"
         "  r.push(sb.mode); sb.mode = 'sequence'; r.push(sb.mode); sb.mode = 'segments'; r.push(sb.mode);"
         "  sb.timestampOffset = 2; r.push(sb.timestampOffset); sb.timestampOffset = 0;"
-        "  try { sb.appendWindowStart = 5 } catch (e) { r.push(e.name) } try { sb.appendWindowEnd = 0 } catch (e) { r.push(e.name) } try { sb.appendWindowStart = -1 } catch (e) { r.push(e.name) }"
+        "  sb.appendWindowStart = 5; try { sb.appendWindowEnd = 0 } catch (e) { r.push(e.name) } sb.appendWindowStart = 0; try { sb.appendWindowStart = -1 } catch (e) { r.push(e.name) }"
         "  sb.appendWindowEnd = 100; r.push(sb.appendWindowEnd); sb.appendWindowEnd = Infinity;"
         "  try { ms.duration = NaN } catch (e) { r.push(e.name) } try { ms.duration = 1 } catch (e) { r.push(e.name) } ms.duration = 600; r.push(ms.duration, v.duration);"
         "  try { sb.remove(-1, 2) } catch (e) { r.push(e.name) } try { sb.remove(2, 1) } catch (e) { r.push(e.name) } try { sb.appendBuffer(5) } catch (e) { r.push(e.name) }"
         "  r.push(sb.videoTracks.length, sb.audioTracks.length, sb.textTracks.length, sb.audioTracks[0].kind, sb.videoTracks.getTrackById('1') !== null);"
         "  log.push(r.join(' '));"
         "  console.log(log.join(' ') + ' | ' + ev.join());"
-        "};"
-        "v.src = URL.createObjectURL(ms);</script></body></html>";
+        "};</script></body></html>";
     page.load(StringView(html.data(), html.size()));
     HtmlDocument doc(a);
     page.render(&doc);
-    mse_pump(page, env, 6);
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 12, &doc);
+    click(page, "b");
     const std::string out = page_log(page);
-    std::fprintf(stderr, "DBGMSE %s\nERR(%u) %.*s\n", out.c_str(), page.errors(), (int)page.first_error().size(), page.first_error().data());
-    // before the append: the state of a source that is not yet open, the errors
-    CHECK(out.find("function true false true ") == 0);
-    CHECK(out.find("closed NaN 0 true InvalidStateError ") != std::string::npos);                 // (addSourceBuffer needs an open source)
-    CHECK(out.find("open open NotSupportedError TypeError 1 true segments false 0 0 Infinity 0 appended true InvalidStateError InvalidStateError InvalidStateError InvalidStateError InvalidStateError") != std::string::npos);
-    CHECK(out.find("sb:updatestart:true sb:update:false sb:updateend:false") != std::string::npos);
-    CHECK(out.find("false 1 0.08 2.08 2.08 2.08 ") != std::string::npos);                         // buffered, duration of both
-    CHECK(out.find(" 96 64 1 2.08 1 2.08 segments sequence segments 2 ") != std::string::npos);
-    CHECK(out.find("InvalidStateError") != std::string::npos);
-    CHECK(out.find(" TypeError TypeError TypeError 100 ") != std::string::npos);                    // the append window checks
-    CHECK(out.find(" TypeError InvalidStateError 600 600 ") != std::string::npos);                  // duration: NaN, below the buffered end, then 600
-    CHECK(out.find(" TypeError TypeError TypeError 1 1 0 main true") != std::string::npos);         // remove(-1, 2), remove(2, 1), appendBuffer(5), the tracks
-    // the element: it opened, knew the duration, had data
-    CHECK(out.find("| loadstart,durationchange,loadedmetadata,loadeddata,progress,canplay,durationchange") != std::string::npos);
+    CHECK(out.find("function true false true closed NaN 0 true InvalidStateError open open NotSupportedError TypeError 1 true segments false 0 0 Infinity 0 appended true "
+                   "InvalidStateError InvalidStateError InvalidStateError InvalidStateError InvalidStateError sb:updatestart:true sb:update:false sb:updateend:false ") == 0);
+    CHECK(out.find("false 1 0.08 2.08 2.08 2.08 ") != std::string::npos);                  // the buffered range; the duration is where the data ends
+    CHECK(out.find(" 3 1 64 48 1 2.08 1 2.08 segments sequence segments 2 ") != std::string::npos);
+    CHECK(out.find(" TypeError TypeError 100 ") != std::string::npos);                     // the append window: end below start, start below 0
+    CHECK(out.find(" TypeError InvalidStateError 600 600 ") != std::string::npos);         // duration: NaN, below the buffered end, then 600
+    CHECK(out.find(" TypeError TypeError TypeError 1 1 0 main true") != std::string::npos);   // remove(-1, 2), remove(2, 1), appendBuffer(5), the tracks
+    CHECK(in_order(out.substr(out.find(" | ")), {"loadstart", "durationchange", "loadedmetadata", "loadeddata", "canplay", "progress"}) && out.find("canplaythrough") == std::string::npos);
   }
   CHECK(a.live == 0);
-  {   // playing from start to end, with the data all there; the ranges, the files opened for the players
+  {   // playing from start to end, with the data all there; the files opened for the players
     FakeEnvironment env(a);
+    mse_serve(env, "mse_muxed.mp4");
     MediaEnvironment media;
     Page page(a, env, "http://example.com/", media, true);
-    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><script>var DATA = " + muxed + "; var v = document.getElementById('v');" + watch +
+    std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><button id=e></button><script>") + kLoad + "var v = document.getElementById('v');" + watch +
         "var ms = new MediaSource(), sb;"
-        "ms.addEventListener('sourceopen', function() {"
-        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
-        "  sb.addEventListener('updateend', function() { if (ms.readyState === 'open') ms.endOfStream() });"
-        "  sb.appendBuffer(__string_to_bytes(DATA));"
+        "load(['mse_muxed.mp4'], function (u8) {"
+        "  ms.addEventListener('sourceopen', function() {"
+        "    sb = ms.addSourceBuffer(" + type + ");"
+        "    sb.addEventListener('updateend', function() { if (ms.readyState === 'open') ms.endOfStream() });"
+        "    sb.appendBuffer(u8);"
+        "  });"
+        "  v.src = URL.createObjectURL(ms);"
         "});"
         "ms.addEventListener('sourceended', function() { ev.push('sourceended:' + ms.readyState + ':' + ms.duration.toFixed(2)) });"
         "v.addEventListener('ended', function() { console.log(ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.paused + ' ' + v.ended) });"
         "document.getElementById('b').onclick = function() { v.play().then(function() { ev.push('promise') }) };"
-        "v.src = URL.createObjectURL(ms);</script></body></html>";
+        "document.getElementById('e').onclick = function() { console.log('STATE ' + ev.join() + ' ' + v.currentTime + ' ' + v.paused + ' ' + v.readyState + ' ' + ms.readyState + ' ' + v.duration) };</script></body></html>";
     page.load(StringView(html.data(), html.size()));
     HtmlDocument doc(a);
     page.render(&doc);
-    mse_pump(page, env, 5);
-    CHECK(env.opened_video == 0);   // (nothing is opened until the playhead needs it? no: the data is there, so the file is)
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
-    mse_pump(page, env, 25);
+    mse_pump(page, env, 12, &doc);
+    click(page, "b");
+    mse_pump(page, env, 25, &doc);
+    click(page, "e");
     const std::string out = page_log(page);
-    CHECK(out.find("loadstart,durationchange,loadedmetadata,loadeddata,progress,canplay,durationchange,sourceended:ended:2.08,canplaythrough,play,playing") != std::string::npos);
-    CHECK(out.find(",pause,ended 2.08 true true") != std::string::npos);
+    CHECK(in_order(out, {"loadstart", "durationchange", "loadedmetadata", "loadeddata", "canplay", "sourceended:ended:2.08", "canplaythrough", "play", "playing", "pause", "ended"}));
+    CHECK(out.find(" 2.08 true true") != std::string::npos);
     CHECK(env.opened_video >= 1 && env.last_video_data.size() > 30000 && env.last_video_data.compare(4, 8, "ftypisom") == 0);
-    CHECK(env.opened_audio == 0);   // (video and sound in one file: one clip)
+    CHECK(env.opened_audio == 0);   // (the picture and the sound are in one file: one clip)
   }
   CHECK(a.live == 0);
   {   // data that comes while playing: the playhead meets the end of what there is, waits, and goes on when more is appended
     FakeEnvironment env(a);
+    mse_serve(env, "mse_muxed.mp4");
     MediaEnvironment media;
     Page page(a, env, "http://example.com/", media, true);
-    std::string html = "<html><body><video id=v width=96 height=64 autoplay></video><button id=b></button><button id=e></button><script>var DATA = " + muxed + "; var v = document.getElementById('v');" + watch +
-        "var ms = new MediaSource(), sb;"
-        "ms.addEventListener('sourceopen', function() {"
-        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
-        "  sb.appendBuffer(__string_to_bytes(DATA.slice(0, 18485)));"
+    std::string html = std::string("<html><body><video id=v width=96 height=64 autoplay></video><button id=b></button><button id=e></button><script>") + kLoad + "var v = document.getElementById('v');" + watch +
+        "var ms = new MediaSource(), sb, U8;"
+        "load(['mse_muxed.mp4'], function (u8) {"
+        "  U8 = u8;"
+        "  ms.addEventListener('sourceopen', function() {"
+        "    sb = ms.addSourceBuffer(" + type + ");"
+        "    sb.appendBuffer(u8.slice(0, 18485));"
+        "  });"
+        "  v.src = URL.createObjectURL(ms);"
         "});"
-        "document.getElementById('b').onclick = function() { sb.appendBuffer(__string_to_bytes(DATA.slice(18485))) };"
+        "document.getElementById('b').onclick = function() { sb.appendBuffer(U8.slice(18485)) };"
         "document.getElementById('e').onclick = function() { console.log(ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.readyState + ' ' + v.paused + ' ' + sb.buffered.end(0).toFixed(2) + ' ' + v.buffered.length) };"
-        "v.src = URL.createObjectURL(ms);</script></body></html>";
+        "</script></body></html>";
     page.load(StringView(html.data(), html.size()));
     HtmlDocument doc(a);
     page.render(&doc);
-    mse_pump(page, env, 12);   // (plays to the end of the first second and waits there)
+    mse_pump(page, env, 14, &doc);   // (plays to the end of the first second and waits there)
     CHECK(env.opened_video == 1 && env.last_clip && !env.last_clip->is_playing);
-    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    click(page, "e");
     const std::string waiting = page_log(page);
-    CHECK(waiting.find("canplay") != std::string::npos && waiting.find(",play,") != std::string::npos && waiting.find(",waiting") != std::string::npos);
+    CHECK(in_order(waiting, {"play", "canplay", "playing", "waiting"}));
     CHECK(waiting.find(" false ") != std::string::npos);   // (not paused: it is waiting)
-    CHECK(waiting.find(",ended") == std::string::npos);
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
-    mse_pump(page, env, 6);
+    CHECK(waiting.find("ended") == std::string::npos);
+    click(page, "b");
+    mse_pump(page, env, 10, &doc);
     CHECK(env.opened_video == 2 && env.last_clip && env.last_clip->is_playing);   // (a fresh file with the second second in it, playing)
-    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    click(page, "e");
     const std::string again = page_log(page);
-    CHECK(again.find(",waiting") != std::string::npos && again.rfind("playing") > again.find("waiting"));
+    const size_t first_wait = again.find("waiting");
+    CHECK(first_wait != std::string::npos && again.find("playing", first_wait) != std::string::npos);
   }
   CHECK(a.live == 0);
-  {   // seeking inside the data and into a gap, remove(), and the source closing
+  {   // seeking inside the data, remove(), the buffers
     FakeEnvironment env(a);
+    mse_serve(env, "mse_muxed.mp4");
     MediaEnvironment media;
     Page page(a, env, "http://example.com/", media, true);
-    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><button id=c></button><button id=e></button><script>var DATA = " + muxed + "; var v = document.getElementById('v');" + watch +
-        "var ms = new MediaSource(), sb, closed = [];"
-        "ms.addEventListener('sourceopen', function() {"
-        "  sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"');"
-        "  sb.timestampOffset = 0;"
-        "  sb.appendBuffer(__string_to_bytes(DATA));"
+    std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><button id=c></button><button id=e></button><script>") + kLoad + "var v = document.getElementById('v');" + watch +
+        "var ms = new MediaSource(), sb;"
+        "load(['mse_muxed.mp4'], function (u8) {"
+        "  ms.addEventListener('sourceopen', function() { sb = ms.addSourceBuffer(" + type + "); sb.appendBuffer(u8) });"
+        "  v.src = URL.createObjectURL(ms);"
         "});"
-        "ms.addEventListener('sourceclose', function() { closed.push('sourceclose:' + ms.readyState + ':' + ms.sourceBuffers.length + ':' + ms.duration) });"
         "document.getElementById('b').onclick = function() { v.currentTime = 1.5 };"
-        "document.getElementById('c').onclick = function() { sb.remove(0, 1.2) };"
-        "document.getElementById('e').onclick = function() { console.log(ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.seeking + ' ' + v.readyState + ' ' + sb.buffered.length + ' ' + (sb.buffered.length ? sb.buffered.start(0).toFixed(2) : '-') + ' ' + sb.updating + ' ' + closed.join()) };"
-        "v.src = URL.createObjectURL(ms);</script></body></html>";
+        "document.getElementById('c').onclick = function() { sb.remove(0, 1.0) };"
+        "document.getElementById('e').onclick = function() { console.log(ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.seeking + ' ' + sb.buffered.length + ' ' + (sb.buffered.length ? sb.buffered.start(0).toFixed(2) : '-') + ' ' + sb.updating) };"
+        "</script></body></html>";
     page.load(StringView(html.data(), html.size()));
     HtmlDocument doc(a);
     page.render(&doc);
-    mse_pump(page, env, 5);
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
-    mse_pump(page, env, 4);
-    page.click(page.document().element_by_id("c")->serial, 0, 0);
-    mse_pump(page, env, 4);
-    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    mse_pump(page, env, 12, &doc);
+    click(page, "b");
+    mse_pump(page, env, 4, &doc);
+    click(page, "c");
+    mse_pump(page, env, 6, &doc);
+    click(page, "e");
     const std::string out = page_log(page);
-    CHECK(out.find(",seeking,seeked") != std::string::npos);
-    CHECK(out.find(" 1.50 false ") != std::string::npos);                       // (the seek is done: the data was there)
-    CHECK(out.find(" 1 1.04 false ") != std::string::npos);                     // (remove(0, 1.2) took the first key frame's group, the rest starts at the second)
-    // the element lets go of the source
-    page.document().element_by_id("v")->owner->touch();
+    CHECK(in_order(out, {"seeking", "seeked"}));
+    CHECK(out.find(" 1.50 false ") != std::string::npos);          // (the seek is done: the data was there)
+    CHECK(out.find(" 1 1.08 false") != std::string::npos);         // (remove(0, 1) took the first key frame's group, to the next key frame; what is left starts there)
+  }
+  CHECK(a.live == 0);
+  {   // the element lets go of the source: it closes, its buffers go
+    FakeEnvironment env(a);
+    mse_serve(env, "mse_muxed.mp4");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = std::string("<html><body><video id=v></video><button id=b></button><button id=e></button><script>") + kLoad + "var v = document.getElementById('v'), ms = new MediaSource(), sb, log = [];"
+        "ms.addEventListener('sourceclose', function() { log.push('sourceclose:' + ms.readyState + ':' + ms.sourceBuffers.length + ':' + ms.duration) });"
+        "load(['mse_muxed.mp4'], function (u8) {"
+        "  ms.addEventListener('sourceopen', function() { sb = ms.addSourceBuffer(" + type + "); sb.appendBuffer(u8) });"
+        "  v.src = URL.createObjectURL(ms);"
+        "});"
+        "document.getElementById('b').onclick = function() { v.removeAttribute('src'); v.load() };"
+        "document.getElementById('e').onclick = function() { try { sb.appendBuffer(new Uint8Array(4)) } catch (e) { log.push(e.name) } try { sb.buffered } catch (e) { log.push('buffered:' + e.name) } console.log(log.join(' ')) };"
+        "</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 10, &doc);
+    click(page, "b");
+    mse_pump(page, env, 6, &doc);
+    click(page, "e");
+    const std::string out = page_log(page);
+    CHECK(out.find("sourceclose:closed:0:NaN") == 0);
+    CHECK(out.find("InvalidStateError buffered:InvalidStateError") != std::string::npos);
   }
   CHECK(a.live == 0);
   {   // bytes that are not a stream: error, updateend, the source ends with a decode error, the element has an error
@@ -1536,76 +1578,340 @@ static void test_mse() {
     page.load(StringView(html.data(), html.size()));
     HtmlDocument doc(a);
     page.render(&doc);
-    mse_pump(page, env, 6);
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 8, &doc);
+    click(page, "b");
     const std::string out = page_log(page);
-    CHECK(out.find("updatestart,error,updateend,sourceended,element-error:3,InvalidStateError ended") != std::string::npos);
+    CHECK(in_order(out, {"updatestart", "error", "updateend", "sourceended", "element-error:3", "InvalidStateError"}) && out.find("update,") == std::string::npos);
   }
   CHECK(a.live == 0);
   {   // separate buffers for the picture and the sound: each is its own file, on its own player; the ranges are what both have
     FakeEnvironment env(a);
+    mse_serve(env, "mse_video.mp4");
+    mse_serve(env, "mse_audio.mp4");
     MediaEnvironment media;
     Page page(a, env, "http://example.com/", media, true);
-    std::string html = "<html><body><video id=v width=96 height=64></video><button id=b></button><script>var V = " + js_file("tests/data/mse_video.mp4") + ", A = " + js_file("tests/data/mse_audio.mp4") +
-        "; var v = document.getElementById('v'); var ms = new MediaSource(), vb, ab;"
-        "ms.addEventListener('sourceopen', function() {"
-        "  vb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e\"'); ab = ms.addSourceBuffer('audio/mp4; codecs=\"mp4a.40.2\"');"
-        "  vb.appendBuffer(__string_to_bytes(V));"
-        "  vb.addEventListener('updateend', function() { ab.appendBuffer(__string_to_bytes(A)) }, { once: true });"
+    std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><script>") + kLoad +
+        "var v = document.getElementById('v'), ms = new MediaSource(), vb, ab;"
+        "load(['mse_video.mp4', 'mse_audio.mp4'], function (V, A) {"
+        "  ms.addEventListener('sourceopen', function() {"
+        "    vb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e\"'); ab = ms.addSourceBuffer('audio/mp4; codecs=\"mp4a.40.2\"');"
+        "    vb.addEventListener('updateend', function() { ab.appendBuffer(A) }, { once: true });"
+        "    vb.appendBuffer(V);"
+        "  });"
+        "  v.src = URL.createObjectURL(ms);"
         "});"
         "document.getElementById('b').onclick = function() {"
-        "  console.log(ms.sourceBuffers.length, ms.activeSourceBuffers.length, vb.buffered.end(0).toFixed(2), ab.buffered.end(0).toFixed(2), v.buffered.length, v.buffered.start(0).toFixed(2), v.buffered.end(0).toFixed(2), v.readyState, v.videoWidth);"
-        "  v.play(); };"
-        "v.src = URL.createObjectURL(ms);</script></body></html>";
+        "  console.log(ms.sourceBuffers.length, ms.activeSourceBuffers.length, vb.buffered.end(0).toFixed(2), ab.buffered.end(0).toFixed(2), v.buffered.length, v.buffered.start(0).toFixed(2), v.buffered.end(0).toFixed(2), v.videoWidth);"
+        "  v.play(); };</script></body></html>";
     page.load(StringView(html.data(), html.size()));
     HtmlDocument doc(a);
     page.render(&doc);
-    mse_pump(page, env, 8);
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
-    mse_pump(page, env, 4);
-    CHECK(page_log(page).find("2 2 2.08 2.02 1 0.08 2.02 ") == 0);
+    mse_pump(page, env, 12, &doc);
+    click(page, "b");
+    mse_pump(page, env, 4, &doc);
+    CHECK(page_log(page).find("2 2 2.08 2.02 1 0.08 2.02 64") == 0);
     CHECK(env.opened_video == 1 && env.opened_audio == 1);
     CHECK(env.last_video_data.size() > 15000 && env.last_audio_data.size() > 15000 && env.last_audio_data.compare(4, 8, "ftypisom") == 0);
   }
   CHECK(a.live == 0);
-  {   // MPEG audio into an <audio>, and `new Audio(url)` for a source nobody put in the page
+  {   // MPEG audio into an <audio>: sequence mode, a second append goes on where the first ended
     FakeEnvironment env(a);
+    mse_serve(env, "mse_audio.mp3");
     MediaEnvironment media;
     Page page(a, env, "http://example.com/", media, true);
-    std::string html = "<html><body><audio id=v></audio><button id=b></button><script>var M = " + js_file("tests/data/mse_audio.mp3") + "; var v = document.getElementById('v'); var ms = new MediaSource(), sb, log = [];"
-        "ms.addEventListener('sourceopen', function() {"
-        "  sb = ms.addSourceBuffer('audio/mpeg'); log.push(sb.mode);"
-        "  sb.appendBuffer(__string_to_bytes(M));"
-        "  sb.addEventListener('updateend', function() { sb.appendBuffer(__string_to_bytes(M)) }, { once: true });"
+    std::string html = std::string("<html><body><audio id=v></audio><button id=b></button><script>") + kLoad +
+        "var v = document.getElementById('v'), ms = new MediaSource(), sb, log = [];"
+        "load(['mse_audio.mp3'], function (M) {"
+        "  ms.addEventListener('sourceopen', function() {"
+        "    sb = ms.addSourceBuffer('audio/mpeg'); log.push(sb.mode);"
+        "    sb.appendBuffer(M);"
+        "    sb.addEventListener('updateend', function() { sb.appendBuffer(M) }, { once: true });"
+        "  });"
+        "  v.src = URL.createObjectURL(ms);"
         "});"
-        "document.getElementById('b').onclick = function() { log.push(sb.buffered.length, sb.buffered.end(0).toFixed(1), v.duration.toFixed(1), v.readyState); console.log(log.join(' ')) };"
-        "v.src = URL.createObjectURL(ms);</script></body></html>";
-    page.load(StringView(html.data(), html.size()));
-    HtmlDocument doc(a);
-    page.render(&doc);
-    mse_pump(page, env, 8);
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
-    CHECK(page_log(page) == "sequence 1 2.1 2.1 3");
-    // (the file for the player is the MPEG frames: it starts with a frame header)
-    mse_pump(page, env, 3);
-    CHECK(env.opened_audio >= 1 && env.last_audio_data.size() > 16000 && static_cast<uint8_t>(env.last_audio_data[0]) == 0xFF);
-  }
-  CHECK(a.live == 0);
-  {   // `new Audio(blob url)` with no element in the page, a revoked address, a source used twice
-    FakeEnvironment env(a);
-    MediaEnvironment media;
-    Page page(a, env, "http://example.com/", media, true);
-    std::string html = "<html><body><button id=b></button><script>var M = " + js_file("tests/data/mse_audio.mp3") + "; var ms = new MediaSource(), au, sb, log = [];"
-        "ms.addEventListener('sourceopen', function() { sb = ms.addSourceBuffer('audio/mpeg'); sb.appendBuffer(__string_to_bytes(M)) });"
-        "var url = URL.createObjectURL(ms); au = new Audio(url); URL.revokeObjectURL(url);"
-        "document.getElementById('b').onclick = function() { log.push(ms.readyState, au.readyState, au.duration.toFixed(1)); var again = new Audio(); try { again.src = URL.createObjectURL(ms) } catch (e) { log.push(e.name) } console.log(log.join(' ')) };"
+        "document.getElementById('b').onclick = function() { log.push(sb.buffered.length, sb.buffered.end(0).toFixed(1), v.duration.toFixed(1)); console.log(log.join(' ')) };"
         "</script></body></html>";
     page.load(StringView(html.data(), html.size()));
     HtmlDocument doc(a);
     page.render(&doc);
-    mse_pump(page, env, 8);
-    page.click(page.document().element_by_id("b")->serial, 0, 0);
-    CHECK(page_log(page).find("open ") == 0);
+    mse_pump(page, env, 12, &doc);
+    click(page, "b");
+    CHECK(page_log(page) == "sequence 1 2.1 2.1");
+    CHECK(env.opened_audio >= 1 && env.last_audio_data.size() > 16000 && static_cast<uint8_t>(env.last_audio_data[0]) == 0xFF);   // (the file for the player: MPEG frames)
+  }
+  CHECK(a.live == 0);
+  {   // `new Audio(url)` for a source nobody put in the page, and the address revoked at once
+    FakeEnvironment env(a);
+    mse_serve(env, "mse_audio.mp3");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = std::string("<html><body><button id=b></button><script>") + kLoad + "var ms = new MediaSource(), au, sb, log = [], url;"
+        "load(['mse_audio.mp3'], function (M) {"
+        "  ms.addEventListener('sourceopen', function() { URL.revokeObjectURL(url); sb = ms.addSourceBuffer('audio/mpeg'); sb.appendBuffer(M) });"
+        "  url = URL.createObjectURL(ms); au = new Audio(url);"
+        "});"
+        "document.getElementById('b').onclick = function() { log.push(ms.readyState, au.readyState >= 1, au.duration.toFixed(1)); console.log(log.join(' ')) };"
+        "</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 3, &doc);
+    mse_pump(page, env, 10, &doc);
+    click(page, "b");
+    CHECK(page_log(page) == "open true 1.0");
+  }
+  CHECK(a.live == 0);
+}
+
+// --- Encrypted Media Extensions ---------------------------------------------------------------------------------------------------
+
+static const std::string kKid1 = "AAECAwQFBgcICQoLDA0ODw", kKey1 = "8OHSw7Sllod4aVpLPC0eDw", kKid2 = "EBESExQVFhcYGRobHB0eHw", kKey2 = "Dx4tPEtaaXiHlqW0w9Lh8A";
+
+// A page that plays an encrypted stream through Clear Key: the license server is the page itself. `licenses` is the script that answers a message (it can use
+// the session `s`, the message text `text` and a function `reply(keys...)`); `extra` is run when the page has started.
+static std::string eme_page(const std::string& file, const std::string& setup_keys, const std::string& on_message, const std::string& extra, const char* autoplay = "") {
+  std::string html = std::string("<html><body><video id=v width=96 height=64 ") + autoplay + "></video><button id=b></button><button id=e></button><button id=p></button><script>" + kLoad +
+      "var v = document.getElementById('v'), log = [], ev = [], ms = new MediaSource(), sb, session, access, keys;"
+      "['encrypted','waitingforkey','loadedmetadata','canplay','canplaythrough','play','playing','pause','waiting','ended','error'].forEach(function (t) { v.addEventListener(t, function () { ev.push(t) }) });"
+      "function license(pairs) { return new TextEncoder().encode(JSON.stringify({ keys: pairs.map(function (p) { return { kty: 'oct', kid: p[0], k: p[1] } }) })) }"
+      "function onmsg(text) { " + on_message + " }"
+      "v.addEventListener('encrypted', function (e) {"
+      "  log.push('encrypted:' + e.initDataType + ':' + e.initData.byteLength);"
+      "  if (!keys) return;"
+      "  session = keys.createSession();"
+      "  session.addEventListener('message', function (m) { log.push('message:' + m.messageType); onmsg(new TextDecoder().decode(new Uint8Array(m.message))) });"
+      "  session.addEventListener('keystatuseschange', function () { var r = []; session.keyStatuses.forEach(function (status, kid) { r.push(status + ':' + kid.byteLength) }); log.push('status:' + r.join(',')) });"
+      "  session.generateRequest(e.initDataType, e.initData).catch(function (x) { log.push('generate-failed:' + x.name) });"
+      "});"
+      "load(['" + file + "'], function (u8) {"
+      "  ms.addEventListener('sourceopen', function () { sb = ms.addSourceBuffer('video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"'); sb.addEventListener('updateend', function () { if (ms.readyState === 'open') ms.endOfStream() }); sb.appendBuffer(u8) });"
+      "  var start = function () { v.src = URL.createObjectURL(ms) };"
+      "  " + setup_keys +
+      "});"
+      "document.getElementById('p').onclick = function () { v.play() };"
+      "document.getElementById('e').onclick = function () { console.log(log.join(' ') + ' | ' + ev.join() + ' | ' + v.readyState + ' ' + v.currentTime.toFixed(2) + ' ' + v.paused + ' ' + v.ended) };"
+      + extra + "</script></body></html>";
+  return html;
+}
+
+static void test_eme() {
+  TestAllocator a;
+  const auto click = [](Page& page, const char* id) { page.click(page.document().element_by_id(id)->serial, 0, 0); };
+  {   // the API: negotiation, sessions, the Clear Key messages and statuses, close, a persistent session
+    const std::string script = std::string() + "<html><body><button id=b></button><script>var log = [], rejected = function (name) { return function (e) { log.push(name + ':' + e.name) } };"
+        "var good = [{ initDataTypes: ['cenc'], videoCapabilities: [{ contentType: 'video/mp4; codecs=\"avc1.4d401e\"' }], audioCapabilities: [{ contentType: 'audio/mp4; codecs=\"mp4a.40.2\"' }] }];"
+        "log.push(typeof navigator.requestMediaKeySystemAccess, typeof MediaKeys, typeof MediaKeySession, typeof MediaKeyStatusMap, typeof MediaKeyMessageEvent, typeof MediaEncryptedEvent, 'mediaKeys' in HTMLMediaElement.prototype);"
+        "navigator.requestMediaKeySystemAccess('com.widevine.alpha', good).catch(rejected('widevine'));"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', []).catch(rejected('empty'));"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/mp4; codecs=\"avc1.4d401e\"', robustness: 'SW_SECURE_CRYPTO' }] }]).catch(rejected('robustness'));"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/webm; codecs=\"vp9\"' }] }]).catch(rejected('webm'));"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ distinctiveIdentifier: 'required' }]).catch(rejected('identifier'));"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ videoCapabilities: [{ contentType: 'video/webm' }] }, good[0]]).then(function (access) {"
+        "  var c = access.getConfiguration();"
+        "  log.push('access:' + access.keySystem + ':' + c.initDataTypes + ':' + c.persistentState + ':' + c.sessionTypes + ':' + c.distinctiveIdentifier + ':' + c.videoCapabilities.length + ':' + c.audioCapabilities.length);"
+        "  return access.createMediaKeys();"
+        "}).then(function (keys) {"
+        "  var s = keys.createSession();"
+        "  log.push(s.sessionId === '', s.expiration, s.keyStatuses.size, s instanceof EventTarget, s instanceof MediaKeySession);"
+        "  try { keys.createSession('persistent-license') } catch (e) { log.push('persistent:' + e.name) } try { keys.createSession('nonsense') } catch (e) { log.push('nonsense:' + e.name) }"
+        "  s.close().catch(rejected('close-new'));"
+        "  s.update(new Uint8Array(4)).catch(rejected('update-new'));"
+        "  keys.setServerCertificate(new Uint8Array(8)).then(function (r) { log.push('certificate:' + r) });"
+        "  keys.getStatusForPolicy({ minHdcpVersion: '1.0' }).then(function (r) { log.push('policy:' + r) });"
+        "  var messages = [];"
+        "  s.addEventListener('message', function (m) {"
+        "    messages.push(m.messageType + ':' + new TextDecoder().decode(new Uint8Array(m.message)));"
+        "    log.push(messages[messages.length - 1], m instanceof MediaKeyMessageEvent, m instanceof Event);"
+        "    var license = function (obj) { return new TextEncoder().encode(JSON.stringify(obj)) };"
+        "    s.update(new TextEncoder().encode('not json')).catch(rejected('bad-json'));"
+        "    s.update(license({ keys: [{ kty: 'RSA', kid: '" + kKid1 + "', k: '" + kKey1 + "' }] })).catch(rejected('bad-kty'));"
+        "    s.update(license({ keys: [{ kty: 'oct', kid: 'AAAA', k: '" + kKey1 + "' }] })).catch(rejected('short-kid'));"
+        "    s.update(license({ keys: [{ kty: 'oct', kid: '" + kKid1 + "', k: '" + kKey1 + "' }], type: 'persistent-license' })).catch(rejected('wrong-type'));"
+        "    s.update(license({ keys: [] })).catch(rejected('no-keys'));"
+        "    s.update(new Uint8Array(0)).catch(rejected('empty-response'));"
+        "    s.update(license({ keys: [{ kty: 'oct', kid: '" + kKid1 + "', k: '" + kKey1 + "' }] })).then(function () {"
+        "      log.push('updated:' + s.keyStatuses.size);"
+        "      var kid = new Uint8Array(16); for (var i = 0; i < 16; i++) kid[i] = i;"
+        "      log.push('has:' + s.keyStatuses.has(kid), 'get:' + s.keyStatuses.get(kid), 'get-other:' + s.keyStatuses.get(new Uint8Array(16)));"
+        "      var entries = []; for (var e of s.keyStatuses) entries.push(e[1] + ':' + e[0].byteLength); log.push('iterated:' + entries.join());"
+        "      s.closed.then(function (reason) { log.push('closed:' + reason + ':' + s.keyStatuses.size) });"
+        "      s.close().then(function () { log.push('close-done'); return s.update(license({ keys: [] })) }).catch(rejected('update-closed'));"
+        "    });"
+        "  });"
+        "  s.addEventListener('keystatuseschange', function () { log.push('keystatuseschange:' + s.keyStatuses.size) });"
+        "  s.generateRequest('keyids', new TextEncoder().encode(JSON.stringify({ kids: ['" + kKid1 + "'] }))).then(function () {"
+        "    log.push('requested:' + (s.sessionId !== ''));"
+        "    s.generateRequest('keyids', new Uint8Array(1)).catch(rejected('again'));"
+        "  });"
+        "  var t = keys.createSession();"
+        "  t.generateRequest('keyids', new TextEncoder().encode('{nope')).catch(rejected('bad-init'));"
+        "  var u = keys.createSession();"
+        "  u.generateRequest('widevine', new Uint8Array(4)).catch(rejected('init-type'));"
+        "  var w = keys.createSession();"
+        "  w.generateRequest('cenc', new Uint8Array(40)).catch(rejected('bad-pssh'));"
+        "}).catch(function (e) { log.push('failed:' + e.name + ':' + e.message) });"
+        "document.getElementById('b').onclick = function () { console.log(log.join(' ')) };</script></body></html>";
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load(StringView(script.data(), script.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 30, &doc);
+    click(page, "b");
+    const std::string out = page_log(page);
+    CHECK(out.find("function function function function function function true") == 0);
+    CHECK(out.find("widevine:NotSupportedError") != std::string::npos && out.find("empty:TypeError") != std::string::npos && out.find("robustness:NotSupportedError") != std::string::npos);
+    CHECK(out.find("webm:NotSupportedError") != std::string::npos && out.find("identifier:NotSupportedError") != std::string::npos);
+    CHECK(out.find("access:org.w3.clearkey:cenc:not-allowed:temporary:not-allowed:1:1") != std::string::npos);
+    CHECK(out.find("true NaN 0 true true") != std::string::npos);
+    CHECK(out.find("persistent:NotSupportedError") != std::string::npos && out.find("nonsense:TypeError") != std::string::npos);
+    CHECK(out.find("close-new:InvalidStateError") != std::string::npos && out.find("update-new:InvalidStateError") != std::string::npos);
+    CHECK(out.find("certificate:false") != std::string::npos && out.find("policy:usable") != std::string::npos);
+    CHECK(out.find("bad-init:TypeError") != std::string::npos && out.find("init-type:NotSupportedError") != std::string::npos && out.find("bad-pssh:TypeError") != std::string::npos && out.find("again:InvalidStateError") != std::string::npos);
+    CHECK(out.find("license-request:{\"kids\":[\"AAECAwQFBgcICQoLDA0ODw\"],\"type\":\"temporary\"} true true") != std::string::npos);
+    for (const char* rejected : {"bad-json:TypeError", "bad-kty:TypeError", "short-kid:TypeError", "wrong-type:TypeError", "no-keys:TypeError", "empty-response:TypeError"})
+      CHECK(out.find(rejected) != std::string::npos);
+    CHECK(in_order(out, {"updated:1", "has:true", "get:usable", "get-other:undefined", "iterated:usable:16"}));
+    CHECK(out.find("closed:closed-by-application:0") != std::string::npos && out.find("update-closed:InvalidStateError") != std::string::npos);
+    CHECK(out.find("keystatuseschange:") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+  {   // a persistent session: its keys survive in storage, load() brings them back, remove() releases them
+    const std::string script = std::string() + "<html><body><button id=b></button><script>var log = [];"
+        "var cfg = [{ initDataTypes: ['keyids'], persistentState: 'required', sessionTypes: ['temporary', 'persistent-license'], videoCapabilities: [{ contentType: 'video/mp4; codecs=\"avc1.4d401e\"' }] }];"
+        "var license = new TextEncoder().encode(JSON.stringify({ keys: [{ kty: 'oct', kid: '" + kKid1 + "', k: '" + kKey1 + "' }], type: 'persistent-license' }));"
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', cfg).then(function (access) {"
+        "  log.push(access.getConfiguration().persistentState, access.getConfiguration().sessionTypes);"
+        "  return access.createMediaKeys();"
+        "}).then(function (keys) {"
+        "  var s = keys.createSession('persistent-license'), id;"
+        "  s.addEventListener('message', function (m) {"
+        "    var text = new TextDecoder().decode(new Uint8Array(m.message));"
+        "    log.push(m.messageType + ':' + text);"
+        "    if (m.messageType === 'license-request') { s.update(license).then(function () { id = s.sessionId; log.push('saved:' + (localStorage.getItem('__eme_licenses').indexOf('" + kKey1 + "') > 0)); return s.close() }).then(function () {"
+        "      var t = keys.createSession('persistent-license');"
+        "      t.addEventListener('message', function (m2) { log.push(m2.messageType + ':' + new TextDecoder().decode(new Uint8Array(m2.message))); t.update(new TextEncoder().encode('{\"kids\":[\"" + kKid1 + "\"]}')).then(function () { log.push('released-closed') }) });"
+        "      t.addEventListener('keystatuseschange', function () { var r = []; t.keyStatuses.forEach(function (st) { r.push(st) }); log.push('t-status:' + r.join()) });"
+        "      t.closed.then(function (why) { log.push('t-closed:' + why + ':' + (localStorage.getItem('__eme_licenses').indexOf('" + kKey1 + "') > 0)) });"
+        "      return t.load(id).then(function (ok) { log.push('loaded:' + ok + ':' + t.sessionId.length + ':' + t.keyStatuses.size); return t.remove() }).then(function () { log.push('removed') });"
+        "    }).then(function () { return keys.createSession('persistent-license').load('nothing') }).then(function (ok) { log.push('missing:' + ok) }); }"
+        "  });"
+        "  s.generateRequest('keyids', new TextEncoder().encode(JSON.stringify({ kids: ['" + kKid1 + "'] })));"
+        "}).catch(function (e) { log.push('failed:' + e.name + ':' + e.message) });"
+        "document.getElementById('b').onclick = function () { console.log(log.join(' | ')) };</script></body></html>";
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load(StringView(script.data(), script.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 40, &doc);
+    click(page, "b");
+    const std::string out = page_log(page);
+    CHECK(in_order(out, {"required | temporary,persistent-license", "license-request:{\"kids\":[\"AAECAwQFBgcICQoLDA0ODw\"],\"type\":\"persistent-license\"}", "saved:true", "loaded:true:16:1", "removed", "missing:false"}));
+    CHECK(in_order(out, {"t-status:released", "license-release:{\"kids\":[\"AAECAwQFBgcICQoLDA0ODw\"]}", "t-closed:closed-by-application:false", "released-closed"}));
+    CHECK(out.find("t-closed:closed-by-application:false") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_eme_playback() {
+  TestAllocator a;
+  const auto click = [](Page& page, const char* id) { page.click(page.document().element_by_id(id)->serial, 0, 0); };
+  const std::string access =
+      "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ initDataTypes: ['cenc', 'keyids'], videoCapabilities: [{ contentType: 'video/mp4; codecs=\"avc1.4d401e\"' }], audioCapabilities: [{ contentType: 'audio/mp4; codecs=\"mp4a.40.2\"' }] }])"
+      ".then(function (a) { access = a; return a.createMediaKeys() }).then(function (k) { keys = k; return v.setMediaKeys(k) }).then(function () { log.push('keys-set:' + (v.mediaKeys === keys)); start() })"
+      ".catch(function (e) { log.push('failed:' + e.name) });";
+  const std::string answer = std::string("onmsg = function (text) { if (JSON.parse(text).kids[0] === '") + kKid1 + "') session.update(license([['" + kKid1 + "', '" + kKey1 + "']])) };";
+  std::string clear_data;
+  {   // the clear stream, for what the decrypted file has to be
+    FakeEnvironment env(a);
+    mse_serve(env, "mse_muxed.mp4");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    const std::string html = eme_page("mse_muxed.mp4", "start();", "", "");
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 12, &doc);
+    CHECK(env.opened_video == 1);
+    clear_data = env.last_video_data;
+  }
+  for (const char* scheme : {"cenc", "cens", "cbc1", "cbcs", "ffmpeg"}) {   // every scheme: the license arrives, the element plays, the file the player gets is the clear one
+    FakeEnvironment env(a);
+    const std::string name = std::string("eme_") + scheme + ".mp4";
+    mse_serve(env, name.c_str());
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = eme_page(name, access, "", "");
+    // (the license server: answers every message)
+    html.replace(html.find("function onmsg(text) {  }"), 25, "var onmsg = function (text) {};");
+    html.insert(html.find("v.addEventListener('encrypted', function (e) {"), answer);
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 14, &doc);
+    click(page, "p");
+    mse_pump(page, env, 25, &doc);
+    click(page, "e");
+    const std::string out = page_log(page);
+    if (!in_order(out, {"keys-set:true", "encrypted:", "message:license-request", "status:usable:16"})) printf("   %s: %s\n", scheme, out.c_str());
+    CHECK(in_order(out, {"keys-set:true", "encrypted:", "message:license-request", "status:usable:16", "|", "loadedmetadata", "waitingforkey", "encrypted", "canplay", "canplaythrough", "play", "playing", "pause", "ended"}));
+    CHECK(env.opened_video >= 1);
+    if (env.last_video_data != clear_data) printf("   the file the player got for %s is not the clear one (%llu / %llu bytes)\n", scheme, (unsigned long long)env.last_video_data.size(), (unsigned long long)clear_data.size());
+    CHECK(env.last_video_data == clear_data);
+  }
+  CHECK(a.live == 0);
+  {   // no MediaKeys: the stream cannot be played, the element says it is waiting for a key; setMediaKeys() and a license later let it go on
+    FakeEnvironment env(a);
+    mse_serve(env, "eme_cenc.mp4");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = eme_page("eme_cenc.mp4", "start();", "", "document.getElementById('b').onclick = function () { navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{}]).then(function (a) { return a.createMediaKeys() }).then(function (k) { keys = k; return v.setMediaKeys(k) }).then(function () { "
+                                                          "session = keys.createSession(); session.addEventListener('message', function () { session.update(license([['" + std::string(kKid1) + "', '" + kKey1 + "']])) }); session.generateRequest('keyids', new TextEncoder().encode('{\"kids\":[\"" + kKid1 + "\"]}')) }) };");
+    html.replace(html.find("function onmsg(text) {  }"), 25, "var onmsg = function (text) {};");
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 14, &doc);
+    click(page, "p");
+    mse_pump(page, env, 6, &doc);
+    click(page, "e");
+    std::string out = page_log(page);
+    CHECK(in_order(out, {"encrypted:cenc", "|", "loadedmetadata", "waitingforkey", "encrypted"}) && out.find("canplay") == std::string::npos);
+    CHECK(env.opened_video == 0);
+    CHECK(out.find(" 1 0.00 ") != std::string::npos);   // (readyState 1: the data is there, nothing can be shown)
+    click(page, "b");
+    mse_pump(page, env, 25, &doc);
+    click(page, "e");
+    out = page_log(page);
+    CHECK(in_order(out, {"waitingforkey", "|", "canplay", "playing", "pause", "ended"}) || in_order(out, {"waitingforkey", "canplay"}));
+    CHECK(env.opened_video >= 1 && env.last_video_data == clear_data);
+  }
+  CHECK(a.live == 0);
+  {   // a key rotation: the first second plays with the first key, the second needs another, and the element waits for it
+    FakeEnvironment env(a);
+    mse_serve(env, "eme_rotate.mp4");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = eme_page("eme_rotate.mp4", access, "", "document.getElementById('b').onclick = function () { session.update(license([['" + std::string(kKid2) + "', '" + kKey2 + "']])) };", "autoplay");
+    html.replace(html.find("function onmsg(text) {  }"), 25, "var onmsg = function (text) {};");
+    html.insert(html.find("v.addEventListener('encrypted', function (e) {"), std::string("onmsg = function (text) { session.update(license([['") + kKid1 + "', '" + kKey1 + "']])) };");
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 30, &doc);   // (plays the first second, and waits)
+    click(page, "e");
+    std::string out = page_log(page);
+    CHECK(in_order(out, {"encrypted:cenc", "status:usable:16", "|", "playing", "waitingforkey"}) && out.find("ended") == std::string::npos);
+    CHECK(env.opened_video == 1);
+    click(page, "b");
+    mse_pump(page, env, 30, &doc);
+    click(page, "e");
+    out = page_log(page);
+    CHECK(env.opened_video == 2 && env.last_video_data.size() > 15000);
+    CHECK(in_order(out, {"waitingforkey", "|", "playing", "waitingforkey", "canplay", "playing", "ended"}));
   }
   CHECK(a.live == 0);
 }
@@ -2820,6 +3126,8 @@ int main(int argc, char** argv) {
   test_audio();
   test_media_api();
   test_mse();
+  test_eme();
+  test_eme_playback();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

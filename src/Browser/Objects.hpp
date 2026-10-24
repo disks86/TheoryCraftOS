@@ -43,6 +43,7 @@
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
 #include "Kernel/Sync.hpp"
 #include "Media/Image.hpp"
+#include "Media/Eme.hpp"
 #include "Media/Mse.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -85,6 +86,8 @@ class IVideoClip {
   virtual uint32_t seekable(ArrayView<double> pairs) { (void)pairs; return 0; }
   // A MediaError code (2 network, 3 decode, 4 not supported) if the clip cannot go on, else 0.
   virtual uint8_t error() { return 0; }
+  // Is it stopped for want of a key to decrypt what comes next (an encrypted stream, Encrypted Media Extensions)? "waitingforkey" is fired when it is.
+  virtual bool waiting_for_key() { return false; }
 
  protected:
   IVideoClip() = default;
@@ -182,6 +185,9 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   // --- Videos (script side)
   // --- Media sources (the MediaSource and SourceBuffer objects of script work on this; the element plays what they hold)
   media::MseHub& mse() { return mse_; }
+  // --- Encrypted media: the keys of the MediaKeys objects, and which of them an element decrypts with (setMediaKeys(); 0 for none).
+  media::EmeHub& eme() { return eme_; }
+  void video_set_keys(uint32_t serial, uint32_t keys);
   // Where playback is for the element a media source is attached to (microseconds; 0 if it is not attached to one).
   int64_t mse_playhead(uint32_t source);
 
@@ -243,6 +249,8 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     bool has_source = false;     // the element names a file (it may not be fetched yet)
     uint32_t mse_source = 0;     // the MediaSource it plays (its address is a blob: one made from one)
     MseClip* mse_clip = nullptr;   // (the clip, when it is that kind)
+    uint32_t keys = 0;           // the MediaKeys it decrypts with (EmeHub number), 0 for none
+    bool waiting_key_sent = false;
     uint8_t last_ready = 0;      // (a clip that is fed while it plays) what readyState was at the last update, and what has been announced
     bool loaded_data = false, waiting_sent = false;
     int64_t last_duration_us = -2;
@@ -316,6 +324,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   List<UniquePointer<SvgSlot>> svgs_;
   List<Event> events_;
   media::MseHub mse_;
+  media::EmeHub eme_;
   uint64_t canvas_pixels_ = 0, now_ms_ = 0;
   uint32_t fetched_images_ = 0;
   bool dirty_ = false, accelerated_ = false;

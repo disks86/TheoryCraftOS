@@ -47,6 +47,43 @@ enum class MseTrackKind : uint8_t { Video, Audio };
 // video codec is in it.
 bool mse_type_supported(StringView type, MseFormat* format, bool* has_video);
 
+// Common Encryption (ISO/IEC 23001-7): how the samples of a track are protected.
+enum class MseScheme : uint8_t { None, Cenc, Cens, Cbc1, Cbcs };
+
+// What the track's 'tenc' box says (the defaults; a sample group can say otherwise for some samples).
+struct MseProtection {
+  MseScheme scheme = MseScheme::None;
+  bool is_protected = false;
+  uint8_t iv_size = 0;                 // bytes of per-sample initialization vector; 0: the constant IV
+  uint8_t constant_iv_size = 0;
+  uint8_t crypt_blocks = 0, skip_blocks = 0;   // the pattern ('cens' and 'cbcs'; 0, 0: every block)
+  uint8_t kid[16] = {};
+  uint8_t constant_iv[16] = {};
+};
+
+// The keys a player has: the standard of EME asks the key system for a key by its identifier.
+class IMseKeys {
+ public:
+  // The 16-byte key of a key identifier; false if there is none (yet).
+  virtual bool key_for(const uint8_t kid[16], uint8_t key[16]) const = 0;
+  // Changes whenever keys came or went.
+  virtual uint64_t key_epoch() const = 0;
+
+ protected:
+  IMseKeys() = default;
+  ~IMseKeys() = default;
+};
+
+// How one sample is protected, as a media segment says (the subsamples are the 6-byte entries of 'senc': 16 bit clear, 32 bit protected bytes).
+struct MseSampleCrypto {
+  MseScheme scheme = MseScheme::None;
+  uint8_t kid[16] = {};
+  uint8_t iv[16] = {};
+  uint8_t crypt_blocks = 0, skip_blocks = 0;
+  uint32_t subsample_count = 0;
+  ConstByteView subsamples;
+};
+
 struct MseTrackInfo {
   uint32_t id = 0;
   MseTrackKind kind = MseTrackKind::Audio;
@@ -54,15 +91,17 @@ struct MseTrackInfo {
   uint32_t timescale = 1000;
   uint32_t width = 0, height = 0, channels = 0, sample_rate = 0;
   uint32_t default_duration = 0, default_size = 0, default_flags = 0;   // trex
-  uint64_t entry_offset = 0, entry_size = 0;                           // the sample description box inside MseInit::entries
+  uint64_t entry_offset = 0, entry_size = 0;                           // the sample description box inside MseInit::entries (without its protection)
+  MseProtection protection;
 };
 
 // An initialization segment: the tracks and the boxes the player needs to know how to decode their samples.
 class MseInit {
  public:
-  explicit MseInit(allocators::IAllocator& allocator) : tracks(allocator), entries(allocator) {}
+  explicit MseInit(allocators::IAllocator& allocator) : tracks(allocator), entries(allocator), pssh(allocator) {}
   List<MseTrackInfo> tracks;
   ByteBuffer entries;
+  ByteBuffer pssh;            // the 'pssh' boxes of the movie box, one after the other (what the "cenc" init data of an "encrypted" event is)
   int64_t duration_us = -1;   // from the movie header, -1 if it does not say
   ConstByteView entry(const MseTrackInfo& track) const;
   bool same_as(const MseInit& other) const;   // the same tracks and sample descriptions
@@ -75,7 +114,10 @@ class IMseSink {
   // False if the stream is not acceptable (the append fails with a decode error).
   virtual bool init_segment(UniquePointer<MseInit> init) = 0;
   // One coded frame of track `track` (an index into the last init segment's tracks), times in microseconds.
-  virtual bool frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t duration_us, bool sync, ConstByteView data) = 0;
+  // `crypto` says how the frame is protected (null: it is in the clear).
+  virtual bool frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t duration_us, bool sync, ConstByteView data, const MseSampleCrypto* crypto) = 0;
+  // 'pssh' boxes found in a media segment (a key rotation brings the key identifiers of the next keys this way).
+  virtual void protection_data(ConstByteView pssh_boxes) = 0;
 
  protected:
   IMseSink() = default;
@@ -100,6 +142,8 @@ class IMseParser {
 UniquePointer<IMseParser> make_mse_parser(allocators::IAllocator& allocator, MseFormat format);
 
 enum class MseAppend : uint8_t { Ok, Decode, Quota, Memory };
+enum class MsePlan : uint8_t { Ok, NoData, NeedKey };
+enum class MseDecrypt : uint8_t { Ok, NeedKey, Failed };
 
 // What to write out: the range around a time and the pieces to take it from.
 struct MseSnapshotPlan {
@@ -172,6 +216,19 @@ class MseBuffer final : private IMseSink {
 
   // --- Snapshots
   bool plan(int64_t time_us, MseSnapshotPlan* out) const;
+  // The same, for content that may be encrypted: the plan stops before the first frame whose key `keys` does not have; if that is the first frame the plan
+  // would start with, there is no plan but NeedKey (and the key identifier it asks for in `missing_kid`, 16 bytes). Null keys: no key at all.
+  MsePlan plan_for(int64_t time_us, MseSnapshotPlan* out, const IMseKeys* keys, uint8_t* missing_kid) const;
+  // Decrypts, in place, the frames a plan covers (what snapshot() then writes is in the clear).
+  MseDecrypt decrypt(const IMseKeys& keys, const MseSnapshotPlan& plan, uint8_t* missing_kid);
+  // Init data for the "encrypted" event: false when there is none waiting. `keyids` says the data is a {"kids":[...]} JSON text instead of 'pssh' boxes.
+  struct EncryptedEvent {
+    explicit EncryptedEvent(allocators::IAllocator& a) : data(a) {}
+    bool keyids = false;
+    ByteBuffer data;
+  };
+  bool take_encrypted(UniquePointer<EncryptedEvent>* out);
+  bool has_protected_frames() const { return protected_frames_ != 0; }
   // Writes the file for a plan; fills in plan->base_us and the video size. False if memory ran out.
   bool snapshot(MseSnapshotPlan* plan, ByteBuffer* out) const;
 
@@ -180,6 +237,7 @@ class MseBuffer final : private IMseSink {
     int64_t pts, dts, duration;
     uint64_t offset;
     uint32_t size, generation;
+    uint32_t aux;            // 0: in the clear; else the position of its protection record in aux_, plus 1
     uint8_t slot;
     bool sync;
   };
@@ -188,9 +246,12 @@ class MseBuffer final : private IMseSink {
 
   // IMseSink
   bool init_segment(UniquePointer<MseInit> init) override;
-  bool frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t duration_us, bool sync, ConstByteView data) override;
+  bool frame(uint32_t track, int64_t pts_us, int64_t dts_us, int64_t duration_us, bool sync, ConstByteView data, const MseSampleCrypto* crypto) override;
+  void protection_data(ConstByteView pssh_boxes) override;
 
-  bool add_frame(uint32_t slot, int64_t pts, int64_t dts, int64_t duration, bool sync, ConstByteView data);
+  bool add_frame(uint32_t slot, int64_t pts, int64_t dts, int64_t duration, bool sync, ConstByteView data, const MseSampleCrypto* crypto);
+  void queue_encrypted(bool keyids, ConstByteView data);
+  void forget_aux(const Frame& f);
   void remove_overlap(uint32_t slot, int64_t pts, int64_t duration);
   void erase_frames(uint32_t slot, uint64_t first, uint64_t last);   // [first, last)
   void note_removed(int64_t from, int64_t to);
@@ -216,6 +277,10 @@ class MseBuffer final : private IMseSink {
   uint32_t slot_count_ = 0;
 
   UniquePointer<ByteBuffer> arena_;
+  UniquePointer<ByteBuffer> aux_;   // the protection records of the encrypted frames
+  uint64_t aux_garbage_ = 0, protected_frames_ = 0;
+  List<UniquePointer<EncryptedEvent>> encrypted_;
+  List<UniquePointer<ByteBuffer>> sent_;   // (init data announced lately, so that the same is not announced again)
   uint64_t arena_used_ = 0, garbage_ = 0;
 
   Mode mode_ = Mode::Segments;

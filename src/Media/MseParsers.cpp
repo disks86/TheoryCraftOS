@@ -172,6 +172,8 @@ class Mp4Parser final : public IMseParser {
           movie_timescale = m.be32();
           movie_duration = m.be32();
         }
+      } else if (box.type == fourcc("pssh")) {
+        if (init->pssh.size() + box.whole.size() > (1u << 20) || !init->pssh.append(box.whole)) return false;
       } else if (box.type == fourcc("mvex")) {
         ByteReader x(box.body);
         BoxRef inner;
@@ -295,8 +297,105 @@ class Mp4Parser final : public IMseParser {
       info->sample_rate = q.be32() >> 16;
     }
     info->entry_offset = init->entries.size();
-    info->entry_size = stsd.size();
-    return init->entries.append(stsd);
+    ByteBuffer clear(allocator_);
+    if (!unprotect(stsd, entry_size, info->kind, info, &clear)) return false;
+    info->entry_size = clear.size();
+    return init->entries.append(clear.view());
+  }
+
+  static bool put32(ByteBuffer* b, uint32_t v) {
+    const uint8_t bytes[4] = {static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)};
+    return b->append(ConstByteView(bytes, 4));
+  }
+
+  // The sample description as it was before it was protected: an 'encv' / 'enca' entry becomes the entry of its original format (the 'frma' of its 'sinf')
+  // without the 'sinf', and the scheme and the 'tenc' go to info->protection. An entry that is not protected is copied as it is.
+  bool unprotect(ConstByteView stsd, uint64_t entry_size, MseTrackKind kind, MseTrackInfo* info, ByteBuffer* out) {
+    const ConstByteView entry = stsd.subview(16, entry_size);
+    const ConstByteView body = entry.subview(8);
+    const uint32_t type = (uint32_t{entry[4]} << 24) | (uint32_t{entry[5]} << 16) | (uint32_t{entry[6]} << 8) | entry[7];
+    const uint32_t wanted = kind == MseTrackKind::Video ? fourcc("encv") : fourcc("enca");
+    if (type != wanted) return out->append(stsd);
+    uint64_t first_child = 78;
+    if (kind == MseTrackKind::Audio) {
+      first_child = 28;
+      if (body.size() >= 10) {
+        const uint32_t version = (uint32_t{body[8]} << 8) | body[9];
+        first_child += version == 1 ? 16 : version == 2 ? 36 : 0;
+      }
+    }
+    if (first_child > body.size()) return false;
+    ConstByteView sinf;
+    uint64_t sinf_at = 0;
+    {
+      ByteReader c(body.subview(first_child));
+      BoxRef child;
+      uint64_t at = first_child;
+      while (next_box(c, &child)) {
+        if (child.type == fourcc("sinf") && sinf.empty()) {
+          sinf = child.body;
+          sinf_at = at;
+          sinf_size_ = child.whole.size();
+        }
+        at += child.whole.size();
+      }
+    }
+    if (sinf.empty()) return false;
+    uint32_t original = 0;
+    if (!parse_sinf(sinf, &info->protection, &original)) return false;
+    info->codec = original;
+    // the entry again: header, the body up to the 'sinf', what follows it
+    const uint64_t new_entry = entry_size - sinf_size_;
+    if (!put32(out, static_cast<uint32_t>(16 + new_entry)) || !out->append(stsd.subview(4, 4)) || !out->append(stsd.subview(8, 4)) || !put32(out, 1)) return false;
+    if (!put32(out, static_cast<uint32_t>(new_entry)) || !put32(out, original)) return false;
+    if (!out->append(body.first(sinf_at)) || !out->append(body.subview(sinf_at + sinf_size_))) return false;
+    return true;
+  }
+
+  // 'sinf': the original format ('frma'), the scheme ('schm') and the track defaults ('tenc' inside 'schi').
+  static bool parse_sinf(ConstByteView sinf, MseProtection* p, uint32_t* original) {
+    ByteReader r(sinf);
+    BoxRef box;
+    bool have_tenc = false;
+    *original = 0;
+    while (next_box(r, &box)) {
+      ByteReader b(box.body);
+      if (box.type == fourcc("frma")) {
+        *original = b.be32();
+      } else if (box.type == fourcc("schm")) {
+        b.skip(4);
+        const uint32_t scheme = b.be32();
+        if (!b.ok()) return false;
+        p->scheme = scheme == fourcc("cenc") ? MseScheme::Cenc : scheme == fourcc("cens") ? MseScheme::Cens : scheme == fourcc("cbc1") ? MseScheme::Cbc1 : scheme == fourcc("cbcs") ? MseScheme::Cbcs : MseScheme::None;
+        if (p->scheme == MseScheme::None) return false;   // (a protection scheme this machine does not know)
+      } else if (box.type == fourcc("schi")) {
+        ByteReader c(box.body);
+        BoxRef inner;
+        while (next_box(c, &inner)) {
+          if (inner.type != fourcc("tenc")) continue;
+          ByteReader t(inner.body);
+          const uint8_t version = t.u8();
+          t.skip(3);
+          t.skip(1);
+          const uint8_t pattern = t.u8();
+          p->is_protected = t.u8() != 0;
+          p->iv_size = t.u8();
+          for (uint8_t& k : p->kid) k = t.u8();
+          if (version >= 1) {
+            p->crypt_blocks = pattern >> 4;
+            p->skip_blocks = pattern & 15;
+          }
+          if (p->is_protected && p->iv_size == 0) {
+            p->constant_iv_size = t.u8();
+            if (p->constant_iv_size != 8 && p->constant_iv_size != 16) return false;
+            for (uint32_t i = 0; i < p->constant_iv_size; ++i) p->constant_iv[i] = t.u8();
+          }
+          if (!t.ok() || (p->iv_size != 0 && p->iv_size != 8 && p->iv_size != 16)) return false;
+          have_tenc = true;
+        }
+      }
+    }
+    return p->scheme != MseScheme::None && have_tenc && *original != 0;
   }
 
   // --- a media segment: `whole` is the moof and the mdat, the moof's size is `moof_size` and the mdat's data starts at `data_start`
@@ -308,6 +407,13 @@ class Mp4Parser final : public IMseParser {
     BoxRef box;
     uint64_t previous_end = 0;   // where the data of the traf before ended
     bool first_traf = true;
+    {   // 'pssh' boxes in the movie fragment: the keys of what follows
+      ByteReader scan(moof.body);
+      ByteBuffer pssh(allocator_);
+      while (next_box(scan, &box))
+        if (box.type == fourcc("pssh") && !pssh.append(box.whole)) return false;
+      if (pssh.size() > 0) sink.protection_data(pssh.view());
+    }
     while (next_box(inside, &box)) {
       if (box.type != fourcc("traf")) continue;
       if (!parse_traf(box.body, whole, data_start, &previous_end, first_traf, sink)) return false;
@@ -316,111 +422,312 @@ class Mp4Parser final : public IMseParser {
     return true;
   }
 
+  // One entry of a 'seig' sample group: protection that holds for some samples of a fragment.
+  struct Seig {
+    bool is_protected = false;
+    uint8_t iv_size = 0, crypt = 0, skip = 0, constant_size = 0;
+    uint8_t kid[16] = {};
+    uint8_t constant_iv[16] = {};
+  };
+  struct Run {
+    uint32_t count, index;
+  };
+
   bool parse_traf(ConstByteView body, ConstByteView whole, uint64_t data_start, uint64_t* previous_end, bool first_traf, IMseSink& sink) {
-    ByteReader r(body);
-    BoxRef box;
-    uint32_t track_id = 0, flags = 0;
-    uint32_t default_duration = 0, default_size = 0, default_flags = 0;
-    bool have_duration = false, have_size = false, have_flags = false, empty = false, have_tfhd = false;
-    uint64_t base_offset = 0;
-    int64_t base_decode = -1;
-    uint64_t cursor = 0;   // where the next trun without a data offset starts
-    uint32_t track_index = 0;
-    bool known = false;
-    while (next_box(r, &box)) {
-      ByteReader t(box.body);
-      if (box.type == fourcc("tfhd")) {
-        const uint32_t vf = t.be32();
-        flags = vf & 0xFFFFFF;
-        track_id = t.be32();
-        if (flags & 0x1) {
-          t.skip(8);   // an absolute offset means nothing for a segment appended on its own: the moof's start is used
-        }
-        if (flags & 0x2) t.skip(4);
-        if (flags & 0x8) { default_duration = t.be32(); have_duration = true; }
-        if (flags & 0x10) { default_size = t.be32(); have_size = true; }
-        if (flags & 0x20) { default_flags = t.be32(); have_flags = true; }
-        if (!t.ok()) return false;
-        empty = (flags & 0x10000) != 0;
-        have_tfhd = true;
-        for (uint32_t i = 0; i < tracks_.count(); ++i) {
-          if (tracks_[i].id == track_id) {
-            track_index = i;
-            known = true;
-          }
-        }
-        if (known) {
-          const MseTrackInfo& info = tracks_[track_index];
-          if (!have_duration) default_duration = info.default_duration;
-          if (!have_size) default_size = info.default_size;
-          if (!have_flags) default_flags = info.default_flags;
-          base_offset = ((flags & 0x1) != 0 || (flags & 0x20000) != 0 || first_traf) ? 0 : *previous_end;
-          cursor = base_offset;
-        }
-      } else if (box.type == fourcc("tfdt")) {
-        const uint8_t version = t.u8();
-        t.skip(3);
-        const uint64_t value = version == 1 ? read64(t) : t.be32();
-        if (!t.ok()) return false;
-        if (value > (uint64_t{1} << 62)) return false;
-        base_decode = static_cast<int64_t>(value);
-      } else if (box.type == fourcc("trun")) {
-        if (!have_tfhd) return false;
-        if (!known || empty) continue;
-        const uint8_t version = t.u8();
-        const uint32_t trun_flags = t.be16() << 8 | t.u8();
-        const uint32_t count = t.be32();
-        if (!t.ok()) return false;
-        int64_t data_offset = 0;
-        bool have_offset = false;
-        if (trun_flags & 0x1) {
-          data_offset = static_cast<int32_t>(t.be32());
-          have_offset = true;
-        }
-        uint32_t first_flags = 0;
-        bool have_first_flags = false;
-        if (trun_flags & 0x4) {
-          first_flags = t.be32();
-          have_first_flags = true;
-        }
-        if (!t.ok()) return false;
-        const uint64_t per_sample = 4u * (((trun_flags & 0x100) != 0) + ((trun_flags & 0x200) != 0) + ((trun_flags & 0x400) != 0) + ((trun_flags & 0x800) != 0));
-        if (count > (1u << 22) || (per_sample && uint64_t{count} > t.remaining() / per_sample)) return false;
-        const MseTrackInfo& info = tracks_[track_index];
-        // where the samples start, in `whole`
-        int64_t position;
-        if (have_offset) {
-          position = static_cast<int64_t>(base_offset) + data_offset;
-        } else {
-          position = static_cast<int64_t>(cursor);
-        }
-        if (base_decode >= 0) {
-          next_dts_[track_index] = base_decode;
-          base_decode = -1;
-        }
-        int64_t dts_ticks = next_dts_[track_index];
-        for (uint32_t i = 0; i < count; ++i) {
-          const uint32_t duration = (trun_flags & 0x100) ? t.be32() : default_duration;
-          const uint32_t size = (trun_flags & 0x200) ? t.be32() : default_size;
-          uint32_t sample_flags = (trun_flags & 0x400) ? t.be32() : default_flags;
-          if (i == 0 && have_first_flags) sample_flags = first_flags;
-          int64_t cto = 0;
-          if (trun_flags & 0x800) cto = version == 0 ? int64_t{t.be32()} : int64_t{static_cast<int32_t>(t.be32())};
-          if (!t.ok()) return false;
-          if (position < static_cast<int64_t>(data_start) || static_cast<uint64_t>(position) > whole.size() || size > whole.size() - static_cast<uint64_t>(position)) return false;
-          const int64_t pts_ticks = dts_ticks + cto;
-          const int64_t dts_us = ticks_to_us(dts_ticks, info.timescale);
-          const int64_t duration_us = ticks_to_us(dts_ticks + duration, info.timescale) - dts_us;
-          const bool sync = info.kind == MseTrackKind::Audio || (sample_flags & 0x10000) == 0;
-          if (!sink.frame(track_index, ticks_to_us(pts_ticks, info.timescale), dts_us, duration_us, sync, whole.subview(static_cast<uint64_t>(position), size))) return false;
-          position += size;
-          dts_ticks += duration;
-        }
-        next_dts_[track_index] = dts_ticks;
-        cursor = static_cast<uint64_t>(position);
-        *previous_end = cursor;
+    // what the traf has, before its samples are read (the boxes about the encryption come after the 'trun' boxes)
+    ConstByteView tfhd, tfdt, senc, saiz, saio, sgpd, sbgp;
+    List<ConstByteView> truns(allocator_);
+    {
+      ByteReader r(body);
+      BoxRef box;
+      while (next_box(r, &box)) {
+        const bool seig = box.body.size() >= 8 && (uint32_t{box.body[4]} << 24 | uint32_t{box.body[5]} << 16 | uint32_t{box.body[6]} << 8 | box.body[7]) == fourcc("seig");
+        if (box.type == fourcc("tfhd")) tfhd = box.body;
+        else if (box.type == fourcc("tfdt")) tfdt = box.body;
+        else if (box.type == fourcc("trun")) {
+          if (truns.count() >= 64 || !truns.push_back(box.body)) return false;
+        } else if (box.type == fourcc("senc")) senc = box.body;
+        else if (box.type == fourcc("saiz")) saiz = box.body;
+        else if (box.type == fourcc("saio")) saio = box.body;
+        else if (box.type == fourcc("sgpd") && seig) sgpd = box.body;
+        else if (box.type == fourcc("sbgp") && seig) sbgp = box.body;
       }
     }
+    if (truns.count() == 0) return true;
+    if (tfhd.empty()) return false;
+    uint32_t track_id = 0, flags = 0, default_duration = 0, default_size = 0, default_flags = 0;
+    bool have_duration = false, have_size = false, have_flags = false;
+    {
+      ByteReader t(tfhd);
+      flags = t.be32() & 0xFFFFFF;
+      track_id = t.be32();
+      if (flags & 0x1) t.skip(8);   // an absolute offset means nothing for a segment appended on its own: the moof's start is used
+      if (flags & 0x2) t.skip(4);
+      if (flags & 0x8) { default_duration = t.be32(); have_duration = true; }
+      if (flags & 0x10) { default_size = t.be32(); have_size = true; }
+      if (flags & 0x20) { default_flags = t.be32(); have_flags = true; }
+      if (!t.ok()) return false;
+    }
+    uint32_t track_index = 0;
+    bool known = false;
+    for (uint32_t i = 0; i < tracks_.count(); ++i) {
+      if (tracks_[i].id == track_id) {
+        track_index = i;
+        known = true;
+      }
+    }
+    if (!known || (flags & 0x10000) != 0) return true;
+    const MseTrackInfo& info = tracks_[track_index];
+    if (!have_duration) default_duration = info.default_duration;
+    if (!have_size) default_size = info.default_size;
+    if (!have_flags) default_flags = info.default_flags;
+    const uint64_t base_offset = ((flags & 0x1) != 0 || (flags & 0x20000) != 0 || first_traf) ? 0 : *previous_end;
+    uint64_t cursor = base_offset;
+    int64_t base_decode = -1;
+    if (!tfdt.empty()) {
+      ByteReader t(tfdt);
+      const uint8_t version = t.u8();
+      t.skip(3);
+      const uint64_t value = version == 1 ? read64(t) : t.be32();
+      if (!t.ok() || value > (uint64_t{1} << 62)) return false;
+      base_decode = static_cast<int64_t>(value);
+    }
+    if (base_decode >= 0) next_dts_[track_index] = base_decode;
+
+    // --- the protection of the samples
+    const bool protected_track = info.protection.scheme != MseScheme::None;
+    List<Seig> seigs(allocator_);
+    List<Run> runs(allocator_);
+    ByteReader senc_reader(senc);
+    uint32_t senc_samples = 0;
+    bool senc_subsamples = false;
+    if (protected_track && !sgpd.empty()) {
+      ByteReader g(sgpd);
+      const uint32_t vf = g.be32();
+      const uint8_t version = static_cast<uint8_t>(vf >> 24);
+      g.skip(4);
+      uint32_t default_length = 0;
+      if (version >= 1) default_length = g.be32();
+      if (version >= 2) g.skip(4);
+      const uint32_t count = g.be32();
+      if (!g.ok() || count > 1024) return false;
+      for (uint32_t i = 0; i < count; ++i) {
+        uint32_t length = default_length;
+        if (version >= 1 && default_length == 0) length = g.be32();
+        const ConstByteView entry = g.take(length);
+        if (!g.ok() || length < 20) return false;
+        ByteReader e(entry);
+        Seig seig;
+        e.skip(1);
+        const uint8_t pattern = e.u8();
+        seig.is_protected = e.u8() != 0;
+        seig.iv_size = e.u8();
+        seig.crypt = pattern >> 4;
+        seig.skip = pattern & 15;
+        for (uint8_t& k : seig.kid) k = e.u8();
+        if (seig.is_protected && seig.iv_size == 0) {
+          seig.constant_size = e.u8();
+          if ((seig.constant_size != 8 && seig.constant_size != 16) || e.remaining() < seig.constant_size) return false;
+          for (uint32_t k = 0; k < seig.constant_size; ++k) seig.constant_iv[k] = e.u8();
+        }
+        if (!e.ok() || (seig.iv_size != 0 && seig.iv_size != 8 && seig.iv_size != 16) || !seigs.push_back(seig)) return false;
+      }
+    }
+    if (protected_track && !sbgp.empty()) {
+      ByteReader g(sbgp);
+      const uint32_t vf = g.be32();
+      g.skip(4);
+      if ((vf >> 24) >= 1) g.skip(4);
+      const uint32_t count = g.be32();
+      if (!g.ok() || count > (1u << 20)) return false;
+      for (uint32_t i = 0; i < count; ++i) {
+        Run run;
+        run.count = g.be32();
+        run.index = g.be32();
+        if (!g.ok() || !runs.push_back(run)) return false;
+      }
+    }
+    if (protected_track && !senc.empty()) {
+      const uint32_t vf = senc_reader.be32();
+      senc_subsamples = (vf & 2) != 0;
+      senc_samples = senc_reader.be32();
+      if (!senc_reader.ok()) return false;
+      // Some muxers (FFmpeg's, for one) write the entries of the fragments before this one in front of its own: the box then has more entries than the
+      // fragment has samples, and the last ones are the ones that are meant.
+      uint64_t total = 0;
+      for (const ConstByteView& trun : truns.view()) {
+        ByteReader c(trun);
+        c.skip(4);
+        total += c.be32();
+      }
+      if (senc_samples > total) {
+        const uint32_t surplus = senc_samples - static_cast<uint32_t>(total);
+        const uint32_t iv_bytes = info.protection.iv_size;
+        for (uint32_t k = 0; k < surplus; ++k) {
+          senc_reader.skip(iv_bytes);
+          if (senc_subsamples) {
+            const uint32_t subsamples = senc_reader.be16();
+            senc_reader.skip(uint64_t{subsamples} * 6);
+          }
+        }
+        if (!senc_reader.ok()) return false;
+        senc_samples = static_cast<uint32_t>(total);
+      }
+    }
+    // the sample information of 'saiz' / 'saio', when there is no 'senc'
+    uint64_t aux_at = 0;
+    uint32_t saiz_default = 0, saiz_count = 0;
+    ConstByteView saiz_sizes;
+    bool have_aux = false;
+    if (protected_track && senc.empty() && !saiz.empty() && !saio.empty()) {
+      ByteReader z(saiz);
+      const uint32_t vf = z.be32();
+      if (vf & 1) z.skip(8);
+      saiz_default = z.u8();
+      saiz_count = z.be32();
+      if (saiz_default == 0) saiz_sizes = z.take(saiz_count);
+      ByteReader o(saio);
+      const uint32_t of = o.be32();
+      if (of & 1) o.skip(8);
+      const uint32_t entries = o.be32();
+      aux_at = (of >> 24) == 1 ? read64(o) : o.be32();
+      if (!z.ok() || !o.ok() || entries == 0) return false;
+      have_aux = true;
+    }
+    uint32_t run_index = 0, run_used = 0, sample_number = 0;
+    uint64_t aux_cursor = aux_at;
+
+    // The protection of one sample: false if the segment does not say enough. `crypto->scheme` stays None for a sample in the clear.
+    auto protection_of = [&](uint32_t size, MseSampleCrypto* crypto) -> bool {
+      const uint32_t n = sample_number++;
+      if (!protected_track) return true;
+      MseProtection effective = info.protection;
+      while (run_index < runs.count() && run_used >= runs[run_index].count) {
+        ++run_index;
+        run_used = 0;
+      }
+      if (run_index < runs.count()) {
+        const uint32_t group = runs[run_index].index;
+        ++run_used;
+        if (group >= 1 && group <= seigs.count()) {
+          const Seig& g = seigs[group - 1];
+          effective.is_protected = g.is_protected;
+          effective.iv_size = g.iv_size;
+          effective.crypt_blocks = g.crypt;
+          effective.skip_blocks = g.skip;
+          effective.constant_iv_size = g.constant_size;
+          for (int k = 0; k < 16; ++k) {
+            effective.kid[k] = g.kid[k];
+            effective.constant_iv[k] = g.constant_iv[k];
+          }
+        }
+      }
+      // the sample's own information: its IV, and the subsamples
+      ConstByteView information;   // (IV and subsample entries as they are stored)
+      uint8_t iv[16] = {};
+      uint32_t iv_bytes = effective.iv_size;
+      ConstByteView subsamples;
+      uint32_t subsample_count = 0;
+      if (!senc.empty()) {
+        if (n >= senc_samples) return false;
+        for (uint32_t k = 0; k < iv_bytes; ++k) iv[k] = senc_reader.u8();
+        if (senc_subsamples) {
+          subsample_count = senc_reader.be16();
+          subsamples = senc_reader.take(uint64_t{subsample_count} * 6);
+        }
+        if (!senc_reader.ok()) return false;
+      } else if (have_aux) {
+        if (n >= saiz_count) return false;
+        const uint32_t length = saiz_default ? saiz_default : saiz_sizes[n];
+        if (aux_cursor > whole.size() || length > whole.size() - aux_cursor || length < iv_bytes) return false;
+        ByteReader a(whole.subview(aux_cursor, length));
+        for (uint32_t k = 0; k < iv_bytes; ++k) iv[k] = a.u8();
+        if (length > iv_bytes) {
+          subsample_count = a.be16();
+          subsamples = a.take(uint64_t{subsample_count} * 6);
+          if (!a.ok()) return false;
+        }
+        aux_cursor += length;
+      } else if (effective.is_protected && iv_bytes != 0) {
+        return false;   // protected, and nothing says how
+      }
+      if (!effective.is_protected) return true;
+      if (iv_bytes == 0) {
+        iv_bytes = effective.constant_iv_size;
+        for (uint32_t k = 0; k < iv_bytes; ++k) iv[k] = effective.constant_iv[k];
+      }
+      // the subsamples must cover the sample
+      if (subsample_count > 0) {
+        uint64_t total = 0;
+        ByteReader u(subsamples);
+        for (uint32_t k = 0; k < subsample_count; ++k) {
+          const uint64_t clear = u.be16();
+          const uint64_t encrypted = u.be32();
+          total += clear + encrypted;
+        }
+        if (!u.ok() || total != size) return false;
+      }
+      crypto->scheme = effective.scheme;
+      for (int k = 0; k < 16; ++k) {
+        crypto->kid[k] = effective.kid[k];
+        crypto->iv[k] = iv[k];   // (an 8-byte IV is the first half of the counter block; the rest is zero)
+      }
+      crypto->crypt_blocks = effective.crypt_blocks;
+      crypto->skip_blocks = effective.skip_blocks;
+      crypto->subsample_count = subsample_count;
+      crypto->subsamples = subsamples;
+      return true;
+    };
+
+    // --- the samples
+    int64_t dts_ticks = next_dts_[track_index];
+    for (const ConstByteView& trun : truns.view()) {
+      ByteReader t(trun);
+      const uint8_t version = t.u8();
+      const uint32_t trun_flags = t.be16() << 8 | t.u8();
+      const uint32_t count = t.be32();
+      if (!t.ok()) return false;
+      int64_t data_offset = 0;
+      bool have_offset = false;
+      if (trun_flags & 0x1) {
+        data_offset = static_cast<int32_t>(t.be32());
+        have_offset = true;
+      }
+      uint32_t first_flags = 0;
+      bool have_first_flags = false;
+      if (trun_flags & 0x4) {
+        first_flags = t.be32();
+        have_first_flags = true;
+      }
+      if (!t.ok()) return false;
+      const uint64_t per_sample = 4u * (((trun_flags & 0x100) != 0) + ((trun_flags & 0x200) != 0) + ((trun_flags & 0x400) != 0) + ((trun_flags & 0x800) != 0));
+      if (count > (1u << 22) || (per_sample && uint64_t{count} > t.remaining() / per_sample)) return false;
+      int64_t position = have_offset ? static_cast<int64_t>(base_offset) + data_offset : static_cast<int64_t>(cursor);
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t duration = (trun_flags & 0x100) ? t.be32() : default_duration;
+        const uint32_t size = (trun_flags & 0x200) ? t.be32() : default_size;
+        uint32_t sample_flags = (trun_flags & 0x400) ? t.be32() : default_flags;
+        if (i == 0 && have_first_flags) sample_flags = first_flags;
+        int64_t cto = 0;
+        if (trun_flags & 0x800) cto = version == 0 ? int64_t{t.be32()} : int64_t{static_cast<int32_t>(t.be32())};
+        if (!t.ok()) return false;
+        if (position < static_cast<int64_t>(data_start) || static_cast<uint64_t>(position) > whole.size() || size > whole.size() - static_cast<uint64_t>(position)) return false;
+        const int64_t pts_ticks = dts_ticks + cto;
+        const int64_t dts_us = ticks_to_us(dts_ticks, info.timescale);
+        const int64_t duration_us = ticks_to_us(dts_ticks + duration, info.timescale) - dts_us;
+        const bool sync = info.kind == MseTrackKind::Audio || (sample_flags & 0x10000) == 0;
+        MseSampleCrypto crypto;
+        if (!protection_of(size, &crypto)) return false;
+        if (!sink.frame(track_index, ticks_to_us(pts_ticks, info.timescale), dts_us, duration_us, sync, whole.subview(static_cast<uint64_t>(position), size),
+                        crypto.scheme == MseScheme::None ? nullptr : &crypto))
+          return false;
+        position += size;
+        dts_ticks += duration;
+      }
+      cursor = static_cast<uint64_t>(position);
+      *previous_end = cursor;
+    }
+    next_dts_[track_index] = dts_ticks;
     return true;
   }
 
@@ -430,6 +737,7 @@ class Mp4Parser final : public IMseParser {
   List<MseTrackInfo> tracks_;
   List<int64_t> next_dts_;
   bool tracks_ready_ = false;
+  uint64_t sinf_size_ = 0;   // (the size of the 'sinf' unprotect() found)
 };
 
 // --- MPEG audio and ADTS: a stream of frames with no initialization segment --------------------------------------------------------------------
@@ -510,7 +818,7 @@ class FramedAudioParser : public IMseParser {
     const int64_t pts = epoch_us_ + static_cast<int64_t>(epoch_samples_ * 1000000u / f.sample_rate);
     epoch_samples_ += f.samples;
     const int64_t end = epoch_us_ + static_cast<int64_t>(epoch_samples_ * 1000000u / f.sample_rate);
-    return sink.frame(0, pts, pts, end - pts, true, data);
+    return sink.frame(0, pts, pts, end - pts, true, data, nullptr);
   }
 
   allocators::IAllocator& allocator_;
@@ -615,7 +923,7 @@ class AdtsParser final : public FramedAudioParser {
     const uint32_t index = (d[2] >> 2) & 15;
     if (index >= 13) return false;
     const uint32_t config = ((d[2] & 1) << 2) | (d[3] >> 6);
-    const uint32_t length = (uint32_t{d[3] & 3} << 11) | (uint32_t{d[4]} << 3) | (d[5] >> 5);
+    const uint32_t length = (uint32_t(d[3] & 3) << 11) | (uint32_t{d[4]} << 3) | (d[5] >> 5);
     const uint32_t header_size = (d[1] & 1) ? 7 : 9;
     if (length < header_size) return false;
     f->length = length;
