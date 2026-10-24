@@ -893,6 +893,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       const bool planned = planned_device.plan_engine(engine_environment);
       if (planned_device.plan_status()[0]) Entry(planned ? Level::Ok : Level::Warning, "Firmware").text(planned_device.name()).text(": ").text(planned_device.plan_status());
     }
+    // Bring up the video engines that were planned and confirmed (AMD VCN 1.0: Ryzen 2000/3000 APUs). They are left idle - no decode path uses them yet - and stopped
+    // again at shutdown. This is the one switch: set it false to leave every engine unstarted.
+    constexpr bool kStartVideoEngines = true;
+    if (kStartVideoEngines && clock_ok && paging_ok) {
+      for (uint32_t i = 0; i < video_codecs.count(); ++i) {
+        hardware::IVideoCodecDevice& engine_device = *video_codecs.at(i);
+        if (!engine_device.firmware_status()[0]) continue;   // nothing to start on this device
+        const bool started = engine_device.start_hardware(clock);
+        Entry(started ? Level::Ok : Level::Warning, "Video").text(engine_device.name()).text(started ? ": engine started (idle)" : ": engine not started - ").text(started ? "" : engine_device.firmware_status());
+      }
+    }
     // The system database: one file on the root volume (/databases/system.db) where the OS and its programs keep their settings; the database query
     // window can open it too (system://localhost/system). Without a writable root volume it lives in memory for this session.
     database::local::LocalDatabase system_database(shared_allocator, &explorer_files.file_system(), "/databases/system.db");

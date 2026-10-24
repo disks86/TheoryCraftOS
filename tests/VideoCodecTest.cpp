@@ -1789,6 +1789,70 @@ static void test_amd_vcn_plan() {
   CHECK(a.live == 0);
 }
 
+// Starting the engine on its own, as the boot code does: only when the plan is whole and the graphics block confirmed the address configuration.
+static void test_amd_vcn_start_hardware() {
+  TestAllocator a;
+  HostFirmwareFileSystem fs(a);
+  const uint64_t cpu = 0xE0000000ull;
+  SteppingClock clock;
+  auto engine_for = [&](FakeRavenBar& bar, AnyRangeMapper& mapper, AmdVcnVideoEngine& e) {
+    e.set_registers(bar.region());
+    VideoEngineEnvironment env;
+    env.mapper = &mapper; env.framebuffer_base = cpu; env.framebuffer_bytes = 8ull << 20;
+    CHECK(e.initialize() && e.load_firmware(fs));
+    return e.plan_engine(env);
+  };
+  {   // Everything agrees: the engine starts, is reported, and shutdown puts it back to sleep.
+    FakeRavenBar bar;
+    bar.words[0x7E00 + 0x5AF] = 2;   // UVD_STATUS reads IDLE: the fake VCPU answers
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    CHECK(engine_for(bar, mapper, raven));
+    CHECK(raven.start_hardware(clock) && raven.engine_running() && strstr(raven.firmware_status(), "engine started, idle"));
+    CHECK(raven.start_hardware(clock) && raven.engine_running());   // already running: nothing more to do
+    CHECK(!raven.info().accelerated && raven.info().accelerated_decode_codecs == 0);
+    raven.shutdown();
+    CHECK(!raven.engine_running() && strstr(raven.firmware_status(), "engine stopped"));
+    raven.shutdown();   // twice is harmless
+  }
+  {   // The graphics block does not report the address configuration (GB_ADDR_CONFIG reads zero): planned, but not started.
+    FakeRavenBar bar(true, 0);
+    bar.words[0x7E00 + 0x5AF] = 2;
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    CHECK(engine_for(bar, mapper, raven) && raven.plan().gb_check == AmdGbAddrConfigCheck::HardwareUnreadable);
+    FakeRavenBar untouched(true, 0);
+    untouched.words[0x7E00 + 0x5AF] = 2;
+    CHECK(!raven.start_hardware(clock) && !raven.engine_running() && strstr(raven.firmware_status(), "did not confirm the address configuration"));
+    CHECK(bar.words == untouched.words);   // and nothing was written to the card
+  }
+  {   // No plan (the registers do not answer): nothing is started.
+    FakeRavenBar off(false);
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    CHECK(!engine_for(off, mapper, raven) && !raven.start_hardware(clock) && !raven.engine_running());
+    FakeRavenBar pristine(false);
+    CHECK(off.words == pristine.words);
+  }
+  {   // A VCPU that never answers: a failed start, three tries only, engine left stopped, the log says so.
+    FakeRavenBar bar;
+    AnyRangeMapper mapper;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    CHECK(engine_for(bar, mapper, raven));
+    SteppingClock before;
+    const uint64_t start = clock.now_us();
+    CHECK(!raven.start_hardware(clock) && !raven.engine_running() && strstr(raven.firmware_status(), "the VCPU did not answer"));
+    const uint64_t spent_ms = (clock.now_us() - start) / 1000;
+    CHECK(spent_ms < 4000 && spent_ms > 2500);   // three seconds of waiting, not the driver's ten
+    raven.shutdown();   // nothing to stop
+  }
+  {   // A device that needs no engine start does not claim to have started one.
+    AmdVcnVideoEngine renoir(a, 0x1636);
+    CHECK(renoir.initialize() && !renoir.start_hardware(clock) && !renoir.engine_running() && renoir.firmware_status()[0] == 0);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_amd_discovery_engine() {
   TestAllocator a;
   std::vector<uint32_t> vram = amd_fake_vram();
@@ -1842,6 +1906,7 @@ int main() {
   test_amd_vcn_firmware();
   test_amd_vcn_start();
   test_amd_vcn_plan();
+  test_amd_vcn_start_hardware();
   test_amd_discovery_engine();
   test_amd_system_window();
   test_amd_card_memory();
