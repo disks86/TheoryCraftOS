@@ -32,6 +32,7 @@ namespace hardware {
 
 namespace h265 {
 class Core;
+class IOffload;
 }
 
 // MD5 of one plane of samples, for checking decoded picture hashes: the decoder does not carry an MD5 implementation of its own (the OS has one in Crypto, which
@@ -74,6 +75,9 @@ class H265Decoder {
   HashStatistics hash_statistics() const;
   // Lets the decoder check MD5 hashes (CRC and checksum hashes need no help). Without it pictures with an MD5 hash are not counted as checked.
   void set_plane_hasher(IPlaneHasher* hasher);
+  // Hands the pixel work to something else (a hardware engine, see H265Core.hpp): this decoder still reads every parameter set and slice header, orders and
+  // outputs the pictures and checks their hashes, but the slice data goes to `offload` and the pictures it makes are the ones that come out. Set before decoding.
+  void set_offload(h265::IOffload* offload);
 
  private:
   allocators::IAllocator& allocator_;

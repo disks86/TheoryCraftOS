@@ -136,6 +136,7 @@ bool Core::parse_st_rps(BitReader& br, int idx, int num_sets, const StRps* sets,
     if (idx == num_sets) delta_idx = static_cast<int>(br.ue()) + 1;
     if (delta_idx > idx) return H265_FALSE;
     const StRps& ref = sets[idx - delta_idx];
+    if (idx == num_sets) rps_ref_delta_pocs_ = ref.num_delta_pocs();   // (the slice header's own set: a hardware decoder needs the size of the one it predicts from)
     const int sign = static_cast<int>(br.u(1));
     const int abs_delta = static_cast<int>(br.ue()) + 1;
     if (abs_delta > 32768) return H265_FALSE;
@@ -453,7 +454,9 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
       sh.poc_lsb = static_cast<int>(br.u(sps.log2_max_poc_lsb));
       const bool st_sps_flag = br.u(1) != 0;
       if (!st_sps_flag) {
+        rps_ref_delta_pocs_ = 0;
         if (!parse_st_rps(br, sps.num_st_rps, sps.num_st_rps, sps.st_rps, &sh.st_rps)) return H265_FALSE;
+        sh.num_delta_pocs_ref_rps_idx = rps_ref_delta_pocs_;
       } else {
         int idx = 0;
         if (sps.num_st_rps > 1) idx = static_cast<int>(br.u(ceil_log2(static_cast<uint32_t>(sps.num_st_rps))));
@@ -733,6 +736,7 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
     return true;
   }
   SliceHeader sh;
+  current_nal_ = ConstByteView(nal, size);
   if (!parse_slice_header(br, type, tid, &sh)) return H265_FALSE;
   if (sh.first_slice_segment_in_pic) {
     if (picture_open_) finish_picture();

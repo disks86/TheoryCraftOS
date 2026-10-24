@@ -156,6 +156,7 @@ struct SliceHeader {
   int num_entry_points = 0;
   uint64_t data_bit_offset = 0;   // where slice_segment_data() starts, in bits from the start of the payload (after the two header bytes), emulation prevention removed
   int num_pic_total_curr = 0;
+  int num_delta_pocs_ref_rps_idx = 0;   // when the slice header's reference picture set is predicted from another: how many pictures that one names
 };
 
 // Motion of a 4x4 block.
@@ -209,9 +210,46 @@ struct SliceInfo {
   bool ref_long[2][kMaxRefs] = {};
 };
 
+// A picture handed to another decoder (a hardware engine) instead of being decoded here: the parameter sets, the reference picture set as numbers the engine
+// can use, the slice NAL units as they came, and the picture's planes to fill. Everything else - picture order, reference marking, the output order, the
+// hash check - stays with the Core.
+struct OffloadReference {
+  int slot = 0;          // which picture buffer of the Core the reference is (stable for as long as it stays a reference)
+  int poc = 0;
+  bool is_long = false;
+};
+struct OffloadPicture {
+  const Sps* sps = nullptr;
+  const Pps* pps = nullptr;
+  const SliceHeader* first = nullptr;                 // the header of the first slice
+  int poc = 0;
+  int slot = 0;
+  bool reference = true;                              // a later picture of the same sub-layer may refer to it (not a sub-layer non-reference picture)
+  uint32_t ref_count = 0;
+  OffloadReference refs[kMaxRefs];                    // the pictures kept as references, which the three sets below index
+  uint32_t st_before_count = 0, st_after_count = 0, lt_count = 0;
+  uint8_t st_before[kMaxRefs] = {}, st_after[kMaxRefs] = {}, lt_curr[kMaxRefs] = {};
+  uint8_t list[2][kMaxRefs - 1] = {};                 // the first slice's final reference picture lists, as indexes into refs (0xFF: no entry)
+  ArrayView<const ConstByteView> slices;              // the NAL units of the picture, header bytes included
+  ByteView plane[3];                                  // I420, the coded size
+  int stride[3] = {0, 0, 0};
+};
+class IOffload {
+ public:
+  // Whether the pictures of this sequence can be decoded by the offload (a size or a tool it cannot take: no). Asked at every picture; a picture it refuses is
+  // decoded by the Core itself, so a stream should be refused from its first picture on or not at all.
+  virtual bool accepts(const Sps& sps, const Pps& pps) = 0;
+  // Decodes the picture into the planes. False: the planes are left grey and the picture counts as damaged.
+  virtual bool decode_picture(const OffloadPicture& picture) = 0;
+
+ protected:
+  constexpr IOffload() = default;
+  ~IOffload() = default;
+};
+
 class Core {
  public:
-  explicit Core(allocators::IAllocator& allocator) : allocator_(allocator), slices_(allocator) {}
+  explicit Core(allocators::IAllocator& allocator) : allocator_(allocator), slices_(allocator), offload_nals_(allocator) {}
   ~Core() = default;
 
   bool configure(ConstByteView hvcc);
@@ -224,6 +262,8 @@ class Core {
   // How many pictures carried a decoded picture hash (SEI) and how many of them the decoder's own picture did not match.
   H265Decoder::HashStatistics hash_statistics() const { return hash_stats_; }
   void set_plane_hasher(IPlaneHasher* hasher) { hasher_ = hasher; }
+  // Pictures are decoded by `offload` from then on (nullptr: here again). Set it before the first picture.
+  void set_offload(IOffload* offload) { offload_ = offload; }
 
  private:
   // --- H265Syntax.cpp
@@ -244,6 +284,7 @@ class Core {
   Picture* generate_missing(int poc, bool long_term);
   bool build_ref_lists(const SliceHeader& sh, SliceInfo* info);
   void finish_picture();
+  void run_offload(Picture* picture);
   void bump_output(bool all);
   bool output_ready() const;
   Picture* find_free_picture();
@@ -327,6 +368,11 @@ class Core {
   Mem<uint8_t> sao_plane_[3];
   List<SliceInfo> slices_;
   int slice_idx_ = -1;
+  IOffload* offload_ = nullptr;
+  bool offloaded_ = false;               // the picture being decoded goes to the offload
+  int rps_ref_delta_pocs_ = 0;
+  List<ConstByteView> offload_nals_;     // the slice NAL units of the picture being collected for the offload
+  ConstByteView current_nal_;            // the NAL unit being handled
 
   // slice data state
   BitReader* br_ = nullptr;

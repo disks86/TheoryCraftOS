@@ -278,6 +278,8 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   after_eos_ = false;
   first_header_ = sh;
   pending_hash_.present = false;
+  offload_nals_.clear();
+  offloaded_ = offload_ && offload_->accepts(sps, pps);
   return true;
 }
 
@@ -358,17 +360,68 @@ bool Core::setup_picture_state() {
   return true;
 }
 
+// Hands the picture to the offload: its parameter sets, the pictures kept as references (named by buffer and order count), and the slices as they came.
+void Core::run_offload(Picture* p) {
+  OffloadPicture o;
+  o.sps = sp_;
+  o.pps = pp_;
+  o.first = &first_header_;
+  o.poc = p->poc;
+  o.slot = static_cast<int>(p - pics_);
+  o.reference = !is_sub_layer_non_ref(first_header_.nal_type);
+  int index_of[kMaxPics];
+  for (int i = 0; i < kMaxPics; ++i) index_of[i] = -1;
+  for (int i = 0; i < kMaxPics && o.ref_count < static_cast<uint32_t>(kMaxRefs); ++i) {
+    const Picture& q = pics_[i];
+    if (&q == p || !q.in_use || !q.is_ref) continue;
+    index_of[i] = static_cast<int>(o.ref_count);
+    o.refs[o.ref_count++] = {i, q.poc, q.is_long};
+  }
+  auto add = [&](Picture* const* set, int count, uint8_t* out, uint32_t* out_count) {
+    for (int i = 0; i < count && *out_count < static_cast<uint32_t>(kMaxRefs); ++i) {
+      if (!set[i]) continue;
+      const int at = index_of[set[i] - pics_];
+      if (at >= 0) out[(*out_count)++] = static_cast<uint8_t>(at);
+    }
+  };
+  add(rps_st_curr_before_, num_st_before_, o.st_before, &o.st_before_count);
+  add(rps_st_curr_after_, num_st_after_, o.st_after, &o.st_after_count);
+  add(rps_lt_curr_, num_lt_curr_, o.lt_curr, &o.lt_count);
+  for (auto& l : o.list)
+    for (uint8_t& e : l) e = 0xFF;
+  if (slices_.count() > 0) {
+    const SliceInfo& first = slices_[0];
+    for (int l = 0; l < 2; ++l)
+      for (int i = 0; i < first_header_.num_ref_idx[l] && i < kMaxRefs - 1; ++i) {
+        const Picture* r = first.ref_pic[l][i];
+        if (r && index_of[r - pics_] >= 0) o.list[l][i] = static_cast<uint8_t>(index_of[r - pics_]);
+      }
+  }
+  o.slices = offload_nals_.view();
+  for (int c = 0; c < 3; ++c) {
+    o.plane[c] = ByteView(p->plane[c].data(), p->plane[c].size());
+    o.stride[c] = p->stride[c];
+  }
+  if (!offload_->decode_picture(o))
+    for (int c = 0; c < 3; ++c)
+      for (uint64_t i = 0; i < p->plane[c].size(); ++i) p->plane[c][i] = 128;
+}
+
 // Called when the last slice of the picture has been decoded.
 void Core::finish_picture() {
   picture_open_ = false;
   Picture* p = cur_;
   if (!p) return;
-  deblock_picture();
-  sao_picture();
+  if (offloaded_) {
+    run_offload(p);
+  } else {
+    deblock_picture();
+    sao_picture();
+  }
   verify_picture_hash();
-  // The motion the following pictures may use as collocated motion: one entry per 16x16 block.
+  // The motion the following pictures may use as collocated motion: one entry per 16x16 block (the engine keeps its own when it decodes).
   const Sps& s = *sp_;
-  const int bw = (s.width + 15) / 16, bh = (s.height + 15) / 16;
+  const int bw = (s.width + 15) / 16, bh = offloaded_ ? 0 : (s.height + 15) / 16;
   for (int by = 0; by < bh; ++by)
     for (int bx = 0; bx < bw; ++bx) {
       ColBlock& c = p->col[static_cast<uint64_t>(by) * bw + bx];

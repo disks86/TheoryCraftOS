@@ -240,12 +240,171 @@ static void test_feedback_reader() {
     }
 }
 
+
+// The H.265 messages: offsets written out by hand from rvcn_dec_message_hevc_t (276 bytes), values from a made-up picture whose fields are all distinct.
+static void test_hevc_messages() {
+  CHECK(hevc_decode_message_bytes() == 56 + 188 + 276);
+  uint8_t created[16];
+  (void)created;
+  std::vector<uint8_t> c(create_message_bytes(), 0);
+  CHECK(build_create_message(ByteView(c.data(), c.size()), 3, 1920, 1080, kStreamTypeH265) && word(c, 40) == 0x10 && word(c, 48) == 1920 && word(c, 52) == 1080);
+
+  h265::Sps sps;
+  h265::Pps pps;
+  h265::SliceHeader first;
+  sps.width = 1920;
+  sps.height = 1080;
+  sps.max_sub_layers = 2;
+  sps.max_dec_pic_buffering[1] = 5;
+  sps.log2_max_poc_lsb = 8;
+  sps.log2_min_cb = 3;
+  sps.log2_ctb = 6;
+  sps.log2_min_tb = 2;
+  sps.log2_max_tb = 5;
+  sps.max_th_depth_inter = 3;
+  sps.max_th_depth_intra = 2;
+  sps.amp = sps.sao = sps.temporal_mvp = sps.strong_intra_smoothing = true;
+  sps.pcm = true;
+  sps.pcm_bit_depth_luma = 7;
+  sps.pcm_bit_depth_chroma = 6;
+  sps.log2_min_pcm = 4;
+  sps.log2_max_pcm = 5;
+  sps.num_st_rps = 9;
+  sps.num_lt_sps = 2;
+  sps.pic_w_ctb = 30;
+  sps.pic_h_ctb = 17;
+  pps.sign_data_hiding = true;
+  pps.cu_qp_delta_enabled = true;
+  pps.diff_cu_qp_delta_depth = 2;
+  pps.cb_qp_offset = -3;
+  pps.cr_qp_offset = 4;
+  pps.init_qp = 30;
+  pps.num_ref_idx_default[0] = 3;
+  pps.num_ref_idx_default[1] = 2;
+  pps.beta_offset_div2 = -2;
+  pps.tc_offset_div2 = 1;
+  pps.log2_parallel_merge_level = 4;
+  pps.tiles_enabled = true;
+  pps.uniform_spacing = true;
+  pps.num_tile_cols = 3;
+  pps.num_tile_rows = 2;
+  pps.num_extra_slice_header_bits = 1;
+  first.num_delta_pocs_ref_rps_idx = 5;
+
+  h265::OffloadPicture pic;
+  pic.sps = &sps;
+  pic.pps = &pps;
+  pic.first = &first;
+  pic.poc = -7;
+  pic.slot = 4;
+  pic.ref_count = 2;
+  pic.refs[0] = {2, 8, false};
+  pic.refs[1] = {9, -16, true};
+  pic.st_before_count = 1;
+  pic.st_before[0] = 1;
+  pic.st_after_count = 1;
+  pic.st_after[0] = 0;
+  pic.lt_count = 0;
+  for (auto& l : pic.list) for (uint8_t& e : l) e = 0xFF;
+  pic.list[0][0] = 1;
+  pic.list[1][0] = 0;
+
+  DecodeBuffers b;
+  b.bitstream_bytes = 1000;
+  const HevcBufferSizes sizes = hevc_buffer_sizes(1920, 1080, 5);
+  b.dpb_bytes = sizes.dpb;
+  b.context_bytes = sizes.context;
+  b.target = target_layout(1920, 1080);
+  std::vector<uint8_t> m(hevc_decode_message_bytes(), 0xEE);
+  CHECK(build_hevc_decode_message(ByteView(m.data(), m.size()), 5, 42, pic, b));
+  CHECK(word(m, 0) == 40 && word(m, 4) == 244 && word(m, 8) == 2 && word(m, 12) == 1 && word(m, 16) == 5 && word(m, 20) == 42);
+  CHECK(word(m, 24) == 2 && word(m, 28) == 56 && word(m, 32) == 188);
+  CHECK(word(m, 40) == 13 && word(m, 44) == 244 && word(m, 48) == 276);
+  CHECK(word(m, 56) == 0x10 && word(m, 64) == 1920 && word(m, 68) == 1080 && word(m, 72) == 1024 && word(m, 76) == uint32_t(sizes.dpb) && word(m, 92) == uint32_t(sizes.context));
+  CHECK(word(m, 56 + 100) == 2048 && word(m, 56 + 104) == 1024 && word(m, 56 + 144) == uint32_t(b.target.chroma_offset));
+  const uint32_t h = 244;
+  // sps_info_flags: amp 1, sao 2, pcm 3, temporal mvp 6, strong intra 7, and 10 (reference lists in use)
+  CHECK(word(m, h) == ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 6) | (1u << 7) | (1u << 10)));
+  // pps_info_flags: sign hiding 2, cu_qp_delta 6, tiles 11, uniform spacing 13, loop filter across tiles 14 (the default is on)
+  CHECK(word(m, h + 4) == ((1u << 2) | (1u << 6) | (1u << 11) | (1u << 13) | (1u << 14)));
+  CHECK(m[h + 8] == 1 && m[h + 9] == 0 && m[h + 10] == 0 && m[h + 11] == 4);
+  CHECK(m[h + 12] == 4 && m[h + 13] == 0 && m[h + 14] == 3 && m[h + 15] == 0);
+  CHECK(m[h + 16] == 3 && m[h + 17] == 3 && m[h + 18] == 2 && m[h + 19] == 6);
+  CHECK(m[h + 20] == 5 && m[h + 21] == 1 && m[h + 22] == 1 && m[h + 23] == 1);
+  CHECK(m[h + 24] == 9 && m[h + 25] == 2 && m[h + 26] == 2 && m[h + 27] == 1);
+  CHECK(int8_t(m[h + 28]) == -3 && int8_t(m[h + 29]) == 4 && int8_t(m[h + 30]) == -2 && int8_t(m[h + 31]) == 1);
+  CHECK(m[h + 32] == 2 && m[h + 33] == 2 && m[h + 34] == 1 && m[h + 35] == 2);
+  // uniform tiles of 30 x 17 CTBs: columns 10, 10, (10); rows 8, (9)
+  CHECK(m[h + 36] == 9 && m[h + 37] == 0 && m[h + 38] == 9 && m[h + 39] == 0 && m[h + 40] == 0);
+  CHECK(m[h + 74] == 7 && m[h + 75] == 0 && m[h + 76] == 0);
+  CHECK(int8_t(m[h + 116]) == 4 && m[h + 117] == 5 && m[h + 118] == 4 && m[h + 119] == 0 && int32_t(word(m, h + 120)) == -7);
+  CHECK(m[h + 124] == 2 && m[h + 125] == 9 && m[h + 126] == 0x7F && m[h + 139] == 0x7F);
+  CHECK(int32_t(word(m, h + 140)) == 8 && int32_t(word(m, h + 144)) == -16 && word(m, h + 148) == 0);
+  CHECK(m[h + 204] == 1 && m[h + 205] == 0xFF && m[h + 212] == 0 && m[h + 213] == 0xFF && m[h + 220] == 0xFF);
+  CHECK(m[h + 244] == 1 && m[h + 245] == 0xFF && m[h + 259] == 0 && m[h + 260] == 0xFF);
+  for (uint32_t i = 236; i < 244; ++i) CHECK(m[h + i] == 0);
+  // Too small: refused, and nothing written.
+  for (uint32_t size : {0u, 55u, 243u, 244u, 519u}) {
+    std::vector<uint8_t> small(size, 0xAB);
+    CHECK(!build_hevc_decode_message(ByteView(small.data(), small.size()), 5, 42, pic, b));
+    for (uint8_t v : small) CHECK(v == 0xAB);
+  }
+  // Pictures the engine does not take: 10 bits, 4:2:2.
+  h265::Sps ten = sps;
+  ten.bit_depth_luma = 10;
+  pic.sps = &ten;
+  CHECK(!build_hevc_decode_message(ByteView(m.data(), m.size()), 5, 42, pic, b));
+  pic.sps = &sps;
+
+  // Buffer sizes (Mesa's formulas): 17 pictures of align(align(1920,32) * 1088 * 3 / 2, 256), and the context of 16 bytes per 16x16 block of the padded picture per picture.
+  CHECK(sizes.references == 17 && sizes.dpb == 17ull * ((1920ull * 1088 * 3 / 2 + 255) / 256 * 256));
+  CHECK(sizes.context == (2175ull / 16) * (1343ull / 16) * 16 * 17 + 52 * 1024);
+  CHECK(hevc_buffer_sizes(4096, 2304, 5).references == 8 && hevc_buffer_sizes(4096, 2304, 9).dpb == 0 && hevc_buffer_sizes(1920, 1080, 18).dpb == 0);
+  CHECK(hevc_buffer_sizes(100, 100, 1).dpb == 0 && hevc_buffer_sizes(8, 8, 1).dpb == 0 && hevc_buffer_sizes(8192, 4320, 1).dpb == 0 && hevc_buffer_sizes(1928, 1080, 1).dpb != 0);
+
+  // The scaling table: lists in coding (up-right diagonal) order, 4x4 at 0, 8x8 at 96, 16x16 at 480, 32x32 (matrices 0 and 3) at 864; DC values in the message.
+  sps.scaling_list_enabled = true;
+  for (int i = 0; i < 16; ++i) sps.scaling.list[0][0][i] = static_cast<uint8_t>(i);
+  for (int i = 0; i < 64; ++i) {
+    sps.scaling.list[1][5][i] = static_cast<uint8_t>(i);
+    sps.scaling.list[2][2][i] = static_cast<uint8_t>(100 + i);
+    sps.scaling.list[3][3][i] = static_cast<uint8_t>(150 + i);
+  }
+  sps.scaling.dc[2][2] = 33;
+  sps.scaling.dc[3][3] = 44;
+  std::vector<uint8_t> t(kMessageFeedbackItBytes, 0xEE);
+  CHECK(prepare_hevc_feedback_and_tables(ByteView(t.data(), t.size()), sps, pps));
+  static const uint8_t kDiagonal4[16] = {0, 4, 1, 8, 5, 2, 12, 9, 6, 3, 13, 10, 7, 14, 11, 15};
+  for (int k = 0; k < 16; ++k) CHECK(t[kItTableOffset + k] == kDiagonal4[k]);
+  // 8x8: raster index of the first positions of the diagonal scan: 0, 8, 1, 16, 9, 2
+  static const uint8_t kDiagonal8[6] = {0, 8, 1, 16, 9, 2};
+  for (int k = 0; k < 6; ++k) {
+    CHECK(t[kItTableOffset + 96 + 5 * 64 + k] == kDiagonal8[k]);
+    CHECK(t[kItTableOffset + 480 + 2 * 64 + k] == 100 + kDiagonal8[k]);
+    CHECK(t[kItTableOffset + 864 + 64 + k] == 150 + kDiagonal8[k]);
+  }
+  CHECK(t[kItTableOffset + 96 + 5 * 64 + 63] == 63 && t[kItTableOffset + 864 + 64 + 63] == 150 + 63);
+  CHECK(word(t, kFeedbackOffset) == 44 && word(t, kFeedbackOffset + 4) == 44);
+  pic.sps = &sps;
+  std::vector<uint8_t> m2(hevc_decode_message_bytes(), 0);
+  CHECK(build_hevc_decode_message(ByteView(m2.data(), m2.size()), 5, 42, pic, b) && m2[h + 228 + 2] == 33 && m2[h + 234 + 1] == 44 && (word(m2, h) & 1) == 1);
+  // A picture parameter set's own lists win over the sequence's.
+  pps.scaling_list_present = true;
+  pps.scaling.set_default();
+  CHECK(prepare_hevc_feedback_and_tables(ByteView(t.data(), t.size()), sps, pps) && t[kItTableOffset + 5] == 16);
+  // Without scaling lists the table is clear.
+  sps.scaling_list_enabled = false;
+  CHECK(prepare_hevc_feedback_and_tables(ByteView(t.data(), t.size()), sps, pps));
+  for (uint32_t i = 0; i < kItTableBytes; ++i) CHECK(t[kItTableOffset + i] == 0);
+}
+
 int main() {
   test_create_and_destroy();
   test_buffer_sizes();
   test_decode_message_from_a_stream();
   test_scaling_order();
   test_feedback_reader();
+  test_hevc_messages();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("AmdVcnDecodeMessagesTest passed\n");
   return 0;

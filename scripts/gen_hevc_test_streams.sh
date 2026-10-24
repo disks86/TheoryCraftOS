@@ -45,3 +45,12 @@ src2="testsrc2=size=176x144:rate=30,noise=alls=12:allf=t+u,format=yuv420p"
 src="$src2"
 make qcif       "keyint=30:bframes=2:ctu=16:ref=2"
 ls -l $out/hevc_*.h265 | awk '{print $5, $9}'
+
+# The stream the VCN H.265 self-test decodes (src/Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc): six 64x64 pictures, B pictures with reordering. Not kept in
+# tests/data; only the generated C++ array is.
+selftest_dir=$(mktemp -d)
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=64x64:rate=30,noise=alls=12:allf=t+u,format=yuv420p" -frames:v 6 -c:v libx265 -pix_fmt yuv420p \
+  -x265-params "log-level=error:repeat-headers=1:info=0:hash=1:keyint=30:bframes=2:ref=2:ctu=32:min-cu-size=8:crf=30:b-adapt=0:no-scenecut=1:weightp=0:weightb=0:frame-threads=1:pools=none" \
+  -f hevc "$selftest_dir/selftest.h265"
+python3 -I scripts/gen_hevc_selftest_inc.py "$selftest_dir/selftest.h265" src/Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc
+rm -rf "$selftest_dir"

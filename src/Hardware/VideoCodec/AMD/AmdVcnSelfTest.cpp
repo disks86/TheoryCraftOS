@@ -20,6 +20,7 @@
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
 #include "Hardware/VideoCodec/Software/H264.hpp"
 #include "Hardware/VideoCodec/Software/H264Encoder.hpp"
+#include "Hardware/VideoCodec/Software/H265.hpp"
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 
 namespace hardware {
@@ -134,6 +135,76 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run(allocators::IAllocator& allocator, co
   if (engine.ring->wedged()) return Result::EngineFailed;
   if (session.statistics().errors != 0) return Result::EngineFailed;
   return got == kPictures ? Result::Passed : Result::Mismatch;
+}
+
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc"
+
+// A copy of a picture the CPU decoder returned (its planes are only valid until the next call).
+bool keep_picture(const VideoFrame& f, VideoFrameBuffer* out) {
+  if (!out->allocate(f.format)) return false;
+  for (uint32_t p = 0; p < f.format.plane_count(); ++p)
+    for (uint32_t row = 0; row < f.format.plane_height(p); ++row)
+      out->plane(p).subview(uint64_t{row} * f.format.plane_stride(p), f.format.plane_width(p)).copy_from(ConstByteView(f.plane[p] + uint64_t{row} * f.stride[p], f.format.plane_width(p)));
+  return true;
+}
+}  // namespace
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine) {
+  const ConstByteView stream(kHevcSelfTestStream);
+  auto packet = [&](uint32_t i) {
+    const uint64_t start = i == 0 ? 0 : kHevcSelfTestEnds[i - 1];
+    return stream.subview(start, kHevcSelfTestEnds[i] - start);
+  };
+  // The CPU's pictures, in display order.
+  VideoFrameBuffer expected[kHevcSelfTestPictures] = {VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator),
+                                                      VideoFrameBuffer(allocator), VideoFrameBuffer(allocator)};
+  int64_t pts[kHevcSelfTestPictures] = {};
+  {
+    H265Decoder cpu(allocator);
+    uint32_t got = 0;
+    VideoFrame f;
+    for (uint32_t i = 0; i <= kHevcSelfTestPictures; ++i) {
+      if (i < kHevcSelfTestPictures) {
+        if (!cpu.decode(packet(i), int64_t{i} * 1000)) return Result::StreamFailed;
+      } else {
+        cpu.flush();
+      }
+      while (cpu.receive(&f)) {
+        if (got >= kHevcSelfTestPictures || !keep_picture(f, &expected[got])) return Result::StreamFailed;
+        pts[got++] = f.pts_us;
+      }
+    }
+    if (got != kHevcSelfTestPictures) return Result::StreamFailed;
+  }
+
+  DecoderConfig config;
+  config.codec = VideoCodec::Hevc;
+  config.output = PixelFormat::I420;
+  AmdVcnHevcDecoder session(allocator, engine, config);
+  if (!session.prepare()) return Result::SessionRefused;
+  uint32_t got = 0;
+  VideoFrame f;
+  for (uint32_t i = 0; i < kHevcSelfTestPictures; ++i) {
+    VideoPacket p;
+    p.data = packet(i);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
+    while (session.receive(&f)) {
+      if (got >= kHevcSelfTestPictures || !same_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
+      ++got;
+    }
+  }
+  session.flush();
+  while (session.receive(&f)) {
+    if (got >= kHevcSelfTestPictures || !same_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
+    ++got;
+  }
+  if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
+  // The engine must really have done the work: every picture went through it (a stream the session passed to the CPU would "pass" too).
+  if (session.pictures_decoded() != kHevcSelfTestPictures) return Result::SessionRefused;
+  return got == kHevcSelfTestPictures ? Result::Passed : Result::Mismatch;
 }
 
 const char* AmdVcnSelfTest::result_name(Result result) {

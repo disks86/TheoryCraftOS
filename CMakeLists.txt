@@ -488,6 +488,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1Ring.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcnHevcDecoder.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.cpp
   src/Hardware/VideoCodec/AMD/AmdMediaEngineHw.cpp
   src/Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.cpp
@@ -523,6 +524,12 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/H264Cabac.cpp
   src/Hardware/VideoCodec/Software/H264Predict.cpp
   src/Hardware/VideoCodec/Software/H264Deblock.cpp
+  src/Hardware/VideoCodec/Software/H265.cpp
+  src/Hardware/VideoCodec/Software/H265Syntax.cpp
+  src/Hardware/VideoCodec/Software/H265Picture.cpp
+  src/Hardware/VideoCodec/Software/H265Slice.cpp
+  src/Hardware/VideoCodec/Software/H265Predict.cpp
+  src/Hardware/VideoCodec/Software/H265Filter.cpp
   src/Hardware/VideoCodec/Software/Vp8.cpp
   src/Hardware/VideoCodec/Software/Vp9.cpp
   src/Hardware/VideoCodec/Software/Vp9Syntax.cpp

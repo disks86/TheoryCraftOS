@@ -20,6 +20,7 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnHevcDecoder.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace hardware {
@@ -51,6 +52,10 @@ class AmdVcnSelfTest {
 
   // Decodes the stream on the engine and on the CPU and compares. The packets go in with presentation times 0, 1000, 2000... microseconds.
   static Result run(allocators::IAllocator& allocator, const AmdVcnAvcDecoder::Engine& engine);
+  // The same for H.265: a stream made by libx265 (64 x 64, six pictures, B pictures with reordering; AmdVcnSelfTestHevcStream.inc) is decoded by the CPU decoder and by
+  // the engine, and the pictures must be byte for byte the same. What passing proves beyond the above: the reference picture set and slot bookkeeping of the H.265
+  // message, 32x32 coding trees with the deblocking filter and SAO the encoder chose, bi-prediction. Not: scaling lists, tiles, slices, weighted prediction, other sizes.
+  static Result run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine);
   static const char* result_name(Result result);
 };
 

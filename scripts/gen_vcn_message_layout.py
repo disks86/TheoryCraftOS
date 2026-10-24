@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates AmdVcnMessageLayout.inc: the byte offsets and sizes of the fields of the decode messages the VCN firmware reads (message header, create, decode, AVC
+"""Generates AmdVcnMessageLayout.inc: the byte offsets and sizes of the fields of the decode messages the VCN firmware reads (message header, create, decode, AVC, HEVC
 picture parameters, feedback header), measured by compiling the structure definitions in Mesa's radeon_vcn_dec.h with a C compiler, so none is typed in by hand.
 
   gen_vcn_message_layout.py out.inc radeon_vcn_dec.h
@@ -18,6 +18,7 @@ TYPES = [
     ('Create', 'rvcn_dec_message_create_t'),
     ('Decode', 'rvcn_dec_message_decode_t'),
     ('Avc', 'rvcn_dec_message_avc_t'),
+    ('Hevc', 'rvcn_dec_message_hevc_t'),
     ('FeedbackIndex', 'rvcn_dec_feature_index_t'),
     ('Feedback', 'rvcn_dec_feedback_header_t'),
 ]

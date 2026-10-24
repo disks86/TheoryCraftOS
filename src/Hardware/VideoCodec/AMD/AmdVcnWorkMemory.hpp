@@ -86,6 +86,8 @@ class AmdVcnWorkMemory {
   }
   bool configured() const { return mapper_ != nullptr; }
   uint64_t free_bytes() const { return mapper_ ? bytes_ - used_ : 0; }
+  // What a session can have in all once it has reset the memory: everything but the permanent part.
+  uint64_t capacity_bytes() const { return mapper_ ? bytes_ - permanent_ : 0; }
 
   // A piece of at least `bytes` (rounded up to whole pages, and aligned to `alignment`, a power of two from a page up), mapped for the CPU. False when it does not fit
   // or the mapper refuses it; then nothing is taken.

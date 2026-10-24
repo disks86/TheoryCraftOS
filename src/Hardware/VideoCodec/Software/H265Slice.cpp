@@ -135,6 +135,7 @@ bool Core::decode_slice_data(const SliceHeader& sh, BitReader& br) {
   if (!slices_.push_back(info)) return H265_FALSE;
   slice_idx_ = static_cast<int>(slices_.count()) - 1;
   slice_ = &slices_[static_cast<uint64_t>(slice_idx_)];
+  if (offloaded_) return offload_nals_.push_back(current_nal_);   // the engine reads the slice data itself
   // NoBackwardPredFlag (8.5.3.2.9): no reference picture follows the current picture in output order.
   no_backward_pred_ = true;
   for (int l = 0; l < 2; ++l)

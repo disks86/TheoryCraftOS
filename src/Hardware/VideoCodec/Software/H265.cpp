@@ -54,4 +54,9 @@ void H265Decoder::set_plane_hasher(IPlaneHasher* hasher) {
   if (core_) core_->set_plane_hasher(hasher);
 }
 
+void H265Decoder::set_offload(h265::IOffload* offload) {
+  if (!core_) core_ = UniquePointer<h265::Core>::make(allocator_, allocator_);
+  if (core_) core_->set_offload(offload);
+}
+
 }  // namespace hardware
