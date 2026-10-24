@@ -18,6 +18,8 @@
 
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
+#include "Hardware/Mmio.hpp"
+#include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 
 namespace hardware {
@@ -31,8 +33,16 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   static constexpr uint16_t kPciVendor = 0x1002;
 
   // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown).
-  explicit AmdVcnVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0)
-      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), gpu_(amd_gpu_identify(gpu_device_id)) {}
+  // `discovery` is the last 64 KiB of the GPU's video memory (see AmdMediaEngineHw), or an empty window to skip looking at the hardware.
+  explicit AmdVcnVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& discovery = MmioRegion())
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), gpu_(amd_gpu_identify(gpu_device_id)), discovery_(discovery) {}
+
+  // Reads the GPU's IP discovery table (when given a window and the generation has one). Always succeeds: the engine is there either way.
+  bool initialize() override {
+    status_ = AmdMediaEngineHw::probe(allocator_, discovery_, gpu_.architecture);
+    return true;
+  }
+  const AmdMediaEngineStatus& engine_status() const { return status_; }
 
   const char* name() const override { return "AMD video engine (VCN) (software path)"; }
   const AmdGpuInfo& gpu() const { return gpu_; }
@@ -51,7 +61,10 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     return amd_gpu_has_video_engine(gpu_.architecture) ? codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mjpeg) : 0;
   }
 
+  allocators::IAllocator& allocator_;
   AmdGpuInfo gpu_;
+  MmioRegion discovery_;
+  AmdMediaEngineStatus status_;
 };
 
 }  // namespace hardware

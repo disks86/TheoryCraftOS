@@ -30,6 +30,7 @@
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnVideoEngine.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaVideoEngine.hpp"
@@ -1053,6 +1054,43 @@ static void test_nvidia_media_engine() {
   CHECK(pascal.initialize() && pascal.info().hardware_engine && !pascal.info().accelerated);
 }
 
+// A pretend end of video memory holding an IP discovery table (RDNA 3: graphics 11.0.0 and one VCN 4.0.0), the way the amdgpu driver documents it.
+static std::vector<uint32_t> amd_fake_vram() {
+  std::vector<uint8_t> t;
+  auto u8 = [&](uint32_t v) { t.push_back(static_cast<uint8_t>(v)); };
+  auto u16 = [&](uint32_t v) { u8(v); u8(v >> 8); };
+  auto u32 = [&](uint32_t v) { u16(v); u16(v >> 16); };
+  u32(0x28211407); u16(2); u16(0); u16(0); u16(0); u16(60);
+  while (t.size() < 60) u8(0);
+  u32(0x53445049); u16(2); u16(0); u32(1); u16(1);
+  const size_t die_table = t.size();
+  for (int i = 0; i < 16; ++i) { u16(0); u16(0); }
+  u8(0); u8(0);
+  t[die_table + 2] = static_cast<uint8_t>(t.size()); t[die_table + 3] = static_cast<uint8_t>(t.size() >> 8);
+  u16(0); u16(2);
+  u16(11); u8(0); u8(0); u8(11); u8(0); u8(0); u8(0);   // graphics
+  u16(12); u8(0); u8(0); u8(4); u8(0); u8(0); u8(0);    // video engine
+  t[10] = static_cast<uint8_t>(t.size()); t[11] = static_cast<uint8_t>(t.size() >> 8);
+  uint16_t sum = 0;
+  for (size_t i = 10; i < t.size(); ++i) sum = static_cast<uint16_t>(sum + t[i]);
+  t[8] = static_cast<uint8_t>(sum); t[9] = static_cast<uint8_t>(sum >> 8);
+  std::vector<uint32_t> words(AmdMediaEngineHw::kDiscoveryWindow / 4, 0);
+  for (size_t i = 0; i < t.size(); ++i) words[i / 4] |= static_cast<uint32_t>(t[i]) << (8 * (i % 4));
+  return words;
+}
+
+static void test_amd_discovery_engine() {
+  TestAllocator a;
+  std::vector<uint32_t> vram = amd_fake_vram();
+  const MmioRegion window(reinterpret_cast<uint64_t>(vram.data()), vram.size() * 4);
+  AmdVcnVideoEngine navi31(a, 0x744C, window), no_window(a, 0x744C), vega(a, 0x15DD, window);
+  CHECK(navi31.initialize() && navi31.engine_status().probed && navi31.engine_status().vcn_count() == 1 && navi31.engine_status().discovery.vcn.major == 4);
+  CHECK(navi31.engine_status().discovery.gc.major == 11 && navi31.engine_status().discovery.checksum_ok);
+  CHECK(no_window.initialize() && !no_window.engine_status().probed && no_window.engine_status().vcn_count() == 0);
+  CHECK(vega.initialize() && !vega.engine_status().probed);   // Vega has no table: nothing is read
+  CHECK(navi31.info().hardware_engine && !navi31.info().accelerated && a.live == 0);
+}
+
 static void test_amd_media_engine() {
   TestAllocator a;
   const uint32_t h264 = codec_mask(VideoCodec::H264), hevc = codec_mask(VideoCodec::Hevc), vp9 = codec_mask(VideoCodec::Vp9), av1 = codec_mask(VideoCodec::Av1);
@@ -1076,6 +1114,7 @@ int main() {
   test_system_list();
   test_intel_media_engine();
   test_amd_media_engine();
+  test_amd_discovery_engine();
   test_nvidia_media_engine();
   test_intel_system();
   test_h264_parser();

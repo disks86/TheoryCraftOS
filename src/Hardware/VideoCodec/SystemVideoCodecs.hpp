@@ -42,12 +42,25 @@ class IRegisterMapper {
   ~IRegisterMapper() = default;
 };
 
+// Tells how big a memory BAR is (the GPU's video memory aperture, for the AMD probe). Sizing a BAR briefly switches the device's decoding off;
+// the OS has a routine for it (pci_read_bar), and a test hands out a number.
+class IBarSizer {
+ public:
+  virtual bool bar_size(PciAddress address, uint8_t index, uint64_t* size) = 0;
+
+ protected:
+  constexpr IBarSizer() = default;
+  ~IBarSizer() = default;
+};
+
 class SystemVideoCodecs {
  public:
   SystemVideoCodecs(const IPciBus& pci, allocators::IAllocator& allocator) : pci_(pci), allocator_(allocator), devices_(allocator) {}
 
   // With a mapper, initialize() maps the register BAR of Intel GPUs and looks at their video engines, and reads the chip ID of NVIDIA GPUs; without one it only names them.
   void set_mmio(IRegisterMapper* mapper) { mmio_ = mapper; }
+  // With a sizer too, initialize() reads the IP discovery table at the end of the video memory of AMD GPUs (RDNA 1 and newer) and reports what the video engines are.
+  void set_bar_sizer(IBarSizer* sizer) { bar_sizer_ = sizer; }
   // Opt in (needs set_mmio): H.264 decoding on the video engine of Gen9.5 Intel GPUs. Off by default: that path has only run against a simulated GPU.
   void set_intel_hardware_decode(bool enable) { intel_hardware_ = enable; }
   // The memory the engine driver takes buffers from; by default the OS allocator's DMA pool. (For tests, which have no memory at device addresses.)
@@ -72,12 +85,14 @@ class SystemVideoCodecs {
  private:
   MmioRegion intel_registers(const PciDeviceInfo& d) const;
   uint32_t nvidia_boot0(const PciDeviceInfo& d) const;
+  MmioRegion amd_discovery_window(const PciDeviceInfo& d) const;
   bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out);
   void add_intel(const PciDeviceInfo& d);
 
   const IPciBus& pci_;
   allocators::IAllocator& allocator_;
   IRegisterMapper* mmio_ = nullptr;
+  IBarSizer* bar_sizer_ = nullptr;
   bool intel_hardware_ = false;
   intel_gt::AllocatorGpuMemory gpu_memory_{allocator_};
   intel_gt::IGpuMemory* gpu_memory_override_ = nullptr;

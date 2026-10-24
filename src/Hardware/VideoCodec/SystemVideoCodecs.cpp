@@ -62,6 +62,22 @@ uint32_t SystemVideoCodecs::nvidia_boot0(const PciDeviceInfo& d) const {
   return value == 0xFFFFFFFFu ? 0 : value;
 }
 
+// The last 64 KiB of an AMD GPU's video memory, where the IP discovery table is, if it can be reached: a generation that has one, a mapper and a
+// sizer, memory decoding switched on, and a memory BAR that covers the whole of video memory (a smaller window - no resizable BAR - cannot show its end,
+// and then the probe finds no table). Empty otherwise.
+MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d) const {
+  constexpr uint16_t kPciCommand = 0x04;
+  constexpr uint32_t kMemorySpace = 1u << 1;
+  MmioRegion region;
+  if (!mmio_ || !bar_sizer_ || !AmdMediaEngineHw::supported(amd_gpu_identify(d.device_id).architecture)) return region;
+  if (!(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return region;
+  const uint64_t base = pci_.memory_bar(d.address, 0);
+  uint64_t size = 0;
+  if (base == 0 || !bar_sizer_->bar_size(d.address, 0, &size) || size < AmdMediaEngineHw::kDiscoveryWindow || size > UINT64_MAX - base) return region;
+  if (!mmio_->map_registers(base + (size - AmdMediaEngineHw::kDiscoveryWindow), AmdMediaEngineHw::kDiscoveryWindow, &region)) return MmioRegion();
+  return region;
+}
+
 // What the engine driver needs of a Gen9.5 GPU, found from its PCI function: the first 2 MiB of the register BAR, the global GTT table (halfway into the 16 MiB BAR,
 // its size from the GMCH control word), and eight entries of it nothing uses.
 struct IntelHardware {

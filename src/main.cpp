@@ -517,6 +517,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     explicit MmioRegisterMapper(hardware::MmioMapper& m) : mapper(m) {}
     bool map_registers(uint64_t physical, uint64_t length, hardware::MmioRegion* region) override { return mapper.ensure_mapped(physical, length, region); }
   } register_mapper(mmio);
+  struct PciBarSizer final : hardware::IBarSizer {
+    hardware::IPciBus& bus;
+    explicit PciBarSizer(hardware::IPciBus& b) : bus(b) {}
+    bool bar_size(hardware::PciAddress address, uint8_t index, uint64_t* size) override {
+      hardware::PciBarInfo info;
+      if (!hardware::pci_read_bar(bus, address, index, &info) || !info.valid || info.io) return false;
+      *size = info.size;
+      return true;
+    }
+  } bar_sizer(pci);
+  video_codecs.set_bar_sizer(paging_ok ? &bar_sizer : nullptr);  // AMD GPUs: read the IP discovery table at the end of video memory
   video_codecs.set_mmio(paging_ok ? &register_mapper : nullptr);  // Intel GPUs: look at the video boxes (sessions still run on the CPU)
   video_codecs.initialize();
   for (uint32_t i = 0; i < video_codecs.count(); ++i) {
