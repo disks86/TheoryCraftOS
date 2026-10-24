@@ -240,6 +240,7 @@ bool DomBindings::call_hook(StringView name, const HookArg* args, uint32_t count
       case HookArg::Kind::Bool: values.push_back(Value::make_bool(args[i].boolean)); break;
       case HookArg::Kind::Number: values.push_back(Value::make_number(args[i].number)); break;
       case HookArg::Kind::String: values.push_back(Value::make_string(vm_.new_string(args[i].text))); break;
+      case HookArg::Kind::Node: values.push_back(bind::node_value(c, args[i].node)); break;
     }
   }
   Value ignored;

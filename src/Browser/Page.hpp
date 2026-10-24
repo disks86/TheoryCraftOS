@@ -107,6 +107,18 @@ class IPageEnvironment : public IObjectEnvironment {
   // The clipboard, for Ctrl+C / X / V in a text field. (False / nothing without one.)
   virtual bool clipboard_get(String* text) { (void)text; return false; }
   virtual void clipboard_set(StringView text) { (void)text; }
+  // The same for more than text (see IDomHost). The defaults know only text.
+  virtual void clipboard_formats(String* csv) {
+    String text(csv->allocator());
+    csv->clear();
+    if (clipboard_get(&text) && !text.empty()) csv->assign("text/plain");
+  }
+  virtual bool clipboard_read_format(StringView format, String* bytes) { return format.equals("text/plain") && clipboard_get(bytes); }
+  virtual bool clipboard_write_items(const ClipboardData& data) {
+    if (!data.has_text) return false;
+    clipboard_set(data.text);
+    return true;
+  }
   // The user clicked a file input (the node with that serial): let them choose; Page::file_chosen() is called for each file they pick. (Nothing without a file dialog.)
   virtual void pick_file(uint32_t node_serial, bool multiple) { (void)node_serial; (void)multiple; }
   // (IObjectEnvironment: fetch_bytes() for pictures and videos, open_video(); pages without pictures need neither)
@@ -253,6 +265,9 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void pip_exit() override;
   bool clipboard_read(String* text) override { return env_.clipboard_get(text); }
   void clipboard_write(StringView text) override { env_.clipboard_set(text); }
+  void clipboard_formats(String* csv) override { env_.clipboard_formats(csv); }
+  bool clipboard_read_format(StringView format, String* bytes) override { return env_.clipboard_read_format(format, bytes); }
+  bool clipboard_write_items(const ClipboardData& data) override { return env_.clipboard_write_items(data); }
   bool fullscreen_supported() override { return env_.fullscreen_supported(); }
   dom::Node* fullscreen_element() override;
   bool fullscreen_request(dom::Node* element) override;
@@ -319,6 +334,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
 
   bool start_engine();
   void resolve_scroll_target(const layout::BoxTree& tree);
+  // Fires `copy`, `cut` or `paste` (a ClipboardEvent with clipboardData) at `target`; true if a listener called preventDefault() (it did the work itself).
+  bool fire_clipboard(dom::Node* target, StringView type);
+  // Ctrl+A / C / X / V with no text field to work on: the page's own selection and the events.
+  void page_clipboard_key(dom::Node* target, char key);
   void deliver_object_events();
   // Forms
   struct Frame;

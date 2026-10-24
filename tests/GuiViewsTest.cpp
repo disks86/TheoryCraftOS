@@ -6672,6 +6672,13 @@ struct FakeLoader final : browser::IPageLoader {
     if (address.equals("http://open.test/")) html = "<title>Opener</title><script>open('http://closer.test/', 'pop')</script>";
     if (address.equals("http://closer.test/")) html = "<title>Closer</title><p>bye</p>";
     if (address.equals("http://closer.test/now")) html = "<title>Closing</title><script>close()</script>";
+    if (address.equals("http://localhost/clip"))
+      html = "<title>Clip</title><button id=b>go</button><script>document.getElementById('b').onclick = function () { navigator.clipboard.write([new ClipboardItem({ 'text/plain': 'plain!', 'text/html': '<b>rich</b>' })])"
+             ".then(function () { return navigator.clipboard.read() }).then(function (items) { document.title = items[0].types.join('+') }) }</script>";
+    if (address.equals("http://localhost/img"))
+      html = "<title>Img</title><button id=b>go</button><script>document.getElementById('b').onclick = function () { var blob; navigator.clipboard.read().then(function (items) { return items[0].getType('image/png') })"
+             ".then(function (b) { blob = b; return navigator.clipboard.writeText('in between') }).then(function () { return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]) })"
+             ".then(function () { document.title = 'png ' + (blob.size > 20) }, function (e) { document.title = 'failed ' + e.name }) }</script>";
     if (address.equals("http://js.test/app.js")) {
       r->content_type.assign("application/javascript");
       html = "document.write('<p>from file</p>'); var answer = 6 * 7; document.write('<p>' + answer + '</p>');";
@@ -7108,6 +7115,54 @@ static void test_web_navigation() {
   CHECK(a.live == 0);
 }
 
+// The clipboard in the browser window: a page puts text and html on the real clipboard and reads them back; a picture on the clipboard is read as a PNG and written back.
+static void test_web_clipboard() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    FakeLoader loader;
+    d.set_page_loader(&loader);
+    kernel::Clipboard clipboard(a);
+    Window& w = d.window();
+    w.set_clipboard(&clipboard);
+    desktop::WebBrowser* b = d.open_web_browser();
+    auto* host = static_cast<gui::TabFrame*>(b->host());
+    put(host, {20, 20, 700, 500});
+    w.layout();
+
+    CHECK(b->navigate("http://localhost/clip") && b->title().equals("Web Browser - Clip"));
+    int32_t x = 0, y = 0;
+    CHECK(text_point(*b, "go", &x, &y));
+    click(w, x, y);
+    String text(a);
+    CHECK(clipboard.get_text(&text) && text.view().equals("plain!"));
+    b->tick(1000000);
+    CHECK(b->title().equals("Web Browser - text/plain+text/html"));
+    // someone else puts text on the clipboard: the html is not theirs
+    CHECK(clipboard.set_text("other"));
+    CHECK(b->navigate("http://localhost/clip") && text_point(*b, "go", &x, &y));
+
+    uint32_t pixels[4 * 3];
+    for (uint32_t i = 0; i < 12; ++i) pixels[i] = 0xFF000000u | (i * 20);
+    CHECK(clipboard.set_image(pixels, 4, 3));
+    CHECK(b->navigate("http://localhost/img") && text_point(*b, "go", &x, &y));
+    click(w, x, y);
+    b->tick(2000000);
+    b->tick(3000000);
+    uint32_t width = 0, height = 0;
+    CHECK(clipboard.has_image() && clipboard.image_size(&width, &height) && width == 4 && height == 3 && b->title().equals("Web Browser - png true"));
+    uint32_t back[12] = {};
+    CHECK(clipboard.get_image(back, 12));
+    bool same = true;
+    for (uint32_t i = 0; i < 12; ++i) same = same && back[i] == pixels[i];
+    CHECK(same);
+  }
+  CHECK(a.live == 0);
+}
+
 // Browsers are tabs like the other programs: "+" opens another, they are dragged between windows, and a session brings them back.
 static void test_web_browser_tabs() {
   TestAllocator a;
@@ -7245,6 +7300,7 @@ int main() {
   test_web_browser();
   test_web_form();
   test_web_navigation();
+  test_web_clipboard();
   test_web_browser_media();
   test_web_browser_tabs();
   test_database_query();

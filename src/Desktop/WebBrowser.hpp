@@ -178,6 +178,9 @@ class WebBrowser : public gui::Frame {
     void navigate_post(StringView address, StringView content_type, StringView body) override;
     bool clipboard_get(String* text) override;
     void clipboard_set(StringView text) override;
+    void clipboard_formats(String* csv) override;
+    bool clipboard_read_format(StringView format, String* bytes) override;
+    bool clipboard_write_items(const browser::ClipboardData& data) override;
     void pick_file(uint32_t node_serial, bool multiple) override;
     void set_hash(StringView hash) override;
     void reload() override;
@@ -283,6 +286,9 @@ class WebBrowser : public gui::Frame {
     int32_t delta = 0;
   };
   static constexpr uint32_t kHops = 10;
+  String rich_html_;                // the html a page put on the clipboard with its text (valid while the clipboard is still the one it wrote)
+  uint64_t rich_sequence_ = 0;
+  bool rich_valid_ = false;
   gui::MenuBar menu_;
   gui::ContextMenu back_menu_, forward_menu_;
   Hop hops_[2 * kHops];

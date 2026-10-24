@@ -61,6 +61,12 @@ class StorageArea {
   uint64_t version_ = 0;
 };
 
+// What a page puts on the clipboard in one go: plain text, html and a picture (PNG bytes); `has_` says which are given.
+struct ClipboardData {
+  bool has_text = false, has_html = false, has_image = false;
+  StringView text, html, image_png;
+};
+
 // What the bindings need from the page they live in.
 class IDomHost {
  public:
@@ -95,6 +101,11 @@ class IDomHost {
   // The text on the clipboard (navigator.clipboard): false if there is none / no clipboard.
   virtual bool clipboard_read(String* text) { (void)text; return false; }
   virtual void clipboard_write(StringView text) { (void)text; }
+  // The rest of the clipboard (navigator.clipboard.read() / write()): the formats on it as a comma separated list of MIME types, the bytes of one, and a write of text,
+  // html and / or a PNG picture (false if it did not work).
+  virtual void clipboard_formats(String* csv) { csv->clear(); }
+  virtual bool clipboard_read_format(StringView format, String* bytes) { (void)format; (void)bytes; return false; }
+  virtual bool clipboard_write_items(const ClipboardData& data) { (void)data; return false; }
   virtual bool fullscreen_supported() { return false; }
   virtual dom::Node* fullscreen_element() { return nullptr; }
   virtual bool fullscreen_request(dom::Node* element) { (void)element; return false; }
@@ -219,7 +230,8 @@ class DomBindings {
   // Calls a global function that the page's built-in scripts define (a "hook") with these arguments: how the browser delivers the events that are made out of
   // script values (a message with its data, a storage change). False if there is no such function or it threw (counted like a listener that threw).
   struct HookArg {
-    enum class Kind : uint8_t { Null, Bool, Number, String } kind = Kind::Null;
+    enum class Kind : uint8_t { Null, Bool, Number, String, Node } kind = Kind::Null;
+    dom::Node* node = nullptr;
     bool boolean = false;
     double number = 0;
     StringView text;
@@ -227,6 +239,7 @@ class DomBindings {
     static HookArg of(bool b) { HookArg a; a.kind = Kind::Bool; a.boolean = b; return a; }
     static HookArg of(double n) { HookArg a; a.kind = Kind::Number; a.number = n; return a; }
     static HookArg of(StringView s) { HookArg a; a.kind = Kind::String; a.text = s; return a; }
+    static HookArg of(dom::Node* n) { HookArg a; a.kind = Kind::Node; a.node = n; return a; }
   };
   // `result` (optional) gets the value the function returned as text ("" for undefined and null).
   bool call_hook(StringView name, const HookArg* args, uint32_t count, String* result = nullptr);
