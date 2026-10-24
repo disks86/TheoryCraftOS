@@ -61,6 +61,7 @@ ListView::ListView(allocators::IAllocator& allocator)
     : Control(allocator),
       model_(allocator),
       icons_(allocator),
+      marks_(allocator),
       columns_(allocator),
       vscroll_(allocator, Orientation::Vertical),
       hscroll_(allocator, Orientation::Horizontal),
@@ -131,7 +132,8 @@ int32_t ListView::add_item(const StringView* cells, uint32_t count, ItemIcon ico
   if (columns_.count() == 0) return -1;
   const int32_t row = model_.add_row(cells, count);
   if (row < 0) return -1;
-  if (!icons_.push_back(static_cast<uint8_t>(icon))) {
+  if (!icons_.push_back(static_cast<uint8_t>(icon)) || !marks_.push_back(0)) {
+    if (icons_.count() > static_cast<uint64_t>(row)) icons_.remove_at(icons_.count() - 1);
     model_.remove_row(static_cast<uint32_t>(row));
     return -1;
   }
@@ -218,6 +220,8 @@ void ListView::clear_items() {
   }
   model_.clear();
   icons_.clear();
+  marks_.clear();
+  marked_ = 0;
   scroll_x_ = scroll_y_ = 0;
   last_click_item_ = -1;
   const bool had_selection = selected_ >= 0;
@@ -393,8 +397,27 @@ void ListView::select_item(int32_t item) {
   UiGuard lock(this);
   if (item < -1 || item >= static_cast<int32_t>(model_.row_count())) return;
   if (item >= 0) ensure_visible(static_cast<uint32_t>(item));
-  if (item == selected_) return;
+  const bool was_multiple = clear_marks();
+  if (item == selected_ && !was_multiple) return;
   selected_ = item;
+  invalidate();
+  fire(selection_changed_);
+}
+
+bool ListView::clear_marks() {
+  if (!marked_) return false;
+  for (uint8_t& m : marks_) m = 0;
+  marked_ = 0;
+  return true;
+}
+
+void ListView::select_all() {
+  UiGuard lock(this);
+  const uint32_t n = model_.row_count();
+  if (n == 0 || marks_.count() != n) return;
+  for (uint8_t& m : marks_) m = 1;
+  marked_ = n;
+  if (selected_ < 0) selected_ = 0;
   invalidate();
   fire(selection_changed_);
 }
@@ -483,7 +506,7 @@ void ListView::paint(Painter& painter) {
     r.y -= body.y;
     const Rect2D visible = intersect(r, view);
     if (visible.width == 0 || visible.height == 0) continue;
-    const bool selected = static_cast<int32_t>(i) == selected_;
+    const bool selected = is_selected(i);
     const ItemIcon icon = item_icon(i);
     painter.push_frame(r);
     const Rect2D cell{0, 0, r.width, r.height};
@@ -619,6 +642,10 @@ bool ListView::on_key(const KeyArgs& args) {
   using namespace hardware;
   const int32_t n = static_cast<int32_t>(model_.row_count());
   const int32_t per = metrics_.per_line;
+  if ((args.modifiers & modifier::kControl) && args.usage == key::kA) {   // Ctrl+A
+    select_all();
+    return true;
+  }
   if (copy_enabled_ && (args.modifiers & modifier::kControl) && args.usage == key::kA + 2) return copy_selected_item();   // Ctrl+C
   switch (args.usage) {
     case key::kEnter:
