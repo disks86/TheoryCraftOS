@@ -43,6 +43,7 @@
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
 #include "Kernel/Sync.hpp"
 #include "Media/Image.hpp"
+#include "Media/Dash.hpp"
 #include "Media/Eme.hpp"
 #include "Media/Mse.hpp"
 #include "Media/WebVtt.hpp"
@@ -54,6 +55,7 @@
 namespace browser {
 
 class MseClip;
+class DashEnvironmentFetcher;
 
 // A video the environment is playing for a page.
 class IVideoClip {
@@ -222,6 +224,8 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void video_set_rate(uint32_t serial, double rate);           // playbackRate, 0 .. 16 (the caller checks)
   void video_set_default_rate(uint32_t serial, double rate);   // defaultPlaybackRate: what playbackRate is after load()
   void video_load(uint32_t serial);   // fetch again
+  // The DASH client playing the element's manifest (null if it plays something else), and where playback is (microseconds).
+  media::DashClient* video_dash(uint32_t serial, int64_t* playhead_us);
 
   // --- Text tracks (WebVTT): script owns the tracks and their cues; this holds a copy of what is not disabled, to draw the cues of the tracks that are
   // showing and to tell script when the cues that are active (the position is within start .. end) change.
@@ -260,6 +264,9 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     String url, poster;
     int32_t poster_cache = -1;
     UniquePointer<IVideoClip> clip;
+    UniquePointer<media::DashClient> dash;   // plays a DASH manifest through `mse_source`
+    UniquePointer<DashEnvironmentFetcher> dash_fetcher;
+    uint32_t dash_source = 0, dash_epoch = 0;
     List<UniquePointer<TrackCue>> cues;
     uint64_t active_signature = 0;   // which of the cues were active at the last update()
     uint64_t track_signature = 0;    // of the <track> children (their serials and attributes), to tell script when they change
@@ -320,6 +327,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void apply_rate(VideoSlot& v);
   void apply_volume(VideoSlot& v);
   void reanchor(VideoSlot& v);
+  void start_dash(VideoSlot& v, dom::Node* n, StringView address, IObjectEnvironment& env);
   void attach_mse(VideoSlot& v, dom::Node* n, uint32_t source, StringView address, IObjectEnvironment& env);
   void release_mse(VideoSlot& v);
   void watch_dynamic(VideoSlot& v);

@@ -86,7 +86,7 @@ bool supported_video_type(StringView type) {
   if (type.empty()) return true;
   const uint64_t semi = type.find(';');
   if (semi != StringView::npos) type = type.first(semi).trimmed();
-  for (const char* ok : {"video/mp4", "video/quicktime", "video/x-m4v", "video/x-msvideo", "video/avi", "video/msvideo", "video/webm", "video/x-matroska", "image/gif", "image/apng", "image/png", "image/webp", "video/x-yuv4mpeg"})
+  for (const char* ok : {"video/mp4", "video/quicktime", "video/x-m4v", "video/x-msvideo", "video/avi", "video/msvideo", "video/webm", "video/x-matroska", "image/gif", "image/apng", "image/png", "image/webp", "video/x-yuv4mpeg", "application/dash+xml"})
     if (type.equals_ignore_case(ok)) return true;
   return false;
 }
@@ -532,11 +532,58 @@ void PageObjects::sync_image(dom::Node* n, IObjectEnvironment& env, StringView b
 
 // --- Videos -----------------------------------------------------------------------------------------------------------------------
 
+// Is the address a DASH manifest (a path that ends in .mpd)?
+bool is_dash_address(StringView address) {
+  uint64_t end = address.size();
+  for (uint64_t i = 0; i < address.size(); ++i)
+    if (address[i] == '?' || address[i] == '#') {
+      end = i;
+      break;
+    }
+  return address.first(end).ends_with(".mpd") || address.first(end).ends_with(".MPD");
+}
+
+// What a DASH client fetches through: the page's environment. A byte range is cut from the whole file, which is kept while the client asks for ranges of it.
+class DashEnvironmentFetcher final : public media::IDashFetcher {
+ public:
+  DashEnvironmentFetcher(allocators::IAllocator& a, IObjectEnvironment* env, const uint64_t* clock) : env_(env), clock_(clock), url_(a), whole_(a) {}
+  void set_environment(IObjectEnvironment* env) { env_ = env; }
+  bool fetch(StringView url, media::DashRange range, ByteBuffer* out) override {
+    if (!env_) return false;
+    if (!range.present) {
+      if (url.starts_with("data:") || url.starts_with("blob:")) return false;
+      return env_->fetch_bytes(url, PageObjects::kMaxVideoBytes, out);
+    }
+    if (!url_.view().equals(url)) {
+      whole_.clear();
+      url_.clear();
+      if (!env_->fetch_bytes(url, PageObjects::kMaxVideoBytes, &whole_)) return false;
+      url_.assign(url);
+    }
+    const ConstByteView all = whole_.view();
+    if (range.first >= all.size()) return false;
+    const uint64_t last = range.last >= all.size() ? all.size() - 1 : range.last;
+    return out->append(all.subview(range.first, last - range.first + 1));
+  }
+  uint64_t now_ms() override { return *clock_; }
+  int64_t wall_clock_s() override { return *clock_ > 1000000000000ull ? static_cast<int64_t>(*clock_ / 1000) : 0; }
+
+ private:
+  IObjectEnvironment* env_;
+  const uint64_t* clock_;
+  String url_;
+  ByteBuffer whole_;
+};
+
 void PageObjects::release_mse(VideoSlot& v) {
   if (v.mse_source == 0) return;
   v.clip = UniquePointer<IVideoClip>();   // (the clip lets go of its files)
   v.mse_clip = nullptr;
+  v.dash = UniquePointer<media::DashClient>();
   mse_.detach(v.mse_source);
+  if (v.dash_source != 0) mse_.drop_source(v.dash_source);   // (a source the page made for a manifest has no script object to keep it)
+  v.dash_source = 0;
+  v.dash_fetcher = UniquePointer<DashEnvironmentFetcher>();
   v.mse_source = 0;
   v.last_ready = 0;
   v.loaded_data = v.waiting_sent = false;
@@ -665,6 +712,54 @@ PageObjects::VideoSlot* PageObjects::ensure_video(uint32_t serial) {
   return slot;
 }
 
+
+// Plays a DASH manifest: a media source of the page's own is attached to the element, and a client feeds it segments as playback needs them (update()).
+void PageObjects::start_dash(VideoSlot& v, dom::Node* n, StringView address, IObjectEnvironment& env) {
+  release_mse(v);
+  v.url.assign(address);
+  v.clip = UniquePointer<IVideoClip>();
+  v.error_code = 0;
+  v.have_picture = false;
+  v.picture_serial = 0xFFFFFFFFu;
+  release_scaled(&v.scaled);
+  auto manifest = UniquePointer<ByteBuffer>::make(allocator_, allocator_);
+  if (!manifest || !env.fetch_bytes(address, 8u << 20, manifest.get())) {
+    v.state = 2;
+    v.error_code = manifest ? 2 : 3;   // MEDIA_ERR_NETWORK
+    v.wants_play = v.play_pending = false;
+    queue(n->serial, "error");
+    dirty_ = true;
+    return;
+  }
+  const uint32_t source = mse_.create_source();
+  if (source == 0) {
+    v.state = 2;
+    v.error_code = 3;
+    queue(n->serial, "error");
+    return;
+  }
+  attach_mse(v, n, source, address, env);
+  if (v.mse_source != source) {   // (attaching failed: the error is queued)
+    mse_.drop_source(source);
+    return;
+  }
+  v.dash_source = source;
+  v.dash_fetcher = UniquePointer<DashEnvironmentFetcher>::make(allocator_, allocator_, &env, &now_ms_);
+  v.dash = UniquePointer<media::DashClient>::make(allocator_, allocator_, mse_, source, *v.dash_fetcher);
+  if (!v.dash_fetcher || !v.dash || !v.dash->start(address, manifest->view())) {
+    const uint8_t code = v.dash ? v.dash->error() : 3;
+    v.dash = UniquePointer<media::DashClient>();
+    v.error_code = code ? code : 4;
+    v.state = 2;
+    v.wants_play = v.play_pending = false;
+    queue(n->serial, "error");
+    dirty_ = true;
+    return;
+  }
+  v.dash_epoch = v.dash->quality_epoch();
+  queue(n->serial, "__dash_init");
+}
+
 void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView base, const MediaEnvironment& media, uint32_t* fetched) {
   (void)media;
   VideoSlot* slot = ensure_video(n->serial);
@@ -741,6 +836,19 @@ void PageObjects::sync_video(dom::Node* n, IObjectEnvironment& env, StringView b
   }
   String absolute(allocator_);
   const bool resolved = candidate.view().starts_with("data:") || candidate.view().starts_with("blob:") ? absolute.assign(candidate.view()) : resolve_reference(allocator_, base, candidate.view(), &absolute);
+  if (resolved && !slot->audio && is_dash_address(absolute.view())) {   // a DASH manifest: the page plays it through a media source of its own
+    if (slot->dash && slot->url.view().equals(absolute.view()) && slot->state != 0) {
+      if (slot->dash_fetcher) slot->dash_fetcher->set_environment(&env);
+      if (slot->mse_clip) slot->mse_clip->set_environment(&env);
+      return;
+    }
+    if (*fetched >= 4) return;
+    ++*fetched;
+    if (slot->clip) queue(n->serial, "emptied");
+    if (slot->clip || slot->state != 0) slot->rate = slot->default_rate;
+    start_dash(*slot, n, absolute.view(), env);
+    return;
+  }
   if (resolved && absolute.view().starts_with("blob:")) {   // maybe a MediaSource
     const uint32_t source = mse_.source_for_url(absolute.view());
     if (source != 0 && !(slot->mse_source == source && slot->url.view().equals(absolute.view()) && slot->state != 0)) {
@@ -901,6 +1009,16 @@ void PageObjects::update(uint64_t now_ms) {
       queue(v.serial, "seeked");
       queue(v.serial, "timeupdate");
       dirty_ = true;
+    }
+    if (v.dash && !v.dash->ended() && v.dash->error() == 0) v.dash->tick(v.clip->position_us());
+    if (v.dash && v.dash->quality_epoch() != v.dash_epoch) {
+      v.dash_epoch = v.dash->quality_epoch();
+      queue(v.serial, "__dash_quality");
+    }
+    if (v.dash && v.dash->error() != 0 && !v.error_code) {
+      v.error_code = v.dash->error();
+      v.wants_play = v.play_pending = false;
+      queue(v.serial, "error");
     }
     follow_clock(v);
     if (v.cues.count() != 0) {
@@ -1303,6 +1421,13 @@ CanvasBitmap* PageObjects::canvas(uint32_t serial, uint32_t width, uint32_t heig
   canvas_pixels_ += uint64_t{width} * height;
   dirty_ = true;
   return s->bitmap.get();
+}
+
+media::DashClient* PageObjects::video_dash(uint32_t serial, int64_t* playhead_us) {
+  VideoSlot* v = find_video(serial);
+  if (!v || !v->dash) return nullptr;
+  *playhead_us = v->clip ? v->clip->position_us() : 0;
+  return v->dash.get();
 }
 
 void PageObjects::video_set_cues(uint32_t serial, List<UniquePointer<TrackCue>>&& cues) {

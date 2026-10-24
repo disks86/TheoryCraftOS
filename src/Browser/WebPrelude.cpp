@@ -1576,6 +1576,224 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   hide(g, 'VTTRegionList', VTTRegionList);
   hide(g, 'TrackEvent', TrackEvent);
 
+  // ---------------------------------------------------------------------------------------------------------------------------- dashjs (DASH playback)
+  // A player in the style of dash.js (dashjs.MediaPlayer().create(), initialize(), attachSource(), the quality and buffer calls, on()/off() with the events of
+  // dashjs.MediaPlayer.events) over the browser's own DASH playback: a <video> whose src is a manifest is played natively (Media/DashClient.cpp), and this object
+  // steers it through __dash_info / __dash_set and listens to the element.
+  var DJ_EVENTS = {
+    ERROR: 'error', MANIFEST_LOADED: 'manifestLoaded', STREAM_INITIALIZED: 'streamInitialized', QUALITY_CHANGE_REQUESTED: 'qualityChangeRequested',
+    QUALITY_CHANGE_RENDERED: 'qualityChangeRendered', PLAYBACK_STARTED: 'playbackStarted', PLAYBACK_PAUSED: 'playbackPaused', PLAYBACK_ENDED: 'playbackEnded',
+    PLAYBACK_SEEKING: 'playbackSeeking', PLAYBACK_SEEKED: 'playbackSeeked', PLAYBACK_TIME_UPDATED: 'playbackTimeUpdated', PLAYBACK_PROGRESS: 'playbackProgress',
+    PLAYBACK_METADATA_LOADED: 'playbackMetaDataLoaded', PLAYBACK_ERROR: 'playbackError', PLAYBACK_PLAYING: 'playbackPlaying', PLAYBACK_WAITING: 'playbackWaiting',
+    PLAYBACK_RATE_CHANGED: 'playbackRateChanged', PLAYBACK_VOLUME_CHANGED: 'playbackVolumeChanged', CAN_PLAY: 'canPlay', BUFFER_EMPTY: 'bufferStalled',
+    BUFFER_LOADED: 'bufferLoaded', PLAYBACK_INITIALIZED: 'playbackInitialized', SOURCE_INITIALIZED: 'sourceInitialized', STREAM_TEARDOWN_COMPLETE: 'streamTeardownComplete'
+  };
+  // the element event -> the events of the player
+  var DJ_ELEMENT = {
+    play: 'PLAYBACK_STARTED', pause: 'PLAYBACK_PAUSED', ended: 'PLAYBACK_ENDED', seeking: 'PLAYBACK_SEEKING', seeked: 'PLAYBACK_SEEKED', timeupdate: 'PLAYBACK_TIME_UPDATED',
+    progress: 'PLAYBACK_PROGRESS', loadedmetadata: 'PLAYBACK_METADATA_LOADED', playing: 'PLAYBACK_PLAYING', waiting: 'PLAYBACK_WAITING', canplay: 'CAN_PLAY',
+    ratechange: 'PLAYBACK_RATE_CHANGED', volumechange: 'PLAYBACK_VOLUME_CHANGED'
+  };
+  var djPlayers = [];
+  var djKinds = ['video', 'audio'];
+  var djCheckType = function (type) {
+    type = String(type);
+    if (type !== 'video' && type !== 'audio') throw new Error('Invalid media type: ' + type);
+    return type;
+  };
+
+  function djCreate() {
+    var view = null, source = null, autoPlay = true, ready = false, listeners = {}, domHandlers = [], lastQuality = {}, held = {};
+    var settings = { streaming: { abr: { autoSwitchBitrate: { video: true, audio: true } }, buffer: { bufferTimeAtTopQuality: 12 } }, debug: { logLevel: 3 } };
+    var player = {};
+    var fire = function (type, payload) {
+      var list = listeners[type];
+      if (!list) return;
+      var event = { type: type };
+      if (payload) for (var k in payload) event[k] = payload[k];
+      list = list.slice();
+      for (var i = 0; i < list.length; i++) {
+        try { list[i].fn.call(list[i].scope, event); }
+        catch (e) { (function (error) { setTimeout(function () { throw error; }, 0); }(e)); }
+      }
+    };
+    var info = function () { return view ? __dash_info(view) : null; };
+    var streamOf = function (type) {
+      var i = info();
+      if (!i) return null;
+      for (var s = 0; s < i.streams.length; s++) if (i.streams[s].kind === type) { i.streams[s].index = s; return i.streams[s]; }
+      return null;
+    };
+    var detachView = function () {
+      for (var i = 0; i < domHandlers.length; i++) view.removeEventListener(domHandlers[i][0], domHandlers[i][1]);
+      domHandlers = [];
+      var at = djPlayers.indexOf(player);
+      if (at >= 0) djPlayers.splice(at, 1);
+      view = null;
+    };
+    // The browser says what its DASH playback did: it started on a manifest (init), or a stream changed quality.
+    Object.defineProperty(player, '__element_event', { value: function (what, media) {
+      if (media !== view) return;
+      var i = info();
+      if (!i) return;
+      if (what === '__dash_init') {
+        ready = true;
+        fire(DJ_EVENTS.MANIFEST_LOADED, { data: { type: i.dynamic ? 'dynamic' : 'static', mediaPresentationDuration: i.duration, minBufferTime: i.minBufferTime, url: source } });
+        fire(DJ_EVENTS.SOURCE_INITIALIZED, {});
+        fire(DJ_EVENTS.STREAM_INITIALIZED, { streamInfo: { id: '0', index: 0, start: 0, duration: i.duration }, error: null });
+        fire(DJ_EVENTS.PLAYBACK_INITIALIZED, {});
+        for (var s = 0; s < i.streams.length; s++) lastQuality[i.streams[s].kind] = i.streams[s].quality;
+      } else if (what === '__dash_quality') {
+        for (var k = 0; k < i.streams.length; k++) {
+          var st = i.streams[k], old = lastQuality[st.kind] === undefined ? -1 : lastQuality[st.kind];
+          if (st.quality === old) continue;
+          lastQuality[st.kind] = st.quality;
+          var payload = { mediaType: st.kind, streamId: '0', oldQuality: old < 0 ? 0 : old, newQuality: st.quality };
+          fire(DJ_EVENTS.QUALITY_CHANGE_REQUESTED, payload);
+          fire(DJ_EVENTS.QUALITY_CHANGE_RENDERED, payload);
+        }
+      }
+    } });
+    var attachView = function (element) {
+      if (view) detachView();
+      view = element || null;
+      if (!view) return;
+      djPlayers.push(player);
+      var listen = function (name, fn) { view.addEventListener(name, fn); domHandlers.push([name, fn]); };
+      Object.keys(DJ_ELEMENT).forEach(function (name) {
+        listen(name, function () {
+          var payload = {};
+          if (name === 'timeupdate') { payload.time = view.currentTime; payload.timeToEnd = view.duration - view.currentTime; }
+          else if (name === 'seeking' || name === 'seeked') payload.seekTime = view.currentTime;
+          else if (name === 'ratechange') payload.playbackRate = view.playbackRate;
+          fire(DJ_EVENTS[DJ_ELEMENT[name]], payload);
+          if (name === 'waiting') fire(DJ_EVENTS.BUFFER_EMPTY, { mediaType: 'video' });
+          if (name === 'canplay') fire(DJ_EVENTS.BUFFER_LOADED, { mediaType: 'video' });
+        });
+      });
+      listen('error', function () {
+        var code = view.error ? view.error.code : 0;
+        var payload = { error: { code: code, message: code === 2 ? 'network error' : code === 3 ? 'decode error' : 'source not supported', data: {} } };
+        fire(DJ_EVENTS.ERROR, payload);
+        fire(DJ_EVENTS.PLAYBACK_ERROR, payload);
+      });
+    };
+    var attachSource = function (url) {
+      if (!view) throw new Error('You must first call attachView() to set the video element before calling attachSource()');
+      source = typeof url === 'string' ? url : url && url.url ? url.url : String(url);
+      ready = false;
+      lastQuality = {};
+      view.src = source;
+      if (autoPlay) { var p = view.play(); if (p && p.then) p.then(null, function () { }); }
+    };
+    var methods = {
+      initialize: function (element, url, auto) { if (auto !== undefined) autoPlay = !!auto; if (element) attachView(element); if (url) attachSource(url); },
+      attachView: attachView,
+      attachSource: attachSource,
+      getSource: function () { return source; },
+      attachVideoContainer: function () { },
+      attachTTMLRenderingDiv: function () { },
+      isReady: function () { return !!view && ready; },
+      getVideoElement: function () { if (!view) throw new Error('Video element not attached'); return view; },
+      play: function () { var p = view.play(); if (p && p.then) p.then(null, function () { }); },
+      pause: function () { view.pause(); },
+      isPaused: function () { return view.paused; },
+      isSeeking: function () { return view.seeking; },
+      seek: function (t) { view.currentTime = Number(t); },
+      time: function () { return view ? view.currentTime : 0; },
+      duration: function () { var i = info(); return i && i.dynamic ? Infinity : view ? view.duration : NaN; },
+      isDynamic: function () { var i = info(); return !!i && i.dynamic; },
+      timeAsUTC: function () { return view ? view.currentTime : 0; },
+      setAutoPlay: function (v) { autoPlay = !!v; },
+      getAutoPlay: function () { return autoPlay; },
+      setMute: function (v) { view.muted = !!v; },
+      isMuted: function () { return view.muted; },
+      setVolume: function (v) { view.volume = Number(v); },
+      getVolume: function () { return view.volume; },
+      setPlaybackRate: function (v) { view.playbackRate = Number(v); },
+      getPlaybackRate: function () { return view.playbackRate; },
+      getVersion: function () { return '4.7.0-native'; },
+      getBufferLength: function (type) {
+        var s = streamOf(type === undefined ? 'video' : djCheckType(type)) || streamOf('audio');
+        return s ? s.buffer : NaN;
+      },
+      getBitrateInfoListFor: function (type) {
+        var s = streamOf(djCheckType(type)), out = [];
+        if (!s) return out;
+        for (var i = 0; i < s.qualities.length; i++) {
+          var q = s.qualities[i];
+          out.push({ mediaType: type, bitrate: q.bandwidth, width: q.width, height: q.height, scanType: 'progressive', qualityIndex: i });
+        }
+        return out;
+      },
+      getTopBitrateInfoFor: function (type) { var list = methods.getBitrateInfoListFor(type); return list.length ? list[list.length - 1] : null; },
+      getQualityFor: function (type) { var s = streamOf(djCheckType(type)); return s && s.quality >= 0 ? s.quality : 0; },
+      setQualityFor: function (type, index) {
+        var s = streamOf(djCheckType(type));
+        if (!s) return;
+        index = Number(index);
+        if (!(index >= 0)) throw new Error('Quality index must be a non-negative number');
+        __dash_set(view, s.index, 0, index);
+        held[type] = true;
+      },
+      getAutoSwitchQualityFor: function (type) { var s = streamOf(djCheckType(type)); return s ? s.auto : settings.streaming.abr.autoSwitchBitrate[type]; },
+      setAutoSwitchQualityFor: function (type, on) {
+        type = djCheckType(type);
+        settings.streaming.abr.autoSwitchBitrate[type] = !!on;
+        var s = streamOf(type);
+        if (s) __dash_set(view, s.index, 1, !!on);
+      },
+      getAverageThroughput: function () { var i = info(); return i ? i.throughput / 1000 : NaN; },
+      getInitialBitrateFor: function () { return NaN; },
+      setInitialBitrateFor: function () { },
+      getMetricsFor: function () { return null; },
+      getDashMetrics: function () { return { getCurrentBufferLevel: function (type) { return methods.getBufferLength(type); } }; },
+      updateSettings: function (patch) {
+        var merge = function (to, from) {
+          for (var k in from) {
+            if (from[k] !== null && typeof from[k] === 'object') { if (typeof to[k] !== 'object' || to[k] === null) to[k] = {}; merge(to[k], from[k]); }
+            else to[k] = from[k];
+          }
+        };
+        merge(settings, patch || {});
+        var abr = patch && patch.streaming && patch.streaming.abr && patch.streaming.abr.autoSwitchBitrate;
+        if (abr) for (var k in abr) if (k === 'video' || k === 'audio') { var s = streamOf(k); if (s) __dash_set(view, s.index, 1, !!abr[k]); }
+      },
+      getSettings: function () { return settings; },
+      on: function (type, fn, scope) {
+        if (!type || typeof fn !== 'function') throw new Error('Missing or invalid event type or listener');
+        (listeners[type] = listeners[type] || []).push({ fn: fn, scope: scope });
+      },
+      off: function (type, fn, scope) {
+        var list = listeners[type];
+        if (!list) return;
+        for (var i = list.length - 1; i >= 0; i--) if (list[i].fn === fn && list[i].scope === scope) list.splice(i, 1);
+      },
+      reset: function () {
+        if (view) { view.pause(); view.removeAttribute('src'); view.load(); }
+        source = null; ready = false; lastQuality = {};
+        fire(DJ_EVENTS.STREAM_TEARDOWN_COMPLETE, {});
+      },
+      destroy: function () { methods.reset(); if (view) detachView(); listeners = {}; },
+      getDebug: function () { return { setLogLevel: function () { }, getLogger: function () { return { debug: function () { }, info: function () { }, warn: function () { }, error: function () { } }; } }; },
+      enableText: function () { },
+      getVideoModel: function () { return { getElement: function () { return view; } }; }
+    };
+    for (var name in methods) Object.defineProperty(player, name, { value: methods[name], enumerable: true });
+    return player;
+  }
+  function djMediaPlayer() {
+    return { create: djCreate, extend: function () { }, getClassName: function () { return 'MediaPlayer'; } };
+  }
+  djMediaPlayer.events = DJ_EVENTS;
+  djMediaPlayer.create = djCreate;
+  hide(g, '__dash_event', function (serial, what) {
+    var media = __node_by_serial(serial);
+    if (!media) return;
+    for (var i = 0; i < djPlayers.length; i++) djPlayers[i].__element_event(what, media);
+  });
+  if (!g.dashjs) hide(g, 'dashjs', { MediaPlayer: djMediaPlayer, supportsMediaSource: function () { return typeof g.MediaSource === 'function'; }, Version: '4.7.0-native' });
+
   // ---------------------------------------------------------------------------------------------------------------------------- FileReader
   function FileReader() {
     this.readyState = 0; this.result = null; this.error = null;

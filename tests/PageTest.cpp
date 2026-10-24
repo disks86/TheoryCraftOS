@@ -3263,6 +3263,104 @@ static void test_text_tracks() {
   CHECK(a.live == 0);
 }
 
+
+// --- DASH ---------------------------------------------------------------------------------------------------------------------------
+
+static void dash_serve(FakeEnvironment& env, const char* dir) {
+  const char* names[] = {"manifest.mpd", "init-stream0.m4s", "init-stream1.m4s", "init-stream2.m4s", "chunk-stream0-00001.m4s", "chunk-stream0-00002.m4s", "chunk-stream0-00003.m4s",
+                         "chunk-stream0-00004.m4s", "chunk-stream1-00001.m4s", "chunk-stream1-00002.m4s", "chunk-stream1-00003.m4s", "chunk-stream1-00004.m4s",
+                         "chunk-stream2-00001.m4s", "chunk-stream2-00002.m4s", "chunk-stream2-00003.m4s", "chunk-stream2-00004.m4s"};
+  for (const char* name : names) {
+    std::string data;
+    FILE* f = fopen((std::string("tests/data/") + dir + "/" + name).c_str(), "rb");
+    if (f) {
+      int c;
+      while ((c = fgetc(f)) != EOF) data.push_back(static_cast<char>(c));
+      fclose(f);
+    }
+    env.blobs[std::string("http://example.com/") + dir + "/" + name] = data;
+  }
+}
+
+static void test_dash_page() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    dash_serve(env, "dash");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src='dash/manifest.mpd' width=96 height=64></video><button id=b></button><button id=e></button><script>"
+              "var v = document.getElementById('v'), ev = [];"
+              "['loadstart','loadedmetadata','canplay','play','ended','error'].forEach(function (t) { v.addEventListener(t, function () { ev.push(t) }) });"
+              "document.getElementById('b').onclick = function () { v.play() };"
+              "document.getElementById('e').onclick = function () { console.log([v.duration.toFixed(1), v.readyState, v.videoWidth, v.buffered.length, v.buffered.end(0) > 3, v.error === null].join(' ') + ' | ' + ev.join()) };"
+              "</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 20, &doc);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 40, &doc);
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    const std::string out = page_log(page);
+    CHECK(out.find("4.0 ") == 0 && out.find(" | ") != std::string::npos && out.find("error") == std::string::npos);
+    CHECK(in_order(out, {"loadstart", "loadedmetadata", "canplay", "play"}));
+    CHECK(env.opened_video >= 1);
+    bool asked_manifest = false, asked_segment = false;
+    for (const auto& f : env.fetched) {
+      asked_manifest = asked_manifest || f == "http://example.com/dash/manifest.mpd";
+      asked_segment = asked_segment || f.find("chunk-stream0-00001.m4s") != std::string::npos || f.find("chunk-stream1-00001.m4s") != std::string::npos;
+    }
+    CHECK(asked_manifest && asked_segment);
+  }
+  CHECK(a.live == 0);
+  {   // a manifest that cannot be had is a network error
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v src='gone.mpd' width=96 height=64></video><script>var v = document.getElementById('v'); v.addEventListener('error', function () { console.log('error', v.error && v.error.code) });</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 6, &doc);
+    CHECK(page_log(page).find("error 2") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_dashjs() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    dash_serve(env, "dash");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><video id=v width=96 height=64></video><button id=b></button><button id=e></button><script>"
+              "var v = document.getElementById('v'), ev = [], E = dashjs.MediaPlayer.events, p = dashjs.MediaPlayer().create();"
+              "[E.MANIFEST_LOADED, E.STREAM_INITIALIZED, E.QUALITY_CHANGE_RENDERED, E.PLAYBACK_STARTED, E.PLAYBACK_METADATA_LOADED, E.ERROR].forEach(function (t) {"
+              "  p.on(t, function (e) { ev.push(e.type + (e.mediaType ? ':' + e.mediaType + ':' + e.oldQuality + '>' + e.newQuality : '')) }) });"
+              "var first = [typeof p.getVersion(), p.isReady(), p.getAutoPlay()];"
+              "p.initialize(v, 'dash/manifest.mpd', false);"
+              "document.getElementById('b').onclick = function () { p.play() };"
+              "document.getElementById('e').onclick = function () {"
+              "  var list = p.getBitrateInfoListFor('video'), r = first.concat([p.isReady(), list.length, list[0].bitrate, list[1].bitrate, list[1].width, p.getQualityFor('video'), p.getBitrateInfoListFor('audio').length,"
+              "    p.getAutoSwitchQualityFor('video'), p.duration().toFixed(1), p.isDynamic(), p.getTopBitrateInfoFor('video').height, p.getSource()]);"
+              "  p.setQualityFor('video', 0); r.push(p.getAutoSwitchQualityFor('video'));"
+              "  p.setAutoSwitchQualityFor('video', true); r.push(p.getAutoSwitchQualityFor('video'));"
+              "  try { p.getQualityFor('text') } catch (e) { r.push('bad type') } p.updateSettings({ streaming: { abr: { autoSwitchBitrate: { video: false } } } }); r.push(p.getAutoSwitchQualityFor('video'));"
+              "  console.log(r.join(' ') + ' | ' + ev.join(' '));"
+              "};</script></body></html>");
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 20, &doc);
+    page.click(page.document().element_by_id("b")->serial, 0, 0);
+    mse_pump(page, env, 40, &doc);
+    page.click(page.document().element_by_id("e")->serial, 0, 0);
+    const std::string out = page_log(page);
+    CHECK(out.find("string false true true 2 150000 400000 64 1 1 true 4.0 false 48 dash/manifest.mpd false true bad type false | manifestLoaded streamInitialized ") == 0);
+    CHECK(out.find("qualityChangeRendered:video:0>1") != std::string::npos && out.find("playbackMetaDataLoaded") != std::string::npos && out.find("playbackStarted") != std::string::npos && out.find("error") == std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
@@ -3303,6 +3401,8 @@ int main(int argc, char** argv) {
   test_blob_media();
   test_webm_page();
   test_text_tracks();
+  test_dash_page();
+  test_dashjs();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();
