@@ -437,6 +437,13 @@ void ParameterSets::effective_scaling(const Sps& s, const Pps& p, uint8_t w4[6][
   }
 }
 
+void ParameterSets::scaling_to_bitstream_order(const uint8_t w4[6][16], const uint8_t w8[2][64], uint8_t z4[6][16], uint8_t z8[2][64]) {
+  for (int i = 0; i < 6; ++i)
+    for (int k = 0; k < 16; ++k) z4[i][k] = w4[i][kZigzag4x4[k]];
+  for (int i = 0; i < 2; ++i)
+    for (int k = 0; k < 64; ++k) z8[i][k] = w8[i][kZigzag8x8[k]];
+}
+
 // Builds LevelScale for the active parameter sets (8.5.9).
 void Core::compute_scaling() {
   uint8_t w4[6][16], w8[2][64];
