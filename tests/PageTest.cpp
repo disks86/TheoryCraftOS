@@ -395,7 +395,7 @@ static void test_events() {
   CHECK(js("", "var t = document.createTextNode('x'), c = document.createComment('y'); console.log(t instanceof CharacterData, c instanceof CharacterData, t instanceof Text, CharacterData.prototype === Object.getPrototypeOf(Text.prototype), typeof CDATASection, typeof ProcessingInstruction, typeof SVGElement, typeof HTMLUnknownElement)", "true true true true function function function function"));
   CHECK(js("", "console.log(typeof Window, window instanceof Window, Object.getPrototypeOf(window) === Window.prototype, window instanceof EventTarget, typeof Window.prototype.addEventListener, Object.prototype.hasOwnProperty.call(window, 'addEventListener'))", "function true true true function false"));
   CHECK(js("", "var hit = 0; window.addEventListener('ping', function () { hit++; }); window.dispatchEvent(new Event('ping')); addEventListener('ping', function () { hit++; }); dispatchEvent(new Event('ping')); console.log(hit)", "3"));
-  CHECK(js("", "console.log(typeof performance.timing.navigationStart, typeof performance.timing.responseStart, typeof performance.navigation.type, performance.getEntriesByType('navigation').length)", "number number number 0"));
+  CHECK(js("", "console.log(typeof performance.timing.navigationStart, typeof performance.timing.responseStart, typeof performance.navigation.type, performance.getEntriesByType('navigation').length)", "number number number 1"));
   // a native called from a mutation callback's epilogue does not lose the result of the native that is running (the VM kept it in one shared slot)
   CHECK(js("<div id=d></div>", "var s = document.createTextNode(''); new MutationObserver(function () {}).observe(s, {characterData: true}); var r = __take_mutations(); s.textContent = 'a'; document.getElementById('d').appendChild(document.createElement('b')); var r2 = __take_mutations(); console.log(typeof r, typeof r2, Array.isArray(r2))", "object object true"));
   CHECK(js("<div id=a><p id=b><i id=c>x</i></p></div>",
@@ -3527,7 +3527,79 @@ static void test_picture_in_picture() {
   CHECK(a.live == 0);
 }
 
+// --- window, document, navigator, location -------------------------------------------------------------------------------------------
+
+static void test_platform() {
+  // what each of them has
+  CHECK(async_is(
+      "function missing(o, names) { return names.split(' ').filter(function (n) { return !(n in o) }).join(' ') }"
+      "console.log('window:' + missing(window, 'locationbar menubar scrollbars clientInformation originAgentCluster captureEvents moveBy resizeBy visualViewport event reportError crossOriginIsolated caches cookieStore speechSynthesis trustedTypes Notification SharedWorker FileList DragEvent ClipboardEvent PageTransitionEvent BeforeUnloadEvent SubmitEvent FormDataEvent DOMRect DOMPoint DOMMatrix DOMQuad NamedNodeMap NodeList HTMLCollection CSSStyleSheet CSSRule StyleSheet MediaQueryList DataTransfer Screen Performance PerformanceEntry Crypto Permissions Geolocation MediaDevices Clipboard ClipboardItem XPathResult XPathEvaluator XMLDocument createImageBitmap onafterprint onbeforeprint onmousedown oncontextmenu ontoggle'));"
+      "console.log('document:' + missing(document, 'plugins queryCommandValue fgColor applets all clear adoptedStyleSheets getElementsByTagNameNS createCDATASection createProcessingInstruction caretPositionFromPoint getAnimations requestStorageAccess pointerLockElement exitPointerLock onvisibilitychange onselectionchange oncopy onfullscreenchange moveBefore wasDiscarded permissionsPolicy xmlVersion createExpression createNSResolver evaluate pictureInPictureElement fullscreenElement'));"
+      "console.log('navigator:' + missing(navigator, 'appCodeName appName appVersion product productSub vendorSub deviceMemory maxTouchPoints pdfViewerEnabled webdriver plugins mimeTypes javaEnabled sendBeacon vibrate share canShare clipboard geolocation mediaDevices permissions serviceWorker storage credentials locks connection userAgentData getGamepads mediaSession wakeLock registerProtocolHandler getBattery setAppBadge keyboard virtualKeyboard'));"
+      "console.log('location:' + missing(location, 'href origin protocol host hostname port pathname search hash assign replace reload toString ancestorOrigins'));"
+      "console.log('element:' + missing(document.documentElement, 'inert translate autocapitalize computedStyleMap part ariaLabel role scroll scrollIntoViewIfNeeded showPopover hidePopover togglePopover popover setHTMLUnsafe'));"
+      "console.log('performance:' + missing(performance, 'getEntries clearMarks clearMeasures toJSON memory eventCounts clearResourceTimings'));",
+      "window: | document: | navigator: | location: | element: | performance:"));
+  // behaviour
+  CHECK(async_is(
+      "var d = new DOMMatrix().translate(10, 20).scale(2), p = d.transformPoint({ x: 1, y: 1 });"
+      "console.log(d.toString(), p.x + ',' + p.y, d.inverse().toString(), new DOMRect(1, 2, 3, 4).right, DOMRect.fromRect({ width: 5 }).width);"
+      "var s = new CSSStyleSheet(); s.replaceSync('p { color: red } @media screen { a { top: 1px } }'); s.insertRule('b { margin: 0 !important }', 1);"
+      "console.log(s.cssRules.length, s.cssRules[1].cssText, s.cssRules[2].cssRules.length, s.cssRules[0].style.color, s.cssRules[2] instanceof CSSMediaRule, s.cssRules[0] instanceof CSSStyleRule);"
+      "try { s.insertRule('{{', 0) } catch (e) { console.log(e.name) } try { s.deleteRule(9) } catch (e) { console.log(e.name) }"
+      "var st = document.createElement('style'); st.textContent = 'h1 { color: red }'; document.head.appendChild(st); st.sheet.cssRules[0].style.color = 'blue'; st.sheet.cssRules[0].style.setProperty('margin', '2px');"
+      "console.log(st.textContent, document.styleSheets.length, document.styleSheets[0] === st.sheet);"
+      "var a = new CSSStyleSheet(); a.replaceSync('body { color: rgb(1, 2, 3) }'); document.adoptedStyleSheets = [a]; console.log(getComputedStyle(document.body).color, document.adoptedStyleSheets.length);",
+      "matrix(2, 0, 0, 2, 10, 20) 12,22 matrix(0.5, 0, 0, 0.5, -5, -10) 4 5 | 3 b { margin: 0 !important; } 1 red true true | SyntaxError | IndexSizeError | h1 { color: blue; margin: 2px; } 1 true | rgb(1, 2, 3) 1"));
+  CHECK(async_is(
+      "document.body.innerHTML = '<ul><li class=a>1</li><li>2</li><li class=a>3</li></ul>';"
+      "var r = function (x, t) { return document.evaluate(x, document, null, t, null) };"
+      "console.log(r('count(//li)', 1).numberValue, r(\"//li[@class='a'][last()]/text()\", 2).stringValue, r('//li[2]/following-sibling::li | //li[2]/preceding-sibling::li', 7).snapshotLength,"
+      "  r(\"concat(substring('hello', 2, 3), '-', string-length('abc'), '-', 7 mod 3, '-', normalize-space('  a   b '))\", 2).stringValue, r('//li[position() > 1]', 4).iterateNext().textContent, r('1 = 1', 3).booleanValue);"
+      "try { r('//[', 0) } catch (e) { console.log(e.name) }"
+      "var e = document.createExpression('//li[. = $x]'.replace(' = $x', ' = \"3\"')); console.log(e.evaluate(document, 9, null).singleNodeValue.className, new XPathEvaluator().evaluate('count(//ul)', document, null, 1, null).numberValue);",
+      "3 3 2 ell-3-1-a b 2 true | SyntaxError | a 1"));
+  CHECK(async_is(
+      "var x = new DOMParser().parseFromString('<r xmlns=\"u\" xmlns:p=\"v\"><p:a x=\"1\">t&amp;</p:a><![CDATA[c]]><b/></r>', 'application/xml');"
+      "console.log(x.contentType, x.documentElement.namespaceURI, x.documentElement.tagName, x.getElementsByTagName('p:a')[0].namespaceURI, x.getElementsByTagName('p:a')[0].prefix, x.getElementsByTagName('p:a')[0].localName, x instanceof XMLDocument, x.documentElement.childNodes[1].nodeType);"
+      "console.log(new XMLSerializer().serializeToString(x));"
+      "console.log(new DOMParser().parseFromString('<a><b></a>', 'text/xml').getElementsByTagName('parsererror').length, new Document().contentType, document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg').documentElement.localName);"
+      "var e = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); e.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '#a');"
+      "console.log(e.namespaceURI, e.tagName, e.getAttributeNS('http://www.w3.org/1999/xlink', 'href'), e.hasAttributeNS('http://www.w3.org/1999/xlink', 'href'), e.getAttributeNS(null, 'href'), e.attributes[0].prefix, e.attributes[0].localName, e.attributes[0].namespaceURI);"
+      "var div = document.createElement('div'); div.innerHTML = '<svg viewBox=\"0 0 1 1\"><foreignObject><p>x</p></foreignObject></svg>'; var sv = div.firstChild;"
+      "console.log(sv.namespaceURI, sv.firstChild.localName, sv.firstChild.firstChild.namespaceURI, document.createElement('div').namespaceURI, document.createProcessingInstruction('a', 'b').nodeType, document.createProcessingInstruction('a', 'b').target);"
+      "try { document.createCDATASection('x') } catch (e) { console.log(e.name) } try { document.createElementNS(null, 'p:q') } catch (e) { console.log(e.name) }"
+      "console.log(x.documentElement.lookupNamespaceURI('p'), x.documentElement.lookupPrefix('v'), x.documentElement.isDefaultNamespace('u'), x.lookupNamespaceURI(null));",
+      "application/xml u r v p a true 4 | <r xmlns=\"u\" xmlns:p=\"v\"><p:a x=\"1\">t&amp;</p:a><![CDATA[c]]><b/></r> | 1 application/xml svg | http://www.w3.org/2000/svg svg #a true null xlink href http://www.w3.org/1999/xlink | http://www.w3.org/2000/svg foreignObject http://www.w3.org/1999/xhtml http://www.w3.org/1999/xhtml 7 a | NotSupportedError | NamespaceError | v p true u"));
+  CHECK(async_is(
+      "var out = [];"
+      "navigator.permissions.query({ name: 'geolocation' }).then(function (s) { out.push('perm:' + s.state + ':' + s.name) });"
+      "navigator.permissions.query({ name: 'bogus' }).catch(function (e) { out.push('perm:' + e.name) });"
+      "navigator.geolocation.getCurrentPosition(function () { }, function (e) { out.push('geo:' + e.code + ':' + (e instanceof GeolocationPositionError)) });"
+      "navigator.mediaDevices.enumerateDevices().then(function (l) { out.push('devices:' + l.length) }); navigator.mediaDevices.getUserMedia({ video: true }).catch(function (e) { out.push('media:' + e.name) });"
+      "navigator.clipboard.writeText('copied').then(function () { return navigator.clipboard.readText() }).then(function (t) { out.push('clip:' + t) });"
+      "navigator.locks.request('l', function (lock) { out.push('lock:' + lock.name + ':' + lock.mode); return 5 }).then(function (v) { out.push('locked:' + v) });"
+      "caches.open('c').then(function (c) { return c.put('/a', new Response('hi')).then(function () { return c.match('/a') }) }).then(function (r) { return r.text() }).then(function (t) { out.push('cache:' + t) });"
+      "navigator.storage.estimate().then(function (e) { out.push('quota:' + (e.quota > 0)) }); navigator.getBattery().then(function (b) { out.push('battery:' + b.level) });"
+      "Notification.requestPermission().then(function (p) { out.push('notify:' + p + ':' + Notification.permission) });"
+      "performance.mark('a'); performance.mark('b'); var m = performance.measure('ab', 'a', 'b'); out.push('perf:' + performance.getEntriesByType('mark').length + ':' + m.entryType + ':' + (m.duration >= 0));"
+      "out.push(navigator.appName + ':' + navigator.product + ':' + navigator.webdriver + ':' + navigator.plugins.length + ':' + navigator.maxTouchPoints + ':' + navigator.javaEnabled() + ':' + navigator.vibrate(1) + ':' + navigator.sendBeacon('/b', 'x'));"
+      "out.push(Object.prototype.toString.call(window) + Object.prototype.toString.call(document) + Object.prototype.toString.call(location) + Object.prototype.toString.call(navigator) + Object.prototype.toString.call(document.querySelectorAll('p')) + Object.prototype.toString.call(document.body.children));"
+      "var ev = document.createEvent('MouseEvents'); ev.initMouseEvent('click', true, true, window, 1, 0, 0, 5, 6); out.push(ev.type + ev.bubbles + ev.clientX);"
+      "var d = new DataTransfer(); d.setData('text', 'x'); out.push(d.getData('text/plain') + d.types.join());"
+      "var e = document.createElement('div'); e.ariaLabel = 'l'; e.role = 'button'; e.inert = true; out.push(e.getAttribute('aria-label') + e.getAttribute('role') + e.hasAttribute('inert') + e.translate);"
+      "var pop = document.createElement('div'); pop.popover = 'auto'; document.body.appendChild(pop); pop.showPopover(); out.push('pop:' + pop.matches(':popover-open')); pop.hidePopover(); out.push(pop.matches(':popover-open'));"
+      "setTimeout(function () { console.log(out.sort().join(' | ')) }, 50);",
+      "Netscape:Gecko:false:0:0:false:false:true | [object Window][object Document][object Location][object Navigator][object NodeList][object HTMLCollection] | battery:1 | cache:hi | clicktrue5 | clip:copied | devices:0 | false | geo:1:true | lbuttontruetrue | lock:l:exclusive | locked:5 | media:NotFoundError | notify:denied:denied | perf:2:measure:true | perm:TypeError | perm:prompt:geolocation | pop:true | quota:true | xtext/plain"));
+}
+
 int main(int argc, char** argv) {
+  if (const char* probe = getenv("PROBE")) {   // runs a script file in a page and prints what it logged (for looking at what an API has)
+    std::string script;
+    if (FILE* f = fopen(probe, "rb")) { int c; while ((c = fgetc(f)) != EOF) script.push_back(static_cast<char>(c)); fclose(f); }
+    printf("%s\n", run_async(script.c_str(), "https://app.example/dir/page.html").c_str());
+    return 0;
+  }
   setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
     printf("%s\n", run_async(argv[1], "https://app.example/dir/page.html").c_str());
@@ -3571,6 +3643,7 @@ int main(int argc, char** argv) {
   test_dashjs();
   test_fullscreen();
   test_picture_in_picture();
+  test_platform();
   test_forms();
   test_table_wrap();
   test_details_and_dialog();

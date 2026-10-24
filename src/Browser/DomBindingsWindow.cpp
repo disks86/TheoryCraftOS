@@ -752,6 +752,86 @@ NATIVE(fs_request) {
   *result = bool_value(n && impl(vm).host.fullscreen_request(n));
   return true;
 }
+// __make_node(document, kind, nameOrTarget, data): kind 7 a processing instruction, 4 a CDATA section.
+NATIVE(make_node) {
+  (void)self;
+  dom::Node* d = node_of(arg_at(args, argc, 0));
+  double kind = 0;
+  String name(vm.allocator()), data(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 1), &kind) || !arg_text(vm, arg_at(args, argc, 2), &name) || !arg_text(vm, arg_at(args, argc, 3), &data)) return false;
+  *result = Value::make_null();
+  if (!d) return true;
+  dom::Node* n = kind == 7 ? d->owner->create_comment(data.view()) : d->owner->create_text(data.view());
+  if (!n) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+  n->dom_type = kind == 7 ? 7 : 4;
+  n->name.assign(kind == 7 ? name.view() : StringView("#cdata-section"));
+  *result = node_value(impl(vm), n);
+  return true;
+}
+
+// __set_attr_ns(element, namespace, qualifiedName, value): an attribute with a namespace. __attr_ns(element, qualifiedName): its namespace (null if it has none, undefined if
+// there is no such attribute). __attr_names(element): the qualified names, in order.
+NATIVE(set_attr_ns) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  String ns(vm.allocator()), name(vm.allocator()), value(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 1), &ns) || !arg_text(vm, arg_at(args, argc, 2), &name) || !arg_text(vm, arg_at(args, argc, 3), &value)) return false;
+  *result = Value();
+  if (!n || !n->is_element()) return true;
+  const dom::DomError e = dom::set_attribute(n, name.view(), value.view());
+  if (e != dom::DomError::None) return throw_dom_error(vm, e);
+  for (uint64_t i = 0; i < n->attrs.count(); ++i) {
+    String lowered(vm.allocator());
+    for (char c : name.view()) lowered.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c);
+    if (n->attrs[i].name.view().equals(lowered.view())) n->attrs[i].ns.assign(ns.view());
+  }
+  return true;
+}
+
+NATIVE(attr_ns) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  String name(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 1), &name)) return false;
+  *result = Value();
+  if (!n || !n->is_element()) return true;
+  for (uint64_t i = 0; i < n->attrs.count(); ++i) {
+    String lowered(vm.allocator());
+    for (char c : name.view()) lowered.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c);
+    if (n->attrs[i].name.view().equals(lowered.view())) {
+      *result = n->attrs[i].ns.empty() ? Value::make_null() : str_value(vm, n->attrs[i].ns.view());
+      return true;
+    }
+  }
+  return true;
+}
+
+// __set_content_type(document, type): the document is XML of that type (DOMParser, createDocument).
+NATIVE(set_content_type) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  String type(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 1), &type)) return false;
+  if (n && n->type == dom::NodeType::Document) n->owner->content_type.assign(type.view());
+  *result = Value();
+  return true;
+}
+
+NATIVE(clipboard_get) {
+  (void)self; (void)args; (void)argc;
+  String text(vm.allocator());
+  *result = impl(vm).host.clipboard_read(&text) ? str_value(vm, text.view()) : Value::make_null();
+  return true;
+}
+NATIVE(clipboard_set) {
+  (void)self;
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  impl(vm).host.clipboard_write(text.view());
+  *result = Value();
+  return true;
+}
+
 NATIVE(pip_supported) {
   (void)self; (void)args; (void)argc;
   *result = bool_value(impl(vm).host.pip_supported());
@@ -883,6 +963,12 @@ bool install_window(DomBindings::Impl& c) {
   JsObject* g = vm.global();
   g->host = &kWindowClass;
   vm.define_named(g, "__time_origin", num_value(vm.clock_ms()), 0);
+  vm.define_native(g, "__set_content_type", set_content_type, 2);
+  vm.define_native(g, "__set_attr_ns", set_attr_ns, 4);
+  vm.define_native(g, "__make_node", make_node, 4);
+  vm.define_native(g, "__attr_ns", attr_ns, 2);
+  vm.define_native(g, "__clipboard_get", clipboard_get, 0);
+  vm.define_native(g, "__clipboard_set", clipboard_set, 1);
   vm.define_native(g, "__pip_supported", pip_supported, 0);
   vm.define_native(g, "__pip_request", pip_request, 1);
   vm.define_native(g, "__pip_exit", pip_exit, 0);

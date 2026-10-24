@@ -223,6 +223,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   dom::Node* pip_element() override;
   int pip_request(dom::Node* video, uint32_t* width, uint32_t* height) override;
   void pip_exit() override;
+  bool clipboard_read(String* text) override { return env_.clipboard_get(text); }
+  void clipboard_write(StringView text) override { env_.clipboard_set(text); }
   bool fullscreen_supported() override { return env_.fullscreen_supported(); }
   dom::Node* fullscreen_element() override;
   bool fullscreen_request(dom::Node* element) override;

@@ -78,6 +78,9 @@ class IDomHost {
   virtual dom::Node* pip_element() { return nullptr; }
   virtual int pip_request(dom::Node* video, uint32_t* width, uint32_t* height) { (void)video; (void)width; (void)height; return 1; }
   virtual void pip_exit() {}
+  // The text on the clipboard (navigator.clipboard): false if there is none / no clipboard.
+  virtual bool clipboard_read(String* text) { (void)text; return false; }
+  virtual void clipboard_write(StringView text) { (void)text; }
   virtual bool fullscreen_supported() { return false; }
   virtual dom::Node* fullscreen_element() { return nullptr; }
   virtual bool fullscreen_request(dom::Node* element) { (void)element; return false; }

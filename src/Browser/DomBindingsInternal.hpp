@@ -88,7 +88,9 @@ dom::Node* this_node(Vm& vm, const Value& self);
 dom::Node* arg_node(Vm& vm, const Value* args, uint32_t argc, uint32_t i);
 
 // A new array of the wrappers of these nodes, with item(i) (the collections the DOM calls NodeList and HTMLCollection).
-JsObject* make_collection(DomBindings::Impl& c, const List<dom::Node*>& nodes);
+JsObject* make_collection(DomBindings::Impl& c, const List<dom::Node*>& nodes, bool html_collection = true);
+// Makes an array an instance of the interface of script with that name ("NodeList", "HTMLCollection"...), if the built-in script has defined it.
+void set_interface(Vm& vm, JsObject* array, const char* name);
 
 // The text of a string-like argument ("" for undefined and null, ToString otherwise).
 bool arg_text(Vm& vm, const Value& v, String* out);
