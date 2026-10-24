@@ -46,7 +46,7 @@ class SystemVideoCodecs {
  public:
   SystemVideoCodecs(const IPciBus& pci, allocators::IAllocator& allocator) : pci_(pci), allocator_(allocator), devices_(allocator) {}
 
-  // With a mapper, initialize() maps the register BAR of Intel GPUs and looks at their video engines; without one it only names them.
+  // With a mapper, initialize() maps the register BAR of Intel GPUs and looks at their video engines, and reads the chip ID of NVIDIA GPUs; without one it only names them.
   void set_mmio(IRegisterMapper* mapper) { mmio_ = mapper; }
   // Opt in (needs set_mmio): H.264 decoding on the video engine of Gen9.5 Intel GPUs. Off by default: that path has only run against a simulated GPU.
   void set_intel_hardware_decode(bool enable) { intel_hardware_ = enable; }
@@ -71,6 +71,7 @@ class SystemVideoCodecs {
 
  private:
   MmioRegion intel_registers(const PciDeviceInfo& d) const;
+  uint32_t nvidia_boot0(const PciDeviceInfo& d) const;
   bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out);
   void add_intel(const PciDeviceInfo& d);
 

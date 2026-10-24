@@ -1037,6 +1037,22 @@ static void test_intel_media_engine() {
   CHECK(meteor.initialize() && !meteor.engine_status().probed);
 }
 
+static void test_nvidia_media_engine() {
+  TestAllocator a;
+  const uint32_t h264 = codec_mask(VideoCodec::H264), hevc = codec_mask(VideoCodec::Hevc), vp9 = codec_mask(VideoCodec::Vp9), av1 = codec_mask(VideoCodec::Av1);
+  NvidiaVideoEngine pascal(a, 0x1B80), ampere(a, 0x2204), hopper(a, 0x2330), ada(a, 0x2684), blackwell(a, 0x2B85), unknown(a);
+  CHECK(pascal.engine_decode_codecs() & hevc && pascal.engine_decode_codecs() & vp9 && !(pascal.engine_decode_codecs() & av1) && !(pascal.engine_encode_codecs() & av1));
+  CHECK(ampere.engine_decode_codecs() & av1 && !(ampere.engine_encode_codecs() & av1) && ampere.engine_encode_codecs() & hevc);
+  CHECK(hopper.engine_decode_codecs() & av1 && hopper.engine_encode_codecs() == 0);
+  CHECK(ada.engine_encode_codecs() & av1 && blackwell.engine_encode_codecs() & av1 && ada.engine_encode_codecs() & h264);
+  CHECK(unknown.engine_decode_codecs() == 0 && unknown.engine_encode_codecs() == 0);
+  // A device ID the table does not know is classified by the chip ID read from the GPU (GB202); a known ID is not overruled by it.
+  NvidiaVideoEngine by_chip(a, 0x0001, 0x1B200000u), by_id(a, 0x1B80, 0x1B200000u), no_chip(a, 0x0001, 0);
+  CHECK(by_chip.gpu().architecture == NvidiaGpuArchitecture::Blackwell && by_chip.engine_encode_codecs() & av1);
+  CHECK(by_id.gpu().architecture == NvidiaGpuArchitecture::Pascal && no_chip.engine_decode_codecs() == 0);
+  CHECK(pascal.initialize() && pascal.info().hardware_engine && !pascal.info().accelerated);
+}
+
 static void test_amd_media_engine() {
   TestAllocator a;
   const uint32_t h264 = codec_mask(VideoCodec::H264), hevc = codec_mask(VideoCodec::Hevc), vp9 = codec_mask(VideoCodec::Vp9), av1 = codec_mask(VideoCodec::Av1);
@@ -1060,6 +1076,7 @@ int main() {
   test_system_list();
   test_intel_media_engine();
   test_amd_media_engine();
+  test_nvidia_media_engine();
   test_intel_system();
   test_h264_parser();
   test_h264_encode();

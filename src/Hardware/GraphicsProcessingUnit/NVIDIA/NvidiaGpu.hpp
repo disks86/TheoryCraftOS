@@ -17,20 +17,25 @@
  */
 
 #pragma once
+#include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
 
 namespace hardware {
 
-// NVIDIA display controller (PCI vendor 0x10DE). Modes and the framebuffer still
-// come from the firmware (UEFI GOP); native mode setting for these parts is
-// future work, and this class is where it will go.
+// NVIDIA display controller (PCI vendor 0x10DE), identified by device ID down to its architecture (Pascal to Blackwell; see
+// NvidiaGpuGenerations.hpp). Modes and the framebuffer come from the firmware (UEFI GOP): NVIDIA does not document the display engine of these
+// parts (Turing and newer are programmed through signed GSP firmware), so there is no native mode setting to write.
 class NvidiaGpu final : public UefiGopGpu {
  public:
   static constexpr uint16_t kPciVendor = 0x10DE;
 
-  explicit NvidiaGpu(const GpuContext& context) : UefiGopGpu(context) {}
+  explicit NvidiaGpu(const GpuContext& context) : UefiGopGpu(context), info_(nvidia_gpu_identify(context.device.device_id)) {}
 
-  const char* name() const override { return "NVIDIA graphics (UEFI framebuffer)"; }
+  const char* name() const override { return info_.name; }
+  const NvidiaGpuInfo& generation() const { return info_; }
+
+ private:
+  NvidiaGpuInfo info_;
 };
 
 }  // namespace hardware
