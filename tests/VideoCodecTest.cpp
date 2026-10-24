@@ -28,6 +28,8 @@
 #include "Hardware/VideoCodec/Software/H264Parser.hpp"
 #include "Hardware/VideoCodec/Software/Jpeg.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Hardware/VideoCodec/Software/Vp8.hpp"
+#include "Hardware/VideoCodec/Software/Av1.hpp"
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
@@ -481,7 +483,7 @@ static void test_system_list() {
     CHECK(system.at(0)->info().hardware_engine && !system.at(0)->info().accelerated && strstr(system.at(0)->name(), "NVIDIA"));
     CHECK(!system.at(1)->info().hardware_engine && strcmp(system.at(1)->name(), "Software video codec") == 0);
     CHECK(system.at(2) == nullptr);
-    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Vp9)));
+    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1)));
     DecoderConfig dc;
     dc.codec = VideoCodec::Mjpeg;
     CHECK(system.create_decoder(dc));
@@ -1021,6 +1023,284 @@ static void test_vp9_robustness() {
   CHECK(a.live == 0);
 }
 
+// ---- AV1 ---------------------------------------------------------------------------------------------------------------------------
+
+// Decodes every temporal unit of an IVF image with an Av1Decoder; the FNV-64 of the pictures (8-bit I420, tight rows, each at its own size).
+static bool av1_decode(allocators::IAllocator& a, const unsigned char* d, long n, unsigned* frames, unsigned* width, unsigned* height, unsigned long long* hash, bool keep_going) {
+  hardware::Av1Decoder dec(a);
+  *frames = 0;
+  *hash = 0xcbf29ce484222325ull;
+  long pos = 32;
+  ConstByteView pk;
+  bool ok = true;
+  while (IvfFile::next(d, n, &pos, &pk)) {
+    if (!dec.decode(pk, *frames)) {
+      ok = false;
+      if (!keep_going) break;
+    }
+    hardware::VideoFrame f;
+    if (dec.receive(&f)) {
+      if (*frames == 0) { *width = f.format.width; *height = f.format.height; }
+      for (uint32_t p = 0; p < 3; ++p)
+        for (uint32_t y = 0; y < f.format.plane_height(p); ++y) *hash = fnv64(*hash, f.plane[p] + static_cast<size_t>(y) * f.stride[p], f.format.plane_width(p));
+      ++*frames;
+    }
+  }
+  return ok;
+}
+
+// The streams made by libaom, SVT-AV1 and rav1e (see tests/data/make_av1_fixtures.py) decode to the pictures dav1d makes from them: every profile and
+// bit depth, tiles, 128x128 superblocks, lossless, quantiser matrices, segmentation, palette and intra block copy, super-resolution, scaled references,
+// film grain and hidden frames.
+static void test_av1() {
+  TestAllocator a;
+  FILE* m = fopen("tests/data/manifest_av1.txt", "r");
+  CHECK(m != nullptr);
+  if (!m) return;
+  char kind[16], name[96];
+  unsigned w, h, frames;
+  unsigned long long hash;
+  int count = 0;
+  while (fscanf(m, "%15s %95s %u %u %u %llx", kind, name, &w, &h, &frames, &hash) == 6) {
+    IvfFile file(name);
+    if (!file.data) { printf("missing fixture %s\n", name); ++g_failed; continue; }
+    unsigned got_frames = 0, got_w = 0, got_h = 0;
+    unsigned long long got_hash = 0;
+    CHECK(av1_decode(a, file.data, file.size, &got_frames, &got_w, &got_h, &got_hash, false));
+    if (got_frames != frames || got_w != w || got_h != h || got_hash != hash) {
+      printf("AV1 fixture %s: got %u frames %ux%u hash %016llx, wanted %u frames %ux%u hash %016llx\n", name, got_frames, got_w, got_h, got_hash, frames, w, h, hash);
+      ++g_failed;
+    }
+    ++count;
+  }
+  fclose(m);
+  CHECK(count >= 18);
+  CHECK(a.live == 0);
+
+  // Through a codec session: pictures come out in the format asked for, one per packet.
+  {
+    hardware::SoftwareVideoCodec device(a);
+    CHECK(device.can_decode(hardware::VideoCodec::Av1) && !device.can_encode(hardware::VideoCodec::Av1));
+    hardware::DecoderConfig config;
+    config.codec = hardware::VideoCodec::Av1;
+    config.output = hardware::PixelFormat::Bgra8888;
+    UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+    CHECK(dec != nullptr);
+    IvfFile file("av1_inter.ivf");
+    CHECK(file.data != nullptr);
+    if (dec && file.data) {
+      long pos = 32;
+      ConstByteView pk;
+      uint32_t n = 0;
+      while (IvfFile::next(file.data, file.size, &pos, &pk)) {
+        hardware::VideoPacket packet;
+        packet.data = pk;
+        packet.pts_us = n * 100000;
+        CHECK(dec->submit(packet) == hardware::SubmitResult::Accepted);
+        hardware::VideoFrame f;
+        if (dec->receive(&f)) {
+          CHECK(f.format.width == 95 && f.format.height == 63 && f.format.pixel_format == hardware::PixelFormat::Bgra8888);
+          ++n;
+        }
+      }
+      CHECK(n == 14 && dec->statistics().errors == 0);
+      // Garbage is refused.
+      const uint8_t noise[16] = {0x12, 0x00, 0x0a, 0x0b, 5, 6, 7, 8};
+      hardware::VideoPacket junk;
+      junk.data = ConstByteView(noise, sizeof noise);
+      dec->reset();
+      hardware::VideoFrame f;
+      dec->submit(junk);
+      CHECK(!dec->receive(&f));
+    }
+  }
+  CHECK(a.live == 0);
+}
+
+// Truncated and damaged copies of the AV1 fixtures must neither crash nor leak.
+static void test_av1_robustness() {
+  TestAllocator a;
+  const char* names[] = {"av1_intra.ivf", "av1_inter.ivf", "av1_tiles.ivf", "av1_lossless.ivf", "av1_segments.ivf", "av1_444.ivf", "av1_10bit.ivf", "av1_screen.ivf", "av1_superres.ivf", "av1_resize.ivf", "av1_grain.ivf", "av1_svt.ivf", "av1_rav1e.ivf"};
+  uint32_t seed = 99;
+  auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
+  for (const char* name : names) {
+    IvfFile file(name);
+    CHECK(file.data != nullptr);
+    if (!file.data) continue;
+    for (int round = 0; round < 24; ++round) {
+      unsigned char* copy = static_cast<unsigned char*>(malloc(file.size));
+      memcpy(copy, file.data, file.size);
+      long len = file.size;
+      switch (round % 4) {
+        case 0: len = 32 + rnd() % (file.size - 32); break;                                                                  // truncated
+        case 1: for (int k = 0; k < 4; ++k) copy[32 + rnd() % (file.size - 32)] ^= 1 << (rnd() % 8); break;                 // bit flips
+        case 2: for (int k = 0; k < 12; ++k) copy[32 + rnd() % (file.size - 32)] = static_cast<uint8_t>(rnd()); break;      // noise
+        default: for (int k = 0; k < 3; ++k) copy[32 + rnd() % (file.size < 400 ? file.size - 32 : 400)] = static_cast<uint8_t>(rnd()); break;  // headers
+      }
+      unsigned frames, w, h;
+      unsigned long long hash;
+      av1_decode(a, copy, len, &frames, &w, &h, &hash, true);
+      free(copy);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
+// Decodes every packet of an IVF image with a Vp8Decoder; the FNV-64 of the pictures (8-bit I420, tight rows). Pictures of any size are hashed as they are.
+static bool vp8_decode(allocators::IAllocator& a, const unsigned char* d, long n, unsigned* frames, unsigned* width, unsigned* height, unsigned long long* hash, bool keep_going) {
+  hardware::Vp8Decoder dec(a);
+  *frames = 0;
+  *hash = 0xcbf29ce484222325ull;
+  long pos = 32;
+  ConstByteView pk;
+  bool ok = true;
+  while (IvfFile::next(d, n, &pos, &pk)) {
+    if (!dec.decode(pk, *frames)) {
+      ok = false;
+      if (!keep_going) break;
+    }
+    hardware::VideoFrame f;
+    if (dec.receive(&f)) {
+      if (*frames == 0) { *width = f.format.width; *height = f.format.height; }
+      for (uint32_t p = 0; p < 3; ++p)
+        for (uint32_t y = 0; y < f.format.plane_height(p); ++y) *hash = fnv64(*hash, f.plane[p] + static_cast<size_t>(y) * f.stride[p], f.format.plane_width(p));
+      ++*frames;
+    }
+  }
+  return ok;
+}
+
+// The streams made by libvpx (see tests/data/make_vp8_fixtures.py) decode to the pictures libvpx's own decoder makes from them, bit for bit: key frames
+// only, inter frames, odd sizes, token partitions, loop filter sharpness, the simple filter and bilinear prediction (versions 1 to 3), hidden alternate
+// references, segmentation, error resilience, several key frames and a change of the picture size.
+static void test_vp8() {
+  TestAllocator a;
+  FILE* m = fopen("tests/data/manifest_vp8.txt", "r");
+  CHECK(m != nullptr);
+  if (!m) return;
+  char kind[16], name[96];
+  unsigned w, h, frames;
+  unsigned long long hash;
+  int count = 0;
+  while (fscanf(m, "%15s %95s %u %u %u %llx", kind, name, &w, &h, &frames, &hash) == 6) {
+    IvfFile file(name);
+    if (!file.data) { printf("missing fixture %s\n", name); ++g_failed; continue; }
+    unsigned got_frames = 0, got_w = 0, got_h = 0;
+    unsigned long long got_hash = 0;
+    CHECK(vp8_decode(a, file.data, file.size, &got_frames, &got_w, &got_h, &got_hash, false));
+    if (got_frames != frames || got_w != w || got_h != h || got_hash != hash) {
+      printf("VP8 fixture %s: got %u frames %ux%u hash %016llx, wanted %u frames %ux%u hash %016llx\n", name, got_frames, got_w, got_h, got_hash, frames, w, h, hash);
+      ++g_failed;
+    }
+    ++count;
+  }
+  fclose(m);
+  CHECK(count >= 19);
+  CHECK(a.live == 0);
+
+  // Through a codec session: pictures come out in the format asked for, one per packet.
+  {
+    hardware::SoftwareVideoCodec device(a);
+    CHECK(device.can_decode(hardware::VideoCodec::Vp8) && !device.can_encode(hardware::VideoCodec::Vp8));
+    hardware::DecoderConfig config;
+    config.codec = hardware::VideoCodec::Vp8;
+    config.output = hardware::PixelFormat::Bgra8888;
+    UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+    CHECK(dec != nullptr);
+    IvfFile file("vp8_inter.ivf");
+    CHECK(file.data != nullptr);
+    if (dec && file.data) {
+      long pos = 32;
+      ConstByteView pk;
+      uint32_t n = 0;
+      while (IvfFile::next(file.data, file.size, &pos, &pk)) {
+        hardware::VideoPacket packet;
+        packet.data = pk;
+        packet.pts_us = n * 100000;
+        CHECK(dec->submit(packet) == hardware::SubmitResult::Accepted);
+        packet.data = pk;
+        CHECK(dec->submit(packet) == hardware::SubmitResult::Full);  // the picture has not been taken yet
+        hardware::VideoFrame f;
+        CHECK(dec->receive(&f) && f.format.width == 80 && f.format.height == 64 && f.format.pixel_format == hardware::PixelFormat::Bgra8888 && f.pts_us == n * 100000);
+        CHECK(f.keyframe == (n == 0));
+        ++n;
+      }
+      CHECK(n == 12);
+      CHECK(dec->output_format().width == 80 && dec->statistics().frames == 12 && dec->statistics().errors == 0);
+      // Garbage is refused, and after a reset the decoder waits for a key frame.
+      const uint8_t noise[16] = {0x91, 2, 3, 4, 5, 6, 7, 8};
+      hardware::VideoPacket junk;
+      junk.data = ConstByteView(noise, sizeof noise);
+      CHECK(dec->submit(junk) == hardware::SubmitResult::Invalid);
+      dec->reset();
+      pos = 32;
+      IvfFile::next(file.data, file.size, &pos, &pk);
+      IvfFile::next(file.data, file.size, &pos, &pk);  // the second packet is an inter frame
+      hardware::VideoPacket second;
+      second.data = pk;
+      hardware::VideoFrame f;
+      CHECK(dec->submit(second) == hardware::SubmitResult::Invalid);
+      CHECK(!dec->receive(&f));
+    }
+  }
+  // A dropped frame (an empty packet) shows the last picture again; with nothing decoded yet it is refused.
+  {
+    hardware::Vp8Decoder dec(a);
+    hardware::VideoFrame f;
+    CHECK(!dec.decode(ConstByteView(), 0));
+    IvfFile file("vp8_inter.ivf");
+    long pos = 32;
+    ConstByteView pk;
+    CHECK(file.data && IvfFile::next(file.data, file.size, &pos, &pk));
+    if (file.data) {
+      CHECK(dec.decode(pk, 0) && dec.receive(&f));
+      const uint8_t first = f.plane[0][0];
+      CHECK(dec.decode(ConstByteView(), 5) && dec.receive(&f) && f.pts_us == 5 && f.plane[0][0] == first && !f.keyframe);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
+// Truncated and damaged copies of the VP8 fixtures must neither crash nor leak.
+static void test_vp8_robustness() {
+  TestAllocator a;
+  const char* names[] = {"vp8_intra.ivf", "vp8_inter.ivf", "vp8_parts.ivf", "vp8_segments.ivf", "vp8_arf.ivf", "vp8_profile1.ivf", "vp8_profile3_rt.ivf", "vp8_resize.ivf", "vp8_odd.ivf"};
+  uint32_t seed = 77;
+  auto rnd = [&seed]() { seed = seed * 1664525 + 1013904223; return seed >> 8; };
+  for (const char* name : names) {
+    IvfFile file(name);
+    CHECK(file.data != nullptr);
+    if (!file.data) continue;
+    for (int round = 0; round < 24; ++round) {
+      unsigned char* copy = static_cast<unsigned char*>(malloc(file.size));
+      memcpy(copy, file.data, file.size);
+      long len = file.size;
+      switch (round % 4) {
+        case 0: len = 32 + rnd() % (file.size - 32); break;                                                                  // truncated
+        case 1: for (int k = 0; k < 4; ++k) copy[32 + rnd() % (file.size - 32)] ^= 1 << (rnd() % 8); break;                 // bit flips
+        case 2: for (int k = 0; k < 12; ++k) copy[32 + rnd() % (file.size - 32)] = static_cast<uint8_t>(rnd()); break;      // noise
+        default: for (int k = 0; k < 3; ++k) copy[32 + rnd() % (file.size < 400 ? file.size - 32 : 400)] = static_cast<uint8_t>(rnd()); break;  // headers
+      }
+      unsigned frames, w, h;
+      unsigned long long hash;
+      vp8_decode(a, copy, len, &frames, &w, &h, &hash, true);
+      free(copy);
+    }
+    // Every prefix of the first packets, byte by byte: a frame cut anywhere is refused or decoded, never read beyond.
+    {
+      long pos = 32;
+      ConstByteView pk;
+      for (int packet = 0; packet < 2 && IvfFile::next(file.data, file.size, &pos, &pk); ++packet) {
+        for (uint64_t cut = 0; cut < pk.size() && cut < 300; ++cut) {
+          hardware::Vp8Decoder dec(a);
+          dec.decode(pk.first(cut), 0);
+        }
+      }
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 // The Intel media engine device: a software codec that has looked at (pretend) hardware registers and says what it found.
 static void test_intel_media_engine() {
   TestAllocator heap;
@@ -1122,6 +1402,10 @@ int main() {
   test_h264_encode_robustness();
   test_vp9();
   test_vp9_robustness();
+  test_av1();
+  test_av1_robustness();
+  test_vp8();
+  test_vp8_robustness();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("video codec tests passed\n");
   return 0;

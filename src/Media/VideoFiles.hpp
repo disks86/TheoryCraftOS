@@ -23,12 +23,12 @@
 namespace media {
 
 // Video containers that are read by decoding all their pictures up front into an Image whose frames carry their own
-// durations: the player shows them like any other video. (AVI is read by video::AviFile, MP4 and MOV by media::Mp4File.)
+// durations: the player shows them like any other video. (AVI is read by video::AviFile, MP4 and MOV by media::Mp4File, WebM and Matroska by media::WebmFile.)
 //
 //   GIF, APNG, animated WebP  animated pictures: decode_image() already yields the frames and delays.
 //   Y4M        YUV4MPEG2 uncompressed video: 4:2:0, 4:2:2, 4:4:4 and mono, progressive; decoded to RGB with the BT.601
 //              limited-range matrix (mono: the luma as grey, full range).
-enum class VideoFileFormat : uint8_t { Unknown, Avi, Gif, Apng, Y4m, AnimatedWebp, Mp4 };
+enum class VideoFileFormat : uint8_t { Unknown, Avi, Gif, Apng, Y4m, AnimatedWebp, Mp4, Webm };
 const char* video_file_format_name(VideoFileFormat format);
 VideoFileFormat detect_video_file(ConstByteView data);
 

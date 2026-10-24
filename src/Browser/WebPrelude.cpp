@@ -753,7 +753,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     var element = __mse_element(buffer.__source.__id);
     if (!element) return;
     for (var i = 0; i + 1 < list.length; i += 2)
-      element.dispatchEvent(new MediaEncryptedEvent('encrypted', { initDataType: list[i] === 1 ? 'keyids' : 'cenc', initData: list[i + 1].buffer }));
+      element.dispatchEvent(new MediaEncryptedEvent('encrypted', { initDataType: list[i] === 2 ? 'webm' : list[i] === 1 ? 'keyids' : 'cenc', initData: list[i + 1].buffer }));
   };
 
   // MediaKeyStatusMap: the key identifiers of a session and the state of each.

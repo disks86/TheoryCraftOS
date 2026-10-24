@@ -41,6 +41,9 @@ void VideoPlayer::release() {
   seq_clear();
   mp4_.clear();
   mp4_track_ = nullptr;
+  webm_.clear();
+  webm_track_ = nullptr;
+  webm_origin_us_ = 0;
   source_ = nullptr;
   packet_.clear();
   images_.clear();
@@ -237,10 +240,20 @@ void VideoPlayer::seq_clear() {
   seq_sync_.clear();
   seq_fed_ = seq_next_rank_ = 0;
   seq_started_ = false;
+  seq_one_to_one_ = false;
 }
 
 bool VideoPlayer::seq_packet(uint32_t decode_index, VideoPacket* packet) const {
   if (seq_source_ == SeqSource::Avi) return file_.frame(decode_index, packet);
+  if (seq_source_ == SeqSource::Webm) {
+    if (!webm_track_ || !source_) return false;
+    packet_.clear();
+    if (!webm_.read_sample(*source_, *webm_track_, decode_index, &packet_) || packet_.size() == 0) return false;
+    packet->data = packet_.view();
+    packet->pts_us = webm_track_->samples[decode_index].pts_us - webm_origin_us_;
+    packet->keyframe = seq_sync_[decode_index] != 0;
+    return true;
+  }
   if (seq_source_ != SeqSource::Mp4 || !mp4_track_ || !source_) return false;
   packet_.clear();
   if (!mp4_.read_sample(*source_, *mp4_track_, decode_index, &packet_) || packet_.size() == 0) return false;
@@ -317,6 +330,29 @@ bool VideoPlayer::seq_build_mp4(const media::Mp4Track& track) {
   return true;
 }
 
+// A WebM track: the frames are stored in the order they show in (no codec of WebM reorders), so a frame's place is its place in the file.
+bool VideoPlayer::seq_build_webm(const media::WebmTrack& track) {
+  const uint32_t n = static_cast<uint32_t>(track.samples.count());
+  if (n == 0) return false;
+  if (!seq_dec_of_rank_.reserve(n) || !seq_rank_of_dec_.reserve(n) || !seq_sync_.reserve(n) || !seq_times_.reserve(n + 1)) return false;
+  webm_origin_us_ = track.samples[0].pts_us;
+  int64_t previous = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const media::WebmSample& s = track.samples[i];
+    int64_t t = s.pts_us - webm_origin_us_;
+    if (t < previous) t = previous;
+    previous = t;
+    if (!seq_dec_of_rank_.push_back(i) || !seq_rank_of_dec_.push_back(i) || !seq_sync_.push_back(s.keyframe ? 1 : 0) || !seq_times_.push_back(t)) return false;
+  }
+  const media::WebmSample& last = track.samples[n - 1];
+  if (!seq_times_.push_back(previous + (last.duration_us ? last.duration_us : 33333))) return false;
+  if (!seq_sync_[0]) seq_sync_[0] = 1;   // (decoding has to begin somewhere)
+  seq_source_ = SeqSource::Webm;
+  webm_track_ = &track;
+  seq_one_to_one_ = track.codec != media::WebmCodec::Unknown;
+  return true;
+}
+
 // Brings the picture to display position `target`: continues decoding where the decoder is, or (after going back or
 // a long jump forward) restarts from the sync sample at or before it.
 bool VideoPlayer::seq_show(uint32_t target) {
@@ -341,21 +377,33 @@ bool VideoPlayer::seq_show(uint32_t target) {
   }
   VideoFrame frame;
   bool shown = false;
+  bool just_fed = false;
   while (seq_next_rank_ <= target) {
     if (!decoder_->receive(&frame)) {
+      if (seq_one_to_one_ && just_fed) {   // the packet showed nothing (a hidden frame, or one that could not be decoded): its place passes with no new picture
+        just_fed = false;
+        ++seq_next_rank_;
+        continue;
+      }
       if (seq_fed_ >= n) {
         decoder_->flush();
         if (!decoder_->receive(&frame)) break;
       } else {
         VideoPacket packet;
         const uint32_t d = seq_fed_++;
-        if (!seq_packet(d, &packet)) continue;
+        if (!seq_packet(d, &packet)) {
+          just_fed = seq_one_to_one_;
+          continue;
+        }
         if (decoder_->submit(packet) == SubmitResult::Full) break;
+        just_fed = true;
         continue;
       }
     }
+    just_fed = false;
     ++decoded_;
     if (seq_next_rank_ == target) shown = show_decoded(frame);
+    else if (seq_one_to_one_ && seq_next_rank_ + kHiddenFrameReach >= target) shown = show_decoded(frame) || shown;   // (the target may be a hidden frame: the picture before it stays)
     else if (seq_next_rank_ > current_frame_ || !have_picture_) ++skipped_;
     ++seq_next_rank_;
   }
@@ -395,6 +443,10 @@ OpenResult VideoPlayer::open_media(ConstByteView data) {
     memory_.reset(data);
     return open_mp4(memory_);
   }
+  if (format == media::VideoFileFormat::Webm) {
+    memory_.reset(data);
+    return open_webm(memory_);
+  }
   kernel::ScopedMutex guard(mutex_);
   release();
   // GIF, APNG and Y4M are videos; any other picture format opens as a video of one frame.
@@ -419,6 +471,7 @@ OpenResult VideoPlayer::open_media(media::IByteSource& source) {
     return result;
   }
   if (format == media::VideoFileFormat::Mp4) return open_mp4(source);
+  if (format == media::VideoFileFormat::Webm) return open_webm(source);
   if (format == media::VideoFileFormat::Y4m) {
     OpenResult result = OpenResult::Unsupported;
     if (open_y4m_stream(source, &result)) return result;   // (else it is read whole, below)
@@ -528,7 +581,7 @@ bool VideoPlayer::open_y4m_stream(media::IByteSource& source, OpenResult* result
   return true;
 }
 
-// An MP4 / MOV file: its H.264 or VP9 video track read sample by sample, and its audio track (AAC or MP3) decoded as it plays.
+// An MP4 / MOV file: its H.264, VP9 or AV1 video track read sample by sample, and its audio track (AAC or MP3) decoded as it plays.
 OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
   kernel::ScopedMutex guard(mutex_);
   release();
@@ -539,14 +592,16 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
     release();
     return OpenResult::Unsupported;
   }
-  const uint32_t avc1 = 0x61766331, avc3 = 0x61766333, vp09 = 0x76703039;
-  const bool vp9 = track->codec == vp09;   // (VP9 streams describe themselves: no configuration record is needed)
-  if (!vp9 && ((track->codec != avc1 && track->codec != avc3) || track->config.empty())) {
+  const uint32_t avc1 = 0x61766331, avc3 = 0x61766333, vp08 = 0x76703038, vp09 = 0x76703039, av01 = 0x61763031;
+  const bool vp8 = track->codec == vp08;
+  const bool vp9 = track->codec == vp09;   // (VP8, VP9 and AV1 streams describe themselves: no configuration record is needed)
+  const bool av1 = track->codec == av01;
+  if (!vp8 && !vp9 && !av1 && ((track->codec != avc1 && track->codec != avc3) || track->config.empty())) {
     release();
     return OpenResult::NoDecoder;
   }
   DecoderConfig config;
-  config.codec = vp9 ? VideoCodec::Vp9 : VideoCodec::H264;
+  config.codec = av1 ? VideoCodec::Av1 : vp9 ? VideoCodec::Vp9 : vp8 ? VideoCodec::Vp8 : VideoCodec::H264;
   config.width = track->width;
   config.height = track->height;
   config.output = PixelFormat::Bgra8888;
@@ -560,6 +615,7 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
     release();
     return OpenResult::OutOfMemory;
   }
+  seq_one_to_one_ = config.codec != VideoCodec::H264;   // (VP8, VP9 and AV1 give a picture for a packet at once, or none for a hidden frame)
   width_ = track->width;
   height_ = track->height;
   duration_us_ = seq_times_[seq_times_.count() - 1];
@@ -571,6 +627,54 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
   have_picture_ = true;
   if (mixer_) {
     audio_stream_ = media::open_mp4_audio_stream(source, allocator_);
+    if (audio_stream_) start_audio(audio_stream_.get());
+  }
+  state_ = VideoState::Stopped;
+  return OpenResult::Ok;
+}
+
+// A WebM / Matroska file: its VP8, VP9 or AV1 video track read frame by frame, and its Opus or Vorbis sound decoded as it plays.
+OpenResult VideoPlayer::open_webm(media::IByteSource& source) {
+  kernel::ScopedMutex guard(mutex_);
+  release();
+  if (!webm_.open(source)) return OpenResult::Unsupported;
+  source_ = &source;
+  const media::WebmTrack* track = webm_.find(media::WebmTrackKind::Video);
+  if (!track) {   // (a sound only, or a picture that cannot be read: the caller may try it as sound)
+    bool has_video = false;
+    for (uint32_t i = 0; i < webm_.track_count(); ++i) has_video = has_video || webm_.track(i).kind == media::WebmTrackKind::Video;
+    release();
+    return has_video ? OpenResult::NoDecoder : OpenResult::Unsupported;
+  }
+  DecoderConfig config;
+  config.codec = track->codec == media::WebmCodec::Vp8 ? VideoCodec::Vp8 : track->codec == media::WebmCodec::Vp9 ? VideoCodec::Vp9 : VideoCodec::Av1;
+  config.width = track->width;
+  config.height = track->height;
+  config.output = PixelFormat::Bgra8888;
+  config.codec_config = track->codec_private.view();
+  decoder_ = codecs_.create_decoder(config);
+  if (!decoder_) {
+    release();
+    return OpenResult::NoDecoder;
+  }
+  if (!seq_build_webm(*track)) {
+    release();
+    return OpenResult::OutOfMemory;
+  }
+  width_ = track->width;
+  height_ = track->height;
+  int64_t end = webm_.duration_us() - webm_origin_us_;   // (the sound may go on after the last picture)
+  if (end < seq_times_[seq_times_.count() - 1]) end = seq_times_[seq_times_.count() - 1];
+  duration_us_ = end;
+  seq_times_[seq_times_.count() - 1] = end;
+  current_frame_ = 0;
+  if (!seq_show(0)) {
+    release();
+    return OpenResult::NoDecoder;
+  }
+  have_picture_ = true;
+  if (mixer_ && webm_.find(media::WebmTrackKind::Audio)) {
+    audio_stream_ = media::open_webm_audio_stream(source, allocator_);
     if (audio_stream_) start_audio(audio_stream_.get());
   }
   state_ = VideoState::Stopped;

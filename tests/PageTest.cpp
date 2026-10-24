@@ -1059,12 +1059,13 @@ static void test_video() {
               "  v.currentTime = 1.5; r.push(v.currentTime); v.pause(); r.push(v.paused); v.volume = 0.25; r.push(v.volume);"
               "  try { v.volume = 3 } catch (e) { r.push(e.name) } v.muted = true; r.push(v.muted); r.push(v.duration, v.videoWidth, v.videoHeight, v.readyState, v.ended, v.loop);"
               "  v.loop = true; r.push(v.loop, v.hasAttribute('loop')); r.push(v.canPlayType('video/mp4') !== '', v.canPlayType('video/ogg') === '');"
+              "  r.push(v.canPlayType('video/webm; codecs=\"vp8, vorbis\"'), v.canPlayType('video/webm; codecs=\"vp9\"'), v.canPlayType('video/webm; codecs=\"theora\"') === '', v.canPlayType('video/webm'));"
               "  r.push(v.buffered.length, v.buffered.end(0), v.seekable.length); console.log(r.join(' '));"
               "}</script></body></html>");
     HtmlDocument doc(a);
     page.render(&doc);
     page.click(page.document().element_by_id("b")->serial, 0, 0);
-    CHECK(page_log(page) == "function function false 1.5 true 0.25 IndexSizeError true 2 64 48 4 false false true true true true 1 2 1 | then");
+    CHECK(page_log(page) == "function function false 1.5 true 0.25 IndexSizeError true 2 64 48 4 false false true true true true probably probably true maybe 1 2 1 | then");
     CHECK(env.last_clip->volume == 0.25 && env.last_clip->muted && !env.last_clip->is_playing);
   }
   CHECK(a.live == 0);
@@ -1863,6 +1864,42 @@ static void test_eme_playback() {
     CHECK(env.last_video_data == clear_data);
   }
   CHECK(a.live == 0);
+  {   // WebM, with the encryption of the WebM standard: announced as "webm" init data (the key identifier), and the player gets the file of the clear stream
+    const std::string webm_access =
+        "navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{ initDataTypes: ['webm'], videoCapabilities: [{ contentType: 'video/webm; codecs=\"vp9\"' }], audioCapabilities: [{ contentType: 'audio/webm; codecs=\"opus\"' }] }])"
+        ".then(function (a) { access = a; return a.createMediaKeys() }).then(function (k) { keys = k; return v.setMediaKeys(k) }).then(function () { log.push('keys-set:' + (v.mediaKeys === keys)); start() })"
+        ".catch(function (e) { log.push('failed:' + e.name) });";
+    const char* const kMp4Type = "video/mp4; codecs=\"avc1.4d401e, mp4a.40.2\"";
+    std::string clear_webm;
+    for (const char* name : {"webm_vp9_opus.webm", "webm_enc.webm"}) {
+      const bool encrypted = std::string(name) == "webm_enc.webm";
+      FakeEnvironment env(a);
+      mse_serve(env, name);
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      std::string html = eme_page(name, encrypted ? webm_access : "start();", "", "");
+      html.replace(html.find(kMp4Type), strlen(kMp4Type), "video/webm; codecs=\"vp9, opus\"");
+      html.replace(html.find("function onmsg(text) {  }"), 25, "var onmsg = function (text) {};");
+      if (encrypted) html.insert(html.find("v.addEventListener('encrypted', function (e) {"), answer);
+      page.load(StringView(html.data(), html.size()));
+      HtmlDocument doc(a);
+      page.render(&doc);
+      mse_pump(page, env, 14, &doc);
+      click(page, "p");
+      mse_pump(page, env, 25, &doc);
+      click(page, "e");
+      const std::string out = page_log(page);
+      if (encrypted) {
+        if (!in_order(out, {"keys-set:true", "encrypted:webm:16", "message:license-request", "status:usable:16", "|", "playing", "ended"})) printf("   webm: %s\n", out.c_str());
+        CHECK(in_order(out, {"keys-set:true", "encrypted:webm:16", "message:license-request", "status:usable:16", "|", "loadedmetadata", "play", "playing", "ended"}));
+        CHECK(!clear_webm.empty() && env.last_video_data == clear_webm);
+      } else {
+        CHECK(out.find("error") == std::string::npos && env.opened_video >= 1);
+        clear_webm = env.last_video_data;
+      }
+    }
+  }
+  CHECK(a.live == 0);
   {   // no MediaKeys: the stream cannot be played, the element says it is waiting for a key; setMediaKeys() and a license later let it go on
     FakeEnvironment env(a);
     mse_serve(env, "eme_cenc.mp4");
@@ -1956,7 +1993,7 @@ static void test_webm_page() {
   std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><button id=e></button><script>") + kLoad +
       "var v = document.getElementById('v'), ms = new MediaSource(), sb, ev = [], log = [];"
       "['loadedmetadata','canplay','play','playing','ended','error'].forEach(function (t) { v.addEventListener(t, function () { ev.push(t) }) });"
-      "log.push(MediaSource.isTypeSupported('video/webm; codecs=\"vp9, opus\"'), MediaSource.isTypeSupported('video/webm; codecs=\"vp8\"'), MediaSource.isTypeSupported('audio/webm; codecs=\"vorbis\"'));"
+      "log.push(MediaSource.isTypeSupported('video/webm; codecs=\"vp9, opus\"'), MediaSource.isTypeSupported('video/webm; codecs=\"theora\"'), MediaSource.isTypeSupported('audio/webm; codecs=\"vorbis\"'));"
       "load(['mse_webm.webm'], function (u8) {"
       "  ms.addEventListener('sourceopen', function () {"
       "    sb = ms.addSourceBuffer('video/webm; codecs=\"vp9, opus\"');"
@@ -1968,7 +2005,7 @@ static void test_webm_page() {
       "});"
       "document.getElementById('b').onclick = function () { v.play() };"
       "document.getElementById('e').onclick = function () { log.push(sb.buffered.length, sb.buffered.end(0).toFixed(1), v.duration.toFixed(1), v.videoWidth, sb.videoTracks.length, sb.audioTracks.length); console.log(log.join(' ') + ' | ' + ev.join()) };"
-      "try { ms.addSourceBuffer('video/webm; codecs=\"vp8\"') } catch (e) { log.push(e.name) }"
+      "try { ms.addSourceBuffer('video/webm; codecs=\"theora\"') } catch (e) { log.push(e.name) }"
       "</script></body></html>";
   page.load(StringView(html.data(), html.size()));
   HtmlDocument doc(a);

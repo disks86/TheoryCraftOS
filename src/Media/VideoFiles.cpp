@@ -19,6 +19,7 @@
 #include "Media/VideoFiles.hpp"
 #include "Media/ImageCodecs.hpp"
 #include "Media/Mp4.hpp"
+#include "Media/Webm.hpp"
 
 namespace media {
 
@@ -75,6 +76,7 @@ const char* video_file_format_name(VideoFileFormat format) {
     case VideoFileFormat::Y4m: return "Y4M";
     case VideoFileFormat::AnimatedWebp: return "animated WebP";
     case VideoFileFormat::Mp4: return "MP4";
+    case VideoFileFormat::Webm: return "WebM";
     default: return "unknown";
   }
 }
@@ -83,6 +85,7 @@ VideoFileFormat detect_video_file(ConstByteView data) {
   if (data.size() >= 12 && starts_with(data, "RIFF") && data[8] == 'A' && data[9] == 'V' && data[10] == 'I' && data[11] == ' ') return VideoFileFormat::Avi;
   if (starts_with(data, "YUV4MPEG2 ")) return VideoFileFormat::Y4m;
   if (looks_like_mp4(data)) return VideoFileFormat::Mp4;
+  if (looks_like_webm(data)) return VideoFileFormat::Webm;
   const ImageFormat image = detect_image_format(data);
   if (image == ImageFormat::Gif) return VideoFileFormat::Gif;
   if (image == ImageFormat::Png && is_apng(data)) return VideoFileFormat::Apng;

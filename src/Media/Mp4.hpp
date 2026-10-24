@@ -36,7 +36,7 @@ struct Mp4Track {
   uint32_t object_type = 0;       // from the esds descriptor (0x40 AAC, 0x6B MPEG-1 audio, ...), 0 if there is none
   uint32_t width = 0, height = 0; // video
   uint32_t channels = 0, sample_rate = 0;  // audio, as the sample entry says
-  ConstByteView config;           // AudioSpecificConfig (esds) or the avcC record; points into the file
+  ConstByteView config;           // AudioSpecificConfig (esds) the avcC / av1C record; points into the file
   uint32_t sample_count = 0;
   ArrayView<uint64_t> offsets;    // where each sample is in the file
   ArrayView<uint32_t> sizes;

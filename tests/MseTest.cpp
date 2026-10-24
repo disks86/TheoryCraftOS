@@ -689,6 +689,84 @@ static double picture_difference(const graphics::Surface& surface, const File& r
   return static_cast<double>(total) / (static_cast<double>(surface.width) * surface.height * 3);
 }
 
+// WebM beyond ffmpeg's muxer: VP8, compressed frames, and the encryption of the WebM standard (AES-CTR, the key named in the track, frames partitioned or whole or left clear).
+static void test_webm_more() {
+  TestAllocator a;
+  {
+  File plain("tests/data/webm_vp9_opus.webm"), zlibbed("tests/data/webm_zlib.webm"), enc("tests/data/webm_enc.webm"), arf("tests/data/webm_vp8_arf.webm");
+  CHECK(plain.ok() && zlibbed.ok() && enc.ok() && arf.ok());
+  if (!plain.ok() || !zlibbed.ok() || !enc.ok() || !arf.ok()) return;
+  // the parts of a plan, as files
+  auto parts = [&](MseBuffer& b, MseSnapshotPlan plan, ByteBuffer* video_file, ByteBuffer* sound_file) {
+    MseSnapshotPlan v = plan, s = plan;
+    v.part = 1;
+    s.part = 2;
+    return b.snapshot(&v, video_file) && b.snapshot(&s, sound_file);
+  };
+  ByteBuffer ref_video(a), ref_sound(a);
+  {
+    MseBuffer b(a, MseFormat::Webm, 1);
+    MseSnapshotPlan plan;
+    CHECK(b.append(plain.view(), 0) == MseAppend::Ok && b.has_video() && b.track_count() == 2 && b.plan(300000, &plan) && parts(b, plan, &ref_video, &ref_sound));
+    CHECK(ref_video.size() > 1000 && ref_sound.size() > 1000);
+  }
+  {   // deflated frames come out as the same file
+    MseBuffer b(a, MseFormat::Webm, 1);
+    MseSnapshotPlan plan;
+    ByteBuffer video_file(a), sound_file(a);
+    CHECK(append_pieces(b, zlibbed.view(), 61) == MseAppend::Ok && b.plan(300000, &plan) && parts(b, plan, &video_file, &sound_file));
+    CHECK(same_bytes(video_file, ref_video) && same_bytes(sound_file, ref_sound));
+  }
+  {   // encrypted: announced with the key identifier, held back until the key is there, then the same files
+    for (uint64_t piece : {uint64_t{1000000}, uint64_t{1}, uint64_t{97}}) {
+      MseBuffer b(a, MseFormat::Webm, 1);
+      CHECK(append_pieces(b, enc.view(), piece) == MseAppend::Ok && b.has_protected_frames() && b.has_video());
+      UniquePointer<MseBuffer::EncryptedEvent> e;
+      CHECK(b.take_encrypted(&e));
+      if (e) CHECK(e->kind == 2 && !e->keyids && e->data.size() == 16 && memcmp(e->data.view().data(), kKid1, 16) == 0);
+      CHECK(!b.take_encrypted(&e));   // (both tracks use the key: one announcement)
+      MseSnapshotPlan plan;
+      uint8_t missing[16] = {};
+      ClearKeyStore none(a);
+      CHECK(b.plan_for(300000, &plan, &none, missing) == MsePlan::NeedKey && memcmp(missing, kKid1, 16) == 0);
+      ClearKeyStore wrong(a);
+      wrong.add_key(1, kKid1, kKey2);
+      {
+        MseBuffer w(a, MseFormat::Webm, 1);
+        ByteBuffer garbage_video(a), garbage_sound(a);
+        MseSnapshotPlan wp;
+        CHECK(append_pieces(w, enc.view(), piece) == MseAppend::Ok && w.plan_for(300000, &wp, &wrong, missing) == MsePlan::Ok && w.decrypt(wrong, wp, missing) == MseDecrypt::Ok);
+        CHECK(parts(w, wp, &garbage_video, &garbage_sound) ? !same_bytes(garbage_video, ref_video) : true);
+      }
+      ClearKeyStore keys(a);
+      keys.add_key(1, kKid1, kKey1);
+      ByteBuffer video_file(a), sound_file(a);
+      CHECK(b.plan_for(300000, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok && parts(b, plan, &video_file, &sound_file));
+      CHECK(same_bytes(video_file, ref_video) && same_bytes(sound_file, ref_sound));
+    }
+  }
+  {   // VP8, hidden frames and all: an MP4 file with a 'vp08' track, which the player opens
+    MseBuffer b(a, MseFormat::Webm, 1);
+    MseSnapshotPlan plan;
+    ByteBuffer mp4(a);
+    CHECK(b.append(arf.view(), 0) == MseAppend::Ok && b.has_video() && b.width() == 64 && b.height() == 48 && b.plan(100000, &plan) && b.snapshot(&plan, &mp4));
+    Mp4File file(a);
+    CHECK(file.open(mp4.view()));
+    const Mp4Track* t = file.find(Mp4TrackKind::Video);
+    CHECK(t && t->codec == 0x76703038 && t->sample_count == 25);   // (the last frame has no duration, and waits for the one after it)
+    NoPci pci;
+    hardware::SystemVideoCodecs codecs(pci, a);
+    codecs.initialize();
+    FakeClock clock;
+    video::VideoPlayer player(clock, codecs, a);
+    CHECK(player.open_media(mp4.view()) == video::OpenResult::Ok && player.frame_width() == 64 && player.frame_count() == 25);
+    player.seek(player.duration_us() / 2);
+    CHECK(player.picture() != nullptr);
+  }
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_webm() {
   TestAllocator a;
   MseFormat f;
@@ -697,7 +775,8 @@ static void test_webm() {
   CHECK(mse_type_supported("video/webm; codecs=\"vp09.00.10.08\"", &f, &video) && video);
   CHECK(mse_type_supported("audio/webm; codecs=\"opus\"", &f, &video) && !video && mse_type_supported("audio/webm; codecs=vorbis", &f, &video));
   CHECK(mse_type_supported("video/webm", &f, &video) && video);
-  CHECK(!mse_type_supported("video/webm; codecs=\"vp8\"", &f, &video) && !mse_type_supported("video/webm; codecs=\"av01.0.04M.08\"", &f, &video));
+  CHECK(mse_type_supported("video/webm; codecs=\"vp8, vorbis\"", &f, &video) && video && !mse_type_supported("audio/webm; codecs=\"vp8\"", &f, &video));
+  CHECK(!mse_type_supported("video/webm; codecs=\"theora\"", &f, &video));
   CHECK(!mse_type_supported("audio/webm; codecs=\"vp9\"", &f, &video) && !mse_type_supported("video/webm; codecs=\"vp9, mp4a.40.2\"", &f, &video));
   File webm("tests/data/mse_webm.webm"), live("tests/data/mse_live.webm"), vp9("tests/data/mse_vp9.webm"), opus("tests/data/mse_opus.webm"), vorbis("tests/data/mse_vorbis.webm");
   CHECK(webm.ok() && live.ok() && vp9.ok() && opus.ok() && vorbis.ok());
@@ -871,6 +950,7 @@ int main() {
   test_keys();
   test_encryption();
   test_webm();
+  test_webm_more();
   test_hub();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

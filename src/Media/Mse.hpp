@@ -19,8 +19,8 @@
 // The engine behind the Media Source Extensions: what a page's MediaSource and SourceBuffer objects do with the bytes they are given. No script, no
 // element in here, so it can be tested on its own (tests/MseTest.cpp).
 //
-//   byte stream formats    WebM (EBML clusters of VP9 video, Opus and Vorbis sound; blocks with or without lacing; segments and clusters of unknown size, as live
-//                          streams have), fragmented MP4 ("video/mp4", "audio/mp4": an initialization segment with the movie box, then moof + mdat pairs; any
+//   byte stream formats    WebM (EBML clusters of VP8, VP9 or AV1 video, Opus and Vorbis sound; blocks with or without lacing; header-stripped or zlib frames; WebM
+//                          encryption, AES-CTR with the key named in the track; segments and clusters of unknown size, as live streams have), fragmented MP4 ("video/mp4", "audio/mp4": an initialization segment with the movie box, then moof + mdat pairs; any
 //                          number of tracks), MPEG audio ("audio/mpeg", "audio/mp3": layers I-III of MPEG-1, 2 and 2.5, ID3 tags skipped) and AAC in
 //                          ADTS ("audio/aac"). A MseParser cuts the bytes into coded frames - in pieces of any size, a segment can be split anywhere.
 //   MseBuffer              a SourceBuffer's frames, kept as the standard's coded frame processing says: timestampOffset and the append window,
@@ -87,7 +87,7 @@ struct MseSampleCrypto {
 
 // What file the machine's players are given for a track (see MseBuffer::snapshot()).
 enum MseContainer : uint8_t {
-  kContainerMp4 = 0,      // an MP4 file (H.264 or VP9 video, AAC or MP3 sound)
+  kContainerMp4 = 0,      // an MP4 file (H.264, VP8, VP9 or AV1 video, AAC or MP3 sound)
   kContainerRaw = 1,      // the frames one after the other (MPEG audio, ADTS)
   kContainerOpus = 2,     // Ogg Opus
   kContainerVorbis = 3,   // Ogg Vorbis
@@ -236,10 +236,12 @@ class MseBuffer final : private IMseSink {
   MsePlan plan_for(int64_t time_us, MseSnapshotPlan* out, const IMseKeys* keys, uint8_t* missing_kid) const;
   // Decrypts, in place, the frames a plan covers (what snapshot() then writes is in the clear).
   MseDecrypt decrypt(const IMseKeys& keys, const MseSnapshotPlan& plan, uint8_t* missing_kid);
-  // Init data for the "encrypted" event: false when there is none waiting. `keyids` says the data is a {"kids":[...]} JSON text instead of 'pssh' boxes.
+  // Init data for the "encrypted" event: false when there is none waiting. `kind` says what the data is: 0 'pssh' boxes ("cenc"), 1 a {"kids":[...]} JSON text
+  // ("keyids", `keyids` is set), 2 one 16 byte key identifier, as WebM streams announce them ("webm").
   struct EncryptedEvent {
     explicit EncryptedEvent(allocators::IAllocator& a) : data(a) {}
     bool keyids = false;
+    uint8_t kind = 0;
     ByteBuffer data;
   };
   bool take_encrypted(UniquePointer<EncryptedEvent>* out);
@@ -265,7 +267,7 @@ class MseBuffer final : private IMseSink {
   void protection_data(ConstByteView pssh_boxes) override;
 
   bool add_frame(uint32_t slot, int64_t pts, int64_t dts, int64_t duration, bool sync, ConstByteView data, const MseSampleCrypto* crypto);
-  void queue_encrypted(bool keyids, ConstByteView data);
+  void queue_encrypted(uint8_t kind, ConstByteView data);
   void forget_aux(const Frame& f);
   void remove_overlap(uint32_t slot, int64_t pts, int64_t duration);
   void erase_frames(uint32_t slot, uint64_t first, uint64_t last);   // [first, last)

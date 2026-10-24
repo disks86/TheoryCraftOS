@@ -135,7 +135,7 @@ bool parse_stbl(allocators::IAllocator& allocator, ConstByteView d, uint64_t sta
         t->height = be16(d, entry.body + 26);
         Box child;
         for (uint64_t c = entry.body + 78; read_box(d, c, entry.end, &child); c = child.end)
-          if (child.type == fourcc("avcC") || child.type == fourcc("hvcC")) t->config = d.subview(child.body, child.end - child.body);
+          if (child.type == fourcc("avcC") || child.type == fourcc("hvcC") || child.type == fourcc("av1C")) t->config = d.subview(child.body, child.end - child.body);
       }
     } else if (b.type == fourcc("stts")) stts = b.body;
     else if (b.type == fourcc("ctts")) ctts = b.body;

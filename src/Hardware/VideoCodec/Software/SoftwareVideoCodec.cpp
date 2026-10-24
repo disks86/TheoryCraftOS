@@ -21,6 +21,8 @@
 #include "Hardware/VideoCodec/Software/H264.hpp"
 #include "Hardware/VideoCodec/Software/H264Encoder.hpp"
 #include "Hardware/VideoCodec/Software/Jpeg.hpp"
+#include "Hardware/VideoCodec/Software/Av1.hpp"
+#include "Hardware/VideoCodec/Software/Vp8.hpp"
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 
@@ -168,6 +170,50 @@ class H264Adapter final : public IVideoDecoder {
   VideoCodecStatistics stats_;
 };
 
+// Decodes VP8: a packet is one frame (as WebM and IVF store them); a picture comes out per packet that shows one.
+class Vp8Adapter final : public IVideoDecoder {
+ public:
+  Vp8Adapter(allocators::IAllocator& allocator, const DecoderConfig& config) : config_(config), dec_(allocator), out_(allocator) {}
+
+  VideoCodec codec() const override { return VideoCodec::Vp8; }
+  SubmitResult submit(const VideoPacket& packet) override {
+    if (dec_.ready()) return SubmitResult::Full;
+    if (!dec_.decode(packet.data, packet.pts_us)) {
+      ++stats_.errors;
+      return SubmitResult::Invalid;
+    }
+    ++stats_.packets;
+    stats_.bytes += packet.data.size();
+    return SubmitResult::Accepted;
+  }
+  bool receive(VideoFrame* frame) override {
+    VideoFrame in;
+    if (!dec_.receive(&in)) return false;
+    if (!out_.allocate({in.format.width, in.format.height, config_.output}) || !convert_frame(in, out_)) {
+      ++stats_.errors;
+      return false;
+    }
+    *frame = out_.frame(in.pts_us, in.keyframe);
+    frame->limited_range = in.limited_range && config_.output != PixelFormat::Bgra8888;
+    ++stats_.frames;
+    return true;
+  }
+  void flush() override { dec_.flush(); }
+  void reset() override { dec_.reset(); }
+  VideoFormat output_format() const override {
+    VideoFormat f = dec_.output_format();
+    f.pixel_format = config_.output;
+    return f;
+  }
+  VideoCodecStatistics statistics() const override { return stats_; }
+
+ private:
+  DecoderConfig config_;
+  Vp8Decoder dec_;
+  VideoFrameBuffer out_;
+  VideoCodecStatistics stats_;
+};
+
 // Decodes VP9: packets are frames or superframes (as WebM and IVF store them); a picture comes out per packet that shows one.
 class Vp9Adapter final : public IVideoDecoder {
  public:
@@ -208,6 +254,52 @@ class Vp9Adapter final : public IVideoDecoder {
  private:
   DecoderConfig config_;
   Vp9Decoder dec_;
+  VideoFrameBuffer out_;
+  VideoCodecStatistics stats_;
+};
+
+// Decodes AV1: packets are temporal units (as MP4, WebM and IVF store them); a picture comes out per packet that shows one.
+class Av1Adapter final : public IVideoDecoder {
+ public:
+  Av1Adapter(allocators::IAllocator& allocator, const DecoderConfig& config) : config_(config), dec_(allocator), out_(allocator) {}
+
+  bool prepare() { return config_.codec_config.empty() || dec_.configure(config_.codec_config); }
+
+  VideoCodec codec() const override { return VideoCodec::Av1; }
+  SubmitResult submit(const VideoPacket& packet) override {
+    if (dec_.ready()) return SubmitResult::Full;
+    if (!dec_.decode(packet.data, packet.pts_us)) {
+      ++stats_.errors;
+      return SubmitResult::Invalid;
+    }
+    ++stats_.packets;
+    stats_.bytes += packet.data.size();
+    return SubmitResult::Accepted;
+  }
+  bool receive(VideoFrame* frame) override {
+    VideoFrame in;
+    if (!dec_.receive(&in)) return false;
+    if (!out_.allocate({in.format.width, in.format.height, config_.output}) || !convert_frame(in, out_)) {
+      ++stats_.errors;
+      return false;
+    }
+    *frame = out_.frame(in.pts_us, in.keyframe);
+    frame->limited_range = in.limited_range && config_.output != PixelFormat::Bgra8888;
+    ++stats_.frames;
+    return true;
+  }
+  void flush() override { dec_.flush(); }
+  void reset() override { dec_.reset(); }
+  VideoFormat output_format() const override {
+    VideoFormat f = dec_.output_format();
+    f.pixel_format = config_.output;
+    return f;
+  }
+  VideoCodecStatistics statistics() const override { return stats_; }
+
+ private:
+  DecoderConfig config_;
+  Av1Decoder dec_;
   VideoFrameBuffer out_;
   VideoCodecStatistics stats_;
 };
@@ -363,7 +455,13 @@ UniquePointer<IVideoDecoder> SoftwareVideoCodec::create_decoder(const DecoderCon
     if (avc && avc->prepare()) return UniquePointer<IVideoDecoder>(util::move(avc));
     return UniquePointer<IVideoDecoder>();
   }
+  if (config.codec == VideoCodec::Vp8) return UniquePointer<IVideoDecoder>(UniquePointer<Vp8Adapter>::make(allocator_, allocator_, config));
   if (config.codec == VideoCodec::Vp9) return UniquePointer<IVideoDecoder>(UniquePointer<Vp9Adapter>::make(allocator_, allocator_, config));
+  if (config.codec == VideoCodec::Av1) {
+    UniquePointer<Av1Adapter> av1 = UniquePointer<Av1Adapter>::make(allocator_, allocator_, config);
+    if (av1 && av1->prepare()) return UniquePointer<IVideoDecoder>(util::move(av1));
+    return UniquePointer<IVideoDecoder>();
+  }
   if (config.codec == VideoCodec::Raw) {
     UniquePointer<RawDecoder> raw = UniquePointer<RawDecoder>::make(allocator_, allocator_, config);
     if (raw && raw->prepare()) return UniquePointer<IVideoDecoder>(util::move(raw));

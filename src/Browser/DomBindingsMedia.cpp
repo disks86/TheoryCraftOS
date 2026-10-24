@@ -460,12 +460,33 @@ NATIVE(el_can_play_type) {
   if (!arg_text(vm, arg_at(args, argc, 0), &type)) return false;
   const StringView t = type.view();
   dom::Node* n = this_node(vm, self);
-  bool maybe = t.starts_with("video/mp4") || t.starts_with("video/quicktime") || t.starts_with("video/x-msvideo") || t.starts_with("image/gif");
+  bool maybe = t.starts_with("video/mp4") || t.starts_with("video/quicktime") || t.starts_with("video/x-msvideo") || t.starts_with("image/gif") ||
+               t.starts_with("video/webm") || t.starts_with("video/x-matroska");
   if (n && n->is_tag("audio")) {
     maybe = false;
     for (const char* ok : {"audio/mpeg", "audio/mp3", "audio/mp4", "audio/x-m4a", "audio/aac", "audio/ogg", "audio/flac", "audio/wav", "audio/wave", "audio/x-wav", "audio/aiff",
-                           "audio/x-aiff", "audio/basic", "audio/midi", "audio/x-midi"})
+                           "audio/x-aiff", "audio/basic", "audio/midi", "audio/x-midi", "audio/webm", "audio/opus", "audio/x-matroska", "video/webm"})
       if (t.starts_with(ok)) maybe = true;
+  }
+  // A WebM type with a codecs list is only as good as its codecs: the ones WebM carries that this machine decodes.
+  if (maybe && (t.starts_with("video/webm") || t.starts_with("audio/webm") || t.starts_with("video/x-matroska") || t.starts_with("audio/x-matroska"))) {
+    const uint64_t at = t.find("codecs");
+    if (at != StringView::npos) {
+      StringView list = t.substr(at + 6);
+      uint64_t q = 0;
+      while (q < list.size() && (list[q] == '=' || list[q] == ' ' || list[q] == '"' || list[q] == '\'')) ++q;
+      list = list.substr(q);
+      uint64_t i = 0;
+      while (i < list.size() && list[i] != '"' && list[i] != '\'') {
+        uint64_t j = i;
+        while (j < list.size() && list[j] != ',' && list[j] != '"' && list[j] != '\'') ++j;
+        const StringView codec = list.substr(i, j - i).trimmed();
+        const bool known = codec.equals_ignore_case("vp8") || codec.equals_ignore_case("vp9") || codec.starts_with("vp09.") || codec.starts_with("av01.") ||
+                           codec.equals_ignore_case("opus") || codec.equals_ignore_case("vorbis");
+        if (!codec.empty() && !known) maybe = false;
+        i = j + 1;
+      }
+    }
   }
   *result = str_value(vm, maybe ? (t.contains("codecs") ? "probably" : "maybe") : "");
   return true;

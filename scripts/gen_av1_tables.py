@@ -85,8 +85,8 @@ SMALL = [
 SCANS = ['4x4', '4x8', '4x16', '8x4', '8x8', '8x16', '8x32', '16x4', '16x8', '16x16', '16x32', '32x8', '32x16', '32x32']
 QMS = SCANS[:]  # the same sizes (qm_tbl_WxH)
 
-prog = ['#include "config.h"', '#include <stdio.h>', '#include <stddef.h>', '#include "src/internal.h"', '#include "src/tables.h"',
-        '#include "src/cdf.c"', '#include "src/scan.c"', '#include "src/qm.c"',
+prog = ['#include "config.h"', '#include <stdio.h>', '#include <stddef.h>', '#include "src/internal.h"', '#include "src/tables.h"', '#include "src/dequant_tables.h"',
+        '#include "src/cdf.c"', '#include "src/ref.h"', 'Dav1dRef *dav1d_ref_create_using_pool(Dav1dMemPool *const pool, size_t size) { return 0; }', 'void dav1d_ref_dec(Dav1dRef **const pref) {}', '#include "src/scan.c"', '#include "src/qm.c"',
         'static void dump_u(const char*type,const char*name,const char*dims,const void*p,size_t count,size_t esz,int sgn){',
         '  printf("static const %s %s%s = {",type,name,dims);',
         '  for(size_t i=0;i<count;i++){ if(i%16==0) printf("\\n "); long long v=0;',
@@ -98,14 +98,22 @@ prog = ['#include "config.h"', '#include <stdio.h>', '#include <stddef.h>', '#in
 for name, t, dims in SMALL:
     sg = 1 if t.startswith('int') else 0
     esz = 2 if '16' in t else 1
-    prog.append('  dump_u("%s","k_%s","%s",dav1d_%s,sizeof(dav1d_%s)/%d,%d,%d);' % (t, name, '', name, name, esz, esz, sg))
+    rank = dims.count('[')
+    a = 'dav1d_' + name
+    fmt, args = '', []
+    for i in range(rank):
+        outer = a + '[0]' * i
+        inner = a + '[0]' * (i + 1) if i + 1 < rank else None
+        args.append('sizeof(%s)/%s' % (outer, ('sizeof(%s)' % inner) if inner else ('sizeof(%s[0]%s)' % (a, '[0]' * (rank - 1)) if False else 'sizeof(%s)' % (a + '[0]' * rank))))
+        fmt += '[%zu]'
+    prog.append('  { char d[64]; snprintf(d, sizeof d, "%s", %s); dump_u("%s","k_%s",d,%s,sizeof(%s)/%d,%d,%d); }' % (fmt, ', '.join(args), t, name, a, a, esz, esz, sg))
     prog.append('  printf("// %s: %s\\n");' % (name, dims))
 for s in SCANS:
-    prog.append('  dump_u("uint16_t","k_scan_%s","",scan_%s,sizeof(scan_%s)/2,2,0);' % (s, s, s))
+    prog.append('  dump_u("uint16_t","k_scan_%s","[]",scan_%s,sizeof(scan_%s)/2,2,0);' % (s, s, s))
 for s in QMS:
-    prog.append('  dump_u("uint8_t","k_qm_tbl_%s","",qm_tbl_%s,sizeof(qm_tbl_%s),1,0);' % (s, s, s))
-prog.append('  dump_u("uint16_t","k_default_cdf","",&default_cdf,sizeof(default_cdf)/2,2,0);')
-prog.append('  dump_u("uint16_t","k_default_coef_cdf","",default_coef_cdf,sizeof(default_coef_cdf)/2,2,0);')
+    prog.append('  dump_u("uint8_t","k_qm_tbl_%s","[]",qm_tbl_%s,sizeof(qm_tbl_%s),1,0);' % (s, s, s))
+prog.append('  dump_u("uint16_t","k_default_cdf","[]",&default_cdf,sizeof(default_cdf)/2,2,0);')
+prog.append('  dump_u("uint16_t","k_default_coef_cdf","[]",default_coef_cdf,sizeof(default_coef_cdf)/2,2,0);')
 prog.append('  printf("constexpr unsigned kDefaultCdfWords = %zu, kDefaultCoefCdfWords = %zu, kCdfModeBytes = %zu, kCdfCoefBytes = %zu, kCdfMvBytes = %zu, kCdfContextBytes = %zu;\\n", sizeof(default_cdf)/2, sizeof(default_coef_cdf[0])/2, sizeof(CdfModeContext), sizeof(CdfCoefContext), sizeof(CdfMvContext), sizeof(CdfContext));')
 prog.append('  printf("constexpr unsigned kDefaultCdfMvJointOffset = %zu, kDefaultCdfMvCompOffset = %zu, kDefaultCdfKfymOffset = %zu;\\n", offsetof(CdfDefaultContext, mv.joint), offsetof(CdfDefaultContext, mv.comp), offsetof(CdfDefaultContext, kfym));')
 prog.append('  return 0; }')

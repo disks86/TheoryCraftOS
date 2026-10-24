@@ -939,6 +939,30 @@ static void test_h264_fuzz() {
   CHECK(a.live == 0);
 }
 
+// The player on AV1: an MP4 (made by ffmpeg from tests/data/av1_inter.ivf, whose sequence header is in the 'av1C' box and the first sample).
+static void test_av1_player() {
+  TestAllocator a;
+  {
+    NoPci pci;
+    hardware::SystemVideoCodecs codecs(pci, a);
+    codecs.initialize();
+    FakeClock clock;
+    video::VideoPlayer player(clock, codecs, a);
+    File file("tests/data/av1.mp4");
+    CHECK(file.data != nullptr);
+    if (file.data) {
+      CHECK(player.open_media(file.view()) == video::OpenResult::Ok);
+      CHECK(player.frame_count() == 14 && player.frame_width() == 95 && player.frame_height() == 63);
+      const uint32_t order[] = {3, 13, 5, 0, 7, 7, 1};
+      for (uint32_t f : order) {
+        player.seek(int64_t{f} * 100000 + 5000);
+        CHECK(player.current_frame() == f && player.picture() != nullptr && player.picture()->width == 95);
+      }
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 // The player on H.264: an MP4 with B frames (frames decoded out of order and shown in order) and an AVI.
 static void test_h264_player() {
   TestAllocator a;
@@ -1046,6 +1070,7 @@ int main() {
   test_player_media();
   test_h264();
   test_h264_player();
+  test_av1_player();
   test_fuzz();
   test_h264_fuzz();
   if (g_failed) {

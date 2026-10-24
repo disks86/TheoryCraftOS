@@ -29,6 +29,7 @@
 #include "Media/ByteSource.hpp"
 #include "Media/Image.hpp"
 #include "Media/Mp4.hpp"
+#include "Media/Webm.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Video/AviFile.hpp"
 
@@ -40,11 +41,11 @@ enum class OpenResult : uint8_t {
   Ok,
   NotAvi,       // not an AVI file, or no video in it
   Unsupported,  // open_media(): not a video format this OS reads (see media::VideoFileFormat)
-  NoDecoder,    // no video codec device can decode this stream (H.265, VP9 and AV1 need a hardware engine driver)
+  NoDecoder,    // no video codec device can decode this stream (H.265 needs a hardware engine driver)
   OutOfMemory,
 };
 
-// Plays an AVI file (or, with open_media(), an MP4 / MOV file with H.264 or VP9 video, or a GIF, APNG, animated WebP or Y4M file -
+// Plays an AVI file (or, with open_media(), an MP4 / MOV file with H.264, VP9 or AV1 video, a WebM / Matroska file with VP8, VP9 or AV1 video and Opus or Vorbis sound, or a GIF, APNG, animated WebP or Y4M file -
 // decoded up front into frames that carry their own durations, and silent): the picture through a video decoder session from the machine's codec devices,
 // the sound (if the file has PCM audio and a mixer is given) through an audio::AudioPlayer. The sound is the clock
 // while it plays - the picture follows it, skipping frames when decoding falls behind - and with no sound the picture
@@ -56,7 +57,7 @@ class VideoPlayer {
   VideoPlayer(const hardware::IClock& clock, hardware::SystemVideoCodecs& codecs, allocators::IAllocator& allocator,
               audio::AudioMixer* mixer = nullptr)
       : clock_(clock), codecs_(codecs), allocator_(allocator), mixer_(mixer), file_(allocator), images_(allocator), frame_starts_(allocator),
-        packet_(allocator), mp4_(allocator), y4m_head_(allocator), y4m_frame_(allocator), seq_dec_of_rank_(allocator), seq_rank_of_dec_(allocator),
+        packet_(allocator), mp4_(allocator), y4m_head_(allocator), y4m_frame_(allocator), webm_(allocator), seq_dec_of_rank_(allocator), seq_rank_of_dec_(allocator),
         seq_times_(allocator), seq_sync_(allocator), display_(allocator) {}
   ~VideoPlayer();
   VideoPlayer(const VideoPlayer&) = delete;
@@ -116,6 +117,7 @@ class VideoPlayer {
 
  private:
   static constexpr uint32_t kMaxCatchUpFrames = 12;
+  static constexpr uint32_t kHiddenFrameReach = 3;   // how many frames before the one wanted are shown anyway (frames that show nothing may follow them)
   static void service_main(void* self);
   void release();
   bool decode_frame(uint32_t index);
@@ -124,6 +126,7 @@ class VideoPlayer {
   uint32_t frame_at_time(int64_t time_us) const;
   OpenResult open_images();
   OpenResult open_mp4(media::IByteSource& source);
+  OpenResult open_webm(media::IByteSource& source);
   OpenResult finish_avi();
   bool open_y4m_stream(media::IByteSource& source, OpenResult* result);
   int64_t y4m_start_us(uint64_t frame) const { return static_cast<int64_t>((frame * 1000 * y4m_rate_den_ / y4m_rate_num_) * 1000); }
@@ -132,6 +135,7 @@ class VideoPlayer {
   bool seq_packet(uint32_t decode_index, hardware::VideoPacket* packet) const;
   bool seq_build_avi();
   bool seq_build_mp4(const media::Mp4Track& track);
+  bool seq_build_webm(const media::WebmTrack& track);
   void seq_clear();
   void open_audio();
   void start_audio(audio::IPcmSource* source);
@@ -159,10 +163,14 @@ class VideoPlayer {
   bool image_mode_ = false;
   // Streams whose pictures come out of the decoder later than they go in (H.264): packets are fed in decode order, and
   // the pictures come back in display order, each display position being a "frame" for the player.
-  enum class SeqSource : uint8_t { None, Avi, Mp4 };
+  enum class SeqSource : uint8_t { None, Avi, Mp4, Webm };
   SeqSource seq_source_ = SeqSource::None;
   media::Mp4File mp4_;
   const media::Mp4Track* mp4_track_ = nullptr;
+  media::WebmFile webm_;
+  const media::WebmTrack* webm_track_ = nullptr;
+  int64_t webm_origin_us_ = 0;       // the time of the first picture in the file: the video starts there
+  bool seq_one_to_one_ = false;      // a decoder that gives its picture (if the packet shows one) at once: a packet without a picture is a hidden frame
   List<uint32_t> seq_dec_of_rank_;  // decode index of the frame at each display position
   List<uint32_t> seq_rank_of_dec_;
   List<int64_t> seq_times_;         // when each display position starts, and the end after the last
