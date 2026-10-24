@@ -463,6 +463,8 @@ add_executable(BOOTX64
   src/Media/Mp4.cpp
   src/Media/Webm.cpp
   src/Media/WebVtt.cpp
+  src/Media/Dash.cpp
+  src/Media/DashClient.cpp
   src/Media/Audio/WebmAudio.cpp
   src/Media/MseParsers.cpp
   src/Media/MseBuffer.cpp

@@ -43,6 +43,7 @@
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
 #include "Kernel/Sync.hpp"
 #include "Media/Image.hpp"
+#include "Media/Dash.hpp"
 #include "Media/Eme.hpp"
 #include "Media/Mse.hpp"
 #include "Media/WebVtt.hpp"
@@ -54,6 +55,7 @@
 namespace browser {
 
 class MseClip;
+class DashEnvironmentFetcher;
 
 // A video the environment is playing for a page.
 class IVideoClip {
@@ -260,6 +262,9 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     String url, poster;
     int32_t poster_cache = -1;
     UniquePointer<IVideoClip> clip;
+    UniquePointer<media::DashClient> dash;   // plays a DASH manifest through `mse_source`
+    UniquePointer<DashEnvironmentFetcher> dash_fetcher;
+    uint32_t dash_source = 0;
     List<UniquePointer<TrackCue>> cues;
     uint64_t active_signature = 0;   // which of the cues were active at the last update()
     uint64_t track_signature = 0;    // of the <track> children (their serials and attributes), to tell script when they change
@@ -320,6 +325,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   void apply_rate(VideoSlot& v);
   void apply_volume(VideoSlot& v);
   void reanchor(VideoSlot& v);
+  void start_dash(VideoSlot& v, dom::Node* n, StringView address, IObjectEnvironment& env);
   void attach_mse(VideoSlot& v, dom::Node* n, uint32_t source, StringView address, IObjectEnvironment& env);
   void release_mse(VideoSlot& v);
   void watch_dynamic(VideoSlot& v);

@@ -1,18 +1,3 @@
-av1 av1_intra.ivf 64 48 3 6fc5990e78b3aded
-av1 av1_inter.ivf 95 63 14 dc23fb97afafa0c2
-av1 av1_tiles.ivf 520 72 4 ca81793f67aa858f
-av1 av1_sb128.ivf 200 136 4 eacf610dcf661f66
-av1 av1_lossless.ivf 48 32 4 e3f3b2233b2d03c5
-av1 av1_qm.ivf 96 64 4 8248e74d136b2b61
-av1 av1_segments.ivf 128 80 8 8535029415d1721e
-av1 av1_screen.ivf 128 96 4 f38c580ac31d7ea3
-av1 av1_superres.ivf 160 90 4 ddf0e0f5bef9f973
-av1 av1_resize.ivf 160 90 8 94bf623cd5f6c55f
-av1 av1_grain.ivf 96 64 4 ccac6461f7c04f97
-av1 av1_10bit.ivf 90 54 6 b1434116f2459f7f
-av1 av1_12bit.ivf 90 54 4 1d1bc089eb8ffaaf
-av1 av1_444.ivf 90 54 6 a3a590d476c593d8
-av1 av1_422.ivf 90 54 6 85104c5088d78a67
-av1 av1_mono.ivf 90 54 4 3db54be5531347a4
-av1 av1_svt.ivf 176 96 12 80c124c46b91ce83
-av1 av1_rav1e.ivf 128 72 8 81e8a5171051d8ab
+version https://git-lfs.github.com/spec/v1
+oid sha256:471d3ecc72fcaed79c3d2b66c8bca2b87a332fa9c377e0aaf1787b03d901f75b
+size 786
