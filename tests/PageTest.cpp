@@ -3175,6 +3175,33 @@ static void test_navigation() {
       page.unload();
       CHECK(std::string(page.log().data(), page.log().size()) == "visible false\nvisibilitychange hidden true\npagehide false hidden\nunload\n");
     }
+    // Page Visibility: the host says the page is in the background / shown again
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/", media, true);
+      page.load("<script>document.addEventListener('visibilitychange', function () { console.log('vc', document.visibilityState, document.hidden) }); "
+                "requestAnimationFrame(function () { console.log('raf1') });</script>");
+      page.set_visible(false);
+      page.set_visible(false);   // (no change: no event)
+      page.run_due_timers(1e12);
+      page.set_visible(true);
+      page.run_due_timers(2e12);
+      CHECK(std::string(page.log().data(), page.log().size()) == "vc hidden true\nvc visible false\nraf1\n");
+    }
+    CHECK(js("", "document.onvisibilitychange = function (e) { console.log('on', e.type, e.bubbles) }; document.dispatchEvent(new Event('visibilitychange', { bubbles: true }))", "on visibilitychange true"));
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/", media, true);
+      page.set_visible(false);   // (a tab opened in the background)
+      page.load("<script>console.log(document.visibilityState, document.hidden); var id = requestAnimationFrame(function () { console.log('never') }); requestAnimationFrame(function () { console.log('shown') }); cancelAnimationFrame(id);"
+                "document.addEventListener('visibilitychange', function () { console.log('vc', document.visibilityState) })</script>");
+      page.run_due_timers(1e12);
+      page.set_visible(true);
+      page.run_due_timers(2e12);
+      CHECK(std::string(page.log().data(), page.log().size()) == "hidden true\nvc visible\nshown\n");
+    }
     CHECK(a.live == 0);
   }
   // --- scrollRestoration, the referrer
@@ -3908,7 +3935,7 @@ static void test_fullscreen() {
     pump(6);
     const std::string out = page_log(page);
     CHECK(out.find("true  false function function exit:TypeError ") == 0);
-    CHECK(in_order(out, {"el doc:a:a entered true true true true", "el doc:a:null left  false", "el doc:a:a entered", "doc:undefined:null"}));
+    CHECK(in_order(out, {"el doc:a:a entered true true true true", "el doc:a:null left  false", "el doc:a:a entered", "doc:a:null"}));
     CHECK(out.find("detached:TypeError") != std::string::npos);
   }
   CHECK(a.live == 0);
@@ -3927,6 +3954,106 @@ static void test_fullscreen() {
     CHECK(page_log(page).find("false") == 0 && page_log(page).find("TypeError null") != std::string::npos && page_log(page).find("error event") != std::string::npos && env.fullscreen_entered == 0);
   }
   CHECK(a.live == 0);
+}
+
+// Fullscreen beyond the basics: it needs a gesture, elements nest, a removed element ends it, a frame may take part, display-mode, the old event names.
+static void test_fullscreen_more() {
+  const auto click_go = [](FakeEnvironment&, Page& page) { page.click(page.document().element_by_id("go")->serial, 1, 1); };
+  const char* body = "<div id=o><div id=i>inner</div></div><div id=x>other</div><button id=go>go</button>";
+  // no gesture, no fullscreen (and the error event); with one, it works
+  CHECK(clip_is(body, "addEventListener('load', function () { var o = document.getElementById('o'); o.addEventListener('fullscreenerror', function (e) { console.log('error event', e.target.id) });"
+                "o.requestFullscreen().catch(function (e) { console.log(e.name, e.message.indexOf('gesture') > 0, document.fullscreenElement) }) })",
+                "TypeError true null | error event o", nullptr, "https://app.example/p", nullptr, [](FakeEnvironment& env) { CHECK(env.fullscreen_entered == 0 && !env.is_fullscreen); }));
+  CHECK(clip_is(body, "addEventListener('load', function () { document.getElementById('go').onclick = function () { var o = document.getElementById('o');"
+                "o.requestFullscreen({ navigationUI: 'bogus' }).catch(function (e) { console.log('options', e.name); return o.requestFullscreen(5) }).catch(function (e) { console.log('arg', e.name); return o.requestFullscreen({ navigationUI: 'hide' }) })"
+                ".then(function () { console.log('entered', document.fullscreenElement.id) }) } })",
+                "options TypeError | arg TypeError | entered o", click_go));
+  // nesting: a descendant of the fullscreen element can go fullscreen as well; an unrelated element cannot; exitFullscreen() takes one step back
+  CHECK(clip_is(body, "addEventListener('load', function () { var o = document.getElementById('o'), i = document.getElementById('i'), x = document.getElementById('x');"
+                "document.addEventListener('fullscreenchange', function (e) { console.log('change', e.target.id, document.fullscreenElement && document.fullscreenElement.id, i.matches(':fullscreen'), o.matches(':fullscreen'), matchMedia('(display-mode: fullscreen)').matches) });"
+                "document.getElementById('go').onclick = function () { console.log(matchMedia('(display-mode: fullscreen)').matches);"
+                "o.requestFullscreen().then(function () { return x.requestFullscreen().catch(function (e) { console.log('x', e.name) }) }).then(function () { return i.requestFullscreen() })"
+                ".then(function () { console.log('inner', document.fullscreenElement.id); return document.exitFullscreen() }).then(function () { console.log('back to', document.fullscreenElement.id); return document.exitFullscreen() })"
+                ".then(function () { console.log('out', document.fullscreenElement) }) } })",
+                "false | change o o false true true | x TypeError | change i i true true true | inner i | change i o false true true | back to o | change o null false false false | out null", click_go, "https://app.example/p", nullptr,
+                [](FakeEnvironment& env) { CHECK(env.fullscreen_entered == 1 && env.fullscreen_left == 1 && !env.is_fullscreen); }));
+  // Escape (the window leaves by itself) takes every step back at once; the legacy names and handler properties work
+  CHECK(clip_is(body, "addEventListener('load', function () { var o = document.getElementById('o'), i = document.getElementById('i');"
+                "document.onfullscreenchange = function (e) { console.log('doc handler', e.target.id) }; i.onfullscreenchange = function () { console.log('el handler') };"
+                "document.addEventListener('webkitfullscreenchange', function (e) { console.log('webkit', e.type, document.webkitFullscreenElement && document.webkitFullscreenElement.id) });"
+                "document.getElementById('go').onclick = function () { o.webkitRequestFullscreen(); setTimeout(function () { i.requestFullscreen() }, 5) } })",
+                "doc handler o | webkit webkitfullscreenchange o | el handler | doc handler i | webkit webkitfullscreenchange i",
+                click_go));
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/p", media, true);
+      page.load((std::string("<html><body>") + body + "<script>var o = document.getElementById('o'), i = document.getElementById('i');"
+                 "document.addEventListener('fullscreenchange', function (e) { console.log('change', e.target.id, document.fullscreenElement && document.fullscreenElement.id) });"
+                 "document.getElementById('go').onclick = function () { o.requestFullscreen().then(function () { return i.requestFullscreen() }) }</script></body></html>").c_str());
+      auto pump = [&] {
+        for (int n = 0; n < 8; ++n) {
+          double due;
+          if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
+          page.run_due_timers(static_cast<double>(env.clock));
+        }
+      };
+      page.click(page.document().element_by_id("go")->serial, 1, 1);
+      pump();
+      CHECK(page.is_fullscreen() && env.is_fullscreen);
+      page.fullscreen_left();   // Escape
+      pump();
+      CHECK(!page.is_fullscreen() && page.fullscreen_element() == nullptr);
+      CHECK(page_log(page) == "change o o | change i i | change i null");
+      // the element is taken out of the page: fullscreen ends and the window goes back
+      page.click(page.document().element_by_id("go")->serial, 1, 1);
+      pump();
+      CHECK(page.is_fullscreen());
+      dom::remove_child(page.document().element_by_id("o")->parent, page.document().element_by_id("o"));
+      HtmlDocument doc(a);
+      page.render(&doc);
+      pump();
+      CHECK(!page.is_fullscreen() && env.fullscreen_left >= 1 && !env.is_fullscreen);
+      CHECK(page_log(page).find("change i null") != std::string::npos);
+    }
+    CHECK(a.live == 0);
+  }
+  // a frame: allowed with allowfullscreen, the <iframe> is the fullscreen element of the page around it
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/p", media, true);
+      page.load("<html><body><iframe id=fr allowfullscreen srcdoc=\"<div id=d>inner</div><button id=ib>Go</button><script>"
+                "document.getElementById('ib').addEventListener('click', function () { var d = document.getElementById('d'); parent.postMessage('enabled ' + document.fullscreenEnabled, '*');"
+                "d.requestFullscreen().then(function () { parent.postMessage('inner ' + document.fullscreenElement.id, '*') }, function (e) { parent.postMessage('inner error ' + e.name, '*') }) })</script>\"></iframe>"
+                "<iframe id=nofr srcdoc=\"<button id=nb>No</button><script>document.getElementById('nb').addEventListener('click', function () { parent.postMessage('plain ' + document.fullscreenEnabled, '*');"
+                "document.body.requestFullscreen().catch(function (e) { parent.postMessage('plain error ' + e.name, '*') }) })</script>\"></iframe>"
+                "<script>addEventListener('message', function (e) { console.log(e.data) }); document.addEventListener('fullscreenchange', function (e) { console.log('outer change', e.target.id, document.fullscreenElement && document.fullscreenElement.id) })</script></body></html>");
+      auto pump = [&] {
+        for (int n = 0; n < 8; ++n) {
+          double due;
+          if (page.next_timer(&due) && due > static_cast<double>(env.clock)) env.clock = static_cast<uint64_t>(due);
+          page.run_due_timers(static_cast<double>(env.clock));
+        }
+      };
+      page.click(node_of_text(page, "[ Go ]"), 0, 0);
+      pump();
+      CHECK(env.is_fullscreen && env.fullscreen_entered == 1 && page.is_fullscreen() && page.fullscreen_element() && page.fullscreen_element()->serial == serial_of(page, "fr"));
+      page.click(node_of_text(page, "[ No ]"), 0, 0);
+      pump();
+      const std::string out = page_log(page);
+      CHECK(out.find("enabled true") != std::string::npos && out.find("inner d") != std::string::npos && out.find("outer change fr fr") != std::string::npos);
+      CHECK(out.find("plain false") != std::string::npos && out.find("plain error TypeError") != std::string::npos && env.fullscreen_entered == 1);
+      page.fullscreen_left();
+      pump();
+      CHECK(!page.is_fullscreen());
+    }
+    CHECK(a.live == 0);
+  }
 }
 
 static void test_picture_in_picture() {
@@ -4263,6 +4390,7 @@ int main(int argc, char** argv) {
   test_dash_page();
   test_dashjs();
   test_fullscreen();
+  test_fullscreen_more();
   test_picture_in_picture();
   test_platform();
   test_fetch_xhr_full();

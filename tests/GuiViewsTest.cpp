@@ -6679,6 +6679,10 @@ struct FakeLoader final : browser::IPageLoader {
       html = "<title>Img</title><button id=b>go</button><script>document.getElementById('b').onclick = function () { var blob; navigator.clipboard.read().then(function (items) { return items[0].getType('image/png') })"
              ".then(function (b) { blob = b; return navigator.clipboard.writeText('in between') }).then(function () { return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]) })"
              ".then(function () { document.title = 'png ' + (blob.size > 20) }, function (e) { document.title = 'failed ' + e.name }) }</script>";
+    if (address.equals("http://localhost/full"))
+      html = "<title>Full</title><div id=d>content</div><button id=b>go</button><script>var d = document.getElementById('d');"
+             "document.addEventListener('fullscreenchange', function () { document.title = 'fs ' + (document.fullscreenElement ? document.fullscreenElement.id : 'none') + ' ' + matchMedia('(display-mode: fullscreen)').matches });"
+             "document.getElementById('b').onclick = function () { d.requestFullscreen() }; document.title = 'enabled ' + document.fullscreenEnabled</script>";
     if (address.equals("http://js.test/app.js")) {
       r->content_type.assign("application/javascript");
       html = "document.write('<p>from file</p>'); var answer = 6 * 7; document.write('<p>' + answer + '</p>');";
@@ -7163,6 +7167,58 @@ static void test_web_clipboard() {
   CHECK(a.live == 0);
 }
 
+// Fullscreen in the browser window: the page's request takes the window's title bar, menu, toolbar, status bar and the tab strip away; Escape brings them back.
+static void test_web_fullscreen() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    FakeLoader loader;
+    d.set_page_loader(&loader);
+    Window& w = d.window();
+    desktop::WebBrowser* b = d.open_web_browser();
+    auto* host = static_cast<gui::TabFrame*>(b->host());
+    put(host, {20, 20, 600, 400});
+    w.layout();
+    CHECK(b->navigate("http://localhost/full") && b->title().equals("Web Browser - enabled true"));
+    CHECK(!b->fullscreen() && b->menu_bar().visible() && host->state() == Frame::State::Normal && host->strip_rect().width > 0);
+    const Rect2D before = host->bounds();
+    const int32_t small_view = b->page().viewport_width();
+    int32_t x = 0, y = 0;
+    CHECK(text_point(*b, "go", &x, &y));
+    click(w, x, y);
+    b->tick(1000000);
+    CHECK(b->fullscreen());
+    CHECK(host->fullscreen());
+    CHECK(!b->menu_bar().visible());
+    CHECK(host->state() == Frame::State::Maximized && host->strip_rect().width == 0 && host->client_rect().y == 0);
+    CHECK(b->title().equals("Web Browser - fs d true"));
+    w.render();
+    // the element covers the page area of the window
+    CHECK(b->page().viewport_width() > small_view);   // (the page got the room)
+    // Escape leaves: everything comes back, and the page hears of it
+    press(w, key::kEscape);
+    b->tick(2000000);
+    b->tick(3000000);
+    CHECK(!b->fullscreen());
+    CHECK(!host->fullscreen());
+    CHECK(b->menu_bar().visible());
+    CHECK(host->state() == Frame::State::Normal);
+    CHECK(host->strip_rect().width > 0);
+    CHECK(host->bounds().width == before.width && host->bounds().height == before.height);
+    CHECK(b->title().equals("Web Browser - fs none false"));
+    // a new page takes the window back as well
+    CHECK(text_point(*b, "go", &x, &y));
+    click(w, x, y);
+    b->tick(4000000);
+    CHECK(b->fullscreen());
+    CHECK(b->navigate("http://localhost/full") && !b->fullscreen() && b->menu_bar().visible());
+  }
+  CHECK(a.live == 0);
+}
+
 // Browsers are tabs like the other programs: "+" opens another, they are dragged between windows, and a session brings them back.
 static void test_web_browser_tabs() {
   TestAllocator a;
@@ -7301,6 +7357,7 @@ int main() {
   test_web_form();
   test_web_navigation();
   test_web_clipboard();
+  test_web_fullscreen();
   test_web_browser_media();
   test_web_browser_tabs();
   test_database_query();

@@ -258,6 +258,8 @@ class DomBindings {
   void set_current_script(dom::Node* script);
   // document.readyState, and the window's numbers (innerWidth ...) from the media environment.
   void set_ready_state(StringView state);
+  // document.hidden / visibilityState before any script runs (no event); later changes go through the page's __page_visibility hook.
+  void set_hidden(bool hidden);
   void update_window_metrics();
   // Looks at the media queries that matchMedia gave out: those whose answer changed get their change listeners called. Returns how many changed.
   uint32_t media_changed();

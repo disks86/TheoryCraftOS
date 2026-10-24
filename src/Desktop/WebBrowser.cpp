@@ -23,6 +23,7 @@
 #include "Media/ImageCodecs.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
+#include "Gui/Windows/TabFrame.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Audio/AudioPlayer.hpp"
 #include "Media/AudioStreaming.hpp"
@@ -286,6 +287,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   pointer_handler_ = {&WebBrowser::on_pointer, this};
   resize_handler_ = {&WebBrowser::on_view_resized, this};
   timer_handler_ = {&WebBrowser::on_timers, this};
+  visibility_handler_ = {&WebBrowser::on_visibility, this};
   key_handler_ = {&WebBrowser::on_form_key, this};
   page_.on_node_clicked(Handler::immediate(&WebBrowser::route_node, this));
   page_.on_pointer_changed(Handler::immediate(&WebBrowser::route_pointer, this));
@@ -836,6 +838,7 @@ void WebBrowser::show(Fetched& page) {
   pip_window_.dismiss();     // (and a video that was in its own window)
   defer_fullscreen_ = 0;
   live_ = UniquePointer<browser::Page>::make(allocator(), allocator(), env_, page.address.view(), media_, scripts);
+  if (live_) live_->set_visible(__atomic_load_n(&page_shown_, __ATOMIC_ACQUIRE));
   if (!live_) ok = false;
   else {
     if (history_.current() && history_.current()->has_state) live_->set_history_state(history_.current()->state.view(), true);
@@ -1014,6 +1017,12 @@ void WebBrowser::on_form_key(void* self, Control&) {
   namespace key = hardware::key;
   KeyArgs args;
   while (b->page_.take_key(&args)) {
+    if (args.usage == key::kEscape && b->fullscreen_) {   // (Escape leaves fullscreen first, wherever the focus is; the page does not get the key)
+      b->apply_fullscreen(false);
+      if (b->live_) b->live_->fullscreen_left();
+      b->settle();
+      continue;
+    }
     if (!b->live_) {
       b->page_.scroll_key(args);
       continue;
@@ -1075,8 +1084,29 @@ uint64_t WebBrowser::page_clock_ms() {
   return clock_base_unix_ + (up - clock_base_up_);
 }
 
+// Is the page on show: its tab is the selected one of its window (or it has a window of its own) and that window is not minimized?
+bool WebBrowser::window_shown() {
+  gui::Frame* window = host() ? host() : this;
+  if (window->state() == gui::Frame::State::Minimized) return false;
+  const gui::TabFrame* tabs = window->as_tabs();
+  return !host() || !tabs || tabs->selected() == this;
+}
+
+void WebBrowser::on_visibility(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (b->live_) b->live_->set_visible(__atomic_load_n(&b->page_shown_, __ATOMIC_ACQUIRE));
+  b->settle();
+}
+
 void WebBrowser::tick(uint64_t uptime_us) {
   __atomic_store_n(&uptime_ms_, uptime_us / 1000, __ATOMIC_RELEASE);
+  if (manager()) {   // (a window that is not open yet counts as shown)
+    const bool shown = window_shown();
+    if (shown != __atomic_load_n(&page_shown_, __ATOMIC_ACQUIRE)) {
+      __atomic_store_n(&page_shown_, shown, __ATOMIC_RELEASE);
+      queue(visibility_handler_, *this, true);
+    }
+  }
   if (pip_window_.showing()) {   // the picture moves on; a window that was resized is noticed
     pip_window_.refresh();
     if (pip_window_.picture_width() != pip_w_ || pip_window_.picture_height() != pip_h_) queue(pip_handler_, *this, true);
@@ -1448,13 +1478,7 @@ void WebBrowser::apply_fullscreen(bool on) {
   menu_.set_visible(!on);
   toolbar_.set_visible(!on);
   status_bar_.set_visible(!on);
-  if (on) {
-    fullscreen_maximized_ = state() != State::Maximized;
-    if (fullscreen_maximized_) maximize();
-  } else if (fullscreen_maximized_) {
-    fullscreen_maximized_ = false;
-    if (state() == State::Maximized) maximize();
-  }
+  set_fullscreen(on);   // (the window: no title bar, border or tab strip, covering the desktop's area)
   UiGuard lock(this);
   invalidate();
 }

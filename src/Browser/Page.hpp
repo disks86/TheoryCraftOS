@@ -213,6 +213,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool before_unload();
   // The page is going away: `visibilitychange` (hidden), `pagehide`, `unload`.
   void unload();
+  // The page is shown to the user (true) or not - its tab is in the background, its window minimized: document.hidden / visibilityState follow, `visibilitychange` fires
+  // when that changes, and requestAnimationFrame callbacks wait while it is hidden. Frames of the page follow. May be called before load().
+  void set_visible(bool visible);
+  bool visible() const { return !hidden_; }
   // Has the page set history.scrollRestoration to "manual"?
   bool scroll_restoration_manual();
   // The fragment of the page's address is scrolled to when the page is next drawn (after load, and a fragment change).
@@ -360,12 +364,19 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
  public:
   // The window left fullscreen by itself (the user pressed Escape): the page is told (fullscreenchange).
   void fullscreen_left();
+  bool is_fullscreen() const { return fullscreen_stack_.count() > 0; }
   // The user closed the Picture-in-Picture window / changed its size.
   void pip_left();
   void pip_resized(uint32_t width, uint32_t height);
  private:
   void clear_fullscreen();
-  uint32_t fullscreen_serial_ = 0, pip_serial_ = 0;
+  // Takes out the fullscreen elements that left the document (the window goes back when none is left; `fullscreenchange` follows).
+  void prune_fullscreen();
+  void sync_fullscreen_media();
+  void fire_fullscreen_change(dom::Node* target);
+  bool frame_allows_fullscreen(uint32_t frame_serial);
+  List<uint32_t> fullscreen_stack_;   // the elements shown fullscreen, the innermost last (requestFullscreen() on a descendant of the fullscreen element nests)
+  uint32_t pip_serial_ = 0;
   void toggle_details(dom::Node* details);
   void close_dialog_text(dom::Node* dialog, StringView value);
   bool fire(dom::Node* target, StringView type, bool bubbles = true, bool cancelable = false, dom::Node* submitter = nullptr);
@@ -400,6 +411,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   int32_t scroll_request_ = -1;
   String referrer_;
   bool fragment_pending_ = false;
+  bool hidden_ = false;   // see set_visible()
   uint32_t scroll_node_ = 0;   // an element scrollIntoView() was called on: its place is worked out when the page is drawn
   uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
   struct Message {
