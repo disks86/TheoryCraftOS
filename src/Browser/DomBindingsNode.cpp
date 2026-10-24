@@ -383,7 +383,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     *out = str_value(vm, text.view());
     return true;
   }
-  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("canvas")) && media_get(c, n, k, out)) return true;
+  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("canvas") || n->is_tag("track")) && media_get(c, n, k, out)) return true;
   if (IS("type") && !dom::has_attribute(n, "type")) {
     if (n->is_tag("input")) { *out = str_value(vm, "text"); return true; }
     if (n->is_tag("button")) { *out = str_value(vm, "submit"); return true; }
@@ -432,7 +432,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     throw_dom_error(vm, e);
     return HostClass::Set::Threw;
   };
-  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("canvas"))) {
+  if (element && (n->is_tag("img") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("canvas") || n->is_tag("track"))) {
     const HostClass::Set handled = media_set(c, n, k, value);
     if (handled != HostClass::Set::NotHandled) return handled;
   }

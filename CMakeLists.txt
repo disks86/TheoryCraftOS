@@ -240,6 +240,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsWindow.cpp
   src/Browser/DomBindingsMedia.cpp
   src/Browser/DomBindingsMse.cpp
+  src/Browser/DomBindingsTracks.cpp
   src/Browser/DomBindingsForm.cpp
   src/Browser/DomBindingsNet.cpp
   src/Browser/WebPrelude.cpp
@@ -461,6 +462,7 @@ add_executable(BOOTX64
   src/Media/Audio/Mp4Audio.cpp
   src/Media/Mp4.cpp
   src/Media/Webm.cpp
+  src/Media/WebVtt.cpp
   src/Media/Audio/WebmAudio.cpp
   src/Media/MseParsers.cpp
   src/Media/MseBuffer.cpp

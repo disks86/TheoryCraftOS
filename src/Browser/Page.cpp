@@ -395,6 +395,11 @@ void Page::deliver_object_events() {
       bindings_->call_hook("__mse_event", args, 2);
       continue;
     }
+    if (StringView(e.type).equals("__tt")) {   // the text tracks of a video: its <track> children changed, or the cues that are active did
+      const DomBindings::HookArg arg = DomBindings::HookArg::of(static_cast<double>(e.serial));
+      bindings_->call_hook("__tt_event", &arg, 1);
+      continue;
+    }
     dom::Node* n = doc_.by_serial(e.serial);
     if (!n) continue;
     EventInit init;

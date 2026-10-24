@@ -309,8 +309,35 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
       else *out = str_value(vm, "");
       return true;
     }
-    if (IS("videoTracks") || IS("audioTracks") || IS("textTracks")) { *out = Value::make_object(vm.new_array()); return true; }
+    if (IS("textTracks")) {   // a TextTrackList: made by the page's built-in script
+      Value make;
+      *out = Value::make_object(vm.new_array());
+      if (vm.get_named(Value::make_object(vm.global()), "__text_tracks", &make) && Vm::is_callable(make)) {
+        const Value arg = node_value(c, n);
+        Value list;
+        if (vm.call(make, Value(), &arg, 1, &list)) {
+          *out = list;
+        } else {
+          String ignored(vm.allocator());
+          vm.take_exception(&ignored);
+        }
+      }
+      return true;
+    }
+    if (IS("videoTracks") || IS("audioTracks")) { *out = Value::make_object(vm.new_array()); return true; }
     return false;
+  }
+  if (n->is_tag("track")) {   // kind, src, srclang, label, default, readyState and track: the page's built-in script knows
+    if (!(IS("kind") || IS("src") || IS("srclang") || IS("label") || IS("default") || IS("readyState") || IS("track"))) return false;
+    Value get;
+    if (!vm.get_named(Value::make_object(vm.global()), "__track_get", &get) || !Vm::is_callable(get)) return false;
+    const Value call_args[2] = {node_value(c, n), str_value(vm, k)};
+    if (!vm.call(get, Value(), call_args, 2, out)) {
+      String ignored(vm.allocator());
+      vm.take_exception(&ignored);
+      return false;
+    }
+    return true;
   }
   if (n->is_tag("canvas")) {
     if (IS("width")) { *out = num_value(attribute_size(n, "width", 300)); return true; }
@@ -322,6 +349,14 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
 
 HostClass::Set media_set(DomBindings::Impl& c, dom::Node* n, StringView k, const Value& value) {
   Vm& vm = c.vm;
+  if (n->is_tag("track")) {
+    if (!(IS("kind") || IS("src") || IS("srclang") || IS("label") || IS("default"))) return HostClass::Set::NotHandled;
+    Value set;
+    if (!vm.get_named(Value::make_object(vm.global()), "__track_set", &set) || !Vm::is_callable(set)) return HostClass::Set::NotHandled;
+    const Value call_args[3] = {node_value(c, n), str_value(vm, k), value};
+    Value ignored;
+    return vm.call(set, Value(), call_args, 3, &ignored) ? HostClass::Set::Handled : HostClass::Set::Threw;
+  }
   if (n->is_tag("video") || n->is_tag("audio")) {
     if (IS("currentTime")) {
       double d;
