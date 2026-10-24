@@ -484,6 +484,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
+  src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.cpp
   src/Hardware/VideoCodec/AMD/AmdMediaEngineHw.cpp
   src/Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.cpp
   src/Hardware/VideoCodec/Intel/IntelMediaEngineHw.cpp
