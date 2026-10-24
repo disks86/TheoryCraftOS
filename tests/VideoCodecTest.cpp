@@ -1596,6 +1596,70 @@ static void test_amd_vcn_firmware() {
   CHECK(a.live == 0);
 }
 
+// Registers and a clock for the engine-level start test: UVD_STATUS (dword 0x7E00 + 0x5AF) reads IDLE when the fake VCPU is "running", everything else reads zero.
+struct VcnStatusRegisters final : IVcnRegisters {
+  bool answers = true;
+  int writes = 0;
+  uint32_t read(uint32_t dword) override { return dword == 0x7E00 + 0x5AF && answers ? 2u : 0u; }
+  void write(uint32_t, uint32_t) override { ++writes; }
+};
+struct SteppingClock final : IClock {
+  mutable uint64_t t = 0;
+  uint64_t now_us() const override { t += 50; return t; }
+  const char* name() const override { return "stepping clock"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+};
+
+// The engine starts VCN 1.0 on request, says so in the boot log, and goes back to sleep when stopped.
+static void test_amd_vcn_start() {
+  TestAllocator a;
+  HostFirmwareFileSystem fs(a);
+  std::vector<uint32_t> block, rings;
+  AmdVcn1::Memory memory;
+  auto prepare = [&](const AmdVcnVideoEngine& engine) {
+    block.assign(AmdVcn1::block_bytes(engine.firmware()) / 4, 0xFFFFFFFFu);
+    rings.assign(AmdVcn1::kRingsTotalBytes / 4, 0xFFFFFFFFu);
+    memory.block_gpu_address = 0x280000000ull; memory.block = MmioRegion(reinterpret_cast<uint64_t>(block.data()), block.size() * 4);
+    memory.rings_gpu_address = 0x270000000ull; memory.rings = MmioRegion(reinterpret_cast<uint64_t>(rings.data()), rings.size() * 4);
+  };
+  SteppingClock clock;
+  AmdVcn1::Config config;
+  config.gb_addr_config = 0x26013041;
+  {
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    VcnStatusRegisters regs;
+    CHECK(raven.initialize() && !raven.engine_running());
+    CHECK(raven.start_engine(regs, clock, memory, config) == AmdVcn1::Status::BadFirmware && regs.writes == 0);   // no firmware loaded yet
+    CHECK(raven.load_firmware(fs) && strstr(raven.firmware_status(), "engine not started"));
+    prepare(raven);
+    CHECK(raven.start_engine(regs, clock, memory, config) == AmdVcn1::Status::Ok && raven.engine_running() && regs.writes == 69);   // the driver's start sequence in this configuration: 69 register writes (AmdVcn1Test checks them one by one)
+    CHECK(strstr(raven.firmware_status(), "engine started, idle; nothing decodes on it yet") && strstr(raven.engine_summary(), "engine started"));
+    CHECK(raven.info().hardware_engine && !raven.info().accelerated && raven.info().accelerated_decode_codecs == 0);   // nothing is decoded on it
+    const int before = regs.writes;
+    raven.stop_engine();
+    CHECK(!raven.engine_running() && regs.writes > before && strstr(raven.firmware_status(), "engine stopped"));
+    const int after = regs.writes;
+    raven.stop_engine();   // nothing to stop
+    CHECK(regs.writes == after);
+  }
+  {
+    // A VCPU that never answers: the start fails, the engine is put back to sleep, and the log says so.
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    VcnStatusRegisters regs;
+    regs.answers = false;
+    CHECK(raven.initialize() && raven.load_firmware(fs));
+    prepare(raven);
+    CHECK(raven.start_engine(regs, clock, memory, config) == AmdVcn1::Status::TimedOut && !raven.engine_running());
+    CHECK(strstr(raven.firmware_status(), "engine start failed: the VCPU did not answer") && !raven.info().accelerated);
+    // A block that is too small is refused before anything is written to the card.
+    VcnStatusRegisters other;
+    memory.block = MmioRegion(memory.block.address(), 4096);
+    CHECK(raven.start_engine(other, clock, memory, config) == AmdVcn1::Status::BadMemory && other.writes == 0 && strstr(raven.firmware_status(), "bad memory block"));
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_amd_discovery_engine() {
   TestAllocator a;
   std::vector<uint32_t> vram = amd_fake_vram();
@@ -1647,6 +1711,7 @@ int main() {
   test_intel_arc_engine();
   test_amd_media_engine();
   test_amd_vcn_firmware();
+  test_amd_vcn_start();
   test_amd_discovery_engine();
   test_amd_system_window();
   test_amd_card_memory();

@@ -20,9 +20,11 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcn1.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Utility/FixedString.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace hardware {
 
@@ -65,31 +67,45 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     if (!name) return false;
     firmware_name_ = name;
     firmware_state_ = firmware_.load(file_system, name);
-    firmware_text_.assign(name);
-    firmware_text_.append(": ");
-    if (firmware_state_ == AmdFirmwareStatus::Ok) {
-      const AmdVcnFirmwareVersion v = firmware_.version();
-      firmware_text_.append("ENC ");
-      firmware_text_.append_uint(v.enc_major);
-      firmware_text_.append(".");
-      firmware_text_.append_uint(v.enc_minor);
-      firmware_text_.append(" DEC ");
-      firmware_text_.append_uint(v.dec);
-      firmware_text_.append(" revision ");
-      firmware_text_.append_uint(v.revision);
-      firmware_text_.append(", ");
-      firmware_text_.append_uint(firmware_.ucode().size());
-      firmware_text_.append(" bytes of microcode loaded, engine not started");
-    } else {
-      firmware_text_.append(amd_firmware_status_name(firmware_state_));
-      firmware_text_.append(" (expected /firmware/");
-      firmware_text_.append(name);
-      firmware_text_.append(")");
-    }
+    engine_note_ = "engine not started";
+    rebuild_firmware_text();
     refresh_summary();
     return firmware_state_ == AmdFirmwareStatus::Ok;
   }
   const char* firmware_status() const override { return firmware_text_.c_str(); }
+
+  // Starts VCN 1.0 with the loaded microcode (AmdVcn1: the driver's start sequence). The caller supplies what only it can know - the memory the engine may use,
+  // as the GPU addresses it, and the GPU's address configuration - and the registers and a clock that outlive the engine. A wrong address makes the engine's DMA
+  // hit whatever is there, so nothing in the OS calls this yet. The engine is only brought up and left idle: no decode path exists, and info().accelerated stays false.
+  AmdVcn1::Status start_engine(IVcnRegisters& registers, const IClock& clock, const AmdVcn1::Memory& memory, const AmdVcn1::Config& config) {
+    if (!firmware_.loaded()) return AmdVcn1::Status::BadFirmware;
+    stop_engine();
+    vcn1_ = UniquePointer<AmdVcn1>::make(allocator_, registers, clock);
+    if (!vcn1_) return AmdVcn1::Status::NoMemory;
+    const AmdVcn1::Status status = vcn1_->start(firmware_, memory, config);
+    if (status == AmdVcn1::Status::Ok) {
+      engine_note_ = "engine started, idle; nothing decodes on it yet";
+    } else {
+      vcn1_.reset();
+      engine_note_ = status == AmdVcn1::Status::TimedOut ? "engine start failed: the VCPU did not answer" :
+                     status == AmdVcn1::Status::BadMemory ? "engine start refused: bad memory block" :
+                     status == AmdVcn1::Status::BadFirmware ? "engine start refused: unusable firmware" : "engine start failed: out of memory";
+    }
+    rebuild_firmware_text();
+    refresh_summary();
+    return status;
+  }
+  // Puts the engine back to sleep. Safe when it was never started.
+  void stop_engine() {
+    if (vcn1_) {
+      vcn1_->stop();
+      vcn1_.reset();
+      engine_note_ = "engine stopped";
+      rebuild_firmware_text();
+      refresh_summary();
+    }
+  }
+  bool engine_running() const { return vcn1_ != nullptr; }
   const AmdVcnFirmware& firmware() const { return firmware_; }
   AmdFirmwareStatus firmware_state() const { return firmware_state_; }
 
@@ -127,6 +143,32 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   }
 
  private:
+  // "<file>: ENC 1.15 DEC 3 revision 9, 369120 bytes of microcode loaded, <what became of the engine>", or why the file is not usable.
+  void rebuild_firmware_text() {
+    firmware_text_.assign(firmware_name_ ? firmware_name_ : "");
+    firmware_text_.append(": ");
+    if (firmware_state_ == AmdFirmwareStatus::Ok) {
+      const AmdVcnFirmwareVersion v = firmware_.version();
+      firmware_text_.append("ENC ");
+      firmware_text_.append_uint(v.enc_major);
+      firmware_text_.append(".");
+      firmware_text_.append_uint(v.enc_minor);
+      firmware_text_.append(" DEC ");
+      firmware_text_.append_uint(v.dec);
+      firmware_text_.append(" revision ");
+      firmware_text_.append_uint(v.revision);
+      firmware_text_.append(", ");
+      firmware_text_.append_uint(firmware_.ucode().size());
+      firmware_text_.append(" bytes of microcode loaded, ");
+      firmware_text_.append(engine_note_);
+    } else {
+      firmware_text_.append(amd_firmware_status_name(firmware_state_));
+      firmware_text_.append(" (expected /firmware/");
+      firmware_text_.append(firmware_name_ ? firmware_name_ : "");
+      firmware_text_.append(")");
+    }
+  }
+
   void refresh_summary() {
     summary_.assign(gpu_.name);
     if (status_.probed) {
@@ -187,7 +229,9 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   AmdVcnFirmware firmware_;
   AmdFirmwareStatus firmware_state_ = AmdFirmwareStatus::NotApplicable;
   const char* firmware_name_ = nullptr;
-  FixedString<160> firmware_text_;
+  FixedString<200> firmware_text_;
+  const char* engine_note_ = "engine not started";
+  UniquePointer<AmdVcn1> vcn1_;
   MmioRegion registers_;
   uint64_t memory_bar_ = 0;
   PciAddress address_{};
