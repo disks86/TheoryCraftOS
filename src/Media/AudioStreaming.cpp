@@ -388,6 +388,7 @@ UniquePointer<audio::IPcmSource> open_audio_stream(IByteSource& source, allocato
     case AudioFileFormat::Mp3: return open_mp3_stream(source, allocator);
     case AudioFileFormat::Aac: return open_aac_stream(source, allocator);
     case AudioFileFormat::Mp4: return open_mp4_audio_stream(source, allocator);
+    case AudioFileFormat::Webm: return open_webm_audio_stream(source, allocator);
     case AudioFileFormat::Midi: return midi::open_midi_stream(source, allocator);   // (in software; the media player offers MIDI hardware first)
     default: return none;
   }

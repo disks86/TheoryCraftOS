@@ -27,8 +27,10 @@ namespace hardware {
 //   - raw pictures (I420, NV12 or Bgra8888 frames one after the other), and
 //   - H.264 / AVC: Baseline profile I and P pictures (see H264Encoder.hpp), and decodes
 //   - H.264 / AVC of the progressive Baseline, Main and High profiles (see H264.hpp), and
-//   - VP9 of all four profiles (see Vp9.hpp),
-// at any size up to VideoFormat::kMaxDimension. Codecs that need a real decode engine (H.265, AV1) are not
+//   - VP8 of all four versions (see Vp8.hpp),
+//   - VP9 of all four profiles (see Vp9.hpp), and
+//   - AV1 of all three profiles (see Av1.hpp),
+// at any size up to VideoFormat::kMaxDimension. Codecs that need a real decode engine (H.265) are not
 // offered: the engines in GPUs and media chips are not driven by this OS yet, and they are the only way those
 // are served. The vendor classes (NvidiaVideoEngine, AmdVcnVideoEngine, IntelMediaEngine) are this device plus the
 // knowledge that such an engine is on the machine.
@@ -38,7 +40,7 @@ class SoftwareVideoCodec : public IVideoCodecDevice {
     info_.hardware_engine = hardware_engine;
     info_.accelerated = false;
     info_.encode_codecs = codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264);
-    info_.decode_codecs = info_.encode_codecs | codec_mask(VideoCodec::Vp9);
+    info_.decode_codecs = info_.encode_codecs | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Vp8);
     info_.max_width = info_.max_height = VideoFormat::kMaxDimension;
   }
 

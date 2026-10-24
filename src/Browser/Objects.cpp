@@ -86,7 +86,7 @@ bool supported_video_type(StringView type) {
   if (type.empty()) return true;
   const uint64_t semi = type.find(';');
   if (semi != StringView::npos) type = type.first(semi).trimmed();
-  for (const char* ok : {"video/mp4", "video/quicktime", "video/x-m4v", "video/x-msvideo", "video/avi", "video/msvideo", "image/gif", "image/apng", "image/png", "image/webp", "video/x-yuv4mpeg"})
+  for (const char* ok : {"video/mp4", "video/quicktime", "video/x-m4v", "video/x-msvideo", "video/avi", "video/msvideo", "video/webm", "video/x-matroska", "image/gif", "image/apng", "image/png", "image/webp", "video/x-yuv4mpeg"})
     if (type.equals_ignore_case(ok)) return true;
   return false;
 }
@@ -98,7 +98,7 @@ bool supported_audio_type(StringView type) {
   if (semi != StringView::npos) type = type.first(semi).trimmed();
   for (const char* ok : {"audio/mpeg", "audio/mp3", "audio/mpeg3", "audio/x-mpeg", "audio/mp4", "audio/x-m4a", "audio/m4a", "audio/aac", "audio/aacp", "audio/ogg", "audio/vorbis",
                          "application/ogg", "audio/flac", "audio/x-flac", "audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave", "audio/aiff", "audio/x-aiff", "audio/basic",
-                         "audio/midi", "audio/x-midi", "audio/mid", "audio/sp-midi"})
+                         "audio/midi", "audio/x-midi", "audio/mid", "audio/sp-midi", "audio/webm", "audio/opus", "audio/x-matroska", "video/webm", "video/x-matroska"})
     if (type.equals_ignore_case(ok)) return true;
   return false;
 }

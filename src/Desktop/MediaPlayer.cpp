@@ -31,7 +31,7 @@ using filesystem::OpenMode;
 using filesystem::Status;
 
 namespace {
-const char kMediaExtensions[] = "wav;aif;aiff;au;flac;ogg;mp3;aac;m4a;mid;midi;kar;rmi;avi;mp4;m4v;mov;gif;apng;webp;y4m";
+const char kMediaExtensions[] = "wav;aif;aiff;au;flac;ogg;mp3;aac;m4a;mid;midi;kar;rmi;avi;mp4;m4v;mov;webm;mkv;weba;mka;opus;gif;apng;webp;y4m";
 const FileDialog::Filter kFilters[] = {{"Media files", kMediaExtensions}, {"All files", "*"}};
 }  // namespace
 
@@ -175,8 +175,8 @@ bool MediaPlayer::open_source() {
   uint8_t head[16384];
   const uint64_t got = source.read(0, ByteView(head, source.size() < sizeof head ? source.size() : sizeof head));
   const media::AudioFileFormat format = media::detect_audio_format(ConstByteView(head, got));
-  // Sound first, except MP4 (which may hold a movie): that is tried as video, then as sound.
-  const bool try_video = format == media::AudioFileFormat::Unknown || format == media::AudioFileFormat::Mp4;
+  // Sound first, except MP4 and WebM (which may hold a movie): that is tried as video, then as sound.
+  const bool try_video = format == media::AudioFileFormat::Unknown || format == media::AudioFileFormat::Mp4 || format == media::AudioFileFormat::Webm;
   video::OpenResult video_result = video::OpenResult::Unsupported;
   if (try_video && video_player_) {
     video_result = video_player_->open_media(source);

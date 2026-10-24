@@ -452,7 +452,7 @@ NATIVE(eme_set_keys) {
   return true;
 }
 
-// The init data found in the stream of a SourceBuffer since the last call, for "encrypted" events: type (0 "cenc", 1 "keyids") and a byte array, one after the other.
+// The init data found in the stream of a SourceBuffer since the last call, for "encrypted" events: type (0 "cenc", 1 "keyids", 2 "webm") and a byte array, one after the other.
 NATIVE(mse_encrypted) {
   (void)self;
   ID(0, buffer);
@@ -465,7 +465,7 @@ NATIVE(mse_encrypted) {
       const ConstByteView data = e->data.view();
       JsObject* bytes = make_byte_array(impl(vm), StringView(reinterpret_cast<const char*>(data.data()), data.size()));
       if (!bytes) return vm.throw_error(ErrorKind::RangeError, "Out of memory");
-      vm.array_push(array, num_value(e->keyids ? 1 : 0));
+      vm.array_push(array, num_value(e->kind));
       vm.array_push(array, Value::make_object(bytes));
     }
   }

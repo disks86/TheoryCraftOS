@@ -336,7 +336,7 @@ const char* type_of_name(StringView name) {
   } kTypes[] = {{"txt", "text/plain"}, {"html", "text/html"}, {"htm", "text/html"}, {"css", "text/css"}, {"js", "text/javascript"}, {"json", "application/json"},
                 {"xml", "application/xml"}, {"csv", "text/csv"}, {"png", "image/png"}, {"jpg", "image/jpeg"}, {"jpeg", "image/jpeg"}, {"gif", "image/gif"},
                 {"bmp", "image/bmp"}, {"webp", "image/webp"}, {"svg", "image/svg+xml"}, {"pdf", "application/pdf"}, {"zip", "application/zip"}, {"wav", "audio/wav"},
-                {"mp3", "audio/mpeg"}, {"mp4", "video/mp4"}};
+                {"mp3", "audio/mpeg"}, {"mp4", "video/mp4"}, {"webm", "video/webm"}, {"mkv", "video/x-matroska"}, {"weba", "audio/webm"}, {"opus", "audio/opus"}};
   for (const auto& t : kTypes)
     if (ext.equals_ignore_case(t.ext)) return t.type;
   return "application/octet-stream";

@@ -23,8 +23,8 @@
 namespace hardware {
 
 // What a video stream is compressed with. Raw is uncompressed frames in one of the PixelFormats.
-enum class VideoCodec : uint8_t { Raw, Mjpeg, H264, Hevc, Vp9, Av1 };
-constexpr uint32_t kVideoCodecCount = 6;
+enum class VideoCodec : uint8_t { Raw, Mjpeg, H264, Hevc, Vp9, Av1, Vp8 };
+constexpr uint32_t kVideoCodecCount = 7;
 constexpr uint32_t codec_mask(VideoCodec codec) { return 1u << static_cast<uint8_t>(codec); }
 const char* codec_name(VideoCodec codec);
 

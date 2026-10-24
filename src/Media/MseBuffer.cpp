@@ -17,6 +17,7 @@
  */
 
 // A SourceBuffer's frames: the coded frame processing of the Media Source Extensions, the buffered ranges, and the files written for the players.
+#include "Media/OggWriter.hpp"
 #include "Media/Mse.hpp"
 #include "Crypto/Crypto.hpp"
 #include "Utility/ByteStream.hpp"
@@ -503,7 +504,12 @@ bool MseBuffer::init_segment(UniquePointer<MseInit> init) {
     bool any_protected = false;
     for (const MseTrackInfo& t : init->tracks.view()) any_protected = any_protected || t.protection.is_protected;
     if (init->pssh.size() > 0) {
-      queue_encrypted(false, init->pssh.view());
+      queue_encrypted(0, init->pssh.view());
+    } else if (any_protected && format_ == MseFormat::Webm) {   // a WebM stream names its keys: one event for each
+      for (uint64_t ti = 0; ti < init->tracks.count(); ++ti) {
+        const MseTrackInfo& t = init->tracks[ti];
+        if (t.protection.is_protected) queue_encrypted(2, ConstByteView(t.protection.kid, 16));
+      }
     } else if (any_protected) {
       ByteBuffer json(allocator_);
       json.append(ConstByteView(reinterpret_cast<const uint8_t*>("{\"kids\":["), 9));
@@ -523,7 +529,7 @@ bool MseBuffer::init_segment(UniquePointer<MseInit> init) {
       }
       json.put8(']');
       json.put8('}');
-      queue_encrypted(true, json.view());
+      queue_encrypted(1, json.view());
     }
     if (inits_.count() >= 256) return false;
     if (!inits_.push_back(util::move(init))) return false;
@@ -747,21 +753,22 @@ void MseBuffer::forget_aux(const Frame& f) {
   if (protected_frames_ > 0) --protected_frames_;
 }
 
-void MseBuffer::queue_encrypted(bool keyids, ConstByteView data) {
+void MseBuffer::queue_encrypted(uint8_t kind, ConstByteView data) {
   for (const UniquePointer<ByteBuffer>& earlier : sent_.view()) {
     const ConstByteView e = earlier->view();
-    if (e.size() == data.size() + 1 && e[0] == (keyids ? 1 : 0) && __builtin_memcmp(e.data() + 1, data.data(), data.size()) == 0) return;   // (announced already)
+    if (e.size() == data.size() + 1 && e[0] == kind && __builtin_memcmp(e.data() + 1, data.data(), data.size()) == 0) return;   // (announced already)
   }
   auto note = UniquePointer<ByteBuffer>::make(allocator_, allocator_);
   auto event = UniquePointer<EncryptedEvent>::make(allocator_, allocator_);
-  if (!note || !event || !note->put8(keyids ? 1 : 0) || !note->append(data) || !event->data.append(data)) return;
-  event->keyids = keyids;
+  if (!note || !event || !note->put8(kind) || !note->append(data) || !event->data.append(data)) return;
+  event->keyids = kind == 1;
+  event->kind = kind;
   if (sent_.count() >= 16) sent_.remove_at(0);
   sent_.push_back(util::move(note));
   if (encrypted_.count() < 32) encrypted_.push_back(util::move(event));
 }
 
-void MseBuffer::protection_data(ConstByteView pssh_boxes) { queue_encrypted(false, pssh_boxes); }
+void MseBuffer::protection_data(ConstByteView pssh_boxes) { queue_encrypted(0, pssh_boxes); }
 
 bool MseBuffer::take_encrypted(UniquePointer<EncryptedEvent>* out) {
   if (encrypted_.count() == 0) return false;
@@ -1054,54 +1061,10 @@ MseDecrypt MseBuffer::decrypt(const IMseKeys& keys, const MseSnapshotPlan& plan,
 
 namespace {
 
-uint32_t ogg_crc(const uint8_t* data, uint64_t n) {
-  static uint32_t table[256];
-  static bool built = false;
-  if (!built) {
-    for (uint32_t i = 0; i < 256; ++i) {
-      uint32_t r = i << 24;
-      for (int k = 0; k < 8; ++k) r = (r & 0x80000000u) ? (r << 1) ^ 0x04C11DB7u : r << 1;
-      table[i] = r;
-    }
-    built = true;
-  }
-  uint32_t crc = 0;
-  for (uint64_t i = 0; i < n; ++i) crc = (crc << 8) ^ table[((crc >> 24) ^ data[i]) & 0xFF];
-  return crc;
-}
-
-void put_le(ByteBuffer* b, uint64_t v, int bytes) {
-  for (int i = 0; i < bytes; ++i) b->put8(static_cast<uint8_t>(v >> (8 * i)));
-}
-
-// One Ogg page of whole packets; false if their segments do not fit in a page.
 bool ogg_page(ByteBuffer* out, uint8_t type, int64_t granule, uint32_t serial, uint32_t sequence, const ConstByteView* packets, uint32_t count) {
-  uint8_t table[255];
-  uint32_t segments = 0;
-  for (uint32_t i = 0; i < count; ++i) {
-    const uint64_t size = packets[i].size();
-    const uint64_t full = size / 255;
-    if (segments + full + 1 > 255) return false;
-    for (uint64_t k = 0; k < full; ++k) table[segments++] = 255;
-    table[segments++] = static_cast<uint8_t>(size % 255);
-  }
-  const uint64_t start = out->size();
-  out->append(ConstByteView(reinterpret_cast<const uint8_t*>("OggS"), 4));
-  out->put8(0);
-  out->put8(type);
-  put_le(out, static_cast<uint64_t>(granule), 8);
-  put_le(out, serial, 4);
-  put_le(out, sequence, 4);
-  put_le(out, 0, 4);   // (the checksum, below)
-  out->put8(static_cast<uint8_t>(segments));
-  out->append(ConstByteView(table, segments));
-  for (uint32_t i = 0; i < count; ++i) out->append(packets[i]);
-  const ConstByteView page = out->view().subview(start);
-  const uint32_t crc = ogg_crc(page.data(), page.size());
-  for (int i = 0; i < 4; ++i)
-    if (!out->patch8(start + 22 + i, static_cast<uint8_t>(crc >> (8 * i)))) return false;
-  return true;
+  return ogg::page(out, type, granule, serial, sequence, packets, count);
 }
+void put_le(ByteBuffer* b, uint64_t v, int bytes) { ogg::put_le(b, v, bytes); }
 
 }  // namespace
 
@@ -1267,7 +1230,7 @@ bool MseBuffer::write_mp4(const MseSnapshotPlan& plan, ByteBuffer* out, int64_t*
     for (uint64_t k = 0; k < init.tracks.count(); ++k) {
       if (init.tracks[k].id == slots_[s]->id && init.tracks[k].kind == slots_[s]->kind) t.info = &init.tracks[k];
     }
-    // only the tracks this file is for: MP4 can carry H.264, VP9 and AAC / MP3; the part says picture or sound
+    // only the tracks this file is for: MP4 can carry H.264, VP9, AV1 and AAC / MP3; the part says picture or sound
     if (!t.info || t.info->container != kContainerMp4 || (plan.part == 1 && t.info->kind != MseTrackKind::Video) || (plan.part == 2 && t.info->kind != MseTrackKind::Audio)) {
       release_view(allocator_, t.indexes);
       continue;

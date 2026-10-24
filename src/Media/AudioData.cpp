@@ -34,6 +34,7 @@ const char* audio_format_name(AudioFileFormat format) {
     case AudioFileFormat::Opus: return "Ogg Opus";
     case AudioFileFormat::Mp4: return "MP4";
     case AudioFileFormat::Midi: return "MIDI";
+    case AudioFileFormat::Webm: return "WebM";
     case AudioFileFormat::Unknown: break;
   }
   return "unknown";
@@ -51,6 +52,8 @@ AudioFileFormat detect_audio_format(ConstByteView d) {
   if (starts("FORM", 0) && (starts("AIFF", 8) || starts("AIFC", 8))) return AudioFileFormat::Aiff;
   if (starts(".snd", 0)) return AudioFileFormat::Au;
   if (starts("fLaC", 0)) return AudioFileFormat::Flac;
+  // WebM / Matroska: the EBML header (the sound of the file is its Opus or Vorbis track).
+  if (d.size() >= 4 && d[0] == 0x1A && d[1] == 0x45 && d[2] == 0xDF && d[3] == 0xA3) return AudioFileFormat::Webm;
   // MP4/M4A: an 'ftyp' box right at the start (whether it has audio is for the decoder to say).
   if (starts("ftyp", 4)) return AudioFileFormat::Mp4;
   // AAC in ADTS framing: sync, layer 0, and a second header where the first frame ends.

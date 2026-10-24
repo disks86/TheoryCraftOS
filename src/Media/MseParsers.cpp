@@ -17,7 +17,9 @@
  */
 
 // The byte stream parsers of the Media Source Extensions (see Mse.hpp): fragmented MP4, MPEG audio and ADTS.
+#include "Media/Ebml.hpp"
 #include "Media/Mse.hpp"
+#include "Media/Zlib.hpp"
 #include "Utility/ByteStream.hpp"
 #include "Utility/Move.hpp"
 
@@ -742,80 +744,22 @@ class Mp4Parser final : public IMseParser {
 
 // --- WebM (Matroska): EBML elements ---------------------------------------------------------------------------------------------------------
 
-// The id of an EBML element (1-4 bytes, the length marker kept) and its size (1-8 bytes; `unknown` when all bits are 1, as live streams write). Result: 1 done,
-// 0 more bytes are needed, -1 it is not an element.
-int ebml_header(ConstByteView d, uint32_t* id, uint64_t* size, bool* unknown, uint32_t* length) {
-  if (d.empty()) return 0;
-  uint32_t id_length = 1;
-  while (id_length <= 4 && !(d[0] & (0x80 >> (id_length - 1)))) ++id_length;
-  if (id_length > 4) return -1;
-  if (d.size() < id_length + 1u) return 0;
-  uint32_t value = 0;
-  for (uint32_t i = 0; i < id_length; ++i) value = (value << 8) | d[i];
-  const uint8_t first = d[id_length];
-  uint32_t size_length = 1;
-  while (size_length <= 8 && !(first & (0x80 >> (size_length - 1)))) ++size_length;
-  if (size_length > 8) return -1;
-  if (d.size() < id_length + size_length) return 0;
-  uint64_t v = first & (0xFFu >> size_length);
-  bool all_ones = v == (0xFFu >> size_length);
-  for (uint32_t i = 1; i < size_length; ++i) {
-    v = (v << 8) | d[id_length + i];
-    all_ones = all_ones && d[id_length + i] == 0xFF;
-  }
-  *id = value;
-  *size = v;
-  *unknown = all_ones;
-  *length = id_length + size_length;
-  return 1;
-}
+int ebml_header(ConstByteView d, uint32_t* id, uint64_t* size, bool* unknown, uint32_t* length) { return ebml::header(d, id, size, unknown, length); }
+bool ebml_vint(ByteReader& r, uint64_t* out, uint32_t* length = nullptr) { return ebml::vint(r, out, length); }
+uint64_t ebml_uint(ConstByteView d) { return ebml::to_uint(d); }
+double ebml_float(ConstByteView d) { return ebml::to_float(d); }
 
-// A variable length integer (a track number, a lace size) at the reader's place; `signed_diff` reads the signed form of EBML lacing.
-bool ebml_vint(ByteReader& r, uint64_t* out, uint32_t* length = nullptr) {
-  uint8_t first;
-  if (!r.peek_u8(0, &first)) return false;
-  uint32_t n = 1;
-  while (n <= 8 && !(first & (0x80 >> (n - 1)))) ++n;
-  if (n > 8) return false;
-  uint64_t v = first & (0xFFu >> n);
-  r.u8();
-  for (uint32_t i = 1; i < n; ++i) v = (v << 8) | r.u8();
-  if (length) *length = n;
-  *out = v;
-  return r.ok();
-}
-
-uint64_t ebml_uint(ConstByteView d) {
-  uint64_t v = 0;
-  for (uint64_t i = 0; i < d.size() && i < 8; ++i) v = (v << 8) | d[i];
-  return v;
-}
-
-double ebml_float(ConstByteView d) {
-  if (d.size() == 4) {
-    const uint32_t bits = static_cast<uint32_t>(ebml_uint(d));
-    float f;
-    __builtin_memcpy(&f, &bits, sizeof f);
-    return f;
-  }
-  if (d.size() == 8) {
-    const uint64_t bits = ebml_uint(d);
-    double f;
-    __builtin_memcpy(&f, &bits, sizeof f);
-    return f;
-  }
-  return 0;
-}
-
-constexpr uint32_t kIdSegment = 0x18538067, kIdCluster = 0x1F43B675, kIdInfo = 0x1549A966, kIdTracks = 0x1654AE6B, kIdTimecode = 0xE7, kIdSimpleBlock = 0xA3,
-                   kIdBlockGroup = 0xA0, kIdBlock = 0xA1, kIdBlockDuration = 0x9B, kIdReferenceBlock = 0xFB, kIdTimecodeScale = 0x2AD7B1, kIdDuration = 0x4489,
-                   kIdTrackEntry = 0xAE, kIdTrackNumber = 0xD7, kIdTrackType = 0x83, kIdCodecId = 0x86, kIdCodecPrivate = 0x63A2, kIdDefaultDuration = 0x23E383,
-                   kIdVideo = 0xE0, kIdAudio = 0xE1, kIdPixelWidth = 0xB0, kIdPixelHeight = 0xBA, kIdSamplingFrequency = 0xB5, kIdChannels = 0x9F,
-                   kIdContentEncodings = 0x6D80;
+constexpr uint32_t kIdSegment = ebml::kSegment, kIdCluster = ebml::kCluster, kIdInfo = ebml::kInfo, kIdTracks = ebml::kTracks, kIdTimecode = ebml::kTimecode,
+                   kIdSimpleBlock = ebml::kSimpleBlock, kIdBlockGroup = ebml::kBlockGroup, kIdBlock = ebml::kBlock, kIdBlockDuration = ebml::kBlockDuration,
+                   kIdReferenceBlock = ebml::kReferenceBlock, kIdTimecodeScale = ebml::kTimecodeScale, kIdDuration = ebml::kDuration,
+                   kIdTrackEntry = ebml::kTrackEntry, kIdTrackNumber = ebml::kTrackNumber, kIdTrackType = ebml::kTrackType, kIdCodecId = ebml::kCodecId,
+                   kIdCodecPrivate = ebml::kCodecPrivate, kIdDefaultDuration = ebml::kDefaultDuration, kIdVideo = ebml::kVideo, kIdAudio = ebml::kAudio,
+                   kIdPixelWidth = ebml::kPixelWidth, kIdPixelHeight = ebml::kPixelHeight, kIdSamplingFrequency = ebml::kSamplingFrequency,
+                   kIdChannels = ebml::kChannels, kIdContentEncodings = ebml::kContentEncodings;
 
 class WebmParser final : public IMseParser {
  public:
-  explicit WebmParser(allocators::IAllocator& allocator) : allocator_(allocator), pending_(allocator), tracks_(allocator) {}
+  explicit WebmParser(allocators::IAllocator& allocator) : allocator_(allocator), pending_(allocator), scratch_(allocator), tracks_(allocator) {}
 
   bool append(ConstByteView bytes, IMseSink& sink) override {
     if (!pending_.append(bytes)) return false;
@@ -838,6 +782,8 @@ class WebmParser final : public IMseParser {
     consumed_ = 0;
     skip_ = 0;
     have_cluster_ = false;
+    for (UniquePointer<Waiting>& w : waiting_)
+      if (w) w->valid = false;
   }
   uint64_t pending() const override { return pending_.size(); }
 
@@ -846,6 +792,11 @@ class WebmParser final : public IMseParser {
     uint64_t number = 0;
     MseTrackKind kind = MseTrackKind::Audio;
     int64_t default_duration_us = 0, last_duration_us = 0;
+    bool encrypted = false;
+    uint8_t compression = 0;   // 0 none, 1 header stripping, 2 zlib
+    uint8_t strip[16] = {};
+    uint32_t strip_size = 0;
+    uint8_t kid[16] = {};
   };
   static constexpr uint64_t kMaxElement = 64u << 20;
 
@@ -917,12 +868,12 @@ class WebmParser final : public IMseParser {
     return b->append(ConstByteView(bytes, 4));
   }
 
-  // The sample description a VP9 track gets in the MP4 file the video player opens: a 'vp09' entry with a 'vpcC' box.
-  static bool vp9_entry(ByteBuffer* out, uint32_t width, uint32_t height) {
+  // The sample description a VP8 or VP9 track gets in the MP4 file the video player opens: a 'vp08' / 'vp09' entry (`type`) with a 'vpcC' box.
+  static bool vpx_entry(ByteBuffer* out, const char* type, uint32_t width, uint32_t height) {
     const uint32_t entry = 8 + 78 + 8 + 12;
     const uint8_t vpcc[12] = {1, 0, 0, 0, 0, 10, 0x82, 2, 2, 2, 0, 0};   // version 1, profile 0, level 1.0, 8 bit 4:2:0, unspecified colour, no init data
     if (!put_u32(out, 16 + entry) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("stsd"), 4)) || !put_u32(out, 0) || !put_u32(out, 1)) return false;
-    if (!put_u32(out, entry) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("vp09"), 4)) || !out->put_zeros(6)) return false;
+    if (!put_u32(out, entry) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>(type), 4)) || !out->put_zeros(6)) return false;
     const uint8_t head[] = {0, 1};   // data reference index
     if (!out->append(ConstByteView(head, 2)) || !out->put_zeros(16)) return false;
     const uint8_t size[] = {static_cast<uint8_t>(width >> 8), static_cast<uint8_t>(width), static_cast<uint8_t>(height >> 8), static_cast<uint8_t>(height)};
@@ -935,10 +886,31 @@ class WebmParser final : public IMseParser {
     return true;
   }
 
+  // The sample description an AV1 track gets: an 'av01' entry with the 'av1C' record the track carries (Matroska's CodecPrivate is that record).
+  static bool av1_entry(ByteBuffer* out, uint32_t width, uint32_t height, ConstByteView record) {
+    static const uint8_t minimal[4] = {0x81, 0, 0, 0};   // version 1, profile 0, level 0: the configuration comes with the stream
+    if (record.size() < 4 || record.size() > 4096) record = ConstByteView(minimal, 4);
+    const uint32_t entry = 8 + 78 + 8 + static_cast<uint32_t>(record.size());
+    if (!put_u32(out, 16 + entry) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("stsd"), 4)) || !put_u32(out, 0) || !put_u32(out, 1)) return false;
+    if (!put_u32(out, entry) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("av01"), 4)) || !out->put_zeros(6)) return false;
+    const uint8_t head[] = {0, 1};   // data reference index
+    if (!out->append(ConstByteView(head, 2)) || !out->put_zeros(16)) return false;
+    const uint8_t size[] = {static_cast<uint8_t>(width >> 8), static_cast<uint8_t>(width), static_cast<uint8_t>(height >> 8), static_cast<uint8_t>(height)};
+    if (!out->append(ConstByteView(size, 4)) || !put_u32(out, 0x00480000) || !put_u32(out, 0x00480000) || !put_u32(out, 0)) return false;
+    const uint8_t frames[] = {0, 1};
+    if (!out->append(ConstByteView(frames, 2)) || !out->put_zeros(32)) return false;
+    const uint8_t depth[] = {0, 0x18, 0xFF, 0xFF};
+    if (!out->append(ConstByteView(depth, 4))) return false;
+    if (!put_u32(out, 8 + static_cast<uint32_t>(record.size())) || !out->append(ConstByteView(reinterpret_cast<const uint8_t*>("av1C"), 4)) || !out->append(record)) return false;
+    return true;
+  }
+
   bool parse_tracks(ConstByteView body, IMseSink& sink) {
     auto init = UniquePointer<MseInit>::make(allocator_, allocator_);
     if (!init) return false;
     tracks_.clear();
+    for (UniquePointer<Waiting>& w : waiting_)
+      if (w) w->valid = false;
     uint64_t at = 0;
     while (at < body.size()) {
       uint32_t id, length;
@@ -953,13 +925,98 @@ class WebmParser final : public IMseParser {
     return sink.init_segment(util::move(init));
   }
 
+  // What a track's ContentEncodings say is done to its frames: compression (header stripping, zlib) or encryption (AES-CTR with a key identifier).
+  struct Encoding {
+    bool encrypted = false, unsupported = false;
+    uint8_t compression = 0;   // 0 none, 1 header stripping, 2 zlib
+    uint8_t strip[16] = {};
+    uint32_t strip_size = 0;
+    uint8_t kid[16] = {};
+  };
+
+  static bool parse_encodings(ConstByteView body, Encoding* e) {
+    uint64_t at = 0;
+    uint32_t layers = 0;
+    while (at < body.size()) {
+      uint32_t id, length;
+      uint64_t size;
+      bool unknown;
+      if (ebml_header(body.subview(at), &id, &size, &unknown, &length) != 1 || unknown || size > body.size() - at - length) return false;
+      const ConstByteView enc = body.subview(at + length, size);
+      at += length + size;
+      if (id != ebml::kContentEncoding) continue;
+      uint64_t scope = 1, type = 0, algo = 0, enc_algo = 0, cipher_mode = 1;
+      ConstByteView settings, kid;
+      bool has_encryption = false;
+      uint64_t p = 0;
+      while (p < enc.size()) {
+        uint32_t cid, clen;
+        uint64_t csize;
+        bool cunknown;
+        if (ebml_header(enc.subview(p), &cid, &csize, &cunknown, &clen) != 1 || cunknown || csize > enc.size() - p - clen) return false;
+        const ConstByteView cv = enc.subview(p + clen, csize);
+        p += clen + csize;
+        if (cid == ebml::kContentEncodingScope) scope = ebml_uint(cv);
+        else if (cid == ebml::kContentEncodingType) type = ebml_uint(cv);
+        else if (cid == ebml::kContentCompression || cid == ebml::kContentEncryption) {
+          has_encryption = has_encryption || cid == ebml::kContentEncryption;
+          uint64_t q = 0;
+          while (q < cv.size()) {
+            uint32_t zid, zlen;
+            uint64_t zsize;
+            bool zunknown;
+            if (ebml_header(cv.subview(q), &zid, &zsize, &zunknown, &zlen) != 1 || zunknown || zsize > cv.size() - q - zlen) return false;
+            const ConstByteView zv = cv.subview(q + zlen, zsize);
+            q += zlen + zsize;
+            if (zid == ebml::kContentCompAlgo) algo = ebml_uint(zv);
+            else if (zid == ebml::kContentCompSettings) settings = zv;
+            else if (zid == ebml::kContentEncAlgo) enc_algo = ebml_uint(zv);
+            else if (zid == ebml::kContentEncKeyId) kid = zv;
+            else if (zid == ebml::kContentEncAesSettings) {
+              uint64_t r = 0;
+              while (r < zv.size()) {
+                uint32_t aid, alen;
+                uint64_t asize;
+                bool aunknown;
+                if (ebml_header(zv.subview(r), &aid, &asize, &aunknown, &alen) != 1 || aunknown || asize > zv.size() - r - alen) return false;
+                if (aid == ebml::kAesSettingsCipherMode) cipher_mode = ebml_uint(zv.subview(r + alen, asize));
+                r += alen + asize;
+              }
+            }
+          }
+        }
+      }
+      if (!(scope & 1)) continue;   // (private data only)
+      if (++layers > 1) e->unsupported = true;
+      if (type == 1 || has_encryption) {
+        if (enc_algo != 5 || cipher_mode != 1 || kid.size() != 16) e->unsupported = true;   // (only AES in counter mode, with a 16 byte key identifier)
+        else {
+          e->encrypted = true;
+          for (uint32_t i = 0; i < 16; ++i) e->kid[i] = kid[i];
+        }
+      } else if (algo == 3) {
+        if (settings.size() > sizeof e->strip) e->unsupported = true;
+        else {
+          e->compression = 1;
+          e->strip_size = static_cast<uint32_t>(settings.size());
+          for (uint64_t i = 0; i < settings.size(); ++i) e->strip[i] = settings[i];
+        }
+      } else if (algo == 0) {
+        e->compression = 2;
+      } else {
+        e->unsupported = true;
+      }
+    }
+    return true;
+  }
+
   bool parse_entry(ConstByteView body, MseInit* init) {
     Track track;
     uint64_t type = 0;
     uint32_t width = 0, height = 0, channels = 1;
     double rate = 8000;
     ConstByteView codec, priv;
-    bool encrypted = false;
+    Encoding encoding;
     uint64_t at = 0;
     while (at < body.size()) {
       uint32_t id, length;
@@ -972,7 +1029,9 @@ class WebmParser final : public IMseParser {
       else if (id == kIdCodecId) codec = v;
       else if (id == kIdCodecPrivate) priv = v;
       else if (id == kIdDefaultDuration) track.default_duration_us = static_cast<int64_t>(ebml_uint(v) / 1000);
-      else if (id == kIdContentEncodings) encrypted = true;
+      else if (id == kIdContentEncodings) {
+        if (!parse_encodings(v, &encoding)) return false;
+      }
       else if (id == kIdVideo || id == kIdAudio) {
         uint64_t p = 0;
         while (p < v.size()) {
@@ -995,15 +1054,26 @@ class WebmParser final : public IMseParser {
     info.id = static_cast<uint32_t>(track.number);
     info.timescale = 1000000;
     info.entry_offset = init->entries.size();
-    if (type == 1 && is("V_VP9")) {
+    if (type == 1 && (is("V_VP9") || is("V_VP8"))) {
+      const bool vp8 = is("V_VP8");
       if (width == 0 || height == 0 || width > 16384 || height > 16384) return false;
       info.kind = MseTrackKind::Video;
-      info.codec = fourcc("vp09");
+      info.codec = fourcc(vp8 ? "vp08" : "vp09");
       info.container = kContainerMp4;
       info.width = width;
       info.height = height;
       ByteBuffer entry(allocator_);
-      if (!vp9_entry(&entry, width, height) || !init->entries.append(entry.view())) return false;
+      if (!vpx_entry(&entry, vp8 ? "vp08" : "vp09", width, height) || !init->entries.append(entry.view())) return false;
+      info.entry_size = entry.size();
+    } else if (type == 1 && is("V_AV1")) {
+      if (width == 0 || height == 0 || width > 16384 || height > 16384) return false;
+      info.kind = MseTrackKind::Video;
+      info.codec = fourcc("av01");
+      info.container = kContainerMp4;
+      info.width = width;
+      info.height = height;
+      ByteBuffer entry(allocator_);
+      if (!av1_entry(&entry, width, height, priv) || !init->entries.append(entry.view())) return false;
       info.entry_size = entry.size();
     } else if (type == 2 && (is("A_OPUS") || is("A_VORBIS"))) {
       const bool opus = is("A_OPUS");
@@ -1023,9 +1093,19 @@ class WebmParser final : public IMseParser {
         info.entry_size = priv.size();
       }
     } else {
-      return true;   // another track (VP8, AV1, subtitles ...): not kept
+      return true;   // another track (subtitles ...): not kept
     }
-    if (encrypted) return false;   // (WebM's own encryption is not handled)
+    if (encoding.unsupported) return false;
+    if (encoding.encrypted) {   // WebM's own encryption: AES in counter mode, the 8 byte IV in each frame, the key named by the track
+      track.encrypted = true;
+      info.protection.scheme = MseScheme::Cenc;
+      info.protection.is_protected = true;
+      info.protection.iv_size = 8;
+      for (uint32_t i = 0; i < 16; ++i) info.protection.kid[i] = track.kid[i] = encoding.kid[i];
+    }
+    track.compression = encoding.compression;
+    track.strip_size = encoding.strip_size;
+    for (uint32_t i = 0; i < encoding.strip_size; ++i) track.strip[i] = encoding.strip[i];
     if (info.id == 0 || init->tracks.count() >= 8) return false;
     track.kind = info.kind;
     if (!tracks_.push_back(track) || !init->tracks.push_back(info)) return false;
@@ -1126,18 +1206,151 @@ class WebmParser final : public IMseParser {
     const int64_t ticks = cluster_timecode_ + relative;
     if (ticks > (int64_t{1} << 50) || ticks < -(int64_t{1} << 50)) return false;
     const int64_t pts = ticks * static_cast<int64_t>(scale_ns_) / 1000;
+    if (duration_units > (int64_t{1} << 40)) duration_units = -1;   // (not a duration)
     int64_t duration = duration_units >= 0 ? duration_units * static_cast<int64_t>(scale_ns_) / 1000 / count : track.default_duration_us;
+    const bool duration_known = duration > 0;
     if (duration <= 0) duration = track.last_duration_us > 0 ? track.last_duration_us : (track.kind == MseTrackKind::Audio ? 20000 : 33333);
     track.last_duration_us = duration;
     for (uint32_t i = 0; i < count; ++i) {
       const int64_t t = pts + static_cast<int64_t>(i) * duration;
-      if (!sink.frame(track_index, t, t, duration, key, frames[i], nullptr)) return false;
+      ConstByteView data = frames[i];
+      MseSampleCrypto crypto;
+      const MseSampleCrypto* protection = nullptr;
+      if (track.encrypted) {
+        if (!unprotect(track, &data, &crypto, &protection)) return false;
+      } else if (track.compression == 1) {   // header stripping: the bytes every frame began with are put back
+        scratch_.clear();
+        if (!scratch_.append(ConstByteView(track.strip, track.strip_size)) || !scratch_.append(data)) return false;
+        data = scratch_.view();
+      } else if (track.compression == 2) {
+        scratch_.clear();
+        if (!inflate(data, &scratch_, kMaxElement)) return false;
+        data = scratch_.view();
+      }
+      if (!deliver(track, track_index, t, duration, duration_known, key, data, protection, sink)) return false;
     }
     return true;
   }
 
+  // A frame no one gave a duration (no BlockDuration, no DefaultDuration) lasts until the next of its track begins - frames need not be evenly spaced (VP8's hidden
+  // alt-ref frames follow their neighbours by a moment) - so it waits for that frame; the others go on at once.
+  struct Waiting {
+    explicit Waiting(allocators::IAllocator& allocator) : data(allocator), subsamples(allocator) {}
+    bool valid = false, key = false, protect = false;
+    int64_t pts = 0;
+    MseSampleCrypto crypto;
+    ByteBuffer data, subsamples;
+  };
+
+  bool release_waiting(uint32_t track_index, int64_t duration, IMseSink& sink) {
+    Waiting* p = track_index < kMaxWaiting ? waiting_[track_index].get() : nullptr;
+    if (!p || !p->valid) return true;
+    p->valid = false;
+    MseSampleCrypto crypto = p->crypto;
+    crypto.subsamples = p->subsamples.view();
+    return sink.frame(track_index, p->pts, p->pts, duration < 0 ? 0 : duration, p->key, p->data.view(), p->protect ? &crypto : nullptr);
+  }
+
+  bool deliver(Track& track, uint32_t track_index, int64_t pts, int64_t duration, bool duration_known, bool key, ConstByteView data, const MseSampleCrypto* protection, IMseSink& sink) {
+    if (track_index >= kMaxWaiting) return sink.frame(track_index, pts, pts, duration, key, data, protection);
+    if (waiting_[track_index] && waiting_[track_index]->valid) {
+      const int64_t gap = pts - waiting_[track_index]->pts;
+      if (gap >= 5000) track.last_duration_us = gap;   // (the spacing of the frames is the best guess for the next)
+      if (!release_waiting(track_index, gap, sink)) return false;
+    }
+    if (duration_known) return sink.frame(track_index, pts, pts, duration, key, data, protection);
+    if (!waiting_[track_index]) waiting_[track_index] = UniquePointer<Waiting>::make(allocator_, allocator_);
+    Waiting* p = waiting_[track_index].get();
+    if (!p) return false;
+    p->data.clear();
+    p->subsamples.clear();
+    p->valid = true;
+    p->pts = pts;
+    p->key = key;
+    p->protect = protection != nullptr;
+    if (protection) {
+      p->crypto = *protection;
+      if (!p->subsamples.append(protection->subsamples)) return false;
+    }
+    return p->data.append(data);
+  }
+
+  // An encrypted frame of WebM: a signal byte (bit 0: encrypted, bit 1: partitioned), then for an encrypted frame the 8 byte IV and for a partitioned one
+  // the number of partitions and their offsets; the rest is the frame. The partitions alternate clear and encrypted, the first being clear; the counter of
+  // the cipher runs on through the encrypted ones. The subsamples are made in `scratch_`.
+  bool unprotect(const Track& track, ConstByteView* data, MseSampleCrypto* crypto, const MseSampleCrypto** protection) {
+    ByteReader r(*data);
+    const uint8_t signal = r.u8();
+    if (!r.ok()) return false;
+    if (!(signal & 1)) {   // in the clear
+      *data = r.rest();
+      return true;
+    }
+    uint8_t iv[8];
+    for (uint8_t& b : iv) b = r.u8();
+    uint64_t offsets[256];
+    uint32_t partitions = 0;
+    if (signal & 2) {
+      partitions = r.u8();
+      for (uint32_t i = 0; i < partitions; ++i) offsets[i] = r.be32();
+    }
+    if (!r.ok()) return false;
+    const ConstByteView payload = r.rest();
+    crypto->scheme = MseScheme::Cenc;
+    for (uint32_t i = 0; i < 16; ++i) crypto->kid[i] = track.kid[i];
+    for (uint32_t i = 0; i < 8; ++i) crypto->iv[i] = iv[i];
+    crypto->subsample_count = 0;
+    scratch_.clear();
+    if (partitions > 0) {
+      // clear, encrypted, clear, ... between the offsets; each pair is a subsample (a clear run of more than 16 bits is cut into several)
+      uint64_t start = 0;
+      uint32_t count = 0;
+      bool clear_run = true;
+      uint64_t clear = 0;
+      for (uint32_t i = 0; i <= partitions; ++i) {
+        const uint64_t end = i < partitions ? offsets[i] : payload.size();
+        if (end < start || end > payload.size()) return false;
+        const uint64_t length = end - start;
+        start = end;
+        if (clear_run) {
+          clear = length;
+          if (i == partitions) {   // the last partition is clear: a subsample with nothing encrypted
+            while (clear > 0) {
+              const uint64_t part = clear > 0xFFFF ? 0xFFFF : clear;
+              if (!put_subsample(&scratch_, part, 0)) return false;
+              clear -= part;
+              ++count;
+            }
+          }
+        } else {
+          while (clear > 0xFFFF) {
+            if (!put_subsample(&scratch_, 0xFFFF, 0)) return false;
+            clear -= 0xFFFF;
+            ++count;
+          }
+          if (!put_subsample(&scratch_, clear, length)) return false;
+          ++count;
+        }
+        clear_run = !clear_run;
+      }
+      crypto->subsample_count = count;
+      crypto->subsamples = scratch_.view();
+    }
+    *data = payload;
+    *protection = crypto;
+    return true;
+  }
+
+  static bool put_subsample(ByteBuffer* b, uint64_t clear, uint64_t protected_bytes) {
+    const uint8_t e[6] = {static_cast<uint8_t>(clear >> 8), static_cast<uint8_t>(clear), static_cast<uint8_t>(protected_bytes >> 24), static_cast<uint8_t>(protected_bytes >> 16),
+                          static_cast<uint8_t>(protected_bytes >> 8), static_cast<uint8_t>(protected_bytes)};
+    return protected_bytes <= 0xFFFFFFFFu && b->append(ConstByteView(e, 6));
+  }
+
   allocators::IAllocator& allocator_;
-  ByteBuffer pending_;
+  static constexpr uint32_t kMaxWaiting = 8;
+  UniquePointer<Waiting> waiting_[kMaxWaiting];   // (the frame of each track that waits for the next one)
+  ByteBuffer pending_, scratch_;
   uint64_t consumed_ = 0, skip_ = 0;
   List<Track> tracks_;
   uint64_t scale_ns_ = 1000000;
@@ -1178,7 +1391,7 @@ class FramedAudioParser : public IMseParser {
     const uint64_t left = all.size() - at;
     if (left) all.first(left).copy_from(all.subview(at));
     pending_.truncate(left);
-    if (left > kMaxPending) return false;
+    if (left > kMaxWaiting) return false;
     return ok;
   }
   void reset() override {
@@ -1195,7 +1408,7 @@ class FramedAudioParser : public IMseParser {
   };
   enum class Step { NeedMore, Skip, Frame };
   virtual Step look(ConstByteView data, FrameInfo* frame, uint64_t* take) = 0;
-  static constexpr uint64_t kMaxPending = 32u << 20;
+  static constexpr uint64_t kMaxWaiting = 32u << 20;
   bool synced_ = false;
 
  private:
@@ -1380,7 +1593,7 @@ bool codec_ok(MseFormat format, StringView codec, bool is_video_type, bool* vide
   codec = codec.trimmed();
   if (codec.empty()) return false;
   if (format == MseFormat::Mp4) {
-    if (starts_with_ci(codec, "avc1.") || codec.equals_ignore_case("avc1")) {
+    if (starts_with_ci(codec, "avc1.") || codec.equals_ignore_case("avc1") || starts_with_ci(codec, "av01.") || codec.equals_ignore_case("av01")) {
       if (!is_video_type) return false;
       *video = true;
       return true;
@@ -1391,7 +1604,7 @@ bool codec_ok(MseFormat format, StringView codec, bool is_video_type, bool* vide
     return false;
   }
   if (format == MseFormat::Webm) {
-    if (codec.equals_ignore_case("vp9") || starts_with_ci(codec, "vp09.")) {   // (VP8 and AV1 have no decoder on this machine)
+    if (codec.equals_ignore_case("vp8") || codec.equals_ignore_case("vp9") || starts_with_ci(codec, "vp09.") || starts_with_ci(codec, "av01.") || codec.equals_ignore_case("av1")) {
       if (!is_video_type) return false;
       *video = true;
       return true;

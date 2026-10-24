@@ -460,6 +460,8 @@ add_executable(BOOTX64
   src/Media/Audio/OpusSilk.cpp
   src/Media/Audio/Mp4Audio.cpp
   src/Media/Mp4.cpp
+  src/Media/Webm.cpp
+  src/Media/Audio/WebmAudio.cpp
   src/Media/MseParsers.cpp
   src/Media/MseBuffer.cpp
   src/Media/MseHub.cpp
@@ -508,10 +510,28 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/H264Cabac.cpp
   src/Hardware/VideoCodec/Software/H264Predict.cpp
   src/Hardware/VideoCodec/Software/H264Deblock.cpp
+  src/Hardware/VideoCodec/Software/Vp8.cpp
   src/Hardware/VideoCodec/Software/Vp9.cpp
   src/Hardware/VideoCodec/Software/Vp9Syntax.cpp
   src/Hardware/VideoCodec/Software/Vp9Recon.cpp
   src/Hardware/VideoCodec/Software/Vp9LoopFilter.cpp
+  src/Hardware/VideoCodec/Software/Av1.cpp
+  src/Hardware/VideoCodec/Software/Av1Frame.cpp
+  src/Hardware/VideoCodec/Software/Av1Decode.cpp
+  src/Hardware/VideoCodec/Software/Av1Recon.cpp
+  src/Hardware/VideoCodec/Software/Av1Obu.cpp
+  src/Hardware/VideoCodec/Software/Av1Cdf.cpp
+  src/Hardware/VideoCodec/Software/Av1Itx.cpp
+  src/Hardware/VideoCodec/Software/Av1Ipred.cpp
+  src/Hardware/VideoCodec/Software/Av1Mc.cpp
+  src/Hardware/VideoCodec/Software/Av1Wedge.cpp
+  src/Hardware/VideoCodec/Software/Av1Warp.cpp
+  src/Hardware/VideoCodec/Software/Av1Refmvs.cpp
+  src/Hardware/VideoCodec/Software/Av1LoopFilter.cpp
+  src/Hardware/VideoCodec/Software/Av1Cdef.cpp
+  src/Hardware/VideoCodec/Software/Av1LoopRestoration.cpp
+  src/Hardware/VideoCodec/Software/Av1SuperRes.cpp
+  src/Hardware/VideoCodec/Software/Av1FilmGrain.cpp
   src/Hardware/VideoCodec/Software/JpegEncoder.cpp
   src/Gui/Controls/Menu.cpp
   src/Gui/Windows/Frame.cpp

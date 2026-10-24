@@ -23,6 +23,7 @@
 #include "Math/FloatMath.hpp"
 #include "Media/AudioCodecs.hpp"
 #include "Media/AudioStreaming.hpp"
+#include "Media/Audio/VorbisSizer.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/Move.hpp"
 #include "Media/Audio/Mdct.hpp"
@@ -307,6 +308,19 @@ class Decoder {
   uint32_t rate() const { return rate_; }
   uint32_t output_channels() const { return out_channels_; }
   ByteBuffer& pcm() { return pcm_; }
+  // The samples (per channel) audio packet `p` adds to the output after the one before it (0 for the first); -1 if it is not an audio packet.
+  // Only reads the packet's mode number: it decodes nothing.
+  int64_t packet_samples(ConstByteView p) {
+    if (state_ != 3 || p.empty() || mode_count_ == 0) return -1;
+    Bits b{p};
+    if (b.read(1) != 0) return -1;
+    const uint32_t mode_index = b.read(ilog(mode_count_ - 1));
+    if (b.eop || mode_index >= mode_count_) return -1;
+    const uint32_t n = blocksize_[modes_[mode_index].blockflag];
+    const int64_t samples = size_previous_ ? int64_t{size_previous_ / 4} + n / 4 : 0;
+    size_previous_ = n;
+    return samples;
+  }
   // Forget the previous block: the next audio packet only primes the transform (it gives no sound).
   void restart_overlap() {
     have_previous_ = false;
@@ -353,6 +367,7 @@ class Decoder {
   uint64_t classes_size_ = 0;
   bool have_previous_ = false;
   uint32_t previous_n_ = 0;
+  uint32_t size_previous_ = 0;   // (for packet_samples())
   uint64_t frames_out_ = 0;
   bool prepared_ = false;
   bool prepare();
@@ -897,6 +912,28 @@ bool Decoder::decode(ConstByteView data, AudioData* out) {
   return true;
 }
 }  // namespace
+
+struct VorbisSizer::Impl {
+  explicit Impl(allocators::IAllocator& allocator) : decoder(allocator) {}
+  Decoder decoder;
+};
+
+VorbisSizer::~VorbisSizer() = default;
+
+bool VorbisSizer::init(ConstByteView identification, ConstByteView comment, ConstByteView setup) {
+  impl_ = UniquePointer<Impl>::make(allocator_, allocator_);
+  if (!impl_) return false;
+  Decoder& d = impl_->decoder;
+  if (!d.packet(identification) || !d.packet(comment) || !d.packet(setup) || !d.ready()) {
+    impl_.reset();
+    return false;
+  }
+  rate_ = d.rate();
+  channels_ = d.output_channels();
+  return true;
+}
+
+int64_t VorbisSizer::next(ConstByteView packet) { return impl_ ? impl_->decoder.packet_samples(packet) : -1; }
 
 bool decode_vorbis(ConstByteView data, AudioData* out) {
   out->clear();

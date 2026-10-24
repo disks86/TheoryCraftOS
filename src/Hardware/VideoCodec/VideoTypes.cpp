@@ -28,6 +28,7 @@ const char* codec_name(VideoCodec codec) {
     case VideoCodec::Hevc: return "H.265";
     case VideoCodec::Vp9: return "VP9";
     case VideoCodec::Av1: return "AV1";
+    case VideoCodec::Vp8: return "VP8";
   }
   return "?";
 }
