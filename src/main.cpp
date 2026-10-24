@@ -894,7 +894,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (planned_device.plan_status()[0]) Entry(planned ? Level::Ok : Level::Warning, "Firmware").text(planned_device.name()).text(": ").text(planned_device.plan_status());
     }
     // Bring up the video engines that were planned and confirmed (AMD VCN 1.0: Ryzen 2000/3000 APUs). An engine that comes up is tested at once: it decodes a short
-    // H.264 stream this OS encodes, and must give the CPU's pictures byte for byte, or it is stopped again and H.264 stays on the CPU. Engines are stopped at shutdown.
+    // H.264 stream this OS encodes, and must give the CPU's pictures byte for byte, or it is stopped again and H.264 stays on the CPU; H.265 has its own test and stays on the
+    // CPU when it fails. Engines are stopped at shutdown.
     // This is the one switch: set it false to leave every engine unstarted.
     constexpr bool kStartVideoEngines = true;
     if (kStartVideoEngines && clock_ok && paging_ok) {
@@ -903,7 +904,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (!engine_device.firmware_status()[0]) continue;   // nothing to start on this device
         const bool started = engine_device.start_hardware(clock);
         const bool decoding = started && engine_device.info().accelerated_decode_codecs != 0;
-        Entry(started ? Level::Ok : Level::Warning, "Video").text(engine_device.name()).text(decoding ? ": engine started, H.264 decode runs on it (self-test passed)" : started ? ": engine started (idle)" : ": engine not started - ").text(started ? "" : engine_device.firmware_status());
+        Entry(started ? Level::Ok : Level::Warning, "Video").text(engine_device.name()).text(decoding ? (engine_device.info().accelerated_decode_codecs & hardware::codec_mask(hardware::VideoCodec::Hevc) ? ": engine started, H.264 and H.265 decode run on it (self-tests passed)" : ": engine started, H.264 decode runs on it (self-test passed)") : started ? ": engine started (idle)" : ": engine not started - ").text(started ? "" : engine_device.firmware_status());
       }
     }
     // The system database: one file on the root volume (/databases/system.db) where the OS and its programs keep their settings; the database query

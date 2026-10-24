@@ -20,6 +20,7 @@
 #pragma once
 #include <stdint.h>
 #include "Hardware/VideoCodec/Software/H264Core.hpp"
+#include "Hardware/VideoCodec/Software/H265Core.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace hardware {
@@ -43,8 +44,8 @@ constexpr uint32_t kCmdItScalingTableBuffer = 0x204;
 constexpr uint32_t kCmdContextBuffer = 0x206;
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;       // header msg_type
-constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6;   // index message_id
-constexpr uint32_t kStreamTypeH264Perf = 7;
+constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13;   // index message_id
+constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;
 constexpr uint32_t kProfileBaseline = 0, kProfileMain = 1, kProfileHigh = 2;
 constexpr uint32_t kArrayModeLinear = 0;
 
@@ -57,6 +58,7 @@ constexpr uint32_t kItTable8x8Offset = 96;
 constexpr uint32_t kMessageFeedbackItBytes = kItTableOffset + kItTableBytes;   // message page, feedback and scaling table together
 constexpr uint32_t kSessionContextBytes = 128 * 1024;
 constexpr uint32_t kMaxH264References = 17;          // NUM_H264_REFS
+constexpr uint32_t kMaxHevcReferences = 17;          // the pictures Mesa sizes the buffers for (8 from 4096 x 2000 up)
 
 // Largest picture the OS asks the engine for: 4096 x 2304 (level 5.1 at 4K). Bigger is refused so sizes cannot overflow.
 constexpr uint32_t kMaxWidth = 4096, kMaxHeight = 2304;
@@ -69,8 +71,9 @@ constexpr uint64_t align_up(uint64_t value, uint64_t alignment) { return (value 
 uint32_t create_message_bytes();
 uint32_t destroy_message_bytes();
 uint32_t decode_message_bytes();   // header, the two indexes, the decode message and the AVC message
+uint32_t hevc_decode_message_bytes();   // the same with the HEVC message
 // False when `out` is too small. The bytes after the message are left alone.
-bool build_create_message(ByteView out, uint32_t stream_handle, uint32_t width, uint32_t height);
+bool build_create_message(ByteView out, uint32_t stream_handle, uint32_t width, uint32_t height, uint32_t stream_type = kStreamTypeH264Perf);
 bool build_destroy_message(ByteView out, uint32_t stream_handle);
 
 // What the engine is told about the picture, taken from the parameter sets and the first slice header.
@@ -135,6 +138,22 @@ bool build_avc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fee
 // Writes the feedback header (and nothing else) into the feedback area and the scaling lists into the scaling table, both inside a buffer of at least
 // kMessageFeedbackItBytes that starts at the message buffer.
 bool prepare_feedback_and_tables(ByteView message_buffer, const AvcPictureState& picture);
+
+// H.265 -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+struct HevcBufferSizes {
+  uint64_t context = 0;
+  uint64_t dpb = 0;
+  uint32_t references = 0;   // pictures both are sized for
+};
+// Sizes for pictures of `width` x `height` luma samples (multiples of 8) whose stream keeps up to `max_dec_pic_buffering` pictures (the sequence parameter set's
+// sps_max_dec_pic_buffering_minus1 + 1). 0 sizes when the picture is too big or the stream wants more pictures than the buffers hold.
+HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_dec_pic_buffering);
+// Builds the decode message (header, indexes, decode message, HEVC message) for one picture of the Core's offload. Only 8-bit 4:2:0 pictures: false otherwise, and when
+// `out` is too small or a size does not fit the message's fields.
+bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const h265::OffloadPicture& picture, const DecodeBuffers& buffers);
+// The feedback header and the scaling table (all four block sizes; kItTableBytes) of an H.265 picture.
+bool prepare_hevc_feedback_and_tables(ByteView message_buffer, const h265::Sps& sps, const h265::Pps& pps);
 
 // What the firmware wrote into the feedback area after a picture.
 struct Feedback {
