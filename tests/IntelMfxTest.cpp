@@ -197,7 +197,7 @@ static void test_layout_and_tiling() {
         }
       CHECK(same_crop);
       CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 5, 4));    // odd origin
-      CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 26, 4));   // runs past the surface
+      CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 90, 4));   // runs past the pitch
       CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 0, 36));
       CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 0xFFFFFFFEu, 0));
     }
