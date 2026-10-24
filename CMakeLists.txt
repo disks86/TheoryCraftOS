@@ -325,6 +325,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/Hardware/GraphicsProcessingUnit/SystemGpu.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp

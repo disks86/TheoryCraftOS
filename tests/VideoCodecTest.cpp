@@ -30,6 +30,7 @@
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnVideoEngine.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaVideoEngine.hpp"
 #include <vector>
@@ -1036,6 +1037,19 @@ static void test_intel_media_engine() {
   CHECK(meteor.initialize() && !meteor.engine_status().probed);
 }
 
+static void test_amd_media_engine() {
+  TestAllocator a;
+  const uint32_t h264 = codec_mask(VideoCodec::H264), hevc = codec_mask(VideoCodec::Hevc), vp9 = codec_mask(VideoCodec::Vp9), av1 = codec_mask(VideoCodec::Av1);
+  AmdVcnVideoEngine polaris(a, 0x67DF), raven(a, 0x15DD), navi21(a, 0x73BF), navi31(a, 0x744C), cdna(a, 0x74A1), unknown(a);
+  CHECK(polaris.engine_decode_codecs() & hevc && !(polaris.engine_decode_codecs() & vp9) && !(polaris.engine_decode_codecs() & av1));
+  CHECK(raven.engine_decode_codecs() & vp9 && !(raven.engine_decode_codecs() & av1));
+  CHECK(navi21.engine_decode_codecs() & av1 && !(navi21.engine_encode_codecs() & av1));
+  CHECK(navi31.engine_decode_codecs() & av1 && navi31.engine_encode_codecs() & av1 && navi31.engine_encode_codecs() & h264);
+  CHECK(cdna.engine_decode_codecs() == 0 && cdna.engine_encode_codecs() == 0 && unknown.engine_decode_codecs() == 0);
+  // The sessions still run in software: the engine is there but not used.
+  CHECK(navi31.initialize() && navi31.info().hardware_engine && !navi31.info().accelerated);
+}
+
 int main() {
   test_formats();
   test_convert();
@@ -1045,6 +1059,7 @@ int main() {
   test_sessions();
   test_system_list();
   test_intel_media_engine();
+  test_amd_media_engine();
   test_intel_system();
   test_h264_parser();
   test_h264_encode();

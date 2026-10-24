@@ -21,7 +21,7 @@
 
 namespace hardware {
 
-// AMD's XDNA NPU in Ryzen AI processors (Phoenix, Hawk Point, Strix). This
+// AMD's XDNA NPU in Ryzen AI processors (Phoenix, Hawk Point: XDNA; Strix, Krackan: XDNA 2). This
 // class names the device; the computation still runs on the CPU until a native
 // driver exists, and this is where it will go.
 class AmdXdnaNpu final : public SoftwareNeuralProcessingUnit {
@@ -31,10 +31,11 @@ class AmdXdnaNpu final : public SoftwareNeuralProcessingUnit {
   using SoftwareNeuralProcessingUnit::SoftwareNeuralProcessingUnit;
 
   const char* name() const override { return "AMD XDNA NPU (software path)"; }
-  static bool matches(uint16_t device_id) {
-    return device_id == 0x1502 ||  // Phoenix / Hawk Point
-           device_id == 0x17F0;    // Strix and later
+  // XDNA (Ryzen 7040/8040) and XDNA 2 (Ryzen AI 300 and later); 0 for a device that is neither.
+  static uint32_t xdna_generation(uint16_t device_id) {
+    return device_id == 0x1502 ? 1 : device_id == 0x17F0 ? 2 : 0;
   }
+  static bool matches(uint16_t device_id) { return xdna_generation(device_id) != 0; }
 };
 
 }  // namespace hardware

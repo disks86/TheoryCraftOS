@@ -26,6 +26,7 @@
 #include "Hardware/CentralProcessingUnit/AMD/AmdZen4Cpu.hpp"
 #include "Hardware/CentralProcessingUnit/AMD/AmdZen5Cpu.hpp"
 #include "Hardware/CentralProcessingUnit/AMD/AmdZenCpu.hpp"
+#include "Hardware/CentralProcessingUnit/AMD/AmdZenPlusCpu.hpp"
 #include "Hardware/CentralProcessingUnit/GenerationTable.hpp"
 
 namespace hardware {
@@ -38,6 +39,9 @@ constexpr GenerationRule kRules[] = {
     rule<AmdBulldozerCpu>(0x15, 0x00, 0x01),
     rule<AmdPiledriverCpu>(0x15, 0x02, 0x02),
     rule<AmdPiledriverCpu>(0x15, 0x10, 0x1F),
+    // Pinnacle Ridge (0x08) and Picasso (0x18) are Zen+; Summit Ridge, Raven Ridge and Dali stay Zen.
+    rule<AmdZenPlusCpu>(0x17, 0x08, 0x08),
+    rule<AmdZenPlusCpu>(0x17, 0x18, 0x18),
     rule<AmdZenCpu>(0x17, 0x00, 0x2F),
     rule<AmdZen2Cpu>(0x17, 0x30, 0xFF),
     rule<AmdZen3Cpu>(0x19, 0x00, 0x0F),

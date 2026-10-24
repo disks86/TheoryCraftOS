@@ -73,7 +73,7 @@ void SystemVideoCodecs::initialize() {
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassDisplay) continue;
     if (d.vendor_id == NvidiaVideoEngine::kPciVendor) try_add<NvidiaVideoEngine>(devices_, allocator_);
-    else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_);
+    else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_, d.device_id);
     else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) add_intel(d);
   }
   try_add<SoftwareVideoCodec>(devices_, allocator_);

@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 
 namespace hardware {
@@ -29,9 +30,28 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
  public:
   static constexpr uint16_t kPciVendor = 0x1002;
 
-  explicit AmdVcnVideoEngine(allocators::IAllocator& allocator) : SoftwareVideoCodec(allocator, /*hardware_engine=*/true) {}
+  // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown).
+  explicit AmdVcnVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0)
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), gpu_(amd_gpu_identify(gpu_device_id)) {}
 
   const char* name() const override { return "AMD video engine (VCN) (software path)"; }
+  const AmdGpuInfo& gpu() const { return gpu_; }
+  // Codecs the engine would serve once it is driven: today's sessions all run in software (info().accelerated is false).
+  uint32_t engine_decode_codecs() const {
+    return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0) |
+           (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0);
+  }
+  uint32_t engine_encode_codecs() const {
+    return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_av1_encode ? codec_mask(VideoCodec::Av1) : 0);
+  }
+
+ private:
+  // H.264 and JPEG are on every generation that has a video engine at all.
+  uint32_t base_codecs() const {
+    return amd_gpu_has_video_engine(gpu_.architecture) ? codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mjpeg) : 0;
+  }
+
+  AmdGpuInfo gpu_;
 };
 
 }  // namespace hardware

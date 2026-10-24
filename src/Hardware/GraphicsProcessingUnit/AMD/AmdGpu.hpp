@@ -17,20 +17,26 @@
  */
 
 #pragma once
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
 
 namespace hardware {
 
-// AMD display controller (PCI vendor 0x1002). Modes and the framebuffer still
+// AMD display controller (PCI vendor 0x1002), identified by device ID down to its architecture (Vega APUs, RDNA 1 to 4, Polaris;
+// see AmdGpuGenerations.hpp). Modes and the framebuffer still
 // come from the firmware (UEFI GOP); native mode setting for these parts is
 // future work, and this class is where it will go.
 class AmdGpu final : public UefiGopGpu {
  public:
   static constexpr uint16_t kPciVendor = 0x1002;
 
-  explicit AmdGpu(const GpuContext& context) : UefiGopGpu(context) {}
+  explicit AmdGpu(const GpuContext& context) : UefiGopGpu(context), info_(amd_gpu_identify(context.device.device_id)) {}
 
-  const char* name() const override { return "AMD graphics (UEFI framebuffer)"; }
+  const char* name() const override { return info_.name; }
+  const AmdGpuInfo& generation() const { return info_; }
+
+ private:
+  AmdGpuInfo info_;
 };
 
 }  // namespace hardware
