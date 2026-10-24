@@ -10,7 +10,7 @@ cxx=${CXX:-g++}
 flags="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I src -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-variable"
 
 # The GUI has player controls, which bring the audio player (and with it the mixer), the video player and the codecs along.
-media="src/Media/*.cpp src/Media/Audio/*.cpp src/Media/Image/*.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp"
+media="src/Crypto/Crypto.cpp src/Media/*.cpp src/Media/Audio/*.cpp src/Media/Image/*.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp"
 gui_audio="src/Hardware/Monitor/*.cpp src/Hardware/Printer/PrinterTypes.cpp src/Hardware/Printer/TextLayout.cpp src/Hardware/Printer/Halftone.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp $media"
 
 build_and_run() {
