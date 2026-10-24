@@ -66,6 +66,16 @@ NvidiaGpuInfo nvidia_gpu_identify_boot0(uint32_t boot0);
 constexpr uint32_t kNvidiaBoot0Offset = 0;
 constexpr uint64_t kNvidiaRegisterWindow = 0x1000;  // enough of BAR0 to read NV_PMC_BOOT_0
 
+// The chip a chipset number (bits 28:20 of NV_PMC_BOOT_0) stands for - "GP102", "AD104", "GB202" - or nullptr for a number the table does not know.
+const char* nvidia_chip_name(uint32_t chipset);
+// Does the chip have NVENC? The compute-only GP100 and GA100 do not (Hopper's lack of it is an architecture-wide fact, see NvidiaGpuInfo::has_nvenc); every
+// other chip of an architecture that has NVENC does, and an unknown chipset is assumed to follow its architecture.
+bool nvidia_chip_has_nvenc(uint32_t chipset, NvidiaGpuArchitecture architecture);
+// The chipset field of a NV_PMC_BOOT_0 value.
+constexpr uint32_t nvidia_boot0_chipset(uint32_t boot0) { return (boot0 >> 20) & 0x1FF; }
+// Offset of NV_PMC_BOOT_42 in BAR0: from Turing on it repeats the chip ID (architecture in bits 28:24, implementation in 23:20, revision in 7:0).
+constexpr uint32_t kNvidiaBoot42Offset = 0xA00;
+
 // Does the architecture come with a video engine? (Every known one does.)
 bool nvidia_gpu_has_video_engine(NvidiaGpuArchitecture architecture);
 

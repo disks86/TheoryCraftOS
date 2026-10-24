@@ -33,6 +33,7 @@
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnVideoEngine.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
+#include "Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaVideoEngine.hpp"
 #include <vector>
 #include "Utility/Crc32.hpp"
@@ -1038,6 +1039,16 @@ static void test_intel_media_engine() {
   CHECK(meteor.initialize() && !meteor.engine_status().probed);
 }
 
+// Pretend first page of an NVIDIA register BAR: BOOT_0 holds the chipset and stepping, BOOT_42 repeats the ID (as Turing and newer do).
+struct NvidiaFakeRegs {
+  std::vector<uint32_t> words = std::vector<uint32_t>(0x1000 / 4, 0);
+  NvidiaFakeRegs(uint32_t chipset, uint32_t stepping) {
+    words[0] = (chipset << 20) | stepping;
+    if (chipset >= 0x160) words[0xA00 / 4] = (chipset << 20) | stepping;
+  }
+  MmioRegion region() { return MmioRegion(reinterpret_cast<uint64_t>(words.data()), words.size() * 4); }
+};
+
 static void test_nvidia_media_engine() {
   TestAllocator a;
   const uint32_t h264 = codec_mask(VideoCodec::H264), hevc = codec_mask(VideoCodec::Hevc), vp9 = codec_mask(VideoCodec::Vp9), av1 = codec_mask(VideoCodec::Av1);
@@ -1047,10 +1058,15 @@ static void test_nvidia_media_engine() {
   CHECK(hopper.engine_decode_codecs() & av1 && hopper.engine_encode_codecs() == 0);
   CHECK(ada.engine_encode_codecs() & av1 && blackwell.engine_encode_codecs() & av1 && ada.engine_encode_codecs() & h264);
   CHECK(unknown.engine_decode_codecs() == 0 && unknown.engine_encode_codecs() == 0);
-  // A device ID the table does not know is classified by the chip ID read from the GPU (GB202); a known ID is not overruled by it.
-  NvidiaVideoEngine by_chip(a, 0x0001, 0x1B200000u), by_id(a, 0x1B80, 0x1B200000u), no_chip(a, 0x0001, 0);
-  CHECK(by_chip.gpu().architecture == NvidiaGpuArchitecture::Blackwell && by_chip.engine_encode_codecs() & av1);
-  CHECK(by_id.gpu().architecture == NvidiaGpuArchitecture::Pascal && no_chip.engine_decode_codecs() == 0);
+  // A device ID the table does not know is classified by the chip ID read from the GPU (GB202); the chip outranks a table entry; GA100 has no NVENC.
+  NvidiaFakeRegs gb202(0x1B2, 0xA1), gp104(0x134, 0x11), ga100(0x170, 0xA1);
+  NvidiaVideoEngine by_chip(a, 0x0001, gb202.region()), by_id(a, 0x1B80, gb202.region()), no_chip(a, 0x0001), a100(a, 0x20B0, ga100.region()), plain(a, 0x1B80, gp104.region());
+  CHECK(by_chip.initialize() && by_id.initialize() && no_chip.initialize() && a100.initialize() && plain.initialize());
+  CHECK(by_chip.gpu().architecture == NvidiaGpuArchitecture::Blackwell && by_chip.engine_encode_codecs() & av1 && by_chip.chip_status().probed);
+  CHECK(by_id.gpu().architecture == NvidiaGpuArchitecture::Blackwell);   // the table said Pascal; the GPU says Blackwell
+  CHECK(!no_chip.chip_status().probed && no_chip.engine_decode_codecs() == 0);
+  CHECK(a100.gpu().architecture == NvidiaGpuArchitecture::Ampere && a100.engine_encode_codecs() == 0 && (a100.engine_decode_codecs() & av1));
+  CHECK(plain.gpu().architecture == NvidiaGpuArchitecture::Pascal && plain.engine_encode_codecs() & hevc && plain.chip_status().chip && plain.chip_status().stepping_major == 1);
   CHECK(pascal.initialize() && pascal.info().hardware_engine && !pascal.info().accelerated);
 }
 

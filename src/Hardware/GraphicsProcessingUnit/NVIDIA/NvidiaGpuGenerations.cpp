@@ -65,6 +65,20 @@ constexpr Range kRanges[] = {
     {0x2F00, 0x2FFF, A::Blackwell, "NVIDIA GeForce RTX 5070 (Blackwell, GB205)"},
 };
 
+struct Chip {
+  uint16_t chipset;
+  const char* name;
+};
+constexpr Chip kChips[] = {
+    {0x130, "GP100"}, {0x132, "GP102"}, {0x134, "GP104"}, {0x136, "GP106"}, {0x137, "GP107"}, {0x138, "GP108"},
+    {0x140, "GV100"},
+    {0x162, "TU102"}, {0x164, "TU104"}, {0x166, "TU106"}, {0x167, "TU117"}, {0x168, "TU116"},
+    {0x170, "GA100"}, {0x172, "GA102"}, {0x173, "GA103"}, {0x174, "GA104"}, {0x176, "GA106"}, {0x177, "GA107"},
+    {0x180, "GH100"},
+    {0x192, "AD102"}, {0x193, "AD103"}, {0x194, "AD104"}, {0x196, "AD106"}, {0x197, "AD107"},
+    {0x1A0, "GB100"}, {0x1B2, "GB202"}, {0x1B3, "GB203"}, {0x1B5, "GB205"}, {0x1B6, "GB206"}, {0x1B7, "GB207"},
+};
+
 // The chipset's architecture bits (chipset & 0x1F0) -> architecture.
 A architecture_of_chipset(uint32_t chipset) {
   switch (chipset & 0x1F0) {
@@ -123,7 +137,18 @@ NvidiaGpuInfo nvidia_gpu_identify(uint16_t device_id) {
 }
 
 NvidiaGpuInfo nvidia_gpu_identify_boot0(uint32_t boot0) {
-  return nvidia_gpu_info_for(architecture_of_chipset((boot0 >> 20) & 0x1FF));
+  return nvidia_gpu_info_for(architecture_of_chipset(nvidia_boot0_chipset(boot0)));
+}
+
+const char* nvidia_chip_name(uint32_t chipset) {
+  for (const Chip& c : kChips)
+    if (c.chipset == chipset) return c.name;
+  return nullptr;
+}
+
+bool nvidia_chip_has_nvenc(uint32_t chipset, NvidiaGpuArchitecture architecture) {
+  if (chipset == 0x130 || chipset == 0x170) return false;   // GP100 and GA100
+  return nvidia_gpu_info_for(architecture).has_nvenc;
 }
 
 bool nvidia_gpu_has_video_engine(NvidiaGpuArchitecture architecture) { return architecture != NvidiaGpuArchitecture::Unknown; }

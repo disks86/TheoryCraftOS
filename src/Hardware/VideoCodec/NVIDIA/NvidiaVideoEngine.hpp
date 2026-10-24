@@ -18,6 +18,8 @@
 
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.hpp"
+#include "Hardware/Mmio.hpp"
+#include "Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 
 namespace hardware {
@@ -30,12 +32,22 @@ class NvidiaVideoEngine final : public SoftwareVideoCodec {
  public:
   static constexpr uint16_t kPciVendor = 0x10DE;
 
-  // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown). `boot0` is the value of
-  // the GPU's NV_PMC_BOOT_0 register when it was read (0 = not read): it names the architecture of a card whose device ID is not in the table.
-  explicit NvidiaVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, uint32_t boot0 = 0)
-      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), gpu_(nvidia_gpu_identify(gpu_device_id)) {
-    if (gpu_.architecture == NvidiaGpuArchitecture::Unknown && boot0 != 0) gpu_ = nvidia_gpu_identify_boot0(boot0);
+  // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown). `registers` is the start of the
+  // GPU's register BAR (at least NvidiaMediaEngineHw::kRegisterWindow bytes), or an empty window to skip looking at the hardware.
+  explicit NvidiaVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& registers = MmioRegion())
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), gpu_(nvidia_gpu_identify(gpu_device_id)), registers_(registers) {}
+
+  // Reads the chip ID. What the chip says about itself outranks the device ID table: it names the architecture of a card the table does not know, corrects a
+  // table entry that is wrong, and tells the chips that have no NVENC. Always succeeds: the engine is there either way.
+  bool initialize() override {
+    status_ = NvidiaMediaEngineHw::probe(registers_);
+    if (status_.probed) {
+      if (status_.architecture != gpu_.architecture) gpu_ = nvidia_gpu_info_for(status_.architecture);
+      if (!status_.has_nvenc) gpu_.has_nvenc = gpu_.media_av1_encode = false;
+    }
+    return true;
   }
+  const NvidiaChipStatus& chip_status() const { return status_; }
 
   const char* name() const override { return "NVIDIA video engine (NVDEC/NVENC) (software path)"; }
   const NvidiaGpuInfo& gpu() const { return gpu_; }
@@ -56,6 +68,8 @@ class NvidiaVideoEngine final : public SoftwareVideoCodec {
   }
 
   NvidiaGpuInfo gpu_;
+  MmioRegion registers_;
+  NvidiaChipStatus status_;
 };
 
 }  // namespace hardware

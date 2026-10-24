@@ -49,17 +49,16 @@ MmioRegion SystemVideoCodecs::intel_registers(const PciDeviceInfo& d) const {
   return region;
 }
 
-// The chip ID of an NVIDIA GPU (NV_PMC_BOOT_0, the first register of BAR0), or 0 if it cannot be read: no mapper, memory decoding off, no BAR, or a
-// GPU that reads all ones. Read-only: nothing is written to the device.
-uint32_t SystemVideoCodecs::nvidia_boot0(const PciDeviceInfo& d) const {
+// The first page of an NVIDIA GPU's register BAR, where the chip ID registers are, if it is safe to touch: a mapper, memory decoding switched on (the
+// firmware did that for its display) and a register BAR the firmware assigned. Empty otherwise.
+MmioRegion SystemVideoCodecs::nvidia_registers(const PciDeviceInfo& d) const {
   constexpr uint16_t kPciCommand = 0x04;
   constexpr uint32_t kMemorySpace = 1u << 1;
-  if (!mmio_ || !(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return 0;
-  const uint64_t base = pci_.memory_bar(d.address, 0);
   MmioRegion region;
-  if (base == 0 || !mmio_->map_registers(base, kNvidiaRegisterWindow, &region)) return 0;
-  const uint32_t value = region.read32(kNvidiaBoot0Offset);
-  return value == 0xFFFFFFFFu ? 0 : value;
+  if (!mmio_ || !(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return region;
+  const uint64_t base = pci_.memory_bar(d.address, 0);
+  if (base == 0 || !mmio_->map_registers(base, NvidiaMediaEngineHw::kRegisterWindow, &region)) return MmioRegion();
+  return region;
 }
 
 // The last 64 KiB of an AMD GPU's video memory, where the IP discovery table is, if it can be reached: a generation that has one, a mapper and a
@@ -101,7 +100,7 @@ void SystemVideoCodecs::initialize() {
   PciDeviceInfo d;
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassDisplay) continue;
-    if (d.vendor_id == NvidiaVideoEngine::kPciVendor) try_add<NvidiaVideoEngine>(devices_, allocator_, d.device_id, nvidia_boot0(d));
+    if (d.vendor_id == NvidiaVideoEngine::kPciVendor) try_add<NvidiaVideoEngine>(devices_, allocator_, d.device_id, nvidia_registers(d));
     else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_, d.device_id);
     else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) add_intel(d);
   }

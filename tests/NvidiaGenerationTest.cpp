@@ -19,7 +19,9 @@
 // Host-side tests for the NVIDIA GPU architecture table (PCI device IDs, and the chip ID in NV_PMC_BOOT_0) and the codec sets of each
 // generation. Every 16-bit device ID and a sweep of boot0 values are classified (nothing may read out of range).
 #include <stdio.h>
+#include <vector>
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.hpp"
+#include "Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.hpp"
 
 using namespace hardware;
 
@@ -79,10 +81,75 @@ static void test_codecs() {
   }
 }
 
+// Pretend first page of the register BAR: plain memory the test fills with what the hardware would show.
+struct FakeRegs {
+  std::vector<uint32_t> words = std::vector<uint32_t>(0x1000 / 4, 0);
+  MmioRegion region() { return MmioRegion(reinterpret_cast<uint64_t>(words.data()), words.size() * 4); }
+  uint32_t& boot0() { return words[0]; }
+  uint32_t& boot42() { return words[kNvidiaBoot42Offset / 4]; }
+};
+
+static void test_probe() {
+  FakeRegs ad;
+  ad.boot0() = ad.boot42() = (0x194u << 20) | 0xA2;   // AD104, stepping A2
+  NvidiaChipStatus s = NvidiaMediaEngineHw::probe(ad.region());
+  CHECK(s.probed && s.chipset == 0x194 && s.architecture == A::AdaLovelace && s.chip && s.chip[0] == 'A' && s.chip[2] == '1' && s.boot42_present && s.has_nvenc);
+  CHECK(s.stepping_major == 0xA && s.stepping_minor == 0x2 && s.boot0 == ad.boot0());
+
+  // Pascal has no BOOT_42; a stray value there is ignored.
+  FakeRegs gp;
+  gp.boot0() = (0x132u << 20) | 0x11;
+  gp.boot42() = 0x12345678;
+  s = NvidiaMediaEngineHw::probe(gp.region());
+  CHECK(s.probed && s.architecture == A::Pascal && !s.boot42_present && s.stepping_major == 1 && s.stepping_minor == 1);
+
+  // The two registers must agree on a Turing or newer chip; GA100 and GP100 have no NVENC; an unnamed chip of a known architecture is still probed.
+  FakeRegs mismatch;
+  mismatch.boot0() = (0x172u << 20) | 0xA1; mismatch.boot42() = (0x192u << 20) | 0xA1;
+  CHECK(!NvidiaMediaEngineHw::probe(mismatch.region()).probed);
+  FakeRegs ga100, gp100, odd;
+  ga100.boot0() = ga100.boot42() = (0x170u << 20) | 0xA1;
+  gp100.boot0() = (0x130u << 20) | 0xA1;
+  odd.boot0() = odd.boot42() = (0x175u << 20) | 0xA1;
+  CHECK(!NvidiaMediaEngineHw::probe(ga100.region()).has_nvenc && !NvidiaMediaEngineHw::probe(gp100.region()).has_nvenc);
+  s = NvidiaMediaEngineHw::probe(odd.region());
+  CHECK(s.probed && s.architecture == A::Ampere && s.chip == nullptr && s.has_nvenc);
+
+  // A GPU that is off (all ones), a window that is not a GPU (zeros), an older chip, and a window that is too small.
+  FakeRegs off, zero, maxwell;
+  for (uint32_t& w : off.words) w = 0xFFFFFFFFu;
+  maxwell.boot0() = (0x120u << 20) | 0xA1;
+  CHECK(!NvidiaMediaEngineHw::probe(off.region()).probed && !NvidiaMediaEngineHw::probe(zero.region()).probed && !NvidiaMediaEngineHw::probe(maxwell.region()).probed);
+  CHECK(!NvidiaMediaEngineHw::probe(MmioRegion()).probed);
+  alignas(4) static uint32_t small[16] = {};
+  small[0] = (0x192u << 20);
+  CHECK(!NvidiaMediaEngineHw::probe(MmioRegion(reinterpret_cast<uint64_t>(small), sizeof small)).probed);
+  // BOOT_42 all ones on a Turing+ chip is "not there", not a disagreement.
+  FakeRegs gb; gb.boot0() = (0x1B2u << 20) | 0xA1; gb.boot42() = 0xFFFFFFFFu;
+  s = NvidiaMediaEngineHw::probe(gb.region());
+  CHECK(s.probed && !s.boot42_present && s.architecture == A::Blackwell);
+
+  // Chip names and NVENC facts straight from the table.
+  CHECK(nvidia_chip_name(0x132) && nvidia_chip_name(0x1B2) && !nvidia_chip_name(0x000) && !nvidia_chip_name(0x1FF));
+  CHECK(!nvidia_chip_has_nvenc(0x170, A::Ampere) && nvidia_chip_has_nvenc(0x172, A::Ampere) && !nvidia_chip_has_nvenc(0x180, A::Hopper));
+  // Every chipset with every stepping and an unrelated BOOT_42: the probe answers without anything inconsistent coming out.
+  for (uint32_t chipset = 0; chipset < 0x200; ++chipset)
+    for (uint32_t stepping = 0; stepping < 256; stepping += 17) {
+      FakeRegs r;
+      r.boot0() = (chipset << 20) | stepping;
+      r.boot42() = (chipset << 20) | stepping;
+      const NvidiaChipStatus st = NvidiaMediaEngineHw::probe(r.region());
+      CHECK(!st.probed || (st.architecture != A::Unknown && st.chipset == chipset));
+      r.boot42() = 0xDEADBEEFu;
+      (void)NvidiaMediaEngineHw::probe(r.region());
+    }
+}
+
 int main() {
   test_device_ids();
   test_boot0();
   test_codecs();
+  test_probe();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("NvidiaGenerationTest passed\n");
   return 0;
