@@ -32,6 +32,11 @@ bool IntelMediaVideoEngine::initialize() {
   } else {
     summary_.append(", video engine registers not read");
   }
+  if (gpu_.discrete && local_memory_bar_) {
+    summary_.append(", local memory aperture ");
+    summary_.append_uint(local_memory_bar_ >> 20);
+    summary_.append(" MiB");
+  }
   driver_.reset();
   info_.accelerated_decode_codecs = 0;
   // The driver is for Gen9.5 (the generation whose layouts it follows) and needs a video box that answered the look above.

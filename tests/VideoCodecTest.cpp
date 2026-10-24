@@ -604,10 +604,13 @@ struct IntelPci final : IPciBus {
 };
 
 struct FakeRegisterMapper final : IRegisterMapper {
-  std::vector<uint32_t> words = std::vector<uint32_t>(IntelMediaEngineHw::kRegisterWindow / 4, 0);
+  std::vector<uint32_t> words;
   int calls = 0;
+  uint64_t asked = 0;   // the length of the last request
+  explicit FakeRegisterMapper(uint64_t bytes = IntelMediaEngineHw::kRegisterWindow) : words(bytes / 4, 0) {}
   bool map_registers(uint64_t physical, uint64_t length, MmioRegion* region) override {
     ++calls;
+    asked = length;
     if (physical != 0x1000 || length > words.size() * 4) return false;
     *region = MmioRegion(reinterpret_cast<uint64_t>(words.data()), words.size() * 4);
     return true;
@@ -639,13 +642,35 @@ static void test_intel_system() {
     system.shutdown();
   }
   {
-    IntelPci pci(0x7D55, true);  // Meteor Lake: no known register layout
+    IntelPci pci(0xB080, true);  // Panther Lake (Xe3): no known register layout
     FakeRegisterMapper mapper;
     SystemVideoCodecs system(pci, a);
     system.set_mmio(&mapper);
     system.initialize();
     CHECK(mapper.calls == 0 && !intel_engine(system)->engine_status().probed);
     system.shutdown();
+  }
+  {
+    // Meteor Lake and Arc Battlemage: the media tile is far into the BAR, so the request covers it (a mapper that cannot give that much leaves the engine unprobed).
+    const uint64_t window = IntelMediaEngineHw::register_window(IntelGpuArchitecture::XeLpg);
+    for (uint16_t id : {uint16_t{0x7D55}, uint16_t{0xE20B}}) {
+      IntelPci pci(id, true);
+      FakeRegisterMapper mapper(window);
+      const uint64_t base = IntelMediaEngineHw::kMediaTileBase;
+      mapper.words[(base + 0x0D50) / 4] = mapper.words[(base + 0x0D58) / 4] = 1;
+      SystemVideoCodecs system(pci, a);
+      system.set_mmio(&mapper);
+      system.initialize();
+      CHECK(mapper.calls == 1 && mapper.asked == window && intel_engine(system)->engine_status().probed && intel_engine(system)->engine_status().vdbox_count() == 2);
+      system.shutdown();
+      IntelPci cut_pci(id, true);
+      FakeRegisterMapper small;
+      SystemVideoCodecs cut(cut_pci, a);
+      cut.set_mmio(&small);
+      cut.initialize();
+      CHECK(small.calls == 1 && !intel_engine(cut)->engine_status().probed);
+      cut.shutdown();
+    }
   }
   {
     IntelPci pci(0x9A49, true);  // no mapper at all
@@ -1304,6 +1329,27 @@ static void test_vp8_robustness() {
 }
 
 // The Intel media engine device: a software codec that has looked at (pretend) hardware registers and says what it found.
+// An Arc Battlemage card: the media tile is 0x380000 into the register BAR, and its local memory has a BAR of its own.
+static void test_intel_arc_engine() {
+  TestAllocator heap;
+  std::vector<uint32_t> bar(IntelMediaEngineHw::register_window(IntelGpuArchitecture::Xe2) / 4, 0);
+  const uint64_t base = IntelMediaEngineHw::kMediaTileBase;
+  bar[(base + 0x0D50) / 4] = bar[(base + 0x0D58) / 4] = 1;
+  const MmioRegion registers(reinterpret_cast<uint64_t>(bar.data()), bar.size() * 4);
+  IntelMediaVideoEngine arc(heap, 0xE20B, registers);   // Arc B580
+  arc.set_local_memory_bar(16ull << 30);
+  CHECK(arc.initialize() && arc.engine_status().probed && arc.engine_status().vdbox_count() == 2 && arc.gpu().discrete);
+  CHECK(strstr(arc.engine_summary(), "Xe2") && strstr(arc.engine_summary(), "2 of 2 awake") && strstr(arc.engine_summary(), "local memory aperture 16384 MiB"));
+  CHECK(arc.engine_decode_codecs() & codec_mask(VideoCodec::Av1) && arc.engine_encode_codecs() & codec_mask(VideoCodec::Av1));
+  // An integrated part never reports local memory; a card with a BAR too short for the tile is not probed.
+  IntelMediaVideoEngine lunar(heap, 0x64A0, registers);
+  lunar.set_local_memory_bar(1ull << 30);
+  CHECK(lunar.initialize() && lunar.engine_status().probed && !strstr(lunar.engine_summary(), "local memory"));
+  std::vector<uint32_t> short_bar(IntelMediaEngineHw::kRegisterWindow / 4, 0);
+  IntelMediaVideoEngine cut(heap, 0xE20B, MmioRegion(reinterpret_cast<uint64_t>(short_bar.data()), short_bar.size() * 4));
+  CHECK(cut.initialize() && !cut.engine_status().probed && strstr(cut.engine_summary(), "not read"));
+}
+
 static void test_intel_media_engine() {
   TestAllocator heap;
   std::vector<uint32_t> words(IntelMediaEngineHw::kRegisterWindow / 4, 0);
@@ -1417,6 +1463,7 @@ int main() {
   test_sessions();
   test_system_list();
   test_intel_media_engine();
+  test_intel_arc_engine();
   test_amd_media_engine();
   test_amd_discovery_engine();
   test_nvidia_media_engine();

@@ -45,7 +45,7 @@ MmioRegion SystemVideoCodecs::intel_registers(const PciDeviceInfo& d) const {
   if (!mmio_ || !IntelMediaEngineHw::supported(intel_gpu_identify(d.device_id).architecture)) return region;
   if (!(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return region;
   const uint64_t base = pci_.memory_bar(d.address, 0);
-  if (base == 0 || !mmio_->map_registers(base, IntelMediaEngineHw::kRegisterWindow, &region)) return MmioRegion();
+  if (base == 0 || !mmio_->map_registers(base, IntelMediaEngineHw::register_window(intel_gpu_identify(d.device_id).architecture), &region)) return MmioRegion();
   return region;
 }
 
@@ -110,8 +110,16 @@ void SystemVideoCodecs::initialize() {
 void SystemVideoCodecs::add_intel(const PciDeviceInfo& d) {
   UniquePointer<IntelMediaVideoEngine> device = UniquePointer<IntelMediaVideoEngine>::make(allocator_, allocator_, d.device_id, intel_registers(d));
   if (!device) return;
+  // A discrete card (Arc) has memory of its own behind a BAR of its own (BAR 2); how big the firmware left that window tells whether Resizable BAR is on.
+  if (device->gpu().discrete && bar_sizer_) {
+    constexpr uint16_t kPciCommand = 0x04;
+    constexpr uint32_t kMemorySpace = 1u << 1;
+    uint64_t local_memory = 0;
+    if ((pci_.read32(d.address, kPciCommand) & kMemorySpace) && bar_sizer_->bar_size(d.address, 2, &local_memory)) device->set_local_memory_bar(local_memory);
+  }
   IntelHardware hardware;
-  if (intel_hardware_ && !intel_registers_bank_ && intel_hardware_setup(d, &hardware)) {
+  // The engine driver follows the Gen9.5 layouts only (its GTT geometry, its video box); no other generation gets its GTT looked at.
+  if (intel_hardware_ && device->gpu().architecture == IntelGpuArchitecture::Gen9_5 && !intel_registers_bank_ && intel_hardware_setup(d, &hardware)) {
     intel_registers_bank_ = UniquePointer<intel_gt::MmioRegisterBank>::make(allocator_, hardware.registers);
     if (intel_registers_bank_) {
       IntelMediaVideoEngine::HardwareSetup setup;

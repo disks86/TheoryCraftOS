@@ -49,6 +49,10 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
     uint64_t ggtt_first_page = 0;
     intel_gt::IGpuMemory* memory = nullptr;
   };
+  // The size of the memory aperture (BAR 2) of a discrete card, as the firmware left it, for the boot log. Call before initialize().
+  void set_local_memory_bar(uint64_t bytes) { local_memory_bar_ = bytes; }
+  uint64_t local_memory_bar() const { return local_memory_bar_; }
+
   // Opts in to running H.264 decoding on the engine. Call before initialize(); everything in `setup` must outlive this device.
   void set_hardware(const HardwareSetup& setup) { setup_ = setup; }
   // Is H.264 decoding running on the engine?
@@ -85,6 +89,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   MmioRegion registers_;
   IntelMediaEngineStatus status_;
   FixedString<120> summary_;
+  uint64_t local_memory_bar_ = 0;
   HardwareSetup setup_;
   UniquePointer<intel_gt::VcsDriver> driver_;
 };

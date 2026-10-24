@@ -112,7 +112,12 @@ struct FakeRegisters {
 static void test_media_engine() {
   using A = IntelGpuArchitecture;
   CHECK(IntelMediaEngineHw::supported(A::Gen9_5) && IntelMediaEngineHw::supported(A::XeLp));
-  CHECK(!IntelMediaEngineHw::supported(A::XeLpg) && !IntelMediaEngineHw::supported(A::Xe2) && !IntelMediaEngineHw::supported(A::Unknown));
+  CHECK(IntelMediaEngineHw::supported(A::XeHpg) && IntelMediaEngineHw::supported(A::XeLpg) && IntelMediaEngineHw::supported(A::Xe2));
+  CHECK(!IntelMediaEngineHw::supported(A::Xe3) && !IntelMediaEngineHw::supported(A::XeHpc) && !IntelMediaEngineHw::supported(A::Unknown));
+  // The register block starts at the BAR for most generations and 0x380000 into it on a standalone media tile; the window to map covers the block.
+  CHECK(IntelMediaEngineHw::register_base(A::XeHpg) == 0 && IntelMediaEngineHw::register_base(A::Gen9_5) == 0);
+  CHECK(IntelMediaEngineHw::register_base(A::XeLpg) == 0x380000 && IntelMediaEngineHw::register_base(A::Xe2) == 0x380000);
+  CHECK(IntelMediaEngineHw::register_window(A::XeLp) == 0x20000 && IntelMediaEngineHw::register_window(A::Xe2) == 0x3A0000 && IntelMediaEngineHw::register_window(A::Xe3) == 0);
 
   // Gen9.5: one box; it acknowledges when the ack bit is set, and the request is withdrawn afterwards.
   FakeRegisters g9;
@@ -138,7 +143,28 @@ static void test_media_engine() {
   CHECK(s.vdbox_present == 0 && s.vdbox_count() == 0);
 
   // Unsupported generations and short windows read nothing.
-  CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeLpg).probed);
+  // Arc Alchemist (Xe-HPG) reads like Xe-LP. The standalone media tile (Meteor Lake and Arrow Lake graphics, Lunar Lake, Arc Battlemage) is the same
+  // block 0x380000 into the BAR: a BAR that ends before it is refused, and nothing outside the tile is touched.
+  FakeRegisters hpg;
+  hpg.at(0x0D50) = hpg.at(0x0D58) = 1;
+  s = IntelMediaEngineHw::probe(hpg.region(), A::XeHpg);
+  CHECK(s.probed && s.vdbox_present == 0x5 && s.vdbox_awake == 0x5);
+  CHECK(!IntelMediaEngineHw::probe(lp.region(), A::XeLpg).probed && !IntelMediaEngineHw::probe(lp.region(), A::Xe2).probed);   // BAR too short for the tile
+  for (A tile : {A::XeLpg, A::Xe2}) {
+    std::vector<uint32_t> bar(IntelMediaEngineHw::register_window(tile) / 4, 0);
+    const uint64_t base = IntelMediaEngineHw::kMediaTileBase;
+    bar[(base + 0x0D50) / 4] = bar[(base + 0x0D58) / 4] = 1;   // both boxes acknowledge
+    const MmioRegion region(reinterpret_cast<uint64_t>(bar.data()), bar.size() * 4);
+    s = IntelMediaEngineHw::probe(region, tile);
+    CHECK(s.probed && s.vdbox_present == 0x5 && s.vdbox_awake == 0x5 && s.vdbox_count() == 2);
+    CHECK(bar[(base + 0xA540) / 4] == 0x00010000 && bar[(base + 0xA548) / 4] == 0x00010000 && bar[0xA540 / 4] == 0);   // requests withdrawn; the GT half untouched
+    bar[(base + 0x9140) / 4] = 0x4;   // VCS2 fused off
+    s = IntelMediaEngineHw::probe(region, tile);
+    CHECK(s.vdbox_present == 0x1 && s.vdbox_awake == 0x1);
+    bar[(base + 0x0D50) / 4] = 0;     // the remaining box never wakes
+    s = IntelMediaEngineHw::probe(region, tile);
+    CHECK(s.probed && s.vdbox_awake == 0 && bar[(base + 0xA540) / 4] == 0x00010000);
+  }
   CHECK(!IntelMediaEngineHw::probe(MmioRegion(), A::XeLp).probed);
   alignas(4) static uint32_t small[16] = {};
   CHECK(!IntelMediaEngineHw::probe(MmioRegion(reinterpret_cast<uint64_t>(small), sizeof small), A::XeLp).probed);

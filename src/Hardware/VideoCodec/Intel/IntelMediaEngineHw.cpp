@@ -52,14 +52,25 @@ bool IntelMediaEngineHw::supported(IntelGpuArchitecture architecture) {
     case IntelGpuArchitecture::Gen9_5:
     case IntelGpuArchitecture::Gen11:
     case IntelGpuArchitecture::XeLp:
-    case IntelGpuArchitecture::XeHpg: return true;
+    case IntelGpuArchitecture::XeHpg:
+    case IntelGpuArchitecture::XeLpg:
+    case IntelGpuArchitecture::Xe2: return true;
     default: return false;
   }
 }
 
-IntelMediaEngineStatus IntelMediaEngineHw::probe(const MmioRegion& registers, IntelGpuArchitecture architecture) {
+uint64_t IntelMediaEngineHw::register_base(IntelGpuArchitecture architecture) {
+  return architecture == IntelGpuArchitecture::XeLpg || architecture == IntelGpuArchitecture::Xe2 ? kMediaTileBase : 0;
+}
+
+uint64_t IntelMediaEngineHw::register_window(IntelGpuArchitecture architecture) {
+  return supported(architecture) ? register_base(architecture) + kRegisterWindow : 0;
+}
+
+IntelMediaEngineStatus IntelMediaEngineHw::probe(const MmioRegion& bar, IntelGpuArchitecture architecture) {
   IntelMediaEngineStatus status;
-  if (!supported(architecture) || registers.length() < kRegisterWindow) return status;
+  if (!supported(architecture) || bar.length() < register_window(architecture)) return status;
+  const MmioRegion registers = bar.subregion(register_base(architecture), kRegisterWindow);
   status.probed = true;
   if (architecture == IntelGpuArchitecture::Gen9_5) {
     status.vdbox_present = 1;
