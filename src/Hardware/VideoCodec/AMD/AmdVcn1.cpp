@@ -457,7 +457,9 @@ AmdVcn1::Status AmdVcn1::start_spg_mode(const AmdVcnFirmware& firmware, const Me
   tmp &= ~UVD_SOFT_RESET__LMI_UMC_SOFT_RESET_MASK;
   WREG32_SOC15(UVD, 0, mmUVD_SOFT_RESET, tmp);
 
-  for (i = 0; i < 10; ++i) {
+  r = -1;
+  const uint32_t attempts = config_.boot_attempts ? config_.boot_attempts : 1;
+  for (i = 0; i < static_cast<int>(attempts); ++i) {
     uint32_t status;
 
     for (j = 0; j < 100; ++j) {

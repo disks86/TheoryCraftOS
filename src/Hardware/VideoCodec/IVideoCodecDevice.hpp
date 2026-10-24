@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/Clock/IClock.hpp"
 #include "Hardware/IHardware.hpp"
 #include "Hardware/RegisterMapper.hpp"
 #include "Hardware/VideoCodec/IVideoDecoder.hpp"
@@ -76,6 +77,9 @@ class IVideoCodecDevice : public IHardware {
   // plan_status() says what came of it ("" when the device has nothing to plan). Needs the firmware loaded first, since its size sets the size of the block.
   virtual bool plan_engine(const VideoEngineEnvironment& environment) { (void)environment; return false; }
   virtual const char* plan_status() const { return ""; }
+  // Brings the engine up if everything checked out (a plan, and the hardware agreeing with it), leaving it idle; true if it is running. firmware_status() says
+  // what came of it. The device stops it again in shutdown(). Nothing decodes on a started engine unless info() says so.
+  virtual bool start_hardware(const IClock& clock) { (void)clock; return false; }
   virtual uint64_t gpu_memory_bytes() const { return 0; }
 
  protected:

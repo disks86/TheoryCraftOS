@@ -18,6 +18,7 @@
 
 #include "Browser/DomBindings.hpp"
 #include <new>
+#include <initializer_list>
 #include "Browser/DomBindingsInternal.hpp"
 #include "Utility/Move.hpp"
 
@@ -80,7 +81,12 @@ dom::Node* arg_node(Vm& vm, const Value* args, uint32_t argc, uint32_t i) {
   return n;
 }
 
-JsObject* make_collection(DomBindings::Impl& c, const List<dom::Node*>& nodes) {
+void set_interface(Vm& vm, JsObject* array, const char* name) {
+  Value ctor, proto;
+  if (vm.get_named(Value::make_object(vm.global()), name, &ctor) && ctor.is_object() && vm.get_named(ctor, "prototype", &proto) && proto.is_object()) array->proto = proto.as_object();
+}
+
+JsObject* make_collection(DomBindings::Impl& c, const List<dom::Node*>& nodes, bool html_collection) {
   Vm& vm = c.vm;
   JsObject* list = vm.new_array(static_cast<uint32_t>(nodes.count()));
   for (uint64_t i = 0; i < nodes.count(); ++i) vm.array_push(list, node_value(c, nodes[i]));
@@ -89,6 +95,7 @@ JsObject* make_collection(DomBindings::Impl& c, const List<dom::Node*>& nodes) {
   vm.get_named(Value::make_object(vm.global()), "__collection_named", &named);
   vm.define_named(list, "item", item, kWritable);
   vm.define_named(list, "namedItem", named, kWritable);
+  set_interface(vm, list, html_collection ? "HTMLCollection" : "NodeList");
   return list;
 }
 
@@ -198,7 +205,18 @@ bool DomBindings::install() {
   c.window_listeners = vm_.new_plain();
   vm_.define_named(vm_.global(), "__wrappers", Value::make_object(c.wrappers), 0);
   vm_.define_named(vm_.global(), "__media_lists", Value::make_object(c.media_lists), 0);
-  return bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_mse(c) && bind::install_tracks(c) && bind::install_dash(c) && bind::install_forms(c) && bind::install_net(c) && !vm_.halted();
+  const bool ok = bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_mse(c) && bind::install_tracks(c) && bind::install_dash(c) && bind::install_forms(c) && bind::install_net(c) && !vm_.halted();
+  // The prototypes and objects that only this code holds are kept alive by a hidden global: a collection before the page first used one would free them.
+  if (ok) {
+    JsObject* kept = vm_.new_array();
+    for (JsObject* o : {c.node_proto, c.element_proto, c.html_proto, c.character_data_proto, c.text_proto, c.comment_proto, c.document_proto, c.fragment_proto, c.event_proto,
+                        c.token_list_proto, c.style_proto, c.computed_proto, c.storage_proto, c.location_proto, c.history_proto, c.media_query_proto, c.exception_proto,
+                        c.canvas_context_proto, c.gradient_proto, c.pattern_proto, c.path2d_proto, c.typed_array_proto, c.image_data_proto, c.text_metrics_proto,
+                        c.thenable_proto, c.time_ranges_proto, c.media_error_proto, c.shadow_root_proto, c.tag_protos, c.window_listeners, c.location, c.local_storage, c.session_storage})
+      if (o) vm_.array_push(kept, Value::make_object(o));
+    vm_.define_named(vm_.global(), "__native_protos", Value::make_object(kept), 0);
+  }
+  return ok;
 }
 
 bool DomBindings::dispatch(dom::Node* target, StringView type, const EventInit& init) {

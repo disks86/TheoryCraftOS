@@ -225,13 +225,43 @@ static void test_timeout() {
   int resets = 0;
   for (size_t i = 0; i < regs.log.size(); ++i)
     if (regs.log[i].first == REG(mmUVD_SOFT_RESET) && (regs.log[i].second & UVD_SOFT_RESET__VCPU_SOFT_RESET_MASK)) ++resets;
-  CHECK(resets >= 10);
+  CHECK(resets == 10 + 1);   // the driver's ten attempts, and the stop sequence that follows a failed start puts the VCPU into reset once more
   const int irq_off = regs.first(REG(mmUVD_MASTINT_EN));
   CHECK(regs.count(REG(mmUVD_MASTINT_EN)) == 1 && !(regs.log[static_cast<size_t>(irq_off)].second & UVD_MASTINT_EN__VCPU_EN_MASK));
   CHECK(regs.count(REG(mmUVD_RBC_RB_CNTL)) == 0 && regs.count(REG(mmUVD_RB_BASE_LO)) == 0 && regs.count(REG(mmUVD_LMI_RBC_RB_64BIT_BAR_LOW)) == 0);
   // ...and puts the engine back to sleep: VCPU clock off, in reset, status cleared.
   CHECK(regs.last(REG(mmUVD_STATUS)) == 0);
   CHECK(!(regs.last(REG(mmUVD_VCPU_CNTL)) & UVD_VCPU_CNTL__CLK_EN_MASK) && (regs.last(REG(mmUVD_SOFT_RESET)) & UVD_SOFT_RESET__VCPU_SOFT_RESET_MASK));
+}
+
+// How long the VCPU is given: the driver's ten attempts by default, fewer when the caller asks, and at least one.
+static void test_boot_attempts() {
+  auto resets_for = [](uint32_t attempts, uint64_t* elapsed_us) {
+    Setup s;
+    FakeClock clock;
+    FakeRegisters regs;
+    regs.responsive = false;
+    s.config.boot_attempts = attempts;
+    AmdVcn1 vcn(regs, clock);
+    CHECK(vcn.start(s.firmware, s.memory, s.config) == AmdVcn1::Status::TimedOut);
+    *elapsed_us = clock.now;
+    int resets = 0;
+    for (const auto& w : regs.log)
+      if (w.first == REG(mmUVD_SOFT_RESET) && (w.second & UVD_SOFT_RESET__VCPU_SOFT_RESET_MASK)) ++resets;
+    // The stop that follows a failed start puts the VCPU into reset once more; that one is not an attempt.
+    return resets - 1;
+  };
+  uint64_t t3 = 0, t10 = 0, t1 = 0, t0 = 0;
+  const int r3 = resets_for(3, &t3), r10 = resets_for(10, &t10), r1 = resets_for(1, &t1), r0 = resets_for(0, &t0);
+  CHECK(r3 == 3 && r10 == 10 && r1 == 1 && r0 == 1);   // zero is treated as one: an attempt is always made
+  CHECK(t3 < t10 && t1 < t3 && t0 == t1);              // and fewer attempts means less time spent waiting
+  // A VCPU that answers does not use up its attempts.
+  Setup s;
+  FakeClock clock;
+  FakeRegisters regs;
+  s.config.boot_attempts = 1;
+  AmdVcn1 vcn(regs, clock);
+  CHECK(vcn.start(s.firmware, s.memory, s.config) == AmdVcn1::Status::Ok);
 }
 
 static void test_stop() {
@@ -315,6 +345,7 @@ int main() {
   test_start(false, true);
   test_start(true, true);
   test_timeout();
+  test_boot_attempts();
   test_stop();
   test_bad_input();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

@@ -36,15 +36,16 @@ class Document;
 enum class NodeType : uint8_t { Element = 1, Text = 3, Comment = 8, Document = 9, Fragment = 11 };
 
 struct Attribute {
-  explicit Attribute(allocators::IAllocator& allocator) : name(allocator), value(allocator) {}
+  explicit Attribute(allocators::IAllocator& allocator) : name(allocator), value(allocator), ns(allocator) {}
   String name, value;
+  String ns;   // the namespace of an attribute made with setAttributeNS (empty: none)
 };
 
 // Bits of Node::ui_state.
 enum UiState : uint8_t { kUiHover = 1, kUiActive = 2 };
 
 struct Node {
-  Node(allocators::IAllocator& allocator, NodeType t, Document* d) : type(t), owner(d), name(allocator), data(allocator), attrs(allocator) {}
+  Node(allocators::IAllocator& allocator, NodeType t, Document* d) : type(t), owner(d), name(allocator), data(allocator), attrs(allocator), ns(allocator), qname(allocator) {}
 
   NodeType type;
   Node *parent = nullptr, *first_child = nullptr, *last_child = nullptr, *prev = nullptr, *next = nullptr;
@@ -53,6 +54,10 @@ struct Node {
   String name;               // elements: the lowercase tag name; others: "#text", "#comment", "#document", "#document-fragment"
   String data;               // text and comments
   List<Attribute> attrs;     // elements
+  // elements: the namespace and the qualified name as the page wrote them. An element of HTML has neither (ns_set is false: its namespace is XHTML, its name `name`).
+  String ns, qname;
+  bool ns_set = false;
+  uint8_t dom_type = 0;      // a comment or text node that stands for a node of another type: 7 a processing instruction (name is its target), 4 a CDATA section
   void* script = nullptr;    // the script engine's object for this node
   Node* content = nullptr;   // <template>: the fragment that holds what is inside it (it is not part of the page)
   Node* shadow = nullptr;    // elements: the shadow root (a fragment) that is drawn in place of the children
@@ -97,6 +102,8 @@ class Document {
   Node* root() const { return root_; }                  // the Document node
   // True for a page read without a doctype: it is laid out the way old pages expect (a table does not take its text alignment from what it is in).
   bool quirks_mode = false;
+  // What contentType says when the document is not HTML ("application/xml" ...); empty for a page of HTML.
+  String content_type;
   Node* document_element() const;                       // <html>
   Node* head() const;
   Node* body() const;

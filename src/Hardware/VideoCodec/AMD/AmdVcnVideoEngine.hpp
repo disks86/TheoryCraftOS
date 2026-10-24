@@ -146,8 +146,27 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     if (!vcn_registers_) return AmdVcn1::Status::NoMemory;
     AmdVcn1::Config config;
     config.gb_addr_config = plan_.gb_addr_config;
+    config.boot_attempts = kBootAttempts;
     return start_engine(*vcn_registers_, clock, memory_, config);
   }
+
+  // Starts the engine when, and only when, every check passed: the plan is whole, and the graphics block itself reports the address configuration this chip variant
+  // should have (so the chip is the one we think it is and the firmware has set its memory system up). A plan whose hardware register could not be read is not
+  // enough. Three tries for the VCPU to answer, not the driver's ten.
+  bool start_hardware(const IClock& clock) override {
+    if (engine_running()) return true;
+    if (!planned_) return false;   // (plan_status() already says why)
+    if (plan_.result != AmdVcn1Plan::Result::Ok || plan_.gb_check != AmdGbAddrConfigCheck::Matches) {
+      engine_note_ = "engine not started: the graphics block did not confirm the address configuration";
+      rebuild_firmware_text();
+      refresh_summary();
+      return false;
+    }
+    return start_planned_engine(clock) == AmdVcn1::Status::Ok;
+  }
+
+  // The engine is put back to sleep when the device is shut down.
+  void shutdown() override { stop_engine(); }
 
   // Puts the engine back to sleep. Safe when it was never started.
   void stop_engine() {
@@ -197,6 +216,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   }
 
  private:
+  static constexpr uint32_t kBootAttempts = 3;
   static void append_hex(FixedString<255>& out, uint64_t value) {
     bool started = false;
     for (int shift = 60; shift >= 0; shift -= 4) {

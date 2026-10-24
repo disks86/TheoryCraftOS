@@ -80,6 +80,9 @@ class AmdVcn1 {
     bool power_gating = false;
     bool clock_gating = false;
     uint32_t gb_addr_config = 0;
+    // How many times the VCPU is given its 100 x 10 ms to answer, resetting it between tries. The driver makes 10 attempts - up to ten seconds when it never
+    // answers - which is far too long to hold up boot, so the caller may ask for fewer (at least one is always made). The sequence itself is unchanged.
+    uint32_t boot_attempts = 10;
   };
   enum class Status : uint8_t { Ok, BadFirmware, BadMemory, TimedOut, NoMemory };
 

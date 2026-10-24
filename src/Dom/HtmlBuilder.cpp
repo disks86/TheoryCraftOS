@@ -414,6 +414,7 @@ class TreeBuilder {
     Node* el = make_element(name);
     if (!el) return after;
     read_attributes(attrs, el);
+    set_namespace(el, name);
     insert(el);
     bool is_void = is_void_tag(name);
     if (!is_void && attrs.trimmed().ends_with('/')) {   // <rect ... /> in an svg is closed in place
@@ -446,6 +447,32 @@ class TreeBuilder {
       if (name_in(name, {"pre", "listing"})) skip_newline_ = true;
     }
     return after;
+  }
+
+  // The elements of an <svg> or <math> are not HTML: they get that namespace (and, for svg, the spelling of their names). What is inside a <foreignObject> is HTML again.
+  void set_namespace(Node* el, StringView name) {
+    static const char* const kSvg = "http://www.w3.org/2000/svg";
+    static const char* const kMath = "http://www.w3.org/1998/Math/MathML";
+    const char* ns = nullptr;
+    if (name.equals("svg")) ns = kSvg;
+    else if (name.equals("math")) ns = kMath;
+    else {
+      const Node* p = current();
+      if (p && p->is_element() && p->ns_set && !p->ns.empty() && !p->name.view().equals("foreignobject") && !p->name.view().equals("annotation-xml")) ns = p->ns.view().equals(kSvg) ? kSvg : kMath;
+    }
+    if (!ns) return;
+    el->ns_set = true;
+    el->ns.assign(ns);
+    if (ns != kSvg) return;
+    static const char* const kCamel[] = {"altGlyph", "altGlyphDef", "altGlyphItem", "animateColor", "animateMotion", "animateTransform", "clipPath", "feBlend", "feColorMatrix", "feComponentTransfer",
+                                         "feComposite", "feConvolveMatrix", "feDiffuseLighting", "feDisplacementMap", "feDistantLight", "feDropShadow", "feFlood", "feFuncA", "feFuncB", "feFuncG",
+                                         "feFuncR", "feGaussianBlur", "feImage", "feMerge", "feMergeNode", "feMorphology", "feOffset", "fePointLight", "feSpecularLighting", "feSpotLight", "feTile",
+                                         "feTurbulence", "foreignObject", "glyphRef", "linearGradient", "radialGradient", "textPath"};
+    for (const char* camel : kCamel)
+      if (name.equals_ignore_case(camel)) {
+        el->qname.assign(camel);
+        break;
+      }
   }
 
   // A <script> has been read (it is in the tree): run it, and read what it wrote.
