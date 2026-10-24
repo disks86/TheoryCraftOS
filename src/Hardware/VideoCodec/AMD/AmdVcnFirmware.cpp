@@ -98,8 +98,8 @@ AmdFirmwareStatus AmdVcnFirmware::load(filesystem::IFileSystem& file_system, con
   ByteBuffer path(allocator_);
   for (const char* c = file_name; *c; ++c)
     if (*c == '/' || *c == '\\') return AmdFirmwareStatus::NotFound;
-  if (!path.append(ConstByteView(reinterpret_cast<const uint8_t*>(kFolder), __builtin_strlen(kFolder))) ||
-      !path.append(ConstByteView(reinterpret_cast<const uint8_t*>(file_name), __builtin_strlen(file_name))))
+  if (!path.append(ConstByteView(reinterpret_cast<const uint8_t*>(kFolder), StringView(kFolder).size())) ||
+      !path.append(ConstByteView(reinterpret_cast<const uint8_t*>(file_name), StringView(file_name).size())))
     return AmdFirmwareStatus::NoMemory;
   UniquePointer<filesystem::IFile> file;
   const filesystem::Status opened = file_system.open_file(StringView(reinterpret_cast<const char*>(path.view().data()), path.size()), filesystem::OpenMode::Read, &file);
