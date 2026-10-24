@@ -367,7 +367,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (IS("attributes")) { *out = attributes_value(c, n); return true; }
   if (IS("offsetWidth") || IS("offsetHeight") || IS("offsetLeft") || IS("offsetTop") || IS("clientWidth") || IS("clientHeight") || IS("clientLeft") || IS("clientTop") ||
       IS("scrollWidth") || IS("scrollHeight") || IS("scrollLeft") || IS("scrollTop")) {
-    double box[4];
+    double box[8];
     *out = num_value(0);
     if (element && (IS("offsetWidth") || IS("offsetHeight") || IS("clientWidth") || IS("clientHeight") || IS("scrollWidth") || IS("scrollHeight")) && c.host.node_rect(n, box)) {
       const bool width = IS("offsetWidth") || IS("clientWidth") || IS("scrollWidth");
@@ -1039,7 +1039,7 @@ NATIVE(el_insert_adjacent_text) {
 
 NATIVE(el_rect) {
   // (viewport coordinates: the box on the page minus where the page is scrolled to; an element with no box has an all-zero rectangle)
-  double box[4] = {0, 0, 0, 0};
+  double box[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   dom::Node* n = node_of(self);
   if (!n || !impl(vm).host.node_rect(n, box)) box[0] = box[1] = box[2] = box[3] = 0;
   else box[1] -= impl(vm).scroll_line;

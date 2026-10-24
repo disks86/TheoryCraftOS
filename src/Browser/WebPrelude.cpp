@@ -8021,6 +8021,120 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     hide(g, '__io_run', run);
     hide(g, 'IntersectionObserver', IntersectionObserver);
   }());
+  // ---------------------------------------------------------------------------------------------------------------------------------- ResizeObserver
+  // Sizes come from __rect() (the boxes of the last picture); the observers look again after every picture. An element with no box is 0 x 0.
+  (function () {
+    var active = [];   // observers that have targets
+    var pendingRun = false;
+    var BOXES = ['content-box', 'border-box', 'device-pixel-content-box'];
+
+    function ResizeObserverSize() { throw new TypeError('Illegal constructor'); }
+    var makeSize = function (inline, block) { var s = Object.create(ResizeObserverSize.prototype); hide(s, '__v', [inline, block]); return s; };
+    Object.defineProperty(ResizeObserverSize.prototype, 'inlineSize', { get: function () { return this.__v[0]; }, enumerable: true, configurable: true });
+    Object.defineProperty(ResizeObserverSize.prototype, 'blockSize', { get: function () { return this.__v[1]; }, enumerable: true, configurable: true });
+    Object.defineProperty(ResizeObserverSize.prototype, Symbol.toStringTag, { value: 'ResizeObserverSize', configurable: true });
+    hide(g, 'ResizeObserverSize', ResizeObserverSize);
+
+    function ResizeObserverEntry() { throw new TypeError('Illegal constructor'); }
+    ['target', 'contentRect', 'borderBoxSize', 'contentBoxSize', 'devicePixelContentBoxSize'].forEach(function (name) {
+      Object.defineProperty(ResizeObserverEntry.prototype, name, { get: function () { return this.__d[name]; }, enumerable: true, configurable: true });
+    });
+    Object.defineProperty(ResizeObserverEntry.prototype, Symbol.toStringTag, { value: 'ResizeObserverEntry', configurable: true });
+    hide(g, 'ResizeObserverEntry', ResizeObserverEntry);
+
+    // [border width, border height, content width, content height, device pixel content width, height, padding left, padding top] of an element now
+    var sizesOf = function (el) {
+      var r = el.isConnected ? __rect(el) : null;
+      if (!r) return [0, 0, 0, 0, 0, 0, 0, 0];
+      var dpr = g.devicePixelRatio || 1;
+      return [r[2], r[3], r[4], r[5], Math.round(r[4] * dpr), Math.round(r[5] * dpr), r[6], r[7]];
+    };
+    var observed = function (box, z) { return box === 'border-box' ? [z[0], z[1]] : box === 'device-pixel-content-box' ? [z[4], z[5]] : [z[2], z[3]]; };
+    var depthOf = function (el) { var d = 0; for (var p = el.parentNode; p; p = p.parentNode) d++; return d; };
+    var entryFor = function (target, z) {
+      var e = Object.create(ResizeObserverEntry.prototype);
+      hide(e, '__d', {
+        target: target,
+        contentRect: new DOMRectReadOnly(z[6], z[7], z[2], z[3]),
+        borderBoxSize: Object.freeze([makeSize(z[0], z[1])]),
+        contentBoxSize: Object.freeze([makeSize(z[2], z[3])]),
+        devicePixelContentBoxSize: Object.freeze([makeSize(z[4], z[5])]) });
+      return e;
+    };
+
+    function ResizeObserver(callback) {
+      if (!(this instanceof ResizeObserver)) throw new TypeError("Failed to construct 'ResizeObserver': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'ResizeObserver': 1 argument required, but only 0 present.");
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'ResizeObserver': The callback provided as parameter 1 is not a function.");
+      hide(this, '__s', { cb: callback, targets: [] });
+    }
+    Object.defineProperty(ResizeObserver.prototype, Symbol.toStringTag, { value: 'ResizeObserver', configurable: true });
+    var wake = function () {   // a look soon, for what was just observed (the pictures only come when something changed)
+      if (pendingRun) return;
+      pendingRun = true;
+      setTimeout(function () { pendingRun = false; run(); }, 0);
+    };
+    method(ResizeObserver.prototype, 'observe', function (target, options) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': 1 argument required, but only 0 present.");
+      if (!target || target.nodeType !== 1) throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+      var box = 'content-box';
+      if (options !== undefined && options !== null) {
+        if (typeof options !== 'object') throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': The provided value is not of type 'ResizeObserverOptions'.");
+        if (options.box !== undefined) {
+          box = String(options.box);
+          if (BOXES.indexOf(box) < 0) throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': Failed to read the 'box' property from 'ResizeObserverOptions': The provided value '" + box + "' is not a valid enum value of type ResizeObserverBoxOptions.");
+        }
+      }
+      var s = this.__s;
+      for (var i = 0; i < s.targets.length; i++) {
+        if (s.targets[i].target === target) {
+          if (s.targets[i].box === box) return;
+          s.targets.splice(i, 1);   // (observed again with another box: starts over)
+          break;
+        }
+      }
+      s.targets.push({ target: target, box: box, last: [0, 0], depth: 0 });
+      if (active.indexOf(this) < 0) active.push(this);
+      wake();
+    });
+    var release = function (obs) { if (obs.__s.targets.length === 0) { var i = active.indexOf(obs); if (i >= 0) active.splice(i, 1); } };
+    method(ResizeObserver.prototype, 'unobserve', function (target) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'unobserve' on 'ResizeObserver': 1 argument required, but only 0 present.");
+      if (!target || target.nodeType !== 1) throw new TypeError("Failed to execute 'unobserve' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+      var s = this.__s;
+      s.targets = s.targets.filter(function (r) { return r.target !== target; });
+      release(this);
+    });
+    method(ResizeObserver.prototype, 'disconnect', function () { this.__s.targets = []; release(this); });
+
+    var run = function () {
+      if (active.length === 0 || !__layout_ready()) return;
+      var shallowest = -1;
+      for (var pass = 0; pass < 8; pass++) {   // (what is deeper than what was told last is told next; what a callback changes shows in the next picture)
+        var batches = [], next = Infinity;
+        active.slice().forEach(function (obs) {
+          var list = [];
+          obs.__s.targets.forEach(function (rec) {
+            var z = sizesOf(rec.target), now = observed(rec.box, z);
+            if (now[0] === rec.last[0] && now[1] === rec.last[1]) return;
+            rec.depth = depthOf(rec.target);
+            if (rec.depth <= shallowest) return;   // (later: in the next picture)
+            rec.last = now;
+            list.push({ entry: entryFor(rec.target, z), depth: rec.depth });
+          });
+          if (list.length) batches.push({ obs: obs, list: list });
+        });
+        if (batches.length === 0) break;
+        batches.forEach(function (b) {
+          b.list.forEach(function (l) { if (l.depth < next) next = l.depth; });
+          try { b.obs.__s.cb.call(b.obs, b.list.map(function (l) { return l.entry; }), b.obs); } catch (e) { setTimeout(function () { throw e; }, 0); }
+        });
+        shallowest = next;
+      }
+    };
+    hide(g, '__ro_run', run);
+    hide(g, 'ResizeObserver', ResizeObserver);
+  }());
   // ---------------------------------------------------------------------------------------------------------------------------------- page lifecycle, window.open()
   (function () {
     hide(g, '__fire_pageshow', function () { g.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false })); });

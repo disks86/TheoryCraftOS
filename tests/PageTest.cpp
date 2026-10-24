@@ -3325,6 +3325,46 @@ static void test_navigation() {
     }
     CHECK(a.live == 0);
   }
+  // --- ResizeObserver
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      media.width = 400;
+      media.height = 300;
+      font::FontSet fonts(a);
+      fonts.add_bundled_fonts();
+      // the page is drawn, then a scroll event changes it and it is drawn again
+      auto watch = [&](const std::string& script) {
+        Page page(a, env, "https://app.example/", media, true);
+        page.load((std::string("<body style='margin:0'><div style='height:2000px'><div id=t style='width:200px;height:100px;padding:10px;border:5px solid'>x</div><div id=h style='display:none'>y</div></div><script>") + script + "</script>").c_str());
+        PagePicture picture(a);
+        CHECK(page.render_picture(&picture, fonts));
+        page.run_due_timers(1e12);
+        page.set_scroll(10);
+        CHECK(page.render_picture(&picture, fonts));
+        page.run_due_timers(2e12);
+        return std::string(page.log().data(), page.log().size());
+      };
+      const std::string pre = "var t = document.getElementById('t'); var show = function (es) { es.forEach(function (e) { console.log(e.target.id, e.contentRect.width, e.contentRect.height, e.contentRect.left, e.contentRect.top, e.contentBoxSize[0].inlineSize, e.contentBoxSize[0].blockSize, e.borderBoxSize[0].inlineSize, e.borderBoxSize[0].blockSize) }) };";
+      // told once at the start, and again when it changes; content and border boxes differ by the padding and border
+      CHECK(watch(pre + "new ResizeObserver(show).observe(t); addEventListener('scroll', function () { t.style.width = '300px' })") ==
+            "t 200 100 10 10 200 100 230 130\nt 300 100 10 10 300 100 330 130\n");
+      // border-box: only a change of the border box counts
+      CHECK(watch(pre + "new ResizeObserver(function (es) { console.log(es[0].borderBoxSize[0].inlineSize) }).observe(t, { box: 'border-box' }); addEventListener('scroll', function () { t.style.paddingLeft = '20px' })") == "230\n240\n");
+      // an element without a box is 0 x 0 and is not told; it is told when it goes away
+      CHECK(watch(pre + "var h = document.getElementById('h'); new ResizeObserver(show).observe(h); addEventListener('scroll', function () { h.style.display = 'block'; h.style.height = '30px' })") ==
+            "h 400 30 0 0 400 30 400 30\n");
+      CHECK(watch(pre + "var o = new ResizeObserver(show); o.observe(t); o.unobserve(t); addEventListener('scroll', function () { t.style.width = '300px' })") == "");
+      CHECK(watch(pre + "var o = new ResizeObserver(function (es) { show(es); o.disconnect() }); o.observe(t); addEventListener('scroll', function () { t.style.width = '300px' })") == "t 200 100 10 10 200 100 230 130\n");
+      CHECK(watch("var o = new ResizeObserver(function () {}); console.log(String(o), typeof ResizeObserverEntry, typeof ResizeObserverSize);"
+                  "try { new ResizeObserver() } catch (e) { console.log(e.name) } try { new ResizeObserver(1) } catch (e) { console.log(e.name) } try { o.observe(5) } catch (e) { console.log(e.name) }"
+                  "try { o.observe(document.body, { box: 'padding-box' }) } catch (e) { console.log(e.name) } try { ResizeObserver(function () {}) } catch (e) { console.log(e.name) } o.observe(document.body, { box: 'device-pixel-content-box' }); o.observe(document.body); o.disconnect()") ==
+            "[object ResizeObserver] function function\nTypeError\nTypeError\nTypeError\nTypeError\nTypeError\n");
+    }
+    CHECK(a.live == 0);
+  }
   // --- window.open(), window.close()
   CHECK(nav_is("var w = open('/popup', 'pop'); console.log(typeof w, w.closed, w.name); console.log(open('/n', '_blank', 'noopener') === null, open('about:blank') === null); w.close(); console.log(w.closed); close();", "object false pop | true true | true",
                nullptr, [](FakeEnvironment& env) {

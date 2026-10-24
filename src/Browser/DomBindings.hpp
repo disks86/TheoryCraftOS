@@ -88,9 +88,10 @@ class IDomHost {
   virtual void close_window() {}
   virtual StringView referrer() { return StringView(); }
   virtual void scroll_node_into_view(dom::Node* node) { (void)node; }
-  // Where the element is on the page as the last picture laid it out: x, y, width, height of its border box in CSS pixels from the top left of the document. False
+  // Where the element is on the page as the last picture laid it out, in CSS pixels: x, y, width, height of its border box from the top left of the document, then
+  // the width and height of its content box (0 for an inline box that is not replaced) and the padding at its left and top. False
   // if it has no box (display: none, not in the document) or nothing was laid out yet; layout_ready() says whether anything was.
-  virtual bool node_rect(dom::Node* node, double* rect4) { (void)node; (void)rect4; return false; }
+  virtual bool node_rect(dom::Node* node, double* rect8) { (void)node; (void)rect8; return false; }
   virtual bool layout_ready() { return false; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;

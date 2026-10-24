@@ -460,11 +460,12 @@ NATIVE(win_prompt) {
 
 NATIVE(win_do_nothing) { return true; }
 
-// __rect(element): [x, y, width, height] of its box on the page (CSS pixels from the top left of the document), or null if it has none.
+// __rect(element): [x, y, width, height, content width, content height, padding left, padding top] of its box on the page (CSS pixels from the top left of the
+// document), or null if it has none.
 NATIVE(node_page_rect) {
   (void)self;
   dom::Node* n = node_of(arg_at(args, argc, 0));
-  double r[4];
+  double r[8];
   if (!n || !impl(vm).host.node_rect(n, r)) {
     *result = Value::make_null();
     return true;
@@ -1278,7 +1279,7 @@ bool install_window(DomBindings::Impl& c) {
   }
 
   // observers and the like exist but never report
-  for (const char* name : {"MutationObserver", "ResizeObserver", "PerformanceObserver"}) {
+  for (const char* name : {"MutationObserver", "PerformanceObserver"}) {
     JsObject* proto = vm.new_plain();
     vm.define_native(proto, "observe", win_do_nothing, 1);
     vm.define_native(proto, "unobserve", win_do_nothing, 1);

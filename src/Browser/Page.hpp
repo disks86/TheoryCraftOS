@@ -264,7 +264,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void close_window() override { env_.close_window(); }
   StringView referrer() override { return referrer_.view(); }
   void scroll_node_into_view(dom::Node* node) override;
-  bool node_rect(dom::Node* node, double* rect4) override;
+  bool node_rect(dom::Node* node, double* rect8) override;
   bool layout_ready() override { return geometry_ready_; }
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t y) override;
@@ -418,7 +418,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool fragment_pending_ = false;
   bool hidden_ = false;   // see set_visible()
   struct BoxRect {
-    double x = 0, y = 0, width = 0, height = 0;
+    double x = 0, y = 0, width = 0, height = 0, content_width = 0, content_height = 0, padding_left = 0, padding_top = 0;
   };
   Dictionary<uint32_t, BoxRect> geometry_;   // node serial -> its box on the page as the last picture laid it out
   bool geometry_ready_ = false;

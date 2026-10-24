@@ -413,6 +413,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
   rendered_media_ = media_;
   deliver_object_events();
   if (ok && bindings_) {   // (what is on screen has changed: intersection observers look again)
+    bindings_->call_hook("__ro_run", nullptr, 0);   // (resize observers first, then intersection observers)
     bindings_->call_hook("__io_run", nullptr, 0);
     flush_errors();
   }
@@ -742,20 +743,32 @@ void Page::record_geometry(const layout::BoxTree& tree) {
       r.y = static_cast<double>(y) / 100.0;
       r.width = static_cast<double>(b.width.to_px100()) / 100.0;
       r.height = static_cast<double>(b.height.to_px100()) / 100.0;
+      if (b.kind != layout::BoxKind::Inline) {   // (an inline box that is not replaced has no content box of its own)
+        const double cw = r.width - static_cast<double>((b.border.horizontal() + b.padding.horizontal()).to_px100()) / 100.0;
+        const double ch = r.height - static_cast<double>((b.border.vertical() + b.padding.vertical()).to_px100()) / 100.0;
+        r.content_width = cw < 0 ? 0 : cw;
+        r.content_height = ch < 0 ? 0 : ch;
+      }
+      r.padding_left = static_cast<double>(b.padding.left.to_px100()) / 100.0;
+      r.padding_top = static_cast<double>(b.padding.top.to_px100()) / 100.0;
       geometry_.put(b.node, r);
     }
     for (uint64_t i = 0; i < b.children.count(); ++i) stack.push_back({b.children[i], x, y});
   }
 }
 
-bool Page::node_rect(dom::Node* node, double* rect4) {
+bool Page::node_rect(dom::Node* node, double* rect8) {
   if (!node || !geometry_ready_ || !dom::is_connected(node)) return false;
   const BoxRect* r = geometry_.find(node->serial);
   if (!r) return false;
-  rect4[0] = r->x;
-  rect4[1] = r->y;
-  rect4[2] = r->width;
-  rect4[3] = r->height;
+  rect8[0] = r->x;
+  rect8[1] = r->y;
+  rect8[2] = r->width;
+  rect8[3] = r->height;
+  rect8[4] = r->content_width;
+  rect8[5] = r->content_height;
+  rect8[6] = r->padding_left;
+  rect8[7] = r->padding_top;
   return true;
 }
 
