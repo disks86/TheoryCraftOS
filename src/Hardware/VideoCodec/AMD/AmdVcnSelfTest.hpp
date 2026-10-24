@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/AMD/AmdVcnAv1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnHevcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnMpeg2Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnVp9Decoder.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -66,6 +67,10 @@ class AmdVcnSelfTest {
   // the above: the reference slot bookkeeping of the VP9 message, the default probabilities in the context buffer and the table, the compressed header and tiles the
   // engine finds in the frame it is given. Not: segmentation, tiles, scaled references, intra-only frames, other sizes.
   static Result run_vp9(allocators::IAllocator& allocator, const AmdVcnVp9Decoder::Engine& engine);
+  // The same for MPEG-2: an ffmpeg stream (64 x 64, eight pictures with B pictures and reordering; AmdVcnSelfTestMpeg2Stream.inc). The engine's inverse transform is not
+  // the CPU decoder's, so the pictures must be close (a level or two apart), not identical. What passing proves beyond the above: the message with the matrices and the
+  // picture coding parameters, the two reference slots of the picture buffer. Not: field pictures, dual prime, other sizes.
+  static Result run_mpeg2(allocators::IAllocator& allocator, const AmdVcnMpeg2Decoder::Engine& engine);
   static const char* result_name(Result result);
 };
 

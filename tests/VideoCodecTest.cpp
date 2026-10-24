@@ -487,7 +487,7 @@ static void test_system_list() {
     CHECK(!system.at(1)->info().hardware_engine && strcmp(system.at(1)->name(), "Software video codec") == 0);
     CHECK(system.at(1)->engine_summary()[0] == 0 && strstr(system.at(0)->engine_summary(), "chip ID not read"));   // no mapper: nothing was read
     CHECK(system.at(2) == nullptr);
-    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1)));
+    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Mpeg2)));
     DecoderConfig dc;
     dc.codec = VideoCodec::Mjpeg;
     CHECK(system.create_decoder(dc));
@@ -1898,6 +1898,8 @@ static void test_amd_media_engine() {
   AmdVcnVideoEngine polaris(a, 0x67DF), raven(a, 0x15DD), navi21(a, 0x73BF), navi31(a, 0x744C), cdna(a, 0x74A1), unknown(a);
   CHECK(polaris.engine_decode_codecs() & hevc && !(polaris.engine_decode_codecs() & vp9) && !(polaris.engine_decode_codecs() & av1));
   CHECK(raven.engine_decode_codecs() & vp9 && !(raven.engine_decode_codecs() & av1));
+  CHECK(raven.engine_decode_codecs() & codec_mask(VideoCodec::Mpeg2) && polaris.engine_decode_codecs() & codec_mask(VideoCodec::Mpeg2) && !(raven.engine_encode_codecs() & codec_mask(VideoCodec::Mpeg2)));
+  CHECK(!(unknown.engine_decode_codecs() & codec_mask(VideoCodec::Mpeg2)));
   CHECK(navi21.engine_decode_codecs() & av1 && !(navi21.engine_encode_codecs() & av1));
   CHECK(navi31.engine_decode_codecs() & av1 && navi31.engine_encode_codecs() & av1 && navi31.engine_encode_codecs() & h264);
   CHECK(cdna.engine_decode_codecs() == 0 && cdna.engine_encode_codecs() == 0 && unknown.engine_decode_codecs() == 0);

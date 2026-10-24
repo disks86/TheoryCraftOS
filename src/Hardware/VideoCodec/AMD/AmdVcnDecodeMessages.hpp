@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/Software/H264Core.hpp"
 #include "Hardware/VideoCodec/Software/Av1Core.hpp"
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg2Core.hpp"
 #include "Hardware/VideoCodec/Software/Vp9Core.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -47,8 +48,8 @@ constexpr uint32_t kCmdItScalingTableBuffer = 0x204;
 constexpr uint32_t kCmdContextBuffer = 0x206;
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;       // header msg_type
-constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13, kMessageVp9 = 0x0E, kMessageDynamicDpb = 0x10, kMessageAv1 = 0x11;   // index message_id
-constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10, kStreamTypeVp9 = 0x11, kStreamTypeAv1 = 0x13;
+constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13, kMessageMpeg2 = 0x0A, kMessageVp9 = 0x0E, kMessageDynamicDpb = 0x10, kMessageAv1 = 0x11;   // index message_id
+constexpr uint32_t kStreamTypeMpeg2 = 3, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10, kStreamTypeVp9 = 0x11, kStreamTypeAv1 = 0x13;
 constexpr uint32_t kProfileBaseline = 0, kProfileMain = 1, kProfileHigh = 2;
 constexpr uint32_t kArrayModeLinear = 0;
 
@@ -219,6 +220,28 @@ uint32_t vp9_message_buffer_bytes();
 bool prepare_vp9_feedback_and_tables(ByteView message_buffer, const vp9::OffloadFrame& frame);
 // The default probabilities as they start the context buffer.
 ConstByteView vp9_default_probabilities();
+
+// MPEG-2 ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+constexpr uint32_t kMpeg2References = 6;   // the pictures Mesa sizes the picture buffer for (NUM_MPEG2_REFS); this code uses three of them
+struct Mpeg2BufferSizes {
+  uint64_t dpb = 0;   // (the engine needs no context buffer for MPEG-2)
+  uint32_t references = 0;
+};
+// Sizes for pictures of `width` x `height` luma samples (Mesa's: the picture buffer holds six pictures of the 32 x 16 aligned size). 0 when the picture is too big.
+Mpeg2BufferSizes mpeg2_buffer_sizes(uint32_t width, uint32_t height);
+// The picture buffer slots the engine is told about: the one this picture is decoded into and the ones it predicts from. A picture without a reference names its
+// own slot for it, as Mesa names the latest picture when it has none.
+struct Mpeg2Slots {
+  uint32_t current = 0, forward = 0, backward = 0;
+};
+uint32_t mpeg2_decode_message_bytes();   // header, the two indexes, the decode message and the MPEG-2 message
+// Builds the decode message of one picture: the picture coding parameters and both quantiser matrices (in the order of the scan the picture uses, as Mesa sends them).
+// A frame, or one field of it; the slices go behind it in the bitstream buffer, each with its start code. False when `out` is too small or the picture is not one the
+// engine takes (4:2:0 only; sizes within the limits).
+bool build_mpeg2_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const mpeg2::OffloadPicture& picture, const Mpeg2Slots& slots, const DecodeBuffers& buffers);
+// The feedback header (and nothing else; the engine has no table for MPEG-2) in a buffer of at least kMessageFeedbackItBytes that starts at the message buffer.
+bool prepare_mpeg2_feedback(ByteView message_buffer);
 
 // What the firmware wrote into the feedback area after a picture.
 struct Feedback {

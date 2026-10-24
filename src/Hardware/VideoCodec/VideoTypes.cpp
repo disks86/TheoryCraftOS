@@ -29,6 +29,7 @@ const char* codec_name(VideoCodec codec) {
     case VideoCodec::Vp9: return "VP9";
     case VideoCodec::Av1: return "AV1";
     case VideoCodec::Vp8: return "VP8";
+    case VideoCodec::Mpeg2: return "MPEG-2";
   }
   return "?";
 }

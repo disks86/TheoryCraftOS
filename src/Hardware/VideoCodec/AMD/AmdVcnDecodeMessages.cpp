@@ -806,5 +806,66 @@ bool prepare_vp9_feedback_and_tables(ByteView buffer, const vp9::OffloadFrame& f
   return true;
 }
 
+// MPEG-2 ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+uint32_t mpeg2_decode_message_bytes() { return kAvcOffset + kMpeg2_sizeof; }
+
+Mpeg2BufferSizes mpeg2_buffer_sizes(uint32_t width, uint32_t height) {
+  Mpeg2BufferSizes sizes;
+  if (!size_ok(width, height)) return sizes;
+  // Mesa's calc_dpb_size: the picture aligned to a macroblock, its width then to 32, with half again for the chroma, a multiple of 1024 bytes, six of them.
+  const uint64_t luma = align_up(align_up(width, 16), 32) * align_up(height, 16);
+  const uint64_t image = align_up(luma + luma / 2, 1024);
+  sizes.references = kMpeg2References;
+  sizes.dpb = image * kMpeg2References;
+  return sizes;
+}
+
+bool build_mpeg2_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const mpeg2::OffloadPicture& picture, const Mpeg2Slots& slots, const DecodeBuffers& b) {
+  if (!picture.seq || !picture.pic || picture.seq->chroma_format != 1) return false;
+  const mpeg2::SequenceHeader& seq = *picture.seq;
+  const mpeg2::PictureHeader& pic = *picture.pic;
+  if (seq.mb_width <= 0 || seq.mb_height <= 0 || pic.type < mpeg2::kPictureI || pic.type > mpeg2::kPictureB || pic.structure < mpeg2::kTopField || pic.structure > mpeg2::kFramePicture) return false;
+  if (slots.current >= kMpeg2References || slots.forward >= kMpeg2References || slots.backward >= kMpeg2References) return false;
+  const uint32_t width = static_cast<uint32_t>(seq.mb_width) * kMacroblock, height = static_cast<uint32_t>(seq.mb_height) * kMacroblock;
+  if (!size_ok(width, height) || !build_common_decode(out, mpeg2_decode_message_bytes(), stream_handle, feedback_number, kStreamTypeMpeg2, kMessageMpeg2, kMpeg2_sizeof, width, height, b)) return false;
+  Image m(out);
+  const uint32_t h = kAvcOffset;
+  m.u32(h + kMpeg2_decoded_pic_idx, slots.current);
+  m.u32(h + kMpeg2_forward_ref_pic_idx, slots.forward);
+  m.u32(h + kMpeg2_backward_ref_pic_idx, slots.backward);
+  // The matrices as the picture's scan orders them: the i-th byte is the weight of the i-th coefficient of the scan.
+  m.u8(h + kMpeg2_load_intra_quantiser_matrix, 1);
+  m.u8(h + kMpeg2_load_nonintra_quantiser_matrix, 1);
+  for (uint32_t i = 0; i < 64; ++i) {
+    m.u8(h + kMpeg2_intra_quantiser_matrix + i, picture.intra_matrix_scan[i]);
+    m.u8(h + kMpeg2_nonintra_quantiser_matrix + i, picture.non_intra_matrix_scan[i]);
+  }
+  m.u8(h + kMpeg2_profile_and_level_indication, 0);
+  m.u8(h + kMpeg2_chroma_format, 1);
+  m.u8(h + kMpeg2_picture_coding_type, static_cast<uint8_t>(pic.type));
+  for (uint32_t d = 0; d < 2; ++d)
+    for (uint32_t c = 0; c < 2; ++c) m.u8(h + kMpeg2_f_code + d * 2 + c, static_cast<uint8_t>(pic.f_code[d][c]));   // (the codes as they are in the stream: Mesa's 0-based ones plus one)
+  m.u8(h + kMpeg2_intra_dc_precision, static_cast<uint8_t>(pic.intra_dc_precision));
+  m.u8(h + kMpeg2_pic_structure, static_cast<uint8_t>(pic.structure));
+  m.u8(h + kMpeg2_top_field_first, pic.top_field_first ? 1 : 0);
+  m.u8(h + kMpeg2_frame_pred_frame_dct, pic.frame_pred_frame_dct ? 1 : 0);
+  m.u8(h + kMpeg2_concealment_motion_vectors, pic.concealment_motion_vectors ? 1 : 0);
+  m.u8(h + kMpeg2_q_scale_type, pic.q_scale_type ? 1 : 0);
+  m.u8(h + kMpeg2_intra_vlc_format, pic.intra_vlc_format ? 1 : 0);
+  m.u8(h + kMpeg2_alternate_scan, pic.alternate_scan ? 1 : 0);
+  return true;
+}
+
+bool prepare_mpeg2_feedback(ByteView buffer) {
+  if (buffer.size() < kMessageFeedbackItBytes) return false;
+  Image m(buffer);
+  m.zero(kFeedbackOffset, kFeedbackBytes);
+  m.u32(kFeedbackOffset + kFeedback_header_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_total_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_num_buffers, 0);
+  return true;
+}
+
 }  // namespace amd_vcn
 }  // namespace hardware

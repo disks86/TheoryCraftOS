@@ -572,6 +572,90 @@ static void test_av1_messages() {
   CHECK(!av1_context_run(av1_context_run_count(), &o, &bytes));
 }
 
+// MPEG-2: the offsets are Mesa's rvcn_dec_message_mpeg2_vld_t, written out here by hand: three indexes of 32 bits, the matrices at 16 and 80, the single bytes from 144.
+static void test_mpeg2_messages() {
+  // 1920x1080 is coded as 1920x1088: image 1920 x 1088 x 1.5 = 3133440 (a multiple of 1024), six of them.
+  Mpeg2BufferSizes sizes = mpeg2_buffer_sizes(1920, 1088);
+  CHECK(sizes.references == 6 && sizes.dpb == 3133440ull * 6);
+  // 720x576 PAL: 45 x 36 macroblocks; the width is rounded up to 736 for the pitch.
+  CHECK(mpeg2_buffer_sizes(720, 576).dpb == ((736ull * 576 * 3 / 2 + 1023) / 1024 * 1024) * 6);
+  // A width that is not a multiple of 32 is rounded up: 16 x 16 macroblock picture 48 x 16 -> pitch 64.
+  CHECK(mpeg2_buffer_sizes(48, 16).dpb == ((64ull * 16 * 3 / 2 + 1023) / 1024 * 1024) * 6);
+  CHECK(mpeg2_buffer_sizes(0, 0).dpb == 0 && mpeg2_buffer_sizes(8192, 4320).dpb == 0 && mpeg2_buffer_sizes(100, 100).dpb == 0);
+
+  mpeg2::SequenceHeader seq;
+  seq.valid = true;
+  seq.mb_width = 120;
+  seq.mb_height = 68;
+  seq.chroma_format = 1;
+  mpeg2::PictureHeader pic;
+  pic.type = mpeg2::kPictureB;
+  pic.structure = mpeg2::kFramePicture;
+  pic.f_code[0][0] = 3;
+  pic.f_code[0][1] = 2;
+  pic.f_code[1][0] = 4;
+  pic.f_code[1][1] = 1;
+  pic.intra_dc_precision = 2;
+  pic.top_field_first = true;
+  pic.q_scale_type = true;
+  pic.alternate_scan = true;
+  mpeg2::OffloadPicture picture;
+  picture.seq = &seq;
+  picture.pic = &pic;
+  for (int i = 0; i < 64; ++i) {
+    picture.intra_matrix_scan[i] = uint8_t(i + 1);
+    picture.non_intra_matrix_scan[i] = uint8_t(200 - i);
+  }
+  DecodeBuffers buffers;
+  buffers.bitstream_bytes = 1000;
+  buffers.dpb_bytes = sizes.dpb;
+  buffers.target = target_layout(1920, 1088);
+  CHECK(mpeg2_decode_message_bytes() == 244 + 160);
+  Mpeg2Slots slots;
+  slots.current = 2;
+  slots.forward = 5;
+  slots.backward = 1;
+  std::vector<uint8_t> m(4096, 0xAA);
+  CHECK(build_mpeg2_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  // Header, indexes: decode message (id 2) at 56, the MPEG-2 message (id 10) at 244.
+  CHECK(word(m, 0) == 40 && word(m, 4) == 244 && word(m, 8) == 2 && word(m, 12) == 1 && word(m, 16) == 9 && word(m, 20) == 77);
+  CHECK(word(m, 24) == 2 && word(m, 28) == 56 && word(m, 32) == 188 && word(m, 40) == 10 && word(m, 44) == 244 && word(m, 48) == 160);
+  CHECK(word(m, 56) == 3);   // stream type MPEG-2
+  CHECK(word(m, 56 + 8) == 1920 && word(m, 56 + 12) == 1088 && word(m, 56 + 20) == sizes.dpb && word(m, 56 + 36) == 0);
+  const uint32_t h = 244;
+  CHECK(word(m, h) == 2 && word(m, h + 4) == 5 && word(m, h + 8) == 1);
+  CHECK(m[h + 12] == 1 && m[h + 13] == 1);
+  for (int i = 0; i < 64; ++i) CHECK(m[h + 16 + i] == i + 1 && m[h + 80 + i] == 200 - i);
+  CHECK(m[h + 144] == 0 && m[h + 145] == 1 && m[h + 146] == 3);
+  CHECK(m[h + 148] == 3 && m[h + 149] == 2 && m[h + 150] == 4 && m[h + 151] == 1);
+  CHECK(m[h + 152] == 2 && m[h + 153] == 3 && m[h + 154] == 1 && m[h + 155] == 0 && m[h + 156] == 0 && m[h + 157] == 1 && m[h + 158] == 0 && m[h + 159] == 1);
+  CHECK(m[mpeg2_decode_message_bytes()] == 0xAA);   // nothing written past the message
+  // Refused: too small a buffer (every size), another chroma format, slots out of range, no headers, a picture size the engine does not take.
+  for (uint32_t n = 0; n < mpeg2_decode_message_bytes(); ++n) CHECK(!build_mpeg2_decode_message(ByteView(m.data(), n), 9, 77, picture, slots, buffers));
+  seq.chroma_format = 2;
+  CHECK(!build_mpeg2_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  seq.chroma_format = 1;
+  Mpeg2Slots bad = slots;
+  bad.forward = 6;
+  CHECK(!build_mpeg2_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, bad, buffers));
+  bad = slots;
+  bad.current = 6;
+  CHECK(!build_mpeg2_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, bad, buffers));
+  mpeg2::OffloadPicture empty;
+  CHECK(!build_mpeg2_decode_message(ByteView(m.data(), m.size()), 9, 77, empty, slots, buffers));
+  seq.mb_width = 300;
+  CHECK(!build_mpeg2_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  seq.mb_width = 120;
+  pic.type = 4;
+  CHECK(!build_mpeg2_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  pic.type = mpeg2::kPictureB;
+  // The feedback header, and no more.
+  std::vector<uint8_t> fb(kMessageFeedbackItBytes, 0xAA);
+  CHECK(prepare_mpeg2_feedback(ByteView(fb.data(), fb.size())));
+  CHECK(word(fb, kFeedbackOffset) == 44 && word(fb, kFeedbackOffset + 4) == 44 && word(fb, kFeedbackOffset + 8) == 0 && fb[0] == 0xAA && fb[kItTableOffset] == 0xAA);
+  CHECK(!prepare_mpeg2_feedback(ByteView(fb.data(), kMessageFeedbackItBytes - 1)));
+}
+
 int main() {
   test_create_and_destroy();
   test_buffer_sizes();
@@ -580,6 +664,7 @@ int main() {
   test_feedback_reader();
   test_hevc_messages();
   test_av1_messages();
+  test_mpeg2_messages();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("AmdVcnDecodeMessagesTest passed\n");
   return 0;

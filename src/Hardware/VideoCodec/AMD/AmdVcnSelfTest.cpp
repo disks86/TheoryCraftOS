@@ -23,6 +23,7 @@
 #include "Hardware/VideoCodec/Software/Av1.hpp"
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg2.hpp"
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 
 namespace hardware {
@@ -277,6 +278,86 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_vp9(allocators::IAllocator& allocator
   // The engine must really have done the work: a stream the session passed to the CPU would "pass" too.
   if (session.frames_decoded() == 0) return Result::SessionRefused;
   return Result::Passed;
+}
+
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestMpeg2Stream.inc"
+
+// MPEG-2 decoders agree on what a picture should look like to within the accuracy of the inverse transform (a level or two, carried along a prediction chain), not
+// bit for bit: the pictures must differ by little. A picture the engine failed to produce is grey and far off.
+constexpr uint32_t kMpeg2MaxDifference = 12;
+constexpr uint64_t kMpeg2MaxTotalDifference = 64 * 64 * 3 / 2;   // (a mean of one level over the picture)
+
+bool close_picture(const VideoFrame& a, const VideoFrame& b) {
+  if (a.format != b.format || a.pts_us != b.pts_us) return false;
+  uint64_t total = 0;
+  for (uint32_t p = 0; p < a.format.plane_count(); ++p)
+    for (uint32_t row = 0; row < a.format.plane_height(p); ++row)
+      for (uint32_t col = 0; col < a.format.plane_width(p); ++col) {
+        const int x = a.plane[p][uint64_t{row} * a.stride[p] + col], y = b.plane[p][uint64_t{row} * b.stride[p] + col];
+        const uint32_t d = static_cast<uint32_t>(x > y ? x - y : y - x);
+        if (d > kMpeg2MaxDifference) return false;
+        total += d;
+      }
+  return total <= kMpeg2MaxTotalDifference;
+}
+}  // namespace
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocator, const AmdVcnMpeg2Decoder::Engine& engine) {
+  const ConstByteView stream(kMpeg2SelfTestStream);
+  auto packet = [&](uint32_t i) {
+    const uint64_t start = i == 0 ? 0 : kMpeg2SelfTestEnds[i - 1];
+    return stream.subview(start, kMpeg2SelfTestEnds[i] - start);
+  };
+  // The CPU's pictures, in display order.
+  VideoFrameBuffer expected[kMpeg2SelfTestPictures] = {VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator),
+                                                       VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator)};
+  int64_t pts[kMpeg2SelfTestPictures] = {};
+  {
+    Mpeg2Decoder cpu(allocator);
+    uint32_t got = 0;
+    VideoFrame f;
+    for (uint32_t i = 0; i <= kMpeg2SelfTestPictures; ++i) {
+      if (i < kMpeg2SelfTestPictures) {
+        if (!cpu.decode(packet(i), int64_t{i} * 1000)) return Result::StreamFailed;
+      } else {
+        cpu.flush();
+      }
+      while (cpu.receive(&f)) {
+        if (got >= kMpeg2SelfTestPictures || !keep_picture(f, &expected[got])) return Result::StreamFailed;
+        pts[got++] = f.pts_us;
+      }
+    }
+    if (got != kMpeg2SelfTestPictures) return Result::StreamFailed;
+  }
+
+  DecoderConfig config;
+  config.codec = VideoCodec::Mpeg2;
+  config.output = PixelFormat::I420;
+  AmdVcnMpeg2Decoder session(allocator, engine, config);
+  if (!session.prepare()) return Result::SessionRefused;
+  uint32_t got = 0;
+  VideoFrame f;
+  for (uint32_t i = 0; i < kMpeg2SelfTestPictures; ++i) {
+    VideoPacket p;
+    p.data = packet(i);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
+    while (session.receive(&f)) {
+      if (got >= kMpeg2SelfTestPictures || !close_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
+      ++got;
+    }
+  }
+  session.flush();
+  while (session.receive(&f)) {
+    if (got >= kMpeg2SelfTestPictures || !close_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
+    ++got;
+  }
+  if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
+  // The engine must really have done the work: every picture went through it (a stream the session passed to the CPU would "pass" too).
+  if (session.pictures_decoded() != kMpeg2SelfTestPictures) return Result::SessionRefused;
+  return got == kMpeg2SelfTestPictures ? Result::Passed : Result::Mismatch;
 }
 
 const char* AmdVcnSelfTest::result_name(Result result) {
