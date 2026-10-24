@@ -86,7 +86,9 @@ class SystemVideoCodecs {
  private:
   MmioRegion intel_registers(const PciDeviceInfo& d) const;
   MmioRegion nvidia_registers(const PciDeviceInfo& d) const;
-  MmioRegion amd_discovery_window(const PciDeviceInfo& d) const;
+  MmioRegion amd_discovery_window(const PciDeviceInfo& d, uint64_t* bar_size) const;
+  MmioRegion amd_registers(const PciDeviceInfo& d) const;
+  void add_amd(const PciDeviceInfo& d);
   bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out);
   void add_intel(const PciDeviceInfo& d);
 

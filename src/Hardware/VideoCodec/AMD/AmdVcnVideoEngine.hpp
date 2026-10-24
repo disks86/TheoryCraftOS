@@ -38,11 +38,28 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   explicit AmdVcnVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& discovery = MmioRegion())
       : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), gpu_(amd_gpu_identify(gpu_device_id)), discovery_(discovery) {}
 
+  // A Radeon card's register BAR (BAR 5; at least AmdMmIndexVramReader::kRegisterWindow bytes), for reaching video memory the CPU-visible aperture does not cover,
+  // and the size of that aperture (BAR 0). Call before initialize(); both are optional.
+  void set_registers(const MmioRegion& registers) { registers_ = registers; }
+  void set_memory_bar(uint64_t bytes) { memory_bar_ = bytes; }
+  uint64_t memory_bar() const { return memory_bar_; }
+
   // Reads the GPU's IP discovery table (when given a window and the generation has one). Always succeeds: the engine is there either way.
   bool initialize() override {
     // An APU's window is its memory BAR (the table is at the end of the carve-out somewhere inside it); a card's is the last 64 KiB of its own memory.
-    status_ = gpu_.discrete ? AmdMediaEngineHw::probe(allocator_, discovery_, gpu_.architecture)
-                            : AmdMediaEngineHw::probe_aperture(allocator_, discovery_, gpu_.architecture);
+    if (gpu_.discrete) {
+      status_ = AmdMediaEngineHw::probe(allocator_, discovery_, gpu_.architecture);
+      if (status_.probed) {
+        if (memory_bar_) status_.video_memory_bytes = memory_bar_;   // the table was at the end of the aperture, so the aperture is all of the memory
+      } else if (registers_.length() >= AmdMmIndexVramReader::kRegisterWindow) {
+        // Not reachable through the aperture (Resizable BAR off): ask the card for the memory past its end, through the register BAR.
+        AmdMmIndexVramReader reader(registers_);
+        status_ = AmdMediaEngineHw::probe_video_memory(allocator_, reader, gpu_.architecture);
+        reader.park();
+      }
+    } else {
+      status_ = AmdMediaEngineHw::probe_aperture(allocator_, discovery_, gpu_.architecture);
+    }
     summary_.assign(gpu_.name);
     if (status_.probed) {
       const AmdIpDiscoveryInfo& d = status_.discovery;
@@ -63,8 +80,25 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
         summary_.append_uint(status_.carve_out_bytes >> 20);
         summary_.append(" MiB");
       }
+      if (status_.video_memory_bytes) {
+        summary_.append(", video memory ");
+        summary_.append_uint(status_.video_memory_bytes >> 20);
+        summary_.append(" MiB");
+        if (memory_bar_ >= status_.video_memory_bytes) {
+          summary_.append(" (all CPU-visible)");
+        } else if (memory_bar_) {
+          summary_.append(", CPU aperture ");
+          summary_.append_uint(memory_bar_ >> 20);
+          summary_.append(" MiB");
+        }
+      }
     } else {
       summary_.append(", IP discovery table not read");
+      if (gpu_.discrete && memory_bar_) {
+        summary_.append(", memory aperture ");
+        summary_.append_uint(memory_bar_ >> 20);
+        summary_.append(" MiB");
+      }
     }
     return true;
   }
@@ -91,6 +125,8 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   allocators::IAllocator& allocator_;
   AmdGpuInfo gpu_;
   MmioRegion discovery_;
+  MmioRegion registers_;
+  uint64_t memory_bar_ = 0;
   AmdMediaEngineStatus status_;
   FixedString<120> summary_;
 };

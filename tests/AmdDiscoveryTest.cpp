@@ -230,11 +230,114 @@ static void test_aperture() {
   CHECK(a.live == 0);
 }
 
+// A pretend Radeon card's video memory read through a function: `size` bytes with a table in the last 64 KiB; past the end it either wraps (the card's memory
+// aliases above its end) or reads as all ones.
+struct FakeCardMemory final : IAmdVramReader {
+  uint64_t size;
+  std::vector<uint8_t> table;
+  bool wrap = false, fail = false;
+  uint64_t reads = 0;
+  FakeCardMemory(uint64_t bytes, std::vector<uint8_t> t) : size(bytes), table(std::move(t)) {}
+  bool read32(uint64_t offset, uint32_t* value) override {
+    ++reads;
+    if (fail) return false;
+    if (offset >= size) {
+      if (!wrap) { *value = 0xFFFFFFFFu; return true; }
+      offset %= size;
+    }
+    const uint64_t at = size - AmdMediaEngineHw::kDiscoveryWindow;
+    uint32_t v = 0;
+    if (offset >= at && offset - at + 4 <= table.size())
+      for (int i = 0; i < 4; ++i) v |= static_cast<uint32_t>(table[offset - at + i]) << (8 * i);
+    *value = v;
+    return true;
+  }
+};
+
+static void test_video_memory_scan() {
+  TestAllocator a;
+  constexpr uint64_t kMiB = 1ull << 20;
+  const std::vector<uint8_t> good = build(kNavi31);
+  // A 16 GB card (16368 MiB usable): found at its real end, whatever its size, with the size read off the position.
+  for (uint64_t mib : {uint64_t{4080}, uint64_t{8176}, uint64_t{16368}, uint64_t{24560}, uint64_t{49136}}) {
+    FakeCardMemory card(mib * kMiB, good);
+    AmdMediaEngineStatus s = AmdMediaEngineHw::probe_video_memory(a, card, AmdGpuArchitecture::Rdna3);
+    CHECK(s.probed && s.video_memory_bytes == mib * kMiB && s.vcn_count() == 2 && s.discovery.checksum_ok && a.live == 0);
+  }
+  // Memory that aliases above its end: the lowest hit is the real end, not 2x or 4x it.
+  FakeCardMemory aliased(8176 * kMiB, good);
+  aliased.wrap = true;
+  AmdMediaEngineStatus s = AmdMediaEngineHw::probe_video_memory(a, aliased, AmdGpuArchitecture::Rdna2);
+  CHECK(s.probed && s.video_memory_bytes == 8176 * kMiB);
+  // A power-of-two size on an aliasing card (the alias of the table lands on every multiple).
+  FakeCardMemory pow2(8192 * kMiB, good);
+  pow2.wrap = true;
+  CHECK(AmdMediaEngineHw::probe_video_memory(a, pow2, AmdGpuArchitecture::Rdna4).video_memory_bytes == 8192 * kMiB);
+  // No table, a damaged one, a card bigger than the limit, a reader that fails, and generations without a table.
+  FakeCardMemory empty(4096 * kMiB, {});
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, empty, AmdGpuArchitecture::Rdna3).probed);
+  std::vector<uint8_t> damaged = good;
+  damaged[40] ^= 0x10;
+  FakeCardMemory bad(4096 * kMiB, damaged);
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, bad, AmdGpuArchitecture::Rdna3).probed);
+  FakeCardMemory big(16368 * kMiB, good);
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, big, AmdGpuArchitecture::Rdna3, 8192 * kMiB).probed);
+  FakeCardMemory broken(4096 * kMiB, good);
+  broken.fail = true;
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, broken, AmdGpuArchitecture::Rdna3).probed && broken.reads == 1);
+  FakeCardMemory polaris(4096 * kMiB, good);
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, polaris, AmdGpuArchitecture::Polaris).probed && polaris.reads == 0);
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, polaris, AmdGpuArchitecture::Cdna).probed && polaris.reads == 0);
+  // A table that lies about its size (bigger than the window) is skipped, and memory running out is a miss.
+  std::vector<uint8_t> lying = good;
+  lying[10] = 0xFF; lying[11] = 0xFF;
+  FakeCardMemory liar(2048 * kMiB, lying);
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, liar, AmdGpuArchitecture::Rdna3).probed);
+  FakeCardMemory starved(2048 * kMiB, good);
+  a.fail = true;
+  CHECK(!AmdMediaEngineHw::probe_video_memory(a, starved, AmdGpuArchitecture::Rdna3).probed);
+  a.fail = false;
+  CHECK(a.live == 0);
+}
+
+// The index/data pair as the register BAR sees it: what the reader writes, and what it refuses.
+static void test_mm_index_reader() {
+  std::vector<uint32_t> regs(AmdMmIndexVramReader::kRegisterWindow / 4, 0);
+  const MmioRegion window(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4);
+  AmdMmIndexVramReader reader(window);
+  CHECK(reader.ready());
+  regs[AmdMmIndexVramReader::kMmData / 4] = 0x28211407;
+  uint32_t v = 0;
+  // Below 2 GiB: low bits plus the video-memory flag, high word zero.
+  CHECK(reader.read32(0x12345678 & ~3u, &v) && v == 0x28211407);
+  CHECK(regs[AmdMmIndexVramReader::kMmIndex / 4] == ((0x12345678u & ~3u) | 0x80000000u) && regs[AmdMmIndexVramReader::kMmIndexHi / 4] == 0);
+  // 5 GiB + 0x100: bit 31 of the position is carried in the high word (position >> 31 == 2), the low 31 bits stay in MM_INDEX.
+  const uint64_t far = (5ull << 30) + 0x100;
+  CHECK(reader.read32(far, &v));
+  CHECK(regs[AmdMmIndexVramReader::kMmIndex / 4] == (static_cast<uint32_t>(far & 0x7FFFFFFFu) | 0x80000000u) && regs[AmdMmIndexVramReader::kMmIndexHi / 4] == 2);
+  // Unaligned offsets and offsets beyond what the register pair can address are refused without touching the card.
+  regs[AmdMmIndexVramReader::kMmIndex / 4] = 0x1111;
+  CHECK(!reader.read32(0x1002, &v) && !reader.read32(1ull << 63, &v) && regs[AmdMmIndexVramReader::kMmIndex / 4] == 0x1111);
+  reader.park();
+  CHECK(regs[AmdMmIndexVramReader::kMmIndex / 4] == 0 && regs[AmdMmIndexVramReader::kMmIndexHi / 4] == 0);
+  // The data register itself is never written; a window that is too short is not ready and is not touched.
+  CHECK(regs[AmdMmIndexVramReader::kMmData / 4] == 0x28211407);
+  uint32_t tiny[4] = {7, 7, 7, 7};
+  AmdMmIndexVramReader short_reader(MmioRegion(reinterpret_cast<uint64_t>(tiny), sizeof tiny));
+  CHECK(!short_reader.ready() && !short_reader.read32(0, &v) && tiny[0] == 7 && tiny[1] == 7);
+  short_reader.park();
+  CHECK(tiny[0] == 7);
+  AmdMmIndexVramReader none{MmioRegion()};
+  CHECK(!none.ready() && !none.read32(0, &v));
+}
+
 int main() {
   test_parse();
   test_truncation_and_flips();
   test_probe();
   test_aperture();
+  test_video_memory_scan();
+  test_mm_index_reader();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("AmdDiscoveryTest passed\n");
   return 0;

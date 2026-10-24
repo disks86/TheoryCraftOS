@@ -1433,6 +1433,31 @@ struct FakeBarSizer final : IBarSizer {
 };
 
 // SystemVideoCodecs finds the window of an AMD GPU: the end of the memory BAR for a card, the BAR itself (up to the scan limit) for an APU.
+// A card read directly (the table at the end of an aperture that covers all of the memory) and one reached only through the register BAR.
+static void test_amd_card_memory() {
+  TestAllocator a;
+  std::vector<uint32_t> vram = amd_fake_vram();
+  const MmioRegion window(reinterpret_cast<uint64_t>(vram.data()), vram.size() * 4);
+  AmdVcnVideoEngine resizable(a, 0x744C, window);
+  resizable.set_memory_bar(16368ull << 20);
+  CHECK(resizable.initialize() && resizable.engine_status().probed && resizable.engine_status().video_memory_bytes == (16368ull << 20));
+  CHECK(strstr(resizable.engine_summary(), "video memory 16368 MiB (all CPU-visible)"));
+  // Without a size for the aperture nothing is claimed.
+  AmdVcnVideoEngine unsized(a, 0x744C, window);
+  CHECK(unsized.initialize() && unsized.engine_status().probed && unsized.engine_status().video_memory_bytes == 0 && !strstr(unsized.engine_summary(), "video memory"));
+  // A card whose table is out of reach and whose register BAR shows no table either: the aperture is all there is to report, and the index registers are parked.
+  std::vector<uint32_t> regs(AmdMmIndexVramReader::kRegisterWindow / 4, 0);
+  AmdVcnVideoEngine hidden(a, 0x744C, MmioRegion(reinterpret_cast<uint64_t>(vram.data()) + 4096, 4096));
+  hidden.set_registers(MmioRegion(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4));
+  hidden.set_memory_bar(256ull << 20);
+  CHECK(hidden.initialize() && !hidden.engine_status().probed && strstr(hidden.engine_summary(), "not read") && strstr(hidden.engine_summary(), "memory aperture 256 MiB"));
+  CHECK(regs[0] == 0 && regs[AmdMmIndexVramReader::kMmIndexHi / 4] == 0);
+  // An APU never goes through the index registers.
+  AmdVcnVideoEngine apu(a, 0x15BF, MmioRegion());
+  apu.set_registers(MmioRegion(reinterpret_cast<uint64_t>(regs.data()), regs.size() * 4));
+  CHECK(apu.initialize() && !apu.engine_status().probed && regs[0] == 0);
+}
+
 static void test_amd_system_window() {
   TestAllocator a;
   std::vector<uint32_t> table = amd_fake_vram();
@@ -1449,16 +1474,18 @@ static void test_amd_system_window() {
     CHECK(mapper.calls == 1 && mapper.asked == (4u << 20) && sizer.calls == 1 && amd->engine_status().probed && amd->engine_status().carve_out_bytes == (3u << 20));
     system.shutdown();
   }
-  {   // A card (Navi 31): only the last 64 KiB of the BAR is mapped
+  {   // A card (Navi 31, 16 GiB, Resizable BAR off or on): only the last 64 KiB of the aperture is read directly, and the register BAR (BAR 5) is mapped for the
+      // index/data route. The fake bus puts every BAR at 0x1000, so only the register page can be mapped; the table is not reachable there, and the log says
+      // what the firmware left of the aperture instead.
     IntelPci pci(0x744C, true); pci.vendor = 0x1002;
-    FakeRegisterMapper mapper(AmdMediaEngineHw::kDiscoveryWindow);
-    FakeBarSizer sizer(16ull << 30);   // 16 GiB, Resizable BAR on
-    for (size_t i = 0; i < table.size(); ++i) mapper.words[i] = table[i];
-    pci.bar0 = 0x1000;
+    FakeRegisterMapper mapper(AmdMmIndexVramReader::kRegisterWindow);
+    FakeBarSizer sizer(16ull << 30);
     SystemVideoCodecs system(pci, a);
     system.set_mmio(&mapper); system.set_bar_sizer(&sizer);
     system.initialize();
-    CHECK(mapper.calls == 0 || mapper.asked == AmdMediaEngineHw::kDiscoveryWindow);   // (the fake maps only at 0x1000: a card's window is far above it)
+    const AmdVcnVideoEngine* amd = static_cast<AmdVcnVideoEngine*>(system.at(0));
+    CHECK(mapper.calls == 2 && mapper.asked == AmdMmIndexVramReader::kRegisterWindow && sizer.calls == 1);   // the end of the aperture (refused: not at 0x1000), then BAR 5
+    CHECK(!amd->engine_status().probed && amd->memory_bar() == (16ull << 30) && strstr(amd->engine_summary(), "memory aperture 16384 MiB"));
     system.shutdown();
   }
   {   // An APU with a huge BAR is mapped only up to the limit; without a sizer or mapper nothing is touched.
@@ -1530,6 +1557,7 @@ int main() {
   test_amd_media_engine();
   test_amd_discovery_engine();
   test_amd_system_window();
+  test_amd_card_memory();
   test_nvidia_media_engine();
   test_intel_system();
   test_h264_parser();

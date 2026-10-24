@@ -60,9 +60,58 @@ AmdMediaEngineStatus read_table(allocators::IAllocator& allocator, const MmioReg
 }
 }  // namespace
 
+bool AmdMmIndexVramReader::read32(uint64_t offset, uint32_t* value) {
+  if (!ready() || (offset & 3) || (offset >> 31) > 0xFFFFFFFFull) return false;
+  registers_.write32(kMmIndex, static_cast<uint32_t>(offset & 0x7FFFFFFFu) | kVramFlag);
+  registers_.write32(kMmIndexHi, static_cast<uint32_t>(offset >> 31));
+  *value = registers_.read32(kMmData);
+  return true;
+}
+
+void AmdMmIndexVramReader::park() {
+  if (!ready()) return;
+  registers_.write32(kMmIndex, 0);
+  registers_.write32(kMmIndexHi, 0);
+}
+
 AmdMediaEngineStatus AmdMediaEngineHw::probe(allocators::IAllocator& allocator, const MmioRegion& window, AmdGpuArchitecture architecture) {
   if (!supported(architecture)) return AmdMediaEngineStatus();
   return read_table(allocator, window);
+}
+
+AmdMediaEngineStatus AmdMediaEngineHw::probe_video_memory(allocators::IAllocator& allocator, IAmdVramReader& reader, AmdGpuArchitecture architecture, uint64_t max_bytes) {
+  constexpr uint64_t kMiB = 1ull << 20;
+  constexpr uint32_t kSignature = 0x28211407;
+  AmdMediaEngineStatus status;
+  if (!supported(architecture)) return status;
+  const uint64_t limit = max_bytes < kMaxVideoMemory ? max_bytes : kMaxVideoMemory;
+  for (uint64_t size = kMiB; size <= limit; size += kMiB) {
+    const uint64_t offset = size - kDiscoveryWindow;
+    uint32_t word = 0;
+    if (!reader.read32(offset, &word)) return AmdMediaEngineStatus();
+    if (word != kSignature) continue;
+    ByteBuffer table(allocator);
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < kAmdIpDiscoveryHeaderBytes; i += 4) {
+      uint32_t w = 0;
+      ok = reader.read32(offset + i, &w) && table.put32(w);
+    }
+    const uint32_t declared = ok ? amd_ip_discovery_declared_size(table.view()) : 0;
+    if (declared == 0 || declared > kDiscoveryWindow) continue;
+    for (uint32_t i = kAmdIpDiscoveryHeaderBytes; ok && i < ((declared + 3) & ~3u); i += 4) {
+      uint32_t w = 0;
+      ok = reader.read32(offset + i, &w) && table.put32(w);
+    }
+    if (!ok) continue;
+    status.discovery = amd_parse_ip_discovery(table.view());
+    status.probed = status.discovery.valid && status.discovery.checksum_ok;
+    if (status.probed) {
+      status.video_memory_bytes = size;
+      return status;
+    }
+    status = AmdMediaEngineStatus();
+  }
+  return status;
 }
 
 AmdMediaEngineStatus AmdMediaEngineHw::probe_aperture(allocators::IAllocator& allocator, const MmioRegion& aperture, AmdGpuArchitecture architecture) {

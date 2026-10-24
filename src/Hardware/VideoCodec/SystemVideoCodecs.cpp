@@ -64,7 +64,7 @@ MmioRegion SystemVideoCodecs::nvidia_registers(const PciDeviceInfo& d) const {
 // Where the IP discovery table of an AMD GPU can be looked for, if it can be reached (the last 64 KiB of a card's video memory; an APU's whole memory BAR, up to a limit): a generation that has one, a mapper and a
 // sizer, memory decoding switched on, and a memory BAR that covers the whole of video memory (a smaller window - no resizable BAR - cannot show its end,
 // and then the probe finds no table). Empty otherwise.
-MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d) const {
+MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d, uint64_t* bar_size) const {
   constexpr uint16_t kPciCommand = 0x04;
   constexpr uint32_t kMemorySpace = 1u << 1;
   MmioRegion region;
@@ -73,6 +73,7 @@ MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d) const
   const uint64_t base = pci_.memory_bar(d.address, 0);
   uint64_t size = 0;
   if (base == 0 || !bar_sizer_->bar_size(d.address, 0, &size) || size < AmdMediaEngineHw::kDiscoveryWindow || size > UINT64_MAX - base) return region;
+  *bar_size = size;
   if (!amd_gpu_identify(d.device_id).discrete) {
     // A Radeon APU: its video memory is a carve-out of system RAM whose end is not the end of the BAR, so the scan gets the BAR itself (up to the limit).
     const uint64_t mapped = size < AmdMediaEngineHw::kApertureScanLimit ? size : AmdMediaEngineHw::kApertureScanLimit;
@@ -81,6 +82,33 @@ MmioRegion SystemVideoCodecs::amd_discovery_window(const PciDeviceInfo& d) const
   }
   if (!mmio_->map_registers(base + (size - AmdMediaEngineHw::kDiscoveryWindow), AmdMediaEngineHw::kDiscoveryWindow, &region)) return MmioRegion();
   return region;
+}
+
+// The register BAR (BAR 5) of a Radeon card, first page: where MM_INDEX and MM_DATA are. Empty if there is no mapper, decoding is off, or no BAR 5.
+MmioRegion SystemVideoCodecs::amd_registers(const PciDeviceInfo& d) const {
+  constexpr uint16_t kPciCommand = 0x04;
+  constexpr uint32_t kMemorySpace = 1u << 1;
+  MmioRegion region;
+  if (!mmio_ || !(pci_.read32(d.address, kPciCommand) & kMemorySpace)) return region;
+  const uint64_t base = pci_.memory_bar(d.address, 5);
+  if (base == 0 || !mmio_->map_registers(base, AmdMmIndexVramReader::kRegisterWindow, &region)) return MmioRegion();
+  return region;
+}
+
+void SystemVideoCodecs::add_amd(const PciDeviceInfo& d) {
+  uint64_t bar_size = 0;
+  const MmioRegion window = amd_discovery_window(d, &bar_size);
+  UniquePointer<AmdVcnVideoEngine> device = UniquePointer<AmdVcnVideoEngine>::make(allocator_, allocator_, d.device_id, window);
+  if (!device) return;
+  if (device->gpu().discrete && AmdMediaEngineHw::supported(device->gpu().architecture)) {
+    device->set_memory_bar(bar_size);
+    device->set_registers(amd_registers(d));
+  }
+  if (!device->initialize()) {
+    device->shutdown();
+    return;
+  }
+  devices_.push_back(UniquePointer<IVideoCodecDevice>(util::move(device)));
 }
 
 // What the engine driver needs of a Gen9.5 GPU, found from its PCI function: the first 2 MiB of the register BAR, the global GTT table (halfway into the 16 MiB BAR,
@@ -107,7 +135,7 @@ void SystemVideoCodecs::initialize() {
   for (uint32_t i = 0; pci_.pci_device(i, &d); ++i) {
     if (d.class_code != kPciClassDisplay) continue;
     if (d.vendor_id == NvidiaVideoEngine::kPciVendor) try_add<NvidiaVideoEngine>(devices_, allocator_, d.device_id, nvidia_registers(d));
-    else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) try_add<AmdVcnVideoEngine>(devices_, allocator_, d.device_id, amd_discovery_window(d));
+    else if (d.vendor_id == AmdVcnVideoEngine::kPciVendor) add_amd(d);
     else if (d.vendor_id == IntelMediaVideoEngine::kPciVendor) add_intel(d);
   }
   try_add<SoftwareVideoCodec>(devices_, allocator_);
