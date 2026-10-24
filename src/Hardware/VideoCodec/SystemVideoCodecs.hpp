@@ -61,7 +61,8 @@ class SystemVideoCodecs {
   void set_mmio(IRegisterMapper* mapper) { mmio_ = mapper; }
   // With a sizer too, initialize() reads the IP discovery table at the end of the video memory of AMD GPUs (RDNA 1 and newer) and reports what the video engines are.
   void set_bar_sizer(IBarSizer* sizer) { bar_sizer_ = sizer; }
-  // Opt in (needs set_mmio): H.264 decoding on the video engine of Gen9.5 Intel GPUs. Off by default: that path has only run against a simulated GPU.
+  // H.264 decoding on the video engine of Gen9.5 Intel GPUs (needs set_mmio, so it is only tried where the registers could be mapped). On by default; pass false
+  // to keep every session on the CPU. That path has only been run against a simulated GPU, so a real GPU that does not answer as expected leaves the sessions on the CPU.
   void set_intel_hardware_decode(bool enable) { intel_hardware_ = enable; }
   // The memory the engine driver takes buffers from; by default the OS allocator's DMA pool. (For tests, which have no memory at device addresses.)
   void set_intel_gpu_memory(intel_gt::IGpuMemory* memory) { gpu_memory_override_ = memory; }
@@ -93,7 +94,7 @@ class SystemVideoCodecs {
   allocators::IAllocator& allocator_;
   IRegisterMapper* mmio_ = nullptr;
   IBarSizer* bar_sizer_ = nullptr;
-  bool intel_hardware_ = false;
+  bool intel_hardware_ = true;
   intel_gt::AllocatorGpuMemory gpu_memory_{allocator_};
   intel_gt::IGpuMemory* gpu_memory_override_ = nullptr;
   UniquePointer<intel_gt::MmioRegisterBank> intel_registers_bank_;  // lives as long as the device that uses it

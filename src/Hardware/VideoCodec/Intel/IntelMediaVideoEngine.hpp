@@ -29,9 +29,9 @@
 namespace hardware {
 
 // Intel's media engine in its graphics (Quick Sync Video: the VDBOX/MFX fixed-function blocks): the video decode/encode block that comes with the GPU (PCI vendor 0x8086).
-// By default it only reports that the engine is there (info().hardware_engine) and what a look at it found; every session runs on the CPU through the software codecs.
-// With set_hardware() before initialize(), on a Gen9.5 GPU whose video box answers, H.264 decoding runs on the engine (VcsDriver, IntelAvcDecoder) - one session at a
-// time, the others (and every other codec, and encoding) stay on the CPU. That path has only been run against a simulated GPU: it is off unless the owner turns it on.
+// It reports that the engine is there (info().hardware_engine) and what a look at it found; sessions run on the CPU through the software codecs unless the engine is driven.
+// With set_hardware() before initialize() (SystemVideoCodecs does it by default, and set_intel_hardware_decode(false) stops it), on a Gen9.5 GPU whose video box answers, H.264 decoding runs on
+// the engine (VcsDriver, IntelAvcDecoder) - one session at a time, the others (and every other codec, and encoding) stay on the CPU. That path has only been run against a simulated GPU.
 class IntelMediaVideoEngine final : public SoftwareVideoCodec {
  public:
   static constexpr uint16_t kPciVendor = 0x8086;
