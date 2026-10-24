@@ -74,6 +74,14 @@ class IDomHost {
   // history.pushState() / replaceState(): the address, and the state as JSON text (`has_state` false: none). history.state reads the entry the page is on.
   virtual void push_state(StringView address, StringView state_json, bool has_state, bool replace) = 0;
   virtual bool history_state(String* json) = 0;
+  // The Navigation API's view of the session history (see IPageEnvironment), window.open() and window.close(), document.referrer, and Element.scrollIntoView().
+  virtual bool history_entries(String* json, int64_t* index) { (void)json; (void)index; return false; }
+  virtual void set_navigation_state(StringView json, bool has_state) { (void)json; (void)has_state; }
+  virtual void history_go_to_key(uint64_t key) { (void)key; }
+  virtual bool open_window(StringView address, StringView target, bool noopener) { (void)address; (void)target; (void)noopener; return false; }
+  virtual void close_window() {}
+  virtual StringView referrer() { return StringView(); }
+  virtual void scroll_node_into_view(dom::Node* node) { (void)node; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
@@ -220,7 +228,8 @@ class DomBindings {
     static HookArg of(double n) { HookArg a; a.kind = Kind::Number; a.number = n; return a; }
     static HookArg of(StringView s) { HookArg a; a.kind = Kind::String; a.text = s; return a; }
   };
-  bool call_hook(StringView name, const HookArg* args, uint32_t count);
+  // `result` (optional) gets the value the function returned as text ("" for undefined and null).
+  bool call_hook(StringView name, const HookArg* args, uint32_t count, String* result = nullptr);
   // The same, as a task of its own: it runs when the event loop gets to it (the next timer turn), not now.
   void schedule_hook(StringView name, const HookArg* args, uint32_t count);
 

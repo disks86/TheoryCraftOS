@@ -32,12 +32,19 @@ class SessionHistory {
   static constexpr uint64_t kMaxStateBytes = 2u << 20;
 
   struct Entry {
-    explicit Entry(allocators::IAllocator& a) : address(a), state(a) {}
+    explicit Entry(allocators::IAllocator& a) : address(a), state(a), nav_state(a), title(a) {}
     String address;
     String state;             // JSON text; meaningful when has_state
     bool has_state = false;
     uint32_t document = 0;    // which document made this entry (0: unknown)
-    int32_t scroll = 0;       // the line the page was scrolled to when it was left
+    int32_t scroll = 0;       // the pixel row the page was scrolled to when it was left
+    bool scroll_saved = false;   // (false: the entry was never left, there is nothing to scroll back to)
+    uint64_t key = 0;         // the Navigation API's key: stays with the entry when it is replaced
+    uint64_t id = 0;          // and its id: a replaced entry gets a new one
+    String nav_state;         // navigation.navigate({ state }) / updateCurrentEntry(): JSON text of the Navigation API's state of the entry
+    bool has_nav_state = false;
+    String title;             // the title the page had when it was left (the list under Back and Forward)
+    bool manual_scroll = false;   // history.scrollRestoration = 'manual' when the entry was left: the browser does not scroll it back
   };
 
   explicit SessionHistory(allocators::IAllocator& allocator) : allocator_(allocator), entries_(allocator) {}
@@ -59,6 +66,12 @@ class SessionHistory {
   bool push_state(StringView address, StringView state, bool has_state, bool replace);
   // A fragment change made by the page or a link: a new entry of the same document.
   bool push_fragment(StringView address);
+  // The current entry is replaced by one for `address` (a reload, or navigating to the address that is already shown): same key, new id, no state.
+  void replace_navigation(StringView address, uint32_t document);
+  // Moves to the entry at `index`. False if there is none.
+  bool go_to(uint32_t index) { return index < entries_.count() && go(static_cast<int32_t>(static_cast<int64_t>(index) - index_)); }
+  // The entry with this Navigation API key (-1: none).
+  int64_t find_key(uint64_t key) const;
   // Moves by `delta` entries. False (nothing changes) if there is no such entry.
   bool go(int32_t delta);
   // After a document was loaded again, its entries answer to its new number.
@@ -70,9 +83,15 @@ class SessionHistory {
 
  private:
   void trim();
+  void stamp(Entry& e, bool keep_key) {
+    ++next_id_;
+    if (!keep_key) e.key = next_id_;
+    e.id = next_id_;
+  }
   allocators::IAllocator& allocator_;
   List<Entry> entries_;
   int64_t index_ = -1;
+  uint64_t next_id_ = 0;
 };
 
 }  // namespace browser

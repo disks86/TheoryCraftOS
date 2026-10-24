@@ -75,6 +75,43 @@ static void test_history() {
   CHECK(a.live == 0);
 }
 
+
+static void test_keys_and_replace() {
+  TestAllocator a;
+  {
+    SessionHistory h(a);
+    CHECK(h.navigate("http://a/1", 1) && h.navigate("http://a/2", 2) && h.navigate("http://a/3", 3));
+    const uint64_t k1 = h.at(0).key, k2 = h.at(1).key, k3 = h.at(2).key;
+    CHECK(k1 && k2 && k3 && k1 != k2 && k2 != k3 && h.at(0).id != h.at(1).id);
+    CHECK(h.find_key(k2) == 1 && h.find_key(k3) == 2 && h.find_key(12345) == -1);
+    // going to an entry by its place
+    CHECK(h.go_to(0) && h.index() == 0 && !h.go_to(3) && h.index() == 0 && h.go_to(2) && h.index() == 2);
+    // replacing keeps the key and gives a new id; state and the Navigation API's state are gone
+    h.at(2).nav_state.assign("\"s\"");
+    h.at(2).has_nav_state = true;
+    const uint64_t id = h.at(2).id;
+    h.replace_navigation("http://a/3b", 7);
+    CHECK(h.at(2).key == k3 && h.at(2).id != id && h.at(2).document == 7 && !h.at(2).has_nav_state && h.at(2).nav_state.empty() && std::string(h.at(2).address.c_str()) == "http://a/3b");
+    // pushState: a new key; replaceState: the same key, a new id
+    CHECK(h.push_state("http://a/3c", "1", true, false) && h.at(3).key != k3 && h.at(3).key != 0);
+    const uint64_t k4 = h.at(3).key, id4 = h.at(3).id;
+    CHECK(h.push_state("http://a/3d", "2", true, true) && h.at(3).key == k4 && h.at(3).id != id4);
+    // a reload (replace_current) keeps both
+    const uint64_t id4b = h.at(3).id;
+    h.replace_current("http://a/3e", 8);
+    CHECK(h.at(3).key == k4 && h.at(3).id == id4b);
+    // dropping the forward entries forgets their keys
+    CHECK(h.go_to(1) && h.navigate("http://a/new", 9) && h.find_key(k3) == -1 && h.find_key(k4) == -1 && h.find_key(k2) == 1 && h.count() == 3);
+    // what a page left behind
+    h.current()->scroll = 480;
+    h.current()->scroll_saved = true;
+    h.current()->title.assign("Title");
+    CHECK(h.current()->scroll == 480 && h.current()->scroll_saved && !h.current()->manual_scroll && std::string(h.current()->title.c_str()) == "Title");
+    CHECK(!h.at(0).scroll_saved);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_hubs() {
   TestAllocator a;
   {
@@ -126,6 +163,7 @@ static void test_hubs() {
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_history();
+  test_keys_and_replace();
   test_hubs();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

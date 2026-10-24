@@ -460,6 +460,73 @@ NATIVE(win_prompt) {
 
 NATIVE(win_do_nothing) { return true; }
 
+// --- navigation: what the Navigation API and window.open() need from the browser ----------------------------------------------------
+
+NATIVE(set_hidden) {
+  (void)self;
+  impl(vm).page_hidden = argc > 0 && args[0].is_bool() && args[0].u.boolean;
+  *result = Value();
+  return true;
+}
+
+// __history_entries(): JSON text {"index":n,"entries":[{"key","id","url","state","nav"}]}, or null without a session history.
+NATIVE(history_entries) {
+  (void)self; (void)args; (void)argc;
+  String json(vm.allocator());
+  int64_t index = -1;
+  if (!impl(vm).host.history_entries(&json, &index)) {
+    *result = Value::make_null();
+    return true;
+  }
+  String text(vm.allocator());
+  text.append("{\"index\":");
+  text.append_int(index);
+  text.append(",\"entries\":");
+  text.append(json.view());
+  text.append("}");
+  *result = str_value(vm, text.view());
+  return true;
+}
+
+// __nav_state(text | null): the Navigation API's state of the current entry.
+NATIVE(nav_state) {
+  (void)self;
+  String text(vm.allocator());
+  const bool has = argc > 0 && !args[0].is_nullish();
+  if (has && !arg_text(vm, args[0], &text)) return false;
+  impl(vm).host.set_navigation_state(text.view(), has);
+  *result = Value();
+  return true;
+}
+
+NATIVE(nav_go_key) {
+  (void)self;
+  double key = 0;
+  if (argc > 0 && !vm.to_number(args[0], &key)) return false;
+  if (key >= 1) impl(vm).host.history_go_to_key(static_cast<uint64_t>(key));
+  *result = Value();
+  return true;
+}
+
+// __open_window(url, target, noopener): true if the browser opened a window.
+NATIVE(open_window) {
+  (void)self;
+  String url(vm.allocator()), target(vm.allocator());
+  if (argc > 0 && !arg_text(vm, args[0], &url)) return false;
+  if (argc > 1 && !arg_text(vm, args[1], &target)) return false;
+  const bool noopener = argc > 2 && args[2].is_bool() && args[2].u.boolean;
+  *result = bool_value(impl(vm).host.open_window(url.view(), target.view(), noopener));
+  return true;
+}
+
+NATIVE(close_window) {
+  (void)self; (void)args; (void)argc;
+  impl(vm).host.close_window();
+  *result = Value();
+  return true;
+}
+
+
 NATIVE(win_structured_clone) {
   Value json;
   if (!vm.get_named(Value::make_object(vm.global()), "JSON", &json)) return false;
@@ -992,6 +1059,12 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__pip_request", pip_request, 1);
   vm.define_native(g, "__pip_exit", pip_exit, 0);
   vm.define_native(g, "__pip_element", pip_element, 0);
+  vm.define_native(g, "__set_hidden", set_hidden, 1);
+  vm.define_native(g, "__history_entries", history_entries, 0);
+  vm.define_native(g, "__nav_state", nav_state, 1);
+  vm.define_native(g, "__nav_go_key", nav_go_key, 1);
+  vm.define_native(g, "__open_window", open_window, 3);
+  vm.define_native(g, "__close_window", close_window, 0);
   vm.define_native(g, "__fs_supported", fs_supported, 0);
   vm.define_native(g, "__fs_request", fs_request, 1);
   vm.define_native(g, "__fs_exit", fs_exit, 0);
@@ -1053,7 +1126,7 @@ bool install_window(DomBindings::Impl& c) {
   define_function_global(vm, "scrollBy", win_scroll_by, 2);
   define_function_global(vm, "confirm", win_confirm, 1);
   define_function_global(vm, "prompt", win_prompt, 2);
-  for (const char* name : {"open", "close", "focus", "blur", "print", "stop", "moveTo", "resizeTo"}) define_function_global(vm, name, win_do_nothing, 0);
+  for (const char* name : {"focus", "blur", "print", "stop", "moveTo", "resizeTo"}) define_function_global(vm, name, win_do_nothing, 0);
   define_function_global(vm, "structuredClone", win_structured_clone, 1);
   define_function_global(vm, "btoa", win_btoa, 1);
   define_function_global(vm, "atob", win_atob, 1);

@@ -7776,6 +7776,370 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     nativeAdd.call(store, 'change', function (e) { if (typeof handler === 'function') handler.call(store, e); });
     defineGetter(g, 'cookieStore', function () { return store; });
   }());
+  // ---------------------------------------------------------------------------------------------------------------------------------- page lifecycle, window.open()
+  (function () {
+    hide(g, '__fire_pageshow', function () { g.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false })); });
+    // beforeunload: '1' if a listener asked for the user to be asked (preventDefault(), or a returnValue / the handler's return value)
+    hide(g, '__page_beforeunload', function () {
+      var e = new BeforeUnloadEvent('beforeunload', { cancelable: true });
+      g.dispatchEvent(e);
+      return e.defaultPrevented || (typeof e.returnValue === 'string' && e.returnValue !== '') ? '1' : '';
+    });
+    hide(g, '__page_unload', function () {
+      __set_hidden(true);
+      document.dispatchEvent(new Event('visibilitychange', { bubbles: true }));
+      g.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }));
+      g.dispatchEvent(new Event('unload'));
+    });
+    var restoration = 'auto';
+    Object.defineProperty(g.history, 'scrollRestoration', {
+      get: function () { return restoration; },
+      set: function (v) { v = String(v); if (v === 'auto' || v === 'manual') restoration = v; },
+      enumerable: true, configurable: true });
+    hide(g, '__scroll_manual', function () { return restoration === 'manual' ? '1' : ''; });
+
+    var opened = 0;
+    var closedWindow = function (name, href) {
+      var w = { closed: false, name: name, opener: g, location: { href: href }, close: function () { this.closed = true; }, focus: function () {}, blur: function () {}, postMessage: function () {} };
+      return w;
+    };
+    method(g, 'open', function (url, target, features) {
+      url = url === undefined ? '' : String(url);
+      target = target === undefined || target === '' ? '_blank' : String(target);
+      features = features === undefined ? '' : String(features);
+      var href = url === '' ? 'about:blank' : new URL(url, g.location.href).href;
+      if (target === '_self' || target === '_parent' || target === '_top' || target === g.name && g.name !== '') {
+        if (href !== 'about:blank') g.location.assign(href);
+        return g;
+      }
+      var noopener = /(^|,)\s*(noopener|noreferrer)\b/i.test(features);
+      if (href === 'about:blank' || opened >= 20 || !__open_window(href, target, noopener)) return null;
+      opened++;
+      return noopener ? null : closedWindow(target === '_blank' ? '' : target, href);
+    });
+    method(g, 'close', function () { __close_window(); });
+    if (g.closed === undefined) Object.defineProperty(g, 'closed', { get: function () { return false; }, configurable: true });
+  }());
+
+  // ---------------------------------------------------------------------------------------------------------------------------------- Navigation API
+  (function () {
+    var Navigation = klass('Navigation', ET), NavigationHistoryEntry = klass('NavigationHistoryEntry', ET), NavigationTransition = klass('NavigationTransition', null),
+        NavigationActivation = klass('NavigationActivation', null), NavigationDestination = klass('NavigationDestination', null);
+    var NavigateEvent = mkEvent('NavigateEvent', null, { navigationType: 'push', destination: null, canIntercept: false, userInitiated: false, hashChange: false, signal: null, formData: null, downloadRequest: null, info: undefined, hasUAVisualTransition: false, sourceElement: null });
+    var CurrentEntryChangeEvent = mkEvent('NavigationCurrentEntryChangeEvent', null, { navigationType: null, from: null });
+    var noop = function () {};
+    var domError = function (message, name) { return new DOMException(message, name); };
+    var HP = Object.getPrototypeOf(g.history), LP = Object.getPrototypeOf(g.location);
+    var nativePush = HP.pushState, nativeReplace = HP.replaceState, nativeGo = HP.go, nativeAssign = LP.assign, nativeLocReplace = LP.replace, nativeReload = LP.reload;
+    var nav = Object.create(Navigation.prototype), wrap = {}, ongoing = null, pendingTraverse = null, transition = null, internal = false, lastKey = null, lastId = null;
+
+    // the entries of the tab that are of the page's origin, around the current one (the others are not for the page to see)
+    var load = function () {
+      var raw = __history_entries();
+      if (raw === null) return null;
+      var d = JSON.parse(raw), origin = g.location.origin, ok = function (e) { try { return new URL(e.url).origin === origin; } catch (x) { return false; } };
+      var lo = d.index, hi = d.index;
+      if (d.index < 0) return { entries: [], current: -1 };
+      while (lo > 0 && ok(d.entries[lo - 1])) lo--;
+      while (hi < d.entries.length - 1 && ok(d.entries[hi + 1])) hi++;
+      var list = [], seen = {};
+      for (var i = lo; i <= hi; i++) {
+        var e = d.entries[i], o = wrap[e.key];
+        if (!o) { o = Object.create(NavigationHistoryEntry.prototype); wrap[e.key] = o; hide(o, '__k', e.key); }
+        hide(o, '__id', e.id); hide(o, '__url', e.url); hide(o, '__doc', e.doc); hide(o, '__nav', e.nav); hide(o, '__i', i - lo);
+        seen[e.key] = true;
+        list.push(o);
+      }
+      var gone = [];
+      for (var k in wrap) if (!seen[k] && !wrap[k].__gone) { hide(wrap[k], '__gone', true); hide(wrap[k], '__i', -1); gone.push(wrap[k]); delete wrap[k]; }
+      for (var j = 0; j < gone.length; j++) gone[j].dispatchEvent(new Event('dispose'));
+      return { entries: list, current: d.index - lo };
+    };
+    var currentEntry = function () { var s = load(); return s && s.current >= 0 ? s.entries[s.current] : null; };
+    defineGetter(NavigationHistoryEntry.prototype, 'key', function () { return String(this.__k); });
+    defineGetter(NavigationHistoryEntry.prototype, 'id', function () { return String(this.__id); });
+    defineGetter(NavigationHistoryEntry.prototype, 'url', function () { return this.__gone ? this.__url : this.__url; });
+    defineGetter(NavigationHistoryEntry.prototype, 'index', function () { return this.__i === undefined ? -1 : this.__i; });
+    defineGetter(NavigationHistoryEntry.prototype, 'sameDocument', function () { var c = currentEntry(); return !!c && c.__doc === this.__doc; });
+    method(NavigationHistoryEntry.prototype, 'getState', function () { return this.__nav === null || this.__nav === undefined ? undefined : __deserialize(this.__nav); });
+    defineGetter(NavigationHistoryEntry.prototype, 'ondispose', function () { return this.__od || null; }, function (fn) { hide(this, '__od', typeof fn === 'function' ? fn : null); if (!this.__odl) { var self = this; hide(this, '__odl', true); this.addEventListener('dispose', function (e) { if (self.__od) self.__od.call(self, e); }); } });
+
+    var sameOriginUrl = function (href) { try { return new URL(href).origin === g.location.origin; } catch (x) { return false; } };
+    var stripHash = function (href) { var i = href.indexOf('#'); return i < 0 ? href : href.slice(0, i); };
+    var makeDestination = function (href, key, id, index, sameDocument, nav) {
+      var d = Object.create(NavigationDestination.prototype);
+      hide(d, '__u', href); hide(d, '__k', key); hide(d, '__id', id); hide(d, '__i', index); hide(d, '__s', sameDocument); hide(d, '__n', nav);
+      return d;
+    };
+    defineGetter(NavigationDestination.prototype, 'url', function () { return this.__u; });
+    defineGetter(NavigationDestination.prototype, 'key', function () { return this.__k === null ? '' : String(this.__k); });
+    defineGetter(NavigationDestination.prototype, 'id', function () { return this.__id === null ? '' : String(this.__id); });
+    defineGetter(NavigationDestination.prototype, 'index', function () { return this.__i; });
+    defineGetter(NavigationDestination.prototype, 'sameDocument', function () { return this.__s; });
+    method(NavigationDestination.prototype, 'getState', function () { return this.__n === null || this.__n === undefined ? undefined : __deserialize(this.__n); });
+
+    method(NavigateEvent.prototype, 'intercept', function (options) {
+      if (!this.__active) throw domError("Failed to execute 'intercept' on 'NavigateEvent': intercept() may only be called while the navigate event is being dispatched.", 'InvalidStateError');
+      if (!this.canIntercept) throw domError("Failed to execute 'intercept' on 'NavigateEvent': A navigation to " + this.destination.url + " cannot be intercepted by a document at " + g.location.href + '.', 'SecurityError');
+      if (this.defaultPrevented) throw domError("Failed to execute 'intercept' on 'NavigateEvent': intercept() may not be called if the event has been canceled.", 'InvalidStateError');
+      options = options || {};
+      if (options.handler !== undefined && typeof options.handler !== 'function') throw typeErr("execute 'intercept' on 'NavigateEvent'", "Failed to read the 'handler' property from 'NavigationInterceptOptions': The provided callback is not a function.");
+      this.__intercepted = true;
+      if (options.handler) this.__handlers.push(options.handler);
+      if (options.scroll === 'manual') this.__manualScroll = true;
+    });
+    method(NavigateEvent.prototype, 'scroll', function () { if (!this.__intercepted || this.__active) throw domError("Failed to execute 'scroll' on 'NavigateEvent': scroll() may only be called after the navigation was intercepted and committed.", 'InvalidStateError'); this.__scrolled = true; });
+    method(NavigateEvent.prototype, 'commit', function () { if (!this.__intercepted || !this.__active) throw domError("Failed to execute 'commit' on 'NavigateEvent': commit() may only be called while an intercepted navigate event is being dispatched.", 'InvalidStateError'); });
+
+    var fire = function (type, init) { nav.dispatchEvent(new Event(type, init)); };
+    var fireChange = function (type, from) { nav.dispatchEvent(new CurrentEntryChangeEvent('currententrychange', { navigationType: type, from: from })); };
+    // tell listeners the current entry is another one (or the same one, replaced)
+    var settle = function (type, from) {
+      var c = currentEntry();
+      if (c && (c.__k !== lastKey || c.__id !== lastId)) { var was = from || (lastKey !== null && wrap[lastKey]) || null; lastKey = c.__k; lastId = c.__id; fireChange(type, was); }
+    };
+    var pair = function () {
+      var c = {}, r = {};
+      r.committed = new Promise(function (res, rej) { c.commit = res; c.failCommit = rej; });
+      r.finished = new Promise(function (res, rej) { c.finish = res; c.failFinish = rej; });
+      r.committed.catch(noop); r.finished.catch(noop);
+      return { result: r, ctl: c };
+    };
+    var abortOngoing = function (reason) {
+      var o = ongoing;
+      if (!o) return;
+      ongoing = null; transition = null;
+      o.controller.abort(reason);
+      var err = reason || domError('Navigation was aborted', 'AbortError');
+      nav.dispatchEvent(new ErrorEvent('navigateerror', { error: err, message: err.message || '' }));
+      o.pair.ctl.failCommit(err); o.pair.ctl.failFinish(err);
+    };
+    var rejected = function (error) { var p = pair(); p.ctl.failCommit(error); p.ctl.failFinish(error); return p.result; };
+
+    // runs the handlers of an intercepted navigate event, then finishes the navigation
+    var finishIntercepted = function (o) {
+      var ev = o.event, list = [];
+      var t = Object.create(NavigationTransition.prototype);
+      hide(t, '__t', o.type); hide(t, '__from', o.from); hide(t, '__finished', o.pair.result.finished); hide(t, '__committed', o.pair.result.committed);
+      transition = t;
+      var run = function () { var out = []; for (var i = 0; i < ev.__handlers.length; i++) { try { out.push(Promise.resolve(ev.__handlers[i].call(undefined, ev))); } catch (e) { out.push(Promise.reject(e)); } } return Promise.all(out); };
+      Promise.resolve().then(run).then(function () {
+        if (ongoing !== o) return;
+        ongoing = null; transition = null;
+        fire('navigatesuccess');
+        o.pair.ctl.finish(currentEntry());
+      }, function (e) {
+        if (ongoing !== o) return;
+        ongoing = null; transition = null;
+        nav.dispatchEvent(new ErrorEvent('navigateerror', { error: e, message: e && e.message || '' }));
+        o.pair.ctl.failFinish(e);
+      });
+    };
+    defineGetter(NavigationTransition.prototype, 'navigationType', function () { return this.__t; });
+    defineGetter(NavigationTransition.prototype, 'from', function () { return this.__from; });
+    defineGetter(NavigationTransition.prototype, 'finished', function () { return this.__finished; });
+    defineGetter(NavigationTransition.prototype, 'committed', function () { return this.__committed; });
+
+    // Fires `navigate` for a navigation that is starting. `o`: type, href, key/id/index (traverse), state (serialized text), info, cancelable, userInitiated, sameDocument, pair.
+    var begin = function (o) {
+      abortOngoing();
+      o.controller = new AbortController();
+      o.from = currentEntry();
+      var cur = g.location.href;
+      var hashOnly = stripHash(o.href) === stripHash(cur) && o.href.indexOf('#') >= 0 && o.href !== cur;
+      var sameDoc = o.sameDocument !== undefined ? o.sameDocument : (o.type === 'reload' ? false : hashOnly);
+      var dest = makeDestination(o.href, o.key === undefined ? null : o.key, o.id === undefined ? null : o.id, o.index === undefined ? -1 : o.index, sameDoc, o.type === 'traverse' ? o.destNav : o.state);
+      var canIntercept = sameOriginUrl(o.href) && o.type !== 'reload' && (o.type !== 'traverse' || sameDoc);
+      var ev = new NavigateEvent('navigate', { cancelable: o.cancelable !== false, navigationType: o.type, destination: dest, canIntercept: canIntercept, userInitiated: !!o.userInitiated, hashChange: hashOnly || (o.type === 'traverse' && sameDoc && stripHash(o.href) === stripHash(cur) && o.href !== cur), signal: o.controller.signal, info: o.info });
+      hide(ev, '__handlers', []); hide(ev, '__active', true); hide(ev, '__intercepted', false);
+      o.event = ev;
+      ongoing = o;
+      var proceed = nav.dispatchEvent(ev);
+      ev.__active = false;
+      if (!proceed) {
+        if (ongoing === o) { ongoing = null; transition = null; var err = domError('Navigation was aborted', 'AbortError'); o.controller.abort(err); nav.dispatchEvent(new ErrorEvent('navigateerror', { error: err, message: err.message })); o.pair.ctl.failCommit(err); o.pair.ctl.failFinish(err); }
+        return false;
+      }
+      return true;
+    };
+
+    // push / replace to a URL (navigation.navigate(), location.assign() ...)
+    var navigateTo = function (href, type, state, info, userInitiated) {
+      var o = { type: type, href: href, state: state, info: info, userInitiated: userInitiated, pair: pair() };
+      var cur = g.location.href;
+      if (!begin(o)) return o.pair.result;
+      var intercepted = o.event.__intercepted;
+      var hashOnly = stripHash(href) === stripHash(cur) && href.indexOf('#') >= 0;
+      if (intercepted || (hashOnly && sameOriginUrl(href))) {
+        var before = currentEntry();
+        internal = true;
+        try { (type === 'replace' ? nativeReplace : nativePush).call(g.history, undefined, '', href); } catch (e) { internal = false; ongoing = null; o.pair.ctl.failCommit(e); o.pair.ctl.failFinish(e); return o.pair.result; } finally { internal = false; }
+        if (state !== undefined && state !== null) __nav_state(state); else if (type === 'replace') __nav_state(null);
+        o.pair.ctl.commit(currentEntry());
+        settle(type, before);
+        if (intercepted) finishIntercepted(o);
+        else { ongoing = null; fire('navigatesuccess'); o.pair.ctl.finish(currentEntry()); }
+        return o.pair.result;
+      }
+      // a navigation to another document: the page is going away (its promises are never settled)
+      ongoing = null;
+      (type === 'replace' ? nativeLocReplace : nativeAssign).call(g.location, href);
+      return o.pair.result;
+    };
+
+    // back / forward / traverseTo: the entry is named; the browser goes there on its own time
+    var traverseTo = function (entry, userInitiated, info) {
+      var s = load(), cur = s ? s.current : -1;
+      if (!s || cur < 0 || entry.__gone) return rejected(domError("Invalid key: the entry no longer exists.", 'InvalidStateError'));
+      if (entry.__k === s.entries[cur].__k) { var p = pair(); p.ctl.commit(entry); p.ctl.finish(entry); return p.result; }
+      var o = { type: 'traverse', href: entry.__url, key: entry.__k, id: entry.__id, index: entry.__i, destNav: entry.__nav, sameDocument: entry.__doc === s.entries[cur].__doc, userInitiated: userInitiated, info: info, pair: pair(), cancelable: true };
+      if (!begin(o)) return o.pair.result;
+      pendingTraverse = o;
+      __nav_go_key(entry.__k);
+      return o.pair.result;
+    };
+
+    method(Navigation.prototype, 'navigate', function (url, options) {
+      if (arguments.length < 1) throw typeErr("execute 'navigate' on 'Navigation'", '1 argument required, but only 0 present.');
+      options = options || {};
+      var href;
+      try { href = new URL(String(url), g.location.href).href; } catch (e) { return rejected(domError("Failed to execute 'navigate' on 'Navigation': Invalid URL '" + url + "'.", 'SyntaxError')); }
+      var h = options.history === undefined ? 'auto' : String(options.history);
+      if (h !== 'auto' && h !== 'push' && h !== 'replace') throw typeErr("execute 'navigate' on 'Navigation'", "The provided value '" + h + "' is not a valid enum value of type NavigationHistoryBehavior.");
+      var state = null;
+      if (options.state !== undefined) { try { state = __serialize(options.state); } catch (e) { return rejected(domError('The state could not be cloned.', 'DataCloneError')); } }
+      var type = h === 'replace' || (h === 'auto' && href === g.location.href) ? 'replace' : 'push';
+      return navigateTo(href, type, state, options.info, false);
+    });
+    method(Navigation.prototype, 'reload', function (options) {
+      options = options || {};
+      var o = { type: 'reload', href: g.location.href, info: options.info, pair: pair() };
+      if (options.state !== undefined) { try { __nav_state(__serialize(options.state)); } catch (e) { return rejected(domError('The state could not be cloned.', 'DataCloneError')); } }
+      if (!begin(o)) return o.pair.result;
+      var intercepted = o.event.__intercepted;
+      if (intercepted) { o.pair.ctl.commit(currentEntry()); finishIntercepted(o); } else { ongoing = null; nativeReload.call(g.location); }
+      return o.pair.result;
+    });
+    method(Navigation.prototype, 'traverseTo', function (key, options) {
+      var s = load(), key = String(key), found = null;
+      if (s) for (var i = 0; i < s.entries.length; i++) if (String(s.entries[i].__k) === key) found = s.entries[i];
+      if (!found) return rejected(domError("Failed to execute 'traverseTo' on 'Navigation': Invalid key.", 'InvalidStateError'));
+      return traverseTo(found, false, options && options.info);
+    });
+    method(Navigation.prototype, 'back', function (options) {
+      var s = load();
+      if (!s || s.current <= 0) return rejected(domError("Failed to execute 'back' on 'Navigation': Cannot go back.", 'InvalidStateError'));
+      return traverseTo(s.entries[s.current - 1], false, options && options.info);
+    });
+    method(Navigation.prototype, 'forward', function (options) {
+      var s = load();
+      if (!s || s.current < 0 || s.current >= s.entries.length - 1) return rejected(domError("Failed to execute 'forward' on 'Navigation': Cannot go forward.", 'InvalidStateError'));
+      return traverseTo(s.entries[s.current + 1], false, options && options.info);
+    });
+    method(Navigation.prototype, 'updateCurrentEntry', function (options) {
+      if (arguments.length < 1 || options === null || typeof options !== 'object' || options.state === undefined) throw typeErr("execute 'updateCurrentEntry' on 'Navigation'", "Failed to read the 'state' property from 'NavigationUpdateCurrentEntryOptions': Required member is undefined.");
+      var c = currentEntry();
+      if (!c) throw domError("Failed to execute 'updateCurrentEntry' on 'Navigation': The current entry is not available.", 'InvalidStateError');
+      var text;
+      try { text = __serialize(options.state); } catch (e) { throw domError('The state could not be cloned.', 'DataCloneError'); }
+      __nav_state(text);
+      load();
+      fireChange(null, c);
+    });
+    method(Navigation.prototype, 'entries', function () { var s = load(); return s ? s.entries.slice() : []; });
+    defineGetter(Navigation.prototype, 'currentEntry', function () { return currentEntry(); });
+    defineGetter(Navigation.prototype, 'transition', function () { return transition; });
+    defineGetter(Navigation.prototype, 'canGoBack', function () { var s = load(); return !!s && s.current > 0; });
+    defineGetter(Navigation.prototype, 'canGoForward', function () { var s = load(); return !!s && s.current >= 0 && s.current < s.entries.length - 1; });
+    defineGetter(Navigation.prototype, 'activation', function () { return activation; });
+    var activation = null;
+    ['navigate', 'navigatesuccess', 'navigateerror', 'currententrychange'].forEach(function (type) {
+      var key = '__on' + type, wired = '__w' + type;
+      Object.defineProperty(Navigation.prototype, 'on' + type, { get: function () { return this[key] || null; }, set: function (fn) {
+        hide(this, key, typeof fn === 'function' ? fn : null);
+        if (!this[wired]) { var self = this; hide(this, wired, true); this.addEventListener(type, function (e) { if (self[key]) self[key].call(self, e); }); }
+      }, enumerable: true, configurable: true });
+    });
+    Object.defineProperty(NavigationActivation.prototype, 'entry', { get: function () { return this.__e; }, enumerable: true, configurable: true });
+    Object.defineProperty(NavigationActivation.prototype, 'from', { get: function () { return this.__f; }, enumerable: true, configurable: true });
+    Object.defineProperty(NavigationActivation.prototype, 'navigationType', { get: function () { return this.__t; }, enumerable: true, configurable: true });
+    Object.defineProperty(g, 'navigation', { get: function () { return nav; }, enumerable: true, configurable: true });
+    // (the entry the page was opened at is where the first change is measured from)
+    (function () {
+      var c = currentEntry();
+      if (c) { lastKey = c.__k; lastId = c.__id; var a = Object.create(NavigationActivation.prototype); hide(a, '__e', c); hide(a, '__f', null); hide(a, '__t', 'push'); activation = a; }
+    }());
+
+    // history.pushState() / replaceState() and location.assign() / replace() are navigations too
+    method(HP, 'pushState', function (state, title, url) {
+      if (internal) return nativePush.apply(this, arguments);
+      var before = currentEntry();
+      nativePush.apply(this, arguments);
+      var o = { type: 'push', href: g.location.href, pair: pair(), cancelable: false, sameDocument: true };
+      if (begin(o)) { ongoing = null; transition = null; }
+      settle('push', before);
+      fire('navigatesuccess');
+    });
+    method(HP, 'replaceState', function (state, title, url) {
+      if (internal) return nativeReplace.apply(this, arguments);
+      var before = currentEntry();
+      nativeReplace.apply(this, arguments);
+      var o = { type: 'replace', href: g.location.href, pair: pair(), cancelable: false, sameDocument: true };
+      if (begin(o)) { ongoing = null; transition = null; }
+      settle('replace', before);
+      fire('navigatesuccess');
+    });
+    var wrapBack = function (name, delta) {
+      var native = HP[name];
+      method(HP, name, function (n) {
+        var d = name === 'go' ? Math.trunc(Number(n)) || 0 : delta;
+        if (d === 0) return native.call(this, 0);
+        var s = load();
+        if (!s || s.current < 0 || s.current + d < 0 || s.current + d >= s.entries.length) return native.call(this, d);
+        traverseTo(s.entries[s.current + d], false);
+      });
+    };
+    wrapBack('back', -1); wrapBack('forward', 1); wrapBack('go', 0);
+    method(LP, 'assign', function (url) {
+      var href = new URL(String(url), g.location.href).href;
+      if (internal) return nativeAssign.call(this, href);
+      navigateTo(href, 'push', null, undefined, false);
+    });
+    method(LP, 'replace', function (url) {
+      var href = new URL(String(url), g.location.href).href;
+      if (internal) return nativeLocReplace.call(this, href);
+      navigateTo(href, 'replace', null, undefined, false);
+    });
+    method(LP, 'reload', function () { var o = { type: 'reload', href: g.location.href, pair: pair() }; if (begin(o)) { if (o.event.__intercepted) { o.pair.ctl.commit(currentEntry()); finishIntercepted(o); } else { ongoing = null; nativeReload.call(this); } } });
+
+    // the browser moved to another entry of this document (Back / Forward / history.go()): the navigation we started is carried out, or one is made up
+    hide(g, '__nav_traversed', function (oldURL, newURL) {
+      var o = pendingTraverse, before = lastKey !== null ? wrap[lastKey] : null;
+      pendingTraverse = null;
+      if (o && ongoing === o) {
+        o.pair.ctl.commit(currentEntry());
+        settle('traverse', before);
+        if (o.event.__intercepted) finishIntercepted(o);
+        else { ongoing = null; fire('navigatesuccess'); o.pair.ctl.finish(currentEntry()); }
+        return;
+      }
+      var p = { type: 'traverse', href: newURL, pair: pair(), cancelable: false, sameDocument: true, userInitiated: true };
+      var c = currentEntry();
+      if (c) { p.key = c.__k; p.id = c.__id; p.index = c.__i; p.destNav = c.__nav; }
+      if (begin(p)) { ongoing = null; transition = null; }
+      settle('traverse', before);
+      fire('navigatesuccess');
+    });
+    // a fragment navigation by the page's script (location.hash = ...) or a click on a link to "#...": a new entry
+    hide(g, '__nav_fragment', function (oldURL, newURL) {
+      var before = lastKey !== null ? wrap[lastKey] : null;
+      var p = { type: 'push', href: newURL, pair: pair(), cancelable: false, sameDocument: true, userInitiated: false };
+      if (begin(p)) { ongoing = null; transition = null; }
+      settle('push', before);
+      fire('navigatesuccess');
+    });
+  }());
+
   // @@END1
 }(this));
 )JSPRELUDE";

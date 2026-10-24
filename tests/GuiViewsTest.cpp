@@ -6620,6 +6620,20 @@ struct FakeLoader final : browser::IPageLoader {
              "document.getElementById('btn').addEventListener('click', function(e) { e.preventDefault(); document.getElementById('out').textContent = 'clicked'; });"
              "setTimeout(function() { document.getElementById('out').textContent += ' timer'; }, 50);</script></body></html>";
     }
+    if (address.equals("http://scroll.test/")) html = "<title>Scroll</title><div style='height:3000px'></div><p>end</p>";
+    if (address.equals("http://manual.test/")) html = "<title>Manual</title><script>history.scrollRestoration = 'manual'</script><div style='height:3000px'></div><p>end</p>";
+    if (address.equals("http://frag.test/") || address.equals("http://frag.test/#t")) html = "<title>Frag</title><div style='height:2000px'></div><h1 id=t>target</h1><div style='height:2000px'></div>";
+    if (address.equals("http://leave.test/"))
+      html = "<title>Leave</title><script>addEventListener('beforeunload', function (e) { e.preventDefault() }); addEventListener('pagehide', function () { localStorage.setItem('hid', '1') }); "
+             "addEventListener('unload', function () { localStorage.setItem('left', 'yes') })</script><p>stay</p>";
+    if (address.equals("http://leave.test/after")) html = "<script>document.title = 'left=' + localStorage.getItem('left') + ' hid=' + localStorage.getItem('hid')</script>";
+    if (address.equals("http://refresh.test/")) html = "<title>Refresh</title><meta http-equiv=refresh content=\"0; url=/next\"><p>wait</p>";
+    if (address.equals("http://ref.test/")) html = "<title>Ref</title><a href=\"/to\">to</a><script>document.title = 'first=[' + document.referrer + ']'</script>";
+    if (address.equals("http://ref.test/to")) html = "<script>document.title = 'ref=[' + document.referrer + ']'</script>";
+    if (address.equals("http://ref.test/other")) html = "<script>document.title = 'other=[' + document.referrer + ']'</script>";
+    if (address.equals("http://open.test/")) html = "<title>Opener</title><script>open('http://closer.test/', 'pop')</script>";
+    if (address.equals("http://closer.test/")) html = "<title>Closer</title><p>bye</p>";
+    if (address.equals("http://closer.test/now")) html = "<title>Closing</title><script>close()</script>";
     if (address.equals("http://js.test/app.js")) {
       r->content_type.assign("application/javascript");
       html = "document.write('<p>from file</p>'); var answer = 6 * 7; document.write('<p>' + answer + '</p>');";
@@ -6960,6 +6974,102 @@ static void test_web_form() {
   CHECK(a.live == 0);
 }
 
+// History and navigation in the browser window: where a page was scrolled to comes back with Back, a fragment scrolls to its element, a page that asks
+// before it is left is asked about, pagehide / unload run, <meta refresh> follows, document.referrer, the list under Back, and pages opening windows.
+static void test_web_navigation() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    FakeLoader loader;
+    d.set_page_loader(&loader);
+    Window& w = d.window();
+    desktop::WebBrowser* b = d.open_web_browser();
+    auto* host = static_cast<gui::TabFrame*>(b->host());
+    put(host, {20, 20, 700, 500});
+    w.layout();
+
+    // Back comes back to where the page was left; a page that asked for "manual" is left to the page (it starts at the top)
+    CHECK(b->navigate("http://scroll.test/") && b->page().picture()->height() > 2500);
+    b->page().scroll_to_y(900);
+    CHECK(b->page().scroll_y() == 900);
+    CHECK(b->navigate("http://one.test/") && b->page().scroll_y() == 0);
+    CHECK(b->go_back() && b->address().equals("http://scroll.test/") && b->page().scroll_y() == 900);
+    CHECK(b->go_forward() && b->address().equals("http://one.test/"));
+    CHECK(b->navigate("http://manual.test/"));
+    b->page().scroll_to_y(700);
+    CHECK(b->navigate("http://one.test/next") && b->go_back() && b->address().equals("http://manual.test/") && b->page().scroll_y() == 0);
+    // Reload keeps the place too
+    b->page().scroll_to_y(500);
+    CHECK(b->reload() && b->page().scroll_y() == 0);   // (manual: the page decides)
+    CHECK(b->navigate("http://scroll.test/"));
+    b->page().scroll_to_y(400);
+    CHECK(b->reload() && b->page().scroll_y() == 400);
+
+    // The list under Back names the pages (by their titles once they were left)
+    {
+      List<String> titles(a);
+      CHECK(b->history_titles(-1, 10, &titles) >= 3 && titles[0].view().equals("Manual") && titles[1].view().equals("Plain"));
+      List<String> ahead(a);
+      CHECK(b->go_back() && b->history_titles(1, 10, &ahead) == 1 && ahead[0].view().equals("Scroll"));
+      CHECK(b->go_forward());
+      const Point at = center(b->back_button());
+      w.mouse_button(at.x, at.y, MouseButton::Right, true);
+      w.mouse_button(at.x, at.y, MouseButton::Right, false);
+      CHECK(b->back_menu().open());
+      press(w, key::kEscape);
+      CHECK(!b->back_menu().open());
+    }
+
+    // A fragment in the address scrolls to its element
+    CHECK(b->navigate("http://frag.test/#t") && b->page().scroll_y() >= 1900 - 200 && b->page().scroll_y() > 0);
+
+    // A page that wants to be asked: the question comes first, "Stay" keeps it, "Leave" goes on; pagehide and unload ran
+    CHECK(b->navigate("http://leave.test/"));
+    const size_t asked = loader.asked.size();
+    CHECK(b->navigate("http://leave.test/after"));
+    CHECK(b->leave_dialog().showing() && b->address().equals("http://leave.test/") && loader.asked.size() == asked);
+    click_center(w, b->leave_dialog().decline_button());
+    CHECK(!b->leave_dialog().showing() && b->address().equals("http://leave.test/") && b->address_box().text().equals("http://leave.test/") && loader.asked.size() == asked);
+    CHECK(b->navigate("http://leave.test/after"));
+    click_center(w, b->leave_dialog().accept_button());
+    CHECK(!b->leave_dialog().showing() && b->address().equals("http://leave.test/after") && b->title().equals("Web Browser - left=yes hid=1"));
+    CHECK(b->go_back() && b->address().equals("http://leave.test/") && !b->leave_dialog().showing());   // (no question about the page that is left now)
+    CHECK(b->navigate("http://one.test/") && b->leave_dialog().showing());
+    click_center(w, b->leave_dialog().accept_button());
+    CHECK(b->address().equals("http://one.test/") && !b->leave_dialog().showing());
+
+    // <meta http-equiv=refresh content="0; url=/next"> follows, and Back does not come back to the page that sent us on
+    CHECK(b->navigate("http://refresh.test/") && b->address().equals("http://refresh.test/"));
+    b->tick(1000000000ull);
+    CHECK(b->address().equals("http://refresh.test/next") && b->title().equals("Web Browser - Plain"));
+    CHECK(b->go_back() && b->address().equals("http://one.test/"));
+
+    // document.referrer: set by a link of the page, not by a typed address
+    CHECK(b->navigate("http://ref.test/") && b->title().equals("Web Browser - first=[]"));
+    int32_t lx = 0, ly = 0;
+    CHECK(text_point(*b, "to", &lx, &ly));
+    click(w, lx, ly);
+    CHECK(b->address().equals("http://ref.test/to") && b->title().equals("Web Browser - ref=[http://ref.test/]"));
+    CHECK(b->navigate("http://ref.test/other") && b->title().equals("Web Browser - other=[]"));
+
+    // window.open(): another tab next to this one; a script may close the window it opened
+    const uint32_t before = d.web_browser_count();
+    CHECK(b->navigate("http://open.test/"));
+    CHECK(d.web_browser_count() == before + 1);
+    auto* opened = static_cast<desktop::WebBrowser*>(host->tab_at(host->tab_count() - 1));
+    CHECK(opened != b && opened->address().equals("http://closer.test/") && opened->title().equals("Web Browser - Closer"));
+    CHECK(opened->navigate("http://closer.test/now"));
+    d.step(1000000);
+    CHECK(d.web_browser_count() == before);
+    // (a window the user opened is not closed by its page)
+    CHECK(b->navigate("http://closer.test/now") && b->address().equals("http://closer.test/now") && d.web_browser_count() == before);
+  }
+  CHECK(a.live == 0);
+}
+
 // Browsers are tabs like the other programs: "+" opens another, they are dragged between windows, and a session brings them back.
 static void test_web_browser_tabs() {
   TestAllocator a;
@@ -7096,6 +7206,7 @@ int main() {
   test_spreadsheet_tabs();
   test_web_browser();
   test_web_form();
+  test_web_navigation();
   test_web_browser_media();
   test_web_browser_tabs();
   test_database_query();
