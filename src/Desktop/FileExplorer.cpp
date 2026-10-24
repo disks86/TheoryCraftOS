@@ -48,6 +48,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
       path_(allocator),
       scratch_(allocator),
       opened_file_(allocator),
+      properties_path_(allocator),
       delete_dialog_(allocator),
       delete_path_(allocator),
       credentials_dialog_(allocator),
@@ -66,11 +67,15 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   menu_.set_size(0, 22);
   if (Menu* file = menu_.add_menu("File")) {
     file->add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
-    file->add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
+    file->add_item("Copy", {&FileExplorer::on_copy_menu, this}, "Ctrl+C");
+    file->add_item("Paste", {&FileExplorer::on_paste_menu, this}, "Ctrl+V");
+    file->add_item("Select All", {&FileExplorer::on_select_all_menu, this}, "Ctrl+A");
+    file->add_item("Copy Path", {&FileExplorer::on_copy_path, this});
     file->add_item("Rename", {&FileExplorer::on_rename_menu, this}, "F2");
     file->add_item("Delete", {&FileExplorer::on_delete_menu, this}, "Del");
     file->add_item("New Folder", {&FileExplorer::on_new_folder, this});
     file->add_item("New File", {&FileExplorer::on_new_file, this});
+    file->add_item("Properties", {&FileExplorer::on_properties_menu, this}, "Alt+Enter");
     file->add_separator();
     file->add_item("Eject", {&FileExplorer::on_eject_menu, this});
     file->add_separator();
@@ -96,7 +101,10 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
 
   // The context menus.
   ctx_open_ = list_menu_.add_item("Open", {&FileExplorer::on_open_item, this}, "Enter");
-  ctx_copy_ = list_menu_.add_item("Copy Path", {&FileExplorer::on_copy_path, this}, "Ctrl+C");
+  ctx_copy_files_ = list_menu_.add_item("Copy", {&FileExplorer::on_copy_menu, this}, "Ctrl+C");
+  ctx_paste_ = list_menu_.add_item("Paste", {&FileExplorer::on_paste_menu, this}, "Ctrl+V");
+  ctx_select_all_ = list_menu_.add_item("Select All", {&FileExplorer::on_select_all_menu, this}, "Ctrl+A");
+  ctx_copy_ = list_menu_.add_item("Copy Path", {&FileExplorer::on_copy_path, this});
   list_menu_.add_separator();
   ctx_rename_ = list_menu_.add_item("Rename", {&FileExplorer::on_rename_menu, this}, "F2");
   ctx_delete_ = list_menu_.add_item("Delete", {&FileExplorer::on_delete_menu, this}, "Del");
@@ -109,6 +117,8 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   list_menu_.add_separator();
   ctx_up_ = list_menu_.add_item("Up One Level", {&FileExplorer::on_up_menu, this}, "Backspace");
   list_menu_.add_item("Refresh", {&FileExplorer::on_refresh_menu, this}, "F5");
+  list_menu_.add_separator();
+  list_menu_.add_item("Properties", {&FileExplorer::on_properties_menu, this}, "Alt+Enter");
   list_menu_.on_opening(Handler::immediate(&FileExplorer::on_list_menu_opening, this));
   address_menu_.add_item("Copy Address", {&FileExplorer::on_copy_address, this});
   address_menu_.add_item("Edit Address", {&FileExplorer::on_address_menu, this}, "Ctrl+L");
@@ -273,7 +283,11 @@ void FileExplorer::update_status() {
   scratch_.append_uint(view_.item_count());
   scratch_.append(view_.item_count() == 1 ? " item" : " items");
   const int32_t item = view_.selected_item();
-  if (item >= 0) {
+  if (view_.selection_count() > 1) {
+    scratch_.append("  |  ");
+    scratch_.append_uint(view_.selection_count());
+    scratch_.append(" selected");
+  } else if (item >= 0) {
     String name(allocator()), size(allocator());
     view_.item_text(static_cast<uint32_t>(item), 0, &name);
     view_.item_text(static_cast<uint32_t>(item), 1, &size);
@@ -303,8 +317,142 @@ bool FileExplorer::copy_selected_path() {
   return true;
 }
 
+// The full paths of the selected items go on the clipboard, one per line.
+bool FileExplorer::copy_selected() {
+  if (view_.selection_count() <= 1) return copy_selected_path();
+  if (!clipboard()) return false;
+  String text(allocator()), name(allocator());
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < view_.item_count(); ++i) {
+    if (!view_.is_selected(i)) continue;
+    view_.item_text(i, 0, &name);
+    if ((count > 0 && !text.push_back('\n')) || !text.append(path_.view()) || (path_.size() > 1 && !text.push_back('/')) || !text.append(name.view())) return true;
+    ++count;
+  }
+  if (clipboard()->set_text(text.view())) {
+    String message(allocator());
+    message.append("Copied ");
+    message.append_uint(count);
+    message.append(" items");
+    status_.set_text(message.view());
+  }
+  return true;
+}
+
+void FileExplorer::select_all() {
+  view_.select_all();
+  update_status();
+}
+
+// Pastes the files and folders named on the clipboard into the folder shown.
+bool FileExplorer::paste() {
+  if (!fs_ || !clipboard()) return false;
+  String text(allocator());
+  if (!clipboard()->get_text(&text)) {
+    status_.set_text("Nothing to paste.");
+    return false;
+  }
+  if (path_.size() <= 1) {
+    notify(NoticeKind::Error, "Files cannot be pasted into the list of drives.");
+    return false;
+  }
+  uint32_t pasted = 0;
+  Status failure = Status::Ok;
+  String source(allocator()), name(allocator()), target(allocator()), message(allocator());
+  const StringView all = text.view();
+  for (uint64_t start = 0; start < all.size();) {
+    uint64_t end = all.find('\n', start);
+    if (end == StringView::npos) end = all.size();
+    StringView line = all.substr(start, end - start);
+    start = end + 1;
+    if (line.size() > 0 && line[line.size() - 1] == '\r') line = line.substr(0, line.size() - 1);
+    DirectoryEntry entry;
+    if (line.size() < 2 || line[0] != '/' || fs_->stat(line, &entry) != Status::Ok) continue;
+    const uint64_t slash = line.rfind('/');
+    if (slash + 1 >= line.size()) continue;
+    source.assign(line);
+    name.assign(line.substr(slash + 1));
+    // A folder cannot be pasted into itself.
+    const StringView here = path_.view();
+    if (here.size() >= source.size() && here.substr(0, source.size()).equals(source.view()) && (here.size() == source.size() || here[source.size()] == '/')) {
+      message.assign("Cannot paste ");
+      message.append(name.view());
+      message.append(": a folder cannot be copied into itself.");
+      notify(NoticeKind::Error, message.view());
+      continue;
+    }
+    // The name in the folder: the same, or "Copy of ..." if it is taken.
+    bool free_name = false;
+    for (uint32_t attempt = 0; attempt < 100 && !free_name; ++attempt) {
+      target.assign(here);
+      target.push_back('/');
+      if (attempt > 0) target.append("Copy of ");
+      target.append(name.view());
+      if (attempt > 1) {
+        target.append(" (");
+        target.append_uint(attempt);
+        target.push_back(')');
+      }
+      DirectoryEntry taken;
+      free_name = fs_->stat(target.view(), &taken) == Status::NotFound;
+    }
+    if (!free_name) continue;
+    FileTransfer transfer(allocator(), *fs_);
+    Status status = transfer.measure(source.view());
+    if (status == Status::Ok) status = transfer.copy(source.view(), target.view());
+    if (status != Status::Ok) {
+      failure = status;
+      continue;
+    }
+    ++pasted;
+  }
+  fs_->flush();
+  fire(files_changed_);
+  refresh();
+  if (failure != Status::Ok) {
+    message.assign("Cannot paste: ");
+    message.append(describe_status(failure));
+    notify(NoticeKind::Error, message.view());
+  }
+  if (pasted == 0) {
+    if (failure == Status::Ok) status_.set_text("Nothing to paste.");
+    return false;
+  }
+  message.assign("Pasted ");
+  message.append_uint(pasted);
+  message.append(pasted == 1 ? " item" : " items");
+  status_.set_text(message.view());
+  return true;
+}
+
+// The selected item's properties, or the folder's when nothing is selected.
+bool FileExplorer::show_properties() {
+  const int32_t item = view_.selected_item();
+  if (item < 0) {
+    properties_path_.assign(path_.view());
+  } else {
+    String name(allocator());
+    view_.item_text(static_cast<uint32_t>(item), 0, &name);
+    if (!properties_path_.assign(path_.view()) || (path_.size() > 1 && !properties_path_.push_back('/')) || !properties_path_.append(name.view())) return false;
+  }
+  fire(properties_);
+  return true;
+}
+
 bool FileExplorer::on_key(const KeyArgs& args) {
-  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 2) return copy_selected_path();   // Ctrl+C
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 2) return copy_selected();   // Ctrl+C
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA + 21) {   // Ctrl+V
+    paste();
+    return true;
+  }
+  if ((args.modifiers & hardware::modifier::kControl) && args.usage == hardware::key::kA) {   // Ctrl+A
+    select_all();
+    return true;
+  }
+  if ((args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) && args.usage == hardware::key::kEnter) {   // Alt+Enter
+    show_properties();
+    return true;
+  }
   if (args.usage == hardware::key::kDelete) {
     delete_selected();
     return true;
@@ -538,6 +686,9 @@ void FileExplorer::on_list_menu_opening(void* self, Control&) {
   const bool selected = e->view_.selected_item() >= 0;
   e->ctx_open_->set_enabled(selected);
   e->ctx_copy_->set_enabled(selected);
+  e->ctx_copy_files_->set_enabled(selected);
+  e->ctx_select_all_->set_enabled(e->view_.item_count() > 0);
+  e->ctx_paste_->set_enabled(e->path_.size() > 1 && e->clipboard() && e->clipboard()->has_text());
   e->ctx_rename_->set_enabled(selected);
   e->ctx_delete_->set_enabled(selected);
   e->ctx_up_->set_enabled(e->path_.size() > 1);
@@ -648,6 +799,10 @@ void FileExplorer::copy_settings_from(const FileExplorer& o) {
 }
 
 void FileExplorer::on_open_item(void* self, Control&) { static_cast<FileExplorer*>(self)->activate_selected(); }
+void FileExplorer::on_copy_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->copy_selected(); }
+void FileExplorer::on_paste_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->paste(); }
+void FileExplorer::on_select_all_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->select_all(); }
+void FileExplorer::on_properties_menu(void* self, Control&) { static_cast<FileExplorer*>(self)->show_properties(); }
 void FileExplorer::on_copy_path(void* self, Control&) { static_cast<FileExplorer*>(self)->copy_selected_path(); }
 bool FileExplorer::new_folder() { return create_new(true); }
 bool FileExplorer::new_file() { return create_new(false); }

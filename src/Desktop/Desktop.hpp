@@ -32,6 +32,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/FileProperties.hpp"
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
@@ -135,6 +136,10 @@ class Desktop {
   // Returns the window (nullptr if memory ran out).
   Paint* open_paint(gui::TabFrame* into = nullptr);
   Notepad& notepad() { return notepad_; }
+  FileProperties& file_properties() { return file_properties_; }
+  // Opens the properties window of the file or folder at `path`, or brings it forward showing that one. It is reached from the file explorer's
+  // context menu.
+  void open_file_properties(StringView path);
   // The databases programs may connect to (nullptr: none). It must outlive the desktop.
   void set_databases(database::DatabaseManager* databases);
   database::DatabaseManager* databases() const { return databases_; }
@@ -254,6 +259,7 @@ class Desktop {
   static bool on_shortcut(void* self, const gui::KeyArgs& args);
   static void on_terminal(void* self, gui::Control&);
   static void on_calculator(void* self, gui::Control&);
+  static void on_explorer_properties(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
   static void on_explorer_file(void* self, gui::Control&);
   static void on_files_changed(void* self, gui::Control&);
@@ -319,6 +325,7 @@ class Desktop {
   FileExplorer explorer_;
   ComputerManager computer_manager_;
   Notepad notepad_;
+  FileProperties file_properties_;
   Paint paint_;
   Spreadsheet spreadsheet_;
   DatabaseQuery database_query_;

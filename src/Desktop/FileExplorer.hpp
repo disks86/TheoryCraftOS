@@ -58,6 +58,18 @@ class FileExplorer : public gui::Frame {
   void on_file_opened(gui::Handler handler) { file_opened_ = handler; }
   StringView opened_file() const { return opened_file_.view(); }
 
+  // --- Copy, paste, select all, properties (File menu, the list's context menu, Ctrl+C / Ctrl+V / Ctrl+A).
+  // copy_selected() puts the full paths of the selected items on the clipboard, one per line. paste() copies the files and folders whose paths are
+  // on the clipboard (from this explorer or another) into the folder shown, next to what is there already: a name that is taken becomes "Copy of
+  // <name>" (then "Copy of <name> (2)", ...). False (with a notice) if nothing could be pasted. select_all() selects every item of the folder.
+  bool copy_selected();
+  bool paste();
+  void select_all();
+  // Fired (see Gui::Handler) by Properties: properties_path() is the selected item's full path, or the folder shown when nothing is selected.
+  void on_properties(gui::Handler handler) { properties_ = handler; }
+  bool show_properties();
+  StringView properties_path() const { return properties_path_.view(); }
+
   // Ejecting a drive (File > Eject): the volume called `volume` - the selected folder when the explorer shows the root, else the volume the
   // current folder is on. The function does it, clears *succeeded if it failed, and returns what a notice should say (a static string or one that stays valid until the
   // next call; null for nothing); the explorer refreshes afterwards. Runs on the thread that fired the menu item.
@@ -145,6 +157,10 @@ class FileExplorer : public gui::Frame {
   static void on_view_details(void* self, gui::Control&);
   static void on_open_item(void* self, gui::Control&);
   static void on_copy_path(void* self, gui::Control&);
+  static void on_copy_menu(void* self, gui::Control&);
+  static void on_paste_menu(void* self, gui::Control&);
+  static void on_select_all_menu(void* self, gui::Control&);
+  static void on_properties_menu(void* self, gui::Control&);
   static void on_eject_menu(void* self, gui::Control&);
   static void on_new_folder(void* self, gui::Control&);
   static void on_new_file(void* self, gui::Control&);
@@ -181,7 +197,7 @@ class FileExplorer : public gui::Frame {
 
   gui::MenuBar menu_;
   gui::ContextMenu list_menu_, address_menu_;
-  gui::MenuItem *ctx_open_ = nullptr, *ctx_rename_ = nullptr, *ctx_delete_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
+  gui::MenuItem *ctx_open_ = nullptr, *ctx_copy_files_ = nullptr, *ctx_paste_ = nullptr, *ctx_select_all_ = nullptr, *ctx_rename_ = nullptr, *ctx_delete_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
   gui::Panel toolbar_, status_bar_;
   gui::BreadcrumbBar address_;
   gui::Label status_;
@@ -192,7 +208,8 @@ class FileExplorer : public gui::Frame {
   String path_;
   String scratch_;
   String opened_file_;
-  gui::Handler file_opened_, files_changed_;
+  gui::Handler file_opened_, files_changed_, properties_;
+  String properties_path_;
   CopyProgressDialog* transfers_ = nullptr;
   gui::NoticeDialog* notices_ = nullptr;
   gui::MessageDialog delete_dialog_;

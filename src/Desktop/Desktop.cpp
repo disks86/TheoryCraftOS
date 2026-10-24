@@ -56,6 +56,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       web_browser_(allocator),
       terminal_(allocator),
       calculator_(allocator),
+      file_properties_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
       display_confirm_dialog_(allocator),
@@ -198,6 +199,7 @@ bool Desktop::on_shortcut(void* self, const KeyArgs& args) {
 void Desktop::set_file_system(filesystem::IFileSystem* fs) {
   window_.locked([&] {
     fs_ = fs;
+    file_properties_.set_file_system(fs);
     explorer_.set_file_system(fs);
     notepad_.set_file_system(fs);
     paint_.set_file_system(fs);
@@ -223,6 +225,7 @@ void Desktop::setup_explorer(FileExplorer& explorer) {
   explorer.set_clock(&now_us_);
   explorer.on_file_opened({&Desktop::on_explorer_file, this});
   explorer.on_files_changed({&Desktop::on_files_changed, this});
+  explorer.on_properties({&Desktop::on_explorer_properties, this});
   explorer.set_transfer_dialog(&copy_progress_);
   explorer.set_file_system(fs_);
 }
@@ -629,6 +632,21 @@ void Desktop::open_network_properties(uint32_t adapter) {
 void Desktop::on_network_properties(void* self, Control&) {
   auto* d = static_cast<Desktop*>(self);
   d->open_network_properties(d->computer_manager_.network_adapter());
+}
+
+void Desktop::open_file_properties(StringView path) {
+  window_.locked([&] {
+    file_properties_.show(path);
+    if (file_properties_.manager()) file_properties_.activate();
+    else windows_.add_window(&file_properties_);
+  });
+}
+
+void Desktop::on_explorer_properties(void* self, Control& sender) {
+  auto* d = static_cast<Desktop*>(self);
+  String path(d->allocator_);
+  path.assign(static_cast<FileExplorer&>(sender).properties_path());
+  d->open_file_properties(path.view());
 }
 
 void Desktop::on_display_settings(void* self, Control&) { static_cast<Desktop*>(self)->open_display_settings(); }

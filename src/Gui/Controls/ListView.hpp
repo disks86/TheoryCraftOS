@@ -23,7 +23,7 @@
 //  - Icons: large icons with the name below, in a grid that wraps to the width; scrolls vertically.
 // Every item has a text cell per column (the first is its name) and an icon. One item is selected: click it, or use the
 // arrow keys (along the way the items are laid out), Home/End; Enter - or a second click on the selected item
-// within a double-click interval - activates it. begin_rename() puts a text box over the selected item's name; Enter (or clicking elsewhere) keeps the new name and fires the rename handler, Escape drops it. Ctrl+C copies the selected item's cells (tab separated) to the clipboard. The mouse wheel scrolls.
+// within a double-click interval - activates it. Ctrl+A (or select_all()) selects every item; any other selection change goes back to one item. begin_rename() puts a text box over the selected item's name; Enter (or clicking elsewhere) keeps the new name and fires the rename handler, Escape drops it. Ctrl+C copies the selected item's cells (tab separated) to the clipboard. The mouse wheel scrolls.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Gui/Controls/DataGrid.hpp"
@@ -75,6 +75,11 @@ class ListView : public Control {
   int32_t selected_item() const { return selected_; }  // -1 = none
   // Selects an item (-1 clears) and scrolls it into view. The handler fires when the selection changes.
   void select_item(int32_t item);
+  // Selects every item (selected_item() stays the item with the focus, or the first). Choosing an item afterwards, or clearing the list, ends it.
+  void select_all();
+  // Whether an item is selected (several can be, after select_all()), and how many are.
+  bool is_selected(uint32_t item) const { return marked_ ? (item < marks_.count() && marks_[item]) : static_cast<int32_t>(item) == selected_; }
+  uint32_t selection_count() const { return marked_ ? marked_ : (selected_ >= 0 ? 1 : 0); }
   void on_selection_changed(Handler handler) { UiGuard lock(this); selection_changed_ = handler; }
   // Fired by Enter or a double click on the selected item.
   void on_item_activated(Handler handler) { UiGuard lock(this); activated_ = handler; }
@@ -134,6 +139,7 @@ class ListView : public Control {
     ListView& owner_;
   };
 
+  bool clear_marks();   // true if there was a multiple selection
   void commit_rename();
   struct Column {
     String title;
@@ -163,6 +169,8 @@ class ListView : public Control {
 
   TextGridModel model_;
   List<uint8_t> icons_;
+  List<uint8_t> marks_;   // 1 for the items of a multiple selection (see select_all()); only meaningful while marked_ is not 0
+  uint32_t marked_ = 0;
   List<Column> columns_;
   ViewMode mode_ = ViewMode::Details;
   int32_t selected_ = -1;

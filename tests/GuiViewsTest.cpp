@@ -40,12 +40,16 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/FileProperties.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Media/AudioData.hpp"
+#include "Media/ImageCodecs.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Database/TextResultSet.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include <map>
+#include "Media/AudioData.hpp"
 #include "Media/ImageCodecs.hpp"
 #include "Desktop/WebBrowser.hpp"
 #include "Browser/HtmlDocument.hpp"
@@ -5884,6 +5888,152 @@ static void test_calculator_session() {
   CHECK(a.live == 0);
 }
 
+// The file explorer's Copy, Paste and Select All, and the properties window with the format-specific rows.
+static void put_bytes(filesystem::IFileSystem& fs, const char* path, ConstByteView bytes) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t written = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+  CHECK(file->write(0, bytes, &written) == filesystem::Status::Ok && written == bytes.size());
+}
+
+static void test_explorer_copy_paste_properties() {
+  TestAllocator a;
+  {
+    kernel::Clipboard cb(a);
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/w") == filesystem::Status::Ok && fs.create_directory("/w/docs") == filesystem::Status::Ok);
+    make_file(fs, "/w/a.txt", "abc");
+    make_file(fs, "/w/docs/n.txt", "note");
+    Screen screen(a, 800, 600);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {800, 600});
+    w.set_clipboard(&cb);
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::FileExplorer ex(a);
+    ex.set_file_system(&fs);
+    CHECK(ex.open_folder("/w"));
+    CHECK(mgr.add_window(&ex));
+    w.layout();
+    String got(a);
+    auto exists = [&](const char* path) {
+      filesystem::DirectoryEntry e;
+      return fs.stat(path, &e) == filesystem::Status::Ok;
+    };
+    auto select = [&](const char* name) {
+      for (uint32_t i = 0; i < ex.view().item_count(); ++i) {
+        String n(a);
+        ex.view().item_text(i, 0, &n);
+        if (n.view().equals(name)) ex.view().select_item(static_cast<int32_t>(i));
+      }
+    };
+
+    // Copy a file, paste it into a folder, and again: the name is taken, so it becomes "Copy of ...".
+    select("a.txt");
+    CHECK(ex.copy_selected() && cb.get_text(&got) && got.view().equals("/w/a.txt"));
+    CHECK(ex.open_folder("/w/docs") && ex.paste() && exists("/w/docs/a.txt"));
+    CHECK(ex.paste() && exists("/w/docs/Copy of a.txt") && ex.paste() && exists("/w/docs/Copy of a.txt (2)"));
+    CHECK(exists("/w/a.txt"));   // (copied, not moved)
+
+    // A folder is pasted with what is in it; it cannot go into itself; the list of drives takes nothing.
+    CHECK(ex.open_folder("/w"));
+    select("docs");
+    CHECK(ex.copy_selected() && ex.paste() && exists("/w/Copy of docs/n.txt") && exists("/w/Copy of docs/a.txt"));
+    CHECK(ex.open_folder("/w/docs") && !ex.paste());
+    CHECK(!exists("/w/docs/docs"));
+    CHECK(ex.open_folder("/") && !ex.paste());   // (the list of drives takes nothing)
+
+    // Select All selects every item; Copy then puts all the paths on the clipboard, one per line.
+    CHECK(ex.open_folder("/w"));
+    ex.select_all();
+    CHECK(ex.view().selection_count() == ex.view().item_count() && ex.view().item_count() == 3 && ex.status_label().text().find("3 selected") != StringView::npos);
+    CHECK(ex.copy_selected() && cb.get_text(&got) && got.view().find("/w/a.txt") != StringView::npos && got.view().find("/w/docs") != StringView::npos && got.view().find('\n') != StringView::npos);
+    ex.view().select_item(0);
+    CHECK(ex.view().selection_count() == 1);
+    w.set_focus(&ex.view());
+    press(w, key::kA, modifier::kLeftControl);   // Ctrl+A in the list
+    CHECK(ex.view().selection_count() == 3);
+
+    // The context menu offers Copy, Paste, Select All, Open and Properties.
+    ContextMenu& menu = ex.list_menu();
+    auto enabled = [&](const char* item) { return menu.find_item(item) && menu.find_item(item)->enabled(); };
+    ex.view().select_item(-1);
+    const Point o = ex.view().window_origin();
+    right_click(w, o.x + 300, o.y + 150);
+    CHECK(menu.find_item("Copy") && menu.find_item("Paste") && menu.find_item("Select All") && menu.find_item("Open") && menu.find_item("Properties"));
+    CHECK(!enabled("Copy") && !enabled("Open") && enabled("Paste") && enabled("Select All") && enabled("Properties"));
+    w.close_popup();
+    Counter shown;
+    ex.on_properties(shown.handler());
+    CHECK(choose_context(w, menu, o.x + 300, o.y + 150, "Properties") && shown.count == 1 && ex.properties_path().equals("/w"));
+    ex.view().select_item(0);
+    Rect2D row;
+    CHECK(ex.view().item_rect(0, &row));
+    CHECK(choose_context(w, menu, o.x + row.x + 30, o.y + row.y + 5, "Properties") && shown.count == 2 && ex.properties_path().size() > 1);
+    CHECK(choose_context(w, menu, o.x + 300, o.y + 150, "Select All") && ex.view().selection_count() == 3);
+    CHECK(choose_context(w, menu, o.x + 300, o.y + 150, "Paste") && exists("/w/Copy of a.txt"));
+  }
+  {
+    // The properties window: size, permissions, and what the format says.
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/pics") == filesystem::Status::Ok);
+    make_file(fs, "/pics/t.txt", "hello");
+    media::Image image(a);
+    CHECK(image.create(3, 2));
+    ByteBuffer png(a);
+    CHECK(media::encode_png(image, 6, &png));
+    put_bytes(fs, "/pics/p.png", png.view());
+    ByteBuffer wav(a);   // one second of silence: 8000 Hz, mono, 16 bits
+    const uint32_t data_bytes = 16000;
+    wav.put_tag("RIFF");
+    wav.put32(36 + data_bytes);
+    wav.put_tag("WAVE");
+    wav.put_tag("fmt ");
+    wav.put32(16);
+    wav.put16(1);
+    wav.put16(1);
+    wav.put32(8000);
+    wav.put32(16000);
+    wav.put16(2);
+    wav.put16(16);
+    wav.put_tag("data");
+    wav.put32(data_bytes);
+    wav.put_zeros(data_bytes);
+    put_bytes(fs, "/pics/s.wav", wav.view());
+
+    desktop::FileProperties props(a);
+    props.set_file_system(&fs);
+    CHECK(props.show("/pics/t.txt"));
+    CHECK(props.value_of("Name").equals("t.txt") && props.value_of("Location").equals("/pics") && props.value_of("Type").equals("File"));
+    CHECK(props.value_of("Size").equals("5 bytes") && props.value_of("Permissions").equals("Read and write") && props.value_of("Dimensions").empty());
+    CHECK(props.title().equals("t.txt Properties") && props.grid().row_count() == props.row_count());
+    CHECK(props.show("/pics/p.png") && props.value_of("Format").equals("PNG") && props.value_of("Dimensions").equals("3 x 2 pixels"));
+    CHECK(props.show("/pics/s.wav") && props.value_of("Format").equals(media::audio_format_name(media::AudioFileFormat::Wav)) && props.value_of("Length").equals("0:01.000") &&
+          props.value_of("Sample rate").equals("8000 Hz") && props.value_of("Channels").equals("mono"));
+    CHECK(props.show("/pics") && props.value_of("Type").equals("Folder") && props.value_of("Contents").equals("3 files") && !props.value_of("Size").empty());
+    CHECK(props.show("/") && props.value_of("Type").equals("Folder"));
+    CHECK(!props.show("/missing") && props.value_of("Status").size() > 0);
+    // Truncated and bit-flipped files do not crash it.
+    for (uint64_t cut : {uint64_t{0}, uint64_t{8}, png.size() / 2, png.size() - 1}) {
+      put_bytes(fs, "/pics/c.png", png.view().first(cut));
+      CHECK(props.show("/pics/c.png"));
+    }
+    for (uint64_t at = 0; at < png.size() && at < 64; ++at) {
+      ByteBuffer flipped(a);
+      flipped.append(png.view());
+      flipped.writable_view()[at] ^= 0x40;
+      put_bytes(fs, "/pics/f.png", flipped.view());
+      CHECK(props.show("/pics/f.png"));
+    }
+    for (uint64_t cut : {uint64_t{12}, uint64_t{44}, uint64_t{300}}) {
+      put_bytes(fs, "/pics/c.wav", wav.view().first(cut));
+      CHECK(props.show("/pics/c.wav"));
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 // Spreadsheets are tabs like the other programs: "+" opens another, and they move between windows by dragging.
 static void test_spreadsheet_tabs() {
   TestAllocator a;
@@ -6977,6 +7127,7 @@ int main() {
   test_text_editor();
   test_notepad();
   test_calculator();
+  test_explorer_copy_paste_properties();
   test_calculator_session();
   test_media_player();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
