@@ -111,11 +111,7 @@ bool Core::available_pb(int x_cb, int y_cb, int n_cb, int x_pb, int y_pb, int w,
 bool Core::decode_slice_data(const SliceHeader& sh, BitReader& br) {
   const Sps& sps = *sp_;
   const Pps& pps = *pp_;
-  if (sh.pps_id != pp_->id || &sps_[pps.sps_id] != sp_) {
-    // A slice of the picture that names another parameter set than the first slice did: it must be the same one.
-    if (&pps_[sh.pps_id] != pp_ && pps_[sh.pps_id].sps_id != pps.sps_id) return H265_FALSE;
-    pp_ = &pps_[sh.pps_id];
-  }
+  if (sh.pps_id != pp_->id) return H265_FALSE;   // every slice of a picture names the same picture parameter set
   sh_ = sh;
   SliceInfo info;
   if (!sh.dependent_slice_segment) {
@@ -145,9 +141,6 @@ bool Core::decode_slice_data(const SliceHeader& sh, BitReader& br) {
     for (int i = 0; i < sh.num_ref_idx[l]; ++i)
       if (slice_->ref_poc[l][i] > poc_) no_backward_pred_ = false;
 
-#ifdef H265_TRACE_PU
-  fprintf(stderr, "SLICE poc %d type %d addr %d dep %d nref %d,%d tmvp %d col_l0 %d col_idx %d merge %d qp %d denom %d,%d lw0 %d,%d lw1 %d,%d cabac_init %d mvdl1z %d\n", poc_, sh.type, sh.segment_address, sh.dependent_slice_segment, sh.num_ref_idx[0], sh.num_ref_idx[1], sh.temporal_mvp, sh.collocated_from_l0, sh.collocated_ref_idx, sh.max_num_merge_cand, sh.slice_qp, sh.luma_log2_denom, sh.chroma_log2_denom, sh.luma_weight_flag[0][0], sh.luma_weight_flag[0][1], sh.luma_weight_flag[1][0], sh.luma_weight_flag[1][1], sh.cabac_init_flag, sh.mvd_l1_zero);
-#endif
   br_ = &br;
   br.seek(sh.data_bit_offset);
   cabac_.attach(&br);
@@ -346,7 +339,9 @@ void Core::set_qp_block(int x0, int y0, int w, int h, int qp) {
 
 // QpY of the coding unit (8-283), from the group's prediction and the delta decoded so far.
 void Core::update_qp(int x_cb, int y_cb) {
-  qp_y_ = ((qg_pred_ + cu_qp_delta_val_ + 52) % 52);
+  // (the delta is limited to -26 .. 25 by the standard; a damaged stream may say more, which must not give a negative quantiser)
+  cu_qp_delta_val_ = clip3(-26, 25, cu_qp_delta_val_);
+  qp_y_ = (((qg_pred_ + cu_qp_delta_val_) % 52) + 52) % 52;
   set_qp_block(x_cb, y_cb, 1 << cur_cb_log2_, 1 << cur_cb_log2_, qp_y_);
 }
 
@@ -687,9 +682,6 @@ bool Core::col_mv(const Picture* col, int xcol, int ycol, int ref_idx, int list,
   if (!(b.pred_flags & 1)) list_col = 1;
   else if (!(b.pred_flags & 2)) list_col = 0;
   else list_col = no_backward_pred_ ? list : (sh_.collocated_from_l0 ? 1 : 0);
-#ifdef H265_TRACE_PU
-  fprintf(stderr, "    col poc %d at %d,%d: pred %d list_col %d mv (%d,%d) refpoc %d\n", col->poc, xcol, ycol, b.pred_flags, list_col, b.mv[list_col][0], b.mv[list_col][1], b.ref_poc[list_col]);
-#endif
   const bool cur_long = slice_->ref_long[list][ref_idx];
   const bool col_long = (b.long_term >> list_col) & 1;
   if (cur_long != col_long) return false;
@@ -823,11 +815,6 @@ void Core::merge_motion(int x_cb, int y_cb, int n_cb, int x_pb, int y_pb, int w,
     m.pred_flags = sh_.type == kSliceB ? 3 : 1;
     cands[count++] = m;
   }
-#ifdef H265_TRACE_PU
-  fprintf(stderr, "  merge cands (idx %d, spatial A1=%d B1=%d B0=%d A0=%d B2=%d):", merge_idx, av_a1, av_b1, av_b0, av_a0, av_b2);
-  for (int i = 0; i < count; ++i) fprintf(stderr, " [%d p%d r%d,%d (%d,%d)(%d,%d)]", i, cands[i].pred_flags, cands[i].ref_idx[0], cands[i].ref_idx[1], cands[i].mv[0][0], cands[i].mv[0][1], cands[i].mv[1][0], cands[i].mv[1][1]);
-  fprintf(stderr, "\n");
-#endif
   *out = cands[merge_idx < count ? merge_idx : 0];
   if ((out->pred_flags & 3) == 3 && orig_w + orig_h == 12) {
     out->pred_flags = 1;
@@ -985,9 +972,6 @@ void Core::prediction_unit(int x0, int y0, int w, int h, int part_idx, int log2_
       m.mv[l][1] = wrap16(pmv[1] + mvd[l][1]);
     }
   }
-#ifdef H265_TRACE_PU
-  fprintf(stderr, "poc %d PU %d,%d %dx%d merge=%d pred=%d ref=%d,%d mv0=%d,%d mv1=%d,%d\n", poc_, x0, y0, w, h, merge, m.pred_flags, m.ref_idx[0], m.ref_idx[1], m.mv[0][0], m.mv[0][1], m.mv[1][0], m.mv[1][1]);
-#endif
   store_motion(x0, y0, w, h, m);
   // the prediction block's left and top edges are edges for the loop filter
   for (int i = 0; i < h >> 2; ++i) edge_[static_cast<uint64_t>((y0 >> 2) + i) * w4_ + (x0 >> 2)] |= 2;
@@ -1131,7 +1115,7 @@ void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
       int level = base;
       if (base == ((num_sig_coeff < 8) ? ((p == last_g1_pos) ? 3 : 2) : 1)) {
         int prefix = 0;
-        while (prefix < 32 && cabac_.bypass()) ++prefix;
+        while (prefix < 25 && cabac_.bypass()) ++prefix;   // (a conforming stream has at most 4 + 12; the limit keeps the shifts below in range for damaged ones)
         int rem;
         if (prefix <= 3) rem = (prefix << rice) + cabac_.bypass_bits(rice);
         else rem = (((1 << (prefix - 3)) + 3 - 1) << rice) + cabac_.bypass_bits(prefix - 3 + rice);
@@ -1145,7 +1129,7 @@ void Core::residual_coding(int x0, int y0, int log2_size, int c_idx) {
       }
       ++num_sig_coeff;
       const int xc = (xs << 2) + px4[p], yc = (ys << 2) + py4[p];
-      coeff_[yc * n + xc] = value;
+      coeff_[yc * n + xc] = clip3(-32768, 32767, value);   // (CoeffMinY .. CoeffMaxY)
     }
   }
 }

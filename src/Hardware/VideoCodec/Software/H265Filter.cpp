@@ -19,6 +19,7 @@
 
 // H.265 decoding, part 5: the in-loop filters - deblocking (8.7.2) and sample adaptive offset (8.7.3).
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
+#include "Hardware/VideoCodec/Software/H265Trace.hpp"
 
 namespace hardware {
 namespace h265 {

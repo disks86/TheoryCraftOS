@@ -404,9 +404,6 @@ bool Core::parse_pps(BitReader& br) {
   p.slice_header_extension_present = br.u(1) != 0;
   // The extensions (range, multilayer, 3D, screen content) are not supported: a stream that uses them is refused when it is decoded.
   if (br.error()) return H265_FALSE;
-#ifdef H265_TRACE_PU
-  fprintf(stderr, "PPS %d: weighted_pred %d bipred %d tskip %d sdh %d cu_qp_delta %d(%d) tiles %d wpp %d dep_slices %d lists_mod %d tq_bypass %d par_merge %d\n", p.id, p.weighted_pred, p.weighted_bipred, p.transform_skip, p.sign_data_hiding, p.cu_qp_delta_enabled, p.diff_cu_qp_delta_depth, p.tiles_enabled, p.entropy_coding_sync, p.dependent_slice_segments, p.lists_modification_present, p.transquant_bypass, p.log2_parallel_merge_level);
-#endif
   p.valid = true;
   pps_[p.id] = p;
   return true;
@@ -422,9 +419,12 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
   const uint32_t pps_id = br.ue();
   if (pps_id > 63 || !pps_[pps_id].valid) return H265_FALSE;
   sh.pps_id = static_cast<int>(pps_id);
-  const Pps& pps = pps_[pps_id];
-  if (!sps_[pps.sps_id].valid) return H265_FALSE;
-  const Sps& sps = sps_[pps.sps_id];
+  // The slices after the first of a picture are read with the parameter sets the picture started with, whatever has been received since.
+  const bool continuing = picture_open_ && !sh.first_slice_segment_in_pic;
+  if (continuing && static_cast<int>(pps_id) != active_pps_.id) return H265_FALSE;
+  const Pps& pps = continuing ? active_pps_ : pps_[pps_id];
+  if (!continuing && !sps_[pps.sps_id].valid) return H265_FALSE;
+  const Sps& sps = continuing ? active_sps_ : sps_[pps.sps_id];
   const int pic_size_in_ctbs = sps.pic_w_ctb * sps.pic_h_ctb;
   if (!sh.first_slice_segment_in_pic) {
     if (pps.dependent_slice_segments) sh.dependent_slice_segment = br.u(1) != 0;
@@ -608,6 +608,74 @@ bool Core::parse_slice_header(BitReader& br, int nal_type, int temporal_id, Slic
   return true;
 }
 
+// D.2.1: the messages of a suffix SEI NAL unit; only the decoded picture hash (payload type 132) is used.
+void Core::parse_sei(BitReader& br) {
+  while (br.bits_left() > 16 && !br.error()) {
+    int type = 0, size = 0;
+    for (uint32_t b = br.u(8); ; b = br.u(8)) { type += static_cast<int>(b); if (b != 0xFF || br.error()) break; }
+    for (uint32_t b = br.u(8); ; b = br.u(8)) { size += static_cast<int>(b); if (b != 0xFF || br.error()) break; }
+    if (br.error() || static_cast<uint64_t>(size) * 8 > br.bits_left()) return;
+    const uint64_t end = br.position() + static_cast<uint64_t>(size) * 8;
+    if (type == 132) {
+      PendingHash h;
+      h.type = static_cast<int>(br.u(8));
+      bool ok = h.type <= 2;
+      for (int c = 0; c < 3 && ok; ++c) {
+        if (h.type == 0) for (int i = 0; i < 16; ++i) h.md5[c][i] = static_cast<uint8_t>(br.u(8));
+        else if (h.type == 1) h.value[c] = br.u(16);
+        else h.value[c] = br.u(32);
+      }
+      h.present = ok && !br.error();
+      pending_hash_ = h;
+    }
+    br.seek(end);
+  }
+}
+
+// D.3.19: compares the finished picture with the hash that came with it
+void Core::verify_picture_hash() {
+  if (!pending_hash_.present || !cur_) return;
+  const PendingHash h = pending_hash_;
+  pending_hash_.present = false;
+  bool match = true;
+  for (int c = 0; c < 3; ++c) {
+    const int w = c ? cur_->width / 2 : cur_->width, hh = c ? cur_->height / 2 : cur_->height;
+    const uint8_t* plane = cur_->plane[c].data();
+    const int stride = cur_->stride[c];
+    if (h.type == 0) {
+      if (!hasher_) return;   // nothing to check it with
+      uint8_t digest[16];
+      hasher_->md5(plane, static_cast<uint32_t>(w), static_cast<uint32_t>(hh), static_cast<uint32_t>(stride), digest);
+      for (int i = 0; i < 16; ++i) match = match && digest[i] == h.md5[c][i];
+    } else if (h.type == 1) {
+      uint32_t crc = 0xFFFF;
+      for (int y = 0; y < hh; ++y)
+        for (int x = 0; x < w; ++x) {
+          const uint32_t byte = plane[static_cast<uint64_t>(y) * stride + x];
+          for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t msb = (crc >> 15) & 1, v = (byte >> (7 - bit)) & 1;
+            crc = (((crc << 1) + v) & 0xFFFF) ^ (msb * 0x1021);
+          }
+        }
+      for (int bit = 0; bit < 16; ++bit) {
+        const uint32_t msb = (crc >> 15) & 1;
+        crc = ((crc << 1) & 0xFFFF) ^ (msb * 0x1021);
+      }
+      match = match && crc == h.value[c];
+    } else {
+      uint32_t sum = 0;
+      for (int y = 0; y < hh; ++y)
+        for (int x = 0; x < w; ++x) {
+          const uint32_t mask = (static_cast<uint32_t>(x) & 0xFF) ^ (static_cast<uint32_t>(y) & 0xFF) ^ (static_cast<uint32_t>(x) >> 8) ^ (static_cast<uint32_t>(y) >> 8);
+          sum += (plane[static_cast<uint64_t>(y) * stride + x] & 0xFFu) ^ mask;
+        }
+      match = match && sum == h.value[c];
+    }
+  }
+  ++hash_stats_.checked;
+  if (!match) ++hash_stats_.mismatched;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 bool Core::configure(ConstByteView hvcc) {
@@ -653,13 +721,17 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
     return true;
   }
   const bool slice = type <= kRaslR || (type >= kBlaWLp && type <= kCra);
-  if (type != kSpsNal && type != kPpsNal && !slice) return H265_FALSE;
+  if (type != kSpsNal && type != kPpsNal && type != kSeiSuffix && !slice) return H265_FALSE;
   if (rbsp_.size() < size && !rbsp_.alloc(allocator_, size + 64)) return H265_FALSE;
   const uint64_t n = h264::remove_emulation_prevention(nal + 1, size - 1, rbsp_.data());
   BitReader br;
   br.init(rbsp_.data(), n);
   if (type == kSpsNal) return parse_sps(br);
   if (type == kPpsNal) return parse_pps(br);
+  if (type == kSeiSuffix) {
+    if (picture_open_) parse_sei(br);
+    return true;
+  }
   SliceHeader sh;
   if (!parse_slice_header(br, type, tid, &sh)) return H265_FALSE;
   if (sh.first_slice_segment_in_pic) {

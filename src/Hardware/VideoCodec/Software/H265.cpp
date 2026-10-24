@@ -47,4 +47,11 @@ VideoFormat H265Decoder::output_format() const { return core_ ? core_->output_fo
 
 bool H265Decoder::ready() const { return core_ && core_->ready(); }
 
+H265Decoder::HashStatistics H265Decoder::hash_statistics() const { return core_ ? core_->hash_statistics() : HashStatistics(); }
+
+void H265Decoder::set_plane_hasher(IPlaneHasher* hasher) {
+  if (!core_) core_ = UniquePointer<h265::Core>::make(allocator_, allocator_);
+  if (core_) core_->set_plane_hasher(hasher);
+}
+
 }  // namespace hardware

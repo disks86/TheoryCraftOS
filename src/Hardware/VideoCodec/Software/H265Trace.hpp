@@ -19,10 +19,8 @@
 
 // A development aid: building with -DH265_TRACE makes every place the decoder refuses its input say where (file and line) on stderr. Without it, H265_FALSE is false.
 #pragma once
-#if defined(H265_TRACE) || defined(H265_TRACE_PU)
-#include <stdio.h>
-#endif
 #ifdef H265_TRACE
+#include <stdio.h>
 #define H265_FALSE (fprintf(stderr, "h265: refused at %s:%d\n", __FILE__, __LINE__), false)
 #else
 #define H265_FALSE false

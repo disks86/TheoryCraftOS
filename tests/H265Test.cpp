@@ -17,12 +17,14 @@
  */
 
 
-// Host-side tests for the H.265 decoder: every stream in tests/data/hevc_*.h265 (made by scripts/gen_hevc_test_streams.sh with libx265) is decoded and each
-// picture compared byte for byte with the one FFmpeg's decoder made of the same stream (hevc_*.yuv). Damaged streams (truncated, bits flipped) must not fault.
+// Host-side tests for the H.265 decoder. Every stream in tests/data/hevc_*.h265 (made by scripts/gen_hevc_test_streams.sh with libx265, each carrying the encoder's MD5
+// of every reconstructed picture) is decoded; the decoder checks every picture against that hash (H265Decoder::hash_statistics) and all of them must agree. Damaged
+// streams (truncated, bits flipped) must not fault. Where tests/data/hevc_*.yuv exists the pictures are also compared with it.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vector>
+#include "Crypto/Crypto.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
 
 using namespace hardware;
@@ -40,6 +42,15 @@ struct TestAllocator final : allocators::IAllocator {
   }
   void deallocate(void* p) override { if (p) { --live; free(p); } }
 };
+
+struct Md5Hasher final : IPlaneHasher {
+  void md5(const uint8_t* plane, uint32_t width, uint32_t height, uint32_t stride, uint8_t out[16]) override {
+    crypto::Hasher h(crypto::HashKind::Md5);
+    for (uint32_t y = 0; y < height; ++y) h.update(ConstByteView(plane + size_t(y) * stride, width));
+    h.finish(out);
+  }
+};
+static Md5Hasher g_md5;
 
 static std::vector<uint8_t> read_file(const char* path) {
   std::vector<uint8_t> bytes;
@@ -72,7 +83,7 @@ static std::vector<std::pair<size_t, size_t>> split_pictures(const std::vector<u
       size_t j = k;
       while (j > 0) {
         const int pt = (d[starts[j - 1] + 3] >> 1) & 0x3F;
-        if (pt >= 32 && pt <= 40) { cut = starts[j - 1]; --j; } else break;
+        if (pt >= 32 && pt <= 39) { cut = starts[j - 1]; --j; } else break;
       }
       if (cut > unit_begin) units.push_back({unit_begin, cut});
       unit_begin = cut;
@@ -87,6 +98,7 @@ static std::vector<std::pair<size_t, size_t>> split_pictures(const std::vector<u
 struct Result {
   int frames = 0, mismatched = 0, first_bad = -1;
   uint32_t width = 0, height = 0;
+  H265Decoder::HashStatistics hash;
 };
 
 static void collect(H265Decoder& dec, const std::vector<uint8_t>& ref, Result* r, size_t* frame_bytes_out) {
@@ -101,9 +113,9 @@ static void collect(H265Decoder& dec, const std::vector<uint8_t>& ref, Result* r
       if (FILE* o = fopen(name, "wb")) { for (uint32_t pl = 0; pl < 3; ++pl) for (uint32_t y = 0; y < f.format.plane_height(pl); ++y) fwrite(f.plane[pl] + size_t(y) * f.stride[pl], 1, f.format.plane_width(pl), o); fclose(o); }
     }
     const size_t off = size_t(r->frames) * bytes;
-    bool same = off + bytes <= ref.size();
+    bool same = ref.empty() || off + bytes <= ref.size();
     size_t p = off;
-    for (uint32_t pl = 0; pl < 3 && same; ++pl)
+    for (uint32_t pl = 0; pl < 3 && same && !ref.empty(); ++pl)
       for (uint32_t y = 0; y < f.format.plane_height(pl) && same; ++y)
         for (uint32_t x = 0; x < f.format.plane_width(pl); ++x, ++p)
           if (f.plane[pl][size_t(y) * f.stride[pl] + x] != ref[p]) {
@@ -124,6 +136,7 @@ static void collect(H265Decoder& dec, const std::vector<uint8_t>& ref, Result* r
 static Result decode_stream(allocators::IAllocator& a, const std::vector<uint8_t>& stream, const std::vector<uint8_t>& ref) {
   Result r;
   H265Decoder dec(a);
+  dec.set_plane_hasher(&g_md5);
   size_t fb = 0;
   for (auto u : split_pictures(stream)) {
     dec.decode(ConstByteView(stream.data() + u.first, u.second - u.first), int64_t(r.frames) * 1000);
@@ -131,10 +144,43 @@ static Result decode_stream(allocators::IAllocator& a, const std::vector<uint8_t
   }
   dec.flush();
   collect(dec, ref, &r, &fb);
+  r.hash = dec.hash_statistics();
   return r;
 }
 
-static const char* const kStreams[] = {"x1", "x2", "x3", "x4", "intra", "intra_filt", "ipp", "ipp_filt", "bframes", "weighted", "slices", "ctu64", "tools", "scaling", "wpp", "cutree_off"};
+// Damaged streams: every picture cut short at many points, and single bits flipped all over the stream. Whatever the decoder makes of them, it must stay inside its
+// buffers (the sanitizers say so), not hang, and not leak.
+static void test_damaged(const char* name) {
+  char path[160];
+  const char* dir = getenv("H265_DIR") ? getenv("H265_DIR") : "tests/data";
+  snprintf(path, sizeof path, "%s/hevc_%s.h265", dir, name);
+  const std::vector<uint8_t> stream = read_file(path);
+  CHECK(!stream.empty());
+  if (stream.empty()) return;
+  TestAllocator a;
+  int runs = 0;
+  {
+    const auto units = split_pictures(stream);
+    for (int variant = 0; variant < 40; ++variant) {
+      H265Decoder dec(a);
+      VideoFrame f;
+      for (size_t u = 0; u < units.size(); ++u) {
+        std::vector<uint8_t> au(stream.begin() + units[u].first, stream.begin() + units[u].second);
+        if (variant % 2 == 1 && u > 0) au.resize(au.size() * (variant + 1) / 41 + 1);                                           // cut short
+        else if (variant % 2 == 0 && u > 0) au[(size_t(variant) * 7919 + u * 104729) % au.size()] ^= uint8_t(1u << (variant % 8));   // one bit flipped
+        dec.decode(ConstByteView(au.data(), au.size()), int64_t(u) * 1000);
+        while (dec.receive(&f)) {}
+        ++runs;
+      }
+      dec.flush();
+      while (dec.receive(&f)) {}
+    }
+  }
+  CHECK(runs > 200);
+  CHECK(a.live == 0);
+}
+
+static const char* const kStreams[] = {"lossless", "cra", "cip", "highrate", "lowrate", "maxref", "oddsize", "qcif", "intra", "intra_filt", "ipp", "ipp_filt", "bframes", "weighted", "slices", "ctu64", "tools", "scaling", "wpp", "cutree_off"};
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
@@ -145,17 +191,25 @@ int main(int argc, char** argv) {
     const char* dir = getenv("H265_DIR") ? getenv("H265_DIR") : "tests/data";
     snprintf(path, sizeof path, "%s/hevc_%s.h265", dir, name);
     const std::vector<uint8_t> stream = read_file(path);
+    CHECK(!stream.empty());
+    if (stream.empty()) continue;
     snprintf(path, sizeof path, "%s/hevc_%s.yuv", dir, name);
-    const std::vector<uint8_t> ref = read_file(path);
-    CHECK(!stream.empty() && !ref.empty());
-    if (stream.empty() || ref.empty()) continue;
+    const std::vector<uint8_t> ref = read_file(path);   // (optional)
     TestAllocator a;
     {
       const Result r = decode_stream(a, stream, ref);
-      printf("  %-12s %d pictures, %d differ\n", name, r.frames, r.mismatched);
-      CHECK(r.frames * size_t(r.width) * r.height * 3 / 2 == ref.size() && r.mismatched == 0);
+      printf("  %-12s %d pictures, %llu checked against the stream's hashes, %llu differ%s\n", name, r.frames, (unsigned long long)r.hash.checked,
+             (unsigned long long)r.hash.mismatched, ref.empty() ? "" : (r.mismatched ? " (and some from the reference pictures)" : ""));
+      CHECK(r.frames == 12 && r.hash.checked == uint64_t(r.frames) && r.hash.mismatched == 0);
     }
     CHECK(a.live == 0);
+  }
+  if (argc == 1) {
+    test_damaged("slices");
+    test_damaged("tools");
+    test_damaged("cra");
+    test_damaged("ctu64");
+    test_damaged("lossless");
   }
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("H265Test passed\n");

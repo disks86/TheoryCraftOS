@@ -21,6 +21,7 @@
 // (clauses 8.1 to 8.3 and C.5 of ITU-T H.265).
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
 #include "Hardware/VideoCodec/Software/H265Trace.hpp"
+#include "Hardware/VideoCodec/Software/H265Trace.hpp"
 
 namespace hardware {
 namespace h265 {
@@ -217,8 +218,10 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
       else if (p.needed_for_output) p.force_out = true;
     }
   }
-  sp_ = &sps_[pps.sps_id];
-  pp_ = &pps_[sh.pps_id];
+  active_sps_ = sps_[pps.sps_id];
+  active_pps_ = pps_[sh.pps_id];
+  sp_ = &active_sps_;
+  pp_ = &active_pps_;
   if (size_change) {
     // Pictures of another size cannot be used or shown any more.
     for (Picture& p : pics_)
@@ -274,6 +277,7 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   first_picture_ = false;
   after_eos_ = false;
   first_header_ = sh;
+  pending_hash_.present = false;
   return true;
 }
 
@@ -361,6 +365,7 @@ void Core::finish_picture() {
   if (!p) return;
   deblock_picture();
   sao_picture();
+  verify_picture_hash();
   // The motion the following pictures may use as collocated motion: one entry per 16x16 block.
   const Sps& s = *sp_;
   const int bw = (s.width + 15) / 16, bh = (s.height + 15) / 16;

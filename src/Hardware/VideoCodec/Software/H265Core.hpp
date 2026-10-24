@@ -42,7 +42,7 @@ constexpr int kMaxCtbs = 4096 * 2304 / (16 * 16);
 enum NalType : int {
   kTrailN = 0, kTrailR = 1, kTsaN = 2, kTsaR = 3, kStsaN = 4, kStsaR = 5, kRadlN = 6, kRadlR = 7, kRaslN = 8, kRaslR = 9,
   kBlaWLp = 16, kBlaWRadl = 17, kBlaNLp = 18, kIdrWRadl = 19, kIdrNLp = 20, kCra = 21,
-  kVps = 32, kSpsNal = 33, kPpsNal = 34, kAud = 35, kEos = 36, kEob = 37
+  kVps = 32, kSpsNal = 33, kPpsNal = 34, kAud = 35, kEos = 36, kEob = 37, kSeiSuffix = 40
 };
 inline bool is_irap(int t) { return t >= 16 && t <= 23; }
 inline bool is_idr(int t) { return t == kIdrWRadl || t == kIdrNLp; }
@@ -221,6 +221,9 @@ class Core {
   void reset();
   VideoFormat output_format() const;
   bool ready() const { return output_ready(); }
+  // How many pictures carried a decoded picture hash (SEI) and how many of them the decoder's own picture did not match.
+  H265Decoder::HashStatistics hash_statistics() const { return hash_stats_; }
+  void set_plane_hasher(IPlaneHasher* hasher) { hasher_ = hasher; }
 
  private:
   // --- H265Syntax.cpp
@@ -230,6 +233,8 @@ class Core {
   bool parse_slice_header(BitReader& br, int nal_type, int temporal_id, SliceHeader* sh);
   bool parse_st_rps(BitReader& br, int idx, int num_sets, const StRps* sets, StRps* out);
   bool parse_scaling_list(BitReader& br, ScalingList* list);
+  void parse_sei(BitReader& br);
+  void verify_picture_hash();
 
   // --- H265Picture.cpp
   bool start_picture(const SliceHeader& sh, int64_t pts);
@@ -299,6 +304,8 @@ class Core {
   int poc_ = 0;
 
   // active parameter sets and the state of the picture being decoded
+  Sps active_sps_;                       // copies taken when a picture starts: a parameter set sent while the picture is being decoded cannot change it
+  Pps active_pps_;
   const Sps* sp_ = nullptr;
   const Pps* pp_ = nullptr;
   bool picture_open_ = false;
@@ -353,6 +360,15 @@ class Core {
   int16_t pred_buf_[2][64 * 64];
 
   Mem<uint8_t> rbsp_;
+  // the decoded picture hash (D.3.19) announced for the picture being decoded
+  struct PendingHash {
+    bool present = false;
+    int type = 0;              // 0 MD5, 1 CRC, 2 checksum
+    uint8_t md5[3][16] = {};
+    uint32_t value[3] = {};    // CRC or checksum
+  } pending_hash_;
+  H265Decoder::HashStatistics hash_stats_;
+  IPlaneHasher* hasher_ = nullptr;
   // the picture's output
   VideoFormat out_format_;
   Mem<uint8_t> out_frame_;

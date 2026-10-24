@@ -34,6 +34,17 @@ namespace h265 {
 class Core;
 }
 
+// MD5 of one plane of samples, for checking decoded picture hashes: the decoder does not carry an MD5 implementation of its own (the OS has one in Crypto, which
+// programs that want the check hand in through this interface).
+class IPlaneHasher {
+ public:
+  virtual void md5(const uint8_t* plane, uint32_t width, uint32_t height, uint32_t stride, uint8_t out[16]) = 0;
+
+ protected:
+  constexpr IPlaneHasher() = default;
+  ~IPlaneHasher() = default;
+};
+
 class H265Decoder {
  public:
   explicit H265Decoder(allocators::IAllocator& allocator) : allocator_(allocator) {}
@@ -54,6 +65,15 @@ class H265Decoder {
   // The size of the pictures; zero until a sequence parameter set was seen.
   VideoFormat output_format() const;
   bool ready() const;  // a picture can be received
+
+  // Streams may carry a hash of every decoded picture (SEI "decoded picture hash": MD5, CRC or checksum of each plane). The decoder checks the pictures it makes
+  // against them: `checked` counts the pictures that had a hash, `mismatched` those the hash did not agree with. A conforming decoder has none of the latter.
+  struct HashStatistics {
+    uint64_t checked = 0, mismatched = 0;
+  };
+  HashStatistics hash_statistics() const;
+  // Lets the decoder check MD5 hashes (CRC and checksum hashes need no help). Without it pictures with an MD5 hash are not counted as checked.
+  void set_plane_hasher(IPlaneHasher* hasher);
 
  private:
   allocators::IAllocator& allocator_;
