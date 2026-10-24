@@ -32,8 +32,10 @@ uint64_t round_up(uint64_t v, uint64_t to) { return (v + to - 1) / to * to; }
 
 IntelEngineBuffers::~IntelEngineBuffers() {
   release_all();
-  release_view(allocator_, batch_words_);
-  if (leased_) driver_.release_lease();
+  if (leased_) {
+    release_view(allocator_, batch_words_);
+    driver_.release_lease();
+  }
 }
 
 bool IntelEngineBuffers::lease() {
@@ -46,6 +48,15 @@ bool IntelEngineBuffers::lease() {
   }
   leased_ = true;
   return true;
+}
+
+void IntelEngineBuffers::release_lease() {
+  if (!leased_) return;
+  release_all();
+  release_view(allocator_, batch_words_);
+  batch_words_ = ArrayView<uint32_t>();
+  driver_.release_lease();
+  leased_ = false;
 }
 
 bool IntelEngineBuffers::place(Block* block, uint64_t bytes) {
@@ -75,6 +86,7 @@ void IntelEngineBuffers::drop(Block* block) {
 
 void IntelEngineBuffers::release_all() {
   for (Block& b : surfaces_) drop(&b);
+  for (Block& b : aux_) drop(&b);
   for (Block& b : scratch_) drop(&b);
   drop(&bitstream_);
   next_address_ = intel_gt::VcsDriver::kFirstBufferGpuAddress;
@@ -97,6 +109,27 @@ bool IntelEngineBuffers::surface(int slot, uint32_t* address) {
   if (!b.buffer.valid() && !place(&b, layout_.size)) return false;
   *address = b.address;
   return true;
+}
+
+bool IntelEngineBuffers::upload_scratch(uint32_t index, ConstByteView bytes) {
+  if (!open_ || index >= kMaxScratch || !scratch_[index].buffer.valid()) return false;
+  return scratch_[index].buffer.cpu.first(bytes.size()).copy_from(bytes);
+}
+
+bool IntelEngineBuffers::picture_buffer(int slot, uint64_t bytes, uint32_t* address) {
+  if (!open_ || slot < 0 || slot >= static_cast<int>(kMaxSurfaces)) return false;
+  Block& b = aux_[slot];
+  if (b.buffer.valid() && b.buffer.cpu.size() < round_up(bytes, kPage)) drop(&b);
+  if (!b.buffer.valid() && !place(&b, bytes)) return false;
+  *address = b.address;
+  return true;
+}
+
+bool IntelEngineBuffers::copy_surface(int from, int to) {
+  if (!open_ || !engine_ready() || from < 0 || to < 0 || from >= static_cast<int>(kMaxSurfaces) || to >= static_cast<int>(kMaxSurfaces)) return false;
+  const intel_gt::GpuBuffer& a = surfaces_[from].buffer;
+  intel_gt::GpuBuffer& b = surfaces_[to].buffer;
+  return a.valid() && b.valid() && b.cpu.first(layout_.size).copy_from(a.cpu.first(layout_.size));
 }
 
 bool IntelEngineBuffers::scratch(uint32_t index, uint64_t bytes, uint32_t* address) {

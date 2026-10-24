@@ -66,6 +66,10 @@ constexpr uint32_t kMfxAvcRefIdxState = mfx_header(2, 1, 0, 4);
 constexpr uint32_t kMfxAvcWeightoffsetState = mfx_header(2, 1, 0, 5);
 constexpr uint32_t kMfdAvcPicidState = mfx_header(2, 1, 1, 5);
 constexpr uint32_t kMfdAvcBsdObject = mfx_header(2, 1, 1, 8);
+constexpr uint32_t kMfxVc1PredPipeState = mfx_header(2, 2, 0, 1);
+constexpr uint32_t kMfxVc1DirectmodeState = mfx_header(2, 2, 0, 2);
+constexpr uint32_t kMfdVc1LongPicState = mfx_header(2, 2, 1, 1);
+constexpr uint32_t kMfdVc1BsdObject = mfx_header(2, 2, 1, 8);
 constexpr uint32_t kMfxMpeg2PicState = mfx_header(2, 3, 0, 0);
 constexpr uint32_t kMfdMpeg2BsdObject = mfx_header(2, 3, 1, 8);
 
@@ -197,6 +201,44 @@ struct Mpeg2SliceJob {
 };
 void emit_mpeg2_pic_state(DwordWriter& w, const Mpeg2Picture& p);
 void emit_mpeg2_bsd_object(DwordWriter& w, const Mpeg2SliceJob& s);
+
+// --- VC-1. The engine reads no picture header: everything the header says is in the picture state.
+
+struct Vc1Picture {
+  uint32_t width_in_mbs = 0, height_in_mbs = 0;
+  bool direct_mv_valid = false;          // B picture: the backward reference was a P picture (its direct motion vector buffer is there)
+  bool implicit_quantizer = false;
+  uint32_t rounding_control = 0;
+  bool sync_marker = false;
+  uint32_t interpolation_mode = 0;       // 8: bilinear half sample, plus the fast chroma bit
+  bool range_reduction = false, range_reduction_scale = false;
+  bool loop_filter = false, overlap = false, advanced = false;
+  uint32_t conditional_overlap = 0;      // 0 none, 2 all block boundaries, 3 selected by the bit plane
+  uint32_t picture_type = 0;             // 0 I, 1 P, 2 B, 3 BI, 4 skipped
+  uint32_t alt_pq = 0, pic_quantizer_scale = 0, scale_factor = 0;
+  uint32_t unified_mv_mode = 0;          // 1 one MV, 2 half sample, 3 half sample bilinear, 0 mixed
+  bool fast_uvmc = false;
+  uint32_t extended_mv_range = 0;
+  uint32_t alt_pquant_edge_mask = 0, alt_pquant_config = 0;
+  bool half_qp = false, pic_quantizer_type = false;
+  bool bitplane_present = false;
+  bool raw_mv_type = false, raw_skip = false, raw_direct = false, raw_overflags = false, raw_ac_pred = false;
+  uint32_t mv_table = 0;
+  uint32_t frame_level_transform_type = 0;   // 0 8x8, 1 8x4, 2 4x8, 3 4x4
+  bool mb_level_transform_type = true;
+  uint32_t trans_ac_y = 0, transform_ac_codingset_idx1 = 0, intra_transform_dc_table = 0, cbp_table = 0;
+};
+void emit_vc1_pic_state(DwordWriter& w, const Vc1Picture& p);
+// Intensity compensation of the forward reference (single, not the interlaced double form); progressive pictures only.
+void emit_vc1_pred_pipe_state(DwordWriter& w, bool compensate_forward, uint32_t luma_scale, uint32_t luma_shift);
+void emit_vc1_directmode_state(DwordWriter& w, uint64_t write_buffer, uint64_t read_buffer, uint32_t mocs);
+// One unit of the picture (the frame, then each slice): `data_offset` is the byte holding its first macroblock bit in the bitstream buffer, `data_size` the bytes from there to
+// its end, `bit_offset` (0-7) the first macroblock bit in that byte.
+struct Vc1BsdJob {
+  uint32_t data_offset = 0, data_size = 0, bit_offset = 0;
+  uint32_t first_row = 0, next_row = 0;
+};
+void emit_vc1_bsd_object(DwordWriter& w, const Vc1BsdJob& job);
 
 }  // namespace intel_mfx
 }  // namespace hardware

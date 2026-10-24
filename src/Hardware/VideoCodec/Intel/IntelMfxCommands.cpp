@@ -253,5 +253,43 @@ void emit_mpeg2_bsd_object(DwordWriter& w, const Mpeg2SliceJob& s) {
   w.emit((s.quantiser_scale_code & 0xFF) << 24 | (s.next_vpos & 0xFFFF) << 8 | (s.next_hpos & 0xFF));
 }
 
+void emit_vc1_pic_state(DwordWriter& w, const Vc1Picture& p) {
+  w.emit(kMfdVc1LongPicState | (6 - 2));
+  w.emit(((p.height_in_mbs - 1) << 16) | (p.width_in_mbs - 1));
+  w.emit((((p.width_in_mbs + 1) / 2 - 1) << 24) | uint32_t{p.direct_mv_valid} << 15 | uint32_t{p.implicit_quantizer} << 14 | (p.rounding_control & 1) << 13 | uint32_t{p.sync_marker} << 12 |
+         (p.interpolation_mode & 15) << 8 | uint32_t{p.range_reduction_scale} << 7 | uint32_t{p.range_reduction} << 6 | uint32_t{p.loop_filter} << 5 | uint32_t{p.overlap} << 4 |
+         (0u << 3) |                                    // (the first field: pictures are frames)
+         uint32_t{p.advanced});
+  w.emit((p.conditional_overlap & 3) << 29 | (p.picture_type & 7) << 26 | (0u << 24) | (p.alt_pq & 31) << 16 | (p.pic_quantizer_scale & 31) << 8 | (p.scale_factor & 0xFF));
+  w.emit((p.unified_mv_mode & 3) << 28 | (0u << 27) | uint32_t{p.fast_uvmc} << 26 | (p.extended_mv_range & 3) << 8 | (p.alt_pquant_edge_mask & 15) << 4 | (p.alt_pquant_config & 3) << 2 |
+         uint32_t{p.half_qp} << 1 | uint32_t{p.pic_quantizer_type});
+  w.emit(uint32_t{p.bitplane_present} << 31 | uint32_t{p.raw_mv_type} << 29 | uint32_t{p.raw_skip} << 28 | uint32_t{p.raw_direct} << 27 | uint32_t{p.raw_overflags} << 26 |
+         uint32_t{p.raw_ac_pred} << 25 | (p.mv_table & 7) << 20 | (p.frame_level_transform_type & 3) << 12 | uint32_t{p.mb_level_transform_type} << 11 | (p.trans_ac_y & 3) << 6 |
+         (p.transform_ac_codingset_idx1 & 3) << 4 | (p.intra_transform_dc_table & 1) << 3 | (p.cbp_table & 7));
+}
+
+void emit_vc1_pred_pipe_state(DwordWriter& w, bool compensate_forward, uint32_t luma_scale, uint32_t luma_shift) {
+  w.emit(kMfxVc1PredPipeState | (6 - 2));
+  w.emit(uint32_t{compensate_forward} << 10);       // single forward compensation; no replication (a progressive reference)
+  w.emit(compensate_forward ? ((luma_shift & 0xFF) << 16 | (luma_scale & 0xFF)) : 0);
+  zeros(w, 3);
+}
+
+void emit_vc1_directmode_state(DwordWriter& w, uint64_t write_buffer, uint64_t read_buffer, uint32_t mocs) {
+  w.emit(kMfxVc1DirectmodeState | (7 - 2));
+  address_or_zero(w, write_buffer);
+  w.emit(mocs);
+  address_or_zero(w, read_buffer);
+  w.emit(mocs);
+}
+
+void emit_vc1_bsd_object(DwordWriter& w, const Vc1BsdJob& job) {
+  w.emit(kMfdVc1BsdObject | (5 - 2));
+  w.emit(job.data_size);
+  w.emit(job.data_offset);
+  w.emit((job.first_row & 0xFFFF) << 16 | (job.next_row & 0xFFFF));
+  w.emit(job.bit_offset & 7);
+}
+
 }  // namespace intel_mfx
 }  // namespace hardware

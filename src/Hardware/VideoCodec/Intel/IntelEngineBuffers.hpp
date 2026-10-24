@@ -41,6 +41,8 @@ class IntelEngineBuffers {
   // Takes the engine's lease and the batch buffer. False when the engine is not ready or busy with another session.
   bool lease();
   bool leased() const { return leased_; }
+  // Gives the lease back (and the batch buffer); nothing must be open.
+  void release_lease();
   bool engine_ready() const { return driver_.state() == intel_gt::VcsDriver::State::Ready; }
   ArrayView<uint32_t> batch_words() const { return batch_words_; }
 
@@ -57,6 +59,12 @@ class IntelEngineBuffers {
   const intel_gt::GpuBuffer& surface_buffer(int slot) const { return surfaces_[slot].buffer; }
   // Scratch buffer `index`, at least `bytes` big (made, or made bigger, when needed: its contents are then zero); its address.
   bool scratch(uint32_t index, uint64_t bytes, uint32_t* address);
+  // Copies `bytes` into the start of scratch buffer `index` (made before with scratch()).
+  bool upload_scratch(uint32_t index, ConstByteView bytes);
+  // A buffer tied to picture `slot` (a direct motion vector buffer), at least `bytes` big; its address. Made on first use.
+  bool picture_buffer(int slot, uint64_t bytes, uint32_t* address);
+  // Copies picture `from` over picture `to` (both made; a skipped picture repeats the one before it). False if either is missing.
+  bool copy_surface(int from, int to);
   // Copies `bits` into the bitstream buffer (growing it as needed) and gives its address.
   bool upload_bitstream(ConstByteView bits, uint32_t* address);
 
@@ -80,7 +88,7 @@ class IntelEngineBuffers {
   bool leased_ = false, open_ = false;
   uint32_t width_ = 0, height_ = 0;
   intel_mfx::Nv12TiledLayout layout_;
-  Block surfaces_[kMaxSurfaces], scratch_[kMaxScratch], bitstream_;
+  Block surfaces_[kMaxSurfaces], aux_[kMaxSurfaces], scratch_[kMaxScratch], bitstream_;
   uint64_t next_address_ = intel_gt::VcsDriver::kFirstBufferGpuAddress;
   ArrayView<uint32_t> batch_words_;
 };

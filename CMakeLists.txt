@@ -507,6 +507,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Intel/IntelAvcSession.cpp
   src/Hardware/VideoCodec/Intel/IntelEngineBuffers.cpp
   src/Hardware/VideoCodec/Intel/IntelMpeg2Session.cpp
+  src/Hardware/VideoCodec/Intel/IntelVc1Session.cpp
   src/Hardware/VideoCodec/Intel/IntelMediaVideoEngine.cpp
   src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
   src/Hardware/Printer/PrinterTypes.cpp
