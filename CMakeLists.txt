@@ -474,6 +474,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Intel/IntelMfxCommands.cpp
   src/Hardware/VideoCodec/Intel/IntelAvcDecode.cpp
   src/Hardware/VideoCodec/Intel/IntelTiling.cpp
+  src/Hardware/VideoCodec/Intel/IntelAvcSession.cpp
+  src/Hardware/VideoCodec/Intel/IntelMediaVideoEngine.cpp
   src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
   src/Hardware/Printer/PrinterTypes.cpp
   src/Hardware/Printer/Halftone.cpp
@@ -494,6 +496,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/JpegDecoder.cpp
   src/Hardware/VideoCodec/Software/H264Syntax.cpp
   src/Hardware/VideoCodec/Software/H264Parser.cpp
+  src/Hardware/VideoCodec/Software/H264Dpb.cpp
   src/Hardware/VideoCodec/Software/H264Encoder.cpp
   src/Hardware/VideoCodec/Software/H264Macroblock.cpp
   src/Hardware/VideoCodec/Software/H264Cabac.cpp

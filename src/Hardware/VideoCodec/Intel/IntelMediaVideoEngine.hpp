@@ -18,16 +18,19 @@
 
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
 #include "Hardware/Mmio.hpp"
+#include "Hardware/VideoCodec/Intel/IntelAvcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace hardware {
 
-// Intel's media engine in its graphics (Quick Sync Video: the VDBOX/MFX fixed-function blocks): the video decode/encode block that comes with the GPU (PCI vendor 0x8086). The sessions
-// still run on the CPU, through the software codecs, until a native driver for the engine exists - this class
-// is where it will go, and what it reports now is that the engine is there (info().hardware_engine) and not used
-// (info().accelerated is false). H.264, H.265, VP9 and AV1 will be served here once the engine is driven.
+// Intel's media engine in its graphics (Quick Sync Video: the VDBOX/MFX fixed-function blocks): the video decode/encode block that comes with the GPU (PCI vendor 0x8086).
+// By default it only reports that the engine is there (info().hardware_engine) and what a look at it found; every session runs on the CPU through the software codecs.
+// With set_hardware() before initialize(), on a Gen9.5 GPU whose video box answers, H.264 decoding runs on the engine (VcsDriver, IntelAvcDecoder) - one session at a
+// time, the others (and every other codec, and encoding) stay on the CPU. That path has only been run against a simulated GPU: it is off unless the owner turns it on.
 class IntelMediaVideoEngine final : public SoftwareVideoCodec {
  public:
   static constexpr uint16_t kPciVendor = 0x8086;
@@ -35,13 +38,26 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown).
   // `registers` is the GPU's register BAR (at least IntelMediaEngineHw::kRegisterWindow bytes), or an empty window to skip looking at the hardware.
   explicit IntelMediaVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& registers = MmioRegion())
-      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), gpu_(intel_gpu_identify(gpu_device_id)), registers_(registers) {}
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), gpu_(intel_gpu_identify(gpu_device_id)), registers_(registers) {}
 
-  // Looks at the video boxes (which exist, which wake up). The sessions stay on the CPU either way: nothing submits work to a box yet.
-  bool initialize() override {
-    status_ = IntelMediaEngineHw::probe(registers_, gpu_.architecture);
-    return true;
-  }
+  // What the engine driver needs: the GPU's registers (the whole first 2 MiB of the register BAR), the global GTT table, a range of eight of its entries nothing
+  // uses, and memory the GPU can reach.
+  struct HardwareSetup {
+    intel_gt::IRegisterBank* registers = nullptr;
+    MmioRegion ggtt_table;
+    uint64_t ggtt_first_page = 0;
+    intel_gt::IGpuMemory* memory = nullptr;
+  };
+  // Opts in to running H.264 decoding on the engine. Call before initialize(); everything in `setup` must outlive this device.
+  void set_hardware(const HardwareSetup& setup) { setup_ = setup; }
+  // Is H.264 decoding running on the engine?
+  bool hardware_decode() const { return driver_ && driver_->state() == intel_gt::VcsDriver::State::Ready; }
+
+  // Looks at the video boxes (which exist, which wake up) and, if the owner opted in and the generation is known, starts the engine driver.
+  bool initialize() override;
+  // Stops the engine driver. Every session made by create_decoder() must be closed first.
+  void shutdown() override { driver_.reset(); info_.accelerated_decode_codecs = 0; }
+  UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override;
   const IntelMediaEngineStatus& engine_status() const { return status_; }
 
   const char* name() const override { return "Intel media engine (Quick Sync) (software path)"; }
@@ -62,9 +78,12 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
     return has_engine ? codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mjpeg) : 0;
   }
 
+  allocators::IAllocator& allocator_;
   IntelGpuInfo gpu_;
   MmioRegion registers_;
   IntelMediaEngineStatus status_;
+  HardwareSetup setup_;
+  UniquePointer<intel_gt::VcsDriver> driver_;
 };
 
 }  // namespace hardware

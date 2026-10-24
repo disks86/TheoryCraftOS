@@ -29,9 +29,10 @@ constexpr uint64_t y_tile_offset(uint32_t pitch, uint32_t x_byte, uint32_t row) 
   return (uint64_t{row} / 32) * pitch * 32 + (uint64_t{row} % 32) * 16 + (uint64_t{x_byte} / 16) * 512 + (x_byte % 16);
 }
 
-// Converts the engine's decoded NV12 surface to a linear I420 frame of `width` x `height` (the cropped size), which must already be allocated in `out`.
-// False if the sizes do not fit the layout or `tiled` is smaller than the surface.
-bool detile_nv12_to_i420(ConstByteView tiled, const Nv12TiledLayout& layout, uint32_t width, uint32_t height, VideoFrameBuffer& out);
+// Converts the engine's decoded NV12 surface to a linear I420 frame of `width` x `height` (the cropped size), which must already be allocated in `out`. The
+// frame starts at (`left`, `top`) in the surface (even, as the chroma planes are half size). False if the sizes do not fit the layout or `tiled` is smaller than
+// the surface.
+bool detile_nv12_to_i420(ConstByteView tiled, const Nv12TiledLayout& layout, uint32_t width, uint32_t height, VideoFrameBuffer& out, uint32_t left = 0, uint32_t top = 0);
 
 }  // namespace intel_mfx
 }  // namespace hardware

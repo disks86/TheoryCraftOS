@@ -115,6 +115,15 @@ class VcsDriver {
 
   uint32_t last_sequence() const { return seqno_; }
 
+  // Only one user at a time can have buffers in the context's address space: whoever starts a decode session takes the lease and gives it back at the end.
+  bool try_lease() {
+    if (state_ != State::Ready || leased_) return false;
+    leased_ = true;
+    return true;
+  }
+  void release_lease() { leased_ = false; }
+  IGpuMemory& memory() { return memory_; }
+
  private:
   // Page table pages come out of the same GPU memory.
   class PageSource final : public IGpuPageSource {
@@ -145,6 +154,7 @@ class VcsDriver {
   uint64_t ring_tail_ = 0;  // bytes
   uint32_t seqno_ = 0;
   uint64_t write_position_ = 0;
+  bool leased_ = false;
   ExeclistPort port_;
 };
 

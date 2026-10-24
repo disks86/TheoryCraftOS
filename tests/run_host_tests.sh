@@ -11,7 +11,7 @@ flags="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=unde
 
 # The GUI has player controls, which bring the audio player (and with it the mixer), the video player and the codecs along.
 media="src/Media/*.cpp src/Media/Audio/*.cpp src/Media/Image/*.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp"
-gui_audio="src/Hardware/Monitor/*.cpp src/Hardware/Printer/PrinterTypes.cpp src/Hardware/Printer/TextLayout.cpp src/Hardware/Printer/Halftone.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Software/*.cpp $media"
+gui_audio="src/Hardware/Monitor/*.cpp src/Hardware/Printer/PrinterTypes.cpp src/Hardware/Printer/TextLayout.cpp src/Hardware/Printer/Halftone.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp $media"
 
 build_and_run() {
   local name=$1; shift
@@ -22,7 +22,7 @@ build_and_run() {
 
 want() { [ $# -eq 0 ] && return 0; for t in "${WANTED[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 WANTED=("$@")
-if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest AmlTest SheetTest DomTest CanvasTest BrowserTest CssTest UrlTest CookieTest FetcherTest PrefetchTest HistoryTest PageTest LayoutUnitTest PixelGoldenTest LayoutTest FlexTest GridTest TableTest PaintTest ScriptTest DatabaseTest DatabaseNetworkTest SystemDatabaseTest StringTest RegexTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest MseTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest WebSocketTest QuicTest Http3Test SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest FontTest IntelGenerationTest IntelMfxTest IntelGtTest IntelVcsDriverTest); fi
+if [ ${#WANTED[@]} -eq 0 ]; then WANTED=(ArrayViewTest AmlTest SheetTest DomTest CanvasTest BrowserTest CssTest UrlTest CookieTest FetcherTest PrefetchTest HistoryTest PageTest LayoutUnitTest PixelGoldenTest LayoutTest FlexTest GridTest TableTest PaintTest ScriptTest DatabaseTest DatabaseNetworkTest SystemDatabaseTest StringTest RegexTest ClipboardTest AllocatorTest PagingTest MmioTest AudioTest AudioMixerTest AudioCaptureTest AudioConvertTest UsbAudioTest AudioHotplugTest AudioHotplugThreadTest UvcTest CameraHotplugTest CameraHotplugThreadTest AudioPlayerTest VideoCodecTest VideoPlayerTest MediaTest MseTest StreamingTest MidiTest UsbMidiTest MonitorTest MidiTest CryptoTest X509Test TlsReplayTest SnmpTest PrinterTest PrinterHotplugTest PrinterHotplugThreadTest PartitionTest FileSystemTest StorageHotplugTest StorageEjectTest StorageHotplugThreadTest InputHotplugTest InputHotplugThreadTest StreamTest AsyncTest ParserFuzzTest NetworkTest HttpTest WebSocketTest QuicTest Http3Test SmbTest NfsTest SshFtpTest GraphicsTest GuiTest GuiControlsTest GuiViewsTest GuiThreadTest FontTest IntelGenerationTest IntelMfxTest IntelGtTest IntelVcsDriverTest IntelAvcSessionTest); fi
 for t in "${WANTED[@]}"; do
   case $t in
     FontTest) build_and_run FontTest tests/FontTest.cpp tests/KernelStubs.cpp src/Font/*.cpp src/Media/Zlib.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp ;;
@@ -101,32 +101,36 @@ for t in "${WANTED[@]}"; do
     AudioPlayerTest) build_and_run AudioPlayerTest tests/AudioPlayerTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                        src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/WavFile.cpp src/Audio/AudioPlayer.cpp ;;
     VideoCodecTest) build_and_run VideoCodecTest tests/VideoCodecTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-                      src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Software/*.cpp ;;
+                      src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp ;;
     VideoPlayerTest) build_and_run VideoPlayerTest tests/VideoPlayerTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-                       src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
+                       src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
                        src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp $media ;;
     MseTest) build_and_run MseTest tests/MseTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
+                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
                  src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp $media ;;
     MediaTest) build_and_run MediaTest tests/MediaTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
-                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
+                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
                  src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp ;;
     MidiTest) build_and_run MidiTest tests/MidiTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
-                src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp src/Hardware/MidiDevice/Mpu401.cpp ;;
+                src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp src/Hardware/MidiDevice/Mpu401.cpp ;;
     UsbMidiTest) build_and_run UsbMidiTest tests/UsbMidiTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp \
                    src/Midi/LiveSynth.cpp src/Math/FloatMath.cpp src/Hardware/MidiDevice/Usb/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp \
                    src/Audio/AudioPlayer.cpp ;;
     IntelGenerationTest) build_and_run IntelGenerationTest tests/IntelGenerationTest.cpp tests/KernelStubs.cpp src/Hardware/CentralProcessingUnit/X86_64Cpu.cpp src/Hardware/CentralProcessingUnit/Intel/IntelX64Cpu.cpp src/Hardware/CentralProcessingUnit/Intel/IntelGenerations.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Intel/IntelMediaEngineHw.cpp ;;
     IntelMfxTest) build_and_run IntelMfxTest tests/IntelMfxTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-                    src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp ;;
+                    src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp ;;
     IntelGtTest) build_and_run IntelGtTest tests/IntelGtTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp \
                    src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp ;;
     IntelVcsDriverTest) build_and_run IntelVcsDriverTest tests/IntelVcsDriverTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp \
                           src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp \
                           src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp src/Hardware/VideoCodec/Intel/IntelMfxCommands.cpp ;;
+    IntelAvcSessionTest) build_and_run IntelAvcSessionTest tests/IntelAvcSessionTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
+                           src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp \
+                           src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp \
+                           src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp ;;
     MonitorTest) build_and_run MonitorTest tests/MonitorTest.cpp src/Hardware/Monitor/*.cpp ;;
     StreamingTest) build_and_run StreamingTest tests/StreamingTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
-                     src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp ;;
+                     src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp ;;
     PartitionTest) build_and_run PartitionTest tests/PartitionTest.cpp tests/KernelStubs.cpp src/Hardware/StorageDevice/Partition/PartitionScanner.cpp ;;
     FileSystemTest) build_and_run FileSystemTest tests/FileSystemTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                       src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/FileSystem/Fat/*.cpp ;;

@@ -160,24 +160,10 @@ VideoFormat Core::output_format() const {
 }
 
 void Core::reset() {
-  flush_dpb();
+  dpb_.reset();
   have_slice_ = false;
   cur_ = nullptr;
   waiting_for_idr_ = true;
-  prev_poc_msb_ = prev_poc_lsb_ = 0;
-  prev_frame_num_ = prev_frame_num_offset_ = 0;
-  returned_ = nullptr;
-}
-
-void Core::flush_dpb() {
-  for (Picture& p : pics_) {
-    p.is_ref = false;
-    p.is_long = false;
-    p.needed_for_output = false;
-  }
-  out_count_ = 0;
-  out_wait_count_ = 0;
-  cur_ = nullptr;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -505,7 +491,7 @@ bool Core::configure(ConstByteView avcc) {
 // NAL units
 
 bool Core::decode(ConstByteView data, int64_t pts_us) {
-  returned_ = nullptr;
+  dpb_.release_returned();
   build_vlc();
   bool any = false;
   for_each_nal(data, nal_length_size_, [&](const uint8_t* nal, uint64_t size) {
@@ -544,6 +530,20 @@ bool Core::handle_nal(const uint8_t* nal, uint64_t size, int64_t pts) {
   have_slice_ = true;
   sh_ = sh;
   build_ref_lists(sh);
+  if (observer_) {
+    H264Decoder::SliceRefs refs;
+    refs.slice_type = sh.type;
+    refs.first_mb = sh.first_mb;
+    refs.current_poc = pic_poc_;
+    for (int l = 0; l < 2; ++l) {
+      refs.count[l] = ref_count_[l] < 32 ? ref_count_[l] : 32;
+      for (int i = 0; i < refs.count[l]; ++i) {
+        refs.poc[l][i] = ref_list_[l][i]->poc;
+        refs.long_term[l][i] = ref_list_[l][i]->is_long;
+      }
+    }
+    observer_(observer_context_, refs);
+  }
   if (!decode_slice(br, sh)) {
     // A damaged slice: keep what was decoded so far.
     return true;
@@ -706,9 +706,9 @@ bool ParameterSets::parse_slice_header(BitReader& br, SliceHeader* sh) const {
 // A new sequence size: the pictures are released and get their memory again as they come into use.
 bool Core::allocate_pictures() {
   const Sps& s = *sp_;
+  dpb_.clear_pictures();
   for (Picture& p : pics_) {
-    p.in_use = false;
-    p.is_ref = p.is_long = p.needed_for_output = false;
+    p.has_memory = false;
     p.y.release();
     p.u.release();
     p.v.release();
@@ -719,28 +719,19 @@ bool Core::allocate_pictures() {
   if (!mbs_.alloc(allocator_, static_cast<uint64_t>(s.mb_w) * s.mb_h)) return false;
   mb_w_ = s.mb_w;
   mb_h_ = s.mb_h;
-  out_count_ = 0;
-  out_wait_count_ = 0;
-  returned_ = nullptr;
   cur_ = nullptr;
   return true;
 }
 
 bool Core::alloc_picture(Picture* p) {
-  if (p->y.size() != 0) return true;
-  const uint64_t w = static_cast<uint64_t>(mb_w_) * 16, h = static_cast<uint64_t>(mb_h_) * 16;
-  return p->y.alloc(allocator_, w * h) && p->u.alloc(allocator_, w / 2 * (h / 2)) && p->v.alloc(allocator_, w / 2 * (h / 2)) &&
-         p->motion.alloc(allocator_, static_cast<uint64_t>(mb_w_) * mb_h_);
-}
-
-Picture* Core::find_free_slot() {
-  Picture* empty = nullptr;
-  for (Picture& p : pics_) {
-    if (&p == cur_ || &p == returned_ || p.is_ref || p.needed_for_output) continue;
-    if (p.y.size() != 0) return &p;  // memory already there
-    if (!empty) empty = &p;
+  if (p->y.size() != 0) {
+    p->has_memory = true;
+    return true;
   }
-  return empty;
+  const uint64_t w = static_cast<uint64_t>(mb_w_) * 16, h = static_cast<uint64_t>(mb_h_) * 16;
+  p->has_memory = p->y.alloc(allocator_, w * h) && p->u.alloc(allocator_, w / 2 * (h / 2)) && p->v.alloc(allocator_, w / 2 * (h / 2)) &&
+                  p->motion.alloc(allocator_, static_cast<uint64_t>(mb_w_) * mb_h_);
+  return p->has_memory;
 }
 
 bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
@@ -748,54 +739,27 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   const Sps& s = ps_.sps[p.sps_id];
   if (sp_ == nullptr || mb_w_ != s.mb_w || mb_h_ != s.mb_h) {
     if (sp_ == nullptr && !sh.idr() && sh.type != kSliceI) return false;
-    bump_output(true);
+    dpb_.bump_output(true);
     sp_ = &s;
+    dpb_.set_sps(sp_);
     if (!allocate_pictures()) {
       sp_ = nullptr;
       return false;
     }
   }
   sp_ = &s;
+  dpb_.set_sps(sp_);
   pp_ = &p;
   active_sps_id_ = p.sps_id;
-  if (sh.idr()) {
-    // Everything before an IDR picture is output first.
-    bump_output(true);
-    for (Picture& q : pics_) {
-      q.is_ref = false;
-      q.is_long = false;
-    }
-    max_long_term_idx_ = -1;
+  PictureInfo* info = dpb_.begin_picture(sh, pts);
+  if (!info) return false;
+  Picture* pic = static_cast<Picture*>(info);  // every slot of the buffer is one of our pictures
+  if (!alloc_picture(pic)) {
+    dpb_.abort_picture();
+    return false;
   }
-  compute_poc(sh);
-  Picture* pic = find_free_slot();
-  while (!pic) {
-    // The buffer is full: push the earliest picture out, and if that frees nothing drop the oldest reference.
-    if (out_count_ > 0) {
-      bump_output(false);
-      pic = find_free_slot();
-      if (pic) break;
-    }
-    Picture* oldest = nullptr;
-    for (Picture& q : pics_)
-      if (q.is_ref && &q != returned_ && (!oldest || q.frame_num_wrap < oldest->frame_num_wrap)) oldest = &q;
-    if (!oldest) return false;
-    oldest->is_ref = false;
-    oldest->is_long = false;
-    pic = find_free_slot();
-  }
-  if (!alloc_picture(pic)) return false;
   cur_ = pic;
-  cur_->in_use = true;
-  cur_->id = next_pic_id_++;
-  cur_->poc = pic_poc_;
-  cur_->frame_num = sh.frame_num;
-  cur_->is_ref = false;
-  cur_->is_long = false;
-  cur_->needed_for_output = false;
-  cur_->non_existing = false;
-  cur_->keyframe = sh.idr() || sh.type == kSliceI;
-  cur_->pts = pts;
+  pic_poc_ = dpb_.pic_poc();
   pic_pts_ = pts;
   slice_no_ = 0;
   for (uint64_t i = 0; i < mbs_.size(); ++i) mbs_[i].slice = -1;
@@ -807,57 +771,6 @@ bool Core::start_picture(const SliceHeader& sh, int64_t pts) {
   return true;
 }
 
-void Core::compute_poc(const SliceHeader& sh) {
-  const Sps& s = *sp_;
-  const int max_frame_num = 1 << s.log2_max_frame_num;
-  if (s.poc_type == 0) {
-    int prev_msb, prev_lsb;
-    if (sh.idr()) {
-      prev_msb = prev_lsb = 0;
-    } else {
-      prev_msb = prev_poc_msb_;
-      prev_lsb = prev_poc_lsb_;
-    }
-    const int max_lsb = 1 << s.log2_max_poc_lsb;
-    int msb;
-    if (sh.poc_lsb < prev_lsb && prev_lsb - sh.poc_lsb >= max_lsb / 2) msb = prev_msb + max_lsb;
-    else if (sh.poc_lsb > prev_lsb && sh.poc_lsb - prev_lsb > max_lsb / 2) msb = prev_msb - max_lsb;
-    else msb = prev_msb;
-    top_poc_ = msb + sh.poc_lsb;
-    bottom_poc_ = top_poc_ + sh.delta_poc_bottom;
-    cur_poc_msb_ = msb;
-  } else {
-    int offset;
-    if (sh.idr()) offset = 0;
-    else if (prev_frame_num_ > sh.frame_num) offset = prev_frame_num_offset_ + max_frame_num;
-    else offset = prev_frame_num_offset_;
-    frame_num_offset_ = offset;
-    if (s.poc_type == 1) {
-      int abs_frame_num = s.num_ref_in_cycle != 0 ? offset + sh.frame_num : 0;
-      if (sh.nal_ref_idc == 0 && abs_frame_num > 0) --abs_frame_num;
-      int expected = 0;
-      if (abs_frame_num > 0) {
-        int per_cycle = 0;
-        for (int i = 0; i < s.num_ref_in_cycle; ++i) per_cycle += s.offset_for_ref_frame[i];
-        const int cycle = (abs_frame_num - 1) / s.num_ref_in_cycle;
-        const int in_cycle = (abs_frame_num - 1) % s.num_ref_in_cycle;
-        expected = cycle * per_cycle;
-        for (int i = 0; i <= in_cycle; ++i) expected += s.offset_for_ref_frame[i];
-      }
-      if (sh.nal_ref_idc == 0) expected += s.offset_for_non_ref_pic;
-      top_poc_ = expected + sh.delta_poc[0];
-      bottom_poc_ = top_poc_ + s.offset_for_top_to_bottom + sh.delta_poc[1];
-    } else {
-      int temp;
-      if (sh.idr()) temp = 0;
-      else if (sh.nal_ref_idc == 0) temp = 2 * (offset + sh.frame_num) - 1;
-      else temp = 2 * (offset + sh.frame_num);
-      top_poc_ = bottom_poc_ = temp;
-    }
-  }
-  pic_poc_ = top_poc_ < bottom_poc_ ? top_poc_ : bottom_poc_;
-}
-
 void Core::finish_picture() {
   if (!cur_ || !have_slice_) {
     have_slice_ = false;
@@ -865,84 +778,19 @@ void Core::finish_picture() {
   }
   have_slice_ = false;
   deblock_picture();
-  const SliceHeader& sh = prev_sh_;
-  bool mmco5 = false;
-  if (sh.nal_ref_idc != 0) {
-    for (int i = 0; i < sh.num_mmco; ++i)
-      if (sh.mmco[i].op == 5) mmco5 = true;
-    mark_references(sh);
-  }
-  if (mmco5) {
-    // 8.2.1: the picture is treated as having frame_num 0 and the order counts restart from it.
-    bump_output(true);
-    const int temp = cur_->poc;
-    top_poc_ -= temp;
-    bottom_poc_ -= temp;
-    cur_->poc = top_poc_ < bottom_poc_ ? top_poc_ : bottom_poc_;
-    cur_->frame_num = 0;
-  }
-  // State for the next picture's order count.
-  const Sps& s = *sp_;
-  if (sh.nal_ref_idc != 0) {
-    if (mmco5) {
-      prev_poc_msb_ = 0;
-      prev_poc_lsb_ = top_poc_;  // tempPicOrderCnt-adjusted TopFieldOrderCnt (frame)
-    } else {
-      prev_poc_msb_ = cur_poc_msb_;
-      prev_poc_lsb_ = sh.poc_lsb;
-    }
-  }
-  if (s.poc_type != 0) {
-    prev_frame_num_ = mmco5 ? 0 : sh.frame_num;
-    prev_frame_num_offset_ = mmco5 ? 0 : frame_num_offset_;
-  } else {
-    prev_frame_num_ = sh.frame_num;
-  }
-  prev_ref_frame_num_ = sh.nal_ref_idc != 0 ? (mmco5 ? 0 : sh.frame_num) : prev_ref_frame_num_;
-  cur_->needed_for_output = true;
-  Picture* done = cur_;
+  dpb_.finish_picture(prev_sh_);
   cur_ = nullptr;
-  queue_output(done);
-}
-
-// Pictures wait here until the display order allows them out.
-void Core::queue_output(Picture* p) {
-  out_wait_[out_wait_count_++] = p;
-  const int depth = sp_->num_reorder_frames >= 0 ? sp_->num_reorder_frames : (sp_->poc_type == 2 ? 0 : sp_->dpb_frames);
-  while (out_wait_count_ > depth) bump_output(false);
-}
-
-// Moves the earliest waiting picture (or all of them) to the queue the user receives from.
-void Core::bump_output(bool all) {
-  do {
-    if (out_wait_count_ == 0) return;
-    int best = 0;
-    for (int i = 1; i < out_wait_count_; ++i)
-      if (out_wait_[i]->poc < out_wait_[best]->poc) best = i;
-    Picture* p = out_wait_[best];
-    for (int i = best; i + 1 < out_wait_count_; ++i) out_wait_[i] = out_wait_[i + 1];
-    --out_wait_count_;
-    if (out_count_ < kMaxPictures) {
-      out_queue_[out_count_++] = p;
-    } else {
-      p->needed_for_output = false;
-    }
-  } while (all);
 }
 
 void Core::flush() {
   finish_picture();
-  bump_output(true);
+  dpb_.bump_output(true);
 }
 
 bool Core::receive(VideoFrame* frame) {
-  returned_ = nullptr;
-  if (out_count_ == 0) return false;
-  Picture* p = out_queue_[0];
-  for (int i = 0; i + 1 < out_count_; ++i) out_queue_[i] = out_queue_[i + 1];
-  --out_count_;
-  p->needed_for_output = false;
-  returned_ = p;
+  PictureInfo* info = dpb_.take_output();
+  if (!info) return false;
+  const Picture* p = static_cast<const Picture*>(info);
   const Sps& s = *sp_;
   frame->format.width = static_cast<uint32_t>(s.mb_w * 16 - s.crop_l - s.crop_r);
   frame->format.height = static_cast<uint32_t>(s.mb_h * 16 - s.crop_t - s.crop_b);
@@ -958,237 +806,12 @@ bool Core::receive(VideoFrame* frame) {
   return true;
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Reference picture marking (8.2.5)
-
-void Core::sliding_window() {
-  int refs = 0;
-  for (Picture& p : pics_)
-    if (&p != cur_ && p.is_ref) ++refs;
-  const int max_refs = sp_->max_num_ref_frames > 0 ? sp_->max_num_ref_frames : 1;
-  while (refs >= max_refs) {
-    Picture* oldest = nullptr;
-    for (Picture& p : pics_)
-      if (&p != cur_ && p.is_ref && !p.is_long && (!oldest || p.frame_num_wrap < oldest->frame_num_wrap)) oldest = &p;
-    if (!oldest) break;
-    oldest->is_ref = false;
-    --refs;
-  }
-}
-
-void Core::mark_references(const SliceHeader& sh) {
-  const int max_frame_num = 1 << sp_->log2_max_frame_num;
-  for (Picture& p : pics_)
-    if (p.is_ref && !p.is_long) p.frame_num_wrap = p.frame_num > sh.frame_num ? p.frame_num - max_frame_num : p.frame_num;
-  cur_->is_ref = true;
-  cur_->is_long = false;
-  if (sh.idr()) {
-    if (sh.long_term_reference) {
-      cur_->is_long = true;
-      cur_->long_term_idx = 0;
-      max_long_term_idx_ = 0;
-    } else {
-      max_long_term_idx_ = -1;
-    }
-    cur_->frame_num_wrap = sh.frame_num;
-    return;
-  }
-  cur_->frame_num_wrap = sh.frame_num;
-  if (sh.adaptive_marking) {
-    apply_mmco(sh);
-  } else {
-    cur_->is_ref = false;  // the current picture does not count in the window
-    sliding_window();
-    cur_->is_ref = true;
-  }
-}
-
-void Core::apply_mmco(const SliceHeader& sh) {
-  const int max_frame_num = 1 << sp_->log2_max_frame_num;
-  (void)max_frame_num;
-  for (int i = 0; i < sh.num_mmco; ++i) {
-    const Mmco& m = sh.mmco[i];
-    switch (m.op) {
-      case 1: {
-        const int pic_num = sh.frame_num - (static_cast<int>(m.a) + 1);
-        for (Picture& p : pics_)
-          if (&p != cur_ && p.is_ref && !p.is_long && p.frame_num_wrap == pic_num) p.is_ref = false;
-        break;
-      }
-      case 2:
-        for (Picture& p : pics_)
-          if (&p != cur_ && p.is_ref && p.is_long && p.long_term_idx == static_cast<int>(m.a)) {
-            p.is_ref = false;
-            p.is_long = false;
-          }
-        break;
-      case 3: {
-        const int pic_num = sh.frame_num - (static_cast<int>(m.a) + 1);
-        for (Picture& p : pics_)
-          if (&p != cur_ && p.is_ref && p.is_long && p.long_term_idx == static_cast<int>(m.b)) {
-            p.is_ref = false;
-            p.is_long = false;
-          }
-        for (Picture& p : pics_)
-          if (&p != cur_ && p.is_ref && !p.is_long && p.frame_num_wrap == pic_num) {
-            p.is_long = true;
-            p.long_term_idx = static_cast<int>(m.b);
-          }
-        break;
-      }
-      case 4:
-        max_long_term_idx_ = static_cast<int>(m.a) - 1;
-        for (Picture& p : pics_)
-          if (&p != cur_ && p.is_ref && p.is_long && p.long_term_idx > max_long_term_idx_) {
-            p.is_ref = false;
-            p.is_long = false;
-          }
-        break;
-      case 5:
-        for (Picture& p : pics_)
-          if (&p != cur_) {
-            p.is_ref = false;
-            p.is_long = false;
-          }
-        max_long_term_idx_ = -1;
-        break;
-      case 6:
-        for (Picture& p : pics_)
-          if (&p != cur_ && p.is_ref && p.is_long && p.long_term_idx == static_cast<int>(m.b)) {
-            p.is_ref = false;
-            p.is_long = false;
-          }
-        cur_->is_long = true;
-        cur_->long_term_idx = static_cast<int>(m.b);
-        break;
-      default:
-        break;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Reference lists (8.2.4)
-
+// The reference lists of a slice (the Dpb builds them), as pictures with samples, plus the implicit bi-prediction weights.
 void Core::build_ref_lists(const SliceHeader& sh) {
-  ref_count_[0] = ref_count_[1] = 0;
-  for (int l = 0; l < 2; ++l)
-    for (int i = 0; i <= kMaxRefs; ++i) ref_list_[l][i] = nullptr;
-  if (sh.type == kSliceI) return;
-  const int max_frame_num = 1 << sp_->log2_max_frame_num;
-  Picture* shorts[kMaxPictures];
-  Picture* longs[kMaxPictures];
-  int ns = 0, nl = 0;
-  for (Picture& p : pics_) {
-    if (&p == cur_ || !p.is_ref) continue;
-    if (p.is_long) {
-      longs[nl++] = &p;
-    } else {
-      p.frame_num_wrap = p.frame_num > sh.frame_num ? p.frame_num - max_frame_num : p.frame_num;
-      shorts[ns++] = &p;
-    }
-  }
-  // sort long-term by index ascending
-  for (int i = 1; i < nl; ++i)
-    for (int j = i; j > 0 && longs[j]->long_term_idx < longs[j - 1]->long_term_idx; --j) {
-      Picture* t = longs[j];
-      longs[j] = longs[j - 1];
-      longs[j - 1] = t;
-    }
-  Picture* init[2][kMaxPictures + 1];
-  int init_n[2] = {0, 0};
-  if (sh.type == kSliceP) {
-    for (int i = 1; i < ns; ++i)
-      for (int j = i; j > 0 && shorts[j]->frame_num_wrap > shorts[j - 1]->frame_num_wrap; --j) {
-        Picture* t = shorts[j];
-        shorts[j] = shorts[j - 1];
-        shorts[j - 1] = t;
-      }
-    for (int i = 0; i < ns; ++i) init[0][init_n[0]++] = shorts[i];
-    for (int i = 0; i < nl; ++i) init[0][init_n[0]++] = longs[i];
-  } else {
-    // B: by picture order count around the current picture.
-    Picture* before[kMaxPictures];
-    Picture* after[kMaxPictures];
-    int nb = 0, na = 0;
-    for (int i = 0; i < ns; ++i) (shorts[i]->poc < pic_poc_ ? before[nb++] : after[na++]) = shorts[i];
-    for (int i = 1; i < nb; ++i)
-      for (int j = i; j > 0 && before[j]->poc > before[j - 1]->poc; --j) {
-        Picture* t = before[j];
-        before[j] = before[j - 1];
-        before[j - 1] = t;
-      }
-    for (int i = 1; i < na; ++i)
-      for (int j = i; j > 0 && after[j]->poc < after[j - 1]->poc; --j) {
-        Picture* t = after[j];
-        after[j] = after[j - 1];
-        after[j - 1] = t;
-      }
-    for (int i = 0; i < nb; ++i) init[0][init_n[0]++] = before[i];
-    for (int i = 0; i < na; ++i) init[0][init_n[0]++] = after[i];
-    for (int i = 0; i < na; ++i) init[1][init_n[1]++] = after[i];
-    for (int i = 0; i < nb; ++i) init[1][init_n[1]++] = before[i];
-    for (int i = 0; i < nl; ++i) {
-      init[0][init_n[0]++] = longs[i];
-      init[1][init_n[1]++] = longs[i];
-    }
-    if (init_n[1] > 1) {
-      bool same = init_n[0] == init_n[1];
-      for (int i = 0; same && i < init_n[0]; ++i) same = init[0][i] == init[1][i];
-      if (same) {
-        Picture* t = init[1][0];
-        init[1][0] = init[1][1];
-        init[1][1] = t;
-      }
-    }
-  }
-  const int max_frame = 1 << sp_->log2_max_frame_num;
-  for (int l = 0; l < (sh.type == kSliceB ? 2 : 1); ++l) {
-    const int n = sh.num_ref_idx[l];
-    Picture* list[kMaxRefs + 2];
-    for (int i = 0; i < kMaxRefs + 2; ++i) list[i] = nullptr;
-    for (int i = 0; i < n && i < init_n[l]; ++i) list[i] = init[l][i];
-    // modification
-    int pred = sh.frame_num;
-    int idx = 0;
-    for (int m = 0; m < sh.num_mod[l] && idx < n; ++m) {
-      const RefMod& rm = sh.mods[l][m];
-      Picture* target = nullptr;
-      if (rm.idc < 2) {
-        const int diff = static_cast<int>(rm.value) + 1;
-        int no_wrap;
-        if (rm.idc == 0) {
-          no_wrap = pred - diff;
-          if (no_wrap < 0) no_wrap += max_frame;
-        } else {
-          no_wrap = pred + diff;
-          if (no_wrap >= max_frame) no_wrap -= max_frame;
-        }
-        pred = no_wrap;
-        const int pic_num = no_wrap > sh.frame_num ? no_wrap - max_frame : no_wrap;
-        for (int i = 0; i < ns; ++i)
-          if (shorts[i]->frame_num_wrap == pic_num) target = shorts[i];
-      } else {
-        for (int i = 0; i < nl; ++i)
-          if (longs[i]->long_term_idx == static_cast<int>(rm.value)) target = longs[i];
-      }
-      if (!target) continue;
-      for (int c = n; c > idx; --c) list[c] = list[c - 1];
-      list[idx++] = target;
-      int w = idx;
-      for (int c = idx; c <= n; ++c)
-        if (list[c] != target) list[w++] = list[c];
-    }
-    // Entries without a picture repeat the first one so a damaged stream never reads a missing reference.
-    Picture* fallback = nullptr;
-    for (int i = 0; i < n; ++i)
-      if (list[i]) {
-        fallback = list[i];
-        break;
-      }
-    if (!fallback) fallback = shorts_any_or_cur();
-    for (int i = 0; i < n; ++i) ref_list_[l][i] = list[i] ? list[i] : fallback;
-    ref_count_[l] = n;
+  dpb_.build_ref_lists(sh);
+  for (int l = 0; l < 2; ++l) {
+    ref_count_[l] = dpb_.ref_count(l);
+    for (int i = 0; i <= kMaxRefs; ++i) ref_list_[l][i] = static_cast<Picture*>(dpb_.ref(l, i));
   }
   if (sh.type == kSliceB) {
     // Implicit bi-prediction weights (8.4.2.3.1) for every pair of references.
@@ -1208,12 +831,6 @@ void Core::build_ref_lists(const SliceHeader& sh) {
       }
     }
   }
-}
-
-Picture* Core::shorts_any_or_cur() {
-  for (Picture& p : pics_)
-    if (&p != cur_ && p.is_ref) return &p;
-  return cur_;
 }
 
 }  // namespace h264
@@ -1246,5 +863,10 @@ void H264Decoder::reset() {
 VideoFormat H264Decoder::output_format() const { return core_ ? core_->output_format() : VideoFormat{}; }
 
 bool H264Decoder::ready() const { return core_ && core_->ready(); }
+
+void H264Decoder::set_slice_observer(SliceObserver observer, void* context) {
+  if (!core_) core_ = UniquePointer<h264::Core>::make(allocator_, allocator_);
+  if (core_) core_->set_slice_observer(observer, context);
+}
 
 }  // namespace hardware

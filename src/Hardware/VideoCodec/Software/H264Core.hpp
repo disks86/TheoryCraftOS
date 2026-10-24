@@ -232,19 +232,90 @@ struct MotionMb {
   uint8_t intra;
 };
 
-struct Picture {
-  Mem<uint8_t> y, u, v;
-  Mem<MotionMb> motion;
-  int stride = 0, cstride = 0;
+// What the decoded picture buffer needs to know of a picture, apart from its samples: order, reference status and output state. The decoder's pictures
+// (Picture) add the samples; a hardware path adds its own buffers beside it.
+struct PictureInfo {
+  int slot = 0;              // index in the buffer, set by Dpb::attach
   int id = 0;
   int poc = 0, frame_num = 0, frame_num_wrap = 0, long_term_idx = 0;
+  int top_poc = 0, bottom_poc = 0;  // the order counts of the two fields of the frame (poc is the smaller)
   bool in_use = false;       // the slot holds a picture that is a reference or waits for output (or is being decoded)
   bool is_ref = false;       // used for (short- or long-term) reference
   bool is_long = false;
   bool needed_for_output = false;
   bool non_existing = false;
   bool keyframe = false;
+  bool has_memory = false;   // the owner has samples/buffers in this slot already (a slot with memory is reused first)
   int64_t pts = 0;
+};
+
+struct Picture : PictureInfo {
+  Mem<uint8_t> y, u, v;
+  Mem<MotionMb> motion;
+  int stride = 0, cstride = 0;
+};
+
+// The decoded picture buffer (8.2): picture order counts, reference marking and the reference lists of each slice, and the order pictures are output in. It
+// works on the PictureInfo of a fixed set of slots the owner provides, so the software decoder (whose slots hold samples) and a hardware decoder (whose
+// slots hold buffers in the GPU's memory) share the same rules.
+class Dpb {
+ public:
+  // The slots (at most kMaxPictures) the buffer works on. Call again to start over with a different set.
+  void attach(PictureInfo* const* slots, int count);
+  void set_sps(const Sps* sps) { sps_ = sps; }
+
+  // A new sequence size or a restart: every slot is empty, nothing is waiting for output.
+  void clear_pictures();
+  // After a seek: nothing is kept, order counting restarts.
+  void reset();
+
+  // Starts the picture of `sh` (its first slice): flushes at an IDR, computes the order count, picks a slot. Null if no slot can be freed. The caller allocates
+  // the slot's memory and sets `has_memory`, or calls abort_picture().
+  PictureInfo* begin_picture(const SliceHeader& sh, int64_t pts);
+  void abort_picture();
+  // The picture is decoded: marks references (8.2.5), updates the counters for the next picture, queues it for output.
+  void finish_picture(const SliceHeader& last_slice);
+  // The reference lists (8.2.4) for a slice of the current picture. Entries without a picture repeat the first one.
+  void build_ref_lists(const SliceHeader& sh);
+
+  // Output, in display order.
+  void bump_output(bool all);
+  bool output_ready() const { return out_count_ > 0; }
+  PictureInfo* take_output();       // the next picture; it stays in use until the next call that releases it
+  void release_returned() { returned_ = nullptr; }
+
+  PictureInfo* cur() const { return cur_; }
+  PictureInfo* ref(int list, int index) const { return ref_list_[list][index]; }
+  int ref_count(int list) const { return ref_count_[list]; }
+  int pic_poc() const { return pic_poc_; }
+  int top_poc() const { return top_poc_; }
+  int bottom_poc() const { return bottom_poc_; }
+
+ private:
+  PictureInfo* find_free_slot() const;
+  PictureInfo* shorts_any_or_cur() const;
+  void compute_poc(const SliceHeader& sh);
+  void mark_references(const SliceHeader& sh);
+  void sliding_window();
+  void apply_mmco(const SliceHeader& sh);
+  void queue_output(PictureInfo* p);
+
+  PictureInfo* slots_[kMaxPictures] = {};
+  int slot_count_ = 0;
+  const Sps* sps_ = nullptr;
+  PictureInfo* cur_ = nullptr;
+  PictureInfo* returned_ = nullptr;   // the picture last handed out (not reused until the next call)
+  PictureInfo* ref_list_[2][kMaxRefs + 1] = {};
+  int ref_count_[2] = {0, 0};
+  PictureInfo* out_wait_[kMaxPictures] = {};   // decoded, waiting for the display order to allow them out
+  int out_wait_count_ = 0;
+  PictureInfo* out_queue_[kMaxPictures] = {};  // ready for take_output()
+  int out_count_ = 0;
+  int next_pic_id_ = 1;
+  int prev_poc_msb_ = 0, prev_poc_lsb_ = 0, cur_poc_msb_ = 0;
+  int prev_frame_num_offset_ = 0, prev_frame_num_ = 0, prev_ref_frame_num_ = 0, frame_num_offset_ = 0;
+  int top_poc_ = 0, bottom_poc_ = 0, pic_poc_ = 0;
+  int max_long_term_idx_ = -1;
 };
 
 // The macroblock-level state kept for the picture being decoded (neighbour contexts and the loop filter).
@@ -320,7 +391,11 @@ void for_each_nal(ConstByteView data, int nal_length_size, F&& visit) {
 
 class Core {
  public:
-  explicit Core(allocators::IAllocator& allocator) : allocator_(allocator) {}
+  explicit Core(allocators::IAllocator& allocator) : allocator_(allocator) {
+    PictureInfo* slots[kMaxPictures];
+    for (int i = 0; i < kMaxPictures; ++i) slots[i] = &pics_[i];
+    dpb_.attach(slots, kMaxPictures);
+  }
   ~Core();
 
   bool configure(ConstByteView avcc);
@@ -329,27 +404,22 @@ class Core {
   void flush();
   void reset();
   VideoFormat output_format() const;
-  bool ready() const { return out_count_ > 0; }
+  bool ready() const { return dpb_.output_ready(); }
+  void set_slice_observer(H264Decoder::SliceObserver observer, void* context) {
+    observer_ = observer;
+    observer_context_ = context;
+  }
 
  private:
   // --- H264Syntax.cpp
   bool handle_nal(const uint8_t* nal, uint64_t size, int64_t pts);
   bool new_picture(const SliceHeader& a, const SliceHeader& b) const;
+  void build_ref_lists(const SliceHeader& sh);  // the Dpb's lists, as pictures, and the implicit weights
   bool start_picture(const SliceHeader& sh, int64_t pts);
   void finish_picture();
-  void compute_poc(const SliceHeader& sh);
-  void mark_references(const SliceHeader& sh);
-  void sliding_window();
-  void apply_mmco(const SliceHeader& sh);
-  void build_ref_lists(const SliceHeader& sh);
-  Picture* find_free_slot();
-  Picture* shorts_any_or_cur();
-  void queue_output(Picture* p);
-  void bump_output(bool all);
   bool allocate_pictures();
   bool alloc_picture(Picture* p);
   void compute_scaling();
-  void flush_dpb();
   void build_vlc();
 
   // --- H264Macroblock.cpp
@@ -430,15 +500,12 @@ class Core {
   Mem<uint8_t> rbsp_;
 
   Picture pics_[kMaxPictures];
+  Dpb dpb_;                       // order counts, reference marking and lists, output order
+  // Cached from dpb_ for the macroblock code: the picture being decoded and the reference lists of the current slice.
   Picture* cur_ = nullptr;
   Picture* ref_list_[2][kMaxRefs + 1];
   int ref_count_[2] = {0, 0};
-  Picture* out_wait_[kMaxPictures];   // decoded, waiting for the display order to allow them out
-  int out_wait_count_ = 0;
-  Picture* out_queue_[kMaxPictures];  // ready for receive()
-  int out_count_ = 0;
-  Picture* returned_ = nullptr;       // the picture last handed out (released on the next call)
-  int next_pic_id_ = 1;
+  int pic_poc_ = 0;
   int mb_w_ = 0, mb_h_ = 0;
   Mem<MbCtx> mbs_;
 
@@ -448,10 +515,8 @@ class Core {
   int slice_no_ = 0;
   int64_t pic_pts_ = 0;
   bool waiting_for_idr_ = true;
-  int prev_poc_msb_ = 0, prev_poc_lsb_ = 0, cur_poc_msb_ = 0;
-  int prev_frame_num_offset_ = 0, prev_frame_num_ = 0, prev_ref_frame_num_ = 0, frame_num_offset_ = 0;
-  int top_poc_ = 0, bottom_poc_ = 0, pic_poc_ = 0;
-  int max_long_term_idx_ = -1;
+  H264Decoder::SliceObserver observer_ = nullptr;
+  void* observer_context_ = nullptr;
 
   // LevelScale[list][qp % 6][position] for 4x4 (six lists) and 8x8 (intra and inter luma)
   int32_t level_scale4_[6][6][16];

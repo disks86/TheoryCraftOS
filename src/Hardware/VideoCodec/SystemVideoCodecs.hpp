@@ -19,6 +19,8 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelRegisterBank.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/IVideoCodecDevice.hpp"
 #include "ObjectContainer/List.hpp"
@@ -46,6 +48,10 @@ class SystemVideoCodecs {
 
   // With a mapper, initialize() maps the register BAR of Intel GPUs and looks at their video engines; without one it only names them.
   void set_mmio(IRegisterMapper* mapper) { mmio_ = mapper; }
+  // Opt in (needs set_mmio): H.264 decoding on the video engine of Gen9.5 Intel GPUs. Off by default: that path has only run against a simulated GPU.
+  void set_intel_hardware_decode(bool enable) { intel_hardware_ = enable; }
+  // The memory the engine driver takes buffers from; by default the OS allocator's DMA pool. (For tests, which have no memory at device addresses.)
+  void set_intel_gpu_memory(intel_gt::IGpuMemory* memory) { gpu_memory_override_ = memory; }
 
   void initialize();
   void shutdown();
@@ -65,10 +71,16 @@ class SystemVideoCodecs {
 
  private:
   MmioRegion intel_registers(const PciDeviceInfo& d) const;
+  bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out);
+  void add_intel(const PciDeviceInfo& d);
 
   const IPciBus& pci_;
   allocators::IAllocator& allocator_;
   IRegisterMapper* mmio_ = nullptr;
+  bool intel_hardware_ = false;
+  intel_gt::AllocatorGpuMemory gpu_memory_{allocator_};
+  intel_gt::IGpuMemory* gpu_memory_override_ = nullptr;
+  UniquePointer<intel_gt::MmioRegisterBank> intel_registers_bank_;  // lives as long as the device that uses it
   List<UniquePointer<IVideoCodecDevice>> devices_;
 };
 

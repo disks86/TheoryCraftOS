@@ -58,6 +58,25 @@ bool Ggtt::read(uint64_t index, uint64_t* entry) const {
   return true;
 }
 
+bool find_unused_ggtt_range(const MmioRegion& table, uint64_t count, uint64_t guard, uint64_t* first_page) {
+  const uint64_t entries = table.length() / 8;
+  if (!table.valid() || count == 0 || guard > entries || count > entries - guard) return false;
+  for (uint64_t first = entries - guard - count;; --first) {
+    bool absent = true, same = true;
+    const uint64_t value = table.read64(first * 8);
+    for (uint64_t i = 0; i < count && (absent || same); ++i) {
+      const uint64_t e = table.read64((first + i) * 8);
+      absent = absent && !(e & kPtePresent);
+      same = same && e == value;
+    }
+    if (absent || same) {
+      *first_page = first;
+      return true;
+    }
+    if (first == 0) return false;
+  }
+}
+
 void program_private_pat(const MmioRegion& registers, const PatTable& table) {
   registers.write32(kPrivatePatLow, table.low);
   registers.write32(kPrivatePatHigh, table.high);

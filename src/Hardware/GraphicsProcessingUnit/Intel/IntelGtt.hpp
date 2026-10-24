@@ -105,6 +105,10 @@ constexpr uint64_t kGttFlushRegister = 0x101008;
 void ggtt_invalidate(const MmioRegion& registers);
 void ggtt_invalidate(IRegisterBank& registers);
 
+// Looks for `count` consecutive global GTT entries nothing is using, from the top of the table down (the firmware sets up the display's mappings from the bottom):
+// not present, or all the same value (the scratch page the firmware or a driver points unused entries at). Skips the last `guard` entries. False if there is no such place.
+bool find_unused_ggtt_range(const MmioRegion& table, uint64_t count, uint64_t guard, uint64_t* first_page);
+
 // Memory for page tables: 4 KiB, zeroed, with the address the GPU uses to reach it.
 class IGpuPageSource {
  public:

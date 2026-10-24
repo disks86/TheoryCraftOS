@@ -116,6 +116,25 @@ static bool walk(const FakePageSource& src, const Ppgtt32& vm, uint64_t gpu, uin
   return true;
 }
 
+static void test_unused_range() {
+  uint64_t first = 0;
+  std::vector<uint64_t> t(1024, 0);
+  const MmioRegion r(reinterpret_cast<uint64_t>(t.data()), t.size() * 8);
+  CHECK(find_unused_ggtt_range(r, 8, 16, &first) && first == 1024 - 16 - 8);  // empty table: the top, below the guard
+  for (uint64_t i = 990; i < 1024; ++i) t[i] = (i << 12) | 1;                // mappings at the top
+  CHECK(find_unused_ggtt_range(r, 8, 16, &first) && first == 982);           // 982-989 are the highest eight free entries below the mapped ones
+  CHECK(first + 8 <= 1024 - 16);
+  for (uint64_t i = 0; i < 1024; ++i) t[i] = ((i + 1) << 12) | 1;            // everything mapped to something different
+  CHECK(!find_unused_ggtt_range(r, 8, 16, &first));
+  for (uint64_t i = 600; i < 640; ++i) t[i] = 0x7000'0001ull;                // a run of the same entry: a scratch page
+  CHECK(find_unused_ggtt_range(r, 8, 16, &first) && first >= 600 && first + 8 <= 640);
+  for (uint64_t i = 0; i < 1024; ++i) t[i] = 0;
+  t[1024 - 16 - 1] = 1;                                                      // the entry just under the guard is in use: the range must still not overlap it
+  CHECK(find_unused_ggtt_range(r, 8, 16, &first) && first + 8 <= 1024 - 16 - 1);
+  CHECK(!find_unused_ggtt_range(r, 0, 16, &first) && !find_unused_ggtt_range(r, 8, 1020, &first) && !find_unused_ggtt_range(r, 2000, 0, &first));
+  CHECK(!find_unused_ggtt_range(MmioRegion(), 8, 0, &first));
+}
+
 static void test_ppgtt() {
   {
     FakePageSource src;
@@ -284,6 +303,7 @@ static void test_execlist() {
 int main() {
   test_entries_and_geometry();
   test_ggtt_writer();
+  test_unused_range();
   test_ppgtt();
   test_lrc();
   test_execlist();

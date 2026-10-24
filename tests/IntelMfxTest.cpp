@@ -182,6 +182,25 @@ static void test_layout_and_tiling() {
         same &= out.plane(2)[uint64_t{y} * ((cw + 1) / 2) + x] == cr(x, y);
       }
     CHECK(same);
+    // A cropped picture, starting inside the surface (the offsets are even, as the chroma planes are half size).
+    {
+      VideoFrameBuffer crop(a);
+      CHECK(crop.allocate({40, 30, PixelFormat::I420}));
+      CHECK(detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 6, 4));
+      bool same_crop = true;
+      for (uint32_t y = 0; y < 30; ++y)
+        for (uint32_t x = 0; x < 40; ++x) same_crop &= crop.plane(0)[uint64_t{y} * 40 + x] == luma(x + 6, y + 4);
+      for (uint32_t y = 0; y < 15; ++y)
+        for (uint32_t x = 0; x < 20; ++x) {
+          same_crop &= crop.plane(1)[uint64_t{y} * 20 + x] == cb(x + 3, y + 2);
+          same_crop &= crop.plane(2)[uint64_t{y} * 20 + x] == cr(x + 3, y + 2);
+        }
+      CHECK(same_crop);
+      CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 5, 4));    // odd origin
+      CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 26, 4));   // runs past the surface
+      CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 0, 36));
+      CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, 40, 30, crop, 0xFFFFFFFEu, 0));
+    }
     // Refusals: surface too small, wrong output format or size.
     CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size() - 1), l, cw, ch, out));
     CHECK(!detile_nv12_to_i420(ConstByteView(tiled.data(), tiled.size()), l, cw + 1, ch, out));

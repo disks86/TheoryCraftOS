@@ -49,9 +49,11 @@ class SoftwareVideoCodec : public IVideoCodecDevice {
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override;
   UniquePointer<IVideoEncoder> create_encoder(const EncoderConfig& config) override;
 
+ protected:
+  VideoCodecInfo info_;  // vendor classes that really drive an engine update it
+
  private:
   allocators::IAllocator& allocator_;
-  VideoCodecInfo info_;
 };
 
 }  // namespace hardware

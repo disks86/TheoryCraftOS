@@ -55,6 +55,18 @@ class H264Decoder {
   VideoFormat output_format() const;
   bool ready() const;  // a picture can be received
 
+  // For tests and tools: told about every slice once its reference lists are built, with the order count of each entry of the lists.
+  struct SliceRefs {
+    int slice_type = 0;          // 0 P, 1 B, 2 I
+    int first_mb = 0;
+    int current_poc = 0;
+    int count[2] = {0, 0};
+    int poc[2][32] = {};
+    bool long_term[2][32] = {};
+  };
+  using SliceObserver = void (*)(void* context, const SliceRefs& refs);
+  void set_slice_observer(SliceObserver observer, void* context);
+
  private:
   allocators::IAllocator& allocator_;
   UniquePointer<h264::Core> core_;

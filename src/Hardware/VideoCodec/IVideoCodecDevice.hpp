@@ -30,6 +30,9 @@ struct VideoCodecInfo {
   // The sessions run on that engine. False means they run on the CPU - either because there is no engine, or
   // because this OS has no driver for it yet.
   bool accelerated = false;
+  // Codecs whose sessions run on the engine even though the device as a whole is not `accelerated` (a driver for part of the engine's work). codec_mask() bits.
+  uint32_t accelerated_decode_codecs = 0;
+  uint32_t accelerated_encode_codecs = 0;
   uint32_t decode_codecs = 0;  // codec_mask() bits create_decoder() can serve
   uint32_t encode_codecs = 0;  // and create_encoder()
   uint32_t max_width = 0, max_height = 0;
