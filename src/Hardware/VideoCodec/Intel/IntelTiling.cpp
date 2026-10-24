@@ -62,5 +62,35 @@ bool detile_nv12_to_i420(ConstByteView tiled, const Nv12TiledLayout& layout, uin
   return true;
 }
 
+bool detile_nv12_to_planes(ConstByteView tiled, const Nv12TiledLayout& layout, uint32_t width, uint32_t height, ByteView y, uint32_t y_stride, ByteView u, uint32_t u_stride, ByteView v,
+                           uint32_t v_stride, uint32_t first, uint32_t step) {
+  if (width == 0 || height == 0 || (width & 1) || (height & 1) || step == 0 || step > 2 || first >= step || tiled.size() < layout.size) return false;
+  if (width > layout.pitch || height > layout.aligned_height || y_stride < width || u_stride < width / 2 || v_stride < width / 2) return false;
+  const uint32_t chroma_w = width / 2, chroma_h = height / 2;
+  if (uint64_t{layout.chroma_offset_rows} + chroma_h > layout.size / layout.pitch) return false;
+  for (uint32_t row = first; row < height; row += step) {
+    for (uint32_t x = 0; x < width;) {
+      uint32_t n = 16 - (x & 15);
+      if (n > width - x) n = width - x;
+      if (!y.subview(uint64_t{row} * y_stride + x, n).copy_from(tiled.subview(y_tile_offset(layout.pitch, x, row), n))) return false;
+      x += n;
+    }
+  }
+  for (uint32_t row = first; row < chroma_h; row += step) {
+    for (uint32_t x = 0; x < chroma_w;) {
+      uint32_t pairs = 8 - (x & 7);
+      if (pairs > chroma_w - x) pairs = chroma_w - x;
+      const ConstByteView src = tiled.subview(y_tile_offset(layout.pitch, x * 2, layout.chroma_offset_rows + row), uint64_t{pairs} * 2);
+      ByteView ud = u.subview(uint64_t{row} * u_stride + x, pairs), vd = v.subview(uint64_t{row} * v_stride + x, pairs);
+      for (uint32_t k = 0; k < pairs; ++k) {
+        ud[k] = src[uint64_t{k} * 2];
+        vd[k] = src[uint64_t{k} * 2 + 1];
+      }
+      x += pairs;
+    }
+  }
+  return true;
+}
+
 }  // namespace intel_mfx
 }  // namespace hardware

@@ -22,6 +22,7 @@
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/Intel/IntelAvcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
+#include "Hardware/VideoCodec/Intel/IntelMpeg2Session.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Utility/FixedString.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -30,7 +31,7 @@ namespace hardware {
 
 // Intel's media engine in its graphics (Quick Sync Video: the VDBOX/MFX fixed-function blocks): the video decode/encode block that comes with the GPU (PCI vendor 0x8086).
 // It reports that the engine is there (info().hardware_engine) and what a look at it found; sessions run on the CPU through the software codecs unless the engine is driven.
-// With set_hardware() before initialize() (SystemVideoCodecs does it by default, and set_intel_hardware_decode(false) stops it), on a Gen9.5 GPU whose video box answers, H.264 decoding runs on
+// With set_hardware() before initialize() (SystemVideoCodecs does it by default, and set_intel_hardware_decode(false) stops it), on a Gen9.5 GPU whose video box answers, H.264 and MPEG-2 decoding run on
 // the engine (VcsDriver, IntelAvcDecoder) - one session at a time, the others (and every other codec, and encoding) stay on the CPU. That path has only been run against a simulated GPU.
 class IntelMediaVideoEngine final : public SoftwareVideoCodec {
  public:
@@ -70,7 +71,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   const IntelGpuInfo& gpu() const { return gpu_; }
   // Codecs the engine would serve once it is driven: today's sessions all run in software (info().accelerated is false).
   uint32_t engine_decode_codecs() const {
-    return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0) |
+    return base_codecs() | (base_codecs() ? codec_mask(VideoCodec::Mpeg2) : 0) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0) |
            (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0);
   }
   uint32_t engine_encode_codecs() const {

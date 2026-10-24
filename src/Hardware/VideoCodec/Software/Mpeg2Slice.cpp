@@ -304,9 +304,34 @@ bool Core::macroblock(BitReader& br, Mb& mb) {
 
 // 6.2.4 slice()
 bool Core::decode_slice(ConstByteView unit, int mb_row) {
-  if (offloaded_) {
-    ++slice_count_;
-    return slices_.push_back(unit);
+  if (offloaded_ || observer_) {
+    // Where the macroblocks begin: after the slice header (6.2.4), which the engine is told about.
+    BitReader hr(unit.subview(4));
+    SliceInfo info;
+    int info_row = mb_row;
+    if (sequence_.vertical_size > 2800) info_row += static_cast<int>(hr.get(3)) << 7;
+    info.quantiser_scale_code = static_cast<int>(hr.get(5));
+    while (hr.bit()) hr.skip(8);
+    info.mb_row = info_row;
+    info.mb_bit_offset = 32 + static_cast<uint32_t>(hr.position());
+    int increment = 0;
+    for (;;) {
+      const uint16_t entry = lut_address_[hr.peek(11)];
+      if (entry == 0 || hr.error()) break;
+      hr.skip(entry & 31);
+      if ((entry >> 5) == 33) {
+        increment += 33;
+        continue;
+      }
+      increment += (entry >> 5) + 1;
+      break;
+    }
+    info.mb_col = increment > 0 ? increment - 1 : 0;
+    if (!slices_.push_back(unit) || !slice_infos_.push_back(info)) return false;
+    if (offloaded_) {
+      ++slice_count_;
+      return true;
+    }
   }
   BitReader br(unit.subview(4));
   if (sequence_.vertical_size > 2800) mb_row += static_cast<int>(br.get(3)) << 7;

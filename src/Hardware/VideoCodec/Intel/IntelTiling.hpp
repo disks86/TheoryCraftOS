@@ -34,5 +34,10 @@ constexpr uint64_t y_tile_offset(uint32_t pitch, uint32_t x_byte, uint32_t row) 
 // the surface.
 bool detile_nv12_to_i420(ConstByteView tiled, const Nv12TiledLayout& layout, uint32_t width, uint32_t height, VideoFrameBuffer& out, uint32_t left = 0, uint32_t top = 0);
 
+// The same into planes that have strides (the CPU decoders' pictures), for the lines `first`, `first + step`, ... of the luma (and of the chroma, which has half as many):
+// a field picture reads back its own parity. `width` and `height` are the whole coded picture, even. False if they do not fit the layout or a plane is too small.
+bool detile_nv12_to_planes(ConstByteView tiled, const Nv12TiledLayout& layout, uint32_t width, uint32_t height, ByteView y, uint32_t y_stride, ByteView u, uint32_t u_stride, ByteView v,
+                           uint32_t v_stride, uint32_t first = 0, uint32_t step = 1);
+
 }  // namespace intel_mfx
 }  // namespace hardware

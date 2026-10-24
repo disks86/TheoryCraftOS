@@ -66,6 +66,8 @@ constexpr uint32_t kMfxAvcRefIdxState = mfx_header(2, 1, 0, 4);
 constexpr uint32_t kMfxAvcWeightoffsetState = mfx_header(2, 1, 0, 5);
 constexpr uint32_t kMfdAvcPicidState = mfx_header(2, 1, 1, 5);
 constexpr uint32_t kMfdAvcBsdObject = mfx_header(2, 1, 1, 8);
+constexpr uint32_t kMfxMpeg2PicState = mfx_header(2, 3, 0, 0);
+constexpr uint32_t kMfdMpeg2BsdObject = mfx_header(2, 3, 1, 8);
 
 // MI commands for the video ring.
 constexpr uint32_t kMiNoop = 0;
@@ -73,8 +75,9 @@ constexpr uint32_t kMiBatchBufferEnd = 0x0Au << 23;
 constexpr uint32_t kMiFlushDw = (0x26u << 23) | 0x2;
 constexpr uint32_t kMiFlushDwVideoPipelineCacheInvalidate = 1u << 7;
 
-constexpr uint32_t kFormatAvc = 2;       // MFX_FORMAT_AVC
+constexpr uint32_t kFormatMpeg2 = 0, kFormatVc1 = 1, kFormatAvc = 2;   // MFX_FORMAT_*
 constexpr uint32_t kSurfacePlanar420 = 4;  // MFX_SURFACE_PLANAR_420_8
+constexpr uint32_t kQmMpegIntra = 0, kQmMpegNonIntra = 1;
 constexpr uint32_t kQmAvc4x4Intra = 0, kQmAvc4x4Inter = 1, kQmAvc8x8Intra = 2, kQmAvc8x8Inter = 3;
 constexpr uint32_t kMaxAvcReferenceFrames = 16;
 constexpr uint32_t kMaxAvcRefIdx = 32;
@@ -116,7 +119,7 @@ struct AvcSlice {
   uint32_t first_mb_bit_offset = 0;   // bit offset of the macroblock data from data_offset
 };
 
-// Graphics addresses of every buffer a picture uses (0 means "none"). The engine reads and writes them through the graphics page tables.
+// Graphics addresses of every buffer a picture uses (0 means "none"). The other codecs of the MFX engine (MPEG-2, VC-1) use the same set. The engine reads and writes them through the graphics page tables.
 struct AvcBuffers {
   uint64_t current_picture = 0;            // decoded output
   uint64_t intra_row_store = 0;            // width_in_mbs * 64 bytes
@@ -129,6 +132,7 @@ struct AvcBuffers {
   int32_t reference_poc[kMaxAvcReferenceFrames][2] = {};  // top, bottom
   int32_t current_poc[2] = {};
   uint64_t bitstream = 0;                  // the slice data buffer
+  uint64_t bitplane_read = 0;              // VC-1: the bit plane buffer
   bool deblocking_enabled = true;          // some slice has the loop filter on: output goes through the post-deblocking path
   uint32_t mocs = 2;                       // memory object control state dword (Gen9: use the page table's cache setting)
 };
@@ -146,7 +150,8 @@ bool nv12_tiled_layout(uint32_t width, uint32_t height, Nv12TiledLayout* out);
 // --- The commands. Each appends its dwords to `w`.
 void emit_mi_flush(DwordWriter& w);             // video pipeline cache invalidate flush
 void emit_batch_end(DwordWriter& w);            // MI_BATCH_BUFFER_END, with an MI_NOOP in front when the count so far is even, so the batch ends on a quadword
-void emit_pipe_mode_select(DwordWriter& w, bool post_deblocking_output, bool pre_deblocking_output);
+void emit_pipe_mode_select(DwordWriter& w, bool post_deblocking_output, bool pre_deblocking_output);   // (H.264)
+void emit_pipe_mode_select(DwordWriter& w, uint32_t format, bool post_deblocking_output, bool pre_deblocking_output);
 void emit_surface_state(DwordWriter& w, uint32_t width, uint32_t height, const Nv12TiledLayout& layout);
 void emit_pipe_buf_addr_state(DwordWriter& w, const AvcBuffers& b);
 void emit_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint32_t mocs);
@@ -168,6 +173,30 @@ void emit_avc_slice_state(DwordWriter& w, const AvcPicture& p, const AvcSlice& s
 void emit_avc_bsd_object(DwordWriter& w, const AvcSlice& s);
 // A slice that covers macroblocks no real slice does (the picture's first slice does not start at 0): the engine needs it to fill the gap.
 void emit_avc_phantom_slice(DwordWriter& w, const AvcPicture& p, bool has_next, uint32_t next_first_mb);
+
+// --- MPEG-2 (Gen8 and Gen9 layouts of the reference driver's gen8_mfd.c).
+
+// What a picture needs of the MPEG-2 picture header: the picture coding extension's fields.
+struct Mpeg2Picture {
+  uint32_t width_in_mbs = 0, height_in_mbs = 0;   // of the frame
+  uint32_t picture_coding_type = 1;               // 1 I, 2 P, 3 B
+  uint32_t f_code[2][2] = {{15, 15}, {15, 15}};
+  uint32_t intra_dc_precision = 0;
+  uint32_t picture_structure = 3;                 // 1 top field, 2 bottom field, 3 frame
+  bool top_field_first = false, frame_pred_frame_dct = false, concealment_motion_vectors = false, q_scale_type = false, intra_vlc_format = false, alternate_scan = false;
+};
+// One slice. `data_offset` is where the byte holding the slice's first macroblock bit is in the bitstream buffer; `data_size` the bytes from there to the end of the slice.
+struct Mpeg2SliceJob {
+  uint32_t data_offset = 0, data_size = 0;
+  uint32_t bit_offset = 0;                        // of the first macroblock within that byte (0-7)
+  uint32_t hpos = 0, vpos = 0;                    // first macroblock (the row within the field for a field picture)
+  uint32_t next_hpos = 0, next_vpos = 0;          // of the next slice, or just below the picture for the last
+  uint32_t mb_count = 0;
+  bool last = false;
+  uint32_t quantiser_scale_code = 1;
+};
+void emit_mpeg2_pic_state(DwordWriter& w, const Mpeg2Picture& p);
+void emit_mpeg2_bsd_object(DwordWriter& w, const Mpeg2SliceJob& s);
 
 }  // namespace intel_mfx
 }  // namespace hardware

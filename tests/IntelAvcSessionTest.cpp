@@ -583,7 +583,7 @@ static void test_device() {
       IntelMediaVideoEngine device(a, 0x3E92, region);  // Coffee Lake
       device.set_hardware(setup);
       CHECK(device.initialize());
-      CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == codec_mask(VideoCodec::H264) && !device.info().accelerated);
+      CHECK(device.hardware_decode() && device.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2)) && !device.info().accelerated);
       std::vector<int64_t> hw_pts, sw_pts;
       {
         UniquePointer<IVideoDecoder> hw = device.create_decoder(i420_config());
@@ -696,7 +696,7 @@ static void test_system() {
       if (enable) {
         CHECK(written == 8 && first == mapper.table.size() - 16 - 8);  // eight entries just below the guard at the top
         CHECK(system.decode_codecs() & codec_mask(VideoCodec::H264));
-        CHECK(intel->info().accelerated_decode_codecs == codec_mask(VideoCodec::H264));
+        CHECK(intel->info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mpeg2)));
         CHECK(mapper.calls >= 3);
       } else {
         CHECK(written == 0 && intel->info().accelerated_decode_codecs == 0);

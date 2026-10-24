@@ -71,15 +71,19 @@ void emit_batch_end(DwordWriter& w) {
   w.emit(kMiBatchBufferEnd);
 }
 
-void emit_pipe_mode_select(DwordWriter& w, bool post_deblocking_output, bool pre_deblocking_output) {
+void emit_pipe_mode_select(DwordWriter& w, uint32_t format, bool post_deblocking_output, bool pre_deblocking_output) {
   w.emit(kMfxPipeModeSelect | (5 - 2));
   w.emit((1u << 17) |                                   // long format
          (0u << 15) |                                   // VLD mode
          (uint32_t{post_deblocking_output} << 9) |
          (uint32_t{pre_deblocking_output} << 8) |
          (0u << 4) |                                    // decode
-         kFormatAvc);
+         format);
   zeros(w, 3);
+}
+
+void emit_pipe_mode_select(DwordWriter& w, bool post_deblocking_output, bool pre_deblocking_output) {
+  emit_pipe_mode_select(w, kFormatAvc, post_deblocking_output, pre_deblocking_output);
 }
 
 void emit_surface_state(DwordWriter& w, uint32_t width, uint32_t height, const Nv12TiledLayout& layout) {
@@ -123,7 +127,7 @@ void emit_bsp_buf_base_addr_state(DwordWriter& w, const AvcBuffers& b) {
   w.emit(b.mocs);
   address_or_zero(w, b.mpr_row_store);
   w.emit(b.mocs);
-  zeros(w, 2);                                          // bitplane read buffer: VC-1 only
+  address_or_zero(w, b.bitplane_read);                  // bitplane read buffer: VC-1 only
   w.emit(b.mocs);
 }
 
@@ -228,6 +232,25 @@ void emit_avc_phantom_slice(DwordWriter& w, const AvcPicture& p, bool has_next, 
   zeros(w, 5);
   w.emit(kMfdAvcBsdObject | (6 - 2));
   zeros(w, 5);
+}
+
+void emit_mpeg2_pic_state(DwordWriter& w, const Mpeg2Picture& p) {
+  w.emit(kMfxMpeg2PicState | (13 - 2));
+  w.emit((p.f_code[1][1] & 0xF) << 28 | (p.f_code[1][0] & 0xF) << 24 | (p.f_code[0][1] & 0xF) << 20 | (p.f_code[0][0] & 0xF) << 16 | (p.intra_dc_precision & 3) << 14 |
+         (p.picture_structure & 3) << 12 | uint32_t{p.top_field_first} << 11 | uint32_t{p.frame_pred_frame_dct} << 10 | uint32_t{p.concealment_motion_vectors} << 9 |
+         uint32_t{p.q_scale_type} << 8 | uint32_t{p.intra_vlc_format} << 7 | uint32_t{p.alternate_scan} << 6);
+  w.emit((p.picture_coding_type & 7) << 9);
+  w.emit((1u << 31) |                                   // slice concealment off
+         ((p.height_in_mbs - 1) << 16) | (p.width_in_mbs - 1));
+  zeros(w, 9);
+}
+
+void emit_mpeg2_bsd_object(DwordWriter& w, const Mpeg2SliceJob& s) {
+  w.emit(kMfdMpeg2BsdObject | (5 - 2));
+  w.emit(s.data_size);
+  w.emit(s.data_offset);
+  w.emit((s.hpos & 0xFF) << 24 | (s.vpos & 0xFF) << 16 | (s.mb_count & 0xFF) << 8 | uint32_t{s.last} << 5 | uint32_t{s.last} << 3 | (s.bit_offset & 7));
+  w.emit((s.quantiser_scale_code & 0xFF) << 24 | (s.next_vpos & 0xFFFF) << 8 | (s.next_hpos & 0xFF));
 }
 
 }  // namespace intel_mfx
