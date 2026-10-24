@@ -1659,6 +1659,44 @@ void Page::cookie_set(StringView text) {
   env_.cookies().store(text, url, env_.now_ms(), true);
 }
 
+void Page::cookie_details(StringView target, String* out) {
+  WebUrl page_url(allocator_), url(allocator_);
+  if (!WebUrl::parse(allocator_, address_.view(), nullptr, &page_url) || !(page_url.scheme.equals("http") || page_url.scheme.equals("https"))) return;
+  if (target.empty()) url = static_cast<WebUrl&&>(page_url);
+  else {
+    if (!WebUrl::parse(allocator_, target, &page_url, &url) || !page_url.same_origin(url)) return;
+  }
+  List<CookieJar::Cookie> list(allocator_);
+  env_.cookies().list_for_script(url, env_.now_ms(), &list);
+  for (uint64_t i = 0; i < list.count(); ++i) {
+    const CookieJar::Cookie& c = list[i];
+    out->append(c.name.view());
+    out->push_back('\t');
+    out->append(c.value.view());
+    out->push_back('\t');
+    out->append(c.domain.view());
+    out->push_back('\t');
+    out->append(c.path.view());
+    out->push_back('\t');
+    out->append_int(c.expires_ms);
+    out->push_back('\t');
+    out->append_uint(c.secure ? 1 : 0);
+    out->push_back('\t');
+    out->append_uint(c.same_site);
+    out->push_back('\t');
+    out->append_uint(c.partitioned ? 1 : 0);
+    out->push_back('\t');
+    out->append_uint(c.host_only ? 1 : 0);
+    out->push_back('\n');
+  }
+}
+
+bool Page::cookie_write(StringView text) {
+  WebUrl url(allocator_);
+  if (!WebUrl::parse(allocator_, address_.view(), nullptr, &url) || !(url.scheme.equals("http") || url.scheme.equals("https"))) return false;
+  return env_.cookies().store(text, url, env_.now_ms(), true);
+}
+
 // --- Web Workers: a script engine of its own, without the document
 
 struct Page::WorkerRuntime final : script::IHost {

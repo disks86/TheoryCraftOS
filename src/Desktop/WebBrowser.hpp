@@ -108,6 +108,11 @@ class WebBrowser : public gui::Frame {
   // The page loaded now (nullptr for text, and before the first page). Use it only from the handler thread.
   browser::Page* live_page() { return live_.get(); }
   bool scripts_enabled() const { return scripts_enabled_; }
+  // Cookies of other sites than the page's are neither sent nor kept (off by default).
+  void set_block_third_party_cookies(bool block);
+  bool block_third_party_cookies() const { return block_third_party_; }
+  // Throws away all cookies, and the localStorage of every origin.
+  void clear_site_data();
   // What the scripts of the last page printed (console.log and so on, one line each, errors included) and how many of them failed.
   StringView script_log() const { return script_log_.view(); }
   uint32_t script_errors() const { return script_errors_; }
@@ -207,6 +212,9 @@ class WebBrowser : public gui::Frame {
   static void on_timers(void* self, gui::Control&);
   static void on_toggle_scripts(void* self, gui::Control&);
   static void on_toggle_dark(void* self, gui::Control&);
+  static void on_toggle_third_party(void* self, gui::Control&);
+  static void on_clear_site_data(void* self, gui::Control&);
+  void apply_clear_site_data(const browser::NetResponse& response);
   void update_media();
   // Hides the window's own controls (menu, toolbar, status bar) and maximizes the window, or puts them back (the Fullscreen API).
   void apply_fullscreen(bool on);
@@ -276,7 +284,8 @@ class WebBrowser : public gui::Frame {
   const hardware::IClock* clock_ = nullptr;
   bool canvas_accelerated_ = false;
   bool scripts_enabled_ = true, dark_ = false;
-  gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr;
+  gui::MenuItem *scripts_item_ = nullptr, *dark_item_ = nullptr, *third_party_item_ = nullptr;
+  bool block_third_party_ = false;
   gui::Handler pointer_handler_, node_handler_, resize_handler_, timer_handler_, key_handler_;
   Env env_;
   UniquePointer<browser::Page> live_;

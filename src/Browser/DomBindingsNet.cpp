@@ -19,6 +19,8 @@
 // The network and text natives of the DOM bindings: URL (a host object over WebUrl), the requests behind fetch() and XMLHttpRequest (the page's JavaScript side is
 // in WebPrelude.cpp), and the helpers for bytes and UTF-8 text that Blob, TextEncoder, TextDecoder and URLSearchParams use.
 #include "Browser/DomBindingsInternal.hpp"
+#include "Media/Zlib.hpp"
+#include "Utility/Crc32.hpp"
 #include "Crypto/Crypto.hpp"
 #include "Script/TypedArray.hpp"
 #include "Utility/ByteText.hpp"
@@ -114,6 +116,61 @@ NATIVE(net_form_decode) {
   return true;
 }
 
+// --- Compression -----------------------------------------------------------------------------------------------------------------
+
+// __zlib(format, compress, bytes): "gzip", "deflate" (zlib) or "deflate-raw" compressed or decompressed; null if the data is not valid.
+NATIVE(net_zlib) {
+  (void)self;
+  String format(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &format)) return false;
+  const bool compress = Vm::to_boolean(arg_at(args, argc, 1));
+  String input(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 2), &input)) return false;
+  const ConstByteView in = input.view().bytes();
+  ByteBuffer out(vm.allocator());
+  *result = Value::make_null();
+  const bool gzip = format.equals("gzip"), raw = format.equals("deflate-raw");
+  if (compress) {
+    if (gzip) {
+      static const uint8_t kHeader[10] = {0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3};
+      if (!out.append(ConstByteView(kHeader, 10))) return true;
+    }
+    if (!media::deflate(in, &out, 6, vm.allocator(), gzip || raw)) return true;
+    if (gzip) {
+      const uint32_t crc = crc32(in), size = static_cast<uint32_t>(in.size());
+      uint8_t trailer[8];
+      for (int i = 0; i < 4; ++i) {
+        trailer[i] = static_cast<uint8_t>(crc >> (8 * i));
+        trailer[4 + i] = static_cast<uint8_t>(size >> (8 * i));
+      }
+      if (!out.append(ConstByteView(trailer, 8))) return true;
+    }
+  } else if (gzip) {
+    if (in.size() < 18 || in[0] != 0x1F || in[1] != 0x8B || in[2] != 8) return true;
+    const uint8_t flags = in[3];
+    uint64_t at = 10;
+    if (flags & 4) { if (at + 2 > in.size()) return true; at += 2 + (in[at] | (in[at + 1] << 8)); }
+    if (flags & 8) { while (at < in.size() && in[at] != 0) ++at; ++at; }
+    if (flags & 16) { while (at < in.size() && in[at] != 0) ++at; ++at; }
+    if (flags & 2) at += 2;
+    if (at + 8 > in.size()) return true;
+    uint64_t used = 0;
+    if (!media::inflate(in.subview(at, in.size() - at - 8), &out, 256u << 20, true, &used)) return true;
+    const ConstByteView tail = in.subview(at + used);
+    if (tail.size() < 8) return true;
+    uint32_t crc = 0, size = 0;
+    for (int i = 0; i < 4; ++i) {
+      crc |= static_cast<uint32_t>(tail[i]) << (8 * i);
+      size |= static_cast<uint32_t>(tail[4 + i]) << (8 * i);
+    }
+    if (crc != crc32(out.view()) || size != static_cast<uint32_t>(out.size())) return true;
+  } else if (!media::inflate(in, &out, 256u << 20, raw)) {
+    return true;
+  }
+  *result = str_value(vm, StringView(out.view()));
+  return true;
+}
+
 // --- Requests ------------------------------------------------------------------------------------------------------------------
 
 bool opt_text(Vm& vm, const Value& opts, const char* name, String* out) {
@@ -137,6 +194,10 @@ bool perform(Vm& vm, const Value& opts, Value* result) {
   if (!opt_text(vm, opts, "method", &method) || !opt_text(vm, opts, "url", &url) || !opt_text(vm, opts, "headers", &headers) || !opt_text(vm, opts, "mode", &mode) ||
       !opt_text(vm, opts, "credentials", &credentials) || !opt_text(vm, opts, "redirect", &redirect))
     return false;
+  String referrer(vm.allocator()), referrer_policy(vm.allocator());
+  Value referrer_value;
+  const bool referrer_given = vm.get_named(opts, "referrer", &referrer_value) && referrer_value.is_string();
+  if (!opt_text(vm, opts, "referrer", &referrer) || !opt_text(vm, opts, "referrerPolicy", &referrer_policy)) return false;
   ByteBuffer body(vm.allocator());
   Value b;
   if (!vm.get_named(opts, "body", &b)) return false;
@@ -162,6 +223,9 @@ bool perform(Vm& vm, const Value& opts, Value* result) {
   fo.mode = mode.equals("no-cors") ? FetchOptions::Mode::NoCors : mode.equals("same-origin") ? FetchOptions::Mode::SameOrigin : mode.equals("navigate") ? FetchOptions::Mode::Navigate : FetchOptions::Mode::Cors;
   fo.credentials = credentials.equals("include") ? FetchOptions::Credentials::Include : credentials.equals("omit") ? FetchOptions::Credentials::Omit : FetchOptions::Credentials::SameOrigin;
   fo.redirect = redirect.equals("error") ? FetchOptions::Redirect::Error : redirect.equals("manual") ? FetchOptions::Redirect::Manual : FetchOptions::Redirect::Follow;
+  fo.referrer_given = referrer_given;
+  fo.referrer = referrer.view();
+  fo.referrer_policy = referrer_policy.view();
   fo.page_address = c.host.address();
   fo.now_ms = vm.host() ? vm.host()->now_ms() : 0;
   fo.timeout_ms = timeout > 0 && timeout < 3.6e6 ? static_cast<uint32_t>(timeout) : 0;
@@ -564,6 +628,7 @@ bool install_net(DomBindings::Impl& c) {
   Vm& vm = c.vm;
   JsObject* g = vm.global();
   vm.define_native(g, "__net_send", net_send, 2);
+  vm.define_native(g, "__zlib", net_zlib, 3);
   vm.define_native(g, "__net_run", net_run, 2);
   vm.define_native(g, "__net_send_sync", net_send_sync, 1);
   vm.define_native(g, "__utf8_clean", net_utf8_clean, 1);

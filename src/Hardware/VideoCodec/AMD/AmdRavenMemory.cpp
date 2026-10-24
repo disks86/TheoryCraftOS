@@ -136,6 +136,15 @@ AmdVcn1Plan amd_plan_vcn1_memory(const AmdRavenMemoryMap& map, uint16_t device_i
   plan.rings_gpu_address = map.gpu_base + rings_offset;
   plan.block_physical = map.cpu_base + block_offset;
   plan.rings_physical = map.cpu_base + rings_offset;
+  // The rest of video memory, from the next MiB after the rings to the tail guard, is for decoding sessions.
+  const uint64_t work_offset = align_up(rings_end, kMiB);
+  const uint64_t work_end = (map.video_memory_bytes - kAmdVcn1TailGuardBytes) / kMiB * kMiB;
+  if (work_end > work_offset) {
+    plan.work_offset = work_offset;
+    plan.work_bytes = work_end - work_offset;
+    plan.work_gpu_address = map.gpu_base + work_offset;
+    plan.work_physical = map.cpu_base + work_offset;
+  }
   plan.result = AmdVcn1Plan::Result::Ok;
   return plan;
 }

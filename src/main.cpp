@@ -893,15 +893,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       const bool planned = planned_device.plan_engine(engine_environment);
       if (planned_device.plan_status()[0]) Entry(planned ? Level::Ok : Level::Warning, "Firmware").text(planned_device.name()).text(": ").text(planned_device.plan_status());
     }
-    // Bring up the video engines that were planned and confirmed (AMD VCN 1.0: Ryzen 2000/3000 APUs). They are left idle - no decode path uses them yet - and stopped
-    // again at shutdown. This is the one switch: set it false to leave every engine unstarted.
+    // Bring up the video engines that were planned and confirmed (AMD VCN 1.0: Ryzen 2000/3000 APUs). An engine that comes up is tested at once: it decodes a short
+    // H.264 stream this OS encodes, and must give the CPU's pictures byte for byte, or it is stopped again and H.264 stays on the CPU. Engines are stopped at shutdown.
+    // This is the one switch: set it false to leave every engine unstarted.
     constexpr bool kStartVideoEngines = true;
     if (kStartVideoEngines && clock_ok && paging_ok) {
       for (uint32_t i = 0; i < video_codecs.count(); ++i) {
         hardware::IVideoCodecDevice& engine_device = *video_codecs.at(i);
         if (!engine_device.firmware_status()[0]) continue;   // nothing to start on this device
         const bool started = engine_device.start_hardware(clock);
-        Entry(started ? Level::Ok : Level::Warning, "Video").text(engine_device.name()).text(started ? ": engine started (idle)" : ": engine not started - ").text(started ? "" : engine_device.firmware_status());
+        const bool decoding = started && engine_device.info().accelerated_decode_codecs != 0;
+        Entry(started ? Level::Ok : Level::Warning, "Video").text(engine_device.name()).text(decoding ? ": engine started, H.264 decode runs on it (self-test passed)" : started ? ": engine started (idle)" : ": engine not started - ").text(started ? "" : engine_device.firmware_status());
       }
     }
     // The system database: one file on the root volume (/databases/system.db) where the OS and its programs keep their settings; the database query
@@ -994,6 +996,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // thread redraws whenever something changed, and a handler thread runs what buttons and menus fire - so a
     // slow click handler can freeze neither the screen nor the pointer.
     // The windows that were open at the last shutdown come back (files that are gone are skipped).
+    const uint32_t browser_items = desktop.restore_browser_data();   // the web browser's cookies and localStorage
+    if (browser_items) Entry(Level::Info, "Desktop").text("restored ").dec(browser_items).text(" cookie(s) and stored item(s) of the web browser");
     const uint32_t restored = desktop.restore_session();
     if (restored) Entry(Level::Info, "Desktop").text("restored ").dec(restored).text(" window(s) from the last session");
     const bool threaded = desktop.start();
@@ -1010,6 +1014,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
       hardware::delay_us(4000);
     }
+    desktop.save_browser_data();
     const uint32_t kept = desktop.save_session();   // what is open now, for the next start
     Entry(Level::Info, "Desktop").text("saved ").dec(kept).text(" window(s) for the next session");
     guest.stop_service();  // (VirtualBox's resize requests touch the desktop)

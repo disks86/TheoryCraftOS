@@ -1802,18 +1802,27 @@ static void test_amd_vcn_start_hardware() {
     CHECK(e.initialize() && e.load_firmware(fs));
     return e.plan_engine(env);
   };
-  {   // Everything agrees: the engine starts, is reported, and shutdown puts it back to sleep.
+  {   // Everything agrees and the VCPU answers, but the ring is not served (the registers are plain memory): the engine starts, then its H.264 self-test cannot finish a
+      // picture, so it is stopped again and nothing is reported as accelerated. (The path where the self-test passes is in AmdVcnAvcDecoderTest, against a simulated ring.)
     FakeRavenBar bar;
     bar.words[0x7E00 + 0x5AF] = 2;   // UVD_STATUS reads IDLE: the fake VCPU answers
     AnyRangeMapper mapper;
     AmdVcnVideoEngine raven(a, 0x15DD);
     CHECK(engine_for(bar, mapper, raven));
-    CHECK(raven.start_hardware(clock) && raven.engine_running() && strstr(raven.firmware_status(), "engine started, idle"));
-    CHECK(raven.start_hardware(clock) && raven.engine_running());   // already running: nothing more to do
+    CHECK(raven.plan().work_bytes > 0 && raven.plan().work_offset == 27ull << 20);
+    CHECK(!raven.start_hardware(clock) && !raven.engine_running() && !raven.decode_ready());
+    CHECK(strstr(raven.firmware_status(), "H.264 self-test failed") && strstr(raven.firmware_status(), "engine stopped"));
     CHECK(!raven.info().accelerated && raven.info().accelerated_decode_codecs == 0);
-    raven.shutdown();
-    CHECK(!raven.engine_running() && strstr(raven.firmware_status(), "engine stopped"));
     raven.shutdown();   // twice is harmless
+  }
+  {   // The work area cannot be mapped (the mapper says it is memory the OS owns): the engine is stopped and the log says decoding is not enabled.
+    FakeRavenBar bar;
+    bar.words[0x7E00 + 0x5AF] = 2;
+    AnyRangeMapper mapper;
+    mapper.refuse_from = cpu + (27ull << 20);
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    CHECK(engine_for(bar, mapper, raven));
+    CHECK(!raven.start_hardware(clock) && !raven.engine_running() && strstr(raven.firmware_status(), "decoding not enabled") && raven.info().accelerated_decode_codecs == 0);
   }
   {   // The graphics block does not report the address configuration (GB_ADDR_CONFIG reads zero): planned, but not started.
     FakeRavenBar bar(true, 0);

@@ -5,6 +5,7 @@ source file uses, taken from AMD's own headers in the Linux kernel tree so none 
   gen_vcn1_regs.py out.inc source.cpp header.h [header.h ...]
 
   AmdVcn1.cpp:         vcn_1_0_offset.h vcn_1_0_sh_mask.h
+  AmdVcn1Ring.cpp:     vcn_1_0_offset.h vcn_1_0_sh_mask.h
   AmdRavenMemory.cpp:  gc_9_1_offset.h mmhub_9_1_offset.h mmhub_9_1_sh_mask.h nbio_7_0_offset.h
   (all under drivers/gpu/drm/amd/include/asic_reg/ in the kernel tree)
 

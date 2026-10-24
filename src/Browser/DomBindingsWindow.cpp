@@ -817,6 +817,23 @@ NATIVE(set_content_type) {
   return true;
 }
 
+// __cookie_details(url): the cookies a script can see, as text (see IDomHost::cookie_details). __cookie_write(setCookie): true if the cookie was kept.
+NATIVE(cookie_details) {
+  (void)self;
+  String url(vm.allocator()), out(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &url)) return false;
+  impl(vm).host.cookie_details(url.view(), &out);
+  *result = str_value(vm, out.view());
+  return true;
+}
+NATIVE(cookie_write) {
+  (void)self;
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  *result = bool_value(impl(vm).host.cookie_write(text.view()));
+  return true;
+}
+
 NATIVE(clipboard_get) {
   (void)self; (void)args; (void)argc;
   String text(vm.allocator());
@@ -967,6 +984,8 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__set_attr_ns", set_attr_ns, 4);
   vm.define_native(g, "__make_node", make_node, 4);
   vm.define_native(g, "__attr_ns", attr_ns, 2);
+  vm.define_native(g, "__cookie_details", cookie_details, 1);
+  vm.define_native(g, "__cookie_write", cookie_write, 1);
   vm.define_native(g, "__clipboard_get", clipboard_get, 0);
   vm.define_native(g, "__clipboard_set", clipboard_set, 1);
   vm.define_native(g, "__pip_supported", pip_supported, 0);

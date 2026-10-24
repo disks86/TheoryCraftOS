@@ -247,6 +247,7 @@ add_executable(BOOTX64
   src/Browser/WebPrelude.cpp
   src/Browser/WebUrl.cpp
   src/Browser/CookieJar.cpp
+  src/Browser/PublicSuffix.cpp
   src/Browser/Fetcher.cpp
   src/Browser/PageHub.cpp
   src/Browser/ResourcePrefetcher.cpp
@@ -371,6 +372,7 @@ add_executable(BOOTX64
   src/Desktop/DatabaseQuery.cpp
   src/Desktop/WebBrowser.cpp
   src/Desktop/PictureInPicture.cpp
+  src/Desktop/BrowserStore.cpp
   src/Desktop/SessionStore.cpp
   src/Desktop/DesktopSession.cpp
   src/Desktop/Paint.cpp
@@ -486,6 +488,10 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
+  src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcn1Ring.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.cpp
   src/Hardware/VideoCodec/AMD/AmdMediaEngineHw.cpp
   src/Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.cpp
   src/Hardware/VideoCodec/Intel/IntelMediaEngineHw.cpp

@@ -46,13 +46,19 @@ class StorageArea {
   bool set(StringView key, StringView value);
   bool remove(StringView key);
   void clear() {
+    if (keys_.count() != 0) ++version_;
     keys_.clear();
     values_.clear();
   }
+  // Goes up with every change (for whoever saves the storage), and the bytes it holds (keys and values).
+  uint64_t version() const { return version_; }
+  uint64_t bytes() const;
+  StringView value_at(uint32_t i) const { return i < values_.count() ? values_[i].view() : StringView(); }
 
  private:
   allocators::IAllocator& allocator_;
   List<String> keys_, values_;
+  uint64_t version_ = 0;
 };
 
 // What the bindings need from the page they live in.
@@ -99,6 +105,11 @@ class IDomHost {
   // document.cookie: what scripts of this page can read, and what a script's assignment does (the cookie jar of the browser, for this page's address).
   virtual void cookie_get(String* out) = 0;
   virtual void cookie_set(StringView text) = 0;
+  // The Cookie Store API: the cookies a script of the page can see for `url` (relative to the page; "" for the page itself; only the page's own origin), one per line,
+  // fields separated by tabs: name, value, domain, path, expires (ms since 1970, -1 for a session cookie), secure, sameSite (0 none given, 1 lax, 2 strict, 3 none), partitioned, hostOnly.
+  // And a Set-Cookie string stored as document.cookie would: true if the cookie was kept (or removed an older one).
+  virtual void cookie_details(StringView url, String* out) { (void)url; (void)out; }
+  virtual bool cookie_write(StringView text) { (void)text; return false; }
   // fetch() and XMLHttpRequest: sends a request (cookies, redirects and the cross-origin rules included; see Fetcher.hpp). False (with response->error) if it failed.
   virtual bool http_request(const FetchOptions& options, NetResponse* response) = 0;
   // The origin of the page ("https://example.com", or "null" for a file or a page without an address).

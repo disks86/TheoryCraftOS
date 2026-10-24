@@ -109,6 +109,8 @@ static void test_plan() {
   CHECK(p.result == AmdVcn1Plan::Result::Ok && p.gb_addr_config == 0x24000042 && p.gb_check == AmdGbAddrConfigCheck::Matches);
   CHECK(p.block_offset == 25 * kMiB && p.rings_offset == 26 * kMiB && p.block_bytes == kBlock);
   CHECK(p.block_gpu_address == gpu + 25 * kMiB && p.rings_gpu_address == gpu + 26 * kMiB && p.block_physical == cpu + 25 * kMiB && p.rings_physical == cpu + 26 * kMiB);
+  // The work area for decoding sessions: from the MiB after the rings (27) to the tail guard of a 512 MiB carve-out (496).
+  CHECK(p.work_offset == 27 * kMiB && p.work_bytes == (512 - 16 - 27) * kMiB && p.work_gpu_address == gpu + 27 * kMiB && p.work_physical == cpu + 27 * kMiB);
   // The same bytes, three addresses: the GPU and CPU views differ by a constant.
   CHECK(p.block_gpu_address - p.block_physical == gpu - cpu && p.rings_gpu_address - p.rings_physical == gpu - cpu);
   // A 4K framebuffer (3840 x 2160 x 4 = 31.64 MiB) pushes it out: 31.64 + 16 guard, rounded up to the next MiB, is 48 MiB.
@@ -164,6 +166,14 @@ static void test_plan_properties() {
         CHECK(p.rings_offset + AmdVcn1::kRingsTotalBytes + kAmdVcn1TailGuardBytes <= video);   // and the rings before the tail guard
         CHECK(p.block_physical == map.cpu_base + p.block_offset && p.block_gpu_address == map.gpu_base + p.block_offset);
         CHECK(p.rings_physical == map.cpu_base + p.rings_offset && p.rings_gpu_address == map.gpu_base + p.rings_offset);
+        // The work area starts after the rings, stays short of the tail guard, is whole MiB, and when there is none it says so with zeros.
+        if (p.work_bytes) {
+          CHECK(p.work_offset >= p.rings_offset + AmdVcn1::kRingsTotalBytes && p.work_offset % kMiB == 0 && p.work_bytes % kMiB == 0);
+          CHECK(p.work_offset + p.work_bytes + kAmdVcn1TailGuardBytes <= video);
+          CHECK(p.work_physical == map.cpu_base + p.work_offset && p.work_gpu_address == map.gpu_base + p.work_offset);
+        } else {
+          CHECK(p.work_offset == 0 && p.work_gpu_address == 0 && p.work_physical == 0);
+        }
       }
   CHECK(ok > 50 && refused > 20);   // the sweep covers both
 }

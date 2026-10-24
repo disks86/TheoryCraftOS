@@ -77,6 +77,10 @@ struct AmdVcn1Plan {
   uint64_t block_offset = 0, rings_offset = 0;                // within video memory; MiB aligned
   uint64_t block_gpu_address = 0, rings_gpu_address = 0;     // as the GPU addresses them
   uint64_t block_physical = 0, rings_physical = 0;           // as the CPU addresses them
+  // What is left of video memory past the rings, short of the tail guard: where decoding sessions put their buffers (picture buffers, bitstream, messages). Whole
+  // MiB; 0 bytes when there is none.
+  uint64_t work_offset = 0, work_bytes = 0;
+  uint64_t work_gpu_address = 0, work_physical = 0;
   uint64_t block_bytes = 0;                                   // what AmdVcn1 needs for the firmware
 };
 const char* amd_vcn1_plan_result_name(AmdVcn1Plan::Result result);

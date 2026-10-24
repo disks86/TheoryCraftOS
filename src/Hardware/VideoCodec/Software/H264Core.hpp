@@ -349,6 +349,8 @@ class ParameterSets {
   bool parse_slice_header(BitReader& br, SliceHeader* sh) const;
   // The six 4x4 and two 8x8 scaling lists (raster order) a picture using `pps` is decoded with.
   void effective_scaling(const Sps& sps, const Pps& pps, uint8_t w4[6][16], uint8_t w8[2][64]) const;
+  // The same lists in the order the bitstream sends them (zigzag scan), which is what a hardware decode engine is handed; effective_scaling() gives raster order.
+  static void scaling_to_bitstream_order(const uint8_t w4[6][16], const uint8_t w8[2][64], uint8_t z4[6][16], uint8_t z8[2][64]);
   // 7.4.1.2.4: does slice `b` start a new picture after slice `a`? (`sps` is the active sequence parameter set.)
   static bool new_picture(const Sps& sps, const SliceHeader& a, const SliceHeader& b);
 };
