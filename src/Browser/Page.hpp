@@ -213,6 +213,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool before_unload();
   // The page is going away: `visibilitychange` (hidden), `pagehide`, `unload`.
   void unload();
+  // The page is shown to the user (true) or not - its tab is in the background, its window minimized: document.hidden / visibilityState follow, `visibilitychange` fires
+  // when that changes, and requestAnimationFrame callbacks wait while it is hidden. Frames of the page follow. May be called before load().
+  void set_visible(bool visible);
+  bool visible() const { return !hidden_; }
   // Has the page set history.scrollRestoration to "manual"?
   bool scroll_restoration_manual();
   // The fragment of the page's address is scrolled to when the page is next drawn (after load, and a fragment change).
@@ -407,6 +411,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   int32_t scroll_request_ = -1;
   String referrer_;
   bool fragment_pending_ = false;
+  bool hidden_ = false;   // see set_visible()
   uint32_t scroll_node_ = 0;   // an element scrollIntoView() was called on: its place is worked out when the page is drawn
   uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
   struct Message {

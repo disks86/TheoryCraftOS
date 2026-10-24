@@ -1277,6 +1277,8 @@ void DomBindings::set_ready_state(StringView state) {
   vm_.define_named(wrap(c.doc.root()), "readyState", bind::str_value(vm_, state), script::kWritable);
 }
 
+void DomBindings::set_hidden(bool hidden) { impl_->page_hidden = hidden; }
+
 void DomBindings::update_window_metrics() { bind::update_metrics(*impl_); }
 
 uint32_t DomBindings::media_changed() { return bind::media_changed_impl(*impl_); }

@@ -151,6 +151,7 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
+      bindings_->set_hidden(hidden_);
       return true;
     }
   }
@@ -647,6 +648,17 @@ bool Page::before_unload() {
 void Page::unload() {
   if (!bindings_) return;
   bindings_->call_hook("__page_unload", nullptr, 0);
+  flush_errors();
+}
+
+void Page::set_visible(bool visible) {
+  if (hidden_ == !visible) return;
+  hidden_ = !visible;
+  for (uint64_t i = 0; i < frames_.count(); ++i)
+    if (frames_[i]->page) frames_[i]->page->set_visible(visible);
+  if (!bindings_) return;
+  const DomBindings::HookArg arg = DomBindings::HookArg::of(hidden_);
+  bindings_->call_hook("__page_visibility", &arg, 1);
   flush_errors();
 }
 
@@ -1850,6 +1862,7 @@ void Page::sync_frames() {
     f->page = UniquePointer<Page>::make(allocator_, allocator_, f->env, address.view(), frame_media, scripts_enabled_ && !sandboxed);
     if (!f->page) continue;
     f->page->set_parent(this, n->serial, depth_ + 1);
+    f->page->set_visible(!hidden_);
     f->page->load(html.view());
     f->page->render(&f->doc);
     loaded.push_back(n->serial);

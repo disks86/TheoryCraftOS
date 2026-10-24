@@ -3175,6 +3175,33 @@ static void test_navigation() {
       page.unload();
       CHECK(std::string(page.log().data(), page.log().size()) == "visible false\nvisibilitychange hidden true\npagehide false hidden\nunload\n");
     }
+    // Page Visibility: the host says the page is in the background / shown again
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/", media, true);
+      page.load("<script>document.addEventListener('visibilitychange', function () { console.log('vc', document.visibilityState, document.hidden) }); "
+                "requestAnimationFrame(function () { console.log('raf1') });</script>");
+      page.set_visible(false);
+      page.set_visible(false);   // (no change: no event)
+      page.run_due_timers(1e12);
+      page.set_visible(true);
+      page.run_due_timers(2e12);
+      CHECK(std::string(page.log().data(), page.log().size()) == "vc hidden true\nvc visible false\nraf1\n");
+    }
+    CHECK(js("", "document.onvisibilitychange = function (e) { console.log('on', e.type, e.bubbles) }; document.dispatchEvent(new Event('visibilitychange', { bubbles: true }))", "on visibilitychange true"));
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/", media, true);
+      page.set_visible(false);   // (a tab opened in the background)
+      page.load("<script>console.log(document.visibilityState, document.hidden); var id = requestAnimationFrame(function () { console.log('never') }); requestAnimationFrame(function () { console.log('shown') }); cancelAnimationFrame(id);"
+                "document.addEventListener('visibilitychange', function () { console.log('vc', document.visibilityState) })</script>");
+      page.run_due_timers(1e12);
+      page.set_visible(true);
+      page.run_due_timers(2e12);
+      CHECK(std::string(page.log().data(), page.log().size()) == "hidden true\nvc visible\nshown\n");
+    }
     CHECK(a.live == 0);
   }
   // --- scrollRestoration, the referrer

@@ -7856,6 +7856,35 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       g.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }));
       g.dispatchEvent(new Event('unload'));
     });
+    // Page Visibility: the host says the page is shown or not. A page that is hidden gets no animation frames until it is shown again.
+    var frames = {}, frameId = 0, rawFrame = g.requestAnimationFrame, rawCancel = g.cancelAnimationFrame;
+    var schedule = function (w) {
+      w.raw = rawFrame.call(g, function (stamp) {
+        if (document.hidden) { w.raw = 0; return; }   // (it runs when the page is shown again)
+        delete frames[w.id];
+        w.fn.call(g, stamp);
+      });
+    };
+    hide(g, '__page_visibility', function (hidden) {
+      hidden = !!hidden;
+      if (document.hidden === hidden) return;
+      __set_hidden(hidden);
+      document.dispatchEvent(new Event('visibilitychange', { bubbles: true }));
+      if (!hidden) Object.keys(frames).forEach(function (id) { var w = frames[id]; if (w && !w.raw) schedule(w); });
+    });
+    method(g, 'requestAnimationFrame', function (fn) {
+      if (typeof fn !== 'function') return rawFrame.call(g, fn);   // (throws)
+      var w = { id: ++frameId, fn: fn, raw: 0 };
+      frames[w.id] = w;
+      if (!document.hidden) schedule(w);
+      return w.id;
+    });
+    method(g, 'cancelAnimationFrame', function (id) {
+      var w = frames[id];
+      if (!w) return;
+      delete frames[id];
+      if (w.raw) rawCancel.call(g, w.raw);
+    });
     var restoration = 'auto';
     Object.defineProperty(g.history, 'scrollRestoration', {
       get: function () { return restoration; },

@@ -234,6 +234,8 @@ class WebBrowser : public gui::Frame {
   static void on_form_key(void* self, gui::Control&);
   static void on_view_resized(void* self, gui::Control&);
   static void on_timers(void* self, gui::Control&);
+  static void on_visibility(void* self, gui::Control&);
+  bool window_shown();
   static void on_toggle_scripts(void* self, gui::Control&);
   static void on_toggle_dark(void* self, gui::Control&);
   static void on_toggle_third_party(void* self, gui::Control&);
@@ -361,6 +363,8 @@ class WebBrowser : public gui::Frame {
   String defer_type_, defer_body_, request_type_, request_body_;
   uint64_t uptime_ms_ = 0, clock_base_unix_ = 0, clock_base_up_ = 0, next_due_ms_ = 0;
   bool clock_based_ = false, timer_pending_ = false;
+  bool page_shown_ = true;   // Page Visibility: is the tab selected in a window that is not minimized (written by tick, read on the handler thread)
+  gui::Handler visibility_handler_;
   uint32_t reported_errors_ = 0;
   uint32_t script_errors_ = 0;
   String script_log_;
