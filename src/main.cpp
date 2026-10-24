@@ -543,6 +543,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       first = false;
     }
     if (info.hardware_engine && !info.accelerated) e.text(" (engine present, not driven yet)");
+    if (codec_device.engine_summary()[0]) Entry(Level::Info, "Video").text("  ").text(codec_device.engine_summary());
   }
 
   // Picture, sound and video files: software codecs for every format, JPEG handed to a video engine first when one really accelerates it.

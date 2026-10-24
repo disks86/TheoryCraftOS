@@ -22,6 +22,16 @@ namespace hardware {
 
 bool IntelMediaVideoEngine::initialize() {
   status_ = IntelMediaEngineHw::probe(registers_, gpu_.architecture);
+  summary_.assign(gpu_.name);
+  if (status_.probed) {
+    summary_.append(", video boxes: ");
+    summary_.append_uint(status_.vdbox_count());
+    summary_.append(" of ");
+    summary_.append_uint(IntelMediaEngineStatus::popcount(status_.vdbox_present));
+    summary_.append(" awake");
+  } else {
+    summary_.append(", video engine registers not read");
+  }
   driver_.reset();
   info_.accelerated_decode_codecs = 0;
   // The driver is for Gen9.5 (the generation whose layouts it follows) and needs a video box that answered the look above.

@@ -23,6 +23,7 @@
 #include "Hardware/VideoCodec/Intel/IntelAvcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Utility/FixedString.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace hardware {
@@ -59,6 +60,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   void shutdown() override { driver_.reset(); info_.accelerated_decode_codecs = 0; }
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override;
   const IntelMediaEngineStatus& engine_status() const { return status_; }
+  const char* engine_summary() const override { return summary_.c_str(); }
 
   const char* name() const override { return "Intel media engine (Quick Sync) (software path)"; }
   const IntelGpuInfo& gpu() const { return gpu_; }
@@ -82,6 +84,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   IntelGpuInfo gpu_;
   MmioRegion registers_;
   IntelMediaEngineStatus status_;
+  FixedString<120> summary_;
   HardwareSetup setup_;
   UniquePointer<intel_gt::VcsDriver> driver_;
 };

@@ -49,6 +49,9 @@ class IVideoCodecDevice : public IHardware {
   // A new session, or an empty pointer if the codec or size is not supported or memory ran out.
   virtual UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) = 0;
   virtual UniquePointer<IVideoEncoder> create_encoder(const EncoderConfig& config) = 0;
+  // One line on what the device found out about its hardware (the GPU generation, the video engines the probe saw), for the boot log; empty if it has nothing to say.
+  // Valid until the device is shut down.
+  virtual const char* engine_summary() const { return ""; }
 
  protected:
   constexpr IVideoCodecDevice() = default;

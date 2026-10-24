@@ -21,6 +21,7 @@
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Utility/FixedString.hpp"
 
 namespace hardware {
 
@@ -40,9 +41,28 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   // Reads the GPU's IP discovery table (when given a window and the generation has one). Always succeeds: the engine is there either way.
   bool initialize() override {
     status_ = AmdMediaEngineHw::probe(allocator_, discovery_, gpu_.architecture);
+    summary_.assign(gpu_.name);
+    if (status_.probed) {
+      const AmdIpDiscoveryInfo& d = status_.discovery;
+      summary_.append(", VCN ");
+      summary_.append_uint(d.vcn.major);
+      summary_.append(".");
+      summary_.append_uint(d.vcn.minor);
+      summary_.append(".");
+      summary_.append_uint(d.vcn.revision);
+      summary_.append(" x");
+      summary_.append_uint(d.vcn_instances);
+      summary_.append(", graphics ");
+      summary_.append_uint(d.gc.major);
+      summary_.append(".");
+      summary_.append_uint(d.gc.minor);
+    } else {
+      summary_.append(", IP discovery table not read");
+    }
     return true;
   }
   const AmdMediaEngineStatus& engine_status() const { return status_; }
+  const char* engine_summary() const override { return summary_.c_str(); }
 
   const char* name() const override { return "AMD video engine (VCN) (software path)"; }
   const AmdGpuInfo& gpu() const { return gpu_; }
@@ -65,6 +85,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   AmdGpuInfo gpu_;
   MmioRegion discovery_;
   AmdMediaEngineStatus status_;
+  FixedString<120> summary_;
 };
 
 }  // namespace hardware

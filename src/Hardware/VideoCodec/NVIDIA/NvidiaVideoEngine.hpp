@@ -21,6 +21,7 @@
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Utility/FixedString.hpp"
 
 namespace hardware {
 
@@ -45,9 +46,22 @@ class NvidiaVideoEngine final : public SoftwareVideoCodec {
       if (status_.architecture != gpu_.architecture) gpu_ = nvidia_gpu_info_for(status_.architecture);
       if (!status_.has_nvenc) gpu_.has_nvenc = gpu_.media_av1_encode = false;
     }
+    summary_.assign(gpu_.name);
+    if (status_.probed) {
+      summary_.append(", chip ");
+      summary_.append(status_.chip ? status_.chip : "(unnamed)");
+      summary_.append(" rev ");
+      if (status_.stepping_major >= 0xA) summary_.push_back(static_cast<char>('A' + (status_.stepping_major - 0xA)));
+      else summary_.append_uint(status_.stepping_major);
+      summary_.append_uint(status_.stepping_minor);
+      summary_.append(status_.has_nvenc ? ", NVDEC+NVENC" : ", NVDEC only");
+    } else {
+      summary_.append(", chip ID not read");
+    }
     return true;
   }
   const NvidiaChipStatus& chip_status() const { return status_; }
+  const char* engine_summary() const override { return summary_.c_str(); }
 
   const char* name() const override { return "NVIDIA video engine (NVDEC/NVENC) (software path)"; }
   const NvidiaGpuInfo& gpu() const { return gpu_; }
@@ -70,6 +84,7 @@ class NvidiaVideoEngine final : public SoftwareVideoCodec {
   NvidiaGpuInfo gpu_;
   MmioRegion registers_;
   NvidiaChipStatus status_;
+  FixedString<120> summary_;
 };
 
 }  // namespace hardware

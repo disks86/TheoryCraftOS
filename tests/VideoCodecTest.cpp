@@ -483,6 +483,7 @@ static void test_system_list() {
     CHECK(system.count() == 2);   // the NVIDIA engine and the software codec
     CHECK(system.at(0)->info().hardware_engine && !system.at(0)->info().accelerated && strstr(system.at(0)->name(), "NVIDIA"));
     CHECK(!system.at(1)->info().hardware_engine && strcmp(system.at(1)->name(), "Software video codec") == 0);
+    CHECK(system.at(1)->engine_summary()[0] == 0 && strstr(system.at(0)->engine_summary(), "chip ID not read"));   // no mapper: nothing was read
     CHECK(system.at(2) == nullptr);
     CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1)));
     DecoderConfig dc;
@@ -1315,6 +1316,7 @@ static void test_intel_media_engine() {
   CHECK(engine.can_decode(VideoCodec::H264));  // sessions still run in software
   IntelMediaVideoEngine blind(heap, 0x9A49);   // no registers: nothing is read
   CHECK(blind.initialize() && !blind.engine_status().probed);
+  CHECK(strstr(engine.engine_summary(), "Xe-LP") && strstr(engine.engine_summary(), "video boxes:") && strstr(blind.engine_summary(), "not read"));
   IntelMediaVideoEngine meteor(heap, 0x7D55, registers);  // media on a separate tile: not probed
   CHECK(meteor.initialize() && !meteor.engine_status().probed);
 }
@@ -1348,6 +1350,9 @@ static void test_nvidia_media_engine() {
   CHECK(a100.gpu().architecture == NvidiaGpuArchitecture::Ampere && a100.engine_encode_codecs() == 0 && (a100.engine_decode_codecs() & av1));
   CHECK(plain.gpu().architecture == NvidiaGpuArchitecture::Pascal && plain.engine_encode_codecs() & hevc && plain.chip_status().chip && plain.chip_status().stepping_major == 1);
   CHECK(pascal.initialize() && pascal.info().hardware_engine && !pascal.info().accelerated);
+  CHECK(strstr(plain.engine_summary(), "GP104") && strstr(plain.engine_summary(), "rev 11"));
+  CHECK(strstr(a100.engine_summary(), "GA100") && strstr(a100.engine_summary(), "NVDEC only") && strstr(plain.engine_summary(), "NVDEC+NVENC"));
+  CHECK(strstr(no_chip.engine_summary(), "chip ID not read") && strstr(by_chip.engine_summary(), "GB202") && strstr(by_chip.engine_summary(), "rev A1"));
 }
 
 // A pretend end of video memory holding an IP discovery table (RDNA 3: graphics 11.0.0 and one VCN 4.0.0), the way the amdgpu driver documents it.
@@ -1385,6 +1390,9 @@ static void test_amd_discovery_engine() {
   CHECK(no_window.initialize() && !no_window.engine_status().probed && no_window.engine_status().vcn_count() == 0);
   CHECK(vega.initialize() && !vega.engine_status().probed);   // Vega has no table: nothing is read
   CHECK(navi31.info().hardware_engine && !navi31.info().accelerated && a.live == 0);
+  // The boot-log line: the generation, the video engine the table lists, and what to say when nothing was read.
+  CHECK(strstr(navi31.engine_summary(), "RDNA 3") && strstr(navi31.engine_summary(), "VCN 4.0.0 x1") && strstr(navi31.engine_summary(), "graphics 11.0"));
+  CHECK(strstr(no_window.engine_summary(), "not read") && strstr(vega.engine_summary(), "Vega") && strstr(vega.engine_summary(), "not read"));
 }
 
 static void test_amd_media_engine() {
