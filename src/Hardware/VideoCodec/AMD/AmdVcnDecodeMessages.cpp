@@ -867,5 +867,69 @@ bool prepare_mpeg2_feedback(ByteView buffer) {
   return true;
 }
 
+// VC-1 --------------------------------------------------------------------------------------------------------------------------------------------------------
+
+uint32_t vc1_decode_message_bytes() { return kAvcOffset + kVc1_sizeof; }
+
+Vc1BufferSizes vc1_buffer_sizes(uint32_t width, uint32_t height) {
+  Vc1BufferSizes sizes;
+  if (!size_ok(width, height)) return sizes;
+  // Mesa's calc_dpb_size: the picture aligned to a macroblock, its width then to 32, with half again for the chroma, a multiple of 1024 bytes, five of them (at least),
+  // then the firmware's context area (128 bytes a macroblock), the intra transform line (64 a macroblock column), the deblocking line (128) and the bit plane line.
+  const uint64_t width16 = align_up(width, 16), height16 = align_up(height, 16);
+  const uint64_t luma = align_up(width16, 32) * height16;
+  const uint64_t image = align_up(luma + luma / 2, 1024);
+  const uint64_t width_mb = width16 / 16, height_mb = align_up(height16 / 16, 2);
+  sizes.references = kVc1References;
+  sizes.dpb = image * kVc1References + width_mb * height_mb * 128 + width_mb * 64 + width_mb * 128 + align_up((width_mb > height_mb ? width_mb : height_mb) * 7 * 16, 64);
+  return sizes;
+}
+
+bool build_vc1_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const vc1::OffloadPicture& picture, const Vc1Slots& slots, const DecodeBuffers& b) {
+  if (!picture.seq || !picture.pic) return false;
+  const vc1::SequenceHeader& seq = *picture.seq;
+  if (seq.mb_width <= 0 || seq.mb_height <= 0 || seq.interlace) return false;
+  if (seq.profile != vc1::kSimple && seq.profile != vc1::kMain && seq.profile != vc1::kAdvanced) return false;
+  if (slots.current >= kVc1References || slots.forward >= kVc1References || slots.backward >= kVc1References) return false;
+  const uint32_t width = static_cast<uint32_t>(seq.mb_width) * kMacroblock, height = static_cast<uint32_t>(seq.mb_height) * kMacroblock;
+  if (!size_ok(width, height) || !build_common_decode(out, vc1_decode_message_bytes(), stream_handle, feedback_number, kStreamTypeVc1, kMessageVc1, kVc1_sizeof, width, height, b)) return false;
+  Image m(out);
+  const bool advanced = seq.profile == vc1::kAdvanced, simple = seq.profile == vc1::kSimple;
+  // The size is in macroblocks for the Simple and Main profiles, in samples for the Advanced one (Mesa).
+  if (!advanced) {
+    m.u32(kDecodeOffset + kDecode_width_in_samples, width / kMacroblock);
+    m.u32(kDecodeOffset + kDecode_height_in_samples, height / kMacroblock);
+  }
+  const uint32_t h = kAvcOffset;
+  m.u32(h + kVc1_profile, advanced ? 2 : (simple ? 0 : 1));
+  m.u32(h + kVc1_level, advanced ? 4 : (simple ? 1 : 2));
+  auto bit = [](bool v, uint32_t shift) { return v ? (1u << shift) : 0u; };
+  m.u32(h + kVc1_sps_info_flags, bit(seq.postprocflag, 7) | bit(seq.broadcast, 6) | bit(seq.interlace, 5) | bit(seq.tfcntrflag, 4) | bit(seq.finterpflag, 3) | bit(seq.psf, 1));
+  uint32_t pps = bit(seq.range_mapy_flag, 31) | bit(seq.range_mapuv_flag, 27) | bit(seq.multires, 21) | (static_cast<uint32_t>(seq.max_b_frames & 7) << 16) | bit(seq.overlap, 11) |
+                 (static_cast<uint32_t>(seq.quantizer_mode & 3) << 9) | bit(seq.panscanflag, 7) | bit(seq.refdist_flag, 6) | bit(seq.vstransform, 0);
+  if (!simple)
+    pps |= bit(seq.resync_marker, 20) | bit(seq.rangered, 19) | bit(seq.loop_filter, 5) | bit(seq.fastuvmc, 4) | bit(seq.extended_mv, 3) | bit(seq.extended_dmv, 8) |
+           (static_cast<uint32_t>(seq.dquant & 3) << 1);
+  m.u32(h + kVc1_pps_info_flags, pps);
+  m.u32(h + kVc1_pic_structure, 0);   // (a progressive frame)
+  m.u32(h + kVc1_chroma_format, 1);
+  m.u16(h + kVc1_decoded_pic_idx, static_cast<uint16_t>(slots.current));
+  m.u16(h + kVc1_deblocked_pic_idx, static_cast<uint16_t>(slots.current));   // (the in-loop filter works in place)
+  m.u16(h + kVc1_forward_ref_idx, static_cast<uint16_t>(slots.forward));
+  m.u16(h + kVc1_backward_ref_idx, static_cast<uint16_t>(slots.backward));
+  m.u32(h + kVc1_cached_frame_flag, 0);
+  return true;
+}
+
+bool prepare_vc1_feedback(ByteView buffer) {
+  if (buffer.size() < kMessageFeedbackItBytes) return false;
+  Image m(buffer);
+  m.zero(kFeedbackOffset, kFeedbackBytes);
+  m.u32(kFeedbackOffset + kFeedback_header_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_total_size, kFeedback_sizeof);
+  m.u32(kFeedbackOffset + kFeedback_num_buffers, 0);
+  return true;
+}
+
 }  // namespace amd_vcn
 }  // namespace hardware

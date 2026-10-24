@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/Software/H264Encoder.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
 #include "Hardware/VideoCodec/Software/Mpeg2.hpp"
+#include "Hardware/VideoCodec/Software/Vc1.hpp"
 #include "Hardware/VideoCodec/Software/Jpeg.hpp"
 #include "Hardware/VideoCodec/Software/Av1.hpp"
 #include "Hardware/VideoCodec/Software/Vp8.hpp"
@@ -260,6 +261,53 @@ class Mpeg2Adapter final : public IVideoDecoder {
  private:
   DecoderConfig config_;
   Mpeg2Decoder dec_;
+  VideoFrameBuffer out_;
+  VideoCodecStatistics stats_;
+};
+
+// Decodes VC-1: a packet is one frame (Simple and Main profile: as a Windows Media track stores it, with the sequence header as the codec configuration; Advanced
+// profile: with its start codes). Pictures come out in display order, a few packets late.
+class Vc1Adapter final : public IVideoDecoder {
+ public:
+  Vc1Adapter(allocators::IAllocator& allocator, const DecoderConfig& config) : config_(config), dec_(allocator), out_(allocator) {}
+
+  bool prepare() { return config_.codec_config.empty() || dec_.configure(config_.codec_config, config_.width, config_.height); }
+
+  VideoCodec codec() const override { return VideoCodec::Vc1; }
+  SubmitResult submit(const VideoPacket& packet) override {
+    if (dec_.ready()) return SubmitResult::Full;
+    if (!dec_.decode(packet.data, packet.pts_us)) {
+      ++stats_.errors;
+      return SubmitResult::Invalid;
+    }
+    ++stats_.packets;
+    stats_.bytes += packet.data.size();
+    return SubmitResult::Accepted;
+  }
+  bool receive(VideoFrame* frame) override {
+    VideoFrame in;
+    if (!dec_.receive(&in)) return false;
+    if (!out_.allocate({in.format.width, in.format.height, config_.output}) || !convert_frame(in, out_)) {
+      ++stats_.errors;
+      return false;
+    }
+    *frame = out_.frame(in.pts_us, in.keyframe);
+    frame->limited_range = in.limited_range && config_.output != PixelFormat::Bgra8888;
+    ++stats_.frames;
+    return true;
+  }
+  void flush() override { dec_.flush(); }
+  void reset() override { dec_.reset(); }
+  VideoFormat output_format() const override {
+    VideoFormat f = dec_.output_format();
+    f.pixel_format = config_.output;
+    return f;
+  }
+  VideoCodecStatistics statistics() const override { return stats_; }
+
+ private:
+  DecoderConfig config_;
+  Vc1Decoder dec_;
   VideoFrameBuffer out_;
   VideoCodecStatistics stats_;
 };
@@ -557,6 +605,11 @@ UniquePointer<IVideoDecoder> SoftwareVideoCodec::create_decoder(const DecoderCon
   if (config.codec == VideoCodec::Mpeg2) {
     UniquePointer<Mpeg2Adapter> mpeg2 = UniquePointer<Mpeg2Adapter>::make(allocator_, allocator_, config);
     if (mpeg2 && mpeg2->prepare()) return UniquePointer<IVideoDecoder>(util::move(mpeg2));
+    return UniquePointer<IVideoDecoder>();
+  }
+  if (config.codec == VideoCodec::Vc1) {
+    UniquePointer<Vc1Adapter> vc1 = UniquePointer<Vc1Adapter>::make(allocator_, allocator_, config);
+    if (vc1 && vc1->prepare()) return UniquePointer<IVideoDecoder>(util::move(vc1));
     return UniquePointer<IVideoDecoder>();
   }
   if (config.codec == VideoCodec::Vp8) return UniquePointer<IVideoDecoder>(UniquePointer<Vp8Adapter>::make(allocator_, allocator_, config));
