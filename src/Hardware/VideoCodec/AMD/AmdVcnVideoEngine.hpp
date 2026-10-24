@@ -20,6 +20,7 @@
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.hpp"
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdMediaEngineHw.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Utility/FixedString.hpp"
 
@@ -36,7 +37,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   // `gpu_device_id` is the PCI device ID of the GPU the engine belongs to; it picks the generation's codec set (0 = unknown).
   // `discovery` is, for a card, the last 64 KiB of its video memory; for an APU, its memory BAR (see AmdMediaEngineHw); or an empty window to skip looking at the hardware.
   explicit AmdVcnVideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id = 0, const MmioRegion& discovery = MmioRegion())
-      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), gpu_(amd_gpu_identify(gpu_device_id)), discovery_(discovery) {}
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), device_id_(gpu_device_id), gpu_(amd_gpu_identify(gpu_device_id)), discovery_(discovery), firmware_(allocator) {}
 
   // A Radeon card's register BAR (BAR 5; at least AmdMmIndexVramReader::kRegisterWindow bytes), for reaching video memory the CPU-visible aperture does not cover,
   // and the size of that aperture (BAR 0). Call before initialize(); both are optional.
@@ -52,6 +53,45 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   }
   // The card's video memory (probe_video_memory, or the aperture when it was all of it), or the APU's carve-out; 0 when the table was not read.
   uint64_t gpu_memory_bytes() const override { return status_.video_memory_bytes ? status_.video_memory_bytes : status_.carve_out_bytes; }
+
+  // The PCI revision of the GPU (config space offset 8): which VCN 1.0 firmware file it needs depends on it. Call before load_firmware().
+  void set_pci_revision(uint8_t revision) { revision_ = revision; }
+
+  // VCN 1.0 (Ryzen 2000/3000 "Raven" APUs) runs on microcode the OS has to put into the engine's memory: this reads the right file from /firmware and checks it.
+  // It does not start the engine - that needs the GPU's memory controller set up and a way to hand the microcode to the card, which this OS does not have.
+  // Other generations have no firmware file here yet (firmware_status() stays empty).
+  bool load_firmware(filesystem::IFileSystem& file_system) override {
+    const char* name = amd_vcn1_firmware_name(device_id_, revision_);
+    if (!name) return false;
+    firmware_name_ = name;
+    firmware_state_ = firmware_.load(file_system, name);
+    firmware_text_.assign(name);
+    firmware_text_.append(": ");
+    if (firmware_state_ == AmdFirmwareStatus::Ok) {
+      const AmdVcnFirmwareVersion v = firmware_.version();
+      firmware_text_.append("ENC ");
+      firmware_text_.append_uint(v.enc_major);
+      firmware_text_.append(".");
+      firmware_text_.append_uint(v.enc_minor);
+      firmware_text_.append(" DEC ");
+      firmware_text_.append_uint(v.dec);
+      firmware_text_.append(" revision ");
+      firmware_text_.append_uint(v.revision);
+      firmware_text_.append(", ");
+      firmware_text_.append_uint(firmware_.ucode().size());
+      firmware_text_.append(" bytes of microcode loaded, engine not started");
+    } else {
+      firmware_text_.append(amd_firmware_status_name(firmware_state_));
+      firmware_text_.append(" (expected /firmware/");
+      firmware_text_.append(name);
+      firmware_text_.append(")");
+    }
+    refresh_summary();
+    return firmware_state_ == AmdFirmwareStatus::Ok;
+  }
+  const char* firmware_status() const override { return firmware_text_.c_str(); }
+  const AmdVcnFirmware& firmware() const { return firmware_; }
+  AmdFirmwareStatus firmware_state() const { return firmware_state_; }
 
   // Reads the GPU's IP discovery table (when given a window and the generation has one). Always succeeds: the engine is there either way.
   bool initialize() override {
@@ -69,6 +109,25 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     } else {
       status_ = AmdMediaEngineHw::probe_aperture(allocator_, discovery_, gpu_.architecture);
     }
+    refresh_summary();
+    return true;
+  }
+  const AmdMediaEngineStatus& engine_status() const { return status_; }
+  const char* engine_summary() const override { return summary_.c_str(); }
+
+  const char* name() const override { return "AMD video engine (VCN) (software path)"; }
+  const AmdGpuInfo& gpu() const { return gpu_; }
+  // Codecs the engine would serve once it is driven: today's sessions all run in software (info().accelerated is false).
+  uint32_t engine_decode_codecs() const {
+    return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0) |
+           (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0);
+  }
+  uint32_t engine_encode_codecs() const {
+    return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_av1_encode ? codec_mask(VideoCodec::Av1) : 0);
+  }
+
+ private:
+  void refresh_summary() {
     summary_.assign(gpu_.name);
     if (status_.probed) {
       const AmdIpDiscoveryInfo& d = status_.discovery;
@@ -102,44 +161,39 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
         }
       }
     } else {
-      summary_.append(", IP discovery table not read");
+      if (AmdMediaEngineHw::supported(gpu_.architecture)) summary_.append(", IP discovery table not read");   // (Vega and older have none)
       if (gpu_.discrete && memory_bar_) {
         summary_.append(", memory aperture ");
         summary_.append_uint(memory_bar_ >> 20);
         summary_.append(" MiB");
       }
     }
-    return true;
-  }
-  const AmdMediaEngineStatus& engine_status() const { return status_; }
-  const char* engine_summary() const override { return summary_.c_str(); }
-
-  const char* name() const override { return "AMD video engine (VCN) (software path)"; }
-  const AmdGpuInfo& gpu() const { return gpu_; }
-  // Codecs the engine would serve once it is driven: today's sessions all run in software (info().accelerated is false).
-  uint32_t engine_decode_codecs() const {
-    return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0) |
-           (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0);
-  }
-  uint32_t engine_encode_codecs() const {
-    return base_codecs() | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) | (gpu_.media_av1_encode ? codec_mask(VideoCodec::Av1) : 0);
+    if (!firmware_text_.empty()) {
+      summary_.append(", firmware ");
+      summary_.append(firmware_text_.view());
+    }
   }
 
- private:
   // H.264 and JPEG are on every generation that has a video engine at all.
   uint32_t base_codecs() const {
     return amd_gpu_has_video_engine(gpu_.architecture) ? codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Mjpeg) : 0;
   }
 
   allocators::IAllocator& allocator_;
+  uint16_t device_id_ = 0;
+  uint8_t revision_ = 0;
   AmdGpuInfo gpu_;
   MmioRegion discovery_;
+  AmdVcnFirmware firmware_;
+  AmdFirmwareStatus firmware_state_ = AmdFirmwareStatus::NotApplicable;
+  const char* firmware_name_ = nullptr;
+  FixedString<160> firmware_text_;
   MmioRegion registers_;
   uint64_t memory_bar_ = 0;
   PciAddress address_{};
   bool has_address_ = false;
   AmdMediaEngineStatus status_;
-  FixedString<120> summary_;
+  FixedString<200> summary_;
 };
 
 }  // namespace hardware

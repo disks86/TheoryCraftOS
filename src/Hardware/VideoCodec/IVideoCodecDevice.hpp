@@ -23,6 +23,8 @@
 #include "Hardware/VideoCodec/IVideoEncoder.hpp"
 #include "Utility/UniquePointer.hpp"
 
+namespace filesystem { class IFileSystem; }
+
 namespace hardware {
 
 struct VideoCodecInfo {
@@ -56,6 +58,11 @@ class IVideoCodecDevice : public IHardware {
   // The GPU this engine belongs to, and how much video memory the probe of its hardware found it has (0 = not found). main hands the size to the display
   // device of the same PCI function, so the computer manager shows the card's memory and not just the framebuffer the firmware set up.
   virtual bool gpu_location(PciAddress* out) const { (void)out; return false; }
+  // Microcode the engine needs from "/firmware" on the OS file system, read once the file system is mounted (it is not yet when the devices are made).
+  // Returns true if it is now loaded; firmware_status() says what happened ("" when this device needs none). Nothing is started: loading is reading the
+  // file and checking it.
+  virtual bool load_firmware(filesystem::IFileSystem& file_system) { (void)file_system; return false; }
+  virtual const char* firmware_status() const { return ""; }
   virtual uint64_t gpu_memory_bytes() const { return 0; }
 
  protected:

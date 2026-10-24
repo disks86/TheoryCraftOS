@@ -876,6 +876,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     network::FtpFileSystem ftps(smb_network, shared_allocator, ftp_environment);
     PasswordLoginContext<network::FtpFileSystem> ftps_login{&ftps};
     SystemFileSystem explorer_files(shared_allocator, storage);
+    // Microcode the video engines need, from /firmware on the root volume (AMD VCN 1: Ryzen 2000/3000 "Raven" APUs). Only read and checked here; no engine is
+    // started with it yet.
+    for (uint32_t i = 0; i < video_codecs.count(); ++i) {
+      hardware::IVideoCodecDevice& firmware_device = *video_codecs.at(i);
+      const bool loaded = firmware_device.load_firmware(explorer_files.file_system());
+      if (firmware_device.firmware_status()[0]) Entry(loaded ? Level::Ok : Level::Warning, "Firmware").text(firmware_device.name()).text(": ").text(firmware_device.firmware_status());
+    }
     // The system database: one file on the root volume (/databases/system.db) where the OS and its programs keep their settings; the database query
     // window can open it too (system://localhost/system). Without a writable root volume it lives in memory for this session.
     database::local::LocalDatabase system_database(shared_allocator, &explorer_files.file_system(), "/databases/system.db");

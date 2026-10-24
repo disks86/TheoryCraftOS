@@ -101,6 +101,7 @@ void SystemVideoCodecs::add_amd(const PciDeviceInfo& d) {
   UniquePointer<AmdVcnVideoEngine> device = UniquePointer<AmdVcnVideoEngine>::make(allocator_, allocator_, d.device_id, window);
   if (!device) return;
   device->set_pci_address(d.address);
+  device->set_pci_revision(static_cast<uint8_t>(pci_.read32(d.address, 0x08) & 0xFF));   // config space offset 8: revision ID
   if (device->gpu().discrete && AmdMediaEngineHw::supported(device->gpu().architecture)) {
     device->set_memory_bar(bar_size);
     device->set_registers(amd_registers(d));

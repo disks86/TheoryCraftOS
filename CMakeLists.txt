@@ -481,6 +481,7 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/ColorConvert.cpp
   src/Hardware/VideoCodec/SystemVideoCodecs.cpp
   src/Hardware/VideoCodec/AMD/AmdIpDiscovery.cpp
+  src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
   src/Hardware/VideoCodec/AMD/AmdMediaEngineHw.cpp
   src/Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.cpp
   src/Hardware/VideoCodec/Intel/IntelMediaEngineHw.cpp
@@ -589,6 +590,8 @@ set(ESP_DIR ${CMAKE_BINARY_DIR}/esp)
 add_custom_target(esp ALL
   COMMAND ${CMAKE_COMMAND} -E make_directory ${ESP_DIR}/EFI/BOOT
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:BOOTX64> ${ESP_DIR}/EFI/BOOT/BOOTX64.EFI
+  # Microcode the OS loads from /firmware (see firmware/README.md; AMD's license files travel with it)
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/firmware ${ESP_DIR}/firmware
   DEPENDS BOOTX64
   COMMENT "Assembling ESP directory"
 )

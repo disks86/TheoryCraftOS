@@ -1513,6 +1513,89 @@ static void test_amd_system_window() {
   }
 }
 
+// A file system that has only the shipped firmware images: "/firmware/<name>" is read from firmware/<name> of the repository (the tests run from its root).
+struct HostFirmwareFile final : filesystem::IFile {
+  std::vector<uint8_t> bytes;
+  uint64_t size() const override { return bytes.size(); }
+  filesystem::Status read(uint64_t offset, ByteView buffer, uint64_t* transferred) override {
+    const uint64_t n = offset >= bytes.size() ? 0 : (buffer.size() < bytes.size() - offset ? buffer.size() : bytes.size() - offset);
+    for (uint64_t i = 0; i < n; ++i) buffer[i] = bytes[offset + i];
+    *transferred = n;
+    return filesystem::Status::Ok;
+  }
+  filesystem::Status write(uint64_t, ConstByteView, uint64_t*) override { return filesystem::Status::ReadOnly; }
+  filesystem::Status resize(uint64_t) override { return filesystem::Status::ReadOnly; }
+  filesystem::Status flush() override { return filesystem::Status::Ok; }
+};
+
+struct HostFirmwareFileSystem final : filesystem::IFileSystem {
+  TestAllocator& allocator;
+  int opened = 0;
+  bool empty = false;   // a volume with no firmware folder
+  explicit HostFirmwareFileSystem(TestAllocator& a) : allocator(a) {}
+  filesystem::FileSystemInfo info() const override { return {}; }
+  filesystem::Status open_file(StringView path, filesystem::OpenMode, UniquePointer<filesystem::IFile>* file) override {
+    constexpr char kPrefix[] = "/firmware/";
+    if (empty) return filesystem::Status::NotFound;
+    if (path.size() <= sizeof(kPrefix) - 1 || strncmp(path.data(), kPrefix, sizeof(kPrefix) - 1) != 0) return filesystem::Status::NotFound;
+    char host[160];
+    snprintf(host, sizeof host, "firmware/%.*s", static_cast<int>(path.size() - (sizeof(kPrefix) - 1)), path.data() + sizeof(kPrefix) - 1);
+    FILE* f = fopen(host, "rb");
+    if (!f) return filesystem::Status::NotFound;
+    UniquePointer<HostFirmwareFile> made = UniquePointer<HostFirmwareFile>::make(allocator);
+    uint8_t chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) made->bytes.insert(made->bytes.end(), chunk, chunk + n);
+    fclose(f);
+    ++opened;
+    *file = UniquePointer<filesystem::IFile>(util::move(made));
+    return filesystem::Status::Ok;
+  }
+  filesystem::Status open_directory(StringView, UniquePointer<filesystem::IDirectory>*) override { return filesystem::Status::Unsupported; }
+  filesystem::Status stat(StringView, filesystem::DirectoryEntry*) override { return filesystem::Status::Unsupported; }
+  filesystem::Status create_directory(StringView) override { return filesystem::Status::ReadOnly; }
+  filesystem::Status remove(StringView) override { return filesystem::Status::ReadOnly; }
+  filesystem::Status rename(StringView, StringView) override { return filesystem::Status::ReadOnly; }
+  filesystem::Status flush() override { return filesystem::Status::Ok; }
+};
+
+// Raven-family APUs read their VCN 1.0 microcode from /firmware; nothing else does yet.
+static void test_amd_vcn_firmware() {
+  TestAllocator a;
+  {
+    HostFirmwareFileSystem fs(a);
+    AmdVcnVideoEngine raven(a, 0x15DD), picasso(a, 0x15D8), raven2(a, 0x15DD), renoir(a, 0x1636), navi(a, 0x744C);
+    raven.set_pci_revision(0x00); picasso.set_pci_revision(0x00); raven2.set_pci_revision(0xC8);
+    CHECK(raven.initialize() && picasso.initialize() && raven2.initialize() && renoir.initialize() && navi.initialize());
+    CHECK(raven.firmware_status()[0] == 0);   // nothing to say before the file system exists
+    CHECK(raven.load_firmware(fs) && picasso.load_firmware(fs) && raven2.load_firmware(fs));
+    CHECK(raven.firmware_state() == AmdFirmwareStatus::Ok && raven.firmware().loaded() && raven.firmware().header().ip_version_major == 1);
+    CHECK(strstr(raven.firmware_status(), "raven_vcn.bin") && strstr(raven.firmware_status(), "ENC 1.15 DEC 3 revision 9") && strstr(raven.firmware_status(), "engine not started"));
+    CHECK(strstr(picasso.firmware_status(), "picasso_vcn.bin") && strstr(raven2.firmware_status(), "raven2_vcn.bin"));
+    CHECK(strstr(raven.engine_summary(), "firmware raven_vcn.bin") && !strstr(raven.engine_summary(), "not read"));   // the boot-log line carries it
+    CHECK(raven.firmware().ucode().size() == raven.firmware().header().ucode_size_bytes && raven.firmware().ucode().size() > 300000);
+    // Generations with no VCN 1.0 file say nothing and are not asked to load anything.
+    const int before = fs.opened;
+    CHECK(!renoir.load_firmware(fs) && !navi.load_firmware(fs) && renoir.firmware_status()[0] == 0 && navi.firmware_status()[0] == 0 && fs.opened == before);
+    CHECK(renoir.firmware_state() == AmdFirmwareStatus::NotApplicable);
+    // The software codecs and their reported hardware do not change.
+    CHECK(raven.info().hardware_engine && !raven.info().accelerated);
+  }
+  {
+    // A volume without the folder: the engine says what it expected, loads nothing, and stays a software codec.
+    HostFirmwareFileSystem none(a);
+    none.empty = true;
+    AmdVcnVideoEngine raven(a, 0x15DD);
+    CHECK(raven.initialize() && !raven.load_firmware(none) && !raven.firmware().loaded() && raven.firmware_state() == AmdFirmwareStatus::NotFound);
+    CHECK(strstr(raven.firmware_status(), "not found") && strstr(raven.firmware_status(), "/firmware/raven_vcn.bin") && raven.firmware().ucode().empty());
+    CHECK(strstr(raven.engine_summary(), "firmware raven_vcn.bin: not found") && raven.info().hardware_engine && !raven.info().accelerated);
+    // Asking again after the file appears works (the volume was mounted late).
+    HostFirmwareFileSystem later(a);
+    CHECK(raven.load_firmware(later) && raven.firmware().loaded() && strstr(raven.engine_summary(), "microcode loaded"));
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_amd_discovery_engine() {
   TestAllocator a;
   std::vector<uint32_t> vram = amd_fake_vram();
@@ -1536,7 +1619,7 @@ static void test_amd_discovery_engine() {
   CHECK(navi31.info().hardware_engine && !navi31.info().accelerated && a.live == 0);
   // The boot-log line: the generation, the video engine the table lists, and what to say when nothing was read.
   CHECK(strstr(navi31.engine_summary(), "RDNA 3") && strstr(navi31.engine_summary(), "VCN 4.0.0 x1") && strstr(navi31.engine_summary(), "graphics 11.0"));
-  CHECK(strstr(no_window.engine_summary(), "not read") && strstr(vega.engine_summary(), "Vega") && strstr(vega.engine_summary(), "not read"));
+  CHECK(strstr(no_window.engine_summary(), "not read") && strstr(vega.engine_summary(), "Vega") && !strstr(vega.engine_summary(), "not read"));   // (no table to be missing)
 }
 
 static void test_amd_media_engine() {
@@ -1563,6 +1646,7 @@ int main() {
   test_intel_media_engine();
   test_intel_arc_engine();
   test_amd_media_engine();
+  test_amd_vcn_firmware();
   test_amd_discovery_engine();
   test_amd_system_window();
   test_amd_card_memory();
