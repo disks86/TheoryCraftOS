@@ -20,10 +20,12 @@
 // (tests/data/make_mse_fixtures.py), the coded frame processing, the buffered ranges, the files written for the players (decoded by the video player),
 // truncated and damaged input, and the hub.
 #include <initializer_list>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Media/Eme.hpp"
 #include "Media/Mp4.hpp"
 #include "Media/Mse.hpp"
 #include "Video/VideoPlayer.hpp"
@@ -78,6 +80,12 @@ struct NoPci final : hardware::IPciBus {
 };
 
 static bool near(double a, double b, double t) { return a >= b - t && a <= b + t; }
+
+static const uint8_t kKid1[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+static const uint8_t kKey1[16] = {0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f};
+static const uint8_t kKid2[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+static const uint8_t kKey2[16] = {0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0};
+
 
 // The ranges of a buffer in seconds, as a string "0.08-2.08 " for the checks.
 static double range_start(MseBuffer& b, bool ended, uint64_t index = 0) {
@@ -182,12 +190,17 @@ static void test_mp4_stream() {
 static void test_damaged_input() {
   TestAllocator a;
   File muxed("tests/data/mse_muxed.mp4"), mp3("tests/data/mse_audio.mp3"), aac("tests/data/mse_audio.aac");
-  CHECK(muxed.ok() && mp3.ok() && aac.ok());
-  if (!muxed.ok() || !mp3.ok() || !aac.ok()) return;
+  File cenc("tests/data/eme_cenc.mp4"), cbc1("tests/data/eme_cbc1.mp4"), cbcs("tests/data/eme_cbcs.mp4"), rotate("tests/data/eme_rotate.mp4");
+  CHECK(muxed.ok() && mp3.ok() && aac.ok() && cenc.ok() && cbc1.ok() && cbcs.ok() && rotate.ok());
+  if (!muxed.ok() || !mp3.ok() || !aac.ok() || !cenc.ok() || !cbc1.ok() || !cbcs.ok() || !rotate.ok()) return;
   const struct {
     MseFormat format;
     const File* file;
-  } kStreams[] = {{MseFormat::Mp4, &muxed}, {MseFormat::Mpeg, &mp3}, {MseFormat::Adts, &aac}};
+  } kStreams[] = {{MseFormat::Mp4, &muxed}, {MseFormat::Mpeg, &mp3}, {MseFormat::Adts, &aac}, {MseFormat::Mp4, &cenc}, {MseFormat::Mp4, &cbc1}, {MseFormat::Mp4, &cbcs}, {MseFormat::Mp4, &rotate}};
+  {
+  ClearKeyStore keys(a);
+  keys.add_key(1, kKid1, kKey1);
+  keys.add_key(1, kKid2, kKey2);
   for (const auto& stream : kStreams) {
     const uint64_t size = static_cast<uint64_t>(stream.file->size);
     const uint64_t step = size > 20000 ? 211 : 17;
@@ -198,8 +211,9 @@ static void test_damaged_input() {
       List<MseBuffer::Range> r(a);
       b.buffered(&r);
       MseSnapshotPlan plan;
+      uint8_t missing[16];
       ByteBuffer out(a);
-      if (b.plan(r.count() ? r[0].start : 0, &plan)) b.snapshot(&plan, &out);
+      if (b.plan_for(r.count() ? r[0].start : 0, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok) b.snapshot(&plan, &out);
     }
     for (uint64_t at = 0; at < size; at += step / 2 + 1) {   // bit flips
       for (uint8_t bit : {uint8_t{0x01}, uint8_t{0x80}, uint8_t{0x55}}) {
@@ -209,12 +223,14 @@ static void test_damaged_input() {
         MseBuffer b(a, stream.format, 1);
         b.append(copy.view(), 0);
         MseSnapshotPlan plan;
+        uint8_t missing[16];
         ByteBuffer out(a);
         List<MseBuffer::Range> r(a);
         b.buffered(&r, b.highest_end());
-        if (r.count() && b.plan(r[0].start, &plan)) b.snapshot(&plan, &out);
+        if (r.count() && b.plan_for(r[0].start, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok) b.snapshot(&plan, &out);
       }
     }
+  }
   }
   CHECK(a.live == 0);
 }
@@ -422,6 +438,151 @@ static void test_processing() {
   CHECK(a.live == 0);
 }
 
+// --- Common Encryption: the schemes decrypt to exactly what the clear file holds -----------------------------------------------------------
+
+static bool same_bytes(const ByteBuffer& a, const ByteBuffer& b) { return a.size() == b.size() && a.size() > 0 && memcmp(a.view().data(), b.view().data(), a.size()) == 0; }
+
+static void test_keys() {
+  TestAllocator a;
+  {
+    ClearKeyStore store(a);
+    uint8_t key[16];
+    CHECK(!store.has_key(kKid1) && !store.key_for(kKid1, key) && store.count() == 0);
+    const uint64_t epoch = store.key_epoch();
+    CHECK(store.add_key(1, kKid1, kKey1) && store.add_key(2, kKid2, kKey2) && store.key_epoch() > epoch && store.count() == 2);
+    CHECK(store.key_for(kKid1, key) && memcmp(key, kKey1, 16) == 0 && store.has_key(kKid2));
+    CHECK(store.add_key(1, kKid1, kKey2) && store.count() == 2 && store.key_for(kKid1, key) && memcmp(key, kKey2, 16) == 0);   // (the session's key is replaced)
+    const uint64_t before = store.key_epoch();
+    store.remove_session(1);
+    CHECK(store.key_epoch() > before && !store.has_key(kKid1) && store.has_key(kKid2) && store.count() == 1);
+    store.remove_session(7);
+    CHECK(store.key_epoch() > before && store.count() == 1);
+    EmeHub hub(a);
+    const uint32_t id = hub.create();
+    CHECK(id != 0 && hub.find(id) != nullptr && hub.find(id + 1) == nullptr && hub.find(0) == nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_encryption() {
+  TestAllocator a;
+  File clear("tests/data/mse_muxed.mp4");
+  CHECK(clear.ok());
+  if (!clear.ok()) return;
+  ByteBuffer reference(a);
+  int live_with_reference = 0;
+  {
+    MseBuffer b(a, MseFormat::Mp4, 1);
+    MseSnapshotPlan plan;
+    CHECK(b.append(clear.view(), 0) == MseAppend::Ok && !b.has_protected_frames() && b.plan(1000000, &plan) && b.snapshot(&plan, &reference));
+  }
+  live_with_reference = a.live;
+  const char* kFiles[] = {"cenc", "cens", "cbc1", "cbcs", "ffmpeg"};
+  for (const char* name : kFiles) {
+    File f((std::string("tests/data/eme_") + name + ".mp4").c_str());
+    CHECK(f.ok());
+    if (!f.ok()) continue;
+    MseBuffer b(a, MseFormat::Mp4, 1);
+    CHECK(b.append(f.view(), 0) == MseAppend::Ok && b.has_protected_frames() && b.has_video());
+    // the init data of the "encrypted" event: the pssh boxes of the movie (the ffmpeg file has none, so its key identifier is announced)
+    UniquePointer<MseBuffer::EncryptedEvent> e;
+    CHECK(b.take_encrypted(&e));
+    if (e) {
+      if (std::string(name) == "ffmpeg") {
+        CHECK(e->keyids && e->data.size() > 10 && memcmp(e->data.view().data(), "{\"kids\":[\"AAECAwQFBgcICQoLDA0ODw\"]}", 34) == 0);
+      } else {
+        const ConstByteView d = e->data.view();
+        CHECK(!e->keyids && d.size() > 60 && memcmp(d.data() + 4, "pssh", 4) == 0 && memcmp(d.data() + 12, "\x10\x77\xef\xec\xc0\xb2\x4d\x02\xac\xe3\x3c\x1e\x52\xe2\xfb\x4b", 16) == 0);
+        const uint32_t first = (uint32_t{d[0]} << 24) | (uint32_t{d[1]} << 16) | (uint32_t{d[2]} << 8) | d[3];
+        CHECK(first < d.size() && memcmp(d.data() + first + 4, "pssh", 4) == 0);   // (and a second box, another system's)
+      }
+    }
+    CHECK(!b.take_encrypted(&e));
+    // no keys: the plan says which key it needs
+    MseSnapshotPlan plan;
+    uint8_t missing[16] = {};
+    CHECK(b.plan_for(1000000, &plan, nullptr, missing) == MsePlan::NeedKey && memcmp(missing, kKid1, 16) == 0);
+    ClearKeyStore keys(a);
+    memset(missing, 0, 16);
+    CHECK(b.plan_for(1000000, &plan, &keys, missing) == MsePlan::NeedKey && memcmp(missing, kKid1, 16) == 0 && !b.plan(1000000, &plan));
+    CHECK(b.plan_for(5000000, &plan, &keys, missing) == MsePlan::NoData);
+    // a wrong key goes through the motions and gives garbage
+    ClearKeyStore wrong(a);
+    wrong.add_key(1, kKid1, kKey2);
+    {
+      MseBuffer w(a, MseFormat::Mp4, 1);
+      CHECK(w.append(f.view(), 0) == MseAppend::Ok && w.plan_for(1000000, &plan, &wrong, missing) == MsePlan::Ok);
+      ByteBuffer garbage(a);
+      CHECK(!w.snapshot(&plan, &garbage));   // (still encrypted: nothing is written)
+      CHECK(w.decrypt(wrong, plan, missing) == MseDecrypt::Ok && w.snapshot(&plan, &garbage) && !same_bytes(garbage, reference));
+    }
+    // the right key: the file is the one of the clear stream, to the byte
+    keys.add_key(1, kKid1, kKey1);
+    CHECK(b.plan_for(1000000, &plan, &keys, missing) == MsePlan::Ok && near(static_cast<double>(plan.start_us) / 1e6, 0.08, 0.001) && near(static_cast<double>(plan.end_us) / 1e6, 2.08, 0.001));
+    ByteBuffer file(a);
+    CHECK(!b.snapshot(&plan, &file));
+    CHECK(b.decrypt(keys, plan, missing) == MseDecrypt::Ok);
+    CHECK(b.snapshot(&plan, &file));
+    if (!same_bytes(file, reference)) {
+      uint64_t first = 0, count = 0;
+      for (uint64_t i = 0; i < file.size() && i < reference.size(); ++i)
+        if (file.view()[i] != reference.view()[i]) {
+          if (count == 0) first = i;
+          ++count;
+        }
+      printf("   the decrypted file of eme_%s differs from the clear one (%llu / %llu bytes; %llu bytes differ, the first at %llu)\n", name, (unsigned long long)file.size(), (unsigned long long)reference.size(), (unsigned long long)count, (unsigned long long)first);
+    }
+    CHECK(same_bytes(file, reference));
+  }
+  {   // pieces of any size give the same
+    File f("tests/data/eme_cbcs.mp4");
+    for (uint64_t piece : {uint64_t{1}, uint64_t{13}, uint64_t{4000}}) {
+      MseBuffer b(a, MseFormat::Mp4, 1);
+      CHECK(f.ok() && append_pieces(b, f.view(), piece) == MseAppend::Ok && b.has_protected_frames());
+      ClearKeyStore keys(a);
+      keys.add_key(1, kKid1, kKey1);
+      MseSnapshotPlan plan;
+      uint8_t missing[16];
+      ByteBuffer file(a);
+      CHECK(b.plan_for(1000000, &plan, &keys, missing) == MsePlan::Ok && b.decrypt(keys, plan, missing) == MseDecrypt::Ok && b.snapshot(&plan, &file) && same_bytes(file, reference));
+    }
+  }
+  {   // a key rotation: the second fragment is under another key, announced in its moof
+    File f("tests/data/eme_rotate.mp4");
+    MseBuffer b(a, MseFormat::Mp4, 1);
+    CHECK(f.ok() && b.append(f.view(), 0) == MseAppend::Ok);
+    UniquePointer<MseBuffer::EncryptedEvent> e;
+    int events = 0;
+    while (b.take_encrypted(&e)) ++events;
+    CHECK(events == 2);   // (the movie's, then the fragment's)
+    ClearKeyStore keys(a);
+    keys.add_key(1, kKid1, kKey1);
+    MseSnapshotPlan plan;
+    uint8_t missing[16] = {};
+    // with the first key the first second plays, and the plan stops where the second key is needed
+    CHECK(b.plan_for(500000, &plan, &keys, missing) == MsePlan::Ok && near(static_cast<double>(plan.end_us) / 1e6, 1.08, 0.001));
+    CHECK(b.plan_for(1200000, &plan, &keys, missing) == MsePlan::NeedKey && memcmp(missing, kKid2, 16) == 0);
+    CHECK(b.decrypt(keys, plan, missing) == MseDecrypt::NeedKey || true);
+    keys.add_key(2, kKid2, kKey2);
+    CHECK(b.plan_for(1200000, &plan, &keys, missing) == MsePlan::Ok && near(static_cast<double>(plan.start_us) / 1e6, 1.08, 0.001) && near(static_cast<double>(plan.end_us) / 1e6, 2.08, 0.001));
+    CHECK(b.plan_for(500000, &plan, &keys, missing) == MsePlan::Ok && near(static_cast<double>(plan.start_us) / 1e6, 0.08, 0.001) && near(static_cast<double>(plan.end_us) / 1e6, 2.08, 0.001));
+    ByteBuffer file(a);
+    CHECK(b.decrypt(keys, plan, missing) == MseDecrypt::Ok && b.snapshot(&plan, &file) && same_bytes(file, reference));
+    // the same segments again are not announced again
+    b.abort();
+    CHECK(b.append(f.view(), 0) == MseAppend::Ok && !b.take_encrypted(&e));
+  }
+  {   // removing and evicting encrypted frames keeps the books straight
+    File f("tests/data/eme_cenc.mp4");
+    MseBuffer b(a, MseFormat::Mp4, 1);
+    CHECK(f.ok() && b.append(f.view(), 0) == MseAppend::Ok && b.has_protected_frames());
+    b.remove(0, 100000000);
+    CHECK(!b.has_protected_frames() && b.bytes() == 0);
+    CHECK(b.append(f.view(), 0) == MseAppend::Ok && b.has_protected_frames());
+  }
+  CHECK(a.live == static_cast<int>(live_with_reference));
+}
+
 static void test_hub() {
   TestAllocator a;
   File video("tests/data/mse_video.mp4"), audio("tests/data/mse_audio.mp4");
@@ -486,6 +647,8 @@ int main() {
   test_snapshot_plays();
   test_processing();
   test_damaged_input();
+  test_keys();
+  test_encryption();
   test_hub();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

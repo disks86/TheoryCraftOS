@@ -55,6 +55,9 @@ class MseClip final : public IVideoClip {
   uint32_t buffered(ArrayView<double> pairs) override;
   uint32_t seekable(ArrayView<double> pairs) override;
   uint8_t error() override { return error_; }
+  bool waiting_for_key() override { return need_key_; }
+  // The keys to decrypt with (null: none; encrypted content then waits).
+  void set_keys(const media::IMseKeys* keys) { keys_ = keys; }
 
  private:
   struct Child {
@@ -62,8 +65,9 @@ class MseClip final : public IVideoClip {
     uint32_t buffer = 0;
     int64_t base = 0, start = 0, end = 0;   // element time = file time + base; the range (element time) the file covers
     uint32_t generation = 0;
-    uint64_t epoch = 0, appended = 0;
+    uint64_t epoch = 0, appended = 0, key_epoch = 0;
     bool video = false;
+    bool started = false;   // play() was called on it (so it stopping means it ran to the end of its file)
   };
   static constexpr uint32_t kMaxChildren = media::MseHub::kMaxBuffersPerSource;
 
@@ -83,7 +87,11 @@ class MseClip final : public IVideoClip {
   Child children_[kMaxChildren];
   bool used_[kMaxChildren] = {};
   int64_t position_ = 0;
-  bool playing_ = false, stalled_ = false, muted_ = false;
+  bool playing_ = false, stalled_ = false, muted_ = false, need_key_ = false;
+  const media::IMseKeys* keys_ = nullptr;
+  uint64_t probe_signature_ = 0;
+  bool probe_result_ = false, probed_ = false;
+  bool blocked_on_key(media::MseSource* source);
   double volume_ = 1, rate_ = 1;
   uint8_t error_ = 0;
   uint32_t picture_serial_ = 0;

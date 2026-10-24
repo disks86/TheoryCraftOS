@@ -284,7 +284,7 @@ bool decode_data_url(allocators::IAllocator& allocator, StringView url, ByteBuff
 }
 
 PageObjects::PageObjects(allocators::IAllocator& allocator)
-    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator), mse_(allocator) {}
+    : allocator_(allocator), cache_(allocator), images_(allocator), videos_(allocator), canvases_(allocator), svgs_(allocator), events_(allocator), mse_(allocator), eme_(allocator) {}
 
 PageObjects::~PageObjects() {
   for (uint64_t i = 0; i < images_.count(); ++i) release_scaled(&images_[i]->scaled);
@@ -555,6 +555,7 @@ void PageObjects::attach_mse(VideoSlot& v, dom::Node* n, uint32_t source, String
     return;
   }
   v.mse_clip = clip.get();
+  if (media::ClearKeyStore* store = v.keys ? eme_.find(v.keys) : nullptr) clip->set_keys(store);
   v.mse_source = source;
   v.clip = util::move(clip);
   v.state = 1;
@@ -610,12 +611,18 @@ void PageObjects::watch_dynamic(VideoSlot& v) {
     }
     v.last_ready = ready;
   }
+  if (c.waiting_for_key()) {
+    if (!v.waiting_key_sent) queue(v.serial, "waitingforkey");
+    v.waiting_key_sent = true;
+  } else {
+    v.waiting_key_sent = false;
+  }
   double pairs[VideoState::kMaxRanges * 2];
   const uint32_t count = c.buffered(ArrayView<double>(pairs, VideoState::kMaxRanges * 2));
   double signature = static_cast<double>(count);
   for (uint32_t i = 0; i < count; ++i) signature += pairs[i * 2] * 3 + pairs[i * 2 + 1];
   if (signature != v.last_progress) {
-    if (v.last_progress >= 0) queue(v.serial, "progress");
+    if (count > 0) queue(v.serial, "progress");
     v.last_progress = signature;
   }
   ensure_picture(v);
@@ -1417,6 +1424,16 @@ void PageObjects::video_seek(uint32_t serial, double seconds) {
   // (kept inside what an int64_t of microseconds holds; seek_slot() clamps to the duration)
   if (seconds > 9e9) seconds = 9e9;
   seek_slot(*v, seconds < 0 ? 0 : static_cast<int64_t>(seconds * 1e6));
+}
+
+void PageObjects::video_set_keys(uint32_t serial, uint32_t keys) {
+  Lock lock(*this);
+  VideoSlot* v = ensure_video(serial);
+  if (!v) return;
+  v->keys = keys;
+  if (v->mse_clip) v->mse_clip->set_keys(keys ? eme_.find(keys) : nullptr);
+  v->waiting_key_sent = false;
+  dirty_ = true;
 }
 
 void PageObjects::video_set_volume(uint32_t serial, double volume) {

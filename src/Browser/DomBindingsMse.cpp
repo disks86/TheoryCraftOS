@@ -379,6 +379,91 @@ NATIVE(mse_source_error) {
   return true;
 }
 
+// --- Encrypted Media Extensions: the keys, and the init data of "encrypted" events -------------------------------------------------------------
+
+// A new key table for a MediaKeys object (its number, 0 if there are too many).
+NATIVE(eme_create_keys) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  PageObjects::Lock lock(objs(vm));
+  *result = num_value(objs(vm).eme().create());
+  return true;
+}
+
+// Gives a session's key to the table: (keys, session, key id, key); false if the identifier or the key is not 16 bytes.
+NATIVE(eme_add_key) {
+  (void)self;
+  ID(0, keys);
+  ID(1, session);
+  ArrayView<uint8_t> kid, key;
+  if (!typed_array_bytes(arg_at(args, argc, 2), &kid) || !typed_array_bytes(arg_at(args, argc, 3), &key)) return vm.throw_error(ErrorKind::TypeError, "The key and its identifier have to be byte arrays.");
+  PageObjects::Lock lock(objs(vm));
+  media::ClearKeyStore* store = objs(vm).eme().find(keys);
+  const bool added = store && kid.size() == 16 && key.size() == 16 && store->add_key(session, kid.data(), key.data());
+  *result = bool_value(added);
+  if (added) objs(vm).mark_dirty();
+  return true;
+}
+
+NATIVE(eme_remove_session) {
+  (void)self;
+  ID(0, keys);
+  ID(1, session);
+  PageObjects::Lock lock(objs(vm));
+  if (media::ClearKeyStore* store = objs(vm).eme().find(keys)) store->remove_session(session);
+  objs(vm).mark_dirty();
+  *result = Value();
+  return true;
+}
+
+// setMediaKeys(): the element decrypts with that table (0: with none).
+NATIVE(eme_set_keys) {
+  (void)self;
+  dom::Node* element = node_of(arg_at(args, argc, 0));
+  if (!element) return vm.throw_error(ErrorKind::TypeError, "The first argument is not an element.");
+  double id = 0;
+  if (!number_arg(vm, args, argc, 1, &id)) return false;
+  PageObjects::Lock lock(objs(vm));
+  const uint32_t keys = id >= 1 && id < 4294967295.0 ? static_cast<uint32_t>(id) : 0;
+  const bool known = keys == 0 || objs(vm).eme().find(keys) != nullptr;
+  *result = bool_value(known);
+  if (known) objs(vm).video_set_keys(element->serial, keys);
+  return true;
+}
+
+// The init data found in the stream of a SourceBuffer since the last call, for "encrypted" events: type (0 "cenc", 1 "keyids") and a byte array, one after the other.
+NATIVE(mse_encrypted) {
+  (void)self;
+  ID(0, buffer);
+  PageObjects::Lock lock(objs(vm));
+  JsObject* array = vm.new_array();
+  if (!array) return vm.throw_error(ErrorKind::RangeError, "Out of memory");
+  if (media::MseBuffer* b = objs(vm).mse().find_buffer(buffer)) {
+    UniquePointer<media::MseBuffer::EncryptedEvent> e;
+    while (b->take_encrypted(&e)) {
+      const ConstByteView data = e->data.view();
+      JsObject* bytes = make_byte_array(impl(vm), StringView(reinterpret_cast<const char*>(data.data()), data.size()));
+      if (!bytes) return vm.throw_error(ErrorKind::RangeError, "Out of memory");
+      vm.array_push(array, num_value(e->keyids ? 1 : 0));
+      vm.array_push(array, Value::make_object(bytes));
+    }
+  }
+  *result = Value::make_object(array);
+  return true;
+}
+
+// The element a MediaSource plays in (null if it is attached to none).
+NATIVE(mse_element) {
+  (void)self;
+  ID(0, id);
+  PageObjects::Lock lock(objs(vm));
+  media::MseSource* s = objs(vm).mse().find(id);
+  dom::Node* node = s && s->element ? impl(vm).doc.by_serial(s->element) : nullptr;
+  *result = node_value(impl(vm), node);
+  return true;
+}
+
 }  // namespace
 
 bool install_mse(DomBindings::Impl& c) {
@@ -407,6 +492,12 @@ bool install_mse(DomBindings::Impl& c) {
   vm.define_native(g, "__mse_reopen", mse_reopen, 1);
   vm.define_native(g, "__mse_live_range", mse_live_range, 3);
   vm.define_native(g, "__mse_source_error", mse_source_error, 1);
+  vm.define_native(g, "__mse_encrypted", mse_encrypted, 1);
+  vm.define_native(g, "__mse_element", mse_element, 1);
+  vm.define_native(g, "__eme_create_keys", eme_create_keys, 0);
+  vm.define_native(g, "__eme_add_key", eme_add_key, 4);
+  vm.define_native(g, "__eme_remove_session", eme_remove_session, 2);
+  vm.define_native(g, "__eme_set_keys", eme_set_keys, 2);
   return !vm.halted();
 }
 
