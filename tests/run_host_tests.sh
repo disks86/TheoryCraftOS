@@ -119,7 +119,7 @@ for t in "${WANTED[@]}"; do
     IntelGenerationTest) build_and_run IntelGenerationTest tests/IntelGenerationTest.cpp tests/KernelStubs.cpp src/Hardware/CentralProcessingUnit/X86_64Cpu.cpp src/Hardware/CentralProcessingUnit/Intel/IntelX64Cpu.cpp src/Hardware/CentralProcessingUnit/Intel/IntelGenerations.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp src/Hardware/VideoCodec/Intel/IntelMediaEngineHw.cpp ;;
     AmdGenerationTest) build_and_run AmdGenerationTest tests/AmdGenerationTest.cpp tests/KernelStubs.cpp src/Hardware/CentralProcessingUnit/X86_64Cpu.cpp src/Hardware/CentralProcessingUnit/AMD/AmdGenerations.cpp src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp ;;
     IntelMfxTest) build_and_run IntelMfxTest tests/IntelMfxTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
-                    src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp ;;
+                    src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/AMD/*.cpp ;;
     IntelGtTest) build_and_run IntelGtTest tests/IntelGtTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp \
                    src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp ;;
     IntelVcsDriverTest) build_and_run IntelVcsDriverTest tests/IntelVcsDriverTest.cpp tests/KernelStubs.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp \
@@ -128,7 +128,7 @@ for t in "${WANTED[@]}"; do
     IntelAvcSessionTest) build_and_run IntelAvcSessionTest tests/IntelAvcSessionTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                            src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp \
                            src/Hardware/GraphicsProcessingUnit/Intel/IntelForcewake.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.cpp src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp \
-                           src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp ;;
+                           src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Hardware/GraphicsProcessingUnit/AMD/*.cpp ;;
     MonitorTest) build_and_run MonitorTest tests/MonitorTest.cpp src/Hardware/Monitor/*.cpp ;;
     StreamingTest) build_and_run StreamingTest tests/StreamingTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
                      src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/GraphicsProcessingUnit/AMD/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Math/FloatMath.cpp ;;
