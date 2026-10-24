@@ -19,6 +19,7 @@
 #include "Desktop/WebBrowser.hpp"
 #include "Browser/Fetcher.hpp"
 #include "Browser/Url.hpp"
+#include "Browser/WebUrl.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -157,6 +158,8 @@ bool is_text(StringView type, StringView body) {
 
 }  // namespace
 
+static void visible_referrer(allocators::IAllocator& allocator, StringView from, StringView to, String* out);
+
 bool WebBrowser::is_page_name(StringView name) {
   const uint64_t dot = name.rfind('.');
   if (dot == StringView::npos) return false;
@@ -167,6 +170,14 @@ bool WebBrowser::is_page_name(StringView name) {
 WebBrowser::WebBrowser(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
+      back_menu_(allocator),
+      forward_menu_(allocator),
+      leave_dialog_(allocator),
+      leave_target_(allocator),
+      pending_referrer_(allocator),
+      referrer_(allocator),
+      refresh_target_(allocator),
+      defer_opens_(allocator),
       toolbar_(allocator),
       status_bar_(allocator),
       back_(allocator),
@@ -221,6 +232,16 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
     go->add_item("Reload", {&WebBrowser::on_reload, this}, "F5");
   }
 
+  leave_dialog_.on_result({&WebBrowser::on_leave_answer, this});
+  for (uint32_t i = 0; i < 2 * kHops; ++i) {
+    hops_[i].owner = this;
+    gui::ContextMenu& menu = i < kHops ? back_menu_ : forward_menu_;
+    hop_items_[i] = menu.add_item("", {&WebBrowser::on_history_hop, &hops_[i]});
+    if (hop_items_[i]) hop_items_[i]->set_enabled(false);
+  }
+  back_menu_.on_opening({&WebBrowser::on_history_opening, this});
+  forward_menu_.on_opening({&WebBrowser::on_history_opening, this});
+
   toolbar_.set_style(PanelStyle::Transparent);
   toolbar_.set_dock(DockStyle::Top);
   toolbar_.set_size(0, 28);
@@ -229,10 +250,12 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   back_.set_dock(DockStyle::Left);
   back_.set_size(28, 0);
   back_.on_click({&WebBrowser::on_back, this});
+  back_.set_context_menu(&back_menu_);
   forward_.set_text(">");
   forward_.set_dock(DockStyle::Left);
   forward_.set_size(28, 0);
   forward_.on_click({&WebBrowser::on_forward, this});
+  forward_.set_context_menu(&forward_menu_);
   reload_.set_text("Reload");
   reload_.set_dock(DockStyle::Left);
   reload_.set_size(64, 0);
@@ -387,7 +410,8 @@ void WebBrowser::on_link(void* self, Control&) {
   auto* b = static_cast<WebBrowser*>(self);
   String target(b->allocator());
   if (browser::resolve_reference(b->allocator(), b->current_.view(), b->page_.clicked_link(), &target)) {
-    b->navigate(target.view());
+    b->pending_referrer_.assign(b->current_.view());
+    if (!b->navigate(target.view())) b->pending_referrer_.clear();
     return;
   }
   String message(b->allocator());
@@ -417,6 +441,7 @@ void WebBrowser::ask_open() {
 
 bool WebBrowser::navigate(StringView typed) {
   String address(allocator());
+
   if (!browser::normalize_address(typed, &address)) {
     say("Type an address first.");
     return false;
@@ -515,6 +540,16 @@ void WebBrowser::load(Request kind, StringView target) {
     traverse_in_place(request_delta_);
     return;
   }
+  if (live_ && manager() && !leave_confirmed_ && live_->before_unload()) {   // the page wants the user to say they want to leave
+    {
+      UiGuard lock(this);
+      loading_ = false;
+    }
+    ask_leave(kind, target);
+    return;
+  }
+  leave_confirmed_ = false;
+  leave_current();
   String message(allocator());
   message.append("Loading ");
   message.append(address.view());
@@ -537,8 +572,15 @@ void WebBrowser::load(Request kind, StringView target) {
   }
   {
     UiGuard lock(this);
+    const uint64_t hash = address.view().find('#');   // (the fragment of the address asked for stays, as redirects keep it, unless they name one)
+    if (hash != StringView::npos && page.address.view().find('#') == StringView::npos) page.address.append(address.view().substr(hash));
     remember(kind, page.address.view());
     loading_ = false;
+    if (kind == Request::Go || kind == Request::Submit) referrer_.assign(pending_referrer_.view());
+    else if (kind != Request::Reload) referrer_.clear();
+    pending_referrer_.clear();
+    const browser::SessionHistory::Entry* entry = history_.current();
+    restore_scroll_ = (kind == Request::Back || kind == Request::Forward || kind == Request::Reload) && entry && entry->scroll_saved && !entry->manual_scroll ? entry->scroll : -1;
   }
   show(page);
 }
@@ -669,10 +711,10 @@ void WebBrowser::remember(Request kind, StringView address) {
   switch (kind) {
     case Request::Back:
     case Request::Forward: {
-      const uint32_t previous = history_.current() ? history_.current()->document : 0;
       history_.go(request_delta_);
+      const uint32_t arrived = history_.current() ? history_.current()->document : 0;   // (the document of the entry we came to is loaded again: its entries follow it)
       history_.replace_current(address, document_);
-      if (previous) history_.renumber_document(previous, document_);
+      if (arrived) history_.renumber_document(arrived, document_);
       break;
     }
     default: {
@@ -681,11 +723,14 @@ void WebBrowser::remember(Request kind, StringView address) {
         const uint32_t previous = history_.current()->document;
         history_.replace_current(address, document_);
         if (previous) history_.renumber_document(previous, document_);
+      } else if (replace_next_ && history_.current()) {   // (a refresh without a delay: Back must not come back to the page that sent it on)
+        history_.replace_navigation(address, document_);
       } else if (!same) {
         history_.navigate(address, document_);
       } else {
-        history_.replace_current(address, document_);
+        history_.replace_navigation(address, document_);   // (going to the address that is shown replaces its entry)
       }
+      replace_next_ = false;
       break;
     }
   }
@@ -696,10 +741,17 @@ void WebBrowser::remember(Request kind, StringView address) {
 bool WebBrowser::traverse_in_place(int32_t delta) {
   String address(allocator()), state(allocator());
   bool has_state;
+  const bool manual = live_ && live_->scroll_restoration_manual();
   {
     UiGuard lock(this);
-    if (!live_ || !history_.go(delta)) return false;
+    if (!live_ || !history_.can_go(delta)) return false;
+    browser::SessionHistory::Entry& leaving = *history_.current();   // (where the page was scrolled to, for when it comes back)
+    leaving.scroll = page_.scroll_y();
+    leaving.scroll_saved = true;
+    leaving.manual_scroll = manual;
+    history_.go(delta);
     const browser::SessionHistory::Entry& entry = *history_.current();
+    restore_scroll_ = entry.scroll_saved && !entry.manual_scroll ? entry.scroll : -1;
     address.assign(entry.address.view());
     state.assign(entry.state.view());
     has_state = entry.has_state;
@@ -746,7 +798,9 @@ void WebBrowser::show(Fetched& page) {
     page_.set_object_painter(nullptr);
   }
   prefetcher_.cancel_all();   // (what the old page was getting is of no use now)
+  if (live_) live_->unload();   // (pagehide, unload)
   live_.reset();   // (the old page and its scripts go before the new one comes)
+  __atomic_store_n(&refresh_armed_, false, __ATOMIC_RELEASE);
   {
     UiGuard lock(this);
     script_log_.clear();
@@ -783,10 +837,21 @@ void WebBrowser::show(Fetched& page) {
   if (!live_) ok = false;
   else {
     if (history_.current() && history_.current()->has_state) live_->set_history_state(history_.current()->state.view(), true);
+    String referrer(allocator());
+    visible_referrer(allocator(), referrer_.view(), page.address.view(), &referrer);
+    live_->set_referrer(referrer.view());
     if (scripts) say("Reading the page and running its scripts...");
     else say("Reading the page...");
     ok = live_->load(html) && live_->render_picture(picture.get(), layout_fonts());
     if (ok) page_.set_object_painter(&live_->objects());
+    double seconds = 0;
+    String target(allocator());
+    if (ok && scripts_enabled_ && live_->meta_refresh(&seconds, &target) && seconds < 1e6) {   // <meta http-equiv=refresh>
+      refresh_target_.assign(target.view());
+      refresh_due_ms_ = __atomic_load_n(&uptime_ms_, __ATOMIC_ACQUIRE) + static_cast<uint64_t>(seconds * 1000);
+      refresh_replace_ = seconds <= 1;
+      __atomic_store_n(&refresh_armed_, true, __ATOMIC_RELEASE);
+    }
   }
   if (!ok) {
     live_.reset();
@@ -808,6 +873,10 @@ void WebBrowser::present(UniquePointer<browser::PagePicture> picture, bool keep_
   if (live_) {
     const int32_t asked = live_->take_scroll_request();
     if (asked >= 0) scroll = asked;
+  }
+  if (restore_scroll_ >= 0) {   // Back / Forward / Reload: where the page was left wins over what the page asks for
+    scroll = restore_scroll_;
+    restore_scroll_ = -1;
   }
   if (scroll >= 0) page_.scroll_to_y(scroll);
   uint32_t errors = 0;
@@ -855,12 +924,33 @@ void WebBrowser::refresh(bool keep_scroll) {
 
 // After the page ran something (a click, a timer, a new window size): do what it asked of the browser, then draw it again if it changed.
 void WebBrowser::settle() {
+  if (defer_opens_.count() > 0) {   // window.open()
+    List<String> opens(allocator());
+    for (uint64_t i = 0; i < defer_opens_.count(); ++i) {
+      String copy(allocator());
+      copy.assign(defer_opens_[i].view());
+      opens.push_back(util::move(copy));
+    }
+    defer_opens_.clear();
+    for (uint64_t i = 0; i < opens.count(); ++i)
+      if (open_fn_) open_fn_(open_ctx_, *this, opens[i].view());
+  }
+  if (want_close_) {   // window.close() of a window a script opened
+    want_close_ = false;
+    if (opened_by_script_) {
+      if (live_) live_->unload();
+      UiGuard lock(this);
+      close();
+      return;
+    }
+  }
   if (want_post_) {
     String target(allocator()), type(allocator()), body(allocator());
     target.assign(defer_go_.view());
     type.assign(defer_type_.view());
     body.assign(defer_body_.view());
     want_post_ = false;
+    pending_referrer_.assign(current_.view());
     post_form(target.view(), type.view(), body.view());
     return;
   }
@@ -868,6 +958,7 @@ void WebBrowser::settle() {
     String target(allocator());
     target.assign(defer_go_.view());
     want_go_ = false;
+    pending_referrer_.assign(current_.view());
     post(Request::Go, target.view());
     return;
   }
@@ -897,7 +988,7 @@ void WebBrowser::settle() {
     page_.invalidate();
   }
   update_key_capture();
-  if (live_->changed() || defer_scroll_ >= 0) refresh(true);
+  if (live_->changed() || defer_scroll_ >= 0 || restore_scroll_ >= 0) refresh(true);
   else if (live_->errors() != reported_errors_) {
     UiGuard lock(this);
     script_log_.assign(live_->log());
@@ -987,6 +1078,11 @@ void WebBrowser::tick(uint64_t uptime_us) {
   if (pip_window_.showing()) {   // the picture moves on; a window that was resized is noticed
     pip_window_.refresh();
     if (pip_window_.picture_width() != pip_w_ || pip_window_.picture_height() != pip_h_) queue(pip_handler_, *this, true);
+  }
+  if (__atomic_load_n(&refresh_armed_, __ATOMIC_ACQUIRE) && uptime_us / 1000 >= refresh_due_ms_ && __atomic_exchange_n(&refresh_armed_, false, __ATOMIC_ACQ_REL)) {
+    replace_next_ = refresh_replace_;   // <meta http-equiv=refresh> comes due: the page is opened again (or the address it names)
+    pending_referrer_.assign(current_.view());
+    post(refresh_target_.view().equals(current_.view()) ? Request::Reload : Request::Go, refresh_target_.view());
   }
   const uint64_t due = __atomic_load_n(&next_due_ms_, __ATOMIC_ACQUIRE);
   if (due == 0 || page_clock_ms() < due || __atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) return;
@@ -1322,5 +1418,172 @@ bool WebBrowser::on_key(const KeyArgs& args) {
   }
   return Frame::on_key(args);
 }
+
+
+// --- Leaving a page, and the lists under Back and Forward ----------------------------------------------------------------------------
+
+// What document.referrer says: the page that led here, as the default policy (strict-origin-when-cross-origin) lets it be seen - the whole address (without the
+// fragment) within one origin, only the origin to another, nothing when going from https to http.
+static void visible_referrer(allocators::IAllocator& allocator, StringView from, StringView to, String* out) {
+  out->clear();
+  if (from.empty()) return;
+  browser::WebUrl a(allocator), b(allocator);
+  if (!browser::WebUrl::parse(allocator, from, nullptr, &a) || !browser::WebUrl::parse(allocator, to, nullptr, &b)) return;
+  if (!a.scheme.equals("http") && !a.scheme.equals("https")) return;
+  if (a.scheme.equals("https") && !b.scheme.equals("https")) return;
+  if (a.same_origin(b)) {
+    a.serialize(out, false);
+    return;
+  }
+  a.origin(out);
+  out->push_back('/');
+}
+
+void WebBrowser::leave_current() {
+  const bool manual = live_ && live_->scroll_restoration_manual();
+  String title(allocator());
+  if (live_) title.assign(live_->page_title());
+  UiGuard lock(this);
+  browser::SessionHistory::Entry* e = history_.current();
+  if (!e) return;
+  e->scroll = page_.scroll_y();
+  e->scroll_saved = true;
+  e->manual_scroll = manual;
+  e->title.assign(title.view());
+}
+
+void WebBrowser::ask_leave(Request kind, StringView target) {
+  UiGuard lock(this);
+  leave_kind_ = kind;
+  leave_target_.assign(target);
+  if (!manager() || leave_dialog_.showing()) return;
+  leave_dialog_.set_texts("Leave page?", "This page asks whether you want to leave it.", "Changes you made may not be saved.", "Leave", "Stay");
+  leave_dialog_.show(*manager());
+}
+
+void WebBrowser::on_leave_answer(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->leave_dialog_.accepted()) {
+    UiGuard lock(b);
+    b->address_.set_text(b->current_.view());
+    return;
+  }
+  {
+    UiGuard lock(b);
+    b->leave_confirmed_ = true;
+    b->request_ = b->leave_kind_;
+    b->request_target_.assign(b->leave_target_.view());
+  }
+  b->queue(b->load_handler_, *b, true);
+}
+
+// The titles (or addresses) of the entries Back (direction -1) or Forward (+1) can go to, nearest first.
+uint32_t WebBrowser::history_titles(int32_t direction, uint32_t limit, List<String>* out) {
+  UiGuard lock(this);
+  uint32_t n = 0;
+  for (int32_t step = 1; n < limit && history_.can_go(direction * step); ++step) {
+    const browser::SessionHistory::Entry& e = history_.at(static_cast<uint32_t>(history_.index() + direction * step));
+    String text(allocator());
+    text.assign(e.title.empty() ? e.address.view() : e.title.view());
+    if (!out->push_back(util::move(text))) break;
+    ++n;
+  }
+  return n;
+}
+
+void WebBrowser::on_history_opening(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  for (int32_t direction = -1; direction <= 1; direction += 2) {
+    List<String> titles(b->allocator());
+    b->history_titles(direction, kHops, &titles);
+    const uint32_t base = direction < 0 ? 0 : kHops;
+    for (uint32_t i = 0; i < kHops; ++i) {
+      gui::MenuItem* item = b->hop_items_[base + i];
+      if (!item) continue;
+      const bool used = i < titles.count();
+      {
+        UiGuard lock(b);
+        item->text.assign(used ? titles[i].view() : StringView());
+        b->hops_[base + i].delta = direction * static_cast<int32_t>(i + 1);
+      }
+      item->set_enabled(used);
+    }
+  }
+}
+
+void WebBrowser::on_history_hop(void* context, Control&) {
+  Hop* hop = static_cast<Hop*>(context);
+  WebBrowser* b = hop->owner;
+  if (!b->history_.can_go(hop->delta)) return;
+  b->request_delta_ = hop->delta;
+  b->post(hop->delta < 0 ? Request::Back : Request::Forward, StringView());
+}
+
+// --- The session history as the Navigation API sees it ----------------------------------------------------------------------------
+
+static void append_json_string(String* out, StringView text) {
+  out->push_back('"');
+  for (const char c : text) {
+    if (c == '"') out->append("\\\"");
+    else if (c == '\\') out->append("\\\\");
+    else if (static_cast<uint8_t>(c) < 0x20) {
+      static const char digits[] = "0123456789abcdef";
+      out->append("\\u00");
+      out->push_back(digits[(static_cast<uint8_t>(c) >> 4) & 15]);
+      out->push_back(digits[static_cast<uint8_t>(c) & 15]);
+    } else {
+      out->push_back(c);
+    }
+  }
+  out->push_back('"');
+}
+
+bool WebBrowser::Env::history_entries(String* json, int64_t* index) {
+  UiGuard lock(&owner_);
+  const browser::SessionHistory& h = owner_.history_;
+  if (h.empty()) return false;
+  json->push_back('[');
+  for (uint32_t i = 0; i < h.count(); ++i) {
+    const browser::SessionHistory::Entry& e = h.at(i);
+    if (i) json->push_back(',');
+    json->append("{\"key\":");
+    json->append_uint(e.key);
+    json->append(",\"id\":");
+    json->append_uint(e.id);
+    json->append(",\"doc\":");
+    json->append_uint(e.document);
+    json->append(",\"url\":");
+    append_json_string(json, e.address.view());
+    json->append(",\"nav\":");
+    if (e.has_nav_state) append_json_string(json, e.nav_state.view());
+    else json->append("null");
+    json->push_back('}');
+  }
+  json->push_back(']');
+  *index = h.index();
+  return true;
+}
+
+void WebBrowser::Env::set_navigation_state(StringView json, bool has_state) {
+  UiGuard lock(&owner_);
+  browser::SessionHistory::Entry* e = owner_.history_.current();
+  if (!e) return;
+  e->nav_state.assign(json);
+  e->has_nav_state = has_state;
+}
+
+void WebBrowser::Env::history_go_to_key(uint64_t key) {
+  const int64_t at = owner_.history_.find_key(key);
+  if (at >= 0) owner_.defer_history_ += static_cast<int32_t>(at - owner_.history_.index());
+}
+
+bool WebBrowser::Env::open_window(StringView address, StringView, bool) {
+  if (!owner_.open_fn_ || !(browser::is_web_address(address) || browser::is_file_address(address)) || owner_.defer_opens_.count() >= 8) return false;
+  String copy(owner_.allocator());
+  copy.assign(address);
+  return owner_.defer_opens_.push_back(util::move(copy));
+}
+
+void WebBrowser::Env::close_window() { owner_.want_close_ = true; }
 
 }  // namespace desktop

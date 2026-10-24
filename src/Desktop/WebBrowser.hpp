@@ -43,6 +43,8 @@
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
+#include "Gui/MessageDialog.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/PageView.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -134,12 +136,26 @@ class WebBrowser : public gui::Frame {
   gui::PageView& page() { return page_; }
   gui::TextBox& address_box() { return address_; }
   gui::Button& back_button() { return back_; }
+  gui::ContextMenu& back_menu() { return back_menu_; }
+  gui::ContextMenu& forward_menu() { return forward_menu_; }
+  gui::MessageDialog& leave_dialog() { return leave_dialog_; }
   gui::Button& forward_button() { return forward_; }
   gui::Button& reload_button() { return reload_; }
   gui::Button& go_button() { return go_; }
   gui::Label& status_label() { return status_; }
   gui::MenuBar& menu_bar() { return menu_; }
   void ask_open();
+
+  // window.open() from a page: the handler opens `address` in another tab / window (and may call set_opened_by_script() on it). Called on the page's thread.
+  using OpenWindowFn = bool (*)(void* context, WebBrowser& from, StringView address);
+  void set_open_window_handler(OpenWindowFn handler, void* context) {
+    open_fn_ = handler;
+    open_ctx_ = context;
+  }
+  // A window a page opened may be closed by its script (window.close()); one that was not may not.
+  void set_opened_by_script(bool opened) { opened_by_script_ = opened; }
+  // The list of pages Back / Forward would go to, nearest first (the address of each, or its title once it has been left), at most `limit`.
+  uint32_t history_titles(int32_t direction, uint32_t limit, List<String>* out);
 
   bool accepts_drop(StringView text, int32_t, int32_t, const gui::Control*) const override { return !text.empty() && text[0] == '/'; }
   void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { navigate(text); }
@@ -168,6 +184,11 @@ class WebBrowser : public gui::Frame {
     void history_go(int32_t delta) override;
     uint32_t history_length() override;
     void push_state(StringView address, StringView state_json, bool has_state, bool replace) override;
+    bool history_entries(String* json, int64_t* index) override;
+    void set_navigation_state(StringView json, bool has_state) override;
+    void history_go_to_key(uint64_t key) override;
+    bool open_window(StringView address, StringView target, bool noopener) override;
+    void close_window() override;
     void alert(StringView text) override;
     bool confirm(StringView) override { return false; }
     void scroll_to(int32_t line) override;
@@ -243,13 +264,43 @@ class WebBrowser : public gui::Frame {
   // Back / Forward to an entry of the document that is shown: nothing is loaded, the page gets a popstate.
   bool traverse_in_place(int32_t delta);
   void update_buttons();
+  // Saves where the page is scrolled to (and its title) in the history entry it is on, as it is left.
+  void leave_current();
+  // The page asked to be asked before it is left: the question, and what happens with the answer.
+  void ask_leave(Request kind, StringView target);
+  static void on_leave_answer(void* self, gui::Control&);
+  // The history entries the Back / Forward buttons list (right-click).
+  static void on_history_opening(void* self, gui::Control&);
+  static void on_history_hop(void* self, gui::Control&);
   void update_title(StringView page_title);
   void say(StringView text);
   void notify(gui::NoticeKind kind, StringView text) {
     if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) say(text);
   }
 
+  struct Hop {
+    WebBrowser* owner = nullptr;
+    int32_t delta = 0;
+  };
+  static constexpr uint32_t kHops = 10;
   gui::MenuBar menu_;
+  gui::ContextMenu back_menu_, forward_menu_;
+  Hop hops_[2 * kHops];
+  gui::MenuItem* hop_items_[2 * kHops] = {};
+  gui::MessageDialog leave_dialog_;
+  Request leave_kind_ = Request::None;
+  String leave_target_;
+  bool leave_confirmed_ = false;
+  int32_t restore_scroll_ = -1;     // where Back / Forward / Reload scrolls the page to once it is drawn
+  String pending_referrer_, referrer_;
+  bool replace_next_ = false;       // the next page replaces the history entry (a <meta refresh> without a delay)
+  bool refresh_armed_ = false, refresh_replace_ = false;
+  uint64_t refresh_due_ms_ = 0;
+  String refresh_target_;
+  List<String> defer_opens_;        // window.open() addresses to hand to the desktop
+  bool want_close_ = false, opened_by_script_ = false;
+  OpenWindowFn open_fn_ = nullptr;
+  void* open_ctx_ = nullptr;
   gui::Panel toolbar_, status_bar_;
   gui::Button back_, forward_, reload_, go_;
   gui::TextBox address_;

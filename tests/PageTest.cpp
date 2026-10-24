@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include "Browser/Page.hpp"
+#include "Browser/SessionHistory.hpp"
 #include "Dom/Form.hpp"
 #include "Browser/PageLayout.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
@@ -233,11 +234,62 @@ struct FakeEnvironment final : IPageEnvironment {
     posts.push_back(std::string(a.data(), a.size()) + " [" + std::string(type.data(), type.size()) + "] " + std::string(body.data(), body.size()));
   }
   void navigate(StringView a, bool replace) override { navigations.push_back(std::string(a.data(), a.size()) + (replace ? " (replace)" : "")); }
-  void set_hash(StringView h) override { hashes.push_back(std::string(h.data(), h.size())); }
+  void set_hash(StringView h) override {
+    hashes.push_back(std::string(h.data(), h.size()));
+    if (sim && sim->current()) {
+      std::string base = sim->current()->address.c_str();
+      if (base.find('#') != std::string::npos) base.resize(base.find('#'));
+      if (h.size() > 1) base += std::string(h.data(), h.size());
+      if (base != sim->current()->address.c_str()) sim->push_fragment(StringView(base.data(), base.size()));
+    }
+  }
   void reload() override { ++reloads; }
-  void history_go(int32_t d) override { history_moves += d; }
-  uint32_t history_length() override { return 3; }
+  // A session history standing in for the browser's (set `sim` to use it): entries, the Navigation API's state, and the moves the page asked for.
+  SessionHistory* sim = nullptr;
+  int pending_delta = 0;
+  std::vector<std::string> opens;
+  int closes = 0;
+  bool allow_open = true;
+  bool open_window(StringView a, StringView target, bool noopener) override {
+    opens.push_back(std::string(a.data(), a.size()) + " [" + std::string(target.data(), target.size()) + "]" + (noopener ? " noopener" : ""));
+    return allow_open;
+  }
+  void close_window() override { ++closes; }
+  bool history_entries(String* json, int64_t* index) override {
+    if (!sim || sim->empty()) return false;
+    auto quote = [](const std::string& t) {
+      std::string o = "\"";
+      for (char c : t) {
+        if (c == '"' || c == '\\') o += '\\';
+        o += c;
+      }
+      return o + "\"";
+    };
+    std::string text = "[";
+    for (uint32_t i = 0; i < sim->count(); ++i) {
+      const SessionHistory::Entry& e = sim->at(i);
+      if (i) text += ",";
+      text += "{\"key\":" + std::to_string(e.key) + ",\"id\":" + std::to_string(e.id) + ",\"doc\":" + std::to_string(e.document) + ",\"url\":" + quote(e.address.c_str()) + ",\"nav\":" + (e.has_nav_state ? quote(e.nav_state.c_str()) : std::string("null")) + "}";
+    }
+    text += "]";
+    json->assign(StringView(text.data(), text.size()));
+    *index = sim->index();
+    return true;
+  }
+  void set_navigation_state(StringView json, bool has) override {
+    if (!sim || !sim->current()) return;
+    sim->current()->nav_state.assign(json);
+    sim->current()->has_nav_state = has;
+  }
+  void history_go_to_key(uint64_t key) override {
+    if (!sim) return;
+    const int64_t at = sim->find_key(key);
+    if (at >= 0) pending_delta += static_cast<int>(at - sim->index());
+  }
+  void history_go(int32_t d) override { history_moves += d; pending_delta += d; }
+  uint32_t history_length() override { return sim ? sim->count() : 3; }
   void push_state(StringView a, StringView state, bool has, bool replace) override {
+    if (sim) sim->push_state(a, state, has, replace);
     states.push_back(std::string(replace ? "replace " : "push ") + std::string(a.data(), a.size()) + (has ? " " + std::string(state.data(), state.size()) : ""));
     state_text.assign(state.data(), state.size());
     has_state = has;
@@ -3010,6 +3062,247 @@ static void test_cookies_web() {
   CHECK(js("", "localStorage.setItem('k', 'v'); console.log(localStorage.length, JSON.stringify(localStorage), 'k' in localStorage, localStorage.hasOwnProperty('k'), localStorage.getItem('toString'), typeof localStorage.toString)", "1 {\"k\":\"v\"} true true null function"));
 }
 
+// A page on a pretend browser with a real session history (the entries the Navigation API lists): `script` runs, the timers run, the moves the page asked for are
+// carried out the way the browser would (Back / Forward within the document give the page a popstate), then `act` does what the user does.
+static std::string nav_run(const char* script, const char* address, const std::function<void(FakeEnvironment&, Page&, SessionHistory&)>& act = nullptr,
+                           const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    SessionHistory history(a);
+    history.navigate(address, 1);
+    FakeEnvironment env(a);
+    env.sim = &history;
+    MediaEnvironment media;
+    Page page(a, env, address, media, true);
+    auto pump = [&] {
+      for (int i = 0; i < 20 && env.pending_delta; ++i) {
+        const int d = env.pending_delta;
+        env.pending_delta = 0;
+        if (!history.can_go(d)) continue;
+        history.go(d);
+        const SessionHistory::Entry* e = history.current();
+        page.traverse(StringView(e->address.view()), e->state.view(), e->has_state);
+      }
+    };
+    auto run_timers = [&] {
+      for (int i = 0; i < 100; ++i) {
+        pump();
+        double due;
+        if (!page.next_timer(&due)) break;
+        if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+        page.run_due_timers(env.clock);
+      }
+      pump();
+    };
+    page.load((std::string("<html><head><title>T</title></head><body><script>") + script + "</script></body></html>").c_str());
+    run_timers();
+    if (act) {
+      act(env, page, history);
+      run_timers();
+    }
+    out = std::string(page.log().data(), page.log().size());
+    if (!out.empty() && out.back() == '\n') out.pop_back();
+    for (size_t p = 0; (p = out.find("\n", p)) != std::string::npos;) {
+      out.replace(p, 1, " | ");
+      p += 3;
+    }
+    if (after) after(env);
+  }
+  if (a.live != 0) {
+    printf("   (leaked %d allocation(s))\n", a.live);
+    return out + " [leak]";
+  }
+  return out;
+}
+
+static bool nav_is(const char* script, const char* expected, const std::function<void(FakeEnvironment&, Page&, SessionHistory&)>& act = nullptr,
+                   const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  const std::string got = nav_run(script, "https://app.example/p/start", act, after);
+  if (got != expected) {
+    printf("   %s\n   gives   %s\n   expects %s\n", script, got.c_str(), expected);
+    return false;
+  }
+  return true;
+}
+
+static void test_navigation() {
+  // an on<event> handler that returns false cancels the event
+  CHECK(js("<a id=l href='#'>x</a>", "var l = document.getElementById('l'); l.onclick = function () { return false }; var e = new MouseEvent('click', { cancelable: true, bubbles: true }); l.dispatchEvent(e); console.log(e.defaultPrevented); l.onclick = function () { return 0 }; var f = new MouseEvent('click', { cancelable: true }); l.dispatchEvent(f); console.log(f.defaultPrevented)", "true | false"));
+  // --- the lifecycle: pageshow after load, beforeunload asks, pagehide / unload say goodbye
+  CHECK(js("", "addEventListener('load', function () { console.log('load', document.readyState) }); addEventListener('pageshow', function (e) { console.log('pageshow', e.persisted, e instanceof PageTransitionEvent) });", "load complete | pageshow false true"));
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      auto asks = [&](const char* script) {
+        Page page(a, env, "https://app.example/", media, true);
+        page.load((std::string("<script>") + script + "</script>").c_str());
+        return page.before_unload();
+      };
+      CHECK(!asks("1"));
+      CHECK(asks("addEventListener('beforeunload', function (e) { e.preventDefault() })"));
+      CHECK(asks("addEventListener('beforeunload', function (e) { e.returnValue = 'sure?' })"));
+      CHECK(!asks("addEventListener('beforeunload', function (e) { e.returnValue = '' })"));
+      CHECK(asks("onbeforeunload = function (e) { e.returnValue = 'x' }"));
+      CHECK(!asks("addEventListener('beforeunload', function () { throw new Error('boom') })"));
+      CHECK(asks("onbeforeunload = function () { return 'Really?' }"));
+      CHECK(!asks("onbeforeunload = function () { }"));
+      Page page(a, env, "https://app.example/", media, true);
+      page.load("<script>document.addEventListener('visibilitychange', function () { console.log('visibilitychange', document.visibilityState, document.hidden) }); addEventListener('pagehide', function (e) { console.log('pagehide', e.persisted, document.visibilityState) }); addEventListener('unload', function () { console.log('unload') }); console.log(document.visibilityState, document.hidden)</script>");
+      page.unload();
+      CHECK(std::string(page.log().data(), page.log().size()) == "visible false\nvisibilitychange hidden true\npagehide false hidden\nunload\n");
+    }
+    CHECK(a.live == 0);
+  }
+  // --- scrollRestoration, the referrer
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/", media, true);
+      page.set_referrer("https://other.example/from");
+      page.load("<script>console.log(history.scrollRestoration, document.referrer); history.scrollRestoration = 'bogus'; console.log(history.scrollRestoration); history.scrollRestoration = 'manual'; console.log(history.scrollRestoration)</script>");
+      CHECK(std::string(page.log().data(), page.log().size()) == "auto https://other.example/from\nauto\nmanual\n");
+      CHECK(page.scroll_restoration_manual());
+    }
+    CHECK(a.live == 0);
+  }
+  // --- <meta http-equiv=refresh>
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      auto refresh = [&](const char* content, const char* expected) {
+        Page page(a, env, "https://app.example/dir/page", media, true);
+        page.load((std::string("<meta http-equiv=refresh content=\"") + content + "\">").c_str());
+        double seconds = -1;
+        String target(a);
+        const bool found = page.meta_refresh(&seconds, &target);
+        std::string got = found ? std::to_string(static_cast<int>(seconds)) + " " + std::string(target.c_str()) : "none";
+        if (got != expected) {
+          printf("   refresh \"%s\" gives %s, expects %s\n", content, got.c_str(), expected);
+          return false;
+        }
+        return true;
+      };
+      CHECK(refresh("5", "5 https://app.example/dir/page"));
+      CHECK(refresh("0; url=/next", "0 https://app.example/next"));
+      CHECK(refresh("3;URL='next?x=1'", "3 https://app.example/dir/next?x=1"));
+      CHECK(refresh("2, https://other.example/", "2 https://other.example/"));
+      CHECK(refresh(" 10 ; url = a.html", "10 https://app.example/dir/a.html"));
+      CHECK(refresh("soon", "none"));
+      CHECK(refresh("5x; url=/a", "none"));
+    }
+    CHECK(a.live == 0);
+  }
+  // --- where the page scrolls to: the fragment, scrollIntoView()
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      font::FontSet fonts(a);
+      fonts.add_bundled_fonts();
+      auto scroll_for = [&](const char* address, const char* script) {
+        Page page(a, env, address, media, true);
+        page.load((std::string("<body style='margin:0'><div style='height:1000px'></div><h1 id=t style='margin:0'>x</h1><div style='height:500px'></div><a name=old>y</a><script>") + script + "</script>").c_str());
+        PagePicture picture(a);
+        CHECK(page.render_picture(&picture, fonts));
+        return page.take_scroll_request();
+      };
+      const int32_t t = scroll_for("https://app.example/p#t", "");
+      CHECK(t >= 1000 && t < 1010);
+      CHECK(scroll_for("https://app.example/p#%74", "") == t);
+      const int32_t old = scroll_for("https://app.example/p#old", "");
+      CHECK(old >= 1500);
+      CHECK(scroll_for("https://app.example/p#nothing", "") == -1);
+      CHECK(scroll_for("https://app.example/p", "") == -1);
+      CHECK(scroll_for("https://app.example/p#top", "") == 0);
+      CHECK(scroll_for("https://app.example/p#", "") == 0);
+      CHECK(scroll_for("https://app.example/p", "document.getElementById('t').scrollIntoView()") == t);
+      // changing the fragment from script scrolls too
+      Page page(a, env, "https://app.example/p", media, true);
+      page.load("<body style='margin:0'><div style='height:1000px'></div><h1 id=t style='margin:0'>x</h1><script>location.hash = '#t'</script>");
+      PagePicture picture(a);
+      CHECK(page.render_picture(&picture, fonts));
+      CHECK(page.take_scroll_request() == t);
+      CHECK(page.take_scroll_request() == -1);
+    }
+    CHECK(a.live == 0);
+  }
+  // --- window.open(), window.close()
+  CHECK(nav_is("var w = open('/popup', 'pop'); console.log(typeof w, w.closed, w.name); console.log(open('/n', '_blank', 'noopener') === null, open('about:blank') === null); w.close(); console.log(w.closed); close();", "object false pop | true true | true",
+               nullptr, [](FakeEnvironment& env) {
+                 CHECK(env.opens.size() == 2);
+                 if (env.opens.size() == 2) CHECK(env.opens[0] == "https://app.example/popup [pop]" && env.opens[1] == "https://app.example/n [_blank] noopener");
+                 CHECK(env.closes == 1);
+               }));
+  CHECK(nav_is("var r = open('/self', '_self'); console.log(r === window)", "true", nullptr, [](FakeEnvironment& env) { CHECK(env.opens.empty()); CHECK(env.navigations.size() == 1); }));
+  // --- the Navigation API
+  CHECK(nav_is("console.log(navigation.entries().length, navigation.currentEntry.url, navigation.currentEntry.index, navigation.canGoBack, navigation.canGoForward, navigation instanceof EventTarget, navigation.transition);"
+               "history.pushState({ a: 1 }, '', '/p/two'); var es = navigation.entries(); console.log(es.length, navigation.currentEntry.url, navigation.currentEntry.index, navigation.canGoBack, navigation.canGoForward, es[0].key !== es[1].key, es[0].sameDocument, es[1].id !== es[0].id);",
+               "1 https://app.example/p/start 0 false false true null | 2 https://app.example/p/two 1 true false true true true"));
+  CHECK(nav_is("navigation.addEventListener('navigate', function (e) { console.log(e.type, e.navigationType, e.canIntercept, e.destination.url, e.hashChange, e.userInitiated, e instanceof NavigateEvent); e.intercept({ handler: function () { console.log('handler'); return new Promise(function (r) { setTimeout(r, 10) }) } }) });"
+               "navigation.addEventListener('currententrychange', function (e) { console.log('change', e.navigationType, e.from.url) });"
+               "navigation.addEventListener('navigatesuccess', function () { console.log('success', location.pathname, navigation.transition) });"
+               "var r = navigation.navigate('/p/next', { state: { n: 1 } }); console.log(navigation.transition === null);"
+               "r.committed.then(function (en) { console.log('committed', en.url, JSON.stringify(en.getState())) }); r.finished.then(function (en) { console.log('finished', en.url, navigation.entries().length) });",
+               "navigate push true https://app.example/p/next false false true | change push https://app.example/p/start | false | handler | committed https://app.example/p/next {\"n\":1} | success /p/next null | finished https://app.example/p/next 2"));
+  CHECK(nav_is("navigation.onnavigate = function (e) { e.preventDefault() }; navigation.addEventListener('navigateerror', function (e) { console.log('error', e.error.name) });"
+               "navigation.navigate('/p/x').committed.catch(function (err) { console.log(err.name, location.pathname, navigation.entries().length) });",
+               "error AbortError | AbortError /p/start 1"));
+  CHECK(nav_is("navigation.onnavigate = function (e) { e.intercept({ handler: function () { throw new Error('nope') } }) }; navigation.onnavigateerror = function (e) { console.log('navigateerror', e.error.message) };"
+               "navigation.navigate('/p/y').finished.catch(function (err) { console.log('rejected', err.message, location.pathname) });",
+               "navigateerror nope | rejected nope /p/y"));
+  // fragment navigation is a same-document navigation without intercepting
+  CHECK(nav_is("navigation.onnavigate = function (e) { console.log(e.navigationType, e.hashChange, e.destination.sameDocument, e.canIntercept) }; navigation.onnavigatesuccess = function () { console.log('success', location.hash) };"
+               "navigation.navigate('#frag').finished.then(function (en) { console.log(en.url, navigation.entries().length) });",
+               "push true true true | success #frag | https://app.example/p/start#frag 2"));
+  CHECK(nav_is("navigation.onnavigate = function (e) { console.log('nav', e.navigationType, e.destination.url, e.canIntercept, e.destination.sameDocument, e.destination.index, e.userInitiated) };"
+               "history.pushState(1, '', '/p/b'); history.pushState(2, '', '/p/c'); console.log(navigation.entries().length);"
+               "navigation.back().finished.then(function (en) { console.log('back done', en.url, location.pathname, history.state, navigation.currentEntry.index, navigation.canGoForward) });",
+               "nav push https://app.example/p/b true true -1 false | nav push https://app.example/p/c true true -1 false | 3 | nav traverse https://app.example/p/b true true 1 false | back done https://app.example/p/b /p/b 1 1 true"));
+  CHECK(nav_is("history.pushState(1, '', '/p/b'); var first = navigation.entries()[0];"
+               "navigation.traverseTo(first.key).finished.then(function (en) { console.log('at', en.url, en.index); return navigation.traverseTo('nope').finished }).catch(function (e) { console.log(e.name); return navigation.back().finished }).catch(function (e) { console.log('no back', e.name) });",
+               "at https://app.example/p/start 0 | InvalidStateError | no back InvalidStateError"));
+  CHECK(nav_is("navigation.back().finished.catch(function (e) { console.log(e.name) }); navigation.forward().finished.catch(function (e) { console.log(e.name) });", "InvalidStateError | InvalidStateError"));
+  // the user presses Back: the page hears of it
+  CHECK(nav_is("history.pushState('s', '', '/p/b'); navigation.onnavigate = function (e) { console.log('nav', e.navigationType, e.userInitiated, e.canIntercept, e.cancelable) }; navigation.oncurrententrychange = function (e) { console.log('change', e.navigationType, e.from.url) }; navigation.onnavigatesuccess = function () { console.log('success', navigation.currentEntry.url) };",
+               "nav traverse true true false | change traverse https://app.example/p/b | success https://app.example/p/start",
+               [](FakeEnvironment&, Page& page, SessionHistory& h) {
+                 h.go(-1);
+                 page.traverse(StringView(h.current()->address.view()), StringView(), false);
+               }));
+  // state of an entry, kept apart from history.state
+  CHECK(nav_is("navigation.updateCurrentEntry({ state: { k: [1, 2] } }); console.log(JSON.stringify(navigation.currentEntry.getState()), history.state);"
+               "navigation.oncurrententrychange = function (e) { console.log('change', e.navigationType, e.from === navigation.currentEntry) }; navigation.updateCurrentEntry({ state: 5 }); console.log(navigation.currentEntry.getState());"
+               "history.pushState('h', '', '/p/z'); console.log(navigation.currentEntry.getState(), navigation.entries()[0].getState());"
+               "try { navigation.updateCurrentEntry({}) } catch (e) { console.log(e.name) }",
+               "{\"k\":[1,2]} null | change null true | 5 | change push false | undefined 5 | TypeError"));
+  // entries that are forgotten say so
+  CHECK(nav_is("history.pushState(0, '', '/p/b'); history.pushState(0, '', '/p/c'); var c = navigation.currentEntry; c.ondispose = function () { console.log('disposed', c.url, c.index) };"
+               "history.back(); setTimeout(function () { history.pushState(0, '', '/p/d'); console.log(navigation.entries().length, navigation.entries().map(function (e) { return e.url.slice(-1) }).join('')) }, 5);",
+               "disposed https://app.example/p/c -1 | 3 tbd"));
+  // location.assign() is a navigation the page can see and stop; one nobody stops goes to the browser
+  CHECK(nav_is("navigation.onnavigate = function (e) { console.log(e.navigationType, e.canIntercept, e.destination.sameDocument) }; location.assign('/p/other'); location.replace('/p/third');", "push true false | replace true false",
+               nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.size() == 2); }));
+  CHECK(nav_is("navigation.onnavigate = function (e) { e.preventDefault() }; location.assign('/p/other'); console.log('stayed');", "stayed", nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.empty()); }));
+  CHECK(nav_is("navigation.onnavigate = function (e) { if (e.canIntercept) e.intercept({ handler: function () { console.log('intercepted', e.destination.url) } }) }; location.assign('/p/spa'); setTimeout(function () { console.log(location.pathname, navigation.entries().length) }, 5);",
+               "intercepted https://app.example/p/spa | /p/spa 2", nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.empty()); }));
+  // other origins' entries are not listed
+  CHECK(nav_is("console.log(navigation.entries().length)", "1"));
+  CHECK(nav_is("navigation.navigate('https://elsewhere.example/').committed.catch(function () {}); console.log(typeof navigation.navigate('/p/q', { history: 'replace' }).finished, navigation.entries().length);"
+               "try { navigation.navigate('/p/q', { history: 'bogus' }) } catch (e) { console.log(e.name) }", "object 1 | TypeError", nullptr, [](FakeEnvironment& env) { CHECK(env.navigations.size() == 2 && env.navigations[0] == "https://elsewhere.example/" && env.navigations[1] == "https://app.example/p/q (replace)"); }));
+  // history.back() and friends go through the same machinery
+  CHECK(nav_is("history.pushState(0, '', '/p/b'); navigation.onnavigate = function (e) { console.log('nav', e.navigationType, e.destination.url); }; navigation.onnavigatesuccess = function () { console.log('done', location.pathname) }; history.back();",
+               "nav traverse https://app.example/p/start | done /p/start"));
+  CHECK(nav_is("history.pushState(0, '', '/p/b'); navigation.onnavigate = function (e) { e.preventDefault(); console.log('stopped') }; history.back(); setTimeout(function () { console.log(location.pathname) }, 5)", "stopped | /p/b"));
+}
+
 static void test_messaging() {
   // to itself: the data is a copy, with what JSON cannot say kept
   CHECK(async_is("addEventListener('message', function (e) { var d = e.data; console.log(e.type, e.origin, e.source === window, e.ports.length, e.lastEventId === '', d.a.length, d.a[1].b, d.d instanceof Date, d.d.getTime(), 'u' in d, d.u, isNaN(d.n), 1 / d.z, d.s, d === msg, e instanceof MessageEvent) });"
@@ -3780,6 +4073,7 @@ int main(int argc, char** argv) {
   test_fetch_wire();
   test_storage();
   test_cookies_web();
+  test_navigation();
   test_messaging();
   test_history_api();
   test_scripts_during_load();

@@ -265,6 +265,17 @@ void Desktop::setup_web_browser(WebBrowser& web) {
   web.set_shared_hubs(&local_storage_, &page_hub_);
   web.set_clock(&Desktop::unix_ms, this);
   web.set_media_services(media_mixer_, media_codecs_, media_clock_);
+  web.set_open_window_handler(&Desktop::open_script_window, this);
+}
+
+// window.open() of a page: another browser tab next to the page's (or a window of its own), showing the address. It may close itself with window.close().
+bool Desktop::open_script_window(void* self, WebBrowser& from, StringView address) {
+  auto* d = static_cast<Desktop*>(self);
+  Frame* host = from.host();
+  WebBrowser* opened = d->open_web_browser(host ? host->as_tabs() : nullptr);
+  if (!opened) return false;
+  opened->set_opened_by_script(true);
+  return opened->navigate(address);
 }
 
 // The local time of the taskbar clock as milliseconds since 1970 (what a script's Date.now() says; 0 without a clock).

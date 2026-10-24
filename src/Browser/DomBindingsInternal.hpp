@@ -53,6 +53,7 @@ struct DomBindings::Impl {
   String first_error;
   List<CustomValidity> custom_validity;   // setCustomValidity() messages of controls
   int32_t scroll_line = 0;
+  bool page_hidden = false;   // document.hidden / visibilityState: true while the page is being left
   script::JsString *k_length = nullptr;
 };
 

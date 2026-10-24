@@ -58,6 +58,15 @@ class IPageEnvironment : public IObjectEnvironment {
   // history.pushState() / replaceState() from the page (the browser adds or changes the history entry), and the state of the entry the page is on (JSON text).
   virtual void push_state(StringView address, StringView state_json, bool has_state, bool replace) = 0;
   virtual bool history_state(String* json) { (void)json; return false; }
+  // The session history for the Navigation API: a JSON array of {"key","id","url","state"} for the entries of the tab, and the index of the current one. False if
+  // the browser has none. The navigation state of the current entry is kept apart from history.state; traverseTo() names an entry by its key.
+  virtual bool history_entries(String* json, int64_t* index) { (void)json; (void)index; return false; }
+  virtual void set_navigation_state(StringView json, bool has_state) { (void)json; (void)has_state; }
+  virtual void history_go_to_key(uint64_t key) { (void)key; }
+  // window.open(): a new window (tab) for `address`; `target` is the name it was given ("" or _blank: always a new one). False if the browser cannot or will not (a
+  // pop-up blocker). close_window() is window.close() of a page that was opened by a script.
+  virtual bool open_window(StringView address, StringView target, bool noopener) { (void)address; (void)target; (void)noopener; return false; }
+  virtual void close_window() {}
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // the page asked for a vertical position, in CSS pixels
@@ -186,6 +195,18 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool next_timer(double* due_ms);
   // Where the page is scrolled to (a script called scrollTo): the vertical position in pixels it asked for, or -1 if it did not since the last call.
   int32_t take_scroll_request();
+  // The address of the page that led here (document.referrer); set before load().
+  void set_referrer(StringView referrer) { referrer_.assign(referrer); }
+  // Leaving the page: fires `beforeunload`; true if a listener asked for a confirmation (preventDefault() or a returnValue).
+  bool before_unload();
+  // The page is going away: `visibilitychange` (hidden), `pagehide`, `unload`.
+  void unload();
+  // Has the page set history.scrollRestoration to "manual"?
+  bool scroll_restoration_manual();
+  // The fragment of the page's address is scrolled to when the page is next drawn (after load, and a fragment change).
+  void scroll_to_fragment() { fragment_pending_ = true; }
+  // A <meta http-equiv=refresh> in the page: the delay in seconds and the address ("" = reload); false if there is none.
+  bool meta_refresh(double* seconds, String* address);
 
   dom::Document& document() { return doc_; }
   StringView address() override { return address_.view(); }
@@ -217,6 +238,13 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint32_t history_length() override { return env_.history_length(); }
   void push_state(StringView address, StringView state_json, bool has_state, bool replace) override;
   bool history_state(String* json) override;
+  bool history_entries(String* json, int64_t* index) override { return env_.history_entries(json, index); }
+  void set_navigation_state(StringView json, bool has_state) override { env_.set_navigation_state(json, has_state); }
+  void history_go_to_key(uint64_t key) override { env_.history_go_to_key(key); }
+  bool open_window(StringView address, StringView target, bool noopener) override { return env_.open_window(address, target, noopener); }
+  void close_window() override { env_.close_window(); }
+  StringView referrer() override { return referrer_.view(); }
+  void scroll_node_into_view(dom::Node* node) override;
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t y) override;
   bool pip_supported() override { return env_.pip_supported(); }
@@ -290,6 +318,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   };
 
   bool start_engine();
+  void resolve_scroll_target(const layout::BoxTree& tree);
   void deliver_object_events();
   // Forms
   struct Frame;
@@ -350,6 +379,9 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint64_t rendered_version_ = 0;
   bool loading_ = true, engine_failed_ = false;
   int32_t scroll_request_ = -1;
+  String referrer_;
+  bool fragment_pending_ = false;
+  uint32_t scroll_node_ = 0;   // an element scrollIntoView() was called on: its place is worked out when the page is drawn
   uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
   struct Message {
     explicit Message(allocators::IAllocator& a) : payload(a), origin(a), ports(a) {}
