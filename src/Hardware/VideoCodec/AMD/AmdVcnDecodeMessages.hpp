@@ -23,6 +23,7 @@
 #include "Hardware/VideoCodec/Software/Av1Core.hpp"
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
 #include "Hardware/VideoCodec/Software/Mpeg2Core.hpp"
+#include "Hardware/VideoCodec/Software/Vc1Core.hpp"
 #include "Hardware/VideoCodec/Software/Vp9Core.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -48,8 +49,8 @@ constexpr uint32_t kCmdItScalingTableBuffer = 0x204;
 constexpr uint32_t kCmdContextBuffer = 0x206;
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;       // header msg_type
-constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13, kMessageMpeg2 = 0x0A, kMessageVp9 = 0x0E, kMessageDynamicDpb = 0x10, kMessageAv1 = 0x11;   // index message_id
-constexpr uint32_t kStreamTypeMpeg2 = 3, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10, kStreamTypeVp9 = 0x11, kStreamTypeAv1 = 0x13;
+constexpr uint32_t kMessageCreate = 1, kMessageDecode = 2, kMessageAvc = 6, kMessageHevc = 13, kMessageVc1 = 7, kMessageMpeg2 = 0x0A, kMessageVp9 = 0x0E, kMessageDynamicDpb = 0x10, kMessageAv1 = 0x11;   // index message_id
+constexpr uint32_t kStreamTypeVc1 = 1, kStreamTypeMpeg2 = 3, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10, kStreamTypeVp9 = 0x11, kStreamTypeAv1 = 0x13;
 constexpr uint32_t kProfileBaseline = 0, kProfileMain = 1, kProfileHigh = 2;
 constexpr uint32_t kArrayModeLinear = 0;
 
@@ -242,6 +243,28 @@ uint32_t mpeg2_decode_message_bytes();   // header, the two indexes, the decode 
 bool build_mpeg2_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const mpeg2::OffloadPicture& picture, const Mpeg2Slots& slots, const DecodeBuffers& buffers);
 // The feedback header (and nothing else; the engine has no table for MPEG-2) in a buffer of at least kMessageFeedbackItBytes that starts at the message buffer.
 bool prepare_mpeg2_feedback(ByteView message_buffer);
+
+// VC-1 --------------------------------------------------------------------------------------------------------------------------------------------------------
+
+constexpr uint32_t kVc1References = 5;   // the pictures Mesa sizes the picture buffer for at least (NUM_VC1_REFS: "the firmware seems to always assume a minimum of ref frames"); three are used
+struct Vc1BufferSizes {
+  uint64_t dpb = 0;   // the pictures, then the context, intra transform, deblocking and bit plane areas the firmware keeps behind them (no context buffer of its own)
+  uint32_t references = 0;
+};
+// Sizes for pictures of `width` x `height` luma samples (Mesa's calc_dpb_size for VC-1). 0 when the picture is too big.
+Vc1BufferSizes vc1_buffer_sizes(uint32_t width, uint32_t height);
+// The picture buffer slots the engine is told about: the one this picture is decoded into and the ones it predicts from. A picture without a reference names its own
+// slot for it.
+struct Vc1Slots {
+  uint32_t current = 0, forward = 0, backward = 0;
+};
+uint32_t vc1_decode_message_bytes();   // header, the two indexes, the decode message and the VC-1 message
+// Builds the decode message of one picture: the profile and the sequence and entry point flags (the firmware reads the picture header itself, from the bitstream, which
+// holds the whole frame: the frame unit and its slices, each behind its start code for the Advanced profile). False when `out` is too small or the stream is not one the
+// engine takes (4:2:0 progressive pictures; sizes within the limits).
+bool build_vc1_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const vc1::OffloadPicture& picture, const Vc1Slots& slots, const DecodeBuffers& buffers);
+// The feedback header (and nothing else) in a buffer of at least kMessageFeedbackItBytes that starts at the message buffer.
+bool prepare_vc1_feedback(ByteView message_buffer);
 
 // What the firmware wrote into the feedback area after a picture.
 struct Feedback {

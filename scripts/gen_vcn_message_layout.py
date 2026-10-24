@@ -25,6 +25,7 @@ TYPES = [
     ('Av1SegmentFg', 'rvcn_dec_av1_segment_fg_t'),
     ('Vp9', 'rvcn_dec_message_vp9_t'),
     ('Mpeg2', 'rvcn_dec_message_mpeg2_vld_t'),
+    ('Vc1', 'rvcn_dec_message_vc1_t'),
     ('DynamicDpb', 'rvcn_dec_message_dynamic_dpb_t'),
     ('Vp9Probs', 'rvcn_dec_vp9_probs_t'),
     ('FeedbackIndex', 'rvcn_dec_feature_index_t'),

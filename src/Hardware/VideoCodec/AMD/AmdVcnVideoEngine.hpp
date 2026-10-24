@@ -176,6 +176,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     enable_vp9_decode();
     enable_av1_decode();
     enable_mpeg2_decode();
+    enable_vc1_decode();
     return true;
   }
 
@@ -189,6 +190,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     av1_ready_ = false;
     vp9_ready_ = false;
     mpeg2_ready_ = false;
+    vc1_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     if (vcn1_) {
@@ -241,6 +243,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     av1_ready_ = false;
     vp9_ready_ = false;
     mpeg2_ready_ = false;
+    vc1_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     AmdVcnWorkMemory::Piece ib, fence;
@@ -390,16 +393,56 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     refresh_summary();
     return true;
   }
+  // After enable_decode(): the same for VC-1, on the engines that have it (the ones that decode MPEG-2). Its test compares with a tolerance too, since nothing here has
+  // verified the engine's VC-1 decoder against the standard.
+  bool enable_vc1_decode() {
+    vc1_ready_ = false;
+    if (!ring_) return false;
+    const AmdVcnSelfTest::Result result = AmdVcnSelfTest::run_vc1(allocator_, decode_engine_);
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("VC-1 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+      } else {
+        decode_text_.assign(engine_note_);
+        decode_text_.append("; VC-1 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("), VC-1 stays on the CPU");
+      }
+      engine_note_ = decode_text_.c_str();
+      rebuild_firmware_text();
+      refresh_summary();
+      return false;
+    }
+    vc1_ready_ = true;
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Vc1);
+    engine_note_ = "engine started; VC-1 decode runs on it (self-test passed)";
+    rebuild_firmware_text();
+    refresh_summary();
+    return true;
+  }
   bool decode_ready() const { return decode_ready_; }
   bool hevc_ready() const { return hevc_ready_; }
   bool av1_ready() const { return av1_ready_; }
   bool vp9_ready() const { return vp9_ready_; }
   bool mpeg2_ready() const { return mpeg2_ready_; }
+  bool vc1_ready() const { return vc1_ready_; }
   // What became of the engine, in words (also part of firmware_status() once the firmware is loaded).
   const char* engine_note() const { return engine_note_; }
 
   // H.264 and H.265 go to the engine when they passed their tests and it is free; anything else (and a stream the engine will not take) goes to the CPU.
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::Vc1 && vc1_ready_ && ring_ && !ring_->wedged()) {
+      AmdVcnVc1Decoder::Engine engine = decode_engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdVcnVc1Decoder> session = UniquePointer<AmdVcnVc1Decoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
     if (config.codec == VideoCodec::Mpeg2 && mpeg2_ready_ && ring_ && !ring_->wedged()) {
       AmdVcnMpeg2Decoder::Engine engine = decode_engine_;
       engine.stream_handle = ++next_stream_handle_;
@@ -461,7 +504,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   const AmdGpuInfo& gpu() const { return gpu_; }
   // Codecs the engine would serve once it is driven: today's sessions all run in software (info().accelerated is false).
   uint32_t engine_decode_codecs() const {
-    return base_codecs() | (amd_gpu_has_video_engine(gpu_.architecture) ? codec_mask(VideoCodec::Mpeg2) : 0) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) |
+    return base_codecs() | (amd_gpu_has_video_engine(gpu_.architecture) ? codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) : 0) | (gpu_.media_hevc ? codec_mask(VideoCodec::Hevc) : 0) |
            (gpu_.media_vp9 ? codec_mask(VideoCodec::Vp9) : 0) | (gpu_.media_av1_decode ? codec_mask(VideoCodec::Av1) : 0);
   }
   uint32_t engine_encode_codecs() const {
@@ -583,6 +626,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
   bool av1_ready_ = false;
   bool vp9_ready_ = false;
   bool mpeg2_ready_ = false;
+  bool vc1_ready_ = false;
   uint32_t next_stream_handle_ = 1;
   FixedString<200> decode_text_;
   MmioRegion registers_;

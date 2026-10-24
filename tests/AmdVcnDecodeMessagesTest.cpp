@@ -59,6 +59,8 @@ static uint32_t word(const std::vector<uint8_t>& m, uint32_t offset) {
   return m[offset] | (m[offset + 1] << 8) | (m[offset + 2] << 16) | (uint32_t{m[offset + 3]} << 24);
 }
 
+static uint32_t half(const std::vector<uint8_t>& m, uint32_t offset) { return m[offset] | (m[offset + 1] << 8); }
+
 // The first access unit of an Annex B file that holds a slice, with the parameter sets in front of it.
 static bool first_picture(const std::vector<uint8_t>& stream, size_t* end) {
   size_t slices = 0;
@@ -656,6 +658,104 @@ static void test_mpeg2_messages() {
   CHECK(!prepare_mpeg2_feedback(ByteView(fb.data(), kMessageFeedbackItBytes - 1)));
 }
 
+// VC-1: the offsets are Mesa's rvcn_dec_message_vc1_t, written out here by hand: profile, level, sps and pps flags, structure and chroma format as 32 bits from 0, then
+// four 16 bit picture indexes from 24 and the cached frame flag at 32.
+static void test_vc1_messages() {
+  // Mesa's sum: five pictures of 1920 x 1088 x 1.5 (a multiple of 1024), then 128 bytes a macroblock, 64 and 128 a macroblock column and the bit plane line.
+  Vc1BufferSizes sizes = vc1_buffer_sizes(1920, 1088);
+  const uint64_t wmb = 120, hmb = 68;
+  CHECK(sizes.references == 5 && sizes.dpb == 3133440ull * 5 + wmb * hmb * 128 + wmb * 64 + wmb * 128 + (120 * 7 * 16 + 63) / 64 * 64);
+  // The macroblock rows are rounded up to an even count (a 96 x 48 picture: 6 x 4 macroblocks; 90 x 54 coded as 96 x 64; 3 rows count as 4).
+  CHECK(vc1_buffer_sizes(96, 48).dpb == ((96ull * 48 * 3 / 2 + 1023) / 1024 * 1024) * 5 + 6 * 4 * 128 + 6 * 64 + 6 * 128 + (6 * 7 * 16 + 63) / 64 * 64);
+  CHECK(vc1_buffer_sizes(96, 48 + 16).dpb == ((96ull * 64 * 3 / 2 + 1023) / 1024 * 1024) * 5 + 6 * 4 * 128 + 6 * 64 + 6 * 128 + (6 * 7 * 16 + 63) / 64 * 64);
+  CHECK(vc1_buffer_sizes(0, 0).dpb == 0 && vc1_buffer_sizes(8192, 4320).dpb == 0 && vc1_buffer_sizes(100, 100).dpb == 0);
+
+  vc1::SequenceHeader seq;
+  seq.valid = true;
+  seq.profile = vc1::kAdvanced;
+  seq.mb_width = 120;
+  seq.mb_height = 68;
+  seq.postprocflag = true;
+  seq.broadcast = true;
+  seq.finterpflag = true;
+  seq.loop_filter = true;
+  seq.overlap = true;
+  seq.fastuvmc = true;
+  seq.extended_mv = true;
+  seq.extended_dmv = true;
+  seq.vstransform = true;
+  seq.resync_marker = true;
+  seq.dquant = 2;
+  seq.quantizer_mode = 3;
+  seq.max_b_frames = 2;
+  vc1::PictureHeader pic;
+  pic.type = vc1::kPictureB;
+  vc1::OffloadPicture picture;
+  picture.seq = &seq;
+  picture.pic = &pic;
+  DecodeBuffers buffers;
+  buffers.bitstream_bytes = 1000;
+  buffers.dpb_bytes = sizes.dpb;
+  buffers.target = target_layout(1920, 1088);
+  CHECK(vc1_decode_message_bytes() == 244 + 36);
+  Vc1Slots slots;
+  slots.current = 2;
+  slots.forward = 4;
+  slots.backward = 1;
+  std::vector<uint8_t> m(4096, 0xAA);
+  CHECK(build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  // Header, indexes: decode message (id 2) at 56, the VC-1 message (id 7) at 244.
+  CHECK(word(m, 0) == 40 && word(m, 4) == 244 && word(m, 8) == 2 && word(m, 12) == 1 && word(m, 16) == 9 && word(m, 20) == 77);
+  CHECK(word(m, 24) == 2 && word(m, 28) == 56 && word(m, 32) == 188 && word(m, 40) == 7 && word(m, 44) == 244 && word(m, 48) == 36);
+  CHECK(word(m, 56) == 1);   // stream type VC-1
+  // The Advanced profile's size is in samples.
+  CHECK(word(m, 56 + 8) == 1920 && word(m, 56 + 12) == 1088 && word(m, 56 + 20) == sizes.dpb && word(m, 56 + 36) == 0);
+  const uint32_t h = 244;
+  CHECK(word(m, h) == 2 && word(m, h + 4) == 4);
+  CHECK(word(m, h + 8) == ((1u << 7) | (1u << 6) | (1u << 3)));
+  CHECK(word(m, h + 12) == ((2u << 16) | (1u << 11) | (3u << 9) | 1u | (1u << 20) | (1u << 5) | (1u << 4) | (1u << 3) | (1u << 8) | (2u << 1)));
+  CHECK(word(m, h + 16) == 0 && word(m, h + 20) == 1);
+  CHECK(half(m, h + 24) == 2 && half(m, h + 26) == 2 && half(m, h + 28) == 4 && half(m, h + 30) == 1 && word(m, h + 32) == 0);
+  CHECK(m[vc1_decode_message_bytes()] == 0xAA);   // nothing written past the message
+  // Simple and Main profile: the size in macroblocks, and Simple has no entry point flags.
+  seq.profile = vc1::kSimple;
+  seq.mb_width = 6;
+  seq.mb_height = 4;
+  buffers.target = target_layout(96, 64);
+  buffers.dpb_bytes = vc1_buffer_sizes(96, 64).dpb;
+  CHECK(build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  CHECK(word(m, 56 + 8) == 6 && word(m, 56 + 12) == 4);
+  CHECK(word(m, h) == 0 && word(m, h + 4) == 1);
+  CHECK(word(m, h + 12) == ((2u << 16) | (1u << 11) | (3u << 9) | 1u));   // (no loop filter, resync, rangered, fastuvmc, extended or dquant bits)
+  seq.profile = vc1::kMain;
+  CHECK(build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  CHECK(word(m, 56 + 8) == 6 && word(m, h) == 1 && word(m, h + 4) == 2 && (word(m, h + 12) & (1u << 5)) != 0);
+  // Refused: too small a buffer (every size), the Complex profile, interlace, slots out of range, no headers, a picture size the engine does not take.
+  for (uint32_t n = 0; n < vc1_decode_message_bytes(); ++n) CHECK(!build_vc1_decode_message(ByteView(m.data(), n), 9, 77, picture, slots, buffers));
+  seq.profile = vc1::kComplex;
+  CHECK(!build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  seq.profile = vc1::kMain;
+  seq.interlace = true;
+  CHECK(!build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  seq.interlace = false;
+  Vc1Slots bad = slots;
+  bad.forward = 5;
+  CHECK(!build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, bad, buffers));
+  bad = slots;
+  bad.current = 5;
+  CHECK(!build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, bad, buffers));
+  vc1::OffloadPicture empty;
+  CHECK(!build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, empty, slots, buffers));
+  seq.mb_width = 300;
+  CHECK(!build_vc1_decode_message(ByteView(m.data(), m.size()), 9, 77, picture, slots, buffers));
+  seq.mb_width = 6;
+  // The feedback header, and no more.
+  std::vector<uint8_t> fb(kMessageFeedbackItBytes, 0xAA);
+  CHECK(prepare_vc1_feedback(ByteView(fb.data(), fb.size())));
+  CHECK(word(fb, kFeedbackOffset) == 44 && word(fb, kFeedbackOffset + 4) == 44 && word(fb, kFeedbackOffset + 8) == 0 && fb[0] == 0xAA && fb[kItTableOffset] == 0xAA);
+  CHECK(!prepare_vc1_feedback(ByteView(fb.data(), kMessageFeedbackItBytes - 1)));
+}
+
 int main() {
   test_create_and_destroy();
   test_buffer_sizes();
@@ -665,6 +765,7 @@ int main() {
   test_hevc_messages();
   test_av1_messages();
   test_mpeg2_messages();
+  test_vc1_messages();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("AmdVcnDecodeMessagesTest passed\n");
   return 0;

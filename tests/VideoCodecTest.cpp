@@ -487,7 +487,7 @@ static void test_system_list() {
     CHECK(!system.at(1)->info().hardware_engine && strcmp(system.at(1)->name(), "Software video codec") == 0);
     CHECK(system.at(1)->engine_summary()[0] == 0 && strstr(system.at(0)->engine_summary(), "chip ID not read"));   // no mapper: nothing was read
     CHECK(system.at(2) == nullptr);
-    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Mpeg2)));
+    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1)));
     DecoderConfig dc;
     dc.codec = VideoCodec::Mjpeg;
     CHECK(system.create_decoder(dc));

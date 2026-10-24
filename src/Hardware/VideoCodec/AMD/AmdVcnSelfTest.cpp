@@ -24,6 +24,7 @@
 #include "Hardware/VideoCodec/Software/Vp9.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
 #include "Hardware/VideoCodec/Software/Mpeg2.hpp"
+#include "Hardware/VideoCodec/Software/Vc1.hpp"
 #include "Hardware/VideoCodec/VideoFrameBuffer.hpp"
 
 namespace hardware {
@@ -288,7 +289,7 @@ namespace {
 constexpr uint32_t kMpeg2MaxDifference = 12;
 constexpr uint64_t kMpeg2MaxTotalDifference = 64 * 64 * 3 / 2;   // (a mean of one level over the picture)
 
-bool close_picture(const VideoFrame& a, const VideoFrame& b) {
+bool close_picture(const VideoFrame& a, const VideoFrame& b, uint32_t max_difference = kMpeg2MaxDifference, uint64_t max_total = kMpeg2MaxTotalDifference) {
   if (a.format != b.format || a.pts_us != b.pts_us) return false;
   uint64_t total = 0;
   for (uint32_t p = 0; p < a.format.plane_count(); ++p)
@@ -296,10 +297,10 @@ bool close_picture(const VideoFrame& a, const VideoFrame& b) {
       for (uint32_t col = 0; col < a.format.plane_width(p); ++col) {
         const int x = a.plane[p][uint64_t{row} * a.stride[p] + col], y = b.plane[p][uint64_t{row} * b.stride[p] + col];
         const uint32_t d = static_cast<uint32_t>(x > y ? x - y : y - x);
-        if (d > kMpeg2MaxDifference) return false;
+        if (d > max_difference) return false;
         total += d;
       }
-  return total <= kMpeg2MaxTotalDifference;
+  return total <= max_total;
 }
 }  // namespace
 
@@ -358,6 +359,85 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocat
   // The engine must really have done the work: every picture went through it (a stream the session passed to the CPU would "pass" too).
   if (session.pictures_decoded() != kMpeg2SelfTestPictures) return Result::SessionRefused;
   return got == kMpeg2SelfTestPictures ? Result::Passed : Result::Mismatch;
+}
+
+namespace {
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestVc1Stream.inc"
+
+// How close the engine's pictures must be to the CPU decoder's (see run_vc1): the same limits as for MPEG-2, a level or two a sample on average.
+constexpr uint32_t kVc1MaxDifference = 12;
+constexpr uint64_t kVc1MaxTotalDifference = 64 * 64 * 3 / 2;
+
+// One of the two streams: `config` is the Main profile sequence header (null for the Advanced profile, whose headers are in the stream), `ends` where each of the
+// kVc1SelfTestPictures packets ends in `stream`.
+AmdVcnSelfTest::Result run_vc1_stream(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine, const uint8_t* config, ConstByteView stream, const uint64_t* ends) {
+  using Result = AmdVcnSelfTest::Result;
+  constexpr uint32_t kCount = kVc1SelfTestPictures;
+  auto packet = [&](uint32_t i) {
+    const uint64_t start = i == 0 ? 0 : ends[i - 1];
+    return stream.subview(start, ends[i] - start);
+  };
+  const ConstByteView header = config ? ConstByteView(config, 4) : ConstByteView();
+  // The CPU's pictures, in display order.
+  VideoFrameBuffer expected[kCount] = {VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator),
+                                       VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator), VideoFrameBuffer(allocator)};
+  int64_t pts[kCount] = {};
+  {
+    Vc1Decoder cpu(allocator);
+    if (config && !cpu.configure(header, kVc1SelfTestSize, kVc1SelfTestSize)) return Result::StreamFailed;
+    uint32_t got = 0;
+    VideoFrame f;
+    for (uint32_t i = 0; i <= kCount; ++i) {
+      if (i < kCount) {
+        if (!cpu.decode(packet(i), int64_t{i} * 1000)) return Result::StreamFailed;
+      } else {
+        cpu.flush();
+      }
+      while (cpu.receive(&f)) {
+        if (got >= kCount || !keep_picture(f, &expected[got])) return Result::StreamFailed;
+        pts[got++] = f.pts_us;
+      }
+    }
+    if (got != kCount) return Result::StreamFailed;
+  }
+
+  DecoderConfig dc;
+  dc.codec = VideoCodec::Vc1;
+  dc.output = PixelFormat::I420;
+  dc.width = dc.height = kVc1SelfTestSize;
+  dc.codec_config = header;
+  AmdVcnVc1Decoder session(allocator, engine, dc);
+  if (!session.prepare()) return Result::SessionRefused;
+  uint32_t got = 0;
+  VideoFrame f;
+  auto check = [&]() {
+    while (session.receive(&f)) {
+      if (got >= kCount || !close_picture(f, expected[got].frame(pts[got]), kVc1MaxDifference, kVc1MaxTotalDifference)) return false;
+      ++got;
+    }
+    return true;
+  };
+  for (uint32_t i = 0; i < kCount; ++i) {
+    VideoPacket p;
+    p.data = packet(i);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
+    if (!check()) return Result::Mismatch;
+  }
+  session.flush();
+  if (!check()) return Result::Mismatch;
+  if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
+  // The engine must really have done the work: every picture went through it (a stream the session passed to the CPU would "pass" too).
+  if (session.pictures_decoded() != kCount) return Result::SessionRefused;
+  return got == kCount ? Result::Passed : Result::Mismatch;
+}
+}  // namespace
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine) {
+  const Result main_profile = run_vc1_stream(allocator, engine, kVc1SelfTestMainConfig, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds);
+  if (main_profile != Result::Passed) return main_profile;
+  return run_vc1_stream(allocator, engine, nullptr, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds);
 }
 
 const char* AmdVcnSelfTest::result_name(Result result) {
