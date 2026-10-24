@@ -683,6 +683,9 @@ bool Core::col_mv(const Picture* col, int xcol, int ycol, int ref_idx, int list,
   if (!(b.pred_flags & 1)) list_col = 1;
   else if (!(b.pred_flags & 2)) list_col = 0;
   else list_col = no_backward_pred_ ? list : (sh_.collocated_from_l0 ? 1 : 0);
+#ifdef H265_TRACE_PU
+  fprintf(stderr, "    col poc %d at %d,%d: pred %d list_col %d mv (%d,%d) refpoc %d\n", col->poc, xcol, ycol, b.pred_flags, list_col, b.mv[list_col][0], b.mv[list_col][1], b.ref_poc[list_col]);
+#endif
   const bool cur_long = slice_->ref_long[list][ref_idx];
   const bool col_long = (b.long_term >> list_col) & 1;
   if (cur_long != col_long) return false;
@@ -724,47 +727,42 @@ void Core::merge_motion(int x_cb, int y_cb, int n_cb, int x_pb, int y_pb, int w,
   const int max_cand = sh_.max_num_merge_cand;
   auto at = [&](int x, int y) -> const MvField& { return mvf_[static_cast<uint64_t>(y >> 2) * w4_ + (x >> 2)]; };
   auto same_region = [&](int xn, int yn) { return (x_pb >> par) == (xn >> par) && (y_pb >> par) == (yn >> par); };
-  bool av_a1 = false, av_b1 = false, av_b0 = false, av_a0 = false, av_b2 = false;
+  // A neighbour is "available" (eligible for comparison) when the rules of 6.4.2 and the parallel merge level allow it; whether it is also added to the list depends on
+  // the comparisons with the neighbours before it, which use eligibility, not whether those were added.
+  bool el_a1 = false, el_b1 = false, el_b0 = false, el_a0 = false, el_b2 = false;
   MvField a1{}, b1{}, b0{}, a0{}, b2{};
   {
     const int xn = x_pb - 1, yn = y_pb + h - 1;
-    av_a1 = !same_region(xn, yn) && !((part_mode == kPartNx2N || part_mode == kPartnLx2N || part_mode == kPartnRx2N) && part_idx == 1) &&
+    el_a1 = !same_region(xn, yn) && !((part_mode == kPartNx2N || part_mode == kPartnLx2N || part_mode == kPartnRx2N) && part_idx == 1) &&
             available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
-    if (av_a1) a1 = at(xn, yn);
+    if (el_a1) a1 = at(xn, yn);
   }
   {
     const int xn = x_pb + w - 1, yn = y_pb - 1;
-    av_b1 = !same_region(xn, yn) && !((part_mode == kPart2NxN || part_mode == kPart2NxnU || part_mode == kPart2NxnD) && part_idx == 1) &&
+    el_b1 = !same_region(xn, yn) && !((part_mode == kPart2NxN || part_mode == kPart2NxnU || part_mode == kPart2NxnD) && part_idx == 1) &&
             available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
-    if (av_b1) {
-      b1 = at(xn, yn);
-      if (av_a1 && same_motion(a1, b1)) av_b1 = false;
-    }
+    if (el_b1) b1 = at(xn, yn);
   }
   {
     const int xn = x_pb + w, yn = y_pb - 1;
-    av_b0 = !same_region(xn, yn) && available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
-    if (av_b0) {
-      b0 = at(xn, yn);
-      if (av_b1 && same_motion(b1, b0)) av_b0 = false;
-    }
+    el_b0 = !same_region(xn, yn) && available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
+    if (el_b0) b0 = at(xn, yn);
   }
   {
     const int xn = x_pb - 1, yn = y_pb + h;
-    av_a0 = !same_region(xn, yn) && available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
-    if (av_a0) {
-      a0 = at(xn, yn);
-      if (av_a1 && same_motion(a1, a0)) av_a0 = false;
-    }
+    el_a0 = !same_region(xn, yn) && available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
+    if (el_a0) a0 = at(xn, yn);
   }
   {
     const int xn = x_pb - 1, yn = y_pb - 1;
-    av_b2 = !same_region(xn, yn) && available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
-    if (av_b2) {
-      b2 = at(xn, yn);
-      if ((av_a1 && same_motion(a1, b2)) || (av_b1 && same_motion(b1, b2)) || (av_a0 && av_b0 && av_a1 && av_b1)) av_b2 = false;
-    }
+    el_b2 = !same_region(xn, yn) && available_pb(x_cb, y_cb, n_cb, x_pb, y_pb, w, h, part_idx, xn, yn);
+    if (el_b2) b2 = at(xn, yn);
   }
+  const bool av_a1 = el_a1;
+  const bool av_b1 = el_b1 && !(el_a1 && same_motion(a1, b1));
+  const bool av_b0 = el_b0 && !(el_b1 && same_motion(b1, b0));
+  const bool av_a0 = el_a0 && !(el_a1 && same_motion(a1, a0));
+  const bool av_b2 = el_b2 && !(el_a1 && same_motion(a1, b2)) && !(el_b1 && same_motion(b1, b2)) && !(av_a0 && av_b0 && av_a1 && av_b1);
   if (av_a1) cands[count++] = a1;
   if (av_b1) cands[count++] = b1;
   if (av_b0) cands[count++] = b0;
@@ -821,6 +819,11 @@ void Core::merge_motion(int x_cb, int y_cb, int n_cb, int x_pb, int y_pb, int w,
     m.pred_flags = sh_.type == kSliceB ? 3 : 1;
     cands[count++] = m;
   }
+#ifdef H265_TRACE_PU
+  fprintf(stderr, "  merge cands (idx %d, spatial A1=%d B1=%d B0=%d A0=%d B2=%d):", merge_idx, av_a1, av_b1, av_b0, av_a0, av_b2);
+  for (int i = 0; i < count; ++i) fprintf(stderr, " [%d p%d r%d,%d (%d,%d)(%d,%d)]", i, cands[i].pred_flags, cands[i].ref_idx[0], cands[i].ref_idx[1], cands[i].mv[0][0], cands[i].mv[0][1], cands[i].mv[1][0], cands[i].mv[1][1]);
+  fprintf(stderr, "\n");
+#endif
   *out = cands[merge_idx < count ? merge_idx : 0];
   if ((out->pred_flags & 3) == 3 && orig_w + orig_h == 12) {
     out->pred_flags = 1;
@@ -978,6 +981,9 @@ void Core::prediction_unit(int x0, int y0, int w, int h, int part_idx, int log2_
       m.mv[l][1] = wrap16(pmv[1] + mvd[l][1]);
     }
   }
+#ifdef H265_TRACE_PU
+  fprintf(stderr, "poc %d PU %d,%d %dx%d merge=%d pred=%d ref=%d,%d mv0=%d,%d mv1=%d,%d\n", poc_, x0, y0, w, h, merge, m.pred_flags, m.ref_idx[0], m.ref_idx[1], m.mv[0][0], m.mv[0][1], m.mv[1][0], m.mv[1][1]);
+#endif
   store_motion(x0, y0, w, h, m);
   // the prediction block's left and top edges are edges for the loop filter
   for (int i = 0; i < h >> 2; ++i) edge_[static_cast<uint64_t>((y0 >> 2) + i) * w4_ + (x0 >> 2)] |= 2;
