@@ -1624,9 +1624,47 @@ struct FakeMonitor final : desktop::ISystemMonitor {
   desktop::TaskGpu gpu_info;
   desktop::TaskBattery battery_info;
   desktop::TaskBattery battery() override { return battery_info; }
+  desktop::TaskNpu npu_info;
+  desktop::TaskNpu npu() override { return npu_info; }
   int32_t cpu_temperature_millicelsius() override { return cpu_temp; }
   desktop::TaskGpu gpu() override { return gpu_info; }
 };
+
+// The NPU meter of the Performance tab: there only when the machine has an NPU, and the share of time it was computing since the last update.
+static void test_computer_manager_npu() {
+  TestAllocator a;
+  {
+    FakeMonitor mon;
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::ComputerManager tm(a);
+    tm.set_monitor(&mon);
+    CHECK(mgr.add_window(&tm));
+    w.layout();
+    tm.update(1000000);
+    CHECK(!tm.npu_row_visible());                       // no NPU: no meter
+    mon.npu_info.present = true;
+    mon.npu_info.busy_us = 500000;
+    tm.update(2000000);
+    CHECK(tm.npu_row_visible() && tm.npu_label().text().equals("n/a"));   // the first sample has nothing to compare with
+    mon.npu_info.busy_us = 1250000;                     // 750 ms busy in the 1 s since the last update
+    tm.update(3000000);
+    CHECK(tm.npu_label().text().equals("75%") && tm.npu_meter().level() == 75);
+    tm.update(4000000);                                 // idle since
+    CHECK(tm.npu_label().text().equals("0%") && tm.npu_meter().level() == 0);
+    mon.npu_info.busy_us = 9000000;                     // (more than the time that passed cannot be more than all of it)
+    tm.update(5000000);
+    CHECK(tm.npu_label().text().equals("100%") && tm.npu_meter().level() == 100);
+    mon.npu_info.present = false;
+    tm.update(6000000);
+    CHECK(!tm.npu_row_visible());
+  }
+  CHECK(a.live == 0);
+}
 
 static void test_computer_manager() {
   TestAllocator a;
@@ -7238,6 +7276,7 @@ int main() {
   test_text_editor();
   test_notepad();
   test_calculator();
+  test_computer_manager_npu();
   test_explorer_copy_paste_properties();
   test_calculator_session();
   test_media_player();

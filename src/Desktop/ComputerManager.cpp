@@ -73,6 +73,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       memory_meter_(allocator),
       grid_(allocator),
       gpu_row_(allocator),
+      npu_row_(allocator),
       vram_row_(allocator),
       cpu_temp_row_(allocator),
       gpu_temp_row_(allocator),
@@ -131,6 +132,8 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     performance_page_.add(&r.row);
   }
   setup_stat_row(gpu_row_, "GPU");
+  setup_stat_row(npu_row_, "NPU");
+  npu_row_.row.set_visible(false);   // (until the machine turns out to have one)
   setup_stat_row(vram_row_, "VRAM");
   setup_stat_row(cpu_temp_row_, "CPU Temp");
   setup_stat_row(gpu_temp_row_, "GPU Temp");
@@ -439,6 +442,19 @@ void ComputerManager::update(uint64_t now_us) {
     row.value.set_text(text.view());
   };
   show_percent(gpu_row_, gpu.usage_percent);
+  // The NPU: how much of the time since the last call it spent computing. The row is there only when the machine has one.
+  const TaskNpu npu = monitor_->npu();
+  npu_row_.row.set_visible(npu.present);
+  if (npu.present) {
+    int32_t npu_percent = -1;
+    if (had_npu_ && elapsed_us > 0 && npu.busy_us >= previous_npu_busy_us_) {
+      const uint64_t percent = (npu.busy_us - previous_npu_busy_us_) * 100 / elapsed_us;
+      npu_percent = static_cast<int32_t>(percent > 100 ? 100 : percent);
+    }
+    show_percent(npu_row_, npu_percent);
+  }
+  had_npu_ = npu.present;
+  previous_npu_busy_us_ = npu.busy_us;
   if (gpu.memory_known && !gpu.memory_total_bytes) {   // the adapter knows what is in use but not what there is
     vram_row_.meter.set_level(0);
     format_size(gpu.memory_used_bytes, &used_text);

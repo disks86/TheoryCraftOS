@@ -73,6 +73,14 @@ desktop::TaskGpu SystemMonitor::gpu() {
   return g;
 }
 
+desktop::TaskNpu SystemMonitor::npu() {
+  desktop::TaskNpu n;
+  if (!npu_) return n;
+  n.present = true;
+  n.busy_us = npu_->busy_us();
+  return n;
+}
+
 desktop::TaskBattery SystemMonitor::battery() {
   desktop::TaskBattery b;
   if (!battery_) return b;

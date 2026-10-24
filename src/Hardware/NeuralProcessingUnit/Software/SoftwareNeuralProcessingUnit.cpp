@@ -45,6 +45,7 @@ template <class In, class Out>
 bool SoftwareNeuralProcessingUnit::matmul(ArrayView<const In> a, ArrayView<const In> b, ArrayView<Out> c,
                                           uint32_t m, uint32_t n, uint32_t k) {
   if (m == 0 || n == 0 || k == 0) return false;
+  BusyTimer timer(*this);
   // The views must hold the matrices the dimensions describe.
   if (a.size() < uint64_t{m} * k || b.size() < uint64_t{k} * n || c.size() < uint64_t{m} * n) return false;
 
@@ -89,6 +90,7 @@ bool SoftwareNeuralProcessingUnit::matmul_f32(ArrayView<const float> a, ArrayVie
 }
 
 bool SoftwareNeuralProcessingUnit::activate(ArrayView<float> data, NpuActivation kind) {
+  BusyTimer timer(*this);
   for (float& x : data) {
     switch (kind) {
       case NpuActivation::Relu:    x = x > 0 ? x : 0; break;
@@ -101,6 +103,7 @@ bool SoftwareNeuralProcessingUnit::activate(ArrayView<float> data, NpuActivation
 
 bool SoftwareNeuralProcessingUnit::softmax(ArrayView<float> data) {
   if (data.empty()) return false;
+  BusyTimer timer(*this);
   float largest = data[0];
   for (float x : data)
     if (x > largest) largest = x;

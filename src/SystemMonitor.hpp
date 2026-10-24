@@ -24,6 +24,7 @@
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
+#include "Hardware/NeuralProcessingUnit/INeuralProcessingUnit.hpp"
 
 class SystemMonitor final : public desktop::ISystemMonitor {
  public:
@@ -37,11 +38,14 @@ class SystemMonitor final : public desktop::ISystemMonitor {
   desktop::TaskMemory memory() override;
   int32_t cpu_temperature_millicelsius() override;
   desktop::TaskGpu gpu() override;
+  desktop::TaskNpu npu() override;
   desktop::TaskBattery battery() override;
 
   // The graphics adapter to report on and the PCI bus (the AMD temperature sensor is behind it); both may be left out.
   void set_gpu(hardware::IGraphicsProcessingUnit* gpu) { gpu_ = gpu; }
   void set_pci(const hardware::IPciBus* pci) { pci_ = pci; }
+  // The machine's hardware NPU, if it has one (nullptr: none, the Performance tab then has no NPU meter). It must outlive the monitor.
+  void set_npu(hardware::INeuralProcessingUnit* npu) { npu_ = npu; }
   // The batteries, if the machine has any (nullptr: none).
   void set_battery(hardware::AcpiBattery* battery) { battery_ = battery; }
 
@@ -49,6 +53,7 @@ class SystemMonitor final : public desktop::ISystemMonitor {
   allocators::Allocator& heap_;
   allocators::ThreadSafeAllocator& shared_;
   hardware::IGraphicsProcessingUnit* gpu_ = nullptr;
+  hardware::INeuralProcessingUnit* npu_ = nullptr;
   const hardware::IPciBus* pci_ = nullptr;
   hardware::AcpiBattery* battery_ = nullptr;
 };

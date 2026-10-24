@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Utility/ArrayView.hpp"
+#include "Hardware/Clock/IClock.hpp"
 #include "Hardware/IHardware.hpp"
 
 namespace hardware {
@@ -32,6 +33,11 @@ class INeuralProcessingUnit : public IHardware {
  public:
   virtual uint32_t compute_units() const = 0;  // independent execution units
   virtual uint64_t memory_bytes() const = 0;   // dedicated on-device memory (0 = shares system RAM)
+  // The clock the unit times its work with (nullptr: it does not). It must outlive the unit.
+  virtual void set_clock(const IClock* /*clock*/) {}
+  // Microseconds the unit has spent computing since it started (cumulative; 0 if it does not measure). The change over an interval, divided by the
+  // interval, is how busy it was: this is what the computer manager's NPU meter shows.
+  virtual uint64_t busy_us() const { return 0; }
 
   // C[m x n] = A[m x k] * B[k x n]. Quantized inference: 8-bit inputs, 32-bit
   // accumulators (no overflow for k up to 2^17). Each matrix is a view that must
