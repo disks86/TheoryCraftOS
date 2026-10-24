@@ -237,6 +237,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void storage_changed(bool session, const String* key, const String* old_value, const String* new_value) override;
   void cookie_get(String* out) override;
   void cookie_set(StringView text) override;
+  void cookie_details(StringView url, String* out) override;
+  bool cookie_write(StringView text) override;
   bool http_request(const FetchOptions& options, NetResponse* response) override { return env_.http_request(options, response); }
   void page_origin(String* out) override;
   uint32_t ws_open(StringView url, StringView protocols, String* error) override;

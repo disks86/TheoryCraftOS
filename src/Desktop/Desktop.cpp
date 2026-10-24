@@ -299,6 +299,7 @@ void Desktop::set_settings(database::local::SystemSettings* settings, StringView
   window_.locked([&] {
     settings_ = settings;
     sessions_ = settings ? UniquePointer<SessionStore>::make(allocator_, allocator_, settings->database()) : UniquePointer<SessionStore>();
+    browser_store_ = settings ? UniquePointer<BrowserStore>::make(allocator_, allocator_, settings->database()) : UniquePointer<BrowserStore>();
     database_url_.assign(database_url);
     database_query_.set_settings(settings, database_url_.view());
     for (auto& q : extra_queries_) q->set_settings(settings, database_url_.view());
@@ -890,6 +891,10 @@ void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   input_.pump();
   web_browser_.tick(uptime_us);
+  if (browser_store_ && browser_data_restored_ && uptime_us - last_browser_save_us_ > 30000000ull) {   // (the data of the browser is saved when it changed, at most every half minute)
+    last_browser_save_us_ = uptime_us;
+    if (cookie_jar_.version() != saved_cookie_version_ || local_storage_.version() != saved_storage_version_) save_browser_data();
+  }
   for (uint64_t i = 0; i < extra_browsers_.count(); ++i) extra_browsers_[i]->tick(uptime_us);
   if (__atomic_exchange_n(&reap_needed_, false, __ATOMIC_ACQ_REL)) reap_closed();
   // Watchdog: a changed window that the render thread has not redrawn for seconds means that thread (or

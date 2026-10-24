@@ -56,6 +56,8 @@ struct NetResponse {
   ByteBuffer body;
   bool redirected = false;  // a redirect was followed
   bool opaque = false;
+  // What a Clear-Site-Data header asked to be cleared (fetch_resource() already did the cookies): 1 cookies, 2 storage, 4 cache.
+  uint8_t clear_site_data = 0;
 };
 
 // A WebSocket connection made for a page (see IPageLoader::open_websocket). The page calls poll() often and reads what has arrived.

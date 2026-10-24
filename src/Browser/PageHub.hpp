@@ -33,7 +33,24 @@ class StorageHub {
   // The storage of an origin ("https://example.com"; "null" for pages without one), made when first asked for.
   StorageArea& area(StringView origin);
   uint32_t origin_count() const { return static_cast<uint32_t>(origins_.count()); }
-  void clear() { origins_.clear(); }
+  void clear() {
+    origins_.clear();
+    ++clears_;
+  }
+  // Empties every origin's storage (the areas stay: pages hold references to them).
+  void clear_all() {
+    for (uint64_t i = 0; i < origins_.count(); ++i) origins_[i]->area.clear();
+    ++clears_;
+  }
+  // For saving: goes up whenever anything in any origin changed; and the origins with their storage.
+  uint64_t version() const;
+  StringView origin_name(uint32_t i) const { return i < origins_.count() ? origins_[i]->origin.view() : StringView(); }
+  StorageArea& area_at(uint32_t i) { return origins_[i]->area; }
+  uint64_t total_bytes() const {
+    uint64_t sum = 0;
+    for (uint64_t i = 0; i < origins_.count(); ++i) sum += origins_[i]->area.bytes();
+    return sum;
+  }
 
  private:
   struct Origin {
@@ -44,6 +61,7 @@ class StorageHub {
   allocators::IAllocator& allocator_;
   List<UniquePointer<Origin>> origins_;
   StorageArea fallback_;
+  uint64_t clears_ = 0;
 };
 
 struct HubEvent {

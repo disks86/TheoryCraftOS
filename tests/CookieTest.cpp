@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string>
 #include "Browser/CookieJar.hpp"
+#include "Browser/PublicSuffix.hpp"
 
 using namespace browser;
 
@@ -211,6 +212,49 @@ static void test_damaged() {
   }
 }
 
+static void test_public_suffix_and_more() {
+  // a Domain naming a public suffix is refused, unless it is the host itself (then the cookie is a host cookie)
+  CookieJar jar(g_alloc);
+  CHECK(!store(jar, "a=1; Domain=com", "http://example.com/") && !store(jar, "b=1; Domain=co.uk", "http://shop.example.co.uk/") && !store(jar, "c=1; Domain=github.io", "http://me.github.io/"));
+  CHECK(store(jar, "d=1; Domain=example.co.uk", "http://shop.example.co.uk/") && header(jar, "http://www.example.co.uk/") == "d=1");
+  CHECK(store(jar, "e=1; Domain=github.io", "http://github.io/") && header(jar, "http://github.io/") == "e=1" && header(jar, "http://me.github.io/").empty());
+  CHECK(is_public_suffix("com") && is_public_suffix("co.uk") && is_public_suffix("herokuapp.com") && !is_public_suffix("example.com") && !is_public_suffix("example.co.uk"));
+  // Partitioned needs Secure
+  CookieJar p(g_alloc);
+  CHECK(!store(p, "x=1; Partitioned", "https://example.com/") && store(p, "x=1; Secure; Partitioned", "https://example.com/"));
+  List<CookieJar::Cookie> list(g_alloc);
+  p.list_for_script(url_of("https://example.com/"), kNow, &list);
+  CHECK(list.count() == 1 && list[0].partitioned && list[0].secure);
+  // the version changes with every change
+  CookieJar v(g_alloc);
+  const uint64_t v0 = v.version();
+  store(v, "a=1", "http://example.com/");
+  const uint64_t v1 = v.version();
+  store(v, "a=2", "http://example.com/");
+  CHECK(v1 > v0 && v.version() > v1);
+  const uint64_t v2 = v.version();
+  CHECK(v.remove_cookie("a", "example.com", "/", true) && v.version() > v2 && v.count() == 0 && !v.remove_cookie("a", "example.com", "/", true));
+  // saving and putting back: only the cookies that outlive the session, with every attribute
+  CookieJar src(g_alloc);
+  store(src, "session=1", "https://example.com/");
+  store(src, "keep=2; Max-Age=3600; Secure; HttpOnly; SameSite=None; Path=/a; Domain=example.com", "https://www.example.com/a/b");
+  store(src, "gone=3; Max-Age=10", "https://example.com/");
+  List<CookieJar::Cookie> saved(g_alloc);
+  src.snapshot_persistent(kNow + 20000, &saved);   // (twenty seconds on: "gone" has expired)
+  CHECK(saved.count() == 1 && saved[0].name.view().equals("keep") && saved[0].http_only && saved[0].secure && !saved[0].host_only && saved[0].same_site == 3);
+  CookieJar dst(g_alloc);
+  for (uint64_t i = 0; i < saved.count(); ++i) CHECK(dst.restore(static_cast<CookieJar::Cookie&&>(saved[i])));
+  CHECK(header(dst, "https://sub.example.com/a/x", CookieJar::Site::SameSite, false, kNow + 20000) == "keep=2" && header(dst, "https://sub.example.com/a/x", CookieJar::Site::SameSite, true, kNow + 20000).empty());
+  // the cookies a script sees, in header order, without HttpOnly ones
+  CookieJar l(g_alloc);
+  store(l, "a=1; Path=/", "http://example.com/x/y");
+  store(l, "b=2", "http://example.com/x/y");
+  store(l, "h=3; HttpOnly", "http://example.com/x/y");
+  List<CookieJar::Cookie> seen(g_alloc);
+  l.list_for_script(url_of("http://example.com/x/z"), kNow, &seen);
+  CHECK(seen.count() == 2 && seen[0].name.view().equals("b") && seen[1].name.view().equals("a"));
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_basics();
@@ -220,6 +264,7 @@ int main() {
   test_flags();
   test_limits_and_dates();
   test_damaged();
+  test_public_suffix_and_more();
   CHECK(g_alloc.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

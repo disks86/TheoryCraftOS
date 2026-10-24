@@ -5756,28 +5756,6 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       return next();
     });
     defineGetter(g, 'caches', function () { return storage; });
-    // cookieStore, over document.cookie
-    var CookieStore = klass('CookieStore', ET), cookieStore = Object.create(CookieStore.prototype);
-    cookieStore.onchange = null;
-    var cookies = function () {
-      var out = [], text = g.document.cookie;
-      if (text) text.split('; ').forEach(function (p) { var eq = p.indexOf('='); out.push({ name: eq < 0 ? '' : p.slice(0, eq), value: eq < 0 ? p : p.slice(eq + 1) }); });
-      return out;
-    };
-    var pick = function (arg) { return typeof arg === 'string' ? { name: arg } : arg || {}; };
-    method(CookieStore.prototype, 'getAll', function (arg) { var q = pick(arg); return Promise.resolve(cookies().filter(function (c) { return q.name === undefined || c.name === q.name; })); });
-    method(CookieStore.prototype, 'get', function (arg) { var q = pick(arg); var m = cookies().filter(function (c) { return q.name === undefined || c.name === q.name; }); return Promise.resolve(m.length ? m[0] : null); });
-    method(CookieStore.prototype, 'set', function (a, b) {
-      var c = typeof a === 'string' ? { name: a, value: b } : a;
-      var text = c.name + '=' + c.value + '; path=' + (c.path || '/');
-      if (c.expires !== undefined && c.expires !== null) text += '; expires=' + new Date(c.expires).toUTCString();
-      if (c.domain) text += '; domain=' + c.domain;
-      if (c.sameSite) text += '; samesite=' + c.sameSite;
-      g.document.cookie = text;
-      return Promise.resolve();
-    });
-    method(CookieStore.prototype, 'delete', function (arg) { var q = pick(arg); g.document.cookie = q.name + '=; path=' + (q.path || '/') + '; expires=Thu, 01 Jan 1970 00:00:00 GMT'; return Promise.resolve(); });
-    defineGetter(g, 'cookieStore', function () { return cookieStore; });
   }());
 
   // ---------------------------------------------------------------------------------------------------------------------------------- geometry
@@ -7687,6 +7665,116 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       Object.defineProperty(e, '__legacy', { value: true });
       return e;
     });
+  }());
+
+  // ---------------------------------------------------------------------------------------------------------------------------------- Cookie Store API
+  (function () {
+    var CookieStore = klass('CookieStore', ET), CookieChangeEvent = mkEvent('CookieChangeEvent', null, { changed: [], deleted: [] });
+    var SAMESITE = ['lax', 'lax', 'strict', 'none'];
+    var secureContext = function () { return g.location.protocol === 'https:' || g.location.hostname === 'localhost' || g.location.hostname === '127.0.0.1'; };
+    var pageCookies = function (url) {
+      var text = __cookie_details(url === undefined || url === null ? '' : String(url)), out = [];
+      text.split('\n').forEach(function (line) {
+        if (!line) return;
+        var f = line.split('\t');
+        out.push({ name: f[0], value: f[1], domain: f[8] === '1' ? null : f[2], path: f[3], expires: Number(f[4]) < 0 ? null : Number(f[4]), secure: f[5] === '1', sameSite: SAMESITE[Number(f[6])] || 'lax', partitioned: f[7] === '1' });
+      });
+      return out;
+    };
+    var options = function (what, arg, needName) {
+      var o = typeof arg === 'string' ? { name: arg } : (arg === undefined || arg === null ? {} : arg);
+      if (typeof o !== 'object') throw typeErr("execute '" + what + "' on 'CookieStore'", "The provided value is not of type 'CookieStoreGetOptions'.");
+      if (needName && o.name === undefined && o.url === undefined) throw typeErr("execute '" + what + "' on 'CookieStore'", 'Required one of: name, url');
+      if (o.url !== undefined) {
+        var resolved = __url_resolve(String(o.url), g.location.href);
+        if (resolved === null || new URL(resolved).origin !== g.location.origin) throw typeErr("execute '" + what + "' on 'CookieStore'", "URL must match the origin of the document: " + o.url);
+      }
+      return o;
+    };
+    var filter = function (o) { return pageCookies(o.url).filter(function (c) { return o.name === undefined || c.name === String(o.name); }); };
+    method(CookieStore.prototype, 'get', function (arg) {
+      if (arguments.length < 1) return Promise.reject(typeErr("execute 'get' on 'CookieStore'", 'Required one of: name, url'));
+      try { var o = options('get', arg, true); } catch (e) { return Promise.reject(e); }
+      var list = filter(o);
+      return Promise.resolve(list.length ? list[0] : null);
+    });
+    method(CookieStore.prototype, 'getAll', function (arg) {
+      try { var o = options('getAll', arg, false); } catch (e) { return Promise.reject(e); }
+      return Promise.resolve(filter(o));
+    });
+    var control = /[\x00-\x08\x0A-\x1F\x7F;]/;
+    var write = function (what, c, deleting) {
+      var name = String(c.name === undefined ? '' : c.name), value = deleting ? '' : String(c.value === undefined ? '' : c.value);
+      if (control.test(name) || control.test(value)) throw typeErr("execute '" + what + "' on 'CookieStore'", 'Cookie name or value contains an invalid character.');
+      if (!deleting && name === '' && value === '') throw typeErr("execute '" + what + "' on 'CookieStore'", 'Cookie name and value both are empty.');
+      if (name.length + value.length > 4096) throw typeErr("execute '" + what + "' on 'CookieStore'", 'Cookie name and value together are larger than 4096 bytes.');
+      var domain = c.domain === undefined || c.domain === null ? null : String(c.domain).toLowerCase(), path = c.path === undefined ? '/' : String(c.path);
+      if (name.indexOf('__Host-') === 0 && (domain !== null || path !== '/' )) throw typeErr("execute '" + what + "' on 'CookieStore'", "Cookies with '__Host-' prefix cannot have a domain or a path other than '/'.");
+      if (domain !== null) {
+        if (domain.charAt(0) === '.') throw typeErr("execute '" + what + "' on 'CookieStore'", "Cookie domain may not begin with '.'.");
+        var host = g.location.hostname;
+        if (!(host === domain || (host.length > domain.length && host.slice(host.length - domain.length - 1) === '.' + domain))) throw typeErr("execute '" + what + "' on 'CookieStore'", 'Cookie domain must domain-match the current host.');
+      }
+      if (path.charAt(0) !== '/') throw typeErr("execute '" + what + "' on 'CookieStore'", "Cookie path must begin with '/'.");
+      if (path.charAt(path.length - 1) !== '/') path += '/';
+      var text = name + '=' + value + '; Path=' + path;
+      if (deleting) text += '; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      else if (c.expires !== undefined && c.expires !== null) {
+        var ms = c.expires instanceof Date ? c.expires.getTime() : Number(c.expires);
+        if (ms !== ms) throw typeErr("execute '" + what + "' on 'CookieStore'", "The provided value for 'expires' is not valid.");
+        text += '; Expires=' + new Date(ms).toUTCString();
+      }
+      if (domain !== null) text += '; Domain=' + domain;
+      if (!deleting) {
+        var same = c.sameSite === undefined ? 'strict' : String(c.sameSite);
+        if (['strict', 'lax', 'none'].indexOf(same) < 0) throw typeErr("execute '" + what + "' on 'CookieStore'", "The provided value '" + same + "' is not a valid enum value of type CookieSameSite.");
+        text += '; SameSite=' + same;
+      }
+      if (g.location.protocol === 'https:') text += '; Secure';
+      if (!deleting && c.partitioned) text += '; Partitioned';
+      return text;
+    };
+    var poll = null;
+    var changeSnapshot = function () { var m = {}; pageCookies('').forEach(function (c) { m[c.domain + '|' + c.path + '|' + c.name] = c; }); return m; };
+    var lastSnapshot = changeSnapshot();
+    var store = Object.create(CookieStore.prototype), listeners = 0, handler = null;
+    var tick = function () {
+      var now = changeSnapshot(), changed = [], deleted = [], k;
+      for (k in now) if (!lastSnapshot[k] || lastSnapshot[k].value !== now[k].value || lastSnapshot[k].expires !== now[k].expires) changed.push(now[k]);
+      for (k in lastSnapshot) if (!now[k]) deleted.push({ name: lastSnapshot[k].name, value: undefined, domain: lastSnapshot[k].domain, path: lastSnapshot[k].path, expires: lastSnapshot[k].expires, secure: lastSnapshot[k].secure, sameSite: lastSnapshot[k].sameSite, partitioned: lastSnapshot[k].partitioned });
+      lastSnapshot = now;
+      if (changed.length || deleted.length) store.dispatchEvent(new CookieChangeEvent('change', { changed: changed, deleted: deleted }));
+    };
+    var watch = function () { if (poll === null) poll = setInterval(tick, 250); };
+    method(CookieStore.prototype, 'set', function (a, b) {
+      var c = typeof a === 'string' ? { name: a, value: b } : a;
+      if (arguments.length < 1 || c === null || typeof c !== 'object') return Promise.reject(typeErr("execute 'set' on 'CookieStore'", 'Required member name is undefined.'));
+      if (typeof a !== 'string' && (c.name === undefined || c.value === undefined)) return Promise.reject(typeErr("execute 'set' on 'CookieStore'", 'Required member ' + (c.name === undefined ? 'name' : 'value') + ' is undefined.'));
+      var text;
+      try { text = write('set', c, false); } catch (e) { return Promise.reject(e); }
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        if (!__cookie_write(text)) { reject(typeErr("execute 'set' on 'CookieStore'", 'Cookie was not written.')); return; }
+        resolve(undefined);
+        setTimeout(tick, 0);
+      });
+    });
+    method(CookieStore.prototype, 'delete', function (arg) {
+      if (arguments.length < 1) return Promise.reject(typeErr("execute 'delete' on 'CookieStore'", 'Required member name is undefined.'));
+      var c = typeof arg === 'string' ? { name: arg } : arg;
+      var text;
+      try { if (c === null || typeof c !== 'object' || c.name === undefined) throw typeErr("execute 'delete' on 'CookieStore'", 'Required member name is undefined.'); text = write('delete', c, true); } catch (e) { return Promise.reject(e); }
+      return new Promise(function (resolve) { __cookie_write(text); resolve(undefined); setTimeout(tick, 0); });
+    });
+    var nativeAdd = ET.prototype.addEventListener;
+    method(store, 'addEventListener', function (type) { if (type === 'change') { listeners++; watch(); } return nativeAdd.apply(this, arguments); });
+    var nativeRemove = ET.prototype.removeEventListener;
+    method(store, 'removeEventListener', function (type) { if (type === 'change' && listeners > 0) listeners--; return nativeRemove.apply(this, arguments); });
+    Object.defineProperty(store, 'onchange', { get: function () { return handler; }, set: function (fn) { handler = typeof fn === 'function' ? fn : null; if (handler) watch(); }, enumerable: true, configurable: true });
+    hide(store, '__deliver', true);
+    // (the handler property is run for the events too)
+    nativeAdd.call(store, 'change', function (e) { if (typeof handler === 'function') handler.call(store, e); });
+    defineGetter(g, 'cookieStore', function () { return store; });
   }());
   // @@END1
 }(this));

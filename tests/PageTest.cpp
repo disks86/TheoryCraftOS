@@ -2990,6 +2990,26 @@ static void test_storage() {
   }
 }
 
+static void test_cookies_web() {
+  // public suffixes cannot be named by Domain; the host's own registrable domain can
+  CHECK(async_is("document.cookie = 'a=1; domain=example'; document.cookie = 'b=2; domain=co.uk'; document.cookie = 'c=3; domain=app.example'; console.log(document.cookie);", "c=3", nullptr, "https://app.example/"));
+  CHECK(async_is("document.cookie = 'a=1; domain=github.io; path=/'; document.cookie = 'b=2; domain=me.github.io; path=/'; console.log(document.cookie);", "b=2", nullptr, "https://me.github.io/"));
+  // Cookie Store API
+  CHECK(async_is("cookieStore.set('a', '1').then(function () { return cookieStore.set({ name: 'b', value: '2', path: '/', sameSite: 'lax' }) }).then(function () { return cookieStore.get('a') }).then(function (c) { console.log(c.name, c.value, c.path, c.secure, c.sameSite, c.partitioned); return cookieStore.getAll() }).then(function (l) { console.log(l.length, document.cookie) });",
+                 "a 1 / true strict false | 2 a=1; b=2", nullptr, "https://app.example/dir/page.html"));
+  CHECK(async_is("document.cookie = 'x=1; path=/'; document.cookie = 'y=2; path=/'; cookieStore.delete('x').then(function () { console.log(document.cookie); return cookieStore.get('x') }).then(function (c) { console.log(c); return cookieStore.getAll({ name: 'y' }) }).then(function (l) { console.log(l.length, l[0].value); return cookieStore.get('nothing') }).then(function (c) { console.log(c) });",
+                 "y=2 | null | 1 2 | null", nullptr, "https://app.example/"));
+  CHECK(async_is("cookieStore.set({ name: '__Host-id', value: 'v' }).then(function () { console.log(document.cookie); return cookieStore.set('bad;name', 'v') }).catch(function (e) { console.log(e.name); return cookieStore.set({ name: 'p', value: 'v', partitioned: true }) }).then(function () { return cookieStore.get('p') }).then(function (c) { console.log(c.partitioned, c.secure) });",
+                 "__Host-id=v | TypeError | true true", nullptr, "https://app.example/"));
+  CHECK(async_is("var seen = []; cookieStore.addEventListener('change', function (e) { seen.push(e.changed.length + ':' + e.deleted.length) }); cookieStore.set('q', '1').then(function () { return new Promise(function (r) { setTimeout(r, 600) }) }).then(function () { return cookieStore.delete('q') }).then(function () { return new Promise(function (r) { setTimeout(r, 600) }) }).then(function () { console.log(seen.join()) });",
+                 "1:0,0:1", nullptr, "https://app.example/"));
+  // Clear-Site-Data: "cookies" clears the origin's cookies
+  CHECK(async_is("document.cookie = 'k=1; path=/'; console.log(document.cookie); fetch('/logout').then(function () { console.log(document.cookie === '' ? 'empty' : document.cookie) });", "k=1 | empty",
+                 [](FakeEnvironment& env) { env.net.answers["GET https://app.example/logout"] = {200, "Clear-Site-Data: \"cookies\"\r\n", "bye"}; }, "https://app.example/"));
+  // storage keeps what is written through the area and the quota counts keys too
+  CHECK(js("", "localStorage.setItem('k', 'v'); console.log(localStorage.length, JSON.stringify(localStorage), 'k' in localStorage, localStorage.hasOwnProperty('k'), localStorage.getItem('toString'), typeof localStorage.toString)", "1 {\"k\":\"v\"} true true null function"));
+}
+
 static void test_messaging() {
   // to itself: the data is a copy, with what JSON cannot say kept
   CHECK(async_is("addEventListener('message', function (e) { var d = e.data; console.log(e.type, e.origin, e.source === window, e.ports.length, e.lastEventId === '', d.a.length, d.a[1].b, d.d instanceof Date, d.d.getTime(), 'u' in d, d.u, isNaN(d.n), 1 / d.z, d.s, d === msg, e instanceof MessageEvent) });"
@@ -3759,6 +3779,7 @@ int main(int argc, char** argv) {
   test_xhr();
   test_fetch_wire();
   test_storage();
+  test_cookies_web();
   test_messaging();
   test_history_api();
   test_scripts_during_load();

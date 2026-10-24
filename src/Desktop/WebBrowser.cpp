@@ -210,6 +210,9 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   if (Menu* view = menu_.add_menu("View")) {
     scripts_item_ = view->add_item("Run Scripts", {&WebBrowser::on_toggle_scripts, this});
     dark_item_ = view->add_item("Dark Colors", {&WebBrowser::on_toggle_dark, this});
+    third_party_item_ = view->add_item("Block Third-Party Cookies", {&WebBrowser::on_toggle_third_party, this});
+    view->add_separator();
+    view->add_item("Clear Cookies and Site Data", {&WebBrowser::on_clear_site_data, this});
     if (scripts_item_) scripts_item_->set_checked(scripts_enabled_);
   }
   if (Menu* go = menu_.add_menu("Go")) {
@@ -549,6 +552,7 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit, bool s
   browser::FetchOptions options;
   options.url = address;
   options.mode = subresource ? browser::FetchOptions::Mode::Subresource : browser::FetchOptions::Mode::Navigate;
+  options.block_third_party_cookies = block_third_party_;
   options.credentials = browser::FetchOptions::Credentials::Include;
   options.headers = "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1\r\n";
   options.now_ms = page_clock_ms();
@@ -1106,8 +1110,41 @@ bool WebBrowser::Env::http_request(const browser::FetchOptions& options, browser
     response->error.assign("There is no network connection.");
     return false;
   }
-  return browser::fetch_resource(owner_.allocator(), *owner_.loader_, owner_.jar(), options, response);
+  browser::FetchOptions mine = options;
+  mine.block_third_party_cookies = owner_.block_third_party_;
+  const bool ok = browser::fetch_resource(owner_.allocator(), *owner_.loader_, owner_.jar(), mine, response);
+  if (ok) owner_.apply_clear_site_data(*response);
+  return ok;
 }
+
+// A Clear-Site-Data header asked for the storage of the site that answered to go (the cookies were dealt with where the answer was read).
+void WebBrowser::apply_clear_site_data(const browser::NetResponse& response) {
+  if (!(response.clear_site_data & 2) || response.url.empty()) return;
+  browser::WebUrl url(allocator());
+  if (!browser::WebUrl::parse(allocator(), response.url.view(), nullptr, &url)) return;
+  String origin(allocator());
+  url.origin(&origin);
+  (shared_local_ ? *shared_local_ : own_local_).area(origin.view()).clear();
+  env_.session_storage_hub().area(origin.view()).clear();
+}
+
+void WebBrowser::set_block_third_party_cookies(bool block) {
+  block_third_party_ = block;
+  if (third_party_item_) third_party_item_->set_checked(block);
+}
+
+void WebBrowser::clear_site_data() {
+  jar().clear();
+  (shared_local_ ? *shared_local_ : own_local_).clear_all();
+  env_.session_storage_hub().clear_all();
+}
+
+void WebBrowser::on_toggle_third_party(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  b->set_block_third_party_cookies(!b->block_third_party_);
+}
+
+void WebBrowser::on_clear_site_data(void* self, Control&) { static_cast<WebBrowser*>(self)->clear_site_data(); }
 
 UniquePointer<browser::IWebSocket> WebBrowser::Env::open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
   if (!owner_.loader_) {

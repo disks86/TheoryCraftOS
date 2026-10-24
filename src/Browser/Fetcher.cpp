@@ -360,7 +360,8 @@ bool fetch_resource(allocators::IAllocator& allocator, IPageLoader& loader, Cook
         headers.append("\r\n");
       }
     }
-    const bool send_cookies = navigate || opt.mode == FetchOptions::Mode::Subresource || opt.credentials == FetchOptions::Credentials::Include || (opt.credentials == FetchOptions::Credentials::SameOrigin && !hop_cross);
+    const bool third_party = opt.block_third_party_cookies && has_page && !navigate && !same_site(allocator, page, current);
+    const bool send_cookies = !third_party && (navigate || opt.mode == FetchOptions::Mode::Subresource || opt.credentials == FetchOptions::Credentials::Include || (opt.credentials == FetchOptions::Credentials::SameOrigin && !hop_cross));
     if (send_cookies) {
       CookieJar::Site site = CookieJar::Site::SameSite;
       if (has_page && !same_site(allocator, page, current)) site = navigate && method.equals("GET") ? CookieJar::Site::CrossSiteNavigation : CookieJar::Site::CrossSiteRequest;
@@ -477,6 +478,19 @@ bool fetch_resource(allocators::IAllocator& allocator, IPageLoader& loader, Cook
     response->body.clear();
     if (!response->body.append(answer.body.view())) return fail("out of memory");
     current.serialize(&response->url, false);
+    StringView clear;
+    if (header_value(answer.headers.view(), "Clear-Site-Data", &clear) && (current.scheme.equals("https") || current.host.equals("localhost") || current.host.equals("127.0.0.1"))) {
+      // "cookies", "storage", "cache" or "*" (quoted, separated by commas)
+      StringView rest = clear, token;
+      while (rest.next_token(',', &token)) {
+        token = token.trimmed();
+        if (token.starts_with('"') && token.ends_with('"') && token.size() >= 2) token = token.substr(1, token.size() - 2);
+        if (token.equals("cookies") || token.equals("*")) response->clear_site_data |= 1;
+        if (token.equals("storage") || token.equals("*")) response->clear_site_data |= 2;
+        if (token.equals("cache") || token.equals("*")) response->clear_site_data |= 4;
+      }
+      if (response->clear_site_data & 1) cookies.remove_host(current.host.view());
+    }
     return true;
   }
 }
