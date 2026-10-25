@@ -29,6 +29,8 @@
 #include "Browser/CacheStore.hpp"
 #include "Browser/ServiceWorker.hpp"
 #include "Browser/WebPush.hpp"
+#include "FakeRtcNetwork.hpp"
+#include "Rtc/RtcService.hpp"
 #include "Crypto/Ecc.hpp"
 #include "Browser/SessionHistory.hpp"
 #include "Dom/Form.hpp"
@@ -186,6 +188,27 @@ struct FakeEnvironment final : IPageEnvironment {
   ServiceWorkerHub workers;
   CacheStore* cache_store() override { return &caches; }
   ServiceWorkerHub* service_workers() override { return &workers; }
+  // WebRTC over an in-memory network shared with another environment (enable_rtc)
+  struct LcgRandom final : crypto::IRandom {
+    uint32_t n = 12345;
+    bool fill(ByteView out) override {
+      for (uint64_t i = 0; i < out.size(); ++i) { n = n * 1664525u + 1013904223u; out[i] = static_cast<uint8_t>(n >> 24); }
+      return true;
+    }
+  };
+  LcgRandom rtc_random;
+  UniquePointer<FakeNode> rtc_node;
+  UniquePointer<::rtc::RtcService> rtc_engine;
+  UniquePointer<TestDevices> rtc_devices;
+  void enable_rtc(FakeWire& wire, TestAllocator& a, Ipv4Address address, uint8_t seed) {
+    rtc_random.n = seed * 7919u;
+    rtc_node = UniquePointer<FakeNode>::make(a, wire, a, address, seed);
+    rtc_engine = UniquePointer<::rtc::RtcService>::make(a, a, *rtc_node, rtc_random);
+    rtc_devices = UniquePointer<TestDevices>::make(a, wire, a);
+    rtc_devices->tone = seed * 440.0;
+    rtc_engine->set_devices(rtc_devices.get());
+  }
+  IRtcService* rtc_service() override { return rtc_engine.get(); }
   // notifications: the answer to the permission question (-1: the user has not answered), and what was shown
   int prompt_answer = 0, prompts = 0;
   struct Shown {
@@ -5125,6 +5148,7 @@ static void test_service_workers() {
       MediaEnvironment media;
       Page page(a, env, "https://app.example/dir/page.html", media, true);
       page.load(("<html><body><script>" + std::string(kSwPrelude) +
+                 "finished = true; function log(x) { console.log(String(x)); } function emit() { }\n"
                  "navigator.serviceWorker.addEventListener('message', function (e) { log('msg ' + e.data); });\n"
                  "var statuses = []; navigator.permissions.query({ name: 'notifications' }).then(function (s) { s.onchange = function () { log('perm-change ' + s.state); }; log('query ' + s.state); });\n"
                  "log('start ' + Notification.permission);\n"
@@ -5141,12 +5165,12 @@ static void test_service_workers() {
                  ".then(function () { return window.reg.getNotifications(); }).then(function (l) { log('list ' + l.length + ' ' + l[0].title + ' ' + l[0].tag + ' ' + l[0].actions.length + ' ' + l[0].data); })\n"
                  ".then(function () { var n = new Notification('Page', { body: 'text', data: [1, 2] }); window.n = n; n.onshow = function () { log('show ' + n.title + ' ' + n.body + ' ' + n.data.length); }; n.onclick = function () { log('click'); }; n.onclose = function () { log('close'); };\n"
                  "  try { new Notification('x', { actions: [{ action: 'a', title: 'A' }] }); } catch (e) { log(e.name); } })\n"
-                 ".catch(fail); };\n"
-                 "window.step_bye = function () { window.reg.showNotification('bye').then(function () { log('shown-bye'); }); };\n"
+                 ".then(emit).catch(fail); };\n"
+                 "window.step_bye = function () { window.reg.showNotification('bye').then(function () { log('shown-bye'); emit(); }); };\n"
                  "window.step_unsub = function () { window.reg.pushManager.getSubscription().then(function (s) { return s.unsubscribe(); }).then(function (r) { log('unsub ' + r); return window.reg.pushManager.getSubscription(); })"
-                 ".then(function (s) { log('after ' + s); return window.reg.pushManager.subscribe({ userVisibleOnly: true }); }).then(function (s) { log('endpoint2 ' + s.endpoint); }); };\n"
-                 "window.step_act = function () { window.reg.showNotification('act', { data: { n: 9 }, actions: [{ action: 'archive', title: 'Archive' }, { action: 'later', title: 'Later' }, { action: 'extra', title: 'Extra' }] }); };\n"
-                 "window.step_final = function () { log('final ' + Notification.permission); };\n"
+                 ".then(function (s) { log('after ' + s); return window.reg.pushManager.subscribe({ userVisibleOnly: true }); }).then(function (s) { log('endpoint2 ' + s.endpoint); emit(); }); };\n"
+                 "window.step_act = function () { window.reg.showNotification('act', { data: { n: 9 }, actions: [{ action: 'archive', title: 'Archive' }, { action: 'later', title: 'Later' }, { action: 'extra', title: 'Extra' }] }).then(emit); };\n"
+                 "window.step_final = function () { log('final ' + Notification.permission); emit(); };\n"
                  "</script></body></html>").c_str());
       settle_page(page, env);
       std::string log(page.log().data(), page.log().size());
@@ -5159,7 +5183,7 @@ static void test_service_workers() {
       settle_page(page, env);
       log.assign(page.log().data(), page.log().size());
       CHECK(log.find("perm-change granted") != std::string::npos && log.find("asked granted granted") != std::string::npos);
-      CHECK(log.find("state granted") != std::string::npos && log.find("uvo NotAllowedError") != std::string::npos && log.find("key InvalidCharacterError") != std::string::npos);
+      CHECK(log.find("state granted") != std::string::npos && log.find("uvo NotAllowedError") != std::string::npos && log.find("key InvalidAccessError") != std::string::npos);
       CHECK(log.find("sub null") != std::string::npos && log.find("keys 65 16 p256dh,auth") != std::string::npos && log.find("same true") != std::string::npos);
       CHECK(log.find("list 1 Hello again t1 0 null") != std::string::npos);   // (the second one replaced the first)
       CHECK(log.find("InvalidAccessError") == std::string::npos || log.find("TypeError") != std::string::npos);
@@ -5171,11 +5195,11 @@ static void test_service_workers() {
       env.workers.notification_activated(env.shown[2].number);
       settle_page(page, env);
       log.assign(page.log().data(), page.log().size());
-      CHECK(log.find("click close") != std::string::npos);
+      CHECK(log.find("click\nclose") != std::string::npos);
       // the endpoint gets a message: the worker shows a notification, the click comes back to the worker
       const size_t at = log.find("endpoint ");
       CHECK(at != std::string::npos);
-      const size_t end = log.find(' ', at + 9);
+      const size_t end = log.find_first_of(" \n", at + 9);
       const std::string endpoint = log.substr(at + 9, end - at - 9);
       CHECK(!env.workers.push_deliver("https://push.example/none", "x", true));
       CHECK(env.workers.push_deliver(StringView(endpoint.data(), endpoint.size()), "hi there", true));
@@ -5211,7 +5235,7 @@ static void test_service_workers() {
       CHECK(log.find("unsub true") != std::string::npos && log.find("after null") != std::string::npos && log.find("endpoint2 ") != std::string::npos);
       CHECK(!env.workers.push_deliver(StringView(endpoint.data(), endpoint.size()), "old", true));   // (the old endpoint is dead)
       const size_t at2 = log.find("endpoint2 ");
-      const std::string endpoint2 = log.substr(at2 + 10, log.find(' ', at2 + 10) - at2 - 10);
+      const std::string endpoint2 = log.substr(at2 + 10, log.find_first_of(" \n", at2 + 10) - at2 - 10);
       CHECK(endpoint2 != endpoint && env.workers.push_expire(StringView(endpoint2.data(), endpoint2.size())));
       settle_page(page, env);
       log.assign(page.log().data(), page.log().size());
@@ -5352,8 +5376,8 @@ static void test_service_workers() {
       CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\n" + auth_header, big.view()) == 413);
       CHECK(post(endpoint, "TTL: 60\r\n", ConstByteView(), "GET") == 405 && post(endpoint, "", ConstByteView(), "OPTIONS") == 204);
       CHECK(post("https://push.theorycraft.invalid/wpush/v2/nothing", ok_headers, body.view()) == 404 && post("https://push.theorycraft.invalid/other", ok_headers, body.view()) == 404);
-      for (uint64_t cut = 0; cut < body.size(); cut += 7) {   // (a message cut anywhere is refused; the page is not shown anything)
-        CHECK(post(endpoint, ok_headers, body.view().first(cut)) == 400 || cut == 0);
+      for (uint64_t cut = 1; cut < body.size(); cut += 7) {   // (a message cut anywhere is refused; the page is not shown anything)
+        CHECK(post(endpoint, ok_headers, body.view().first(cut)) == 400);
       }
       for (uint64_t at = 0; at < body.size(); at += 5) {
         ByteBuffer flipped(a);
@@ -5408,6 +5432,257 @@ static void test_service_workers() {
   }
 }
 
+// WebRTC: the script interface over the real engine, two pages talking over an in-memory network.
+static void run_pages(Page& a, FakeEnvironment& ea, Page& b, FakeEnvironment& eb, FakeWire& wire, uint32_t ms) {
+  for (uint32_t t = 0; t < ms; t += 5) {
+    wire.now += 5;
+    ea.clock = eb.clock = wire.now;
+    a.run_due_timers(ea.clock);
+    b.run_due_timers(eb.clock);
+  }
+}
+
+static std::string between(const std::string& log, const std::string& from) {
+  const size_t at = log.find(from);
+  if (at == std::string::npos) return "";
+  const size_t start = at + from.size(), end = log.find('\n', start);
+  return log.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+static void test_webrtc() {
+  TestAllocator a;
+  {   // the interface without a peer: checks, states, errors
+    FakeWire wire;
+    wire.alloc = &a;
+    FakeEnvironment env(a);
+    env.clock = wire.now = 1700000000000ull;
+    env.enable_rtc(wire, a, Ipv4Address::make(192, 168, 1, 10), 1);
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    page.load(
+        "<html><body><script>"
+        "var out = []; function log(x) { console.log(String(x)); }\n"
+        "log('types ' + [typeof RTCPeerConnection, typeof RTCDataChannel, typeof RTCSessionDescription, typeof RTCIceCandidate, typeof RTCStatsReport].join());\n"
+        "var pc = new RTCPeerConnection({ iceServers: [{ urls: ['stun:stun.test:3478', 'turn:turn.test'] }] });\n"
+        "log('initial ' + [pc.signalingState, pc.connectionState, pc.iceConnectionState, pc.iceGatheringState, pc.localDescription, pc.remoteDescription, pc.canTrickleIceCandidates, pc.sctp].join());\n"
+        "try { new RTCPeerConnection({ iceServers: [{ urls: 'http://x' }] }); } catch (e) { log('bad url ' + e.name); }\n"
+        "try { new RTCSessionDescription({ type: 'bogus' }); } catch (e) { log('bad type ' + e.name); }\n"
+        "try { new RTCIceCandidate({ candidate: 'x' }); } catch (e) { log('bad cand ' + e.name); }\n"
+        "var c = new RTCIceCandidate({ candidate: 'candidate:1 1 udp 2113937151 192.168.1.5 50000 typ srflx raddr 10.0.0.1 rport 4000', sdpMid: '0', sdpMLineIndex: 0 });\n"
+        "log('cand ' + [c.foundation, c.component, c.protocol, c.priority, c.address, c.port, c.type, c.relatedAddress, c.relatedPort].join());\n"
+        "var dc = pc.createDataChannel('chat', { protocol: 'p', ordered: false, maxRetransmits: 3 });\n"
+        "log('channel ' + [dc.label, dc.protocol, dc.ordered, dc.maxRetransmits, dc.maxPacketLifeTime, dc.negotiated, dc.id, dc.readyState, dc.bufferedAmount, dc.binaryType].join());\n"
+        "try { pc.createDataChannel('x', { maxRetransmits: 1, maxPacketLifeTime: 1 }); } catch (e) { log('both ' + e.name); }\n"
+        "try { pc.createDataChannel('x', { negotiated: true }); } catch (e) { log('no id ' + e.name); }\n"
+        "try { dc.send('x'); } catch (e) { log('send early ' + e.name); }\n"
+        "try { dc.binaryType = 'text'; } catch (e) { log('binaryType ' + e.name); }\n"
+        "pc.onnegotiationneeded = function () { log('negotiationneeded'); };\n"
+        "pc.onsignalingstatechange = function () { log('signaling ' + pc.signalingState); };\n"
+        "pc.createOffer().then(function (o) { log('offer ' + o.type + ' ' + (o instanceof RTCSessionDescription) + ' ' + o.sdp.indexOf('m=application') + ' ' + /a=fingerprint:sha-256 ([0-9A-F]{2}:){31}[0-9A-F]{2}/.test(o.sdp));\n"
+        "  return pc.setRemoteDescription({ type: 'answer', sdp: 'v=0' }).catch(function (e) { log('early answer ' + e.name); return pc.setLocalDescription(o); }); })\n"
+        "  .then(function () { log('local ' + pc.signalingState + ' ' + pc.localDescription.type + ' ' + (pc.pendingLocalDescription !== null) + ' ' + (pc.currentLocalDescription === null)); return pc.getStats(); })\n"
+        "  .then(function (r) { var types = []; r.forEach(function (v) { types.push(v.type); }); log('stats ' + (r instanceof RTCStatsReport) + ' ' + types.join()); pc.close(); log('closed ' + pc.signalingState + ' ' + pc.connectionState + ' ' + dc.readyState); return pc.createOffer(); })\n"
+        "  .catch(function (e) { log('after close ' + e.name); });\n"
+        "try { pc.addTrack({}); } catch (e) { log('addTrack ' + e.name); }\n"
+        "</script></body></html>");
+    for (int i = 0; i < 100; ++i) {
+      wire.now += 10;
+      env.clock = wire.now;
+      page.run_due_timers(env.clock);
+    }
+    const std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("types function,function,function,function,function") != std::string::npos);
+    CHECK(log.find("initial stable,new,new,new,,,,") != std::string::npos);
+    CHECK(log.find("bad url SyntaxError") != std::string::npos && log.find("bad type TypeError") != std::string::npos && log.find("bad cand TypeError") != std::string::npos);
+    CHECK(log.find("cand 1,rtp,udp,2113937151,192.168.1.5,50000,srflx,10.0.0.1,4000") != std::string::npos);
+    CHECK(log.find("channel chat,p,false,3,,false,,connecting,0,blob") != std::string::npos);
+    CHECK(log.find("both SyntaxError") != std::string::npos && log.find("no id TypeError") != std::string::npos && log.find("send early InvalidStateError") != std::string::npos && log.find("binaryType SyntaxError") != std::string::npos);
+    CHECK(log.find("negotiationneeded") != std::string::npos);
+    CHECK(log.find("offer offer true") != std::string::npos && log.find("early answer InvalidStateError") != std::string::npos);
+    CHECK(log.find("local have-local-offer offer true true") != std::string::npos);
+    CHECK(log.find("stats true peer-connection,transport,data-channel") != std::string::npos);
+    CHECK(log.find("closed closed closed closed") != std::string::npos && log.find("after close InvalidStateError") != std::string::npos && log.find("addTrack TypeError") != std::string::npos);
+  }
+  {   // two pages: offer, answer, a data channel with text and binary messages
+    FakeWire wire;
+    wire.alloc = &a;
+    FakeEnvironment ea(a), eb(a);
+    ea.clock = eb.clock = wire.now = 1700000000000ull;
+    ea.enable_rtc(wire, a, Ipv4Address::make(192, 168, 1, 10), 1);
+    eb.enable_rtc(wire, a, Ipv4Address::make(192, 168, 1, 20), 2);
+    MediaEnvironment media;
+    Page pa(a, ea, "https://a.example/page.html", media, true), pb(a, eb, "https://b.example/page.html", media, true);
+    pa.load(
+        "<html><body><script>"
+        "function log(x) { console.log(String(x)); }\n"
+        "var pc = new RTCPeerConnection(), dc = pc.createDataChannel('chat');\n"
+        "function gathered() { return new Promise(function (r) { if (pc.iceGatheringState === 'complete') r(); else pc.onicegatheringstatechange = function () { if (pc.iceGatheringState === 'complete') r(); }; }); }\n"
+        "dc.binaryType = 'arraybuffer';\n"
+        "dc.onopen = function () { log('A open ' + dc.readyState + ' ' + (dc.id !== null)); dc.send('hello from A'); dc.send(new Uint8Array([9, 8, 7])); dc.bufferedAmountLowThreshold = 0; };\n"
+        "dc.onmessage = function (e) { log('A got ' + (typeof e.data === 'string' ? e.data : 'bytes ' + (function (u) { var t = []; for (var i = 0; i < u.length; i++) t.push(u[i]); return t.join('-'); }(new Uint8Array(e.data))))); };\n"
+        "dc.onclose = function () { log('A channel closed'); };\n"
+        "pc.onconnectionstatechange = function () { log('A connection ' + pc.connectionState); };\n"
+        "pc.oniceconnectionstatechange = function () { log('A ice ' + pc.iceConnectionState); };\n"
+        "window.start = function () { return pc.createOffer().then(function (o) { return pc.setLocalDescription(o); }).then(gathered).then(function () { console.log('OFFER:' + JSON.stringify(pc.localDescription)); }); };\n"
+        "window.finish = function (answer) { return pc.setRemoteDescription(JSON.parse(answer)); };\n"
+        "window.stats = function () { return pc.getStats().then(function (r) { var o = []; r.forEach(function (v) { if (v.type === 'data-channel') o.push(v.label + ':' + v.state + ':' + v.messagesSent + ':' + v.messagesReceived); if (v.type === 'candidate-pair') o.push('pair:' + v.state); }); log('A stats ' + o.join()); }); };\n"
+        "window.closeChannel = function () { dc.close(); log('A closing ' + dc.readyState); };\n"
+        "</script></body></html>");
+    pb.load(
+        "<html><body><script>"
+        "function log(x) { console.log(String(x)); }\n"
+        "var pc = new RTCPeerConnection(), channel = null;\n"
+        "function gathered() { return new Promise(function (r) { if (pc.iceGatheringState === 'complete') r(); else pc.onicegatheringstatechange = function () { if (pc.iceGatheringState === 'complete') r(); }; }); }\n"
+        "pc.ondatachannel = function (e) { channel = e.channel; log('B channel ' + channel.label + ' ' + channel.readyState); channel.binaryType = 'arraybuffer';\n"
+        "  channel.onmessage = function (m) { if (typeof m.data === 'string') { log('B got ' + m.data); channel.send('echo: ' + m.data); } else { log('B got bytes ' + new Uint8Array(m.data).length); channel.send(m.data); } };\n"
+        "  channel.onclose = function () { log('B channel closed'); }; };\n"
+        "pc.onconnectionstatechange = function () { log('B connection ' + pc.connectionState); };\n"
+        "window.accept = function (offer) { return pc.setRemoteDescription(JSON.parse(offer)).then(function () { return pc.createAnswer(); }).then(function (a) { return pc.setLocalDescription(a); }).then(gathered).then(function () { console.log('ANSWER:' + JSON.stringify(pc.localDescription)); }); };\n"
+        "</script></body></html>");
+    pa.call_global("start", nullptr, 0);
+    run_pages(pa, ea, pb, eb, wire, 1000);
+    std::string offer = between(std::string(pa.log().data(), pa.log().size()), "OFFER:");
+    CHECK(offer.find("webrtc-datachannel") != std::string::npos && offer.find("a=candidate:") != std::string::npos);
+    DomBindings::HookArg arg = DomBindings::HookArg::of(StringView(offer.data(), offer.size()));
+    pb.call_global("accept", &arg, 1);
+    run_pages(pa, ea, pb, eb, wire, 1000);
+    std::string answer = between(std::string(pb.log().data(), pb.log().size()), "ANSWER:");
+    CHECK(answer.find("a=setup:active") != std::string::npos);
+    arg = DomBindings::HookArg::of(StringView(answer.data(), answer.size()));
+    pa.call_global("finish", &arg, 1);
+    run_pages(pa, ea, pb, eb, wire, 4000);
+    std::string la(pa.log().data(), pa.log().size()), lb(pb.log().data(), pb.log().size());
+    CHECK(la.find("A open open true") != std::string::npos && la.find("A connection connected") != std::string::npos && la.find("A ice completed") != std::string::npos);
+    CHECK(lb.find("B channel chat open") != std::string::npos && lb.find("B connection connected") != std::string::npos);
+    CHECK(lb.find("B got hello from A") != std::string::npos && lb.find("B got bytes 3") != std::string::npos);
+    CHECK(la.find("A got echo: hello from A") != std::string::npos && la.find("A got bytes 9-8-7") != std::string::npos);
+    pa.call_global("stats", nullptr, 0);
+    run_pages(pa, ea, pb, eb, wire, 50);
+    pa.call_global("closeChannel", nullptr, 0);
+    run_pages(pa, ea, pb, eb, wire, 2000);
+    la.assign(pa.log().data(), pa.log().size());
+    lb.assign(pb.log().data(), pb.log().size());
+    CHECK(la.find("A stats pair:succeeded,chat:open:2:2") != std::string::npos);
+    CHECK(la.find("A closing closing") != std::string::npos && la.find("A channel closed") != std::string::npos && lb.find("B channel closed") != std::string::npos);
+  }
+  {   // audio: getUserMedia, addTrack, ontrack, srcObject
+    FakeWire wire;
+    wire.alloc = &a;
+    FakeEnvironment ea(a), eb(a);
+    ea.clock = eb.clock = wire.now = 1700000000000ull;
+    ea.enable_rtc(wire, a, Ipv4Address::make(192, 168, 1, 10), 1);
+    eb.enable_rtc(wire, a, Ipv4Address::make(192, 168, 1, 20), 2);
+    MediaEnvironment media;
+    Page pa(a, ea, "https://a.example/page.html", media, true), pb(a, eb, "https://b.example/page.html", media, true);
+    ea.rtc_devices->permission = -1;   // (the user has not decided: the page waits)
+    pa.load(
+        "<html><body><script>"
+        "function log(x) { console.log(String(x)); }\n"
+        "var pc = new RTCPeerConnection(), stream = null;\n"
+        "function gathered() { return new Promise(function (r) { if (pc.iceGatheringState === 'complete') r(); else pc.onicegatheringstatechange = function () { if (pc.iceGatheringState === 'complete') r(); }; }); }\n"
+        "navigator.mediaDevices.getUserMedia({ video: true }).catch(function (e) { log('video ' + e.name); });\n"
+        "navigator.mediaDevices.getUserMedia({}).catch(function (e) { log('nothing ' + e.name); });\n"
+        "navigator.mediaDevices.enumerateDevices().then(function (l) { log('devices ' + l.map(function (d) { return d.kind + ':' + d.label; }).join()); });\n"
+        "navigator.permissions.query({ name: 'microphone' }).then(function (s) { log('permission ' + s.state); });\n"
+        "navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) { stream = s; var t = s.getAudioTracks()[0];\n"
+        "  log('gum ' + s.getTracks().length + ' ' + s.active + ' ' + t.kind + ' ' + t.readyState + ' ' + t.enabled + ' ' + t.label + ' ' + (t instanceof MediaStreamTrack));\n"
+        "  var sender = pc.addTrack(t, s); log('sender ' + (sender.track === t) + ' ' + pc.getSenders().length + ' ' + pc.getTransceivers()[0].direction);\n"
+        "  try { pc.addTrack(t, s); } catch (e) { log('twice ' + e.name); } });\n"
+        "pc.ontrack = function (e) { log('A track ' + e.track.kind + ' ' + e.streams[0].id); };\n"
+        "pc.onconnectionstatechange = function () { log('A connection ' + pc.connectionState); };\n"
+        "window.start = function () { return pc.createOffer().then(function (o) { return pc.setLocalDescription(o); }).then(gathered).then(function () { console.log('OFFER:' + JSON.stringify(pc.localDescription)); }); };\n"
+        "window.finish = function (answer) { return pc.setRemoteDescription(JSON.parse(answer)); };\n"
+        "window.mute = function () { stream.getAudioTracks()[0].enabled = false; log('muted ' + stream.getAudioTracks()[0].enabled); };\n"
+        "window.stop = function () { var t = stream.getAudioTracks()[0]; t.stop(); log('stopped ' + t.readyState + ' ' + stream.active); pc.removeTrack(pc.getSenders()[0]); log('removed ' + (pc.getSenders()[0].track === null)); };\n"
+        "</script></body></html>");
+    pb.load(
+        "<html><body><audio id=out></audio><script>"
+        "function log(x) { console.log(String(x)); }\n"
+        "var pc = new RTCPeerConnection(), got = null;\n"
+        "function gathered() { return new Promise(function (r) { if (pc.iceGatheringState === 'complete') r(); else pc.onicegatheringstatechange = function () { if (pc.iceGatheringState === 'complete') r(); }; }); }\n"
+        "pc.ontrack = function (e) { got = e; var t = e.track; log('B track ' + t.kind + ' ' + t.readyState + ' ' + t.muted + ' ' + e.streams.length + ' ' + e.transceiver.direction + ' ' + (e.receiver.track === t));\n"
+        "  t.onunmute = function () { log('B unmute'); }; document.getElementById('out').srcObject = e.streams[0]; log('srcObject ' + (document.getElementById('out').srcObject === e.streams[0])); };\n"
+        "pc.onconnectionstatechange = function () { log('B connection ' + pc.connectionState); };\n"
+        "window.accept = function (offer) { return pc.setRemoteDescription(JSON.parse(offer)).then(function () { return pc.createAnswer(); }).then(function (a) { return pc.setLocalDescription(a); }).then(gathered).then(function () { console.log('ANSWER:' + JSON.stringify(pc.localDescription)); }); };\n"
+        "window.info = function () { var t = pc.getTransceivers()[0]; log('B info ' + pc.getTransceivers().length + ' ' + t.direction + ' ' + t.currentDirection + ' ' + t.mid + ' ' + pc.getReceivers().length + ' ' + got.track.muted); };\n"
+        "window.detach = function () { document.getElementById('out').srcObject = null; log('detached ' + document.getElementById('out').srcObject); };\n"
+        "</script></body></html>");
+    run_pages(pa, ea, pb, eb, wire, 600);
+    std::string la(pa.log().data(), pa.log().size());
+    CHECK(la.find("video NotFoundError") != std::string::npos && la.find("nothing TypeError") != std::string::npos && la.find("gum ") == std::string::npos);   // (still waiting for the user)
+    CHECK(la.find("devices audioinput:,audiooutput:") != std::string::npos && la.find("permission prompt") != std::string::npos);
+    run_pages(pa, ea, pb, eb, wire, 2000);
+    la.assign(pa.log().data(), pa.log().size());
+    CHECK(la.find("gum 1 true audio live true Microphone true") != std::string::npos && la.find("sender true 1 sendrecv") != std::string::npos && la.find("twice InvalidAccessError") != std::string::npos);
+    pa.call_global("start", nullptr, 0);
+    run_pages(pa, ea, pb, eb, wire, 1000);
+    std::string offer = between(std::string(pa.log().data(), pa.log().size()), "OFFER:");
+    CHECK(offer.find("m=audio 9 UDP/TLS/RTP/SAVPF 0 8") != std::string::npos && offer.find("a=sendrecv") != std::string::npos);
+    DomBindings::HookArg arg = DomBindings::HookArg::of(StringView(offer.data(), offer.size()));
+    pb.call_global("accept", &arg, 1);
+    run_pages(pa, ea, pb, eb, wire, 1000);
+    std::string lb(pb.log().data(), pb.log().size());
+    CHECK(lb.find("B track audio live true 1 recvonly true") != std::string::npos && lb.find("srcObject true") != std::string::npos);
+    std::string answer = between(lb, "ANSWER:");
+    CHECK(answer.find("a=recvonly") != std::string::npos && answer.find("m=audio 9 UDP/TLS/RTP/SAVPF 0\\r\\n") != std::string::npos);
+    arg = DomBindings::HookArg::of(StringView(answer.data(), answer.size()));
+    pa.call_global("finish", &arg, 1);
+    run_pages(pa, ea, pb, eb, wire, 3000);
+    la.assign(pa.log().data(), pa.log().size());
+    lb.assign(pb.log().data(), pb.log().size());
+    CHECK(la.find("A connection connected") != std::string::npos && lb.find("B connection connected") != std::string::npos && lb.find("B unmute") != std::string::npos);
+    const std::vector<int16_t>& heard = eb.rtc_devices->heard;   // B's speaker: A's tone (440 Hz)
+    CHECK(heard.size() > 16000);
+    if (heard.size() > 16000) {
+      size_t n = 0;
+      for (size_t i = 8001; i < 16000; ++i) n += (heard[i - 1] < 0) != (heard[i] < 0);
+      CHECK(n > 840 && n < 920);   // (880 crossings a second for 440 Hz)
+    }
+    CHECK(ea.rtc_devices->heard.empty());   // (nothing plays on A)
+    pb.call_global("info", nullptr, 0);
+    pa.call_global("mute", nullptr, 0);
+    run_pages(pa, ea, pb, eb, wire, 500);
+    lb.assign(pb.log().data(), pb.log().size());
+    CHECK(lb.find("B info 1 recvonly recvonly 0 1 false") != std::string::npos);
+    const size_t before = heard.size();
+    int loud = 0;
+    run_pages(pa, ea, pb, eb, wire, 1000);
+    for (size_t i = before; i < heard.size(); ++i) loud += heard[i] > 100 || heard[i] < -100;
+    CHECK(heard.size() > before + 6000 && loud == 0);   // (a disabled track sends silence)
+    pb.call_global("detach", nullptr, 0);
+    pa.call_global("stop", nullptr, 0);
+    run_pages(pa, ea, pb, eb, wire, 500);
+    la.assign(pa.log().data(), pa.log().size());
+    lb.assign(pb.log().data(), pb.log().size());
+    CHECK(la.find("stopped ended false") != std::string::npos && la.find("removed true") != std::string::npos && lb.find("detached null") != std::string::npos);
+  }
+  {   // the user says no
+    FakeWire wire;
+    wire.alloc = &a;
+    FakeEnvironment env(a);
+    env.clock = wire.now = 1700000000000ull;
+    env.enable_rtc(wire, a, Ipv4Address::make(192, 168, 1, 10), 1);
+    env.rtc_devices->permission = 0;
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    page.load("<html><body><script>navigator.mediaDevices.getUserMedia({ audio: true }).catch(function (e) { console.log('denied ' + e.name); });\n"
+              "navigator.permissions.query({ name: 'microphone' }).then(function (s) { console.log('state ' + s.state); });\n"
+              "var pc = new RTCPeerConnection(); pc.addTransceiver('audio', { direction: 'recvonly' }); console.log('tx ' + pc.getTransceivers().length + ' ' + pc.getTransceivers()[0].direction + ' ' + pc.getReceivers()[0].track.kind);\n"
+              "try { pc.addTransceiver('video'); } catch (e) { console.log('video ' + e.name); }\n"
+              "console.log(JSON.stringify(RTCRtpSender.getCapabilities('audio').codecs.map(function (c) { return c.mimeType; })) + ' ' + RTCRtpSender.getCapabilities('video'));\n"
+              "</script></body></html>");
+    for (int i = 0; i < 100; ++i) {
+      wire.now += 10;
+      env.clock = wire.now;
+      page.run_due_timers(env.clock);
+    }
+    const std::string log(page.log().data(), page.log().size());
+    CHECK(log.find("denied NotAllowedError") != std::string::npos && log.find("state denied") != std::string::npos && log.find("tx 1 recvonly audio") != std::string::npos);
+    CHECK(log.find("video NotSupportedError") != std::string::npos && log.find("[\"audio/PCMU\",\"audio/PCMA\"] null") != std::string::npos);
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   if (const char* probe = getenv("PROBE")) {   // runs script files (comma separated: one document after the other) and prints what they logged (for looking at what an API has)
     std::vector<Visit> list;
@@ -5427,6 +5702,7 @@ int main(int argc, char** argv) {
   if (getenv("ONLY_SW")) {   // (just the Cache API and service worker tests)
     test_cache_api();
     if (getenv("ONLY_SW")[0] == '2') test_service_workers();
+    if (getenv("ONLY_SW")[0] == '3') test_webrtc();
     printf(g_failed ? "%d check(s) failed\n" : "service worker tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -5455,6 +5731,7 @@ int main(int argc, char** argv) {
   test_clipboard();
   test_wasm();
   test_cache_api();
+  test_webrtc();
   test_messaging();
   test_history_api();
   test_scripts_during_load();

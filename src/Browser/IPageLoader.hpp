@@ -24,6 +24,10 @@
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 
+namespace rtc {
+class IRtcNetwork;
+}
+
 namespace browser {
 
 struct PageResult {
@@ -82,6 +86,8 @@ class IWebSocket {
 
 class IPageLoader {
  public:
+  // The network WebRTC uses (UDP, the machine's address); nullptr: none.
+  virtual rtc::IRtcNetwork* rtc_network() { return nullptr; }
   // Opens a WebSocket to `url` (ws://, wss://, http://, https://) offering the comma separated `protocols`; `origin` is sent as the Origin header. Null with
   // *error set when it cannot be done. The connection is made while the page polls it.
   virtual UniquePointer<IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) {

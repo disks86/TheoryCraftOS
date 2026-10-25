@@ -6209,7 +6209,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (statuses[name]) return statuses[name];
       var st = Object.create(PermissionStatus.prototype);
       Object.defineProperty(st, 'name', { value: name, enumerable: true });
-      Object.defineProperty(st, 'state', { get: function () { if (name === 'clipboard-read') return g.__activeNow() ? 'granted' : 'prompt'; if (name === 'notifications' || name === 'push') { var np = __nt_permission(); return np === 'granted' ? 'granted' : np === 'denied' ? 'denied' : 'prompt'; } return granted[name] ? 'granted' : 'prompt'; }, enumerable: true });
+      Object.defineProperty(st, 'state', { get: function () { if (name === 'clipboard-read') return g.__activeNow() ? 'granted' : 'prompt'; if (name === 'microphone' && typeof __rtc_op === 'function') { var mp = __rtc_op(0, 'mic_permission', '', '', null, 0, 0); return mp === 'ok:granted' ? 'granted' : mp === 'ok:denied' ? 'denied' : 'prompt'; } if (name === 'notifications' || name === 'push') { var np = __nt_permission(); return np === 'granted' ? 'granted' : np === 'denied' ? 'denied' : 'prompt'; } return granted[name] ? 'granted' : 'prompt'; }, enumerable: true });
       st.onchange = null;
       if (name === 'notifications' || name === 'push') told[name] = st.state;
       return (statuses[name] = st);
@@ -6512,9 +6512,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       self.__id = res.id; live[res.id] = self;
     });
     var fire = function (n, type) {
-      var e = new Event(type), h = n['on' + type];
-      if (typeof h === 'function') h.call(n, e);
-      n.dispatchEvent(e);
+      n.dispatchEvent(new Event(type));   // (the on-handler is called by the target itself)
     };
     Object.defineProperty(Notification, 'permission', { get: function () { var s = __nt_permission(); return s === 'pending' ? 'default' : s; }, enumerable: true });
     Notification.maxActions = 2;
@@ -6551,6 +6549,625 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       hide(n, '__id', info.id);
       return n;
     });
+  }());
+  // ---------------------------------------------------------------------------------------------------------------------------------- WebRTC
+  // RTCPeerConnection and what hangs off it. The engine is native (src/Rtc/); this is the interface: promises, events, the dictionaries and their checks. A connection is
+  // driven by a timer that asks the engine for what happened (__rtc_op(id, 'events')) while any connection is alive.
+  (function () {
+    if (g.RTCPeerConnection || typeof __rtc_op !== 'function') return;
+    if (typeof __sws_id === 'function' && __sws_id() !== 0) return;
+    var SDP_TYPES = ['offer', 'answer', 'pranswer', 'rollback'];
+    var enc = function (text) { return new TextEncoder().encode(text); };
+    var domError = function (text) {   // "Name: message" from the engine
+      var at = text.indexOf(': '), name = at < 0 ? 'OperationError' : text.slice(0, at), message = at < 0 ? text : text.slice(at + 2);
+      if (name === 'TypeError') return new TypeError(message);
+      return new DOMException(message, name);
+    };
+    var op = function (id, name, a, b, bytes, n1, n2) {
+      var r = __rtc_op(id, name, a === undefined ? '' : a, b === undefined ? '' : b, bytes === undefined ? null : bytes, n1 || 0, n2 || 0);
+      if (r.slice(0, 3) === 'ok:') return r.slice(3);
+      throw domError(r.slice(4));
+    };
+    var live = {}, liveCount = 0, timer = null;
+    var pump = function () {
+      timer = null;
+      Object.keys(live).forEach(function (key) {
+        var pc = live[key];
+        if (pc) pc.__drain();
+      });
+      if (liveCount > 0) timer = setTimeout(pump, 10);
+    };
+    var track = function (pc) { live[pc.__id] = pc; liveCount++; if (!timer) timer = setTimeout(pump, 10); };
+    var untrack = function (pc) { if (live[pc.__id]) { delete live[pc.__id]; liveCount--; } };
+
+    var RTCSessionDescription = klass('RTCSessionDescription', null, function (init) {
+      if (init === null || typeof init !== 'object') throw typeErr("construct 'RTCSessionDescription'", "The provided value is not of type 'RTCSessionDescriptionInit'.");
+      var type = init.type === undefined ? '' : String(init.type);
+      if (SDP_TYPES.indexOf(type) < 0) throw typeErr("construct 'RTCSessionDescription'", "The provided value '" + type + "' is not a valid enum value of type RTCSdpType.");
+      Object.defineProperty(this, 'type', { value: type, enumerable: true });
+      Object.defineProperty(this, 'sdp', { value: init.sdp === undefined ? '' : String(init.sdp), enumerable: true });
+    });
+    method(RTCSessionDescription.prototype, 'toJSON', function () { return { type: this.type, sdp: this.sdp }; });
+
+    var parseCandidate = function (c) {
+      var m = /^(?:a=)?(?:candidate:)?(\S+) (\d+) (\S+) (\d+) (\S+) (\d+) typ (\S+)(?: raddr (\S+) rport (\d+))?(?: tcptype (\S+))?/.exec(c);
+      if (!m) return null;
+      return { foundation: m[1], component: m[2] === '1' ? 'rtp' : m[2] === '2' ? 'rtcp' : null, protocol: m[3].toLowerCase(), priority: Number(m[4]), address: m[5], port: Number(m[6]), type: m[7],
+               relatedAddress: m[8] || null, relatedPort: m[9] === undefined ? null : Number(m[9]), tcpType: m[10] || null };
+    };
+    var RTCIceCandidate = klass('RTCIceCandidate', null, function (init) {
+      if (init === undefined || init === null || typeof init !== 'object') init = {};
+      var candidate = init.candidate === undefined ? '' : String(init.candidate);
+      var mid = init.sdpMid === undefined ? null : init.sdpMid === null ? null : String(init.sdpMid);
+      var index = init.sdpMLineIndex === undefined || init.sdpMLineIndex === null ? null : Number(init.sdpMLineIndex);
+      if (mid === null && index === null) throw new TypeError("Failed to construct 'RTCIceCandidate': sdpMid and sdpMLineIndex are both null.");
+      var parsed = parseCandidate(candidate) || {};
+      var def = function (k, v) { Object.defineProperty(this, k, { value: v, enumerable: true }); }.bind(this);
+      def('candidate', candidate); def('sdpMid', mid); def('sdpMLineIndex', index); def('usernameFragment', init.usernameFragment === undefined ? null : init.usernameFragment);
+      ['foundation', 'component', 'priority', 'address', 'protocol', 'port', 'type', 'tcpType', 'relatedAddress', 'relatedPort'].forEach(function (k) { def(k, parsed[k] === undefined ? null : parsed[k]); });
+    });
+    method(RTCIceCandidate.prototype, 'toJSON', function () { return { candidate: this.candidate, sdpMid: this.sdpMid, sdpMLineIndex: this.sdpMLineIndex, usernameFragment: this.usernameFragment }; });
+
+    var eventClass = function (name, fields) {
+      var C = function (type, init) {
+        if (!(this instanceof C)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+        if (arguments.length < 1) throw new TypeError("Failed to construct '" + name + "': 1 argument required, but only 0 present.");
+        var e = new g.Event(type, init);
+        Object.setPrototypeOf(e, C.prototype);
+        fields.forEach(function (f) { Object.defineProperty(e, f[0], { value: init && init[f[0]] !== undefined ? init[f[0]] : f[1], enumerable: true }); });
+        return e;
+      };
+      Object.defineProperty(C, 'name', { value: name });
+      C.prototype = Object.create(g.Event.prototype);
+      Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true });
+      tag(C, name);
+      hide(g, name, C);
+      return C;
+    };
+    var RTCPeerConnectionIceEvent = eventClass('RTCPeerConnectionIceEvent', [['candidate', null], ['url', null]]);
+    var RTCDataChannelEvent = eventClass('RTCDataChannelEvent', [['channel', null]]);
+    var RTCPeerConnectionIceErrorEvent = eventClass('RTCPeerConnectionIceErrorEvent', [['address', null], ['port', null], ['url', ''], ['errorCode', 0], ['errorText', '']]);
+    var RTCError = klass('RTCError', g.DOMException, function (init, message) {
+      Object.defineProperty(this, 'errorDetail', { value: init && init.errorDetail ? String(init.errorDetail) : '', enumerable: true });
+      Object.defineProperty(this, 'message', { value: message === undefined ? '' : String(message), enumerable: true });
+      Object.defineProperty(this, 'name', { value: 'OperationError', enumerable: true });
+    });
+    var RTCErrorEvent = eventClass('RTCErrorEvent', [['error', null]]);
+
+    // ------------------------------------------------------------------------------------------------------------------------------ tracks and streams
+    var uuid = function () {
+      var t = '', hexd = '0123456789abcdef';
+      for (var i = 0; i < 36; i++) t += (i === 8 || i === 13 || i === 18 || i === 23) ? '-' : hexd.charAt(Math.floor(Math.random() * 16));
+      return t;
+    };
+    var MediaStreamTrack = klass('MediaStreamTrack', ET), MediaStream = klass('MediaStream', ET, function (arg) {
+      hide(this, '__tracks', []); hide(this, '__id', uuid()); hide(this, '__elements', []);
+      this.onaddtrack = this.onremovetrack = null;
+      var self = this;
+      if (arg instanceof MediaStream) arg.getTracks().forEach(function (t) { self.addTrack(t); });
+      else if (arg !== undefined && arg !== null) {
+        if (typeof arg.length !== 'number') throw typeErr("construct 'MediaStream'", "The provided value is not of type 'MediaStreamTrack sequence'.");
+        for (var i = 0; i < arg.length; i++) { if (!(arg[i] instanceof MediaStreamTrack)) throw typeErr("construct 'MediaStream'", "The provided value is not of type 'MediaStreamTrack'."); self.addTrack(arg[i]); }
+      }
+    });
+    g.MediaStream = MediaStream;   // (replaces the empty one the device stubs made)
+    var newTrack = function (kind, label, source) {
+      var t = Object.create(MediaStreamTrack.prototype);
+      hide(t, '__kind', kind); hide(t, '__id', uuid()); hide(t, '__label', label); hide(t, '__source', source || 0); hide(t, '__state', 'live'); hide(t, '__enabled', true);
+      hide(t, '__muted', !source); hide(t, '__pc', null); hide(t, '__index', -1); hide(t, '__senders', []); hide(t, '__playing', 0);
+      t.onended = t.onmute = t.onunmute = null;
+      return t;
+    };
+    var tacc = function (name, get, set) { Object.defineProperty(MediaStreamTrack.prototype, name, { get: get, set: set, enumerable: true, configurable: true }); };
+    tacc('kind', function () { return this.__kind; });
+    tacc('id', function () { return this.__id; });
+    tacc('label', function () { return this.__label; });
+    tacc('readyState', function () { return this.__state; });
+    tacc('muted', function () { return this.__muted; });
+    tacc('contentHint', function () { return ''; }, function () { });
+    tacc('enabled', function () { return this.__enabled; }, function (v) {
+      v = !!v;
+      this.__enabled = v;
+      this.__senders.forEach(function (s) { try { op(s.pc.__id, 'senderenabled', '', '', undefined, s.index, v ? 1 : 0); } catch (e) { } });
+    });
+    method(MediaStreamTrack.prototype, 'stop', function () {
+      if (this.__state === 'ended') return;
+      this.__state = 'ended';
+      if (this.__source) { try { op(0, 'source_close', '', '', undefined, this.__source); } catch (e) { } this.__source = 0; }
+      if (this.__pc && this.__playing) { try { op(this.__pc.__id, 'play', '', '', undefined, this.__index, 0); } catch (e) { } }
+    });
+    method(MediaStreamTrack.prototype, 'clone', function () {
+      if (this.__source) throw new DOMException("Failed to execute 'clone' on 'MediaStreamTrack': a microphone track cannot be cloned yet", 'NotSupportedError');
+      var t = newTrack(this.__kind, this.__label, 0);
+      return t;
+    });
+    method(MediaStreamTrack.prototype, 'getSettings', function () { return { deviceId: this.__source ? 'default' : '', sampleRate: 8000, channelCount: 1, echoCancellation: false, autoGainControl: false, noiseSuppression: false }; });
+    method(MediaStreamTrack.prototype, 'getCapabilities', function () { return { sampleRate: { min: 8000, max: 8000 }, channelCount: { min: 1, max: 1 } }; });
+    method(MediaStreamTrack.prototype, 'getConstraints', function () { return {}; });
+    method(MediaStreamTrack.prototype, 'applyConstraints', function () { return Promise.resolve(); });
+    hide(MediaStreamTrack.prototype, '__play', function (on) {   // a remote track played through the speaker
+      if (!this.__pc || this.__state === 'ended') return;
+      this.__playing = on ? 1 : 0;
+      try { op(this.__pc.__id, 'play', '', '', undefined, this.__index, on ? 1 : 0); } catch (e) { }
+    });
+    var sacc = function (name, get) { Object.defineProperty(MediaStream.prototype, name, { get: get, enumerable: true, configurable: true }); };
+    sacc('id', function () { return this.__id; });
+    sacc('active', function () { return this.__tracks.some(function (t) { return t.readyState === 'live'; }); });
+    method(MediaStream.prototype, 'getTracks', function () { return this.__tracks.slice(); });
+    method(MediaStream.prototype, 'getAudioTracks', function () { return this.__tracks.filter(function (t) { return t.kind === 'audio'; }); });
+    method(MediaStream.prototype, 'getVideoTracks', function () { return this.__tracks.filter(function (t) { return t.kind === 'video'; }); });
+    method(MediaStream.prototype, 'getTrackById', function (id) { id = String(id); for (var i = 0; i < this.__tracks.length; i++) if (this.__tracks[i].id === id) return this.__tracks[i]; return null; });
+    method(MediaStream.prototype, 'addTrack', function (t) {
+      if (!(t instanceof MediaStreamTrack)) throw typeErr("execute 'addTrack' on 'MediaStream'", "parameter 1 is not of type 'MediaStreamTrack'.");
+      if (this.__tracks.indexOf(t) >= 0) return;
+      this.__tracks.push(t);
+      this.__elements.forEach(function (el) { if (t.__pc) t.__play(true); });
+    });
+    method(MediaStream.prototype, 'removeTrack', function (t) {
+      var i = this.__tracks.indexOf(t);
+      if (i < 0) return;
+      this.__tracks.splice(i, 1);
+      if (this.__elements.length && t.__pc) t.__play(false);
+    });
+    method(MediaStream.prototype, 'clone', function () { var m = new MediaStream(); this.__tracks.forEach(function (t) { m.addTrack(t.clone()); }); return m; });
+    // <audio>/<video> srcObject: a stream with remote tracks plays through the speaker
+    var attached = [];
+    hide(g, '__srcobject_get', function (node) { for (var i = 0; i < attached.length; i++) if (attached[i].node === node) return attached[i].stream; return null; });
+    hide(g, '__srcobject_set', function (node, value) {
+      if (value !== null && value !== undefined && !(value instanceof MediaStream)) throw typeErr("set 'srcObject' on 'HTMLMediaElement'", "The provided value is not of type 'MediaProvider'.");
+      for (var i = 0; i < attached.length; i++) if (attached[i].node === node) {
+        var old = attached[i].stream;
+        attached.splice(i, 1);
+        var at = old.__elements.indexOf(node);
+        if (at >= 0) old.__elements.splice(at, 1);
+        old.__tracks.forEach(function (t) { if (t.__pc && !attached.some(function (a) { return a.stream.__tracks.indexOf(t) >= 0; })) t.__play(false); });
+        break;
+      }
+      if (value) {
+        attached.push({ node: node, stream: value });
+        value.__elements.push(node);
+        value.__tracks.forEach(function (t) { if (t.__pc && t.kind === 'audio') t.__play(true); });
+      }
+    });
+    // getUserMedia and enumerateDevices: the microphone, when the machine has one and the user allows it
+    var MediaDevicesProto = g.MediaDevices && g.MediaDevices.prototype;
+    var deviceError = function (name, message) { return new DOMException(message, name); };
+    if (MediaDevicesProto) {
+      MediaDevicesProto.getUserMedia = function (constraints) {
+        if (constraints === null || typeof constraints !== 'object' || (!constraints.audio && !constraints.video)) return Promise.reject(new TypeError("Failed to execute 'getUserMedia' on 'MediaDevices': At least one of audio and video must be requested"));
+        if (constraints.video) return Promise.reject(deviceError('NotFoundError', 'Requested device not found'));
+        return new Promise(function (resolve, reject) {
+          var ask = function (waited) {
+            var state;
+            try { state = op(0, 'mic_permission'); if (state === 'default') state = op(0, 'mic_request'); } catch (e) { reject(e); return; }
+            if (state === 'default') { if (waited > 120000) reject(deviceError('NotAllowedError', 'Permission dismissed')); else setTimeout(function () { ask(waited + 100); }, 100); return; }
+            if (state !== 'granted') { reject(deviceError('NotAllowedError', 'Permission denied')); return; }
+            try {
+              var handle = Number(op(0, 'mic_open'));
+              resolve(new MediaStream([newTrack('audio', 'Microphone', handle)]));
+            } catch (e) { reject(e); }
+          };
+          ask(0);
+        });
+      };
+      MediaDevicesProto.enumerateDevices = function () {
+        var list = [];
+        try {
+          if (op(0, 'mic_present') === '1') {
+            var granted = op(0, 'mic_permission') === 'granted';
+            [['audioinput', 'Microphone'], ['audiooutput', 'Speaker']].forEach(function (d) {
+              var info = Object.create((g.MediaDeviceInfo || function () { }).prototype || Object.prototype);
+              Object.defineProperty(info, 'deviceId', { value: 'default', enumerable: true }); Object.defineProperty(info, 'kind', { value: d[0], enumerable: true });
+              Object.defineProperty(info, 'label', { value: granted ? d[1] : '', enumerable: true }); Object.defineProperty(info, 'groupId', { value: 'default', enumerable: true });
+              list.push(info);
+            });
+          }
+        } catch (e) { }
+        return Promise.resolve(list);
+      };
+      MediaDevicesProto.getSupportedConstraints = function () { return { sampleRate: true, channelCount: true, deviceId: true }; };
+    }
+
+    // ------------------------------------------------------------------------------------------------------------------------------ RTCDataChannel
+    var RTCDataChannel = klass('RTCDataChannel', ET);
+    var channelFrom = function (pc, info) {
+      var ch = Object.create(RTCDataChannel.prototype);
+      hide(ch, '__pc', pc); hide(ch, '__h', info.id); hide(ch, '__info', info); hide(ch, '__state', 'connecting'); hide(ch, '__type', 'blob'); hide(ch, '__low', 0);
+      ch.onopen = ch.onmessage = ch.onclose = ch.onclosing = ch.onerror = ch.onbufferedamountlow = null;
+      pc.__channels[info.id] = ch;
+      return ch;
+    };
+    var cacc = function (name, get, set) { Object.defineProperty(RTCDataChannel.prototype, name, { get: get, set: set, enumerable: true, configurable: true }); };
+    cacc('label', function () { return this.__info.label; });
+    cacc('ordered', function () { return this.__info.ordered; });
+    cacc('maxPacketLifeTime', function () { return this.__info.maxPacketLifeTime; });
+    cacc('maxRetransmits', function () { return this.__info.maxRetransmits; });
+    cacc('protocol', function () { return this.__info.protocol; });
+    cacc('negotiated', function () { return this.__info.negotiated; });
+    cacc('id', function () { if (this.__info.sid === null && this.__state !== 'closed') { var t = op(this.__pc.__id, 'channelinfo', '', '', undefined, this.__h); if (t) this.__info = JSON.parse(t); } return this.__info.sid; });
+    cacc('readyState', function () { return this.__state; });
+    cacc('priority', function () { return 'low'; });
+    cacc('bufferedAmount', function () { return this.__state === 'closed' ? 0 : Number(op(this.__pc.__id, 'buffered', '', '', undefined, this.__h)); });
+    cacc('bufferedAmountLowThreshold', function () { return this.__low; }, function (v) {
+      v = Number(v);
+      if (!(v >= 0 && v <= 4294967295)) throw typeErr("set 'bufferedAmountLowThreshold' on 'RTCDataChannel'", 'The value provided is out of range.');
+      this.__low = Math.floor(v);
+      if (this.__state !== 'closed') op(this.__pc.__id, 'threshold', '', '', undefined, this.__h, this.__low);
+    });
+    cacc('binaryType', function () { return this.__type; }, function (v) {
+      v = String(v);
+      if (v !== 'blob' && v !== 'arraybuffer') throw new DOMException("Failed to set the 'binaryType' property on 'RTCDataChannel': Unsupported binary type", 'SyntaxError');
+      this.__type = v;
+    });
+    method(RTCDataChannel.prototype, 'send', function (data) {
+      if (arguments.length < 1) throw typeErr("execute 'send' on 'RTCDataChannel'", '1 argument required, but only 0 present.');
+      var self = this;
+      if (this.__state !== 'open') throw new DOMException("Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel.readyState is not 'open'", 'InvalidStateError');
+      var push = function (bytes, binary) {
+        try { op(self.__pc.__id, 'send', '', '', bytes, self.__h, binary ? 1 : 0); }
+        catch (e) { throw e.name === 'InvalidStateError' ? e : new DOMException("Failed to execute 'send' on 'RTCDataChannel': " + e.message, e.name === 'TypeError' ? 'OperationError' : e.name); }
+      };
+      if (typeof data === 'string') push(enc(data), false);
+      else if (data instanceof ArrayBuffer) push(new Uint8Array(data), true);
+      else if (ArrayBuffer.isView(data)) push(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), true);
+      else if (data instanceof Blob) data.arrayBuffer().then(function (b) { if (self.__state === 'open') push(new Uint8Array(b), true); });
+      else push(enc(String(data)), false);
+    });
+    method(RTCDataChannel.prototype, 'close', function () {
+      if (this.__state === 'closed' || this.__state === 'closing') return;
+      op(this.__pc.__id, 'closechannel', '', '', undefined, this.__h);
+      this.__pc.__drain();
+    });
+    var hex2bytes = function (hex) {
+      var out = new Uint8Array(hex.length >> 1);
+      for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+      return out;
+    };
+    var fire = function (target, type, event) {
+      var h = target['on' + type];
+      target.dispatchEvent(event || new g.Event(type));
+    };
+    var channelEvent = function (pc, e) {
+      var ch = pc.__channels[e.id];
+      if (!ch) return;
+      switch (e.t) {
+        case 'dcopen': if (ch.__state === 'connecting') ch.__state = 'open'; ch.__info = JSON.parse(op(pc.__id, 'channelinfo', '', '', undefined, ch.__h)); fire(ch, 'open'); break;
+        case 'dcclosing': if (ch.__state !== 'closed') { ch.__state = 'closing'; fire(ch, 'closing'); } break;
+        case 'dcclose': if (ch.__state !== 'closed') { if (ch.__state !== 'closing') { ch.__state = 'closing'; fire(ch, 'closing'); } ch.__state = 'closed'; fire(ch, 'close'); delete pc.__channels[e.id]; } break;
+        case 'dcerror': fire(ch, 'error', new RTCErrorEvent('error', { error: new RTCError({ errorDetail: 'sctp-failure' }, 'The data channel failed') })); break;
+        case 'dcbufferedamountlow': fire(ch, 'bufferedamountlow'); break;
+        case 'dcmessage': {
+          var data;
+          if (!e.binary) data = e.data;
+          else {
+            var bytes = hex2bytes(e.data);
+            data = ch.__type === 'arraybuffer' ? bytes.buffer : new Blob([bytes]);
+          }
+          fire(ch, 'message', new g.MessageEvent('message', { data: data, origin: '' }));
+          break;
+        }
+      }
+    };
+
+    // ------------------------------------------------------------------------------------------------------------------------------ transports
+    var RTCDtlsTransport = klass('RTCDtlsTransport', ET), RTCIceTransport = klass('RTCIceTransport', ET), RTCSctpTransport = klass('RTCSctpTransport', ET), RTCCertificate = klass('RTCCertificate', null);
+    var transportState = function (pc, which) {
+      var st = pc.__state;
+      if (which === 'ice') return st.ice === 'completed' ? 'completed' : st.ice;
+      return st.connection === 'connected' ? 'connected' : st.connection === 'closed' ? 'closed' : st.connection === 'failed' ? 'failed' : st.connection === 'new' ? 'new' : 'connecting';
+    };
+    var makeTransports = function (pc) {
+      var ice = Object.create(RTCIceTransport.prototype), dtls = Object.create(RTCDtlsTransport.prototype), sctp = Object.create(RTCSctpTransport.prototype);
+      Object.defineProperty(ice, 'state', { get: function () { return pc.__open ? transportState(pc, 'ice') : 'new'; }, enumerable: true });
+      Object.defineProperty(ice, 'gatheringState', { get: function () { return pc.__state.gathering; }, enumerable: true });
+      Object.defineProperty(ice, 'role', { get: function () { return 'unknown'; }, enumerable: true });
+      Object.defineProperty(dtls, 'state', { get: function () { return transportState(pc, 'dtls'); }, enumerable: true });
+      Object.defineProperty(dtls, 'iceTransport', { value: ice, enumerable: true });
+      Object.defineProperty(sctp, 'transport', { value: dtls, enumerable: true });
+      Object.defineProperty(sctp, 'state', { get: function () { return pc.__state.connection === 'connected' ? 'connected' : pc.__state.connection === 'closed' ? 'closed' : 'connecting'; }, enumerable: true });
+      Object.defineProperty(sctp, 'maxMessageSize', { get: function () { return Number(op(pc.__id, 'maxmessage')); }, enumerable: true });
+      Object.defineProperty(sctp, 'maxChannels', { value: 65535, enumerable: true });
+      return { ice: ice, dtls: dtls, sctp: sctp };
+    };
+    method(RTCCertificate.prototype, 'getFingerprints', function () { return [{ algorithm: 'sha-256', value: this.__fp }]; });
+
+    // ------------------------------------------------------------------------------------------------------------------------------ stats
+    var RTCStatsReport = klass('RTCStatsReport', null);
+    var statsReport = function (list) {
+      var r = Object.create(RTCStatsReport.prototype), map = new Map();
+      list.forEach(function (s) { s.timestamp = Date.now(); map.set(s.id, s); });
+      hide(r, '__map', map);
+      return r;
+    };
+    ['get', 'has', 'forEach', 'keys', 'values', 'entries'].forEach(function (name) { method(RTCStatsReport.prototype, name, function () { return this.__map[name].apply(this.__map, arguments); }); });
+    Object.defineProperty(RTCStatsReport.prototype, 'size', { get: function () { return this.__map.size; }, enumerable: true, configurable: true });
+    method(RTCStatsReport.prototype, Symbol.iterator, function () { return this.__map.entries(); });
+
+    // ------------------------------------------------------------------------------------------------------------------------------ RTCPeerConnection
+    var checkDescription = function (what, d, needSdp) {
+      if (d === null || typeof d !== 'object') throw typeErr(what, "The provided value is not of type 'RTCSessionDescriptionInit'.");
+      var type = d.type === undefined ? undefined : String(d.type);
+      if (type !== undefined && SDP_TYPES.indexOf(type) < 0) throw typeErr(what, "The provided value '" + type + "' is not a valid enum value of type RTCSdpType.");
+      return { type: type, sdp: d.sdp === undefined ? '' : String(d.sdp) };
+    };
+    var RTCPeerConnection = klass('RTCPeerConnection', ET, function (config) {
+      var servers = [], self = this;
+      config = config || {};
+      if (typeof config !== 'object') throw typeErr("construct 'RTCPeerConnection'", "The provided value is not of type 'RTCConfiguration'.");
+      (config.iceServers || []).forEach(function (s) {
+        var urls = typeof s.urls === 'string' ? [s.urls] : s.urls;
+        if (!urls) throw typeErr("construct 'RTCPeerConnection'", "Failed to read the 'iceServers' property: 'urls' is required.");
+        urls.forEach(function (u) {
+          u = String(u);
+          if (!/^(stun|stuns|turn|turns):/i.test(u)) throw new DOMException("Failed to construct 'RTCPeerConnection': '" + u + "' is not a valid URL.", 'SyntaxError');
+          if (/^stun:/i.test(u)) servers.push(u);
+        });
+      });
+      if (!__rtc_available()) throw new DOMException("Failed to construct 'RTCPeerConnection': WebRTC is not available", 'NotSupportedError');
+      var id = __rtc_create(servers.join('\n'));
+      if (!id) throw domError(String(g.__rtc_error));
+      hide(this, '__id', id); hide(this, '__channels', {}); hide(this, '__open', true); hide(this, '__config', config);
+      hide(this, '__state', { signaling: 'stable', connection: 'new', ice: 'new', gathering: 'new' });
+      hide(this, '__tr', makeTransports(this)); hide(this, '__trickle', null); hide(this, '__needed', false); hide(this, '__tx', {}); hide(this, '__txList', []); hide(this, '__streams', {});
+      this.onicecandidate = this.onicecandidateerror = this.oniceconnectionstatechange = this.onicegatheringstatechange = this.onsignalingstatechange = this.onconnectionstatechange = null;
+      this.onnegotiationneeded = this.ondatachannel = this.ontrack = null;
+      track(this);
+    });
+    var pacc = function (name, get) { Object.defineProperty(RTCPeerConnection.prototype, name, { get: get, enumerable: true, configurable: true }); };
+    pacc('signalingState', function () { return this.__state.signaling; });
+    pacc('connectionState', function () { return this.__state.connection; });
+    pacc('iceConnectionState', function () { return this.__state.ice; });
+    pacc('iceGatheringState', function () { return this.__state.gathering; });
+    pacc('canTrickleIceCandidates', function () { return this.__trickle; });
+    pacc('sctp', function () { return this.__state.signaling !== 'stable' || this.__state.connection !== 'new' ? this.__tr.sctp : null; });
+    var description = function (pc, which) {
+      if (!pc.__open && pc.__state.connection !== 'closed') return null;
+      var t = op(pc.__id, which);
+      if (!t) return null;
+      var d = JSON.parse(t);
+      return new RTCSessionDescription(d);
+    };
+    pacc('localDescription', function () { return description(this, 'localdesc'); });
+    pacc('remoteDescription', function () { return description(this, 'remotedesc'); });
+    pacc('currentLocalDescription', function () { return this.__state.signaling === 'stable' ? description(this, 'localdesc') : null; });
+    pacc('currentRemoteDescription', function () { return this.__state.signaling === 'stable' ? description(this, 'remotedesc') : null; });
+    pacc('pendingLocalDescription', function () { return this.__state.signaling === 'have-local-offer' ? description(this, 'localdesc') : null; });
+    pacc('pendingRemoteDescription', function () { return this.__state.signaling === 'have-remote-offer' ? description(this, 'remotedesc') : null; });
+    var closedError = function (what) { return new DOMException("Failed to execute '" + what + "' on 'RTCPeerConnection': The RTCPeerConnection's signalingState is 'closed'.", 'InvalidStateError'); };
+    var wrap = function (what, fn) {
+      return function () {
+        if (this.__state.signaling === 'closed') return Promise.reject(closedError(what));
+        try { return Promise.resolve(fn.apply(this, arguments)); } catch (e) { return Promise.reject(e); }
+      };
+    };
+    method(RTCPeerConnection.prototype, 'createOffer', wrap('createOffer', function () { return new RTCSessionDescription({ type: 'offer', sdp: op(this.__id, 'offer') }); }));
+    method(RTCPeerConnection.prototype, 'createAnswer', wrap('createAnswer', function () { return new RTCSessionDescription({ type: 'answer', sdp: op(this.__id, 'answer') }); }));
+    method(RTCPeerConnection.prototype, 'setLocalDescription', wrap('setLocalDescription', function (desc) {
+      var d = desc === undefined ? { type: undefined, sdp: '' } : checkDescription("execute 'setLocalDescription' on 'RTCPeerConnection'", desc), type = d.type;
+      if (type === undefined) type = this.__state.signaling === 'have-remote-offer' ? 'answer' : 'offer';
+      if (d.sdp === '' && type !== 'rollback' && desc === undefined) op(this.__id, type === 'offer' ? 'offer' : 'answer');
+      op(this.__id, 'setlocal', type, d.sdp);
+      this.__drain();
+    }));
+    method(RTCPeerConnection.prototype, 'setRemoteDescription', wrap('setRemoteDescription', function (desc) {
+      if (arguments.length < 1) throw typeErr("execute 'setRemoteDescription' on 'RTCPeerConnection'", '1 argument required, but only 0 present.');
+      var d = checkDescription("execute 'setRemoteDescription' on 'RTCPeerConnection'", desc);
+      if (d.type === undefined) throw typeErr("execute 'setRemoteDescription' on 'RTCPeerConnection'", "Failed to read the 'type' property from 'RTCSessionDescriptionInit': Required member is undefined.");
+      op(this.__id, 'setremote', d.type, d.sdp);
+      this.__trickle = true;
+      this.__drain();
+    }));
+    method(RTCPeerConnection.prototype, 'addIceCandidate', wrap('addIceCandidate', function (c) {
+      if (c === undefined || c === null) { op(this.__id, 'addcandidate', '', '', undefined, 0); return; }
+      var cand = c.candidate === undefined ? '' : String(c.candidate), mid = c.sdpMid === undefined || c.sdpMid === null ? '' : String(c.sdpMid);
+      var index = c.sdpMLineIndex === undefined || c.sdpMLineIndex === null ? -1 : Number(c.sdpMLineIndex);
+      if (cand !== '' && c.sdpMid == null && c.sdpMLineIndex == null) throw new TypeError("Failed to execute 'addIceCandidate' on 'RTCPeerConnection': Candidate missing values for both sdpMid and sdpMLineIndex");
+      op(this.__id, 'addcandidate', cand.replace(/^a=/, ''), mid, undefined, index);
+    }));
+    method(RTCPeerConnection.prototype, 'createDataChannel', function (label, init) {
+      if (arguments.length < 1) throw typeErr("execute 'createDataChannel' on 'RTCPeerConnection'", '1 argument required, but only 0 present.');
+      if (this.__state.signaling === 'closed') throw closedError('createDataChannel');
+      init = init || {};
+      var ordered = init.ordered === undefined ? true : !!init.ordered, life = init.maxPacketLifeTime === undefined || init.maxPacketLifeTime === null ? -1 : Number(init.maxPacketLifeTime);
+      var rtx = init.maxRetransmits === undefined || init.maxRetransmits === null ? -1 : Number(init.maxRetransmits), negotiated = !!init.negotiated, id = init.id === undefined || init.id === null ? -1 : Number(init.id);
+      label = String(label);
+      var protocol = init.protocol === undefined ? '' : String(init.protocol);
+      if (life >= 0 && rtx >= 0) throw new DOMException("Failed to execute 'createDataChannel' on 'RTCPeerConnection': Both maxRetransmits and maxPacketLifeTime cannot be set", 'SyntaxError');
+      if (life > 65535 || rtx > 65535 || life < -1 || rtx < -1) throw typeErr("execute 'createDataChannel' on 'RTCPeerConnection'", 'The value is out of range.');
+      if (negotiated && id < 0) throw typeErr("execute 'createDataChannel' on 'RTCPeerConnection'", 'A negotiated channel needs an id.');
+      if (id > 65534) throw typeErr("execute 'createDataChannel' on 'RTCPeerConnection'", 'The id is out of range.');
+      var flags = (ordered ? 1 : 0) | (negotiated ? 2 : 0) | ((rtx + 1) << 8) | ((life + 1) * 16777216);
+      var h = Number(op(this.__id, 'createchannel', label, protocol, undefined, flags, id));
+      return channelFrom(this, JSON.parse(op(this.__id, 'channelinfo', '', '', undefined, h)));
+    });
+    method(RTCPeerConnection.prototype, 'getStats', wrap('getStats', function () { return statsReport(JSON.parse(op(this.__id, 'stats'))); }));
+    method(RTCPeerConnection.prototype, 'restartIce', function () { op(this.__id, 'restartice'); });
+    method(RTCPeerConnection.prototype, 'getConfiguration', function () { var c = this.__config, o = {}; Object.keys(c).forEach(function (k) { o[k] = c[k]; }); o.iceServers = o.iceServers || []; o.iceTransportPolicy = o.iceTransportPolicy || 'all'; o.bundlePolicy = o.bundlePolicy || 'balanced'; o.rtcpMuxPolicy = o.rtcpMuxPolicy || 'require'; o.iceCandidatePoolSize = o.iceCandidatePoolSize || 0; o.certificates = o.certificates || []; return o; });
+    method(RTCPeerConnection.prototype, 'setConfiguration', function (c) { this.__config = c || {}; });
+    method(RTCPeerConnection.prototype, 'close', function () {
+      if (this.__state.signaling === 'closed') return;
+      op(this.__id, 'close');
+      this.__drain();
+      this.__open = false;
+      untrack(this);
+    });
+    // media: audio tracks over RTP (G.711)
+    var RTCRtpSender = klass('RTCRtpSender', null), RTCRtpReceiver = klass('RTCRtpReceiver', null), RTCRtpTransceiver = klass('RTCRtpTransceiver', null), RTCTrackEvent = null;
+    var DIRECTIONS = ['sendrecv', 'sendonly', 'recvonly', 'inactive'];
+    var codecs = function () { return [{ mimeType: 'audio/PCMU', clockRate: 8000, channels: 1, payloadType: 0 }, { mimeType: 'audio/PCMA', clockRate: 8000, channels: 1, payloadType: 8 }]; };
+    RTCRtpSender.getCapabilities = RTCRtpReceiver.getCapabilities = function (kind) { return String(kind) === 'audio' ? { codecs: codecs(), headerExtensions: [] } : null; };
+    var rtcTrackEvent = function (init) {
+      var e = new g.Event('track');
+      Object.setPrototypeOf(e, RTCTrackEvent.prototype);
+      ['receiver', 'track', 'streams', 'transceiver'].forEach(function (k) { Object.defineProperty(e, k, { value: init[k], enumerable: true }); });
+      return e;
+    };
+    RTCTrackEvent = function (type, init) { return rtcTrackEvent(init || {}); };
+    RTCTrackEvent.prototype = Object.create(g.Event.prototype);
+    Object.defineProperty(RTCTrackEvent.prototype, 'constructor', { value: RTCTrackEvent, writable: true, configurable: true });
+    Object.defineProperty(RTCTrackEvent, 'name', { value: 'RTCTrackEvent' });
+    hide(g, 'RTCTrackEvent', RTCTrackEvent);
+    var txOf = function (pc, index, info) {
+      var t = pc.__tx[index];
+      if (t) return t;
+      t = Object.create(RTCRtpTransceiver.prototype);
+      var sender = Object.create(RTCRtpSender.prototype), receiver = Object.create(RTCRtpReceiver.prototype);
+      hide(t, '__pc', pc); hide(t, '__index', index); hide(t, '__info', info || null); hide(t, '__sender', sender); hide(t, '__receiver', receiver);
+      hide(sender, '__pc', pc); hide(sender, '__index', index); hide(sender, '__track', null); hide(sender, '__tx', t); hide(sender, '__streams', []);
+      var rt = newTrack('audio', '', 0);
+      rt.__pc = pc; rt.__index = index;
+      hide(receiver, '__pc', pc); hide(receiver, '__index', index); hide(receiver, '__track', rt); hide(receiver, '__tx', t);
+      pc.__tx[index] = t; pc.__txList.push(t);
+      return t;
+    };
+    var refresh = function (pc) {   // what the engine knows of its transceivers: new ones (from a remote offer), directions, ids
+      var list = JSON.parse(op(pc.__id, 'transceivers'));
+      list.forEach(function (info) { var t = txOf(pc, info.index, info); t.__info = info; });
+      return pc.__txList;
+    };
+    var xacc = function (C, name, get, set) { Object.defineProperty(C.prototype, name, { get: get, set: set, enumerable: true, configurable: true }); };
+    xacc(RTCRtpSender, 'track', function () { return this.__track; });
+    xacc(RTCRtpSender, 'transport', function () { return this.__pc.__tr.dtls; });
+    xacc(RTCRtpSender, 'dtmf', function () { return null; });
+    method(RTCRtpSender.prototype, 'getParameters', function () { return { transactionId: '', encodings: [{ active: true }], headerExtensions: [], rtcp: { cname: '', reducedSize: false }, codecs: codecs() }; });
+    method(RTCRtpSender.prototype, 'setParameters', function () { return Promise.resolve(); });
+    method(RTCRtpSender.prototype, 'setStreams', function () { });
+    method(RTCRtpSender.prototype, 'getStats', function () { return this.__pc.getStats(); });
+    method(RTCRtpSender.prototype, 'replaceTrack', function (track) {
+      var self = this, pc = this.__pc;
+      if (pc.__state.signaling === 'closed') return Promise.reject(new DOMException("Failed to execute 'replaceTrack' on 'RTCRtpSender': the connection is closed", 'InvalidStateError'));
+      if (track !== null && !(track instanceof MediaStreamTrack)) return Promise.reject(new TypeError("Failed to execute 'replaceTrack' on 'RTCRtpSender': parameter 1 is not of type 'MediaStreamTrack'."));
+      if (track !== null && track.kind !== 'audio') return Promise.reject(new TypeError("Failed to execute 'replaceTrack' on 'RTCRtpSender': the track kind does not match"));
+      try {
+        var prev = this.__track;
+        if (prev) prev.__senders = prev.__senders.filter(function (x) { return x.pc !== pc || x.index !== self.__index; });
+        if (track) { op(pc.__id, 'setsender', track.id, this.__streams.length ? this.__streams[0].id : '', undefined, this.__index, track.__source); track.__senders.push({ pc: pc, index: this.__index }); }
+        else op(pc.__id, 'setsender', '', '', undefined, this.__index, 0);
+        this.__track = track;
+        return Promise.resolve();
+      } catch (e) { return Promise.reject(e); }
+    });
+    xacc(RTCRtpReceiver, 'track', function () { return this.__track; });
+    xacc(RTCRtpReceiver, 'transport', function () { return this.__pc.__tr.dtls; });
+    method(RTCRtpReceiver.prototype, 'getParameters', function () { return { headerExtensions: [], rtcp: { cname: '', reducedSize: false }, codecs: codecs() }; });
+    method(RTCRtpReceiver.prototype, 'getContributingSources', function () { return []; });
+    method(RTCRtpReceiver.prototype, 'getSynchronizationSources', function () { return []; });
+    method(RTCRtpReceiver.prototype, 'getStats', function () { return this.__pc.getStats(); });
+    xacc(RTCRtpTransceiver, 'mid', function () { refresh(this.__pc); return this.__info ? this.__info.mid : null; });
+    xacc(RTCRtpTransceiver, 'sender', function () { return this.__sender; });
+    xacc(RTCRtpTransceiver, 'receiver', function () { return this.__receiver; });
+    xacc(RTCRtpTransceiver, 'stopped', function () { refresh(this.__pc); return !!(this.__info && this.__info.stopped); });
+    xacc(RTCRtpTransceiver, 'direction', function () { refresh(this.__pc); return this.__info ? this.__info.direction : 'inactive'; }, function (d) {
+      d = String(d);
+      if (DIRECTIONS.indexOf(d) < 0) throw typeErr("set 'direction' on 'RTCRtpTransceiver'", "The provided value '" + d + "' is not a valid enum value of type RTCRtpTransceiverDirection.");
+      op(this.__pc.__id, 'setdirection', '', '', undefined, this.__index, DIRECTIONS.indexOf(d));
+    });
+    xacc(RTCRtpTransceiver, 'currentDirection', function () { refresh(this.__pc); return this.__info ? this.__info.currentDirection : null; });
+    method(RTCRtpTransceiver.prototype, 'stop', function () { op(this.__pc.__id, 'stoptransceiver', '', '', undefined, this.__index); this.__receiver.__track.__muted = true; });
+    method(RTCRtpTransceiver.prototype, 'setCodecPreferences', function () { });
+    var streamFor = function (pc, id) {
+      if (!id || id === '-') return null;
+      var m = pc.__streams[id];
+      if (!m) { m = new MediaStream(); m.__id = id; pc.__streams[id] = m; }
+      return m;
+    };
+    method(RTCPeerConnection.prototype, 'addTrack', function (track) {
+      if (this.__state.signaling === 'closed') throw closedError('addTrack');
+      if (!(track instanceof MediaStreamTrack)) throw typeErr("execute 'addTrack' on 'RTCPeerConnection'", "parameter 1 is not of type 'MediaStreamTrack'.");
+      if (track.kind !== 'audio') throw new DOMException("Failed to execute 'addTrack' on 'RTCPeerConnection': only audio is supported", 'NotSupportedError');
+      var self = this, streams = Array.prototype.slice.call(arguments, 1);
+      refresh(this).forEach(function (t) { if (t.__sender.__track === track) throw new DOMException("Failed to execute 'addTrack' on 'RTCPeerConnection': A sender already exists for the track.", 'InvalidAccessError'); });
+      var index = Number(op(this.__id, 'addtrack', track.id, streams.length ? streams[0].id : '', undefined, 0, track.__source));
+      refresh(this);
+      var t = this.__tx[index];
+      t.__sender.__track = track; t.__sender.__streams = streams;
+      track.__senders.push({ pc: this, index: index });
+      if (!track.__enabled) op(this.__id, 'senderenabled', '', '', undefined, index, 0);
+      return t.__sender;
+    });
+    method(RTCPeerConnection.prototype, 'addTransceiver', function (what, init) {
+      if (this.__state.signaling === 'closed') throw closedError('addTransceiver');
+      init = init || {};
+      var kind = what instanceof MediaStreamTrack ? what.kind : String(what), dir = init.direction === undefined ? 'sendrecv' : String(init.direction);
+      if (kind !== 'audio' && kind !== 'video') throw typeErr("execute 'addTransceiver' on 'RTCPeerConnection'", "The provided value '" + kind + "' is not a valid enum value of type MediaStreamTrackKind.");
+      if (DIRECTIONS.indexOf(dir) < 0) throw typeErr("execute 'addTransceiver' on 'RTCPeerConnection'", "The provided value '" + dir + "' is not a valid enum value of type RTCRtpTransceiverDirection.");
+      var index = Number(op(this.__id, 'addtransceiver', kind, '', undefined, DIRECTIONS.indexOf(dir)));
+      refresh(this);
+      var t = this.__tx[index];
+      if (what instanceof MediaStreamTrack) {
+        var streams = init.streams || [];
+        op(this.__id, 'setsender', what.id, streams.length ? streams[0].id : '', undefined, index, what.__source);
+        t.__sender.__track = what; t.__sender.__streams = streams;
+        what.__senders.push({ pc: this, index: index });
+      }
+      return t;
+    });
+    method(RTCPeerConnection.prototype, 'removeTrack', function (sender) {
+      if (this.__state.signaling === 'closed') throw closedError('removeTrack');
+      if (!(sender instanceof RTCRtpSender) || sender.__pc !== this) throw new DOMException("Failed to execute 'removeTrack' on 'RTCPeerConnection': The sender was not created by this connection.", 'InvalidAccessError');
+      if (!sender.__track) return;
+      var t = sender.__track;
+      t.__senders = t.__senders.filter(function (x) { return !(x.pc === sender.__pc && x.index === sender.__index); });
+      op(this.__id, 'removesender', '', '', undefined, sender.__index);
+      sender.__track = null;
+    });
+    method(RTCPeerConnection.prototype, 'getTransceivers', function () { return refresh(this).slice(); });
+    method(RTCPeerConnection.prototype, 'getSenders', function () { return refresh(this).filter(function (t) { return !t.__info || !t.__info.stopped; }).map(function (t) { return t.__sender; }); });
+    method(RTCPeerConnection.prototype, 'getReceivers', function () { return refresh(this).filter(function (t) { return !t.__info || !t.__info.stopped; }).map(function (t) { return t.__receiver; }); });
+    hide(RTCPeerConnection.prototype, '__trackEvent', function (e) {
+      var t = txOf(this, e.index, null);
+      refresh(this);
+      var track = t.__receiver.__track;
+      track.__label = e.trackId; track.__id = e.trackId;
+      var stream = streamFor(this, e.streamId), streams = stream ? [stream] : [];
+      if (stream) stream.addTrack(track);
+      fire(this, 'track', new RTCTrackEvent('track', { receiver: t.__receiver, track: track, streams: streams, transceiver: t }));
+      if (stream && stream.__elements.length) track.__play(true);
+    });
+    hide(RTCPeerConnection.prototype, '__muteEvent', function (e, muted) {
+      var t = this.__tx[e.index];
+      if (!t) return;
+      var track = t.__receiver.__track;
+      if (track.__muted === muted || track.__state === 'ended') return;
+      track.__muted = muted;
+      fire(track, muted ? 'mute' : 'unmute');
+    });
+    RTCPeerConnection.generateCertificate = function (alg) {
+      return Promise.resolve().then(function () {
+        var c = Object.create(RTCCertificate.prototype);
+        Object.defineProperty(c, 'expires', { value: Date.now() + 30 * 24 * 3600 * 1000, enumerable: true });
+        hide(c, '__fp', '');
+        return c;
+      });
+    };
+    // what the engine has to tell, in order
+    hide(RTCPeerConnection.prototype, '__drain', function () {
+      if (!live[this.__id] && !this.__open && this.__state.signaling === 'closed' && !this.__final) { this.__final = true; }
+      var list = JSON.parse(op(this.__id, 'events')), self = this;
+      list.forEach(function (e) { self.__event(e); });
+    });
+    hide(RTCPeerConnection.prototype, '__event', function (e) {
+      var st = this.__state;
+      switch (e.t) {
+        case 'signalingstatechange': st.signaling = e.state; fire(this, 'signalingstatechange'); if (e.state === 'stable') this.__needed = false; break;
+        case 'iceconnectionstatechange': st.ice = e.state; fire(this, 'iceconnectionstatechange'); break;
+        case 'connectionstatechange': st.connection = e.state; fire(this, 'connectionstatechange'); break;
+        case 'icegatheringstatechange': st.gathering = e.state; fire(this, 'icegatheringstatechange'); break;
+        case 'negotiationneeded': if (st.signaling === 'stable' && !this.__needed) { this.__needed = true; fire(this, 'negotiationneeded'); } break;
+        case 'icecandidate': {
+          var c = null;
+          if (e.candidate !== null) c = new RTCIceCandidate({ candidate: e.candidate, sdpMid: e.sdpMid, sdpMLineIndex: e.sdpMLineIndex, usernameFragment: e.usernameFragment });
+          fire(this, 'icecandidate', new RTCPeerConnectionIceEvent('icecandidate', { candidate: c }));
+          break;
+        }
+        case 'track': this.__trackEvent(e); break;
+        case 'trackunmute': this.__muteEvent(e, false); break;
+        case 'trackmute': this.__muteEvent(e, true); break;
+        case 'datachannel': { var made = channelFrom(this, e.channel); made.__state = 'open'; fire(this, 'datachannel', new RTCDataChannelEvent('datachannel', { channel: made })); break; }
+        default: if (e.t.slice(0, 2) === 'dc') channelEvent(this, e);
+      }
+    });
+    hide(RTCPeerConnection.prototype, '__unused', null);
   }());
   if (!g.SharedWorker) {
     var SharedWorker = klass('SharedWorker', ET, function () { throw new DOMException('SharedWorker is not supported by this browser.', 'NotSupportedError'); });

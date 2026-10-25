@@ -287,7 +287,18 @@ bool media_get(DomBindings::Impl& c, dom::Node* n, StringView k, Value* out) {
     if (IS("playbackRate")) { *out = num_value(st.rate); return true; }
     if (IS("defaultPlaybackRate")) { *out = num_value(st.default_rate); return true; }
     if (IS("error")) { *out = st.error_code ? make_media_error(c, st.error_code) : Value::make_null(); return true; }
-    if (IS("srcObject")) { *out = Value::make_null(); return true; }
+    if (IS("srcObject")) {   // kept by the script side (the stream of a WebRTC connection, played through the machine's speaker)
+      Value get;
+      *out = Value::make_null();
+      if (!c.vm.get_named(Value::make_object(c.vm.global()), "__srcobject_get", &get) || !Vm::is_callable(get)) return true;
+      const Value call_args[1] = {node_value(c, n)};
+      if (!c.vm.call(get, Value(), call_args, 1, out)) {
+        String ignored(c.vm.allocator());
+        c.vm.take_exception(&ignored);
+        *out = Value::make_null();
+      }
+      return true;
+    }
     if (IS("preload")) {
       StringView p;
       const bool given = dom::get_attribute(n, "preload", &p);
@@ -356,6 +367,13 @@ HostClass::Set media_set(DomBindings::Impl& c, dom::Node* n, StringView k, const
     const Value call_args[3] = {node_value(c, n), str_value(vm, k), value};
     Value ignored;
     return vm.call(set, Value(), call_args, 3, &ignored) ? HostClass::Set::Handled : HostClass::Set::Threw;
+  }
+  if ((n->is_tag("video") || n->is_tag("audio")) && IS("srcObject")) {
+    Value set;
+    if (!vm.get_named(Value::make_object(vm.global()), "__srcobject_set", &set) || !Vm::is_callable(set)) return HostClass::Set::Handled;
+    const Value call_args[2] = {node_value(c, n), value};
+    Value ignored;
+    return vm.call(set, Value(), call_args, 2, &ignored) ? HostClass::Set::Handled : HostClass::Set::Threw;
   }
   if (n->is_tag("video") || n->is_tag("audio")) {
     if (IS("currentTime")) {

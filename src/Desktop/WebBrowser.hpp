@@ -35,6 +35,7 @@
 #include "Browser/ResourcePrefetcher.hpp"
 #include "Browser/SessionHistory.hpp"
 #include "Browser/Page.hpp"
+#include "Rtc/RtcService.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Audio/AudioMixer.hpp"
@@ -174,6 +175,11 @@ class WebBrowser : public gui::Frame {
   }
   // Where the notifications of pages are shown (nullptr: nowhere - pages are not allowed any).
   void set_notification_sink(INotificationSink* sink) { notification_sink_ = sink; }
+  // The microphone and speaker WebRTC uses (nullptr: none).
+  void set_rtc_audio(rtc::IRtcAudioDevices* devices) {
+    rtc_audio_ = devices;
+    if (rtc_service_) rtc_service_->set_devices(devices);
+  }
   // A window a page opened may be closed by its script (window.close()); one that was not may not.
   void set_opened_by_script(bool opened) { opened_by_script_ = opened; }
   // The list of pages Back / Forward would go to, nearest first (the address of each, or its title once it has been left), at most `limit`.
@@ -236,6 +242,7 @@ class WebBrowser : public gui::Frame {
     browser::PageHub& page_hub() override;
     browser::ServiceWorkerHub* service_workers() override { return owner_.sw_hub_; }
     browser::CacheStore* cache_store() override { return owner_.shared_caches_; }
+    browser::IRtcService* rtc_service() override { return owner_.rtc(); }
     uint64_t tab_id() override { return tab_; }
     browser::CookieJar& cookies() override;
     bool http_request(const browser::FetchOptions& options, browser::NetResponse* response) override;
@@ -339,6 +346,15 @@ class WebBrowser : public gui::Frame {
   String refresh_target_;
   List<String> defer_opens_;        // window.open() addresses to hand to the desktop
   bool want_close_ = false, opened_by_script_ = false;
+  // WebRTC: the peer connections of this window's pages, made when the first page asks and the network can do UDP.
+  browser::IRtcService* rtc();
+  class RtcRandom final : public crypto::IRandom {
+   public:
+    bool fill(ByteView out) override;
+  };
+  RtcRandom rtc_random_;
+  rtc::IRtcAudioDevices* rtc_audio_ = nullptr;
+  UniquePointer<rtc::RtcService> rtc_service_;
   INotificationSink* notification_sink_ = nullptr;
   OpenWindowFn open_fn_ = nullptr;
   void* open_ctx_ = nullptr;

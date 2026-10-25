@@ -59,6 +59,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       web_browser_(allocator),
       permission_dialog_(allocator),
       web_notifications_(allocator, toasts_, permission_dialog_, windows_, service_workers_),
+      rtc_audio_(allocator, web_notifications_),
       terminal_(allocator),
       calculator_(allocator),
       file_properties_(allocator),
@@ -275,6 +276,7 @@ void Desktop::setup_web_browser(WebBrowser& web) {
   web.set_media_services(media_mixer_, media_codecs_, media_clock_);
   web.set_open_window_handler(&Desktop::open_script_window, this);
   web.set_notification_sink(&web_notifications_);
+  web.set_rtc_audio(&rtc_audio_);
 }
 
 // window.open() of a page: another browser tab next to the page's (or a window of its own), showing the address. It may close itself with window.close().

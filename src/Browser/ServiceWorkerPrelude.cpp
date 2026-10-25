@@ -390,16 +390,35 @@ const char kClientPrelude[] = R"JSPRELUDE((function (g) {
     for (var i = 0; i < bytes.length; i++) out += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
     return out;
   };
-  var base64url = function (bytes) {
-    var bin = '';
-    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    return g.btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  var B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  var base64url = function (bytes) {   // (not btoa: it takes characters, and these are bytes)
+    var out = '';
+    for (var i = 0; i < bytes.length; i += 3) {
+      var n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+      out += B64URL.charAt(n >> 18) + B64URL.charAt((n >> 12) & 63);
+      if (i + 1 < bytes.length) out += B64URL.charAt((n >> 6) & 63);
+      if (i + 2 < bytes.length) out += B64URL.charAt(n & 63);
+    }
+    return out;
+  };
+  var bytesOfBase64url = function (text) {
+    var out = [], acc = 0, bits = 0;
+    text = text.replace(/=+$/, '');
+    if (text.length % 4 === 1) throw new Error('bad base64');
+    for (var i = 0; i < text.length; i++) {
+      var v = B64URL.indexOf(text.charAt(i));
+      if (v < 0) { v = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(text.charAt(i)); }
+      if (v < 0) throw new Error('bad base64');
+      acc = (acc << 6) | v; bits += 6;
+      if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); acc &= (1 << bits) - 1; }
+    }
+    return new Uint8Array(out);
   };
   // the applicationServerKey of subscribe(): base64url text or bytes; a P-256 public key (65 bytes, the first is 4) as hex
   var keyHex = function (key) {
     var bytes;
     if (typeof key === 'string') {
-      try { var bin = g.atob(key.replace(/-/g, '+').replace(/_/g, '/')); bytes = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); }
+      try { bytes = bytesOfBase64url(key); }
       catch (e) { throw new DOMException("Failed to execute 'subscribe' on 'PushManager': The provided applicationServerKey is not encoded as base64url without padding.", 'InvalidCharacterError'); }
     } else if (key instanceof ArrayBuffer) bytes = new Uint8Array(key);
     else if (ArrayBuffer.isView(key)) bytes = new Uint8Array(key.buffer, key.byteOffset, key.byteLength);

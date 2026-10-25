@@ -39,6 +39,9 @@ class WebNotifications final : public INotificationSink {
   WebNotifications(allocators::IAllocator& allocator, gui::ToastCenter& toasts, gui::MessageDialog& dialog, gui::WindowManager& windows, browser::ServiceWorkerHub& hub);
 
   int prompt(StringView origin) override;
+  // The microphone: what the user decided for the origin (1 allowed, 0 blocked, -1 not asked / not answered), and asking (the answer comes through pump(); -1 until then).
+  int microphone_state(StringView origin) const;
+  int ask_microphone(StringView origin);
   uint32_t show(StringView origin, StringView title, StringView body, bool sticky, StringView actions) override;
   void close(uint32_t number) override;
   void pump();
@@ -61,8 +64,9 @@ class WebNotifications final : public INotificationSink {
   browser::ServiceWorkerHub& hub_;
   mutable kernel::RecursiveMutex mutex_;
   List<UniquePointer<Entry>> entries_;
-  List<String> questions_;   // the origins waiting to be asked about
-  String asking_;            // the origin the dialog is about
+  List<String> questions_;   // the origins waiting to be asked about, each with a prefix: "n:" for notifications, "m:" for the microphone
+  String asking_;            // the question the dialog is about (same form)
+  List<String> mic_allowed_, mic_blocked_;
   uint32_t next_number_ = 1;
 };
 

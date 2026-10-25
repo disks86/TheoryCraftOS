@@ -29,6 +29,7 @@
 #pragma once
 #include "Browser/CookieJar.hpp"
 #include "Browser/DomBindings.hpp"
+#include "Browser/IRtcService.hpp"
 #include "Browser/HtmlDocument.hpp"
 #include "Browser/PageHub.hpp"
 #include "Browser/PagePicture.hpp"
@@ -51,6 +52,8 @@ class IPageEnvironment : public IObjectEnvironment {
   // The service workers of the browser and the caches of the Cache API, shared by all its pages (nullptr: the browser has none; a page then keeps caches of its own).
   virtual ServiceWorkerHub* service_workers() { return nullptr; }
   virtual CacheStore* cache_store() { return nullptr; }
+  // WebRTC (nullptr: the browser has none).
+  virtual IRtcService* rtc_service() { return nullptr; }
   // The text at an address (a script or a style sheet), at most `limit` bytes. False if it cannot be had.
   virtual bool fetch_text(StringView address, uint64_t limit, String* text) = 0;
   // The page is going to ask for `address` (a script, style sheet or picture) soon: start getting it, without waiting. Optional; what it does not do the later
@@ -319,6 +322,10 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void ws_close(uint32_t id, uint16_t code, StringView reason) override;
   bool ws_receive(uint32_t id, bool* text, ByteBuffer* data) override;
   void ws_info(uint32_t id, String* protocol, uint16_t* code, String* reason, bool* opened) override;
+  bool rtc_available() override { return env_.rtc_service() != nullptr; }
+  uint32_t rtc_create(StringView ice_servers, String* error) override;
+  bool rtc_op(uint32_t id, StringView name, StringView a, StringView b, ConstByteView bytes, int64_t n1, int64_t n2, String* out) override;
+  void rtc_release(uint32_t id) override;
   void ws_release(uint32_t id) override;
   uint32_t worker_start(StringView source, StringView url, StringView name, String* error) override;
   void worker_post(uint32_t id, StringView message) override;
@@ -506,6 +513,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
     UniquePointer<IWebSocket> socket;
   };
   List<Socket> sockets_;
+  List<uint32_t> rtc_ids_, rtc_sources_;   // the connections this page made, and the microphones it opened   // the peer connections this page made (let go of with it)
   struct WorkerRuntime;
   List<UniquePointer<WorkerRuntime>> workers_;
   uint32_t next_worker_ = 1;
