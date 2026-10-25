@@ -806,12 +806,26 @@ NATIVE(formdata_constructor) {
   return true;
 }
 
+// A File or Blob is kept as the object it is (it carries `__bytes`); anything else is turned into text.
+bool entry_value(Vm& vm, const Value& v, Value* out) {
+  Value bytes;
+  if (v.is_object() && vm.get_named(v, "__bytes", &bytes) && bytes.is_string()) {
+    *out = v;
+    return true;
+  }
+  String text(vm.allocator());
+  if (!arg_text(vm, v, &text)) return false;
+  *out = str_value(vm, text.view());
+  return true;
+}
+
 NATIVE(formdata_append) {
   JsObject* entries = entries_of(vm, self);
   if (!entries) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
-  String name(vm.allocator()), value(vm.allocator());
-  if (!arg_text(vm, arg_at(args, argc, 0), &name) || !arg_text(vm, arg_at(args, argc, 1), &value)) return false;
-  vm.array_push(entries, pair(vm, vm.new_string(name.view()), str_value(vm, value.view())));
+  String name(vm.allocator());
+  Value value;
+  if (!arg_text(vm, arg_at(args, argc, 0), &name) || !entry_value(vm, arg_at(args, argc, 1), &value)) return false;
+  vm.array_push(entries, pair(vm, vm.new_string(name.view()), value));
   return true;
 }
 
@@ -896,11 +910,12 @@ NATIVE(formdata_delete) {
 NATIVE(formdata_set) {
   JsObject* entries = entries_of(vm, self);
   if (!entries) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
-  String name(vm.allocator()), value(vm.allocator());
-  if (!arg_text(vm, arg_at(args, argc, 0), &name) || !arg_text(vm, arg_at(args, argc, 1), &value)) return false;
+  String name(vm.allocator());
+  Value value;
+  if (!arg_text(vm, arg_at(args, argc, 0), &name) || !entry_value(vm, arg_at(args, argc, 1), &value)) return false;
   List<uint32_t> at(vm.allocator());
   find_all(vm, entries, name.view(), &at);
-  const Value p = pair(vm, vm.new_string(name.view()), str_value(vm, value.view()));
+  const Value p = pair(vm, vm.new_string(name.view()), value);
   return rebuild(vm, self, entries, at, &p);
 }
 

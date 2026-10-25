@@ -584,11 +584,20 @@ NATIVE(win_btoa) {
 NATIVE(win_atob) {
   String text(vm.allocator()), out(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  String clean(vm.allocator());   // (forgiving-base64 decode: white space goes, a length of 0 mod 4 may end in one or two '=', 1 mod 4 and any other '=' are errors)
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    const char ch = text[i];
+    if (ch != ' ' && ch != '\n' && ch != '\t' && ch != '\r' && ch != '\f') clean.push_back(ch);
+  }
+  if (clean.size() % 4 == 0) {
+    for (int k = 0; k < 2 && clean.size() && clean[clean.size() - 1] == '='; ++k) clean.truncate(clean.size() - 1);
+  }
+  if (clean.size() % 4 == 1) return throw_dom(vm, "InvalidCharacterError", "The string to be decoded is not correctly encoded.");
+  text.assign(clean.view());
   uint32_t buffer = 0;
   int bits = 0;
   for (uint64_t i = 0; i < text.size(); ++i) {
     const char ch = text[i];
-    if (ch == '=' || ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r') continue;
     int v = -1;
     for (int k = 0; k < 64 && v < 0; ++k)
       if (kBase64[k] == ch) v = k;

@@ -291,12 +291,27 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
 
   // ------------------------------------------------------------------------------------------------------------------- TextEncoder / TextDecoder
   function TextEncoder() { this.encoding = 'utf-8'; }
-  method(TextEncoder.prototype, 'encode', function (text) { return __string_to_bytes(text === undefined ? '' : String(text)); });
+  // (the engine keeps a lone surrogate as the three bytes of its code point: text encoding replaces it with U+FFFD)
+  var scrubSurrogates = function (bytes) {
+    var at = bytes.indexOf(0xED);
+    if (at < 0) return bytes;
+    var out = [];
+    for (var i = 0; i < bytes.length; i++) {
+      if (bytes[i] === 0xED && i + 2 < bytes.length + 0 && bytes[i + 1] >= 0xA0 && bytes[i + 1] <= 0xBF) { out.push(0xEF, 0xBF, 0xBD); i += 2; } else out.push(bytes[i]);
+    }
+    return new Uint8Array(out);
+  };
+  method(TextEncoder.prototype, 'encode', function (text) { return scrubSurrogates(__string_to_bytes(text === undefined ? '' : String(text))); });
   method(TextEncoder.prototype, 'encodeInto', function (text, target) {
-    var bytes = __string_to_bytes(String(text));
-    var n = Math.min(bytes.length, target.length);
-    for (var i = 0; i < n; i++) target[i] = bytes[i];
-    return { read: text.length, written: n };
+    var bytes = scrubSurrogates(__string_to_bytes(String(text)));
+    var read = 0, written = 0, i = 0;   // (whole characters only: read counts UTF-16 code units, which the engine's UTF-8 strings do not have, so a 4 byte character counts two)
+    while (i < bytes.length) {
+      var lead = bytes[i], len = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+      if (written + len > target.length) break;
+      for (var k = 0; k < len; k++) target[written + k] = bytes[i + k];
+      written += len; i += len; read += len === 4 ? 2 : 1;
+    }
+    return { read: read, written: written };
   });
   var CP1252 = [0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178];
   var ENCODING_LABELS = { 'utf-8': 'utf-8', utf8: 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'unicode11utf8': 'utf-8', 'x-unicode20utf8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le',
@@ -388,7 +403,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     hide(this, '__bytes', bytes);
     this.size = bytes.length;
     var type = options && options.type !== undefined ? String(options.type) : '';
-    this.type = /* lower-case, and empty if it holds anything but printable ASCII */ type.length && type.length === __utf8_clean(type).length ? lower(type) : '';
+    this.type = /* lower-case, and empty if it holds anything but printable ASCII */ /^[\x20-\x7E]+$/.test(type) ? lower(type) : '';
   }
   var B = Blob.prototype;
   method(B, 'text', function () { return Promise.resolve(__utf8_clean(this.__bytes)); });
@@ -2772,7 +2787,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     var status = init.status === undefined ? 200 : Number(init.status);
     if (!(status >= 200 && status <= 599) || status !== Math.floor(status)) throw new RangeError("Failed to construct 'Response': The status provided (" + init.status + ") is outside the range [200, 599].");
     var statusText = init.statusText === undefined ? '' : String(init.statusText);
-    if (!/^[\t\x20-\x7E\x80-\xFF]*$/.test(statusText) && statusText !== __utf8_clean(statusText)) throw typeError("construct 'Response'", "Invalid statusText");
+    if (/[\x00-\x08\x0A-\x1F\x7F]/.test(statusText)) throw typeError("construct 'Response'", "Invalid statusText");
     hide(this, '__r', { type: 'default', url: '', redirected: false, status: status, statusText: statusText });
     hide(this, '__h', new Headers(init.headers, 'response'));
     var b = extractBody(body);
@@ -7403,6 +7418,22 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       }
       return nativeAdd.apply(this, arguments);
     });
+    // FormData: a Blob entry becomes a File (named 'blob' unless a file name is given)
+    if (g.FormData && g.File && g.Blob) {
+      var fdFile = function (name, value, filename, op) {
+        if (value instanceof g.Blob) {
+          if (filename !== undefined || !(value instanceof g.File)) return new g.File([value], filename !== undefined ? String(filename) : 'blob', { type: value.type, lastModified: value.lastModified });
+        } else if (arguments.length > 2 && filename !== undefined) throw typeErr("execute '" + op + "' on 'FormData'", "parameter 2 is not of type 'Blob'.");
+        return value;
+      };
+      ['append', 'set'].forEach(function (op) {
+        var native = g.FormData.prototype[op];
+        method(g.FormData.prototype, op, function (name, value, filename) {
+          if (arguments.length < 2) throw typeErr("execute '" + op + "' on 'FormData'", '2 arguments required, but only ' + arguments.length + ' present.');
+          return native.call(this, name, fdFile(name, value, filename, op));
+        });
+      });
+    }
     var NativeCustom = g.CustomEvent;
     if (NativeCustom) {
       var CustomEvent = function (type, init) {
@@ -9119,6 +9150,11 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       return out;
     });
   }());
+
+  if (g.URL && !g.URL.parse) method(g.URL, 'parse', function (url, base) {
+    if (arguments.length < 1) throw typeErr("execute 'parse' on 'URL'", '1 argument required, but only 0 present.');
+    try { return base === undefined ? new g.URL(url) : new g.URL(url, base); } catch (e) { return null; }
+  });
 
   hide(g, '__doctype_of', function (d) {
     var t = d.__doctype;
