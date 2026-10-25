@@ -31,5 +31,9 @@ const char* dom_prelude();
 // The WebAssembly object (Module, Instance, Memory, Table, Global, the errors, validate / compile / instantiate) over the natives of DomBindingsWasm.cpp. Run by a page's
 // engine and a worker's, after install_wasm_natives().
 const char* web_assembly_prelude();
+// WebGLRenderingContext and WebGL2RenderingContext over the natives of DomBindingsGl.cpp. Run by a page's engine.
+const char* webgl_prelude();
+// navigator.gpu and the WebGPU interfaces over the natives of DomBindingsGpu.cpp. Run by a page's engine.
+const char* webgpu_prelude();
 
 }  // namespace browser

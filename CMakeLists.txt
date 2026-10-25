@@ -250,6 +250,23 @@ add_executable(BOOTX64
   src/Browser/DomBindingsNet.cpp
   src/Browser/DomBindingsCrypto.cpp
   src/Browser/DomBindingsWasm.cpp
+  src/Browser/DomBindingsGl.cpp
+  src/Browser/DomBindingsGpu.cpp
+  src/Browser/WebGpuPrelude.cpp
+  src/Browser/WebGlPrelude.cpp
+  src/WebGl/ShaderMachine.cpp
+  src/WebGl/ShaderBuiltins.cpp
+  src/WebGl/ShaderLayout.cpp
+  src/WebGl/Glsl.cpp
+  src/WebGl/Wgsl.cpp
+  src/WebGl/GpuDevice.cpp
+  src/WebGl/GpuRender.cpp
+  src/WebGl/Raster.cpp
+  src/WebGl/GlContext.cpp
+  src/WebGl/GlProgram.cpp
+  src/WebGl/GlTexture.cpp
+  src/WebGl/GlSampler.cpp
+  src/WebGl/GlDraw.cpp
   src/Browser/DomBindingsServiceWorker.cpp
   src/Browser/DomBindingsRtc.cpp
   src/Browser/CacheStore.cpp

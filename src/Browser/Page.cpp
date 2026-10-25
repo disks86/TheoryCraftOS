@@ -178,6 +178,16 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
+      if (!engine_->run_library(webgl_prelude(), &prelude_error)) {
+        prelude_error.insert(0, "The WebGL script failed: ");
+        env_.console(3, prelude_error.view());
+      }
+      prelude_error.clear();
+      if (!engine_->run_library(webgpu_prelude(), &prelude_error)) {
+        prelude_error.insert(0, "The WebGPU script failed: ");
+        env_.console(3, prelude_error.view());
+      }
+      prelude_error.clear();
       if (!engine_->run_library(cache_prelude(), &prelude_error) || !engine_->run_library(service_worker_client_prelude(), &prelude_error) ||
           (sw_worker_ != 0 && !engine_->run_library(service_worker_scope_prelude(), &prelude_error))) {
         prelude_error.insert(0, "The service worker script failed: ");

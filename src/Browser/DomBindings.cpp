@@ -206,7 +206,7 @@ bool DomBindings::install() {
   c.window_listeners = vm_.new_plain();
   vm_.define_named(vm_.global(), "__wrappers", Value::make_object(c.wrappers), 0);
   vm_.define_named(vm_.global(), "__media_lists", Value::make_object(c.media_lists), 0);
-  const bool ok = bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_mse(c) && bind::install_tracks(c) && bind::install_dash(c) && bind::install_forms(c) && bind::install_net(c) && bind::install_service_worker(c) && bind::install_rtc(c) && bind::install_crypto(c) && (c.wasm = bind::install_wasm_natives(c.vm)).get() != nullptr && !vm_.halted();
+  const bool ok = bind::install_nodes(c) && bind::install_events(c) && bind::install_styles(c) && bind::install_window(c) && bind::install_media(c) && bind::install_mse(c) && bind::install_tracks(c) && bind::install_dash(c) && bind::install_forms(c) && bind::install_net(c) && bind::install_service_worker(c) && bind::install_rtc(c) && bind::install_gl(c) && bind::install_gpu(c) && bind::install_crypto(c) && (c.wasm = bind::install_wasm_natives(c.vm)).get() != nullptr && !vm_.halted();
   // The prototypes and objects that only this code holds are kept alive by a hidden global: a collection before the page first used one would free them.
   if (ok) {
     JsObject* kept = vm_.new_array();

@@ -19,6 +19,7 @@
 // What the files of the DOM bindings share: the state of one page's bindings (DomBindings::Impl) and the small helpers the natives are written with.
 #pragma once
 #include "Browser/DomBindings.hpp"
+#include "Browser/Canvas.hpp"
 #include "Browser/Fetcher.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
@@ -28,6 +29,8 @@ namespace browser {
 
 namespace bind {
 struct WasmState;   // the WebAssembly runtime of the page (DomBindingsWasm.cpp)
+struct GlState;     // the WebGL contexts of the page (DomBindingsGl.cpp)
+struct GpuState;    // the WebGPU devices of the page (DomBindingsGpu.cpp)
 }
 
 // An asynchronous fetch()/XMLHttpRequest. The script thread makes it and polls it from a timer; a worker thread makes the request (the request is copied, so the
@@ -90,6 +93,8 @@ struct DomBindings::Impl {
   uint32_t net_workers = 0;   // threads started and not yet finished (changed under net_mutex; read atomically by the destructor)
   bool net_closing = false;
   UniquePointer<bind::WasmState> wasm;   // the WebAssembly store of the page (made by install_wasm)
+  UniquePointer<bind::GlState> gl;       // the WebGL contexts of the page (made by the first getContext('webgl'))
+  UniquePointer<bind::GpuState> gpu;     // the WebGPU devices of the page (made by the first requestDevice())
 };
 
 namespace bind {
@@ -150,6 +155,11 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* element, StringView key
 bool is_form_element(const dom::Node* n);
 bool form_lookup_named(DomBindings::Impl& c, dom::Node* n, StringView key, Value* out);
 bool install_crypto(DomBindings::Impl& c);   // the natives under crypto.getRandomValues() and crypto.subtle (DomBindingsCrypto.cpp)
+bool install_gpu(DomBindings::Impl& c);              // WebGPU's natives (DomBindingsGpu.cpp)
+bool install_gl(DomBindings::Impl& c);               // WebGL's natives (DomBindingsGl.cpp)
+void flush_gl(DomBindings::Impl& c, uint32_t serial);   // copies what a WebGL canvas has drawn into its bitmap
+// An ImageSource for an <img>, <canvas> or <video> element value (DomBindingsMedia.cpp).
+bool media_source_pixels(Vm& vm, const Value& v, ImageSource* src);
 bool install_rtc(DomBindings::Impl& c);              // RTCPeerConnection's natives (DomBindingsRtc.cpp)
 bool install_service_worker(DomBindings::Impl& c);   // the Cache API and service worker natives (DomBindingsServiceWorker.cpp)
 bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest's natives, byte and text helpers (DomBindingsNet.cpp)
