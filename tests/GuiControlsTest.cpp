@@ -23,13 +23,16 @@
 #include <string.h>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Color.hpp"
+#include "Gui/Controls/Accordion.hpp"
 #include "Gui/Controls/BarChart.hpp"
 #include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DatePicker.hpp"
 #include "Gui/Controls/HeatMap.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
+#include "Gui/Controls/Knob.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/PieChart.hpp"
 #include "Gui/Controls/RadioButton.hpp"
 #include "Gui/Controls/ScrollPanel.hpp"
@@ -227,6 +230,218 @@ static void test_slider() {
     click(w, 10 + 100, 22);
     CHECK(s.value() == 5);
     w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_knob() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 300);
+    Window w(a, screen.renderer, theme, {300, 300});
+    Knob k(a);
+    k.set_bounds({10, 10, 48, 48});
+    w.add(&k);
+    Counter changes;
+    k.on_value_changed(changes.handler());
+    CHECK(k.minimum() == 0 && k.maximum() == 100 && k.value() == 0 && k.radius() == 21);
+
+    // Fixed-point sine, for any angle.
+    CHECK(Knob::sine(0) == 0 && Knob::sine(90) == 1024 && Knob::sine(180) == 0 && Knob::sine(270) == -1024 && Knob::sine(-90) == -1024);
+    CHECK(Knob::sine(30) == 512 && Knob::sine(150) == 512 && Knob::sine(-30) == -512 && Knob::sine(450) == 1024 && near(Knob::sine(47), 749, 2));
+
+    // The pointer sweeps -135 .. 135 degrees.
+    CHECK(k.angle() == -135 && k.angle_of(100) == 135 && k.angle_of(50) == 0 && k.angle_of(500) == 135 && k.angle_of(-5) == -135);
+    k.set_value(50);
+    const Point c = k.center(), up = k.point_at(0, 1000);
+    CHECK(c.x == 24 && c.y == 24 && up.x == 24 && up.y == 3);
+    k.set_value(100);
+    CHECK(k.point_at(k.angle(), 1000).x > c.x && k.point_at(k.angle(), 1000).y > c.y);   // 4:30: right and below
+    k.set_value(500);   // clamped, no change
+    CHECK(k.value() == 100 && changes.count == 2);
+    k.set_value(0);
+    w.render();
+    const Point tip = k.point_at(-135, 720);
+    CHECK(screen.px(10 + tip.x, 10 + tip.y) == theme.text);   // the pointer reaches its tip
+
+    // Dragging up (or right) turns it up, down (or left) turns it down; 150 pixels cover the range.
+    changes.count = 0;
+    w.mouse_move(10 + 24, 10 + 24);
+    w.mouse_button(10 + 24, 10 + 24, MouseButton::Left, true);
+    CHECK(k.dragging() && k.value() == 0 && w.focus() == &k);
+    w.mouse_move(10 + 24, 10 + 24 - 75);
+    CHECK(k.value() == 50 && changes.count == 1);
+    w.mouse_move(10 + 24 + 30, 10 + 24 - 75);
+    CHECK(k.value() == 70);
+    w.mouse_move(10 + 24, 10 + 24 + 400);   // far down: clamped
+    CHECK(k.value() == 0);
+    w.mouse_move(10 + 24, 10 + 24 - 400);
+    CHECK(k.value() == 100);
+    w.mouse_button(10 + 24, 10 + 24 - 400, MouseButton::Left, false);
+    CHECK(!k.dragging());
+    w.mouse_move(10 + 24, 10 + 24);
+    CHECK(k.value() == 100);   // no longer dragging
+
+    // Keys and the wheel.
+    k.set_value(40);
+    k.set_step(2, 25);
+    press(w, key::kUp);
+    CHECK(k.value() == 42);
+    press(w, key::kLeft);
+    press(w, key::kDown);
+    CHECK(k.value() == 38);
+    press(w, 0x4B);
+    CHECK(k.value() == 63);
+    press(w, 0x4E);
+    press(w, 0x4E);
+    press(w, 0x4E);
+    CHECK(k.value() == 0);
+    press(w, 0x4D);
+    CHECK(k.value() == 100);
+    press(w, 0x4A);
+    CHECK(k.value() == 0);
+    w.mouse_wheel(20, 20, 1);
+    CHECK(k.value() == 2);
+    w.mouse_wheel(20, 20, -1);
+    w.mouse_wheel(20, 20, -1);
+    CHECK(k.value() == 0);
+
+    // A new range keeps the value inside it; a backwards range collapses and the pointer rests at the start.
+    k.set_value(80);
+    k.set_range(10, 20);
+    CHECK(k.value() == 20 && k.minimum() == 10 && k.angle() == 135);
+    k.set_range(30, 5);
+    CHECK(k.minimum() == 30 && k.maximum() == 30 && k.value() == 30 && k.angle() == -135);
+    k.set_range(-50, 50);
+    k.set_value(0);
+    CHECK(k.angle() == 0);
+    k.set_range(INT32_MIN, INT32_MAX);   // no overflow in the angle or the drag
+    k.set_value(INT32_MAX);
+    CHECK(k.angle() == 135);
+    w.mouse_move(34, 34);
+    w.mouse_button(34, 34, MouseButton::Left, true);
+    w.mouse_move(34, 34 - 140);
+    w.mouse_button(34, 34 - 140, MouseButton::Left, false);
+    CHECK(k.value() == INT32_MAX);
+
+    // Too small to draw, and disabled: nothing is drawn, no input.
+    k.set_range(0, 100);
+    k.set_value(5);
+    k.set_bounds({10, 10, 6, 6});
+    CHECK(k.radius() == 0);
+    w.render();
+    k.set_bounds({10, 10, 48, 48});
+    k.set_enabled(false);
+    click(w, 10 + 24, 10 + 24);
+    press(w, key::kUp);
+    CHECK(k.value() == 5);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_accordion() {
+  TestAllocator a;
+  const Theme theme;
+  {
+    Screen screen(a, 300, 300);
+    Window w(a, screen.renderer, theme, {300, 300});
+    Accordion acc(a);
+    acc.set_bounds({10, 10, 200, 260});
+    w.add(&acc);
+    Panel p0(a), p1(a), p2(a);
+    Label inside(a);
+    inside.set_dock(DockStyle::Top);
+    p1.add(&inside);
+    Counter changes;
+    acc.on_expansion_changed(changes.handler());
+    CHECK(acc.section_count() == 0 && acc.focused_section() == -1 && acc.header_at(5, 5) == -1 && acc.content_height() == 0);
+    CHECK(acc.add_section("First", nullptr) == -1 && acc.section_count() == 0);
+    CHECK(acc.add_section("First", &p0, 60) == 0 && acc.add_section("Second", &p1, 80) == 1 && acc.add_section("Third", &p2) == 2);
+    CHECK(acc.section_title(1) == "Second" && acc.section_body(2) == &p2 && acc.section_body(7) == nullptr && acc.section_title(-1) == "");
+
+    // The first section starts open, the others closed; the default body height applies when none is asked for.
+    w.layout();
+    CHECK(acc.expanded(0) && !acc.expanded(1) && !acc.expanded(2) && p0.visible() && !p1.visible() && !p2.visible() && changes.count == 0);
+    CHECK(acc.content_height() == 3 * Accordion::kHeaderHeight + 60);
+    const Rect2D b0 = acc.body_rect(0);
+    CHECK(b0.y == Accordion::kHeaderHeight && b0.height == 60 && p0.bounds().y == b0.y && p0.bounds().height == 60 && p0.bounds().width == b0.width);
+    CHECK(acc.header_rect(1).y == Accordion::kHeaderHeight + 60 && acc.header_rect(2).y == 2 * Accordion::kHeaderHeight + 60);
+    CHECK(acc.body_rect(1).width == 0 && acc.header_rect(5).width == 0);
+    CHECK(acc.header_at(5, 5) == 0 && acc.header_at(5, acc.header_rect(2).y + 3) == 2 && acc.header_at(5, b0.y + 5) == -1);
+
+    // A click opens a section and (exclusive) closes the other; the headers move to follow.
+    click(w, 10 + 20, 10 + acc.header_rect(1).y + 5);
+    CHECK(acc.expanded(1) && !acc.expanded(0) && !p0.visible() && p1.visible() && changes.count == 1 && acc.last_changed() == 1);
+    CHECK(acc.focused_section() == 1 && w.focus() == &acc && acc.expanded_count() == 1);
+    w.layout();
+    CHECK(acc.header_rect(1).y == Accordion::kHeaderHeight && p1.bounds().y == 2 * Accordion::kHeaderHeight && p1.bounds().height == 80);
+    CHECK(inside.bounds().width == p1.bounds().width);
+    CHECK(acc.header_rect(2).y == 2 * Accordion::kHeaderHeight + 80);
+    // A click on an open section closes it.
+    click(w, 10 + 20, 10 + acc.header_rect(1).y + 5);
+    CHECK(acc.expanded_count() == 0 && !p1.visible() && changes.count == 2 && acc.content_height() == 3 * Accordion::kHeaderHeight);
+    w.render();
+    // A click in a body goes to the body, not the accordion.
+    acc.set_expanded(0, true);
+    changes.count = 0;
+    click(w, 10 + 50, 10 + acc.body_rect(0).y + 10);
+    CHECK(acc.expanded(0) && changes.count == 0);
+
+    // Keys: Down/Up/Home/End move between headers, Enter and Space toggle.
+    acc.set_expanded(0, false);
+    changes.count = 0;
+    click(w, 10 + 20, 10 + 5);   // open the first again, focus on it
+    CHECK(acc.focused_section() == 0 && acc.expanded(0));
+    press(w, key::kDown);
+    CHECK(acc.focused_section() == 1);
+    press(w, key::kEnter);
+    CHECK(acc.expanded(1) && !acc.expanded(0));
+    press(w, key::kDown);
+    press(w, key::kDown);   // at the last: stays
+    CHECK(acc.focused_section() == 2);
+    press(w, key::kSpace);
+    CHECK(acc.expanded(2) && !acc.expanded(1));
+    press(w, 0x4A);
+    CHECK(acc.focused_section() == 0);
+    press(w, 0x4D);
+    CHECK(acc.focused_section() == 2);
+    press(w, key::kUp);
+    CHECK(acc.focused_section() == 1);
+    press(w, key::kSpace);
+    CHECK(acc.expanded(1) && !acc.expanded(2));
+
+    // Not exclusive: any number may be open.
+    acc.set_exclusive(false);
+    CHECK(!acc.exclusive());
+    acc.set_expanded(0, true);
+    acc.set_expanded(2, true);
+    CHECK(acc.expanded_count() == 3 && p0.visible() && p1.visible() && p2.visible());
+    w.layout();
+    CHECK(p2.bounds().y == acc.body_rect(2).y && p2.bounds().height == Accordion::kDefaultBodyHeight);
+    acc.collapse_all();
+    CHECK(acc.expanded_count() == 0);
+    acc.expand_all();
+    CHECK(acc.expanded_count() == 3);
+    changes.count = 0;
+    acc.set_expanded(1, true);   // already open: nothing happens
+    acc.set_expanded(9, true);   // out of range
+    CHECK(changes.count == 0);
+    w.render();
+    // Back to exclusive: only the first open one stays.
+    acc.set_exclusive(true);
+    CHECK(acc.expanded_count() == 1 && acc.expanded(0));
+    acc.expand_all();   // ignored while exclusive
+    CHECK(acc.expanded_count() == 1);
+
+    // Sections beyond the bottom are cut off, nothing breaks; the pixels of an open header's arrow area are drawn.
+    acc.set_bounds({10, 10, 200, 40});
+    w.render();
+    acc.set_enabled(false);
+    click(w, 10 + 20, 10 + 5);
+    press(w, key::kSpace);
+    CHECK(acc.expanded(0));
   }
   CHECK(a.live == 0);
 }
@@ -1157,6 +1372,8 @@ static void test_date_picker() {
 int main() {
   test_helpers();
   test_slider();
+  test_knob();
+  test_accordion();
   test_level_meter();
   test_pie_chart();
   test_bar_chart();
