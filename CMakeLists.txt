@@ -432,6 +432,7 @@ add_executable(BOOTX64
   src/Gui/Controls/ColorPalette.cpp
   src/Gui/Controls/DrawingCanvas.cpp
   src/Gui/Controls/TabControl.cpp
+  src/Gui/Controls/Accordion.cpp
   src/Gui/Controls/BreadcrumbBar.cpp
   src/Gui/Controls/SpreadsheetGrid.cpp
   src/Gui/Controls/PageView.cpp
