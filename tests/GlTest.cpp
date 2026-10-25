@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "WebGl/GlCompressed.hpp"
 #include "WebGl/GlContext.hpp"
 
 using namespace webgl;
@@ -495,7 +496,99 @@ static void test_compressed() {
   CHECK(a.live == 0);
 }
 
+#include "GlCompressedVectors.inc"
+
+// BC7, BC6H and ASTC blocks against the output of a reference decoder, then truncated and bit-flipped data.
+static void test_bptc_astc() {
+  TestAllocator a;
+  {
+    size_t o = 0;
+    int checked = 0;
+    while (o < sizeof(kRefVectors)) {
+      const uint32_t fmt = kRefVectors[o] | (kRefVectors[o + 1] << 8) | (kRefVectors[o + 2] << 16) | (uint32_t{kRefVectors[o + 3]} << 24);
+      const CompressedFormat* cf = find_compressed(fmt);
+      CHECK(cf != nullptr);
+      if (!cf) break;
+      const uint8_t* block = kRefVectors + o + 4;
+      const uint8_t* want = block + 16;
+      const uint32_t n = uint32_t{cf->bw} * cf->bh;
+      o += 4 + 16 + n * 4;
+      Image img(a);
+      CHECK(img.allocate(find_format(cf->decoded), cf->bw, cf->bh, 1));
+      CHECK(decode_compressed(*cf, ConstByteView(block, 16), cf->bw, cf->bh, 1, &img, 0, 0, 0));
+      bool same = true;
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t r[4];
+        read_texel(img, i % cf->bw, i / cf->bw, 0, r);
+        for (int k = 0; k < (cf->codec == Codec::Bc6U ? 3 : 4); ++k) {
+          int got;
+          if (cf->codec == Codec::Bc6U) {
+            float f;
+            memcpy(&f, &r[k], 4);
+            got = static_cast<int>(f < 0 ? 0 : f > 1 ? 255 : f * 255 + 0.5f);
+          } else {
+            got = static_cast<int>(r[k]);
+          }
+          if (got - want[i * 4 + k] > 1 || want[i * 4 + k] - got > 1) same = false;
+        }
+      }
+      if (!same) printf("  reference mismatch: format %x\n", fmt);
+      CHECK(same);
+      ++checked;
+    }
+    CHECK(checked == 104);
+    // truncated data is refused, never read past the end
+    const CompressedFormat* astc = find_compressed(0x93B7);
+    const CompressedFormat* bc7 = find_compressed(0x8E8C);
+    CHECK(astc && bc7);
+    uint8_t blk[16] = {0};
+    Image img(a);
+    CHECK(img.allocate(find_format(astc->decoded), 16, 8, 1));
+    CHECK(!decode_compressed(*astc, ConstByteView(blk, 16), 16, 8, 1, &img, 0, 0, 0));   // two blocks needed
+    CHECK(compressed_size(*astc, 16, 8, 1) == 32);
+    CHECK(compressed_size(*astc, 9, 9, 1) == 64);
+    // every single-bit flip of a valid block decodes (or is rejected) without a sanitizer report
+    uint32_t seed = 99;
+    for (int round = 0; round < 40; ++round) {
+      for (int i = 0; i < 16; ++i) { seed = seed * 1664525u + 1013904223u; blk[i] = static_cast<uint8_t>(seed >> 24); }
+      const CompressedFormat* const flip_formats[5] = {astc, bc7, find_compressed(0x8E8F), find_compressed(0x93BD), find_compressed(0x93D4)};
+      for (const CompressedFormat* cf : flip_formats) {
+        for (int bit = 0; bit < 128; ++bit) {
+          uint8_t flipped[16];
+          memcpy(flipped, blk, 16);
+          flipped[bit >> 3] = static_cast<uint8_t>(flipped[bit >> 3] ^ (1 << (bit & 7)));
+          Image t(a);
+          CHECK(t.allocate(find_format(cf->decoded), cf->bw, cf->bh, 1));
+          (void)decode_compressed(*cf, ConstByteView(flipped, 16), cf->bw, cf->bh, 1, &t, 0, 0, 0);
+        }
+      }
+    }
+  }
+  {
+    // through the context: an ASTC 6x6 void-extent block (one colour), sub-image alignment by block size
+    GlContext gl(a, true, 16, 16, noaa());
+    const uint32_t tex = gl.create_texture(), fbo = gl.create_framebuffer();
+    gl.bind_texture(0x0DE1, tex);
+    gl.bind_framebuffer(0x8D40, fbo);
+    gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, tex, 0, 0);
+    uint8_t block[16] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
+    block[8] = 0x11; block[9] = 0xff; block[10] = 0x22; block[11] = 0xff; block[12] = 0x33; block[13] = 0xff;   // the 16-bit colour, high bytes at 9, 11, 13, 15
+    block[14] = 0x44; block[15] = 0xff;
+    gl.compressed_tex_image(0x0DE1, 0, 0x93B4, 6, 6, 1, 0, ConstByteView(block, 16), false);
+    CHECK(gl.get_error() == 0);
+    uint8_t px[4];
+    gl.read_pixels(5, 5, 1, 1, 0x1908, 0x1401, ByteView(px, 4));
+    CHECK(px[0] == 0xff && px[1] == 0xff && px[2] == 0xff && px[3] == 0xff);
+    gl.compressed_tex_sub_image(0x0DE1, 0, 3, 0, 0, 6, 6, 1, 0x93B4, ConstByteView(block, 16), false);
+    CHECK(gl.get_error() == 0x501);   // not on a 6 x 6 boundary
+    gl.compressed_tex_image(0x0DE1, 0, 0x93B4, 6, 6, 1, 0, ConstByteView(block, 15), false);
+    CHECK(gl.get_error() == 0x501);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_bptc_astc();
   test_compressed();
   test_wide_lines();
   test_cube_seams();

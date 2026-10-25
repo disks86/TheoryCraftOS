@@ -521,7 +521,7 @@ void GlContext::compressed_tex_sub_image(uint32_t target, int32_t level, int32_t
   if (!im || im->compressed != format) { set_error(INVALID_OPERATION); return; }
   const bool layered = t->target == 0x806F || t->target == 0x8C1A;
   if (three_d != layered) { set_error(INVALID_ENUM); return; }
-  if (xo < 0 || yo < 0 || zo < 0 || (xo & 3) || (yo & 3) || ((w & 3) && static_cast<uint32_t>(xo) + w != im->w) || ((h & 3) && static_cast<uint32_t>(yo) + h != im->h) ||
+  if (xo < 0 || yo < 0 || zo < 0 || (static_cast<uint32_t>(xo) % cf->bw) || (static_cast<uint32_t>(yo) % cf->bh) || ((w % cf->bw) && static_cast<uint32_t>(xo) + w != im->w) || ((h % cf->bh) && static_cast<uint32_t>(yo) + h != im->h) ||
       uint64_t{static_cast<uint32_t>(xo)} + w > im->w || uint64_t{static_cast<uint32_t>(yo)} + h > im->h || uint64_t{static_cast<uint32_t>(zo)} + d > im->d) {
     set_error(INVALID_VALUE);
     return;
