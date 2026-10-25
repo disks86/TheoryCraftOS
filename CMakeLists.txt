@@ -17,8 +17,9 @@
 cmake_minimum_required(VERSION 3.20)
 
 # Select the UEFI cross toolchain unless the caller supplied one.
-# -DTCOS_ARCH=aarch64 picks the AArch64 toolchain (and the AArch64 image, see cmake/aarch64.cmake).
-set(TCOS_ARCH "x86_64" CACHE STRING "Target architecture: x86_64 or aarch64")
+# -DTCOS_ARCH=aarch64 picks the AArch64 toolchain (and the AArch64 image, see cmake/aarch64.cmake), -DTCOS_ARCH=riscv64
+# the RISC-V one (cmake/riscv64.cmake).
+set(TCOS_ARCH "x86_64" CACHE STRING "Target architecture: x86_64, aarch64 or riscv64")
 if(NOT CMAKE_TOOLCHAIN_FILE)
   set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/toolchain-${TCOS_ARCH}-uefi.cmake)
 endif()
@@ -31,6 +32,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(TCOS_ARCH STREQUAL "aarch64")
   include(cmake/aarch64.cmake)
+  return()
+endif()
+if(TCOS_ARCH STREQUAL "riscv64")
+  include(cmake/riscv64.cmake)
   return()
 endif()
 

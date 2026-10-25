@@ -67,6 +67,25 @@ class DebugConsole final : public IHardware {
  private:
   static inline uint64_t base_ = 0;
 };
+#elif defined(__riscv) && __riscv_xlen == 64
+// The SBI debug console (every RISC-V UEFI platform runs on SBI firmware): bytes go wherever the firmware's
+// console is, with no UART address to find. That is usually the same serial port the UEFI text console already
+// writes to, so the mirror is off until something needs it (a kernel panic, when firmware services are unusable).
+// Defined in Arch/RiscV64/Sbi.cpp.
+class DebugConsole final : public IHardware {
+ public:
+  constexpr DebugConsole() = default;
+
+  const char* name() const override { return "SBI debug console"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+
+  static void set_enabled(bool enabled) { enabled_ = enabled; }
+  void put(char c) const;
+
+ private:
+  static inline bool enabled_ = false;
+};
 #else
 #error "No debug console for this architecture"
 #endif

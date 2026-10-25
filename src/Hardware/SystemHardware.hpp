@@ -35,6 +35,13 @@ using SystemRam = UefiRandomAccessMemory;
 namespace hardware {
 using SystemRam = UefiRandomAccessMemory;
 }  // namespace hardware
+#elif defined(__riscv) && __riscv_xlen == 64
+// The RISC-V image has no CPU class of its own beyond Arch/RiscV64/Cpu.hpp, which main.cpp includes.
+#include "Hardware/RandomAccessMemory/UefiRandomAccessMemory.hpp"
+
+namespace hardware {
+using SystemRam = UefiRandomAccessMemory;
+}  // namespace hardware
 #else
 #error "No hardware classes for this architecture"
 #endif

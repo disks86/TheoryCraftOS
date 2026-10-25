@@ -39,6 +39,13 @@ inline uint64_t rdtsc() {
   __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(count)::"memory");
   return count;
 }
+#elif defined(__riscv) && __riscv_xlen == 64
+// The time CSR: a constant-rate counter shared by all harts.
+inline uint64_t rdtsc() {
+  uint64_t count;
+  __asm__ volatile("rdtime %0" : "=r"(count)::"memory");
+  return count;
+}
 #endif
 inline void cpu_pause() { kernel::cpu_relax(); }
 }  // namespace

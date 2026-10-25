@@ -63,6 +63,25 @@ cmake -S . -B build-aarch64 -DTCOS_ARCH=aarch64 -G Ninja
 cmake --build build-aarch64 --target run   # QEMU "virt"; the log appears on the serial console in your terminal
 ```
 
+## RISC-V (work in progress)
+
+Any RV64 machine with UEFI firmware (and SBI, which every RISC-V UEFI platform has) is the target. LLVM cannot emit RISC-V PE/COFF, so
+the image is linked as a position-independent ELF with `ld.lld` and `scripts/elf2efi.py` rewrites it as a PE32+ `BOOTRISCV64.EFI` (machine
+`0x5064`, base relocations from the ELF's relative relocations), the way EDK2's GenFw does. The first milestone matches the AArch64 one: the
+portable layers (console, RAM, allocator, ACPI tables, the firmware framebuffer), supervisor trap handling, the SBI timer tick, the preemptive
+thread scheduler, and the other harts, which start through SBI `hart_start` (the boot hart comes from the firmware's `RISCV_EFI_BOOT_PROTOCOL`
+and the harts from the ACPI MADT RINTC entries; the timebase from the RHCT). Console output through SBI is only enabled for a kernel panic,
+because it usually reaches the same serial port as the UEFI text console. PLIC/APLIC/IMSIC interrupts, PCIe (ECAM) and the drivers are still
+to port before the rest of the OS can join this image.
+
+Needs `clang` (riscv64 target), `ld.lld` (rustup's `gcc-ld/ld.lld` works), Python 3, mingw-w64's libstdc++ headers, `qemu-system-riscv64` and
+the edk2 `RISCV_VIRT_CODE.fd`/`RISCV_VIRT_VARS.fd`:
+
+```
+cmake -S . -B build-riscv64 -DTCOS_ARCH=riscv64 -G Ninja
+cmake --build build-riscv64 --target run   # QEMU "virt"; the log appears on the serial console in your terminal
+```
+
 ## Debugging in QEMU
 
 `scripts/gdb-proxy.py` rebuilds `BOOTX64`, starts QEMU frozen at reset with a gdbstub on :2159 and bridges gdb to it. It
