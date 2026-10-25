@@ -1158,6 +1158,24 @@ static void test_webgpu_mapping() {
         "mapped | OperationError OperationError no OperationError | unmapped 0 OperationError | wrong usage OperationError | misaligned OperationError | mapped 7 7 0 | AbortError,OperationError");
 }
 
+static void test_webgl_pbo() {
+  CHECK(gl_script(
+            "var gl = c.getContext('webgl2');"
+            " var pbo = gl.createBuffer(); gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, pbo);"
+            " gl.bufferData(gl.PIXEL_UNPACK_BUFFER, new Uint8Array([9,9,9,9, 10,20,30,255, 40,50,60,255, 70,80,90,255, 100,110,120,255]), gl.STREAM_DRAW);"
+            " var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, 4);"
+            " console.log(gl.getError());"
+            " var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);"
+            " gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);"
+            " var px = new Uint8Array(16); gl.readPixels(0, 0, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, px); console.log(px.join(','));"
+            " var out = gl.createBuffer(); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, out); gl.bufferData(gl.PIXEL_PACK_BUFFER, 32, gl.STREAM_READ);"
+            " gl.readPixels(0, 0, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, 8); console.log(gl.getError());"
+            " var back = new Uint8Array(32); gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, back); console.log(back.join(','));"
+            " gl.readPixels(0, 0, 2, 2, gl.RGBA, gl.UNSIGNED_BYTE, px); console.log(gl.getError());"
+            " gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, pbo); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4)); console.log(gl.getError());") ==
+        "0 | 10,20,30,255,40,50,60,255,70,80,90,255,100,110,120,255 | 0 | 0,0,0,0,0,0,0,0,10,20,30,255,40,50,60,255,70,80,90,255,100,110,120,255,0,0,0,0,0,0,0,0 | 1282 | 1282");
+}
+
 static void test_canvas_scripts() {
   std::string shown;
   // the element, the context and the state
@@ -5812,6 +5830,7 @@ int main(int argc, char** argv) {
     test_webgl();
     test_webgpu();
   test_webgpu_mapping();
+  test_webgl_pbo();
     printf(g_failed ? "%d check(s) failed\n" : "webgl and webgpu tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -5860,6 +5879,7 @@ int main(int argc, char** argv) {
   test_webgl();
   test_webgpu();
   test_webgpu_mapping();
+  test_webgl_pbo();
   test_video();
   test_audio();
   test_media_api();
