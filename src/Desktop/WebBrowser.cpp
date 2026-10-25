@@ -1254,10 +1254,10 @@ bool WebBrowser::Env::http_request(const browser::FetchOptions& options, browser
   }
   browser::FetchOptions mine = options;
   mine.block_third_party_cookies = owner_.block_third_party_;
-  const bool ok = browser::fetch_resource(owner_.allocator(), *owner_.loader_, owner_.jar(), mine, response);
-  if (ok) owner_.apply_clear_site_data(*response);
-  return ok;
+  return browser::fetch_resource(owner_.allocator(), *owner_.loader_, owner_.jar(), mine, response);   // (may run on a worker thread)
 }
+
+void WebBrowser::Env::http_answered(const browser::NetResponse& response) { owner_.apply_clear_site_data(response); }
 
 // A Clear-Site-Data header asked for the storage of the site that answered to go (the cookies were dealt with where the answer was read).
 void WebBrowser::apply_clear_site_data(const browser::NetResponse& response) {
