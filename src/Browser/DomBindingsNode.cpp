@@ -265,9 +265,16 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (IS("host")) { *out = node_value(c, n->shadow_host); return true; }
     if (IS("mode")) { *out = str_value(vm, n->shadow_closed ? "closed" : "open"); return true; }
   }
-  if (n->is_text() && IS("wholeText")) { *out = str_value(vm, n->data.view()); return true; }
-  if (n->is_text() && IS("length")) { *out = num_value(static_cast<double>(n->data.size())); return true; }
-  if (n->is_text() && IS("data")) { *out = str_value(vm, n->data.view()); return true; }
+  if (n->is_text() && IS("wholeText")) {   // the text of the run of adjacent text nodes around this one
+    dom::Node* first = n;
+    while (first->prev && first->prev->is_text()) first = first->prev;
+    String all(vm.allocator());
+    for (dom::Node* t = first; t && t->is_text(); t = t->next) all.append(t->data.view());
+    *out = str_value(vm, all.view());
+    return true;
+  }
+  if ((n->is_text() || n->type == dom::NodeType::Comment) && IS("length")) { *out = num_value(static_cast<double>(n->data.size())); return true; }
+  if ((n->is_text() || n->type == dom::NodeType::Comment) && IS("data")) { *out = str_value(vm, n->data.view()); return true; }
   // --- documents
   if (document) {
     if (IS("documentElement")) { *out = node_value(c, n->owner->document_element()); return true; }
@@ -298,7 +305,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (IS("doctype")) {   // a page that began with <!DOCTYPE ...> has one: the built-in script makes the object
       *out = Value::make_null();
       Value make;
-      if (!n->owner->quirks_mode && n->owner->content_type.empty() && vm.get_named(Value::make_object(vm.global()), "__doctype_of", &make) && Vm::is_callable(make)) {
+      if (!n->owner->quirks_mode && (n->owner->content_type.empty() || n->owner->content_type.view() == StringView("text/html")) && vm.get_named(Value::make_object(vm.global()), "__doctype_of", &make) && Vm::is_callable(make)) {
         const Value arg = node_value(c, n);
         if (!vm.call(make, Value(), &arg, 1, out)) {
           String ignored(vm.allocator());
@@ -507,7 +514,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     return done(dom::set_text_content(n, text.view()));
   }
-  if (IS("nodeValue") || (n->is_text() && IS("data"))) {
+  if (IS("nodeValue") || ((n->is_text() || n->type == dom::NodeType::Comment) && IS("data"))) {
     if (n->is_text() || n->type == dom::NodeType::Comment) {
       if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
       return done(dom::set_text_content(n, text.view()));
@@ -1583,7 +1590,7 @@ bool install_nodes(DomBindings::Impl& c) {
     int value;
   } kConstants[] = {{"ELEMENT_NODE", 1}, {"ATTRIBUTE_NODE", 2}, {"TEXT_NODE", 3}, {"CDATA_SECTION_NODE", 4}, {"PROCESSING_INSTRUCTION_NODE", 7}, {"COMMENT_NODE", 8},
                     {"DOCUMENT_NODE", 9}, {"DOCUMENT_TYPE_NODE", 10}, {"DOCUMENT_FRAGMENT_NODE", 11}, {"DOCUMENT_POSITION_DISCONNECTED", 1}, {"DOCUMENT_POSITION_PRECEDING", 2},
-                    {"DOCUMENT_POSITION_FOLLOWING", 4}, {"DOCUMENT_POSITION_CONTAINS", 8}, {"DOCUMENT_POSITION_CONTAINED_BY", 16}};
+                    {"DOCUMENT_POSITION_FOLLOWING", 4}, {"DOCUMENT_POSITION_CONTAINS", 8}, {"DOCUMENT_POSITION_CONTAINED_BY", 16}, {"DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 32}};
   for (const auto& k : kConstants) {
     vm.define_named(node_ctor, k.name, num_value(k.value), 0);
     vm.define_named(np, k.name, num_value(k.value), 0);

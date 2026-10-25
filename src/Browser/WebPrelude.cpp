@@ -4045,16 +4045,24 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   method(EP, 'getAttributeNode', function (name) { return this.hasAttribute(name) ? makeAttr(String(name).toLowerCase(), this.getAttribute(name), this) : null; });
   method(EP, 'getAttributeNodeNS', function (ns, name) { return this.hasAttribute(name) ? makeAttr(name, this.getAttribute(name), this, ns) : null; });
   method(EP, 'setAttributeNode', function (attr) {
-    var old = this.getAttributeNode(attr.name);
+    if (attr.ownerElement && attr.ownerElement !== this) throw dom("Failed to execute 'setAttributeNode' on 'Element': The node provided is an attribute node that is already an attribute of another Element; attribute nodes must be explicitly cloned.", 'InUseAttributeError');
+    var name = String(attr.name).toLowerCase(), store = this.__attrNodes || (this.__attrNodes = {});
+    var old = store[name] && store[name].ownerElement === this ? store[name] : this.getAttributeNode(name);
+    if (old === attr) return attr;
     this.setAttribute(attr.name, attr.value);
+    if (old) old.ownerElement = null;
     attr.ownerElement = this;
+    store[name] = attr;
     return old;
   });
   method(EP, 'setAttributeNodeNS', EP.setAttributeNode);
   method(EP, 'removeAttributeNode', function (attr) {
     if (!this.hasAttribute(attr.name)) throw dom("Failed to execute 'removeAttributeNode' on 'Element': The node provided is not an attribute of this element.", 'NotFoundError');
-    var old = this.getAttributeNode(attr.name);
+    var name = String(attr.name).toLowerCase(), store = this.__attrNodes || (this.__attrNodes = {});
+    var old = store[name] && store[name].ownerElement === this ? store[name] : this.getAttributeNode(name);
     this.removeAttribute(attr.name);
+    delete store[name];
+    if (old) old.ownerElement = null;
     return old;
   });
   method(EP, 'getAttributeNS', function (ns, name) { return this.getAttribute(name); });
@@ -9085,7 +9093,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
 
   hide(g, '__doctype_of', function (d) {
     var t = d.__doctype;
-    if (!t) { t = d.implementation.createDocumentType('html', '', ''); Object.defineProperty(d, '__doctype', { value: t }); }
+    if (!t) { t = document.implementation.createDocumentType('html', '', ''); Object.defineProperty(d, '__doctype', { value: t }); }
     return t;
   });
 
