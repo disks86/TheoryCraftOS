@@ -3365,6 +3365,34 @@ static void test_navigation() {
     }
     CHECK(a.live == 0);
   }
+  // --- requestAnimationFrame: frames, time stamps, order, cancelling
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      Page page(a, env, "http://example.com/", media, true);
+      page.load("<script>var log = []; var stamps = [];"
+                "var a = requestAnimationFrame(function (t) { stamps.push(t); log.push('a'); requestAnimationFrame(function () { log.push('a2') }); cancelAnimationFrame(c) });"
+                "var b = requestAnimationFrame(function (t) { stamps.push(t); log.push('b'); throw new Error('boom') });"
+                "var c = requestAnimationFrame(function () { log.push('NO') });"
+                "var d = requestAnimationFrame(function (t) { stamps.push(t); log.push('d'); requestAnimationFrame(report) });"
+                "var e = requestAnimationFrame(function () { log.push('NO2') }); cancelAnimationFrame(e); cancelAnimationFrame(99999); cancelAnimationFrame('x'); cancelAnimationFrame();"
+                "console.log(a > 0, b > a, c > b, typeof a);"
+                "try { requestAnimationFrame() } catch (x) { console.log(x.name) } try { requestAnimationFrame('f') } catch (x) { console.log(x.name) }"
+                "function report() { console.log(log.join(), stamps.length, stamps[0] === stamps[1] && stamps[1] === stamps[2], typeof stamps[0], stamps[0] >= 0 && stamps[0] <= performance.now()) }</script>");
+      page.run_due_timers(env.clock + 20);   // the first frame: a, b (which throws), d; a2 waits for the next one
+      page.run_due_timers(env.clock + 20);
+      page.run_due_timers(env.clock + 40);   // the second frame
+      page.run_due_timers(env.clock + 60);   // (the error b threw is thrown again as a timer)
+      double due;
+      CHECK(!page.next_timer(&due));
+      const std::string log(page.log().data(), page.log().size());
+      CHECK(log == "true true true number\nTypeError\nTypeError\na,b,d,a2 3 true number true\nscript error: Error: boom\n");
+      CHECK(page.errors() >= 1);
+    }
+    CHECK(a.live == 0);
+  }
   // --- window.open(), window.close()
   CHECK(nav_is("var w = open('/popup', 'pop'); console.log(typeof w, w.closed, w.name); console.log(open('/n', '_blank', 'noopener') === null, open('about:blank') === null); w.close(); console.log(w.closed); close();", "object false pop | true true | true",
                nullptr, [](FakeEnvironment& env) {
