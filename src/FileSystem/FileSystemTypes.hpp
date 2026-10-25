@@ -57,6 +57,9 @@ const char* status_name(Status status);
 using UnixClock = uint64_t (*)(void* context);
 void set_unix_clock(UnixClock clock, void* context);
 uint64_t unix_time_now();
+// How far the local time (what the taskbar shows, and what FAT stores) is ahead of UTC, in seconds; 0 when not known or the same.
+void set_local_offset_seconds(int32_t seconds);
+int32_t local_offset_seconds();
 
 // Days since 1970-01-01 of a calendar date (month 1..12, day 1..31).
 constexpr int64_t days_from_civil(int64_t year, int64_t month, int64_t day) {

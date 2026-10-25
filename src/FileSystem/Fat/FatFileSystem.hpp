@@ -111,6 +111,7 @@ class FatFileSystem final : public IFileSystem {
   Status resize_chain(uint32_t* first, uint32_t old_size, uint32_t new_size);
   Status write_chain(uint32_t first, uint64_t offset, const uint8_t* data, uint64_t length, ChainCursor* cursor);  // null data: zeros
   Status update_entry(uint64_t short_offset, uint32_t first, uint32_t size);
+  Status touch_directory(const Node& directory);  // its written time becomes now (a name was added or removed); the root has none
   uint32_t free_cluster_count();
   Status find_slots(const Node& directory, uint32_t needed, uint64_t* offsets);
   bool alias_taken(const Node& directory, const uint8_t name11[11], uint64_t ignore_offset);

@@ -1309,6 +1309,10 @@ Status NtfsFileSystem::describe(uint64_t number, const NameInfo& name, Directory
   if (attr_find(record, kAttrStandardInformation, "", &a) == Status::Ok && !a.nonresident && a.value_length >= 0x24)
     attributes = rd32(record.bytes(), a.value_offset + 0x20);
   result.read_only = (attributes & kFileReadOnly) != 0;
+  if (attr_find(record, kAttrStandardInformation, "", &a) == Status::Ok && !a.nonresident && a.value_length >= 0x10) {
+    result.created = unix_from_filetime(rd64(record.bytes(), a.value_offset));
+    result.modified = unix_from_filetime(rd64(record.bytes(), a.value_offset + 8));
+  }
   if (!directory) {
     Stream data(allocator_);
     s = stream_open(record, kAttrData, "", &data);

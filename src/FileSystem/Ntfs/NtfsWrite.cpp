@@ -1074,7 +1074,7 @@ Status NtfsFileSystem::build_file_name(const Record& parent, Units name, uint8_t
   if (!value->put_zeros(0x42 + 2 * units)) return Status::OutOfMemory;
   ByteView v = value->writable_view();
   wr64(v, 0, parent.number | (uint64_t{rd16(parent.bytes(), 0x10)} << 48));
-  for (uint32_t i = 0; i < 4; ++i) wr64(v, 8 + 8 * i, kTimeStamp);
+  for (uint32_t i = 0; i < 4; ++i) wr64(v, 8 + 8 * i, stamp_now());
   wr32(v, 0x38, flags);
   v[0x40] = static_cast<uint8_t>(units);
   v[0x41] = ns;
@@ -1113,7 +1113,7 @@ Status NtfsFileSystem::create_node(StringView path, bool directory, uint64_t* nu
   uint32_t at = rd16(record.bytes(), 0x14);
   // $STANDARD_INFORMATION
   if (!value.put_zeros(0x48)) return Status::OutOfMemory;
-  for (uint32_t i = 0; i < 4; ++i) wr64(value.writable_view(), 8 * i, kTimeStamp);
+  for (uint32_t i = 0; i < 4; ++i) wr64(value.writable_view(), 8 * i, stamp_now());
   wr32(value.writable_view(), 0x20, directory ? 0 : kFileArchive);
   wr32(value.writable_view(), 0x34, security);
   if (!build_resident(kAttrStandardInformation, "", 0, take_attr_id(record), value.view(), false, &attr)) return Status::OutOfMemory;
@@ -1161,6 +1161,8 @@ Status NtfsFileSystem::create_node(StringView path, bool directory, uint64_t* nu
     release_record(record.number);
     return s;
   }
+  s = touch_folder(parent.number);
+  if (s != Status::Ok) return s;
   *number = record.number;
   return Status::Ok;
 }
@@ -1295,6 +1297,8 @@ Status NtfsFileSystem::remove(StringView path) {
     s = index_remove(r.parent, name.info.view());
     if (s != Status::Ok && s != Status::NotFound) return s;
   }
+  s = touch_folder(r.parent);
+  if (s != Status::Ok) return s;
   if (others == 0 || r.directory) return delete_file_record(r.number);
   for (uint32_t i = mine.count(); i-- > 0;) {  // from the back, so that the offsets stay right
     Attr victim;
@@ -1433,8 +1437,24 @@ Status NtfsFileSystem::rename(StringView from, StringView to) {
   if (s != Status::Ok) {  // the record on the medium is unchanged: undo the folder entries
     index_remove(target_parent.number, units);
     restore();
+    return s;
   }
+  s = touch_folder(src.parent);
+  if (s == Status::Ok && target_parent.number != src.parent) s = touch_folder(target_parent.number);
   return s;
+}
+
+// The times of a folder in its $STANDARD_INFORMATION (created, modified, MFT changed, accessed).
+Status NtfsFileSystem::touch_folder(uint64_t number) {
+  const uint64_t now = ntfs::filetime_now();
+  if (now == 0) return Status::Ok;
+  Record record(allocator_);
+  Status s = read_record(number, &record);
+  if (s != Status::Ok) return s;
+  Attr a;
+  if (attr_find(record, kAttrStandardInformation, "", &a) != Status::Ok || a.nonresident || a.value_length < 0x20) return Status::Ok;
+  for (uint32_t k = 1; k <= 3; ++k) wr64(record.bytes(), a.value_offset + 8 * k, now);
+  return write_record(record);
 }
 
 // Brings the copies of a file's sizes and attributes in its $FILE_NAME attributes and in the folders' index entries up to date (Windows
@@ -1486,6 +1506,11 @@ Status NtfsFileSystem::sync_names(uint64_t number) {
     it = attr_next(record, &n);
   }
   if (it != Status::EndOfDirectory) return it;
+  const uint64_t now = ntfs::filetime_now();
+  if (now != 0 && attr_find(record, kAttrStandardInformation, "", &a) == Status::Ok && !a.nonresident && a.value_length >= 0x20) {
+    for (uint32_t k = 1; k <= 3; ++k) wr64(record.bytes(), a.value_offset + 8 * k, now);  // written: modified, MFT changed, accessed
+    changed = true;
+  }
   if (changed) {
     s = write_record(record);
     if (s != Status::Ok) return s;

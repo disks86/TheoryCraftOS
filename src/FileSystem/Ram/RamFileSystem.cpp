@@ -23,10 +23,19 @@
 
 namespace filesystem {
 
+namespace {
+// A modification time becomes now - unless there is no clock, which leaves the time alone.
+void touch_time(uint64_t* modified) {
+  const uint64_t now = unix_time_now();
+  if (now) *modified = now;
+}
+}  // namespace
+
 struct RamFileSystem::Node {
   Node(allocators::IAllocator& a, Node* parent_node, StringView node_name, NodeType node_type)
       : allocator(a), parent(parent_node), type(node_type), children(a) {
     name.assign(node_name);
+    created = modified = unix_time_now();
   }
   ~Node() { allocator.deallocate(data); }
 
@@ -39,6 +48,7 @@ struct RamFileSystem::Node {
   uint64_t size = 0;
   uint64_t capacity = 0;
   uint32_t open_count = 0;
+  uint64_t created = 0, modified = 0;  // seconds since 1970 UTC (0: no clock when it was made)
 };
 
 class RamFileSystem::File final : public IFile {
@@ -75,12 +85,16 @@ class RamFileSystem::File final : public IFile {
       if (grown != Status::Ok) return grown;
     }
     __builtin_memmove(node_.data + offset, data.data(), data.size());
+    touch_time(&node_.modified);
     *transferred = data.size();
     return Status::Ok;
   }
   Status resize(uint64_t new_size) override {
     kernel::ScopedRecursiveMutex lock(fs_.mutex_);
-    return writable_ ? fs_.set_size(node_, new_size) : Status::ReadOnly;
+    if (!writable_) return Status::ReadOnly;
+    const Status s = fs_.set_size(node_, new_size);
+    if (s == Status::Ok) touch_time(&node_.modified);
+    return s;
   }
   Status flush() override { return Status::Ok; }
 
@@ -140,6 +154,8 @@ void RamFileSystem::describe(const Node& node, DirectoryEntry* entry) {
   entry->type = node.type;
   entry->size = node.type == NodeType::File ? node.size : 0;
   entry->read_only = false;
+  entry->modified = node.modified;
+  entry->created = node.created;
 }
 
 Status RamFileSystem::resolve(StringView path, Node** node) {
@@ -175,6 +191,7 @@ Status RamFileSystem::add_child(Node& parent, StringView name, NodeType type, No
   if (!node) return Status::OutOfMemory;
   Node* raw = node.get();
   if (!parent.children.push_back(util::move(node))) return Status::OutOfMemory;
+  touch_time(&parent.modified);
   *created = raw;
   return Status::Ok;
 }
@@ -279,6 +296,7 @@ Status RamFileSystem::remove(StringView path) {
   if (node.type == NodeType::Directory && node.children.count()) return Status::NotEmpty;
   used_ -= node.size;
   parent->children.remove_at(at);
+  touch_time(&parent->modified);
   return Status::Ok;
 }
 
@@ -304,6 +322,8 @@ Status RamFileSystem::rename(StringView from, StringView to) {
   node->name.assign(to_leaf);
   node->parent = to_parent;
   to_parent->children.push_back(util::move(moved));  // cannot fail: reserved above
+  touch_time(&from_parent->modified);
+  touch_time(&to_parent->modified);
   return Status::Ok;
 }
 

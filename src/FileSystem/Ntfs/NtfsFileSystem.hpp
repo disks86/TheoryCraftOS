@@ -47,7 +47,7 @@ namespace filesystem {
 // log) and it is version 3.x; any other volume is read only (writes return ReadOnly). The dirty flag is set before the first change and
 // cleared by flush() (and when the filesystem is destroyed), so a crash in between leaves the volume for chkdsk. New files are created
 // with a Win32 name only (no 8.3 alias), names with characters Windows does not allow (\ / : * ? " < > | and controls) are InvalidPath,
-// time stamps are not kept up to date (no clock here: new entries get 1980-01-01) and a new file takes the security of its folder.
+// time stamps come from the system wall clock (new entries get 1980-01-01 while there is none) and a new file takes the security of its folder.
 // Not written: compressed and encrypted files (Unsupported; they can be read and removed), and anything that would need a new attribute
 // list or extension record: a file record that is full (a very fragmented file, a folder whose first index block does not fit) answers
 // NoSpace, and a file that already has an attribute list can be read, overwritten in place and removed, but not grown, cut or renamed
@@ -297,6 +297,8 @@ class NtfsFileSystem final : public IFileSystem {
   Status delete_file_record(uint64_t number);
   Status drop_links(Record& record, uint64_t parent, const NameInfo& matched, ByteBuffer* removed_keys, uint32_t* remaining);
   Status sync_names(uint64_t number);
+  Status touch_folder(uint64_t number);  // modified, changed and accessed become now (a name was added or removed); nothing without a clock
+  static uint64_t stamp_now() { const uint64_t now = ntfs::filetime_now(); return now ? now : ntfs::kTimeStamp; }
   Status touch_volume_flag(bool dirty);
   static bool valid_new_name(StringView name);
 

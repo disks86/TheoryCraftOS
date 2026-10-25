@@ -229,7 +229,12 @@ static void sync_wall_clock(efi::SystemTable* st) {
   kernel::firmware([&] { status = st->runtime_services->get_time(&t, nullptr); });
   if (status != efi::kSuccess || t.year < 1970 || t.month < 1 || t.month > 12 || t.day < 1 || t.day > 31 || t.hour > 23 || t.minute > 59 || t.second > 59) return;
   int64_t seconds = filesystem::days_from_civil(t.year, t.month, t.day) * 86400 + t.hour * 3600 + t.minute * 60 + t.second;
-  if (t.time_zone != efi::kUnspecifiedTimeZone && t.time_zone >= -1440 && t.time_zone <= 1440) seconds += int64_t{t.time_zone} * 60;  // (UTC = local + zone)
+  int32_t local_offset = 0;
+  if (t.time_zone != efi::kUnspecifiedTimeZone && t.time_zone >= -1440 && t.time_zone <= 1440) {
+    seconds += int64_t{t.time_zone} * 60;  // (UTC = local + zone)
+    local_offset = -int32_t{t.time_zone} * 60;
+  }
+  filesystem::set_local_offset_seconds(local_offset);
   if (seconds <= 0) return;
   __atomic_store_n(&g_unix_us_at_boot, static_cast<uint64_t>(seconds) * 1000000ull - hardware::uptime_us(), __ATOMIC_RELAXED);
 }

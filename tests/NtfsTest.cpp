@@ -46,6 +46,7 @@ struct TestAllocator final : allocators::IAllocator {
 static int g_failed = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAILED line %d: %s\n", __LINE__, #cond); ++g_failed; } } while (0)
 #define CHECK_STATUS(expr, want) do { Status got_ = (expr); if (got_ != (want)) { printf("FAILED line %d: %s -> %s, want %s\n", __LINE__, #expr, status_name(got_), status_name(want)); ++g_failed; } } while (0)
+#include "FileTimes.hpp"
 
 struct MemDisk : hardware::IStorageDevice {
   MemDisk(const uint8_t* image, uint64_t length, uint32_t block, uint64_t lead_blocks = 0, bool writable = false) : block_size(block), can_write(writable) {
@@ -1290,6 +1291,14 @@ static void remount_check(MemDisk& disk, uint32_t block, const Model& model, uin
 
 static Mounted* g_unused = nullptr;
 
+static void test_times() {
+  Opts o;
+  Standard s = make_standard(o, 0);
+  Mounted m;
+  CHECK_STATUS(m.mount(s.image, 512, true), Status::Ok);
+  if (m.fs) filetimes::check_stamps(*m.fs, "ntfs");
+}
+
 static void test_write_files() {
   Opts o;
   Standard s = make_standard(o, 40);
@@ -2027,6 +2036,7 @@ int main(int argc, char** argv) {
   if (want("bigdir")) test_big_directory();
   if (want("mount")) test_mount_rules();
   if (want("files")) test_write_files();
+  if (want("times")) test_times();
   if (want("dirty")) test_dirty_flag();
   if (want("handles")) test_handles();
   if (want("blocks")) test_blocks_and_partitions();

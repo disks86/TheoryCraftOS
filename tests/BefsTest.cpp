@@ -43,6 +43,7 @@ struct TestAllocator final : allocators::IAllocator {
 static int g_failed = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAILED line %d: %s\n", __LINE__, #cond); ++g_failed; } } while (0)
 #define CHECK_STATUS(expr, want) do { Status got_ = (expr); if (got_ != (want)) { printf("FAILED line %d: %s -> %s, want %s\n", __LINE__, #expr, status_name(got_), status_name(want)); ++g_failed; } } while (0)
+#include "FileTimes.hpp"
 
 struct MemDisk : hardware::IStorageDevice {
   MemDisk(const uint8_t* image, uint64_t length, uint32_t block, uint64_t lead_blocks = 0, bool writable = false) : block_size(block), can_write(writable) {
@@ -1686,7 +1687,18 @@ done:
   CHECK(a.live == 0);
 }
 
+static void test_times() {
+  printf("BeFS time stamps\n");
+  Built v(1024, 13, 3, 1024);
+  TestAllocator a;
+  MemDisk disk(v.image.img.data(), v.image.img.size(), 512, 0, true);
+  UniquePointer<IFileSystem> fs;
+  CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+  if (fs) filetimes::check_stamps(*fs, "befs");
+}
+
 int main() {
+  test_times();
   test_volume(1024, 8, 16, 1024, 512, "BeFS 1 KiB blocks, 512 byte device");
   test_volume(2048, 7, 32, 2048, 2048, "BeFS 2 KiB blocks, 2 KiB device");
   test_volume(1024, 10, 4, 4096, 512, "BeFS 1 KiB blocks, 4 KiB tree nodes");
