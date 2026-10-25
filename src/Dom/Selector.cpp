@@ -71,6 +71,7 @@ uint32_t SelectorSet::tag(uint32_t i) const { return selectors_[tops_[i]].tag; }
 uint32_t SelectorSet::specificity(uint32_t i) const { return selectors_[tops_[i]].specificity; }
 uint8_t SelectorSet::pseudo(uint32_t i) const { return selectors_[tops_[i]].pseudo; }
 bool SelectorSet::uses_host(uint32_t i) const { return selectors_[tops_[i]].host; }
+bool SelectorSet::uses_slotted(uint32_t i) const { return selectors_[tops_[i]].slotted; }
 
 // --- Reading selectors -------------------------------------------------------------------------------------------
 
@@ -433,6 +434,20 @@ class SelectorSet::Reader {
       String element_name(set_.alloc_);
       for (uint64_t i = 0; i < scratch_.size(); ++i) element_name.push_back(lower(scratch_[i]));
       const bool known = element_name.equals("before") || element_name.equals("after") || element_name.equals("marker");
+      if (element_name.equals("slotted") && cur() == '(') {   // ::slotted(selector): what is assigned to a slot, if it matches the selector
+        ++pos_;
+        uint32_t first, count;
+        if (!list(true, false, true, &first, &count)) return false;
+        skip_space();
+        if (cur() != ')') return false;
+        ++pos_;
+        t->kind = TestKind::Is;
+        t->first_ref = first;
+        t->ref_count = count;
+        if (count == 0) *applies = false;
+        *specificity += 1;
+        return true;
+      }
       if (cur() == '(') {
         ++pos_;
         skip_parens_body();
@@ -608,6 +623,8 @@ bool SelectorSet::parse(StringView text, uint32_t tag, uint32_t* added, bool for
   if (!forgiving && reader.unknown_pseudo_) return false;
   if (text.contains(":host"))
     for (uint64_t i = before; i < tops_.count(); ++i) selectors_[tops_[i]].host = true;
+  if (text.contains("::slotted"))
+    for (uint64_t i = before; i < tops_.count(); ++i) selectors_[tops_[i]].slotted = true;
   return ok && syntax;
 }
 
@@ -626,12 +643,24 @@ bool SelectorSet::matches_any(const Node* element, const Node* scope) const {
   return false;
 }
 
+// The compound is written with :host or :host(...).
+bool SelectorSet::compound_is_host(const Compound& c) const {
+  for (uint32_t i = 0; i < c.test_count; ++i) {
+    const TestKind k = tests_[c.first_test + i].kind;
+    if (k == TestKind::Host || k == TestKind::HostIs) return true;
+  }
+  return false;
+}
+
 bool SelectorSet::match_chain(const Selector& s, uint32_t k, const Node* node, const Node* scope) const {
   const Compound& c = compounds_[s.first_compound + k];
   if (!match_compound(c, node, scope)) return false;
   if (k == 0) return true;
+  const bool to_host = compound_is_host(compounds_[s.first_compound + k - 1]);   // (":host(.x) p": from the shadow tree up to its host)
   switch (c.combinator) {
-    case Combinator::Child: return node->parent && node->parent->is_element() && match_chain(s, k - 1, node->parent, scope);
+    case Combinator::Child:
+      if (node->parent && node->parent->is_element()) return match_chain(s, k - 1, node->parent, scope);
+      return to_host && node->parent && node->parent->shadow_host && match_chain(s, k - 1, node->parent->shadow_host, scope);
     case Combinator::Adjacent: {
       const Node* p = previous_element_sibling(node);
       return p && match_chain(s, k - 1, p, scope);
@@ -643,6 +672,11 @@ bool SelectorSet::match_chain(const Selector& s, uint32_t k, const Node* node, c
     default:
       for (const Node* p = node->parent; p && p->is_element(); p = p->parent)
         if (match_chain(s, k - 1, p, scope)) return true;
+      if (to_host) {
+        const Node* top = node;
+        while (top->parent) top = top->parent;
+        return top->shadow_host && match_chain(s, k - 1, top->shadow_host, scope);
+      }
       return false;
   }
 }

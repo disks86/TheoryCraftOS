@@ -5571,7 +5571,23 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (node.nodeType === 1) fn(node);
     for (var c = node.firstChild; c; c = c.nextSibling) eachElement(c, fn);
   }
+  // slotchange: a slot whose assigned nodes differ from the last time the slots of that tree were looked at is told so
+  function slotsOf(host) {
+    var root = host && host.nodeType === 1 ? host.shadowRoot : null;
+    return root ? root.querySelectorAll('slot') : [];
+  }
+  function checkSlots(host) {
+    var slots = slotsOf(host);
+    for (var i = 0; i < slots.length; i++) {
+      var now = slots[i].assignedNodes(), before = slots[i].__sig || [], same = now.length === before.length;
+      for (var k = 0; same && k < now.length; k++) same = now[k] === before[k];
+      if (same) continue;
+      Object.defineProperty(slots[i], '__sig', { value: now, writable: true, configurable: true });
+      slots[i].dispatchEvent(new Event('slotchange', { bubbles: true }));
+    }
+  }
   function reactions(record) {
+    if (record.type === 'childList' || (record.type === 'attributes' && record.attributeName === 'slot')) checkSlots(record.type === 'childList' ? record.target : record.target.parentNode);
     if (record.type === 'childList') {
       for (var i = 0; i < record.addedNodes.length; i++) eachElement(record.addedNodes[i], function (el) {
         if (el.__ce === undefined && el.isConnected && defOf(el)) upgrade(el);
@@ -7515,6 +7531,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       define('slotAssignment', init.slotAssignment === 'manual' ? 'manual' : 'named');
       define('clonable', !!init.clonable);
       define('serializable', !!init.serializable);
+      __mutations_on();   // (slotchange comes from watching the host's children)
       return root;
     });
     // ShadowRoot.innerHTML (the setter is the fragment's)

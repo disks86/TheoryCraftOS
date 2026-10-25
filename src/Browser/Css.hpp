@@ -768,7 +768,7 @@ class StyleSheet {
   allocators::IAllocator& allocator_;
   bool pointer_state_ = false;
   uint32_t scope_ = 0;
-  bool rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope) const;
+  bool rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope, uint32_t slot_scope = 0) const;
   String pool_;
   dom::SelectorSet selectors_;
   const MediaEnvironment* env_ = nullptr;

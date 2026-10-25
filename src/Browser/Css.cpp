@@ -5431,17 +5431,19 @@ bool StyleSheet::add_declarations(StringView body, uint32_t rule) {
 }
 
 // The shadow root an element is in (0: the document's tree) and the one it hosts.
-static void element_scopes(const dom::Node* element, uint32_t* in_scope, uint32_t* hosted) {
+static void element_scopes(const dom::Node* element, uint32_t* in_scope, uint32_t* hosted, uint32_t* slotted = nullptr) {
   const dom::Node* top = element;
   while (top->parent) top = top->parent;
   *in_scope = top->shadow_host ? top->serial : 0;
   *hosted = element->shadow ? element->shadow->serial : 0;
+  if (slotted) *slotted = element->parent && element->parent->shadow ? element->parent->shadow->serial : 0;   // (the shadow tree of its parent: what it may be slotted into)
 }
 
 // A rule applies to what is in its own tree (the document's rules to the document's elements, a shadow tree's to that shadow tree's), and the rules of a shadow
 // tree written with :host to its host.
-bool StyleSheet::rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope) const {
+bool StyleSheet::rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope, uint32_t slot_scope) const {
   const uint32_t scope = rules_[selectors_.tag(selector)].scope;
+  if (selectors_.uses_slotted(selector)) return scope != 0 && scope == slot_scope;   // ::slotted() rules style what the shadow tree's host holds
   return scope == element_scope || (scope != 0 && scope == host_scope && selectors_.uses_host(selector));
 }
 
@@ -6018,10 +6020,10 @@ bool StyleSheet::property_registration(uint32_t index, PropertyRegistration* out
 void StyleSheet::apply(const dom::Node* element, StringView inline_style, const Style& parent, Style* style, PseudoElement pseudo) const {
   uint32_t matched[kMaxMatches];
   uint32_t count = 0;
-  uint32_t element_scope, host_scope;
-  element_scopes(element, &element_scope, &host_scope);
+  uint32_t element_scope, host_scope, slot_scope;
+  element_scopes(element, &element_scope, &host_scope, &slot_scope);
   for (uint32_t s = 0; s < selectors_.count() && count < kMaxMatches; ++s) {
-    if (selectors_.pseudo(s) != static_cast<uint8_t>(pseudo) || !rule_applies(s, element_scope, host_scope) || !selectors_.matches(s, element, nullptr, true)) continue;
+    if (selectors_.pseudo(s) != static_cast<uint8_t>(pseudo) || !rule_applies(s, element_scope, host_scope, slot_scope) || !selectors_.matches(s, element, nullptr, true)) continue;
     const Rule& rule = rules_[selectors_.tag(s)];
     if (rule.container != 0 && !container_applies(rule.container, element)) continue;
     matched[count++] = s;
