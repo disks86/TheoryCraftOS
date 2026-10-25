@@ -79,7 +79,17 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
                  maxComputeWorkgroupStorageSize: 16384, maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256, maxComputeWorkgroupSizeZ: 64,
                  maxComputeWorkgroupsPerDimension: 65535 };
   var newLimits = function () { var l = Object.create(GPUSupportedLimits.prototype); for (var k in LIMITS) Object.defineProperty(l, k, { value: LIMITS[k], enumerable: true }); return l; };
-  var FEATURES = ['depth-clip-control', 'depth32float-stencil8', 'indirect-first-instance', 'bgra8unorm-storage', 'float32-filterable', 'rg11b10ufloat-renderable', 'timestamp-query'];
+  var FEATURES = ['depth-clip-control', 'depth32float-stencil8', 'indirect-first-instance', 'bgra8unorm-storage', 'float32-filterable', 'rg11b10ufloat-renderable', 'texture-compression-astc', 'texture-compression-bc', 'timestamp-query'];
+  // block compressed formats: [feature, texels wide, texels high]
+  var BLOCKS = {};
+  ['bc1-rgba-unorm', 'bc2-rgba-unorm', 'bc3-rgba-unorm', 'bc4-r-unorm', 'bc4-r-snorm', 'bc5-rg-unorm', 'bc5-rg-snorm', 'bc6h-rgb-ufloat', 'bc6h-rgb-float', 'bc7-rgba-unorm'].forEach(function (n) {
+    BLOCKS[n] = ['texture-compression-bc', 4, 4];
+    if (/unorm$/.test(n) && n.indexOf('bc4') < 0 && n.indexOf('bc5') < 0 && n.indexOf('bc6') < 0) BLOCKS[n + '-srgb'] = ['texture-compression-bc', 4, 4];
+  });
+  [[4, 4], [5, 4], [5, 5], [6, 5], [6, 6], [8, 5], [8, 6], [8, 8], [10, 5], [10, 6], [10, 8], [10, 10], [12, 10], [12, 12]].forEach(function (b) {
+    BLOCKS['astc-' + b[0] + 'x' + b[1] + '-unorm'] = ['texture-compression-astc', b[0], b[1]];
+    BLOCKS['astc-' + b[0] + 'x' + b[1] + '-unorm-srgb'] = ['texture-compression-astc', b[0], b[1]];
+  });
   var GPUSupportedFeatures = makeClass('GPUSupportedFeatures');
   var newFeatures = function (list) {
     var s = new Set(list);
@@ -150,7 +160,12 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
     def(info, 'vendor', 'theorycraftos'); def(info, 'architecture', 'software'); def(info, 'device', 'rasterizer'); def(info, 'description', 'TheoryCraftOS software rasterizer');
     def(adapter, 'info', info);
     def(adapter, 'requestAdapterInfo', function () { return Promise.resolve(info); });
-    def(adapter, 'requestDevice', function (desc) { return Promise.resolve(createDevice(adapter, desc)); });
+    def(adapter, 'requestDevice', function (desc) {
+      var wanted = desc && desc.requiredFeatures ? Array.prototype.slice.call(desc.requiredFeatures) : [];
+      for (var i = 0; i < wanted.length; i++)
+        if (FEATURES.indexOf(wanted[i]) < 0) return Promise.reject(new TypeError("Unsupported feature '" + wanted[i] + "'."));
+      return Promise.resolve(createDevice(adapter, desc));
+    });
     return Promise.resolve(adapter);
   });
   def(GPU.prototype, 'getPreferredCanvasFormat', function () { return 'bgra8unorm'; });
@@ -287,6 +302,15 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
   def(D, 'createTexture', function (desc) {
     var size = toSize(desc.size);
     var dim = desc.dimension || '2d';
+    var blk = BLOCKS[desc.format];
+    if (blk && !this.features.has(blk[0])) {
+      deviceError(this, 'validation', "The format '" + desc.format + "' needs the feature '" + blk[0] + "'.");
+      var bad = Object.create(GPUTexture.prototype);
+      hide(bad, '__dev', this); hide(bad, '__id', 0); hide(bad, '__label', desc.label || '');
+      def(bad, 'width', size[0]); def(bad, 'height', size[1]); def(bad, 'depthOrArrayLayers', size[2]); def(bad, 'mipLevelCount', desc.mipLevelCount || 1);
+      def(bad, 'sampleCount', desc.sampleCount || 1); def(bad, 'dimension', dim); def(bad, 'format', desc.format); def(bad, 'usage', desc.usage);
+      return bad;
+    }
     var id = op(this, 'createTexture', size[0], size[1], size[2], desc.mipLevelCount || 1, desc.sampleCount || 1, texDim[dim], desc.format, desc.usage);
     if (!id) pullError(this);
     var t = Object.create(GPUTexture.prototype);
@@ -579,7 +603,7 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
     // (depth/array layers are copied by a second call each; see below)
     if (sz[2] > 1) {
       for (var z = 1; z < sz[2]; z++)
-        op(this.__dev, 'writeTexture', dest.texture.__id, dest.mipLevel || 0, o[0], o[1], o[2] + z, ASPECT[dest.aspect || 'all'], view, (layout.offset || 0) + z * (layout.rowsPerImage || sz[1]) * (layout.bytesPerRow || 0), layout.bytesPerRow || 0, layout.rowsPerImage || 0, sz[0], sz[1], 1);
+        op(this.__dev, 'writeTexture', dest.texture.__id, dest.mipLevel || 0, o[0], o[1], o[2] + z, ASPECT[dest.aspect || 'all'], view, (layout.offset || 0) + z * (layout.rowsPerImage || Math.ceil(sz[1] / (BLOCKS[dest.texture.format] ? BLOCKS[dest.texture.format][2] : 1))) * (layout.bytesPerRow || 0), layout.bytesPerRow || 0, layout.rowsPerImage || 0, sz[0], sz[1], 1);
     }
   });
   def(Q, 'copyExternalImageToTexture', function (src, dest, size) {

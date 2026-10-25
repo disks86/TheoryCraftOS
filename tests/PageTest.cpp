@@ -1140,6 +1140,32 @@ static void test_webgpu() {
         "0 128 255 255 mapped | unmapped | 0 6 14 | true true | canvas 255 128 0 255");
 }
 
+static void test_webgpu_compressed() {
+  CHECK(gl_script(
+            "navigator.gpu.requestAdapter().then(function (a) {"
+            " console.log(a.features.has('texture-compression-bc'), a.features.has('texture-compression-astc'));"
+            " return a.requestDevice({ requiredFeatures: ['no-such-feature'] }).catch(function (e) { console.log(e.name); return a.requestDevice({ requiredFeatures: ['texture-compression-bc', 'texture-compression-astc'] }); }); }).then(function (d) {"
+            " var t = d.createTexture({ size: [8, 8], format: 'bc1-rgba-unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });"
+            " var blk = new Uint8Array([0x00, 0xF8, 0x1F, 0x00, 0xE4, 0, 0, 0]);"
+            " var data = new Uint8Array(40); data.set(blk, 0); data.set(blk, 24);"
+            " d.queue.writeTexture({ texture: t, origin: [0, 0] }, data, { bytesPerRow: 24, rowsPerImage: 2 }, [8, 8]);"
+            " var cs = d.createShaderModule({ code: '@group(0) @binding(0) var t: texture_2d<f32>; @group(0) @binding(1) var<storage, read_write> o: array<f32>; @compute @workgroup_size(1) fn main() { let c = textureLoad(t, vec2<i32>(1, 0), 0); o[0] = c.r; o[1] = c.b; let e = textureLoad(t, vec2<i32>(7, 7), 0); o[2] = e.b; }' });"
+            " var p = d.createComputePipeline({ layout: 'auto', compute: { module: cs, entryPoint: 'main' } });"
+            " var sb = d.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });"
+            " var bg = d.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: t.createView() }, { binding: 1, resource: { buffer: sb } }] });"
+            " var rb = d.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });"
+            " var raw = d.createBuffer({ size: 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });"
+            " var e = d.createCommandEncoder(); var cp = e.beginComputePass(); cp.setPipeline(p); cp.setBindGroup(0, bg); cp.dispatchWorkgroups(1); cp.end();"
+            " e.copyBufferToBuffer(sb, 0, rb, 0, 16); e.copyTextureToBuffer({ texture: t }, { buffer: raw, bytesPerRow: 16 }, [8, 8]); d.queue.submit([e.finish()]);"
+            " return rb.mapAsync(GPUMapMode.READ).then(function () { var f = new Float32Array(rb.getMappedRange()); console.log(f[0], f[1], f[2]); return raw.mapAsync(GPUMapMode.READ); }).then(function () {"
+            "  var r = new Uint8Array(raw.getMappedRange()); console.log(r[0], r[2], r[17], r[24]);"
+            "  d.pushErrorScope('validation'); d.createTexture({ size: [8, 8], format: 'bc1-rgba-unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT }); d.createTexture({ size: [6, 8], format: 'astc-4x4-unorm', usage: GPUTextureUsage.TEXTURE_BINDING });"
+            "  return d.popErrorScope(); }).then(function (er) { console.log(er ? 'error' : 'none');"
+            "  return navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice(); }).then(function (plain) { plain.pushErrorScope('validation'); plain.createTexture({ size: [8, 8], format: 'bc7-rgba-unorm', usage: GPUTextureUsage.TEXTURE_BINDING }); return plain.popErrorScope(); }).then(function (er2) { console.log(er2 ? 'needs feature' : 'no check'); }); });"
+            "}).catch(function (e) { console.log('ERR', e && e.message); });") ==
+        "true true | TypeError | 0 1 0 | 0 31 248 0 | error | needs feature");
+}
+
 static void test_webgpu_mapping() {
   CHECK(gl_script(
             "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice(); }).then(function (d) {"
@@ -5857,6 +5883,7 @@ int main(int argc, char** argv) {
     test_webgl();
     test_webgpu();
   test_webgpu_mapping();
+  test_webgpu_compressed();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();
@@ -5908,6 +5935,7 @@ int main(int argc, char** argv) {
   test_webgl();
   test_webgpu();
   test_webgpu_mapping();
+  test_webgpu_compressed();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();

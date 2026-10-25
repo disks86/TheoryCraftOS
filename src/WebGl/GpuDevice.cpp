@@ -18,6 +18,7 @@
 
 // The WebGPU device (see GpuDevice.hpp): resources, copies, pipelines, bindings and compute. Drawing is in GpuRender.cpp.
 #include "WebGl/GpuDevice.hpp"
+#include "WebGl/GlCompressed.hpp"
 #include "WebGl/GlPixels.hpp"
 
 namespace wgpu {
@@ -46,6 +47,49 @@ const FormatDesc kFormats[] = {
     {"rgba32float", 0x8814, false, 4, 10, 16, false, false}, {"stencil8", 0x8D48, false, 1, 11, 1, false, true}, {"depth16unorm", 0x81A5, false, 1, 4, 2, true, false},
     {"depth24plus", 0x81A6, false, 1, 4, 0, true, false}, {"depth24plus-stencil8", 0x88F0, false, 1, 11, 0, true, true}, {"depth32float", 0x8CAC, false, 1, 10, 4, true, false},
     {"depth32float-stencil8", 0x8CAD, false, 1, 10, 4, true, true},
+    // block compressed (the texture-compression-bc and -astc features)
+    {"bc1-rgba-unorm", 0x8058, false, 4, 0, 0, false, false, 4, 4, 8, 0x83F1},
+    {"bc1-rgba-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 4, 4, 8, 0x8C4D},
+    {"bc2-rgba-unorm", 0x8058, false, 4, 0, 0, false, false, 4, 4, 16, 0x83F2},
+    {"bc2-rgba-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 4, 4, 16, 0x8C4E},
+    {"bc3-rgba-unorm", 0x8058, false, 4, 0, 0, false, false, 4, 4, 16, 0x83F3},
+    {"bc3-rgba-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 4, 4, 16, 0x8C4F},
+    {"bc4-r-unorm", 0x8229, false, 4, 0, 0, false, false, 4, 4, 8, 0x8DBB},
+    {"bc4-r-snorm", 0x8F94, false, 4, 0, 0, false, false, 4, 4, 8, 0x8DBC},
+    {"bc5-rg-unorm", 0x822B, false, 4, 0, 0, false, false, 4, 4, 16, 0x8DBD},
+    {"bc5-rg-snorm", 0x8F95, false, 4, 0, 0, false, false, 4, 4, 16, 0x8DBE},
+    {"bc6h-rgb-ufloat", 0x8814, false, 4, 0, 0, false, false, 4, 4, 16, 0x8E8F},
+    {"bc6h-rgb-float", 0x8814, false, 4, 0, 0, false, false, 4, 4, 16, 0x8E8E},
+    {"bc7-rgba-unorm", 0x8058, false, 4, 0, 0, false, false, 4, 4, 16, 0x8E8C},
+    {"bc7-rgba-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 4, 4, 16, 0x8E8D},
+    {"astc-4x4-unorm", 0x8058, false, 4, 0, 0, false, false, 4, 4, 16, 0x93B0},
+    {"astc-4x4-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 4, 4, 16, 0x93D0},
+    {"astc-5x4-unorm", 0x8058, false, 4, 0, 0, false, false, 5, 4, 16, 0x93B1},
+    {"astc-5x4-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 5, 4, 16, 0x93D1},
+    {"astc-5x5-unorm", 0x8058, false, 4, 0, 0, false, false, 5, 5, 16, 0x93B2},
+    {"astc-5x5-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 5, 5, 16, 0x93D2},
+    {"astc-6x5-unorm", 0x8058, false, 4, 0, 0, false, false, 6, 5, 16, 0x93B3},
+    {"astc-6x5-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 6, 5, 16, 0x93D3},
+    {"astc-6x6-unorm", 0x8058, false, 4, 0, 0, false, false, 6, 6, 16, 0x93B4},
+    {"astc-6x6-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 6, 6, 16, 0x93D4},
+    {"astc-8x5-unorm", 0x8058, false, 4, 0, 0, false, false, 8, 5, 16, 0x93B5},
+    {"astc-8x5-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 8, 5, 16, 0x93D5},
+    {"astc-8x6-unorm", 0x8058, false, 4, 0, 0, false, false, 8, 6, 16, 0x93B6},
+    {"astc-8x6-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 8, 6, 16, 0x93D6},
+    {"astc-8x8-unorm", 0x8058, false, 4, 0, 0, false, false, 8, 8, 16, 0x93B7},
+    {"astc-8x8-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 8, 8, 16, 0x93D7},
+    {"astc-10x5-unorm", 0x8058, false, 4, 0, 0, false, false, 10, 5, 16, 0x93B8},
+    {"astc-10x5-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 10, 5, 16, 0x93D8},
+    {"astc-10x6-unorm", 0x8058, false, 4, 0, 0, false, false, 10, 6, 16, 0x93B9},
+    {"astc-10x6-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 10, 6, 16, 0x93D9},
+    {"astc-10x8-unorm", 0x8058, false, 4, 0, 0, false, false, 10, 8, 16, 0x93BA},
+    {"astc-10x8-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 10, 8, 16, 0x93DA},
+    {"astc-10x10-unorm", 0x8058, false, 4, 0, 0, false, false, 10, 10, 16, 0x93BB},
+    {"astc-10x10-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 10, 10, 16, 0x93DB},
+    {"astc-12x10-unorm", 0x8058, false, 4, 0, 0, false, false, 12, 10, 16, 0x93BC},
+    {"astc-12x10-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 12, 10, 16, 0x93DC},
+    {"astc-12x12-unorm", 0x8058, false, 4, 0, 0, false, false, 12, 12, 16, 0x93BD},
+    {"astc-12x12-unorm-srgb", 0x8C43, false, 4, 0, 0, false, false, 12, 12, 16, 0x93DD},
 };
 
 const char* const kVertexNames[] = {"uint8x2", "uint8x4", "sint8x2", "sint8x4", "unorm8x2", "unorm8x4", "snorm8x2", "snorm8x4", "uint16x2", "uint16x4", "sint16x2", "sint16x4",
@@ -238,6 +282,10 @@ uint32_t Device::create_texture(uint32_t w, uint32_t h, uint32_t depth, uint32_t
   if (!format || w == 0 || h == 0 || depth == 0 || mips == 0 || w > 8192 || h > 8192 || depth > 2048) { fail("bad texture size"); return 0; }
   const webgl::FormatInfo* fi = webgl::find_format(format->gl);
   if (!fi) { fail("unsupported format"); return 0; }
+  if (format->block_bytes) {
+    if (w % format->bw || h % format->bh) { fail("the size of a compressed texture must be a multiple of its block size"); return 0; }
+    if (samples > 1 || dimension != 1 || (usage & (0x10 | 0x8))) { fail("a compressed texture is a 2d, single sampled, sampled-only texture"); return 0; }
+  }
   UniquePointer<Texture> t = UniquePointer<Texture>::make(a_, a_);
   if (!t) { fail("out of memory"); return 0; }
   t->format = format;
@@ -250,6 +298,12 @@ uint32_t Device::create_texture(uint32_t w, uint32_t h, uint32_t depth, uint32_t
     total += uint64_t{lw} * lh * ld * 16 * ss * ss;
     if (total > (512ull << 20) || !im || !im->allocate(fi, lw * ss, lh * ss, ld)) { fail("out of memory"); return 0; }
     im->ss = ss;
+    if (format->block_bytes) {
+      UniquePointer<ByteBuffer> rb = UniquePointer<ByteBuffer>::make(a_, a_);
+      const uint64_t bytes = uint64_t{(lw + format->bw - 1) / format->bw} * ((lh + format->bh - 1) / format->bh) * ld * format->block_bytes;
+      if (!rb || !rb->put_zeros(bytes)) { fail("out of memory"); return 0; }
+      t->raw.push_back(static_cast<UniquePointer<ByteBuffer>&&>(rb));
+    }
     if (fi->store == webgl::Store::Depth || fi->store == webgl::Store::DepthStencil) {   // depth starts at zero, as does everything else
     }
     t->mips.push_back(static_cast<UniquePointer<Image>&&>(im));
@@ -481,10 +535,62 @@ bool Device::clear_buffer(uint32_t id, uint64_t offset, uint64_t size) {
   return true;
 }
 
+bool Device::block_copy_ok(const Image& img, const FormatDesc& fd, const ImageCopy& t, uint32_t w, uint32_t h) {
+  if (t.aspect != 0) return fail("a compressed texture has only the color aspect");
+  if (t.x % fd.bw || t.y % fd.bh || (w % fd.bw && t.x + w != img.w) || (h % fd.bh && t.y + h != img.h)) return fail("the copy is not aligned to the blocks of the format");
+  return true;
+}
+
+bool Device::write_blocks(const ImageCopy& dst, ConstByteView data, const BufferLayout& layout, uint32_t w, uint32_t h, uint32_t d) {
+  Image* img;
+  const FormatDesc* fd;
+  if (!texture_copy(dst, w, h, d, &img, &fd) || !block_copy_ok(*img, *fd, dst, w, h)) return false;
+  Texture* tx = texture_mut(dst.texture);
+  const webgl::CompressedFormat* cf = webgl::find_compressed(fd->cgl);
+  if (!cf) return fail("unsupported format");
+  const uint32_t nbx = (w + fd->bw - 1) / fd->bw, nby = (h + fd->bh - 1) / fd->bh, mbx = (img->w + fd->bw - 1) / fd->bw, mby = (img->h + fd->bh - 1) / fd->bh;
+  const uint64_t line = uint64_t{nbx} * fd->block_bytes;
+  const uint64_t row = layout.bytes_per_row ? layout.bytes_per_row : line;
+  const uint64_t rows = layout.rows_per_image ? layout.rows_per_image : nby;
+  if (row < line || rows < nby) return fail("the layout is smaller than the copy");
+  ByteView raw = tx->raw[dst.mip]->writable_view();
+  for (uint32_t z = 0; z < d; ++z)
+    for (uint32_t by = 0; by < nby; ++by) {
+      const uint64_t at = layout.offset + (uint64_t{z} * rows + by) * row;
+      if (at > data.size() || line > data.size() - at) return fail("data too small");
+      const ConstByteView src = data.subview(at, line);
+      webgl::decode_compressed(*cf, src, nbx * fd->bw, fd->bh, 1, img, dst.x, dst.y + by * fd->bh, dst.z + z);
+      raw.subview(((uint64_t{dst.z + z} * mby + dst.y / fd->bh + by) * mbx + dst.x / fd->bw) * fd->block_bytes, line).copy_from(src);
+    }
+  return true;
+}
+
+bool Device::read_blocks(const ImageCopy& src, Buffer* dst, const BufferLayout& layout, uint32_t w, uint32_t h, uint32_t d) {
+  Image* img;
+  const FormatDesc* fd;
+  if (!texture_copy(src, w, h, d, &img, &fd) || !block_copy_ok(*img, *fd, src, w, h)) return false;
+  const Texture* tx = texture(src.texture);
+  const uint32_t nbx = (w + fd->bw - 1) / fd->bw, nby = (h + fd->bh - 1) / fd->bh, mbx = (img->w + fd->bw - 1) / fd->bw, mby = (img->h + fd->bh - 1) / fd->bh;
+  const uint64_t line = uint64_t{nbx} * fd->block_bytes;
+  const uint64_t row = layout.bytes_per_row ? layout.bytes_per_row : line;
+  const uint64_t rows = layout.rows_per_image ? layout.rows_per_image : nby;
+  if (row < line || rows < nby) return fail("the layout is smaller than the copy");
+  ConstByteView raw = tx->raw[src.mip]->view();
+  ByteView out = dst->data.writable_view();
+  for (uint32_t z = 0; z < d; ++z)
+    for (uint32_t by = 0; by < nby; ++by) {
+      const uint64_t at = layout.offset + (uint64_t{z} * rows + by) * row;
+      if (at > out.size() || line > out.size() - at) return fail("buffer too small");
+      out.subview(at, line).copy_from(raw.subview(((uint64_t{src.z + z} * mby + src.y / fd->bh + by) * mbx + src.x / fd->bw) * fd->block_bytes, line));
+    }
+  return true;
+}
+
 bool Device::write_texture(const ImageCopy& dst, ConstByteView data, const BufferLayout& layout, uint32_t w, uint32_t h, uint32_t d) {
   Image* img;
   const FormatDesc* fd;
   if (!texture_copy(dst, w, h, d, &img, &fd)) return false;
+  if (fd->block_bytes) return write_blocks(dst, data, layout, w, h, d);
   const uint32_t bpp = texel_copy_bytes(*fd, dst.aspect);
   if (!bpp) return fail("this format cannot be written from memory");
   const uint64_t row = layout.bytes_per_row ? layout.bytes_per_row : uint64_t{w} * bpp;
@@ -510,6 +616,7 @@ bool Device::copy_texture_to_buffer(const ImageCopy& src, uint32_t id, const Buf
   const FormatDesc* fd;
   if (!b || b->destroyed) return fail("buffer is destroyed");
   if (!texture_copy(src, w, h, d, &img, &fd)) return false;
+  if (fd->block_bytes) return read_blocks(src, b, layout, w, h, d);
   const uint32_t bpp = texel_copy_bytes(*fd, src.aspect);
   if (!bpp) return fail("this format cannot be read back");
   const uint64_t row = layout.bytes_per_row ? layout.bytes_per_row : uint64_t{w} * bpp;
@@ -528,7 +635,24 @@ bool Device::copy_texture_to_texture(const ImageCopy& src, const ImageCopy& dst,
   Image *si, *di;
   const FormatDesc *sf, *df;
   if (!texture_copy(src, w, h, d, &si, &sf) || !texture_copy(dst, w, h, d, &di, &df)) return false;
-  if (si->info != di->info) return fail("formats differ");
+  if (si->info != di->info || sf != df) return fail("formats differ");
+  if (sf->block_bytes) {
+    if (!block_copy_ok(*si, *sf, src, w, h) || !block_copy_ok(*di, *df, dst, w, h)) return false;
+    const Texture* st = texture(src.texture);
+    Texture* dt = texture_mut(dst.texture);
+    const uint32_t nbx = (w + sf->bw - 1) / sf->bw, nby = (h + sf->bh - 1) / sf->bh;
+    const uint32_t sbx = (si->w + sf->bw - 1) / sf->bw, sby = (si->h + sf->bh - 1) / sf->bh, dbx = (di->w + sf->bw - 1) / sf->bw, dby = (di->h + sf->bh - 1) / sf->bh;
+    const uint64_t line = uint64_t{nbx} * sf->block_bytes;
+    const webgl::CompressedFormat* cf = webgl::find_compressed(sf->cgl);
+    if (!cf) return fail("unsupported format");
+    for (uint32_t z = 0; z < d; ++z)
+      for (uint32_t by = 0; by < nby; ++by) {
+        const ConstByteView from = st->raw[src.mip]->view().subview(((uint64_t{src.z + z} * sby + src.y / sf->bh + by) * sbx + src.x / sf->bw) * sf->block_bytes, line);
+        dt->raw[dst.mip]->writable_view().subview(((uint64_t{dst.z + z} * dby + dst.y / sf->bh + by) * dbx + dst.x / sf->bw) * sf->block_bytes, line).copy_from(from);
+        webgl::decode_compressed(*cf, from, nbx * sf->bw, sf->bh, 1, di, dst.x, dst.y + by * sf->bh, dst.z + z);
+      }
+    return true;
+  }
   for (uint32_t z = 0; z < d; ++z)
     for (uint32_t y = 0; y < h; ++y)
       for (uint32_t x = 0; x < w; ++x) {
