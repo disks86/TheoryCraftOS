@@ -100,6 +100,7 @@ class SelectorSet::Reader {
   bool ident() {
     scratch_.clear();
     bool any = false;
+    if (pos_ < text_.size() && (is_digit(text_[pos_]) || (text_[pos_] == '-' && pos_ + 1 < text_.size() && is_digit(text_[pos_ + 1])))) return false;   // (an identifier does not start with a digit)
     while (pos_ < text_.size() && is_ident_char(text_[pos_])) {
       char c = text_[pos_];
       if (c == '\\') {
@@ -464,6 +465,8 @@ class SelectorSet::Reader {
       }
       if (n.equals("not") || n.equals("is") || n.equals("where") || n.equals("matches") || n.equals("-webkit-any") || n.equals("-moz-any") || n.equals("has") || n.equals("host")) {
         const bool has = n.equals("has");
+        skip_space();
+        if (cur() == ')' && (has || n.equals("not"))) return false;   // (an empty :not() or :has() is a syntax error)
         t->kind = n.equals("not") ? TestKind::Not : has ? TestKind::Has : n.equals("host") ? TestKind::HostIs : TestKind::Is;
         // the specificity inside counts (the most specific), except for :where()
         const uint64_t selectors_before = set_.selectors_.count();
@@ -485,7 +488,38 @@ class SelectorSet::Reader {
         if (count == 0 && !n.equals("not")) *applies = false;   // an empty :is() matches nothing
         return true;
       }
-      // :lang(), :dir() and other functional states: never match
+      if (n.equals("lang")) {   // :lang(range, "range", ...): the language of the element (its own lang attribute or the nearest ancestor's) is one of them
+        String ranges(set_.alloc_);
+        for (;;) {
+          skip_space();
+          if (cur() == '"' || cur() == '\'') {
+            const char q = text_[pos_++];
+            while (!end() && cur() != q) ranges.push_back(text_[pos_++]);
+            if (end()) return false;
+            ++pos_;
+          } else if (cur() == '*' || ident()) {
+            if (cur() == '*') { ranges.push_back('*'); ++pos_; }
+            else ranges.append(scratch_.view());
+          } else {
+            return false;
+          }
+          skip_space();
+          if (cur() == ',') {
+            ranges.push_back('\n');
+            ++pos_;
+            continue;
+          }
+          break;
+        }
+        if (cur() != ')') return false;
+        ++pos_;
+        t->kind = TestKind::Lang;
+        if (!keep(ranges.view(), &t->value_offset)) return false;
+        t->value_length = static_cast<uint32_t>(ranges.size());
+        return true;
+      }
+      // :dir(), :state(), :host-context() and the other functional states that need a page's own state: never match
+      if (!(n.equals("dir") || n.equals("state") || n.equals("host-context") || n.equals("current") || n.equals("past") || n.equals("future") || n.equals("nth-col") || n.equals("nth-last-col"))) unknown_pseudo_ = true;
       skip_parens_body();
       *applies = false;
       return true;
@@ -520,7 +554,15 @@ class SelectorSet::Reader {
       *specificity -= 99;
     } else if (n.equals("hover")) t->kind = TestKind::Hover;
     else if (n.equals("active")) t->kind = TestKind::Active;
-    else *applies = false;   // visited, target, first-line and the rest: states a page being read does not have
+    else {   // visited, target, first-line and the rest: states a page being read does not have
+      static const char* const kInert[] = {"visited", "target", "target-within", "first-line", "first-letter", "indeterminate", "default", "in-range", "out-of-range", "user-valid", "user-invalid", "defined",
+                                           "paused", "playing", "popover-open", "modal", "open", "closed", "autofill", "-webkit-autofill", "blank", "local-link", "picture-in-picture", "seeking", "stalled",
+                                           "buffering", "muted", "volume-locked", "current", "past", "future", "active-view-transition", "scope-root", "has-slotted", "xr-overlay", "left", "right", "first", "root-like", "selection"};
+      bool known = false;
+      for (const char* k : kInert) known = known || n.equals(k);
+      if (!known) unknown_pseudo_ = true;
+      *applies = false;
+    }
     return true;
   }
 
@@ -552,6 +594,9 @@ class SelectorSet::Reader {
   String scratch_;
   uint64_t pos_ = 0;
   bool oom_ = false, universal_ = false;
+public:
+  bool unknown_pseudo_ = false;   // a pseudo-class that is none of the ones known (a stylesheet skips the rule; the selector API reports a syntax error)
+private:
   List<Test> local_{set_.alloc_};
 };
 
@@ -560,6 +605,7 @@ bool SelectorSet::parse(StringView text, uint32_t tag, uint32_t* added, bool for
   bool syntax = true;
   const uint64_t before = tops_.count();
   const bool ok = reader.top(added, &syntax, forgiving);
+  if (!forgiving && reader.unknown_pseudo_) return false;
   if (text.contains(":host"))
     for (uint64_t i = before; i < tops_.count(); ++i) selectors_[tops_[i]].host = true;
   return ok && syntax;
@@ -731,6 +777,22 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
       return false;
     }
     case TestKind::Never: return false;
+    case TestKind::Lang: {
+      StringView lang;
+      bool found = false;
+      for (const Node* e = node; e && e->is_element() && !found; e = e->parent) found = get_attribute(e, "lang", &lang) || get_attribute(e, "xml:lang", &lang);
+      if (!found) return false;
+      const StringView ranges = text(t.value_offset, t.value_length);
+      uint64_t from = 0;
+      while (from <= ranges.size()) {
+        uint64_t to = from;
+        while (to < ranges.size() && ranges[to] != '\n') ++to;
+        const StringView r = ranges.substr(from, to - from);
+        if (r.equals("*") ? !lang.empty() : (equals_fold(lang, r) || (lang.size() > r.size() && lang[r.size()] == '-' && equals_fold(lang.first(r.size()), r)))) return true;
+        from = to + 1;
+      }
+      return false;
+    }
   }
   return false;
 }
