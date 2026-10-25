@@ -320,7 +320,7 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
     var n = arguments.length;
     if (n === 6) { CALL(this, 'texImage', target, level, internal, 0, 0, 1, 0, a, b, c, false); return; }   // (format, type, source)
     if (n < 9) throw new TypeError("Failed to execute 'texImage2D' on 'WebGLRenderingContext': Overload resolution failed.");
-    var pixels = f === undefined ? null : (typeof f === 'number' ? null : f);
+    var pixels = f === undefined ? null : f;   // (a number is an offset into the pixel unpack buffer)
     if (gg !== undefined && pixels && pixels.buffer) pixels = viewAt(pixels, gg);
     CALL(this, 'texImage', target, level, internal, a, b, 1, c, d, e, pixels, false);   // (width, height, border, format, type, pixels)
   });
@@ -592,8 +592,7 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
   m1('readPixels', function (x, y, w, h, format, type, pixels, dstOffset) {
     if (this.__lost) return;
     if (pixels === null || pixels === undefined) { this.__err(0x502); return; }
-    if (typeof pixels === 'number') { this.__err(0x502); return; }
-    if (dstOffset) pixels = viewAt(pixels, dstOffset);
+    if (dstOffset && typeof pixels !== 'number') pixels = viewAt(pixels, dstOffset);
     __gl_present(this.__id);
     CALL(this, 'readPixels', x, y, w, h, format, type, pixels);
   });

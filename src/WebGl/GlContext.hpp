@@ -297,6 +297,9 @@ class GlContext final : public shader::ITextureHost {
   bool get_buffer_sub_data(uint32_t target, uint64_t offset, ByteView out);
   void copy_buffer_sub_data(uint32_t read_target, uint32_t write_target, uint64_t ro, uint64_t wo, uint64_t size);
   uint32_t bound_buffer(uint32_t target) const;
+  // The bytes of the buffer bound to PIXEL_UNPACK_BUFFER from `offset` on / of PIXEL_PACK_BUFFER (false if none is bound or the offset is past its end).
+  bool pixel_unpack_view(uint64_t offset, ConstByteView* out);
+  bool pixel_pack_view(uint64_t offset, ByteView* out);
   uint64_t buffer_size(uint32_t id) const;
   uint32_t buffer_usage(uint32_t id) const;
 

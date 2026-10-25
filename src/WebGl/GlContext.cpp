@@ -336,6 +336,20 @@ void GlContext::copy_buffer_sub_data(uint32_t rt, uint32_t wt, uint64_t ro, uint
   if (size) w->data.writable_view().subview(wo, size).copy_from(r->data.view().subview(ro, size));
 }
 
+bool GlContext::pixel_unpack_view(uint64_t offset, ConstByteView* out) {
+  Buffer* b = buffer_at(pixel_unpack_);
+  if (!b || offset > b->data.size()) return false;
+  *out = b->data.view().subview(offset);
+  return true;
+}
+
+bool GlContext::pixel_pack_view(uint64_t offset, ByteView* out) {
+  Buffer* b = buffer_at(pixel_pack_);
+  if (!b || offset > b->data.size()) return false;
+  *out = b->data.writable_view().subview(offset);
+  return true;
+}
+
 uint64_t GlContext::buffer_size(uint32_t id) const { return buffer_at(id) ? buffer_at(id)->data.size() : 0; }
 uint32_t GlContext::buffer_usage(uint32_t id) const { return buffer_at(id) ? buffer_at(id)->usage : 0; }
 

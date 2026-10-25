@@ -105,6 +105,7 @@ struct Args {
     const double d = num(i);
     return d <= 0 ? 0 : (d >= 4294967295.0 ? 0xFFFFFFFFu : static_cast<uint32_t>(d));
   }
+  uint64_t u64(uint32_t i) const { const double d = num(i); return d <= 0 ? 0 : static_cast<uint64_t>(d); }
   int32_t i32(uint32_t i) const {
     const double d = num(i);
     return d <= -2147483648.0 ? INT32_MIN : (d >= 2147483647.0 ? INT32_MAX : static_cast<int32_t>(d));
@@ -341,8 +342,14 @@ NATIVE(gl_call) {
       uint32_t w = a.u32(3), h = a.u32(4);
       ConstByteView bytes;
       List<uint8_t> store(vm.allocator());
-      bool from_source;
-      const bool has = make_pixels_arg(vm, a, 9, &bytes, &store, &w, &h, &from_source);
+      bool from_source = false;
+      bool has;
+      if (a.at(9).is_number() || (gl.bound_buffer(0x88EC) && !a.at(9).is_nullish())) {   // an offset into the pixel unpack buffer
+        has = a.at(9).is_number() && gl.pixel_unpack_view(a.u64(9), &bytes);
+        if (!has) { gl.set_error(0x502); break; }
+      } else {
+        has = make_pixels_arg(vm, a, 9, &bytes, &store, &w, &h, &from_source);
+      }
       const uint32_t format = from_source ? 0x1908 : a.u32(7), type = from_source ? 0x1401 : a.u32(8);
       gl.tex_image(a.u32(0), a.i32(1), a.u32(2), w, h, a.u32(5), a.i32(6), format, type, bytes, has, a.flag(10));
       break;
@@ -352,8 +359,10 @@ NATIVE(gl_call) {
       uint32_t w = a.u32(5), h = a.u32(6);
       ConstByteView bytes;
       List<uint8_t> store(vm.allocator());
-      bool from_source;
-      if (!make_pixels_arg(vm, a, 10, &bytes, &store, &w, &h, &from_source)) { gl.set_error(0x501); break; }
+      bool from_source = false;
+      if (a.at(10).is_number() || (gl.bound_buffer(0x88EC) && !a.at(10).is_nullish())) {
+        if (!a.at(10).is_number() || !gl.pixel_unpack_view(a.u64(10), &bytes)) { gl.set_error(0x502); break; }
+      } else if (!make_pixels_arg(vm, a, 10, &bytes, &store, &w, &h, &from_source)) { gl.set_error(0x501); break; }
       const uint32_t format = from_source ? 0x1908 : a.u32(8), type = from_source ? 0x1401 : a.u32(9);
       gl.tex_sub_image(a.u32(0), a.i32(1), a.i32(2), a.i32(3), a.i32(4), w, h, a.u32(7), format, type, bytes, a.flag(11));
       break;
@@ -616,7 +625,13 @@ NATIVE(gl_call) {
     case op_drawRangeElements: gl.draw_range_elements(a.u32(0), a.u32(1), a.u32(2), a.i32(3), a.u32(4), static_cast<uint64_t>(a.num(5))); touches_screen = true; break;
     case op_readPixels: {
       ArrayView<uint8_t> raw;
-      if (!a.bytes(6, &raw)) { gl.set_error(0x502); break; }
+      if (a.at(6).is_number()) {   // an offset into the pixel pack buffer
+        ByteView into;
+        if (!gl.pixel_pack_view(a.u64(6), &into)) { gl.set_error(0x502); break; }
+        gl.read_pixels(a.i32(0), a.i32(1), a.u32(2), a.u32(3), a.u32(4), a.u32(5), into);
+        break;
+      }
+      if (gl.bound_buffer(0x88EB) || !a.bytes(6, &raw)) { gl.set_error(0x502); break; }
       gl.read_pixels(a.i32(0), a.i32(1), a.u32(2), a.u32(3), a.u32(4), a.u32(5), ByteView(raw.data(), raw.size()));
       break;
     }
