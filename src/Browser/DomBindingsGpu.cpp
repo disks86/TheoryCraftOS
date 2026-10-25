@@ -96,7 +96,7 @@ double item_num(JsObject* a, uint32_t i, double def = 0) {
 #define GPU_OPS(X)                                                                                                                                              \
   X(createBuffer) X(destroyBuffer) X(writeBuffer) X(readBuffer) X(createTexture) X(destroyTexture) X(createView) X(createSampler) X(createShaderModule)         \
   X(createBindGroupLayout) X(createPipelineLayout) X(createBindGroup) X(createRenderPipeline) X(createComputePipeline) X(getBindGroupLayout)                    \
-  X(createQuerySet) X(submit) X(writeTexture) X(copyExternal) X(readQuery) X(lastError) X(bufferSize)
+  X(createQuerySet) X(submit) X(writeTexture) X(copyExternal) X(readQuery) X(lastError) X(bufferSize) X(detach)
 
 enum Op : uint32_t {
 #define X(name) op_##name,
@@ -584,6 +584,10 @@ NATIVE(gpu_call) {
     case op_lastError: {
       *result = str_value(vm, d->error.view());
       d->error.clear();
+      break;
+    }
+    case op_detach: {   // an ArrayBuffer that was a mapped range: it has no bytes any more
+      if (a.at(0).is_object()) script::detach_array_buffer(a.at(0).as_object());
       break;
     }
     case op_bufferSize: *result = num_value(static_cast<double>(d->buffer_size(a.u32(0)))); break;

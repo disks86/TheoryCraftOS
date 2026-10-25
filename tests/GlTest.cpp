@@ -400,7 +400,44 @@ static void test_cube_seams() {
   CHECK(a.live == 0);
 }
 
+static void test_wide_lines() {
+  TestAllocator a;
+  {
+    GlContext gl(a, false, 16, 16, noaa());
+    const uint32_t prog = make_program(gl, "attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }", "void main() { gl_FragColor = vec4(1.0); }");
+    gl.use_program(prog);
+    const float verts[] = {-1, 0, 1, 0};   // across the middle
+    const uint32_t vb = gl.create_buffer();
+    gl.bind_buffer(0x8892, vb);
+    gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(verts), sizeof(verts)), 0, 0x88E4);
+    gl.enable_vertex_attrib(0, true);
+    gl.vertex_attrib_pointer(0, 2, 0x1406, false, 0, 0, false);
+    auto rows_lit = [&]() {
+      int n = 0;
+      for (int y = 0; y < 16; ++y) n += (pixel(gl, 8, y) & 255) == 255;
+      return n;
+    };
+    gl.clear_color(0, 0, 0, 0);
+    gl.clear(0x4000);
+    gl.draw_arrays(1, 0, 2, 1);
+    CHECK(rows_lit() == 1);
+    gl.clear(0x4000);
+    gl.line_width(5);
+    gl.draw_arrays(1, 0, 2, 1);
+    const int n = rows_lit();
+    CHECK(n >= 4 && n <= 6);
+    gl.line_width(0);
+    CHECK(gl.get_error() == 0x501);
+    double range[2];
+    uint32_t cnt;
+    gl.get_integer(0x846E, range, &cnt);
+    CHECK(range[1] >= 5);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_wide_lines();
   test_cube_seams();
   test_default_antialias();
   test_multisample();

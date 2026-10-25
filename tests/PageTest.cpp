@@ -1140,6 +1140,24 @@ static void test_webgpu() {
         "0 128 255 255 mapped | unmapped | 0 6 14 | true true | canvas 255 128 0 255");
 }
 
+static void test_webgpu_mapping() {
+  CHECK(gl_script(
+            "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice(); }).then(function (d) {"
+            " var b = d.createBuffer({ size: 32, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, mappedAtCreation: true });"
+            " console.log(b.mapState);"
+            " var r = b.getMappedRange(8, 8); new Uint8Array(r).fill(7);"
+            " function err(f) { try { f(); return 'no'; } catch (e) { return e.name; } }"
+            " console.log(err(function () { b.getMappedRange(12, 4); }), err(function () { b.getMappedRange(0, 12); }), err(function () { b.getMappedRange(0, 4); }), err(function () { b.getMappedRange(40, 4); }));"
+            " b.unmap(); console.log(b.mapState, r.byteLength, err(function () { b.getMappedRange(); }));"
+            " return b.mapAsync(GPUMapMode.WRITE).catch(function (e) { console.log('wrong usage', e.name);"
+            "  return b.mapAsync(GPUMapMode.READ, 3); }).catch(function (e) { console.log('misaligned', e.name);"
+            "  return b.mapAsync(GPUMapMode.READ, 8, 16); }).then(function () { var v = new Uint8Array(b.getMappedRange(8, 16)); console.log(b.mapState, v[0], v[7], v[8]); b.unmap();"
+            "  var p = b.mapAsync(GPUMapMode.READ); var again = b.mapAsync(GPUMapMode.READ); b.unmap();"
+            "  return Promise.all([p.then(function () { return 'ok'; }, function (e) { return e.name; }), again.then(function () { return 'ok'; }, function (e) { return e.name; })]); })"
+            "  .then(function (r) { console.log(r.join(',')); }); }).catch(function (e) { console.log('ERR', e && e.message); });") ==
+        "mapped | OperationError OperationError no OperationError | unmapped 0 OperationError | wrong usage OperationError | misaligned OperationError | mapped 7 7 0 | AbortError,OperationError");
+}
+
 static void test_canvas_scripts() {
   std::string shown;
   // the element, the context and the state
@@ -5793,6 +5811,7 @@ int main(int argc, char** argv) {
   if (getenv("ONLY_GL")) {   // (just the WebGL and WebGPU tests)
     test_webgl();
     test_webgpu();
+  test_webgpu_mapping();
     printf(g_failed ? "%d check(s) failed\n" : "webgl and webgpu tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -5840,6 +5859,7 @@ int main(int argc, char** argv) {
   test_canvas_scripts();
   test_webgl();
   test_webgpu();
+  test_webgpu_mapping();
   test_video();
   test_audio();
   test_media_api();
