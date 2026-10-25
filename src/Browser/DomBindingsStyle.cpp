@@ -1046,10 +1046,7 @@ bool dataset_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   String attribute(vm.allocator());
   data_attribute(k, &attribute);
   StringView v;
-  if (!dom::get_attribute(data_node(o), attribute.view(), &v)) {
-    *out = Value();
-    return true;   // (undefined, and not a property of Object either)
-  }
+  if (!dom::get_attribute(data_node(o), attribute.view(), &v)) return false;   // (no such data attribute: the prototype chain answers, so `in` is false and undefined comes out)
   *out = str_value(vm, v);
   return true;
 }
@@ -1057,6 +1054,12 @@ bool dataset_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
 HostClass::Set dataset_set(Vm& vm, JsObject* o, JsString* key, const Value& value) {
   const StringView k = key->view();
   if (k.empty() || (k.size() > 1 && k[0] == '_' && k[1] == '_')) return HostClass::Set::NotHandled;
+  for (uint64_t i = 0; i + 1 < k.size(); ++i) {   // (a name with a hyphen before a lower case letter would not survive the round trip)
+    if (k[i] == '-' && k[i + 1] >= 'a' && k[i + 1] <= 'z') {
+      throw_dom(vm, "SyntaxError", "The property name contains a hyphen followed by a lower case letter.");
+      return HostClass::Set::Threw;
+    }
+  }
   String attribute(vm.allocator()), text(vm.allocator());
   data_attribute(k, &attribute);
   if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;

@@ -7648,22 +7648,51 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     ('Atomic AutoComplete Busy Checked ColCount ColIndex ColSpan Current Description Disabled Expanded HasPopup Hidden Invalid KeyShortcuts Label Level Live Modal MultiLine MultiSelectable Orientation Placeholder PosInSet Pressed ReadOnly Relevant Required RoleDescription RowCount RowIndex RowSpan Selected SetSize Sort ValueMax ValueMin ValueNow ValueText').split(' ').forEach(function (n) {
       reflectString('aria' + n, 'aria-' + n.toLowerCase());
     });
-    // part: a list of tokens over the attribute
-    var PartList = klass('DOMTokenList', null);
-    var tokens = function (el) { var v = el.getAttribute('part'); return v ? v.split(/\s+/).filter(Boolean) : []; };
-    put('part', function () {
-      var el = this, list = Object.create(PartList.prototype);
-      defineGetter(list, 'length', function () { return tokens(el).length; });
-      defineGetter(list, 'value', function () { return tokens(el).join(' '); }, function (v) { el.setAttribute('part', String(v)); });
-      list.item = function (i) { var t = tokens(el); return i < t.length ? t[i] : null; };
-      list.contains = function (t) { return tokens(el).indexOf(String(t)) >= 0; };
-      list.add = function () { var t = tokens(el); for (var i = 0; i < arguments.length; i++) if (t.indexOf(String(arguments[i])) < 0) t.push(String(arguments[i])); el.setAttribute('part', t.join(' ')); };
-      list.remove = function () { var t = tokens(el), r = Array.prototype.map.call(arguments, String); el.setAttribute('part', t.filter(function (x) { return r.indexOf(x) < 0; }).join(' ')); };
-      list.toggle = function (t, force) { t = String(t); var has = list.contains(t); if (force === undefined ? has : !force) { list.remove(t); return false; } list.add(t); return true; };
-      list.replace = function (a, b) { if (!list.contains(a)) return false; el.setAttribute('part', tokens(el).map(function (x) { return x === String(a) ? String(b) : x; }).join(' ')); return true; };
-      list.toString = function () { return tokens(el).join(' '); };
+    // part, relList, sandbox...: a list of tokens over an attribute (the same object each time)
+    var PartList = g.DOMTokenList && g.DOMTokenList.prototype ? g.DOMTokenList : klass('DOMTokenList', null);   // (the interface of the class list: lists made here and that one share it)
+    var tokens = function (el, attr) { var v = el.getAttribute(attr); return v ? v.split(/[ \t\n\f\r]+/).filter(Boolean).filter(function (x, i, a) { return a.indexOf(x) === i; }) : []; };
+    var tokenCheck = function (t) {
+      t = String(t);
+      if (t === '') throw new DOMException('The token provided must not be empty.', 'SyntaxError');
+      if (/[ \t\n\f\r]/.test(t)) throw new DOMException('The token provided contains HTML space characters, which are not valid in tokens.', 'InvalidCharacterError');
+      return t;
+    };
+    var tokenList = function (el, attr, supported) {
+      var key = '__tl_' + attr, have = Object.getOwnPropertyDescriptor(el, key);
+      if (have) return have.value;
+      var list = Object.create(PartList.prototype), write = function (t) { el.setAttribute(attr, t.join(' ')); };
+      defineGetter(list, 'length', function () { return tokens(el, attr).length; });
+      defineGetter(list, 'value', function () { var v = el.getAttribute(attr); return v === null ? '' : v; }, function (v) { el.setAttribute(attr, String(v)); });
+      list.item = function (i) { var t = tokens(el, attr); return i >= 0 && i < t.length ? t[i] : null; };
+      list.contains = function (t) { return tokens(el, attr).indexOf(String(t)) >= 0; };
+      list.add = function () { var t = tokens(el, attr), a = Array.prototype.map.call(arguments, tokenCheck); a.forEach(function (x) { if (t.indexOf(x) < 0) t.push(x); }); write(t); };
+      list.remove = function () { var r = Array.prototype.map.call(arguments, tokenCheck); write(tokens(el, attr).filter(function (x) { return r.indexOf(x) < 0; })); };
+      list.toggle = function (t, force) { t = tokenCheck(t); var has = list.contains(t); if (force === undefined ? has : !force) { if (has) list.remove(t); return false; } if (!has) list.add(t); return true; };
+      list.replace = function (a, b) { a = tokenCheck(a); b = tokenCheck(b); var t = tokens(el, attr), i = t.indexOf(a); if (i < 0) return false; t[i] = b; write(t.filter(function (x, k) { return x !== b || k === i; })); return true; };
+      list.supports = function (t) {
+        if (!supported) throw new TypeError("Failed to execute 'supports' on 'DOMTokenList': DOMTokenList has no supported tokens.");
+        return supported.indexOf(String(t).toLowerCase()) >= 0;
+      };
+      list.forEach = function (fn, self) { tokens(el, attr).forEach(function (x, i) { fn.call(self, x, i, list); }); };
+      list.toString = function () { var v = el.getAttribute(attr); return v === null ? '' : v; };
+      Object.defineProperty(el, key, { value: list });
       return list;
+    };
+    put('part', function () { return tokenList(this, 'part'); }, function (v) { this.setAttribute('part', String(v)); });
+    var relTokens = ['alternate', 'author', 'bookmark', 'external', 'help', 'license', 'next', 'nofollow', 'noopener', 'noreferrer', 'opener', 'prev', 'privacy-policy', 'search', 'tag', 'terms-of-service',
+                     'dns-prefetch', 'icon', 'manifest', 'modulepreload', 'preconnect', 'prefetch', 'preload', 'prerender', 'stylesheet'];
+    ['HTMLAnchorElement', 'HTMLAreaElement', 'HTMLLinkElement', 'HTMLFormElement'].forEach(function (n) {
+      var P = g[n] && g[n].prototype;
+      if (!P || 'relList' in P) return;
+      Object.defineProperty(P, 'relList', { get: function () { return tokenList(this, 'rel', relTokens); }, set: function (v) { this.setAttribute('rel', String(v)); }, enumerable: true, configurable: true });
     });
+    if (g.HTMLIFrameElement && !('sandbox' in g.HTMLIFrameElement.prototype)) Object.defineProperty(g.HTMLIFrameElement.prototype, 'sandbox', { get: function () { return tokenList(this, 'sandbox', ['allow-forms', 'allow-modals', 'allow-popups', 'allow-same-origin', 'allow-scripts', 'allow-top-navigation']); }, set: function (v) { this.setAttribute('sandbox', String(v)); }, enumerable: true, configurable: true });
+    // iteration over a list of tokens
+    var listValues = function () { var o = []; for (var i = 0; i < this.length; i++) o.push(this.item(i)); return o; };
+    method(PartList.prototype, 'values', listValues);
+    method(PartList.prototype, 'keys', function () { var o = []; for (var i = 0; i < this.length; i++) o.push(i); return o; });
+    method(PartList.prototype, 'entries', function () { var o = []; for (var i = 0; i < this.length; i++) o.push([i, this.item(i)]); return o; });
+    Object.defineProperty(PartList.prototype, Symbol.iterator, { value: listValues, writable: true, configurable: true });
     var m = function (name, fn) { if (!(name in EP)) method(EP, name, fn); };
     m('scroll', function () { return this.scrollTo.apply(this, arguments); });
     m('scrollIntoViewIfNeeded', function () { return this.scrollIntoView(); });
