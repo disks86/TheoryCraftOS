@@ -25,6 +25,7 @@
 #include "Gui/Color.hpp"
 #include "Gui/Controls/Accordion.hpp"
 #include "Gui/Controls/BarChart.hpp"
+#include "Gui/Controls/Carousel.hpp"
 #include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DatePicker.hpp"
@@ -33,6 +34,7 @@
 #include "Gui/Controls/Knob.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Panel.hpp"
+#include "Gui/Controls/Pagination.hpp"
 #include "Gui/Controls/PieChart.hpp"
 #include "Gui/Controls/RadioButton.hpp"
 #include "Gui/Controls/ScrollPanel.hpp"
@@ -442,6 +444,206 @@ static void test_accordion() {
     click(w, 10 + 20, 10 + 5);
     press(w, key::kSpace);
     CHECK(acc.expanded(0));
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_pagination() {
+  TestAllocator a;
+  const Theme theme;
+  {
+    Screen screen(a, 500, 100);
+    Window w(a, screen.renderer, theme, {500, 100});
+    Pagination p(a);
+    p.set_bounds({10, 10, 400, 28});
+    w.add(&p);
+    Counter changes;
+    p.on_page_changed(changes.handler());
+    int32_t e[Pagination::kMaxEntries];
+    auto list = [&]() { return p.entries(ArrayView<int32_t>(e, Pagination::kMaxEntries)); };
+    CHECK(p.page_count() == 1 && p.current_page() == 0 && list() == 1 && e[0] == 0);
+    p.set_page_count(0);
+    CHECK(p.page_count() == 1);
+
+    // A few pages: all of them. Many pages: seven entries with gaps, the ends always there.
+    p.set_page_count(5);
+    CHECK(list() == 5 && e[0] == 0 && e[4] == 4);
+    p.set_page_count(20);
+    CHECK(list() == 7 && e[0] == 0 && e[4] == 4 && e[5] == Pagination::kGap && e[6] == 19);
+    p.set_current_page(10);
+    CHECK(changes.count == 1 && list() == 7 && e[0] == 0 && e[1] == Pagination::kGap && e[2] == 9 && e[3] == 10 && e[4] == 11 && e[5] == Pagination::kGap && e[6] == 19);
+    p.set_current_page(19);
+    CHECK(list() == 7 && e[1] == Pagination::kGap && e[2] == 15 && e[6] == 19);
+    p.set_current_page(99);   // clamped, no change
+    CHECK(p.current_page() == 19 && changes.count == 2);
+    p.set_page_count(8);      // the current page follows the count
+    CHECK(p.current_page() == 7 && changes.count == 3 && list() == 7);
+    p.set_page_count(20);
+    p.set_current_page(0);
+    changes.count = 0;
+    {
+      int32_t small[3];
+      CHECK(p.entries(ArrayView<int32_t>(small, 3)) == 3);   // a short buffer is filled, not overrun
+    }
+
+    // The buttons sit side by side in order, inside the control; a point finds its button.
+    CHECK(p.previous_rect().x < p.entry_rect(0).x && p.entry_rect(6).x + static_cast<int32_t>(p.entry_rect(6).width) <= p.next_rect().x);
+    CHECK(p.row_width() <= 400 && p.entry_rect(7).width == 0);
+    CHECK(list() == 7);
+    for (int32_t i = 0; i < 7; ++i) {
+      const Rect2D r = p.entry_rect(i);
+      CHECK(p.button_at(r.x + 2, r.y + 2) == e[i]);
+      if (i) CHECK(r.x >= p.entry_rect(i - 1).x + static_cast<int32_t>(p.entry_rect(i - 1).width));
+    }
+    CHECK(p.button_at(p.previous_rect().x + 2, 5) == Pagination::kPrevious && p.button_at(p.next_rect().x + 2, 5) == Pagination::kNext);
+    CHECK(p.button_at(395, 5) == Pagination::kNone && p.button_at(5, 90) == Pagination::kNone);
+    w.render();
+
+    // Clicks: a page, next, previous (not past the ends), a gap does nothing.
+    click(w, 10 + p.entry_rect(3).x + 4, 10 + 12);
+    CHECK(p.current_page() == 3 && changes.count == 1 && w.focus() == &p);
+    click(w, 10 + p.next_rect().x + 4, 10 + 12);
+    CHECK(p.current_page() == 4);
+    click(w, 10 + p.previous_rect().x + 4, 10 + 12);
+    CHECK(p.current_page() == 3);
+    list();
+    for (int32_t i = 0; i < 7; ++i) {
+      if (e[i] == Pagination::kGap) {
+        const int32_t before = changes.count;
+        click(w, 10 + p.entry_rect(i).x + 4, 10 + 12);
+        CHECK(changes.count == before);
+      }
+    }
+    p.set_current_page(0);
+    click(w, 10 + p.previous_rect().x + 4, 10 + 12);
+    CHECK(p.current_page() == 0);
+
+    // Keys.
+    press(w, key::kRight);
+    press(w, key::kRight);
+    CHECK(p.current_page() == 2);
+    press(w, key::kLeft);
+    CHECK(p.current_page() == 1);
+    press(w, 0x4D);
+    CHECK(p.current_page() == 19);
+    press(w, key::kRight);
+    CHECK(p.current_page() == 19);
+    press(w, 0x4A);
+    CHECK(p.current_page() == 0);
+
+    // Many digits make wider buttons; huge counts do not overflow.
+    p.set_page_count(INT32_MAX);
+    p.set_current_page(INT32_MAX - 1);
+    CHECK(list() == 7 && e[6] == INT32_MAX - 1 && p.entry_rect(6).width > static_cast<uint32_t>(Pagination::kButtonWidth));
+    w.render();
+    p.set_enabled(false);
+    click(w, 10 + p.previous_rect().x + 4, 10 + 12);
+    CHECK(p.current_page() == INT32_MAX - 1);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_carousel() {
+  TestAllocator a;
+  const Theme theme;
+  {
+    Screen screen(a, 400, 300);
+    Window w(a, screen.renderer, theme, {400, 300});
+    Carousel c(a);
+    c.set_bounds({10, 10, 300, 200});
+    w.add(&c);
+    Panel s0(a), s1(a), s2(a);
+    Counter changes;
+    c.on_slide_changed(changes.handler());
+    CHECK(c.current_slide() == -1 && c.slide_count() == 0 && !c.can_step(1) && c.dot_at(100, 190) == -1);
+    c.next();
+    c.set_current_slide(0);
+    CHECK(c.add_slide(nullptr) == -1 && c.add_slide(&s0) == 0 && c.add_slide(&s1) == 1 && c.add_slide(&s2) == 2);
+    CHECK(c.current_slide() == 0 && c.slide(1) == &s1 && c.slide(5) == nullptr && changes.count == 0);
+    w.layout();
+    const Rect2D area = c.slide_rect();
+    CHECK(s0.visible() && !s1.visible() && !s2.visible());
+    CHECK(s0.bounds().x == area.x && s0.bounds().y == area.y && s0.bounds().width == area.width && s0.bounds().height == area.height);
+    CHECK(area.x == Carousel::kArrowWidth && area.width == 300 - 2 * Carousel::kArrowWidth && area.height == 200 - Carousel::kDotsHeight);
+
+    // The arrows step (wrapping), the dots jump.
+    click(w, 10 + c.next_rect().x + 5, 10 + 50);
+    CHECK(c.current_slide() == 1 && !s0.visible() && s1.visible() && changes.count == 1 && w.focus() == &c);
+    click(w, 10 + c.previous_rect().x + 5, 10 + 50);
+    click(w, 10 + c.previous_rect().x + 5, 10 + 50);
+    CHECK(c.current_slide() == 2);   // wrapped back from the first
+    click(w, 10 + c.next_rect().x + 5, 10 + 50);
+    CHECK(c.current_slide() == 0);
+    const Rect2D d2 = c.dot_rect(2);
+    CHECK(d2.x > c.dot_rect(1).x && c.dot_rect(1).x > c.dot_rect(0).x && c.dot_rect(3).width == 0);
+    CHECK(c.dot_at(d2.x + 2, d2.y + 2) == 2 && c.dot_at(d2.x + 2, 50) == -1 && c.dot_at(5, d2.y) == -1);
+    click(w, 10 + d2.x + 2, 10 + d2.y + 2);
+    CHECK(c.current_slide() == 2 && s2.visible());
+    w.render();
+    // The current dot is filled with the ink, the others are hollow.
+    CHECK(screen.px(10 + d2.x + 4, 10 + d2.y + 4) == theme.text);
+    CHECK(screen.px(10 + c.dot_rect(0).x + 4, 10 + c.dot_rect(0).y + 4) == theme.face);
+
+    // Keys.
+    press(w, key::kRight);
+    CHECK(c.current_slide() == 0);
+    press(w, key::kLeft);
+    CHECK(c.current_slide() == 2);
+    press(w, 0x4A);
+    CHECK(c.current_slide() == 0);
+    press(w, 0x4D);
+    CHECK(c.current_slide() == 2);
+
+    // Not wrapping: the ends stop and their arrows are closed.
+    c.set_wrap(false);
+    changes.count = 0;
+    CHECK(!c.can_step(1) && c.can_step(-1));
+    click(w, 10 + c.next_rect().x + 5, 10 + 50);
+    CHECK(c.current_slide() == 2 && changes.count == 0);
+    c.set_current_slide(0);
+    CHECK(!c.can_step(-1) && c.can_step(1));
+    c.previous();
+    CHECK(c.current_slide() == 0);
+    w.render();
+
+    // Automatic advance: by the interval, not while the pointer is over it, restarting after the end without wrap.
+    c.set_wrap(true);
+    c.set_current_slide(0);
+    w.mouse_move(350, 280);   // the pointer away from the carousel
+    CHECK(c.interval() == 0);
+    c.tick(100000);
+    CHECK(c.current_slide() == 0);   // off
+    c.set_interval(1000);
+    c.tick(400);
+    c.tick(400);
+    CHECK(c.current_slide() == 0);
+    c.tick(300);
+    CHECK(c.current_slide() == 1);
+    c.tick(UINT32_MAX);
+    CHECK(c.current_slide() == 2);
+    c.tick(1000);
+    CHECK(c.current_slide() == 0);   // wrapped
+    w.mouse_move(10 + 100, 10 + 50);
+    c.tick(5000);
+    CHECK(c.current_slide() == 0);   // hovered
+    w.mouse_move(350, 280);
+    c.set_wrap(false);
+    c.set_current_slide(2);
+    c.tick(1000);
+    CHECK(c.current_slide() == 0);   // the end starts over
+
+    // Too small for the arrows and dots: nothing breaks.
+    c.set_bounds({10, 10, 20, 10});
+    CHECK(c.slide_rect().width == 0 && c.slide_rect().height == 0);
+    w.render();
+    Carousel single(a);
+    Panel only(a);
+    single.set_bounds({10, 10, 100, 100});
+    w.add(&single);
+    single.add_slide(&only);
+    single.next();
+    CHECK(single.current_slide() == 0 && !single.can_step(1));
+    w.render();
   }
   CHECK(a.live == 0);
 }
@@ -1374,6 +1576,8 @@ int main() {
   test_slider();
   test_knob();
   test_accordion();
+  test_pagination();
+  test_carousel();
   test_level_meter();
   test_pie_chart();
   test_bar_chart();
