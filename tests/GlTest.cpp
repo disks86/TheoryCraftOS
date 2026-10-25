@@ -362,7 +362,46 @@ static void test_default_antialias() {
   CHECK(a.live == 0);
 }
 
+static void test_cube_seams() {
+  TestAllocator a;
+  {
+    GlContext gl(a, false, 8, 8, noaa());
+    const uint32_t tex = gl.create_texture();
+    gl.bind_texture(0x8513, tex);
+    uint8_t white[16], black[16];
+    for (int i = 0; i < 16; ++i) { white[i] = 255; black[i] = i % 4 == 3 ? 255 : 0; }
+    for (uint32_t f = 0; f < 6; ++f) gl.tex_image(0x8515 + f, 0, 0x1908, 2, 2, 1, 0, 0x1908, 0x1401, ConstByteView(f == 0 ? white : black, 16), true, false);
+    gl.tex_parameter(0x8513, 0x2801, 0x2601);
+    gl.tex_parameter(0x8513, 0x2800, 0x2601);
+    const uint32_t prog = make_program(gl, "attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }",
+                                       "precision mediump float; uniform samplerCube t; uniform vec3 d; void main() { gl_FragColor = textureCube(t, d); }");
+    gl.use_program(prog);
+    const float verts[] = {-1, -1, 3, -1, -1, 3};
+    const uint32_t vb = gl.create_buffer();
+    gl.bind_buffer(0x8892, vb);
+    gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(verts), sizeof(verts)), 0, 0x88E4);
+    gl.enable_vertex_attrib(0, true);
+    gl.vertex_attrib_pointer(0, 2, 0x1406, false, 0, 0, false);
+    const uint32_t zero = 0;
+    gl.uniform(gl.get_uniform_location(prog, "t"), 'i', 1, 1, 1, &zero);
+    auto draw_dir = [&](float x, float y, float z) {
+      const float v[3] = {x, y, z};
+      uint32_t bits[3];
+      memcpy(bits, v, 12);
+      gl.uniform(gl.get_uniform_location(prog, "d"), 'f', 1, 3, 1, bits);
+      gl.draw_arrays(4, 0, 3, 1);
+      return pixel(gl, 4, 4) & 255;
+    };
+    CHECK(draw_dir(1, 0, 0) == 255);              // the middle of the white face
+    const uint32_t edge = draw_dir(1, 0, 0.99f);  // next to the black +Z face: the filter reaches over the seam
+    CHECK(edge > 60 && edge < 200);
+    CHECK(draw_dir(0, 0, 1) == 0);                // the black face itself
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_cube_seams();
   test_default_antialias();
   test_multisample();
   test_transform_feedback();

@@ -77,6 +77,30 @@ bool compare(uint32_t func, float ref, float d) {
 
 float log2f_(float x) { return shader::flog(x) * 1.4426950408889634f; }
 
+// Which face a direction points at and where on it (0..1 across each way).
+void cube_select(float ax, float ay, float az, uint32_t* face, float* cs, float* ct) {
+  const float aax = ax < 0 ? -ax : ax, aay = ay < 0 ? -ay : ay, aaz = az < 0 ? -az : az;
+  float sc, tc, ma;
+  if (aax >= aay && aax >= aaz) { ma = aax; if (ax > 0) { *face = 0; sc = -az; tc = -ay; } else { *face = 1; sc = az; tc = -ay; } }
+  else if (aay >= aaz) { ma = aay; if (ay > 0) { *face = 2; sc = ax; tc = az; } else { *face = 3; sc = ax; tc = -az; } }
+  else { ma = aaz; if (az > 0) { *face = 4; sc = ax; tc = -ay; } else { *face = 5; sc = -ax; tc = -ay; } }
+  if (ma == 0) ma = 1;
+  *cs = 0.5f * (sc / ma + 1.0f);
+  *ct = 0.5f * (tc / ma + 1.0f);
+}
+
+// The direction through the point (s, t) in -1..1 on a face (the inverse of cube_select); points outside the face run onto its neighbours.
+void cube_direction(uint32_t face, float s, float t, float d[3]) {
+  switch (face) {
+    case 0: d[0] = 1; d[1] = -t; d[2] = -s; break;
+    case 1: d[0] = -1; d[1] = -t; d[2] = s; break;
+    case 2: d[0] = s; d[1] = 1; d[2] = t; break;
+    case 3: d[0] = s; d[1] = -1; d[2] = -t; break;
+    case 4: d[0] = s; d[1] = -t; d[2] = 1; break;
+    default: d[0] = -s; d[1] = -t; d[2] = -1; break;
+  }
+}
+
 }  // namespace
 
 bool GlContext::texture_complete(const Texture& t, const SamplerObj& s, bool* is_cube) const {
@@ -255,17 +279,7 @@ void sample_images(const SampleSource& t, const SamplerObj& s, const shader::Sam
   uint32_t face = 0;
   float cs = rq.coord[0], ct = rq.coord[1], cr = rq.coord[2];
   float layer_f = rq.layer;
-  if (is_cube) {
-    const float ax = rq.coord[0], ay = rq.coord[1], az = rq.coord[2];
-    const float aax = ax < 0 ? -ax : ax, aay = ay < 0 ? -ay : ay, aaz = az < 0 ? -az : az;
-    float sc, tc, ma;
-    if (aax >= aay && aax >= aaz) { ma = aax; if (ax > 0) { face = 0; sc = -az; tc = -ay; } else { face = 1; sc = az; tc = -ay; } }
-    else if (aay >= aaz) { ma = aay; if (ay > 0) { face = 2; sc = ax; tc = az; } else { face = 3; sc = ax; tc = -az; } }
-    else { ma = aaz; if (az > 0) { face = 4; sc = ax; tc = -ay; } else { face = 5; sc = -ax; tc = -ay; } }
-    if (ma == 0) ma = 1;
-    cs = 0.5f * (sc / ma + 1.0f);
-    ct = 0.5f * (tc / ma + 1.0f);
-  }
+  if (is_cube) cube_select(rq.coord[0], rq.coord[1], rq.coord[2], &face, &cs, &ct);
   if (t.target == 0x8C1A) layer_f = rq.coord[2];
 
   auto sample_level = [&](int32_t level, bool linear, float res[4]) {
@@ -280,6 +294,23 @@ void sample_images(const SampleSource& t, const SamplerObj& s, const shader::Sam
       if (layer >= d) layer = d - 1;
     }
     auto tap = [&](int32_t x, int32_t y, int32_t z, float o[4]) {
+      if (is_cube) {   // a texel past the edge of the face is a texel of the neighbouring face (seamless filtering)
+        const Image* fim = im;
+        uint32_t f2 = face;
+        if (x < 0 || y < 0 || x >= w || y >= h) {
+          float dir[3], u, v;
+          cube_direction(face, (static_cast<float>(x) + 0.5f) / static_cast<float>(w) * 2.0f - 1.0f, (static_cast<float>(y) + 0.5f) / static_cast<float>(h) * 2.0f - 1.0f, dir);
+          cube_select(dir[0], dir[1], dir[2], &f2, &u, &v);
+          x = static_cast<int32_t>(u * static_cast<float>(w));
+          y = static_cast<int32_t>(v * static_cast<float>(h));
+          const Image* other = image_at(f2, level);
+          if (other) fim = other;
+        }
+        x = x < 0 ? 0 : (x >= w ? w - 1 : x);
+        y = y < 0 ? 0 : (y >= h ? h - 1 : y);
+        fetch_f(*fim, x, y, t.faces_in_layers ? static_cast<int32_t>(t.layer_offset + f2) : 0, o);
+        return;
+      }
       x = wrap_index(x + rq.offset[0], w, s.wrap_s);
       y = wrap_index(y + rq.offset[1], h, s.wrap_t);
       z = is3d ? wrap_index(z + rq.offset[2], d, s.wrap_r) : (t.faces_in_layers && is_cube ? static_cast<int32_t>(t.layer_offset + face) : layer + static_cast<int32_t>(t.layer_offset));
