@@ -19,6 +19,9 @@
 // What the files of the DOM bindings share: the state of one page's bindings (DomBindings::Impl) and the small helpers the natives are written with.
 #pragma once
 #include "Browser/DomBindings.hpp"
+#include "Browser/Fetcher.hpp"
+#include "Kernel/Sync.hpp"
+#include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace browser {
@@ -27,8 +30,27 @@ namespace bind {
 struct WasmState;   // the WebAssembly runtime of the page (DomBindingsWasm.cpp)
 }
 
+// An asynchronous fetch()/XMLHttpRequest. The script thread makes it and polls it from a timer; a worker thread makes the request (the request is copied, so the
+// worker never touches script objects) and the script thread builds the answer once it is done.
+struct NetJob {
+  explicit NetJob(allocators::IAllocator& a)
+      : method(a), url(a), headers(a), mode(a), credentials(a), redirect(a), referrer(a), referrer_policy(a), page_address(a), body(a), response(a) {}
+  enum class State : uint8_t { Queued, Running, Done };
+  double id = 0;
+  double timer = 0;   // the polling timer of the script thread
+  String method, url, headers, mode, credentials, redirect, referrer, referrer_policy, page_address;
+  ByteBuffer body;
+  bool referrer_given = false;
+  uint64_t now_ms = 0;
+  uint32_t timeout_ms = 0;
+  NetResponse response;
+  bool ok = false;
+  State state = State::Queued;   // (guarded by Impl::net_mutex)
+};
+
 struct DomBindings::Impl {
-  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()) {}
+  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()) {}
+  ~Impl();   // waits for the request threads
   struct CustomValidity {
     explicit CustomValidity(allocators::IAllocator& a) : message(a) {}
     uint32_t serial = 0;
@@ -60,6 +82,13 @@ struct DomBindings::Impl {
   int32_t scroll_line = 0;
   bool page_hidden = false;   // document.hidden / visibilityState: true while the page is being left
   script::JsString *k_length = nullptr;
+  // Requests in flight (see NetJob). At most kMaxNetWorkers threads run at once and they exist only while there is something to send.
+  static constexpr uint32_t kMaxNetWorkers = 6, kMaxNetJobs = 256;
+  kernel::Mutex net_mutex;
+  List<UniquePointer<NetJob>> net_jobs;
+  double net_next_id = 0;   // (script thread only)
+  uint32_t net_workers = 0;   // threads started and not yet finished (changed under net_mutex; read atomically by the destructor)
+  bool net_closing = false;
   UniquePointer<bind::WasmState> wasm;   // the WebAssembly store of the page (made by install_wasm)
 };
 
@@ -121,6 +150,7 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* element, StringView key
 bool is_form_element(const dom::Node* n);
 bool form_lookup_named(DomBindings::Impl& c, dom::Node* n, StringView key, Value* out);
 bool install_crypto(DomBindings::Impl& c);   // the natives under crypto.getRandomValues() and crypto.subtle (DomBindingsCrypto.cpp)
+bool install_service_worker(DomBindings::Impl& c);   // the Cache API and service worker natives (DomBindingsServiceWorker.cpp)
 bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest's natives, byte and text helpers (DomBindingsNet.cpp)
 // Uint8Array objects (DomBindingsMedia.cpp): a new one holding these bytes, and the bytes of one (a view into the array; false for anything else).
 JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes);

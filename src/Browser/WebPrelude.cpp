@@ -2838,6 +2838,11 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     return r;
   }
   hide(g, 'Response', Response);
+  // for the Cache API: a response made from what was stored (the headers as a "Name: value" block, the body as bytes)
+  hide(g, '__new_response', function (type, status, statusText, headerBlock, bytes, url, redirected) {
+    var h = Headers.__fromBlock(headerBlock); h.__guard = 'response'; h.__immutable = true;
+    return newResponse(type, status, statusText, h, type === 'opaque' || type === 'opaqueredirect' || NULL_BODY.indexOf(status) >= 0 ? null : bytes, url, redirected);
+  });
 
   // --------------------------------------------------------------------------------------------------------------------------------- Request
   var SIMPLE_METHODS = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'];
@@ -2924,7 +2929,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   Object.defineProperty(Request.prototype, 'referrer', { get: function () { return this.__q.referrer; }, enumerable: true, configurable: true });
   Object.defineProperty(Request.prototype, 'headers', { get: function () { return this.__h; }, enumerable: true, configurable: true });
   Object.defineProperty(Request.prototype, 'signal', { get: function () { return this.__sig; }, enumerable: true, configurable: true });
-  Object.defineProperty(Request.prototype, 'destination', { get: function () { return ''; }, enumerable: true, configurable: true });
+  Object.defineProperty(Request.prototype, 'destination', { get: function () { return this.__q.destination || ''; }, enumerable: true, configurable: true });
   Object.defineProperty(Request.prototype, 'duplex', { get: function () { return 'half'; }, enumerable: true, configurable: true });
   Object.defineProperty(Request.prototype, 'isReloadNavigation', { get: function () { return false; }, enumerable: true, configurable: true });
   Object.defineProperty(Request.prototype, 'isHistoryNavigation', { get: function () { return false; }, enumerable: true, configurable: true });
@@ -3658,6 +3663,16 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     }
     return out;
   }
+  // for the service worker bridge: a message with the ports it transfers (they leave the document: messages for them go through the hub), and one that arrives
+  hide(g, '__serialize_transfer', function (value, transfer) {
+    var s = serialize(value, transfer);
+    for (var i = 0; i < s.ports.length; i++) { s.ports[i].__detached = true; __port_move(s.ports[i].__id, 4294967295); }
+    return { text: s.text, ids: s.ids.join(',') };
+  });
+  hide(g, '__deserialize_transfer', function (text, idsCsv) {
+    var found = [], data = deserialize(text, found);
+    return { data: data, ports: arrivedPorts(parseIds(idsCsv), found) };
+  });
   hide(g, '__port_deliver', function (id, text, idsCsv) {
     var port = portRegistry[id];
     if (!port || port.__closed || port.__detached) return;
@@ -6328,7 +6343,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     put('userActivation', getter(function () { return userActivation; }));
     // storage manager, credentials, locks, wake lock, battery, connection, user agent data, media session, service workers, keyboard
     var StorageManager = klass('StorageManager', null), storage = Object.create(StorageManager.prototype);
-    method(StorageManager.prototype, 'estimate', function () { return Promise.resolve({ usage: 0, quota: 134217728 }); });
+    method(StorageManager.prototype, 'estimate', function () { var used = typeof __cache_usage === 'function' ? __cache_usage() : 0; return Promise.resolve({ usage: used, quota: 134217728, usageDetails: { caches: used } }); });
     method(StorageManager.prototype, 'persist', function () { return Promise.resolve(false); });
     method(StorageManager.prototype, 'persisted', function () { return Promise.resolve(false); });
     method(StorageManager.prototype, 'getDirectory', function () { return Promise.reject(new DOMException('Storage directory access is denied.', 'SecurityError')); });
@@ -6408,14 +6423,6 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     method(MediaSession.prototype, 'setCameraActive', function () { });
     method(MediaSession.prototype, 'setMicrophoneActive', function () { });
     put('mediaSession', getter(function () { return session; }));
-    var ServiceWorkerContainer = klass('ServiceWorkerContainer', ET), sw = Object.create(ServiceWorkerContainer.prototype);
-    sw.controller = null; sw.oncontrollerchange = null; sw.onmessage = null; sw.onmessageerror = null;
-    defineGetter(ServiceWorkerContainer.prototype, 'ready', function () { return new Promise(function () { }); });
-    method(ServiceWorkerContainer.prototype, 'register', function () { return Promise.reject(new DOMException('Failed to register a ServiceWorker: service workers are not supported by this browser.', 'SecurityError')); });
-    method(ServiceWorkerContainer.prototype, 'getRegistration', function () { return Promise.resolve(undefined); });
-    method(ServiceWorkerContainer.prototype, 'getRegistrations', function () { return Promise.resolve([]); });
-    method(ServiceWorkerContainer.prototype, 'startMessages', function () { });
-    put('serviceWorker', getter(function () { return sw; }));
     var Keyboard = klass('Keyboard', ET), keyboard = Object.create(Keyboard.prototype);
     method(Keyboard.prototype, 'getLayoutMap', function () { return Promise.resolve(new Map()); });
     method(Keyboard.prototype, 'lock', function () { return Promise.resolve(); });
@@ -6456,56 +6463,6 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   if (!g.SharedWorker) {
     var SharedWorker = klass('SharedWorker', ET, function () { throw new DOMException('SharedWorker is not supported by this browser.', 'NotSupportedError'); });
   }
-
-  // ---------------------------------------------------------------------------------------------------------------------------------- caches, cookie store
-  (function () {
-    if (g.caches) return;
-    var CacheStorage = klass('CacheStorage', null), Cache = klass('Cache', null);
-    var keyOf = function (request) { return (request instanceof g.Request ? request.url : new URL(String(request), g.location.href).href); };
-    var newCache = function () {
-      var c = Object.create(Cache.prototype), entries = [];
-      hide(c, '__entries', entries);
-      return c;
-    };
-    method(Cache.prototype, 'put', function (request, response) {
-      var key = keyOf(request), entries = this.__entries;
-      return response.clone().arrayBuffer().then(function (buffer) {
-        var stored = { key: key, request: request instanceof g.Request ? request : new g.Request(key), status: response.status, statusText: response.statusText, headers: Array.from ? Array.from(response.headers) : [], body: buffer };
-        for (var i = 0; i < entries.length; i++) if (entries[i].key === key) { entries[i] = stored; return; }
-        entries.push(stored);
-      });
-    });
-    var rebuild = function (e) { return new g.Response(e.body.slice(0), { status: e.status, statusText: e.statusText, headers: e.headers }); };
-    method(Cache.prototype, 'match', function (request) {
-      var key = keyOf(request);
-      for (var i = 0; i < this.__entries.length; i++) if (this.__entries[i].key === key) return Promise.resolve(rebuild(this.__entries[i]));
-      return Promise.resolve(undefined);
-    });
-    method(Cache.prototype, 'matchAll', function (request) {
-      var out = [], key = request === undefined ? null : keyOf(request);
-      for (var i = 0; i < this.__entries.length; i++) if (key === null || this.__entries[i].key === key) out.push(rebuild(this.__entries[i]));
-      return Promise.resolve(out);
-    });
-    method(Cache.prototype, 'add', function (request) { var self = this; return g.fetch(request).then(function (r) { if (!r.ok) throw typeErr("execute 'add' on 'Cache'", 'Request failed'); return self.put(request, r); }); });
-    method(Cache.prototype, 'addAll', function (requests) { var self = this; return Promise.all(Array.prototype.map.call(requests, function (r) { return self.add(r); })).then(function () { }); });
-    method(Cache.prototype, 'delete', function (request) {
-      var key = keyOf(request);
-      for (var i = 0; i < this.__entries.length; i++) if (this.__entries[i].key === key) { this.__entries.splice(i, 1); return Promise.resolve(true); }
-      return Promise.resolve(false);
-    });
-    method(Cache.prototype, 'keys', function () { return Promise.resolve(this.__entries.map(function (e) { return e.request; })); });
-    var all = {}, storage = Object.create(CacheStorage.prototype);
-    method(CacheStorage.prototype, 'open', function (name) { name = String(name); return Promise.resolve(all[name] || (all[name] = newCache())); });
-    method(CacheStorage.prototype, 'has', function (name) { return Promise.resolve(all[String(name)] !== undefined); });
-    method(CacheStorage.prototype, 'delete', function (name) { name = String(name); var had = all[name] !== undefined; delete all[name]; return Promise.resolve(had); });
-    method(CacheStorage.prototype, 'keys', function () { return Promise.resolve(Object.keys(all)); });
-    method(CacheStorage.prototype, 'match', function (request) {
-      var names = Object.keys(all), i = 0;
-      var next = function () { if (i >= names.length) return Promise.resolve(undefined); return all[names[i++]].match(request).then(function (r) { return r || next(); }); };
-      return next();
-    });
-    defineGetter(g, 'caches', function () { return storage; });
-  }());
 
   // ---------------------------------------------------------------------------------------------------------------------------------- geometry
   (function () {

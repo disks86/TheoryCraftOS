@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 #include "Browser/Page.hpp"
+#include "Browser/CacheStore.hpp"
+#include "Browser/ServiceWorker.hpp"
 #include "Browser/SessionHistory.hpp"
 #include "Dom/Form.hpp"
 #include "Browser/PageLayout.hpp"
@@ -112,6 +114,17 @@ struct FakeNet final : IPageLoader {
     Answer a;
     if (it != answers.end()) a = it->second;
     else a.status = 404;
+    if (it == answers.end() && getenv("PROBE_ROOT") && key.find("GET https://app.example/") == 0) {   // (PROBE: files of a directory are the site)
+      const std::string path = std::string(getenv("PROBE_ROOT")) + "/" + key.substr(strlen("GET https://app.example/"));
+      if (FILE* f = fopen(path.c_str(), "rb")) {
+        a.status = 200;
+        a.body.clear();
+        int c;
+        while ((c = fgetc(f)) != EOF) a.body.push_back(static_cast<char>(c));
+        fclose(f);
+        a.headers = path.size() > 3 && path.substr(path.size() - 3) == ".js" ? "Content-Type: application/javascript\r\n" : "Content-Type: text/html\r\n";
+      }
+    }
     if (request.headers.contains("If-None-Match")) {   // a revalidation: the answer "<key>#304" if the test has one
       auto not_modified = answers.find(key + "#304");
       if (not_modified != answers.end()) a = not_modified->second;
@@ -162,7 +175,15 @@ struct FakeSocket final : IWebSocket {
 };
 
 struct FakeEnvironment final : IPageEnvironment {
-  explicit FakeEnvironment(TestAllocator& a) : local_hub(a), session_hub(a), hub(a), jar(a) { allocator_for_clips = &a; }
+  explicit FakeEnvironment(TestAllocator& a) : local_hub(a), session_hub(a), hub(a), jar(a), caches(a), workers(a) {
+    allocator_for_clips = &a;
+    workers.set_host(this);
+  }
+  ~FakeEnvironment() { workers.stop_all(); }
+  CacheStore caches;
+  ServiceWorkerHub workers;
+  CacheStore* cache_store() override { return &caches; }
+  ServiceWorkerHub* service_workers() override { return &workers; }
   std::map<std::string, std::string> blobs;   // binary files (pictures, videos)
   FakeClip* last_clip = nullptr;
   bool can_play_video = true, clips_play_at_any_rate = false;
@@ -4677,14 +4698,460 @@ static void test_wasm() {
                  "[\"object\",42,2]", nullptr, "https://app.example/"));
 }
 
+// --- The Cache API and service workers ---------------------------------------------------------------------------------------------------
+
+// Serves a file of the test site.
+static void serve(FakeEnvironment& env, const char* path, const char* type, const std::string& body, uint32_t status = 200, const std::string& extra = std::string()) {
+  env.net.answers[std::string("GET https://app.example") + path] = {status, std::string("Content-Type: ") + type + "\r\n" + extra, body};
+}
+
+// Lets the timers of a page run (the network and the workers with them) until none is waiting.
+static void settle_page(Page& page, FakeEnvironment& env, int rounds = 600) {
+  for (int i = 0; i < rounds; ++i) {
+    double due;
+    if (!page.next_timer(&due)) break;
+    if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+    page.run_due_timers(env.clock);
+  }
+}
+
+// One document after the other in the same browser (the same caches and service workers): each is loaded, runs its script and settles; what each logged is returned
+// joined by " || ".
+struct Visit {
+  const char* address;
+  std::string script;
+  std::string head = std::string();   // extra markup for the head
+  std::function<void(FakeEnvironment&)> before = nullptr;   // done before the document is opened
+};
+static std::string visits(const std::vector<Visit>& list, const std::function<void(FakeEnvironment&)>& setup = nullptr, const std::function<void(FakeEnvironment&)>& after = nullptr) {
+  TestAllocator a;
+  std::string out;
+  {
+    FakeEnvironment env(a);
+    if (setup) setup(env);
+    for (size_t v = 0; v < list.size(); ++v) {
+      if (list[v].before) list[v].before(env);
+      MediaEnvironment media;
+      Page page(a, env, list[v].address, media, true);
+      page.load((std::string("<html><head><title>T</title>") + list[v].head + "</head><body><script>" + list[v].script + "</script></body></html>").c_str());
+      settle_page(page, env);
+      std::string log(page.log().data(), page.log().size());
+      if (!log.empty() && log.back() == '\n') log.pop_back();
+      for (size_t p = 0; (p = log.find("\n", p)) != std::string::npos;) { log.replace(p, 1, " | "); p += 3; }
+      if (v) out += " || ";
+      out += log;
+    }
+    if (after) after(env);
+  }
+  if (a.live != 0) {
+    printf("   leak (%d) in service worker test\n", a.live);
+    ++g_failed;
+  }
+  return out;
+}
+static bool visits_are(const std::vector<Visit>& list, const std::string& expected, const std::function<void(FakeEnvironment&)>& setup = nullptr) {
+  const std::string got = visits(list, setup);
+  if (got != expected) {
+    printf("   %s\n   logs     %s\n   expects  %s\n", list.empty() ? "" : list[0].script.c_str(), got.c_str(), expected.c_str());
+    return false;
+  }
+  return true;
+}
+
+static void test_cache_api() {
+  const std::string prelude = "var out = []; function log(x) { out.push(String(x)); } function done() { console.log(out.join(' ')); } "
+                              "function fail(e) { log('ERR:' + (e && e.name ? e.name : e)); done(); } ";
+  // put, match, the query options, keys, delete, storage-wide match
+  CHECK(visits_are({{"https://app.example/dir/page.html", prelude +
+      "var cache; caches.open('v1').then(function (c) { cache = c; log(c instanceof Cache); return c.put('/a', new Response('hello', { status: 200, headers: { 'X-A': '1' } })); })"
+      ".then(function () { return cache.put('/b?q=1', new Response('bee', { status: 201, statusText: 'Made' })); })"
+      ".then(function () { return cache.match('/a'); }).then(function (r) { log(r.status + ':' + r.headers.get('x-a') + ':' + r.type + ':[' + r.url + ']'); return r.text(); })"
+      ".then(function (t) { log(t); return cache.match('/b'); }).then(function (r) { log(r); return cache.match('/b', { ignoreSearch: true }); })"
+      ".then(function (r) { log(r.status + r.statusText); return cache.match(new Request('/b?q=1', { method: 'POST' })); }).then(function (r) { log(r); return cache.match(new Request('/b?q=1', { method: 'POST' }), { ignoreMethod: true }); })"
+      ".then(function (r) { log(r.status); return cache.keys(); }).then(function (k) { log(k.map(function (x) { return x.method + ' ' + x.url; }).join()); return cache.matchAll(); })"
+      ".then(function (l) { log(l.length); return cache.put('/a', new Response('again')); }).then(function () { return cache.keys(); }).then(function (k) { log('order ' + k.map(function (x) { return new URL(x.url).pathname; }).join()); return cache.delete('/a'); })"
+      ".then(function (d) { log('deleted ' + d); return cache.delete('/a'); }).then(function (d) { log('deleted ' + d); return caches.keys(); }).then(function (n) { log(n.join()); return caches.match('/b?q=1'); })"
+      ".then(function (r) { log('any ' + r.status); return caches.delete('v1'); }).then(function (d) { log('gone ' + d); return caches.has('v1'); }).then(function (h) { log('has ' + h); done(); }).catch(fail);"}},
+      "true 200:1:default:[] hello undefined 201Made undefined 201 GET https://app.example/a,GET https://app.example/b?q=1 2 order /b,/a deleted true deleted false v1 any 201 gone true has false"));
+  // Vary decides what matches; Vary: * cannot be stored; a request with another method, a 206, a used body and other schemes are refused
+  CHECK(visits_are({{"https://app.example/dir/page.html", prelude +
+      "var c; caches.open('v').then(function (x) { c = x; return c.put(new Request('/v', { headers: { 'Accept-Language': 'fr' } }), new Response('fr', { headers: { Vary: 'Accept-Language' } })); })"
+      ".then(function () { return c.match(new Request('/v', { headers: { 'Accept-Language': 'fr' } })); }).then(function (r) { log(r && r.status); return c.match(new Request('/v', { headers: { 'Accept-Language': 'en' } })); })"
+      ".then(function (r) { log(r); return c.match(new Request('/v'), { ignoreVary: true }); }).then(function (r) { log(r && r.status); return c.put('/s', new Response('x', { headers: { Vary: '*' } })); })"
+      ".catch(function (e) { log(e.name); return c.put(new Request('/p', { method: 'POST', body: 'x' }), new Response('x')); }).catch(function (e) { log(e.name); var u = new Response('x'); return u.text().then(function () { return c.put('/u', u); }); })"
+      ".catch(function (e) { log(e.name); return c.put('ftp://app.example/f', new Response('x')); }).catch(function (e) { log(e.name); return c.put('data:text/plain,hi', new Response('x')); }).catch(function (e) { log(e.name); return c.put('/x', 'not a response'); })"
+      ".catch(function (e) { log(e.name); return c.add('/n'); }).catch(function (e) { log(e.name); return c.keys(); }).then(function (k) { log('keys ' + k.length); done(); }).catch(fail);"}},
+      "200 undefined 200 TypeError TypeError TypeError TypeError TypeError TypeError TypeError keys 1"));
+  // add / addAll fetch and store (all or nothing); duplicates are refused
+  CHECK(visits_are({{"https://app.example/dir/page.html", prelude +
+      "var c; caches.open('s').then(function (x) { c = x; return c.addAll(['/one', '/two']); }).then(function () { return c.keys(); }).then(function (k) { log('stored ' + k.length); return c.match('/two'); })"
+      ".then(function (r) { return r.text(); }).then(function (t) { log(t); return c.addAll(['/three', '/missing']); }).catch(function (e) { log(e.name); return c.keys(); })"
+      ".then(function (k) { log('after failure ' + k.length); return c.addAll(['/one', '/one']); }).catch(function (e) { log(e.name); return c.add('/missing'); }).catch(function (e) { log(e.name); return c.add('/three'); })"
+      ".then(function () { return c.match('/three'); }).then(function (r) { log(r.headers.get('content-type')); done(); }).catch(fail);"}},
+      "stored 2 b TypeError after failure 2 InvalidStateError TypeError text/plain",
+      [](FakeEnvironment& env) {
+        serve(env, "/one", "text/plain", "a");
+        serve(env, "/two", "text/plain", "b");
+        serve(env, "/three", "text/plain", "c");
+      }));
+  // binary bodies, opaque responses, and two documents (and an origin of their own) seeing the same caches
+  CHECK(visits_are({{"https://app.example/dir/page.html", prelude +
+      "caches.open('bin').then(function (c) { var bytes = new Uint8Array([0, 1, 200, 255, 13, 10]); return c.put('/bin', new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream' } })); })"
+      ".then(function () { return fetch('https://other.example/opaque', { mode: 'no-cors' }); }).then(function (r) { log(r.type + ':' + r.status); return caches.open('bin').then(function (c) { return c.put('https://other.example/opaque', r); }); })"
+      ".then(function () { return caches.match('https://other.example/opaque'); }).then(function (r) { log(r.type + ':' + r.status); done(); }).catch(fail);"},
+      {"https://app.example/other.html", prelude + "caches.match('/bin').then(function (r) { return r.arrayBuffer(); }).then(function (b) { var u = new Uint8Array(b), l = []; for (var i = 0; i < u.length; i++) l.push(u[i]); log(l.join(',')); return caches.keys(); }).then(function (n) { log(n.join()); done(); }).catch(fail);"},
+      {"https://elsewhere.example/page.html", prelude + "caches.keys().then(function (n) { log('names ' + n.length); return caches.match('/bin'); }).then(function (r) { log(r); done(); }).catch(fail);"}},
+      "opaque:0 opaque:0 || 0,1,200,255,13,10 bin || names 0 undefined",
+      [](FakeEnvironment& env) { env.net.answers["GET https://other.example/opaque"] = {200, "Content-Type: text/plain\r\n", "secret"}; }));
+  // the Storage API counts what the caches hold
+  CHECK(async_is("var out = []; caches.open('q').then(function (c) { return c.put('/a', new Response(new Array(1001).join('x'))); }).then(function () { return navigator.storage.estimate(); })"
+                 ".then(function (e) { console.log(e.usage >= 1000, e.usageDetails.caches >= 1000); });", "true true"));
+  // the store itself: the quota, the limits, the order of the names, and what a clear takes away
+  {
+    TestAllocator a;
+    {
+      CacheStore store(a);
+      bool over = false;
+      CHECK(store.open("https://a.example", "one") && store.open("https://a.example", "two") && store.open("https://b.example", "one"));
+      CacheStore::Entry big(a);
+      big.method.assign("GET");
+      big.url.assign("https://a.example/big");
+      std::string chunk(40u << 20, 'x');
+      big.body.assign(StringView(chunk.data(), chunk.size()));
+      CHECK(store.write("https://a.example", "one", -1, static_cast<CacheStore::Entry&&>(big), &over) && !over);
+      CacheStore::Entry again(a);
+      again.method.assign("GET");
+      again.url.assign("https://a.example/big2");
+      again.body.assign(StringView(chunk.data(), chunk.size()));
+      CHECK(!store.write("https://a.example", "two", -1, static_cast<CacheStore::Entry&&>(again), &over) && over);   // (80 MB do not fit in 64)
+      CHECK(store.usage("https://a.example") > (40u << 20) && store.usage("https://b.example") == 0 && store.count("https://a.example", "two") == 0);
+      List<String> names(a);
+      store.names("https://a.example", &names);
+      CHECK(names.count() == 2 && names[0].view().equals("one") && names[1].view().equals("two"));
+      const uint64_t version = store.version();
+      CHECK(store.remove("https://a.example", "one") && !store.remove("https://a.example", "one") && store.version() > version && store.usage("https://a.example") < 1000);
+      store.clear_origin("https://a.example");
+      CHECK(!store.has("https://a.example", "two") && store.has("https://b.example", "one"));
+      store.clear_all();
+      CHECK(!store.has("https://b.example", "one"));
+    }
+    CHECK(a.live == 0);
+  }
+}
+
+static const char* const kSwPrelude = "var out = [], finished = false; function log(x) { out.push(String(x)); } function done() { finished = true; console.log(out.join(' ')); } "
+                                      "setTimeout(function () { if (!finished) { out.push('(stuck)'); done(); } }, 20000); "
+                                      "function fail(e) { log('ERR:' + (e && e.name ? e.name + ':' + e.message : e)); done(); } "
+                                      "function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); } ";
+
+// A worker that caches a shell, takes over at once and answers some requests itself.
+static const char* const kSwBasic =
+    "var VERSION = 'v1';\n"
+    "self.addEventListener('install', function (e) { e.waitUntil(caches.open(VERSION).then(function (c) { return c.put('/shell', new Response('shell-body')); }).then(function () { return self.skipWaiting(); })); });\n"
+    "self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });\n"
+    "self.addEventListener('fetch', function (e) {\n"
+    "  var u = new URL(e.request.url);\n"
+    "  if (u.pathname === '/shell') e.respondWith(caches.match('/shell'));\n"
+    "  else if (u.pathname === '/gen') e.respondWith(e.request.text().then(function (t) { return new Response([e.request.method, e.request.mode, e.request.destination, e.request.headers.get('x-a'), t, e.clientId !== '' ].join('|'), { status: 202, statusText: 'Gen', headers: { 'X-Gen': 'yes' } }); }));\n"
+    "  else if (u.pathname === '/boom') e.respondWith(Promise.reject(new Error('x')));\n"
+    "  else if (u.pathname === '/notresponse') e.respondWith(Promise.resolve('text'));\n"
+    "  else if (u.pathname === '/redir') e.respondWith(Response.redirect('/shell', 302));\n"
+    "  else if (u.pathname === '/net') e.respondWith(fetch(e.request).then(function (r) { return r.text(); }).then(function (t) { return new Response('wrapped(' + t + ')'); }));\n"
+    "  else if (u.pathname === '/app.js') e.respondWith(new Response(\"console.log('script from the worker')\", { headers: { 'Content-Type': 'application/javascript' } }));\n"
+    "  else if (u.pathname === '/late') e.respondWith(new Promise(function (r) { setTimeout(function () { r(new Response('late')); }, 300); }));\n"
+    "  else if (u.pathname === '/swr') { e.respondWith(caches.open('swr').then(function (c) { return c.match(e.request).then(function (hit) { var net = fetch(e.request).then(function (r) { c.put(e.request, r.clone()); return r; }); e.waitUntil(net); return hit || net; }); })); }\n"
+    "});\n"
+    "self.addEventListener('sync', function (e) { e.waitUntil(clients.matchAll().then(function (l) { l.forEach(function (c) { c.postMessage('sync:' + e.tag); }); })); });\n"
+    "self.addEventListener('message', function (e) {\n"
+    "  if (e.data === 'skip') self.skipWaiting();\n"
+    "  else if (e.data === 'ports') e.ports[0].postMessage({ got: 'port', source: e.source.type });\n"
+    "  else if (e.data === 'clients') clients.matchAll().then(function (l) { e.source.postMessage('clients:' + l.length + ':' + (l[0] instanceof WindowClient) + ':' + l[0].frameType); });\n"
+    "  else if (e.data === 'who') e.source.postMessage({ origin: e.origin, id: e.source.id === undefined, ports: e.ports.length });\n"
+    "  else e.source.postMessage('echo:' + e.data);\n"
+    "});\n";
+
+static void site_basic(FakeEnvironment& env) {
+  serve(env, "/sw.js", "application/javascript", kSwBasic);
+  serve(env, "/net", "text/plain", "from-network");
+  serve(env, "/plain", "text/plain", "plain-net");
+  serve(env, "/swr", "text/plain", "swr-net");
+}
+
+static void test_service_workers() {
+  // register, the states in order, ready, the controller, fetch events (a cached shell, a made response, a rejected promise, a bad answer, a redirect, the network), messages
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "var states = []; navigator.serviceWorker.addEventListener('controllerchange', function () { log('controllerchange:' + !!navigator.serviceWorker.controller); });\n"
+      "log('before ' + navigator.serviceWorker.controller);\n"
+      "navigator.serviceWorker.register('/sw.js').then(function (reg) {\n"
+      "  var w = reg.installing; log('registered ' + reg.scope + ' ' + w.state + ' ' + w.scriptURL + ' ' + reg.updateViaCache + ' ' + (reg instanceof ServiceWorkerRegistration) + (w instanceof ServiceWorker));\n"
+      "  w.addEventListener('statechange', function () { states.push(w.state); });\n"
+      "  return navigator.serviceWorker.ready;\n"
+      "}).then(function (reg) { return wait(50).then(function () { log('ready ' + reg.active.state + ' ' + states.join()); return fetch('/shell'); }); })\n"
+      ".then(function (r) { return r.text(); }).then(function (t) { log('shell ' + t); return fetch('/gen', { method: 'POST', headers: { 'X-A': 'a' }, body: 'payload' }); })\n"
+      ".then(function (r) { return r.text().then(function (t) { log('gen ' + r.status + r.statusText + ' ' + r.headers.get('x-gen') + ' ' + t); return fetch('/boom'); }); })\n"
+      ".catch(function (e) { log('boom ' + e.name); return fetch('/notresponse'); }).catch(function (e) { log('notresponse ' + e.name); return fetch('/redir'); })\n"
+      ".then(function (r) { return r.text().then(function (t) { log('redir ' + t + ' ' + r.redirected); return fetch('/plain'); }); }).then(function (r) { return r.text(); }).then(function (t) { log('passthrough ' + t); return fetch('/net'); })\n"
+      ".then(function (r) { return r.text(); }).then(function (t) { log(t); return fetch('/late'); }).then(function (r) { return r.text(); }).then(function (t) { log(t); done(); }).catch(fail);\n"},
+      },
+      "before null registered https://app.example/ installing https://app.example/sw.js imports truetrue controllerchange:true ready activated installed,activating,activated shell shell-body gen 202Gen yes POST|cors||a|payload|true "
+      "boom TypeError notresponse TypeError redir shell-body true passthrough plain-net wrapped(from-network) late",
+      site_basic));
+
+  const std::string register_basic = std::string(kSwPrelude) + "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function () { return wait(20); }).then(function () { log('registered'); done(); }).catch(fail);";
+  // a document opened later is controlled from the start; scripts it names are answered by the worker; messages go to the worker and back (the ports too); the worker shares the caches
+  CHECK(visits_are({{"https://app.example/dir/page.html", register_basic},
+                    {"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "var c = navigator.serviceWorker.controller; log((c instanceof ServiceWorker) + ' ' + c.state + ' ' + c.scriptURL);\n"
+      "navigator.serviceWorker.addEventListener('message', function (e) { log('msg ' + (typeof e.data === 'string' ? e.data : JSON.stringify(e.data)) + ' ' + (e.source === c) + ' ' + e.origin); });\n"
+      "navigator.serviceWorker.ready.then(function (reg) { log('ready ' + reg.active.state + ' ' + (reg.active === c)); c.postMessage('hello'); c.postMessage('clients'); c.postMessage('who');\n"
+      "  var ch = new MessageChannel(); ch.port1.onmessage = function (e) { log('port ' + JSON.stringify(e.data)); }; c.postMessage('ports', [ch.port2]);\n"
+      "  return wait(100); }).then(function () { return caches.match('/shell'); }).then(function (r) { return r.text(); }).then(function (t) { log('cache ' + t); return fetch('/gen'); })\n"
+      ".then(function (r) { return r.text(); }).then(function (t) { log(t); done(); }).catch(fail);\n", "<script src=\"/app.js\"></script>"}},
+      "registered || script from the worker | true activated https://app.example/sw.js ready activated true msg echo:hello true https://app.example msg clients:1:true:top-level true https://app.example "
+      "msg {\"origin\":\"https://app.example\",\"id\":false,\"ports\":0} true https://app.example port {\"got\":\"port\",\"source\":\"window\"} cache shell-body GET|cors||||true",
+      site_basic));
+
+  // an update: a changed script installs next to the one in charge and waits; it takes over when it skips waiting
+  const std::string v1 = "self.addEventListener('install', function () { }); self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });"
+                         "self.addEventListener('fetch', function (e) { if (new URL(e.request.url).pathname === '/version') e.respondWith(new Response('v1')); });"
+                         "self.addEventListener('message', function (e) { if (e.data === 'skip') self.skipWaiting(); });";
+  std::string v2 = v1;
+  v2.replace(v2.find("'v1'"), 4, "'v2'");
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function () { return wait(20); }).then(function () { return fetch('/version'); })"
+      ".then(function (r) { return r.text(); }).then(function (t) { log(t); done(); }).catch(fail);"},
+      {"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "var reg; navigator.serviceWorker.getRegistration().then(function (r) { reg = r; var found = 0; reg.addEventListener('updatefound', function () { found++; log('updatefound ' + reg.installing.state); });\n"
+      "  return reg.update().then(function (same) { log('update ' + (same === reg) + ' found=' + found + ' installing=' + (reg.installing && reg.installing.state)); return wait(50); }); })\n"
+      ".then(function () { log('waiting=' + (reg.waiting && reg.waiting.state) + ' active=' + reg.active.state + ' installing=' + reg.installing); return fetch('/version'); }).then(function (r) { return r.text(); })\n"
+      ".then(function (t) { log('still ' + t); var changed = new Promise(function (r) { navigator.serviceWorker.addEventListener('controllerchange', r); }); reg.waiting.postMessage('skip'); return changed; })\n"
+      ".then(function () { return wait(20); }).then(function () { log('now waiting=' + reg.waiting + ' active=' + reg.active.state); return fetch('/version'); }).then(function (r) { return r.text(); })\n"
+      ".then(function (t) { log(t); return reg.update(); }).then(function () { log('same script: installing=' + reg.installing); done(); }).catch(fail);",
+       "", [v2](FakeEnvironment& env) { serve(env, "/sw.js", "application/javascript", v2); }}},
+      "v1 || updatefound installing update true found=1 installing=installing waiting=installed active=activated installing=null still v1 now waiting=null active=activated v2 same script: installing=null",
+      [v1](FakeEnvironment& env) { serve(env, "/sw.js", "application/javascript", v1); }));
+
+  // what register() refuses
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "function attempt(url, options) { return navigator.serviceWorker.register(url, options).then(function () { return 'ok'; }, function (e) { return e.name; }); }\n"
+      "attempt('/missing.js').then(function (r) { log('404 ' + r); return attempt('/html.js'); }).then(function (r) { log('mime ' + r); return attempt('/dir/sw.js', { scope: '/' }); })\n"
+      ".then(function (r) { log('scope ' + r); return attempt('/dir/allowed.js', { scope: '/' }); }).then(function (r) { log('allowed ' + r); return attempt('https://other.example/sw.js'); })\n"
+      ".then(function (r) { log('origin ' + r); return attempt('/syntax.js'); }).then(function (r) { log('syntax ' + r); return attempt('/throws.js'); }).then(function (r) { log('throws ' + r); return attempt('/imports.js'); })\n"
+      ".then(function (r) { log('imports ' + r); return attempt('/dir/ok.js', { scope: '/dir/x/' }); }).then(function (r) { log('inner ' + r); return attempt('/dir/ok.js', { type: 'bogus' }); })\n"
+      ".then(function (r) { log('type ' + r); return navigator.serviceWorker.getRegistrations(); }).then(function (l) { log(l.map(function (r) { return r.scope; }).join()); done(); }).catch(fail);"}},
+      "404 TypeError mime SecurityError scope SecurityError allowed ok origin SecurityError syntax TypeError throws TypeError imports TypeError inner ok type TypeError https://app.example/,https://app.example/dir/x/",
+      [](FakeEnvironment& env) {
+        serve(env, "/html.js", "text/html", "x");
+        serve(env, "/dir/sw.js", "application/javascript", "");
+        serve(env, "/dir/allowed.js", "application/javascript", "", 200, "Service-Worker-Allowed: /\r\n");
+        serve(env, "/syntax.js", "application/javascript", "function (");
+        serve(env, "/throws.js", "application/javascript", "throw new Error('boom');");
+        serve(env, "/imports.js", "application/javascript", "importScripts('/nothing.js');");
+        serve(env, "/dir/ok.js", "application/javascript", "");
+      }));
+  // a page that is not in a secure context has no service workers; a local one has
+  CHECK(visits_are({{"http://app.example/page.html", "console.log(typeof navigator.serviceWorker, isSecureContext)"}}, "undefined false"));
+  CHECK(visits_are({{"http://localhost/page.html", "console.log(typeof navigator.serviceWorker, isSecureContext)"}}, "object true"));
+
+  // a worker that fails to install is redundant and takes its registration along
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "navigator.serviceWorker.register('/sw.js').then(function (reg) { var w = reg.installing; var seen = []; w.addEventListener('statechange', function () { seen.push(w.state); });\n"
+      "  return wait(100).then(function () { log(seen.join() + ' ' + reg.installing + ' ' + reg.waiting + ' ' + reg.active); return navigator.serviceWorker.getRegistration(); }); })\n"
+      ".then(function (r) { log('registration ' + r); done(); }).catch(fail);"}},
+      "redundant null null null registration undefined",
+      [](FakeEnvironment& env) { serve(env, "/sw.js", "application/javascript", "self.addEventListener('install', function (e) { e.waitUntil(Promise.reject(new Error('no'))); });"); }));
+
+  // unregister(): the registration is gone at once; the document it controls keeps its worker until it is closed; the next one is not controlled
+  CHECK(visits_are({{"https://app.example/dir/page.html", register_basic},
+                    {"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "navigator.serviceWorker.getRegistration().then(function (reg) { return reg.unregister().then(function (b) { log('unregistered ' + b); return navigator.serviceWorker.getRegistration(); }); })\n"
+      ".then(function (r) { log('now ' + r + ' controller ' + !!navigator.serviceWorker.controller); return fetch('/shell'); }).then(function (r) { return r.text(); }).then(function (t) { log(t); done(); }).catch(fail);"},
+                    {"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "log('controller ' + navigator.serviceWorker.controller); fetch('/shell').then(function (r) { log(r.status); return caches.match('/shell'); }).then(function (r) { return r.text(); }).then(function (t) { log('cache kept ' + t); done(); }).catch(fail);"}},
+      "registered || unregistered true now undefined controller true shell-body || controller null 404 cache kept shell-body",
+      site_basic));
+
+  // scopes: the longest one that holds the address is in charge
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "var swa = \"self.addEventListener('install', function () { self.skipWaiting(); }); self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); }); self.addEventListener('fetch', function (e) { if (new URL(e.request.url).pathname === '/who') e.respondWith(new Response('%')); });\";\n"
+      "Promise.all([navigator.serviceWorker.register('/a.js', { scope: '/' }), navigator.serviceWorker.register('/b.js', { scope: '/dir/' }), navigator.serviceWorker.register('/c.js', { scope: '/other/' })])\n"
+      ".then(function () { return wait(100); }).then(function () { return Promise.all([navigator.serviceWorker.getRegistration(), navigator.serviceWorker.getRegistration('/other/x'), navigator.serviceWorker.getRegistration('/zzz'), navigator.serviceWorker.getRegistrations()]); })\n"
+      ".then(function (r) { log(r[0].scope + ' ' + r[1].scope + ' ' + r[2].scope + ' ' + r[3].length + ' ' + r[0].active.scriptURL); done(); }).catch(fail);"},
+      {"https://app.example/dir/page.html", std::string(kSwPrelude) + "fetch('/who').then(function (r) { return r.text(); }).then(function (t) { log('dir page: ' + t + ' ' + navigator.serviceWorker.controller.scriptURL); done(); });"},
+      {"https://app.example/page.html", std::string(kSwPrelude) + "fetch('/who').then(function (r) { return r.text(); }).then(function (t) { log('root page: ' + t + ' ' + navigator.serviceWorker.controller.scriptURL); done(); });"},
+      {"https://elsewhere.example/page.html", std::string(kSwPrelude) + "log(navigator.serviceWorker.controller); navigator.serviceWorker.getRegistrations().then(function (l) { log(l.length); done(); });"}},
+      "https://app.example/dir/ https://app.example/other/ https://app.example/ 3 https://app.example/b.js || dir page: b https://app.example/b.js || root page: a https://app.example/a.js || null 0",
+      [](FakeEnvironment& env) {
+        const char* names[3] = {"a", "b", "c"};
+        for (const char* n : names) {
+          std::string body = "self.addEventListener('install', function () { self.skipWaiting(); }); self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });"
+                             "self.addEventListener('fetch', function (e) { if (new URL(e.request.url).pathname === '/who') e.respondWith(new Response('" + std::string(n) + "')); });";
+          serve(env, (std::string("/") + n + ".js").c_str(), "application/javascript", body);
+        }
+      }));
+
+  // stale-while-revalidate: the second answer comes from the cache and the cache is refreshed from the network after it went out (waitUntil)
+  CHECK(visits_are({{"https://app.example/dir/page.html", register_basic},
+                    {"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "fetch('/swr').then(function (r) { return r.text(); }).then(function (t) { log(t); return fetch('/swr'); }).then(function (r) { return r.text(); }).then(function (t) { log(t); return wait(50); })"
+      ".then(function () { return caches.open('swr'); }).then(function (c) { return c.match('/swr'); }).then(function (r) { return r.text(); }).then(function (t) { log('cached ' + t); done(); }).catch(fail);"}},
+      "registered || swr-net swr-net cached swr-net",
+      [](FakeEnvironment& env) { site_basic(env); }));
+  {   // (how many times the network was asked: once for the first answer, once for the refresh behind the second)
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      site_basic(env);
+      MediaEnvironment media;
+      {
+        Page page(a, env, "https://app.example/dir/page.html", media, true);
+        page.load(("<html><body><script>" + std::string(kSwPrelude) + "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function () { return wait(20); }).then(function () { done(); });</script></body></html>").c_str());
+        settle_page(page, env);
+      }
+      Page page(a, env, "https://app.example/dir/page.html", media, true);
+      page.load(("<html><body><script>" + std::string(kSwPrelude) + "fetch('/swr').then(function (r) { return r.text(); }).then(function () { return fetch('/swr'); }).then(function (r) { return r.text(); }).then(function () { done(); });</script></body></html>").c_str());
+      settle_page(page, env);
+      int asked = 0;
+      for (const std::string& s : env.net.sent)
+        if (s.find("GET https://app.example/swr\n") == 0) ++asked;
+      CHECK(asked == 2);
+      // a navigation to an address in the scope is answered by the worker too, with no document asking
+      FetchOptions options;
+      options.url = "https://app.example/shell";
+      options.mode = FetchOptions::Mode::Navigate;
+      NetResponse response(a);
+      CHECK(env.workers.controls("https://app.example/anything"));
+      CHECK(env.workers.intercept(0, options, "document", true, &response) == ServiceWorkerHub::Intercept::Responded && response.status == 200 && StringView(response.body.view()).equals("shell-body"));
+      options.url = "https://elsewhere.example/shell";
+      CHECK(!env.workers.controls("https://elsewhere.example/shell") && env.workers.intercept(0, options, "document", true, &response) == ServiceWorkerHub::Intercept::Pass);
+      // the hub saves what it keeps and a hub of another browser brings it back: the worker is active again and answers without having been fetched
+      List<SavedRegistration> saved(a);
+      env.workers.snapshot(&saved);
+      CHECK(saved.count() == 1 && saved[0].scope.view().equals("https://app.example/") && saved[0].source.view().contains("addEventListener"));
+      FakeEnvironment other(a);
+      CHECK(other.workers.restore(static_cast<SavedRegistration&&>(saved[0])));
+      Page restored(a, other, "https://app.example/dir/page.html", media, true);
+      restored.load(("<html><body><script>" + std::string(kSwPrelude) + "log(!!navigator.serviceWorker.controller); fetch('/gen', { method: 'PUT', body: 'q' }).then(function (r) { return r.text(); }).then(function (t) { log(t); return navigator.serviceWorker.ready; })"
+                     ".then(function (reg) { log(reg.active.state + ' ' + reg.scope); done(); }).catch(fail);</script></body></html>").c_str());
+      settle_page(restored, other);
+      std::string log(restored.log().data(), restored.log().size());
+      CHECK(log == "true PUT|cors|||q|true activated https://app.example/\n");
+      CHECK(other.net.sent.empty());   // (nothing was fetched: not the script, and the worker answered itself)
+      // a Clear-Site-Data for the origin takes the registrations (and the caches) away
+      other.workers.clear_origin("https://app.example");
+      Page after(a, other, "https://app.example/dir/page.html", media, true);
+      after.load(("<html><body><script>navigator.serviceWorker.getRegistrations().then(function (l) { console.log(l.length, !!navigator.serviceWorker.controller); });</script></body></html>"));
+      settle_page(after, other);
+      CHECK(std::string(after.log().data(), after.log().size()) == "0 false\n");
+    }
+    CHECK(a.live == 0);
+  }
+
+  {   // what the browser saved is read back with care: a truncated or damaged record never crashes the hub (it keeps what it can use)
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      const std::string imports = "https://app.example/one.js\n12\nvar one = 1;\nhttps://app.example/two.js\n9\nvar t = 2;";
+      for (size_t cut = 0; cut <= imports.size(); ++cut) {
+        SavedRegistration saved(a);
+        saved.origin.assign("https://app.example");
+        saved.scope.assign("https://app.example/");
+        saved.script_url.assign("https://app.example/sw.js");
+        saved.update_via_cache.assign("imports");
+        saved.type.assign("classic");
+        saved.source.assign("importScripts('https://app.example/one.js');");
+        saved.imports.assign(StringView(imports.data(), cut));
+        env.workers.restore(static_cast<SavedRegistration&&>(saved));
+      }
+      for (size_t at = 0; at < imports.size(); ++at)
+        for (int bit = 0; bit < 8; bit += 3) {
+          std::string flipped = imports;
+          flipped[at] = static_cast<char>(flipped[at] ^ (1 << bit));
+          SavedRegistration saved(a);
+          saved.origin.assign("https://app.example");
+          saved.scope.assign("https://app.example/x/");
+          saved.script_url.assign("https://app.example/sw.js");
+          saved.source.assign("1;");
+          saved.imports.assign(StringView(flipped.data(), flipped.size()));
+          env.workers.restore(static_cast<SavedRegistration&&>(saved));
+        }
+      List<SavedRegistration> kept(a);
+      env.workers.snapshot(&kept);
+      CHECK(kept.count() > 0 && kept.count() <= ServiceWorkerHub::kMaxRegistrations);
+    }
+    CHECK(a.live == 0);
+  }
+
+  // background sync fires the sync event; a worker that is idle is stopped and started again for the next event (its globals start over)
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "navigator.serviceWorker.addEventListener('message', function (e) { log('msg ' + e.data); });\n"
+      "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function (reg) { return reg.sync.register('outbox').then(function () { return reg.sync.getTags(); }); })\n"
+      ".then(function (tags) { log('tags ' + tags.join()); return wait(100); }).then(function () { return navigator.serviceWorker.ready; }).then(function (reg) { return reg.sync.getTags(); }).then(function (t) { log('left ' + t.length);\n"
+      "  return reg0(); }).then(function () { done(); }).catch(fail);\n"
+      "function reg0() { return navigator.serviceWorker.getRegistration().then(function (r) { return r.periodicSync.register('p').catch(function (e) { log('periodic ' + e.name); return r.pushManager.subscribe().catch(function (e2) { log('push ' + e2.name); return r.showNotification('x').catch(function (e3) { log('notify ' + e3.name); }); }); }); }); }"}},
+      "tags outbox msg sync:outbox left 0 periodic NotAllowedError push NotAllowedError notify TypeError",
+      site_basic));
+
+  // navigation preload: the worker's preloadResponse is the network answer for a navigation, with the header the page asked for
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function (reg) { var m = reg.navigationPreload;\n"
+      "  return m.getState().then(function (s) { log(JSON.stringify(s)); return m.enable(); }).then(function () { return m.setHeaderValue('yes'); }).then(function () { return m.getState(); }); })\n"
+      ".then(function (s) { log(JSON.stringify(s)); done(); }).catch(fail);"}},
+      "{\"enabled\":false,\"headerValue\":\"true\"} {\"enabled\":true,\"headerValue\":\"yes\"}",
+      [](FakeEnvironment& env) {
+        serve(env, "/sw.js", "application/javascript",
+              "self.addEventListener('install', function () { self.skipWaiting(); }); self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });"
+              "self.addEventListener('fetch', function (e) { e.respondWith(e.preloadResponse.then(function (r) { return r || fetch(e.request); })); });");
+      }));
+  {   // ...and a navigation does get a preload response and the header
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      serve(env, "/sw.js", "application/javascript",
+            "self.addEventListener('install', function () { self.skipWaiting(); }); self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });"
+            "self.addEventListener('fetch', function (e) { e.respondWith(e.preloadResponse.then(function (r) { return r ? r.text().then(function (t) { return new Response('preloaded:' + t + ':' + e.request.mode + ':' + e.request.destination); }) : new Response('none'); })); });");
+      serve(env, "/doc", "text/html", "network-document");
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/dir/page.html", media, true);
+      page.load(("<html><body><script>" + std::string(kSwPrelude) + "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function (reg) { return reg.navigationPreload.enable(); }).then(function () { done(); });</script></body></html>").c_str());
+      settle_page(page, env);
+      FetchOptions options;
+      options.url = "https://app.example/doc";
+      options.mode = FetchOptions::Mode::Navigate;
+      NetResponse response(a);
+      CHECK(env.workers.intercept(0, options, "document", true, &response) == ServiceWorkerHub::Intercept::Responded && StringView(response.body.view()).equals("preloaded:network-document:navigate:document"));
+      bool sent_header = false;
+      for (const std::string& s : env.net.sent)
+        if (s.find("GET https://app.example/doc") == 0 && s.find("service-worker-navigation-preload: true") != std::string::npos) sent_header = true;
+      if (!sent_header) for (const std::string& s : env.net.sent) { std::string e; for (char c : s) { if (c == '\n') e += "\\n"; else if (c == '\r') e += "\\r"; else e += c; } printf("   sent: %s\n", e.c_str()); }
+      CHECK(sent_header);
+    }
+    CHECK(a.live == 0);
+  }
+}
+
 int main(int argc, char** argv) {
-  if (const char* probe = getenv("PROBE")) {   // runs a script file in a page and prints what it logged (for looking at what an API has)
-    std::string script;
-    if (FILE* f = fopen(probe, "rb")) { int c; while ((c = fgetc(f)) != EOF) script.push_back(static_cast<char>(c)); fclose(f); }
-    printf("%s\n", run_async(script.c_str(), "https://app.example/dir/page.html").c_str());
+  if (const char* probe = getenv("PROBE")) {   // runs script files (comma separated: one document after the other) and prints what they logged (for looking at what an API has)
+    std::vector<Visit> list;
+    std::string names = probe;
+    for (size_t at = 0; at <= names.size();) {
+      size_t comma = names.find(',', at);
+      if (comma == std::string::npos) comma = names.size();
+      std::string script;
+      if (FILE* f = fopen(names.substr(at, comma - at).c_str(), "rb")) { int c; while ((c = fgetc(f)) != EOF) script.push_back(static_cast<char>(c)); fclose(f); }
+      list.push_back(Visit{"https://app.example/dir/page.html", script});
+      at = comma + 1;
+    }
+    printf("%s\n", visits(list).c_str());
     return 0;
   }
   setvbuf(stdout, nullptr, _IONBF, 0);
+  if (getenv("ONLY_SW")) {   // (just the Cache API and service worker tests)
+    test_cache_api();
+    if (getenv("ONLY_SW")[0] == '2') test_service_workers();
+    printf(g_failed ? "%d check(s) failed\n" : "service worker tests passed\n", g_failed);
+    return g_failed ? 1 : 0;
+  }
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
     printf("%s\n", run_async(argv[1], "https://app.example/dir/page.html").c_str());
     return 0;
@@ -4709,6 +5176,7 @@ int main(int argc, char** argv) {
   test_navigation();
   test_clipboard();
   test_wasm();
+  test_cache_api();
   test_messaging();
   test_history_api();
   test_scripts_during_load();

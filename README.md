@@ -14,7 +14,7 @@ kernel image and runs as kernel threads in one address space. That includes:
 - the network stack: IPv4, TCP, UDP, DHCP, DNS, TLS 1.3/1.2, HTTP/1.1, HTTP/3 over QUIC, WebSockets, SNMP, IPP
 - the sound server and the media codecs
 - the database layer, including a built-in SQL database and a PostgreSQL client
-- a JavaScript engine, an HTML/CSS/DOM web browser model (with a WebAssembly runtime) and a regular expression engine
+- a JavaScript engine, an HTML/CSS/DOM web browser model (with a WebAssembly runtime, service workers and the Cache API) and a regular expression engine
 - the GUI toolkit and the desktop itself
 
 There is no system-call boundary or driver-model split. Services call each other directly through interfaces, which keeps
@@ -41,6 +41,10 @@ cmake --build build --target run-std # always with the standard VGA card (softwa
 `run-gl` needs QEMU built with virglrenderer and a host OpenGL stack. `scripts/qemu-debug.sh` and `scripts/gdb-proxy.py`
 take `QEMU_GPU=gl` (virgl), `virtio` (virtio-gpu, software rendering), `std` (Bochs VGA, software rendering) or the default
 `auto`. Without a 3D engine everything falls back to the software renderers.
+
+The VM has an Intel HD Audio card (`ich9-intel-hda` with an `hda-duplex` codec) played through the host's sound server: PipeWire,
+else PulseAudio, ALSA or SDL. `QEMU_AUDIO=<driver>` in the scripts (`-DQEMU_AUDIO_DRIVER=<driver>` for the cmake targets) picks
+another `-audiodev` driver; `QEMU_AUDIO=wav` records to `audio.wav` in the build directory to check without speakers.
 
 Host tests build with ASan and UBSan and run with `tests/run_host_tests.sh <TestName>`.
 

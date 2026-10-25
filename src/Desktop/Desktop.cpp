@@ -54,6 +54,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       cookie_jar_(allocator),
       local_storage_(allocator),
       page_hub_(allocator),
+      cache_store_(allocator),
+      service_workers_(allocator),
       web_browser_(allocator),
       terminal_(allocator),
       calculator_(allocator),
@@ -142,6 +144,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   setup_spreadsheet(spreadsheet_);
   setup_database_query(database_query_);
   setup_web_browser(web_browser_);
+  service_workers_.set_host(&web_browser_.environment());
   setup_terminal(terminal_);
   setup_calculator(calculator_);
   setup_explorer(explorer_);
@@ -265,6 +268,7 @@ void Desktop::setup_web_browser(WebBrowser& web) {
   web.set_page_loader(page_loader_);
   web.set_cookie_jar(&cookie_jar_);
   web.set_shared_hubs(&local_storage_, &page_hub_);
+  web.set_service_workers(&service_workers_, &cache_store_);
   web.set_clock(&Desktop::unix_ms, this);
   web.set_media_services(media_mixer_, media_codecs_, media_clock_);
   web.set_open_window_handler(&Desktop::open_script_window, this);
@@ -841,6 +845,8 @@ Desktop::~Desktop() {
   copy_progress_.cancel();
   copy_progress_.wait_until_idle(30000000);
   window_.wait_for_background(30000000);
+  service_workers_.stop_all();   // (the workers borrow the main browser's network: they go before it)
+  service_workers_.set_host(nullptr);
 }
 
 void Desktop::on_copy_finished(void* self, Control&) {
@@ -909,7 +915,9 @@ void Desktop::pump(uint64_t uptime_us) {
   toasts_.tick(uptime_us);
   if (browser_store_ && browser_data_restored_ && uptime_us - last_browser_save_us_ > 30000000ull) {   // (the data of the browser is saved when it changed, at most every half minute)
     last_browser_save_us_ = uptime_us;
-    if (cookie_jar_.version() != saved_cookie_version_ || local_storage_.version() != saved_storage_version_) save_browser_data();
+    if (cookie_jar_.version() != saved_cookie_version_ || local_storage_.version() != saved_storage_version_ || cache_store_.version() != saved_cache_version_ ||
+        service_workers_.version() != saved_worker_version_)
+      save_browser_data();
   }
   for (uint64_t i = 0; i < extra_browsers_.count(); ++i) extra_browsers_[i]->tick(uptime_us);
   if (__atomic_exchange_n(&reap_needed_, false, __ATOMIC_ACQ_REL)) reap_closed();

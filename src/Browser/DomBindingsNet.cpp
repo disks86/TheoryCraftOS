@@ -182,61 +182,72 @@ bool opt_text(Vm& vm, const Value& opts, const char* name, String* out) {
   return out->assign(s->view()) || true;
 }
 
-// Makes the request an options object describes and builds the answer object: { ok, status, statusText, url, redirected, opaque, headers, body } or { ok: false, error }.
-bool perform(Vm& vm, const Value& opts, Value* result) {
+// Copies what an options object says into `job` (nothing in it points at script objects afterwards).
+bool read_request(Vm& vm, const Value& opts, NetJob* job) {
   DomBindings::Impl& c = impl(vm);
-  String method(vm.allocator()), url(vm.allocator()), headers(vm.allocator()), mode(vm.allocator()), credentials(vm.allocator()), redirect(vm.allocator());
-  method.assign("GET");
-  mode.assign("cors");
-  credentials.assign("same-origin");
-  redirect.assign("follow");
+  job->method.assign("GET");
+  job->mode.assign("cors");
+  job->credentials.assign("same-origin");
+  job->redirect.assign("follow");
   if (!opts.is_object()) return vm.throw_error(ErrorKind::TypeError, "request options are missing");
-  if (!opt_text(vm, opts, "method", &method) || !opt_text(vm, opts, "url", &url) || !opt_text(vm, opts, "headers", &headers) || !opt_text(vm, opts, "mode", &mode) ||
-      !opt_text(vm, opts, "credentials", &credentials) || !opt_text(vm, opts, "redirect", &redirect))
+  if (!opt_text(vm, opts, "method", &job->method) || !opt_text(vm, opts, "url", &job->url) || !opt_text(vm, opts, "headers", &job->headers) || !opt_text(vm, opts, "mode", &job->mode) ||
+      !opt_text(vm, opts, "credentials", &job->credentials) || !opt_text(vm, opts, "redirect", &job->redirect))
     return false;
-  String referrer(vm.allocator()), referrer_policy(vm.allocator());
   Value referrer_value;
-  const bool referrer_given = vm.get_named(opts, "referrer", &referrer_value) && referrer_value.is_string();
-  if (!opt_text(vm, opts, "referrer", &referrer) || !opt_text(vm, opts, "referrerPolicy", &referrer_policy)) return false;
-  ByteBuffer body(vm.allocator());
+  job->referrer_given = vm.get_named(opts, "referrer", &referrer_value) && referrer_value.is_string();
+  if (!opt_text(vm, opts, "referrer", &job->referrer) || !opt_text(vm, opts, "referrerPolicy", &job->referrer_policy)) return false;
   Value b;
   if (!vm.get_named(opts, "body", &b)) return false;
   StringView bytes;
   if (b.is_string()) {
-    body.append(b.as_string()->view().bytes());
+    job->body.append(b.as_string()->view().bytes());
   } else if (byte_array_bytes(b, &bytes)) {
-    body.append(bytes.bytes());
+    job->body.append(bytes.bytes());
   } else if (!b.is_nullish()) {
     String text(vm.allocator());
     if (!arg_text(vm, b, &text)) return false;
-    body.append(text.view().bytes());
+    job->body.append(text.view().bytes());
   }
   double timeout = 0;
   Value t;
   if (vm.get_named(opts, "timeout", &t) && t.is_number()) timeout = t.u.number;
+  job->page_address.assign(c.host.address());
+  job->now_ms = vm.host() ? vm.host()->now_ms() : 0;
+  job->timeout_ms = timeout > 0 && timeout < 3.6e6 ? static_cast<uint32_t>(timeout) : 0;
+  return true;
+}
 
+// Sends the request of `job` (on whichever thread) and keeps the answer in job->response.
+bool send_request(IDomHost& host, NetJob* job) {
   FetchOptions fo;
-  fo.method = method.view();
-  fo.url = url.view();
-  fo.headers = headers.view();
-  fo.body = body.view();
+  fo.method = job->method.view();
+  fo.url = job->url.view();
+  fo.headers = job->headers.view();
+  fo.body = job->body.view();
+  const StringView mode = job->mode.view(), credentials = job->credentials.view(), redirect = job->redirect.view();
   fo.mode = mode.equals("no-cors") ? FetchOptions::Mode::NoCors : mode.equals("same-origin") ? FetchOptions::Mode::SameOrigin : mode.equals("navigate") ? FetchOptions::Mode::Navigate : FetchOptions::Mode::Cors;
   fo.credentials = credentials.equals("include") ? FetchOptions::Credentials::Include : credentials.equals("omit") ? FetchOptions::Credentials::Omit : FetchOptions::Credentials::SameOrigin;
   fo.redirect = redirect.equals("error") ? FetchOptions::Redirect::Error : redirect.equals("manual") ? FetchOptions::Redirect::Manual : FetchOptions::Redirect::Follow;
-  fo.referrer_given = referrer_given;
-  fo.referrer = referrer.view();
-  fo.referrer_policy = referrer_policy.view();
-  fo.page_address = c.host.address();
-  fo.now_ms = vm.host() ? vm.host()->now_ms() : 0;
-  fo.timeout_ms = timeout > 0 && timeout < 3.6e6 ? static_cast<uint32_t>(timeout) : 0;
-  NetResponse response(vm.allocator());
-  const bool ok = c.host.http_request(fo, &response);
+  fo.referrer_given = job->referrer_given;
+  fo.referrer = job->referrer.view();
+  fo.referrer_policy = job->referrer_policy.view();
+  fo.page_address = job->page_address.view();
+  fo.now_ms = job->now_ms;
+  fo.timeout_ms = job->timeout_ms;
+  return host.http_request(fo, &job->response);
+}
+
+// Builds the answer object: { ok, status, statusText, url, redirected, opaque, headers, body } or { ok: false, error }. Script thread only.
+void build_answer(Vm& vm, NetJob& job, Value* result) {
+  DomBindings::Impl& c = impl(vm);
+  const NetResponse& response = job.response;
+  if (job.ok) c.host.http_answered(response);
   JsObject* r = vm.new_plain();
   *result = Value::make_object(r);
-  vm.define_named(r, "ok", bool_value(ok));
-  if (!ok) {
+  vm.define_named(r, "ok", bool_value(job.ok));
+  if (!job.ok) {
     vm.define_named(r, "error", str_value(vm, response.error.empty() ? StringView("Failed to fetch") : response.error.view()));
-    return true;
+    return;
   }
   vm.define_named(r, "status", num_value(response.status));
   vm.define_named(r, "statusText", str_value(vm, response.reason.view()));
@@ -245,12 +256,20 @@ bool perform(Vm& vm, const Value& opts, Value* result) {
   vm.define_named(r, "opaque", bool_value(response.opaque));
   vm.define_named(r, "headers", str_value(vm, response.headers.view()));
   vm.define_named(r, "body", Value::make_object(make_byte_array(c, StringView(response.body.view()))));
+}
+
+// Makes the request an options object describes, waiting for the answer.
+bool perform(Vm& vm, const Value& opts, Value* result) {
+  NetJob job(vm.allocator());
+  if (!read_request(vm, opts, &job)) return false;
+  job.ok = send_request(impl(vm).host, &job);
+  build_answer(vm, job, result);
   return true;
 }
 
 NATIVE(net_send_sync) { return perform(vm, arg_at(args, argc, 0), result); }
 
-// The timer task of an asynchronous request: makes it, then hands the answer to the callback.
+// The timer task of an asynchronous request when there are no threads: makes it, then hands the answer to the callback.
 NATIVE(net_run) {
   Value answer;
   if (!perform(vm, arg_at(args, argc, 0), &answer)) return false;
@@ -259,13 +278,113 @@ NATIVE(net_run) {
   return vm.call(callback, Value(), &answer, 1, result);
 }
 
-// __net_send(options, callback): the request is made as a task of its own (after the script that asked, as the network would answer); returns the timer id.
+// A worker thread takes the oldest queued request until there is none, then ends. The script thread never frees a job that is not Done.
+void net_worker(void* argument) {
+  DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(argument);
+  for (;;) {
+    NetJob* job = nullptr;
+    {
+      kernel::ScopedMutex lock(c.net_mutex);
+      if (!c.net_closing)
+        for (UniquePointer<NetJob>& j : c.net_jobs)
+          if (j->state == NetJob::State::Queued) {
+            job = j.get();
+            job->state = NetJob::State::Running;
+            break;
+          }
+      if (!job) {
+        __atomic_fetch_sub(&c.net_workers, 1u, __ATOMIC_ACQ_REL);   // (under the lock, so that a request queued now starts a worker of its own)
+        return;
+      }
+    }
+    const bool ok = send_request(c.host, job);   // (no lock held: this is the slow part)
+    kernel::ScopedMutex lock(c.net_mutex);
+    job->ok = ok;
+    job->state = NetJob::State::Done;
+  }
+}
+
+bool timer_alive(Vm& vm, double id) {
+  Value list;
+  if (!vm.get_named(Value::make_object(vm.global()), "__timers", &list) || !list.is_object()) return false;
+  const JsObject* l = list.as_object();
+  for (uint32_t i = 0; i < l->length; ++i)
+    if (l->items[i].is_object() && l->items[i].as_object()->length >= 3 && l->items[i].as_object()->items[2].is_number() && l->items[i].as_object()->items[2].u.number == id) return true;
+  return false;
+}
+
+// The timer task that waits for an asynchronous request: __net_poll(job id, callback) runs every few milliseconds until the worker is done.
+NATIVE(net_poll) {
+  DomBindings::Impl& c = impl(vm);
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  UniquePointer<NetJob> job;
+  {
+    kernel::ScopedMutex lock(c.net_mutex);
+    for (uint64_t i = 0; i < c.net_jobs.count(); ++i) {
+      if (c.net_jobs[i]->id != id) continue;
+      if (c.net_jobs[i]->state != NetJob::State::Done) return true;   // (not yet: the timer fires again)
+      job = util::move(c.net_jobs[i]);
+      c.net_jobs.remove_at(i);
+      break;
+    }
+  }
+  if (!job) return true;
+  vm.clear_timer(job->timer);
+  const Value callback = arg_at(args, argc, 1);
+  if (!Vm::is_callable(callback)) return true;
+  Value answer;
+  build_answer(vm, *job, &answer);
+  return vm.call(callback, Value(), &answer, 1, result);
+}
+
+// __net_send(options, callback): the request is made by a worker thread, in parallel with the other requests; the callback runs as a task of its own on the
+// script thread when the answer is there. Returns the timer id (clearTimeout cancels the callback). Without threads (the tests) the request is made as a
+// task of its own, after the script that asked.
 NATIVE(net_send) {
   if (!arg_at(args, argc, 0).is_object() || !Vm::is_callable(arg_at(args, argc, 1))) return vm.throw_error(ErrorKind::TypeError, "request options and a callback are needed");
-  Value runner;
-  if (!vm.get_named(Value::make_object(vm.global()), "__net_run", &runner)) return false;
-  const Value task_args[2] = {args[0], args[1]};
-  *result = num_value(vm.add_timer(runner, 0, -1, task_args, 2));
+  DomBindings::Impl& c = impl(vm);
+  if (!kernel::running()) {
+    Value runner;
+    if (!vm.get_named(Value::make_object(vm.global()), "__net_run", &runner)) return false;
+    const Value task_args[2] = {args[0], args[1]};
+    *result = num_value(vm.add_timer(runner, 0, -1, task_args, 2));
+    return true;
+  }
+  Value poller;
+  if (!vm.get_named(Value::make_object(vm.global()), "__net_poll", &poller)) return false;
+  auto job = UniquePointer<NetJob>::make(vm.allocator(), vm.allocator());
+  if (!job) return vm.throw_error(ErrorKind::RangeError, "out of memory");
+  if (!read_request(vm, args[0], job.get())) return false;
+  job->id = ++c.net_next_id;
+  const Value task_args[2] = {num_value(job->id), args[1]};
+  job->timer = vm.add_timer(poller, 2, 2, task_args, 2);
+  const double timer = job->timer;
+  *result = num_value(timer);
+  bool start = false;
+  {
+    kernel::ScopedMutex lock(c.net_mutex);
+    for (uint64_t i = 0; i < c.net_jobs.count();) {   // (requests that were cancelled after they were done)
+      if (c.net_jobs[i]->state == NetJob::State::Done && !timer_alive(vm, c.net_jobs[i]->timer)) c.net_jobs.remove_at(i);
+      else ++i;
+    }
+    if (c.net_jobs.count() >= DomBindings::Impl::kMaxNetJobs || !c.net_jobs.push_back(util::move(job))) {
+      vm.clear_timer(timer);
+      return vm.throw_error(ErrorKind::RangeError, "too many requests at once");
+    }
+    if (c.net_workers < DomBindings::Impl::kMaxNetWorkers) {
+      ++c.net_workers;
+      start = true;
+    }
+  }
+  if (!start) return true;
+  kernel::Thread* thread = kernel::spawn(&net_worker, &c, "net");
+  if (thread) {
+    kernel::detach(thread);
+    return true;
+  }
+  kernel::ScopedMutex lock(c.net_mutex);
+  --c.net_workers;   // (no thread to be had: the request waits for a running worker, or is made by the next request's worker)
   return true;
 }
 
@@ -624,12 +743,26 @@ NATIVE(url_resolve) {
 
 }  // namespace
 
+}  // namespace
+
+DomBindings::Impl::~Impl() {
+  {
+    kernel::ScopedMutex lock(net_mutex);
+    net_closing = true;
+  }
+  while (__atomic_load_n(&net_workers, __ATOMIC_ACQUIRE) != 0) kernel::sleep_us(1000);
+  kernel::ScopedMutex lock(net_mutex);   // (a worker that just finished has let go of the mutex)
+}
+
+namespace bind {
+
 bool install_net(DomBindings::Impl& c) {
   Vm& vm = c.vm;
   JsObject* g = vm.global();
   vm.define_native(g, "__net_send", net_send, 2);
   vm.define_native(g, "__zlib", net_zlib, 3);
   vm.define_native(g, "__net_run", net_run, 2);
+  vm.define_native(g, "__net_poll", net_poll, 2);
   vm.define_native(g, "__net_send_sync", net_send_sync, 1);
   vm.define_native(g, "__utf8_clean", net_utf8_clean, 1);
   vm.define_native(g, "__bytes_to_string", net_bytes_to_string, 1);

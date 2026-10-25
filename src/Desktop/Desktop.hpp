@@ -40,6 +40,8 @@
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/WebBrowser.hpp"
+#include "Browser/CacheStore.hpp"
+#include "Browser/ServiceWorker.hpp"
 #include "Desktop/BrowserStore.hpp"
 #include "Desktop/SessionStore.hpp"
 #include "Desktop/Spreadsheet.hpp"
@@ -348,6 +350,8 @@ class Desktop {
   browser::CookieJar cookie_jar_;   // the web browser's cookies, shared by all its windows
   browser::StorageHub local_storage_;   // and its localStorage (of every origin),
   browser::PageHub page_hub_;            // and what its pages tell each other (storage changes, broadcasts)
+  browser::CacheStore cache_store_;       // the Cache API's caches, of every origin
+  browser::ServiceWorkerHub service_workers_;   // and its service workers (before the browsers: their pages are clients of it to the end)
   WebBrowser web_browser_;
   Terminal terminal_;
   Calculator calculator_;
@@ -368,7 +372,7 @@ class Desktop {
   String database_url_;
   UniquePointer<SessionStore> sessions_;
   UniquePointer<BrowserStore> browser_store_;
-  uint64_t saved_cookie_version_ = 0, saved_storage_version_ = 0, last_browser_save_us_ = 0;
+  uint64_t saved_cookie_version_ = 0, saved_storage_version_ = 0, saved_cache_version_ = 0, saved_worker_version_ = 0, last_browser_save_us_ = 0;
   bool browser_data_restored_ = false;
   List<UniquePointer<FileExplorer>> extra_explorers_;
   List<UniquePointer<Notepad>> extra_notepads_;

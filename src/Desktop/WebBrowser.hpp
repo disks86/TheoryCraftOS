@@ -90,6 +90,13 @@ class WebBrowser : public gui::Frame {
     shared_local_ = local;
     shared_hub_ = hub;
   }
+  // The service workers and the Cache API's storage, to share between the windows (without them pages have no service workers and keep caches of their own).
+  void set_service_workers(browser::ServiceWorkerHub* workers, browser::CacheStore* caches) {
+    sw_hub_ = workers;
+    shared_caches_ = caches;
+  }
+  // What the browser offers a page that runs on its behalf (a service worker): its network, clock and storage.
+  browser::IPageEnvironment& environment() { return env_; }
   void set_clock(UnixClock clock, void* context) { unix_clock_ = clock; unix_clock_context_ = context; }
   // Whether the scripts of pages are run (on by default); the next page loaded (or Reload) takes it.
   void set_scripts_enabled(bool enabled);
@@ -205,9 +212,12 @@ class WebBrowser : public gui::Frame {
     browser::StorageHub& local_storage_hub() override;
     browser::StorageHub& session_storage_hub() override { return session_; }
     browser::PageHub& page_hub() override;
+    browser::ServiceWorkerHub* service_workers() override { return owner_.sw_hub_; }
+    browser::CacheStore* cache_store() override { return owner_.shared_caches_; }
     uint64_t tab_id() override { return tab_; }
     browser::CookieJar& cookies() override;
     bool http_request(const browser::FetchOptions& options, browser::NetResponse* response) override;
+    void http_answered(const browser::NetResponse& response) override;
     UniquePointer<browser::IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) override;
 
    private:
@@ -321,6 +331,8 @@ class WebBrowser : public gui::Frame {
   browser::CookieJar* shared_jar_ = nullptr;
   browser::StorageHub* shared_local_ = nullptr;
   browser::PageHub* shared_hub_ = nullptr;
+  browser::ServiceWorkerHub* sw_hub_ = nullptr;
+  browser::CacheStore* shared_caches_ = nullptr;
   browser::StorageHub own_local_;
   browser::PageHub own_hub_;
   int32_t request_delta_ = 0;       // how far Back / Forward goes in the history

@@ -153,22 +153,26 @@ void apply_geometry(Frame* window, const gui::Rect2D& bounds, Frame::State state
 
 uint32_t Desktop::save_browser_data() {
   if (!browser_store_) return 0;
-  const uint64_t cookies_at = cookie_jar_.version(), storage_at = local_storage_.version();
+  const uint64_t cookies_at = cookie_jar_.version(), storage_at = local_storage_.version(), caches_at = cache_store_.version(), workers_at = service_workers_.version();
   uint64_t now = unix_ms(this);
-  if (!browser_store_->save(cookie_jar_, local_storage_, now)) return 0;
+  if (!browser_store_->save(cookie_jar_, local_storage_, cache_store_, service_workers_, now)) return 0;
   saved_cookie_version_ = cookies_at;
   saved_storage_version_ = storage_at;
+  saved_cache_version_ = caches_at;
+  saved_worker_version_ = workers_at;
   return cookie_jar_.count() + local_storage_.origin_count();
 }
 
 uint32_t Desktop::restore_browser_data() {
   browser_data_restored_ = true;
   if (!browser_store_) return 0;
-  uint32_t cookies = 0, items = 0;
-  browser_store_->load(cookie_jar_, local_storage_, unix_ms(this), &cookies, &items);
+  uint32_t cookies = 0, items = 0, entries = 0, registrations = 0;
+  browser_store_->load(cookie_jar_, local_storage_, cache_store_, service_workers_, unix_ms(this), &cookies, &items, &entries, &registrations);
   saved_cookie_version_ = cookie_jar_.version();
   saved_storage_version_ = local_storage_.version();
-  return cookies + items;
+  saved_cache_version_ = cache_store_.version();
+  saved_worker_version_ = service_workers_.version();
+  return cookies + items + entries + registrations;
 }
 
 uint32_t Desktop::restore_session() {
