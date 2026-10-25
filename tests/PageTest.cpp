@@ -5917,6 +5917,37 @@ static void test_webrtc() {
   CHECK(a.live == 0);
 }
 
+// --- web-platform-tests derived suites ----------------------------------------------------------------------------------------------------
+
+// The files of tests/data/wpt are written in the style of web-platform-tests (testharness.js: test(), async_test(), promise_test(), assert_*) and are ports of what WPT
+// checks for the base platform: dom/nodes, dom/events, dom/lists, url, fetch/api + FileAPI + encoding, html/webappapis + domparsing + ranges + observers, css selectors and
+// cssom, html forms/tables, custom elements/shadow dom/templates, messaging, streams, history, webcrypto, xhr. harness.js reports "FAIL name: reason" for a failing test and
+// "XPASS name" for a known gap (xfail("name") in the file) that started to work, so fixing an engine gap makes this test ask for its xfail line to be removed.
+static void test_wpt() {
+  const std::string harness = read_text_file("tests/data/wpt/harness.js");
+  CHECK(!harness.empty());
+  static const char* const files[] = {"dom_nodes", "dom_events", "dom_lists", "url", "fetch_api", "html_platform", "css_selectors", "cssom", "html_forms", "components", "messaging_streams"};
+  for (const char* name : files) {
+    const std::string source = read_text_file((std::string("tests/data/wpt/") + name + ".js").c_str());
+    CHECK(!source.empty());
+    const std::string log = run_async((harness + "\n" + source).c_str(), "https://app.example/dir/page.html", nullptr, 4000);
+    const bool done = log.find("DONE ") != std::string::npos;
+    if (!done) printf("   wpt %s never finished: %s\n", name, log.substr(0, 400).c_str());
+    CHECK(done);
+    for (size_t at = 0; (at = log.find("FAIL ", at)) != std::string::npos; ++at) {
+      if (at != 0 && log.compare(at - 3, 3, " | ") != 0) continue;   // (only a line that starts with it)
+      size_t end = log.find(" | ", at);
+      printf("   wpt %s: %s\n", name, log.substr(at, end == std::string::npos ? std::string::npos : end - at).c_str());
+      ++g_failed;
+    }
+    for (size_t at = 0; (at = log.find("XPASS ", at)) != std::string::npos; ++at) {
+      size_t end = log.find(" | ", at);
+      printf("   wpt %s fixed a known gap (remove its xfail): %s\n", name, log.substr(at + 6, end == std::string::npos ? std::string::npos : end - at - 6).c_str());
+      ++g_failed;
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   if (const char* probe = getenv("PROBE")) {   // runs script files (comma separated: one document after the other) and prints what they logged (for looking at what an API has)
     std::vector<Visit> list;
@@ -5945,6 +5976,11 @@ int main(int argc, char** argv) {
   test_webgl_compressed();
   test_webgl_bptc_astc();
     printf(g_failed ? "%d check(s) failed\n" : "webgl and webgpu tests passed\n", g_failed);
+    return g_failed ? 1 : 0;
+  }
+  if (getenv("ONLY_WPT")) {   // (just the web-platform-tests derived suites)
+    test_wpt();
+    printf(g_failed ? "%d check(s) failed\n" : "wpt tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
   if (getenv("ONLY_SW")) {   // (just the Cache API and service worker tests)
@@ -6023,6 +6059,7 @@ int main(int argc, char** argv) {
   test_iframe();
   test_svg();
   test_input_more();
+  test_wpt();
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;
