@@ -17,6 +17,7 @@
  */
 
 #include "SystemFileSystem.hpp"
+#include "FileSystem/Befs/BefsFileSystem.hpp"
 #include "FileSystem/Fat/FatFileSystem.hpp"
 #include "Hardware/StorageDevice/Partition/PartitionScanner.hpp"
 #include "Kernel/Thread.hpp"
@@ -27,7 +28,7 @@ using namespace filesystem;
 
 namespace {
 
-// A FAT volume and what it reads through: the device (kept alive by this), the window onto the partition, and the filesystem.
+// A FAT or BeFS volume and what it reads through: the device (kept alive by this), the window onto the partition, and the filesystem.
 class StorageVolume final : public IVolume {
  public:
   explicit StorageVolume(SharedPointer<IStorageDevice> device) : device_(util::move(device)) {}
@@ -42,7 +43,8 @@ class StorageVolume final : public IVolume {
       if (!partition_) return false;
       target = partition_.get();
     }
-    return FatFileSystem::mount(allocator, *target, 0, &fs_) == Status::Ok;
+    if (FatFileSystem::mount(allocator, *target, 0, &fs_) == Status::Ok) return true;
+    return BefsFileSystem::mount(allocator, *target, 0, &fs_) == Status::Ok;
   }
 
  private:
