@@ -22,7 +22,7 @@
 namespace kernel {
 
 namespace {
-inline void pause_hint() { __asm__ volatile("pause"); }
+inline void pause_hint() { kernel::cpu_relax(); }
 
 // Deadlines are kept as timestamp-counter values; waits take microseconds.
 uint64_t deadline_tsc(uint64_t timeout_us) { return hardware::read_tsc() + timeout_us * hardware::tsc_ticks_per_us(); }

@@ -34,7 +34,7 @@ class RawSpinLock {
   void lock() {
     const uint64_t flags = irq_save();
     while (__atomic_exchange_n(&locked_, 1, __ATOMIC_ACQUIRE)) {
-      while (__atomic_load_n(&locked_, __ATOMIC_RELAXED)) __asm__ volatile("pause");
+      while (__atomic_load_n(&locked_, __ATOMIC_RELAXED)) cpu_relax();
     }
     saved_flags_ = flags;
   }

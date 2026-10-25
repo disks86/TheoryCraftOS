@@ -17,10 +17,15 @@
  */
 
 #include <new>
-#include "Kernel/Apic.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Firmware.hpp"
+#if defined(__x86_64__)
+#include "Kernel/Apic.hpp"
 #include "Kernel/Paging.hpp"
+#elif defined(__aarch64__)
+#include "Arch/AArch64/Gic.hpp"
+#include "Arch/AArch64/Timer.hpp"
+#endif
 #include "Kernel/Thread.hpp"
 
 namespace kernel {
@@ -33,7 +38,7 @@ constexpr uint32_t kSliceTicks = 10;
 struct Core {
   Core* self = nullptr;  // first field: read through the GS base
   uint32_t index = 0;
-  uint32_t apic_id = 0;
+  uint64_t apic_id = 0;   // what addresses the core in an inter-processor interrupt (APIC id; MPIDR affinity on ARM)
   bool online = false;
   bool parked = false;
   hardware::CoreKind kind = hardware::CoreKind::Performance;
@@ -71,6 +76,9 @@ struct Scheduler {
 };
 
 Scheduler g;
+
+// ---- the few places where the two architectures differ ----
+#if defined(__x86_64__)
 alignas(16) uint8_t g_fpu_template[512];
 
 constexpr uint32_t kMsrGsBase = 0xC0000101;
@@ -90,7 +98,66 @@ Core* this_core() {
   return c;
 }
 
-inline void pause_hint() { __asm__ volatile("pause"); }
+void send_wakeup(uint64_t hardware_id) { apic::send_ipi(static_cast<uint32_t>(hardware_id), kVectorWakeup); }
+void stop_tick() { apic::stop_timer(); }
+void ack_tick() { apic::eoi(); }
+void ack_wakeup() { apic::eoi(); }
+[[noreturn]] void halt_forever() { for (;;) __asm__ volatile("cli; hlt"); }
+void idle_wait() { __asm__ volatile("sti; hlt"); }
+void start_tick(uint32_t hz) { apic::start_timer(hz); }
+// Makes `c` this core's record and returns what the firmware had there.
+uint64_t swap_core_pointer(Core* c) {
+  const uint64_t old = rdmsr(kMsrGsBase);
+  wrmsr(kMsrGsBase, reinterpret_cast<uint64_t>(c));
+  return old;
+}
+void restore_core_pointer(uint64_t old) { wrmsr(kMsrGsBase, old); }
+uint64_t this_hardware_id() { return apic::this_apic_id(); }
+uint64_t with_interrupts_enabled(uint64_t flags) { return flags | kRflagsInterrupts; }
+#elif defined(__aarch64__)
+// The core's own record hangs off TPIDR_ELx (EL2 when the firmware runs us there), the way x86 uses GS.
+uint64_t current_el() {
+  uint64_t v;
+  __asm__ volatile("mrs %0, CurrentEL" : "=r"(v));
+  return v >> 2;
+}
+uint64_t read_core_pointer() {
+  uint64_t v;
+  if (current_el() == 2) __asm__ volatile("mrs %0, tpidr_el2" : "=r"(v));
+  else __asm__ volatile("mrs %0, tpidr_el1" : "=r"(v));
+  return v;
+}
+void write_core_pointer(uint64_t v) {
+  if (current_el() == 2) __asm__ volatile("msr tpidr_el2, %0" ::"r"(v));
+  else __asm__ volatile("msr tpidr_el1, %0" ::"r"(v));
+}
+Core* this_core() { return reinterpret_cast<Core*>(read_core_pointer()); }
+
+uint64_t this_mpidr() {
+  uint64_t v;
+  __asm__ volatile("mrs %0, mpidr_el1" : "=r"(v));
+  return v & 0xFF00FFFFFFull;
+}
+
+void send_wakeup(uint64_t hardware_id) { gic::send_sgi(hardware_id, kVectorWakeup); }
+void stop_tick() { gtimer::stop(); }
+void ack_tick() { gtimer::rearm(); }   // the dispatcher ends the interrupt in the GIC once the handler returns
+void ack_wakeup() {}
+[[noreturn]] void halt_forever() { for (;;) { irq_disable(); __asm__ volatile("wfi"); } }
+// WFI wakes for a pending interrupt even while it is masked, so unmasking first loses no wake-up for long.
+void idle_wait() { irq_enable(); __asm__ volatile("wfi"); }
+void start_tick(uint32_t hz) { gtimer::start(hz); }
+uint64_t swap_core_pointer(Core* c) {
+  const uint64_t old = read_core_pointer();
+  write_core_pointer(reinterpret_cast<uint64_t>(c));
+  return old;
+}
+void restore_core_pointer(uint64_t old) { write_core_pointer(old); }
+uint64_t this_hardware_id() { return this_mpidr(); }
+uint64_t with_interrupts_enabled(uint64_t daif) { return daif & ~kDaifIrqMasked; }
+#endif
+
+inline void pause_hint() { cpu_relax(); }
 
 // ---- the scheduler lock (spin + interrupts masked) ----
 
@@ -170,7 +237,7 @@ void poke_idle_core(const Thread* t) {
     const Core& c = g.cores[i];
     if (!c.online || &c == self || !c.current || !c.current->is_idle) continue;
     if (t->affinity >= 0 && static_cast<uint32_t>(t->affinity) != i) continue;
-    apic::send_ipi(c.apic_id, kVectorWakeup);
+    send_wakeup(c.apic_id);
     return;
   }
 }
@@ -230,12 +297,12 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
 
 [[noreturn]] void park_core(Core* c) {
   c->parked = true;
-  apic::stop_timer();
-  for (;;) __asm__ volatile("cli; hlt");
+  stop_tick();
+  halt_forever();
 }
 
 Frame* on_timer(Frame* frame, void*) {
-  apic::eoi();
+  ack_tick();
   Core* c = this_core();
   if (g.stopping && c->index != g.boot_core) park_core(c);
   const uint64_t flags = lock_irq();
@@ -273,7 +340,7 @@ Frame* on_yield(Frame* frame, void*) {
 }
 
 Frame* on_wakeup(Frame* frame, void*) {
-  apic::eoi();
+  ack_wakeup();
   Core* c = this_core();
   if (g.stopping && c->index != g.boot_core) park_core(c);
   const uint64_t flags = lock_irq();
@@ -292,6 +359,7 @@ void thread_main(Thread* t) {
 void build_initial_frame(Thread* t, uint32_t stack_bytes) {
   uint8_t* top = t->stack + stack_bytes;  // 16-byte aligned
   Frame* f = reinterpret_cast<Frame*>(reinterpret_cast<uint64_t>(top - 64 - sizeof(Frame)) & ~uint64_t{15});
+#if defined(__x86_64__)
   __builtin_memcpy(f->fpu, g_fpu_template, sizeof(f->fpu));
   f->r15 = f->r14 = f->r13 = f->r12 = f->r11 = f->r10 = f->r9 = f->r8 = 0;
   f->rdi = f->rsi = f->rbp = f->rbx = f->rdx = f->rax = 0;
@@ -303,6 +371,15 @@ void build_initial_frame(Thread* t, uint32_t stack_bytes) {
   f->rflags = 0x202;
   f->rsp = reinterpret_cast<uint64_t>(top) - 8;  // as if entered by a call
   f->ss = kSelectorData;
+#elif defined(__aarch64__)
+  for (uint64_t& r : f->x) r = 0;
+  f->x[0] = reinterpret_cast<uint64_t>(t);  // first argument (AAPCS64)
+  f->sp = reinterpret_cast<uint64_t>(f) + sizeof(Frame);  // where the stack is once the frame is popped
+  f->elr = reinterpret_cast<uint64_t>(&thread_main);
+  f->vector = f->esr = f->far = 0;
+  // Resume in the exception level we are running at, on its own stack pointer (SPx), interrupts unmasked.
+  f->spsr = current_el() == 2 ? 0x9 : 0x5;
+#endif
   t->saved = f;
 }
 
@@ -370,10 +447,11 @@ uint32_t reap_zombies_impl() {
 void idle_loop(void*) {
   for (;;) {
     reap_zombies_impl();
-    __asm__ volatile("sti; hlt");
+    idle_wait();
   }
 }
 
+#if defined(__x86_64__)
 // What each application processor runs, forever, after the firmware hands it over.
 void ap_main(void* context) {
   const ApStart* start = static_cast<ApStart*>(context);
@@ -395,6 +473,29 @@ void ap_main(void* context) {
   apic::start_timer(g.tick_hz);
   for (;;) __asm__ volatile("sti; hlt");
 }
+#elif defined(__aarch64__)
+// What each secondary core runs, forever, after PSCI started it and Arch/AArch64/Secondary.S gave it the boot core's MMU setup.
+void ap_main(void* context) {
+  const ApStart* start = static_cast<ApStart*>(context);
+  while (!__atomic_load_n(&g.go, __ATOMIC_ACQUIRE)) pause_hint();
+  Core* c = &g.cores[start->core];
+  interrupts_load(false);
+  gic::enable_this_core();
+  c->self = c;
+  c->index = start->core;
+  c->apic_id = this_hardware_id();
+  c->kind = g.cpu->core_kind(start->core);
+  write_core_pointer(reinterpret_cast<uint64_t>(c));
+  Thread* idle = adopt_context("idle", true, static_cast<int32_t>(start->core));
+  if (!idle) halt_forever();
+  c->idle = c->current = idle;
+  c->online = true;
+  __atomic_add_fetch(&g.aps_ready, 1, __ATOMIC_SEQ_CST);
+  gic::enable_interrupt(kVectorWakeup);
+  start_tick(g.tick_hz);
+  for (;;) idle_wait();
+}
+#endif
 
 }  // namespace
 
@@ -454,7 +555,9 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
   g.tick_hz = tick_hz;
   g.boot_core = cpu.current_core();
   g.core_count = cpu.core_count() < kMaxCores ? cpu.core_count() : kMaxCores;
+#if defined(__x86_64__)
   __asm__ volatile("fxsave %0" : "=m"(g_fpu_template));
+#endif
   // Application processors are started first, while the firmware's services still
   // work normally; they wait in ap_main until the boot core has set everything up.
   uint32_t expected = 0;
@@ -466,28 +569,39 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
   const uint64_t flags = irq_save();
   interrupts_init();
   interrupts_load(true);
-  if (!apic::init_boot_core()) {
+#if defined(__x86_64__)
+  const bool controller_ok = apic::init_boot_core();
+#else
+  const bool controller_ok = gic::version() != 0;   // the caller brought the GIC up (it needs the ACPI tables)
+#endif
+  if (!controller_ok) {
     interrupts_restore_firmware();
     irq_restore(flags);
     return false;
   }
+  #if defined(__x86_64__)
   set_interrupt_handler(kVectorTimer, on_timer, nullptr);
+#else
+  set_interrupt_handler(static_cast<Vector>(gtimer::interrupt()), on_timer, nullptr);
+#endif
   set_interrupt_handler(kVectorYield, on_yield, nullptr);
   set_interrupt_handler(kVectorWakeup, on_wakeup, nullptr);
+#if defined(__aarch64__)
+  gic::enable_interrupt(kVectorWakeup);
+#endif
 
   Core* boot = &g.cores[g.boot_core];
   boot->self = boot;
   boot->index = g.boot_core;
-  boot->apic_id = apic::this_apic_id();
+  boot->apic_id = this_hardware_id();
   boot->kind = cpu.core_kind(g.boot_core);
-  g.firmware_gs_base = rdmsr(kMsrGsBase);
-  wrmsr(kMsrGsBase, reinterpret_cast<uint64_t>(boot));
+  g.firmware_gs_base = swap_core_pointer(boot);
 
   // The caller becomes the main thread, pinned here so it may keep calling firmware.
   Thread* main_thread = adopt_context("main", false, static_cast<int32_t>(g.boot_core));
   Thread* idle = make_thread(idle_loop, nullptr, "idle", static_cast<int32_t>(g.boot_core), -1, 16 * 1024);
   if (!main_thread || !idle) {
-    wrmsr(kMsrGsBase, g.firmware_gs_base);
+    restore_core_pointer(g.firmware_gs_base);
     interrupts_restore_firmware();
     irq_restore(flags);
     return false;
@@ -502,9 +616,9 @@ bool start(hardware::ICentralProcessingUnit& cpu, allocators::IAllocator& alloca
 
   __atomic_store_n(&g.go, true, __ATOMIC_RELEASE);
   for (int i = 0; i < 2000 && __atomic_load_n(&g.aps_ready, __ATOMIC_SEQ_CST) < expected; ++i) hardware::delay_us(1000);
-  apic::start_timer(tick_hz);
+  start_tick(tick_hz);
   hardware::set_sleep_function(sleep_us);  // long driver delays now give the core away
-  irq_restore(flags | kRflagsInterrupts);
+  irq_restore(with_interrupts_enabled(flags));
   irq_enable();
   firmware_service_start();  // from now on firmware calls go through kernel::firmware()
   return true;
@@ -517,14 +631,17 @@ void stop() {
   for (uint32_t i = 0; i < g.core_count; ++i) {
     Core& c = g.cores[i];
     if (!c.online || i == g.boot_core) continue;
-    apic::send_ipi(c.apic_id, kVectorWakeup);
+    send_wakeup(c.apic_id);
     for (int k = 0; k < 100 && !c.parked; ++k) hardware::delay_us(1000);
   }
   irq_disable();
-  apic::stop_timer();
+  stop_tick();
   g.running = false;
-  wrmsr(kMsrGsBase, g.firmware_gs_base);
+  restore_core_pointer(g.firmware_gs_base);
   interrupts_restore_firmware();
+#if defined(__aarch64__)
+  gic::restore_firmware();
+#endif
   irq_enable();
 }
 
@@ -547,7 +664,11 @@ void yield() {
   // (or is in an interrupt-off section): another thread would then run inside
   // that critical section. That is always a bug, so stop at once.
   if (!irq_enabled()) panic("yield or blocking wait with interrupts disabled (a spinlock held?)", nullptr);
+#if defined(__x86_64__)
   __asm__ volatile("int %0" ::"i"(kVectorYield) : "memory");
+#else
+  __asm__ volatile("svc #0" ::: "memory");   // a synchronous exception: the dispatcher calls the yield handler
+#endif
 }
 
 void sleep_us(uint64_t us) {

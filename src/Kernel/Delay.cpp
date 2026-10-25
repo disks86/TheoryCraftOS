@@ -26,12 +26,21 @@ uint64_t g_ticks_per_us = 0;
 uint64_t g_origin = 0;
 void (*g_sleep)(uint64_t) = nullptr;
 
+#if defined(__x86_64__)
 inline uint64_t rdtsc() {
   uint32_t low, high;
   __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
   return (uint64_t{high} << 32) | low;
 }
-inline void cpu_pause() { __asm__ volatile("pause"); }
+#elif defined(__aarch64__)
+// The generic timer's virtual count: constant rate, readable at any exception level.
+inline uint64_t rdtsc() {
+  uint64_t count;
+  __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(count)::"memory");
+  return count;
+}
+#endif
+inline void cpu_pause() { kernel::cpu_relax(); }
 }  // namespace
 
 uint64_t read_tsc() { return rdtsc(); }
