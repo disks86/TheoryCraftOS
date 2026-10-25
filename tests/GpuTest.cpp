@@ -310,6 +310,29 @@ static void test_compressed() {
     CHECK(dev.write_texture(ad, ConstByteView(ab, 32), BufferLayout(), 12, 6, 1));
     webgl::read_texel(*dev.texture(at)->mips[0], 3, 3, 0, px); CHECK(px[0] == 255 && px[1] == 0 && px[3] == 255);
     webgl::read_texel(*dev.texture(at)->mips[0], 9, 3, 0, px); CHECK(px[0] == 0 && px[1] == 255);
+    // ETC2 (an individual block: red 255 and +2 on every channel) and EAC (base 128, multiplier 0 counts as 1, selector 0 is -3: (128 * 8 + 4 - 3) / 2047)
+    const FormatDesc* etc = find_format("etc2-rgb8unorm");
+    const FormatDesc* eacr = find_format("eac-r11unorm");
+    const FormatDesc* eacrg = find_format("eac-rg11snorm");
+    CHECK(etc && eacr && eacrg && find_format("etc2-rgba8unorm-srgb") && find_format("etc2-rgb8a1unorm"));
+    const uint32_t et = dev.create_texture(4, 4, 1, 1, 1, 1, etc, 0x04 | 0x02), er = dev.create_texture(4, 4, 1, 1, 1, 1, eacr, 0x04 | 0x02), erg = dev.create_texture(4, 4, 1, 1, 1, 1, eacrg, 0x04 | 0x02);
+    CHECK(et && er && erg);
+    const uint8_t eb[8] = {0xFF, 0, 0, 0, 0, 0, 0, 0}, rb1[8] = {128, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t rgb[16] = {};
+    memcpy(rgb, rb1, 8);
+    rgb[0] = 0x80;   // signed base -128 means -127: (-127 * 8 - 3) / 1023
+    ImageCopy ec;
+    ec.texture = et;
+    CHECK(dev.write_texture(ec, ConstByteView(eb, 8), BufferLayout(), 4, 4, 1));
+    webgl::read_texel(*dev.texture(et)->mips[0], 2, 2, 0, px); CHECK(px[0] == 255 && px[1] == 2 && px[2] == 2 && px[3] == 255);
+    ec.texture = er;
+    CHECK(dev.write_texture(ec, ConstByteView(rb1, 8), BufferLayout(), 4, 4, 1));
+    webgl::read_texel(*dev.texture(er)->mips[0], 1, 3, 0, px);
+    CHECK(__builtin_bit_cast(float, px[0]) > 0.5007f && __builtin_bit_cast(float, px[0]) < 0.5008f);
+    ec.texture = erg;
+    CHECK(dev.write_texture(ec, ConstByteView(rgb, 16), BufferLayout(), 4, 4, 1));
+    webgl::read_texel(*dev.texture(erg)->mips[0], 0, 0, 0, px);
+    CHECK(__builtin_bit_cast(float, px[0]) < -0.9960f && __builtin_bit_cast(float, px[0]) > -0.9962f && __builtin_bit_cast(float, px[1]) < -0.0029f && __builtin_bit_cast(float, px[1]) > -0.0030f);
     // mip 1 of the BC1 texture is 4 x 4 texels (one block)
     ImageCopy m1;
     m1.texture = tex; m1.mip = 1;

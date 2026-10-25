@@ -526,9 +526,18 @@ static void test_bptc_astc() {
             float f;
             memcpy(&f, &r[k], 4);
             got = static_cast<int>(f < 0 ? 0 : f > 1 ? 255 : f * 255 + 0.5f);
+          } else if (cf->codec == Codec::EacR || cf->codec == Codec::EacRs || cf->codec == Codec::EacRg || cf->codec == Codec::EacRgs) {
+            // the reference keeps 8 of the 11 bits (the signed form shifted to 0..255)
+            float f;
+            memcpy(&f, &r[k == 1 ? 1 : 0], 4);
+            const bool sg = cf->codec == Codec::EacRs || cf->codec == Codec::EacRgs;
+            const bool has = k == 0 || (k == 1 && (cf->codec == Codec::EacRg || cf->codec == Codec::EacRgs));
+            const int v = static_cast<int>(f * (sg ? 1023.0f : 2047.0f) + (f < 0 ? -0.5f : 0.5f));
+            got = has ? ((sg ? v + 1023 : v) >> 3) : (k == 3 ? 255 : 0);
           } else {
             got = static_cast<int>(r[k]);
           }
+          if (cf->codec == Codec::Etc2A1 && k < 3 && r[3] == 0 && want[i * 4 + 3] == 0) continue;   // the colour of a transparent texel is not defined
           if (got - want[i * 4 + k] > 1 || want[i * 4 + k] - got > 1) same = false;
         }
       }
@@ -536,7 +545,7 @@ static void test_bptc_astc() {
       CHECK(same);
       ++checked;
     }
-    CHECK(checked == 104);
+    CHECK(checked == 224);
     // truncated data is refused, never read past the end
     const CompressedFormat* astc = find_compressed(0x93B7);
     const CompressedFormat* bc7 = find_compressed(0x8E8C);
@@ -551,7 +560,7 @@ static void test_bptc_astc() {
     uint32_t seed = 99;
     for (int round = 0; round < 40; ++round) {
       for (int i = 0; i < 16; ++i) { seed = seed * 1664525u + 1013904223u; blk[i] = static_cast<uint8_t>(seed >> 24); }
-      const CompressedFormat* const flip_formats[5] = {astc, bc7, find_compressed(0x8E8F), find_compressed(0x93BD), find_compressed(0x93D4)};
+      const CompressedFormat* const flip_formats[10] = {astc, bc7, find_compressed(0x8E8F), find_compressed(0x93BD), find_compressed(0x93D4), find_compressed(0x9274), find_compressed(0x9276), find_compressed(0x9279), find_compressed(0x9271), find_compressed(0x9272)};
       for (const CompressedFormat* cf : flip_formats) {
         for (int bit = 0; bit < 128; ++bit) {
           uint8_t flipped[16];

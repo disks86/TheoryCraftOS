@@ -16,13 +16,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Compressed texture formats WebGL can upload (S3TC, RGTC, ETC1) and their decoders.
+// Compressed texture formats WebGL can upload (S3TC, RGTC, ETC1, ETC2/EAC, BPTC, ASTC LDR) and their decoders.
 #pragma once
 #include "WebGl/GlContext.hpp"
 
 namespace webgl {
 
-enum class Codec : uint8_t { Bc1Rgb, Bc1Rgba, Bc2, Bc3, Bc4U, Bc4S, Bc5U, Bc5S, Etc1, Bc6U, Bc6S, Bc7, Astc };
+enum class Codec : uint8_t { Bc1Rgb, Bc1Rgba, Bc2, Bc3, Bc4U, Bc4S, Bc5U, Bc5S, Etc1, Bc6U, Bc6S, Bc7, Astc, Etc2Rgb, Etc2A1, Etc2Rgba, EacR, EacRs, EacRg, EacRgs };
 
 struct CompressedFormat {
   uint32_t internal;       // the GL enum
