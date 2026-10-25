@@ -138,6 +138,7 @@ FileExplorer::FileExplorer(allocators::IAllocator& allocator)
   view_.add_column("Name", 240);
   view_.add_column("Size", 80, Align::Right);
   view_.add_column("Type", 100);
+  view_.add_column("Modified", 130);
   view_.set_dock(DockStyle::Fill);
   view_.set_copy_enabled(false);  // Ctrl+C copies the item's path instead (see on_key)
   delete_dialog_.on_result({&FileExplorer::on_delete_answer, this});
@@ -207,14 +208,15 @@ bool FileExplorer::load(StringView path) {
   if (!next.assign(path.empty() ? StringView("/") : path)) return false;
   path_ = util::move(next);
   view_.clear_items();
-  String size(allocator()), type(allocator());
+  String size(allocator()), type(allocator()), modified(allocator());
   for (const DirectoryEntry& e : entries) {
     const bool folder = e.type == NodeType::Directory;
     if (folder) size.clear();
     else format_size(e.size, &size);
     describe_entry_type(e, &type);
-    const StringView cells[3] = {e.name.view(), size.view(), type.view()};
-    view_.add_item(cells, 3, folder ? ItemIcon::Folder : ItemIcon::File);
+    format_unix_time(e.modified, &modified);
+    const StringView cells[4] = {e.name.view(), size.view(), type.view(), modified.view()};
+    view_.add_item(cells, 4, folder ? ItemIcon::Folder : ItemIcon::File);
   }
   address_.set_path(path_.view());
   update_status();

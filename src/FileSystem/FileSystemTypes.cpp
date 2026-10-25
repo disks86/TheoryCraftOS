@@ -20,6 +20,21 @@
 
 namespace filesystem {
 
+namespace {
+UnixClock g_clock = nullptr;
+void* g_clock_context = nullptr;
+}  // namespace
+
+void set_unix_clock(UnixClock clock, void* context) {
+  __atomic_store_n(&g_clock_context, context, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_clock, clock, __ATOMIC_RELEASE);
+}
+
+uint64_t unix_time_now() {
+  UnixClock clock = __atomic_load_n(&g_clock, __ATOMIC_ACQUIRE);
+  return clock ? clock(__atomic_load_n(&g_clock_context, __ATOMIC_ACQUIRE)) : 0;
+}
+
 const char* status_name(Status status) {
   switch (status) {
     case Status::Ok: return "ok";

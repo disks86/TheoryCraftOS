@@ -27,7 +27,7 @@ namespace filesystem {
 using namespace ext;
 
 namespace {
-constexpr uint32_t kTimeStamp = 315532800;  // 1980-01-01: there is no clock here, so new inodes get this
+constexpr uint32_t kTimeStamp = 315532800;  // 1980-01-01: what a new inode gets while no clock is known
 constexpr uint32_t kDefaultExtraIsize = 32;
 
 // The rec_len stored for a record of `length` bytes (a 64 KiB block's single record is 65535).
@@ -535,6 +535,7 @@ Status ExtFileSystem::write_file_data(Inode* inode, uint64_t offset, ConstByteVi
     position += consumed;
     rest = rest.dropped(consumed);
     *transferred += consumed;
+    if (consumed > 0) touch(inode, true);
     if (consumed > 0 && position > inode->size()) {  // (the file grows by what was written, not by a failed attempt to write past its end)
       inode->set_size(position);
       note_size(*inode);
@@ -552,6 +553,7 @@ Status ExtFileSystem::resize_inode(Inode* inode, uint64_t new_size) {
   if (new_size == old_size) return Status::Ok;
   Status s = check_size(*inode, new_size);
   if (s != Status::Ok) return s;
+  touch(inode, true);
   if (new_size > old_size) {
     s = zero_tail(inode, old_size);
     if (s != Status::Ok) return s;
@@ -756,12 +758,36 @@ Status ExtFileSystem::dir_set_parent(const Inode& dir, uint32_t parent) {
 // ---------------------------------------------------------------------------------------------------------------------------------
 // The namespace
 
+uint64_t ExtFileSystem::inode_time(const Inode& inode, uint32_t field, uint32_t extra_field) const {
+  int64_t seconds = static_cast<int32_t>(rd32(inode.bytes(), field));
+  const uint32_t extra_isize = inode_size_ > kGoodOldInodeSize ? rd16(inode.bytes(), kInExtraIsize) : 0;
+  if (extra_field + 4 <= kGoodOldInodeSize + extra_isize) seconds += int64_t{rd32(inode.bytes(), extra_field) & 3} << 32;
+  return seconds > 0 ? static_cast<uint64_t>(seconds) : 0;
+}
+
+void ExtFileSystem::set_inode_time(Inode* inode, uint32_t field, uint32_t extra_field, uint64_t seconds) const {
+  wr32(inode->bytes(), field, static_cast<uint32_t>(seconds));
+  const uint32_t extra_isize = inode_size_ > kGoodOldInodeSize ? rd16(inode->bytes(), kInExtraIsize) : 0;
+  if (extra_field + 4 <= kGoodOldInodeSize + extra_isize) {  // the two epoch bits, and no fraction of a second
+    const int64_t epoch = (static_cast<int64_t>(seconds) - static_cast<int32_t>(static_cast<uint32_t>(seconds))) >> 32;
+    wr32(inode->bytes(), extra_field, static_cast<uint32_t>(epoch) & 3);
+  }
+}
+
+void ExtFileSystem::touch(Inode* inode, bool contents) const {
+  const uint64_t now = unix_time_now();
+  if (now == 0) return;
+  set_inode_time(inode, kInCtime, kInCtimeExtra, now);
+  if (contents) set_inode_time(inode, kInMtime, kInMtimeExtra, now);
+}
+
 Status ExtFileSystem::init_inode(Inode* inode, uint16_t mode, uint32_t links) {
   inode->length = inode_size_;
   inode->bytes().fill(0);
   ByteView v = inode->bytes();
   wr16(v, kInMode, mode);
   wr16(v, kInLinks, links);
+  const uint64_t now = unix_time_now();
   wr32(v, kInAtime, kTimeStamp);
   wr32(v, kInCtime, kTimeStamp);
   wr32(v, kInMtime, kTimeStamp);
@@ -776,6 +802,12 @@ Status ExtFileSystem::init_inode(Inode* inode, uint16_t mode, uint32_t links) {
     extra &= ~3u;
     wr16(v, kInExtraIsize, extra);
     if (extra >= 24) wr32(v, kInCrtime, kTimeStamp);
+  }
+  if (now != 0) {
+    set_inode_time(inode, kInAtime, kInAtimeExtra, now);
+    set_inode_time(inode, kInCtime, kInCtimeExtra, now);
+    set_inode_time(inode, kInMtime, kInMtimeExtra, now);
+    if (inode_size_ > kGoodOldInodeSize && rd16(v, kInExtraIsize) >= 24) set_inode_time(inode, kInCrtime, kInCrtimeExtra, now);
   }
   return Status::Ok;
 }
@@ -824,11 +856,10 @@ Status ExtFileSystem::create_node(StringView path, bool directory, uint32_t* num
     delete_inode(&node);
     return s;
   }
-  if (directory) {
-    wr16(dir.bytes(), kInLinks, dir.links() + 1);
-    s = write_inode(dir);
-    if (s != Status::Ok) return s;
-  }
+  if (directory) wr16(dir.bytes(), kInLinks, dir.links() + 1);
+  touch(&dir, true);
+  s = write_inode(dir);
+  if (s != Status::Ok) return s;
   *number = ino;
   return Status::Ok;
 }
@@ -882,14 +913,13 @@ Status ExtFileSystem::remove(StringView path) {
   }
   s = dir_remove(dir, leaf);
   if (s != Status::Ok) return s;
-  if (r.directory) {
-    if (dir.links() > 2) wr16(dir.bytes(), kInLinks, dir.links() - 1);
-    s = write_inode(dir);
-    if (s != Status::Ok) return s;
-    return delete_inode(&node);
-  }
-  if (node.links() > 1) {
+  if (r.directory && dir.links() > 2) wr16(dir.bytes(), kInLinks, dir.links() - 1);
+  touch(&dir, true);
+  s = write_inode(dir);
+  if (s != Status::Ok) return s;
+  if (!r.directory && node.links() > 1) {
     wr16(node.bytes(), kInLinks, node.links() - 1);
+    touch(&node, false);
     return write_inode(node);
   }
   return delete_inode(&node);
@@ -943,19 +973,25 @@ Status ExtFileSystem::rename(StringView from, StringView to) {
   if (s != Status::Ok) return s;
   s = dir_remove(old_dir, source_leaf);
   if (s != Status::Ok) return s;
-  if (source.directory && source_parent.number != target_parent.number) {
+  const bool moved = source_parent.number != target_parent.number;
+  if (source.directory && moved) {
     s = dir_set_parent(node, target_parent.number);
     if (s != Status::Ok) return s;
     if (old_dir.links() > 2) wr16(old_dir.bytes(), kInLinks, old_dir.links() - 1);
-    s = write_inode(old_dir);
-    if (s != Status::Ok) return s;
+  }
+  touch(&old_dir, true);
+  s = write_inode(old_dir);
+  if (s != Status::Ok) return s;
+  if (moved) {
     s = read_inode(target_parent.number, &target_dir);
     if (s != Status::Ok) return s;
-    wr16(target_dir.bytes(), kInLinks, target_dir.links() + 1);
+    if (source.directory) wr16(target_dir.bytes(), kInLinks, target_dir.links() + 1);
+    touch(&target_dir, true);
     s = write_inode(target_dir);
     if (s != Status::Ok) return s;
   }
-  return Status::Ok;
+  touch(&node, false);
+  return write_inode(node);
 }
 
 }  // namespace filesystem

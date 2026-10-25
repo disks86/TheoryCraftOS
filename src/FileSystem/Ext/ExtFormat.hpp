@@ -64,7 +64,7 @@ constexpr uint16_t kGroupInodeUninit = 0x0001, kGroupBlockUninit = 0x0002, kGrou
 constexpr uint32_t kInMode = 0x00, kInUid = 0x02, kInSizeLo = 0x04, kInAtime = 0x08, kInCtime = 0x0C, kInMtime = 0x10, kInDtime = 0x14,
                    kInGid = 0x18, kInLinks = 0x1A, kInBlocksLo = 0x1C, kInFlags = 0x20, kInBlock = 0x28, kInGeneration = 0x64,
                    kInFileAcl = 0x68, kInSizeHi = 0x6C, kInBlocksHi = 0x74, kInFileAclHi = 0x76, kInChecksumLo = 0x7C, kInExtraIsize = 0x80,
-                   kInChecksumHi = 0x82, kInCrtime = 0x90;
+                   kInChecksumHi = 0x82, kInCrtime = 0x90, kInCtimeExtra = 0x84, kInMtimeExtra = 0x88, kInAtimeExtra = 0x8C, kInCrtimeExtra = 0x94;
 constexpr uint32_t kGoodOldInodeSize = 128;
 constexpr uint32_t kInlineBlocks = 15;  // i_block holds 15 32-bit numbers
 constexpr uint16_t kModeTypeMask = 0170000, kModeSocket = 0140000, kModeLink = 0120000, kModeRegular = 0100000, kModeBlock = 0060000,
