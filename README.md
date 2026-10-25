@@ -14,7 +14,7 @@ kernel image and runs as kernel threads in one address space. That includes:
 - the network stack: IPv4, TCP, UDP, DHCP, DNS, TLS 1.3/1.2, HTTP/1.1, HTTP/3 over QUIC, WebSockets, SNMP, IPP
 - the sound server and the media codecs
 - the database layer, including a built-in SQL database and a PostgreSQL client
-- a JavaScript engine, an HTML/CSS/DOM web browser model (with a WebAssembly runtime, service workers and the Cache API) and a regular expression engine
+- a JavaScript engine, an HTML/CSS/DOM web browser model (with a WebAssembly runtime, WebGL 1/2 and WebGPU on a software rasterizer, service workers and the Cache API) and a regular expression engine
 - the GUI toolkit and the desktop itself
 
 There is no system-call boundary or driver-model split. Services call each other directly through interfaces, which keeps

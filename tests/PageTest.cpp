@@ -1049,6 +1049,97 @@ static uint32_t shown_pixel(const std::string& data, int x, int y) {
   return v;
 }
 
+// Runs a script in a page with a 64 x 64 canvas called c (no 2D context made), and returns what it logged. Promise callbacks run before the page is looked at.
+static std::string gl_script(const char* script) {
+  TestAllocator a;
+  std::string out;
+  {
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = std::string("<html><body><canvas id=c width=64 height=64></canvas><script>var c = document.getElementById('c'); ") + script + "</script></body></html>";
+    page.load(html.c_str());
+    HtmlDocument doc(a);
+    page.render(&doc);
+    page.run_due_timers(env.clock + 10);
+    out = page_log(page);
+  }
+  CHECK(a.live == 0);
+  if (getenv("SHOWLOG")) printf("SCRIPT %s\n  => %s\n", script, out.c_str());
+  return out;
+}
+
+static const char* kGlHeader =
+    "var gl = c.getContext('webgl'); function sh(t, s) { var o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) console.log('shader: ' + gl.getShaderInfoLog(o)); return o; } "
+    "function prog(vs, fs) { var p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.log('link: ' + gl.getProgramInfoLog(p)); return p; } "
+    "function pix(x, y) { var px = new Uint8Array(4); gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); return px[0] + ',' + px[1] + ',' + px[2] + ',' + px[3]; } "
+    "function tri(p, name) { var b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1]), gl.STATIC_DRAW); var l = gl.getAttribLocation(p, name); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, 2, gl.FLOAT, false, 0, 0); } ";
+
+static void test_webgl() {
+  const std::string head = kGlHeader;
+  // the context, its identity and the parameters
+  CHECK(gl_script("var gl = c.getContext('webgl'); console.log(typeof gl, gl === c.getContext('webgl'), c.getContext('2d'), c.getContext('webgl2'), gl.canvas === c, gl.drawingBufferWidth, gl.drawingBufferHeight, gl.getError(), gl instanceof WebGLRenderingContext, gl.getParameter(gl.MAX_TEXTURE_SIZE) > 1024, gl.getParameter(gl.VERSION).indexOf('WebGL 1.0'), gl.TRIANGLES, WebGLRenderingContext.FLOAT, gl.getContextAttributes().alpha)") ==
+        "object true null null true 64 64 0 true true 0 4 5126 true");
+  CHECK(gl_script("var g2 = c.getContext('webgl2'); console.log(g2 instanceof WebGL2RenderingContext, g2 instanceof WebGLRenderingContext, g2.TEXTURE_3D, g2.getParameter(g2.VERSION).indexOf('WebGL 2.0'), c.getContext('webgl'))") == "true true 32879 0 null");
+  // draw a triangle, read it back, see it through the canvas
+  CHECK(gl_script((head + "var p = prog('attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }', 'precision mediump float; uniform vec4 col; void main() { gl_FragColor = col; }'); gl.useProgram(p); tri(p, 'pos'); "
+                  "gl.uniform4f(gl.getUniformLocation(p, 'col'), 0, 1, 0, 1); gl.clearColor(0, 0, 0.5, 1); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLES, 0, 3); console.log(pix(5, 5), pix(60, 60), gl.getError(), gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS), gl.getActiveUniform(p, 0).name, gl.getActiveUniform(p, 0).type === gl.FLOAT_VEC4); "
+                  "Promise.resolve().then(function () { var d = document.createElement('canvas'); d.width = 64; d.height = 64; var x = d.getContext('2d'); x.drawImage(c, 0, 0); var a = x.getImageData(5, 58, 1, 1).data; var b = x.getImageData(60, 5, 1, 1).data; console.log(a[0], a[1], a[2], b[0], b[1], b[2], c.toDataURL().slice(0, 15)); });").c_str()) ==
+        "0,255,0,255 0,0,128,255 0 1 col true | 0 255 0 0 0 128 data:image/png;");
+  // errors: a bad enum, an operation in the wrong state
+  CHECK(gl_script((head + "gl.bindBuffer(12345, null); console.log(gl.getError(), gl.getError()); gl.useProgram(null); gl.drawArrays(gl.TRIANGLES, 0, 3); console.log(gl.getError()); gl.enable(0); console.log(gl.getError(), gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT).precision);").c_str()) ==
+        "1280 0 | 1282 | 1280 23");
+  // a shader that does not compile, and one that does not link
+  CHECK(gl_script((head + "var s = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(s, 'void main() { gl_Position = vec4(undefinedName); }'); gl.compileShader(s); console.log(gl.getShaderParameter(s, gl.COMPILE_STATUS), gl.getShaderInfoLog(s).indexOf('undeclared') >= 0);").c_str()).find("false true") != std::string::npos);
+  // textures: upload, sample with nearest filtering, mipmaps, a canvas as the source
+  CHECK(gl_script((head + "var p = prog('attribute vec2 pos; varying vec2 uv; void main() { uv = pos * 0.5 + 0.5; gl_Position = vec4(pos, 0.0, 1.0); }', 'precision mediump float; uniform sampler2D tex; varying vec2 uv; void main() { gl_FragColor = texture2D(tex, uv); }'); gl.useProgram(p); "
+                  "var b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]), gl.STATIC_DRAW); var l = gl.getAttribLocation(p, 'pos'); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, 2, gl.FLOAT, false, 0, 0); "
+                  "var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255])); "
+                  "gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); gl.uniform1i(gl.getUniformLocation(p, 'tex'), 0); gl.drawArrays(gl.TRIANGLES, 0, 6); "
+                  "console.log(pix(10, 10), pix(50, 10), pix(10, 50), pix(50, 50), gl.getError()); "
+                  "var src = document.createElement('canvas'); src.width = 2; src.height = 2; var sx = src.getContext('2d'); sx.fillStyle = '#ff00ff'; sx.fillRect(0, 0, 2, 2); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src); gl.drawArrays(gl.TRIANGLES, 0, 6); console.log(pix(32, 32), gl.getError());").c_str()) ==
+        "255,0,0,255 0,255,0,255 0,0,255,255 255,255,255,255 0 | 255,0,255,255 0");
+  // framebuffer objects and render-to-texture, depth testing, blending
+  CHECK(gl_script((head + "var tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 16, 16, 0, gl.RGBA, gl.UNSIGNED_BYTE, null); var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); "
+                  "gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0); console.log(gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE); gl.clearColor(1, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); console.log(pix(3, 3)); "
+                  "gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT); console.log(pix(3, 3), gl.getParameter(gl.FRAMEBUFFER_BINDING)); "
+                  "gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); var p = prog('attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }', 'void main() { gl_FragColor = vec4(1.0, 1.0, 1.0, 0.5); }'); gl.useProgram(p); tri(p, 'pos'); gl.drawArrays(gl.TRIANGLES, 0, 3); console.log(pix(5, 5));").c_str()) ==
+        "true | 255,0,0,255 | 0,0,0,255 null | 128,128,128,191");
+  // WebGL 2: instancing with a flat integer varying, a uniform block, texture arrays
+  CHECK(gl_script("var gl = c.getContext('webgl2'); function sh(t, s) { var o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) console.log('shader: ' + gl.getShaderInfoLog(o)); return o; } "
+                  "var p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, '#version 300 es\\nlayout(location=0) in vec2 pos; uniform Block { vec4 tint; float scale; }; flat out int id; out vec4 tc; void main() { id = gl_InstanceID; tc = tint; gl_Position = vec4(pos * scale + vec2(float(gl_InstanceID) - 0.5, 0.0), 0.0, 1.0); }')); "
+                  "gl.attachShader(p, sh(gl.FRAGMENT_SHADER, '#version 300 es\\nprecision highp float; flat in int id; in vec4 tc; out vec4 o; void main() { o = tc * float(id + 1); }')); gl.linkProgram(p); console.log(gl.getProgramParameter(p, gl.LINK_STATUS), gl.getProgramInfoLog(p)); gl.useProgram(p); "
+                  "var vao = gl.createVertexArray(); gl.bindVertexArray(vao); var b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 0,1]), gl.STATIC_DRAW); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0); "
+                  "var ub = gl.createBuffer(); gl.bindBuffer(gl.UNIFORM_BUFFER, ub); gl.bufferData(gl.UNIFORM_BUFFER, new Float32Array([0.25, 0.5, 0.125, 1, 0.4, 0, 0, 0]), gl.STATIC_DRAW); var bi = gl.getUniformBlockIndex(p, 'Block'); gl.uniformBlockBinding(p, bi, 2); gl.bindBufferBase(gl.UNIFORM_BUFFER, 2, ub); "
+                  "gl.drawArraysInstanced(gl.TRIANGLES, 0, 3, 2); var px = new Uint8Array(4); gl.readPixels(16, 32, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); var qx = new Uint8Array(4); gl.readPixels(48, 32, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, qx); console.log(bi, px.join(','), qx.join(','), gl.getError());") ==
+        "true  | 0 64,128,32,255 128,255,64,255 0");
+  // lost contexts
+  CHECK(gl_script((head + "var e = gl.getExtension('WEBGL_lose_context'); var lostEvents = 0; c.addEventListener('webglcontextlost', function (ev) { lostEvents++; ev.preventDefault(); }); e.loseContext(); console.log(gl.isContextLost(), gl.getError(), gl.createBuffer(), lostEvents, gl.getExtension('OES_vertex_array_object') === null);").c_str()) ==
+        "true 0 null 1 true");
+}
+
+static void test_webgpu() {
+  // the entry points and constants
+  CHECK(gl_script("console.log(typeof navigator.gpu, navigator.gpu instanceof GPU, GPUBufferUsage.UNIFORM, GPUTextureUsage.RENDER_ATTACHMENT, GPUShaderStage.COMPUTE, GPUColorWrite.ALL, navigator.gpu.getPreferredCanvasFormat(), c.getContext('webgpu') instanceof GPUCanvasContext, c.getContext('webgl'), c.getContext('webgpu') === c.getContext('webgpu'))") ==
+        "object true 64 16 4 15 bgra8unorm true null true");
+  // a render pipeline drawing to a canvas, read back by a buffer copy and seen through the canvas; a compute pipeline with a storage buffer; error scopes
+  CHECK(gl_script(
+            "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice(); }).then(function (device) {"
+            " var ctx = c.getContext('webgpu'); ctx.configure({ device: device, format: 'bgra8unorm', alphaMode: 'opaque' });"
+            " var m = device.createShaderModule({ code: 'struct V { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32> };\\n@vertex fn vs(@builtin(vertex_index) i: u32) -> V { var p = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0)); var o: V; o.pos = vec4(p[i], 0.0, 1.0); o.col = vec3(1.0, 0.5, 0.0); return o; }\\n@fragment fn fs(v: V) -> @location(0) vec4<f32> { return vec4(v.col, 1.0); }' });"
+            " var pl = device.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: 'bgra8unorm' }] } });"
+            " var enc = device.createCommandEncoder(); var pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 1, 1] }] }); pass.setPipeline(pl); pass.draw(3); pass.end(); device.queue.submit([enc.finish()]);"
+            " var buf = device.createBuffer({ size: 32 * 32 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }); var e2 = device.createCommandEncoder(); e2.copyTextureToBuffer({ texture: ctx.getCurrentTexture() }, { buffer: buf, bytesPerRow: 128 }, [32, 32]); device.queue.submit([e2.finish()]);"
+            " return buf.mapAsync(GPUMapMode.READ).then(function () { var px = new Uint8Array(buf.getMappedRange()); console.log(px[0], px[1], px[2], px[3], buf.mapState); buf.unmap(); console.log(buf.mapState);"
+            "  var cm = device.createShaderModule({ code: '@group(0) @binding(0) var<storage, read_write> d: array<f32>; @compute @workgroup_size(4) fn main(@builtin(global_invocation_id) g: vec3<u32>) { d[g.x] = f32(g.x) * 2.0; }' });"
+            "  var cp = device.createComputePipeline({ layout: 'auto', compute: { module: cm, entryPoint: 'main' } }); var sb = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }); var rb = device.createBuffer({ size: 32, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });"
+            "  var bg = device.createBindGroup({ layout: cp.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: sb } }] }); var e3 = device.createCommandEncoder(); var cpass = e3.beginComputePass(); cpass.setPipeline(cp); cpass.setBindGroup(0, bg); cpass.dispatchWorkgroups(2); cpass.end(); e3.copyBufferToBuffer(sb, 0, rb, 0, 32); device.queue.submit([e3.finish()]);"
+            "  return rb.mapAsync(GPUMapMode.READ).then(function () { var f = new Float32Array(rb.getMappedRange()); console.log(f[0], f[3], f[7]);"
+            "   device.pushErrorScope('validation'); device.createShaderModule({ code: 'fn broken( {' }); return device.popErrorScope().then(function (e) { console.log(e instanceof GPUValidationError, e && e.message.length > 0); }); }); }); })"
+            ".then(function () { var d = document.createElement('canvas'); d.width = 32; d.height = 32; var x = d.getContext('2d'); x.drawImage(c, 0, 0); var p = x.getImageData(16, 16, 1, 1).data; console.log('canvas', p[0], p[1], p[2], p[3]); }).catch(function (e) { console.log('ERR', e && e.message); });") ==
+        "0 128 255 255 mapped | unmapped | 0 6 14 | true true | canvas 255 128 0 255");
+}
+
 static void test_canvas_scripts() {
   std::string shown;
   // the element, the context and the state
@@ -5699,6 +5790,12 @@ int main(int argc, char** argv) {
     return 0;
   }
   setvbuf(stdout, nullptr, _IONBF, 0);
+  if (getenv("ONLY_GL")) {   // (just the WebGL and WebGPU tests)
+    test_webgl();
+    test_webgpu();
+    printf(g_failed ? "%d check(s) failed\n" : "webgl and webgpu tests passed\n", g_failed);
+    return g_failed ? 1 : 0;
+  }
   if (getenv("ONLY_SW")) {   // (just the Cache API and service worker tests)
     test_cache_api();
     if (getenv("ONLY_SW")[0] == '2') test_service_workers();
@@ -5741,6 +5838,8 @@ int main(int argc, char** argv) {
   test_images();
   test_picture_paint();
   test_canvas_scripts();
+  test_webgl();
+  test_webgpu();
   test_video();
   test_audio();
   test_media_api();

@@ -620,6 +620,7 @@ bool source_pixels(Vm& vm, const Value& v, ImageSource* src) {
   if (n->is_tag("img")) return o.image_pixels(n->serial, src);
   if (n->is_tag("video")) return o.video_pixels(n->serial, src);
   if (n->is_tag("canvas")) {
+    flush_gl(impl(vm), n->serial);   // (a WebGL canvas draws lazily)
     CanvasBitmap* b = o.existing_canvas(n->serial);
     if (!b) return false;
     *src = b->snapshot();
@@ -1804,13 +1805,39 @@ NATIVE(canvas_get_context) {
   if (!n->is_tag("canvas")) return vm.throw_error(ErrorKind::TypeError, "getContext is not a function");
   String kind(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &kind)) return false;
-  if (!kind.view().equals("2d")) {   // (no WebGL, no bitmap renderer)
+  const bool is_2d = kind.view().equals("2d");
+  const bool is_gl = kind.view().equals("webgl") || kind.view().equals("experimental-webgl") || kind.view().equals("webgl2");
+  const bool is_gpu = kind.view().equals("webgpu");
+  if (!is_2d && !is_gl && !is_gpu) {   // (no bitmap renderer)
     *result = Value::make_null();
     return true;
   }
-  Value existing;
+  // a canvas keeps the first kind of context it was given
+  Value existing, existing_kind;
   if (vm.get_plain(self.as_object(), key_of(vm, "__ctx"), &existing) && existing.is_object()) {
-    *result = existing;
+    String have(vm.allocator());
+    if (vm.get_plain(self.as_object(), key_of(vm, "__ctxkind"), &existing_kind) && existing_kind.is_string()) have.assign(existing_kind.as_string()->view());
+    const bool same = have.view().equals(kind.view()) || (is_gl && (have.view().equals("webgl") || have.view().equals("experimental-webgl")) && !kind.view().equals("webgl2")) ||
+                      (is_gl && have.view().equals("experimental-webgl") && kind.view().equals("webgl"));
+    *result = same ? existing : Value::make_null();
+    return true;
+  }
+  if (is_gl || is_gpu) {
+    Value hook;
+    if (!vm.get_named(Value::make_object(vm.global()), is_gl ? "__make_gl_context" : "__make_gpu_context", &hook) || !Vm::is_callable(hook)) {
+      *result = Value::make_null();
+      return true;
+    }
+    const Value call_args[2] = {str_value(vm, kind.view()), arg_at(args, argc, 1)};
+    Value made;
+    if (!vm.call(hook, self, call_args, 2, &made)) return false;
+    if (made.is_object()) {
+      vm.define(self.as_object(), key_of(vm, "__ctx"), made, 0);
+      vm.define(self.as_object(), key_of(vm, "__ctxkind"), str_value(vm, kind.view()), 0);
+      *result = made;
+    } else {
+      *result = Value::make_null();
+    }
     return true;
   }
   PageObjects& objects = objs(vm);
@@ -1824,11 +1851,13 @@ NATIVE(canvas_get_context) {
   JsObject* ctx = vm.new_host_object(c.canvas_context_proto, &kContextClass, reinterpret_cast<void*>(static_cast<uintptr_t>(n->serial)));
   vm.define_named(ctx, "canvas", self, kWritable);
   vm.define(self.as_object(), key_of(vm, "__ctx"), Value::make_object(ctx), 0);
+  vm.define(self.as_object(), key_of(vm, "__ctxkind"), str_value(vm, "2d"), 0);
   *result = Value::make_object(ctx);
   return true;
 }
 
 bool canvas_data_url(Vm& vm, dom::Node* n, StringView type, double quality, String* out) {
+  flush_gl(impl(vm), n->serial);
   PageObjects& objects = objs(vm);
   PageObjects::Lock lock(objects);
   CanvasBitmap* bm = objects.canvas(n->serial, attribute_size(n, "width", 300), attribute_size(n, "height", 150));
@@ -2029,6 +2058,8 @@ bool install_media(DomBindings::Impl& c) {
 }
 
 JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes) { return make_bytes(c, bytes, false); }
+
+bool media_source_pixels(Vm& vm, const Value& v, ImageSource* src) { return source_pixels(vm, v, src); }
 
 bool byte_array_bytes(const Value& v, StringView* out) {
   ArrayView<uint8_t> bytes;
