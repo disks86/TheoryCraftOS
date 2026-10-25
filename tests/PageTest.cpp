@@ -3945,7 +3945,7 @@ static void test_messaging() {
                  "document.body.appendChild(host); console.log(host.shadowRoot === root, root.host === host, root.mode, root.querySelector('#in').textContent, document.querySelector('#in'), root instanceof ShadowRoot, root instanceof DocumentFragment, host.childNodes.length);",
                  "true true open inside null true true 0", nullptr, "https://app.example/"));
   CHECK(async_is("var h = document.createElement('div'); var r = h.attachShadow({ mode: 'closed' }); var e = []; console.log(h.shadowRoot, r.mode); try { h.attachShadow({ mode: 'open' }); } catch (x) { e.push(x.name); } try { document.createElement('p').attachShadow({}); } catch (x) { e.push(x.name); } console.log(e.join());",
-                 "null closed | InvalidStateError,TypeError", nullptr, "https://app.example/"));
+                 "null closed | NotSupportedError,TypeError", nullptr, "https://app.example/"));
   CHECK(async_is("var host = document.createElement('div'); var root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<slot name=a></slot><slot></slot>';"
                  "host.innerHTML = '<b slot=a>one</b><i>two</i><u slot=a>three</u>text'; var slots = root.querySelectorAll('slot');"
                  "console.log(slots[0].assignedNodes().length, slots[0].assignedElements().map(function (n) { return n.tagName; }).join(), slots[1].assignedNodes().length, host.firstChild.slot);", "2 B,U 2 a", nullptr, "https://app.example/"));

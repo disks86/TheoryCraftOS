@@ -5532,8 +5532,26 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (name.indexOf('-') < 1 || name !== name.toLowerCase() || !/^[a-z]/.test(name)) return false;
     return ['annotation-xml', 'color-profile', 'font-face', 'font-face-src', 'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph'].indexOf(name) < 0;
   }
+  // The definition an element is made by: its name's, or (a customized built-in) the one its is="" names for this tag.
+  function defOf(el) {
+    var d = definitions[el.localName];
+    if (d && !d.extends) return d;
+    var is = el.__is !== undefined ? el.__is : el.getAttribute('is');
+    if (is) { d = definitions[is]; if (d && d.extends === el.localName) return d; }
+    return null;
+  }
+  function connected(el) {   // (connectedCallback runs once until the element is disconnected)
+    if (el.__cc === true) return;
+    Object.defineProperty(el, '__cc', { value: true, writable: true, configurable: true });
+    callback(el, 'connectedCallback', []);
+  }
+  function disconnected(el) {
+    if (el.__cc !== true) return;
+    el.__cc = false;
+    callback(el, 'disconnectedCallback', []);
+  }
   function upgrade(el) {
-    var def = definitions[el.localName];
+    var def = defOf(el);
     if (!def || el.__ce !== undefined) return;
     Object.defineProperty(el, '__ce', { value: 1, writable: true });
     Object.setPrototypeOf(el, def.ctor.prototype);
@@ -5542,7 +5560,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       var a = def.observed[i];
       if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a)]);
     }
-    if (el.isConnected) callback(el, 'connectedCallback', []);
+    if (el.isConnected) connected(el);
   }
   function callback(el, name, args) {
     var fn = el[name];
@@ -5556,14 +5574,14 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   function reactions(record) {
     if (record.type === 'childList') {
       for (var i = 0; i < record.addedNodes.length; i++) eachElement(record.addedNodes[i], function (el) {
-        if (definitions[el.localName] && el.__ce === undefined && el.isConnected) upgrade(el);
-        else if (el.__ce !== undefined && el.isConnected) callback(el, 'connectedCallback', []);
+        if (el.__ce === undefined && el.isConnected && defOf(el)) upgrade(el);
+        else if (el.__ce !== undefined && el.isConnected) connected(el);
       });
       for (var j = 0; j < record.removedNodes.length; j++) eachElement(record.removedNodes[j], function (el) {
-        if (el.__ce !== undefined && !el.isConnected) callback(el, 'disconnectedCallback', []);
+        if (el.__ce !== undefined && !el.isConnected) disconnected(el);
       });
     } else if (record.type === 'attributes') {
-      var el = record.target, def = definitions[el.localName];
+      var el = record.target, def = el.nodeType === 1 ? defOf(el) : null;
       if (def && el.__ce !== undefined && def.observed.indexOf(record.attributeName) >= 0)
         callback(el, 'attributeChangedCallback', [record.attributeName, record.oldValue, el.getAttribute(record.attributeName)]);
     }
@@ -5599,11 +5617,14 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var observed = [];
     var list = ctor.observedAttributes;
     if (list) for (var i = 0; i < list.length; i++) observed.push(String(list[i]));
-    definitions[name] = { ctor: ctor, observed: observed };
+    var extended = options && options.extends !== undefined ? String(options.extends).toLowerCase() : null;
+    if (extended !== null && validName(extended)) throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + extended + '" is a valid custom element name', 'NotSupportedError');
+    definitions[name] = { ctor: ctor, observed: observed, extends: extended };
     __register_tag(name, ctor.prototype);
     __mutations_on();
-    var found = doc.querySelectorAll(name);
+    var found = doc.querySelectorAll(extended ? extended + '[is="' + name + '"]' : name);
     for (var k = 0; k < found.length; k++) upgrade(found[k]);
+    // a customized built-in made by createElement(tag, { is }) before it was defined stays plain: only elements with the is attribute upgrade
     if (waiting[name]) { waiting[name].forEach(function (resolve) { resolve(ctor); }); delete waiting[name]; }
   });
   method(CustomElementRegistry.prototype, 'get', function (name) { var d = definitions[String(name)]; return d ? d.ctor : undefined; });
@@ -5614,7 +5635,22 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (definitions[name]) return Promise.resolve(definitions[name].ctor);
     return new Promise(function (resolve) { (waiting[name] = waiting[name] || []).push(resolve); });
   });
-  method(CustomElementRegistry.prototype, 'upgrade', function (root) { eachElement(root, function (el) { if (definitions[el.localName]) upgrade(el); }); });
+  method(CustomElementRegistry.prototype, 'upgrade', function (root) { eachElement(root, function (el) { if (defOf(el)) upgrade(el); }); });
+  // createElement(tag, { is }), and the elements a clone or an import makes, are upgraded at once
+  (function () {
+    var nativeCreate = DP.createElement, nativeClone = g.Node.prototype.cloneNode, nativeImport = DP.importNode;
+    method(DP, 'createElement', function (name, options) {
+      var el = nativeCreate.apply(this, arguments), is = options && typeof options === 'object' ? options.is : undefined;
+      if (is !== undefined && is !== null) {
+        Object.defineProperty(el, '__is', { value: String(is) });
+        if (defOf(el)) upgrade(el);
+      }
+      return el;
+    });
+    var upgradeTree = function (node) { eachElement(node, function (el) { if (el.__ce === undefined && defOf(el)) upgrade(el); }); return node; };
+    method(g.Node.prototype, 'cloneNode', function (deep) { return upgradeTree(nativeClone.call(this, deep)); });
+    method(DP, 'importNode', function (node, deep) { return upgradeTree(nativeImport.call(this, node, deep)); });
+  }());
   hide(g, 'CustomElementRegistry', CustomElementRegistry);
   hide(g, 'customElements', registry);
   // ------------------------------------------------------------------------------------------------------------------ IndexedDB
@@ -7459,6 +7495,66 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (this.hasAttribute('disabled') && /^(button|input|select|textarea|fieldset|optgroup|option)$/.test(this.localName)) return;
       return click.apply(this, arguments);
     });
+  }());
+
+  // ---------------------------------------------------------------------------------------------------------------------------------- shadow DOM: attachShadow rules, slots
+  (function () {
+    var EP = g.Element.prototype, nativeAttach = EP.attachShadow;
+    var hostable = /^(article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span)$/;
+    if (nativeAttach) method(EP, 'attachShadow', function (init) {
+      var name = this.localName;
+      if (init && typeof init === 'object' && !(hostable.test(name) || (name.indexOf('-') > 0 && name === name.toLowerCase())) && !(this.namespaceURI !== 'http://www.w3.org/1999/xhtml'))
+        throw new DOMException("Failed to execute 'attachShadow' on 'Element': This element does not support attachShadow", 'NotSupportedError');
+      var root;
+      try { root = nativeAttach.call(this, init); } catch (e) {
+        if (e && e.name === 'InvalidStateError') throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be created on a host which already hosts a shadow tree.", 'NotSupportedError');
+        throw e;
+      }
+      var define = function (k, v) { Object.defineProperty(root, k, { value: v, enumerable: true, configurable: true }); };
+      define('delegatesFocus', !!init.delegatesFocus);
+      define('slotAssignment', init.slotAssignment === 'manual' ? 'manual' : 'named');
+      define('clonable', !!init.clonable);
+      define('serializable', !!init.serializable);
+      return root;
+    });
+    // ShadowRoot.innerHTML (the setter is the fragment's)
+    var DF = g.DocumentFragment && g.DocumentFragment.prototype;
+    var esc = function (t) { return t.split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;'); };
+    if (DF && !Object.prototype.hasOwnProperty.call(DF, 'innerHTML')) Object.defineProperty(DF, 'innerHTML', { get: function () {
+      var out = '';
+      for (var c = this.firstChild; c; c = c.nextSibling) out += c.nodeType === 1 ? c.outerHTML : c.nodeType === 3 ? esc(String(c.data)) : c.nodeType === 8 ? '<!--' + c.data + '-->' : '';
+      return out;
+    }, configurable: true });
+    // slots
+    var HSP = g.HTMLSlotElement && g.HTMLSlotElement.prototype;
+    if (HSP && HSP.assignedNodes) {
+      var nativeNodes = HSP.assignedNodes;
+      var assigned = function (slot) {
+        var root = slot.getRootNode();
+        if (root && root.slotAssignment === 'manual' && root.host) return (slot.__manual || []).filter(function (n) { return n.parentNode === root.host; });
+        return Array.prototype.slice.call(nativeNodes.call(slot));
+      };
+      var flat = function (slot, depth) {
+        var list = assigned(slot), out = [];
+        if (!list.length) list = Array.prototype.slice.call(slot.childNodes);
+        list.forEach(function (n) { if (depth < 32 && n.nodeType === 1 && n.localName === 'slot') out = out.concat(flat(n, depth + 1)); else out.push(n); });
+        return out;
+      };
+      method(HSP, 'assignedNodes', function (options) { return options && options.flatten ? flat(this, 0) : assigned(this); });
+      method(HSP, 'assignedElements', function (options) { return this.assignedNodes(options).filter(function (n) { return n.nodeType === 1; }); });
+      method(HSP, 'assign', function () {
+        var nodes = Array.prototype.slice.call(arguments);
+        Object.defineProperty(this, '__manual', { value: nodes.filter(function (n) { return n && (n.nodeType === 1 || n.nodeType === 3); }), configurable: true, writable: true });
+      });
+      var assignedSlot = function () {
+        var parent = this.parentNode, root = parent && parent.nodeType === 1 ? parent.shadowRoot : null;
+        if (!root) return null;
+        var slots = root.querySelectorAll('slot');
+        for (var i = 0; i < slots.length; i++) if (assigned(slots[i]).indexOf(this) >= 0) return slots[i];
+        return null;
+      };
+      [EP, g.Text && g.Text.prototype].forEach(function (P) { if (P && !Object.prototype.hasOwnProperty.call(P, 'assignedSlot')) Object.defineProperty(P, 'assignedSlot', { get: assignedSlot, enumerable: true, configurable: true }); });
+    }
   }());
 
   // ---------------------------------------------------------------------------------------------------------------------------------- <a> and <area> as URL utils

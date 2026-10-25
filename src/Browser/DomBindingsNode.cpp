@@ -263,6 +263,18 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   }
   if (n->shadow_host) {   // a shadow root
     if (IS("host")) { *out = node_value(c, n->shadow_host); return true; }
+    if (IS("activeElement")) {   // the focused element if it is in this tree (one in a tree inside it shows as that tree's host)
+      dom::Node* focused = c.host.focused();
+      for (;;) {
+        dom::Node* top = focused;
+        while (top && top->parent) top = top->parent;
+        if (!focused || top == n) break;
+        if (!top || !top->shadow_host) { focused = nullptr; break; }
+        focused = top->shadow_host;
+      }
+      *out = node_value(c, focused);
+      return true;
+    }
     if (IS("mode")) { *out = str_value(vm, n->shadow_closed ? "closed" : "open"); return true; }
   }
   if (n->is_text() && IS("wholeText")) {   // the text of the run of adjacent text nodes around this one
@@ -317,7 +329,18 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     }
     if (IS("defaultView")) { *out = Value::make_object(vm.global()); return true; }
     if (IS("location")) { *out = object_value(c.location); return true; }
-    if (IS("activeElement") || IS("scrollingElement")) { *out = node_value(c, IS("activeElement") ? (c.host.focused() ? c.host.focused() : n->owner->body()) : n->owner->document_element()); return true; }
+    if (IS("activeElement")) {   // what has the focus, as seen from the page: an element inside a shadow tree shows up as the host
+      dom::Node* focused = c.host.focused();
+      for (;;) {
+        dom::Node* top = focused;
+        while (top && top->parent) top = top->parent;
+        if (!top || !top->shadow_host) break;
+        focused = top->shadow_host;
+      }
+      *out = node_value(c, focused ? focused : n->owner->body());
+      return true;
+    }
+    if (IS("scrollingElement")) { *out = node_value(c, n->owner->document_element()); return true; }
     if (IS("currentScript")) { *out = node_value(c, c.current_script); return true; }
     if (IS("hidden")) { *out = bool_value(c.page_hidden); return true; }
     if (IS("visibilityState")) { *out = str_value(vm, c.page_hidden ? "hidden" : "visible"); return true; }
