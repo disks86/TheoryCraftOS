@@ -21,7 +21,7 @@
 // devices of the machine grouped by kind (processors, memory, display adapters, displays, disk drives, ...), with a line of detail for the selected one.
 // It reads the machine through an ISystemMonitor and an IHardwareInventory and refreshes itself when update() is called (the desktop does so once
 // a second while the window is open). Right-clicking the Displays group of the hardware tree offers Display Settings, and right-clicking a network
-// adapter offers Properties (its address, gateway, DNS server, link state and speed - another window, see NetworkProperties). The File menu
+// adapter offers Properties (its address, gateway, DNS server, link state and speed - another window, see NetworkProperties); a Wi-Fi adapter also offers Wi-Fi Properties (the network it is joined to, the networks in range and joining one - see WirelessProperties). The File menu
 // closes the window; the View menu picks the tab.
 #pragma once
 #include "Gui/Controls/DataGrid.hpp"
@@ -120,6 +120,9 @@ class ComputerManager : public gui::Frame {
   // Fired when Properties is chosen for a network adapter; network_adapter() is the adapter's number (HardwareEntry::id).
   void on_open_network_properties(gui::Handler handler) { open_network_properties_ = handler; }
   uint32_t network_adapter() const { return properties_adapter_; }
+  // Fired when Wi-Fi Properties is chosen for a wireless adapter; wireless_adapter() is the adapter's number (HardwareEntry::id).
+  void on_open_wireless_properties(gui::Handler handler) { open_wireless_properties_ = handler; }
+  uint32_t wireless_adapter() const { return properties_adapter_; }
   // Reads the monitor and refreshes everything. `now_us` is the uptime; load figures are over the time since
   // the previous call.
   void update(uint64_t now_us);
@@ -134,6 +137,8 @@ class ComputerManager : public gui::Frame {
   gui::TreeView& hardware_tree() { return tree_; }
   gui::ContextMenu& display_menu() { return display_menu_; }
   gui::ContextMenu& adapter_menu() { return adapter_menu_; }
+  // The menu of a Wi-Fi adapter: Properties and Wi-Fi Properties.
+  gui::ContextMenu& wireless_menu() { return wireless_menu_; }
   gui::Label& hardware_info() { return hardware_info_; }
   // The tree node of a group (-1 if no device of the group is listed).
   int32_t hardware_group_node(HardwareGroup group) const;
@@ -208,6 +213,8 @@ class ComputerManager : public gui::Frame {
   static void on_hardware_selection(void* self, gui::Control&);
   static void on_display_settings_item(void* self, gui::Control&);
   static void on_properties_item(void* self, gui::Control&);
+  static void on_wireless_item(void* self, gui::Control&);
+  bool selected_adapter(uint32_t* id) const;
   void rebuild_hardware();
 
   gui::MenuBar menu_;
@@ -218,11 +225,11 @@ class ComputerManager : public gui::Frame {
   gui::ScrollPanel core_scroll_;
   gui::Panel processes_page_, performance_page_, hardware_page_, cpu_row_, memory_row_;
   gui::TreeView tree_;
-  gui::ContextMenu display_menu_, adapter_menu_;
-  gui::MenuItem *display_settings_item_ = nullptr, *properties_item_ = nullptr;
+  gui::ContextMenu display_menu_, adapter_menu_, wireless_menu_;
+  gui::MenuItem *display_settings_item_ = nullptr, *properties_item_ = nullptr, *wireless_properties_item_ = nullptr, *wireless_adapter_item_ = nullptr;
   gui::Label hardware_info_;
   IHardwareInventory* inventory_ = nullptr;
-  gui::Handler open_display_settings_, open_network_properties_;
+  gui::Handler open_display_settings_, open_network_properties_, open_wireless_properties_;
   uint32_t properties_adapter_ = 0;
   int32_t group_nodes_[kHardwareGroupCount] = {};
   gui::Label cpu_title_, cpu_value_, memory_title_, memory_value_, info_;

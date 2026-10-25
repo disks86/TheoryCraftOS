@@ -193,6 +193,8 @@ add_executable(BOOTX64
   src/Hardware/NetworkInterface/Intel/E1000NetworkInterface.cpp
   src/Hardware/NetworkInterface/Realtek/Rtl8139NetworkInterface.cpp
   src/Hardware/NetworkInterface/UEFI/UefiSimpleNetworkInterface.cpp
+  src/Hardware/WirelessInterface/WirelessTypes.cpp
+  src/Hardware/WirelessInterface/Software/SoftwareWirelessInterface.cpp
   src/StorageDemo.cpp
   src/Hardware/StorageDevice/StorageDeviceBase.cpp
   src/Hardware/StorageDevice/SystemStorageDevices.cpp
@@ -429,7 +431,9 @@ add_executable(BOOTX64
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
   src/SystemNetworkDetails.cpp
+  src/SystemWirelessDetails.cpp
   src/Desktop/NetworkProperties.cpp
+  src/Desktop/WirelessProperties.cpp
   src/Gui/Controls/MenuButton.cpp
   src/GraphicsDemo.cpp
   src/GuiDemo.cpp

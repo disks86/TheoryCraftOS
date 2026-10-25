@@ -24,6 +24,8 @@ namespace hardware {
 
 enum class LinkDuplex : uint8_t { Unknown, Half, Full };
 
+class IWirelessInterface;
+
 // An Ethernet network interface. It moves raw frames - destination MAC, source
 // MAC, EtherType, payload - and knows nothing about protocols above that.
 // Polled: nothing blocks, and received frames queue up inside the interface
@@ -56,6 +58,9 @@ class INetworkInterface : public IHardware {
     (void)enable;
     return false;
   }
+
+  // The Wi-Fi side of this interface (scanning, joining a network), or nullptr when it is not a wireless adapter.
+  virtual IWirelessInterface* wireless() { return nullptr; }
 
   virtual NetworkStatistics statistics() const = 0;
 

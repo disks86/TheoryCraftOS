@@ -35,6 +35,7 @@
 #include "Hardware/Monitor/SystemMonitors.hpp"
 #include "SystemInventory.hpp"
 #include "SystemNetworkDetails.hpp"
+#include "SystemWirelessDetails.hpp"
 #include "BootLog.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/SystemGraphics.hpp"
@@ -818,6 +819,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   inventory.set_cameras(&cameras);
   inventory.set_pci(&pci);
   SystemNetworkDetails network_details(network, stacks);
+  SystemWirelessDetails wireless_details(network);
 
   // The desktop: runs until Shut Down is chosen from the Start menu (or, with no display, until a key).
   // The monitors become the display: the surface is as big as all of them side by side, and when a monitor shows its picture at another size
@@ -982,6 +984,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_display_changer(&DisplayPipeline::apply, &display_pipeline);
     desktop.set_hardware_inventory(&inventory);
     desktop.set_network_details(&network_details);
+    desktop.set_wireless_details(&wireless_details);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
     desktop.set_capture_hub(capture_hub.get());
     desktop.set_midi_output(&usb_midi);
