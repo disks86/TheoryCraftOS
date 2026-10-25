@@ -28,6 +28,9 @@ const CompressedFormat kFormats[] = {
     {0x8C4C, 8, Codec::Bc1Rgb, 0x8C43}, {0x8C4D, 8, Codec::Bc1Rgba, 0x8C43}, {0x8C4E, 16, Codec::Bc2, 0x8C43}, {0x8C4F, 16, Codec::Bc3, 0x8C43},
     {0x8DBB, 8, Codec::Bc4U, 0x8229}, {0x8DBC, 8, Codec::Bc4S, 0x8F94}, {0x8DBD, 16, Codec::Bc5U, 0x822B}, {0x8DBE, 16, Codec::Bc5S, 0x8F95},
     {0x8D64, 8, Codec::Etc1, 0x8058},
+    {0x9274, 8, Codec::Etc2Rgb, 0x8058}, {0x9275, 8, Codec::Etc2Rgb, 0x8C43}, {0x9276, 8, Codec::Etc2A1, 0x8058}, {0x9277, 8, Codec::Etc2A1, 0x8C43},
+    {0x9278, 16, Codec::Etc2Rgba, 0x8058}, {0x9279, 16, Codec::Etc2Rgba, 0x8C43},
+    {0x9270, 8, Codec::EacR, 0x822E}, {0x9271, 8, Codec::EacRs, 0x822E}, {0x9272, 16, Codec::EacRg, 0x8230}, {0x9273, 16, Codec::EacRgs, 0x8230},
     {0x8E8C, 16, Codec::Bc7, 0x8058}, {0x8E8D, 16, Codec::Bc7, 0x8C43}, {0x8E8E, 16, Codec::Bc6S, 0x8814}, {0x8E8F, 16, Codec::Bc6U, 0x8814},
     // ASTC (LDR profile): 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12, linear then sRGB
     {0x93B0, 16, Codec::Astc, 0x8058, 4, 4}, {0x93B1, 16, Codec::Astc, 0x8058, 5, 4}, {0x93B2, 16, Codec::Astc, 0x8058, 5, 5}, {0x93B3, 16, Codec::Astc, 0x8058, 6, 5},
@@ -137,6 +140,139 @@ void etc1(const uint8_t* p, Rgba out[16]) {
     }
 }
 
+
+// ETC2 colour blocks: the four modes of the format (individual and differential as in ETC1; T, H and planar from the differential codes that overflow).
+// `a1` is the punch-through alpha form, whose bit 33 is the opaque flag instead of "diff" (it always uses the differential codes).
+void etc2(const uint8_t* d, bool a1, Rgba out[16]) {
+  static const int kDist[8] = {3, 6, 11, 16, 23, 32, 41, 64};
+  const bool diff = a1 || (d[3] & 2) != 0, opaque = !a1 || (d[3] & 2) != 0;
+  const uint32_t j = static_cast<uint32_t>(d[6] << 8 | d[7]), k = static_cast<uint32_t>(d[4] << 8 | d[5]);   // low and high bits of the pixel selectors
+  auto put = [&](int pix, int r, int g, int b, bool transparent) {
+    Rgba& o = out[(pix & 3) * 4 + (pix >> 2)];   // the selectors run down the columns
+    o.c[0] = transparent ? 0 : clamp8(r);
+    o.c[1] = transparent ? 0 : clamp8(g);
+    o.c[2] = transparent ? 0 : clamp8(b);
+    o.c[3] = transparent ? 0 : 255;
+  };
+  auto sel = [&](int pix) { return static_cast<int>((((k >> pix) & 1) << 1) | ((j >> pix) & 1)); };
+  int c[3][3] = {};
+  if (!diff) {   // individual
+    for (int q = 0; q < 3; ++q) { c[0][q] = (d[q] & 0xf0) | (d[q] >> 4); c[1][q] = (d[q] & 0x0f) | (d[q] << 4 & 0xf0); }
+    const int code[2] = {d[3] >> 5, d[3] >> 2 & 7};
+    for (int pix = 0; pix < 16; ++pix) {
+      const int s = (d[3] & 1) ? ((pix >> 1) & 1) : (pix >> 3);
+      const int m = kEtcTable[code[s]][((j >> pix) & 1) | (((k >> pix) & 1) ? 2 : 0)];
+      put(pix, c[s][0] + m, c[s][1] + m, c[s][2] + m, false);
+    }
+    return;
+  }
+  const int r = d[0] & 0xf8, g = d[1] & 0xf8, b = d[2] & 0xf8;
+  const int dr = (d[0] << 3 & 0x18) - (d[0] << 3 & 0x20), dg = (d[1] << 3 & 0x18) - (d[1] << 3 & 0x20), db = (d[2] << 3 & 0x18) - (d[2] << 3 & 0x20);
+  auto paint = [&](const int col[4][3]) {
+    for (int pix = 0; pix < 16; ++pix) {
+      const int i = sel(pix);
+      put(pix, col[i][0], col[i][1], col[i][2], !opaque && i == 2);
+    }
+  };
+  if (r + dr < 0 || r + dr > 255) {   // T mode
+    c[0][0] = (d[0] << 3 & 0xc0) | (d[0] << 4 & 0x30) | (d[0] >> 1 & 0xc) | (d[0] & 3);
+    c[0][1] = (d[1] & 0xf0) | d[1] >> 4;
+    c[0][2] = (d[1] & 0x0f) | (d[1] << 4 & 0xf0);
+    c[1][0] = (d[2] & 0xf0) | d[2] >> 4;
+    c[1][1] = (d[2] & 0x0f) | (d[2] << 4 & 0xf0);
+    c[1][2] = (d[3] & 0xf0) | d[3] >> 4;
+    const int dist = kDist[(d[3] >> 1 & 6) | (d[3] & 1)];
+    const int col[4][3] = {{c[0][0], c[0][1], c[0][2]}, {c[1][0] + dist, c[1][1] + dist, c[1][2] + dist}, {c[1][0], c[1][1], c[1][2]}, {c[1][0] - dist, c[1][1] - dist, c[1][2] - dist}};
+    paint(col);
+  } else if (g + dg < 0 || g + dg > 255) {   // H mode
+    c[0][0] = (d[0] << 1 & 0xf0) | (d[0] >> 3 & 0xf);
+    c[0][1] = (d[0] << 5 & 0xe0) | (d[1] & 0x10);
+    c[0][1] |= c[0][1] >> 4;
+    c[0][2] = (d[1] & 8) | (d[1] << 1 & 6) | d[2] >> 7;
+    c[0][2] |= c[0][2] << 4;
+    c[1][0] = (d[2] << 1 & 0xf0) | (d[2] >> 3 & 0xf);
+    c[1][1] = (d[2] << 5 & 0xe0) | (d[3] >> 3 & 0x10);
+    c[1][1] |= c[1][1] >> 4;
+    c[1][2] = (d[3] << 1 & 0xf0) | (d[3] >> 3 & 0xf);
+    for (int q = 0; q < 3; ++q) { c[0][q] &= 255; c[1][q] &= 255; }
+    int di = (d[3] & 4) | (d[3] << 1 & 2);
+    if (c[0][0] > c[1][0] || (c[0][0] == c[1][0] && (c[0][1] > c[1][1] || (c[0][1] == c[1][1] && c[0][2] >= c[1][2])))) ++di;
+    const int dist = kDist[di];
+    const int col[4][3] = {{c[0][0] + dist, c[0][1] + dist, c[0][2] + dist}, {c[0][0] - dist, c[0][1] - dist, c[0][2] - dist},
+                           {c[1][0] + dist, c[1][1] + dist, c[1][2] + dist}, {c[1][0] - dist, c[1][1] - dist, c[1][2] - dist}};
+    paint(col);
+  } else if (b + db < 0 || b + db > 255) {   // planar
+    c[0][0] = (d[0] << 1 & 0xfc) | (d[0] >> 5 & 3);
+    c[0][1] = (d[0] << 7 & 0x80) | (d[1] & 0x7e) | (d[0] & 1);
+    c[0][2] = (d[1] << 7 & 0x80) | (d[2] << 2 & 0x60) | (d[2] << 3 & 0x18) | (d[3] >> 5 & 4);
+    c[0][2] |= c[0][2] >> 6;
+    c[1][0] = (d[3] << 1 & 0xf8) | (d[3] << 2 & 4) | (d[3] >> 5 & 3);
+    c[1][1] = (d[4] & 0xfe) | d[4] >> 7;
+    c[1][2] = (d[4] << 7 & 0x80) | (d[5] >> 1 & 0x7c);
+    c[1][2] |= c[1][2] >> 6;
+    c[2][0] = (d[5] << 5 & 0xe0) | (d[6] >> 3 & 0x1c) | (d[5] >> 1 & 3);
+    c[2][1] = (d[6] << 3 & 0xf8) | (d[7] >> 5 & 0x6) | (d[6] >> 4 & 1);
+    c[2][2] = (d[7] << 2 & 0xff) | (d[7] >> 4 & 3);
+    for (int q = 0; q < 3; ++q) for (int e = 0; e < 3; ++e) c[q][e] &= 255;
+    for (int y = 0; y < 4; ++y)
+      for (int x = 0; x < 4; ++x) {
+        Rgba& o = out[y * 4 + x];
+        for (int q = 0; q < 3; ++q) o.c[q] = clamp8((x * (c[1][q] - c[0][q]) + y * (c[2][q] - c[0][q]) + 4 * c[0][q] + 2) >> 2);
+        o.c[3] = 255;
+      }
+  } else {   // differential
+    const int code[2] = {d[3] >> 5, d[3] >> 2 & 7};
+    c[0][0] = r | r >> 5; c[0][1] = g | g >> 5; c[0][2] = b | b >> 5;
+    c[1][0] = r + dr; c[1][1] = g + dg; c[1][2] = b + db;
+    for (int q = 0; q < 3; ++q) c[1][q] |= c[1][q] >> 5;
+    for (int pix = 0; pix < 16; ++pix) {
+      const int s = (d[3] & 1) ? ((pix >> 1) & 1) : (pix >> 3);
+      const int lo = (j >> pix) & 1, hi = (k >> pix) & 1;
+      const int mod = (!opaque && !lo) ? 0 : kEtcTable[code[s]][lo] * (hi ? -1 : 1);
+      put(pix, c[s][0] + mod, c[s][1] + mod, c[s][2] + mod, !opaque && hi && !lo);
+    }
+  }
+}
+
+const int kEacTable[16][8] = {
+    {-3, -6, -9, -15, 2, 5, 8, 14}, {-3, -7, -10, -13, 2, 6, 9, 12}, {-2, -5, -8, -13, 1, 4, 7, 12}, {-2, -4, -6, -13, 1, 3, 5, 12},
+    {-3, -6, -8, -12, 2, 5, 7, 11}, {-3, -7, -9, -11, 2, 6, 8, 10}, {-4, -7, -8, -11, 3, 6, 7, 10}, {-3, -5, -8, -11, 2, 4, 7, 10},
+    {-2, -6, -8, -10, 1, 5, 7, 9},  {-2, -5, -8, -10, 1, 4, 7, 9},  {-2, -4, -8, -10, 1, 3, 7, 9},  {-2, -5, -7, -10, 1, 4, 6, 9},
+    {-3, -4, -7, -10, 2, 3, 6, 9},  {-1, -2, -3, -10, 0, 1, 2, 9},  {-4, -6, -8, -9, 3, 5, 7, 8},   {-3, -5, -7, -9, 2, 4, 6, 8}};
+
+// EAC: a base value, a multiplier, a modifier table and a 3-bit selector per pixel (column by column). `out` is in row-major order, in 0..1 (unsigned) or -1..1.
+void eac(const uint8_t* p, bool is_signed, float out[16]) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+  const int mult = (p[1] >> 4) ? (p[1] >> 4) * 8 : 1;
+  const int* table = kEacTable[p[1] & 15];
+  int base = is_signed ? static_cast<int8_t>(p[0]) : p[0];
+  if (is_signed && base < -127) base = -127;
+  for (int pix = 0; pix < 16; ++pix) {
+    const int m = table[(v >> (45 - 3 * pix)) & 7] * mult;
+    float f;
+    if (is_signed) {
+      int val = base * 8 + m;
+      val = val < -1023 ? -1023 : (val > 1023 ? 1023 : val);
+      f = static_cast<float>(val) / 1023.0f;
+    } else {
+      int val = base * 8 + 4 + m;
+      val = val < 0 ? 0 : (val > 2047 ? 2047 : val);
+      f = static_cast<float>(val) / 2047.0f;
+    }
+    out[(pix & 3) * 4 + (pix >> 2)] = f;
+  }
+}
+
+// The alpha of ETC2 RGBA: a base, a multiplier (0 means no modifier at all), a table and 3-bit selectors, 8 bit results.
+void etc2_alpha(const uint8_t* p, Rgba out[16]) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+  const int mult = p[1] >> 4;
+  const int* table = kEacTable[p[1] & 15];
+  for (int pix = 0; pix < 16; ++pix)
+    out[(pix & 3) * 4 + (pix >> 2)].c[3] = clamp8(p[0] + mult * table[(v >> (45 - 3 * pix)) & 7]);
+}
 
 // --- BC6H and BC7 -------------------------------------------------------------------------------------------------------------------------------------
 
@@ -747,6 +883,11 @@ bool decode_compressed(const CompressedFormat& f, ConstByteView data, uint32_t w
           case Codec::Bc4U: case Codec::Bc4S: bc4(p, f.codec == Codec::Bc4S, chan[0]); break;
           case Codec::Bc5U: case Codec::Bc5S: bc4(p, f.codec == Codec::Bc5S, chan[0]); bc4(p + 8, f.codec == Codec::Bc5S, chan[1]); break;
           case Codec::Etc1: etc1(p, px); break;
+          case Codec::Etc2Rgb: etc2(p, false, px); break;
+          case Codec::Etc2A1: etc2(p, true, px); break;
+          case Codec::Etc2Rgba: etc2(p + 8, false, px); etc2_alpha(p, px); break;
+          case Codec::EacR: case Codec::EacRs: eac(p, f.codec == Codec::EacRs, chan[0]); break;
+          case Codec::EacRg: case Codec::EacRgs: eac(p, f.codec == Codec::EacRgs, chan[0]); eac(p + 8, f.codec == Codec::EacRgs, chan[1]); break;
           case Codec::Bc7: bc7(p, px); break;
           case Codec::Bc6U: case Codec::Bc6S: bc6(p, f.codec == Codec::Bc6S, rgb); break;
           case Codec::Astc: {
@@ -756,7 +897,8 @@ bool decode_compressed(const CompressedFormat& f, ConstByteView data, uint32_t w
             break;
           }
         }
-        const bool two = f.codec == Codec::Bc5U || f.codec == Codec::Bc5S, one = f.codec == Codec::Bc4U || f.codec == Codec::Bc4S;
+        const bool two = f.codec == Codec::Bc5U || f.codec == Codec::Bc5S || f.codec == Codec::EacRg || f.codec == Codec::EacRgs;
+        const bool one = f.codec == Codec::Bc4U || f.codec == Codec::Bc4S || f.codec == Codec::EacR || f.codec == Codec::EacRs;
         const bool hdr6 = f.codec == Codec::Bc6U || f.codec == Codec::Bc6S;
         for (uint32_t i = 0; i < static_cast<uint32_t>(f.bw) * f.bh; ++i) {
           const uint32_t tx = bx * f.bw + i % f.bw, ty = by * f.bh + i / f.bw;

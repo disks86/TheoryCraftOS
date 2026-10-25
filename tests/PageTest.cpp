@@ -1182,6 +1182,25 @@ static void test_webgpu_rg11b10() {
         "960 896 512 true | sampled ok needs feature");
 }
 
+static void test_etc2_eac() {
+  CHECK(gl_script(
+            "var gl = c.getContext('webgl2'); var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);"
+            " var etc = gl.getExtension('WEBGL_compressed_texture_etc'); console.log(etc.COMPRESSED_RGB8_ETC2, etc.COMPRESSED_SIGNED_RG11_EAC, gl.getParameter(gl.COMPRESSED_TEXTURE_FORMATS).length);"
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, etc.COMPRESSED_RGB8_ETC2, 4, 4, 0, new Uint8Array([0xFF, 0, 0, 0, 0, 0, 0, 0])); console.log(gl.getError());"
+            " var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);"
+            " var px = new Uint8Array(4); gl.readPixels(1, 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); console.log(px.join(','));"
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, etc.COMPRESSED_RGBA8_ETC2_EAC, 4, 4, 0, new Uint8Array(8)); console.log(gl.getError());"
+            " navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice({ requiredFeatures: ['texture-compression-etc2'] }); }).then(function (d) {"
+            "  var tx = d.createTexture({ size: [4, 4], format: 'etc2-rgb8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });"
+            "  d.queue.writeTexture({ texture: tx }, new Uint8Array([0xFF, 0, 0, 0, 1, 2, 3, 4]), { bytesPerRow: 8 }, [4, 4]);"
+            "  var out = d.createBuffer({ size: 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });"
+            "  var e = d.createCommandEncoder(); e.copyTextureToBuffer({ texture: tx }, { buffer: out, bytesPerRow: 8 }, [4, 4]); d.queue.submit([e.finish()]);"
+            "  return out.mapAsync(GPUMapMode.READ).then(function () { var u = new Uint8Array(out.getMappedRange()); console.log(u[0], u[1], u[4], u[7]);"
+            "   d.pushErrorScope('validation'); d.createTexture({ size: [4, 4], format: 'eac-r11snorm', usage: GPUTextureUsage.RENDER_ATTACHMENT }); return d.popErrorScope(); }).then(function (er) { console.log(er ? 'not renderable' : 'bad'); });"
+            " }).catch(function (e) { console.log('ERR', e && e.message); });") ==
+        "37492 37491 10 | 0 | 255,2,2,255 | 1281 | 255 0 1 4 | not renderable");
+}
+
 static void test_webgpu_mapping() {
   CHECK(gl_script(
             "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice(); }).then(function (d) {"
@@ -5901,6 +5920,7 @@ int main(int argc, char** argv) {
   test_webgpu_mapping();
   test_webgpu_compressed();
   test_webgpu_rg11b10();
+  test_etc2_eac();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();
@@ -5954,6 +5974,7 @@ int main(int argc, char** argv) {
   test_webgpu_mapping();
   test_webgpu_compressed();
   test_webgpu_rg11b10();
+  test_etc2_eac();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();

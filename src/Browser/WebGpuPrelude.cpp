@@ -79,13 +79,15 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
                  maxComputeWorkgroupStorageSize: 16384, maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256, maxComputeWorkgroupSizeZ: 64,
                  maxComputeWorkgroupsPerDimension: 65535 };
   var newLimits = function () { var l = Object.create(GPUSupportedLimits.prototype); for (var k in LIMITS) Object.defineProperty(l, k, { value: LIMITS[k], enumerable: true }); return l; };
-  var FEATURES = ['depth-clip-control', 'depth32float-stencil8', 'indirect-first-instance', 'bgra8unorm-storage', 'float32-filterable', 'rg11b10ufloat-renderable', 'texture-compression-astc', 'texture-compression-bc', 'timestamp-query'];
+  var FEATURES = ['depth-clip-control', 'depth32float-stencil8', 'indirect-first-instance', 'bgra8unorm-storage', 'float32-filterable', 'rg11b10ufloat-renderable', 'texture-compression-astc', 'texture-compression-bc', 'texture-compression-etc2', 'timestamp-query'];
   // block compressed formats: [feature, texels wide, texels high]
   var BLOCKS = {};
   ['bc1-rgba-unorm', 'bc2-rgba-unorm', 'bc3-rgba-unorm', 'bc4-r-unorm', 'bc4-r-snorm', 'bc5-rg-unorm', 'bc5-rg-snorm', 'bc6h-rgb-ufloat', 'bc6h-rgb-float', 'bc7-rgba-unorm'].forEach(function (n) {
     BLOCKS[n] = ['texture-compression-bc', 4, 4];
     if (/unorm$/.test(n) && n.indexOf('bc4') < 0 && n.indexOf('bc5') < 0 && n.indexOf('bc6') < 0) BLOCKS[n + '-srgb'] = ['texture-compression-bc', 4, 4];
   });
+  ['etc2-rgb8unorm', 'etc2-rgb8a1unorm', 'etc2-rgba8unorm'].forEach(function (n) { BLOCKS[n] = ['texture-compression-etc2', 4, 4]; BLOCKS[n + '-srgb'] = ['texture-compression-etc2', 4, 4]; });
+  ['eac-r11unorm', 'eac-r11snorm', 'eac-rg11unorm', 'eac-rg11snorm'].forEach(function (n) { BLOCKS[n] = ['texture-compression-etc2', 4, 4]; });
   [[4, 4], [5, 4], [5, 5], [6, 5], [6, 6], [8, 5], [8, 6], [8, 8], [10, 5], [10, 6], [10, 8], [10, 10], [12, 10], [12, 12]].forEach(function (b) {
     BLOCKS['astc-' + b[0] + 'x' + b[1] + '-unorm'] = ['texture-compression-astc', b[0], b[1]];
     BLOCKS['astc-' + b[0] + 'x' + b[1] + '-unorm-srgb'] = ['texture-compression-astc', b[0], b[1]];

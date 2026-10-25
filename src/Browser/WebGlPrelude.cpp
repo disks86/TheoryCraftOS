@@ -674,11 +674,11 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
   // ------------------------------------------------------------------------------------------------------------------------------------------ extensions
   var ext1 = ['ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float', 'EXT_frag_depth', 'EXT_shader_texture_lod', 'EXT_texture_filter_anisotropic', 'OES_element_index_uint',
               'OES_standard_derivatives', 'OES_texture_float', 'OES_texture_float_linear', 'OES_texture_half_float', 'OES_texture_half_float_linear', 'OES_vertex_array_object',
-              'WEBGL_color_buffer_float', 'WEBGL_compressed_texture_etc1', 'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb', 'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc', 'WEBGL_compressed_texture_astc', 'WEBGL_debug_renderer_info', 'WEBGL_depth_texture', 'WEBGL_draw_buffers', 'WEBGL_lose_context'];
-  var ext2 = ['EXT_color_buffer_float', 'EXT_color_buffer_half_float', 'EXT_texture_filter_anisotropic', 'OES_texture_float_linear', 'WEBGL_compressed_texture_etc1', 'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb', 'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc', 'WEBGL_compressed_texture_astc', 'WEBGL_debug_renderer_info', 'WEBGL_lose_context'];
+              'WEBGL_color_buffer_float', 'WEBGL_compressed_texture_etc', 'WEBGL_compressed_texture_etc1', 'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb', 'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc', 'WEBGL_compressed_texture_astc', 'WEBGL_debug_renderer_info', 'WEBGL_depth_texture', 'WEBGL_draw_buffers', 'WEBGL_lose_context'];
+  var ext2 = ['EXT_color_buffer_float', 'EXT_color_buffer_half_float', 'EXT_texture_filter_anisotropic', 'OES_texture_float_linear', 'WEBGL_compressed_texture_etc', 'WEBGL_compressed_texture_etc1', 'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb', 'EXT_texture_compression_bptc', 'EXT_texture_compression_rgtc', 'WEBGL_compressed_texture_astc', 'WEBGL_debug_renderer_info', 'WEBGL_lose_context'];
   m1('getSupportedExtensions', function () { return (this.__es3 ? ext2 : ext1).slice(); });
   var COMPRESSED_BY_EXT = { WEBGL_compressed_texture_s3tc: [0x83F0, 0x83F1, 0x83F2, 0x83F3], WEBGL_compressed_texture_s3tc_srgb: [0x8C4C, 0x8C4D, 0x8C4E, 0x8C4F],
-                            EXT_texture_compression_rgtc: [0x8DBB, 0x8DBC, 0x8DBD, 0x8DBE], WEBGL_compressed_texture_etc1: [0x8D64],
+                            EXT_texture_compression_rgtc: [0x8DBB, 0x8DBC, 0x8DBD, 0x8DBE], WEBGL_compressed_texture_etc1: [0x8D64], WEBGL_compressed_texture_etc: [0x9270, 0x9271, 0x9272, 0x9273, 0x9274, 0x9275, 0x9276, 0x9277, 0x9278, 0x9279],
                             EXT_texture_compression_bptc: [0x8E8C, 0x8E8D, 0x8E8E, 0x8E8F], WEBGL_compressed_texture_astc: [0x93B0, 0x93B1, 0x93B2, 0x93B3, 0x93B4, 0x93B5, 0x93B6, 0x93B7, 0x93B8, 0x93B9, 0x93BA, 0x93BB, 0x93BC, 0x93BD, 0x93D0, 0x93D1, 0x93D2, 0x93D3, 0x93D4, 0x93D5, 0x93D6, 0x93D7, 0x93D8, 0x93D9, 0x93DA, 0x93DB, 0x93DC, 0x93DD] };
   var makeExt = function (ctx, name) {
     var e = {};
@@ -741,6 +741,11 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
         nm('COMPRESSED_RGBA_ASTC_4x4_KHR', 0x93B0); nm('COMPRESSED_RGBA_ASTC_5x4_KHR', 0x93B1); nm('COMPRESSED_RGBA_ASTC_5x5_KHR', 0x93B2); nm('COMPRESSED_RGBA_ASTC_6x5_KHR', 0x93B3); nm('COMPRESSED_RGBA_ASTC_6x6_KHR', 0x93B4); nm('COMPRESSED_RGBA_ASTC_8x5_KHR', 0x93B5); nm('COMPRESSED_RGBA_ASTC_8x6_KHR', 0x93B6); nm('COMPRESSED_RGBA_ASTC_8x8_KHR', 0x93B7); nm('COMPRESSED_RGBA_ASTC_10x5_KHR', 0x93B8); nm('COMPRESSED_RGBA_ASTC_10x6_KHR', 0x93B9); nm('COMPRESSED_RGBA_ASTC_10x8_KHR', 0x93BA); nm('COMPRESSED_RGBA_ASTC_10x10_KHR', 0x93BB); nm('COMPRESSED_RGBA_ASTC_12x10_KHR', 0x93BC); nm('COMPRESSED_RGBA_ASTC_12x12_KHR', 0x93BD);
         nm('COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR', 0x93D0); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR', 0x93D1); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR', 0x93D2); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR', 0x93D3); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR', 0x93D4); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR', 0x93D5); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR', 0x93D6); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR', 0x93D7); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR', 0x93D8); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR', 0x93D9); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR', 0x93DA); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR', 0x93DB); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR', 0x93DC); nm('COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR', 0x93DD);
         nm('getSupportedProfiles', function () { return ['ldr']; });
+        break;
+      case 'WEBGL_compressed_texture_etc':
+        nm('COMPRESSED_R11_EAC', 0x9270); nm('COMPRESSED_SIGNED_R11_EAC', 0x9271); nm('COMPRESSED_RG11_EAC', 0x9272); nm('COMPRESSED_SIGNED_RG11_EAC', 0x9273);
+        nm('COMPRESSED_RGB8_ETC2', 0x9274); nm('COMPRESSED_SRGB8_ETC2', 0x9275); nm('COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2', 0x9276); nm('COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2', 0x9277);
+        nm('COMPRESSED_RGBA8_ETC2_EAC', 0x9278); nm('COMPRESSED_SRGB8_ALPHA8_ETC2_EAC', 0x9279);
         break;
       case 'WEBGL_compressed_texture_etc1': nm('COMPRESSED_RGB_ETC1_WEBGL', 0x8D64); break;
       case 'EXT_color_buffer_float': break;
