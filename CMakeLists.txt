@@ -223,6 +223,7 @@ add_executable(BOOTX64
   src/FileSystem/Ntfs/NtfsWrite.cpp
   src/FileSystem/Ext/ExtFileSystem.cpp
   src/FileSystem/Ext/ExtWrite.cpp
+  src/FileSystem/Ext/ExtJournal.cpp
   src/ConcurrentDemo.cpp
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp

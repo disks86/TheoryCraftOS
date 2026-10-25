@@ -268,6 +268,7 @@ struct Variant {
   const char* options;  // for mke2fs
   uint32_t megabytes;
   uint32_t block_size;
+  const char* type = "ext2";  // what info() reports
 };
 
 static Bytes make_image(const Variant& v, const std::string& populate_dir = "", const char* extra = "") {
@@ -290,6 +291,19 @@ static std::vector<Variant> ext2_variants() {
   };
 }
 
+static std::vector<Variant> ext3_variants() {
+  return {
+      {"ext3 1k", "-t ext3 -b 1024 -I 128 -N 4000", 24, 1024, "ext3"},
+      {"ext3 4k", "-t ext3 -b 4096 -I 256 -N 4000", 40, 4096, "ext3"},
+  };
+}
+
+static std::vector<Variant> all_variants() {
+  std::vector<Variant> v = ext2_variants(), w = ext3_variants();
+  v.insert(v.end(), w.begin(), w.end());
+  return v;
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 static void test_read(const Variant& v, uint32_t device_block, uint64_t lead) {
@@ -305,7 +319,7 @@ static void test_read(const Variant& v, uint32_t device_block, uint64_t lead) {
   const FileSystemInfo info = mt.fs->info();
   CHECK(info.read_only);
   CHECK(info.total_bytes > 0);
-  CHECK(strncmp(info.type_name.view().data(), "ext2", 4) == 0);
+  CHECK(info.type_name.view().equals(v.type));
   CHECK(compare_tree(*mt.fs, m, v.name) == 0);
   // The disk was only read.
   CHECK(mt.disk->writes == 0);
@@ -509,7 +523,7 @@ static void test_big_directory(const Variant& v) {
 static void test_full_volume(const Variant& v) {
   if (g_verbose) printf("full: %s\n", v.name);
   Variant small = v;
-  small.megabytes = 4;
+  small.megabytes = strcmp(v.type, "ext2") == 0 ? 4 : 12;
   Bytes image = make_image(small, "", "-N 200");
   Mounted mt;
   CHECK_STATUS(mt.mount(image, 512, true), Status::Ok);
@@ -538,6 +552,7 @@ static void test_full_volume(const Variant& v) {
   int made = 0;
   for (; made < 1000; ++made) if (write_file(fs, "/i" + std::to_string(made), Bytes()) != Status::Ok) break;
   CHECK(made > 100 && made < 1000);
+  if (made >= 1000) return;
   CHECK_STATUS(fs.create_directory("/nodirs"), Status::NoSpace);
   CHECK_STATUS(fs.flush(), Status::Ok);
   CHECK_FSCK(mt.image());
@@ -640,6 +655,149 @@ static void test_random(const Variant& v, uint32_t seed, int operations) {
   Mounted again;
   CHECK_STATUS(again.mount(out, 512, false), Status::Ok);
   if (again.fs) CHECK(compare_tree(*again.fs, model, "random remount") == 0);
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The journal and hash tree directories (ext3)
+
+static std::string debugfs(const std::string& image, const std::string& commands, bool write) {
+  const std::string script = g_work + "/debugfs.cmd", out = g_work + "/debugfs.out";
+  spit(script, Bytes(commands.begin(), commands.end()));
+  sh(std::string("debugfs ") + (write ? "-w " : "") + "-f '" + script + "' '" + image + "' > '" + out + "' 2>&1");
+  Bytes text = slurp(out);
+  return std::string(text.begin(), text.end());
+}
+
+// The disk blocks of the first `count` blocks of a file, as the reference debugfs sees them.
+static std::vector<uint64_t> file_blocks(const std::string& image, const std::string& path, int count) {
+  std::string commands;
+  for (int i = 0; i < count; ++i) commands += "bmap " + path + " " + std::to_string(i) + "\n";
+  std::istringstream in(debugfs(image, commands, false));
+  std::vector<uint64_t> blocks;
+  std::string line;
+  while (std::getline(in, line)) if (!line.empty() && isdigit(static_cast<unsigned char>(line[0]))) blocks.push_back(strtoull(line.c_str(), nullptr, 10));
+  return blocks;
+}
+
+static std::string csv(const std::vector<uint64_t>& blocks, size_t from, size_t to) {
+  std::string out;
+  for (size_t i = from; i < to; ++i) out += (out.empty() ? "" : ",") + std::to_string(blocks[i]);
+  return out;
+}
+
+// Builds a volume whose journal holds transactions (written by debugfs) that were never replayed, lets the reference e2fsck replay a
+// copy, and requires this code to arrive at the same files.
+static void test_journal(const Variant& v, const char* label, const char* journal_commands_template, bool expect_changes) {
+  if (g_verbose) printf("journal: %s %s\n", v.name, label);
+  const int blocks_in_file = 330;
+  const std::string dir = g_work + "/src";
+  sh("rm -rf '" + dir + "'; mkdir -p '" + dir + "'");
+  Model m;
+  m.files["/f"] = make_data(uint64_t{blocks_in_file} * v.block_size, 1);
+  m.files["/g"] = make_data(3 * v.block_size + 5, 2);
+  populate(dir, m);
+  Bytes clean = make_image(v, dir);
+  const std::string img = g_work + "/crashed.img";
+  spit(img, clean);
+  std::vector<uint64_t> blocks = file_blocks(img, "/f", blocks_in_file);
+  if (blocks.size() != static_cast<size_t>(blocks_in_file)) { printf("FAILED: bmap gave %zu blocks\n", blocks.size()); ++g_failed; return; }
+  Bytes pat1 = make_data(uint64_t{blocks_in_file} * v.block_size, 77), pat2 = make_data(uint64_t{blocks_in_file} * v.block_size, 88);
+  spit(g_work + "/pat1", pat1);
+  spit(g_work + "/pat2", pat2);
+  std::string commands = journal_commands_template;
+  auto replace_all = [&](const std::string& from, const std::string& to) {
+    for (size_t at; (at = commands.find(from)) != std::string::npos;) commands.replace(at, from.size(), to);
+  };
+  replace_all("@ALL@", csv(blocks, 0, blocks.size()));
+  replace_all("@A@", csv(blocks, 0, 10));
+  replace_all("@B@", csv(blocks, 5, 15));
+  replace_all("@C@", csv(blocks, 100, 110));
+  replace_all("@WORK@", g_work);
+  debugfs(img, commands, true);
+  Bytes crashed = slurp(img);
+  // the reference: e2fsck replays the journal
+  const std::string ref = g_work + "/reference.img";
+  spit(ref, crashed);
+  sh("e2fsck -fy '" + ref + "' > /dev/null 2>&1");
+  debugfs(ref, "dump /f " + g_work + "/ref_f\ndump /g " + g_work + "/ref_g\n", false);
+  Model want;
+  want.files["/f"] = slurp(g_work + "/ref_f");
+  want.files["/g"] = slurp(g_work + "/ref_g");
+  CHECK(want.files["/f"].size() == m.files["/f"].size());
+  CHECK((want.files["/f"] != m.files["/f"]) == expect_changes);
+
+  {  // a device that cannot be written: nothing is replayed, the volume is read only and shows the old content
+    Mounted ro;
+    CHECK_STATUS(ro.mount(crashed, 512, false), Status::Ok);
+    if (ro.fs) {
+      CHECK(ro.fs->info().read_only);
+      CHECK(compare_tree(*ro.fs, m, "unreplayed") == 0);
+    }
+  }
+  Mounted mt;
+  CHECK_STATUS(mt.mount(crashed, 512, true), Status::Ok);
+  if (!mt.fs) return;
+  CHECK(!mt.fs->info().read_only);
+  CHECK(compare_tree(*mt.fs, want, label) == 0);
+  CHECK_STATUS(write_file(*mt.fs, "/after", make_data(7000, 5)), Status::Ok);  // writable and usable afterwards
+  want.files["/after"] = make_data(7000, 5);
+  CHECK(compare_tree(*mt.fs, want, label) == 0);
+  CHECK_STATUS(mt.fs->flush(), Status::Ok);
+  Bytes done = mt.image();
+  CHECK_FSCK(done);
+  // the journal is empty now: mounting the result again has nothing to replay
+  Mounted again;
+  CHECK_STATUS(again.mount(done, 512, true), Status::Ok);
+  if (again.fs) CHECK(compare_tree(*again.fs, want, "after replay") == 0);
+}
+
+static void test_journals(const Variant& v) {
+  test_journal(v, "committed", "jo\njw -b @ALL@ @WORK@/pat1\njc\n", true);
+  test_journal(v, "uncommitted", "jo\njw -b @ALL@ @WORK@/pat1 -c\njc\n", false);
+  test_journal(v, "two transactions", "jo\njw -b @A@ @WORK@/pat1\njc\njo\njw -b @B@ @WORK@/pat2\njc\n", true);
+  test_journal(v, "revoked", "jo\njw -b @ALL@ @WORK@/pat1\njc\njo\njw -r @C@\njc\n", true);
+  test_journal(v, "checksummed", "jo -c\njw -b @ALL@ @WORK@/pat1\njc\n", true);
+}
+
+// A directory with a hash tree (made by e2fsck -D) is read, and flattened by the first change to it.
+static void test_htree(const Variant& v) {
+  if (g_verbose) printf("htree: %s\n", v.name);
+  const std::string dir = g_work + "/src";
+  sh("rm -rf '" + dir + "'; mkdir -p '" + dir + "'");
+  Model m;
+  m.dirs.insert("/big");
+  for (int i = 0; i < 3000; ++i) {
+    char name[96];
+    snprintf(name, sizeof name, "/big/a_rather_long_file_name_for_the_hash_tree_%05d", i);
+    m.files[name] = make_data(i % 3, i);
+  }
+  populate(dir, m);
+  Bytes image = make_image(v, dir, "-N 8000");
+  const std::string img = g_work + "/htree.img";
+  spit(img, image);
+  sh("e2fsck -fyD '" + img + "' > /dev/null 2>&1");
+  CHECK(debugfs(img, "stat /big\n", false).find("Flags: 0x1000") != std::string::npos);
+  image = slurp(img);
+  Mounted mt;
+  CHECK_STATUS(mt.mount(image, 512, true), Status::Ok);
+  if (!mt.fs) return;
+  CHECK(compare_tree(*mt.fs, m, "htree read") == 0);
+  CHECK_STATUS(write_file(*mt.fs, "/big/added", make_data(100, 1)), Status::Ok);
+  m.files["/big/added"] = make_data(100, 1);
+  CHECK_STATUS(mt.fs->remove("/big/a_rather_long_file_name_for_the_hash_tree_00007"), Status::Ok);
+  m.files.erase("/big/a_rather_long_file_name_for_the_hash_tree_00007");
+  CHECK_STATUS(mt.fs->rename("/big/a_rather_long_file_name_for_the_hash_tree_00100", "/big/moved"), Status::Ok);
+  m.files["/big/moved"] = m.files["/big/a_rather_long_file_name_for_the_hash_tree_00100"];
+  m.files.erase("/big/a_rather_long_file_name_for_the_hash_tree_00100");
+  for (int i = 0; i < 400; ++i) {
+    const std::string name = "/big/new_entry_with_a_name_" + std::to_string(i);
+    m.files[name] = make_data(i % 4, i);
+    CHECK_STATUS(write_file(*mt.fs, name, m.files[name]), Status::Ok);
+  }
+  CHECK(compare_tree(*mt.fs, m, "htree changed") == 0);
+  CHECK_STATUS(mt.fs->flush(), Status::Ok);
+  CHECK_FSCK(mt.image());
 }
 
 static void test_handles() {
@@ -859,15 +1017,18 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) if (strcmp(argv[i], name) == 0) return true;
     return false;
   };
-  const std::vector<Variant> variants = ext2_variants();
+  const std::vector<Variant> variants = all_variants();
+  const std::vector<Variant> ext3 = ext3_variants();
   if (want("read")) {
-    for (size_t i = 0; i < variants.size(); ++i) test_read(variants[i], i == 2 ? 4096 : 512, i == 1 ? 63 : 0);
+    for (size_t i = 0; i < variants.size(); ++i) test_read(variants[i], i == 2 || i == 6 ? 4096 : 512, i == 1 || i == 5 ? 63 : 0);
     test_read_sparse();
   }
   if (want("write")) for (const Variant& v : variants) test_write(v);
   if (want("bigdir")) { test_big_directory(variants[0]); test_big_directory(variants[2]); }
   if (want("full")) for (const Variant& v : variants) test_full_volume(v);
-  if (want("random")) for (uint32_t seed = 1; seed <= 6; ++seed) test_random(variants[seed % variants.size()], seed, 1500);
+  if (want("random")) for (uint32_t seed = 1; seed <= 8; ++seed) test_random(variants[seed % variants.size()], seed, 1500);
+  if (want("journal")) for (const Variant& v : ext3) test_journals(v);
+  if (want("htree")) for (const Variant& v : ext3) test_htree(v);
   if (want("handles")) test_handles();
   if (want("mount")) test_mount_rules();
   if (want("damage")) { test_damage(variants[0]); test_damage(variants[2]); }

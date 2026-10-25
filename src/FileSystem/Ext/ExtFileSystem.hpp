@@ -40,10 +40,15 @@ namespace filesystem {
 // extended attributes are left as they are; only the immutable flag makes a file ReadOnly. There is no clock here, so new inodes get the
 // time stamp 1980-01-01.
 //
+// ext3: the journal is a hidden file. A volume that was not unmounted cleanly (the needs_recovery feature) has its journal replayed when
+// it is mounted on a device that can be written, as e2fsck or the kernel would do: committed transactions are copied to their places,
+// revoked blocks are skipped, an unfinished transaction is dropped, and the journal is left empty. A journal that cannot be replayed
+// here (one on another device, or using fast commits) leaves the volume read only. Changes made afterwards are not journaled.
+//
 // Writing: files and directories can be created, written, grown, cut, renamed (into other directories too) and removed; blocks and
 // inodes come from the bitmaps of the block groups, near their directory. Nothing is journaled: a volume is mounted writable only if its
-// device is, it was unmounted cleanly (state "valid", no orphan list) and it uses only features written here; any other volume is read
-// only (writes return ReadOnly). The "valid" flag is cleared before the first change and set again by flush() (and when the filesystem is
+// device is, it was unmounted cleanly (state "valid", no orphan list, nothing left to replay) and it uses only features written here;
+// any other volume is read only (writes return ReadOnly). The "valid" flag is cleared before the first change and set again by flush() (and when the filesystem is
 // destroyed), so a crash in between leaves the volume for e2fsck.
 //
 // The volume starts at block `first_block` of the device (0 for a bare filesystem, the partition's first block otherwise). The device
@@ -127,6 +132,9 @@ class ExtFileSystem final : public IFileSystem {
 
   // Mounting and device access.
   Status init();
+  Status load_volume();
+  Status recover();
+  Status replay_journal();
   void decide_writable();
   Status read_bytes(uint64_t offset, ByteView out);  // volume-relative byte offset
   Status write_bytes(uint64_t offset, ConstByteView data);

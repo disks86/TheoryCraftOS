@@ -34,7 +34,7 @@ constexpr uint32_t kMaxGroups = 1u << 22;
 // What this code reads, and what it also writes (anything else in the superblock makes the volume read only or unusable).
 constexpr uint32_t kReadableIncompat = kIncompatFiletype | kIncompatRecover | kIncompatFlexBg;
 constexpr uint32_t kWritableIncompat = kIncompatFiletype | kIncompatFlexBg;
-constexpr uint32_t kWritableCompat = 0x1 /*dir_prealloc*/ | kCompatExtAttr | kCompatResizeInode | kCompatDirIndex | kCompatSparseSuper2;
+constexpr uint32_t kWritableCompat = 0x1 /*dir_prealloc*/ | kCompatHasJournal | kCompatExtAttr | kCompatResizeInode | kCompatDirIndex | kCompatSparseSuper2;
 constexpr uint32_t kWritableRoCompat = kRoSparseSuper | kRoLargeFile | kRoBtreeDir | kRoHugeFile | kRoDirNlink | kRoExtraIsize;
 
 bool power_of_two(uint64_t x) { return x != 0 && (x & (x - 1)) == 0; }
@@ -272,6 +272,32 @@ Status ExtFileSystem::init() {
   block_ = allocate_view<uint8_t>(allocator_, device_block_size_);
   if (block_.empty()) return Status::OutOfMemory;
 
+  Status s = load_volume();
+  if (s != Status::Ok) return s;
+  // A journal that still holds committed changes is replayed first (this needs a device that can be written).
+  if ((incompat_ & kIncompatRecover) && !storage.read_only) {
+    s = recover();
+    if (s != Status::Ok && s != Status::Unsupported) return s;  // (Unsupported: a journal that cannot be replayed here: the volume stays read only)
+  }
+
+  // The root must be a directory.
+  Inode root;
+  s = read_inode(kRootInode, &root);
+  if (s != Status::Ok) return s;
+  if (!root.is_directory() || root.links() == 0) return Status::Corrupt;
+  return Status::Ok;
+}
+
+// Reads and checks the superblock and the group descriptors (again, after a journal replay changed them).
+Status ExtFileSystem::load_volume() {
+  const hardware::StorageInfo storage = device_.info();
+  sb_.clear();
+  gd_.clear();
+  free_blocks_ = free_inodes_ = 0;
+  label_.clear();
+  compat_ = incompat_ = ro_compat_ = 0;
+  block_number_ = ~uint64_t{0};
+
   if (!sb_.put_zeros(kSuperblockSize)) return Status::OutOfMemory;
   Status s = read_bytes(kSuperblockOffset, sb_.writable_view());
   if (s != Status::Ok) return s;
@@ -332,12 +358,6 @@ Status ExtFileSystem::init() {
   for (uint32_t i = 0; i < 16 && sb_.view()[kSbVolumeName + i] != 0; ++i) label_.push_back(static_cast<char>(sb_.view()[kSbVolumeName + i]));
 
   decide_writable();
-
-  // The root must be a directory.
-  Inode root;
-  s = read_inode(kRootInode, &root);
-  if (s != Status::Ok) return s;
-  if (!root.is_directory() || root.links() == 0) return Status::Corrupt;
   return Status::Ok;
 }
 
