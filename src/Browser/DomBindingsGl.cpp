@@ -138,7 +138,7 @@ Value make_number_array(Vm& vm, const double* values, uint32_t n) {
   X(getActiveUniformBlockName) X(getActiveUniformBlockParameter) X(uniformBlockBinding) X(getFragDataLocation) X(getAttachedShaders)                         \
   X(transformFeedbackVaryings) X(enableVertexAttribArray) X(disableVertexAttribArray) X(vertexAttribPointer) X(vertexAttribDivisor) X(vertexAttrib)        \
   X(getVertexAttrib) X(bindVertexArray) X(clear) X(clearBuffer) X(clearBufferfi) X(drawArrays) X(drawElements) X(drawRangeElements) X(readPixels)          \
-  X(beginQuery) X(endQuery) X(getQueryParameter) X(getQuery) X(currentProgram) X(boundObject) X(lose) X(restore) X(attributes)
+  X(beginQuery) X(endQuery) X(getQueryParameter) X(getQuery) X(currentProgram) X(boundObject) X(lose) X(restore) X(attributes) X(beginTransformFeedback) X(endTransformFeedback)
 
 enum Op : uint32_t {
 #define X(name) op_##name,
@@ -637,6 +637,8 @@ NATIVE(gl_call) {
       if (gl.get_integer(what, out, &count)) *result = num_value(out[0]);
       break;
     }
+    case op_beginTransformFeedback: gl.begin_transform_feedback(a.u32(0)); break;
+    case op_endTransformFeedback: gl.end_transform_feedback(); break;
     case op_lose: gl.lose(); break;
     case op_restore: gl.restore(); break;
     case op_attributes: {

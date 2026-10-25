@@ -508,7 +508,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
       for (uint32_t i = 0; i < kCache; ++i) cache[i].key = -1;
       cur_instance = instance;
     }
-    if (indexed && slot.key == key) {
+    if (indexed && !tf_active_ && slot.key == key) {
       *out = slot.v;
       return true;
     }
@@ -542,6 +542,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     out->point_size = vps_g >= 0 ? u2f(pr[ps_slot]) : 1.0f;
     for (const VaryingLink& l : p->links)
       for (uint32_t k = 0; k < l.count; ++k) out->var[l.var_offset + k] = u2f(pr[l.vs_slot + k]);
+    if (tf_active_) tf_capture(*p, pr);
     slot.key = key;
     slot.v = *out;
     return true;

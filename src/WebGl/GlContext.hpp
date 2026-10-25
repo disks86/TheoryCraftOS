@@ -557,6 +557,10 @@ class GlContext final : public shader::ITextureHost {
 
   SamplerObj default_sampler_;
   bool default_draw_back_ = true, default_read_back_ = true;
+  uint64_t tf_pos_[4] = {0, 0, 0, 0};   // bytes captured so far into each transform feedback binding
+  bool tf_capturing() const { return tf_active_; }
+  bool tf_active_ = false;
+  void tf_capture(const ProgramObj& p, const uint32_t* priv);
 };
 
 }  // namespace webgl
