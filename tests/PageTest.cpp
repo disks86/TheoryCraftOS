@@ -1242,8 +1242,12 @@ static void test_webgl_bptc_astc() {
             " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, astc.COMPRESSED_RGBA_ASTC_6x6_KHR, 6, 6, 0, blk); console.log(gl.getError());"
             " var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);"
             " var px = new Uint8Array(4); gl.readPixels(5, 5, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); console.log(px.join(','));"
-            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, bptc.COMPRESSED_RGBA_BPTC_UNORM_EXT, 4, 4, 0, new Uint8Array(16)); console.log(gl.getError());") ==
-        "37812 37853 36492 ldr 32 | 0 | 255,128,0,255 | 0");
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, bptc.COMPRESSED_RGBA_BPTC_UNORM_EXT, 4, 4, 0, new Uint8Array(16)); console.log(gl.getError());"
+            // an HDR void-extent block: 1, 2, 4 and 0.5 as half floats
+            " var hdr = new Uint8Array([0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x3c, 0x00, 0x40, 0x00, 0x44, 0x00, 0x38]);"
+            " var t2 = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t2); gl.compressedTexImage2D(gl.TEXTURE_2D, 0, astc.COMPRESSED_RGBA_ASTC_4x4_KHR, 4, 4, 0, hdr);"
+            " gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t2, 0); var fl = new Float32Array(4); gl.readPixels(1, 1, 1, 1, gl.RGBA, gl.FLOAT, fl); console.log(gl.getError(), fl.join(','));") ==
+        "37812 37853 36492 ldr,hdr 32 | 0 | 255,128,0,255 | 0 | 0 1,2,4,0.5");
 }
 
 static void test_webgl_pbo() {
