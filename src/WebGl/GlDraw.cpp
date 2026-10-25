@@ -822,6 +822,11 @@ void GlContext::read_pixels(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32
   uint32_t layer = 0;
   if (read_fb_ == 0) src = default_read_back_ ? &def_color_ : nullptr;
   else for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (t.color[i]) { src = t.color[i]; layer = t.layer[i]; }
+  Image resolved(a_);
+  if (src && src->ss > 1 && read_fb_ == 0) {   // the default framebuffer is resolved implicitly
+    if (!resolve_samples(*src, 0, &resolved)) { set_error(0x505); return; }
+    src = &resolved;
+  }
   if (!src || src->ss > 1) { set_error(INVALID_OPERATION); return; }
   uint32_t err = 0;
   // zero the destination first (pixels outside the framebuffer read as zero)
@@ -841,6 +846,11 @@ void GlContext::copy_tex_image_2d(uint32_t target, int32_t level, uint32_t inter
   Image* src = read_fb_ == 0 ? &def_color_ : nullptr;
   uint32_t layer = 0;
   if (!src) for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (rt.color[i]) { src = rt.color[i]; layer = rt.layer[i]; }
+  Image resolved(a_);
+  if (src && src->ss > 1) {
+    if (read_fb_ != 0 || !resolve_samples(*src, 0, &resolved)) { set_error(INVALID_OPERATION); return; }
+    src = &resolved;
+  }
   if (!src) { set_error(INVALID_OPERATION); return; }
   Image* im = make_texture_image(tx, target, level);
   if (!im || !im->allocate(fi, w, h, 1)) { set_error(INVALID_OPERATION); return; }
@@ -869,6 +879,11 @@ void GlContext::copy_tex_sub_image(uint32_t target, int32_t level, int32_t xo, i
   Image* src = read_fb_ == 0 ? &def_color_ : nullptr;
   uint32_t layer = 0;
   if (!src) for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (rt.color[i]) { src = rt.color[i]; layer = rt.layer[i]; }
+  Image resolved(a_);
+  if (src && src->ss > 1) {
+    if (read_fb_ != 0 || !resolve_samples(*src, 0, &resolved)) { set_error(INVALID_OPERATION); return; }
+    src = &resolved;
+  }
   if (!src) { set_error(INVALID_OPERATION); return; }
   if (xo < 0 || yo < 0 || zo < 0 || static_cast<uint64_t>(xo) + w > im->w || static_cast<uint64_t>(yo) + h > im->h || static_cast<uint32_t>(zo) >= im->d) { set_error(INVALID_VALUE); return; }
   for (uint32_t yy = 0; yy < h; ++yy)
@@ -889,6 +904,7 @@ void GlContext::blit_framebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
   resolve_target(read_fb_, false, &rt);
   resolve_target(draw_fb_, true, &dt);
   if (!rt.ok || !dt.ok) { set_error(INVALID_FRAMEBUFFER_OPERATION); return; }
+  if (dt.ss > 1 && rt.ss == 1) { dx0 *= dt.ss; dx1 *= dt.ss; dy0 *= dt.ss; dy1 *= dt.ss; }
   const int32_t sw = sx1 - sx0, sh = sy1 - sy0, dw = dx1 - dx0, dh = dy1 - dy0;
   if (sw == 0 || sh == 0 || dw == 0 || dh == 0) return;
   const int32_t ddx0 = dx0 < dx1 ? dx0 : dx1, ddx1 = dx0 < dx1 ? dx1 : dx0, ddy0 = dy0 < dy1 ? dy0 : dy1, ddy1 = dy0 < dy1 ? dy1 : dy0;
@@ -964,21 +980,29 @@ void GlContext::blit_framebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
 
 bool GlContext::present(uint32_t* dst, uint32_t pitch, gpu::TouchBox* changed, bool force_all) {
   if (!def_color_.defined()) return false;
+  const int32_t k = static_cast<int32_t>(def_color_.ss);
   int32_t x0 = 0, y0 = 0, x1 = static_cast<int32_t>(width_) - 1, y1 = static_cast<int32_t>(height_) - 1;
   if (!force_all && !all_dirty_) {
     if (dirty_.empty()) return false;
-    x0 = dirty_.x0 < 0 ? 0 : dirty_.x0;
-    y0 = dirty_.y0 < 0 ? 0 : dirty_.y0;
-    x1 = dirty_.x1 >= static_cast<int32_t>(width_) ? static_cast<int32_t>(width_) - 1 : dirty_.x1;
-    y1 = dirty_.y1 >= static_cast<int32_t>(height_) ? static_cast<int32_t>(height_) - 1 : dirty_.y1;
+    x0 = dirty_.x0 < 0 ? 0 : dirty_.x0 / k;
+    y0 = dirty_.y0 < 0 ? 0 : dirty_.y0 / k;
+    x1 = dirty_.x1 / k >= static_cast<int32_t>(width_) ? static_cast<int32_t>(width_) - 1 : dirty_.x1 / k;
+    y1 = dirty_.y1 / k >= static_cast<int32_t>(height_) ? static_cast<int32_t>(height_) - 1 : dirty_.y1 / k;
   }
   const uint8_t* px = def_color_.px.view().data();
+  const uint64_t stride = uint64_t{def_color_.w} * 4;
   for (int32_t gy = y0; gy <= y1; ++gy) {
     const int32_t row = static_cast<int32_t>(height_) - 1 - gy;   // GL rows run bottom to top
     uint32_t* d = dst + static_cast<uint64_t>(row) * pitch;
-    const uint8_t* s = px + static_cast<uint64_t>(gy) * width_ * 4;
     for (int32_t x = x0; x <= x1; ++x) {
-      uint32_t r = s[x * 4], g = s[x * 4 + 1], b = s[x * 4 + 2], a = attrs_.alpha ? s[x * 4 + 3] : 255;
+      uint32_t sum[4] = {0, 0, 0, 0};   // the samples of the pixel, averaged
+      for (int32_t j = 0; j < k; ++j)
+        for (int32_t i = 0; i < k; ++i) {
+          const uint8_t* s = px + static_cast<uint64_t>(gy * k + j) * stride + static_cast<uint64_t>(x * k + i) * 4;
+          for (int c = 0; c < 4; ++c) sum[c] += s[c];
+        }
+      const uint32_t n = static_cast<uint32_t>(k * k);
+      uint32_t r = (sum[0] + n / 2) / n, g = (sum[1] + n / 2) / n, b = (sum[2] + n / 2) / n, a = attrs_.alpha ? (sum[3] + n / 2) / n : 255;
       if (attrs_.alpha && attrs_.premultiplied) {   // the canvas keeps straight alpha
         if (a == 0) { r = g = b = 0; }
         else if (a < 255) {

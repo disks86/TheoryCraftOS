@@ -263,6 +263,7 @@ class GlContext final : public shader::ITextureHost {
   const Attributes& attributes() const { return attrs_; }
   void resize(uint32_t w, uint32_t h);
   bool lost() const { return lost_; }
+  bool antialiased() const { return def_color_.ss > 1; }
   void lose() { lost_ = true; }
   void restore();
   uint64_t version() const { return version_; }

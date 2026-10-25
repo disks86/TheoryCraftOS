@@ -55,8 +55,11 @@ void GlContext::resize(uint32_t w, uint32_t h) {
   width_ = w;
   height_ = h;
   const bool had_vp = vp_[2] != 0;
-  def_color_.allocate(find_format(0x8058), w, h, 1);
-  if (attrs_.depth || attrs_.stencil) def_depth_.allocate(find_format(0x88F0), w, h, 1);
+  // an antialiased drawing buffer keeps 2 x 2 samples per pixel (not for very large ones)
+  const uint32_t ss = attrs_.antialias && uint64_t{w} * h <= 2048ull * 2048 ? 2 : 1;
+  def_color_.allocate(find_format(0x8058), w * ss, h * ss, 1);
+  def_color_.ss = ss;
+  if (attrs_.depth || attrs_.stencil) { def_depth_.allocate(find_format(0x88F0), w * ss, h * ss, 1); def_depth_.ss = ss; }
   // a freshly sized drawing buffer is transparent black (or opaque black without alpha) and has a clear depth of 1
   if (def_color_.defined() && !attrs_.alpha) {
     uint8_t* p = def_color_.px.writable_view().data();
@@ -64,8 +67,8 @@ void GlContext::resize(uint32_t w, uint32_t h) {
   }
   if (def_depth_.defined()) {
     uint32_t v[4] = {__builtin_bit_cast(uint32_t, 1.0f), 0, 0, 0};
-    for (uint32_t y = 0; y < h; ++y)
-      for (uint32_t x = 0; x < w; ++x) write_texel(def_depth_, x, y, 0, v);
+    for (uint32_t y = 0; y < def_depth_.h; ++y)
+      for (uint32_t x = 0; x < def_depth_.w; ++x) write_texel(def_depth_, x, y, 0, v);
   }
   if (had_vp) {   // the viewport and scissor of a resized buffer follow it, as the specification says only for the initial values
     vp_[2] = static_cast<int32_t>(w);
@@ -730,8 +733,9 @@ void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t) {
   *t = Target();
   if (fb_id == 0) {
     t->is_default = true;
-    t->w = width_;
-    t->h = height_;
+    t->w = def_color_.w;
+    t->h = def_color_.h;
+    t->ss = def_color_.ss;
     t->color_count = 1;
     if (!draw || default_draw_back_) t->color[0] = &def_color_;
     if (def_depth_.defined()) { t->depth = &def_depth_; t->stencil = &def_depth_; }
@@ -1178,8 +1182,8 @@ bool GlContext::get_integer(uint32_t pname, double* o, uint32_t* count) {
     case 0x0D55: *o = attrs_.alpha ? 8 : 0; return true;
     case 0x0D56: *o = attrs_.depth ? 24 : 0; return true;
     case 0x0D57: *o = attrs_.stencil ? 8 : 0; return true;
-    case 0x80A9: *o = 0; return true;
-    case 0x80A8: *o = 0; return true;
+    case 0x80A9: *o = def_color_.ss > 1 && draw_fb_ == 0 ? 4 : 0; return true;
+    case 0x80A8: *o = def_color_.ss > 1 && draw_fb_ == 0 ? 1 : 0; return true;
     case 0x80AA: *o = sc_value_; return true;
     case 0x80AB: *o = sc_invert_; return true;
     case 0x8192: case 0x8B8B: *o = 0x1100; return true;
