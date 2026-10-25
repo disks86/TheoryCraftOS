@@ -116,6 +116,7 @@ class Frame : public Control {
   // A double arrow over the borders and corners that resize the window (and while one is being dragged).
   CursorShape cursor_shape(int32_t x, int32_t y) const override;
   Rect2D client_rect() const override;
+  bool handler_lane() const override { return true; }
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
   void on_mouse_move(const MouseArgs& args) override;

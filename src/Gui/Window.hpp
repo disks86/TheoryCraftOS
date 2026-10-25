@@ -69,13 +69,17 @@ class Window final : public Control {
     kernel::ScopedRecursiveMutex guard(ui_mutex_);
     function();
   }
-  // Starts the thread that runs fired handlers (see Handler); false if threads are not available (the
-  // kernel has not started) or it already runs - handlers then run in the thread that fires them.
+  // Starts running fired handlers on threads of the window (see Handler); false if threads are not available (the
+  // kernel has not started) or it already runs - handlers then run in the thread that fires them. Handlers are
+  // sorted into lanes, one per application window (Control::handler_lane(), a Frame); a lane runs one handler at a
+  // time in the order fired, different lanes run at the same time on up to kMaxHandlerThreads threads (started
+  // when needed), so a slow handler of one application does not hold up the others.
   bool start_handler_thread();
-  // Runs everything still queued, then ends the thread. Must not be called with the UI lock held or from
+  // Runs everything still queued, then ends the threads. Must not be called with the UI lock held or from
   // a handler.
   void stop_handler_thread();
-  bool has_handler_thread() const { return __atomic_load_n(&handler_thread_, __ATOMIC_ACQUIRE) != nullptr; }
+  bool has_handler_thread() const { return __atomic_load_n(&handlers_on_, __ATOMIC_ACQUIRE); }
+  static constexpr uint32_t kMaxHandlerThreads = 8;
   // Queues the handler (or calls it, see Handler). Safe from any thread.
   void dispatch(const Handler& handler, Control& sender);
   // Waits until no handler is queued or running; false on timeout. For shutdown and tests.
@@ -156,9 +160,22 @@ class Window final : public Control {
   struct Pending {
     Handler handler;
     Control* sender;
+    const Control* lane;  // only compared, never used
+  };
+  // One handler thread; `lane` and `sender` are set while it runs a handler.
+  struct Worker {
+    kernel::Thread* thread = nullptr;
+    const Control* lane = nullptr;
+    const Control* sender = nullptr;
+    bool busy = false;
   };
   static void handler_main(void* window);
   void run_handlers();
+  const Control* lane_of(const Control& sender);
+  // With queue_mutex_ held.
+  bool lane_busy(const Control* lane) const;
+  bool any_busy() const;
+  bool spawn_worker();  // (false: no thread to be had)
 
   graphics::IRenderer2D* renderer_;
   const Theme& theme_;
@@ -188,9 +205,9 @@ class Window final : public Control {
   kernel::Mutex queue_mutex_;
   kernel::Semaphore queue_signal_{0};
   List<Pending> pending_;
-  kernel::Thread* handler_thread_ = nullptr;
-  const Control* running_sender_ = nullptr;
-  bool running_handler_ = false;
+  Worker workers_[kMaxHandlerThreads];
+  uint32_t worker_count_ = 0;
+  bool handlers_on_ = false;
   bool handler_stop_ = false;
   uint32_t background_ = 0;  // run_async() jobs in flight
 };

@@ -41,6 +41,7 @@
 #include "Gui/MessageDialog.hpp"
 #include "Gui/RenderLoop.hpp"
 #include "Gui/Window.hpp"
+#include "Gui/Windows/Frame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
@@ -156,6 +157,60 @@ static void test_slow_handler() {
     CHECK(state.finished == 1 && read_text(w, result) == "handler done");
     loop.stop();
     CHECK(!loop.running());
+    w.stop_handler_thread();
+    CHECK(!w.has_handler_thread());
+  }
+  CHECK(a.live == 0);
+}
+
+// --- 1b. A slow handler in one application window does not hold up another -------------------
+
+struct LaneState {
+  std::atomic<bool> release{false}, slow_started{false}, slow_done{false}, fast_done{false};
+  std::atomic<int> same_lane_order{0};
+};
+static void lane_slow(void* context, Control&) {
+  auto* s = static_cast<LaneState*>(context);
+  s->slow_started = true;
+  for (int i = 0; i < 600 && !s->release; ++i) sleep_ms(5);
+  s->slow_done = true;
+}
+static void lane_fast(void* context, Control&) { static_cast<LaneState*>(context)->fast_done = true; }
+static void lane_second(void* context, Control&) {   // (same lane as the slow one: must come after it)
+  auto* s = static_cast<LaneState*>(context);
+  s->same_lane_order = s->slow_done ? 1 : -1;
+}
+
+static void test_lanes() {
+  TestAllocator a;
+  {
+    Screen screen(a, 400, 300);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {400, 300});
+    Frame one(a), two(a);
+    Button slow(a), second(a), fast(a);
+    slow.set_dock(DockStyle::Top); second.set_dock(DockStyle::Top); fast.set_dock(DockStyle::Top);
+    one.set_bounds({0, 0, 190, 200}); two.set_bounds({200, 0, 190, 200});
+    one.add(&slow); one.add(&second); two.add(&fast);
+    w.add(&one); w.add(&two);
+    LaneState state;
+    slow.on_click({lane_slow, &state});
+    second.on_click({lane_second, &state});
+    fast.on_click({lane_fast, &state});
+    CHECK(w.start_handler_thread());
+    slow.click();
+    for (int i = 0; i < 400 && !state.slow_started; ++i) sleep_ms(5);
+    CHECK(state.slow_started);
+    second.click();  // queued behind the slow handler of the same window
+    fast.click();    // another window: runs at once, on another thread
+    for (int i = 0; i < 400 && !state.fast_done; ++i) sleep_ms(5);
+    CHECK(state.fast_done);
+    CHECK(!state.slow_done);
+    CHECK(state.same_lane_order.load() == 0);
+    state.release = true;
+    CHECK(w.wait_for_handlers(3000000));
+    CHECK(state.slow_done);
+    CHECK(state.same_lane_order.load() == 1);
     w.stop_handler_thread();
     CHECK(!w.has_handler_thread());
   }
@@ -525,6 +580,7 @@ int main(int argc, char** argv) {
   const bool only_desktop = argc > 1 && strcmp(argv[1], "desktop") == 0;
   if (!only_desktop) {
     test_slow_handler();
+    test_lanes();
     test_handler_order();
     test_stress();
     test_run_async();

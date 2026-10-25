@@ -166,6 +166,10 @@ class Control {
   Control* hit_test(int32_t x, int32_t y);
   // True for a control the pointer passes through (a tooltip): hit_test() never returns it, only the controls inside it.
   virtual bool mouse_transparent() const { return false; }
+  // True for a control whose handlers (and those of everything inside it) form a lane of their own on the window's
+  // handler threads (Window::start_handler_thread): an application window. Handlers of one lane run one at a time,
+  // those of different lanes at the same time.
+  virtual bool handler_lane() const { return false; }
 
  protected:
   explicit Control(allocators::IAllocator& allocator) : allocator_(allocator), children_(allocator) {}

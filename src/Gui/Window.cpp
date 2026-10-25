@@ -464,47 +464,94 @@ namespace gui {
 
 bool Window::start_handler_thread() {
   if (!kernel::running() || has_handler_thread()) return false;
-  handler_stop_ = false;
-  kernel::Thread* thread = kernel::spawn(&Window::handler_main, this, "gui-handlers");
-  if (!thread) return false;
-  __atomic_store_n(&handler_thread_, thread, __ATOMIC_RELEASE);
+  {
+    kernel::ScopedMutex lock(queue_mutex_);
+    handler_stop_ = false;
+    if (!spawn_worker()) return false;
+  }
+  __atomic_store_n(&handlers_on_, true, __ATOMIC_RELEASE);
   return true;
 }
 
 void Window::handler_main(void* window) { static_cast<Window*>(window)->run_handlers(); }
 
+// With queue_mutex_ held.
+bool Window::spawn_worker() {
+  if (worker_count_ >= kMaxHandlerThreads) return false;
+  kernel::Thread* thread = kernel::spawn(&Window::handler_main, this, "gui-handlers");
+  if (!thread) return false;
+  workers_[worker_count_++].thread = thread;
+  return true;
+}
+
+bool Window::lane_busy(const Control* lane) const {
+  for (const Worker& worker : workers_)
+    if (worker.busy && worker.lane == lane) return true;
+  return false;
+}
+
+bool Window::any_busy() const {
+  for (const Worker& worker : workers_)
+    if (worker.busy) return true;
+  return false;
+}
+
+const Control* Window::lane_of(const Control& sender) {
+  kernel::ScopedRecursiveMutex guard(ui_mutex_);  // (the tree must not change while its parents are followed)
+  for (const Control* c = &sender; c; c = c->parent())
+    if (c->handler_lane()) return c;
+  return nullptr;  // the shared lane: handlers of the desktop itself
+}
+
 void Window::run_handlers() {
+  Worker* self = nullptr;
   for (;;) {
-    queue_signal_.acquire();
+    queue_signal_.acquire_for(100000);  // (the timeout makes missed wake-ups harmless)
     Pending item;
     {
       kernel::ScopedMutex lock(queue_mutex_);
-      if (pending_.count() == 0) {
-        if (handler_stop_) return;
+      if (!self) {
+        for (Worker& worker : workers_)
+          if (worker.thread == kernel::current_thread()) self = &worker;
+        if (!self) continue;  // (the spawner has not recorded the thread yet)
+      }
+      uint64_t at = 0;
+      while (at < pending_.count() && lane_busy(pending_[at].lane)) ++at;
+      if (at == pending_.count()) {
+        if (handler_stop_ && pending_.count() == 0) return;
         continue;
       }
-      item = pending_[0];
-      pending_.remove_at(0);
-      running_sender_ = item.sender;
-      running_handler_ = true;
+      item = pending_[at];
+      pending_.remove_at(at);
+      self->lane = item.lane;
+      self->sender = item.sender;
+      self->busy = true;
     }
     item.handler(*item.sender);  // no lock held: this may take as long as it likes
     kernel::ScopedMutex lock(queue_mutex_);
-    running_handler_ = false;
-    running_sender_ = nullptr;
+    self->busy = false;
+    self->lane = nullptr;
+    self->sender = nullptr;
+    if (pending_.count() > 0) queue_signal_.release();  // what waited for this lane can go on
   }
 }
 
 void Window::stop_handler_thread() {
-  kernel::Thread* thread = __atomic_load_n(&handler_thread_, __ATOMIC_ACQUIRE);
-  if (!thread || thread == kernel::current_thread()) return;
+  uint32_t count = 0;
   {
     kernel::ScopedMutex lock(queue_mutex_);
+    if (!has_handler_thread()) return;
+    for (const Worker& worker : workers_)
+      if (worker.thread == kernel::current_thread()) return;  // (called from a handler)
     handler_stop_ = true;
+    count = worker_count_;
   }
-  queue_signal_.release();  // the thread first runs what is queued, then sees the flag
-  kernel::join(thread);
-  __atomic_store_n(&handler_thread_, static_cast<kernel::Thread*>(nullptr), __ATOMIC_RELEASE);
+  queue_signal_.release(count);  // the threads first run what is queued, then see the flag
+  for (uint32_t i = 0; i < count; ++i) kernel::join(workers_[i].thread);
+  kernel::ScopedMutex lock(queue_mutex_);
+  for (Worker& worker : workers_) worker = Worker();
+  worker_count_ = 0;
+  __atomic_store_n(&handlers_on_, false, __ATOMIC_RELEASE);
 }
 
 void Window::dispatch(const Handler& handler, Control& sender) {
@@ -513,10 +560,17 @@ void Window::dispatch(const Handler& handler, Control& sender) {
     handler(sender);
     return;
   }
+  const Control* lane = lane_of(sender);
   bool queued = false;
   {
     kernel::ScopedMutex lock(queue_mutex_);
-    if (!handler_stop_) queued = pending_.push_back(Pending{handler, &sender});
+    if (!handler_stop_) queued = pending_.push_back(Pending{handler, &sender, lane});
+    if (queued && !lane_busy(lane)) {  // another lane can run at once: make sure a thread is free for it
+      uint32_t idle = 0;
+      for (uint32_t i = 0; i < worker_count_; ++i)
+        if (!workers_[i].busy) ++idle;
+      if (idle < pending_.count()) spawn_worker();  // (failing is fine: the threads there will get to it)
+    }
   }
   if (queued) queue_signal_.release();
   else handler(sender);  // stopping, or out of memory: run it here rather than lose it
@@ -526,7 +580,7 @@ bool Window::wait_for_handlers(uint64_t timeout_us) {
   for (uint64_t waited = 0;; waited += 500) {
     {
       kernel::ScopedMutex lock(queue_mutex_);
-      if (pending_.count() == 0 && !running_handler_) return true;
+      if (pending_.count() == 0 && !any_busy()) return true;
     }
     if (waited >= timeout_us) return false;
     kernel::sleep_us(500);
@@ -582,7 +636,7 @@ bool Window::wait_for_background(uint64_t timeout_us) {
 
 void Window::control_destroyed(Control* control) {
   {
-    // Queued handlers of this control are dropped. (Their semaphore counts stay: the handler thread just
+    // Queued handlers of this control are dropped. (Their semaphore counts stay: a handler thread just
     // finds the queue shorter than the count and goes back to waiting.)
     kernel::ScopedMutex lock(queue_mutex_);
     for (uint64_t i = 0; i < pending_.count();) {
@@ -592,14 +646,15 @@ void Window::control_destroyed(Control* control) {
   }
   // A handler of this control that is running right now must finish before the control goes away - unless we
   // are that handler (a control destroying itself from its own callback).
-  if (kernel::current_thread() != __atomic_load_n(&handler_thread_, __ATOMIC_ACQUIRE)) {
-    for (;;) {
-      {
-        kernel::ScopedMutex lock(queue_mutex_);
-        if (!(running_handler_ && running_sender_ == control)) break;
-      }
-      kernel::sleep_us(200);
+  for (;;) {
+    {
+      kernel::ScopedMutex lock(queue_mutex_);
+      bool running = false;
+      for (const Worker& worker : workers_)
+        if (worker.busy && worker.sender == control && worker.thread != kernel::current_thread()) running = true;
+      if (!running) break;
     }
+    kernel::sleep_us(200);
   }
   kernel::ScopedRecursiveMutex guard(ui_mutex_);
   if (focus_ == control) focus_ = nullptr;
