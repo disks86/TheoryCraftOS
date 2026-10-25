@@ -1076,6 +1076,13 @@ Machine::Status Interp::exec_step(uint32_t base) {
   using S = Machine::Status;
   Machine::Frame& f = m.frames_[m.frame_top_ - 1];
   const uint32_t fi = m.frame_top_ - 1;
+  if (f.node < 0) {   // the end of a function that was called without recursing: go back to the caller
+    m.var_top_ = f.saved_top;
+    m.var_base_ = f.saved_base;
+    m.top_ = f.mark;
+    --m.frame_top_;
+    return S::Done;
+  }
   const Node& node = mod.nodes[static_cast<uint64_t>(f.node)];
   auto pop = [&]() { --m.frame_top_; };
   switch (node.kind) {
@@ -1127,6 +1134,42 @@ Machine::Status Interp::exec_step(uint32_t base) {
         if (e.kind == NodeKind::Builtin && static_cast<BuiltinFn>(e.ival) == BuiltinFn::Barrier && m.depth_ == 0 && base == 0) {
           pop();
           return S::Yield;
+        }
+        // A function with a barrier in it is entered by pushing its frames, so that the invocation can stop at the barrier with the call still open.
+        if (e.kind == NodeKind::Call && m.depth_ == 0 && base == 0 && e.ival >= 0 && static_cast<uint64_t>(e.ival) < mod.functions.count() &&
+            mod.functions[static_cast<uint64_t>(e.ival)]->has_barrier) {
+          const Function& F = *mod.functions[static_cast<uint64_t>(e.ival)];
+          bool simple = static_cast<uint64_t>(e.count) == F.params.count() && F.body >= 0 && F.params.count() <= 16;
+          for (uint64_t i = 0; i < F.params.count(); ++i) simple = simple && F.params[i].dir == 0;
+          if (simple) {
+            const uint32_t mark = m.top_;
+            Ref vals[16];
+            for (uint32_t i = 0; i < F.params.count(); ++i)
+              if (!eval(mod.kids[static_cast<uint64_t>(e.first) + i], &vals[i])) return m.discarded_ ? S::Discarded : S::Failed;
+            uint32_t* retp = alloc(slots(F.ret));
+            if (!retp && slots(F.ret)) return S::Failed;
+            if (m.var_top_ + F.locals > Machine::kMaxVars || m.frame_top_ + 2 > Machine::kMaxFrames) return fail("shader nesting too deep"), S::Failed;
+            const uint32_t new_base = m.var_top_;
+            for (uint32_t i = 0; i < F.locals; ++i) m.vars_[new_base + i] = Machine::Var{nullptr, Type()};
+            for (uint32_t i = 0; i < F.params.count(); ++i) {
+              const Type pt = F.params[i].type;
+              uint32_t* p = alloc(slots(pt));
+              if (!p && slots(pt)) return S::Failed;
+              LRef l;
+              l.p = p;
+              l.t = pt;
+              store(l, vals[i]);
+              m.vars_[new_base + i] = Machine::Var{p, pt};
+            }
+            Machine::Frame bf{-1, -1, e.ival, mark, static_cast<uint32_t>(retp - m.arena_)};
+            bf.saved_base = m.var_base_;
+            bf.saved_top = m.var_top_;
+            m.var_top_ += F.locals;
+            m.var_base_ = new_base;
+            pop();   // the statement is over once the call returns
+            m.frames_[m.frame_top_++] = bf;
+            return push_frame(F.body) ? S::Done : S::Failed;
+          }
         }
         const uint32_t mark = m.top_;
         Ref r;
