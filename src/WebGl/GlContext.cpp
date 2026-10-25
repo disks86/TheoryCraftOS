@@ -1111,7 +1111,7 @@ bool GlContext::get_integer(uint32_t pname, double* o, uint32_t* count) {
     case 0x0D3A: *count = 2; o[0] = 8192; o[1] = 8192; return true;
     case 0x0BA2: *count = 4; for (int i = 0; i < 4; ++i) o[i] = vp_[i]; return true;
     case 0x0C10: *count = 4; for (int i = 0; i < 4; ++i) o[i] = sc_[i]; return true;
-    case 0x846E: *count = 2; o[0] = 1; o[1] = 1; return true;
+    case 0x846E: *count = 2; o[0] = 1; o[1] = 16; return true;
     case 0x846D: *count = 2; o[0] = 1; o[1] = 64; return true;
     case 0x0B70: *count = 2; o[0] = depth_n_; o[1] = depth_f_; return true;
     case 0x0C22: *count = 4; for (int i = 0; i < 4; ++i) o[i] = clear_color_[i]; return true;

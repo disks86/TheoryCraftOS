@@ -23,6 +23,10 @@
 
 namespace gpu {
 
+namespace {
+float shader_sqrt(float x) { return shader::fsqrt(x); }
+}  // namespace
+
 struct TriSetup {
   int64_t X[3], Y[3];
   double area;
@@ -317,9 +321,18 @@ void draw_line(const RasterState& rs, const RVertex& a, const RVertex& b, IFragm
     const float iw = wp.iw + (wq.iw - wp.iw) * t;
     const float lam = iw != 0 ? (wq.iw * t) / iw : 0;
     for (uint32_t i = 0; i < rs.nvar; ++i) var[i] = rs.flat[i] ? flatvals[i] : p.var[i] + (q.var[i] - p.var[i]) * lam;
-    for (int32_t k = 0; k < thick; ++k) {
-      const int32_t mm = mn + k - (thick - 1) / 2;
+    // the pixels of this step within half the width of the line (measured across it)
+    const float width = rs.line_width > 1 ? rs.line_width : 1.0f;
+    const float seg = shader_sqrt(dx * dx + dy * dy);
+    const float stretch = seg > 0 && len > 0 ? seg / len : 1.0f;
+    const int32_t reach = thick > 1 ? static_cast<int32_t>(width * 0.5f * stretch) + 1 : 0;
+    for (int32_t k = thick > 1 ? -reach : 0; k < (thick > 1 ? reach + 1 : 1); ++k) {
+      const int32_t mm = thick > 1 ? mn + k : mn;
       const int32_t px = xmajor ? m : mm, py = xmajor ? mm : m;
+      if (thick > 1 && seg > 0) {
+        const float across = ((px + 0.5f - wp.x) * dy - (py + 0.5f - wp.y) * dx) / seg;
+        if ((across < 0 ? -across : across) > width * 0.5f) continue;
+      }
       if (px < lx || px >= hx || py < ly || py >= hy) continue;
       float z = wp.z + (wq.z - wp.z) * t;
       if (z < 0) z = 0;

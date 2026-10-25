@@ -471,7 +471,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   for (const VaryingLink& l : p->links)
     for (uint32_t k = 0; k < l.count; ++k) rs.flat[l.var_offset + k] = l.flat;
   rs.flat_first = false;
-  rs.line_width = 1;
+  rs.line_width = line_width_ < 1 ? 1 : (line_width_ > 16 ? 16 : line_width_);
 
   bool deriv = fmod.uses_derivatives;
   if (!deriv && fmod.uses_implicit_lod) {

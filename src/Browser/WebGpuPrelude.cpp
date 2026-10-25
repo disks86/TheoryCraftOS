@@ -226,38 +226,61 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
     var id = op(this, 'createBuffer', desc.size, desc.usage);
     if (!id) pullError(this);
     var b = Object.create(GPUBuffer.prototype);
-    hide(b, '__dev', this); hide(b, '__id', id); hide(b, '__label', desc.label || ''); hide(b, '__state', 'unmapped'); hide(b, '__mode', 0); hide(b, '__ranges', []);
+    hide(b, '__dev', this); hide(b, '__id', id); hide(b, '__label', desc.label || ''); hide(b, '__state', 'unmapped'); hide(b, '__mode', 0); hide(b, '__ranges', []); hide(b, '__abort', null); hide(b, '__created', false); hide(b, '__off', 0); hide(b, '__len', 0);
     def(b, 'size', desc.size); def(b, 'usage', desc.usage);
-    if (desc.mappedAtCreation) { b.__state = 'mapped'; b.__mode = 2; b.__off = 0; b.__len = desc.size; }
+    if (desc.mappedAtCreation) { if (desc.size % 4 !== 0) deviceError(this, 'validation', 'A buffer mapped at creation needs a size that is a multiple of 4.'); b.__state = 'mapped'; b.__mode = 2; b.__off = 0; b.__len = desc.size; b.__created = true; }
     return b;
   });
   getter(GPUBuffer.prototype, 'mapState', function () { return this.__state; });
   def(GPUBuffer.prototype, 'mapAsync', function (mode, offset, size) {
     var b = this;
-    if (b.__state !== 'unmapped') return Promise.reject(new DOMException('The buffer is not unmapped.', 'OperationError'));
+    offset = offset === undefined ? 0 : offset;
     if (b.__destroyed) return Promise.reject(new DOMException('The buffer is destroyed.', 'OperationError'));
+    if (b.__state !== 'unmapped') return Promise.reject(new DOMException('The buffer is already mapped or being mapped.', 'OperationError'));
+    if (mode !== 1 && mode !== 2) return Promise.reject(new TypeError("Failed to execute 'mapAsync' on 'GPUBuffer': mode must be GPUMapMode.READ or GPUMapMode.WRITE."));
+    if (!(b.usage & (mode === 1 ? 1 : 2))) return Promise.reject(new DOMException('The buffer was not created with the usage this map needs.', 'OperationError'));
+    size = size === undefined ? b.size - offset : size;
+    if (offset % 8 !== 0 || size % 4 !== 0 || offset > b.size || offset + size > b.size) return Promise.reject(new DOMException('The mapped range is misaligned or out of the buffer.', 'OperationError'));
     b.__state = 'pending';
-    return Promise.resolve().then(function () {
-      b.__state = 'mapped'; b.__mode = mode; b.__off = offset || 0; b.__len = size === undefined ? b.size - (offset || 0) : size;
+    return new Promise(function (resolve, reject) {
+      b.__abort = reject;
+      Promise.resolve().then(function () {
+        if (b.__state !== 'pending') return;   // unmapped or destroyed meanwhile: already rejected
+        b.__abort = null; b.__state = 'mapped'; b.__mode = mode; b.__off = offset; b.__len = size;
+        resolve();
+      });
     });
   });
   def(GPUBuffer.prototype, 'getMappedRange', function (offset, size) {
     if (this.__state !== 'mapped') throw new DOMException('The buffer is not mapped.', 'OperationError');
-    offset = offset === undefined ? 0 : offset;
-    size = size === undefined ? this.size - offset : size;
+    offset = offset === undefined ? this.__off : offset;
+    size = size === undefined ? this.__off + this.__len - offset : size;
+    if (offset % 8 !== 0 || size % 4 !== 0 || offset < this.__off || offset + size > this.__off + this.__len)
+      throw new DOMException('The requested range is misaligned or outside the mapped range.', 'OperationError');
+    for (var i = 0; i < this.__ranges.length; i++) {
+      var r = this.__ranges[i];
+      if (offset < r.offset + r.ab.byteLength && r.offset < offset + size) throw new DOMException('The requested range overlaps one already returned.', 'OperationError');
+    }
     var ab = new ArrayBuffer(size);
-    if (this.__mode === 1) op(this.__dev, 'readBuffer', this.__id, offset, new Uint8Array(ab));
-    else if (this.__mode === 2) op(this.__dev, 'readBuffer', this.__id, offset, new Uint8Array(ab));
+    if (this.__mode === 1 || this.__created) op(this.__dev, 'readBuffer', this.__id, offset, new Uint8Array(ab));
     this.__ranges.push({ offset: offset, ab: ab });
     return ab;
   });
+  var endMap = function (b, write) {
+    for (var i = 0; i < b.__ranges.length; i++) {
+      var r = b.__ranges[i];
+      if (write) op(b.__dev, 'writeBuffer', b.__id, r.offset, new Uint8Array(r.ab));
+      op(b.__dev, 'detach', r.ab);   // script can no longer reach the mapped memory
+    }
+    b.__ranges = [];
+    if (b.__abort) { var rej = b.__abort; b.__abort = null; rej(new DOMException('The map was cancelled.', 'AbortError')); }
+    b.__state = 'unmapped'; b.__mode = 0; b.__created = false;
+  };
   def(GPUBuffer.prototype, 'unmap', function () {
-    if (this.__state === 'unmapped') return;
-    if (this.__mode === 2)
-      for (var i = 0; i < this.__ranges.length; i++) op(this.__dev, 'writeBuffer', this.__id, this.__ranges[i].offset, new Uint8Array(this.__ranges[i].ab));
-    this.__ranges = []; this.__state = 'unmapped'; this.__mode = 0;
+    if (this.__state === 'unmapped' && !this.__abort) return;
+    endMap(this, this.__mode === 2);
   });
-  def(GPUBuffer.prototype, 'destroy', function () { op(this.__dev, 'destroyBuffer', this.__id); this.__destroyed = true; this.__state = 'unmapped'; });
+  def(GPUBuffer.prototype, 'destroy', function () { if (this.__state !== 'unmapped') endMap(this, false); op(this.__dev, 'destroyBuffer', this.__id); this.__destroyed = true; });
 
   // textures
   var texDim = { '1d': 0, '2d': 1, '3d': 2 };
@@ -545,6 +568,7 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
     schedulePresent(dev);
   });
   def(Q, 'writeBuffer', function (buf, offset, data, dataOffset, size) {
+    if (buf.__state !== 'unmapped') { deviceError(this.__dev, 'validation', 'The buffer is mapped.'); return; }
     var b = bytesOf(data, dataOffset, size);
     if (!op(this.__dev, 'writeBuffer', buf.__id, offset, b[0], b[1], b[2])) pullError(this.__dev);
   });

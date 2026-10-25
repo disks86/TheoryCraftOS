@@ -360,7 +360,7 @@ class GlContext final : public shader::ITextureHost {
   void cull_face(uint32_t m) { cull_mode_ = m; }
   void front_face(uint32_t m) { front_face_ = m; }
   void polygon_offset(float factor, float units) { po_factor_ = factor; po_units_ = units; }
-  void line_width(float w) { line_width_ = w; }
+  void line_width(float w) { if (!(w > 0)) { set_error(0x501); return; } line_width_ = w; }
   void clear_color(float r, float g, float b, float a) { clear_color_[0] = r; clear_color_[1] = g; clear_color_[2] = b; clear_color_[3] = a; }
   void clear_depth(float d) { clear_depth_ = d; }
   void clear_stencil(int32_t s) { clear_stencil_ = s; }
