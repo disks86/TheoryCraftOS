@@ -18,6 +18,7 @@
 
 // The GL object tables and state machine (see GlContext.hpp): buffers, textures, framebuffers, programs, state.
 #include "WebGl/GlContext.hpp"
+#include "WebGl/GlCompressed.hpp"
 #include "WebGl/GlPixels.hpp"
 
 namespace webgl {
@@ -457,6 +458,7 @@ void GlContext::tex_image(uint32_t target, int32_t level, uint32_t internal, uin
     return;
   }
   if (!im->allocate(fi, w, h, d)) { set_error(OUT_OF_MEMORY); return; }
+  im->compressed = 0;
   total_bytes_ += im->px.size();
   if (has_data) {
     uint32_t err = 0;
@@ -473,7 +475,7 @@ void GlContext::tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_
   Texture* t = bound_texture_for(target, &face);
   if (!t) return;
   Image* im = texture_image(t, target, level);
-  if (!im) { set_error(INVALID_OPERATION); return; }
+  if (!im || im->compressed) { set_error(INVALID_OPERATION); return; }
   const bool layered = t->target == 0x806F || t->target == 0x8C1A;
   if (three_d != layered) { set_error(INVALID_ENUM); return; }
   if (xo < 0 || yo < 0 || zo < 0 || uint64_t{static_cast<uint32_t>(xo)} + w > im->w || uint64_t{static_cast<uint32_t>(yo)} + h > im->h || uint64_t{static_cast<uint32_t>(zo)} + d > im->d) {
@@ -485,11 +487,56 @@ void GlContext::tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_
   ++version_;
 }
 
+void GlContext::compressed_tex_image(uint32_t target, int32_t level, uint32_t internal, uint32_t w, uint32_t h, uint32_t d, int32_t border, ConstByteView data, bool three_d) {
+  uint32_t face;
+  Texture* t = bound_texture_for(target, &face);
+  if (!t) return;
+  const CompressedFormat* cf = find_compressed(internal);
+  if (!cf) { set_error(INVALID_ENUM); return; }
+  const bool layered = t->target == 0x806F || t->target == 0x8C1A;
+  if (border != 0 || level < 0 || level >= static_cast<int32_t>(kMaxLevels) || w > kMaxTextureSize || h > kMaxTextureSize || three_d != layered || t->target == 0x806F) { set_error(INVALID_VALUE); return; }
+  if (t->immutable) { set_error(INVALID_OPERATION); return; }
+  if (data.size() != compressed_size(*cf, w, h, d)) { set_error(INVALID_VALUE); return; }
+  Image* im = make_texture_image(t, target, level);
+  const FormatInfo* fi = find_format(cf->decoded);
+  if (!im || !fi) { set_error(INVALID_OPERATION); return; }
+  const uint64_t need = uint64_t{w} * h * d * texel_bytes(fi->store);
+  if (need > (256ull << 20) || total_bytes_ + need > kMaxTotalBytes) { set_error(OUT_OF_MEMORY); return; }
+  if (im->defined()) total_bytes_ -= im->px.size() < total_bytes_ ? im->px.size() : total_bytes_;
+  if (w == 0 || h == 0 || d == 0) { im->info = nullptr; im->w = im->h = 0; return; }
+  if (!im->allocate(fi, w, h, d)) { set_error(OUT_OF_MEMORY); return; }
+  total_bytes_ += im->px.size();
+  im->compressed = internal;
+  if (!decode_compressed(*cf, data, w, h, d, im, 0, 0, 0)) set_error(INVALID_VALUE);
+  ++version_;
+}
+
+void GlContext::compressed_tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, uint32_t w, uint32_t h, uint32_t d, uint32_t format, ConstByteView data, bool three_d) {
+  uint32_t face;
+  Texture* t = bound_texture_for(target, &face);
+  if (!t) return;
+  const CompressedFormat* cf = find_compressed(format);
+  if (!cf) { set_error(INVALID_ENUM); return; }
+  Image* im = texture_image(t, target, level);
+  if (!im || im->compressed != format) { set_error(INVALID_OPERATION); return; }
+  const bool layered = t->target == 0x806F || t->target == 0x8C1A;
+  if (three_d != layered) { set_error(INVALID_ENUM); return; }
+  if (xo < 0 || yo < 0 || zo < 0 || (xo & 3) || (yo & 3) || ((w & 3) && static_cast<uint32_t>(xo) + w != im->w) || ((h & 3) && static_cast<uint32_t>(yo) + h != im->h) ||
+      uint64_t{static_cast<uint32_t>(xo)} + w > im->w || uint64_t{static_cast<uint32_t>(yo)} + h > im->h || uint64_t{static_cast<uint32_t>(zo)} + d > im->d) {
+    set_error(INVALID_VALUE);
+    return;
+  }
+  if (data.size() != compressed_size(*cf, w, h, d)) { set_error(INVALID_VALUE); return; }
+  decode_compressed(*cf, data, w, h, d, im, static_cast<uint32_t>(xo), static_cast<uint32_t>(yo), static_cast<uint32_t>(zo));
+  ++version_;
+}
+
 void GlContext::tex_storage(uint32_t target, uint32_t levels, uint32_t internal, uint32_t w, uint32_t h, uint32_t d) {
   uint32_t face;
   Texture* t = bound_texture_for(target, &face);
   if (!t) return;
-  const FormatInfo* fi = find_format(internal);
+  const CompressedFormat* cf = find_compressed(internal);
+  const FormatInfo* fi = cf ? find_format(cf->decoded) : find_format(internal);
   if (!fi || levels == 0 || levels > kMaxLevels || w == 0 || h == 0 || d == 0 || w > kMaxTextureSize || h > kMaxTextureSize) { set_error(fi ? INVALID_VALUE : INVALID_ENUM); return; }
   if (t->immutable) { set_error(INVALID_OPERATION); return; }
   const uint32_t faces = t->target == 0x8513 ? 6 : 1;
@@ -499,6 +546,7 @@ void GlContext::tex_storage(uint32_t target, uint32_t levels, uint32_t internal,
       const uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1, ld = layered ? (d >> l ? d >> l : 1) : d;
       Image* im = make_texture_image(t, t->target == 0x8513 ? 0x8515 + f : t->target, static_cast<int32_t>(l));
       if (!im || !im->allocate(fi, lw, lh, ld)) { set_error(OUT_OF_MEMORY); return; }
+      if (cf) im->compressed = internal;
       total_bytes_ += im->px.size();
     }
   t->immutable = true;
@@ -578,7 +626,7 @@ void GlContext::generate_mipmap(uint32_t target) {
     const uint32_t tgt = t->target == 0x8513 ? 0x8515 + f : t->target;
     Image* base = texture_image(t, tgt, t->base_level < 0 ? 0 : t->base_level);
     if (!base) { set_error(INVALID_OPERATION); return; }
-    if (base->info->store == Store::DepthStencil || base->info->store == Store::Depth) { set_error(INVALID_OPERATION); return; }
+    if (base->info->store == Store::DepthStencil || base->info->store == Store::Depth || base->compressed) { set_error(INVALID_OPERATION); return; }
     const bool layered3d = t->target == 0x806F;
     uint32_t w = base->w, h = base->h, d = base->d;
     for (int32_t l = (t->base_level < 0 ? 0 : t->base_level) + 1; l < static_cast<int32_t>(kMaxLevels) && (w > 1 || h > 1 || (layered3d && d > 1)); ++l) {

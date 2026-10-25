@@ -872,7 +872,7 @@ void GlContext::copy_tex_sub_image(uint32_t target, int32_t level, int32_t xo, i
   Texture* tx = bound_texture_for(target, &face);
   if (!tx) return;
   Image* im = texture_image(tx, target, level);
-  if (!im) { set_error(INVALID_OPERATION); return; }
+  if (!im || im->compressed) { set_error(INVALID_OPERATION); return; }
   Target rt;
   resolve_target(read_fb_, false, &rt);
   if (!rt.ok) { set_error(INVALID_FRAMEBUFFER_OPERATION); return; }

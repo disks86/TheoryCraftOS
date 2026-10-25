@@ -1158,6 +1158,19 @@ static void test_webgpu_mapping() {
         "mapped | OperationError OperationError no OperationError | unmapped 0 OperationError | wrong usage OperationError | misaligned OperationError | mapped 7 7 0 | AbortError,OperationError");
 }
 
+static void test_webgl_compressed() {
+  CHECK(gl_script(
+            "var gl = c.getContext('webgl'); var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);"
+            " var block = new Uint8Array([0x00, 0xF8, 0x1F, 0x00, 0xE4, 0, 0, 0]);"
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, 0x83F0, 4, 4, 0, block); console.log(gl.getError(), gl.getParameter(gl.COMPRESSED_TEXTURE_FORMATS).length);"
+            " var ext = gl.getExtension('WEBGL_compressed_texture_s3tc'); console.log(ext.COMPRESSED_RGBA_S3TC_DXT5_EXT, gl.getParameter(gl.COMPRESSED_TEXTURE_FORMATS).length);"
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, ext.COMPRESSED_RGB_S3TC_DXT1_EXT, 4, 4, 0, block); console.log(gl.getError());"
+            " var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);"
+            " var px = new Uint8Array(4); gl.readPixels(1, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); console.log(px[0], px[1], px[2], px[3]);"
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, ext.COMPRESSED_RGB_S3TC_DXT1_EXT, 4, 4, 0, block.subarray(0, 4)); console.log(gl.getError());") ==
+        "1280 0 | 33779 4 | 0 | 0 0 255 255 | 1281");
+}
+
 static void test_webgl_pbo() {
   CHECK(gl_script(
             "var gl = c.getContext('webgl2');"
@@ -5831,6 +5844,7 @@ int main(int argc, char** argv) {
     test_webgpu();
   test_webgpu_mapping();
   test_webgl_pbo();
+  test_webgl_compressed();
     printf(g_failed ? "%d check(s) failed\n" : "webgl and webgpu tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -5880,6 +5894,7 @@ int main(int argc, char** argv) {
   test_webgpu();
   test_webgpu_mapping();
   test_webgl_pbo();
+  test_webgl_compressed();
   test_video();
   test_audio();
   test_media_api();

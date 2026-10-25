@@ -139,7 +139,7 @@ Value make_number_array(Vm& vm, const double* values, uint32_t n) {
   X(getActiveUniformBlockName) X(getActiveUniformBlockParameter) X(uniformBlockBinding) X(getFragDataLocation) X(getAttachedShaders)                         \
   X(transformFeedbackVaryings) X(enableVertexAttribArray) X(disableVertexAttribArray) X(vertexAttribPointer) X(vertexAttribDivisor) X(vertexAttrib)        \
   X(getVertexAttrib) X(bindVertexArray) X(clear) X(clearBuffer) X(clearBufferfi) X(drawArrays) X(drawElements) X(drawRangeElements) X(readPixels)          \
-  X(beginQuery) X(endQuery) X(getQueryParameter) X(getQuery) X(currentProgram) X(boundObject) X(lose) X(restore) X(attributes) X(beginTransformFeedback) X(endTransformFeedback)
+  X(beginQuery) X(endQuery) X(getQueryParameter) X(getQuery) X(currentProgram) X(boundObject) X(lose) X(restore) X(attributes) X(beginTransformFeedback) X(endTransformFeedback) X(compressedTexImage) X(compressedTexSubImage)
 
 enum Op : uint32_t {
 #define X(name) op_##name,
@@ -365,6 +365,18 @@ NATIVE(gl_call) {
       } else if (!make_pixels_arg(vm, a, 10, &bytes, &store, &w, &h, &from_source)) { gl.set_error(0x501); break; }
       const uint32_t format = from_source ? 0x1908 : a.u32(8), type = from_source ? 0x1401 : a.u32(9);
       gl.tex_sub_image(a.u32(0), a.i32(1), a.i32(2), a.i32(3), a.i32(4), w, h, a.u32(7), format, type, bytes, a.flag(11));
+      break;
+    }
+    case op_compressedTexImage: {   // (target, level, internal, w, h, d, border, data, is3d)
+      ArrayView<uint8_t> raw;
+      if (!a.bytes(7, &raw)) { gl.set_error(0x501); break; }
+      gl.compressed_tex_image(a.u32(0), a.i32(1), a.u32(2), a.u32(3), a.u32(4), a.u32(5), a.i32(6), ConstByteView(raw.data(), raw.size()), a.flag(8));
+      break;
+    }
+    case op_compressedTexSubImage: {   // (target, level, xo, yo, zo, w, h, d, format, data, is3d)
+      ArrayView<uint8_t> raw;
+      if (!a.bytes(9, &raw)) { gl.set_error(0x501); break; }
+      gl.compressed_tex_sub_image(a.u32(0), a.i32(1), a.i32(2), a.i32(3), a.i32(4), a.u32(5), a.u32(6), a.u32(7), a.u32(8), ConstByteView(raw.data(), raw.size()), a.flag(10));
       break;
     }
     case op_texStorage: gl.tex_storage(a.u32(0), a.u32(1), a.u32(2), a.u32(3), a.u32(4), a.u32(5)); break;
