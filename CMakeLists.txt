@@ -244,6 +244,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsDash.cpp
   src/Browser/DomBindingsForm.cpp
   src/Browser/DomBindingsNet.cpp
+  src/Browser/DomBindingsCrypto.cpp
   src/Browser/WebPrelude.cpp
   src/Browser/WebUrl.cpp
   src/Browser/CookieJar.cpp
@@ -400,6 +401,7 @@ add_executable(BOOTX64
   src/Gui/Controls/DropDown.cpp
   src/Gui/Controls/Slider.cpp
   src/Gui/Controls/LevelMeter.cpp
+  src/Gui/Controls/PieChart.cpp
   src/Gui/Controls/CheckBox.cpp
   src/Gui/Controls/RadioButton.cpp
   src/Gui/Controls/Toggle.cpp

@@ -43,4 +43,8 @@ bool ec_point_valid(EcCurve curve, ConstByteView point);
 // ECDSA signature check (r and s as unsigned big-endian integers) over `digest`, truncated per FIPS 186-4 if longer than the curve order.
 bool ecdsa_verify(EcCurve curve, ConstByteView public_point, const uint8_t* digest, uint32_t digest_length, ConstByteView r, ConstByteView s);
 
+// ECDSA signature over `digest` (truncated per FIPS 186-4 like verification does) with a fresh random nonce from `random`: r | s, each ec_field_size bytes,
+// big-endian, into `signature`. False if the key is out of range or the random source fails.
+bool ecdsa_sign(EcCurve curve, const uint8_t* private_key, const uint8_t* digest, uint32_t digest_length, IRandom& random, uint8_t* signature);
+
 }  // namespace crypto

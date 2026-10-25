@@ -28,6 +28,7 @@
 #include "Gui/Controls/DatePicker.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/PieChart.hpp"
 #include "Gui/Controls/RadioButton.hpp"
 #include "Gui/Controls/ScrollPanel.hpp"
 #include "Gui/Controls/Slider.hpp"
@@ -283,6 +284,77 @@ static void test_level_meter() {
     w.render();
     CHECK(screen.px(200 + 8, 10 + 120 - 2 - 3) == 0xFF00C000);   // bottom segment lit
     CHECK(screen.px(200 + 8, 10 + 8) == 0xFF400000);             // top segment dark
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_pie_chart() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    PieChart p(a);
+    p.set_bounds({10, 10, 200, 140});
+    p.set_legend(false);
+    w.add(&p);
+    CHECK(p.slice_count() == 0 && p.slice_at(100, 70) == -1 && p.total() == 0);
+    CHECK(p.add_slice("A", 25) == 0 && p.add_slice("B", 25) == 1 && p.add_slice("C", 50, 0xFF112233) == 2);
+    CHECK(p.total() == 100 && p.permille(0) == 250 && p.permille(2) == 500 && p.slice_color(2) == 0xFF112233 && p.slice_color(0) != 0);
+    // Slices start at 12 o'clock and run clockwise: A the first quarter, B the second, C the half.
+    CHECK(p.slice_at_angle(0) == 0 && p.slice_at_angle(16383) == 0 && p.slice_at_angle(16385) == 1 && p.slice_at_angle(32770) == 2 && p.slice_at_angle(65535) == 2);
+    const Rect2D r = p.pie_rect();
+    CHECK(r.width == 132 && r.height == 132);
+    const int32_t cx = r.x + 66, cy = r.y + 66;
+    CHECK(p.slice_at(cx + 30, cy - 30) == 0);   // upper right
+    CHECK(p.slice_at(cx + 30, cy + 30) == 1);   // lower right
+    CHECK(p.slice_at(cx - 30, cy + 30) == 2);   // lower left
+    CHECK(p.slice_at(cx - 30, cy - 30) == 2);   // upper left
+    CHECK(p.slice_at(r.x + 1, r.y + 1) == -1);  // the corner of the square is outside the disc
+    w.render();
+    CHECK(screen.px(10 + cx + 30, 10 + cy - 30) == p.slice_color(0));
+    CHECK(screen.px(10 + cx - 30, 10 + cy + 30) == 0xFF112233);
+    CHECK(screen.px(10 + r.x + 1, 10 + r.y + 1) == theme.face);
+
+    // Selection by click and by key; the handler fires only on a change.
+    click(w, 10 + cx + 30, 10 + cy + 30);
+    CHECK(p.selected_index() == 1);
+    w.render();
+    CHECK(screen.px(10 + cx + 30, 10 + cy + 30) != p.slice_color(1));   // drawn lighter
+    click(w, 10 + 2, 10 + 2);
+    CHECK(p.selected_index() == -1);
+    press(w, key::kDown);
+    CHECK(p.selected_index() == 0);
+    press(w, key::kUp);
+    CHECK(p.selected_index() == 2);
+
+    // Zero valued slices take no angle; an all zero chart is an empty disc.
+    p.set_slice_value(1, 0);
+    CHECK(p.slice_at_angle(30000) == 2 && p.permille(1) == 0);
+    p.set_slice_value(0, 0);
+    p.set_slice_value(2, 0);
+    CHECK(p.slice_at(cx, cy) == -1 && p.permille(2) == 0);
+    w.render();
+    CHECK(screen.px(10 + cx + 30, 10 + cy - 30) == theme.field);
+
+    // Huge values do not overflow.
+    p.set_slice_value(0, UINT64_MAX);
+    p.set_slice_value(1, UINT64_MAX);
+    CHECK(p.total() == UINT64_MAX && p.slice_at_angle(0) == 0);
+    p.clear_slices();
+    CHECK(p.slice_count() == 0 && p.selected_index() == -1);
+
+    // The legend shows swatch, label and share, and a click on its row selects the slice.
+    p.set_legend(true);
+    p.add_slice("Alpha", 1);
+    p.add_slice("Beta", 3);
+    const int32_t row = p.legend_row_at(200 - 10, 70 - 18 / 2 * 2 + 18 + 5);
+    CHECK(row == 1 || row == 0);
+    p.set_selected_index(0);
+    w.render();
+    CHECK(p.pie_rect().width < 132);
+    p.set_selected_index(9);
+    CHECK(p.selected_index() == -1);
   }
   CHECK(a.live == 0);
 }
@@ -691,6 +763,7 @@ int main() {
   test_helpers();
   test_slider();
   test_level_meter();
+  test_pie_chart();
   test_scroll_panel();
   test_checkbox();
   test_radio();

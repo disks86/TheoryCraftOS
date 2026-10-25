@@ -325,15 +325,9 @@ bool ec_ecdh(EcCurve curve, const uint8_t* private_key, ConstByteView peer_point
   return c->f.store(x, ByteView(shared_x, c->size));
 }
 
-bool ecdsa_verify(EcCurve curve, ConstByteView public_point, const uint8_t* digest, uint32_t digest_length, ConstByteView r_bytes, ConstByteView s_bytes) {
-  const Curve* c = curve_for(curve);
-  Point q;
-  if (!c || !c->parse_point(public_point, &q)) return false;
-  Num r, s;
-  if (!c->order.load(r_bytes, &r) || !c->order.load(s_bytes, &s)) return false;
-  if (r.is_zero() || s.is_zero() || !c->order.below_modulus(r) || !c->order.below_modulus(s)) return false;
-  // e: the leftmost bits of the digest, as many as the order has
-  const uint32_t nbits = c->order.bits();
+// The integer e of FIPS 186-4: the leftmost bits of the digest, as many as the order has, reduced once.
+static bool digest_scalar(const Curve& c, const uint8_t* digest, uint32_t digest_length, Num* e) {
+  const uint32_t nbits = c.order.bits();
   uint32_t use = digest_length;
   if (use * 8 > nbits) use = (nbits + 7) / 8;
   uint8_t e_bytes[64];
@@ -344,9 +338,20 @@ bool ecdsa_verify(EcCurve curve, ConstByteView public_point, const uint8_t* dige
       for (uint32_t i = use; i-- > 0;) e_bytes[i] = static_cast<uint8_t>((e_bytes[i] >> shift) | (i ? e_bytes[i - 1] << (8 - shift) : 0));
     }
   }
+  if (!c.order.load(ConstByteView(e_bytes, use), e)) return false;
+  c.order.reduce_once(e);
+  return true;
+}
+
+bool ecdsa_verify(EcCurve curve, ConstByteView public_point, const uint8_t* digest, uint32_t digest_length, ConstByteView r_bytes, ConstByteView s_bytes) {
+  const Curve* c = curve_for(curve);
+  Point q;
+  if (!c || !c->parse_point(public_point, &q)) return false;
+  Num r, s;
+  if (!c->order.load(r_bytes, &r) || !c->order.load(s_bytes, &s)) return false;
+  if (r.is_zero() || s.is_zero() || !c->order.below_modulus(r) || !c->order.below_modulus(s)) return false;
   Num e;
-  if (!c->order.load(ConstByteView(e_bytes, use), &e)) return false;
-  c->order.reduce_once(&e);
+  if (!digest_scalar(*c, digest, digest_length, &e)) return false;
   Num em, sm, rm, w, u1, u2;
   c->order.to_mont(e, &em);
   c->order.to_mont(s, &sm);
@@ -367,6 +372,40 @@ bool ecdsa_verify(EcCurve curve, ConstByteView public_point, const uint8_t* dige
   // x mod n == r (p > n, so x may exceed n once)
   c->order.reduce_once(&x);
   return x == r;
+}
+
+bool ecdsa_sign(EcCurve curve, const uint8_t* private_key, const uint8_t* digest, uint32_t digest_length, IRandom& random, uint8_t* signature) {
+  const Curve* c = curve_for(curve);
+  Num d, e;
+  if (!c || !scalar_from_bytes(*c, private_key, &d) || !digest_scalar(*c, digest, digest_length, &e)) return false;
+  const uint32_t size = c->size;
+  for (int attempt = 0; attempt < 64; ++attempt) {
+    uint8_t kb[48];
+    if (!random.fill(ByteView(kb, size))) return false;
+    Num k;
+    if (!scalar_from_bytes(*c, kb, &k)) continue;
+    Point rp;
+    c->mul_secret(c->g, k, &rp);
+    Num x, y, r;
+    if (!c->to_affine(rp, &x, &y)) continue;
+    uint8_t xb[48];
+    if (!c->f.store(x, ByteView(xb, size)) || !c->order.load(ConstByteView(xb, size), &r)) continue;
+    c->order.reduce_once(&r);
+    if (r.is_zero()) continue;
+    Num km, rm, dm, em, t, sum, kinv, sm, s;
+    c->order.to_mont(k, &km);
+    c->order.to_mont(r, &rm);
+    c->order.to_mont(d, &dm);
+    c->order.to_mont(e, &em);
+    c->order.mul(rm, dm, &t);
+    c->order.add(em, t, &sum);
+    c->order.invert_prime(km, &kinv);
+    c->order.mul(kinv, sum, &sm);
+    c->order.from_mont(sm, &s);
+    if (s.is_zero()) continue;
+    return c->order.store(r, ByteView(signature, size)) && c->order.store(s, ByteView(signature + size, size));
+  }
+  return false;
 }
 
 }  // namespace crypto
