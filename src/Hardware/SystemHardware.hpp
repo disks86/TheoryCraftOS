@@ -28,6 +28,13 @@
 namespace hardware {
 using SystemRam = UefiRandomAccessMemory;
 }  // namespace hardware
+#elif defined(__aarch64__)
+// The AArch64 image has no CPU class yet (Arch/AArch64/main.cpp reads MIDR_EL1 itself).
+#include "Hardware/RandomAccessMemory/UefiRandomAccessMemory.hpp"
+
+namespace hardware {
+using SystemRam = UefiRandomAccessMemory;
+}  // namespace hardware
 #else
 #error "No hardware classes for this architecture"
 #endif

@@ -3,3 +3,4 @@ build/
 compile_commands.json
 *.gch
 __pycache__/
+build-*/

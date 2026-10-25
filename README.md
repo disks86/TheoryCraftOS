@@ -48,6 +48,21 @@ another `-audiodev` driver; `QEMU_AUDIO=wav` records to `audio.wav` in the build
 
 Host tests build with ASan and UBSan and run with `tests/run_host_tests.sh <TestName>`.
 
+## AArch64 (work in progress)
+
+Any ARM64 machine with UEFI firmware is the target. The first milestone is a bootable `BOOTAA64.EFI` holding the portable layers
+(console, RAM, allocator, ACPI tables, the SPCR debug UART, the firmware framebuffer). Exception vectors, the GIC (v2 and v3, from the
+ACPI MADT), the generic-timer tick and the preemptive thread scheduler run on the boot core, at EL1 or EL2 (checked in QEMU with
+`-machine virt[,virtualization=on][,gic-version=3]`). The other cores start through PSCI `CPU_ON` (SMC or HVC as the FADT says) and copy the boot core's MMU setup (checked with `-smp 4`). Floating-point state across switches, PCIe (ECAM) and
+the drivers are still to port before the rest of the OS can join this image.
+
+Needs `clang` (aarch64 target), `lld-link` (rustup's `rust-lld` works), mingw-w64's libstdc++ headers, `qemu-system-aarch64` and AAVMF:
+
+```
+cmake -S . -B build-aarch64 -DTCOS_ARCH=aarch64 -G Ninja
+cmake --build build-aarch64 --target run   # QEMU "virt"; the log appears on the serial console in your terminal
+```
+
 ## Debugging in QEMU
 
 `scripts/gdb-proxy.py` rebuilds `BOOTX64`, starts QEMU frozen at reset with a gdbstub on :2159 and bridges gdb to it. It
