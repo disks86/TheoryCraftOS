@@ -1201,6 +1201,21 @@ static void test_etc2_eac() {
         "37492 37491 10 | 0 | 255,2,2,255 | 1281 | 255 0 1 4 | not renderable");
 }
 
+static void test_webgpu_sliced_3d() {
+  CHECK(gl_script(
+            "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice({ requiredFeatures: ['texture-compression-bc', 'texture-compression-bc-sliced-3d'] }).then(function (d) {"
+            " var t = d.createTexture({ size: [4, 4, 2], dimension: '3d', format: 'bc1-rgba-unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });"
+            " var data = new Uint8Array([0x00, 0xF8, 0x1F, 0, 0, 0, 0, 0, 0x1F, 0, 0x00, 0xF8, 0, 0, 0, 0]);"
+            " d.queue.writeTexture({ texture: t }, data, { bytesPerRow: 8, rowsPerImage: 1 }, [4, 4, 2]);"
+            " var out = d.createBuffer({ size: 512, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });"
+            " var e = d.createCommandEncoder(); e.copyTextureToBuffer({ texture: t }, { buffer: out, bytesPerRow: 256, rowsPerImage: 1 }, [4, 4, 2]); d.queue.submit([e.finish()]);"
+            " return out.mapAsync(GPUMapMode.READ).then(function () { var u = new Uint8Array(out.getMappedRange()); console.log(u[0], u[1], u[2], u[3], u[256], u[257]);"
+            "  return a.requestDevice({ requiredFeatures: ['texture-compression-bc'] }); }).then(function (d2) {"
+            "   d2.pushErrorScope('validation'); d2.createTexture({ size: [4, 4, 2], dimension: '3d', format: 'bc1-rgba-unorm', usage: GPUTextureUsage.TEXTURE_BINDING }); return d2.popErrorScope(); }).then(function (er) { console.log(er ? 'needs sliced' : 'bad'); });"
+            " }); }).catch(function (e) { console.log('ERR', e && e.message); });") ==
+        "0 248 31 0 31 0 | needs sliced");
+}
+
 static void test_webgpu_mapping() {
   CHECK(gl_script(
             "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice(); }).then(function (d) {"
@@ -5925,6 +5940,7 @@ int main(int argc, char** argv) {
   test_webgpu_compressed();
   test_webgpu_rg11b10();
   test_etc2_eac();
+  test_webgpu_sliced_3d();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();
@@ -5979,6 +5995,7 @@ int main(int argc, char** argv) {
   test_webgpu_compressed();
   test_webgpu_rg11b10();
   test_etc2_eac();
+  test_webgpu_sliced_3d();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();

@@ -494,7 +494,8 @@ void GlContext::compressed_tex_image(uint32_t target, int32_t level, uint32_t in
   const CompressedFormat* cf = find_compressed(internal);
   if (!cf) { set_error(INVALID_ENUM); return; }
   const bool layered = t->target == 0x806F || t->target == 0x8C1A;
-  if (border != 0 || level < 0 || level >= static_cast<int32_t>(kMaxLevels) || w > kMaxTextureSize || h > kMaxTextureSize || three_d != layered || t->target == 0x806F) { set_error(INVALID_VALUE); return; }
+  if (border != 0 || level < 0 || level >= static_cast<int32_t>(kMaxLevels) || w > kMaxTextureSize || h > kMaxTextureSize || three_d != layered) { set_error(INVALID_VALUE); return; }
+  if (t->target == 0x806F && !sliced_3d_codec(cf->codec)) { set_error(INVALID_OPERATION); return; }   // only RGTC and BPTC are allowed in a 3D texture
   if (t->immutable) { set_error(INVALID_OPERATION); return; }
   if (data.size() != compressed_size(*cf, w, h, d)) { set_error(INVALID_VALUE); return; }
   Image* im = make_texture_image(t, target, level);

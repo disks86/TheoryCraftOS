@@ -33,6 +33,8 @@ struct CompressedFormat {
   bool srgb = false;       // ASTC: the colours are sRGB encoded
 };
 
+// Whether WebGL allows the format in a TEXTURE_3D (the RGTC and BPTC ones; S3TC, ETC and ASTC do not).
+inline bool sliced_3d_codec(Codec c) { return c == Codec::Bc4U || c == Codec::Bc4S || c == Codec::Bc5U || c == Codec::Bc5S || c == Codec::Bc6U || c == Codec::Bc6S || c == Codec::Bc7; }
 const CompressedFormat* find_compressed(uint32_t internal);
 uint64_t compressed_size(const CompressedFormat& f, uint32_t w, uint32_t h, uint32_t d);
 // Decodes `data` (w x h x d texels in blocks) into dst at (xo, yo, zo). False if the data is too short.

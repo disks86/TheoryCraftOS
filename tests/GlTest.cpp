@@ -521,9 +521,9 @@ static void test_bptc_astc() {
       for (uint32_t i = 0; i < n; ++i) {
         uint32_t r[4];
         read_texel(img, i % cf->bw, i / cf->bw, 0, r);
-        for (int k = 0; k < (cf->codec == Codec::Bc6U ? 3 : 4); ++k) {
+        for (int k = 0; k < (cf->codec == Codec::Bc6U || cf->codec == Codec::Bc6S ? 3 : 4); ++k) {
           int got;
-          if (cf->codec == Codec::Bc6U || (cf->codec == Codec::Astc && !cf->srgb)) {
+          if (cf->codec == Codec::Bc6U || cf->codec == Codec::Bc6S || (cf->codec == Codec::Astc && !cf->srgb)) {
             float f;
             memcpy(&f, &r[k], 4);
             got = static_cast<int>(f < 0 ? 0 : f > 1 ? 255 : f * 255 + 0.5f);
@@ -546,7 +546,7 @@ static void test_bptc_astc() {
       CHECK(same);
       ++checked;
     }
-    CHECK(checked == 224);
+    CHECK(checked == 248);
     // truncated data is refused, never read past the end
     const CompressedFormat* astc = find_compressed(0x93B7);
     const CompressedFormat* bc7 = find_compressed(0x8E8C);
@@ -588,6 +588,23 @@ static void test_bptc_astc() {
     uint8_t px[4];
     gl.read_pixels(5, 5, 1, 1, 0x1908, 0x1401, ByteView(px, 4));
     CHECK(px[0] == 0xff && px[1] == 0xff && px[2] == 0xff && px[3] == 0xff);
+    // 3D textures take the RGTC and BPTC formats (two layers of one block), not S3TC or ASTC
+    {
+      const uint32_t t3 = gl.create_texture();
+      gl.bind_texture(0x806F, t3);
+      uint8_t two[32] = {};
+      gl.compressed_tex_image(0x806F, 0, 0x8E8C, 4, 4, 2, 0, ConstByteView(two, 32), true);
+      CHECK(gl.get_error() == 0);
+      gl.compressed_tex_image(0x806F, 0, 0x8DBB, 4, 4, 2, 0, ConstByteView(two, 16), true);
+      CHECK(gl.get_error() == 0);
+      gl.compressed_tex_sub_image(0x806F, 0, 0, 0, 1, 4, 4, 1, 0x8DBB, ConstByteView(two, 8), true);
+      CHECK(gl.get_error() == 0);
+      gl.compressed_tex_image(0x806F, 0, 0x83F0, 4, 4, 2, 0, ConstByteView(two, 16), true);
+      CHECK(gl.get_error() == 0x502);
+      gl.compressed_tex_image(0x806F, 0, 0x93B0, 4, 4, 2, 0, ConstByteView(two, 32), true);
+      CHECK(gl.get_error() == 0x502);
+      gl.bind_texture(0x0DE1, tex);
+    }
     gl.compressed_tex_sub_image(0x0DE1, 0, 3, 0, 0, 6, 6, 1, 0x93B4, ConstByteView(block, 16), false);
     CHECK(gl.get_error() == 0x501);   // not on a 6 x 6 boundary
     gl.compressed_tex_image(0x0DE1, 0, 0x93B4, 6, 6, 1, 0, ConstByteView(block, 15), false);

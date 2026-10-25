@@ -311,6 +311,22 @@ static void test_compressed() {
     auto fl = [](uint32_t u) { return __builtin_bit_cast(float, u); };
     webgl::read_texel(*dev.texture(at)->mips[0], 3, 3, 0, px); CHECK(fl(px[0]) == 1.0f && fl(px[1]) == 0.0f && fl(px[3]) == 1.0f);
     webgl::read_texel(*dev.texture(at)->mips[0], 9, 3, 0, px); CHECK(fl(px[0]) == 0.0f && fl(px[1]) == 1.0f);
+    // a 3d texture of 2 layers of blocks (the sliced-3d features are checked by the page layer)
+    const uint32_t vol = dev.create_texture(8, 4, 2, 1, 1, 2, bc1, 0x04 | 0x02);
+    CHECK(vol != 0);
+    uint8_t layers[16];
+    memcpy(layers, blk, 8);
+    memcpy(layers + 8, blk, 8);
+    layers[8] = 0x1F; layers[9] = 0x00; layers[10] = 0x00; layers[11] = 0xF8;   // the second layer's colours swapped
+    ImageCopy vc;
+    vc.texture = vol;
+    BufferLayout vl;
+    vl.rows_per_image = 1;
+    vl.bytes_per_row = 8;
+    CHECK(dev.write_texture(vc, ConstByteView(layers, 16), vl, 4, 4, 2));
+    webgl::read_texel(*dev.texture(vol)->mips[0], 0, 0, 0, px); CHECK(px[0] == 255 && px[2] == 0);
+    webgl::read_texel(*dev.texture(vol)->mips[0], 0, 0, 1, px); CHECK(px[0] == 0 && px[2] == 255);
+    CHECK(dev.create_texture(8, 4, 1, 1, 1, 0, bc1, 0x04) == 0);   // not 1d
     // ETC2 (an individual block: red 255 and +2 on every channel) and EAC (base 128, multiplier 0 counts as 1, selector 0 is -3: (128 * 8 + 4 - 3) / 2047)
     const FormatDesc* etc = find_format("etc2-rgb8unorm");
     const FormatDesc* eacr = find_format("eac-r11unorm");
