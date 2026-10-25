@@ -44,13 +44,13 @@ static int g_failed = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAILED line %d: %s\n", __LINE__, #cond); ++g_failed; } } while (0)
 #define CHECK_STATUS(expr, want) do { Status got_ = (expr); if (got_ != (want)) { printf("FAILED line %d: %s -> %s, want %s\n", __LINE__, #expr, status_name(got_), status_name(want)); ++g_failed; } } while (0)
 
-struct MemDisk final : hardware::IStorageDevice {
+struct MemDisk : hardware::IStorageDevice {
   MemDisk(const uint8_t* image, uint64_t length, uint32_t block, uint64_t lead_blocks = 0, bool writable = false) : block_size(block), can_write(writable) {
     blocks = lead_blocks + (length + block - 1) / block;
     data = static_cast<uint8_t*>(calloc(blocks, block));
     memcpy(data + lead_blocks * block, image, length);
   }
-  ~MemDisk() { free(data); }
+  virtual ~MemDisk() { free(data); }
   const char* name() const override { return "memdisk"; }
   bool initialize() override { return true; }
   void shutdown() override {}
@@ -94,8 +94,11 @@ struct BefsImage {
     per_group = ((uint64_t{1} << group_shift) + bs * 8 - 1) / (bs * 8);
     used.assign(total, false);
     next = 1 + groups * per_group;  // the super block and the bitmap
+    log_first = next;               // then the journal
+    next += kLogBlocks;
     for (uint64_t b = 0; b < next; ++b) used[b] = true;
   }
+  static const uint32_t kLogBlocks = 256;
 
   uint8_t* at(uint64_t block) { return img.data() + block * bs; }
   uint64_t alloc(uint64_t n) {
@@ -290,13 +293,14 @@ struct BefsImage {
     put32(s + 80, ag_count);
     put32(s + 84, 0x434c454e);
     put32(s + 112, 0x15b6830e);
+    put_run(s + 88, log_first, kLogBlocks);
     put_run(s + 116, root_inode, 1);
     meta.push_back(0);
     used_blocks = used_count;
   }
 
   uint32_t bs, shift = 0, ag_shift, ag_count, ns;
-  uint64_t total, next, used_blocks = 0, per_group = 0;
+  uint64_t total, next, used_blocks = 0, per_group = 0, log_first = 0;
   std::vector<bool> used;
   std::vector<uint64_t> inodes;
   std::vector<uint8_t> img;
@@ -716,6 +720,12 @@ static void check_accounting(const uint8_t* img, const BefsImage& b, const char*
     }
   };
   claim(0, 1 + b.ag_count * b.per_group);
+  {
+    uint64_t log_block; uint32_t log_length;
+    if (!raw_run(v, img + 512 + 88, &log_block, &log_length)) { ok = false; log_length = 0; }
+    claim(log_block, log_length);
+    if (rd32(img + 512 + 84) != 0x434c454e || rd64(img + 512 + 96) != rd64(img + 512 + 104)) { printf("  the journal is not empty and clean\n"); ok = false; }
+  }
   std::vector<uint64_t> todo{(rd32(img + 512 + 116) << b.ag_shift) + rd16(img + 512 + 120)};
   std::set<uint64_t> seen;
   while (!todo.empty()) {
@@ -987,9 +997,38 @@ static void test_write_refused() {
   }
   {
     std::vector<uint8_t> dirty = v.image.img;
-    put32(dirty.data() + 512 + 84, 0x44495254);  // not shut down cleanly
+    put32(dirty.data() + 512 + 84, 0x44495254);  // not shut down cleanly, but nothing in the log: that is just made clean
     MemDisk disk(dirty.data(), dirty.size(), 512, 0, true);
-    check_read_only(disk, "dirty");
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    CHECK(fs && !fs->info().read_only);
+    CHECK(rd32(disk.data + 512 + 84) == 0x434c454e);
+  }
+  {
+    std::vector<uint8_t> dirty = v.image.img;
+    put32(dirty.data() + 512 + 84, 0x44495254);
+    MemDisk disk(dirty.data(), dirty.size(), 512);  // ... but not on a device that cannot be written
+    check_read_only(disk, "dirty, read-only device");
+    CHECK(rd32(disk.data + 512 + 84) == 0x44495254);
+  }
+  {
+    std::vector<uint8_t> odd = v.image.img;
+    put32(odd.data() + 512 + 84, 0x12345678);  // neither clean nor dirty
+    MemDisk disk(odd.data(), odd.size(), 512, 0, true);
+    check_read_only(disk, "odd flag");
+  }
+  {
+    std::vector<uint8_t> small_log = v.image.img;
+    put16(small_log.data() + 512 + 88 + 6, 100);  // a log too short for our transactions
+    MemDisk disk(small_log.data(), small_log.size(), 512, 0, true);
+    check_read_only(disk, "short log");
+  }
+  {
+    std::vector<uint8_t> free_log = v.image.img;
+    const uint64_t log = v.image.log_first + 10;  // a block of the log shows as free in the bitmap
+    free_log[(1 + (log >> v.image.ag_shift) * v.image.per_group) * 1024 + ((log & ((1u << v.image.ag_shift) - 1)) / 8)] &= ~(1u << (log % 8));
+    MemDisk disk(free_log.data(), free_log.size(), 512, 0, true);
+    check_read_only(disk, "log not in the bitmap");
   }
   {
     std::vector<uint8_t> logged = v.image.img;
@@ -1394,6 +1433,259 @@ static void test_namespace_random(uint32_t block_size, uint32_t ag_shift, const 
   CHECK(a.live == 0);
 }
 
+// ---- The journal --------------------------------------------------------------------------------------------------------------------
+
+// Puts a log entry of `targets.size()` blocks (arrays of at most 127 runs, each followed by its blocks) into the image at ring
+// position `position`, and marks the volume dirty with the log from `position` to the end of the entry. Returns the end position.
+static uint64_t put_log_entry(BefsImage* image, uint64_t position, const std::vector<uint64_t>& targets, const std::vector<std::vector<uint8_t>>& contents) {
+  const uint32_t bs = image->bs;
+  const uint32_t capacity = std::min<uint32_t>((bs - 8) / 8, 127);
+  const uint64_t length = BefsImage::kLogBlocks;
+  uint64_t at = position;
+  auto put_block = [&](const uint8_t* data, size_t n) {
+    memcpy(image->at(image->log_first + at), data, n);
+    at = (at + 1) % length;
+  };
+  for (size_t done = 0; done < targets.size();) {
+    const size_t n = std::min<size_t>(capacity, targets.size() - done);
+    std::vector<uint8_t> array(bs, 0);
+    put32(array.data(), n);
+    put32(array.data() + 4, capacity + 1);
+    for (size_t i = 0; i < n; ++i) image->put_run(array.data() + 8 + i * 8, targets[done + i], 1);
+    put_block(array.data(), bs);
+    for (size_t i = 0; i < n; ++i) put_block(contents[done + i].data(), bs);
+    done += n;
+  }
+  uint8_t* s = image->img.data() + 512;
+  put32(s + 84, 0x44495254);
+  put64(s + 96, position);
+  put64(s + 104, at);
+  return at;
+}
+
+static void test_journal_replay() {
+  printf("BeFS replaying the journal\n");
+  const uint32_t bs = 1024;
+  TestAllocator a;
+  Built v(bs, 13, 3, 1024);
+  // Where hello.txt's data is, and blocks that are free to be written by the log.
+  const RawVolume raw{v.image.img.data(), bs, v.image.ag_shift, v.image.ag_count, v.image.total, v.image.per_group};
+  TreeInfo root_info;
+  CHECK(check_tree(raw, (rd32(v.image.img.data() + 512 + 116) << v.image.ag_shift) + rd16(v.image.img.data() + 512 + 120), &root_info, "root"));
+  uint64_t hello_inode = 0;
+  for (auto& e : root_info.entries) if (e.first == "hello.txt") hello_inode = e.second;
+  const uint64_t hello_block = raw_table(raw, hello_inode).direct.at(0).first;
+  std::vector<uint64_t> targets;
+  std::vector<std::vector<uint8_t>> contents;
+  for (uint64_t i = 0; i < 130; ++i) {  // free blocks near the end of the volume
+    targets.push_back(v.image.total - 400 + i);
+    contents.push_back(make_data(bs, static_cast<uint32_t>(i)));
+  }
+  targets.push_back(hello_block);  // (a second array: 127 + 4 runs)
+  contents.push_back(std::vector<uint8_t>(bs, 0));
+  memcpy(contents.back().data(), "REPLAYED by the journal.\n", 25);
+
+  for (uint64_t position : {uint64_t{0}, uint64_t{200}, uint64_t{BefsImage::kLogBlocks - 5}}) {  // the last one wraps around the end of the log
+    BefsImage image = v.image;
+    const uint64_t end = put_log_entry(&image, position, targets, contents);
+    MemDisk disk(image.img.data(), image.img.size(), 512, 0, true);
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    CHECK(fs && !fs->info().read_only);
+    std::vector<uint8_t> got;
+    CHECK(fs && read_back(*fs, "/hello.txt", &got) && std::string(got.begin(), got.end()) == "REPLAYED by t");
+    for (size_t i = 0; i < 130; ++i) CHECK(memcmp(disk.data + targets[i] * bs, contents[i].data(), bs) == 0);
+    CHECK(rd32(disk.data + 512 + 84) == 0x434c454e && rd64(disk.data + 512 + 96) == end && rd64(disk.data + 512 + 104) == end);
+    // It is a working volume again.
+    CHECK(fs && put_file(*fs, "/after.txt", make_data(2000, 5)));
+    fs = UniquePointer<IFileSystem>();
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    CHECK(fs && read_back(*fs, "/after.txt", &got) && got == make_data(2000, 5));
+  }
+
+  // The same journal on a device that cannot be written: read as it is, the log left alone.
+  {
+    BefsImage image = v.image;
+    put_log_entry(&image, 0, targets, contents);
+    MemDisk disk(image.img.data(), image.img.size(), 512);
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    std::vector<uint8_t> got;
+    CHECK(fs && fs->info().read_only && read_back(*fs, "/hello.txt", &got) && std::string(got.begin(), got.end()) == "Hello, BeFS!\n");
+    CHECK(rd32(disk.data + 512 + 84) == 0x44495254);
+  }
+
+  // Damaged logs are not replayed at all (not even in part), and the volume stays read-only.
+  struct Damage { const char* what; std::function<void(BefsImage*, uint64_t)> apply; };
+  const Damage damages[] = {
+      {"count of zero", [](BefsImage* i, uint64_t) { put32(i->at(i->log_first), 0); }},
+      {"count too big", [](BefsImage* i, uint64_t) { put32(i->at(i->log_first), 128); }},
+      {"wrong maximum", [](BefsImage* i, uint64_t) { put32(i->at(i->log_first) + 4, 100); }},
+      {"run of two blocks", [](BefsImage* i, uint64_t) { put16(i->at(i->log_first) + 8 + 6, 2); }},
+      {"run outside the volume", [](BefsImage* i, uint64_t) { put32(i->at(i->log_first) + 8 + 8, 0x7fffff); }},
+      {"entry beyond log_end", [](BefsImage* i, uint64_t end) { put64(i->img.data() + 512 + 104, end - 3); }},
+      {"log_end outside the log", [](BefsImage* i, uint64_t) { put64(i->img.data() + 512 + 104, 5000); }},
+      {"block 0 that is no super block", [](BefsImage* i, uint64_t) { put32(i->at(i->log_first) + 8, 0); put16(i->at(i->log_first) + 8 + 4, 0); }},
+  };
+  for (const Damage& d : damages) {
+    BefsImage image = v.image;
+    std::vector<uint64_t> few(targets.begin(), targets.begin() + 5);
+    std::vector<std::vector<uint8_t>> few_contents(contents.begin(), contents.begin() + 5);
+    const uint64_t end = put_log_entry(&image, 0, few, few_contents);
+    d.apply(&image, end);
+    const std::vector<uint8_t> before = image.img;
+    MemDisk disk(image.img.data(), image.img.size(), 512, 0, true);
+    UniquePointer<IFileSystem> fs;
+    const Status s = BefsFileSystem::mount(a, disk, 0, &fs);
+    if (s == Status::Ok) {
+      CHECK(fs->info().read_only);
+      CHECK_STATUS(fs->create_directory("/x"), Status::ReadOnly);
+    }
+    CHECK(memcmp(disk.data, before.data(), before.size()) == 0);  // nothing was written
+    if (s == Status::Ok && !fs->info().read_only) printf("  (damage: %s)\n", d.what);
+  }
+  CHECK(a.live == 0);
+}
+
+// ---- Crashes ------------------------------------------------------------------------------------------------------------------------
+
+// A device that records every block written and every flush, so that the state after a crash at any point can be rebuilt from the trace.
+struct TraceDisk final : MemDisk {
+  struct Event { bool flush; uint64_t lba; std::vector<uint8_t> data; };
+  using MemDisk::MemDisk;
+  bool write(uint64_t lba, ConstByteView buffer) override {
+    if (!MemDisk::write(lba, buffer)) return false;
+    for (uint64_t i = 0; i < buffer.size() / block_size; ++i)
+      trace.push_back({false, lba + i, std::vector<uint8_t>(buffer.data() + i * block_size, buffer.data() + (i + 1) * block_size)});
+    return true;
+  }
+  bool flush() override { trace.push_back({true, 0, {}}); return true; }
+  std::vector<Event> trace;
+};
+
+typedef std::map<std::string, std::pair<int64_t, uint64_t>> Dump;  // path -> (size, hash); size -1 for a directory
+
+static void dump_dir(IFileSystem& fs, const std::string& path, Dump* out, int depth) {
+  UniquePointer<IDirectory> dir;
+  if (depth > 6 || fs.open_directory(path.c_str(), &dir) != Status::Ok) { (*out)[path + "!"] = {-2, 0}; return; }
+  DirectoryEntry e;
+  while (dir->next(&e) == Status::Ok) {
+    const std::string child = (path == "/" ? "" : path) + "/" + e.name.c_str();
+    if (e.type == NodeType::Directory) {
+      (*out)[child] = {-1, 0};
+      dump_dir(fs, child, out, depth + 1);
+    } else {
+      std::vector<uint8_t> bytes;
+      uint64_t hash = 1469598103934665603ull;
+      if (!read_back(fs, child.c_str(), &bytes)) hash = 0;
+      for (uint8_t b : bytes) hash = (hash ^ b) * 1099511628211ull;
+      (*out)[child] = {static_cast<int64_t>(bytes.size()), hash};
+    }
+  }
+}
+
+static Dump dump_of(IFileSystem& fs) {
+  Dump d;
+  dump_dir(fs, "/", &d, 0);
+  return d;
+}
+
+static void test_crash(uint32_t bs, uint32_t ag_shift, uint32_t groups, uint32_t device_block, const char* what) {
+  printf("BeFS crashes at every write (%s)\n", what);
+  Built v(bs, ag_shift, groups, bs);
+  TestAllocator a;
+  struct Step { const char* name; std::function<void(IFileSystem&)> run; };
+  std::vector<Step> steps;
+  steps.push_back({"append to a file", [&](IFileSystem& fs) { UniquePointer<IFile> f; std::vector<uint8_t> d = make_data(5000, 40); uint64_t n; fs.open_file("/hello.txt", OpenMode::ReadWrite, &f); f->write(13, ConstByteView(d.data(), d.size()), &n); }});
+  steps.push_back({"make a directory", [&](IFileSystem& fs) { fs.create_directory("/d1"); }});
+  steps.push_back({"create a file", [&](IFileSystem& fs) { UniquePointer<IFile> f; fs.open_file("/d1/f", OpenMode::CreateOrOpen, &f); }});
+  steps.push_back({"write to it", [&](IFileSystem& fs) { UniquePointer<IFile> f; std::vector<uint8_t> d = make_data(3000, 41); uint64_t n; fs.open_file("/d1/f", OpenMode::ReadWrite, &f); f->write(0, ConstByteView(d.data(), d.size()), &n); }});
+  steps.push_back({"rename it", [&](IFileSystem& fs) { fs.rename("/d1/f", "/f2"); }});
+  steps.push_back({"cut a file", [&](IFileSystem& fs) { UniquePointer<IFile> f; fs.open_file("/contig", OpenMode::ReadWrite, &f); f->resize(10ull * bs + 3); }});
+  steps.push_back({"grow a file", [&](IFileSystem& fs) { UniquePointer<IFile> f; fs.open_file("/frag", OpenMode::ReadWrite, &f); f->resize(30ull * bs); }});
+  steps.push_back({"remove an empty file", [&](IFileSystem& fs) { fs.remove("/empty"); }});
+  steps.push_back({"remove a directory", [&](IFileSystem& fs) { fs.remove("/d1"); }});
+  for (int i = 0; i < 7; ++i) {  // /many has four names to a node: some of these split nodes
+    steps.push_back({"create in a full directory", [&, i](IFileSystem& fs) { UniquePointer<IFile> f; fs.open_file(("/many/g" + std::to_string(i)).c_str(), OpenMode::CreateOrOpen, &f); }});
+  }
+  steps.push_back({"move between directories", [&](IFileSystem& fs) { fs.rename("/many/g3", "/sub/moved"); }});
+  for (int i : {0, 1, 2, 4}) {  // (empty files: removing one with data is two commits, cut and unlink, with a shorter file in between)
+    steps.push_back({"remove from a directory", [&, i](IFileSystem& fs) { fs.remove(("/many/g" + std::to_string(i)).c_str()); }});
+  }
+
+  const std::vector<uint8_t> pristine = v.image.img;
+  TraceDisk disk(pristine.data(), pristine.size(), device_block, 0, true);
+  std::vector<Dump> dumps;
+  std::vector<size_t> begins;
+  {
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (!fs) return;
+    dumps.push_back(dump_of(*fs));
+    for (Step& step : steps) {
+      begins.push_back(disk.trace.size());
+      step.run(*fs);
+      dumps.push_back(dump_of(*fs));
+    }
+    begins.push_back(disk.trace.size());
+    fs = UniquePointer<IFileSystem>();
+    check_accounting(disk.data, v.image, "scenario without a crash");
+  }
+  for (size_t i = 0; i < steps.size(); ++i) CHECK(dumps[i] != dumps[i + 1]);  // (every step changes something)
+  printf("  %zu steps, %zu events\n", steps.size(), disk.trace.size());
+
+  // Rebuild the medium as a crash after event `cut` would leave it: what was flushed, and any part of what was not.
+  std::vector<uint8_t> durable(disk.blocks * device_block, 0);
+  memcpy(durable.data(), pristine.data(), pristine.size());
+  std::vector<const TraceDisk::Event*> pending;
+  uint32_t seed = 2024;
+  auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+  size_t trials = 0, failures = 0;
+  for (size_t cut = 0; cut <= disk.trace.size(); ++cut) {
+    if (cut > 0) {
+      const TraceDisk::Event& e = disk.trace[cut - 1];
+      if (e.flush) {
+        for (const TraceDisk::Event* w : pending) memcpy(durable.data() + w->lba * device_block, w->data.data(), device_block);
+        pending.clear();
+      } else {
+        pending.push_back(&e);
+      }
+    }
+    size_t step = 0;
+    while (step + 1 < steps.size() && cut > begins[step + 1]) ++step;
+    for (int mode = 0; mode < 5; ++mode) {
+      std::vector<uint8_t> image = durable;
+      for (const TraceDisk::Event* w : pending) {
+        if (mode == 0 || (mode >= 2 && rnd() % 2)) continue;  // nothing / about half of what was not flushed / all of it
+        memcpy(image.data() + w->lba * device_block, w->data.data(), device_block);
+      }
+      MemDisk after(image.data(), image.size(), device_block, 0, true);
+      UniquePointer<IFileSystem> fs;
+      ++trials;
+      bool ok = BefsFileSystem::mount(a, after, 0, &fs) == Status::Ok && fs && !fs->info().read_only;
+      if (ok) {
+        const Dump seen = dump_of(*fs);
+        ok = seen == dumps[step] || seen == dumps[step + 1];
+        if (!ok) printf("  crash after event %zu (step '%s', mode %d): neither the old nor the new state\n", cut, steps[step].name, mode);
+      } else {
+        printf("  crash after event %zu (step '%s', mode %d): cannot mount\n", cut, steps[step].name, mode);
+      }
+      if (ok) {
+        fs = UniquePointer<IFileSystem>();
+        const int before = g_failed;
+        check_accounting(after.data, v.image, "after a crash");
+        ok = g_failed == before;
+        if (!ok) printf("  crash after event %zu (step '%s', mode %d)\n", cut, steps[step].name, mode);
+      }
+      if (!ok) { ++failures; if (failures >= 5) { ++g_failed; goto done; } }
+    }
+  }
+done:
+  printf("  %zu crash states checked\n", trials);
+  if (failures) ++g_failed;
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_volume(1024, 8, 16, 1024, 512, "BeFS 1 KiB blocks, 512 byte device");
   test_volume(2048, 7, 32, 2048, 2048, "BeFS 2 KiB blocks, 2 KiB device");
@@ -1404,6 +1696,9 @@ int main() {
   test_write_full();
   test_write_refused();
   test_write_fuzz();
+  test_journal_replay();
+  test_crash(1024, 10, 2, 512, "1 KiB blocks, 512 byte device");
+  test_crash(2048, 9, 4, 2048, "2 KiB blocks, 2 KiB device");
   test_namespace();
   test_namespace_random(1024, 13, "1 KiB blocks");
   test_namespace_random(2048, 12, "2 KiB blocks");

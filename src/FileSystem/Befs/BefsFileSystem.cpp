@@ -29,7 +29,8 @@ constexpr uint32_t kSuperMagic1 = 0x42465331, kSuperMagic2 = 0xdd121031, kSuperM
 constexpr uint32_t kByteOrderLittle = 0x42494745, kByteOrderBig = 0x45474942;
 constexpr uint32_t kInodeMagic = 0x3bbe0ad9, kTreeMagic = 0x69f6c2e8;
 constexpr uint32_t kInodeInUse = 0x1, kLongSymlink = 0x40;
-constexpr uint32_t kVolumeClean = 0x434c454e;
+constexpr uint32_t kVolumeClean = 0x434c454e, kVolumeDirty = 0x44495254;
+constexpr uint32_t kMinLogBlocks = 256;  // (a transaction holds up to kTxHard blocks, and its log entry has to fit)
 constexpr uint32_t kInodeDeleted = 0x10;
 constexpr uint32_t kTxHard = 192;           // most blocks one transaction holds
 constexpr uint32_t kTxSoft = 96;            // a long operation commits what it has when it holds this many
@@ -475,6 +476,48 @@ Status BefsFileSystem::init() {
   block_ = allocate_view<uint8_t>(allocator_, device_block_size_);
   if (block_.empty()) return Status::OutOfMemory;
 
+  Status s = parse_super();
+  if (s != Status::Ok) return s;
+  scratch_ = allocate_view<uint8_t>(allocator_, uint64_t{block_size_} * 2);
+  if (scratch_.empty()) return Status::OutOfMemory;
+
+  // A volume that was not shut down cleanly: put the logged blocks where they belong first (that can change the root, even the super
+  // block). Without that the volume can be read only as it is.
+  bool replay_failed = false;
+  if (!storage.read_only && (volume_flags_ == kVolumeDirty || log_start_ != log_end_) && log_usable_ &&
+      (volume_flags_ == kVolumeDirty || volume_flags_ == kVolumeClean)) {
+    bool touched = false;
+    if (replay_log(&touched) != Status::Ok) {
+      replay_failed = true;
+    } else if (touched) {
+      s = parse_super();
+      if (s != Status::Ok) return s;
+    }
+  }
+
+  Inode root;
+  s = read_inode(root_block_, &root);
+  if (s != Status::Ok) return s;
+  if (!root.is_directory()) return Status::Corrupt;
+
+  // Writable only for a clean volume (nothing in the log) on a device that can be written, with a log and a bitmap we understand.
+  if (!storage.read_only && !replay_failed && volume_flags_ == kVolumeClean && log_start_ == log_end_ && log_usable_ && group_shift_ <= 16 &&
+      inode_size_ == block_size_) {
+    bitmap_per_group_ = static_cast<uint32_t>((((uint64_t{1} << group_shift_) + (uint64_t{block_size_} << 3) - 1)) / (uint64_t{block_size_} << 3));
+    if (bitmap_per_group_ == bitmap_groups_field_) {
+      bitmap_ = allocate_view<uint8_t>(allocator_, block_size_);
+      zeros_ = allocate_view<uint8_t>(allocator_, block_size_);
+      tx_ = allocate_view<TxBlock>(allocator_, kTxHard);
+      if (bitmap_.empty() || zeros_.empty() || tx_.empty()) return Status::OutOfMemory;
+      zeros_.fill(0);
+      writable_ = check_bitmap() == Status::Ok;
+    }
+  }
+  return Status::Ok;
+}
+
+// Reads and checks the super block.
+Status BefsFileSystem::parse_super() {
   uint8_t raw[kSuperSize];
   Status s = read_bytes(kSuperOffset, ByteView(raw));
   if (s != Status::Ok) return s;
@@ -490,15 +533,17 @@ Status BefsFileSystem::init() {
   used_blocks_ = in.le64();
   const uint32_t inode_size = in.le32();
   if (in.le32() != kSuperMagic2) return Status::Corrupt;
-  const uint32_t bitmap_per_group = in.le32();
+  bitmap_groups_field_ = in.le32();
   group_shift_ = in.le32();
   group_count_ = in.le32();
-  const uint32_t volume_flags = in.le32();
-  in.skip(8);  // the journal's blocks
-  const uint64_t log_start = in.le64(), log_end = in.le64();
-  if (in.le32() != kSuperMagic3) return Status::Corrupt;
+  volume_flags_ = in.le32();
   uint32_t group = 0;
   uint16_t start = 0, length = 0;
+  if (read_run(&in, &group, &start, &length) != Status::Ok) return Status::Corrupt;
+  const Run log_run{group, start, length};
+  log_start_ = in.le64();
+  log_end_ = in.le64();
+  if (in.le32() != kSuperMagic3) return Status::Corrupt;
   if (read_run(&in, &group, &start, &length) != Status::Ok) return Status::Corrupt;
   root_run_ = Run{group, start, length};
   if (block_size_ < 1024 || block_size_ > 8192 || block_shift_ > 13 || (1u << block_shift_) != block_size_) return Status::Corrupt;
@@ -508,32 +553,16 @@ Status BefsFileSystem::init() {
   if (group_shift_ > 40 || group_count_ == 0 || group_count_ > (1u << 20)) return Status::Corrupt;
   if (!run_to_block(root_run_, &root_block_)) return Status::Corrupt;
 
+  // The log is a ring of blocks; the positions are block numbers in it.
+  log_usable_ = run_to_block(log_run, &log_first_) && log_run.length >= kMinLogBlocks && log_start_ < log_run.length && log_end_ < log_run.length;
+  log_len_ = log_usable_ ? log_run.length : 0;
+
   FixedString<kMaxNameLength + 1> text;
   for (uint8_t c : name) {
     if (c == 0) break;
     text.push_back(static_cast<char>(c));
   }
   label_.assign(text.view().first(text.size() < label_.capacity() ? text.size() : label_.capacity()));
-
-  scratch_ = allocate_view<uint8_t>(allocator_, uint64_t{block_size_} * 2);
-  if (scratch_.empty()) return Status::OutOfMemory;
-  Inode root;
-  s = read_inode(root_block_, &root);
-  if (s != Status::Ok) return s;
-  if (!root.is_directory()) return Status::Corrupt;
-
-  // Writable only for a clean volume (nothing in the journal to replay) on a device that can be written, with a bitmap we understand.
-  if (!storage.read_only && volume_flags == kVolumeClean && log_start == log_end && group_shift_ <= 16 && inode_size == block_size_) {
-    bitmap_per_group_ = static_cast<uint32_t>((((uint64_t{1} << group_shift_) + (uint64_t{block_size_} << 3) - 1)) / (uint64_t{block_size_} << 3));
-    if (bitmap_per_group == bitmap_per_group_) {
-      bitmap_ = allocate_view<uint8_t>(allocator_, block_size_);
-      zeros_ = allocate_view<uint8_t>(allocator_, block_size_);
-      tx_ = allocate_view<TxBlock>(allocator_, kTxHard);
-      if (bitmap_.empty() || zeros_.empty() || tx_.empty()) return Status::OutOfMemory;
-      zeros_.fill(0);
-      writable_ = check_bitmap() == Status::Ok;
-    }
-  }
   return Status::Ok;
 }
 
@@ -1059,15 +1088,13 @@ Status BefsFileSystem::tx_zero(uint64_t block, uint32_t count) {
   return Status::Ok;
 }
 
-// Writes the changed blocks (and the used-blocks count of the super block) to the medium, lowest block first.
+// Commits the transaction through the journal (see the class comment): log entry, flush, super block dirty with the new end of the log
+// and used-blocks count, flush, the blocks in their places, flush, super block clean. Before the super block says so the entry is not
+// there for anyone, so a failure up to then just drops the transaction; after it the volume is left to the next mount's replay.
 Status BefsFileSystem::tx_commit() {
-  if (tx_count_ == 0 && used_blocks_ == tx_used_blocks_) return Status::Ok;
-  if (used_blocks_ != tx_used_blocks_) {
-    uint8_t raw[8];
-    ByteWriter out{ByteView(raw)};
-    out.le64(used_blocks_);
-    const Status s = tx_write(kSuperOffset + 56, ConstByteView(raw));
-    if (s != Status::Ok) return s;  // the caller drops the transaction
+  if (tx_count_ == 0) {
+    tx_used_blocks_ = used_blocks_;
+    return Status::Ok;
   }
   for (uint32_t i = 1; i < tx_count_; ++i) {  // insertion sort: there are few
     const TxBlock moved = tx_[i];
@@ -1075,21 +1102,148 @@ Status BefsFileSystem::tx_commit() {
     for (; j > 0 && tx_[j - 1].block > moved.block; --j) tx_[j] = tx_[j - 1];
     tx_[j] = moved;
   }
-  Status result = Status::Ok;
-  for (uint32_t i = 0; i < tx_count_ && result == Status::Ok; ++i) result = raw_write(tx_[i].block << block_shift_, ConstByteView(tx_[i].data));
-  if (result != Status::Ok) {
-    tx_rollback();
-    return result;
+  const uint32_t capacity = journal_capacity();
+  const uint64_t entry_blocks = tx_count_ + (tx_count_ + capacity - 1) / capacity;
+  if (entry_blocks >= log_len_) return Status::NoSpace;  // (the caller drops the transaction)
+  Status s = journal_write();
+  if (s == Status::Ok && !device_.flush()) s = Status::IoError;
+  if (s != Status::Ok) return s;
+  const uint64_t new_end = (log_end_ + entry_blocks) % log_len_;
+  s = write_super(kVolumeDirty, log_start_, new_end, &used_blocks_);
+  if (s == Status::Ok && !device_.flush()) s = Status::IoError;
+  if (s != Status::Ok) {
+    tx_abandon();
+    return s;
   }
+  log_end_ = new_end;
+  for (uint32_t i = 0; i < tx_count_ && s == Status::Ok; ++i) s = raw_write(tx_[i].block << block_shift_, ConstByteView(tx_[i].data));
+  if (s == Status::Ok && !device_.flush()) s = Status::IoError;
+  if (s == Status::Ok) s = write_super(kVolumeClean, new_end, new_end, nullptr);
+  if (s != Status::Ok) {
+    tx_abandon();
+    return s;
+  }
+  log_start_ = new_end;
   for (uint32_t i = 0; i < tx_count_; ++i) release_view(allocator_, tx_[i].data);
   tx_count_ = 0;
   tx_used_blocks_ = used_blocks_;
   return Status::Ok;
 }
 
+// After a failure once the log said the transaction was there: nothing more is written to this volume until it is mounted again (and
+// its log replayed).
+void BefsFileSystem::tx_abandon() {
+  for (uint32_t i = 0; i < tx_count_; ++i) release_view(allocator_, tx_[i].data);
+  tx_count_ = 0;
+  writable_ = false;
+}
+
+uint32_t BefsFileSystem::journal_capacity() const {
+  const uint32_t fit = (block_size_ - 8) / 8;  // (Be's file system also stops at 127)
+  return fit < 127 ? fit : 127;
+}
+
+// Writes the transaction's blocks to the log at log_end_ as arrays of runs, each followed by the blocks it names.
+Status BefsFileSystem::journal_write() {
+  const uint32_t capacity = journal_capacity();
+  const ByteView array = scratch_.first(block_size_);
+  uint64_t position = log_end_;
+  for (uint32_t done = 0; done < tx_count_;) {
+    const uint32_t n = tx_count_ - done < capacity ? tx_count_ - done : capacity;
+    array.fill(0);
+    ByteWriter out{array};
+    out.le32(n);
+    out.le32(capacity + 1);  // (Be's file system stores the maximum plus one)
+    for (uint32_t i = 0; i < n; ++i) {
+      Run run;
+      if (!block_to_run(tx_[done + i].block, &run)) return Status::Corrupt;
+      uint8_t raw[8];
+      encode_run(run, raw);
+      out.bytes(ConstByteView(raw));
+    }
+    if (!out.ok()) return Status::Corrupt;
+    Status s = raw_write((log_first_ + position) << block_shift_, ConstByteView(array));
+    position = (position + 1) % log_len_;
+    for (uint32_t i = 0; i < n && s == Status::Ok; ++i) {
+      s = raw_write((log_first_ + position) << block_shift_, ConstByteView(tx_[done + i].data));
+      position = (position + 1) % log_len_;
+    }
+    if (s != Status::Ok) return s;
+    done += n;
+  }
+  return Status::Ok;
+}
+
+// Changes the fields of the super block that the journal and the used-blocks count live in (all in one sector).
+Status BefsFileSystem::write_super(uint32_t flags, uint64_t log_start, uint64_t log_end, const uint64_t* used_blocks) {
+  uint8_t raw[56];  // bytes 56 to 111 of the super block
+  Status s = raw_read(kSuperOffset + 56, ByteView(raw));
+  if (s != Status::Ok) return s;
+  if (used_blocks) {
+    ByteWriter w{ByteView(raw).subview(0, 8)};
+    w.le64(*used_blocks);
+  }
+  ByteWriter f{ByteView(raw).subview(28, 4)};  // flags at 84
+  f.le32(flags);
+  ByteWriter a{ByteView(raw).subview(40, 8)};  // log_start at 96
+  a.le64(log_start);
+  ByteWriter b{ByteView(raw).subview(48, 8)};  // log_end at 104
+  b.le64(log_end);
+  return raw_write(kSuperOffset + 56, ConstByteView(raw));
+}
+
+// Puts the blocks in the log where they belong, then marks the volume clean. The log is checked as Be's file system does: the arrays
+// have to be well formed and everything must lie inside the volume, and a block 0 that is written has to be a super block.
+Status BefsFileSystem::replay_log(bool* super_touched) {
+  *super_touched = false;
+  const uint32_t capacity = journal_capacity();
+  Owned array(allocator_, block_size_);
+  Owned blocks(allocator_, uint64_t{capacity} * block_size_);
+  if (!array.ok() || !blocks.ok()) return Status::OutOfMemory;
+  uint64_t position = log_start_;
+  for (uint64_t guard = 0; position != log_end_; ++guard) {
+    if (guard > log_len_) return Status::Corrupt;
+    Status s = raw_read((log_first_ + position) << block_shift_, array.view());
+    if (s != Status::Ok) return s;
+    ByteReader in{ConstByteView(array.view())};
+    const uint32_t count = in.le32(), maximum = in.le32();
+    if (count == 0 || count > capacity || maximum != capacity + 1) return Status::Corrupt;
+    if (1 + uint64_t{count} > (log_end_ + log_len_ - position) % log_len_) return Status::Corrupt;  // (it must end before log_end)
+    uint64_t targets[127];
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t group = 0;
+      uint16_t start = 0, length = 0;
+      if (read_run(&in, &group, &start, &length) != Status::Ok || length != 1 || !run_to_block(Run{group, start, length}, &targets[i]))
+        return Status::Corrupt;
+    }
+    for (uint32_t i = 0; i < count; ++i) {  // first read and check everything, then write
+      const ByteView block = blocks.view().subview(uint64_t{i} * block_size_, block_size_);
+      s = raw_read((log_first_ + (position + 1 + i) % log_len_) << block_shift_, block);
+      if (s != Status::Ok) return s;
+      uint64_t m1 = 0, m2 = 0, m3 = 0;
+      if (targets[i] == 0 && (!field(ConstByteView(block), kSuperOffset + 32, 4, &m1) || !field(ConstByteView(block), kSuperOffset + 68, 4, &m2) ||
+                              !field(ConstByteView(block), kSuperOffset + 112, 4, &m3) || m1 != kSuperMagic1 || m2 != kSuperMagic2 || m3 != kSuperMagic3))
+        return Status::Corrupt;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      s = raw_write(targets[i] << block_shift_, ConstByteView(blocks.view().subview(uint64_t{i} * block_size_, block_size_)));
+      if (s != Status::Ok) return s;
+      if (targets[i] == 0) *super_touched = true;
+    }
+    position = (position + 1 + count) % log_len_;
+  }
+  if (!device_.flush()) return Status::IoError;
+  Status s = write_super(kVolumeClean, log_end_, log_end_, nullptr);
+  if (s == Status::Ok && !device_.flush()) s = Status::IoError;
+  if (s != Status::Ok) return s;
+  log_start_ = log_end_;
+  volume_flags_ = kVolumeClean;
+  return Status::Ok;
+}
+
 // Drops everything the transaction changed.
 void BefsFileSystem::tx_rollback() {
-  if (!writable_) return;
+  if (tx_.empty()) return;
   for (uint32_t i = 0; i < tx_count_; ++i) release_view(allocator_, tx_[i].data);
   tx_count_ = 0;
   used_blocks_ = tx_used_blocks_;
@@ -1132,6 +1286,15 @@ Status BefsFileSystem::check_bitmap() {
   const uint64_t reserved = 1 + uint64_t{last_group} * bitmap_per_group_ + (group_bits(last_group) + block_bits - 1) / block_bits;
   if (reserved >= block_count_) return Status::Corrupt;
   for (uint64_t block = 0; block < reserved; ++block) {
+    const uint32_t group = static_cast<uint32_t>(block >> group_shift_);
+    const uint32_t bit = static_cast<uint32_t>(block & ((uint64_t{1} << group_shift_) - 1));
+    const Status s = load_bitmap(1 + uint64_t{group} * bitmap_per_group_ + bit / block_bits);
+    if (s != Status::Ok) return s;
+    const uint32_t in_block = bit % block_bits;
+    if (!(bitmap_[in_block >> 3] & (1u << (in_block & 7)))) return Status::Corrupt;
+  }
+  // The log must be marked used too, or its blocks could be handed out for something else.
+  for (uint64_t block = log_first_; block < log_first_ + log_len_; ++block) {
     const uint32_t group = static_cast<uint32_t>(block >> group_shift_);
     const uint32_t bit = static_cast<uint32_t>(block & ((uint64_t{1} << group_shift_) - 1));
     const Status s = load_bitmap(1 + uint64_t{group} * bitmap_per_group_ + bit / block_bits);
@@ -2104,6 +2267,22 @@ Status BefsFileSystem::remove(StringView path) {
     s = directory_empty(node, &empty);
     if (s != Status::Ok) return s;
     if (!empty) return Status::NotEmpty;
+  }
+  if (node.is_directory()) {
+    // A directory goes in one piece, tree and name together, so that no crash can leave a name that leads to a directory without a tree.
+    // (If its tree is too big for one transaction the steps below take over.)
+    {
+      AtomicScope atomic(&atomic_);
+      tx_begin();
+      Inode gone = node;
+      gone.size = 0;
+      s = shrink_stream(&gone, 0);
+      if (s == Status::Ok) s = remove_body(&parent, leaf, block);
+      if (s == Status::Ok) s = tx_commit();
+      if (s == Status::Ok) return s;
+      tx_rollback();
+      if (s != Status::NoSpace) return s;
+    }
   }
   if (!node.inline_link && (node.size != 0 || node.max_direct != 0)) {  // give the data back first, in steps
     tx_begin();
