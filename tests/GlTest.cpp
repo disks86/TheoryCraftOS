@@ -496,6 +496,7 @@ static void test_compressed() {
   CHECK(a.live == 0);
 }
 
+#include "GlAstcHdrVectors.inc"
 #include "GlCompressedVectors.inc"
 
 // BC7, BC6H and ASTC blocks against the output of a reference decoder, then truncated and bit-flipped data.
@@ -522,7 +523,7 @@ static void test_bptc_astc() {
         read_texel(img, i % cf->bw, i / cf->bw, 0, r);
         for (int k = 0; k < (cf->codec == Codec::Bc6U ? 3 : 4); ++k) {
           int got;
-          if (cf->codec == Codec::Bc6U) {
+          if (cf->codec == Codec::Bc6U || (cf->codec == Codec::Astc && !cf->srgb)) {
             float f;
             memcpy(&f, &r[k], 4);
             got = static_cast<int>(f < 0 ? 0 : f > 1 ? 255 : f * 255 + 0.5f);
@@ -581,8 +582,7 @@ static void test_bptc_astc() {
     gl.bind_framebuffer(0x8D40, fbo);
     gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, tex, 0, 0);
     uint8_t block[16] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
-    block[8] = 0x11; block[9] = 0xff; block[10] = 0x22; block[11] = 0xff; block[12] = 0x33; block[13] = 0xff;   // the 16-bit colour, high bytes at 9, 11, 13, 15
-    block[14] = 0x44; block[15] = 0xff;
+    for (int i = 8; i < 16; ++i) block[i] = 0xff;   // the colour: four 16-bit values
     gl.compressed_tex_image(0x0DE1, 0, 0x93B4, 6, 6, 1, 0, ConstByteView(block, 16), false);
     CHECK(gl.get_error() == 0);
     uint8_t px[4];
@@ -596,7 +596,68 @@ static void test_bptc_astc() {
   CHECK(a.live == 0);
 }
 
+// ASTC blocks of the linear formats against astcenc's HDR profile: exact float results (HDR endpoint modes, constant half-float blocks, LDR blocks decoded as 16 bit).
+static void test_astc_hdr() {
+  TestAllocator a;
+  {
+    size_t o = 0;
+    int checked = 0, hdr_texels = 0;
+    while (o < sizeof(kAstcHdrVectors)) {
+      const uint32_t fmt = kAstcHdrVectors[o] | (kAstcHdrVectors[o + 1] << 8) | (kAstcHdrVectors[o + 2] << 16) | (uint32_t{kAstcHdrVectors[o + 3]} << 24);
+      const CompressedFormat* cf = find_compressed(fmt);
+      CHECK(cf != nullptr);
+      if (!cf) break;
+      const uint8_t* block = kAstcHdrVectors + o + 4;
+      const uint32_t n = uint32_t{cf->bw} * cf->bh;
+      const uint8_t* want = block + 16;
+      o += 4 + 16 + n * 16;
+      Image img(a);
+      CHECK(img.allocate(find_format(cf->decoded), cf->bw, cf->bh, 1));
+      CHECK(decode_compressed(*cf, ConstByteView(block, 16), cf->bw, cf->bh, 1, &img, 0, 0, 0));
+      bool same = true;
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t r[4];
+        read_texel(img, i % cf->bw, i / cf->bw, 0, r);
+        for (int k = 0; k < 4; ++k) {
+          uint32_t w;
+          memcpy(&w, want + (i * 4 + k) * 4, 4);
+          float wf, gf;
+          memcpy(&wf, &w, 4);
+          memcpy(&gf, &r[k], 4);
+          if (wf > 1.0001f) ++hdr_texels;
+          if (wf != wf ? gf == gf : (w != r[k])) same = false;
+        }
+      }
+      if (!same) printf("  hdr mismatch: format %x\n", fmt);
+      CHECK(same);
+      ++checked;
+    }
+    CHECK(checked == 29 && hdr_texels > 100);
+    // an HDR constant block whose colours are half floats, and a bad void extent / too few bits for the endpoints
+    const CompressedFormat* f = find_compressed(0x93B0);
+    Image img(a);
+    CHECK(img.allocate(find_format(f->decoded), 4, 4, 1));
+    uint8_t blk[16] = {0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x3c, 0x00, 0x40, 0x00, 0x44, 0x00, 0x38};   // 1, 2, 4, 0.5 as halves
+    CHECK(decode_compressed(*f, ConstByteView(blk, 16), 4, 4, 1, &img, 0, 0, 0));
+    uint32_t px[4];
+    read_texel(img, 3, 3, 0, px);
+    float c[4];
+    memcpy(c, px, 16);
+    CHECK(c[0] == 1.0f && c[1] == 2.0f && c[2] == 4.0f && c[3] == 0.5f);
+    blk[1] = 0xf3;   // reserved bits of a void extent: the block is an error (magenta)
+    CHECK(decode_compressed(*f, ConstByteView(blk, 16), 4, 4, 1, &img, 0, 0, 0));
+    read_texel(img, 0, 0, 0, px);
+    memcpy(c, px, 16);
+    CHECK(c[0] == 1.0f && c[1] == 0.0f && c[2] == 1.0f && c[3] == 1.0f);
+    // the sRGB formats stay LDR: an HDR block is an error
+    const CompressedFormat* s = find_compressed(0x93D0);
+    CHECK(s && s->decoded == 0x8C43);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_astc_hdr();
   test_bptc_astc();
   test_compressed();
   test_wide_lines();

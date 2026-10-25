@@ -302,14 +302,15 @@ static void test_compressed() {
     webgl::read_texel(*dev.texture(other)->mips[0], 5, 4, 0, px); CHECK(px[2] == 255);
     CHECK(!dev.copy_texture_to_texture(src, ImageCopy{at, 0, 0, 0, 0, 0}, 4, 4, 1));   // formats differ
     // ASTC 6x6: a void-extent block, 12 x 6 texels = two blocks, the second one with another colour
-    uint8_t ab[32] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff};
+    uint8_t ab[32] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};   // (the colour is four 16 bit values, decoded to floats)
     memcpy(ab + 16, ab, 16);
-    ab[16 + 9] = 0x00; ab[16 + 11] = 0xff;
+    ab[16 + 8] = 0x00; ab[16 + 9] = 0x00; ab[16 + 10] = 0xff; ab[16 + 11] = 0xff;
     ImageCopy ad;
     ad.texture = at;
     CHECK(dev.write_texture(ad, ConstByteView(ab, 32), BufferLayout(), 12, 6, 1));
-    webgl::read_texel(*dev.texture(at)->mips[0], 3, 3, 0, px); CHECK(px[0] == 255 && px[1] == 0 && px[3] == 255);
-    webgl::read_texel(*dev.texture(at)->mips[0], 9, 3, 0, px); CHECK(px[0] == 0 && px[1] == 255);
+    auto fl = [](uint32_t u) { return __builtin_bit_cast(float, u); };
+    webgl::read_texel(*dev.texture(at)->mips[0], 3, 3, 0, px); CHECK(fl(px[0]) == 1.0f && fl(px[1]) == 0.0f && fl(px[3]) == 1.0f);
+    webgl::read_texel(*dev.texture(at)->mips[0], 9, 3, 0, px); CHECK(fl(px[0]) == 0.0f && fl(px[1]) == 1.0f);
     // ETC2 (an individual block: red 255 and +2 on every channel) and EAC (base 128, multiplier 0 counts as 1, selector 0 is -3: (128 * 8 + 4 - 3) / 2047)
     const FormatDesc* etc = find_format("etc2-rgb8unorm");
     const FormatDesc* eacr = find_format("eac-r11unorm");

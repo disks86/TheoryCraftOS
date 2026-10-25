@@ -32,11 +32,11 @@ const CompressedFormat kFormats[] = {
     {0x9278, 16, Codec::Etc2Rgba, 0x8058}, {0x9279, 16, Codec::Etc2Rgba, 0x8C43},
     {0x9270, 8, Codec::EacR, 0x822E}, {0x9271, 8, Codec::EacRs, 0x822E}, {0x9272, 16, Codec::EacRg, 0x8230}, {0x9273, 16, Codec::EacRgs, 0x8230},
     {0x8E8C, 16, Codec::Bc7, 0x8058}, {0x8E8D, 16, Codec::Bc7, 0x8C43}, {0x8E8E, 16, Codec::Bc6S, 0x8814}, {0x8E8F, 16, Codec::Bc6U, 0x8814},
-    // ASTC (LDR profile): 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12, linear then sRGB
-    {0x93B0, 16, Codec::Astc, 0x8058, 4, 4}, {0x93B1, 16, Codec::Astc, 0x8058, 5, 4}, {0x93B2, 16, Codec::Astc, 0x8058, 5, 5}, {0x93B3, 16, Codec::Astc, 0x8058, 6, 5},
-    {0x93B4, 16, Codec::Astc, 0x8058, 6, 6}, {0x93B5, 16, Codec::Astc, 0x8058, 8, 5}, {0x93B6, 16, Codec::Astc, 0x8058, 8, 6}, {0x93B7, 16, Codec::Astc, 0x8058, 8, 8},
-    {0x93B8, 16, Codec::Astc, 0x8058, 10, 5}, {0x93B9, 16, Codec::Astc, 0x8058, 10, 6}, {0x93BA, 16, Codec::Astc, 0x8058, 10, 8}, {0x93BB, 16, Codec::Astc, 0x8058, 10, 10},
-    {0x93BC, 16, Codec::Astc, 0x8058, 12, 10}, {0x93BD, 16, Codec::Astc, 0x8058, 12, 12},
+    // ASTC (LDR and HDR profiles: the linear formats decode to float, the sRGB ones are LDR only): 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12, linear then sRGB
+    {0x93B0, 16, Codec::Astc, 0x8814, 4, 4}, {0x93B1, 16, Codec::Astc, 0x8814, 5, 4}, {0x93B2, 16, Codec::Astc, 0x8814, 5, 5}, {0x93B3, 16, Codec::Astc, 0x8814, 6, 5},
+    {0x93B4, 16, Codec::Astc, 0x8814, 6, 6}, {0x93B5, 16, Codec::Astc, 0x8814, 8, 5}, {0x93B6, 16, Codec::Astc, 0x8814, 8, 6}, {0x93B7, 16, Codec::Astc, 0x8814, 8, 8},
+    {0x93B8, 16, Codec::Astc, 0x8814, 10, 5}, {0x93B9, 16, Codec::Astc, 0x8814, 10, 6}, {0x93BA, 16, Codec::Astc, 0x8814, 10, 8}, {0x93BB, 16, Codec::Astc, 0x8814, 10, 10},
+    {0x93BC, 16, Codec::Astc, 0x8814, 12, 10}, {0x93BD, 16, Codec::Astc, 0x8814, 12, 12},
     {0x93D0, 16, Codec::Astc, 0x8C43, 4, 4, true}, {0x93D1, 16, Codec::Astc, 0x8C43, 5, 4, true}, {0x93D2, 16, Codec::Astc, 0x8C43, 5, 5, true}, {0x93D3, 16, Codec::Astc, 0x8C43, 6, 5, true},
     {0x93D4, 16, Codec::Astc, 0x8C43, 6, 6, true}, {0x93D5, 16, Codec::Astc, 0x8C43, 8, 5, true}, {0x93D6, 16, Codec::Astc, 0x8C43, 8, 6, true}, {0x93D7, 16, Codec::Astc, 0x8C43, 8, 8, true},
     {0x93D8, 16, Codec::Astc, 0x8C43, 10, 5, true}, {0x93D9, 16, Codec::Astc, 0x8C43, 10, 6, true}, {0x93DA, 16, Codec::Astc, 0x8C43, 10, 8, true}, {0x93DB, 16, Codec::Astc, 0x8C43, 10, 10, true},
@@ -551,13 +551,182 @@ void bit_transfer(int* a, int* b) {
   if (*a & 0x20) *a -= 0x40;
 }
 
-// Decodes one ASTC block into RGBA bytes. Returns false for an invalid block (the caller shows magenta) and sets *hdr for blocks that need the HDR profile.
-bool astc_block(const uint8_t* buf, int bw, int bh, bool srgb, Rgba* out, bool* hdr) {
+
+// --- ASTC HDR --------------------------------------------------------------------------------------------------------------------------------------
+
+float half_to_f32(uint32_t h) {
+  const uint32_t e = (h >> 10) & 31, m = h & 1023;
+  float v;
+  if (e == 0) v = static_cast<float>(m) / 16777216.0f;   // m * 2^-24
+  else if (e == 31) v = m ? __builtin_bit_cast(float, 0x7FC00000u) : __builtin_bit_cast(float, 0x7F800000u);
+  else v = (1.0f + static_cast<float>(m) / 1024.0f) * (e >= 15 ? static_cast<float>(1u << (e - 15)) : 1.0f / static_cast<float>(1u << (15 - e)));
+  return (h & 0x8000) ? -v : v;
+}
+
+// A 16 bit unorm value as a half float (the way the reference decoder rounds it), and a 16 bit "LNS" value (a log-like format) as a half.
+uint32_t unorm16_to_half(uint32_t p) {
+  if (p == 0xFFFF) return 0x3C00;
+  if (p < 4) return p << 8;
+  int lz = 0;
+  while (!((p << lz) & 0x8000)) ++lz;   // leading zeros of the 16 bit value
+  p = (p << (lz + 1)) & 0xFFFF;
+  p >>= 6;
+  return p | ((14 - lz) << 10);
+}
+
+uint32_t lns_to_half(uint32_t p) {
+  const uint32_t mc = p & 0x7FF, ec = p >> 11;
+  const uint32_t mt = mc < 512 ? mc * 3 : (mc < 1536 ? mc * 4 - 512 : mc * 5 - 2048);
+  const uint32_t r = (ec << 10) | (mt >> 3);
+  return r > 0x7BFF ? 0x7BFF : r;
+}
+
+// The HDR colour endpoint modes: `v` are the unquantized (0..255) values, the endpoints come out as 16 bit values, 4 lanes each.
+void hdr_rgbo(const int* v, int e0[4], int e1[4]) {
+  const int modeval = ((v[0] & 0xC0) >> 6) | (((v[1] & 0x80) >> 7) << 2) | (((v[2] & 0x80) >> 7) << 3);
+  int majcomp, mode;
+  if ((modeval & 0xC) != 0xC) { majcomp = modeval >> 2; mode = modeval & 3; }
+  else if (modeval != 0xF) { majcomp = modeval & 3; mode = 4; }
+  else { majcomp = 0; mode = 5; }
+  int red = v[0] & 0x3F, green = v[1] & 0x1F, blue = v[2] & 0x1F, scale = v[3] & 0x1F;
+  const int bit0 = (v[1] >> 6) & 1, bit1 = (v[1] >> 5) & 1, bit2 = (v[2] >> 6) & 1, bit3 = (v[2] >> 5) & 1, bit4 = (v[3] >> 7) & 1, bit5 = (v[3] >> 6) & 1, bit6 = (v[3] >> 5) & 1;
+  const int oh = 1 << mode;
+  if (oh & 0x30) green |= bit0 << 6;
+  if (oh & 0x3A) green |= bit1 << 5;
+  if (oh & 0x30) blue |= bit2 << 6;
+  if (oh & 0x3A) blue |= bit3 << 5;
+  if (oh & 0x3D) scale |= bit6 << 5;
+  if (oh & 0x2D) scale |= bit5 << 6;
+  if (oh & 0x04) scale |= bit4 << 7;
+  if (oh & 0x3B) red |= bit4 << 6;
+  if (oh & 0x04) red |= bit3 << 6;
+  if (oh & 0x10) red |= bit5 << 7;
+  if (oh & 0x0F) red |= bit2 << 7;
+  if (oh & 0x05) red |= bit1 << 8;
+  if (oh & 0x0A) red |= bit0 << 8;
+  if (oh & 0x05) red |= bit0 << 9;
+  if (oh & 0x02) red |= bit6 << 9;
+  if (oh & 0x01) red |= bit3 << 10;
+  if (oh & 0x02) red |= bit5 << 10;
+  static const int kShift[6] = {1, 1, 2, 3, 4, 5};
+  const int sh = kShift[mode];
+  red <<= sh; green <<= sh; blue <<= sh; scale <<= sh;
+  if (mode != 5) { green = red - green; blue = red - blue; }
+  if (majcomp == 1) { const int t = red; red = green; green = t; }
+  if (majcomp == 2) { const int t = red; red = blue; blue = t; }
+  int r0 = red - scale, g0 = green - scale, b0 = blue - scale;
+  if (red < 0) red = 0;
+  if (green < 0) green = 0;
+  if (blue < 0) blue = 0;
+  if (r0 < 0) r0 = 0;
+  if (g0 < 0) g0 = 0;
+  if (b0 < 0) b0 = 0;
+  e0[0] = r0 << 4; e0[1] = g0 << 4; e0[2] = b0 << 4;
+  e1[0] = red << 4; e1[1] = green << 4; e1[2] = blue << 4;
+}
+
+void hdr_rgb(const int* v, int e0[4], int e1[4]) {
+  const int modeval = ((v[1] & 0x80) >> 7) | (((v[2] & 0x80) >> 7) << 1) | (((v[3] & 0x80) >> 7) << 2);
+  const int majcomp = ((v[4] & 0x80) >> 7) | (((v[5] & 0x80) >> 7) << 1);
+  if (majcomp == 3) {
+    e0[0] = v[0] << 8; e0[1] = v[2] << 8; e0[2] = (v[4] & 0x7F) << 9;
+    e1[0] = v[1] << 8; e1[1] = v[3] << 8; e1[2] = (v[5] & 0x7F) << 9;
+    return;
+  }
+  int a = v[0] | ((v[1] & 0x40) << 2), b0 = v[2] & 0x3f, b1 = v[3] & 0x3f, c = v[1] & 0x3f, d0 = v[4] & 0x7f, d1 = v[5] & 0x7f;
+  static const int kDBits[8] = {7, 6, 7, 6, 5, 6, 5, 6};
+  const int dbits = kDBits[modeval];
+  const int bit0 = (v[2] >> 6) & 1, bit1 = (v[3] >> 6) & 1, bit2 = (v[4] >> 6) & 1, bit3 = (v[5] >> 6) & 1, bit4 = (v[4] >> 5) & 1, bit5 = (v[5] >> 5) & 1;
+  const int oh = 1 << modeval;
+  if (oh & 0xA4) a |= bit0 << 9;
+  if (oh & 0x8) a |= bit2 << 9;
+  if (oh & 0x50) a |= bit4 << 9;
+  if (oh & 0x50) a |= bit5 << 10;
+  if (oh & 0xA0) a |= bit1 << 10;
+  if (oh & 0xC0) a |= bit2 << 11;
+  if (oh & 0x4) c |= bit1 << 6;
+  if (oh & 0xE8) c |= bit3 << 6;
+  if (oh & 0x20) c |= bit2 << 7;
+  if (oh & 0x5B) { b0 |= bit0 << 6; b1 |= bit1 << 6; }
+  if (oh & 0x12) { b0 |= bit2 << 7; b1 |= bit3 << 7; }
+  if (oh & 0xAF) { d0 |= bit4 << 5; d1 |= bit5 << 5; }
+  if (oh & 0x5) { d0 |= bit2 << 6; d1 |= bit3 << 6; }
+  const int sx = 32 - dbits;   // sign extend d0 and d1 from `dbits` bits
+  d0 = static_cast<int>(static_cast<uint32_t>(d0) << sx) >> sx;
+  d1 = static_cast<int>(static_cast<uint32_t>(d1) << sx) >> sx;
+  const int up = (modeval >> 1) ^ 3;
+  a <<= up; b0 <<= up; b1 <<= up; c <<= up; d0 <<= up; d1 <<= up;
+  int r1 = a, g1 = a - b0, bl1 = a - b1, r0 = a - c, g0 = a - b0 - c - d0, bl0 = a - b1 - c - d1;
+  auto cl = [](int x) { return x < 0 ? 0 : (x > 4095 ? 4095 : x); };
+  r0 = cl(r0); g0 = cl(g0); bl0 = cl(bl0); r1 = cl(r1); g1 = cl(g1); bl1 = cl(bl1);
+  if (majcomp == 1) { int t = r0; r0 = g0; g0 = t; t = r1; r1 = g1; g1 = t; }
+  if (majcomp == 2) { int t = r0; r0 = bl0; bl0 = t; t = r1; r1 = bl1; bl1 = t; }
+  e0[0] = r0 << 4; e0[1] = g0 << 4; e0[2] = bl0 << 4;
+  e1[0] = r1 << 4; e1[1] = g1 << 4; e1[2] = bl1 << 4;
+}
+
+void hdr_luminance_small(const int* v, int e0[4], int e1[4]) {
+  int y0, y1;
+  if (v[0] & 0x80) { y0 = ((v[1] & 0xE0) << 4) | ((v[0] & 0x7F) << 2); y1 = (v[1] & 0x1F) << 2; }
+  else { y0 = ((v[1] & 0xF0) << 4) | ((v[0] & 0x7F) << 1); y1 = (v[1] & 0xF) << 1; }
+  y1 += y0;
+  if (y1 > 0xFFF) y1 = 0xFFF;
+  for (int k = 0; k < 3; ++k) { e0[k] = y0 << 4; e1[k] = y1 << 4; }
+}
+
+void hdr_luminance_large(const int* v, int e0[4], int e1[4]) {
+  int y0, y1;
+  if (v[1] >= v[0]) { y0 = v[0] << 4; y1 = v[1] << 4; }
+  else { y0 = (v[1] << 4) + 8; y1 = (v[0] << 4) - 8; }
+  for (int k = 0; k < 3; ++k) { e0[k] = y0 << 4; e1[k] = y1 << 4; }
+}
+
+void hdr_alpha(const int* v, int* a0, int* a1) {
+  int v6 = v[0], v7 = v[1];
+  const int selector = ((v6 >> 7) & 1) | ((v7 >> 6) & 2);
+  v6 &= 0x7F;
+  v7 &= 0x7F;
+  if (selector == 3) {
+    *a0 = v6 << 5;
+    *a1 = v7 << 5;
+  } else {
+    v6 |= (v7 << (selector + 1)) & 0x780;
+    v7 &= (0x3f >> selector);
+    v7 ^= 32 >> selector;
+    v7 -= 32 >> selector;
+    v6 <<= (4 - selector);
+    v7 <<= (4 - selector);
+    v7 += v6;
+    if (v7 < 0) v7 = 0; else if (v7 > 0xFFF) v7 = 0xFFF;
+    *a0 = v6;
+    *a1 = v7;
+  }
+  *a0 <<= 4;
+  *a1 <<= 4;
+}
+
+// Decodes one ASTC block into RGBA bytes, or (outf non-null, linear formats) into floats with the HDR profile. Returns false for an invalid block (the caller shows
+// magenta); without outf a block that needs the HDR profile sets *hdr and is invalid.
+bool astc_block(const uint8_t* buf, int bw, int bh, bool srgb, Rgba* out, bool* hdr, float* outf = nullptr) {
   *hdr = false;
   const int nt = bw * bh;
   auto u16 = [&](int i) { return buf[i] | (buf[i + 1] << 8); };
   // void extent: one colour
   if (buf[0] == 0xfc && (buf[1] & 1) == 1) {
+    uint64_t lo = 0;
+    for (int i = 0; i < 8; ++i) lo |= uint64_t{buf[i]} << (8 * i);
+    const uint32_t xl = (lo >> 12) & 0x1FFF, xh = (lo >> 25) & 0x1FFF, yl = (lo >> 38) & 0x1FFF, yh = (lo >> 51) & 0x1FFF;
+    const bool all_ones = xl == 0x1FFF && xh == 0x1FFF && yl == 0x1FFF && yh == 0x1FFF;
+    if (((buf[1] >> 2) & 3) != 3 || ((xl >= xh || yl >= yh) && !all_ones)) return false;   // the reserved bits and the extent must be valid
+    if (outf) {
+      float c[4];
+      for (int k = 0; k < 4; ++k) {
+        const uint32_t v = static_cast<uint32_t>(buf[8 + 2 * k] | (buf[9 + 2 * k] << 8));
+        c[k] = (buf[1] & 2) ? ((v & 0x8000) ? __builtin_bit_cast(float, 0x7FC00000u) : half_to_f32(v)) : half_to_f32(unorm16_to_half(v));   // (a negative half is not a colour)
+      }
+      for (int i = 0; i < nt; ++i) for (int k = 0; k < 4; ++k) outf[i * 4 + k] = c[k];
+      return true;
+    }
     if (buf[1] & 2) { *hdr = true; return false; }
     Rgba c;
     for (int k = 0; k < 4; ++k) c.c[k] = buf[9 + 2 * k];
@@ -641,8 +810,8 @@ bool astc_block(const uint8_t* buf, int bw, int bh, bool srgb, Rgba* out, bool* 
   int cem_range = -1;
   for (int i = 0; i < 19; ++i)
     if (ise_bits(nvalues, kCemA[i], kCemB[i]) <= remain) { cem_range = i; break; }
-  if (cem_range < 0) return false;
-  if (*hdr) return false;
+  if (cem_range < 0 || cem_range > 16) return false;   // fewer than 6 levels for the colour values is not allowed
+  if (*hdr && !outf) return false;
   // colour values
   IseValue seq[32];
   decode_ise(buf, parts == 1 ? 17 : 29, kCemA[cem_range], kCemB[cem_range], nvalues, seq);
@@ -690,11 +859,13 @@ bool astc_block(const uint8_t* buf, int bw, int bh, bool srgb, Rgba* out, bool* 
     }
   }
   int ends[4][8];
+  int ends16[4][8] = {};      // the endpoints as 16 bit values (float decoding)
+  bool lns[4][2] = {};       // whether the colour / alpha lanes of a partition are HDR (LNS)
   const int* v = ev;
   auto set = [&](int p, int r1, int g1, int b1, int a1, int r2, int g2, int b2, int a2, bool clamp, bool blue) {
     if (blue) { r1 = (r1 + b1) >> 1; g1 = (g1 + b1) >> 1; r2 = (r2 + b2) >> 1; g2 = (g2 + b2) >> 1; }
     const int e[8] = {r1, g1, b1, a1, r2, g2, b2, a2};
-    for (int k = 0; k < 8; ++k) ends[p][k] = clamp ? clamp255(e[k]) : e[k];
+    for (int k = 0; k < 8; ++k) { ends[p][k] = clamp ? clamp255(e[k]) : e[k]; ends16[p][k] = ends[p][k] * 257; }
   };
   for (int p = 0; p < parts; v += ((cem[p] / 4) + 1) * 2, ++p) {
     int t[8];
@@ -734,6 +905,21 @@ bool astc_block(const uint8_t* buf, int bw, int bh, bool srgb, Rgba* out, bool* 
         if (t[1] + t[3] + t[5] >= 0) set(p, t[0], t[2], t[4], t[6], t[0] + t[1], t[2] + t[3], t[4] + t[5], t[6] + t[7], true, false);
         else set(p, t[0] + t[1], t[2] + t[3], t[4] + t[5], t[6] + t[7], t[0], t[2], t[4], t[6], true, true);
         break;
+      case 2: case 3: case 7: case 11: case 14: case 15: {
+        if (!outf) return false;
+        int e0[4] = {0, 0, 0, 0x7800}, e1[4] = {0, 0, 0, 0x7800};
+        lns[p][0] = lns[p][1] = true;
+        switch (cem[p]) {
+          case 2: hdr_luminance_large(t, e0, e1); break;
+          case 3: hdr_luminance_small(t, e0, e1); break;
+          case 7: hdr_rgbo(t, e0, e1); break;
+          case 11: hdr_rgb(t, e0, e1); break;
+          case 14: hdr_rgb(t, e0, e1); e0[3] = t[6] * 257; e1[3] = t[7] * 257; lns[p][1] = false; break;
+          default: hdr_rgb(t, e0, e1); hdr_alpha(t + 6, &e0[3], &e1[3]); break;
+        }
+        for (int k = 0; k < 4; ++k) { ends16[p][k] = e0[k]; ends16[p][4 + k] = e1[k]; }
+        break;
+      }
       default: return false;
     }
   }
@@ -835,6 +1021,11 @@ bool astc_block(const uint8_t* buf, int bw, int bh, bool srgb, Rgba* out, bool* 
     const int p = part[i];
     for (int k = 0; k < 4; ++k) {
       const int w = weights[i][dual ? ps[k] : 0];
+      if (outf) {
+        const int c = (ends16[p][k] * (64 - w) + ends16[p][4 + k] * w + 32) >> 6;
+        outf[i * 4 + k] = half_to_f32(lns[p][k == 3] ? lns_to_half(static_cast<uint32_t>(c)) : unorm16_to_half(static_cast<uint32_t>(c)));
+        continue;
+      }
       const int e0 = ends[p][k], e1 = ends[p][4 + k];
       if (srgb) out[i].c[k] = static_cast<uint8_t>((((e0 << 8) | 0x80) * (64 - w) + ((e1 << 8) | 0x80) * w + 32) >> 14);
       else out[i].c[k] = static_cast<uint8_t>((((((e0 << 8) | e0) * (64 - w) + ((e1 << 8) | e1) * w + 32) >> 6) * 255 + 32768) >> 16);
@@ -866,6 +1057,8 @@ bool decode_compressed(const CompressedFormat& f, ConstByteView data, uint32_t w
         Rgba px[144] = {};
         float chan[2][16] = {};
         float rgb[16][3] = {};
+        float fpx[144 * 4] = {};   // ASTC linear formats decode to floats
+        bool astc_float = false;
         switch (f.codec) {
           case Codec::Bc1Rgb: bc1(p, false, false, px); break;
           case Codec::Bc1Rgba: bc1(p, false, true, px); break;
@@ -892,8 +1085,13 @@ bool decode_compressed(const CompressedFormat& f, ConstByteView data, uint32_t w
           case Codec::Bc6U: case Codec::Bc6S: bc6(p, f.codec == Codec::Bc6S, rgb); break;
           case Codec::Astc: {
             bool hdr;
-            if (!astc_block(p, f.bw, f.bh, f.srgb, px, &hdr))
+            if (!f.srgb) {
+              astc_float = true;
+              if (!astc_block(p, f.bw, f.bh, false, px, &hdr, fpx))
+                for (int i = 0; i < f.bw * f.bh; ++i) { fpx[i * 4] = 1; fpx[i * 4 + 1] = 0; fpx[i * 4 + 2] = 1; fpx[i * 4 + 3] = 1; }   // an invalid block is magenta
+            } else if (!astc_block(p, f.bw, f.bh, true, px, &hdr)) {
               for (int i = 0; i < f.bw * f.bh; ++i) { px[i].c[0] = 255; px[i].c[1] = 0; px[i].c[2] = 255; px[i].c[3] = 255; }   // an invalid block (or HDR) is magenta
+            }
             break;
           }
         }
@@ -905,7 +1103,9 @@ bool decode_compressed(const CompressedFormat& f, ConstByteView data, uint32_t w
           const uint32_t x = xo + tx, y = yo + ty;
           if (x >= dst->w || y >= dst->h || tx >= w || ty >= h) continue;
           uint32_t lanes[4];
-          if (hdr6) {
+          if (astc_float) {
+            for (int k = 0; k < 4; ++k) lanes[k] = f2u(fpx[i * 4 + k]);
+          } else if (hdr6) {
             for (int k = 0; k < 3; ++k) lanes[k] = f2u(rgb[i][k]);
             lanes[3] = f2u(1.0f);
           } else if (one || two) {
