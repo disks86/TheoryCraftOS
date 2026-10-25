@@ -230,10 +230,46 @@ class Parser {
       }
       m_.nodes[static_cast<uint64_t>(pending_[i]->node)].ival = f;
     }
+    mark_barriers();
     return true;
   }
 
  private:
+  // Which functions have a workgroup barrier in them or in a function they call.
+  void mark_barriers() {
+    const uint64_t n = m_.functions.count();
+    List<int32_t> stack(a_);
+    for (uint64_t f = 0; f < n; ++f) {
+      Function& F = *m_.functions[f];
+      if (F.body < 0) continue;
+      stack.clear();
+      stack.push_back(F.body);
+      List<uint8_t> seen(a_);
+      for (uint64_t i = 0; i < m_.nodes.count(); ++i) seen.push_back(0);
+      while (stack.count() && !F.has_barrier) {
+        const int32_t id = stack[stack.count() - 1];
+        stack.remove_at(stack.count() - 1);
+        if (id < 0 || seen[static_cast<uint64_t>(id)]) continue;
+        seen[static_cast<uint64_t>(id)] = 1;
+        const Node& nd = m_.nodes[static_cast<uint64_t>(id)];
+        if (nd.kind == NodeKind::Builtin && static_cast<BuiltinFn>(nd.ival) == BuiltinFn::Barrier) { F.has_barrier = true; break; }
+        if (nd.kind == NodeKind::Call && nd.ival >= 0) {
+          const Function& callee = *m_.functions[static_cast<uint64_t>(nd.ival)];
+          if (callee.has_barrier) { F.has_barrier = true; break; }
+        }
+        switch (nd.kind) {
+          case NodeKind::Const: case NodeKind::Zero: case NodeKind::Local: case NodeKind::Global: case NodeKind::Empty: case NodeKind::Break: case NodeKind::Continue: case NodeKind::Discard:
+            continue;
+          case NodeKind::Field: stack.push_back(nd.a); continue;
+          default: break;
+        }
+        stack.push_back(nd.a); stack.push_back(nd.b); stack.push_back(nd.c); stack.push_back(nd.d);
+        for (int32_t k = 0; k < nd.count; ++k) stack.push_back(m_.kids[static_cast<uint64_t>(nd.first + k)]);
+        if (nd.kind == NodeKind::Call && nd.ival >= 0) stack.push_back(m_.functions[static_cast<uint64_t>(nd.ival)]->body);
+      }
+    }
+  }
+
   Module& m_;
   allocators::IAllocator& a_;
   List<Token>& toks_;
@@ -1308,13 +1344,17 @@ class Parser {
   int32_t make_call(StringView name, List<int32_t>& args) {
     Node n;
     n.line = cur().line;
+    // a function the shader declares hides a built-in of the same name (wherever in the module it is declared)
+    bool user = false;
+    for (uint64_t i = 0; i + 1 < toks_.count() && !user; ++i)
+      user = toks_[i].kind == Tok::Ident && toks_[i].text.equals("fn") && toks_[i + 1].kind == Tok::Ident && toks_[i + 1].text.equals(name);
     // texture functions
-    if (name.starts_with("texture")) {
+    if (!user && name.starts_with("texture")) {
       const int32_t t = make_tex(name, args);
       if (t != -2) return t;
     }
     for (const BuiltinName& b : kBuiltins)
-      if (name.equals(b.name)) {
+      if (!user && name.equals(b.name)) {
         n.first = add_kids(args.view().data(), static_cast<uint32_t>(args.count()));
         n.count = static_cast<int32_t>(args.count());
         n.kind = NodeKind::Builtin;

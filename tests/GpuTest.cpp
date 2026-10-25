@@ -207,7 +207,46 @@ static void test_multisample() {
   CHECK(a.live == 0);
 }
 
+static void test_barrier_in_function() {
+  TestAllocator a;
+  {
+    Device dev(a);
+    String log(a);
+    // a tree reduction whose steps (with the barrier) are in a function
+    const char* wgsl =
+        "@group(0) @binding(0) var<storage, read_write> data: array<u32>;\n"
+        "var<workgroup> tile: array<u32, 8>;\n"
+        "fn step(i: u32, stride: u32) { if (i < stride) { tile[i] = tile[i] + tile[i + stride]; } workgroupBarrier(); }\n"
+        "fn reduce(i: u32) { step(i, 4u); step(i, 2u); step(i, 1u); }\n"
+        "@compute @workgroup_size(8) fn main(@builtin(local_invocation_id) l: vec3<u32>) {\n"
+        "  tile[l.x] = data[l.x];\n"
+        "  workgroupBarrier();\n"
+        "  reduce(l.x);\n"
+        "  data[l.x] = tile[0];\n"
+        "}\n";
+    const uint32_t mod = dev.create_shader_module(wgsl, &log);
+    CHECK(mod != 0 && log.empty());
+    const uint32_t data = dev.create_buffer(32, 0x80 | 0x04 | 0x08);
+    const uint32_t in[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    dev.write_buffer(data, 0, ConstByteView(reinterpret_cast<const uint8_t*>(in), 32));
+    List<UniquePointer<Device::ConstantValue>> none(a);
+    const uint32_t cp = dev.create_compute_pipeline(0, mod, "main", none);
+    CHECK(cp != 0);
+    List<BgEntry> entries(a);
+    BgEntry e0;
+    e0.binding = 0; e0.id = data;
+    entries.push_back(e0);
+    const uint32_t bg = dev.create_bind_group(dev.pipeline_layout_bgl(cp, true, 0), entries);
+    CHECK(dev.begin_compute_pass() && dev.set_pipeline(cp) && dev.set_bind_group(0, bg, ArrayView<const uint32_t>()) && dev.dispatch(1, 1, 1) && dev.end_compute_pass());
+    uint32_t out[8];
+    CHECK(dev.read_buffer(data, 0, ByteView(reinterpret_cast<uint8_t*>(out), 32)));
+    for (int i = 0; i < 8; ++i) CHECK(out[i] == 36);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_barrier_in_function();
   test_multisample();
   test_render();
   test_compute();

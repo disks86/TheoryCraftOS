@@ -148,6 +148,7 @@ struct Function {
   int32_t ret_location = -1;
   int32_t ret_builtin = kBvNone;
   bool uses_derivatives = false;
+  bool has_barrier = false;  // it, or a function it calls, has a workgroup barrier (such a function can be called as a statement while the invocation waits at a barrier)
 };
 
 enum class NodeKind : uint8_t {
@@ -306,7 +307,7 @@ class Machine {
  private:
   friend struct Interp;
   struct Var { uint32_t* p; Type t; };
-  struct Frame { int32_t node; int32_t state; int32_t index; uint32_t mark; uint32_t aux; };
+  struct Frame { int32_t node; int32_t state; int32_t index; uint32_t mark; uint32_t aux; uint32_t saved_base = 0, saved_top = 0; };
 
   const Module& module_;
   allocators::IAllocator& allocator_;
