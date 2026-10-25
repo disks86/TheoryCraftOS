@@ -33,6 +33,7 @@ constexpr uint32_t kVolumeClean = 0x434c454e, kVolumeDirty = 0x44495254;
 constexpr uint32_t kMinLogBlocks = 256;  // (a transaction holds up to kTxHard blocks, and its log entry has to fit)
 constexpr uint32_t kInodeDeleted = 0x10;
 constexpr uint32_t kTxHard = 192;           // most blocks one transaction holds
+constexpr uint32_t kDataPieceBlocks = 64;     // most blocks of file data one write puts into one transaction
 constexpr uint32_t kTxSoft = 96;            // a long operation commits what it has when it holds this many
 constexpr uint32_t kArrayBlocks = 4;        // length of the arrays of block runs we create (as Be's file system does)
 constexpr uint32_t kMaxRunBlocks = 0xFFFF;
@@ -148,25 +149,29 @@ class BefsFileSystem::File final : public IFile {
     if (!inode.is_regular()) return Status::Unsupported;
     const uint64_t end = offset + data.size();
     if (end < offset || end > fs_.max_file_size()) return Status::NoSpace;
-    const uint64_t old_size = inode.size;
-    fs_.tx_begin();
-    s = fs_.grow_stream(&inode, (end + fs_.block_size_ - 1) >> fs_.block_shift_);
-    if (s == Status::Ok && offset > old_size) s = fs_.zero_stream(inode, old_size, offset);
-    if (s == Status::Ok) {
-      s = fs_.write_stream(inode, offset, data);
-      if (s != Status::Ok && offset < old_size) *transferred = old_size - offset < data.size() ? old_size - offset : data.size();
+    const uint64_t wanted_blocks = (end + fs_.block_size_ - 1) >> fs_.block_shift_, mapped = mapped_blocks(inode, fs_.block_shift_);
+    if (wanted_blocks > mapped && wanted_blocks - mapped > fs_.block_count_ - fs_.used_blocks_) return Status::NoSpace;  // (a write that cannot fit changes nothing)
+    if (offset > inode.size) {  // a gap: the file first grows to where the data starts (zeros, with the new blocks)
+      s = fs_.resize_file(inode_block_, offset);
+      if (s != Status::Ok) return s;
     }
-    if (s == Status::Ok) {
-      if (end > old_size) inode.size = end;
-      s = fs_.store_inode(inode);
+    // The data goes through the journal with the changes to the file's blocks, so a crash leaves each piece either old or new. A piece is
+    // as many blocks as a transaction holds with room for the bookkeeping; if one turns out not to fit, the pieces get smaller.
+    uint32_t piece_blocks = kDataPieceBlocks;
+    uint64_t done = 0;
+    while (done < data.size()) {
+      const uint64_t position = offset + done;
+      const uint64_t piece_end = ((position >> fs_.block_shift_) + piece_blocks) << fs_.block_shift_;
+      const uint64_t length = piece_end - position < data.size() - done ? piece_end - position : data.size() - done;
+      s = fs_.write_piece(inode_block_, position, data.subview(done, length));
+      if (s == Status::NoSpace && piece_blocks > 1) {
+        piece_blocks /= 2;
+        continue;
+      }
+      if (s != Status::Ok) return s;  // (*transferred says how much of it did get written)
+      done += length;
+      *transferred = done;
     }
-    if (s == Status::Ok) s = fs_.touch(&inode);
-    if (s == Status::Ok) s = fs_.tx_commit();
-    if (s != Status::Ok) {
-      fs_.tx_rollback();
-      return s;
-    }
-    *transferred = data.size();
     return Status::Ok;
   }
   Status resize(uint64_t new_size) override {
@@ -174,28 +179,7 @@ class BefsFileSystem::File final : public IFile {
     if (!writable_) return Status::ReadOnly;
     Status s = fs_.writable();
     if (s != Status::Ok) return s;
-    if (new_size > fs_.max_file_size()) return Status::NoSpace;
-    Inode inode;
-    s = fs_.read_inode(inode_block_, &inode);
-    if (s != Status::Ok) return s;
-    if (!inode.is_regular()) return Status::Unsupported;
-    const uint64_t old_size = inode.size;
-    const uint64_t blocks = (new_size + fs_.block_size_ - 1) >> fs_.block_shift_;
-    fs_.tx_begin();
-    if (new_size > old_size) {
-      s = fs_.grow_stream(&inode, blocks);
-      if (s == Status::Ok) s = fs_.zero_stream(inode, old_size, new_size);
-      inode.size = new_size;
-    } else {  // (also when the size stays: blocks a failed grow left behind past the end go back)
-      inode.size = new_size;  // the size never claims more than the blocks that are left
-      s = fs_.store_inode(inode);
-      if (s == Status::Ok) s = fs_.shrink_stream(&inode, blocks);
-    }
-    if (s == Status::Ok) s = fs_.store_inode(inode);
-    if (s == Status::Ok) s = fs_.touch(&inode);
-    if (s == Status::Ok) s = fs_.tx_commit();
-    if (s != Status::Ok) fs_.tx_rollback();
-    return s;
+    return fs_.resize_file(inode_block_, new_size);
   }
   Status flush() override {
     kernel::ScopedRecursiveMutex lock(fs_.mutex_);
@@ -1072,7 +1056,7 @@ Status BefsFileSystem::tx_write(uint64_t offset, ConstByteView data) {
       if (tx_count_ == kTxHard) return Status::NoSpace;
       ByteView copy = allocate_view<uint8_t>(allocator_, block_size_);
       if (copy.empty()) return Status::OutOfMemory;
-      const Status s = raw_read(block << block_shift_, copy);
+      const Status s = chunk == block_size_ ? Status::Ok : raw_read(block << block_shift_, copy);  // (a whole block is replaced: no need to load it)
       if (s != Status::Ok) {
         release_view(allocator_, copy);
         return s;
@@ -1084,6 +1068,52 @@ Status BefsFileSystem::tx_write(uint64_t offset, ConstByteView data) {
     done += chunk;
   }
   return Status::Ok;
+}
+
+// Sets the length of a file: longer adds zeros, shorter gives blocks back.
+Status BefsFileSystem::resize_file(uint64_t inode_block, uint64_t new_size) {
+  if (new_size > max_file_size()) return Status::NoSpace;
+  Inode inode;
+  Status s = read_inode(inode_block, &inode);
+  if (s != Status::Ok) return s;
+  if (!inode.is_regular()) return Status::Unsupported;
+  const uint64_t old_size = inode.size;
+  const uint64_t blocks = (new_size + block_size_ - 1) >> block_shift_;
+  tx_begin();
+  if (new_size > old_size) {
+    s = grow_stream(&inode, blocks);
+    if (s == Status::Ok) s = zero_stream(inode, old_size, new_size);
+    inode.size = new_size;
+  } else {  // (also when the size stays: blocks a failed grow left behind past the end go back)
+    inode.size = new_size;  // the size never claims more than the blocks that are left
+    s = store_inode(inode);
+    if (s == Status::Ok) s = shrink_stream(&inode, blocks);
+  }
+  if (s == Status::Ok) s = store_inode(inode);
+  if (s == Status::Ok) s = touch(&inode);
+  if (s == Status::Ok) s = tx_commit();
+  if (s != Status::Ok) tx_rollback();
+  return s;
+}
+
+// Writes `data` at `offset` (not past the end of the file) in one transaction together with the blocks the file needs for it and its new
+// size: file data is journaled like the rest, so the piece is written entirely or not at all.
+Status BefsFileSystem::write_piece(uint64_t inode_block, uint64_t offset, ConstByteView data) {
+  Inode inode;
+  Status s = read_inode(inode_block, &inode);
+  if (s != Status::Ok) return s;
+  const uint64_t end = offset + data.size();
+  tx_begin();
+  s = grow_stream(&inode, (end + block_size_ - 1) >> block_shift_);
+  if (s == Status::Ok) {
+    if (end > inode.size) inode.size = end;
+    s = tx_write_stream(inode, offset, data);
+  }
+  if (s == Status::Ok) s = store_inode(inode);
+  if (s == Status::Ok) s = touch(&inode);
+  if (s == Status::Ok) s = tx_commit();
+  if (s != Status::Ok) tx_rollback();
+  return s;
 }
 
 Status BefsFileSystem::tx_zero(uint64_t block, uint32_t count) {

@@ -1598,6 +1598,7 @@ static void test_crash(uint32_t bs, uint32_t ag_shift, uint32_t groups, uint32_t
   struct Step { const char* name; std::function<void(IFileSystem&)> run; };
   std::vector<Step> steps;
   steps.push_back({"append to a file", [&](IFileSystem& fs) { UniquePointer<IFile> f; std::vector<uint8_t> d = make_data(5000, 40); uint64_t n; fs.open_file("/hello.txt", OpenMode::ReadWrite, &f); f->write(13, ConstByteView(d.data(), d.size()), &n); }});
+  steps.push_back({"overwrite inside a file", [&](IFileSystem& fs) { UniquePointer<IFile> f; std::vector<uint8_t> d = make_data(3ull * bs + 77, 43); uint64_t n; fs.open_file("/contig", OpenMode::ReadWrite, &f); f->write(2ull * bs + 100, ConstByteView(d.data(), d.size()), &n); }});
   steps.push_back({"make a directory", [&](IFileSystem& fs) { fs.create_directory("/d1"); }});
   steps.push_back({"create a file", [&](IFileSystem& fs) { UniquePointer<IFile> f; fs.open_file("/d1/f", OpenMode::CreateOrOpen, &f); }});
   steps.push_back({"write to it", [&](IFileSystem& fs) { UniquePointer<IFile> f; std::vector<uint8_t> d = make_data(3000, 41); uint64_t n; fs.open_file("/d1/f", OpenMode::ReadWrite, &f); f->write(0, ConstByteView(d.data(), d.size()), &n); }});
@@ -1687,6 +1688,41 @@ done:
   CHECK(a.live == 0);
 }
 
+// Writes of many more blocks than one transaction holds go in pieces; the result must be as if they were one.
+static void test_big_writes() {
+  printf("BeFS writes of many blocks\n");
+  const uint32_t bs = 1024;
+  Built v(bs, 13, 3, bs);
+  TestAllocator a;
+  MemDisk disk(v.image.img.data(), v.image.img.size(), 512, 0, true);
+  UniquePointer<IFileSystem> fs;
+  CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+  if (!fs) return;
+  std::vector<uint8_t> model = make_data(40ull * bs + 5, 1), got;
+  CHECK(put_file(*fs, "/big", model));
+  UniquePointer<IFile> f;
+  CHECK_STATUS(fs->open_file("/big", OpenMode::ReadWrite, &f), Status::Ok);
+  uint64_t n = 0;
+  auto write_at = [&](uint64_t at, const std::vector<uint8_t>& d) {
+    CHECK_STATUS(f->write(at, ConstByteView(d.data(), d.size()), &n), Status::Ok);
+    CHECK(n == d.size());
+    if (model.size() < at + d.size()) model.resize(at + d.size(), 0);
+    memcpy(model.data() + at, d.data(), d.size());
+  };
+  write_at(7 * bs + 33, make_data(200ull * bs + 11, 2));   // over the old end, 200 blocks: four pieces
+  write_at(5, make_data(30ull * bs, 3));                    // inside, over old data
+  write_at(model.size() + 100ull * bs + 3, make_data(90ull * bs, 4));   // past the end: a gap of zeros first
+  write_at(0, make_data(model.size(), 5));                  // the whole file again
+  f = UniquePointer<IFile>();
+  CHECK(read_back(*fs, "/big", &got) && got == model);
+  CHECK_STATUS(fs->flush(), Status::Ok);
+  check_accounting(disk.data, v.image, "writes of many blocks");
+  fs = UniquePointer<IFileSystem>();
+  MemDisk again(disk.data, disk.blocks * 512, 512, 0, false);
+  CHECK_STATUS(BefsFileSystem::mount(a, again, 0, &fs), Status::Ok);
+  if (fs) CHECK(read_back(*fs, "/big", &got) && got == model);
+}
+
 static void test_times() {
   printf("BeFS time stamps\n");
   Built v(1024, 13, 3, 1024);
@@ -1698,6 +1734,7 @@ static void test_times() {
 }
 
 int main() {
+  test_big_writes();
   test_times();
   test_volume(1024, 8, 16, 1024, 512, "BeFS 1 KiB blocks, 512 byte device");
   test_volume(2048, 7, 32, 2048, 2048, "BeFS 2 KiB blocks, 2 KiB device");

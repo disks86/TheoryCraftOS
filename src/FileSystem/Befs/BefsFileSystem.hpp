@@ -37,7 +37,8 @@ namespace filesystem {
 // through the volume's journal, as Be's file system does: the changed blocks are written to the log, then the super block says so
 // (dirty, log_end), then the blocks go to their places, then the super block says clean again. A crash at any point leaves either the
 // old state or the new one: a volume that was not shut down cleanly has its log replayed when it is mounted on a writable device
-// (file data is not journaled, as in Be's file system: a write that is cut short can leave partly new data). Removing a file first cuts
+// (file data is journaled too, unlike in Be's file system: a write goes in pieces of up to 64 blocks, each in one transaction with the changes
+// to the file's blocks and size, so a crash leaves every piece either old or new). Removing a file first cuts
 // it to nothing in steps, so a failure then leaves a shorter file, never lost blocks. A volume is mounted writable only if its device
 // is, its log is usable (and was replayed if needed), its inodes are one block each and its bitmap is laid out as expected; any other
 // volume is read only (every write returns ReadOnly). What is not kept up to date: attributes and the
@@ -187,6 +188,8 @@ class BefsFileSystem final : public IFileSystem {
 
   // Writing streams.
   Status store_inode(const Inode& inode);
+  Status resize_file(uint64_t inode_block, uint64_t new_size);
+  Status write_piece(uint64_t inode_block, uint64_t offset, ConstByteView data);
   Status store_times(const Inode& inode);  // the creation and modification times
   Status touch(Inode* inode);              // the modification time becomes now (nothing without a clock)
   static uint64_t time_now();              // the system wall clock as an inode time, 0 without one
