@@ -67,6 +67,7 @@
 #include "Kernel/Clipboard.hpp"
 #include "SystemFileSystem.hpp"
 #include "Browser/HttpPageLoader.hpp"
+#include "Browser/WebRandom.hpp"
 #include "Network/Tls/CaBundle.hpp"
 #include "Database/SystemDatabases.hpp"
 #include "Database/Local/SystemSettings.hpp"
@@ -850,6 +851,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     crypto::IEntropySource& smb_entropy = crypto::CpuEntropySource::available() ? static_cast<crypto::IEntropySource&>(cpu_entropy)
         : guest.entropy() ? *guest.entropy() : static_cast<crypto::IEntropySource&>(timing_entropy);
     crypto::DrbgRandom smb_random(smb_entropy);
+    crypto::DrbgRandom web_random(smb_entropy);   // crypto.getRandomValues() and the keys web pages make
+    if (web_random.initialize()) browser::set_system_random(&web_random);
     network::StackSetNetwork smb_network(stacks);
     // Databases (PostgreSQL) for the programs that want them, reached over the same interfaces. TLS needs a trust store, which this system does not ship:
     // connections are plain until one is given (SystemDatabases::transport().set_tls()).

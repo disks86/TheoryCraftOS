@@ -114,6 +114,7 @@ bool form_get(DomBindings::Impl& c, dom::Node* element, StringView key, Value* o
 HostClass::Set form_set(DomBindings::Impl& c, dom::Node* element, StringView key, const Value& value);
 bool is_form_element(const dom::Node* n);
 bool form_lookup_named(DomBindings::Impl& c, dom::Node* n, StringView key, Value* out);
+bool install_crypto(DomBindings::Impl& c);   // the natives under crypto.getRandomValues() and crypto.subtle (DomBindingsCrypto.cpp)
 bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest's natives, byte and text helpers (DomBindingsNet.cpp)
 // Uint8Array objects (DomBindingsMedia.cpp): a new one holding these bytes, and the bytes of one (a view into the array; false for anything else).
 JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes);

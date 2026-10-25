@@ -3089,7 +3089,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     list.forEach(function (e) { if (rank[e.alg] > best) best = rank[e.alg]; });
     var strongest = list.filter(function (e) { return rank[e.alg] === best; });
     var name = best === 3 ? 'SHA-512' : best === 2 ? 'SHA-384' : 'SHA-256';
-    return crypto.subtle.digest(name, __string_to_bytes(bytes)).then(function (digest) {
+    return g.__subtle.digest(name, __string_to_bytes(bytes)).then(function (digest) {
       var actual = btoa(__bytes_to_string(new Uint8Array(digest)));
       return strongest.some(function (e) { return e.hash.replace(/=+$/, '') === actual.replace(/=+$/, ''); });
     });
@@ -4511,76 +4511,763 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   if (g.screenX === undefined) { g.screenX = 0; g.screenY = 0; g.screenLeft = 0; g.screenTop = 0; }
   if (g.origin === undefined) g.origin = location.origin;
   if (g.crypto === undefined) {
-    var HASHES = { 'SHA-1': 1, 'SHA-256': 2, 'SHA-384': 3, 'SHA-512': 4 };
-    function hashKind(algorithm) {
-      var name = typeof algorithm === 'string' ? algorithm : algorithm && (typeof algorithm.name === 'string' ? algorithm.name : null);
-      var kind = name === null ? undefined : HASHES[name.toUpperCase()];
-      if (!kind) throw new DOMException('Unrecognized name.', 'NotSupportedError');
-      return kind;
-    }
-    function bytesOf(data) {
-      if (data instanceof ArrayBuffer) return new Uint8Array(data);
-      if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-      throw new TypeError("Failed to execute on 'SubtleCrypto': parameter 2 is not of type '(ArrayBuffer or ArrayBufferView)'.");
-    }
+    // ---------------------------------------------------------------------------------------------------------------------------------- Web Crypto
+    // crypto.getRandomValues(), crypto.randomUUID() and crypto.subtle. The primitives are natives (__crypto_*); the algorithms, key objects and key formats are here.
+    var HASHES = { 'SHA-1': { kind: 1, size: 20, block: 64 }, 'SHA-256': { kind: 2, size: 32, block: 64 }, 'SHA-384': { kind: 3, size: 48, block: 128 }, 'SHA-512': { kind: 4, size: 64, block: 128 } };
+    var CANON = {};
+    ['RSASSA-PKCS1-v1_5', 'RSA-PSS', 'RSA-OAEP', 'ECDSA', 'ECDH', 'Ed25519', 'X25519', 'AES-CTR', 'AES-CBC', 'AES-GCM', 'AES-KW', 'HMAC', 'HKDF', 'PBKDF2', 'SHA-1', 'SHA-256', 'SHA-384', 'SHA-512']
+      .forEach(function (n) { CANON[n.toUpperCase()] = n; });
+    var AES_NAMES = ['AES-CTR', 'AES-CBC', 'AES-GCM', 'AES-KW'];
+    var SUPPORT = {
+      digest: ['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512'],
+      sign: ['RSASSA-PKCS1-v1_5', 'RSA-PSS', 'ECDSA', 'Ed25519', 'HMAC'],
+      encrypt: ['RSA-OAEP', 'AES-CTR', 'AES-CBC', 'AES-GCM'],
+      deriveBits: ['ECDH', 'X25519', 'HKDF', 'PBKDF2'],
+      wrapKey: ['AES-KW', 'RSA-OAEP', 'AES-CTR', 'AES-CBC', 'AES-GCM'],
+      generateKey: ['RSASSA-PKCS1-v1_5', 'RSA-PSS', 'RSA-OAEP', 'ECDSA', 'ECDH', 'Ed25519', 'X25519', 'AES-CTR', 'AES-CBC', 'AES-GCM', 'AES-KW', 'HMAC'],
+      importKey: ['RSASSA-PKCS1-v1_5', 'RSA-PSS', 'RSA-OAEP', 'ECDSA', 'ECDH', 'Ed25519', 'X25519', 'AES-CTR', 'AES-CBC', 'AES-GCM', 'AES-KW', 'HMAC', 'HKDF', 'PBKDF2'],
+      getKeyLength: ['AES-CTR', 'AES-CBC', 'AES-GCM', 'AES-KW', 'HMAC', 'HKDF', 'PBKDF2']
+    };
+    SUPPORT.verify = SUPPORT.sign; SUPPORT.decrypt = SUPPORT.encrypt; SUPPORT.deriveKey = SUPPORT.deriveBits; SUPPORT.unwrapKey = SUPPORT.wrapKey; SUPPORT.exportKey = SUPPORT.importKey;
+    var notSupported = function (msg) { return new DOMException(msg || 'Unrecognized name.', 'NotSupportedError'); };
+    var opError = function (msg) { return new DOMException(msg || 'The operation failed for an operation-specific reason', 'OperationError'); };
+    var dataError = function (msg) { return new DOMException(msg || 'Invalid key data', 'DataError'); };
+    var accessError = function (msg) { return new DOMException(msg, 'InvalidAccessError'); };
+    var syntaxError = function (msg) { return new DOMException(msg, 'SyntaxError'); };
+    var normalize = function (alg, op) {
+      var a = typeof alg === 'string' ? { name: alg } : alg;
+      if (a === null || a === undefined || typeof a !== 'object') throw new TypeError('The algorithm must be a string or an object with a name.');
+      if (a.name === undefined) throw new TypeError("Algorithm: name: Missing or not a string");
+      var canon = CANON[String(a.name).toUpperCase()];
+      if (!canon || SUPPORT[op].indexOf(canon) < 0) throw notSupported();
+      var out = {};
+      for (var k in a) out[k] = a[k];
+      out.name = canon;
+      return out;
+    };
+    var hashOf = function (h) {
+      if (h === undefined || h === null) throw new TypeError('Algorithm: hash: Missing or not a string');
+      var name = typeof h === 'string' ? h : h.name;
+      var canon = CANON[String(name).toUpperCase()];
+      if (!canon || !HASHES[canon]) throw notSupported();
+      return canon;
+    };
+    var toBytes = function (data) {
+      if (data instanceof ArrayBuffer) return new Uint8Array(new Uint8Array(data));
+      if (ArrayBuffer.isView(data)) return new Uint8Array(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+      throw new TypeError("The data argument must be of type '(ArrayBuffer or ArrayBufferView)'.");
+    };
+    var concat = function () {
+      var n = 0, i, j, parts = arguments;
+      for (i = 0; i < parts.length; i++) n += parts[i].length;
+      var out = new Uint8Array(n), at = 0;
+      for (i = 0; i < parts.length; i++) { for (j = 0; j < parts[i].length; j++) out[at + j] = parts[i][j]; at += parts[i].length; }
+      return out;
+    };
+    var sliceBytes = function (u, from, to) { return new Uint8Array(u.subarray(from, to === undefined ? u.length : to)); };
+    var sameBytes = function (a, b) {
+      if (a.length !== b.length) return false;
+      var d = 0;
+      for (var i = 0; i < a.length; i++) d |= a[i] ^ b[i];
+      return d === 0;
+    };
+    var buf = function (u) { return u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ? u.buffer : new Uint8Array(u).buffer; };
+    var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    var b64enc = function (u) {
+      var out = '';
+      for (var i = 0; i < u.length; i += 3) {
+        var n = (u[i] << 16) | ((i + 1 < u.length ? u[i + 1] : 0) << 8) | (i + 2 < u.length ? u[i + 2] : 0);
+        out += B64.charAt((n >> 18) & 63) + B64.charAt((n >> 12) & 63) + (i + 1 < u.length ? B64.charAt((n >> 6) & 63) : '') + (i + 2 < u.length ? B64.charAt(n & 63) : '');
+      }
+      return out;
+    };
+    var b64dec = function (s) {
+      s = String(s).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+      var out = [], bits = 0, acc = 0;
+      for (var i = 0; i < s.length; i++) {
+        var v = B64.indexOf(s.charAt(i));
+        if (v < 0) throw dataError('The JWK has invalid base64url data');
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; out.push((acc >> bits) & 255); acc &= (1 << bits) - 1; }
+      }
+      return new Uint8Array(out);
+    };
+    var randomBytes = function (n) { return n === 0 ? new Uint8Array(0) : __crypto_random(n); };
+    var digestOf = function (hash, data) { return __crypto_hash(HASHES[hash].kind, data); };
+    var strip = function (u) { var i = 0; while (i < u.length - 1 && u[i] === 0) i++; return i ? sliceBytes(u, i) : u; };
+    var bitLength = function (u) { u = strip(u); if (u.length === 1 && u[0] === 0) return 0; var b = 0, t = u[0]; while (t) { b++; t >>= 1; } return (u.length - 1) * 8 + b; };
+
+    // --- DER (the little of it that SPKI, PKCS #8 and the key structures need)
+    var derLen = function (n) { if (n < 128) return [n]; var b = []; while (n > 0) { b.unshift(n & 255); n = Math.floor(n / 256); } return [128 | b.length].concat(b); };
+    var der = function (tag, parts) { var body = concat.apply(null, parts.length ? parts : [new Uint8Array(0)]); return concat(new Uint8Array([tag].concat(derLen(body.length))), body); };
+    var derInt = function (u) { u = strip(u); return der(2, [u[0] & 128 ? concat(new Uint8Array([0]), u) : u]); };
+    var derReader = function (u, pos) {
+      if (pos + 2 > u.length) throw dataError('Bad DER');
+      var tag = u[pos], len = u[pos + 1], at = pos + 2;
+      if (len & 128) { var c = len & 127; if (c === 0 || c > 3 || at + c > u.length) throw dataError('Bad DER'); len = 0; for (var i = 0; i < c; i++) len = len * 256 + u[at++]; }
+      if (at + len > u.length) throw dataError('Bad DER');
+      return { tag: tag, body: sliceBytes(u, at, at + len), end: at + len };
+    };
+    var derKids = function (node) { var out = [], at = 0; while (at < node.body.length) { var k = derReader(node.body, at); out.push(k); at = k.end; } return out; };
+    var derRoot = function (u) { var n = derReader(u, 0); if (n.end !== u.length) throw dataError('Bad DER'); return n; };
+    var OID = {
+      ec: new Uint8Array([0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]), p256: new Uint8Array([0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]), p384: new Uint8Array([0x2b, 0x81, 0x04, 0x00, 0x22]),
+      rsa: new Uint8Array([0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]), x25519: new Uint8Array([0x2b, 0x65, 0x6e]), ed25519: new Uint8Array([0x2b, 0x65, 0x70])
+    };
+    var oidIs = function (node, oid) { return node.tag === 6 && sameBytes(node.body, oid); };
+    var algId = function (oid, params) { return der(0x30, [der(6, [oid])].concat(params ? [params] : [])); };
+
+    // --- key objects
+    var CURVES = { 'P-256': 256, 'P-384': 384 };
+    var CURVE_NAMES = { 256: 'P-256', 384: 'P-384' };
+    var ORDER = ['encrypt', 'decrypt', 'sign', 'verify', 'deriveKey', 'deriveBits', 'wrapKey', 'unwrapKey'];
     function CryptoKey() { throw new TypeError('Illegal constructor'); }
+    ['type', 'extractable', 'algorithm', 'usages'].forEach(function (name) {
+      Object.defineProperty(CryptoKey.prototype, name, { get: function () { if (!this.__d) throw new TypeError('Illegal invocation'); return this.__d[name]; }, enumerable: true, configurable: true });
+    });
+    Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, { value: 'CryptoKey', configurable: true });
     hide(g, 'CryptoKey', CryptoKey);
+    var makeKey = function (type, extractable, algorithm, usages, data) {
+      var k = Object.create(CryptoKey.prototype);
+      hide(k, '__d', { type: type, extractable: !!extractable, algorithm: algorithm, usages: Object.freeze(ORDER.filter(function (u) { return usages.indexOf(u) >= 0; })), data: data });
+      return k;
+    };
+    var checkUsages = function (usages, allowed, needSome) {
+      var list = [];
+      if (usages !== undefined && usages !== null) {
+        if (typeof usages !== 'object' || typeof usages.length !== 'number') throw new TypeError("The provided value cannot be converted to a sequence.");
+        list = Array.prototype.slice.call(usages).map(String);
+      }
+      list.forEach(function (u) { if (ORDER.indexOf(u) < 0) throw new TypeError("The provided value '" + u + "' is not a valid enum value of type KeyUsage."); if (allowed.indexOf(u) < 0) throw syntaxError('Unsupported key usage for this algorithm'); });
+      if (needSome && list.length === 0) throw syntaxError('Usages cannot be empty when creating a key.');
+      return list;
+    };
+    var USAGES = {
+      'AES-CTR': ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'], 'AES-CBC': ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'], 'AES-GCM': ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'], 'AES-KW': ['wrapKey', 'unwrapKey'],
+      HMAC: ['sign', 'verify'], HKDF: ['deriveKey', 'deriveBits'], PBKDF2: ['deriveKey', 'deriveBits']
+    };
+    var aesAlgorithm = function (name, bytes) { return { name: name, length: bytes.length * 8 }; };
+    var hmacAlgorithm = function (hash, bits) { return { name: 'HMAC', hash: { name: hash }, length: bits }; };
+
+    // --- JWK
+    var jwkCheck = function (jwk, kty, usages, extractable) {
+      if (jwk === null || typeof jwk !== 'object') throw new TypeError("The JWK must be an object");
+      if (jwk.kty !== kty) throw dataError('The JWK "kty" member was not "' + kty + '"');
+      if (jwk.use !== undefined && usages.length && jwk.use !== 'sig' && jwk.use !== 'enc') throw dataError('The JWK "use" member is invalid');
+      if (jwk.key_ops !== undefined) {
+        if (!Array.isArray(jwk.key_ops)) throw dataError('The JWK "key_ops" member must be an array');
+        usages.forEach(function (u) { if (jwk.key_ops.indexOf(u) < 0) throw dataError('The JWK "key_ops" member does not allow the requested usages'); });
+      }
+      if (extractable && jwk.ext === false) throw dataError('The JWK "ext" member is false but the key was requested to be extractable');
+    };
+    var AES_JWK = { 'AES-CTR': 'CTR', 'AES-CBC': 'CBC', 'AES-GCM': 'GCM', 'AES-KW': 'KW' };
+
+    // --- importing
+    var importSecret = function (alg, format, data, extractable, usages) {
+      var name = alg.name, bytes, list;
+      if (format === 'jwk') {
+        list = checkUsages(usages, USAGES[name], true);
+        jwkCheck(data, 'oct', list, extractable);
+        bytes = b64dec(data.k);
+        if (AES_JWK[name] && data.alg !== undefined && data.alg !== 'A' + bytes.length * 8 + AES_JWK[name]) throw dataError('The JWK "alg" member does not match the key');
+        if (name === 'HMAC' && data.alg !== undefined && data.alg !== (hashOf(alg.hash) === 'SHA-1' ? 'HS1' : 'HS' + hashOf(alg.hash).slice(4))) throw dataError('The JWK "alg" member does not match the hash');
+      } else if (format === 'raw') {
+        list = checkUsages(usages, USAGES[name], name !== 'HKDF' && name !== 'PBKDF2' ? true : true);
+        bytes = toBytes(data);
+      } else {
+        throw notSupported('Unsupported import key format for ' + name);
+      }
+      if (name === 'HKDF' || name === 'PBKDF2') {
+        if (extractable) throw syntaxError('Key extractable cannot be true');
+        return makeKey('secret', false, { name: name }, list, { bytes: bytes });
+      }
+      if (AES_NAMES.indexOf(name) >= 0) {
+        if (bytes.length !== 16 && bytes.length !== 24 && bytes.length !== 32) throw dataError('Invalid AES key length');
+        return makeKey('secret', extractable, aesAlgorithm(name, bytes), list, { bytes: bytes });
+      }
+      var hash = hashOf(alg.hash), bits = bytes.length * 8;
+      if (bits === 0) throw dataError('HMAC key data must not be empty');
+      if (alg.length !== undefined) {
+        if (alg.length > bits || alg.length <= bits - 8 || alg.length === 0) throw dataError('Invalid HMAC key length');
+        bits = alg.length;
+      }
+      return makeKey('secret', extractable, hmacAlgorithm(hash, bits), list, { bytes: bytes });
+    };
+    var ecAlgorithm = function (name, curve) { return { name: name, namedCurve: CURVE_NAMES[curve] }; };
+    var curveBits = function (alg) {
+      var c = CURVES[alg.namedCurve];
+      if (!c) { if (alg.namedCurve === undefined) throw new TypeError('Algorithm: namedCurve: Missing or not a string'); throw notSupported('Unsupported named curve'); }
+      return c;
+    };
+    var ecPublicUsages = function (name) { return name === 'ECDSA' ? ['verify'] : []; };
+    var ecPrivateUsages = function (name) { return name === 'ECDSA' ? ['sign'] : ['deriveKey', 'deriveBits']; };
+    var importEc = function (alg, format, data, extractable, usages) {
+      var name = alg.name, curve = curveBits(alg), size = curve / 8, pub, priv = null, list;
+      if (format === 'raw' || format === 'spki') {
+        list = checkUsages(usages, ecPublicUsages(name), false);
+        if (format === 'raw') { pub = toBytes(data); }
+        else {
+          var spki = derKids(derRoot(toBytes(data)));
+          if (spki.length !== 2) throw dataError('Bad SPKI');
+          var alg2 = derKids(spki[0]);
+          if (alg2.length !== 2 || !oidIs(alg2[0], OID.ec) || !oidIs(alg2[1], curve === 256 ? OID.p256 : OID.p384)) throw dataError('The key is not an EC key on this curve');
+          pub = sliceBytes(spki[1].body, 1);
+          if (spki[1].tag !== 3 || spki[1].body[0] !== 0) throw dataError('Bad SPKI');
+        }
+      } else if (format === 'pkcs8') {
+        list = checkUsages(usages, ecPrivateUsages(name), true);
+        var p8 = derKids(derRoot(toBytes(data)));
+        if (p8.length < 3) throw dataError('Bad PKCS #8');
+        var alg3 = derKids(p8[1]);
+        if (alg3.length !== 2 || !oidIs(alg3[0], OID.ec) || !oidIs(alg3[1], curve === 256 ? OID.p256 : OID.p384)) throw dataError('The key is not an EC key on this curve');
+        var ecp = derKids(derRoot(p8[2].body));
+        if (ecp.length < 2) throw dataError('Bad EC private key');
+        priv = ecp[1].body;
+      } else if (format === 'jwk') {
+        var isPrivate = data && data.d !== undefined;
+        list = checkUsages(usages, isPrivate ? ecPrivateUsages(name) : ecPublicUsages(name), isPrivate);
+        jwkCheck(data, 'EC', list, extractable);
+        if (data.crv !== CURVE_NAMES[curve]) throw dataError('The JWK "crv" member does not match');
+        var x = b64dec(data.x), y = b64dec(data.y);
+        if (x.length !== size || y.length !== size) throw dataError('Bad JWK EC coordinates');
+        pub = concat(new Uint8Array([4]), x, y);
+        if (isPrivate) priv = b64dec(data.d);
+      } else {
+        throw notSupported('Unsupported import key format for ' + name);
+      }
+      if (priv) {
+        if (priv.length !== size) throw dataError('Bad EC private key');
+        var derived = __crypto_ec(2, curve, priv);
+        if (!derived) throw dataError('Bad EC private key');
+        if (!pub) pub = derived;
+        else if (!sameBytes(pub, derived)) throw dataError('The EC private key does not match the public key');
+        return makeKey('private', extractable, ecAlgorithm(name, curve), list, { curve: curve, pub: pub, priv: priv });
+      }
+      if (pub.length !== 1 + 2 * size || pub[0] !== 4 || !__crypto_ec(6, curve, pub)) throw dataError('The point is not on the curve');
+      return makeKey('public', true, ecAlgorithm(name, curve), list, { curve: curve, pub: pub, priv: null });
+    };
+    var importOkp = function (alg, format, data, extractable, usages) {
+      var name = alg.name, crv = name, pub = null, priv = null, list;
+      var pubUsages = name === 'Ed25519' ? ['verify'] : [], privUsages = name === 'Ed25519' ? ['sign'] : ['deriveKey', 'deriveBits'];
+      if (format === 'raw') { list = checkUsages(usages, pubUsages, false); pub = toBytes(data); }
+      else if (format === 'spki') {
+        list = checkUsages(usages, pubUsages, false);
+        var spki = derKids(derRoot(toBytes(data)));
+        if (spki.length !== 2 || spki[1].tag !== 3 || spki[1].body[0] !== 0) throw dataError('Bad SPKI');
+        var a = derKids(spki[0]);
+        if (a.length < 1 || !oidIs(a[0], name === 'Ed25519' ? OID.ed25519 : OID.x25519)) throw dataError('The key is not a ' + name + ' key');
+        pub = sliceBytes(spki[1].body, 1);
+      } else if (format === 'pkcs8') {
+        list = checkUsages(usages, privUsages, true);
+        var p8 = derKids(derRoot(toBytes(data)));
+        if (p8.length < 3) throw dataError('Bad PKCS #8');
+        var a2 = derKids(p8[1]);
+        if (a2.length < 1 || !oidIs(a2[0], name === 'Ed25519' ? OID.ed25519 : OID.x25519)) throw dataError('The key is not a ' + name + ' key');
+        var inner = derRoot(p8[2].body);
+        if (inner.tag !== 4) throw dataError('Bad PKCS #8');
+        priv = inner.body;
+      } else if (format === 'jwk') {
+        var isPrivate = data && data.d !== undefined;
+        list = checkUsages(usages, isPrivate ? privUsages : pubUsages, isPrivate);
+        jwkCheck(data, 'OKP', list, extractable);
+        if (data.crv !== crv) throw dataError('The JWK "crv" member does not match');
+        pub = b64dec(data.x);
+        if (isPrivate) priv = b64dec(data.d);
+      } else {
+        throw notSupported('Unsupported import key format for ' + name);
+      }
+      if (priv) {
+        if (priv.length !== 32) throw dataError('Bad private key');
+        if (name === 'X25519') { var derived = __crypto_x25519(1, priv); if (pub && !sameBytes(pub, derived)) throw dataError('The private key does not match the public key'); pub = derived; }
+        return makeKey('private', extractable, { name: name }, list, { pub: pub, priv: priv });
+      }
+      if (pub.length !== 32) throw dataError('Bad public key');
+      return makeKey('public', true, { name: name }, list, { pub: pub, priv: null });
+    };
+    var rsaHashAlg = function (alg) { return alg.name === 'RSA-OAEP' ? ['encrypt', 'wrapKey'] : ['verify']; };
+    var importRsa = function (alg, format, data, extractable, usages) {
+      var name = alg.name, hash = hashOf(alg.hash), n, e, d = null, extra = {}, list;
+      var pubUsages = name === 'RSA-OAEP' ? ['encrypt', 'wrapKey'] : ['verify'], privUsages = name === 'RSA-OAEP' ? ['decrypt', 'unwrapKey'] : ['sign'];
+      if (format === 'spki') {
+        list = checkUsages(usages, pubUsages, false);
+        var spki = derKids(derRoot(toBytes(data)));
+        if (spki.length !== 2 || spki[1].tag !== 3) throw dataError('Bad SPKI');
+        var a = derKids(spki[0]);
+        if (a.length < 1 || !oidIs(a[0], OID.rsa)) throw dataError('The key is not an RSA key');
+        var k = derKids(derRoot(sliceBytes(spki[1].body, 1)));
+        if (k.length !== 2) throw dataError('Bad RSA public key');
+        n = strip(k[0].body); e = strip(k[1].body);
+      } else if (format === 'pkcs8') {
+        list = checkUsages(usages, privUsages, true);
+        var p8 = derKids(derRoot(toBytes(data)));
+        if (p8.length < 3) throw dataError('Bad PKCS #8');
+        var a2 = derKids(p8[1]);
+        if (a2.length < 1 || !oidIs(a2[0], OID.rsa)) throw dataError('The key is not an RSA key');
+        var r = derKids(derRoot(p8[2].body));
+        if (r.length < 9) throw dataError('Bad RSA private key');
+        n = strip(r[1].body); e = strip(r[2].body); d = strip(r[3].body);
+        extra = { p: strip(r[4].body), q: strip(r[5].body), dp: strip(r[6].body), dq: strip(r[7].body), qi: strip(r[8].body) };
+      } else if (format === 'jwk') {
+        var isPrivate = data && data.d !== undefined;
+        list = checkUsages(usages, isPrivate ? privUsages : pubUsages, isPrivate);
+        jwkCheck(data, 'RSA', list, extractable);
+        n = strip(b64dec(data.n)); e = strip(b64dec(data.e));
+        if (isPrivate) {
+          d = strip(b64dec(data.d));
+          if (data.p !== undefined) extra = { p: strip(b64dec(data.p)), q: strip(b64dec(data.q)), dp: strip(b64dec(data.dp)), dq: strip(b64dec(data.dq)), qi: strip(b64dec(data.qi)) };
+        }
+      } else {
+        throw notSupported('Unsupported import key format for ' + name);
+      }
+      if (bitLength(n) < 512 || (n[n.length - 1] & 1) === 0) throw dataError('Bad RSA modulus');
+      var algorithm = { name: name, modulusLength: bitLength(n), publicExponent: e, hash: { name: hash } };
+      return makeKey(d ? 'private' : 'public', d ? extractable : true, algorithm, list, { n: n, e: e, d: d, crt: extra });
+    };
+    var importAny = function (format, data, alg, extractable, usages) {
+      if (format !== 'raw' && format !== 'jwk' && format !== 'spki' && format !== 'pkcs8') throw new TypeError("The provided value '" + format + "' is not a valid enum value of type KeyFormat.");
+      if (format === 'jwk') { if (data === null || typeof data !== 'object' || ArrayBuffer.isView(data) || data instanceof ArrayBuffer) throw new TypeError('The JWK must be an object'); }
+      else data = toBytes(data);
+      var name = alg.name;
+      if (name === 'HMAC' || AES_NAMES.indexOf(name) >= 0 || name === 'HKDF' || name === 'PBKDF2') return importSecret(alg, format, data, extractable, usages);
+      if (name === 'ECDSA' || name === 'ECDH') return importEc(alg, format, data, extractable, usages);
+      if (name === 'Ed25519' || name === 'X25519') return importOkp(alg, format, data, extractable, usages);
+      return importRsa(alg, format, data, extractable, usages);
+    };
+
+    // --- exporting
+    var jwkOps = function (key) { return Array.prototype.slice.call(key.__d.usages); };
+    var exportAny = function (format, key) {
+      var d = key.__d, name = d.algorithm.name, data = d.data;
+      if (!d.extractable) throw accessError('key is not extractable');
+      if (name === 'HKDF' || name === 'PBKDF2') throw accessError('key is not extractable');
+      if (format === 'raw') {
+        if (d.type === 'secret') return buf(new Uint8Array(data.bytes));
+        if (d.type === 'public' && data.pub) return buf(new Uint8Array(data.pub));
+        throw accessError('Cannot export this key as raw');
+      }
+      if (format === 'jwk') {
+        var jwk;
+        if (d.type === 'secret') {
+          jwk = { kty: 'oct', k: b64enc(data.bytes) };
+          if (name === 'HMAC') jwk.alg = d.algorithm.hash.name === 'SHA-1' ? 'HS1' : 'HS' + d.algorithm.hash.name.slice(4);
+          else jwk.alg = 'A' + d.algorithm.length + AES_JWK[name];
+        } else if (name === 'ECDSA' || name === 'ECDH') {
+          var size = data.curve / 8;
+          jwk = { kty: 'EC', crv: CURVE_NAMES[data.curve], x: b64enc(sliceBytes(data.pub, 1, 1 + size)), y: b64enc(sliceBytes(data.pub, 1 + size)) };
+          if (d.type === 'private') jwk.d = b64enc(data.priv);
+        } else if (name === 'Ed25519' || name === 'X25519') {
+          jwk = { kty: 'OKP', crv: name, x: b64enc(data.pub) };
+          if (d.type === 'private') jwk.d = b64enc(data.priv);
+        } else {
+          var h = d.algorithm.hash.name;
+          jwk = { kty: 'RSA', alg: name === 'RSA-OAEP' ? (h === 'SHA-1' ? 'RSA-OAEP' : 'RSA-OAEP-' + h.slice(4)) : (name === 'RSA-PSS' ? 'PS' : 'RS') + (h === 'SHA-1' ? '1' : h.slice(4)), n: b64enc(data.n), e: b64enc(data.e) };
+          if (d.type === 'private') {
+            jwk.d = b64enc(data.d);
+            if (data.crt.p) { jwk.p = b64enc(data.crt.p); jwk.q = b64enc(data.crt.q); jwk.dp = b64enc(data.crt.dp); jwk.dq = b64enc(data.crt.dq); jwk.qi = b64enc(data.crt.qi); }
+          }
+        }
+        jwk.key_ops = jwkOps(key);
+        jwk.ext = true;
+        return jwk;
+      }
+      if (format === 'spki') {
+        if (d.type !== 'public') throw accessError('Cannot export this key as spki');
+        if (name === 'ECDSA' || name === 'ECDH') return buf(der(0x30, [algId(OID.ec, der(6, [data.curve === 256 ? OID.p256 : OID.p384])), der(3, [concat(new Uint8Array([0]), data.pub)])]));
+        if (name === 'Ed25519' || name === 'X25519') return buf(der(0x30, [algId(name === 'Ed25519' ? OID.ed25519 : OID.x25519), der(3, [concat(new Uint8Array([0]), data.pub)])]));
+        return buf(der(0x30, [algId(OID.rsa, der(5, [])), der(3, [concat(new Uint8Array([0]), der(0x30, [derInt(data.n), derInt(data.e)]))])]));
+      }
+      if (format === 'pkcs8') {
+        if (d.type !== 'private') throw accessError('Cannot export this key as pkcs8');
+        var inner, alg;
+        if (name === 'ECDSA' || name === 'ECDH') {
+          alg = algId(OID.ec, der(6, [data.curve === 256 ? OID.p256 : OID.p384]));
+          inner = der(0x30, [derInt(new Uint8Array([1])), der(4, [data.priv]), der(0xa1, [der(3, [concat(new Uint8Array([0]), data.pub)])])]);
+        } else if (name === 'Ed25519' || name === 'X25519') {
+          alg = algId(name === 'Ed25519' ? OID.ed25519 : OID.x25519);
+          inner = der(4, [data.priv]);
+        } else {
+          if (!data.crt.p) throw notSupported('This RSA key has no CRT parameters to put in PKCS #8');
+          alg = algId(OID.rsa, der(5, []));
+          inner = der(0x30, [new Uint8Array([2, 1, 0]), derInt(data.n), derInt(data.e), derInt(data.d), derInt(data.crt.p), derInt(data.crt.q), derInt(data.crt.dp), derInt(data.crt.dq), derInt(data.crt.qi)]);
+        }
+        return buf(der(0x30, [new Uint8Array([2, 1, 0]), alg, der(4, [inner])]));
+      }
+      throw new TypeError("The provided value '" + format + "' is not a valid enum value of type KeyFormat.");
+    };
+
+    // --- RSA operations (the natives give the modular power; the padding is here)
+    var mgf1 = function (hash, seed, length) {
+      var out = new Uint8Array(0), counter = 0;
+      while (out.length < length) {
+        out = concat(out, digestOf(hash, concat(seed, new Uint8Array([counter >>> 24, (counter >>> 16) & 255, (counter >>> 8) & 255, counter & 255]))));
+        counter++;
+      }
+      return sliceBytes(out, 0, length);
+    };
+    var xorInto = function (a, b) { var out = new Uint8Array(a.length); for (var i = 0; i < a.length; i++) out[i] = a[i] ^ b[i]; return out; };
+    var DIGEST_INFO = {
+      'SHA-1': [0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14],
+      'SHA-256': [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20],
+      'SHA-384': [0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30],
+      'SHA-512': [0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40]
+    };
+    var rsaPower = function (n, exp, data) {
+      var out = __crypto_rsa_modpow(n, exp, data);
+      if (!out) throw opError('The RSA data is out of range');
+      return out;
+    };
+    var pkcs1Encode = function (hash, message, k) {
+      var t = concat(new Uint8Array(DIGEST_INFO[hash]), digestOf(hash, message));
+      if (k < t.length + 11) throw opError('The RSA key is too small for this hash');
+      var em = new Uint8Array(k);
+      em[1] = 1;
+      for (var i = 2; i < k - t.length - 1; i++) em[i] = 255;
+      for (var j = 0; j < t.length; j++) em[k - t.length + j] = t[j];
+      return em;
+    };
+    var pssEncode = function (hash, message, bits, saltLength) {
+      var hLen = HASHES[hash].size, emLen = Math.ceil((bits - 1) / 8);
+      if (emLen < hLen + saltLength + 2) throw opError('The RSA key is too small for this salt');
+      var salt = randomBytes(saltLength), h = digestOf(hash, concat(new Uint8Array(8), digestOf(hash, message), salt));
+      var db = new Uint8Array(emLen - hLen - 1);
+      db[emLen - saltLength - hLen - 2] = 1;
+      for (var i = 0; i < saltLength; i++) db[emLen - saltLength - hLen - 1 + i] = salt[i];
+      var masked = xorInto(db, mgf1(hash, h, db.length));
+      masked[0] &= 255 >> (8 * emLen - (bits - 1));
+      return concat(masked, h, new Uint8Array([0xbc]));
+    };
+    var pssVerify = function (hash, message, em, bits, saltLength) {
+      var hLen = HASHES[hash].size, emLen = Math.ceil((bits - 1) / 8);
+      if (em.length > emLen) { for (var z = 0; z < em.length - emLen; z++) if (em[z] !== 0) return false; em = sliceBytes(em, em.length - emLen); }
+      if (emLen < hLen + saltLength + 2 || em[em.length - 1] !== 0xbc) return false;
+      var masked = sliceBytes(em, 0, emLen - hLen - 1), h = sliceBytes(em, emLen - hLen - 1, emLen - 1);
+      var topBits = 8 * emLen - (bits - 1);
+      if (topBits && (masked[0] >> (8 - topBits)) !== 0) return false;
+      var db = xorInto(masked, mgf1(hash, h, masked.length));
+      db[0] &= 255 >> topBits;
+      var ps = emLen - hLen - saltLength - 2;
+      for (var i = 0; i < ps; i++) if (db[i] !== 0) return false;
+      if (db[ps] !== 1) return false;
+      var salt = sliceBytes(db, db.length - saltLength);
+      return sameBytes(h, digestOf(hash, concat(new Uint8Array(8), digestOf(hash, message), salt)));
+    };
+    var oaepEncrypt = function (hash, key, message, label) {
+      var d = key.__d.data, k = d.n.length, hLen = HASHES[hash].size;
+      if (message.length > k - 2 * hLen - 2) throw opError('The message is too long for this RSA key');
+      var db = concat(digestOf(hash, label), new Uint8Array(k - message.length - 2 * hLen - 2), new Uint8Array([1]), message);
+      var seed = randomBytes(hLen), maskedDb = xorInto(db, mgf1(hash, seed, db.length)), maskedSeed = xorInto(seed, mgf1(hash, maskedDb, hLen));
+      return rsaPower(d.n, d.e, concat(new Uint8Array([0]), maskedSeed, maskedDb));
+    };
+    var oaepDecrypt = function (hash, key, cipher, label) {
+      var d = key.__d.data, k = d.n.length, hLen = HASHES[hash].size;
+      if (cipher.length !== k || k < 2 * hLen + 2) throw opError();
+      var em = rsaPower(d.n, d.d, cipher), bad = em[0] !== 0 ? 1 : 0;
+      var maskedSeed = sliceBytes(em, 1, 1 + hLen), maskedDb = sliceBytes(em, 1 + hLen);
+      var seed = xorInto(maskedSeed, mgf1(hash, maskedDb, hLen)), db = xorInto(maskedDb, mgf1(hash, seed, maskedDb.length));
+      if (!sameBytes(sliceBytes(db, 0, hLen), digestOf(hash, label))) bad = 1;
+      var at = hLen;
+      while (at < db.length && db[at] === 0) at++;
+      if (at >= db.length || db[at] !== 1) bad = 1;
+      if (bad) throw opError();
+      return sliceBytes(db, at + 1);
+    };
+
+    // --- the operations of SubtleCrypto
+    var needKey = function (key) { if (!key || !key.__d) throw new TypeError("parameter is not of type 'CryptoKey'."); return key.__d; };
+    var useKey = function (key, name, usage) {
+      var d = needKey(key);
+      if (d.algorithm.name !== name) throw accessError('The key is not for this algorithm');
+      if (d.usages.indexOf(usage) < 0) throw accessError('The key does not support the requested usage');
+      return d;
+    };
+    var pad = function (u) { var n = 16 - (u.length % 16), out = new Uint8Array(u.length + n); out.set(u); for (var i = u.length; i < out.length; i++) out[i] = n; return out; };
+    var unpad = function (u) {
+      var n = u.length ? u[u.length - 1] : 0;
+      if (u.length === 0 || n === 0 || n > 16 || n > u.length) throw opError();
+      for (var i = u.length - n; i < u.length; i++) if (u[i] !== n) throw opError();
+      return sliceBytes(u, 0, u.length - n);
+    };
+    var aesKeyBytes = function (d) { return d.data.bytes; };
+    var kwWrap = function (key, p) {
+      var n = p.length / 8;
+      if (p.length % 8 !== 0 || n < 2) throw opError('AES-KW data must be a multiple of 8 bytes, at least 16');
+      var a = new Uint8Array([0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6, 0xa6]), r = [], i, j;
+      for (i = 0; i < n; i++) r.push(sliceBytes(p, i * 8, i * 8 + 8));
+      for (j = 0; j < 6; j++) for (i = 0; i < n; i++) {
+        var b = __crypto_aes(4, false, key, null, concat(a, r[i]));
+        var t = n * j + i + 1;
+        a = sliceBytes(b, 0, 8);
+        a[4] ^= (t >>> 24) & 255; a[5] ^= (t >>> 16) & 255; a[6] ^= (t >>> 8) & 255; a[7] ^= t & 255;
+        r[i] = sliceBytes(b, 8, 16);
+      }
+      return concat.apply(null, [a].concat(r));
+    };
+    var kwUnwrap = function (key, c) {
+      var n = c.length / 8 - 1;
+      if (c.length % 8 !== 0 || n < 2) throw opError();
+      var a = sliceBytes(c, 0, 8), r = [], i, j;
+      for (i = 0; i < n; i++) r.push(sliceBytes(c, 8 + i * 8, 16 + i * 8));
+      for (j = 5; j >= 0; j--) for (i = n - 1; i >= 0; i--) {
+        var t = n * j + i + 1, x = new Uint8Array(a);
+        x[4] ^= (t >>> 24) & 255; x[5] ^= (t >>> 16) & 255; x[6] ^= (t >>> 8) & 255; x[7] ^= t & 255;
+        var b = __crypto_aes(4, true, key, null, concat(x, r[i]));
+        a = sliceBytes(b, 0, 8);
+        r[i] = sliceBytes(b, 8, 16);
+      }
+      for (i = 0; i < 8; i++) if (a[i] !== 0xa6) throw opError();
+      return concat.apply(null, r);
+    };
+    var cipher = function (alg, key, data, decrypt, usage) {
+      var name = alg.name, d = useKey(key, name, usage), bytes;
+      if (name === 'RSA-OAEP') {
+        var label = alg.label === undefined ? new Uint8Array(0) : toBytes(alg.label), hash = d.algorithm.hash.name;
+        if (decrypt) { if (d.type !== 'private') throw accessError('The key is not a private key'); return oaepDecrypt(hash, key, data, label); }
+        if (d.type !== 'public') throw accessError('The key is not a public key');
+        return oaepEncrypt(hash, key, data, label);
+      }
+      var kb = aesKeyBytes(d);
+      if (name === 'AES-KW') return decrypt ? kwUnwrap(kb, data) : kwWrap(kb, data);
+      if (name === 'AES-CBC') {
+        var iv = toBytes(alg.iv);
+        if (iv.length !== 16) throw opError('The iv must be 16 bytes');
+        if (!decrypt) return __crypto_aes(1, false, kb, iv, pad(data));
+        if (data.length === 0 || data.length % 16) throw opError();
+        return unpad(__crypto_aes(1, true, kb, iv, data));
+      }
+      if (name === 'AES-CTR') {
+        var counter = toBytes(alg.counter), length = alg.length;
+        if (counter.length !== 16) throw opError('The counter must be 16 bytes');
+        if (!(length >= 1 && length <= 128)) throw opError('The length must be between 1 and 128');
+        if (length < 32 && Math.ceil(data.length / 16) > Math.pow(2, length)) throw opError('The data is too long for the counter');
+        return __crypto_aes(2, decrypt, kb, counter, data, null, length);
+      }
+      // AES-GCM
+      var giv = toBytes(alg.iv), tagLength = alg.tagLength === undefined ? 128 : alg.tagLength, aad = alg.additionalData === undefined ? new Uint8Array(0) : toBytes(alg.additionalData);
+      if ([32, 64, 96, 104, 112, 120, 128].indexOf(tagLength) < 0) throw opError('Invalid tag length');
+      if (giv.length !== 12) throw notSupported('Only 12 byte AES-GCM ivs are supported');
+      if (kb.length === 24) throw notSupported('AES-GCM with a 192 bit key is not supported');
+      if (!decrypt) {
+        var sealed = __crypto_aes(3, false, kb, giv, data, aad);
+        return sliceBytes(sealed, 0, sealed.length - 16 + tagLength / 8);
+      }
+      if (tagLength !== 128) throw notSupported('Only 128 bit AES-GCM tags can be checked');
+      var opened = __crypto_aes(3, true, kb, giv, data, aad);
+      if (!opened) throw opError();
+      return opened;
+    };
+    var signData = function (alg, key, data) {
+      var name = alg.name, d = useKey(key, name, 'sign');
+      if (name === 'HMAC') return __crypto_hmac(HASHES[d.algorithm.hash.name].kind, d.data.bytes, data);
+      if (d.type !== 'private') throw accessError('The key is not a private key');
+      if (name === 'ECDSA') {
+        var sig = __crypto_ec(4, d.data.curve, d.data.priv, digestOf(hashOf(alg.hash), data));
+        if (!sig) throw opError();
+        return sig;
+      }
+      if (name === 'Ed25519') throw notSupported('Ed25519 signing is not supported');
+      var hash = d.algorithm.hash.name, k = d.data.n.length;
+      if (name === 'RSASSA-PKCS1-v1_5') return rsaPower(d.data.n, d.data.d, pkcs1Encode(hash, data, k));
+      var em = pssEncode(hash, data, bitLength(d.data.n), alg.saltLength);
+      return rsaPower(d.data.n, d.data.d, em.length < k ? concat(new Uint8Array(k - em.length), em) : em);
+    };
+    var verifyData = function (alg, key, signature, data) {
+      var name = alg.name, d = useKey(key, name, 'verify');
+      if (name === 'HMAC') return sameBytes(__crypto_hmac(HASHES[d.algorithm.hash.name].kind, d.data.bytes, data), signature);
+      if (d.type !== 'public') throw accessError('The key is not a public key');
+      if (name === 'ECDSA') return __crypto_ec(5, d.data.curve, d.data.pub, digestOf(hashOf(alg.hash), data), signature);
+      if (name === 'Ed25519') return __crypto_x25519(3, d.data.pub, data, signature);
+      var hash = d.algorithm.hash.name, k = d.data.n.length;
+      if (signature.length !== k) return false;
+      var em = __crypto_rsa_modpow(d.data.n, d.data.e, signature);
+      if (!em) return false;
+      if (name === 'RSASSA-PKCS1-v1_5') {
+        if (k < DIGEST_INFO[hash].length + HASHES[hash].size + 11) return false;
+        return sameBytes(em, pkcs1Encode(hash, data, k));
+      }
+      return pssVerify(hash, data, em, bitLength(d.data.n), alg.saltLength);
+    };
+    var truncateBits = function (bytes, bits) {
+      if (bits === null || bits === undefined) return bytes;
+      if (bits > bytes.length * 8) throw opError('The requested length is longer than the shared secret');
+      var out = sliceBytes(bytes, 0, Math.ceil(bits / 8));
+      if (bits % 8) out[out.length - 1] &= (255 << (8 - bits % 8)) & 255;
+      return out;
+    };
+    var deriveBytes = function (alg, base, length) {
+      var name = alg.name, d = useKey(base, name, 'deriveBits');
+      if (name === 'PBKDF2') {
+        if (length === null || length === undefined || length % 8 !== 0 || length === 0) throw opError('The length must be a positive multiple of 8');
+        if (!(alg.iterations >= 1)) throw opError('The iteration count must be at least 1');
+        return __crypto_pbkdf2(HASHES[hashOf(alg.hash)].kind, d.data.bytes, toBytes(alg.salt), alg.iterations, length / 8);
+      }
+      if (name === 'HKDF') {
+        if (length === null || length === undefined || length % 8 !== 0) throw opError('The length must be a multiple of 8');
+        var hash = hashOf(alg.hash);
+        if (length / 8 > 255 * HASHES[hash].size) throw opError('The requested length is too long');
+        return __crypto_hkdf(HASHES[hash].kind, d.data.bytes, toBytes(alg.salt), toBytes(alg.info), length / 8);
+      }
+      var peer = needKey(alg.public);
+      if (d.type !== 'private') throw accessError('The base key must be a private key');
+      if (peer.type !== 'public' || peer.algorithm.name !== name) throw accessError('The public key is not for this algorithm');
+      var secret;
+      if (name === 'ECDH') {
+        if (peer.data.curve !== d.data.curve) throw accessError('The keys are on different curves');
+        secret = __crypto_ec(3, d.data.curve, d.data.priv, peer.data.pub);
+      } else {
+        secret = __crypto_x25519(2, d.data.priv, peer.data.pub);
+      }
+      if (!secret) throw opError('The key agreement failed');
+      return truncateBits(secret, length);
+    };
+    var keyLength = function (alg) {
+      var name = alg.name;
+      if (name === 'HKDF' || name === 'PBKDF2') return null;
+      if (name === 'HMAC') {
+        if (alg.length !== undefined) { if (alg.length === 0) throw new TypeError('Algorithm: length: must be non-zero'); return alg.length; }
+        return HASHES[hashOf(alg.hash)].block * 8;
+      }
+      if (alg.length !== 128 && alg.length !== 192 && alg.length !== 256) throw opError('Invalid AES key length');
+      return alg.length;
+    };
+    var generate = function (alg, extractable, usages) {
+      var name = alg.name, list, bits, bytes;
+      if (AES_NAMES.indexOf(name) >= 0) {
+        list = checkUsages(usages, USAGES[name], true);
+        bits = keyLength(alg);
+        if (name === 'AES-GCM' && bits === 192) throw notSupported('AES-GCM with a 192 bit key is not supported');
+        bytes = randomBytes(bits / 8);
+        return makeKey('secret', extractable, aesAlgorithm(name, bytes), list, { bytes: bytes });
+      }
+      if (name === 'HMAC') {
+        list = checkUsages(usages, USAGES.HMAC, true);
+        var hash = hashOf(alg.hash);
+        bits = keyLength(alg);
+        bytes = randomBytes(Math.ceil(bits / 8));
+        if (bits % 8) bytes[bytes.length - 1] &= (255 << (8 - bits % 8)) & 255;
+        return makeKey('secret', extractable, hmacAlgorithm(hash, bits), list, { bytes: bytes });
+      }
+      if (name === 'ECDSA' || name === 'ECDH') {
+        var curve = curveBits(alg);
+        var privUsages = checkUsages(usages, ecPublicUsages(name).concat(ecPrivateUsages(name)), true).filter(function (u) { return ecPrivateUsages(name).indexOf(u) >= 0; });
+        if (privUsages.length === 0) throw syntaxError('Usages cannot be empty when creating a key.');
+        var priv = __crypto_ec(1, curve), pub = __crypto_ec(2, curve, priv);
+        var pubUsages = Array.prototype.slice.call(usages).filter(function (u) { return ecPublicUsages(name).indexOf(u) >= 0; });
+        return {
+          publicKey: makeKey('public', true, ecAlgorithm(name, curve), pubUsages, { curve: curve, pub: pub, priv: null }),
+          privateKey: makeKey('private', extractable, ecAlgorithm(name, curve), privUsages, { curve: curve, pub: pub, priv: priv })
+        };
+      }
+      if (name === 'X25519') {
+        var all = checkUsages(usages, ['deriveKey', 'deriveBits'], true), priv25 = randomBytes(32);
+        return {
+          publicKey: makeKey('public', true, { name: name }, [], { pub: __crypto_x25519(1, priv25), priv: null }),
+          privateKey: makeKey('private', extractable, { name: name }, all, { pub: __crypto_x25519(1, priv25), priv: priv25 })
+        };
+      }
+      throw notSupported('Generating ' + name + ' keys is not supported');
+    };
+    var asyncOp = function (fn) {
+      try { return Promise.resolve(fn()); } catch (e) { return Promise.reject(e); }
+    };
+    var needArgs = function (args, n, what) { if (args.length < n) throw new TypeError("Failed to execute '" + what + "' on 'SubtleCrypto': " + n + " arguments required, but only " + args.length + " present."); };
+
     function SubtleCrypto() { throw new TypeError('Illegal constructor'); }
-    var subtle = Object.create(SubtleCrypto.prototype);
     hide(g, 'SubtleCrypto', SubtleCrypto);
-    method(SubtleCrypto.prototype, 'digest', function (algorithm, data) {
-      try { return Promise.resolve(__crypto_hash(hashKind(algorithm), bytesOf(data)).buffer); } catch (e) { return Promise.reject(e); }
+    Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, { value: 'SubtleCrypto', configurable: true });
+    var subtle = Object.create(SubtleCrypto.prototype);
+    var SP = SubtleCrypto.prototype;
+    method(SP, 'digest', function (algorithm, data) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 2, 'digest'); var a = normalize(algorithm, 'digest'); return buf(digestOf(a.name, toBytes(data))); });
     });
-    method(SubtleCrypto.prototype, 'importKey', function (format, keyData, algorithm, extractable, usages) {
-      try {
-        if (format !== 'raw') throw new DOMException('Only raw keys are supported.', 'NotSupportedError');
-        var name = typeof algorithm === 'string' ? algorithm : algorithm.name;
-        if (String(name).toUpperCase() !== 'HMAC') throw new DOMException('Unsupported algorithm ' + name, 'NotSupportedError');
-        var key = Object.create(CryptoKey.prototype);
-        key.type = 'secret'; key.extractable = !!extractable; key.algorithm = { name: 'HMAC', hash: { name: typeof algorithm.hash === 'string' ? algorithm.hash : algorithm.hash.name }, length: bytesOf(keyData).length * 8 };
-        key.usages = Array.from(usages || []);
-        hide(key, '__bytes', new Uint8Array(bytesOf(keyData)));
-        hide(key, '__hash', hashKind(algorithm.hash));
-        return Promise.resolve(key);
-      } catch (e) { return Promise.reject(e); }
+    method(SP, 'generateKey', function (algorithm, extractable, usages) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 3, 'generateKey'); return generate(normalize(algorithm, 'generateKey'), !!extractable, usages); });
     });
-    method(SubtleCrypto.prototype, 'sign', function (algorithm, key, data) {
-      try {
-        if (!key || key.__bytes === undefined) throw new DOMException('The key is not usable for signing.', 'InvalidAccessError');
-        return Promise.resolve(__crypto_hmac(key.__hash, key.__bytes, bytesOf(data)).buffer);
-      } catch (e) { return Promise.reject(e); }
+    method(SP, 'importKey', function (format, keyData, algorithm, extractable, usages) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 5, 'importKey'); return importAny(format, keyData, normalize(algorithm, 'importKey'), !!extractable, usages); });
     });
-    method(SubtleCrypto.prototype, 'verify', function (algorithm, key, signature, data) {
-      return this.sign(algorithm, key, data).then(function (mac) {
-        var a = new Uint8Array(mac), b = bytesOf(signature), same = a.length === b.length;
-        for (var i = 0; i < a.length && same; i++) same = a[i] === b[i];
-        return same;
+    method(SP, 'exportKey', function (format, key) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 2, 'exportKey'); needKey(key); return exportAny(String(format), key); });
+    });
+    method(SP, 'sign', function (algorithm, key, data) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 3, 'sign'); return buf(signData(normalize(algorithm, 'sign'), key, toBytes(data))); });
+    });
+    method(SP, 'verify', function (algorithm, key, signature, data) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 4, 'verify'); return verifyData(normalize(algorithm, 'verify'), key, toBytes(signature), toBytes(data)); });
+    });
+    method(SP, 'encrypt', function (algorithm, key, data) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 3, 'encrypt'); return buf(cipher(normalize(algorithm, 'encrypt'), key, toBytes(data), false, 'encrypt')); });
+    });
+    method(SP, 'decrypt', function (algorithm, key, data) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 3, 'decrypt'); return buf(cipher(normalize(algorithm, 'decrypt'), key, toBytes(data), true, 'decrypt')); });
+    });
+    method(SP, 'deriveBits', function (algorithm, baseKey, length) {
+      var args = arguments;
+      return asyncOp(function () { needArgs(args, 2, 'deriveBits'); return buf(deriveBytes(normalize(algorithm, 'deriveBits'), baseKey, length === undefined ? null : length)); });
+    });
+    method(SP, 'deriveKey', function (algorithm, baseKey, derivedKeyType, extractable, usages) {
+      var args = arguments;
+      return asyncOp(function () {
+        needArgs(args, 5, 'deriveKey');
+        var alg = normalize(algorithm, 'deriveKey'), target = normalize(derivedKeyType, 'importKey');
+        useKey(baseKey, alg.name, 'deriveKey');
+        var bits = keyLength(normalize(derivedKeyType, 'getKeyLength'));
+        if (bits === null) throw new TypeError('The derived key type has no key length');
+        var raw = deriveBytes(alg, baseKey, bits);
+        return importAny('raw', raw, target, !!extractable, usages);
       });
     });
-    method(SubtleCrypto.prototype, 'exportKey', function (format, key) {
-      if (!key || key.__bytes === undefined || !key.extractable) return Promise.reject(new DOMException('The key is not extractable.', 'InvalidAccessError'));
-      return Promise.resolve(new Uint8Array(key.__bytes).buffer);
+    method(SP, 'wrapKey', function (format, key, wrappingKey, wrapAlgorithm) {
+      var args = arguments;
+      return asyncOp(function () {
+        needArgs(args, 4, 'wrapKey');
+        var alg = normalize(wrapAlgorithm, 'wrapKey');
+        useKey(wrappingKey, alg.name, 'wrapKey');
+        var exported = exportAny(String(format), needKey(key) && key);
+        var bytes = format === 'jwk' ? new TextEncoder().encode(JSON.stringify(exported)) : new Uint8Array(exported);
+        return buf(cipher(alg, wrappingKey, bytes, false, 'wrapKey'));
+      });
     });
-    hide(g, 'crypto', {
-      subtle: subtle,
-      getRandomValues: function (array) {
-        if (!ArrayBuffer.isView(array) || array instanceof Float32Array || array instanceof Float64Array) throw new DOMException("The data argument must be an integer-type TypedArray.", 'TypeMismatchError');
-        if (array.byteLength > 65536) throw new DOMException('The ArrayBufferView\'s byte length (' + array.byteLength + ') exceeds the number of bytes of entropy available via this API (65536).', 'QuotaExceededError');
-        var max = array.BYTES_PER_ELEMENT === 4 ? 4294967296 : array.BYTES_PER_ELEMENT === 2 ? 65536 : 256;
-        for (var i = 0; i < array.length; i++) array[i] = Math.floor(Math.random() * max);
-        return array;
-      },
-      randomUUID: function () {
-        var template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx', out = '';
-        for (var i = 0; i < template.length; i++) {
-          var c = template.charAt(i);
-          if (c !== 'x' && c !== 'y') { out += c; continue; }
-          var r = Math.floor(Math.random() * 16);
-          out += (c === 'x' ? r : (r & 3) | 8).toString(16);
-        }
-        return out;
-      }
+    method(SP, 'unwrapKey', function (format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, usages) {
+      var args = arguments;
+      return asyncOp(function () {
+        needArgs(args, 7, 'unwrapKey');
+        var alg = normalize(unwrapAlgorithm, 'unwrapKey'), target = normalize(unwrappedKeyAlgorithm, 'importKey');
+        var bytes = cipher(alg, unwrappingKey, toBytes(wrappedKey), true, 'unwrapKey');
+        var data = bytes;
+        if (format === 'jwk') { try { data = JSON.parse(new TextDecoder().decode(bytes)); } catch (e) { throw dataError('The unwrapped data is not a JWK'); } }
+        return importAny(String(format), data, target, !!extractable, usages);
+      });
     });
+
+    var INTEGER_ARRAYS = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array', 'BigUint64Array'];
+    function Crypto() { throw new TypeError('Illegal constructor'); }
+    hide(g, 'Crypto', Crypto);
+    Object.defineProperty(Crypto.prototype, Symbol.toStringTag, { value: 'Crypto', configurable: true });
+    method(Crypto.prototype, 'getRandomValues', function (array) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getRandomValues' on 'Crypto': 1 argument required, but only 0 present.");
+      var integer = ArrayBuffer.isView(array) && INTEGER_ARRAYS.some(function (name) { return typeof g[name] === 'function' && array instanceof g[name]; });
+      if (!integer) throw new DOMException("The data argument must be an integer-type TypedArray.", 'TypeMismatchError');
+      if (array.byteLength > 65536) throw new DOMException('The ArrayBufferView\'s byte length (' + array.byteLength + ') exceeds the number of bytes of entropy available via this API (65536).', 'QuotaExceededError');
+      if (array.byteLength > 0) new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(__crypto_random(array.byteLength));
+      return array;
+    });
+    method(Crypto.prototype, 'randomUUID', function () {
+      var b = __crypto_random(16), hex = '';
+      b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
+      for (var i = 0; i < 16; i++) { hex += (b[i] < 16 ? '0' : '') + b[i].toString(16); if (i === 3 || i === 5 || i === 7 || i === 9) hex += '-'; }
+      return hex;
+    });
+    Object.defineProperty(Crypto.prototype, 'subtle', { get: function () { if (g.isSecureContext === false) return undefined; return subtle; }, enumerable: true, configurable: true });
+    hide(g, '__subtle', subtle);
+    hide(g, 'crypto', Object.create(Crypto.prototype));
   }
   var resolved = function (v) { return Promise.resolve(v); };
   method(EP, 'animate', function (keyframes, options) {

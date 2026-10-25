@@ -3663,7 +3663,178 @@ static void test_messaging() {
                  "var enc = new TextEncoder(); crypto.subtle.importKey('raw', enc.encode('key'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']).then(function (key) {"
                  "return crypto.subtle.sign('HMAC', key, enc.encode('The quick brown fox jumps over the lazy dog')).then(function (mac) { console.log(hex(mac)); return crypto.subtle.verify('HMAC', key, mac, enc.encode('The quick brown fox jumps over the lazy dog')); }); }).then(function (ok) { console.log(ok); });",
                  "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8 | true", nullptr, "https://app.example/"));
-  CHECK(async_is("var a = crypto.getRandomValues(new Uint8Array(16)); var r = ''; try { crypto.subtle.digest('MD5', new Uint8Array(1)).catch(function (e) { console.log(a.length, e.name, crypto.randomUUID().length, typeof crypto.subtle.encrypt); }); } catch (e) { r = e.name; }", "16 NotSupportedError 36 undefined", nullptr, "https://app.example/"));
+  CHECK(async_is("var a = crypto.getRandomValues(new Uint8Array(16)); var r = ''; try { crypto.subtle.digest('MD5', new Uint8Array(1)).catch(function (e) { console.log(a.length, e.name, crypto.randomUUID().length, typeof crypto.subtle.encrypt); }); } catch (e) { r = e.name; }", "16 NotSupportedError 36 function", nullptr, "https://app.example/"));
+  // Web Crypto
+  // random
+  CHECK(async_is(R"JSC(function hex(b) { return Array.from(new Uint8Array(b)).map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+function unhex(s) { var o = new Uint8Array(s.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(s.substr(i * 2, 2), 16); return o; }
+function b64u(b) { var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', u = new Uint8Array(b), o = '', i; for (i = 0; i < u.length; i += 3) { var n = (u[i] << 16) | ((u[i + 1] || 0) << 8) | (u[i + 2] || 0); o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u.length ? A[(n >> 6) & 63] : '') + (i + 2 < u.length ? A[n & 63] : ''); } return o; }
+var enc = new TextEncoder(), S = crypto.subtle;
+function fail(e) { console.log('FAIL', e && e.name, e && e.message); }
+var a = crypto.getRandomValues(new Uint8Array(32)), b = crypto.getRandomValues(new Uint32Array(8));
+var z = 0; a.forEach(function (x) { z |= x; });
+var u = crypto.randomUUID();
+var errs = [];
+try { crypto.getRandomValues(new Float32Array(2)) } catch (e) { errs.push(e.name) }
+try { crypto.getRandomValues(new Uint8Array(65537)) } catch (e) { errs.push(e.name) }
+try { crypto.getRandomValues([1, 2]) } catch (e) { errs.push(e.name) }
+console.log(z !== 0, b.length, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(u), u !== crypto.randomUUID(), errs.join(), crypto instanceof Crypto, S instanceof SubtleCrypto, crypto.getRandomValues(a) === a);)JSC",
+                 "true 8 true true TypeMismatchError,QuotaExceededError,TypeMismatchError true true true", nullptr, "https://app.example/"));
+  // kdf
+  CHECK(async_is(R"JSC(function hex(b) { return Array.from(new Uint8Array(b)).map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+function unhex(s) { var o = new Uint8Array(s.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(s.substr(i * 2, 2), 16); return o; }
+function b64u(b) { var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', u = new Uint8Array(b), o = '', i; for (i = 0; i < u.length; i += 3) { var n = (u[i] << 16) | ((u[i + 1] || 0) << 8) | (u[i + 2] || 0); o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u.length ? A[(n >> 6) & 63] : '') + (i + 2 < u.length ? A[n & 63] : ''); } return o; }
+var enc = new TextEncoder(), S = crypto.subtle;
+function fail(e) { console.log('FAIL', e && e.name, e && e.message); }
+S.importKey('raw', enc.encode('password'), 'PBKDF2', false, ['deriveBits', 'deriveKey']).then(function (k) {
+  return S.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('salt'), iterations: 1 }, k, 256).then(function (a) { console.log(hex(a));
+  return S.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('salt'), iterations: 2 }, k, 256); }).then(function (a) { console.log(hex(a));
+  return S.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('salt'), iterations: 3 }, k, { name: 'AES-GCM', length: 256 }, true, ['encrypt']); }).then(function (key) { console.log(key.algorithm.name, key.algorithm.length, key.extractable, key.usages.join(), key.type); });
+}).then(function () {
+  var ikm = new Uint8Array(22).fill(11), salt = unhex('000102030405060708090a0b0c'), info = unhex('f0f1f2f3f4f5f6f7f8f9');
+  return S.importKey('raw', ikm, 'HKDF', false, ['deriveBits']).then(function (k) { return S.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: salt, info: info }, k, 336); });
+}).then(function (a) { console.log(hex(a)); }).catch(fail);)JSC",
+                 "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b | ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43 | AES-GCM 256 true encrypt secret | 3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", nullptr, "https://app.example/"));
+  // aes
+  CHECK(async_is(R"JSC(function hex(b) { return Array.from(new Uint8Array(b)).map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+function unhex(s) { var o = new Uint8Array(s.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(s.substr(i * 2, 2), 16); return o; }
+function b64u(b) { var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', u = new Uint8Array(b), o = '', i; for (i = 0; i < u.length; i += 3) { var n = (u[i] << 16) | ((u[i + 1] || 0) << 8) | (u[i + 2] || 0); o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u.length ? A[(n >> 6) & 63] : '') + (i + 2 < u.length ? A[n & 63] : ''); } return o; }
+var enc = new TextEncoder(), S = crypto.subtle;
+function fail(e) { console.log('FAIL', e && e.name, e && e.message); }
+var kb = unhex('2b7e151628aed2a6abf7158809cf4f3c'), pt = unhex('6bc1bee22e409f96e93d7e117393172a');
+S.importKey('raw', new Uint8Array(16), 'AES-GCM', false, ['encrypt', 'decrypt']).then(function (k) {
+  return S.encrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, k, new Uint8Array(16)).then(function (c) { console.log(hex(c));
+    return S.decrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, k, c).then(function (p) { console.log(hex(p));
+      var bad = new Uint8Array(c); bad[3] ^= 1; return S.decrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, k, bad); }); }).catch(function (e) { console.log(e.name); });
+}).then(function () {
+  return S.importKey('raw', kb, 'AES-CBC', true, ['encrypt', 'decrypt']).then(function (k) {
+    var iv = unhex('000102030405060708090a0b0c0d0e0f');
+    return S.encrypt({ name: 'AES-CBC', iv: iv }, k, pt).then(function (c) { console.log(c.byteLength, hex(c).slice(0, 32)); return S.decrypt({ name: 'AES-CBC', iv: iv }, k, c); }).then(function (p) { console.log(hex(p));
+      return S.decrypt({ name: 'AES-CBC', iv: iv }, k, new Uint8Array(32)); }).catch(function (e) { console.log(e.name); });
+  });
+}).then(function () {
+  return S.importKey('raw', kb, 'AES-CTR', false, ['encrypt']).then(function (k) { return S.encrypt({ name: 'AES-CTR', counter: unhex('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff'), length: 64 }, k, pt); }).then(function (c) { console.log(hex(c)); });
+}).then(function () {
+  return S.importKey('raw', unhex('000102030405060708090a0b0c0d0e0f'), 'AES-KW', true, ['wrapKey', 'unwrapKey']).then(function (kek) {
+    return S.importKey('raw', unhex('00112233445566778899aabbccddeeff'), 'AES-CBC', true, ['encrypt']).then(function (key) {
+      return S.wrapKey('raw', key, kek, 'AES-KW').then(function (w) { console.log(hex(w)); return S.unwrapKey('raw', w, kek, 'AES-KW', 'AES-CBC', true, ['decrypt']); })
+        .then(function (u) { console.log(u.algorithm.name, u.algorithm.length, u.usages.join()); return S.exportKey('raw', u); }).then(function (r) { console.log(hex(r)); });
+    });
+  });
+}).then(function () {
+  return S.generateKey({ name: 'AES-GCM', length: 128 }, true, ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey']).then(function (wk) {
+    return S.generateKey({ name: 'HMAC', hash: 'SHA-256' }, true, ['sign']).then(function (h) {
+      var iv = new Uint8Array(12);
+      return S.wrapKey('jwk', h, wk, { name: 'AES-GCM', iv: iv }).then(function (w) { return S.unwrapKey('jwk', w, wk, { name: 'AES-GCM', iv: iv }, { name: 'HMAC', hash: 'SHA-256' }, true, ['sign']); })
+        .then(function (u) { return Promise.all([S.exportKey('jwk', u), S.exportKey('jwk', h)]); }).then(function (both) { console.log(both[0].k === both[1].k, both[0].alg, h.algorithm.length); });
+    });
+  });
+}).catch(fail);)JSC",
+                 "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf | 00000000000000000000000000000000 | OperationError | 32 7649abac8119b246cee98e9b12e9197d | 6bc1bee22e409f96e93d7e117393172a | OperationError | 874d6191b620e3261bef6864990db6ce | 1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5 | AES-CBC 128 decrypt | 00112233445566778899aabbccddeeff | true HS256 512", nullptr, "https://app.example/"));
+  // ec
+  CHECK(async_is(R"JSC(function hex(b) { return Array.from(new Uint8Array(b)).map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+function unhex(s) { var o = new Uint8Array(s.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(s.substr(i * 2, 2), 16); return o; }
+function b64u(b) { var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', u = new Uint8Array(b), o = '', i; for (i = 0; i < u.length; i += 3) { var n = (u[i] << 16) | ((u[i + 1] || 0) << 8) | (u[i + 2] || 0); o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u.length ? A[(n >> 6) & 63] : '') + (i + 2 < u.length ? A[n & 63] : ''); } return o; }
+var enc = new TextEncoder(), S = crypto.subtle;
+function fail(e) { console.log('FAIL', e && e.name, e && e.message); }
+var order = [];
+function run(curve, hash) {
+  return S.generateKey({ name: 'ECDSA', namedCurve: curve }, true, ['sign', 'verify']).then(function (pair) {
+    var data = enc.encode('message');
+    return S.sign({ name: 'ECDSA', hash: hash }, pair.privateKey, data).then(function (sig) {
+      return Promise.all([S.verify({ name: 'ECDSA', hash: hash }, pair.publicKey, sig, data), S.verify({ name: 'ECDSA', hash: hash }, pair.publicKey, sig, enc.encode('messagf')), Promise.resolve(sig.byteLength)]);
+    }).then(function (r) { console.log(curve, r.join(), pair.publicKey.type, pair.privateKey.type, pair.publicKey.usages.join(), pair.privateKey.usages.join(), pair.publicKey.algorithm.namedCurve);
+      return Promise.all([S.exportKey('spki', pair.publicKey), S.exportKey('pkcs8', pair.privateKey), S.exportKey('jwk', pair.privateKey), S.exportKey('raw', pair.publicKey)]);
+    }).then(function (ex) {
+      return Promise.all([S.importKey('spki', ex[0], { name: 'ECDSA', namedCurve: curve }, true, ['verify']), S.importKey('pkcs8', ex[1], { name: 'ECDSA', namedCurve: curve }, true, ['sign']),
+                          S.importKey('jwk', ex[2], { name: 'ECDSA', namedCurve: curve }, true, ['sign']), S.importKey('raw', ex[3], { name: 'ECDSA', namedCurve: curve }, true, ['verify'])]).then(function (k) {
+        return Promise.all([S.exportKey('spki', k[0]), S.exportKey('pkcs8', k[1]), S.exportKey('jwk', k[2]), S.exportKey('raw', k[3])]).then(function (again) {
+          console.log(hex(again[0]) === hex(ex[0]), hex(again[1]) === hex(ex[1]), JSON.stringify(again[2]) === JSON.stringify(ex[2]), hex(again[3]) === hex(ex[3]), ex[2].kty, ex[2].crv, ex[2].key_ops.join());
+        });
+      });
+    });
+  });
+}
+run('P-256', 'SHA-256').then(function () { return run('P-384', 'SHA-384'); }).then(function () {
+  return Promise.all([S.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']), S.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits'])]);
+}).then(function (p) {
+  return Promise.all([S.deriveBits({ name: 'ECDH', public: p[1].publicKey }, p[0].privateKey, 256), S.deriveBits({ name: 'ECDH', public: p[0].publicKey }, p[1].privateKey, 256), S.deriveBits({ name: 'ECDH', public: p[0].publicKey }, p[1].privateKey, 100),
+                      S.deriveKey({ name: 'ECDH', public: p[1].publicKey }, p[0].privateKey, { name: 'AES-GCM', length: 128 }, false, ['encrypt'])]).then(function (r) {
+    console.log(hex(r[0]) === hex(r[1]), r[0].byteLength, r[2].byteLength, r[3].algorithm.length, p[0].publicKey.usages.length);
+  });
+}).then(function () {
+  return S.generateKey({ name: 'ECDSA', namedCurve: 'P-521' }, true, ['sign']);
+}).catch(function (e) { console.log(e.name); });)JSC",
+                 "P-256 true,false,64 public private verify sign P-256 | true true true true EC P-256 sign | P-384 true,false,96 public private verify sign P-384 | true true true true EC P-384 sign | true 32 13 128 0 | NotSupportedError", nullptr, "https://app.example/"));
+  // x25519
+  CHECK(async_is(R"JSC(function hex(b) { return Array.from(new Uint8Array(b)).map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+function unhex(s) { var o = new Uint8Array(s.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(s.substr(i * 2, 2), 16); return o; }
+function b64u(b) { var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', u = new Uint8Array(b), o = '', i; for (i = 0; i < u.length; i += 3) { var n = (u[i] << 16) | ((u[i + 1] || 0) << 8) | (u[i + 2] || 0); o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u.length ? A[(n >> 6) & 63] : '') + (i + 2 < u.length ? A[n & 63] : ''); } return o; }
+var enc = new TextEncoder(), S = crypto.subtle;
+function fail(e) { console.log('FAIL', e && e.name, e && e.message); }
+function jwkOf(priv, pub) { return { kty: 'OKP', crv: 'X25519', x: b64u(unhex(pub)), d: b64u(unhex(priv)) }; }
+var A = jwkOf('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a', '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a');
+var B = jwkOf('5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb', 'de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f');
+Promise.all([S.importKey('jwk', A, 'X25519', true, ['deriveBits']), S.importKey('jwk', { kty: 'OKP', crv: 'X25519', x: B.x }, 'X25519', true, [])]).then(function (k) {
+  return S.deriveBits({ name: 'X25519', public: k[1] }, k[0], 256).then(function (s) { console.log(hex(s)); return S.exportKey('raw', k[1]); });
+}).then(function (raw) { console.log(hex(raw)); return S.generateKey('X25519', true, ['deriveBits']); })
+.then(function (pair) { return Promise.all([S.exportKey('spki', pair.publicKey), S.exportKey('pkcs8', pair.privateKey)]).then(function (e) { return Promise.all([S.importKey('spki', e[0], 'X25519', true, []), S.importKey('pkcs8', e[1], 'X25519', true, ['deriveBits'])]); }); })
+.then(function (k) { console.log(k[0].type, k[1].type, k[1].algorithm.name); return S.generateKey('Ed25519', true, ['sign']); }).catch(function (e) { console.log(e.name); });)JSC",
+                 "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742 | de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f | public private X25519 | NotSupportedError", nullptr, "https://app.example/"));
+  // rsa
+  CHECK(async_is(R"JSC(function hex(b) { return Array.from(new Uint8Array(b)).map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+function unhex(s) { var o = new Uint8Array(s.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(s.substr(i * 2, 2), 16); return o; }
+function b64u(b) { var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', u = new Uint8Array(b), o = '', i; for (i = 0; i < u.length; i += 3) { var n = (u[i] << 16) | ((u[i + 1] || 0) << 8) | (u[i + 2] || 0); o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u.length ? A[(n >> 6) & 63] : '') + (i + 2 < u.length ? A[n & 63] : ''); } return o; }
+var enc = new TextEncoder(), S = crypto.subtle;
+function fail(e) { console.log('FAIL', e && e.name, e && e.message); }
+var jwk = {"kty": "RSA", "n": "ly_gCWaj8mFwTtEpLzI32f2kL6-ADXs9rt55Oi5_D6xOAlft3UVCc02bibV7lySpdqDO3fJ9Zy6jfO8ADGKR0yjhDfHNV7XeVYkG_QTD1e7ZdMbPF46l8iuEaQaiDh6FuVomjtjFDHj_LGlC97PajRAV2PPE43wr4kGbNUmhick", "e": "AQAB", "d": "OzOtGCFQK7aKIuL2rJuOkVcoNuATVbQfuF03vVe9u6ZuOa6y30WiusH2GRuu1MWvcluQBgtRndj-fgqcyzzB-wLfIpagbNsRnY_TVOGvZe7yDImJZZdD8cE1y-YOrzmwobz4F2a90tzAWXSCpHv6Gf-ZMaI0U1ZhuH9hqWfg0DE", "p": "xmUKqmLFdjx6C_d_BngZeoqd16d0wbwEpVmTuxhJIERCjxvkOZTP33pl3trJ7wJS5aecFXmU0W2CavTAES7KRQ", "q": "wxXR18-RYsBJQ5KzwseOJRVGw1z-THRd75ek8g1z3nw-vrvRG9lxu7FDlZak_UUZeqvVeAQqvQIUNqwduG5btQ", "dp": "CiHQ6KDAuugdx4ytRRRPIM4Bf6kCsn46soMfo1d7LJWv3IUtI6-w6hXjK_16gKVavHXR59rcudFg7rtvL7F3DQ", "dq": "c9nWVwnN9c3o9Db_h5FISZ9b-ZKU9cQ5MJpmetQgViSEgnI42QgFcYfwcboXWsyZN-8pgu8-jiXY6SrHL4ph7Q", "qi": "T76CrsTM5vDZTpoNJ61XCQb2OBOVwiMh3lqhykjVPi8Q2T1zQkhSM4xx4ruQ_dscLjfyd-ubEHJiVetwJASc0A"}, sigHex = '4b7146c511c67dd98358ded32919e84edf964c6b99b876fcdba36055ba2c9ff1c69bf7894b26da6b939bbe011ef0dd37b9ac97295ef6588ee28603912f02b45d63d4c447c72336b459da0ab02a3a3dbc3e71f97d3e4b00e627460b811d228a2f3022f16220eb4a81d6f2e57ce6a3cea1238b4b16a252debf0eadeec80b2da2d7', oaepHex = '854020ef41eee8099b8ee805287363d68f99cccafadf38f1d0932ad47573a893be5d1baffcf94bd2d5d5714c43b3b7efc7dfced6a009d53ff03943dc17f61940da9f230b10c0a16e079a7fda85065070f2fc095b7955f813242573860260a183daaa1bbcc080b22b3fec4fd23336689e3423160466ab8bb724747a1b60576580', pkcs8Hex = '30820275020100300d06092a864886f70d01010105000482025f3082025b02010002818100972fe00966a3f261704ed1292f3237d9fda42faf800d7b3daede793a2e7f0fac4e0257eddd4542734d9b89b57b9724a976a0ceddf27d672ea37cef000c6291d328e10df1cd57b5de558906fd04c3d5eed974c6cf178ea5f22b846906a20e1e85b95a268ed8c50c78ff2c6942f7b3da8d1015d8f3c4e37c2be2419b3549a189c902030100010281803b33ad1821502bb68a22e2f6ac9b8e91572836e01355b41fb85d37bd57bdbba66e39aeb2df45a2bac1f6191baed4c5af725b90060b519dd8fe7e0a9ccb3cc1fb02df2296a06cdb119d8fd354e1af65eef20c8989659743f1c135cbe60eaf39b0a1bcf81766bdd2dcc0597482a47bfa19ff9931a234535661b87f61a967e0d031024100c6650aaa62c5763c7a0bf77f0678197a8a9dd7a774c1bc04a55993bb18492044428f1be43994cfdf7a65dedac9ef0252e5a79c157994d16d826af4c0112eca45024100c315d1d7cf9162c0494392b3c2c78e251546c35cfe4c745def97a4f20d73de7c3ebebbd11bd971bbb1439596a4fd45197aabd578042abd021436ac1db86e5bb502400a21d0e8a0c0bae81dc78cad45144f20ce017fa902b27e3ab2831fa3577b2c95afdc852d23afb0ea15e32bfd7a80a55abc75d1e7dadcb9d160eebb6f2fb1770d024073d9d65709cdf5cde8f436ff879148499f5bf99294f5c439309a667ad420562484827238d908057187f071ba175acc9937ef2982ef3e8e25d8e92ac72f8a61ed02404fbe82aec4cce6f0d94e9a0d27ad570906f6381395c22321de5aa1ca48d53e2f10d93d73424852338c71e2bb90fddb1c2e37f277eb9b10726255eb7024049cd0', spkiHex = '30819f300d06092a864886f70d010101050003818d0030818902818100972fe00966a3f261704ed1292f3237d9fda42faf800d7b3daede793a2e7f0fac4e0257eddd4542734d9b89b57b9724a976a0ceddf27d672ea37cef000c6291d328e10df1cd57b5de558906fd04c3d5eed974c6cf178ea5f22b846906a20e1e85b95a268ed8c50c78ff2c6942f7b3da8d1015d8f3c4e37c2be2419b3549a189c90203010001';
+var msg = enc.encode('hello rsa');
+var pubJwk = { kty: 'RSA', n: jwk.n, e: jwk.e };
+Promise.all([S.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, true, ['sign']), S.importKey('jwk', pubJwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, true, ['verify'])]).then(function (k) {
+  console.log(k[0].algorithm.modulusLength, hex(k[0].algorithm.publicExponent), k[0].type, k[1].type);
+  return S.sign('RSASSA-PKCS1-v1_5', k[0], msg).then(function (sig) { console.log(hex(sig) === sigHex);
+    return Promise.all([S.verify('RSASSA-PKCS1-v1_5', k[1], unhex(sigHex), msg), S.verify('RSASSA-PKCS1-v1_5', k[1], unhex(sigHex), enc.encode('hello rsb')), S.verify('RSASSA-PKCS1-v1_5', k[1], new Uint8Array(128), msg)]); });
+}).then(function (r) { console.log(r.join()); }).then(function () {
+  return Promise.all([S.importKey('jwk', jwk, { name: 'RSA-PSS', hash: 'SHA-256' }, true, ['sign']), S.importKey('jwk', pubJwk, { name: 'RSA-PSS', hash: 'SHA-256' }, true, ['verify'])]).then(function (k) {
+    return S.sign({ name: 'RSA-PSS', saltLength: 32 }, k[0], msg).then(function (sig) {
+      return Promise.all([S.verify({ name: 'RSA-PSS', saltLength: 32 }, k[1], sig, msg), S.verify({ name: 'RSA-PSS', saltLength: 20 }, k[1], sig, msg), S.verify({ name: 'RSA-PSS', saltLength: 32 }, k[1], sig, enc.encode('x'))]); });
+  });
+}).then(function (r) { console.log(r.join()); }).then(function () {
+  return Promise.all([S.importKey('jwk', jwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['decrypt']), S.importKey('spki', unhex(spkiHex), { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt'])]).then(function (k) {
+    return S.decrypt('RSA-OAEP', k[0], unhex(oaepHex)).then(function (p) { console.log(new TextDecoder().decode(p));
+      return S.encrypt({ name: 'RSA-OAEP', label: enc.encode('L') }, k[1], msg); }).then(function (c) { console.log(c.byteLength);
+      return S.decrypt({ name: 'RSA-OAEP', label: enc.encode('L') }, k[0], c).then(function (p) { console.log(new TextDecoder().decode(p)); return S.decrypt('RSA-OAEP', k[0], c); }); });
+  });
+}).catch(function (e) { console.log(e.name); }).then(function () {
+  return S.importKey('pkcs8', unhex(pkcs8Hex), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, true, ['sign']).then(function (k) {
+    return Promise.all([S.exportKey('pkcs8', k), S.exportKey('jwk', k)]).then(function (e) { console.log(hex(e[0]) === pkcs8Hex, e[1].alg, e[1].p === jwk.p, e[1].qi === jwk.qi, e[1].key_ops.join()); return S.generateKey({ name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign']); });
+  });
+}).catch(function (e) { console.log(e.name); });)JSC",
+                 "1024 010001 private public | true | true,false,false | true,false,false | hello rsa | 128 | hello rsa | OperationError | true RS256 true true sign | NotSupportedError", nullptr, "https://app.example/"));
+  // errors
+  CHECK(async_is(R"JSC(function hex(b) { return Array.from(new Uint8Array(b)).map(function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+function unhex(s) { var o = new Uint8Array(s.length / 2); for (var i = 0; i < o.length; i++) o[i] = parseInt(s.substr(i * 2, 2), 16); return o; }
+function b64u(b) { var A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_', u = new Uint8Array(b), o = '', i; for (i = 0; i < u.length; i += 3) { var n = (u[i] << 16) | ((u[i + 1] || 0) << 8) | (u[i + 2] || 0); o += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < u.length ? A[(n >> 6) & 63] : '') + (i + 2 < u.length ? A[n & 63] : ''); } return o; }
+var enc = new TextEncoder(), S = crypto.subtle;
+function fail(e) { console.log('FAIL', e && e.name, e && e.message); }
+var out = [];
+function tryIt(name, p) { return p.then(function () { out.push(name + ':ok'); }, function (e) { out.push(name + ':' + e.name); }); }
+S.generateKey({ name: 'HMAC', hash: 'SHA-256' }, false, ['sign']).then(function (h) {
+  return tryIt('md5', S.digest('MD5', new Uint8Array(1))).then(function () {
+  return tryIt('notextractable', S.exportKey('raw', h)); }).then(function () {
+  return tryIt('wrongusage', S.verify('HMAC', h, new Uint8Array(32), new Uint8Array(1))); }).then(function () {
+  return tryIt('wrongalg', S.sign('ECDSA', h, new Uint8Array(1))); }).then(function () {
+  return tryIt('emptyusages', S.generateKey({ name: 'AES-GCM', length: 128 }, true, [])); }).then(function () {
+  return tryIt('badusage', S.generateKey({ name: 'AES-GCM', length: 128 }, true, ['sign'])); }).then(function () {
+  return tryIt('badlength', S.generateKey({ name: 'AES-GCM', length: 100 }, true, ['encrypt'])); }).then(function () {
+  return tryIt('badraw', S.importKey('raw', new Uint8Array(5), 'AES-GCM', true, ['encrypt'])); }).then(function () {
+  return tryIt('badformat', S.importKey('spki', new Uint8Array(5), 'AES-GCM', true, ['encrypt'])); }).then(function () {
+  return tryIt('noargs', S.digest()); }).then(function () {
+  return tryIt('hkdfextractable', S.importKey('raw', new Uint8Array(5), 'HKDF', true, ['deriveBits'])); }).then(function () {
+  return tryIt('badpoint', S.importKey('raw', new Uint8Array(65), { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify'])); }).then(function () {
+  return tryIt('gcmiv', S.generateKey({ name: 'AES-GCM', length: 128 }, true, ['encrypt']).then(function (k) { return S.encrypt({ name: 'AES-GCM', iv: new Uint8Array(16) }, k, new Uint8Array(1)); })); });
+}).then(function () { console.log(out.join(' ')); try { new CryptoKey() } catch (e) { console.log(e.name) } });)JSC",
+                 "md5:NotSupportedError notextractable:InvalidAccessError wrongusage:InvalidAccessError wrongalg:InvalidAccessError emptyusages:SyntaxError badusage:SyntaxError badlength:OperationError badraw:DataError badformat:NotSupportedError noargs:TypeError hkdfextractable:SyntaxError badpoint:DataError gcmiv:NotSupportedError | TypeError", nullptr, "https://app.example/"));
   // IndexedDB
   CHECK(async_is("var open = indexedDB.open('shop', 1); open.onupgradeneeded = function () { var db = open.result; var s = db.createObjectStore('items', { keyPath: 'id' }); s.createIndex('byName', 'name', { unique: false }); s.add({ id: 1, name: 'pen' }); s.add({ id: 2, name: 'ink' }); };"
                  "open.onsuccess = function () { var db = open.result; var tx = db.transaction('items', 'readwrite'); var st = tx.objectStore('items'); st.put({ id: 3, name: 'cap' }); var all = st.getAll(); var by = st.index('byName').get('ink');"

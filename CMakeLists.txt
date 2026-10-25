@@ -244,6 +244,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsDash.cpp
   src/Browser/DomBindingsForm.cpp
   src/Browser/DomBindingsNet.cpp
+  src/Browser/DomBindingsCrypto.cpp
   src/Browser/WebPrelude.cpp
   src/Browser/WebUrl.cpp
   src/Browser/CookieJar.cpp
