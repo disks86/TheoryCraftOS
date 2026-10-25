@@ -17,8 +17,10 @@
 cmake_minimum_required(VERSION 3.20)
 
 # Select the UEFI cross toolchain unless the caller supplied one.
+# -DTCOS_ARCH=aarch64 picks the AArch64 toolchain (and the AArch64 image, see cmake/aarch64.cmake).
+set(TCOS_ARCH "x86_64" CACHE STRING "Target architecture: x86_64 or aarch64")
 if(NOT CMAKE_TOOLCHAIN_FILE)
-  set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/toolchain-x86_64-uefi.cmake)
+  set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/toolchain-${TCOS_ARCH}-uefi.cmake)
 endif()
 
 project(TheoryCraftOS LANGUAGES C CXX ASM)
@@ -26,6 +28,11 @@ project(TheoryCraftOS LANGUAGES C CXX ASM)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(TCOS_ARCH STREQUAL "aarch64")
+  include(cmake/aarch64.cmake)
+  return()
+endif()
 
 # Optional boot-time pause for debuggers that cannot use hardware breakpoints.
 set(TCOS_DEBUG_WAIT_SECS 0 CACHE STRING

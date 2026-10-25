@@ -17,11 +17,15 @@
  */
 
 #pragma once
+#include <stdint.h>
 #include "Hardware/IHardware.hpp"
+#if defined(__x86_64__)
 #include "Hardware/IoPort.hpp"
+#endif
 
 namespace hardware {
 
+#if defined(__x86_64__)
 // QEMU's isa-debugcon device: bytes written to port 0x402 reach the host.
 // Harmless on real hardware (the write is ignored).
 class DebugConsole final : public IHardware {
@@ -38,5 +42,33 @@ class DebugConsole final : public IHardware {
   static constexpr uint16_t kPort = 0x402;
   IoPort port_{kPort};
 };
+#elif defined(__aarch64__)
+// The firmware-described debug UART: a PL011 whose base address comes from the ACPI SPCR table
+// (set_base(), see Arch/AArch64/Spcr.hpp). Until a base is known the output is dropped, so nothing
+// ever touches an address the platform did not name.
+class DebugConsole final : public IHardware {
+ public:
+  constexpr DebugConsole() = default;
+
+  const char* name() const override { return "PL011 debug UART"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+
+  static void set_base(uint64_t mmio_base) { base_ = mmio_base; }
+  void put(char c) const {
+    if (!base_) return;
+    auto* dr = reinterpret_cast<volatile uint32_t*>(base_);          // UARTDR
+    auto* fr = reinterpret_cast<volatile uint32_t*>(base_ + 0x18);   // UARTFR
+    constexpr uint32_t kTxFull = 1u << 5;
+    for (uint32_t spin = 0; (*fr & kTxFull) && spin < 100000; ++spin) {}
+    *dr = static_cast<uint8_t>(c);
+  }
+
+ private:
+  static inline uint64_t base_ = 0;
+};
+#else
+#error "No debug console for this architecture"
+#endif
 
 }  // namespace hardware
