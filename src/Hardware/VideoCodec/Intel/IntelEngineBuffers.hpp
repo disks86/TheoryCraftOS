@@ -67,6 +67,12 @@ class IntelEngineBuffers {
   bool read_scratch(uint32_t index, ByteView out) const;
   // A buffer tied to picture `slot` (a direct motion vector buffer), at least `bytes` big; its address. Made on first use.
   bool picture_buffer(int slot, uint64_t bytes, uint32_t* address);
+  // Reads, writes or zeroes `bytes` of picture buffer `slot` from `offset` on (made before with picture_buffer()).
+  bool read_picture_buffer(int slot, uint64_t offset, ByteView out) const;
+  bool write_picture_buffer(int slot, uint64_t offset, ConstByteView bytes);
+  bool clear_picture_buffer(int slot, uint64_t offset, uint64_t bytes);
+  // Copies `bytes` from `from_offset` of picture buffer `from` to `to_offset` of picture buffer `to` (both made before; the ranges must not overlap if they are the same buffer).
+  bool copy_picture_buffer(int from, uint64_t from_offset, int to, uint64_t to_offset, uint64_t bytes);
   // Copies picture `from` over picture `to` (both made; a skipped picture repeats the one before it). False if either is missing.
   bool copy_surface(int from, int to);
   // Copies `bits` into the bitstream buffer (growing it as needed) and gives its address.

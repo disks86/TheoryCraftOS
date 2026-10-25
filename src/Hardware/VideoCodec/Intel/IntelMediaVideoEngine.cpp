@@ -67,7 +67,13 @@ bool IntelMediaVideoEngine::initialize() {
 }
 
 UniquePointer<IVideoDecoder> IntelMediaVideoEngine::create_decoder(const DecoderConfig& config) {
-  if (generation_ == intel_gt::Generation::Gen12) return SoftwareVideoCodec::create_decoder(config);   // (AV1 sessions: see below)
+  if (generation_ == intel_gt::Generation::Gen12) {
+    if (config.codec == VideoCodec::Av1 && hardware_decode()) {
+      UniquePointer<IntelAv1Decoder> session = UniquePointer<IntelAv1Decoder>::make(allocator_, allocator_, *driver_, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));   // else the engine is busy with another session: the CPU does it
+    }
+    return SoftwareVideoCodec::create_decoder(config);
+  }
   if (config.codec == VideoCodec::H264 && hardware_decode()) {
     UniquePointer<IntelAvcDecoder> session = UniquePointer<IntelAvcDecoder>::make(allocator_, allocator_, *driver_, config);
     if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));  // else the engine is busy with another session: the CPU does it

@@ -33,6 +33,7 @@ constexpr uint32_t kMiArbCheck = 0x05u << 23;
 constexpr uint32_t kMiArbOnOff = 0x08u << 23;
 constexpr uint32_t kMiArbEnable = 1;
 constexpr uint32_t kMiBatchBufferEnd = 0x0Au << 23;
+constexpr uint32_t kMfxWaitHeader = 0x68000000;       // MFX_WAIT: a single dword (bit 8 is its sync flag)
 constexpr uint32_t kMiBatchBufferStartGen8 = (0x31u << 23) | 1;
 constexpr uint32_t kBatchInPpgtt = 1u << 8;
 constexpr uint32_t kMiFlushDw = (0x26u << 23) | 1;
@@ -265,6 +266,10 @@ bool VcsDriver::batch_is_acceptable(ArrayView<const uint32_t> commands) {
     if (h == kMiNoop) { ++i; continue; }
     if (h == kMiBatchBufferEnd) return i + 1 == n;  // the end must be the last dword
     uint64_t length;
+    if ((h & ~0x100u) == kMfxWaitHeader) {                        // MFX_WAIT (with or without its sync flag): a single dword
+      ++i;
+      continue;
+    }
     if ((h >> 29) == 3) {
       if (((h >> 27) & 3) != 2) return false;                     // only the MFX pipeline
       length = (h & 0xFF) + 2;

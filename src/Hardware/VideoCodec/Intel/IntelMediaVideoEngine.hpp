@@ -20,6 +20,7 @@
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
 #include "Hardware/Mmio.hpp"
+#include "Hardware/VideoCodec/Intel/IntelAv1Session.hpp"
 #include "Hardware/VideoCodec/Intel/IntelAvcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelHevcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
