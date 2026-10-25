@@ -61,6 +61,7 @@ Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(
   host.write = &Terminal::host_write;
   host.clear = &Terminal::host_clear;
   host.exit = &Terminal::host_exit;
+  host.unsupported_executable = &Terminal::host_unsupported_executable;
   host.context = this;
   shell_.set_host(host);
   view_.write("TheoryCraftOS terminal. Type help for the commands;\ndrop a folder here to go to it.\n\n");
@@ -204,6 +205,12 @@ void Terminal::on_save(void* self, Control&) { static_cast<Terminal*>(self)->ask
 void Terminal::on_close(void* self, Control&) { static_cast<Terminal*>(self)->close(); }
 void Terminal::on_copy_all(void* self, Control&) { static_cast<Terminal*>(self)->view_.copy_all(); }
 void Terminal::on_paste(void* self, Control&) { static_cast<Terminal*>(self)->view_.paste(); }
+void Terminal::host_unsupported_executable(void* self, StringView path, exe::ExecutableKind kind) {
+  auto* t = static_cast<Terminal*>(self);
+  String message(t->allocator());
+  if (exe::unsupported_executable_message(path, kind, &message)) t->notify(NoticeKind::Warning, message.view());
+}
+
 void Terminal::on_clear(void* self, Control&) { static_cast<Terminal*>(self)->view_.clear(); }
 
 bool Terminal::on_key(const KeyArgs& args) {

@@ -26,6 +26,7 @@
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/TerminalView.hpp"
+#include "Executable/ExecutableKind.hpp"
 #include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 
@@ -78,6 +79,7 @@ class Terminal : public gui::Frame {
   static void host_write(void* self, StringView text);
   static void host_clear(void* self);
   static void host_exit(void* self);
+  static void host_unsupported_executable(void* self, StringView path, exe::ExecutableKind kind);
   void refresh_prompt();
   void notify(gui::NoticeKind kind, StringView text) { gui::NoticeDialog::post(notices_, manager(), kind, text); }
 

@@ -20,7 +20,10 @@
 #include <string>
 #include <vector>
 #include "Executable/ElfFile.hpp"
+#include "Executable/ExecutableKind.hpp"
 #include "Executable/PeFile.hpp"
+#include "Desktop/Shell.hpp"
+#include "FileSystem/Ram/RamFileSystem.hpp"
 
 using namespace exe;
 
@@ -307,7 +310,79 @@ static void test_pe_hostile() {
   CHECK(!pe.parse(view(bad)));
 }
 
+static void put_file(filesystem::IFileSystem& fs, const char* path, const Bytes& data) {
+  UniquePointer<filesystem::IFile> file;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateOrOpen, &file) == filesystem::Status::Ok);
+  uint64_t written = 0;
+  if (file) CHECK(file->write(0, view(data), &written) == filesystem::Status::Ok && written == data.size());
+}
+
+static void test_identify() {
+  using exe::ExecutableKind;
+  Bytes elf = make_elf64(), pe = make_pe64();
+  CHECK(exe::identify_executable(view(elf)) == ExecutableKind::Elf);
+  CHECK(exe::identify_executable(view(pe)) == ExecutableKind::Pe);
+  // Only the start of the file is needed.
+  CHECK(exe::identify_executable(ConstByteView(pe.data(), 0x100)) == ExecutableKind::Pe);
+  CHECK(exe::identify_executable(ConstByteView()) == ExecutableKind::None);
+  CHECK(exe::identify_executable(ConstByteView(pe.data(), 0x30)) == ExecutableKind::None);
+  Bytes text(200, 'a');
+  text[0] = 'M'; text[1] = 'Z';      // "MZ" alone is not enough
+  CHECK(exe::identify_executable(view(text)) == ExecutableKind::None);
+  const char plain[] = "hello world";
+  CHECK(exe::identify_executable(ConstByteView(reinterpret_cast<const uint8_t*>(plain), sizeof(plain))) == ExecutableKind::None);
+  String message(A);
+  CHECK(exe::unsupported_executable_message("/bin/tool.exe", ExecutableKind::Pe, &message));
+  CHECK(str(message.view()).find("Unsupported executable: tool.exe") == 0 && str(message.view()).find("PE program") != std::string::npos);
+}
+
+struct ShellCapture {
+  std::string output;
+  std::string executable;
+  int calls = 0;
+  static void write(void* c, StringView t) { static_cast<ShellCapture*>(c)->output += str(t); }
+  static void unsupported(void* c, StringView path, exe::ExecutableKind) {
+    auto* s = static_cast<ShellCapture*>(c);
+    s->executable = str(path);
+    ++s->calls;
+  }
+};
+
+static void test_shell() {
+  filesystem::RamFileSystem fs(A);
+  CHECK(fs.create_directory("/bin") == filesystem::Status::Ok);
+  put_file(fs, "/bin/tool", make_elf64());
+  put_file(fs, "/setup.exe", make_pe64());
+  put_file(fs, "/notes.txt", Bytes{'h', 'i', '\n'});
+  ShellCapture capture;
+  desktop::Shell shell(A);
+  desktop::Shell::Host host;
+  host.write = &ShellCapture::write;
+  host.unsupported_executable = &ShellCapture::unsupported;
+  host.context = &capture;
+  shell.set_host(host);
+  shell.set_file_system(&fs);
+
+  shell.execute("/bin/tool");
+  CHECK(capture.calls == 1 && capture.executable == "/bin/tool" && capture.output.find("unsupported executable (ELF") != std::string::npos);
+  shell.execute("./setup.exe --flag");
+  CHECK(capture.calls == 2 && capture.executable == "/setup.exe");
+  shell.execute("setup.exe");
+  CHECK(capture.calls == 3);
+  capture.output.clear();
+  shell.execute("notes.txt");      // a file that is not a program is still "command not found"
+  CHECK(capture.calls == 3 && capture.output.find("command not found") != std::string::npos);
+  shell.execute("nothing");
+  CHECK(capture.calls == 3);
+  shell.execute("bin");            // a folder is not a program either
+  CHECK(capture.calls == 3);
+  shell.execute("../../etc");      // above the root: no crash
+  CHECK(capture.calls == 3);
+}
+
 int main() {
+  test_identify();
+  test_shell();
   test_elf64();
   test_elf32_be();
   test_elf_hostile();

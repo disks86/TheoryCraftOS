@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Desktop.hpp"
+#include "Executable/ExecutableKind.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
@@ -801,6 +802,14 @@ void Desktop::on_explorer_file(void* self, Control& sender) {
 }
 
 void Desktop::open_file(StringView file) {
+  if (fs_) {   // programs cannot be run yet: say so instead of showing the bytes as text
+    const exe::ExecutableKind kind = exe::identify_executable_file(*fs_, file);
+    if (kind != exe::ExecutableKind::None) {
+      String message(allocator_);
+      if (exe::unsupported_executable_message(file, kind, &message)) gui::NoticeDialog::post(&notice_dialog_, &windows_, gui::NoticeKind::Warning, message.view());
+      return;
+    }
+  }
   if (Paint::is_picture_name(file)) {  // pictures open in Paint, everything else as text
     if (Paint* paint = paint_for(file)) paint->open_file(file);
     return;

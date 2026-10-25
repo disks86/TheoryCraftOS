@@ -22,6 +22,7 @@
 // relative to the current folder and may use "." and ".." (resolved here: the filesystems do not know them). It works on any IFileSystem, so
 // it also goes into mounted network shares. Everything runs in the calling thread.
 #pragma once
+#include "Executable/ExecutableKind.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Utility/String.hpp"
 
@@ -33,6 +34,8 @@ class Shell {
     void (*write)(void* context, StringView text) = nullptr;
     void (*clear)(void* context) = nullptr;   // the "clear" command
     void (*exit)(void* context) = nullptr;    // the "exit" command
+    // A command that names an ELF or PE file was typed: `path` is its absolute path. The shell has already printed a line about it.
+    void (*unsupported_executable)(void* context, StringView path, exe::ExecutableKind kind) = nullptr;
     void* context = nullptr;
   };
   static constexpr uint32_t kMaxArguments = 16;
@@ -64,6 +67,7 @@ class Shell {
   void rm(StringView* args, uint32_t count);
   void cp_or_mv(StringView command, StringView* args, uint32_t count, bool move);
   void stat(StringView path);
+  bool run_program(StringView command);
   void help() const;
 
   allocators::IAllocator& allocator_;

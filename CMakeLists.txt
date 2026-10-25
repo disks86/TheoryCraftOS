@@ -495,6 +495,7 @@ add_executable(BOOTX64
   src/Media/Webm.cpp
   src/Media/WebVtt.cpp
   src/Executable/ElfFile.cpp
+  src/Executable/ExecutableKind.cpp
   src/Executable/PeFile.cpp
   src/Media/Dash.cpp
   src/Media/DashClient.cpp

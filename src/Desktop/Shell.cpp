@@ -203,7 +203,23 @@ void Shell::execute(StringView line) {
     if (count < 2) return say("usage: stat path");
     return stat(args[1]);
   }
+  if (run_program(command)) return;
   say(command, ": command not found (try help)");
+}
+
+// A command that is not built in but names a file (./tool, /bin/tool, tool in the current folder): programs cannot be run yet, so say so if it is
+// one. False if the word names no ELF or PE file.
+bool Shell::run_program(StringView command) {
+  String path(allocator_);
+  if (!resolve(command, &path)) return false;
+  DirectoryEntry entry;
+  if (fs_->stat(path.view(), &entry) != Status::Ok || entry.type == NodeType::Directory) return false;
+  const exe::ExecutableKind kind = exe::identify_executable_file(*fs_, path.view());
+  if (kind == exe::ExecutableKind::None) return false;
+  String reason(allocator_);
+  if (reason.append(": unsupported executable (") && reason.append(exe::executable_kind_name(kind)) && reason.append(" programs cannot be run yet)")) say(command, reason.view());
+  if (host_.unsupported_executable) host_.unsupported_executable(host_.context, path.view(), kind);
+  return true;
 }
 
 void Shell::help() const {
