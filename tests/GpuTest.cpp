@@ -158,7 +158,57 @@ static void test_compute() {
   CHECK(a.live == 0);
 }
 
+static void test_multisample() {
+  TestAllocator a;
+  {
+    Device dev(a);
+    const FormatDesc* rgba = find_format("rgba8unorm");
+    const uint32_t ms = dev.create_texture(16, 16, 1, 1, 4, 1, rgba, 0x10), one = dev.create_texture(16, 16, 1, 1, 1, 1, rgba, 0x10 | 0x01);
+    TextureView mv, ov;
+    mv.texture = ms; mv.format = rgba;
+    ov.texture = one; ov.format = rgba;
+    const uint32_t msv = dev.create_view(mv), ov_id = dev.create_view(ov);
+    String log(a);
+    const uint32_t mod = dev.create_shader_module(
+        "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> { var p = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(1.0,-1.0), vec2(1.0,1.0)); return vec4(p[i], 0.0, 1.0); }\n"
+        "@fragment fn fs() -> @location(0) vec4<f32> { return vec4(1.0); }", &log);
+    List<UniquePointer<VertexBufferLayout>> buffers(a);
+    List<ColorTarget> targets(a);
+    ColorTarget ct;
+    ct.format = rgba;
+    targets.push_back(ct);
+    List<UniquePointer<Device::ConstantValue>> none(a);
+    const uint32_t rp = dev.create_render_pipeline(0, mod, "vs", mod, "fs", buffers, targets, nullptr, 3, 0, true, 0, false, 4, none, none);
+    CHECK(rp != 0);
+    RenderPassDesc pd(a);
+    ColorAttachment ca;
+    ca.view = msv; ca.resolve = ov_id; ca.clear[3] = 1;
+    pd.colors.push_back(ca);
+    CHECK(dev.begin_render_pass(pd));
+    CHECK(dev.set_pipeline(rp));
+    CHECK(dev.draw(3, 1, 0, 0));
+    CHECK(dev.end_render_pass());
+    const uint32_t out = dev.create_buffer(16 * 16 * 4, 0x08 | 0x02);
+    ImageCopy src;
+    src.texture = one;
+    BufferLayout bl;
+    bl.bytes_per_row = 64;
+    CHECK(dev.copy_texture_to_buffer(src, out, bl, 16, 16, 1));
+    uint8_t px[16 * 16 * 4];
+    CHECK(dev.read_buffer(out, 0, ByteView(px, sizeof(px))));
+    // the diagonal runs through the pixels on it: those are partly covered
+    const uint8_t edge = px[(8 * 16 + 7) * 4];   // row 8 (from the top), column 7: on the diagonal
+    CHECK(edge > 60 && edge < 200);
+    CHECK(px[(12 * 16 + 12) * 4] == 255 && px[(3 * 16 + 3) * 4] == 0);
+    ImageCopy bad;
+    bad.texture = ms;
+    CHECK(!dev.copy_texture_to_buffer(bad, out, bl, 16, 16, 1));
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_multisample();
   test_render();
   test_compute();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }

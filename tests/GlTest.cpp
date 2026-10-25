@@ -265,7 +265,57 @@ static void test_transform_feedback() {
   CHECK(a.live == 0);
 }
 
+static void test_multisample() {
+  TestAllocator a;
+  {
+    GlContext gl(a, true, 16, 16, GlContext::Attributes());
+    const uint32_t rb = gl.create_renderbuffer(), fbo = gl.create_framebuffer();
+    gl.bind_renderbuffer(rb);
+    gl.renderbuffer_storage(0x8058, 16, 16, 4);
+    double w = 0;
+    gl.get_renderbuffer_parameter(0x8D42, &w);
+    CHECK(w == 16);
+    gl.bind_framebuffer(0x8D40, fbo);
+    gl.framebuffer_renderbuffer(0x8D40, 0x8CE0, rb);
+    CHECK(gl.check_framebuffer_status(0x8D40) == 0x8CD5);
+    gl.clear_color(0, 0, 0, 1);
+    gl.clear(0x4000);
+    const uint32_t prog = make_program(gl, "attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }", "void main() { gl_FragColor = vec4(1.0); }");
+    gl.use_program(prog);
+    // a triangle whose edge cuts pixels in half: the diagonal from (-1,-1) to (1,1)
+    const float verts[] = {-1, -1, 1, -1, 1, 1};
+    const uint32_t vb = gl.create_buffer();
+    gl.bind_buffer(0x8892, vb);
+    gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(verts), sizeof(verts)), 0, 0x88E4);
+    gl.enable_vertex_attrib(0, true);
+    gl.vertex_attrib_pointer(0, 2, 0x1406, false, 0, 0, false);
+    gl.draw_arrays(4, 0, 3, 1);
+    // reading a multisampled framebuffer directly is an error; resolving with a blit is not
+    uint8_t px[4];
+    gl.read_pixels(8, 4, 1, 1, 0x1908, 0x1401, ByteView(px, 4));
+    CHECK(gl.get_error() == 0x502);
+    const uint32_t tex = gl.create_texture(), fbo2 = gl.create_framebuffer();
+    gl.bind_texture(0x0DE1, tex);
+    gl.tex_image(0x0DE1, 0, 0x8058, 16, 16, 1, 0, 0x1908, 0x1401, ConstByteView(), false, false);
+    gl.bind_framebuffer(0x8CA8, fbo);
+    gl.bind_framebuffer(0x8CA9, fbo2);
+    gl.framebuffer_texture(0x8CA9, 0x8CE0, 0x0DE1, tex, 0, 0);
+    gl.blit_framebuffer(0, 0, 16, 16, 0, 0, 16, 16, 0x4000, 0x2600);
+    CHECK(gl.get_error() == 0);
+    gl.bind_framebuffer(0x8CA8, fbo2);
+    // pixel (8,8) lies on the diagonal: half covered; (12,4) is inside the lower right half; (4,12) outside
+    uint8_t edge[4], inside[4], outside[4];
+    gl.read_pixels(8, 8, 1, 1, 0x1908, 0x1401, ByteView(edge, 4));
+    gl.read_pixels(12, 4, 1, 1, 0x1908, 0x1401, ByteView(inside, 4));
+    gl.read_pixels(4, 12, 1, 1, 0x1908, 0x1401, ByteView(outside, 4));
+    CHECK(edge[0] > 60 && edge[0] < 200);
+    CHECK(inside[0] == 255 && outside[0] == 0);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_multisample();
   test_transform_feedback();
   test_triangle();
   test_interpolation_and_blend();

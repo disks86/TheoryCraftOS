@@ -165,8 +165,8 @@ struct FragmentPipeline final : gpu::IFragmentSink {
     for (const VaryingLink& l : p.links)
       for (uint32_t k = 0; k < l.count; ++k) pr[l.fs_slot + k] = f2u(tmp[l.var_offset + k]);
     if (fc_slot >= 0) {
-      pr[fc_slot] = f2u(static_cast<float>(px) + 0.5f);
-      pr[fc_slot + 1] = f2u(static_cast<float>(py) + 0.5f);
+      pr[fc_slot] = f2u((static_cast<float>(px) + 0.5f) / static_cast<float>(t.ss));
+      pr[fc_slot + 1] = f2u((static_cast<float>(py) + 0.5f) / static_cast<float>(t.ss));
       pr[fc_slot + 2] = f2u(f.z);
       pr[fc_slot + 3] = f2u(f.coord[3]);
     }
@@ -455,9 +455,10 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
 
   // varying flags for the rasterizer
   gpu::RasterState rs;
-  rs.vp_x = vp_[0]; rs.vp_y = vp_[1]; rs.vp_w = vp_[2]; rs.vp_h = vp_[3];
+  const int32_t ss = static_cast<int32_t>(target.ss);
+  rs.vp_x = vp_[0] * ss; rs.vp_y = vp_[1] * ss; rs.vp_w = vp_[2] * ss; rs.vp_h = vp_[3] * ss;
   rs.depth_near = depth_n_; rs.depth_far = depth_f_;
-  if (scissor_test_) { rs.sc_x = sc_[0]; rs.sc_y = sc_[1]; rs.sc_w = sc_[2]; rs.sc_h = sc_[3]; }
+  if (scissor_test_) { rs.sc_x = sc_[0] * ss; rs.sc_y = sc_[1] * ss; rs.sc_w = sc_[2] * ss; rs.sc_h = sc_[3] * ss; }
   else { rs.sc_x = 0; rs.sc_y = 0; rs.sc_w = static_cast<int32_t>(target.w); rs.sc_h = static_cast<int32_t>(target.h); }
   rs.target_w = static_cast<int32_t>(target.w);
   rs.target_h = static_cast<int32_t>(target.h);
@@ -686,10 +687,11 @@ void GlContext::clear(uint32_t mask) {
   if (!t.ok) return;
   int32_t x0 = 0, y0 = 0, x1 = static_cast<int32_t>(t.w), y1 = static_cast<int32_t>(t.h);
   if (scissor_test_) {
-    x0 = sc_[0] > x0 ? sc_[0] : x0;
-    y0 = sc_[1] > y0 ? sc_[1] : y0;
-    x1 = sc_[0] + sc_[2] < x1 ? sc_[0] + sc_[2] : x1;
-    y1 = sc_[1] + sc_[3] < y1 ? sc_[1] + sc_[3] : y1;
+    const int32_t k = static_cast<int32_t>(t.ss);
+    x0 = sc_[0] * k > x0 ? sc_[0] * k : x0;
+    y0 = sc_[1] * k > y0 ? sc_[1] * k : y0;
+    x1 = (sc_[0] + sc_[2]) * k < x1 ? (sc_[0] + sc_[2]) * k : x1;
+    y1 = (sc_[1] + sc_[3]) * k < y1 ? (sc_[1] + sc_[3]) * k : y1;
   }
   if (x0 >= x1 || y0 >= y1) return;
   if (mask & 0x4000) {
@@ -751,10 +753,11 @@ void GlContext::clear_buffer(uint32_t buffer, int32_t drawbuffer, const uint32_t
   if (!t.ok) return;
   int32_t x0 = 0, y0 = 0, x1 = static_cast<int32_t>(t.w), y1 = static_cast<int32_t>(t.h);
   if (scissor_test_) {
-    x0 = sc_[0] > x0 ? sc_[0] : x0;
-    y0 = sc_[1] > y0 ? sc_[1] : y0;
-    x1 = sc_[0] + sc_[2] < x1 ? sc_[0] + sc_[2] : x1;
-    y1 = sc_[1] + sc_[3] < y1 ? sc_[1] + sc_[3] : y1;
+    const int32_t k = static_cast<int32_t>(t.ss);
+    x0 = sc_[0] * k > x0 ? sc_[0] * k : x0;
+    y0 = sc_[1] * k > y0 ? sc_[1] * k : y0;
+    x1 = (sc_[0] + sc_[2]) * k < x1 ? (sc_[0] + sc_[2]) * k : x1;
+    y1 = (sc_[1] + sc_[3]) * k < y1 ? (sc_[1] + sc_[3]) * k : y1;
   }
   if (buffer == 0x1800) {
     if (drawbuffer < 0 || drawbuffer >= static_cast<int32_t>(kMaxDrawBuffers)) { set_error(INVALID_VALUE); return; }
@@ -819,7 +822,7 @@ void GlContext::read_pixels(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32
   uint32_t layer = 0;
   if (read_fb_ == 0) src = default_read_back_ ? &def_color_ : nullptr;
   else for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (t.color[i]) { src = t.color[i]; layer = t.layer[i]; }
-  if (!src) { set_error(INVALID_OPERATION); return; }
+  if (!src || src->ss > 1) { set_error(INVALID_OPERATION); return; }
   uint32_t err = 0;
   // zero the destination first (pixels outside the framebuffer read as zero)
   if (out.size()) __builtin_memset(out.data(), 0, out.size());
@@ -932,11 +935,28 @@ void GlContext::blit_framebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
     uint32_t sl = 0;
     if (read_fb_ == 0) src = &def_color_;
     else for (uint32_t i = 0; i < kMaxDrawBuffers && !src; ++i) if (rt.color[i]) { src = rt.color[i]; sl = rt.layer[i]; }
+    Image resolved(a_);
+    if (src && src->ss > 1) {
+      if (dt.ss > 1) { set_error(INVALID_OPERATION); return; }
+      if (!resolve_samples(*src, sl, &resolved)) { set_error(0x505); return; }
+      src = &resolved;
+      sl = 0;
+    }
     for (uint32_t i = 0; i < kMaxDrawBuffers; ++i)
       if (dt.color[i]) copy(src, sl, dt.color[i], dt.layer[i], true);
     if (dt.is_default && dt.color[0]) { dirty_.add(ddx0, ddy0); dirty_.add(ddx1 - 1, ddy1 - 1); }
   }
-  if ((mask & 0x100) && rt.depth && dt.depth) copy(rt.depth, rt.depth_layer, dt.depth, dt.depth_layer, false);
+  if ((mask & 0x100) && rt.depth && dt.depth) {
+    Image resolved(a_);
+    Image* ds = rt.depth;
+    uint32_t dl = rt.depth_layer;
+    if (ds->ss > 1) {
+      if (dt.ss > 1 || !resolve_samples(*ds, dl, &resolved)) { set_error(INVALID_OPERATION); return; }
+      ds = &resolved;
+      dl = 0;
+    }
+    copy(ds, dl, dt.depth, dt.depth_layer, false);
+  }
   ++version_;
 }
 
