@@ -56,6 +56,8 @@
 #include "Audio/AudioRouter.hpp"
 #include "Hardware/AudioDevice/SystemAudioDevices.hpp"
 #include "Hardware/Camera/SystemCameras.hpp"
+#include "Hardware/SerialPort/SystemSerialPorts.hpp"
+#include "Hardware/SerialPort/X86SerialPortIo.hpp"
 #include "Hardware/Clock/TscClock.hpp"
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
 #include "Media/MediaCodecs.hpp"
@@ -640,6 +642,15 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         console::debug_puts("\n");
       }, nullptr))
     Entry(Level::Warning, "Camera").text("could not start the camera service; USB cameras plugged in later are not seen");
+
+  // Serial ports: the legacy COM ports that answer. They are only found here; a program opens one with the framing it wants. The service
+  // moves the bytes between the ports and their queues.
+  hardware::X86SerialPortIo serial_io;
+  hardware::SystemSerialPorts serial_ports(serial_io, shared_allocator);
+  serial_ports.initialize();
+  for (uint32_t i = 0; i < serial_ports.count(); ++i) Entry(Level::Ok, "Serial").text(serial_ports.at(i)->name());
+  if (serial_ports.count() == 0) Entry(Level::Info, "Serial").text("no serial port");
+  else if (!serial_ports.start_service()) Entry(Level::Warning, "Serial").text("could not start the serial service; ports do not move bytes");
 #ifdef TCOS_SELFTESTS
   UniquePointer<NetworkStackDemo> stack_demo;
   if (clock_ok && !run_async_demo(clock, shared_allocator)) console::puts("  async self-check incomplete\n");
@@ -1053,6 +1064,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   capture_hub.reset();
   mixer.reset();   // the mixer thread ends before its audio device goes
   cameras.stop_service();
+  serial_ports.stop_service();
   guest.stop_service();
   hyperv.stop_service();
   vmware_tools.stop();
@@ -1078,6 +1090,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   Entry(Level::Ok, "Shutdown").text("storage flushed and released");
   audio.shutdown();
   cameras.shutdown();
+  serial_ports.shutdown();
   video_codecs.shutdown();
   network.shutdown();
   printers.shutdown();

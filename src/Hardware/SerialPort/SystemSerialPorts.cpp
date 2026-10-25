@@ -38,6 +38,7 @@ bool SystemSerialPorts::add(SharedPointer<ISerialPort> port) {
 }
 
 void SystemSerialPorts::shutdown() {
+  stop_service();
   kernel::ScopedMutex guard(mutex_);
   for (uint64_t i = ports_.count(); i > 0; --i) ports_[i - 1]->shutdown();   // newest first
   ports_.clear();
@@ -65,6 +66,28 @@ void SystemSerialPorts::poll() {
     for (const SharedPointer<ISerialPort>& p : ports_.view()) snapshot.push_back(p);
   }
   for (const SharedPointer<ISerialPort>& p : snapshot.view()) p->poll();   // (outside the lock: polling touches hardware)
+}
+
+bool SystemSerialPorts::start_service() {
+  if (service_) return true;
+  stop_ = false;
+  service_ = kernel::spawn(service_main, this, "serial");
+  return service_ != nullptr;
+}
+
+void SystemSerialPorts::stop_service() {
+  if (!service_) return;
+  __atomic_store_n(&stop_, true, __ATOMIC_RELEASE);
+  kernel::join(service_);
+  service_ = nullptr;
+}
+
+void SystemSerialPorts::service_main(void* self) {
+  SystemSerialPorts* ports = static_cast<SystemSerialPorts*>(self);
+  while (!__atomic_load_n(&ports->stop_, __ATOMIC_ACQUIRE)) {
+    ports->poll();
+    kernel::sleep_us(kPollIntervalUs);
+  }
 }
 
 }  // namespace hardware

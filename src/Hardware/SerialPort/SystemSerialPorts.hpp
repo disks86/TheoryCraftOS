@@ -21,6 +21,7 @@
 #include "Hardware/SerialPort/ISerialPort.hpp"
 #include "Hardware/SerialPort/Uart16550.hpp"
 #include "Kernel/Sync.hpp"
+#include "Kernel/Thread.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/SharedPointer.hpp"
 
@@ -33,6 +34,8 @@ namespace hardware {
 // A program that uses a port holds share() (not the pointer at() hands out, which is only good while the list stays as it is).
 class SystemSerialPorts {
  public:
+  static constexpr uint64_t kPollIntervalUs = 1000;
+
   SystemSerialPorts(ISerialPortIo& io, allocators::IAllocator& allocator) : io_(io), allocator_(allocator), ports_(allocator) {}
   ~SystemSerialPorts() { shutdown(); }
 
@@ -46,13 +49,21 @@ class SystemSerialPorts {
   ISerialPort* at(uint32_t index) const;
   SharedPointer<ISerialPort> share(uint32_t index) const;
 
+  // One round of the polling, for callers that service the ports themselves.
   void poll();
+  // Runs poll() every millisecond from a thread ("serial"): a 16550's FIFO holds 16 bytes, which at 115200 baud is under 1.4 ms of line time.
+  bool start_service();
+  void stop_service();
 
  private:
+  static void service_main(void* self);
+
   ISerialPortIo& io_;
   allocators::IAllocator& allocator_;
   mutable kernel::Mutex mutex_;
   List<SharedPointer<ISerialPort>> ports_;
+  kernel::Thread* service_ = nullptr;
+  bool stop_ = false;
 };
 
 }  // namespace hardware
