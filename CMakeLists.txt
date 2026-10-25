@@ -409,6 +409,7 @@ add_executable(BOOTX64
   src/Gui/Controls/TextBox.cpp
   src/Gui/Controls/DropDown.cpp
   src/Gui/Controls/Slider.cpp
+  src/Gui/Controls/Knob.cpp
   src/Gui/Controls/LevelMeter.cpp
   src/Gui/Controls/PieChart.cpp
   src/Gui/Controls/BarChart.cpp

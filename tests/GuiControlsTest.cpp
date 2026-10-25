@@ -29,6 +29,7 @@
 #include "Gui/Controls/DatePicker.hpp"
 #include "Gui/Controls/HeatMap.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
+#include "Gui/Controls/Knob.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/PieChart.hpp"
 #include "Gui/Controls/RadioButton.hpp"
@@ -226,6 +227,113 @@ static void test_slider() {
     s.set_enabled(false);
     click(w, 10 + 100, 22);
     CHECK(s.value() == 5);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_knob() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 300);
+    Window w(a, screen.renderer, theme, {300, 300});
+    Knob k(a);
+    k.set_bounds({10, 10, 48, 48});
+    w.add(&k);
+    Counter changes;
+    k.on_value_changed(changes.handler());
+    CHECK(k.minimum() == 0 && k.maximum() == 100 && k.value() == 0 && k.radius() == 21);
+
+    // Fixed-point sine, for any angle.
+    CHECK(Knob::sine(0) == 0 && Knob::sine(90) == 1024 && Knob::sine(180) == 0 && Knob::sine(270) == -1024 && Knob::sine(-90) == -1024);
+    CHECK(Knob::sine(30) == 512 && Knob::sine(150) == 512 && Knob::sine(-30) == -512 && Knob::sine(450) == 1024 && near(Knob::sine(47), 749, 2));
+
+    // The pointer sweeps -135 .. 135 degrees.
+    CHECK(k.angle() == -135 && k.angle_of(100) == 135 && k.angle_of(50) == 0 && k.angle_of(500) == 135 && k.angle_of(-5) == -135);
+    k.set_value(50);
+    const Point c = k.center(), up = k.point_at(0, 1000);
+    CHECK(c.x == 24 && c.y == 24 && up.x == 24 && up.y == 3);
+    k.set_value(100);
+    CHECK(k.point_at(k.angle(), 1000).x > c.x && k.point_at(k.angle(), 1000).y > c.y);   // 4:30: right and below
+    k.set_value(500);   // clamped, no change
+    CHECK(k.value() == 100 && changes.count == 2);
+    k.set_value(0);
+    w.render();
+    const Point tip = k.point_at(-135, 720);
+    CHECK(screen.px(10 + tip.x, 10 + tip.y) == theme.text);   // the pointer reaches its tip
+
+    // Dragging up (or right) turns it up, down (or left) turns it down; 150 pixels cover the range.
+    changes.count = 0;
+    w.mouse_move(10 + 24, 10 + 24);
+    w.mouse_button(10 + 24, 10 + 24, MouseButton::Left, true);
+    CHECK(k.dragging() && k.value() == 0 && w.focus() == &k);
+    w.mouse_move(10 + 24, 10 + 24 - 75);
+    CHECK(k.value() == 50 && changes.count == 1);
+    w.mouse_move(10 + 24 + 30, 10 + 24 - 75);
+    CHECK(k.value() == 70);
+    w.mouse_move(10 + 24, 10 + 24 + 400);   // far down: clamped
+    CHECK(k.value() == 0);
+    w.mouse_move(10 + 24, 10 + 24 - 400);
+    CHECK(k.value() == 100);
+    w.mouse_button(10 + 24, 10 + 24 - 400, MouseButton::Left, false);
+    CHECK(!k.dragging());
+    w.mouse_move(10 + 24, 10 + 24);
+    CHECK(k.value() == 100);   // no longer dragging
+
+    // Keys and the wheel.
+    k.set_value(40);
+    k.set_step(2, 25);
+    press(w, key::kUp);
+    CHECK(k.value() == 42);
+    press(w, key::kLeft);
+    press(w, key::kDown);
+    CHECK(k.value() == 38);
+    press(w, 0x4B);
+    CHECK(k.value() == 63);
+    press(w, 0x4E);
+    press(w, 0x4E);
+    press(w, 0x4E);
+    CHECK(k.value() == 0);
+    press(w, 0x4D);
+    CHECK(k.value() == 100);
+    press(w, 0x4A);
+    CHECK(k.value() == 0);
+    w.mouse_wheel(20, 20, 1);
+    CHECK(k.value() == 2);
+    w.mouse_wheel(20, 20, -1);
+    w.mouse_wheel(20, 20, -1);
+    CHECK(k.value() == 0);
+
+    // A new range keeps the value inside it; a backwards range collapses and the pointer rests at the start.
+    k.set_value(80);
+    k.set_range(10, 20);
+    CHECK(k.value() == 20 && k.minimum() == 10 && k.angle() == 135);
+    k.set_range(30, 5);
+    CHECK(k.minimum() == 30 && k.maximum() == 30 && k.value() == 30 && k.angle() == -135);
+    k.set_range(-50, 50);
+    k.set_value(0);
+    CHECK(k.angle() == 0);
+    k.set_range(INT32_MIN, INT32_MAX);   // no overflow in the angle or the drag
+    k.set_value(INT32_MAX);
+    CHECK(k.angle() == 135);
+    w.mouse_move(34, 34);
+    w.mouse_button(34, 34, MouseButton::Left, true);
+    w.mouse_move(34, 34 - 140);
+    w.mouse_button(34, 34 - 140, MouseButton::Left, false);
+    CHECK(k.value() == INT32_MAX);
+
+    // Too small to draw, and disabled: nothing is drawn, no input.
+    k.set_range(0, 100);
+    k.set_value(5);
+    k.set_bounds({10, 10, 6, 6});
+    CHECK(k.radius() == 0);
+    w.render();
+    k.set_bounds({10, 10, 48, 48});
+    k.set_enabled(false);
+    click(w, 10 + 24, 10 + 24);
+    press(w, key::kUp);
+    CHECK(k.value() == 5);
     w.render();
   }
   CHECK(a.live == 0);
@@ -1157,6 +1265,7 @@ static void test_date_picker() {
 int main() {
   test_helpers();
   test_slider();
+  test_knob();
   test_level_meter();
   test_pie_chart();
   test_bar_chart();
