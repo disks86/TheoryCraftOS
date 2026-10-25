@@ -22,6 +22,7 @@
 #include "Browser/DomBindingsInternal.hpp"
 #include "Browser/Url.hpp"
 #include "Browser/WebUrl.hpp"
+#include "Script/TypedArray.hpp"
 #include "Utility/Move.hpp"
 
 namespace browser {
@@ -904,6 +905,15 @@ NATIVE(attr_ns) {
   return true;
 }
 
+// __detach_buffer(arrayBuffer): the buffer is transferred away (structuredClone with `transfer`): it has no bytes any more.
+NATIVE(detach_buffer) {
+  (void)self;
+  (void)result;
+  const Value b = arg_at(args, argc, 0);
+  if (b.is_object()) script::detach_array_buffer(b.as_object());   // (does nothing for an object that is no ArrayBuffer)
+  return true;
+}
+
 // __set_content_type(document, type): the document is XML of that type (DOMParser, createDocument).
 NATIVE(set_content_type) {
   (void)self;
@@ -1123,6 +1133,7 @@ bool install_window(DomBindings::Impl& c) {
   g->host = &kWindowClass;
   vm.define_named(g, "__time_origin", num_value(vm.clock_ms()), 0);
   vm.define_native(g, "__set_content_type", set_content_type, 2);
+  vm.define_native(g, "__detach_buffer", detach_buffer, 1);
   vm.define_native(g, "__set_attr_ns", set_attr_ns, 4);
   vm.define_native(g, "__make_node", make_node, 4);
   vm.define_native(g, "__attr_ns", attr_ns, 2);

@@ -3517,13 +3517,16 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   function dataCloneError(message) { return new DOMException(message, 'DataCloneError'); }
   function isBytes(v) { return isObject(v) && typeof v.byteLength === 'number' && v.BYTES_PER_ELEMENT === 1; }
   function serialize(value, transfer) {
-    var seen = [], ids = [], transferred = [];
+    var seen = [], ids = [], transferred = [], buffers = [];
     if (transfer) {
       var list = Array.isArray(transfer) ? transfer : (isObject(transfer) && Array.isArray(transfer.transfer) ? transfer.transfer : []);
       for (var t = 0; t < list.length; t++) {
         if (list[t] instanceof MessagePort) {
           if (list[t].__detached) throw dataCloneError('Port is already detached.');
           if (transferred.indexOf(list[t]) < 0) { transferred.push(list[t]); ids.push(list[t].__id); }
+        } else if (list[t] instanceof ArrayBuffer) {
+          if (list[t].byteLength === 0 && list[t].__transferred) throw dataCloneError('An ArrayBuffer is detached and could not be cloned.');
+          if (buffers.indexOf(list[t]) < 0) buffers.push(list[t]);
         }
       }
     }
@@ -3560,6 +3563,8 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       if (v instanceof RegExp) return { $: 're', s: v.source, f: v.flags };
       if (v instanceof Blob) return { $: v instanceof File ? 'f' : 'b', b: btoa(v.__bytes), t: v.type, n: v.name, m: v.lastModified };
       if (isBytes(v)) return { $: 'u8', b: btoa(__bytes_to_string(v)) };
+      if (v instanceof ArrayBuffer) return { $: 'ab', b: btoa(__bytes_to_string(new Uint8Array(v))) };
+      if (ArrayBuffer.isView(v)) return { $: v instanceof DataView ? 'dv' : 'ta', k: v.constructor.name, b: btoa(__bytes_to_string(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))) };
       if (v instanceof Error) return { $: 'x', n: v.name, m: v.message };
       var props = {};
       var keys = Object.keys(v);
@@ -3567,7 +3572,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       return { $: 'o', p: props };
     }
     var text = JSON.stringify(enc(value));
-    return { text: text, ids: ids, ports: transferred };
+    return { text: text, ids: ids, ports: transferred, buffers: buffers };
   }
   function deserialize(text, revived) {
     var objs = [];
@@ -3594,6 +3599,9 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         case 'b': out = new Blob([atob(e.b)], { type: e.t }); objs.push(out); return out;
         case 'f': out = new File([atob(e.b)], e.n, { type: e.t, lastModified: e.m }); objs.push(out); return out;
         case 'u8': out = __string_to_bytes(atob(e.b)); objs.push(out); return out;
+        case 'ab': out = __string_to_bytes(atob(e.b)).buffer; objs.push(out); return out;
+        case 'ta': out = new g[e.k](__string_to_bytes(atob(e.b)).buffer); objs.push(out); return out;
+        case 'dv': out = new DataView(__string_to_bytes(atob(e.b)).buffer); objs.push(out); return out;
         case 'x':
           out = e.n === 'TypeError' ? new TypeError(e.m) : e.n === 'RangeError' ? new RangeError(e.m) : e.n === 'SyntaxError' ? new SyntaxError(e.m) : e.n === 'ReferenceError' ? new ReferenceError(e.m) : new Error(e.m);
           objs.push(out); return out;
@@ -3612,6 +3620,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (arguments.length < 1) throw typeError("execute 'structuredClone' on 'Window'", "1 argument required, but only 0 present.");
     var s = serialize(value, options);
     for (var i = 0; i < s.ports.length; i++) s.ports[i].__detached = true;
+    for (var b = 0; b < s.buffers.length; b++) __detach_buffer(s.buffers[b]);
     return deserialize(s.text, null);
   });
 
@@ -8927,7 +8936,10 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     method(parserProto, 'parseFromString', function (str, type) {
       if (arguments.length < 2) throw typeErr("execute 'parseFromString' on 'DOMParser'", '2 arguments required, but only ' + arguments.length + ' present.');
       type = String(type);
-      if (!xmlTypes[type]) return nativeParse.call(this, str, type);
+      if (!xmlTypes[type]) {
+        if (type !== 'text/html') throw typeErr("execute 'parseFromString' on 'DOMParser'", "The provided value '" + type + "' is not a valid enum value of type DOMParserSupportedType.");
+        return nativeParse.call(this, str, type);
+      }
       return parseXml(String(str), type);
     });
     // new Document(): an empty XML document
@@ -8994,9 +9006,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       method(NativeSerializer.prototype, 'serializeToString', function (node) {
         if (arguments.length < 1) throw typeErr("execute 'serializeToString' on 'XMLSerializer'", '1 argument required, but only 0 present.');
         if (!node || typeof node.nodeType !== 'number') throw typeErr("execute 'serializeToString' on 'XMLSerializer'", "parameter 1 is not of type 'Node'.");
-        var d = node.nodeType === 9 ? node : node.ownerDocument;
-        if (d && d.contentType !== 'text/html') return serializeNode(node, {});
-        return nativeSerialize.call(this, node);
+        return serializeNode(node, {});   // (an HTML node too: the XML serialisation gives it its namespace)
       });
     }
   }());
