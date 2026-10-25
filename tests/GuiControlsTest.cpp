@@ -23,6 +23,7 @@
 #include <string.h>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Color.hpp"
+#include "Gui/Controls/BarChart.hpp"
 #include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DatePicker.hpp"
@@ -355,6 +356,69 @@ static void test_pie_chart() {
     CHECK(p.pie_rect().width < 132);
     p.set_selected_index(9);
     CHECK(p.selected_index() == -1);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_bar_chart() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    BarChart b(a);
+    b.set_bounds({10, 10, 260, 160});
+    w.add(&b);
+    CHECK(b.bar_count() == 0 && b.bar_at(100, 50) == -1 && b.scale_top() == 1);
+    CHECK(b.add_bar("A", 10) == 0 && b.add_bar("B", 20, 0xFF112233) == 1 && b.add_bar("C", 0) == 2 && b.add_bar("D", 1) == 3);
+    CHECK(b.scale_top() == 20 && b.bar_color(1) == 0xFF112233 && b.bar_color(0) != 0);
+    const Rect2D p = b.plot_rect();
+    CHECK(p.width > 0 && p.height > 0);
+    // Heights are in proportion to the scale; any non-zero value shows at least a pixel.
+    CHECK(b.bar_height(20) == p.height && b.bar_height(10) == p.height / 2 && b.bar_height(0) == 0 && b.bar_height(1) >= 1);
+    b.set_maximum(40);
+    CHECK(b.bar_height(20) == p.height / 2 && b.bar_height(400) == p.height);   // above a fixed maximum: full height
+    b.set_maximum(0);
+
+    // The columns tile the plot; a pixel is in exactly one of them.
+    int32_t covered = 0;
+    for (int32_t i = 0; i < 4; ++i) covered += static_cast<int32_t>(b.column_rect(i).width);
+    CHECK(covered == static_cast<int32_t>(p.width));
+    for (int32_t i = 0; i < 4; ++i) {
+      const Rect2D c = b.column_rect(i);
+      CHECK(b.bar_at(c.x, c.y + 3) == i && b.bar_at(c.x + static_cast<int32_t>(c.width) - 1, c.y + 3) == i);
+    }
+    CHECK(b.bar_at(p.x - 1, p.y + 3) == -1 && b.bar_at(p.x + 3, p.y - 1) == -1);
+
+    w.render();
+    const Rect2D c1 = b.column_rect(1);
+    CHECK(screen.px(10 + c1.x + static_cast<int32_t>(c1.width) / 2, 10 + p.y + static_cast<int32_t>(p.height) - 5) == 0xFF112233);   // inside the tall bar
+    const Rect2D c2 = b.column_rect(2);
+    CHECK(screen.px(10 + c2.x + static_cast<int32_t>(c2.width) / 2, 10 + p.y + static_cast<int32_t>(p.height) - 5) == theme.field);  // a zero bar is empty
+
+    // Selection by click and by key; the handler fires only on a change.
+    click(w, 10 + c1.x + 3, 10 + p.y + 3);
+    CHECK(b.selected_index() == 1);
+    w.render();
+    CHECK(screen.px(10 + c1.x + static_cast<int32_t>(c1.width) / 2, 10 + p.y + static_cast<int32_t>(p.height) - 5) != 0xFF112233);   // drawn lighter
+    click(w, 10 + 2, 10 + 2);
+    CHECK(b.selected_index() == -1);
+    press(w, key::kRight);
+    CHECK(b.selected_index() == 0);
+    press(w, key::kLeft);
+    CHECK(b.selected_index() == 3);
+    b.set_selected_index(9);
+    CHECK(b.selected_index() == -1);
+
+    // Huge values do not overflow.
+    b.set_bar_value(0, UINT64_MAX);
+    b.set_bar_value(1, UINT64_MAX / 2);
+    CHECK(b.scale_top() == UINT64_MAX && b.bar_height(UINT64_MAX) == p.height && near(static_cast<int32_t>(b.bar_height(UINT64_MAX / 2)), static_cast<int32_t>(p.height / 2), 1));
+    w.render();
+
+    b.clear_bars();
+    CHECK(b.bar_count() == 0 && b.selected_index() == -1);
+    w.render();
   }
   CHECK(a.live == 0);
 }
@@ -764,6 +828,7 @@ int main() {
   test_slider();
   test_level_meter();
   test_pie_chart();
+  test_bar_chart();
   test_scroll_panel();
   test_checkbox();
   test_radio();

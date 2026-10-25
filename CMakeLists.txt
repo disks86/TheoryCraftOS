@@ -402,6 +402,7 @@ add_executable(BOOTX64
   src/Gui/Controls/Slider.cpp
   src/Gui/Controls/LevelMeter.cpp
   src/Gui/Controls/PieChart.cpp
+  src/Gui/Controls/BarChart.cpp
   src/Gui/Controls/CheckBox.cpp
   src/Gui/Controls/RadioButton.cpp
   src/Gui/Controls/Toggle.cpp
