@@ -100,6 +100,11 @@ constexpr uint64_t kPrivatePatLow = 0x40E0, kPrivatePatHigh = 0x40E4;
 void program_private_pat(const MmioRegion& registers, const PatTable& table);
 void program_private_pat(IRegisterBank& registers, const PatTable& table);
 
+// Gen12 (Xe-LP) keeps its table in eight registers of its own, one per index. Index 3 is uncached and 4 write-back, which is what the page table entries above select.
+// Values as the i915 driver sets them (tgl_setup_private_ppat): index 0 write-back, 1 write-combining, 2 write-through, 3 uncached, 4-7 write-back.
+constexpr uint64_t kGen12PatIndexBase = 0x4800;
+void program_gen12_pat(IRegisterBank& registers);
+
 // Asks the GPU to drop what it cached of the global GTT; needed after changing entries. `registers` is the register BAR (at least 0x102000 bytes).
 constexpr uint64_t kGttFlushRegister = 0x101008;
 void ggtt_invalidate(const MmioRegion& registers);
@@ -129,7 +134,9 @@ class Ppgtt32 {
   Ppgtt32(const Ppgtt32&) = delete;
   Ppgtt32& operator=(const Ppgtt32&) = delete;
 
-  bool initialize();
+  // `four_level`: the 48-bit form of Gen12 contexts, in which a page-map level 4 page (whose address goes into the context image as its first page directory
+  // pointer) points at one page of directory pointers that holds these four directories; everything else in the two levels points at scratch pages.
+  bool initialize(bool four_level = false);
   // Gives the pages back (only when the GPU can no longer reach them), or - with abandon() - forgets them without freeing, for a GPU that may still be using them.
   void shutdown() { release(); }
   void abandon();
@@ -139,6 +146,8 @@ class Ppgtt32 {
   bool unmap(uint64_t gpu_address);
   // The address of page directory `n` (0-3), which goes into the context image.
   uint64_t page_directory_dma(uint32_t n) const { return n < 4 ? directories_dma_[n] : 0; }
+  // The top of a four-level space (0 for the 32-bit form).
+  uint64_t root_dma() const { return pml4_dma_; }
   // What the hardware would find: the page a graphics address is mapped to (or the scratch page). False for addresses of 4 GiB and more.
   bool translate(uint64_t gpu_address, uint64_t* dma_address) const;
   uint64_t scratch_dma() const { return scratch_dma_; }
@@ -155,6 +164,8 @@ class Ppgtt32 {
   uint64_t scratch_table_dma_ = 0;
   ArrayView<uint64_t> directories_[4];
   uint64_t directories_dma_[4] = {};
+  ArrayView<uint64_t> pml4_, pdpt_, scratch_pdpt_, scratch_pd_;
+  uint64_t pml4_dma_ = 0, pdpt_dma_ = 0, scratch_pdpt_dma_ = 0, scratch_pd_dma_ = 0;
   ArrayView<uint64_t> tables_[kMaxTables];
   uint64_t tables_dma_[kMaxTables] = {};
 };

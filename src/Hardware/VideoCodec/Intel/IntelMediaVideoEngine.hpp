@@ -96,6 +96,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   uint64_t local_memory_bar_ = 0;
   HardwareSetup setup_;
   UniquePointer<intel_gt::VcsDriver> driver_;
+  intel_gt::Generation generation_ = intel_gt::Generation::Gen9;
 };
 
 }  // namespace hardware

@@ -87,6 +87,12 @@ void program_private_pat(IRegisterBank& registers, const PatTable& table) {
   registers.write32(kPrivatePatHigh, table.high);
 }
 
+void program_gen12_pat(IRegisterBank& registers) {
+  constexpr uint32_t kUncached = 0, kWriteCombining = 1, kWriteThrough = 2, kWriteBack = 3;
+  const uint32_t values[8] = {kWriteBack, kWriteCombining, kWriteThrough, kUncached, kWriteBack, kWriteBack, kWriteBack, kWriteBack};
+  for (uint32_t i = 0; i < 8; ++i) registers.write32(kGen12PatIndexBase + 4 * i, values[i]);
+}
+
 void ggtt_invalidate(IRegisterBank& registers) {
   registers.write32(kGttFlushRegister, 1);
   registers.read32(kGttFlushRegister);
@@ -98,6 +104,10 @@ void ggtt_invalidate(const MmioRegion& registers) {
 }
 
 void Ppgtt32::release() {
+  ArrayView<uint64_t>* const upper[] = {&pml4_, &pdpt_, &scratch_pdpt_, &scratch_pd_};
+  for (ArrayView<uint64_t>* page : upper)
+    if (!page->empty()) { pages_.free_page(*page); *page = ArrayView<uint64_t>(); }
+  pml4_dma_ = pdpt_dma_ = scratch_pdpt_dma_ = scratch_pd_dma_ = 0;
   for (ArrayView<uint64_t>& t : tables_)
     if (!t.empty()) { pages_.free_page(t); t = ArrayView<uint64_t>(); }
   for (ArrayView<uint64_t>& d : directories_)
@@ -108,6 +118,8 @@ void Ppgtt32::release() {
 }
 
 void Ppgtt32::abandon() {
+  pml4_ = pdpt_ = scratch_pdpt_ = scratch_pd_ = ArrayView<uint64_t>();
+  pml4_dma_ = pdpt_dma_ = scratch_pdpt_dma_ = scratch_pd_dma_ = 0;
   for (ArrayView<uint64_t>& t : tables_) t = ArrayView<uint64_t>();
   for (ArrayView<uint64_t>& d : directories_) d = ArrayView<uint64_t>();
   scratch_table_ = ArrayView<uint64_t>();
@@ -115,13 +127,26 @@ void Ppgtt32::abandon() {
   ready_ = false;
 }
 
-bool Ppgtt32::initialize() {
+bool Ppgtt32::initialize(bool four_level) {
   release();
   if (!pages_.allocate_page(&scratch_page_, &scratch_dma_) || !pages_.allocate_page(&scratch_table_, &scratch_table_dma_)) { release(); return false; }
   for (uint64_t& e : scratch_table_) e = ppgtt_pte(scratch_dma_, Caching::Cached);
   for (uint32_t i = 0; i < 4; ++i) {
     if (!pages_.allocate_page(&directories_[i], &directories_dma_[i])) { release(); return false; }
     for (uint64_t& e : directories_[i]) e = ppgtt_pde(scratch_table_dma_, Caching::Cached);
+  }
+  if (four_level) {
+    if (!pages_.allocate_page(&scratch_pd_, &scratch_pd_dma_) || !pages_.allocate_page(&scratch_pdpt_, &scratch_pdpt_dma_) || !pages_.allocate_page(&pdpt_, &pdpt_dma_) ||
+        !pages_.allocate_page(&pml4_, &pml4_dma_)) {
+      release();
+      return false;
+    }
+    for (uint64_t& e : scratch_pd_) e = ppgtt_pde(scratch_table_dma_, Caching::Cached);
+    for (uint64_t& e : scratch_pdpt_) e = ppgtt_pde(scratch_pd_dma_, Caching::Cached);
+    for (uint64_t& e : pdpt_) e = ppgtt_pde(scratch_pd_dma_, Caching::Cached);
+    for (uint32_t i = 0; i < 4; ++i) pdpt_[i] = ppgtt_pde(directories_dma_[i], Caching::Cached);
+    for (uint64_t& e : pml4_) e = ppgtt_pde(scratch_pdpt_dma_, Caching::Cached);
+    pml4_[0] = ppgtt_pde(pdpt_dma_, Caching::Cached);
   }
   ready_ = true;
   return true;
