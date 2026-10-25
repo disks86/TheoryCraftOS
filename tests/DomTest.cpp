@@ -74,7 +74,7 @@ static void test_builder() {
               "<html><head><meta charset=\"utf-8\"><title>T</title></head><body class=\"b\"><p>x</p></body></html>"));
   CHECK(built("<ul><li>a<li>b</ul>", "<html><head></head><body><ul><li>a</li><li>b</li></ul></body></html>"));
   CHECK(built("<p>a<p>b<div>c</div>", "<html><head></head><body><p>a</p><p>b</p><div>c</div></body></html>"));
-  CHECK(built("<table><tr><td>1<td>2<tr><td>3</table>", "<html><head></head><body><table><tr><td>1</td><td>2</td></tr><tr><td>3</td></tr></table></body></html>"));
+  CHECK(built("<table><tr><td>1<td>2<tr><td>3</table>", "<html><head></head><body><table><tbody><tr><td>1</td><td>2</td></tr><tr><td>3</td></tr></tbody></table></body></html>"));
   CHECK(built("<dl><dt>a<dd>b<dt>c</dl>", "<html><head></head><body><dl><dt>a</dt><dd>b</dd><dt>c</dt></dl></body></html>"));
   CHECK(built("<select><option>a<option>b</select>", "<html><head></head><body><select><option>a</option><option>b</option></select></body></html>"));
   CHECK(built("a<br>b<hr>c<img src=x>d", "<html><head></head><body>a<br>b<hr>c<img src=\"x\">d</body></html>"));

@@ -7354,6 +7354,97 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     }
   }());
 
+  // ---------------------------------------------------------------------------------------------------------------------------------- tables
+  (function () {
+    var T = g.HTMLTableElement && g.HTMLTableElement.prototype, S = g.HTMLTableSectionElement && g.HTMLTableSectionElement.prototype, R = g.HTMLTableRowElement && g.HTMLTableRowElement.prototype,
+        C = g.HTMLTableCellElement && g.HTMLTableCellElement.prototype;
+    if (!T || !S || !R || !C) return;
+    var kids = function (el, names) { var out = []; for (var c = el.firstElementChild; c; c = c.nextElementSibling) if (names.indexOf(c.localName) >= 0) out.push(c); return out; };
+    var first = function (el, name) { for (var c = el.firstElementChild; c; c = c.nextElementSibling) if (c.localName === name) return c; return null; };
+    var tableRows = function (table) {
+      var out = [], head = first(table, 'thead');
+      if (head) out = out.concat(kids(head, ['tr']));
+      kids(table, ['tr', 'tbody']).forEach(function (c) { if (c.localName === 'tr') out.push(c); else out = out.concat(kids(c, ['tr'])); });
+      kids(table, ['tfoot']).forEach(function (f) { out = out.concat(kids(f, ['tr'])); });
+      return out;
+    };
+    var def = function (proto, name, get, set) { if (!Object.prototype.hasOwnProperty.call(proto, name)) Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+    var meth = function (proto, name, fn) { if (!Object.prototype.hasOwnProperty.call(proto, name)) method(proto, name, fn); };
+    var indexError = function (op, cls) { return new DOMException("Failed to execute '" + op + "' on '" + cls + "': The provided index is out of range.", 'IndexSizeError'); };
+    var make = function (el, name) { return el.ownerDocument.createElement(name); };
+    def(T, 'caption', function () { return first(this, 'caption'); }, function (v) { this.deleteCaption(); if (v) this.insertBefore(v, this.firstChild); });
+    def(T, 'tHead', function () { return first(this, 'thead'); }, function (v) { this.deleteTHead(); if (v) this.insertBefore(v, afterCaptions(this)); });
+    def(T, 'tFoot', function () { return first(this, 'tfoot'); }, function (v) { this.deleteTFoot(); if (v) this.appendChild(v); });
+    def(T, 'tBodies', function () { return kids(this, ['tbody']); });
+    var afterCaptions = function (table) { for (var c = table.firstChild; c; c = c.nextSibling) if (c.nodeType === 1 && c.localName !== 'caption' && c.localName !== 'colgroup') return c; return null; };
+    meth(T, 'createCaption', function () { var c = first(this, 'caption'); if (!c) { c = make(this, 'caption'); this.insertBefore(c, this.firstChild); } return c; });
+    meth(T, 'deleteCaption', function () { var c = first(this, 'caption'); if (c) c.remove(); });
+    meth(T, 'createTHead', function () { var h = first(this, 'thead'); if (!h) { h = make(this, 'thead'); this.insertBefore(h, afterCaptions(this)); } return h; });
+    meth(T, 'deleteTHead', function () { var h = first(this, 'thead'); if (h) h.remove(); });
+    meth(T, 'createTFoot', function () { var f = first(this, 'tfoot'); if (!f) { f = make(this, 'tfoot'); this.appendChild(f); } return f; });
+    meth(T, 'deleteTFoot', function () { var f = first(this, 'tfoot'); if (f) f.remove(); });
+    meth(T, 'createTBody', function () {
+      var b = make(this, 'tbody'), bodies = kids(this, ['tbody']);
+      if (bodies.length) this.insertBefore(b, bodies[bodies.length - 1].nextSibling);
+      else this.insertBefore(b, first(this, 'tfoot'));
+      return b;
+    });
+    meth(T, 'insertRow', function (index) {
+      index = index === undefined ? -1 : Math.trunc(Number(index)) || 0;
+      var rows = tableRows(this);
+      if (index < -1 || index > rows.length) throw indexError('insertRow', 'HTMLTableElement');
+      var tr = make(this, 'tr');
+      if (!rows.length) {
+        var bodies = kids(this, ['tbody']);
+        (bodies.length ? bodies[bodies.length - 1] : this.createTBody()).appendChild(tr);
+      } else if (index === -1 || index === rows.length) rows[rows.length - 1].parentNode.appendChild(tr);
+      else rows[index].parentNode.insertBefore(tr, rows[index]);
+      return tr;
+    });
+    meth(T, 'deleteRow', function (index) {
+      index = Math.trunc(Number(index)) || 0;
+      var rows = tableRows(this);
+      if (index < -1 || index >= rows.length) throw indexError('deleteRow', 'HTMLTableElement');
+      if (index === -1) index = rows.length - 1;
+      if (rows[index]) rows[index].remove();
+    });
+    def(S, 'rows', function () { return kids(this, ['tr']); });
+    meth(S, 'insertRow', function (index) {
+      index = index === undefined ? -1 : Math.trunc(Number(index)) || 0;
+      var rows = kids(this, ['tr']);
+      if (index < -1 || index > rows.length) throw indexError('insertRow', 'HTMLTableSectionElement');
+      var tr = make(this, 'tr');
+      if (index === -1 || index === rows.length) this.appendChild(tr); else this.insertBefore(tr, rows[index]);
+      return tr;
+    });
+    meth(S, 'deleteRow', function (index) {
+      index = Math.trunc(Number(index)) || 0;
+      var rows = kids(this, ['tr']);
+      if (index < -1 || index >= rows.length) throw indexError('deleteRow', 'HTMLTableSectionElement');
+      if (index === -1) index = rows.length - 1;
+      if (rows[index]) rows[index].remove();
+    });
+    var tableOfRow = function (row) { var p = row.parentNode; if (p && p.localName !== 'table') p = p.parentNode; return p && p.localName === 'table' ? p : null; };
+    def(R, 'rowIndex', function () { var t = tableOfRow(this); return t ? tableRows(t).indexOf(this) : -1; });
+    def(R, 'sectionRowIndex', function () { var p = this.parentNode; return p && ['table', 'thead', 'tbody', 'tfoot'].indexOf(p.localName) >= 0 ? kids(p, ['tr']).indexOf(this) : -1; });
+    meth(R, 'insertCell', function (index) {
+      index = index === undefined ? -1 : Math.trunc(Number(index)) || 0;
+      var cells = kids(this, ['td', 'th']);
+      if (index < -1 || index > cells.length) throw indexError('insertCell', 'HTMLTableRowElement');
+      var td = make(this, 'td');
+      if (index === -1 || index === cells.length) this.appendChild(td); else this.insertBefore(td, cells[index]);
+      return td;
+    });
+    meth(R, 'deleteCell', function (index) {
+      index = Math.trunc(Number(index)) || 0;
+      var cells = kids(this, ['td', 'th']);
+      if (index < -1 || index >= cells.length) throw indexError('deleteCell', 'HTMLTableRowElement');
+      if (index === -1) index = cells.length - 1;
+      if (cells[index]) cells[index].remove();
+    });
+    def(C, 'cellIndex', function () { var p = this.parentNode; return p && p.localName === 'tr' ? kids(p, ['td', 'th']).indexOf(this) : -1; });
+  }());
+
   // ---------------------------------------------------------------------------------------------------------------------------------- more events
   var mkEvent = function (name, parent, defaults) {
     var fields = Object.keys(defaults), base = parent || g.Event;

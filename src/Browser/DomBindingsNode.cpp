@@ -420,12 +420,34 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     *out = Value::make_object(make_collection(c, list));
     return true;
   }
-  if ((IS("options") && n->is_tag("select")) || (IS("rows") && n->is_tag("table")) || (IS("cells") && n->is_tag("tr"))) {
+  const bool section = n->is_tag("thead") || n->is_tag("tbody") || n->is_tag("tfoot");
+  if (IS("rows") && (n->is_tag("table") || section)) {   // a table's rows: the head's, then the body's (and the table's own), then the foot's; a section's: its own
+    List<dom::Node*> list(vm.allocator());
+    auto rows_of = [&](dom::Node* parent) {
+      for (dom::Node* d = parent->first_child; d; d = d->next)
+        if (d->is_element() && d->is_tag("tr")) list.push_back(d);
+    };
+    if (section) {
+      rows_of(n);
+    } else {
+      for (dom::Node* d = n->first_child; d; d = d->next)
+        if (d->is_tag("thead")) rows_of(d);
+      for (dom::Node* d = n->first_child; d; d = d->next) {
+        if (d->is_tag("tr")) list.push_back(d);
+        else if (d->is_tag("tbody")) rows_of(d);
+      }
+      for (dom::Node* d = n->first_child; d; d = d->next)
+        if (d->is_tag("tfoot")) rows_of(d);
+    }
+    *out = Value::make_object(make_collection(c, list));
+    return true;
+  }
+  if ((IS("options") && n->is_tag("select")) || (IS("cells") && n->is_tag("tr"))) {
     List<dom::Node*> list(vm.allocator());
     for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
       if (!d->is_element()) continue;
-      if ((IS("options") && d->is_tag("option")) || (IS("rows") && d->is_tag("tr")) || (IS("cells") && (d->is_tag("td") || d->is_tag("th")))) list.push_back(d);
-      if (IS("cells") && d->parent != n) continue;
+      if (IS("cells") && d->parent != n) continue;   // (a row's own cells, not those of a table inside one)
+      if ((IS("options") && d->is_tag("option")) || (IS("cells") && (d->is_tag("td") || d->is_tag("th")))) list.push_back(d);
     }
     *out = Value::make_object(make_collection(c, list));
     return true;

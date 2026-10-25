@@ -210,9 +210,17 @@ class TreeBuilder {
     if (name_in(name, {"h1", "h2", "h3", "h4", "h5", "h6"}) && open_.count() && name_in(current()->name.view(), {"h1", "h2", "h3", "h4", "h5", "h6"})) pop_to(open_.count() - 1);
     if (name.equals("li")) close_open({"li"}, {"ul", "ol", "menu", "dir", "table", "body"});
     else if (name_in(name, {"dt", "dd"})) close_open({"dt", "dd"}, {"dl", "table", "body"});
-    else if (name.equals("tr")) close_open({"tr"}, {"table"});
+    else if (name.equals("tr")) close_open({"tr", "caption"}, {"table"});
     else if (name_in(name, {"td", "th"})) close_open({"td", "th"}, {"tr", "table"});
-    else if (name_in(name, {"thead", "tbody", "tfoot", "tr", "caption", "colgroup"})) close_open({"thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup"}, {"table"});
+    else if (name_in(name, {"thead", "tbody", "tfoot", "caption", "colgroup"})) {   // these start directly in the table: whatever is open inside it ends
+      for (uint64_t i = open_.count(); i > 0; --i) {
+        if (open_[i - 1]->is_tag("table")) {
+          pop_to(i);
+          break;
+        }
+        if (name_in(open_[i - 1]->name.view(), {"html", "body"})) break;
+      }
+    }
     else if (name.equals("option")) close_open({"option"}, {"select", "datalist", "optgroup"});
     else if (name.equals("optgroup")) close_open({"option", "optgroup"}, {"select"});
     else if (name.equals("a")) close_open({"a"}, {"table", "td", "th", "body", "html", "template"});
@@ -367,6 +375,19 @@ class TreeBuilder {
       }
       if (!open) return;   // (a stray </p>)
     }
+    if (name_in(name, {"thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup"})) {   // a part of a table ends with what is open inside it (a </thead> closes the row and cell)
+      for (uint64_t i = open_.count(); i > 0; --i) {
+        const StringView open_name = open_[i - 1]->name.view();
+        if (open_name.equals(name)) {
+          pop_to(i - 1);
+          return;
+        }
+        if (name_in(open_name, {"table", "template", "html", "body"})) return;
+        if (name_in(name, {"td", "th"}) && name_in(open_name, {"tr", "tbody", "thead", "tfoot"})) return;
+        if (name.equals("tr") && name_in(open_name, {"tbody", "thead", "tfoot"})) return;
+      }
+      return;
+    }
     for (uint64_t i = open_.count(); i > 0; --i) {
       const Node* n = open_[i - 1];
       if (n->name.view().equals(name)) {
@@ -410,7 +431,23 @@ class TreeBuilder {
         ensure_body();
       }
     }
-    if (!head_thing) close_for_start(name);
+    if (!head_thing) {
+      close_for_start(name);
+      if (name_in(name, {"tr", "td", "th"})) {   // rows go in a table body and cells in a row, which the page may leave out
+        if (current() && current()->is_tag("table")) {
+          if (Node* body = make_element("tbody")) {
+            insert(body);
+            push(body);
+          }
+        }
+        if (!name.equals("tr") && current() && name_in(current()->name.view(), {"tbody", "thead", "tfoot"})) {
+          if (Node* row = make_element("tr")) {
+            insert(row);
+            push(row);
+          }
+        }
+      }
+    }
     Node* el = make_element(name);
     if (!el) return after;
     read_attributes(attrs, el);
