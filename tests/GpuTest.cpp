@@ -318,7 +318,50 @@ static void test_compressed() {
   CHECK(a.live == 0);
 }
 
+static void test_rg11b10() {
+  TestAllocator a;
+  {
+    Device dev(a);
+    const FormatDesc* f = find_format("rg11b10ufloat");
+    CHECK(f != nullptr);
+    const uint32_t tex = dev.create_texture(4, 1, 1, 1, 1, 1, f, 0x04 | 0x02 | 0x01);
+    CHECK(tex != 0);
+    auto pack = [](uint32_t r, uint32_t g, uint32_t b) { return r | (g << 11) | (b << 22); };
+    // 1.0, 0.5, 2.0 / the smallest denormals / infinity and NaN / the largest finite values
+    const uint32_t texels[4] = {pack(15 << 6, 14 << 6, 16 << 5), pack(1, 1, 1), pack(31 << 6, 31 << 6 | 1, 31 << 5), pack(1983, 1983, 991)};
+    ImageCopy c;
+    c.texture = tex;
+    CHECK(dev.write_texture(c, ConstByteView(reinterpret_cast<const uint8_t*>(texels), 16), BufferLayout(), 4, 1, 1));
+    const Image& im = *dev.texture(tex)->mips[0];
+    uint32_t px[4];
+    auto fl = [](uint32_t u) { return __builtin_bit_cast(float, u); };
+    webgl::read_texel(im, 0, 0, 0, px); CHECK(fl(px[0]) == 1.0f && fl(px[1]) == 0.5f && fl(px[2]) == 2.0f);
+    webgl::read_texel(im, 1, 0, 0, px); CHECK(fl(px[0]) == 1.0f / 64 / 16384 && fl(px[2]) == 1.0f / 32 / 16384);
+    webgl::read_texel(im, 2, 0, 0, px); CHECK(fl(px[0]) > 1e38f && fl(px[1]) != fl(px[1]) && fl(px[2]) > 1e38f);
+    webgl::read_texel(im, 3, 0, 0, px); CHECK(fl(px[0]) == 65024.0f && fl(px[2]) == 64512.0f);
+    // reading back encodes again: exact values round-trip; others round to nearest even, negatives to zero, overflow to the largest finite value
+    const uint32_t out = dev.create_buffer(16, 0x08 | 0x02);
+    CHECK(dev.copy_texture_to_buffer(c, out, BufferLayout(), 4, 1, 1));
+    uint32_t back[4];
+    CHECK(dev.read_buffer(out, 0, ByteView(reinterpret_cast<uint8_t*>(back), 16)));
+    CHECK(back[0] == texels[0] && back[1] == texels[1] && back[3] == texels[3] && back[2] >> 22 == 31 << 5);
+    Image& wm = *dev.texture_mut(tex)->mips[0];
+    const float vals[4] = {1.0f + 1.0f / 128, -3.0f, 1e9f, 3.14159f};   // 1 + 2^-7 is a tie between 1 and 1 + 2^-6 for an 11-bit float: rounds to even (1.0)
+    uint32_t lanes[4] = {__builtin_bit_cast(uint32_t, vals[0]), __builtin_bit_cast(uint32_t, vals[1]), __builtin_bit_cast(uint32_t, vals[2]), __builtin_bit_cast(uint32_t, 1.0f)};
+    webgl::write_texel(wm, 0, 0, 0, lanes);
+    lanes[0] = __builtin_bit_cast(uint32_t, vals[3]); lanes[1] = lanes[0]; lanes[2] = lanes[0];
+    webgl::write_texel(wm, 1, 0, 0, lanes);
+    CHECK(dev.copy_texture_to_buffer(c, out, BufferLayout(), 4, 1, 1));
+    CHECK(dev.read_buffer(out, 0, ByteView(reinterpret_cast<uint8_t*>(back), 16)));
+    CHECK((back[0] & 2047) == 15 << 6 && ((back[0] >> 11) & 2047) == 0 && (back[0] >> 22) == 991);
+    // pi: 1.5707963 * 2^1 -> mantissa 0.5707963 * 64 = 36.53 -> 37 (11 bit), * 32 = 18.26 -> 18 (10 bit)
+    CHECK((back[1] & 2047) == ((16 << 6) | 37) && (back[1] >> 22) == ((16 << 5) | 18));
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_rg11b10();
   test_compressed();
   test_barrier_in_function();
   test_multisample();
