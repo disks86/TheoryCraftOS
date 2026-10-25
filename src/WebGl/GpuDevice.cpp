@@ -337,7 +337,7 @@ uint32_t Device::create_texture(uint32_t w, uint32_t h, uint32_t depth, uint32_t
   if (!fi) { fail("unsupported format"); return 0; }
   if (format->block_bytes) {
     if (w % format->bw || h % format->bh) { fail("the size of a compressed texture must be a multiple of its block size"); return 0; }
-    if (samples > 1 || dimension != 1 || (usage & (0x10 | 0x8))) { fail("a compressed texture is a 2d, single sampled, sampled-only texture"); return 0; }
+    if (samples > 1 || dimension == 0 || (usage & (0x10 | 0x8))) { fail("a compressed texture is a 2d or 3d, single sampled, sampled-only texture"); return 0; }
   }
   UniquePointer<Texture> t = UniquePointer<Texture>::make(a_, a_);
   if (!t) { fail("out of memory"); return 0; }

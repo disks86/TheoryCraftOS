@@ -79,7 +79,7 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
                  maxComputeWorkgroupStorageSize: 16384, maxComputeInvocationsPerWorkgroup: 256, maxComputeWorkgroupSizeX: 256, maxComputeWorkgroupSizeY: 256, maxComputeWorkgroupSizeZ: 64,
                  maxComputeWorkgroupsPerDimension: 65535 };
   var newLimits = function () { var l = Object.create(GPUSupportedLimits.prototype); for (var k in LIMITS) Object.defineProperty(l, k, { value: LIMITS[k], enumerable: true }); return l; };
-  var FEATURES = ['depth-clip-control', 'depth32float-stencil8', 'indirect-first-instance', 'bgra8unorm-storage', 'float32-filterable', 'rg11b10ufloat-renderable', 'texture-compression-astc', 'texture-compression-astc-hdr', 'texture-compression-bc', 'texture-compression-etc2', 'timestamp-query'];
+  var FEATURES = ['depth-clip-control', 'depth32float-stencil8', 'indirect-first-instance', 'bgra8unorm-storage', 'float32-filterable', 'rg11b10ufloat-renderable', 'texture-compression-astc', 'texture-compression-astc-hdr', 'texture-compression-astc-sliced-3d', 'texture-compression-bc', 'texture-compression-bc-sliced-3d', 'texture-compression-etc2', 'timestamp-query'];
   // block compressed formats: [feature, texels wide, texels high]
   var BLOCKS = {};
   ['bc1-rgba-unorm', 'bc2-rgba-unorm', 'bc3-rgba-unorm', 'bc4-r-unorm', 'bc4-r-snorm', 'bc5-rg-unorm', 'bc5-rg-snorm', 'bc6h-rgb-ufloat', 'bc6h-rgb-float', 'bc7-rgba-unorm'].forEach(function (n) {
@@ -305,6 +305,11 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
     var size = toSize(desc.size);
     var dim = desc.dimension || '2d';
     var blk = BLOCKS[desc.format];
+    if (blk && dim === '3d' && !this.features.has(blk[0] + '-sliced-3d') && this.features.has(blk[0])) {
+      deviceError(this, 'validation', "A 3d texture in '" + desc.format + "' needs the feature '" + blk[0] + "-sliced-3d'.");
+      desc = { size: desc.size, format: desc.format, usage: desc.usage, dimension: '2d', label: desc.label };
+      dim = '2d';
+    }
     if (blk && !this.features.has(blk[0])) {
       deviceError(this, 'validation', "The format '" + desc.format + "' needs the feature '" + blk[0] + "'.");
       var bad = Object.create(GPUTexture.prototype);
