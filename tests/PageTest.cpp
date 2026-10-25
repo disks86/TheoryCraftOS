@@ -1166,6 +1166,22 @@ static void test_webgpu_compressed() {
         "true true | TypeError | 0 1 0 | 0 31 248 0 | error | needs feature");
 }
 
+static void test_webgpu_rg11b10() {
+  CHECK(gl_script(
+            "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice({ requiredFeatures: ['rg11b10ufloat-renderable'] }).then(function (d) {"
+            " var t = d.createTexture({ size: [2, 2], format: 'rg11b10ufloat', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST });"
+            " var e = d.createCommandEncoder(); var p = e.beginRenderPass({ colorAttachments: [{ view: t.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [1, 0.5, 2, 1] }] }); p.end();"
+            " var out = d.createBuffer({ size: 256 * 2, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });"
+            " e.copyTextureToBuffer({ texture: t }, { buffer: out, bytesPerRow: 256 }, [2, 2]); d.queue.submit([e.finish()]);"
+            " return out.mapAsync(GPUMapMode.READ).then(function () { var w = new Uint32Array(out.getMappedRange()); var v = w[0];"
+            "  console.log(v & 2047, (v >> 11) & 2047, v >>> 22, w[64] === v);"
+            "  d.queue.writeTexture({ texture: t }, new Uint32Array([1983 | (1983 << 11) | (991 << 22), 0]), { bytesPerRow: 8 }, [2, 1]);"
+            "  var plain = a.requestDevice().then(function (d2) { d2.pushErrorScope('validation'); d2.createTexture({ size: [2, 2], format: 'rg11b10ufloat', usage: GPUTextureUsage.TEXTURE_BINDING });"
+            "   return d2.popErrorScope().then(function (e1) { d2.pushErrorScope('validation'); d2.createTexture({ size: [2, 2], format: 'rg11b10ufloat', usage: GPUTextureUsage.RENDER_ATTACHMENT }); return d2.popErrorScope().then(function (e2) { console.log(e1 ? 'bad' : 'sampled ok', e2 ? 'needs feature' : 'bad'); }); }); });"
+            "  return plain; }); }); }).catch(function (e) { console.log('ERR', e && e.message); });") ==
+        "960 896 512 true | sampled ok needs feature");
+}
+
 static void test_webgpu_mapping() {
   CHECK(gl_script(
             "navigator.gpu.requestAdapter().then(function (a) { return a.requestDevice(); }).then(function (d) {"
@@ -5884,6 +5900,7 @@ int main(int argc, char** argv) {
     test_webgpu();
   test_webgpu_mapping();
   test_webgpu_compressed();
+  test_webgpu_rg11b10();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();
@@ -5936,6 +5953,7 @@ int main(int argc, char** argv) {
   test_webgpu();
   test_webgpu_mapping();
   test_webgpu_compressed();
+  test_webgpu_rg11b10();
   test_webgl_pbo();
   test_webgl_compressed();
   test_webgl_bptc_astc();

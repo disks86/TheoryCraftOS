@@ -311,6 +311,10 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
       def(bad, 'sampleCount', desc.sampleCount || 1); def(bad, 'dimension', dim); def(bad, 'format', desc.format); def(bad, 'usage', desc.usage);
       return bad;
     }
+    if (desc.format === 'rg11b10ufloat' && (desc.usage & 16) && !this.features.has('rg11b10ufloat-renderable')) {
+      deviceError(this, 'validation', "Rendering to 'rg11b10ufloat' needs the feature 'rg11b10ufloat-renderable'.");
+      desc = { size: desc.size, format: desc.format, usage: desc.usage & ~16, mipLevelCount: desc.mipLevelCount, sampleCount: desc.sampleCount, dimension: desc.dimension, label: desc.label };
+    }
     var id = op(this, 'createTexture', size[0], size[1], size[2], desc.mipLevelCount || 1, desc.sampleCount || 1, texDim[dim], desc.format, desc.usage);
     if (!id) pullError(this);
     var t = Object.create(GPUTexture.prototype);

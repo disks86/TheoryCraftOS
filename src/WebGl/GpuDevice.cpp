@@ -38,7 +38,7 @@ const FormatDesc kFormats[] = {
     {"rg8uint", 0x8238, false, 2, 2, 2, false, false}, {"rg8sint", 0x8237, false, 2, 3, 2, false, false}, {"rgba8unorm", 0x8058, false, 4, 0, 4, false, false},
     {"rgba8unorm-srgb", 0x8C43, false, 4, 0, 4, false, false}, {"rgba8snorm", 0x8F97, false, 4, 1, 4, false, false}, {"rgba8uint", 0x8D7C, false, 4, 2, 4, false, false},
     {"rgba8sint", 0x8D8E, false, 4, 3, 4, false, false}, {"bgra8unorm", 0x8058, true, 4, 0, 4, false, false}, {"bgra8unorm-srgb", 0x8C43, true, 4, 0, 4, false, false},
-    {"rgb10a2unorm", 0x8059, false, 4, 12, 4, false, false}, {"r16uint", 0x8234, false, 1, 5, 2, false, false}, {"r16sint", 0x8233, false, 1, 6, 2, false, false},
+    {"rgb10a2unorm", 0x8059, false, 4, 12, 4, false, false}, {"rg11b10ufloat", 0x8C3A, false, 3, 13, 4, false, false}, {"r16uint", 0x8234, false, 1, 5, 2, false, false}, {"r16sint", 0x8233, false, 1, 6, 2, false, false},
     {"r16float", 0x822D, false, 1, 7, 2, false, false}, {"rg16uint", 0x823A, false, 2, 5, 4, false, false}, {"rg16sint", 0x8239, false, 2, 6, 4, false, false},
     {"rg16float", 0x822F, false, 2, 7, 4, false, false}, {"rgba16uint", 0x8D76, false, 4, 5, 8, false, false}, {"rgba16sint", 0x8D88, false, 4, 6, 8, false, false},
     {"rgba16float", 0x881A, false, 4, 7, 8, false, false}, {"r32uint", 0x8236, false, 1, 8, 4, false, false}, {"r32sint", 0x8235, false, 1, 9, 4, false, false},
@@ -129,6 +129,40 @@ int kind_bits(uint8_t k) {
   }
 }
 
+
+// The unsigned small floats of rg11b10ufloat: 5 exponent bits, `mant` mantissa bits, bias 15, no sign.
+float small_float_to_f32(uint32_t v, int mant) {
+  const uint32_t e = v >> mant, m = v & ((1u << mant) - 1);
+  const float scale = static_cast<float>(1u << mant);
+  if (e == 0) return m / scale / 16384.0f;   // denormal: m / 2^mant * 2^-14
+  if (e == 31) return m ? u2f(0x7FC00000u) : u2f(0x7F800000u);
+  return (1.0f + m / scale) * static_cast<float>(1u << (e > 15 ? e - 15 : 0)) / static_cast<float>(1u << (e < 15 ? 15 - e : 0));
+}
+
+uint32_t f32_to_small_float(float f, int mant) {
+  const uint32_t top = 31u << mant;
+  if (f != f) return top | 1;
+  if (f <= 0) return 0;
+  const float max_finite = (2.0f - 1.0f / static_cast<float>(1u << mant)) * 32768.0f;
+  if (f > max_finite) return f >= u2f(0x7F800000u) ? top : top - 1;
+  const uint32_t bits = f2u(f);
+  const int e32 = static_cast<int>(bits >> 23) - 127;
+  if (e32 < -14) {   // denormal range: a multiple of 2^-(14 + mant)
+    const float units = f * 16384.0f * static_cast<float>(1u << mant);
+    uint32_t q = static_cast<uint32_t>(units);
+    const float rem = units - static_cast<float>(q);
+    if (rem > 0.5f || (rem == 0.5f && (q & 1))) ++q;
+    return q;   // may carry into the first normal value, which is correct
+  }
+  uint32_t m = (bits & 0x7FFFFF) >> (23 - mant);
+  const uint32_t rest = bits & ((1u << (23 - mant)) - 1), half = 1u << (22 - mant);
+  uint32_t e = static_cast<uint32_t>(e32 + 15);
+  if (rest > half || (rest == half && (m & 1))) ++m;
+  if (m >> mant) { m = 0; ++e; }
+  const uint32_t r = (e << mant) | m;
+  return r > top - 1 ? top - 1 : r;
+}
+
 // Unpacks one texel from a buffer into the lanes the image store takes (see webgl::store_lanes): floats for unorm/snorm/float, raw ints for integer formats.
 void decode_texel(const FormatDesc& f, const uint8_t* p, uint8_t aspect, uint32_t lanes[4], bool* ints) {
   *ints = f.kind == 2 || f.kind == 3 || f.kind == 5 || f.kind == 6 || f.kind == 8 || f.kind == 9;
@@ -142,16 +176,20 @@ void decode_texel(const FormatDesc& f, const uint8_t* p, uint8_t aspect, uint32_
     else __builtin_memcpy(&lanes[0], p, 4);
     return;
   }
+  if (f.kind == 12 || f.kind == 13) {   // packed in one 32 bit word
+    uint32_t v;
+    __builtin_memcpy(&v, p, 4);
+    if (f.kind == 12) {
+      lanes[0] = f2u((v & 1023) / 1023.0f); lanes[1] = f2u(((v >> 10) & 1023) / 1023.0f); lanes[2] = f2u(((v >> 20) & 1023) / 1023.0f); lanes[3] = f2u((v >> 30) / 3.0f);
+    } else {
+      lanes[0] = f2u(small_float_to_f32(v & 2047, 6)); lanes[1] = f2u(small_float_to_f32((v >> 11) & 2047, 6)); lanes[2] = f2u(small_float_to_f32(v >> 22, 5));
+    }
+    return;
+  }
   uint8_t px[16] = {};
   const uint32_t n = f.comps * (kind_bits(f.kind) / 8);
   for (uint32_t i = 0; i < n && i < 16; ++i) px[i] = p[i];
   if (f.bgra) { const uint8_t t = px[0]; px[0] = px[2]; px[2] = t; }
-  if (f.kind == 12) {
-    uint32_t v;
-    __builtin_memcpy(&v, p, 4);
-    lanes[0] = f2u((v & 1023) / 1023.0f); lanes[1] = f2u(((v >> 10) & 1023) / 1023.0f); lanes[2] = f2u(((v >> 20) & 1023) / 1023.0f); lanes[3] = f2u((v >> 30) / 3.0f);
-    return;
-  }
   const int bytes = kind_bits(f.kind) / 8;
   for (uint32_t c = 0; c < f.comps; ++c) {
     const uint8_t* q = px + c * bytes;
@@ -198,6 +236,11 @@ void encode_texel(const FormatDesc& f, const Image& img, uint32_t x, uint32_t y,
   if (f.kind == 12) {
     auto q = [](float v, float m) { return static_cast<uint32_t>((v < 0 ? 0 : (v > 1 ? 1 : v)) * m + 0.5f); };
     const uint32_t v = q(fv[0], 1023) | (q(fv[1], 1023) << 10) | (q(fv[2], 1023) << 20) | (q(fv[3], 3) << 30);
+    __builtin_memcpy(out, &v, 4);
+    return;
+  }
+  if (f.kind == 13) {
+    const uint32_t v = f32_to_small_float(fv[0], 6) | (f32_to_small_float(fv[1], 6) << 11) | (f32_to_small_float(fv[2], 5) << 22);
     __builtin_memcpy(out, &v, 4);
     return;
   }
