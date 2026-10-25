@@ -22,13 +22,15 @@
 
 namespace webgl {
 
-enum class Codec : uint8_t { Bc1Rgb, Bc1Rgba, Bc2, Bc3, Bc4U, Bc4S, Bc5U, Bc5S, Etc1 };
+enum class Codec : uint8_t { Bc1Rgb, Bc1Rgba, Bc2, Bc3, Bc4U, Bc4S, Bc5U, Bc5S, Etc1, Bc6U, Bc6S, Bc7, Astc };
 
 struct CompressedFormat {
   uint32_t internal;       // the GL enum
   uint8_t block_bytes;     // bytes of one 4 x 4 block
   Codec codec;
   uint32_t decoded;        // the format the decoded image is stored as
+  uint8_t bw = 4, bh = 4;  // texels of a block (ASTC has many sizes)
+  bool srgb = false;       // ASTC: the colours are sRGB encoded
 };
 
 const CompressedFormat* find_compressed(uint32_t internal);

@@ -1171,6 +1171,20 @@ static void test_webgl_compressed() {
         "1280 0 | 33779 4 | 0 | 0 0 255 255 | 1281");
 }
 
+static void test_webgl_bptc_astc() {
+  CHECK(gl_script(
+            "var gl = c.getContext('webgl2'); var t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);"
+            " var astc = gl.getExtension('WEBGL_compressed_texture_astc'); var bptc = gl.getExtension('EXT_texture_compression_bptc');"
+            " console.log(astc.COMPRESSED_RGBA_ASTC_6x6_KHR, astc.COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR, bptc.COMPRESSED_RGBA_BPTC_UNORM_EXT, astc.getSupportedProfiles().join(), gl.getParameter(gl.COMPRESSED_TEXTURE_FORMATS).length);"
+            // an ASTC void-extent block: the colour is the four 16-bit values at bytes 8..15
+            " var blk = new Uint8Array([0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0]); blk.set([0xff, 0xff, 0x80, 0x80, 0x00, 0x00, 0xff, 0xff], 8);"
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, astc.COMPRESSED_RGBA_ASTC_6x6_KHR, 6, 6, 0, blk); console.log(gl.getError());"
+            " var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);"
+            " var px = new Uint8Array(4); gl.readPixels(5, 5, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); console.log(px.join(','));"
+            " gl.compressedTexImage2D(gl.TEXTURE_2D, 0, bptc.COMPRESSED_RGBA_BPTC_UNORM_EXT, 4, 4, 0, new Uint8Array(16)); console.log(gl.getError());") ==
+        "37812 37853 36492 ldr 32 | 0 | 255,128,0,255 | 0");
+}
+
 static void test_webgl_pbo() {
   CHECK(gl_script(
             "var gl = c.getContext('webgl2');"
@@ -5845,6 +5859,7 @@ int main(int argc, char** argv) {
   test_webgpu_mapping();
   test_webgl_pbo();
   test_webgl_compressed();
+  test_webgl_bptc_astc();
     printf(g_failed ? "%d check(s) failed\n" : "webgl and webgpu tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -5895,6 +5910,7 @@ int main(int argc, char** argv) {
   test_webgpu_mapping();
   test_webgl_pbo();
   test_webgl_compressed();
+  test_webgl_bptc_astc();
   test_video();
   test_audio();
   test_media_api();
