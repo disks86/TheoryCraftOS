@@ -159,7 +159,9 @@ struct FakeGpu final : IRegisterBank {
   std::function<void(FakeGpu&, const std::vector<uint32_t>&)> on_batch;
 
   void run_batch_at(uint64_t address) {
+    // Walks the commands by their lengths (a data dword may look like the end marker): MFX commands carry their length, a no-op is one dword, the end is the last.
     std::vector<uint32_t> dump;
+    uint32_t remaining = 0;
     for (uint32_t n = 0; n < 8192; ++n) {
       bool ok;
       uint8_t* p = ppgtt_bytes(address + n * 4, 4, "batch", &ok);
@@ -167,6 +169,9 @@ struct FakeGpu final : IRegisterBank {
       uint32_t d;
       memcpy(&d, p, 4);
       dump.push_back(d);
+      if (remaining) { --remaining; continue; }
+      if ((d >> 29) == 3) { remaining = (d & 0xFF) + 1; continue; }
+      if ((d >> 23) == 0x26) { remaining = 3; continue; }
       if ((d >> 23) == 0x0A) {
         batches.push_back(dump);
         if (on_batch) on_batch(*this, dump);

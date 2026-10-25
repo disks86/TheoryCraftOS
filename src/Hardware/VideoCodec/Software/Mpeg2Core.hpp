@@ -79,6 +79,13 @@ struct Picture {
 };
 
 // What the engine of an offload is given for each picture: the headers, the pictures it refers to (by slot: the index in the Core's pool), the slices.
+// Where a slice's macroblocks begin, for an offload that is given the slice's bits and must be told where to start (a slice is the bits of the slice with its start code).
+struct SliceInfo {
+  int mb_row = 0, mb_col = 0;      // the first macroblock (a field picture: the row in the field)
+  uint32_t mb_bit_offset = 0;      // of the first macroblock_address_increment, from the first bit of the start code
+  int quantiser_scale_code = 0;
+};
+
 struct OffloadPicture {
   const SequenceHeader* seq = nullptr;
   const PictureHeader* pic = nullptr;
@@ -87,6 +94,8 @@ struct OffloadPicture {
   int anchor_slot[2] = {-1, -1};               // the older and the newer anchor picture when this one starts: the pictures an offload must still hold
   bool second_field = false;                   // a field picture whose frame was started by the first field
   ArrayView<const ConstByteView> slices;       // each slice with its start code (00 00 01 xx)
+  ArrayView<const SliceInfo> slice_info;       // one per slice
+  uint8_t intra_matrix[64] = {}, non_intra_matrix[64] = {};   // the same matrices by position (row * 8 + column)
   uint8_t intra_matrix_scan[64] = {}, non_intra_matrix_scan[64] = {};   // the quantiser matrices in the order of the scan the picture uses (the i-th byte weighs the i-th coefficient)
   // The frame to fill (8-bit planes; for a field picture the whole frame, of which the offload writes its field's lines).
   ByteView plane[3];
@@ -214,6 +223,7 @@ class Core {
   bool need_intra_ = true;            // decoding starts at an intra picture
   int slice_count_ = 0;
   List<ConstByteView> slices_;        // the slices of the picture being collected for the offload
+  List<SliceInfo> slice_infos_;
 
   IOffload* offload_ = nullptr;
   IFrameObserver* observer_ = nullptr;

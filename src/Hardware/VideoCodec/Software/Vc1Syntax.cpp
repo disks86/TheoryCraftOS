@@ -85,7 +85,7 @@ uint64_t next_start_code(ConstByteView data, uint64_t from) {
 }
 }  // namespace
 
-Core::Core(allocators::IAllocator& allocator) : allocator_(allocator) {
+Core::Core(allocators::IAllocator& allocator) : allocator_(allocator), unit_infos_(allocator) {
   for (int k = 0; k < 4; ++k)
     for (int i = 0; i < 64; ++i) {
       const int p = kScan8x8[k * 64 + i];
@@ -773,21 +773,25 @@ bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slic
     // The picture repeats the one before it.
     Picture* last = anchor_[1];
     for (int c = 0; c < 3; ++c) ArrayView<uint8_t>(cur_->plane[c].data(), cur_->plane[c].size()).copy_from(ConstByteView(last->plane[c].data(), last->plane[c].size()));
-  } else if (!offloaded_) {
+  } else {
     // Per picture state.
-    slice_start_row_.fill(0);
-    intra_mask_.fill(0);
-    cbp_blocks_.fill(0);
-    ttblk_.fill(0);
-    mv_.fill(0);
-    mv_back_.fill(0);
-    uvmv_.fill(0);
-    qscale_.fill(0);
-    esc3_level_length_ = 0;
-    esc3_run_length_ = 0;
-    ConstByteView data = frame;
-    // Switch to the first slice at the macroblock row it names.
-    int rows_done = 0;
+    if (!offloaded_) {
+      slice_start_row_.fill(0);
+      intra_mask_.fill(0);
+      cbp_blocks_.fill(0);
+      ttblk_.fill(0);
+      mv_.fill(0);
+      mv_back_.fill(0);
+      uvmv_.fill(0);
+      qscale_.fill(0);
+      esc3_level_length_ = 0;
+      esc3_run_length_ = 0;
+    }
+    // Switch to the first slice at the macroblock row it names. (With the pixel work offloaded the slices are only walked, to know where their macroblocks begin.)
+    unit_infos_.clear();
+    UnitInfo first;
+    first.mb_bit_offset = static_cast<uint32_t>(br.position());
+    if (!unit_infos_.push_back(first)) return false;
     int slice_count = static_cast<int>(slices.size());
     for (int s = 0; s <= slice_count; ++s) {
       BitReader sbr = br;
@@ -798,7 +802,12 @@ bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slic
         if (sbr.bit()) {
           if (!parse_picture_header(sbr)) return false;
         }
+        UnitInfo info;
+        info.start_row = start_row;
+        info.mb_bit_offset = static_cast<uint32_t>(sbr.position());
+        if (!unit_infos_.push_back(info)) return false;
       }
+      if (offloaded_) continue;
       if (s < slice_count) {
         BitReader nbr(slices[static_cast<uint64_t>(s)]);
         end_row = static_cast<int>(nbr.get(9));
@@ -808,11 +817,8 @@ bool Core::decode_frame(ConstByteView frame, ArrayView<const ConstByteView> slic
       if (!decode_slice_blocks(sbr, start_row, end_row)) {
         // A damaged slice leaves the rest of its rows as they are (grey, or a prediction).
       }
-      rows_done = end_row;
     }
-    (void)rows_done;
-    (void)data;
-    finish_intra_and_filters();
+    if (!offloaded_) finish_intra_and_filters();
   }
   finish_picture(raw_units);
   return true;
@@ -832,6 +838,25 @@ void Core::finish_picture(ArrayView<const ConstByteView> units) {
     for (int i = 0; i < 2; ++i)
       if (anchor_[i]) o.anchor_slot[i] = static_cast<int>(anchor_[i] - pool_);
     o.units = units;
+    o.unit_info = unit_infos_.view();
+    if (!pic_.skipped) {
+      const bool intra_like = pic_.type == kPictureI || pic_.type == kPictureBI;
+      const bool adv = seq_.profile == kAdvanced;
+      auto plane = [&](const Buf<uint8_t>& b) { return ArrayView<const uint8_t>(b.data(), b.size()); };
+      if (pic_.type == kPictureP) {
+        if (!pic_.skip_raw) o.skip_plane = plane(plane_skip_);
+        if (!pic_.mv_type_raw && ((pic_.mv_mode == kMvIntensityComp && pic_.mv_mode2 == kMvMixed) || pic_.mv_mode == kMvMixed)) o.mv_type_plane = plane(plane_mvtype_);
+      } else if (pic_.type == kPictureB) {
+        if (!pic_.skip_raw) o.skip_plane = plane(plane_skip_);
+        if (!pic_.direct_raw) o.direct_plane = plane(plane_direct_);
+      } else if (intra_like && adv) {
+        if (!pic_.acpred_raw) o.acpred_plane = plane(plane_acpred_);
+        if (!pic_.overflags_raw && seq_.overlap && pic_.pq <= 8 && pic_.condover == kCondOverSelect) o.overflags_plane = plane(plane_overflags_);
+      }
+    }
+    o.ic_forward = ic_use_ && (pic_.type == kPictureP || pic_.type == kPictureB);
+    o.ic_scale = ic_scale_;
+    o.ic_shift = ic_shift_;
     for (int c = 0; c < 3; ++c) {
       o.plane[c] = ByteView(cur_->plane[c].data(), cur_->plane[c].size());
       o.stride[c] = cur_->stride[c];

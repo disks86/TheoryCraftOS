@@ -132,6 +132,13 @@ struct Picture {
 
 // What an offload (a hardware decoder) is given for each picture: the headers, the pictures it refers to (by slot: the index in the Core's pool) and the picture's
 // data: the frame unit and its slice units, as they are in the stream (Advanced profile: each behind its start code; Simple and Main: the frame as stored).
+// Where the macroblocks of a unit of a picture begin (the frame unit, then each slice unit): the first macroblock row, and the bit position of the first macroblock in the unit's
+// bits with the emulation prevention bytes removed, counted from the first bit after the start code (Simple and Main profile: from the first bit of the frame).
+struct UnitInfo {
+  int start_row = 0;
+  uint32_t mb_bit_offset = 0;
+};
+
 struct OffloadPicture {
   const SequenceHeader* seq = nullptr;
   const PictureHeader* pic = nullptr;
@@ -139,6 +146,12 @@ struct OffloadPicture {
   int forward_slot = -1, backward_slot = -1;   // the pictures this one predicts from (-1: none)
   int anchor_slot[2] = {-1, -1};               // the older and the newer anchor picture when this one starts: the pictures an offload must still hold
   ArrayView<const ConstByteView> units;
+  ArrayView<const UnitInfo> unit_info;         // one per unit
+  // The bit planes the picture codes (one byte per macroblock, 0 or 1, in raster order); empty for a plane that is not there or is coded in the macroblock layer ("raw").
+  ArrayView<const uint8_t> skip_plane, mv_type_plane, direct_plane, acpred_plane, overflags_plane;
+  // Intensity compensation of the forward reference (set by the P picture that follows it, and in force for the B pictures between): the 6 bit scale and shift of the header.
+  bool ic_forward = false;
+  int ic_scale = 0, ic_shift = 0;
   // The frame to fill (8-bit planes).
   ByteView plane[3];
   int stride[3] = {0, 0, 0};
@@ -367,6 +380,7 @@ class Core {
 
   // bit planes of the picture being decoded (one byte per macroblock)
   Buf<uint8_t> plane_skip_, plane_mvtype_, plane_direct_, plane_acpred_, plane_overflags_;
+  List<UnitInfo> unit_infos_;
 
   // picture decoding state
   int mb_w_ = 0, mb_h_ = 0;

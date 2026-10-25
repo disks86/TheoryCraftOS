@@ -70,7 +70,7 @@ bool make_lut(allocators::IAllocator& a, Mem<uint16_t>* lut, const uint16_t* cod
 constexpr int kMaxFCode = 9;
 }  // namespace
 
-Core::Core(allocators::IAllocator& allocator) : allocator_(allocator), slices_(allocator) {}
+Core::Core(allocators::IAllocator& allocator) : allocator_(allocator), slices_(allocator), slice_infos_(allocator) {}
 
 bool Core::build_vlcs() {
   if (vlcs_ready_) return true;
@@ -338,6 +338,7 @@ bool Core::start_picture() {
   picture_open_ = true;
   slice_count_ = 0;
   slices_.clear();
+  slice_infos_.clear();
   return true;
 }
 
@@ -363,6 +364,11 @@ void Core::finish_picture() {
     }
     o.second_field = second_field_;
     o.slices = slices_.view();
+    o.slice_info = slice_infos_.view();
+    for (int i = 0; i < 64; ++i) {
+      o.intra_matrix[i] = sequence_.intra_matrix[i];
+      o.non_intra_matrix[i] = sequence_.non_intra_matrix[i];
+    }
     for (int c = 0; c < 3; ++c) {
       o.plane[c] = ByteView(cur_->plane[c].data(), cur_->plane[c].size());
       o.stride[c] = cur_->stride[c];
