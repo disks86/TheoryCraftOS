@@ -278,6 +278,7 @@ add_executable(BOOTX64
   src/WebGl/GlContext.cpp
   src/WebGl/GlProgram.cpp
   src/WebGl/GlTexture.cpp
+  src/WebGl/GlCompressed.cpp
   src/WebGl/GlSampler.cpp
   src/WebGl/GlDraw.cpp
   src/Browser/DomBindingsServiceWorker.cpp
