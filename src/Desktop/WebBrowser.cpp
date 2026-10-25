@@ -1017,8 +1017,18 @@ void WebBrowser::settle() {
     page_.invalidate();
   }
   update_key_capture();
-  if (live_->changed() || defer_scroll_ >= 0 || restore_scroll_ >= 0) refresh(true);
-  else if (live_->errors() != reported_errors_) {
+  const uint64_t now_ms = __atomic_load_n(&uptime_ms_, __ATOMIC_ACQUIRE);
+  const bool shown = __atomic_load_n(&page_shown_, __ATOMIC_ACQUIRE);
+  const bool must = defer_scroll_ >= 0 || restore_scroll_ >= 0;
+  if (live_->changed() || must) {
+    if (!must && (!shown || (in_timers_ && now_ms < __atomic_load_n(&last_refresh_ms_, __ATOMIC_ACQUIRE) + kMinRefreshGapMs))) {   // (a timer made it too soon, or nobody looks: tick comes back for it; a click or key is drawn at once)
+      __atomic_store_n(&refresh_deferred_, true, __ATOMIC_RELEASE);
+    } else {
+      __atomic_store_n(&refresh_deferred_, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&last_refresh_ms_, now_ms, __ATOMIC_RELEASE);
+      refresh(true);
+    }
+  } else if (live_->errors() != reported_errors_) {
     UiGuard lock(this);
     script_log_.assign(live_->log());
     script_errors_ = live_->errors();
@@ -1140,7 +1150,17 @@ void WebBrowser::tick(uint64_t uptime_us) {
     pending_referrer_.assign(current_.view());
     post(refresh_target_.view().equals(current_.view()) ? Request::Reload : Request::Go, refresh_target_.view());
   }
+  const bool shown_now = __atomic_load_n(&page_shown_, __ATOMIC_ACQUIRE);
+  const uint64_t ms = uptime_us / 1000;
   const uint64_t due = __atomic_load_n(&next_due_ms_, __ATOMIC_ACQUIRE);
+  if (__atomic_load_n(&refresh_deferred_, __ATOMIC_ACQUIRE) && shown_now && ms >= __atomic_load_n(&last_refresh_ms_, __ATOMIC_ACQUIRE) + kMinRefreshGapMs && !__atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) {
+    queue(timer_handler_, *this, true);   // (a redraw was put off: the handler's settle() does it now)
+    return;
+  }
+  if (due != 0 && !shown_now) {   // a page that is not shown: its timers run once a second
+    if (ms < last_hidden_run_ms_ + kHiddenTimerGapMs) return;
+    last_hidden_run_ms_ = ms;
+  }
   if (due == 0 || page_clock_ms() < due || __atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) return;
   queue(timer_handler_, *this, true);
 }
@@ -1152,7 +1172,9 @@ void WebBrowser::on_timers(void* self, Control&) {
   const double now = static_cast<double>(b->page_clock_ms());
   b->live_->run_due_timers(now);
   b->live_->step_objects(now);
+  b->in_timers_ = true;
   b->settle();
+  b->in_timers_ = false;
 }
 
 void WebBrowser::on_pointer(void* self, Control&) {

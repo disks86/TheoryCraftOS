@@ -393,8 +393,10 @@ DomError set_attribute(Node* e, StringView name, StringView value) {
   if (i >= 0) {
     String old(e->owner->allocator());
     old.assign(e->attrs[static_cast<uint64_t>(i)].value.view());
+    const bool same = old.view().equals(value);
     if (!e->attrs[static_cast<uint64_t>(i)].value.assign(value)) return DomError::OutOfMemory;
     record_attribute(e, name, &old);
+    if (same) return DomError::None;   // (writing the value it already has changes nothing on screen: no new version, so no relayout)
   } else {
     if (name.empty()) return DomError::HierarchyRequest;
     Attribute a(e->owner->allocator());
@@ -452,11 +454,16 @@ DomError set_text_content(Node* node, StringView text) {
       m.had_old_value = true;
       node->owner->record(util::move(m));
     }
+    const bool same = node->data.view().equals(text);
     if (!node->data.assign(text)) return DomError::OutOfMemory;
-    touch(node);
+    if (!same) touch(node);
     return DomError::None;
   }
   if (node->type == NodeType::Document) return DomError::None;
+  if (!node->owner->recording()) {   // (nothing to replace: already empty, or already just this text)
+    if (text.empty() && !node->first_child) return DomError::None;
+    if (!text.empty() && node->first_child && !node->first_child->next && node->first_child->type == NodeType::Text && node->first_child->data.view().equals(text)) return DomError::None;
+  }
   while (node->first_child) unlink(node->first_child);
   if (!text.empty()) {
     Node* t = node->owner->create_text(text);

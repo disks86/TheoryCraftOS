@@ -416,6 +416,11 @@ class WebBrowser : public gui::Frame {
   String defer_type_, defer_body_, request_type_, request_body_;
   uint64_t uptime_ms_ = 0, clock_base_unix_ = 0, clock_base_up_ = 0, next_due_ms_ = 0;
   bool clock_based_ = false, timer_pending_ = false;
+  // A busy page is drawn again at most every kMinRefreshGapMs; a page that is not shown runs its timers once a second and is not drawn at all.
+  static constexpr uint64_t kMinRefreshGapMs = 100, kHiddenTimerGapMs = 1000;
+  uint64_t last_refresh_ms_ = 0, last_hidden_run_ms_ = 0;
+  bool in_timers_ = false;          // (settle() runs for a timer: handler thread only)
+  bool refresh_deferred_ = false;   // (written by tick and the handler thread alike: atomic)
   bool page_shown_ = true;   // Page Visibility: is the tab selected in a window that is not minimized (written by tick, read on the handler thread)
   gui::Handler visibility_handler_;
   uint32_t reported_errors_ = 0;
