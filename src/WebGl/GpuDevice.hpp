@@ -43,12 +43,15 @@ struct FormatDesc {
   uint8_t kind;       // see the table
   uint8_t bytes;      // per texel in a buffer (the depth aspect for depth formats)
   bool depth, stencil;
+  uint8_t bw = 1, bh = 1, block_bytes = 0;   // a block compressed format: texels of a block and bytes of one (`gl` is then the format it is decoded to)
+  uint32_t cgl = 0;                         // ... and its WebGL enum, which names the decoder
 };
 const FormatDesc* find_format(StringView name);
 
 struct Texture {
-  explicit Texture(allocators::IAllocator& a) : mips(a) {}
+  explicit Texture(allocators::IAllocator& a) : mips(a), raw(a) {}
   List<UniquePointer<Image>> mips;
+  List<UniquePointer<ByteBuffer>> raw;   // a compressed texture also keeps its blocks, per mip level, so that they can be copied out
   const FormatDesc* format = nullptr;
   uint32_t w = 1, h = 1, depth = 1, mip_count = 1, samples = 1, usage = 0;
   uint8_t dimension = 1;   // 0 = 1d, 1 = 2d, 2 = 3d
@@ -306,6 +309,10 @@ class Device final : public shader::ITextureHost {
   bool write_back(shader::Module& m, List<uint32_t>& region);
   bool draw_primitives(uint32_t count, uint32_t first, int32_t base_vertex, uint32_t instances, uint32_t first_instance, bool indexed, uint32_t unused);
   bool texture_copy(const ImageCopy& t, uint32_t w, uint32_t h, uint32_t d, Image** img, const FormatDesc** fd);
+  // The block compressed paths of the texture copies: `data` rows hold whole blocks.
+  bool block_copy_ok(const Image& img, const FormatDesc& fd, const ImageCopy& t, uint32_t w, uint32_t h);
+  bool write_blocks(const ImageCopy& dst, ConstByteView data, const BufferLayout& layout, uint32_t w, uint32_t h, uint32_t d);
+  bool read_blocks(const ImageCopy& src, Buffer* dst, const BufferLayout& layout, uint32_t w, uint32_t h, uint32_t d);
   uint32_t register_bound(const TextureView* v, const Sampler* s);
 
   allocators::IAllocator& a_;

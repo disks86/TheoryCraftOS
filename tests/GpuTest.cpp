@@ -245,7 +245,81 @@ static void test_barrier_in_function() {
   CHECK(a.live == 0);
 }
 
+static void test_compressed() {
+  TestAllocator a;
+  {
+    Device dev(a);
+    const FormatDesc* bc1 = find_format("bc1-rgba-unorm");
+    const FormatDesc* astc = find_format("astc-6x6-unorm");
+    CHECK(bc1 && astc && find_format("bc7-rgba-unorm-srgb") && find_format("astc-12x10-unorm-srgb") && find_format("bc6h-rgb-float"));
+    CHECK(dev.create_texture(5, 8, 1, 1, 1, 1, bc1, 0x04) == 0);          // not a multiple of the block size
+    CHECK(dev.create_texture(8, 8, 1, 1, 1, 1, bc1, 0x10 | 0x04) == 0);   // not renderable
+    CHECK(dev.create_texture(8, 8, 1, 1, 4, 1, bc1, 0x04) == 0);          // not multisampled
+    dev.error.clear();
+    const uint32_t tex = dev.create_texture(8, 8, 1, 2, 1, 1, bc1, 0x04 | 0x02 | 0x01), at = dev.create_texture(12, 6, 1, 1, 1, 1, astc, 0x04 | 0x02 | 0x01);
+    CHECK(tex && at);
+    // BC1: red and blue end points; the first row of indices is 0 1 2 3
+    const uint8_t blk[8] = {0x00, 0xF8, 0x1F, 0x00, 0xE4, 0x00, 0x00, 0x00};
+    uint8_t two[16];
+    memcpy(two, blk, 8); memcpy(two + 8, blk, 8);
+    ImageCopy dst;
+    dst.texture = tex; dst.x = 4;
+    BufferLayout bl;
+    CHECK(dev.write_texture(dst, ConstByteView(two, 8), bl, 4, 4, 1));
+    const Texture* t = dev.texture(tex);
+    uint32_t px[4];
+    webgl::read_texel(*t->mips[0], 4, 0, 0, px); CHECK(px[0] == 255 && px[1] == 0 && px[2] == 0 && px[3] == 255);
+    webgl::read_texel(*t->mips[0], 5, 0, 0, px); CHECK(px[0] == 0 && px[2] == 255);
+    webgl::read_texel(*t->mips[0], 0, 0, 0, px); CHECK(px[0] == 0 && px[2] == 0);   // not written
+    // a row of two blocks with padding, and its raw read back
+    dst.x = 0;
+    bl.bytes_per_row = 20;
+    CHECK(!dev.write_texture(dst, ConstByteView(two, 16), bl, 8, 8, 1));   // data too small
+    uint8_t rows[36] = {};
+    memcpy(rows, two, 16);
+    memcpy(rows + 20, two, 16);
+    CHECK(dev.write_texture(dst, ConstByteView(rows, 36), bl, 8, 8, 1));
+    const uint32_t out = dev.create_buffer(32, 0x08 | 0x02);
+    BufferLayout rb;
+    rb.bytes_per_row = 16;
+    ImageCopy src;
+    src.texture = tex;
+    CHECK(dev.copy_texture_to_buffer(src, out, rb, 8, 8, 1));
+    uint8_t back[32];
+    CHECK(dev.read_buffer(out, 0, ByteView(back, 32)));
+    CHECK(memcmp(back, two, 16) == 0 && memcmp(back + 16, rows + 20, 16) == 0);
+    // alignment and bounds
+    dst.x = 2;
+    CHECK(!dev.write_texture(dst, ConstByteView(two, 16), BufferLayout(), 4, 4, 1));
+    dst.x = 0;
+    CHECK(!dev.write_texture(dst, ConstByteView(two, 16), BufferLayout(), 3, 4, 1));
+    // texture to texture copies the blocks (and decodes them)
+    const uint32_t other = dev.create_texture(8, 8, 1, 1, 1, 1, bc1, 0x04 | 0x02);
+    ImageCopy to;
+    to.texture = other; to.x = 4; to.y = 4;
+    src.x = 4; src.y = 0;
+    CHECK(dev.copy_texture_to_texture(src, to, 4, 4, 1));
+    webgl::read_texel(*dev.texture(other)->mips[0], 5, 4, 0, px); CHECK(px[2] == 255);
+    CHECK(!dev.copy_texture_to_texture(src, ImageCopy{at, 0, 0, 0, 0, 0}, 4, 4, 1));   // formats differ
+    // ASTC 6x6: a void-extent block, 12 x 6 texels = two blocks, the second one with another colour
+    uint8_t ab[32] = {0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff};
+    memcpy(ab + 16, ab, 16);
+    ab[16 + 9] = 0x00; ab[16 + 11] = 0xff;
+    ImageCopy ad;
+    ad.texture = at;
+    CHECK(dev.write_texture(ad, ConstByteView(ab, 32), BufferLayout(), 12, 6, 1));
+    webgl::read_texel(*dev.texture(at)->mips[0], 3, 3, 0, px); CHECK(px[0] == 255 && px[1] == 0 && px[3] == 255);
+    webgl::read_texel(*dev.texture(at)->mips[0], 9, 3, 0, px); CHECK(px[0] == 0 && px[1] == 255);
+    // mip 1 of the BC1 texture is 4 x 4 texels (one block)
+    ImageCopy m1;
+    m1.texture = tex; m1.mip = 1;
+    CHECK(dev.write_texture(m1, ConstByteView(blk, 8), BufferLayout(), 4, 4, 1));
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_compressed();
   test_barrier_in_function();
   test_multisample();
   test_render();
