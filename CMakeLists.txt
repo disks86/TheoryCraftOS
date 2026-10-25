@@ -217,6 +217,7 @@ add_executable(BOOTX64
   src/FileSystem/Ram/RamFileSystem.cpp
   src/FileSystem/Mount/MountTable.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
+  src/FileSystem/Befs/BefsFileSystem.cpp
   src/ConcurrentDemo.cpp
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
@@ -405,6 +406,9 @@ add_executable(BOOTX64
   src/Gui/Controls/DropDown.cpp
   src/Gui/Controls/Slider.cpp
   src/Gui/Controls/LevelMeter.cpp
+  src/Gui/Controls/PieChart.cpp
+  src/Gui/Controls/BarChart.cpp
+  src/Gui/Controls/Tooltip.cpp
   src/Gui/Controls/CheckBox.cpp
   src/Gui/Controls/RadioButton.cpp
   src/Gui/Controls/Toggle.cpp
@@ -516,6 +520,9 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Intel/IntelHevcSession.cpp
   src/Hardware/VideoCodec/Intel/IntelVp9Probs.cpp
   src/Hardware/VideoCodec/Intel/IntelVp9Session.cpp
+  src/Hardware/VideoCodec/Intel/IntelAvpCommands.cpp
+  src/Hardware/VideoCodec/Intel/IntelAv1Cdf.cpp
+  src/Hardware/VideoCodec/Intel/IntelAv1Session.cpp
   src/Hardware/VideoCodec/Intel/IntelMediaVideoEngine.cpp
   src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
   src/Hardware/Printer/PrinterTypes.cpp

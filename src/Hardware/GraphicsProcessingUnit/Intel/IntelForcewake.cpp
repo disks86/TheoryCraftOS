@@ -32,6 +32,7 @@ uint32_t Forcewake::request_register(ForcewakeDomain domain) {
     case ForcewakeDomain::Gt: return 0xA188;      // FORCEWAKE_GT_GEN9
     case ForcewakeDomain::Render: return 0xA278;  // FORCEWAKE_RENDER_GEN9
     case ForcewakeDomain::Media: return 0xA270;   // FORCEWAKE_MEDIA_GEN9
+    case ForcewakeDomain::MediaVdbox0: return 0xA540;   // FORCEWAKE_MEDIA_VDBOX_GEN11(0)
   }
   return 0;
 }
@@ -41,6 +42,7 @@ uint32_t Forcewake::ack_register(ForcewakeDomain domain) {
     case ForcewakeDomain::Gt: return 0x130044;    // FORCEWAKE_ACK_GT_GEN9
     case ForcewakeDomain::Render: return 0x0D84;  // FORCEWAKE_ACK_RENDER_GEN9
     case ForcewakeDomain::Media: return 0x0D88;   // FORCEWAKE_ACK_MEDIA_GEN9
+    case ForcewakeDomain::MediaVdbox0: return 0x0D50;   // FORCEWAKE_ACK_MEDIA_VDBOX_GEN11(0)
   }
   return 0;
 }

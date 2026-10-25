@@ -25,6 +25,7 @@ namespace {
 constexpr uint32_t kMiLoadRegisterImmBase = (0x22u << 23);
 constexpr uint32_t kMiLriForcePosted = 1u << 12;
 constexpr uint32_t kCtxCtrlRestoreInhibit = 1u << 0, kCtxCtrlRsCtxEnable = 1u << 1, kCtxCtrlSaveInhibit = 1u << 2, kCtxCtrlInhibitSynCtxSwitch = 1u << 3;
+constexpr uint32_t kMiLriLrmCsMmio = 1u << 19;
 constexpr uint32_t kStopRing = 1u << 8;
 constexpr uint32_t kRingValid = 1;
 
@@ -82,6 +83,44 @@ bool lrc_init_gen9_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhib
                               masked_disable(kCtxCtrlSaveInhibit | kCtxCtrlRsCtxEnable);
   // The ring is not stopped when the context starts.
   state[kCtxRingMiMode] = masked_disable(kStopRing);
+  return true;
+}
+
+namespace {
+// gen12_xcs_offsets: a skip, a load of 13 registers, a skip, a load of 9.
+constexpr uint16_t kGen12Run0[] = {0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x1c0, 0x1c4, 0x1c8, 0x180, 0x2b4};
+constexpr uint16_t kGen12Run1[] = {0x3a8, 0x28c, 0x288, 0x284, 0x280, 0x27c, 0x278, 0x274, 0x270};
+constexpr uint32_t kGen12RingMiMode = 0x60 + 1, kGen12BbOffset = 0x70 + 1;   // (lrc_ring_mi_mode, lrc_ring_bb_offset: the value follows the register)
+
+bool gen12_load(ArrayView<uint32_t> state, uint64_t* at, uint32_t skip, ArrayView<const uint16_t> offsets, uint32_t mmio_base) {
+  *at += skip;
+  if (*at + 1 + uint64_t{offsets.size()} * 2 > state.size()) return false;
+  state[(*at)++] = kMiLoadRegisterImmBase | (2u * static_cast<uint32_t>(offsets.size()) - 1u) | kMiLriForcePosted | kMiLriLrmCsMmio;
+  for (const uint16_t offset : offsets) {
+    state[*at] = mmio_base + offset;
+    *at += 2;
+  }
+  return true;
+}
+}  // namespace
+
+bool lrc_init_gen12_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) {
+  if (state.size() != kLrcStateDwords) return false;
+  for (uint32_t& d : state) d = 0;
+  uint64_t at = 0;
+  if (!gen12_load(state, &at, 1, ArrayView<const uint16_t>(kGen12Run0), mmio_base) || !gen12_load(state, &at, 5, ArrayView<const uint16_t>(kGen12Run1), mmio_base)) return false;
+  // Context control as Gen11 and later set it: the synchronous switch inhibit on, the restore inhibited for a context that has never run, and the save and render-state
+  // bits left to the hardware.
+  state[kCtxContextControl] = masked_enable(kCtxCtrlInhibitSynCtxSwitch) | masked_disable(kCtxCtrlRestoreInhibit) | (inhibit_restore ? kCtxCtrlRestoreInhibit : 0u);
+  state[kGen12RingMiMode] = masked_disable(kStopRing);
+  state[kGen12BbOffset] = 0;
+  return true;
+}
+
+bool lrc_set_pml4(ArrayView<uint32_t> state, uint64_t pml4) {
+  if (state.size() != kLrcStateDwords || (pml4 & 4095)) return false;
+  state[kCtxPdp0Udw] = static_cast<uint32_t>(pml4 >> 32);
+  state[kCtxPdp0Ldw] = static_cast<uint32_t>(pml4);
   return true;
 }
 

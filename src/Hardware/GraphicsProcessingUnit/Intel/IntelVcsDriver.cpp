@@ -33,6 +33,7 @@ constexpr uint32_t kMiArbCheck = 0x05u << 23;
 constexpr uint32_t kMiArbOnOff = 0x08u << 23;
 constexpr uint32_t kMiArbEnable = 1;
 constexpr uint32_t kMiBatchBufferEnd = 0x0Au << 23;
+constexpr uint32_t kMfxWaitHeader = 0x68000000;       // MFX_WAIT: a single dword (bit 8 is its sync flag)
 constexpr uint32_t kMiBatchBufferStartGen8 = (0x31u << 23) | 1;
 constexpr uint32_t kBatchInPpgtt = 1u << 8;
 constexpr uint32_t kMiFlushDw = (0x26u << 23) | 1;
@@ -130,17 +131,18 @@ bool VcsDriver::initialize(const Config& config) {
   IRegisterBank& regs = *config.registers;
 
   if (!Forcewake::acquire(regs, ForcewakeDomain::Gt)) { state_ = State::Failed; return false; }
-  if (!Forcewake::acquire(regs, ForcewakeDomain::Media)) {
+  if (!Forcewake::acquire(regs, media_domain())) {
     Forcewake::release(regs, ForcewakeDomain::Gt);
     state_ = State::Failed;
     return false;
   }
-  auto release_wells = [&regs] {
-    Forcewake::release(regs, ForcewakeDomain::Media);
+  auto release_wells = [this, &regs] {
+    Forcewake::release(regs, media_domain());
     Forcewake::release(regs, ForcewakeDomain::Gt);
   };
 
-  program_private_pat(regs, gen9_private_pat());
+  if (config.generation == Generation::Gen12) program_gen12_pat(regs);
+  else program_private_pat(regs, gen9_private_pat());
 
   if (!allocate(kPageSize, &scratch_) || !allocate(kRingBytes, &ring_) || !allocate(kPageSize, &status_) || !allocate(kLrcPages * kPageSize, &context_) ||
       !allocate(kBatchBytes, &batch_)) {
@@ -173,14 +175,16 @@ bool VcsDriver::initialize(const Config& config) {
   if (!ok) { fail_init(); release_wells(); return false; }
 
   // The context's own address space, with the batch buffer in it.
-  if (!ppgtt_.initialize()) { fail_init(); release_wells(); return false; }
+  if (!ppgtt_.initialize(config.generation == Generation::Gen12)) { fail_init(); release_wells(); return false; }
   for (uint64_t i = 0; i < kBatchBytes / kPageSize; ++i)
     if (!ppgtt_.map(kBatchGpuAddress + i * kPageSize, batch_.dma + i * kPageSize)) { fail_init(); release_wells(); return false; }
 
   // The context image: registers, page directories, ring.
   const uint64_t directories[4] = {ppgtt_.page_directory_dma(0), ppgtt_.page_directory_dma(1), ppgtt_.page_directory_dma(2), ppgtt_.page_directory_dma(3)};
-  if (!lrc_init_gen9_xcs(context_state_, config.engine_base, true) || !lrc_set_page_directories(context_state_, directories) ||
-      !lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), 0, 0)) {
+  const bool gen12 = config.generation == Generation::Gen12;
+  const bool image = gen12 ? lrc_init_gen12_xcs(context_state_, engine_base(), true) && lrc_set_pml4(context_state_, ppgtt_.root_dma())
+                           : lrc_init_gen9_xcs(context_state_, engine_base(), true) && lrc_set_page_directories(context_state_, directories);
+  if (!image || !lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), 0, 0)) {
     fail_init();
     release_wells();
     return false;
@@ -189,7 +193,7 @@ bool VcsDriver::initialize(const Config& config) {
   memory_fence();
 
   // From here the engine knows our status page.
-  port_.configure(regs, config.engine_base, status_dwords_, static_cast<uint32_t>(status_ggtt_));
+  port_.configure(regs, engine_base(), status_dwords_, static_cast<uint32_t>(status_ggtt_), gen12 ? ExeclistPort::Mode::Elsq : ExeclistPort::Mode::Elsp);
   if (!port_.enable()) { fail_init(); release_wells(); return false; }
   release_wells();
   state_ = State::Ready;
@@ -207,10 +211,10 @@ bool VcsDriver::wedge() {
 void VcsDriver::shutdown() {
   if (state_ != State::Ready) return;
   IRegisterBank& regs = *config_.registers;
-  if (!Forcewake::acquire(regs, ForcewakeDomain::Media)) { wedge(); return; }
+  if (!Forcewake::acquire(regs, media_domain())) { wedge(); return; }
   if (!port_.stop(100000)) {
     wedge();
-    Forcewake::release(regs, ForcewakeDomain::Media);
+    Forcewake::release(regs, media_domain());
     return;
   }
   // Idle. The engine's status page address still names our page: point the whole range at the scratch page, which is never freed (the engine may still
@@ -219,7 +223,7 @@ void VcsDriver::shutdown() {
   ggtt.clear(0, kGgttPagesNeeded, scratch_.dma);
   ggtt_invalidate(regs);
   ggtt_mapped_ = false;
-  Forcewake::release(regs, ForcewakeDomain::Media);
+  Forcewake::release(regs, media_domain());
   ppgtt_.shutdown();
   GpuBuffer* const freed[] = {&batch_, &context_, &status_, &ring_};  // not the scratch page
   for (GpuBuffer* b : freed)
@@ -262,6 +266,10 @@ bool VcsDriver::batch_is_acceptable(ArrayView<const uint32_t> commands) {
     if (h == kMiNoop) { ++i; continue; }
     if (h == kMiBatchBufferEnd) return i + 1 == n;  // the end must be the last dword
     uint64_t length;
+    if ((h & ~0x100u) == kMfxWaitHeader) {                        // MFX_WAIT (with or without its sync flag): a single dword
+      ++i;
+      continue;
+    }
     if ((h >> 29) == 3) {
       if (((h >> 27) & 3) != 2) return false;                     // only the MFX pipeline
       length = (h & 0xFF) + 2;
@@ -285,7 +293,7 @@ void VcsDriver::write_ring(uint32_t dword) {
 VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
   if (state_ != State::Ready || !batch_is_acceptable(commands)) return Result::Rejected;
   IRegisterBank& regs = *config_.registers;
-  if (!Forcewake::acquire(regs, ForcewakeDomain::Media)) return Result::Rejected;
+  if (!Forcewake::acquire(regs, media_domain())) return Result::Rejected;
 
   // The batch.
   for (uint64_t i = 0; i < commands.size(); ++i) batch_dwords_[i] = commands[i];
@@ -319,7 +327,10 @@ VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
 
   lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), static_cast<uint32_t>(old_tail), static_cast<uint32_t>(new_tail));
   memory_fence();
-  port_.submit(lrc_descriptor(static_cast<uint32_t>(context_ggtt_), kContextId) | kDescriptorForceRestore);
+  const uint64_t descriptor = config_.generation == Generation::Gen12
+                                  ? lrc_descriptor_gen12(static_cast<uint32_t>(context_ggtt_), kContextId, 0, kVideoDecodeClass)
+                                  : lrc_descriptor(static_cast<uint32_t>(context_ggtt_), kContextId);
+  port_.submit(descriptor | kDescriptorForceRestore);
 
   bool marker = false, idle = false;
   for (uint32_t i = 0; i < config_.poll_limit && !(marker && idle); ++i) {
@@ -330,11 +341,11 @@ VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
   }
   if (!(marker && idle)) {
     wedge();  // while the well is still awake: its registers are only reliable then
-    Forcewake::release(regs, ForcewakeDomain::Media);
+    Forcewake::release(regs, media_domain());
     return Result::Timeout;
   }
   ring_tail_ = new_tail;
-  Forcewake::release(regs, ForcewakeDomain::Media);
+  Forcewake::release(regs, media_domain());
   return Result::Done;
 }
 

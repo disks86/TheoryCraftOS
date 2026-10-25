@@ -156,8 +156,8 @@ void SystemVideoCodecs::add_intel(const PciDeviceInfo& d) {
     if ((pci_.read32(d.address, kPciCommand) & kMemorySpace) && bar_sizer_->bar_size(d.address, 2, &local_memory)) device->set_local_memory_bar(local_memory);
   }
   IntelHardware hardware;
-  // The engine driver follows the Gen9.5 layouts only (its GTT geometry, its video box); no other generation gets its GTT looked at.
-  if (intel_hardware_ && device->gpu().architecture == IntelGpuArchitecture::Gen9_5 && !intel_registers_bank_ && intel_hardware_setup(d, &hardware)) {
+  // The engine driver follows the Gen9.5 and Xe-LP layouts only (its GTT geometry, its video box); no other generation gets its GTT looked at.
+  if (intel_hardware_ && (device->gpu().architecture == IntelGpuArchitecture::Gen9_5 || (device->gpu().architecture == IntelGpuArchitecture::XeLp && !device->gpu().discrete)) && !intel_registers_bank_ && intel_hardware_setup(d, &hardware)) {
     intel_registers_bank_ = UniquePointer<intel_gt::MmioRegisterBank>::make(allocator_, hardware.registers);
     if (intel_registers_bank_) {
       IntelMediaVideoEngine::HardwareSetup setup;

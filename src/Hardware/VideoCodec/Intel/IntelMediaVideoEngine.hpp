@@ -20,6 +20,7 @@
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
 #include "Hardware/Mmio.hpp"
+#include "Hardware/VideoCodec/Intel/IntelAv1Session.hpp"
 #include "Hardware/VideoCodec/Intel/IntelAvcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelHevcSession.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaEngineHw.hpp"
@@ -96,6 +97,7 @@ class IntelMediaVideoEngine final : public SoftwareVideoCodec {
   uint64_t local_memory_bar_ = 0;
   HardwareSetup setup_;
   UniquePointer<intel_gt::VcsDriver> driver_;
+  intel_gt::Generation generation_ = intel_gt::Generation::Gen9;
 };
 
 }  // namespace hardware

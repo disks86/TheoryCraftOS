@@ -23,15 +23,18 @@
 #include <string.h>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Color.hpp"
+#include "Gui/Controls/BarChart.hpp"
 #include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DatePicker.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/PieChart.hpp"
 #include "Gui/Controls/RadioButton.hpp"
 #include "Gui/Controls/ScrollPanel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/Toggle.hpp"
+#include "Gui/Controls/Tooltip.hpp"
 #include "Gui/Date.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -283,6 +286,198 @@ static void test_level_meter() {
     w.render();
     CHECK(screen.px(200 + 8, 10 + 120 - 2 - 3) == 0xFF00C000);   // bottom segment lit
     CHECK(screen.px(200 + 8, 10 + 8) == 0xFF400000);             // top segment dark
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_pie_chart() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    PieChart p(a);
+    p.set_bounds({10, 10, 200, 140});
+    p.set_legend(false);
+    w.add(&p);
+    CHECK(p.slice_count() == 0 && p.slice_at(100, 70) == -1 && p.total() == 0);
+    CHECK(p.add_slice("A", 25) == 0 && p.add_slice("B", 25) == 1 && p.add_slice("C", 50, 0xFF112233) == 2);
+    CHECK(p.total() == 100 && p.permille(0) == 250 && p.permille(2) == 500 && p.slice_color(2) == 0xFF112233 && p.slice_color(0) != 0);
+    // Slices start at 12 o'clock and run clockwise: A the first quarter, B the second, C the half.
+    CHECK(p.slice_at_angle(0) == 0 && p.slice_at_angle(16383) == 0 && p.slice_at_angle(16385) == 1 && p.slice_at_angle(32770) == 2 && p.slice_at_angle(65535) == 2);
+    const Rect2D r = p.pie_rect();
+    CHECK(r.width == 132 && r.height == 132);
+    const int32_t cx = r.x + 66, cy = r.y + 66;
+    CHECK(p.slice_at(cx + 30, cy - 30) == 0);   // upper right
+    CHECK(p.slice_at(cx + 30, cy + 30) == 1);   // lower right
+    CHECK(p.slice_at(cx - 30, cy + 30) == 2);   // lower left
+    CHECK(p.slice_at(cx - 30, cy - 30) == 2);   // upper left
+    CHECK(p.slice_at(r.x + 1, r.y + 1) == -1);  // the corner of the square is outside the disc
+    w.render();
+    CHECK(screen.px(10 + cx + 30, 10 + cy - 30) == p.slice_color(0));
+    CHECK(screen.px(10 + cx - 30, 10 + cy + 30) == 0xFF112233);
+    CHECK(screen.px(10 + r.x + 1, 10 + r.y + 1) == theme.face);
+
+    // Selection by click and by key; the handler fires only on a change.
+    click(w, 10 + cx + 30, 10 + cy + 30);
+    CHECK(p.selected_index() == 1);
+    w.render();
+    CHECK(screen.px(10 + cx + 30, 10 + cy + 30) != p.slice_color(1));   // drawn lighter
+    click(w, 10 + 2, 10 + 2);
+    CHECK(p.selected_index() == -1);
+    press(w, key::kDown);
+    CHECK(p.selected_index() == 0);
+    press(w, key::kUp);
+    CHECK(p.selected_index() == 2);
+
+    // Zero valued slices take no angle; an all zero chart is an empty disc.
+    p.set_slice_value(1, 0);
+    CHECK(p.slice_at_angle(30000) == 2 && p.permille(1) == 0);
+    p.set_slice_value(0, 0);
+    p.set_slice_value(2, 0);
+    CHECK(p.slice_at(cx, cy) == -1 && p.permille(2) == 0);
+    w.render();
+    CHECK(screen.px(10 + cx + 30, 10 + cy - 30) == theme.field);
+
+    // Huge values do not overflow.
+    p.set_slice_value(0, UINT64_MAX);
+    p.set_slice_value(1, UINT64_MAX);
+    CHECK(p.total() == UINT64_MAX && p.slice_at_angle(0) == 0);
+    p.clear_slices();
+    CHECK(p.slice_count() == 0 && p.selected_index() == -1);
+
+    // The legend shows swatch, label and share, and a click on its row selects the slice.
+    p.set_legend(true);
+    p.add_slice("Alpha", 1);
+    p.add_slice("Beta", 3);
+    const int32_t row = p.legend_row_at(200 - 10, 70 - 18 / 2 * 2 + 18 + 5);
+    CHECK(row == 1 || row == 0);
+    p.set_selected_index(0);
+    w.render();
+    CHECK(p.pie_rect().width < 132);
+    p.set_selected_index(9);
+    CHECK(p.selected_index() == -1);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_bar_chart() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    BarChart b(a);
+    b.set_bounds({10, 10, 260, 160});
+    w.add(&b);
+    CHECK(b.bar_count() == 0 && b.bar_at(100, 50) == -1 && b.scale_top() == 1);
+    CHECK(b.add_bar("A", 10) == 0 && b.add_bar("B", 20, 0xFF112233) == 1 && b.add_bar("C", 0) == 2 && b.add_bar("D", 1) == 3);
+    CHECK(b.scale_top() == 20 && b.bar_color(1) == 0xFF112233 && b.bar_color(0) != 0);
+    const Rect2D p = b.plot_rect();
+    CHECK(p.width > 0 && p.height > 0);
+    // Heights are in proportion to the scale; any non-zero value shows at least a pixel.
+    CHECK(b.bar_height(20) == p.height && b.bar_height(10) == p.height / 2 && b.bar_height(0) == 0 && b.bar_height(1) >= 1);
+    b.set_maximum(40);
+    CHECK(b.bar_height(20) == p.height / 2 && b.bar_height(400) == p.height);   // above a fixed maximum: full height
+    b.set_maximum(0);
+
+    // The columns tile the plot; a pixel is in exactly one of them.
+    int32_t covered = 0;
+    for (int32_t i = 0; i < 4; ++i) covered += static_cast<int32_t>(b.column_rect(i).width);
+    CHECK(covered == static_cast<int32_t>(p.width));
+    for (int32_t i = 0; i < 4; ++i) {
+      const Rect2D c = b.column_rect(i);
+      CHECK(b.bar_at(c.x, c.y + 3) == i && b.bar_at(c.x + static_cast<int32_t>(c.width) - 1, c.y + 3) == i);
+    }
+    CHECK(b.bar_at(p.x - 1, p.y + 3) == -1 && b.bar_at(p.x + 3, p.y - 1) == -1);
+
+    w.render();
+    const Rect2D c1 = b.column_rect(1);
+    CHECK(screen.px(10 + c1.x + static_cast<int32_t>(c1.width) / 2, 10 + p.y + static_cast<int32_t>(p.height) - 5) == 0xFF112233);   // inside the tall bar
+    const Rect2D c2 = b.column_rect(2);
+    CHECK(screen.px(10 + c2.x + static_cast<int32_t>(c2.width) / 2, 10 + p.y + static_cast<int32_t>(p.height) - 5) == theme.field);  // a zero bar is empty
+
+    // Selection by click and by key; the handler fires only on a change.
+    click(w, 10 + c1.x + 3, 10 + p.y + 3);
+    CHECK(b.selected_index() == 1);
+    w.render();
+    CHECK(screen.px(10 + c1.x + static_cast<int32_t>(c1.width) / 2, 10 + p.y + static_cast<int32_t>(p.height) - 5) != 0xFF112233);   // drawn lighter
+    click(w, 10 + 2, 10 + 2);
+    CHECK(b.selected_index() == -1);
+    press(w, key::kRight);
+    CHECK(b.selected_index() == 0);
+    press(w, key::kLeft);
+    CHECK(b.selected_index() == 3);
+    b.set_selected_index(9);
+    CHECK(b.selected_index() == -1);
+
+    // Huge values do not overflow.
+    b.set_bar_value(0, UINT64_MAX);
+    b.set_bar_value(1, UINT64_MAX / 2);
+    CHECK(b.scale_top() == UINT64_MAX && b.bar_height(UINT64_MAX) == p.height && near(static_cast<int32_t>(b.bar_height(UINT64_MAX / 2)), static_cast<int32_t>(p.height / 2), 1));
+    w.render();
+
+    b.clear_bars();
+    CHECK(b.bar_count() == 0 && b.selected_index() == -1);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_tooltip() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    Label under(a);
+    under.set_bounds({0, 0, 300, 200});
+    w.add(&under);
+    Tooltip tip(a);
+    w.add(&tip);   // after the controls it floats over
+    CHECK(!tip.shown() && tip.line_count() == 0);
+    tip.show_at(50, 50);   // no text: stays hidden
+    CHECK(!tip.shown());
+
+    CHECK(tip.set_text("Save\nCtrl+S"));
+    CHECK(tip.line_count() == 2 && tip.text() == "Save\nCtrl+S");
+    const Size size = tip.box_size();
+    CHECK(size.width == 6 * 8 + 2 * Tooltip::kPadX + 2 && size.height == 2 * 16 + 2 * Tooltip::kPadY + 2);
+
+    // Below and to the right of the pointer, clear of it.
+    tip.show_at(50, 50);
+    CHECK(tip.shown() && tip.bounds().x > 50 && tip.bounds().y > 50);
+    CHECK(tip.bounds().width == static_cast<uint32_t>(size.width) && tip.bounds().height == static_cast<uint32_t>(size.height));
+    w.render();
+    const Rect2D b = tip.bounds();
+    CHECK(screen.px(b.x + b.width - 3, b.y + 3) == Tooltip::kBackground);   // inside the box
+    CHECK(screen.px(b.x, b.y) == theme.dark);                               // its border
+
+    // Near the right and bottom edges it flips to the other side of the pointer.
+    tip.show_at(295, 195);
+    CHECK(tip.bounds().x + static_cast<int32_t>(tip.bounds().width) <= 295 && tip.bounds().y + static_cast<int32_t>(tip.bounds().height) <= 195);
+    tip.show_at(0, 0);
+    CHECK(tip.bounds().x >= 0 && tip.bounds().y >= 0);
+
+    // Under a control, or above it when there is no room below; always inside the window.
+    tip.show_below({20, 30, 60, 20});
+    CHECK(tip.bounds().x == 20 && tip.bounds().y == 52);
+    tip.show_below({20, 180, 60, 20});
+    CHECK(tip.bounds().y + static_cast<int32_t>(tip.bounds().height) <= 180);
+    tip.show_below({290, 30, 10, 20});
+    CHECK(tip.bounds().x + static_cast<int32_t>(tip.bounds().width) <= 300);
+
+    // The pointer passes through it: a click on the tooltip reaches the control below.
+    tip.show_at(100, 100);
+    const Rect2D t = tip.bounds();
+    CHECK(w.hit_test(t.x + 5, t.y + 5) == &under);
+
+    tip.hide();
+    CHECK(!tip.shown());
+    w.render();
+    CHECK(tip.set_text(""));
+    tip.show_at(10, 10);
+    CHECK(!tip.shown());
   }
   CHECK(a.live == 0);
 }
@@ -691,6 +886,9 @@ int main() {
   test_helpers();
   test_slider();
   test_level_meter();
+  test_pie_chart();
+  test_bar_chart();
+  test_tooltip();
   test_scroll_panel();
   test_checkbox();
   test_radio();
