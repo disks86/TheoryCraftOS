@@ -46,7 +46,22 @@ case $GPU_CHOICE in
   std) GPU_ARGS="-vga none -device VGA,vgamem_mb=${QEMU_VGAMEM:-64}"; DISPLAY_ARGS="gtk,zoom-to-fit=off,show-cursor=off,show-menubar=off" ;;
   *) echo "unknown QEMU_GPU=$QEMU_GPU (auto, std, virtio, gl)" >&2; exit 2 ;;
 esac
-exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} ${QEMU_GDB:+-gdb tcp:127.0.0.1:2159} \
+# QEMU_AUDIO: the host sound backend for the guest's HD Audio codec: auto (default: PipeWire, else PulseAudio, ALSA, SDL, whichever this QEMU has first),
+# any QEMU -audiodev driver name (pipewire, pa, alsa, sdl, ...), wav (record to $BUILD/audio.wav, for checking without speakers) or none (discard).
+AUDIO_CHOICE=${QEMU_AUDIO:-auto}
+if [ "$AUDIO_CHOICE" = auto ]; then
+  AUDIO_CHOICE=none
+  DRIVERS=$(qemu-system-x86_64 -audiodev help 2>/dev/null || true)
+  for d in pipewire pa alsa sdl; do
+    if printf '%s\n' "$DRIVERS" | grep -qx "$d"; then AUDIO_CHOICE=$d; break; fi
+  done
+fi
+AUDIO_OPTS=
+[ "$AUDIO_CHOICE" != wav ] || AUDIO_OPTS=,path="$BUILD/audio.wav"
+echo "QEMU audio backend: $AUDIO_CHOICE" >&2
+AUDIO_ARGS="-audiodev $AUDIO_CHOICE,id=snd0$AUDIO_OPTS -device ich9-intel-hda -device hda-duplex,audiodev=snd0"
+
+exec qemu-system-x86_64 -machine q35 -smp ${QEMU_SMP:-4} -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0 -rtc base=localtime $GPU_ARGS -device virtio-tablet-pci $AUDIO_ARGS -display ${QEMU_DISPLAY:-$DISPLAY_ARGS} ${QEMU_GDB:+-gdb tcp:127.0.0.1:2159} \
   -qmp unix:"$BUILD/qmp.sock",server=on,wait=off -d guest_errors,unimp -D "$BUILD/qemu-guest.log" \
   -drive if=pflash,format=raw,readonly=on,file="$(sed -n 's/^OVMF_CODE:FILEPATH=//p' "$BUILD/CMakeCache.txt")" \
   -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \

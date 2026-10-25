@@ -83,6 +83,7 @@ class Page::FrameEnv final : public IPageEnvironment {
   uint64_t tab_id() override { return owner_.env_.tab_id(); }
   CookieJar& cookies() override { return owner_.env_.cookies(); }
   bool http_request(const FetchOptions& options, NetResponse* response) override { return owner_.env_.http_request(options, response); }
+  void http_answered(const NetResponse& response) override { owner_.env_.http_answered(response); }
 
  private:
   Page& owner_;

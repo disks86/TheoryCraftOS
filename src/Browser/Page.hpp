@@ -94,11 +94,14 @@ class IPageEnvironment : public IObjectEnvironment {
   virtual uint64_t tab_id() { return 1; }   // (tells the pages of one tab from those of another: they share a sessionStorage)
   // The cookies of the browser (shared by all its pages), and the network for fetch() and XMLHttpRequest.
   virtual CookieJar& cookies() = 0;
+  // May be called on worker threads, several at a time.
   virtual bool http_request(const FetchOptions& options, NetResponse* response) {
     (void)options;
     response->error.assign("This browser cannot make requests.");
     return false;
   }
+  // The answer to http_request() reaches the script (on the thread that runs the page).
+  virtual void http_answered(const NetResponse& response) { (void)response; }
   // A WebSocket for a page (see IPageLoader::open_websocket).
   virtual UniquePointer<IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
     (void)url;
@@ -297,6 +300,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void cookie_details(StringView url, String* out) override;
   bool cookie_write(StringView text) override;
   bool http_request(const FetchOptions& options, NetResponse* response) override;
+  void http_answered(const NetResponse& response) override { env_.http_answered(response); }
   void page_origin(String* out) override;
   uint32_t ws_open(StringView url, StringView protocols, String* error) override;
   int ws_state(uint32_t id) override;

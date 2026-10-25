@@ -137,7 +137,10 @@ class IDomHost {
   virtual void cookie_details(StringView url, String* out) { (void)url; (void)out; }
   virtual bool cookie_write(StringView text) { (void)text; return false; }
   // fetch() and XMLHttpRequest: sends a request (cookies, redirects and the cross-origin rules included; see Fetcher.hpp). False (with response->error) if it failed.
+  // May be called on a worker thread, several at a time (asynchronous requests run in parallel).
   virtual bool http_request(const FetchOptions& options, NetResponse* response) = 0;
+  // An answer that http_request() returned reaches the script (always on the script thread): what has to be done on that thread (Clear-Site-Data of storage).
+  virtual void http_answered(const NetResponse& response) { (void)response; }
   // The origin of the page ("https://example.com", or "null" for a file or a page without an address).
   virtual void page_origin(String* out) = 0;
   // Compiles the code of an on* attribute (or a javascript: address) into a function taking `event`. False (with a message sent to console) if it does not

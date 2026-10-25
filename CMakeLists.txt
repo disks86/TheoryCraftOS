@@ -655,6 +655,20 @@ find_file(OVMF_VARS NAMES OVMF_VARS.4m.fd OVMF_VARS_4M.fd OVMF_VARS.fd
         /usr/share/ovmf/x64 /usr/share/qemu)
 
 if(QEMU AND OVMF_CODE AND OVMF_VARS)
+  # The host sound backend: PipeWire, else PulseAudio, ALSA or SDL, whichever this QEMU has first (`none` discards the sound).
+  # Override with -DQEMU_AUDIO_DRIVER=wav,path=... or any other -audiodev driver.
+  if(NOT QEMU_AUDIO_DRIVER)
+    execute_process(COMMAND ${QEMU} -audiodev help OUTPUT_VARIABLE QEMU_AUDIO_DRIVERS ERROR_QUIET)
+    set(QEMU_AUDIO_DRIVER none)
+    foreach(driver pipewire pa alsa sdl)
+      if(QEMU_AUDIO_DRIVERS MATCHES "(^|\n)${driver}(\n|$)")
+        set(QEMU_AUDIO_DRIVER ${driver})
+        break()
+      endif()
+    endforeach()
+    set(QEMU_AUDIO_DRIVER ${QEMU_AUDIO_DRIVER} CACHE STRING "QEMU -audiodev driver for the guest's sound card")
+  endif()
+  message(STATUS "QEMU audio backend: ${QEMU_AUDIO_DRIVER}")
   set(QEMU_COMMON
     ${QEMU} -machine q35 -smp 4 -m 8G -netdev user,id=net0 -device virtio-net-pci,netdev=net0
     -rtc base=localtime  # the taskbar clock shows local time
@@ -662,8 +676,8 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -device virtio-tablet-pci
     # Guest services: the host's entropy pool, a memory balloon (`balloon` in the monitor) and the crash notification.
     -device virtio-rng-pci -device virtio-balloon-pci -device pvpanic
-    # An HD Audio controller with a duplex codec; the `none` backend discards the sound (use e.g. `pa` to hear it).
-    -audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
+    # An HD Audio controller with a duplex codec, played through the host's sound server (QEMU_AUDIO_DRIVER).
+    -audiodev ${QEMU_AUDIO_DRIVER},id=snd0 -device ich9-intel-hda -device hda-duplex,audiodev=snd0
     -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
     -drive if=pflash,format=raw,file=${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     -drive format=raw,file=fat:rw:${ESP_DIR}
