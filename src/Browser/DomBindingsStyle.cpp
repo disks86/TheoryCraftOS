@@ -88,6 +88,157 @@ StringView strip_important(StringView value) {
   return value;
 }
 
+// --- Shorthands read back as longhands: "margin: 1px 2px" gives margin-left 2px ---------------------------------------------------------------
+
+// The space separated items of a value (parentheses keep their insides together).
+void split_items(StringView v, List<StringView>* out) {
+  uint64_t i = 0;
+  int depth = 0;
+  while (i < v.size()) {
+    while (i < v.size() && is_space(v[i])) ++i;
+    const uint64_t start = i;
+    while (i < v.size() && (depth > 0 || !is_space(v[i]))) {
+      if (v[i] == '(') ++depth;
+      else if (v[i] == ')') --depth;
+      ++i;
+    }
+    if (i > start) out->push_back(v.substr(start, i - start));
+  }
+}
+
+bool border_style_word(StringView t) {
+  static const char* const kStyles[] = {"none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset"};
+  for (const char* w : kStyles)
+    if (t.equals_ignore_case(w)) return true;
+  return false;
+}
+
+bool border_width_word(StringView t) {
+  if (t.empty()) return false;
+  const char c = t[0];
+  return (c >= '0' && c <= '9') || c == '.' || c == '+' || t.starts_with("calc(") || t.equals_ignore_case("thin") || t.equals_ignore_case("medium") || t.equals_ignore_case("thick");
+}
+
+bool side_index(StringView side, uint32_t* index) {   // top right bottom left
+  static const char* const kSides[] = {"top", "right", "bottom", "left"};
+  for (uint32_t i = 0; i < 4; ++i)
+    if (side.equals(kSides[i])) {
+      *index = i;
+      return true;
+    }
+  return false;
+}
+
+// 1 to 4 values apply to the sides the way margin and padding do.
+bool box_item(const List<StringView>& items, uint32_t side, StringView* out) {
+  if (items.count() == 0 || items.count() > 4) return false;
+  static const uint32_t kPick[4][4] = {{0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
+  *out = items[kPick[items.count() - 1][side]];
+  return true;
+}
+
+// The value `name` has through the declaration `decl: value`, if that is a shorthand covering it.
+bool through_shorthand(allocators::IAllocator& a, StringView decl, StringView value, StringView name, String* out) {
+  value = strip_important(value);
+  List<StringView> items(a);
+  split_items(value, &items);
+  StringView picked;
+  uint32_t side = 0;
+  // margin / padding: margin-top ...
+  for (const char* box : {"margin", "padding"}) {
+    const StringView b(box);
+    if (decl.equals(b) && name.starts_with(b) && name.size() > b.size() + 1 && name[b.size()] == '-' && side_index(name.substr(b.size() + 1), &side) && box_item(items, side, &picked)) {
+      out->assign(picked);
+      return true;
+    }
+  }
+  // border-width / -style / -color: border-top-width ...
+  if (name.starts_with("border-") ) {
+    const StringView rest = name.substr(7);
+    StringView part;
+    StringView sidename;
+    for (const char* suffix : {"width", "style", "color"}) {
+      const StringView sf(suffix);
+      if (rest.equals(sf)) { part = sf; break; }
+      if (rest.size() > sf.size() + 1 && rest.ends_with(sf) && rest[rest.size() - sf.size() - 1] == '-') {
+        part = sf;
+        sidename = rest.first(rest.size() - sf.size() - 1);
+        break;
+      }
+    }
+    if (!part.empty() && !sidename.empty() && side_index(sidename, &side)) {   // a side's own longhand
+      String group(a);
+      group.append("border-");
+      group.append(part);
+      if (decl.equals(group.view()) && box_item(items, side, &picked)) {
+        out->assign(picked);
+        return true;
+      }
+      if (decl.equals("border") || (decl.starts_with("border-") && decl.substr(7).equals(sidename))) {
+        for (uint64_t i = 0; i < items.count(); ++i) {
+          const bool is_width = border_width_word(items[i]), is_style = border_style_word(items[i]);
+          if ((part.equals("width") && is_width) || (part.equals("style") && is_style) || (part.equals("color") && !is_width && !is_style)) {
+            out->assign(items[i]);
+            return true;
+          }
+        }
+        return false;
+      }
+    }
+  }
+  if (decl.equals("background") && name.equals("background-color")) {
+    for (uint64_t i = 0; i < items.count(); ++i) {
+      uint32_t color;
+      if (parse_css_color(items[i], &color) || items[i].equals_ignore_case("currentcolor")) {
+        out->assign(items[i]);
+        return true;
+      }
+    }
+    return false;
+  }
+  if (decl.equals("font") && (name.equals("font-size") || name.equals("font-weight") || name.equals("font-style"))) {
+    for (uint64_t i = 0; i < items.count(); ++i) {
+      StringView t = items[i];
+      const bool is_size = border_width_word(t) && !(t.size() > 0 && t[0] >= '0' && t[0] <= '9' && t.find('.') == StringView::npos && t.find('p') == StringView::npos && t.find('%') == StringView::npos && t.find('e') == StringView::npos && t.find('r') == StringView::npos);
+      if (is_size) {
+        if (name.equals("font-size")) {
+          const uint64_t slash = t.find('/');
+          out->assign(slash == StringView::npos ? t : t.first(slash));
+          return true;
+        }
+        return false;
+      }
+      const bool weight = t.equals_ignore_case("bold") || t.equals_ignore_case("bolder") || t.equals_ignore_case("lighter") || (t.size() == 3 && t[0] >= '1' && t[0] <= '9' && t[1] == '0' && t[2] == '0');
+      const bool style = t.equals_ignore_case("italic") || t.equals_ignore_case("oblique");
+      if (name.equals("font-weight") && weight) { out->assign(t); return true; }
+      if (name.equals("font-style") && style) { out->assign(t); return true; }
+    }
+    if (name.equals("font-weight") || name.equals("font-style")) { out->assign("normal"); return true; }
+    return false;
+  }
+  if (decl.equals("overflow") && (name.equals("overflow-x") || name.equals("overflow-y")) && items.count() >= 1 && items.count() <= 2) {
+    out->assign(items[name.equals("overflow-x") || items.count() == 1 ? 0 : 1]);
+    return true;
+  }
+  if (decl.equals("gap") && (name.equals("row-gap") || name.equals("column-gap")) && items.count() >= 1 && items.count() <= 2) {
+    out->assign(items[name.equals("row-gap") || items.count() == 1 ? 0 : 1]);
+    return true;
+  }
+  return false;
+}
+
+// The value of property `name` in the declarations: its own declaration or a shorthand that covers it, whichever comes last.
+bool declared_value(allocators::IAllocator& a, const List<Pair>& pairs, StringView name, String* out) {
+  for (uint64_t i = pairs.count(); i > 0; --i) {
+    if (pairs[i - 1].name.view().equals(name)) {
+      out->assign(strip_important(pairs[i - 1].value.view()));
+      return true;
+    }
+    if (through_shorthand(a, pairs[i - 1].name.view(), pairs[i - 1].value.view(), name, out)) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 void css_name_from_js(StringView js, String* out) {
@@ -158,13 +309,8 @@ bool style_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   }
   String css(vm.allocator());
   css_name_from_js(k, &css);
-  for (uint64_t i = pairs.count(); i > 0; --i) {
-    if (pairs[i - 1].name.view().equals(css.view())) {
-      *out = str_value(vm, strip_important(pairs[i - 1].value.view()));
-      return true;
-    }
-  }
-  *out = str_value(vm, "");
+  String found(vm.allocator());
+  *out = str_value(vm, declared_value(vm.allocator(), pairs, css.view(), &found) ? found.view() : StringView());
   return true;
 }
 
@@ -242,12 +388,9 @@ NATIVE(style_get_property_value) {
   dom::get_attribute(n, "style", &text);
   List<Pair> pairs(vm.allocator());
   parse_declarations(vm.allocator(), text, &pairs);
-  *result = str_value(vm, "");
-  for (uint64_t i = pairs.count(); i > 0; --i)
-    if (pairs[i - 1].name.view().equals_ignore_case(name.view())) {
-      *result = str_value(vm, strip_important(pairs[i - 1].value.view()));
-      break;
-    }
+  String lowered(vm.allocator()), found(vm.allocator());
+  for (uint64_t i = 0; i < name.size(); ++i) lowered.push_back(lower_char(name[i]));
+  *result = str_value(vm, declared_value(vm.allocator(), pairs, lowered.view(), &found) ? found.view() : StringView());
   return true;
 }
 
@@ -327,15 +470,31 @@ NATIVE(computed_get_property_value) {
   String name(vm.allocator());
   if (!self.is_object() || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
   String js(vm.allocator());
-  js_name_from_css(name.view(), &js);
+  if (name.view().starts_with("--")) js.assign(name.view());   // (a custom property keeps its name)
+  else js_name_from_css(name.view(), &js);
   if (name.view().equals("float")) js.assign("cssFloat");
   Value v;
   *result = vm.get_plain(self.as_object(), vm.intern(js.view()), &v) ? v : str_value(vm, "");
   return true;
 }
 
-NATIVE(computed_item) {
+NATIVE(computed_item) {   // the name of the i-th property the style lists
+  double d;
   *result = str_value(vm, "");
+  if (!self.is_object() || !vm.to_number(arg_at(args, argc, 0), &d) || d < 0) return true;
+  JsObject* keys = vm.own_keys(self.as_object());
+  uint64_t seen = 0;
+  for (uint32_t i = 0; i < keys->length; ++i) {
+    const StringView k = keys->items[i].as_string()->view();
+    if (k.empty() || (k[0] >= '0' && k[0] <= '9') || k.equals("length")) continue;
+    if (seen++ == static_cast<uint64_t>(d)) {
+      String css(vm.allocator());
+      if (k.starts_with("--")) css.assign(k);
+      else css_name_from_js(k, &css);
+      *result = str_value(vm, css.equals("css-float") ? StringView("float") : css.view());
+      return true;
+    }
+  }
   return true;
 }
 
@@ -824,6 +983,28 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   set("scrollBehavior", s.scroll_smooth ? "smooth" : "auto");
   set("containerType", s.container_type == 1 ? "inline-size" : s.container_type == 2 ? "size" : "normal");
   set("containerName", text_of(s.container_name, "none"));
+  if (sheet) {   // the custom properties that apply (the nearest declaration of a name wins)
+    StringView cname, cvalue;
+    uint32_t at = s.custom_scope;
+    for (uint32_t guard = 0; guard < 4096 && sheet->custom_property_at(at, &cname, &cvalue, &at); ++guard) {
+      Value existing;
+      if (!vm.get_plain(o, vm.intern(cname), &existing)) vm.define(o, vm.intern(cname), str_value(vm, cvalue.trimmed()), kEnumerable);
+    }
+  }
+  {   // length and the indexes list the properties (the names the item() method gives)
+    JsObject* keys = vm.own_keys(o);
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < keys->length; ++i) {
+      const StringView k = keys->items[i].as_string()->view();
+      if (k.empty() || (k[0] >= '0' && k[0] <= '9') || k.equals("length")) continue;
+      String css(vm.allocator()), index(vm.allocator());
+      if (k.starts_with("--")) css.assign(k);
+      else css_name_from_js(k, &css);
+      index.append_uint(count++);
+      vm.define(o, vm.intern(index.view()), str_value(vm, css.equals("css-float") ? StringView("float") : css.view()), 0);
+    }
+    vm.define(o, vm.intern("length"), num_value(static_cast<double>(count)), 0);
+  }
   return Value::make_object(o);
 }
 

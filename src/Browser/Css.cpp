@@ -4856,6 +4856,20 @@ StringView StyleSheet::text(TextRef ref) const {
   return StringView(pool_.view()).substr(ref.offset, ref.length);
 }
 
+bool StyleSheet::custom_property_at(uint32_t scope, StringView* name, StringView* value, uint32_t* parent) const {
+  if (scope == 0 || scope > scopes_.count()) return false;
+  const Scope& sc = scopes_[scope - 1];
+  TextRef n, v;
+  n.offset = sc.name_offset;
+  n.length = sc.name_length;
+  v.offset = sc.value_offset;
+  v.length = sc.value_length;
+  *name = text(n);
+  *value = text(v);
+  *parent = sc.parent;
+  return true;
+}
+
 TextRef StyleSheet::keep_text(StringView s) const {
   TextRef ref;
   if (s.empty() || kept_.count() >= 50000) return ref;

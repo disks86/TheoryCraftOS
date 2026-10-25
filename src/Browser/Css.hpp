@@ -627,6 +627,8 @@ class StyleSheet {
   bool has_pseudo(const dom::Node* element, PseudoElement pseudo) const;
   // The text of a TextRef (valid for as long as the sheet is), and a place to keep text so that a Style can point to it.
   StringView text(TextRef ref) const;
+  // One custom property of a scope chain (Style::custom_scope): its name and value, and the scope that comes next (0 at the end); false for scope 0.
+  bool custom_property_at(uint32_t scope, StringView* name, StringView* value, uint32_t* parent) const;
   TextRef keep_text(StringView s) const;
   // The size of the display, for vw / vh.
   void set_viewport(int32_t width_px, int32_t height_px) {
