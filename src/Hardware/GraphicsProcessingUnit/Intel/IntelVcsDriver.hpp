@@ -58,7 +58,8 @@ class AllocatorGpuMemory final : public IGpuMemory {
   allocators::IAllocator& allocator_;
 };
 
-// The first video engine (VCS0) of a Gen9 GPU (Skylake through Coffee Lake and Comet Lake graphics), driven through its execlist: one context, one
+// The first video engine of a Gen9 GPU (VCS0; Skylake through Coffee Lake and Comet Lake graphics) or of a Gen12 one (VD0; Xe-LP: Tiger Lake, Rocket Lake, Alder Lake
+// and Raptor Lake graphics, integrated parts), driven through its execlist: one context, one
 // engine, one job at a time, polled to completion. It sets up everything the engine needs (global GTT entries for the ring, status page and context,
 // the context's own page tables, the register state image), takes a command batch and runs it.
 //
@@ -89,7 +90,8 @@ class VcsDriver {
     IRegisterBank* registers = nullptr;   // the GPU's registers
     MmioRegion ggtt_table;                // the whole global GTT table
     uint64_t ggtt_first_page = 0;         // the first of the kGgttPagesNeeded pages of graphics address space this driver may use; it touches no others
-    uint32_t engine_base = kVcs0MmioBase;
+    Generation generation = Generation::Gen9;
+    uint32_t engine_base = 0;             // 0: the first video engine of the generation (VCS0 at 0x12000, VD0 at 0x1C0000)
     uint32_t poll_limit = 5'000'000;      // polls of the completion marker (and then the status buffer) before a job is given up
   };
 
@@ -137,6 +139,8 @@ class VcsDriver {
   };
 
   bool allocate(uint64_t bytes, GpuBuffer* out);
+  ForcewakeDomain media_domain() const { return config_.generation == Generation::Gen12 ? ForcewakeDomain::MediaVdbox0 : ForcewakeDomain::Media; }
+  uint32_t engine_base() const { return config_.engine_base ? config_.engine_base : config_.generation == Generation::Gen12 ? kVd0MmioBase : kVcs0MmioBase; }
   void fail_init();
   bool wedge();
   void write_ring(uint32_t dword);

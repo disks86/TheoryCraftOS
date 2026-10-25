@@ -80,6 +80,9 @@ struct FakeGpu final : IRegisterBank {
   uint32_t elsp[4] = {};
   int elsp_count = 0;
   uint32_t csb_wp = 5;
+  Generation gen = Generation::Gen9;
+  uint32_t base = kBase;              // the engine's register base
+  uint32_t elsq[4] = {};              // Gen12: the submit queue contents (port 0 low, high, port 1 low, high)
   int tlb_invalidates = 0;
   int jobs = 0;
 
@@ -91,28 +94,34 @@ struct FakeGpu final : IRegisterBank {
 
   uint32_t read32(uint64_t offset) override {
     uint32_t v = ack(static_cast<uint32_t>(offset));
-    if (offset == kBase + ExeclistPort::kRingMiMode && (v & (1u << 8)) && !never_idle) v |= 1u << 9;  // STOP_RING set: the engine reports idle
+    if (offset == base + ExeclistPort::kRingMiMode && (v & (1u << 8)) && !never_idle) v |= 1u << 9;  // STOP_RING set: the engine reports idle
     return v;
   }
 
   void write32(uint64_t offset, uint32_t value) override {
-    if (offset == 0xA188 || offset == 0xA270) {
+    if (offset == 0xA188 || offset == 0xA270 || offset == 0xA540) {
       const bool gt = offset == 0xA188;
-      const uint32_t ack_reg = gt ? 0x130044 : 0x0D88;
+      if ((offset == 0xA270 && gen == Generation::Gen12) || (offset == 0xA540 && gen == Generation::Gen9)) violation("forcewake domain of another generation");
+      const uint32_t ack_reg = gt ? 0x130044 : offset == 0xA540 ? 0x0D50 : 0x0D88;
       const bool enable = (value & 1) && (value >> 16);
       if (enable && !(gt ? deny_gt : deny_media)) regs[ack_reg] = 1;
       else if (!enable) regs[ack_reg] = 0;
       regs[offset] = value;
       return;
     }
-    if (offset == kBase + ExeclistPort::kRingMiMode) {  // masked register
+    if (offset == base + ExeclistPort::kRingMiMode) {  // masked register
       const uint32_t mask = value >> 16;
       regs[offset] = (ack(static_cast<uint32_t>(offset)) & ~mask) | (value & mask);
       return;
     }
     regs[offset] = value;
-    if (offset == kBase + ExeclistPort::kRingContextStatusPtr) csb_wp = value & 0xFF;
-    if (offset == kBase + ExeclistPort::kRingElsp) {
+    if (offset == base + ExeclistPort::kRingContextStatusPtr) csb_wp = value & 0xFF;
+    if (gen == Generation::Gen12 && offset >= base + ExeclistPort::kRingExeclistSqContents && offset < base + ExeclistPort::kRingExeclistSqContents + 16) elsq[(offset - base - ExeclistPort::kRingExeclistSqContents) / 4] = value;
+    if (gen == Generation::Gen12 && offset == base + ExeclistPort::kRingExeclistControl && (value & 1)) {
+      if (elsq[2] != 0 || elsq[3] != 0) violation("port 1 was not empty");
+      if (!hang) run((uint64_t{elsq[1]} << 32) | elsq[0]);
+    }
+    if (gen == Generation::Gen9 && offset == base + ExeclistPort::kRingElsp) {
       elsp[elsp_count++] = value;
       if (elsp_count == 4) {
         elsp_count = 0;
@@ -140,7 +149,22 @@ struct FakeGpu final : IRegisterBank {
   uint8_t* ppgtt_bytes(uint64_t address, uint64_t length, const char* what, bool* ok) {
     *ok = false;
     bool dead = false;
-    uint64_t* pd = reinterpret_cast<uint64_t*>(mem->find(pdp[address >> 30], 4096, &dead));
+    uint64_t* pd = nullptr;
+    if (gen == Generation::Gen12) {
+      // Four levels: the page-map level 4 page (pdp[0]) points at a page of directory pointers, which point at the page directories.
+      if (address >> 48) { violation(std::string("address beyond 48 bits: ") + what); return nullptr; }
+      uint64_t* pml4 = reinterpret_cast<uint64_t*>(mem->find(pdp[0], 4096, &dead));
+      if (!pml4 || dead) { violation(std::string("PML4 missing: ") + what); return nullptr; }
+      const uint64_t pml4e = pml4[(address >> 39) & 511];
+      if (!(pml4e & 1)) { violation(std::string("PML4E not present: ") + what); return nullptr; }
+      uint64_t* pdpt = reinterpret_cast<uint64_t*>(mem->find(pml4e & ~0xFFFull & 0x7FFFFFFFFFull, 4096, &dead));
+      if (!pdpt || dead) { violation(std::string("page directory pointer table missing: ") + what); return nullptr; }
+      const uint64_t pdpe = pdpt[(address >> 30) & 511];
+      if (!(pdpe & 1)) { violation(std::string("PDPE not present: ") + what); return nullptr; }
+      pd = reinterpret_cast<uint64_t*>(mem->find(pdpe & ~0xFFFull & 0x7FFFFFFFFFull, 4096, &dead));
+    } else {
+      pd = reinterpret_cast<uint64_t*>(mem->find(pdp[address >> 30], 4096, &dead));
+    }
     if (!pd || dead) { violation(std::string("page directory missing: ") + what); return nullptr; }
     const uint64_t pde = pd[(address >> 21) & 511];
     if (!(pde & 1)) { violation(std::string("PDE not present: ") + what); return nullptr; }
@@ -184,17 +208,26 @@ struct FakeGpu final : IRegisterBank {
   void run(uint64_t desc) {
     const uint64_t ctx = desc & 0xFFFFF000u;
     const uint32_t id = static_cast<uint32_t>(desc >> 32);
-    if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 1) violation("descriptor flags");
+    if (gen == Generation::Gen12) {
+      if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 3 || (desc >> 61) != 1 || ((desc >> 48) & 0x3F) != 0 || ((desc >> 37) & 0x7FF) == 0x7FF) violation("descriptor flags");
+    } else if (!(desc & 1) || !(desc & (1u << 8)) || ((desc >> 3) & 3) != 1) {
+      violation("descriptor flags");
+    }
     uint32_t* st = ggtt_dword(ctx + 4096, "context state");
     if (!st) return;
     uint32_t* regs_state = st;
     // The restore: a load header, then offset/value pairs. Check the pairs the driver set are where the engine looks for them.
-    if (regs_state[kCtxRingStart - 1] != kBase + 0x38 || regs_state[kCtxRingTail - 1] != kBase + 0x30) violation("context image layout");
+    if (regs_state[kCtxRingStart - 1] != base + 0x38 || regs_state[kCtxRingTail - 1] != base + 0x30) violation("context image layout");
+    if (gen == Generation::Gen12) {
+      if ((regs_state[1] & (1u << 19)) == 0 || regs_state[1] >> 23 != 0x22 || regs_state[33] >> 23 != 0x22 || regs_state[kCtxPdp0Udw - 1] != base + 0x274) violation("Gen12 context image layout");
+      if (regs_state[0x61] != (1u << 24)) violation("ring MI mode in the context image");
+    }
     const uint32_t start = regs_state[kCtxRingStart], head = regs_state[kCtxRingHead], tail = regs_state[kCtxRingTail], ctl = regs_state[kCtxRingCtl];
     const uint64_t size = (ctl & ~0xFFFu) + 4096;
     if (!(ctl & 1)) violation("ring not valid");
     const uint32_t udw[4] = {kCtxPdp0Udw, kCtxPdp1Udw, kCtxPdp2Udw, kCtxPdp3Udw}, ldw[4] = {kCtxPdp0Ldw, kCtxPdp1Ldw, kCtxPdp2Ldw, kCtxPdp3Ldw};
     for (int i = 0; i < 4; ++i) pdp[i] = (uint64_t{regs_state[udw[i]]} << 32) | regs_state[ldw[i]];
+    if (gen == Generation::Gen12 && (pdp[0] & 0xFFF)) violation("PML4 address");
     uint32_t pos = head;
     uint64_t guard = 0;
     while (pos != tail && guard++ < size) {
@@ -234,11 +267,28 @@ struct FakeGpu final : IRegisterBank {
     ++jobs;
     regs_state[kCtxRingHead] = tail;  // the engine saves its state when the context stops
     // Report to the status page the engine was given.
-    uint32_t* wp = ggtt_dword(uint64_t{regs[kBase + ExeclistPort::kRingHwsPga]} + ExeclistPort::kCsbWriteDword * 4, "csb pointer");
+    const uint64_t status_page = regs[base + ExeclistPort::kRingHwsPga];
+    if (gen == Generation::Gen12) {
+      uint32_t* wp12 = ggtt_dword(status_page + ExeclistPort::kCsb12WriteDword * 4, "csb pointer");
+      if (!wp12) return;
+      const uint32_t ctx_id = static_cast<uint32_t>((desc >> 37) & 0x7FF), idle = 0x7FF;
+      // The context starts (the one switched away from is the idle one), then stops (the one switched to is the idle one).
+      const uint32_t entries[2][2] = {{ctx_id << 15 | 1u, idle << 15}, {idle << 15, ctx_id << 15}};
+      for (const auto& entry : entries) {
+        csb_wp = (csb_wp + 1) % ExeclistPort::kCsb12Entries;
+        uint32_t* e = ggtt_dword(status_page + (ExeclistPort::kCsbFirstDword + csb_wp * 2) * 4, "csb entry");
+        if (!e) return;
+        e[0] = entry[0];
+        e[1] = entry[1];
+        *wp12 = csb_wp;
+      }
+      return;
+    }
+    uint32_t* wp = ggtt_dword(status_page + ExeclistPort::kCsbWriteDword * 4, "csb pointer");
     if (!wp) return;
     for (uint32_t status : {ExeclistPort::kStatusIdleToActive, ExeclistPort::kStatusComplete | ExeclistPort::kStatusActiveToIdle}) {
       csb_wp = (csb_wp + 1) % ExeclistPort::kCsbEntries;
-      uint32_t* e = ggtt_dword(uint64_t{regs[kBase + ExeclistPort::kRingHwsPga]} + (ExeclistPort::kCsbFirstDword + csb_wp * 2) * 4, "csb entry");
+      uint32_t* e = ggtt_dword(status_page + (ExeclistPort::kCsbFirstDword + csb_wp * 2) * 4, "csb entry");
       if (!e) return;
       e[0] = status;
       e[1] = id;
@@ -251,8 +301,14 @@ struct Rig {
   FakeMemory mem;
   std::vector<uint64_t> ggtt = std::vector<uint64_t>(1024, 0xAAAA'AAAA'AAAA'AAAAull);
   FakeGpu gpu{&ggtt, &mem};
+  Generation generation;
+  explicit Rig(Generation g = Generation::Gen9) : generation(g) {
+    gpu.gen = g;
+    gpu.base = g == Generation::Gen12 ? kVd0MmioBase : kBase;
+  }
   VcsDriver::Config config() {
     VcsDriver::Config c;
+    c.generation = generation;
     c.registers = &gpu;
     c.ggtt_table = MmioRegion(reinterpret_cast<uint64_t>(ggtt.data()), ggtt.size() * 8);
     c.ggtt_first_page = 100;

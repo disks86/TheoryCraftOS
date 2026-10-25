@@ -136,6 +136,35 @@ bool IntelEngineBuffers::picture_buffer(int slot, uint64_t bytes, uint32_t* addr
   return true;
 }
 
+bool IntelEngineBuffers::read_picture_buffer(int slot, uint64_t offset, ByteView out) const {
+  if (!open_ || slot < 0 || slot >= static_cast<int>(kMaxSurfaces) || !aux_[slot].buffer.valid()) return false;
+  ByteView part;
+  return aux_[slot].buffer.cpu.try_subview(offset, out.size(), &part) && out.copy_from(part);
+}
+
+bool IntelEngineBuffers::write_picture_buffer(int slot, uint64_t offset, ConstByteView bytes) {
+  if (!open_ || slot < 0 || slot >= static_cast<int>(kMaxSurfaces) || !aux_[slot].buffer.valid()) return false;
+  ByteView part;
+  return aux_[slot].buffer.cpu.try_subview(offset, bytes.size(), &part) && part.copy_from(bytes);
+}
+
+bool IntelEngineBuffers::clear_picture_buffer(int slot, uint64_t offset, uint64_t bytes) {
+  if (!open_ || slot < 0 || slot >= static_cast<int>(kMaxSurfaces) || !aux_[slot].buffer.valid()) return false;
+  ByteView part;
+  if (!aux_[slot].buffer.cpu.try_subview(offset, bytes, &part)) return false;
+  part.fill(0);
+  return true;
+}
+
+bool IntelEngineBuffers::copy_picture_buffer(int from, uint64_t from_offset, int to, uint64_t to_offset, uint64_t bytes) {
+  if (!open_ || from < 0 || to < 0 || from >= static_cast<int>(kMaxSurfaces) || to >= static_cast<int>(kMaxSurfaces)) return false;
+  if (!aux_[from].buffer.valid() || !aux_[to].buffer.valid()) return false;
+  ByteView source, target;
+  if (!aux_[from].buffer.cpu.try_subview(from_offset, bytes, &source) || !aux_[to].buffer.cpu.try_subview(to_offset, bytes, &target)) return false;
+  if (from == to && from_offset < to_offset + bytes && to_offset < from_offset + bytes) return false;
+  return target.copy_from(source);
+}
+
 bool IntelEngineBuffers::copy_surface(int from, int to) {
   if (!open_ || !engine_ready() || from < 0 || to < 0 || from >= static_cast<int>(kMaxSurfaces) || to >= static_cast<int>(kMaxSurfaces)) return false;
   const intel_gt::GpuBuffer& a = surfaces_[from].buffer;

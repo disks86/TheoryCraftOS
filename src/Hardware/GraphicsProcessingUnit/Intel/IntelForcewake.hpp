@@ -27,7 +27,8 @@ namespace intel_gt {
 // domain per part: the GT (global registers such as the PAT), the render engine, and the media engines (the video rings at 0x12000 and 0x1c000+).
 // A request is a masked write of bit 0 of the domain's register; the acknowledge register shows when it is granted. Registers from the i915 driver
 // (gt/intel_gt_regs.h, intel_uncore.c).
-enum class ForcewakeDomain : uint8_t { Gt, Render, Media };
+// MediaVdbox0 is the well of the first video box on Gen11 and later (Gen9 has one well for all of them).
+enum class ForcewakeDomain : uint8_t { Gt, Render, Media, MediaVdbox0 };
 
 class Forcewake {
  public:
