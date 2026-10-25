@@ -18,6 +18,7 @@
 
 // Inline styles (element.style, over the style attribute), computed styles (getComputedStyle), class lists (classList) and dataset.
 #include <initializer_list>
+#include "Browser/Css.hpp"
 #include "Browser/DomBindingsInternal.hpp"
 #include "Utility/Move.hpp"
 
@@ -169,6 +170,7 @@ bool style_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
 
 // Sets (or, for "", removes) one property of a style attribute.
 bool style_write(Vm& vm, dom::Node* n, StringView css_name, StringView value, StringView priority) {
+  if (!value.empty() && !css_declaration_valid(css_name, value)) return true;   // (a value the property does not take is ignored: the declaration stays as it was)
   StringView text;
   dom::get_attribute(n, "style", &text);
   List<Pair> pairs(vm.allocator());
@@ -1112,8 +1114,27 @@ NATIVE(css_escape) {
   return true;
 }
 
-NATIVE(css_supports) {
-  *result = bool_value(false);
+NATIVE(css_supports_native) {   // CSS.supports(property, value) and CSS.supports(condition)
+  String first(vm.allocator()), second(vm.allocator());
+  if (argc == 0) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'supports' on 'CSS': 1 argument required, but only 0 present.");
+  if (!arg_text(vm, args[0], &first)) return false;
+  if (argc >= 2) {
+    if (!arg_text(vm, args[1], &second)) return false;
+    String lowered(vm.allocator());
+    for (uint64_t i = 0; i < first.size(); ++i) lowered.push_back(lower_char(first[i]));
+    *result = bool_value(css_declaration_valid(lowered.view(), second.view()));
+    return true;
+  }
+  const StringView t = first.view().trimmed();
+  if (t.starts_with("(") || t.starts_with("not") || t.starts_with("selector(")) {
+    *result = bool_value(css_supports(t));
+  } else {
+    String wrapped(vm.allocator());
+    wrapped.push_back('(');
+    wrapped.append(t);
+    wrapped.push_back(')');
+    *result = bool_value(css_supports(wrapped.view()));
+  }
   return true;
 }
 
@@ -1147,7 +1168,7 @@ bool install_styles(DomBindings::Impl& c) {
   vm.define_native(c.token_list_proto, "supports", tokens_supports, 1);
   JsObject* css = vm.new_plain();
   vm.define_native(css, "escape", css_escape, 1);
-  vm.define_native(css, "supports", css_supports, 2);
+  vm.define_native(css, "supports", css_supports_native, 2);
   vm.define_named(vm.global(), "CSS", Value::make_object(css), kWritable);
   return !vm.halted();
 }

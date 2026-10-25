@@ -59,6 +59,11 @@ bool parse_css_color(StringView text, uint32_t* out);
 // The same with the alpha kept (0xAARRGGBB; "transparent" is 0x00000000), for canvases. False for anything else.
 bool parse_css_color_alpha(StringView text, uint32_t* out);
 
+// Does the declaration make sense (a known property and a value it takes)? Properties whose values are not checked here accept any value.
+bool css_declaration_valid(StringView name, StringView value);
+// Does an @supports condition hold, "(display: grid) and (color: red)"?
+bool css_supports(StringView text);
+
 // The value of attribute `name` in the text of a tag (after its tag name), as written (entities are not decoded); false if it has none.
 bool find_attribute(StringView attrs, StringView name, StringView* value);
 

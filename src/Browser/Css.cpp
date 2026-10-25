@@ -4648,6 +4648,9 @@ StringView take_block(StringView css, uint64_t* i) {
   return css.substr(start, *i - start);
 }
 
+bool css_value_valid_impl(StringView name, StringView value);
+bool declaration_supported(StringView name, StringView value) { return property_from_name(name) != pNone && css_value_valid_impl(name.trimmed(), value.trimmed().ends_with("!important") ? value.trimmed().first(value.trimmed().size() - 10).trimmed() : value.trimmed()); }
+
 // Do the conditions of an @supports rule hold? (property: value) pairs are checked against the properties known here; not / and / or are understood.
 bool supports_condition(StringView text) {
   text = text.trimmed();
@@ -4669,14 +4672,155 @@ bool supports_condition(StringView text) {
     const StringView inner = text.substr(1, text.size() - 2).trimmed();
     const uint64_t colon = inner.find(':');
     if (colon == StringView::npos || inner.starts_with("(") || inner.starts_with("not ")) return supports_condition(inner);
-    return property_from_name(inner.first(colon).trimmed()) != pNone;
+    return declaration_supported(inner.first(colon).trimmed(), inner.substr(colon + 1));
   }
   if (text.starts_with("selector(")) return true;
   const uint64_t colon = text.find(':');
-  return colon != StringView::npos && property_from_name(text.first(colon).trimmed()) != pNone;
+  return colon != StringView::npos && declaration_supported(text.first(colon).trimmed(), text.substr(colon + 1));
 }
 
 }  // namespace
+
+// --- Does a declaration make sense? ---------------------------------------------------------------------------------------------------------
+
+namespace {
+
+bool name_in(StringView name, const char* const* list, uint64_t count) {
+  for (uint64_t i = 0; i < count; ++i)
+    if (name.equals(list[i])) return true;
+  return false;
+}
+#define IN_LIST(name, list) name_in(name, list, sizeof(list) / sizeof(list[0]))
+
+// A value that is evaluated later (or is a keyword every property takes) passes whatever the property is.
+bool starts_ci(StringView t, const char* prefix) {
+  const StringView p(prefix);
+  return t.size() >= p.size() && t.first(p.size()).equals_ignore_case(p);
+}
+
+bool value_is_deferred(StringView v) {
+  static const char* const kGlobal[] = {"inherit", "initial", "unset", "revert", "revert-layer"};
+  for (const char* g : kGlobal)
+    if (v.equals_ignore_case(g)) return true;
+  return v.contains("var(") || v.contains("env(") || v.contains("attr(");
+}
+
+bool length_token_valid(StringView t) {
+  t = t.trimmed();
+  if (t.empty()) return false;
+  if (starts_ci(t, "calc(") || starts_ci(t, "min(") || starts_ci(t, "max(") || starts_ci(t, "clamp(") ||
+      starts_ci(t, "fit-content(") || starts_ci(t, "anchor(") || starts_ci(t, "anchor-size(")) return t.ends_with(')');
+  double v;
+  U unit;
+  if (parse_dimension(t, &v, &unit)) return true;
+  uint64_t i = 0;
+  if (read_double(t, &i, &v) && i == t.size()) return v == 0;   // a bare number is a length only as 0
+  static const char* const kWords[] = {"auto", "none", "normal", "min-content", "max-content", "fit-content", "stretch", "thin", "medium", "thick", "xx-small", "x-small", "small", "large",
+                                       "x-large", "xx-large", "xxx-large", "larger", "smaller", "content", "contain", "cover", "inherit", "initial", "unset", "revert", "currentcolor"};
+  for (const char* w : kWords)
+    if (t.equals_ignore_case(w)) return true;
+  return false;
+}
+
+// Every space separated item of the value satisfies `ok` (and there are at most `max` of them).
+template <class F>
+bool each_item_valid(StringView v, uint32_t max, F ok) {
+  uint64_t i = 0;
+  uint32_t n = 0;
+  int depth = 0;
+  while (i < v.size()) {
+    while (i < v.size() && is_space(v[i])) ++i;
+    const uint64_t start = i;
+    while (i < v.size() && (depth > 0 || !is_space(v[i]))) {
+      if (v[i] == '(') ++depth;
+      else if (v[i] == ')') --depth;
+      ++i;
+    }
+    if (i > start) {
+      if (++n > max || !ok(v.substr(start, i - start))) return false;
+    }
+  }
+  return n > 0;
+}
+
+bool css_value_valid_impl(StringView name, StringView value) {
+  value = value.trimmed();
+  if (value.empty()) return false;
+  const Prop prop = property_from_name(name);
+  if (prop == pNone) return false;
+  if (prop == pCustom || value_is_deferred(value)) return true;
+  static const char* const kColors[] = {"color", "background-color", "border-color", "border-top-color", "border-right-color", "border-bottom-color", "border-left-color", "outline-color",
+                                        "text-decoration-color", "caret-color", "column-rule-color", "accent-color"};
+  static const char* const kLengths[] = {"width", "height", "min-width", "min-height", "max-width", "max-height", "top", "right", "bottom", "left", "font-size", "letter-spacing", "word-spacing",
+                                         "text-indent", "flex-basis", "gap", "row-gap", "column-gap", "border-width", "border-top-width", "border-right-width", "border-bottom-width",
+                                         "border-left-width", "outline-width", "outline-offset", "border-radius", "border-top-left-radius", "border-top-right-radius",
+                                         "border-bottom-left-radius", "border-bottom-right-radius", "margin-top", "margin-right", "margin-bottom", "margin-left", "padding-top",
+                                         "padding-right", "padding-bottom", "padding-left", "inset"};
+  static const char* const kBoxes[] = {"margin", "padding"};
+  static const char* const kNumbers[] = {"opacity", "flex-grow", "flex-shrink", "order", "z-index", "font-weight", "line-height"};
+  struct Keywords {
+    const char* property;
+    const char* words;   // space separated
+  };
+  static const Keywords kEnums[] = {
+      {"display", " none block inline inline-block flex inline-flex grid inline-grid table inline-table table-row table-cell table-row-group table-header-group table-footer-group table-column table-column-group table-caption list-item contents flow-root ruby "},
+      {"position", " static relative absolute fixed sticky "},
+      {"visibility", " visible hidden collapse "},
+      {"float", " none left right inline-start inline-end "},
+      {"clear", " none left right both inline-start inline-end "},
+      {"box-sizing", " content-box border-box "},
+      {"overflow", " visible hidden scroll auto clip "},
+      {"overflow-x", " visible hidden scroll auto clip "},
+      {"overflow-y", " visible hidden scroll auto clip "},
+      {"text-align", " left right center justify start end match-parent "},
+      {"font-style", " normal italic oblique "},
+      {"text-transform", " none capitalize uppercase lowercase full-width "},
+      {"white-space", " normal nowrap pre pre-wrap pre-line break-spaces "},
+      {"flex-direction", " row row-reverse column column-reverse "},
+      {"flex-wrap", " nowrap wrap wrap-reverse "},
+  };
+  if (IN_LIST(name, kColors)) {
+    uint32_t c;
+    return parse_css_color(value, &c) || value.equals_ignore_case("currentcolor") || starts_ci(value, "color-mix(") || starts_ci(value, "light-dark(") ||
+           (name.equals("outline-color") && value.equals_ignore_case("invert"));
+  }
+  if (IN_LIST(name, kBoxes)) return each_item_valid(value, 4, length_token_valid);
+  if (name.equals("border-width") || name.equals("border-radius") || name.equals("inset")) return each_item_valid(value, 4, length_token_valid);
+  if (IN_LIST(name, kLengths)) {
+    if (name.starts_with("border-") && name.ends_with("-radius")) return each_item_valid(value, 2, length_token_valid);
+    return each_item_valid(value, 1, length_token_valid) || (name.equals("gap") && each_item_valid(value, 2, length_token_valid));
+  }
+  if (IN_LIST(name, kNumbers)) {
+    double v;
+    uint64_t i = 0;
+    if (read_double(value, &i, &v) && i == value.size()) return true;
+    if (name.equals("line-height")) return length_token_valid(value);
+    if (name.equals("z-index")) return value.equals_ignore_case("auto");
+    if (name.equals("font-weight")) return value.equals_ignore_case("normal") || value.equals_ignore_case("bold") || value.equals_ignore_case("bolder") || value.equals_ignore_case("lighter");
+    return starts_ci(value, "calc(");
+  }
+  for (const Keywords& e : kEnums) {
+    if (!name.equals(e.property)) continue;
+    const StringView words(e.words);
+    return each_item_valid(value, 4, [&](StringView word) {   // (each word of the value must be one of the property's)
+      uint64_t at = 0;
+      while (at < words.size()) {
+        while (at < words.size() && words[at] == ' ') ++at;
+        const uint64_t start = at;
+        while (at < words.size() && words[at] != ' ') ++at;
+        if (at > start && word.equals_ignore_case(words.substr(start, at - start))) return true;
+      }
+      return false;
+    });
+  }
+  return true;   // (a property whose values are not checked here)
+}
+
+}  // namespace
+
+bool css_declaration_valid(StringView name, StringView value) { return css_value_valid_impl(name, value); }
+
+bool css_supports(StringView text) { return supports_condition(text); }
 
 void StyleSheet::clear() {
   pointer_state_ = false;
