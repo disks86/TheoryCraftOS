@@ -68,6 +68,32 @@ constexpr Vector kVectorWakeup = 1;      // SGI: look for work (inter-processor 
 constexpr Vector kVectorYield = 1020;    // pseudo vector: the SVC that gives up the core
 constexpr Vector kVectorMax = 1024;
 constexpr uint64_t kSpsrInterruptsEnabled = 0;  // DAIF clear
+#elif defined(__riscv) && __riscv_xlen == 64
+// The register state of an interrupted context, as Arch/RiscV64/Trap.S saves it on the interrupted
+// stack (lowest address first). A handler returns the frame to resume: the same one, or another
+// context's - which is how threads are switched. Only the integer registers are saved: the image is
+// built for rv64imac, so no kernel code touches floating-point state. x[i] holds register x(i+1);
+// x0 is not saved. The assembly relies on these offsets (x at 0, sepc at 248, sstatus at 256).
+struct alignas(16) Frame {
+  uint64_t x[31];    // x1..x31 (x[1] is sp: the interrupted stack pointer, informational - resuming uses the frame's own address)
+  uint64_t sepc;     // where to resume
+  uint64_t sstatus;  // supervisor status to resume with (SPIE becomes SIE on sret, SPP picks the privilege)
+  uint64_t scause;   // interrupt flag (bit 63) and cause code
+  uint64_t stval;    // faulting address or instruction
+  uint64_t reserved_;
+};
+static_assert(sizeof(Frame) == 288);
+
+// Vectors are supervisor interrupt cause codes plus a pseudo vector for the exception that is not an interrupt.
+using Vector = uint16_t;
+constexpr Vector kVectorWakeup = 1;     // supervisor software interrupt: look for work (SBI inter-processor interrupt)
+constexpr Vector kVectorTimer = 5;      // supervisor timer interrupt: preemption tick
+constexpr Vector kVectorExternal = 9;   // supervisor external interrupt (no controller is driven yet)
+constexpr Vector kVectorYield = 67;     // pseudo vector: the EBREAK that gives up the core
+constexpr Vector kVectorMax = 128;
+constexpr uint64_t kSstatusSie = 1u << 1;
+constexpr uint64_t kSstatusSpie = 1u << 5;
+constexpr uint64_t kSstatusSpp = 1u << 8;
 #endif
 
 using InterruptHandler = Frame* (*)(Frame* frame, void* context);
@@ -116,16 +142,35 @@ inline bool irq_enabled() {
   __asm__ volatile("mrs %0, daif" : "=r"(daif));
   return !(daif & kDaifIrqMasked);
 }
+#elif defined(__riscv) && __riscv_xlen == 64
+// sstatus.SIE is the supervisor interrupt enable. The saved value is sstatus itself.
+inline uint64_t irq_save() {
+  uint64_t sstatus;
+  __asm__ volatile("csrrci %0, sstatus, 2" : "=r"(sstatus)::"memory");
+  return sstatus;
+}
+inline void irq_restore(uint64_t sstatus) {
+  if (sstatus & kSstatusSie) __asm__ volatile("csrsi sstatus, 2" ::: "memory");
+}
+inline void irq_enable() { __asm__ volatile("csrsi sstatus, 2" ::: "memory"); }
+inline void irq_disable() { __asm__ volatile("csrci sstatus, 2" ::: "memory"); }
+inline bool irq_enabled() {
+  uint64_t sstatus;
+  __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
+  return sstatus & kSstatusSie;
+}
 #else
 #error "No interrupt flag helpers for this architecture"
 #endif
 
-// The hint a spin-wait loop gives the core (x86 PAUSE, ARM YIELD).
+// The hint a spin-wait loop gives the core (x86 PAUSE, ARM YIELD, RISC-V PAUSE).
 inline void cpu_relax() {
 #if defined(__x86_64__)
   __asm__ volatile("pause");
 #elif defined(__aarch64__)
   __asm__ volatile("yield");
+#elif defined(__riscv)
+  __asm__ volatile(".4byte 0x0100000F");   // Zihintpause: a FENCE encoding that is a plain hint on cores without it
 #endif
 }
 

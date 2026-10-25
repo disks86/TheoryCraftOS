@@ -96,13 +96,29 @@ bool UefiRandomAccessMemory::initialize() {
   const bool use_low = low_pages > 0;
   uint64_t pages = use_low ? low_pages : best_pages;
   if (pages == 0) return false;
+  uint64_t region_start = use_low ? low_start : best_start;
+  {
+    // Some firmware (EDK2 on RISC-V) reports the top of the stack this code is running on as free memory. The pool must
+    // not overlay a live stack, so a region that starts just above or around the stack pointer (within kStackNear)
+    // begins above the next kStackSlack boundary instead.
+    constexpr uint64_t kStackSlack = 2ull << 20, kStackNear = 256ull << 10;
+    const uint64_t stack = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+    const uint64_t region_end = region_start + pages * kPageSize;
+    if (stack + kStackNear >= region_start && stack < region_end) {
+      const uint64_t above = (stack + kStackSlack) & ~(kStackSlack - 1);
+      if (above < region_end && region_end - above >= 2 * kFirmwareReserve) {
+        region_start = above;
+        pages = (region_end - above) / kPageSize;
+      }
+    }
+  }
   // Boot services stay alive, and firmware drivers (the UEFI block and network fallbacks) allocate DMA
   // buffers below 4 GiB while we run: leave them the end of the region, 128 MiB or half of a small one.
   const uint64_t reserve_pages = (pages / 2 < kFirmwareReserve / kPageSize) ? pages / 2 : kFirmwareReserve / kPageSize;
   pages -= reserve_pages;
   if (pages == 0) return false;
 
-  uint64_t address = use_low ? low_start : best_start;
+  uint64_t address = region_start;
   if (bs->allocate_pages(efi::AllocateType::Address, efi::MemoryType::LoaderData, pages,
                          &address) != efi::kSuccess)
     return false;
