@@ -38,8 +38,7 @@ namespace filesystem {
 // inodes of 128 bytes and more, sparse superblock backups, large files, the filetype and extended attribute features.
 // Regular files and directories are read and written; a symbolic link reads as a file holding its target; devices, sockets and pipes
 // are not listed. Names are the bytes stored (UTF-8 in practice) and differ by case. Owners, permissions, links to other owners and
-// extended attributes are left as they are; only the immutable flag makes a file ReadOnly. There is no clock here, so new inodes get the
-// time stamp 1980-01-01.
+// extended attributes are left as they are; only the immutable flag makes a file ReadOnly.
 //
 // ext3: the journal is a hidden file. A volume that was not unmounted cleanly (the needs_recovery feature) has its journal replayed when
 // it is mounted on a device that can be written, as e2fsck or the kernel would do: committed transactions are copied to their places,
@@ -52,6 +51,11 @@ namespace filesystem {
 // blocks, kept up to date for everything that is written) or the older uninit_bg group descriptor crc16. Not supported: meta_bg, inline
 // data, encryption, case folding, bigalloc (read only), quotas and the other features that need more bookkeeping than this does (read
 // only), extended attributes (kept as they are, a block that holds them is released with its last file).
+//
+// Time stamps come from the system wall clock (set_unix_clock): a new inode gets the time as its creation, change, modification and access
+// time; writing or cutting a file sets its modification and change times; adding, removing or renaming entries does the same to the
+// directories concerned (and linking or renaming to the inode's change time). Reading does not touch the access time. While no clock is
+// known stamps are left alone and new inodes get 1980-01-01. DirectoryEntry::modified and ::created report what is stored.
 //
 // Writing: files and directories can be created, written, grown, cut, renamed (into other directories too) and removed; blocks and
 // inodes come from the bitmaps of the block groups, near their directory. Nothing is journaled: a volume is mounted writable only if its
@@ -188,6 +192,10 @@ class ExtFileSystem final : public IFileSystem {
   Status inode_offset(uint32_t number, uint64_t* offset);
   Status read_inode(uint32_t number, Inode* inode);
   Status write_inode(const Inode& inode);
+  // Time stamps: seconds since 1970 in the 32-bit field plus, in the extra part of a large inode, two more bits (the years after 2038).
+  uint64_t inode_time(const Inode& inode, uint32_t field, uint32_t extra_field) const;
+  void set_inode_time(Inode* inode, uint32_t field, uint32_t extra_field, uint64_t seconds) const;
+  void touch(Inode* inode, bool contents) const;  // ctime (and mtime if the contents changed) become now; nothing without a clock
   uint32_t inode_seed(const Inode& inode) const;  // the checksum seed of one inode: its number and generation folded into the volume's
   void inode_checksum_set(Inode* inode) const;
   void extent_checksum_set(const Inode& inode, ByteView node) const;

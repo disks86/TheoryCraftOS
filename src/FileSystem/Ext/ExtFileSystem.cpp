@@ -847,6 +847,8 @@ Status ExtFileSystem::describe(const Inode& inode, StringView name, DirectoryEnt
   }
   if (!result.name.assign(name)) return Status::InvalidPath;
   result.read_only = inode_immutable(inode);
+  result.modified = inode_time(inode, kInMtime, kInMtimeExtra);
+  if (inode_size_ > kGoodOldInodeSize && rd16(inode.bytes(), kInExtraIsize) >= 24) result.created = inode_time(inode, kInCrtime, kInCrtimeExtra);
   *entry = result;
   return Status::Ok;
 }

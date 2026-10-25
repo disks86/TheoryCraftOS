@@ -219,6 +219,26 @@ static bool read_local_time(void* context, desktop::DateTime* out) {
   return true;
 }
 
+// The wall clock for the filesystems. The firmware clock can only be read here on the boot core, so it is read now and then and the time in
+// between comes from the uptime counter: g_unix_us_at_boot is the (UTC) time of uptime 0 in microseconds, 0 while the clock is unknown.
+static uint64_t g_unix_us_at_boot = 0;
+
+static void sync_wall_clock(efi::SystemTable* st) {
+  efi::Time t{};
+  efi::Status status = efi::kSuccess;
+  kernel::firmware([&] { status = st->runtime_services->get_time(&t, nullptr); });
+  if (status != efi::kSuccess || t.year < 1970 || t.month < 1 || t.month > 12 || t.day < 1 || t.day > 31 || t.hour > 23 || t.minute > 59 || t.second > 59) return;
+  int64_t seconds = filesystem::days_from_civil(t.year, t.month, t.day) * 86400 + t.hour * 3600 + t.minute * 60 + t.second;
+  if (t.time_zone != efi::kUnspecifiedTimeZone && t.time_zone >= -1440 && t.time_zone <= 1440) seconds += int64_t{t.time_zone} * 60;  // (UTC = local + zone)
+  if (seconds <= 0) return;
+  __atomic_store_n(&g_unix_us_at_boot, static_cast<uint64_t>(seconds) * 1000000ull - hardware::uptime_us(), __ATOMIC_RELAXED);
+}
+
+static uint64_t wall_clock_seconds(void*) {
+  const uint64_t at_boot = __atomic_load_n(&g_unix_us_at_boot, __ATOMIC_RELAXED);
+  return at_boot ? (at_boot + hardware::uptime_us()) / 1000000ull : 0;
+}
+
 // Unpredictable bytes from the timing of things, for machines whose CPU has neither RDSEED nor RDRAND (QEMU's default CPU, for one): the cycle
 // counter sampled around short waits, hashed. Weaker than a hardware generator, and good enough for what SMB uses it for (client nonces).
 struct TimingEntropy final : crypto::IEntropySource {
@@ -891,6 +911,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     ftp_environment.trust = &host_trust;
     network::FtpFileSystem ftps(smb_network, shared_allocator, ftp_environment);
     PasswordLoginContext<network::FtpFileSystem> ftps_login{&ftps};
+    sync_wall_clock(st);
+    filesystem::set_unix_clock(wall_clock_seconds, nullptr);   // before the volumes are mounted: they stamp what they create
     SystemFileSystem explorer_files(shared_allocator, storage);
     // Microcode the video engines need, from /firmware on the root volume (AMD VCN 1: Ryzen 2000/3000 "Raven" APUs). Only read and checked here; no engine is
     // started with it yet.
@@ -1033,7 +1055,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     if (restored) Entry(Level::Info, "Desktop").text("restored ").dec(restored).text(" window(s) from the last session");
     const bool threaded = desktop.start();
     if (!threaded) Entry(Level::Warning, "Desktop").text("could not start the render and handler threads; running single-threaded");
+    uint64_t clock_synced_us = hardware::uptime_us();
     while (!desktop.shutdown_requested()) {
+      if (hardware::uptime_us() - clock_synced_us >= 60000000ull) {   // once a minute, against drift
+        sync_wall_clock(st);
+        clock_synced_us = hardware::uptime_us();
+      }
       if (hyperv.take_shutdown_request(&hyperv_restart)) desktop.request_shutdown();   // the Hyper-V manager asked
       if (vmware_tools.take_shutdown_request(&vmware_restart)) desktop.request_shutdown();   // so did VMware
       uint32_t tools_width, tools_height;

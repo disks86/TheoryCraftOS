@@ -79,6 +79,10 @@ struct MemDisk : hardware::IStorageDevice {
 
 typedef std::vector<uint8_t> Bytes;
 
+static uint64_t g_fake_now = 0;
+static uint64_t g_fake_step = 0;  // added after each reading: a clock that runs by itself
+static uint64_t fake_clock(void*) { const uint64_t t = g_fake_now; g_fake_now += g_fake_step; return t; }
+
 static std::string g_work;  // scratch directory
 static int sh(const std::string& command) {
   const int r = system(command.c_str());
@@ -576,6 +580,10 @@ static void test_random(const Variant& v, uint32_t seed, int operations) {
   Variant big = v;
   big.megabytes = 48;
   Bytes image = make_image(big, "", "-N 6000");
+  g_fake_now = 1600000000 + seed * 1000;
+  g_fake_step = 1;
+  set_unix_clock(fake_clock, nullptr);
+  struct Reset { ~Reset() { set_unix_clock(nullptr, nullptr); } } reset_clock;
   Mounted mt;
   CHECK_STATUS(mt.mount(image, 512, true), Status::Ok);
   if (!mt.fs) return;
@@ -1014,6 +1022,123 @@ static void test_mount_rules_ext4() {
   }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Time stamps
+
+
+static std::string hex8(uint64_t t) { char b[16]; snprintf(b, sizeof b, "%08x", static_cast<unsigned>(static_cast<uint32_t>(t))); return b; }
+
+static void test_timestamps(const Variant& v) {
+  if (g_verbose) printf("times: %s\n", v.name);
+  // the calendar helpers
+  CHECK(days_from_civil(1970, 1, 1) == 0);
+  CHECK(days_from_civil(2000, 3, 1) == 11017);
+  const CivilTime c = civil_from_unix(1700000000);
+  CHECK(c.year == 2023 && c.month == 11 && c.day == 14 && c.hour == 22 && c.minute == 13 && c.second == 20);
+  const CivilTime d = civil_from_unix(2240000000);
+  CHECK(d.year == 2040 && d.month == 12 && d.day == 24 && d.hour == 22 && d.minute == 13);
+
+  set_unix_clock(nullptr, nullptr);
+  Bytes image = make_image(v);
+  Mounted mt;
+  CHECK_STATUS(mt.mount(image, 512, true), Status::Ok);
+  if (!mt.fs) return;
+  IFileSystem& fs = *mt.fs;
+  const bool has_created = strstr(v.options, "-I 128") == nullptr;
+  auto stat_times = [&](const char* path, uint64_t* modified, uint64_t* created) {
+    DirectoryEntry e;
+    CHECK_STATUS(fs.stat(path, &e), Status::Ok);
+    *modified = e.modified;
+    *created = e.created;
+  };
+  uint64_t m = 0, cr = 0;
+  // without a clock: the fixed time for new files, and nothing moves
+  CHECK_STATUS(write_file(fs, "/old", make_data(100, 1)), Status::Ok);
+  stat_times("/old", &m, &cr);
+  CHECK(m == 315532800);
+  set_unix_clock(fake_clock, nullptr);
+  g_fake_step = 0;
+  g_fake_now = 1700000000;
+  CHECK_STATUS(fs.create_directory("/d"), Status::Ok);
+  CHECK_STATUS(write_file(fs, "/d/f", make_data(5000, 2)), Status::Ok);
+  stat_times("/d/f", &m, &cr);
+  CHECK(m == 1700000000);
+  if (has_created) CHECK(cr == 1700000000);
+  stat_times("/d", &m, &cr);
+  CHECK(m == 1700000000);
+  stat_times("/old", &m, &cr);
+  CHECK(m == 315532800);
+
+  g_fake_now = 1700001000;  // writing: the file's modification time
+  {
+    UniquePointer<IFile> f;
+    CHECK_STATUS(fs.open_file("/d/f", OpenMode::ReadWrite, &f), Status::Ok);
+    Bytes more = make_data(10, 3);
+    uint64_t put = 0;
+    CHECK_STATUS(f->write(10, ConstByteView(more.data(), more.size()), &put), Status::Ok);
+  }
+  stat_times("/d/f", &m, &cr);
+  CHECK(m == 1700001000);
+  if (has_created) CHECK(cr == 1700000000);
+  stat_times("/d", &m, &cr);
+  CHECK(m == 1700000000);  // (the directory did not change)
+
+  g_fake_now = 1700002000;  // a new entry: the directory's
+  CHECK_STATUS(write_file(fs, "/d/g", make_data(1, 4)), Status::Ok);
+  stat_times("/d", &m, &cr);
+  CHECK(m == 1700002000);
+  stat_times("/d/f", &m, &cr);
+  CHECK(m == 1700001000);
+
+  g_fake_now = 1700003000;  // a rename: the directories, not the file
+  CHECK_STATUS(fs.create_directory("/e"), Status::Ok);
+  g_fake_now = 1700004000;
+  CHECK_STATUS(fs.rename("/d/f", "/e/h"), Status::Ok);
+  stat_times("/e", &m, &cr);
+  CHECK(m == 1700004000);
+  stat_times("/d", &m, &cr);
+  CHECK(m == 1700004000);
+  stat_times("/e/h", &m, &cr);
+  CHECK(m == 1700001000);
+
+  g_fake_now = 1700005000;  // cutting, and removing
+  {
+    UniquePointer<IFile> f;
+    CHECK_STATUS(fs.open_file("/e/h", OpenMode::ReadWrite, &f), Status::Ok);
+    CHECK_STATUS(f->resize(7), Status::Ok);
+  }
+  stat_times("/e/h", &m, &cr);
+  CHECK(m == 1700005000);
+  g_fake_now = 1700006000;
+  CHECK_STATUS(fs.remove("/d/g"), Status::Ok);
+  stat_times("/d", &m, &cr);
+  CHECK(m == 1700006000);
+
+  // times after 2038 need the extra bits of a large inode
+  g_fake_now = 2240000000;
+  CHECK_STATUS(write_file(fs, "/future38", make_data(10, 5)), Status::Ok);
+  stat_times("/future38", &m, &cr);
+  if (strstr(v.options, "-I 128") == nullptr) CHECK(m == 2240000000);
+  g_fake_now = 4400000000ull;
+  CHECK_STATUS(write_file(fs, "/future", make_data(10, 5)), Status::Ok);
+  stat_times("/future", &m, &cr);
+  if (strstr(v.options, "-I 128") == nullptr) CHECK(m == 4400000000ull);
+
+  CHECK_STATUS(fs.flush(), Status::Ok);
+  Bytes out = mt.image();
+  CHECK_FSCK(out);
+  // the reference reads the same stamps
+  const std::string img = g_work + "/times.img";
+  spit(img, out);
+  const std::string text = debugfs(img, "stat /e/h\n", false);
+  CHECK(text.find("mtime: 0x" + hex8(1700005000)) != std::string::npos);
+  if (has_created) CHECK(text.find("crtime: 0x" + hex8(1700000000)) != std::string::npos);
+  const std::string future = debugfs(img, "stat /future\n", false);
+  // (e2fsprogs reads the low half of an extended time as unsigned, the kernel as signed: they agree where it is positive, from 2106 on)
+  if (strstr(v.options, "-I 128") == nullptr) CHECK(future.find("mtime: 0x" + hex8(4400000000ull) + ":00000001") != std::string::npos && future.find("2109") != std::string::npos);
+  set_unix_clock(nullptr, nullptr);
+}
+
 static void test_handles() {
   const Variant v = ext2_variants()[0];
   Bytes image = make_image(v);
@@ -1252,6 +1377,7 @@ int main(int argc, char** argv) {
     for (size_t i : {0, 1, 3}) test_unwritten(ext4[i]);
   }
   if (want("handles")) test_handles();
+  if (want("times")) for (size_t i : {size_t{0}, size_t{2}, size_t{7}, size_t{8}, size_t{10}}) test_timestamps(variants[i]);
   if (want("mount")) { test_mount_rules(); test_mount_rules_ext4(); }
   if (want("damage")) { test_damage(variants[0]); test_damage(variants[2]); test_damage(ext3[0]); for (size_t i : {0, 2, 5, 6}) test_damage(ext4[i]); }
   sh("rm -rf '" + g_work + "'");
