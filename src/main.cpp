@@ -972,6 +972,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_hardware_inventory(&inventory);
     desktop.set_network_details(&network_details);
     desktop.set_media_services(mixer.get(), &video_codecs, &clock);
+    desktop.set_capture_hub(capture_hub.get());
     desktop.set_midi_output(&usb_midi);
     desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());

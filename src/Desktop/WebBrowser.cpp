@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/WebBrowser.hpp"
+#include "Browser/WebRandom.hpp"
 #include "Browser/CacheStore.hpp"
 #include "Browser/ServiceWorker.hpp"
 #include "Browser/Fetcher.hpp"
@@ -310,6 +311,17 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   welcome.type.assign("text/html");
   show(welcome);
   say("Type an address and press Enter.");
+}
+
+bool WebBrowser::RtcRandom::fill(ByteView out) { return browser::system_random(out); }
+
+browser::IRtcService* WebBrowser::rtc() {
+  if (!rtc_service_ && loader_)
+    if (rtc::IRtcNetwork* network = loader_->rtc_network()) {
+      rtc_service_ = UniquePointer<rtc::RtcService>::make(allocator(), allocator(), *network, rtc_random_);
+      if (rtc_service_) rtc_service_->set_devices(rtc_audio_);
+    }
+  return rtc_service_.get();
 }
 
 WebBrowser::~WebBrowser() {

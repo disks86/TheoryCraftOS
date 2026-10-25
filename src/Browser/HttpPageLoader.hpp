@@ -23,6 +23,7 @@
 #include "Browser/IPageLoader.hpp"
 #include "Network/Http/HttpClient.hpp"
 #include "Network/NetworkStackSet.hpp"
+#include "Browser/StackRtcNetwork.hpp"
 
 namespace browser {
 
@@ -30,7 +31,8 @@ class HttpPageLoader final : public IPageLoader {
  public:
   static constexpr uint64_t kMaxPageBytes = 4u << 20, kMaxFetchBytes = 16u << 20;
 
-  HttpPageLoader(network::NetworkStackSet& stacks, allocators::IAllocator& allocator) : stacks_(stacks), allocator_(allocator), sessions_(allocator), alt_svc_(allocator) {}
+  HttpPageLoader(network::NetworkStackSet& stacks, allocators::IAllocator& allocator) : stacks_(stacks), allocator_(allocator), sessions_(allocator), rtc_network_(stacks), alt_svc_(allocator) {}
+  rtc::IRtcNetwork* rtc_network() override { return &rtc_network_; }
 
   // Lets https:// addresses through (copied; what it points to must outlive the loader). nullptr: plain http only.
   void set_tls(const network::TlsConfig* config) {
@@ -52,6 +54,7 @@ class HttpPageLoader final : public IPageLoader {
   bool has_tls_ = false;
   uint32_t timeout_ms_ = 30000;
   network::TlsSessionCache sessions_;   // TLS tickets: later requests to the same server resume the session
+  rtc::StackRtcNetwork rtc_network_;
   network::AltSvcCache alt_svc_;   // servers that announced HTTP/3: later requests to them go over QUIC (see HttpClient)
 };
 

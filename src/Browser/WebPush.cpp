@@ -103,7 +103,7 @@ bool webpush_encrypt(ConstByteView ua_public, ConstByteView auth, ConstByteView 
   AesGcm gcm;
   if (!gcm.set_key(ConstByteView(cek, 16))) return false;
   body->clear();
-  if (!body->append(salt) || !body->put32(record_size) || !body->put8(kPoint) || !body->append(ConstByteView(as_public, kPoint))) return false;
+  if (!body->append(salt) || !body->put8(record_size >> 24) || !body->put8(record_size >> 16) || !body->put8(record_size >> 8) || !body->put8(record_size) || !body->put8(kPoint) || !body->append(ConstByteView(as_public, kPoint))) return false;
   const uint64_t chunk = record_size - 17;   // (data per record: the delimiter and the tag take the rest)
   uint64_t pos = 0;
   uint32_t sequence = 0;

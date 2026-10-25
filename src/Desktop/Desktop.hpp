@@ -40,6 +40,7 @@
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/WebBrowser.hpp"
+#include "Desktop/WebAudio.hpp"
 #include "Desktop/WebNotifications.hpp"
 #include "Browser/CacheStore.hpp"
 #include "Browser/ServiceWorker.hpp"
@@ -126,7 +127,10 @@ class Desktop {
   // Opens the 3D test window (a spinning cube with the frame rate and whether the GPU draws it), or brings it forward.
   void open_graphics_test();
   // The machine's sound mixer, video codecs and clock for the media player (any may be nullptr). They must outlive the desktop.
+  // The machine's microphone, for WebRTC (getUserMedia).
+  void set_capture_hub(audio::AudioCaptureHub* hub) { rtc_audio_.set_capture_hub(hub); }
   void set_media_services(audio::AudioMixer* mixer, hardware::SystemVideoCodecs* codecs, const hardware::IClock* clock) {
+    rtc_audio_.set_mixer(mixer);
     media_player_.set_services(mixer, codecs, clock);
     media_mixer_ = mixer;
     media_codecs_ = codecs;
@@ -356,6 +360,7 @@ class Desktop {
   WebBrowser web_browser_;
   gui::MessageDialog permission_dialog_;   // "may this site show notifications?"
   WebNotifications web_notifications_;   // the toasts and the question for the notifications of its pages
+  DesktopRtcAudio rtc_audio_;   // the microphone and speaker for its pages' WebRTC (after the notifications: it asks its questions through them)
   Terminal terminal_;
   Calculator calculator_;
   MediaPlayer media_player_;

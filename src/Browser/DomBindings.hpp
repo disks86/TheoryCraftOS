@@ -191,6 +191,19 @@ class IDomHost {
   virtual bool ws_receive(uint32_t id, bool* text, ByteBuffer* data) { (void)id; (void)text; (void)data; return false; }
   virtual void ws_info(uint32_t id, String* protocol, uint16_t* code, String* reason, bool* opened) { (void)id; (void)protocol; (void)code; (void)reason; (void)opened; }
   virtual void ws_release(uint32_t id) { (void)id; }
+  // WebRTC: peer connections made and driven by name (see IRtcService). rtc_available() says whether the browser has the machinery at all.
+  virtual bool rtc_available() { return false; }
+  virtual uint32_t rtc_create(StringView ice_servers, String* error) {
+    (void)ice_servers;
+    error->assign("NotSupportedError: This browser cannot make peer connections");
+    return 0;
+  }
+  virtual bool rtc_op(uint32_t id, StringView name, StringView a, StringView b, ConstByteView bytes, int64_t n1, int64_t n2, String* out) {
+    (void)id; (void)name; (void)a; (void)b; (void)bytes; (void)n1; (void)n2;
+    out->assign("InvalidStateError: The connection is gone");
+    return false;
+  }
+  virtual void rtc_release(uint32_t id) { (void)id; }
   // Web Workers: a worker is a script engine of its own that the page owns. worker_start() runs `source` in it (0 and *error set when that cannot be done);
   // worker_post() hands it a message (serialized); worker_pump() lets it run (messages in, timers) and collects what it says, which worker_next_event() gives
   // one at a time: kind 0 a message (text), 1 an uncaught error (text), 2 the worker closed itself.

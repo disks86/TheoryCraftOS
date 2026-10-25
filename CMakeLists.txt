@@ -251,9 +251,20 @@ add_executable(BOOTX64
   src/Browser/DomBindingsCrypto.cpp
   src/Browser/DomBindingsWasm.cpp
   src/Browser/DomBindingsServiceWorker.cpp
+  src/Browser/DomBindingsRtc.cpp
   src/Browser/CacheStore.cpp
   src/Browser/ServiceWorker.cpp
   src/Browser/WebPush.cpp
+  src/Rtc/Dtls.cpp
+  src/Rtc/Ice.cpp
+  src/Rtc/PeerConnection.cpp
+  src/Rtc/Rtp.cpp
+  src/Rtc/RtcService.cpp
+  src/Rtc/Sctp.cpp
+  src/Rtc/Sdp.cpp
+  src/Rtc/Srtp.cpp
+  src/Browser/StackRtcNetwork.cpp
+  src/Rtc/Stun.cpp
   src/Browser/ServiceWorkerPrelude.cpp
   src/Wasm/WasmDecode.cpp
   src/Wasm/WasmRun.cpp
@@ -386,6 +397,7 @@ add_executable(BOOTX64
   src/Desktop/DatabaseQuery.cpp
   src/Desktop/WebBrowser.cpp
   src/Desktop/WebNotifications.cpp
+  src/Desktop/WebAudio.cpp
   src/Desktop/PictureInPicture.cpp
   src/Desktop/BrowserStore.cpp
   src/Desktop/SessionStore.cpp

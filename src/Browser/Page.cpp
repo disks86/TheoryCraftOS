@@ -127,6 +127,8 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       invalid_text_(allocator),
       style_cache_(allocator),
       sockets_(allocator),
+      rtc_ids_(allocator),
+      rtc_sources_(allocator),
       workers_(allocator),
       geometry_(allocator) {
   address_.assign(address);
@@ -140,6 +142,12 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
 }
 
 Page::~Page() {
+  if (rtc_ids_.count() > 0 || rtc_sources_.count() > 0)   // (the environment is asked only if this page used it: it may have lost its network by now)
+    if (IRtcService* rtc = env_.rtc_service()) {
+      String ignored(allocator_);
+      for (const uint32_t handle : rtc_sources_) rtc->op(0, "source_close", StringView(), StringView(), ConstByteView(), handle, 0, &ignored);
+      for (const uint32_t id : rtc_ids_) rtc->release(id);
+    }
   if (sw_client_ != 0)
     if (ServiceWorkerHub* hub = env_.service_workers()) hub->client_remove(sw_client_);
   bindings_.reset();
@@ -2454,6 +2462,75 @@ void Page::ws_release(uint32_t id) {
   for (uint64_t i = 0; i < sockets_.count(); ++i)
     if (sockets_[i].id == id) {
       sockets_.remove_at(i);
+      return;
+    }
+}
+
+uint32_t Page::rtc_create(StringView ice_servers, String* error) {
+  IRtcService* rtc = env_.rtc_service();
+  if (!rtc) {
+    error->assign("NotSupportedError: This browser cannot make peer connections");
+    return 0;
+  }
+  const uint32_t id = rtc->create(ice_servers, error);
+  if (id != 0 && !rtc_ids_.push_back(id)) {
+    rtc->release(id);
+    error->assign("OperationError: Out of memory");
+    return 0;
+  }
+  return id;
+}
+
+bool Page::rtc_op(uint32_t id, StringView name, StringView a, StringView b, ConstByteView bytes, int64_t n1, int64_t n2, String* out) {
+  if (id == 0) {   // the microphone: asked for in the name of the page's origin
+    IRtcService* service = env_.rtc_service();
+    if (!service) {
+      out->assign("NotFoundError: Requested device not found");
+      return false;
+    }
+    String origin(allocator_);
+    page_origin(&origin);
+    if (name.equals("source_close")) {   // (only the page's own microphones)
+      bool owned = false;
+      for (const uint32_t known : rtc_sources_) owned = owned || known == static_cast<uint32_t>(n1);
+      if (!owned) return true;
+    }
+    const bool ok = service->op(0, name, a, origin.view(), bytes, n1, n2, out);
+    if (ok && name.equals("mic_open")) {
+      uint64_t handle = 0;
+      if (out->view().parse_uint(&handle) && rtc_sources_.count() < 16) rtc_sources_.push_back(static_cast<uint32_t>(handle));
+    } else if (name.equals("source_close")) {
+      for (uint64_t i = 0; i < rtc_sources_.count(); ++i)
+        if (rtc_sources_[i] == static_cast<uint32_t>(n1)) {
+          rtc_sources_.remove_at(i);
+          break;
+        }
+    }
+    return ok;
+  }
+  bool mine = false;
+  for (const uint32_t known : rtc_ids_) mine = mine || known == id;   // (a page can only touch its own connections)
+  if (mine && n2 != 0 && (name.equals("setsender") || name.equals("addtrack"))) {   // ... and give them its own microphones
+    bool owned = false;
+    for (const uint32_t known : rtc_sources_) owned = owned || known == static_cast<uint32_t>(n2);
+    if (!owned) {
+      out->assign("InvalidStateError: The track is not this page's");
+      return false;
+    }
+  }
+  IRtcService* rtc = env_.rtc_service();
+  if (!mine || !rtc) {
+    out->assign("InvalidStateError: The connection is gone");
+    return false;
+  }
+  return rtc->op(id, name, a, b, bytes, n1, n2, out);
+}
+
+void Page::rtc_release(uint32_t id) {
+  for (uint64_t i = 0; i < rtc_ids_.count(); ++i)
+    if (rtc_ids_[i] == id) {
+      rtc_ids_.remove_at(i);
+      if (IRtcService* rtc = env_.rtc_service()) rtc->release(id);
       return;
     }
 }

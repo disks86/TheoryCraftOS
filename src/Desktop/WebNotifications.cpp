@@ -23,20 +23,47 @@ namespace desktop {
 
 WebNotifications::WebNotifications(allocators::IAllocator& allocator, gui::ToastCenter& toasts, gui::MessageDialog& dialog, gui::WindowManager& windows,
                                    browser::ServiceWorkerHub& hub)
-    : allocator_(allocator), toasts_(toasts), dialog_(dialog), windows_(windows), hub_(hub), entries_(allocator), questions_(allocator), asking_(allocator) {}
+    : allocator_(allocator), toasts_(toasts), dialog_(dialog), windows_(windows), hub_(hub), entries_(allocator), questions_(allocator), asking_(allocator), mic_allowed_(allocator), mic_blocked_(allocator) {}
+
+namespace {
+
+bool listed(const List<String>& list, StringView text) {
+  for (const String& s : list)
+    if (s.view().equals(text)) return true;
+  return false;
+}
+
+}  // namespace
+
+// Puts a question to the user unless it is open already; -1 (the answer comes later), or 0 if there is no room for it.
+static int enqueue(List<String>& questions, String& asking, allocators::IAllocator& allocator, uint32_t limit, StringView prefix, StringView origin) {
+  String key(allocator);
+  key.assign(prefix);
+  key.append(origin);
+  if (asking.view().equals(key.view()) || listed(questions, key.view())) return -1;
+  return questions.count() >= limit || !questions.push_back(util::move(key)) ? 0 : -1;
+}
 
 int WebNotifications::prompt(StringView origin) {
-  kernel::RecursiveMutex& m = mutex_;
-  m.lock();
-  int answer = -1;
-  bool known = asking_.view().equals(origin);
-  for (const String& q : questions_) known = known || q.view().equals(origin);
-  if (!known) {
-    String copy(allocator_);
-    copy.assign(origin);
-    if (questions_.count() >= kMaxQuestions || !questions_.push_back(util::move(copy))) answer = 0;
-  }
-  m.unlock();
+  mutex_.lock();
+  const int answer = enqueue(questions_, asking_, allocator_, kMaxQuestions, "n:", origin);
+  mutex_.unlock();
+  return answer;
+}
+
+int WebNotifications::microphone_state(StringView origin) const {
+  mutex_.lock();
+  const int state = listed(mic_allowed_, origin) ? 1 : listed(mic_blocked_, origin) ? 0 : -1;
+  mutex_.unlock();
+  return state;
+}
+
+int WebNotifications::ask_microphone(StringView origin) {
+  const int state = microphone_state(origin);
+  if (state >= 0) return state;
+  mutex_.lock();
+  const int answer = enqueue(questions_, asking_, allocator_, kMaxQuestions, "m:", origin);
+  mutex_.unlock();
   return answer;
 }
 
@@ -125,18 +152,36 @@ void WebNotifications::pump() {
   }
   mutex_.unlock();
   if (!next.empty()) {
+    const bool microphone = next.view().starts_with("m:");
     String line(allocator_);
-    line.append(next.view());
-    line.append(" wants to show notifications.");
-    dialog_.set_texts("Notifications", line.view(), "Allow this site to show notifications?", "Allow", "Block");
+    line.append(next.view().substr(2));
+    line.append(microphone ? " wants to use your microphone." : " wants to show notifications.");
+    if (microphone) dialog_.set_texts("Microphone", line.view(), "Allow this site to use the microphone?", "Allow", "Block");
+    else dialog_.set_texts("Notifications", line.view(), "Allow this site to show notifications?", "Allow", "Block");
     if (!dialog_.show(windows_)) {   // (it cannot be asked: the answer is no)
       mutex_.lock();
       asking_.clear();
+      if (microphone) {
+        String copy(allocator_);
+        copy.assign(next.view().substr(2));
+        mic_blocked_.push_back(util::move(copy));
+      }
       mutex_.unlock();
-      hub_.set_notification_permission(next.view(), false);
+      if (!microphone) hub_.set_notification_permission(next.view().substr(2), false);
     }
   }
-  if (have_answer) hub_.set_notification_permission(answered.view(), granted);
+  if (have_answer) {
+    const StringView origin = answered.view().substr(2);
+    if (answered.view().starts_with("m:")) {
+      String copy(allocator_);
+      copy.assign(origin);
+      mutex_.lock();
+      (granted ? mic_allowed_ : mic_blocked_).push_back(util::move(copy));
+      mutex_.unlock();
+    } else {
+      hub_.set_notification_permission(origin, granted);
+    }
+  }
   for (uint32_t i = 0; i < event_count; ++i) {   // (outside the lock: the hub runs the worker's handlers, which may show or close notifications)
     if (events[i].clicked) hub_.notification_activated(events[i].number, events[i].action);
     else hub_.notification_closed(events[i].number);

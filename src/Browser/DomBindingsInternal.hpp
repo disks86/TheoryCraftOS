@@ -150,6 +150,7 @@ HostClass::Set form_set(DomBindings::Impl& c, dom::Node* element, StringView key
 bool is_form_element(const dom::Node* n);
 bool form_lookup_named(DomBindings::Impl& c, dom::Node* n, StringView key, Value* out);
 bool install_crypto(DomBindings::Impl& c);   // the natives under crypto.getRandomValues() and crypto.subtle (DomBindingsCrypto.cpp)
+bool install_rtc(DomBindings::Impl& c);              // RTCPeerConnection's natives (DomBindingsRtc.cpp)
 bool install_service_worker(DomBindings::Impl& c);   // the Cache API and service worker natives (DomBindingsServiceWorker.cpp)
 bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest's natives, byte and text helpers (DomBindingsNet.cpp)
 // Uint8Array objects (DomBindingsMedia.cpp): a new one holding these bytes, and the bytes of one (a view into the array; false for anything else).
