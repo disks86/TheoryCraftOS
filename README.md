@@ -42,6 +42,10 @@ cmake --build build --target run-std # always with the standard VGA card (softwa
 take `QEMU_GPU=gl` (virgl), `virtio` (virtio-gpu, software rendering), `std` (Bochs VGA, software rendering) or the default
 `auto`. Without a 3D engine everything falls back to the software renderers.
 
+The VM has an Intel HD Audio card (`ich9-intel-hda` with an `hda-duplex` codec) played through the host's sound server: PipeWire,
+else PulseAudio, ALSA or SDL. `QEMU_AUDIO=<driver>` in the scripts (`-DQEMU_AUDIO_DRIVER=<driver>` for the cmake targets) picks
+another `-audiodev` driver; `QEMU_AUDIO=wav` records to `audio.wav` in the build directory to check without speakers.
+
 Host tests build with ASan and UBSan and run with `tests/run_host_tests.sh <TestName>`.
 
 ## Debugging in QEMU

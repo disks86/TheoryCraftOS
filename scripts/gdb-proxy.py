@@ -64,6 +64,18 @@ def gpu_arguments():
     sys.exit("unknown QEMU_GPU=%s (auto, std, virtio, gl)" % choice)
 
 
+def audio_arguments(build):
+    """The HD Audio card and its host backend, from QEMU_AUDIO like scripts/qemu-debug.sh: auto (the default: PipeWire, else PulseAudio,
+    ALSA, SDL), any -audiodev driver name, wav (records to audio.wav in the build directory) or none (discards the sound)."""
+    choice = os.environ.get("QEMU_AUDIO", "auto")
+    if choice == "auto":
+        drivers = subprocess.run(["qemu-system-x86_64", "-audiodev", "help"], capture_output=True, text=True).stdout.split()
+        choice = next((d for d in ("pipewire", "pa", "alsa", "sdl") if d in drivers), "none")
+    backend = f"{choice},id=snd0" + (f",path={os.path.join(build, 'audio.wav')}" if choice == "wav" else "")
+    sys.stderr.write(f"[gdb-proxy] QEMU audio backend: {choice}\n")
+    return ["-audiodev", backend, "-device", "ich9-intel-hda", "-device", "hda-duplex,audiodev=snd0"]
+
+
 def start_qemu(build):
     esp = os.path.join(build, "esp", "EFI", "BOOT")
     os.makedirs(esp, exist_ok=True)
@@ -89,7 +101,7 @@ def start_qemu(build):
         "-drive", f"format=raw,file=fat:rw:{os.path.join(build, 'esp')}",
         "-chardev", f"stdio,id=dbg,logfile={log},signal=off",
         "-device", "isa-debugcon,iobase=0x402,chardev=dbg", "-serial", "null",
-    ] + gpu + os.environ.get("QEMU_EXTRA", "").split()
+    ] + gpu + audio_arguments(build) + os.environ.get("QEMU_EXTRA", "").split()
     # QEMU's stdout would corrupt the gdb channel: send it to stderr instead.
     return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=sys.stderr.fileno())
 

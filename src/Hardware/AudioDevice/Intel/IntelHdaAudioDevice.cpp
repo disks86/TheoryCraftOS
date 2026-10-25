@@ -19,6 +19,7 @@
 #include "Hardware/AudioDevice/Intel/IntelHdaAudioDevice.hpp"
 #include "Hardware/Bus/Pci/FirmwareDriverDetach.hpp"
 #include "Kernel/Delay.hpp"
+#include "console.hpp"
 
 namespace hardware {
 
@@ -34,6 +35,9 @@ constexpr uint32_t kRirbLower = 0x50, kRirbUpper = 0x54, kRirbWrite = 0x58, kRir
 constexpr uint32_t kGctlReset = 1u << 0;  // 0 = held in reset
 constexpr uint16_t kPointerReset = 1u << 15;
 constexpr uint8_t kRingDmaRun = 1u << 1;
+// RIRBCTL bit 0: raise the response-interrupt flag (RIRBSTS bit 0) when RINTCNT responses are in. QEMU counts responses until that flag is set and
+// cleared and then stops taking commands, so without it only the first verb is ever answered (the interrupt itself stays off: see INTCTL).
+constexpr uint8_t kRirbResponseInterrupt = 1u << 0;
 
 // Stream descriptor registers (relative to the descriptor).
 constexpr uint32_t kSdControl = 0x00, kSdTag = 0x02, kSdPosition = 0x04, kSdBufferLength = 0x08, kSdLastIndex = 0x0C,
@@ -141,7 +145,7 @@ bool IntelHdaAudioDevice::start_command_rings() {
   write16(kRirbCount, 1);
   write8(kRirbStatus, 0x05);
   write8(kCorbControl, kRingDmaRun);
-  write8(kRirbControl, kRingDmaRun);
+  write8(kRirbControl, kRingDmaRun | kRirbResponseInterrupt);
   return true;
 }
 
@@ -381,8 +385,18 @@ bool IntelHdaAudioDevice::initialize() {
   input_streams_ = input_streams;
   stream_ = 0x80 + 0x20 * input_streams;  // the output descriptors follow the input ones
 
-  if (!reset_controller() || !start_command_rings() || !find_output_path() || !configure_path() || !ring_.allocate(allocator_, kRingBytes) ||
-      !run_stream(stream_, descriptors_, ring_.address(), kStreamTag)) {
+  // Each step names itself on the debug console when it fails: a controller that is silently skipped looks like a machine without sound.
+  const char* failed = nullptr;
+  if (!reset_controller()) failed = "no codec answered after the controller reset";
+  else if (!start_command_rings()) failed = "could not start the command rings";
+  else if (!find_output_path()) failed = "no output pin with a converter behind it";
+  else if (!configure_path()) failed = "the converter cannot play 48 kHz 16-bit";
+  else if (!ring_.allocate(allocator_, kRingBytes)) failed = "could not allocate the playback buffer";
+  else if (!run_stream(stream_, descriptors_, ring_.address(), kStreamTag)) failed = "could not start the output stream";
+  if (failed) {
+    console::debug_puts("hda: ");
+    console::debug_puts(failed);
+    console::debug_puts("\n");
     shutdown();
     return false;
   }
