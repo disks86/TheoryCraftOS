@@ -27,6 +27,7 @@
 #include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/ColorPicker.hpp"
 #include "Gui/Controls/DatePicker.hpp"
+#include "Gui/Controls/HeatMap.hpp"
 #include "Gui/Controls/LevelMeter.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/PieChart.hpp"
@@ -34,6 +35,7 @@
 #include "Gui/Controls/ScrollPanel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/Toggle.hpp"
+#include "Gui/Controls/WordCloud.hpp"
 #include "Gui/Controls/ToastCenter.hpp"
 #include "Gui/Controls/Tooltip.hpp"
 #include "Gui/Date.hpp"
@@ -420,6 +422,185 @@ static void test_bar_chart() {
 
     b.clear_bars();
     CHECK(b.bar_count() == 0 && b.selected_index() == -1);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_heat_map() {
+  TestAllocator a;
+  const Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    HeatMap h(a);
+    h.set_bounds({10, 10, 260, 160});
+    w.add(&h);
+    CHECK(h.row_count() == 0 && h.column_count() == 0 && h.grid_rect().width == 0 && h.value(0, 0) == 0);
+    int32_t r = 0, c = 0;
+    CHECK(!h.cell_at(50, 50, r, c));
+    CHECK(!h.set_dimensions(-1, 3) && !h.set_dimensions(3, HeatMap::kMaxDimension + 1) && !h.set_dimensions(1024, 1024) && h.row_count() == 0);
+    CHECK(h.set_dimensions(3, 4) && h.row_count() == 3 && h.column_count() == 4);
+    h.set_row_label(0, "Mon");
+    h.set_row_label(2, "Wed");
+    h.set_column_label(3, "Q4");
+    h.set_row_label(9, "x");   // ignored
+    CHECK(h.row_label(0) == "Mon" && h.row_label(1) == "" && h.row_label(2) == "Wed" && h.column_label(3) == "Q4" && h.row_label(9) == "");
+    h.set_value(0, 0, 10);
+    h.set_value(1, 1, 55);
+    h.set_value(2, 3, 100);
+    h.set_value(5, 5, 7);      // ignored
+    CHECK(h.value(2, 3) == 100 && h.value(1, 1) == 55 && h.value(5, 5) == 0 && h.value(-1, 0) == 0);
+
+    // The ramp runs from the smallest to the largest value; blue - teal - yellow - red.
+    CHECK(h.range_low() == 0 && h.range_high() == 100);   // the zero cells count
+    CHECK(h.position(0) == 0 && h.position(100) == 1000 && h.position(50) == 500 && h.position(1000) == 1000);
+    CHECK(HeatMap::ramp_color(0) == 0xFF2C4DA8 && HeatMap::ramp_color(1000) == 0xFFD7301F && HeatMap::ramp_color(5000) == 0xFFD7301F);
+    CHECK(HeatMap::ramp_color(333) != HeatMap::ramp_color(334) && HeatMap::ramp_color(500) != HeatMap::ramp_color(0));
+    h.set_range(20, 60);
+    CHECK(h.fixed_range() && h.position(10) == 0 && h.position(40) == 500 && h.position(99) == 1000);
+    h.set_range(60, 20);   // swapped
+    CHECK(h.range_low() == 20 && h.range_high() == 60);
+    h.clear_range();
+    CHECK(!h.fixed_range() && h.range_high() == 100);
+
+    // The cells tile the grid, each pixel is in exactly one of them.
+    const Rect2D g = h.grid_rect();
+    CHECK(g.width > 0 && g.height > 0);
+    int32_t area = 0;
+    for (int32_t i = 0; i < 3; ++i)
+      for (int32_t j = 0; j < 4; ++j) area += static_cast<int32_t>(h.cell_rect(i, j).width * h.cell_rect(i, j).height);
+    CHECK(area == static_cast<int32_t>(g.width * g.height));
+    for (int32_t i = 0; i < 3; ++i) {
+      for (int32_t j = 0; j < 4; ++j) {
+        const Rect2D cell = h.cell_rect(i, j);
+        CHECK(h.cell_at(cell.x, cell.y, r, c) && r == i && c == j);
+        CHECK(h.cell_at(cell.x + static_cast<int32_t>(cell.width) - 1, cell.y + static_cast<int32_t>(cell.height) - 1, r, c) && r == i && c == j);
+      }
+    }
+    CHECK(!h.cell_at(g.x - 1, g.y, r, c) && !h.cell_at(g.x, g.y - 1, r, c) && h.cell_rect(3, 0).width == 0);
+
+    w.render();
+    const Rect2D hot = h.cell_rect(2, 3), cold = h.cell_rect(1, 0);
+    CHECK(screen.px(10 + hot.x + static_cast<int32_t>(hot.width) / 2, 10 + hot.y + static_cast<int32_t>(hot.height) / 2) == HeatMap::ramp_color(1000));
+    CHECK(screen.px(10 + cold.x + static_cast<int32_t>(cold.width) / 2, 10 + cold.y + static_cast<int32_t>(cold.height) / 2) == HeatMap::ramp_color(0));
+
+    // Selection by click and by key; the handler fires only on a change.
+    click(w, 10 + hot.x + 3, 10 + hot.y + 3);
+    CHECK(h.selected_row() == 2 && h.selected_column() == 3);
+    press(w, key::kRight);   // at the edge: stays
+    press(w, key::kDown);
+    CHECK(h.selected_row() == 2 && h.selected_column() == 3);
+    press(w, key::kLeft);
+    press(w, key::kUp);
+    CHECK(h.selected_row() == 1 && h.selected_column() == 2);
+    click(w, 10 + 2, 10 + 2);
+    CHECK(h.selected_row() == -1 && h.selected_column() == -1);
+    press(w, key::kDown);
+    CHECK(h.selected_row() == 0 && h.selected_column() == 0);
+    h.select_cell(9, 9);
+    CHECK(h.selected_row() == -1);
+    h.select_cell(1, 1);
+    w.render();
+    CHECK(screen.px(10 + h.cell_rect(1, 1).x, 10 + h.cell_rect(1, 1).y) == theme.selection);   // outlined
+
+    // Values printed in the cells.
+    h.set_show_values(true);
+    CHECK(h.show_values());
+    w.render();
+
+    // Too small for a pixel per cell: nothing is drawn, nothing crashes.
+    h.set_bounds({10, 10, 12, 12});
+    CHECK(h.grid_rect().width == 0 && !h.cell_at(5, 5, r, c));
+    w.render();
+
+    // Huge values do not overflow.
+    h.set_bounds({10, 10, 260, 160});
+    h.set_value(0, 0, UINT64_MAX);
+    h.set_value(1, 1, UINT64_MAX / 2);
+    CHECK(h.position(UINT64_MAX) == 1000 && near(static_cast<int32_t>(h.position(UINT64_MAX / 2)), 500, 1));
+    w.render();
+
+    CHECK(h.set_dimensions(0, 0) && h.row_count() == 0 && h.selected_row() == -1);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_word_cloud() {
+  TestAllocator a;
+  const Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    WordCloud wc(a);
+    wc.set_bounds({10, 10, 260, 160});
+    w.add(&wc);
+    CHECK(wc.word_count() == 0 && wc.word_at(50, 50) == -1 && wc.word_rect(0).width == 0 && wc.word_scale(0) == 1);
+    CHECK(wc.add_word("big", 100) == 0 && wc.add_word("mid", 50, 0xFF112233) == 1 && wc.add_word("small", 1) == 2 && wc.add_word("tiny", 1) == 3);
+    CHECK(wc.word_color(1) == 0xFF112233 && wc.word_color(0) != 0 && wc.word_text(2) == "small" && wc.word_weight(0) == 100);
+
+    // Sizes follow the weights between 1x and 4x.
+    CHECK(wc.word_scale(0) == WordCloud::kMaxScale && wc.word_scale(1) == 2 && wc.word_scale(2) == 1 && wc.word_scale(3) == 1);
+    wc.set_word_weight(1, 100);
+    CHECK(wc.word_scale(1) == WordCloud::kMaxScale);
+    wc.set_word_weight(1, 50);
+    wc.set_word_weight(9, 5);   // ignored
+    {
+      WordCloud same(a);
+      same.add_word("a", 7);
+      same.add_word("b", 7);
+      CHECK(same.word_scale(0) == 2 && same.word_scale(1) == 2);
+    }
+
+    // Each word has its own place inside the control, sized by its text and scale; no two overlap.
+    for (int32_t i = 0; i < 4; ++i) {
+      const Rect2D r = wc.word_rect(i);
+      CHECK(r.width == static_cast<uint32_t>(8 * wc.word_scale(i)) * wc.word_text(i).size() && r.height == static_cast<uint32_t>(16 * wc.word_scale(i)));
+      CHECK(r.x >= 0 && r.y >= 0 && r.x + static_cast<int32_t>(r.width) <= 260 && r.y + static_cast<int32_t>(r.height) <= 160);
+      for (int32_t j = i + 1; j < 4; ++j) {
+        const Rect2D o = wc.word_rect(j);
+        const bool apart = o.x >= r.x + static_cast<int32_t>(r.width) || r.x >= o.x + static_cast<int32_t>(o.width) ||
+                           o.y >= r.y + static_cast<int32_t>(r.height) || r.y >= o.y + static_cast<int32_t>(o.height);
+        CHECK(apart);
+      }
+      CHECK(wc.word_at(r.x, r.y) == i && wc.word_at(r.x + static_cast<int32_t>(r.width) - 1, r.y + static_cast<int32_t>(r.height) - 1) == i);
+    }
+    CHECK(wc.word_at(0, 0) == -1);
+
+    // A narrow control wraps the words onto more lines; the layout follows the width.
+    const int32_t one_line_y = wc.word_rect(3).y;
+    wc.set_bounds({10, 10, 120, 160});
+    CHECK(wc.word_rect(3).y > one_line_y || wc.word_rect(0).y != wc.word_rect(3).y);
+    CHECK(wc.word_rect(3).y > wc.word_rect(0).y);
+    wc.set_bounds({10, 10, 260, 160});
+    CHECK(wc.word_rect(3).y == one_line_y);
+
+    w.render();
+    // Selection by click and by key; drawn with the selection colour behind the word.
+    const Rect2D r1 = wc.word_rect(1);
+    click(w, 10 + r1.x + 2, 10 + r1.y + 2);
+    CHECK(wc.selected_index() == 1);
+    w.render();
+    CHECK(screen.px(10 + r1.x - 1, 10 + r1.y + 1) == theme.selection);
+    click(w, 10 + 1, 10 + 1);
+    CHECK(wc.selected_index() == -1);
+    press(w, key::kRight);
+    CHECK(wc.selected_index() == 0);
+    press(w, key::kLeft);
+    CHECK(wc.selected_index() == 3);
+    wc.set_selected_index(9);
+    CHECK(wc.selected_index() == -1);
+
+    // Words wider than the control, huge weights, and a lot of words: clipped, no overflow.
+    wc.add_word("a-word-far-too-long-to-fit-in-a-control-two-hundred-sixty-pixels-wide", UINT64_MAX);
+    wc.set_word_weight(0, UINT64_MAX / 2);
+    CHECK(wc.word_scale(4) == WordCloud::kMaxScale && wc.word_scale(0) >= 1 && wc.word_scale(0) <= WordCloud::kMaxScale);
+    for (int32_t i = 0; i < 200; ++i) wc.add_word("w", static_cast<uint64_t>(i));
+    w.render();
+
+    wc.clear_words();
+    CHECK(wc.word_count() == 0 && wc.selected_index() == -1 && wc.word_at(30, 30) == -1);
     w.render();
   }
   CHECK(a.live == 0);
@@ -979,6 +1160,8 @@ int main() {
   test_level_meter();
   test_pie_chart();
   test_bar_chart();
+  test_heat_map();
+  test_word_cloud();
   test_tooltip();
   test_toast_center();
   test_scroll_panel();

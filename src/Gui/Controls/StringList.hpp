@@ -43,6 +43,11 @@ class StringList {
     }
     return static_cast<int32_t>(items_.count() - 1);
   }
+  // Replaces the text at `index`; false if the index is out of range or memory ran out (the old text is kept then).
+  bool set(int32_t index, StringView text) {
+    if (index < 0 || static_cast<uint64_t>(index) >= items_.count()) return false;
+    return items_[static_cast<uint64_t>(index)]->assign(text);
+  }
   void clear() {
     for (uint64_t i = 0; i < items_.count(); ++i) {
       items_[i]->~String();
