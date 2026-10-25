@@ -32,12 +32,14 @@ namespace filesystem {
 // lookup), file data through the direct, indirect and double indirect block runs. Symbolic links are shown as small files that hold the
 // link target (they are not followed). Attributes, indices and the journal are ignored.
 //
-// Writing: the data of existing regular files can be changed, grown and cut (open_file() with ReadWrite, write(), resize()); blocks come
-// from the allocation bitmap. Creating, removing and renaming are not there yet (Unsupported on a writable volume). Metadata changes
-// are collected in a transaction (a set of changed blocks) and written when the operation is done, or dropped if it failed; there is
-// no journal, so a crash in the middle of the final write can leave the volume needing a check. A volume is mounted writable only if
-// its device is, it was shut down cleanly (flag clean, journal empty) and its bitmap is laid out as expected; any other volume is
-// read only (every write returns ReadOnly). Time stamps are not kept up to date (no clock here).
+// Writing: files and directories can be created, written, grown, cut, renamed and removed; blocks come from the allocation bitmap and
+// names go into the directories' B+trees. Metadata changes are collected in a transaction (a set of changed blocks) and written when
+// the operation is done, or dropped if it failed; there is no journal, so a crash in the middle of the final write can leave the volume
+// needing a check. Removing a file first cuts it to nothing in steps, so a failure then leaves a shorter file, never lost blocks. A
+// volume is mounted writable only if its device is, it was shut down cleanly (flag clean, journal empty), its inodes are one block
+// each and its bitmap is laid out as expected; any other volume is read only (every write returns ReadOnly). What is not kept up to
+// date: time stamps (no clock here), attributes and the indices (name, size, last modified), so queries in Haiku will not find new
+// files until it reindexes.
 //
 // The volume starts at block `first_block` of the device and mounting reads and validates its super block (at byte 512 of the volume).
 // The device must outlive the filesystem.
@@ -67,6 +69,7 @@ class BefsFileSystem final : public IFileSystem {
  private:
   class File;
   class Directory;
+  class NodeEdit;
 
   // A run of consecutive blocks: allocation group, first block within the group, length in blocks.
   struct Run {
@@ -81,6 +84,7 @@ class BefsFileSystem final : public IFileSystem {
     Run direct[12];
     Run indirect, double_indirect;
     uint64_t max_direct = 0, max_indirect = 0, max_double = 0;  // bytes mapped, each counted from the start of the file
+    uint64_t parent = 0;                                        // block of the directory that holds it (0 if unknown)
     uint8_t link[144] = {};  // a short symbolic link's target, stored in the inode itself
     uint32_t link_size = 0;
     bool inline_link = false;
@@ -99,6 +103,21 @@ class BefsFileSystem final : public IFileSystem {
     uint64_t right = 0, overflow = 0;
     uint32_t count = 0, keys_size = 0, ends_at = 0, values_at = 0;
     bool leaf() const { return overflow == ~uint64_t{0}; }
+  };
+  // A directory tree's header, as the code that changes the tree works with it.
+  struct TreeCtx {
+    uint32_t node_size = 0, levels = 0;
+    uint64_t root = 0, free_node = 0, max_size = 0;
+  };
+  // One step of the way down a tree: the node and which of its entries was followed (count: the overflow child).
+  struct PathStep {
+    uint64_t offset = 0;
+    uint32_t index = 0;
+  };
+  // Registered by every open file and directory: what is open cannot be removed.
+  struct OpenHandle {
+    uint64_t block = 0;
+    OpenHandle* next = nullptr;
   };
   // State of one search through a file's block runs (see locate()).
   struct Seek {
@@ -139,7 +158,7 @@ class BefsFileSystem final : public IFileSystem {
   Status tx_write(uint64_t offset, ConstByteView data);
   Status tx_commit();
   void tx_rollback();
-  bool tx_full() const { return tx_count_ >= tx_soft_limit(); }
+  bool tx_full() const { return !atomic_ && tx_count_ >= tx_soft_limit(); }
   static uint32_t tx_soft_limit();
   Status tx_zero(uint64_t block, uint32_t count);
   Status checkpoint(const Inode& inode);  // commits a consistent state and starts a new transaction
@@ -179,7 +198,32 @@ class BefsFileSystem final : public IFileSystem {
   Status read_node(const Inode& directory, const Tree& tree, uint64_t at, ByteView buffer, Node* node);
   static bool node_key(const Node& node, uint32_t index, ConstByteView* key);
   static bool node_value(const Node& node, uint32_t index, uint64_t* value);
+  Status descend_to(const Inode& directory, const Tree& tree, StringView name, ByteView buffer, Node* leaf);
   Status find(const Inode& directory, StringView name, uint64_t* inode_block);
+  Status directory_empty(const Inode& directory, bool* empty);
+  Status seek_after(const Inode& directory, const Tree& tree, StringView name, ByteView buffer, Node* leaf, uint32_t* index);
+
+  // Changing directory trees (all inside a transaction; the caller stores the directory's inode afterwards).
+  Status tree_load(const Inode& directory, TreeCtx* ctx);
+  Status tree_save(const Inode& directory, const TreeCtx& ctx);
+  Status tx_write_stream(const Inode& inode, uint64_t offset, ConstByteView data);
+  Status edit_read(const Inode& directory, ByteView buffer, uint64_t at, NodeEdit* node);
+  Status edit_write(const Inode& directory, ByteView buffer, uint64_t at, const NodeEdit& node);
+  Status tree_alloc_node(Inode* directory, TreeCtx* ctx, uint64_t* offset);
+  Status tree_free_node(const Inode& directory, TreeCtx* ctx, uint64_t offset);
+  Status tree_unlink(const Inode& directory, uint64_t left, uint64_t right);
+  Status tree_insert(Inode* directory, StringView name, uint64_t inode_block);
+  Status tree_remove(Inode* directory, StringView name);
+  Status init_tree(Inode* directory);
+
+  // Namespace.
+  Status create_node(StringView path, bool directory, uint64_t* inode_block);
+  Status create_body(Inode* parent, StringView leaf, bool directory, uint64_t* inode_block);
+  Status remove_body(Inode* parent, StringView leaf, uint64_t inode_block);
+  Status rename_body(Inode* from_parent, StringView from_leaf, Inode* to_parent, StringView to_leaf, const Inode& node);
+  Status split_path(StringView path, Inode* parent, StringView* leaf);
+  bool is_open(uint64_t block) const;
+  bool block_to_run(uint64_t block, Run* run) const;
   Status resolve(StringView path, Inode* inode, StringView* leaf);
   static void fill_entry(const Inode& inode, StringView name, DirectoryEntry* entry);
 
@@ -200,7 +244,11 @@ class BefsFileSystem final : public IFileSystem {
   uint32_t tx_count_ = 0;
   uint64_t tx_used_blocks_ = 0;  // used_blocks_ when the transaction began
   bool writable_ = false;
+  bool atomic_ = false;     // an operation that must reach the medium as one transaction: no commits on the way
   uint32_t bitmap_per_group_ = 0;
+  uint32_t inode_size_ = 0;
+  OpenHandle* open_ = nullptr;
+  uint64_t tree_epoch_ = 0;  // counts changes to directory trees, so that open directories know to look again
 
   uint32_t block_size_ = 0, block_shift_ = 0;
   uint64_t block_count_ = 0, used_blocks_ = 0;

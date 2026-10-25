@@ -30,6 +30,7 @@ constexpr uint32_t kByteOrderLittle = 0x42494745, kByteOrderBig = 0x45474942;
 constexpr uint32_t kInodeMagic = 0x3bbe0ad9, kTreeMagic = 0x69f6c2e8;
 constexpr uint32_t kInodeInUse = 0x1, kLongSymlink = 0x40;
 constexpr uint32_t kVolumeClean = 0x434c454e;
+constexpr uint32_t kInodeDeleted = 0x10;
 constexpr uint32_t kTxHard = 192;           // most blocks one transaction holds
 constexpr uint32_t kTxSoft = 96;            // a long operation commits what it has when it holds this many
 constexpr uint32_t kArrayBlocks = 4;        // length of the arrays of block runs we create (as Be's file system does)
@@ -40,7 +41,9 @@ constexpr uint32_t kSuperSize = 132, kInodeBytes = 232, kInlineLink = 144, kTree
 constexpr uint32_t kMinNodeSize = 64, kMaxNodeSize = 1u << 16;
 constexpr uint32_t kSeekBudget = 1u << 18;  // array blocks read for one lookup of a file block: stops loops in damaged run tables
 constexpr uint32_t kMaxDepth = 64;          // B+tree levels followed before the tree is taken for a loop
-constexpr uint64_t kNone = ~uint64_t{0};
+constexpr uint64_t kNone = ~uint64_t{0};       // BPLUSTREE_NULL (-1)
+constexpr uint64_t kFreeNode = ~uint64_t{1};   // BPLUSTREE_FREE (-2): marks a node on the free list
+constexpr uint32_t kMaxWriteNodeSize = 1u << 15;  // the key length fields are 16 bits
 
 // Memory that is given back at the end of the scope.
 class Owned {
@@ -90,7 +93,21 @@ Status read_run(ByteReader* in, uint32_t* group, uint16_t* start, uint16_t* leng
 // made through another handle) stay consistent.
 class BefsFileSystem::File final : public IFile {
  public:
-  File(BefsFileSystem& fs, uint64_t inode_block, bool writable) : fs_(fs), inode_block_(inode_block), writable_(writable) {}
+  File(BefsFileSystem& fs, uint64_t inode_block, bool writable) : fs_(fs), inode_block_(inode_block), writable_(writable) {
+    kernel::ScopedRecursiveMutex lock(fs_.mutex_);
+    handle_.block = inode_block;
+    handle_.next = fs_.open_;
+    fs_.open_ = &handle_;
+  }
+  ~File() {
+    kernel::ScopedRecursiveMutex lock(fs_.mutex_);
+    for (OpenHandle** link = &fs_.open_; *link; link = &(*link)->next) {
+      if (*link == &handle_) {
+        *link = handle_.next;
+        break;
+      }
+    }
+  }
 
   uint64_t size() const override {
     kernel::ScopedRecursiveMutex lock(fs_.mutex_);
@@ -188,25 +205,45 @@ class BefsFileSystem::File final : public IFile {
   BefsFileSystem& fs_;
   const uint64_t inode_block_;
   const bool writable_;
+  OpenHandle handle_;
 };
 
-// An open directory: walks the leaves of its B+tree from the left.
+// An open directory: walks the leaves of its B+tree from the left. If the tree is changed meanwhile it looks again, starting after the
+// last name it gave out (entries may then be skipped or repeated, as IDirectory says).
 class BefsFileSystem::Directory final : public IDirectory {
  public:
   Directory(BefsFileSystem& fs, const Inode& inode, const Tree& tree, ByteView buffer)
-      : fs_(fs), inode_(inode), tree_(tree), buffer_(buffer) {}
-  ~Directory() { release_view(fs_.allocator_, buffer_); }
+      : fs_(fs), inode_(inode), tree_(tree), buffer_(buffer) {
+    handle_.block = inode.block;
+    handle_.next = fs_.open_;
+    fs_.open_ = &handle_;  // (the caller holds the lock)
+  }
+  ~Directory() {
+    kernel::ScopedRecursiveMutex lock(fs_.mutex_);
+    for (OpenHandle** link = &fs_.open_; *link; link = &(*link)->next) {
+      if (*link == &handle_) {
+        *link = handle_.next;
+        break;
+      }
+    }
+    release_view(fs_.allocator_, buffer_);
+  }
 
   Status next(DirectoryEntry* entry) override {
     kernel::ScopedRecursiveMutex lock(fs_.mutex_);
     if (ended_) return Status::EndOfDirectory;
+    if (loaded_ && epoch_ != fs_.tree_epoch_) {
+      const Status s = refresh();
+      if (s != Status::Ok) return s;
+    }
     if (!loaded_) {
-      Status s = descend();
+      epoch_ = fs_.tree_epoch_;
+      const Status s = descend();
       if (s != Status::Ok) return s;
       loaded_ = true;
     }
-    const uint64_t max_nodes = inode_.size / tree_.node_size + 1;
     for (;;) {
+      const uint64_t max_nodes = inode_.size / tree_.node_size + 1;
       while (index_ < node_.count) {
         ConstByteView key;
         uint64_t inode_block = 0;
@@ -219,6 +256,7 @@ class BefsFileSystem::Directory final : public IDirectory {
         const Status s = fs_.read_inode(inode_block, &child);
         if (s != Status::Ok) return s;
         fill_entry(child, name.view(), entry);
+        last_ = name;
         return Status::Ok;
       }
       if (node_.right == kNone || ++hops_ > max_nodes) {
@@ -236,6 +274,7 @@ class BefsFileSystem::Directory final : public IDirectory {
     loaded_ = ended_ = false;
     index_ = 0;
     hops_ = 0;
+    last_.clear();
   }
 
  private:
@@ -258,15 +297,150 @@ class BefsFileSystem::Directory final : public IDirectory {
     }
     return Status::Corrupt;
   }
+  // The tree changed: read the directory's inode and tree again and go on after the last name given out.
+  Status refresh() {
+    Status s = fs_.read_inode(inode_.block, &inode_);
+    if (s != Status::Ok) return s;
+    if (!inode_.is_directory()) return Status::Corrupt;
+    Tree tree;
+    s = fs_.open_tree(inode_, &tree);
+    if (s != Status::Ok) return s;
+    if (tree.node_size != tree_.node_size) return Status::Corrupt;
+    tree_ = tree;
+    epoch_ = fs_.tree_epoch_;
+    hops_ = 0;
+    if (last_.empty()) {
+      loaded_ = false;
+      return Status::Ok;
+    }
+    return fs_.seek_after(inode_, tree_, last_.view(), buffer_, &node_, &index_);
+  }
 
   BefsFileSystem& fs_;
-  const Inode inode_;
-  const Tree tree_;
+  Inode inode_;
+  Tree tree_;
   ByteView buffer_;
   Node node_;
+  OpenHandle handle_;
+  FixedString<kMaxNameLength + 1> last_;
   uint32_t index_ = 0;
-  uint64_t hops_ = 0;
+  uint64_t hops_ = 0, epoch_ = 0;
   bool loaded_ = false, ended_ = false;
+};
+
+// A node of a directory tree taken apart for changing: its keys, their values and the links. Whole nodes are read into it and written
+// out from it, so inserting and removing are plain array operations; fits() says whether it can be written back.
+class BefsFileSystem::NodeEdit {
+ public:
+  NodeEdit(allocators::IAllocator& allocator, uint32_t node_size)
+      : allocator_(allocator),
+        node_size_(node_size),
+        capacity_(node_size / 10 + 2),
+        keys_(allocate_view<uint8_t>(allocator, uint64_t{node_size} + 256)),
+        ends_(allocate_view<uint32_t>(allocator, node_size / 10 + 2)),
+        values_(allocate_view<uint64_t>(allocator, node_size / 10 + 2)) {}
+  ~NodeEdit() {
+    release_view(allocator_, keys_);
+    release_view(allocator_, ends_);
+    release_view(allocator_, values_);
+  }
+  NodeEdit(const NodeEdit&) = delete;
+  NodeEdit& operator=(const NodeEdit&) = delete;
+
+  bool ok() const { return !keys_.empty() && !ends_.empty() && !values_.empty(); }
+  uint32_t count() const { return count_; }
+  bool leaf() const { return overflow == kNone; }
+  void reset_leaf() {
+    left = right = overflow = kNone;
+    count_ = keys_size_ = 0;
+  }
+  ConstByteView key(uint32_t i) const { return ConstByteView(keys_).subview(i ? ends_[i - 1] : 0, ends_[i] - (i ? ends_[i - 1] : 0)); }
+  uint64_t value(uint32_t i) const { return values_[i]; }
+  void set_value(uint32_t i, uint64_t v) { values_[i] = v; }
+  uint32_t entry_bytes(uint32_t i) const { return static_cast<uint32_t>(key(i).size()) + 10; }
+  uint64_t total_bytes() const { return uint64_t{keys_size_} + uint64_t{count_} * 10; }
+  bool fits() const { return ((uint64_t{kNodeHeaderSize} + keys_size_ + 7) & ~uint64_t{7}) + uint64_t{count_} * 10 <= node_size_; }
+
+  Status load(ConstByteView node) {
+    uint64_t c = 0, k = 0;
+    if (!field(node, 0, 8, &left) || !field(node, 8, 8, &right) || !field(node, 16, 8, &overflow) || !field(node, 24, 2, &c) ||
+        !field(node, 26, 2, &k))
+      return Status::Corrupt;
+    const uint64_t ends_at = (uint64_t{kNodeHeaderSize} + k + 7) & ~uint64_t{7};
+    const uint64_t values_at = ends_at + c * 2;
+    if (c > capacity_ || k > keys_.size() || values_at + c * 8 > node.size()) return Status::Corrupt;
+    uint64_t previous = 0;
+    for (uint32_t i = 0; i < c; ++i) {
+      uint64_t end = 0, v = 0;
+      if (!field(node, ends_at + uint64_t{i} * 2, 2, &end) || !field(node, values_at + uint64_t{i} * 8, 8, &v)) return Status::Corrupt;
+      if (end < previous || end > k) return Status::Corrupt;
+      ends_[i] = static_cast<uint32_t>(end);
+      values_[i] = v;
+      previous = end;
+    }
+    ConstByteView keys;
+    if (!node.try_subview(kNodeHeaderSize, k, &keys)) return Status::Corrupt;
+    if (k) keys_.first(k).copy_from(keys);
+    count_ = static_cast<uint32_t>(c);
+    keys_size_ = static_cast<uint32_t>(k);
+    return Status::Ok;
+  }
+  bool insert(uint32_t i, ConstByteView name, uint64_t v) {
+    const uint32_t length = static_cast<uint32_t>(name.size());
+    if (i > count_ || count_ >= capacity_ || keys_size_ + uint64_t{length} > keys_.size()) return false;
+    const uint32_t start = i ? ends_[i - 1] : 0;
+    for (uint32_t b = keys_size_; b > start; --b) keys_[b - 1 + length] = keys_[b - 1];
+    for (uint32_t b = 0; b < length; ++b) keys_[start + b] = name[b];
+    for (uint32_t j = count_; j > i; --j) {
+      ends_[j] = ends_[j - 1] + length;
+      values_[j] = values_[j - 1];
+    }
+    ends_[i] = start + length;
+    values_[i] = v;
+    ++count_;
+    keys_size_ += length;
+    return true;
+  }
+  void remove(uint32_t i) {
+    const uint32_t start = i ? ends_[i - 1] : 0, length = ends_[i] - start;
+    for (uint32_t b = start; b + length < keys_size_; ++b) keys_[b] = keys_[b + length];
+    for (uint32_t j = i; j + 1 < count_; ++j) {
+      ends_[j] = ends_[j + 1] - length;
+      values_[j] = values_[j + 1];
+    }
+    --count_;
+    keys_size_ -= length;
+  }
+  void truncate(uint32_t n) {
+    if (n >= count_) return;
+    keys_size_ = n ? ends_[n - 1] : 0;
+    count_ = n;
+  }
+  Status store(ByteView out) const {
+    if (out.size() != node_size_ || !fits()) return Status::Corrupt;
+    out.fill(0);
+    ByteWriter w{out};
+    w.le64(left);
+    w.le64(right);
+    w.le64(overflow);
+    w.le16(static_cast<uint16_t>(count_));
+    w.le16(static_cast<uint16_t>(keys_size_));
+    if (keys_size_) w.bytes(ConstByteView(keys_).first(keys_size_));
+    w.zeros(((uint64_t{kNodeHeaderSize} + keys_size_ + 7) & ~uint64_t{7}) - (uint64_t{kNodeHeaderSize} + keys_size_));
+    for (uint32_t i = 0; i < count_; ++i) w.le16(static_cast<uint16_t>(ends_[i]));
+    for (uint32_t i = 0; i < count_; ++i) w.le64(values_[i]);
+    return w.ok() ? Status::Ok : Status::Corrupt;
+  }
+
+  uint64_t left = kNone, right = kNone, overflow = kNone;
+
+ private:
+  allocators::IAllocator& allocator_;
+  const uint32_t node_size_, capacity_;
+  ByteView keys_;
+  ArrayView<uint32_t> ends_;
+  ArrayView<uint64_t> values_;
+  uint32_t count_ = 0, keys_size_ = 0;
 };
 
 Status BefsFileSystem::mount(allocators::IAllocator& allocator, hardware::IStorageDevice& device, uint64_t first_block,
@@ -330,6 +504,7 @@ Status BefsFileSystem::init() {
   if (block_size_ < 1024 || block_size_ > 8192 || block_shift_ > 13 || (1u << block_shift_) != block_size_) return Status::Corrupt;
   if (block_count_ == 0 || block_count_ > (uint64_t{1} << 50) || used_blocks_ > block_count_) return Status::Corrupt;
   if (inode_size < kInodeBytes || inode_size > (1u << 16)) return Status::Corrupt;
+  inode_size_ = inode_size;
   if (group_shift_ > 40 || group_count_ == 0 || group_count_ > (1u << 20)) return Status::Corrupt;
   if (!run_to_block(root_run_, &root_block_)) return Status::Corrupt;
 
@@ -348,7 +523,7 @@ Status BefsFileSystem::init() {
   if (!root.is_directory()) return Status::Corrupt;
 
   // Writable only for a clean volume (nothing in the journal to replay) on a device that can be written, with a bitmap we understand.
-  if (!storage.read_only && volume_flags == kVolumeClean && log_start == log_end && group_shift_ <= 16) {
+  if (!storage.read_only && volume_flags == kVolumeClean && log_start == log_end && group_shift_ <= 16 && inode_size == block_size_) {
     bitmap_per_group_ = static_cast<uint32_t>((((uint64_t{1} << group_shift_) + (uint64_t{block_size_} << 3) - 1)) / (uint64_t{block_size_} << 3));
     if (bitmap_per_group == bitmap_per_group_) {
       bitmap_ = allocate_view<uint8_t>(allocator_, block_size_);
@@ -472,6 +647,12 @@ Status BefsFileSystem::read_inode(uint64_t block, Inode* inode) {
   result.mode = in.le32();
   result.flags = in.le32();
   if (!in.ok() || !(result.flags & kInodeInUse)) return Status::Corrupt;
+  in.seek(44);
+  uint32_t parent_group = 0;
+  uint16_t parent_start = 0, parent_length = 0;
+  read_run(&in, &parent_group, &parent_start, &parent_length);
+  uint64_t parent_block = 0;
+  if (run_to_block(Run{parent_group, parent_start, parent_length}, &parent_block)) result.parent = parent_block;
   in.seek(72);  // the data stream, or a short link
   if ((result.mode & kTypeMask) == kTypeLink && !(result.flags & kLongSymlink)) {
     ConstByteView text = in.take(kInlineLink);
@@ -638,29 +819,18 @@ bool BefsFileSystem::node_value(const Node& node, uint32_t index, uint64_t* valu
   return index < node.count && field(node.data, node.values_at + uint64_t{index} * 8, 8, value);
 }
 
-// The inode block of entry `name` in `directory`.
-Status BefsFileSystem::find(const Inode& directory, StringView name, uint64_t* inode_block) {
-  Tree tree;
-  Status s = open_tree(directory, &tree);
-  if (s != Status::Ok) return s;
-  Owned buffer(allocator_, tree.node_size);
-  if (!buffer.ok()) return Status::OutOfMemory;
+// Walks down the tree to the leaf where `name` is or would be. The leaf is left in `buffer`.
+Status BefsFileSystem::descend_to(const Inode& directory, const Tree& tree, StringView name, ByteView buffer, Node* leaf) {
   uint64_t at = tree.root;
   for (uint32_t depth = 0; depth < kMaxDepth; ++depth) {
     Node node;
-    s = read_node(directory, tree, at, buffer.view(), &node);
+    const Status s = read_node(directory, tree, at, buffer, &node);
     if (s != Status::Ok) return s;
     if (node.leaf()) {
-      for (uint32_t i = 0; i < node.count; ++i) {
-        ConstByteView key;
-        if (!node_key(node, i, &key)) return Status::Corrupt;
-        const int order = compare_names(key, name);
-        if (order == 0) return node_value(node, i, inode_block) ? Status::Ok : Status::Corrupt;
-        if (order > 0) break;
-      }
-      return Status::NotFound;
+      *leaf = node;
+      return Status::Ok;
     }
-    // Each key of an inner node is the largest of its child; names above all of them are in the overflow child.
+    // Each key of an inner node is at least the largest of its child; names above all of them are in the overflow child.
     uint64_t child = node.overflow;
     for (uint32_t i = 0; i < node.count; ++i) {
       ConstByteView key;
@@ -671,6 +841,81 @@ Status BefsFileSystem::find(const Inode& directory, StringView name, uint64_t* i
       }
     }
     at = child;
+  }
+  return Status::Corrupt;
+}
+
+// The inode block of entry `name` in `directory`.
+Status BefsFileSystem::find(const Inode& directory, StringView name, uint64_t* inode_block) {
+  Tree tree;
+  Status s = open_tree(directory, &tree);
+  if (s != Status::Ok) return s;
+  Owned buffer(allocator_, tree.node_size);
+  if (!buffer.ok()) return Status::OutOfMemory;
+  Node node;
+  s = descend_to(directory, tree, name, buffer.view(), &node);
+  if (s != Status::Ok) return s;
+  for (uint32_t i = 0; i < node.count; ++i) {
+    ConstByteView key;
+    if (!node_key(node, i, &key)) return Status::Corrupt;
+    const int order = compare_names(key, name);
+    if (order == 0) return node_value(node, i, inode_block) ? Status::Ok : Status::Corrupt;
+    if (order > 0) break;
+  }
+  return Status::NotFound;
+}
+
+// Leaves `leaf` (in `buffer`) at the entry after `name`: *index is the first entry that sorts after it.
+Status BefsFileSystem::seek_after(const Inode& directory, const Tree& tree, StringView name, ByteView buffer, Node* leaf, uint32_t* index) {
+  const Status s = descend_to(directory, tree, name, buffer, leaf);
+  if (s != Status::Ok) return s;
+  uint32_t i = 0;
+  for (; i < leaf->count; ++i) {
+    ConstByteView key;
+    if (!node_key(*leaf, i, &key)) return Status::Corrupt;
+    if (compare_names(key, name) > 0) break;
+  }
+  *index = i;
+  return Status::Ok;
+}
+
+Status BefsFileSystem::directory_empty(const Inode& directory, bool* empty) {
+  Tree tree;
+  Status s = open_tree(directory, &tree);
+  if (s != Status::Ok) return s;
+  Owned buffer(allocator_, tree.node_size);
+  if (!buffer.ok()) return Status::OutOfMemory;
+  Node node;
+  uint64_t at = tree.root;
+  bool at_leaf = false;
+  for (uint32_t depth = 0; depth < kMaxDepth && !at_leaf; ++depth) {
+    s = read_node(directory, tree, at, buffer.view(), &node);
+    if (s != Status::Ok) return s;
+    if (node.leaf()) {
+      at_leaf = true;
+    } else if (node.count == 0) {
+      at = node.overflow;
+    } else if (!node_value(node, 0, &at)) {
+      return Status::Corrupt;
+    }
+  }
+  if (!at_leaf) return Status::Corrupt;
+  const uint64_t max_nodes = directory.size / tree.node_size + 1;
+  for (uint64_t hops = 0; hops <= max_nodes; ++hops) {
+    for (uint32_t i = 0; i < node.count; ++i) {
+      ConstByteView key;
+      if (!node_key(node, i, &key)) return Status::Corrupt;
+      if (!is_dot_or_dotdot(key)) {
+        *empty = false;
+        return Status::Ok;
+      }
+    }
+    if (node.right == kNone) {
+      *empty = true;
+      return Status::Ok;
+    }
+    s = read_node(directory, tree, node.right, buffer.view(), &node);
+    if (s != Status::Ok) return s;
   }
   return Status::Corrupt;
 }
@@ -705,8 +950,17 @@ Status BefsFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<I
   kernel::ScopedRecursiveMutex lock(mutex_);
   Inode inode;
   StringView leaf;
-  const Status s = resolve(path, &inode, &leaf);
-  if (s != Status::Ok) return s == Status::NotFound && mode != OpenMode::Read ? (writable_ ? Status::Unsupported : Status::ReadOnly) : s;
+  Status s = resolve(path, &inode, &leaf);
+  bool created = false;
+  if (s == Status::NotFound && mode != OpenMode::Read) {
+    if (!writable_) return Status::ReadOnly;
+    if (mode == OpenMode::ReadWrite) return Status::NotFound;
+    uint64_t block = 0;
+    s = create_node(path, false, &block);
+    if (s == Status::Ok) s = read_inode(block, &inode);
+    created = true;
+  }
+  if (s != Status::Ok) return s;
   if (inode.is_directory()) return Status::IsADirectory;
   if (!inode.is_file()) return Status::Unsupported;
   if (mode != OpenMode::Read) {
@@ -714,11 +968,11 @@ Status BefsFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<I
     if (!inode.is_regular()) return Status::Unsupported;
   }
   UniquePointer<IFile> opened = UniquePointer<IFile>::make_as<File>(allocator_, *this, inode.block, mode != OpenMode::Read);
-  if (opened && mode == OpenMode::CreateTruncate) {
-    const Status s = opened->resize(0);
+  if (!opened) return Status::OutOfMemory;
+  if (mode == OpenMode::CreateTruncate && !created) {
+    s = opened->resize(0);
     if (s != Status::Ok) return s;
   }
-  if (!opened) return Status::OutOfMemory;
   *file = util::move(opened);
   return Status::Ok;
 }
@@ -1378,9 +1632,558 @@ Status BefsFileSystem::zero_stream(const Inode& inode, uint64_t from, uint64_t t
   return Status::Ok;
 }
 
-Status BefsFileSystem::create_directory(StringView) { return writable_ ? Status::Unsupported : Status::ReadOnly; }
-Status BefsFileSystem::remove(StringView) { return writable_ ? Status::Unsupported : Status::ReadOnly; }
-Status BefsFileSystem::rename(StringView, StringView) { return writable_ ? Status::Unsupported : Status::ReadOnly; }
+
+// ---- Changing directory trees --------------------------------------------------------------------------------------------------------
+// A directory's stream holds a B+tree: a header node, then nodes of node_size bytes (named by their offset in the stream). Leaves hold
+// name -> inode block, inner nodes hold name -> child with the child's largest name, and the overflow link is the last child. Nodes of
+// one level are linked left to right. Freed nodes hang on a list from the header, chained through left_link and marked in overflow_link.
+
+Status BefsFileSystem::tree_load(const Inode& directory, TreeCtx* ctx) {
+  uint8_t raw[kTreeHeaderSize];
+  if (directory.size < kTreeHeaderSize) return Status::Corrupt;
+  const Status s = read_stream(directory, 0, ByteView(raw));
+  if (s != Status::Ok) return s;
+  ByteReader in{ConstByteView(raw)};
+  if (in.le32() != kTreeMagic) return Status::Corrupt;
+  TreeCtx result;
+  result.node_size = in.le32();
+  result.levels = in.le32();
+  in.skip(4);  // data type
+  result.root = in.le64();
+  result.free_node = in.le64();
+  result.max_size = in.le64();
+  if (!in.ok() || result.node_size < kMinNodeSize || result.node_size % 8 != 0 || result.max_size > directory.size) return Status::Corrupt;
+  if (result.node_size > kMaxWriteNodeSize) return Status::Unsupported;
+  *ctx = result;
+  return Status::Ok;
+}
+
+Status BefsFileSystem::tree_save(const Inode& directory, const TreeCtx& ctx) {
+  uint8_t levels[4], rest[24];
+  ByteWriter a{ByteView(levels)}, b{ByteView(rest)};
+  a.le32(ctx.levels);
+  b.le64(ctx.root);
+  b.le64(ctx.free_node);
+  b.le64(ctx.max_size);
+  Status s = tx_write_stream(directory, 8, ConstByteView(levels));
+  if (s == Status::Ok) s = tx_write_stream(directory, 16, ConstByteView(rest));
+  return s;
+}
+
+// Writes into the stream through the transaction.
+Status BefsFileSystem::tx_write_stream(const Inode& inode, uint64_t offset, ConstByteView data) {
+  if (offset > inode.size || data.size() > inode.size - offset) return Status::Corrupt;
+  uint64_t done = 0;
+  while (done < data.size()) {
+    const uint64_t at = offset + done;
+    uint64_t block = 0, left = 0;
+    Status s = locate(inode, at >> block_shift_, &block, &left);
+    if (s != Status::Ok) return s;
+    const uint64_t within = at & (block_size_ - 1);
+    uint64_t chunk = (left << block_shift_) - within;
+    if (chunk > data.size() - done) chunk = data.size() - done;
+    s = tx_write((block << block_shift_) + within, data.subview(done, chunk));
+    if (s != Status::Ok) return s;
+    done += chunk;
+  }
+  return Status::Ok;
+}
+
+Status BefsFileSystem::edit_read(const Inode& directory, ByteView buffer, uint64_t at, NodeEdit* node) {
+  const Status s = read_stream(directory, at, buffer);
+  return s == Status::Ok ? node->load(ConstByteView(buffer)) : s;
+}
+
+Status BefsFileSystem::edit_write(const Inode& directory, ByteView buffer, uint64_t at, const NodeEdit& node) {
+  const Status s = node.store(buffer);
+  return s == Status::Ok ? tx_write_stream(directory, at, ConstByteView(buffer)) : s;
+}
+
+// A node for the tree: one from the free list, or a new one at the end of the stream (which may need blocks, and changes the
+// directory's size - the caller stores the directory's inode).
+Status BefsFileSystem::tree_alloc_node(Inode* directory, TreeCtx* ctx, uint64_t* offset) {
+  if (ctx->free_node != kNone) {
+    uint8_t raw[8];
+    const uint64_t node = ctx->free_node;
+    if (node % 8 != 0) return Status::Corrupt;
+    const Status s = read_stream(*directory, node, ByteView(raw));
+    if (s != Status::Ok) return s;
+    ByteReader in{ConstByteView(raw)};
+    ctx->free_node = in.le64();  // (left_link: the next free node)
+    *offset = node;
+    return Status::Ok;
+  }
+  const uint64_t start = ctx->max_size, end = start + ctx->node_size;
+  if (end < start || end > max_file_size()) return Status::NoSpace;
+  const Status s = grow_stream(directory, (end + block_size_ - 1) >> block_shift_);
+  if (s != Status::Ok) return s;
+  if (end > directory->size) directory->size = end;
+  ctx->max_size = end;
+  *offset = start;
+  return Status::Ok;
+}
+
+Status BefsFileSystem::tree_free_node(const Inode& directory, TreeCtx* ctx, uint64_t offset) {
+  uint8_t raw[kNodeHeaderSize] = {};
+  ByteWriter w{ByteView(raw)};
+  w.le64(ctx->free_node);
+  w.le64(kNone);
+  w.le64(kFreeNode);
+  const Status s = tx_write_stream(directory, offset, ConstByteView(raw));
+  if (s == Status::Ok) ctx->free_node = offset;
+  return s;
+}
+
+// Takes a node out of its level's list of links.
+Status BefsFileSystem::tree_unlink(const Inode& directory, uint64_t left, uint64_t right) {
+  uint8_t raw[8];
+  Status s = Status::Ok;
+  if (left != kNone) {
+    ByteWriter w{ByteView(raw)};
+    w.le64(right);
+    s = tx_write_stream(directory, left + 8, ConstByteView(raw));
+  }
+  if (s == Status::Ok && right != kNone) {
+    ByteWriter w{ByteView(raw)};
+    w.le64(left);
+    s = tx_write_stream(directory, right, ConstByteView(raw));
+  }
+  return s;
+}
+
+// The tree of a new, empty directory: the header node and an empty root leaf.
+Status BefsFileSystem::init_tree(Inode* directory) {
+  const uint32_t node_size = block_size_;
+  if (node_size > kMaxWriteNodeSize) return Status::Unsupported;
+  Status s = grow_stream(directory, (uint64_t{node_size} * 2 + block_size_ - 1) >> block_shift_);
+  if (s != Status::Ok) return s;
+  directory->size = uint64_t{node_size} * 2;
+  Owned buffer(allocator_, node_size);
+  if (!buffer.ok()) return Status::OutOfMemory;
+  buffer.view().fill(0);
+  ByteWriter w{buffer.view()};
+  w.le32(kTreeMagic);
+  w.le32(node_size);
+  w.le32(1);   // levels
+  w.le32(0);   // data type: strings
+  w.le64(node_size);
+  w.le64(kNone);
+  w.le64(uint64_t{node_size} * 2);
+  s = tx_write_stream(*directory, 0, ConstByteView(buffer.view()));
+  if (s != Status::Ok) return s;
+  NodeEdit root(allocator_, node_size);
+  if (!root.ok()) return Status::OutOfMemory;
+  root.reset_leaf();
+  return edit_write(*directory, buffer.view(), node_size, root);
+}
+
+// Adds `name` -> `inode_block` to the directory's tree, splitting nodes that get too full.
+Status BefsFileSystem::tree_insert(Inode* directory, StringView name, uint64_t inode_block) {
+  TreeCtx ctx;
+  Status s = tree_load(*directory, &ctx);
+  if (s != Status::Ok) return s;
+  Owned buffer(allocator_, ctx.node_size);
+  NodeEdit cur(allocator_, ctx.node_size), sibling(allocator_, ctx.node_size);
+  if (!buffer.ok() || !cur.ok() || !sibling.ok()) return Status::OutOfMemory;
+  PathStep path[kMaxDepth];
+  uint32_t depth = 0;
+  uint64_t at = ctx.root;
+  for (;;) {  // down to the leaf
+    s = edit_read(*directory, buffer.view(), at, &cur);
+    if (s != Status::Ok) return s;
+    if (cur.leaf()) break;
+    if (depth == kMaxDepth) return Status::Corrupt;
+    uint32_t i = 0;
+    while (i < cur.count() && compare_names(cur.key(i), name) < 0) ++i;
+    path[depth++] = PathStep{at, i};
+    at = i < cur.count() ? cur.value(i) : cur.overflow;
+  }
+  uint32_t position = 0;
+  for (; position < cur.count(); ++position) {
+    const int order = compare_names(cur.key(position), name);
+    if (order == 0) return Status::AlreadyExists;
+    if (order > 0) break;
+  }
+  if (!cur.insert(position, name.bytes(), inode_block)) return Status::Corrupt;
+
+  bool written = false;  // (the new root is written where it is made)
+  while (!cur.fits()) {
+    const uint32_t count = cur.count();
+    const bool leaf = cur.leaf();
+    if (count < (leaf ? 2u : 3u)) return Status::Corrupt;
+    // Split by size: the left part is about half of the bytes.
+    uint32_t split = 0;
+    uint64_t sum = 0;
+    while (split < count && sum * 2 < cur.total_bytes()) sum += cur.entry_bytes(split++);
+    const uint32_t lowest = 1, highest = leaf ? count - 1 : count - 2;
+    if (split < lowest) split = lowest;
+    if (split > highest) split = highest;
+
+    uint64_t other = 0;
+    s = tree_alloc_node(directory, &ctx, &other);
+    if (s != Status::Ok) return s;
+    uint8_t separator[kMaxNameLength + 1];
+    uint32_t separator_size = 0;
+    sibling.reset_leaf();
+    if (leaf) {  // the left part keeps its entries, its largest name goes up
+      const ConstByteView last = cur.key(split - 1);
+      if (last.size() > sizeof separator) return Status::Corrupt;
+      separator_size = static_cast<uint32_t>(last.size());
+      ByteView(separator, separator_size).copy_from(last);
+      for (uint32_t j = split; j < count; ++j) {
+        if (!sibling.insert(sibling.count(), cur.key(j), cur.value(j))) return Status::Corrupt;
+      }
+      cur.truncate(split);
+    } else {  // the entry at `split` goes up; its child becomes the left part's last child
+      const ConstByteView middle = cur.key(split);
+      if (middle.size() > sizeof separator) return Status::Corrupt;
+      separator_size = static_cast<uint32_t>(middle.size());
+      ByteView(separator, separator_size).copy_from(middle);
+      sibling.overflow = cur.overflow;
+      for (uint32_t j = split + 1; j < count; ++j) {
+        if (!sibling.insert(sibling.count(), cur.key(j), cur.value(j))) return Status::Corrupt;
+      }
+      const uint64_t middle_child = cur.value(split);
+      cur.truncate(split);
+      cur.overflow = middle_child;
+    }
+    const uint64_t old_right = cur.right;
+    sibling.left = at;
+    sibling.right = old_right;
+    cur.right = other;
+    s = edit_write(*directory, buffer.view(), at, cur);
+    if (s == Status::Ok) s = edit_write(*directory, buffer.view(), other, sibling);
+    if (s == Status::Ok && old_right != kNone) {
+      uint8_t raw[8];
+      ByteWriter w{ByteView(raw)};
+      w.le64(other);
+      s = tx_write_stream(*directory, old_right, ConstByteView(raw));
+    }
+    if (s != Status::Ok) return s;
+
+    const ConstByteView up(separator, separator_size);
+    if (depth == 0) {  // the root split: a new root over the two halves
+      uint64_t root = 0;
+      s = tree_alloc_node(directory, &ctx, &root);
+      if (s != Status::Ok) return s;
+      cur.reset_leaf();
+      cur.overflow = other;
+      if (!cur.insert(0, up, at)) return Status::Corrupt;
+      s = edit_write(*directory, buffer.view(), root, cur);
+      if (s != Status::Ok) return s;
+      ctx.root = root;
+      ++ctx.levels;
+      written = true;
+      break;
+    }
+    const PathStep step = path[--depth];
+    const uint64_t halved = at;
+    at = step.offset;
+    s = edit_read(*directory, buffer.view(), at, &cur);
+    if (s != Status::Ok) return s;
+    if (step.index < cur.count()) {
+      cur.set_value(step.index, other);
+    } else {
+      cur.overflow = other;
+    }
+    if (!cur.insert(step.index, up, halved)) return Status::Corrupt;
+  }
+  if (!written) {
+    s = edit_write(*directory, buffer.view(), at, cur);
+    if (s != Status::Ok) return s;
+  }
+  s = tree_save(*directory, ctx);
+  ++tree_epoch_;
+  return s;
+}
+
+// Removes `name` from the directory's tree. A node that ends up empty is freed (and an inner node left with a single child is replaced
+// by that child); nodes are not merged.
+Status BefsFileSystem::tree_remove(Inode* directory, StringView name) {
+  TreeCtx ctx;
+  Status s = tree_load(*directory, &ctx);
+  if (s != Status::Ok) return s;
+  Owned buffer(allocator_, ctx.node_size);
+  NodeEdit cur(allocator_, ctx.node_size);
+  if (!buffer.ok() || !cur.ok()) return Status::OutOfMemory;
+  PathStep path[kMaxDepth];
+  uint32_t depth = 0;
+  uint64_t at = ctx.root;
+  for (;;) {
+    s = edit_read(*directory, buffer.view(), at, &cur);
+    if (s != Status::Ok) return s;
+    if (cur.leaf()) break;
+    if (depth == kMaxDepth) return Status::Corrupt;
+    uint32_t i = 0;
+    while (i < cur.count() && compare_names(cur.key(i), name) < 0) ++i;
+    path[depth++] = PathStep{at, i};
+    at = i < cur.count() ? cur.value(i) : cur.overflow;
+  }
+  uint32_t position = 0;
+  while (position < cur.count() && compare_names(cur.key(position), name) < 0) ++position;
+  if (position == cur.count() || compare_names(cur.key(position), name) != 0) return Status::NotFound;
+  cur.remove(position);
+  ++tree_epoch_;
+  if (depth == 0 || cur.count() > 0) return edit_write(*directory, buffer.view(), at, cur);
+
+  // The leaf is empty: take it out of its level and out of its parent, and so on upwards while the parents lose their last child. (An
+  // inner node that keeps a single child, its overflow link, stays: every leaf has to stay at the same depth.)
+  for (;;) {
+    if (depth == 0) {  // the root itself has nothing left below it
+      cur.reset_leaf();
+      s = edit_write(*directory, buffer.view(), at, cur);
+      if (s != Status::Ok) return s;
+      ctx.levels = 1;
+      break;
+    }
+    s = tree_unlink(*directory, cur.left, cur.right);
+    if (s == Status::Ok) s = tree_free_node(*directory, &ctx, at);
+    if (s != Status::Ok) return s;
+    const PathStep step = path[--depth];
+    at = step.offset;
+    s = edit_read(*directory, buffer.view(), at, &cur);
+    if (s != Status::Ok) return s;
+    if (step.index < cur.count()) {
+      cur.remove(step.index);
+    } else if (cur.count() > 0) {  // it was the overflow child: the child of the last entry takes that place
+      cur.overflow = cur.value(cur.count() - 1);
+      cur.remove(cur.count() - 1);
+    } else {  // it was the only child: this node is empty now too
+      continue;
+    }
+    s = edit_write(*directory, buffer.view(), at, cur);
+    if (s != Status::Ok) return s;
+    break;
+  }
+  // A root with a single child gives way to it (the tree gets one level shallower).
+  for (uint32_t guard = 0; guard < kMaxDepth; ++guard) {
+    s = edit_read(*directory, buffer.view(), ctx.root, &cur);
+    if (s != Status::Ok) return s;
+    if (cur.leaf() || cur.count() > 0) break;
+    const uint64_t old_root = ctx.root;
+    ctx.root = cur.overflow;
+    if (ctx.levels > 1) --ctx.levels;
+    s = tree_free_node(*directory, &ctx, old_root);
+    if (s != Status::Ok) return s;
+  }
+  return tree_save(*directory, ctx);
+}
+
+// ---- Creating, removing and renaming ------------------------------------------------------------------------------------------------
+
+namespace {
+// Keeps an operation's transaction in one piece (no commits in between) for as long as it lives.
+class AtomicScope {
+ public:
+  explicit AtomicScope(bool* flag) : flag_(flag) { *flag_ = true; }
+  ~AtomicScope() { *flag_ = false; }
+  AtomicScope(const AtomicScope&) = delete;
+  AtomicScope& operator=(const AtomicScope&) = delete;
+
+ private:
+  bool* flag_;
+};
+}  // namespace
+
+bool BefsFileSystem::is_open(uint64_t block) const {
+  for (const OpenHandle* handle = open_; handle; handle = handle->next) {
+    if (handle->block == block) return true;
+  }
+  return false;
+}
+
+bool BefsFileSystem::block_to_run(uint64_t block, Run* run) const {
+  const uint64_t group = block >> group_shift_;
+  if (block >= block_count_ || group >= group_count_) return false;
+  *run = Run{static_cast<uint32_t>(group), static_cast<uint16_t>(block & ((uint64_t{1} << group_shift_) - 1)), 1};
+  return true;
+}
+
+// The directory that holds `path` and the name in it.
+Status BefsFileSystem::split_path(StringView path, Inode* parent, StringView* leaf) {
+  StringView parent_path;
+  if (!split_parent(path, &parent_path, leaf) || !valid_name(*leaf)) return Status::InvalidPath;
+  StringView ignored;
+  const Status s = resolve(parent_path, parent, &ignored);
+  if (s != Status::Ok) return s;
+  return parent->is_directory() ? Status::Ok : Status::NotADirectory;
+}
+
+Status BefsFileSystem::create_body(Inode* parent, StringView leaf, bool directory, uint64_t* inode_block) {
+  Run run;
+  Status s = allocate_any(parent->block, 1, 1, &run);
+  uint64_t block = 0;
+  if (s == Status::Ok && !run_to_block(run, &block)) s = Status::Corrupt;
+  if (s == Status::Ok) s = tx_zero(block, 1);
+  if (s != Status::Ok) return s;
+  Run parent_run;
+  if (!block_to_run(parent->block, &parent_run)) return Status::Corrupt;
+  Inode fresh;
+  fresh.block = block;
+  fresh.mode = directory ? 0x41ED : 0x81A4;
+  fresh.flags = kInodeInUse;
+  uint8_t raw[72] = {};
+  ByteWriter w{ByteView(raw)};
+  w.le32(kInodeMagic);
+  w.le32(run.group);
+  w.le16(run.start);
+  w.le16(run.length);
+  w.le32(0);  // owner and group
+  w.le32(0);
+  w.le32(fresh.mode);
+  w.le32(fresh.flags);
+  w.zeros(16);  // time stamps
+  w.le32(parent_run.group);
+  w.le16(parent_run.start);
+  w.le16(parent_run.length);
+  w.zeros(8);   // attributes
+  w.le32(0);    // type
+  w.le32(inode_size_);
+  w.le32(0);
+  if (!w.ok() || w.position() != sizeof raw) return Status::Corrupt;
+  s = tx_write(block << block_shift_, ConstByteView(raw));
+  if (s == Status::Ok && directory) s = init_tree(&fresh);
+  if (s == Status::Ok) s = store_inode(fresh);
+  if (s == Status::Ok) s = tree_insert(parent, leaf, block);
+  if (s == Status::Ok) s = store_inode(*parent);
+  if (s != Status::Ok) return s;
+  *inode_block = block;
+  return Status::Ok;
+}
+
+Status BefsFileSystem::create_node(StringView path, bool directory, uint64_t* inode_block) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  Status s = writable();
+  if (s != Status::Ok) return s;
+  Inode parent;
+  StringView leaf;
+  s = split_path(path, &parent, &leaf);
+  if (s != Status::Ok) return s;
+  uint64_t existing = 0;
+  s = find(parent, leaf, &existing);
+  if (s == Status::Ok) return Status::AlreadyExists;
+  if (s != Status::NotFound) return s;
+  AtomicScope atomic(&atomic_);
+  tx_begin();
+  s = create_body(&parent, leaf, directory, inode_block);
+  if (s == Status::Ok) s = tx_commit();
+  if (s != Status::Ok) tx_rollback();
+  return s;
+}
+
+Status BefsFileSystem::remove_body(Inode* parent, StringView leaf, uint64_t inode_block) {
+  Status s = tree_remove(parent, leaf);
+  if (s == Status::Ok) s = store_inode(*parent);
+  if (s == Status::Ok) s = set_bits(inode_block, 1, false);
+  if (s == Status::Ok) {  // (leave no inode behind that would still pass for a live one)
+    uint8_t raw[4];
+    ByteWriter w{ByteView(raw)};
+    w.le32(kInodeDeleted);
+    s = tx_write((inode_block << block_shift_) + 24, ConstByteView(raw));
+  }
+  return s;
+}
+
+Status BefsFileSystem::remove(StringView path) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  Status s = writable();
+  if (s != Status::Ok) return s;
+  Inode parent;
+  StringView leaf;
+  s = split_path(path, &parent, &leaf);
+  if (s != Status::Ok) return s;
+  uint64_t block = 0;
+  s = find(parent, leaf, &block);
+  if (s != Status::Ok) return s;
+  Inode node;
+  s = read_inode(block, &node);
+  if (s != Status::Ok) return s;
+  if (is_open(block)) return Status::Busy;
+  if (node.is_directory()) {
+    bool empty = false;
+    s = directory_empty(node, &empty);
+    if (s != Status::Ok) return s;
+    if (!empty) return Status::NotEmpty;
+  }
+  if (!node.inline_link && (node.size != 0 || node.max_direct != 0)) {  // give the data back first, in steps
+    tx_begin();
+    node.size = 0;
+    s = store_inode(node);
+    if (s == Status::Ok) s = shrink_stream(&node, 0);
+    if (s == Status::Ok) s = store_inode(node);
+    if (s == Status::Ok) s = tx_commit();
+    if (s != Status::Ok) {
+      tx_rollback();
+      return s;
+    }
+  }
+  AtomicScope atomic(&atomic_);
+  tx_begin();
+  s = remove_body(&parent, leaf, block);
+  if (s == Status::Ok) s = tx_commit();
+  if (s != Status::Ok) tx_rollback();
+  return s;
+}
+
+Status BefsFileSystem::rename_body(Inode* from_parent, StringView from_leaf, Inode* to_parent, StringView to_leaf, const Inode& node) {
+  Status s = tree_insert(to_parent, to_leaf, node.block);
+  if (s == Status::Ok) s = tree_remove(from_parent, from_leaf);
+  if (s == Status::Ok) s = store_inode(*to_parent);
+  if (s == Status::Ok && from_parent != to_parent) s = store_inode(*from_parent);
+  if (s == Status::Ok && node.is_directory() && from_parent != to_parent) {  // its parent link
+    Run run;
+    if (!block_to_run(to_parent->block, &run)) return Status::Corrupt;
+    uint8_t raw[8];
+    encode_run(run, raw);
+    s = tx_write((node.block << block_shift_) + 44, ConstByteView(raw));
+  }
+  return s;
+}
+
+Status BefsFileSystem::rename(StringView from, StringView to) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  Status s = writable();
+  if (s != Status::Ok) return s;
+  Inode from_parent, to_parent;
+  StringView from_leaf, to_leaf;
+  s = split_path(from, &from_parent, &from_leaf);
+  if (s != Status::Ok) return s;
+  s = split_path(to, &to_parent, &to_leaf);
+  if (s != Status::Ok) return s;
+  uint64_t block = 0, taken = 0;
+  s = find(from_parent, from_leaf, &block);
+  if (s != Status::Ok) return s;
+  s = find(to_parent, to_leaf, &taken);
+  if (s == Status::Ok) return Status::AlreadyExists;
+  if (s != Status::NotFound) return s;
+  Inode node;
+  s = read_inode(block, &node);
+  if (s != Status::Ok) return s;
+  if (node.is_directory()) {  // not into itself: walk up from the new parent
+    uint64_t up = to_parent.block;
+    for (uint32_t guard = 0; guard < 4096; ++guard) {
+      if (up == block) return Status::InvalidArgument;
+      if (up == root_block_) break;
+      Inode above;
+      s = read_inode(up, &above);
+      if (s != Status::Ok) return s;
+      if (above.parent == 0 || above.parent == up) break;
+      up = above.parent;
+    }
+  }
+  const bool same_directory = from_parent.block == to_parent.block;
+  AtomicScope atomic(&atomic_);
+  tx_begin();
+  s = rename_body(same_directory ? &to_parent : &from_parent, from_leaf, &to_parent, to_leaf, node);
+  if (s == Status::Ok) s = tx_commit();
+  if (s != Status::Ok) tx_rollback();
+  return s;
+}
+
+Status BefsFileSystem::create_directory(StringView path) {
+  uint64_t block = 0;
+  return create_node(path, true, &block);
+}
 
 Status BefsFileSystem::flush() {
   kernel::ScopedRecursiveMutex lock(mutex_);

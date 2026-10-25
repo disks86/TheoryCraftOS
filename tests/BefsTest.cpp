@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <functional>
+#include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -554,9 +557,156 @@ static uint64_t rd16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 static uint64_t rd32(const uint8_t* p) { return rd16(p) | (uint64_t{rd16(p + 2)} << 16); }
 static uint64_t rd64(const uint8_t* p) { return rd32(p) | (rd32(p + 4) << 32); }
 
+struct RawVolume {
+  const uint8_t* img;
+  uint32_t bs, ag_shift, ag_count;
+  uint64_t total, per_group;
+};
+typedef std::vector<std::pair<uint64_t, uint32_t>> RunList;
+struct RawTable { RunList direct, indirect, dbl, arrays; };
+
+static bool raw_run(const RawVolume& v, const uint8_t* p, uint64_t* block, uint32_t* length) {
+  *block = (rd32(p) << v.ag_shift) + rd16(p + 4);
+  *length = rd16(p + 6);
+  return *length != 0 && *block + *length <= v.total;
+}
+
+static RawTable raw_table(const RawVolume& v, uint64_t inode) {
+  RawTable table;
+  const uint8_t* stream = v.img + inode * v.bs + 72;
+  uint64_t block; uint32_t length;
+  for (int i = 0; i < 12 && raw_run(v, stream + i * 8, &block, &length); ++i) table.direct.push_back({block, length});
+  if (raw_run(v, stream + 104, &block, &length)) {
+    table.arrays.push_back({block, length});
+    for (uint64_t e = 0; e < uint64_t{length} * v.bs / 8; ++e) {
+      uint64_t data; uint32_t n;
+      if (!raw_run(v, v.img + block * v.bs + e * 8, &data, &n)) break;
+      table.indirect.push_back({data, n});
+    }
+  }
+  if (raw_run(v, stream + 120, &block, &length)) {
+    table.arrays.push_back({block, length});
+    for (uint64_t e = 0; e < uint64_t{length} * v.bs / 8; ++e) {
+      uint64_t array; uint32_t alen;
+      if (!raw_run(v, v.img + block * v.bs + e * 8, &array, &alen)) break;
+      table.arrays.push_back({array, alen});
+      for (uint64_t f = 0; f < uint64_t{alen} * v.bs / 8; ++f) {
+        uint64_t data; uint32_t n;
+        if (!raw_run(v, v.img + array * v.bs + f * 8, &data, &n)) break;
+        table.dbl.push_back({data, n});
+      }
+    }
+  }
+  return table;
+}
+
+static std::vector<uint8_t> raw_stream(const RawVolume& v, uint64_t inode) {
+  const RawTable table = raw_table(v, inode);
+  std::vector<uint8_t> out;
+  for (const RunList* runs : {&table.direct, &table.indirect, &table.dbl}) {
+    for (auto& r : *runs) out.insert(out.end(), v.img + r.first * v.bs, v.img + (r.first + r.second) * v.bs);
+  }
+  out.resize(rd64(v.img + inode * v.bs + 72 + 136));
+  return out;
+}
+
+struct TreeInfo { std::vector<std::pair<std::string, uint64_t>> entries; uint32_t nodes = 0, free_nodes = 0, levels = 0; };
+
+// Checks a directory's B+tree from the raw image: order, separators, equal depth, links, free list, and that every node is accounted for.
+static bool check_tree(const RawVolume& v, uint64_t dir_inode, TreeInfo* info, const char* what) {
+  bool ok = true;
+  const std::vector<uint8_t> s = raw_stream(v, dir_inode);
+  if (s.size() < 40 || rd32(s.data()) != 0x69f6c2e8) { printf("  %s: no tree header\n", what); return false; }
+  const uint32_t ns = rd32(s.data() + 4);
+  info->levels = rd32(s.data() + 8);
+  const uint64_t root = rd64(s.data() + 16), free_pointer = rd64(s.data() + 24), max_size = rd64(s.data() + 32);
+  if (max_size != s.size() || ns == 0 || s.size() % ns) { printf("  %s: tree size %llu vs %zu\n", what, (unsigned long long)max_size, s.size()); return false; }
+  std::vector<std::vector<uint64_t>> by_level;
+  std::string previous;
+  bool have_previous = false;
+  int leaf_depth = -1;
+  const uint64_t none = ~uint64_t{0};
+  std::function<bool(uint64_t, uint32_t, std::string*, std::string*, bool*)> walk = [&](uint64_t off, uint32_t depth, std::string* low, std::string* high, bool* empty) -> bool {
+    if (off % 8 || off < ns || off + ns > s.size() || depth > 40) return false;
+    const uint8_t* n = s.data() + off;
+    const uint32_t count = rd16(n + 24), key_bytes = rd16(n + 26);
+    const uint32_t ends_at = (28 + key_bytes + 7) & ~7u, values_at = ends_at + count * 2;
+    if (values_at + count * 8 > ns) return false;
+    std::vector<std::string> keys;
+    std::vector<uint64_t> values;
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t end = rd16(n + ends_at + i * 2);
+      if (end < start || end > key_bytes) return false;
+      keys.push_back(std::string(reinterpret_cast<const char*>(n + 28 + start), end - start));
+      values.push_back(rd64(n + values_at + i * 8));
+      start = end;
+      if (i && !(keys[i - 1] < keys[i])) { printf("  %s: keys out of order in node %llu\n", what, (unsigned long long)off); ok = false; }
+    }
+    ++info->nodes;
+    if (by_level.size() <= depth) by_level.resize(depth + 1);
+    by_level[depth].push_back(off);
+    const uint64_t overflow = rd64(n + 16);
+    if (overflow == none) {
+      if (leaf_depth < 0) leaf_depth = depth;
+      if (static_cast<int>(depth) != leaf_depth) { printf("  %s: leaves at different depths\n", what); ok = false; }
+      for (uint32_t i = 0; i < count; ++i) {
+        if (have_previous && !(previous < keys[i])) { printf("  %s: leaves out of order at '%s'\n", what, keys[i].c_str()); ok = false; }
+        previous = keys[i];
+        have_previous = true;
+        info->entries.push_back({keys[i], values[i]});
+      }
+      *empty = count == 0;
+      if (count) { *low = keys.front(); *high = keys.back(); }
+      return true;
+    }
+    values.push_back(overflow);
+    bool first = true;
+    for (uint32_t c = 0; c < values.size(); ++c) {
+      std::string child_low, child_high;
+      bool child_empty = false;
+      if (!walk(values[c], depth + 1, &child_low, &child_high, &child_empty)) return false;
+      if (child_empty) { printf("  %s: empty node below the root\n", what); ok = false; continue; }
+      if (c < count && keys[c] < child_high) { printf("  %s: separator '%s' below its child's '%s'\n", what, keys[c].c_str(), child_high.c_str()); ok = false; }
+      if (c > 0 && !(keys[c - 1] < child_low)) { printf("  %s: separator '%s' not below next child's '%s'\n", what, keys[c - 1].c_str(), child_low.c_str()); ok = false; }
+      if (first) *low = child_low;
+      *high = child_high;
+      first = false;
+    }
+    *empty = first;
+    return true;
+  };
+  std::string low, high;
+  bool empty = false;
+  if (!walk(root, 0, &low, &high, &empty)) { printf("  %s: tree cannot be walked\n", what); return false; }
+  if (info->levels != by_level.size()) { printf("  %s: header says %u levels, found %zu\n", what, info->levels, by_level.size()); ok = false; }
+  for (size_t l = 0; l < by_level.size(); ++l) {
+    for (size_t j = 0; j < by_level[l].size(); ++j) {
+      const uint8_t* n = s.data() + by_level[l][j];
+      const uint64_t left = rd64(n), right = rd64(n + 8);
+      const uint64_t want_left = j ? by_level[l][j - 1] : none, want_right = j + 1 < by_level[l].size() ? by_level[l][j + 1] : none;
+      const bool strict = l + 1 == by_level.size();
+      if (strict ? (left != want_left || right != want_right) : ((left != want_left && left != none) || (right != want_right && right != none))) {
+        printf("  %s: links of node %llu at level %zu are wrong\n", what, (unsigned long long)by_level[l][j], l);
+        ok = false;
+      }
+    }
+  }
+  uint64_t free_at = free_pointer;
+  for (uint32_t guard = 0; free_at != none && guard < 100000; ++guard) {
+    if (free_at % 8 || free_at < ns || free_at + ns > s.size() || rd64(s.data() + free_at + 16) != ~uint64_t{1}) { printf("  %s: bad free node\n", what); ok = false; break; }
+    ++info->free_nodes;
+    free_at = rd64(s.data() + free_at);
+  }
+  if (info->nodes + info->free_nodes + 1 != s.size() / ns) { printf("  %s: %u nodes + %u free + header != %zu\n", what, info->nodes, info->free_nodes, s.size() / ns); ok = false; }
+  return ok;
+}
+
 // Checks a volume the way a file system check would: every block that something uses is marked in the bitmap, every marked block is
-// used by exactly one thing, the used-blocks count is right, and each stream maps what its size and ranges say.
+// used by exactly one thing, the used-blocks count is right, each stream maps what its size and ranges say, and the directory trees
+// are well formed. Everything is found by walking from the root directory.
 static void check_accounting(const uint8_t* img, const BefsImage& b, const char* what) {
+  const RawVolume v{img, b.bs, b.ag_shift, b.ag_count, b.total, b.per_group};
   const uint32_t bs = b.bs;
   std::vector<uint8_t> owner(b.total, 0);
   bool ok = true;
@@ -565,56 +715,45 @@ static void check_accounting(const uint8_t* img, const BefsImage& b, const char*
       if (block + i >= b.total || owner[block + i]++) ok = false;
     }
   };
-  auto run_at = [&](const uint8_t* p, uint64_t* block, uint32_t* length) {
-    *block = (rd32(p) << b.ag_shift) + rd16(p + 4);
-    *length = rd16(p + 6);
-    return *length != 0;
-  };
   claim(0, 1 + b.ag_count * b.per_group);
-  for (uint64_t inode : b.inodes) {
+  std::vector<uint64_t> todo{(rd32(img + 512 + 116) << b.ag_shift) + rd16(img + 512 + 120)};
+  std::set<uint64_t> seen;
+  while (!todo.empty()) {
+    const uint64_t inode = todo.back();
+    todo.pop_back();
+    if (!seen.insert(inode).second) { ok = false; continue; }
     const uint8_t* p = img + inode * bs;
-    if (rd32(p) != 0x3bbe0ad9) { ok = false; continue; }
+    if (rd32(p) != 0x3bbe0ad9 || !(rd32(p + 24) & 1)) { printf("  inode %llu is not live\n", (unsigned long long)inode); ok = false; continue; }
     claim(inode, 1);
-    if ((rd32(p + 20) & 0xF000) == 0xA000 && !(rd32(p + 24) & 0x40)) continue;
+    const uint32_t mode = rd32(p + 20) & 0xF000;
+    if (mode == 0xA000 && !(rd32(p + 24) & 0x40)) continue;
     const uint8_t* stream = p + 72;
-    uint64_t block; uint32_t length;
+    const RawTable table = raw_table(v, inode);
     uint64_t direct = 0, indirect = 0, dbl = 0;
-    for (int i = 0; i < 12 && run_at(stream + i * 8, &block, &length); ++i) { claim(block, length); direct += length; }
-    if (run_at(stream + 104, &block, &length)) {
-      claim(block, length);
-      for (uint64_t e = 0; e < uint64_t{length} * bs / 8; ++e) {
-        uint64_t data; uint32_t n;
-        if (!run_at(img + block * bs + e * 8, &data, &n)) break;
-        claim(data, n); indirect += n;
-      }
-    }
-    if (run_at(stream + 120, &block, &length)) {
-      claim(block, length);
-      for (uint64_t e = 0; e < uint64_t{length} * bs / 8; ++e) {
-        uint64_t array; uint32_t alen;
-        if (!run_at(img + block * bs + e * 8, &array, &alen)) break;
-        claim(array, alen);
-        for (uint64_t f = 0; f < uint64_t{alen} * bs / 8; ++f) {
-          uint64_t data; uint32_t n;
-          if (!run_at(img + array * bs + f * 8, &data, &n)) break;
-          claim(data, n); dbl += n;
-        }
-      }
-    }
+    for (auto& r : table.direct) { claim(r.first, r.second); direct += r.second; }
+    for (auto& r : table.indirect) { claim(r.first, r.second); indirect += r.second; }
+    for (auto& r : table.dbl) { claim(r.first, r.second); dbl += r.second; }
+    for (auto& r : table.arrays) claim(r.first, r.second);
     const uint64_t mapped = (direct + indirect + dbl) * bs;
-    if (rd64(stream + 136) > mapped) ok = false;
+    if (rd64(stream + 136) > mapped) { printf("  inode %llu: size beyond its blocks\n", (unsigned long long)inode); ok = false; }
     const uint64_t want = dbl ? mapped : indirect ? (direct + indirect) * bs : direct * bs;
     const uint64_t have = rd64(stream + 128) ? rd64(stream + 128) : rd64(stream + 112) ? rd64(stream + 112) : rd64(stream + 96);
-    if (want != have) ok = false;
+    if (want != have) { printf("  inode %llu: ranges %llu, blocks %llu\n", (unsigned long long)inode, (unsigned long long)have, (unsigned long long)want); ok = false; }
     if (indirect && rd64(stream + 112) != (direct + indirect) * bs) ok = false;
+    if (mode == 0x4000) {
+      TreeInfo info;
+      if (!check_tree(v, inode, &info, what)) ok = false;
+      for (auto& e : info.entries) todo.push_back(e.second);
+    }
   }
-  uint64_t count = 0;
+  uint64_t count = 0, reported = 0;
   for (uint64_t blk = 0; blk < b.total; ++blk) {
     const uint64_t group = blk >> b.ag_shift, bit = blk & ((uint64_t{1} << b.ag_shift) - 1);
     const bool marked = img[(1 + group * b.per_group + bit / (bs * 8)) * bs + (bit % (bs * 8)) / 8] & (1u << (bit % 8));
-    if (marked != (owner[blk] == 1)) { ok = false; printf("  block %llu: marked %d, used %d\n", (unsigned long long)blk, marked, owner[blk]); if (!ok && count > 1000000) break; }
+    if (marked != (owner[blk] == 1) && reported++ < 5) { ok = false; printf("  block %llu: marked %d, used %d\n", (unsigned long long)blk, marked, owner[blk]); }
     count += marked;
   }
+  if (reported) ok = false;
   if (rd64(img + 512 + 56) != count) { ok = false; printf("  used_blocks %llu, bitmap %llu\n", (unsigned long long)rd64(img + 512 + 56), (unsigned long long)count); }
   if (!ok) { printf("FAILED accounting: %s\n", what); ++g_failed; }
 }
@@ -734,10 +873,6 @@ static void test_write() {
       CHECK_STATUS(fs->open_file("/link", OpenMode::ReadWrite, &f), Status::Unsupported);
       CHECK_STATUS(fs->open_file("/sub", OpenMode::ReadWrite, &f), Status::IsADirectory);
       CHECK_STATUS(fs->open_file("/locked", OpenMode::ReadWrite, &f), Status::ReadOnly);
-      CHECK_STATUS(fs->open_file("/missing", OpenMode::CreateOrOpen, &f), Status::Unsupported);
-      CHECK_STATUS(fs->create_directory("/x"), Status::Unsupported);
-      CHECK_STATUS(fs->remove("/hello.txt"), Status::Unsupported);
-      CHECK_STATUS(fs->rename("/hello.txt", "/y"), Status::Unsupported);
       CHECK_STATUS(fs->open_file("/hello.txt", OpenMode::ReadWrite, &f), Status::Ok);
       uint64_t done = 0;
       CHECK_STATUS(f->write(uint64_t{1} << 50, ConstByteView(reinterpret_cast<const uint8_t*>("x"), 1), &done), Status::NoSpace);
@@ -840,6 +975,9 @@ static void test_write_refused() {
     CHECK(fs->info().read_only);
     CHECK_STATUS(fs->open_file("/hello.txt", OpenMode::ReadWrite, &f), Status::ReadOnly);
     CHECK_STATUS(fs->open_file("/missing", OpenMode::CreateOrOpen, &f), Status::ReadOnly);
+    CHECK_STATUS(fs->create_directory("/x"), Status::ReadOnly);
+    CHECK_STATUS(fs->remove("/hello.txt"), Status::ReadOnly);
+    CHECK_STATUS(fs->rename("/hello.txt", "/y"), Status::ReadOnly);
     std::vector<uint8_t> got;
     if (!read_back(*fs, "/hello.txt", &got) || got.size() != 13) { printf("FAILED: cannot read (%s)\n", why); ++g_failed; }
   };
@@ -867,6 +1005,8 @@ static void test_write_refused() {
   }
   CHECK(a.live == 0);
 }
+
+static std::string long_name(int i, size_t length);
 
 // Damaged volumes that are written to: whatever happens, nothing crashes or reads and writes outside the volume.
 static void test_write_fuzz() {
@@ -901,7 +1041,354 @@ static void test_write_fuzz() {
         else f->write(rnd() % (60 * bs), ConstByteView(data.data(), data.size()), &done);
         if (rnd() % 4 == 0) f->resize(rnd() % (20 * bs));
       }
+      const char* places[] = {"/", "/sub/", "/many/", "/emptydir/", "/filler/"};
+      for (int k = 0; k < 8; ++k) {
+        const std::string one = std::string(places[rnd() % 5]) + long_name(rnd() % 12, rnd() % 2 ? 90 : 5);
+        const std::string two = std::string(places[rnd() % 5]) + long_name(rnd() % 12, rnd() % 2 ? 90 : 5);
+        UniquePointer<IFile> f;
+        switch (rnd() % 5) {
+          case 0: fs->create_directory(one.c_str()); break;
+          case 1: fs->open_file(one.c_str(), OpenMode::CreateOrOpen, &f); break;
+          case 2: fs->remove(one.c_str()); break;
+          case 3: fs->rename(one.c_str(), two.c_str()); break;
+          default: fs->remove((std::string(places[rnd() % 5]) + "f0" + std::to_string(10 + rnd() % 50)).c_str()); break;
+        }
+      }
       fs->flush();
+    }
+  }
+  CHECK(a.live == 0);
+}
+
+// ---- Creating, removing, renaming --------------------------------------------------------------------------------------------------
+
+static std::vector<std::string> names_in(IFileSystem& fs, const std::string& path) {
+  std::vector<std::string> out;
+  UniquePointer<IDirectory> dir;
+  if (fs.open_directory(path.c_str(), &dir) != Status::Ok) { out.push_back("!open"); return out; }
+  DirectoryEntry e;
+  Status s;
+  while ((s = dir->next(&e)) == Status::Ok) out.push_back(e.name.c_str());
+  if (s != Status::EndOfDirectory) out.push_back(std::string("!") + status_name(s));
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+static std::string long_name(int i, size_t length) {
+  char number[16];
+  snprintf(number, sizeof number, "%05d", i);
+  std::string name = "n";
+  name += number;
+  while (name.size() < length) name += static_cast<char>('a' + (i + name.size()) % 26);
+  return name;
+}
+
+static bool put_file(IFileSystem& fs, const std::string& path, const std::vector<uint8_t>& data) {
+  UniquePointer<IFile> f;
+  if (fs.open_file(path.c_str(), OpenMode::CreateTruncate, &f) != Status::Ok) return false;
+  uint64_t done = 0;
+  return data.empty() || (f->write(0, ConstByteView(data.data(), data.size()), &done) == Status::Ok && done == data.size());
+}
+
+static void test_namespace() {
+  printf("BeFS creating, removing, renaming\n");
+  Built v(1024, 13, 3, 1024);
+  const uint32_t bs = 1024;
+  TestAllocator a;
+  {
+    MemDisk disk(v.image.img.data(), v.image.img.size(), 512, 0, true);
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (!fs) return;
+    const std::vector<uint8_t> bitmap_before(disk.data + bs, disk.data + bs + 3 * bs);
+    const uint64_t used_before = rd64(disk.data + 512 + 56);
+    DirectoryEntry e;
+    UniquePointer<IFile> f;
+
+    // Files and directories.
+    CHECK(put_file(*fs, "/new.txt", make_data(3000, 20)));
+    std::vector<uint8_t> got;
+    CHECK(read_back(*fs, "/new.txt", &got) && got == make_data(3000, 20));
+    CHECK_STATUS(fs->create_directory("/newdir"), Status::Ok);
+    CHECK_STATUS(fs->create_directory("/newdir/inner"), Status::Ok);
+    CHECK(put_file(*fs, "/newdir/inner/deep.bin", make_data(70000, 21)));
+    CHECK(read_back(*fs, "/newdir/inner/deep.bin", &got) && got == make_data(70000, 21));
+    CHECK(names_in(*fs, "/newdir") == std::vector<std::string>{"inner"});
+    CHECK_STATUS(fs->stat("/newdir/inner", &e), Status::Ok);
+    CHECK(e.type == NodeType::Directory && e.name.equals("inner"));
+    CHECK_STATUS(fs->open_file("/new.txt", OpenMode::CreateOrOpen, &f), Status::Ok);  // exists: opened, not truncated
+    CHECK(f->size() == 3000);
+    f = UniquePointer<IFile>();
+    CHECK(names_in(*fs, "/").size() == 13);
+    check_accounting(disk.data, v.image, "after creating");
+
+    // Refusals.
+    CHECK_STATUS(fs->create_directory("/newdir"), Status::AlreadyExists);
+    CHECK_STATUS(fs->create_directory("/new.txt"), Status::AlreadyExists);
+    CHECK_STATUS(fs->create_directory("/"), Status::InvalidPath);
+    CHECK_STATUS(fs->create_directory("/sub/../b"), Status::InvalidPath);
+    CHECK_STATUS(fs->create_directory("/nowhere/x"), Status::NotFound);
+    CHECK_STATUS(fs->create_directory("/new.txt/x"), Status::NotADirectory);
+    CHECK_STATUS(fs->create_directory(("/" + std::string(256, 'x')).c_str()), Status::InvalidPath);
+    CHECK_STATUS(fs->create_directory(("/" + std::string(255, 'x')).c_str()), Status::Ok);
+    CHECK_STATUS(fs->open_file("/nowhere/x", OpenMode::CreateOrOpen, &f), Status::NotFound);
+    CHECK_STATUS(fs->open_file("/nothing", OpenMode::ReadWrite, &f), Status::NotFound);
+    CHECK_STATUS(fs->remove("/"), Status::InvalidPath);
+    CHECK_STATUS(fs->remove("/nothing"), Status::NotFound);
+    CHECK_STATUS(fs->remove("/newdir"), Status::NotEmpty);
+    CHECK_STATUS(fs->remove("/newdir/inner/deep.bin/x"), Status::NotADirectory);
+    CHECK_STATUS(fs->rename("/nothing", "/x"), Status::NotFound);
+    CHECK_STATUS(fs->rename("/new.txt", "/newdir"), Status::AlreadyExists);
+    CHECK_STATUS(fs->rename("/new.txt", "/new.txt"), Status::AlreadyExists);
+    CHECK_STATUS(fs->rename("/new.txt", "/nowhere/x"), Status::NotFound);
+    CHECK_STATUS(fs->rename("/newdir", "/newdir/inner/moved"), Status::InvalidArgument);
+    CHECK_STATUS(fs->rename("/newdir", "/newdir/moved"), Status::InvalidArgument);
+    CHECK_STATUS(fs->rename("/", "/x"), Status::InvalidPath);
+
+    // Open things cannot be removed; the handle stays good through a rename.
+    CHECK_STATUS(fs->open_file("/new.txt", OpenMode::ReadWrite, &f), Status::Ok);
+    CHECK_STATUS(fs->remove("/new.txt"), Status::Busy);
+    CHECK_STATUS(fs->rename("/new.txt", "/newdir/renamed.txt"), Status::Ok);
+    uint64_t done = 0;
+    CHECK_STATUS(f->write(3000, ConstByteView(reinterpret_cast<const uint8_t*>("tail"), 4), &done), Status::Ok);
+    CHECK(read_back(*fs, "/newdir/renamed.txt", &got) && got.size() == 3004);
+    CHECK_STATUS(fs->stat("/new.txt", &e), Status::NotFound);
+    f = UniquePointer<IFile>();
+    {
+      UniquePointer<IDirectory> d;
+      CHECK_STATUS(fs->open_directory("/newdir/inner", &d), Status::Ok);
+      CHECK_STATUS(fs->remove("/newdir/inner/deep.bin"), Status::Ok);
+      CHECK_STATUS(fs->remove("/newdir/inner"), Status::Busy);
+    }
+    CHECK_STATUS(fs->remove("/newdir/inner"), Status::Ok);
+    check_accounting(disk.data, v.image, "after the first removals");
+
+    // Moving a directory to another place.
+    CHECK_STATUS(fs->create_directory("/a"), Status::Ok);
+    CHECK_STATUS(fs->create_directory("/a/b"), Status::Ok);
+    CHECK(put_file(*fs, "/a/b/file", make_data(5000, 22)));
+    CHECK_STATUS(fs->rename("/a/b", "/newdir/b2"), Status::Ok);
+    CHECK(names_in(*fs, "/a").empty());
+    CHECK(read_back(*fs, "/newdir/b2/file", &got) && got == make_data(5000, 22));
+    CHECK_STATUS(fs->rename("/newdir/b2", "/sub/../c"), Status::InvalidPath);
+    CHECK_STATUS(fs->rename("/a", "/newdir/b2/a"), Status::Ok);
+    CHECK(read_back(*fs, "/newdir/b2/a/../file", &got) == false);
+    CHECK_STATUS(fs->rename("/newdir/b2", "/newdir/b2/a/inside"), Status::InvalidArgument);
+    check_accounting(disk.data, v.image, "after moving");
+    CHECK_STATUS(fs->remove("/newdir/b2/file"), Status::Ok);
+    CHECK_STATUS(fs->remove("/newdir/b2/a"), Status::Ok);
+    CHECK_STATUS(fs->remove("/newdir/b2"), Status::Ok);
+    CHECK_STATUS(fs->remove("/newdir/renamed.txt"), Status::Ok);
+    CHECK_STATUS(fs->remove("/newdir"), Status::Ok);
+    CHECK_STATUS(fs->remove(("/" + std::string(255, 'x')).c_str()), Status::Ok);
+    check_accounting(disk.data, v.image, "after the clean-up");
+    CHECK(rd64(disk.data + 512 + 56) == used_before);
+    CHECK(std::vector<uint8_t>(disk.data + bs, disk.data + bs + 3 * bs) == bitmap_before);  // everything came back
+
+    // A directory with so many long names that its tree gets several levels.
+    CHECK_STATUS(fs->create_directory("/wide"), Status::Ok);
+    const int count = 600;
+    std::vector<int> order(count);
+    for (int i = 0; i < count; ++i) order[i] = i;
+    uint32_t seed = 99;
+    auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    for (int i = count - 1; i > 0; --i) std::swap(order[i], order[rnd() % (i + 1)]);
+    for (int i : order) CHECK(put_file(*fs, "/wide/" + long_name(i, 100 + i % 100), i % 7 == 0 ? make_data(i * 3, i) : std::vector<uint8_t>()));
+    check_accounting(disk.data, v.image, "wide directory");
+    std::vector<std::string> expect;
+    for (int i = 0; i < count; ++i) expect.push_back(long_name(i, 100 + i % 100));
+    std::sort(expect.begin(), expect.end());
+    CHECK(names_in(*fs, "/wide") == expect);
+    {
+      const RawVolume raw{disk.data, bs, v.image.ag_shift, v.image.ag_count, v.image.total, v.image.per_group};
+      TreeInfo root_info, wide_info;
+      CHECK(check_tree(raw, (rd32(disk.data + 512 + 116) << v.image.ag_shift) + rd16(disk.data + 512 + 120), &root_info, "root"));
+      uint64_t wide_inode = 0;
+      for (auto& entry : root_info.entries) if (entry.first == "wide") wide_inode = entry.second;
+      CHECK(wide_inode != 0 && check_tree(raw, wide_inode, &wide_info, "wide"));
+      CHECK(wide_info.levels >= 4 && wide_info.entries.size() == static_cast<size_t>(count));
+    }
+    for (int i = 0; i < count; ++i) {
+      if (i % 7 == 0) {
+        CHECK(read_back(*fs, ("/wide/" + long_name(i, 100 + i % 100)).c_str(), &got) && got == make_data(i * 3, i));
+      } else {
+        CHECK_STATUS(fs->stat(("/wide/" + long_name(i, 100 + i % 100)).c_str(), &e), Status::Ok);
+      }
+    }
+    // Listing while the directory changes underneath: it carries on without error.
+    {
+      UniquePointer<IDirectory> d;
+      CHECK_STATUS(fs->open_directory("/wide", &d), Status::Ok);
+      int seen = 0;
+      Status s;
+      while ((s = d->next(&e)) == Status::Ok) {
+        if (seen % 10 == 0) {
+          const int victim = order[seen % count];
+          fs->remove(("/wide/" + long_name(victim, 100 + victim % 100)).c_str());
+          put_file(*fs, "/wide/" + long_name(1000 + seen, 120), {});
+        }
+        if (++seen > 5000) break;
+      }
+      CHECK(s == Status::EndOfDirectory);
+      CHECK(seen > 100 && seen < 5000);
+    }
+    check_accounting(disk.data, v.image, "after listing during changes");
+    // Empty it in random order, then remove it: the volume is as it was.
+    std::vector<std::string> now = names_in(*fs, "/wide");
+    for (size_t i = now.size(); i > 1; --i) std::swap(now[i - 1], now[rnd() % i]);
+    for (size_t i = 0; i < now.size(); ++i) {
+      CHECK_STATUS(fs->remove(("/wide/" + now[i]).c_str()), Status::Ok);
+      if (i % 100 == 0) check_accounting(disk.data, v.image, "while emptying");
+    }
+    CHECK(names_in(*fs, "/wide").empty());
+    check_accounting(disk.data, v.image, "emptied directory");
+    {  // Fill it again: the nodes freed above are used again before the directory grows.
+      const RawVolume raw{disk.data, bs, v.image.ag_shift, v.image.ag_count, v.image.total, v.image.per_group};
+      TreeInfo root_info, before, after;
+      CHECK(check_tree(raw, (rd32(disk.data + 512 + 116) << v.image.ag_shift) + rd16(disk.data + 512 + 120), &root_info, "root"));
+      uint64_t wide_inode = 0;
+      for (auto& entry : root_info.entries) if (entry.first == "wide") wide_inode = entry.second;
+      CHECK(wide_inode != 0 && check_tree(raw, wide_inode, &before, "wide, empty"));
+      CHECK(before.free_nodes > 20);
+      const uint64_t size_before = rd64(disk.data + wide_inode * bs + 72 + 136);
+      for (int i = 0; i < 250; ++i) CHECK(put_file(*fs, "/wide/" + long_name(i, 100 + i % 100), {}));
+      CHECK(check_tree(raw, wide_inode, &after, "wide, refilled"));
+      CHECK(after.entries.size() == 250 && after.free_nodes < before.free_nodes);
+      CHECK(rd64(disk.data + wide_inode * bs + 72 + 136) == size_before);  // (no new nodes were needed)
+      check_accounting(disk.data, v.image, "refilled directory");
+      std::vector<std::string> again = names_in(*fs, "/wide");
+      for (size_t i = 0; i < again.size(); ++i) CHECK_STATUS(fs->remove(("/wide/" + again[i]).c_str()), Status::Ok);
+    }
+    CHECK_STATUS(fs->remove("/wide"), Status::Ok);
+    check_accounting(disk.data, v.image, "after removing it");
+    CHECK(rd64(disk.data + 512 + 56) == used_before);
+    CHECK(std::vector<uint8_t>(disk.data + bs, disk.data + bs + 3 * bs) == bitmap_before);
+
+    // Removing files of every layout gives all their blocks back.
+    CHECK_STATUS(fs->remove("/big"), Status::Ok);
+    CHECK_STATUS(fs->remove("/frag"), Status::Ok);
+    CHECK_STATUS(fs->remove("/contig"), Status::Ok);
+    CHECK_STATUS(fs->remove("/link"), Status::Ok);
+    CHECK_STATUS(fs->remove("/empty"), Status::Ok);
+    CHECK_STATUS(fs->remove("/many"), Status::NotEmpty);
+    check_accounting(disk.data, v.image, "after removing files");
+    CHECK(read_back(*fs, "/hello.txt", &got) && got.size() == 13);
+    CHECK(read_back(*fs, "/many/f007", &got) && std::string(got.begin(), got.end()) == "f007");
+
+    fs = UniquePointer<IFileSystem>();
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (fs) CHECK(read_back(*fs, "/sub/nested.txt", &got) && got.size() == 6);
+  }
+  CHECK(a.live == 0);
+}
+
+// Random namespace operations against a model of the tree.
+struct NsNode { bool dir; std::vector<uint8_t> data; };
+
+static void test_namespace_random(uint32_t block_size, uint32_t ag_shift, const char* what) {
+  printf("BeFS random namespace operations (%s)\n", what);
+  Built v(block_size, ag_shift, 2, block_size);
+  TestAllocator a;
+  {
+    MemDisk disk(v.image.img.data(), v.image.img.size(), 512, 0, true);
+    UniquePointer<IFileSystem> fs;
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (!fs) return;
+    CHECK_STATUS(fs->create_directory("/t"), Status::Ok);
+    std::map<std::string, NsNode> model;
+    model["/t"] = {true, {}};
+    uint32_t seed = 31337;
+    auto rnd = [&seed]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    auto pick = [&](bool want_dir, bool any) -> std::string {
+      std::vector<std::string> options;
+      for (auto& n : model) if (any || n.second.dir == want_dir) options.push_back(n.first);
+      return options.empty() ? std::string() : options[rnd() % options.size()];
+    };
+    auto children = [&](const std::string& dir) {
+      std::vector<std::string> out;
+      for (auto& n : model) if (n.first.size() > dir.size() + 1 && n.first.compare(0, dir.size() + 1, dir + "/") == 0 && n.first.find('/', dir.size() + 1) == std::string::npos) out.push_back(n.first.substr(dir.size() + 1));
+      return out;
+    };
+    auto fresh_name = [&]() { return long_name(rnd() % 40, rnd() % 3 == 0 ? 150 : 6); };
+    const int iterations = 1500;
+    for (int i = 0; i < iterations; ++i) {
+      const uint32_t op = rnd() % 10;
+      if (op < 3) {  // create a file
+        const std::string path = pick(true, false) + "/" + fresh_name();
+        const bool exists = model.count(path);
+        std::vector<uint8_t> data = make_data(rnd() % (3 * block_size), rnd());
+        UniquePointer<IFile> f;
+        Status s = fs->open_file(path.c_str(), OpenMode::CreateOrOpen, &f);
+        if (exists && model[path].dir) { CHECK_STATUS(s, Status::IsADirectory); continue; }
+        if (s != Status::Ok) { printf("  create %s -> %s (iteration %d)\n", path.c_str(), status_name(s), i); ++g_failed; break; }
+        uint64_t done = 0;
+        if (!exists) model[path] = {false, {}};
+        if (!data.empty()) { s = f->write(0, ConstByteView(data.data(), data.size()), &done); CHECK_STATUS(s, Status::Ok); }
+        std::vector<uint8_t>& m = model[path].data;
+        if (m.size() < data.size()) m.resize(data.size(), 0);
+        if (!data.empty()) memcpy(m.data(), data.data(), data.size());
+      } else if (op < 4) {  // make a directory
+        const std::string path = pick(true, false) + "/" + fresh_name();
+        const Status s = fs->create_directory(path.c_str());
+        if (model.count(path)) { CHECK_STATUS(s, Status::AlreadyExists); } else { CHECK_STATUS(s, Status::Ok); if (s == Status::Ok) model[path] = {true, {}}; }
+      } else if (op < 7) {  // remove something
+        const std::string path = pick(false, true);
+        if (path.empty() || path == "/t") continue;
+        const Status s = fs->remove(path.c_str());
+        if (model[path].dir && !children(path).empty()) { CHECK_STATUS(s, Status::NotEmpty); } else { CHECK_STATUS(s, Status::Ok); if (s == Status::Ok) model.erase(path); }
+      } else if (op < 9) {  // rename
+        const std::string from = pick(false, true);
+        if (from.empty() || from == "/t") continue;
+        const std::string to = pick(true, false) + "/" + fresh_name();
+        const Status s = fs->rename(from.c_str(), to.c_str());
+        Status want = Status::Ok;
+        if (model.count(to)) want = Status::AlreadyExists;
+        else if (model[from].dir && (to == from || to.compare(0, from.size() + 1, from + "/") == 0)) want = Status::InvalidArgument;
+        CHECK_STATUS(s, want);
+        if (s == Status::Ok && want == Status::Ok) {
+          std::map<std::string, NsNode> moved;
+          for (auto it = model.begin(); it != model.end();) {
+            if (it->first == from || it->first.compare(0, from.size() + 1, from + "/") == 0) { moved[to + it->first.substr(from.size())] = it->second; it = model.erase(it); }
+            else ++it;
+          }
+          model.insert(moved.begin(), moved.end());
+        }
+      } else {  // cut or grow a file
+        const std::string path = pick(false, false);
+        if (path.empty()) continue;
+        UniquePointer<IFile> f;
+        if (fs->open_file(path.c_str(), OpenMode::ReadWrite, &f) != Status::Ok) continue;
+        if (model.count(path) && !model[path].dir) {
+          const uint64_t size = rnd() % (4 * block_size);
+          CHECK_STATUS(f->resize(size), Status::Ok);
+          model[path].data.resize(size, 0);
+        }
+      }
+      if (i % 50 == 49 || i + 1 == iterations) {
+        for (auto& n : model) {
+          if (!n.second.dir) continue;
+          std::vector<std::string> want = children(n.first);
+          std::sort(want.begin(), want.end());
+          if (names_in(*fs, n.first) != want) { printf("FAILED: listing of %s differs (iteration %d)\n", n.first.c_str(), i); ++g_failed; }
+        }
+        for (auto& n : model) {
+          if (n.second.dir) continue;
+          std::vector<uint8_t> got;
+          if (!read_back(*fs, n.first.c_str(), &got) || got != n.second.data) { printf("FAILED: %s differs (iteration %d)\n", n.first.c_str(), i); ++g_failed; }
+        }
+        if (g_failed) break;
+      }
+      if (i % 300 == 299) check_accounting(disk.data, v.image, "random namespace");
+    }
+    check_accounting(disk.data, v.image, "random namespace, end");
+    fs = UniquePointer<IFileSystem>();
+    CHECK_STATUS(BefsFileSystem::mount(a, disk, 0, &fs), Status::Ok);
+    if (fs) {
+      for (auto& n : model) {
+        if (n.second.dir) continue;
+        std::vector<uint8_t> got;
+        if (!read_back(*fs, n.first.c_str(), &got) || got != n.second.data) { printf("FAILED: %s differs after remount\n", n.first.c_str()); ++g_failed; }
+      }
     }
   }
   CHECK(a.live == 0);
@@ -917,6 +1404,9 @@ int main() {
   test_write_full();
   test_write_refused();
   test_write_fuzz();
+  test_namespace();
+  test_namespace_random(1024, 13, "1 KiB blocks");
+  test_namespace_random(2048, 12, "2 KiB blocks");
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("befs tests passed\n");
   return 0;
