@@ -8151,12 +8151,23 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       g.dispatchEvent(new Event('unload'));
     });
     // Page Visibility: the host says the page is shown or not. A page that is hidden gets no animation frames until it is shown again.
-    var frames = {}, frameId = 0, rawFrame = g.requestAnimationFrame, rawCancel = g.cancelAnimationFrame;
-    var schedule = function (w) {
-      w.raw = rawFrame.call(g, function (stamp) {
-        if (document.hidden) { w.raw = 0; return; }   // (it runs when the page is shown again)
-        delete frames[w.id];
-        w.fn.call(g, stamp);
+    // requestAnimationFrame: one frame at a time. The callbacks asked for before the frame run in the order they were asked for, all with the same time stamp
+    // (performance.now() at the start of the frame); what they ask for runs in the next frame. A hidden page has no frames (they come when it is shown again).
+    var frameCallbacks = [], frameIds = {}, frameCounter = 0, frameTimer = false, rawFrame = g.requestAnimationFrame;
+    var wantFrame = function () {
+      if (frameTimer || document.hidden || frameCallbacks.length === 0) return;
+      frameTimer = true;
+      rawFrame.call(g, function () {
+        frameTimer = false;
+        if (document.hidden) return;
+        var stamp = performance.now(), batch = frameCallbacks;
+        frameCallbacks = [];
+        batch.forEach(function (item) {
+          if (item.cancelled) return;
+          delete frameIds[item.id];
+          try { item.fn.call(g, stamp); } catch (e) { setTimeout(function () { throw e; }, 0); }
+        });
+        wantFrame();
       });
     };
     hide(g, '__page_visibility', function (hidden) {
@@ -8164,21 +8175,30 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (document.hidden === hidden) return;
       __set_hidden(hidden);
       document.dispatchEvent(new Event('visibilitychange', { bubbles: true }));
-      if (!hidden) Object.keys(frames).forEach(function (id) { var w = frames[id]; if (w && !w.raw) schedule(w); });
+      if (!hidden) wantFrame();
     });
-    method(g, 'requestAnimationFrame', function (fn) {
-      if (typeof fn !== 'function') return rawFrame.call(g, fn);   // (throws)
-      var w = { id: ++frameId, fn: fn, raw: 0 };
-      frames[w.id] = w;
-      if (!document.hidden) schedule(w);
-      return w.id;
-    });
-    method(g, 'cancelAnimationFrame', function (id) {
-      var w = frames[id];
-      if (!w) return;
-      delete frames[id];
-      if (w.raw) rawCancel.call(g, w.raw);
-    });
+    var request = function (fn) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'requestAnimationFrame' on 'Window': 1 argument required, but only 0 present.");
+      if (typeof fn !== 'function') throw new TypeError("Failed to execute 'requestAnimationFrame' on 'Window': The callback provided as parameter 1 is not a function.");
+      var item = { id: ++frameCounter, fn: fn, cancelled: false };
+      frameIds[item.id] = item;
+      frameCallbacks.push(item);
+      wantFrame();
+      return item.id;
+    };
+    var cancel = function (id) {
+      var item = frameIds[id];
+      if (!item) return;
+      item.cancelled = true;
+      delete frameIds[id];
+      var at = frameCallbacks.indexOf(item);
+      if (at >= 0) frameCallbacks.splice(at, 1);
+    };
+    method(g, 'requestAnimationFrame', request);
+    method(g, 'cancelAnimationFrame', cancel);
+    method(g, 'webkitRequestAnimationFrame', request);
+    method(g, 'webkitCancelAnimationFrame', cancel);
+    method(g, 'webkitCancelRequestAnimationFrame', cancel);
     var restoration = 'auto';
     Object.defineProperty(g.history, 'scrollRestoration', {
       get: function () { return restoration; },
