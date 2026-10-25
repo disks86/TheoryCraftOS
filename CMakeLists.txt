@@ -412,6 +412,8 @@ add_executable(BOOTX64
   src/Gui/Controls/LevelMeter.cpp
   src/Gui/Controls/PieChart.cpp
   src/Gui/Controls/BarChart.cpp
+  src/Gui/Controls/HeatMap.cpp
+  src/Gui/Controls/WordCloud.cpp
   src/Gui/Controls/Tooltip.cpp
   src/Gui/Controls/ToastCenter.cpp
   src/Gui/Controls/CheckBox.cpp
