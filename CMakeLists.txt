@@ -501,6 +501,9 @@ add_executable(BOOTX64
   src/Hardware/Monitor/MonitorLayout.cpp
   src/Hardware/Monitor/SystemMonitors.cpp
   src/Hardware/MidiDevice/Mpu401.cpp
+  src/Hardware/SerialPort/SerialRing.cpp
+  src/Hardware/SerialPort/Uart16550.cpp
+  src/Hardware/SerialPort/SystemSerialPorts.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiDescriptors.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiDevice.cpp
   src/Hardware/MidiDevice/Usb/UsbMidiService.cpp
