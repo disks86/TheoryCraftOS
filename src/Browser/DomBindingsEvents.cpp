@@ -58,14 +58,19 @@ JsObject* listeners_of(Vm& vm, JsObject* target, bool create) {
   return l;
 }
 
-bool read_options(Vm& vm, const Value& options, bool* capture, bool* once) {
+bool read_options(Vm& vm, const Value& options, bool* capture, bool* once, bool* passive = nullptr) {
   *capture = *once = false;
+  if (passive) *passive = false;
   if (options.is_object()) {
     Value v;
     if (!vm.get_named(options, "capture", &v)) return false;
     *capture = Vm::to_boolean(v);
     if (!vm.get_named(options, "once", &v)) return false;
     *once = Vm::to_boolean(v);
+    if (passive) {
+      if (!vm.get_named(options, "passive", &v)) return false;
+      *passive = Vm::to_boolean(v);
+    }
   } else {
     *capture = Vm::to_boolean(options);
   }
@@ -85,8 +90,8 @@ NATIVE(add_event_listener) {
   if (!target || !arg_text(vm, arg_at(args, argc, 0), &type)) return false;
   const Value fn = arg_at(args, argc, 1);
   if (!Vm::is_callable(fn) && !fn.is_object()) return true;   // (null: nothing to add)
-  bool capture, once;
-  if (!read_options(vm, arg_at(args, argc, 2), &capture, &once)) return false;
+  bool capture, once, passive;
+  if (!read_options(vm, arg_at(args, argc, 2), &capture, &once, &passive)) return false;
   JsObject* l = listeners_of(vm, target, true);
   JsString* key = vm.intern(type.view());
   Value list_value;
@@ -101,10 +106,11 @@ NATIVE(add_event_listener) {
     JsObject* e = list->items[i].as_object();
     if (vm.strict_equals(e->items[0], fn) && Vm::to_boolean(e->items[1]) == capture) return true;
   }
-  JsObject* entry = vm.new_array(3);
+  JsObject* entry = vm.new_array(4);
   vm.array_push(entry, fn);
   vm.array_push(entry, bool_value(capture));
   vm.array_push(entry, bool_value(once));
+  vm.array_push(entry, bool_value(passive));
   vm.array_push(list, Value::make_object(entry));
   return true;
 }
@@ -155,6 +161,7 @@ bool event_flag(Vm& vm, JsObject* e, const char* name) {
 NATIVE(event_prevent_default) {
   if (!self.is_object()) return true;
   JsObject* e = self.as_object();
+  if (event_flag(vm, e, "__passive")) return true;
   Value cancelable;
   if (vm.get_plain(e, vm.intern("cancelable"), &cancelable) && Vm::to_boolean(cancelable)) vm.define_named(e, "defaultPrevented", bool_value(true));
   return true;
@@ -413,7 +420,10 @@ bool invoke(DomBindings::Impl& c, dom::Node* node, JsObject* current, StringView
         }
       }
     }
+    const bool passive = entry->length > 3 && Vm::to_boolean(entry->items[3]);   // (a passive listener's preventDefault() does nothing)
+    if (passive) vm.define(e, vm.intern("__passive"), bool_value(true), 0);
     call_listener(c, entry->items[0], current, event, type);
+    if (passive) vm.define(e, vm.intern("__passive"), bool_value(false), 0);
     if (event_flag(vm, e, "__stopi")) return false;
   }
   return true;

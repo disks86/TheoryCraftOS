@@ -7370,6 +7370,47 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   legacy(g.KeyboardEvent && g.KeyboardEvent.prototype, 'initKeyboardEvent', ['type', 'bubbles', 'cancelable', 'view', 'key', 'location', 'ctrlKey', 'altKey', 'shiftKey', 'metaKey']);
   legacy(g.CustomEvent && g.CustomEvent.prototype, 'initCustomEvent', ['type', 'bubbles', 'cancelable', 'detail']);
   legacy(g.FocusEvent && g.FocusEvent.prototype, 'initFocusEvent', ['type', 'bubbles', 'cancelable', 'view', 'detail', 'relatedTarget']);
+  // Event interface constants, the UIEvent hierarchy, cancelBubble and CustomEvent.detail
+  (function () {
+    var phases = { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 };
+    Object.keys(phases).forEach(function (k) {
+      Object.defineProperty(g.Event, k, { value: phases[k], enumerable: true });
+      Object.defineProperty(g.Event.prototype, k, { value: phases[k], enumerable: true });
+    });
+    ['MouseEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent', 'TouchEvent'].forEach(function (n) { if (g[n] && g.UIEvent) Object.setPrototypeOf(g[n].prototype, g.UIEvent.prototype); });
+    ['PointerEvent', 'WheelEvent'].forEach(function (n) { if (g[n] && g.MouseEvent) Object.setPrototypeOf(g[n].prototype, g.MouseEvent.prototype); });
+    Object.defineProperty(g.Event.prototype, 'cancelBubble', {
+      get: function () { return this.__stop === true; },
+      set: function (v) { if (v) this.stopPropagation(); }, configurable: true, enumerable: true });
+    // addEventListener's signal option: the listener goes when the signal aborts (and is not added when it already has)
+    var ET = g.EventTarget && g.EventTarget.prototype, nativeAdd = ET && ET.addEventListener;
+    if (nativeAdd) method(ET, 'addEventListener', function (type, fn, options) {
+      var signal = options && typeof options === 'object' ? options.signal : undefined, self = this;
+      if (signal !== undefined && signal !== null) {
+        if (signal.aborted) return;
+        var capture = !!options.capture;
+        nativeAdd.call(this, type, fn, options);
+        signal.addEventListener('abort', function () { ET.removeEventListener.call(self, type, fn, capture); }, { once: true });
+        return;
+      }
+      return nativeAdd.apply(this, arguments);
+    });
+    var NativeCustom = g.CustomEvent;
+    if (NativeCustom) {
+      var CustomEvent = function (type, init) {
+        if (!(this instanceof CustomEvent)) throw typeErr("construct 'CustomEvent'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+        if (arguments.length < 1) throw typeErr("construct 'CustomEvent'", '1 argument required, but only 0 present.');
+        var e = new NativeCustom(type, init);
+        if (!init || init.detail === undefined) Object.defineProperty(e, 'detail', { value: null, enumerable: true, writable: true, configurable: true });
+        Object.setPrototypeOf(e, CustomEvent.prototype);
+        return e;
+      };
+      CustomEvent.prototype = NativeCustom.prototype;
+      Object.defineProperty(NativeCustom.prototype, 'constructor', { value: CustomEvent, writable: true, configurable: true });
+      Object.defineProperty(CustomEvent, 'name', { value: 'CustomEvent' });
+      hide(g, 'CustomEvent', CustomEvent);
+    }
+  }());
   legacy(g.CompositionEvent && g.CompositionEvent.prototype, 'initCompositionEvent', ['type', 'bubbles', 'cancelable', 'view', 'data']);
   legacy(g.StorageEvent && g.StorageEvent.prototype, 'initStorageEvent', ['type', 'bubbles', 'cancelable', 'key', 'oldValue', 'newValue', 'url', 'storageArea']);
 
