@@ -230,7 +230,43 @@ static void test_framebuffer_object() {
   CHECK(a.live == 0);
 }
 
+static void test_transform_feedback() {
+  TestAllocator a;
+  {
+    GlContext gl(a, true, 8, 8, GlContext::Attributes());
+    const uint32_t v = gl.create_shader(0x8B31), f = gl.create_shader(0x8B30), p = gl.create_program();
+    gl.shader_source(v, "#version 300 es\nlayout(location=0) in vec2 pos; out vec2 doubled; out float idx; void main() { doubled = pos * 2.0; idx = float(gl_VertexID); gl_Position = vec4(pos, 0.0, 1.0); }");
+    gl.compile_shader(v);
+    gl.shader_source(f, "#version 300 es\nprecision highp float; out vec4 o; void main() { o = vec4(1.0); }");
+    gl.compile_shader(f);
+    gl.attach_shader(p, v);
+    gl.attach_shader(p, f);
+    const StringView names[] = {"doubled", "idx"};
+    gl.transform_feedback_varyings(p, ArrayView<const StringView>(names, 2), 0x8C8C);
+    gl.link_program(p);
+    gl.use_program(p);
+    const float verts[] = {1, 2, 3, 4, 5, 6};
+    const uint32_t vb = gl.create_buffer(), tb = gl.create_buffer();
+    gl.bind_buffer(0x8892, vb);
+    gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(verts), sizeof(verts)), 0, 0x88E4);
+    gl.enable_vertex_attrib(0, true);
+    gl.vertex_attrib_pointer(0, 2, 0x1406, false, 0, 0, false);
+    gl.bind_buffer(0x8C8E, tb);
+    gl.buffer_data(0x8C8E, ConstByteView(), 36, 0x88E8);
+    gl.bind_buffer_range(0x8C8E, 0, tb, 0, 0);
+    gl.enable(0x8C89, true);
+    gl.begin_transform_feedback(4);
+    gl.draw_arrays(4, 0, 3, 1);
+    gl.end_transform_feedback();
+    float out[9];
+    CHECK(gl.get_buffer_sub_data(0x8C8E, 0, ByteView(reinterpret_cast<uint8_t*>(out), 36)));
+    CHECK(out[0] == 2 && out[1] == 4 && out[2] == 0 && out[3] == 6 && out[4] == 8 && out[5] == 1 && out[6] == 10 && out[7] == 12 && out[8] == 2);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_transform_feedback();
   test_triangle();
   test_interpolation_and_blend();
   test_depth_and_textures();

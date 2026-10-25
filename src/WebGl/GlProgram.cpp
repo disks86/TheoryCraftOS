@@ -599,10 +599,43 @@ void GlContext::transform_feedback_varyings(uint32_t program, ArrayView<const St
 void GlContext::begin_transform_feedback(uint32_t) {
   TransformFeedbackObj* tf = tf_bound_ ? tfs_[tf_bound_ - 1].get() : &default_tf_;
   tf->active = true;
+  tf_active_ = true;
+  for (auto& v : tf_pos_) v = 0;
 }
 void GlContext::end_transform_feedback() {
   TransformFeedbackObj* tf = tf_bound_ ? tfs_[tf_bound_ - 1].get() : &default_tf_;
   tf->active = false;
+  tf_active_ = false;
+}
+
+// Appends the captured varyings of one vertex (the vertex shader's private slots) to the bound feedback buffers.
+void GlContext::tf_capture(const ProgramObj& p, const uint32_t* priv) {
+  const bool separate = p.tf_mode == 0x8C8D;
+  for (uint64_t i = 0; i < p.tf_varyings.count(); ++i) {
+    const StringView name = p.tf_varyings[i]->view();
+    const shader::Global* g = nullptr;
+    for (uint64_t k = 0; k < p.vsm->globals.count() && !g; ++k) {
+      const shader::Global& c = *p.vsm->globals[k];
+      if (c.kind != shader::GlobalKind::Out && !(c.kind == shader::GlobalKind::Builtin && c.builtin == shader::kBvPosition)) continue;
+      if (c.name.view().equals(name)) g = &c;
+    }
+    if (!g) continue;
+    const uint32_t binding = separate ? static_cast<uint32_t>(i) : 0;
+    if (binding >= 4) continue;
+    const BufferBinding& bb = tf_bindings_[binding];
+    Buffer* b = buffer_at(bb.buffer);
+    if (!b) continue;
+    const uint32_t n = p.vsm->slots_of(g->type);
+    const uint64_t limit = bb.size ? bb.offset + bb.size : b->data.size();
+    ByteView bytes = b->data.writable_view();
+    for (uint32_t k = 0; k < n; ++k) {
+      const uint64_t at = bb.offset + tf_pos_[binding];
+      if (at + 4 > limit || at + 4 > bytes.size()) return;
+      const uint32_t v = priv[g->slot + k];
+      __builtin_memcpy(bytes.data() + at, &v, 4);
+      tf_pos_[binding] += 4;
+    }
+  }
 }
 
 }  // namespace webgl

@@ -616,8 +616,8 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
   m2('deleteTransformFeedback', function (o) { if (o && !o.__deleted) { call(this.__id, OP.destroy, 120, o.__h); o.__deleted = true; } });
   m2('isTransformFeedback', function (o) { return !!o && o instanceof Classes.TransformFeedback && !o.__deleted; });
   m2('bindTransformFeedback', function () {});
-  m2('beginTransformFeedback', function () {});
-  m2('endTransformFeedback', function () {});
+  m2('beginTransformFeedback', function (mode) { CALL(this, 'beginTransformFeedback', mode); });
+  m2('endTransformFeedback', function () { CALL(this, 'endTransformFeedback'); });
   m2('pauseTransformFeedback', function () {});
   m2('resumeTransformFeedback', function () {});
   m2('transformFeedbackVaryings', function (p, names, mode) { CALL(this, 'transformFeedbackVaryings', handleOf(p), Array.prototype.slice.call(names), mode); });
