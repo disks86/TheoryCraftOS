@@ -40,6 +40,7 @@
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/WebBrowser.hpp"
+#include "Desktop/WebNotifications.hpp"
 #include "Browser/CacheStore.hpp"
 #include "Browser/ServiceWorker.hpp"
 #include "Desktop/BrowserStore.hpp"
@@ -353,6 +354,8 @@ class Desktop {
   browser::CacheStore cache_store_;       // the Cache API's caches, of every origin
   browser::ServiceWorkerHub service_workers_;   // and its service workers (before the browsers: their pages are clients of it to the end)
   WebBrowser web_browser_;
+  gui::MessageDialog permission_dialog_;   // "may this site show notifications?"
+  WebNotifications web_notifications_;   // the toasts and the question for the notifications of its pages
   Terminal terminal_;
   Calculator calculator_;
   MediaPlayer media_player_;

@@ -55,6 +55,19 @@
 
 namespace desktop {
 
+// Where the notifications of pages and the questions about their permission go: the desktop shows them as toasts and a dialog (see WebNotifications.hpp). Called from any thread.
+class INotificationSink {
+ public:
+  // The question "may this origin show notifications?" is put to the user: -1 (the answer comes later, through the hub's set_notification_permission()), 0 when it cannot be asked.
+  virtual int prompt(StringView origin) = 0;
+  virtual uint32_t show(StringView origin, StringView title, StringView body, bool sticky, StringView actions) = 0;
+  virtual void close(uint32_t number) = 0;
+
+ protected:
+  INotificationSink() = default;
+  ~INotificationSink() = default;
+};
+
 class WebBrowser : public gui::Frame {
  public:
   static constexpr uint64_t kMaxFileBytes = 4u << 20;
@@ -159,6 +172,8 @@ class WebBrowser : public gui::Frame {
     open_fn_ = handler;
     open_ctx_ = context;
   }
+  // Where the notifications of pages are shown (nullptr: nowhere - pages are not allowed any).
+  void set_notification_sink(INotificationSink* sink) { notification_sink_ = sink; }
   // A window a page opened may be closed by its script (window.close()); one that was not may not.
   void set_opened_by_script(bool opened) { opened_by_script_ = opened; }
   // The list of pages Back / Forward would go to, nearest first (the address of each, or its title once it has been left), at most `limit`.
@@ -199,6 +214,13 @@ class WebBrowser : public gui::Frame {
     void history_go_to_key(uint64_t key) override;
     bool open_window(StringView address, StringView target, bool noopener) override;
     void close_window() override;
+    int notification_prompt(StringView origin) override { return owner_.notification_sink_ ? owner_.notification_sink_->prompt(origin) : 0; }
+    uint32_t notification_show(StringView origin, StringView title, StringView body, bool sticky, StringView actions) override {
+      return owner_.notification_sink_ ? owner_.notification_sink_->show(origin, title, body, sticky, actions) : 0;
+    }
+    void notification_close(uint32_t number) override {
+      if (owner_.notification_sink_) owner_.notification_sink_->close(number);
+    }
     void alert(StringView text) override;
     bool confirm(StringView) override { return false; }
     void scroll_to(int32_t line) override;
@@ -317,6 +339,7 @@ class WebBrowser : public gui::Frame {
   String refresh_target_;
   List<String> defer_opens_;        // window.open() addresses to hand to the desktop
   bool want_close_ = false, opened_by_script_ = false;
+  INotificationSink* notification_sink_ = nullptr;
   OpenWindowFn open_fn_ = nullptr;
   void* open_ctx_ = nullptr;
   gui::Panel toolbar_, status_bar_;

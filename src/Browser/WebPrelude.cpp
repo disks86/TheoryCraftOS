@@ -6209,8 +6209,9 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (statuses[name]) return statuses[name];
       var st = Object.create(PermissionStatus.prototype);
       Object.defineProperty(st, 'name', { value: name, enumerable: true });
-      Object.defineProperty(st, 'state', { get: function () { if (name === 'clipboard-read') return g.__activeNow() ? 'granted' : 'prompt'; return granted[name] ? 'granted' : (name === 'notifications' || name === 'push' ? 'denied' : 'prompt'); }, enumerable: true });
+      Object.defineProperty(st, 'state', { get: function () { if (name === 'clipboard-read') return g.__activeNow() ? 'granted' : 'prompt'; if (name === 'notifications' || name === 'push') { var np = __nt_permission(); return np === 'granted' ? 'granted' : np === 'denied' ? 'denied' : 'prompt'; } return granted[name] ? 'granted' : 'prompt'; }, enumerable: true });
       st.onchange = null;
+      if (name === 'notifications' || name === 'push') told[name] = st.state;
       return (statuses[name] = st);
     };
     method(Permissions.prototype, 'query', function (descriptor) {
@@ -6220,6 +6221,17 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (known.indexOf(name) < 0) return Promise.reject(typeErr("execute 'query' on 'Permissions'", "The provided value '" + name + "' is not a valid enum value of type PermissionName."));
       return Promise.resolve(statusFor(name));
     });
+    // the notification permission changed (the user answered): the statuses that follow it say so
+    var told = {};
+    Object.defineProperty(g, '__perm_changed', { value: function () {
+      ['notifications', 'push'].forEach(function (name) {
+        var st = statuses[name];
+        if (!st) return;
+        var now = st.state;
+        if (told[name] !== undefined && told[name] !== now) { var e = new Event('change'); if (typeof st.onchange === 'function') st.onchange.call(st, e); st.dispatchEvent(e); }
+        told[name] = now;
+      });
+    }, writable: true });
     method(Permissions.prototype, 'request', function (d) { return this.query(d); });
     method(Permissions.prototype, 'revoke', function (d) { return this.query(d); });
     var permissions = Object.create(Permissions.prototype);
@@ -6445,20 +6457,100 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   // ---------------------------------------------------------------------------------------------------------------------------------- notifications
   (function () {
     if (g.Notification) return;
+    var inWorker = typeof __sws_id === 'function' && __sws_id() !== 0;
+    var live = {}, waiting = [];   // the notifications of this document that wait for the user (by number); the requestPermission() calls waiting for the answer
+    var DIRS = ['auto', 'ltr', 'rtl'];
+    var fail = function (what, message) { return new TypeError("Failed to " + what + ": " + message); };
+    // What the options say, checked the way the standard has it, and cut into what the hub needs and what it keeps for the events.
+    var spec = function (what, title, options, persistent) {
+      if (options === undefined || options === null) options = {};
+      else if (typeof options !== 'object' && typeof options !== 'function') throw fail(what, "The provided value is not of type 'NotificationOptions'.");
+      var o = {}, dir = options.dir === undefined ? 'auto' : String(options.dir);
+      if (DIRS.indexOf(dir) < 0) throw fail(what, "The provided value '" + dir + "' is not a valid enum value of type NotificationDirection.");
+      var tag = options.tag === undefined ? '' : String(options.tag), actions = [];
+      if (options.actions !== undefined && options.actions !== null) {
+        if (!persistent) throw fail(what, 'Actions are only supported for persistent notifications.');
+        for (var i = 0; i < options.actions.length && actions.length < Notification.maxActions; i++) {
+          var a = options.actions[i];
+          if (a === null || typeof a !== 'object' || a.action === undefined || a.title === undefined) throw fail(what, "Required member is undefined.");
+          actions.push({ action: String(a.action), title: String(a.title), icon: a.icon === undefined ? '' : String(a.icon) });
+        }
+      }
+      var vibrate = [];
+      if (options.vibrate !== undefined && options.vibrate !== null) {
+        var v = typeof options.vibrate === 'number' ? [options.vibrate] : Array.prototype.slice.call(options.vibrate);
+        vibrate = v.map(function (n) { n = Number(n); return n > 0 ? n : 0; });
+      }
+      var silent = options.silent === undefined || options.silent === null ? null : !!options.silent;
+      if (silent === true && vibrate.length) throw fail(what, 'Silent notifications must not specify vibration patterns.');
+      var renotify = !!options.renotify;
+      if (renotify && tag === '') throw fail(what, 'Notifications which set the renotify flag must specify a non-empty tag.');
+      o.icon = options.icon === undefined ? '' : String(options.icon); o.badge = options.badge === undefined ? '' : String(options.badge); o.image = options.image === undefined ? '' : String(options.image);
+      o.lang = options.lang === undefined ? '' : String(options.lang); o.dir = dir; o.silent = silent; o.requireInteraction = !!options.requireInteraction; o.renotify = renotify;
+      o.vibrate = vibrate; o.actions = actions; o.timestamp = options.timestamp === undefined ? g.Date.now() : Number(options.timestamp);
+      if (options.data !== undefined) { var s = g.__serialize_transfer(options.data, []); o.d = s.text; o.di = s.ids; }
+      return { title: String(title), body: options.body === undefined ? '' : String(options.body), tag: tag, sticky: o.requireInteraction, renotify: renotify, options: JSON.stringify(o),
+               ids: actions.map(function (a) { return a.action.replace(/\n/g, ' '); }).join('\n'), titles: actions.map(function (a) { return a.title.replace(/\n/g, ' '); }).join('\n') };
+    };
+    var fill = function (n, title, body, tag, o) {
+      var ro = function (k, v) { Object.defineProperty(n, k, { value: v, enumerable: true, configurable: true }); };
+      ro('title', title); ro('body', body); ro('tag', tag); ro('icon', o.icon || ''); ro('badge', o.badge || ''); ro('image', o.image || ''); ro('lang', o.lang || ''); ro('dir', o.dir || 'auto');
+      ro('silent', o.silent === undefined ? null : o.silent); ro('requireInteraction', !!o.requireInteraction); ro('renotify', !!o.renotify); ro('vibrate', Object.freeze((o.vibrate || []).slice()));
+      ro('timestamp', o.timestamp === undefined ? 0 : o.timestamp); ro('actions', Object.freeze((o.actions || []).map(function (a) { return Object.freeze({ action: a.action, title: a.title, icon: a.icon }); })));
+      ro('data', o.d === undefined ? null : g.__deserialize_transfer(o.d, o.di || '').data);
+      n.onclick = n.onclose = n.onerror = n.onshow = null;
+    };
     var Notification = klass('Notification', ET, function (title, options) {
+      if (inWorker) throw fail("construct 'Notification'", "Illegal constructor. Use ServiceWorkerRegistration.showNotification() instead.");
       if (arguments.length < 1) throw typeErr("construct 'Notification'", '1 argument required, but only 0 present.');
-      options = options || {};
-      this.title = String(title); this.body = options.body === undefined ? '' : String(options.body); this.icon = options.icon || ''; this.tag = options.tag || '';
-      this.data = options.data === undefined ? null : options.data; this.lang = options.lang || ''; this.dir = options.dir || 'auto'; this.silent = options.silent === undefined ? null : options.silent;
-      this.requireInteraction = !!options.requireInteraction; this.timestamp = Date.now();
-      this.onclick = this.onclose = this.onerror = this.onshow = null;
-      var self = this;
-      later(function () { self.dispatchEvent(new Event('error')); });   // (no permission: the notification is not shown)
+      var sp = spec("construct 'Notification'", title, options, false), self = this;
+      fill(this, sp.title, sp.body, sp.tag, JSON.parse(sp.options));
+      hide(this, '__id', 0);
+      if (__nt_permission() !== 'granted') { later(function () { fire(self, 'error'); }); return; }
+      var res = JSON.parse(__nt_show(0, sp.title, sp.body, sp.tag, sp.sticky, sp.renotify, sp.options, '', ''));
+      if (!res.ok) { later(function () { fire(self, 'error'); }); return; }
+      self.__id = res.id; live[res.id] = self;
     });
-    Object.defineProperty(Notification, 'permission', { get: function () { return 'denied'; }, enumerable: true });
+    var fire = function (n, type) {
+      var e = new Event(type), h = n['on' + type];
+      if (typeof h === 'function') h.call(n, e);
+      n.dispatchEvent(e);
+    };
+    Object.defineProperty(Notification, 'permission', { get: function () { var s = __nt_permission(); return s === 'pending' ? 'default' : s; }, enumerable: true });
     Notification.maxActions = 2;
-    Notification.requestPermission = function (callback) { if (typeof callback === 'function') later(function () { callback('denied'); }); return Promise.resolve('denied'); };
-    method(Notification.prototype, 'close', function () { });
+    Notification.requestPermission = function (callback) {
+      if (callback !== undefined && callback !== null && typeof callback !== 'function') return Promise.reject(fail("execute 'requestPermission' on 'Notification'", 'The callback provided as parameter 1 is not a function.'));
+      return new Promise(function (resolve) {
+        var s = __nt_request();
+        if (s === 'pending') waiting.push(resolve); else resolve(s);
+      }).then(function (s) {
+        if (g.__perm_changed) g.__perm_changed();
+        if (typeof callback === 'function') callback(s);
+        return s;
+      });
+    };
+    method(Notification.prototype, 'close', function () { if (this.__id) __nt_close(this.__id); });
+    // what the hub tells the document: the answer the user gave, and what happened to a notice
+    hide(g, '__notify_permission_changed', function (state) {
+      var list = waiting; waiting = [];
+      list.forEach(function (resolve) { resolve(state); });
+      if (g.__perm_changed) g.__perm_changed();
+    });
+    hide(g, '__notify_event', function (id, type) {
+      var n = live[id];
+      if (!n) return;
+      if (type === 'close') delete live[id];
+      fire(n, type);
+    });
+    // for the service worker side: what showNotification() sends, and a Notification made from what the hub kept
+    hide(g, '__notification_spec', function (title, options) { return spec("execute 'showNotification' on 'ServiceWorkerRegistration'", title, options, true); });
+    hide(g, '__notification_from', function (info) {
+      var n = Object.create(Notification.prototype), o = {};
+      try { o = info.o || {}; } catch (e) { }
+      fill(n, info.title, info.body, info.tag, o);
+      hide(n, '__id', info.id);
+      return n;
+    });
   }());
   if (!g.SharedWorker) {
     var SharedWorker = klass('SharedWorker', ET, function () { throw new DOMException('SharedWorker is not supported by this browser.', 'NotSupportedError'); });

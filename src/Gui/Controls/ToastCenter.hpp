@@ -22,9 +22,12 @@
 // The center is one control that sits over the other controls of its parent (add it after them); it shrinks to the toasts it shows, so everything
 // else stays reachable, and it paints nothing while it has none. post() may be called from any thread. The time comes from tick(), which the
 // desktop calls with the uptime: a toast's time starts at the first tick after it was posted. Clicking a toast fires its handler (if it
-// has one) and removes it; clicking its [x] only removes it. When more than kMaxToasts are showing, the oldest goes.
+// has one) and removes it; clicking its [x] only removes it. A toast may carry up to kMaxActions buttons (a row of small labelled buttons under the text):
+// clicking one runs the toast's action handler instead (last_action() then says which, counting from 0) and removes the toast; clicking elsewhere on the toast
+// sets last_action() to -1. When more than kMaxToasts are showing, the oldest goes.
 #pragma once
 #include "Gui/Control.hpp"
+#include "Utility/ArrayView.hpp"
 #include "Gui/NoticeDialog.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
@@ -33,7 +36,8 @@ namespace gui {
 
 class ToastCenter : public Control {
  public:
-  static constexpr uint32_t kMaxToasts = 5, kMaxLines = 3, kTitleChars = 36, kDefaultDurationMs = 5000;
+  static constexpr uint32_t kMaxToasts = 5, kMaxLines = 3, kTitleChars = 36, kDefaultDurationMs = 5000, kMaxActions = 2, kActionChars = 14;
+  static constexpr int32_t kActionHeight = 20, kActionGap = 6, kActionPad = 8;
   static constexpr int32_t kWidth = 340, kMargin = 8, kGap = 6, kPad = 6, kStripe = 4;
 
   explicit ToastCenter(allocators::IAllocator& allocator) : Control(allocator), toasts_(allocator) {}
@@ -42,7 +46,14 @@ class ToastCenter : public Control {
   // It stays `duration_ms` (0: until clicked). `on_click` runs when the toast is clicked, with the center as its sender. Returns the toast's
   // number (never 0), or 0 if memory ran out or both texts are empty.
   uint32_t post(StringView title, StringView message, NoticeKind kind = NoticeKind::Information, uint32_t duration_ms = kDefaultDurationMs,
-                Handler on_click = Handler());
+                Handler on_click = Handler(), ArrayView<const StringView> actions = ArrayView<const StringView>(), Handler on_action = Handler());
+  // The button the last click on a toast hit (0 is the first), -1 if it was on the toast itself. Read it in the handler that click fired.
+  int32_t last_action() const { return last_action_; }
+  // The buttons of a toast: how many, and their texts ("" past the last).
+  uint32_t action_count(uint32_t id) const;
+  StringView action_of(uint32_t id, uint32_t index) const;
+  // Where button `index` of toast number `toast` (0 is the oldest) is, in the parent's coordinates; an empty rectangle if there is none.
+  Rect2D action_bounds(uint32_t toast, uint32_t index) const;
   // Removes a toast (false: there is none with that number - it timed out or was clicked already).
   bool dismiss(uint32_t id);
   void clear();
@@ -66,20 +77,24 @@ class ToastCenter : public Control {
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
 
-  static constexpr uint32_t kInfoColor = 0xFF2060C0, kWarningColor = 0xFFE0A000, kErrorColor = 0xFFC02020, kBackground = 0xFFF8F8F8;
+  static constexpr uint32_t kInfoColor = 0xFF2060C0, kWarningColor = 0xFFE0A000, kErrorColor = 0xFFC02020, kBackground = 0xFFF8F8F8, kActionBackground = 0xFFE4E4E4;
 
  private:
   struct Toast {
-    explicit Toast(allocators::IAllocator& allocator) : title(allocator), body(allocator) {}
+    explicit Toast(allocators::IAllocator& allocator) : title(allocator), body(allocator), actions{String(allocator), String(allocator)} {}
     uint32_t id = 0;
     NoticeKind kind = NoticeKind::Information;
     String title, body;     // body: the wrapped lines joined by '\n'
     uint32_t lines = 0;
     uint64_t duration_us = 0, deadline_us = 0;   // deadline 0: the clock has not been seen yet
-    Handler on_click;
+    Handler on_click, on_action;
+    String actions[kMaxActions];   // the texts of the buttons
+    uint32_t action_count = 0;
   };
 
   static int32_t height_of(const Toast& toast);
+  // The button `index` of a toast, relative to the toast's top left corner.
+  static Rect2D action_rect(const Toast& toast, uint32_t index);
   static uint32_t color_of(NoticeKind kind);
   int32_t stack_height() const;
   // The toast whose rectangle holds y (this control's coordinates), or count() if none.
@@ -89,6 +104,7 @@ class ToastCenter : public Control {
   Rect2D area_;
   bool has_area_ = false;
   uint32_t next_id_ = 1;
+  int32_t last_action_ = -1;
 };
 
 }  // namespace gui

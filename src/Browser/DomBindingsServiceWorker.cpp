@@ -301,6 +301,104 @@ NATIVE(sw_sync_tags) {
   return true;
 }
 
+// --- Notifications and Push ------------------------------------------------------------------------------------------------------
+
+// __nt_permission() / __nt_request() -> "default", "granted", "denied" ("pending": the user has not answered yet)
+NATIVE(nt_permission) {
+  (void)self; (void)args; (void)argc;
+  ServiceWorkerHub* hub = hub_of(vm);
+  String state(vm.allocator());
+  if (hub) hub->notify_permission(impl(vm).host.service_worker_client(), impl(vm).host.service_worker_id(), &state);
+  else state.assign("denied");
+  *result = str_value(vm, state.view());
+  return true;
+}
+NATIVE(nt_request) {
+  (void)self; (void)args; (void)argc;
+  ServiceWorkerHub* hub = hub_of(vm);
+  String state(vm.allocator());
+  if (hub) hub->notify_request(impl(vm).host.service_worker_client(), impl(vm).host.service_worker_id(), &state);
+  else state.assign("denied");
+  *result = str_value(vm, state.view());
+  return true;
+}
+// __nt_show(reg, title, body, tag, sticky, renotify, options, actionIds, actionTitles) -> JSON
+NATIVE(nt_show) {
+  (void)self;
+  ServiceWorkerHub* hub = hub_of(vm);
+  double reg;
+  String title(vm.allocator()), body(vm.allocator()), tag(vm.allocator()), options(vm.allocator()), ids(vm.allocator()), titles(vm.allocator()), json(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &reg) || !arg_text(vm, arg_at(args, argc, 1), &title) || !arg_text(vm, arg_at(args, argc, 2), &body) ||
+      !arg_text(vm, arg_at(args, argc, 3), &tag) || !arg_text(vm, arg_at(args, argc, 6), &options) || !arg_text(vm, arg_at(args, argc, 7), &ids) ||
+      !arg_text(vm, arg_at(args, argc, 8), &titles))
+    return false;
+  if (hub) hub->notify_show(impl(vm).host.service_worker_client(), static_cast<uint32_t>(reg), title.view(), body.view(), tag.view(), Vm::to_boolean(arg_at(args, argc, 4)),
+                            Vm::to_boolean(arg_at(args, argc, 5)), options.view(), ids.view(), titles.view(), &json);
+  else json.assign("{\"ok\":false,\"name\":\"NotAllowedError\",\"message\":\"No notification permission has been granted for this origin.\"}");
+  *result = str_value(vm, json.view());
+  return true;
+}
+NATIVE(nt_close) {
+  (void)self;
+  ServiceWorkerHub* hub = hub_of(vm);
+  double id;
+  if (!vm.to_number(arg_at(args, argc, 0), &id)) return false;
+  *result = bool_value(hub && hub->notify_close(impl(vm).host.service_worker_client(), static_cast<uint32_t>(id)));
+  return true;
+}
+NATIVE(nt_list) {
+  (void)self;
+  ServiceWorkerHub* hub = hub_of(vm);
+  double reg;
+  String tag(vm.allocator()), json(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &reg) || !arg_text(vm, arg_at(args, argc, 1), &tag)) return false;
+  if (hub) hub->notify_list(static_cast<uint32_t>(reg), tag.view(), &json);
+  else json.assign("[]");
+  *result = str_value(vm, json.view());
+  return true;
+}
+// __pu_subscribe(reg, userVisibleOnly, keyHex) -> JSON
+NATIVE(pu_subscribe) {
+  (void)self;
+  ServiceWorkerHub* hub = hub_of(vm);
+  double reg;
+  String key(vm.allocator()), json(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &reg) || !arg_text(vm, arg_at(args, argc, 2), &key)) return false;
+  if (hub) hub->push_subscribe(static_cast<uint32_t>(reg), Vm::to_boolean(arg_at(args, argc, 1)), key.view(), &json);
+  else json.assign("{\"ok\":false,\"name\":\"NotAllowedError\",\"message\":\"Registration failed - permission denied\"}");
+  *result = str_value(vm, json.view());
+  return true;
+}
+NATIVE(pu_get) {
+  (void)self;
+  ServiceWorkerHub* hub = hub_of(vm);
+  double reg;
+  String json(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &reg)) return false;
+  if (hub) hub->push_get(static_cast<uint32_t>(reg), &json);
+  *result = str_value(vm, json.view());
+  return true;
+}
+NATIVE(pu_unsubscribe) {
+  (void)self;
+  ServiceWorkerHub* hub = hub_of(vm);
+  double reg;
+  if (!vm.to_number(arg_at(args, argc, 0), &reg)) return false;
+  *result = bool_value(hub && hub->push_unsubscribe(static_cast<uint32_t>(reg)));
+  return true;
+}
+NATIVE(pu_state) {
+  (void)self;
+  ServiceWorkerHub* hub = hub_of(vm);
+  double reg;
+  String state(vm.allocator());
+  if (!vm.to_number(arg_at(args, argc, 0), &reg)) return false;
+  if (hub) hub->push_state(static_cast<uint32_t>(reg), &state);
+  else state.assign("denied");
+  *result = str_value(vm, state.view());
+  return true;
+}
+
 // --- Service workers: the global scope's side ------------------------------------------------------------------------------------
 
 // The worker this page is the scope of, and the hub; false (a TypeError thrown) in a page that is not one.
@@ -505,6 +603,15 @@ bool install_service_worker(DomBindings::Impl& c) {
   vm.define_native(g, "__sw_preload", sw_preload, 3);
   vm.define_native(g, "__sw_sync_register", sw_sync_register, 2);
   vm.define_native(g, "__sw_sync_tags", sw_sync_tags, 1);
+  vm.define_native(g, "__nt_permission", nt_permission, 0);
+  vm.define_native(g, "__nt_request", nt_request, 0);
+  vm.define_native(g, "__nt_show", nt_show, 9);
+  vm.define_native(g, "__nt_close", nt_close, 1);
+  vm.define_native(g, "__nt_list", nt_list, 2);
+  vm.define_native(g, "__pu_subscribe", pu_subscribe, 3);
+  vm.define_native(g, "__pu_get", pu_get, 1);
+  vm.define_native(g, "__pu_unsubscribe", pu_unsubscribe, 1);
+  vm.define_native(g, "__pu_state", pu_state, 1);
   vm.define_native(g, "__sws_id", sws_id, 0);
   vm.define_native(g, "__sws_skip_waiting", sws_skip_waiting, 0);
   vm.define_native(g, "__sws_claim", sws_claim, 0);

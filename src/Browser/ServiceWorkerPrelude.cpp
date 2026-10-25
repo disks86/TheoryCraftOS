@@ -332,11 +332,18 @@ const char kClientPrelude[] = R"JSPRELUDE((function (g) {
     return Promise.resolve(r);
   });
   method(ServiceWorkerRegistration.prototype, 'unregister', function () { return Promise.resolve(__sw_unregister(this.__id)); });
-  method(ServiceWorkerRegistration.prototype, 'showNotification', function (title) {
+  method(ServiceWorkerRegistration.prototype, 'showNotification', function (title, options) {
     if (arguments.length < 1) return Promise.reject(new TypeError("Failed to execute 'showNotification' on 'ServiceWorkerRegistration': 1 argument required, but only 0 present."));
-    return Promise.reject(new TypeError("Failed to execute 'showNotification' on 'ServiceWorkerRegistration': No notification permission has been granted for this origin."));
+    var sp;
+    try { sp = g.__notification_spec(title, options); } catch (e) { return Promise.reject(e); }
+    var res = JSON.parse(__nt_show(this.__id, sp.title, sp.body, sp.tag, sp.sticky, sp.renotify, sp.options, sp.ids, sp.titles));
+    if (!res.ok) return Promise.reject(res.name === 'NotAllowedError' ? new TypeError("Failed to execute 'showNotification' on 'ServiceWorkerRegistration': " + res.message) : error(res));
+    return Promise.resolve();
   });
-  method(ServiceWorkerRegistration.prototype, 'getNotifications', function () { return Promise.resolve([]); });
+  method(ServiceWorkerRegistration.prototype, 'getNotifications', function (filter) {
+    var tag = filter && filter.tag !== undefined ? String(filter.tag) : '';
+    return Promise.resolve(JSON.parse(__nt_list(this.__id, tag)).map(g.__notification_from));
+  });
   function manager(r, key, make) { return r.__managers[key] || (r.__managers[key] = make(r)); }
   accessor(ServiceWorkerRegistration.prototype, 'navigationPreload', function () {
     return manager(this, 'preload', function (r) { var m = Object.create(NavigationPreloadManager.prototype); hide(m, '__reg', r); return m; });
@@ -371,12 +378,92 @@ const char kClientPrelude[] = R"JSPRELUDE((function (g) {
   accessor(ServiceWorkerRegistration.prototype, 'pushManager', function () {
     return manager(this, 'push', function (r) { var m = Object.create(PushManager.prototype); hide(m, '__reg', r); return m; });
   });
-  method(PushManager.prototype, 'subscribe', function () { return Promise.reject(new DOMException('Registration failed - permission denied', 'NotAllowedError')); });
-  method(PushManager.prototype, 'getSubscription', function () { return Promise.resolve(null); });
-  method(PushManager.prototype, 'permissionState', function () { return Promise.resolve('denied'); });
+  // ------------------------------------------------------------------------------------------------------------------------------ Push
+  var PushSubscription = iface('PushSubscription'), PushSubscriptionOptions = iface('PushSubscriptionOptions'), PushMessageData = iface('PushMessageData');
+  var bytesOfHex = function (hex) {
+    var out = new Uint8Array(hex.length >> 1);
+    for (var i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  };
+  var hexOfBytes = function (bytes) {
+    var out = '';
+    for (var i = 0; i < bytes.length; i++) out += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+    return out;
+  };
+  var base64url = function (bytes) {
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return g.btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+  // the applicationServerKey of subscribe(): base64url text or bytes; a P-256 public key (65 bytes, the first is 4) as hex
+  var keyHex = function (key) {
+    var bytes;
+    if (typeof key === 'string') {
+      try { var bin = g.atob(key.replace(/-/g, '+').replace(/_/g, '/')); bytes = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); }
+      catch (e) { throw new DOMException("Failed to execute 'subscribe' on 'PushManager': The provided applicationServerKey is not encoded as base64url without padding.", 'InvalidCharacterError'); }
+    } else if (key instanceof ArrayBuffer) bytes = new Uint8Array(key);
+    else if (ArrayBuffer.isView(key)) bytes = new Uint8Array(key.buffer, key.byteOffset, key.byteLength);
+    else throw new TypeError("Failed to execute 'subscribe' on 'PushManager': The provided value is not of type '(ArrayBuffer or ArrayBufferView or DOMString)'.");
+    if (bytes.length !== 65 || bytes[0] !== 4) throw new DOMException("Failed to execute 'subscribe' on 'PushManager': The provided applicationServerKey is not valid.", 'InvalidAccessError');
+    return hexOfBytes(bytes);
+  };
+  function subscription(info, reg) {
+    var s = Object.create(PushSubscription.prototype), o = Object.create(PushSubscriptionOptions.prototype);
+    Object.defineProperty(o, 'userVisibleOnly', { value: true, enumerable: true });
+    Object.defineProperty(o, 'applicationServerKey', { value: info.key ? bytesOfHex(info.key).buffer : null, enumerable: true });
+    Object.defineProperty(s, 'endpoint', { value: info.endpoint, enumerable: true });
+    Object.defineProperty(s, 'expirationTime', { value: null, enumerable: true });
+    Object.defineProperty(s, 'options', { value: o, enumerable: true });
+    hide(s, '__info', info); hide(s, '__reg', reg);
+    return s;
+  }
+  method(PushSubscription.prototype, 'getKey', function (name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getKey' on 'PushSubscription': 1 argument required, but only 0 present.");
+    name = String(name);
+    if (name === 'p256dh') return bytesOfHex(this.__info.p256dh).buffer;
+    if (name === 'auth') return bytesOfHex(this.__info.auth).buffer;
+    if (name === '') return null;
+    throw new TypeError("Failed to execute 'getKey' on 'PushSubscription': The provided value '" + name + "' is not a valid enum value of type PushEncryptionKeyName.");
+  });
+  method(PushSubscription.prototype, 'toJSON', function () {
+    return { endpoint: this.endpoint, expirationTime: null, keys: { p256dh: base64url(bytesOfHex(this.__info.p256dh)), auth: base64url(bytesOfHex(this.__info.auth)) } };
+  });
+  method(PushSubscription.prototype, 'unsubscribe', function () {
+    var current = __pu_get(this.__reg);
+    if (!current || JSON.parse(current).endpoint !== this.endpoint) return Promise.resolve(false);
+    return Promise.resolve(__pu_unsubscribe(this.__reg));
+  });
+  var messageData = function (hex) {
+    var d = Object.create(PushMessageData.prototype);
+    hide(d, '__bytes', bytesOfHex(hex));
+    return d;
+  };
+  method(PushMessageData.prototype, 'arrayBuffer', function () { return this.__bytes.slice().buffer; });
+  method(PushMessageData.prototype, 'bytes', function () { return this.__bytes.slice(); });
+  method(PushMessageData.prototype, 'blob', function () { return new g.Blob([this.__bytes.slice()]); });
+  method(PushMessageData.prototype, 'text', function () { return new g.TextDecoder().decode(this.__bytes); });
+  method(PushMessageData.prototype, 'json', function () { return JSON.parse(this.text()); });
+  method(PushManager.prototype, 'subscribe', function (options) {
+    var reg = this.__reg, key = '';
+    options = options || {};
+    try { if (options.applicationServerKey !== undefined && options.applicationServerKey !== null) key = keyHex(options.applicationServerKey); } catch (e) { return Promise.reject(e); }
+    if (!options.userVisibleOnly) return Promise.reject(new DOMException('Failed to execute \'subscribe\' on \'PushManager\': Subscription failed - userVisibleOnly is false', 'NotAllowedError'));
+    var asked = !inScope && __nt_permission() === 'default' ? g.Notification.requestPermission() : Promise.resolve();
+    return asked.then(function () {
+      var res = JSON.parse(__pu_subscribe(reg.__id, true, key));
+      if (!res.ok) throw error(res);
+      return subscription(res.sub, reg.__id);
+    });
+  });
+  method(PushManager.prototype, 'getSubscription', function () {
+    var text = __pu_get(this.__reg.__id);
+    return Promise.resolve(text ? subscription(JSON.parse(text), this.__reg.__id) : null);
+  });
+  method(PushManager.prototype, 'permissionState', function () { return Promise.resolve(__pu_state(this.__reg.__id)); });
   PushManager.supportedContentEncodings = ['aes128gcm'];
 
   hide(g, '__sw_internals', { worker: worker, registration: registration });
+  hide(g, '__push_data', messageData); hide(g, '__push_subscription', subscription);
   if (inScope || !g.navigator || g.isSecureContext === false) return;
   var N = g.navigator;
 
@@ -466,6 +553,12 @@ const char kClientPrelude[] = R"JSPRELUDE((function (g) {
         try { got = g.__deserialize_transfer(e.data, e.ports); } catch (x) { container.dispatchEvent(new g.MessageEvent('messageerror', { data: null })); break; }
         container.dispatchEvent(new g.MessageEvent('message', { data: got.data, origin: e.origin, lastEventId: '', source: workerObjs[e.worker] || null, ports: got.ports }));
         break;
+      case 'permission':
+        g.__notify_permission_changed(e.state);
+        break;
+      case 'notification':
+        g.__notify_event(e.id, e.ev);
+        break;
       case 'port':
         g.__port_deliver(e.port, e.data, e.ports);
         break;
@@ -537,7 +630,7 @@ const char kScopePrelude[] = R"JSPRELUDE((function (g) {
   mk('SyncEvent', ExtendableEvent, [['tag', ''], ['lastChance', false]]);
   mk('PeriodicSyncEvent', ExtendableEvent, [['tag', '']]);
   mk('NotificationEvent', ExtendableEvent, [['notification', null], ['action', '']]);
-  mk('PushSubscriptionChangeEvent', ExtendableEvent, []);
+  mk('PushSubscriptionChangeEvent', ExtendableEvent, [['oldSubscription', null], ['newSubscription', null]]);
   mk('BackgroundFetchUpdateUIEvent', ExtendableEvent, []);
   mk('CookieChangeEvent2', ExtendableEvent, []);
 
@@ -652,8 +745,10 @@ const char kScopePrelude[] = R"JSPRELUDE((function (g) {
         event = new ExtendableMessageEvent('message', { data: got.data, origin: arg.origin || '', lastEventId: '', source: info ? clientObject(JSON.parse(info)) : null, ports: got.ports });
         break;
       case 'sync': event = new g.SyncEvent('sync', { tag: arg.tag, lastChance: !!arg.lastChance }); break;
-      case 'push': event = new g.PushEvent('push', { data: arg.data === undefined ? null : arg.data }); break;
-      case 'notificationclick': openAllowed = true; event = new g.NotificationEvent('notificationclick', { notification: arg.notification || null, action: arg.action || '' }); break;
+      case 'push': event = new g.PushEvent('push', { data: arg.data === undefined ? null : g.__push_data(arg.data) }); break;
+      case 'pushsubscriptionchange': event = new g.PushSubscriptionChangeEvent('pushsubscriptionchange', { oldSubscription: arg.old ? g.__push_subscription(arg.old, JSON.parse(__sws_registration()).id) : null, newSubscription: null }); break;
+      case 'notificationclose': event = new g.NotificationEvent('notificationclose', { notification: arg.notification ? g.__notification_from(arg.notification) : null, action: arg.action || '' }); break;
+      case 'notificationclick': openAllowed = true; event = new g.NotificationEvent('notificationclick', { notification: arg.notification ? g.__notification_from(arg.notification) : null, action: arg.action || '' }); break;
       default: __sws_done(token, true, ''); return;
     }
     try { fire(event); } finally { openAllowed = false; }

@@ -39,7 +39,15 @@ void for_each_line(StringView text, F&& each) {
 
 int32_t ToastCenter::height_of(const Toast& toast) {
   const int32_t rows = static_cast<int32_t>(toast.lines) + (toast.title.empty() ? 0 : 1);
-  return rows * Painter::kGlyphHeight + 2 * kPad + 2;
+  return rows * Painter::kGlyphHeight + 2 * kPad + 2 + (toast.action_count ? kPad + kActionHeight : 0);
+}
+
+Rect2D ToastCenter::action_rect(const Toast& toast, uint32_t index) {
+  if (index >= toast.action_count) return Rect2D{};
+  int32_t x = 1 + kStripe + kPad;
+  for (uint32_t i = 0; i < index; ++i) x += static_cast<int32_t>(toast.actions[i].size()) * Painter::kGlyphWidth + 2 * kActionPad + kActionGap;
+  const int32_t w = static_cast<int32_t>(toast.actions[index].size()) * Painter::kGlyphWidth + 2 * kActionPad;
+  return {x, height_of(toast) - 1 - kPad - kActionHeight, static_cast<uint32_t>(w), static_cast<uint32_t>(kActionHeight)};
 }
 
 uint32_t ToastCenter::color_of(NoticeKind kind) {
@@ -56,7 +64,8 @@ int32_t ToastCenter::stack_height() const {
   return total;
 }
 
-uint32_t ToastCenter::post(StringView title, StringView message, NoticeKind kind, uint32_t duration_ms, Handler on_click) {
+uint32_t ToastCenter::post(StringView title, StringView message, NoticeKind kind, uint32_t duration_ms, Handler on_click, ArrayView<const StringView> actions,
+                           Handler on_action) {
   if (title.empty() && message.empty()) return 0;
   UiGuard lock(this);
   Toast toast(allocator());
@@ -74,6 +83,13 @@ uint32_t ToastCenter::post(StringView title, StringView message, NoticeKind kind
   toast.kind = kind;
   toast.duration_us = uint64_t{duration_ms} * 1000;
   toast.on_click = on_click;
+  toast.on_action = on_action;
+  for (const StringView label : actions) {   // (the first kMaxActions with something to read, each cut at kActionChars)
+    if (toast.action_count >= kMaxActions) break;
+    if (label.empty()) continue;
+    if (!toast.actions[toast.action_count].assign(label.size() > kActionChars ? label.substr(0, kActionChars) : label)) return 0;
+    ++toast.action_count;
+  }
   toast.id = next_id_;
   if (!toasts_.push_back(static_cast<Toast&&>(toast))) return 0;
   const uint32_t id = next_id_++;
@@ -146,6 +162,28 @@ NoticeKind ToastCenter::kind_of(uint32_t id) const {
   return NoticeKind::Information;
 }
 
+uint32_t ToastCenter::action_count(uint32_t id) const {
+  for (uint64_t i = 0; i < toasts_.count(); ++i)
+    if (toasts_[i].id == id) return static_cast<uint32_t>(toasts_[i].action_count);
+  return 0;
+}
+
+StringView ToastCenter::action_of(uint32_t id, uint32_t index) const {
+  for (uint64_t i = 0; i < toasts_.count(); ++i)
+    if (toasts_[i].id == id) return index < toasts_[i].action_count ? toasts_[i].actions[index].view() : StringView();
+  return StringView();
+}
+
+Rect2D ToastCenter::action_bounds(uint32_t toast, uint32_t index) const {
+  if (toast >= toasts_.count()) return Rect2D{};
+  Rect2D r = action_rect(toasts_[toast], index);
+  if (r.width == 0) return r;
+  const Rect2D t = toast_bounds(toast);
+  r.x += t.x;
+  r.y += t.y;
+  return r;
+}
+
 Rect2D ToastCenter::toast_bounds(uint32_t index) const {
   if (index >= toasts_.count()) return Rect2D{};
   int32_t y = bounds_.y;
@@ -191,6 +229,13 @@ void ToastCenter::paint(Painter& painter) {
       painter.text(tx, ty, line, t.text);
       ty += Painter::kGlyphHeight;
     });
+    for (uint32_t j = 0; j < toast.action_count; ++j) {
+      Rect2D r = action_rect(toast, j);
+      r.y += y;
+      painter.fill(r, kActionBackground);
+      painter.outline(r, t.dark);
+      painter.text(r.x + kActionPad, r.y + (kActionHeight - Painter::kGlyphHeight) / 2, toast.actions[j].view(), t.text);
+    }
     y += h + kGap;
   }
 }
@@ -212,6 +257,20 @@ void ToastCenter::on_mouse_down(const MouseArgs& args) {
   const Toast& toast = toasts_[index];
   const bool close_box = args.x >= kWidth - kPad - 2 * Painter::kGlyphWidth && args.y < toast_bounds(index).y - bounds_.y + 1 + kPad + Painter::kGlyphHeight;
   const bool activate = args.button == MouseButton::Left && !close_box;
+  if (args.button == MouseButton::Left && !close_box) {   // a button of the toast?
+    const int32_t top = toast_bounds(index).y - bounds_.y;
+    for (uint32_t j = 0; j < toast.action_count; ++j) {
+      const Rect2D r = action_rect(toast, j);
+      if (!contains(Rect2D{r.x, r.y + top, r.width, r.height}, args.x, args.y)) continue;
+      const Handler action_handler = toast.on_action;
+      last_action_ = static_cast<int32_t>(j);
+      toasts_.remove_at(index);
+      invalidate();
+      if (action_handler) fire(action_handler);
+      return;
+    }
+  }
+  last_action_ = -1;
   const Handler handler = toast.on_click;
   toasts_.remove_at(index);
   invalidate();
