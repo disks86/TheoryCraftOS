@@ -320,9 +320,9 @@ void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec) {
   w.emit(0);
 }
 
-void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout) {
+void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id) {
   w.emit(kHcpSurfaceState | (3 - 2));
-  w.emit(layout.pitch - 1);
+  w.emit((id << 28) | (layout.pitch - 1));
   w.emit((kSurfacePlanar420 << 28) | layout.chroma_offset_rows);
 }
 
@@ -356,14 +356,16 @@ void emit_hevc_pipe_buf_addr_state(DwordWriter& w, const HevcBuffers& b) {
   for (uint32_t i = 0; i < 4; ++i) hcp_buffer(w, 0, b.mocs);   // 83-94, not used for HEVC
 }
 
-void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b) {
+void emit_hcp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs) {
   w.emit(kHcpIndObjBaseAddrState | (14 - 2));
-  hcp_buffer(w, b.bitstream, b.mocs);                   // 1-3
-  w.emit_address(b.bitstream + ((b.bitstream_bytes + 4095) & ~uint64_t{4095}));   // 4-5: the upper bound
-  hcp_buffer(w, 0, b.mocs);                             // 6-8
-  hcp_buffer(w, 0, b.mocs);                             // 9-11
+  hcp_buffer(w, bitstream, mocs);                       // 1-3
+  w.emit_address(bitstream + ((bitstream_bytes + 4095) & ~uint64_t{4095}));   // 4-5: the upper bound
+  hcp_buffer(w, 0, mocs);                               // 6-8
+  hcp_buffer(w, 0, mocs);                               // 9-11
   zeros(w, 2);                                          // 12-13
 }
+
+void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b) { emit_hcp_ind_obj_base_addr_state(w, b.bitstream, b.bitstream_bytes, b.mocs); }
 
 namespace {
 void hevc_qm_state(DwordWriter& w, uint32_t size_id, uint32_t component, uint32_t pred_type, uint32_t dc, const uint8_t* matrix, uint32_t length) {
@@ -452,6 +454,98 @@ void emit_hevc_bsd_object(DwordWriter& w, const HevcSlice& s) {
   w.emit(kHcpBsdObject | (3 - 2));
   w.emit(s.data_size);
   w.emit(s.data_offset);
+}
+
+
+// --- VP9
+
+Vp9BufferBytes vp9_buffer_bytes(uint32_t width, uint32_t height) {
+  const uint64_t w_sb = (uint64_t{width} + 63) / 64, h_sb = (uint64_t{height} + 63) / 64;
+  Vp9BufferBytes b;
+  b.deblocking_line = (w_sb * 18) << 6;
+  b.deblocking_tile_line = b.deblocking_line;
+  b.deblocking_tile_column = (h_sb * 17) << 6;
+  b.metadata_line = (w_sb * 5) << 6;
+  b.metadata_tile_line = b.metadata_line;
+  b.metadata_tile_column = (h_sb * 5) << 6;
+  b.hvd_line = w_sb << 6;
+  b.hvd_tile = b.hvd_line;
+  b.probability = 32 << 6;
+  b.segment_id = (w_sb * h_sb) << 6;
+  b.motion_vector = (w_sb * h_sb * 9) << 6;
+  return b;
+}
+
+void emit_vp9_pipe_buf_addr_state(DwordWriter& w, const Vp9Buffers& b) {
+  w.emit(kHcpPipeBufAddrState | (95 - 2));
+  hcp_buffer(w, b.current_picture, b.mocs);             // 1-3
+  hcp_buffer(w, b.deblocking_line, b.mocs);             // 4-6
+  hcp_buffer(w, b.deblocking_tile_line, b.mocs);
+  hcp_buffer(w, b.deblocking_tile_column, b.mocs);
+  hcp_buffer(w, b.metadata_line, b.mocs);               // 13-15
+  hcp_buffer(w, b.metadata_tile_line, b.mocs);
+  hcp_buffer(w, b.metadata_tile_column, b.mocs);
+  for (uint32_t i = 0; i < 3; ++i) hcp_buffer(w, 0, b.mocs);   // 22-30: the SAO buffers, not used for VP9
+  hcp_buffer(w, b.motion_vector_current, b.mocs);       // 31-33
+  hcp_buffer(w, 0, b.mocs);                             // 34-36, reserved
+  for (uint32_t i = 0; i < kMaxHevcReferenceFrames; ++i) address_or_zero(w, i < 3 ? b.reference_pictures[i] : 0);   // 37-52
+  w.emit(0);                                            // 53
+  for (uint32_t i = 0; i < 4; ++i) hcp_buffer(w, 0, b.mocs);   // 54-65
+  for (uint32_t i = 0; i < kMaxHevcReferenceFrames; ++i) address_or_zero(w, i == 0 ? b.motion_vector_last : 0);   // 66-81: the collocated motion vectors, of the frame before
+  w.emit(0);                                            // 82
+  hcp_buffer(w, b.probability, b.mocs);                 // 83-85
+  hcp_buffer(w, b.segment_id, b.mocs);                  // 86-88
+  hcp_buffer(w, b.hvd_line, b.mocs);                    // 89-91
+  hcp_buffer(w, b.hvd_tile, b.mocs);                    // 92-94
+}
+
+void emit_vp9_pic_state(DwordWriter& w, const Vp9Picture& p) {
+  w.emit(kHcpVp9PicState | (12 - 2));
+  w.emit(((p.height - 1) << 16) | (p.width - 1));
+  w.emit((uint32_t{p.segment_id_in} << 31) | (uint32_t{p.segment_id_out} << 30) | (uint32_t{p.lossless} << 29) | (uint32_t{p.segmentation_temporal_update} << 28) |
+         (uint32_t{p.segmentation_enabled && p.segment_id_out} << 27) | (uint32_t{p.segmentation_enabled} << 26) | (p.sharpness_level << 23) | (p.filter_level << 17) |
+         (uint32_t{p.frame_parallel} << 16) | (uint32_t{p.error_resilient} << 15) | (uint32_t{p.refresh_frame_context} << 14) | (p.last_frame_type << 13) |
+         (uint32_t{p.use_prev_frame_mvs} << 10) | (uint32_t{p.alt_ref_sign_bias} << 9) | (uint32_t{p.golden_ref_sign_bias} << 8) | (uint32_t{p.last_ref_sign_bias} << 7) |
+         (p.interp_filter << 4) | (uint32_t{p.allow_high_precision_mv} << 3) | (uint32_t{p.intra_only} << 2) | (uint32_t{p.adapt_probabilities} << 1) | p.frame_type);
+  w.emit((p.log2_tile_rows << 8) | p.log2_tile_columns);   // (profile 0, 8 bits, 4:2:0)
+  // How each reference picture is scaled to this one (16.14 fixed point; all ones when the sizes are not within the range the format allows), then their sizes.
+  for (uint32_t i = 0; i < 3; ++i) {
+    uint32_t scale_w = 0, scale_h = 0;
+    if (p.reference_present[i]) {
+      const uint32_t rw = p.reference_width[i], rh = p.reference_height[i];
+      if (2 * p.frame_width >= rw && 2 * p.frame_height >= rh && p.frame_width <= 16 * rw && p.frame_height <= 16 * rh) {
+        scale_w = (rw << 14) / p.frame_width;
+        scale_h = (rh << 14) / p.frame_height;
+      } else {
+        scale_w = scale_h = 0xFFFF;
+      }
+    }
+    w.emit(((scale_w & 0xFFFF) << 16) | (scale_h & 0xFFFF));
+  }
+  for (uint32_t i = 0; i < 3; ++i) w.emit(p.reference_present[i] ? (((p.reference_height[i] - 1) & 0x3FFF) << 16) | ((p.reference_width[i] - 1) & 0x3FFF) : 0);
+  w.emit((p.first_partition_size << 16) | p.header_bytes);
+  w.emit(1u << 1);
+}
+
+void emit_vp9_segment_state(DwordWriter& w, const Vp9Segment& s, bool filter_enabled, bool intra_frame) {
+  const uint32_t reference = intra_frame ? 0 : s.reference;
+  w.emit(kHcpVp9SegmentState | (7 - 2));
+  w.emit(s.id);
+  w.emit((uint32_t{s.reference_enabled} << 3) | (reference << 1) | uint32_t{s.reference_skipped});
+  if (filter_enabled) {
+    w.emit((uint32_t{s.filter_level[1][1]} << 24) | (uint32_t{s.filter_level[1][0]} << 16) | (uint32_t{s.filter_level[0][1]} << 8) | s.filter_level[0][0]);
+    w.emit((uint32_t{s.filter_level[3][1]} << 24) | (uint32_t{s.filter_level[3][0]} << 16) | (uint32_t{s.filter_level[2][1]} << 8) | s.filter_level[2][0]);
+  } else {
+    zeros(w, 2);
+  }
+  w.emit((s.luma_ac << 16) | s.luma_dc);
+  w.emit((s.chroma_ac << 16) | s.chroma_dc);
+}
+
+void emit_vp9_bsd_object(DwordWriter& w, uint32_t data_size, uint32_t data_offset) {
+  w.emit(kHcpBsdObject | (3 - 2));
+  w.emit(data_size);
+  w.emit(data_offset);
 }
 
 }  // namespace intel_mfx

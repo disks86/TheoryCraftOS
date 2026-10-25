@@ -1781,6 +1781,12 @@ void Core::fill_offload_frame(OffloadFrame* out, ConstByteView data, uint32_t un
   o.log2_tile_cols = log2_tile_cols_;
   o.log2_tile_rows = log2_tile_rows_;
   o.seg = seg_;
+  for (int sg = 0; sg < (seg_.enabled ? MAX_SEGMENTS : 1); ++sg) {
+    o.dequant[sg][0] = y_dequant_[sg][0];
+    o.dequant[sg][1] = y_dequant_[sg][1];
+    o.dequant[sg][2] = uv_dequant_[sg][0];
+    o.dequant[sg][3] = uv_dequant_[sg][1];
+  }
   for (int i = 0; i < 3; ++i) {
     o.ref_slot[i] = ref_slots_[i];
     o.sign_bias[i] = ref_frame_sign_bias_[LAST_FRAME + i];

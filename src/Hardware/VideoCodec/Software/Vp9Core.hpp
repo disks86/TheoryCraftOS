@@ -270,6 +270,7 @@ struct OffloadFrame {
   int base_qindex = 0, y_dc_delta_q = 0, uv_dc_delta_q = 0, uv_ac_delta_q = 0;   // all zero for a lossless frame
   int log2_tile_cols = 0, log2_tile_rows = 0;
   Segmentation seg;
+  int16_t dequant[MAX_SEGMENTS][4] = {};   // per segment (only the first without segmentation): the luma DC and AC and the chroma DC and AC quantizer steps
   int ref_slot[3] = {0, 0, 0};       // which of the eight reference slots the last, golden and alt-ref pictures are
   int sign_bias[3] = {0, 0, 0};
   int refresh_frame_flags = 0;

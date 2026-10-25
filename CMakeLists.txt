@@ -510,6 +510,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Intel/IntelMpeg2Session.cpp
   src/Hardware/VideoCodec/Intel/IntelVc1Session.cpp
   src/Hardware/VideoCodec/Intel/IntelHevcSession.cpp
+  src/Hardware/VideoCodec/Intel/IntelVp9Probs.cpp
+  src/Hardware/VideoCodec/Intel/IntelVp9Session.cpp
   src/Hardware/VideoCodec/Intel/IntelMediaVideoEngine.cpp
   src/Hardware/VideoCodec/Software/SoftwareVideoCodec.cpp
   src/Hardware/Printer/PrinterTypes.cpp

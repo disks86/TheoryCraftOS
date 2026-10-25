@@ -86,6 +86,8 @@ constexpr uint32_t kHcpRefIdxState = hcp_header(0x12);
 constexpr uint32_t kHcpWeightoffset = hcp_header(0x13);
 constexpr uint32_t kHcpSliceState = hcp_header(0x14);
 constexpr uint32_t kHcpBsdObject = hcp_header(0x20);
+constexpr uint32_t kHcpVp9PicState = hcp_header(0x30);
+constexpr uint32_t kHcpVp9SegmentState = hcp_header(0x32);
 constexpr uint32_t kHcpCodecHevc = 0, kHcpCodecVp9 = 1;
 
 // MI commands for the video ring.
@@ -333,7 +335,8 @@ constexpr uint32_t hevc_ref_idx_entry(uint32_t frame_store, bool long_term, int3
 }
 
 void emit_hcp_pipe_mode_select(DwordWriter& w, uint32_t codec);
-void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout);
+// `id` 0 is the picture being decoded; VP9 describes its three reference pictures as 2 to 4.
+void emit_hcp_surface_state(DwordWriter& w, const Nv12TiledLayout& layout, uint32_t id = 0);
 void emit_hevc_pipe_buf_addr_state(DwordWriter& w, const HevcBuffers& b);
 void emit_hevc_ind_obj_base_addr_state(DwordWriter& w, const HevcBuffers& b);
 void emit_hevc_qm_states(DwordWriter& w, const HevcScaling& s);
@@ -344,6 +347,62 @@ void emit_hevc_ref_idx_state(DwordWriter& w, uint32_t list, uint32_t count, cons
 void emit_hevc_weightoffset_state(DwordWriter& w, uint32_t list, uint32_t count, const HevcWeights& weights);
 void emit_hevc_slice_state(DwordWriter& w, const HevcSlice& s);
 void emit_hevc_bsd_object(DwordWriter& w, const HevcSlice& s);
+
+// --- VP9 (the HCP pipeline, Gen9.5 layouts of the reference driver's gen9_mfd.c). Profile 0 only: 8-bit 4:2:0.
+
+// Graphics addresses of what a frame uses (0: none).
+struct Vp9Buffers {
+  uint64_t current_picture = 0;
+  uint64_t reference_pictures[3] = {};                     // last, golden, alt-ref
+  uint64_t deblocking_line = 0, deblocking_tile_line = 0, deblocking_tile_column = 0;
+  uint64_t metadata_line = 0, metadata_tile_line = 0, metadata_tile_column = 0;
+  uint64_t motion_vector_current = 0, motion_vector_last = 0;
+  uint64_t probability = 0, segment_id = 0, hvd_line = 0, hvd_tile = 0;
+  uint64_t bitstream = 0, bitstream_bytes = 0;
+  uint32_t mocs = 2;
+};
+
+struct Vp9BufferBytes {
+  uint64_t deblocking_line = 0, deblocking_tile_line = 0, deblocking_tile_column = 0;
+  uint64_t metadata_line = 0, metadata_tile_line = 0, metadata_tile_column = 0;
+  uint64_t hvd_line = 0, hvd_tile = 0;
+  uint64_t probability = 0, segment_id = 0, motion_vector = 0;
+};
+// For a frame of `width` x `height` luma samples (the reference driver's formulas, in superblocks of 64).
+Vp9BufferBytes vp9_buffer_bytes(uint32_t width, uint32_t height);
+
+struct Vp9Picture {
+  uint32_t width = 0, height = 0;                          // luma samples, rounded up to 8
+  bool segment_id_in = false, segment_id_out = false, lossless = false, segmentation_temporal_update = false, segmentation_enabled = false;
+  uint32_t sharpness_level = 0, filter_level = 0;
+  bool frame_parallel = false, error_resilient = false, refresh_frame_context = false;
+  uint32_t last_frame_type = 0;                            // 0 key frame, 1 not
+  bool use_prev_frame_mvs = false;
+  bool alt_ref_sign_bias = false, golden_ref_sign_bias = false, last_ref_sign_bias = false;
+  uint32_t interp_filter = 0;                              // libvpx's numbering: 0 regular, 1 smooth, 2 sharp, 3 bilinear, 4 switchable
+  bool allow_high_precision_mv = false, intra_only = false, adapt_probabilities = false;
+  uint32_t frame_type = 0;                                 // 0 key frame, 1 inter frame
+  uint32_t log2_tile_columns = 0, log2_tile_rows = 0;
+  bool reference_present[3] = {false, false, false};
+  uint32_t reference_width[3] = {}, reference_height[3] = {};   // of the reference pictures, as coded
+  uint32_t frame_width = 0, frame_height = 0;              // as coded (not rounded)
+  uint32_t first_partition_size = 0, header_bytes = 0;     // the compressed header, the uncompressed header
+};
+
+struct Vp9Segment {
+  uint32_t id = 0;
+  bool reference_enabled = false, reference_skipped = false;
+  uint32_t reference = 0;
+  uint8_t filter_level[4][2] = {};
+  uint32_t luma_dc = 0, luma_ac = 0, chroma_dc = 0, chroma_ac = 0;
+};
+
+void emit_vp9_pipe_buf_addr_state(DwordWriter& w, const Vp9Buffers& b);
+void emit_hcp_ind_obj_base_addr_state(DwordWriter& w, uint64_t bitstream, uint64_t bitstream_bytes, uint32_t mocs);
+void emit_vp9_pic_state(DwordWriter& w, const Vp9Picture& p);
+void emit_vp9_segment_state(DwordWriter& w, const Vp9Segment& s, bool filter_enabled, bool intra_frame);
+// The frame's compressed header and tiles: `data_size` bytes at `data_offset` of the bitstream buffer.
+void emit_vp9_bsd_object(DwordWriter& w, uint32_t data_size, uint32_t data_offset);
 
 }  // namespace intel_mfx
 }  // namespace hardware
