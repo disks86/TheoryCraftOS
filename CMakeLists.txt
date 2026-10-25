@@ -250,6 +250,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsServiceWorker.cpp
   src/Browser/CacheStore.cpp
   src/Browser/ServiceWorker.cpp
+  src/Browser/WebPush.cpp
   src/Browser/ServiceWorkerPrelude.cpp
   src/Wasm/WasmDecode.cpp
   src/Wasm/WasmRun.cpp
@@ -381,6 +382,7 @@ add_executable(BOOTX64
   src/Desktop/Spreadsheet.cpp
   src/Desktop/DatabaseQuery.cpp
   src/Desktop/WebBrowser.cpp
+  src/Desktop/WebNotifications.cpp
   src/Desktop/PictureInPicture.cpp
   src/Desktop/BrowserStore.cpp
   src/Desktop/SessionStore.cpp

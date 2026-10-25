@@ -85,6 +85,17 @@ class IPageEnvironment : public IObjectEnvironment {
   virtual bool pip_supported() { return false; }
   virtual bool open_pip(uint32_t video_serial, uint32_t width, uint32_t height, PageObjects& objects) { (void)video_serial; (void)width; (void)height; (void)objects; return false; }
   virtual void close_pip() {}
+  // Notifications and Push (the service worker hub keeps the permissions, the notifications and the push subscriptions; the browser shows them to the user).
+  // Asks the user whether `origin` may show notifications: 1 allowed, 0 blocked, -1 not answered yet (the browser then calls ServiceWorkerHub::set_notification_permission()
+  // when the user has answered). Without a user to ask, a page is blocked.
+  virtual int notification_prompt(StringView origin) { (void)origin; return 0; }
+  // Shows a notice to the user (`sticky`: until the user deals with it; `actions`: the texts of its buttons, one on each line, at most two). Returns its number (0: it cannot be shown). When the user clicks it or sends it away the browser calls
+  // ServiceWorkerHub::notification_activated() (with the button, if one was) / notification_closed() with that number.
+  virtual uint32_t notification_show(StringView origin, StringView title, StringView body, bool sticky, StringView actions) {
+    (void)origin; (void)title; (void)body; (void)sticky; (void)actions;
+    return 0;
+  }
+  virtual void notification_close(uint32_t number) { (void)number; }
   virtual uint64_t now_ms() = 0;                 // milliseconds since 1970 (0 without a clock)
   virtual void console(int level, StringView text) = 0;
   // Web Storage: the hub of localStorage (all origins, all windows) and the one of this tab's sessionStorage; and what the pages share to talk to each other.

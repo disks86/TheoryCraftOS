@@ -28,6 +28,8 @@
 #include "Browser/Page.hpp"
 #include "Browser/CacheStore.hpp"
 #include "Browser/ServiceWorker.hpp"
+#include "Browser/WebPush.hpp"
+#include "Crypto/Ecc.hpp"
 #include "Browser/SessionHistory.hpp"
 #include "Dom/Form.hpp"
 #include "Browser/PageLayout.hpp"
@@ -184,6 +186,23 @@ struct FakeEnvironment final : IPageEnvironment {
   ServiceWorkerHub workers;
   CacheStore* cache_store() override { return &caches; }
   ServiceWorkerHub* service_workers() override { return &workers; }
+  // notifications: the answer to the permission question (-1: the user has not answered), and what was shown
+  int prompt_answer = 0, prompts = 0;
+  struct Shown {
+    uint32_t number;
+    std::string origin, title, body;
+    bool sticky;
+    std::string actions;
+  };
+  std::vector<Shown> shown;
+  std::vector<uint32_t> closed_numbers;
+  int notification_prompt(StringView) override { ++prompts; return prompt_answer; }
+  uint32_t notification_show(StringView origin, StringView title, StringView body, bool sticky, StringView actions) override {
+    const uint32_t number = static_cast<uint32_t>(shown.size() + 100);
+    shown.push_back({number, std::string(origin.data(), origin.size()), std::string(title.data(), title.size()), std::string(body.data(), body.size()), sticky, std::string(actions.data(), actions.size())});
+    return number;
+  }
+  void notification_close(uint32_t number) override { closed_numbers.push_back(number); }
   std::map<std::string, std::string> blobs;   // binary files (pictures, videos)
   FakeClip* last_clip = nullptr;
   bool can_play_video = true, clips_play_at_any_rate = false;
@@ -5091,6 +5110,265 @@ static void test_service_workers() {
       "function reg0() { return navigator.serviceWorker.getRegistration().then(function (r) { return r.periodicSync.register('p').catch(function (e) { log('periodic ' + e.name); return r.pushManager.subscribe().catch(function (e2) { log('push ' + e2.name); return r.showNotification('x').catch(function (e3) { log('notify ' + e3.name); }); }); }); }); }"}},
       "tags outbox msg sync:outbox left 0 periodic NotAllowedError push NotAllowedError notify TypeError",
       site_basic));
+
+  {   // Notifications and Push: permission, page notifications and their events, a worker's notifications and clicks, push subscriptions and delivery
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      env.prompt_answer = -1;   // (the user answers later)
+      serve(env, "/sw.js", "application/javascript",
+            "self.addEventListener('install', function () { self.skipWaiting(); }); self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });\n"
+            "self.addEventListener('push', function (e) { var t = e.data ? e.data.text() : '(none)'; e.waitUntil(self.registration.showNotification('pushed', { body: t, tag: 'p', data: { n: 7 } })); });\n"
+            "self.addEventListener('notificationclick', function (e) { e.notification.close(); e.waitUntil(clients.matchAll().then(function (l) { l[0].postMessage('click:' + e.notification.title + ':' + e.notification.data.n + ':' + e.notification.body + ':' + e.action); })); });\n"
+            "self.addEventListener('notificationclose', function (e) { e.waitUntil(clients.matchAll().then(function (l) { l[0].postMessage('close:' + e.notification.title); })); });\n"
+            "self.addEventListener('pushsubscriptionchange', function (e) { e.waitUntil(clients.matchAll().then(function (l) { l[0].postMessage('change:' + !!e.oldSubscription + ':' + e.newSubscription); })); });");
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/dir/page.html", media, true);
+      page.load(("<html><body><script>" + std::string(kSwPrelude) +
+                 "navigator.serviceWorker.addEventListener('message', function (e) { log('msg ' + e.data); });\n"
+                 "var statuses = []; navigator.permissions.query({ name: 'notifications' }).then(function (s) { s.onchange = function () { log('perm-change ' + s.state); }; log('query ' + s.state); });\n"
+                 "log('start ' + Notification.permission);\n"
+                 "var asked = Notification.requestPermission().then(function (p) { log('asked ' + p + ' ' + Notification.permission); });\n"
+                 "var early = new Notification('early'); early.onerror = function () { log('early-error'); };\n"
+                 "window.go = function () { navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function (reg) { window.reg = reg;\n"
+                 "  return reg.pushManager.permissionState({ userVisibleOnly: true }); }).then(function (st) { log('state ' + st);\n"
+                 "  return window.reg.pushManager.subscribe({ userVisibleOnly: false }).catch(function (e) { log('uvo ' + e.name); return window.reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: 'nope' }).catch(function (e2) { log('key ' + e2.name); }); }); })\n"
+                 ".then(function () { return window.reg.pushManager.getSubscription(); }).then(function (none) { log('sub ' + none); return window.reg.pushManager.subscribe({ userVisibleOnly: true }); })\n"
+                 ".then(function (sub) { log('endpoint ' + sub.endpoint); log('keys ' + sub.getKey('p256dh').byteLength + ' ' + sub.getKey('auth').byteLength + ' ' + Object.keys(sub.toJSON().keys).join());\n"
+                 "  return window.reg.pushManager.getSubscription().then(function (again) { log('same ' + (again.endpoint === sub.endpoint)); }); })\n"
+                 ".then(function () { return window.reg.showNotification('Hello', { body: 'there', tag: 't1', data: { n: 3 }, requireInteraction: true, actions: [{ action: 'a', title: 'A' }] }); })\n"
+                 ".then(function () { return window.reg.showNotification('Hello again', { tag: 't1' }); })\n"
+                 ".then(function () { return window.reg.getNotifications(); }).then(function (l) { log('list ' + l.length + ' ' + l[0].title + ' ' + l[0].tag + ' ' + l[0].actions.length + ' ' + l[0].data); })\n"
+                 ".then(function () { var n = new Notification('Page', { body: 'text', data: [1, 2] }); window.n = n; n.onshow = function () { log('show ' + n.title + ' ' + n.body + ' ' + n.data.length); }; n.onclick = function () { log('click'); }; n.onclose = function () { log('close'); };\n"
+                 "  try { new Notification('x', { actions: [{ action: 'a', title: 'A' }] }); } catch (e) { log(e.name); } })\n"
+                 ".catch(fail); };\n"
+                 "window.step_bye = function () { window.reg.showNotification('bye').then(function () { log('shown-bye'); }); };\n"
+                 "window.step_unsub = function () { window.reg.pushManager.getSubscription().then(function (s) { return s.unsubscribe(); }).then(function (r) { log('unsub ' + r); return window.reg.pushManager.getSubscription(); })"
+                 ".then(function (s) { log('after ' + s); return window.reg.pushManager.subscribe({ userVisibleOnly: true }); }).then(function (s) { log('endpoint2 ' + s.endpoint); }); };\n"
+                 "window.step_act = function () { window.reg.showNotification('act', { data: { n: 9 }, actions: [{ action: 'archive', title: 'Archive' }, { action: 'later', title: 'Later' }, { action: 'extra', title: 'Extra' }] }); };\n"
+                 "window.step_final = function () { log('final ' + Notification.permission); };\n"
+                 "</script></body></html>").c_str());
+      settle_page(page, env);
+      std::string log(page.log().data(), page.log().size());
+      CHECK(log.find("start default") != std::string::npos && log.find("query prompt") != std::string::npos);
+      CHECK(log.find("early-error") != std::string::npos && env.shown.empty() && env.prompts == 1);   // (no permission yet: nothing shown, and the user was asked once)
+      CHECK(log.find("asked ") == std::string::npos);                                                 // (the answer is still awaited)
+      env.workers.set_notification_permission("https://app.example", true);                            // (the user says yes)
+      settle_page(page, env);
+      page.call_global("go", nullptr, 0);
+      settle_page(page, env);
+      log.assign(page.log().data(), page.log().size());
+      CHECK(log.find("perm-change granted") != std::string::npos && log.find("asked granted granted") != std::string::npos);
+      CHECK(log.find("state granted") != std::string::npos && log.find("uvo NotAllowedError") != std::string::npos && log.find("key InvalidCharacterError") != std::string::npos);
+      CHECK(log.find("sub null") != std::string::npos && log.find("keys 65 16 p256dh,auth") != std::string::npos && log.find("same true") != std::string::npos);
+      CHECK(log.find("list 1 Hello again t1 0 null") != std::string::npos);   // (the second one replaced the first)
+      CHECK(log.find("InvalidAccessError") == std::string::npos || log.find("TypeError") != std::string::npos);
+      CHECK(log.find("TypeError") != std::string::npos);                     // (actions on a notification of a page)
+      CHECK(log.find("show Page text 2") != std::string::npos);
+      CHECK(env.shown.size() == 3 && env.shown[0].title == "Hello" && env.shown[0].sticky && env.shown[1].title == "Hello again" && !env.shown[1].sticky && env.shown[2].title == "Page");
+      CHECK(env.closed_numbers.size() == 1 && env.closed_numbers[0] == env.shown[0].number);   // (the replaced one went away)
+      // a click on the page's notification: click, then close
+      env.workers.notification_activated(env.shown[2].number);
+      settle_page(page, env);
+      log.assign(page.log().data(), page.log().size());
+      CHECK(log.find("click close") != std::string::npos);
+      // the endpoint gets a message: the worker shows a notification, the click comes back to the worker
+      const size_t at = log.find("endpoint ");
+      CHECK(at != std::string::npos);
+      const size_t end = log.find(' ', at + 9);
+      const std::string endpoint = log.substr(at + 9, end - at - 9);
+      CHECK(!env.workers.push_deliver("https://push.example/none", "x", true));
+      CHECK(env.workers.push_deliver(StringView(endpoint.data(), endpoint.size()), "hi there", true));
+      CHECK(env.shown.size() == 4 && env.shown[3].title == "pushed" && env.shown[3].body == "hi there");
+      CHECK(env.workers.push_deliver(StringView(endpoint.data(), endpoint.size()), "", false));
+      CHECK(env.shown.size() == 5 && env.shown[4].body == "(none)" && env.closed_numbers.size() == 2);   // (the same tag: replaced)
+      env.workers.notification_activated(env.shown[4].number);
+      settle_page(page, env);
+      env.workers.notification_closed(env.shown[3].number);   // (already replaced: nothing to tell)
+      log.assign(page.log().data(), page.log().size());
+      CHECK(log.find("msg click:pushed:7:(none):\n") != std::string::npos || log.find("msg click:pushed:7:(none): ") != std::string::npos);
+      CHECK(log.find("msg close:") == std::string::npos);
+      // a notice sent away by the user is a notificationclose for the worker
+      page.call_global("step_bye", nullptr, 0);
+      settle_page(page, env);
+      CHECK(env.shown.size() == 6);
+      env.workers.notification_closed(env.shown[5].number);
+      settle_page(page, env);
+      log.assign(page.log().data(), page.log().size());
+      CHECK(log.find("msg close:bye") != std::string::npos);
+      // a notice with buttons: they are handed to the browser, and a click on one names it in the event
+      page.call_global("step_act", nullptr, 0);
+      settle_page(page, env);
+      CHECK(env.shown.size() == 7 && env.shown[6].title == "act" && env.shown[6].actions == "Archive\nLater");   // (at most two)
+      env.workers.notification_activated(env.shown[6].number, 1);
+      settle_page(page, env);
+      log.assign(page.log().data(), page.log().size());
+      CHECK(log.find("msg click:act:9::later") != std::string::npos);
+      // unsubscribing, and the push service dropping a subscription
+      page.call_global("step_unsub", nullptr, 0);
+      settle_page(page, env);
+      log.assign(page.log().data(), page.log().size());
+      CHECK(log.find("unsub true") != std::string::npos && log.find("after null") != std::string::npos && log.find("endpoint2 ") != std::string::npos);
+      CHECK(!env.workers.push_deliver(StringView(endpoint.data(), endpoint.size()), "old", true));   // (the old endpoint is dead)
+      const size_t at2 = log.find("endpoint2 ");
+      const std::string endpoint2 = log.substr(at2 + 10, log.find(' ', at2 + 10) - at2 - 10);
+      CHECK(endpoint2 != endpoint && env.workers.push_expire(StringView(endpoint2.data(), endpoint2.size())));
+      settle_page(page, env);
+      log.assign(page.log().data(), page.log().size());
+      CHECK(log.find("msg change:true:null") != std::string::npos);
+      CHECK(!env.workers.push_expire(StringView(endpoint2.data(), endpoint2.size())));
+      // blocking the origin takes its notifications away
+      const size_t open = env.shown.size() - env.closed_numbers.size();
+      CHECK(open > 0);
+      env.workers.set_notification_permission("https://app.example", false);
+      CHECK(env.closed_numbers.size() >= env.shown.size() - 4);
+      page.call_global("step_final", nullptr, 0);
+      CHECK(std::string(page.log().data(), page.log().size()).find("final denied") != std::string::npos);
+    }
+    CHECK(a.live == 0);
+  }
+
+  {   // The push service: an application server sends encrypted, signed messages to the endpoint of a subscription
+    using namespace browser;
+    struct CountRandom final : crypto::IRandom {
+      uint8_t n = 1;
+      bool fill(ByteView out) override { for (uint64_t i = 0; i < out.size(); ++i) out[i] = n++; return true; }
+    };
+    // RFC 8291 appendix A: the message from the standard decrypts
+    {
+      TestAllocator a;
+      ByteBuffer priv(a), pub(a), auth(a), body(a), plain(a);
+      CHECK(base64url_decode("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94", &priv) && base64url_decode("BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4", &pub) &&
+            base64url_decode("BTBZMqHH6r4Tts7J_aSIgg", &auth));
+      CHECK(base64url_decode("DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN", &body));
+      CHECK(webpush_decrypt(priv.view().data(), pub.view(), auth.view(), body.view(), &plain));
+      CHECK(std::string(reinterpret_cast<const char*>(plain.view().data()), plain.size()) == "When I grow up, I want to be a watermelon");
+      // cut or changed, it never decrypts and never reads outside the body
+      for (uint64_t cut = 0; cut < body.size(); ++cut) {
+        ByteBuffer part(a);
+        part.append(body.view().first(cut));
+        CHECK(!webpush_decrypt(priv.view().data(), pub.view(), auth.view(), part.view(), &plain));
+      }
+      for (uint64_t at = 0; at < body.size(); ++at) {
+        ByteBuffer flipped(a);
+        flipped.append(body.view());
+        flipped.writable_view()[at] ^= 0x10;
+        CHECK(!webpush_decrypt(priv.view().data(), pub.view(), auth.view(), flipped.view(), &plain));
+      }
+      // several records
+      uint8_t as_priv[32], salt[16];
+      for (int i = 0; i < 32; ++i) as_priv[i] = static_cast<uint8_t>(0x11 + i);
+      for (int i = 0; i < 16; ++i) salt[i] = static_cast<uint8_t>(i);
+      std::string long_text(1000, 'x');
+      CHECK(webpush_encrypt(pub.view(), auth.view(), ConstByteView(reinterpret_cast<const uint8_t*>(long_text.data()), long_text.size()), as_priv, ConstByteView(salt, 16), 200, &body));
+      CHECK(webpush_decrypt(priv.view().data(), pub.view(), auth.view(), body.view(), &plain) && plain.size() == 1000);
+    }
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      uint8_t vapid_priv[32], vapid_pub[65];
+      for (int i = 0; i < 32; ++i) vapid_priv[i] = static_cast<uint8_t>(0x22 + i);
+      CHECK(crypto::ec_public_key(crypto::EcCurve::P256, vapid_priv, vapid_pub));
+      String vapid_text(a);
+      base64url_encode(ConstByteView(vapid_pub, 65), &vapid_text);
+      serve(env, "/sw.js", "application/javascript",
+            "self.addEventListener('install', function () { self.skipWaiting(); }); self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });\n"
+            "self.addEventListener('push', function (e) { e.waitUntil(self.registration.showNotification('push', { body: e.data ? e.data.text() : '(none)' })); });");
+      MediaEnvironment media;
+      Page page(a, env, "https://app.example/dir/page.html", media, true);
+      env.workers.set_notification_permission("https://app.example", true);
+      page.load(("<html><body><script>" + std::string(kSwPrelude) +
+                 "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function (reg) {\n"
+                 "  return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: '" + std::string(vapid_text.view().data(), vapid_text.size()) + "' }); })\n"
+                 ".then(function (sub) { var k = sub.toJSON(); log('E ' + sub.endpoint + ' ' + k.keys.p256dh + ' ' + k.keys.auth + ' '); done(); }).catch(fail);</script></body></html>").c_str());
+      settle_page(page, env);
+      const std::string log(page.log().data(), page.log().size());
+      CHECK(log.rfind("E https://push.theorycraft.invalid/wpush/v2/", 0) == 0);
+      std::vector<std::string> parts;
+      for (size_t from = 2, to; (to = log.find(' ', from)) != std::string::npos; from = to + 1) parts.push_back(log.substr(from, to - from));
+      CHECK(parts.size() == 3);
+      const std::string endpoint = parts[0];
+      ByteBuffer ua_pub(a), auth(a), body(a);
+      CHECK(base64url_decode(StringView(parts[1].data(), parts[1].size()), &ua_pub) && ua_pub.size() == 65 && ua_pub.view()[0] == 4 && crypto::ec_point_valid(crypto::EcCurve::P256, ua_pub.view()));   // (a real P-256 key)
+      CHECK(base64url_decode(StringView(parts[2].data(), parts[2].size()), &auth) && auth.size() == 16);
+      uint8_t as_priv[32], salt[16];
+      for (int i = 0; i < 32; ++i) as_priv[i] = static_cast<uint8_t>(0x41 + i);
+      for (int i = 0; i < 16; ++i) salt[i] = static_cast<uint8_t>(0xA0 + i);
+      auto jwt = [&](const char* aud, uint64_t exp, bool good_signature) {
+        String head(a), claims(a), signed_text(a);
+        const char* h = "{\"typ\":\"JWT\",\"alg\":\"ES256\"}";
+        std::string c = std::string("{\"aud\":\"") + aud + "\",\"exp\":" + std::to_string(exp) + ",\"sub\":\"mailto:ops@app.example\"}";
+        base64url_encode(ConstByteView(reinterpret_cast<const uint8_t*>(h), strlen(h)), &head);
+        base64url_encode(ConstByteView(reinterpret_cast<const uint8_t*>(c.data()), c.size()), &claims);
+        signed_text.append(head.view());
+        signed_text.append(".");
+        signed_text.append(claims.view());
+        uint8_t digest[32], sig[64];
+        crypto::hash(crypto::HashKind::Sha256, ConstByteView(reinterpret_cast<const uint8_t*>(signed_text.view().data()), signed_text.size()), digest);
+        CountRandom random;
+        CHECK(crypto::ecdsa_sign(crypto::EcCurve::P256, vapid_priv, digest, 32, random, sig));
+        if (!good_signature) sig[5] ^= 1;
+        String sig_text(a);
+        base64url_encode(ConstByteView(sig, 64), &sig_text);
+        std::string out = "vapid t=" + std::string(signed_text.view().data(), signed_text.size()) + "." + std::string(sig_text.view().data(), sig_text.size()) + ", k=" + std::string(vapid_text.view().data(), vapid_text.size());
+        return out;
+      };
+      const uint64_t now_s = env.now_ms() / 1000;
+      auto post = [&](const std::string& url, const std::string& headers, ConstByteView data, const char* method = "POST") {
+        FetchOptions o;
+        o.method = method;
+        o.url = StringView(url.data(), url.size());
+        o.headers = StringView(headers.data(), headers.size());
+        o.body = data;
+        NetResponse r(a);
+        env.workers.push_request(o, &r);
+        return r.status;
+      };
+      const std::string plain = "hello push";
+      CHECK(webpush_encrypt(ua_pub.view(), auth.view(), ConstByteView(reinterpret_cast<const uint8_t*>(plain.data()), plain.size()), as_priv, ConstByteView(salt, 16), 4096, &body));
+      const std::string ok_headers = "TTL: 60\r\nContent-Encoding: aes128gcm\r\nUrgency: high\r\nTopic: news\r\nAuthorization: " + jwt("https://push.theorycraft.invalid", now_s + 3600, true) + "\r\n";
+      CHECK(env.workers.push_handles(StringView(endpoint.data(), endpoint.size())) && !env.workers.push_handles("https://app.example/x"));
+      CHECK(post(endpoint, ok_headers, body.view()) == 201);
+      CHECK(env.shown.size() == 1 && env.shown[0].body == "hello push");
+      CHECK(post(endpoint, "TTL: 0\r\nAuthorization: " + jwt("https://push.theorycraft.invalid", now_s + 60, true) + "\r\n", ConstByteView()) == 201);   // (no payload)
+      CHECK(env.shown.size() == 2 && env.shown[1].body == "(none)");
+      // what is refused, and how
+      const std::string no_ttl = "Content-Encoding: aes128gcm\r\nAuthorization: " + jwt("https://push.theorycraft.invalid", now_s + 3600, true) + "\r\n";
+      CHECK(post(endpoint, no_ttl, body.view()) == 400);
+      CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\n", body.view()) == 401);                                                         // (not signed)
+      CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\nAuthorization: " + jwt("https://push.theorycraft.invalid", now_s + 3600, false) + "\r\n", body.view()) == 403);
+      CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\nAuthorization: " + jwt("https://other.example", now_s + 3600, true) + "\r\n", body.view()) == 403);
+      if (now_s) {
+        CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\nAuthorization: " + jwt("https://push.theorycraft.invalid", now_s - 1, true) + "\r\n", body.view()) == 403);        // expired
+        CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\nAuthorization: " + jwt("https://push.theorycraft.invalid", now_s + 3 * 86400, true) + "\r\n", body.view()) == 403);   // too long
+      }
+      const std::string auth_header = "Authorization: " + jwt("https://push.theorycraft.invalid", now_s + 3600, true) + "\r\n";
+      CHECK(post(endpoint, "TTL: 60\r\nUrgency: now\r\n" + auth_header, ConstByteView()) == 400);
+      CHECK(post(endpoint, "TTL: 60\r\nTopic: no spaces\r\n" + auth_header, ConstByteView()) == 400);
+      CHECK(post(endpoint, "TTL: 60\r\n" + auth_header, body.view()) == 400);   // (a body without the content coding)
+      CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\n" + auth_header, ua_pub.view()) == 400);   // (not an encrypted message)
+      ByteBuffer big(a);
+      big.put_zeros(kWebPushMaxBody + 1);
+      CHECK(post(endpoint, "TTL: 60\r\nContent-Encoding: aes128gcm\r\n" + auth_header, big.view()) == 413);
+      CHECK(post(endpoint, "TTL: 60\r\n", ConstByteView(), "GET") == 405 && post(endpoint, "", ConstByteView(), "OPTIONS") == 204);
+      CHECK(post("https://push.theorycraft.invalid/wpush/v2/nothing", ok_headers, body.view()) == 404 && post("https://push.theorycraft.invalid/other", ok_headers, body.view()) == 404);
+      for (uint64_t cut = 0; cut < body.size(); cut += 7) {   // (a message cut anywhere is refused; the page is not shown anything)
+        CHECK(post(endpoint, ok_headers, body.view().first(cut)) == 400 || cut == 0);
+      }
+      for (uint64_t at = 0; at < body.size(); at += 5) {
+        ByteBuffer flipped(a);
+        flipped.append(body.view());
+        flipped.writable_view()[at] ^= 0x04;
+        CHECK(post(endpoint, ok_headers, flipped.view()) == 400);
+      }
+      CHECK(env.shown.size() == 2);
+      // a message to a subscription that was given up: gone
+      page.load(("<html><body><script>" + std::string(kSwPrelude) + "navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); }).then(function (s) { return s.unsubscribe(); }).then(function (r) { log(r); done(); }).catch(fail);</script></body></html>").c_str());
+      settle_page(page, env);
+      CHECK(post(endpoint, ok_headers, body.view()) == 410);
+    }
+    CHECK(a.live == 0);
+  }
 
   // navigation preload: the worker's preloadResponse is the network answer for a navigation, with the header the page asked for
   CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +

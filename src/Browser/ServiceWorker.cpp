@@ -17,6 +17,9 @@
  */
 
 #include "Browser/ServiceWorker.hpp"
+#include "Browser/WebPush.hpp"
+#include "Browser/WebRandom.hpp"
+#include "Crypto/Ecc.hpp"
 #include "Browser/WebUrl.hpp"
 #include "Utility/Move.hpp"
 
@@ -114,9 +117,10 @@ struct ServiceWorkerHub::Worker {
 };
 
 struct ServiceWorkerHub::Registration {
-  explicit Registration(allocators::IAllocator& a) : origin(a), scope(a), script_url(a), update_via_cache(a), type(a), preload_header(a), sync_tags(a) {}
+  explicit Registration(allocators::IAllocator& a) : origin(a), scope(a), script_url(a), update_via_cache(a), type(a), preload_header(a), sync_tags(a), push_endpoint(a), push_p256dh(a), push_auth(a), push_key(a), push_private(a) {}
   uint32_t id = 0;
   String origin, scope, script_url, update_via_cache, type;
+  String push_endpoint, push_p256dh, push_auth, push_key, push_private;   // the push subscription (endpoint empty: none); keys as hex
   uint32_t installing = 0, waiting = 0, active = 0;
   bool preload_enabled = false, unregistered = false, update_due = false;
   String preload_header;
@@ -129,6 +133,12 @@ struct ServiceWorkerHub::Client {
   uint32_t id = 0, controller = 0;   // the registration that controls it
   String url, origin;
   List<String> events;
+};
+
+struct ServiceWorkerHub::Notification {
+  explicit Notification(allocators::IAllocator& a) : origin(a), title(a), body(a), tag(a), options(a), actions(a) {}
+  uint32_t id = 0, reg = 0, client = 0, number = 0;   // reg 0: made by a document (client); number: the browser's number for the notice
+  String origin, title, body, tag, options, actions;   // actions: the names of the buttons, one on each line
 };
 
 // The environment a worker's page runs in: the browser's network, clock and storage, no window.
@@ -199,7 +209,7 @@ class ServiceWorkerHub::Lock {
   bool held_;
 };
 
-ServiceWorkerHub::ServiceWorkerHub(allocators::IAllocator& allocator) : allocator_(allocator), routes_(allocator), registrations_(allocator), workers_(allocator), clients_(allocator) {}
+ServiceWorkerHub::ServiceWorkerHub(allocators::IAllocator& allocator) : allocator_(allocator), routes_(allocator), registrations_(allocator), workers_(allocator), clients_(allocator), permissions_(allocator), notifications_(allocator), push_gone_(allocator) {}
 
 ServiceWorkerHub::~ServiceWorkerHub() { stop_all(); }
 
@@ -370,6 +380,8 @@ uint32_t ServiceWorkerHub::client_add(StringView url) {
 
 void ServiceWorkerHub::client_remove(uint32_t client) {
   Lock lock(*this);
+  for (uint64_t i = notifications_.count(); i-- > 0;)   // (the notices of a document go with it)
+    if (notifications_[i]->reg == 0 && notifications_[i]->client == client) remove_notification(i, true);
   for (uint64_t i = 0; i < clients_.count(); ++i)
     if (clients_[i]->id == client) {
       clients_.remove_at(i);
@@ -1044,6 +1056,591 @@ void ServiceWorkerHub::api_sync_tags(uint32_t reg, String* json) {
     jq(json, r->sync_tags[i].view());
   }
   json->push_back(']');
+}
+
+// --- Notifications and Push ------------------------------------------------------------------------------------------------------
+
+namespace {
+
+void hex_byte(uint8_t b, String* out) {
+  static const char kHex[] = "0123456789abcdef";
+  out->push_back(kHex[b >> 4]);
+  out->push_back(kHex[b & 15]);
+}
+
+class SystemRandom final : public crypto::IRandom {
+ public:
+  bool fill(ByteView out) override { return system_random(out); }
+};
+
+bool hex_decode(StringView text, ByteView out) {
+  if (text.size() != out.size() * 2) return false;
+  for (uint64_t i = 0; i < out.size(); ++i) {
+    uint8_t v = 0;
+    for (uint64_t j = 0; j < 2; ++j) {
+      const char c = text[i * 2 + j];
+      const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+      if (d < 0) return false;
+      v = static_cast<uint8_t>(v * 16 + d);
+    }
+    out[i] = v;
+  }
+  return true;
+}
+
+bool random_hex(uint32_t count, bool point, String* out) {
+  uint8_t bytes[65];
+  if (count > sizeof(bytes) || !system_random(ByteView(bytes, count))) return false;
+  if (point) bytes[0] = 4;   // (an uncompressed point, the shape of a P-256 public key)
+  for (uint32_t i = 0; i < count; ++i) hex_byte(bytes[i], out);
+  return true;
+}
+
+}  // namespace
+
+ServiceWorkerHub::Permission* ServiceWorkerHub::find_permission(StringView origin) {
+  for (Permission& p : permissions_)
+    if (p.origin.view().equals(origin)) return &p;
+  return nullptr;
+}
+
+const char* ServiceWorkerHub::notification_permission(StringView origin) {
+  Lock lock(*this);
+  const Permission* p = find_permission(origin);
+  return !p ? "default" : p->granted ? "granted" : "denied";
+}
+
+void ServiceWorkerHub::apply_permission(StringView origin, bool granted) {
+  Permission* p = find_permission(origin);
+  if (!p) {
+    if (permissions_.count() >= kMaxPermissions) permissions_.remove_at(0);
+    Permission fresh(allocator_);
+    fresh.origin.assign(origin);
+    if (!permissions_.push_back(util::move(fresh))) return;
+    p = &permissions_[permissions_.count() - 1];
+  }
+  p->granted = granted;
+}
+
+void ServiceWorkerHub::set_notification_permission(StringView origin, bool granted) {
+  Lock lock(*this);
+  apply_permission(origin, granted);
+  String json(allocator_);
+  json.append("{\"t\":\"permission\",\"state\":\"");
+  json.append(granted ? "granted" : "denied");
+  json.append("\"}");
+  emit_to_origin(origin, json.view());
+  if (!granted)   // (a blocked origin has nothing on show)
+    for (uint64_t i = notifications_.count(); i-- > 0;)
+      if (notifications_[i]->origin.view().equals(origin)) remove_notification(i, true);
+}
+
+bool ServiceWorkerHub::origin_of(uint32_t client, uint32_t worker, String* origin) {
+  if (client != 0) {
+    if (const Client* c = find_client(client)) {
+      origin->assign(c->origin.view());
+      return true;
+    }
+  }
+  if (worker != 0) {
+    const Worker* w = find_worker(worker);
+    const Registration* r = w ? find_registration(w->registration) : nullptr;
+    if (r) {
+      origin->assign(r->origin.view());
+      return true;
+    }
+  }
+  return false;
+}
+
+void ServiceWorkerHub::notify_permission(uint32_t client, uint32_t worker, String* state) {
+  Lock lock(*this);
+  String origin(allocator_);
+  state->assign(origin_of(client, worker, &origin) ? notification_permission(origin.view()) : "denied");
+}
+
+void ServiceWorkerHub::notify_request(uint32_t client, uint32_t worker, String* state) {
+  Lock lock(*this);
+  String origin(allocator_);
+  if (!origin_of(client, worker, &origin) || client == 0) {   // (only a document may ask)
+    notify_permission(client, worker, state);
+    return;
+  }
+  state->assign(notification_permission(origin.view()));
+  if (!state->view().equals("default")) return;
+  const int answer = host_ ? host_->notification_prompt(origin.view()) : 0;
+  if (answer < 0) {
+    state->assign("pending");
+    return;
+  }
+  set_notification_permission(origin.view(), answer > 0);
+  state->assign(answer > 0 ? "granted" : "denied");
+}
+
+void ServiceWorkerHub::notification_json(const Notification& n, String* json) {
+  json->append("{\"id\":");
+  json->append_uint(n.id);
+  json->append(",\"title\":");
+  jq(json, n.title.view());
+  json->append(",\"body\":");
+  jq(json, n.body.view());
+  json->append(",\"tag\":");
+  jq(json, n.tag.view());
+  json->append(",\"o\":");
+  json->append(n.options.view());
+  json->push_back('}');
+}
+
+void ServiceWorkerHub::remove_notification(uint64_t index, bool tell_host) {
+  if (index >= notifications_.count()) return;
+  const uint32_t number = notifications_[index]->number;
+  notifications_.remove_at(index);
+  if (tell_host && number != 0 && host_) host_->notification_close(number);
+}
+
+void ServiceWorkerHub::notify_show(uint32_t client, uint32_t reg, StringView title, StringView body, StringView tag, bool sticky, bool renotify, StringView options, StringView action_ids,
+                                      StringView action_titles, String* json) {
+  Lock lock(*this);
+  (void)renotify;   // (a toast cannot be told to stay quiet: a replaced notice is shown again either way)
+  String origin(allocator_);
+  Registration* r = reg ? find_registration(reg) : nullptr;
+  if (reg) {
+    if (!r || r->unregistered) {
+      error_json(json, "InvalidStateError", "The registration is gone.");
+      return;
+    }
+    origin.assign(r->origin.view());
+  } else if (!origin_of(client, 0, &origin)) {
+    error_json(json, "NotAllowedError", "The document cannot show notifications.");
+    return;
+  }
+  if (!StringView(notification_permission(origin.view())).equals("granted")) {
+    error_json(json, "NotAllowedError", "No notification permission has been granted for this origin.");
+    return;
+  }
+  if (!tag.empty()) {   // a notification with the same tag from the same place is replaced
+    for (uint64_t i = 0; i < notifications_.count(); ++i) {
+      const Notification& old = *notifications_[i];
+      if (old.reg != reg || (reg == 0 && old.client != client) || !old.origin.view().equals(origin.view()) || !old.tag.view().equals(tag)) continue;
+      if (reg == 0) {
+        String ev(allocator_);
+        ev.append("{\"t\":\"notification\",\"id\":");
+        ev.append_uint(old.id);
+        ev.append(",\"ev\":\"close\"}");
+        if (Client* c = find_client(old.client)) emit_to_client(*c, ev.view());
+      }
+      remove_notification(i, true);
+      break;
+    }
+  }
+  if (notifications_.count() >= kMaxNotifications) remove_notification(0, true);
+  UniquePointer<Notification> n = UniquePointer<Notification>::make(allocator_, allocator_);
+  n->id = next_notification_++;
+  if (next_notification_ == 0) next_notification_ = 1;
+  n->reg = reg;
+  n->client = reg ? 0 : client;
+  n->origin.assign(origin.view());
+  n->title.assign(title);
+  n->body.assign(body);
+  n->tag.assign(tag);
+  n->options.assign(options.size() >= 2 && options[0] == '{' && options[options.size() - 1] == '}' ? options : StringView("{}"));
+  n->actions.assign(action_ids);
+  n->number = host_ ? host_->notification_show(origin.view(), title, body, sticky, action_titles) : 0;
+  if (n->number == 0) {
+    error_json(json, "NotAllowedError", "The notification could not be shown.");
+    return;
+  }
+  const uint32_t id = n->id, number = n->number;
+  if (!notifications_.push_back(util::move(n))) {
+    host_->notification_close(number);
+    error_json(json, "NotAllowedError", "The notification could not be shown.");
+    return;
+  }
+  if (reg == 0) {
+    String ev(allocator_);
+    ev.append("{\"t\":\"notification\",\"id\":");
+    ev.append_uint(id);
+    ev.append(",\"ev\":\"show\"}");
+    if (Client* c = find_client(client)) emit_to_client(*c, ev.view());
+  }
+  json->assign("{\"ok\":true,\"id\":");
+  json->append_uint(id);
+  json->push_back('}');
+}
+
+bool ServiceWorkerHub::notify_close(uint32_t client, uint32_t id) {
+  Lock lock(*this);
+  for (uint64_t i = 0; i < notifications_.count(); ++i) {
+    const Notification& n = *notifications_[i];
+    if (n.id != id) continue;
+    if (n.reg == 0 && n.client != client) return false;   // (a document closes its own; a worker's may be closed from anywhere in its origin)
+    if (n.reg == 0) {
+      String ev(allocator_);
+      ev.append("{\"t\":\"notification\",\"id\":");
+      ev.append_uint(n.id);
+      ev.append(",\"ev\":\"close\"}");
+      if (Client* c = find_client(n.client)) emit_to_client(*c, ev.view());
+    }
+    remove_notification(i, true);
+    return true;
+  }
+  return false;
+}
+
+void ServiceWorkerHub::notify_list(uint32_t reg, StringView tag, String* json) {
+  Lock lock(*this);
+  json->assign("[");
+  bool first = true;
+  for (const UniquePointer<Notification>& n : notifications_) {
+    if (n->reg != reg || reg == 0 || (!tag.empty() && !n->tag.view().equals(tag))) continue;
+    if (!first) json->push_back(',');
+    first = false;
+    notification_json(*n, json);
+  }
+  json->push_back(']');
+}
+
+// The notice was clicked: a document's notification gets click and close; a registration's worker gets notificationclick (and may open a window).
+void ServiceWorkerHub::notification_activated(uint32_t number, int32_t action) {
+  Lock lock(*this);
+  for (uint64_t i = 0; i < notifications_.count(); ++i) {
+    if (notifications_[i]->number != number) continue;
+    String info(allocator_), arg(allocator_);
+    notification_json(*notifications_[i], &info);
+    const uint32_t reg = notifications_[i]->reg, client = notifications_[i]->client, id = notifications_[i]->id;
+    String action_id(allocator_);
+    if (action >= 0) {   // (the name of the button: line `action` of the list)
+      StringView rest = notifications_[i]->actions.view(), line;
+      for (int32_t k = 0; rest.next_token('\n', &line); ++k)
+        if (k == action) {
+          action_id.assign(line);
+          break;
+        }
+    }
+    remove_notification(i, false);
+    if (reg == 0) {
+      Client* c = find_client(client);
+      if (!c) return;
+      for (const char* ev : {"click", "close"}) {
+        String text(allocator_);
+        text.append("{\"t\":\"notification\",\"id\":");
+        text.append_uint(id);
+        text.append(",\"ev\":\"");
+        text.append(ev);
+        text.append("\"}");
+        emit_to_client(*c, text.view());
+      }
+      return;
+    }
+    Registration* r = find_registration(reg);
+    Worker* w = r && r->active ? find_worker(r->active) : nullptr;
+    if (!w || w->state != Worker::State::Activated) return;
+    arg.append("{\"notification\":");
+    arg.append(info.view());
+    arg.append(",\"action\":");
+    jq(&arg, action_id.view());
+    arg.push_back('}');
+    dispatch_extendable(*w, "notificationclick", arg.view());
+    return;
+  }
+}
+
+void ServiceWorkerHub::notification_closed(uint32_t number) {
+  Lock lock(*this);
+  for (uint64_t i = 0; i < notifications_.count(); ++i) {
+    if (notifications_[i]->number != number) continue;
+    String info(allocator_), arg(allocator_);
+    notification_json(*notifications_[i], &info);
+    const uint32_t reg = notifications_[i]->reg, client = notifications_[i]->client, id = notifications_[i]->id;
+    remove_notification(i, false);
+    if (reg == 0) {
+      if (Client* c = find_client(client)) {
+        String text(allocator_);
+        text.append("{\"t\":\"notification\",\"id\":");
+        text.append_uint(id);
+        text.append(",\"ev\":\"close\"}");
+        emit_to_client(*c, text.view());
+      }
+      return;
+    }
+    Registration* r = find_registration(reg);
+    Worker* w = r && r->active ? find_worker(r->active) : nullptr;
+    if (!w || w->state != Worker::State::Activated) return;
+    arg.append("{\"notification\":");
+    arg.append(info.view());
+    arg.append(",\"action\":\"\"}");
+    dispatch_extendable(*w, "notificationclose", arg.view());
+    return;
+  }
+}
+
+void ServiceWorkerHub::push_json(const Registration& r, String* json) {
+  json->append("{\"endpoint\":");
+  jq(json, r.push_endpoint.view());
+  json->append(",\"p256dh\":\"");
+  json->append(r.push_p256dh.view());
+  json->append("\",\"auth\":\"");
+  json->append(r.push_auth.view());
+  json->append("\",\"key\":\"");
+  json->append(r.push_key.view());
+  json->append("\"}");
+}
+
+void ServiceWorkerHub::push_subscribe(uint32_t reg, bool user_visible_only, StringView key_hex, String* json) {
+  Lock lock(*this);
+  Registration* r = find_registration(reg);
+  if (!r || r->unregistered || r->active == 0) {
+    error_json(json, "InvalidStateError", "Subscription failed - no active Service Worker");
+    return;
+  }
+  if (!user_visible_only) {
+    error_json(json, "NotAllowedError", "Subscription failed - userVisibleOnly is false");
+    return;
+  }
+  if (!StringView(notification_permission(r->origin.view())).equals("granted")) {
+    error_json(json, "NotAllowedError", "Registration failed - permission denied");
+    return;
+  }
+  for (const char c : key_hex)
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      error_json(json, "InvalidAccessError", "Subscription failed - the applicationServerKey is not valid");
+      return;
+    }
+  if (key_hex.size() > 256) {
+    error_json(json, "InvalidAccessError", "Subscription failed - the applicationServerKey is not valid");
+    return;
+  }
+  if (!r->push_endpoint.empty()) {
+    if (!key_hex.empty() && !r->push_key.empty() && !r->push_key.view().equals(key_hex)) {
+      error_json(json, "InvalidStateError", "Subscription failed - a subscription with a different applicationServerKey already exists");
+      return;
+    }
+  } else {
+    String endpoint(allocator_), p256dh(allocator_), auth(allocator_), token(allocator_), secret(allocator_);
+    uint8_t priv[32], point[crypto::kMaxEcPoint];
+    SystemRandom random;
+    if (!random_hex(24, false, &token) || !random_hex(16, false, &auth) || !crypto::ec_generate_private(crypto::EcCurve::P256, random, priv) ||
+        !crypto::ec_public_key(crypto::EcCurve::P256, priv, point)) {
+      error_json(json, "AbortError", "Subscription failed - no source of random numbers");
+      return;
+    }
+    for (uint32_t i = 0; i < 65; ++i) hex_byte(point[i], &p256dh);
+    for (uint32_t i = 0; i < 32; ++i) hex_byte(priv[i], &secret);
+    endpoint.assign("https://");
+    endpoint.append(kPushHost);
+    endpoint.append("/wpush/v2/");
+    endpoint.append(token.view());
+    r->push_endpoint = util::move(endpoint);
+    r->push_private = util::move(secret);
+    r->push_p256dh = util::move(p256dh);
+    r->push_auth = util::move(auth);
+    r->push_key.assign(key_hex);
+  }
+  json->assign("{\"ok\":true,\"sub\":");
+  push_json(*r, json);
+  json->push_back('}');
+}
+
+void ServiceWorkerHub::push_get(uint32_t reg, String* json) {
+  Lock lock(*this);
+  const Registration* r = find_registration(reg);
+  json->clear();
+  if (r && !r->unregistered && !r->push_endpoint.empty()) push_json(*r, json);
+}
+
+bool ServiceWorkerHub::push_unsubscribe(uint32_t reg) {
+  Lock lock(*this);
+  Registration* r = find_registration(reg);
+  if (!r || r->push_endpoint.empty()) return false;
+  push_retire(*r);
+  return true;
+}
+
+// The subscription is given up: its endpoint answers 410 from now on (for the last few).
+void ServiceWorkerHub::push_retire(Registration& r) {
+  const StringView endpoint = r.push_endpoint.view();
+  const uint64_t slash = endpoint.size() ? endpoint.find("/wpush/v2/") : StringView::npos;
+  if (slash != StringView::npos) {
+    if (push_gone_.count() >= 64) push_gone_.remove_at(0);
+    String token(allocator_);
+    token.assign(endpoint.substr(slash + 10));
+    push_gone_.push_back(util::move(token));
+  }
+  r.push_endpoint.clear();
+  r.push_p256dh.clear();
+  r.push_auth.clear();
+  r.push_key.clear();
+  r.push_private.clear();
+}
+
+void ServiceWorkerHub::push_state(uint32_t reg, String* state) {
+  Lock lock(*this);
+  const Registration* r = find_registration(reg);
+  const char* p = r ? notification_permission(r->origin.view()) : "denied";
+  state->assign(StringView(p).equals("default") ? "prompt" : p);
+}
+
+bool ServiceWorkerHub::push_deliver(StringView endpoint, StringView data, bool has_data) {
+  Lock lock(*this);
+  if (endpoint.empty()) return false;
+  for (const UniquePointer<Registration>& r : registrations_) {
+    if (r->unregistered || !r->push_endpoint.view().equals(endpoint)) continue;
+    Worker* w = r->active ? find_worker(r->active) : nullptr;
+    if (!w || w->state != Worker::State::Activated) return false;
+    String arg(allocator_);
+    arg.append("{");
+    if (has_data) {
+      arg.append("\"data\":\"");
+      for (const char c : data) hex_byte(static_cast<uint8_t>(c), &arg);
+      arg.append("\"");
+    }
+    arg.append("}");
+    return dispatch_extendable(*w, "push", arg.view());
+  }
+  return false;
+}
+
+bool ServiceWorkerHub::push_expire(StringView endpoint) {
+  Lock lock(*this);
+  if (endpoint.empty()) return false;
+  for (const UniquePointer<Registration>& r : registrations_) {
+    if (r->unregistered || !r->push_endpoint.view().equals(endpoint)) continue;
+    String arg(allocator_);
+    arg.append("{\"old\":");
+    push_json(*r, &arg);
+    arg.push_back('}');
+    push_retire(*r);
+    Worker* w = r->active ? find_worker(r->active) : nullptr;
+    return w && w->state == Worker::State::Activated && dispatch_extendable(*w, "pushsubscriptionchange", arg.view());
+  }
+  return false;
+}
+
+bool ServiceWorkerHub::push_handles(StringView url) {
+  WebUrl parsed(allocator_);
+  return WebUrl::parse(allocator_, url, nullptr, &parsed) && parsed.scheme.equals("https") && parsed.host.view().equals(kPushHost);
+}
+
+namespace {
+
+void push_answer(NetResponse* response, uint32_t status, const char* reason, StringView url, StringView extra) {
+  response->status = status;
+  response->reason.assign(reason);
+  response->url.assign(url);
+  response->headers.assign("Access-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: Location, TTL\r\n");
+  response->headers.append(extra);
+  response->body.clear();
+}
+
+}  // namespace
+
+// The push service of RFC 8030. Every outcome is an HTTP answer, never a failure of the request.
+void ServiceWorkerHub::push_request(const FetchOptions& options, NetResponse* response) {
+  Lock lock(*this);
+  WebUrl url(allocator_);
+  if (!WebUrl::parse(allocator_, options.url, nullptr, &url)) {
+    push_answer(response, 400, "Bad Request", options.url, "");
+    return;
+  }
+  const StringView path = url.path.view(), prefix = "/wpush/v2/";
+  if (!path.starts_with(prefix) || path.size() == prefix.size() || path.substr(prefix.size()).contains('/')) {
+    push_answer(response, 404, "Not Found", options.url, "");
+    return;
+  }
+  if (StringView(options.method).equals("OPTIONS")) {   // (the preflight of a page acting as an application server)
+    push_answer(response, 204, "No Content", options.url,
+                "Access-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: content-encoding, content-type, ttl, urgency, topic, authorization, crypto-key\r\n");
+    return;
+  }
+  if (!StringView(options.method).equals("POST")) {
+    push_answer(response, 405, "Method Not Allowed", options.url, "Allow: POST\r\n");
+    return;
+  }
+  const StringView token = path.substr(prefix.size());
+  Registration* r = nullptr;
+  for (const UniquePointer<Registration>& candidate : registrations_) {
+    const StringView endpoint = candidate->push_endpoint.view();
+    if (!candidate->unregistered && !endpoint.empty() && endpoint.ends_with(token) && endpoint.size() > token.size() && endpoint[endpoint.size() - token.size() - 1] == '/') r = candidate.get();
+  }
+  if (!r) {
+    bool gone = false;
+    for (const String& g : push_gone_) gone = gone || g.view().equals(token);
+    push_answer(response, gone ? 410 : 404, gone ? "Gone" : "Not Found", options.url, "");
+    return;
+  }
+  StringView value;
+  uint64_t ttl = 0;
+  if (!header_value(options.headers, "ttl", &value) || !value.parse_uint(&ttl)) {   // (RFC 8030: a push without TTL is refused)
+    push_answer(response, 400, "Bad Request", options.url, "");
+    return;
+  }
+  if (header_value(options.headers, "urgency", &value) && !(value.equals("very-low") || value.equals("low") || value.equals("normal") || value.equals("high"))) {
+    push_answer(response, 400, "Bad Request", options.url, "");
+    return;
+  }
+  if (header_value(options.headers, "topic", &value)) {
+    bool good = !value.empty() && value.size() <= 32;
+    for (const char c : value) good = good && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_');
+    if (!good) {
+      push_answer(response, 400, "Bad Request", options.url, "");
+      return;
+    }
+  }
+  if (options.body.size() > kWebPushMaxBody) {
+    push_answer(response, 413, "Payload Too Large", options.url, "");
+    return;
+  }
+  if (!r->push_key.empty()) {   // the subscription was made for one sender: only it may push
+    uint8_t key[65];
+    StringView authorization, crypto_key;
+    header_value(options.headers, "authorization", &authorization);
+    header_value(options.headers, "crypto-key", &crypto_key);
+    String audience(allocator_);
+    audience.assign("https://");
+    audience.append(kPushHost);
+    const Vapid vapid = hex_decode(r->push_key.view(), ByteView(key, 65))
+                            ? vapid_check(allocator_, authorization, crypto_key, ConstByteView(key, 65), audience.view(), host_ ? host_->now_ms() / 1000 : 0)
+                            : Vapid::Invalid;
+    if (vapid != Vapid::Ok) {
+      push_answer(response, vapid == Vapid::Missing ? 401 : 403, vapid == Vapid::Missing ? "Unauthorized" : "Forbidden", options.url, "");
+      return;
+    }
+  }
+  ByteBuffer plain(allocator_);
+  const bool has_data = options.body.size() != 0;
+  if (has_data) {
+    StringView coding;
+    uint8_t priv[32], pub[65], auth[16];
+    if (!header_value(options.headers, "content-encoding", &coding) || !coding.equals("aes128gcm") || !hex_decode(r->push_private.view(), ByteView(priv, 32)) ||
+        !hex_decode(r->push_p256dh.view(), ByteView(pub, 65)) || !hex_decode(r->push_auth.view(), ByteView(auth, 16)) ||
+        !webpush_decrypt(priv, ConstByteView(pub, 65), ConstByteView(auth, 16), options.body, &plain)) {
+      push_answer(response, 400, "Bad Request", options.url, "");
+      return;
+    }
+  }
+  Worker* w = r->active ? find_worker(r->active) : nullptr;
+  if (!w || w->state != Worker::State::Activated) {   // (no worker to take it: the subscription is as good as gone)
+    push_answer(response, 503, "Service Unavailable", options.url, "Retry-After: 60\r\n");
+    return;
+  }
+  String arg(allocator_), location(allocator_), extra(allocator_);
+  arg.append("{");
+  if (has_data) {
+    arg.append("\"data\":\"");
+    for (const uint8_t b : plain.view()) hex_byte(b, &arg);
+    arg.append("\"");
+  }
+  arg.append("}");
+  dispatch_extendable(*w, "push", arg.view());   // (a handler that fails does not un-deliver the message)
+  location.assign(r->push_endpoint.view());
+  location.append("/m/");
+  location.append_uint(++push_messages_);
+  extra.append("Location: ");
+  extra.append(location.view());
+  extra.append("\r\nTTL: ");
+  extra.append_uint(ttl);
+  extra.append("\r\n");
+  push_answer(response, 201, "Created", options.url, extra.view());
 }
 
 // --- The lifecycle ---------------------------------------------------------------------------------------------------------------

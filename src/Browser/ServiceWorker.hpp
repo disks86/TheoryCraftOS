@@ -89,6 +89,46 @@ class ServiceWorkerHub final : public IServiceWorkerPersistence {
   bool api_sync_register(uint32_t reg, StringView tag);
   void api_sync_tags(uint32_t reg, String* json);
 
+  // --- Notifications and Push. The permission is kept per origin for as long as the browser runs; the notifications are shown by the browser (IPageEnvironment::notification_*).
+  struct Permission {
+    explicit Permission(allocators::IAllocator& a) : origin(a) {}
+    String origin;
+    bool granted = false;
+  };
+  static constexpr uint32_t kMaxPermissions = 256, kMaxNotifications = 64;
+  // "default", "granted" or "denied" for the origin.
+  const char* notification_permission(StringView origin);
+  // The user's answer (or a setting): the pages of the origin are told ({"t":"permission"}) and the answers they wait for are given.
+  void set_notification_permission(StringView origin, bool granted);
+  // For a document (client) or a worker: its origin's permission; or ask for it (the answer is "pending" while the browser waits for the user).
+  void notify_permission(uint32_t client, uint32_t worker, String* state);
+  void notify_request(uint32_t client, uint32_t worker, String* state);
+  // Shows a notification: from a document (reg 0) or for a registration. `options` is the JSON of the rest of the options, kept for the events; the names and texts of the action buttons are lines of `action_ids` / `action_titles`. {"ok":true,"id":N} or an error.
+  void notify_show(uint32_t client, uint32_t reg, StringView title, StringView body, StringView tag, bool sticky, bool renotify, StringView options, StringView action_ids,
+                   StringView action_titles, String* json);
+  bool notify_close(uint32_t client, uint32_t id);
+  // The notifications of a registration, as a JSON array (those with `tag` if it is not empty).
+  void notify_list(uint32_t reg, StringView tag, String* json);
+  // The user clicked / sent away the notice the browser showed under that number.
+  // `action`: the button that was clicked (0 is the first), -1 for the notice itself; the worker's event says the action's name.
+  void notification_activated(uint32_t number, int32_t action = -1);
+  void notification_closed(uint32_t number);
+  // Push: the subscription of a registration. The browser has no push service of its own to reach: a message is handed to push_deliver() with the endpoint of the subscription.
+  void push_subscribe(uint32_t reg, bool user_visible_only, StringView key_hex, String* json);
+  void push_get(uint32_t reg, String* json);   // the subscription as JSON, "" if there is none
+  bool push_unsubscribe(uint32_t reg);
+  void push_state(uint32_t reg, String* state);   // "granted", "denied" or "prompt"
+  // The push service: the addresses of subscriptions' endpoints are on a host of its own, which the browser answers itself (an application server on this machine, or a page
+  // acting as one, sends there). A POST with a TTL header and a body encrypted for the subscription (RFC 8291), signed with VAPID (RFC 8292) when the subscription was made
+  // with an applicationServerKey, is decrypted and handed to the worker as a push event; the answer is the one of RFC 8030 (201, or 400, 401, 403, 404, 410, 413).
+  static constexpr const char* kPushHost = "push.theorycraft.invalid";
+  bool push_handles(StringView url);
+  void push_request(const FetchOptions& options, NetResponse* response);
+  // A message for the subscription: the worker gets a push event (with `data` when has_data). False if there is no such subscription or the worker did not take it.
+  bool push_deliver(StringView endpoint, StringView data, bool has_data);
+  // The subscription is gone on the push service's side: the worker gets pushsubscriptionchange.
+  bool push_expire(StringView endpoint);
+
   // --- Message ports that cross between documents and workers (a port moved with postMessage() lives on the other side; the document or worker it left sends what is
   // posted to its peer here). Port numbers are unique over the whole browser (Page seeds them from base_port()).
   static uint32_t base_port(bool worker, uint32_t id) { return (worker ? 0x80000000u : 0u) + id * 65536u + 1u; }
@@ -178,6 +218,14 @@ class ServiceWorkerHub final : public IServiceWorkerPersistence {
   void refresh_controllers();
   void fire_waiting_syncs(Registration& r);
   void touch() { ++version_; }
+  struct Notification;
+  Permission* find_permission(StringView origin);
+  bool origin_of(uint32_t client, uint32_t worker, String* origin);
+  void notification_json(const Notification& n, String* json);
+  void remove_notification(uint64_t index, bool tell_host);
+  void push_json(const Registration& r, String* json);
+  void push_retire(Registration& r);
+  void apply_permission(StringView origin, bool granted);
 
   allocators::IAllocator& allocator_;
   kernel::RecursiveMutex mutex_;
@@ -187,6 +235,11 @@ class ServiceWorkerHub final : public IServiceWorkerPersistence {
   List<UniquePointer<Registration>> registrations_;
   List<UniquePointer<Worker>> workers_;
   List<UniquePointer<Client>> clients_;
+  List<Permission> permissions_;
+  List<UniquePointer<Notification>> notifications_;
+  uint32_t next_notification_ = 1;
+  List<String> push_gone_;   // the tokens of endpoints that were given up (answered with 410)
+  uint32_t push_messages_ = 0;
   friend struct Runtime;
 };
 

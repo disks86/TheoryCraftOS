@@ -483,6 +483,8 @@ static void test_tooltip() {
   CHECK(a.live == 0);
 }
 
+static int g_toast_actions = 0, g_toast_last = -2;
+static void on_toast_action(void*, Control& sender) { ++g_toast_actions; g_toast_last = static_cast<ToastCenter&>(sender).last_action(); }
 static int g_toast_clicks = 0;
 static void on_toast_click(void*, Control&) { ++g_toast_clicks; }
 
@@ -551,6 +553,32 @@ static void test_toast_center() {
     w.mouse_button(b.x + b.width - 10, b.y + 6, MouseButton::Left, true);
     w.mouse_button(b.x + b.width - 10, b.y + 6, MouseButton::Left, false);
     CHECK(g_toast_clicks == 1 && !toasts.showing(other) && toasts.count() == 0);
+
+    // A toast with buttons is taller by a row; a click on a button runs the action handler (and names the button), not the click handler.
+    g_toast_clicks = g_toast_actions = 0;
+    g_toast_last = -2;
+    const StringView labels[3] = {"Open", "A label that is far too long", "Third"};
+    const uint32_t buttoned = toasts.post("Message", "From Ann", NoticeKind::Information, 0, Handler::immediate(&on_toast_click, nullptr), ArrayView<const StringView>(labels, 3),
+                                          Handler::immediate(&on_toast_action, nullptr));
+    CHECK(buttoned != 0 && toasts.action_count(buttoned) == ToastCenter::kMaxActions && toasts.action_of(buttoned, 0) == "Open");
+    CHECK(toasts.action_of(buttoned, 1).size() == ToastCenter::kActionChars && toasts.action_of(buttoned, 2).empty());
+    w.layout();
+    b = toasts.toast_bounds(0);
+    CHECK(b.height == 2 * 16 + 2 * ToastCenter::kPad + 2 + ToastCenter::kPad + ToastCenter::kActionHeight);
+    const Rect2D first_button = toasts.action_bounds(0, 0), second_button = toasts.action_bounds(0, 1);
+    CHECK(first_button.width == 4 * 8 + 2 * ToastCenter::kActionPad && second_button.x > first_button.x + static_cast<int32_t>(first_button.width) && toasts.action_bounds(0, 2).width == 0);
+    CHECK(first_button.y + static_cast<int32_t>(first_button.height) < b.y + static_cast<int32_t>(b.height));
+    w.render();
+    CHECK(screen.px(first_button.x + 2, first_button.y + 2) == ToastCenter::kActionBackground);
+    w.mouse_button(second_button.x + 4, second_button.y + 4, MouseButton::Left, true);
+    w.mouse_button(second_button.x + 4, second_button.y + 4, MouseButton::Left, false);
+    CHECK(g_toast_actions == 1 && g_toast_last == 1 && g_toast_clicks == 0 && toasts.count() == 0);
+    toasts.post("Message", "From Ann", NoticeKind::Information, 0, Handler::immediate(&on_toast_click, nullptr), ArrayView<const StringView>(labels, 3), Handler::immediate(&on_toast_action, nullptr));
+    w.layout();
+    b = toasts.toast_bounds(0);
+    w.mouse_button(b.x + 40, b.y + 20, MouseButton::Left, true);   // (the text, not a button)
+    w.mouse_button(b.x + 40, b.y + 20, MouseButton::Left, false);
+    CHECK(g_toast_actions == 1 && g_toast_clicks == 1 && toasts.last_action() == -1 && toasts.count() == 0);
 
     // At most kMaxToasts: the oldest makes room. dismiss() and clear().
     uint32_t ids[ToastCenter::kMaxToasts + 2];

@@ -1258,6 +1258,10 @@ browser::PageHub& WebBrowser::Env::page_hub() { return owner_.shared_hub_ ? *own
 browser::CookieJar& WebBrowser::Env::cookies() { return owner_.jar(); }
 
 bool WebBrowser::Env::http_request(const browser::FetchOptions& options, browser::NetResponse* response) {
+  if (owner_.sw_hub_ && owner_.sw_hub_->push_handles(options.url)) {   // (the push service answers for itself)
+    owner_.sw_hub_->push_request(options, response);
+    return true;
+  }
   if (!owner_.loader_) {
     response->error.assign("There is no network connection.");
     return false;
