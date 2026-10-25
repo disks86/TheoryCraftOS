@@ -330,7 +330,9 @@ int32_t selected_index(const Node* select) {
   List<Node*> options(select->owner->allocator());
   select_options(select, &options);
   int32_t last = -1, first_enabled = -1;
+  bool chosen_by_script = false;   // (an option whose selectedness was set: when none is selected then, none stays so)
   for (uint64_t i = 0; i < options.count(); ++i) {
+    chosen_by_script = chosen_by_script || (options[i]->form_state & kFormCheckedDirty);
     if (is_checked(options[i])) {
       if (has_attribute(select, "multiple")) return static_cast<int32_t>(i);
       last = static_cast<int32_t>(i);
@@ -338,7 +340,7 @@ int32_t selected_index(const Node* select) {
     if (first_enabled < 0 && !is_disabled(options[i])) first_enabled = static_cast<int32_t>(i);
   }
   if (last >= 0) return last;
-  if (select_is_list(select)) return -1;
+  if (select_is_list(select) || chosen_by_script) return -1;
   return first_enabled;
 }
 

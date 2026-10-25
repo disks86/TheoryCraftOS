@@ -661,6 +661,20 @@ bool SelectorSet::match_inner(const Test& t, const Node* node, const Node* scope
   return false;
 }
 
+// A control is disabled by its own attribute or by a fieldset around it that is (the controls in that fieldset's first legend stay enabled).
+static bool is_disabled_control(const Node* node) {
+  if (has_attribute(node, "disabled")) return true;
+  const Node* child = node;
+  for (const Node* p = node->parent; p && p->is_element(); child = p, p = p->parent) {
+    if (!p->is_tag("fieldset") || !has_attribute(p, "disabled")) continue;
+    const Node* legend = nullptr;
+    for (const Node* k = p->first_child; k && !legend; k = k->next)
+      if (k->is_tag("legend")) legend = k;
+    if (legend != child) return true;
+  }
+  return false;
+}
+
 bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope) const {
   StringView value;
   switch (t.kind) {
@@ -750,8 +764,8 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
       get_value(node, &v);
       return v.empty();
     }
-    case TestKind::Disabled: return is_form_control(node->name.view()) && has_attribute(node, "disabled");
-    case TestKind::Enabled: return is_form_control(node->name.view()) && !has_attribute(node, "disabled");
+    case TestKind::Disabled: return is_form_control(node->name.view()) && is_disabled_control(node);
+    case TestKind::Enabled: return is_form_control(node->name.view()) && !is_disabled_control(node);
     case TestKind::Not: return !match_inner(t, node, scope);
     case TestKind::Is: return match_inner(t, node, scope);
     case TestKind::Host: return node->shadow != nullptr;

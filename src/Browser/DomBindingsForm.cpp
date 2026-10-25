@@ -132,7 +132,26 @@ Value elements_value(DomBindings::Impl& c, dom::Node* form) {
     for (const char* attribute : {"id", "name"}) {
       if (dom::get_attribute(list[i], attribute, &v) && !v.empty() && !(v[0] >= '0' && v[0] <= '9')) {
         Value existing;
-        if (!vm.get_named(Value::make_object(collection), v, &existing) || existing.is_undefined()) vm.define_named(collection, v, node_value(c, list[i]), kWritable);
+        if (!vm.get_named(Value::make_object(collection), v, &existing) || existing.is_undefined()) {
+          List<dom::Node*> group(vm.allocator());   // several controls with the name: a list of them (a RadioNodeList: its value is the checked radio button's)
+          for (uint64_t k = 0; k < list.count(); ++k) {
+            StringView other;
+            if (dom::get_attribute(list[k], "name", &other) && other.equals(v)) group.push_back(list[k]);
+          }
+          if (group.count() > 1) {
+            JsObject* nodes = make_collection(c, group);
+            String chosen(vm.allocator());
+            for (uint64_t k = 0; k < group.count(); ++k)
+              if (group[k]->is_tag("input") && dom::input_type(group[k]) == dom::InputType::Radio && dom::is_checked(group[k])) {
+                dom::get_value(group[k], &chosen);
+                break;
+              }
+            vm.define_named(nodes, "value", str_value(vm, chosen.view()), kWritable);
+            vm.define_named(collection, v, Value::make_object(nodes), kWritable);
+          } else {
+            vm.define_named(collection, v, node_value(c, list[i]), kWritable);
+          }
+        }
       }
     }
   }

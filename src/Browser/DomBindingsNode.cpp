@@ -479,10 +479,11 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (n->is_tag("input")) { *out = str_value(vm, "text"); return true; }
     if (n->is_tag("button")) { *out = str_value(vm, "submit"); return true; }
   }
+  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return false;   // (token lists: the script's accessors)
   if (const ReflectedAttribute* r = find_reflected(k)) {
     StringView v;
     const bool present = dom::get_attribute(n, r->attribute, &v);
-    switch (r->kind) {
+    switch (IS("value") && n->is_tag("li") ? Reflect::Int : r->kind) {   // (an <li>'s value is a number)
       case Reflect::Bool: *out = bool_value(present); return true;
       case Reflect::Int: {
         double d = r->js[0] == 't' ? -1 : 0;
@@ -500,8 +501,17 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       case Reflect::Url: {
         if (!present) { *out = str_value(vm, ""); return true; }
         String resolved(vm.allocator());
-        if (!v.empty() && resolve_reference(vm.allocator(), c.host.address(), v, &resolved)) *out = str_value(vm, resolved.view());
-        else *out = str_value(vm, v);
+        if (!v.empty() && resolve_reference(vm.allocator(), c.host.address(), v, &resolved)) {
+          const uint64_t hash = v.trimmed().find('#');   // (the address to fetch has no fragment; the property keeps the one that was written)
+          if (hash != StringView::npos) {
+            const uint64_t old = resolved.view().find('#');
+            if (old != StringView::npos) resolved.truncate(old);
+            resolved.append(v.trimmed().substr(hash));
+          }
+          *out = str_value(vm, resolved.view());
+        } else {
+          *out = str_value(vm, v);
+        }
         return true;
       }
       default: *out = str_value(vm, present ? v : StringView()); return true;
@@ -602,6 +612,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     return done(dom::set_text_content(n, text.view()));
   }
+  if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return HostClass::Set::NotHandled;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     switch (r->kind) {
       case Reflect::Bool:

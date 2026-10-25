@@ -7445,6 +7445,45 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     def(C, 'cellIndex', function () { var p = this.parentNode; return p && p.localName === 'tr' ? kids(p, ['td', 'th']).indexOf(this) : -1; });
   }());
 
+  // ---------------------------------------------------------------------------------------------------------------------------------- select.add, disabled controls, RadioNodeList
+  (function () {
+    var SP = g.HTMLSelectElement && g.HTMLSelectElement.prototype;
+    if (SP && !Object.prototype.hasOwnProperty.call(SP, 'add')) method(SP, 'add', function (element, before) {
+      if (before !== undefined && before !== null && typeof before === 'number') before = this.options[before] || null;
+      if (before && before.nodeType === 1 && !this.contains(before)) throw new DOMException("Failed to execute 'add' on 'HTMLSelectElement': The node before which the new node is to be inserted is not a child of this node.", 'NotFoundError');
+      (before && before.parentNode ? before.parentNode : this).insertBefore(element, before || null);
+    });
+    // click() does nothing on a disabled control
+    var click = g.HTMLElement && g.HTMLElement.prototype.click;
+    if (click) method(g.HTMLElement.prototype, 'click', function () {
+      if (this.hasAttribute('disabled') && /^(button|input|select|textarea|fieldset|optgroup|option)$/.test(this.localName)) return;
+      return click.apply(this, arguments);
+    });
+  }());
+
+  // ---------------------------------------------------------------------------------------------------------------------------------- <a> and <area> as URL utils
+  (function () {
+    ['HTMLAnchorElement', 'HTMLAreaElement'].forEach(function (n) {
+      var P = g[n] && g[n].prototype;
+      if (!P) return;
+      var parsed = function (el) { var h = el.getAttribute('href'); return h === null ? null : g.URL.parse(el.href); };
+      var part = function (name, set) {
+        if (Object.prototype.hasOwnProperty.call(P, name)) return;
+        Object.defineProperty(P, name, {
+          get: function () { var u = parsed(this); return u ? (name === 'origin' && u.origin === 'null' ? 'null' : u[name]) : ''; },
+          set: set === false ? undefined : function (v) {
+            var u = parsed(this);
+            if (!u) return;
+            u[name] = v;
+            this.setAttribute('href', u.href);
+          }, enumerable: true, configurable: true });
+      };
+      ['protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].forEach(function (k) { part(k); });
+      part('origin', false);
+      if (!Object.prototype.hasOwnProperty.call(P, 'toString')) method(P, 'toString', function () { return this.href; });
+    });
+  }());
+
   // ---------------------------------------------------------------------------------------------------------------------------------- more events
   var mkEvent = function (name, parent, defaults) {
     var fields = Object.keys(defaults), base = parent || g.Event;
@@ -7818,6 +7857,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       Object.defineProperty(P, 'relList', { get: function () { return tokenList(this, 'rel', relTokens); }, set: function (v) { this.setAttribute('rel', String(v)); }, enumerable: true, configurable: true });
     });
     if (g.HTMLIFrameElement && !('sandbox' in g.HTMLIFrameElement.prototype)) Object.defineProperty(g.HTMLIFrameElement.prototype, 'sandbox', { get: function () { return tokenList(this, 'sandbox', ['allow-forms', 'allow-modals', 'allow-popups', 'allow-same-origin', 'allow-scripts', 'allow-top-navigation']); }, set: function (v) { this.setAttribute('sandbox', String(v)); }, enumerable: true, configurable: true });
+    if (g.HTMLOutputElement && !Object.prototype.hasOwnProperty.call(g.HTMLOutputElement.prototype, 'htmlFor')) Object.defineProperty(g.HTMLOutputElement.prototype, 'htmlFor', { get: function () { return tokenList(this, 'for'); }, set: function (v) { this.setAttribute('for', String(v)); }, enumerable: true, configurable: true });
     // iteration over a list of tokens
     var listValues = function () { var o = []; for (var i = 0; i < this.length; i++) o.push(this.item(i)); return o; };
     method(PartList.prototype, 'values', listValues);
