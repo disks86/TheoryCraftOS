@@ -41,4 +41,7 @@ bool pack_pixels(const Image& img, int32_t x0, int32_t y0, uint32_t w, uint32_t 
 
 void downsample(const Image& src, Image* dst);
 
+// Averages the samples of a multisampled image (layer `layer`) into a one-sample image of its size / ss. False if memory ran out.
+bool resolve_samples(const Image& src, uint32_t layer, Image* dst);
+
 }  // namespace webgl

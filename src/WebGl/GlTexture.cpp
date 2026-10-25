@@ -483,4 +483,31 @@ void downsample(const Image& src, Image* dst) {
       }
 }
 
+bool resolve_samples(const Image& src, uint32_t layer, Image* dst) {
+  const uint32_t k = src.ss ? src.ss : 1, w = src.w / k, h = src.h / k;
+  if (!dst->allocate(src.info, w, h, 1)) return false;
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      double acc[4] = {0, 0, 0, 0};
+      uint32_t raw[4], first[4];
+      for (uint32_t j = 0; j < k; ++j)
+        for (uint32_t i = 0; i < k; ++i) {
+          read_texel(src, x * k + i, y * k + j, layer, raw);
+          if (i == 0 && j == 0) for (int c = 0; c < 4; ++c) first[c] = raw[c];
+          for (int c = 0; c < 4; ++c) acc[c] += src.info->store == Store::U8x4 ? static_cast<double>(raw[c]) : (src.info->store == Store::F32x4 || src.info->store == Store::Depth ? static_cast<double>(u2f(raw[c])) : 0.0);
+        }
+      uint32_t out[4];
+      const double n = static_cast<double>(k) * k;
+      switch (src.info->store) {
+        case Store::U8x4: for (int c = 0; c < 4; ++c) out[c] = static_cast<uint32_t>(acc[c] / n + 0.5); break;
+        case Store::F32x4: case Store::Depth: for (int c = 0; c < 4; ++c) out[c] = f2u(static_cast<float>(acc[c] / n)); break;
+        default: for (int c = 0; c < 4; ++c) out[c] = first[c]; break;   // integers and stencil: the first sample
+      }
+      if (src.info->store == Store::Depth || src.info->store == Store::DepthStencil) out[0] = first[0];
+      if (src.info->store == Store::DepthStencil) { out[1] = first[1]; out[2] = out[3] = 0; }
+      write_texel(*dst, x, y, 0, out);
+    }
+  return true;
+}
+
 }  // namespace webgl

@@ -407,6 +407,7 @@ struct Device::Target {
   uint32_t ds_layer = 0;
   const FormatDesc* dfmt = nullptr;
   uint32_t w = 0, h = 0;
+  uint32_t ss = 1;
 };
 
 namespace {
@@ -496,6 +497,17 @@ bool Device::end_render_pass() {
       uint32_t sl, rl;
       const FormatDesc *sf, *rf;
       if (!sv || !rv || !view_image_for_pass(*this, sv, &si, &sl, &sf) || !view_image_for_pass(*this, rv, &ri, &rl, &rf)) continue;
+      if (si->ss > 1 && ri->ss == 1) {
+        Image tmp(a_);
+        if (!webgl::resolve_samples(*si, sl, &tmp)) continue;
+        for (uint32_t y = 0; y < tmp.h && y < ri->h; ++y)
+          for (uint32_t x = 0; x < tmp.w && x < ri->w; ++x) {
+            uint32_t raw[4];
+            webgl::read_texel(tmp, x, y, 0, raw);
+            webgl::write_texel(*ri, x, y, rl, raw);
+          }
+        continue;
+      }
       for (uint32_t y = 0; y < si->h && y < ri->h; ++y)
         for (uint32_t x = 0; x < si->w && x < ri->w; ++x) {
           uint32_t raw[4];
@@ -573,9 +585,10 @@ struct RenderSink final : gpu::IFragmentSink {
     const gpu::Fragment* f = nullptr;
     const float* var = nullptr;
     int32_t px = 0, py = 0;
+    float ss = 1;
     uint32_t get(int32_t builtin, int32_t location, uint32_t out[4]) override {
       switch (builtin) {
-        case shader::kBvPosition: out[0] = f2u(px + 0.5f); out[1] = f2u(py + 0.5f); out[2] = f2u(f->z); out[3] = f2u(f->coord[3]); return 4;
+        case shader::kBvPosition: out[0] = f2u((px + 0.5f) / ss); out[1] = f2u((py + 0.5f) / ss); out[2] = f2u(f->z); out[3] = f2u(f->coord[3]); return 4;
         case shader::kBvFrontFacing: out[0] = f->front ? 1 : 0; return 1;
         case shader::kBvSampleIndex: out[0] = 0; return 1;
         case shader::kBvSampleMask: out[0] = 0xFFFFFFFFu; return 1;
@@ -594,7 +607,7 @@ struct RenderSink final : gpu::IFragmentSink {
     if (same) for (uint32_t i = 0; i < gpu::kMaxVarying; ++i) tmp[i] = f.varyings[i];
     else f.varyings_at(px, py, tmp, gpu::kMaxVarying);
     FragIo io;
-    io.f = &f; io.var = tmp; io.px = px; io.py = py;
+    io.f = &f; io.var = tmp; io.px = px; io.py = py; io.ss = static_cast<float>(t.ss);
     args.lanes.clear();
     args.ptrs.clear();
     if (!build_args(mod, fn, io, &args)) return shader::Machine::Status::Failed;
@@ -757,11 +770,11 @@ bool Device::draw_primitives(uint32_t count, uint32_t first, int32_t base_vertex
     if (!view_image_for_pass(*this, v, &im, &tg.layer[i], &tg.cfmt[i])) return fail("an attachment is gone");
     tg.color[i] = im;
     tg.count = i + 1;
-    tg.w = im->w; tg.h = im->h;
+    tg.w = im->w; tg.h = im->h; tg.ss = im->ss;
   }
   if (pd.depth_view) {
     const TextureView* v = view(pd.depth_view);
-    if (v && view_image_for_pass(*this, v, &tg.ds, &tg.ds_layer, &tg.dfmt)) { if (!tg.w) { tg.w = tg.ds->w; tg.h = tg.ds->h; } }
+    if (v && view_image_for_pass(*this, v, &tg.ds, &tg.ds_layer, &tg.dfmt)) { if (!tg.w) { tg.w = tg.ds->w; tg.h = tg.ds->h; tg.ss = tg.ds->ss; } }
   }
   if (!tg.w) return fail("a render pass needs an attachment");
   // pipeline state against the pass
@@ -785,12 +798,13 @@ bool Device::draw_primitives(uint32_t count, uint32_t first, int32_t base_vertex
   const shader::Function& vfn = *rp.vs->functions[static_cast<uint64_t>(rp.vs_fn)];
 
   gpu::RasterState rs;
-  const float vx = have_viewport_ ? viewport_[0] : 0, vy = have_viewport_ ? viewport_[1] : 0, vw = have_viewport_ ? viewport_[2] : static_cast<float>(tg.w),
-              vh = have_viewport_ ? viewport_[3] : static_cast<float>(tg.h);
-  rs.vp_x = static_cast<int32_t>(vx); rs.vp_y = static_cast<int32_t>(vy); rs.vp_w = static_cast<int32_t>(vw); rs.vp_h = static_cast<int32_t>(vh);
+  const float vx = have_viewport_ ? viewport_[0] : 0, vy = have_viewport_ ? viewport_[1] : 0, vw = have_viewport_ ? viewport_[2] : static_cast<float>(tg.w / tg.ss),
+              vh = have_viewport_ ? viewport_[3] : static_cast<float>(tg.h / tg.ss);
+  const int32_t kss = static_cast<int32_t>(tg.ss);
+  rs.vp_x = static_cast<int32_t>(vx) * kss; rs.vp_y = static_cast<int32_t>(vy) * kss; rs.vp_w = static_cast<int32_t>(vw) * kss; rs.vp_h = static_cast<int32_t>(vh) * kss;
   rs.depth_near = have_viewport_ ? viewport_[4] : 0; rs.depth_far = have_viewport_ ? viewport_[5] : 1;
-  rs.sc_x = have_scissor_ ? static_cast<int32_t>(scissor_[0]) : 0; rs.sc_y = have_scissor_ ? static_cast<int32_t>(scissor_[1]) : 0;
-  rs.sc_w = have_scissor_ ? static_cast<int32_t>(scissor_[2]) : static_cast<int32_t>(tg.w); rs.sc_h = have_scissor_ ? static_cast<int32_t>(scissor_[3]) : static_cast<int32_t>(tg.h);
+  rs.sc_x = have_scissor_ ? static_cast<int32_t>(scissor_[0]) * kss : 0; rs.sc_y = have_scissor_ ? static_cast<int32_t>(scissor_[1]) * kss : 0;
+  rs.sc_w = have_scissor_ ? static_cast<int32_t>(scissor_[2]) * kss : static_cast<int32_t>(tg.w); rs.sc_h = have_scissor_ ? static_cast<int32_t>(scissor_[3]) * kss : static_cast<int32_t>(tg.h);
   rs.target_w = static_cast<int32_t>(tg.w); rs.target_h = static_cast<int32_t>(tg.h);
   // y is flipped into window space (row 0 is the top), which mirrors the winding
   rs.front_ccw = !rp.front_ccw;

@@ -246,8 +246,10 @@ uint32_t Device::create_texture(uint32_t w, uint32_t h, uint32_t depth, uint32_t
   for (uint32_t l = 0; l < mips; ++l) {
     const uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1, ld = dimension == 2 ? (depth >> l ? depth >> l : 1) : depth;
     UniquePointer<Image> im = UniquePointer<Image>::make(a_, a_);
-    total += uint64_t{lw} * lh * ld * 16;
-    if (total > (512ull << 20) || !im || !im->allocate(fi, lw, lh, ld)) { fail("out of memory"); return 0; }
+    const uint32_t ss = samples > 1 ? 2 : 1;   // four samples are kept as a 2x supersampled image
+    total += uint64_t{lw} * lh * ld * 16 * ss * ss;
+    if (total > (512ull << 20) || !im || !im->allocate(fi, lw * ss, lh * ss, ld)) { fail("out of memory"); return 0; }
+    im->ss = ss;
     if (fi->store == webgl::Store::Depth || fi->store == webgl::Store::DepthStencil) {   // depth starts at zero, as does everything else
     }
     t->mips.push_back(static_cast<UniquePointer<Image>&&>(im));
@@ -455,6 +457,7 @@ bool Device::texture_copy(const ImageCopy& t, uint32_t w, uint32_t h, uint32_t d
   if (!tx || tx->destroyed) return fail("texture is destroyed");
   if (t.mip >= tx->mips.count()) return fail("mip level out of range");
   Image* im = tx->mips[t.mip].get();
+  if (im && im->ss > 1) return fail("a multisampled texture cannot be copied; resolve it first");
   if (!im || uint64_t{t.x} + w > im->w || uint64_t{t.y} + h > im->h || uint64_t{t.z} + d > im->d) return fail("copy out of the texture");
   *img = im;
   *fd = tx->format;

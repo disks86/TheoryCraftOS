@@ -634,7 +634,9 @@ void GlContext::renderbuffer_storage(uint32_t internal, uint32_t w, uint32_t h, 
   if (w > kMaxTextureSize || h > kMaxTextureSize) { set_error(INVALID_VALUE); return; }
   if (rb->image.defined()) total_bytes_ -= rb->image.px.size() < total_bytes_ ? rb->image.px.size() : total_bytes_;
   if (w == 0 || h == 0) { rb->image.info = nullptr; rb->image.w = rb->image.h = 0; return; }
-  if (!rb->image.allocate(fi, w, h, 1)) { set_error(OUT_OF_MEMORY); return; }
+  const uint32_t ss = samples > 1 ? 2 : 1;
+  if (!rb->image.allocate(fi, w * ss, h * ss, 1)) { set_error(OUT_OF_MEMORY); return; }
+  rb->image.ss = ss;
   total_bytes_ += rb->image.px.size();
   rb->internal = internal;
   rb->samples = samples;
@@ -644,8 +646,8 @@ bool GlContext::get_renderbuffer_parameter(uint32_t pname, double* out) {
   Renderbuffer* rb = rb_at(rb_bound_);
   if (!rb) { set_error(INVALID_OPERATION); return false; }
   switch (pname) {
-    case 0x8D42: *out = rb->image.w; return true;
-    case 0x8D43: *out = rb->image.h; return true;
+    case 0x8D42: *out = rb->image.w / rb->image.ss; return true;
+    case 0x8D43: *out = rb->image.h / rb->image.ss; return true;
     case 0x8D44: *out = rb->internal; return true;
     case 0x8CAB: *out = rb->samples; return true;
     case 0x8D50: *out = rb->image.info && rb->image.info->base != 0x1902 && rb->image.info->base != 0x84F9 ? 8 : 0; return true;
@@ -765,6 +767,10 @@ void GlContext::resolve_target(uint32_t fb_id, bool draw, Target* t) {
   t->w = dw;
   t->h = dh;
   t->ok = any;
+  Image* first = t->depth ? t->depth : t->stencil;
+  for (uint32_t i = 0; i < kMaxDrawBuffers; ++i)
+    if (t->color[i]) { first = t->color[i]; break; }
+  if (first) t->ss = first->ss;
 }
 
 bool GlContext::framebuffer_complete(uint32_t fb_id, uint32_t* status) {
@@ -772,7 +778,7 @@ bool GlContext::framebuffer_complete(uint32_t fb_id, uint32_t* status) {
   Framebuffer* fb = fb_at(fb_id);
   if (!fb) { *status = 0x8CD7; return false; }
   bool any = false;
-  uint32_t w = 0, h = 0;
+  uint32_t w = 0, h = 0, ss = 1;
   auto check = [&](const Attachment& at, bool color, bool depth, bool stencil) -> uint32_t {
     if (!at.kind) return 0x8CD5;
     Image* im;
@@ -782,7 +788,8 @@ bool GlContext::framebuffer_complete(uint32_t fb_id, uint32_t* status) {
     if (color && (!fi->color_renderable || fi->store == Store::Depth || fi->store == Store::DepthStencil)) return 0x8CD6;
     if (depth && fi->store != Store::Depth && fi->store != Store::DepthStencil) return 0x8CD6;
     if (stencil && fi->store != Store::DepthStencil) return 0x8CD6;
-    if (!any) { w = im->w; h = im->h; any = true; }
+    if (!any) { w = im->w; h = im->h; ss = im->ss; any = true; }
+    else if (im->ss != ss) return 0x8D56;
     else if (im->w != w || im->h != h) return 0x8CD9;
     return 0x8CD5;
   };

@@ -52,7 +52,8 @@ uint32_t texel_bytes(Store s);
 
 struct Image {
   explicit Image(allocators::IAllocator& a) : px(a) {}
-  uint32_t w = 0, h = 0, d = 1;
+  uint32_t w = 0, h = 0, d = 1;   // (for a multisampled image these are the stored samples: ss x ss of them per pixel)
+  uint32_t ss = 1;                // 2 for a 4-sample image, which is kept as a 2x supersampled image and averaged when resolved
   const FormatInfo* info = nullptr;
   ByteBuffer px;
   bool defined() const { return info != nullptr && w > 0 && h > 0; }
@@ -472,6 +473,7 @@ class GlContext final : public shader::ITextureHost {
     Image* depth = nullptr;        // Depth or DepthStencil image
     Image* stencil = nullptr;      // DepthStencil image (same as depth when packed)
     uint32_t w = 0, h = 0;
+    uint32_t ss = 1;
     uint32_t layer[kMaxDrawBuffers] = {};
     uint32_t depth_layer = 0;
     bool is_default = false;
