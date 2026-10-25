@@ -204,6 +204,7 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
     hide(ctx, '__h', canvas.height);
     hide(ctx, '__es3', es3);
     hide(ctx, '__ext', {});
+    hide(ctx, '__compressed', {});
     hide(ctx, '__attrs', a);
     hide(ctx, '__loseExt', null);
     Object.defineProperty(ctx, 'canvas', { value: canvas, enumerable: true });
@@ -334,8 +335,26 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
   });
   m1('copyTexImage2D', function (t, l, f, x, y, w, h, b) { CALL(this, 'copyTexImage2D', t, l, f, x, y, w, h, b); });
   m1('copyTexSubImage2D', function (t, l, xo, yo, x, y, w, h) { CALL(this, 'copyTexSubImage', t, l, xo, yo, 0, x, y, w, h); });
-  m1('compressedTexImage2D', function () { this.__err(0x500); });
-  m1('compressedTexSubImage2D', function () { this.__err(0x500); });
+  // compressed textures: only the formats of the extensions the page has asked for (getExtension) are accepted
+  var compressedOk = function (ctx, fmt) { return !!ctx.__compressed[fmt]; };
+  var compressedData = function (data, srcOffset, srcLength) {
+    if (data === null || data === undefined) return null;
+    return srcOffset || srcLength ? slicedView(data, srcOffset, srcLength) : data;
+  };
+  m1('compressedTexImage2D', function (target, level, fmt, w, h, border, data, srcOffset, srcLength) {
+    if (this.__lost) return;
+    if (!compressedOk(this, fmt)) { this.__err(0x500); return; }
+    var d = compressedData(data, srcOffset, srcLength);
+    if (!d) { this.__err(0x501); return; }
+    CALL(this, 'compressedTexImage', target, level, fmt, w, h, 1, border, d, false);
+  });
+  m1('compressedTexSubImage2D', function (target, level, xo, yo, w, h, fmt, data, srcOffset, srcLength) {
+    if (this.__lost) return;
+    if (!compressedOk(this, fmt)) { this.__err(0x500); return; }
+    var d = compressedData(data, srcOffset, srcLength);
+    if (!d) { this.__err(0x501); return; }
+    CALL(this, 'compressedTexSubImage', target, level, xo, yo, 0, w, h, 1, fmt, d, false);
+  });
   m2('texImage3D', function (target, level, internal, w, h, d, border, format, type, pixels, srcOffset) {
     if (this.__lost) return;
     if (pixels && pixels.buffer && srcOffset) pixels = viewAt(pixels, srcOffset);
@@ -349,8 +368,20 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
   m2('texStorage2D', function (t, levels, f, w, h) { CALL(this, 'texStorage', t, levels, f, w, h, 1); });
   m2('texStorage3D', function (t, levels, f, w, h, d) { CALL(this, 'texStorage', t, levels, f, w, h, d); });
   m2('copyTexSubImage3D', function (t, l, xo, yo, zo, x, y, w, h) { CALL(this, 'copyTexSubImage', t, l, xo, yo, zo, x, y, w, h); });
-  m2('compressedTexImage3D', function () { this.__err(0x500); });
-  m2('compressedTexSubImage3D', function () { this.__err(0x500); });
+  m2('compressedTexImage3D', function (target, level, fmt, w, h, d, border, data, srcOffset, srcLength) {
+    if (this.__lost) return;
+    if (!compressedOk(this, fmt)) { this.__err(0x500); return; }
+    var v = compressedData(data, srcOffset, srcLength);
+    if (!v) { this.__err(0x501); return; }
+    CALL(this, 'compressedTexImage', target, level, fmt, w, h, d, border, v, true);
+  });
+  m2('compressedTexSubImage3D', function (target, level, xo, yo, zo, w, h, d, fmt, data, srcOffset, srcLength) {
+    if (this.__lost) return;
+    if (!compressedOk(this, fmt)) { this.__err(0x500); return; }
+    var v = compressedData(data, srcOffset, srcLength);
+    if (!v) { this.__err(0x501); return; }
+    CALL(this, 'compressedTexSubImage', target, level, xo, yo, zo, w, h, d, fmt, v, true);
+  });
   // texImage2D / texSubImage2D of WebGL 2 accept the same forms; the context's prototype chain already provides them.
 
   // samplers
@@ -444,7 +475,11 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
       case C1.SHADING_LANGUAGE_VERSION: return es3 ? 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 TheoryCraftOS)' : 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 TheoryCraftOS)';
       case 0x9245: if (this.__ext.WEBGL_debug_renderer_info) return 'TheoryCraftOS'; break;
       case 0x9246: if (this.__ext.WEBGL_debug_renderer_info) return 'TheoryCraftOS Software Rasterizer'; break;
-      case C1.COMPRESSED_TEXTURE_FORMATS: return new Uint32Array(0);
+      case C1.COMPRESSED_TEXTURE_FORMATS: {
+        var list = [];
+        for (var cf in this.__compressed) list.push(+cf);
+        return new Uint32Array(list);
+      }
       case 0x84FF: if (this.__ext.EXT_texture_filter_anisotropic) return 16; break;
       case 0x8824: case 0x8CDF: if (!es3 && !this.__ext.WEBGL_draw_buffers) break; return call(this.__id, OP.getParameter, 0x8824);
       case 0x8825: break;
@@ -639,9 +674,11 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
   // ------------------------------------------------------------------------------------------------------------------------------------------ extensions
   var ext1 = ['ANGLE_instanced_arrays', 'EXT_blend_minmax', 'EXT_color_buffer_half_float', 'EXT_frag_depth', 'EXT_shader_texture_lod', 'EXT_texture_filter_anisotropic', 'OES_element_index_uint',
               'OES_standard_derivatives', 'OES_texture_float', 'OES_texture_float_linear', 'OES_texture_half_float', 'OES_texture_half_float_linear', 'OES_vertex_array_object',
-              'WEBGL_color_buffer_float', 'WEBGL_debug_renderer_info', 'WEBGL_depth_texture', 'WEBGL_draw_buffers', 'WEBGL_lose_context'];
-  var ext2 = ['EXT_color_buffer_float', 'EXT_color_buffer_half_float', 'EXT_texture_filter_anisotropic', 'OES_texture_float_linear', 'WEBGL_debug_renderer_info', 'WEBGL_lose_context'];
+              'WEBGL_color_buffer_float', 'WEBGL_compressed_texture_etc1', 'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb', 'EXT_texture_compression_rgtc', 'WEBGL_debug_renderer_info', 'WEBGL_depth_texture', 'WEBGL_draw_buffers', 'WEBGL_lose_context'];
+  var ext2 = ['EXT_color_buffer_float', 'EXT_color_buffer_half_float', 'EXT_texture_filter_anisotropic', 'OES_texture_float_linear', 'WEBGL_compressed_texture_etc1', 'WEBGL_compressed_texture_s3tc', 'WEBGL_compressed_texture_s3tc_srgb', 'EXT_texture_compression_rgtc', 'WEBGL_debug_renderer_info', 'WEBGL_lose_context'];
   m1('getSupportedExtensions', function () { return (this.__es3 ? ext2 : ext1).slice(); });
+  var COMPRESSED_BY_EXT = { WEBGL_compressed_texture_s3tc: [0x83F0, 0x83F1, 0x83F2, 0x83F3], WEBGL_compressed_texture_s3tc_srgb: [0x8C4C, 0x8C4D, 0x8C4E, 0x8C4F],
+                            EXT_texture_compression_rgtc: [0x8DBB, 0x8DBC, 0x8DBD, 0x8DBE], WEBGL_compressed_texture_etc1: [0x8D64] };
   var makeExt = function (ctx, name) {
     var e = {};
     var nm = function (n, v) { Object.defineProperty(e, n, { value: v, enumerable: true }); };
@@ -687,6 +724,16 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
           setTimeout(function () { ctx.__lost = false; call(ctx.__id, OP.restore); ctx.canvas.dispatchEvent(new Event('webglcontextrestored')); }, 0);
         });
         break;
+      case 'WEBGL_compressed_texture_s3tc':
+        nm('COMPRESSED_RGB_S3TC_DXT1_EXT', 0x83F0); nm('COMPRESSED_RGBA_S3TC_DXT1_EXT', 0x83F1); nm('COMPRESSED_RGBA_S3TC_DXT3_EXT', 0x83F2); nm('COMPRESSED_RGBA_S3TC_DXT5_EXT', 0x83F3);
+        break;
+      case 'WEBGL_compressed_texture_s3tc_srgb':
+        nm('COMPRESSED_SRGB_S3TC_DXT1_EXT', 0x8C4C); nm('COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT', 0x8C4D); nm('COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT', 0x8C4E); nm('COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT', 0x8C4F);
+        break;
+      case 'EXT_texture_compression_rgtc':
+        nm('COMPRESSED_RED_RGTC1_EXT', 0x8DBB); nm('COMPRESSED_SIGNED_RED_RGTC1_EXT', 0x8DBC); nm('COMPRESSED_RED_GREEN_RGTC2_EXT', 0x8DBD); nm('COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT', 0x8DBE);
+        break;
+      case 'WEBGL_compressed_texture_etc1': nm('COMPRESSED_RGB_ETC1_WEBGL', 0x8D64); break;
       case 'EXT_color_buffer_float': break;
     }
     tag();
@@ -699,7 +746,11 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
     for (var i = 0; i < supported.length; i++) {
       if (supported[i].toLowerCase() === lc) {
         var key = supported[i];
-        if (!this.__ext[key]) this.__ext[key] = makeExt(this, key);
+        if (!this.__ext[key]) {
+          this.__ext[key] = makeExt(this, key);
+          var formats = COMPRESSED_BY_EXT[key];
+          if (formats) for (var fi = 0; fi < formats.length; fi++) this.__compressed[formats[fi]] = true;
+        }
         return this.__ext[key];
       }
     }

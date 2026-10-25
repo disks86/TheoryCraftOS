@@ -53,6 +53,7 @@ uint32_t texel_bytes(Store s);
 struct Image {
   explicit Image(allocators::IAllocator& a) : px(a) {}
   uint32_t w = 0, h = 0, d = 1;   // (for a multisampled image these are the stored samples: ss x ss of them per pixel)
+  uint32_t compressed = 0;        // the compressed format it was uploaded in (it is stored decoded), or 0
   uint32_t ss = 1;                // 2 for a 4-sample image, which is kept as a 2x supersampled image and averaged when resolved
   const FormatInfo* info = nullptr;
   ByteBuffer px;
@@ -321,6 +322,9 @@ class GlContext final : public shader::ITextureHost {
                  bool has_data, bool three_d);
   void tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, uint32_t w, uint32_t h, uint32_t d, uint32_t format, uint32_t type, ConstByteView data,
                      bool three_d);
+  // `data` holds the blocks (see GlCompressed.hpp). The size and offsets must be whole blocks unless they reach the edge of the level.
+  void compressed_tex_image(uint32_t target, int32_t level, uint32_t internal, uint32_t w, uint32_t h, uint32_t d, int32_t border, ConstByteView data, bool three_d);
+  void compressed_tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, uint32_t w, uint32_t h, uint32_t d, uint32_t format, ConstByteView data, bool three_d);
   void tex_storage(uint32_t target, uint32_t levels, uint32_t internal, uint32_t w, uint32_t h, uint32_t d);
   void copy_tex_image_2d(uint32_t target, int32_t level, uint32_t internal, int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t border);
   void copy_tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, int32_t x, int32_t y, uint32_t w, uint32_t h);

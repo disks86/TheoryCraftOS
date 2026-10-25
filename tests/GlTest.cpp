@@ -436,7 +436,67 @@ static void test_wide_lines() {
   CHECK(a.live == 0);
 }
 
+static void test_compressed() {
+  TestAllocator a;
+  {
+    GlContext gl(a, true, 8, 8, noaa());
+    const uint32_t tex = gl.create_texture(), fbo = gl.create_framebuffer();
+    gl.bind_texture(0x0DE1, tex);
+    gl.bind_framebuffer(0x8D40, fbo);
+    gl.framebuffer_texture(0x8D40, 0x8CE0, 0x0DE1, tex, 0, 0);
+    auto texel = [&](int x, int y, uint8_t out[4]) { gl.read_pixels(x, y, 1, 1, 0x1908, 0x1401, ByteView(out, 4)); };
+    uint8_t px[4];
+    // BC1: red and blue end points, one of each index in the first row
+    const uint8_t bc1[8] = {0x00, 0xF8, 0x1F, 0x00, 0xE4, 0x00, 0x00, 0x00};
+    gl.compressed_tex_image(0x0DE1, 0, 0x83F0, 4, 4, 1, 0, ConstByteView(bc1, 8), false);
+    CHECK(gl.get_error() == 0);
+    texel(0, 0, px); CHECK(px[0] == 255 && px[1] == 0 && px[2] == 0 && px[3] == 255);
+    texel(1, 0, px); CHECK(px[0] == 0 && px[2] == 255);
+    texel(2, 0, px); CHECK(px[0] == 170 && px[2] == 85);
+    texel(3, 0, px); CHECK(px[0] == 85 && px[2] == 170);
+    // BC4: 200 and 100 end points; index 2 is (6 * 200 + 100) / 7
+    const uint8_t bc4[8] = {200, 100, 0x88, 0, 0, 0, 0, 0};
+    gl.compressed_tex_image(0x0DE1, 0, 0x8DBB, 4, 4, 1, 0, ConstByteView(bc4, 8), false);
+    texel(0, 0, px); CHECK(px[0] == 200);
+    texel(1, 0, px); CHECK(px[0] == 100);
+    texel(2, 0, px); CHECK(px[0] == 185);
+    // BC3: colour from a BC1 block, alpha from a BC4 block (255 and 0, all index 0 -> 255; pixel 1 index 1 -> 0)
+    const uint8_t bc3[16] = {255, 0, 0x08, 0, 0, 0, 0, 0, 0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0};
+    gl.compressed_tex_image(0x0DE1, 0, 0x83F3, 4, 4, 1, 0, ConstByteView(bc3, 16), false);
+    texel(0, 0, px); CHECK(px[0] == 255 && px[3] == 255);
+    texel(1, 0, px); CHECK(px[3] == 0);
+    // ETC1, individual mode: left half 136 + 2, right half 0 + 2; then with the flip bit: top and bottom
+    uint8_t etc[8] = {0x80, 0x80, 0x80, 0x00, 0, 0, 0, 0};
+    gl.compressed_tex_image(0x0DE1, 0, 0x8D64, 4, 4, 1, 0, ConstByteView(etc, 8), false);
+    texel(0, 3, px); CHECK(px[0] == 138);
+    texel(3, 3, px); CHECK(px[0] == 2);
+    etc[3] = 0x01;
+    gl.compressed_tex_image(0x0DE1, 0, 0x8D64, 4, 4, 1, 0, ConstByteView(etc, 8), false);
+    texel(3, 0, px); CHECK(px[0] == 138);
+    texel(3, 3, px); CHECK(px[0] == 2);
+    // sizes and mixing with uncompressed calls
+    gl.compressed_tex_image(0x0DE1, 0, 0x83F0, 4, 4, 1, 0, ConstByteView(bc1, 4), false);
+    CHECK(gl.get_error() == 0x501);
+    gl.compressed_tex_image(0x0DE1, 0, 0x83F0, 4, 4, 1, 0, ConstByteView(bc1, 8), false);
+    const uint8_t rgba[4] = {1, 2, 3, 4};
+    gl.tex_sub_image(0x0DE1, 0, 0, 0, 0, 1, 1, 1, 0x1908, 0x1401, ConstByteView(rgba, 4), false);
+    CHECK(gl.get_error() == 0x502);
+    gl.compressed_tex_sub_image(0x0DE1, 0, 1, 0, 0, 4, 4, 1, 0x83F0, ConstByteView(bc1, 8), false);
+    CHECK(gl.get_error() == 0x501);   // not on a block boundary
+    gl.compressed_tex_image(0x0DE1, 0, 0x9999, 4, 4, 1, 0, ConstByteView(bc1, 8), false);
+    CHECK(gl.get_error() == 0x500);
+    // 6x6 in 2x2 blocks: the part past the edge is dropped
+    uint8_t blocks[32];
+    for (int i = 0; i < 4; ++i) memcpy(blocks + i * 8, bc1, 8);
+    gl.compressed_tex_image(0x0DE1, 0, 0x83F0, 6, 6, 1, 0, ConstByteView(blocks, 32), false);
+    CHECK(gl.get_error() == 0);
+    texel(5, 5, px); CHECK(px[0] == 255);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_compressed();
   test_wide_lines();
   test_cube_seams();
   test_default_antialias();
