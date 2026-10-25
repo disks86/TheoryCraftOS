@@ -160,6 +160,7 @@ class BefsFileSystem::File final : public IFile {
       if (end > old_size) inode.size = end;
       s = fs_.store_inode(inode);
     }
+    if (s == Status::Ok) s = fs_.touch(&inode);
     if (s == Status::Ok) s = fs_.tx_commit();
     if (s != Status::Ok) {
       fs_.tx_rollback();
@@ -191,6 +192,7 @@ class BefsFileSystem::File final : public IFile {
       if (s == Status::Ok) s = fs_.shrink_stream(&inode, blocks);
     }
     if (s == Status::Ok) s = fs_.store_inode(inode);
+    if (s == Status::Ok) s = fs_.touch(&inode);
     if (s == Status::Ok) s = fs_.tx_commit();
     if (s != Status::Ok) fs_.tx_rollback();
     return s;
@@ -676,6 +678,8 @@ Status BefsFileSystem::read_inode(uint64_t block, Inode* inode) {
   result.mode = in.le32();
   result.flags = in.le32();
   if (!in.ok() || !(result.flags & kInodeInUse)) return Status::Corrupt;
+  result.created_time = in.le64();
+  result.modified_time = in.le64();
   in.seek(44);
   uint32_t parent_group = 0;
   uint16_t parent_start = 0, parent_length = 0;
@@ -973,6 +977,8 @@ void BefsFileSystem::fill_entry(const Inode& inode, StringView name, DirectoryEn
   entry->type = inode.is_directory() ? NodeType::Directory : NodeType::File;
   entry->size = inode.is_directory() ? 0 : inode.inline_link ? inode.link_size : inode.is_file() ? inode.size : 0;
   entry->read_only = (inode.mode & 0222) == 0;
+  entry->modified = inode.modified_time >> 16;
+  entry->created = inode.created_time >> 16;
 }
 
 Status BefsFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<IFile>* file) {
@@ -1472,6 +1478,24 @@ Status BefsFileSystem::store_inode(const Inode& inode) {
   out.le64(inode.size);
   if (!out.ok() || out.position() != sizeof raw) return Status::Corrupt;
   return tx_write((inode.block << block_shift_) + 72, ConstByteView(raw));
+}
+
+uint64_t BefsFileSystem::time_now() { return unix_time_now() << 16; }
+
+Status BefsFileSystem::store_times(const Inode& inode) {
+  uint8_t raw[16];
+  ByteWriter out{ByteView(raw)};
+  out.le64(inode.created_time);
+  out.le64(inode.modified_time);
+  if (!out.ok()) return Status::Corrupt;
+  return tx_write((inode.block << block_shift_) + 28, ConstByteView(raw));
+}
+
+Status BefsFileSystem::touch(Inode* inode) {
+  const uint64_t now = time_now();
+  if (now == 0) return Status::Ok;
+  inode->modified_time = now;
+  return store_times(*inode);
 }
 
 Status BefsFileSystem::read_entry(const Run& array, uint32_t index, Run* out) {
@@ -2195,7 +2219,9 @@ Status BefsFileSystem::create_body(Inode* parent, StringView leaf, bool director
   w.le32(0);
   w.le32(fresh.mode);
   w.le32(fresh.flags);
-  w.zeros(16);  // time stamps
+  fresh.created_time = fresh.modified_time = time_now();
+  w.le64(fresh.created_time);
+  w.le64(fresh.modified_time);
   w.le32(parent_run.group);
   w.le16(parent_run.start);
   w.le16(parent_run.length);
@@ -2209,6 +2235,7 @@ Status BefsFileSystem::create_body(Inode* parent, StringView leaf, bool director
   if (s == Status::Ok) s = store_inode(fresh);
   if (s == Status::Ok) s = tree_insert(parent, leaf, block);
   if (s == Status::Ok) s = store_inode(*parent);
+  if (s == Status::Ok) s = touch(parent);
   if (s != Status::Ok) return s;
   *inode_block = block;
   return Status::Ok;
@@ -2237,6 +2264,7 @@ Status BefsFileSystem::create_node(StringView path, bool directory, uint64_t* in
 Status BefsFileSystem::remove_body(Inode* parent, StringView leaf, uint64_t inode_block) {
   Status s = tree_remove(parent, leaf);
   if (s == Status::Ok) s = store_inode(*parent);
+  if (s == Status::Ok) s = touch(parent);
   if (s == Status::Ok) s = set_bits(inode_block, 1, false);
   if (s == Status::Ok) {  // (leave no inode behind that would still pass for a live one)
     uint8_t raw[4];
@@ -2308,7 +2336,9 @@ Status BefsFileSystem::rename_body(Inode* from_parent, StringView from_leaf, Ino
   Status s = tree_insert(to_parent, to_leaf, node.block);
   if (s == Status::Ok) s = tree_remove(from_parent, from_leaf);
   if (s == Status::Ok) s = store_inode(*to_parent);
+  if (s == Status::Ok) s = touch(to_parent);
   if (s == Status::Ok && from_parent != to_parent) s = store_inode(*from_parent);
+  if (s == Status::Ok && from_parent != to_parent) s = touch(from_parent);
   if (s == Status::Ok && node.is_directory() && from_parent != to_parent) {  // its parent link
     Run run;
     if (!block_to_run(to_parent->block, &run)) return Status::Corrupt;

@@ -18,6 +18,7 @@
 
 #pragma once
 #include <stdint.h>
+#include "FileSystem/FileSystemTypes.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace filesystem {
@@ -42,7 +43,15 @@ constexpr uint16_t kStreamCompressed = 0x0001, kStreamEncrypted = 0x4000, kStrea
 constexpr uint16_t kEntryChild = 0x0001, kEntryLast = 0x0002;
 constexpr uint32_t kVolumeDirty = 0x0001;
 constexpr uint64_t kTimeStamp = 119600064000000000ull;  // 1980-01-01 in 100 ns steps since 1601: new entries have no real time
+constexpr uint64_t kFileTimeOfUnixEpoch = 116444736000000000ull;  // 1970-01-01 in 100 ns steps since 1601
 constexpr uint32_t kFixupUnit = 512;                    // multi sector protection always works on 512 byte pieces
+
+// Time stamps are FILETIMEs (UTC). "Now" is the system wall clock, or the fixed 1980 time while there is none (0: no clock).
+inline uint64_t filetime_now() {
+  const uint64_t unix_seconds = unix_time_now();
+  return unix_seconds ? kFileTimeOfUnixEpoch + unix_seconds * 10000000ull : 0;
+}
+inline uint64_t unix_from_filetime(uint64_t filetime) { return filetime > kFileTimeOfUnixEpoch ? (filetime - kFileTimeOfUnixEpoch) / 10000000ull : 0; }
 
 inline uint16_t le16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
 inline uint32_t le32(const uint8_t* p) { return uint32_t{p[0]} | (uint32_t{p[1]} << 8) | (uint32_t{p[2]} << 16) | (uint32_t{p[3]} << 24); }

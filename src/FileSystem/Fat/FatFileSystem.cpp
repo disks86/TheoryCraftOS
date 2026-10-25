@@ -30,6 +30,58 @@ constexpr uint8_t kAttrReadOnly = 0x01, kAttrVolumeLabel = 0x08, kAttrDirectory 
 uint16_t le16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
 uint32_t le32(const uint8_t* p) { return uint32_t{p[0]} | (uint32_t{p[1]} << 8) | (uint32_t{p[2]} << 16) | (uint32_t{p[3]} << 24); }
 
+// Time stamps of a directory entry: FAT keeps the local time, no zone, in 2 second steps (a created time to 10 ms), from 1980 to 2107.
+// Entry bytes: 13 created (tenths of a second, 0..199), 14 created time, 16 created date, 18 accessed date, 22 written time, 24 written date.
+struct FatStamp {
+  uint16_t date = 0x0021, time = 0;  // 1980-01-01 00:00:00 while there is no clock
+  uint8_t tenths = 0;
+  bool known = false;
+};
+
+FatStamp fat_stamp_now() {
+  FatStamp stamp;
+  const uint64_t utc = unix_time_now();
+  if (utc == 0) return stamp;
+  const int64_t local = static_cast<int64_t>(utc) + local_offset_seconds();
+  if (local < 315532800) return stamp;  // before 1980
+  CivilTime t = civil_from_unix(static_cast<uint64_t>(local));
+  if (t.year > 2107) {
+    t.year = 2107, t.month = 12, t.day = 31, t.hour = 23, t.minute = 59, t.second = 58;
+  }
+  stamp.date = static_cast<uint16_t>(((t.year - 1980) << 9) | (t.month << 5) | t.day);
+  stamp.time = static_cast<uint16_t>((t.hour << 11) | (t.minute << 5) | (t.second / 2));
+  stamp.tenths = static_cast<uint8_t>((t.second & 1) * 100);
+  stamp.known = true;
+  return stamp;
+}
+
+void put16(uint8_t* p, uint16_t v) {
+  p[0] = static_cast<uint8_t>(v);
+  p[1] = static_cast<uint8_t>(v >> 8);
+}
+
+// Stamps a new entry: created, accessed and written all now.
+void stamp_new_entry(uint8_t* raw) {
+  const FatStamp stamp = fat_stamp_now();
+  raw[13] = stamp.tenths;
+  put16(raw + 14, stamp.time);
+  put16(raw + 16, stamp.date);
+  put16(raw + 18, stamp.date);
+  put16(raw + 22, stamp.time);
+  put16(raw + 24, stamp.date);
+}
+
+// A stored date and time as seconds since 1970 UTC; 0 for none (a zero date, or one that is no date).
+uint64_t fat_to_unix(uint16_t date, uint16_t time, uint8_t tenths) {
+  const int64_t year = 1980 + (date >> 9), month = (date >> 5) & 15, day = date & 31;
+  if (date == 0 || month < 1 || month > 12 || day < 1) return 0;
+  const int64_t hour = time >> 11, minute = (time >> 5) & 63, second = (time & 31) * 2 + (tenths >= 100 ? 1 : 0);
+  if (hour > 23 || minute > 59 || second > 59) return 0;
+  const int64_t local = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+  const int64_t utc = local - local_offset_seconds();
+  return utc > 0 ? static_cast<uint64_t>(utc) : 0;
+}
+
 uint8_t short_name_checksum(const uint8_t* name11) {
   uint8_t sum = 0;
   for (int i = 0; i < 11; ++i) sum = static_cast<uint8_t>(((sum & 1) << 7) + (sum >> 1) + name11[i]);
@@ -500,6 +552,8 @@ Status FatFileSystem::next_node(Position* position, Node* node) {
     node->entry.type = (attributes & kAttrDirectory) ? NodeType::Directory : NodeType::File;
     node->entry.size = node->entry.type == NodeType::File ? le32(raw + 28) : 0;
     node->entry.read_only = (attributes & kAttrReadOnly) != 0;
+    node->entry.modified = fat_to_unix(le16(raw + 24), le16(raw + 22), 0);
+    node->entry.created = fat_to_unix(le16(raw + 16), le16(raw + 14), raw[13]);
     node->cluster = le16(raw + 26);
     if (kind_ == Kind::Fat32) node->cluster |= uint32_t{le16(raw + 20)} << 16;
     // A directory must have clusters; a file with data must too.
@@ -655,7 +709,6 @@ bool strictly_inside(StringView outer, StringView inner) {
 
 constexpr uint8_t kDot11[11] = {'.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
 constexpr uint8_t kDotDot11[11] = {'.', '.', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
-constexpr uint16_t kStampDate = 0x0021;  // 1980-01-01: new entries have no real time
 }  // namespace
 
 Status FatFileSystem::flush() {
@@ -882,7 +935,25 @@ Status FatFileSystem::update_entry(uint64_t short_offset, uint32_t first, uint32
     raw[21] = static_cast<uint8_t>(first >> 24);
   }
   for (int i = 0; i < 4; ++i) raw[28 + i] = static_cast<uint8_t>(size >> (8 * i));
+  const FatStamp stamp = fat_stamp_now();
+  if (stamp.known) {  // the file was written
+    put16(raw + 18, stamp.date);
+    put16(raw + 22, stamp.time);
+    put16(raw + 24, stamp.date);
+  }
   return write_bytes(short_offset, ConstByteView(raw, 32));
+}
+
+Status FatFileSystem::touch_directory(const Node& directory) {
+  const FatStamp stamp = fat_stamp_now();
+  if (!stamp.known || directory.short_offset == 0 || directory.entry.type != NodeType::Directory) return Status::Ok;
+  uint8_t raw[32];
+  Status s = read_bytes(directory.short_offset, ByteView(raw, 32));
+  if (s != Status::Ok) return s;
+  put16(raw + 18, stamp.date);
+  put16(raw + 22, stamp.time);
+  put16(raw + 24, stamp.date);
+  return write_bytes(directory.short_offset, ConstByteView(raw, 32));
 }
 
 // Finds `needed` free slots in a row in a directory (growing it if need be) and returns their byte offsets.
@@ -1050,11 +1121,7 @@ Status FatFileSystem::make_entry(const Node& parent, StringView name, uint8_t at
   __builtin_memcpy(raw, name11, 11);
   raw[11] = attributes;
   raw[12] = flags;
-  for (int i = 0; i < 2; ++i) {
-    raw[16 + i] = static_cast<uint8_t>(kStampDate >> (8 * i));  // created
-    raw[18 + i] = static_cast<uint8_t>(kStampDate >> (8 * i));  // accessed
-    raw[24 + i] = static_cast<uint8_t>(kStampDate >> (8 * i));  // written
-  }
+  stamp_new_entry(raw);
   raw[26] = static_cast<uint8_t>(cluster);
   raw[27] = static_cast<uint8_t>(cluster >> 8);
   if (kind_ == Kind::Fat32) {
@@ -1072,7 +1139,7 @@ Status FatFileSystem::make_entry(const Node& parent, StringView name, uint8_t at
     created->entry.type = (attributes & kAttrDirectory) ? NodeType::Directory : NodeType::File;
     created->entry.size = size;
   }
-  return Status::Ok;
+  return touch_directory(parent);
 }
 
 Status FatFileSystem::delete_slots(const Node& node) {
@@ -1126,11 +1193,7 @@ Status FatFileSystem::create_directory(StringView path) {
     uint8_t raw[32] = {};
     __builtin_memcpy(raw, which == 0 ? kDot11 : kDotDot11, 11);
     raw[11] = kAttrDirectory;
-    for (int i = 0; i < 2; ++i) {
-      raw[16 + i] = static_cast<uint8_t>(kStampDate >> (8 * i));
-      raw[18 + i] = static_cast<uint8_t>(kStampDate >> (8 * i));
-      raw[24 + i] = static_cast<uint8_t>(kStampDate >> (8 * i));
-    }
+    stamp_new_entry(raw);
     raw[26] = static_cast<uint8_t>(target);
     raw[27] = static_cast<uint8_t>(target >> 8);
     if (kind_ == Kind::Fat32) {
@@ -1161,7 +1224,13 @@ Status FatFileSystem::remove(StringView path) {
     if (s == Status::Ok) return Status::NotEmpty;
     if (s != Status::EndOfDirectory) return s;
   }
+  Node parent;
+  StringView leaf;
+  s = split(path, &parent, &leaf);
+  if (s != Status::Ok) return s;
   s = delete_slots(node);  // the entry first: a crash then leaks clusters instead of leaving an entry that points at free ones
+  if (s != Status::Ok) return s;
+  s = touch_directory(parent);
   if (s != Status::Ok) return s;
   return node.cluster >= 2 ? free_chain(node.cluster) : Status::Ok;
 }
@@ -1200,7 +1269,13 @@ Status FatFileSystem::rename(StringView from, StringView to) {
   __builtin_memcpy(new_raw + 22, old_raw + 22, 4);
   s = write_bytes(created.short_offset, ConstByteView(new_raw, 32));
   if (s != Status::Ok) return s;
+  Node source_parent;
+  StringView source_leaf;
+  s = split(from, &source_parent, &source_leaf);
+  if (s != Status::Ok) return s;
   s = delete_slots(source);
+  if (s != Status::Ok) return s;
+  s = touch_directory(source_parent);
   if (s != Status::Ok) return s;
   if (source.entry.type == NodeType::Directory && source.cluster >= 2) {  // ".." follows the directory to its new parent
     const bool root_parent = target_parent.cluster == 0 || (kind_ == Kind::Fat32 && target_parent.cluster == root_cluster_);

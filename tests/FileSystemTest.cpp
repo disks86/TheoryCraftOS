@@ -39,6 +39,8 @@ static int g_failed = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAILED line %d: %s\n", __LINE__, #cond); ++g_failed; } } while (0)
 #define CHECK_STATUS(expr, want) do { Status got_ = (expr); if (got_ != (want)) { printf("FAILED line %d: %s -> %s, want %s\n", __LINE__, #expr, status_name(got_), status_name(want)); ++g_failed; } } while (0)
 
+#include "FileTimes.hpp"
+
 static ConstByteView bytes_of(const char* s) { return ConstByteView(reinterpret_cast<const uint8_t*>(s), strlen(s)); }
 
 // Everything in a directory, as "name" or "name/" strings joined by ','.
@@ -712,7 +714,45 @@ static void test_fat_write(FatImage::Kind kind, uint32_t block, const char* labe
   CHECK(a.live == 0);
 }
 
+// Time stamps on a RAM filesystem and on FAT (12, 16, 32), also with a local time that differs from UTC.
+static void test_times() {
+  {
+    TestAllocator a;
+    RamFileSystem fs(a);
+    filetimes::check_stamps(fs, "ram");
+  }
+  const FatImage::Kind kinds[3] = {FatImage::F12, FatImage::F16, FatImage::F32};
+  for (const FatImage::Kind kind : kinds) {
+    for (int zone = 0; zone < 2; ++zone) {
+      TestAllocator a;
+      FatImage im(kind);
+      MemDisk disk(im.img, im.total * 512ull, 512, true);
+      UniquePointer<IFileSystem> fsp;
+      CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &fsp), Status::Ok);
+      if (!fsp) continue;
+      set_local_offset_seconds(zone ? 5 * 3600 + 1800 : 0);   // (local time five and a half hours ahead of UTC)
+      filetimes::check_stamps(*fsp, zone ? "fat zone" : "fat");
+      if (zone) {  // the entry of /e/h holds the local time of its last change: 2023-11-15 04:50:00 (UTC 23:20:00 plus 5:30)
+        UniquePointer<IFile> f;
+        CHECK_STATUS(fsp->flush(), Status::Ok);
+        const uint8_t name[11] = {'H', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
+        bool found = false;
+        for (uint64_t at = 0; at + 32 <= im.total * 512ull && !found; at += 32) {
+          if (memcmp(disk.data + at, name, 11) != 0) continue;
+          found = true;
+          const uint32_t time = disk.data[at + 22] | (disk.data[at + 23] << 8), date = disk.data[at + 24] | (disk.data[at + 25] << 8);
+          CHECK(date == (((2023 - 1980) << 9) | (11 << 5) | 15));
+          CHECK((time >> 11) == 4 && ((time >> 5) & 63) == 50 && (time & 31) == 0);
+        }
+        (void)found;
+      }
+      set_local_offset_seconds(0);
+    }
+  }
+}
+
 int main() {
+  test_times();
   test_paths();
   test_ram();
   test_fat(FatImage::F12, 512, "FAT12");

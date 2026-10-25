@@ -40,8 +40,9 @@ namespace filesystem {
 // (file data is not journaled, as in Be's file system: a write that is cut short can leave partly new data). Removing a file first cuts
 // it to nothing in steps, so a failure then leaves a shorter file, never lost blocks. A volume is mounted writable only if its device
 // is, its log is usable (and was replayed if needed), its inodes are one block each and its bitmap is laid out as expected; any other
-// volume is read only (every write returns ReadOnly). What is not kept up to date: time stamps (no clock here), attributes and the
-// indices (name, size, last modified), so queries in Haiku will not find new files until it reindexes.
+// volume is read only (every write returns ReadOnly). What is not kept up to date: attributes and the
+// indices (name, size, last modified), so queries in Haiku will not find new files until it reindexes. Creation and modification times come from
+// the system wall clock (set_unix_clock); the folders concerned are stamped too.
 //
 // The volume starts at block `first_block` of the device and mounting reads and validates its super block (at byte 512 of the volume).
 // The device must outlive the filesystem.
@@ -87,6 +88,7 @@ class BefsFileSystem final : public IFileSystem {
     Run indirect, double_indirect;
     uint64_t max_direct = 0, max_indirect = 0, max_double = 0;  // bytes mapped, each counted from the start of the file
     uint64_t parent = 0;                                        // block of the directory that holds it (0 if unknown)
+    uint64_t created_time = 0, modified_time = 0;               // seconds since 1970 UTC shifted left 16 bits (the low bits are a counter); 0: none
     uint8_t link[144] = {};  // a short symbolic link's target, stored in the inode itself
     uint32_t link_size = 0;
     bool inline_link = false;
@@ -185,6 +187,9 @@ class BefsFileSystem final : public IFileSystem {
 
   // Writing streams.
   Status store_inode(const Inode& inode);
+  Status store_times(const Inode& inode);  // the creation and modification times
+  Status touch(Inode* inode);              // the modification time becomes now (nothing without a clock)
+  static uint64_t time_now();              // the system wall clock as an inode time, 0 without one
   Status read_entry(const Run& array, uint32_t index, Run* out);
   Status write_entry(const Run& array, uint32_t index, const Run& run);
   Status count_entries(const Run& array, uint32_t* count);

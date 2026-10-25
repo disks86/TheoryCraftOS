@@ -35,11 +35,12 @@ inline bool format_size(uint64_t bytes, String* out) {
   return out->append_uint(tenths / 10) && out->push_back('.') && out->append_uint(tenths % 10) && out->append(unit);
 }
 
-// "2026-10-25 14:03" (UTC) for a time in seconds since 1970; empty for 0 (unknown). Replaces the contents of `out`; false if memory ran out.
+// "2026-10-25 14:03" (local time, like the taskbar clock) for a time in seconds since 1970 UTC; empty for 0 (unknown). Replaces the contents of `out`; false if memory ran out.
 inline bool format_unix_time(uint64_t seconds, String* out) {
   out->clear();
   if (seconds == 0) return true;
-  const filesystem::CivilTime t = filesystem::civil_from_unix(seconds);
+  const int64_t local = static_cast<int64_t>(seconds) + filesystem::local_offset_seconds();
+  const filesystem::CivilTime t = filesystem::civil_from_unix(local > 0 ? static_cast<uint64_t>(local) : 0);
   auto two = [&](uint32_t v) { return (v < 10 ? out->push_back('0') : true) && out->append_uint(v); };
   return out->append_uint(static_cast<uint32_t>(t.year)) && out->push_back('-') && two(t.month) && out->push_back('-') && two(t.day) &&
          out->push_back(' ') && two(t.hour) && out->push_back(':') && two(t.minute);
