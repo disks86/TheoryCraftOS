@@ -17,6 +17,9 @@
  */
 
 #include "Browser/Page.hpp"
+#include "Browser/CacheStore.hpp"
+#include "Browser/ServiceWorker.hpp"
+#include "Browser/ServiceWorkerPrelude.hpp"
 #include "Layout/BoxBuilder.hpp"
 #include "Layout/FontMeasurer.hpp"
 #include "Layout/Layout.hpp"
@@ -72,6 +75,8 @@ class Page::FrameEnv final : public IPageEnvironment {
   }
   uint64_t now_ms() override { return owner_.env_.now_ms(); }
   void console(int level, StringView text) override { owner_.env_.console(level, text); }
+  ServiceWorkerHub* service_workers() override { return owner_.env_.service_workers(); }
+  CacheStore* cache_store() override { return &owner_.cache_store(); }
   StorageHub& local_storage_hub() override { return owner_.env_.local_storage_hub(); }
   StorageHub& session_storage_hub() override { return owner_.env_.session_storage_hub(); }
   PageHub& page_hub() override { return owner_.env_.page_hub(); }
@@ -127,9 +132,15 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
   style_cache_media_ = media;
   hub_id_ = env_.page_hub().add_page();
   hub_seen_ = env_.page_hub().serial();
+  if (ServiceWorkerHub* hub = env_.service_workers()) {
+    sw_client_ = hub->client_add(address);
+    if (sw_client_ != 0) next_port_ = ServiceWorkerHub::base_port(false, sw_client_);
+  }
 }
 
 Page::~Page() {
+  if (sw_client_ != 0)
+    if (ServiceWorkerHub* hub = env_.service_workers()) hub->client_remove(sw_client_);
   bindings_.reset();
   engine_.reset();
 }
@@ -157,6 +168,12 @@ bool Page::start_engine() {
         prelude_error.insert(0, "The WebAssembly script failed: ");
         env_.console(3, prelude_error.view());
       }
+      prelude_error.clear();
+      if (!engine_->run_library(cache_prelude(), &prelude_error) || !engine_->run_library(service_worker_client_prelude(), &prelude_error) ||
+          (sw_worker_ != 0 && !engine_->run_library(service_worker_scope_prelude(), &prelude_error))) {
+        prelude_error.insert(0, "The service worker script failed: ");
+        env_.console(3, prelude_error.view());
+      }
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
       bindings_->set_hidden(hidden_);
       return true;
@@ -179,10 +196,134 @@ void Page::note_error(StringView text) {
 
 bool Page::resolve(StringView reference, String* out) { return resolve_reference(allocator_, address_.view(), reference, out); }
 
+// What the pictures and videos of the page fetch through: the page's environment, with the service worker in charge of the page asked first.
+class PageObjectEnv final : public IObjectEnvironment {
+ public:
+  explicit PageObjectEnv(Page& page) : page_(page) {}
+  bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override { return page_.sw_fetch_bytes(address, "image", limit, out); }
+  UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override { return page_.environment().open_video(util::move(data)); }
+  UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override { return page_.environment().open_audio(util::move(data)); }
+
+ private:
+  Page& page_;
+};
+
+IObjectEnvironment& Page::object_environment() {
+  if (!object_env_) object_env_ = UniquePointer<PageObjectEnv>::make(allocator_, *this);
+  return object_env_ ? static_cast<IObjectEnvironment&>(*object_env_) : static_cast<IObjectEnvironment&>(env_);
+}
+
+// --- Service workers and the Cache API ---------------------------------------------------------------------------------------
+
+void Page::set_service_worker(ServiceWorkerHub* hub, uint32_t worker) {
+  sw_hub_ = hub;
+  sw_worker_ = worker;
+  next_port_ = ServiceWorkerHub::base_port(true, worker);
+}
+
+CacheStore& Page::cache_store() {
+  if (CacheStore* shared = env_.cache_store()) return *shared;
+  if (!own_caches_) own_caches_ = UniquePointer<CacheStore>::make(allocator_, allocator_);
+  return *own_caches_;
+}
+
+// The answer for a request of this document, from the service worker in charge of it if there is one; Pass when nobody answered.
+bool Page::http_request(const FetchOptions& options, NetResponse* response) {
+  if (sw_client_ != 0) {
+    if (ServiceWorkerHub* hub = env_.service_workers()) {
+      switch (hub->intercept(sw_client_, options, StringView(), false, response)) {
+        case ServiceWorkerHub::Intercept::Responded: return true;
+        case ServiceWorkerHub::Intercept::Failed: return false;
+        case ServiceWorkerHub::Intercept::Pass: break;
+      }
+    }
+  }
+  return env_.http_request(options, response);
+}
+
+bool Page::sw_fetch_bytes(StringView address, StringView destination, uint64_t limit, ByteBuffer* out) {
+  if (sw_client_ != 0 && (address.starts_with("http://") || address.starts_with("https://"))) {
+    if (ServiceWorkerHub* hub = env_.service_workers()) {
+      FetchOptions options;
+      options.url = address;
+      options.mode = FetchOptions::Mode::NoCors;
+      options.page_address = address_.view();
+      options.now_ms = env_.now_ms();
+      NetResponse response(allocator_);
+      switch (hub->intercept(sw_client_, options, destination, false, &response)) {
+        case ServiceWorkerHub::Intercept::Responded:
+          return response.status < 400 && response.body.size() <= limit && out->append(response.body.view());
+        case ServiceWorkerHub::Intercept::Failed: return false;
+        case ServiceWorkerHub::Intercept::Pass: break;
+      }
+    }
+  }
+  return env_.fetch_bytes(address, limit, out);
+}
+
+bool Page::fetch_text_via_sw(StringView address, const char* destination, uint64_t limit, String* text) {
+  if (sw_client_ != 0) {
+    ByteBuffer bytes(allocator_);
+    if (env_.service_workers() && env_.service_workers()->client_controller(sw_client_, nullptr) != 0)
+      return sw_fetch_bytes(address, destination, limit, &bytes) && text->assign(StringView(bytes.view()));
+  }
+  return env_.fetch_text(address, limit, text);
+}
+
+// What the service worker hub has to say to this document, as events of navigator.serviceWorker.
+void Page::deliver_sw_events() {
+  ServiceWorkerHub* hub = env_.service_workers();
+  if (!hub || sw_client_ == 0) return;
+  String json(allocator_);
+  while (hub->client_take_event(sw_client_, &json)) {
+    if (!bindings_) continue;
+    using Arg = DomBindings::HookArg;
+    const Arg args[1] = {Arg::of(json.view())};
+    bindings_->call_hook("__sw_event", args, 1);
+    json.clear();
+  }
+  flush_errors();
+}
+
+bool Page::run_worker_script(StringView source, String* error) {
+  if (!start_engine()) {
+    error->assign("The script engine could not be started.");
+    return false;
+  }
+  String result(allocator_);
+  const bool ok = engine_->run(source, error, &result);
+  flush_errors();
+  return ok;
+}
+
+bool Page::call_global(StringView name, const DomBindings::HookArg* args, uint32_t count, String* result) {
+  if (!start_engine()) return false;
+  const bool ok = bindings_->call_hook(name, args, count, result);
+  flush_errors();
+  return ok;
+}
+
+bool Page::run_timers_ahead(uint32_t max) {
+  if (!engine_) return false;
+  double due;
+  if (!engine_->next_timer(&due)) return false;
+  String error(allocator_);
+  engine_->run_timers(max, &error);
+  if (!error.empty()) note_error(error.view());
+  flush_errors();
+  return true;
+}
+
+bool Page::has_timers() {
+  double due;
+  return engine_ && engine_->next_timer(&due);
+}
+
 // --- Loading -----------------------------------------------------------------------------------------------------------------
 
 // Asks the environment to start downloading what the page's HTML names, so the scripts and style sheets arrive while the page is read.
 void Page::prefetch_resources(StringView html) {
+  if (sw_client_ != 0 && env_.service_workers() && env_.service_workers()->client_controller(sw_client_, nullptr) != 0) return;   // (a service worker may answer these: they are fetched when needed)
   scan_resources(html, [this](ResourceKind kind, StringView reference) {
     if (kind == ResourceKind::Script && !scripts_enabled_) return;
     String address(allocator_);
@@ -235,7 +376,7 @@ StringView Page::external(uint32_t index, StringView src) {
     if (scripts_[i].serial == index + 1) return scripts_[i].text.view();
   Fetched f(allocator_);
   f.serial = index + 1;
-  if (resolve(src, &f.address)) env_.fetch_text(f.address.view(), kMaxScriptBytes, &f.text);
+  if (resolve(src, &f.address)) fetch_text_via_sw(f.address.view(), "script", kMaxScriptBytes, &f.text);
   if (!scripts_.push_back(util::move(f))) return StringView();
   return scripts_[scripts_.count() - 1].text.view();
 }
@@ -332,7 +473,7 @@ void Page::fetch_pending_styles() {
     if (sheets_.count() >= kMaxStyleSheets || !pending_style_link(n, &href)) continue;
     Fetched f(allocator_);
     f.serial = n->serial;
-    if (resolve(href, &f.address)) env_.fetch_text(f.address.view(), kMaxStyleSheetBytes, &f.text);
+    if (resolve(href, &f.address)) fetch_text_via_sw(f.address.view(), "style", kMaxStyleSheetBytes, &f.text);
     sheets_.push_back(util::move(f));   // (even an empty answer: it is not asked for again)
   }
 }
@@ -367,7 +508,7 @@ bool Page::render(HtmlDocument* out) {
   fetch_pending_styles();
   sync_frames();
   objects_.set_now(env_.now_ms());
-  objects_.sync(doc_, env_, address_.view(), media_);
+  objects_.sync(doc_, object_environment(), address_.view(), media_);
   RenderOptions options;
   options.media = media_;
   options.styles = this;
@@ -389,7 +530,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
   fetch_pending_styles();
   sync_frames();
   objects_.set_now(env_.now_ms());
-  objects_.sync(doc_, env_, address_.view(), media_);
+  objects_.sync(doc_, object_environment(), address_.view(), media_);
   style_sheet();
   style_cache_.set_viewport(media_.width, media_.height);
   layout::BuildOptions build;
@@ -577,6 +718,18 @@ bool Page::run_due_timers(double now_ms) {
     deliver_messages();
     any_frame = true;
   }
+  if (sw_client_ != 0) {
+    if (ServiceWorkerHub* hub = env_.service_workers()) {
+      if (hub->busy()) {
+        hub->pump(env_.now_ms());
+        any_frame = true;
+      }
+      if (hub->client_has_events(sw_client_)) {
+        deliver_sw_events();
+        any_frame = true;
+      }
+    }
+  }
   if (!engine_) return any_frame;
   double due;
   if (!engine_->next_timer(&due) || due > now_ms) return any_frame;
@@ -603,6 +756,13 @@ bool Page::next_timer(double* due_ms) {
   if (!messages_.empty() || env_.page_hub().pending(hub_id_, storage_origin(), hub_seen_)) {   // (a message waits to be delivered: now)
     *due_ms = 1;
     any = true;
+  }
+  if (sw_client_ != 0) {   // (a service worker has something to tell this document, or a worker waits for its next step)
+    ServiceWorkerHub* hub = env_.service_workers();
+    if (hub && (hub->client_has_events(sw_client_) || hub->busy())) {
+      *due_ms = 1;
+      any = true;
+    }
   }
   if (objects_.animating()) {   // (a playing video, an animated picture: the next frame)
     const double frame = static_cast<double>(env_.now_ms()) + 33;
@@ -1931,7 +2091,7 @@ void Page::sync_frames() {
       address.assign("about:blank");
     } else {
       address.assign(key.view());
-      if (!env_.fetch_text(key.view(), 1u << 20, &html)) html.assign("<p>This frame could not be loaded.</p>");
+      if (!fetch_text_via_sw(key.view(), "iframe", 1u << 20, &html)) html.assign("<p>This frame could not be loaded.</p>");
     }
     StringView sandbox;
     const bool sandboxed = dom::get_attribute(n, "sandbox", &sandbox) && !sandbox.contains("allow-scripts");
@@ -2370,14 +2530,17 @@ void Page::move_port(uint32_t port, uint32_t window) {
 
 void Page::post_port_message(uint32_t port, StringView payload, StringView ports) {
   Page* top = root();
+  constexpr uint32_t kBridge = 0xFFFFFFFFu;   // (the home of a port that was moved to a service worker or a document: the hub carries what is posted to it)
   for (uint64_t i = 0; i < top->port_homes_.count(); ++i) {
     if (top->port_homes_[i].port != port) continue;
+    if (top->port_homes_[i].window == kBridge) break;
     Page* target = top->find_window(top->port_homes_[i].window);
     if (!target) return;
     claim_ports(ports, target->window_id_);
     target->queue_port_message(port, payload, ports);
     return;
   }
+  if (ServiceWorkerHub* hub = service_workers()) hub->port_message(sw_client_, sw_worker_, port, payload, ports);
 }
 
 void Page::broadcast(StringView channel, StringView payload) {

@@ -17,6 +17,8 @@
  */
 
 #include "Desktop/WebBrowser.hpp"
+#include "Browser/CacheStore.hpp"
+#include "Browser/ServiceWorker.hpp"
 #include "Browser/Fetcher.hpp"
 #include "Browser/Url.hpp"
 #include "Browser/WebUrl.hpp"
@@ -606,7 +608,12 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit, bool s
   options.now_ms = page_clock_ms();
   if (subresource) options.timeout_ms = kSubresourceTimeoutMs;
   browser::NetResponse result(allocator());
-  if (!browser::fetch_resource(allocator(), *loader_, jar(), options, &result)) {
+  // a service worker in charge of the address answers a page being opened first
+  const browser::ServiceWorkerHub::Intercept verdict =
+      !subresource && sw_hub_ ? sw_hub_->intercept(0, options, "document", true, &result) : browser::ServiceWorkerHub::Intercept::Pass;
+  const bool fetched = verdict == browser::ServiceWorkerHub::Intercept::Responded ||
+                       (verdict == browser::ServiceWorkerHub::Intercept::Pass && browser::fetch_resource(allocator(), *loader_, jar(), options, &result));
+  if (!fetched) {
     String message(allocator());
     message.append("Cannot open ");
     message.append(address.size() > 24 ? address.first(24) : address);   // (the notice dialog has room for four short lines)
@@ -652,7 +659,10 @@ bool WebBrowser::fetch_post(StringView address, Fetched* page) {
   options.credentials = browser::FetchOptions::Credentials::Include;
   options.now_ms = page_clock_ms();
   browser::NetResponse result(allocator());
-  if (!browser::fetch_resource(allocator(), *loader_, jar(), options, &result)) {
+  const browser::ServiceWorkerHub::Intercept verdict = sw_hub_ ? sw_hub_->intercept(0, options, "document", true, &result) : browser::ServiceWorkerHub::Intercept::Pass;
+  const bool sent = verdict == browser::ServiceWorkerHub::Intercept::Responded ||
+                    (verdict == browser::ServiceWorkerHub::Intercept::Pass && browser::fetch_resource(allocator(), *loader_, jar(), options, &result));
+  if (!sent) {
     String message(allocator());
     message.append("Cannot send the form: ");
     message.append(result.error.empty() ? StringView("the server did not answer.") : result.error.view());
@@ -1266,8 +1276,11 @@ void WebBrowser::apply_clear_site_data(const browser::NetResponse& response) {
   if (!browser::WebUrl::parse(allocator(), response.url.view(), nullptr, &url)) return;
   String origin(allocator());
   url.origin(&origin);
+  // "storage": localStorage and sessionStorage, the caches of the Cache API and the service workers of the origin
   (shared_local_ ? *shared_local_ : own_local_).area(origin.view()).clear();
   env_.session_storage_hub().area(origin.view()).clear();
+  if (sw_hub_) sw_hub_->clear_origin(origin.view());
+  if (shared_caches_) shared_caches_->clear_origin(origin.view());
 }
 
 void WebBrowser::set_block_third_party_cookies(bool block) {
@@ -1279,6 +1292,8 @@ void WebBrowser::clear_site_data() {
   jar().clear();
   (shared_local_ ? *shared_local_ : own_local_).clear_all();
   env_.session_storage_hub().clear_all();
+  if (sw_hub_) sw_hub_->clear_all();
+  if (shared_caches_) shared_caches_->clear_all();
 }
 
 void WebBrowser::on_toggle_third_party(void* self, Control&) {

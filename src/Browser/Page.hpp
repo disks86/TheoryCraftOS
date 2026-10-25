@@ -44,8 +44,13 @@
 namespace browser {
 
 // What a page asks of the browser it is shown in.
+class PageObjectEnv;
+
 class IPageEnvironment : public IObjectEnvironment {
  public:
+  // The service workers of the browser and the caches of the Cache API, shared by all its pages (nullptr: the browser has none; a page then keeps caches of its own).
+  virtual ServiceWorkerHub* service_workers() { return nullptr; }
+  virtual CacheStore* cache_store() { return nullptr; }
   // The text at an address (a script or a style sheet), at most `limit` bytes. False if it cannot be had.
   virtual bool fetch_text(StringView address, uint64_t limit, String* text) = 0;
   // The page is going to ask for `address` (a script, style sheet or picture) soon: start getting it, without waiting. Optional; what it does not do the later
@@ -291,7 +296,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void cookie_set(StringView text) override;
   void cookie_details(StringView url, String* out) override;
   bool cookie_write(StringView text) override;
-  bool http_request(const FetchOptions& options, NetResponse* response) override { return env_.http_request(options, response); }
+  bool http_request(const FetchOptions& options, NetResponse* response) override;
   void page_origin(String* out) override;
   uint32_t ws_open(StringView url, StringView protocols, String* error) override;
   int ws_state(uint32_t id) override;
@@ -306,6 +311,25 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void worker_pump() override;
   bool worker_next_event(uint32_t* id, uint32_t* kind, String* text) override;
   bool compile_handler(StringView code, script::Value* function) override;
+  ServiceWorkerHub* service_workers() override { return sw_hub_ ? sw_hub_ : env_.service_workers(); }
+  uint32_t service_worker_client() override { return sw_client_; }
+  uint32_t service_worker_id() override { return sw_worker_; }
+  CacheStore& cache_store() override;
+
+  // --- Service workers
+  IPageEnvironment& environment() { return env_; }
+  // This page is the global scope of that worker of `hub`, not a document (set before the first script runs).
+  void set_service_worker(ServiceWorkerHub* hub, uint32_t worker);
+  // Runs the worker's script in the global scope (the engine is started if needed). False with *error if it threw or does not compile.
+  bool run_worker_script(StringView source, String* error);
+  // Calls a global function of the built-in scripts (see DomBindings::call_hook); microtasks the call queued have run when it returns.
+  bool call_global(StringView name, const DomBindings::HookArg* args, uint32_t count, String* result = nullptr);
+  // Runs the timers that are waiting without waiting for them to be due (at most `max`); true if any ran. has_timers(): is one waiting?
+  bool run_timers_ahead(uint32_t max);
+  bool has_timers();
+  // The bytes at `address` for the document (a script, style sheet, picture, frame: `destination` says which), asked of the service worker in charge of the page first.
+  // False if they cannot be had (or the status is 400 or more).
+  bool sw_fetch_bytes(StringView address, StringView destination, uint64_t limit, ByteBuffer* out);
 
   // --- IDomHost: forms
   dom::Node* focused() override;
@@ -445,6 +469,13 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   List<PortHome> port_homes_;                              // (kept by the top page: which window each message port is in)
   uint32_t hub_id_ = 0;
   uint64_t hub_seen_ = 0;
+  ServiceWorkerHub* sw_hub_ = nullptr;   // set for the page that is a service worker's scope
+  uint32_t sw_worker_ = 0, sw_client_ = 0;
+  UniquePointer<CacheStore> own_caches_;   // for an environment without a store of its own
+  UniquePointer<PageObjectEnv> object_env_;   // what the page's pictures and videos fetch through (kept: PageObjects holds on to it)
+  IObjectEnvironment& object_environment();
+  void deliver_sw_events();
+  bool fetch_text_via_sw(StringView address, const char* destination, uint64_t limit, String* text);
   String storage_origin_;
   String state_json_;           // history.state: the state of the entry this page is on, as JSON
   bool has_state_ = false;

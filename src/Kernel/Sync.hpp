@@ -73,6 +73,18 @@ class RecursiveMutex {
     __atomic_store_n(&owner_, me, __ATOMIC_RELAXED);
     depth_ = 1;
   }
+  // Takes it if that does not mean waiting (the calling thread may already hold it).
+  bool try_lock() {
+    Thread* me = current_thread();
+    if (__atomic_load_n(&owner_, __ATOMIC_RELAXED) == me) {
+      ++depth_;
+      return true;
+    }
+    if (!mutex_.try_lock()) return false;
+    __atomic_store_n(&owner_, me, __ATOMIC_RELAXED);
+    depth_ = 1;
+    return true;
+  }
   void unlock() {
     if (--depth_ == 0) {
       __atomic_store_n(&owner_, static_cast<Thread*>(nullptr), __ATOMIC_RELAXED);

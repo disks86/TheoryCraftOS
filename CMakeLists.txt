@@ -247,6 +247,10 @@ add_executable(BOOTX64
   src/Browser/DomBindingsNet.cpp
   src/Browser/DomBindingsCrypto.cpp
   src/Browser/DomBindingsWasm.cpp
+  src/Browser/DomBindingsServiceWorker.cpp
+  src/Browser/CacheStore.cpp
+  src/Browser/ServiceWorker.cpp
+  src/Browser/ServiceWorkerPrelude.cpp
   src/Wasm/WasmDecode.cpp
   src/Wasm/WasmRun.cpp
   src/Wasm/WasmSimd.cpp

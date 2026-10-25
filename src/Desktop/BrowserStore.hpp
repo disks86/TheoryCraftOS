@@ -20,10 +20,17 @@
 //
 //   web_cookies        (name, value, domain, path TEXT; host_only, secure, http_only, partitioned, same_site, expires, created, accessed, position INTEGER)
 //   web_local_storage  (origin, key, value TEXT)
+//   web_cache_entries  (origin, cache, method, url, request_headers, status_text, headers, response_url, response_type TEXT; position, status, redirected INTEGER; body BLOB)
+//                      one row for each stored request / response pair of the Cache API, and a row with position -1 for a cache without any
+//   web_service_workers (origin, scope, script_url, update_via_cache, type, preload_header TEXT; source, imports BLOB; preload_enabled INTEGER)
+//                      the registrations of service workers, with the script of the worker that was active
 //
-// Saving replaces both tables in one transaction; loading puts what was saved into a CookieJar and a StorageHub (cookies that have expired are left out).
+// Saving replaces the tables in one transaction; loading puts what was saved into a CookieJar, a StorageHub, a CacheStore and a ServiceWorkerHub (cookies that have
+// expired are left out).
+#include "Browser/CacheStore.hpp"
 #include "Browser/CookieJar.hpp"
 #include "Browser/PageHub.hpp"
+#include "Browser/ServiceWorkerTypes.hpp"
 #include "Database/Local/LocalDatabase.hpp"
 
 namespace desktop {
@@ -33,9 +40,10 @@ class BrowserStore {
   BrowserStore(allocators::IAllocator& allocator, database::local::LocalDatabase& database) : allocator_(allocator), connection_(allocator, database) {}
 
   // Writes the persistent cookies and all of localStorage. False if the database is busy or cannot be written (nothing is changed then).
-  bool save(browser::CookieJar& cookies, browser::StorageHub& local_storage, uint64_t now_ms);
-  // Reads them back. Returns how many cookies and storage items were restored.
-  bool load(browser::CookieJar& cookies, browser::StorageHub& local_storage, uint64_t now_ms, uint32_t* cookie_count, uint32_t* item_count);
+  bool save(browser::CookieJar& cookies, browser::StorageHub& local_storage, browser::CacheStore& caches, browser::IServiceWorkerPersistence& workers, uint64_t now_ms);
+  // Reads them back. Returns how many cookies and storage items were restored (and the caches' entries and the service worker registrations).
+  bool load(browser::CookieJar& cookies, browser::StorageHub& local_storage, browser::CacheStore& caches, browser::IServiceWorkerPersistence& workers, uint64_t now_ms, uint32_t* cookie_count,
+            uint32_t* item_count, uint32_t* cache_entries = nullptr, uint32_t* registrations = nullptr);
 
  private:
   bool ensure_tables();

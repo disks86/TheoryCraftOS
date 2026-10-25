@@ -34,6 +34,8 @@
 namespace browser {
 
 class PageObjects;
+class CacheStore;
+class ServiceWorkerHub;
 
 // A set of named strings: localStorage and sessionStorage.
 class StorageArea {
@@ -200,6 +202,12 @@ class IDomHost {
   virtual void worker_terminate(uint32_t id) { (void)id; }
   virtual void worker_pump() {}
   virtual bool worker_next_event(uint32_t* id, uint32_t* kind, String* text) { (void)id; (void)kind; (void)text; return false; }
+  // Service workers and the Cache API. service_workers() is the hub of the browser (nullptr: none); service_worker_client() is the id of this document there (0: it is not one
+  // that service workers know); service_worker_id() is not 0 when this page is the global scope of that worker. cache_store() holds the caches of every origin.
+  virtual ServiceWorkerHub* service_workers() { return nullptr; }
+  virtual uint32_t service_worker_client() { return 0; }
+  virtual uint32_t service_worker_id() { return 0; }
+  virtual CacheStore& cache_store() = 0;
   // Shows what is wrong with a control (reportValidity()); true if nothing is.
   virtual bool report_validity(dom::Node* control) = 0;
 
