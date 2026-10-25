@@ -27,6 +27,7 @@
 #include "Desktop/DesktopSurface.hpp"
 #include "Desktop/DisplaySettings.hpp"
 #include "Desktop/NetworkProperties.hpp"
+#include "Desktop/WirelessProperties.hpp"
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/FileDialog.hpp"
@@ -240,6 +241,12 @@ class Desktop {
   // the menu of an adapter in the computer manager's hardware tree.
   void open_network_properties(uint32_t adapter);
   NetworkProperties& network_properties() { return network_properties_; }
+  // The Wi-Fi adapters, for the Wi-Fi properties window (nullptr: none). It must outlive the desktop.
+  void set_wireless_details(IWirelessDetails* details) { wireless_properties_.set_details(details); }
+  // Opens the Wi-Fi properties window of a wireless adapter (its number: HardwareEntry::id), or brings it forward showing that adapter. It is reached
+  // from the Wi-Fi Properties item in the computer manager's menu of a wireless adapter.
+  void open_wireless_properties(uint32_t adapter);
+  WirelessProperties& wireless_properties() { return wireless_properties_; }
   // Opens the display settings window, or brings it forward. It is reached from the Displays group of the computer manager's hardware tree.
   void open_display_settings();
   // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
@@ -293,6 +300,7 @@ class Desktop {
   static void on_about(void* self, gui::Control&);
   static void on_display_settings(void* self, gui::Control&);
   static void on_network_properties(void* self, gui::Control&);
+  static void on_wireless_properties(void* self, gui::Control&);
   static bool apply_changes_thunk(void* self);
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
@@ -368,6 +376,7 @@ class Desktop {
   gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"
   DisplaySettings display_settings_;
   NetworkProperties network_properties_;
+  WirelessProperties wireless_properties_;
   gui::Frame about_;
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;

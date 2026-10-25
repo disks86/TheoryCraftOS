@@ -2121,6 +2121,161 @@ static void test_network_properties() {
   CHECK(a.live == 0);
 }
 
+struct FakeWirelessDetails final : desktop::IWirelessDetails {
+  using Info = desktop::WirelessNetworkInfo;
+  desktop::WirelessAdapterInfo info;
+  Info list[3];
+  uint32_t known = 5, scans = 0;
+  bool is_wireless(uint32_t id) override { return id == known; }
+  bool adapter(uint32_t id, desktop::WirelessAdapterInfo* out) override {
+    if (id != known) return false;
+    *out = info;
+    return true;
+  }
+  bool scan(uint32_t id) override { ++scans; return id == known; }
+  uint32_t networks(uint32_t id, Info* out, uint32_t capacity) override {
+    if (id != known) return 0;
+    uint32_t n = 0;
+    for (; n < 3 && n < capacity; ++n) out[n] = list[n];
+    return n;
+  }
+  desktop::WirelessResult connect(uint32_t id, StringView ssid, StringView passphrase) override {
+    if (id != known) return desktop::WirelessResult::Failed;
+    for (const Info& n : list) {
+      if (!ssid.equals(StringView(n.ssid))) continue;
+      if (n.security != desktop::WirelessSecurity::Open && !passphrase.equals("sesame123")) {
+        info.last_result = desktop::WirelessResult::BadPassphrase;
+        return desktop::WirelessResult::BadPassphrase;
+      }
+      info.state = desktop::WirelessState::Connected;
+      info.last_result = desktop::WirelessResult::Ok;
+      info.network = n;
+      return desktop::WirelessResult::Ok;
+    }
+    return desktop::WirelessResult::NoSuchNetwork;
+  }
+  void disconnect(uint32_t) override { info.state = desktop::WirelessState::Disconnected; info.last_result = desktop::WirelessResult::Ok; info.network = Info(); }
+  FakeWirelessDetails() {
+    strcpy(info.name, "Fake Wi-Fi");
+    strcpy(list[0].ssid, "Home");
+    list[0].security = desktop::WirelessSecurity::Wpa2;
+    list[0].channel = 6;
+    list[0].signal_percent = 90;
+    strcpy(list[1].ssid, "Cafe");
+    list[1].security = desktop::WirelessSecurity::Open;
+    list[1].channel = 11;
+    list[1].signal_percent = 40;
+    strcpy(list[2].ssid, "Old");
+    list[2].security = desktop::WirelessSecurity::Wep;
+    list[2].channel = 1;
+    list[2].signal_percent = 20;
+  }
+};
+
+// The Wi-Fi properties: the networks in range, joining one (with and without the right password), leaving it.
+static void test_wireless_properties() {
+  TestAllocator a;
+  {
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    desktop::WirelessProperties props(a);
+    FakeWirelessDetails details;
+    CHECK(mgr.add_window(&props));
+    props.update();   // (no source yet)
+    CHECK(props.connection_label().text().find(StringView("No Wi-Fi")) != StringView::npos && !props.connect_button().enabled());
+    props.set_details(&details);
+    props.show_adapter(5);
+    w.layout();
+    CHECK(details.scans == 1 && props.adapter() == 5 && props.title().equals("Fake Wi-Fi - Wi-Fi Properties") && props.grid().row_count() == 3);
+    CHECK(props.connection_label().text().equals("Not connected"));
+    CHECK(props.cell(0, 0).equals("Home") && props.cell(0, 1).equals("90%") && props.cell(0, 2).equals("WPA2") && props.cell(0, 3).equals("6"));
+    CHECK(props.cell(1, 2).equals("Open") && props.cell(2, 2).equals("WEP") && props.cell(7, 0).empty());
+    // Nothing picked: Connect is off. Picking a network turns it on; Disconnect is off while nothing is joined.
+    CHECK(!props.connect_button().enabled() && !props.disconnect_button().enabled() && props.scan_button().enabled());
+    props.grid().select_row(0);
+    CHECK(props.connect_button().enabled());
+    // A secured network needs a password; a wrong one is refused with the reason.
+    click_center(w, props.connect_button());
+    CHECK(props.status_label().text().find(StringView("password")) != StringView::npos && props.connection_label().text().equals("Not connected"));
+    props.password_box().set_text("nope");
+    click_center(w, props.connect_button());
+    CHECK(props.status_label().text().equals("The password is not right.") && props.connection_label().text().equals("Not connected"));
+    props.password_box().set_text("sesame123");
+    click_center(w, props.connect_button());
+    CHECK(props.status_label().text().equals("Connected to Home.") && props.password_box().text().empty());
+    CHECK(props.connection_label().text().equals("Connected to Home - WPA2, channel 6, signal 90%"));
+    CHECK(props.disconnect_button().enabled());
+    // An open network joins without one.
+    props.grid().select_row(1);
+    click_center(w, props.connect_button());
+    CHECK(props.connection_label().text().find(StringView("Cafe")) != StringView::npos);
+    // Scan asks the adapter again; Disconnect leaves.
+    click_center(w, props.scan_button());
+    CHECK(details.scans == 2);
+    click_center(w, props.disconnect_button());
+    CHECK(props.connection_label().text().equals("Not connected") && !props.disconnect_button().enabled() && props.status_label().text().equals("Disconnected."));
+    // The air changes: a network appears or goes, and a Connecting adapter cannot scan or connect.
+    details.list[1].signal_percent = 55;
+    props.update();
+    CHECK(props.cell(1, 1).equals("55%"));
+    details.info.state = desktop::WirelessState::Connecting;
+    props.update();
+    CHECK(!props.scan_button().enabled() && !props.connect_button().enabled() && props.disconnect_button().enabled());
+    // An adapter that is gone.
+    details.info.state = desktop::WirelessState::Disconnected;
+    details.known = 9;
+    props.update();
+    CHECK(props.grid().row_count() == 0 && props.connection_label().text().find(StringView("not there")) != StringView::npos && !props.scan_button().enabled());
+    props.close();
+    CHECK(!props.manager());
+  }
+  CHECK(a.live == 0);
+}
+
+// A Wi-Fi adapter's menu in the computer manager has Wi-Fi Properties as well as Properties; a wired one has only Properties.
+static void test_wireless_menu() {
+  TestAllocator a;
+  {
+    using desktop::HardwareGroup;
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    FakeInventory inv(a);
+    inv.list.add(HardwareGroup::Network, "Fake e1000", "connected", 3);
+    inv.list.add(HardwareGroup::Network, "Fake Wi-Fi", "Wi-Fi, not connected", 5, true);
+    d.set_hardware_inventory(&inv);
+    FakeWirelessDetails details;
+    d.set_wireless_details(&details);
+    d.open_computer_manager();
+    desktop::ComputerManager& cm = d.computer_manager();
+    cm.tabs().select_page(2);
+    d.window().layout();
+    Window& w = d.window();
+    const int32_t network = cm.hardware_group_node(HardwareGroup::Network);
+    CHECK(network >= 0 && cm.hardware_tree().child_count(network) == 2);
+    const Point wired = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 0));
+    const Point wifi = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 1));
+    CHECK(!choose_context(w, cm.adapter_menu(), wifi.x, wifi.y, "Wi-Fi Properties...") && !d.wireless_properties().manager());
+    w.close_popup();
+    CHECK(!choose_context(w, cm.wireless_menu(), wired.x, wired.y, "Wi-Fi Properties...") && !d.wireless_properties().manager());
+    w.close_popup();
+    CHECK(choose_context(w, cm.wireless_menu(), wifi.x, wifi.y, "Wi-Fi Properties...") && d.wireless_properties().manager() != nullptr);
+    CHECK(d.wireless_properties().adapter() == 5 && cm.wireless_adapter() == 5 && d.wireless_properties().grid().row_count() == 3 && !d.network_properties().manager());
+    // The menu still has the adapter's ordinary Properties.
+    cm.activate();
+    CHECK(choose_context(w, cm.wireless_menu(), wifi.x, wifi.y, "Properties...") && d.network_properties().manager() != nullptr && d.network_properties().adapter() == 5);
+    // The window follows the adapter once a second.
+    details.info.state = desktop::WirelessState::Connected;
+    details.info.network = details.list[0];
+    d.step(5000000);
+    CHECK(d.wireless_properties().connection_label().text().find(StringView("Connected to Home")) != StringView::npos);
+  }
+  CHECK(a.live == 0);
+}
+
 // Display Settings is no longer in the Start menu: it is in the menu of the Displays group of the computer manager's hardware tree.
 static void test_display_settings_entry() {
   TestAllocator a;
@@ -7385,6 +7540,8 @@ int main() {
   test_tree_view();
   test_hardware_tab();
   test_network_properties();
+  test_wireless_properties();
+  test_wireless_menu();
   test_display_settings_entry();
   test_text_editor();
   test_notepad();

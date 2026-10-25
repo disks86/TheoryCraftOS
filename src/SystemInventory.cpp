@@ -17,6 +17,7 @@
  */
 
 #include "SystemInventory.hpp"
+#include "Hardware/WirelessInterface/IWirelessInterface.hpp"
 #include "Desktop/Format.hpp"
 
 using desktop::HardwareGroup;
@@ -71,7 +72,7 @@ const char* usb_class_name(uint8_t device_class) {
 
 }  // namespace
 
-void SystemInventory::add(desktop::HardwareList* list, HardwareGroup group, StringView name, uint32_t id) { list->add(group, name, scratch_.view(), id); }
+void SystemInventory::add(desktop::HardwareList* list, HardwareGroup group, StringView name, uint32_t id, bool wireless) { list->add(group, name, scratch_.view(), id, wireless); }
 
 void SystemInventory::collect(desktop::HardwareList* list) {
   String name(allocator_);
@@ -154,7 +155,18 @@ void SystemInventory::collect(desktop::HardwareList* list) {
             scratch_.append(" Mbps");
           }
         }
-        add(list, HardwareGroup::Network, n->name(), i);
+        hardware::IWirelessInterface* radio = n->wireless();
+        if (radio) {
+          const hardware::WifiStatus wifi = radio->status();
+          scratch_.assign("Wi-Fi, ");
+          if (wifi.state == hardware::WifiState::Connected) {
+            scratch_.append("connected to ");
+            scratch_.append(wifi.network.ssid);
+          } else {
+            scratch_.append("not connected");
+          }
+        }
+        add(list, HardwareGroup::Network, n->name(), i, radio != nullptr);
       }
   }
   if (audio_) {

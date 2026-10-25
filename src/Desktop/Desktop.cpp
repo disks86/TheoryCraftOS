@@ -69,6 +69,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       display_confirm_dialog_(allocator),
       display_settings_(allocator),
       network_properties_(allocator),
+      wireless_properties_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
       database_url_(allocator),
@@ -176,6 +177,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   display_settings_.set_confirm_dialog(&display_confirm_dialog_);
   computer_manager_.on_open_display_settings({&Desktop::on_display_settings, this});
   computer_manager_.on_open_network_properties({&Desktop::on_network_properties, this});
+  computer_manager_.on_open_wireless_properties({&Desktop::on_wireless_properties, this});
   input_.set_confine(&Desktop::confine_pointer, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
   window_.layout();
@@ -658,6 +660,19 @@ void Desktop::on_network_properties(void* self, Control&) {
   d->open_network_properties(d->computer_manager_.network_adapter());
 }
 
+void Desktop::open_wireless_properties(uint32_t adapter) {
+  window_.locked([&] {
+    wireless_properties_.show_adapter(adapter);
+    if (wireless_properties_.manager()) wireless_properties_.activate();
+    else windows_.add_window(&wireless_properties_);
+  });
+}
+
+void Desktop::on_wireless_properties(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->open_wireless_properties(d->computer_manager_.wireless_adapter());
+}
+
 void Desktop::open_file_properties(StringView path) {
   window_.locked([&] {
     file_properties_.show(path);
@@ -962,6 +977,7 @@ void Desktop::pump(uint64_t uptime_us) {
   if (second != polled_second_) {
     polled_second_ = second;
     if (network_properties_.manager()) network_properties_.update();
+    if (wireless_properties_.manager()) wireless_properties_.update();
     display_settings_.tick();
     if (computer_manager_.manager()) computer_manager_.update(uptime_us);
     DateTime now;
