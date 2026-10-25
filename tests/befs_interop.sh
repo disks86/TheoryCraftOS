@@ -23,7 +23,7 @@ ${CXX:-g++} -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover
 # What goes on the volumes (host side; bfs_shell addresses the volume as /myfs and the host as :path). The files of /frag fill the volume, every
 # other one is removed again so that the free space is in small pieces, and the big file is copied last: it has to be spread over more runs
 # than the inode and its indirect run array hold, which brings in the double indirect run arrays.
-make_source() {  # block size, number of /frag files, size of big.bin
+make_source() {  # block size, number of /frag files, size of big.bin, size of a /frag file
   src="$work/src"; rm -rf "$src" "$work/fragsrc"
   mkdir -p "$src/dir1/sub" "$src/many" "$src/emptydir" "$src/frag" "$work/fragsrc"
   head -c 200 /dev/urandom > "$src/small.txt"
@@ -34,7 +34,7 @@ make_source() {  # block size, number of /frag files, size of big.bin
   head -c 300 /dev/urandom > "$src/héllo wörld.txt"
   head -c 90 /dev/urandom > "$src/$(printf 'n%.0s' $(seq 1 255))"
   for i in $(seq 0 599); do head -c $(( (i * 37) % 2500 )) /dev/urandom > "$src/many/$(printf 'a_reasonably_long_file_name_%04d.dat' $i)"; done
-  for i in $(seq 0 $(( $2 - 1 ))); do head -c 3000 /dev/urandom > "$work/fragsrc/$(printf 'f%05d' $i)"; done
+  for i in $(seq 0 $(( $2 - 1 ))); do head -c "${4:-3000}" /dev/urandom > "$work/fragsrc/$(printf 'f%05d' $i)"; done
   for i in $(seq 1 2 $(( $2 - 1 ))); do cp "$work/fragsrc/$(printf 'f%05d' $i)" "$src/frag/"; done   # (the odd ones stay on the volume)
 }
 common_commands() {
@@ -58,10 +58,13 @@ checkfs() {  # image, label
 }
 
 fail=0
-configs=${BEFS_INTEROP_CONFIGS:-"1024 64M 2000 900000|2048 64M 2400 4600000|4096 128M 5200 17500000|8192 128M 600 2200000"}   # block size, image size, files in /frag, size of big.bin
+configs=${BEFS_INTEROP_CONFIGS:-"1024 64M 1400 3000000 7000|2048 64M 2400 4600000|4096 128M 5200 17500000|8192 128M 600 2200000"}   # block size, image size, files in /frag, size of big.bin, size of a /frag file (default 3000)
+# Notes on the 1 KiB volume: Haiku's allocator wastes most of the free space when it is in holes of 4 blocks, so it uses holes of 8; and Haiku itself
+# cannot write a file that grows into the double indirect range at this block size (its own FindBlockRun then rejects what it has just written and
+# cp fails with B_BAD_DATA), so the big file here stays below that, at about 500 runs. Double indirect run arrays are covered at 2 and 4 KiB.
 IFS="|" read -ra config_list <<< "$configs"
 for cfg in "${config_list[@]}"; do
-  set -- $cfg; bs=$1; size=$2; make_source "$bs" "$3" "$4"
+  set -- $cfg; bs=$1; size=$2; make_source "$bs" "$3" "$4" "${5:-3000}"
   img="$work/v.img"; rm -f "$img"; truncate -s "$size" "$img"
   "$shell" --initialize "$img" INTEROP "block_size $bs" > "$work/init.log" 2>&1 || { echo "FAIL ($bs): bfs_shell cannot initialize"; cat "$work/init.log"; fail=1; continue; }
   common_commands > "$work/stage1.cmds"
