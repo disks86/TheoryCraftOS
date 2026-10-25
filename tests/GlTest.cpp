@@ -34,6 +34,12 @@ struct TestAllocator final : allocators::IAllocator {
   void deallocate(void* p) override { if (p) { --live; free(p); } }
 };
 
+static GlContext::Attributes noaa() {
+  GlContext::Attributes a;
+  a.antialias = false;
+  return a;
+}
+
 static uint32_t make_program(GlContext& gl, const char* vs, const char* fs) {
   const uint32_t v = gl.create_shader(0x8B31), f = gl.create_shader(0x8B30), p = gl.create_program();
   gl.shader_source(v, vs);
@@ -65,7 +71,7 @@ static const char* kFs = "precision mediump float; varying vec3 vcol; void main(
 static void test_triangle() {
   TestAllocator a;
   {
-    GlContext gl(a, false, 64, 64, GlContext::Attributes());
+    GlContext gl(a, false, 64, 64, noaa());
     CHECK(gl.valid());
     gl.clear_color(0, 0, 0, 1);
     gl.clear(0x4000);
@@ -102,7 +108,7 @@ static void test_triangle() {
 static void test_interpolation_and_blend() {
   TestAllocator a;
   {
-    GlContext gl(a, false, 32, 32, GlContext::Attributes());
+    GlContext gl(a, false, 32, 32, noaa());
     const uint32_t prog = make_program(gl, kVs, kFs);
     gl.use_program(prog);
     // full-screen quad (two triangles), colour red at the left edge, blue at the right
@@ -139,7 +145,7 @@ static void test_interpolation_and_blend() {
 static void test_depth_and_textures() {
   TestAllocator a;
   {
-    GlContext::Attributes at;
+    GlContext::Attributes at = noaa();
     at.depth = true;
     GlContext gl(a, false, 32, 32, at);
     const char* vs = "attribute vec3 pos; uniform vec3 off; varying vec2 uv; void main() { uv = pos.xy * 0.5 + 0.5; gl_Position = vec4(pos + off, 1.0); }";
@@ -194,7 +200,7 @@ static void test_depth_and_textures() {
 static void test_framebuffer_object() {
   TestAllocator a;
   {
-    GlContext gl(a, true, 16, 16, GlContext::Attributes());
+    GlContext gl(a, true, 16, 16, noaa());
     const uint32_t tex = gl.create_texture();
     gl.bind_texture(0x0DE1, tex);
     gl.tex_image(0x0DE1, 0, 0x8058, 8, 8, 1, 0, 0x1908, 0x1401, ConstByteView(), false, false);
@@ -233,7 +239,7 @@ static void test_framebuffer_object() {
 static void test_transform_feedback() {
   TestAllocator a;
   {
-    GlContext gl(a, true, 8, 8, GlContext::Attributes());
+    GlContext gl(a, true, 8, 8, noaa());
     const uint32_t v = gl.create_shader(0x8B31), f = gl.create_shader(0x8B30), p = gl.create_program();
     gl.shader_source(v, "#version 300 es\nlayout(location=0) in vec2 pos; out vec2 doubled; out float idx; void main() { doubled = pos * 2.0; idx = float(gl_VertexID); gl_Position = vec4(pos, 0.0, 1.0); }");
     gl.compile_shader(v);
@@ -268,7 +274,7 @@ static void test_transform_feedback() {
 static void test_multisample() {
   TestAllocator a;
   {
-    GlContext gl(a, true, 16, 16, GlContext::Attributes());
+    GlContext gl(a, true, 16, 16, noaa());
     const uint32_t rb = gl.create_renderbuffer(), fbo = gl.create_framebuffer();
     gl.bind_renderbuffer(rb);
     gl.renderbuffer_storage(0x8058, 16, 16, 4);
@@ -314,7 +320,50 @@ static void test_multisample() {
   CHECK(a.live == 0);
 }
 
+static void test_default_antialias() {
+  TestAllocator a;
+  {
+    GlContext::Attributes at;
+    at.antialias = true;
+    GlContext gl(a, false, 16, 16, at);
+    CHECK(gl.antialiased());
+    double samples = 0;
+    uint32_t n;
+    gl.get_integer(0x80A9, &samples, &n);
+    CHECK(samples == 4);
+    const uint32_t prog = make_program(gl, "attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }", "void main() { gl_FragColor = vec4(1.0); }");
+    gl.use_program(prog);
+    const float verts[] = {-1, -1, 1, -1, 1, 0.3f};
+    const uint32_t vb = gl.create_buffer();
+    gl.bind_buffer(0x8892, vb);
+    gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(verts), sizeof(verts)), 0, 0x88E4);
+    gl.enable_vertex_attrib(0, true);
+    gl.vertex_attrib_pointer(0, 2, 0x1406, false, 0, 0, false);
+    gl.clear_color(0, 0, 0, 1);
+    gl.clear(0x4000);
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(gl.get_error() == 0);
+    bool partial = false;
+    for (int y = 0; y < 16; ++y) { const uint32_t r = (pixel(gl, 8, y) >> 16) & 255; partial = partial || (r > 20 && r < 235); }
+    CHECK(partial);
+    CHECK(pixel(gl, 12, 1) == 0xFFFFFFFFu && pixel(gl, 4, 14) == 0xFF000000u);
+    List<uint32_t> out(a);
+    for (int i = 0; i < 256; ++i) out.push_back(0);
+    gpu::TouchBox box;
+    CHECK(gl.present(out.view().data(), 16, &box, true));
+    bool shown_partial = false;
+    for (int y = 0; y < 16; ++y) { const uint32_t r = (out[y * 16 + 8] >> 16) & 255; shown_partial = shown_partial || (r > 20 && r < 235); }
+    CHECK(shown_partial);
+    GlContext::Attributes off;
+    off.antialias = false;
+    GlContext plain(a, false, 16, 16, off);
+    CHECK(!plain.antialiased());
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
+  test_default_antialias();
   test_multisample();
   test_transform_feedback();
   test_triangle();

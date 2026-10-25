@@ -647,7 +647,7 @@ NATIVE(gl_call) {
       vm.define_named(o, "alpha", bool_value(at.alpha));
       vm.define_named(o, "depth", bool_value(at.depth));
       vm.define_named(o, "stencil", bool_value(at.stencil));
-      vm.define_named(o, "antialias", bool_value(false));
+      vm.define_named(o, "antialias", bool_value(gl.antialiased()));
       vm.define_named(o, "premultipliedAlpha", bool_value(at.premultiplied));
       vm.define_named(o, "preserveDrawingBuffer", bool_value(at.preserve));
       *result = Value::make_object(o);
