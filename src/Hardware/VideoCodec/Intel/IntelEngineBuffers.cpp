@@ -116,6 +116,17 @@ bool IntelEngineBuffers::upload_scratch(uint32_t index, ConstByteView bytes) {
   return scratch_[index].buffer.cpu.first(bytes.size()).copy_from(bytes);
 }
 
+bool IntelEngineBuffers::clear_scratch(uint32_t index) {
+  if (!open_ || index >= kMaxScratch || !scratch_[index].buffer.valid()) return false;
+  scratch_[index].buffer.cpu.fill(0);
+  return true;
+}
+
+bool IntelEngineBuffers::read_scratch(uint32_t index, ByteView out) const {
+  if (!open_ || index >= kMaxScratch || !scratch_[index].buffer.valid()) return false;
+  return out.copy_from(scratch_[index].buffer.cpu.first(out.size()));
+}
+
 bool IntelEngineBuffers::picture_buffer(int slot, uint64_t bytes, uint32_t* address) {
   if (!open_ || slot < 0 || slot >= static_cast<int>(kMaxSurfaces)) return false;
   Block& b = aux_[slot];

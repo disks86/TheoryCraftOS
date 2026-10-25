@@ -61,6 +61,10 @@ class IntelEngineBuffers {
   bool scratch(uint32_t index, uint64_t bytes, uint32_t* address);
   // Copies `bytes` into the start of scratch buffer `index` (made before with scratch()).
   bool upload_scratch(uint32_t index, ConstByteView bytes);
+  // Fills scratch buffer `index` (made before with scratch()) with zeros.
+  bool clear_scratch(uint32_t index);
+  // Copies the start of scratch buffer `index` (made before) into `out`.
+  bool read_scratch(uint32_t index, ByteView out) const;
   // A buffer tied to picture `slot` (a direct motion vector buffer), at least `bytes` big; its address. Made on first use.
   bool picture_buffer(int slot, uint64_t bytes, uint32_t* address);
   // Copies picture `from` over picture `to` (both made; a skipped picture repeats the one before it). False if either is missing.
