@@ -174,6 +174,9 @@ static void test_vectors(const char* path) {
       bool good;
       if (t.size() == arrow + 2 && t[arrow + 1] == "trap") {
         good = st == Status::Trap;
+      } else if (t.size() == arrow + 2 && t[arrow + 1] == "exception") {
+        good = st == Status::Exception && store.has_pending_exception();
+        store.take_pending_exception();
       } else {
         good = st == Status::Ok && t.size() == arrow + 1 + fn->sig->nresults;
         for (uint32_t i = 0; good && i < fn->sig->nresults; ++i) {

@@ -107,7 +107,8 @@ class Machine {
 };
 
 Store::Store(allocators::IAllocator& allocator)
-    : allocator_(allocator), sigs_(allocator), memories_(allocator), tables_(allocator), globals_(allocator), funcs_(allocator), instances_(allocator) {}
+    : allocator_(allocator), sigs_(allocator), memories_(allocator), tables_(allocator), globals_(allocator), funcs_(allocator), tags_(allocator), exceptions_(allocator), free_exceptions_(allocator),
+      instances_(allocator) {}
 
 Store::~Store() = default;
 
@@ -185,6 +186,50 @@ FuncInst* Store::new_host_function(const FuncSig* sig, uint32_t host_id, void* h
   return result;
 }
 
+Tag* Store::new_tag(const FuncSig* sig) {
+  UniquePointer<Tag> t = UniquePointer<Tag>::make(allocator_);
+  if (!t) return nullptr;
+  t->sig = sig;
+  Tag* result = t.get();
+  if (!tags_.push_back(util::move(t))) return nullptr;
+  return result;
+}
+
+namespace {
+constexpr uint64_t kMaxExceptions = 1u << 22;   // (exceptions that something refers to are kept for good)
+}
+
+ExnObj* Store::new_exception(Tag* tag, const Slot* values, uint32_t count) {
+  ExnObj* e;
+  if (!free_exceptions_.count()) {
+    if (exceptions_.count() >= kMaxExceptions) return nullptr;
+    UniquePointer<ExnObj> fresh = UniquePointer<ExnObj>::make(allocator_, allocator_);
+    if (!fresh) return nullptr;
+    e = fresh.get();
+    if (!exceptions_.push_back(util::move(fresh))) return nullptr;
+  } else {
+    e = free_exceptions_[free_exceptions_.count() - 1];
+    free_exceptions_.remove_at(free_exceptions_.count() - 1);
+  }
+  e->tag = tag;
+  e->foreign = 0;
+  e->referenced = false;
+  e->values.clear();
+  for (uint32_t i = 0; i < count; ++i)
+    if (!e->values.push_back(values[i])) return nullptr;
+  return e;
+}
+
+ExnObj* Store::new_foreign_exception(uint64_t foreign) {
+  ExnObj* e = new_exception(nullptr, nullptr, 0);
+  if (e) e->foreign = foreign;
+  return e;
+}
+
+void Store::release_exception(ExnObj* exception) {
+  if (!exception->referenced) free_exceptions_.push_back(exception);
+}
+
 ExternVal Store::export_value(const Instance& instance, const Export& e) {
   ExternVal v;
   v.kind = e.kind;
@@ -193,6 +238,7 @@ ExternVal Store::export_value(const Instance& instance, const Export& e) {
     case ExternKind::Table: v.ptr = instance.tables[e.index]; break;
     case ExternKind::Memory: v.ptr = instance.memories[e.index]; break;
     case ExternKind::Global: v.ptr = instance.globals[e.index]; break;
+    case ExternKind::Tag: v.ptr = instance.tags[e.index]; break;
   }
   return v;
 }
@@ -313,7 +359,7 @@ bool Store::instantiate(const SharedPointer<Module>& module, ArrayView<const Ext
     const ExternVal v = imports[i];
     if (v.kind != imp.kind || !v.ptr) {
       *link = true;
-      set_error(error, i, imp, imp.kind == ExternKind::Func ? "function import requires a callable" : (imp.kind == ExternKind::Table ? "table import requires a WebAssembly.Table" : (imp.kind == ExternKind::Memory ? "memory import must be a WebAssembly.Memory object" : "global import must be a number, valid Wasm reference, or WebAssembly.Global object")));
+      set_error(error, i, imp, imp.kind == ExternKind::Func ? "function import requires a callable" : (imp.kind == ExternKind::Table ? "table import requires a WebAssembly.Table" : (imp.kind == ExternKind::Memory ? "memory import must be a WebAssembly.Memory object" : imp.kind == ExternKind::Tag ? "tag import requires a WebAssembly.Tag" : "global import must be a number, valid Wasm reference, or WebAssembly.Global object")));
       return false;
     }
     switch (imp.kind) {
@@ -357,6 +403,16 @@ bool Store::instantiate(const SharedPointer<Module>& module, ArrayView<const Ext
         inst.globals.push_back(g);
         break;
       }
+      case ExternKind::Tag: {
+        Tag* t = static_cast<Tag*>(v.ptr);
+        if (t->sig != inst.type_sigs[imp.type_index]) {
+          *link = true;
+          set_error(error, i, imp, "imported tag does not match the expected type");
+          return false;
+        }
+        inst.tags.push_back(t);
+        break;
+      }
     }
   }
   // functions the module defines
@@ -376,7 +432,14 @@ bool Store::instantiate(const SharedPointer<Module>& module, ArrayView<const Ext
       return false;
     }
   }
-  // tables, memories, globals
+  // tags, tables, memories, globals
+  for (uint64_t i = m.imported_tags; i < m.tags.count(); ++i) {
+    Tag* t = new_tag(inst.type_sigs[m.tags[i]]);
+    if (!t || !inst.tags.push_back(t)) {
+      error->assign(kTrapOutOfMemory);
+      return false;
+    }
+  }
   for (uint64_t i = m.imported_tables; i < m.tables.count(); ++i) {
     Table* t = new_table(m.tables[i], 0);
     if (!t || !inst.tables.push_back(t)) {
@@ -504,7 +567,7 @@ Status Machine::invoke(FuncInst& f, const Slot* args, Slot* results, const char*
       *trap = kTrapOutOfMemory;
       return Status::Trap;
     }
-    if (!store_.host() || !store_.host()->call(store_, f, base, tmp.data())) return Status::HostError;
+    if (!store_.host() || !store_.host()->call(store_, f, base, tmp.data())) return store_.has_pending_exception() ? Status::Exception : Status::HostError;
     for (uint32_t i = 0; i < nr; ++i) results[i] = tmp[i];
     return Status::Ok;
   }
@@ -553,6 +616,7 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
   Slot* const stack_end = stack_ + kStackSlots;
   uint32_t fuel = 4096;
   FuncInst* callee = nullptr;
+  ExnObj* ex = nullptr;   // the exception being thrown
   bool tail = false;
   Status result = Status::Trap;
 
@@ -650,6 +714,27 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
         if (callee->sig != inst->type_sigs[in.a]) TRAP(kTrapSignature);
         tail = in.op == 0x13;
         goto call_function;
+      }
+      case 0x08: {   // throw
+        Tag* tag = inst->tags[in.a];
+        const uint32_t n = tag->sig->nparams;
+        ex = store_.new_exception(tag, sp - n, n);
+        if (!ex) TRAP(kTrapOutOfMemory);
+        sp -= n;
+        goto throw_exception;
+      }
+      case 0x09: {   // rethrow: the exception a legacy catch block kept in its slot
+        const uint64_t r = fp[in.a].lo;
+        if (!r) TRAP(kTrapNullRef);
+        ex = exn_from_ref(r);
+        goto throw_exception;
+      }
+      case 0x0A: {   // throw_ref
+        const uint64_t r = sp[-1].lo;
+        --sp;
+        if (!r) TRAP(kTrapNullRef);
+        ex = exn_from_ref(r);
+        goto throw_exception;
       }
       case 0x1A: --sp; break;
       case 0x1B: {
@@ -1105,6 +1190,10 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
       sp_ = sp;
       frame->pc = pc;
       if (!store_.host() || !store_.host()->call(store_, *callee, sp - np, tmp.data())) {
+        if (store_.has_pending_exception()) {   // the host threw an exception that code in this call may catch
+          ex = store_.take_pending_exception();
+          goto throw_exception;
+        }
         result = Status::HostError;
         goto unwind;
       }
@@ -1138,6 +1227,70 @@ Status Machine::execute(uint32_t entry_depth, const char** trap) {
     base_pc = code->code.view().data();
     pc = base_pc;
     mem0 = inst->memories.count() ? inst->memories[0] : nullptr;
+    continue;
+  }
+
+  throw_exception: {
+    // Unwind to the innermost try_table or try that has a clause for the exception: this function's, then its callers'. `pc` is just past the instruction that threw
+    // or called (a call's return address is saved in its frame). A delegate clause narrows the search to the older handlers and starts it again.
+    uint64_t search = code->handlers.count();
+    for (;;) {
+      const uint64_t at = static_cast<uint64_t>(pc - base_pc) - 1;
+      bool caught = false, restart = false;
+      for (uint64_t h = search; h > 0 && !caught && !restart; --h) {
+        const Handler& handler = code->handlers[h - 1];
+        if (at < handler.start || at >= handler.end) continue;
+        for (uint32_t k = handler.first; k != 0xFFFFFFFFu; k = code->catches[k].next) {
+          const CatchClause& clause = code->catches[k];
+          if (clause.kind == CatchKind::Delegate) {
+            search = clause.tag;
+            restart = true;
+            break;
+          }
+          const bool any = clause.kind == CatchKind::CatchAll || clause.kind == CatchKind::CatchAllRef || clause.kind == CatchKind::LegacyCatchAll;
+          if (!any && (ex->tag == nullptr || ex->tag != inst->tags[clause.tag])) continue;
+          const BrTarget& target = code->targets[clause.target];
+          Slot* dest = fp + target.height;
+          Slot* put = dest;
+          const bool legacy = clause.kind == CatchKind::LegacyCatch || clause.kind == CatchKind::LegacyCatchAll;
+          if (legacy) {   // the exception itself first (if the block rethrows it), then its values
+            put->lo = clause.keep ? exn_ref(ex) : 0;
+            put->hi = 0;
+            ++put;
+          }
+          if (clause.kind == CatchKind::Catch || clause.kind == CatchKind::CatchRef || clause.kind == CatchKind::LegacyCatch)
+            for (const Slot& v : ex->values.view()) *put++ = v;
+          if (clause.kind == CatchKind::CatchRef || clause.kind == CatchKind::CatchAllRef) {
+            ex->referenced = true;
+            put->lo = exn_ref(ex);
+            put->hi = 0;
+            ++put;
+          } else if (legacy && clause.keep) {
+            ex->referenced = true;
+          } else {
+            store_.release_exception(ex);
+          }
+          sp = put;
+          pc = base_pc + target.pc;
+          caught = true;
+          break;
+        }
+      }
+      if (restart) continue;
+      if (caught) break;
+      if (--depth_ == entry_depth) {   // nobody in this call catches it
+        store_.set_pending_exception(ex);
+        return Status::Exception;
+      }
+      frame = &frames_[depth_ - 1];
+      code = frame->code;
+      inst = frame->inst;
+      fp = frame->fp;
+      base_pc = code->code.view().data();
+      pc = frame->pc;
+      mem0 = inst->memories.count() ? inst->memories[0] : nullptr;
+      search = code->handlers.count();
+    }
     continue;
   }
   }

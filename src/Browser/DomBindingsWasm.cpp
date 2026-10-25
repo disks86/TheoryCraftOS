@@ -37,11 +37,13 @@ using namespace script;
 
 struct WasmState final : wasm::IHost {
   explicit WasmState(script::Vm& v)
-      : vm(v), store(v.allocator()), modules(v.allocator()), instances(v.allocator()), mems(v.allocator()), tables(v.allocator()), globals(v.allocator()), funcs(v.allocator()) {
+      : vm(v), store(v.allocator()), modules(v.allocator()), instances(v.allocator()), mems(v.allocator()), tables(v.allocator()), globals(v.allocator()), funcs(v.allocator()), tags(v.allocator()),
+        exns(v.allocator()) {
     store.set_host(this);
     store.set_page_budget(1024);   // 64 MiB of linear memory in all
   }
   bool call(wasm::Store& s, wasm::FuncInst& function, const wasm::Slot* args, wasm::Slot* results) override;
+  bool call_script(wasm::FuncInst& function, const wasm::Slot* args, wasm::Slot* results);
   bool tick(uint64_t instructions) override { return vm.charge(instructions * 16); }
 
   script::Vm& vm;
@@ -52,6 +54,8 @@ struct WasmState final : wasm::IHost {
   List<wasm::Table*> tables;
   List<wasm::Global*> globals;
   List<wasm::FuncInst*> funcs;
+  List<wasm::Tag*> tags;
+  List<wasm::ExnObj*> exns;   // the exceptions script holds an object for
   JsObject *host_fns = nullptr, *func_objs = nullptr, *buffers = nullptr;   // arrays inside __wasm_roots
 };
 
@@ -134,6 +138,7 @@ bool type_from_text(StringView t, ValType* out) {
   else if (t.equals("v128")) *out = ValType::V128;
   else if (t.equals("anyfunc") || t.equals("funcref")) *out = ValType::FuncRef;
   else if (t.equals("externref")) *out = ValType::ExternRef;
+  else if (t.equals("exnref")) *out = ValType::ExnRef;
   else return false;
   return true;
 }
@@ -267,6 +272,7 @@ bool to_wasm(Vm& vm, WasmState& st, ValType t, const Value& v, Slot* out) {
       out->lo = wasm::func_ref(f);
       return true;
     }
+    case ValType::ExnRef: return vm.throw_error(ErrorKind::TypeError, "type incompatibility when transforming from/to JS");
     case ValType::ExternRef: {
       Value h;
       if (!call_global(vm, "__wasm_extern_in", v, &h)) return false;
@@ -286,6 +292,7 @@ bool to_js(Vm& vm, WasmState& st, ValType t, const Slot& s, Value* out) {
     case ValType::F64: *out = number(__builtin_bit_cast(double, s.lo)); return true;
     case ValType::V128: return vm.throw_error(ErrorKind::TypeError, "type incompatibility when transforming from/to JS");
     case ValType::FuncRef: *out = s.lo ? function_value(st, wasm::func_from_ref(s.lo)) : Value::make_null(); return true;
+    case ValType::ExnRef: return vm.throw_error(ErrorKind::TypeError, "type incompatibility when transforming from/to JS");
     case ValType::ExternRef: return call_global(vm, "__wasm_extern_out", number(static_cast<double>(s.lo)), out);
   }
   return false;
@@ -369,7 +376,45 @@ bool memory_resize(wasm::Memory& m, uint64_t new_size) {
 
 }  // namespace
 
+namespace {
+
+// The exception object script sees for an exception (the thing a script exception stands for if it came from script), and the other way round.
+bool exception_to_js(WasmState& st, wasm::ExnObj* e, Value* out) {
+  Vm& vm = st.vm;
+  if (!e->tag) return call_global(vm, "__wasm_extern_out", number(static_cast<double>(e->foreign)), out);
+  e->referenced = true;
+  if (e->host_id == 0) {
+    if (st.exns.count() >= kMaxHandles || !st.exns.push_back(e)) return vm.throw_error(ErrorKind::RangeError, "WebAssembly: too many exceptions");
+    e->host_id = static_cast<uint32_t>(st.exns.count());
+  }
+  return call_global(vm, "__wasm_exception_wrap", number(e->host_id), out);
+}
+
+wasm::ExnObj* exception_from_js(WasmState& st, const Value& v) {
+  Vm& vm = st.vm;
+  uint32_t h;
+  if (wrapper_handle(vm, v, "exception", &h) && h >= 1 && h <= st.exns.count()) return st.exns[h - 1];
+  Value handle;
+  if (!call_global(vm, "__wasm_extern_in", v, &handle) || !handle.is_number()) return nullptr;
+  return st.store.new_foreign_exception(static_cast<uint64_t>(handle.u.number));
+}
+
+}  // namespace
+
+// A call out to script. What the script throws goes into the store as an exception, which code that called us can catch with catch_all (a script exception) or with
+// the tag (a WebAssembly.Exception); one that nothing catches is thrown again, the same value, where the outermost call came from.
 bool WasmState::call(wasm::Store&, wasm::FuncInst& function, const Slot* args, Slot* results) {
+  if (call_script(function, args, results)) return true;
+  if (vm.halted() || !vm.has_exception()) return false;
+  Value thrown;
+  vm.take_exception_value(&thrown);
+  wasm::ExnObj* e = exception_from_js(*this, thrown);
+  if (!e) return vm.throw_value(thrown);
+  store.set_pending_exception(e);
+  return false;
+}
+
+bool WasmState::call_script(wasm::FuncInst& function, const Slot* args, Slot* results) {
   const wasm::FuncSig& sig = *function.sig;
   Value fn;
   if (!array_get(vm, host_fns, function.host_id - 1, &fn) || !Vm::is_callable(fn)) return vm.throw_error(ErrorKind::TypeError, "imported function is not callable");
@@ -399,6 +444,14 @@ bool WasmState::call(wasm::Store&, wasm::FuncInst& function, const Slot* args, S
 namespace {
 
 // The exported function object: this native with the registry number of its function in items[0].
+// Throws the exception that left a call (see Status::Exception) as the script value it stands for.
+bool throw_pending(WasmState& st) {
+  wasm::ExnObj* e = st.store.take_pending_exception();
+  Value v;
+  if (!e || !exception_to_js(st, e, &v)) return false;
+  return st.vm.throw_value(v);
+}
+
 NATIVE(wasm_function_call) {
   (void)self;
   WasmState& st = state(vm);
@@ -413,6 +466,7 @@ NATIVE(wasm_function_call) {
   const char* trap = nullptr;
   const wasm::Status status = st.store.invoke(*f, in.data(), out.data(), &trap);
   if (status == wasm::Status::HostError) return false;
+  if (status == wasm::Status::Exception) return throw_pending(st);
   if (status == wasm::Status::Trap) return throw_trap(vm, trap ? trap : "trap");
   if (sig.nresults == 0) {
     *result = Value();
@@ -478,6 +532,7 @@ const char* kind_text(wasm::ExternKind k) {
     case wasm::ExternKind::Table: return "table";
     case wasm::ExternKind::Memory: return "memory";
     case wasm::ExternKind::Global: return "global";
+    case wasm::ExternKind::Tag: return "tag";
   }
   return "";
 }
@@ -581,6 +636,15 @@ bool resolve_import(Vm& vm, WasmState& st, const wasm::Module& m, const wasm::Im
       out->ptr = st.mems[h - 1];
       return true;
     }
+    case wasm::ExternKind::Tag: {
+      uint32_t h;
+      if (!wrapper_handle(vm, v, "tag", &h) || h > st.tags.count()) {
+        *why = "tag import requires a WebAssembly.Tag";
+        return true;
+      }
+      out->ptr = st.tags[h - 1];
+      return true;
+    }
     case wasm::ExternKind::Global: {
       uint32_t h;
       if (wrapper_handle(vm, v, "global", &h) && h <= st.globals.count()) {
@@ -648,6 +712,7 @@ NATIVE(wasm_instantiate) {
   wasm::Status status = wasm::Status::Ok;
   if (!st.store.instantiate(m, ArrayView<const wasm::ExternVal>(resolved.view().data(), resolved.count()), &inst, &error, &link, &status)) {
     if (status == wasm::Status::HostError) return false;
+    if (status == wasm::Status::Exception) return throw_pending(st);
     String message(vm.allocator());
     with_api(&message, api, vm, error.view());
     if (link) return throw_wasm(vm, "LinkError", message.view());
@@ -678,6 +743,7 @@ NATIVE(wasm_instance_exports) {
       case wasm::ExternKind::Table: v = number(handle_for(st.tables, static_cast<wasm::Table*>(ev.ptr))); break;
       case wasm::ExternKind::Memory: v = number(handle_for(st.mems, static_cast<wasm::Memory*>(ev.ptr))); break;
       case wasm::ExternKind::Global: v = number(handle_for(st.globals, static_cast<wasm::Global*>(ev.ptr))); break;
+      case wasm::ExternKind::Tag: v = number(handle_for(st.tags, static_cast<wasm::Tag*>(ev.ptr))); break;
     }
     JsObject* row = vm.new_array();
     vm.array_push(row, str_value(vm, e.name.view()));
@@ -924,6 +990,100 @@ NATIVE(wasm_table_type) {
   return true;
 }
 
+// --- Tag and Exception ---------------------------------------------------------------------------------------------------------------------------
+
+// __wasm_tag_new(types): types is an array of the names of the value types a tag carries
+NATIVE(wasm_tag_new) {
+  (void)self;
+  WasmState& st = state(vm);
+  const Value list = arg_at(args, argc, 0);
+  if (!list.is_object()) return vm.throw_error(ErrorKind::TypeError, "WebAssembly.Tag(): Argument 0 must be a tag type with 'parameters'");
+  JsObject* items = vm.new_array();
+  if (!vm.iterate_into(items, list, -1)) return false;
+  if (items->length > wasm::kMaxParams) return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Tag(): too many parameters");
+  wasm::FuncSig sig(vm.allocator());
+  if (!sig.init(items->length, 0)) return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Tag(): out of memory");
+  for (uint32_t i = 0; i < items->length; ++i) {
+    Value item;
+    String text(vm.allocator());
+    ValType t;
+    if (!array_get(vm, items, i, &item) || !arg_text(vm, item, &text)) return false;
+    if (!type_from_text(text.view(), &t) || t == ValType::V128 || t == ValType::ExnRef) return vm.throw_error(ErrorKind::TypeError, "WebAssembly.Tag(): Argument 0 parameter type at index #0 must be a value type");
+    sig.params[i] = t;
+  }
+  const wasm::FuncSig* interned = st.store.intern_sig(sig);
+  wasm::Tag* tag = interned ? st.store.new_tag(interned) : nullptr;
+  if (!tag) return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Tag(): out of memory");
+  *result = number(handle_for(st.tags, tag));
+  return true;
+}
+
+bool tag_arg(Vm& vm, WasmState& st, const Value* args, uint32_t argc, uint32_t i, wasm::Tag** out) {
+  double d;
+  if (!vm.to_number(arg_at(args, argc, i), &d)) return false;
+  if (!(d >= 1) || d > static_cast<double>(st.tags.count())) return vm.throw_error(ErrorKind::TypeError, "Argument 0 must be a WebAssembly.Tag");
+  *out = st.tags[static_cast<uint64_t>(d) - 1];
+  return true;
+}
+
+// __wasm_exception_new(tag, values): the registry number of a new exception
+NATIVE(wasm_exception_new) {
+  (void)self;
+  WasmState& st = state(vm);
+  wasm::Tag* tag;
+  if (!tag_arg(vm, st, args, argc, 0, &tag)) return false;
+  JsObject* items = vm.new_array();
+  if (!vm.iterate_into(items, arg_at(args, argc, 1), -1)) return false;
+  if (items->length != tag->sig->nparams) return vm.throw_error(ErrorKind::TypeError, "WebAssembly.Exception(): Number of exception values does not match signature length");
+  wasm::SmallArray<Slot, 8> values(vm.allocator(), items->length);
+  if (!values.ok()) return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Exception(): out of memory");
+  for (uint32_t i = 0; i < items->length; ++i) {
+    Value item;
+    if (!array_get(vm, items, i, &item) || !to_wasm(vm, st, tag->sig->params[i], item, &values[i])) return false;
+  }
+  wasm::ExnObj* e = st.store.new_exception(tag, values.data(), items->length);
+  if (!e) return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Exception(): out of memory");
+  e->referenced = true;
+  if (st.exns.count() >= kMaxHandles || !st.exns.push_back(e)) return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Exception(): too many exceptions");
+  e->host_id = static_cast<uint32_t>(st.exns.count());
+  *result = number(e->host_id);
+  return true;
+}
+
+bool exception_arg(Vm& vm, WasmState& st, const Value* args, uint32_t argc, wasm::ExnObj** out) {
+  double d;
+  if (!vm.to_number(arg_at(args, argc, 0), &d)) return false;
+  if (!(d >= 1) || d > static_cast<double>(st.exns.count())) return vm.throw_error(ErrorKind::TypeError, "Receiver is not a WebAssembly.Exception");
+  *out = st.exns[static_cast<uint64_t>(d) - 1];
+  return true;
+}
+
+// __wasm_exception_is(exception, tag)
+NATIVE(wasm_exception_is) {
+  (void)self;
+  WasmState& st = state(vm);
+  wasm::ExnObj* e;
+  wasm::Tag* tag;
+  if (!exception_arg(vm, st, args, argc, &e) || !tag_arg(vm, st, args, argc, 1, &tag)) return false;
+  *result = bool_value(e->tag == tag);
+  return true;
+}
+
+// __wasm_exception_get(exception, tag, index)
+NATIVE(wasm_exception_get) {
+  (void)self;
+  WasmState& st = state(vm);
+  wasm::ExnObj* e;
+  wasm::Tag* tag;
+  if (!exception_arg(vm, st, args, argc, &e) || !tag_arg(vm, st, args, argc, 1, &tag)) return false;
+  if (e->tag != tag) return vm.throw_error(ErrorKind::TypeError, "WebAssembly.Exception.getArg(): First argument does not match the exception tag");
+  double d;
+  if (!vm.to_number(arg_at(args, argc, 2), &d)) return false;
+  if (!(d >= 0) || d != static_cast<double>(static_cast<uint32_t>(d)) || d >= static_cast<double>(e->values.count()))
+    return vm.throw_error(ErrorKind::RangeError, "WebAssembly.Exception.getArg(): Index out of range");
+  return to_js(vm, st, tag->sig->params[static_cast<uint32_t>(d)], e->values[static_cast<uint64_t>(d)], result);
+}
+
 // __wasm_is_function(value)
 NATIVE(wasm_is_function) {
   (void)self;
@@ -970,6 +1130,10 @@ UniquePointer<WasmState> install_wasm_natives(Vm& vm) {
   vm.define_native(g, "__wasm_global_set", wasm_global_set, 2);
   vm.define_native(g, "__wasm_global_type", wasm_global_type, 1);
   vm.define_native(g, "__wasm_is_function", wasm_is_function, 1);
+  vm.define_native(g, "__wasm_tag_new", wasm_tag_new, 1);
+  vm.define_native(g, "__wasm_exception_new", wasm_exception_new, 2);
+  vm.define_native(g, "__wasm_exception_is", wasm_exception_is, 2);
+  vm.define_native(g, "__wasm_exception_get", wasm_exception_get, 3);
   if (vm.halted()) return UniquePointer<WasmState>();
   return owned;
 }

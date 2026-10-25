@@ -11,7 +11,7 @@
 'use strict';
 
 const out = [];
-const I32 = 0x7f, I64 = 0x7e, F32 = 0x7d, F64 = 0x7c, V128 = 0x7b, FUNCREF = 0x70, EXTERNREF = 0x6f;
+const I32 = 0x7f, I64 = 0x7e, F32 = 0x7d, F64 = 0x7c, V128 = 0x7b, FUNCREF = 0x70, EXTERNREF = 0x6f, EXNREF = 0x69;
 
 // --- an assembler -----------------------------------------------------------------------------------------------------------------
 const u32 = (n) => { const b = []; n = BigInt(n); do { let x = Number(n & 0x7fn); n >>= 7n; if (n) x |= 0x80; b.push(x); } while (n); return b; };
@@ -41,6 +41,16 @@ const fc = (n, ...imm) => [0xfc, ...u32(n), ...imm.flat(Infinity)];
 const simd = (n, ...imm) => [0xfd, ...u32(n), ...imm.flat(Infinity)];
 const vconst = (lo, hi) => { const b = []; for (const w of [lo, hi]) { let x = BigInt.asUintN(64, BigInt(w)); for (let i = 0; i < 8; i++) { b.push(Number(x & 0xffn)); x >>= 8n; } } return simd(12, b); };
 
+// exception handling: throw, throw_ref, try_table with its catch clauses
+const throwOp = (tag) => [0x08, ...u32(tag)], throwRef = [0x0a];
+const cth = (tag, l) => [0, ...u32(tag), ...u32(l)], cthRef = (tag, l) => [1, ...u32(tag), ...u32(l)], cthAll = (l) => [2, ...u32(l)], cthAllRef = (l) => [3, ...u32(l)];
+// the legacy forms: try ... catch tag ... catch_all ... end / delegate / rethrow
+const tryOp = (t, ...parts) => [0x06, ...bt(t), ...parts.flat(Infinity), END];
+const catchOp = (tag, ...body) => [0x07, ...u32(tag), ...body.flat(Infinity)], catchAllOp = (...body) => [0x19, ...body.flat(Infinity)];
+const tryDelegate = (t, label, ...body) => [0x06, ...bt(t), ...body.flat(Infinity), 0x18, ...u32(label)];
+const rethrow = (l) => [0x09, ...u32(l)];
+const tryTable = (t, catches, ...body) => [0x1f, ...bt(t), ...u32(catches.length), ...catches.flat(Infinity), ...body.flat(Infinity), END];
+
 function limits(min, max, shared) { return max === undefined ? [0, ...u32(min)] : [shared ? 3 : 1, ...u32(min), ...u32(max)]; }
 
 // spec: {types: [[params],[results]], imports: [[mod,name,kind,desc]], funcs: [{type, locals:[[n,t]], body}], tables: [[reftype, min, max]], mems: [[min,max]], globals: [[type, mut, initbytes]],
@@ -54,6 +64,7 @@ function module(spec) {
   if (funcs.length) m.push(...section(3, vec(funcs.map((f) => u32(f.type)))));
   if (spec.tables) m.push(...section(4, vec(spec.tables.map(([t, min, max]) => [t, ...limits(min, max)]))));
   if (spec.mems) m.push(...section(5, vec(spec.mems.map(([min, max]) => limits(min, max)))));
+  if (spec.tags) m.push(...section(13, vec(spec.tags.map((t) => [0, ...u32(t)]))));
   if (spec.globals) m.push(...section(6, vec(spec.globals.map(([t, mut, init]) => [t, mut, ...init, END]))));
   if (spec.exports) m.push(...section(7, vec(spec.exports.map(([n, k, i]) => [...str(n), k, ...u32(i)]))));
   if (spec.start !== undefined) m.push(...section(8, u32(spec.start)));
@@ -85,7 +96,8 @@ function emitCall(inst, name, ptypes, rtypes, args) {
     else if (rtypes.length === 1) r = [r];
     for (let i = 0; i < rtypes.length; i++) line += ' ' + tok(rtypes[i], r[i]);
   } catch (e) {
-    if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) line += ' trap';
+    if (e instanceof WebAssembly.Exception) line += ' exception';
+    else if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) line += ' trap';
     else throw e;
   }
   out.push(line);
@@ -212,6 +224,136 @@ function controlTests() {
     ['early', [I32], [I32], [[7]]],
     ['brif', [I32], [I32], [[0], [1], [9]]],
   ]);
+}
+
+
+// --- 2b. exception handling
+function exceptionTests() {
+  // tags: 0 (i32), 1 (i32, i64, f32, f64), 2 (), 3 (i32)  -- 3 is a different tag with the same type
+  const types = [[[I32], []], [[I32, I64, F32, F64], []], [[], []], [[I32], [I32]], [[I32, I32], [I32]], [[I32], [EXNREF]], [[EXNREF], [I32]], [[F64], [F64]], [[I32, I64, F32, F64], [I32, I64, F32, F64]], [[], [I64]], [[], [I32, EXNREF]], [[], [I32, I64, F32, F64]]];
+  const funcs = [
+    { type: 0, body: [lget(0), throwOp(0)] },                                                                      // 0: throw0(x)
+    { type: 0, body: [lget(0), throwOp(3)] },                                                                      // 1: throw3(x)
+    // 2: catch0(x): returns the payload if throw0(x) throws, else 100; x == 0 does not throw
+    { type: 3, body: [block(I32, tryTable(I32, [cth(0, 0)], lget(0), [0x04, 0x40, lget(0), call(0), END], i32c(100)))] },
+    // 3: all(x): catch_all
+    { type: 3, body: [block(undefined, tryTable(undefined, [cthAll(0)], lget(0), call(0)), i32c(1), [0x0f]), i32c(2)] },
+    // 4: wrongTag(x): throw3 caught by a catch of tag 0 only: not caught here
+    { type: 3, body: [block(I32, tryTable(I32, [cth(0, 0)], lget(0), call(1), i32c(7)))] },
+    // 5: nested(x): the inner try_table catches tag 0, the outer catches tag 3; throws tag 3
+    { type: 3, body: [block(I32, block(I32, tryTable(I32, [cth(3, 1)], tryTable(I32, [cth(0, 0)], lget(0), call(1), i32c(5)))), i32c(1000), [0x6a], [0x0f]), i32c(2000), [0x6a]] },
+    // 6: ref(x): catch_ref then throw_ref the exnref out again
+    { type: 3, body: [block(I32, tryTable(I32, [], block(EXNREF, tryTable(undefined, [cthRef(0, 0)], lget(0), call(0)), i32c(9), [0x0f]), throwRef))] },
+    // 7: catchref/rethrow caught outside: f(x): outer catches payload of the rethrown exception
+    { type: 3, body: [block(I32, tryTable(I32, [cth(0, 0)], block(I32, EXNREF, ...[]).slice(0, 0), block(EXNREF, tryTable(undefined, [cthRef(0, 0)], lget(0), call(0)), i32c(5), [0x0f]), throwRef))] },
+    // 8: catch_all_ref
+    { type: 3, body: [block(I32, tryTable(I32, [cth(0, 0)], block(EXNREF, tryTable(undefined, [cthAllRef(0)], lget(0), call(0)), i32c(5), [0x0f]), throwRef))] },
+    // 9: deep(x): recursion that throws at the bottom, a catch at the top
+    { type: 3, body: [lget(0), [0x45], iff(I32, [i32c(77), throwOp(0), i32c(0)], [lget(0), i32c(1), [0x6b], call(9), i32c(1), [0x6a]])] },
+    { type: 3, body: [block(I32, tryTable(I32, [cth(0, 0)], lget(0), call(9)))] },                                   // 10: top(x) = 77 or throws... deep(x) never returns normally
+    // 11: loop that throws on iteration x and is caught; the sum of the iterations that finished is returned in the payload
+    { type: 3, locals: [[2, I32]], body: [block(I32, tryTable(I32, [cth(0, 0)], loop(undefined, lget(1), lget(0), [0x48], iff(undefined, [lget(2), lget(1), [0x6a], lset(2), lget(1), i32c(1), [0x6a], lset(1), br(1)])), lget(2), throwOp(0), i32c(0)))] },
+    // 12: uncaught
+    { type: 0, body: [lget(0), call(0)] },
+    // 13: payload with all four types, caught and returned
+    { type: 8, body: [block(I32, I64, F32, F64, ...[]).slice(0, 0), lget(0), lget(1), lget(2), lget(3), throwOp(1)] },
+    // 14: throw_ref of null traps
+    { type: 9, body: [[0xd0, EXNREF], throwRef] },
+    // 15: a catch_all that is not reached because the body does not throw, result of the body
+    { type: 3, body: [block(undefined, tryTable(undefined, [cthAll(0)], lget(0), [0x1a])), lget(0), i32c(1), [0x6a]] },
+    // 16: try_table with a parameter: (i32)->(i32)
+    { type: 3, body: [lget(0), tryTable({ type: 3 }, [], i32c(2), [0x6a])] },
+    // 17: the exception passes a function with locals that is not a catcher, then is caught in the caller; locals survive
+    { type: 3, locals: [[1, I32]], body: [lget(0), i32c(3), [0x6a], lset(1), block(I32, tryTable(I32, [cth(0, 0)], lget(0), call(0), i32c(0))), lget(1), [0x6a]] },
+  ];
+  // function 13 returns nothing useful: rebuild it to catch the payload of tag 1 and return it as four results
+  funcs[13] = { type: 8, body: [block({ type: 11 }, tryTable(undefined, [cth(1, 0)], lget(0), lget(1), lget(2), lget(3), throwOp(1)), i32c(0), i64c(0), f32c(0), f64c(0))] };
+  // catch_ref (payload and exnref), the exnref thrown again: caught outside by tag 0 (6), by catch_all (7); catch_all_ref then caught by tag 0 (8)
+  funcs[6] = { type: 3, body: [block(I32, tryTable(I32, [cth(0, 0)], block({ type: 10 }, tryTable(undefined, [cthRef(0, 0)], lget(0), call(0)), [0x00]), throwRef))] };
+  funcs[7] = { type: 3, body: [block(I32, block(undefined, tryTable(undefined, [cthAll(0)], block({ type: 10 }, tryTable(undefined, [cthRef(0, 0)], lget(0), call(0)), [0x00]), throwRef)), i32c(55))] };
+  funcs[8] = { type: 3, body: [block(I32, tryTable(I32, [cth(0, 0)], block(EXNREF, tryTable(undefined, [cthAllRef(0)], lget(0), call(0)), [0x00]), throwRef))] };
+  const exports = ['throw0', 'throw3', 'catch0', 'all', 'wrongTag', 'nested', 'ref', 'rethrow', 'allref', 'deep', 'top', 'loop', 'uncaught', 'payload', 'nullref', 'nothrow', 'param', 'locals'].map((n, i) => [n, 0, i]);
+  const inst = emitModule(module({ types, tags: [0, 1, 2, 0], funcs, exports }));
+  const one = (name, args) => emitCall(inst, name, args.map(() => I32), [I32], args);
+  for (const x of [0, 1, 5, -3]) one('catch0', [x]);
+  for (const x of [0, 1, 9]) one('all', [x]);
+  for (const x of [1, 3]) one('wrongTag', [x]);
+  for (const x of [1, 4]) one('nested', [x]);
+  for (const x of [0, 4]) { one('ref', [x]); one('rethrow', [x]); one('allref', [x]); }
+  for (const x of [0, 1, 6]) { one('top', [x]); one('deep', [x]); }
+  for (const x of [0, 1, 4, 10]) one('loop', [x]);
+  one('uncaught', [3]);
+  emitCall(inst, 'payload', [I32, I64, F32, F64], [I32, I64, F32, F64], [7, 1234567890123n, 1.5, -2.25]);
+  emitCall(inst, 'nullref', [], [I64], []);
+  for (const x of [0, 5]) { one('nothrow', [x]); one('param', [x]); }
+  one('locals', [4]);
+  one('throw0', [1]);
+  // after an exception left a call the instance is still usable
+  one('catch0', [2]);
+  // the same through a table and call_indirect, and a catch in a callee (not the caller)
+  const inst2 = emitModule(module({
+    types: [[[I32], []], [[I32], [I32]]], tags: [0],
+    funcs: [
+      { type: 0, body: [lget(0), throwOp(0)] },
+      { type: 1, body: [block(I32, tryTable(I32, [cth(0, 0)], lget(0), lget(0), [0x11, 0, 0], i32c(0)))] },     // 1: catches what call_indirect(throw) raises
+      { type: 1, body: [lget(0), call(1), i32c(1), [0x6a]] },
+    ],
+    tables: [[FUNCREF, 1]], elems: [[0, i32c(0), END, vec([u32(0)])]],
+    exports: [['viaTable', 0, 1], ['caller', 0, 2]],
+  }));
+  for (const x of [5, 0]) { emitCall(inst2, 'viaTable', [I32], [I32], [x]); emitCall(inst2, 'caller', [I32], [I32], [x]); }
+}
+
+
+// --- 2c. the legacy exception handling instructions
+function legacyTests() {
+  const types = [[[I32], []], [[I32, I64, F32, F64], []], [[], []], [[I32], [I32]], [[], [I32, I64, F32, F64]], [[I32, I64, F32, F64], [I32, I64, F32, F64]]];
+  const funcs = [
+    { type: 0, body: [lget(0), throwOp(0)] },                                                       // 0: throw0
+    { type: 0, body: [lget(0), throwOp(3)] },                                                       // 1: throw3
+    // 2: catch0(x): payload + 1 when x != 0 throws, else 100
+    { type: 3, body: [tryOp(I32, lget(0), [0x04, 0x40, lget(0), call(0), END], i32c(100), catchOp(0, i32c(1), [0x6a]))] },
+    // 3: catchAll(x)
+    { type: 3, body: [tryOp(I32, lget(0), call(0), i32c(1), catchAllOp(i32c(2)))] },
+    // 4: two catches: tag 0 adds 10, tag 3 adds 20
+    { type: 3, body: [tryOp(I32, lget(0), [0x04, 0x40, lget(0), i32c(1), [0x6a], call(1), END], lget(0), call(0), i32c(0), catchOp(0, i32c(10), [0x6a]), catchOp(3, i32c(20), [0x6a]))] },
+    // 5: rethrow: the inner catch rethrows, the outer catches it with its payload
+    { type: 3, body: [tryOp(I32, tryOp(I32, lget(0), call(0), i32c(0), catchOp(0, [0x1a], rethrow(0))), catchOp(0, i32c(1000), [0x6a]))] },
+    // 6: rethrow into a catch_all
+    { type: 3, body: [tryOp(I32, tryOp(I32, lget(0), call(0), i32c(0), catchOp(0, [0x1a], rethrow(0))), catchAllOp(i32c(55)))] },
+    // 7: delegate to the enclosing try (it catches)
+    { type: 3, body: [tryOp(I32, tryDelegate(I32, 0, lget(0), call(0), i32c(0)), catchOp(0, i32c(1), [0x6a]))] },
+    // 8: delegate that skips a try: C delegates to A, so B's catch (which gives 5) is skipped
+    { type: 3, body: [tryOp(I32, tryOp(I32, tryDelegate(I32, 1, lget(0), call(0), i32c(0)), catchOp(0, [0x1a], i32c(5))), catchOp(0, i32c(2), [0x6c]))] },
+    // 9: delegate to the function: nobody in the function catches it
+    { type: 3, body: [tryDelegate(I32, 1, lget(0), call(0), i32c(0))].slice(0, 0).concat([tryOp(I32, tryDelegate(I32, 1, lget(0), call(0), i32c(0)), catchOp(0, [0x1a], i32c(5)))].slice(0, 0)).concat([tryDelegate(I32, 0, lget(0), call(0), i32c(0))]) },
+    // 10: br out of a catch block with a value
+    { type: 3, body: [block(I32, tryOp(undefined, lget(0), call(0), catchAllOp(i32c(7), br(2))), i32c(8))] },
+    // 11: an exception thrown in a catch block goes to the outer handler
+    { type: 3, body: [tryOp(I32, tryOp(I32, lget(0), call(0), i32c(0), catchOp(0, [0x1a], lget(0), call(1), i32c(0))), catchOp(3, i32c(300), [0x6a]))] },
+    // 12: the payload of all four types stays on the stack as the results
+    { type: 5, body: [tryOp({ type: 4 }, lget(0), lget(1), lget(2), lget(3), throwOp(1), catchOp(1))] },
+    // 13: through a call; the callee has the catch and rethrows after cleanup (a catch_all that rethrows)
+    { type: 3, body: [tryOp(I32, lget(0), call(14), catchOp(0, i32c(7), [0x6a]))] },
+    { type: 3, body: [tryOp(I32, lget(0), call(0), i32c(0), catchAllOp(rethrow(0)))] },               // 14
+    // 15: rethrow twice in nested catch blocks (the label picks which exception)
+    { type: 3, body: [tryOp(I32, tryOp(I32, tryOp(I32, lget(0), call(0), i32c(0), catchOp(0, [0x1a], i32c(9), call(1), i32c(0))), catchOp(3, [0x1a], rethrow(0))), catchOp(3, i32c(2000), [0x6a]))] },
+    // 18: loop with a catch inside; counts how many throws it caught
+    { type: 3, locals: [[2, I32]], body: [loop(undefined, lget(1), lget(0), [0x48], iff(undefined, [tryOp(undefined, lget(1), call(0), catchOp(0, [0x1a], lget(2), i32c(1), [0x6a], lset(2))), lget(1), i32c(1), [0x6a], lset(1), br(1)])), lget(2)] },
+  ];
+  funcs[9] = { type: 3, body: [tryDelegate(I32, 0, lget(0), call(0), i32c(0))] };
+  const names = ['throw0', 'throw3', 'catch0', 'all', 'two', 'rethrow', 'rethrowAll', 'delegate1', 'delegateSkip', 'delegateOut', 'brOut', 'inCatch', 'payload', 'viaCall', 'cleanup', 'nestedRethrow', 'loopCount'];
+  const exports = names.map((n, i) => [n, 0, i]);
+  const inst = emitModule(module({ types, tags: [0, 1, 2, 0], funcs, exports }));
+  const one = (name, xs) => emitCall(inst, name, xs.map(() => I32), [I32], xs);
+  for (const x of [0, 1, 5, -3]) one('catch0', [x]);
+  for (const x of [0, 1, 9]) one('all', [x]);
+  for (const x of [0, 1, 2, 5]) one('two', [x]);
+  for (const n of ['rethrow', 'rethrowAll', 'delegate1', 'delegateSkip', 'delegateOut', 'brOut', 'inCatch', 'viaCall', 'nestedRethrow']) for (const x of [0, 1, 6]) one(n, [x]);
+  for (const x of [0, 3, 8]) one('loopCount', [x]);
+  emitCall(inst, 'payload', [I32, I64, F32, F64], [I32, I64, F32, F64], [7, 1234567890123n, 1.5, -2.25]);
+  // legacy and the new instructions in different functions
+  one('catch0', [2]);
 }
 
 function memoryTests() {
@@ -527,6 +669,30 @@ function invalidTests() {
   bad({ types: [[[I32], []]], funcs: [{ type: 0, body: [] }], start: 0 });                              // start with params
   bad({ types: [[[], []]], funcs: [{ type: 0, body: [] }], mems: [[2, 1]] });                           // min > max
   bad({ types: [[[], []]], funcs: [{ type: 0, body: [fc(8, 0, 0)] }], mems: [[1]] });                   // memory.init without datacount
+  const eh = (extra) => Object.assign({ types: [[[I32], []], [[], []], [[], [I32]]], tags: [0], funcs: [{ type: 1, body: [] }] }, extra);
+  bad(eh({ funcs: [{ type: 1, body: [throwOp(0)] }] }));                                                  // missing operand
+  bad(eh({ funcs: [{ type: 1, body: [i64c(1), throwOp(0)] }] }));                                         // wrong operand
+  bad(eh({ funcs: [{ type: 1, body: [throwOp(5)] }] }));                                                  // unknown tag
+  bad(eh({ funcs: [{ type: 1, body: [i32c(0), throwRef] }] }));                                           // throw_ref of an i32
+  bad(eh({ tags: [2] }));                                                                                  // tag type with results
+  bad(eh({ funcs: [{ type: 1, body: [block(undefined, tryTable(undefined, [cth(0, 0)], []))] }] }));       // label has no i32
+  bad(eh({ funcs: [{ type: 1, body: [block(undefined, tryTable(undefined, [cthAll(3)], []))] }] }));       // unknown label
+  bad(eh({ funcs: [{ type: 1, body: [block(undefined, tryTable(undefined, [cth(4, 0)], []))] }] }));       // unknown tag in a clause
+  bad(eh({ funcs: [{ type: 1, body: [block(EXNREF, tryTable(undefined, [cthAll(0)], []))] }] }));         // catch_all gives nothing
+  bad(eh({ funcs: [{ type: 1, body: [rethrow(0)] }] }));                                                    // rethrow outside a catch
+  bad(eh({ funcs: [{ type: 1, body: [catchAllOp()] }] }));                                                  // catch without try
+  bad(eh({ funcs: [{ type: 1, body: [tryOp(undefined, catchAllOp(), catchOp(0, [0x1a]))] }] }));          // catch after catch_all
+  bad(eh({ funcs: [{ type: 1, body: [tryOp(undefined, catchOp(0))] }] }));                                  // catch body lacks the payload to drop? leaves it
+  bad(eh({ funcs: [{ type: 1, body: [tryOp(undefined, catchAllOp(), 0x18, 0)] }] }));                       // delegate after a catch
+  bad(eh({ funcs: [{ type: 1, body: [tryDelegate(undefined, 5)] }] }));                                     // unknown label
+  bad(eh({ funcs: [{ type: 1, body: [block(undefined, rethrow(0))] }] }));                                  // rethrow of a plain block
+  bad(eh({ funcs: [{ type: 1, body: [tryOp(I32, i32c(1), catchOp(0))] }] }));                                // catch gives an i32 for the i32 result: valid? payload i32 result
+  good(eh({ funcs: [{ type: 1, body: [tryOp(undefined, catchOp(0, [0x1a]), catchAllOp(rethrow(0)))] }] }));
+  good(eh({ funcs: [{ type: 1, body: [block(undefined, tryDelegate(undefined, 0))] }] }));
+  bad(eh({ funcs: [{ type: 1, body: [block(undefined, tryTable(undefined, [cthAll(0)], [])), tryOp(undefined, catchAllOp())] }] }));   // legacy and new in one module
+  good(eh({ funcs: [{ type: 1, body: [block(I32, tryTable(I32, [cth(0, 0)], i32c(1))), [0x1a]] }] }));
+  good(eh({ funcs: [{ type: 1, body: [i32c(1), throwOp(0)] }] }));
+  good(eh({ funcs: [{ type: 1, body: [block(EXNREF, tryTable(EXNREF, [cthAllRef(0)], [0xd0, EXNREF])), [0x1a]] }] }));
   good(fn([[[], []]], [[0x00], [0x6a], [0x0b].slice(0, 0)].slice(0, 1)));        // unreachable is fine
   good(fn([[[], [I32]]], [[0x00], [0x6a]]));                              // polymorphic stack
   good(fn([[[], [I32]]], [block(I32, i32c(1), br(0), [0x6a])]));
@@ -560,6 +726,8 @@ function mutations() {
 
 numericTests();
 controlTests();
+exceptionTests();
+legacyTests();
 memoryTests();
 tableTests();
 globalTests();

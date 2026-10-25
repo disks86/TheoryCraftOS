@@ -37,6 +37,7 @@ constexpr const char* kTrapSegment = "out of bounds";
 constexpr const char* kTrapDataSegment = "data segment out of bounds";
 constexpr const char* kTrapElemSegment = "element segment out of bounds";
 constexpr const char* kTrapOutOfMemory = "out of memory";
+constexpr const char* kTrapNullRef = "null reference";
 
 // Runs the SIMD operation `sub` (0xFD sub-opcode) on the stack whose top is `sp` (advanced or retreated as the operation pushes and pops). `*extra` is how many
 // instructions after `in` it consumed (a 128 bit constant or shuffle has its upper half in the next one). Returns a trap message or null.

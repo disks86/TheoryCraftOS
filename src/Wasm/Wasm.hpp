@@ -18,8 +18,8 @@
 
 // A WebAssembly runtime that does not know about the script engine: the binary decoder and validator (Module::parse), instantiation with linking (Store::instantiate)
 // and an interpreter (Store::invoke). Supported: the 1.0 core, sign extension, saturating float conversions, multi-value, reference types, bulk memory and tables,
-// fixed-width and relaxed SIMD, tail calls, extended constants and multiple memories. Not supported: threads and atomics, exception handling, garbage collection
-// types, 64-bit memories (a module that uses them fails to validate).
+// fixed-width and relaxed SIMD, tail calls, extended constants, multiple memories and exception handling (tags, throw, throw_ref, try_table and the legacy try / catch
+// / catch_all / rethrow / delegate). Not supported: threads and atomics, garbage collection types, 64-bit memories (a module that uses them fails to validate).
 //
 // Function bodies are checked and translated in one pass into a flat instruction array with resolved branch targets (see Instr), which the interpreter runs over a
 // stack of 16 byte slots. Everything a Store makes (modules, memories, tables, globals, functions, instances) lives until the Store does.
@@ -36,9 +36,9 @@
 
 namespace wasm {
 
-enum class ValType : uint8_t { I32 = 0x7F, I64 = 0x7E, F32 = 0x7D, F64 = 0x7C, V128 = 0x7B, FuncRef = 0x70, ExternRef = 0x6F };
+enum class ValType : uint8_t { I32 = 0x7F, I64 = 0x7E, F32 = 0x7D, F64 = 0x7C, V128 = 0x7B, FuncRef = 0x70, ExternRef = 0x6F, ExnRef = 0x69 };
 
-inline bool is_ref_type(ValType t) { return t == ValType::FuncRef || t == ValType::ExternRef; }
+inline bool is_ref_type(ValType t) { return t == ValType::FuncRef || t == ValType::ExternRef || t == ValType::ExnRef; }
 
 // One value on the operand stack. i32 / f32 are in the low 32 bits of `lo`, i64 / f64 in `lo`, a v128 in both halves (lane 0 is in the low byte of `lo`), a reference
 // in `lo` (0 is null; a funcref is a FuncInst*, an externref is whatever number the host made).
@@ -113,7 +113,7 @@ struct GlobalType {
   bool mut = false;
 };
 
-enum class ExternKind : uint8_t { Func = 0, Table = 1, Memory = 2, Global = 3 };
+enum class ExternKind : uint8_t { Func = 0, Table = 1, Memory = 2, Global = 3, Tag = 4 };
 
 // A constant expression (the value of a global, the offset of a segment, an element): a few operations over a tiny stack.
 enum class ConstOpKind : uint8_t { I32Const, I64Const, F32Const, F64Const, V128Const, GlobalGet, RefNull, RefFunc, I32Add, I32Sub, I32Mul, I64Add, I64Sub, I64Mul };
@@ -144,14 +144,34 @@ struct BrTarget {
   uint32_t arity = 0;
 };
 
+// A catch clause of a try_table: what it catches and where the values go (an entry of FuncCode::targets, like a br_table label).
+// The legacy forms: LegacyCatch / LegacyCatchAll continue at the catch block with the exnref (in a slot of its own, for `rethrow`) and the values below it on the
+// stack; Delegate hands the exception on to the handlers older than the one numbered `tag`.
+enum class CatchKind : uint8_t { Catch = 0, CatchRef = 1, CatchAll = 2, CatchAllRef = 3, LegacyCatch = 4, LegacyCatchAll = 5, Delegate = 6 };
+struct CatchClause {
+  CatchKind kind = CatchKind::CatchAll;
+  uint32_t tag = 0;      // the tag index (Catch, CatchRef, LegacyCatch); for Delegate the number of handlers that stay in the search
+  uint32_t target = 0;   // the index in FuncCode::targets
+  uint32_t next = 0xFFFFFFFFu;   // the next clause of the same handler
+  bool keep = false;     // (LegacyCatch*) a `rethrow` in the block needs the exception kept
+};
+// The instructions [start, end) are in a try_table or a legacy try whose clauses are the chain that starts at catches[first]. Handlers are in the order the blocks begin,
+// so that of two that contain an instruction the later is the inner one.
+struct Handler {
+  uint32_t start = 0, end = 0xFFFFFFFFu;
+  uint32_t first = 0xFFFFFFFFu;
+};
+
 struct FuncCode {
-  explicit FuncCode(allocators::IAllocator& allocator) : code(allocator), targets(allocator) {}
+  explicit FuncCode(allocators::IAllocator& allocator) : code(allocator), targets(allocator), handlers(allocator), catches(allocator) {}
   uint32_t type_index = 0;
   uint32_t nparams = 0, nresults = 0;
   uint32_t nlocals = 0;     // the parameters and the declared locals
   uint32_t max_stack = 0;   // operands above the locals
   List<Instr> code;
   List<BrTarget> targets;
+  List<Handler> handlers;
+  List<CatchClause> catches;
 };
 
 struct Import {
@@ -161,7 +181,7 @@ struct Import {
   uint32_t type_index = 0;
   TableType table;
   MemType memory;
-  GlobalType global;
+  GlobalType global;   // (a tag import has its function type in type_index)
 };
 
 struct Export {
@@ -219,7 +239,8 @@ class Module {
   List<TableType> tables;             // every table, the imported ones first
   List<MemType> memories;
   List<GlobalType> globals;
-  uint32_t imported_funcs = 0, imported_tables = 0, imported_memories = 0, imported_globals = 0;
+  List<uint32_t> tags;                // the function type of every tag, the imported ones first
+  uint32_t imported_funcs = 0, imported_tables = 0, imported_memories = 0, imported_globals = 0, imported_tags = 0;
   List<UniquePointer<GlobalDef>> global_defs;   // the globals the module defines
   List<UniquePointer<Export>> exports;
   List<UniquePointer<ElemSegment>> elems;
@@ -228,6 +249,8 @@ class Module {
   List<UniquePointer<CustomSection>> customs;
   bool has_start = false;
   uint32_t start = 0;
+  // Which form of exception handling the code uses (a module may use only one: the legacy try / catch or try_table / throw_ref).
+  bool legacy_eh = false, new_eh = false;
 
  private:
   allocators::IAllocator& allocator_;
@@ -285,27 +308,47 @@ struct FuncInst {
   uint32_t handle = 0;    // the number the host's registry gave this function when it first handed it out (0: none yet)
 };
 
+// An exception tag: the types of what an exception with it carries. Two tags are the same only if they are the same object.
+struct Tag {
+  const FuncSig* sig = nullptr;   // (its results are empty)
+  void* host = nullptr;
+  uint32_t host_id = 0;
+};
+
+// A thrown exception, which an exnref is the address of. A foreign one (tag is null) stands for something the host threw that is not a WebAssembly exception;
+// `foreign` is the host's number for it.
+struct ExnObj {
+  explicit ExnObj(allocators::IAllocator& allocator) : values(allocator) {}
+  Tag* tag = nullptr;
+  List<Slot> values;
+  uint64_t foreign = 0;
+  bool referenced = false;   // an exnref or a host object holds it: it is not reused when a catch takes the values
+  uint32_t host_id = 0;
+};
+
 struct Instance {
   explicit Instance(allocators::IAllocator& allocator)
-      : funcs(allocator), tables(allocator), memories(allocator), globals(allocator), type_sigs(allocator), dropped_elems(allocator), dropped_datas(allocator) {}
+      : funcs(allocator), tables(allocator), memories(allocator), globals(allocator), tags(allocator), type_sigs(allocator), dropped_elems(allocator), dropped_datas(allocator) {}
   SharedPointer<Module> module;
   List<FuncInst*> funcs;
   List<Table*> tables;
   List<Memory*> memories;
   List<Global*> globals;
+  List<Tag*> tags;
   List<const FuncSig*> type_sigs;
   List<uint8_t> dropped_elems, dropped_datas;
 };
 
 struct ExternVal {
   ExternKind kind = ExternKind::Func;
-  void* ptr = nullptr;   // a FuncInst*, Table*, Memory* or Global*
+  void* ptr = nullptr;   // a FuncInst*, Table*, Memory*, Global* or Tag*
 };
 
 class IHost {
  public:
   // Calls a function the host provides. `args` holds sig->nparams values; the results go to `results` (sig->nresults slots). False if the host failed: whatever it
-  // reports (a script exception) is pending in the host, and the interpreter unwinds.
+  // reports (a script exception) is pending in the host, and the interpreter unwinds - unless the host gave the store an exception to throw with
+  // Store::set_pending_exception(), which WebAssembly code can then catch.
   virtual bool call(Store& store, FuncInst& function, const Slot* args, Slot* results) = 0;
   // Called now and then while code runs, with the number of instructions run since the last call. False stops the run (a limit; the host reports it).
   virtual bool tick(uint64_t instructions) = 0;
@@ -315,7 +358,8 @@ class IHost {
   ~IHost() = default;
 };
 
-enum class Status : uint8_t { Ok, Trap, HostError };
+// Exception: an exception no handler caught left the call; Store::take_pending_exception() has it.
+enum class Status : uint8_t { Ok, Trap, HostError, Exception };
 
 class Machine;
 
@@ -345,6 +389,20 @@ class Store {
   Table* new_table(const TableType& type, uint64_t init);
   Global* new_global(const GlobalType& type, const Slot& value);
   FuncInst* new_host_function(const FuncSig* sig, uint32_t host_id, void* host);
+  Tag* new_tag(const FuncSig* sig);
+  // A new exception with these values (in a recycled object when one is free). Null if there is no memory or too many are alive.
+  ExnObj* new_exception(Tag* tag, const Slot* values, uint32_t count);
+  ExnObj* new_foreign_exception(uint64_t foreign);
+  // Gives an exception back for reuse; only for one nothing refers to.
+  void release_exception(ExnObj* exception);
+  // The exception a host function throws (see IHost::call), and the one that left a call.
+  void set_pending_exception(ExnObj* exception) { pending_ = exception; }
+  bool has_pending_exception() const { return pending_ != nullptr; }
+  ExnObj* take_pending_exception() {
+    ExnObj* e = pending_;
+    pending_ = nullptr;
+    return e;
+  }
   uint64_t memory_pages_in_use() const { return pages_in_use_; }
   uint64_t page_budget() const { return page_budget_; }
   void set_page_budget(uint64_t pages) { page_budget_ = pages; }
@@ -374,6 +432,10 @@ class Store {
   List<UniquePointer<Table>> tables_;
   List<UniquePointer<Global>> globals_;
   List<UniquePointer<FuncInst>> funcs_;
+  List<UniquePointer<Tag>> tags_;
+  List<UniquePointer<ExnObj>> exceptions_;
+  List<ExnObj*> free_exceptions_;
+  ExnObj* pending_ = nullptr;
   List<UniquePointer<Instance>> instances_;
   UniquePointer<Machine> machine_;
   uint64_t pages_in_use_ = 0, page_budget_ = 4096;
@@ -387,5 +449,8 @@ const char* val_type_name(ValType t);
 // Store, and a slot holds either 0 or a value func_ref() made.
 inline uint64_t func_ref(const FuncInst* f) { return reinterpret_cast<uint64_t>(f); }
 inline FuncInst* func_from_ref(uint64_t r) { return reinterpret_cast<FuncInst*>(r); }
+// An exnref is the address of its ExnObj (0 is null); the same rules.
+inline uint64_t exn_ref(const ExnObj* e) { return reinterpret_cast<uint64_t>(e); }
+inline ExnObj* exn_from_ref(uint64_t r) { return reinterpret_cast<ExnObj*>(r); }
 
 }  // namespace wasm

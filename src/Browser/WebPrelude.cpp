@@ -9383,10 +9383,12 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
       Object.defineProperty(self, '__wasm_id', { value: id });
     };
     var waIs = function (v, kind) { return v !== null && typeof v === 'object' && v.__wasm_kind === kind; };
-    var memories = {}, tables = {}, globals = {};
+    var memories = {}, tables = {}, globals = {}, tags = {}, exceptions = {};
     var wrapMemory = function (id) { return memories[id] || (memories[id] = waWrap(Memory.prototype, 'memory', id)); };
     var wrapTable = function (id) { return tables[id] || (tables[id] = waWrap(Table.prototype, 'table', id)); };
     var wrapGlobal = function (id) { return globals[id] || (globals[id] = waWrap(Global.prototype, 'global', id)); };
+    var wrapTag = function (id) { return tags[id] || (tags[id] = waWrap(Tag.prototype, 'tag', id)); };
+    hide(g, '__wasm_exception_wrap', function (id) { return exceptions[id] || (exceptions[id] = waWrap(Exception.prototype, 'exception', id)); });
     var waCount = function (v, what, api) {
       var n = Number(v);
       if (!(n >= 0) || n !== Math.floor(n) || n > 4294967295) throw new TypeError(api + ": Property '" + what + "': value " + String(v) + ' is not a valid size');
@@ -9443,6 +9445,7 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
         if (r[1] === 'memory') v = wrapMemory(v);
         else if (r[1] === 'table') v = wrapTable(v);
         else if (r[1] === 'global') v = wrapGlobal(v);
+        else if (r[1] === 'tag') v = wrapTag(v);
         Object.defineProperty(out, r[0], { value: v, enumerable: true });
       });
       return Object.freeze(out);
@@ -9528,6 +9531,32 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
     Global.prototype.valueOf = function () { return __wasm_global_get(needGlobal(this)); };
     waTag(Global, 'WebAssembly.Global');
     waDefine('Global', Global);
+
+    // --- Tag and Exception
+    function Tag(descriptor) {
+      if (!(this instanceof Tag)) throw new TypeError("WebAssembly.Tag must be invoked with 'new'");
+      if (descriptor === null || typeof descriptor !== 'object') throw new TypeError('WebAssembly.Tag(): Argument 0 must be a tag type');
+      if (descriptor.parameters === undefined || descriptor.parameters === null || typeof descriptor.parameters !== 'object') throw new TypeError("WebAssembly.Tag(): Argument 0 must be a tag type with 'parameters'");
+      var id = __wasm_tag_new(descriptor.parameters);
+      waNew(this, Tag, 'tag', id, 'Tag');
+      tags[id] = this;
+    }
+    waTag(Tag, 'WebAssembly.Tag');
+    waDefine('Tag', Tag);
+    function Exception(tag, payload, options) {
+      if (!(this instanceof Exception)) throw new TypeError("WebAssembly.Exception must be invoked with 'new'");
+      if (!waIs(tag, 'tag')) throw new TypeError('WebAssembly.Exception(): Argument 0 must be a WebAssembly tag');
+      if (payload === null || typeof payload !== 'object') throw new TypeError('WebAssembly.Exception(): Argument 1 must be an iterable');
+      var id = __wasm_exception_new(tag.__wasm_id, payload);
+      waNew(this, Exception, 'exception', id, 'Exception');
+      exceptions[id] = this;
+    }
+    var needException = function (e) { if (!waIs(e, 'exception')) throw new TypeError('Receiver is not a WebAssembly.Exception'); return e.__wasm_id; };
+    var needTagArg = function (t, api) { if (!waIs(t, 'tag')) throw new TypeError(api + ': Argument 0 must be a WebAssembly tag'); return t.__wasm_id; };
+    Exception.prototype.is = function (tag) { var id = needException(this); return __wasm_exception_is(id, needTagArg(tag, 'WebAssembly.Exception.is()')); };
+    Exception.prototype.getArg = function (tag, index) { var id = needException(this); return __wasm_exception_get(id, needTagArg(tag, 'WebAssembly.Exception.getArg()'), index); };
+    waTag(Exception, 'WebAssembly.Exception');
+    waDefine('Exception', Exception);
 
     // --- functions
     waDefine('validate', function validate(bytes) {

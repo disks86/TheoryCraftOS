@@ -68,6 +68,7 @@ const char* val_type_name(ValType t) {
     case ValType::V128: return "v128";
     case ValType::FuncRef: return "funcref";
     case ValType::ExternRef: return "externref";
+    case ValType::ExnRef: return "exnref";
   }
   return "?";
 }
@@ -79,6 +80,7 @@ Module::Module(allocators::IAllocator& allocator)
       tables(allocator),
       memories(allocator),
       globals(allocator),
+      tags(allocator),
       global_defs(allocator),
       exports(allocator),
       elems(allocator),
@@ -93,7 +95,7 @@ constexpr uint32_t kNone = 0xFFFFFFFFu;
 constexpr uint8_t kUnknown = 0;
 constexpr uint32_t kMaxLocals = 50000, kMaxLabels = 1u << 20, kMaxFunctions = 1000000, kMaxTypes = 1000000, kMaxEntries = 1000000, kMaxDepth = 100000;
 
-bool valid_val_type(uint8_t b) { return b == 0x7F || b == 0x7E || b == 0x7D || b == 0x7C || b == 0x7B || b == 0x70 || b == 0x6F; }
+bool valid_val_type(uint8_t b) { return b == 0x7F || b == 0x7E || b == 0x7D || b == 0x7C || b == 0x7B || b == 0x70 || b == 0x6F || b == 0x69; }
 
 // Reads the primitives of the binary format.
 class Reader {
@@ -231,7 +233,7 @@ void truncate_to(List<uint8_t>& list, uint64_t n) {
 
 // --- The function compiler -----------------------------------------------------------------------------------------------------
 
-enum class CtlKind : uint8_t { Func, Block, Loop, If, Else };
+enum class CtlKind : uint8_t { Func, Block, Loop, If, Else, TryTable, Try, Catch, CatchAll };
 
 struct Ctl {
   CtlKind kind = CtlKind::Block;
@@ -242,6 +244,12 @@ struct Ctl {
   bool dead = false;               // opened inside unreachable code: nothing is emitted for it
   uint32_t height = 0;
   uint32_t loop_pc = 0;
+  uint32_t handler = kNone;        // the try_table's / try's entry in FuncCode::handlers
+  uint32_t handlers_before = 0;    // how many handlers there were when the block began
+  uint32_t last_clause = kNone;    // the last clause of the handler (legacy try: they come one by one)
+  uint32_t cur_clause = kNone;     // the clause of the catch block this is
+  // Where the operands of the block begin: a catch block has the exception below them.
+  uint32_t base() const { return height + (kind == CtlKind::Catch || kind == CtlKind::CatchAll ? 1u : 0u); }
   uint32_t else_patch = kNone;     // the jump taken when an `if` has no true branch
   uint32_t patch_code = kNone, patch_table = kNone;   // the forward branches to the end of the block (chained through their target field)
   uint32_t nparams() const { return sig ? sig->nparams : 0; }
@@ -274,6 +282,7 @@ class FuncCompiler {
   List<Ctl> ctls_;
   const char* why_ = nullptr;
   uint32_t max_height_ = 0;
+  uint32_t cur_tag_ = 0;
 
   bool fail(const char* why) {
     if (!why_) why_ = why;
@@ -302,7 +311,7 @@ class FuncCompiler {
   }
   bool pop_any(uint8_t* out) {
     const Ctl& c = top();
-    if (vals_.count() == c.height) {
+    if (vals_.count() == c.base()) {
       if (c.unreachable) {
         *out = kUnknown;
         return true;
@@ -322,13 +331,13 @@ class FuncCompiler {
   bool pop_ref() {
     uint8_t got;
     if (!pop_any(&got)) return false;
-    if (got != kUnknown && got != 0x70 && got != 0x6F) return fail("type mismatch: reference expected");
+    if (got != kUnknown && got != 0x70 && got != 0x6F && got != 0x69) return fail("type mismatch: reference expected");
     return true;
   }
   bool pop_t(ValType t) { return pop(static_cast<uint8_t>(t)); }
   bool push_t(ValType t) { return push(static_cast<uint8_t>(t)); }
   bool mark_unreachable() {
-    truncate_to(vals_, top().height);
+    truncate_to(vals_, top().base());
     top().unreachable = true;
     return true;
   }
@@ -382,6 +391,7 @@ class FuncCompiler {
     c.has_single = has_single;
     c.single = single;
     c.height = static_cast<uint32_t>(vals_.count());
+    c.handlers_before = static_cast<uint32_t>(fc_.handlers.count());
     c.dead = ctls_.count() > 0 && !live();
     c.loop_pc = here();
     if (!ctls_.push_back(c)) return fail("out of memory");
@@ -495,6 +505,27 @@ class FuncCompiler {
   bool load(uint8_t op);
   bool store(uint8_t op);
   bool end_block();
+  // Appends a catch clause to the chain whose ends are *first and *last.
+  bool link_clause(const CatchClause& clause, uint32_t* first, uint32_t* last) {
+    const uint32_t index = static_cast<uint32_t>(fc_.catches.count());
+    if (!fc_.catches.push_back(clause)) return fail("out of memory");
+    if (*last != kNone) fc_.catches[*last].next = index;
+    else *first = index;
+    *last = index;
+    return true;
+  }
+  bool use_legacy_eh() {
+    if (m_.new_eh) return fail("module uses a mix of legacy and new exception handling instructions");
+    m_.legacy_eh = true;
+    return true;
+  }
+  bool use_new_eh() {
+    if (m_.legacy_eh) return fail("module uses a mix of legacy and new exception handling instructions");
+    m_.new_eh = true;
+    return true;
+  }
+  bool legacy_catch(bool all);
+  bool legacy_delegate();
 };
 
 // The operand types of a plain numeric operation (no immediates): in1 and in2 (0: none) and the result.
@@ -777,7 +808,8 @@ bool FuncCompiler::end_block() {
   // `end`: the values on the stack are exactly the block's results
   Ctl c = top();
   if (!pop_ctl_results(c)) return false;
-  if (vals_.count() != c.height) return fail("type mismatch: values left on the stack at the end of a block");
+  if (vals_.count() != c.base()) return fail("type mismatch: values left on the stack at the end of a block");
+  if (c.kind == CtlKind::Catch || c.kind == CtlKind::CatchAll) vals_.remove_at(vals_.count() - 1);   // (the exception under the block's values)
   if (c.kind == CtlKind::If) {   // an `if` without `else` passes its parameters through
     if (c.nparams() != c.nresults()) return fail("type mismatch: if without else");
     for (uint32_t i = 0; i < c.nparams(); ++i)
@@ -787,6 +819,7 @@ bool FuncCompiler::end_block() {
   ctls_.remove_at(ctls_.count() - 1);
   if (!dead) {
     const uint32_t target = here();
+    if (c.handler != kNone && fc_.handlers[c.handler].end == kNone) fc_.handlers[c.handler].end = target;
     if (c.else_patch != kNone) fc_.code[c.else_patch].a = target;
     resolve(c, target);
   }
@@ -797,6 +830,74 @@ bool FuncCompiler::end_block() {
     return true;
   }
   return push_ctl_results(c);
+}
+
+// `catch tag` / `catch_all` of a legacy try: ends the body that came before (a try body or the previous catch block) and begins a block whose operands are
+// the values of the exception, above one slot that holds the exception itself.
+bool FuncCompiler::legacy_catch(bool all) {
+  Ctl& first = top();
+  if (first.kind != CtlKind::Try && first.kind != CtlKind::Catch) return fail("catch without try");
+  Ctl saved = first;
+  if (!pop_ctl_results(saved)) return false;
+  if (vals_.count() != saved.base()) return fail("type mismatch: values left on the stack before catch");
+  Ctl& t = top();
+  if (!t.dead) {
+    if (t.handler != kNone && fc_.handlers[t.handler].end == kNone) fc_.handlers[t.handler].end = here();
+    if (!t.unreachable) {   // the body before falls through to the end of the whole try
+      Instr j;
+      j.op = kOpJmp;
+      j.a = t.patch_code;
+      t.patch_code = here();
+      if (!fc_.code.push_back(j)) return fail("out of memory");
+    }
+  }
+  truncate_to(vals_, t.height);
+  t.kind = all ? CtlKind::CatchAll : CtlKind::Catch;
+  t.unreachable = false;
+  if (!push_t(ValType::ExnRef)) return false;
+  const FuncSig* tag_sig = all ? nullptr : m_.types[m_.tags[cur_tag_]].get();
+  for (uint32_t i = 0; tag_sig && i < tag_sig->nparams; ++i)
+    if (!push_t(tag_sig->params[i])) return false;
+  Ctl& c = top();
+  if (!c.dead && c.handler != kNone) {
+    BrTarget bt;
+    bt.pc = here();
+    bt.height = fc_.nlocals + c.height;
+    bt.arity = tag_sig ? tag_sig->nparams : 0;
+    if (!fc_.targets.push_back(bt)) return fail("out of memory");
+    CatchClause cc;
+    cc.kind = all ? CatchKind::LegacyCatchAll : CatchKind::LegacyCatch;
+    cc.tag = all ? 0 : cur_tag_;
+    cc.target = static_cast<uint32_t>(fc_.targets.count() - 1);
+    uint32_t head = fc_.handlers[c.handler].first, tail = c.last_clause;
+    if (!link_clause(cc, &head, &tail)) return false;
+    fc_.handlers[c.handler].first = head;
+    c.last_clause = tail;
+    c.cur_clause = tail;
+  }
+  return true;
+}
+
+// `delegate label`: ends a try that has no catch clauses; whatever is thrown in its body goes on to the handlers of the block `label` (counted from outside the try)
+// or, for the function, to the caller.
+bool FuncCompiler::legacy_delegate() {
+  const uint32_t depth = r_.u32();
+  if (!r_.ok()) return fail("malformed label");
+  if (top().kind != CtlKind::Try) return fail("delegate without try");
+  if (depth + 2 > ctls_.count()) return fail("unknown label");
+  const Ctl target = ctls_[ctls_.count() - 2 - depth];
+  Ctl& t = top();
+  if (!t.dead && t.handler != kNone) {
+    CatchClause cc;
+    cc.kind = CatchKind::Delegate;
+    // (a delegate to a try goes to that try's catches too, to any other block to the handlers that surround it)
+    cc.tag = target.kind == CtlKind::Try && target.handler != kNone ? target.handler + 1 : target.handlers_before;
+    uint32_t head = fc_.handlers[t.handler].first, tail = t.last_clause;
+    if (!link_clause(cc, &head, &tail)) return false;
+    fc_.handlers[t.handler].first = head;
+    t.last_clause = tail;
+  }
+  return end_block();
 }
 
 bool FuncCompiler::prefix_fc() {
@@ -933,6 +1034,116 @@ bool FuncCompiler::one(uint8_t op) {
       return push_ctl_params(t);
     }
     case 0x0B: return end_block();
+    case 0x06: {   // try (the legacy form)
+      if (!use_legacy_eh()) return false;
+      const FuncSig* sig;
+      bool has_single;
+      ValType single = I;
+      if (!read_block_type(&sig, &has_single, &single)) return false;
+      if (sig) {
+        Ctl probe;
+        probe.sig = sig;
+        if (!pop_ctl_params(probe)) return false;
+      }
+      const bool was_live = live();
+      const uint32_t start = here();
+      if (!push_ctl(CtlKind::Try, sig, has_single, single)) return false;
+      if (was_live) {
+        Handler h;
+        h.start = start;
+        if (!fc_.handlers.push_back(h)) return fail("out of memory");
+        top().handler = static_cast<uint32_t>(fc_.handlers.count() - 1);
+      }
+      return push_ctl_params(top());
+    }
+    case 0x07: {   // catch
+      if (!use_legacy_eh()) return false;
+      const uint32_t tag = r_.u32();
+      if (!r_.ok()) return fail("malformed tag index");
+      if (tag >= m_.tags.count()) return fail("unknown tag");
+      cur_tag_ = tag;
+      return legacy_catch(false);
+    }
+    case 0x19: return use_legacy_eh() && legacy_catch(true);
+    case 0x18: return use_legacy_eh() && legacy_delegate();
+    case 0x09: {   // rethrow
+      if (!use_legacy_eh()) return false;
+      const uint32_t depth = r_.u32();
+      if (!r_.ok()) return fail("malformed label");
+      Ctl* t;
+      if (!label_info(depth, &t)) return false;
+      if (t->kind != CtlKind::Catch && t->kind != CtlKind::CatchAll) return fail("invalid rethrow label: not a catch block");
+      if (live()) {
+        if (!emit(0x09, fc_.nlocals + t->height)) return false;
+        if (t->cur_clause != kNone) fc_.catches[t->cur_clause].keep = true;
+      }
+      return mark_unreachable();
+    }
+    case 0x08: {   // throw
+      const uint32_t tag = r_.u32();
+      if (!r_.ok()) return fail("malformed tag index");
+      if (tag >= m_.tags.count()) return fail("unknown tag");
+      if (!pop_sig_params(*m_.types[m_.tags[tag]]) || !emit(0x08, tag)) return false;
+      return mark_unreachable();
+    }
+    case 0x0A:   // throw_ref
+      if (!use_new_eh() || !pop_t(ValType::ExnRef) || !emit(0x0A)) return false;
+      return mark_unreachable();
+    case 0x1F: {   // try_table
+      if (!use_new_eh()) return false;
+      const FuncSig* sig;
+      bool has_single;
+      ValType single = I;
+      if (!read_block_type(&sig, &has_single, &single)) return false;
+      const uint32_t n = r_.u32();
+      if (!r_.ok() || n > kMaxLabels) return fail("malformed catch list");
+      const bool was_live = live();
+      uint32_t first_clause = kNone, last_clause = kNone;
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t kind = r_.u8();
+        uint32_t tag = 0;
+        if (kind <= 1) tag = r_.u32();
+        const uint32_t depth = r_.u32();
+        if (!r_.ok() || kind > 3) return fail("malformed catch clause");
+        Ctl* t;
+        if (!label_info(depth, &t)) return false;   // (the labels outside the try_table: its own is not among them)
+        uint32_t want = 0;
+        const FuncSig* tag_sig = nullptr;
+        if (kind <= 1) {
+          if (tag >= m_.tags.count()) return fail("unknown tag");
+          tag_sig = m_.types[m_.tags[tag]].get();
+          want = tag_sig->nparams;
+        }
+        if (kind == 1 || kind == 3) ++want;
+        if (t->label_arity() != want) return fail("type mismatch: catch label");
+        for (uint32_t k = 0; tag_sig && k < tag_sig->nparams; ++k)
+          if (t->label_type(k) != tag_sig->params[k]) return fail("type mismatch: catch label");
+        if ((kind == 1 || kind == 3) && t->label_type(want - 1) != ValType::ExnRef) return fail("type mismatch: catch label");
+        if (was_live) {
+          if (!add_table_target(depth)) return false;
+          CatchClause cc;
+          cc.kind = static_cast<CatchKind>(kind);
+          cc.tag = tag;
+          cc.target = static_cast<uint32_t>(fc_.targets.count() - 1);
+          if (!link_clause(cc, &first_clause, &last_clause)) return false;
+        }
+      }
+      if (sig) {
+        Ctl probe;
+        probe.sig = sig;
+        if (!pop_ctl_params(probe)) return false;
+      }
+      const uint32_t start = here();
+      if (!push_ctl(CtlKind::TryTable, sig, has_single, single)) return false;
+      if (was_live) {
+        Handler h;
+        h.start = start;
+        h.first = first_clause;
+        if (!fc_.handlers.push_back(h)) return fail("out of memory");
+        top().handler = static_cast<uint32_t>(fc_.handlers.count() - 1);
+      }
+      return push_ctl_params(top());
+    }
     case 0x0C: {
       const uint32_t depth = r_.u32();
       if (!r_.ok()) return fail("malformed label");
@@ -1013,7 +1224,7 @@ bool FuncCompiler::one(uint8_t op) {
       uint8_t a, b;
       if (!pop_any(&a) || !pop_any(&b)) return false;
       if (op == 0x1B) {
-        if ((a == 0x70 || a == 0x6F || b == 0x70 || b == 0x6F)) return fail("type mismatch: select needs a type for references");
+        if ((a == 0x70 || a == 0x6F || a == 0x69 || b == 0x70 || b == 0x6F || b == 0x69)) return fail("type mismatch: select needs a type for references");
         if (a != b && a != kUnknown && b != kUnknown) return fail("type mismatch in select");
         return push(a == kUnknown ? b : a) && emit(0x1B);
       }
@@ -1090,7 +1301,7 @@ bool FuncCompiler::one(uint8_t op) {
     }
     case 0xD0: {
       const uint8_t t = r_.u8();
-      if (!r_.ok() || (t != 0x70 && t != 0x6F)) return fail("invalid reference type");
+      if (!r_.ok() || (t != 0x70 && t != 0x6F && t != 0x69)) return fail("invalid reference type");
       return push(t) && emit(0xD0);
     }
     case 0xD1:
@@ -1241,6 +1452,8 @@ class Decoder {
   bool section_function(Reader& r);
   bool section_table(Reader& r);
   bool section_memory(Reader& r);
+  bool section_tag(Reader& r);
+  bool tag_type(Reader& r, uint32_t* type);
   bool section_global(Reader& r);
   bool section_export(Reader& r);
   bool section_start(Reader& r);
@@ -1291,7 +1504,7 @@ bool Decoder::const_expr(Reader& r, ValType expected, ConstExpr* out, uint32_t g
       }
       case 0xD0: {
         const uint8_t t = r.u8();
-        if (!r.ok() || (t != 0x70 && t != 0x6F)) return fail(r, "invalid reference type");
+        if (!r.ok() || (t != 0x70 && t != 0x6F && t != 0x69)) return fail(r, "invalid reference type");
         c.op = ConstOpKind::RefNull;
         pushes = t;
         break;
@@ -1337,14 +1550,14 @@ bool Decoder::section_type(Reader& r) {
     if (!r.ok()) return fail(r, "malformed function type");
     if (np > kMaxParams) return fail(r, "param count exceeds the internal limit of 1000");
     for (uint32_t k = 0; k < np; ++k) {
-      ValType t;
+      ValType t = ValType::I32;
       if (!val_type(r, &t) || !types.push_back(static_cast<uint8_t>(t))) return false;
     }
     const uint32_t nr = r.u32();
     if (!r.ok()) return fail(r, "malformed function type");
     if (nr > kMaxResults) return fail(r, "return count exceeds the internal limit of 1000");
     for (uint32_t k = 0; k < nr; ++k) {
-      ValType t;
+      ValType t = ValType::I32;
       if (!val_type(r, &t) || !types.push_back(static_cast<uint8_t>(t))) return false;
     }
     if (!sig->init(np, nr)) return fail_msg("out of memory");
@@ -1363,7 +1576,7 @@ bool Decoder::section_import(Reader& r) {
     if (!imp) return fail_msg("out of memory");
     if (!name(r, &imp->module) || !name(r, &imp->name)) return false;
     const uint8_t kind = r.u8();
-    if (!r.ok() || kind > 3) return fail(r, "malformed import kind");
+    if (!r.ok() || kind > 4) return fail(r, "malformed import kind");
     imp->kind = static_cast<ExternKind>(kind);
     switch (imp->kind) {
       case ExternKind::Func: {
@@ -1388,6 +1601,10 @@ bool Decoder::section_import(Reader& r) {
         if (!global_type(r, &imp->global)) return false;
         if (!m_.globals.push_back(imp->global)) return fail_msg("out of memory");
         ++m_.imported_globals;
+        break;
+      case ExternKind::Tag:
+        if (!tag_type(r, &imp->type_index) || !m_.tags.push_back(imp->type_index)) return false;
+        ++m_.imported_tags;
         break;
     }
     if (!m_.imports.push_back(util::move(imp))) return fail_msg("out of memory");
@@ -1430,6 +1647,26 @@ bool Decoder::section_memory(Reader& r) {
   return true;
 }
 
+// The type of a tag: an attribute byte (always 0) and a function type with no results.
+bool Decoder::tag_type(Reader& r, uint32_t* type) {
+  if (r.u8() != 0 || !r.ok()) return fail(r, "malformed tag attribute");
+  *type = r.u32();
+  if (!r.ok()) return fail(r, "malformed tag type");
+  if (*type >= m_.types.count()) return fail(r, "unknown type");
+  if (m_.types[*type]->nresults != 0) return fail(r, "tag type must not have results");
+  return true;
+}
+
+bool Decoder::section_tag(Reader& r) {
+  const uint32_t n = r.u32();
+  if (!r.ok() || n > kMaxEntries) return fail(r, "malformed tag section");
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t type;
+    if (!tag_type(r, &type) || !m_.tags.push_back(type)) return false;
+  }
+  return true;
+}
+
 bool Decoder::section_global(Reader& r) {
   const uint32_t n = r.u32();
   if (!r.ok() || n > kMaxEntries) return fail(r, "malformed global section");
@@ -1453,7 +1690,7 @@ bool Decoder::section_export(Reader& r) {
     if (!name(r, &e->name)) return false;
     const uint8_t kind = r.u8();
     e->index = r.u32();
-    if (!r.ok() || kind > 3) return fail(r, "malformed export");
+    if (!r.ok() || kind > 4) return fail(r, "malformed export");
     e->kind = static_cast<ExternKind>(kind);
     uint64_t limit = 0;
     switch (e->kind) {
@@ -1461,6 +1698,7 @@ bool Decoder::section_export(Reader& r) {
       case ExternKind::Table: limit = m_.tables.count(); break;
       case ExternKind::Memory: limit = m_.memories.count(); break;
       case ExternKind::Global: limit = m_.globals.count(); break;
+      case ExternKind::Tag: limit = m_.tags.count(); break;
     }
     if (e->index >= limit) return fail(r, "unknown export index");
     for (uint64_t k = 0; k < m_.exports.count(); ++k)
@@ -1595,7 +1833,7 @@ bool Decoder::run() {
   if (!top.ok()) return fail_msg("expected magic word 00 61 73 6d");
   if (magic != 0x6D736100u) return fail_msg("expected magic word 00 61 73 6d");
   if (version != 1) return fail_msg("expected version 01 00 00 00");
-  static const uint8_t kRank[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 10};   // by section id; the data count section (12) comes between element (9) and code (10)
+  static const uint8_t kRank[] = {0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 11, 6};   // by section id; the data count section (12) comes between element (9) and code (10), the tag section (13) between memory (5) and global (6)
   int last_rank = 0;
   while (!top.at_end()) {
     const uint8_t id = top.u8();
@@ -1613,7 +1851,7 @@ bool Decoder::run() {
       m_.customs.push_back(util::move(c));
       continue;
     }
-    if (id > 12) return fail(top, "malformed section id");
+    if (id > 13) return fail(top, "malformed section id");
     if (kRank[id] <= last_rank) return fail(top, "unexpected content after last section or sections out of order");
     last_rank = kRank[id];
     // (the functions ref.func may name are marked by the sections that declare them: globals, exports, elements)
@@ -1628,6 +1866,7 @@ bool Decoder::run() {
       case 4: ok = section_table(r); break;
       case 5: ok = section_memory(r); break;
       case 6: ok = section_global(r); break;
+      case 13: ok = section_tag(r); break;
       case 7: ok = section_export(r); break;
       case 8: ok = section_start(r); break;
       case 9: ok = section_element(r); break;
