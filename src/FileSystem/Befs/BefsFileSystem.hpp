@@ -33,13 +33,15 @@ namespace filesystem {
 // link target (they are not followed). Attributes, indices and the journal are ignored.
 //
 // Writing: files and directories can be created, written, grown, cut, renamed and removed; blocks come from the allocation bitmap and
-// names go into the directories' B+trees. Metadata changes are collected in a transaction (a set of changed blocks) and written when
-// the operation is done, or dropped if it failed; there is no journal, so a crash in the middle of the final write can leave the volume
-// needing a check. Removing a file first cuts it to nothing in steps, so a failure then leaves a shorter file, never lost blocks. A
-// volume is mounted writable only if its device is, it was shut down cleanly (flag clean, journal empty), its inodes are one block
-// each and its bitmap is laid out as expected; any other volume is read only (every write returns ReadOnly). What is not kept up to
-// date: time stamps (no clock here), attributes and the indices (name, size, last modified), so queries in Haiku will not find new
-// files until it reindexes.
+// names go into the directories' B+trees. Metadata changes are collected in a transaction (a set of changed blocks) and committed
+// through the volume's journal, as Be's file system does: the changed blocks are written to the log, then the super block says so
+// (dirty, log_end), then the blocks go to their places, then the super block says clean again. A crash at any point leaves either the
+// old state or the new one: a volume that was not shut down cleanly has its log replayed when it is mounted on a writable device
+// (file data is not journaled, as in Be's file system: a write that is cut short can leave partly new data). Removing a file first cuts
+// it to nothing in steps, so a failure then leaves a shorter file, never lost blocks. A volume is mounted writable only if its device
+// is, its log is usable (and was replayed if needed), its inodes are one block each and its bitmap is laid out as expected; any other
+// volume is read only (every write returns ReadOnly). What is not kept up to date: time stamps (no clock here), attributes and the
+// indices (name, size, last modified), so queries in Haiku will not find new files until it reindexes.
 //
 // The volume starts at block `first_block` of the device and mounting reads and validates its super block (at byte 512 of the volume).
 // The device must outlive the filesystem.
@@ -147,6 +149,12 @@ class BefsFileSystem final : public IFileSystem {
   };
 
   Status init();
+  Status parse_super();
+  Status replay_log(bool* super_touched);
+  Status journal_write();
+  Status write_super(uint32_t flags, uint64_t log_start, uint64_t log_end, const uint64_t* used_blocks);
+  uint32_t journal_capacity() const;
+  void tx_abandon();
   Status read_bytes(uint64_t offset, ByteView out);  // volume-relative byte offset; sees the open transaction's changes
   Status raw_read(uint64_t offset, ByteView out);    // the medium only
   Status raw_write(uint64_t offset, ConstByteView data);
@@ -244,9 +252,15 @@ class BefsFileSystem final : public IFileSystem {
   uint32_t tx_count_ = 0;
   uint64_t tx_used_blocks_ = 0;  // used_blocks_ when the transaction began
   bool writable_ = false;
+  uint64_t log_first_ = 0;                    // the journal: first block, length in blocks, and the ring positions (in blocks from its start)
+  uint32_t log_len_ = 0;
+  uint64_t log_start_ = 0, log_end_ = 0;
+  uint32_t volume_flags_ = 0;
+  bool log_usable_ = false;
   bool atomic_ = false;     // an operation that must reach the medium as one transaction: no commits on the way
   uint32_t bitmap_per_group_ = 0;
   uint32_t inode_size_ = 0;
+  uint32_t bitmap_groups_field_ = 0;  // the super block's count of bitmap blocks per group
   OpenHandle* open_ = nullptr;
   uint64_t tree_epoch_ = 0;  // counts changes to directory trees, so that open directories know to look again
 
