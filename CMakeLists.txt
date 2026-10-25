@@ -218,6 +218,9 @@ add_executable(BOOTX64
   src/FileSystem/Mount/MountTable.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
   src/FileSystem/Befs/BefsFileSystem.cpp
+  src/FileSystem/Ntfs/NtfsFileSystem.cpp
+  src/FileSystem/Ntfs/NtfsMount.cpp
+  src/FileSystem/Ntfs/NtfsWrite.cpp
   src/ConcurrentDemo.cpp
   src/Hardware/NeuralProcessingUnit/Software/SoftwareNeuralProcessingUnit.cpp
   src/Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.cpp
