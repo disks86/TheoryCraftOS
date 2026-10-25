@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <algorithm>
 #include <functional>
 #include <map>
@@ -1733,7 +1735,151 @@ static void test_times() {
   if (fs) filetimes::check_stamps(*fs, "befs");
 }
 
-int main() {
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Interop with Haiku's own BFS code (tests/befs_interop.sh): `BefsTest dump in.img out_dir` copies every file of a volume Haiku made out to
+// a host folder, and `BefsTest real in.img out.img expected_dir` changes such a volume the way a user would while keeping the expected
+// tree up to date in expected_dir, so that Haiku's checkfs and cp can judge the result.
+
+namespace interop {
+typedef std::vector<uint8_t> Bytes;
+
+static Bytes slurp(const std::string& path) {
+  Bytes out;
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return out;
+  uint8_t buffer[65536];
+  size_t n;
+  while ((n = fread(buffer, 1, sizeof buffer, f)) > 0) out.insert(out.end(), buffer, buffer + n);
+  fclose(f);
+  return out;
+}
+static void spit(const std::string& path, const Bytes& data) {
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) return;
+  if (!data.empty()) fwrite(data.data(), 1, data.size(), f);
+  fclose(f);
+}
+static void host_dir(const std::string& path) {
+  for (size_t at = 1; at <= path.size(); ++at)
+    if (at == path.size() || path[at] == '/') mkdir(path.substr(0, at).c_str(), 0755);
+}
+
+static void dump_tree(IFileSystem& fs, const std::string& path, const std::string& out, int* files) {
+  host_dir(out + path);
+  UniquePointer<IDirectory> dir;
+  if (fs.open_directory(path.empty() ? "/" : path.c_str(), &dir) != Status::Ok) { printf("cannot open %s\n", path.c_str()); ++g_failed; return; }
+  std::vector<DirectoryEntry> entries;
+  DirectoryEntry e;
+  while (dir->next(&e) == Status::Ok) entries.push_back(e);
+  dir = UniquePointer<IDirectory>();
+  for (const DirectoryEntry& entry : entries) {
+    const std::string full = path + "/" + std::string(entry.name.view().data(), entry.name.view().size());
+    if (entry.type == NodeType::Directory) { dump_tree(fs, full, out, files); continue; }
+    std::vector<uint8_t> bytes;
+    if (!read_back(fs, full.c_str(), &bytes)) { printf("cannot read %s\n", full.c_str()); ++g_failed; continue; }
+    spit(out + full, bytes);
+    ++*files;
+  }
+}
+
+static int run_dump(const char* in, const char* out) {
+  Bytes image = slurp(in);
+  if (image.empty()) return 2;
+  TestAllocator a;
+  MemDisk disk(image.data(), image.size(), 512, 0, false);
+  UniquePointer<IFileSystem> fs;
+  const Status s = BefsFileSystem::mount(a, disk, 0, &fs);
+  if (s != Status::Ok) { printf("mount failed: %s\n", status_name(s)); return 1; }
+  int files = 0;
+  dump_tree(*fs, "", out, &files);
+  printf("dumped %d files\n", files);
+  return g_failed ? 1 : 0;
+}
+
+static int run_real(const char* in, const char* out, const char* expected) {
+  Bytes image = slurp(in);
+  if (image.empty()) return 2;
+  TestAllocator a;
+  MemDisk disk(image.data(), image.size(), 512, 0, true);
+  UniquePointer<IFileSystem> fsp;
+  const Status ms = BefsFileSystem::mount(a, disk, 0, &fsp);
+  if (ms != Status::Ok || !fsp || fsp->info().read_only) { printf("mount failed or read only: %s\n", status_name(ms)); return 1; }
+  IFileSystem& fs = *fsp;
+  int bad = 0;
+  auto must = [&](Status s, const char* what) { if (s != Status::Ok) { printf("FAILED: %s: %s\n", what, status_name(s)); ++bad; } };
+  const std::string exp = expected;
+  auto create = [&](const std::string& path, const Bytes& data) {
+    must(put_file(fs, path, data) ? Status::Ok : Status::IoError, ("create " + path).c_str());
+    spit(exp + path, data);
+  };
+  auto change = [&](const std::string& path, const std::function<void(Bytes&, UniquePointer<IFile>&)>& edit) {
+    UniquePointer<IFile> f;
+    must(fs.open_file(path.c_str(), OpenMode::ReadWrite, &f), ("open " + path).c_str());
+    if (!f) return;
+    Bytes model = slurp(exp + path);
+    edit(model, f);
+    spit(exp + path, model);
+  };
+  auto write_at = [&](Bytes& model, UniquePointer<IFile>& f, uint64_t at, const Bytes& d) {
+    uint64_t put = 0;
+    must(f->write(at, ConstByteView(d.data(), d.size()), &put), "write");
+    if (model.size() < at + d.size()) model.resize(at + d.size(), 0);
+    memcpy(model.data() + at, d.data(), d.size());
+  };
+
+  create("/new_small.txt", make_data(100, 31));
+  create("/new_big.bin", make_data(400000, 32));
+  create("/dir1/new.dat", make_data(3000, 33));
+  change("/small.txt", [&](Bytes& m, UniquePointer<IFile>& f) { write_at(m, f, 200, make_data(20000, 34)); });
+  change("/medium.bin", [&](Bytes& m, UniquePointer<IFile>& f) {
+    write_at(m, f, 7000, make_data(9000, 35));       // over old data, across blocks
+    write_at(m, f, 100000, make_data(5000, 36));     // past the end: a hole of zeros
+  });
+  change("/big.bin", [&](Bytes& m, UniquePointer<IFile>& f) {
+    write_at(m, f, 123457, make_data(300000, 37));
+    must(f->resize(1000000), "cut big");
+    m.resize(1000000);
+  });
+  host_dir(exp + "/newdir/inner");
+  must(fs.create_directory("/newdir"), "mkdir newdir");
+  must(fs.create_directory("/newdir/inner"), "mkdir inner");
+  create("/newdir/inner/deep.bin", make_data(70000, 38));
+  host_dir(exp + "/many2");
+  must(fs.create_directory("/many2"), "mkdir many2");
+  for (int i = 0; i < 300; ++i) {
+    char name[96];
+    snprintf(name, sizeof name, "/many2/file_number_with_a_longish_name_%04d.dat", (i * 53) % 1000);
+    create(name, make_data(i % 5 * 400, i));
+  }
+  must(fs.rename("/dir1/sub/deep.txt", "/dir1/moved.txt"), "rename file");
+  rename((exp + "/dir1/sub/deep.txt").c_str(), (exp + "/dir1/moved.txt").c_str());
+  must(fs.rename("/dir1/sub", "/subdir_renamed"), "rename directory");
+  rename((exp + "/dir1/sub").c_str(), (exp + "/subdir_renamed").c_str());
+  for (int i = 0; i < 600; i += 2) {
+    char name[96];
+    snprintf(name, sizeof name, "/many/a_reasonably_long_file_name_%04d.dat", i);
+    must(fs.remove(name), "remove");
+    remove((exp + name).c_str());
+  }
+  must(fs.remove("/emptydir"), "remove emptydir");
+  rmdir((exp + "/emptydir").c_str());
+  must(fs.remove("/new_small.txt"), "remove new_small");
+  remove((exp + "/new_small.txt").c_str());
+  must(fs.flush(), "flush");
+  fsp = UniquePointer<IFileSystem>();
+  FILE* o = fopen(out, "wb");
+  if (!o) return 2;
+  fwrite(disk.data, 1, disk.blocks * disk.block_size, o);
+  fclose(o);
+  printf(bad ? "%d operations failed\n" : "all operations succeeded\n", bad);
+  return bad ? 1 : 0;
+}
+}  // namespace interop
+
+int main(int argc, char** argv) {
+  if (argc == 4 && strcmp(argv[1], "dump") == 0) return interop::run_dump(argv[2], argv[3]);
+  if (argc == 5 && strcmp(argv[1], "real") == 0) return interop::run_real(argv[2], argv[3], argv[4]);
+
   test_big_writes();
   test_times();
   test_volume(1024, 8, 16, 1024, 512, "BeFS 1 KiB blocks, 512 byte device");
