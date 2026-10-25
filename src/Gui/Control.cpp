@@ -173,7 +173,7 @@ Control* Control::hit_test(int32_t x, int32_t y) {
     Control* c = children_[i - 1];
     if (Control* hit = c->hit_test(x - c->bounds_.x, y - c->bounds_.y)) return hit;
   }
-  return this;
+  return mouse_transparent() ? nullptr : this;
 }
 
 }  // namespace gui

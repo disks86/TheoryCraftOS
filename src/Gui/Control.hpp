@@ -164,6 +164,8 @@ class Control {
 
   // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
   Control* hit_test(int32_t x, int32_t y);
+  // True for a control the pointer passes through (a tooltip): hit_test() never returns it, only the controls inside it.
+  virtual bool mouse_transparent() const { return false; }
 
  protected:
   explicit Control(allocators::IAllocator& allocator) : allocator_(allocator), children_(allocator) {}

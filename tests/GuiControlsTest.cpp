@@ -34,6 +34,7 @@
 #include "Gui/Controls/ScrollPanel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/Toggle.hpp"
+#include "Gui/Controls/Tooltip.hpp"
 #include "Gui/Date.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -419,6 +420,64 @@ static void test_bar_chart() {
     b.clear_bars();
     CHECK(b.bar_count() == 0 && b.selected_index() == -1);
     w.render();
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_tooltip() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 200);
+    Window w(a, screen.renderer, theme, {300, 200});
+    Label under(a);
+    under.set_bounds({0, 0, 300, 200});
+    w.add(&under);
+    Tooltip tip(a);
+    w.add(&tip);   // after the controls it floats over
+    CHECK(!tip.shown() && tip.line_count() == 0);
+    tip.show_at(50, 50);   // no text: stays hidden
+    CHECK(!tip.shown());
+
+    CHECK(tip.set_text("Save\nCtrl+S"));
+    CHECK(tip.line_count() == 2 && tip.text() == "Save\nCtrl+S");
+    const Size size = tip.box_size();
+    CHECK(size.width == 6 * 8 + 2 * Tooltip::kPadX + 2 && size.height == 2 * 16 + 2 * Tooltip::kPadY + 2);
+
+    // Below and to the right of the pointer, clear of it.
+    tip.show_at(50, 50);
+    CHECK(tip.shown() && tip.bounds().x > 50 && tip.bounds().y > 50);
+    CHECK(tip.bounds().width == static_cast<uint32_t>(size.width) && tip.bounds().height == static_cast<uint32_t>(size.height));
+    w.render();
+    const Rect2D b = tip.bounds();
+    CHECK(screen.px(b.x + b.width - 3, b.y + 3) == Tooltip::kBackground);   // inside the box
+    CHECK(screen.px(b.x, b.y) == theme.dark);                               // its border
+
+    // Near the right and bottom edges it flips to the other side of the pointer.
+    tip.show_at(295, 195);
+    CHECK(tip.bounds().x + static_cast<int32_t>(tip.bounds().width) <= 295 && tip.bounds().y + static_cast<int32_t>(tip.bounds().height) <= 195);
+    tip.show_at(0, 0);
+    CHECK(tip.bounds().x >= 0 && tip.bounds().y >= 0);
+
+    // Under a control, or above it when there is no room below; always inside the window.
+    tip.show_below({20, 30, 60, 20});
+    CHECK(tip.bounds().x == 20 && tip.bounds().y == 52);
+    tip.show_below({20, 180, 60, 20});
+    CHECK(tip.bounds().y + static_cast<int32_t>(tip.bounds().height) <= 180);
+    tip.show_below({290, 30, 10, 20});
+    CHECK(tip.bounds().x + static_cast<int32_t>(tip.bounds().width) <= 300);
+
+    // The pointer passes through it: a click on the tooltip reaches the control below.
+    tip.show_at(100, 100);
+    const Rect2D t = tip.bounds();
+    CHECK(w.hit_test(t.x + 5, t.y + 5) == &under);
+
+    tip.hide();
+    CHECK(!tip.shown());
+    w.render();
+    CHECK(tip.set_text(""));
+    tip.show_at(10, 10);
+    CHECK(!tip.shown());
   }
   CHECK(a.live == 0);
 }
@@ -829,6 +888,7 @@ int main() {
   test_level_meter();
   test_pie_chart();
   test_bar_chart();
+  test_tooltip();
   test_scroll_panel();
   test_checkbox();
   test_radio();
