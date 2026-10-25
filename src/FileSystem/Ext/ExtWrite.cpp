@@ -17,6 +17,7 @@
  */
 
 // The writing half of ExtFileSystem: allocation, the block map, file data, directory changes and the namespace operations.
+#include "FileSystem/Ext/ExtChecksum.hpp"
 #include "FileSystem/Ext/ExtFileSystem.hpp"
 #include "FileSystem/Path.hpp"
 #include "Utility/Move.hpp"
@@ -36,13 +37,43 @@ uint32_t record_length_to_disk(uint32_t length) { return length >= 65536 ? 65535
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Blocks and inodes
 
+// The bitmap of a group marked as never used (BLOCK_UNINIT) was never written: it is worked out instead.
 Status ExtFileSystem::load_block_bitmap(uint32_t group, ByteBuffer* bitmap) {
   bitmap->clear();
   if (!bitmap->put_zeros(block_size_)) return Status::OutOfMemory;
+  if (group_csum_ && (gd_flags(group) & kGroupBlockUninit)) {
+    synth_block_bitmap(group, bitmap->writable_view());
+    return Status::Ok;
+  }
   return read_block(gd_block_bitmap(group), bitmap->writable_view());
 }
 
-Status ExtFileSystem::store_block_bitmap(uint32_t group, ByteBuffer& bitmap) { return write_block(gd_block_bitmap(group), bitmap.view()); }
+// Writing a bitmap makes its group an initialized one, and updates the checksum in the descriptor (the caller stores the descriptor).
+Status ExtFileSystem::store_block_bitmap(uint32_t group, ByteBuffer& bitmap) {
+  const Status s = write_block(gd_block_bitmap(group), bitmap.view());
+  if (s != Status::Ok) return s;
+  if (group_csum_ && (gd_flags(group) & kGroupBlockUninit)) gd_set_flags(group, gd_flags(group) & ~uint32_t{kGroupBlockUninit});
+  bitmap_checksum_set(group, false, bitmap.view());
+  return Status::Ok;
+}
+
+Status ExtFileSystem::load_inode_bitmap(uint32_t group, ByteBuffer* bitmap) {
+  bitmap->clear();
+  if (!bitmap->put_zeros(block_size_)) return Status::OutOfMemory;
+  if (group_csum_ && (gd_flags(group) & kGroupInodeUninit)) {
+    for (uint64_t bit = inodes_per_group_; bit < uint64_t{block_size_} * 8; ++bit) bit_set(bitmap->writable_view(), bit);
+    return Status::Ok;
+  }
+  return read_block(gd_inode_bitmap(group), bitmap->writable_view());
+}
+
+Status ExtFileSystem::store_inode_bitmap(uint32_t group, ByteBuffer& bitmap) {
+  const Status s = write_block(gd_inode_bitmap(group), bitmap.view());
+  if (s != Status::Ok) return s;
+  if (group_csum_ && (gd_flags(group) & kGroupInodeUninit)) gd_set_flags(group, gd_flags(group) & ~uint32_t{kGroupInodeUninit});
+  bitmap_checksum_set(group, true, bitmap.view());
+  return Status::Ok;
+}
 
 // Takes a run of up to `want` free blocks (at least one), as near to `goal_block` as possible: its group first, then the others in order.
 Status ExtFileSystem::alloc_blocks(uint32_t goal_group, uint64_t goal_block, uint64_t want, uint64_t* start, uint64_t* got) {
@@ -139,18 +170,27 @@ Status ExtFileSystem::alloc_inode(bool directory, uint32_t parent, uint32_t* num
   for (uint32_t step = 0; step < group_count_; ++step) {
     const uint32_t group = (parent_group + step) % group_count_;
     if (gd_free_inodes(group) == 0) continue;
-    bitmap.clear();
-    if (!bitmap.put_zeros(block_size_)) return Status::OutOfMemory;
-    Status s = read_block(gd_inode_bitmap(group), bitmap.writable_view());
+    Status s = load_inode_bitmap(group, &bitmap);
     if (s != Status::Ok) return s;
     const uint64_t from = group == 0 ? first_inode_ - 1 : 0;
     const uint64_t index = bit_find_zero(bitmap.view(), from, inodes_per_group_);
-    if (index >= inodes_per_group_) {
-      bitmap.clear();
-      continue;
-    }
+    if (index >= inodes_per_group_) continue;
     bit_set(bitmap.writable_view(), index);
-    s = write_block(gd_inode_bitmap(group), bitmap.view());
+    if (group_csum_) {
+      // The inodes at the end of the table that were never used are not looked at by e2fsck; taking one moves that boundary.
+      const uint64_t unused = gd_get(group, kGdItableUnused, kGdItableUnusedHi, true);
+      const uint64_t boundary = inodes_per_group_ > unused ? inodes_per_group_ - unused : 0;
+      if (index >= boundary) {
+        if (!(gd_flags(group) & kGroupItableZeroed) && index > boundary) {  // the slots in between must read as free inodes
+          ByteBuffer zeros(allocator_);
+          if (!zeros.put_zeros((index - boundary) * inode_size_)) return Status::OutOfMemory;
+          s = write_bytes(gd_inode_table(group) * block_size_ + boundary * inode_size_, zeros.view());
+          if (s != Status::Ok) return s;
+        }
+        gd_set(group, kGdItableUnused, kGdItableUnusedHi, true, inodes_per_group_ - index - 1);
+      }
+    }
+    s = store_inode_bitmap(group, bitmap);
     if (s != Status::Ok) return s;
     gd_set(group, kGdFreeInodes, kGdFreeInodesHi, true, gd_free_inodes(group) - 1);
     if (directory) gd_set(group, kGdUsedDirs, kGdUsedDirsHi, true, gd_used_dirs(group) + 1);
@@ -168,12 +208,11 @@ Status ExtFileSystem::free_inode(uint32_t number, bool directory) {
   const uint32_t group = (number - 1) / inodes_per_group_;
   const uint32_t index = (number - 1) % inodes_per_group_;
   ByteBuffer bitmap(allocator_);
-  if (!bitmap.put_zeros(block_size_)) return Status::OutOfMemory;
-  Status s = read_block(gd_inode_bitmap(group), bitmap.writable_view());
+  Status s = load_inode_bitmap(group, &bitmap);
   if (s != Status::Ok) return s;
   if (!bit_test(bitmap.view(), index)) return Status::Corrupt;
   bit_clear(bitmap.writable_view(), index);
-  s = write_block(gd_inode_bitmap(group), bitmap.view());
+  s = store_inode_bitmap(group, bitmap);
   if (s != Status::Ok) return s;
   gd_set(group, kGdFreeInodes, kGdFreeInodesHi, true, gd_free_inodes(group) + 1);
   if (directory && gd_used_dirs(group) > 0) gd_set(group, kGdUsedDirs, kGdUsedDirsHi, true, gd_used_dirs(group) - 1);
@@ -194,7 +233,13 @@ Status ExtFileSystem::release_xattr_block(uint64_t block) {
   if (rd32(data.view(), 0) != kXattrMagic) return Status::Corrupt;
   const uint32_t references = rd32(data.view(), 4);
   if (references > 1) {
-    wr32(data.writable_view(), 4, references - 1);
+    wr32(data.writable_view(), kXattrRefcount, references - 1);
+    if (metadata_csum_) {  // crc32c over the block number and the block with its checksum field zeroed
+      wr32(data.writable_view(), kXattrChecksum, 0);
+      const uint8_t number[8] = {static_cast<uint8_t>(block), static_cast<uint8_t>(block >> 8), static_cast<uint8_t>(block >> 16), static_cast<uint8_t>(block >> 24),
+                                 static_cast<uint8_t>(block >> 32), static_cast<uint8_t>(block >> 40), static_cast<uint8_t>(block >> 48), static_cast<uint8_t>(block >> 56)};
+      wr32(data.writable_view(), kXattrChecksum, crc32c(crc32c(csum_seed_, ConstByteView(number)), data.view()));
+    }
     return write_block(block, data.view());
   }
   return free_blocks(block, 1);
@@ -379,12 +424,13 @@ Status ExtFileSystem::bm_free_from(Inode* inode, uint64_t keep) {
 
 Status ExtFileSystem::free_from(Inode* inode, uint64_t first_block) {
   if (is_fast_symlink(*inode)) return Status::Ok;
-  Status s = bm_free_from(inode, first_block);
+  Status s = uses_extents(*inode) ? ext_free_from(inode, first_block) : bm_free_from(inode, first_block);
   const Status f = flush_frees();
   return s != Status::Ok ? s : f;
 }
 
 Status ExtFileSystem::map_range(Inode* inode, uint64_t first, uint32_t count, bool create, ArrayView<Mapping> out, uint32_t* done) {
+  if (uses_extents(*inode)) return (incompat_ & kIncompatExtents) ? ext_map_range(inode, first, count, create, out, done) : Status::Corrupt;
   *done = 0;
   uint64_t previous = 0;
   for (uint32_t i = 0; i < count; ++i) {
@@ -435,7 +481,7 @@ Status ExtFileSystem::write_file_data(Inode* inode, uint64_t offset, ConstByteVi
   *transferred = 0;
   if (data.empty()) return Status::Ok;
   if (offset > UINT64_MAX - data.size()) return Status::NoSpace;
-  Status s = check_size(offset + data.size());
+  Status s = check_size(*inode, offset + data.size());
   if (s != Status::Ok) return s;
   if (offset > inode->size()) {
     s = zero_tail(inode, inode->size());
@@ -489,7 +535,7 @@ Status ExtFileSystem::write_file_data(Inode* inode, uint64_t offset, ConstByteVi
     position += consumed;
     rest = rest.dropped(consumed);
     *transferred += consumed;
-    if (position > inode->size()) {
+    if (consumed > 0 && position > inode->size()) {  // (the file grows by what was written, not by a failed attempt to write past its end)
       inode->set_size(position);
       note_size(*inode);
     }
@@ -504,7 +550,7 @@ Status ExtFileSystem::write_file_data(Inode* inode, uint64_t offset, ConstByteVi
 Status ExtFileSystem::resize_inode(Inode* inode, uint64_t new_size) {
   const uint64_t old_size = inode->size();
   if (new_size == old_size) return Status::Ok;
-  Status s = check_size(new_size);
+  Status s = check_size(*inode, new_size);
   if (s != Status::Ok) return s;
   if (new_size > old_size) {
     s = zero_tail(inode, old_size);
@@ -545,12 +591,61 @@ void ExtFileSystem::dir_init_block(ByteView block, uint32_t self, uint32_t paren
   block.fill(0);
   const uint8_t type = (incompat_ & kIncompatFiletype) ? kFtDirectory : kFtUnknown;
   put_entry(block, 0, self, 12, ".", type);
-  put_entry(block, 12, parent, block_size_ - 12, "..", type);
+  put_entry(block, 12, parent, dir_limit() - 12, "..", type);
+}
+
+// With metadata_csum every directory leaf block ends in a 12 byte record that looks like an empty entry and holds the block's crc32c.
+void ExtFileSystem::dir_tail_set(const Inode& dir, ByteView block) const {
+  if (!metadata_csum_) return;
+  const uint32_t at = block_size_ - 12;
+  wr32(block, at, 0);
+  wr16(block, at + 4, 12);
+  wr8(block, at + 6, 0);
+  wr8(block, at + 7, 0xDE);
+  wr32(block, at + 8, crc32c(inode_seed(dir), ConstByteView(block).first(at)));
+}
+
+Status ExtFileSystem::store_dir_block(const Inode& dir, uint64_t disk, ByteBuffer& block) {
+  dir_tail_set(dir, block.writable_view());
+  return write_block(disk, block.view());
 }
 
 // A directory made by ext3/ext4 may have a hash tree, which this code does not keep up to date. The tree is just a layer over the
-// entries, which stay a valid linear list, so dropping the flag leaves a plain directory.
+// entries, which stay a valid linear list, so dropping the flag leaves a plain directory. (With metadata_csum the blocks of the tree
+// carry checksums of their own kind: the root block and the index blocks are rewritten as ordinary blocks, with the checksum record.)
 Status ExtFileSystem::dir_flatten(Inode* dir) {
+  if (metadata_csum_) {
+    ByteBuffer block(allocator_);
+    if (!block.put_zeros(block_size_)) return Status::OutOfMemory;
+    const uint64_t blocks = (dir->size() + block_size_ - 1) / block_size_;
+    for (uint64_t index = 0; index < blocks; ++index) {
+      uint64_t disk = 0, run = 0;
+      Status s = map_run(*dir, index, 1, &disk, &run);
+      if (s != Status::Ok) return s;
+      if (disk == 0) continue;
+      s = read_block(disk, block.writable_view());
+      if (s != Status::Ok) return s;
+      DirEntry first;
+      s = dir_parse(block.view(), 0, &first);
+      if (s != Status::Ok) return s;
+      if (index == 0) {  // the root: "." and ".." and, hidden in the length of "..", the start of the tree
+        DirEntry parent;
+        s = dir_parse(block.view(), first.record_length, &parent);
+        if (s != Status::Ok) return s;
+        const uint32_t used = first.record_length + align4(kDirHeader + parent.name_length);
+        if (used > dir_limit()) return Status::Corrupt;
+        wr16(block.writable_view(), first.record_length + 4, record_length_to_disk(dir_limit() - first.record_length));
+        block.writable_view().subview(used, block_size_ - used).fill(0);
+      } else if (first.record_length == block_size_) {  // an index block: an empty leaf takes its place
+        block.writable_view().fill(0);
+        wr16(block.writable_view(), 4, record_length_to_disk(dir_limit()));
+      } else {
+        continue;
+      }
+      s = store_dir_block(*dir, disk, block);
+      if (s != Status::Ok) return s;
+    }
+  }
   wr32(dir->bytes(), kInFlags, dir->flags() & ~kFlagIndex);
   return write_inode(*dir);
 }
@@ -571,10 +666,11 @@ Status ExtFileSystem::dir_add(Inode* dir, StringView name, uint32_t number, uint
     if (disk == 0) continue;
     s = read_block(disk, block.writable_view());
     if (s != Status::Ok) return s;
-    for (uint32_t offset = 0; offset < block_size_;) {
+    for (uint32_t offset = 0; offset < dir_limit();) {
       DirEntry found;
       s = dir_parse(block.view(), offset, &found);
       if (s != Status::Ok) return s;
+      if (found.record_length > dir_limit() - offset) return Status::Corrupt;  // (runs into the checksum record)
       const uint32_t used = found.inode == 0 ? 0 : align4(kDirHeader + found.name_length);
       if (found.record_length - used >= need) {
         if (found.inode == 0) {
@@ -583,7 +679,7 @@ Status ExtFileSystem::dir_add(Inode* dir, StringView name, uint32_t number, uint
           wr16(block.writable_view(), offset + 4, record_length_to_disk(used));
           put_entry(block.writable_view(), offset + used, number, found.record_length - used, name, type);
         }
-        return write_block(disk, block.view());
+        return store_dir_block(*dir, disk, block);
       }
       offset += found.record_length;
     }
@@ -597,8 +693,8 @@ Status ExtFileSystem::dir_add(Inode* dir, StringView name, uint32_t number, uint
     return s;
   }
   block.writable_view().fill(0);
-  put_entry(block.writable_view(), 0, number, block_size_, name, type);
-  Status w = write_block(mapping[0].block, block.view());
+  put_entry(block.writable_view(), 0, number, dir_limit(), name, type);
+  Status w = store_dir_block(*dir, mapping[0].block, block);
   if (w != Status::Ok) return w;
   dir->set_size((blocks + 1) * block_size_);
   return write_inode(*dir);
@@ -617,10 +713,11 @@ Status ExtFileSystem::dir_remove(const Inode& dir, StringView name) {
     if (s != Status::Ok) return s;
     bool have_previous = false;
     DirEntry previous;
-    for (uint32_t offset = 0; offset < block_size_;) {
+    for (uint32_t offset = 0; offset < dir_limit();) {
       DirEntry found;
       s = dir_parse(block.view(), offset, &found);
       if (s != Status::Ok) return s;
+      if (found.record_length > dir_limit() - offset) return Status::Corrupt;
       const StringView text(reinterpret_cast<const char*>(block.view().subview(found.offset + kDirHeader, found.name_length).data()), found.name_length);
       if (found.inode != 0 && text.equals(name)) {
         if (!have_previous) {
@@ -628,7 +725,7 @@ Status ExtFileSystem::dir_remove(const Inode& dir, StringView name) {
         } else {
           wr16(block.writable_view(), previous.offset + 4, record_length_to_disk(previous.record_length + found.record_length));
         }
-        return write_block(disk, block.view());
+        return store_dir_block(dir, disk, block);
       }
       previous = found;
       have_previous = true;
@@ -648,7 +745,12 @@ Status ExtFileSystem::dir_set_parent(const Inode& dir, uint32_t parent) {
   s = map_run(dir, index, 1, &disk, &run);
   if (s != Status::Ok) return s;
   if (disk == 0) return Status::Corrupt;
-  return write_word(disk, entry.offset / 4, parent);
+  ByteBuffer block(allocator_);
+  if (!block.put_zeros(block_size_)) return Status::OutOfMemory;
+  s = read_block(disk, block.writable_view());
+  if (s != Status::Ok) return s;
+  wr32(block.writable_view(), entry.offset, parent);
+  return store_dir_block(dir, disk, block);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
@@ -663,13 +765,17 @@ Status ExtFileSystem::init_inode(Inode* inode, uint16_t mode, uint32_t links) {
   wr32(v, kInAtime, kTimeStamp);
   wr32(v, kInCtime, kTimeStamp);
   wr32(v, kInMtime, kTimeStamp);
+  if ((incompat_ & kIncompatExtents) && ((mode & kModeTypeMask) == kModeRegular || (mode & kModeTypeMask) == kModeDirectory)) {
+    wr32(v, kInFlags, kFlagExtents);
+    ext_init_root(inode);
+  }
   if (inode_size_ > kOldInodeSize) {
     uint32_t extra = sb16(kSbWantExtraIsize);
     if (extra == 0) extra = kDefaultExtraIsize;
     if (extra > inode_size_ - kOldInodeSize) extra = inode_size_ - kOldInodeSize;
     extra &= ~3u;
     wr16(v, kInExtraIsize, extra);
-    if (extra >= 24) wr32(v, 0x90, kTimeStamp);  // i_crtime
+    if (extra >= 24) wr32(v, kInCrtime, kTimeStamp);
   }
   return Status::Ok;
 }
@@ -707,7 +813,7 @@ Status ExtFileSystem::create_node(StringView path, bool directory, uint32_t* num
         s = Status::OutOfMemory;
       } else {
         dir_init_block(block.writable_view(), ino, parent.number);
-        s = write_block(mapping[0].block, block.view());
+        s = store_dir_block(node, mapping[0].block, block);
         node.set_size(block_size_);
       }
     }

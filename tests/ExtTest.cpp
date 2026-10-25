@@ -298,9 +298,22 @@ static std::vector<Variant> ext3_variants() {
   };
 }
 
+static std::vector<Variant> ext4_variants() {
+  return {
+      {"ext4 4k", "-t ext4 -b 4096 -I 256 -N 4000", 40, 4096, "ext4"},                       // the defaults: extents, 64bit, flex_bg, metadata_csum
+      {"ext4 1k", "-t ext4 -b 1024 -I 256 -N 4000", 32, 1024, "ext4"},
+      {"ext4 uninit_bg", "-t ext4 -b 2048 -I 256 -O ^metadata_csum,uninit_bg -N 4000", 32, 2048, "ext4"},
+      {"ext4 plain", "-t ext4 -b 4096 -I 128 -O ^64bit,^has_journal,^metadata_csum,^flex_bg -N 4000", 32, 4096, "ext4"},
+      {"ext4 lazy", "-t ext4 -b 4096 -I 256 -g 2048 -E lazy_itable_init=1,lazy_journal_init=1 -N 4000", 40, 4096, "ext4"},
+      {"ext4 groups", "-t ext4 -b 1024 -I 256 -g 1024 -O ^metadata_csum,uninit_bg -N 4000", 32, 1024, "ext4"},
+      {"ext4 groups csum", "-t ext4 -b 2048 -I 256 -g 2048 -N 4000", 40, 2048, "ext4"},
+  };
+}
+
 static std::vector<Variant> all_variants() {
-  std::vector<Variant> v = ext2_variants(), w = ext3_variants();
+  std::vector<Variant> v = ext2_variants(), w = ext3_variants(), x = ext4_variants();
   v.insert(v.end(), w.begin(), w.end());
+  v.insert(v.end(), x.begin(), x.end());
   return v;
 }
 
@@ -760,6 +773,8 @@ static void test_journals(const Variant& v) {
   test_journal(v, "checksummed", "jo -c\njw -b @ALL@ @WORK@/pat1\njc\n", true);
 }
 
+static void check_flags_indexed(const std::string& image, const std::string& path, bool want_indexed);
+
 // A directory with a hash tree (made by e2fsck -D) is read, and flattened by the first change to it.
 static void test_htree(const Variant& v) {
   if (g_verbose) printf("htree: %s\n", v.name);
@@ -777,7 +792,7 @@ static void test_htree(const Variant& v) {
   const std::string img = g_work + "/htree.img";
   spit(img, image);
   sh("e2fsck -fyD '" + img + "' > /dev/null 2>&1");
-  CHECK(debugfs(img, "stat /big\n", false).find("Flags: 0x1000") != std::string::npos);
+  check_flags_indexed(img, "/big", true);
   image = slurp(img);
   Mounted mt;
   CHECK_STATUS(mt.mount(image, 512, true), Status::Ok);
@@ -798,6 +813,205 @@ static void test_htree(const Variant& v) {
   CHECK(compare_tree(*mt.fs, m, "htree changed") == 0);
   CHECK_STATUS(mt.fs->flush(), Status::Ok);
   CHECK_FSCK(mt.image());
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Extent trees (ext4)
+
+static void check_flags_indexed(const std::string& image, const std::string& path, bool want_indexed) {
+  const std::string text = debugfs(image, "stat " + path + "\n", false);
+  const size_t at = text.find("Flags: 0x");
+  const unsigned long flags = at == std::string::npos ? 0 : strtoul(text.c_str() + at + 9, nullptr, 16);
+  CHECK(((flags & 0x1000) != 0) == want_indexed);
+}
+
+static void test_extent_trees(const Variant& v) {
+  if (g_verbose) printf("extents: %s\n", v.name);
+  const uint32_t bs = v.block_size;
+  const std::string dir = g_work + "/src";
+  sh("rm -rf '" + dir + "'; mkdir -p '" + dir + "'");
+  // files made of many single block pieces with holes between them: a tree of depth 1 and one of depth 2
+  Model m;
+  for (int variant = 0; variant < 2; ++variant) {
+    const int pieces = variant == 0 ? 7 : 1500;
+    std::vector<std::pair<uint64_t, Bytes>> parts;
+    Bytes whole(uint64_t{2} * pieces * bs, 0);
+    for (int i = 0; i < pieces; ++i) {
+      Bytes piece = make_data(bs, i + 3 * variant);
+      parts.push_back({uint64_t{2} * i * bs, piece});
+      memcpy(whole.data() + uint64_t{2} * i * bs, piece.data(), bs);
+    }
+    whole.resize((uint64_t{2} * (pieces - 1) + 1) * bs);
+    const std::string name = variant == 0 ? "/frag7" : "/frag1500";
+    make_sparse(dir + name, parts);
+    m.files[name] = whole;
+  }
+  Bytes image = make_image(v, dir, "-N 200");
+  {
+    const std::string img = g_work + "/frag.img";
+    spit(img, image);
+    const std::string text = debugfs(img, "ex /frag1500\n", false);
+    CHECK(text.find("Level Entries") != std::string::npos);
+    CHECK(text.find("  2/ 2") != std::string::npos || text.find("2/ 2") != std::string::npos);  // (levels 0, 1 and 2 are listed)
+  }
+  Mounted mt;
+  CHECK_STATUS(mt.mount(image, 512, true), Status::Ok);
+  if (!mt.fs) return;
+  IFileSystem& fs = *mt.fs;
+  CHECK(compare_tree(fs, m, v.name) == 0);
+
+  // fill the holes of the big one: the extents get new neighbours, in the middle of the tree
+  {
+    UniquePointer<IFile> f;
+    CHECK_STATUS(fs.open_file("/frag1500", OpenMode::ReadWrite, &f), Status::Ok);
+    Bytes& cur = m.files["/frag1500"];
+    for (int i = 0; i < 1499; i += (i < 100 ? 1 : 3)) {
+      Bytes piece = make_data(bs, 5000 + i);
+      uint64_t put = 0;
+      CHECK_STATUS(f->write((uint64_t{2} * i + 1) * bs, ConstByteView(piece.data(), piece.size()), &put), Status::Ok);
+      memcpy(cur.data() + (uint64_t{2} * i + 1) * bs, piece.data(), bs);
+    }
+    // one write over many holes and extents at once
+    Bytes wide = make_data(300ull * bs + 11, 9);
+    uint64_t put = 0;
+    CHECK_STATUS(f->write(1000ull * bs + 7, ConstByteView(wide.data(), wide.size()), &put), Status::Ok);
+    memcpy(cur.data() + 1000ull * bs + 7, wide.data(), wide.size());
+  }
+  CHECK(compare_tree(fs, m, "holes filled") == 0);
+  CHECK_STATUS(fs.flush(), Status::Ok);
+  CHECK_FSCK(mt.image());
+
+  // cut it back through the levels of the tree, grow again, empty it
+  {
+    UniquePointer<IFile> f;
+    CHECK_STATUS(fs.open_file("/frag1500", OpenMode::ReadWrite, &f), Status::Ok);
+    for (uint64_t blocks : {uint64_t{2400}, uint64_t{1200}, uint64_t{700}, uint64_t{9}, uint64_t{2}, uint64_t{0}}) {
+      const uint64_t size = blocks * bs + (blocks % 3 ? 17 : 0);
+      CHECK_STATUS(f->resize(size), Status::Ok);
+      m.files["/frag1500"].resize(size, 0);
+      CHECK(compare_tree(fs, m, "cut") == 0);
+      CHECK_STATUS(fs.flush(), Status::Ok);
+      CHECK_FSCK(mt.image());
+    }
+    Bytes again = make_data(40 * bs, 1);
+    uint64_t put = 0;
+    CHECK_STATUS(f->write(0, ConstByteView(again.data(), again.size()), &put), Status::Ok);
+    m.files["/frag1500"] = again;
+  }
+  CHECK(compare_tree(fs, m, "regrown") == 0);
+
+  // two files grown alternately a block at a time: both end up with an extent for each block
+  {
+    UniquePointer<IFile> a, b;
+    CHECK_STATUS(fs.open_file("/alt_a", OpenMode::CreateOrOpen, &a), Status::Ok);
+    CHECK_STATUS(fs.open_file("/alt_b", OpenMode::CreateOrOpen, &b), Status::Ok);
+    Bytes& wa = m.files["/alt_a"];
+    Bytes& wb = m.files["/alt_b"];
+    for (int i = 0; i < 900; ++i) {
+      Bytes pa = make_data(bs, i), pb = make_data(bs, i + 1000);
+      uint64_t put = 0;
+      CHECK_STATUS(a->write(static_cast<uint64_t>(i) * bs, ConstByteView(pa.data(), pa.size()), &put), Status::Ok);
+      CHECK_STATUS(b->write(static_cast<uint64_t>(i) * bs, ConstByteView(pb.data(), pb.size()), &put), Status::Ok);
+      wa.insert(wa.end(), pa.begin(), pa.end());
+      wb.insert(wb.end(), pb.begin(), pb.end());
+    }
+  }
+  CHECK(compare_tree(fs, m, "alternating") == 0);
+  CHECK_STATUS(fs.remove("/alt_a"), Status::Ok);
+  m.files.erase("/alt_a");
+  CHECK_STATUS(fs.remove("/frag7"), Status::Ok);
+  m.files.erase("/frag7");
+  CHECK(compare_tree(fs, m, "removed") == 0);
+  CHECK_STATUS(fs.flush(), Status::Ok);
+  Bytes after = mt.image();
+  CHECK_FSCK(after);
+  Mounted again;
+  CHECK_STATUS(again.mount(after, 512, false), Status::Ok);
+  if (again.fs) CHECK(compare_tree(*again.fs, m, "remounted") == 0);
+}
+
+// Preallocated (unwritten) extents read as zeros, can be cut and removed, but are not written into.
+static void test_unwritten(const Variant& v) {
+  if (g_verbose) printf("unwritten: %s\n", v.name);
+  const uint32_t bs = v.block_size;
+  const std::string dir = g_work + "/src";
+  sh("rm -rf '" + dir + "'; mkdir -p '" + dir + "'");
+  Model m;
+  m.files["/pre"] = make_data(20ull * bs, 1);
+  populate(dir, m);
+  Bytes image = make_image(v, dir);
+  const std::string img = g_work + "/pre.img";
+  spit(img, image);
+  debugfs(img, "fallocate /pre 20 99\n", true);
+  debugfs(img, "dump /pre " + g_work + "/pre_ref\n", false);
+  Model want;
+  want.files["/pre"] = slurp(g_work + "/pre_ref");
+  CHECK(want.files["/pre"].size() >= 20ull * bs);
+  image = slurp(img);
+  Mounted mt;
+  CHECK_STATUS(mt.mount(image, 512, true), Status::Ok);
+  if (!mt.fs) return;
+  CHECK(compare_tree(*mt.fs, want, "unwritten") == 0);
+  UniquePointer<IFile> f;
+  CHECK_STATUS(mt.fs->open_file("/pre", OpenMode::ReadWrite, &f), Status::Ok);
+  Bytes data = make_data(100, 4);
+  uint64_t put = 0;
+  CHECK_STATUS(f->write(50ull * bs, ConstByteView(data.data(), data.size()), &put), Status::Unsupported);
+  CHECK(put == 0);
+  CHECK_STATUS(f->write(5ull * bs, ConstByteView(data.data(), data.size()), &put), Status::Ok);  // (the written part is fine)
+  memcpy(want.files["/pre"].data() + 5ull * bs, data.data(), data.size());
+  CHECK(compare_tree(*mt.fs, want, "unwritten after write") == 0);
+  CHECK_STATUS(f->resize(60ull * bs), Status::Ok);
+  want.files["/pre"].resize(60ull * bs);
+  CHECK_STATUS(f->resize(10ull * bs), Status::Ok);
+  want.files["/pre"].resize(10ull * bs);
+  f = UniquePointer<IFile>();
+  CHECK(compare_tree(*mt.fs, want, "unwritten cut") == 0);
+  CHECK_STATUS(mt.fs->flush(), Status::Ok);
+  CHECK_FSCK(mt.image());
+  CHECK_STATUS(mt.fs->remove("/pre"), Status::Ok);
+  CHECK_STATUS(mt.fs->flush(), Status::Ok);
+  CHECK_FSCK(mt.image());
+}
+
+// What mount does with the feature flags of ext4.
+static void test_mount_rules_ext4() {
+  const Variant v = ext4_variants()[0];
+  const Bytes clean = make_image(v);
+  auto put32 = [](Bytes& b, size_t o, uint32_t x) { for (int i = 0; i < 4; ++i) b[o + i] = x >> (8 * i); };
+  auto get32 = [](const Bytes& b, size_t o) { return b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (uint32_t{b[o + 3]} << 24); };
+  auto flag = [&](size_t offset, uint32_t bit) { Bytes b = clean; put32(b, 1024 + offset, get32(b, 1024 + offset) | bit); return b; };
+  {
+    Mounted m;
+    CHECK_STATUS(m.mount(clean, 512, true), Status::Ok);
+    CHECK(!m.fs->info().read_only);
+    CHECK(m.fs->info().type_name.view().equals("ext4"));
+    CHECK(m.fs->info().free_bytes > 0);
+  }
+  Mounted m;
+  CHECK_STATUS(m.mount(flag(0x60, 0x8000), 512, true), Status::Unsupported);   // inline data
+  CHECK_STATUS(m.mount(flag(0x60, 0x10), 512, true), Status::Unsupported);     // meta_bg
+  CHECK_STATUS(m.mount(flag(0x60, 0x10000), 512, true), Status::Unsupported);  // encryption
+  CHECK_STATUS(m.mount(flag(0x64, 0x200), 512, true), Status::Unsupported);    // bigalloc
+  CHECK_STATUS(m.mount(flag(0x64, 0x100), 512, true), Status::Ok);             // quota: read only
+  CHECK(m.fs->info().read_only);
+  CHECK_STATUS(m.mount(flag(0x64, 0x2000), 512, true), Status::Ok);            // project quota
+  CHECK(m.fs->info().read_only);
+  CHECK_STATUS(m.mount(flag(0x5C, 0x10000), 512, true), Status::Ok);           // orphans present
+  CHECK(m.fs->info().read_only);
+  CHECK_STATUS(m.mount(flag(0x5C, 0x400), 512, true), Status::Ok);             // fast commits
+  CHECK(m.fs->info().read_only);
+  {
+    Bytes b = clean;
+    b[1024 + 0x175] = 7;  // an unknown checksum type
+    CHECK_STATUS(m.mount(b, 512, true), Status::Unsupported);
+  }
+  {
+    Bytes b = clean;
+    put32(b, 1024 + 0xFE, 48);  // a descriptor size that is no power of two
+    CHECK_STATUS(m.mount(b, 512, true), Status::Corrupt);
+  }
 }
 
 static void test_handles() {
@@ -1019,19 +1233,27 @@ int main(int argc, char** argv) {
   };
   const std::vector<Variant> variants = all_variants();
   const std::vector<Variant> ext3 = ext3_variants();
+  const std::vector<Variant> ext4 = ext4_variants();
   if (want("read")) {
-    for (size_t i = 0; i < variants.size(); ++i) test_read(variants[i], i == 2 || i == 6 ? 4096 : 512, i == 1 || i == 5 ? 63 : 0);
+    for (size_t i = 0; i < variants.size(); ++i) test_read(variants[i], i % 3 == 2 ? 4096 : 512, i % 4 == 1 ? 63 : 0);
     test_read_sparse();
   }
   if (want("write")) for (const Variant& v : variants) test_write(v);
   if (want("bigdir")) { test_big_directory(variants[0]); test_big_directory(variants[2]); }
   if (want("full")) for (const Variant& v : variants) test_full_volume(v);
-  if (want("random")) for (uint32_t seed = 1; seed <= 8; ++seed) test_random(variants[seed % variants.size()], seed, 1500);
+  if (want("random")) for (uint32_t seed = 1; seed <= 14; ++seed) test_random(variants[(seed * 5) % variants.size()], seed, 1500);
   if (want("journal")) for (const Variant& v : ext3) test_journals(v);
-  if (want("htree")) for (const Variant& v : ext3) test_htree(v);
+  if (want("htree")) {
+    for (const Variant& v : ext3) test_htree(v);
+    for (size_t i : {0, 1, 2}) test_htree(ext4[i]);
+  }
+  if (want("extents")) {
+    for (const Variant& v : ext4) test_extent_trees(v);
+    for (size_t i : {0, 1, 3}) test_unwritten(ext4[i]);
+  }
   if (want("handles")) test_handles();
-  if (want("mount")) test_mount_rules();
-  if (want("damage")) { test_damage(variants[0]); test_damage(variants[2]); }
+  if (want("mount")) { test_mount_rules(); test_mount_rules_ext4(); }
+  if (want("damage")) { test_damage(variants[0]); test_damage(variants[2]); test_damage(ext3[0]); for (size_t i : {0, 2, 5, 6}) test_damage(ext4[i]); }
   sh("rm -rf '" + g_work + "'");
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("ExtTest: all passed\n");

@@ -18,6 +18,7 @@
 
 // Mounting, reading and the namespace of ExtFileSystem; the writing half is in ExtWrite.cpp.
 #include "FileSystem/Ext/ExtFileSystem.hpp"
+#include "FileSystem/Ext/ExtChecksum.hpp"
 #include "FileSystem/Path.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Utility/Move.hpp"
@@ -32,10 +33,12 @@ constexpr uint64_t kMaxGroupTable = uint64_t{1} << 26;  // a group descriptor ta
 constexpr uint32_t kMaxGroups = 1u << 22;
 
 // What this code reads, and what it also writes (anything else in the superblock makes the volume read only or unusable).
-constexpr uint32_t kReadableIncompat = kIncompatFiletype | kIncompatRecover | kIncompatFlexBg;
-constexpr uint32_t kWritableIncompat = kIncompatFiletype | kIncompatFlexBg;
-constexpr uint32_t kWritableCompat = 0x1 /*dir_prealloc*/ | kCompatHasJournal | kCompatExtAttr | kCompatResizeInode | kCompatDirIndex | kCompatSparseSuper2;
-constexpr uint32_t kWritableRoCompat = kRoSparseSuper | kRoLargeFile | kRoBtreeDir | kRoHugeFile | kRoDirNlink | kRoExtraIsize;
+constexpr uint32_t kReadableIncompat = kIncompatFiletype | kIncompatRecover | kIncompatFlexBg | kIncompatExtents | kIncompat64Bit | kIncompatMmp |
+                                       kIncompatCsumSeed | kIncompatLargeDir;
+constexpr uint32_t kWritableIncompat = kIncompatFiletype | kIncompatFlexBg | kIncompatExtents | kIncompat64Bit | kIncompatCsumSeed | kIncompatLargeDir;
+constexpr uint32_t kWritableCompat = 0x1 /*dir_prealloc*/ | kCompatHasJournal | kCompatExtAttr | kCompatResizeInode | kCompatDirIndex | kCompatSparseSuper2 |
+                                     kCompatStableInodes | kCompatOrphanFile;
+constexpr uint32_t kWritableRoCompat = kRoSparseSuper | kRoLargeFile | kRoBtreeDir | kRoHugeFile | kRoGdtCsum | kRoDirNlink | kRoExtraIsize | kRoMetadataCsum;
 
 bool power_of_two(uint64_t x) { return x != 0 && (x & (x - 1)) == 0; }
 }  // namespace
@@ -324,6 +327,13 @@ Status ExtFileSystem::load_volume() {
   if (first_inode_ < kRootInode + 1) return Status::Corrupt;
 
   blocks_count_ = sb32(kSbBlocksCount);
+  if (incompat_ & kIncompat64Bit) blocks_count_ |= uint64_t{sb32(kSbBlocksCountHi)} << 32;
+  metadata_csum_ = (ro_compat_ & kRoMetadataCsum) != 0;
+  group_csum_ = metadata_csum_ || (ro_compat_ & kRoGdtCsum) != 0;
+  if (metadata_csum_) {
+    if (sb_.view()[kSbChecksumType] != 1) return Status::Unsupported;  // (crc32c is the only kind there is)
+    csum_seed_ = (incompat_ & kIncompatCsumSeed) ? sb32(kSbChecksumSeed) : crc32c(~0u, sb_.view().subview(kSbUuid, 16));
+  }
   first_data_block_ = sb32(kSbFirstDataBlock);
   blocks_per_group_ = sb32(kSbBlocksPerGroup);
   inodes_per_group_ = sb32(kSbInodesPerGroup);
@@ -340,6 +350,10 @@ Status ExtFileSystem::load_volume() {
   itable_blocks_ = static_cast<uint32_t>((uint64_t{inodes_per_group_} * inode_size_ + block_size_ - 1) / block_size_);
 
   descriptor_size_ = 32;
+  if (incompat_ & kIncompat64Bit) {
+    descriptor_size_ = sb16(kSbDescSize);
+    if (!power_of_two(descriptor_size_) || descriptor_size_ < 64 || descriptor_size_ > 1024 || descriptor_size_ > block_size_) return Status::Corrupt;
+  }
   gdt_start_ = first_data_block_ + 1;
   const uint64_t table_bytes = uint64_t{group_count_} * descriptor_size_;
   if (table_bytes > kMaxGroupTable) return Status::Unsupported;
@@ -366,7 +380,7 @@ void ExtFileSystem::decide_writable() {
   writable_ = false;
   if (device_.info().read_only) return;
   const uint16_t state = sb16(kSbState);
-  if (!(state & kStateValid) || (state & (kStateError | kStateOrphans)) || sb32(kSbLastOrphan) != 0) return;
+  if (!(state & kStateValid) || (state & (kStateError | kStateOrphans)) || sb32(kSbLastOrphan) != 0 || (compat_ & kCompatOrphanPresent)) return;
   if (incompat_ & ~kWritableIncompat) return;
   if (compat_ & ~kWritableCompat) return;
   if (ro_compat_ & ~kWritableRoCompat) return;
@@ -408,7 +422,66 @@ void ExtFileSystem::gd_set(uint32_t group, uint32_t low, uint32_t high, bool wid
   }
 }
 
+void ExtFileSystem::gd_set_flags(uint32_t group, uint32_t flags) {
+  wr16(gd_.writable_view().subview(uint64_t{group} * descriptor_size_, descriptor_size_), kGdFlags, flags);
+}
+
+// The checksum of a group descriptor: crc32c with metadata_csum (low 16 bits of it), otherwise the crc16 of uninit_bg.
+void ExtFileSystem::group_checksum_set(uint32_t group) {
+  if (!group_csum_) return;
+  ByteView d = gd_.writable_view().subview(uint64_t{group} * descriptor_size_, descriptor_size_);
+  const ConstByteView rest = descriptor_size_ > kGdBlockBitmapHi ? ConstByteView(d).subview(kGdBlockBitmapHi, descriptor_size_ - kGdBlockBitmapHi) : ConstByteView();
+  uint32_t crc;
+  if (metadata_csum_) {
+    crc = crc32c_u32(csum_seed_, group);
+    crc = crc32c(crc, ConstByteView(d).first(kGdChecksum));
+    crc = crc32c_zeros(crc, 2);
+    crc = crc32c(crc, rest);
+  } else {
+    const uint8_t number[4] = {static_cast<uint8_t>(group), static_cast<uint8_t>(group >> 8), static_cast<uint8_t>(group >> 16), static_cast<uint8_t>(group >> 24)};
+    uint16_t sum = crc16(0xFFFF, sb_.view().subview(kSbUuid, 16));
+    sum = crc16(sum, ConstByteView(number));
+    sum = crc16(sum, ConstByteView(d).first(kGdChecksum));
+    if (incompat_ & kIncompat64Bit) sum = crc16(sum, rest);
+    crc = sum;
+  }
+  wr16(d, kGdChecksum, crc & 0xFFFF);
+}
+
+// The checksum of a bitmap lives in the group descriptor.
+void ExtFileSystem::bitmap_checksum_set(uint32_t group, bool inode_bitmap, ConstByteView bitmap) {
+  if (!metadata_csum_) return;
+  ByteView d = gd_.writable_view().subview(uint64_t{group} * descriptor_size_, descriptor_size_);
+  const uint32_t crc = crc32c(csum_seed_, bitmap.first((inode_bitmap ? inodes_per_group_ : blocks_per_group_) / 8));
+  if (inode_bitmap) {
+    wr16(d, kGdInodeBitmapCsum, crc & 0xFFFF);
+    if (descriptor_size_ >= kGdInodeBitmapCsumHi + 2) wr16(d, kGdInodeBitmapCsumHi, crc >> 16);
+  } else {
+    wr16(d, kGdBlockBitmapCsum, crc & 0xFFFF);
+    if (descriptor_size_ >= kGdBlockBitmapCsumHi + 2) wr16(d, kGdBlockBitmapCsumHi, crc >> 16);
+  }
+}
+
+// The block bitmap of a group that was never used (and so was never written): the superblock and descriptor copies, its own bitmaps and
+// inode table where they lie inside it, and the padding after the last block.
+void ExtFileSystem::synth_block_bitmap(uint32_t group, ByteView bitmap) const {
+  bitmap.fill(0);
+  const uint64_t first = group_first_block(group), count = group_block_count(group);
+  auto mark = [&](uint64_t block) {
+    if (block >= first && block - first < count) bit_set(bitmap, block - first);
+  };
+  if (group_has_super(group)) {
+    const uint64_t table_blocks = (uint64_t{group_count_} * descriptor_size_ + block_size_ - 1) / block_size_;
+    for (uint64_t k = 0; k < 1 + table_blocks + sb16(kSbReservedGdt); ++k) mark(first + k);
+  }
+  mark(gd_block_bitmap(group));
+  mark(gd_inode_bitmap(group));
+  for (uint32_t k = 0; k < itable_blocks_; ++k) mark(gd_inode_table(group) + k);
+  for (uint64_t bit = count; bit < uint64_t{block_size_} * 8; ++bit) bit_set(bitmap, bit);
+}
+
 Status ExtFileSystem::store_group(uint32_t group) {
+  group_checksum_set(group);
   const uint64_t offset = uint64_t{group} * descriptor_size_;
   return write_bytes(gdt_start_ * block_size_ + offset, gd_.view().subview(offset, descriptor_size_));
 }
@@ -416,7 +489,9 @@ Status ExtFileSystem::store_group(uint32_t group) {
 Status ExtFileSystem::write_super() {
   ByteView v = sb_.writable_view();
   wr32(v, kSbFreeBlocks, static_cast<uint32_t>(free_blocks_));
+  if (incompat_ & kIncompat64Bit) wr32(v, kSbFreeBlocksHi, static_cast<uint32_t>(free_blocks_ >> 32));
   wr32(v, kSbFreeInodes, static_cast<uint32_t>(free_inodes_));
+  if (metadata_csum_) wr32(v, kSbChecksum, crc32c(~0u, sb_.view().first(kSbChecksum)));
   return write_bytes(kSuperblockOffset, sb_.view());
 }
 
@@ -464,11 +539,28 @@ Status ExtFileSystem::read_inode(uint32_t number, Inode* inode) {
   return read_bytes(offset, inode->bytes());
 }
 
+uint32_t ExtFileSystem::inode_seed(const Inode& inode) const {
+  return crc32c_u32(crc32c_u32(csum_seed_, inode.number), rd32(inode.bytes(), kInGeneration));
+}
+
+void ExtFileSystem::inode_checksum_set(Inode* inode) const {
+  ByteView v = inode->bytes();
+  const bool has_high = inode_size_ > kGoodOldInodeSize && rd16(v, kInExtraIsize) >= 4;  // (the high half fits in the part that is used)
+  wr16(v, kInChecksumLo, 0);
+  if (has_high) wr16(v, kInChecksumHi, 0);
+  const uint32_t crc = crc32c(inode_seed(*inode), v);
+  wr16(v, kInChecksumLo, crc & 0xFFFF);
+  if (has_high) wr16(v, kInChecksumHi, crc >> 16);
+}
+
 Status ExtFileSystem::write_inode(const Inode& inode) {
   uint64_t offset = 0;
   const Status s = inode_offset(inode.number, &offset);
   if (s != Status::Ok) return s;
-  return write_bytes(offset, inode.bytes());
+  if (!metadata_csum_) return write_bytes(offset, inode.bytes());
+  Inode copy = inode;
+  inode_checksum_set(&copy);
+  return write_bytes(offset, copy.bytes());
 }
 
 uint64_t ExtFileSystem::inode_blocks(const Inode& inode) const {
@@ -534,6 +626,7 @@ Status ExtFileSystem::bm_get(const Inode& inode, uint64_t index, uint64_t* block
 // Looks at the blocks from `first` on: *block is the disk block of the first (0 for a hole) and *run how many of the next blocks (at
 // most `max`) are in the same situation: all holes, or consecutive disk blocks.
 Status ExtFileSystem::map_run(const Inode& inode, uint64_t first, uint64_t max, uint64_t* block, uint64_t* run) {
+  if (uses_extents(inode)) return (incompat_ & kIncompatExtents) ? ext_map_run(inode, first, max, block, run) : Status::Corrupt;
   uint64_t start = 0;
   Status s = bm_get(inode, first, &start);
   if (s != Status::Ok) return s;
@@ -551,7 +644,8 @@ Status ExtFileSystem::map_run(const Inode& inode, uint64_t first, uint64_t max, 
 }
 
 // The largest file the block map can hold, in blocks.
-Status ExtFileSystem::check_size(uint64_t size) const {
+Status ExtFileSystem::check_size(const Inode& inode, uint64_t size) const {
+  if (uses_extents(inode)) return size / block_size_ >= 0xFFFFFFFFull ? Status::NoSpace : Status::Ok;
   const uint64_t n = block_size_ / 4;
   const uint64_t blocks = 12 + n + n * n + n * n * n;
   const uint64_t limit = blocks > 0xFFFFFFFFull ? 0xFFFFFFFFull : blocks;

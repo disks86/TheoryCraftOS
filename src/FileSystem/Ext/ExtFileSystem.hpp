@@ -23,6 +23,7 @@
 #include "FileSystem/IFileSystem.hpp"
 #include "Hardware/StorageDevice/IStorageDevice.hpp"
 #include "Kernel/Sync.hpp"
+#include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -44,6 +45,13 @@ namespace filesystem {
 // it is mounted on a device that can be written, as e2fsck or the kernel would do: committed transactions are copied to their places,
 // revoked blocks are skipped, an unfinished transaction is dropped, and the journal is left empty. A journal that cannot be replayed
 // here (one on another device, or using fast commits) leaves the volume read only. Changes made afterwards are not journaled.
+//
+// ext4: extent trees (any depth; a file is read and written through them, holes and unwritten extents read as zeros, and a write into an
+// unwritten extent is Unsupported), 64-bit block numbers and group descriptors, flex_bg, uninitialized block groups, huge files, extra inode
+// fields, and the checksums: metadata_csum (crc32c over the superblock, group descriptors, bitmaps, inodes, extent blocks and directory
+// blocks, kept up to date for everything that is written) or the older uninit_bg group descriptor crc16. Not supported: meta_bg, inline
+// data, encryption, case folding, bigalloc (read only), quotas and the other features that need more bookkeeping than this does (read
+// only), extended attributes (kept as they are, a block that holds them is released with its last file).
 //
 // Writing: files and directories can be created, written, grown, cut, renamed (into other directories too) and removed; blocks and
 // inodes come from the bitmaps of the block groups, near their directory. Nothing is journaled: a volume is mounted writable only if its
@@ -112,6 +120,15 @@ class ExtFileSystem final : public IFileSystem {
   };
   static constexpr uint32_t kChunk = 256;  // blocks mapped and written at a time
 
+  // An extent of a file: `length` blocks from file block `block` stored from disk block `start` (an unwritten one reads as zeros).
+  struct Extent {
+    uint64_t block = 0, start = 0;
+    uint32_t length = 0;
+    bool unwritten = false;
+  };
+  using ExtentList = List<Extent>;
+  using BlockList = List<uint64_t>;
+
   // A name in a directory block.
   struct DirEntry {
     uint32_t inode = 0;
@@ -160,18 +177,27 @@ class ExtFileSystem final : public IFileSystem {
   uint64_t gd_free_blocks(uint32_t group) const { return gd_get(group, ext::kGdFreeBlocks, ext::kGdFreeBlocksHi, true); }
   uint64_t gd_free_inodes(uint32_t group) const { return gd_get(group, ext::kGdFreeInodes, ext::kGdFreeInodesHi, true); }
   uint64_t gd_used_dirs(uint32_t group) const { return gd_get(group, ext::kGdUsedDirs, ext::kGdUsedDirsHi, true); }
+  uint32_t gd_flags(uint32_t group) const { return ext::rd16(gd_.view().subview(uint64_t{group} * descriptor_size_, descriptor_size_), ext::kGdFlags); }
+  void gd_set_flags(uint32_t group, uint32_t flags);
   Status store_group(uint32_t group);
+  void group_checksum_set(uint32_t group);
+  void bitmap_checksum_set(uint32_t group, bool inode_bitmap, ConstByteView bitmap);
+  void synth_block_bitmap(uint32_t group, ByteView bitmap) const;
 
   // Inodes.
   Status inode_offset(uint32_t number, uint64_t* offset);
   Status read_inode(uint32_t number, Inode* inode);
   Status write_inode(const Inode& inode);
+  uint32_t inode_seed(const Inode& inode) const;  // the checksum seed of one inode: its number and generation folded into the volume's
+  void inode_checksum_set(Inode* inode) const;
+  void extent_checksum_set(const Inode& inode, ByteView node) const;
   bool inode_immutable(const Inode& inode) const { return (inode.flags() & (ext::kFlagImmutable)) != 0; }
   uint64_t inode_blocks(const Inode& inode) const;
   void inode_add_blocks(Inode* inode, int64_t delta);  // delta in filesystem blocks
   bool is_fast_symlink(const Inode& inode) const;  // the target is in i_block, not in a block
 
   // Mapping file blocks to disk blocks.
+  bool uses_extents(const Inode& inode) const { return (inode.flags() & ext::kFlagExtents) != 0; }
   Status map_run(const Inode& inode, uint64_t first, uint64_t max, uint64_t* block, uint64_t* run);
   // Maps `count` blocks from `first`; with `create` the holes are allocated. *done is how many leading blocks were mapped (all of them when Ok).
   Status map_range(Inode* inode, uint64_t first, uint32_t count, bool create, ArrayView<Mapping> out, uint32_t* done);
@@ -184,16 +210,30 @@ class ExtFileSystem final : public IFileSystem {
   Status queue_free(Inode* inode, uint64_t block);
   Status flush_frees();
 
+  // Extent trees (ExtExtent.cpp).
+  uint32_t ext_node_capacity() const { return (block_size_ - ext::kExtentHeader) / ext::kExtentEntry; }
+  static uint64_t ext_nodes_needed(uint64_t extents, uint32_t capacity, uint32_t* depth);
+  void ext_init_root(Inode* inode) const;
+  Status ext_lookup(const Inode& inode, uint64_t block, Extent* found, bool* mapped, uint64_t* hole_end);
+  Status ext_map_run(const Inode& inode, uint64_t first, uint64_t max, uint64_t* block, uint64_t* run);
+  Status ext_map_range(Inode* inode, uint64_t first, uint32_t count, bool create, ArrayView<Mapping> out, uint32_t* done);
+  Status ext_load(const Inode& inode, ExtentList* extents, BlockList* nodes);
+  Status ext_load_node(const Inode& inode, ConstByteView node, uint32_t expected_depth, ExtentList* extents, BlockList* nodes);
+  Status ext_store(Inode* inode, const ExtentList& extents, BlockList* nodes);
+  Status ext_free_from(Inode* inode, uint64_t keep);
+
   // Reading and writing the data of an inode.
   Status read_data(const Inode& inode, uint64_t offset, ByteView out, uint64_t* transferred);
   Status write_file_data(Inode* inode, uint64_t offset, ConstByteView data, uint64_t* transferred);
   Status resize_inode(Inode* inode, uint64_t new_size);
   Status zero_tail(Inode* inode, uint64_t size);  // zeroes what follows `size` in its (mapped) last block
-  Status check_size(uint64_t size) const;
+  Status check_size(const Inode& inode, uint64_t size) const;
   void note_size(const Inode& inode);  // sets the large_file feature once a file passes 2 GiB
 
   // Blocks and inodes.
   Status load_block_bitmap(uint32_t group, ByteBuffer* bitmap);
+  Status load_inode_bitmap(uint32_t group, ByteBuffer* bitmap);
+  Status store_inode_bitmap(uint32_t group, ByteBuffer& bitmap);
   Status store_block_bitmap(uint32_t group, ByteBuffer& bitmap);
   Status alloc_one(const Inode& inode, uint64_t goal, uint64_t* block);
   Status alloc_blocks(uint32_t goal_group, uint64_t goal_block, uint64_t want, uint64_t* start, uint64_t* got);
@@ -213,6 +253,9 @@ class ExtFileSystem final : public IFileSystem {
   Status dir_set_parent(const Inode& dir, uint32_t parent);
   Status dir_parent(const Inode& dir, uint32_t* parent);
   Status dir_flatten(Inode* dir);
+  uint32_t dir_limit() const { return block_size_ - (metadata_csum_ ? 12 : 0); }  // where the entries of a directory block end (a checksum follows)
+  void dir_tail_set(const Inode& dir, ByteView block) const;
+  Status store_dir_block(const Inode& dir, uint64_t disk, ByteBuffer& block);
   void dir_init_block(ByteView block, uint32_t self, uint32_t parent);
   void put_entry(ByteView block, uint32_t offset, uint32_t number, uint32_t record_length, StringView name, uint8_t type);
   Status zero_block(uint64_t block);
@@ -247,6 +290,8 @@ class ExtFileSystem final : public IFileSystem {
   bool writable_ = false, dirty_set_ = false;
   uint32_t block_size_ = 0, inode_size_ = 0, first_inode_ = 0, descriptor_size_ = 0;
   uint32_t compat_ = 0, incompat_ = 0, ro_compat_ = 0;
+  bool metadata_csum_ = false, group_csum_ = false;  // metadata_csum; metadata_csum or uninit_bg (checksummed group descriptors, uninitialized groups)
+  uint32_t csum_seed_ = 0;
   uint64_t blocks_count_ = 0, first_data_block_ = 0, gdt_start_ = 0;
   uint32_t blocks_per_group_ = 0, inodes_per_group_ = 0, inodes_count_ = 0, group_count_ = 0, itable_blocks_ = 0;
   uint64_t free_blocks_ = 0, free_inodes_ = 0;
