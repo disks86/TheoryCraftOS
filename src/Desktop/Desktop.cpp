@@ -40,6 +40,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       clock_(allocator),
       shutdown_dialog_(allocator),
       notice_dialog_(allocator),
+      toasts_(allocator),
       file_dialog_(allocator),
       copy_progress_(allocator),
       color_dialog_(allocator),
@@ -126,6 +127,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   windows_.set_dock(DockStyle::Fill);
   surface_.set_dock(DockStyle::Fill);
   surface_.add(&windows_);
+  surface_.add(&toasts_);   // over the windows
 
   shutdown_dialog_.set_texts("Shut Down", "Shut down TheoryCraftOS now?", "Running services will be stopped.", "Shut Down", "Cancel");
   shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
@@ -711,6 +713,7 @@ void Desktop::monitors_changed() {
         if (layout.at(i).enabled) monitor_rects_[monitor_rect_count_++] = layout.at(i).rect;
     }
     if (!several) {
+      toasts_.clear_area();
       display_settings_.refresh();
       return;
     }
@@ -740,6 +743,7 @@ void Desktop::monitors_changed() {
     }
     surface_.set_regions(regions, count);
     windows_.set_areas(areas, count);
+    if (count) toasts_.set_area(areas[0]);   // the primary monitor above its taskbar
     display_settings_.refresh();
   });
 }
@@ -902,6 +906,7 @@ void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   input_.pump();
   web_browser_.tick(uptime_us);
+  toasts_.tick(uptime_us);
   if (browser_store_ && browser_data_restored_ && uptime_us - last_browser_save_us_ > 30000000ull) {   // (the data of the browser is saved when it changed, at most every half minute)
     last_browser_save_us_ = uptime_us;
     if (cookie_jar_.version() != saved_cookie_version_ || local_storage_.version() != saved_storage_version_) save_browser_data();

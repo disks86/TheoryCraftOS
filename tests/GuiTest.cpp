@@ -27,6 +27,7 @@
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Desktop/Desktop.hpp"
+#include "Gui/Controls/ToastCenter.hpp"
 #include "FakeMonitors.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/MenuButton.hpp"
@@ -994,6 +995,29 @@ static void test_notice_dialog() {
   CHECK(a.live == 0);
 }
 
+static void test_desktop_toasts() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    CHECK(d.toasts().count() == 0);
+    // A program posts a toast; it sits over the windows in the corner above the taskbar, and the desktop's clock takes it away again.
+    const uint32_t id = d.notify("Copy finished", "2 files copied", NoticeKind::Information, 3000);
+    CHECK(id != 0 && d.toasts().count() == 1);
+    d.step(1000000);
+    const Rect2D b = d.toasts().toast_bounds(0);
+    const Point origin = d.toasts().parent()->window_origin();
+    CHECK(origin.x + b.x + static_cast<int32_t>(b.width) == 800 - ToastCenter::kMargin);
+    CHECK(origin.y + b.y + static_cast<int32_t>(b.height) <= 600 - desktop::Desktop::kTaskbarHeight);
+    CHECK(d.window().hit_test(origin.x + b.x + 10, origin.y + b.y + 10) == &d.toasts());
+    d.step(3999999);
+    CHECK(d.toasts().showing(id));
+    d.step(4000000);
+    CHECK(d.toasts().count() == 0);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_switcher() {
   TestAllocator a;
   {
@@ -1383,6 +1407,7 @@ int main() {
   test_modal_and_dialog();
   test_notice_dialog();
   test_switcher();
+  test_desktop_toasts();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gui: all checks passed\n");
   return 0;

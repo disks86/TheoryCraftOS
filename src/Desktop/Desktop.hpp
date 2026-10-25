@@ -49,6 +49,7 @@
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
+#include "Gui/Controls/ToastCenter.hpp"
 #include "Gui/InputPump.hpp"
 #include "Gui/MessageDialog.hpp"
 #include "Gui/NoticeDialog.hpp"
@@ -99,6 +100,14 @@ class Desktop {
   gui::MessageDialog& shutdown_dialog() { return shutdown_dialog_; }
   // The dialog the programs show warnings, information and errors in.
   gui::NoticeDialog& notice_dialog() { return notice_dialog_; }
+  // The toasts: short notices in the bottom right corner that go away by themselves, for a program to tell the user something without stopping them.
+  // Thread-safe, like every control; see gui::ToastCenter.
+  gui::ToastCenter& toasts() { return toasts_; }
+  // Shows a toast (see ToastCenter::post). Returns its number, 0 if it could not be shown.
+  uint32_t notify(StringView title, StringView message, gui::NoticeKind kind = gui::NoticeKind::Information,
+                  uint32_t duration_ms = gui::ToastCenter::kDefaultDurationMs, gui::Handler on_click = gui::Handler()) {
+    return toasts_.post(title, message, kind, duration_ms, on_click);
+  }
   // The window that shows files being moved between volumes and remote shares.
   CopyProgressDialog& copy_progress() { return copy_progress_; }
   gui::Frame& about_window() { return about_; }
@@ -324,6 +333,7 @@ class Desktop {
   gui::Label clock_;
   gui::MessageDialog shutdown_dialog_;
   gui::NoticeDialog notice_dialog_;
+  gui::ToastCenter toasts_;
   FileDialog file_dialog_;
   CopyProgressDialog copy_progress_;
   ColorDialog color_dialog_;

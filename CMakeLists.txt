@@ -409,6 +409,7 @@ add_executable(BOOTX64
   src/Gui/Controls/PieChart.cpp
   src/Gui/Controls/BarChart.cpp
   src/Gui/Controls/Tooltip.cpp
+  src/Gui/Controls/ToastCenter.cpp
   src/Gui/Controls/CheckBox.cpp
   src/Gui/Controls/RadioButton.cpp
   src/Gui/Controls/Toggle.cpp

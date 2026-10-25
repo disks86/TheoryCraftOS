@@ -34,6 +34,7 @@
 #include "Gui/Controls/ScrollPanel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/Toggle.hpp"
+#include "Gui/Controls/ToastCenter.hpp"
 #include "Gui/Controls/Tooltip.hpp"
 #include "Gui/Date.hpp"
 #include "Gui/Window.hpp"
@@ -482,6 +483,96 @@ static void test_tooltip() {
   CHECK(a.live == 0);
 }
 
+static int g_toast_clicks = 0;
+static void on_toast_click(void*, Control&) { ++g_toast_clicks; }
+
+static void test_toast_center() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 600, 400);
+    Window w(a, screen.renderer, theme, {600, 400});
+    Label under(a);
+    under.set_bounds({0, 0, 600, 400});
+    w.add(&under);
+    ToastCenter toasts(a);
+    w.add(&toasts);
+    w.layout();
+    CHECK(toasts.count() == 0 && toasts.bounds().width == 0 && toasts.post("", "") == 0);
+
+    // One toast sits in the bottom right corner, a margin from the edges.
+    const uint32_t first = toasts.post("Copy finished", "3 files copied to D:", NoticeKind::Information, 1000);
+    CHECK(first != 0 && toasts.count() == 1 && toasts.showing(first));
+    CHECK(toasts.title_of(first) == "Copy finished" && toasts.message_of(first) == "3 files copied to D:");
+    w.layout();
+    Rect2D b = toasts.toast_bounds(0);
+    CHECK(b.x + static_cast<int32_t>(b.width) == 600 - ToastCenter::kMargin && b.y + static_cast<int32_t>(b.height) == 400 - ToastCenter::kMargin);
+    CHECK(b.height == 2 * 16 + 2 * ToastCenter::kPad + 2);
+    w.render();
+    CHECK(screen.px(b.x + b.width - 4, b.y + b.height - 4) == ToastCenter::kBackground);
+    CHECK(screen.px(b.x + 2, b.y + 4) == ToastCenter::kInfoColor);
+
+    // A long message wraps and ends in "..." past three lines; a long title is cut.
+    const uint32_t second = toasts.post("A title that is a good deal longer than the toast can show", "The quick brown fox jumps over the lazy dog and keeps running through the whole field until the sun goes down behind the hills far away", NoticeKind::Error);
+    CHECK(second != first && toasts.title_of(second).size() == ToastCenter::kTitleChars);
+    CHECK(toasts.message_of(second).size() <= 3 * 41 && toasts.message_of(second).substr(toasts.message_of(second).size() - 3) == "...");
+    CHECK(toasts.kind_of(second) == NoticeKind::Error);
+    w.layout();
+    CHECK(toasts.toast_bounds(0).y < toasts.toast_bounds(1).y);   // the newest is the lowest
+    CHECK(toasts.toast_bounds(1).y + static_cast<int32_t>(toasts.toast_bounds(1).height) == 400 - ToastCenter::kMargin);
+
+    // The pointer reaches what is under the center, except where a toast is.
+    CHECK(w.hit_test(10, 10) == &under);
+    const Rect2D top = toasts.toast_bounds(0);
+    CHECK(w.hit_test(top.x + 5, top.y + 5) == &toasts);
+
+    // Time starts at the first tick (10 s); the first toast (1 s) goes at 11 s, the second (5 s) at 15 s.
+    CHECK(toasts.tick(10000000) == 0 && toasts.count() == 2);
+    CHECK(toasts.tick(10500000) == 0);
+    CHECK(toasts.tick(11000000) == 1 && !toasts.showing(first) && toasts.showing(second));
+    CHECK(toasts.tick(14999999) == 0 && toasts.tick(15000000) == 1 && toasts.count() == 0);
+    w.layout();
+    CHECK(toasts.bounds().width == 0 && w.hit_test(top.x + 5, top.y + 5) == &under);
+
+    // A toast with duration 0 stays; clicking it fires its handler and removes it. The [x] removes it without the handler.
+    g_toast_clicks = 0;
+    const uint32_t sticky = toasts.post("Printer", "Out of paper", NoticeKind::Warning, 0, Handler::immediate(&on_toast_click, nullptr));
+    toasts.tick(1);
+    toasts.tick(1000000000000ull);
+    CHECK(toasts.showing(sticky));
+    w.layout();
+    b = toasts.toast_bounds(0);
+    w.mouse_button(b.x + 40, b.y + b.height - 8, MouseButton::Left, true);
+    w.mouse_button(b.x + 40, b.y + b.height - 8, MouseButton::Left, false);
+    CHECK(g_toast_clicks == 1 && toasts.count() == 0);
+    const uint32_t other = toasts.post("Printer", "Out of paper", NoticeKind::Warning, 0, Handler::immediate(&on_toast_click, nullptr));
+    w.layout();
+    b = toasts.toast_bounds(0);
+    w.mouse_button(b.x + b.width - 10, b.y + 6, MouseButton::Left, true);
+    w.mouse_button(b.x + b.width - 10, b.y + 6, MouseButton::Left, false);
+    CHECK(g_toast_clicks == 1 && !toasts.showing(other) && toasts.count() == 0);
+
+    // At most kMaxToasts: the oldest makes room. dismiss() and clear().
+    uint32_t ids[ToastCenter::kMaxToasts + 2];
+    for (uint32_t& id : ids) id = toasts.post("t", "m");
+    CHECK(toasts.count() == ToastCenter::kMaxToasts && !toasts.showing(ids[0]) && !toasts.showing(ids[1]) && toasts.showing(ids[2]));
+    CHECK(toasts.dismiss(ids[3]) && !toasts.dismiss(ids[3]) && toasts.count() == ToastCenter::kMaxToasts - 1);
+    toasts.clear();
+    CHECK(toasts.count() == 0);
+
+    // An area (a monitor above its taskbar) moves the corner.
+    toasts.set_area({0, 0, 400, 200});
+    toasts.post("Hi", "there");
+    w.layout();
+    b = toasts.toast_bounds(0);
+    CHECK(b.x + static_cast<int32_t>(b.width) == 400 - ToastCenter::kMargin && b.y + static_cast<int32_t>(b.height) == 200 - ToastCenter::kMargin);
+    toasts.clear_area();
+    w.layout();
+    CHECK(toasts.toast_bounds(0).x + static_cast<int32_t>(toasts.toast_bounds(0).width) == 600 - ToastCenter::kMargin);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_scroll_panel() {
   TestAllocator a;
   Theme theme;
@@ -889,6 +980,7 @@ int main() {
   test_pie_chart();
   test_bar_chart();
   test_tooltip();
+  test_toast_center();
   test_scroll_panel();
   test_checkbox();
   test_radio();
