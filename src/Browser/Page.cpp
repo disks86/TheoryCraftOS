@@ -23,6 +23,7 @@
 #include "Paint/PaintBuilder.hpp"
 #include "Browser/ResourceScan.hpp"
 #include "Browser/Url.hpp"
+#include "Browser/WasmBindings.hpp"
 #include "Browser/WebPrelude.hpp"
 #include "Script/TypedArray.hpp"
 #include "Utility/ByteText.hpp"
@@ -149,6 +150,11 @@ bool Page::start_engine() {
       prelude_error.clear();
       if (!engine_->run_library(dom_prelude(), &prelude_error)) {
         prelude_error.insert(0, "The DOM script failed: ");
+        env_.console(3, prelude_error.view());
+      }
+      prelude_error.clear();
+      if (!engine_->run_library(web_assembly_prelude(), &prelude_error)) {
+        prelude_error.insert(0, "The WebAssembly script failed: ");
         env_.console(3, prelude_error.view());
       }
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
@@ -2058,6 +2064,7 @@ struct Page::WorkerRuntime final : script::IHost {
   Page& page;
   uint32_t id;
   UniquePointer<script::Engine> engine;
+  UniquePointer<bind::WasmState> wasm;   // (made after the engine, so destroyed before it)
   String url, name;
   List<String> inbox;      // messages for the worker, serialized
   List<Event> events;      // what it said: messages, errors, its closing
@@ -2151,6 +2158,11 @@ uint32_t Page::worker_start(StringView source, StringView url, StringView name, 
   if (!runtime->engine->run_library(worker_prelude(), &problem)) {
     error->assign(problem.view());
     return 0;
+  }
+  runtime->wasm = bind::install_wasm_natives(vm);
+  if (runtime->wasm && !runtime->engine->run_library(web_assembly_prelude(), &problem)) {   // (a worker is still useful without WebAssembly)
+    runtime->wasm.reset();
+    vm.set_extension(nullptr);
   }
   const uint32_t id = next_worker_++;
   runtime->id = id;

@@ -4620,6 +4620,63 @@ static void test_streams() {
       " | pipeTo=p,q | pull=0,1,2 | raw=raw | reqstream=up | strategy=17 | streamed=from stream | tee=1,2/1,2 | text=true | transform=A,B | unlocked=true | writable=x,y,closed"));
 }
 
+
+static std::string read_text_file(const char* path) {
+  std::string text;
+  if (FILE* f = fopen(path, "rb")) {
+    int c;
+    while ((c = fgetc(f)) != EOF) text.push_back(static_cast<char>(c));
+    fclose(f);
+  }
+  return text;
+}
+
+// WebAssembly: tests/data/wasm_api.js runs in the page and in node alike; wasm_api.expected is what node printed. The runtime itself is tested in WasmTest.
+static void test_wasm() {
+  const std::string script = read_text_file("tests/data/wasm_api.js");
+  std::string expected = read_text_file("tests/data/wasm_api.expected");
+  CHECK(!script.empty() && !expected.empty());
+  while (!expected.empty() && (expected.back() == '\n' || expected.back() == ' ')) expected.pop_back();
+  std::string got = run_async(script.c_str(), "https://app.example/dir/page.html", nullptr, 4000);
+  while (!got.empty() && (got.back() == '\n' || got.back() == ' ')) got.pop_back();
+  if (got != expected) {
+    // show the first line that differs
+    size_t a = 0, b = 0;
+    int line = 1;
+    for (;;) {
+      size_t ea = expected.find(" | ", a), eb = got.find(" | ", b);
+      const std::string la = expected.substr(a, ea == std::string::npos ? std::string::npos : ea - a), lb = got.substr(b, eb == std::string::npos ? std::string::npos : eb - b);
+      if (la != lb) { printf("wasm_api line %d:\n  node: %s\n  page: %s\n", line, la.c_str(), lb.c_str()); break; }
+      if (ea == std::string::npos || eb == std::string::npos) break;
+      a = ea + 3; b = eb + 3; ++line;
+    }
+  }
+  CHECK(got == expected);
+  // a module that never stops is stopped by the script budget, and one that recurses without end is a RangeError
+  const std::string loop_script =
+      "var m = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0, 1,4,1,96,0,0, 3,2,1,0, 7,5,1,1,102,0,0, 10,9,1,7,0,3,64,12,0,11,11])));\n"
+      "console.log('before'); m.exports.f(); console.log('after');";
+  const std::string looped = run_async(loop_script.c_str(), "https://app.example/dir/page.html", nullptr, 400);
+  CHECK(looped.find("before") != std::string::npos && looped.find("after") == std::string::npos && looped.find("ran too long") != std::string::npos);
+  const std::string recurse_script =
+      "var m = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0, 1,4,1,96,0,0, 3,2,1,0, 7,5,1,1,102,0,0, 10,6,1,4,0,16,0,11])));\n"
+      "try { m.exports.f(); } catch (e) { console.log(e.name + ' ' + (e instanceof RangeError)); }\n"
+      "try { new WebAssembly.Memory({initial: 65536}); console.log('allocated'); } catch (e) { console.log(e.name); }\n"
+      "var mem = new WebAssembly.Memory({initial: 1});\n"
+      "var views = []; for (var i = 0; i < 50; i++) { mem.grow(1); views.push(mem.buffer.byteLength); }\n"
+      "console.log(views[0] + ' ' + views[49]);";
+  const std::string recursed = run_async(recurse_script.c_str(), "https://app.example/dir/page.html", nullptr, 400);
+  CHECK(recursed.find("RangeError true") != std::string::npos);
+  CHECK(recursed.find("allocated") == std::string::npos);
+  CHECK(recursed.find("131072 3342336") != std::string::npos);
+  // a worker has the WebAssembly object too (its own store: an instance made in the page is not shared)
+  CHECK(async_is("var src = 'onmessage = function (e) { var i = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(e.data))); postMessage([typeof WebAssembly, i.exports.add(20, 22), i.exports.add.length]); };';"
+                 "var w = new Worker(URL.createObjectURL(new Blob([src])));"
+                 "w.onmessage = function (e) { console.log(JSON.stringify(e.data)); w.terminate(); };"
+                 "w.postMessage([0,97,115,109,1,0,0,0,1,7,1,96,2,127,127,1,127,3,2,1,0,7,7,1,3,97,100,100,0,0,10,9,1,7,0,32,0,32,1,106,11]);",
+                 "[\"object\",42,2]", nullptr, "https://app.example/"));
+}
+
 int main(int argc, char** argv) {
   if (const char* probe = getenv("PROBE")) {   // runs a script file in a page and prints what it logged (for looking at what an API has)
     std::string script;
@@ -4651,6 +4708,7 @@ int main(int argc, char** argv) {
   test_cookies_web();
   test_navigation();
   test_clipboard();
+  test_wasm();
   test_messaging();
   test_history_api();
   test_scripts_during_load();

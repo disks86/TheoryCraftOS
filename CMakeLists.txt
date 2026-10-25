@@ -245,6 +245,10 @@ add_executable(BOOTX64
   src/Browser/DomBindingsForm.cpp
   src/Browser/DomBindingsNet.cpp
   src/Browser/DomBindingsCrypto.cpp
+  src/Browser/DomBindingsWasm.cpp
+  src/Wasm/WasmDecode.cpp
+  src/Wasm/WasmRun.cpp
+  src/Wasm/WasmSimd.cpp
   src/Browser/WebPrelude.cpp
   src/Browser/WebUrl.cpp
   src/Browser/CookieJar.cpp

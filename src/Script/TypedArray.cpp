@@ -104,6 +104,12 @@ void store(ArrayKind kind, uint8_t* p, double d, bool little = true) {
 JsString* cell_of(JsObject* o) { return static_cast<JsString*>(o->host_data); }
 ArrayKind kind_of(JsObject* o) { return static_cast<ArrayKind>(static_cast<uint32_t>(o->bound_this.u.number)); }
 
+// The length of a view, 0 once the bytes it covered were detached.
+uint32_t live_length(JsObject* o) {
+  const uint64_t need = uint64_t{o->position} + uint64_t{o->length} * size_of(kind_of(o));
+  return cell_of(o)->length >= need ? o->length : 0;
+}
+
 bool parse_index(StringView k, uint32_t* out) {
   if (k.empty() || k.size() > 10) return false;
   uint64_t v = 0;
@@ -139,15 +145,15 @@ bool typed_hook_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     return true;
   }
   if (k.equals("length")) {
-    *out = num_value(o->length);
+    *out = num_value(live_length(o));
     return true;
   }
   if (k.equals("byteLength")) {
-    *out = num_value(static_cast<double>(o->length) * size_of(kind_of(o)));
+    *out = num_value(static_cast<double>(live_length(o)) * size_of(kind_of(o)));
     return true;
   }
   if (k.equals("byteOffset")) {
-    *out = num_value(o->position);
+    *out = num_value(live_length(o) || o->length == 0 ? o->position : 0);
     return true;
   }
   return false;
@@ -560,8 +566,14 @@ bool typed_array_bytes(const Value& v, ArrayView<uint8_t>* bytes) {
   return false;
 }
 
+JsObject* new_array_buffer(Vm& vm, JsString* cell) { return new_buffer_object(vm, cell); }
+
+void detach_array_buffer(JsObject* buffer) {
+  if (is_buffer(Value::make_object(buffer))) cell_of(buffer)->length = 0;
+}
+
 bool typed_array_get(JsObject* array, uint32_t index, Value* out) {
-  if (index >= array->length) {
+  if (index >= array->length || live_length(array) == 0) {
     *out = Value();
     return false;
   }
@@ -572,7 +584,7 @@ bool typed_array_get(JsObject* array, uint32_t index, Value* out) {
 bool typed_array_put(Vm& vm, JsObject* array, uint32_t index, const Value& value) {
   double d;
   if (!vm.to_number(value, &d)) return false;
-  if (index < array->length) store(kind_of(array), element_ptr(array, index), d);
+  if (index < array->length && live_length(array) != 0) store(kind_of(array), element_ptr(array, index), d);
   return true;
 }
 

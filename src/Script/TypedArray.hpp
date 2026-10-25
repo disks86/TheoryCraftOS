@@ -37,6 +37,11 @@ bool is_typed_array(const Value& v);
 // The bytes a typed array, an ArrayBuffer or a DataView covers.
 bool typed_array_bytes(const Value& v, ArrayView<uint8_t>* bytes);
 
+// An ArrayBuffer over a cell made by Vm::new_bytes (the memory of a WebAssembly instance is one), and the end of its life: a detached buffer has no bytes (its
+// byteLength is 0, and so is the length of every view of it).
+JsObject* new_array_buffer(Vm& vm, JsString* cell);
+void detach_array_buffer(JsObject* buffer);
+
 // What the interpreter does with `array[index]`.
 bool typed_array_get(JsObject* array, uint32_t index, Value* out);
 bool typed_array_put(Vm& vm, JsObject* array, uint32_t index, const Value& value);

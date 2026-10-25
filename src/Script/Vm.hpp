@@ -62,7 +62,18 @@ class Vm {
   void set_instruction_budget(uint64_t instructions) { budget_ = instructions; }
   void set_memory_limit(uint64_t bytes) { memory_limit_ = bytes; }
   uint64_t instructions_run() const { return instructions_; }
+  // Counts instructions run by native code (a WebAssembly interpreter) against the budget. False, with the script stopped, when it is spent.
+  bool charge(uint64_t instructions) {
+    if (!budget_) return true;
+    instructions_ += instructions;
+    if (instructions_ > budget_) {
+      halt("the script ran too long");
+      return false;
+    }
+    return true;
+  }
   uint64_t heap_bytes() const { return heap_bytes_; }
+  uint64_t memory_limit() const { return memory_limit_; }
 
   // --- Running
   // Runs top-level code (a FunctionCode from the compiler) with `this` the global object. False if it threw (see take_exception()) or hit a limit.
@@ -219,6 +230,9 @@ class Vm {
   // collector does not run while anything holds it: for C++ code that keeps script values in its own variables across calls into scripts).
   void set_user(void* user) { user_ = user; }
   void* user() const { return user_; }
+  // A second pointer for a part of the host that has state of its own (the WebAssembly store) next to the one `user` holds.
+  void set_extension(void* extension) { extension_ = extension; }
+  void* extension() const { return extension_; }
   bool get_plain(JsObject* object, JsString* key, Value* out);
   void hold_collector() { ++gc_hold_; }
   void release_collector() { if (gc_hold_ > 0) --gc_hold_; }
@@ -378,6 +392,7 @@ class Vm {
   uint64_t random_state_ = 88172645463325252ull;
   double skew_ms_ = 0;
   void* user_ = nullptr;
+  void* extension_ = nullptr;
   uint32_t gc_hold_ = 0;
 };
 

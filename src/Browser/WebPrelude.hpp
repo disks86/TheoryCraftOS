@@ -28,5 +28,8 @@ const char* web_prelude();
 const char* worker_prelude();
 // The DOM interfaces that are written in JavaScript (Range, Selection, TreeWalker, NodeIterator, NodeFilter, Attr nodes, CharacterData methods, Option, XMLSerializer ...).
 const char* dom_prelude();
+// The WebAssembly object (Module, Instance, Memory, Table, Global, the errors, validate / compile / instantiate) over the natives of DomBindingsWasm.cpp. Run by a page's
+// engine and a worker's, after install_wasm_natives().
+const char* web_assembly_prelude();
 
 }  // namespace browser

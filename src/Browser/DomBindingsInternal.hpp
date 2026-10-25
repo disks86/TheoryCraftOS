@@ -19,8 +19,13 @@
 // What the files of the DOM bindings share: the state of one page's bindings (DomBindings::Impl) and the small helpers the natives are written with.
 #pragma once
 #include "Browser/DomBindings.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace browser {
+
+namespace bind {
+struct WasmState;   // the WebAssembly runtime of the page (DomBindingsWasm.cpp)
+}
 
 struct DomBindings::Impl {
   Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()) {}
@@ -55,6 +60,7 @@ struct DomBindings::Impl {
   int32_t scroll_line = 0;
   bool page_hidden = false;   // document.hidden / visibilityState: true while the page is being left
   script::JsString *k_length = nullptr;
+  UniquePointer<bind::WasmState> wasm;   // the WebAssembly store of the page (made by install_wasm)
 };
 
 namespace bind {
