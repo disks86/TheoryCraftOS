@@ -75,6 +75,14 @@ struct Value {
   }
 
   bool is_undefined() const { return tag == Tag::Undefined; }
+  // The value of a let / const / class binding that has not been initialized yet (its temporal dead zone): an undefined that carries a mark. It is only
+  // ever in a variable slot, and only GetVar/SetVar of a lexical binding look at it.
+  static Value make_uninitialized() {
+    Value v;
+    v.u.number = 1;
+    return v;
+  }
+  bool is_uninitialized() const { return tag == Tag::Undefined && u.number == 1; }
   bool is_null() const { return tag == Tag::Null; }
   bool is_nullish() const { return tag == Tag::Undefined || tag == Tag::Null; }
   bool is_bool() const { return tag == Tag::Boolean; }
@@ -145,6 +153,9 @@ struct HostClass {
   // Appends the names of the enumerable properties it has (as strings) to `keys`.
   void (*keys)(Vm& vm, JsObject* object, JsObject* keys);
 };
+
+// JsObject::position of an array that is a function's `arguments` object.
+constexpr uint32_t kArgumentsMark = 0xA46;
 
 struct JsObject : Cell {
   ObjKind okind = ObjKind::Plain;

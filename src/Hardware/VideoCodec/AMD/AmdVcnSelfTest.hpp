@@ -56,10 +56,15 @@ class AmdVcnSelfTest {
 
   // Decodes the stream on the engine and on the CPU and compares. The packets go in with presentation times 0, 1000, 2000... microseconds.
   static Result run(allocators::IAllocator& allocator, const AmdVcnAvcDecoder::Engine& engine);
+  // The same check on any engine's H.264 session (already prepared): `wedged(context)` says whether the engine's ring gave up. The UVD 6 engine's test is this too.
+  static Result run_h264_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* context);
   // The same for H.265: a stream made by libx265 (64 x 64, six pictures, B pictures with reordering; AmdVcnSelfTestHevcStream.inc) is decoded by the CPU decoder and by
   // the engine, and the pictures must be byte for byte the same. What passing proves beyond the above: the reference picture set and slot bookkeeping of the H.265
   // message, 32x32 coding trees with the deblocking filter and SAO the encoder chose, bi-prediction. Not: scaling lists, tiles, slices, weighted prediction, other sizes.
   static Result run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine);
+  // The same check on any engine's H.265 session (already prepared): `wedged(ring)` says whether the engine's ring gave up, `decoded(decoder)` how many pictures the
+  // engine itself decoded (all of them must have gone through it).
+  static Result run_hevc_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*), const void* decoder);
   // The same for AV1: a libaom stream (64 x 64, ten temporal units with hidden frames and show_existing_frame; AmdVcnSelfTestAv1Stream.inc). What passing proves beyond
   // the above: the reference slot bookkeeping of the AV1 message (which engine picture each reference slot holds, across hidden frames and shown-again ones), the initial
   // entropy contexts, the tile table. Not: tiles, film grain, super-resolution, 10-bit, other sizes.
@@ -72,6 +77,8 @@ class AmdVcnSelfTest {
   // the CPU decoder's, so the pictures must be close (a level or two apart), not identical. What passing proves beyond the above: the message with the matrices and the
   // picture coding parameters, the two reference slots of the picture buffer. Not: field pictures, dual prime, other sizes.
   static Result run_mpeg2(allocators::IAllocator& allocator, const AmdVcnMpeg2Decoder::Engine& engine);
+  // The same check on any engine's MPEG-2 session (already prepared); see run_hevc_session for the callbacks.
+  static Result run_mpeg2_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*), const void* decoder);
   // The same for VC-1, with two streams (a Main profile one and an Advanced profile one, 64 x 64, eight pictures each with B pictures and reordering, made by
   // scripts/gen_vc1_synthetic.py; AmdVcnSelfTestVc1Stream.inc), both of which must pass. The pictures must be close to the CPU decoder's (nothing here has checked the
   // engine's VC-1 decoder against the standard: it is held to a level or two, which a wrong reference or a wrong table is far from). What passing proves beyond the

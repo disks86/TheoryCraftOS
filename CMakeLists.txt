@@ -626,8 +626,11 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Ring.cpp
+  src/Hardware/VideoCodec/AMD/AmdSmu7.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.cpp
+  src/Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.cpp
+  src/Hardware/VideoCodec/AMD/AmdUvd6Mpeg2Decoder.cpp
   src/Hardware/VideoCodec/AMD/AmdGmc8Memory.cpp
   src/Hardware/VideoCodec/AMD/AmdRavenMemory.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1Ring.cpp
@@ -821,6 +824,10 @@ endif()
 option(TCOS_INTEL_RENDER "Use the render engine of an Intel Gen9.5 display GPU for 3D (not yet run on real hardware; the CPU renderer is used if its self-test fails)" OFF)
 if(TCOS_INTEL_RENDER)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_INTEL_RENDER)
+endif()
+option(TCOS_AMD_UVD "Start the UVD 6 video engine of a Radeon RX Vega M (Kaby Lake-G) and decode H.264 on it (not yet run on a real card; H.264 stays on the CPU if its self-test fails)" OFF)
+if(TCOS_AMD_UVD)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_UVD)
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

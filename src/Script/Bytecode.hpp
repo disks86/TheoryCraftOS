@@ -52,7 +52,20 @@ enum class Opc : uint8_t {
   Await,
   // generators: [value] -> (the generator is suspended; the value goes to whoever called next(); the argument of the next next() takes its place)
   Yield,
+  // [iterator] -> (): calls the return() of an iterator that is left early (b = 1: an exception is on its way, so one thrown by return() is dropped)
+  IterClose,
+  // a = slot, b = how many Envs out: the let / const / class variable there is in its temporal dead zone (until it is initialized)
+  TdzMark,
+  // block scopes whose variables closures capture: PushEnv (a = variables) makes a new Env inside the current one, PopEnv leaves it, CopyEnv replaces the
+  // current one with a copy (a `for (let ...)` loop gives each iteration its own variables)
+  PushEnv, PopEnv, CopyEnv,
+  // [] -> [value]: what the iterator that just finished returned (the value of `yield*`)
+  IterReturn,
 };
+
+// What the 16 spare bits of GetVar / SetVar say: 0 plain; kConstAssign (SetVar of a const: a TypeError); n >= kChecked: the variable is let / const / class and
+// may be in its temporal dead zone (n - kChecked is the constant holding its name, for the message).
+constexpr uint16_t kConstAssign = 1, kChecked = 2;
 
 struct Instr {
   Opc op;

@@ -34,16 +34,18 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   objects and non-configurable properties are implemented (`js_strict.js`); the host's own scripts keep configurable-by-default properties
   (`FunctionCode::library`). Left: the `prototype` of built-in constructors is configurable, module namespace properties are accessors
   (not writable data properties), no strict-only early errors (octal literals, duplicate parameters, `eval`/`arguments` assignment). Also missing:
-  `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, `Intl` beyond basic formatting, RegExp `v` flag (set notation) / `d` flag /
-  duplicate named groups / case folding beyond ASCII (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tags for Date, Map, Set and arguments,
-  TDZ, per-iteration `let` bindings in `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special
+  `SharedArrayBuffer`/`Atomics` are single-threaded stand-ins (no `wait`/`notify` blocking, `instanceof ArrayBuffer` is true); missing: `Intl` beyond basic formatting, RegExp `v` flag (set notation) / `d` flag /
+  duplicate named groups / case folding beyond ASCII (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tag for Date,
+  TDZ and `const` only inside functions and blocks (top-level `let`/`const` are globals), duplicate `let` at top level, array destructuring does not close its iterator, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special
   casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
   content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
   references that stand for two code points, `innerHTML` scripts must not run.
-- **CSS**: computed values are often not resolved (`flow-root`, blockified `display`, `line-height`, `text-align`, `transform-origin`), UA style sheet
-  values (heading sizes, `ul` padding, link colour, `em`), newer colour spaces (`lab`, `oklch`, `color-mix`, relative colours), `lh`, nesting,
-  `revert-layer`, `@container` failure, `:dir()`, `:nth-child(… of S)`, `aspect-ratio`, `flow-root` floats, many properties return `""`
+- **CSS**: closed: `getComputedStyle` reports table parts (`td`, `tr`, `table` ... with `cellpadding`), controls (`inline-block`), closed `dialog` (`none`),
+  blockified `display` under `float` and absolute positioning, `em`/`i` italic, `pre` white-space, `ol` decimal, link colour, `sub`/`sup`, `mark`.
+  Still open: heading sizes, `ul` padding (40px), `blockquote` margin and `small` size (the UA metrics are terminal cells on purpose), `hr` border,
+  newer colour spaces (`lab`, `oklch`, `color-mix`, relative colours), `lh`, nesting, `revert-layer`, `@container` failure, `:dir()`,
+  `:nth-child(… of S)`, `aspect-ratio`, `flow-root` floats, many properties return `""`
   (`text-indent`, `word-break`, `quotes`, `counter-*`, `contain`, `will-change`, …).
 - **Web APIs**: the constructor of an interface inherits from the constructor of its parent, `AbstractRange`/`StaticRange`, `EventSource`,
   `IDBVersionChangeEvent`, the device events, `DOMImplementation`, `NodeFilter` as an interface object, the legacy element interfaces and the

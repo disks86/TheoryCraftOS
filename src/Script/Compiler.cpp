@@ -27,6 +27,16 @@ struct Binding {
   StringView name;
   uint32_t slot;
   StringView import_name;   // an imported binding: the name of the export it reads (from the namespace object the slot holds)
+  bool lexical = false;     // let / const / class: reading it before it is initialized is a ReferenceError
+  bool is_const = false;    // const: assigning to it is a TypeError
+  uint32_t level = 0;       // 0: a slot of the function's Env; n: a slot of the n-th block Env that is open (see EnvScope)
+};
+
+// A block whose variables live in an Env of their own (a closure made in it may capture them, and each time round a loop they must be new ones).
+struct EnvScope {
+  uint32_t scope_depth;     // the FuncState::scope_depth of the block
+  uint32_t count;           // variables declared so far
+  uint32_t capacity;        // variables the PushEnv made room for
 };
 
 struct Ctx {
@@ -36,6 +46,8 @@ struct Ctx {
   bool handler_active;     // Try: an exception handler of the VM is set for the code being compiled
   Node* finalizer;         // Try: the finally block to run on the way out (or null)
   int32_t continue_target; // Loop: where `continue` goes if that is known already (else it is patched)
+  uint32_t env_depth = 0;  // how many block Envs were open where it began (a break or continue leaves the ones above)
+  int32_t iter_slot = -1;  // Loop over values (for-of): the slot of its iterator, which is closed when the loop is left early
 };
 
 struct Patch {
@@ -45,13 +57,14 @@ struct Patch {
 };
 
 struct FuncState {
-  explicit FuncState(allocators::IAllocator& a) : bindings(a), scope_marks(a), ctx(a), patches(a) {}
+  explicit FuncState(allocators::IAllocator& a) : bindings(a), scope_marks(a), ctx(a), patches(a), envs(a) {}
   FunctionCode* code = nullptr;
   FuncState* parent = nullptr;
   List<Binding> bindings;
   List<uint32_t> scope_marks;
   List<Ctx> ctx;
   List<Patch> patches;
+  List<EnvScope> envs;          // the block Envs that are open here, outermost first
   bool is_global = false;
   uint32_t scope_depth = 0;     // blocks entered (0: the function's own top level)
   int32_t completion_slot = -1;
@@ -74,7 +87,7 @@ class Compiler {
     hoist_globals(block->list);
     init_functions(block->list);
     for (Node* s = block->list; s && !failed_; s = s->next) statement(s);
-    emit(Opc::GetVar, fs.completion_slot, 0, 0);
+    emit(Opc::GetVar, fs.completion_slot, fn_hops(), 0);
     emit(Opc::Return, 0, 0, 0);
     fs.code->slot_count = next_slot_of(fs);
     cur_ = nullptr;
@@ -157,21 +170,80 @@ class Compiler {
     for (uint64_t i = cur_->bindings.count(); i > 0; --i) {
       if (cur_->bindings[i - 1].name.equals(name) && i - 1 >= (cur_->scope_marks.count() ? cur_->scope_marks[cur_->scope_marks.count() - 1] : 0)) return cur_->bindings[i - 1].slot;
     }
-    const uint32_t slot = new_slot();
-    cur_->bindings.push_back(Binding{name, slot});
+    Binding b{name, 0};
+    if (cur_->envs.count() && cur_->envs[cur_->envs.count() - 1].scope_depth == cur_->scope_depth) {   // a variable of a block that has its own Env
+      EnvScope& e = cur_->envs[cur_->envs.count() - 1];
+      if (e.count >= e.capacity) {
+        fail("Too many block variables", line_);
+        return 0;
+      }
+      b.slot = e.count++;
+      b.level = static_cast<uint32_t>(cur_->envs.count());
+    } else {
+      b.slot = new_slot();
+    }
+    cur_->bindings.push_back(b);
+    return b.slot;
+  }
+  // How many Envs out the function's own Env is.
+  uint8_t fn_hops() const { return static_cast<uint8_t>(cur_->envs.count() < 250 ? cur_->envs.count() : 250); }
+  void begin_env(uint32_t capacity, uint32_t line) {
+    emit(Opc::PushEnv, static_cast<int32_t>(capacity), 0, line);
+    cur_->envs.push_back(EnvScope{cur_->scope_depth, 0, capacity});
+  }
+  void end_env(uint32_t line) {
+    emit(Opc::PopEnv, 0, 0, line);
+    cur_->envs.remove_at(cur_->envs.count() - 1);
+  }
+  // Does anything in this subtree make a function (which could capture a variable)?
+  static bool makes_closure(const Node* n, uint32_t depth = 0) {
+    if (!n) return false;
+    if (n->kind == NodeKind::Function || n->kind == NodeKind::FunctionDecl || depth > 400) return true;
+    if (makes_closure(n->a, depth + 1) || makes_closure(n->b, depth + 1) || makes_closure(n->c, depth + 1) || makes_closure(n->d, depth + 1)) return true;
+    for (const Node* c = n->list; c; c = c->next)
+      if (makes_closure(c, depth + 1)) return true;
+    return false;
+  }
+  static uint32_t lexical_count(const Node* list) {
+    uint32_t n = 0;
+    for (const Node* s = list; s; s = s->next)
+      if (s->kind == NodeKind::Var && s->var_kind != VarKind::Var)
+        for (const Node* d = s->list; d; d = d->next) ++n;
+    return n;
+  }
+
+  // A let / const / class variable of the current block. A second declaration in the same block is an early error.
+  uint32_t declare_lexical(StringView name, bool is_const, uint32_t line) {
+    const uint64_t floor = cur_->scope_marks.count() ? cur_->scope_marks[cur_->scope_marks.count() - 1] : 0;
+    for (uint64_t i = cur_->bindings.count(); i > floor; --i)
+      if (cur_->bindings[i - 1].name.equals(name) && cur_->bindings[i - 1].lexical) {
+        fail("Identifier has already been declared", line);
+        return cur_->bindings[i - 1].slot;
+      }
+    const uint32_t slot = declare(name);
+    for (uint64_t i = cur_->bindings.count(); i > 0; --i)
+      if (cur_->bindings[i - 1].slot == slot) {
+        cur_->bindings[i - 1].lexical = true;
+        cur_->bindings[i - 1].is_const = is_const;
+        break;
+      }
     return slot;
   }
 
   // Where a name lives: depth = how many functions out, slot; false for a global.
   bool resolve(StringView name, uint32_t* depth, uint32_t* slot) {
-    uint32_t d = 0;
+    uint32_t hops = 0, funcs = 0;
     resolved_import_ = StringView();
-    for (FuncState* fs = cur_; fs; fs = fs->parent, ++d) {
+    resolved_lexical_ = resolved_const_ = false;
+    for (FuncState* fs = cur_; fs; fs = fs->parent, ++funcs) {
       for (uint64_t i = fs->bindings.count(); i > 0; --i) {
         if (fs->bindings[i - 1].name.equals(name)) {
-          *depth = d;
+          *depth = hops + static_cast<uint32_t>(fs->envs.count()) - fs->bindings[i - 1].level;
           *slot = fs->bindings[i - 1].slot;
+          resolved_funcs_ = funcs;
           resolved_import_ = fs->bindings[i - 1].import_name;
+          resolved_lexical_ = fs->bindings[i - 1].lexical;
+          resolved_const_ = fs->bindings[i - 1].is_const;
           return true;
         }
       }
@@ -183,10 +255,12 @@ class Compiler {
         for (uint64_t m = 0; m < fs->scope_marks.count(); ++m) ++fs->scope_marks[m];
         fs->code->arguments_slot = static_cast<int32_t>(s);
         cur_ = saved;
-        *depth = d;
+        *depth = hops + static_cast<uint32_t>(fs->envs.count());
         *slot = s;
+        resolved_funcs_ = funcs;
         return true;
       }
+      hops += static_cast<uint32_t>(fs->envs.count()) + 1;
     }
     return false;
   }
@@ -251,10 +325,10 @@ class Compiler {
           if (d->a) cur_->bindings[i].import_name = d->a->text;
           break;
         }
-        emit(Opc::GetVar, 0, 0, s->line);
+        emit(Opc::GetVar, 0, fn_hops(), s->line);
         emit(Opc::PushInt, static_cast<int32_t>(s->number), 0, s->line);
         emit(Opc::GetElem, 0, 0, s->line);
-        emit(Opc::SetVar, static_cast<int32_t>(slot), 0, s->line);
+        emit(Opc::SetVar, static_cast<int32_t>(slot), fn_hops(), s->line);
         emit(Opc::Pop);
       }
     }
@@ -274,7 +348,10 @@ class Compiler {
     if (global_scope()) return;
     for (Node* s = list; s; s = s->next)
       if (s->kind == NodeKind::Var && s->var_kind != VarKind::Var)
-        for (Node* d = s->list; d; d = d->next) declare(d->text);
+        for (Node* d = s->list; d; d = d->next) {
+          const uint32_t slot = declare_lexical(d->text, s->var_kind == VarKind::Const, d->line);
+          emit(Opc::TdzMark, static_cast<int32_t>(slot), static_cast<uint8_t>(cur_->envs.count() - cur_->bindings[cur_->bindings.count() - 1].level), d->line);
+        }
   }
 
   // --- Variables
@@ -285,7 +362,8 @@ class Compiler {
         fail("Functions are nested too deeply", line);
         return;
       }
-      emit(Opc::GetVar, static_cast<int32_t>(slot), static_cast<uint8_t>(depth), line);
+      const uint32_t at = emit(Opc::GetVar, static_cast<int32_t>(slot), static_cast<uint8_t>(depth), line);
+      if (resolved_lexical_) cur_->code->code[at].unused = checked_mark(name);
       if (!resolved_import_.empty()) emit(Opc::GetProp, static_cast<int32_t>(constant_string(resolved_import_)), 0, line);   // (an import is read from its module's namespace each time: a live binding)
     } else if (name.equals("undefined")) {
       emit(Opc::PushUndef);
@@ -294,7 +372,13 @@ class Compiler {
     }
   }
   // Stores the value on the top of the stack into a name, leaving the value there.
-  void store_name(StringView name, uint32_t line) {
+  // The spare bits of a GetVar / SetVar of a let / const / class variable (see kChecked).
+  uint16_t checked_mark(StringView name) {
+    const uint32_t k = constant_string(name);
+    return k < 60000 ? static_cast<uint16_t>(kChecked + k) : kChecked;
+  }
+  // `initialize`: this store is the declaration itself (for (const x of ...) gives x its value), not an assignment.
+  void store_name(StringView name, uint32_t line, bool initialize = false) {
     uint32_t depth, slot;
     if (resolve(name, &depth, &slot)) {
       if (depth > 250) {
@@ -302,7 +386,11 @@ class Compiler {
         return;
       }
       if (!resolved_import_.empty()) fail("Assignment to constant variable", line);
-      emit(Opc::SetVar, static_cast<int32_t>(slot), static_cast<uint8_t>(depth), line);
+      const uint32_t at = emit(Opc::SetVar, static_cast<int32_t>(slot), static_cast<uint8_t>(depth), line);
+      if (!initialize) {
+        if (resolved_const_) cur_->code->code[at].unused = kConstAssign;
+        else if (resolved_lexical_) cur_->code->code[at].unused = checked_mark(name);
+      }
     } else {
       emit(Opc::SetGlobal, static_cast<int32_t>(constant_string(name)), 0, line);
     }
@@ -358,12 +446,12 @@ class Compiler {
     uint32_t index = 0;
     for (Node* p = fn->list; p; p = p->next, ++index) {
       if (!p->a) continue;
-      emit(Opc::GetVar, static_cast<int32_t>(index), 0, p->line);
+      emit(Opc::GetVar, static_cast<int32_t>(index), fn_hops(), p->line);
       emit(Opc::PushUndef);
       emit(Opc::StrictEq);
       const uint32_t skip = emit(Opc::JumpIfFalse);
       expression(p->a);
-      emit(Opc::SetVar, static_cast<int32_t>(index), 0, p->line);
+      emit(Opc::SetVar, static_cast<int32_t>(index), fn_hops(), p->line);
       emit(Opc::Pop);
       patch(skip);
     }
@@ -389,7 +477,7 @@ class Compiler {
 
   // --- Control flow contexts
   Ctx& push_ctx(Ctx::Kind kind, bool handler_active = false, Node* finalizer = nullptr) {
-    Ctx c{kind, pending_label_, cur_->next_ctx_id++, handler_active, finalizer, -1};
+    Ctx c{kind, pending_label_, cur_->next_ctx_id++, handler_active, finalizer, -1, static_cast<uint32_t>(cur_->envs.count()), -1};
     pending_label_ = StringView();
     cur_->ctx.push_back(c);
     return cur_->ctx[cur_->ctx.count() - 1];
@@ -417,6 +505,10 @@ class Compiler {
     const uint64_t count = cur_->ctx.count();
     for (uint64_t i = count; i > static_cast<uint64_t>(target + 1) && !failed_; --i) {
       const Ctx c = cur_->ctx[i - 1];
+      if (c.kind == Ctx::Loop && c.iter_slot >= 0) {   // (leaving a for-of: its iterator is closed)
+        emit(Opc::GetVar, c.iter_slot, fn_hops(), line_);
+        emit(Opc::IterClose, 0, 0, line_);
+      }
       if (c.kind != Ctx::Try) continue;
       if (c.handler_active) emit(Opc::TryEnd);
       if (c.finalizer) {
@@ -463,18 +555,23 @@ class Compiler {
       case NodeKind::ExprStmt:
         expression(n->a);
         if (cur_->is_global && cur_->parent == nullptr && cur_->completion_slot >= 0) {
-          emit(Opc::SetVar, cur_->completion_slot, 0, n->line);
+          emit(Opc::SetVar, cur_->completion_slot, fn_hops(), n->line);
         }
         emit(Opc::Pop);
         return;
       case NodeKind::Var: var_statement(n); return;
-      case NodeKind::Block:
+      case NodeKind::Block: {
         push_scope();
+        const uint32_t lexicals = global_scope() ? 0 : lexical_count(n->list);
+        const bool own_env = lexicals > 0 && makes_closure(n);
+        if (own_env) begin_env(lexicals, n->line);
         declare_lexicals(n->list);
         init_functions(n->list);
         statement_list(n->list);
+        if (own_env) end_env(n->line);
         pop_scope();
         return;
+      }
       case NodeKind::If: {
         expression(n->a);
         const uint32_t to_else = emit(Opc::JumpIfFalse);
@@ -518,13 +615,14 @@ class Compiler {
         if (n->a) expression(n->a);
         else emit(Opc::PushUndef);
         bool has_finally = false;
-        for (uint64_t i = 0; i < cur_->ctx.count(); ++i) has_finally = has_finally || (cur_->ctx[i].kind == Ctx::Try && cur_->ctx[i].finalizer);
+        for (uint64_t i = 0; i < cur_->ctx.count(); ++i)
+          has_finally = has_finally || (cur_->ctx[i].kind == Ctx::Try && cur_->ctx[i].finalizer) || (cur_->ctx[i].kind == Ctx::Loop && cur_->ctx[i].iter_slot >= 0);
         if (has_finally) {
           const uint32_t tmp = new_slot();
-          emit(Opc::SetVar, static_cast<int32_t>(tmp), 0, n->line);
+          emit(Opc::SetVar, static_cast<int32_t>(tmp), fn_hops(), n->line);
           emit(Opc::Pop);
           unwind_to(-1);
-          emit(Opc::GetVar, static_cast<int32_t>(tmp), 0, n->line);
+          emit(Opc::GetVar, static_cast<int32_t>(tmp), fn_hops(), n->line);
         }
         emit(Opc::Return, 0, 0, n->line);
         return;
@@ -535,7 +633,12 @@ class Compiler {
         const int64_t target = find_ctx(is_continue, n->text, n->line);
         if (target < 0) return;
         unwind_to(target);
+        if (!is_continue && cur_->ctx[static_cast<uint64_t>(target)].iter_slot >= 0) {   // (a break leaves the for-of it ends)
+          emit(Opc::GetVar, cur_->ctx[static_cast<uint64_t>(target)].iter_slot, fn_hops(), n->line);
+          emit(Opc::IterClose, 0, 0, n->line);
+        }
         Ctx& c = cur_->ctx[static_cast<uint64_t>(target)];
+        for (uint64_t k = cur_->envs.count(); k > c.env_depth; --k) emit(Opc::PopEnv, 0, 0, n->line);   // (the block Envs the jump leaves)
         if (is_continue && c.continue_target >= 0) {
           emit(Opc::Jump, c.continue_target);
         } else {
@@ -581,7 +684,7 @@ class Compiler {
       }
       if (n->var_kind != VarKind::Var && !global_scope()) {
         uint32_t depth, slot;
-        if (resolve(d->text, &depth, &slot) && depth == 0) emit(Opc::SetVar, static_cast<int32_t>(slot), 0, d->line);
+        if (resolve(d->text, &depth, &slot) && resolved_funcs_ == 0) emit(Opc::SetVar, static_cast<int32_t>(slot), static_cast<uint8_t>(depth), d->line);
         else store_name(d->text, d->line);
       } else {
         store_name(d->text, d->line);
@@ -592,10 +695,13 @@ class Compiler {
 
   void for_statement(Node* n) {
     push_scope();
+    // for (let i ...) { ... function () { i } ... }: every iteration has its own i
+    const bool own_env = n->a && n->a->kind == NodeKind::Var && n->a->var_kind != VarKind::Var && !global_scope() && makes_closure(n);
+    if (own_env) begin_env(lexical_count(n->a), n->line);
     if (n->a) {
       if (n->a->kind == NodeKind::Var) {
         if (n->a->var_kind != VarKind::Var && !global_scope())
-          for (Node* d = n->a->list; d; d = d->next) declare(d->text);
+          for (Node* d = n->a->list; d; d = d->next) declare_lexical(d->text, n->a->var_kind == VarKind::Const, d->line);
         var_statement(n->a);
       } else {
         expression(n->a);
@@ -613,6 +719,7 @@ class Compiler {
     }
     statement(n->d);
     const uint32_t cont = pos();
+    if (own_env) emit(Opc::CopyEnv, 0, 0, n->line);
     if (n->c) {
       expression(n->c);
       emit(Opc::Pop);
@@ -620,6 +727,7 @@ class Compiler {
     emit(Opc::Jump, static_cast<int32_t>(top));
     if (has_cond) patch(to_end);
     pop_ctx(static_cast<int32_t>(cont));
+    if (own_env) end_env(n->line);
     pop_scope();
   }
 
@@ -628,27 +736,30 @@ class Compiler {
     const bool of = n->kind == NodeKind::ForOf;
     Node* target = n->a;
     StringView name;
-    bool declared_here = false;
-    if (target->kind == NodeKind::Var) {
-      name = target->list->text;
-      if (target->var_kind != VarKind::Var && !global_scope()) {
-        declare(name);
-        declared_here = true;
-      }
-    }
-    (void)declared_here;
+    const bool lexical = target->kind == NodeKind::Var && target->var_kind != VarKind::Var && !global_scope();
+    if (target->kind == NodeKind::Var) name = target->list->text;
     expression(n->b);
     emit(of ? Opc::ForOfStart : Opc::ForInStart);
     const uint32_t it = new_slot();
-    emit(Opc::SetVar, static_cast<int32_t>(it), 0, n->line);
+    emit(Opc::SetVar, static_cast<int32_t>(it), fn_hops(), n->line);
     emit(Opc::Pop);
     push_ctx(Ctx::Loop);
+    if (of) cur_->ctx[cur_->ctx.count() - 1].iter_slot = static_cast<int32_t>(it);
     const uint32_t top = pos();
-    emit(Opc::GetVar, static_cast<int32_t>(it), 0, n->line);
+    emit(Opc::GetVar, static_cast<int32_t>(it), fn_hops(), n->line);
     const uint32_t to_end = emit(Opc::IterNext);
+    uint32_t guard = 0;
+    if (of) {   // an exception in the body closes the iterator on its way out
+      guard = emit(Opc::TryBegin);
+      push_ctx(Ctx::Try, true, nullptr);
+    }
+    // for (let x of xs) { ... function () { x } ... }: every iteration has a variable of its own
+    const bool own_env = lexical && makes_closure(n->d);
+    if (own_env) begin_env(1, n->line);
+    if (lexical) declare_lexical(name, target->var_kind == VarKind::Const, n->line);
     if (target->kind == NodeKind::Var || target->kind == NodeKind::Ident) {
       if (target->kind == NodeKind::Ident) name = target->text;
-      store_name(name, n->line);
+      store_name(name, n->line, target->kind == NodeKind::Var);
       emit(Opc::Pop);
     } else if (target->kind == NodeKind::Member) {
       expression(target->a);
@@ -659,7 +770,18 @@ class Compiler {
       fail("Unsupported loop variable", n->line);
     }
     statement(n->d);
+    if (own_env) end_env(n->line);
+    if (of) {
+      cur_->ctx.remove_at(cur_->ctx.count() - 1);
+      emit(Opc::TryEnd);
+    }
     emit(Opc::Jump, static_cast<int32_t>(top));
+    if (of) {
+      patch(guard);   // (the exception is on the stack)
+      emit(Opc::GetVar, static_cast<int32_t>(it), fn_hops(), n->line);
+      emit(Opc::IterClose, 0, 1, n->line);
+      emit(Opc::Throw, 0, 0, n->line);
+    }
     patch(to_end);
     pop_ctx(static_cast<int32_t>(top));
     pop_scope();
@@ -680,9 +802,15 @@ class Compiler {
       patch(begin);   // the exception is on the stack here
       skip_catch = emit(Opc::CheckReturn);   // (a generator's return() is not caught: only the finally block runs)
       push_scope();
-      if (n->b) {
+      // catch (e) { ... function () { e } ... }: the variable is in an Env of its own, so that every exception has a new one
+      const bool own_env = n->b && makes_closure(n->c);
+      uint32_t held = 0;
+      if (own_env) {
+        held = new_slot();
+        emit(Opc::SetVar, static_cast<int32_t>(held), fn_hops(), n->line);
+      } else if (n->b) {
         const uint32_t slot = declare(n->b->text);
-        emit(Opc::SetVar, static_cast<int32_t>(slot), 0, n->line);
+        emit(Opc::SetVar, static_cast<int32_t>(slot), fn_hops(), n->line);
       }
       emit(Opc::Pop);
       uint32_t rethrow_begin = 0;
@@ -690,7 +818,15 @@ class Compiler {
         rethrow_begin = emit(Opc::TryBegin);
         push_ctx(Ctx::Try, true, n->d);
       }
+      if (own_env) {
+        begin_env(1, n->line);
+        const uint32_t slot = declare(n->b->text);
+        emit(Opc::GetVar, static_cast<int32_t>(held), fn_hops(), n->line);
+        emit(Opc::SetVar, static_cast<int32_t>(slot), 0, n->line);
+        emit(Opc::Pop);
+      }
       statement(n->c);
+      if (own_env) end_env(n->line);
       pop_scope();
       if (has_finally) {
         cur_->ctx.remove_at(cur_->ctx.count() - 1);
@@ -720,10 +856,10 @@ class Compiler {
   // The exception is on the stack: keep it, run the finally block, throw it again.
   void finally_rethrow(Node* finalizer) {
     const uint32_t tmp = new_slot();
-    emit(Opc::SetVar, static_cast<int32_t>(tmp), 0, finalizer->line);
+    emit(Opc::SetVar, static_cast<int32_t>(tmp), fn_hops(), finalizer->line);
     emit(Opc::Pop);
     statement(finalizer);
-    emit(Opc::GetVar, static_cast<int32_t>(tmp), 0, finalizer->line);
+    emit(Opc::GetVar, static_cast<int32_t>(tmp), fn_hops(), finalizer->line);
     emit(Opc::Throw);
   }
 
@@ -731,7 +867,7 @@ class Compiler {
     push_scope();
     expression(n->a);
     const uint32_t disc = new_slot();
-    emit(Opc::SetVar, static_cast<int32_t>(disc), 0, n->line);
+    emit(Opc::SetVar, static_cast<int32_t>(disc), fn_hops(), n->line);
     emit(Opc::Pop);
     for (Node* c = n->list; c; c = c->next) declare_lexicals(c->list);
     push_ctx(Ctx::Switch);
@@ -744,7 +880,7 @@ class Compiler {
         jumps.push_back(0);
         continue;
       }
-      emit(Opc::GetVar, static_cast<int32_t>(disc), 0, c->line);
+      emit(Opc::GetVar, static_cast<int32_t>(disc), fn_hops(), c->line);
       expression(c->a);
       emit(Opc::StrictEq);
       jumps.push_back(emit(Opc::JumpIfTrue));
@@ -876,12 +1012,19 @@ class Compiler {
       case NodeKind::Assign: assignment(n); return;
       case NodeKind::Call: call(n, false); return;
       case NodeKind::New: call(n, true); return;
+      case NodeKind::OptionalChain: {
+        const uint64_t first = chain_jumps_.count();
+        chain_marks_.push_back(static_cast<uint32_t>(first));
+        expression(n->a);
+        end_chain(first, false);
+        return;
+      }
       case NodeKind::Member:
         expression(n->a);
         if (n->flags & kFlagOptional) {
-          optional_guard();
+          const bool g = optional_guard();
           emit(Opc::GetProp, static_cast<int32_t>(constant_string(n->text)), 0, n->line);
-          optional_end();
+          optional_end(g);
         } else {
           emit(Opc::GetProp, static_cast<int32_t>(constant_string(n->text)), 0, n->line);
         }
@@ -889,10 +1032,10 @@ class Compiler {
       case NodeKind::Index:
         expression(n->a);
         if (n->flags & kFlagOptional) {
-          optional_guard();
+          const bool g = optional_guard();
           expression(n->b);
           emit(Opc::GetElem, 0, 0, n->line);
-          optional_end();
+          optional_end(g);
         } else {
           expression(n->b);
           emit(Opc::GetElem, 0, 0, n->line);
@@ -910,13 +1053,30 @@ class Compiler {
   }
 
   // `a?.b`: with the object on the stack, nothing nullish is read from; the result is undefined instead.
-  void optional_guard() {
+  // The end of an optional chain that began with chain_jumps_[first]: where a nullish value lands ([x] is on the stack at each jump) and leaves undefined (or true, for delete).
+  void end_chain(uint64_t first, bool delete_result) {
+    chain_marks_.remove_at(chain_marks_.count() - 1);
+    if (chain_jumps_.count() <= first) return;
+    const uint32_t to_end = emit(Opc::Jump);
+    for (uint64_t i = first; i < chain_jumps_.count(); ++i) patch(chain_jumps_[i]);
+    emit(Opc::Pop);
+    emit(delete_result ? Opc::PushTrue : Opc::PushUndef);
+    patch(to_end);
+    while (chain_jumps_.count() > first) chain_jumps_.remove_at(chain_jumps_.count() - 1);
+  }
+  bool optional_guard() {
     emit(Opc::Dup);
     emit(Opc::PushNull);
     emit(Opc::Ne);
+    if (chain_marks_.count()) {   // inside a chain: a nullish value ends the whole chain
+      chain_jumps_.push_back(emit(Opc::JumpIfFalse));
+      return true;
+    }
     optional_jumps_.push_back(emit(Opc::JumpIfFalse));
+    return false;
   }
-  void optional_end() {
+  void optional_end(bool in_chain) {
+    if (in_chain) return;
     const uint32_t to_end = emit(Opc::Jump);
     patch(optional_jumps_[optional_jumps_.count() - 1]);
     optional_jumps_.remove_at(optional_jumps_.count() - 1);
@@ -955,7 +1115,21 @@ class Compiler {
   void unary(Node* n) {
     switch (n->op) {
       case Op::Delete:
-        if (n->a->kind == NodeKind::Member) {
+        if (n->a->kind == NodeKind::OptionalChain && (n->a->a->kind == NodeKind::Member || n->a->a->kind == NodeKind::Index)) {   // delete a?.b
+          Node* link = n->a->a;
+          const uint64_t first = chain_jumps_.count();
+          chain_marks_.push_back(static_cast<uint32_t>(first));
+          expression(link->a);
+          const bool g = (link->flags & kFlagOptional) ? optional_guard() : false;
+          if (link->kind == NodeKind::Member) {
+            emit(Opc::DeleteProp, static_cast<int32_t>(constant_string(link->text)));
+          } else {
+            expression(link->b);
+            emit(Opc::DeleteElem);
+          }
+          optional_end((link->flags & kFlagOptional) ? g : true);
+          end_chain(first, true);
+        } else if (n->a->kind == NodeKind::Member) {
           expression(n->a->a);
           emit(Opc::DeleteProp, static_cast<int32_t>(constant_string(n->a->text)));
         } else if (n->a->kind == NodeKind::Index) {
@@ -995,16 +1169,16 @@ class Compiler {
           expression(n->a);
           emit(Opc::ForOfStart);
           const uint32_t it = new_slot();
-          emit(Opc::SetVar, static_cast<int32_t>(it), 0, n->line);
+          emit(Opc::SetVar, static_cast<int32_t>(it), fn_hops(), n->line);
           emit(Opc::Pop);
           const uint32_t top = pos();
-          emit(Opc::GetVar, static_cast<int32_t>(it), 0, n->line);
+          emit(Opc::GetVar, static_cast<int32_t>(it), fn_hops(), n->line);
           const uint32_t to_end = emit(Opc::IterNext);
           emit(Opc::Yield, 0, 0, n->line);
           emit(Opc::Pop);
           emit(Opc::Jump, static_cast<int32_t>(top));
           patch(to_end);
-          emit(Opc::PushUndef);
+          emit(Opc::IterReturn);
         }
         return;
       case Op::Not: expression(n->a); emit(Opc::Not); return;
@@ -1199,17 +1373,26 @@ class Compiler {
     if (optional_call) {
       const uint32_t to_end = emit(Opc::Jump);
       patch(skip);
-      emit(Opc::Pop);
-      emit(Opc::Pop);
-      emit(Opc::PushUndef);
+      if (chain_marks_.count()) {   // in a chain: the rest of it is skipped too
+        emit(Opc::Pop);
+        chain_jumps_.push_back(emit(Opc::Jump));
+      } else {
+        emit(Opc::Pop);
+        emit(Opc::Pop);
+        emit(Opc::PushUndef);
+      }
       patch(to_end);
     }
     if (guard_skip != kNoJump) {   // the object was nullish: [obj] -> [undefined]
-      const uint32_t to_end = emit(Opc::Jump);
-      patch(guard_skip);
-      emit(Opc::Pop);
-      emit(Opc::PushUndef);
-      patch(to_end);
+      if (chain_marks_.count()) {
+        chain_jumps_.push_back(guard_skip);
+      } else {
+        const uint32_t to_end = emit(Opc::Jump);
+        patch(guard_skip);
+        emit(Opc::Pop);
+        emit(Opc::PushUndef);
+        patch(to_end);
+      }
     }
   }
 
@@ -1228,12 +1411,16 @@ class Compiler {
   FuncState* cur_ = nullptr;
   bool failed_ = false;
   bool library_ = false;
+  uint32_t resolved_funcs_ = 0;   // set by resolve(): how many functions out the name was found
+  bool resolved_lexical_ = false, resolved_const_ = false;   // set by resolve(): the binding is let / const / class, or const
   StringView resolved_import_;   // set by resolve(): the export an import binding reads (empty for any other)
   uint32_t line_ = 0;
   uint32_t function_level_count_ = 0;   // how many of the current function's bindings are function-level (parameters, var, functions)
   StringView pending_label_;
   List<uint32_t>* dummy_ = nullptr;
   List<uint32_t> optional_jumps_{vm_.allocator()};
+  List<uint32_t> chain_jumps_{vm_.allocator()};   // the nullish exits of the optional chains being compiled (where each chain's begin in chain_marks_)
+  List<uint32_t> chain_marks_{vm_.allocator()};
 };
 
 }  // namespace

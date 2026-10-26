@@ -675,6 +675,7 @@ void Vm::collect() {
   for (uint64_t i = 0; i < handlers_.count(); ++i) mark(handlers_[i].env);
   mark_value(exception_);
   mark_value(last_result_);
+  mark_value(iter_return_);
   mark_value(await_value_);
   mark(promise_proto_);
   mark(micro_);
@@ -895,6 +896,20 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     return true;
   }
   if (o->okind == ObjKind::Function || o->okind == ObjKind::Native || o->okind == ObjKind::Bound) {
+    if (o->okind == ObjKind::Bound && o->target && (key == name_ || key == length_)) {   // bind(): "bound f", and the parameters left after the bound arguments
+      Value inner;
+      get_own(o->target, key, &inner);
+      if (key == name_) {
+        String text(allocator_);
+        text.append("bound ");
+        if (inner.is_string()) text.append(inner.as_string()->view());
+        *out = Value::make_string(new_string(text.view()));
+      } else {
+        double n = inner.is_number() ? inner.u.number - o->length : 0;
+        *out = Value::make_number(n < 0 ? 0 : n);
+      }
+      return true;
+    }
     if (key == name_) {
       *out = o->okind == ObjKind::Function ? Value::make_string(o->code->name ? o->code->name : empty_) : o->okind == ObjKind::Native ? o->bound_this : Value::make_string(empty_);
       return true;
@@ -1106,6 +1121,11 @@ bool Vm::put_ex(const Value& base, JsString* key, const Value& value, bool stric
       if (epilogue_pending_) run_epilogue();
       return true;
     }
+  }
+  if (o->okind == ObjKind::Array && key == length_) {   // a length must be a whole number below 2^32
+    double d = 0;
+    if (!to_number(value, &d)) return false;
+    if (!(d >= 0 && d < 4294967296.0 && d == static_cast<double>(static_cast<uint32_t>(d)))) return throw_error(ErrorKind::RangeError, "Invalid array length");
   }
   if (o->frozen) return refuse("Cannot assign to read only property '", "' of object");
   const int64_t at = find_prop(o, key);
@@ -1556,6 +1576,17 @@ double js_pow(double a, double b) {
       base *= base;
       n >>= 1;
     }
+    if (negative && (result == kInfinity || result == -kInfinity) && a != 0) {   // (2 ** -1074: the positive power overflows, the denormal result does not)
+      int64_t m = -static_cast<int64_t>(b);
+      result = 1;
+      base = 1 / a;
+      while (m > 0) {
+        if (m & 1) result *= base;
+        base *= base;
+        m >>= 1;
+      }
+      return result;
+    }
     return negative ? 1 / result : result;
   }
   if (a > 0 && a < kInfinity) return fmath::pow(a, b);
@@ -1602,6 +1633,16 @@ bool Vm::compare(const Value& a, const Value& b, bool* less, bool* undefined) {
 }
 
 bool Vm::instance_of(const Value& v, const Value& ctor, bool* out) {
+  if (ctor.is_object()) {   // a [Symbol.hasInstance] method decides
+    Value method;
+    if (!get_named(ctor, "@@hasInstance", &method)) return false;
+    if (is_callable(method)) {
+      Value answer;
+      if (!call_value(method, ctor, &v, 1, &answer, false)) return false;
+      *out = to_boolean(answer);
+      return true;
+    }
+  }
   if (!is_callable(ctor)) return throw_error(ErrorKind::TypeError, "Right-hand side of 'instanceof' is not callable");
   JsObject* c = ctor.as_object();
   while (c->okind == ObjKind::Bound && c->target) c = c->target;
@@ -1816,6 +1857,7 @@ bool Vm::make_iterator(const Value& v, bool for_in, Value* out) {
 
 bool Vm::iterator_next(JsObject* it, Value* out) {
   const Value& src = it->bound_this;
+  iter_return_ = Value();
   if (it->frozen) {   // an iterator object: call its next()
     Value next, step, done;
     if (!get_named(src, "next", &next)) return false;
@@ -1825,7 +1867,11 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
       return false;
     }
     if (!get_named(step, "done", &done)) return false;
-    if (to_boolean(done)) return false;
+    if (to_boolean(done)) {
+      iter_return_ = Value();
+      if (!get_named(step, "value", &iter_return_)) return false;
+      return false;
+    }
     return get_named(step, "value", out);
   }
   if (it->target) {   // for-in: a list of keys
@@ -1853,6 +1899,37 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
     }
   }
   return false;
+}
+
+bool Vm::throw_uninitialized(FunctionCode* code, uint16_t mark) {
+  String message(allocator_);
+  const uint32_t name = mark - kChecked;
+  if (name < code->constants.count() && code->constants[name].is_string()) {
+    JsString* s = code->constants[name].as_string();
+    message.append("Cannot access '");
+    message.append(StringView(s->data(), s->length));
+    message.append("' before initialization");
+  } else {
+    message.append("Cannot access a variable before initialization");
+  }
+  return throw_error(ErrorKind::ReferenceError, message.view());
+}
+
+bool Vm::iterator_close(JsObject* it, bool silent) {
+  if (!it->frozen) return true;   // (arrays, strings and key lists have nothing to close)
+  const Value src = it->bound_this;
+  Value method, result;
+  bool ok = get_named(src, "return", &method);
+  if (ok && is_callable(method)) {
+    ok = call_value(method, src, nullptr, 0, &result, false);
+    if (ok && !silent && !result.is_object()) ok = throw_error(ErrorKind::TypeError, "Iterator result is not an object");
+  }
+  if (!ok && silent) {
+    has_exception_ = false;
+    exception_ = Value();
+    return true;
+  }
+  return ok;
 }
 
 bool Vm::iterate_into(JsObject* array, const Value& iterable, int64_t max) {
@@ -1925,6 +2002,7 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   if (code->arguments_slot >= 0) {
     JsObject* list = new_array(argc);
     for (uint32_t k = 0; k < argc; ++k) array_push(list, args[k]);
+    list->position = kArgumentsMark;   // (an array that stands for an arguments object: Object.prototype.toString says so)
     slots[code->arguments_slot] = Value::make_object(list);
   }
   if (code->self_slot >= 0) slots[code->self_slot] = Value::make_object(fn);
@@ -2191,13 +2269,51 @@ reload:
       case Opc::GetVar: {
         Env* e = fp->env;
         for (uint8_t d = in.b; d > 0; --d) e = e->parent;
+        if (in.unused >= kChecked && e->slots()[in.a].is_uninitialized()) {
+          CHECK(throw_uninitialized(code, in.unused));
+        }
         PUSH(e->slots()[in.a]);
         break;
       }
       case Opc::SetVar: {
         Env* e = fp->env;
         for (uint8_t d = in.b; d > 0; --d) e = e->parent;
+        if (in.unused != 0) {
+          if (in.unused == kConstAssign) {
+            throw_error(ErrorKind::TypeError, "Assignment to constant variable.");
+            THROW_PENDING();
+          }
+          if (e->slots()[in.a].is_uninitialized()) CHECK(throw_uninitialized(code, in.unused));
+        }
         e->slots()[in.a] = stack_[sp_ - 1];
+        break;
+      }
+      case Opc::TdzMark: {
+        Env* e = fp->env;
+        for (uint8_t d = in.b; d > 0; --d) e = e->parent;
+        e->slots()[in.a] = Value::make_uninitialized();
+        break;
+      }
+      case Opc::PushEnv: {
+        Env* e = new_env(static_cast<uint32_t>(in.a), fp->env);
+        if (!e) {
+          throw_error(ErrorKind::RangeError, "out of memory");
+          THROW_PENDING();
+        }
+        fp->env = e;
+        break;
+      }
+      case Opc::IterReturn: PUSH(iter_return_); break;
+      case Opc::PopEnv: fp->env = fp->env->parent; break;
+      case Opc::CopyEnv: {
+        Env* old = fp->env;
+        Env* e = new_env(old->count, old->parent);
+        if (!e) {
+          throw_error(ErrorKind::RangeError, "out of memory");
+          THROW_PENDING();
+        }
+        for (uint32_t i = 0; i < old->count; ++i) e->slots()[i] = old->slots()[i];
+        fp->env = e;
         break;
       }
       case Opc::GetGlobal: {
@@ -2552,6 +2668,12 @@ reload:
           --sp_;
           pc = static_cast<uint32_t>(in.a);
         }
+        break;
+      }
+      case Opc::IterClose: {
+        JsObject* it = stack_[sp_ - 1].as_object();
+        --sp_;
+        CHECK(iterator_close(it, in.b != 0));
         break;
       }
       case Opc::TryBegin: {

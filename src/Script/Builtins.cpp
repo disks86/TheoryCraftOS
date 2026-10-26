@@ -115,8 +115,16 @@ NATIVE(object_ctor) {
   return true;
 }
 
+// A string seen as an object (its characters at "0", "1" ...): an array of them stands in for it.
+Value string_as_object(Vm& vm, const Value& v) {
+  if (!v.is_string()) return v;
+  JsObject* chars = vm.new_array(v.as_string()->length);
+  for (uint32_t i = 0; i < v.as_string()->length; ++i) vm.array_push(chars, str_value(vm, StringView(v.as_string()->data() + i, 1)));
+  return Value::make_object(chars);
+}
+
 NATIVE(object_keys) {
-  const Value v = arg_at(args, argc, 0);
+  const Value v = string_as_object(vm, arg_at(args, argc, 0));
   if (!v.is_object()) {
     *result = Value::make_object(vm.new_array());
     return true;
@@ -126,7 +134,7 @@ NATIVE(object_keys) {
 }
 
 NATIVE(object_values) {
-  const Value v = arg_at(args, argc, 0);
+  const Value v = string_as_object(vm, arg_at(args, argc, 0));
   JsObject* out = vm.new_array();
   if (v.is_object()) {
     JsObject* keys = vm.own_keys(v.as_object());
@@ -141,7 +149,7 @@ NATIVE(object_values) {
 }
 
 NATIVE(object_entries) {
-  const Value v = arg_at(args, argc, 0);
+  const Value v = string_as_object(vm, arg_at(args, argc, 0));
   JsObject* out = vm.new_array();
   if (v.is_object()) {
     JsObject* keys = vm.own_keys(v.as_object());
@@ -162,11 +170,12 @@ NATIVE(object_assign) {
   const Value target = arg_at(args, argc, 0);
   if (!target.is_object()) return vm.throw_error(ErrorKind::TypeError, "Cannot convert undefined or null to object");
   for (uint32_t a = 1; a < argc; ++a) {
-    if (!args[a].is_object()) continue;
-    JsObject* keys = vm.own_keys(args[a].as_object());
+    const Value source = string_as_object(vm, args[a]);
+    if (!source.is_object()) continue;
+    JsObject* keys = vm.own_keys(source.as_object());
     for (uint32_t i = 0; i < keys->length; ++i) {
       Value item;
-      if (!vm.get(args[a], keys->items[i].as_string(), &item) || !vm.put(target, keys->items[i].as_string(), item)) return false;
+      if (!vm.get(source, keys->items[i].as_string(), &item) || !vm.put(target, keys->items[i].as_string(), item)) return false;
     }
   }
   *result = target;
@@ -175,6 +184,7 @@ NATIVE(object_assign) {
 
 NATIVE(object_create) {
   const Value proto = arg_at(args, argc, 0);
+  if (!proto.is_object() && !proto.is_null()) return vm.throw_error(ErrorKind::TypeError, "Object prototype may only be an Object or null");
   *result = Value::make_object(vm.new_object(proto.is_object() ? proto.as_object() : nullptr));
   return true;
 }
@@ -373,7 +383,7 @@ NATIVE(object_get_own_property_descriptor) {
 }
 
 NATIVE(object_get_own_property_names) {
-  const Value target = arg_at(args, argc, 0);
+  const Value target = string_as_object(vm, arg_at(args, argc, 0));
   if (!target.is_object()) {
     *result = Value::make_object(vm.new_array());
     return true;
@@ -561,7 +571,10 @@ NATIVE(object_has_own_property) {
 // __template(cooked, raw): the strings array a tag function gets
 NATIVE(template_object) {
   const Value cooked = arg_at(args, argc, 0), raw = arg_at(args, argc, 1);
-  if (cooked.is_object() && raw.is_object()) vm.define_named(cooked.as_object(), "raw", raw, 0);
+  if (cooked.is_object() && raw.is_object()) {
+    vm.define_named(cooked.as_object(), "raw", raw, 0);
+    cooked.as_object()->frozen = raw.as_object()->frozen = true;   // (the strings array of a tagged template and its raw array are frozen)
+  }
   *result = cooked;
   return true;
 }
@@ -586,7 +599,7 @@ NATIVE(object_to_string) {
   else if (self.is_bool()) name = "[object Boolean]";
   else if (self.is_object()) {
     switch (self.as_object()->okind) {
-      case ObjKind::Array: name = "[object Array]"; break;
+      case ObjKind::Array: name = self.as_object()->position == kArgumentsMark ? "[object Arguments]" : "[object Array]"; break;
       case ObjKind::Function: case ObjKind::Native: case ObjKind::Bound: name = "[object Function]"; break;
       case ObjKind::Error: name = "[object Error]"; break;
       case ObjKind::RegExp: name = "[object RegExp]"; break;
@@ -632,6 +645,15 @@ NATIVE(function_bind) {
 
 NATIVE(function_to_string) {
   String text(vm.allocator());
+  if (self.is_object() && self.as_object()->okind == ObjKind::Native) {
+    Value name;
+    if (!vm.get_named(self, "name", &name)) return false;
+    text.append("function ");
+    if (name.is_string()) text.append(name.as_string()->view());
+    text.append("() { [native code] }");
+    *result = str_value(vm, text.view());
+    return true;
+  }
   vm.describe(self, &text, 0);
   *result = str_value(vm, text.view());
   return true;
@@ -647,6 +669,21 @@ NATIVE(array_ctor) {
     vm.array_set_length(a, static_cast<uint32_t>(d));
   } else {
     for (uint32_t i = 0; i < argc; ++i) vm.array_push(a, args[i]);
+  }
+  if (self.is_object() && self.as_object()->okind == ObjKind::Plain && self.as_object()->proto && self.as_object()->proto != vm.array_proto()) {
+    bool derived = false;   // class D extends Array: `new D()` made `self` with D.prototype, which the array takes over
+    for (JsObject* p = self.as_object()->proto; p && !derived; p = p->proto) derived = p == vm.array_proto();
+    if (derived) {   // (the object keeps its prototype and becomes the array)
+      JsObject* d = self.as_object();
+      d->okind = ObjKind::Array;
+      d->items = a->items;
+      d->length = a->length;
+      d->capacity = a->capacity;
+      a->items = nullptr;
+      a->length = a->capacity = 0;
+      *result = self;
+      return true;
+    }
   }
   *result = Value::make_object(a);
   return true;
@@ -1020,10 +1057,14 @@ NATIVE(array_sort) {
       vm.allocator().deallocate(scratch);
       return vm.throw_error(ErrorKind::RangeError, "out of memory");
     }
-    for (uint32_t i = 0; i < a->length; ++i) copy[i] = a->items[i];
-    const bool ok = merge_sort(vm, fn, copy, scratch, a->length);
-    if (ok)
-      for (uint32_t i = 0; i < a->length; ++i) a->items[i] = copy[i];
+    uint32_t defined = 0;   // (undefined sorts after everything else without being compared)
+    for (uint32_t i = 0; i < a->length; ++i)
+      if (!a->items[i].is_undefined()) copy[defined++] = a->items[i];
+    const bool ok = merge_sort(vm, fn, copy, scratch, defined);
+    if (ok) {
+      for (uint32_t i = 0; i < defined; ++i) a->items[i] = copy[i];
+      for (uint32_t i = defined; i < a->length; ++i) a->items[i] = Value();
+    }
     vm.allocator().deallocate(copy);
     vm.allocator().deallocate(scratch);
     if (!ok) return false;
@@ -1034,18 +1075,29 @@ NATIVE(array_sort) {
 
 NATIVE(array_to_string) { return array_join(vm, self, nullptr, 0, result); }
 
+bool flatten_into(Vm& vm, JsObject* out, JsObject* source, double depth, uint32_t nesting) {
+  for (uint32_t i = 0; i < source->length; ++i) {
+    const Value item = source->items[i];
+    if (depth >= 1 && item.is_object() && item.as_object()->okind == ObjKind::Array) {
+      if (nesting > 500) return vm.throw_error(ErrorKind::RangeError, "Maximum call stack size exceeded");
+      if (!flatten_into(vm, out, item.as_object(), depth - 1, nesting + 1)) return false;
+    } else {
+      vm.array_push(out, item);
+    }
+  }
+  return true;
+}
+
 NATIVE(array_flat) {
   JsObject* a;
   if (!this_array(vm, self, &a)) return false;
-  JsObject* out = vm.new_array();
-  for (uint32_t i = 0; i < a->length; ++i) {
-    if (a->items[i].is_object() && a->items[i].as_object()->okind == ObjKind::Array) {
-      JsObject* inner = a->items[i].as_object();
-      for (uint32_t k = 0; k < inner->length; ++k) vm.array_push(out, inner->items[k]);
-    } else {
-      vm.array_push(out, a->items[i]);
-    }
+  double depth = 1;
+  if (argc > 0 && !args[0].is_undefined()) {
+    if (!vm.to_number(args[0], &depth)) return false;
+    if (depth != depth) depth = 0;
   }
+  JsObject* out = vm.new_array();
+  if (!flatten_into(vm, out, a, depth, 0)) return false;
   *result = Value::make_object(out);
   return true;
 }
@@ -1155,8 +1207,15 @@ NATIVE(string_index_of) {
 NATIVE(string_last_index_of) {
   JsString *s, *needle;
   if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle)) return false;
+  double from_index = kNaN;   // (NaN: from the end)
+  if (argc > 1 && !args[1].is_undefined() && !vm.to_number(args[1], &from_index)) return false;
   int64_t found = -1;
-  for (int64_t i = static_cast<int64_t>(s->length) - needle->length; i >= 0; --i) {
+  int64_t start = static_cast<int64_t>(s->length) - needle->length;
+  if (from_index == from_index) {
+    const int64_t limit = from_index < 0 ? 0 : from_index > 9e15 ? static_cast<int64_t>(9e15) : static_cast<int64_t>(from_index);
+    if (limit < start) start = limit;
+  }
+  for (int64_t i = start; i >= 0; --i) {
     if (s->view().substr(static_cast<uint64_t>(i), needle->length).equals(needle->view())) {
       found = i;
       break;
@@ -1168,22 +1227,31 @@ NATIVE(string_last_index_of) {
 
 NATIVE(string_includes) {
   JsString *s, *needle;
-  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle)) return false;
-  *result = Value::make_bool(s->view().find(needle->view()) != StringView::npos);
+  int64_t from;
+  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle) || !arg_integer(vm, args, argc, 1, 0, &from)) return false;
+  if (from < 0) from = 0;
+  if (from > s->length) from = s->length;
+  *result = Value::make_bool(s->view().find(needle->view(), static_cast<uint64_t>(from)) != StringView::npos);
   return true;
 }
 
 NATIVE(string_starts_with) {
   JsString *s, *needle;
-  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle)) return false;
-  *result = Value::make_bool(s->view().starts_with(needle->view()));
+  int64_t from;
+  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle) || !arg_integer(vm, args, argc, 1, 0, &from)) return false;
+  if (from < 0) from = 0;
+  if (from > s->length) from = s->length;
+  *result = Value::make_bool(s->view().substr(static_cast<uint64_t>(from)).starts_with(needle->view()));
   return true;
 }
 
 NATIVE(string_ends_with) {
   JsString *s, *needle;
-  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle)) return false;
-  *result = Value::make_bool(s->view().ends_with(needle->view()));
+  int64_t end;
+  if (!this_string(vm, self, &s) || !arg_string(vm, args, argc, 0, &needle) || !arg_integer(vm, args, argc, 1, s->length, &end)) return false;
+  if (end < 0) end = 0;
+  if (end > s->length) end = s->length;
+  *result = Value::make_bool(s->view().substr(0, static_cast<uint64_t>(end)).ends_with(needle->view()));
   return true;
 }
 
@@ -1291,6 +1359,20 @@ NATIVE(string_split) {
   return true;
 }
 
+// A replacement string with $$, $&, $` and $' worked out (for a string pattern there are no groups).
+void append_replacement(String* out, StringView text, StringView subject, uint64_t at, StringView matched) {
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '$' && i + 1 < text.size()) {
+      const char c = text[i + 1];
+      if (c == '$') { out->push_back('$'); ++i; continue; }
+      if (c == '&') { out->append(matched); ++i; continue; }
+      if (c == '`') { out->append(subject.substr(0, at)); ++i; continue; }
+      if (c == '\'') { out->append(subject.substr(at + matched.size())); ++i; continue; }
+    }
+    out->push_back(text[i]);
+  }
+}
+
 bool replace_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result, bool all) {
   JsString *s, *pattern;
   if (!this_string(vm, self, &s)) return false;
@@ -1306,7 +1388,7 @@ bool replace_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, V
     if (at == StringView::npos || (pattern->length == 0 && at >= s->length && pos > 0)) break;
     out.append(s->view().substr(pos, at - pos));
     if (fixed) {
-      out.append(fixed->view());
+      append_replacement(&out, fixed->view(), s->view(), at, pattern->view());
     } else {
       Value call_args[3] = {Value::make_string(pattern), num_value(static_cast<double>(at)), Value::make_string(s)};
       Value r;
@@ -1584,7 +1666,7 @@ double floor_of(double x) {
 MATH1(math_abs, x < 0 ? -x : x)
 MATH1(math_floor, floor_of(x))
 MATH1(math_ceil, -floor_of(-x))
-MATH1(math_round, floor_of(x + 0.5))
+MATH1(math_round, x != x || x == kInf || x == -kInf ? x : (x < 0 && x >= -0.5) ? -0.0 : (x > 0 && x < 0.5) ? 0.0 : floor_of(x + 0.5))   // (-0.4 rounds to -0; x + 0.5 would round up 0.49999999999999994)
 MATH1(math_trunc, x < 0 ? -floor_of(-x) : floor_of(x))
 MATH1(math_sign, x != x ? x : x > 0 ? 1 : x < 0 ? -1 : x)
 MATH1(math_sqrt, x < 0 || x != x ? kNaN : x == kInf ? kInf : fmath::sqrt(x))
@@ -1607,16 +1689,22 @@ NATIVE(math_pow) {
 NATIVE(math_atan2) {
   double y, x;
   if (!arg_number(vm, args, argc, 0, &y) || !arg_number(vm, args, argc, 1, &x)) return false;
-  // atan from the series through the library's sin / cos is not available: use a rational approximation
   if (x != x || y != y) {
     *result = num_value(kNaN);
     return true;
   }
   const double ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
-  double a = ax > ay ? ay / ax : (ay == 0 ? 0 : ax / ay);
-  // atan(a) for 0..1 by a minimax polynomial
+  double a = ax > ay ? ay / ax : (ay == 0 ? 0 : ax / ay);   // 0..1
+  // atan(a) = 2 atan(a / (1 + sqrt(1 + a^2))) twice over, then the Taylor series on the small argument
+  a = a / (1 + fmath::sqrt(1 + a * a));
+  a = a / (1 + fmath::sqrt(1 + a * a));
   const double s = a * a;
-  double r = a * (0.99997726 + s * (-0.33262347 + s * (0.19354346 + s * (-0.11643287 + s * (0.05265332 + s * -0.01172120)))));
+  double term = a, sum = a;
+  for (int n = 1; n < 12; ++n) {
+    term *= -s;
+    sum += term / (2 * n + 1);
+  }
+  double r = 4 * sum;
   if (ay > ax) r = 1.5707963267948966 - r;
   if (x < 0) r = 3.141592653589793 - r;
   if (y < 0) r = -r;
@@ -1640,7 +1728,7 @@ NATIVE(math_min) {
       *result = num_value(d);
       return true;
     }
-    if (d < best) best = d;
+    if (d < best || (d == 0 && best == 0 && __builtin_signbit(d))) best = d;   // (-0 is smaller than 0)
   }
   *result = num_value(best);
   return true;
@@ -1655,7 +1743,7 @@ NATIVE(math_max) {
       *result = num_value(d);
       return true;
     }
-    if (d > best) best = d;
+    if (d > best || (d == 0 && best == 0 && !__builtin_signbit(d))) best = d;   // (0 is larger than -0)
   }
   *result = num_value(best);
   return true;
@@ -1694,8 +1782,20 @@ bool error_ctor(Vm& vm, const Value&, const Value* args, uint32_t argc, Value* r
 }
 
 NATIVE(error_to_string) {
+  if (!self.is_object()) return vm.throw_error(ErrorKind::TypeError, "Error.prototype.toString called on a non-object");
+  Value name_value, message_value;
+  if (!vm.get_named(self, "name", &name_value) || !vm.get_named(self, "message", &message_value)) return false;
+  JsString* name = nullptr;
+  JsString* message = nullptr;
+  if (name_value.is_undefined()) name = vm.intern("Error");
+  else if (!vm.to_string(name_value, &name)) return false;
+  if (!message_value.is_undefined() && !vm.to_string(message_value, &message)) return false;
   String text(vm.allocator());
-  vm.describe(self, &text, 0);
+  text.append(name->view());
+  if (message && message->length) {
+    if (name->length) text.append(": ");
+    text.append(message->view());
+  }
   *result = str_value(vm, text.view());
   return true;
 }
@@ -1703,7 +1803,10 @@ NATIVE(error_to_string) {
 // --- Promise -------------------------------------------------------------------------------------------------------
 
 NATIVE(promise_ctor) {
-  if (!self.is_object() || self.as_object()->okind != ObjKind::Plain || self.as_object()->proto != vm.promise_proto()) return vm.throw_error(ErrorKind::TypeError, "Promise constructor cannot be invoked without 'new'");
+  bool is_promise_instance = false;   // (`new Promise` or `new D` of a class D extends Promise)
+  if (self.is_object() && self.as_object()->okind == ObjKind::Plain)
+    for (JsObject* p = self.as_object()->proto; p && !is_promise_instance; p = p->proto) is_promise_instance = p == vm.promise_proto();
+  if (!is_promise_instance) return vm.throw_error(ErrorKind::TypeError, "Promise constructor cannot be invoked without 'new'");
   const Value executor = arg_at(args, argc, 0);
   if (!Vm::is_callable(executor)) return vm.throw_error(ErrorKind::TypeError, "Promise resolver is not a function");
   JsObject* promise = self.as_object();

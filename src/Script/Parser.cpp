@@ -2343,11 +2343,21 @@ class Parser {
 
   // Follows `.name`, `[expr]`, `?.`, and (when allowed) `(args)` after an expression.
   Node* members(Node* e, bool calls) {
+    bool optional_seen = false;
+    Node* r = members_links(e, calls, &optional_seen);
+    if (!r || !optional_seen) return r;
+    Node* w = make(NodeKind::OptionalChain);
+    if (!w) return nullptr;
+    w->a = r;
+    return w;
+  }
+  Node* members_links(Node* e, bool calls, bool* optional_seen) {
     for (uint32_t chain = 0;; ++chain) {
       if (failed_) return nullptr;
       if (chain > 2500) return null_fail("Expression too long");
       if (is(T::Dot) || is(T::QuestionDot)) {
         const bool optional = is(T::QuestionDot);
+        if (optional) *optional_seen = true;
         next();
         if (optional && is(T::LParen)) {
           if (!calls) return e;

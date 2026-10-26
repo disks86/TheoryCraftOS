@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6VideoEngine.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnVideoEngine.hpp"
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaVideoEngine.hpp"
@@ -95,7 +96,31 @@ MmioRegion SystemVideoCodecs::amd_registers(const PciDeviceInfo& d, uint64_t len
   return region;
 }
 
+// The Vega M: the register BAR (BAR 5) and the memory BAR (BAR 0) for the engine; it reads the card's memory controller itself.
+void SystemVideoCodecs::add_amd_uvd6(const PciDeviceInfo& d) {
+  constexpr uint16_t kPciCommand = 0x04;
+  constexpr uint32_t kMemorySpace = 1u << 1;
+  UniquePointer<AmdUvd6VideoEngine> device = UniquePointer<AmdUvd6VideoEngine>::make(allocator_, allocator_, d.device_id);
+  if (!device) return;
+  device->set_pci_address(d.address);
+  uint64_t aperture = 0;
+  const uint64_t base = pci_.memory_bar(d.address, 0);
+  if (mmio_ && bar_sizer_ && (pci_.read32(d.address, kPciCommand) & kMemorySpace) && base != 0 && bar_sizer_->bar_size(d.address, 0, &aperture)) {
+    device->set_aperture(base, aperture);
+    device->set_registers(amd_registers(d, kAmdGmc8RegisterBytes));
+  }
+  if (!device->initialize()) {
+    device->shutdown();
+    return;
+  }
+  devices_.push_back(UniquePointer<IVideoCodecDevice>(util::move(device)));
+}
+
 void SystemVideoCodecs::add_amd(const PciDeviceInfo& d) {
+  if (amd_uvd6_ && amd_uvd6_firmware_name(d.device_id)) {
+    add_amd_uvd6(d);
+    return;
+  }
   uint64_t bar_size = 0;
   const MmioRegion window = amd_discovery_window(d, &bar_size);
   UniquePointer<AmdVcnVideoEngine> device = UniquePointer<AmdVcnVideoEngine>::make(allocator_, allocator_, d.device_id, window);

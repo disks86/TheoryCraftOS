@@ -321,6 +321,9 @@ class Vm {
   bool has_in(const Value& key, const Value& object, bool* out);
   bool make_iterator(const Value& v, bool for_in, Value* out);
   bool iterator_next(JsObject* it, Value* out);
+  // Leaves an iteration early: calls the iterator's return() if it has one. `silent`: an exception from it is dropped (another one is already on its way).
+  bool iterator_close(JsObject* it, bool silent);
+  bool throw_uninitialized(FunctionCode* code, uint16_t mark);   // ReferenceError for a let / const read or written in its temporal dead zone
   bool spread_into(JsObject* array, const Value& iterable);
   bool has_global(JsString* name);
   bool lookup_global(JsString* name, Value* out);
@@ -385,6 +388,7 @@ class Vm {
   bool has_exception_ = false;
   uint32_t throw_line_ = 0;   // the source line an exception was thrown from (kept for debugging builds: TCOS_ERROR_LINES prints it)
   Value last_result_;
+  Value iter_return_;   // the value an iterator finished with (done: true, value: ...): what `yield*` evaluates to
   JsObject *global_ = nullptr, *object_proto_ = nullptr, *array_proto_ = nullptr, *function_proto_ = nullptr, *string_proto_ = nullptr, *number_proto_ = nullptr,
            *boolean_proto_ = nullptr, *error_proto_ = nullptr, *iterator_proto_ = nullptr, *sentinel_ = nullptr;
   JsObject* error_protos_[5] = {};
