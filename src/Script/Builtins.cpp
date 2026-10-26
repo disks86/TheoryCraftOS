@@ -466,7 +466,23 @@ NATIVE(object_to_string) {
       return true;
     }
   }
-  *result = str_value(vm, self.is_undefined() ? "[object Undefined]" : self.is_null() ? "[object Null]" : self.is_object() && self.as_object()->okind == ObjKind::Array ? "[object Array]" : "[object Object]");
+  const char* name = "[object Object]";
+  if (self.is_undefined()) name = "[object Undefined]";
+  else if (self.is_null()) name = "[object Null]";
+  else if (self.is_number()) name = "[object Number]";
+  else if (self.is_string()) name = "[object String]";
+  else if (self.is_bool()) name = "[object Boolean]";
+  else if (self.is_object()) {
+    switch (self.as_object()->okind) {
+      case ObjKind::Array: name = "[object Array]"; break;
+      case ObjKind::Function: case ObjKind::Native: case ObjKind::Bound: name = "[object Function]"; break;
+      case ObjKind::Error: name = "[object Error]"; break;
+      case ObjKind::RegExp: name = "[object RegExp]"; break;
+      case ObjKind::Promise: name = "[object Promise]"; break;
+      default: break;
+    }
+  }
+  *result = str_value(vm, name);
   return true;
 }
 
@@ -2496,6 +2512,7 @@ bool install_builtins(Vm& vm) {
   // Math
   JsObject* math = vm.new_plain();
   global_value("Math", Value::make_object(math));
+  vm.define_named(math, "@@toStringTag", str_value(vm, "Math"), 0);
   vm.define_named(math, "PI", num_value(3.141592653589793), 0);
   vm.define_named(math, "E", num_value(2.718281828459045), 0);
   vm.define_named(math, "LN2", num_value(0.6931471805599453), 0);
@@ -2544,6 +2561,7 @@ bool install_builtins(Vm& vm) {
   // JSON
   JsObject* json = vm.new_plain();
   global_value("JSON", Value::make_object(json));
+  vm.define_named(json, "@@toStringTag", str_value(vm, "JSON"), 0);
   vm.define_native(json, "stringify", json_stringify, 3);
   vm.define_native(json, "parse", json_parse, 1);
 
