@@ -31,6 +31,11 @@
 
 using namespace hardware;
 
+namespace {
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Tables.inc"
+constexpr const uint32_t* kMacroModes = kMacrotileModes;
+}  // namespace
+
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
@@ -359,10 +364,11 @@ static void test_load_failures() {
 struct GfxRig {
   fakegfx::Card card;
   fakegfx::FakeClock clock;
-  Block ring_block, wb_block;
-  uint64_t ring_gpu = 0x2'0010'0000ull, wb_gpu = 0x2'0020'0000ull;
-  GfxRig() : ring_block(AmdGfx8::kRingBytes), wb_block(4096) {
+  Block ring_block, wb_block, csb_block;
+  uint64_t ring_gpu = 0x2'0010'0000ull, wb_gpu = 0x2'0020'0000ull, csb_gpu = 0x2'0030'0000ull;
+  GfxRig() : ring_block(AmdGfx8::kRingBytes), wb_block(4096), csb_block(8192) {
     card.windows.push_back({ring_gpu, ring_block.base, AmdGfx8::kRingBytes});
+    card.windows.push_back({csb_gpu, csb_block.base, 8192});
     card.windows.push_back({wb_gpu, wb_block.base, 4096});
     card.set_sram(card.soft_status_address(), 0x47E);   // the SMC has loaded the microcode
   }
@@ -372,6 +378,8 @@ struct GfxRig {
     m.ring = hardware::MmioRegion(reinterpret_cast<uint64_t>(ring_block.base), AmdGfx8::kRingBytes);
     m.writeback_gpu_address = wb_gpu;
     m.writeback = hardware::MmioRegion(reinterpret_cast<uint64_t>(wb_block.base), 16);
+    m.csb_gpu_address = csb_gpu;
+    m.csb = hardware::MmioRegion(reinterpret_cast<uint64_t>(csb_block.base), 8192);
     return m;
   }
   uint32_t ring_word(uint32_t i) { return card.get32(ring_gpu + uint64_t{i} * 4); }
@@ -401,15 +409,45 @@ static void test_start() {
   // The golden registers: a mask of all ones writes the value, otherwise the owned bits are replaced and the value ORed in (VI family).
   for (const Golden& g : kGolden) {
     const uint32_t expected = g.and_mask == 0xFFFFFFFFu ? g.or_mask : ((initial_value(g.reg) & ~g.and_mask) | g.or_mask);
-    if (g.reg != 0xC200) CHECK(rig.card.reg(g.reg) == expected);   // (the register index ends up on broadcast, below)
+    if (g.reg != 0xC200 && g.reg != 0xA0D4 && g.reg != 0xA0D5) CHECK(rig.card.reg(g.reg) == expected);   // (the register index ends up on broadcast, below; the raster configuration is set again by the back-end set-up)
   }
   CHECK(rig.card.reg(0xC200) == 0xE0000000);
   // The order of the writes: the golden table first, in order, then the sequence of gfx_v8_0_hw_init.
   const auto& w = rig.card.writes;
-  CHECK(w.size() > 23 + 28);
+  CHECK(w.size() > 23 + 200);
   for (size_t i = 0; i < 23 && i < w.size(); ++i) CHECK(w[i].first == kGolden[i].reg);
   const uint64_t rptr_addr = rig.wb_gpu, poll_addr = rig.wb_gpu + 8, base = rig.ring_gpu >> 8;
-  const std::pair<uint32_t, uint32_t> sequence[] = {
+  std::vector<std::pair<uint32_t, uint32_t>> sequence;
+  auto add = [&](uint32_t reg, uint32_t value) { sequence.push_back({reg, value}); };
+  // gfx_v8_0_constants_init: GRBM_CNTL READ_TIMEOUT 0xFF, the address configuration three times, the 32 tile modes and the 15 macrotile modes (not 7), the render back-end
+  // set-up (broadcast selections, the unharvested raster configuration), SH_STATIC_MEM_CONFIG, the shader memory set-up of VMIDs 0..7 through SRBM_GFX_CNTL, the same for
+  // the compute VMIDs 8..15 followed by their GDS registers, the GDS registers of VMIDs 1..15, the FIFO sizes and the SPI arbitration priority.
+  add(0x2000, 0xFF);
+  add(0x263E, 0x22011003); add(0xBD2, 0x22011003); add(0x303, 0x22011003);
+  for (uint32_t i = 0; i < 32; ++i) add(0x2644 + i, kTileModes[i]);
+  for (uint32_t i = 0; i < 16; ++i) if (i != 7) add(0x2664 + i, kMacroModes[i]);
+  add(fakegfx::kGrbmGfxIndex, 0x40000000); add(fakegfx::kGrbmGfxIndex, 0x40010000); add(fakegfx::kGrbmGfxIndex, 0xE0000000);   // setup_rb: look at every SE/SH
+  add(0xA0D4, 0x3a00161a); add(0xA0D5, 0x0000002e);
+  add(fakegfx::kGrbmGfxIndex, 0x40000000); add(fakegfx::kGrbmGfxIndex, 0x40010000); add(fakegfx::kGrbmGfxIndex, 0xE0000000);   // ... and cache the values
+  add(0x2581, 0x1b);
+  for (uint32_t vmid = 0; vmid < 8; ++vmid) {
+    add(0x391, vmid << 4);
+    add(0x230d, vmid == 0 ? 0x378 : 0x338);
+    add(0x230a, vmid == 0 ? 0 : 0x2000);
+    add(0x230b, 1); add(0x230c, 0);
+  }
+  add(0x391, 0);
+  for (uint32_t vmid = 8; vmid < 16; ++vmid) {
+    add(0x391, vmid << 4);
+    add(0x230d, 0x5e); add(0x230b, 1); add(0x230c, 0); add(0x230a, 0x60006000);
+  }
+  add(0x391, 0);
+  for (uint32_t vmid = 8; vmid < 16; ++vmid) { add(0x3300 + 2 * vmid, 0); add(0x3301 + 2 * vmid, 0); add(0x3320 + vmid, 0); add(0x3330 + vmid, 0); }
+  for (uint32_t vmid = 1; vmid < 16; ++vmid) { add(0x3300 + 2 * vmid, 0); add(0x3301 + 2 * vmid, 0); add(0x3320 + vmid, 0); add(0x3330 + vmid, 0); }
+  add(fakegfx::kGrbmGfxIndex, 0xE0000000);
+  add(0x22f3, 0x98184020);
+  add(0x31c0, 0x492);
+  const std::pair<uint32_t, uint32_t> rest[] = {
       {fakegfx::kRlcCntl, 0x6 & ~1u},                      // gfx_v8_0_rlc_stop: RLC_ENABLE_F32 off (the other bits stay)
       {fakegfx::kCpIntCntlRing0, 0},                       // the GUI idle interrupt off
       {fakegfx::kGrbmGfxIndex, 0x40000000},                // wait for the RLC serdes: SE 0, SH 0, every instance
@@ -417,6 +455,10 @@ static void test_start() {
       {fakegfx::kGrbmGfxIndex, 0xE0000000},                // broadcast again
       {fakegfx::kGrbmSoftReset, 0x4},                      // gfx_v8_0_rlc_reset
       {fakegfx::kGrbmSoftReset, 0},
+      {fakegfx::kHdpFlush, 1},                             // gfx_v8_0_init_csb: the clear state into the buffer, then where it is
+      {0xeca3, static_cast<uint32_t>(rig.csb_gpu >> 32)},
+      {0xeca2, static_cast<uint32_t>(rig.csb_gpu)},
+      {0xeca4, 912},
       {fakegfx::kRlcCntl, 0x7},                            // gfx_v8_0_rlc_start
       {fakegfx::kCpIntCntlRing0, 0x3C0000},
       {fakegfx::kCpIntCntlRing0, 0},                       // gfx_v8_0_cp_resume
@@ -437,16 +479,17 @@ static void test_start() {
       {0x3050, 0},                                         // CP_ENDIAN_SWAP
       {0x304b, 1},                                         // CP_DEVICE_ID
       {fakegfx::kCpMeCntl, 0},                             // cp_gfx_enable: the halt bits off
-      {fakegfx::kHdpFlush, 1},                             // the start stream is committed
-      {fakegfx::kRb0Wptr, 256},
+      {fakegfx::kHdpFlush, 1},                             // the start stream is committed (916 dwords, padded to 1024)
+      {fakegfx::kRb0Wptr, 1024},
       {fakegfx::kScratch0, 0xCAFEDEAD},                    // the ring test
       {fakegfx::kHdpFlush, 1},
-      {fakegfx::kRb0Wptr, 512},
+      {fakegfx::kRb0Wptr, 1280},
       {fakegfx::kCpIntCntlRing0, 0x3C0000},
   };
+  for (const auto& r : rest) sequence.push_back(r);
   size_t at = 23;
   for (const auto& expected : sequence) {
-    CHECK(at < w.size() && w[at] == expected);
+    CHECK(at < w.size() && w[at] == expected);   // (a mismatch prints the position below)
     if (at < w.size() && w[at] != expected) printf("  write %zu: %04x=%08x, expected %04x=%08x\n", at, w[at].first, w[at].second, expected.first, expected.second);
     ++at;
   }
@@ -461,20 +504,23 @@ static void test_start() {
   CHECK(restore == poll_hi + 1 && t[restore] - t[poll_hi] >= 1000);
   const size_t enable = index_of(restore, fakegfx::kCpMeCntl, 0);
   CHECK(t[enable + 1] - t[enable] >= 50);
-  // The ring: the start stream (17 dwords, padded with NOPs to 256), then the test packet (padded to 512).
-  const uint32_t stream[] = {0xC0004A00, 0x20000000, 0xC0012800, 0x80000000, 0x80000000, 0xC0026900, 0x000000D4, 0x3a00161a, 0x0000002e,
-                             0xC0004A00, 0x30000000, 0xC0001200, 0, 0xC0021100, 3, 0x8000, 0x8000};
-  for (uint32_t i = 0; i < 17; ++i) CHECK(rig.ring_word(i) == stream[i]);
-  for (uint32_t i = 17; i < 256; ++i) CHECK(rig.ring_word(i) == kNop);
-  CHECK(rig.ring_word(256) == 0xC0017900 && rig.ring_word(257) == 0x40 && rig.ring_word(258) == 0xDEADBEEF);
-  for (uint32_t i = 259; i < 512; ++i) CHECK(rig.ring_word(i) == kNop);
-  CHECK(rig.ring_word(512) == 0);   // the ring was cleared
+  // The ring: the clear state and the CE partitions (916 dwords, padded with NOPs to 1024), then the test packet (padded to 1280).
+  uint32_t expected_stream[920];
+  CHECK(AmdGfx8::build_clear_state(0x3a00161a, 0x2e, ArrayView<uint32_t>(expected_stream, 920), true) == 916);
+  for (uint32_t i = 0; i < 916; ++i) CHECK(rig.ring_word(i) == expected_stream[i]);
+  for (uint32_t i = 916; i < 1024; ++i) CHECK(rig.ring_word(i) == kNop);
+  CHECK(rig.ring_word(1024) == 0xC0017900 && rig.ring_word(1025) == 0x40 && rig.ring_word(1026) == 0xDEADBEEF);
+  for (uint32_t i = 1027; i < 1280; ++i) CHECK(rig.ring_word(i) == kNop);
+  CHECK(rig.ring_word(1280) == 0);   // the ring was cleared
+  // The clear-state buffer of the RLC holds the same without the CE partitions.
+  for (uint32_t i = 0; i < 912; ++i) CHECK(rig.card.get32(rig.csb_gpu + uint64_t{i} * 4) == expected_stream[i]);
+  CHECK(rig.card.get32(rig.csb_gpu + 912 * 4) == 0);
   // The command processor executed it, and wrote its read pointer back.
   CHECK(rig.card.protocol_errors == 0 && rig.card.reg(fakegfx::kScratch0) == 0xDEADBEEF);
-  CHECK(rig.card.executed.size() == 7 && rig.card.fillers == (256 - 17) + (256 - 3));
-  const uint32_t opcodes[] = {0x4A, 0x28, 0x69, 0x4A, 0x12, 0x11, 0x79};
-  for (size_t i = 0; i < 7 && i < rig.card.executed.size(); ++i) CHECK(rig.card.executed[i].opcode == opcodes[i]);
-  CHECK(rig.card.get32(rptr_addr) == 512 && gfx.write_pointer() == 512);
+  CHECK(rig.card.executed.size() == 5 + 8 + 1 && rig.card.fillers == (1024 - 916) + (256 - 3));
+  const uint32_t opcodes[] = {0x4A, 0x28, 0x69, 0x69, 0x69, 0x69, 0x69, 0x69, 0x69, 0x69, 0x4A, 0x12, 0x11, 0x79};
+  for (size_t i = 0; i < 14 && i < rig.card.executed.size(); ++i) CHECK(rig.card.executed[i].opcode == opcodes[i]);
+  CHECK(rig.card.get32(rptr_addr) == 1280 && gfx.write_pointer() == 1280);
 }
 
 static void test_start_failures() {
@@ -545,6 +591,151 @@ static void test_high_address() {
   CHECK(seen);
 }
 
+
+static void test_clear_state() {
+  uint32_t out[920];
+  CHECK(AmdGfx8::build_clear_state(0x3a00161a, 0x2e, ArrayView<uint32_t>(out, 911)) == 0);
+  CHECK(AmdGfx8::build_clear_state(0x3a00161a, 0x2e, ArrayView<uint32_t>(out, 915), true) == 0);
+  CHECK(AmdGfx8::build_clear_state(0x3a00161a, 0x2e, ArrayView<uint32_t>(out, 912)) == 912);
+  CHECK(AmdGfx8::kClearStateDwords == 912 && AmdGfx8::kClearStateBytes == 3648);
+  // The preamble, then the seven runs of vi_cs_data (first register, count) each as SET_CONTEXT_REG, then the raster configuration, the end of the preamble and CLEAR_STATE.
+  CHECK(out[0] == 0xC0004A00 && out[1] == 0x20000000 && out[2] == 0xC0012800 && out[3] == 0x80000000 && out[4] == 0x80000000);
+  const uint32_t runs[7][2] = {{0xa000, 212}, {0xa0d6, 274}, {0xa1f5, 6}, {0xa200, 157}, {0xa2a0, 2}, {0xa2a3, 1}, {0xa2a5, 233}};
+  uint32_t at = 5;
+  for (const auto& run : runs) {
+    CHECK(out[at] == (0xC0000000u | 0x6900 | (run[1] << 16)) && out[at + 1] == run[0] - 0xA000);
+    at += 2 + run[1];
+  }
+  CHECK(at == 5 + 14 + 885);
+  CHECK(out[at] == 0xC0026900 && out[at + 1] == 0xA0D4 - 0xA000 && out[at + 2] == 0x3a00161a && out[at + 3] == 0x2e);
+  CHECK(out[at + 4] == 0xC0004A00 && out[at + 5] == 0x30000000 && out[at + 6] == 0xC0001200 && out[at + 7] == 0 && at + 8 == 912);
+  // Values of the defaults that can be read off AMD's table: the 14th register of the first run is PA_SC_SCREEN_SCISSOR_BR (0xa00d) = 0x40004000, the first is DB_RENDER_CONTROL = 0.
+  CHECK(out[5 + 2 + 13] == 0x40004000 && out[5 + 2] == 0);
+  // With the CE partitions (the ring start stream): SET_BASE, the partition index, two sizes.
+  CHECK(AmdGfx8::build_clear_state(1, 2, ArrayView<uint32_t>(out, 920), true) == 916 && out[912] == 0xC0021100 && out[913] == 3 && out[914] == 0x8000 && out[915] == 0x8000);
+  CHECK(out[at + 2] == 1 && out[at + 3] == 2);
+}
+
+static void test_tables() {
+  // The first tile modes by hand: ARRAY_2D_TILED_THIN1 (4) at bit 2, P16_32x32_16x16 (0x11) at bit 6, the tile split (64B..2KB = 0,1,2,3,5) at bit 11, depth micro tiling (2) at bit 22.
+  const uint32_t first[] = {0x00800450, 0x00800C50, 0x00801450, 0x00801C50, 0x00802C50};
+  for (int i = 0; i < 5; ++i) CHECK(kTileModes[i] == first[i]);
+  // The tables are long: all 32 and 15 entries must be programmed, mode 7 of the macrotile table left alone (checked in test_start).
+  uint32_t used = 0;
+  for (uint32_t v : kTileModes) used += v != 0;
+  CHECK(used >= 28);
+}
+
+static void test_raster_configs() {
+  uint32_t config = 0, config_1 = 0;
+  AmdGfx8::default_raster_config(&config, &config_1);
+  CHECK(config == 0x3a00161a && config_1 == 0x2e);
+  // No back-end harvested: every engine keeps the configuration.
+  uint32_t per_se[4] = {0, 0, 0, 0}, c1 = 0;
+  AmdGfx8::harvested_raster_configs(config, config_1, 0xF, 4, 2, 1, &c1, ArrayView<uint32_t>(per_se, 4));
+  CHECK(c1 == 0x2e && per_se[0] == 0x3a00161a && per_se[1] == 0x3a00161a);
+  // Back-end 3 harvested (mask 0b0111): the second engine maps its second back-end to the first (RB_MAP_PKR0 = 0).
+  AmdGfx8::harvested_raster_configs(config, config_1, 0x7, 4, 2, 1, &c1, ArrayView<uint32_t>(per_se, 4));
+  CHECK(c1 == 0x2e && per_se[0] == 0x3a00161a && per_se[1] == 0x3a001618);
+  // The first engine's back-ends both gone (mask 0b1100): SE_MAP 3 and RB_MAP_PKR0 3 for it, and the second engine follows the SE map (the driver's mask arithmetic gives
+  // the second engine an empty mask too).
+  AmdGfx8::harvested_raster_configs(config, config_1, 0xC, 4, 2, 1, &c1, ArrayView<uint32_t>(per_se, 4));
+  CHECK(per_se[0] == 0x3b00161b && per_se[1] == 0x3b00161a);
+  // Four engines, the first pair gone: the pair map is 3.
+  AmdGfx8::harvested_raster_configs(config, config_1, 0xF0, 8, 4, 1, &c1, ArrayView<uint32_t>(per_se, 4));
+  CHECK(c1 == 0x2f);
+  // Only the first engine's back-ends left: the second engine's mask is empty, SE_MAP is cleared for both and the second one maps RB_MAP_PKR0 to 3.
+  AmdGfx8::harvested_raster_configs(config, config_1, 0x3, 4, 2, 1, &c1, ArrayView<uint32_t>(per_se, 4));
+  CHECK(per_se[0] == 0x3800161a && per_se[1] == 0x3800161b);
+  // Three back-ends per engine and two shader arrays per engine: one back-end per packer. Back-end 3 harvested (mask 0b110111).
+  AmdGfx8::harvested_raster_configs(config, config_1, 0x37, 6, 2, 2, &c1, ArrayView<uint32_t>(per_se, 4));
+  CHECK(per_se[0] == 0x3a00161a && per_se[1] == 0x3a00171b);
+  // Too small an output array only fills what fits.
+  uint32_t one[1] = {0};
+  AmdGfx8::harvested_raster_configs(config, config_1, 0xF, 4, 2, 1, &c1, ArrayView<uint32_t>(one, 1));
+  CHECK(one[0] == 0x3a00161a);
+}
+
+static void test_harvested_start() {
+  GfxRig rig;
+  rig.card.user_backend_disable[1] = 0x20000;   // GC_USER_RB_BACKEND_DISABLE.BACKEND_DISABLE bit 1 on the second shader engine
+  AmdGfx8 gfx(rig.card, rig.clock);
+  CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok);
+  CHECK(gfx.active_render_backends() == 0x7 && gfx.raster_config() == 0x3a00161a && gfx.raster_config_1() == 0x2e);
+  // The writes of the harvested set-up: each engine selected in turn, then the broadcast selection.
+  const auto& w = rig.card.writes;
+  size_t first = 0;
+  for (size_t i = 1; i < w.size(); ++i) if (w[i].first == 0xA0D4 && w[i - 1] == std::make_pair(fakegfx::kGrbmGfxIndex, uint32_t{0x60000000}) && first == 0) first = i;
+  // (setup_rb's harvested path selects one engine with every SH and instance broadcast: 0x60000000 | engine << 16)
+  CHECK(first > 1 && w[first - 1] == std::make_pair(fakegfx::kGrbmGfxIndex, uint32_t{0x60000000}) && w[first + 1].first == 0xA0D5 && w[first].second == 0x3a00161a);
+  CHECK(w[first + 2] == std::make_pair(fakegfx::kGrbmGfxIndex, uint32_t{0x60010000}) && w[first + 3] == std::make_pair(uint32_t{0xA0D4}, uint32_t{0x3a001618}));
+}
+
+static void test_backend_discovery() {
+  // The disable bits of CC_RB_BACKEND_DISABLE count as well as those of GC_USER_RB_BACKEND_DISABLE: back-end 0 of each engine off (bit 16).
+  {
+    GfxRig rig;
+    rig.card.set_reg(0x263d, 0x10000);
+    AmdGfx8 gfx(rig.card, rig.clock);
+    CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok && gfx.active_render_backends() == 0xA);
+  }
+  // Two shader arrays per engine: the bits of each array are placed after the previous one's (width 2). Engine 1 has back-end 0 off.
+  {
+    GfxRig rig;
+    rig.card.user_backend_disable[1] = 0x10000;
+    AmdGfx8::Config c;
+    c.sh_per_se = 2;
+    c.max_backends_per_se = 4;
+    AmdGfx8 gfx(rig.card, rig.clock, c);
+    CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok && gfx.active_render_backends() == 0xAF);
+  }
+  // More than 16 back-ends: the count to compare with is capped at 16, so 20 active of 32 is not harvested (one plain broadcast write of the raster configuration).
+  {
+    GfxRig rig;
+    for (auto& d : rig.card.user_backend_disable) d = 0x70 << 16;
+    AmdGfx8::Config c;
+    c.shader_engines = 4;
+    c.max_backends_per_se = 8;
+    AmdGfx8 gfx(rig.card, rig.clock, c);
+    CHECK(gfx.start(rig.memory()) == AmdGfx8::Result::Ok && gfx.active_render_backends() == 0x8F8F8F8Fu);
+    size_t raster_writes = 0;
+    for (const auto& w : rig.card.writes) raster_writes += w.first == 0xA0D4;
+    CHECK(raster_writes == 2);   // the golden table's, and the plain write
+  }
+}
+
+static void test_config_refusals() {
+  GfxRig rig;
+  AmdGfx8::Memory m = rig.memory();
+  AmdGfx8 gfx(rig.card, rig.clock);
+  AmdGfx8::Memory no_csb = m;
+  no_csb.csb = hardware::MmioRegion();
+  CHECK(gfx.start(no_csb) == AmdGfx8::Result::BadArgument);
+  AmdGfx8::Memory small_csb = m;
+  small_csb.csb = hardware::MmioRegion(m.csb.address(), AmdGfx8::kClearStateBytes - 4);
+  CHECK(gfx.start(small_csb) == AmdGfx8::Result::BadArgument);
+  AmdGfx8::Memory skew_csb = m;
+  skew_csb.csb_gpu_address += 2;
+  CHECK(gfx.start(skew_csb) == AmdGfx8::Result::BadArgument);
+  const uint32_t bad_values[][3] = {{0, 2, 1}, {5, 2, 1}, {2, 3, 2}, {2, 0, 1}, {2, 2, 3}, {2, 33, 1}};   // shader engines, back-ends per engine, SHs per engine
+  for (const auto& v : bad_values) {
+    AmdGfx8::Config c;
+    c.shader_engines = v[0];
+    c.max_backends_per_se = v[1];
+    c.sh_per_se = v[2];
+    AmdGfx8 bad(rig.card, rig.clock, c);
+    CHECK(bad.start(m) == AmdGfx8::Result::BadArgument);
+  }
+  AmdGfx8::Config c;
+  c.first_kfd_vmid = 0;
+  AmdGfx8 bad_vmid(rig.card, rig.clock, c);
+  CHECK(bad_vmid.start(m) == AmdGfx8::Result::BadArgument);
+  c.first_kfd_vmid = 17;
+  AmdGfx8 bad_vmid2(rig.card, rig.clock, c);
+  CHECK(bad_vmid2.start(m) == AmdGfx8::Result::BadArgument);
+  CHECK(rig.card.writes.empty());
+}
+
 static void test_ring_wrap_and_stop() {
   GfxRig rig;
   AmdGfx8 gfx(rig.card, rig.clock);
@@ -552,7 +743,7 @@ static void test_ring_wrap_and_stop() {
   // The ring holds 2048 dwords: 4 more 256-dword tests go round once, 12 more twice.
   for (int i = 0; i < 12; ++i) {
     CHECK(gfx.test_ring());
-    CHECK(gfx.write_pointer() == ((512u + 256u * (i + 1)) & 2047));
+    CHECK(gfx.write_pointer() == ((1280u + 256u * (i + 1)) & 2047));
     CHECK(rig.card.get32(rig.wb_gpu) == gfx.write_pointer());
   }
   CHECK(rig.card.protocol_errors == 0);
@@ -563,16 +754,6 @@ static void test_ring_wrap_and_stop() {
   CHECK((rig.card.reg(fakegfx::kRlcCntl) & 1) == 0);
   // A stopped engine does not run the ring.
   CHECK(!gfx.test_ring(1000));
-  // The start stream builder checks its buffer.
-  uint32_t out[16];
-  const AmdGfx8::Config defaults;
-  CHECK(AmdGfx8::build_start_stream(defaults, ArrayView<uint32_t>(out, 16)) == 0);
-  uint32_t big[32];
-  CHECK(AmdGfx8::build_start_stream(defaults, ArrayView<uint32_t>(big, 32)) == 17);
-  AmdGfx8::Config custom;
-  custom.raster_config = 0x11111111;
-  custom.raster_config_1 = 0x22222222;
-  CHECK(AmdGfx8::build_start_stream(custom, ArrayView<uint32_t>(big, 32)) == 17 && big[7] == 0x11111111 && big[8] == 0x22222222);
 }
 
 // From a card with nothing loaded to a running ring: the SMC loads the microcode, then the engine starts.
@@ -581,10 +762,11 @@ static void test_end_to_end() {
   fakegfx::FakeClock clock;
   AmdSmu7Ucode::Images images;
   CHECK(g_files.parse(&images));
-  Block block(1600 * 1024), ring(AmdGfx8::kRingBytes), wb(4096);
+  Block block(1600 * 1024), ring(AmdGfx8::kRingBytes), wb(4096), csb(8192);
   card.windows.push_back({0x180000000ull, block.base, 1600 * 1024});
   card.windows.push_back({0x200100000ull, ring.base, AmdGfx8::kRingBytes});
   card.windows.push_back({0x200200000ull, wb.base, 4096});
+  card.windows.push_back({0x200300000ull, csb.base, 8192});
   card.set_sram(0x20000 + 48, card.soft_registers);
   // Without the load the ring test fails; after it, it passes.
   AmdGfx8::Memory m;
@@ -592,6 +774,8 @@ static void test_end_to_end() {
   m.ring = hardware::MmioRegion(reinterpret_cast<uint64_t>(ring.base), AmdGfx8::kRingBytes);
   m.writeback_gpu_address = 0x200200000ull;
   m.writeback = hardware::MmioRegion(reinterpret_cast<uint64_t>(wb.base), 16);
+  m.csb_gpu_address = 0x200300000ull;
+  m.csb = hardware::MmioRegion(reinterpret_cast<uint64_t>(csb.base), 8192);
   AmdGfx8 gfx(card, clock);
   CHECK(gfx.start(m, 2000) == AmdGfx8::Result::RingTestFailed);
   AmdSmu7Ucode loader(card, clock);
@@ -615,6 +799,12 @@ int main() {
   test_start();
   test_start_failures();
   test_high_address();
+  test_clear_state();
+  test_tables();
+  test_raster_configs();
+  test_harvested_start();
+  test_backend_discovery();
+  test_config_refusals();
   test_ring_wrap_and_stop();
   test_end_to_end();
   printf(g_failed ? "AmdGfx8Test: %d FAILED\n" : "AmdGfx8Test: all passed\n", g_failed);

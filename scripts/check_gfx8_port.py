@@ -6,8 +6,8 @@ that its golden register table is the driver's, value for value.
 
 For each ported function it takes the ordered list of register names (mm...) in the kernel function and in the port and compares them; WREG32_FIELD(REG, ...) counts as
 a read and a write of REG (the port spells the read-modify-write out). A port that drops, adds, reorders or mistypes a register access fails. The values written are
-compared only for the golden table (the rest are checked by tests/AmdGfx8Test.cpp). Left out of the port on purpose, and so of the comparison: the doorbell range registers,
-the kernel's clear-state context defaults, and the compute queues (see AmdGfx8.hpp).
+compared only for the golden table (the rest are checked by tests/AmdGfx8Test.cpp). Left out of the port on purpose, and so of the comparison: the doorbell range registers
+and the compute queues (see AmdGfx8.hpp). The GDS registers are numbered by arithmetic in the port, by a table in the kernel, and are not compared.
 """
 import os
 import re
@@ -71,7 +71,7 @@ def main():
                 break
 
     def kern(name):
-        return tokens(body(kernel, r'static (?:int|void|u32) %s\([^)]*\)\s*\{' % name))
+        return tokens(body(kernel, r'static\s+(?:int|void|u32)\s+%s\([^)]*\)\s*\{' % name))
 
     def mine(name):
         return tokens(body(port, r'(?:void|bool|uint32_t) AmdGfx8::%s\([^)]*\)\s*\{' % name))
@@ -94,8 +94,16 @@ def main():
                               tokens(cut(resume_p, 'wr(mmCP_RB_WPTR_DELAY', '// gfx_v8_0_set_cpg_door_bell'))),
         ('doorbell (enable bit)', tokens(door_k)[:2], tokens(cut(resume_p, '// gfx_v8_0_set_cpg_door_bell', '// amdgpu_ring_clear_ring'))),
         ('cp_gfx_start (init, stream)', tokens(cut(start_k, 'WREG32(mmCP_MAX_CONTEXT', 'gfx_v8_0_cp_gfx_enable(adev, true);')) + tokens(start_k[start_k.index('PACKET3_SET_CONTEXT_REG, 2'):start_k.index('PACKET3_PREAMBLE_END_CLEAR_STATE')]),
-                              tokens(cut(resume_p, '// gfx_v8_0_cp_gfx_start', 'cp_gfx_enable(true);')) + tokens(body(port, r'uint32_t AmdGfx8::build_start_stream\([^)]*\)\s*\{'))),
+                              tokens(cut(resume_p, '// gfx_v8_0_cp_gfx_start', 'cp_gfx_enable(true);')) + tokens(body(port, r'uint32_t AmdGfx8::build_clear_state\([^)]*\)\s*\{'))),
         ('ring test', kern('gfx_v8_0_ring_test_ring'), mine('test_ring')),
+        ('constants_init', kern('gfx_v8_0_constants_init'), mine('constants_init')),
+        ('srbm_select', tokens(body(open(sys.argv[1].replace('gfx_v8_0.c', 'vi.c')).read(), r'void vi_srbm_select\([^)]*\)\s*\{')) if os.path.exists(sys.argv[1].replace('gfx_v8_0.c', 'vi.c')) else mine('srbm_select'), mine('srbm_select')),
+        ('setup_rb', kern('gfx_v8_0_setup_rb'), mine('setup_rb')),
+        ('rb_active_bitmap', kern('gfx_v8_0_get_rb_active_bitmap'), mine('rb_active_bitmap')),
+        ('write_harvested', kern('gfx_v8_0_write_harvested_raster_configs'), mine('write_harvested_raster_configs')),
+        ('init_compute_vmid', kern('gfx_v8_0_init_compute_vmid'), [t for t in mine('init_compute_vmid') if not t.startswith('mmGDS_')]),
+        ('init_gds_vmid', kern('gfx_v8_0_init_gds_vmid'), [t for t in mine('init_gds_vmid') if not t.startswith('mmGDS_')]),
+        ('init_csb', kern('gfx_v8_0_init_csb'), mine('init_csb')),
     ]
     for name, k, p in pairs:
         print(f'{name:28s} kernel {len(k):3d}  port {len(p):3d}  {"same" if k == p else "DIFFERENT"}')
