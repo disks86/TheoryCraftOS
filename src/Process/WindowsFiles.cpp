@@ -447,6 +447,17 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   ProcessFiles& files = p.files();
   const DescriptorKind kind = files.kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
+  if (kind == DescriptorKind::ConsoleInput && static_cast<uint32_t>(info_class) == 24) {      // FilePipeLocalInformation: what the console input could give at once
+    bool at_end = false;
+    const uint64_t available = p.host().console_input_available(&at_end);
+    uint8_t b[40] = {};
+    const uint32_t value = available > 0xFFFFFFFFu ? 0xFFFFFFFFu : uint32_t(available);
+    for (int i = 0; i < 4; ++i) b[20 + i] = uint8_t(value >> (8 * i));      // ReadDataAvailable
+    b[24] = at_end ? 1 : 0;      // (OutboundQuota's first byte: the end of input is there; a read would not wait)
+    if ((r.args[3] & 0xFFFFFFFFu) < sizeof b) return kInfoLengthMismatch;
+    if (!p.write_user(r.args[2], ConstByteView(b, sizeof b))) return kAccessViolation;
+    return store_io_status(p, r.args[1], kSuccess, sizeof b) ? kSuccess : kAccessViolation;
+  }
   if (kind == DescriptorKind::Pipe) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
     if (pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
