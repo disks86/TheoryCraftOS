@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.hpp"
+#include "Hardware/VideoCodec/Software/H265Core.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace hardware {
@@ -37,7 +38,7 @@ namespace hardware {
 namespace amd_uvd6 {
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;      // msg_type
-constexpr uint32_t kStreamTypeH264Perf = 7;                               // RUVD_CODEC_H264_PERF
+constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;        // RUVD_CODEC_H264_PERF, RUVD_CODEC_H265
 
 constexpr uint32_t kMessagePageBytes = 0x1000;       // the message structure's page; the feedback area starts behind it
 constexpr uint32_t kFeedbackOffset = 0x1000;         // FB_BUFFER_OFFSET
@@ -80,6 +81,21 @@ bool build_avc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fee
 // Writes the feedback area's first word (its size, as Mesa does before a picture) and the scaling lists into the scaling table, inside a buffer of at least
 // kMessageFeedbackItBytes that starts at the message page. The rest of the feedback area is cleared.
 bool prepare_avc_feedback_and_tables(ByteView message_buffer, const amd_vcn::AvcPictureState& picture);
+
+// H.265 (RUVD_CODEC_H265, 8-bit 4:2:0): unlike the H.264 performance stream type, the engine's decoded picture buffer is a set of slots the message names (a picture's slot,
+// and the slots of the pictures it refers to), so the messages carry slot numbers as the VCN ones do. Sizes follow Mesa's calc_dpb_size and calc_ctx_size_h265_main.
+struct HevcBufferSizes {
+  uint64_t dpb = 0;       // all the slots
+  uint64_t context = 0;
+  uint32_t references = 0;   // slots (17; 8 from 4096 x 2000 up)
+};
+// 0 sizes when the picture is not whole minimum coding blocks (8) within the limits, or the stream needs more slots than there are.
+HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_dec_pic_buffering);
+// Builds the decode message for one H.265 picture (the offload interface of H265Decoder hands over what it needs). False when `out` is too small, the sequence is not
+// 8-bit 4:2:0 within the limits, or a size does not fit the message.
+bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const h265::OffloadPicture& picture, const DecodeBuffers& buffers);
+// The feedback area's first word and the scaling table (4x4 lists at 0, 8x8 at 96, 16x16 at 480, 32x32 at 864) in a buffer of kMessageFeedbackItBytes at the message page.
+bool prepare_hevc_feedback_and_tables(ByteView message_buffer, const h265::Sps& sps, const h265::Pps& pps);
 
 // Where the buffers of a job are, as the GPU addresses them (the message buffer holds the message page, the feedback area and the scaling table).
 struct JobAddresses {
