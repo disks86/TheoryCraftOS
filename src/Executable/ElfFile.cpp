@@ -78,6 +78,8 @@ void ElfFile::clear() {
   type_ = machine_ = 0;
   flags_ = 0;
   entry_ = 0;
+  phoff_ = 0;
+  phentsize_ = phnum_ = 0;
   segments_.clear();
   sections_.clear();
   symbols_.clear();
@@ -145,6 +147,9 @@ bool ElfFile::parse_all(ConstByteView file) {
   flags_ = r.u32();
   r.u16();      // e_ehsize
   const uint16_t phentsize = r.u16(), phnum = r.u16();
+  phoff_ = phoff;
+  phentsize_ = phentsize;
+  phnum_ = phnum;
   const uint16_t shentsize = r.u16();
   uint64_t shnum = r.u16();
   uint64_t shstrndx = r.u16();
