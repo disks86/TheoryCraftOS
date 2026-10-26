@@ -3010,6 +3010,7 @@ bool install_builtins(Vm& vm) {
   if (!install_regexp(vm) || !install_typed_arrays(vm)) return false;
   {
     JsObject* proxy = vm.new_native(proxy_constructor, "Proxy", 2);
+    proxy->constructs = true;
     vm.define_native(proxy, "revocable", proxy_revocable, 2);
     vm.define_named(vm.global(), "Proxy", Value::make_object(proxy), kWritable);
   }
