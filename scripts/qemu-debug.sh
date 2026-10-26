@@ -24,15 +24,11 @@ BUILD=${BUILD_DIR:-$(for d in build cmake-build-debug; do [ -f "$d/CMakeCache.tx
 
 # cmake may not be on PATH (e.g. only bundled with the IDE); the cache knows it.
 CMAKE=$(sed -n 's/^CMAKE_COMMAND:INTERNAL=//p' "$BUILD/CMakeCache.txt")
-[ -n "${NO_BUILD:-}" ] || "$CMAKE" --build "$BUILD" --target esp vars
+[ -n "${NO_BUILD:-}" ] || "$CMAKE" --build "$BUILD" --target esp vars primary
 [ -n "${NO_BUILD:-}" ] || rm -f "$BUILD/debugcon.log"
-# A persistent, writable data disk (FAT32, volume "DATA"), created on first use. It shows up in the file explorer next to the boot disk,
-# whose contents QEMU only fakes (fat:rw: is a host folder presented as a disk, not something to keep files on).
-DATA_IMG=${DATA_IMG:-$BUILD/data.img}
-if [ ! -f "$DATA_IMG" ]; then
-  qemu-img create -f raw "$DATA_IMG" "${DATA_SIZE:-256M}" >/dev/null
-  mkfs.fat -F 32 -n DATA "$DATA_IMG" >/dev/null
-fi
+# The primary disk (FAT32, built by the `primary` target with the Windows libraries in /Windows/Windows/System32). It is persistent: the OS writes to it, and a build only
+# puts the libraries on it again. It shows up in the file explorer next to the boot disk, whose contents QEMU only fakes (fat:rw: is a host folder presented as a disk).
+DATA_IMG=${DATA_IMG:-$BUILD/primary.img}
 # The window shows the guest's picture pixel for pixel (zoom-to-fit=off): a tiling window manager or a resized window would otherwise stretch it by a
 # fraction and blur and wobble the text.
 # QEMU_GPU: auto (default: gl when this QEMU has virtio-gpu-gl, else std), std (Bochs VGA with 64 MiB of video memory so the larger resolutions fit; QEMU_VGAMEM changes it), virtio (virtio-gpu, 2D scanout) or gl (virtio-gpu with virgl 3D).

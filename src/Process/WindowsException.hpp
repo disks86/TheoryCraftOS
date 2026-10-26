@@ -62,4 +62,8 @@ bool dispatch_exception(Process& process, const X86Context& at, const ExceptionI
 // read or is not an x64 one.
 bool apply_context(Process& process, uint64_t address, X86Context* context);
 
+// GetThreadContext: writes `context` into the CONTEXT at `address`, the parts its ContextFlags (which the program set) ask for; the rest of the record is left alone. False if
+// the memory cannot be written or the flags are not those of an x64 CONTEXT.
+bool store_context(Process& process, uint64_t address, const X86Context& context);
+
 }  // namespace process

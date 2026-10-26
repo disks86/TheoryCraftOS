@@ -43,7 +43,11 @@ class AddressSpace final : public IUserMemory {
   static constexpr uint64_t kUserTop = 0x0000800000000000ull;      // the lower half of 48-bit addresses
 
   // `max_bytes` limits what all regions together may hold.
-  explicit AddressSpace(allocators::IAllocator& allocator, uint64_t max_bytes = 256ull << 20) : allocator_(allocator), regions_(allocator), max_bytes_(max_bytes) {}
+  explicit AddressSpace(allocators::IAllocator& allocator, uint64_t max_bytes = 256ull << 20) : allocator_(allocator), retired_(allocator), regions_(allocator), max_bytes_(max_bytes) {}
+  ~AddressSpace() {
+    retired_.deferred = false;
+    reclaim();
+  }
   AddressSpace(const AddressSpace&) = delete;
   AddressSpace& operator=(const AddressSpace&) = delete;
 
@@ -72,6 +76,11 @@ class AddressSpace final : public IUserMemory {
   // The whole allocation that contains `address`: the pages one map() call created, which stay together even after protect() or unmap() cut them into
   // several regions. Returns where the surviving pieces start and the total length up to the last contiguous piece.
   bool allocation_extent(uint64_t address, uint64_t* base, uint64_t* size) const;
+
+  // With this on, the memory behind a region that is unmapped, cut or replaced is not given back at once but kept until reclaim(): hardware page tables that other CPUs
+  // still run on may point at it. The user of the page tables calls reclaim() when no CPU can have the old mappings any more.
+  void set_deferred_free(bool on) { retired_.deferred = on; }
+  void reclaim();
 
   // Addresses no region may cover (map, resize and find_free keep away from them). The ranges must outlive the address space.
   void set_reserved(ArrayView<const AddressRange> ranges) { reserved_ = ranges; }
@@ -102,9 +111,15 @@ class AddressSpace final : public IUserMemory {
   uint64_t region_count() const { return regions_.count(); }
 
  private:
+  // Memory of regions that went away while deferred_free is on.
+  struct Retired {
+    explicit Retired(allocators::IAllocator& allocator) : storages(allocator) {}
+    List<uint8_t*> storages;
+    bool deferred = false;
+  };
   // One run of pages and the page-aligned memory behind it (`capacity` may exceed `size` after a cut or a shrink).
   struct Region {
-    explicit Region(allocators::IAllocator& allocator) : allocator_(allocator) {}
+    Region(allocators::IAllocator& allocator, Retired& retired) : allocator_(allocator), retired_(retired) {}
     ~Region() { release(); }
     Region(const Region&) = delete;
     Region& operator=(const Region&) = delete;
@@ -119,6 +134,7 @@ class AddressSpace final : public IUserMemory {
 
    private:
     allocators::IAllocator& allocator_;
+    Retired& retired_;
   };
   bool overlaps_reserved(uint64_t start, uint64_t end, uint64_t* reserved_end = nullptr) const;
 
@@ -132,6 +148,7 @@ class AddressSpace final : public IUserMemory {
   bool prepare_range(uint64_t address, uint64_t size, uint64_t* end) const;
 
   allocators::IAllocator& allocator_;
+  Retired retired_;
   List<UniquePointer<Region>> regions_;      // sorted by base
   uint64_t max_bytes_;
   uint64_t mapped_bytes_ = 0;

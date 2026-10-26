@@ -25,8 +25,15 @@
 #include "Process/UserProgram.hpp"
 #include "console.hpp"
 
+struct DemoFile { const char* name; const uint8_t* begin; const uint8_t* end; };
+#ifdef TCOS_USERMODE_DEMO
+extern "C" const DemoFile tcos_demo_libraries[];      // ntdll.dll, kernel32.dll and msvcrt.dll (CMakeLists.txt)
+extern "C" const uint64_t tcos_demo_library_count;
+#endif
 #ifdef TCOS_USERMODE_DEMO_PROGRAM
 extern "C" const uint8_t tcos_demo_program[], tcos_demo_program_end[];
+extern "C" const DemoFile tcos_demo_files[];
+extern "C" const uint64_t tcos_demo_file_count;
 #endif
 
 namespace {
@@ -5466,6 +5473,19 @@ bool run_usermode_demo(allocators::IAllocator& allocator) {
   filesystem::RamFileSystem files(allocator);
   g_files = &files;
   bool ok = check(process::prepare_program_folders(files), "program folders");
+#ifdef TCOS_USERMODE_DEMO
+  {      // the libraries a real system has on its primary disk (the build embeds copies for the demo: it has no disk)
+    for (uint64_t i = 0; i < tcos_demo_library_count; ++i) {
+      String path(allocator);
+      path.assign("/Windows/Windows/System32/");
+      path.append(StringView(tcos_demo_libraries[i].name));
+      UniquePointer<filesystem::IFile> f;
+      uint64_t n = 0;
+      const ConstByteView image(tcos_demo_libraries[i].begin, static_cast<uint64_t>(tcos_demo_libraries[i].end - tcos_demo_libraries[i].begin));
+      ok = check(files.open_file(path.view(), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok && f->write(0, image, &n) == filesystem::Status::Ok && n == image.size(), path.c_str()) && ok;
+    }
+  }
+#endif
   {
     const char motd[] = "welcome to TheoryCraftOS\n", hello[] = "hello from the C: drive\n";
     UniquePointer<filesystem::IFile> f;
@@ -5530,6 +5550,13 @@ bool run_usermode_demo(allocators::IAllocator& allocator) {
     const char* path = windows ? "/Windows/Windows/System32/extra.exe" : "/Linux/bin/extra";
     if (files.open_file(path, filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, file, &n);
     f.reset();
+    for (uint64_t i = 0; i < tcos_demo_file_count; ++i) {      // the DLLs and programs it uses
+      String extra(allocator);
+      extra.assign(windows ? "/Windows/Windows/System32/" : "/Linux/bin/");
+      extra.append(StringView(tcos_demo_files[i].name));
+      if (files.open_file(extra.view(), filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok) f->write(0, ConstByteView(tcos_demo_files[i].begin, static_cast<uint64_t>(tcos_demo_files[i].end - tcos_demo_files[i].begin)), &n);
+      f.reset();
+    }
     struct Show {
       static void write(void*, StringView text) { console::puts(text); }
     };

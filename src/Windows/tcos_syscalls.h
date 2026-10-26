@@ -62,4 +62,8 @@
 #define NT_SERVICE_NtReleaseSemaphore 39
 #define NT_SERVICE_NtWaitForMultipleObjects 40
 #define NT_SERVICE_NtDuplicateObject 41
+#define NT_SERVICE_NtSuspendThread 42
+#define NT_SERVICE_NtGetContextThread 43
+#define NT_SERVICE_NtSetContextThread 44
+#define NT_SERVICE_NtCreateUserProcess 45
 #endif

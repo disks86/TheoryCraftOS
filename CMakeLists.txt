@@ -395,6 +395,11 @@ add_executable(BOOTX64
   src/Font/FontDataFallback.cpp
   src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/Hardware/GraphicsProcessingUnit/SystemGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuTopology.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuManager.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuPool.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuNativeDrivers.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp
@@ -413,6 +418,10 @@ add_executable(BOOTX64
   src/Graphics/Graphics3D/WebGlAccelerator.cpp
   src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
   src/Graphics/Graphics3D/Svga/SvgaDevice.cpp
+  src/Graphics/RenderNode.cpp
+  src/Graphics/RenderNodeAccel.cpp
+  src/Graphics/Renderer2DSlot.cpp
+  src/Graphics/GraphicsPool.cpp
   src/Graphics/SystemGraphics.cpp
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
@@ -568,6 +577,7 @@ add_executable(BOOTX64
   src/Process/WindowsException.cpp
   src/Process/WindowsThreads.cpp
   src/Process/WindowsObjects.cpp
+  src/Process/WindowsProcess.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
@@ -717,8 +727,9 @@ endif()
 if(TCOS_USERMODE_DEMO_PAIR)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO_PAIR)
 endif()
-# ntdll.dll and kernel32.dll for Windows programs (src/Windows): freestanding DLLs built with the same mingw compiler, carried in the image (.incbin) and mapped into
-# each Windows process by the kernel. kernel32.dll is linked against ntdll's import library, as a real one would be.
+# ntdll.dll, kernel32.dll and msvcrt.dll for Windows programs (src/Windows): freestanding DLLs built with the same mingw compiler. They are not part of the kernel: they are
+# files of the primary disk image (/Windows/Windows/System32, see `primary` below) that the loader maps into each Windows process. kernel32.dll is linked against ntdll's import
+# library, as a real one would be.
 if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_DIR ${CMAKE_BINARY_DIR}/windows)
   set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector
@@ -741,14 +752,22 @@ if(TCOS_ARCH STREQUAL "x86_64")
     DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.def ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc
             ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
     COMMENT "Building msvcrt.dll")
-  file(WRITE ${WINDOWS_DIR}/libraries.S
-    ".section .rdata,\"dr\"\n.balign 16\n"
-    ".global tcos_ntdll_dll\ntcos_ntdll_dll:\n.incbin \"${WINDOWS_DIR}/ntdll.dll\"\n.global tcos_ntdll_dll_end\ntcos_ntdll_dll_end:\n.balign 16\n"
-    ".global tcos_kernel32_dll\ntcos_kernel32_dll:\n.incbin \"${WINDOWS_DIR}/kernel32.dll\"\n.global tcos_kernel32_dll_end\ntcos_kernel32_dll_end:\n.balign 16\n"
-    ".global tcos_msvcrt_dll\ntcos_msvcrt_dll:\n.incbin \"${WINDOWS_DIR}/msvcrt.dll\"\n.global tcos_msvcrt_dll_end\ntcos_msvcrt_dll_end:\n")
-  target_sources(BOOTX64 PRIVATE ${WINDOWS_DIR}/libraries.S src/Windows/BuiltinLibraries.cpp)
-  set_source_files_properties(${WINDOWS_DIR}/libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll;${WINDOWS_DIR}/msvcrt.dll")
   add_custom_target(windows_dlls DEPENDS ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_DIR}/msvcrt.dll)
+  if(TCOS_USERMODE_DEMO)
+    # The demo runs on a RAM file system, not on the primary disk: it gets copies of the libraries inside the demo build and writes them to /Windows/Windows/System32 itself.
+    set(_demo_libraries_s ".section .rdata,\"dr\"\n.balign 16\n")
+    set(_demo_libraries_table "")
+    set(_demo_library_index 0)
+    foreach(_library ntdll kernel32 msvcrt)
+      string(APPEND _demo_libraries_s ".balign 16\ntcos_demo_library_${_demo_library_index}:\n.incbin \"${WINDOWS_DIR}/${_library}.dll\"\ntcos_demo_library_${_demo_library_index}_end:\ntcos_demo_library_name_${_demo_library_index}:\n.asciz \"${_library}.dll\"\n")
+      string(APPEND _demo_libraries_table ".quad tcos_demo_library_name_${_demo_library_index}, tcos_demo_library_${_demo_library_index}, tcos_demo_library_${_demo_library_index}_end\n")
+      math(EXPR _demo_library_index "${_demo_library_index}+1")
+    endforeach()
+    string(APPEND _demo_libraries_s ".balign 8\n.global tcos_demo_libraries\ntcos_demo_libraries:\n${_demo_libraries_table}.global tcos_demo_library_count\ntcos_demo_library_count:\n.quad ${_demo_library_index}\n")
+    file(WRITE ${WINDOWS_DIR}/demo_libraries.S "${_demo_libraries_s}")
+    target_sources(BOOTX64 PRIVATE ${WINDOWS_DIR}/demo_libraries.S)
+    set_source_files_properties(${WINDOWS_DIR}/demo_libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll;${WINDOWS_DIR}/msvcrt.dll")
+  endif()
 endif()
 
 # An extra program for the demo to run (a static Linux x86-64 ELF, say a C program built with `gcc -static -no-pie`); its output and exit code are logged.
@@ -760,6 +779,22 @@ if(TCOS_USERMODE_DEMO AND TCOS_USERMODE_DEMO_PROGRAM)
   target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_program.S)
   set_source_files_properties(${CMAKE_BINARY_DIR}/demo_program.S PROPERTIES OBJECT_DEPENDS ${TCOS_USERMODE_DEMO_PROGRAM})
   target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO_PROGRAM)
+  # More files for C:\\Windows\\System32 (DLLs and programs the extra program uses, say): a ;-separated list.
+  set(TCOS_USERMODE_DEMO_FILES "" CACHE STRING "Files the user-mode demo puts next to the extra program")
+  set(_demo_files_s ".section .rdata,\"dr\"\n.balign 16\n")
+  set(_demo_table "")
+  set(_demo_index 0)
+  foreach(_file ${TCOS_USERMODE_DEMO_FILES})
+    get_filename_component(_name ${_file} NAME)
+    string(APPEND _demo_files_s ".balign 16\ntcos_demo_file_${_demo_index}:\n.incbin \"${_file}\"\ntcos_demo_file_${_demo_index}_end:\ntcos_demo_name_${_demo_index}:\n.asciz \"${_name}\"\n")
+    string(APPEND _demo_table ".quad tcos_demo_name_${_demo_index}, tcos_demo_file_${_demo_index}, tcos_demo_file_${_demo_index}_end\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_file})
+    math(EXPR _demo_index "${_demo_index}+1")
+  endforeach()
+  string(APPEND _demo_files_s ".balign 8\n.global tcos_demo_files\ntcos_demo_files:\n${_demo_table}.global tcos_demo_file_count\ntcos_demo_file_count:\n.quad ${_demo_index}\n")
+  file(WRITE ${CMAKE_BINARY_DIR}/demo_files.S "${_demo_files_s}")
+  target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_files.S)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/demo_files.S PROPERTIES OBJECT_DEPENDS "${TCOS_USERMODE_DEMO_FILES}")
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)
@@ -793,6 +828,36 @@ add_custom_target(esp ALL
   DEPENDS BOOTX64
   COMMENT "Assembling ESP directory"
 )
+
+# The primary disk image: a FAT32 volume with what belongs on the root volume of an installed system (today the Windows libraries in /Windows/Windows/System32). It is
+# filled by the OS's own FAT driver (tools/PrimaryImage.cpp, built for this machine). An image that exists keeps its files, so the disk the OS writes to survives builds;
+# the listed files are put on it again each time. Write it to a disk or a USB stick, or let the run targets attach it.
+set(TCOS_PRIMARY_IMAGE ${CMAKE_BINARY_DIR}/primary.img)
+set(TCOS_PRIMARY_IMAGE_SIZE 256M CACHE STRING "Size of the primary disk image (when it is made)")
+find_program(MKFS_FAT mkfs.fat)
+find_program(TCOS_HOST_CXX NAMES c++ g++ clang++)
+if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
+  set(_primary_tool ${CMAKE_BINARY_DIR}/tools/primary_image)
+  file(GLOB _primary_tool_sources ${CMAKE_SOURCE_DIR}/src/FileSystem/Fat/*.cpp ${CMAKE_SOURCE_DIR}/src/FileSystem/Fat/*.hpp)
+  set(_primary_tool_inputs ${CMAKE_SOURCE_DIR}/tools/PrimaryImage.cpp ${CMAKE_SOURCE_DIR}/tests/KernelStubs.cpp ${CMAKE_SOURCE_DIR}/src/Kernel/Sync.cpp
+      ${CMAKE_SOURCE_DIR}/src/FileSystem/FileSystemTypes.cpp ${_primary_tool_sources})
+  list(FILTER _primary_tool_inputs EXCLUDE REGEX "\\.hpp$")
+  add_custom_command(OUTPUT ${_primary_tool}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools
+    COMMAND ${TCOS_HOST_CXX} -std=c++20 -O1 -I ${CMAKE_SOURCE_DIR}/src -o ${_primary_tool} ${_primary_tool_inputs}
+    DEPENDS ${_primary_tool_inputs} ${CMAKE_SOURCE_DIR}/src/FileSystem/Fat/FatFileSystem.hpp
+    COMMENT "Building the primary image tool")
+  set(_system32 /Windows/Windows/System32)
+  add_custom_target(primary ALL
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-primary-image.sh ${TCOS_PRIMARY_IMAGE} ${TCOS_PRIMARY_IMAGE_SIZE} ${_primary_tool}
+            file:${_system32}/ntdll.dll=${WINDOWS_DIR}/ntdll.dll file:${_system32}/kernel32.dll=${WINDOWS_DIR}/kernel32.dll file:${_system32}/msvcrt.dll=${WINDOWS_DIR}/msvcrt.dll
+    DEPENDS ${_primary_tool}
+    COMMENT "Filling the primary disk image")
+  add_dependencies(primary windows_dlls)
+else()
+  message(WARNING "No primary disk image: it needs an x86-64 build, mkfs.fat and a host C++ compiler")
+  add_custom_target(primary COMMAND ${CMAKE_COMMAND} -E touch ${TCOS_PRIMARY_IMAGE})
+endif()
 
 find_program(QEMU qemu-system-x86_64)
 find_file(OVMF_CODE NAMES OVMF_CODE.4m.fd OVMF_CODE_4M.fd OVMF_CODE.fd
@@ -829,8 +894,8 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     -drive if=pflash,format=raw,readonly=on,file=${OVMF_CODE}
     -drive if=pflash,format=raw,file=${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     -drive format=raw,file=fat:rw:${ESP_DIR}
-    # A persistent writable FAT32 disk (the `data` target creates it); it appears in the file explorer as "DATA".
-    -drive if=none,id=data,format=raw,file=${CMAKE_BINARY_DIR}/data.img -device virtio-blk-pci,drive=data
+    # The primary disk (the `primary` target makes it): the root volume, with the Windows libraries in /Windows/Windows/System32.
+    -drive if=none,id=data,format=raw,file=${TCOS_PRIMARY_IMAGE} -device virtio-blk-pci,drive=data
     # OS debug output (port 0x402) goes to this terminal and debugcon.log.
     -chardev stdio,id=dbg,logfile=${CMAKE_BINARY_DIR}/debugcon.log,signal=off
     -device isa-debugcon,iobase=0x402,chardev=dbg
@@ -841,18 +906,6 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
   add_custom_target(vars
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OVMF_VARS} ${CMAKE_BINARY_DIR}/OVMF_VARS.fd
     COMMAND chmod u+w ${CMAKE_BINARY_DIR}/OVMF_VARS.fd)
-
-  find_program(QEMU_IMG qemu-img)
-  find_program(MKFS_FAT mkfs.fat)
-  if(QEMU_IMG AND MKFS_FAT)
-    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/data.img
-      COMMAND ${QEMU_IMG} create -f raw ${CMAKE_BINARY_DIR}/data.img 256M
-      COMMAND ${MKFS_FAT} -F 32 -n DATA ${CMAKE_BINARY_DIR}/data.img)
-  else()
-    message(WARNING "qemu-img or mkfs.fat not found: no data disk for the run targets")
-    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/data.img COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_BINARY_DIR}/data.img)
-  endif()
-  add_custom_target(data DEPENDS ${CMAKE_BINARY_DIR}/data.img)
 
   # `cmake --build build --target run`
   # The standard VGA card gets 64 MiB of video memory (the default 16 MiB leaves out the largest resolutions).
@@ -868,17 +921,17 @@ if(QEMU AND OVMF_CODE AND OVMF_VARS)
     set(QEMU_DEFAULT_GPU ${QEMU_STD_VGA})
   endif()
   add_custom_target(run COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU}
-    DEPENDS esp vars data USES_TERMINAL)
+    DEPENDS esp vars primary USES_TERMINAL)
   add_custom_target(run-std COMMAND ${QEMU_COMMON} ${QEMU_STD_VGA}
-    DEPENDS esp vars data USES_TERMINAL)
+    DEPENDS esp vars primary USES_TERMINAL)
   add_custom_target(run-gl COMMAND ${QEMU_COMMON} ${QEMU_GL_GPU}
-    DEPENDS esp vars data USES_TERMINAL)
+    DEPENDS esp vars primary USES_TERMINAL)
   # Starts the gdbstub on :2159 without halting; use with TCOS_DEBUG_WAIT.
   add_custom_target(debug COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -gdb tcp:127.0.0.1:2159
-    DEPENDS esp vars data USES_TERMINAL)
+    DEPENDS esp vars primary USES_TERMINAL)
   # Freeze the CPU at reset until gdb connects (-S).
   add_custom_target(debug-halted COMMAND ${QEMU_COMMON} ${QEMU_DEFAULT_GPU} -gdb tcp:127.0.0.1:2159 -S
-    DEPENDS esp vars data USES_TERMINAL)
+    DEPENDS esp vars primary USES_TERMINAL)
 else()
   message(WARNING "qemu-system-x86_64 or OVMF firmware not found; run/debug targets disabled")
 endif()

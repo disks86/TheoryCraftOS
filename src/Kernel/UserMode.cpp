@@ -18,8 +18,10 @@
 #include "Kernel/UserMode.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Delay.hpp"
+#include "Executable/ExecutableKind.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsException.hpp"
+#include "Process/WindowsThreads.hpp"
 #include "console.hpp"
 
 #if defined(__x86_64__)
@@ -188,11 +190,46 @@ Task* current_task() {
 
 bool kill_pending(const Task* task) { return __atomic_load_n(&task->kill_requested, __ATOMIC_ACQUIRE); }
 
+// The thread was asked to stop (SuspendThread) or to end (TerminateThread by another thread). With the program's lock held and interrupts on: a thread told to end ends (its
+// stack goes, and the process with its last thread); one told to stop keeps its registers, says it is parked, and waits to be resumed (it may find other registers in the
+// frame then: SetThreadContext). True if the thread has ended and must leave.
+bool stop_point(UserThread* ut, Frame* frame) {
+  Task* task = ut->task;
+  process::Process* process = task->program.process();
+  while (true) {
+    if (process->exited() || kill_pending(task)) break;      // (the caller deals with the end of the program)
+    if (__atomic_load_n(&ut->terminate_requested, __ATOMIC_ACQUIRE)) {
+      if (process::Process::ThreadRecord* record = process->find_thread(ut->id)) process::windowsabi::end_thread(*process, *record, ut->terminate_code);
+      return true;
+    }
+    if (!__atomic_load_n(&ut->suspend_requested, __ATOMIC_ACQUIRE)) break;
+    if (!ut->parked) {
+      frame_to_context(*frame, &ut->saved);
+      ut->parked = true;
+      task->changed.notify_all();
+    }
+    task->changed.wait(task->mutex, 0);
+  }
+  if (ut->parked) {
+    ut->parked = false;
+    if (ut->context_dirty) { context_to_frame(ut->saved, frame); ut->context_dirty = false; }
+  }
+  return false;
+}
+
 // Timer tick in user mode: a program that was told to stop gets its instruction pointer moved to page zero, which is never mapped. Its next step is a page
 // fault, which on_user_fault() recognises as the end the program was asked for.
 void on_user_tick(Frame* frame) {
   Task* task = current_task();
-  if (task && (kill_pending(task) || task->program.process()->exited())) frame->rip = 0;
+  if (task && (kill_pending(task) || task->program.process()->exited())) {
+    frame->rip = 0;
+  } else if (UserThread* u = current_user_thread()) {      // asked to stop or end: send it to address 0 (the fault there is how it gets into the kernel in a state it can wait in)
+    if (!u->redirected && (__atomic_load_n(&u->suspend_requested, __ATOMIC_ACQUIRE) || __atomic_load_n(&u->terminate_requested, __ATOMIC_ACQUIRE))) {
+      u->saved_rip = frame->rip;
+      u->redirected = true;
+      frame->rip = 0;
+    }
+  }
 }
 
 // SYSCALL from user mode (the stub made it look like an interrupt): the registers are in the frame.
@@ -205,7 +242,7 @@ Frame* on_syscall(Frame* frame, void*) {
   if (process->exited()) { thread_ends_now(self); exit_thread(); }      // another thread ended the program
   if (kill_pending(task)) {
     task->killed = true;
-    process->terminate(130);
+    process->terminate(task->kill_code);
     thread_ends_now(self);
     exit_thread();
   }
@@ -221,7 +258,7 @@ Frame* on_syscall(Frame* frame, void*) {
   if (fs_changed || gs_changed) set_current_user_bases(fs_changed, fs, gs_changed, gs);      // arch_prctl
   bool alive = !process->exited();
   uint32_t thread_code = 0;
-  const bool thread_ends = process->take_thread_exit(&thread_code);
+  bool thread_ends = process->take_thread_exit(&thread_code);
   uint64_t context_at = 0;
   if (alive && !thread_ends && process->take_context_restore(&context_at)) {      // NtContinue
     process::X86Context context;
@@ -233,9 +270,10 @@ Frame* on_syscall(Frame* frame, void*) {
       alive = false;
     }
   }
+  if (alive && !thread_ends && stop_point(self, frame)) thread_ends = true;      // SuspendThread / TerminateThread from another thread
   if (alive && kill_pending(task)) {      // asked to stop while the call ran (or in it)
     task->killed = true;
-    process->terminate(130);
+    process->terminate(task->kill_code);
     alive = false;
   }
   // The call may have changed the memory layout: rebuild the page tables and hand the new ones to this thread's siblings and core.
@@ -259,10 +297,25 @@ Frame* on_user_fault(Frame* frame) {
   if (!task) panic("fault in user mode on a thread that is not a user program", frame);
   if ((kill_pending(task) || task->program.process()->exited()) && (frame->vector & 0xFF) == 14 && frame->rip == 0) {      // the end on_user_tick() arranged: not a fault of the program's
     if (!task->program.process()->exited()) task->killed = true;
-    task->program.process()->terminate(130);      // (a program that already ended keeps its exit code)
+    task->program.process()->terminate(task->kill_code);      // (a program that already ended keeps its exit code)
     thread_ends_now(current_user_thread());
     irq_enable();
     exit_thread();
+  }
+  if (UserThread* ut = current_user_thread(); ut && ut->redirected && (frame->vector & 0xFF) == 14 && frame->rip == 0) {      // the tick sent it here (see on_user_tick)
+    ut->redirected = false;
+    frame->rip = ut->saved_rip;
+    irq_enable();
+    task->mutex.lock();
+    const bool ends = stop_point(ut, frame);
+    if (ends) {
+      task->sync_tables();      // (its stack is gone)
+      thread_ends_now(ut);
+    }
+    task->mutex.unlock();
+    if (ends) exit_thread();
+    irq_disable();
+    return frame;
   }
   // A Windows program gets its exception delivered, to be handled by SEH or C++ code (or to end up in ntdll's last resort); only when that cannot be done is the program stopped.
   process::Process* process = task->program.process();
@@ -420,6 +473,7 @@ Task::~Task() {
         break;
       }
   }
+  reap_children(true);
   while (threads) {
     UserThread* next = threads->next;
     threads->~UserThread();
@@ -433,7 +487,64 @@ bool Task::wait(uint64_t timeout_ns) {
   return changed.wait(mutex, us == 0 && timeout_ns != ~uint64_t{0} ? 1 : us);
 }
 
-bool Task::interrupted() { return kill_pending(this) || program.process()->exited(); }
+bool Task::interrupted() {
+  if (kill_pending(this) || program.process()->exited()) return true;
+  UserThread* u = current_user_thread();
+  return u && __atomic_load_n(&u->terminate_requested, __ATOMIC_ACQUIRE);      // (a thread told to end stops waiting)
+}
+
+UserThread* Task::find_thread(uint64_t id) {
+  for (UserThread* t = threads; t; t = t->next) if (t->id == id) return t;
+  return nullptr;
+}
+void Task::request_suspend(uint64_t id) {
+  if (UserThread* t = find_thread(id)) __atomic_store_n(&t->suspend_requested, true, __ATOMIC_RELEASE);
+}
+void Task::request_resume(uint64_t id) {
+  if (UserThread* t = find_thread(id)) __atomic_store_n(&t->suspend_requested, false, __ATOMIC_RELEASE);
+  changed.notify_all();
+}
+bool Task::is_parked(uint64_t id) {
+  UserThread* t = find_thread(id);
+  return t && t->parked;
+}
+bool Task::get_context(uint64_t id, process::X86Context* out) {
+  UserThread* t = find_thread(id);
+  if (!t) return false;
+  if (!t->spawned) {      // it has not run yet: its registers are the ones it will start with
+    *out = process::X86Context();
+    out->rip = t->start.entry;
+    out->gpr[process::X86Context::kRsp] = t->start.stack_pointer;
+    out->gpr[process::X86Context::kRcx] = t->start.argument;
+    out->gpr[process::X86Context::kRdx] = t->start.argument2;
+    return true;
+  }
+  if (!t->parked) return false;
+  *out = t->saved;
+  return true;
+}
+bool Task::set_context(uint64_t id, const process::X86Context& context) {
+  UserThread* t = find_thread(id);
+  if (!t) return false;
+  if (!t->spawned) {
+    t->start.entry = context.rip;
+    t->start.stack_pointer = context.gpr[process::X86Context::kRsp];
+    t->start.argument = context.gpr[process::X86Context::kRcx];
+    t->start.argument2 = context.gpr[process::X86Context::kRdx];
+    return true;
+  }
+  if (!t->parked) return false;
+  t->saved = context;
+  t->context_dirty = true;
+  return true;
+}
+void Task::request_terminate(uint64_t id, uint32_t code) {
+  UserThread* t = find_thread(id);
+  if (!t) return;
+  t->terminate_code = code;
+  __atomic_store_n(&t->terminate_requested, true, __ATOMIC_RELEASE);
+  changed.notify_all();      // (a parked thread wakes to end)
+}
 
 uint64_t Task::current_thread_id() {
   UserThread* u = current_user_thread();
@@ -455,32 +566,35 @@ UserThread* Task::add_thread(const process::ThreadStart& start) {
 constexpr uint32_t kUserThreadKernelStack = 256 * 1024;
 
 bool Task::launch(UserThread* t, uint32_t stack_bytes) {
-  t->thread = kernel::spawn(user_main, t, "user-thread", home_core, -1, stack_bytes);
+  t->thread = kernel::spawn(user_main, t, "user-thread", -1, -1, stack_bytes);
   t->spawned = t->thread != nullptr;
   return t->spawned;
 }
 
 bool Task::sync_tables() {
-  // The old tables are freed when the new ones are ready, and the program's other threads (time-sliced on this core) still have the old ones: none of them may run in
-  // between, so nothing interrupts the change of tables.
-  const uint64_t flags = irq_save();
-  const bool ok = tables.sync(program.address_space());
-  if (ok) {
-    const uint64_t root = tables.root();
-    for (UserThread* t = threads; t; t = t->next) {
-      if (t->spawned && t->thread && !t->joined && !t->finished && t->thread->user_cr3 != root) set_thread_user_cr3(t->thread, root);
-    }
+  // The program's threads run side by side on every core, each on the page tables it was given. New tables are built beside the old ones; every thread is then given the new
+  // ones (a thread running on another core takes them when that core's interrupt brings it into the kernel and back), and only after all those cores have answered are the old
+  // tables and the memory of what was unmapped given back: until then another core may still be running on them.
+  if (!tables.sync(program.address_space(), true)) return false;
+  const uint64_t root = tables.root();
+  CoreMask others;
+  for (UserThread* t = threads; t; t = t->next) {
+    if (!t->spawned || !t->thread || t->joined || t->finished || t->thread->user_cr3 == root) continue;
+    const int32_t core = set_thread_user_cr3(t->thread, root);
+    if (core >= 0) others.add(static_cast<uint32_t>(core));
   }
-  irq_restore(flags);
-  return ok;
+  bool answered = true;
+  if (!others.empty()) answered = wait_for_kernel_entry(others);
+  if (answered) {
+    tables.release_previous();
+    program.address_space().reclaim();
+  } else {
+    console::puts("user program: a core did not give up the old page tables\n");      // (the old tables and memory are kept until the next change)
+  }
+  return true;
 }
 
 bool Task::start_thread(const process::ThreadStart& start, bool suspended) {
-  Thread* me = current_thread();
-  if (home_core < 0 && me) {      // the first extra thread: the program's threads stay on this core from now on
-    home_core = static_cast<int32_t>(current_core());
-    set_thread_affinity(me, home_core);
-  }
   UserThread* t = add_thread(start);
   if (!t) return false;
   if (!sync_tables()) return false;      // the new thread's stack and TEB are in the tables before it runs
@@ -495,7 +609,130 @@ bool Task::resume_thread(uint64_t id) {
   return false;
 }
 
-UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name) {
+// A program started by CreateProcess: its own Task, run on its own CPU threads, sharing the files, the libraries and the console of the program that started it.
+struct Task::Child {
+  UniquePointer<process::UserProgram> program;
+  UniquePointer<Task> task;
+  uint64_t pid = 0;
+  bool started = true;
+  Child* next = nullptr;
+};
+
+uint64_t Task::allocate_process_id() {
+  static uint64_t next = 0x40000;
+  static Mutex ids;
+  ScopedMutex hold(ids);
+  const uint64_t id = next++;
+  if (next >= 0x100000) next = 0x40000;      // (a thread id carries its process's id in the low 20 bits)
+  return id;
+}
+
+uint32_t Task::spawn_process(const process::ChildSpec& spec) {
+  constexpr uint32_t kNoMemory = 0xC0000017u, kInvalidImage = 0xC000007Bu, kNoResources = 0xC000009Au;
+  reap_children(false);
+  const process::SyscallAbi abi = process::abi_for_executable(exe::identify_executable(spec.image.at_most(exe::kIdentifyBytes)));
+  if (abi == process::SyscallAbi::None) return kInvalidImage;
+  void* memory = allocator_.allocate(sizeof(Child));
+  if (!memory) return kNoMemory;
+  Child* child = new (memory) Child();
+  auto discard = [&]() { child->~Child(); allocator_.deallocate(child); };
+  child->pid = spec.pid;
+  child->program = UniquePointer<process::UserProgram>::make(allocator_, allocator_, spec.pid, program.host());
+  if (!child->program) { discard(); return kNoMemory; }
+  process::UserProgram& p = *child->program;
+  p.address_space().set_reserved(reserved_ranges());
+  p.set_file_system(program.file_system());
+  if (abi == process::SyscallAbi::Windows) p.set_library_provider(program.library_provider());
+  p.set_working_directory(spec.working_directory);
+  p.set_command_line(spec.command_line);
+  // argv: the program's name, then (for a Linux program) the words of the command line
+  StringView argv[32];
+  uint32_t argc = 0;
+  argv[argc++] = spec.image_path;
+  if (abi != process::SyscallAbi::Windows) {
+    StringView rest = spec.command_line;
+    bool first_word = true;
+    while (argc < 32) {
+      while (!rest.empty() && rest[0] == ' ') rest = rest.without_prefix(1);
+      if (rest.empty()) break;
+      uint64_t end = rest.find(' ');
+      if (end == StringView::npos) end = rest.size();
+      if (!first_word) argv[argc++] = rest.first(end);
+      first_word = false;
+      rest = rest.without_prefix(end);
+    }
+  }
+  uint8_t random[16];
+  uint64_t t = hardware::read_tsc() ^ (spec.pid * 0x9E3779B97F4A7C15ull);
+  for (uint8_t& b : random) {
+    t = t * 6364136223846793005ull + 1442695040888963407ull;
+    b = static_cast<uint8_t>(t >> 56);
+  }
+  const process::LoadStatus loaded = p.load(spec.image, ArrayView<const StringView>(argv, argc), spec.environment, ConstByteView(random, sizeof(random)));
+  if (loaded != process::LoadStatus::Ok) {
+    discard();
+    return loaded == process::LoadStatus::OutOfMemory ? kNoMemory : kInvalidImage;
+  }
+  child->task = usermode::spawn(p, allocator_, "program", spec.suspended);
+  if (!child->task) { discard(); return kNoResources; }
+  child->started = !spec.suspended;
+  child->next = children;
+  children = child;
+  return 0;
+}
+
+bool Task::terminate_process(uint64_t pid, uint32_t code) {
+  for (Child* c = children; c; c = c->next) {
+    if (c->pid != pid) continue;
+    if (c->task->program.process()->exited()) return false;
+    if (!c->started) {      // it never ran: there is no thread to stop
+      c->task->kill_code = code;
+      c->task->killed = true;
+      c->task->program.process()->terminate(code);
+      return true;
+    }
+    request_kill(*c->task, code);
+    c->program->host().wake_blocked();
+    return true;
+  }
+  return false;
+}
+
+bool Task::resume_process(uint64_t pid) {
+  for (Child* c = children; c; c = c->next) {
+    if (c->pid != pid || c->started) continue;
+    c->started = true;
+    return c->task->start_first_thread();
+  }
+  return false;
+}
+
+void Task::reap_children(bool all) {
+  Child** link = &children;
+  while (*link) {
+    Child* c = *link;
+    Task& t = *c->task;
+    uint32_t code = 0;
+    if (all) {
+      if (c->started) {
+        request_kill(t, t.kill_code);
+        c->program->host().wake_blocked();
+        usermode::wait(t, &code);
+      } else if (!c->task->program.process()->exited()) {
+        c->task->program.process()->terminate(c->task->kill_code);
+      }
+    } else if (!c->started || !usermode::wait(t, &code, 1)) {
+      link = &c->next;
+      continue;
+    }
+    if (process::ObjectManager* objects = process::system_objects()) objects->process_exited(c->pid, c->task->program.process()->exit_code());
+    *link = c->next;
+    c->~Child();
+    allocator_.deallocate(c);
+  }
+}
+
+UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name, bool suspended) {
   if (!g.ready || !program.loaded()) return UniquePointer<Task>();
   UniquePointer<Task> task = UniquePointer<Task>::make(allocator, allocator, program, g.nx);
   if (!task) return task;
@@ -506,6 +743,7 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
     if (!task->tables.add_identity({r.base, r.size, !read_only, code})) return UniquePointer<Task>();
   }
   if (!task->tables.rebuild(program.address_space())) return UniquePointer<Task>();
+  program.address_space().set_deferred_free(true);      // (see Task::sync_tables)
   const process::ProgramStart& start = program.start();
   process::ThreadStart first;
   first.entry = start.entry;
@@ -518,9 +756,13 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   UserThread* t = task->add_thread(first);
   if (!t) return UniquePointer<Task>();
   program.process()->attach_runtime(task.get());
-  t->thread = kernel::spawn(user_main, t, name);
-  t->spawned = t->thread != nullptr;
-  if (!t->spawned) return UniquePointer<Task>();
+  if (suspended) {      // it waits for Task::start_first_thread()
+    task->first_thread = t;
+  } else {
+    t->thread = kernel::spawn(user_main, t, name);
+    t->spawned = t->thread != nullptr;
+    if (!t->spawned) return UniquePointer<Task>();
+  }
   task->set_name(StringView(name));
   {
     ScopedMutex hold(g_tasks_mutex);
@@ -557,7 +799,17 @@ uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity) {
   return n;
 }
 
-void request_kill(Task& task) {
+bool Task::start_first_thread() {
+  UserThread* t = first_thread;
+  if (!t || t->spawned) return false;
+  first_thread = nullptr;
+  t->thread = kernel::spawn(user_main, t, "program");
+  t->spawned = t->thread != nullptr;
+  return t->spawned;
+}
+
+void request_kill(Task& task, uint32_t exit_code) {
+  task.kill_code = exit_code;
   __atomic_store_n(&task.kill_requested, true, __ATOMIC_RELEASE);
   task.changed.notify_all();      // a thread waiting for another one must see it
   if (process::ObjectManager* objects = process::system_objects()) objects->notify();
@@ -596,6 +848,7 @@ bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us) {
     if (!to_join) break;
     join(to_join, 0);      // (it only has to finish leaving)
   }
+  task.reap_children(true);      // (the programs it started do not outlive it)
   *exit_code = task.program.process()->exit_code();
   return true;
 }

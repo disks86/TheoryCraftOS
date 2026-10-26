@@ -15,15 +15,23 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
+// What GraphicsPool needs of whoever already renders on the display GPU (SystemGraphics): that GPU's 3D back end and its 2D renderer. The pool reuses
+// them instead of building second ones on the same GPU.
 #pragma once
-#include "Process/ModuleLoader.hpp"
+#include "Graphics/Graphics2D/IRenderer2D.hpp"
+#include "Graphics/RenderNode.hpp"
 
-namespace windows {
+namespace graphics {
 
-// ntdll.dll and kernel32.dll, built from src/Windows/ with the rest of the OS and carried inside the image (see CMakeLists.txt).
-class BuiltinLibraries final : public process::ILibraryProvider {
+class IDisplayGraphics {
  public:
-  bool find(StringView canonical_name, ConstByteView* image) override;
+  virtual RenderNode& render_node() = 0;
+  virtual IRenderer2D* renderer_2d() = 0;
+
+ protected:
+  constexpr IDisplayGraphics() = default;
+  ~IDisplayGraphics() = default;
 };
 
-}  // namespace windows
+}  // namespace graphics

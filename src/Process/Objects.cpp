@@ -90,6 +90,45 @@ ObjectManager::Created ObjectManager::create(ObjectKind kind, StringView name, b
   return result;
 }
 
+ObjectManager::Created ObjectManager::create_process(uint64_t pid) {
+  Created result;
+  Locked hold(sync_);
+  for (uint32_t i = 0; i < kCapacity; ++i) {
+    Object& o = objects_[i];
+    if (o.kind != ObjectKind::None) continue;
+    o = Object();
+    o.kind = ObjectKind::Process;
+    o.references = 1;
+    o.manual_reset = true;
+    o.owner = pid;
+    o.count = 259;      // STILL_ACTIVE
+    result.id = i + 1;
+    return result;
+  }
+  result.status = kNoResources;
+  return result;
+}
+
+void ObjectManager::process_exited(uint64_t pid, uint32_t code) {
+  Locked hold(sync_);
+  for (Object& o : objects_) {
+    if (o.kind != ObjectKind::Process || o.owner != pid || o.signaled) continue;
+    o.signaled = true;
+    o.count = static_cast<int32_t>(code);
+  }
+  sync_.notify_all();
+}
+
+bool ObjectManager::query_process(uint32_t id, bool* exited, uint32_t* code, uint64_t* pid) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::Process) return false;
+  *exited = o->signaled;
+  *code = static_cast<uint32_t>(o->count);
+  *pid = o->owner;
+  return true;
+}
+
 ObjectManager::Created ObjectManager::open(ObjectKind kind, StringView name) {
   Created result;
   Locked hold(sync_);
@@ -205,6 +244,7 @@ bool ObjectManager::ready_locked(uint32_t id, uint64_t waiter) {
   if (!o) return true;      // gone: nothing to wait for
   switch (o->kind) {
     case ObjectKind::Event: return o->signaled || o->pulses > 0;
+    case ObjectKind::Process: return o->signaled;
     case ObjectKind::Mutex: return o->owner == 0 || o->owner == waiter;
     case ObjectKind::Semaphore: return o->count > 0;
     default: return true;
