@@ -155,11 +155,14 @@ class VirglImage final : public IImage {
     hardware::VirtioGpu& gpu = device.gpu();
     id_ = gpu.allocate_resource_id();
     const bool depth = desc.format == Format::D32Float;
+    // A texture (an image that is only sampled) is stored top row first, the way write_pixels() gives it and the sampler reads it, so it does not take the Y_0_TOP
+    // flip of the images that are drawn into.
+    const bool texture = (desc.usage & kImageSampled) != 0;
     uint32_t bind = depth ? virgl::kBindDepthStencil : (virgl::kBindRenderTarget | virgl::kBindSamplerView);
     if (desc.usage & kImagePresent) bind |= virgl::kBindScanout;
     ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetTexture2d,
                             depth ? virgl::kFormatZ32Float : virgl::kFormatB8G8R8A8Unorm, bind,
-                            desc.extent.width, desc.extent.height, 1, 1, 0, 0, kResourceFlagY0Top, 0};
+                            desc.extent.width, desc.extent.height, 1, 1, 0, 0, texture ? 0u : kResourceFlagY0Top, 0};
     CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
     ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(ctx));
     accounted_ = uint64_t{desc.extent.width} * desc.extent.height * 4;   // (every format here is 32 bits per pixel)
@@ -171,9 +174,16 @@ class VirglImage final : public IImage {
       const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSurface, 5), surface_, id_, fmt, 0, 0};
       ok_ = device.send_commands(cmd, 6);
     }
+    // The sampler view is what a texture unit is bound to: the whole resource, level 0, components in order.
+    if (ok_ && texture) {
+      view_ = device.new_handle();
+      const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerView, 6), view_, id_, virgl::kFormatB8G8R8A8Unorm, 0, 0, virgl::kSwizzleRgba};
+      ok_ = device.send_commands(cmd, 7);
+    }
   }
   ~VirglImage() {
     hardware::VirtioGpu& gpu = device_.gpu();
+    if (view_) device_.destroy_object(view_);
     if (surface_) device_.destroy_object(surface_);
     if (id_) {
       CtxResource detach{header(kCmdCtxDetachResource), id_, 0};
@@ -187,6 +197,7 @@ class VirglImage final : public IImage {
   bool valid() const { return ok_; }
   uint32_t id() const { return id_; }
   uint32_t surface() const { return surface_; }
+  uint32_t view() const { return view_; }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
@@ -195,16 +206,7 @@ class VirglImage final : public IImage {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (desc_.format == Format::D32Float || out.size() < count) return false;
     hardware::VirtioGpu& gpu = device_.gpu();
-    if (backing_.empty()) {  // guest memory for the host to copy into, attached on first use
-      backing_ = allocate_dma_view<uint8_t>(gpu.allocator(), count * 4, 4096);
-      if (backing_.empty()) return false;
-      ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
-                                   {reinterpret_cast<uint64_t>(backing_.data()), static_cast<uint32_t>(count * 4), 0}};
-      if (!gpu.command(as_bytes(attach))) {
-        release_view(gpu.allocator(), backing_);
-        return false;
-      }
-    }
+    if (!ensure_backing(count)) return false;
     TransferHost3d transfer{header(kCmdTransferFromHost3d),
                             {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0,
                             desc_.extent.width * 4, 0};
@@ -214,10 +216,36 @@ class VirglImage final : public IImage {
     return true;
   }
 
+  // Only a texture takes pixels: the host copies them from guest memory (the backing) into the resource.
+  bool write_pixels(ArrayView<const uint32_t> pixels) override {
+    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
+    if (!(desc_.usage & kImageSampled) || desc_.format == Format::D32Float || pixels.size() != count) return false;
+    if (!ensure_backing(count)) return false;
+    const ArrayView<uint32_t> staged = backing_.cast<uint32_t>();
+    for (uint64_t i = 0; i < count; ++i) staged[i] = pixels[i];
+    TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, desc_.extent.width, desc_.extent.height, 1}, 0, id_, 0, desc_.extent.width * 4, 0};
+    return device_.gpu().command(as_bytes(transfer));
+  }
+
  private:
+  // Guest memory for the host to copy from or into, attached on first use.
+  bool ensure_backing(uint64_t pixel_count) {
+    if (!backing_.empty()) return true;
+    hardware::VirtioGpu& gpu = device_.gpu();
+    backing_ = allocate_dma_view<uint8_t>(gpu.allocator(), pixel_count * 4, 4096);
+    if (backing_.empty()) return false;
+    ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
+                                 {reinterpret_cast<uint64_t>(backing_.data()), static_cast<uint32_t>(pixel_count * 4), 0}};
+    if (!gpu.command(as_bytes(attach))) {
+      release_view(gpu.allocator(), backing_);
+      return false;
+    }
+    return true;
+  }
+
   VirglDevice& device_;
   ImageDesc desc_;
-  uint32_t id_ = 0, surface_ = 0;
+  uint32_t id_ = 0, surface_ = 0, view_ = 0;
   uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this image
   ByteView backing_;
   bool ok_ = false;
@@ -360,6 +388,25 @@ bool VirglDevice::send_commands(const uint32_t* dwords, uint32_t count) {
   return ok;
 }
 
+VirglDevice::~VirglDevice() {
+  for (uint32_t handle : sampler_states_) destroy_object(handle);
+}
+
+uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
+  const uint32_t key = (sampler.filter == Filter::Linear ? 1u : 0u) | (sampler.address_u == AddressMode::ClampToEdge ? 2u : 0u) | (sampler.address_v == AddressMode::ClampToEdge ? 4u : 0u);
+  if (sampler_states_[key]) return sampler_states_[key];
+  const uint32_t handle = new_handle();
+  const uint32_t wrap_s = sampler.address_u == AddressMode::Repeat ? virgl::kWrapRepeat : virgl::kWrapClampToEdge;
+  const uint32_t wrap_t = sampler.address_v == AddressMode::Repeat ? virgl::kWrapRepeat : virgl::kWrapClampToEdge;
+  const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
+  // No mipmaps: the minification filter is the magnification one and no level is chosen between.
+  const uint32_t s0 = wrap_s | (wrap_t << 3) | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13);
+  const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, 0, 0, 0, 0, 0, 0, 0};
+  if (!send_commands(cmd, 10)) return 0;
+  sampler_states_[key] = handle;
+  return handle;
+}
+
 bool VirglDevice::destroy_object(uint32_t handle) {
   if (!handle) return true;
   const uint32_t cmd[] = {virgl::header(virgl::kDestroyObject, 0, 1), handle};
@@ -379,6 +426,9 @@ void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), st
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.stencil) return nullptr;   // (no stencil plane on this device)
+  // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
+  if ((desc.usage & kImageSampled) && (desc.usage & (kImageColorAttachment | kImageDepthAttachment | kImagePresent))) return nullptr;
+  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
@@ -406,7 +456,7 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 }
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
-  if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
+  if (desc.texture_count > kMaxTextureUnits || desc.fragment_shader == nullptr) return nullptr;
   if (desc.stencil.enable) return nullptr;   // (no stencil test on this device)
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes ||
       desc.varying_count > kMaxVaryings)
@@ -438,6 +488,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
   VirglImage* depth = nullptr;
   VirglBuffer* vertex_buffer = nullptr;
   uint64_t vertex_offset = 0;
+  const VirglImage* textures[kMaxTextureUnits] = {};
+  SamplerDesc samplers[kMaxTextureUnits];
+  bool textures_dirty = false;
   VirglBuffer* index_buffer = nullptr;
   uint64_t index_offset = 0;
   IndexType index_type = IndexType::Uint16;
@@ -545,7 +598,14 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         index_offset = cmd.offset;
         index_type = cmd.index_type;
         break;
-      case RecordedCommand::Type::BindTexture: return false;   // (no pipeline of this device samples a texture)
+      case RecordedCommand::Type::BindTexture: {
+        const VirglImage* image = static_cast<const VirglImage*>(cmd.image);
+        if (cmd.unit >= kMaxTextureUnits || !image || !image->view()) return false;   // (only an image created with kImageSampled has a view)
+        textures[cmd.unit] = image;
+        samplers[cmd.unit] = cmd.sampler;
+        textures_dirty = true;
+        break;
+      }
       case RecordedCommand::Type::PushConstants: {
         ConstByteView block;
         if (!pool.try_subview(cmd.constants_offset, cmd.constants_size, &block)) return false;
@@ -575,6 +635,26 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (!in_pass || !pipeline || !vertex_buffer) return false;
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
+        if (const uint32_t unit_count = pipeline->desc().texture_count) {
+          for (uint32_t unit = 0; unit < unit_count; ++unit)
+            if (!textures[unit] || textures[unit] == color || textures[unit] == depth) return false;   // unbound, or the image being drawn into
+          if (textures_dirty) {
+            stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
+            stream.put(virgl::kShaderFragment);
+            stream.put(0);
+            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(textures[unit]->view());
+            uint32_t states[kMaxTextureUnits];
+            for (uint32_t unit = 0; unit < unit_count; ++unit) {
+              states[unit] = sampler_state(samplers[unit]);   // (created straight away, so it exists before the stream that uses it)
+              if (!states[unit]) return false;
+            }
+            stream.command(virgl::kBindSamplerStates, 0, 2 + unit_count);
+            stream.put(virgl::kShaderFragment);
+            stream.put(0);
+            for (uint32_t unit = 0; unit < unit_count; ++unit) stream.put(states[unit]);
+            textures_dirty = false;
+          }
+        }
         if (constants_dirty) {
           for (uint32_t shader = 0; shader < 2; ++shader) {
             stream.command(virgl::kSetConstantBuffer, 0, 2 + constants_dwords);
