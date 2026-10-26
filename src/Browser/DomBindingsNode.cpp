@@ -1666,6 +1666,22 @@ NATIVE(register_svg_tag) {
   return true;
 }
 
+// __set_animated_style(element, declarations): what running animations put on an element ("" removes it); the page is styled again
+NATIVE(set_animated_style) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  String text(vm.allocator());
+  if (!n || !n->is_element() || !arg_text(vm, arg_at(args, argc, 1), &text)) return vm.throw_error(ErrorKind::TypeError, "__set_animated_style: not an element");
+  if (n->animated.view().equals(text.view())) {
+    *result = Value();
+    return true;
+  }
+  n->animated.assign(text.view());
+  n->owner->touch();
+  *result = Value();
+  return true;
+}
+
 // `new MyElement()` for a class that extends HTMLElement: a document node whose tag was registered for a prototype in the chain
 JsObject* construct_element(void* user, JsObject* proto) {
   DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(user);
@@ -1696,6 +1712,7 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(g, "__take_mutations", take_mutations, 0);
   vm.define_native(g, "__register_tag", register_tag, 2);
   vm.define_native(g, "__register_svg_tag", register_svg_tag, 2);
+  vm.define_native(g, "__set_animated_style", set_animated_style, 2);
   vm.set_construct_hook(construct_element, &c);
   c.doc.set_insert_hook(script_inserted_hook, &c);
   vm.set_epilogue(mutation_epilogue, &c);
