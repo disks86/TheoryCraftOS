@@ -59,6 +59,8 @@ enum class Opc : uint8_t {
   // block scopes whose variables closures capture: PushEnv (a = variables) makes a new Env inside the current one, PopEnv leaves it, CopyEnv replaces the
   // current one with a copy (a `for (let ...)` loop gives each iteration its own variables)
   PushEnv, PopEnv, CopyEnv,
+  // [] -> [value]: what the iterator that just finished returned (the value of `yield*`)
+  IterReturn,
 };
 
 // What the 16 spare bits of GetVar / SetVar say: 0 plain; kConstAssign (SetVar of a const: a TypeError); n >= kChecked: the variable is let / const / class and

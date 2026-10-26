@@ -1012,12 +1012,19 @@ class Compiler {
       case NodeKind::Assign: assignment(n); return;
       case NodeKind::Call: call(n, false); return;
       case NodeKind::New: call(n, true); return;
+      case NodeKind::OptionalChain: {
+        const uint64_t first = chain_jumps_.count();
+        chain_marks_.push_back(static_cast<uint32_t>(first));
+        expression(n->a);
+        end_chain(first, false);
+        return;
+      }
       case NodeKind::Member:
         expression(n->a);
         if (n->flags & kFlagOptional) {
-          optional_guard();
+          const bool g = optional_guard();
           emit(Opc::GetProp, static_cast<int32_t>(constant_string(n->text)), 0, n->line);
-          optional_end();
+          optional_end(g);
         } else {
           emit(Opc::GetProp, static_cast<int32_t>(constant_string(n->text)), 0, n->line);
         }
@@ -1025,10 +1032,10 @@ class Compiler {
       case NodeKind::Index:
         expression(n->a);
         if (n->flags & kFlagOptional) {
-          optional_guard();
+          const bool g = optional_guard();
           expression(n->b);
           emit(Opc::GetElem, 0, 0, n->line);
-          optional_end();
+          optional_end(g);
         } else {
           expression(n->b);
           emit(Opc::GetElem, 0, 0, n->line);
@@ -1046,13 +1053,30 @@ class Compiler {
   }
 
   // `a?.b`: with the object on the stack, nothing nullish is read from; the result is undefined instead.
-  void optional_guard() {
+  // The end of an optional chain that began with chain_jumps_[first]: where a nullish value lands ([x] is on the stack at each jump) and leaves undefined (or true, for delete).
+  void end_chain(uint64_t first, bool delete_result) {
+    chain_marks_.remove_at(chain_marks_.count() - 1);
+    if (chain_jumps_.count() <= first) return;
+    const uint32_t to_end = emit(Opc::Jump);
+    for (uint64_t i = first; i < chain_jumps_.count(); ++i) patch(chain_jumps_[i]);
+    emit(Opc::Pop);
+    emit(delete_result ? Opc::PushTrue : Opc::PushUndef);
+    patch(to_end);
+    while (chain_jumps_.count() > first) chain_jumps_.remove_at(chain_jumps_.count() - 1);
+  }
+  bool optional_guard() {
     emit(Opc::Dup);
     emit(Opc::PushNull);
     emit(Opc::Ne);
+    if (chain_marks_.count()) {   // inside a chain: a nullish value ends the whole chain
+      chain_jumps_.push_back(emit(Opc::JumpIfFalse));
+      return true;
+    }
     optional_jumps_.push_back(emit(Opc::JumpIfFalse));
+    return false;
   }
-  void optional_end() {
+  void optional_end(bool in_chain) {
+    if (in_chain) return;
     const uint32_t to_end = emit(Opc::Jump);
     patch(optional_jumps_[optional_jumps_.count() - 1]);
     optional_jumps_.remove_at(optional_jumps_.count() - 1);
@@ -1091,7 +1115,21 @@ class Compiler {
   void unary(Node* n) {
     switch (n->op) {
       case Op::Delete:
-        if (n->a->kind == NodeKind::Member) {
+        if (n->a->kind == NodeKind::OptionalChain && (n->a->a->kind == NodeKind::Member || n->a->a->kind == NodeKind::Index)) {   // delete a?.b
+          Node* link = n->a->a;
+          const uint64_t first = chain_jumps_.count();
+          chain_marks_.push_back(static_cast<uint32_t>(first));
+          expression(link->a);
+          const bool g = (link->flags & kFlagOptional) ? optional_guard() : false;
+          if (link->kind == NodeKind::Member) {
+            emit(Opc::DeleteProp, static_cast<int32_t>(constant_string(link->text)));
+          } else {
+            expression(link->b);
+            emit(Opc::DeleteElem);
+          }
+          optional_end((link->flags & kFlagOptional) ? g : true);
+          end_chain(first, true);
+        } else if (n->a->kind == NodeKind::Member) {
           expression(n->a->a);
           emit(Opc::DeleteProp, static_cast<int32_t>(constant_string(n->a->text)));
         } else if (n->a->kind == NodeKind::Index) {
@@ -1140,7 +1178,7 @@ class Compiler {
           emit(Opc::Pop);
           emit(Opc::Jump, static_cast<int32_t>(top));
           patch(to_end);
-          emit(Opc::PushUndef);
+          emit(Opc::IterReturn);
         }
         return;
       case Op::Not: expression(n->a); emit(Opc::Not); return;
@@ -1335,17 +1373,26 @@ class Compiler {
     if (optional_call) {
       const uint32_t to_end = emit(Opc::Jump);
       patch(skip);
-      emit(Opc::Pop);
-      emit(Opc::Pop);
-      emit(Opc::PushUndef);
+      if (chain_marks_.count()) {   // in a chain: the rest of it is skipped too
+        emit(Opc::Pop);
+        chain_jumps_.push_back(emit(Opc::Jump));
+      } else {
+        emit(Opc::Pop);
+        emit(Opc::Pop);
+        emit(Opc::PushUndef);
+      }
       patch(to_end);
     }
     if (guard_skip != kNoJump) {   // the object was nullish: [obj] -> [undefined]
-      const uint32_t to_end = emit(Opc::Jump);
-      patch(guard_skip);
-      emit(Opc::Pop);
-      emit(Opc::PushUndef);
-      patch(to_end);
+      if (chain_marks_.count()) {
+        chain_jumps_.push_back(guard_skip);
+      } else {
+        const uint32_t to_end = emit(Opc::Jump);
+        patch(guard_skip);
+        emit(Opc::Pop);
+        emit(Opc::PushUndef);
+        patch(to_end);
+      }
     }
   }
 
@@ -1372,6 +1419,8 @@ class Compiler {
   StringView pending_label_;
   List<uint32_t>* dummy_ = nullptr;
   List<uint32_t> optional_jumps_{vm_.allocator()};
+  List<uint32_t> chain_jumps_{vm_.allocator()};   // the nullish exits of the optional chains being compiled (where each chain's begin in chain_marks_)
+  List<uint32_t> chain_marks_{vm_.allocator()};
 };
 
 }  // namespace
