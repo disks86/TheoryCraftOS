@@ -12,8 +12,9 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 
 ## Not done
 
-- **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
-  None of it exists and none can be checked without the hardware and the firmware blobs.
+- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written (see "Radeon RX Vega M: graphics engine start-up" below, simulation only). Still missing: the memory controller
+  programming and GART for the HBM2 (the video engine borrows what the card's firmware left), SDMA, the interrupt handler, DCE 11.2 display, the rest of GFX 8 (tiling tables, clear-state buffer, compute queues).
+  None of it can be checked without the hardware.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 (interlaced pictures untested against real data, see below) and MPEG-4 (the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
@@ -193,6 +194,32 @@ surface should ignore it).
 
 Not done: interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
 on real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.
+
+## Radeon RX Vega M: graphics engine start-up
+
+Code: `src/Hardware/GraphicsProcessingUnit/AMD/AmdGfx8Firmware.*`, `AmdSmu7Ucode.*`, `AmdGfx8.*` (+ generated `AmdGfx8Registers.inc`), tests: `tests/AmdGfx8Test.cpp` with the simulated card `tests/FakeAmdGfx8.hpp`
+(`tests/run_host_tests.sh AmdGfx8Test`), checker: `scripts/check_gfx8_port.py <gfx_v8_0.c>`.
+
+| File | Job |
+| --- | --- |
+| `AmdGfx8Firmware` | Takes apart the microcode files (`amdgpu_ucode.h`: the common header and the gfx/rlc/sdma additions): sizes checked against the file, the ucode array, the MEC's jump table. The names are those of linux-firmware (`vegam_pfp.bin`, `_me`, `_ce`, `_mec`, `_mec2`, `_rlc`, `_sdma`, `_sdma1`; all in `/firmware`, SHA-256 in `firmware/README.md`). |
+| `AmdSmu7Ucode` | On this chip the **SMC loads the engines' microcode**, not the driver (`smu7_request_smu_load_fw`): a table of contents (`SMU_DRAMData_TOC`: id, version, address, size, flags per image) and the images go to video memory, the SMC is told where (`PPSMC_MSG_SMU_DRAM_ADDR_HI/LO`, `DRV_DRAM_ADDR_HI/LO`), asked to load (`LoadUcodes`, mask `0x47E`: RLC_G, SDMA0/1, CE, ME, PFP, MEC) and `UcodeLoadStatus` (SMC memory, soft registers address at header +48, word at +108 - `offsetof` on the real `smu75.h`) is polled for the same bits. The MEC's slot excludes its jump table, which has slots of its own (JT1 from the MEC file, JT2 from `vegam_mec2.bin` if given). |
+| `AmdGfx8` | `gfx_v8_0_hw_init` without `constants_init` and `init_pg`: the VEGAM golden registers (`golden_settings_vegam_a11`, `vegam_golden_common_all`, compared value for value by the checker), RLC stop / reset / start, CP ring 0 (8 KiB, `CP_RB0_*`, write-back read pointer), the start stream (`PREAMBLE`, `CONTEXT_CONTROL`, raster config, `CLEAR_STATE`, `SET_BASE` for the CE partitions), and the driver's ring test (`SET_UCONFIG_REG` of `SCRATCH_REG0`). `stop()` is `gfx_v8_0_hw_fini` (graphics and compute CPs halted, RLC stopped). |
+
+What the test shows: the real firmware files parse to the values worked out from their headers (and every truncated or bit-flipped header is refused or yields views inside the file, under the sanitizers); the table the
+SMC reads has the right ids, versions, sizes, flags and GPU addresses (including addresses above 4 GiB), and each image is in video memory byte for byte; the messages go in the driver's order and a flush of the host data
+path precedes them; every failure (no SMC, no firmware header, a refused load, a load that does not finish, memory that is too small or misaligned) is reported and leaves video memory untouched where it should; the
+register writes of the start are in the driver's order with the driver's pauses; and the simulated command processor only runs the ring once the SMC has set the CE, PFP and ME bits and the halt bits are clear, so the ring test
+fails without the load and passes with it. The simulated card is written from the driver's description; it does **not** show that the real SMC accepts this table or that the real command processor runs these packets.
+
+Not done and assumed:
+- Registers the start leaves out: `gfx_v8_0_constants_init` (tiling tables, render back-end set-up), `init_pg` (RLC clear-state buffer, save/restore list, power gating), the clear-state context defaults (`vi_cs_data`), the compute queues
+  (KIQ/KCQ), doorbells (the write pointer goes through `CP_RB0_WPTR`) and interrupts, the RLC safe mode and idle waits of `hw_fini`. Without `constants_init` and the clear-state defaults the engine will not draw.
+- `shader_engines` / `sh_per_se` (2 / 1 by default) come from the video BIOS in the driver (`amdgpu_atombios_get_gfx_info`); they only bound the RLC serdes wait here. The raster configuration is the golden value of the table.
+- The SMC is assumed to be running already (the card's firmware started it; `vegam_start_smu` only starts it if it is not): a card where it is not gets `NotAnswering` and nothing is written to its memory. The SMC firmware (`vegam_smc.bin`) is not loaded.
+- A `NOP` of count `0x3FFF` is a one-dword filler in the ring (that is how the driver pads), and the simulated card encodes that assumption.
+- The memory controller must let the SMC and the CP reach the video memory addresses used (VMID 0, inside the system aperture the card's firmware set), as for the video engine.
+- Nothing here was run on a real 9575.
 
 ## Radeon RX Vega M: UVD 6.3
 
