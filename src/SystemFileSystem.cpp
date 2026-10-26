@@ -21,6 +21,7 @@
 #include "FileSystem/Ext/ExtFileSystem.hpp"
 #include "FileSystem/Fat/FatFileSystem.hpp"
 #include "FileSystem/Ntfs/NtfsFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Hardware/StorageDevice/Partition/PartitionScanner.hpp"
 #include "Kernel/Thread.hpp"
 #include "Utility/String.hpp"
@@ -105,14 +106,16 @@ uint32_t SystemFileSystem::mount_device(uint32_t id, const SharedPointer<IStorag
     DirectoryEntry efi;   // a volume with an EFI folder is a boot partition
     const bool boot_volume = volume->file_system().stat("/EFI", &efi) == Status::Ok && efi.type == NodeType::Directory;
     String name(allocator_);
-    if (!info.label.view().trimmed().empty()) name.assign(info.label.view().trimmed());
-    else name.assign(boot_volume ? "EFI" : device->info().removable ? "Removable disk" : "Disk");
+    if (boot_volume) name.assign(layout::kEfiMountName);   // (the EFI partition is "/EFI" whatever its label says)
+    else if (!info.label.view().trimmed().empty()) name.assign(info.label.view().trimmed());
+    else name.assign(device->info().removable ? "Removable disk" : "Disk");
     FixedString<MountTable::kMaxName + 1> assigned;
     if (table_.mount(name.view(), SharedPointer<IVolume>(volume), id, &assigned)) {
       ++mounted;
       // The first writable volume that is built into the machine and is not a boot partition is what "/" shows; the others are folders in it.
-      if (!table_.has_root() && !boot_volume && !device->info().removable && !device->info().read_only && !info.read_only)
-        table_.set_root(assigned.view());
+      if (!table_.has_root() && !boot_volume && !device->info().removable && !device->info().read_only && !info.read_only &&
+          table_.set_root(assigned.view()))
+        layout::create_folders(volume->file_system());   // (the primary partition: Desktop, Windows, Linux, AppStore, ...)
     }
   }
   return mounted;
@@ -123,8 +126,7 @@ void SystemFileSystem::mount_fallback() {
   SharedPointer<MemoryVolume> volume = SharedPointer<MemoryVolume>::make(allocator_, allocator_);
   if (!volume) return;
   RamFileSystem& ram = volume->ram();
-  ram.create_directory("/Documents");
-  ram.create_directory("/Programs");
+  layout::create_folders(ram);   // (no primary partition: the layout lives in this folder instead of in "/")
   UniquePointer<IFile> file;
   uint64_t written = 0;
   if (ram.open_file("/Welcome.txt", OpenMode::CreateTruncate, &file) == Status::Ok)

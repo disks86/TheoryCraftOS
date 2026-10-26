@@ -20,6 +20,10 @@
 // partition, or a whole device without a partition table) on the storage devices, named by its label - and, on a machine with none, a
 // small filesystem in memory called "Memory" so the explorer still has something to show.
 //
+// The tree follows the layout in FileSystem/SystemLayout.hpp (docs/FileSystemLayout.md): "/" is the primary partition, the EFI system
+// partition is mounted as "/EFI", and the folders Desktop, Windows, Linux and AppStore are created on the primary partition. The memory
+// fallback has no primary partition, so it holds the same folders itself (under "/Memory").
+//
 // USB mass-storage devices come and go while the machine runs: poll() (or the service thread, start_service()) mounts the volumes of a
 // stick that was plugged in and unmounts those of one that was pulled out. Open files and folders on a volume that went away fail with
 // Status::NoMedia and the volume is freed when they are closed.

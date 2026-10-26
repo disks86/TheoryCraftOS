@@ -155,10 +155,10 @@ static void test_file_and_transactions() {
   {
     filesystem::RamFileSystem files(a);
     {
-      LocalDatabase database(a, &files, "/databases/system.db");
+      LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == DbStatus::Ok && database.persistent());
       filesystem::DirectoryEntry entry;
-      CHECK(files.stat("/databases/system.db", &entry) == filesystem::Status::Ok && entry.size > 8 && files.stat("/databases/system.db.tmp", &entry) == filesystem::Status::NotFound);
+      CHECK(files.stat("/AppStore/System/system.db", &entry) == filesystem::Status::Ok && entry.size > 8 && files.stat("/AppStore/System/system.db.tmp", &entry) == filesystem::Status::NotFound);
       Db db(a, database);
       CHECK(db.run("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)") == DbStatus::Ok && db.run("INSERT INTO t VALUES (1, 'one'), (2, 'two')") == DbStatus::Ok);
       CHECK(db.run("INSERT INTO t VALUES (2, 'again')") == DbStatus::Server);
@@ -185,40 +185,40 @@ static void test_file_and_transactions() {
     }
     // A new start reads the file back.
     {
-      LocalDatabase database(a, &files, "/databases/system.db");
+      LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == DbStatus::Ok && database.table_count() == 1);
       Db db(a, database);
       CHECK(db.run("SELECT id, v FROM t ORDER BY id") == DbStatus::Ok && db.rows->row_count() == 3 && db.rows->text(2, 1).equals("seven") && db.rows->text(0, 1).equals("one"));
     }
     // The file replaced halfway (only the .tmp is there): it is used.
-    CHECK(files.rename("/databases/system.db", "/databases/system.db.tmp") == filesystem::Status::Ok);
+    CHECK(files.rename("/AppStore/System/system.db", "/AppStore/System/system.db.tmp") == filesystem::Status::Ok);
     {
-      LocalDatabase database(a, &files, "/databases/system.db");
+      LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == DbStatus::Ok && database.table_count() == 1);
       filesystem::DirectoryEntry entry;
-      CHECK(files.stat("/databases/system.db", &entry) == filesystem::Status::Ok && files.stat("/databases/system.db.tmp", &entry) == filesystem::Status::NotFound);
+      CHECK(files.stat("/AppStore/System/system.db", &entry) == filesystem::Status::Ok && files.stat("/AppStore/System/system.db.tmp", &entry) == filesystem::Status::NotFound);
     }
     // A damaged file is set aside and a new database starts.
     {
       UniquePointer<filesystem::IFile> file;
-      CHECK(files.open_file("/databases/system.db", filesystem::OpenMode::ReadWrite, &file) == filesystem::Status::Ok);
+      CHECK(files.open_file("/AppStore/System/system.db", filesystem::OpenMode::ReadWrite, &file) == filesystem::Status::Ok);
       const uint8_t junk[] = {1, 2, 3, 4};
       uint64_t wrote = 0;
       CHECK(file->write(10, ConstByteView(junk, 4), &wrote) == filesystem::Status::Ok);
     }
     {
-      LocalDatabase database(a, &files, "/databases/system.db");
+      LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == DbStatus::Ok && database.table_count() == 0 && database.persistent() && database.problem().view().contains("damaged"));
       filesystem::DirectoryEntry entry;
-      CHECK(files.stat("/databases/system.db.corrupt", &entry) == filesystem::Status::Ok);
+      CHECK(files.stat("/AppStore/System/system.db.corrupt", &entry) == filesystem::Status::Ok);
     }
     // A short or empty file is damaged too.
     {
       UniquePointer<filesystem::IFile> file;
-      CHECK(files.open_file("/databases/system.db", filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+      CHECK(files.open_file("/AppStore/System/system.db", filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
     }
     {
-      LocalDatabase database(a, &files, "/databases/system.db");
+      LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == DbStatus::Ok && database.table_count() == 0);
     }
   }
@@ -229,7 +229,7 @@ static void test_driver_and_settings() {
   TestAllocator a;
   {
     filesystem::RamFileSystem files(a);
-    LocalDatabase database(a, &files, "/databases/system.db");
+    LocalDatabase database(a, &files, "/AppStore/System/system.db");
     CHECK(database.open() == DbStatus::Ok);
     LocalDriver driver(a);
     CHECK(driver.add_database("system", &database) && !driver.add_database("SYSTEM", &database));
@@ -269,12 +269,12 @@ static void test_driver_and_settings() {
   {
     filesystem::RamFileSystem files(a);
     {
-      LocalDatabase database(a, &files, "/databases/system.db");
+      LocalDatabase database(a, &files, "/AppStore/System/system.db");
       database.open();
       SystemSettings settings(a, database);
       CHECK(settings.set_int("boot", "count", 5));
     }
-    LocalDatabase database(a, &files, "/databases/system.db");
+    LocalDatabase database(a, &files, "/AppStore/System/system.db");
     database.open();
     SystemSettings settings(a, database);
     CHECK(settings.get_int("boot", "count", 0) == 5 && settings.set_int("boot", "count", 6) && settings.get_int("boot", "count", 0) == 6);
@@ -282,7 +282,7 @@ static void test_driver_and_settings() {
   // A file system that cannot be written to: the database works in memory.
   {
     filesystem::RamFileSystem files(a, 64);   // room for nothing
-    LocalDatabase database(a, &files, "/databases/system.db");
+    LocalDatabase database(a, &files, "/AppStore/System/system.db");
     CHECK(database.open() == DbStatus::Ok);
     SystemSettings settings(a, database);
     CHECK(settings.set_int("a", "b", 1) && settings.get_int("a", "b", 0) == 1 && !database.persistent() && !database.problem().empty());

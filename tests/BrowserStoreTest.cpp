@@ -90,7 +90,7 @@ int main() {
     filesystem::RamFileSystem files(a);
     uint64_t cookie_version = 0, storage_version = 0;
     {   // a first run: cookies and storage are made and saved
-      database::local::LocalDatabase database(a, &files, "/databases/system.db");
+      database::local::LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == database::DbStatus::Ok);
       BrowserStore store(a, database);
       CookieJar cookies(a);
@@ -132,7 +132,7 @@ int main() {
       CHECK(store.save(cookies, local, caches, workers, kNow));
     }
     {   // the next start: the same data
-      database::local::LocalDatabase database(a, &files, "/databases/system.db");
+      database::local::LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == database::DbStatus::Ok);
       BrowserStore store(a, database);
       CookieJar cookies(a);
@@ -176,7 +176,7 @@ int main() {
       CHECK(store.load(late, local2, caches2, workers2, kNow + 7200000, &nc, &ni) && nc == 0 && ni == 3);
     }
     {   // an empty jar and no storage: everything is gone from the table
-      database::local::LocalDatabase database(a, &files, "/databases/system.db");
+      database::local::LocalDatabase database(a, &files, "/AppStore/System/system.db");
       CHECK(database.open() == database::DbStatus::Ok);
       BrowserStore store(a, database);
       CookieJar cookies(a);

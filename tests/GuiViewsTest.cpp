@@ -6058,7 +6058,7 @@ static void test_calculator_session() {
   TestAllocator a;
   {
     filesystem::RamFileSystem fs(a);
-    database::local::LocalDatabase system_db(a, &fs, "/databases/system.db");
+    database::local::LocalDatabase system_db(a, &fs, "/AppStore/System/system.db");
     system_db.open();
     database::local::SystemSettings settings(a, system_db);
     {
@@ -6537,7 +6537,7 @@ static void test_database_query_system() {
   TestAllocator a;
   {
     filesystem::RamFileSystem fs(a);
-    database::local::LocalDatabase system_db(a, &fs, "/databases/system.db");
+    database::local::LocalDatabase system_db(a, &fs, "/AppStore/System/system.db");
     system_db.open();
     database::local::SystemSettings settings(a, system_db);
     database::local::LocalDriver driver(a);
@@ -6609,7 +6609,7 @@ static void test_session_restore() {
     make_file(fs, "/q.sql", "SELECT 1");
     CHECK(fs.create_directory("/docs") == filesystem::Status::Ok);
     filesystem::RamFileSystem system_files(a);
-    database::local::LocalDatabase system_db(a, &system_files, "/databases/system.db");
+    database::local::LocalDatabase system_db(a, &system_files, "/AppStore/System/system.db");
     system_db.open();
     database::local::SystemSettings settings(a, system_db);
     auto same = [](const Rect2D& x, const Rect2D& y) { return x.x == y.x && x.y == y.y && x.width == y.width && x.height == y.height; };
@@ -7442,7 +7442,7 @@ static void test_web_browser_tabs() {
 
     // A session keeps the browsers: a local page comes back loaded, a web address is only shown (nothing is fetched at start-up).
     filesystem::RamFileSystem system_files(a);
-    database::local::LocalDatabase system_db(a, &system_files, "/databases/system.db");
+    database::local::LocalDatabase system_db(a, &system_files, "/AppStore/System/system.db");
     system_db.open();
     database::local::SystemSettings settings(a, system_db);
     d.set_settings(&settings);

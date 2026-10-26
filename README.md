@@ -22,6 +22,13 @@ the system small to reason about and fast, at the cost of isolation. Memory safe
 memory is owned by allocator-backed containers and smart pointers and passed around as bounds-checked views (see
 [CLAUDE.md](CLAUDE.md)), and the decoders and parsers are tested with truncated and bit-flipped input under ASan/UBSan.
 
+## Filesystem layout
+
+`/` is the primary partition and `/EFI` the EFI partition. User files live in `/Desktop` (`Downloads`, `Documents`, `Pictures`, `Video`,
+`Audio`), `/Windows` is the root Windows processes see as `C:\`, `/Linux` is the root Linux processes see as `/`, and each application keeps
+its files in `/AppStore/<Application>` (the browser's cache is `/AppStore/Browser/Cache`). Details and rules in
+[docs/FileSystemLayout.md](docs/FileSystemLayout.md).
+
 ## Requirements
 
 `cmake`, `ninja` (or make), `x86_64-w64-mingw32-gcc/g++` (mingw-w64), `qemu-system-x86_64`, OVMF/edk2 firmware, `gdb`.

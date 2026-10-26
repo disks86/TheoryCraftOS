@@ -20,7 +20,7 @@
 // database through the DatabaseManager (the driver "system", URL system://localhost/system). The OS and its programs keep their settings in it
 // (see SystemSettings); the database query application can open it to look at the tables and change them.
 //
-//   LocalDatabase system_db(allocator, &files, "/databases/system.db");
+//   LocalDatabase system_db(allocator, &files, "/AppStore/System/system.db");
 //   system_db.open(&error);
 //   LocalDriver driver(allocator);
 //   driver.add_database("system", &system_db);
@@ -41,7 +41,7 @@ namespace database::local {
 // Statements are atomic: one that fails changes nothing. Safe to use from any thread.
 class LocalDatabase {
  public:
-  // `files` may be nullptr: the tables are then only in memory. The file system and `path` ("/databases/system.db") must stay valid.
+  // `files` may be nullptr: the tables are then only in memory. The file system and `path` ("/AppStore/System/system.db") must stay valid.
   LocalDatabase(allocators::IAllocator& allocator, filesystem::IFileSystem* files, StringView path)
       : allocator_(allocator), files_(files), path_(allocator), catalog_(allocator), transaction_(allocator), problem_(allocator) {
     path_.assign(path);

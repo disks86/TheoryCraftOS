@@ -87,6 +87,7 @@
 #include "AudioDemo.hpp"
 #include "ConcurrentDemo.hpp"
 #include "ContainerDemo.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "FileSystemDemo.hpp"
 #include "GraphicsDemo.hpp"
 #include "GuiDemo.hpp"
@@ -962,9 +963,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         }
       }
     }
-    // The system database: one file on the root volume (/databases/system.db) where the OS and its programs keep their settings; the database query
+    // The system database: one file on the root volume (/AppStore/System/system.db) where the OS and its programs keep their settings; the database query
     // window can open it too (system://localhost/system). Without a writable root volume it lives in memory for this session.
-    database::local::LocalDatabase system_database(shared_allocator, &explorer_files.file_system(), "/databases/system.db");
+    database::local::LocalDatabase system_database(shared_allocator, &explorer_files.file_system(), filesystem::layout::kSystemDatabase);
     system_database.open();
     // The root certificates for https: the bundle on the system volume (/certs/ca-bundle.pem) or else the one built into the image.
     crypto::TrustStore web_roots(shared_allocator);

@@ -24,6 +24,7 @@
 #include "FileSystem/Fat/FatFileSystem.hpp"
 #include "FileSystem/Path.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Hardware/StorageDevice/Partition/PartitionStorageDevice.hpp"
 
 using namespace filesystem;
@@ -80,6 +81,41 @@ static void test_paths() {
   CHECK(valid_name("a b.txt") && !valid_name("") && !valid_name(".") && !valid_name("..") && !valid_name(StringView("a\0b", 3)));
   char longname[300]; memset(longname, 'x', sizeof longname);
   CHECK(valid_name(StringView(longname, 255)) && !valid_name(StringView(longname, 256)));
+}
+
+static void test_layout() {
+  TestAllocator alloc;
+  {
+    RamFileSystem ram(alloc);
+    CHECK(layout::create_folders(ram));
+    for (const char* folder : layout::kFolders) {
+      DirectoryEntry entry;
+      CHECK_STATUS(ram.stat(folder, &entry), Status::Ok);
+      CHECK(entry.type == NodeType::Directory);
+    }
+    // again: what is there stays
+    UniquePointer<IFile> file;
+    CHECK_STATUS(ram.open_file("/Desktop/Downloads/a.bin", OpenMode::CreateTruncate, &file), Status::Ok);
+    file.reset();
+    CHECK(layout::create_folders(ram));
+    DirectoryEntry kept;
+    CHECK_STATUS(ram.stat("/Desktop/Downloads/a.bin", &kept), Status::Ok);
+
+    String path(alloc);
+    CHECK(layout::app_store_path(&path, "Browser", "Cache") && path.view().equals("/AppStore/Browser/Cache"));
+    CHECK(layout::app_store_path(&path, "Browser") && path.view().equals("/AppStore/Browser"));
+    CHECK(!layout::app_store_path(&path, "") && !layout::app_store_path(&path, ".."));
+    CHECK_STATUS(layout::create_app_folder(ram, "Browser", alloc), Status::Ok);
+    CHECK_STATUS(layout::create_app_folder(ram, "Browser", alloc), Status::Ok);
+    CHECK_STATUS(ram.create_directory("/AppStore/Browser/Cache"), Status::Ok);
+    CHECK_STATUS(layout::create_app_folder(ram, "..", alloc), Status::InvalidPath);
+
+    RamFileSystem bare(alloc);   // a medium without the parent folders still works: "/AppStore" is made on demand
+    CHECK_STATUS(layout::create_app_folder(bare, "Notes", alloc), Status::Ok);
+    DirectoryEntry made;
+    CHECK_STATUS(bare.stat("/AppStore/Notes", &made), Status::Ok);
+  }
+  CHECK(alloc.live == 0);
 }
 
 static void test_ram() {
@@ -755,6 +791,7 @@ int main() {
   test_times();
   test_paths();
   test_ram();
+  test_layout();
   test_fat(FatImage::F12, 512, "FAT12");
   test_fat(FatImage::F16, 512, "FAT16");
   test_fat(FatImage::F32, 512, "FAT32");

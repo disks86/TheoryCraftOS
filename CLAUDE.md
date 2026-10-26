@@ -13,6 +13,17 @@ Write new code so that memory errors cannot happen, not so that they are unlikel
 - Keep every `reinterpret_cast` in one small helper with a comment saying why it is safe (alignment, lifetime), and don't scatter casts through logic code.
 - New decoders and parsers need truncation and bit-flip cases in their host tests. Run them with `tests/run_host_tests.sh <TestName>`, which builds with ASan and UBSan, and fix any sanitizer report.
 
+## Filesystem layout
+
+The system filesystem has a fixed layout: `/` is the primary partition, `/EFI` the EFI partition, `/Desktop` (with `Downloads`, `Documents`,
+`Pictures`, `Video` and `Audio`) the user's files, `/Windows` and `/Linux` the roots of Windows and Linux processes, and `/AppStore/<App>` the
+files each application keeps. See [docs/FileSystemLayout.md](docs/FileSystemLayout.md) and `src/FileSystem/SystemLayout.hpp`.
+
+- Use the constants and helpers in `filesystem::layout` for these places; do not spell the paths out.
+- Browser downloads go to `/Desktop/Downloads`, documents to `/Desktop/Documents`, and so on. An application keeps its own files (cache,
+  settings, state) under `/AppStore/<Application>/` and nowhere else.
+- Do not add top-level folders to `/`. If something does not fit, extend the layout doc and `SystemLayout.hpp` in the same change.
+
 ## Delegating routine work to a local model
 
 When possible, use Ollama with the `qwen3-coder-next` model (the `mcp__ollama__*` tools, e.g. `generate` or `chat`) for routine work:

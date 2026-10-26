@@ -391,6 +391,13 @@ static void test_system_file_system() {
     // nothing at start-up: the memory filesystem
     CHECK(!files.from_storage() && list(fs, "/").size() == 1 && has(list(fs, "/"), "Memory"));
     CHECK(read_text(fs, "/Memory/Welcome.txt").size() > 10);
+    {   // (no primary partition: the standard folders are in the memory volume)
+      DirectoryEntry entry;
+      CHECK_STATUS(fs.stat("/Memory/Desktop/Downloads", &entry), Status::Ok);
+      CHECK_STATUS(fs.stat("/Memory/Windows", &entry), Status::Ok);
+      CHECK_STATUS(fs.stat("/Memory/Linux", &entry), Status::Ok);
+      CHECK_STATUS(fs.stat("/Memory/AppStore", &entry), Status::Ok);
+    }
     CHECK(files.poll() == 0);
 
     // a stick is plugged in: its volume appears under its label
