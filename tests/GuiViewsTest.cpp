@@ -2277,6 +2277,44 @@ static void test_wireless_menu() {
 }
 
 // Display Settings is no longer in the Start menu: it is in the menu of the Displays group of the computer manager's hardware tree.
+// The Start menu has a search box that is focused as soon as the menu opens: typing filters the entries (fuzzy, ignoring case) and Enter runs the first match.
+static void test_start_menu_search() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    Window& w = d.window();
+    CHECK(MenuPopup::fuzzy_match("", "Paint") && MenuPopup::fuzzy_match("pnt", "Paint") && MenuPopup::fuzzy_match("MEDIA", "Media Player"));
+    CHECK(!MenuPopup::fuzzy_match("tnp", "Paint") && !MenuPopup::fuzzy_match("paintx", "Paint"));
+
+    d.start_button().toggle_menu();
+    CHECK(d.start_button().open() && w.popup());
+    const uint32_t full_height = w.popup()->bounds().height;
+    type_char(w, 't');
+    type_char(w, 'e');
+    type_char(w, 'x');                                       // typed straight into the search box
+    w.render();
+    CHECK(d.start_button().open() && w.popup()->bounds().height == full_height);   // the menu keeps its size while filtered
+    press(w, hardware::key::kBackspace);
+    press(w, hardware::key::kBackspace);
+    press(w, hardware::key::kBackspace);
+    CHECK(d.start_button().open());
+    type_char(w, 'C');
+    type_char(w, 'A');
+    type_char(w, 'L');                                       // "Calculator" is the first (and only) match
+    const uint32_t before = d.calculator_count();
+    press(w, hardware::key::kEnter);
+    CHECK(!d.start_button().open() && d.calculator_count() == before + 1);
+
+    // Reopened, the search box is empty again.
+    d.start_button().toggle_menu();
+    CHECK(d.start_button().open());
+    press(w, hardware::key::kEscape);
+    CHECK(!d.start_button().open());
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_display_settings_entry() {
   TestAllocator a;
   {
@@ -7542,6 +7580,7 @@ int main() {
   test_network_properties();
   test_wireless_properties();
   test_wireless_menu();
+  test_start_menu_search();
   test_display_settings_entry();
   test_text_editor();
   test_notepad();

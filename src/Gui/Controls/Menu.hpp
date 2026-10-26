@@ -93,13 +93,20 @@ class Menu {
 // The drop-down part of a menu (a popup).
 class MenuPopup final : public Control {
  public:
-  static constexpr int32_t kRowHeight = 20, kSeparatorHeight = 8;
+  static constexpr int32_t kRowHeight = 20, kSeparatorHeight = 8, kSearchHeight = 28;
 
-  MenuPopup(allocators::IAllocator& allocator, MenuHost& host) : Control(allocator), host_(host) {}
+  MenuPopup(allocators::IAllocator& allocator, MenuHost& host) : Control(allocator), host_(host), query_(allocator) {}
   void set_min_width(int32_t width) { min_width_ = width; }
   // `armed_`: a menu opened by a mouse press ignores the release of that press until the pointer has moved, so a click that opens it at
   // the pointer cannot also choose an item.
-  void show(Menu* menu) { menu_ = menu; highlighted_ = -1; armed_ = false; }
+  void show(Menu* menu) { menu_ = menu; highlighted_ = -1; armed_ = false; query_.clear(); }
+  // A search box along the bottom that is always focused: typing filters the items (case-insensitive, fuzzy: the typed letters must appear in
+  // the item's text in that order, not necessarily next to each other), Backspace erases, Enter runs the highlighted item or else the first
+  // match. Separators are hidden while something is typed.
+  void set_searchable(bool searchable) { searchable_ = searchable; }
+  StringView query() const { return query_.view(); }
+  // True if `text` contains the letters of `query` in order, ignoring case. An empty query matches everything.
+  static bool fuzzy_match(StringView query, StringView text);
   void paint(Painter& painter) override;
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
@@ -110,6 +117,9 @@ class MenuPopup final : public Control {
   Size default_size() const override;
 
  private:
+  bool visible(uint32_t index) const;
+  int32_t row_height(uint32_t index) const;
+  void edit_query(bool erase, char c);
   int32_t item_at(int32_t y) const;
   int32_t row_top(int32_t index) const;
   void step(int32_t direction, int32_t from);
@@ -120,6 +130,8 @@ class MenuPopup final : public Control {
   Menu* menu_ = nullptr;
   int32_t highlighted_ = -1;
   bool armed_ = false;
+  bool searchable_ = false;
+  String query_;
 };
 
 class MenuBar : public Control, public MenuHost {

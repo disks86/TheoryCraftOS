@@ -93,6 +93,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.set_size(76, 0);
   start_.set_direction(MenuButton::Direction::Up);
   start_.set_menu_min_width(200);
+  start_.set_searchable(true);
   start_.menu().add_item("File Explorer", {&Desktop::on_explorer, this});
   start_.menu().add_item("Computer Manager", {&Desktop::on_computer_manager, this});
   start_.menu().add_item("Text Editor", {&Desktop::on_text_editor, this});

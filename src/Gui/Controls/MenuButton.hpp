@@ -33,6 +33,8 @@ class MenuButton : public Control, public MenuHost {
   Menu& menu() { return menu_; }
   void set_direction(Direction d) { UiGuard lock(this); direction_ = d; }
   void set_menu_min_width(int32_t width) { UiGuard lock(this); popup_.set_min_width(width); }
+  // Adds a search box to the bottom of the menu that filters its items as you type (see MenuPopup::set_searchable).
+  void set_searchable(bool searchable) { UiGuard lock(this); popup_.set_searchable(searchable); }
   bool open() const { return open_; }
   // Opens the menu, or closes it if it is open (the keyboard shortcut of the desktop's Start button).
   void toggle_menu() { if (open_) close_menu(); else open_menu(); }

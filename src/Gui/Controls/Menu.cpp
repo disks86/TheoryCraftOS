@@ -59,15 +59,36 @@ MenuItem* Menu::add_separator() { return add(StringView(), StringView(), true, {
 
 // --- MenuPopup -----------------------------------------------------------------
 
+namespace {
+char lower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c; }
+}  // namespace
+
+bool MenuPopup::fuzzy_match(StringView query, StringView text) {
+  uint64_t q = 0;
+  for (uint64_t i = 0; i < text.size() && q < query.size(); ++i)
+    if (lower(text[i]) == lower(query[q])) ++q;
+  return q == query.size();
+}
+
+bool MenuPopup::visible(uint32_t index) const {
+  const MenuItem* it = menu_ ? menu_->item(index) : nullptr;
+  if (!it) return false;
+  if (query_.empty()) return true;
+  return !it->separator && fuzzy_match(query_.view(), it->text.view());
+}
+
+int32_t MenuPopup::row_height(uint32_t index) const { return menu_->item(index)->separator ? kSeparatorHeight : kRowHeight; }
+
 Size MenuPopup::default_size() const {
   int32_t text = 0, shortcut = 0, height = 4;
-  for (uint32_t i = 0; menu_ && i < menu_->item_count(); ++i) {
+  for (uint32_t i = 0; menu_ && i < menu_->item_count(); ++i) {  // the size of the whole menu: it does not shrink while filtered
     const MenuItem* it = menu_->item(i);
-    height += it->separator ? kSeparatorHeight : kRowHeight;
+    height += row_height(i);
     const int32_t t = Painter::text_width(it->text.view()), s = Painter::text_width(it->shortcut.view());
     if (t > text) text = t;
     if (s > shortcut) shortcut = s;
   }
+  if (searchable_) height += kSearchHeight;
   int32_t width = 26 + text + (shortcut ? 24 + shortcut : 0) + 14;
   if (width < min_width_) width = min_width_;
   return {width, height};
@@ -75,7 +96,8 @@ Size MenuPopup::default_size() const {
 
 int32_t MenuPopup::row_top(int32_t index) const {
   int32_t y = 2;
-  for (int32_t i = 0; i < index; ++i) y += menu_->item(static_cast<uint32_t>(i))->separator ? kSeparatorHeight : kRowHeight;
+  for (int32_t i = 0; i < index; ++i)
+    if (visible(static_cast<uint32_t>(i))) y += row_height(static_cast<uint32_t>(i));
   return y;
 }
 
@@ -83,7 +105,8 @@ int32_t MenuPopup::item_at(int32_t y) const {
   if (!menu_) return -1;
   int32_t top = 2;
   for (uint32_t i = 0; i < menu_->item_count(); ++i) {
-    const int32_t h = menu_->item(i)->separator ? kSeparatorHeight : kRowHeight;
+    if (!visible(i)) continue;
+    const int32_t h = row_height(i);
     if (y >= top && y < top + h) return static_cast<int32_t>(i);
     top += h;
   }
@@ -97,6 +120,7 @@ void MenuPopup::paint(Painter& painter) {
   painter.fill(all, t.face);
   painter.bevel(all, false);
   for (uint32_t i = 0; i < menu_->item_count(); ++i) {
+    if (!visible(i)) continue;
     const MenuItem* it = menu_->item(i);
     const int32_t top = row_top(static_cast<int32_t>(i)), w = static_cast<int32_t>(bounds_.width);
     if (it->separator) {
@@ -116,6 +140,24 @@ void MenuPopup::paint(Painter& painter) {
     }
     painter.text(22, ty, it->text.view(), color);
     if (!it->shortcut.empty()) painter.text(w - 10 - Painter::text_width(it->shortcut.view()), ty, it->shortcut.view(), color);
+  }
+  if (searchable_) {
+    const int32_t w = static_cast<int32_t>(bounds_.width), top = static_cast<int32_t>(bounds_.height) - kSearchHeight;
+    const Rect2D box{4, top + 2, static_cast<uint32_t>(w - 8), static_cast<uint32_t>(kSearchHeight - 6)};
+    painter.fill(box, t.field);
+    painter.bevel(box, true);
+    const int32_t ty = box.y + (static_cast<int32_t>(box.height) - Painter::kGlyphHeight) / 2;
+    if (query_.empty()) {
+      painter.text(box.x + 4, ty, StringView("Type to search"), t.disabled_text);
+      painter.line(box.x + 3, ty, box.x + 3, ty + Painter::kGlyphHeight - 1, t.text);  // the caret
+    } else {
+      const int32_t room = (static_cast<int32_t>(box.width) - 10) / Painter::kGlyphWidth;  // keeps the end of long text in view
+      const StringView q = query_.view();
+      const StringView shown = static_cast<int32_t>(q.size()) > room && room > 0 ? q.substr(q.size() - static_cast<uint64_t>(room)) : q;
+      painter.text(box.x + 4, ty, shown, t.text);
+      const int32_t cx = box.x + 4 + Painter::text_width(shown);
+      painter.line(cx, ty, cx, ty + Painter::kGlyphHeight - 1, t.text);
+    }
   }
 }
 
@@ -147,7 +189,7 @@ void MenuPopup::step(int32_t direction, int32_t from) {
   for (int32_t tries = 0; tries < n; ++tries) {
     i = (i + direction + n) % n;
     const MenuItem* it = menu_->item(static_cast<uint32_t>(i));
-    if (!it->separator && it->enabled()) {
+    if (visible(static_cast<uint32_t>(i)) && !it->separator && it->enabled()) {
       highlighted_ = i;
       invalidate();
       return;
@@ -155,8 +197,32 @@ void MenuPopup::step(int32_t direction, int32_t from) {
   }
 }
 
+void MenuPopup::edit_query(bool erase, char c) {
+  if (erase) {
+    if (query_.empty()) return;
+    query_.truncate(query_.size() - 1);
+  } else if (!query_.push_back(c)) {
+    return;
+  }
+  highlighted_ = -1;
+  step(1, -1);  // the first match is the one Enter runs
+  invalidate();
+}
+
 bool MenuPopup::on_key(const KeyArgs& args) {
   using namespace hardware;
+  if (searchable_) {
+    const bool printable = args.character >= 0x20 && args.character < 0x7F && !(args.modifiers & (modifier::kControl | modifier::kLeftAlt | modifier::kRightAlt));
+    if (args.usage == key::kBackspace) {
+      edit_query(true, 0);
+      return true;
+    }
+    if (printable && (args.usage != key::kSpace || !query_.empty())) {  // a first space still runs the highlighted item
+      edit_query(false, args.character);
+      return true;
+    }
+    if (args.usage == key::kEnter && highlighted_ < 0 && !query_.empty()) step(1, -1);
+  }
   switch (args.usage) {
     case key::kDown:
       step(1, highlighted_);
