@@ -11478,6 +11478,536 @@ const char* worker_prelude() { return kWorkerPrelude; }
 const char* dom_prelude() { return kDomPrelude; }
 const char* web_assembly_prelude() { return kWebAssemblyPrelude; }
 const char* module_prelude() { return kModulePrelude; }
+// The SVG DOM: SVGElement and its subclasses (one for each element), the animated attributes (x, width, viewBox, transform ...), lengths, lists, getBBox(),
+// getTotalLength() and the rest. Written in script on top of the native SVGElement (the elements in the SVG namespace get their prototype from __register_svg_tag).
+const char kSvgPrelude[] = R"JSPRELUDE((function (g) {
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false }); };
+  var accessor = function (proto, name, get, set) { Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  var iface = function (name, parent, init) {
+    var C = function () { if (!init) throw new TypeError('Illegal constructor'); if (!(this instanceof C)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function."); init.apply(this, arguments); };
+    Object.defineProperty(C, 'name', { value: name });
+    C.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+    def(C.prototype, 'constructor', C);
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    if (parent) Object.setPrototypeOf(C, parent);
+    def(g, name, C);
+    return C;
+  };
+  var constants = function (C, table) { Object.keys(table).forEach(function (k) { Object.defineProperty(C, k, { value: table[k], enumerable: true }); Object.defineProperty(C.prototype, k, { value: table[k], enumerable: true }); }); };
+  var num = function (v) { v = Number(v); return v === v ? v : 0; };
+  var indexSize = function (what) { return new DOMException('The index provided is out of range.', 'IndexSizeError'); };
+  // a per-element store (the animated values must be the same object each time they are read)
+  var store = function (el) { if (!el.__svg) hide(el, '__svg', {}); return el.__svg; };
+
+  // ---------------------------------------------------------------------------------------------------------------------------- numbers, strings, lengths
+  var SVGNumber = iface('SVGNumber', null, function () { hide(this, '__n', { v: 0 }); });
+  accessor(SVGNumber.prototype, 'value', function () { var n = this.__n; return n.el ? num(n.el.getAttribute(n.name)) : n.v; }, function (v) { var n = this.__n; n.v = Number(v); if (n.el) n.el.setAttribute(n.name, String(Number(v))); });
+  var LT = { SVG_LENGTHTYPE_UNKNOWN: 0, SVG_LENGTHTYPE_NUMBER: 1, SVG_LENGTHTYPE_PERCENTAGE: 2, SVG_LENGTHTYPE_EMS: 3, SVG_LENGTHTYPE_EXS: 4, SVG_LENGTHTYPE_PX: 5, SVG_LENGTHTYPE_CM: 6, SVG_LENGTHTYPE_MM: 7, SVG_LENGTHTYPE_IN: 8, SVG_LENGTHTYPE_PT: 9, SVG_LENGTHTYPE_PC: 10 };
+  var UNIT = [null, '', '%', 'em', 'ex', 'px', 'cm', 'mm', 'in', 'pt', 'pc'], PX = { 5: 1, 6: 96 / 2.54, 7: 96 / 25.4, 8: 96, 9: 4 / 3, 10: 16 };
+  function parseLength(text) {
+    var m = /^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(%|[a-zA-Z]*)\s*$/.exec(String(text));
+    if (!m) return { v: 0, u: 1 };
+    var u = UNIT.indexOf(m[2].toLowerCase());
+    return { v: parseFloat(m[1]), u: u < 0 ? 0 : u };
+  }
+  var SVGLength = iface('SVGLength', null, function () { hide(this, '__l', { v: 0, u: 1 }); });
+  constants(SVGLength, LT);
+  function lengthState(l) { var s = l.__l; if (s.el) { var t = s.el.getAttribute(s.name); if (t !== null) { var p = parseLength(t); s.v = p.v; s.u = p.u; } else { s.v = s.d || 0; s.u = 1; } } return s; }
+  function lengthWrite(l) { var s = l.__l; if (s.el) s.el.setAttribute(s.name, s.v + (UNIT[s.u] || '')); }
+  function reference(el, name) {   // what a percentage is of: the size of the viewport (or of the viewBox)
+    var svg = el, vb;
+    while (svg && !(svg.localName === 'svg' && svg.namespaceURI === SVGNS)) svg = svg.parentNode;
+    if (!svg) return 0;
+    vb = svg.getAttribute('viewBox');
+    var horizontal = /^(x|cx|dx|x1|x2|width|rx|refX|fx|markerWidth)$/.test(name), vertical = /^(y|cy|dy|y1|y2|height|ry|refY|fy|markerHeight)$/.test(name);
+    var box = vb ? vb.trim().split(/[\s,]+/).map(Number) : null;
+    var w = box ? box[2] : parseLength(svg.getAttribute('width') || '0').v, h = box ? box[3] : parseLength(svg.getAttribute('height') || '0').v;
+    return horizontal ? w : vertical ? h : Math.sqrt((w * w + h * h) / 2);
+  }
+  function lengthValue(l) {
+    var s = lengthState(l), f = PX[s.u];
+    if (s.u === 2) return s.v / 100 * (s.el ? reference(s.el, s.name) : 0);
+    if (s.u === 3) return s.v * 16;
+    if (s.u === 4) return s.v * 8;
+    return f ? s.v * f : s.v;
+  }
+  accessor(SVGLength.prototype, 'value', function () { return lengthValue(this); }, function (v) { var s = lengthState(this); v = Number(v); if (v !== v || v === Infinity || v === -Infinity) throw new TypeError("Failed to set the 'value' property on 'SVGLength': The provided float value is non-finite."); if (s.u === 2 || s.u === 3 || s.u === 4) { s.v = v; s.u = 1; } else s.v = s.u === 1 ? v : v / (PX[s.u] || 1); lengthWrite(this); });
+  accessor(SVGLength.prototype, 'valueInSpecifiedUnits', function () { return lengthState(this).v; }, function (v) { lengthState(this).v = Number(v); lengthWrite(this); });
+  accessor(SVGLength.prototype, 'unitType', function () { return lengthState(this).u; });
+  accessor(SVGLength.prototype, 'valueAsString', function () { var s = lengthState(this); return s.v + (UNIT[s.u] || ''); }, function (v) { var p = parseLength(v); if (!/^\s*[+-]?[\d.]/.test(String(v))) throw new DOMException("Failed to set the 'valueAsString' property on 'SVGLength': The value provided ('" + v + "') is invalid.", 'SyntaxError'); var s = lengthState(this); s.v = p.v; s.u = p.u; lengthWrite(this); });
+  def(SVGLength.prototype, 'newValueSpecifiedUnits', function (type, v) { var s = lengthState(this); s.u = type; s.v = Number(v); lengthWrite(this); });
+  def(SVGLength.prototype, 'convertToSpecifiedUnits', function (type) { var s = lengthState(this), px = lengthValue(this); s.u = type; s.v = type === 1 ? px : px / (PX[type] || 1); lengthWrite(this); });
+  var SVGAnimatedLength = iface('SVGAnimatedLength'), SVGAnimatedNumber = iface('SVGAnimatedNumber'), SVGAnimatedString = iface('SVGAnimatedString'), SVGAnimatedBoolean = iface('SVGAnimatedBoolean'), SVGAnimatedEnumeration = iface('SVGAnimatedEnumeration'), SVGAnimatedInteger = iface('SVGAnimatedInteger');
+  [SVGAnimatedLength, SVGAnimatedNumber, SVGAnimatedString, SVGAnimatedBoolean, SVGAnimatedEnumeration, SVGAnimatedInteger].forEach(function (C) { accessor(C.prototype, 'baseVal', function () { return this.__b; }, C === SVGAnimatedLength ? undefined : function (v) { this.__set(v); }); accessor(C.prototype, 'animVal', function () { return this.__a; }); });
+  function animatedLength(el, name, fallback) {
+    var st = store(el), key = 'L:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedLength.prototype), b = Object.create(SVGLength.prototype), v = Object.create(SVGLength.prototype);
+    hide(b, '__l', { v: fallback || 0, d: fallback || 0, u: 1, el: el, name: name });
+    hide(v, '__l', { v: fallback || 0, d: fallback || 0, u: 1, el: el, name: name });
+    hide(a, '__b', b); hide(a, '__a', v);
+    return (st[key] = a);
+  }
+  function animatedNumber(el, name, fallback) {
+    var st = store(el), key = 'N:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedNumber.prototype), read = function () { var t = el.getAttribute(name); return t === null ? (fallback || 0) : num(t); };
+    accessor(a, 'baseVal', read, function (v) { el.setAttribute(name, String(Number(v))); });
+    accessor(a, 'animVal', read);
+    return (st[key] = a);
+  }
+  function animatedString(el, name, attrNames) {
+    var st = store(el), key = 'S:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedString.prototype), names = attrNames || [name];
+    var read = function () { for (var i = 0; i < names.length; i++) { var t = el.getAttribute(names[i]); if (t !== null) return t; } return ''; };
+    hide(a, '__b', undefined); hide(a, '__a', undefined);
+    Object.defineProperty(a, '__b', { get: read }); Object.defineProperty(a, '__a', { get: read });
+    hide(a, '__set', function (v) { el.setAttribute(names[0], String(v)); });
+    // baseVal is a string: reading it gives the text, setting it (through the animated object) writes the attribute
+    accessor(a, 'baseVal', read, function (v) { el.setAttribute(names[0], String(v)); });
+    return (st[key] = a);
+  }
+  function animatedEnum(el, name, table, fallback) {
+    var st = store(el), key = 'E:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedEnumeration.prototype), read = function () { var t = el.getAttribute(name); var i = table.indexOf(t); return i < 0 ? fallback : i + 1; };
+    Object.defineProperty(a, '__b', { get: read }); Object.defineProperty(a, '__a', { get: read });
+    hide(a, '__set', function (v) { v = Number(v); if (v >= 1 && v <= table.length) el.setAttribute(name, table[v - 1]); else throw new TypeError("Failed to set the value: The enumeration value provided (" + v + ") is not valid."); });
+    return (st[key] = a);
+  }
+  function animatedBoolean(el, name) {
+    var st = store(el), key = 'B:' + name;
+    if (st[key]) return st[key];
+    var a = Object.create(SVGAnimatedBoolean.prototype), read = function () { return el.getAttribute(name) === 'true'; };
+    Object.defineProperty(a, '__b', { get: read }); Object.defineProperty(a, '__a', { get: read });
+    hide(a, '__set', function (v) { el.setAttribute(name, v ? 'true' : 'false'); });
+    return (st[key] = a);
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- lists
+  var SVGLengthList = iface('SVGLengthList'), SVGNumberList = iface('SVGNumberList'), SVGStringList = iface('SVGStringList'), SVGPointList = iface('SVGPointList');
+  var SVGAnimatedLengthList = iface('SVGAnimatedLengthList'), SVGAnimatedNumberList = iface('SVGAnimatedNumberList');
+  function listProto(C, make) {
+    var P = C.prototype;
+    accessor(P, 'numberOfItems', function () { return this.__items().length; });
+    accessor(P, 'length', function () { return this.__items().length; });
+    def(P, 'getItem', function (i) { var a = this.__items(); i = i >>> 0; if (i >= a.length) throw indexSize(); return a[i]; });
+    def(P, 'initialize', function (v) { this.__write([v]); return v; });
+    def(P, 'clear', function () { this.__write([]); });
+    def(P, 'appendItem', function (v) { var a = this.__items().slice(); a.push(v); this.__write(a); return v; });
+    def(P, 'insertItemBefore', function (v, i) { var a = this.__items().slice(); a.splice(Math.min(i >>> 0, a.length), 0, v); this.__write(a); return v; });
+    def(P, 'replaceItem', function (v, i) { var a = this.__items().slice(); i = i >>> 0; if (i >= a.length) throw indexSize(); a[i] = v; this.__write(a); return v; });
+    def(P, 'removeItem', function (i) { var a = this.__items().slice(); i = i >>> 0; if (i >= a.length) throw indexSize(); var r = a.splice(i, 1)[0]; this.__write(a); return r; });
+  }
+  [SVGLengthList, SVGNumberList, SVGStringList, SVGPointList].forEach(function (C) { listProto(C); });
+  function lengthList(el, name) {
+    var st = store(el), key = 'LL:' + name;
+    if (st[key]) return st[key];
+    var list = Object.create(SVGLengthList.prototype), animated = Object.create(SVGAnimatedLengthList.prototype);
+    hide(list, '__items', function () { var t = el.getAttribute(name); if (!t) return []; return t.trim().split(/[\s,]+/).filter(Boolean).map(function (s, i) { var l = Object.create(SVGLength.prototype); var p = parseLength(s); hide(l, '__l', { v: p.v, u: p.u }); return l; }); });
+    hide(list, '__write', function (items) { el.setAttribute(name, items.map(function (l) { return l.valueAsString; }).join(' ')); });
+    hide(animated, '__b', list); hide(animated, '__a', list);
+    accessor(SVGAnimatedLengthList.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedLengthList.prototype, 'animVal', function () { return this.__a; });
+    return (st[key] = animated);
+  }
+  function numberList(el, name) {
+    var st = store(el), key = 'NL:' + name;
+    if (st[key]) return st[key];
+    var list = Object.create(SVGNumberList.prototype), animated = Object.create(SVGAnimatedNumberList.prototype);
+    hide(list, '__items', function () { var t = el.getAttribute(name); if (!t) return []; return t.trim().split(/[\s,]+/).filter(Boolean).map(function (s) { var n = Object.create(SVGNumber.prototype); hide(n, '__n', { v: num(s) }); return n; }); });
+    hide(list, '__write', function (items) { el.setAttribute(name, items.map(function (n) { return n.value; }).join(' ')); });
+    hide(animated, '__b', list); hide(animated, '__a', list);
+    accessor(SVGAnimatedNumberList.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedNumberList.prototype, 'animVal', function () { return this.__a; });
+    return (st[key] = animated);
+  }
+  function emptyStringList() { var l = Object.create(SVGStringList.prototype); hide(l, '__items', function () { return []; }); hide(l, '__write', function () { }); return l; }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- matrices, transforms
+  if (!g.DOMPointReadOnly.prototype.matrixTransform) def(g.DOMPointReadOnly.prototype, 'matrixTransform', function (m) {
+    m = m && m.__m ? m.__m : new g.DOMMatrix(m).__m;
+    var x = this.x, y = this.y, z = this.z, w = this.w;
+    return new g.DOMPoint(m[0] * x + m[4] * y + m[8] * z + m[12] * w, m[1] * x + m[5] * y + m[9] * z + m[13] * w, m[2] * x + m[6] * y + m[10] * z + m[14] * w, m[3] * x + m[7] * y + m[11] * z + m[15] * w);
+  });
+  def(g, 'SVGPoint', g.DOMPoint); def(g, 'SVGMatrix', g.DOMMatrix); def(g, 'SVGRect', g.DOMRect);
+  var TT = { SVG_TRANSFORM_UNKNOWN: 0, SVG_TRANSFORM_MATRIX: 1, SVG_TRANSFORM_TRANSLATE: 2, SVG_TRANSFORM_SCALE: 3, SVG_TRANSFORM_ROTATE: 4, SVG_TRANSFORM_SKEWX: 5, SVG_TRANSFORM_SKEWY: 6 };
+  var SVGTransform = iface('SVGTransform', null, function () { hide(this, '__t', { type: 1, m: new g.DOMMatrix(), angle: 0 }); });
+  constants(SVGTransform, TT);
+  accessor(SVGTransform.prototype, 'type', function () { return this.__t.type; });
+  accessor(SVGTransform.prototype, 'matrix', function () { return this.__t.m; });
+  accessor(SVGTransform.prototype, 'angle', function () { return this.__t.angle; });
+  function changed(t) { if (t.__owner) t.__owner(); }
+  def(SVGTransform.prototype, 'setMatrix', function (m) { var t = this.__t; t.type = 1; t.m = new g.DOMMatrix([m.a, m.b, m.c, m.d, m.e, m.f]); t.angle = 0; changed(this); });
+  def(SVGTransform.prototype, 'setTranslate', function (x, y) { var t = this.__t; t.type = 2; t.m = new g.DOMMatrix().translate(num(x), num(y)); t.angle = 0; t.args = [num(x), num(y)]; changed(this); });
+  def(SVGTransform.prototype, 'setScale', function (x, y) { var t = this.__t; t.type = 3; t.m = new g.DOMMatrix().scale(num(x), num(y)); t.angle = 0; t.args = [num(x), num(y)]; changed(this); });
+  def(SVGTransform.prototype, 'setRotate', function (a, cx, cy) { var t = this.__t; t.type = 4; a = num(a); cx = num(cx); cy = num(cy); t.m = new g.DOMMatrix().translate(cx, cy).rotate(a).translate(-cx, -cy); t.angle = a; t.args = [a, cx, cy]; changed(this); });
+  def(SVGTransform.prototype, 'setSkewX', function (a) { var t = this.__t; t.type = 5; a = num(a); t.m = new g.DOMMatrix().skewX(a); t.angle = a; t.args = [a]; changed(this); });
+  def(SVGTransform.prototype, 'setSkewY', function (a) { var t = this.__t; t.type = 6; a = num(a); t.m = new g.DOMMatrix().skewY(a); t.angle = a; t.args = [a]; changed(this); });
+  function transformText(t) {
+    var x = t.args || [];
+    switch (t.type) {
+      case 2: return 'translate(' + x[0] + ' ' + x[1] + ')';
+      case 3: return 'scale(' + x[0] + ' ' + x[1] + ')';
+      case 4: return x[1] || x[2] ? 'rotate(' + x[0] + ' ' + x[1] + ' ' + x[2] + ')' : 'rotate(' + x[0] + ')';
+      case 5: return 'skewX(' + x[0] + ')';
+      case 6: return 'skewY(' + x[0] + ')';
+      default: var m = t.m; return 'matrix(' + [m.a, m.b, m.c, m.d, m.e, m.f].join(' ') + ')';
+    }
+  }
+  function parseTransforms(text) {
+    var out = [], re = /([a-zA-Z]+)\s*\(([^)]*)\)/g, f;
+    while ((f = re.exec(text || ''))) {
+      var a = f[2].trim().split(/[\s,]+/).filter(Boolean).map(Number), t = Object.create(SVGTransform.prototype);
+      hide(t, '__t', { type: 1, m: new g.DOMMatrix(), angle: 0 });
+      switch (f[1]) {
+        case 'translate': t.setTranslate(a[0], a.length > 1 ? a[1] : 0); break;
+        case 'scale': t.setScale(a[0], a.length > 1 ? a[1] : a[0]); break;
+        case 'rotate': t.setRotate(a[0], a[1], a[2]); break;
+        case 'skewX': t.setSkewX(a[0]); break;
+        case 'skewY': t.setSkewY(a[0]); break;
+        case 'matrix': if (a.length === 6) t.setMatrix({ a: a[0], b: a[1], c: a[2], d: a[3], e: a[4], f: a[5] }); break;
+      }
+      out.push(t);
+    }
+    return out;
+  }
+  var SVGTransformList = iface('SVGTransformList'), SVGAnimatedTransformList = iface('SVGAnimatedTransformList');
+  listProto(SVGTransformList);
+  def(SVGTransformList.prototype, 'createSVGTransformFromMatrix', function (m) { var t = new SVGTransform(); t.setMatrix(m); return t; });
+  def(SVGTransformList.prototype, 'consolidate', function () {
+    var a = this.__items(); if (!a.length) return null;
+    var m = new g.DOMMatrix(); a.forEach(function (t) { m = m.multiply(t.matrix); });
+    var t = new SVGTransform(); t.setMatrix(m); this.__write([t]); return t;
+  });
+  accessor(SVGAnimatedTransformList.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedTransformList.prototype, 'animVal', function () { return this.__a; });
+  function transformList(el) {
+    var st = store(el);
+    if (st.T) return st.T;
+    var list = Object.create(SVGTransformList.prototype), animated = Object.create(SVGAnimatedTransformList.prototype), cache = null, cached = null;
+    hide(list, '__items', function () {
+      var text = el.getAttribute('transform') || '';
+      if (cached !== text) { cache = parseTransforms(text); cached = text; cache.forEach(function (t) { hide(t, '__owner', function () { write(cache); }); }); }
+      return cache;
+    });
+    var write = function (items) { var text = items.map(function (t) { return transformText(t.__t); }).join(' '); cached = text; cache = items; el.setAttribute('transform', text); items.forEach(function (t) { hide(t, '__owner', function () { write(cache); }); }); };
+    hide(list, '__write', write);
+    hide(animated, '__b', list); hide(animated, '__a', list);
+    return (st.T = animated);
+  }
+  function transformOf(el) {
+    var m = new g.DOMMatrix(), a = el.getAttribute && el.getAttribute('transform');
+    if (a) parseTransforms(a).forEach(function (t) { m = m.multiply(t.matrix); });
+    return m;
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- viewBox
+  var SVGAnimatedRect = iface('SVGAnimatedRect');
+  accessor(SVGAnimatedRect.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedRect.prototype, 'animVal', function () { return this.__a; });
+  function viewBox(el) {
+    var st = store(el);
+    if (st.VB) return st.VB;
+    var a = Object.create(SVGAnimatedRect.prototype), rect = Object.create(g.DOMRect.prototype);
+    var read = function () { var t = el.getAttribute('viewBox'); if (!t) return [0, 0, 0, 0]; var v = t.trim().split(/[\s,]+/).map(Number); return v.length === 4 && v.every(function (n) { return n === n; }) ? v : [0, 0, 0, 0]; };
+    var write = function (i, v) { var r = read(); r[i] = Number(v); el.setAttribute('viewBox', r.join(' ')); };
+    hide(rect, '__r', [0, 0, 0, 0]);
+    [['x', 0], ['y', 1], ['width', 2], ['height', 3]].forEach(function (f) { accessor(rect, f[0], function () { return read()[f[1]]; }, function (v) { write(f[1], v); }); });
+    hide(a, '__b', rect); hide(a, '__a', rect);
+    return (st.VB = a);
+  }
+  var SVGPreserveAspectRatio = iface('SVGPreserveAspectRatio'), SVGAnimatedPreserveAspectRatio = iface('SVGAnimatedPreserveAspectRatio');
+  constants(SVGPreserveAspectRatio, { SVG_PRESERVEASPECTRATIO_UNKNOWN: 0, SVG_PRESERVEASPECTRATIO_NONE: 1, SVG_PRESERVEASPECTRATIO_XMINYMIN: 2, SVG_PRESERVEASPECTRATIO_XMAXYMAX: 10, SVG_MEETORSLICE_MEET: 1, SVG_MEETORSLICE_SLICE: 2 });
+  var ALIGNS = ['none', 'xMinYMin', 'xMidYMin', 'xMaxYMin', 'xMinYMid', 'xMidYMid', 'xMaxYMid', 'xMinYMax', 'xMidYMax', 'xMaxYMax'];
+  function preserveAspectRatio(el) {
+    var st = store(el);
+    if (st.PAR) return st.PAR;
+    var a = Object.create(SVGAnimatedPreserveAspectRatio.prototype), p = Object.create(SVGPreserveAspectRatio.prototype);
+    var read = function () { var w = (el.getAttribute('preserveAspectRatio') || 'xMidYMid meet').trim().split(/\s+/); if (w[0] === 'defer') w.shift(); return { align: Math.max(ALIGNS.indexOf(w[0]), 0) + 1 || 6, slice: w[1] === 'slice' }; };
+    var write = function (align, slice) { el.setAttribute('preserveAspectRatio', ALIGNS[align - 1] + (slice ? ' slice' : ' meet')); };
+    accessor(p, 'align', function () { return read().align; }, function (v) { write(Number(v), read().slice); });
+    accessor(p, 'meetOrSlice', function () { return read().slice ? 2 : 1; }, function (v) { write(read().align, Number(v) === 2); });
+    accessor(SVGAnimatedPreserveAspectRatio.prototype, 'baseVal', function () { return this.__b; }); accessor(SVGAnimatedPreserveAspectRatio.prototype, 'animVal', function () { return this.__a; });
+    hide(a, '__b', p); hide(a, '__a', p);
+    return (st.PAR = a);
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- geometry of shapes
+  function parseNumbers(t) { return (t || '').trim().split(/[\s,]+/).filter(Boolean).map(Number); }
+  function lengthAttr(el, name, fallback) { var t = el.getAttribute(name); if (t === null) return fallback || 0; var p = parseLength(t), l = Object.create(SVGLength.prototype); hide(l, '__l', { v: p.v, u: p.u, el: el, name: name }); return lengthValue(l); }
+  function arcPoints(x1, y1, rx, ry, rot, large, sweep, x2, y2, out) {
+    if (rx === 0 || ry === 0) { out.push([x2, y2]); return; }
+    rx = Math.abs(rx); ry = Math.abs(ry);
+    var phi = rot * Math.PI / 180, c = Math.cos(phi), s = Math.sin(phi);
+    var dx = (x1 - x2) / 2, dy = (y1 - y2) / 2, x1p = c * dx + s * dy, y1p = -s * dx + c * dy;
+    var lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
+    if (lam > 1) { var sq = Math.sqrt(lam); rx *= sq; ry *= sq; }
+    var num2 = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p, den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    var co = (large === sweep ? -1 : 1) * Math.sqrt(Math.max(0, num2 / den));
+    var cxp = co * rx * y1p / ry, cyp = -co * ry * x1p / rx;
+    var cx = c * cxp - s * cyp + (x1 + x2) / 2, cy = s * cxp + c * cyp + (y1 + y2) / 2;
+    var ang = function (ux, uy, vx, vy) { var a = Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy); return a; };
+    var th1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry), dth = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    if (!sweep && dth > 0) dth -= 2 * Math.PI; else if (sweep && dth < 0) dth += 2 * Math.PI;
+    var n = Math.max(8, Math.ceil(Math.abs(dth) / (Math.PI / 24)));
+    for (var i = 1; i <= n; i++) { var t = th1 + dth * i / n, ex = rx * Math.cos(t), ey = ry * Math.sin(t); out.push([c * ex - s * ey + cx, s * ex + c * ey + cy]); }
+  }
+  // the points along a path (curves cut into short lines): an array of subpaths, each an array of [x, y] and a closed flag
+  function flattenPath(d) {
+    var re = /([MmLlHhVvCcSsQqTtAaZz])|([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)/g, tokens = [], m;
+    while ((m = re.exec(d || ''))) tokens.push(m[1] || Number(m[2]));
+    var subs = [], cur = null, x = 0, y = 0, sx = 0, sy = 0, i = 0, cmd = '', lastC = null, lastQ = null;
+    var take = function (n) { var a = []; for (var k = 0; k < n; k++) { if (typeof tokens[i] !== 'number') return null; a.push(tokens[i++]); } return a; };
+    var start = function (px, py) { cur = { pts: [[px, py]], closed: false }; subs.push(cur); };
+    while (i < tokens.length) {
+      if (typeof tokens[i] === 'string') cmd = tokens[i++];
+      else if (cmd === 'M') cmd = 'L'; else if (cmd === 'm') cmd = 'l';
+      if (!cmd) break;
+      var rel = cmd === cmd.toLowerCase(), C = cmd.toUpperCase(), a;
+      if (C === 'Z') { if (cur) { if (x !== sx || y !== sy) cur.pts.push([sx, sy]); cur.closed = true; x = sx; y = sy; start(x, y); cur.pts.length = 1; } lastC = lastQ = null; continue; }
+      var n = { M: 2, L: 2, H: 1, V: 1, C: 6, S: 4, Q: 4, T: 2, A: 7 }[C];
+      a = take(n); if (!a) break;
+      var ox = rel ? x : 0, oy = rel ? y : 0;
+      if (!cur && C !== 'M') start(x, y);
+      switch (C) {
+        case 'M': x = a[0] + ox; y = a[1] + oy; sx = x; sy = y; start(x, y); lastC = lastQ = null; break;
+        case 'L': x = a[0] + ox; y = a[1] + oy; cur.pts.push([x, y]); lastC = lastQ = null; break;
+        case 'H': x = a[0] + (rel ? x : 0); cur.pts.push([x, y]); lastC = lastQ = null; break;
+        case 'V': y = a[0] + (rel ? y : 0); cur.pts.push([x, y]); lastC = lastQ = null; break;
+        case 'C': case 'S': {
+          var x1, y1, x2, y2, ex, ey;
+          if (C === 'C') { x1 = a[0] + ox; y1 = a[1] + oy; x2 = a[2] + ox; y2 = a[3] + oy; ex = a[4] + ox; ey = a[5] + oy; }
+          else { x1 = lastC ? 2 * x - lastC[0] : x; y1 = lastC ? 2 * y - lastC[1] : y; x2 = a[0] + ox; y2 = a[1] + oy; ex = a[2] + ox; ey = a[3] + oy; }
+          for (var k = 1; k <= 24; k++) { var t = k / 24, u = 1 - t; cur.pts.push([u * u * u * x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * ex, u * u * u * y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * ey]); }
+          lastC = [x2, y2]; lastQ = null; x = ex; y = ey; break;
+        }
+        case 'Q': case 'T': {
+          var qx, qy, qex, qey;
+          if (C === 'Q') { qx = a[0] + ox; qy = a[1] + oy; qex = a[2] + ox; qey = a[3] + oy; }
+          else { qx = lastQ ? 2 * x - lastQ[0] : x; qy = lastQ ? 2 * y - lastQ[1] : y; qex = a[0] + ox; qey = a[1] + oy; }
+          for (var q = 1; q <= 20; q++) { var tq = q / 20, uq = 1 - tq; cur.pts.push([uq * uq * x + 2 * uq * tq * qx + tq * tq * qex, uq * uq * y + 2 * uq * tq * qy + tq * tq * qey]); }
+          lastQ = [qx, qy]; lastC = null; x = qex; y = qey; break;
+        }
+        case 'A': { var ax = a[5] + ox, ay = a[6] + oy; arcPoints(x, y, a[0], a[1], a[2], !!a[3], !!a[4], ax, ay, cur.pts); x = ax; y = ay; lastC = lastQ = null; break; }
+      }
+    }
+    return subs.filter(function (s) { return s.pts.length > 1 || s.closed; });
+  }
+  function pointsOf(el) {   // the outline of a basic shape or path as subpaths
+    var n = el.localName;
+    if (n === 'rect') {
+      var x = lengthAttr(el, 'x'), y = lengthAttr(el, 'y'), w = lengthAttr(el, 'width'), h = lengthAttr(el, 'height'), rx = lengthAttr(el, 'rx', -1), ry = lengthAttr(el, 'ry', -1);
+      if (rx < 0 && ry < 0) rx = ry = 0; else if (rx < 0) rx = ry; else if (ry < 0) ry = rx;
+      rx = Math.min(rx, w / 2); ry = Math.min(ry, h / 2);
+      if (!rx || !ry) return [{ pts: [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]], closed: true }];
+      var d = 'M' + (x + rx) + ' ' + y + 'H' + (x + w - rx) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + (x + w) + ' ' + (y + ry) + 'V' + (y + h - ry) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + (x + w - rx) + ' ' + (y + h) + 'H' + (x + rx) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + x + ' ' + (y + h - ry) + 'V' + (y + ry) + 'A' + rx + ' ' + ry + ' 0 0 1 ' + (x + rx) + ' ' + y + 'Z';
+      return flattenPath(d);
+    }
+    if (n === 'circle' || n === 'ellipse') {
+      var cx = lengthAttr(el, 'cx'), cy = lengthAttr(el, 'cy'), rx2 = n === 'circle' ? lengthAttr(el, 'r') : lengthAttr(el, 'rx'), ry2 = n === 'circle' ? rx2 : lengthAttr(el, 'ry');
+      var pts = [];
+      for (var k = 0; k <= 64; k++) { var t = k / 64 * 2 * Math.PI; pts.push([cx + rx2 * Math.cos(t), cy + ry2 * Math.sin(t)]); }
+      return [{ pts: pts, closed: true }];
+    }
+    if (n === 'line') return [{ pts: [[lengthAttr(el, 'x1'), lengthAttr(el, 'y1')], [lengthAttr(el, 'x2'), lengthAttr(el, 'y2')]], closed: false }];
+    if (n === 'polyline' || n === 'polygon') {
+      var v = parseNumbers(el.getAttribute('points')), ps = [];
+      for (var j = 0; j + 1 < v.length; j += 2) ps.push([v[j], v[j + 1]]);
+      if (n === 'polygon' && ps.length) ps.push(ps[0]);
+      return ps.length ? [{ pts: ps, closed: n === 'polygon' }] : [];
+    }
+    if (n === 'path') return flattenPath(el.getAttribute('d'));
+    return [];
+  }
+  function polylineLength(subs) { var total = 0; subs.forEach(function (s) { for (var i = 1; i < s.pts.length; i++) total += Math.hypot(s.pts[i][0] - s.pts[i - 1][0], s.pts[i][1] - s.pts[i - 1][1]); }); return total; }
+  function boxOfPoints(subs) {
+    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    subs.forEach(function (s) { s.pts.forEach(function (p) { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }); });
+    return x0 === Infinity ? new g.DOMRect(0, 0, 0, 0) : new g.DOMRect(x0, y0, x1 - x0, y1 - y0);
+  }
+  function transformBox(box, m) {
+    var xs = [], ys = [];
+    [[box.x, box.y], [box.x + box.width, box.y], [box.x, box.y + box.height], [box.x + box.width, box.y + box.height]].forEach(function (p) { var q = new g.DOMPoint(p[0], p[1]).matrixTransform(m); xs.push(q.x); ys.push(q.y); });
+    var x0 = Math.min.apply(null, xs), y0 = Math.min.apply(null, ys);
+    return new g.DOMRect(x0, y0, Math.max.apply(null, xs) - x0, Math.max.apply(null, ys) - y0);
+  }
+  var SHAPES = { rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1, path: 1 };
+  function bboxOf(el) {
+    var n = el.localName;
+    if (SHAPES[n]) return boxOfPoints(pointsOf(el));
+    if (n === 'text' || n === 'tspan') { var len = (el.textContent || '').length; return new g.DOMRect(lengthAttr(el, 'x'), lengthAttr(el, 'y') - 12, len * 8, 16); }
+    if (n === 'image' || n === 'foreignObject' || n === 'use') return new g.DOMRect(lengthAttr(el, 'x'), lengthAttr(el, 'y'), lengthAttr(el, 'width'), lengthAttr(el, 'height'));
+    var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, any = false;
+    for (var c = el.firstElementChild; c; c = c.nextElementSibling) {
+      if (c.namespaceURI !== SVGNS || !/^(g|svg|a|switch|rect|circle|ellipse|line|polyline|polygon|path|text|tspan|image|use|foreignObject)$/.test(c.localName)) continue;
+      var b = transformBox(bboxOf(c), transformOf(c));
+      x0 = Math.min(x0, b.x); y0 = Math.min(y0, b.y); x1 = Math.max(x1, b.x + b.width); y1 = Math.max(y1, b.y + b.height); any = true;
+    }
+    return any ? new g.DOMRect(x0, y0, x1 - x0, y1 - y0) : new g.DOMRect(0, 0, 0, 0);
+  }
+  function totalLength(el) {
+    var n = el.localName;
+    if (n === 'circle') return 2 * Math.PI * lengthAttr(el, 'r');
+    if (n === 'ellipse') { var a = lengthAttr(el, 'rx'), b = lengthAttr(el, 'ry'), h = (a - b) * (a - b) / ((a + b) * (a + b) || 1); return Math.PI * (a + b) * (1 + 3 * h / (10 + Math.sqrt(4 - 3 * h))); }
+    return polylineLength(pointsOf(el));
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------------------- interfaces
+  var SVGElement = g.SVGElement;
+  var SVGGraphicsElement = iface('SVGGraphicsElement', SVGElement), SVGGeometryElement = iface('SVGGeometryElement', SVGGraphicsElement), SVGSVGElement = iface('SVGSVGElement', SVGGraphicsElement);
+  var SVGTextContentElement = iface('SVGTextContentElement', SVGGraphicsElement), SVGTextPositioningElement = iface('SVGTextPositioningElement', SVGTextContentElement);
+  var SVGGradientElement = iface('SVGGradientElement', SVGElement);
+  var table = [
+    ['SVGGElement', 'g', SVGGraphicsElement], ['SVGDefsElement', 'defs', SVGGraphicsElement], ['SVGSwitchElement', 'switch', SVGGraphicsElement], ['SVGUseElement', 'use', SVGGraphicsElement],
+    ['SVGImageElement', 'image', SVGGraphicsElement], ['SVGForeignObjectElement', 'foreignObject', SVGGraphicsElement], ['SVGAElement', 'a', SVGGraphicsElement],
+    ['SVGRectElement', 'rect', SVGGeometryElement], ['SVGCircleElement', 'circle', SVGGeometryElement], ['SVGEllipseElement', 'ellipse', SVGGeometryElement], ['SVGLineElement', 'line', SVGGeometryElement],
+    ['SVGPolylineElement', 'polyline', SVGGeometryElement], ['SVGPolygonElement', 'polygon', SVGGeometryElement], ['SVGPathElement', 'path', SVGGeometryElement],
+    ['SVGTextElement', 'text', SVGTextPositioningElement], ['SVGTSpanElement', 'tspan', SVGTextPositioningElement], ['SVGTextPathElement', 'textPath', SVGTextContentElement],
+    ['SVGLinearGradientElement', 'linearGradient', SVGGradientElement], ['SVGRadialGradientElement', 'radialGradient', SVGGradientElement], ['SVGStopElement', 'stop', SVGElement],
+    ['SVGClipPathElement', 'clipPath', SVGElement], ['SVGMaskElement', 'mask', SVGElement], ['SVGPatternElement', 'pattern', SVGElement], ['SVGMarkerElement', 'marker', SVGElement],
+    ['SVGSymbolElement', 'symbol', SVGElement], ['SVGFilterElement', 'filter', SVGElement], ['SVGTitleElement', 'title', SVGElement], ['SVGDescElement', 'desc', SVGElement],
+    ['SVGMetadataElement', 'metadata', SVGElement], ['SVGStyleElement', 'style', SVGElement], ['SVGScriptElement', 'script', SVGElement], ['SVGViewElement', 'view', SVGElement]
+  ];
+  var protos = { svg: SVGSVGElement.prototype, g: null };
+  table.forEach(function (row) { var C = iface(row[0], row[2]); protos[row[1]] = C.prototype; });
+  Object.keys(protos).forEach(function (name) { if (protos[name]) g.__register_svg_tag(name, protos[name]); });
+  g.__register_svg_tag('svg', SVGSVGElement.prototype);
+  function lengthsFor(proto, names, defaults) { names.forEach(function (n) { accessor(proto, n, function () { return animatedLength(this, n, defaults && defaults[n]); }); }); }
+  lengthsFor(SVGSVGElement.prototype, ['x', 'y', 'width', 'height']);
+  lengthsFor(protos.rect, ['x', 'y', 'width', 'height', 'rx', 'ry']);
+  lengthsFor(protos.circle, ['cx', 'cy', 'r']);
+  lengthsFor(protos.ellipse, ['cx', 'cy', 'rx', 'ry']);
+  lengthsFor(protos.line, ['x1', 'y1', 'x2', 'y2']);
+  ['image', 'foreignObject', 'use', 'mask', 'pattern', 'filter'].forEach(function (n) { lengthsFor(protos[n], ['x', 'y', 'width', 'height']); });
+  lengthsFor(protos.marker, ['refX', 'refY', 'markerWidth', 'markerHeight'], { markerWidth: 3, markerHeight: 3 });
+  lengthsFor(protos.linearGradient, ['x1', 'y1', 'x2', 'y2']);
+  lengthsFor(protos.radialGradient, ['cx', 'cy', 'r', 'fx', 'fy', 'fr']);
+  [SVGTextPositioningElement.prototype].forEach(function (p) { ['x', 'y', 'dx', 'dy'].forEach(function (n) { accessor(p, n, function () { return lengthList(this, n); }); }); accessor(p, 'rotate', function () { return numberList(this, 'rotate'); }); });
+  accessor(SVGGeometryElement.prototype, 'pathLength', function () { return animatedNumber(this, 'pathLength'); });
+  accessor(protos.stop, 'offset', function () { return animatedNumber(this, 'offset'); });
+  accessor(SVGElement.prototype, 'className', function () { return animatedString(this, 'class'); });
+  accessor(SVGElement.prototype, 'ownerSVGElement', function () { for (var p = this.parentNode; p; p = p.parentNode) if (p.localName === 'svg' && p.namespaceURI === SVGNS) return p; return null; });
+  accessor(SVGElement.prototype, 'viewportElement', function () { return this.ownerSVGElement; });
+  accessor(SVGGraphicsElement.prototype, 'transform', function () { return transformList(this); });
+  accessor(SVGGraphicsElement.prototype, 'nearestViewportElement', function () { return this.ownerSVGElement; });
+  accessor(SVGGraphicsElement.prototype, 'farthestViewportElement', function () { var r = null; for (var p = this.parentNode; p; p = p.parentNode) if (p.localName === 'svg' && p.namespaceURI === SVGNS) r = p; return r; });
+  ['requiredExtensions', 'systemLanguage'].forEach(function (n) { accessor(SVGGraphicsElement.prototype, n, function () { return emptyStringList(); }); });
+  ['use', 'image', 'a', 'pattern', 'linearGradient', 'radialGradient', 'textPath', 'script', 'view'].forEach(function (n) { if (protos[n]) accessor(protos[n], 'href', function () { return animatedString(this, 'href', ['href', 'xlink:href']); }); });
+  accessor(protos.a, 'target', function () { return animatedString(this, 'target'); });
+  accessor(protos.a, 'download', function () { return this.getAttribute('download') || ''; }, function (v) { this.setAttribute('download', v); });
+  accessor(protos.a, 'rel', function () { return this.getAttribute('rel') || ''; }, function (v) { this.setAttribute('rel', v); });
+  accessor(SVGSVGElement.prototype, 'viewBox', function () { return viewBox(this); });
+  [SVGSVGElement.prototype, protos.image, protos.pattern, protos.marker, protos.symbol, protos.view].forEach(function (p) { if (p) accessor(p, 'preserveAspectRatio', function () { return preserveAspectRatio(this); }); });
+  [protos.pattern, protos.marker, protos.symbol, protos.view].forEach(function (p) { if (p) accessor(p, 'viewBox', function () { return viewBox(this); }); });
+  var UNITS = ['userSpaceOnUse', 'objectBoundingBox'];
+  accessor(SVGGradientElement.prototype, 'gradientUnits', function () { return animatedEnum(this, 'gradientUnits', UNITS, 2); });
+  accessor(SVGGradientElement.prototype, 'spreadMethod', function () { return animatedEnum(this, 'spreadMethod', ['pad', 'reflect', 'repeat'], 1); });
+  accessor(SVGGradientElement.prototype, 'gradientTransform', function () { var st = store(this); return st.GT || (st.GT = transformListFor(this, 'gradientTransform')); });
+  function transformListFor(el, name) { var a = Object.create(SVGAnimatedTransformList.prototype), real = transformList({ getAttribute: function () { return el.getAttribute(name); }, setAttribute: function (n, v) { el.setAttribute(name, v); }, __svg: {} }); return real; }
+  accessor(protos.pattern, 'patternUnits', function () { return animatedEnum(this, 'patternUnits', UNITS, 2); });
+  accessor(protos.pattern, 'patternContentUnits', function () { return animatedEnum(this, 'patternContentUnits', UNITS, 1); });
+  accessor(protos.mask, 'maskUnits', function () { return animatedEnum(this, 'maskUnits', UNITS, 2); });
+  accessor(protos.mask, 'maskContentUnits', function () { return animatedEnum(this, 'maskContentUnits', UNITS, 1); });
+  accessor(protos.clipPath, 'clipPathUnits', function () { return animatedEnum(this, 'clipPathUnits', UNITS, 1); });
+  accessor(protos.marker, 'markerUnits', function () { return animatedEnum(this, 'markerUnits', ['userSpaceOnUse', 'strokeWidth'], 2); });
+  accessor(SVGTextContentElement.prototype, 'textLength', function () { return animatedLength(this, 'textLength'); });
+  accessor(SVGTextContentElement.prototype, 'lengthAdjust', function () { return animatedEnum(this, 'lengthAdjust', ['spacing', 'spacingAndGlyphs'], 1); });
+  constants(SVGGradientElement, { SVG_SPREADMETHOD_UNKNOWN: 0, SVG_SPREADMETHOD_PAD: 1, SVG_SPREADMETHOD_REFLECT: 2, SVG_SPREADMETHOD_REPEAT: 3 });
+  constants(SVGTextContentElement, { LENGTHADJUST_UNKNOWN: 0, LENGTHADJUST_SPACING: 1, LENGTHADJUST_SPACINGANDGLYPHS: 2 });
+  constants(g.SVGMarkerElement, { SVG_MARKERUNITS_UNKNOWN: 0, SVG_MARKERUNITS_USERSPACEONUSE: 1, SVG_MARKERUNITS_STROKEWIDTH: 2, SVG_MARKER_ORIENT_UNKNOWN: 0, SVG_MARKER_ORIENT_AUTO: 1, SVG_MARKER_ORIENT_ANGLE: 2 });
+
+  // methods
+  def(SVGGraphicsElement.prototype, 'getBBox', function () { return bboxOf(this); });
+  def(SVGGraphicsElement.prototype, 'getCTM', function () {
+    var chain = [];
+    for (var e = this; e && e.namespaceURI === SVGNS; e = e.parentNode) { if (e.localName === 'svg' && !(e.parentNode && e.parentNode.namespaceURI === SVGNS)) { chain.push(e); break; } chain.push(e); }
+    var m = new g.DOMMatrix();
+    for (var i = chain.length - 1; i >= 0; i--) {
+      var e2 = chain[i];
+      if (e2.localName === 'svg' && i !== chain.length - 1 || (e2.localName === 'svg' && e2 === chain[chain.length - 1] && false)) m = m.translate(lengthAttr(e2, 'x'), lengthAttr(e2, 'y'));
+      m = m.multiply(transformOf(e2));
+    }
+    return m;
+  });
+  def(SVGGraphicsElement.prototype, 'getScreenCTM', function () { return this.getCTM(); });
+  def(SVGGeometryElement.prototype, 'getTotalLength', function () { return totalLength(this); });
+  def(SVGGeometryElement.prototype, 'getPointAtLength', function (distance) {
+    var n = this.localName, total = totalLength(this);
+    distance = Math.max(0, Math.min(Number(distance) || 0, total));
+    if (n === 'circle' || n === 'ellipse') {
+      var cx = lengthAttr(this, 'cx'), cy = lengthAttr(this, 'cy'), rx = n === 'circle' ? lengthAttr(this, 'r') : lengthAttr(this, 'rx'), ry = n === 'circle' ? rx : lengthAttr(this, 'ry'), t = total ? distance / total * 2 * Math.PI : 0;
+      return new g.DOMPoint(cx + rx * Math.cos(t), cy + ry * Math.sin(t));
+    }
+    var subs = pointsOf(this), left = distance, last = null;
+    for (var s = 0; s < subs.length; s++) {
+      var pts = subs[s].pts;
+      for (var i = 1; i < pts.length; i++) {
+        var seg = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+        last = pts[i];
+        if (left <= seg) { var f = seg ? left / seg : 0; return new g.DOMPoint(pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * f, pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * f); }
+        left -= seg;
+      }
+    }
+    return last ? new g.DOMPoint(last[0], last[1]) : new g.DOMPoint(0, 0);
+  });
+  function inside(subs, x, y) {   // non-zero winding of the outline (open subpaths are closed)
+    var wn = 0;
+    subs.forEach(function (s) {
+      var p = s.pts;
+      for (var i = 0; i < p.length; i++) {
+        var a = p[i], b = p[(i + 1) % p.length];
+        if (a[1] <= y) { if (b[1] > y && (b[0] - a[0]) * (y - a[1]) - (x - a[0]) * (b[1] - a[1]) > 0) wn++; }
+        else if (b[1] <= y && (b[0] - a[0]) * (y - a[1]) - (x - a[0]) * (b[1] - a[1]) < 0) wn--;
+      }
+    });
+    return wn !== 0;
+  }
+  def(SVGGeometryElement.prototype, 'isPointInFill', function (pt) { return inside(pointsOf(this), pt.x, pt.y); });
+  def(SVGGeometryElement.prototype, 'isPointInStroke', function (pt) {
+    var width = num(parseFloat(this.getAttribute('stroke-width') || '1')) / 2, found = false;
+    pointsOf(this).forEach(function (s) { for (var i = 1; i < s.pts.length && !found; i++) { var a = s.pts[i - 1], b = s.pts[i], dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy, t = l2 ? Math.max(0, Math.min(1, ((pt.x - a[0]) * dx + (pt.y - a[1]) * dy) / l2)) : 0; if (Math.hypot(pt.x - a[0] - t * dx, pt.y - a[1] - t * dy) <= width) found = true; } });
+    return found;
+  });
+  def(SVGSVGElement.prototype, 'createSVGNumber', function () { return new SVGNumber(); });
+  def(SVGSVGElement.prototype, 'createSVGLength', function () { return new SVGLength(); });
+  def(SVGSVGElement.prototype, 'createSVGPoint', function () { return new g.DOMPoint(); });
+  def(SVGSVGElement.prototype, 'createSVGMatrix', function () { return new g.DOMMatrix(); });
+  def(SVGSVGElement.prototype, 'createSVGRect', function () { return new g.DOMRect(); });
+  def(SVGSVGElement.prototype, 'createSVGTransform', function () { return new SVGTransform(); });
+  def(SVGSVGElement.prototype, 'createSVGTransformFromMatrix', function (m) { var t = new SVGTransform(); t.setMatrix(m); return t; });
+  def(SVGSVGElement.prototype, 'getElementById', function (id) { id = String(id); var all = this.querySelectorAll('*'); for (var i = 0; i < all.length; i++) if (all[i].getAttribute('id') === id) return all[i]; return null; });
+  def(SVGSVGElement.prototype, 'getCurrentTime', function () { return 0; });
+  def(SVGSVGElement.prototype, 'setCurrentTime', function () { });
+  def(SVGSVGElement.prototype, 'suspendRedraw', function () { return 1; });
+  def(SVGSVGElement.prototype, 'unsuspendRedraw', function () { });
+  def(SVGSVGElement.prototype, 'unsuspendRedrawAll', function () { });
+  def(SVGSVGElement.prototype, 'forceRedraw', function () { });
+  def(SVGSVGElement.prototype, 'pauseAnimations', function () { });
+  def(SVGSVGElement.prototype, 'unpauseAnimations', function () { });
+  def(SVGSVGElement.prototype, 'animationsPaused', function () { return false; });
+  def(SVGSVGElement.prototype, 'deselectAll', function () { });
+  accessor(SVGSVGElement.prototype, 'currentScale', function () { var s = store(this); return s.scale === undefined ? 1 : s.scale; }, function (v) { store(this).scale = Number(v); });
+  accessor(SVGSVGElement.prototype, 'currentTranslate', function () { var s = store(this); return s.translate || (s.translate = new g.DOMPoint()); });
+  accessor(SVGSVGElement.prototype, 'pixelUnitToMillimeterX', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'pixelUnitToMillimeterY', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'screenPixelToMillimeterX', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'screenPixelToMillimeterY', function () { return 0.2645833333; });
+  accessor(SVGSVGElement.prototype, 'useCurrentView', function () { return false; });
+  var textLen = function (el) { return (el.textContent || '').length; };
+  def(SVGTextContentElement.prototype, 'getNumberOfChars', function () { return textLen(this); });
+  def(SVGTextContentElement.prototype, 'getComputedTextLength', function () { return textLen(this) * 8; });
+  def(SVGTextContentElement.prototype, 'getSubStringLength', function (offset, count) { var n = textLen(this); offset = offset >>> 0; if (offset > n) throw indexSize(); return Math.max(0, Math.min(count >>> 0, n - offset)) * 8; });
+  def(SVGTextContentElement.prototype, 'getStartPositionOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return new g.DOMPoint(lengthAttr(this, 'x') + i * 8, lengthAttr(this, 'y')); });
+  def(SVGTextContentElement.prototype, 'getEndPositionOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return new g.DOMPoint(lengthAttr(this, 'x') + (i + 1) * 8, lengthAttr(this, 'y')); });
+  def(SVGTextContentElement.prototype, 'getExtentOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return new g.DOMRect(lengthAttr(this, 'x') + i * 8, lengthAttr(this, 'y') - 12, 8, 16); });
+  def(SVGTextContentElement.prototype, 'getRotationOfChar', function (i) { i = i >>> 0; if (i >= textLen(this)) throw indexSize(); return 0; });
+  def(SVGTextContentElement.prototype, 'getCharNumAtPosition', function (pt) { var i = Math.floor((pt.x - lengthAttr(this, 'x')) / 8); return i >= 0 && i < textLen(this) ? i : -1; });
+  def(SVGTextContentElement.prototype, 'selectSubString', function () { });
+}(globalThis));
+)JSPRELUDE";
+
+const char* svg_prelude() { return kSvgPrelude; }
+
 const char* finish_prelude() { return kFinishPrelude; }
 
 }  // namespace browser

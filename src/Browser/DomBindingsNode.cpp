@@ -82,6 +82,10 @@ const ReflectedAttribute kReflected[] = {
     {"noValidate", "novalidate", Reflect::Bool}, {"srcdoc", "srcdoc", Reflect::Str}, {"sandbox", "sandbox", Reflect::Str}, {"allow", "allow", Reflect::Str}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::Str},
 };
 
+// An element in the SVG namespace: some names are not the reflected attributes of HTML (className is an SVGAnimatedString there), the script's accessors answer.
+bool in_svg_namespace(const dom::Node* n) { return n->is_element() && n->ns_set && n->ns.view().equals("http://www.w3.org/2000/svg"); }
+bool svg_own_name(StringView js) { return js.equals("className") || js.equals("href") || js.equals("target") || js.equals("type") || js.equals("media") || js.equals("name") || js.equals("content") || js.equals("width") || js.equals("height") || js.equals("max") || js.equals("min") || js.equals("rel") || js.equals("download"); }
+
 const ReflectedAttribute* find_reflected(StringView js) {
   for (const ReflectedAttribute& r : kReflected)
     if (js.equals(r.js)) return &r;
@@ -608,6 +612,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     if (n->is_tag("button")) { *out = str_value(vm, "submit"); return true; }
   }
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return false;   // (token lists: the script's accessors)
+  if (in_svg_namespace(n) && svg_own_name(k)) return false;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     StringView v;
     const bool present = dom::get_attribute(n, r->attribute, &v);
@@ -741,6 +746,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     return done(dom::set_text_content(n, text.view()));
   }
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe"))) return HostClass::Set::NotHandled;
+  if (in_svg_namespace(n) && svg_own_name(k)) return HostClass::Set::NotHandled;
   if (const ReflectedAttribute* r = find_reflected(k)) {
     switch (r->kind) {
       case Reflect::Bool:
@@ -1647,6 +1653,19 @@ NATIVE(register_tag) {
   return true;
 }
 
+// __register_svg_tag(name, prototype): SVG elements with that local name get this prototype
+NATIVE(register_svg_tag) {
+  (void)self;
+  DomBindings::Impl& c = impl(vm);
+  JsString* name;
+  if (!vm.to_string(arg_at(args, argc, 0), &name) || !arg_at(args, argc, 1).is_object()) return false;
+  String key(vm.allocator());   // (the local name in lower case: the parser may have folded it)
+  for (uint64_t i = 0; i < name->length; ++i) key.push_back(name->data()[i] >= 'A' && name->data()[i] <= 'Z' ? static_cast<char>(name->data()[i] + 32) : name->data()[i]);
+  vm.define(c.svg_tag_protos, vm.intern(key.view()), args[1], 0);
+  *result = Value();
+  return true;
+}
+
 // `new MyElement()` for a class that extends HTMLElement: a document node whose tag was registered for a prototype in the chain
 JsObject* construct_element(void* user, JsObject* proto) {
   DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(user);
@@ -1676,6 +1695,7 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(g, "__watch_node", watch_node, 1);
   vm.define_native(g, "__take_mutations", take_mutations, 0);
   vm.define_native(g, "__register_tag", register_tag, 2);
+  vm.define_native(g, "__register_svg_tag", register_svg_tag, 2);
   vm.set_construct_hook(construct_element, &c);
   c.doc.set_insert_hook(script_inserted_hook, &c);
   vm.set_epilogue(mutation_epilogue, &c);
@@ -1782,7 +1802,10 @@ bool install_nodes(DomBindings::Impl& c) {
   make_class(c, "EventTarget", event_target_constructor, event_target);
   vm.define_native(ep, "attachShadow", el_attach_shadow, 1);
   make_class(c, "Element", illegal_constructor, ep);
-  make_class(c, "SVGElement", illegal_constructor, vm.new_object(ep));
+  c.svg_proto = vm.new_object(ep);
+  make_class(c, "SVGElement", illegal_constructor, c.svg_proto);
+  c.svg_tag_protos = vm.new_plain();
+  vm.define_named(g, "__svg_tag_protos", Value::make_object(c.svg_tag_protos), 0);
   make_class(c, "HTMLUnknownElement", illegal_constructor, vm.new_object(c.html_proto));
   {   // `window` is a Window, which is an EventTarget: addEventListener and the rest are inherited, as pages that patch Window.prototype expect
     JsObject* window_proto = vm.new_object(event_target);
