@@ -163,11 +163,16 @@ The firmware is `/firmware/vegam_uvd.bin` (linux-firmware, UVD 6.3, version 1.13
 (including the real firmware file) and covers the layout, the register values, the reset order, boot retries and failure, stop and restart, and every refused argument.
 
 What it does not do, and what is needed before a Vega M decodes anything:
-- **Power: the request is made; clocks are not.** `AmdSmu7` is the SMC's message interface ported from `smu7_smumgr.c` (message and result registers, the wait for the previous message, the argument), with the UVD
+- **Power and clock: both requests are made.** `AmdSmu7` is the SMC's message interface ported from `smu7_smumgr.c` (message and result registers, the wait for the previous message, the argument), with the UVD
   messages of `smu7_ppsmc.h` (`PPSMC_MSG_UVDPowerON` 0x61, `PPSMC_MSG_UVDPowerOFF` 0x60; `smu7_powerup_uvd`'s argument). `AmdUvd6VideoEngine` asks it to power the engine before the start and to power it down when the
   engine stops (only if the SMC said yes). An SMC that is not running (the result register stuck at zero, or reading all ones) gets nothing written and the engine is assumed powered; the start itself then shows whether it is.
-  `tests/AmdSmu7Test.cpp` runs the mailbox against a simulated SMC. What is still missing is clocks: amdgpu sets the engine's clocks through the SMC's DPM tables or the PLL (`vi_set_uvd_clocks`, via AtomBIOS), neither of
-  which exists here, so the engine runs at whatever clock the system firmware left.
+  `tests/AmdSmu7Test.cpp` runs the mailbox against a simulated SMC. The clock follows the power, the way `smu7_powergate_uvd(false)` does it (`AmdSmu7::uvd_dpm_enable`): the top UVD level becomes the boot level in the SMC's DPM table (the
+  table is found through the firmware header at SMC memory 0x20000 + 52; `UvdLevelCount` is byte 212 and `UvdBootLevel` byte 1648 of it - `offsetof` on the real `smu75_discrete.h` - in the big-endian dword that holds
+  them), `PPSMC_MSG_UVDDPM_SetEnabledMask` (0x12d) enables that one level only (the stable-pstate case; `set_clock_level(UvdLevel::Default)` leaves every level enabled and sends no mask) and
+  `PPSMC_MSG_UVDDPM_Enable` (0x154) switches DPM on; stopping sends `UVDDPM_Disable` (0x155) before the power-off. An SMC with no DPM table (its firmware not running), or one that refuses, leaves the
+  clock as the system firmware had it (the status line says "no DPM" / "DPM refused"; its text is short on purpose: the status string is full at 254 characters). The VCE shares the table and the code
+  (`AmdSmu7::dpm_enable`). Still open: whether the system firmware leaves the SMC's DPM running (the driver enables it itself at load, which this OS does not do), so the request may be a no-op on a real card,
+  and the PLL path (`vi_set_uvd_clocks`, via AtomBIOS) the older cards use does not exist here.
 - **Diagnostics for the first run.** When the start gives up, the ring test fails or the H.264 self-test fails, the status line (the `Firmware` / `Video` lines at boot) carries the engine's registers as they were at that
   moment - `st` UVD_STATUS (bit 1: the VCPU answered), `pw` UVD_POWER_STATUS, `rst` UVD_SOFT_RESET, `cn` UVD_VCPU_CNTL, `lmi` UVD_LMI_CTRL2, `rp`/`wp` the ring pointers - taken before the stop sequence changes them
   (`AmdUvd6::failure_snapshot`, `read_diagnostics`). A card whose engine is unpowered shows in `pw`/`st`, a stalled memory path in `lmi`.

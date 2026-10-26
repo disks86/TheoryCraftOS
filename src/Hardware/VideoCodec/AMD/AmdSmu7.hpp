@@ -45,6 +45,8 @@ class AmdSmu7 {
   // The messages that switch dynamic power management of the VCE's clock levels on and off (smu7_clockpowergating.c: smu7_update_vce_dpm) and pick its levels (the polaris10 /
   // vegam smumgr's update_smc_table(SMU_VCE_TABLE)); smu7_ppsmc.h.
   static constexpr uint16_t kMsgVceDpmSetEnabledMask = 0x12E, kMsgVceDpmEnable = 0x15a, kMsgVceDpmDisable = 0x15b;
+  // ... and the same for the decoder (smu7_update_uvd_dpm; vegam_update_uvd_smc_table).
+  static constexpr uint16_t kMsgUvdDpmSetEnabledMask = 0x12D, kMsgUvdDpmEnable = 0x154, kMsgUvdDpmDisable = 0x155;
   static constexpr uint16_t kResultOk = 0x01, kResultUnknownCommand = 0xFE;
   static constexpr uint32_t kDefaultTimeoutUs = 100000;                        // adev->usec_timeout
 
@@ -73,6 +75,9 @@ class AmdSmu7 {
   static constexpr uint32_t kDpmVceLevelCountOffset = 213;      // offsetof(SMU75_Discrete_DpmTable, VceLevelCount)
   static constexpr uint32_t kDpmVceBootLevelOffset = 1649;      // offsetof(SMU75_Discrete_DpmTable, VceBootLevel)
   static constexpr uint32_t kMaxVceLevels = 8;                  // SMU75_MAX_LEVELS_VCE
+  static constexpr uint32_t kDpmUvdLevelCountOffset = 212;      // offsetof(SMU75_Discrete_DpmTable, UvdLevelCount)
+  static constexpr uint32_t kDpmUvdBootLevelOffset = 1648;      // offsetof(SMU75_Discrete_DpmTable, UvdBootLevel)
+  static constexpr uint32_t kMaxUvdLevels = 8;                  // SMU75_MAX_LEVELS_UVD
   enum class VceLevel : uint8_t {
     Lowest,    // boot level 0, every level enabled: the SMC raises the clock itself (the driver's default)
     Highest,   // the driver's stable-pstate case: the top level is the boot level and the only one enabled
@@ -90,10 +95,18 @@ class AmdSmu7 {
   // smu7_update_vce_dpm(true): switches the VCE's DPM off again.
   Result vce_dpm_disable();
 
+  // The decoder's clock levels, the same way. The driver always makes the top level the UVD's boot level; `Default` leaves every level enabled (the SMC raises the clock
+  // itself, the driver's case when UVD DPM is on and no stable pstate is asked for), `Highest` enables only the top one (the stable-pstate case).
+  enum class UvdLevel : uint8_t { Default, Highest };
+  DpmResult uvd_dpm_enable(UvdLevel which, uint32_t* level = nullptr);
+  Result uvd_dpm_disable();
+
  private:
   // Waits until the result register is not zero (the SMC has finished what it was doing); false on timeout. A register that reads all ones is not an SMC.
   bool wait_for_result(uint32_t timeout_us, uint32_t* value);
   bool set_sram_address(uint32_t address);
+  // The part the two engines share: the boot level byte of the DPM table (set to `top ? count - 1 : 0`), the level mask when asked for, the enable message.
+  DpmResult dpm_enable(uint32_t count_offset, uint32_t boot_offset, uint32_t max_levels, bool top, bool mask, uint16_t mask_message, uint16_t enable_message, uint32_t* level);
   Result send_message(uint16_t message, const uint32_t* argument, uint32_t* response, uint32_t timeout_us);
 
   IVcnRegisters& registers_;

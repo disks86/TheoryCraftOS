@@ -87,6 +87,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     }
     if (!vce_) vce_ = UniquePointer<AmdVce3VideoEngine>::make(allocator_, allocator_, device_id_);
   }
+  // The decoder's clock level asked of the SMC at the next start (the default is the top level only: the driver's stable-pstate case).
+  void set_clock_level(AmdSmu7::UvdLevel level) { clock_level_ = level; }
   bool encode_enabled() const { return vce_ != nullptr; }
   bool encode_ready() const { return vce_ && vce_->ready(); }
   const char* encode_status() const { return vce_ ? vce_->status() : ""; }
@@ -518,15 +520,32 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   void request_power(const IClock& clock) {
     AmdSmu7 smc(*registers_, clock);
     switch (smc.uvd_power(true)) {
-      case AmdSmu7::Result::Ok: smc_powered_ = true; power_note_ = "SMC powered the engine"; break;
-      case AmdSmu7::Result::NotAnswering: power_note_ = "SMC did not answer, engine assumed powered"; break;
-      case AmdSmu7::Result::Unsupported: power_note_ = "SMC does not know the power-on message, engine assumed powered"; break;
-      case AmdSmu7::Result::Failed: power_note_ = "SMC refused to power the engine"; break;
+      case AmdSmu7::Result::Ok: smc_powered_ = true; power_note_.assign("SMC powered the engine"); break;
+      case AmdSmu7::Result::NotAnswering: power_note_.assign("SMC did not answer, engine assumed powered"); return;
+      case AmdSmu7::Result::Unsupported: power_note_.assign("SMC does not know the power-on message, engine assumed powered"); break;
+      case AmdSmu7::Result::Failed: power_note_.assign("SMC refused to power the engine"); break;
+    }
+    // The clock, once the SMC is there to ask (smu7_powergate_uvd(false): power, then the DPM table's boot level and DPM on).
+    uint32_t level = 0;
+    switch (smc.uvd_dpm_enable(clock_level_, &level)) {
+      case AmdSmu7::DpmResult::Ok:
+        dpm_enabled_ = true;
+        power_note_.append(", level ");
+        power_note_.append_uint(level);
+        break;
+      case AmdSmu7::DpmResult::NoDpmTable:
+      case AmdSmu7::DpmResult::BadDpmTable: power_note_.append(", no DPM"); break;
+      case AmdSmu7::DpmResult::NotAnswering:
+      case AmdSmu7::DpmResult::Unsupported:
+      case AmdSmu7::DpmResult::Failed: power_note_.append(", DPM refused"); break;
     }
   }
   void release_power(const IClock& clock) {
-    if (!smc_powered_ || !registers_) return;
-    AmdSmu7(*registers_, clock).uvd_power(false);
+    if (!registers_) return;
+    AmdSmu7 smc(*registers_, clock);
+    if (dpm_enabled_) smc.uvd_dpm_disable();   // (before the power goes, as smu7_powergate_uvd(true) does)
+    dpm_enabled_ = false;
+    if (smc_powered_) smc.uvd_power(false);
     smc_powered_ = false;
   }
   static constexpr uint32_t kGbAddrConfig = 0x263e;   // mmGB_ADDR_CONFIG (gca/gfx_8_0_d.h)
@@ -548,9 +567,9 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
       firmware_text_.append_uint(firmware_.ucode().size());
       firmware_text_.append(" bytes of microcode loaded, ");
       firmware_text_.append(note_);
-      if (power_note_[0]) {
+      if (power_note_.size() != 0) {
         firmware_text_.append("; ");
-        firmware_text_.append(power_note_);
+        firmware_text_.append(power_note_.view());
       }
     } else {
       firmware_text_.append(amd_firmware_status_name(firmware_state_));
@@ -569,7 +588,9 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   const char* firmware_name_ = nullptr;
   FixedString<255> firmware_text_, summary_;
   FixedString<255> decode_text_, diag_text_;
-  const char* power_note_ = "";
+  FixedString<127> power_note_;
+  AmdSmu7::UvdLevel clock_level_ = AmdSmu7::UvdLevel::Highest;
+  bool dpm_enabled_ = false;      // the SMC acknowledged the request for a clock level, so we ask it to switch DPM off again
   bool smc_powered_ = false;   // the SMC acknowledged our request to power the engine, so we ask it to power it down again
   const char* note_ = "engine not started";
   IVcnRegisters* registers_ = nullptr;
