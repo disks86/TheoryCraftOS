@@ -98,31 +98,43 @@ AmdSmu7::DpmResult dpm_result(AmdSmu7::Result r) {
 }
 }  // namespace
 
-AmdSmu7::DpmResult AmdSmu7::vce_dpm_enable(VceLevel which, uint32_t* level) {
+AmdSmu7::DpmResult AmdSmu7::dpm_enable(uint32_t count_offset, uint32_t boot_offset, uint32_t max_levels, bool top, bool mask, uint16_t mask_message, uint16_t enable_message,
+                                       uint32_t* level) {
   // vegam_process_firmware_header: where the SMC keeps its DPM table.
   uint32_t table = 0;
   if (!read_sram_dword(kFirmwareHeaderLocation + kHeaderDpmTableOffset, &table) || table == 0 || table == 0xFFFFFFFFu || (table & 3) != 0) return DpmResult::NoDpmTable;
-  if (table > kSmcRamEnd || kDpmVceBootLevelOffset >= kSmcRamEnd - table) return DpmResult::BadDpmTable;
+  if (table > kSmcRamEnd || boot_offset >= kSmcRamEnd - table || count_offset >= kSmcRamEnd - table) return DpmResult::BadDpmTable;
   // The byte of a field in the big-endian dword that holds it.
-  const uint32_t count_address = table + kDpmVceLevelCountOffset, boot_address = table + kDpmVceBootLevelOffset;
+  const uint32_t count_address = table + count_offset, boot_address = table + boot_offset;
   uint32_t word = 0;
   if (!read_sram_dword(count_address & ~3u, &word)) return DpmResult::BadDpmTable;
   const uint32_t count = (word >> (24 - 8 * (count_address & 3))) & 0xFF;
-  if (count == 0 || count > kMaxVceLevels) return DpmResult::BadDpmTable;
-  const uint32_t boot = which == VceLevel::Highest ? count - 1 : 0;
-  // vegam_update_vce_smc_table: the boot level into its byte of the table.
+  if (count == 0 || count > max_levels) return DpmResult::BadDpmTable;
+  const uint32_t boot = top ? count - 1 : 0;
+  // vegam_update_vce_smc_table / _uvd_: the boot level into its byte of the table.
   const uint32_t shift = 24 - 8 * (boot_address & 3);
   if (!read_sram_dword(boot_address & ~3u, &word)) return DpmResult::BadDpmTable;
   word = (word & ~(0xFFu << shift)) | (boot << shift);
   if (!write_sram_dword(boot_address & ~3u, word)) return DpmResult::BadDpmTable;
-  if (which == VceLevel::Highest) {
-    const Result mask = send_with_parameter(kMsgVceDpmSetEnabledMask, 1u << boot);
-    if (mask != Result::Ok) return dpm_result(mask);
+  if (mask) {
+    const Result sent = send_with_parameter(mask_message, 1u << boot);
+    if (sent != Result::Ok) return dpm_result(sent);
   }
   if (level) *level = boot;
-  return dpm_result(send(kMsgVceDpmEnable));
+  return dpm_result(send(enable_message));
+}
+
+AmdSmu7::DpmResult AmdSmu7::vce_dpm_enable(VceLevel which, uint32_t* level) {
+  const bool top = which == VceLevel::Highest;
+  return dpm_enable(kDpmVceLevelCountOffset, kDpmVceBootLevelOffset, kMaxVceLevels, top, top, kMsgVceDpmSetEnabledMask, kMsgVceDpmEnable, level);
+}
+
+AmdSmu7::DpmResult AmdSmu7::uvd_dpm_enable(UvdLevel which, uint32_t* level) {
+  return dpm_enable(kDpmUvdLevelCountOffset, kDpmUvdBootLevelOffset, kMaxUvdLevels, true, which == UvdLevel::Highest, kMsgUvdDpmSetEnabledMask, kMsgUvdDpmEnable, level);
 }
 
 AmdSmu7::Result AmdSmu7::vce_dpm_disable() { return send(kMsgVceDpmDisable); }
+
+AmdSmu7::Result AmdSmu7::uvd_dpm_disable() { return send(kMsgUvdDpmDisable); }
 
 }  // namespace hardware

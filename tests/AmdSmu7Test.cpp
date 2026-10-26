@@ -100,10 +100,11 @@ static void test_vce_power() {
 // The Vega M's SMC memory as the DPM code finds it: the header at 0x20000 names the DPM table (at 0x30000 here), whose VceLevelCount (byte 213) and VceBootLevel (byte 1649)
 // sit in the dwords at 0x300D4 and 0x30670 - the second byte of each (bits 23:16: the SMC is big-endian). The bytes around them are other fields.
 constexpr uint32_t kTable = 0x30000, kCountWord = kTable + 212, kBootWord = kTable + 1648;
-static void put_table(FakeSmc& smc, uint32_t levels) {
+static uint32_t count_word(uint32_t vce_levels, uint32_t uvd_levels) { return (uvd_levels << 24) | (vce_levels << 16) | 0x00002200u | 0x33u; }
+static void put_table(FakeSmc& smc, uint32_t levels, uint32_t uvd_levels = 3) {
   smc.regs[kResp] = 1;
   smc.sram[0x20000 + 52] = kTable;
-  smc.sram[kCountWord] = 0x11000033u | (levels << 16) | 0x00002200u;
+  smc.sram[kCountWord] = count_word(levels, uvd_levels);   // UvdLevelCount in bits 31:24, VceLevelCount in 23:16
   smc.sram[kBootWord] = 0xAA00CCDDu | 0x00220000u;   // UvdBootLevel 0xAA, VceBootLevel 0x22, AcpBootLevel (bits 15:8) 0, SamuBootLevel 0xDD
 }
 
@@ -134,7 +135,7 @@ static void test_vce_dpm() {
     CHECK(smu.vce_dpm_enable(AmdSmu7::VceLevel::Highest, &level) == AmdSmu7::DpmResult::Ok && level == 3);
     CHECK(smc.sram_writes.size() == 1 && smc.sram_writes[0] == std::make_pair(kBootWord, 0xAA03CCDDu));
     CHECK(smc.handled.size() == 2 && smc.handled[0] == std::make_pair(0x12Eu, 8u) && smc.handled[1].first == 0x15a);
-    CHECK(smc.sram[kCountWord] == (0x11000033u | (4u << 16) | 0x00002200u));   // the level count dword is as it was
+    CHECK(smc.sram[kCountWord] == count_word(4, 3));   // the level count dword is as it was
     CHECK(smu.vce_dpm_disable() == AmdSmu7::Result::Ok && smc.handled.size() == 3 && smc.handled[2].first == 0x15b);
   }
   {  // The lowest level: boot level 0, no mask, DPM enabled.
@@ -184,6 +185,53 @@ static void test_vce_dpm() {
     failing.result = 0xFF;
     AmdSmu7 smu3(failing, clock);
     CHECK(smu3.vce_dpm_enable(AmdSmu7::VceLevel::Highest) == AmdSmu7::DpmResult::Failed && failing.handled.size() == 1);   // (the mask failed: DPM is not enabled)
+  }
+}
+
+static void test_uvd_dpm() {
+  fakevcn::FakeClock clock;
+  {  // The top level is always the boot level; Highest enables that one only.
+    FakeSmc smc;
+    put_table(smc, 4, 5);
+    AmdSmu7 smu(smc, clock);
+    uint32_t level = 99;
+    CHECK(smu.uvd_dpm_enable(AmdSmu7::UvdLevel::Highest, &level) == AmdSmu7::DpmResult::Ok && level == 4);
+    CHECK(smc.sram_writes.size() == 1 && smc.sram_writes[0] == std::make_pair(kBootWord, 0x0422CCDDu));   // only the UVD byte changed
+    CHECK(smc.handled.size() == 2 && smc.handled[0] == std::make_pair(0x12Du, 16u) && smc.handled[1].first == 0x154);
+    CHECK(smc.sram[kCountWord] == count_word(4, 5));
+    CHECK(smu.uvd_dpm_disable() == AmdSmu7::Result::Ok && smc.handled.size() == 3 && smc.handled[2].first == 0x155);
+  }
+  {  // Default: the same boot level, every level left enabled (no mask).
+    FakeSmc smc;
+    put_table(smc, 4, 2);
+    AmdSmu7 smu(smc, clock);
+    uint32_t level = 99;
+    CHECK(smu.uvd_dpm_enable(AmdSmu7::UvdLevel::Default, &level) == AmdSmu7::DpmResult::Ok && level == 1);
+    CHECK(smc.sram_writes.size() == 1 && smc.sram_writes[0] == std::make_pair(kBootWord, 0x0122CCDDu));
+    CHECK(smc.handled.size() == 1 && smc.handled[0].first == 0x154);
+  }
+  {  // A level count nobody has, no DPM table, a mailbox that does not answer.
+    for (uint32_t levels : {0u, 9u}) {
+      FakeSmc smc;
+      put_table(smc, 4, levels);
+      AmdSmu7 smu(smc, clock);
+      CHECK(smu.uvd_dpm_enable(AmdSmu7::UvdLevel::Highest) == AmdSmu7::DpmResult::BadDpmTable && smc.sram_writes.empty() && smc.handled.empty());
+    }
+    FakeSmc none;
+    put_table(none, 4, 3);
+    none.sram[0x20000 + 52] = 0;
+    AmdSmu7 smu(none, clock);
+    CHECK(smu.uvd_dpm_enable(AmdSmu7::UvdLevel::Highest) == AmdSmu7::DpmResult::NoDpmTable);
+    FakeSmc silent;
+    put_table(silent, 4, 3);
+    silent.running = false;
+    AmdSmu7 smu2(silent, clock);
+    CHECK(smu2.uvd_dpm_enable(AmdSmu7::UvdLevel::Highest) == AmdSmu7::DpmResult::NotAnswering);
+    // The two engines' counts are separate bytes: a bad VCE count does not stop the UVD request.
+    FakeSmc mixed;
+    put_table(mixed, 0, 3);
+    AmdSmu7 smu3(mixed, clock);
+    CHECK(smu3.uvd_dpm_enable(AmdSmu7::UvdLevel::Default) == AmdSmu7::DpmResult::Ok && smu3.vce_dpm_enable(AmdSmu7::VceLevel::Highest) == AmdSmu7::DpmResult::BadDpmTable);
   }
 }
 
@@ -270,6 +318,7 @@ int main() {
   test_vce_power();
   test_sram();
   test_vce_dpm();
+  test_uvd_dpm();
   test_results();
   test_not_running();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
