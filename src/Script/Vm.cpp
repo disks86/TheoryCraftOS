@@ -896,6 +896,20 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     return true;
   }
   if (o->okind == ObjKind::Function || o->okind == ObjKind::Native || o->okind == ObjKind::Bound) {
+    if (o->okind == ObjKind::Bound && o->target && (key == name_ || key == length_)) {   // bind(): "bound f", and the parameters left after the bound arguments
+      Value inner;
+      get_own(o->target, key, &inner);
+      if (key == name_) {
+        String text(allocator_);
+        text.append("bound ");
+        if (inner.is_string()) text.append(inner.as_string()->view());
+        *out = Value::make_string(new_string(text.view()));
+      } else {
+        double n = inner.is_number() ? inner.u.number - o->length : 0;
+        *out = Value::make_number(n < 0 ? 0 : n);
+      }
+      return true;
+    }
     if (key == name_) {
       *out = o->okind == ObjKind::Function ? Value::make_string(o->code->name ? o->code->name : empty_) : o->okind == ObjKind::Native ? o->bound_this : Value::make_string(empty_);
       return true;
@@ -1561,6 +1575,17 @@ double js_pow(double a, double b) {
       if (n & 1) result *= base;
       base *= base;
       n >>= 1;
+    }
+    if (negative && (result == kInfinity || result == -kInfinity) && a != 0) {   // (2 ** -1074: the positive power overflows, the denormal result does not)
+      int64_t m = -static_cast<int64_t>(b);
+      result = 1;
+      base = 1 / a;
+      while (m > 0) {
+        if (m & 1) result *= base;
+        base *= base;
+        m >>= 1;
+      }
+      return result;
     }
     return negative ? 1 / result : result;
   }

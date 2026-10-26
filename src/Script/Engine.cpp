@@ -573,6 +573,39 @@ const char kCollections[] = R"JSLIB((function (g) {
   Object.defineProperty(Atomics, '@@toStringTag', { value: 'Atomics', configurable: true });
   def(g, 'Atomics', Atomics);
 
+  // legacy Annex B built-ins
+  def(Object.prototype, '__defineGetter__', function (key, fn) { if (typeof fn !== 'function') throw new TypeError('Object.prototype.__defineGetter__: Expecting function'); Object.defineProperty(this, key, { get: fn, enumerable: true, configurable: true }); });
+  def(Object.prototype, '__defineSetter__', function (key, fn) { if (typeof fn !== 'function') throw new TypeError('Object.prototype.__defineSetter__: Expecting function'); Object.defineProperty(this, key, { set: fn, enumerable: true, configurable: true }); });
+  def(Object.prototype, '__lookupGetter__', function (key) { for (var o = this; o; o = Object.getPrototypeOf(o)) { var d = Object.getOwnPropertyDescriptor(o, key); if (d) return d.get; } });
+  def(Object.prototype, '__lookupSetter__', function (key) { for (var o = this; o; o = Object.getPrototypeOf(o)) { var d = Object.getOwnPropertyDescriptor(o, key); if (d) return d.set; } });
+  var HEX = '0123456789ABCDEF';
+  def(g, 'escape', function (value) {
+    var text = String(value), out = '';
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i);
+      if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || '@*_+-./'.indexOf(text[i]) >= 0) out += text[i];
+      else if (c < 256) out += '%' + HEX[c >> 4] + HEX[c & 15];
+      else out += '%u' + HEX[(c >> 12) & 15] + HEX[(c >> 8) & 15] + HEX[(c >> 4) & 15] + HEX[c & 15];
+    }
+    return out;
+  });
+  def(g, 'unescape', function (value) {
+    var text = String(value);
+    return text.replace(/%u([0-9a-fA-F]{4})|%([0-9a-fA-F]{2})/g, function (m, u, b) { return String.fromCharCode(parseInt(u || b, 16)); });
+  });
+  [['anchor', 'a', 'name'], ['big', 'big'], ['blink', 'blink'], ['bold', 'b'], ['fixed', 'tt'], ['fontcolor', 'font', 'color'], ['fontsize', 'font', 'size'], ['italics', 'i'],
+   ['link', 'a', 'href'], ['small', 'small'], ['strike', 'strike'], ['sub', 'sub'], ['sup', 'sup']].forEach(function (spec) {
+    def(String.prototype, spec[0], function (value) {
+      if (this === null || this === undefined) throw new TypeError('String.prototype.' + spec[0] + ' called on null or undefined');
+      var open = '<' + spec[1];
+      if (spec[2]) open += ' ' + spec[2] + '="' + String(value).replace(/"/g, '&quot;') + '"';
+      return open + '>' + String(this) + '</' + spec[1] + '>';
+    });
+  });
+  [[MP, 'Map'], [SP, 'Set'], [WMP, 'WeakMap'], [WSP, 'WeakSet']].forEach(function (pair) {
+    Object.defineProperty(pair[0], '@@toStringTag', { value: pair[1], configurable: true });
+  });
+
   // Array.from / Array.of
   if (!Array.from) def(Array, 'from', function (source, mapFn, thisArg) {
     if (source === null || source === undefined) throw new TypeError(String(source) + ' is not iterable');
