@@ -395,6 +395,9 @@ add_executable(BOOTX64
   src/Font/FontDataFallback.cpp
   src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/Hardware/GraphicsProcessingUnit/SystemGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuTopology.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.cpp
+  src/Hardware/GraphicsProcessingUnit/Multi/GpuManager.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp

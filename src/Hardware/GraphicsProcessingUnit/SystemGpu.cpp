@@ -20,6 +20,7 @@
 #include <new>
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpu.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuTopology.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpu.hpp"
 
 namespace hardware {
@@ -40,10 +41,10 @@ IGraphicsProcessingUnit* try_gpu(void* storage, const GpuContext& context) {
 }  // namespace
 
 SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllocator& allocator) {
-  // The first display-class device is assumed to be the primary one.
+  // The display the firmware is showing the screen on is the primary one (with an integrated and a discrete GPU that is not necessarily the
+  // first on the bus); see Multi/GpuTopology. The other GPUs are left to GpuManager.
   PciDeviceInfo d{};
-  bool found = false;
-  for (uint32_t i = 0; !found && pci.pci_device(i, &d); ++i) found = d.class_code == kPciClassDisplay;
+  const bool found = gpu_boot_display(pci, &d);
   if (!found) d = {};
   const GpuContext context{st, &pci, d, &allocator};
 

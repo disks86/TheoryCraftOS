@@ -30,6 +30,7 @@
 #include "Hardware/Bus/SystemPciBus.hpp"
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuManager.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
@@ -428,6 +429,16 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     Entry(Level::Warning, "GPU").text("no usable display; using the firmware text console, the desktop needs a graphics display");
   }
   Entry(Level::Ok, pci.name()).dec(pci.device_count()).text(" devices");
+
+  // Every display controller, not only the one on screen: a discrete GPU beside the CPU's graphics sleeps until something needs it.
+  hardware::GpuManager gpu_manager(pci);
+  gpu_manager.initialize();
+  if (gpu_manager.is_hybrid()) {
+    for (uint32_t i = 0; i < gpu_manager.count(); ++i) {
+      const hardware::GpuAdapter& a = gpu_manager.topology().adapter(i);
+      Entry(Level::Info, "GPU").text(a.name).text(" (").text(hardware::gpu_kind_name(a.kind)).text(static_cast<int32_t>(i) == gpu_manager.display_index() ? ", display" : gpu_manager.asleep(i) ? ", asleep" : "").text(")");
+    }
+  }
 
   // The monitors the display device has (their EDIDs tell what they are) and how they are arranged on the desktop. The layout is applied
   // just before the desktop starts, so that the boot console stays a plain screen.
