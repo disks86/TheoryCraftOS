@@ -88,6 +88,11 @@ What it does not do, and what is needed before a Vega M decodes anything:
   (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. What is missing is the plumbing:
   finding the card's register BAR (BAR 5) and memory BAR (BAR 0, with its size) from PCI and creating the objects at boot, and the video device on top (`IVideoDecoder` for H.264 and HEVC). That the memory controller lets
   the engine reach these addresses unchanged (VMID 0, inside the system aperture the firmware set) is the driver's behaviour and has not been seen on the card.
-- **The ring and the messages.** The decode ring is programmed but nothing writes to it. UVD 6 decode messages are the older `ruvd_*` layouts (Mesa `radeon_uvd.c`), not the VCN ones the existing decoders build.
+- **The ring: done in simulation.** `AmdUvd6Ring` ports the ring side (`uvd_v6_0_ring_emit_ib`, `_emit_fence`, `_insert_nop`, `_set_wptr`, `_ring_test_ring`) and builds the indirect buffer Mesa builds
+  (`radeon_uvd.c`: each buffer's address through the GPCOM registers and its command, then the engine start); the command numbers are the same as the VCN ones. It flushes the host data path before it
+  publishes the write pointer, and wedges on a missed fence. `tests/AmdUvd6RingTest.cpp` runs it against a simulated ring controller (wrap-around, fence, stall, bad arguments, the ring test), and
+  `check_uvd6_port.py` confirms the ring test and the ring commands touch the same registers in the same order as the driver.
+- **The messages.** Nothing builds the session create/decode/destroy messages yet. UVD 6 uses the older `ruvd_*` layouts (Mesa `radeon_uvd.c`/`ac_uvd_dec.h`), not the VCN ones the existing decoders build,
+  and `IVideoDecoder` for H.264 and HEVC on top of the ring and messages does not exist.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.
