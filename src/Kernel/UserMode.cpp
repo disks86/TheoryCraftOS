@@ -754,11 +754,11 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   program.process()->attach_runtime(task.get());
   if (suspended) {      // it waits for Task::start_first_thread()
     task->first_thread = t;
-    return task;
+  } else {
+    t->thread = kernel::spawn(user_main, t, name);
+    t->spawned = t->thread != nullptr;
+    if (!t->spawned) return UniquePointer<Task>();
   }
-  t->thread = kernel::spawn(user_main, t, name);
-  t->spawned = t->thread != nullptr;
-  if (!t->spawned) return UniquePointer<Task>();
   task->set_name(StringView(name));
   {
     ScopedMutex hold(g_tasks_mutex);
