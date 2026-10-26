@@ -144,11 +144,14 @@ LoadStatus map_stack(AddressSpace& space, uint64_t size, uint64_t* top) {
 }
 
 LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const LoadedImage& image, ArrayView<const StringView> arguments,
-                             ArrayView<const StringView> environment, ConstByteView random, uint64_t* stack_pointer) {
+                             ArrayView<const StringView> environment, StringView executable, ConstByteView random, uint64_t* stack_pointer) {
   if (random.size() != 16 || arguments.size() > 4096 || environment.size() > 4096) return LoadStatus::Malformed;
   uint64_t string_bytes = 0;
   for (const StringView& s : arguments) string_bytes += s.size() + 1;      // each is bounded below, so the sum cannot wrap
   for (const StringView& s : environment) string_bytes += s.size() + 1;
+  const StringView platform = "x86_64";
+  if (executable.size() > kMaxStartupStrings) return LoadStatus::Malformed;
+  string_bytes += executable.size() + 1 + platform.size() + 1;
   if (string_bytes > kMaxStartupStrings) return LoadStatus::Malformed;
   if (string_bytes > stack_top) return LoadStatus::Malformed;
 
@@ -156,8 +159,13 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
   const uint64_t strings = stack_top - string_bytes;
   uint64_t cursor = strings;
   const uint8_t nul = 0;
-  for (uint32_t pass = 0; pass < 2; ++pass) {
-    for (const StringView& s : pass == 0 ? arguments : environment) {
+  const uint64_t executable_at = strings + (string_bytes - platform.size() - 1 - executable.size() - 1);
+  const uint64_t platform_at = strings + (string_bytes - platform.size() - 1);
+  for (uint32_t pass = 0; pass < 4; ++pass) {
+    ArrayView<const StringView> group = pass == 0 ? arguments : pass == 1 ? environment : ArrayView<const StringView>();
+    if (pass == 2) group = ArrayView<const StringView>(&executable, 1);
+    if (pass == 3) group = ArrayView<const StringView>(&platform, 1);
+    for (const StringView& s : group) {
       if (!space.write_privileged(cursor, s.bytes()) || !space.write_privileged(cursor + s.size(), ConstByteView(&nul, 1)))
         return LoadStatus::OutOfMemory;
       cursor += s.size() + 1;
@@ -168,7 +176,7 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
 
   struct Aux { uint64_t key, value; };
   const Aux aux[] = {{3, image.phdr}, {4, image.phent}, {5, image.phnum}, {6, AddressSpace::kPageSize}, {7, 0}, {8, 0}, {9, image.entry}, {11, 0}, {12, 0},
-                     {13, 0}, {14, 0}, {23, 0}, {25, random_address}, {0, 0}};
+                     {13, 0}, {14, 0}, {15, platform_at}, {16, 0}, {17, 100}, {23, 0}, {25, random_address}, {26, 0}, {31, executable_at}, {0, 0}};
   const uint64_t words = 1 + arguments.size() + 1 + environment.size() + 1 + 2 * (sizeof(aux) / sizeof(aux[0]));
   if (words * 8 > random_address) return LoadStatus::Malformed;
   const uint64_t sp = (random_address - words * 8) & ~uint64_t{15};

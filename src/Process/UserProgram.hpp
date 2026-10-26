@@ -32,14 +32,17 @@ struct ProgramStart {
   UserArch arch = UserArch::None;
   uint64_t entry = 0;
   uint64_t stack_pointer = 0;
-  uint64_t argument = 0;      // first argument register (Windows: the thread parameter; nothing is passed yet)
+  uint64_t argument = 0;      // first argument register (Windows: the PEB, as the NT process start passes it)
+  uint64_t fs_base = 0;       // thread pointers the thread starts with (Windows: gs_base is the TEB)
+  uint64_t gs_base = 0;
 };
 
 // A user-mode program ready to run: its address space, its Process (with the syscall interface its executable kind selects) and the start state of its
 // first thread. load() is the one call that turns the bytes of a file into all of that:
 //   identify (ELF or PE) -> parse -> choose the system-call interface -> map the image -> map the stack -> build the startup block -> attach the
 //   address space to the process.
-// The arguments and environment are used by Linux programs; a Windows program gets its command line from the PEB, which does not exist yet.
+// Linux programs get arguments and environment on their stack; Windows programs get them in the PEB's process parameters (the command line is the
+// arguments joined by spaces). The first argument is also the program's path.
 class UserProgram {
  public:
   UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = 256ull << 20)

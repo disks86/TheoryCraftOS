@@ -25,6 +25,7 @@
 #include "Process/Syscall.hpp"
 #include "Process/UserPageTables.hpp"
 #include "Process/UserProgram.hpp"
+#include "Process/WindowsStartup.hpp"
 #include "Process/WindowsSyscalls.hpp"
 
 using namespace process;
@@ -257,7 +258,7 @@ static void test_load_elf_rejects() {
   }
 }
 
-static Bytes make_pe(uint64_t base_high = 1) {
+static Bytes make_pe(uint64_t base_high = 1, bool with_tls = false) {
   Bytes b(0x400, 0);
   put_text(b, 0, "MZ"); put(b, 0x3C, 0x40, 4);
   put_text(b, 0x40, std::string("PE\0\0", 4));
@@ -268,6 +269,14 @@ static Bytes make_pe(uint64_t base_high = 1) {
   const uint64_t s = 0x148;
   put_text(b, s, ".text"); put(b, s + 8, 0x100, 4); put(b, s + 12, 0x1000, 4); put(b, s + 16, 0x200, 4); put(b, s + 20, 0x200, 4); put(b, s + 36, 0x60000020, 4);
   put_text(b, 0x200, "\xC3");
+  if (with_tls) {
+    // IMAGE_TLS_DIRECTORY64 at rva 0x1080: template [0x10C0, 0x10C8) = "TLSDATA!", index variable at 0x10D0, 8 bytes of zero fill.
+    const uint64_t image_base = base_high << 32;
+    put(b, o + 112 + 9 * 8, 0x1080, 4); put(b, o + 112 + 9 * 8 + 4, 0x28, 4);
+    put(b, 0x280, image_base + 0x10C0, 8); put(b, 0x288, image_base + 0x10C8, 8); put(b, 0x290, image_base + 0x10D0, 8); put(b, 0x298, 0, 8); put(b, 0x2A0, 8, 4);
+    put_text(b, 0x2C0, "TLSDATA!");
+    put(b, 0x2D0, 0xFFFFFFFF, 4);
+  }
   return b;
 }
 
@@ -361,30 +370,31 @@ static void test_stacks() {
   for (int i = 0; i < 16; ++i) random[i] = uint8_t(i + 1);
   CHECK(top == AddressSpace::kUserTop - 4096);
   uint64_t sp = 0;
-  CHECK(build_linux_stack(s, top, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(env, 2), ConstByteView(random, 16), &sp) == LoadStatus::Ok);
+  CHECK(build_linux_stack(s, top, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(env, 2), "/bin/prog", ConstByteView(random, 16), &sp) == LoadStatus::Ok);
   CHECK(sp % 16 == 0 && sp < top);
   CHECK(word(s, sp) == 2);
   CHECK(cstr(s, word(s, sp + 8)) == "prog" && cstr(s, word(s, sp + 16)) == "-x" && word(s, sp + 24) == 0);
   CHECK(cstr(s, word(s, sp + 32)) == "HOME=/" && cstr(s, word(s, sp + 40)) == "A=b" && word(s, sp + 48) == 0);
-  uint64_t at = sp + 56, entry = 0, phdr = 0, rnd = 0, pagesz = 0, phnum = 0;
+  uint64_t at = sp + 56, entry = 0, phdr = 0, rnd = 0, pagesz = 0, phnum = 0, execfn = 0, platform = 0, clktck = 0;
   for (int i = 0; i < 40; ++i, at += 16) {
     const uint64_t key = word(s, at), value = word(s, at + 8);
     if (key == 0) break;
-    if (key == 9) entry = value; else if (key == 3) phdr = value; else if (key == 25) rnd = value; else if (key == 6) pagesz = value; else if (key == 5) phnum = value;
+    if (key == 9) entry = value; else if (key == 3) phdr = value; else if (key == 25) rnd = value; else if (key == 6) pagesz = value; else if (key == 5) phnum = value; else if (key == 31) execfn = value; else if (key == 15) platform = value; else if (key == 17) clktck = value;
   }
-  CHECK(entry == 0x400100 && phdr == 0x400040 && pagesz == 4096 && phnum == 2);
+  CHECK(entry == 0x400100 && phdr == 0x400040 && pagesz == 4096 && phnum == 2 && clktck == 100);
+  CHECK(cstr(s, execfn) == "/bin/prog" && cstr(s, platform) == "x86_64");
   uint8_t got[16] = {};
   CHECK(s.read(rnd, ByteView(got, 16)) && got[0] == 1 && got[15] == 16);
 
   // Limits.
-  CHECK(build_linux_stack(s, top, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(env, 2), ConstByteView(random, 8), &sp) == LoadStatus::Malformed);
+  CHECK(build_linux_stack(s, top, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(env, 2), "/bin/prog", ConstByteView(random, 8), &sp) == LoadStatus::Malformed);
   std::string huge(kMaxStartupStrings + 1, 'x');
   const StringView big[] = {StringView(huge.data(), huge.size())};
-  CHECK(build_linux_stack(s, top, image, ArrayView<const StringView>(big, 1), ArrayView<const StringView>(), ConstByteView(random, 16), &sp) == LoadStatus::Malformed);
+  CHECK(build_linux_stack(s, top, image, ArrayView<const StringView>(big, 1), ArrayView<const StringView>(), "/bin/prog", ConstByteView(random, 16), &sp) == LoadStatus::Malformed);
   AddressSpace small(A);
   CHECK(small.map(0x10000, 4096, kProtRead | kProtWrite));
-  CHECK(build_linux_stack(small, 0x11000, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(env, 2), ConstByteView(random, 16), &sp) == LoadStatus::Ok);
-  CHECK(build_linux_stack(small, 0x20000, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(), ConstByteView(random, 16), &sp) == LoadStatus::OutOfMemory);
+  CHECK(build_linux_stack(small, 0x11000, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(env, 2), "/bin/prog", ConstByteView(random, 16), &sp) == LoadStatus::Ok);
+  CHECK(build_linux_stack(small, 0x20000, image, ArrayView<const StringView>(args, 2), ArrayView<const StringView>(), "/bin/prog", ConstByteView(random, 16), &sp) == LoadStatus::OutOfMemory);
 
   CHECK(windows_initial_stack_pointer(top) % 16 == 8 && top - windows_initial_stack_pointer(top) >= 0x28);
 }
@@ -656,6 +666,164 @@ static void test_user_page_tables() {
   CHECK(!starved.rebuild(s) && !starved.built() && starved.root() == 0);
 }
 
+namespace {
+struct RandomHost final : IProcessHost {
+  std::string out;
+  uint64_t unhandled = 0, seed = 7;
+  bool give_random = true;
+  bool write_console(uint32_t, ConstByteView d) override { for (uint8_t c : d) out.push_back(char(c)); return true; }
+  bool read_console(ByteView, uint64_t* got) override { *got = 0; return true; }
+  uint64_t realtime_ns() override { return 1700000000ull * 1000000000ull + 5000; }
+  uint64_t monotonic_ns() override { return 0; }
+  void sleep_ns(uint64_t) override {}
+  void yield() override {}
+  bool random_bytes(ByteView o) override {
+    if (!give_random) return false;
+    for (uint8_t& b : o) { seed = seed * 6364136223846793005ull + 1; b = uint8_t(seed >> 56); }
+    return true;
+  }
+  void unhandled_syscall(SyscallAbi, uint64_t number) override { unhandled = number; }
+};
+}  // namespace
+
+static void test_linux_thread_pointer_and_startup_calls() {
+  AddressSpace s(A);
+  RandomHost host;
+  ProcessBinding binding{SyscallAbi::Linux, UserArch::X86_64, syscall_interface(SyscallAbi::Linux, UserArch::X86_64)};
+  Process p(1, binding, s, host);
+  CHECK(s.map(0x10000, 0x2000, kProtRead | kProtWrite));
+  uint64_t v = 0;
+  // arch_prctl
+  CHECK(!p.take_fs_change(&v) && v == 0);
+  CHECK(p.syscall(lin(158, 0x1002, 0x7000)) == 0 && p.fs_base() == 0x7000 && p.take_fs_change(&v) && v == 0x7000 && !p.take_fs_change(&v));
+  CHECK(!p.take_gs_change(&v));
+  CHECK(p.syscall(lin(158, 0x1001, 0x9000)) == 0 && p.take_gs_change(&v) && v == 0x9000);
+  CHECK(p.syscall(lin(158, 0x1003, 0x10000)) == 0 && s.read(0x10000, ByteView(reinterpret_cast<uint8_t*>(&v), 8)) && v == 0x7000);
+  CHECK(p.syscall(lin(158, 0x1004, 0x10000)) == 0 && s.read(0x10000, ByteView(reinterpret_cast<uint8_t*>(&v), 8)) && v == 0x9000);
+  CHECK(sres(p.syscall(lin(158, 0x1002, AddressSpace::kUserTop))) == -22);       // not a user address
+  CHECK(sres(p.syscall(lin(158, 0x1002, ~uint64_t{0}))) == -22);
+  CHECK(sres(p.syscall(lin(158, 0x1003, 0xDEAD0000))) == -14);
+  CHECK(sres(p.syscall(lin(158, 0x9999, 0))) == -22);
+  p.set_initial_thread_pointers(5, 6);
+  CHECK(p.fs_base() == 5 && p.gs_base() == 6 && !p.take_fs_change(&v) && !p.take_gs_change(&v));
+
+  // The calls a C library makes before main().
+  CHECK(sres(p.syscall(lin(16, 1, 0x5413, 0x10000))) == -25);              // ioctl on a console: not a terminal
+  CHECK(sres(p.syscall(lin(16, 9, 0x5413, 0))) == -9);
+  CHECK(p.syscall(lin(5, 1, 0x10100)) == 0);                               // fstat(1)
+  uint8_t mode[4] = {};
+  CHECK(s.read(0x10100 + 24, ByteView(mode, 4)) && mode[1] == 0x21 && mode[0] == 0x90);      // S_IFCHR | 0620 = 0020620
+  CHECK(sres(p.syscall(lin(5, 9, 0x10100))) == -9 && sres(p.syscall(lin(5, 1, 0xDEAD0000))) == -14);
+  uint8_t zero = 0;
+  CHECK(s.write(0x10200, ConstByteView(&zero, 1)));
+  CHECK(p.syscall(lin(262, 1, 0x10200, 0x10100, 0x1000)) == 0);            // newfstatat(1, "", buf, AT_EMPTY_PATH)
+  CHECK(sres(p.syscall(lin(262, 1, 0x10200, 0x10100, 0))) == -2);          // a path lookup: no file system
+  CHECK(sres(p.syscall(lin(257, ~uint64_t{99}, 0x10200, 0))) == -2 && sres(p.syscall(lin(267, ~uint64_t{99}, 0x10200, 0x10100, 10))) == -2);
+  CHECK(sres(p.syscall(lin(8, 1, 0, 0))) == -29 && sres(p.syscall(lin(8, 9, 0, 0))) == -9);
+  uint8_t junk[32]; for (uint8_t& b : junk) b = 0xFF;
+  CHECK(s.write(0x10300, ConstByteView(junk, 32)));
+  CHECK(p.syscall(lin(13, 2, 0, 0x10300, 8)) == 0 && s.read(0x10300, ByteView(junk, 32)) && junk[0] == 0 && junk[31] == 0);      // rt_sigaction fills the old action
+  CHECK(p.syscall(lin(14, 0, 0, 0x10300, 8)) == 0 && p.syscall(lin(131, 0, 0x10300)) == 0 && p.syscall(lin(273, 0, 24)) == 0 && p.syscall(lin(28, 0x10000, 4096, 4)) == 0);
+  CHECK(sres(p.syscall(lin(334, 0, 0, 0, 0))) == -38);                     // rseq: not supported
+  CHECK(p.syscall(lin(302, 0, 3, 0, 0x10400)) == 0 && p.read_user_u64(0x10400, &v) && v == (8ull << 20));      // prlimit64(RLIMIT_STACK)
+  CHECK(p.syscall(lin(302, 0, 7, 0, 0x10400)) == 0 && p.read_user_u64(0x10400, &v) && v == ~uint64_t{0});
+  CHECK(p.syscall(lin(110)) == 0);
+  CHECK(p.syscall(lin(96, 0x10500, 0)) == 0 && p.read_user_u64(0x10500, &v) && v == 1700000000 && p.read_user_u64(0x10508, &v) && v == 5);
+  // getrandom: the host's bytes, spread over the request; not supported without a source.
+  CHECK(p.syscall(lin(318, 0x10600, 600, 0)) == 600);
+  uint8_t r1[16], r2[16];
+  CHECK(s.read(0x10600, ByteView(r1, 16)) && s.read(0x10600 + 584, ByteView(r2, 16)));
+  bool all_zero = true; for (uint8_t b : r1) all_zero = all_zero && b == 0;
+  CHECK(!all_zero);
+  CHECK(sres(p.syscall(lin(318, 0xDEAD0000, 16, 0))) == -14);
+  host.give_random = false;
+  CHECK(sres(p.syscall(lin(318, 0x10600, 16, 0))) == -38);
+  // A call this OS lacks is reported to the host.
+  CHECK(sres(p.syscall(lin(202, 0, 0, 0))) == -38 && host.unhandled == 202);
+  // The generic table has its own numbers and no arch_prctl.
+  Process g(2, ProcessBinding{SyscallAbi::Linux, UserArch::AArch64, syscall_interface(SyscallAbi::Linux, UserArch::AArch64)}, s, host);
+  CHECK(sres(g.syscall(lin(158, 0x1002, 0x7000))) == -38 && g.syscall(lin(173)) == 0 && g.syscall(lin(169, 0x10500, 0)) == 0);
+  CHECK(g.syscall(lin(80, 1, 0x10100)) == 0 && s.read(0x10100 + 16, ByteView(mode, 4)) && mode[1] == 0x21);      // generic struct stat keeps st_mode at 16
+}
+
+static std::string wide_to_narrow(AddressSpace& s, uint64_t at, uint64_t bytes) {
+  std::string out;
+  for (uint64_t i = 0; i + 1 < bytes + 1 && i < bytes; i += 2) { uint8_t c[2]; CHECK(s.read(at + i, ByteView(c, 2))); out.push_back(char(c[0])); }
+  return out;
+}
+
+static void test_windows_startup() {
+  RandomHost host;
+  UserProgram win(A, 33, host);
+  const StringView args[] = {"C:\\tools\\app.exe", "-v", "two words"};
+  const StringView env[] = {"PATH=C:\\bin", "A=b"};
+  Bytes pe = make_pe(1, true);
+  CHECK(win.load(view(pe), ArrayView<const StringView>(args, 3), ArrayView<const StringView>(env, 2), ConstByteView(nullptr, 0)) == LoadStatus::Ok);
+  AddressSpace& s = win.address_space();
+  Process& p = *win.process();
+  const uint64_t teb = win.start().gs_base, peb = win.start().argument;
+  CHECK(teb != 0 && peb != 0 && p.gs_base() == teb && p.fs_base() == 0 && win.start().fs_base == 0);
+  uint64_t v = 0;
+  CHECK(p.read_user_u64(teb + 0x30, &v) && v == teb);                       // gs:[0x30] = Self
+  CHECK(p.read_user_u64(teb + 0x60, &v) && v == peb);                       // gs:[0x60] = PEB
+  CHECK(p.read_user_u64(teb + 0x40, &v) && v == 33 && p.read_user_u64(teb + 0x48, &v) && v == 33);
+  uint64_t stack_base = 0, stack_limit = 0;
+  CHECK(p.read_user_u64(teb + 0x08, &stack_base) && p.read_user_u64(teb + 0x10, &stack_limit) && stack_base - stack_limit == kDefaultStackBytes);
+  CHECK(win.start().stack_pointer < stack_base && win.start().stack_pointer > stack_limit);
+  CHECK(p.read_user_u64(peb + 0x10, &v) && v == 0x100000000ull);            // ImageBaseAddress
+  uint8_t b4[4] = {};
+  CHECK(s.read(peb + 0x118, ByteView(b4, 4)) && b4[0] == 10);                // OSMajorVersion
+  uint64_t params = 0;
+  CHECK(p.read_user_u64(peb + 0x20, &params) && params != 0);
+  CHECK(p.read_user_u64(params + 0x20, &v) && v == 4 && p.read_user_u64(params + 0x28, &v) && v == 8 && p.read_user_u64(params + 0x30, &v) && v == 12);
+  uint8_t us[16];
+  CHECK(s.read(params + 0x70, ByteView(us, 16)));                           // CommandLine: UNICODE_STRING
+  uint64_t length = us[0] | (us[1] << 8), buffer = 0;
+  for (int i = 0; i < 8; ++i) buffer |= uint64_t{us[8 + i]} << (8 * i);
+  CHECK(wide_to_narrow(s, buffer, length) == "C:\\tools\\app.exe -v \"two words\"");
+  CHECK(s.read(params + 0x60, ByteView(us, 16)));                           // ImagePathName
+  length = us[0] | (us[1] << 8); buffer = 0;
+  for (int i = 0; i < 8; ++i) buffer |= uint64_t{us[8 + i]} << (8 * i);
+  CHECK(wide_to_narrow(s, buffer, length) == "C:\\tools\\app.exe");
+  uint64_t environment = 0, environment_size = 0;
+  CHECK(p.read_user_u64(params + 0x80, &environment) && p.read_user_u64(params + 0x3F0, &environment_size));
+  CHECK(environment_size == 17 * 2 && wide_to_narrow(s, environment, 11 * 2) == "PATH=C:\\bin");      // "PATH=C:\bin\0" "A=b\0" "\0"
+  // KUSER_SHARED_DATA
+  CHECK(s.read(kSharedUserDataAddress + 0x26C, ByteView(b4, 4)) && b4[0] == 10);
+  uint8_t prot = 0;
+  CHECK(s.protection_at(kSharedUserDataAddress, &prot) && prot == kProtRead);
+  // Static TLS: the TEB points at an array whose first entry is this thread's copy of the template, with the zero fill after it.
+  uint64_t array = 0, block = 0;
+  CHECK(p.read_user_u64(teb + 0x58, &array) && array != 0 && p.read_user_u64(array, &block) && block != 0);
+  uint8_t tls[16];
+  CHECK(s.read(block, ByteView(tls, 16)) && std::string((char*)tls, 8) == "TLSDATA!" && tls[8] == 0 && tls[15] == 0);
+  CHECK(s.read(0x100000000ull + 0x10D0, ByteView(b4, 4)) && b4[0] == 0 && b4[1] == 0);      // the index variable was set to 0
+  CHECK(s.write(block, ConstByteView(tls + 8, 1)));                          // the block is writable
+
+  // No TLS directory: no TLS pointer.
+  UserProgram plain(A, 34, host);
+  Bytes pe2 = make_pe();
+  CHECK(plain.load(view(pe2), ArrayView<const StringView>(), ArrayView<const StringView>(), ConstByteView(nullptr, 0)) == LoadStatus::Ok);
+  CHECK(plain.process()->read_user_u64(plain.start().gs_base + 0x58, &v) && v == 0);
+  // Damaged TLS directories are refused, not followed.
+  Bytes bad = make_pe(1, true); put(bad, 0x288, 0x100000000ull + 0x10C0 - 8, 8);        // end before start
+  UserProgram u1(A, 35, host);
+  CHECK(u1.load(view(bad), ArrayView<const StringView>(), ArrayView<const StringView>(), ConstByteView(nullptr, 0)) == LoadStatus::Malformed);
+  bad = make_pe(1, true); put(bad, 0x280, 0x100000000ull + 0x10F0000, 8); put(bad, 0x288, 0x100000000ull + 0x10F0008, 8);      // template outside the image
+  UserProgram u2(A, 36, host);
+  CHECK(u2.load(view(bad), ArrayView<const StringView>(), ArrayView<const StringView>(), ConstByteView(nullptr, 0)) == LoadStatus::Malformed);
+  bad = make_pe(1, true); put(bad, 0x2A0, 0x7FFFFFFF, 4);                                // absurd zero fill
+  UserProgram u3(A, 37, host);
+  CHECK(u3.load(view(bad), ArrayView<const StringView>(), ArrayView<const StringView>(), ConstByteView(nullptr, 0)) == LoadStatus::Malformed);
+  // Bit flips in the TLS directory and the startup text never read or write out of bounds.
+  Bytes base = make_pe(1, true);
+  for (size_t i = 0x280; i < 0x2A8; ++i) for (int bit = 0; bit < 8; ++bit) {
+    Bytes f = base; f[i] ^= uint8_t(1 << bit);
+    UserProgram u(A, 38, host);
+    (void)u.load(view(f), ArrayView<const StringView>(args, 3), ArrayView<const StringView>(env, 2), ConstByteView(nullptr, 0));
+  }
+}
+
 int main() {
   test_address_space();
   test_load_elf();
@@ -666,6 +834,8 @@ int main() {
   test_windows_memory();
   test_user_program();
   test_user_page_tables();
+  test_linux_thread_pointer_and_startup_calls();
+  test_windows_startup();
   CHECK(A.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

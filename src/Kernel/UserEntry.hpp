@@ -50,6 +50,9 @@ uint64_t core_entry_stack_top(uint32_t core);
 // user-mode thread, and when its tables are rebuilt.
 void set_current_user_context(uint64_t cr3, void* context);
 
+// Changes the FS and/or GS base the calling user thread will return to ring 3 with (and keeps them for later switches).
+void set_current_user_bases(bool set_fs, uint64_t fs, bool set_gs, uint64_t gs);
+
 // Called on exceptions taken in user mode (instead of the kernel panic).
 using UserFaultHandler = Frame* (*)(Frame* frame);
 void set_user_fault_handler(UserFaultHandler handler);

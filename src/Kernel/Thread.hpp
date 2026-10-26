@@ -63,6 +63,7 @@ struct Thread {
   uint8_t* stack_top = nullptr;
   uint64_t user_cr3 = 0;
   uint64_t user_gs = 0;
+  uint64_t user_fs = 0;        // the program's FS base (saved when the thread is switched out)
   void* user_context = nullptr;
 };
 
