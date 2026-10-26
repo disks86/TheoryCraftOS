@@ -18,12 +18,13 @@
 
 // A small command shell for the terminal: it keeps a current folder on a filesystem and runs one command line at a time, writing what
 // the command prints through the host's write function. Commands: help, pwd, cd, ls [-l], cat, echo, mkdir, touch, rm [-r], cp, mv, stat,
-// clear, exit. Arguments are separated by blanks; "double" or 'single' quotes keep blanks inside an argument. Paths may be absolute or
+// clear, exit; a word that names an ELF or PE file runs that program when the host can. Arguments are separated by blanks; "double" or 'single' quotes keep blanks inside an argument. Paths may be absolute or
 // relative to the current folder and may use "." and ".." (resolved here: the filesystems do not know them). It works on any IFileSystem, so
 // it also goes into mounted network shares. Everything runs in the calling thread.
 #pragma once
 #include "Executable/ExecutableKind.hpp"
 #include "FileSystem/IFileSystem.hpp"
+#include "Utility/ArrayView.hpp"
 #include "Utility/String.hpp"
 
 namespace desktop {
@@ -36,6 +37,10 @@ class Shell {
     void (*exit)(void* context) = nullptr;    // the "exit" command
     // A command that names an ELF or PE file was typed: `path` is its absolute path. The shell has already printed a line about it.
     void (*unsupported_executable)(void* context, StringView path, exe::ExecutableKind kind) = nullptr;
+    // If set, a command that names an ELF or PE file runs it: `path` is its absolute path, `arguments` what followed the command. The host runs the program
+    // (blocking until it ends) and prints what it needs to; it returns false if it cannot run programs, and the shell then falls back on
+    // unsupported_executable. The shell's current folder is cwd().
+    bool (*run_executable)(void* context, StringView path, exe::ExecutableKind kind, ArrayView<const StringView> arguments) = nullptr;
     void* context = nullptr;
   };
   static constexpr uint32_t kMaxArguments = 16;
@@ -67,7 +72,7 @@ class Shell {
   void rm(StringView* args, uint32_t count);
   void cp_or_mv(StringView command, StringView* args, uint32_t count, bool move);
   void stat(StringView path);
-  bool run_program(StringView command);
+  bool run_program(StringView command, StringView* args, uint32_t count);
   void help() const;
 
   allocators::IAllocator& allocator_;

@@ -564,6 +564,9 @@ add_executable(BOOTX64
   src/Process/LinuxFiles.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp
+  src/Process/ProgramEnvironment.cpp
+  src/Desktop/ProgramHost.cpp
+  src/Desktop/ProgramRunner.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
   src/Media/DashClient.cpp

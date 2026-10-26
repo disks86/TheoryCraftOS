@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Terminal.hpp"
+#include "Desktop/ProgramRunner.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -62,6 +63,7 @@ Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(
   host.clear = &Terminal::host_clear;
   host.exit = &Terminal::host_exit;
   host.unsupported_executable = &Terminal::host_unsupported_executable;
+  host.run_executable = &Terminal::host_run_executable;
   host.context = this;
   shell_.set_host(host);
   view_.write("TheoryCraftOS terminal. Type help for the commands;\ndrop a folder here to go to it.\n\n");
@@ -84,6 +86,7 @@ void Terminal::refresh_prompt() {
   set_title(title.view());
 }
 
+void Terminal::host_write_output(void* self, StringView text) { static_cast<Terminal*>(self)->view_.write(text); }
 void Terminal::host_write(void* self, StringView text) { static_cast<Terminal*>(self)->view_.write(text); }
 void Terminal::host_clear(void* self) { static_cast<Terminal*>(self)->view_.clear(); }
 void Terminal::host_exit(void* self) { static_cast<Terminal*>(self)->close(); }
@@ -209,6 +212,53 @@ void Terminal::host_unsupported_executable(void* self, StringView path, exe::Exe
   auto* t = static_cast<Terminal*>(self);
   String message(t->allocator());
   if (exe::unsupported_executable_message(path, kind, &message)) t->notify(NoticeKind::Warning, message.view());
+}
+
+// Runs a program the shell found. This blocks the window's handler thread until the program ends (other windows have their own); what it prints comes
+// into the terminal as it is printed.
+bool Terminal::host_run_executable(void* self, StringView path, exe::ExecutableKind kind, ArrayView<const StringView> arguments) {
+  auto* t = static_cast<Terminal*>(self);
+  if (!t->fs_) return false;
+  ProgramRun run;
+  run.allocator = &t->allocator();
+  run.files = t->fs_;
+  run.path = path;
+  run.working_directory = t->shell_.cwd();
+  run.arguments = arguments;
+  run.kind = kind;
+  run.output = &Terminal::host_write_output;
+  run.context = t;
+  uint32_t code = 0;
+  String message(t->allocator());
+  const RunResult result = run_program(run, &code, &message);
+  String line(t->allocator());
+  switch (result) {
+    case RunResult::CouldNotRun:
+      line.assign(path);
+      line.append(": ");
+      line.append(message.view());
+      line.push_back('\n');
+      break;
+    case RunResult::Faulted:
+      line.assign("[");
+      line.append(message.view());
+      line.append("]\n");
+      break;
+    case RunResult::Exited:
+      if (code != 0 || !message.empty()) {
+        line.assign("[");
+        if (code != 0) {
+          line.append("exit code ");
+          line.append_uint(code);
+          if (!message.empty()) line.append("; ");
+        }
+        line.append(message.view());
+        line.append("]\n");
+      }
+      break;
+  }
+  if (!line.empty()) t->view_.write(line.view());
+  return true;
 }
 
 void Terminal::on_clear(void* self, Control&) { static_cast<Terminal*>(self)->view_.clear(); }
