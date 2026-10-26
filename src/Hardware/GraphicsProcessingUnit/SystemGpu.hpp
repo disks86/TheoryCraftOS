@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Hardware/GraphicsProcessingUnit/AMD/AmdGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/GpuContext.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
@@ -43,6 +44,8 @@ class SystemGpu {
   IGraphicsProcessingUnit* gpu() { return active_; }
   // The active GPU as a virtio-gpu if it is one (the 3D path needs its command channel), else nullptr.
   VirtioGpu* virtio_gpu() { return virtio_ ? static_cast<VirtioGpu*>(active_) : nullptr; }
+  // The active GPU as an AMD one if it is (on a Raven-family APU it can show an OS framebuffer of its own), else nullptr.
+  AmdGpu* amd_gpu() { return amd_ ? static_cast<AmdGpu*>(active_) : nullptr; }
   // The active GPU as an Intel one if it is (it can drive the display engine natively), else nullptr.
   IntelGpu* intel_gpu() { return intel_ ? static_cast<IntelGpu*>(active_) : nullptr; }
   // The active GPU as a VMware SVGA II adapter if it is one (its 3D engine takes commands through the FIFO), else nullptr.
@@ -50,13 +53,14 @@ class SystemGpu {
 
  private:
   static constexpr unsigned long kSize =
-      GpuMaxOf(GpuMaxOf(GpuMaxOf(GpuMaxOf(sizeof(UefiGopGpu), sizeof(QemuStdVgaGpu)), sizeof(VirtioGpu)), sizeof(VmwareSvgaGpu)), sizeof(IntelGpu));
+      GpuMaxOf(GpuMaxOf(GpuMaxOf(GpuMaxOf(GpuMaxOf(sizeof(UefiGopGpu), sizeof(QemuStdVgaGpu)), sizeof(VirtioGpu)), sizeof(VmwareSvgaGpu)), sizeof(IntelGpu)), sizeof(AmdGpu));
 
   alignas(16) unsigned char storage_[kSize];
   IGraphicsProcessingUnit* active_ = nullptr;
   bool virtio_ = false;
   bool vmware_ = false;
   bool intel_ = false;
+  bool amd_ = false;
 };
 
 }  // namespace hardware

@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelScanout.hpp"
+#include "Hardware/GraphicsProcessingUnit/FramebufferFlush.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace hardware {
@@ -78,15 +79,7 @@ bool Scanout::set_mode(uint32_t width, uint32_t height, ByteView* memory, uint32
 }
 
 void Scanout::flush(ByteView memory, uint32_t pitch_bytes, uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
-  if (width == 0 || height == 0 || pitch_bytes == 0) return;
-  constexpr uint64_t kLine = 64;
-  for (uint32_t row = y; row < y + height; ++row) {
-    const uint64_t start = uint64_t{row} * pitch_bytes + uint64_t{x} * 4;
-    const uint64_t end = start + uint64_t{width} * 4;
-    if (end > memory.size()) break;
-    for (uint64_t at = start & ~(kLine - 1); at < end; at += kLine) __builtin_ia32_clflush(memory.data() + at);
-  }
-  __builtin_ia32_sfence();
+  flush_framebuffer_rect(memory, pitch_bytes, x, y, width, height);
 }
 
 void Scanout::shutdown() {

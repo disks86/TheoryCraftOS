@@ -115,7 +115,7 @@ class AmdVcnVideoEngine final : public SoftwareVideoCodec {
     mapper_ = environment.mapper;
     MmioVcnRegisters registers(registers_);
     plan_ = amd_plan_vcn1_memory(amd_read_raven_memory_map(registers), device_id_, revision_, AmdVcn1::block_bytes(firmware_), environment.framebuffer_base,
-                                 environment.framebuffer_bytes);
+                                 environment.framebuffer_bytes, environment.reserved_tail_bytes);
     if (plan_.result != AmdVcn1Plan::Result::Ok) {
       plan_text_.append(amd_vcn1_plan_result_name(plan_.result));
       return false;

@@ -60,8 +60,10 @@ SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllo
       active_ = try_gpu<IntelGpu>(storage_, context);
       intel_ = active_ != nullptr;
     }
-    else if (d.vendor_id == AmdGpu::kPciVendor)
+    else if (d.vendor_id == AmdGpu::kPciVendor) {
       active_ = try_gpu<AmdGpu>(storage_, context);
+      amd_ = active_ != nullptr;
+    }
     else if (d.vendor_id == NvidiaGpu::kPciVendor)
       active_ = try_gpu<NvidiaGpu>(storage_, context);
   }

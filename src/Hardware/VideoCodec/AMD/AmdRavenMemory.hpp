@@ -88,8 +88,22 @@ const char* amd_vcn1_plan_result_name(AmdVcn1Plan::Result result);
 // Chooses the block (for `block_bytes`, AmdVcn1::block_bytes(firmware)) and the rings. `framebuffer_physical`/`framebuffer_bytes` are the firmware's display buffer
 // (the UEFI graphics output's), which must lie inside the carve-out. Pure arithmetic: nothing is read or mapped. Ok means every address is consistent and clear of the
 // firmware's part; it does not mean the memory is safe to touch (map_amd_vcn1_plan refuses a range that is memory the OS owns).
+//
+// `tail_reserved` bytes at the end of video memory, short of the tail guard, are not used: the display's own framebuffer lives there (amd_plan_display_region()), and
+// decoding must keep clear of it.
 AmdVcn1Plan amd_plan_vcn1_memory(const AmdRavenMemoryMap& map, uint16_t pci_device_id, uint8_t pci_revision, uint64_t block_bytes, uint64_t framebuffer_physical,
-                                 uint64_t framebuffer_bytes);
+                                 uint64_t framebuffer_bytes, uint64_t tail_reserved = 0);
+
+// Where the OS keeps its own copy of the screen (the display engine is pointed at it instead of at the firmware's framebuffer): `bytes` (whole MiB, enough for
+// the largest mode) just short of the tail guard, clear of the firmware's part and its guard. Pure arithmetic, like the plan above.
+struct AmdDisplayRegion {
+  bool ok = false;
+  uint64_t offset = 0, bytes = 0;      // within video memory
+  uint64_t gpu_address = 0;            // as the GPU addresses it
+  uint64_t physical = 0;               // as the CPU addresses it
+};
+// `bytes` is rounded up to whole MiB. False (ok = false) if the firmware's framebuffer is not inside the carve-out, or there is no room for the region.
+AmdDisplayRegion amd_plan_display_region(const AmdRavenMemoryMap& map, uint64_t bytes, uint64_t framebuffer_physical, uint64_t framebuffer_bytes);
 
 // Maps the planned block and rings for the CPU. Only a plan that is Ok is mapped; the mapper refuses a range that overlaps memory the OS owns (then false and
 // nothing is mapped).

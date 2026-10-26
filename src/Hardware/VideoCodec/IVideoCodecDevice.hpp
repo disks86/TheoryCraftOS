@@ -49,6 +49,8 @@ struct VideoEngineEnvironment {
   IRegisterMapper* mapper = nullptr;
   uint64_t framebuffer_base = 0;
   uint64_t framebuffer_bytes = 0;
+  // Video memory the display driver keeps for its own framebuffer, at the end of video memory (AMD APUs): an engine must leave it alone.
+  uint64_t reserved_tail_bytes = 0;
 };
 
 // Something that decodes and encodes video: a hardware engine, or the software fallback that is always

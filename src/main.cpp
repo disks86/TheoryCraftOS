@@ -432,6 +432,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     console::puts("TheoryCraftOS: initializing hardware\n");
     bootlog::replay();  // the mode change cleared what was logged so far
     Entry(Level::Ok, "GPU").text(gpu->name()).text(", ").dec(gpu->width()).text("x").dec(gpu->height()).text(", ").dec(gpu->mode_count()).text(" modes");
+    if (hardware::AmdGpu* amd = system_gpu.amd_gpu())
+      Entry(amd->native_available() ? Level::Ok : Level::Info, "GPU").text(amd->native_available() ? "display engine: own framebuffer in video memory (AMD DCN 1.0), the firmware sets the modes" : "firmware framebuffer (own framebuffer needs a Raven-family APU)");
     if (hardware::IntelGpu* intel = system_gpu.intel_gpu())
       Entry(intel->native_available() ? Level::Ok : Level::Info, "GPU").text(intel->native_available() ? "native mode setting (Intel display engine)" : "firmware framebuffer (native mode setting needs a supported Intel GPU)");
   } else {
@@ -968,6 +970,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     hardware::VideoEngineEnvironment engine_environment;
     engine_environment.mapper = paging_ok ? &register_mapper : nullptr;
     if (gpu) gpu->framebuffer_range(&engine_environment.framebuffer_base, &engine_environment.framebuffer_bytes);
+    if (hardware::AmdGpu* amd = system_gpu.amd_gpu()) engine_environment.reserved_tail_bytes = amd->reserved_video_memory();
     for (uint32_t i = 0; i < video_codecs.count(); ++i) {
       hardware::IVideoCodecDevice& planned_device = *video_codecs.at(i);
       const bool planned = planned_device.plan_engine(engine_environment);
