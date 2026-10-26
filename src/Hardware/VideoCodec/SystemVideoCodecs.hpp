@@ -55,6 +55,9 @@ class SystemVideoCodecs {
   // H.264 decoding on the video engine of Gen9.5 Intel GPUs (needs set_mmio, so it is only tried where the registers could be mapped). On by default; pass false
   // to keep every session on the CPU. That path has only been run against a simulated GPU, so a real GPU that does not answer as expected leaves the sessions on the CPU.
   void set_intel_hardware_decode(bool enable) { intel_hardware_ = enable; }
+  // The UVD 6 video engine of the Radeon RX Vega M (Kaby Lake-G): with this on, the card gets an AmdUvd6VideoEngine that can be planned and started; off (the default),
+  // it is only named like any other Radeon. Opt-in because the start has never run on a real card (it does not power the engine itself).
+  void set_amd_uvd6(bool enable) { amd_uvd6_ = enable; }
   // The memory the engine driver takes buffers from; by default the OS allocator's DMA pool. (For tests, which have no memory at device addresses.)
   void set_intel_gpu_memory(intel_gt::IGpuMemory* memory) { gpu_memory_override_ = memory; }
 
@@ -82,12 +85,14 @@ class SystemVideoCodecs {
   void add_amd(const PciDeviceInfo& d);
   bool intel_hardware_setup(const PciDeviceInfo& d, struct IntelHardware* out);
   void add_intel(const PciDeviceInfo& d);
+  void add_amd_uvd6(const PciDeviceInfo& d);
 
   const IPciBus& pci_;
   allocators::IAllocator& allocator_;
   IRegisterMapper* mmio_ = nullptr;
   IBarSizer* bar_sizer_ = nullptr;
   bool intel_hardware_ = true;
+  bool amd_uvd6_ = false;
   intel_gt::AllocatorGpuMemory gpu_memory_{allocator_};
   intel_gt::IGpuMemory* gpu_memory_override_ = nullptr;
   UniquePointer<intel_gt::MmioRegisterBank> intel_registers_bank_;  // lives as long as the device that uses it
