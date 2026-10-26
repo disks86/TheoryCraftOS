@@ -107,6 +107,8 @@ struct JsString : Cell {
   uint32_t length = 0;
   uint32_t hash = 0;
   bool interned = false;   // property names are interned: two equal names are the same cell
+  bool symbol = false;     // a Symbol: a string cell that scripts see as a symbol (typeof, no conversion to string or number, hidden from the string property lists); its text is "@@<description>#<n>"
+  bool described = false;  // a symbol made with a description (Symbol('') is not Symbol())
   // What the bytes mean to a script (looked at when something asks for the length in characters or an index; see Vm::string_kind):
   //   ascii: every byte is a character; text: valid UTF-8 (a lone surrogate is kept as its three bytes), a character is a UTF-16 code unit;
   //   binary: raw bytes made by __bytes_to_string, atob and the like (or anything that is not valid UTF-8): every byte is a character, its value.

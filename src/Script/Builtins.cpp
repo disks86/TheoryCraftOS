@@ -602,6 +602,10 @@ NATIVE(template_object) {
 }
 
 NATIVE(object_to_string) {
+  if (Vm::is_symbol(self)) {
+    *result = str_value(vm, "[object Symbol]");
+    return true;
+  }
   if (self.is_object()) {   // [Symbol.toStringTag]
     Value tag;
     if (vm.get_named(self, "@@toStringTag", &tag) && tag.is_string()) {
@@ -1132,7 +1136,8 @@ NATIVE(string_ctor) {
     return true;
   }
   JsString* s;
-  if (!vm.to_string(args[0], &s)) return false;
+  if (Vm::is_symbol(args[0])) s = vm.symbol_descriptive_string(args[0].as_string());   // String(sym) is allowed, unlike sym + ''
+  else if (!vm.to_string(args[0], &s)) return false;
   *result = Value::make_string(s);
   return true;
 }
@@ -1997,17 +2002,49 @@ NATIVE(promise_catch) {
 // --- Symbol (just enough for Symbol.iterator: a symbol is a string that begins "@@") ------------------------------------------
 
 NATIVE(symbol_function) {
-  static uint32_t counter = 0;
-  String text(vm.allocator());
-  text.append("@@");
-  JsString* description;
-  if (argc > 0 && !args[0].is_undefined()) {
-    if (!vm.to_string(args[0], &description)) return false;
-    text.append(description->view());
+  if (self.is_object() && self.as_object()->proto == vm.symbol_proto()) return vm.throw_error(ErrorKind::TypeError, "Symbol is not a constructor");   // (new Symbol())
+  JsString* symbol = vm.new_symbol(argc > 0 ? args[0] : Value());
+  if (!symbol) return false;
+  *result = Value::make_string(symbol);
+  return true;
+}
+
+// __symbol_info(symbol, what): 0 the description (undefined if there is none), 1 "Symbol(description)", 2 whether it is a symbol
+NATIVE(symbol_info) {
+  (void)self;
+  const Value v = arg_at(args, argc, 0);
+  double what = 0;
+  vm.to_number(arg_at(args, argc, 1), &what);
+  if (what == 2) {
+    *result = Value::make_bool(Vm::is_symbol(v));
+    return true;
   }
-  text.push_back('#');
-  text.append_uint(++counter);
-  *result = str_value(vm, text.view());
+  if (!Vm::is_symbol(v)) return vm.throw_error(ErrorKind::TypeError, "Receiver is not a symbol");
+  JsString* s = v.as_string();
+  if (what == 1) {
+    *result = Value::make_string(vm.symbol_descriptive_string(s));
+    return true;
+  }
+  if (what == 3) {   // the unique text (the key of a Map entry)
+    *result = Value::make_string(vm.new_string(s->view()));
+    return true;
+  }
+  StringView t = s->view();
+  uint64_t i = t.size();
+  while (i > 2 && t[i - 1] != '#') --i;
+  if (i <= 2 && s->described) {   // a well-known symbol: Symbol.iterator.description is "Symbol.iterator"
+    String text(vm.allocator());
+    text.append("Symbol.");
+    text.append(t.substr(2));
+    *result = str_value(vm, text.view());
+  } else *result = s->described && i > 2 ? str_value(vm, t.substr(2, i - 3)) : Value();
+  return true;
+}
+
+NATIVE(object_get_own_property_symbols) {
+  (void)self;
+  const Value v = arg_at(args, argc, 0);
+  *result = v.is_object() ? Value::make_object(vm.own_symbols(v.as_object())) : Value::make_object(vm.new_array());
   return true;
 }
 
@@ -2089,7 +2126,11 @@ struct JsonWriter {
         }
         *wrote = true;
         return true;
-      case Tag::String: json_quote(value.as_string()->view(), &out); *wrote = true; return true;
+      case Tag::String:
+        if (value.as_string()->symbol) return true;   // (a symbol has no JSON form)
+        json_quote(value.as_string()->view(), &out);
+        *wrote = true;
+        return true;
       case Tag::Object: break;
     }
     if (Vm::is_callable(value)) return true;
@@ -2940,13 +2981,20 @@ bool install_builtins(Vm& vm) {
 
   // Symbol
   JsObject* symbol = vm.new_native(symbol_function, "Symbol", 0);
+  vm.define(symbol, vm.prototype_name(), Value::make_object(vm.symbol_proto()), 0);
+  vm.define(vm.symbol_proto(), vm.intern("constructor"), Value::make_object(symbol), kWritable);
   global_value("Symbol", Value::make_object(symbol));
-  for (const char* name : {"iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag", "species"}) {
+  for (const char* name : {"iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag", "species", "isConcatSpreadable", "match", "matchAll", "replace", "search", "split", "unscopables"}) {
     String well_known(vm.allocator());
     well_known.append("@@");
     well_known.append(name);
-    vm.define_named(symbol, name, str_value(vm, well_known.view()), 0);
+    JsString* s = vm.intern(well_known.view());   // (the C++ side looks these up by their text: the same cell)
+    s->symbol = true;
+    s->described = true;
+    vm.define_named(symbol, name, Value::make_string(s), 0);
   }
+  vm.define_native(g, "__symbol_info", symbol_info, 2);
+  vm.define_native(object, "getOwnPropertySymbols", object_get_own_property_symbols, 1);
 
   // Promise
   JsObject* promise = make_ctor("Promise", promise_ctor, 1, vm.promise_proto());
