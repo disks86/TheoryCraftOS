@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Regex/RegexProgram.hpp"
+#include "Regex/UnicodeProperties.hpp"
 
 namespace regex {
 
@@ -30,7 +31,9 @@ namespace regex {
 //   ^ $ \b \B \A \z      (? ... ): groups  (...) (?:...) (?<name>...)  \1 \k<name>
 //   a|b   * + ? {n} {n,} {n,m} and the lazy forms *? +? ?? {n,m}?
 //   lookahead (?=...) (?!...)
-// Not supported: lookbehind, possessive quantifiers, inline flags, Unicode properties.
+//   lookbehind (?<=...) (?<!...)  (matched backwards: the terms of a branch are emitted in reverse order, with instructions that read the character before)
+//   \p{...} \P{...}  Unicode properties (only with Flags::Unicode; see UnicodeProperties.hpp)
+// Not supported: possessive quantifiers, inline flags, set notation of the v flag.
 //
 // The parser is one pass that emits code directly: a quantifier is applied by
 // inserting a Split in front of the piece it follows and copying that piece,
@@ -53,6 +56,7 @@ class Compiler {
     groups_ = 1;
     loops_ = 0;
     look_depth_ = 0;
+    backward_ = false;
     bool nullable = false;
     if (!parse_alternation(&nullable, 0)) return error_;
     if (pos_ != length_) {  // a ')' with nothing open
@@ -95,10 +99,82 @@ class Compiler {
     }
     return true;
   }
+  // The instruction that reads a character: in a lookbehind, the one that reads the character before the position.
+  constexpr Op reading(Op forward) const {
+    if (!backward_) return forward;
+    switch (forward) {
+      case Op::Char: return Op::CharBack;
+      case Op::CharFold: return Op::CharFoldBack;
+      case Op::Any: return Op::AnyBack;
+      case Op::AnyAll: return Op::AnyAllBack;
+      case Op::Class: return Op::ClassBack;
+      case Op::ClassNot: return Op::ClassNotBack;
+      case Op::Backref: return Op::BackrefBack;
+      case Op::BackrefFold: return Op::BackrefFoldBack;
+      default: return forward;
+    }
+  }
   constexpr bool emit_char(uint32_t cp) {
     if (fold_ && ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z')))
-      return emit(Op::CharFold, static_cast<int32_t>(cp | 0x20));
-    return emit(Op::Char, static_cast<int32_t>(cp));
+      return emit(reading(Op::CharFold), static_cast<int32_t>(cp | 0x20));
+    return emit(reading(Op::Char), static_cast<int32_t>(cp));
+  }
+  // Removes code_[at, at+count).
+  constexpr void erase_code(uint64_t at, uint64_t count) {
+    for (uint64_t i = at; i + count < code_.size(); ++i) code_[i] = code_[i + count];
+    code_.truncate(code_.size() - count);
+  }
+  // After \p or \P (at the '{'): the ranges of the property, added to the set being made. `negate`: the code points that are not in it.
+  constexpr bool add_property(bool negate) {
+    if (!accept('{')) return fail(Error::BadEscape);
+    const uint64_t start = pos_;
+    while (!at_end() && peek() != '}') ++pos_;
+    if (at_end()) return fail(Error::BadEscape);
+    const uint64_t length = pos_ - start;
+    ++pos_;
+    uint64_t eq = length;
+    for (uint64_t i = 0; i < length; ++i)
+      if (text_[start + i] == '=') { eq = i; break; }
+    bool have = false;   // (a flag, not a null pointer: a constant expression cannot compare the address of a table entry with null)
+    const unicode::PropertyEntry* found = unicode::kBinaryAndCategories;
+    if (eq == length) {
+      for (const unicode::PropertyEntry& e : unicode::kBinaryAndCategories)
+        if (same_text(e.name, start, length)) { found = &e; have = true; break; }
+    } else if (same_text("General_Category", start, eq) || same_text("gc", start, eq)) {
+      for (const unicode::PropertyEntry& e : unicode::kBinaryAndCategories)
+        if (same_text(e.name, start + eq + 1, length - eq - 1)) { found = &e; have = true; break; }
+    } else if (same_text("Script", start, eq) || same_text("sc", start, eq) || same_text("Script_Extensions", start, eq) || same_text("scx", start, eq)) {
+      for (const unicode::PropertyEntry& e : unicode::kScripts)
+        if (same_text(e.name, start + eq + 1, length - eq - 1)) { found = &e; have = true; break; }
+    }
+    if (!have) return fail(Error::BadProperty);
+    if (!negate) {
+      for (uint32_t i = 0; i < found->count; ++i)
+        if (!push_folded(found->ranges[i].lo, found->ranges[i].hi)) return false;
+      return true;
+    }
+    uint32_t next = 0;
+    for (uint32_t i = 0; i < found->count; ++i) {
+      if (found->ranges[i].lo > next && !push_folded(next, found->ranges[i].lo - 1)) return false;
+      next = found->ranges[i].hi + 1;
+    }
+    return next > kMaxCodePoint || push_folded(next, kMaxCodePoint);
+  }
+  // A range, and the other case of the ASCII letters in it when the pattern ignores case.
+  constexpr bool push_folded(uint32_t lo, uint32_t hi) {
+    if (!push_range(lo, hi)) return false;
+    if (!fold_) return true;
+    uint32_t a = lo > 'a' ? lo : 'a', b = hi < 'z' ? hi : 'z';
+    if (a <= b && !push_range(a - 32, b - 32)) return false;
+    a = lo > 'A' ? lo : 'A';
+    b = hi < 'Z' ? hi : 'Z';
+    return a > b || push_range(a + 32, b + 32);
+  }
+  constexpr bool same_text(const char* name, uint64_t start, uint64_t length) const {
+    uint64_t i = 0;
+    for (; i < length; ++i)
+      if (name[i] == '\0' || name[i] != text_[start + i]) return false;
+    return name[i] == '\0';
   }
   constexpr bool add_range(uint32_t lo, uint32_t hi) {
     Range r;
@@ -218,6 +294,7 @@ class Compiler {
         }
         return read_hex(4, cp);
       default:
+        if ((c == 'p' || c == 'P') && !has_flag(flags_, Flags::Unicode)) return read_char(cp);   // (without the u flag \p is just a p)
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c)) return fail(Error::BadEscape);
         return read_char(cp);  // an escaped punctuation mark stands for itself
     }
@@ -255,10 +332,24 @@ class Compiler {
   // branch := term*
   constexpr bool parse_branch(bool* nullable, uint32_t depth) {
     bool all = true;
+    constexpr uint32_t kMaxTerms = 256;
+    uint64_t bounds[kMaxTerms + 1] = {};
+    uint32_t terms = 0;
+    bounds[0] = code_.size();
     while (!at_end() && peek() != '|' && peek() != ')') {
       bool n = false;
       if (!parse_term(&n, depth)) return false;
       all = all && n;
+      if (backward_) {
+        if (terms >= kMaxTerms) return fail(Error::ProgramTooLarge);
+        bounds[++terms] = code_.size();
+      }
+    }
+    if (backward_ && terms > 1) {   // a lookbehind matches the terms of a branch from the last to the first (every term is a block that moves as it is)
+      const uint64_t total = bounds[terms] - bounds[0];
+      for (uint32_t i = terms; i > 0; --i)
+        if (!append_copy(bounds[i - 1], bounds[i] - bounds[i - 1])) return false;
+      erase_code(bounds[0], total);
     }
     *nullable = all;
     return true;
@@ -284,7 +375,7 @@ class Compiler {
       }
       case '.':
         ++pos_;
-        if (!emit(has_flag(flags_, Flags::DotAll) ? Op::AnyAll : Op::Any)) return false;
+        if (!emit(reading(has_flag(flags_, Flags::DotAll) ? Op::AnyAll : Op::Any))) return false;
         break;
       case '^':
         ++pos_;
@@ -332,7 +423,14 @@ class Compiler {
         ++pos_;
         const uint64_t first = ranges_.size();
         if (!add_set(c)) return false;
-        return emit(Op::Class, static_cast<int32_t>(first), static_cast<int32_t>(ranges_.size() - first));
+        return emit(reading(Op::Class), static_cast<int32_t>(first), static_cast<int32_t>(ranges_.size() - first));
+      }
+      case 'p': case 'P': {
+        if (!has_flag(flags_, Flags::Unicode)) break;   // without the u flag \p is just a p
+        ++pos_;
+        const uint64_t first = ranges_.size();
+        if (!add_property(c == 'P')) return false;
+        return emit(reading(Op::Class), static_cast<int32_t>(first), static_cast<int32_t>(ranges_.size() - first));
       }
       case 'b': ++pos_; *repeatable = false; return emit(Op::WordBoundary);
       case 'B': ++pos_; *repeatable = false; return emit(Op::NotWordBoundary);
@@ -348,7 +446,7 @@ class Compiler {
         ++pos_;
         if (g < 0) return fail(Error::BadBackreference);
         *nullable = true;
-        return emit(fold_ ? Op::BackrefFold : Op::Backref, g);
+        return emit(reading(fold_ ? Op::BackrefFold : Op::Backref), g);
       }
       default: break;
     }
@@ -361,7 +459,7 @@ class Compiler {
       }
       if (n >= groups_) return fail(Error::BadBackreference);
       *nullable = true;
-      return emit(fold_ ? Op::BackrefFold : Op::Backref, static_cast<int32_t>(n));
+      return emit(reading(fold_ ? Op::BackrefFold : Op::Backref), static_cast<int32_t>(n));
     }
     uint32_t cp;
     return read_escaped_char(&cp) && emit_char(cp);
@@ -374,6 +472,12 @@ class Compiler {
     for (;;) {
       if (at_end()) return fail(Error::UnterminatedClass);
       if (accept(']')) break;
+      if (peek() == '\\' && (peek(1) == 'p' || peek(1) == 'P') && has_flag(flags_, Flags::Unicode)) {   // \p{...} inside a set
+        const bool negated_property = peek(1) == 'P';
+        pos_ += 2;
+        if (!add_property(negated_property)) return false;
+        continue;
+      }
       uint32_t lo;
       char set = 0;
       if (!parse_class_atom(&lo, &set)) return false;
@@ -390,7 +494,7 @@ class Compiler {
       }
       if (!add_range(lo, hi)) return false;
     }
-    return emit(negate ? Op::ClassNot : Op::Class, static_cast<int32_t>(first), static_cast<int32_t>(ranges_.size() - first));
+    return emit(reading(negate ? Op::ClassNot : Op::Class), static_cast<int32_t>(first), static_cast<int32_t>(ranges_.size() - first));
   }
   constexpr bool parse_class_atom(uint32_t* cp, char* set) {
     if (!accept('\\')) return read_char(cp);
@@ -418,15 +522,20 @@ class Compiler {
   constexpr bool parse_group(bool* nullable, bool* repeatable, uint32_t depth) {
     if (accept('?')) {
       if (accept(':')) return parse_group_body(nullable, depth);
-      if (peek() == '=' || peek() == '!') {
+      if (peek() == '=' || peek() == '!' || (peek() == '<' && (peek(1) == '=' || peek(1) == '!'))) {
+        const bool behind = peek() == '<';
+        if (behind) ++pos_;
         const bool negate = peek() == '!';
         ++pos_;
         if (look_depth_ >= kMaxLookDepth) return fail(Error::NestingTooDeep);
         ++look_depth_;
         const uint64_t look = code_.size();
         if (!emit(Op::Look, 0, negate ? 1 : 0)) return false;
+        const bool saved_direction = backward_;
+        backward_ = behind;   // (a lookbehind reads backwards, a lookahead inside it forwards again)
         bool inner = false;
         if (!parse_alternation(&inner, depth + 1)) return false;
+        backward_ = saved_direction;
         if (!accept(')')) return fail(Error::UnbalancedParen);
         if (!emit(Op::LookEnd)) return false;
         code_[look].a = static_cast<int32_t>(code_.size() - look);
@@ -436,7 +545,6 @@ class Compiler {
         return true;
       }
       if (accept('<')) {
-        if (peek() == '=' || peek() == '!') return fail(Error::Unsupported);
         const uint64_t name_start = pos_;
         if (!is_name_start(peek())) return fail(Error::BadGroupName);
         while (!at_end() && peek() != '>') {
@@ -464,8 +572,8 @@ class Compiler {
   constexpr bool parse_capture(bool* nullable, uint32_t depth) {
     if (groups_ >= kMaxGroups) return fail(Error::TooManyGroups);
     const uint32_t g = groups_++;
-    if (!emit(Op::Save, static_cast<int32_t>(g * 2)) || !parse_group_body(nullable, depth)) return false;
-    return emit(Op::Save, static_cast<int32_t>(g * 2 + 1));
+    if (!emit(Op::Save, static_cast<int32_t>(backward_ ? g * 2 + 1 : g * 2)) || !parse_group_body(nullable, depth)) return false;   // (read backwards, the end of a group comes first)
+    return emit(Op::Save, static_cast<int32_t>(backward_ ? g * 2 : g * 2 + 1));
   }
   // The alternation and closing parenthesis of a group.
   constexpr bool parse_group_body(bool* nullable, uint32_t depth) {
@@ -623,6 +731,7 @@ class Compiler {
   bool utf8_ = false, fold_ = false;
   Error error_ = Error::None;
   uint32_t groups_ = 1, loops_ = 0, look_depth_ = 0;
+  bool backward_ = false;   // inside a lookbehind
 };
 
 }  // namespace regex

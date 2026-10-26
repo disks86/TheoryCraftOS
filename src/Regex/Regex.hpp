@@ -125,7 +125,7 @@ class StaticRegex {
 
 namespace detail {
 
-constexpr uint32_t kScratchCode = 4096, kScratchRanges = 1024, kScratchNames = 32;
+constexpr uint32_t kScratchCode = 4096, kScratchRanges = 2048, kScratchNames = 32;
 
 struct Sizes {
   Error error = Error::None;

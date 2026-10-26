@@ -47,6 +47,7 @@ enum class Flags : uint32_t {
   Multiline = 2,   // ^ and $ also match at line breaks
   DotAll = 4,      // . also matches line breaks
   Utf8 = 8,        // pattern and input are UTF-8: one character is one code point, not one byte
+  Unicode = 16,    // the u flag: \p{...} and \P{...} are Unicode property escapes
 };
 constexpr Flags operator|(Flags a, Flags b) { return static_cast<Flags>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b)); }
 constexpr bool has_flag(Flags set, Flags one) { return (static_cast<uint32_t>(set) & static_cast<uint32_t>(one)) != 0; }
@@ -69,7 +70,8 @@ enum class Error : uint8_t {
   BadBackreference,
   ProgramTooLarge,
   NestingTooDeep,
-  Unsupported,        // lookbehind
+  Unsupported,
+  BadProperty,         // \p{Nope}
   BadUtf8,
   OutOfMemory,
 };
@@ -93,7 +95,8 @@ constexpr const char* error_text(Error e) {
     case Error::BadBackreference: return "backreference to a group that does not exist";
     case Error::ProgramTooLarge: return "pattern compiles to too large a program";
     case Error::NestingTooDeep: return "pattern nests too deeply";
-    case Error::Unsupported: return "unsupported syntax (lookbehind)";
+    case Error::Unsupported: return "unsupported syntax";
+    case Error::BadProperty: return "invalid property name";
     case Error::BadUtf8: return "pattern is not valid UTF-8";
     case Error::OutOfMemory: return "out of memory";
   }
@@ -122,7 +125,15 @@ enum class Op : uint8_t {
   NotWordBoundary,
   Backref,     // a = group
   BackrefFold,
-  Look,        // lookahead: the body follows, ends at LookEnd; execution resumes at pc+a. b = 1 for a negative one
+  CharBack,    // the same, matching the character before the position and moving back (the body of a lookbehind)
+  CharFoldBack,
+  AnyBack,
+  AnyAllBack,
+  ClassBack,
+  ClassNotBack,
+  BackrefBack,
+  BackrefFoldBack,
+  Look,        // lookahead (or lookbehind: its body is made of the Back instructions): the body follows, ends at LookEnd; execution resumes at pc+a. b = 1 for a negative one
   LookEnd,
   LoopEnter,   // slots[a] = position (guards a loop whose body can match nothing)
   LoopCheck,   // fails if the position is still slots[a]
