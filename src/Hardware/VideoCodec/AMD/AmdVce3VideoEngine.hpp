@@ -40,8 +40,11 @@ namespace hardware {
 // CPU's H.264 decoder, and only when each is close to the source (the mean squared error of the luma at most kMaxSelfTestError) does it serve sessions (AmdVce3Encoder).
 // Anything else leaves the encoder on the CPU and the engine stopped. The engine serves one session at a time.
 //
-// Not here: the VCE clocks (the driver asks the SMC's DPM tables; the engine runs at whatever clock the card was left with) and anything about power gating beyond the SMC's
-// power message. Nothing here has run on a real card; the sessions that hold a pointer to the ring must be closed before stop().
+// The clock: after the SMC's power-on the VCE's DPM is switched on at the top level (AmdSmu7::vce_dpm_enable: the boot level in the SMC's DPM table, the level mask, the
+// enable message - the order of the Linux driver's smu7_powergate_vce), and switched off again before the power-off. set_clock_level() picks the lowest instead. An SMC that
+// does not answer, or whose DPM table cannot be found, leaves the engine at whatever clock the card was left with; the status line says so. Nothing here has run on a
+// real card, and it is not known whether the system firmware leaves the SMC's DPM running (the driver enables it itself at load, which this OS does not); the sessions that
+// hold a pointer to the ring must be closed before stop().
 class AmdVce3VideoEngine {
  public:
   // The memory the engine is given: a run of the card's video memory, as the GPU (`gpu_address`) and the CPU (`physical`, through the memory BAR) address it. MiB aligned.
@@ -55,6 +58,12 @@ class AmdVce3VideoEngine {
   static constexpr uint64_t kWorkBytes = 16 * kMiB;     // the sessions' pictures, coded picture buffer, bitstream and feedback
   static constexpr uint32_t kMaxSelfTestError = 160;    // mean squared luma error between the source and the decoded picture (about 26 dB)
   static constexpr uint32_t kBootAttempts = 3;
+
+  // The VCE clock level asked of the SMC (before start()).
+  void set_clock_level(AmdSmu7::VceLevel level) { clock_level_ = level; }
+  AmdSmu7::VceLevel clock_level() const { return clock_level_; }
+  // The level the SMC was asked for, or -1 when no request was acknowledged.
+  int requested_level() const { return dpm_enabled_ ? static_cast<int>(dpm_level_) : -1; }
 
   // What a Region must hold: the block, the ring area and the work memory.
   static constexpr uint64_t reserve_bytes() { return (AmdVce3::kBlockBytes + kMiB - 1) / kMiB * kMiB + kRingAreaBytes + kWorkBytes; }
@@ -163,7 +172,7 @@ class AmdVce3VideoEngine {
       return false;
     }
     ready_ = true;
-    text_.assign(smc_note_);
+    text_.assign(smc_note_.view());
     text_.append(": VCE started; H.264 encode runs on it (self-test passed)");
     return true;
   }
@@ -272,15 +281,33 @@ class AmdVce3VideoEngine {
   void request_power(const IClock& clock) {
     AmdSmu7 smc(*registers_, clock);
     switch (smc.vce_power(true)) {
-      case AmdSmu7::Result::Ok: smc_powered_ = true; smc_note_ = "SMC powered the engine"; break;
-      case AmdSmu7::Result::NotAnswering: smc_note_ = "SMC did not answer, engine assumed powered"; break;
-      case AmdSmu7::Result::Unsupported: smc_note_ = "SMC does not know the power-on message, engine assumed powered"; break;
-      case AmdSmu7::Result::Failed: smc_note_ = "SMC refused to power the engine"; break;
+      case AmdSmu7::Result::Ok: smc_powered_ = true; smc_note_.assign("SMC powered the engine"); break;
+      case AmdSmu7::Result::NotAnswering: smc_note_.assign("SMC did not answer, engine assumed powered"); return;
+      case AmdSmu7::Result::Unsupported: smc_note_.assign("SMC does not know the power-on message, engine assumed powered"); break;
+      case AmdSmu7::Result::Failed: smc_note_.assign("SMC refused to power the engine"); break;
+    }
+    // The clock, once the SMC is there to ask.
+    uint32_t level = 0;
+    switch (smc.vce_dpm_enable(clock_level_, &level)) {
+      case AmdSmu7::DpmResult::Ok:
+        dpm_enabled_ = true;
+        dpm_level_ = level;
+        smc_note_.append(", clock level ");
+        smc_note_.append_uint(level);
+        break;
+      case AmdSmu7::DpmResult::NoDpmTable:
+      case AmdSmu7::DpmResult::BadDpmTable: smc_note_.append(", SMC's DPM table not found, clock as left"); break;
+      case AmdSmu7::DpmResult::NotAnswering:
+      case AmdSmu7::DpmResult::Unsupported:
+      case AmdSmu7::DpmResult::Failed: smc_note_.append(", SMC refused the clock request, clock as left"); break;
     }
   }
   void release_power() {
-    if (!smc_powered_ || !registers_ || !clock_) return;
-    AmdSmu7(*registers_, *clock_).vce_power(false);
+    if (!registers_ || !clock_) return;
+    AmdSmu7 smc(*registers_, *clock_);
+    if (dpm_enabled_) smc.vce_dpm_disable();   // (before the power goes, as the driver's smu7_powergate_vce(true) does)
+    dpm_enabled_ = false;
+    if (smc_powered_) smc.vce_power(false);
     smc_powered_ = false;
   }
 
@@ -296,8 +323,10 @@ class AmdVce3VideoEngine {
   UniquePointer<AmdVce3> vce_;
   UniquePointer<AmdVce3Ring> ring_;
   uint32_t harvest_ = AmdVce3::kHarvestVce1;
-  bool planned_ = false, ready_ = false, smc_powered_ = false;
-  const char* smc_note_ = "";
+  bool planned_ = false, ready_ = false, smc_powered_ = false, dpm_enabled_ = false;
+  AmdSmu7::VceLevel clock_level_ = AmdSmu7::VceLevel::Highest;
+  uint32_t dpm_level_ = 0;
+  FixedString<127> smc_note_;
   uint32_t next_stream_handle_ = 0;
   FixedString<255> text_;
 };
