@@ -275,5 +275,11 @@ rest instead of returning them on a later call (each watch keeps only its most r
   threads on every core. Reads and writes stop at the first page that is not committed (`ERROR_PARTIAL_COPY`, with the count); writes ignore page protection, as debuggers need.
   A remote thread's handle can be waited for, `GetExitCodeThread`, `GetThreadId`, `ResumeThread` (if created suspended) and `TerminateThread` work on it; other thread calls
   (contexts, priorities, APCs) do not. Code can be injected: write it into memory allocated with `VirtualAllocEx` and start a thread on it. There is no access check beyond having a handle.
-- **Not provided**: debugging APIs, and the many exports of the real kernel32 and msvcrt that no program here has needed (`FindFirstChangeNotification`/`ReadDirectoryChangesW` - see "Directory change notifications" - and mailslots - see "Mailslots" - are both done).
+- **Not provided**: debugging APIs, and most of the many exports of a real kernel32.dll that no program here has needed yet (`FindFirstChangeNotification`/
+  `ReadDirectoryChangesW` - see "Directory change notifications" - and mailslots - see "Mailslots" - are both done). An ongoing audit (diffing this DLL's export
+  table against a real kernel32.dll's) is filling these in a batch at a time - `lstrcat`/`lstrcmp`/`lstrcmpi`/`lstrcpy`/`lstrcpyn`/`lstrlen` (the bare,
+  always-ANSI names, distinct from the `A`/`W` ones already there), `RtlCopyMemory`/`RtlMoveMemory`/`RtlFillMemory`/`RtlZeroMemory`/`RtlCompareMemory`,
+  `GetEnvironmentStrings` (likewise bare/ANSI), `Beep`, `CancelIo`/`CancelIoEx`/`CancelSynchronousIo`, `GetCompressedFileSizeA`/`W`, `WinExec`, `OpenFile`, and
+  `FatalAppExitA`/`W` are the first batch; debugging APIs, transacted file operations, serial port (`COMM`) functions, volume enumeration, and the rest are not
+  done yet.
   A call to an import that nothing provides stops the program with a message saying which one.
