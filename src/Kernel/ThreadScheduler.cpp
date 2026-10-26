@@ -99,7 +99,7 @@ Scheduler g;
 #if defined(__x86_64__)
 alignas(16) uint8_t g_fpu_template[512];
 
-constexpr uint32_t kMsrGsBase = 0xC0000101, kMsrKernelGsBase = 0xC0000102;
+constexpr uint32_t kMsrFsBase = 0xC0000100, kMsrGsBase = 0xC0000101, kMsrKernelGsBase = 0xC0000102;
 
 uint64_t rdmsr(uint32_t msr) {
   uint32_t low, high;
@@ -337,10 +337,16 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   c->current = next;
 #if defined(__x86_64__)
   // A user-mode thread brings its page tables and its GS base along; the entry stubs find them in this core's page.
-  if (prev->user_cr3) prev->user_gs = rdmsr(kMsrKernelGsBase);
+  if (prev->user_cr3) {
+    prev->user_gs = rdmsr(kMsrKernelGsBase);
+    prev->user_fs = rdmsr(kMsrFsBase);
+  }
   c->user.user_cr3 = next->user_cr3;
   c->user.kernel_stack = reinterpret_cast<uint64_t>(next->stack_top);
-  if (next->user_cr3) wrmsr(kMsrKernelGsBase, next->user_gs);
+  if (next->user_cr3) {
+    wrmsr(kMsrKernelGsBase, next->user_gs);
+    wrmsr(kMsrFsBase, next->user_fs);
+  }
 #endif
   c->slice = kSliceTicks;
   return next->saved;
@@ -630,11 +636,27 @@ uint64_t core_page(uint32_t core) { return core < kMaxCores ? reinterpret_cast<u
 uint64_t core_entry_stack_top(uint32_t core) {
   return core < kMaxCores ? reinterpret_cast<uint64_t>(g.cores[core].entry_stack) + sizeof(g.cores[core].entry_stack) : 0;
 }
+void set_current_user_bases(bool set_fs, uint64_t fs, bool set_gs, uint64_t gs) {
+  const uint64_t flags = irq_save();
+  Thread* t = this_core()->current;
+  if (set_fs) {
+    t->user_fs = fs;
+    wrmsr(kMsrFsBase, fs);
+  }
+  if (set_gs) {
+    t->user_gs = gs;
+    wrmsr(kMsrKernelGsBase, gs);      // while in the kernel the program's GS base waits in the other register (SWAPGS brings it back)
+  }
+  irq_restore(flags);
+}
 void set_current_user_context(uint64_t cr3, void* context) {
   const uint64_t flags = irq_save();
   Core* c = this_core();
   Thread* t = c->current;
-  if (cr3 && !t->user_cr3) wrmsr(kMsrKernelGsBase, t->user_gs);      // the GS base the program starts with
+  if (cr3 && !t->user_cr3) {      // the thread pointers the program starts with
+    wrmsr(kMsrKernelGsBase, t->user_gs);
+    wrmsr(kMsrFsBase, t->user_fs);
+  }
   t->user_cr3 = cr3;
   t->user_context = context;
   c->user.user_cr3 = cr3;

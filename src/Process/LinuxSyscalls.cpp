@@ -26,10 +26,12 @@ namespace process {
 
 namespace {
 
-constexpr int64_t kEnomem = 12, kEnodev = 19, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
+constexpr int64_t kEnoent = 2, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEnodev = 19, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
 constexpr uint64_t kIovMax = 1024, kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 
-enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect };
+enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
+  SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise };
+constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
   uint16_t x86_64, generic;
@@ -42,13 +44,19 @@ constexpr NumberEntry kNumbers[] = {
     {60, 93, Call::Exit},          {231, 94, Call::ExitGroup},  {63, 160, Call::Uname},       {228, 113, Call::ClockGettime},
     {35, 101, Call::Nanosleep},    {24, 124, Call::SchedYield}, {218, 96, Call::SetTidAddress},
     {12, 214, Call::Brk},          {9, 222, Call::Mmap},        {11, 215, Call::Munmap},      {10, 226, Call::Mprotect},
+    {158, kAbsent, Call::ArchPrctl}, {16, 29, Call::Ioctl},     {5, 80, Call::Fstat},         {262, 79, Call::Newfstatat},
+    {8, 62, Call::Lseek},          {257, 56, Call::Openat},     {267, 78, Call::Readlinkat},  {13, 134, Call::RtSigaction},
+    {14, 135, Call::RtSigprocmask}, {131, 132, Call::Sigaltstack}, {273, 99, Call::SetRobustList}, {334, 293, Call::Rseq},
+    {302, 261, Call::Prlimit64},   {318, 278, Call::Getrandom}, {96, 169, Call::Gettimeofday}, {110, 173, Call::Getppid},
+    {28, 233, Call::Madvise},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
 
 Call translate(UserArch arch, uint64_t number) {
   for (const NumberEntry& entry : kNumbers) {
-    if (number == (arch == UserArch::X86_64 ? entry.x86_64 : entry.generic)) return entry.call;
+    const uint16_t wanted = arch == UserArch::X86_64 ? entry.x86_64 : entry.generic;
+    if (wanted != kAbsent && number == wanted) return entry.call;
   }
   return Call::None;
 }
@@ -158,6 +166,78 @@ uint64_t do_mprotect(Process& process, uint64_t address, uint64_t length, uint64
   return space->protect(address, length, uint8_t(prot)) ? 0 : error(kEnomem);      // part of the range is not mapped
 }
 
+// --- thread pointer, terminal-ish and signal calls that C libraries make while starting up -------------------------------------------------------------
+
+constexpr uint64_t kArchSetGs = 0x1001, kArchSetFs = 0x1002, kArchGetFs = 0x1003, kArchGetGs = 0x1004;
+constexpr uint64_t kAtEmptyPath = 0x1000;
+
+uint64_t do_arch_prctl(Process& process, uint64_t code, uint64_t address) {
+  switch (code) {
+    case kArchSetFs:
+    case kArchSetGs:
+      if (address >= AddressSpace::kUserTop) return error(kEinval);      // must be a user address (this also keeps it canonical)
+      if (code == kArchSetFs) process.set_fs_base(address);
+      else process.set_gs_base(address);
+      return 0;
+    case kArchGetFs: return process.write_user_u64(address, process.fs_base()) ? 0 : error(kEfault);
+    case kArchGetGs: return process.write_user_u64(address, process.gs_base()) ? 0 : error(kEfault);
+    default: return error(kEinval);
+  }
+}
+
+// Writes `count` zero bytes to user memory (an empty structure the program asked to be filled).
+bool write_zeros(Process& process, uint64_t address, uint64_t count) {
+  uint8_t zeros[256] = {};
+  return count <= sizeof(zeros) && process.write_user(address, ConstByteView(zeros, count));
+}
+
+// A character device (the console): what fstat says about descriptors 0..2, so C libraries line-buffer them.
+uint64_t do_fstat(Process& process, UserArch arch, uint64_t fd, uint64_t address) {
+  if (process.descriptor(fd) == DescriptorKind::Closed) return error(kEbadf);
+  uint8_t buffer[144] = {};
+  const uint32_t mode = 0020620;      // S_IFCHR | rw--w----
+  const uint64_t mode_at = arch == UserArch::X86_64 ? 24 : 16;
+  for (uint32_t i = 0; i < 4; ++i) buffer[mode_at + i] = uint8_t(mode >> (8 * i));
+  buffer[arch == UserArch::X86_64 ? 16 : 20] = 1;      // one link
+  buffer[56] = 0x00; buffer[57] = 0x04;                  // st_blksize 1024
+  const uint64_t size = arch == UserArch::X86_64 ? 144 : 128;
+  return process.write_user(address, ConstByteView(buffer, size)) ? 0 : error(kEfault);
+}
+
+uint64_t do_newfstatat(Process& process, UserArch arch, uint64_t dirfd, uint64_t path, uint64_t address, uint64_t flags) {
+  uint8_t first = 0;
+  const bool empty = path == 0 || (process.read_user(path, ByteView(&first, 1)) && first == 0);
+  if ((flags & kAtEmptyPath) && empty) return do_fstat(process, arch, dirfd, address);
+  return error(kEnoent);      // there is no file system for programs yet
+}
+
+uint64_t do_prlimit(Process& process, uint64_t resource, uint64_t old_limit) {
+  if (!old_limit) return 0;
+  const uint64_t infinity = ~uint64_t{0};
+  const uint64_t current = resource == 3 ? 8ull << 20 : infinity;      // RLIMIT_STACK is the 8 MiB the stack was mapped with
+  return process.write_user_u64(old_limit, current) && process.write_user_u64(old_limit + 8, resource == 3 ? infinity : infinity) ? 0 : error(kEfault);
+}
+
+uint64_t do_getrandom(Process& process, uint64_t address, uint64_t length) {
+  if (length > kMaxIoBytes) length = kMaxIoBytes;
+  uint8_t chunk[256];
+  uint64_t done = 0;
+  while (done < length) {
+    const uint64_t n = length - done < sizeof(chunk) ? length - done : sizeof(chunk);
+    if (!process.host().random_bytes(ByteView(chunk, n))) return done ? done : error(kEnosys);
+    if (!process.write_user(address + done, ConstByteView(chunk, n))) return done ? done : error(kEfault);
+    done += n;
+  }
+  return done;
+}
+
+uint64_t do_gettimeofday(Process& process, uint64_t tv) {
+  if (!tv) return 0;
+  const uint64_t ns = process.host().realtime_ns();
+  return process.write_user_u64(tv, ns / 1000000000u) && process.write_user_u64(tv + 8, ns % 1000000000u / 1000) ? 0 : error(kEfault);
+}
+
+
 }  // namespace
 
 class LinuxSyscalls final : public ISyscallInterface {
@@ -188,7 +268,24 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Mmap: return do_mmap(process, a[0], a[1], a[2], a[3], a[4]);
       case Call::Munmap: return do_munmap(process, a[0], a[1]);
       case Call::Mprotect: return do_mprotect(process, a[0], a[1], a[2]);
-      default: return error(kEnosys);
+      case Call::ArchPrctl: return do_arch_prctl(process, a[0], a[1]);
+      case Call::Ioctl: return process.descriptor(a[0]) == DescriptorKind::Closed ? error(kEbadf) : error(kEnotty);
+      case Call::Fstat: return do_fstat(process, arch_, a[0], a[1]);
+      case Call::Newfstatat: return do_newfstatat(process, arch_, a[0], a[1], a[2], a[3]);
+      case Call::Lseek: return process.descriptor(a[0]) == DescriptorKind::Closed ? error(kEbadf) : error(kEspipe);
+      case Call::Openat:
+      case Call::Readlinkat: return error(kEnoent);
+      case Call::RtSigaction: return a[2] && !write_zeros(process, a[2], 32) ? error(kEfault) : 0;
+      case Call::RtSigprocmask: return a[2] && !write_zeros(process, a[2], 8) ? error(kEfault) : 0;
+      case Call::Sigaltstack: return a[1] && !write_zeros(process, a[1], 24) ? error(kEfault) : 0;
+      case Call::SetRobustList:
+      case Call::Madvise: return 0;
+      case Call::Rseq: return error(kEnosys);
+      case Call::Prlimit64: return do_prlimit(process, a[1], a[3]);
+      case Call::Getrandom: return do_getrandom(process, a[0], a[1]);
+      case Call::Gettimeofday: return do_gettimeofday(process, a[0]);
+      case Call::Getppid: return 0;
+      default: process.host().unhandled_syscall(SyscallAbi::Linux, r.number); return error(kEnosys);
     }
   }
 

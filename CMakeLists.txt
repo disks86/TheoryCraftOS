@@ -559,6 +559,7 @@ add_executable(BOOTX64
   src/Process/ImageLoader.cpp
   src/Process/UserProgram.cpp
   src/Process/UserPageTables.cpp
+  src/Process/WindowsStartup.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
@@ -695,6 +696,16 @@ target_compile_options(BOOTX64 PRIVATE -fno-omit-frame-pointer)
 option(TCOS_USERMODE_DEMO "Run two small programs in ring 3 at boot (x86-64)" OFF)
 if(TCOS_USERMODE_DEMO)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO)
+endif()
+# An extra program for the demo to run (a static Linux x86-64 ELF, say a C program built with `gcc -static -no-pie`); its output and exit code are logged.
+set(TCOS_USERMODE_DEMO_PROGRAM "" CACHE FILEPATH "An ELF or PE program the user-mode demo also runs")
+if(TCOS_USERMODE_DEMO AND TCOS_USERMODE_DEMO_PROGRAM)
+  file(WRITE ${CMAKE_BINARY_DIR}/demo_program.S
+    ".section .rdata,\"dr\"\n.balign 16\n.global tcos_demo_program\ntcos_demo_program:\n.incbin \"${TCOS_USERMODE_DEMO_PROGRAM}\"\n.global tcos_demo_program_end\ntcos_demo_program_end:\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${TCOS_USERMODE_DEMO_PROGRAM})
+  target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_program.S)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/demo_program.S PROPERTIES OBJECT_DEPENDS ${TCOS_USERMODE_DEMO_PROGRAM})
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO_PROGRAM)
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

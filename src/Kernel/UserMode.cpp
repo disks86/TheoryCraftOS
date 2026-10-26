@@ -118,6 +118,10 @@ void load_core(void* argument) {
   uint64_t cr4;
   __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
   if (cr4 & (1u << 7)) __asm__ volatile("movq %0, %%cr4" ::"r"(cr4 & ~uint64_t{1u << 7}) : "memory");
+  // Interrupts save the x87/SSE state only. With XSAVE on, a program could use AVX, whose upper halves would leak between programs, so user mode is told
+  // there is none (CPUID then reports OSXSAVE clear).
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  if (cr4 & (1u << 18)) __asm__ volatile("movq %0, %%cr4" ::"r"(cr4 & ~uint64_t{1u << 18}) : "memory");
   wrmsr(kMsrEfer, rdmsr(kMsrEfer) | kEferSce);
   wrmsr(kMsrStar, (uint64_t{0x10} << 48) | (uint64_t{kSelectorCode} << 32));      // SYSCALL loads CS 0x08 / SS 0x10 (the SYSRET half is unused: we return with IRET)
   wrmsr(kMsrLstar, copy_of(tcos_tramp_syscall));
@@ -144,6 +148,9 @@ Frame* on_syscall(Frame* frame, void*) {
   process::SyscallRequest request;
   if (process::decode_x86_64(process->abi(), regs, &request)) frame->rax = process->syscall(request);
   else frame->rax = ~uint64_t{37};      // -ENOSYS
+  uint64_t fs = 0, gs = 0;
+  const bool fs_changed = process->take_fs_change(&fs), gs_changed = process->take_gs_change(&gs);
+  if (fs_changed || gs_changed) set_current_user_bases(fs_changed, fs, gs_changed, gs);      // arch_prctl
   bool alive = !process->exited();
   // The call may have changed the memory layout: rebuild the page tables and hand the new ones to this thread and core.
   if (alive) {
@@ -186,6 +193,9 @@ Frame* on_user_fault(Frame* frame) {
 void user_main(void* argument) {
   Task* task = static_cast<Task*>(argument);
   const process::ProgramStart& start = task->program.start();
+  Thread* me = current_thread();
+  me->user_fs = start.fs_base;
+  me->user_gs = start.gs_base;
   set_current_user_context(task->tables.root(), task);
   Frame frame;      // on this stack, which stays untouched until the CPU is in ring 3 (the next entry starts at the top of the stack)
   __asm__ volatile("fxsave %0" : "=m"(frame.fpu));

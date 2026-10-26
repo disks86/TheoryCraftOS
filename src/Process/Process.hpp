@@ -45,6 +45,10 @@ class IProcessHost {
   virtual uint64_t monotonic_ns() = 0;
   virtual void sleep_ns(uint64_t ns) = 0;
   virtual void yield() = 0;
+  // Optional: fills `out` with random bytes (getrandom); false if there is no source, which the program sees as "not supported".
+  virtual bool random_bytes(ByteView out) { (void)out; return false; }
+  // Optional: a program made a system call this OS does not have (for finding out what a program needs).
+  virtual void unhandled_syscall(SyscallAbi abi, uint64_t number) { (void)abi; (void)number; }
 
  protected:
   IProcessHost() = default;
@@ -92,6 +96,18 @@ class Process {
   uint64_t mmap_cursor() const { return mmap_cursor_; }
   void set_mmap_cursor(uint64_t value) { mmap_cursor_ = value; }
 
+  // The thread pointers of the program's (one) thread: the FS base (Linux thread-local storage, set by arch_prctl) and the GS base (the Windows TEB). They
+  // live here, in the portable part; whoever runs the program applies a changed one to the CPU after the system call (take_*_change()).
+  uint64_t fs_base() const { return fs_base_; }
+  uint64_t gs_base() const { return gs_base_; }
+  void set_fs_base(uint64_t value) { fs_base_ = value; fs_changed_ = true; }
+  void set_gs_base(uint64_t value) { gs_base_ = value; gs_changed_ = true; }
+  // The program starts with these (not reported as a change).
+  void set_initial_thread_pointers(uint64_t fs, uint64_t gs) { fs_base_ = fs; gs_base_ = gs; fs_changed_ = gs_changed_ = false; }
+  // True once after the base was set.
+  bool take_fs_change(uint64_t* value) { *value = fs_base_; const bool c = fs_changed_; fs_changed_ = false; return c; }
+  bool take_gs_change(uint64_t* value) { *value = gs_base_; const bool c = gs_changed_; gs_changed_ = false; return c; }
+
   DescriptorKind descriptor(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot] : DescriptorKind::Closed; }
   bool close_descriptor(uint64_t slot);
 
@@ -102,6 +118,8 @@ class Process {
   IProcessHost& host_;
   bool exited_ = false;
   uint32_t exit_code_ = 0;
+  uint64_t fs_base_ = 0, gs_base_ = 0;
+  bool fs_changed_ = false, gs_changed_ = false;
   AddressSpace* space_ = nullptr;
   uint64_t heap_start_ = 0, heap_break_ = 0, mmap_cursor_ = 0x00007F0000000000ull;
   DescriptorKind slots_[kMaxDescriptors] = {DescriptorKind::ConsoleInput, DescriptorKind::ConsoleOutput, DescriptorKind::ConsoleError};
