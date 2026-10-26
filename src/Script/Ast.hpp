@@ -62,6 +62,8 @@ enum NodeFlag : uint8_t {
   kFlagGetter = 32,      // Property: get name() { ... }
   kFlagSetter = 64,      // Property: set name(v) { ... }
   kFlagLogicalAssign = 1,   // Logical: a ||= b - a is the target (evaluated once), b the value
+  kFlagParenthesized = 2,   // String: written in parentheses (so it is not a directive)
+  kFlagStrict = 64,      // Function / Block (a program): strict mode code (a module, a class body); a "use strict" directive is found by the compiler
   kFlagSuper = 128,      // Member / Index: super.name (the object the method is looked up on is the prototype of the parent class; `this` stays the receiver)
 };
 

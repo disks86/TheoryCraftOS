@@ -70,6 +70,8 @@ struct FunctionCode {
   int32_t arguments_slot = -1;          // where `arguments` goes, if the function uses it
   int32_t self_slot = -1;               // where a named function expression finds itself
   bool is_arrow = false, has_rest = false, is_async = false, is_generator = false;
+  bool strict = false;                  // strict mode code: `this` is not made the global object, failed writes and deletes throw, assigning to an undeclared name is an error
+  bool library = false;                 // the host's own scripts (the preludes): Object.defineProperty leaves a property configurable unless told otherwise
   JsString* name = nullptr;
 };
 

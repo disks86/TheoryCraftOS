@@ -1080,7 +1080,7 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
   return get(base, k, out);
 }
 
-bool Vm::put(const Value& base, JsString* key, const Value& value) {
+bool Vm::put_ex(const Value& base, JsString* key, const Value& value, bool strict) {
   if (base.is_nullish()) {
     String message(allocator_);
     message.append("Cannot set properties of ");
@@ -1090,7 +1090,16 @@ bool Vm::put(const Value& base, JsString* key, const Value& value) {
     message.append("')");
     return throw_error(ErrorKind::TypeError, message.view());
   }
-  if (!base.is_object()) return true;   // (a property of a primitive is lost, as in sloppy mode)
+  // a write that does not happen: nothing in sloppy mode, a TypeError in strict mode
+  auto refuse = [&](const char* before, const char* after) {
+    if (!strict) return true;
+    String message(allocator_);
+    message.append(before);
+    message.append(key->view());
+    message.append(after);
+    return throw_error(ErrorKind::TypeError, message.view());
+  };
+  if (!base.is_object()) return refuse("Cannot create property '", "' on a primitive value");
   JsObject* o = base.as_object();
   if (o->okind == ObjKind::Proxy) return proxy_set(o, key, value, base);
   if (o->host && o->host->set) {
@@ -1101,24 +1110,35 @@ bool Vm::put(const Value& base, JsString* key, const Value& value) {
       return true;
     }
   }
-  if (o->frozen) return true;
+  if (o->frozen) return refuse("Cannot assign to read only property '", "' of object");
   const int64_t at = find_prop(o, key);
   if (at >= 0) {
-    if (o->props[at].flags & kAccessor) return call_setter(o->props[at].value, base, value);
+    if (o->props[at].flags & kAccessor) {
+      const Value pair = o->props[at].value;
+      if (strict && !(pair.is_object() && pair.as_object()->length >= 2 && is_callable(pair.as_object()->items[1]))) return refuse("Cannot set property ", " of #<Object> which has only a getter");
+      return call_setter(pair, base, value);
+    }
     if (o->props[at].flags & kWritable) o->props[at].value = value;
+    else return refuse("Cannot assign to read only property '", "' of object");
     return true;
   }
-  for (JsObject* p = o->proto; p; p = p->proto) {   // a setter further up the chain takes the write
+  for (JsObject* p = o->proto; p; p = p->proto) {   // a setter further up the chain takes the write; a read-only property there stops it
     const int64_t up = find_prop(p, key);
     if (up < 0) continue;
-    if (p->props[up].flags & kAccessor) return call_setter(p->props[up].value, base, value);
+    if (p->props[up].flags & kAccessor) {
+      const Value pair = p->props[up].value;
+      if (strict && !(pair.is_object() && pair.as_object()->length >= 2 && is_callable(pair.as_object()->items[1]))) return refuse("Cannot set property ", " of #<Object> which has only a getter");
+      return call_setter(pair, base, value);
+    }
+    if (!(p->props[up].flags & kWritable) && !p->host) return refuse("Cannot assign to read only property '", "' of object");
     break;
   }
+  if (o->non_extensible || o->sealed) return refuse("Cannot add property ", ", object is not extensible");
   define(o, key, value);
   return true;
 }
 
-bool Vm::put_member(const Value& base, const Value& key, const Value& value) {
+bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, bool strict) {
   uint32_t i;
   if (base.is_object() && array_index(key, &i)) {
     JsObject* o = base.as_object();
@@ -1127,6 +1147,11 @@ bool Vm::put_member(const Value& base, const Value& key, const Value& value) {
       if (i < o->length) {
         o->items[i] = value;
         return true;
+      }
+      if (o->non_extensible || o->sealed) {
+        JsString* k;
+        if (!to_property_key(key, &k)) return false;
+        return put_ex(base, k, value, strict);
       }
       if (i <= o->length + (1u << 20) && ensure_items(o, i + 1)) {
         for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value();
@@ -1139,10 +1164,15 @@ bool Vm::put_member(const Value& base, const Value& key, const Value& value) {
   JsString* k;
   if (base.is_nullish()) {
     if (!to_property_key(key, &k)) return false;
-    return put(base, key.is_string() ? key.as_string() : k, value);
+    return put_ex(base, key.is_string() ? key.as_string() : k, value, strict);
   }
   if (!to_property_key(key, &k)) return false;
-  return put(base, k, value);
+  return put_ex(base, k, value, strict);
+}
+
+void Vm::set_property_flags(JsObject* o, JsString* key, uint8_t bits, uint8_t mask) {
+  const int64_t at = find_prop(o, key);
+  if (at >= 0) o->props[at].flags = static_cast<uint8_t>((o->props[at].flags & ~mask) | (bits & mask));
 }
 
 bool Vm::delete_property(JsObject* o, JsString* key) {
@@ -1154,7 +1184,11 @@ bool Vm::delete_property(JsObject* o, JsString* key) {
     bool deleted = true;
     if (o->host->remove(*this, o, key, &deleted)) return deleted;
   }
-  if (o->frozen) return false;
+  if (o->frozen || o->sealed) {
+    Value ignored;
+    uint8_t flags;
+    return !own_property(o, key, &ignored, &flags);   // (deleting what is not there succeeds)
+  }
   if (o->okind == ObjKind::Array) {
     uint32_t i;
     if (canonical_index(key->view(), &i)) {
@@ -1164,6 +1198,7 @@ bool Vm::delete_property(JsObject* o, JsString* key) {
   }
   const int64_t at = find_prop(o, key);
   if (at < 0) return true;
+  if (o->props[at].flags & kNonConfigurable) return false;
   for (uint32_t i = static_cast<uint32_t>(at); i + 1 < o->prop_count; ++i) o->props[i] = o->props[i + 1];
   --o->prop_count;
   index_rebuild(o);
@@ -1900,7 +1935,7 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   f.code = code;
   f.pc = 0;
   f.env = env;
-  f.this_value = code->is_arrow ? fn->bound_this : (this_value.is_nullish() && !construct ? Value::make_object(global_) : this_value);
+  f.this_value = code->is_arrow ? fn->bound_this : (this_value.is_nullish() && !construct && !code->strict ? Value::make_object(global_) : this_value);   // (strict code keeps an undefined `this`)
   f.callee = fn;
   f.base = base;
   f.handlers = static_cast<uint32_t>(handlers_.count());
@@ -2181,6 +2216,13 @@ reload:
           if (r == HostClass::Set::Threw) THROW_PENDING();
           if (r == HostClass::Set::Handled) break;
         }
+        if (code->strict && !has_global(name)) {   // (assigning to a name that was never declared)
+          String message(allocator_);
+          message.append(name->view());
+          message.append(" is not defined");
+          throw_error(ErrorKind::ReferenceError, message.view());
+          THROW_PENDING();
+        }
         define(global_, name, stack_[sp_ - 1], kDefaultFlags);
         break;
       }
@@ -2207,7 +2249,7 @@ reload:
       }
       case Opc::SetProp: {   // [obj, value] -> [value]
         const Value value = stack_[sp_ - 1], base = stack_[sp_ - 2];
-        CHECK(put(base, code->constants[static_cast<uint32_t>(in.a)].as_string(), value));
+        CHECK(put_ex(base, code->constants[static_cast<uint32_t>(in.a)].as_string(), value, code->strict));
         sp_ -= 2;
         stack_[sp_++] = value;
         break;
@@ -2221,7 +2263,7 @@ reload:
       }
       case Opc::SetElem: {   // [obj, key, value] -> [value]
         const Value value = stack_[sp_ - 1], key = stack_[sp_ - 2], base = stack_[sp_ - 3];
-        CHECK(put_member(base, key, value));
+        CHECK(put_member_ex(base, key, value, code->strict));
         sp_ -= 3;
         stack_[sp_++] = value;
         break;
@@ -2243,6 +2285,14 @@ reload:
         }
         bool r = true;
         if (base.is_object()) r = delete_property(base.as_object(), k);
+        if (!r && code->strict) {
+          String message(allocator_);
+          message.append("Cannot delete property '");
+          message.append(k->view());
+          message.append("' of object");
+          throw_error(ErrorKind::TypeError, message.view());
+          THROW_PENDING();
+        }
         PUSH(Value::make_bool(r));
         break;
       }

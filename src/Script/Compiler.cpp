@@ -60,13 +60,15 @@ struct FuncState {
 
 class Compiler {
  public:
-  Compiler(Vm& vm, String* error) : vm_(vm), error_(error) {}
+  Compiler(Vm& vm, String* error, bool library) : vm_(vm), error_(error), library_(library) {}
 
   bool program(Node* block, FunctionCode** out) {
     FuncState fs(vm_.allocator());
     fs.code = vm_.new_code();
     if (!fs.code) return fail("Out of memory", 0);
     fs.is_global = true;
+    fs.code->library = library_;
+    fs.code->strict = (block->flags & kFlagStrict) != 0 || has_use_strict(block->list);
     cur_ = &fs;
     fs.completion_slot = static_cast<int32_t>(new_slot());
     hoist_globals(block->list);
@@ -82,6 +84,13 @@ class Compiler {
   }
 
  private:
+  // Does a statement list begin with the "use strict" directive?
+  static bool has_use_strict(const Node* list) {
+    for (const Node* s = list; s && s->kind == NodeKind::ExprStmt && s->a && s->a->kind == NodeKind::String; s = s->next)
+      if (s->a->text.equals("use strict") && !(s->a->flags & kFlagParenthesized)) return true;
+    return false;
+  }
+
   // --- Errors and emitting
   bool fail(const char* message, uint32_t line) {
     if (!failed_) {
@@ -315,6 +324,8 @@ class Compiler {
       return nullptr;
     }
     fs.parent = cur_;
+    fs.code->library = library_;
+    fs.code->strict = (cur_ && cur_->code->strict) || (fn->flags & kFlagStrict) != 0 || (!(fn->flags & kFlagExprBody) && has_use_strict(fn->a->list));
     FuncState* saved = cur_;
     const uint32_t saved_level = function_level_count_;
     function_level_count_ = 0;
@@ -1210,6 +1221,7 @@ class Compiler {
   String* error_;
   FuncState* cur_ = nullptr;
   bool failed_ = false;
+  bool library_ = false;
   StringView resolved_import_;   // set by resolve(): the export an import binding reads (empty for any other)
   uint32_t line_ = 0;
   uint32_t function_level_count_ = 0;   // how many of the current function's bindings are function-level (parameters, var, functions)
@@ -1220,8 +1232,8 @@ class Compiler {
 
 }  // namespace
 
-bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error) {
-  Compiler compiler(vm, error);
+bool compile_program(Vm& vm, Node* program, FunctionCode** out, String* error, bool library) {
+  Compiler compiler(vm, error, library);
   return compiler.program(program, out);
 }
 
