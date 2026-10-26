@@ -601,6 +601,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // Video codecs: a device per GPU video engine found (not driven yet: its sessions run on the CPU) and the software codec.
   hardware::SystemVideoCodecs video_codecs(pci, shared_allocator);
+#ifdef TCOS_AMD_UVD
+  video_codecs.set_amd_uvd6(true);   // the Radeon RX Vega M's UVD 6 engine (opt-in: it has not run on a real card)
+#endif
   struct PciBarSizer final : hardware::IBarSizer {
     hardware::IPciBus& bus;
     explicit PciBarSizer(hardware::IPciBus& b) : bus(b) {}

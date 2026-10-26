@@ -56,6 +56,8 @@ class AmdVcnSelfTest {
 
   // Decodes the stream on the engine and on the CPU and compares. The packets go in with presentation times 0, 1000, 2000... microseconds.
   static Result run(allocators::IAllocator& allocator, const AmdVcnAvcDecoder::Engine& engine);
+  // The same check on any engine's H.264 session (already prepared): `wedged(context)` says whether the engine's ring gave up. The UVD 6 engine's test is this too.
+  static Result run_h264_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* context);
   // The same for H.265: a stream made by libx265 (64 x 64, six pictures, B pictures with reordering; AmdVcnSelfTestHevcStream.inc) is decoded by the CPU decoder and by
   // the engine, and the pictures must be byte for byte the same. What passing proves beyond the above: the reference picture set and slot bookkeeping of the H.265
   // message, 32x32 coding trees with the deblocking filter and SAO the encoder chose, bi-prediction. Not: scaling lists, tiles, slices, weighted prediction, other sizes.

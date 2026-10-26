@@ -1,0 +1,297 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+
+#pragma once
+#include "Hardware/Mmio.hpp"
+#include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
+#include "Hardware/VideoCodec/AMD/AmdVcnWorkMemory.hpp"
+#include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
+#include "Utility/FixedString.hpp"
+#include "Utility/UniquePointer.hpp"
+
+namespace hardware {
+
+// The video engine of the Radeon RX Vega M in a Kaby Lake-G machine (Dell XPS 15 9575; PCI 1002:694C / 694E / 694F): the Unified Video Decoder 6.3. The card's register BAR
+// (BAR 5) and memory BAR (BAR 0) are mapped by the caller; this reads the memory controller (AmdGmc8Memory) to find a block of video memory nothing else uses, starts the
+// engine with the microcode from /firmware (AmdUvd6), runs the decode ring's own test and an H.264 self-test (the same stream and comparison as the VCN engine's:
+// AmdVcnSelfTest), and only when the engine's pictures are the CPU's byte for byte does it serve H.264 sessions (AmdUvd6AvcDecoder). Anything else, and every session while
+// the engine is not up or failed a test, runs on the CPU through the software codecs. info().accelerated says false (the device as a whole is not accelerated);
+// info().accelerated_decode_codecs lists what the engine really does.
+//
+// Nothing here has run on a real card. What the start does not do is power the engine (the driver asks the card's SMC; a card that was not left with the engine powered
+// makes the VCPU never answer, which the start reports and undoes), so it is only started when the memory plan is whole and the graphics block reports a plausible
+// address configuration.
+class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
+ public:
+  static constexpr uint16_t kPciVendor = 0x1002;
+
+  explicit AmdUvd6VideoEngine(allocators::IAllocator& allocator, uint16_t gpu_device_id)
+      : SoftwareVideoCodec(allocator, /*hardware_engine=*/true), allocator_(allocator), device_id_(gpu_device_id), firmware_(allocator) {}
+
+  // The card's register BAR (BAR 5, at least kAmdGmc8RegisterBytes) and its memory BAR (BAR 0: the CPU address, and the size of the part of video memory it shows).
+  // A window shorter than that leaves the engine without registers (plan_engine() says so).
+  void set_registers(const MmioRegion& registers) {
+    registers_ = nullptr;
+    register_window_.reset();
+    if (registers.length() < kAmdGmc8RegisterBytes) return;
+    register_window_ = UniquePointer<MmioVcnRegisters>::make(allocator_, registers);
+    registers_ = register_window_.get();
+  }
+  // The registers of the card through something other than a mapped BAR (a test's simulated card). Must outlive the engine.
+  void set_register_file(IVcnRegisters& registers) { register_window_.reset(); registers_ = &registers; }
+  void set_aperture(uint64_t physical, uint64_t bytes) { aperture_physical_ = physical; aperture_bytes_ = bytes; }
+  void set_pci_address(const PciAddress& address) { address_ = address; has_address_ = true; }
+  bool gpu_location(PciAddress* out) const override {
+    if (!has_address_ || !out) return false;
+    *out = address_;
+    return true;
+  }
+  uint64_t gpu_memory_bytes() const override { return memory_map_.video_memory_bytes; }
+
+  bool load_firmware(filesystem::IFileSystem& file_system) override {
+    const char* name = amd_uvd6_firmware_name(device_id_);
+    if (!name) return false;
+    firmware_name_ = name;
+    firmware_state_ = firmware_.load(file_system, name);
+    note_ = "engine not started";
+    rebuild_status();
+    return firmware_state_ == AmdFirmwareStatus::Ok;
+  }
+  const char* firmware_status() const override { return firmware_text_.c_str(); }
+
+  // Reads the memory controller (reads only), chooses the engine's block, ring and work area, and maps them. plan_status() says where, or why not.
+  bool plan_engine(const VideoEngineEnvironment& environment) override {
+    planned_ = false;
+    plan_text_.assign("");
+    if (!amd_uvd6_firmware_name(device_id_)) return false;
+    plan_text_.assign("engine memory not planned: ");
+    if (!firmware_.loaded()) { plan_text_.append("no firmware"); return false; }
+    if (!registers_) { plan_text_.append("no access to the registers of the card"); return false; }
+    if (!environment.mapper || aperture_bytes_ == 0 || aperture_physical_ == 0) { plan_text_.append("no way to map the card's memory"); return false; }
+    mapper_ = environment.mapper;
+    memory_map_ = amd_read_gmc8_memory_map(*registers_);
+    config_.max_handles = AmdUvd6::max_handles_for(firmware_);
+    plan_ = amd_plan_uvd6_memory(memory_map_, aperture_bytes_, AmdUvd6::block_bytes(firmware_, config_.max_handles));
+    if (plan_.result != AmdUvd6Plan::Result::Ok) {
+      plan_text_.append(amd_uvd6_plan_result_name(plan_.result));
+      return false;
+    }
+    if (!amd_map_uvd6_plan(plan_, *environment.mapper, aperture_physical_, &memory_)) {
+      plan_text_.append("the card's memory cannot be mapped (the OS owns it, or the mapper refuses)");
+      return false;
+    }
+    config_.gb_addr_config = registers_->read(kGbAddrConfig);
+    plan_text_.assign("engine memory: block at video memory +");
+    plan_text_.append_uint(plan_.block_offset >> 20);
+    plan_text_.append(" MiB (GPU 0x");
+    append_hex(plan_text_, plan_.block_gpu_address);
+    plan_text_.append("), ");
+    plan_text_.append_uint(plan_.block_bytes >> 10);
+    plan_text_.append(" KiB; work area ");
+    plan_text_.append_uint(plan_.work_bytes >> 20);
+    plan_text_.append(" MiB; gb_addr_config 0x");
+    append_hex(plan_text_, config_.gb_addr_config);
+    planned_ = true;
+    return true;
+  }
+  const char* plan_status() const override { return plan_text_.c_str(); }
+  const AmdUvd6Plan& plan() const { return plan_; }
+  bool engine_planned() const { return planned_; }
+
+  // Starts the engine and brings up decoding, when the plan is whole and the graphics block's address configuration reads as a configured chip (not zero, not all ones,
+  // which is what a block that was never set up, or a card that does not answer, reads as). Three tries for the VCPU to answer, not the driver's ten.
+  bool start_hardware(const IClock& clock) override {
+    if (engine_running()) return true;
+    if (!planned_) return false;
+    if (config_.gb_addr_config == 0 || config_.gb_addr_config == 0xFFFFFFFFu) {
+      note_ = "engine not started: the graphics block did not report an address configuration";
+      rebuild_status();
+      return false;
+    }
+    config_.boot_attempts = kBootAttempts;
+    uvd_ = UniquePointer<AmdUvd6>::make(allocator_, *registers_, clock);
+    if (!uvd_) return false;
+    const AmdUvd6::Status status = uvd_->start(firmware_, memory_.engine, config_);
+    if (status != AmdUvd6::Status::Ok) {
+      uvd_.reset();
+      note_ = status == AmdUvd6::Status::TimedOut ? "engine start failed: the VCPU did not answer (is the engine powered?)" :
+              status == AmdUvd6::Status::BadMemory ? "engine start refused: bad memory block" : "engine start refused: unusable firmware";
+      rebuild_status();
+      return false;
+    }
+    note_ = "engine started, idle";
+    rebuild_status();
+    return enable_decode(*registers_, clock, memory_.engine.ring, *mapper_, plan_.work_gpu_address, aperture_physical_ + plan_.work_offset, plan_.work_bytes);
+  }
+
+  void shutdown() override { stop_engine(); }
+  void stop_engine() {
+    decode_ready_ = false;
+    info_.accelerated_decode_codecs = 0;
+    ring_.reset();
+    if (uvd_) {
+      uvd_->stop();
+      uvd_.reset();
+      note_ = "engine stopped";
+      rebuild_status();
+    }
+  }
+  bool engine_running() const { return uvd_ != nullptr; }
+
+  // The decode path on a running engine: the work memory, the decode ring (the page AmdUvd6 programmed), the ring's own test, and the H.264 self-test. True when it all
+  // passed and H.264 sessions run on the engine. Any failure stops the engine again; status says why.
+  bool enable_decode(IVcnRegisters& registers, const IClock& clock, const MmioRegion& decode_ring, IRegisterMapper& mapper, uint64_t work_gpu, uint64_t work_physical,
+                     uint64_t work_bytes) {
+    decode_ready_ = false;
+    info_.accelerated_decode_codecs = 0;
+    ring_.reset();
+    const char* why = nullptr;
+    bool tested = false;
+    AmdVcnWorkMemory::Piece ib, fence;
+    if (!work_.configure(&mapper, work_gpu, work_physical, work_bytes)) {
+      why = "no room in video memory for decoding";
+    } else if (!work_.allocate(AmdUvd6Ring::kIndirectBufferBytes, AmdVcnWorkMemory::kPage, &ib) || !work_.allocate(AmdUvd6Ring::kFenceBytes, AmdVcnWorkMemory::kPage, &fence)) {
+      why = "the decode buffers could not be mapped";
+    } else {
+      work_.keep();
+      AmdUvd6Ring::Memory ring_memory;
+      ring_memory.ib_gpu_address = ib.gpu_address;
+      ring_memory.ib = ib.cpu;
+      ring_memory.fence_gpu_address = fence.gpu_address;
+      ring_memory.fence = fence.cpu;
+      ring_memory.ring = decode_ring;
+      ring_ = UniquePointer<AmdUvd6Ring>::make(allocator_, registers, clock, ring_memory);
+      if (!ring_) {
+        why = "out of memory";
+      } else if (!ring_->test()) {
+        why = "the decode ring did not run a register write";
+      } else {
+        engine_.ring = ring_.get();
+        engine_.memory = &work_;
+        engine_.stream_handle = 1;
+        DecoderConfig config;
+        config.codec = VideoCodec::H264;
+        config.output = PixelFormat::I420;
+        AmdUvd6AvcDecoder session(allocator_, engine_, config);
+        AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
+        if (session.prepare())
+          result = AmdVcnSelfTest::run_h264_session(
+              allocator_, session, [](const void* ring) { return static_cast<const AmdUvd6Ring*>(ring)->wedged(); }, ring_.get());
+        if (result != AmdVcnSelfTest::Result::Passed) {
+          why = AmdVcnSelfTest::result_name(result);
+          tested = true;
+        }
+      }
+    }
+    if (why) {
+      decode_text_.assign(tested ? "H.264 self-test failed (" : "decoding not enabled (");
+      decode_text_.append(why);
+      decode_text_.append("); engine stopped");
+      stop_engine();
+      note_ = decode_text_.c_str();
+      rebuild_status();
+      return false;
+    }
+    decode_ready_ = true;
+    info_.accelerated_decode_codecs = codec_mask(VideoCodec::H264);
+    note_ = "engine started; H.264 decode runs on it (self-test passed)";
+    rebuild_status();
+    return true;
+  }
+  bool decode_ready() const { return decode_ready_; }
+  const char* engine_note() const { return note_; }
+
+  // H.264 goes to the engine when it passed its test and is free (it runs one session at a time); anything else goes to the CPU.
+  UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::H264 && decode_ready_ && ring_ && !ring_->wedged()) {
+      AmdUvd6AvcDecoder::Engine engine = engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdUvd6AvcDecoder> session = UniquePointer<AmdUvd6AvcDecoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
+    return SoftwareVideoCodec::create_decoder(config);
+  }
+
+  const char* name() const override { return "AMD video engine (UVD 6) (software path)"; }
+  const char* engine_summary() const override { return summary_.c_str(); }
+  const AmdVcnFirmware& firmware() const { return firmware_; }
+
+ private:
+  static constexpr uint32_t kBootAttempts = 3;
+  static constexpr uint32_t kGbAddrConfig = 0x263e;   // mmGB_ADDR_CONFIG (gca/gfx_8_0_d.h)
+
+  static void append_hex(FixedString<255>& out, uint64_t value) {
+    bool started = false;
+    for (int shift = 60; shift >= 0; shift -= 4) {
+      const uint32_t nibble = static_cast<uint32_t>((value >> shift) & 0xF);
+      if (nibble == 0 && !started && shift != 0) continue;
+      started = true;
+      out.push_back("0123456789ABCDEF"[nibble]);
+    }
+  }
+  void rebuild_status() {
+    firmware_text_.assign(firmware_name_ ? firmware_name_ : "");
+    firmware_text_.append(": ");
+    if (firmware_state_ == AmdFirmwareStatus::Ok) {
+      firmware_text_.append_uint(firmware_.ucode().size());
+      firmware_text_.append(" bytes of microcode loaded, ");
+      firmware_text_.append(note_);
+    } else {
+      firmware_text_.append(amd_firmware_status_name(firmware_state_));
+      firmware_text_.append(" (expected /firmware/");
+      firmware_text_.append(firmware_name_ ? firmware_name_ : "");
+      firmware_text_.append(")");
+    }
+    summary_.assign("AMD Radeon RX Vega M (UVD 6.3), firmware ");
+    summary_.append(firmware_text_.view());
+  }
+
+  allocators::IAllocator& allocator_;
+  uint16_t device_id_ = 0;
+  AmdVcnFirmware firmware_;
+  AmdFirmwareStatus firmware_state_ = AmdFirmwareStatus::NotApplicable;
+  const char* firmware_name_ = nullptr;
+  FixedString<200> firmware_text_, summary_, decode_text_;
+  const char* note_ = "engine not started";
+  IVcnRegisters* registers_ = nullptr;
+  UniquePointer<MmioVcnRegisters> register_window_;   // the mapped BAR, when that is what registers_ is
+  uint64_t aperture_physical_ = 0, aperture_bytes_ = 0;
+  PciAddress address_{};
+  bool has_address_ = false;
+  IRegisterMapper* mapper_ = nullptr;
+  AmdGmc8MemoryMap memory_map_;
+  AmdUvd6Plan plan_;
+  AmdUvd6Memory memory_;
+  AmdUvd6::Config config_;
+  bool planned_ = false;
+  FixedString<255> plan_text_;
+  UniquePointer<AmdUvd6> uvd_;
+  UniquePointer<AmdUvd6Ring> ring_;
+  AmdVcnWorkMemory work_;
+  AmdUvd6AvcDecoder::Engine engine_;
+  bool decode_ready_ = false;
+  uint32_t next_stream_handle_ = 1;
+};
+
+}  // namespace hardware
