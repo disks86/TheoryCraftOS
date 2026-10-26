@@ -109,7 +109,7 @@
 #include "ThreadSafetyDemo.hpp"
 #include "UtilityDemo.hpp"
 #endif
-#ifdef TCOS_USERMODE_DEMO
+#if defined(TCOS_USERMODE_DEMO) || defined(TCOS_WINE_TEST_PROGRAM)
 #include "UserModeDemo.hpp"
 #endif
 
@@ -872,6 +872,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
   }
   wait_for_key(st, input, faults || warnings ? 15000000 : 1500000);
+
+#ifdef TCOS_WINE_TEST_PROGRAM
+  // Deliberately here, not with TCOS_USERMODE_DEMO above: every detach_firmware_drivers() caller (Network, Storage) has already run, so whatever a PE
+  // program's execution leaves behind cannot crash one of those calls the way it does when a PE program runs before them (see UserModeDemo.hpp).
+  run_wine_test_program(shared_allocator);
+#endif
 
   // MIDI (set up before the desktop, which is gone first: songs on the hardware are silenced when the player closes): an MPU-401 port if the machine has one, and the USB MIDI devices (keyboards, controllers, synthesizers). A song is played on the hardware
   // that makes sound when there is some, else synthesized by the media player; what a keyboard plays goes to the same hardware or, with none, to

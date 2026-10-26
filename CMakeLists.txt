@@ -770,6 +770,35 @@ endif()
 if(TCOS_USERMODE_DEMO_PAIR)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO_PAIR)
 endif()
+
+# A PE program to run once, after all hardware is ready (not before, like TCOS_USERMODE_DEMO): works around a firmware-driver-detach bug a PE program's
+# execution triggers (see the "usermode-windows" project memory), by running after every detach_firmware_drivers() caller (network, storage) instead of
+# before it. Independent of TCOS_USERMODE_DEMO, so it can run without the full built-in demo.
+set(TCOS_WINE_TEST_PROGRAM "" CACHE FILEPATH "A PE program to run once, after all hardware bring-up (a TCOS_USERMODE_DEMO alternative that avoids the firmware-driver-detach bug)")
+if(TCOS_WINE_TEST_PROGRAM)
+  file(WRITE ${CMAKE_BINARY_DIR}/wine_test_program.S
+    ".section .rdata,\"dr\"\n.balign 16\n.global tcos_wine_test_program\ntcos_wine_test_program:\n.incbin \"${TCOS_WINE_TEST_PROGRAM}\"\n.global tcos_wine_test_program_end\ntcos_wine_test_program_end:\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${TCOS_WINE_TEST_PROGRAM})
+  target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/wine_test_program.S)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/wine_test_program.S PROPERTIES OBJECT_DEPENDS ${TCOS_WINE_TEST_PROGRAM})
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_WINE_TEST_PROGRAM)
+  # More files for C:\\Windows\\System32 (DLLs the test program uses, say): a ;-separated list.
+  set(TCOS_WINE_TEST_FILES "" CACHE STRING "Files TCOS_WINE_TEST_PROGRAM puts next to it in C:\\Windows\\System32")
+  set(_wine_test_files_s ".section .rdata,\"dr\"\n.balign 16\n")
+  set(_wine_test_table "")
+  set(_wine_test_index 0)
+  foreach(_file ${TCOS_WINE_TEST_FILES})
+    get_filename_component(_name ${_file} NAME)
+    string(APPEND _wine_test_files_s ".balign 16\ntcos_wine_test_file_${_wine_test_index}:\n.incbin \"${_file}\"\ntcos_wine_test_file_${_wine_test_index}_end:\ntcos_wine_test_name_${_wine_test_index}:\n.asciz \"${_name}\"\n")
+    string(APPEND _wine_test_table ".quad tcos_wine_test_name_${_wine_test_index}, tcos_wine_test_file_${_wine_test_index}, tcos_wine_test_file_${_wine_test_index}_end\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_file})
+    math(EXPR _wine_test_index "${_wine_test_index}+1")
+  endforeach()
+  string(APPEND _wine_test_files_s ".balign 8\n.global tcos_wine_test_files\ntcos_wine_test_files:\n${_wine_test_table}.global tcos_wine_test_file_count\ntcos_wine_test_file_count:\n.quad ${_wine_test_index}\n")
+  file(WRITE ${CMAKE_BINARY_DIR}/wine_test_files.S "${_wine_test_files_s}")
+  target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/wine_test_files.S)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/wine_test_files.S PROPERTIES OBJECT_DEPENDS "${TCOS_WINE_TEST_FILES}")
+endif()
 # ntdll.dll, kernel32.dll and msvcrt.dll for Windows programs (src/Windows): freestanding DLLs built with the same mingw compiler. They are not part of the kernel: they are
 # files of the primary disk image (/Windows/Windows/System32, see `primary` below) that the loader maps into each Windows process. kernel32.dll is linked against ntdll's import
 # library, as a real one would be.
@@ -845,8 +874,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
     list(APPEND WINDOWS_DLL_FILES ${WINDOWS_DIR}/${_library}.dll)
   endforeach()
   add_custom_target(windows_dlls DEPENDS ${WINDOWS_DLL_FILES})
-  if(TCOS_USERMODE_DEMO)
-    # The demo runs on a RAM file system, not on the primary disk: it gets copies of the libraries inside the demo build and writes them to /Windows/Windows/System32 itself.
+  if(TCOS_USERMODE_DEMO OR TCOS_WINE_TEST_PROGRAM)
+    # The demo (and TCOS_WINE_TEST_PROGRAM, below) run on a RAM file system, not on the primary disk: they get copies of the libraries inside the build and write them to /Windows/Windows/System32 themselves.
     set(_demo_libraries_s ".section .rdata,\"dr\"\n.balign 16\n")
     set(_demo_libraries_table "")
     set(_demo_library_index 0)
