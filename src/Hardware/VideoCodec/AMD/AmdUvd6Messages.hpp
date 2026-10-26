@@ -21,6 +21,7 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnDecodeMessages.hpp"
 #include "Hardware/VideoCodec/Software/H265Core.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg2Core.hpp"
 #include "Utility/ArrayView.hpp"
 
 namespace hardware {
@@ -38,7 +39,7 @@ namespace hardware {
 namespace amd_uvd6 {
 
 constexpr uint32_t kMsgCreate = 0, kMsgDecode = 1, kMsgDestroy = 2;      // msg_type
-constexpr uint32_t kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;        // RUVD_CODEC_H264_PERF, RUVD_CODEC_H265
+constexpr uint32_t kStreamTypeMpeg2 = 3, kStreamTypeH264Perf = 7, kStreamTypeH265 = 0x10;   // RUVD_CODEC_MPEG2, _H264_PERF, _H265
 
 constexpr uint32_t kMessagePageBytes = 0x1000;       // the message structure's page; the feedback area starts behind it
 constexpr uint32_t kFeedbackOffset = 0x1000;         // FB_BUFFER_OFFSET
@@ -97,6 +98,26 @@ bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fe
 // The feedback area's first word and the scaling table (4x4 lists at 0, 8x8 at 96, 16x16 at 480, 32x32 at 864) in a buffer of kMessageFeedbackItBytes at the message page.
 bool prepare_hevc_feedback_and_tables(ByteView message_buffer, const h265::Sps& sps, const h265::Pps& pps);
 
+// MPEG-2 (RUVD_CODEC_MPEG2, 4:2:0): the engine's picture buffer holds the last six pictures it decoded, and the message names a picture by the number of its decode job
+// (decoded_pic_idx; Mesa's frame_number, counted from 1) and each reference by the number of the job that decoded it, no more than six back. There is no context buffer
+// and no scaling table.
+constexpr uint32_t kMpeg2References = 6;   // NUM_MPEG2_REFS
+struct Mpeg2BufferSizes {
+  uint64_t dpb = 0;
+  uint32_t references = 0;
+};
+// Mesa's calc_dpb_size for MPEG-2: six pictures of the size aligned to a macroblock. 0 when the picture is too big or not whole macroblocks.
+Mpeg2BufferSizes mpeg2_buffer_sizes(uint32_t width, uint32_t height);
+// The job numbers the message carries: this picture's, and those of the pictures it predicts from (a picture with no reference names the latest job, as Mesa does).
+struct Mpeg2Pictures {
+  uint32_t current = 0, forward = 0, backward = 0;
+};
+// Builds the decode message of one picture (a frame, or a field). The quantiser matrices go in the order of the scan the picture uses, as Mesa sends them. False when `out`
+// is too small, the picture is not 4:2:0 or within the limits, or a reference is not one of the last six jobs.
+bool build_mpeg2_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const mpeg2::OffloadPicture& picture, const Mpeg2Pictures& pictures, const DecodeBuffers& buffers);
+// The feedback area's first word (its size) in a buffer of at least kMessageFeedbackItBytes at the message page; the rest of the area is cleared.
+bool prepare_mpeg2_feedback(ByteView message_buffer);
+
 // Where the buffers of a job are, as the GPU addresses them (the message buffer holds the message page, the feedback area and the scaling table).
 struct JobAddresses {
   uint64_t session_context = 0;
@@ -110,6 +131,9 @@ constexpr uint32_t kDecodeJobBuffers = 8;
 // The buffers of a decode job in the order Mesa names them to the engine (session context, message, picture buffer, context, bitstream, decoding target, feedback,
 // scaling table). `out` must hold kDecodeJobBuffers; the count is returned (0 if it does not fit).
 uint32_t decode_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
+// The buffers of an MPEG-2 job: session context, message, picture buffer, bitstream, decoding target, feedback (no context, no scaling table).
+constexpr uint32_t kMpeg2JobBuffers = 6;
+uint32_t mpeg2_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);
 // The buffers of a create or destroy job: the session context and the message.
 constexpr uint32_t kSessionJobBuffers = 2;
 uint32_t session_job_buffers(const JobAddresses& addresses, ArrayView<AmdUvd6Ring::Buffer> out);

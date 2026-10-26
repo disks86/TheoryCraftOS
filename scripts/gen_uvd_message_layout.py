@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generates AmdUvd6MessageLayout.inc: the byte offsets and sizes of the fields of the decode messages the UVD 6 firmware reads (the message header, the create and
-decode messages and the H.264 and H.265 picture parameters), measured by compiling the structure definitions in Mesa's ac_uvd_dec.h with a C compiler, so none is typed in by hand.
+decode messages and the H.264, H.265 and MPEG-2 picture parameters), measured by compiling the structure definitions in Mesa's ac_uvd_dec.h with a C compiler, so none is typed in by hand.
 
   gen_uvd_message_layout.py out.inc ac_uvd_dec.h
 
@@ -37,8 +37,12 @@ FIELDS = (
         'log2_parallel_merge_level_minus2', 'column_width_minus1', 'row_height_minus1', 'init_qp_minus26', 'num_delta_pocs_ref_rps_idx', 'curr_idx', 'curr_poc',
         'ref_pic_list', 'poc_list', 'ref_pic_set_st_curr_before', 'ref_pic_set_st_curr_after', 'ref_pic_set_lt_curr', 'ucScalingListDCCoefSizeID2',
         'ucScalingListDCCoefSizeID3', 'direct_reflist')]
+    + [('Mpeg2_' + f, 'body.decode.codec.mpeg2.' + f) for f in (
+        'decoded_pic_idx', 'ref_pic_idx', 'load_intra_quantiser_matrix', 'load_nonintra_quantiser_matrix', 'intra_quantiser_matrix', 'nonintra_quantiser_matrix',
+        'profile_and_level_indication', 'chroma_format', 'picture_coding_type', 'f_code', 'intra_dc_precision', 'pic_structure', 'top_field_first', 'frame_pred_frame_dct',
+        'concealment_motion_vectors', 'q_scale_type', 'intra_vlc_format', 'alternate_scan')]
 )
-SIZES = [('Msg_sizeof', 'struct ruvd_msg'), ('H264_sizeof', 'struct ruvd_h264'), ('H265_sizeof', 'struct ruvd_h265')]
+SIZES = [('Msg_sizeof', 'struct ruvd_msg'), ('H264_sizeof', 'struct ruvd_h264'), ('H265_sizeof', 'struct ruvd_h265'), ('Mpeg2_sizeof', 'struct ruvd_mpeg2')]
 
 
 def main():

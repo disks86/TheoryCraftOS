@@ -296,6 +296,73 @@ bool prepare_hevc_feedback_and_tables(ByteView message_buffer, const h265::Sps& 
   return true;
 }
 
+Mpeg2BufferSizes mpeg2_buffer_sizes(uint32_t width, uint32_t height) {
+  Mpeg2BufferSizes sizes;
+  if (!size_ok(width, height)) return sizes;
+  uint64_t image = align_up(width, kDbPitchAlignment) * height;
+  image += image / 2;
+  image = align_up(image, 1024);
+  sizes.references = kMpeg2References;
+  sizes.dpb = image * kMpeg2References;   // calc_dpb_size: "must be big enough for all frames"
+  return sizes;
+}
+
+bool build_mpeg2_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const mpeg2::OffloadPicture& picture, const Mpeg2Pictures& p, const DecodeBuffers& b) {
+  if (!picture.seq || !picture.pic || picture.seq->chroma_format != 1) return false;
+  const mpeg2::SequenceHeader& seq = *picture.seq;
+  const mpeg2::PictureHeader& pic = *picture.pic;
+  if (seq.mb_width <= 0 || seq.mb_height <= 0 || pic.type < mpeg2::kPictureI || pic.type > mpeg2::kPictureB || pic.structure < mpeg2::kTopField || pic.structure > mpeg2::kFramePicture) return false;
+  // get_ref_pic_idx limits a reference to the last six jobs; a picture further back is no longer in the engine's buffer.
+  const uint32_t refs[2] = {p.forward, p.backward};
+  for (uint32_t r : refs)
+    if (p.current == 0 || r >= p.current || p.current - r > kMpeg2References) return false;
+  const uint32_t width = static_cast<uint32_t>(seq.mb_width) * kMacroblock, height = static_cast<uint32_t>(seq.mb_height) * kMacroblock;
+  if (!size_ok(width, height) || !build_common_decode(out, kStreamTypeMpeg2, stream_handle, feedback_number, width, height, b)) return false;
+  Image m(out);
+  m.u32(kUvd_Mpeg2_decoded_pic_idx, p.current);
+  m.u32(kUvd_Mpeg2_ref_pic_idx, p.forward);
+  m.u32(kUvd_Mpeg2_ref_pic_idx + 4, p.backward);
+  m.u8(kUvd_Mpeg2_load_intra_quantiser_matrix, 1);
+  m.u8(kUvd_Mpeg2_load_nonintra_quantiser_matrix, 1);
+  for (uint32_t i = 0; i < 64; ++i) {
+    m.u8(kUvd_Mpeg2_intra_quantiser_matrix + i, picture.intra_matrix_scan[i]);
+    m.u8(kUvd_Mpeg2_nonintra_quantiser_matrix + i, picture.non_intra_matrix_scan[i]);
+  }
+  m.u8(kUvd_Mpeg2_profile_and_level_indication, 0);
+  m.u8(kUvd_Mpeg2_chroma_format, 1);
+  m.u8(kUvd_Mpeg2_picture_coding_type, static_cast<uint8_t>(pic.type));
+  for (uint32_t d = 0; d < 2; ++d)
+    for (uint32_t c = 0; c < 2; ++c) m.u8(kUvd_Mpeg2_f_code + d * 2 + c, static_cast<uint8_t>(pic.f_code[d][c]));   // (the codes as they are in the stream: Mesa's 0-based ones plus one)
+  m.u8(kUvd_Mpeg2_intra_dc_precision, static_cast<uint8_t>(pic.intra_dc_precision));
+  m.u8(kUvd_Mpeg2_pic_structure, static_cast<uint8_t>(pic.structure));
+  m.u8(kUvd_Mpeg2_top_field_first, pic.top_field_first ? 1 : 0);
+  m.u8(kUvd_Mpeg2_frame_pred_frame_dct, pic.frame_pred_frame_dct ? 1 : 0);
+  m.u8(kUvd_Mpeg2_concealment_motion_vectors, pic.concealment_motion_vectors ? 1 : 0);
+  m.u8(kUvd_Mpeg2_q_scale_type, pic.q_scale_type ? 1 : 0);
+  m.u8(kUvd_Mpeg2_intra_vlc_format, pic.intra_vlc_format ? 1 : 0);
+  m.u8(kUvd_Mpeg2_alternate_scan, pic.alternate_scan ? 1 : 0);
+  return true;
+}
+
+bool prepare_mpeg2_feedback(ByteView message_buffer) {
+  if (message_buffer.size() < kMessageFeedbackItBytes) return false;
+  Image m(message_buffer);
+  m.zero(kFeedbackOffset, kFeedbackBytes);
+  m.u32(kFeedbackOffset, kFeedbackBytes);   // "set at least the feedback buffer size"
+  return true;
+}
+
+uint32_t mpeg2_job_buffers(const JobAddresses& a, ArrayView<AmdUvd6Ring::Buffer> out) {
+  if (out.size() < kMpeg2JobBuffers) return 0;
+  out[0] = {amd_vcn::kCmdSessionContextBuffer, a.session_context};
+  out[1] = {amd_vcn::kCmdMsgBuffer, a.message};
+  out[2] = {amd_vcn::kCmdDpbBuffer, a.dpb};
+  out[3] = {amd_vcn::kCmdBitstreamBuffer, a.bitstream};
+  out[4] = {amd_vcn::kCmdDecodingTargetBuffer, a.target};
+  out[5] = {amd_vcn::kCmdFeedbackBuffer, a.message + kFeedbackOffset};
+  return kMpeg2JobBuffers;
+}
+
 uint32_t session_job_buffers(const JobAddresses& a, ArrayView<AmdUvd6Ring::Buffer> out) {
   if (out.size() < kSessionJobBuffers) return 0;
   out[0] = {amd_vcn::kCmdSessionContextBuffer, a.session_context};
