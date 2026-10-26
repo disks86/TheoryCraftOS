@@ -27,10 +27,17 @@
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "WebGl/GlContext.hpp"
+#include "WebGl/Accelerator.hpp"
 #include "WebGl/Raster.hpp"
 #include "WebGl/Shader.hpp"
+#include "WebGl/TgsiTranslator.hpp"
 
 namespace wgpu {
+
+using webgl::AccelState;
+using webgl::IAccelerator;
+using webgl::TgsiConstant;
+using webgl::TgsiProgram;
 
 using webgl::Image;
 
@@ -174,6 +181,14 @@ struct RenderPipeline {
   uint8_t cull = 0;       // 0 none, 1 front, 2 back
   bool unclipped_depth = false;
   uint32_t sample_count = 1;
+  // Hardware acceleration (GpuAccel.cpp): the TGSI translation and the accelerator's program, made when the pipeline is first drawn with.
+  UniquePointer<TgsiProgram> tgsi;
+  IAccelerator* accel = nullptr;
+  uint32_t accel_program = 0;
+  bool accel_tried = false;
+  ~RenderPipeline() {
+    if (accel && accel_program) accel->destroy_program(accel_program);
+  }
 };
 
 struct ComputePipeline {
@@ -351,7 +366,26 @@ class Device final : public shader::ITextureHost {
   struct Target;
   Target* target_ = nullptr;
   uint64_t clock_ = 1000;
+
+  // --- 3D hardware (GpuAccel.cpp). A render pass whose color attachment is cleared (not loaded) is drawn on the accelerator, one device picture per pass, and read back
+  // into the texture when the pass ends or at the first draw the hardware cannot take (the rest of the pass is then drawn on the CPU on top of it).
+  IAccelerator* hw_ = nullptr;
+  uint32_t hw_target_ = 0, hw_w_ = 0, hw_h_ = 0;
+  bool hw_pass_ = false;     // the open pass is drawn on the hardware
+  bool hw_ahead_ = false;    // ... and the device picture is newer than the texture
+  bool hw_depth_ = false;    // ... and has a depth buffer
+  uint32_t hw_view_ = 0;     // the color attachment's view
+  void hw_release();
+  void hw_begin(const RenderPassDesc& d);
+  void hw_sync();
+  void hw_end();
+  bool hw_program(RenderPipeline& rp, IAccelerator& acc);
+  bool hw_draw(RenderPipeline& rp, uint32_t count, uint32_t first, int32_t base_vertex, uint32_t instances, uint32_t first_instance, bool indexed);
 };
+
+// Vertex attribute decoding shared with GpuAccel.cpp (GpuRender.cpp): the lanes (float bit patterns, or raw integers when *ints) of the attribute at p.
+void decode_vertex_attribute(uint8_t fmt, const uint8_t* p, uint32_t lanes[4], bool* ints);
+uint32_t vertex_attribute_bytes(uint8_t fmt);
 
 // The buffer-order size of one texel of a format for a copy aspect (0: unsupported).
 uint32_t texel_copy_bytes(const FormatDesc& f, uint8_t aspect);

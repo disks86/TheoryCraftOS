@@ -23,6 +23,7 @@
 #pragma once
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Graphics/Graphics3D/LockedDevice.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include "Graphics/Graphics3D/Svga/SvgaDevice.hpp"
 #include "Graphics/Graphics3D/Virgl/VirglDevice.hpp"
@@ -74,6 +75,11 @@ class SystemGraphics {
   SoftwareDevice software_;
   alignas(8) unsigned char virgl_storage_[sizeof(VirglDevice)];
   alignas(8) unsigned char svga_storage_[sizeof(SvgaDevice)];
+  // The accelerated device is used through a locked wrapper (it is shared by the 2D renderer, the 3D test window and the browser's canvases, which run on different
+  // threads); raw_device_ is the real one.
+  alignas(8) unsigned char locked_storage_[sizeof(LockedDevice)];
+  LockedDevice* locked_ = nullptr;
+  IGraphicsDevice* raw_device_ = nullptr;
   bool svga_ = false;
   const char* reason_ = "";
   FixedString<96> reason_text_;

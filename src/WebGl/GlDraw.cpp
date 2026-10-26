@@ -453,6 +453,12 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     }
   }
 
+  // The 3D hardware takes the draw if it can (default framebuffer, shaders and state the device has); otherwise the picture is brought back to the CPU first.
+  if (target.is_default) {
+    if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
+    hw_cpu_write();
+  }
+
   // varying flags for the rasterizer
   gpu::RasterState rs;
   const int32_t ss = static_cast<int32_t>(target.ss);
@@ -694,6 +700,12 @@ void GlContext::clear(uint32_t mask) {
     y1 = (sc_[1] + sc_[3]) * k < y1 ? (sc_[1] + sc_[3]) * k : y1;
   }
   if (x0 >= x1 || y0 >= y1) return;
+  const bool whole = x0 == 0 && y0 == 0 && x1 == static_cast<int32_t>(t.w) && y1 == static_cast<int32_t>(t.h);
+  if (t.is_default) {
+    // The CPU clear below builds on the picture that is there - unless it replaces all of it.
+    if ((mask & 0x4000) && whole && cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3]) hw_ahead_ = false;
+    else hw_sync();
+  }
   if (mask & 0x4000) {
     for (uint32_t bi = 0; bi < kMaxDrawBuffers; ++bi) {
       Image* im = t.color[bi];
@@ -742,6 +754,7 @@ void GlContext::clear(uint32_t mask) {
         write_texel(*t.stencil, static_cast<uint32_t>(x), static_cast<uint32_t>(y), t.depth_layer, raw);
       }
   }
+  if (t.is_default) hw_after_clear(mask, whole);
   ++version_;
 }
 
@@ -751,6 +764,7 @@ void GlContext::clear_buffer(uint32_t buffer, int32_t drawbuffer, const uint32_t
   Target t;
   resolve_target(draw_fb_, true, &t);
   if (!t.ok) return;
+  if (t.is_default) hw_cpu_write();
   int32_t x0 = 0, y0 = 0, x1 = static_cast<int32_t>(t.w), y1 = static_cast<int32_t>(t.h);
   if (scissor_test_) {
     const int32_t k = static_cast<int32_t>(t.ss);
@@ -813,6 +827,7 @@ void GlContext::clear_buffer_fi(int32_t, float depth, int32_t stencil) {
 // --- Reads and copies --------------------------------------------------------------------------------------------------------------------------------
 
 void GlContext::read_pixels(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32_t format, uint32_t type, ByteView out) {
+  if (read_fb_ == 0) hw_sync();
   uint32_t status;
   if (!framebuffer_complete(read_fb_, &status)) { set_error(INVALID_FRAMEBUFFER_OPERATION); return; }
   Target t;
@@ -835,6 +850,7 @@ void GlContext::read_pixels(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32
 }
 
 void GlContext::copy_tex_image_2d(uint32_t target, int32_t level, uint32_t internal, int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t border) {
+  if (read_fb_ == 0) hw_sync();
   uint32_t face;
   Texture* tx = bound_texture_for(target, &face);
   if (!tx) return;
@@ -868,6 +884,7 @@ void GlContext::copy_tex_image_2d(uint32_t target, int32_t level, uint32_t inter
 }
 
 void GlContext::copy_tex_sub_image(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, int32_t x, int32_t y, uint32_t w, uint32_t h) {
+  if (read_fb_ == 0) hw_sync();
   uint32_t face;
   Texture* tx = bound_texture_for(target, &face);
   if (!tx) return;
@@ -900,6 +917,7 @@ void GlContext::copy_tex_sub_image(uint32_t target, int32_t level, int32_t xo, i
 }
 
 void GlContext::blit_framebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, uint32_t mask, uint32_t filter) {
+  if (read_fb_ == 0 || draw_fb_ == 0) hw_cpu_write();   // (conservative: a blit between two other framebuffers is not touched)
   Target rt, dt;
   resolve_target(read_fb_, false, &rt);
   resolve_target(draw_fb_, true, &dt);
@@ -979,6 +997,7 @@ void GlContext::blit_framebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t 
 // --- Presenting --------------------------------------------------------------------------------------------------------------------------------------
 
 bool GlContext::present(uint32_t* dst, uint32_t pitch, gpu::TouchBox* changed, bool force_all) {
+  hw_sync();
   if (!def_color_.defined()) return false;
   const int32_t k = static_cast<int32_t>(def_color_.ss);
   int32_t x0 = 0, y0 = 0, x1 = static_cast<int32_t>(width_) - 1, y1 = static_cast<int32_t>(height_) - 1;
@@ -1025,5 +1044,10 @@ bool GlContext::present(uint32_t* dst, uint32_t pitch, gpu::TouchBox* changed, b
   all_dirty_ = false;
   return true;
 }
+
+// What the accelerated path (GlAccel.cpp) shares with the software one.
+void read_vertex_attrib(const VertexAttrib& at, const uint8_t* element, uint32_t out[4]) { read_attrib(at, element, at.size, false, out); }
+uint32_t vertex_attrib_element_bytes(const VertexAttrib& at) { return attrib_type_size(at.type) * at.size; }
+uint32_t read_index_value(const uint8_t* p, uint32_t type) { return read_index(p, type); }
 
 }  // namespace webgl
