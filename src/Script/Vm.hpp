@@ -321,6 +321,9 @@ class Vm {
   bool has_in(const Value& key, const Value& object, bool* out);
   bool make_iterator(const Value& v, bool for_in, Value* out);
   bool iterator_next(JsObject* it, Value* out);
+  // Leaves an iteration early: calls the iterator's return() if it has one. `silent`: an exception from it is dropped (another one is already on its way).
+  bool iterator_close(JsObject* it, bool silent);
+  bool throw_uninitialized(FunctionCode* code, uint16_t mark);   // ReferenceError for a let / const read or written in its temporal dead zone
   bool spread_into(JsObject* array, const Value& iterable);
   bool has_global(JsString* name);
   bool lookup_global(JsString* name, Value* out);

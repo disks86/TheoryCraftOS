@@ -586,7 +586,7 @@ NATIVE(object_to_string) {
   else if (self.is_bool()) name = "[object Boolean]";
   else if (self.is_object()) {
     switch (self.as_object()->okind) {
-      case ObjKind::Array: name = "[object Array]"; break;
+      case ObjKind::Array: name = self.as_object()->position == kArgumentsMark ? "[object Arguments]" : "[object Array]"; break;
       case ObjKind::Function: case ObjKind::Native: case ObjKind::Bound: name = "[object Function]"; break;
       case ObjKind::Error: name = "[object Error]"; break;
       case ObjKind::RegExp: name = "[object RegExp]"; break;

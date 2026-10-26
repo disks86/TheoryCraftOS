@@ -34,9 +34,9 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   objects and non-configurable properties are implemented (`js_strict.js`); the host's own scripts keep configurable-by-default properties
   (`FunctionCode::library`). Left: the `prototype` of built-in constructors is configurable, module namespace properties are accessors
   (not writable data properties), no strict-only early errors (octal literals, duplicate parameters, `eval`/`arguments` assignment). Also missing:
-  `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, `Intl` beyond basic formatting, RegExp `v` flag (set notation) / `d` flag /
-  duplicate named groups / case folding beyond ASCII (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tags for Date, Map, Set and arguments,
-  TDZ, per-iteration `let` bindings in `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special
+  `SharedArrayBuffer`/`Atomics` are single-threaded stand-ins (no `wait`/`notify` blocking, `instanceof ArrayBuffer` is true); missing: resizable/transferable `ArrayBuffer`, `Intl` beyond basic formatting, RegExp `v` flag (set notation) / `d` flag /
+  duplicate named groups / case folding beyond ASCII (and `\p` covers the general categories, the main scripts and some binary properties only), `Object.prototype.toString` tags for Date, Map and Set,
+  TDZ and `const` only inside functions and blocks (top-level `let`/`const` are globals), duplicate `let` at top level, array destructuring does not close its iterator, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special
   casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
   content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
