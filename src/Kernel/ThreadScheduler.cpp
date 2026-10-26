@@ -55,6 +55,7 @@ struct alignas(4096) Core {
   Thread* current = nullptr;
   Thread* idle = nullptr;
   uint64_t busy_ticks = 0, idle_ticks = 0;
+  uint64_t kernel_entries = 0;      // interrupts of this core taken from ring 3 or the kernel that went through the scheduler (see wait_for_kernel_entry)
 #if defined(__x86_64__)
   // The stack an interrupt or SYSCALL from ring 3 lands on (TSS.rsp0); fills the rest of the page. Frames move to the thread's kernel stack at once.
   alignas(16) uint8_t entry_stack[3584];
@@ -364,6 +365,7 @@ UserTickHook g_user_tick = nullptr;
 
 Frame* on_timer(Frame* frame, void*) {
   ack_tick();
+  __atomic_fetch_add(&this_core()->kernel_entries, 1, __ATOMIC_SEQ_CST);
 #if defined(__x86_64__)
   if ((frame->cs & 3) == 3 && g_user_tick) g_user_tick(frame);
 #endif
@@ -406,6 +408,7 @@ Frame* on_yield(Frame* frame, void*) {
 Frame* on_wakeup(Frame* frame, void*) {
   ack_wakeup();
   Core* c = this_core();
+  __atomic_fetch_add(&c->kernel_entries, 1, __ATOMIC_SEQ_CST);
   if (g.stopping && c->index != g.boot_core) park_core(c);
   const uint64_t flags = lock_irq();
   Frame* result = reschedule_locked(frame, c, false);
@@ -657,14 +660,38 @@ void set_current_user_bases(bool set_fs, uint64_t fs, bool set_gs, uint64_t gs) 
   }
   irq_restore(flags);
 }
-void set_thread_user_cr3(Thread* t, uint64_t cr3) {
+int32_t set_thread_user_cr3(Thread* t, uint64_t cr3) {
+  int32_t running_on = -1;
   const uint64_t flags = lock_irq();
   if (t->user_cr3) {      // (a thread that has not started in user mode yet takes the tables it finds when it does: see set_current_user_context)
     t->user_cr3 = cr3;
-    Core* c = this_core();
-    if (c->current == t) c->user.user_cr3 = cr3;
+    for (uint32_t i = 0; i < g.core_count; ++i) {
+      if (g.cores[i].current != t) continue;
+      g.cores[i].user.user_cr3 = cr3;      // (what that core returns to ring 3 with: a store of one word, taken under the lock that every switch takes)
+      running_on = static_cast<int32_t>(i);
+    }
   }
   unlock_irq(flags);
+  return running_on;
+}
+
+bool wait_for_kernel_entry(const CoreMask& cores) {
+  uint64_t before[kMaxCores] = {};
+  const uint32_t self = current_core();
+  for (uint32_t i = 0; i < g.core_count; ++i) {
+    if (i == self || !cores.has(i)) continue;
+    before[i] = __atomic_load_n(&g.cores[i].kernel_entries, __ATOMIC_SEQ_CST);
+    send_wakeup(g.cores[i].apic_id);
+  }
+  const uint64_t limit = hardware::read_tsc() + hardware::tsc_ticks_per_us() * 1000000;      // (a second: a core that does not answer is stuck anyway)
+  for (uint32_t i = 0; i < g.core_count; ++i) {
+    if (i == self || !cores.has(i)) continue;
+    while (__atomic_load_n(&g.cores[i].kernel_entries, __ATOMIC_SEQ_CST) == before[i]) {
+      if (hardware::read_tsc() > limit) return false;
+      pause_hint();
+    }
+  }
+  return true;
 }
 void set_current_user_context(uint64_t cr3, void* context) {
   const uint64_t flags = irq_save();

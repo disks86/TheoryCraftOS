@@ -623,6 +623,38 @@ static uint64_t translate(uint64_t root, uint64_t address, uint64_t* flags) {
   return 0;
 }
 
+// With deferred freeing, the memory of what is unmapped, cut or moved stays allocated until reclaim() (other CPUs may still run on the old page tables).
+static void test_deferred_free() {
+  const int base = A.live;
+  {
+    AddressSpace s(A);
+    s.set_deferred_free(true);
+    CHECK(s.map(0x400000, 0x4000, kProtRead | kProtWrite));
+    const int mapped = A.live;
+    CHECK(s.unmap(0x401000, 0x1000));      // a hole in the middle: the tail is copied to new memory, the old memory stays whole
+    CHECK(s.unmap(0x400000, 0x1000));
+    CHECK(A.live > mapped);                // nothing was given back yet
+    s.reclaim();
+    CHECK(A.live < mapped + 4);
+    CHECK(s.resize(0x402000, 0x8000));     // growing moves the region to bigger memory
+    const int before = A.live;
+    s.reclaim();
+    CHECK(A.live < before);
+    CHECK(s.unmap(0x402000, 0x10000));
+    CHECK(A.live > base);
+    s.set_deferred_free(false);
+    s.reclaim();
+  }
+  CHECK(A.live == base);
+  {
+    AddressSpace s(A);      // destroyed with memory still waiting
+    s.set_deferred_free(true);
+    CHECK(s.map(0x400000, 0x2000, kProtRead));
+    CHECK(s.unmap(0x400000, 0x2000));
+  }
+  CHECK(A.live == base);
+}
+
 static void test_user_page_tables() {
   AddressSpace s(A);
   CHECK(s.map(0x400000, 0x2000, kProtRead | kProtExecute));
@@ -847,6 +879,7 @@ int main() {
   test_linux_memory();
   test_windows_memory();
   test_user_program();
+  test_deferred_free();
   test_user_page_tables();
   test_linux_thread_pointer_and_startup_calls();
   test_windows_startup();

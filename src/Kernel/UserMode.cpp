@@ -566,32 +566,35 @@ UserThread* Task::add_thread(const process::ThreadStart& start) {
 constexpr uint32_t kUserThreadKernelStack = 256 * 1024;
 
 bool Task::launch(UserThread* t, uint32_t stack_bytes) {
-  t->thread = kernel::spawn(user_main, t, "user-thread", home_core, -1, stack_bytes);
+  t->thread = kernel::spawn(user_main, t, "user-thread", -1, -1, stack_bytes);
   t->spawned = t->thread != nullptr;
   return t->spawned;
 }
 
 bool Task::sync_tables() {
-  // The old tables are freed when the new ones are ready, and the program's other threads (time-sliced on this core) still have the old ones: none of them may run in
-  // between, so nothing interrupts the change of tables.
-  const uint64_t flags = irq_save();
-  const bool ok = tables.sync(program.address_space());
-  if (ok) {
-    const uint64_t root = tables.root();
-    for (UserThread* t = threads; t; t = t->next) {
-      if (t->spawned && t->thread && !t->joined && !t->finished && t->thread->user_cr3 != root) set_thread_user_cr3(t->thread, root);
-    }
+  // The program's threads run side by side on every core, each on the page tables it was given. New tables are built beside the old ones; every thread is then given the new
+  // ones (a thread running on another core takes them when that core's interrupt brings it into the kernel and back), and only after all those cores have answered are the old
+  // tables and the memory of what was unmapped given back: until then another core may still be running on them.
+  if (!tables.sync(program.address_space(), true)) return false;
+  const uint64_t root = tables.root();
+  CoreMask others;
+  for (UserThread* t = threads; t; t = t->next) {
+    if (!t->spawned || !t->thread || t->joined || t->finished || t->thread->user_cr3 == root) continue;
+    const int32_t core = set_thread_user_cr3(t->thread, root);
+    if (core >= 0) others.add(static_cast<uint32_t>(core));
   }
-  irq_restore(flags);
-  return ok;
+  bool answered = true;
+  if (!others.empty()) answered = wait_for_kernel_entry(others);
+  if (answered) {
+    tables.release_previous();
+    program.address_space().reclaim();
+  } else {
+    console::puts("user program: a core did not give up the old page tables\n");      // (the old tables and memory are kept until the next change)
+  }
+  return true;
 }
 
 bool Task::start_thread(const process::ThreadStart& start, bool suspended) {
-  Thread* me = current_thread();
-  if (home_core < 0 && me) {      // the first extra thread: the program's threads stay on this core from now on
-    home_core = static_cast<int32_t>(current_core());
-    set_thread_affinity(me, home_core);
-  }
   UserThread* t = add_thread(start);
   if (!t) return false;
   if (!sync_tables()) return false;      // the new thread's stack and TEB are in the tables before it runs
@@ -740,6 +743,7 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
     if (!task->tables.add_identity({r.base, r.size, !read_only, code})) return UniquePointer<Task>();
   }
   if (!task->tables.rebuild(program.address_space())) return UniquePointer<Task>();
+  program.address_space().set_deferred_free(true);      // (see Task::sync_tables)
   const process::ProgramStart& start = program.start();
   process::ThreadStart first;
   first.entry = start.entry;
