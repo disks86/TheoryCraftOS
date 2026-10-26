@@ -142,6 +142,14 @@ renumbers its services in nearly every build, which is why programs call ntdll);
   no file I/O is asynchronous, so files associated with a port never post packets. **Process lists**: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, `Process32First/Next` and
   `K32EnumProcesses` read `NtQuerySystemInformation` class 5 (one entry per running program, without thread entries). `ReadProcessMemory`/`WriteProcessMemory` work on the
   program itself only; thread descriptions are kept per thread.
-- **Not provided**: the console screen-buffer functions (cursor, attributes, input records, console modes and control handlers), job objects, debugging APIs, memory of
+- **The console**: the terminal gives a program lines of text and takes text; on top of that kernel32 keeps what a Windows console has (`console.inc`): screen buffers
+  of character/colour cells (`CreateConsoleScreenBuffer`, `SetConsoleActiveScreenBuffer`, the `Read/Write/Fill/ScrollConsoleOutput*` family), cursor, window, text
+  attributes, input and output modes, the title, and ANSI sequences when the output mode has `ENABLE_VIRTUAL_TERMINAL_PROCESSING` (colours, cursor movement, erasing, cursor
+  visibility, title). Text written with `WriteFile`/`WriteConsole` to the console goes into the model and, without the sequences, to the terminal; cell and cursor
+  changes made with the other functions stay in the model, because the terminal cannot show them. Key events (`ReadConsoleInput`, `PeekConsoleInput`,
+  `GetNumberOfConsoleInputEvents`, `WriteConsoleInput`, waiting on the input handle) are made from the typed text, a key down and a key up per character; no mouse, focus or resize events.
+  `NtQueryInformationFile` class 24 on the console input says how many bytes could be read without waiting. `GenerateConsoleCtrlEvent` runs the program's own control handlers;
+  Ctrl+C typed at the terminal still ends the program without running them.
+- **Not provided**: job objects, debugging APIs, memory of
   other processes, remote threads, Toolhelp lists of threads, modules and heaps, mailslots, change notifications, hard and symbolic links, and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.
