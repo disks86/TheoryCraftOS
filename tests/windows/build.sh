@@ -54,6 +54,8 @@ $cc -O1 -Wall -Wextra -o "$out/linktest.exe" tests/windows/linktest.c
 echo "built $out/linktest.exe (hard and symbolic links)"
 $cc -O1 -Wall -Wextra -o "$out/priotest.exe" tests/windows/priotest.c
 echo "built $out/priotest.exe (thread and process priority affects scheduling)"
+$cc -O1 -Wall -Wextra -o "$out/regtest.exe" tests/windows/regtest.c -ladvapi32
+echo "built $out/regtest.exe (the registry, over advapi32)"
 $cc -O1 -Wall -Wextra -o "$out/locktest.exe" tests/windows/locktest.c
 echo "built $out/locktest.exe (byte-range locks; procchild.exe in System32)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c

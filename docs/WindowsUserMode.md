@@ -1,10 +1,11 @@
 # Windows programs: libraries and system services
 
 
-Windows (PE) programs run in ring 3 on `ntdll.dll`, `kernel32.dll` and `msvcrt.dll`, freestanding DLLs built from `src/Windows/` and put on the primary disk image in
-`C:\Windows\System32` (see [FileSystemLayout.md](FileSystemLayout.md)). ntdll turns the NT services into `SYSCALL`s. The service numbers are this OS's own (real Windows
-renumbers its services in nearly every build, which is why programs call ntdll); `src/Windows/tcos_syscalls.h` and `src/Process/WindowsSyscalls.hpp` hold the numbers and
-`tests/SyscallTest.cpp` checks that they agree. The services behind the system calls are in `src/Process/Windows*.cpp`; the kernel side is `src/Kernel/UserMode.cpp`.
+Windows (PE) programs run in ring 3 on `ntdll.dll`, `kernel32.dll`, `msvcrt.dll` and `advapi32.dll`, freestanding DLLs built from `src/Windows/` and put on the primary disk
+image in `C:\Windows\System32` (see [FileSystemLayout.md](FileSystemLayout.md)). ntdll turns the NT services into `SYSCALL`s. The service numbers are this OS's own (real
+Windows renumbers its services in nearly every build, which is why programs call ntdll); `src/Windows/tcos_syscalls.h` and `src/Process/WindowsSyscalls.hpp` hold the numbers
+and `tests/SyscallTest.cpp` checks that they agree. The services behind the system calls are in `src/Process/Windows*.cpp`; the kernel side is `src/Kernel/UserMode.cpp`.
+advapi32.dll is the one library here with no NT services of its own: it is written entirely over kernel32.dll, the way a real one is layered over kernel32 for the registry.
 
 ## Files and directories
 
@@ -114,6 +115,22 @@ renumbers its services in nearly every build, which is why programs call ntdll);
 | `NtLoadModule` | 50 |
 | `NtReleaseModule` | 52 |
 | `NtUnloadModule` | 51 |
+
+## The registry
+
+`advapi32.dll` (`src/Windows/advapi32/advapi32.c`) implements the registry entirely over kernel32.dll's file functions, with no NT services of its own: a key is a
+directory under `C:\Windows\System32\config\<hive>`, and a value is one file in that directory, holding a small `[type, length, data]` header the value's own bytes follow;
+the unnamed "default" value of a key is the file named `(Default)`. The five predefined keys (`HKEY_LOCAL_MACHINE`, `HKEY_CURRENT_USER`, `HKEY_CLASSES_ROOT`, `HKEY_USERS`,
+`HKEY_CURRENT_CONFIG`) are fixed pseudo-handles mapping to the hive directories (made, with their parents, the first time something is created under them); there is no
+separate per-user hive, so `HKEY_CURRENT_USER` is just another one of the five, and `HKEY_CLASSES_ROOT` does not merge with `HKLM\Software\Classes` the way the real one does.
+This makes the registry an ordinary part of the file system, shared by every process like the real one (not per-process), and exactly as persistent as whatever is mounted
+there (nothing, on the RAM file system the boot demo uses, like everything else in it). `RegOpenKeyEx`, `RegCreateKeyEx`, `RegCloseKey`, `RegQueryValueEx`/`RegGetValue`,
+`RegSetValueEx`, `RegDeleteValue`, `RegDeleteKey` (only on a key with no subkeys, like the real one), `RegEnumKeyEx`, `RegEnumValue`, `RegQueryInfoKey` and `RegFlushKey`
+(a no-op: there is no cache) all work, for `REG_SZ`, `REG_EXPAND_SZ` (no `%VAR%` expansion), `REG_MULTI_SZ`, `REG_DWORD`, `REG_QWORD` and `REG_BINARY`. Not provided:
+security descriptors and access checks (any access is granted), `REG_DWORD_BIG_ENDIAN`, volatile keys (a key made "volatile" is not treated specially: it persists exactly
+like any other, as far as the mounted file system does), remote registries, and registry change notifications. `advapi32.dll` also has `GetUserName` (one fixed user),
+`OpenProcessToken`/`GetTokenInformation` (enough to answer "what user" and "is it elevated", always yes: there is no UAC), and `CryptAcquireContext`/`CryptGenRandom`/
+`CryptReleaseContext` (bytes that are not predictable in practice but are not a cryptographic guarantee, since there is no entropy driver for programs yet).
 
 ## Job objects
 

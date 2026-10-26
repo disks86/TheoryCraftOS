@@ -625,6 +625,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/AMD/AmdVcnFirmware.cpp
   src/Hardware/VideoCodec/AMD/AmdVcn1.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6.cpp
+  src/Hardware/VideoCodec/AMD/AmdVce3.cpp
+  src/Hardware/VideoCodec/AMD/AmdVce3Ring.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Ring.cpp
   src/Hardware/VideoCodec/AMD/AmdSmu7.cpp
   src/Hardware/VideoCodec/AMD/AmdUvd6Messages.cpp
@@ -778,13 +780,19 @@ if(TCOS_ARCH STREQUAL "x86_64")
     DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.def ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc
             ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
     COMMENT "Building msvcrt.dll")
-  add_custom_target(windows_dlls DEPENDS ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_DIR}/msvcrt.dll)
+  add_custom_command(OUTPUT ${WINDOWS_DIR}/advapi32.dll
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180600000 -o ${WINDOWS_DIR}/advapi32.dll
+            ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.c ${CMAKE_SOURCE_DIR}/src/Windows/advapi32/advapi32.def
+            ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
+    COMMENT "Building advapi32.dll")
+  add_custom_target(windows_dlls DEPENDS ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_DIR}/msvcrt.dll ${WINDOWS_DIR}/advapi32.dll)
   if(TCOS_USERMODE_DEMO)
     # The demo runs on a RAM file system, not on the primary disk: it gets copies of the libraries inside the demo build and writes them to /Windows/Windows/System32 itself.
     set(_demo_libraries_s ".section .rdata,\"dr\"\n.balign 16\n")
     set(_demo_libraries_table "")
     set(_demo_library_index 0)
-    foreach(_library ntdll kernel32 msvcrt)
+    foreach(_library ntdll kernel32 msvcrt advapi32)
       string(APPEND _demo_libraries_s ".balign 16\ntcos_demo_library_${_demo_library_index}:\n.incbin \"${WINDOWS_DIR}/${_library}.dll\"\ntcos_demo_library_${_demo_library_index}_end:\ntcos_demo_library_name_${_demo_library_index}:\n.asciz \"${_library}.dll\"\n")
       string(APPEND _demo_libraries_table ".quad tcos_demo_library_name_${_demo_library_index}, tcos_demo_library_${_demo_library_index}, tcos_demo_library_${_demo_library_index}_end\n")
       math(EXPR _demo_library_index "${_demo_library_index}+1")
@@ -792,7 +800,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
     string(APPEND _demo_libraries_s ".balign 8\n.global tcos_demo_libraries\ntcos_demo_libraries:\n${_demo_libraries_table}.global tcos_demo_library_count\ntcos_demo_library_count:\n.quad ${_demo_library_index}\n")
     file(WRITE ${WINDOWS_DIR}/demo_libraries.S "${_demo_libraries_s}")
     target_sources(BOOTX64 PRIVATE ${WINDOWS_DIR}/demo_libraries.S)
-    set_source_files_properties(${WINDOWS_DIR}/demo_libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll;${WINDOWS_DIR}/msvcrt.dll")
+    set_source_files_properties(${WINDOWS_DIR}/demo_libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll;${WINDOWS_DIR}/msvcrt.dll;${WINDOWS_DIR}/advapi32.dll")
   endif()
 endif()
 
@@ -884,7 +892,7 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   set(_system32 /Windows/Windows/System32)
   add_custom_target(primary ALL
     COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-primary-image.sh ${TCOS_PRIMARY_IMAGE} ${TCOS_PRIMARY_IMAGE_SIZE} ${_primary_tool}
-            file:${_system32}/ntdll.dll=${WINDOWS_DIR}/ntdll.dll file:${_system32}/kernel32.dll=${WINDOWS_DIR}/kernel32.dll file:${_system32}/msvcrt.dll=${WINDOWS_DIR}/msvcrt.dll
+            file:${_system32}/ntdll.dll=${WINDOWS_DIR}/ntdll.dll file:${_system32}/kernel32.dll=${WINDOWS_DIR}/kernel32.dll file:${_system32}/msvcrt.dll=${WINDOWS_DIR}/msvcrt.dll file:${_system32}/advapi32.dll=${WINDOWS_DIR}/advapi32.dll
     DEPENDS ${_primary_tool}
     COMMENT "Filling the primary disk image")
   add_dependencies(primary windows_dlls)

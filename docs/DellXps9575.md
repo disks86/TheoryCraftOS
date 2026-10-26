@@ -15,6 +15,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 - **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
   None of it exists and none can be checked without the hardware and the firmware blobs.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265, MPEG-2 and VC-1 (10-bit HEVC; MPEG-4; interlaced VC-1; the chip has no VP9), and any run of it on the card.
+- **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
 
@@ -69,6 +70,29 @@ engine might write to is kept) are covered too.
 
 The context workarounds are written to the registers directly instead of being loaded into every context with `MI_LOAD_REGISTER_IMM`, which is enough because the driver has one context (the engine saves them with it). The MCR steering
 selector (needed for reads of slice-specific registers) is not set; nothing here reads them.
+
+## Radeon RX Vega M: VCE 3.4 (H.264 encode)
+
+`src/Hardware/VideoCodec/AMD/AmdVce3.*` is the start/stop of the Video Coding Engine 3.4, ported from amdgpu (`vce_v3_0.c`: `vce_v3_0_start`, `_stop`, `_mc_resume`, `_firmware_loaded`, the clock gating override and
+software clock gating, `_get_harvest_config`; `amdgpu_vce.c`: the memory layout and the microcode copy) the way `AmdUvd6` was ported from `uvd_v6_0.c`: registers numbered by dword in the card's register BAR, constants
+generated from AMD's headers (`scripts/gen_vcn1_regs.py --vi` -> `AmdVce3Registers.inc`), and `scripts/check_vce3_port.py <path to vce_v3_0.c>` confirms every ported function touches the same registers in the same order as
+the driver (it skips only the branches for chips before Stoney). The firmware is `/firmware/vegam_vce.bin` (linux-firmware, VCE 3.4, encoder firmware 53.21, so three rings), found with `amd_vce3_firmware_name()`.
+
+What is there: the two instances behind `GRBM_GFX_INDEX` (a Polaris-family chip has the second one fused off; the fuse is read through the SMC, `read_harvest_config`), the memory block (a 384 KiB microcode window, then a stack
+and a data area for each instance: 1144 KiB), the three rings of 1024 dwords, the memory controller windows, the clock gating, the start (with the driver's retries of the ECPU) and the stop, and a register snapshot of the moment a
+start gives up (`failure_snapshot`, as for the UVD). `tests/AmdVce3Test.cpp` runs it against a simulated card whose registers are banked per instance, and covers one instance, both, only the second, none, the layout of each
+instance's windows, the rings, the clock gating, retries and failure, and every refused argument.
+
+The ring: `AmdVce3Ring` is the work submission (`vce_v3_0_ring_emit_ib` of the chips from Stoney on, `amdgpu_vce_ring_emit_fence`, `amdgpu_vce_ring_test_ring`, the ring pointers through
+`GRBM_GFX_INDEX`, the nop command and the 16-dword alignment, the commands' values from `vid.h`). A job is `IB_VM` (VMID 0, the indirect buffer's address and length), `FENCE` (address, sequence), `TRAP`, `END` and
+padding; the indirect buffer holds the firmware's own task commands (the encode messages, next), padded with no-ops to 16 dwords; the CPU polls the fence word, and a job that does not finish wedges the ring until the engine is
+restarted. The host data path is flushed before the write pointer is published. `tests/AmdVce3RingTest.cpp` runs it against a simulated ring controller (all three rings, either instance, wrap-around over 200 jobs, the fence,
+a stalled engine, a dead one, every bad argument, and the order of the flush and the pointer; moving the fence words, dropping the padding, using the wrong ring's registers or flushing after the pointer each fails it) and
+`check_vce3_port.py vce_v3_0.c amdgpu_vce.c` confirms the job's commands, the ring test and the pointer registers against the driver.
+
+Not there, and needed before a Vega M encodes anything: the encode messages (Mesa's `radeon_vce.c` and `radeon_vce_52.c`: session, create, rate control, picture control, the feedback), an `IVideoEncoder` session on
+top, a self-test (the engine's bitstream has to decode with the CPU decoder to something close to the picture that went in), the memory planning and the PCI plumbing (as `AmdGmc8Memory` and `AmdUvd6VideoEngine` do for
+the UVD), and the SMC's power and clock requests. Not run on a Vega M.
 
 ## Textures in the graphics device API
 
