@@ -210,7 +210,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     note_ = "engine started, idle";
     rebuild_status();
     if (!enable_decode(*registers_, clock, memory_.engine.ring, *mapper_, plan_.work_gpu_address, aperture_physical_ + plan_.work_offset, plan_.work_bytes)) return false;
-    enable_hevc_decode();   // (H.264 works either way)
+    if (enable_hevc_decode()) enable_hevc10_decode();   // (H.264 works either way; ten bits is a test on top of the eight-bit one)
     if (engine_running()) enable_mpeg2_decode();
     if (engine_running()) enable_vc1_decode();
     return engine_running();
@@ -227,6 +227,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   void stop_engine() {
     decode_ready_ = false;
     hevc_ready_ = false;
+    hevc10_ready_ = false;
+    hevc10_note_.assign("");
     mpeg2_ready_ = false;
     vc1_ready_ = false;
     info_.accelerated_decode_codecs = 0;
@@ -313,6 +315,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   // engine as well. A failed test leaves H.264 as it was - unless the engine stopped answering, which stops it altogether. True when H.265 is served by the engine now.
   bool enable_hevc_decode() {
     hevc_ready_ = false;
+    hevc10_ready_ = false;
+    hevc10_note_.assign("");
     if (!ring_) return false;
     AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
     {
@@ -347,6 +351,49 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Hevc);
     note_ = "engine started; H.264 and H.265 decode run on it (self-tests passed)";
     rebuild_status();
+    return true;
+  }
+  // After enable_hevc_decode(): the Main 10 test (AmdVcnSelfTest::run_hevc10_session: ten-bit libx265 stream, the engine's P010 pictures checked against the stream's own MD5s).
+  // Passing lets H.265 sessions take ten-bit streams, which the CPU cannot decode at all; a failure leaves ten-bit streams undecoded and everything else as it was - unless
+  // the engine stopped answering, which stops it altogether.
+  bool enable_hevc10_decode() {
+    hevc10_ready_ = false;
+    if (!ring_ || !hevc_ready_) return false;
+    AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
+    {
+      DecoderConfig config;
+      config.codec = VideoCodec::Hevc;
+      config.output = PixelFormat::P010;
+      AmdUvd6HevcDecoder session(allocator_, engine_, config);
+      AmdVcnSelfTest::Md5PlaneHasher hasher;
+      session.allow_deep(true);
+      session.set_plane_hasher(&hasher);
+      if (session.prepare()) {
+        result = AmdVcnSelfTest::run_hevc10_session(
+            allocator_, session, [](const void* ring) { return static_cast<const AmdUvd6Ring*>(ring)->wedged(); }, ring_.get(),
+            [](const void* decoder) { return static_cast<const AmdUvd6HevcDecoder*>(decoder)->pictures_decoded(); },
+            [](const void* decoder) { return static_cast<const AmdUvd6HevcDecoder*>(decoder)->hash_statistics(); }, &session);
+      }
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("Main 10 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+        note_ = decode_text_.c_str();
+      } else {
+        hevc10_note_.assign("Main 10 test failed (");   // (kept apart: the notes of the tests after this one replace note_)
+        hevc10_note_.append(AmdVcnSelfTest::result_name(result));
+        hevc10_note_.append(")");
+      }
+      rebuild_status();
+      return false;
+    }
+    hevc10_ready_ = true;
     return true;
   }
   // After enable_decode(): the same for MPEG-2 (AmdVcnSelfTest::run_mpeg2_session: an ffmpeg stream with B pictures). The engine's inverse transform is not the CPU decoder's, so
@@ -447,6 +494,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   bool vc1_ready() const { return vc1_ready_; }
   bool mpeg2_ready() const { return mpeg2_ready_; }
   bool hevc_ready() const { return hevc_ready_; }
+  bool hevc10_ready() const { return hevc10_ready_; }
   const char* engine_note() const { return note_; }
 
   // H.264, H.265, MPEG-2 and VC-1 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
@@ -467,6 +515,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
       AmdUvd6AvcDecoder::Engine engine = engine_;
       engine.stream_handle = ++next_stream_handle_;
       UniquePointer<AmdUvd6HevcDecoder> session = UniquePointer<AmdUvd6HevcDecoder>::make(allocator_, allocator_, engine, config);
+      if (session) session->allow_deep(hevc10_ready_);
       if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
     }
     if (config.codec == VideoCodec::H264 && decode_ready_ && ring_ && !ring_->wedged()) {
@@ -567,6 +616,10 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
       firmware_text_.append_uint(firmware_.ucode().size());
       firmware_text_.append(" bytes of microcode loaded, ");
       firmware_text_.append(note_);
+      if (hevc10_note_.size() != 0) {
+        firmware_text_.append("; ");
+        firmware_text_.append(hevc10_note_.view());
+      }
       if (power_note_.size() != 0) {
         firmware_text_.append("; ");
         firmware_text_.append(power_note_.view());
@@ -615,6 +668,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   bool has_ring_detail_ = false;
   bool decode_ready_ = false;
   bool hevc_ready_ = false;
+  bool hevc10_ready_ = false;   // ten-bit H.265 passed its test
+  FixedString<95> hevc10_note_;   // why not, when it did not
   bool mpeg2_ready_ = false;
   bool vc1_ready_ = false;
   uint32_t next_stream_handle_ = 1;

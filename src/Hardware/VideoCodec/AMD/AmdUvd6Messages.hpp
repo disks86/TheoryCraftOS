@@ -84,15 +84,16 @@ bool build_avc_decode_message(ByteView out, uint32_t stream_handle, uint32_t fee
 // kMessageFeedbackItBytes that starts at the message page. The rest of the feedback area is cleared.
 bool prepare_avc_feedback_and_tables(ByteView message_buffer, const amd_vcn::AvcPictureState& picture);
 
-// H.265 (RUVD_CODEC_H265, 8-bit 4:2:0): unlike the H.264 performance stream type, the engine's decoded picture buffer is a set of slots the message names (a picture's slot,
+// H.265 (RUVD_CODEC_H265, 8-bit and 10-bit 4:2:0; Main 10 pictures are decoded to a P010 surface): unlike the H.264 performance stream type, the engine's decoded picture buffer is a set of slots the message names (a picture's slot,
 // and the slots of the pictures it refers to), so the messages carry slot numbers as the VCN ones do. Sizes follow Mesa's calc_dpb_size and calc_ctx_size_h265_main.
 struct HevcBufferSizes {
   uint64_t dpb = 0;       // all the slots
   uint64_t context = 0;
   uint32_t references = 0;   // slots (17; 8 from 4096 x 2000 up)
 };
-// 0 sizes when the picture is not whole minimum coding blocks (8) within the limits, or the stream needs more slots than there are.
-HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_dec_pic_buffering);
+// 0 sizes when the picture is not whole minimum coding blocks (8) within the limits, or the stream needs more slots than there are. `deep_log2_ctb` is 0 for an 8-bit
+// stream, else the log2 of its coding tree block size: a stream with samples deeper than eight bits needs the bigger slots and the context of calc_ctx_size_h265_main10.
+HevcBufferSizes hevc_buffer_sizes(uint32_t width, uint32_t height, uint32_t max_dec_pic_buffering, uint32_t deep_log2_ctb = 0);
 // Builds the decode message for one H.265 picture (the offload interface of H265Decoder hands over what it needs). False when `out` is too small, the sequence is not
 // 8-bit 4:2:0 within the limits, or a size does not fit the message.
 bool build_hevc_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const h265::OffloadPicture& picture, const DecodeBuffers& buffers);

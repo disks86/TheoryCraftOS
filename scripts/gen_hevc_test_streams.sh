@@ -53,4 +53,13 @@ ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=64x64
   -x265-params "log-level=error:repeat-headers=1:info=0:hash=1:keyint=30:bframes=2:ref=2:ctu=32:min-cu-size=8:crf=30:b-adapt=0:no-scenecut=1:weightp=0:weightb=0:frame-threads=1:pools=none" \
   -f hevc "$selftest_dir/selftest.h265"
 python3 -I scripts/gen_hevc_selftest_inc.py "$selftest_dir/selftest.h265" src/Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc
+
+# The same at ten bits (Main 10) for the UVD 6 Main 10 self-test (AmdVcnSelfTestHevc10Stream.inc). The stream carries MD5 hashes of the pictures (hash=1), which the decoder checks over the
+# 16-bit samples (x265's CRC hashes (hash=2) did not match the spec's CRC of the chroma planes when checked, so MD5 it is): the engine's pictures are confirmed by the stream itself.
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=64x64:rate=30,noise=alls=12:allf=t+u,format=yuv420p10le" -frames:v 6 -c:v libx265 -pix_fmt yuv420p10le \
+  -x265-params "log-level=error:repeat-headers=1:info=0:hash=1:keyint=30:bframes=2:ref=2:ctu=32:min-cu-size=8:crf=30:b-adapt=0:no-scenecut=1:weightp=0:weightb=0:frame-threads=1:pools=none" \
+  -f hevc "$selftest_dir/selftest10.h265"
+python3 -I scripts/gen_hevc_selftest_inc.py "$selftest_dir/selftest10.h265" src/Hardware/VideoCodec/AMD/AmdVcnSelfTestHevc10Stream.inc Hevc10
+# What the engine must produce, for the host tests' stand-in firmware (the CPU decoder cannot make it): FFmpeg's decode, 16-bit little-endian planar, display order.
+ffmpeg -nostdin -hide_banner -loglevel error -y -i "$selftest_dir/selftest10.h265" -f rawvideo -pix_fmt yuv420p10le tests/data/hevc10_selftest.yuv
 rm -rf "$selftest_dir"
