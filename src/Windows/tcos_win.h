@@ -275,8 +275,67 @@ typedef struct _TIME_ZONE_INFORMATION { LONG Bias; WCHAR StandardName[32]; SYSTE
 typedef struct _SLIST_ENTRY { struct _SLIST_ENTRY *Next; } SLIST_ENTRY, *PSLIST_ENTRY;
 typedef union _SLIST_HEADER { struct { ULONGLONG Alignment, Region; }; struct { PSLIST_ENTRY Next; ULONGLONG Depth; }; } SLIST_HEADER, *PSLIST_HEADER;
 typedef struct _RTL_RUN_ONCE { PVOID Ptr; } INIT_ONCE, *PINIT_ONCE;
+/* Exceptions and the x64 CONTEXT (the layout programs and libgcc know). */
+#define EXCEPTION_NONCONTINUABLE 0x1
+#define EXCEPTION_UNWINDING 0x2
+#define EXCEPTION_EXIT_UNWIND 0x4
+#define EXCEPTION_STACK_INVALID 0x8
+#define EXCEPTION_NESTED_CALL 0x10
+#define EXCEPTION_TARGET_UNWIND 0x20
+#define EXCEPTION_COLLIDED_UNWIND 0x40
+#define EXCEPTION_EXECUTE_HANDLER 1
+#define EXCEPTION_CONTINUE_SEARCH 0
+#define EXCEPTION_CONTINUE_EXECUTION (-1)
+#define CONTEXT_AMD64 0x100000
+#define CONTEXT_CONTROL (CONTEXT_AMD64 | 0x1)
+#define CONTEXT_INTEGER (CONTEXT_AMD64 | 0x2)
+#define CONTEXT_SEGMENTS (CONTEXT_AMD64 | 0x4)
+#define CONTEXT_FLOATING_POINT (CONTEXT_AMD64 | 0x8)
+#define CONTEXT_FULL (CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT)
+#define CONTEXT_UNWOUND_TO_CALL 0x20000000
+#define UNW_FLAG_NHANDLER 0
+#define UNW_FLAG_EHANDLER 1
+#define UNW_FLAG_UHANDLER 2
+#define UNW_FLAG_CHAININFO 4
+typedef enum _EXCEPTION_DISPOSITION { ExceptionContinueExecution, ExceptionContinueSearch, ExceptionNestedException, ExceptionCollidedUnwind } EXCEPTION_DISPOSITION;
+typedef struct __attribute__((aligned(16))) _M128A { ULONGLONG Low; LONGLONG High; } M128A;
+struct _EXCEPTION_RECORD {
+  DWORD ExceptionCode, ExceptionFlags;
+  struct _EXCEPTION_RECORD *ExceptionRecord;
+  PVOID ExceptionAddress;
+  DWORD NumberParameters;
+  ULONG64 ExceptionInformation[15];
+};
 typedef struct _EXCEPTION_RECORD EXCEPTION_RECORD;
+struct __attribute__((aligned(16))) _CONTEXT {
+  ULONG64 P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
+  DWORD ContextFlags, MxCsr;
+  WORD SegCs, SegDs, SegEs, SegFs, SegGs, SegSs;
+  DWORD EFlags;
+  ULONG64 Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+  ULONG64 Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15;
+  ULONG64 Rip;
+  BYTE FltSave[512] __attribute__((aligned(16)));      /* FXSAVE image: the XMM registers are at byte 160 */
+  M128A VectorRegister[26];
+  ULONG64 VectorControl, DebugControl, LastBranchToRip, LastBranchFromRip, LastExceptionToRip, LastExceptionFromRip;
+};
 typedef struct _CONTEXT CONTEXT;
+typedef CONTEXT *PCONTEXT;
+#define CONTEXT_XMM(c, n) (((M128A *)((c)->FltSave + 160))[n])
+typedef struct _RUNTIME_FUNCTION { DWORD BeginAddress, EndAddress, UnwindData; } RUNTIME_FUNCTION, *PRUNTIME_FUNCTION;
+typedef struct _UNWIND_HISTORY_TABLE UNWIND_HISTORY_TABLE, *PUNWIND_HISTORY_TABLE;
+typedef EXCEPTION_DISPOSITION (*PEXCEPTION_ROUTINE)(EXCEPTION_RECORD *, PVOID, CONTEXT *, PVOID);
+typedef struct _DISPATCHER_CONTEXT {
+  ULONG64 ControlPc, ImageBase;
+  PRUNTIME_FUNCTION FunctionEntry;
+  ULONG64 EstablisherFrame, TargetIp;
+  CONTEXT *ContextRecord;
+  PEXCEPTION_ROUTINE LanguageHandler;
+  PVOID HandlerData;
+  PUNWIND_HISTORY_TABLE HistoryTable;
+  DWORD ScopeIndex, Fill0;
+} DISPATCHER_CONTEXT;
+typedef struct _KNONVOLATILE_CONTEXT_POINTERS { ULONG64 *Xmm[16]; ULONG64 *Integer[16]; } KNONVOLATILE_CONTEXT_POINTERS;
 typedef struct _EXCEPTION_POINTERS { EXCEPTION_RECORD *ExceptionRecord; CONTEXT *ContextRecord; } EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
 typedef LONG (WINAPI *LPTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS);
 typedef BOOL (WINAPI *PHANDLER_ROUTINE)(DWORD);
@@ -331,6 +390,10 @@ IMPORT NTSTATUS NTAPI NtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
 IMPORT NTSTATUS NTAPI NtWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
 IMPORT NTSTATUS NTAPI NtClose(HANDLE);
 IMPORT NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
+IMPORT void NTAPI RtlRaiseException(EXCEPTION_RECORD *);
+IMPORT LPTOP_LEVEL_EXCEPTION_FILTER NTAPI RtlSetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER);
+IMPORT PVOID NTAPI RtlAddVectoredExceptionHandler(ULONG, PVOID);
+IMPORT ULONG NTAPI RtlRemoveVectoredExceptionHandler(PVOID);
 IMPORT NTSTATUS NTAPI NtYieldExecution(void);
 IMPORT NTSTATUS NTAPI NtDelayExecution(BOOLEAN, PLARGE_INTEGER);
 IMPORT NTSTATUS NTAPI NtQuerySystemTime(PLARGE_INTEGER);

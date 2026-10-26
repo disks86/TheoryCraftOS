@@ -46,6 +46,8 @@ enum class WindowsSyscallNumber : uint32_t {
   NtQueryPerformanceCounter = 19,
   NtQueryVirtualMemory = 20,
   NtQueryInformationProcess = 21,
+  NtContinue = 22,
+  NtRaiseException = 23,
 };
 
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service

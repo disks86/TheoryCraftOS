@@ -44,6 +44,24 @@ uint32_t nt_query_system_time(Process& process, const SyscallRequest& r) {
   return process.write_user_u64(r.args[0], nt_time_now(process)) ? kStatusSuccess : kStatusAccessViolation;
 }
 
+// NtContinue(PCONTEXT Context, BOOLEAN TestAlert): the thread goes on with the registers of the CONTEXT (loaded into the CPU by whoever runs the program, see
+// Process::take_context_restore()). Used by ntdll to resume after a handler dealt with an exception.
+uint32_t nt_continue(Process& process, const SyscallRequest& r) {
+  uint8_t probe[8];
+  if (!process.read_user(r.args[0], ByteView(probe))) return kStatusAccessViolation;
+  process.request_context_restore(r.args[0]);
+  return kStatusSuccess;
+}
+
+// NtRaiseException(PEXCEPTION_RECORD, PCONTEXT, BOOLEAN FirstChance) as the kernel sees it: ntdll looks for handlers itself, so a call that gets here is the last chance. The
+// process ends with the exception code as its exit code.
+uint32_t nt_raise_exception_final(Process& process, const SyscallRequest& r) {
+  uint8_t code[4];
+  if (!process.read_user(r.args[0], ByteView(code))) return kStatusAccessViolation;
+  process.terminate(uint32_t(code[0]) | uint32_t(code[1]) << 8 | uint32_t(code[2]) << 16 | uint32_t(code[3]) << 24);
+  return kStatusSuccess;
+}
+
 // NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval): negative = relative, in 100 ns units; positive = an absolute system time.
 uint32_t nt_delay_execution(Process& process, const SyscallRequest& r) {
   uint64_t raw = 0;
@@ -284,6 +302,8 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtQueryPerformanceCounter: return nt_query_performance_counter(process, r);
       case WindowsSyscallNumber::NtQueryVirtualMemory: return nt_query_virtual_memory(process, r);
       case WindowsSyscallNumber::NtQueryInformationProcess: return nt_query_information_process(process, r);
+      case WindowsSyscallNumber::NtContinue: return nt_continue(process, r);
+      case WindowsSyscallNumber::NtRaiseException: return nt_raise_exception_final(process, r);
       case WindowsSyscallNumber::NtTerminateProcess:
         if (r.args[0] != kCurrentProcess) return kStatusInvalidHandle;      // other processes are not reachable yet
         process.terminate(uint32_t(r.args[1]));

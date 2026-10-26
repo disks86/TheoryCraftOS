@@ -43,7 +43,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   const exe::ExecutableKind kind = exe::identify_executable(file.at_most(exe::kIdentifyBytes));
   ProcessBinding binding;
   LoadedImage image;
-  uint64_t stack_top = 0, stack_pointer = 0, heap_start = 0, fs_base = 0, gs_base = 0, argument = 0, argument2 = 0;
+  uint64_t stack_top = 0, stack_pointer = 0, heap_start = 0, fs_base = 0, gs_base = 0, argument = 0, argument2 = 0, dispatcher = 0;
   UniquePointer<ModuleSet> loaded_modules;      // (kept by the program once everything worked)
   const StringView path = arguments.empty() ? StringView("") : arguments[0];
   if (kind == exe::ExecutableKind::Elf) {
@@ -115,6 +115,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
       argument2 = startup.peb;
       image.entry = thunk;
     }
+    dispatcher = modules ? modules->export_address("ntdll.dll", "KiUserExceptionDispatcher") : 0;
     loaded_modules = static_cast<UniquePointer<ModuleSet>&&>(modules);
   } else {
     return LoadStatus::NotExecutable;
@@ -123,6 +124,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   if (!process) return LoadStatus::OutOfMemory;
   process->attach_address_space(space_, heap_start);
   process->set_initial_thread_pointers(fs_base, gs_base);
+  process->set_exception_dispatcher(dispatcher);
   if (files_) {
     process->attach_file_system(allocator_, *files_);
     if (!working_directory_.empty()) process->files().change_directory(working_directory_.view());

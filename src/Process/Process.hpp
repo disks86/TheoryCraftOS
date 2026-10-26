@@ -106,6 +106,13 @@ class Process {
   bool take_fs_change(uint64_t* value) { *value = fs_base_; const bool c = fs_changed_; fs_changed_ = false; return c; }
   bool take_gs_change(uint64_t* value) { *value = gs_base_; const bool c = gs_changed_; gs_changed_ = false; return c; }
 
+  // Structured exception handling (Windows): where a fault of the program is delivered (ntdll's KiUserExceptionDispatcher; 0 = nowhere, the program ends), and the
+  // CONTEXT that NtContinue asked for (whoever runs the program loads it into the CPU's registers after the call: take_context_restore()).
+  uint64_t exception_dispatcher() const { return exception_dispatcher_; }
+  void set_exception_dispatcher(uint64_t address) { exception_dispatcher_ = address; }
+  void request_context_restore(uint64_t address) { context_restore_ = address; context_restore_pending_ = true; }
+  bool take_context_restore(uint64_t* address) { *address = context_restore_; const bool p = context_restore_pending_; context_restore_pending_ = false; return p; }
+
   // The process's files and descriptors. Without a file system attached only the console descriptors work.
   ProcessFiles& files() { return files_; }
   // Gives the process its tree: "/Linux" is the root of a Linux process, "/Windows" is C:\\ of a Windows one, both in `fs`.
@@ -124,6 +131,8 @@ class Process {
   uint32_t exit_code_ = 0;
   uint64_t fs_base_ = 0, gs_base_ = 0;
   bool fs_changed_ = false, gs_changed_ = false;
+  uint64_t exception_dispatcher_ = 0, context_restore_ = 0;
+  bool context_restore_pending_ = false;
   AddressSpace* space_ = nullptr;
   uint64_t heap_start_ = 0, heap_break_ = 0, mmap_cursor_ = 0x00007F0000000000ull;
   ProcessFiles files_;

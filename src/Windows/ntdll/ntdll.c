@@ -506,31 +506,9 @@ EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs) {
 }
 EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) { cs->LockCount = -1; cs->RecursionCount = 0; cs->OwningThread = NULL; return STATUS_SUCCESS; }
 
-/* ---- exceptions: structured exception handling is not implemented; these keep programs that register handlers loading and running ------------------------------- */
+/* ---- exceptions: unwinding, dispatching, __C_specific_handler ----------------------------------------------------------------------------------------------- */
 
-struct _CONTEXT { BYTE bytes[0x4D0]; };
-EXPORT void NTAPI RtlCaptureContext(CONTEXT *context) {
-  memset(context, 0, sizeof(*context));
-  *(ULONGLONG *)(context->bytes + 0xF8) = (ULONGLONG)__builtin_return_address(0);      /* Rip */
-  *(ULONGLONG *)(context->bytes + 0x98) = (ULONGLONG)__builtin_frame_address(0);       /* Rsp (approximately) */
-}
-EXPORT PVOID NTAPI RtlLookupFunctionEntry(ULONG64 pc, PULONG64 base, PVOID history) { (void)pc; (void)history; if (base) *base = 0; return NULL; }
-EXPORT PVOID NTAPI RtlVirtualUnwind(ULONG type, ULONG64 base, ULONG64 pc, PVOID entry, CONTEXT *context, PVOID *data, PULONG64 frame, PVOID pointers) {
-  (void)type; (void)base; (void)pc; (void)entry; (void)context; (void)pointers;
-  if (data) *data = NULL;
-  if (frame) *frame = 0;
-  return NULL;
-}
-EXPORT BOOLEAN NTAPI RtlAddFunctionTable(PVOID table, ULONG count, ULONG64 base) { (void)table; (void)count; (void)base; return TRUE; }
-EXPORT BOOLEAN NTAPI RtlDeleteFunctionTable(PVOID table) { (void)table; return TRUE; }
-EXPORT void NTAPI RtlUnwind(PVOID target, PVOID address, EXCEPTION_RECORD *record, PVOID value) { (void)target; (void)address; (void)record; (void)value; }
-EXPORT void NTAPI RtlUnwindEx(PVOID target, PVOID address, EXCEPTION_RECORD *record, PVOID value, CONTEXT *context, PVOID history) {
-  (void)target; (void)address; (void)record; (void)value; (void)context; (void)history;
-}
-EXPORT void NTAPI RtlRestoreContext(CONTEXT *context, EXCEPTION_RECORD *record) { (void)context; (void)record; RtlExitUserProcess((NTSTATUS)0xC0000025); }
-EXPORT int __C_specific_handler(EXCEPTION_RECORD *record, PVOID frame, CONTEXT *context, PVOID dispatcher) { (void)record; (void)frame; (void)context; (void)dispatcher; return 1; /* ExceptionContinueSearch */ }
-EXPORT void NTAPI RtlRaiseException(EXCEPTION_RECORD *record) { RtlExitUserProcess(record ? *(NTSTATUS *)record : (NTSTATUS)0xC0000025); }
-EXPORT NTSTATUS NTAPI NtRaiseException(EXCEPTION_RECORD *record, CONTEXT *context, BOOLEAN first_chance) { (void)context; (void)first_chance; RtlRaiseException(record); return STATUS_SUCCESS; }
+#include "except.inc"
 EXPORT ULONG DbgPrint(const char *format, ...) { (void)format; return 0; }
 /* SSE and SSE2 are there (PF_XMMI_INSTRUCTIONS_AVAILABLE = 6, PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10); nothing newer is reported. */
 EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return feature == 6 || feature == 10; }

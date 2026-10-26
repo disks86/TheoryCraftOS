@@ -1,0 +1,14 @@
+LIBRARY kernel32.dll
+EXPORTS
+RtlCaptureContext = ntdll.RtlCaptureContext
+RtlRestoreContext = ntdll.RtlRestoreContext
+RtlLookupFunctionEntry = ntdll.RtlLookupFunctionEntry
+RtlVirtualUnwind = ntdll.RtlVirtualUnwind
+RtlUnwind = ntdll.RtlUnwind
+RtlUnwindEx = ntdll.RtlUnwindEx
+RtlPcToFileHeader = ntdll.RtlPcToFileHeader
+RtlAddFunctionTable = ntdll.RtlAddFunctionTable
+RtlDeleteFunctionTable = ntdll.RtlDeleteFunctionTable
+RtlInstallFunctionTableCallback = ntdll.RtlInstallFunctionTableCallback
+RtlCaptureStackBackTrace = ntdll.RtlCaptureStackBackTrace
+RtlRaiseException = ntdll.RtlRaiseException

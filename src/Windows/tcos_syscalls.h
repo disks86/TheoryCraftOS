@@ -42,4 +42,6 @@
 #define NT_SERVICE_NtQueryPerformanceCounter 19
 #define NT_SERVICE_NtQueryVirtualMemory 20
 #define NT_SERVICE_NtQueryInformationProcess 21
+#define NT_SERVICE_NtContinue 22
+#define NT_SERVICE_NtRaiseException 23
 #endif

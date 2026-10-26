@@ -378,6 +378,8 @@ static void test_service_numbers_agree() {
       {"NtFlushBuffersFile", WindowsSyscallNumber::NtFlushBuffersFile}, {"NtQueryVolumeInformationFile", WindowsSyscallNumber::NtQueryVolumeInformationFile},
       {"NtQueryPerformanceCounter", WindowsSyscallNumber::NtQueryPerformanceCounter}, {"NtQueryVirtualMemory", WindowsSyscallNumber::NtQueryVirtualMemory},
       {"NtQueryInformationProcess", WindowsSyscallNumber::NtQueryInformationProcess},
+      {"NtContinue", WindowsSyscallNumber::NtContinue},
+      {"NtRaiseException", WindowsSyscallNumber::NtRaiseException},
   };
   FILE* header = fopen("src/Windows/tcos_syscalls.h", "r");
   CHECK(header != nullptr);

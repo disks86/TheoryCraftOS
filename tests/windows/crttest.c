@@ -43,6 +43,8 @@ static jmp_buf g_jump;
 static int g_atexit_ran;
 static void at_exit_handler(void) { g_atexit_ran = 1; puts("atexit handler ran"); }
 static volatile int g_signalled;
+static jmp_buf g_fault_jump;
+static void on_fault(int s) { g_signalled = s; longjmp(g_fault_jump, 5); }
 static void on_signal(int s) { g_signalled = s; }
 
 static void test_format(void) {
@@ -216,6 +218,15 @@ static void test_time_and_control(void) {
   signal(SIGINT, on_signal);
   raise(SIGINT);
   check(g_signalled == SIGINT, "signal and raise");
+  /* the C runtime turns processor faults into signals (through the unhandled-exception filter) */
+  signal(SIGSEGV, on_fault);
+  g_signalled = 0;
+  if (setjmp(g_fault_jump) == 0) { *(volatile int *)0 = 1; check(0, "a write to address 0 returns"); }
+  check(g_signalled == SIGSEGV, "a fault becomes SIGSEGV and the handler can longjmp out");
+  signal(SIGFPE, on_fault);
+  g_signalled = 0;
+  if (setjmp(g_fault_jump) == 0) { volatile int zero = 0; volatile int x = 5 / zero; (void)x; check(0, "a division by zero returns"); }
+  check(g_signalled == SIGFPE, "a division by zero becomes SIGFPE");
   atexit(at_exit_handler);
   check(getenv("TCOS_NO_SUCH_VARIABLE") == NULL, "getenv of a missing variable");
   _putenv("TCOS_CRT=hello");

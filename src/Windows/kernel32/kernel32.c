@@ -819,6 +819,15 @@ EXPORT HANDLE WINAPI CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHRE
 EXPORT BOOL WINAPI SetThreadPriority(HANDLE h, int priority) { (void)h; (void)priority; return TRUE; }
 EXPORT int WINAPI GetThreadPriority(HANDLE h) { (void)h; return 0; }
 EXPORT BOOL WINAPI SetProcessAffinityMask(HANDLE h, DWORD_PTR mask) { (void)h; (void)mask; return TRUE; }
+EXPORT BOOL WINAPI GetProcessAffinityMask(HANDLE h, DWORD_PTR *process, DWORD_PTR *system) { (void)h; if (process) *process = 1; if (system) *system = 1; return TRUE; }
+EXPORT HANDLE WINAPI OpenProcess(DWORD access, BOOL inherit, DWORD id) { (void)access; (void)inherit; set_error(id == GetCurrentProcessId() ? ERROR_NOT_SUPPORTED : ERROR_INVALID_PARAMETER); return NULL; }
+EXPORT DWORD WINAPI SuspendThread(HANDLE h) { (void)h; set_error(ERROR_NOT_SUPPORTED); return (DWORD)-1; }
+EXPORT DWORD WINAPI ResumeThread(HANDLE h) { (void)h; set_error(ERROR_NOT_SUPPORTED); return (DWORD)-1; }
+EXPORT BOOL WINAPI GetThreadContext(HANDLE h, CONTEXT *context) { (void)h; (void)context; set_error(ERROR_NOT_SUPPORTED); return FALSE; }
+EXPORT BOOL WINAPI SetThreadContext(HANDLE h, const CONTEXT *context) { (void)h; (void)context; set_error(ERROR_NOT_SUPPORTED); return FALSE; }
+EXPORT HANDLE WINAPI CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCSTR name) { (void)sa; (void)initial; (void)maximum; (void)name; set_error(ERROR_NOT_SUPPORTED); return NULL; }
+EXPORT HANDLE WINAPI CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name) { (void)sa; (void)initial; (void)maximum; (void)name; set_error(ERROR_NOT_SUPPORTED); return NULL; }
+EXPORT BOOL WINAPI ReleaseSemaphore(HANDLE h, LONG count, PLONG previous) { (void)h; (void)count; (void)previous; set_error(ERROR_NOT_SUPPORTED); return FALSE; }
 
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -881,12 +890,26 @@ EXPORT void WINAPI GetLocalTime(LPSYSTEMTIME st) { GetSystemTime(st); }      /* 
 EXPORT BOOL WINAPI FileTimeToLocalFileTime(const FILETIME *in, LPFILETIME out) { *out = *in; return TRUE; }
 EXPORT BOOL WINAPI LocalFileTimeToFileTime(const FILETIME *in, LPFILETIME out) { *out = *in; return TRUE; }
 EXPORT DWORD WINAPI GetTimeZoneInformation(LPTIME_ZONE_INFORMATION tz) { memset(tz, 0, sizeof(*tz)); return 0; /* TIME_ZONE_ID_UNKNOWN */ }
-static LPTOP_LEVEL_EXCEPTION_FILTER g_filter;
-EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter) { LPTOP_LEVEL_EXCEPTION_FILTER old = g_filter; g_filter = filter; return old; }
-EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) { (void)info; return 1; /* EXCEPTION_EXECUTE_HANDLER */ }
-EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD count, const ULONG_PTR *arguments) { (void)flags; (void)count; (void)arguments; RtlExitUserProcess((NTSTATUS)code); }
-EXPORT PVOID WINAPI AddVectoredExceptionHandler(ULONG first, PVOID handler) { (void)first; return handler; }
-EXPORT ULONG WINAPI RemoveVectoredExceptionHandler(PVOID handler) { (void)handler; return 1; }
+/* Exception handling lives in ntdll.dll (src/Windows/ntdll/except.inc); kernel32 gives programs the names they know. RtlUnwindEx, RtlVirtualUnwind and the others
+ * are forwarded to ntdll by kernel32.def. */
+EXPORT LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter) { return RtlSetUnhandledExceptionFilter(filter); }
+EXPORT LONG WINAPI UnhandledExceptionFilter(PEXCEPTION_POINTERS info) {
+  LPTOP_LEVEL_EXCEPTION_FILTER filter = RtlSetUnhandledExceptionFilter(NULL);      /* (read it, put it back) */
+  RtlSetUnhandledExceptionFilter(filter);
+  return filter ? filter(info) : EXCEPTION_EXECUTE_HANDLER;
+}
+EXPORT void WINAPI RaiseException(DWORD code, DWORD flags, DWORD count, const ULONG_PTR *arguments) {
+  EXCEPTION_RECORD record;
+  memset(&record, 0, sizeof(record));
+  record.ExceptionCode = code;
+  record.ExceptionFlags = flags & EXCEPTION_NONCONTINUABLE;
+  if (arguments && count > 15) count = 15;
+  record.NumberParameters = arguments ? count : 0;
+  for (DWORD i = 0; i < record.NumberParameters; ++i) record.ExceptionInformation[i] = arguments[i];
+  RtlRaiseException(&record);
+}
+EXPORT PVOID WINAPI AddVectoredExceptionHandler(ULONG first, PVOID handler) { return RtlAddVectoredExceptionHandler(first, handler); }
+EXPORT ULONG WINAPI RemoveVectoredExceptionHandler(PVOID handler) { return RtlRemoveVectoredExceptionHandler(handler); }
 
 /* ---- the console and standard handles ------------------------------------------------------------------------------------------------------------------ */
 

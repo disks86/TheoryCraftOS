@@ -17,6 +17,7 @@
  */
 #include "Kernel/UserMode.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
+#include "Process/WindowsException.hpp"
 #include "console.hpp"
 
 #if defined(__x86_64__)
@@ -131,6 +132,24 @@ void load_core(void* argument) {
   __atomic_add_fetch(&g.cores_loaded, 1, __ATOMIC_SEQ_CST);
 }
 
+// The registers of an interrupted user context as a CONTEXT-style record, and back.
+void frame_to_context(const Frame& frame, process::X86Context* c) {
+  const uint64_t* in[16] = {&frame.rax, &frame.rcx, &frame.rdx, &frame.rbx, &frame.rsp, &frame.rbp, &frame.rsi, &frame.rdi,
+                            &frame.r8, &frame.r9, &frame.r10, &frame.r11, &frame.r12, &frame.r13, &frame.r14, &frame.r15};
+  for (uint32_t i = 0; i < 16; ++i) c->gpr[i] = *in[i];
+  c->rip = frame.rip;
+  c->rflags = frame.rflags;
+  for (uint32_t i = 0; i < 512; ++i) c->fpu[i] = frame.fpu[i];
+}
+void context_to_frame(const process::X86Context& c, Frame* frame) {
+  uint64_t* out[16] = {&frame->rax, &frame->rcx, &frame->rdx, &frame->rbx, &frame->rsp, &frame->rbp, &frame->rsi, &frame->rdi,
+                       &frame->r8, &frame->r9, &frame->r10, &frame->r11, &frame->r12, &frame->r13, &frame->r14, &frame->r15};
+  for (uint32_t i = 0; i < 16; ++i) *out[i] = c.gpr[i];
+  frame->rip = c.rip;
+  frame->rflags = c.rflags;
+  for (uint32_t i = 0; i < 512; ++i) frame->fpu[i] = c.fpu[i];
+}
+
 Task* current_task() {
   Thread* t = current_thread();
   return t ? static_cast<Task*>(t->user_context) : nullptr;
@@ -166,6 +185,17 @@ Frame* on_syscall(Frame* frame, void*) {
   const bool fs_changed = process->take_fs_change(&fs), gs_changed = process->take_gs_change(&gs);
   if (fs_changed || gs_changed) set_current_user_bases(fs_changed, fs, gs_changed, gs);      // arch_prctl
   bool alive = !process->exited();
+  uint64_t context_at = 0;
+  if (alive && process->take_context_restore(&context_at)) {      // NtContinue
+    process::X86Context context;
+    frame_to_context(*frame, &context);
+    if (process::apply_context(*process, context_at, &context)) {
+      context_to_frame(context, frame);
+    } else {
+      process->terminate(process::kStatusAccessViolation);
+      alive = false;
+    }
+  }
   if (alive && kill_pending(task)) {      // asked to stop while the call ran (or in it)
     task->killed = true;
     process->terminate(130);
@@ -195,6 +225,19 @@ Frame* on_user_fault(Frame* frame) {
     task->program.process()->terminate(130);
     irq_enable();
     exit_thread();
+  }
+  // A Windows program gets its exception delivered, to be handled by SEH or C++ code (or to end up in ntdll's last resort); only when that cannot be done is the program stopped.
+  process::Process* process = task->program.process();
+  if (process->abi() == process::SyscallAbi::Windows && process->exception_dispatcher() != 0) {
+    process::X86Context at, entry;
+    frame_to_context(*frame, &at);
+    process::ExceptionInfo info;
+    const uint64_t vector = frame->vector & 0xFF;
+    if (process::fault_to_exception(vector, frame->error, vector == 14 ? read_cr2() : 0, &at, &info) &&
+        process::dispatch_exception(*process, at, info, process->exception_dispatcher(), &entry)) {
+      context_to_frame(entry, frame);
+      return frame;
+    }
   }
   task->faulted = true;
   task->fault_vector = frame->vector & 0xFF;
@@ -270,7 +313,7 @@ bool init(allocators::IAllocator& allocator) {
     gate.offset_low = static_cast<uint16_t>(stub);
     gate.selector = kSelectorCode;
     gate.ist = 0;
-    gate.type_attributes = 0x8E;      // present, ring 0 only, interrupt gate
+    gate.type_attributes = v == 3 ? 0xEE : 0x8E;      // present, interrupt gate; ring 0 only except INT3, which a program may execute (a breakpoint)
     gate.offset_middle = static_cast<uint16_t>(stub >> 16);
     gate.offset_high = static_cast<uint32_t>(stub >> 32);
     gate.reserved = 0;

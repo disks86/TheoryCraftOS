@@ -1635,6 +1635,12 @@ API size_t_ wcstombs(char *out, const wchar_t *s, size_t_ n) {
   free(tmp);
   return count;
 }
+API size_t_ mbsrtowcs(wchar_t *out, const char **src, size_t_ n, void *state) {
+  (void)state;
+  const size_t_ count = mbstowcs(out, *src, n);
+  if (out && count != (size_t_)-1) *src = count < n ? NULL : *src + count;
+  return count;
+}
 API int mblen(const char *s, size_t_ n) {
   if (!s) return 0;
   if (!n || !*s) return 0;
@@ -2056,6 +2062,3 @@ API uintptr_t_ _beginthread(void (__cdecl *start)(void *), unsigned stack, void 
 API void _endthread(void) { ExitThread(0); }
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) { (void)module; (void)reason; (void)reserved; return TRUE; }
-
-/* Structured exception handling arrives with the unwinder; until then no handler claims an exception. */
-API int __C_specific_handler(void *record, void *frame, void *context, void *dispatcher) { (void)record; (void)frame; (void)context; (void)dispatcher; return 1; /* ExceptionContinueSearch */ }

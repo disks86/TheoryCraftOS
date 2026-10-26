@@ -560,6 +560,7 @@ add_executable(BOOTX64
   src/Process/UserProgram.cpp
   src/Process/UserPageTables.cpp
   src/Process/WindowsStartup.cpp
+  src/Process/WindowsException.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
@@ -709,23 +710,23 @@ endif()
 if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_DIR ${CMAKE_BINARY_DIR}/windows)
   set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector
-      -fno-asynchronous-unwind-tables -nostdlib -shared -Wl,--entry=DllMain)
+      -fasynchronous-unwind-tables -nostdlib -shared -Wl,--entry=DllMain)
   file(GLOB WINDOWS_HEADERS ${CMAKE_SOURCE_DIR}/src/Windows/*.h)
   add_custom_command(OUTPUT ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/libntdll.a
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
             -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${WINDOWS_HEADERS}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/except.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc ${WINDOWS_HEADERS}
     COMMENT "Building ntdll.dll")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
-            ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${WINDOWS_DIR}/libntdll.a
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
+            ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
     COMMENT "Building kernel32.dll")
   add_custom_command(OUTPUT ${WINDOWS_DIR}/msvcrt.dll
     COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wno-unused-value -Wl,--image-base=0x180400000 -o ${WINDOWS_DIR}/msvcrt.dll
-            ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc
+            ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.def ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.c ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/msvcrt.def ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/format.inc ${CMAKE_SOURCE_DIR}/src/Windows/libc_string.inc
             ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS}
     COMMENT "Building msvcrt.dll")
   file(WRITE ${WINDOWS_DIR}/libraries.S
