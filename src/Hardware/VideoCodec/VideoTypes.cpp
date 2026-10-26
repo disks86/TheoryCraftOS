@@ -50,6 +50,7 @@ uint32_t VideoFormat::plane_stride(uint32_t plane) const {
     case PixelFormat::Bgra8888: return width * 4;
     case PixelFormat::I420: return plane == 0 ? width : chroma_width();
     case PixelFormat::Nv12: return plane == 0 ? width : chroma_width() * 2;
+    case PixelFormat::P010: return (plane == 0 ? width : chroma_width() * 2) * 2;
   }
   return 0;
 }
