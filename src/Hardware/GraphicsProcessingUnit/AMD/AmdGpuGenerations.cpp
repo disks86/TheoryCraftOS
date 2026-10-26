@@ -37,6 +37,8 @@ constexpr AmdGpuInfo make(A a, const char* name, bool discrete, bool vp9, bool a
 constexpr Range kRanges[] = {
     // Polaris
     {0x67C0, 0x67FF, make(A::Polaris, "AMD Radeon RX 400/500 (Polaris 10/11)", true, false, false, false)},
+    // Polaris 22: Radeon RX Vega M GH/GL, the HBM2 graphics die beside the Intel CPU in Kaby Lake-G (Dell XPS 15 9575, Intel NUC8 "Hades Canyon")
+    {0x694C, 0x694F, make(A::Polaris, "AMD Radeon RX Vega M (Polaris 22, Kaby Lake-G)", true, false, false, false)},
     {0x6980, 0x699F, make(A::Polaris, "AMD Radeon RX 500 (Polaris 12)", true, false, false, false)},
     // Vega: Radeon RX Vega, Vega 12 (Pro), Radeon VII (Vega 20)
     {0x6860, 0x687F, make(A::Vega, "AMD Radeon RX Vega (Vega 10)", true, true, false, false)},

@@ -32,6 +32,7 @@ enum class NodeKind : uint8_t {
   Call, New, Member, Index, Sequence, Spread,
   // statements
   Var, Declarator, ExprStmt, Block, If, For, ForIn, ForOf, While, DoWhile, Return, Break, Continue, Throw, Try, Switch, Case, FunctionDecl, Empty, Labeled,
+  Import,   // import declaration of a module (number: index of the request; list: Declarators, text = local name, a = String node with the imported name or null for `* as`)
 };
 
 // Operators and punctuation (what Node::op holds, and what the lexer reads).
@@ -136,6 +137,23 @@ class Arena {
   char* current_ = nullptr;
   uint64_t used_ = 0;
 };
+
+// What a module asks for: the module specifiers of its import and export-from declarations, in the order they first appear (the dependencies array the
+// module function is called with follows that order).
+struct ModuleRequests {
+  explicit ModuleRequests(allocators::IAllocator& allocator) : specifiers(allocator), imports(allocator), exports(allocator), stars(allocator) {}
+  List<String> specifiers;
+  List<String> imports;   // "request:name" for each name the module imports (or re-exports) from another: checked when the modules are linked
+  List<String> exports;   // the names it exports itself (not through export *)
+  List<String> stars;     // "request" of each `export * from`
+
+};
+
+// Parses a module. The result is a program (a Block) whose one statement is the module as an async function expression
+// `async function (__deps, __exports, import.meta) { ... }`: the import declarations are Import nodes at the head of its body, and the exports are
+// defined at its start (each as an accessor on __exports: __export_get(__exports, name, () => local), __export_star(__exports, namespace)).
+// nullptr (with *error set) for a syntax error.
+Node* parse_module(StringView source, Arena& arena, String* error, ModuleRequests* requests);
 
 // Parses a whole program: a Block node whose list holds its statements. nullptr (with *error set to "message (line N)") for a syntax error.
 Node* parse_program(StringView source, Arena& arena, String* error);

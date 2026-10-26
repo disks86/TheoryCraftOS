@@ -20,6 +20,7 @@
 #include <new>
 #include "Hardware/GraphicsProcessingUnit/AMD/AmdGpu.hpp"
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelGpu.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuTopology.hpp"
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpu.hpp"
 
 namespace hardware {
@@ -39,13 +40,13 @@ IGraphicsProcessingUnit* try_gpu(void* storage, const GpuContext& context) {
 }
 }  // namespace
 
-SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllocator& allocator) {
-  // The first display-class device is assumed to be the primary one.
+SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllocator& allocator, IRegisterMapper* registers) {
+  // The display the firmware is showing the screen on is the primary one (with an integrated and a discrete GPU that is not necessarily the
+  // first on the bus); see Multi/GpuTopology. The other GPUs are left to GpuManager.
   PciDeviceInfo d{};
-  bool found = false;
-  for (uint32_t i = 0; !found && pci.pci_device(i, &d); ++i) found = d.class_code == kPciClassDisplay;
+  const bool found = gpu_boot_display(pci, &d);
   if (!found) d = {};
-  const GpuContext context{st, &pci, d, &allocator};
+  const GpuContext context{st, &pci, d, &allocator, registers};
 
   if (found) {
     if (QemuStdVgaGpu::supports(d.vendor_id, d.device_id))
@@ -55,10 +56,14 @@ SystemGpu::SystemGpu(efi::SystemTable* st, const IPciBus& pci, allocators::IAllo
     else if (d.vendor_id == VirtioGpu::kPciVendor && d.device_id == VirtioGpu::kPciDeviceId) {
       active_ = try_gpu<VirtioGpu>(storage_, context);
       virtio_ = active_ != nullptr;
-    } else if (d.vendor_id == IntelGpu::kPciVendor)
+    } else if (d.vendor_id == IntelGpu::kPciVendor) {
       active_ = try_gpu<IntelGpu>(storage_, context);
-    else if (d.vendor_id == AmdGpu::kPciVendor)
+      intel_ = active_ != nullptr;
+    }
+    else if (d.vendor_id == AmdGpu::kPciVendor) {
       active_ = try_gpu<AmdGpu>(storage_, context);
+      amd_ = active_ != nullptr;
+    }
     else if (d.vendor_id == NvidiaGpu::kPciVendor)
       active_ = try_gpu<NvidiaGpu>(storage_, context);
   }

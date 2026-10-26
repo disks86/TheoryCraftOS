@@ -26,6 +26,7 @@ namespace {
 struct Binding {
   StringView name;
   uint32_t slot;
+  StringView import_name;   // an imported binding: the name of the export it reads (from the namespace object the slot holds)
 };
 
 struct Ctx {
@@ -155,11 +156,13 @@ class Compiler {
   // Where a name lives: depth = how many functions out, slot; false for a global.
   bool resolve(StringView name, uint32_t* depth, uint32_t* slot) {
     uint32_t d = 0;
+    resolved_import_ = StringView();
     for (FuncState* fs = cur_; fs; fs = fs->parent, ++d) {
       for (uint64_t i = fs->bindings.count(); i > 0; --i) {
         if (fs->bindings[i - 1].name.equals(name)) {
           *depth = d;
           *slot = fs->bindings[i - 1].slot;
+          resolved_import_ = fs->bindings[i - 1].import_name;
           return true;
         }
       }
@@ -225,6 +228,29 @@ class Compiler {
   }
   void hoist_globals(Node* list) { hoist_vars(list, false); }
 
+  // The imports of a module function: each name is a variable holding the namespace object of its module (the first parameter is the array of them);
+  // reading a named import reads the property of that object.
+  void bind_imports(Node* list) {
+    for (Node* s = list; s && !failed_; s = s->next) {
+      if (s->kind != NodeKind::Import) continue;
+      for (Node* d = s->list; d; d = d->next) {
+        declare_var(d->text);
+        uint32_t slot = 0;
+        for (uint64_t i = 0; i < cur_->bindings.count(); ++i) {
+          if (!cur_->bindings[i].name.equals(d->text)) continue;
+          slot = cur_->bindings[i].slot;
+          if (d->a) cur_->bindings[i].import_name = d->a->text;
+          break;
+        }
+        emit(Opc::GetVar, 0, 0, s->line);
+        emit(Opc::PushInt, static_cast<int32_t>(s->number), 0, s->line);
+        emit(Opc::GetElem, 0, 0, s->line);
+        emit(Opc::SetVar, static_cast<int32_t>(slot), 0, s->line);
+        emit(Opc::Pop);
+      }
+    }
+  }
+
   // At the start of a statement list: the functions declared in it exist.
   void init_functions(Node* list) {
     for (Node* s = list; s; s = s->next) {
@@ -251,6 +277,7 @@ class Compiler {
         return;
       }
       emit(Opc::GetVar, static_cast<int32_t>(slot), static_cast<uint8_t>(depth), line);
+      if (!resolved_import_.empty()) emit(Opc::GetProp, static_cast<int32_t>(constant_string(resolved_import_)), 0, line);   // (an import is read from its module's namespace each time: a live binding)
     } else if (name.equals("undefined")) {
       emit(Opc::PushUndef);
     } else {
@@ -265,6 +292,7 @@ class Compiler {
         fail("Functions are nested too deeply", line);
         return;
       }
+      if (!resolved_import_.empty()) fail("Assignment to constant variable", line);
       emit(Opc::SetVar, static_cast<int32_t>(slot), static_cast<uint8_t>(depth), line);
     } else {
       emit(Opc::SetGlobal, static_cast<int32_t>(constant_string(name)), 0, line);
@@ -314,6 +342,7 @@ class Compiler {
       }
     }
     if (!(fn->flags & kFlagExprBody)) hoist_vars(fn->a->list, false);
+    if (!(fn->flags & kFlagExprBody)) bind_imports(fn->a->list);
     // default values of parameters
     uint32_t index = 0;
     for (Node* p = fn->list; p; p = p->next, ++index) {
@@ -336,8 +365,8 @@ class Compiler {
       expression(fn->a);
       emit(Opc::Return);
     } else {
+      declare_lexicals(fn->a->list);   // (before the functions: they may use the let / const of the body)
       init_functions(fn->a->list);
-      declare_lexicals(fn->a->list);
       for (Node* s = fn->a->list; s && !failed_; s = s->next) statement(s);
       emit(Opc::PushUndef);
       emit(Opc::Return);
@@ -418,6 +447,7 @@ class Compiler {
     line_ = n->line;
     switch (n->kind) {
       case NodeKind::Empty: return;
+      case NodeKind::Import: return;   // (bound at the start of the module function)
       case NodeKind::FunctionDecl: return;   // (made when its list began)
       case NodeKind::ExprStmt:
         expression(n->a);
@@ -429,8 +459,8 @@ class Compiler {
       case NodeKind::Var: var_statement(n); return;
       case NodeKind::Block:
         push_scope();
-        init_functions(n->list);
         declare_lexicals(n->list);
+        init_functions(n->list);
         statement_list(n->list);
         pop_scope();
         return;
@@ -1180,6 +1210,7 @@ class Compiler {
   String* error_;
   FuncState* cur_ = nullptr;
   bool failed_ = false;
+  StringView resolved_import_;   // set by resolve(): the export an import binding reads (empty for any other)
   uint32_t line_ = 0;
   uint32_t function_level_count_ = 0;   // how many of the current function's bindings are function-level (parameters, var, functions)
   StringView pending_label_;

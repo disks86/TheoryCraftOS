@@ -42,6 +42,10 @@ constexpr uint32_t kPphwspScratchAddress = 0x34 * 4;   // LRC_PPHWSP_SCRATCH_ADD
 
 // Ring bytes of one job: invalidating flush (4), batch start (1 + 3 + 2), marker write (4), interrupt and wait-for-arbitration padding (1 + 1 + 2).
 constexpr uint64_t kJobDwords = 4 + 6 + 4 + 4;
+// The render engine's: an invalidating PIPE_CONTROL (6), batch start as above (1 + 1 + 3 + 1), a flushing one (6), the one that writes the marker (6), and the tail (4).
+constexpr uint64_t kRenderJobDwords = 6 + 6 + 6 + 6 + 4;
+constexpr uint32_t kPipeControlHeader = gen9_3d::kPipeControl | 4;
+constexpr uint32_t kRenderScratchDword = 0x42;   // a spare qword of the status page, where the invalidating PIPE_CONTROL has to write
 
 // The status page is written by the GPU: read it from memory every time.
 uint32_t load(const uint32_t& word) {
@@ -104,8 +108,8 @@ bool VcsDriver::allocate(uint64_t bytes, GpuBuffer* out) {
 void VcsDriver::fail_init() {
   // Nothing has been given to the engine yet (the port is enabled last), so everything can go back.
   if (ggtt_mapped_) {
-    const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, kGgttPagesNeeded);
-    for (uint64_t i = 0; i < kGgttPagesNeeded; ++i) ggtt.write_raw(i, saved_entries_[i]);
+    const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_);
+    for (uint64_t i = 0; i < ggtt_pages_; ++i) ggtt.write_raw(i, saved_entries_[i]);
     ggtt_invalidate(*config_.registers);
     ggtt_mapped_ = false;
   }
@@ -121,30 +125,32 @@ void VcsDriver::fail_init() {
 bool VcsDriver::initialize(const Config& config) {
   if (state_ != State::Created) return false;
   config_ = config;
-  if (!config.registers || !config.ggtt_table.valid()) { state_ = State::Failed; return false; }
+  ggtt_pages_ = ggtt_pages_for(config.engine);
+  lrc_pages_ = config.engine == Engine::Render ? kLrcRenderPages : kLrcPages;
+  if (!config.registers || !config.ggtt_table.valid() || (config.engine == Engine::Render && config.generation != Generation::Gen9)) { state_ = State::Failed; return false; }
   const uint64_t entries = config.ggtt_table.length() / 8;
-  if (config.ggtt_first_page > entries || kGgttPagesNeeded > entries - config.ggtt_first_page ||
-      (config.ggtt_first_page + kGgttPagesNeeded) * kPageSize > kGgttReach) {
+  if (config.ggtt_first_page > entries || ggtt_pages_ > entries - config.ggtt_first_page ||
+      (config.ggtt_first_page + ggtt_pages_) * kPageSize > kGgttReach) {
     state_ = State::Failed;
     return false;
   }
   IRegisterBank& regs = *config.registers;
 
   if (!Forcewake::acquire(regs, ForcewakeDomain::Gt)) { state_ = State::Failed; return false; }
-  if (!Forcewake::acquire(regs, media_domain())) {
+  if (!Forcewake::acquire(regs, engine_domain())) {
     Forcewake::release(regs, ForcewakeDomain::Gt);
     state_ = State::Failed;
     return false;
   }
   auto release_wells = [this, &regs] {
-    Forcewake::release(regs, media_domain());
+    Forcewake::release(regs, engine_domain());
     Forcewake::release(regs, ForcewakeDomain::Gt);
   };
 
   if (config.generation == Generation::Gen12) program_gen12_pat(regs);
   else program_private_pat(regs, gen9_private_pat());
 
-  if (!allocate(kPageSize, &scratch_) || !allocate(kRingBytes, &ring_) || !allocate(kPageSize, &status_) || !allocate(kLrcPages * kPageSize, &context_) ||
+  if (!allocate(kPageSize, &scratch_) || !allocate(kRingBytes, &ring_) || !allocate(kPageSize, &status_) || !allocate(lrc_pages_ * kPageSize, &context_) ||
       !allocate(kBatchBytes, &batch_)) {
     fail_init();
     release_wells();
@@ -159,15 +165,15 @@ bool VcsDriver::initialize(const Config& config) {
   }
 
   // The global GTT: the driver's eight entries are remembered, point at the scratch page, then the ring, the status page and the context get theirs.
-  const Ggtt ggtt(config.ggtt_table, config.ggtt_first_page, kGgttPagesNeeded);
+  const Ggtt ggtt(config.ggtt_table, config.ggtt_first_page, ggtt_pages_);
   if (!ggtt.valid()) { fail_init(); release_wells(); return false; }
-  for (uint64_t i = 0; i < kGgttPagesNeeded; ++i) ggtt.read(i, &saved_entries_[i]);
-  if (!ggtt.clear(0, kGgttPagesNeeded, scratch_.dma)) { fail_init(); release_wells(); return false; }
+  for (uint64_t i = 0; i < ggtt_pages_; ++i) ggtt.read(i, &saved_entries_[i]);
+  if (!ggtt.clear(0, ggtt_pages_, scratch_.dma)) { fail_init(); release_wells(); return false; }
   ggtt_mapped_ = true;
   bool ok = true;
   for (uint64_t i = 0; i < kRingBytes / kPageSize; ++i) ok = ok && ggtt.map(i, ring_.dma + i * kPageSize);
   ok = ok && ggtt.map(4, status_.dma);
-  for (uint64_t i = 0; i < kLrcPages; ++i) ok = ok && ggtt.map(5 + i, context_.dma + i * kPageSize);
+  for (uint64_t i = 0; i < lrc_pages_; ++i) ok = ok && ggtt.map(5 + i, context_.dma + i * kPageSize);
   ring_ggtt_ = ggtt.address_of(0);
   status_ggtt_ = ggtt.address_of(4);
   context_ggtt_ = ggtt.address_of(5);
@@ -183,7 +189,8 @@ bool VcsDriver::initialize(const Config& config) {
   const uint64_t directories[4] = {ppgtt_.page_directory_dma(0), ppgtt_.page_directory_dma(1), ppgtt_.page_directory_dma(2), ppgtt_.page_directory_dma(3)};
   const bool gen12 = config.generation == Generation::Gen12;
   const bool image = gen12 ? lrc_init_gen12_xcs(context_state_, engine_base(), true) && lrc_set_pml4(context_state_, ppgtt_.root_dma())
-                           : lrc_init_gen9_xcs(context_state_, engine_base(), true) && lrc_set_page_directories(context_state_, directories);
+                           : (render() ? lrc_init_gen9_rcs(context_state_, engine_base(), true) : lrc_init_gen9_xcs(context_state_, engine_base(), true)) &&
+                                 lrc_set_page_directories(context_state_, directories);
   if (!image || !lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), 0, 0)) {
     fail_init();
     release_wells();
@@ -211,19 +218,19 @@ bool VcsDriver::wedge() {
 void VcsDriver::shutdown() {
   if (state_ != State::Ready) return;
   IRegisterBank& regs = *config_.registers;
-  if (!Forcewake::acquire(regs, media_domain())) { wedge(); return; }
+  if (!Forcewake::acquire(regs, engine_domain())) { wedge(); return; }
   if (!port_.stop(100000)) {
     wedge();
-    Forcewake::release(regs, media_domain());
+    Forcewake::release(regs, engine_domain());
     return;
   }
   // Idle. The engine's status page address still names our page: point the whole range at the scratch page, which is never freed (the engine may still
   // write there when it wakes), and free the rest.
-  const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, kGgttPagesNeeded);
-  ggtt.clear(0, kGgttPagesNeeded, scratch_.dma);
+  const Ggtt ggtt(config_.ggtt_table, config_.ggtt_first_page, ggtt_pages_);
+  ggtt.clear(0, ggtt_pages_, scratch_.dma);
   ggtt_invalidate(regs);
   ggtt_mapped_ = false;
-  Forcewake::release(regs, media_domain());
+  Forcewake::release(regs, engine_domain());
   ppgtt_.shutdown();
   GpuBuffer* const freed[] = {&batch_, &context_, &status_, &ring_};  // not the scratch page
   for (GpuBuffer* b : freed)
@@ -290,21 +297,43 @@ void VcsDriver::write_ring(uint32_t dword) {
   write_position_ = (write_position_ + 4) % kRingBytes;
 }
 
-VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
-  if (state_ != State::Ready || !batch_is_acceptable(commands)) return Result::Rejected;
-  IRegisterBank& regs = *config_.registers;
-  if (!Forcewake::acquire(regs, media_domain())) return Result::Rejected;
-
-  // The batch.
-  for (uint64_t i = 0; i < commands.size(); ++i) batch_dwords_[i] = commands[i];
-
-  // The ring: pad to the end if the job does not fit before it, then the job.
-  const uint64_t job_bytes = kJobDwords * 4;
-  const uint64_t old_tail = ring_tail_;
-  write_position_ = old_tail;
-  if (write_position_ + job_bytes > kRingBytes)
-    while (write_position_ != 0) write_ring(kMiNoop);
-  ++seqno_;
+// The ring commands of one job: flush, run the batch, flush again, store the sequence number in the status page, interrupt.
+void VcsDriver::write_job(uint64_t status_address, uint32_t sequence) {
+  const uint32_t marker_address = static_cast<uint32_t>(status_address + uint64_t{kSeqnoDword} * 4);
+  if (render()) {
+    // Invalidate every cache the batch reads through (with the write the TLB invalidate needs, to a spare qword of the status page), run the batch, flush the
+    // render target and data caches and wait for the pipeline to drain, then write the marker.
+    write_ring(kPipeControlHeader);
+    write_ring(gen9_3d::kPcCsStall | gen9_3d::kPcTlbInvalidate | gen9_3d::kPcInstructionCacheInvalidate | gen9_3d::kPcTextureCacheInvalidate | gen9_3d::kPcVfCacheInvalidate |
+               gen9_3d::kPcConstCacheInvalidate | gen9_3d::kPcStateCacheInvalidate | gen9_3d::kPcPostSyncWriteImmediate | gen9_3d::kPcGlobalGtt);
+    write_ring(static_cast<uint32_t>(status_address + uint64_t{kRenderScratchDword} * 4));
+    write_ring(0);
+    write_ring(0);
+    write_ring(0);
+    write_ring(kMiArbOnOff | kMiArbEnable);
+    write_ring(kMiBatchBufferStartGen8 | kBatchInPpgtt);
+    write_ring(kBatchGpuAddress);
+    write_ring(0);
+    write_ring(kMiArbOnOff);
+    write_ring(kMiNoop);
+    write_ring(kPipeControlHeader);
+    write_ring(gen9_3d::kPcRenderTargetCacheFlush | gen9_3d::kPcDepthCacheFlush | gen9_3d::kPcDcFlush | gen9_3d::kPcPipeControlFlush | gen9_3d::kPcCsStall);
+    write_ring(0);
+    write_ring(0);
+    write_ring(0);
+    write_ring(0);
+    write_ring(kPipeControlHeader);
+    write_ring(gen9_3d::kPcCsStall | gen9_3d::kPcPostSyncWriteImmediate | gen9_3d::kPcGlobalGtt);
+    write_ring(marker_address);
+    write_ring(0);
+    write_ring(sequence);
+    write_ring(0);
+    write_ring(kMiUserInterrupt);
+    write_ring(kMiArbOnOff | kMiArbEnable);
+    write_ring(kMiArbCheck);
+    write_ring(kMiNoop);
+    return;
+  }
   write_ring((kMiFlushDw + 1) | kFlushDwStoreIndex | kFlushDwOpStoreDw | kFlushDwInvalidateTlb | kFlushDwInvalidateBsd);  // (MI_FLUSH_DW + 1)
   write_ring(kPphwspScratchAddress);
   write_ring(0);
@@ -316,13 +345,32 @@ VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
   write_ring(kMiArbOnOff);
   write_ring(kMiNoop);
   write_ring((kMiFlushDw + 1) | kFlushDwOpStoreDw);  // the completion marker: store the sequence number in the status page
-  write_ring(static_cast<uint32_t>(status_ggtt_ + uint64_t{kSeqnoDword} * 4) | kFlushDwUseGtt);
+  write_ring(marker_address | kFlushDwUseGtt);
   write_ring(0);
-  write_ring(seqno_);
+  write_ring(sequence);
   write_ring(kMiUserInterrupt);
   write_ring(kMiArbOnOff | kMiArbEnable);
   write_ring(kMiArbCheck);
   write_ring(kMiNoop);
+}
+
+VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
+  if (state_ != State::Ready) return Result::Rejected;
+  if (render() ? commands.size() > kBatchBytes / 4 || !gen9_3d::render_batch_is_acceptable(commands) : !batch_is_acceptable(commands)) return Result::Rejected;
+  IRegisterBank& regs = *config_.registers;
+  if (!Forcewake::acquire(regs, engine_domain())) return Result::Rejected;
+
+  // The batch.
+  for (uint64_t i = 0; i < commands.size(); ++i) batch_dwords_[i] = commands[i];
+
+  // The ring: pad to the end if the job does not fit before it, then the job.
+  const uint64_t job_bytes = (render() ? kRenderJobDwords : kJobDwords) * 4;
+  const uint64_t old_tail = ring_tail_;
+  write_position_ = old_tail;
+  if (write_position_ + job_bytes > kRingBytes)
+    while (write_position_ != 0) write_ring(kMiNoop);
+  ++seqno_;
+  write_job(status_ggtt_, seqno_);
   const uint64_t new_tail = write_position_;
 
   lrc_set_ring(context_state_, static_cast<uint32_t>(ring_ggtt_), static_cast<uint32_t>(kRingBytes), static_cast<uint32_t>(old_tail), static_cast<uint32_t>(new_tail));
@@ -341,11 +389,11 @@ VcsDriver::Result VcsDriver::run_batch(ArrayView<const uint32_t> commands) {
   }
   if (!(marker && idle)) {
     wedge();  // while the well is still awake: its registers are only reliable then
-    Forcewake::release(regs, media_domain());
+    Forcewake::release(regs, engine_domain());
     return Result::Timeout;
   }
   ring_tail_ = new_tail;
-  Forcewake::release(regs, media_domain());
+  Forcewake::release(regs, engine_domain());
   return Result::Done;
 }
 

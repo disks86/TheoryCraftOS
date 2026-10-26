@@ -31,6 +31,9 @@
 //   /Linux             the root of Linux processes: they see its contents as /
 //   /AppStore          one sub-folder per application for the files it keeps (the browser's cache is /AppStore/Browser/Cache)
 //
+// Inside /Windows is the usual Windows tree (Program Files, Program Files (x86), ProgramData, Users, Windows\System32, ...) and inside /Linux
+// the usual FHS tree (bin, etc, home, usr/bin, var/log, ...); the lists are kWindowsFolders and kLinuxFolders below.
+//
 // Volumes other than those above (USB sticks, network shares) are folders of "/" named by their label.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
@@ -57,17 +60,74 @@ inline constexpr const char* kSystemDatabase = "/AppStore/System/system.db";
 // The name the EFI system partition is mounted under (the folder "/EFI").
 inline constexpr const char* kEfiMountName = "EFI";
 
+// What a Windows process sees as C:\Program Files, C:\Program Files (x86), C:\Users and C:\Windows.
+inline constexpr const char* kWindowsProgramFiles = "/Windows/Program Files";
+inline constexpr const char* kWindowsProgramFilesX86 = "/Windows/Program Files (x86)";
+inline constexpr const char* kWindowsProgramData = "/Windows/ProgramData";
+inline constexpr const char* kWindowsUsers = "/Windows/Users";
+inline constexpr const char* kWindowsDirectory = "/Windows/Windows";
+inline constexpr const char* kWindowsSystem32 = "/Windows/Windows/System32";
+inline constexpr const char* kWindowsSysWow64 = "/Windows/Windows/SysWOW64";
+
+// What a Linux process sees as /bin, /etc, /home, /tmp and /usr/bin.
+inline constexpr const char* kLinuxBin = "/Linux/bin";
+inline constexpr const char* kLinuxEtc = "/Linux/etc";
+inline constexpr const char* kLinuxHome = "/Linux/home";
+inline constexpr const char* kLinuxTmp = "/Linux/tmp";
+inline constexpr const char* kLinuxUsrBin = "/Linux/usr/bin";
+
+// The folders under /Windows (what C:\ holds on a Windows installation), parents before children.
+inline constexpr const char* kWindowsFolders[] = {
+    kWindowsProgramFiles,
+    "/Windows/Program Files/Common Files",
+    kWindowsProgramFilesX86,
+    "/Windows/Program Files (x86)/Common Files",
+    kWindowsProgramData,
+    "/Windows/ProgramData/Microsoft",
+    kWindowsUsers,
+    "/Windows/Users/Default",
+    "/Windows/Users/Public",
+    "/Windows/Users/Public/Desktop",
+    "/Windows/Users/Public/Documents",
+    "/Windows/Users/Public/Downloads",
+    "/Windows/Users/Public/Music",
+    "/Windows/Users/Public/Pictures",
+    "/Windows/Users/Public/Videos",
+    kWindowsDirectory,
+    "/Windows/Windows/Fonts",
+    "/Windows/Windows/Logs",
+    kWindowsSystem32,
+    "/Windows/Windows/System32/drivers",
+    "/Windows/Windows/System32/config",
+    kWindowsSysWow64,
+    "/Windows/Windows/Temp",
+};
+
+// The folders under /Linux (the Filesystem Hierarchy Standard), parents before children. /dev, /proc and /sys are the places the kernel
+// presents devices and process information; here they start out empty.
+inline constexpr const char* kLinuxFolders[] = {
+    kLinuxBin, "/Linux/boot", "/Linux/dev", kLinuxEtc, "/Linux/etc/opt", kLinuxHome, "/Linux/lib", "/Linux/lib64", "/Linux/media",
+    "/Linux/mnt", "/Linux/opt", "/Linux/proc", "/Linux/root", "/Linux/run", "/Linux/sbin", "/Linux/srv", "/Linux/sys", kLinuxTmp,
+    "/Linux/usr", kLinuxUsrBin, "/Linux/usr/include", "/Linux/usr/lib", "/Linux/usr/lib64", "/Linux/usr/local", "/Linux/usr/local/bin",
+    "/Linux/usr/local/lib", "/Linux/usr/sbin", "/Linux/usr/share", "/Linux/var", "/Linux/var/cache", "/Linux/var/lib", "/Linux/var/log",
+    "/Linux/var/tmp",
+};
+
 // Every folder of the layout that lives on the primary partition, parents before children. "/EFI" is not one: it is a mount.
 inline constexpr const char* kFolders[] = {kDesktop, kDownloads, kDocuments, kPictures, kVideo, kAudio, kWindows, kLinux, kAppStore};
 
-// Creates the folders above in `fs` (the primary partition's own filesystem, or one standing in for it) when they are missing. Folders that
+inline bool create_folder(filesystem::IFileSystem& fs, const char* folder) {
+  const Status status = fs.create_directory(folder);
+  return status == Status::Ok || status == Status::AlreadyExists;
+}
+
+// Creates the folders above (kFolders, then the Windows and Linux trees) in `fs` (the primary partition's own filesystem, or one standing in for it) when they are missing. Folders that
 // exist stay as they are, and so does everything else in them. False if one could not be made (read-only medium, no space).
 inline bool create_folders(filesystem::IFileSystem& fs) {
   bool ok = true;
-  for (const char* folder : kFolders) {
-    const Status status = fs.create_directory(folder);
-    if (status != Status::Ok && status != Status::AlreadyExists) ok = false;
-  }
+  for (const char* folder : kFolders) ok &= create_folder(fs, folder);
+  for (const char* folder : kWindowsFolders) ok &= create_folder(fs, folder);
+  for (const char* folder : kLinuxFolders) ok &= create_folder(fs, folder);
   return ok;
 }
 

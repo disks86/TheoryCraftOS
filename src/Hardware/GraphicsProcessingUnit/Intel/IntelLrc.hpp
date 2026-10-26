@@ -28,6 +28,7 @@ namespace intel_gt {
 // (gt/intel_lrc.c, gt/intel_lrc_reg.h, gt/intel_lrc.h).
 
 constexpr uint32_t kLrcPages = 2;              // video engines of Gen8+ (GEN8_LR_CONTEXT_OTHER_SIZE)
+constexpr uint32_t kLrcRenderPages = 22;       // the render engine of Gen9 (GEN9_LR_CONTEXT_RENDER_SIZE): the engine saves its whole 3D state there
 constexpr uint32_t kLrcStatePage = 1;          // the register state starts one page in
 constexpr uint32_t kLrcStateDwords = 1024;     // one page
 
@@ -46,6 +47,8 @@ constexpr uint32_t kCtxRingMiMode = 0x54 + 1;  // GEN9_CTX_RING_MI_MODE
 // MMIO offset of the first video engine (VCS0) on Gen8 to Gen10, and of the first video box (VD0) on Gen11 and later.
 constexpr uint32_t kVcs0MmioBase = 0x12000;
 constexpr uint32_t kVd0MmioBase = 0x1C0000;
+// MMIO offset of the render engine (RCS0) on Gen8 to Gen11.
+constexpr uint32_t kRcs0MmioBase = 0x2000;
 
 // Which generation's layouts a context follows.
 enum class Generation : uint8_t { Gen9, Gen12 };
@@ -54,6 +57,9 @@ enum class Generation : uint8_t { Gen9, Gen12 };
 // the context control and the engine's MI mode (ring not stopped). `mmio_base` is the engine's register base; `inhibit_restore` is true for a context that has
 // never run (there is no saved engine state to restore). `state` must be exactly kLrcStateDwords long.
 bool lrc_init_gen9_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
+// The same for the Gen9 render engine (gen9_rcs_offsets): the register list is the video engine's, but the third load (the render power/clock state register,
+// not the video engine's) is not posted.
+bool lrc_init_gen9_rcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore);
 
 // The same for a Gen12 (Xe-LP) video engine: the shorter register list of gen12_xcs_offsets (the load commands also set the "from the command streamer's MMIO"
 // bit), the ring MI mode and batch buffer offset at the places Gen12 has them. As the i915 driver does (gt/intel_lrc.c).

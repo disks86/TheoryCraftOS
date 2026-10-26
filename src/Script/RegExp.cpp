@@ -117,7 +117,11 @@ bool make_regexp(Vm& vm, StringView source, StringView flags, Value* out) {
   escaped_source(source, &shown);
   vm.define_named(o, "lastIndex", Value::make_number(0), kWritable);
   vm.define_named(o, "source", str_value(vm, shown.view()), 0);
-  vm.define_named(o, "flags", str_value(vm, flags), 0);
+  String canonical(vm.allocator());   // (the flags property lists the flags in a fixed order whatever order they were written in)
+  for (const char* f = "dgimsuvy"; *f; ++f) {
+    if (flags.contains(*f)) canonical.push_back(*f);
+  }
+  vm.define_named(o, "flags", str_value(vm, canonical.view()), 0);
   auto has = [&](char ch) { return flags.contains(ch); };
   vm.define_named(o, "global", Value::make_bool(has('g')), 0);
   vm.define_named(o, "ignoreCase", Value::make_bool(has('i')), 0);

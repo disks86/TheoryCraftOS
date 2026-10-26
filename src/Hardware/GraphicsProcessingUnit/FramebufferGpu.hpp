@@ -54,6 +54,8 @@ class FramebufferGpu : public IGraphicsProcessingUnit {
   // `memory` is the whole framebuffer; it must cover height * pitch_bytes bytes or no drawing happens.
   void set_framebuffer(ByteView memory, uint32_t width, uint32_t height, uint32_t pitch_bytes, bool bgr);
   uint32_t pitch_bytes() const { return pitch_; }
+  // Memory order B, G, R, x (the usual layout) rather than R, G, B, x.
+  bool bgr() const { return bgr_; }
   // The size of the device's video memory when it is more than the visible framebuffer.
   void set_video_memory_total(uint64_t bytes) override { video_total_ = bytes; }
   bool framebuffer_range(uint64_t* base, uint64_t* bytes) const override {

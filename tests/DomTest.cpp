@@ -78,10 +78,10 @@ static void test_builder() {
   CHECK(built("<dl><dt>a<dd>b<dt>c</dl>", "<html><head></head><body><dl><dt>a</dt><dd>b</dd><dt>c</dt></dl></body></html>"));
   CHECK(built("<select><option>a<option>b</select>", "<html><head></head><body><select><option>a</option><option>b</option></select></body></html>"));
   CHECK(built("a<br>b<hr>c<img src=x>d", "<html><head></head><body>a<br>b<hr>c<img src=\"x\">d</body></html>"));
-  CHECK(built("<b>x<i>y</b>z</i>", "<html><head></head><body><b>x<i>y</i></b>z</body></html>"));
+  CHECK(built("<b>x<i>y</b>z</i>", "<html><head></head><body><b>x<i>y</i></b><i>z</i></body></html>"));
   CHECK(built("<a href=\"x?a=1&amp;b=2\" CLASS=a id='i' DATA-X=1 hidden>t</a>", "<html><head></head><body><a href=\"x?a=1&amp;b=2\" class=\"a\" id=\"i\" data-x=\"1\" hidden=\"\">t</a></body></html>"));
   CHECK(built("<a href=x class=1 class=2>t</a>", "<html><head></head><body><a href=\"x\" class=\"1\">t</a></body></html>"));
-  CHECK(built("<p>&amp; &lt;b&gt; &quot;q&quot; &#65;&#x42; &nbsp;|&copy;|&eacute;", "<html><head></head><body><p>&amp; &lt;b&gt; \"q\" AB \xC2\xA0|\xC2\xA9|\xC3\xA9</p></body></html>"));
+  CHECK(built("<p>&amp; &lt;b&gt; &quot;q&quot; &#65;&#x42; &nbsp;|&copy;|&eacute;", "<html><head></head><body><p>&amp; &lt;b&gt; \"q\" AB &nbsp;|\xC2\xA9|\xC3\xA9</p></body></html>"));
   CHECK(built("a &bogus; b & c &amp d", "<html><head></head><body>a &amp;bogus; b &amp; c &amp; d</body></html>"));
   CHECK(built("<a href='?a=1&copy=2&amp;x'>l</a>", "<html><head></head><body><a href=\"?a=1&amp;copy=2&amp;x\">l</a></body></html>"));
   CHECK(built("<!-- c --><p>x<!--y--></p>", "<html><head></head><body><p>x<!--y--></p></body></html>"));
@@ -93,7 +93,7 @@ static void test_builder() {
   CHECK(built("<pre>\nline1\n\nline2</pre>", "<html><head></head><body><pre>line1\n\nline2</pre></body></html>"));
   CHECK(built("</div></p>text</b>", "<html><head></head><body>text</body></html>"));
   CHECK(built("<div><span>unclosed", "<html><head></head><body><div><span>unclosed</span></div></body></html>"));
-  CHECK(built("<head><title>t</title></head> \n <body>x</body> \n</html>", "<html><head><title>t</title></head><body>x \n</body></html>"));
+  CHECK(built("<head><title>t</title></head> \n <body>x</body> \n</html>", "<html><head><title>t</title></head> \n <body>x \n</body></html>"));
   CHECK(built("<p>x</p></body></html><p>after", "<html><head></head><body><p>x</p><p>after</p></body></html>"));
   CHECK(built("1 < 2 and <3", "<html><head></head><body>1 &lt; 2 and &lt;3</body></html>"));
   CHECK(built("<h1>a<h2>b</h2>", "<html><head></head><body><h1>a</h1><h2>b</h2></body></html>"));

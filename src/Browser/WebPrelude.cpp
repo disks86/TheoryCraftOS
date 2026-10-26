@@ -10736,11 +10736,302 @@ const char kWorkerPrelude[] = R"JSPRELUDE((function (g) {
 }(this));
 )JSPRELUDE";
 
+
+// ES modules and script elements: the loader that goes with __compile_module (Builtins.cpp). Module sources are read synchronously (a blob: URL from the
+// registry kept here, anything else with a synchronous XMLHttpRequest), so a page's module graph is loaded when import() or a <script type=module> asks for it;
+// only evaluation is asynchronous (a module is an async function: top-level await). Also: <script> elements put in the document by a script, import maps.
+const char kModulePrelude[] = R"JSPRELUDE((function (g) {
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var records = {};          // address -> module record
+  var blobs = {};            // blob: address -> Blob (module sources are read from here)
+  var inlineCounter = 0;
+  var topPairs = [], scopes = [];   // the import map: [[normalized key, address or null]] longest keys first; [[scope prefix, pairs]]
+
+  var nativeCreate = URL.createObjectURL, nativeRevoke = URL.revokeObjectURL;
+  URL.createObjectURL = function (blob) { var address = nativeCreate.apply(URL, arguments); if (blob instanceof Blob) blobs[address] = blob; return address; };
+  URL.revokeObjectURL = function (address) { delete blobs[String(address)]; return nativeRevoke.apply(URL, arguments); };
+
+  var baseAddress = function () { return document.baseURI || location.href; };
+  var parse = function (text, base) { try { return base === undefined ? new URL(text) : new URL(text, base); } catch (e) { return null; } };
+  // A specifier that is an address: absolute, or starting with /, ./ or ../ (a bare name like "lodash" is not).
+  var parseLike = function (text, base) { return /^(\/|\.\/|\.\.\/)/.test(text) ? parse(text, base) : parse(text); };
+
+  // ------------------------------------------------------------------------------------------------------------------------------ import maps
+  function normalizeKey(key, base) { var u = parseLike(key, base); return u ? u.href : key; }
+  function sortPairs(pairs) { pairs.sort(function (a, b) { return a[0].length < b[0].length ? 1 : a[0].length > b[0].length ? -1 : a[0] < b[0] ? -1 : 1; }); return pairs; }
+  function normalizeImports(imports, base) {
+    var out = [];
+    if (imports === null || typeof imports !== 'object' || Array.isArray(imports)) return out;
+    Object.keys(imports).forEach(function (key) {
+      var normalized = normalizeKey(key, base), value = imports[key];
+      if (normalized === '') return;
+      if (typeof value !== 'string') { out.push([normalized, null]); return; }
+      var u = parseLike(value, base);
+      if (!u || (key.charAt(key.length - 1) === '/' && u.href.charAt(u.href.length - 1) !== '/')) { out.push([normalized, null]); return; }
+      out.push([normalized, u.href]);
+    });
+    return sortPairs(out);
+  }
+  function registerImportMap(text, base) {
+    var map = JSON.parse(text);
+    if (map === null || typeof map !== 'object' || Array.isArray(map)) throw new TypeError('The import map must be a JSON object.');
+    if (map.imports !== undefined) topPairs = sortPairs(topPairs.concat(normalizeImports(map.imports, base)));
+    if (map.scopes !== undefined && map.scopes !== null && typeof map.scopes === 'object') {
+      Object.keys(map.scopes).forEach(function (prefix) {
+        var u = parse(prefix, base);
+        if (u) scopes.push([u.href, normalizeImports(map.scopes[prefix], base)]);
+      });
+      scopes.sort(function (a, b) { return a[0].length < b[0].length ? 1 : -1; });
+    }
+  }
+  // The address a specifier maps to in `pairs`; undefined for no match; null for a mapping that blocks it.
+  function matchPairs(normalized, pairs) {
+    for (var i = 0; i < pairs.length; i++) {
+      var key = pairs[i][0], value = pairs[i][1];
+      if (key === normalized) return value;
+      if (key.charAt(key.length - 1) === '/' && normalized.indexOf(key) === 0) {
+        if (value === null) return null;
+        var after = normalized.slice(key.length), u = parse(after, value);
+        if (!u || u.href.indexOf(value) !== 0) return null;
+        return u.href;
+      }
+    }
+    return undefined;
+  }
+  function resolveSpecifier(specifier, referrer) {
+    var asAddress = parseLike(specifier, referrer);
+    var normalized = asAddress ? asAddress.href : specifier;
+    var blocked = function () { return new TypeError("Failed to resolve module specifier '" + specifier + "': the import map blocks it."); };
+    for (var i = 0; i < scopes.length; i++) {
+      var prefix = scopes[i][0];
+      if (referrer === prefix || (prefix.charAt(prefix.length - 1) === '/' && referrer.indexOf(prefix) === 0)) {
+        var r = matchPairs(normalized, scopes[i][1]);
+        if (r === null) throw blocked();
+        if (r !== undefined) return r;
+      }
+    }
+    var top = matchPairs(normalized, topPairs);
+    if (top === null) throw blocked();
+    if (top !== undefined) return top;
+    if (asAddress) return asAddress.href;
+    throw new TypeError("Failed to resolve module specifier '" + specifier + "'. Relative references must start with either \"/\", \"./\", or \"../\".");
+  }
+
+  // ------------------------------------------------------------------------------------------------------------------------------- module records
+  function sourceOf(address) {
+    var failed = function () { return new TypeError('Failed to fetch dynamically imported module: ' + address); };
+    if (address.indexOf('blob:') === 0) {
+      var b = blobs[address];
+      if (!b) throw failed();
+      return b.__bytes;
+    }
+    var x = new XMLHttpRequest();
+    try { x.open('GET', address, false); x.send(); } catch (e) { throw failed(); }
+    if (x.status < 200 || x.status > 299) throw failed();
+    return x.responseText;
+  }
+  function makeNamespace() {
+    var ns = Object.create(null);
+    Object.defineProperty(ns, Symbol.toStringTag, { value: 'Module' });
+    return ns;
+  }
+  // Compiles `text` as the module at `address` (`key` names it in the module map). Syntax errors are kept: asking again gives the same error.
+  function newRecord(key, address, text) {
+    var rec = { key: key, url: address, ns: makeNamespace(), meta: { url: address }, depUrls: null, depRecs: null, promise: null, error: null, fn: null };
+    records[key] = rec;
+    try {
+      var c = __compile_module(text);
+      rec.fn = c[0]; rec.requests = c[1]; rec.imports = c[2]; rec.exportNames = c[3]; rec.stars = c[4];
+    } catch (e) { rec.error = e; }
+    return rec;
+  }
+  function recordFor(address) {
+    var rec = records[address];
+    if (rec) return rec;
+    return newRecord(address, address, sourceOf(address));
+  }
+  // Fetches and compiles everything `rec` imports (not the same module twice); throws what went wrong.
+  function load(rec, seen) {
+    if (rec.error) throw rec.error;
+    seen[rec.key] = true;
+    if (!rec.depUrls) rec.depUrls = rec.requests.map(function (specifier) { return resolveSpecifier(specifier, rec.url); });
+    rec.depRecs = rec.depUrls.map(function (address) {
+      var dep = recordFor(address);
+      if (dep.error) throw dep.error;
+      if (!seen[dep.key]) load(dep, seen);
+      return dep;
+    });
+  }
+  function hasExport(rec, name, visited) {
+    if (visited[rec.key]) return false;
+    visited[rec.key] = true;
+    if (rec.exportNames.indexOf(name) >= 0) return true;
+    if (name === 'default') return false;
+    for (var i = 0; i < rec.stars.length; i++) if (hasExport(rec.depRecs[+rec.stars[i]], name, visited)) return true;
+    return false;
+  }
+  // Every import must name something its module exports.
+  function link(rec, seen) {
+    if (seen[rec.key]) return;
+    seen[rec.key] = true;
+    rec.imports.forEach(function (entry) {
+      var colon = entry.indexOf(':'), dep = rec.depRecs[+entry.slice(0, colon)], name = entry.slice(colon + 1);
+      if (!hasExport(dep, name, {})) throw new SyntaxError("The requested module '" + dep.url + "' does not provide an export named '" + name + "'");
+    });
+    rec.depRecs.forEach(function (dep) { link(dep, seen); });
+  }
+  function finalizeNamespace(ns) {
+    var names = Object.keys(ns).sort(), getters = names.map(function (n) { return Object.getOwnPropertyDescriptor(ns, n).get; });
+    names.forEach(function (n) { delete ns[n]; });
+    names.forEach(function (n, i) { Object.defineProperty(ns, n, { get: getters[i], enumerable: true, configurable: false }); });
+    Object.preventExtensions(ns);
+  }
+  // Runs the dependencies in order, then the module itself. A promise; a module in progress higher up the chain (a cycle) is not waited for.
+  function evaluate(rec, ancestors) {
+    if (rec.promise) return rec.promise;
+    if (ancestors.indexOf(rec) >= 0) return Promise.resolve();
+    var chain = ancestors.concat([rec]);
+    var p = Promise.resolve();
+    rec.depRecs.forEach(function (dep) { p = p.then(function () { return evaluate(dep, chain); }); });
+    rec.promise = p.then(function () {
+      var started = rec.fn.call(undefined, rec.depRecs.map(function (d) { return d.ns; }), rec.ns, rec.meta);
+      finalizeNamespace(rec.ns);
+      return started;
+    });
+    return rec.promise;
+  }
+  function importRecord(rec) {
+    var seen = {};
+    load(rec, seen);
+    link(rec, {});
+    return evaluate(rec, []).then(function () { return rec.ns; });
+  }
+
+  Object.defineProperty(g, '__export_get', { value: function (o, name, getter) { Object.defineProperty(o, name, { get: getter, enumerable: true, configurable: true }); } });
+  Object.defineProperty(g, '__export_star', { value: function (o, ns) {
+    Object.keys(ns).forEach(function (k) {
+      if (k === 'default' || Object.prototype.hasOwnProperty.call(o, k)) return;
+      var d = Object.getOwnPropertyDescriptor(ns, k);
+      Object.defineProperty(o, k, { get: d.get, enumerable: true, configurable: true });
+    });
+  } });
+  // import(specifier) with the address of the module that wrote it (undefined in a script: the document's)
+  Object.defineProperty(g, '__dynamic_import', { value: function (specifier, referrer) {
+    return new Promise(function (resolve, reject) {
+      try { resolve(importRecord(recordFor(resolveSpecifier(String(specifier), referrer || baseAddress())))); } catch (e) { reject(e); }
+    });
+  } });
+
+  // --------------------------------------------------------------------------------------------------------------------------- script elements
+  var JS_TYPES = /^(application\/(x-)?(ecma|java)script|text\/(x-)?(ecma|java)script(1\.[0-5])?|text\/(jscript|livescript))$/;
+  var started = typeof WeakSet === 'function' ? new WeakSet() : null;
+  function scriptKind(el) {
+    var t = el.getAttribute('type');
+    if (t === null) return 'classic';
+    t = String(t).replace(/^\s+|\s+$/g, '').toLowerCase();
+    if (t === '' || JS_TYPES.test(t)) return 'classic';
+    if (t === 'module' || t === 'importmap') return t;
+    return null;
+  }
+  function report(e) {
+    var ev;
+    try { ev = new ErrorEvent('error', { message: 'Uncaught ' + (e && e.name ? e.name + ': ' + e.message : String(e)), error: e, cancelable: true }); } catch (x) { ev = null; }
+    if (ev) { if (g.dispatchEvent(ev)) console.error(ev.message); } else console.error(String(e));
+  }
+  function fire(el, type) { try { el.dispatchEvent(new Event(type)); } catch (e) { report(e); } }
+  function later(fn) { setTimeout(fn, 0); }
+
+  function runClassic(el, text) {
+    try { (0, eval)(text); } catch (e) { report(e); }
+  }
+  function runModule(el, rec, withEvents, done) {
+    var failed = false;
+    try { load(rec, {}); link(rec, {}); } catch (e) {
+      failed = true;
+      if (withEvents) fire(el, 'error'); else report(e);
+    }
+    if (failed) { if (done) done(); return; }
+    evaluate(rec, []).then(function () {}, function (e) { report(e); }).then(function () {
+      if (withEvents) fire(el, 'load');
+      if (done) done();
+    });
+  }
+
+  // A <script> element is in the document. `parsed`: the parser met it (modules and import maps, which the parser leaves to this code), `done` is called when a module has run.
+  Object.defineProperty(g, '__prepare_script', { value: function (el, parsed, done) {
+    if (started && started.has(el) && !parsed) return;
+    var kind = scriptKind(el);
+    if (kind === null) return;
+    if (kind === 'classic' && el.hasAttribute('nomodule')) return;
+    var src = el.getAttribute('src');
+    var hasSrc = src !== null && src !== '';
+    var text = el.textContent;
+    if (!hasSrc && text === '') return;
+    if (started) started.add(el);
+    if (kind === 'importmap') {
+      if (hasSrc) { fire(el, 'error'); return; }
+      try { registerImportMap(text, baseAddress()); } catch (e) { report(e); }
+      return;
+    }
+    if (kind === 'classic') {
+      if (!hasSrc) { runClassic(el, text); return; }
+      var address = parse(src, baseAddress());
+      later(function () {
+        var body;
+        try { body = address ? sourceOf(address.href) : null; } catch (e) { body = null; }
+        if (body === null) { fire(el, 'error'); return; }
+        runClassic(el, body);
+        fire(el, 'load');
+      });
+      return;
+    }
+    // module
+    var go = function () {
+      var rec, withEvents = hasSrc;
+      try {
+        if (hasSrc) {
+          var u = parse(src, baseAddress());
+          if (!u) throw new TypeError('Failed to resolve the module script address');
+          rec = recordFor(u.href);
+        } else {
+          rec = newRecord('inline:' + (++inlineCounter), baseAddress(), text);
+        }
+      } catch (e) {
+        if (withEvents) fire(el, 'error'); else report(e);
+        if (done) done();
+        return;
+      }
+      runModule(el, rec, withEvents, done);
+    };
+    if (parsed) go(); else later(go);
+  } });
+  Object.defineProperty(g, '__script_inserted', { value: function (el) { g.__prepare_script(el, false); } });
+  // The scripts the parser left: import maps first, then the modules in the order of the page, each after the one before it has run.
+  Object.defineProperty(g, '__run_parsed_scripts', { value: function () {
+    var scripts = Array.prototype.slice.call(document.getElementsByTagName('script'));
+    scripts.forEach(function (el) { if (el.getAttribute('type') === 'importmap') g.__prepare_script(el, true); });
+    var chain = Promise.resolve();
+    scripts.forEach(function (el) {
+      var type = el.getAttribute('type');
+      if (type === null || String(type).toLowerCase() !== 'module') return;
+      chain = chain.then(function () { return new Promise(function (resolve) { g.__prepare_script(el, true, resolve); }); });
+    });
+  } });
+
+  if (typeof HTMLScriptElement === 'function') {
+    var supports = function (type) { type = String(type); return type === 'classic' || type === 'module' || type === 'importmap'; };
+    Object.defineProperty(HTMLScriptElement, 'supports', { value: supports, writable: true, configurable: true });
+    Object.defineProperty(HTMLScriptElement.prototype, 'noModule', { get: function () { return this.hasAttribute('nomodule'); }, set: function (v) { if (v) this.setAttribute('nomodule', ''); else this.removeAttribute('nomodule'); }, enumerable: true, configurable: true });
+  }
+}(this));
+)JSPRELUDE";
+
 }  // namespace
 
 const char* web_prelude() { return kPrelude; }
 const char* worker_prelude() { return kWorkerPrelude; }
 const char* dom_prelude() { return kDomPrelude; }
 const char* web_assembly_prelude() { return kWebAssemblyPrelude; }
+const char* module_prelude() { return kModulePrelude; }
 
 }  // namespace browser

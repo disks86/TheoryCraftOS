@@ -361,7 +361,7 @@ static void test_css_text_styles() {
     CHECK(find_run(doc, "l") && (find_run(doc, "l")->flags & kRunUnderline) && find_run(doc, "t") && find_run(doc, "t")->color == 0xFFEEEEEE && find_run(doc, "t")->background == 0);
     // The stylesheets a caller fetched are read first, the page's own win over them.
     CHECK(doc.parse_html("<p>x</p><style>p{color:blue}</style>", "p{color:red;background:#eee} p{color:lime}") && find_run(doc, "x")->color == 0xFF0000FF && find_run(doc, "x")->background == 0xFFEEEEEE);
-    CHECK(doc.parse_html("<body bgcolor=#ffffcc><td bgcolor=red>x</td></body>") && doc.page_background() == 0xFFFFFFCC && find_run(doc, "x")->background == 0xFFFF0000);
+    CHECK(doc.parse_html("<body bgcolor=#ffffcc><table><tr><td bgcolor=red>x</td></tr></table></body>") && doc.page_background() == 0xFFFFFFCC && find_run(doc, "x")->background == 0xFFFF0000);
   }
   CHECK(a.live == 0);
 }
@@ -434,8 +434,8 @@ static void test_scripts() {
   CHECK(scripted_page_is("a<script>w:<script>w:deep</script></script>b", 40, "adeepb", 2));
   CHECK(scripted_page_is("a<script>w:<div>open</script>b", 40, "a\nopenb", 1));   // (an element it leaves open stays open: no dangling text)
   CHECK(scripted_page_is("a<script>w:<style>p{color:red}</style><p>styled</p></script>", 40, "a\n\nstyled", 1));
-  CHECK(scripted_page_is("<script>unclosed", 40, "", 1));
-  CHECK(scripted_page_is("a<script>\nw:x\n", 40, "a", 1));
+  CHECK(scripted_page_is("<script>unclosed", 40, "", 0));   // (a script the page ends in the middle of is not run)
+  CHECK(scripted_page_is("a<script>\nw:x\n", 40, "a", 0));
   TestAllocator a;
   {
     HtmlDocument doc(a);

@@ -93,6 +93,16 @@ static void test_layout() {
       CHECK_STATUS(ram.stat(folder, &entry), Status::Ok);
       CHECK(entry.type == NodeType::Directory);
     }
+    for (const char* folder : layout::kWindowsFolders) {
+      DirectoryEntry entry;
+      CHECK_STATUS(ram.stat(folder, &entry), Status::Ok);
+      CHECK(entry.type == NodeType::Directory);
+    }
+    for (const char* folder : layout::kLinuxFolders) {
+      DirectoryEntry entry;
+      CHECK_STATUS(ram.stat(folder, &entry), Status::Ok);
+      CHECK(entry.type == NodeType::Directory);
+    }
     // again: what is there stays
     UniquePointer<IFile> file;
     CHECK_STATUS(ram.open_file("/Desktop/Downloads/a.bin", OpenMode::CreateTruncate, &file), Status::Ok);

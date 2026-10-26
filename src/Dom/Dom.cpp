@@ -121,6 +121,16 @@ void Document::record(Mutation&& m) {
   if (first && hook_) hook_(hook_context_);
 }
 
+void Document::inserted(Node* node) {
+  if (!insert_hook_ || !node->is_element()) return;
+  if (node->is_tag("script")) {
+    if (!node->script_started) insert_hook_(insert_context_, node);
+    return;
+  }
+  for (Node* n = node->first_child; n; n = next_in_tree(n, node))
+    if (n->is_tag("script") && !n->script_started) insert_hook_(insert_context_, n);
+}
+
 // --- Tree --------------------------------------------------------------------------------------------------------
 
 namespace {
@@ -166,6 +176,7 @@ void link_before(Node* parent, Node* node, Node* reference) {
     m.added = node;
     parent->owner->record(util::move(m));
   }
+  if (parent->owner) parent->owner->inserted(node);
 }
 
 bool can_have_children(const Node* n) { return n->type == NodeType::Element || n->type == NodeType::Document || n->type == NodeType::Fragment; }
@@ -256,6 +267,7 @@ Node* clone_into(Document& doc, Node* node, bool deep) {
     case NodeType::Element:
       copy = doc.create_element(node->name.view());
       if (copy) {
+        copy->script_started = node->script_started;
         copy->ns_set = node->ns_set;
         copy->ns.assign(node->ns.view());
         copy->qname.assign(node->qname.view());
@@ -388,7 +400,7 @@ int64_t find_attr(const Node* e, StringView name) {
     const StringView n = e->attrs[i].name.view();
     if (n.size() != name.size()) continue;
     bool same = true;
-    for (uint64_t k = 0; k < n.size() && same; ++k) same = n[k] == lower(name[k]);
+    for (uint64_t k = 0; k < n.size() && same; ++k) same = lower(n[k]) == lower(name[k]);
     if (same) return static_cast<int64_t>(i);
   }
   return -1;
@@ -507,7 +519,7 @@ DomError set_text_content(Node* node, StringView text) {
 }
 
 bool is_void_tag(StringView tag) {
-  static const char* const kVoid[] = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
+  static const char* const kVoid[] = {"area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
   for (const char* v : kVoid)
     if (tag.equals(v)) return true;
   return false;
@@ -519,14 +531,17 @@ void escape_into(StringView s, bool attribute, String* out) {
   for (uint64_t i = 0; i < s.size(); ++i) {
     const char c = s[i];
     if (c == '&') out->append("&amp;");
-    else if (c == '"' && attribute) out->append("&quot;");
+    else if (c == '\xC2' && i + 1 < s.size() && s[i + 1] == '\xA0') {   // (U+00A0 is written as a reference so that it can be seen)
+      out->append("&nbsp;");
+      ++i;
+    } else if (c == '"' && attribute) out->append("&quot;");
     else if (c == '<' && !attribute) out->append("&lt;");
     else if (c == '>' && !attribute) out->append("&gt;");
     else out->push_back(c);
   }
 }
 
-bool is_raw_text_tag(StringView tag) { return tag.equals("script") || tag.equals("style") || tag.equals("xmp") || tag.equals("iframe") || tag.equals("noembed") || tag.equals("noframes"); }
+bool is_raw_text_tag(StringView tag) { return tag.equals("script") || tag.equals("style") || tag.equals("xmp") || tag.equals("iframe") || tag.equals("noembed") || tag.equals("noframes") || tag.equals("plaintext"); }
 
 void serialize(const Node* n, String* out, uint32_t depth) {
   if (depth > 400) return;

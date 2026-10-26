@@ -21,36 +21,33 @@
 // (virgl on a virtio-gpu, i.e. QEMU with a -gl display; SVGA3D on a VMware SVGA adapter, i.e. VMware and VirtualBox's VMSVGA), else the software one.
 // Storage is inline because there is no heap-free way to build them elsewhere.
 #pragma once
-#include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
-#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
-#include "Graphics/Graphics3D/LockedDevice.hpp"
-#include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
-#include "Graphics/Graphics3D/Svga/SvgaDevice.hpp"
-#include "Graphics/Graphics3D/Virgl/VirglDevice.hpp"
+#include "Graphics/IDisplayGraphics.hpp"
+#include "Graphics/RenderNode.hpp"
+#include "Graphics/Renderer2DSlot.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Utility/FixedString.hpp"
 
 namespace graphics {
 
-class SystemGraphics {
+class SystemGraphics : public IDisplayGraphics {
  public:
   // `gpu` must outlive this object. If `allow_acceleration` is false the software
   // device is used even where a GPU device would work.
-  SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator& allocator, bool allow_acceleration = true);
-  ~SystemGraphics();
+  // `allow_intel_render` switches on the render engine path of an Intel Gen9.5 display GPU (untried on hardware).
+  SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator& allocator, bool allow_acceleration = true, bool allow_intel_render = false);
 
   // The device to render 3D with: accelerated if it passed its self-test, else software.
-  IGraphicsDevice& device() { return *active_; }
-  bool accelerated() const { return active_ == gpu_device_; }
+  IGraphicsDevice& device() { return node_.device(); }
+  bool accelerated() const { return node_.accelerated(); }
   // Why the software device is in use, in a few words ("display adapter has no 3D engine: Bochs VGA", "virgl self-test failed", ...); empty when accelerated.
-  const char* software_reason() const { return reason_; }
+  const char* software_reason() const { return node_.software_reason(); }
   // Always the CPU renderer's device (e.g. to compare against the accelerated one).
-  IGraphicsDevice& software_device() { return software_; }
+  IGraphicsDevice& software_device() { return node_.software_device(); }
 
   // The 2D renderer for the whole screen: drawn by the GPU device where there is one, else on the
   // CPU into a back buffer that present() copies to the display. Created on first use; nullptr
   // if out of memory.
-  IRenderer2D* renderer_2d();
+  IRenderer2D* renderer_2d() override { return renderer_.get(node_, override_ ? override_ : display_, override_ == nullptr); }
 
   // Presents the 2D picture through `display` instead of straight to the display device (nullptr: straight again): the monitor compositor, when the
   // desktop is not laid out like the device's screen. The renderer is a software one then, drawing a picture of the size `display` reports
@@ -59,35 +56,18 @@ class SystemGraphics {
 
   // Throws the 2D renderer away; the next renderer_2d() builds one for the display's size as it is then (after the display was resized for several
   // monitors). Nothing may be using the old renderer.
-  void reset_renderer();
+  void reset_renderer() { renderer_.reset(); }
 
   // The display GPU everything is shown on.
   hardware::IGraphicsProcessingUnit* display() { return display_; }
+  // The 3D back end of the display GPU (GraphicsPool reuses it rather than building a second device on the same GPU).
+  RenderNode& render_node() override { return node_; }
 
  private:
-  bool self_test(IGraphicsDevice& device);
-  // Draws a triangle on the device and looks at the pixel: for back ends whose protocol could not be tried against a real host in advance.
-  bool drawing_test(IGraphicsDevice& device);
-
-  allocators::IAllocator& allocator_;
   hardware::IGraphicsProcessingUnit* display_;
   hardware::IGraphicsProcessingUnit* override_ = nullptr;
-  SoftwareDevice software_;
-  alignas(8) unsigned char virgl_storage_[sizeof(VirglDevice)];
-  alignas(8) unsigned char svga_storage_[sizeof(SvgaDevice)];
-  // The accelerated device is used through a locked wrapper (it is shared by the 2D renderer, the 3D test window and the browser's canvases, which run on different
-  // threads); raw_device_ is the real one.
-  alignas(8) unsigned char locked_storage_[sizeof(LockedDevice)];
-  LockedDevice* locked_ = nullptr;
-  IGraphicsDevice* raw_device_ = nullptr;
-  bool svga_ = false;
-  const char* reason_ = "";
-  FixedString<96> reason_text_;
-  Surface backbuffer_;
-  SoftwareRenderer2D* software_2d_ = nullptr;
-  DeviceRenderer2D* device_2d_ = nullptr;
-  IGraphicsDevice* gpu_device_ = nullptr;
-  IGraphicsDevice* active_ = nullptr;
+  RenderNode node_;
+  Renderer2DSlot renderer_;
 };
 
 }  // namespace graphics

@@ -16,12 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Reads HTML into a document tree, the forgiving way browsers do: the <html>, <head> and <body> elements are made when the page has none, text and
-// elements that belong in the body start it, end tags that were left out (of <p>, <li>, <td>, <tr>, <dt>, <dd>, <option> ...) are put in, unknown and
-// misplaced tags are kept as they are, comments are kept, character references are decoded (to UTF-8), the first newline of <pre> and <textarea> is dropped
-// and the content of <script>, <style>, <title>, <textarea> and a few others is read as text. Scripts are handed to an IScriptRunner as they are met: what
-// they document.write is read in their place. Not done: foster parenting of table content, reconstruction of formatting elements, <frameset>, SVG and MathML
-// namespaces (their elements are ordinary elements).
+// Reads HTML into a document tree the way the HTML Standard says (section 13.2, "parsing HTML documents"): the tokenizer with all its states, the insertion
+// modes, the list of active formatting elements with the adoption agency algorithm, foster parenting, foreign content (SVG and MathML), templates, quirks
+// mode from the doctype, and the fragment case (innerHTML). Scripts are handed to an IScriptRunner as they are met: what they document.write is read in
+// their place. Not done: the doctype as a node, and the character references that stand for two code points.
 #pragma once
 #include "Dom/Dom.hpp"
 
