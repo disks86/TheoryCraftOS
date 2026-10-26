@@ -400,7 +400,7 @@ int64_t find_attr(const Node* e, StringView name) {
     const StringView n = e->attrs[i].name.view();
     if (n.size() != name.size()) continue;
     bool same = true;
-    for (uint64_t k = 0; k < n.size() && same; ++k) same = n[k] == lower(name[k]);
+    for (uint64_t k = 0; k < n.size() && same; ++k) same = lower(n[k]) == lower(name[k]);
     if (same) return static_cast<int64_t>(i);
   }
   return -1;
@@ -519,7 +519,7 @@ DomError set_text_content(Node* node, StringView text) {
 }
 
 bool is_void_tag(StringView tag) {
-  static const char* const kVoid[] = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
+  static const char* const kVoid[] = {"area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"};
   for (const char* v : kVoid)
     if (tag.equals(v)) return true;
   return false;
@@ -531,14 +531,17 @@ void escape_into(StringView s, bool attribute, String* out) {
   for (uint64_t i = 0; i < s.size(); ++i) {
     const char c = s[i];
     if (c == '&') out->append("&amp;");
-    else if (c == '"' && attribute) out->append("&quot;");
+    else if (c == '\xC2' && i + 1 < s.size() && s[i + 1] == '\xA0') {   // (U+00A0 is written as a reference so that it can be seen)
+      out->append("&nbsp;");
+      ++i;
+    } else if (c == '"' && attribute) out->append("&quot;");
     else if (c == '<' && !attribute) out->append("&lt;");
     else if (c == '>' && !attribute) out->append("&gt;");
     else out->push_back(c);
   }
 }
 
-bool is_raw_text_tag(StringView tag) { return tag.equals("script") || tag.equals("style") || tag.equals("xmp") || tag.equals("iframe") || tag.equals("noembed") || tag.equals("noframes"); }
+bool is_raw_text_tag(StringView tag) { return tag.equals("script") || tag.equals("style") || tag.equals("xmp") || tag.equals("iframe") || tag.equals("noembed") || tag.equals("noframes") || tag.equals("plaintext"); }
 
 void serialize(const Node* n, String* out, uint32_t depth) {
   if (depth > 400) return;

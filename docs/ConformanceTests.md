@@ -35,9 +35,9 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   arguments, TDZ, per-iteration `let` bindings in `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`,
   `String.prototype.normalize`/special casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key
   order, and a call depth of 500.
-- **HTML**: the adoption agency algorithm and foster parenting, `<image>`→`<img>`, form/nobr/optgroup/ruby rules, comment and CDATA tokenizer states,
-  `U+0000`/CR handling, foreign-content breakout, `&nbsp;` serialisation, frameset documents, doctype identifiers and quirks mode, XML parsing in
-  `DOMParser`, `innerHTML` scripts must not run.
+- **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
+  content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
+  references that stand for two code points, `innerHTML` scripts must not run.
 - **CSS**: computed values are often not resolved (`flow-root`, blockified `display`, `line-height`, `text-align`, `transform-origin`), UA style sheet
   values (heading sizes, `ul` padding, link colour, `em`), newer colour spaces (`lab`, `oklch`, `color-mix`, relative colours), `lh`, nesting,
   `revert-layer`, `@container` failure, `:dir()`, `:nth-child(… of S)`, `aspect-ratio`, `flow-root` floats, many properties return `""`
