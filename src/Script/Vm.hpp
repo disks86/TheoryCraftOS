@@ -195,6 +195,14 @@ class Vm {
   JsObject* string_proto() { return string_proto_; }
   JsObject* number_proto() { return number_proto_; }
   JsObject* boolean_proto() { return boolean_proto_; }
+  JsObject* symbol_proto() { return symbol_proto_; }
+  static bool is_symbol(const Value& v) { return v.tag == Tag::String && v.as_string()->symbol; }
+  // A new symbol (not interned: it is its own property key). The well-known ones are interned "@@iterator" and the like, flagged by the builtins.
+  JsString* new_symbol(const Value& description);
+  // The own property keys that are symbols (enumerable or not).
+  JsObject* own_symbols(JsObject* o);
+  // "Symbol(description)"
+  JsString* symbol_descriptive_string(JsString* symbol);
   JsObject* error_proto() { return error_proto_; }
   JsString* empty_string() { return empty_; }
   JsString* length_name() { return length_; }
@@ -319,6 +327,7 @@ class Vm {
   void index_rebuild(JsObject* o);
   int64_t find_prop(JsObject* o, JsString* key) const;
   void push_property_keys(JsObject* names, JsObject* o, bool enumerable);
+  uint32_t symbol_counter_ = 0;
   bool array_index(const Value& key, uint32_t* index) const;
   static bool canonical_index(StringView s, uint32_t* index);
   bool ensure_items(JsObject* o, uint32_t capacity);
@@ -404,7 +413,7 @@ class Vm {
   Value extra_root_;    // a value the collector must keep while native code that is not in a frame holds it (see Engine::call_guarded)
   Value iter_return_;   // the value an iterator finished with (done: true, value: ...): what `yield*` evaluates to
   JsObject *global_ = nullptr, *object_proto_ = nullptr, *array_proto_ = nullptr, *function_proto_ = nullptr, *string_proto_ = nullptr, *number_proto_ = nullptr,
-           *boolean_proto_ = nullptr, *error_proto_ = nullptr, *iterator_proto_ = nullptr, *sentinel_ = nullptr;
+           *boolean_proto_ = nullptr, *symbol_proto_ = nullptr, *error_proto_ = nullptr, *iterator_proto_ = nullptr, *sentinel_ = nullptr;
   JsObject* error_protos_[5] = {};
   JsObject *promise_proto_ = nullptr, *micro_ = nullptr, *rejections_ = nullptr, *current_native_ = nullptr;
   uint32_t micro_head_ = 0;

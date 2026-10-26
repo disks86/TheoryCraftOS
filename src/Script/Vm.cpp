@@ -84,6 +84,7 @@ Vm::Vm(allocators::IAllocator& allocator, IHost* host)
   string_proto_ = new_object(object_proto_);
   number_proto_ = new_object(object_proto_);
   boolean_proto_ = new_object(object_proto_);
+  symbol_proto_ = new_object(object_proto_);
   error_proto_ = new_object(object_proto_);
   iterator_proto_ = new_object(object_proto_);
   sentinel_ = new_object(object_proto_);
@@ -876,7 +877,7 @@ void Vm::collect() {
   mark(promise_proto_);
   mark(micro_);
   mark(rejections_);
-  for (JsObject* o : {global_, object_proto_, function_proto_, array_proto_, string_proto_, number_proto_, boolean_proto_, error_proto_, iterator_proto_, sentinel_}) mark(o);
+  for (JsObject* o : {global_, object_proto_, function_proto_, array_proto_, string_proto_, number_proto_, boolean_proto_, symbol_proto_, error_proto_, iterator_proto_, sentinel_}) mark(o);
   for (int i = 0; i < 5; ++i) mark(error_protos_[i]);
   for (JsString* s : {empty_, length_, prototype_, name_, message_, constructor_, to_string_, value_of_, undefined_text_, null_text_, true_text_, false_text_}) mark(s);
   for (uint64_t i = 0; i < codes_.count(); ++i) {
@@ -1193,6 +1194,10 @@ bool Vm::get(const Value& base, JsString* key, Value* out) {
     }
     case Tag::String: {
       JsString* s = base.as_string();
+      if (s->symbol) {
+        o = symbol_proto_;
+        break;
+      }
       if (key == length_) {
         *out = Value::make_number(string_length(s));
         return true;
@@ -1234,7 +1239,7 @@ bool Vm::get(const Value& base, JsString* key, Value* out) {
 bool Vm::to_property_key(const Value& v, JsString** out) {
   if (v.is_string()) {
     JsString* s = v.as_string();
-    *out = s->interned ? s : intern(s->view());
+    *out = s->interned || s->symbol ? s : intern(s->view());
     return true;
   }
   if (v.is_number() && v.u.number >= 0 && v.u.number < 1e9 && v.u.number == static_cast<double>(static_cast<uint32_t>(v.u.number))) {
@@ -1443,12 +1448,52 @@ JsObject* Vm::own_keys(JsObject* o) {
   return keys;
 }
 
+JsString* Vm::new_symbol(const Value& description) {
+  String text(allocator_);
+  text.append("@@");
+  const bool described = !description.is_undefined();
+  if (described) {
+    JsString* d;
+    if (!to_string(description, &d)) return nullptr;
+    text.append(d->view());
+  }
+  text.push_back('#');
+  text.append_uint(++symbol_counter_);
+  JsString* s = new_string(text.view());
+  s->symbol = true;
+  s->described = described;
+  return s;
+}
+
+JsString* Vm::symbol_descriptive_string(JsString* symbol) {
+  StringView t = symbol->view();
+  const uint64_t hash = [&] { uint64_t i = t.size(); while (i > 2 && t[i - 1] != '#') --i; return i; }();   // (one past the last '#' - or 2)
+  String text(allocator_);
+  text.append("Symbol(");
+  if (hash <= 2 && symbol->described) {   // a well-known symbol, "@@iterator": Symbol.iterator
+    text.append("Symbol.");
+    text.append(t.substr(2));
+  } else if (symbol->described) {
+    text.append(t.substr(2, hash - 3));
+  }
+  text.push_back(')');
+  return new_string(text.view());
+}
+
+JsObject* Vm::own_symbols(JsObject* o) {
+  JsObject* out = new_array(0);
+  if (o->okind == ObjKind::Proxy) return out;
+  for (uint32_t i = 0; i < o->prop_count; ++i)
+    if (o->props[i].key->symbol) array_push(out, Value::make_string(o->props[i].key));
+  return out;
+}
+
 // The own property names of an ordinary object, in the order the language gives: integer indices ascending, then the rest as they were added.
 void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   List<uint32_t> indexed(allocator_);
   for (uint32_t i = 0; i < o->prop_count; ++i) {
     uint32_t n;
-    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && canonical_index(o->props[i].key->view(), &n)) indexed.push_back(i);
+    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && canonical_index(o->props[i].key->view(), &n)) indexed.push_back(i);
   }
   for (uint64_t a = 1; a < indexed.count(); ++a) {   // (insertion sort by the index: objects with many integer keys are arrays, which do not come here)
     const uint32_t item = indexed[a];
@@ -1466,7 +1511,7 @@ void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   for (uint64_t a = 0; a < indexed.count(); ++a) array_push(names, Value::make_string(o->props[indexed[a]].key));
   for (uint32_t i = 0; i < o->prop_count; ++i) {
     uint32_t n;
-    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n)) array_push(names, Value::make_string(o->props[i].key));
+    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n)) array_push(names, Value::make_string(o->props[i].key));
   }
 }
 
@@ -1552,7 +1597,10 @@ bool Vm::to_string(const Value& v, JsString** out) {
     case Tag::Undefined: *out = undefined_text_; return true;
     case Tag::Null: *out = null_text_; return true;
     case Tag::Boolean: *out = v.u.boolean ? true_text_ : false_text_; return true;
-    case Tag::String: *out = v.as_string(); return true;
+    case Tag::String:
+      if (v.as_string()->symbol) return throw_error(ErrorKind::TypeError, "Cannot convert a Symbol value to a string");
+      *out = v.as_string();
+      return true;
     case Tag::Number: {
       String text(allocator_);
       number_to_string(v.u.number, &text);
@@ -1576,14 +1624,6 @@ bool Vm::to_string(const Value& v, JsString** out) {
   }
 }
 
-// A symbol is a string "@@<description>#<number>" (see symbol_function): the number at the end is what tells one from a string that happens to start with @@.
-static bool is_symbol_text(StringView s) {
-  if (s.size() < 4 || s[0] != '@' || s[1] != '@') return false;
-  uint64_t i = s.size();
-  while (i > 2 && s[i - 1] >= '0' && s[i - 1] <= '9') --i;
-  return i < s.size() && i > 2 && s[i - 1] == '#';
-}
-
 bool Vm::to_number(const Value& v, double* out) {
   switch (v.tag) {
     case Tag::Undefined: *out = __builtin_nan(""); return true;
@@ -1592,7 +1632,7 @@ bool Vm::to_number(const Value& v, double* out) {
     case Tag::Number: *out = v.u.number; return true;
     case Tag::String: {
       double d;
-      if (is_symbol_text(v.as_string()->view())) return throw_error(ErrorKind::TypeError, "Cannot convert a Symbol value to a number");
+      if (v.as_string()->symbol) return throw_error(ErrorKind::TypeError, "Cannot convert a Symbol value to a number");
       if (!string_to_number(v.as_string()->view(), &d)) d = __builtin_nan("");
       *out = d;
       return true;
@@ -1635,7 +1675,7 @@ StringView Vm::type_of(const Value& v) {
     case Tag::Null: return "object";
     case Tag::Boolean: return "boolean";
     case Tag::Number: return "number";
-    case Tag::String: return "string";
+    case Tag::String: return v.as_string()->symbol ? "symbol" : "string";
     default: return is_bigint(v) ? "bigint" : is_callable(v) ? "function" : "object";
   }
 }
@@ -1647,7 +1687,7 @@ bool Vm::strict_equals(const Value& a, const Value& b) {
     case Tag::Null: return true;
     case Tag::Boolean: return a.u.boolean == b.u.boolean;
     case Tag::Number: return a.u.number == b.u.number;
-    case Tag::String: return a.as_string() == b.as_string() || (a.as_string()->length == b.as_string()->length && a.as_string()->view().equals(b.as_string()->view()));
+    case Tag::String: return a.as_string() == b.as_string() || (a.as_string()->symbol == b.as_string()->symbol && a.as_string()->length == b.as_string()->length && a.as_string()->view().equals(b.as_string()->view()));
     default: {
       if (a.u.cell == b.u.cell) return true;
       bool na, nb;
@@ -1684,7 +1724,9 @@ bool Vm::loose_equals(const Value& a, const Value& b) {
 void Vm::describe(const Value& v, String* out, uint32_t depth) {
   switch (v.tag) {
     case Tag::String:
-      if (depth == 0) {
+      if (v.as_string()->symbol) {
+        out->append(symbol_descriptive_string(v.as_string())->view());
+      } else if (depth == 0) {
         out->append(v.as_string()->view());
       } else {
         out->push_back('\'');

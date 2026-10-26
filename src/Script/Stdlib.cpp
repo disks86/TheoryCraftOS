@@ -90,17 +90,66 @@ const char kStdlib[] = R"JSLIB((function (g) {
   }
   def(SP, 'isWellFormed', function () { var t = String(this); for (var i = 0; i < t.length; i++) if (lonelySurrogate(t, i)) return false; return true; });
   def(SP, 'toWellFormed', function () { var t = String(this), out = ''; for (var i = 0; i < t.length; i++) out += lonelySurrogate(t, i) ? '\uFFFD' : t[i]; return out; });
-  // a Symbol is a string that starts with @@ (the text up to the # is its description)
-  Object.defineProperty(SP, 'description', { get: function () {
-    var s = String(this);
-    if (s.charAt(0) !== '@' || s.charAt(1) !== '@') return undefined;
-    var hash = s.lastIndexOf('#');
-    return s.slice(2, hash > 1 ? hash : s.length);
-  } });
-  var registry = {};
-  def(Symbol, 'for', function (key) { key = String(key); return '@@' + key + '#for'; });
-  def(Symbol, 'keyFor', function (sym) { sym = String(sym); return sym.slice(-4) === '#for' && sym.slice(0, 2) === '@@' ? sym.slice(2, -4) : undefined; });
-  if (!Symbol.isConcatSpreadable) Symbol.isConcatSpreadable = '@@isConcatSpreadable';
+  // Symbol.prototype: a symbol is a string cell the engine flags (see Vm::new_symbol); __symbol_info reads it
+  var SymP = Symbol.prototype;
+  Object.defineProperty(SymP, 'description', { get: function () { return __symbol_info(this, 0); }, configurable: true });
+  def(SymP, 'toString', function () { return __symbol_info(this, 1); });
+  def(SymP, 'valueOf', function () { __symbol_info(this, 0); return this; });
+  def(SymP, Symbol.toPrimitive, function () { __symbol_info(this, 0); return this; });
+  Object.defineProperty(SymP, Symbol.toStringTag, { value: 'Symbol', configurable: true });
+  var symbolRegistry = new Map(), symbolKeys = new Map();
+  def(Symbol, 'for', function (key) {
+    key = String(key);
+    var sym = symbolRegistry.get(key);
+    if (sym === undefined) { sym = Symbol(key); symbolRegistry.set(key, sym); symbolKeys.set(sym, key); }
+    return sym;
+  });
+  def(Symbol, 'keyFor', function (sym) {
+    if (!__symbol_info(sym, 2)) throw new TypeError(String(sym) + ' is not a symbol');
+    return symbolKeys.get(sym);
+  });
+
+  // the well-known symbols that change what a built-in does: the String methods ask the argument first, concat asks isConcatSpreadable
+  [['match', Symbol.match], ['matchAll', Symbol.matchAll], ['replace', Symbol.replace], ['search', Symbol.search], ['split', Symbol.split]].forEach(function (pair) {
+    var name = pair[0], sym = pair[1], orig = SP[name];
+    var wrapper = function (arg) {
+      if (arg !== null && arg !== undefined && typeof arg === 'object' && !(arg instanceof RegExp)) {
+        var method = arg[sym];
+        if (typeof method === 'function') return method.apply(arg, [this].concat(Array.prototype.slice.call(arguments, 1)));
+      }
+      return orig.apply(this, arguments);
+    };
+    Object.defineProperty(wrapper, 'name', { value: name });
+    Object.defineProperty(wrapper, 'length', { value: orig.length });
+    def(SP, name, wrapper);
+  });
+  (function () {
+    var orig = AP.concat, spread = Symbol.isConcatSpreadable;
+    var wrapper = function (item) {
+      var args = [];
+      for (var i = 0; i < arguments.length; i++) {
+        var a = arguments[i];
+        if (a !== null && typeof a === 'object') {
+          var flag = a[spread];
+          if (flag !== undefined) a = flag ? Array.prototype.slice.call(a) : [a];
+        }
+        args.push(a);
+      }
+      return orig.apply(this, args);
+    };
+    Object.defineProperty(wrapper, 'name', { value: 'concat' });
+    Object.defineProperty(wrapper, 'length', { value: 1 });
+    def(AP, 'concat', wrapper);
+  }());
+  var unscopables = Object.create(null);
+  ['at', 'copyWithin', 'entries', 'fill', 'find', 'findIndex', 'findLast', 'findLastIndex', 'flat', 'flatMap', 'includes', 'keys', 'toReversed', 'toSorted', 'toSpliced', 'values'].forEach(function (n) { unscopables[n] = true; });
+  Object.defineProperty(AP, Symbol.unscopables, { value: unscopables, configurable: true });
+  [Array, Map, Set, Promise, RegExp, ArrayBuffer].forEach(function (C) {
+    if (typeof C !== 'function') return;
+    var getter = function () { return this; };
+    Object.defineProperty(getter, 'name', { value: 'get [Symbol.species]' });
+    Object.defineProperty(C, Symbol.species, { get: getter, configurable: true });
+  });
 
   // ------------------------------------------------------------------------------------------------------------------ Object
   def(Object, 'hasOwn', function (o, k) { return OP.hasOwnProperty.call(o, k); });
@@ -109,7 +158,6 @@ const char kStdlib[] = R"JSLIB((function (g) {
     for (var i = 0; i < names.length; i++) out[names[i]] = Object.getOwnPropertyDescriptor(o, names[i]);
     return out;
   });
-  def(Object, 'getOwnPropertySymbols', function () { return []; });
   def(Object, 'groupBy', function (items, fn) {
     var out = Object.create(null), i = 0;
     for (var item of items) { var key = String(fn(item, i++)); (out[key] = out[key] || []).push(item); }
