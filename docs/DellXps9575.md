@@ -96,6 +96,11 @@ What it does not do, and what is needed before a Vega M decodes anything:
   index header; offsets measured by `scripts/gen_uvd_message_layout.py` into `AmdUvd6MessageLayout.inc`), the picture-buffer and context sizes (`calc_dpb_size` / `calc_ctx_size_h264_perf` for Polaris and newer: pictures only,
   17 at most), the feedback word and scaling table, and the list of buffers of a job in Mesa's order (session context, message, picture buffer, context, bitstream, target, feedback, scaling table) ready for `AmdUvd6Ring`. It takes the
   same `AvcPictureState` the VCN path makes from the parser, and a linear NV12 target. `tests/AmdUvd6MessagesTest.cpp` checks every field against offsets worked out by hand from the structure definition, and builds a message
-  from a real H.264 stream. HEVC messages (`ruvd_h265`), the other codecs, reading the feedback area back, and `IVideoDecoder` on top are not done.
+  from a real H.264 stream. HEVC messages (`ruvd_h265`), the other codecs and reading the feedback area back are not done.
+- **The H.264 session: done in simulation.** `AmdUvd6AvcDecoder` is an `IVideoDecoder` (the same session logic as the VCN one: parser, decoded picture buffer rules, output order, avcC and Annex B, grey for a picture the
+  engine fails, wedge on a missed fence, one session at a time) over the UVD ring, the messages and the work memory. `tests/AmdUvd6AvcDecoderTest.cpp` runs whole streams through it against a simulated ring controller and a stand-in
+  for the firmware that checks the messages and buffers and writes the CPU decoder's pictures into the target; the session must return exactly the CPU decoder's pictures, in order. It also covers a wedged engine, too little
+  memory and 24 damaged variants of the stream (under the sanitizers). Making the stand-in's checks wrong (the target address, the pitch) makes the test fail by the hundreds. What is missing is the glue that makes the card a video
+  device (`AmdUvd6VideoEngine`, like `AmdVcnVideoEngine`: PCI discovery, the BARs, the memory plan, the firmware, power, `AmdUvd6::start`, the ring test, a self-test decode, then `create_decoder`) and everything on the card itself.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.
