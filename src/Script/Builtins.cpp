@@ -2179,6 +2179,38 @@ bool run_source(Vm& vm, StringView source, Value* result) {
   return vm.call(Value::make_object(fn), Value::make_object(vm.global()), nullptr, 0, result);
 }
 
+// __compile_module(source): [the module function, [the specifiers it asks for]]. The function is called with (dependency namespaces, the exports object,
+// import.meta) and returns a promise (see parse_module). Throws a SyntaxError.
+NATIVE(compile_module) {
+  JsString* source;
+  if (!vm.to_string(arg_at(args, argc, 0), &source)) return false;
+  Arena arena(vm.allocator());
+  String message(vm.allocator());
+  ModuleRequests requests(vm.allocator());
+  Node* program = parse_module(source->view(), arena, &message, &requests);
+  if (!program) return vm.throw_error(ErrorKind::SyntaxError, message.view());
+  FunctionCode* code = nullptr;
+  if (!compile_program(vm, program, &code, &message)) return vm.throw_error(ErrorKind::SyntaxError, message.view());
+  JsObject* top = vm.new_function(code, nullptr, Value());
+  Value module_function;
+  if (!vm.call(Value::make_object(top), Value::make_object(vm.global()), nullptr, 0, &module_function)) return false;
+  JsObject* list = vm.new_array();
+  for (uint64_t i = 0; i < requests.specifiers.count(); ++i) vm.array_push(list, str_value(vm, requests.specifiers[i].view()));
+  auto strings = [&](const List<String>& names) {
+    JsObject* array = vm.new_array();
+    for (uint64_t i = 0; i < names.count(); ++i) vm.array_push(array, str_value(vm, names[i].view()));
+    return Value::make_object(array);
+  };
+  JsObject* out = vm.new_array(5);
+  vm.array_push(out, module_function);
+  vm.array_push(out, Value::make_object(list));
+  vm.array_push(out, strings(requests.imports));
+  vm.array_push(out, strings(requests.exports));
+  vm.array_push(out, strings(requests.stars));
+  *result = Value::make_object(out);
+  return true;
+}
+
 NATIVE(global_eval) {
   const Value code = arg_at(args, argc, 0);
   if (!code.is_string()) {
@@ -2497,6 +2529,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "isFinite", global_is_finite, 1);
   vm.define_native(g, "alert", global_alert, 1);
   vm.define_native(g, "eval", global_eval, 1);
+  vm.define_native(g, "__compile_module", compile_module, 1);
   vm.define_native(g, "setTimeout", set_timeout, 2);
   vm.define_native(g, "setInterval", set_interval, 2);
   vm.define_native(g, "clearTimeout", clear_timeout, 1);

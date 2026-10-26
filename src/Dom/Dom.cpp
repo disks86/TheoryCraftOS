@@ -121,6 +121,16 @@ void Document::record(Mutation&& m) {
   if (first && hook_) hook_(hook_context_);
 }
 
+void Document::inserted(Node* node) {
+  if (!insert_hook_ || !node->is_element()) return;
+  if (node->is_tag("script")) {
+    if (!node->script_started) insert_hook_(insert_context_, node);
+    return;
+  }
+  for (Node* n = node->first_child; n; n = next_in_tree(n, node))
+    if (n->is_tag("script") && !n->script_started) insert_hook_(insert_context_, n);
+}
+
 // --- Tree --------------------------------------------------------------------------------------------------------
 
 namespace {
@@ -166,6 +176,7 @@ void link_before(Node* parent, Node* node, Node* reference) {
     m.added = node;
     parent->owner->record(util::move(m));
   }
+  if (parent->owner) parent->owner->inserted(node);
 }
 
 bool can_have_children(const Node* n) { return n->type == NodeType::Element || n->type == NodeType::Document || n->type == NodeType::Fragment; }
@@ -256,6 +267,7 @@ Node* clone_into(Document& doc, Node* node, bool deep) {
     case NodeType::Element:
       copy = doc.create_element(node->name.view());
       if (copy) {
+        copy->script_started = node->script_started;
         copy->ns_set = node->ns_set;
         copy->ns.assign(node->ns.view());
         copy->qname.assign(node->qname.view());

@@ -52,7 +52,7 @@ struct NetJob {
 };
 
 struct DomBindings::Impl {
-  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()) {}
+  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()), pending_scripts(v.allocator()) {}
   ~Impl();   // waits for the request threads
   dom::Document* inert_document = nullptr;   // the document the contents of templates belong to as far as ownerDocument tells (made when first asked for)
   struct CustomValidity {
@@ -79,6 +79,7 @@ struct DomBindings::Impl {
   script::JsObject* local_storage = nullptr;
   script::JsObject* session_storage = nullptr;
   dom::Node* current_script = nullptr;
+  List<uint32_t> pending_scripts;   // <script> elements a script put in the tree, for __script_inserted (run when the call that did it returns)
   uint32_t error_count = 0;
   bool in_error_event = false;
   String first_error;

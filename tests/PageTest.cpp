@@ -818,6 +818,34 @@ static void test_external_and_errors() {
 }
 
 
+// ES modules in a page: <script type=module> (inline and src) run after parsing and before DOMContentLoaded, in order; imports are fetched relative to the
+// importing module, import maps apply, a module is evaluated once, dynamic import() works, nomodule scripts are skipped.
+static void test_modules() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    env.net.answers["GET https://app.example/dir/lib.js"] = {200, "Content-Type: text/javascript\r\n", "import { twice } from './util.js'; export const lib = twice(21); console.log('lib.js');"};
+    env.net.answers["GET https://app.example/dir/util.js"] = {200, "Content-Type: text/javascript\r\n", "export function twice(n) { return n * 2; } console.log('util.js');"};
+    env.net.answers["GET https://app.example/dir/mapped.js"] = {200, "Content-Type: text/javascript\r\n", "export default 'mapped'; console.log('mapped.js', import.meta.url);"};
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/dir/page.html", media, true);
+    page.load("<html><head><script type=importmap>{\"imports\": {\"m\": \"./mapped.js\"}}</script></head><body>"
+              "<script>console.log('classic 1'); document.addEventListener('DOMContentLoaded', function () { console.log('DOMContentLoaded'); });</script>"
+              "<script type=module>import { lib } from './lib.js'; import m from 'm'; console.log('inline module', lib, m);</script>"
+              "<script type=module src=lib.js></script>"
+              "<script nomodule>console.log('nomodule must not run')</script>"
+              "<script>console.log('classic 2')</script>"
+              "<script type=module>const ns = await import('./util.js'); console.log('dynamic', ns.twice(4), typeof import.meta.url);</script>"
+              "</body></html>");
+    page.run_due_timers(1e12);
+    const std::string log(page.log().data(), page.log().size());
+    if (log != "classic 1\nclassic 2\nutil.js\nlib.js\nmapped.js https://app.example/dir/mapped.js\ninline module 42 mapped\ndynamic 8 string\nDOMContentLoaded\n") printf("   modules logged: %s\n", log.c_str());
+    CHECK(log == "classic 1\nclassic 2\nutil.js\nlib.js\nmapped.js https://app.example/dir/mapped.js\ninline module 42 mapped\ndynamic 8 string\nDOMContentLoaded\n");
+    CHECK(page.errors() == 0);
+  }
+  CHECK(a.live == 0);
+}
+
 // --- Pictures, videos and canvases --------------------------------------------------------------------------------------------------
 
 static std::string make_picture(TestAllocator& a, uint32_t w, uint32_t h, uint32_t color, media::ImageFormat format = media::ImageFormat::Png) {
@@ -5978,6 +6006,11 @@ int main(int argc, char** argv) {
     printf(g_failed ? "%d check(s) failed\n" : "webgl and webgpu tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
+  if (getenv("ONLY_MODULES")) {   // (just the ES module tests)
+    test_modules();
+    printf(g_failed ? "%d check(s) failed\n" : "module tests passed\n", g_failed);
+    return g_failed ? 1 : 0;
+  }
   if (getenv("ONLY_WPT")) {   // (just the web-platform-tests derived suites)
     test_wpt();
     printf(g_failed ? "%d check(s) failed\n" : "wpt tests passed\n", g_failed);
@@ -6022,6 +6055,7 @@ int main(int argc, char** argv) {
   test_page_rendering();
   test_clicks_and_resize();
   test_external_and_errors();
+  test_modules();
   test_images();
   test_picture_paint();
   test_canvas_scripts();

@@ -74,6 +74,7 @@ class TreeBuilder {
   Node* make_element(StringView name) {
     Node* n = doc_.create_element(name);
     if (!n) (doc_.full() ? stopped_ : failed_) = true;   // (a page too big for the node limit is cut off where it stands)
+    else if (name.equals_ignore_case("script")) n->script_started = true;   // (the parser runs the script itself, or never: not the host when it is put in the tree)
     return n;
   }
   void insert(Node* n) {
@@ -521,7 +522,7 @@ class TreeBuilder {
     if (has_src) index = external_scripts_++;
     const bool javascript = !has_type || type.empty() || type.equals_ignore_case("text/javascript") || type.equals_ignore_case("application/javascript") ||
                             type.equals_ignore_case("text/ecmascript") || type.equals_ignore_case("application/ecmascript");
-    if (!scripts_ || fragment_ || !javascript || script_depth_ > 3) return;
+    if (!scripts_ || fragment_ || !javascript || script_depth_ > 3 || has_attribute(script, "nomodule")) return;
     for (const Node* p = script->parent; p; p = p->parent)
       if (p->is_tag("template")) return;   // (what is in a template is inert)
     String inline_text(doc_.allocator());
