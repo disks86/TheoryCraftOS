@@ -553,7 +553,118 @@ static void test_driver_failures() {
   }
 }
 
+// ---- Y tiling and mip layouts, with the numbers worked out by hand from the PRM's description (not from the code).
+
+static void test_tiling_and_mips() {
+  // A Y tile is 128 bytes by 32 rows in 4096 bytes, in columns of 16 bytes: byte (x, y) of a tile is at (x / 16) * 512 + y * 16 + x % 16. Tiles go row by row.
+  CHECK(y_tile_offset(128, 0, 0) == 0 && y_tile_offset(128, 1, 0) == 1 && y_tile_offset(128, 15, 0) == 15 && y_tile_offset(128, 16, 0) == 512 && y_tile_offset(128, 127, 0) == 7 * 512 + 15);
+  CHECK(y_tile_offset(128, 0, 1) == 16 && y_tile_offset(128, 0, 31) == 31 * 16 && y_tile_offset(128, 5, 3) == 3 * 16 + 5 && y_tile_offset(128, 20, 2) == 512 + 2 * 16 + 4);
+  // The next tile to the right is 4096 on; the first tile of the next row of tiles is a row of tiles (pitch / 128) on.
+  CHECK(y_tile_offset(256, 128, 0) == 4096 && y_tile_offset(256, 0, 32) == 2 * 4096 && y_tile_offset(256, 130, 33) == 3 * 4096 + 16 + 2 && y_tile_offset(512, 0, 64) == 8 * 4096);
+  // Every byte of a surface has its own place: 256 x 64 bytes fill 8 tiles exactly.
+  {
+    std::vector<uint8_t> seen(8 * 4096, 0);
+    bool whole = true;
+    for (uint32_t y = 0; y < 64; ++y)
+      for (uint32_t x = 0; x < 256; ++x) {
+        const uint64_t o = y_tile_offset(256, x, y);
+        whole = whole && o < seen.size() && !seen[o];
+        if (o < seen.size()) seen[o] = 1;
+      }
+    CHECK(whole);
+  }
+  MipLayout l;
+  // 64 x 64, seven levels. Aligned to 4 texels: 64, 32, 16, 8, 4, 4 (2), 4 (1). Level 1 under level 0 (y = 64); level 2 right of it (x = 32, y = 64) with the others below it
+  // (y = 64 + 16 = 80, 88, 92, 96). The widest row is level 0 (64), level 1 + level 2 are 48; the taller column is the right one: 64 + 16 + 8 + 4 + 4 + 4 = 100 rows against
+  // 64 + 32 = 96. The pitch 256 bytes, the memory 128 rows (a multiple of 32) of it.
+  CHECK(mip_layout(64, 64, 7, true, &l) && l.levels == 7 && l.pitch == 256 && l.slice_rows == 100 && l.rows == 128 && l.bytes() == 256 * 128);
+  const uint32_t xs[7] = {0, 0, 32, 32, 32, 32, 32}, ys[7] = {0, 64, 64, 80, 88, 92, 96}, sizes[7] = {64, 32, 16, 8, 4, 2, 1};
+  for (uint32_t i = 0; i < 7; ++i) CHECK(l.x[i] == xs[i] && l.y[i] == ys[i] && l.w[i] == sizes[i] && l.h[i] == sizes[i]);
+  // 5 x 3, three levels: 5 x 3 (aligned 8 x 4), 2 x 1 (4 x 4), 1 x 1 (4 x 4). Level 1 at (0, 4), level 2 at (4, 4). Width 8 texels both ways, 8 rows: pitch 128, memory 32 rows.
+  CHECK(mip_layout(5, 3, 3, true, &l) && l.pitch == 128 && l.slice_rows == 8 && l.rows == 32 && l.x[1] == 0 && l.y[1] == 4 && l.x[2] == 4 && l.y[2] == 4 && l.w[1] == 2 && l.h[1] == 1 && l.w[2] == 1 && l.h[2] == 1);
+  // One level, tiled: the pitch a multiple of 128 bytes, rows a multiple of 32. 33 texels are 132 bytes: 256.
+  CHECK(mip_layout(33, 20, 1, true, &l) && l.pitch == 256 && l.rows == 32 && l.slice_rows == 20 && l.x[0] == 0 && l.y[0] == 0);
+  CHECK(mip_layout(32, 32, 1, true, &l) && l.pitch == 128 && l.rows == 32);
+  // Linear: pitch to 64 bytes, as many rows as the height.
+  CHECK(mip_layout(33, 20, 1, false, &l) && l.pitch == 192 && l.rows == 20 && l.slice_rows == 20);
+  // A wide level 2: 100 x 4: 100, 50 (aligned 52), 25 (28)... level 1 is 50 x 2 (52 x 4) and level 2 is 25 x 1 (28 x 4): bottom row 52 + 28 = 80 < 100, so the width is 100 -> pitch 512.
+  CHECK(mip_layout(100, 4, 3, true, &l) && l.pitch == 512 && l.x[2] == 52 && l.y[2] == 4 && l.slice_rows == 8);
+  // Refused: no size, too big, more levels than the size has (a chain ends at 1 x 1), a mip chain that is not tiled, too many.
+  CHECK(!mip_layout(0, 8, 1, true, &l) && !mip_layout(8, 0, 1, true, &l) && !mip_layout(16385, 8, 1, true, &l) && !mip_layout(8, 8, 0, true, &l));
+  CHECK(!mip_layout(8, 8, 5, true, &l) && mip_layout(8, 8, 4, true, &l) && !mip_layout(64, 64, 2, false, &l) && !mip_layout(4096, 4096, 14, true, &l) && mip_layout(4096, 4096, 13, true, &l));
+
+  // The surface state and sampler state of tiled and mipmapped textures.
+  std::vector<uint32_t> image(VcsDriver::kBatchBytes / 4);
+  RenderBatch b(ArrayView<uint32_t>(image.data(), image.size()), VcsDriver::kBatchGpuAddress);
+  DrawState draw;
+  draw.target = {0x200000, 16, 16, 64, SurfaceFormat::B8G8R8A8Unorm};
+  Surface texture;
+  texture.gpu_address = 0x400000;
+  texture.width = texture.height = 64;
+  texture.pitch = 256;
+  texture.tiled_y = true;
+  texture.levels = 7;
+  texture.slice_rows = 100;
+  CHECK(texture.valid());
+  Vertex uv[3] = {{{1, 1, 0.5f, 1}, {0.25f, 0.5f, 7, 7}}, {{1, 14, 0.5f, 1}, {0.25f, 0.75f, 7, 7}}, {{14, 14, 0.5f, 1}, {0.5f, 0.75f, 7, 7}}};
+  Sampler sampler;
+  sampler.linear = true;
+  sampler.mip = MipMode::Linear;
+  sampler.lod_bias = 1.5f;
+  sampler.min_lod = 0.5f;
+  sampler.max_lod = 3.25f;
+  CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, sampler));
+  {
+    std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    Decoded d(job);
+    const uint32_t bt = d.one(kBindingTablePointersPs), sp = d.one(kSamplerStatePointersPs);
+    CHECK(bt != 0xFFFFFFFFu && sp != 0xFFFFFFFFu);
+    if (bt != 0xFFFFFFFFu && sp != 0xFFFFFFFFu) {
+      const uint32_t table = job[bt + 1] / 4, target_state = image[table] / 4, texture_state = image[table + 1] / 4;
+      // The target is linear with a QPitch of its 16 rows; the texture Y-tiled (tile mode 3 in bits 13:12) with the QPitch of its levels (100 rows: 25 units), its pitch less one,
+      // and the mip count less one in the low bits of dword 5 (next to the mip tail start LOD).
+      CHECK((image[target_state] & (3u << 12)) == 0 && (image[target_state + 1] & 0x7FFF) == 4 && (image[target_state + 5] & 0xF) == 0);
+      CHECK(image[texture_state] == ((1u << 29) | (0x0C0u << 18) | (1u << 16) | (1u << 14) | (1u << 8) | (3u << 12)));
+      CHECK(image[texture_state + 1] == ((2u << 24) | 25) && image[texture_state + 3] == 255 && image[texture_state + 5] == ((1u << 8) | 6) && image[texture_state + 8] == 0x400000);
+      CHECK(((image[texture_state + 2]) & 0x3FFF) == 63 && ((image[texture_state + 2] >> 16) & 0x3FFF) == 63);
+      // The sampler: both filters linear, mip mode linear (3), bias 1.5 -> 384 in 13 bits from bit 1; maximum LOD 3.25 -> 832 (bits 19:8), minimum 0.5 -> 128 (bits 31:20).
+      const uint32_t sampler_at = job[sp + 1] / 4;
+      CHECK(image[sampler_at] == ((1u << 14) | (1u << 17) | (3u << 20) | (384u << 1)) && image[sampler_at + 1] == ((832u << 8) | (128u << 20)));
+    }
+    // Nearest mip mode is 1; a negative bias is the 13 bit two's complement of the 4.8 value; with no mip mode the LOD fields stay zero whatever they say.
+    sampler.mip = MipMode::Nearest;
+    sampler.lod_bias = -1.0f;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, sampler));
+    std::vector<uint32_t> second(image.begin(), image.begin() + b.dwords());
+    Decoded d2(second);
+    const uint32_t sp2 = d2.one(kSamplerStatePointersPs);
+    CHECK(sp2 != 0xFFFFFFFFu && image[second[sp2 + 1] / 4] == ((1u << 14) | (1u << 17) | (1u << 20) | ((0x2000u - 256u) << 1)));
+    sampler.mip = MipMode::None;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, sampler));
+    std::vector<uint32_t> third(image.begin(), image.begin() + b.dwords());
+    Decoded d3(third);
+    const uint32_t sp3 = d3.one(kSamplerStatePointersPs);
+    CHECK(sp3 != 0xFFFFFFFFu && image[third[sp3 + 1] / 4] == ((1u << 14) | (1u << 17) | ((0x2000u - 256u) << 1)) && image[third[sp3 + 1] / 4 + 1] == 0);
+  }
+  // Surfaces the hardware cannot use: a mip chain that is not tiled, a tiled surface whose pitch is not a whole number of tiles or whose base is not a whole page, too many levels.
+  Surface bad = texture;
+  bad.tiled_y = false;
+  CHECK(!bad.valid());
+  bad = texture; bad.pitch = 192; CHECK(!bad.valid());
+  bad = texture; bad.gpu_address = 0x400040; CHECK(!bad.valid());
+  bad = texture; bad.levels = 14; CHECK(!bad.valid());
+  bad = texture; bad.levels = 0; CHECK(!bad.valid());
+  bad = texture; bad.levels = 1; CHECK(bad.valid());
+  CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), bad, sampler));   // (one level: fine)
+  bad.levels = 14;
+  CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), bad, sampler));
+  bad.levels = 7;
+  bad.tiled_y = false;
+  CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), bad, sampler));
+}
+
 int main() {
+  test_tiling_and_mips();
   test_context_image();
   test_command_set();
   test_kernels();

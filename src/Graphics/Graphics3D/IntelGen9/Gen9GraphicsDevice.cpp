@@ -95,7 +95,15 @@ class Gen9Image final : public IImage {
     s.height = desc_.extent.height;
     s.pitch = pitch_;
     s.format = desc_.format == Format::R8G8B8A8Unorm ? SurfaceFormat::R8G8B8A8Unorm : SurfaceFormat::B8G8R8A8Unorm;
+    s.tiled_y = !is_depth();   // (every colour image is Y-tiled)
+    s.levels = desc_.mip_levels;
+    s.slice_rows = layout_.slice_rows;
     return s;
+  }
+  uint32_t mip_levels() const override { return desc_.mip_levels; }
+  // The byte offset in the image's memory of texel (x, y) of a level.
+  uint64_t texel_offset(uint32_t level, uint32_t x, uint32_t y) const {
+    return hardware::intel_gt::gen9_3d::y_tile_offset(layout_.pitch, (layout_.x[level] + x) * 4, layout_.y[level] + y);
   }
   bool is_depth() const { return desc_.format == Format::D32Float; }
   bool has_stencil() const { return desc_.stencil; }
@@ -113,36 +121,53 @@ class Gen9Image final : public IImage {
     d.height = desc_.extent.height;
     return d;
   }
+  // 0xAARRGGBB <-> the memory order B, G, R, A or R, G, B, A, at texel (x, y) of a level.
+  uint32_t load(uint32_t level, uint32_t x, uint32_t y) const {
+    const uint8_t* p = buffer_.cpu.subview(texel_offset(level, x, y), 4).data();
+    const uint32_t b0 = p[0], b1 = p[1], b2 = p[2], b3 = p[3];
+    return desc_.format == Format::R8G8B8A8Unorm ? (b3 << 24) | (b0 << 16) | (b1 << 8) | b2 : (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+  }
+  void store(uint32_t level, uint32_t x, uint32_t y, uint32_t argb) const {
+    const uint8_t a = static_cast<uint8_t>(argb >> 24), r = static_cast<uint8_t>(argb >> 16), g = static_cast<uint8_t>(argb >> 8), b = static_cast<uint8_t>(argb);
+    const uint8_t bytes[4] = {desc_.format == Format::R8G8B8A8Unorm ? r : b, g, desc_.format == Format::R8G8B8A8Unorm ? b : r, a};
+    buffer_.cpu.subview(texel_offset(level, x, y), 4).copy_from(ConstByteView(bytes, 4));
+  }
   bool read_pixels(ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
     if (is_depth() || buffer_.cpu.empty() || out.size() < count) return false;
-    for (uint32_t y = 0; y < desc_.extent.height; ++y) {
-      for (uint32_t x = 0; x < desc_.extent.width; ++x) {
-        const uint8_t* p = buffer_.cpu.subview(uint64_t{y} * pitch_ + uint64_t{x} * 4, 4).data();
-        const uint32_t b0 = p[0], b1 = p[1], b2 = p[2], b3 = p[3];
-        // 0xAARRGGBB from the memory order B, G, R, A or R, G, B, A.
-        out[uint64_t{y} * desc_.extent.width + x] = desc_.format == Format::R8G8B8A8Unorm ? (b3 << 24) | (b0 << 16) | (b1 << 8) | b2 : (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
-      }
-    }
+    for (uint32_t y = 0; y < desc_.extent.height; ++y)
+      for (uint32_t x = 0; x < desc_.extent.width; ++x) out[uint64_t{y} * desc_.extent.width + x] = load(0, x, y);
     return true;
   }
-  bool write_pixels(ArrayView<const uint32_t> pixels) override {
-    const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (is_depth() || buffer_.cpu.empty() || pixels.size() != count) return false;
-    for (uint32_t y = 0; y < desc_.extent.height; ++y) {
-      for (uint32_t x = 0; x < desc_.extent.width; ++x) {
-        const uint32_t argb = pixels[uint64_t{y} * desc_.extent.width + x];
-        const uint8_t a = static_cast<uint8_t>(argb >> 24), r = static_cast<uint8_t>(argb >> 16), g = static_cast<uint8_t>(argb >> 8), b = static_cast<uint8_t>(argb);
-        // The memory order B, G, R, A or R, G, B, A (the inverse of read_pixels).
-        const uint8_t bytes[4] = {desc_.format == Format::R8G8B8A8Unorm ? r : b, g, desc_.format == Format::R8G8B8A8Unorm ? b : r, a};
-        buffer_.cpu.subview(uint64_t{y} * pitch_ + uint64_t{x} * 4, 4).copy_from(ConstByteView(bytes, 4));
-      }
+  bool write_pixels(ArrayView<const uint32_t> pixels) override { return write_mip_pixels(0, pixels); }
+  bool write_mip_pixels(uint32_t level, ArrayView<const uint32_t> pixels) override {
+    if (is_depth() || buffer_.cpu.empty() || level >= desc_.mip_levels) return false;
+    const uint32_t w = layout_.w[level], h = layout_.h[level];
+    if (pixels.size() != uint64_t{w} * h) return false;
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) store(level, x, y, pixels[uint64_t{y} * w + x]);
+    return true;
+  }
+  bool generate_mipmaps() override {
+    if (is_depth() || buffer_.cpu.empty() || desc_.mip_levels < 2) return false;
+    for (uint32_t level = 1; level < desc_.mip_levels; ++level) {
+      const uint32_t sw = layout_.w[level - 1], sh = layout_.h[level - 1], dw = layout_.w[level], dh = layout_.h[level];
+      for (uint32_t y = 0; y < dh; ++y)
+        for (uint32_t x = 0; x < dw; ++x) {
+          const uint32_t y0 = 2 * y < sh ? 2 * y : sh - 1, y1 = 2 * y + 1 < sh ? 2 * y + 1 : sh - 1;
+          const uint32_t x0 = 2 * x < sw ? 2 * x : sw - 1, x1 = 2 * x + 1 < sw ? 2 * x + 1 : sw - 1;
+          const uint32_t block[4] = {load(level - 1, x0, y0), load(level - 1, x1, y0), load(level - 1, x0, y1), load(level - 1, x1, y1)};
+          uint32_t averaged = 0;
+          mip_box_downsample(ArrayView<const uint32_t>(block, 4), 2, 2, ArrayView<uint32_t>(&averaged, 1), 1, 1);
+          store(level, x, y, averaged);
+        }
     }
     return true;
   }
   GpuBuffer buffer_;
   uint32_t address_ = 0;
   uint32_t pitch_ = 0;
+  hardware::intel_gt::gen9_3d::MipLayout layout_;   // the levels and tiling of a colour image
   GpuBuffer stencil_buffer_memory_;   // the stencil plane (W-tiled, opaque), when the image has one
   uint32_t stencil_address_ = 0;
 
@@ -342,15 +367,24 @@ IImage* Gen9GraphicsDevice::create_image(const ImageDesc& desc) {
   if (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm) return nullptr;
   if (depth != ((desc.usage & kImageDepthAttachment) != 0) || (depth && (desc.usage & (kImageColorAttachment | kImagePresent)))) return nullptr;
   if (desc.stencil && !depth) return nullptr;   // (a stencil plane goes with a depth image)
+  // Levels: a sampled colour image and nothing else (a render target is drawn into level 0 only; the chain would have to stay out of the way).
+  if (desc.mip_levels == 0 || desc.mip_levels > kMaxMipLevels || desc.mip_levels > mip_level_limit(desc.extent)) return nullptr;
+  if (desc.mip_levels > 1 && (depth || desc.usage != kImageSampled)) return nullptr;
   Gen9Image* image = make<Gen9Image>(allocator_, desc);
   if (!image) return nullptr;
-  // A depth buffer is Y-tiled (rows of tiles of 128 bytes by 32 rows) and opaque to us; a colour image is linear.
-  image->pitch_ = depth ? DepthBuffer::pitch_for(w) : align_up(w * 4, kPitchAlignment);
-  const uint64_t bytes = depth ? DepthBuffer::bytes_for(w, h) : uint64_t{image->pitch_} * h;
+  // A depth buffer is Y-tiled (rows of tiles of 128 bytes by 32 rows) and opaque to us; a colour image is Y-tiled too, but the CPU addresses it (the memory controller does not
+  // swizzle bit 6 on Gen9), and may have a mip chain.
+  if (!depth && !hardware::intel_gt::gen9_3d::mip_layout(w, h, desc.mip_levels, /*tiled=*/true, &image->layout_)) {
+    destroy(allocator_, image);
+    return nullptr;
+  }
+  image->pitch_ = depth ? DepthBuffer::pitch_for(w) : image->layout_.pitch;
+  const uint64_t bytes = depth ? DepthBuffer::bytes_for(w, h) : image->layout_.bytes();
   if (!allocate_region(bytes, &image->buffer_, &image->address_)) {
     destroy(allocator_, image);
     return nullptr;
   }
+  if (!depth) image->buffer_.cpu.fill(0);   // (a new image is transparent black)
   if (depth) {
     // Nothing in front: 1.0 in every word, padding included.
     ArrayView<uint32_t> words;
@@ -417,6 +451,15 @@ bool Gen9GraphicsDevice::run_job(const DrawState& state, uint32_t vertices, cons
     sampler.linear = texture->sampler.filter == Filter::Linear;
     sampler.repeat_u = texture->sampler.address_u == AddressMode::Repeat;
     sampler.repeat_v = texture->sampler.address_v == AddressMode::Repeat;
+    // The mip filter, bias and bounds (an image with one level is read at level 0 whatever the sampler says; the bounds stay within the levels there are).
+    const uint32_t levels = texture->image->mip_levels();
+    if (levels > 1 && texture->sampler.mip_filter != MipFilter::None) {
+      const float top = static_cast<float>(levels - 1);
+      sampler.mip = texture->sampler.mip_filter == MipFilter::Nearest ? hardware::intel_gt::gen9_3d::MipMode::Nearest : hardware::intel_gt::gen9_3d::MipMode::Linear;
+      sampler.lod_bias = texture->sampler.lod_bias;
+      sampler.min_lod = texture->sampler.min_lod < top ? texture->sampler.min_lod : top;
+      sampler.max_lod = texture->sampler.max_lod < top ? texture->sampler.max_lod : top;
+    }
     if (!batch.textured_triangles(state, ArrayView<const Vertex>(staging_.data(), vertices), texture->image->surface(), sampler)) return false;
   } else if (!batch.triangles(state, ArrayView<const Vertex>(staging_.data(), vertices), true, nullptr)) {
     return false;
@@ -678,11 +721,17 @@ bool Gen9GraphicsDevice::submit(ICommandBuffer* commands) {
 bool Gen9GraphicsDevice::present(IImage* image) {
   Gen9Image* img = static_cast<Gen9Image*>(image);
   if (!img || !display_ || !(img->usage() & kImagePresent) || img->format() != Format::B8G8R8A8Unorm) return false;
-  ArrayView<uint32_t> pixels;
-  if (!img->buffer_.cpu.try_cast<uint32_t>(&pixels)) return false;
-  display_->blit(0, 0, img->extent().width, img->extent().height, pixels.data(), img->pitch_bytes() / 4);
-  display_->present();
-  return true;
+  // The image is tiled: its rows are gathered into a linear copy for the display.
+  const uint32_t w = img->extent().width, h = img->extent().height;
+  ArrayView<uint32_t> linear = allocate_view<uint32_t>(allocator_, uint64_t{w} * h);
+  if (linear.empty()) return false;
+  const bool read = img->read_pixels(linear);
+  if (read) {
+    display_->blit(0, 0, w, h, linear.data(), w);
+    display_->present();
+  }
+  release_view(allocator_, linear);
+  return read;
 }
 
 }  // namespace graphics

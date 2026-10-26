@@ -692,6 +692,175 @@ static void test_textures() {
   p.gpu->destroy_image(depth);
 }
 
+// --- Tiling and mipmaps ----------------------------------------------------------
+
+// A texture with mip levels, drawn on both devices: `levels[k]` are the pixels of level k (all of them written with write_mip_pixels), or with `generate` only level 0 is
+// written and generate_mipmaps() makes the rest.
+static bool draw_mipped(TexturedScene& ts, int i, uint32_t w, uint32_t h, const std::vector<std::vector<uint32_t>>& levels, bool generate, const SamplerDesc& sampler,
+                        const TexturedVertex* vertices, uint32_t count, const Mat4& mvp, std::vector<uint32_t>* out) {
+  IGraphicsDevice& device = *ts.devices[i];
+  IImage* texture = device.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageSampled, false, static_cast<uint32_t>(levels.size())});
+  IImage* target = device.create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  IBuffer* vb = device.create_buffer(count * sizeof(TexturedVertex) + 16, kBufferVertex);
+  bool ok = texture && target && vb && ts.pipeline[i];
+  if (ok && generate) {
+    ok = texture->write_pixels(ArrayView<const uint32_t>(levels[0].data(), levels[0].size())) && texture->generate_mipmaps();
+  } else if (ok) {
+    for (uint32_t k = 0; k < levels.size() && ok; ++k) ok = texture->write_mip_pixels(k, ArrayView<const uint32_t>(levels[k].data(), levels[k].size()));
+  }
+  if (ok) {
+    ByteView m = vb->map();
+    memcpy(m.data(), vertices, count * sizeof(TexturedVertex));
+    vb->unmap();
+    ICommandBuffer* cb = device.create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = target;
+    pass.clear_color_value = {0, 0, 0, 1};
+    cb->begin_render_pass(pass);
+    cb->bind_pipeline(ts.pipeline[i]);
+    cb->bind_vertex_buffer(vb);
+    cb->push_constants(&mvp, sizeof mvp);
+    cb->bind_texture(0, texture, sampler);
+    cb->draw(count);
+    cb->end_render_pass();
+    ok = cb->end() && device.submit(cb);
+    device.destroy_command_buffer(cb);
+    if (ok) *out = read(target);
+  }
+  if (texture) device.destroy_image(texture);
+  if (target) device.destroy_image(target);
+  if (vb) device.destroy_buffer(vb);
+  return ok;
+}
+
+static void compare_mipped(Pair& p, TexturedScene& ts, uint32_t w, uint32_t h, const std::vector<std::vector<uint32_t>>& levels, bool generate, const SamplerDesc& sampler,
+                           const TexturedVertex* vertices, uint32_t count, const Mat4& mvp, uint32_t tolerance, uint32_t allowed_bad, const char* what) {
+  std::vector<uint32_t> gpu_picture, soft_picture;
+  const int jobs = p.rig.gpu.jobs;
+  CHECK(draw_mipped(ts, 0, w, h, levels, generate, sampler, vertices, count, mvp, &gpu_picture));
+  CHECK(draw_mipped(ts, 1, w, h, levels, generate, sampler, vertices, count, mvp, &soft_picture));
+  CHECK(p.rig.gpu.jobs > jobs && p.rig.gpu.violations.empty());
+  const uint32_t bad = differing(gpu_picture, soft_picture, tolerance);
+  if (bad > allowed_bad) printf("  mipmapped scene \"%s\": %u pixels differ\n", what, bad);
+  CHECK(bad <= allowed_bad);
+}
+
+static uint32_t mip_color(uint32_t level) { return 0xFF000000u | ((20 + level * 30) << 16) | ((200 - level * 20) << 8) | 0x40; }
+
+static void test_tiling_and_mipmaps() {
+  Pair p;
+  CHECK(p.gpu);
+  if (!p.gpu) return;
+  TexturedScene ts(p);
+  const Mat4 id = Mat4::identity();
+  TexturedVertex v[6];
+
+  // Solid levels: which level a lookup read shows in the colour. 64 x 64, 7 levels. A quad whose coordinates run 0..n over the 64 pixels minifies n times.
+  std::vector<std::vector<uint32_t>> solid;
+  for (uint32_t k = 0; k < 7; ++k) solid.push_back(std::vector<uint32_t>(uint64_t{mip_extent(64, k)} * mip_extent(64, k), mip_color(k)));
+  SamplerDesc nearest_mips, linear_mips, none;
+  nearest_mips.mip_filter = MipFilter::Nearest;
+  linear_mips.mip_filter = MipFilter::Linear;
+  for (float n : {1.0f, 2.0f, 3.0f, 4.0f, 8.0f, 100.0f}) {
+    quad(v, 0, 0, n, n);
+    compare_mipped(p, ts, 64, 64, solid, false, nearest_mips, v, 6, id, 2, 100, "nearest mip");
+    compare_mipped(p, ts, 64, 64, solid, false, linear_mips, v, 6, id, 3, 100, "linear mip");
+  }
+  quad(v, 0, 0, 4, 4);
+  compare_mipped(p, ts, 64, 64, solid, false, none, v, 6, id, 0, 100, "no mip filter: level 0");
+  // Bias and the bounds of the level of detail.
+  SamplerDesc biased = linear_mips, capped = nearest_mips, floored = nearest_mips;
+  biased.lod_bias = 1.0f;
+  capped.max_lod = 1.0f;
+  floored.min_lod = 2.0f;
+  quad(v, 0, 0, 2, 2);
+  compare_mipped(p, ts, 64, 64, solid, false, biased, v, 6, id, 3, 100, "bias");
+  quad(v, 0, 0, 8, 8);
+  compare_mipped(p, ts, 64, 64, solid, false, capped, v, 6, id, 2, 100, "max lod");
+  quad(v, 0, 0, 1, 1);
+  compare_mipped(p, ts, 64, 64, solid, false, floored, v, 6, id, 2, 100, "min lod");
+  // Magnified: level 0, filtered as asked.
+  quad(v, 0, 0, 0.25f, 0.25f);
+  compare_mipped(p, ts, 64, 64, solid, false, linear_mips, v, 6, id, 2, 100, "magnified");
+
+  // A generated chain from a picture with structure: a gradient and a pattern, 32 x 32 down to 1 x 1.
+  std::vector<std::vector<uint32_t>> base(1, std::vector<uint32_t>(32 * 32));
+  for (uint32_t y = 0; y < 32; ++y)
+    for (uint32_t x = 0; x < 32; ++x) base[0][y * 32 + x] = 0xFF000000u | ((x * 8) << 16) | ((y * 8) << 8) | (((x ^ y) & 4) ? 0xC0u : 0x30u);
+  base.resize(6);   // (the other levels are made by generate_mipmaps; the vectors only count them)
+  for (float n : {1.0f, 2.0f, 3.5f, 6.0f}) {
+    quad(v, 0, 0, n, n);
+    SamplerDesc smooth = linear_mips;
+    smooth.filter = Filter::Linear;
+    smooth.address_u = smooth.address_v = AddressMode::Repeat;
+    compare_mipped(p, ts, 32, 32, base, true, smooth, v, 6, id, 6, 160, "generated chain, trilinear");
+    SamplerDesc hard = nearest_mips;
+    hard.address_u = hard.address_v = AddressMode::Repeat;
+    compare_mipped(p, ts, 32, 32, base, true, hard, v, 6, id, 3, 160, "generated chain, nearest");
+  }
+  // Sizes that are not powers of two (20 x 12: 20 x 12, 10 x 6, 5 x 3, 2 x 1, 1 x 1), every level written by hand.
+  {
+    std::vector<std::vector<uint32_t>> odd;
+    for (uint32_t k = 0; k < 5; ++k) odd.push_back(std::vector<uint32_t>(uint64_t{mip_extent(20, k)} * mip_extent(12, k), mip_color(k)));
+    for (float n : {1.0f, 2.0f, 4.0f}) {
+      quad(v, 0, 0, n, n);
+      SamplerDesc clamp = nearest_mips;
+      clamp.address_u = clamp.address_v = AddressMode::ClampToEdge;
+      compare_mipped(p, ts, 20, 12, odd, false, clamp, v, 6, id, 2, 200, "odd sizes");
+    }
+  }
+  // Perspective: a floor receding from the viewer, the level of detail growing with the distance.
+  {
+    const TexturedVertex tilted[6] = {{{-1, -1, 0}, {0, 0}}, {{-1, 1, 0}, {0, 16}}, {{1, 1, 0}, {16, 16}}, {{-1, -1, 0}, {0, 0}}, {{1, 1, 0}, {16, 16}}, {{1, -1, 0}, {16, 0}}};
+    Mat4 persp = Mat4::identity();
+    persp.m[7] = 0.9f;    // w depends on y: rows farther up are farther away
+    persp.m[15] = 1.2f;
+    compare_mipped(p, ts, 64, 64, solid, false, linear_mips, tilted, 6, persp, 10, 700, "perspective floor, trilinear");
+  }
+
+  // What is refused: a mip chain on a render target, a depth image or a present image; more levels than the size has; none.
+  CHECK(!p.gpu->create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled, false, 2}));
+  CHECK(!p.gpu->create_image({{64, 64}, Format::B8G8R8A8Unorm, kImagePresent | kImageSampled, false, 2}));
+  CHECK(!p.gpu->create_image({{64, 64}, Format::D32Float, kImageDepthAttachment, false, 2}));
+  CHECK(!p.gpu->create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageSampled, false, 8}) && !p.gpu->create_image({{64, 64}, Format::B8G8R8A8Unorm, kImageSampled, false, 0}));
+  CHECK(!p.gpu->create_image({{4096, 8}, Format::B8G8R8A8Unorm, kImageSampled, false, 14}));
+  // Writing: the level has to exist and the pixels to be the level's count; level 0 is write_pixels; an image with one level cannot generate.
+  IImage* image = p.gpu->create_image({{20, 12}, Format::B8G8R8A8Unorm, kImageSampled, false, 5});
+  CHECK(image && image->mip_levels() == 5);
+  if (image) {
+    std::vector<uint32_t> level(20 * 12, 0xFF123456u);
+    CHECK(image->write_mip_pixels(0, ArrayView<const uint32_t>(level.data(), 240)) && image->write_pixels(ArrayView<const uint32_t>(level.data(), 240)));
+    CHECK(!image->write_mip_pixels(5, ArrayView<const uint32_t>(level.data(), 1)) && !image->write_mip_pixels(1, ArrayView<const uint32_t>(level.data(), 61)) && image->write_mip_pixels(1, ArrayView<const uint32_t>(level.data(), 60)));
+    CHECK(!image->write_mip_pixels(4, ArrayView<const uint32_t>(level.data(), 2)) && image->write_mip_pixels(4, ArrayView<const uint32_t>(level.data(), 1)));
+    std::vector<uint32_t> back(240);
+    CHECK(image->read_pixels(ArrayView<uint32_t>(back.data(), 240)) && back[0] == 0xFF123456u && back[239] == 0xFF123456u);   // (level 0 reads back through the tiling)
+    p.gpu->destroy_image(image);
+  }
+  IImage* single = p.gpu->create_image({{8, 8}, Format::B8G8R8A8Unorm, kImageSampled});
+  CHECK(single && !single->generate_mipmaps());
+  if (single) p.gpu->destroy_image(single);
+  // Memory: the chain's memory comes back, and so does a plain image's.
+  const int before = p.rig.mem.live();
+  IImage* big = p.gpu->create_image({{256, 256}, Format::B8G8R8A8Unorm, kImageSampled, false, 9});
+  IImage* plain = p.gpu->create_image({{33, 17}, Format::R8G8B8A8Unorm, kImageColorAttachment});
+  CHECK(big && plain && p.rig.mem.live() > before);
+  p.gpu->destroy_image(big);
+  p.gpu->destroy_image(plain);
+  CHECK(p.rig.mem.live() == before && p.rig.gpu.violations.empty());
+  // Every texel of a tiled image is where the tiling says: a picture written is the picture read back, whatever the size (single tiles, partial tiles, odd widths).
+  for (uint32_t w : {1u, 5u, 31u, 32u, 33u, 100u, 130u})
+    for (uint32_t h : {1u, 3u, 31u, 32u, 33u, 70u}) {
+      IImage* im = p.gpu->create_image({{w, h}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+      CHECK(im);
+      if (!im) continue;
+      std::vector<uint32_t> in(uint64_t{w} * h), out(uint64_t{w} * h);
+      for (uint32_t i = 0; i < in.size(); ++i) in[i] = 0xFF000000u | (i * 2654435761u >> 8);
+      CHECK(im->write_pixels(ArrayView<const uint32_t>(in.data(), in.size())) && im->read_pixels(ArrayView<uint32_t>(out.data(), out.size())) && in == out);
+      p.gpu->destroy_image(im);
+    }
+}
+
 // --- Stencil --------------------------------------------------------------------
 
 struct StencilItem {
@@ -896,6 +1065,7 @@ int main() {
   test_resources();
   test_scenes();
   test_textures();
+  test_tiling_and_mipmaps();
   test_stencil();
   test_present_and_failures();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
