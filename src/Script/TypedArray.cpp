@@ -162,10 +162,21 @@ JsString* cell_of(JsObject* o) { return static_cast<JsString*>(o->host_data); }
 ArrayKind kind_of(JsObject* o) { return static_cast<ArrayKind>(static_cast<uint32_t>(o->bound_this.u.number)); }
 
 // The length of a view, 0 once the bytes it covered were detached.
+// A view that tracks the length of a resizable buffer (made without a length) has `capacity` 1; any other has the length it was made with, and is out of bounds
+// (length 0) once the buffer is shrunk below its end.
+bool tracks_length(const JsObject* o) { return o->capacity == 1; }
+
 uint32_t live_length(JsObject* o) {
+  const uint64_t total = cell_of(o)->length;
+  if (tracks_length(o)) return o->position <= total ? static_cast<uint32_t>((total - o->position) / size_of(kind_of(o))) : 0;
   const uint64_t need = uint64_t{o->position} + uint64_t{o->length} * size_of(kind_of(o));
-  return cell_of(o)->length >= need ? o->length : 0;
+  return total >= need ? o->length : 0;
 }
+
+// An ArrayBuffer made resizable keeps its largest size + 1 in `position` (0: fixed length); a detached one has `capacity` 1.
+bool buffer_resizable(const JsObject* b) { return b->position != 0; }
+uint64_t buffer_max(const JsObject* b) { return b->position - 1; }
+bool buffer_detached(const JsObject* b) { return b->capacity == 1; }
 
 bool parse_index(StringView k, uint32_t* out) {
   if (k.empty() || k.size() > 10) return false;
@@ -183,8 +194,21 @@ uint8_t* data_of(JsString* cell) { return chars_as_bytes(cell->data()); }
 
 bool buffer_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   (void)vm;
-  if (key->view().equals("byteLength")) {
+  const StringView k = key->view();
+  if (k.equals("byteLength")) {
     *out = num_value(cell_of(o)->length);
+    return true;
+  }
+  if (k.equals("resizable")) {
+    *out = Value::make_bool(buffer_resizable(o));
+    return true;
+  }
+  if (k.equals("maxByteLength")) {
+    *out = num_value(buffer_detached(o) ? 0 : buffer_resizable(o) ? static_cast<double>(buffer_max(o)) : static_cast<double>(cell_of(o)->length));
+    return true;
+  }
+  if (k.equals("detached")) {
+    *out = Value::make_bool(buffer_detached(o));
     return true;
   }
   return false;
@@ -196,7 +220,7 @@ bool typed_hook_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   const StringView k = key->view();
   uint32_t i;
   if (parse_index(k, &i)) {
-    if (i < o->length) typed_array_get_value(vm, o, i, out);
+    if (i < live_length(o)) typed_array_get_value(vm, o, i, out);
     else *out = Value();
     return true;
   }
@@ -230,7 +254,7 @@ HostClass::Set typed_hook_set(Vm& vm, JsObject* o, JsString* key, const Value& v
 }
 
 void typed_hook_keys(Vm& vm, JsObject* o, JsObject* keys) {
-  const uint32_t n = o->length < (1u << 20) ? o->length : (1u << 20);
+  const uint32_t n = live_length(o) < (1u << 20) ? live_length(o) : (1u << 20);
   for (uint32_t i = 0; i < n; ++i) {
     String s(vm.allocator());
     s.append_uint(i);
@@ -259,11 +283,12 @@ JsObject* new_buffer_object(Vm& vm, JsString* cell) {
 }
 
 // A typed array of `kind` over (part of) a buffer.
-JsObject* new_view(Vm& vm, ArrayKind kind, JsObject* buffer, uint32_t byte_offset, uint32_t length) {
+JsObject* new_view(Vm& vm, ArrayKind kind, JsObject* buffer, uint32_t byte_offset, uint32_t length, bool tracking = false) {
   JsObject* o = vm.new_host_object(proto_for(vm, kind), &kTypedClass, cell_of(buffer));
   o->okind = ObjKind::TypedArray;
   o->position = byte_offset;
   o->length = length;
+  o->capacity = tracking ? 1 : 0;
   o->bound_this = num_value(static_cast<double>(static_cast<uint32_t>(kind)));
   vm.define_named(o, "buffer", Value::make_object(buffer), 0);
   return o;
@@ -302,6 +327,10 @@ bool construct(Vm& vm, ArrayKind kind, const Value* args, uint32_t argc, Value* 
       return vm.throw_error(ErrorKind::RangeError, m.view());
     }
     uint64_t length;
+    if (count < 0 && buffer_resizable(buffer)) {   // a view of a resizable buffer without a length follows the buffer
+      *result = Value::make_object(new_view(vm, kind, buffer, static_cast<uint32_t>(off), static_cast<uint32_t>((total - off) / size), true));
+      return true;
+    }
     if (count < 0) {
       if ((total - off) % size != 0) {
         String m(vm.allocator());
@@ -338,7 +367,7 @@ bool construct(Vm& vm, ArrayKind kind, const Value* args, uint32_t argc, Value* 
         if (!(n >= 0)) n = 0;
       }
     } else {
-      n = source->length;
+      n = live_length(source);
     }
     if (n * size > static_cast<double>(kMaxBytes)) return vm.throw_error(ErrorKind::RangeError, "Invalid typed array length");
     JsObject* buffer = new_buffer_object(vm, new_zeroed_cell(vm, static_cast<uint64_t>(n) * size));
@@ -382,15 +411,94 @@ TYPED_CONSTRUCTOR(ctor_bigint64, BigInt64)
 TYPED_CONSTRUCTOR(ctor_biguint64, BigUint64)
 #undef TYPED_CONSTRUCTOR
 
+// The bytes of a resizable buffer are allocated for its largest size; the length of the cell is the current one (and resizing changes it in place).
+JsObject* new_resizable_buffer(Vm& vm, uint64_t length, uint64_t max) {
+  JsString* cell = new_zeroed_cell(vm, max);
+  if (max != 0) cell->length = static_cast<uint32_t>(length);
+  JsObject* b = new_buffer_object(vm, cell);
+  b->position = static_cast<uint32_t>(max + 1);
+  return b;
+}
+
+NATIVE(typed_array_abstract) {
+  (void)self; (void)args; (void)argc; (void)result;
+  return vm.throw_error(ErrorKind::TypeError, "Abstract class TypedArray not directly constructable");
+}
+
 NATIVE(array_buffer_constructor) {
   (void)self;
   double n = 0;
   if (argc > 0 && !args[0].is_undefined() && !vm.to_number(args[0], &n)) return false;
   if (n != n) n = 0;
   if (!(n >= 0) || n > static_cast<double>(kMaxBytes)) return vm.throw_error(ErrorKind::RangeError, "Array buffer allocation failed");
-  *result = Value::make_object(new_buffer_object(vm, new_zeroed_cell(vm, static_cast<uint64_t>(n))));
+  bool resizable = false;
+  double max = 0;
+  if (argc > 1 && args[1].is_object()) {   // new ArrayBuffer(length, { maxByteLength })
+    Value m;
+    if (!vm.get_named(args[1], "maxByteLength", &m)) return false;
+    if (!m.is_undefined()) {
+      if (!vm.to_number(m, &max)) return false;
+      if (max != max) max = 0;
+      if (!(max >= 0) || max > static_cast<double>(kMaxBytes)) return vm.throw_error(ErrorKind::RangeError, "Invalid array buffer max length");
+      if (n > max) return vm.throw_error(ErrorKind::RangeError, "Invalid array buffer max length");
+      resizable = true;
+    }
+  }
+  if (!resizable) {
+    *result = Value::make_object(new_buffer_object(vm, new_zeroed_cell(vm, static_cast<uint64_t>(n))));
+    return true;
+  }
+  *result = Value::make_object(new_resizable_buffer(vm, static_cast<uint64_t>(n), static_cast<uint64_t>(max)));
   return true;
 }
+
+NATIVE(array_buffer_resize) {
+  if (!is_buffer(self) || !buffer_resizable(self.as_object())) return vm.throw_error(ErrorKind::TypeError, "Method ArrayBuffer.prototype.resize called on incompatible receiver #<ArrayBuffer>");
+  JsObject* b = self.as_object();
+  if (buffer_detached(b)) return vm.throw_error(ErrorKind::TypeError, "Cannot perform ArrayBuffer.prototype.resize on a detached ArrayBuffer");
+  double n = 0;
+  if (argc > 0 && !vm.to_number(args[0], &n)) return false;
+  if (n != n) n = 0;
+  if (!(n >= 0) || n > static_cast<double>(buffer_max(b))) return vm.throw_error(ErrorKind::RangeError, "ArrayBuffer.prototype.resize: Invalid length parameter");
+  JsString* cell = cell_of(b);
+  const uint32_t from = cell->length, to = static_cast<uint32_t>(n);
+  if (to < from) {   // (what is cut off is gone: growing again gives zeros)
+    uint8_t* d = data_of(cell);
+    for (uint32_t i = to; i < from; ++i) d[i] = 0;
+  }
+  cell->length = to;
+  *result = Value();
+  return true;
+}
+
+// buffer.transfer(newLength) and transferToFixedLength(newLength): the bytes move to a new buffer and this one is detached.
+bool transfer_buffer(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result, bool fixed) {
+  if (!is_buffer(self)) return vm.throw_error(ErrorKind::TypeError, "Method ArrayBuffer.prototype.transfer called on incompatible receiver");
+  JsObject* b = self.as_object();
+  if (b->length == 1) return vm.throw_error(ErrorKind::TypeError, "Cannot perform ArrayBuffer.prototype.transfer on a WebAssembly.Memory buffer");
+  if (buffer_detached(b)) return vm.throw_error(ErrorKind::TypeError, "Cannot perform ArrayBuffer.prototype.transfer on a detached ArrayBuffer");
+  JsString* cell = cell_of(b);
+  double n = cell->length;
+  if (argc > 0 && !args[0].is_undefined()) {
+    if (!vm.to_number(args[0], &n)) return false;
+    if (n != n) n = 0;
+    if (!(n >= 0) || n > static_cast<double>(kMaxBytes)) return vm.throw_error(ErrorKind::RangeError, "Invalid array buffer length");
+  }
+  const bool keep_resizable = buffer_resizable(b) && !fixed;
+  if (keep_resizable && n > static_cast<double>(buffer_max(b))) return vm.throw_error(ErrorKind::RangeError, "Invalid array buffer length");
+  const uint64_t length = static_cast<uint64_t>(n);
+  JsObject* fresh = keep_resizable ? new_resizable_buffer(vm, length, buffer_max(b)) : new_buffer_object(vm, new_zeroed_cell(vm, length));
+  const uint64_t copy = length < cell->length ? length : cell->length;
+  uint8_t* to = data_of(cell_of(fresh));
+  const uint8_t* from = data_of(cell);
+  for (uint64_t i = 0; i < copy; ++i) to[i] = from[i];
+  cell->length = 0;   // (detached: every view of it is now empty)
+  b->capacity = 1;
+  *result = Value::make_object(fresh);
+  return true;
+}
+NATIVE(array_buffer_transfer) { return transfer_buffer(vm, self, args, argc, result, false); }
+NATIVE(array_buffer_transfer_fixed) { return transfer_buffer(vm, self, args, argc, result, true); }
 
 NATIVE(array_buffer_is_view) {
   (void)vm;
@@ -443,13 +551,13 @@ NATIVE(typed_set) {
   if (!(offset >= 0)) return vm.throw_error(ErrorKind::RangeError, "offset is out of bounds");
   double n = 0;
   if (is_typed_array(source)) {
-    n = source.as_object()->length;
+    n = live_length(source.as_object());
   } else {
     Value len;
     if (!vm.get(source, vm.length_name(), &len) || !vm.to_number(len, &n)) return false;
     if (!(n >= 0)) n = 0;
   }
-  if (offset + n > o->length) return vm.throw_error(ErrorKind::RangeError, "offset is out of bounds");
+  if (offset + n > live_length(o)) return vm.throw_error(ErrorKind::RangeError, "offset is out of bounds");
   const uint32_t start = static_cast<uint32_t>(offset), count = static_cast<uint32_t>(n);
   if (is_typed_array(source)) {   // (the source may overlap: it is read first)
     List<Value> values(vm.allocator());
@@ -494,7 +602,7 @@ NATIVE(typed_subarray) {
   if (!typed_self(vm, self, &o)) return false;
   uint32_t from, to;
   bool ok;
-  clamp_range(args, argc, vm, o->length, &from, &to, &ok);
+  clamp_range(args, argc, vm, live_length(o), &from, &to, &ok);
   if (!ok) return false;
   Value buffer;
   vm.get_plain(o, vm.intern("buffer"), &buffer);
@@ -508,7 +616,7 @@ NATIVE(typed_slice) {
   if (!typed_self(vm, self, &o)) return false;
   uint32_t from, to;
   bool ok;
-  clamp_range(args, argc, vm, o->length, &from, &to, &ok);
+  clamp_range(args, argc, vm, live_length(o), &from, &to, &ok);
   if (!ok) return false;
   const uint32_t size = size_of(kind_of(o));
   JsString* copy = vm.new_string(bytes_as_text(ConstByteView(element_ptr(o, from), static_cast<uint64_t>(to - from) * size)));
@@ -522,7 +630,7 @@ NATIVE(typed_fill) {
   if (!typed_self(vm, self, &o)) return false;
   uint32_t from, to;
   bool ok;
-  clamp_range(argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0, vm, o->length, &from, &to, &ok);
+  clamp_range(argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0, vm, live_length(o), &from, &to, &ok);
   if (!ok) return false;
   for (uint32_t i = from; i < to; ++i)
     if (!store_value(vm, kind_of(o), element_ptr(o, i), argc > 0 ? args[0] : Value())) return false;
@@ -613,7 +721,7 @@ bool typed_array_bytes(const Value& v, ArrayView<uint8_t>* bytes) {
   if (!v.is_object()) return false;
   JsObject* o = v.as_object();
   if (o->okind == ObjKind::TypedArray) {
-    *bytes = ArrayView<uint8_t>(element_ptr(o, 0), static_cast<uint64_t>(o->length) * size_of(kind_of(o)));
+    *bytes = ArrayView<uint8_t>(element_ptr(o, 0), static_cast<uint64_t>(live_length(o)) * size_of(kind_of(o)));
     return true;
   }
   if (o->host == &kBufferClass) {
@@ -623,14 +731,21 @@ bool typed_array_bytes(const Value& v, ArrayView<uint8_t>* bytes) {
   return false;
 }
 
-JsObject* new_array_buffer(Vm& vm, JsString* cell) { return new_buffer_object(vm, cell); }
+// (the buffer of a WebAssembly memory: only the memory can detach it, so transfer() refuses; `length` 1 says so)
+JsObject* new_array_buffer(Vm& vm, JsString* cell) {
+  JsObject* b = new_buffer_object(vm, cell);
+  b->length = 1;
+  return b;
+}
 
 void detach_array_buffer(JsObject* buffer) {
-  if (is_buffer(Value::make_object(buffer))) cell_of(buffer)->length = 0;
+  if (!is_buffer(Value::make_object(buffer))) return;
+  cell_of(buffer)->length = 0;
+  buffer->capacity = 1;
 }
 
 bool typed_array_get(JsObject* array, uint32_t index, Value* out) {
-  if (index >= array->length || live_length(array) == 0) {
+  if (index >= live_length(array)) {
     *out = Value();
     return false;
   }
@@ -640,7 +755,7 @@ bool typed_array_get(JsObject* array, uint32_t index, Value* out) {
 }
 
 bool typed_array_get_value(Vm& vm, JsObject* array, uint32_t index, Value* out) {
-  if (index >= array->length || live_length(array) == 0) {
+  if (index >= live_length(array)) {
     *out = Value();
     return true;
   }
@@ -693,6 +808,9 @@ bool install_typed_arrays(Vm& vm) {
   // ArrayBuffer
   JsObject* buffer_proto = vm.new_plain();
   vm.define_native(buffer_proto, "slice", array_buffer_slice, 2);
+  vm.define_native(buffer_proto, "resize", array_buffer_resize, 1);
+  vm.define_native(buffer_proto, "transfer", array_buffer_transfer, 0);
+  vm.define_native(buffer_proto, "transferToFixedLength", array_buffer_transfer_fixed, 0);
   JsObject* buffer_ctor = vm.new_native(array_buffer_constructor, "ArrayBuffer", 1);
   vm.define(buffer_ctor, vm.prototype_name(), Value::make_object(buffer_proto), 0);
   vm.define(buffer_proto, vm.intern("constructor"), Value::make_object(buffer_ctor), kWritable);
@@ -706,6 +824,9 @@ bool install_typed_arrays(Vm& vm) {
   vm.define_native(shared, "slice", typed_slice, 2);
   vm.define_native(shared, "fill", typed_fill, 1);
   vm.define_named(g, "__typed_array_proto", Value::make_object(shared), 0);
+  JsObject* abstract_ctor = vm.new_native(typed_array_abstract, "TypedArray", 0);   // %TypedArray%: what every typed array constructor inherits from
+  vm.define(abstract_ctor, vm.prototype_name(), Value::make_object(shared), 0);
+  vm.define(shared, vm.intern("constructor"), Value::make_object(abstract_ctor), kWritable);
   JsObject* protos = vm.new_plain();
   vm.define_named(g, "__typed_protos", Value::make_object(protos), 0);
   static const NativeFn kConstructors[] = {ctor_int8, ctor_uint8, ctor_uint8_clamped, ctor_int16, ctor_uint16, ctor_int32, ctor_uint32, ctor_float32, ctor_float64, ctor_bigint64, ctor_biguint64};
@@ -714,6 +835,7 @@ bool install_typed_arrays(Vm& vm) {
     JsObject* ctor = vm.new_native(kConstructors[k], kNames[k], 3);
     vm.define(ctor, vm.prototype_name(), Value::make_object(proto), 0);
     vm.define(proto, vm.intern("constructor"), Value::make_object(ctor), kWritable);
+    ctor->proto = abstract_ctor;
     vm.define_named(ctor, "BYTES_PER_ELEMENT", num_value(kSizes[k]), 0);
     vm.define_named(proto, "BYTES_PER_ELEMENT", num_value(kSizes[k]), 0);
     vm.define_named(g, kNames[k], Value::make_object(ctor), kWritable);
