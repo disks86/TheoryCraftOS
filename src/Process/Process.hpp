@@ -94,6 +94,7 @@ class Process {
   static constexpr uint32_t kMaxDescriptors = ProcessFiles::kMaxDescriptors;
 
   Process(uint64_t id, const ProcessBinding& binding, IUserMemory& memory, IProcessHost& host);
+  ~Process();
   Process(const Process&) = delete;
   Process& operator=(const Process&) = delete;
 
@@ -176,8 +177,6 @@ class Process {
   void block_sleep(uint64_t ns);
   void block_yield();
   bool block_read_console(ByteView out, uint64_t* got);
-  // With the lock held: waits for a change in the process (a thread ended, ...) for at most `timeout_ns`. False on timeout, or when the process was told to stop.
-  bool wait_for_change(uint64_t timeout_ns);
 
   // The process's files and descriptors. Without a file system attached only the console descriptors work.
   ProcessFiles& files() { return files_; }
@@ -186,7 +185,8 @@ class Process {
     files_.attach(allocator, fs, binding_.abi == SyscallAbi::Windows ? StringView("/Windows") : StringView("/Linux"));
   }
   DescriptorKind descriptor(uint64_t slot) const { return files_.kind(slot); }
-  bool close_descriptor(uint64_t slot) { return files_.close(slot); }
+  // Closes a descriptor; a handle to a synchronization object lets go of the object.
+  bool close_descriptor(uint64_t slot);
 
  private:
   uint64_t id_;

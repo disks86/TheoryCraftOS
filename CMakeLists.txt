@@ -562,6 +562,8 @@ add_executable(BOOTX64
   src/Process/WindowsStartup.cpp
   src/Process/WindowsException.cpp
   src/Process/WindowsThreads.cpp
+  src/Process/WindowsObjects.cpp
+  src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
@@ -703,8 +705,12 @@ target_compile_options(BOOTX64 PRIVATE
 target_compile_options(BOOTX64 PRIVATE -fno-omit-frame-pointer)
 
 option(TCOS_USERMODE_DEMO "Run two small programs in ring 3 at boot (x86-64)" OFF)
+option(TCOS_USERMODE_DEMO_PAIR "With TCOS_USERMODE_DEMO_PROGRAM: also run it twice at the same time, as \"server\" and \"client\"" OFF)
 if(TCOS_USERMODE_DEMO)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO)
+endif()
+if(TCOS_USERMODE_DEMO_PAIR)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO_PAIR)
 endif()
 # ntdll.dll and kernel32.dll for Windows programs (src/Windows): freestanding DLLs built with the same mingw compiler, carried in the image (.incbin) and mapped into
 # each Windows process by the kernel. kernel32.dll is linked against ntdll's import library, as a real one would be.

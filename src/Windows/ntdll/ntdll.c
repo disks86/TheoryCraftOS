@@ -42,6 +42,19 @@ NT_SERVICE(NtTerminateThread);
 NT_SERVICE(NtWaitForSingleObject);
 NT_SERVICE(NtResumeThread);
 NT_SERVICE(NtQueryInformationThread);
+NT_SERVICE(NtCreateEvent);
+NT_SERVICE(NtOpenEvent);
+NT_SERVICE(NtSetEvent);
+NT_SERVICE(NtResetEvent);
+NT_SERVICE(NtPulseEvent);
+NT_SERVICE(NtCreateMutant);
+NT_SERVICE(NtOpenMutant);
+NT_SERVICE(NtReleaseMutant);
+NT_SERVICE(NtCreateSemaphore);
+NT_SERVICE(NtOpenSemaphore);
+NT_SERVICE(NtReleaseSemaphore);
+NT_SERVICE(NtWaitForMultipleObjects);
+NT_SERVICE(NtDuplicateObject);
 NT_SERVICE(NtClose);
 NT_SERVICE(NtTerminateProcess);
 NT_SERVICE(NtYieldExecution);
@@ -182,6 +195,11 @@ EXPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS status) {
     case 0xC0000033u: return ERROR_INVALID_NAME;
     case 0xC0000034u: return ERROR_FILE_NOT_FOUND;
     case 0xC0000035u: return ERROR_ALREADY_EXISTS;
+    case 0xC0000024u: return ERROR_INVALID_HANDLE;      /* the wrong type of object */
+    case 0xC0000046u: return 288;                       /* ERROR_NOT_OWNER */
+    case 0xC0000047u: return 298;                       /* ERROR_TOO_MANY_POSTS */
+    case 0xC000009Au: return ERROR_NOT_ENOUGH_MEMORY;
+    case 0xC0000106u: return 206;                       /* ERROR_FILENAME_EXCED_RANGE */
     case 0xC000003Au: return ERROR_PATH_NOT_FOUND;
     case 0xC0000043u: return ERROR_SHARING_VIOLATION;
     case 0xC000007Fu: return ERROR_DISK_FULL;

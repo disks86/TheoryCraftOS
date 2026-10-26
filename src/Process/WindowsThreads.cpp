@@ -18,6 +18,7 @@
 #include "Process/WindowsThreads.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/Objects.hpp"
 #include "Process/WindowsStartup.hpp"
 
 namespace process::windowsabi {
@@ -118,9 +119,11 @@ uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r) {
     p.address_space()->unmap(record->region_base, record->region_size);
     record->region_size = 0;
   }
+  if (ObjectManager* objects = system_objects()) objects->abandon_thread(record->id);      // the mutexes it owned are abandoned
   if (p.live_threads() == 0) p.terminate(code);      // the last thread ends the process
   p.request_thread_exit(code);
   if (p.runtime()) p.runtime()->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();      // whoever waits for the thread looks again
   return kSuccess;
 }
 
@@ -156,42 +159,6 @@ uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
   if (!p.write_user(r.args[2], ConstByteView(out, 48))) return kAccessViolation;
   if (returned != 0 && !put32(p, returned, 48)) return kAccessViolation;
   return kSuccess;
-}
-
-// NtWaitForSingleObject(HANDLE, BOOLEAN Alertable, PLARGE_INTEGER Timeout): Timeout null = forever, negative = relative (100 ns units), positive = absolute system time.
-uint32_t nt_wait_for_single_object(Process& p, const SyscallRequest& r) {
-  if (r.args[0] % 4 != 0 || r.args[0] == 0) return kInvalidHandle;
-  const uint64_t slot = r.args[0] / 4 - 1;
-  if (slot >= Process::kMaxDescriptors || p.files().kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
-  if (p.files().kind(slot) != DescriptorKind::Thread) return kObjectTypeMismatch;
-  uint64_t raw = 0, timeout_ns = ~uint64_t{0};
-  if (r.args[2] != 0) {
-    if (!p.read_user_u64(r.args[2], &raw)) return kAccessViolation;
-    if (int64_t(raw) < 0) {
-      const uint64_t units = uint64_t(0) - raw;
-      timeout_ns = units > ~uint64_t{0} / 100 ? ~uint64_t{0} : units * 100;
-    } else {
-      constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
-      const uint64_t now = p.host().realtime_ns() / 100 + kUnixToNt;
-      timeout_ns = raw > now ? (raw - now) * 100 : 0;
-    }
-  }
-  const uint64_t started = p.host().monotonic_ns();
-  for (;;) {
-    Process::ThreadRecord* record = p.find_thread(p.files().token(slot));
-    if (!record || record->finished) return kSuccess;
-    uint64_t left = timeout_ns;
-    if (timeout_ns != ~uint64_t{0}) {
-      const uint64_t used = p.host().monotonic_ns() - started;
-      if (used >= timeout_ns) return kTimeout;
-      left = timeout_ns - used;
-    }
-    if (!p.wait_for_change(left)) {
-      if (p.exited() || (p.runtime() && p.runtime()->interrupted())) return kAlerted;
-      Process::ThreadRecord* again = p.find_thread(p.files().token(slot));
-      return !again || again->finished ? kSuccess : kTimeout;
-    }
-  }
 }
 
 }  // namespace process::windowsabi

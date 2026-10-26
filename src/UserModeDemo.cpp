@@ -5564,6 +5564,55 @@ bool run_usermode_demo(allocators::IAllocator& allocator) {
       console::put_dec(static_cast<int64_t>(out->size()));
       console::puts(" bytes\n");
     }
+#ifdef TCOS_USERMODE_DEMO_PAIR
+    {
+      // The same program twice at the same time, as two processes: one is told "server", the other "client" (they find each other by the names of the objects they share).
+      struct Instance {
+        allocators::IAllocator* allocator;
+        filesystem::IFileSystem* files;
+        const char* path;
+        const char* role;
+        exe::ExecutableKind kind;
+        bool windows;
+        uint32_t code = 0;
+        desktop::RunResult result = desktop::RunResult::CouldNotRun;
+        kernel::Thread* thread = nullptr;
+        static void show(void*, StringView text) { console::puts(text); }
+        static void entry(void* argument) {
+          Instance* self = static_cast<Instance*>(argument);
+          desktop::ProgramHost host(*self->allocator);
+          host.close_input();
+          desktop::ProgramRun run;
+          run.allocator = self->allocator;
+          run.files = self->files;
+          run.path = self->path;
+          run.working_directory = self->windows ? "/Windows" : "/Linux";
+          const StringView arguments[] = {StringView(self->role)};
+          run.arguments = ArrayView<const StringView>(arguments, 1);
+          run.kind = self->kind;
+          run.output = &Instance::show;
+          run.host = &host;
+          String message(*self->allocator);
+          self->result = desktop::run_program(run, &self->code, &message);
+        }
+      };
+      Instance server{&allocator, &files, path, "server", kind, windows};
+      Instance client{&allocator, &files, path, "client", kind, windows};
+      server.thread = kernel::spawn(&Instance::entry, &server, "pair-server");
+      client.thread = kernel::spawn(&Instance::entry, &client, "pair-client");
+      if (server.thread) kernel::join(server.thread);
+      if (client.thread) kernel::join(client.thread);
+      console::puts("  pair: server result ");
+      console::put_dec(static_cast<int64_t>(server.result));
+      console::puts(" exit code ");
+      console::put_dec(server.code);
+      console::puts(", client result ");
+      console::put_dec(static_cast<int64_t>(client.result));
+      console::puts(" exit code ");
+      console::put_dec(client.code);
+      console::puts("\n");
+    }
+#endif
   }
 #endif
   {

@@ -17,6 +17,7 @@
  */
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsObjects.hpp"
 #include "Process/WindowsThreads.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
@@ -309,6 +310,19 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtWaitForSingleObject: return windowsabi::nt_wait_for_single_object(process, r);
       case WindowsSyscallNumber::NtResumeThread: return windowsabi::nt_resume_thread(process, r);
       case WindowsSyscallNumber::NtQueryInformationThread: return windowsabi::nt_query_information_thread(process, r);
+      case WindowsSyscallNumber::NtCreateEvent: return windowsabi::nt_create_event(process, r);
+      case WindowsSyscallNumber::NtOpenEvent: return windowsabi::nt_open_event(process, r);
+      case WindowsSyscallNumber::NtSetEvent: return windowsabi::nt_set_event(process, r);
+      case WindowsSyscallNumber::NtResetEvent: return windowsabi::nt_reset_event(process, r);
+      case WindowsSyscallNumber::NtPulseEvent: return windowsabi::nt_pulse_event(process, r);
+      case WindowsSyscallNumber::NtCreateMutant: return windowsabi::nt_create_mutant(process, r);
+      case WindowsSyscallNumber::NtOpenMutant: return windowsabi::nt_open_mutant(process, r);
+      case WindowsSyscallNumber::NtReleaseMutant: return windowsabi::nt_release_mutant(process, r);
+      case WindowsSyscallNumber::NtCreateSemaphore: return windowsabi::nt_create_semaphore(process, r);
+      case WindowsSyscallNumber::NtOpenSemaphore: return windowsabi::nt_open_semaphore(process, r);
+      case WindowsSyscallNumber::NtReleaseSemaphore: return windowsabi::nt_release_semaphore(process, r);
+      case WindowsSyscallNumber::NtWaitForMultipleObjects: return windowsabi::nt_wait_for_multiple_objects(process, r);
+      case WindowsSyscallNumber::NtDuplicateObject: return windowsabi::nt_duplicate_object(process, r);
       case WindowsSyscallNumber::NtRaiseException: return nt_raise_exception_final(process, r);
       case WindowsSyscallNumber::NtTerminateProcess:
         if (r.args[0] != kCurrentProcess) return kStatusInvalidHandle;      // other processes are not reachable yet

@@ -27,7 +27,5 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r);
 uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_resume_thread(Process& p, const SyscallRequest& r);
 uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r);
-// NtWaitForSingleObject(Handle, Alertable, PLARGE_INTEGER Timeout): waits for a thread to end.
-uint32_t nt_wait_for_single_object(Process& p, const SyscallRequest& r);
 
 }  // namespace process::windowsabi

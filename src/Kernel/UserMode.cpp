@@ -18,6 +18,7 @@
 #include "Kernel/UserMode.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Delay.hpp"
+#include "Process/Objects.hpp"
 #include "Process/WindowsException.hpp"
 #include "console.hpp"
 
@@ -53,8 +54,27 @@ struct Gate {
 };
 static_assert(sizeof(Gate) == 16);
 
+// The one lock and wake-up of the waiting for threads and for the synchronization objects that processes share.
+class SystemSync final : public process::ISystemSync {
+ public:
+  void lock() override { mutex_.lock(); }
+  void unlock() override { mutex_.unlock(); }
+  bool wait(uint64_t timeout_ns) override {
+    uint64_t us = 0;
+    if (timeout_ns != ~uint64_t{0}) us = timeout_ns / 1000 + 1;
+    return changed_.wait(mutex_, us);
+  }
+  void notify_all() override { changed_.notify_all(); }
+
+ private:
+  Mutex mutex_;
+  ConditionVariable changed_;
+};
+
 struct State {
   allocators::IAllocator* allocator = nullptr;
+  SystemSync* sync = nullptr;      // (made once and kept: the state has no destructor to run at exit)
+  process::ObjectManager* objects = nullptr;
   uint8_t* code = nullptr;          // the copy of the entry stubs
   uint64_t code_bytes = 0;
   Gate* idt = nullptr;
@@ -325,6 +345,14 @@ bool init(allocators::IAllocator& allocator) {
   __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
   if (!(edx & (1u << 11))) return false;      // no SYSCALL
   g.allocator = &allocator;
+  if (!g.sync) {
+    void* sync_memory = allocator.allocate(sizeof(SystemSync));
+    void* objects_memory = sync_memory ? allocator.allocate(sizeof(process::ObjectManager)) : nullptr;
+    if (!objects_memory) { if (sync_memory) allocator.deallocate(sync_memory); return false; }
+    g.sync = new (sync_memory) SystemSync();
+    g.objects = new (objects_memory) process::ObjectManager(*g.sync);
+    process::set_system_objects(g.objects);
+  }
   g.nx = (rdmsr(kMsrEfer) & kEferNxe) != 0;
 
   const uint64_t used = address_of(tcos_tramp_end) - address_of(tcos_tramp_begin);
@@ -479,6 +507,7 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
 void request_kill(Task& task) {
   __atomic_store_n(&task.kill_requested, true, __ATOMIC_RELEASE);
   task.changed.notify_all();      // a thread waiting for another one must see it
+  if (process::ObjectManager* objects = process::system_objects()) objects->notify();
 }
 
 bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us) {

@@ -788,69 +788,130 @@ EXPORT BOOL WINAPI SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lo
   return wait_condition(cv, timeout_ms, srw_release, srw_acquire, lock);
 }
 
-/* Events and mutexes are objects of the process only (nothing else can wait on them): handles in a range of their own, closed by CloseHandle. The threads of the process
- * share them; a thread that has to wait polls (every millisecond) until another one signals. */
-#define OBJECT_BASE 0x40000000ull
-#define MAX_OBJECTS 64
-typedef struct { BYTE kind; volatile BYTE signaled; BYTE manual_reset; LONG count; volatile DWORD owner; } SyncObject;      /* kind: 0 free, 1 event, 2 mutex, 3 semaphore */
-static SyncObject g_objects[MAX_OBJECTS];
-static SyncObject *object_of(HANDLE h) {
-  const ULONG_PTR v = (ULONG_PTR)h;
-  if (v < OBJECT_BASE || v >= OBJECT_BASE + MAX_OBJECTS * 4 || (v & 3)) return NULL;
-  SyncObject *o = &g_objects[(v - OBJECT_BASE) / 4];
-  return o->kind ? o : NULL;
+/* Events, mutexes and semaphores are objects of the system (src/Process/Objects.hpp): a name makes two processes share one. The wait functions below wait for them and
+ * for threads. Names live in "\\BaseNamedObjects\\" (Local\\ and Global\\ are the same here). */
+EXPORT void WINAPI Sleep(DWORD ms);
+EXPORT ULONGLONG WINAPI GetTickCount64(void);
+
+/* Builds the OBJECT_ATTRIBUTES of a name (or none). `buffer` holds the wide name: 3 + 17 + name characters. */
+typedef struct { OBJECT_ATTRIBUTES attributes; UNICODE_STRING string; WCHAR text[300]; } NamedAttributes;
+static POBJECT_ATTRIBUTES named_attributes(NamedAttributes *n, LPCWSTR name) {
+  if (!name || !*name) return NULL;
+  static const WCHAR prefix[] = L"\\BaseNamedObjects\\";
+  unsigned length = 0;
+  for (; prefix[length]; ++length) n->text[length] = prefix[length];
+  const WCHAR *skip = name;
+  if ((name[0] == 'L' || name[0] == 'l') && (name[1] == 'o' || name[1] == 'O') && (name[2] == 'c' || name[2] == 'C') && (name[3] == 'a' || name[3] == 'A') && (name[4] == 'l' || name[4] == 'L') && name[5] == '\\') skip = name + 6;
+  else if ((name[0] == 'G' || name[0] == 'g') && (name[1] == 'l' || name[1] == 'L') && (name[2] == 'o' || name[2] == 'O') && (name[3] == 'b' || name[3] == 'B') && (name[4] == 'a' || name[4] == 'A') && (name[5] == 'l' || name[5] == 'L') && name[6] == '\\') skip = name + 7;
+  for (; *skip && length < 299; ++skip) n->text[length++] = *skip;
+  n->text[length] = 0;
+  n->string.Buffer = n->text;
+  n->string.Length = (USHORT)(length * 2);
+  n->string.MaximumLength = (USHORT)(length * 2 + 2);
+  n->attributes.Length = sizeof(OBJECT_ATTRIBUTES);
+  n->attributes.RootDirectory = NULL;
+  n->attributes.ObjectName = &n->string;
+  n->attributes.Attributes = 0x40;      /* OBJ_CASE_INSENSITIVE */
+  n->attributes.SecurityDescriptor = NULL;
+  n->attributes.SecurityQualityOfService = NULL;
+  return &n->attributes;
 }
-static HANDLE new_object(BYTE kind, BYTE signaled, BYTE manual) {
-  for (int i = 0; i < MAX_OBJECTS; ++i) {
-    if (g_objects[i].kind || !__sync_bool_compare_and_swap(&g_objects[i].kind, 0, 0xFF)) continue;      /* (0xFF: taken, being set up) */
-    g_objects[i].signaled = signaled;
-    g_objects[i].manual_reset = manual;
-    g_objects[i].count = 0;
-    g_objects[i].owner = 0;
-    g_objects[i].kind = kind;
-    return (HANDLE)(OBJECT_BASE + (ULONG_PTR)i * 4);
-  }
-  set_error(ERROR_NOT_ENOUGH_MEMORY);
-  return NULL;
-}
-EXPORT HANDLE WINAPI CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR name) { (void)sa; (void)name; return new_object(1, (BYTE)(initial != 0), (BYTE)(manual != 0)); }
-EXPORT HANDLE WINAPI CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCSTR name) { (void)sa; (void)name; return new_object(1, (BYTE)(initial != 0), (BYTE)(manual != 0)); }
-EXPORT BOOL WINAPI SetEvent(HANDLE h) { SyncObject *o = object_of(h); if (!o || o->kind != 1) { set_error(ERROR_INVALID_HANDLE); return FALSE; } o->signaled = 1; return TRUE; }
-EXPORT BOOL WINAPI ResetEvent(HANDLE h) { SyncObject *o = object_of(h); if (!o || o->kind != 1) { set_error(ERROR_INVALID_HANDLE); return FALSE; } o->signaled = 0; return TRUE; }
-EXPORT BOOL WINAPI PulseEvent(HANDLE h) { SyncObject *o = object_of(h); if (!o || o->kind != 1) { set_error(ERROR_INVALID_HANDLE); return FALSE; } o->signaled = 1; Sleep(0); o->signaled = 0; return TRUE; }
-static HANDLE make_mutex(BOOL owned) {
-  HANDLE h = new_object(2, 1, 0);
-  SyncObject *o = object_of(h);
-  if (o && owned) { o->signaled = 0; o->count = 1; o->owner = GetCurrentThreadId(); }
+/* The result of a create call: the handle, with ERROR_ALREADY_EXISTS set if the name was taken. */
+static HANDLE created(NTSTATUS status, HANDLE h) {
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  set_error(status == STATUS_OBJECT_NAME_EXISTS ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
   return h;
 }
-EXPORT HANDLE WINAPI CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCWSTR name) { (void)sa; (void)name; return make_mutex(owned); }
-EXPORT HANDLE WINAPI CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCSTR name) { (void)sa; (void)name; return make_mutex(owned); }
-EXPORT BOOL WINAPI ReleaseMutex(HANDLE h) {
-  SyncObject *o = object_of(h);
-  if (!o || o->kind != 2 || o->count == 0 || o->owner != GetCurrentThreadId()) { set_error(ERROR_NOT_OWNER); return FALSE; }
-  if (--o->count == 0) { o->owner = 0; o->signaled = 1; }
-  return TRUE;
-}
-static HANDLE make_semaphore(LONG initial, LONG maximum) {
-  if (maximum <= 0 || initial < 0 || initial > maximum) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
-  HANDLE h = new_object(3, 0, 0);
-  SyncObject *o = object_of(h);
-  if (o) o->count = initial;      /* (and `owner` holds the maximum) */
-  if (o) o->owner = (DWORD)maximum;
+static HANDLE opened(NTSTATUS status, HANDLE h) {
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
   return h;
 }
-EXPORT HANDLE WINAPI CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCSTR name) { (void)sa; (void)name; return make_semaphore(initial, maximum); }
-EXPORT HANDLE WINAPI CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name) { (void)sa; (void)name; return make_semaphore(initial, maximum); }
-EXPORT BOOL WINAPI ReleaseSemaphore(HANDLE h, LONG count, PLONG previous) {
-  SyncObject *o = object_of(h);
-  if (!o || o->kind != 3) { set_error(ERROR_INVALID_HANDLE); return FALSE; }
-  for (;;) {
-    const LONG have = o->count;
-    if (count <= 0 || have > (LONG)o->owner - count) { set_error(ERROR_TOO_MANY_POSTS); return FALSE; }
-    if (__sync_bool_compare_and_swap(&o->count, have, have + count)) { if (previous) *previous = have; return TRUE; }
-  }
+
+EXPORT HANDLE WINAPI CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCWSTR name) {
+  (void)sa;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  { const NTSTATUS status = NtCreateEvent(&h, 0x1F0003, named_attributes(&n, name), manual ? 0 : 1, initial != 0); return created(status, h); }
 }
+EXPORT HANDLE WINAPI CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL initial, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  HANDLE h = CreateEventW(sa, manual, initial, w);
+  free_wide(w);
+  return h;
+}
+EXPORT HANDLE WINAPI CreateEventExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) { (void)access; return CreateEventW(sa, (flags & 1) ? TRUE : FALSE, (flags & 2) ? TRUE : FALSE, name); }
+EXPORT HANDLE WINAPI CreateEventExA(LPSECURITY_ATTRIBUTES sa, LPCSTR name, DWORD flags, DWORD access) { (void)access; return CreateEventA(sa, (flags & 1) ? TRUE : FALSE, (flags & 2) ? TRUE : FALSE, name); }
+EXPORT HANDLE WINAPI OpenEventW(DWORD access, BOOL inherit, LPCWSTR name) {
+  (void)access; (void)inherit;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  { const NTSTATUS status = NtOpenEvent(&h, 0x1F0003, named_attributes(&n, name)); return opened(status, h); }
+}
+EXPORT HANDLE WINAPI OpenEventA(DWORD access, BOOL inherit, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  HANDLE h = OpenEventW(access, inherit, w);
+  free_wide(w);
+  return h;
+}
+EXPORT BOOL WINAPI SetEvent(HANDLE h) { const NTSTATUS s = NtSetEvent(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI ResetEvent(HANDLE h) { const NTSTATUS s = NtResetEvent(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI PulseEvent(HANDLE h) { const NTSTATUS s = NtPulseEvent(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+
+EXPORT HANDLE WINAPI CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCWSTR name) {
+  (void)sa;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  { const NTSTATUS status = NtCreateMutant(&h, 0x1F0001, named_attributes(&n, name), owned != 0); return created(status, h); }
+}
+EXPORT HANDLE WINAPI CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL owned, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  HANDLE h = CreateMutexW(sa, owned, w);
+  free_wide(w);
+  return h;
+}
+EXPORT HANDLE WINAPI CreateMutexExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name, DWORD flags, DWORD access) { (void)access; return CreateMutexW(sa, (flags & 1) ? TRUE : FALSE, name); }
+EXPORT HANDLE WINAPI CreateMutexExA(LPSECURITY_ATTRIBUTES sa, LPCSTR name, DWORD flags, DWORD access) { (void)access; return CreateMutexA(sa, (flags & 1) ? TRUE : FALSE, name); }
+EXPORT HANDLE WINAPI OpenMutexW(DWORD access, BOOL inherit, LPCWSTR name) {
+  (void)access; (void)inherit;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  { const NTSTATUS status = NtOpenMutant(&h, 0x1F0001, named_attributes(&n, name)); return opened(status, h); }
+}
+EXPORT HANDLE WINAPI OpenMutexA(DWORD access, BOOL inherit, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  HANDLE h = OpenMutexW(access, inherit, w);
+  free_wide(w);
+  return h;
+}
+EXPORT BOOL WINAPI ReleaseMutex(HANDLE h) { const NTSTATUS s = NtReleaseMutant(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+
+EXPORT HANDLE WINAPI CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name) {
+  (void)sa;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  { const NTSTATUS status = NtCreateSemaphore(&h, 0x1F0003, named_attributes(&n, name), initial, maximum); return created(status, h); }
+}
+EXPORT HANDLE WINAPI CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  HANDLE h = CreateSemaphoreW(sa, initial, maximum, w);
+  free_wide(w);
+  return h;
+}
+EXPORT HANDLE WINAPI CreateSemaphoreExW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LPCWSTR name, DWORD flags, DWORD access) { (void)flags; (void)access; return CreateSemaphoreW(sa, initial, maximum, name); }
+EXPORT HANDLE WINAPI OpenSemaphoreW(DWORD access, BOOL inherit, LPCWSTR name) {
+  (void)access; (void)inherit;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  { const NTSTATUS status = NtOpenSemaphore(&h, 0x1F0003, named_attributes(&n, name)); return opened(status, h); }
+}
+EXPORT HANDLE WINAPI OpenSemaphoreA(DWORD access, BOOL inherit, LPCSTR name) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  HANDLE h = OpenSemaphoreW(access, inherit, w);
+  free_wide(w);
+  return h;
+}
+EXPORT BOOL WINAPI ReleaseSemaphore(HANDLE h, LONG count, PLONG previous) { const NTSTATUS s = NtReleaseSemaphore(h, count, previous); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable);
 EXPORT DWORD WINAPI WaitForSingleObject(HANDLE h, DWORD timeout_ms) { return WaitForSingleObjectEx(h, timeout_ms, FALSE); }
 
@@ -863,70 +924,31 @@ EXPORT void WINAPI Sleep(DWORD ms) {
 EXPORT DWORD WINAPI SleepEx(DWORD ms, BOOL alertable) { (void)alertable; Sleep(ms); return 0; }
 EXPORT BOOL WINAPI SwitchToThread(void) { NtYieldExecution(); return TRUE; }
 
-/* Tries to take what the object gives a waiter; TRUE if the wait is over. */
-static int try_acquire(SyncObject *o) {
-  if (o->kind == 1) {
-    if (!o->signaled) return 0;
-    if (o->manual_reset) return 1;
-    return __sync_bool_compare_and_swap(&o->signaled, 1, 0);
-  }
-  if (o->kind == 2) {
-    const DWORD me = GetCurrentThreadId();
-    if (o->owner == me && o->count > 0) { ++o->count; return 1; }      /* the owner takes it again */
-    if (!__sync_bool_compare_and_swap(&o->signaled, 1, 0)) return 0;
-    o->owner = me;
-    o->count = 1;
-    return 1;
-  }
-  if (o->kind == 3) {
-    for (;;) {
-      const LONG have = o->count;
-      if (have <= 0) return 0;
-      if (__sync_bool_compare_and_swap(&o->count, have, have - 1)) return 1;
-    }
-  }
-  return 0;
+/* The Win32 result of a wait: the index (WAIT_OBJECT_0 + i), WAIT_ABANDONED_0 + i, WAIT_TIMEOUT, WAIT_IO_COMPLETION. */
+static DWORD wait_result(NTSTATUS status) {
+  if (status >= 0 && status < 64) return WAIT_OBJECT_0 + (DWORD)status;
+  if (status >= 0x80 && status < 0x80 + 64) return WAIT_ABANDONED + ((DWORD)status - 0x80);
+  if (status == 0x102) return WAIT_TIMEOUT;
+  if (status == 0x101) return WAIT_IO_COMPLETION;
+  fail_nt(status);
+  return WAIT_FAILED;
 }
-
 EXPORT DWORD WINAPI WaitForSingleObjectEx(HANDLE h, DWORD timeout_ms, BOOL alertable) {
-  SyncObject *o = object_of(h);
-  if (!o) {      /* a thread (or something else the system keeps) */
-    LARGE_INTEGER t;
-    t.QuadPart = -(LONGLONG)timeout_ms * 10000;
-    const NTSTATUS status = NtWaitForSingleObject(h, alertable != 0, timeout_ms == INFINITE ? NULL : &t);
-    if (status == STATUS_SUCCESS) return WAIT_OBJECT_0;
-    if (status == 0x102) return WAIT_TIMEOUT;
-    if (status == 0x101) return WAIT_IO_COMPLETION;
-    set_error(RtlNtStatusToDosError(status));
-    return WAIT_FAILED;
-  }
-  const ULONGLONG start = GetTickCount64();
-  for (;;) {
-    if (try_acquire(o)) return WAIT_OBJECT_0;
-    if (timeout_ms == 0) return WAIT_TIMEOUT;
-    if (timeout_ms != INFINITE && GetTickCount64() - start >= timeout_ms) return WAIT_TIMEOUT;
-    Sleep(1);
-  }
+  LARGE_INTEGER t;
+  t.QuadPart = -(LONGLONG)timeout_ms * 10000;
+  return wait_result(NtWaitForSingleObject(h, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
 }
 EXPORT DWORD WINAPI WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL all, DWORD timeout_ms, BOOL alertable) {
-  (void)alertable;
-  if (count == 0 || count > 64) { set_error(ERROR_INVALID_PARAMETER); return WAIT_FAILED; }
-  const ULONGLONG start = GetTickCount64();
-  for (;;) {
-    if (all) {
-      /* every one must be ready at the same time: look first without taking anything (threads and events stay ready) */
-      DWORD ready = 0;
-      for (DWORD i = 0; i < count; ++i) if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) ++ready; else break;
-      if (ready == count) return WAIT_OBJECT_0;
-    } else {
-      for (DWORD i = 0; i < count; ++i) if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) return WAIT_OBJECT_0 + i;
-    }
-    if (timeout_ms == 0) return WAIT_TIMEOUT;
-    if (timeout_ms != INFINITE && GetTickCount64() - start >= timeout_ms) return WAIT_TIMEOUT;
-    Sleep(1);
-  }
+  if (count == 0 || count > 64 || !handles) { set_error(ERROR_INVALID_PARAMETER); return WAIT_FAILED; }
+  LARGE_INTEGER t;
+  t.QuadPart = -(LONGLONG)timeout_ms * 10000;
+  return wait_result(NtWaitForMultipleObjects(count, handles, all ? 0 : 1, alertable != 0, timeout_ms == INFINITE ? NULL : &t));
 }
 EXPORT DWORD WINAPI WaitForMultipleObjects(DWORD count, const HANDLE *handles, BOOL all, DWORD timeout_ms) { return WaitForMultipleObjectsEx(count, handles, all, timeout_ms, FALSE); }
+EXPORT DWORD WINAPI SignalObjectAndWait(HANDLE signal, HANDLE wait, DWORD timeout_ms, BOOL alertable) {
+  SetEvent(signal);      /* (an event; a mutex or semaphore signalled this way is released by its own function) */
+  return WaitForSingleObjectEx(wait, timeout_ms, alertable);
+}
 
 /* ---- threads ------------------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -972,8 +994,6 @@ EXPORT BOOL WINAPI SetThreadContext(HANDLE h, const CONTEXT *context) { (void)h;
 /* ---- handles, time --------------------------------------------------------------------------------------------------------------------------------------- */
 
 EXPORT BOOL WINAPI CloseHandle(HANDLE h) {
-  SyncObject *o = object_of(h);
-  if (o) { o->kind = 0; return TRUE; }
   const NTSTATUS status = NtClose(h);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
@@ -1078,7 +1098,6 @@ static int device_type(HANDLE h) {
   return info[0] | (info[1] << 8);
 }
 EXPORT DWORD WINAPI GetFileType(HANDLE h) {
-  if (object_of(h)) return FILE_TYPE_UNKNOWN;
   const int type = device_type(h);
   if (type < 0) { set_error(ERROR_INVALID_HANDLE); return FILE_TYPE_UNKNOWN; }
   set_error(ERROR_SUCCESS);
@@ -1706,9 +1725,9 @@ EXPORT UINT WINAPI GetTempFileNameA(LPCSTR dir, LPCSTR prefix, UINT unique, LPST
   return id;
 }
 EXPORT BOOL WINAPI DuplicateHandle(HANDLE sp, HANDLE source, HANDLE tp, HANDLE *target, DWORD access, BOOL inherit, DWORD options) {
-  (void)sp; (void)tp; (void)access; (void)inherit; (void)options;      /* one process: the same handle serves (closing it closes it for all copies) */
-  if (target) *target = source;
-  return TRUE;
+  (void)inherit;
+  const NTSTATUS status = NtDuplicateObject(sp, source, tp, target, access, 0, options & 1);      /* DUPLICATE_CLOSE_SOURCE; within this process */
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 
 /* ---- directory listings ---------------------------------------------------------------------------------------------------------------------------------- */

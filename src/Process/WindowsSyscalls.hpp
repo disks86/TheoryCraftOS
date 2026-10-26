@@ -53,6 +53,19 @@ enum class WindowsSyscallNumber : uint32_t {
   NtWaitForSingleObject = 26,
   NtResumeThread = 27,
   NtQueryInformationThread = 28,
+  NtCreateEvent = 29,
+  NtOpenEvent = 30,
+  NtSetEvent = 31,
+  NtResetEvent = 32,
+  NtPulseEvent = 33,
+  NtCreateMutant = 34,
+  NtOpenMutant = 35,
+  NtReleaseMutant = 36,
+  NtCreateSemaphore = 37,
+  NtOpenSemaphore = 38,
+  NtReleaseSemaphore = 39,
+  NtWaitForMultipleObjects = 40,
+  NtDuplicateObject = 41,
 };
 
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service

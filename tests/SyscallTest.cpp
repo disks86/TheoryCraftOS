@@ -385,6 +385,19 @@ static void test_service_numbers_agree() {
       {"NtWaitForSingleObject", WindowsSyscallNumber::NtWaitForSingleObject},
       {"NtResumeThread", WindowsSyscallNumber::NtResumeThread},
       {"NtQueryInformationThread", WindowsSyscallNumber::NtQueryInformationThread},
+      {"NtCreateEvent", WindowsSyscallNumber::NtCreateEvent},
+      {"NtOpenEvent", WindowsSyscallNumber::NtOpenEvent},
+      {"NtSetEvent", WindowsSyscallNumber::NtSetEvent},
+      {"NtResetEvent", WindowsSyscallNumber::NtResetEvent},
+      {"NtPulseEvent", WindowsSyscallNumber::NtPulseEvent},
+      {"NtCreateMutant", WindowsSyscallNumber::NtCreateMutant},
+      {"NtOpenMutant", WindowsSyscallNumber::NtOpenMutant},
+      {"NtReleaseMutant", WindowsSyscallNumber::NtReleaseMutant},
+      {"NtCreateSemaphore", WindowsSyscallNumber::NtCreateSemaphore},
+      {"NtOpenSemaphore", WindowsSyscallNumber::NtOpenSemaphore},
+      {"NtReleaseSemaphore", WindowsSyscallNumber::NtReleaseSemaphore},
+      {"NtWaitForMultipleObjects", WindowsSyscallNumber::NtWaitForMultipleObjects},
+      {"NtDuplicateObject", WindowsSyscallNumber::NtDuplicateObject},
   };
   FILE* header = fopen("src/Windows/tcos_syscalls.h", "r");
   CHECK(header != nullptr);

@@ -49,4 +49,17 @@
 #define NT_SERVICE_NtWaitForSingleObject 26
 #define NT_SERVICE_NtResumeThread 27
 #define NT_SERVICE_NtQueryInformationThread 28
+#define NT_SERVICE_NtCreateEvent 29
+#define NT_SERVICE_NtOpenEvent 30
+#define NT_SERVICE_NtSetEvent 31
+#define NT_SERVICE_NtResetEvent 32
+#define NT_SERVICE_NtPulseEvent 33
+#define NT_SERVICE_NtCreateMutant 34
+#define NT_SERVICE_NtOpenMutant 35
+#define NT_SERVICE_NtReleaseMutant 36
+#define NT_SERVICE_NtCreateSemaphore 37
+#define NT_SERVICE_NtOpenSemaphore 38
+#define NT_SERVICE_NtReleaseSemaphore 39
+#define NT_SERVICE_NtWaitForMultipleObjects 40
+#define NT_SERVICE_NtDuplicateObject 41
 #endif

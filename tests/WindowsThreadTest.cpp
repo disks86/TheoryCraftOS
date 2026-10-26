@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <vector>
 #include "Process/AddressSpace.hpp"
+#include "Process/Objects.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -61,7 +62,7 @@ struct Host final : IProcessHost {
   bool write_console(uint32_t, ConstByteView) override { return true; }
   bool read_console(ByteView, uint64_t* got) override { *got = 0; return true; }
   uint64_t realtime_ns() override { return 0; }
-  uint64_t monotonic_ns() override { return now; }
+  uint64_t monotonic_ns() override { return now += 1000000; }      // (every look at the clock lets a millisecond pass: nothing else runs to make it)
   void sleep_ns(uint64_t ns) override { now += ns; }
   void yield() override {}
 };
@@ -82,7 +83,17 @@ struct Runtime final : IProcessRuntime {
   uint64_t current_thread_id() override { return current; }
 };
 
+// One thread drives these tests: the system's lock needs no real locking and a wait just lets time pass.
+struct SingleThreadSync final : ISystemSync {
+  void lock() override {}
+  void unlock() override {}
+  bool wait(uint64_t) override { return false; }
+  void notify_all() override {}
+};
+
 struct Setup {
+  SingleThreadSync sync;
+  ObjectManager objects{sync};
   FakeMemory memory;
   Host host;
   AddressSpace space{A};
@@ -90,6 +101,7 @@ struct Setup {
   Process process{7, ProcessBinding{SyscallAbi::Windows, UserArch::X86_64, syscall_interface(SyscallAbi::Windows, UserArch::X86_64)}, memory, host};
   const ISyscallInterface* iface = syscall_interface(SyscallAbi::Windows, UserArch::X86_64);
   Setup() {
+    set_system_objects(&objects);
     process.attach_address_space(space, 0x10000000);
     process.attach_runtime(&runtime);
     Process::ThreadSupport support;
@@ -100,6 +112,7 @@ struct Setup {
     process.register_main_thread(7, 0x7FFD0000);
     runtime.current = 7;
   }
+  ~Setup() { set_system_objects(nullptr); }
   // NtCreateThreadEx(&handle, access, NULL, -1, start, parameter, flags, 0, stack, stack, NULL): the arguments past the fourth go on the stack, past 32 bytes of home space.
   uint32_t create(uint64_t start, uint64_t parameter, uint64_t flags, uint64_t stack, uint64_t* handle) {
     const uint64_t sp = kBase + 0x1000;

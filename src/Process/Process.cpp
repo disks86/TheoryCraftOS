@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/Process.hpp"
+#include "Process/Objects.hpp"
 
 namespace process {
 
@@ -33,12 +34,34 @@ uint64_t Process::syscall(const SyscallRequest& request) {
   return binding_.interface->dispatch(*this, request);
 }
 
+namespace {
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore; }
+}  // namespace
+
+Process::~Process() {
+  if (ObjectManager* objects = system_objects()) {
+    for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) if (is_object_kind(files_.kind(slot))) objects->release(uint32_t(files_.token(slot)));
+  }
+}
+
+bool Process::close_descriptor(uint64_t slot) {
+  const DescriptorKind kind = files_.kind(slot);
+  const uint64_t token = files_.token(slot);
+  if (!files_.close(slot)) return false;
+  if (is_object_kind(kind)) if (ObjectManager* objects = system_objects()) objects->release(uint32_t(token));
+  return true;
+}
+
 void Process::terminate(uint32_t code) {
   if (exited()) return;
   exit_code_ = code;
   __atomic_store_n(&exited_, true, __ATOMIC_RELEASE);
   host_.wake_blocked();
   if (runtime_) runtime_->notify();
+  if (ObjectManager* objects = system_objects()) {      // what it owned is abandoned; whoever waits for it or for them looks again
+    objects->abandon_process(id_);
+    objects->notify();
+  }
 }
 
 void Process::register_main_thread(uint64_t id, uint64_t teb) {
@@ -120,14 +143,6 @@ bool Process::block_read_console(ByteView out, uint64_t* got) {
   return host_.read_console(out, got);
 }
 
-bool Process::wait_for_change(uint64_t timeout_ns) {
-  if (!runtime_) {
-    host_.sleep_ns(timeout_ns == ~uint64_t{0} ? 1000000 : timeout_ns);      // a single thread: nothing else can change anything
-    return timeout_ns == ~uint64_t{0};
-  }
-  if (runtime_->interrupted() || exited()) return false;
-  return runtime_->wait(timeout_ns);
-}
 
 bool Process::read_user_u64(uint64_t address, uint64_t* out) {
   uint8_t raw[8];
