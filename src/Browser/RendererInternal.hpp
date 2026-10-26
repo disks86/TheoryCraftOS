@@ -1054,7 +1054,7 @@ class DocumentRenderer {
           if (focused && !selection) {   // (the caret is a bar between two characters)
             String with(out_.allocator());
             with.append(content.view().first(caret));
-            with.push_back('|');
+            with.push_back(options_.caret_hidden ? ' ' : '|');
             with.append(content.view().substr(caret));
             content.assign(with.view());
           }
@@ -1118,7 +1118,7 @@ class DocumentRenderer {
       if (focused && caret_line < lines.count()) {
         String with(out_.allocator());
         with.append(lines[caret_line].view().first(caret_col));
-        with.push_back('|');
+        with.push_back(options_.caret_hidden ? ' ' : '|');
         with.append(lines[caret_line].view().substr(caret_col));
         lines[caret_line].assign(with.view());
       }

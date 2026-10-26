@@ -111,6 +111,7 @@ class MenuPopup final : public Control {
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
   bool on_key(const KeyArgs& args) override;
+  bool shows_caret() const override { return searchable_; }
   void highlight_first() { step(1, -1); }
 
  protected:

@@ -149,14 +149,14 @@ void MenuPopup::paint(Painter& painter) {
     const int32_t ty = box.y + (static_cast<int32_t>(box.height) - Painter::kGlyphHeight) / 2;
     if (query_.empty()) {
       painter.text(box.x + 4, ty, StringView("Type to search"), t.disabled_text);
-      painter.line(box.x + 3, ty, box.x + 3, ty + Painter::kGlyphHeight - 1, t.text);  // the caret
+      if (caret_visible()) painter.line(box.x + 3, ty, box.x + 3, ty + Painter::kGlyphHeight - 1, t.text);  // the caret
     } else {
       const int32_t room = (static_cast<int32_t>(box.width) - 10) / Painter::kGlyphWidth;  // keeps the end of long text in view
       const StringView q = query_.view();
       const StringView shown = static_cast<int32_t>(q.size()) > room && room > 0 ? q.substr(q.size() - static_cast<uint64_t>(room)) : q;
       painter.text(box.x + 4, ty, shown, t.text);
       const int32_t cx = box.x + 4 + Painter::text_width(shown);
-      painter.line(cx, ty, cx, ty + Painter::kGlyphHeight - 1, t.text);
+      if (caret_visible()) painter.line(cx, ty, cx, ty + Painter::kGlyphHeight - 1, t.text);
     }
   }
 }

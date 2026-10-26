@@ -363,7 +363,7 @@ void TextEditor::paint(Painter& painter) {
         if (!part.empty()) painter.text(x_of(part_from), y, part, t.selection_text);
       }
     }
-    if (focused() && enabled() && caret_ >= start && caret_ <= end) {
+    if (focused() && enabled() && caret_visible() && caret_ >= start && caret_ <= end) {
       const int32_t cx = x_of(column_at(line, caret_));
       if (cx >= kPad - 1) painter.line(cx, y, cx, y + kLineHeight - 1, t.text);
     }

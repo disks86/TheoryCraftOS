@@ -58,7 +58,7 @@ struct Shot {
   media::Image image;
   uint32_t width, height;
 
-  Shot(const std::string& html, uint32_t w = 200, uint32_t h = 100, browser::IObjectPainter* pictures = nullptr) : doc(g_alloc), sheet(g_alloc), tree(g_alloc), list(g_alloc), image(g_alloc), width(w), height(h) {
+  Shot(const std::string& html, uint32_t w = 200, uint32_t h = 100, browser::IObjectPainter* pictures = nullptr, bool focus_input = false, bool caret_hidden = false) : doc(g_alloc), sheet(g_alloc), tree(g_alloc), list(g_alloc), image(g_alloc), width(w), height(h) {
     dom::build_document(doc, html.c_str(), nullptr);
     browser::RenderOptions render;
     render.media.width = static_cast<int32_t>(w);
@@ -78,6 +78,12 @@ struct Shot {
     po.measurer = &measurer;
     po.sheet = &sheet;
     po.doc = &doc;
+    po.caret_hidden = caret_hidden;
+    if (focus_input)
+      for (uint32_t serial = 1; serial < 64; ++serial) {
+        const dom::Node* n = doc.by_serial(serial);
+        if (n && n->is_tag("input")) { po.focus = serial; break; }
+      }
     paint::build_display_list(tree, po, &list);
     image.create(w, h);
     graphics::Surface surface = image.surface(0);
@@ -118,6 +124,20 @@ static bool near_color(uint32_t actual, uint32_t expected, int tolerance) {
     if (a - e > tolerance || e - a > tolerance) return false;
   }
   return true;
+}
+
+// The caret of a focused text field: a bar after the typed text that is left out in the hidden half of its blink (and nothing else moves then).
+static void test_caret() {
+  const std::string html = page("<input type=text value=\"ab\" style=\"width:100px\">");
+  Shot plain(html, 200, 60);
+  Shot shown(html, 200, 60, nullptr, true, false);
+  Shot hidden(html, 200, 60, nullptr, true, true);
+  CHECK(shown.ink(0, 0, 200, 60) > plain.ink(0, 0, 200, 60));   // the bar is extra ink
+  CHECK(hidden.ink(0, 0, 200, 60) == plain.ink(0, 0, 200, 60));
+  int different = 0;
+  for (uint32_t y = 0; y < 60; ++y)
+    for (uint32_t x = 0; x < 200; ++x) different += hidden.px(x, y) != plain.px(x, y);
+  CHECK(different == 0);
 }
 
 static void test_boxes() {
@@ -788,6 +808,7 @@ int main() {
     font::FontSet fonts(g_alloc);
     fonts.add_bundled_fonts();
     g_fonts = &fonts;
+    test_caret();
     test_boxes();
     test_stacking();
     test_clip_and_opacity();

@@ -53,6 +53,7 @@ class TextBox : public Control {
   void on_changed(Handler handler) { UiGuard lock(this); changed_ = handler; }
 
   bool focusable() const override { return true; }
+  bool shows_caret() const override { return focused() && enabled(); }
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
   void on_mouse_move(const MouseArgs& args) override;

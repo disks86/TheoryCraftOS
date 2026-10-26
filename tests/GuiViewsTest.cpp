@@ -2315,6 +2315,49 @@ static void test_start_menu_search() {
   CHECK(a.live == 0);
 }
 
+// A caret blinks: shown for half a second, hidden for half a second, solid again right after a key press or click. The window is only redrawn
+// when the caret of the focused control changed.
+static void test_caret_blink() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 300, 100);
+    Window w(a, screen.renderer, theme, {300, 100});
+    TextBox box(a);
+    box.set_bounds({10, 10, 200, 24});
+    w.add(&box);
+    w.set_focus(&box);
+    w.tick(100000);
+    w.render();
+    CHECK(w.caret_visible() && !w.dirty());
+    w.tick(400000);                                         // still in the shown half
+    CHECK(w.caret_visible() && !w.dirty());
+    w.tick(600000);                                         // 0.6 s on: hidden, and the window wants a frame
+    CHECK(!w.caret_visible() && w.dirty());
+    w.render();
+    w.tick(700000);
+    CHECK(!w.caret_visible() && !w.dirty());                 // no change, no frame
+    w.tick(1100000);
+    CHECK(w.caret_visible() && w.dirty());
+    w.render();
+    w.tick(1700000);                                         // hidden again ...
+    CHECK(!w.caret_visible());
+    type_char(w, 'x');                                       // ... a key makes it solid and restarts the period
+    CHECK(w.caret_visible());
+    w.tick(2100000);
+    CHECK(w.caret_visible());
+    w.tick(2300000);
+    CHECK(!w.caret_visible());
+
+    // Without a control that shows a caret the clock does not cost frames.
+    w.set_focus(nullptr);
+    w.render();
+    w.tick(3000000);
+    CHECK(!w.dirty());
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_display_settings_entry() {
   TestAllocator a;
   {
@@ -7581,6 +7624,7 @@ int main() {
   test_wireless_properties();
   test_wireless_menu();
   test_start_menu_search();
+  test_caret_blink();
   test_display_settings_entry();
   test_text_editor();
   test_notepad();

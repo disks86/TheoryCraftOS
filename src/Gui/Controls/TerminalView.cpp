@@ -409,7 +409,7 @@ void TerminalView::paint(Painter& painter) {
         }
       }
     }
-    if (is_live && focused()) {   // the caret: a block on the character it is in front of
+    if (is_live && focused() && caret_visible()) {   // the caret: a block on the character it is in front of
       const uint64_t at = lines_[i].size() + prompt_.size() + caret_;
       const uint32_t visual = row + static_cast<uint32_t>(at / cols);
       if (visual >= first && visual < first + rows_) {

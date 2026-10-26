@@ -92,6 +92,7 @@ class TextEditor : public Control {
   Point cell_origin(uint32_t line, uint32_t column) const;
 
   bool focusable() const override { return true; }
+  bool shows_caret() const override { return focused() && enabled(); }
   void layout() override;
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;

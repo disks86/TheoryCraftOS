@@ -178,7 +178,7 @@ void TextBox::paint(Painter& painter) {
       painter.text(x, y, shown(a, b - a), t.selection_text);
     }
   }
-  if (focused() && enabled()) {
+  if (focused() && enabled() && caret_visible()) {
     const int32_t cx = kPad - 2 + static_cast<int32_t>(caret_ - scroll_) * Painter::kGlyphWidth;
     painter.line(cx, y, cx, y + Painter::kGlyphHeight - 1, t.text);
   }

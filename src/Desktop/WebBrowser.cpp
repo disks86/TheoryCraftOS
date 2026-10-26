@@ -291,6 +291,7 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   resize_handler_ = {&WebBrowser::on_view_resized, this};
   scroll_handler_ = {&WebBrowser::on_view_scrolled, this};
   timer_handler_ = {&WebBrowser::on_timers, this};
+  caret_handler_ = {&WebBrowser::on_caret, this};
   visibility_handler_ = {&WebBrowser::on_visibility, this};
   key_handler_ = {&WebBrowser::on_form_key, this};
   page_.on_node_clicked(Handler::immediate(&WebBrowser::route_node, this));
@@ -1042,6 +1043,7 @@ void WebBrowser::update_key_capture() {
     page_.set_capture_keys(PageView::kCaptureNone);
     return;
   }
+  __atomic_store_n(&caret_blinks_, live_->caret_blinks(), __ATOMIC_RELEASE);
   const uint8_t mode = live_->has_focus() || live_->has_modal() ? PageView::kCaptureAll : live_->has_controls() ? PageView::kCaptureTab : PageView::kCaptureNone;
   page_.set_capture_keys(mode);
 }
@@ -1051,6 +1053,7 @@ void WebBrowser::on_form_key(void* self, Control&) {
   namespace key = hardware::key;
   KeyArgs args;
   while (b->page_.take_key(&args)) {
+    b->restart_caret();
     if (args.usage == key::kEscape && b->fullscreen_) {   // (Escape leaves fullscreen first, wherever the focus is; the page does not get the key)
       b->apply_fullscreen(false);
       if (b->live_) b->live_->fullscreen_left();
@@ -1152,6 +1155,14 @@ void WebBrowser::tick(uint64_t uptime_us) {
   }
   const bool shown_now = __atomic_load_n(&page_shown_, __ATOMIC_ACQUIRE);
   const uint64_t ms = uptime_us / 1000;
+  if (shown_now && __atomic_load_n(&caret_blinks_, __ATOMIC_ACQUIRE)) {
+    const uint64_t epoch = __atomic_load_n(&caret_epoch_ms_, __ATOMIC_ACQUIRE);
+    const uint8_t phase = ms >= epoch ? ((ms - epoch) / kCaretHalfPeriodMs) & 1 : 0;
+    if (phase != __atomic_load_n(&caret_phase_, __ATOMIC_ACQUIRE)) {
+      __atomic_store_n(&caret_phase_, phase, __ATOMIC_RELEASE);
+      queue(caret_handler_, *this, true);
+    }
+  }
   const uint64_t due = __atomic_load_n(&next_due_ms_, __ATOMIC_ACQUIRE);
   if (__atomic_load_n(&refresh_deferred_, __ATOMIC_ACQUIRE) && shown_now && ms >= __atomic_load_n(&last_refresh_ms_, __ATOMIC_ACQUIRE) + kMinRefreshGapMs && !__atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) {
     queue(timer_handler_, *this, true);   // (a redraw was put off: the handler's settle() does it now)
@@ -1163,6 +1174,20 @@ void WebBrowser::tick(uint64_t uptime_us) {
   }
   if (due == 0 || page_clock_ms() < due || __atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) return;
   queue(timer_handler_, *this, true);
+}
+
+// A key or click: the caret is shown solid and its blink counts from now.
+void WebBrowser::restart_caret() {
+  __atomic_store_n(&caret_epoch_ms_, __atomic_load_n(&uptime_ms_, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+  __atomic_store_n(&caret_phase_, uint8_t{0}, __ATOMIC_RELEASE);
+  if (live_) live_->set_caret_visible(true);
+}
+
+void WebBrowser::on_caret(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->live_) return;
+  b->live_->set_caret_visible(__atomic_load_n(&b->caret_phase_, __ATOMIC_ACQUIRE) == 0);
+  b->settle();
 }
 
 void WebBrowser::on_timers(void* self, Control&) {
@@ -1187,6 +1212,7 @@ void WebBrowser::on_pointer(void* self, Control&) {
 void WebBrowser::on_node_click(void* self, Control&) {
   auto* b = static_cast<WebBrowser*>(self);
   if (!b->live_) return;
+  b->restart_caret();
   b->live_->click(b->page_.clicked_node(), b->page_.clicked_x(), b->page_.clicked_y(), b->page_.clicked_object(), b->page_.clicked_local_x(), b->page_.clicked_local_y(),
                   b->page_.clicked_width(), b->page_.clicked_height());
   b->settle();
