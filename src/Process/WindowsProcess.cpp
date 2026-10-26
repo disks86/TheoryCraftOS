@@ -272,6 +272,40 @@ uint32_t win32_priority_class(uint32_t nt) {
   }
 }
 
+}  // namespace
+
+// The base level of each priority class (the kernel scheduler's absolute priority a THREAD_PRIORITY_NORMAL thread of that class runs at), and how a relative thread
+// priority offsets it; at the two extremes (idle, time-critical) real Windows saturates to an absolute level instead of adding an offset, which this keeps.
+int32_t absolute_thread_priority(uint32_t win32_class, int32_t relative) {
+  const bool realtime = win32_class == 0x100;
+  uint32_t base = 8;                          // NORMAL_PRIORITY_CLASS
+  switch (win32_class) {
+    case 0x40: base = 4; break;                // IDLE_PRIORITY_CLASS
+    case 0x4000: base = 6; break;               // BELOW_NORMAL_PRIORITY_CLASS
+    case 0x8000: base = 10; break;              // ABOVE_NORMAL_PRIORITY_CLASS
+    case 0x80: base = 13; break;                // HIGH_PRIORITY_CLASS
+    case 0x100: base = 24; break;               // REALTIME_PRIORITY_CLASS
+    default: break;
+  }
+  if (relative <= -15) return realtime ? 16 : 1;      // THREAD_PRIORITY_IDLE
+  if (relative >= 15) return realtime ? 31 : 15;      // THREAD_PRIORITY_TIME_CRITICAL
+  int32_t level = int32_t(base) + relative;
+  if (level < 1) level = 1;
+  if (level > 31) level = 31;
+  return level;
+}
+
+void repriority_threads(Process& p) {
+  IProcessRuntime* runtime = p.runtime();
+  if (!runtime) return;
+  for (uint32_t i = 0; i < Process::kMaxThreads; ++i) {
+    Process::ThreadRecord* record = p.thread_at(i);
+    if (record && record->used && !record->finished) runtime->set_priority(record->id, absolute_thread_priority(p.priority_class, record->priority));
+  }
+}
+
+namespace {
+
 struct Buffer {
   uint8_t bytes[128] = {};
   void put(uint32_t at, uint64_t value, uint32_t size) { for (uint32_t i = 0; i < size; ++i) bytes[at + i] = uint8_t(value >> (8 * i)); }
@@ -401,6 +435,7 @@ uint32_t nt_set_information_process(Process& p, const SyscallRequest& r) {
       if (length != 2 || !p.read_user(r.args[2], ByteView(in, 2))) return length != 2 ? kInfoLengthMismatch : kAccessViolation;
       if (in[1] < 1 || in[1] > 6) return kInvalidParameter;
       p.priority_class = win32_priority_class(in[1]);
+      repriority_threads(p);
       return kSuccess;
     case 21: {    // ProcessAffinityMask
       if (length != 8 || !p.read_user(r.args[2], ByteView(in, 8))) return length != 8 ? kInfoLengthMismatch : kAccessViolation;

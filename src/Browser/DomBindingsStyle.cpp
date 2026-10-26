@@ -847,11 +847,13 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     return Value::make_object(o);
   }
   const bool dark = c.host.media().dark;
+  const StyleSheet* sheet_for_color = c.host.computed_style_sheet();
   const uint32_t text_color = s.color ? s.color : (dark ? 0xE8E8E8 : 0x000000);
   if (s.color_argb_set && (s.color_argb >> 24) != 0xFF) rgba_text(s.color_argb, &t);
   else rgb_text(text_color, &t);
   if (element->is_tag("a") && dom::has_attribute(element, "href") && !s.color && !s.color_argb_set) t.assign("rgb(0, 0, 238)");
-  set("color", t.view());
+  if (sheet_for_color && !s.color_text.empty()) set("color", sheet_for_color->text(s.color_text));
+  else set("color", t.view());
   t.clear();
   if (s.background_argb != 0 && (s.background_argb >> 24) != 0xFF) rgba_text(s.background_argb, &t);
   else if (s.background) rgb_text(s.background, &t);

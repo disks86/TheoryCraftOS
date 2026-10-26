@@ -242,6 +242,7 @@ struct Style {
   uint16_t root_font_px = 16;       // the font size of the root element: what rem means
   // stored for scripts (computed style); the layout does not use them (inherited)
   TextRef quotes, tab_size;
+  TextRef color_text;               // `color` as scripts see it when it is lab(), oklch(), color() or color-mix() (else empty: rgb of color_argb)
   uint32_t accent_color_argb = 0;   // accent-color (0: auto)
   int32_t line_height_num_x1000 = -1;   // line-height given as a number: the factor (the pixels follow the font size), else -1
   uint8_t text_align_kw = 0;        // text-align as written when it is start, end, match-parent or left (0: otherwise, and the initial value start)

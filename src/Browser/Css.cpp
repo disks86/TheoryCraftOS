@@ -832,6 +832,7 @@ bool next_slash_part(StringView text, uint64_t* at, StringView* part) {
 struct ColorContext {
   bool dark = false;                // light-dark() takes its second colour
   uint32_t current = 0xFF000000;    // what currentcolor is
+  allocators::IAllocator* alloc = nullptr;   // for the text relative colours are rebuilt in (without it they are not understood)
 };
 
 bool color_value(StringView text, const ColorContext& ctx, int depth, uint32_t* argb);
@@ -1089,8 +1090,16 @@ uint32_t from_space(Vec3 c, Space space, double alpha) {
   return 0;
 }
 
+// What a mix came to before it was made into 8-bit sRGB (for serializing it in its own space).
+struct MixDetail {
+  Vec3 v = {{0, 0, 0}};
+  Space space = Space::Srgb;
+  double alpha = 1;
+  bool set = false;
+};
+
 // color-mix(in <space> [<hue> hue], <color> [<p>%], <color> [<p>%])
-bool color_mix(StringView inner, const ColorContext& ctx, int depth, uint32_t* out) {
+bool color_mix(StringView inner, const ColorContext& ctx, int depth, uint32_t* out, MixDetail* detail = nullptr) {
   uint64_t at = 0;
   StringView head, c1, c2, extra;
   if (!next_comma_part(inner, &at, &head) || !next_comma_part(inner, &at, &c1) || !next_comma_part(inner, &at, &c2)) return false;
@@ -1164,6 +1173,12 @@ bool color_mix(StringView inner, const ColorContext& ctx, int depth, uint32_t* o
     else { if (h1 < h2) h1 += 360; }
     mixed.v[hi] = wrap_hue(h1 * w1 + h2 * w2);
   }
+  if (detail) {
+    detail->v = mixed;
+    detail->space = space;
+    detail->alpha = alpha * alpha_scale;
+    detail->set = true;
+  }
   *out = from_space(mixed, space, alpha * alpha_scale);
   return true;
 }
@@ -1172,6 +1187,8 @@ bool is_modern_color_function(StringView text) {
   const uint64_t open = text.find('(');
   if (open == StringView::npos) return false;
   const StringView f = text.first(open).trimmed();
+  if (text.substr(open + 1).trimmed().starts_with("from ") && (f.equals_ignore_case("rgb") || f.equals_ignore_case("rgba") || f.equals_ignore_case("hsl") || f.equals_ignore_case("hsla") || f.equals_ignore_case("hwb")))
+    return true;   // (relative colours)
   return f.equals_ignore_case("lab") || f.equals_ignore_case("lch") || f.equals_ignore_case("oklab") || f.equals_ignore_case("oklch") || f.equals_ignore_case("color") ||
          f.equals_ignore_case("color-mix") || f.equals_ignore_case("light-dark");
 }
@@ -1254,9 +1271,188 @@ bool modern_color(StringView text, const ColorContext& ctx, int depth, uint32_t*
   return true;
 }
 
+// A number as a computed colour shows it: up to six decimals, no trailing zeros.
+void append_color_number(String* out, double v) {
+  if (v != v) v = 0;
+  if (v < 0 && v > -0.0000005) v = 0;
+  if (v < 0) {
+    out->push_back('-');
+    v = -v;
+  }
+  if (v > 1e9) v = 1e9;
+  const uint64_t scaled = static_cast<uint64_t>(v * 1000000 + 0.5);
+  out->append_uint(static_cast<uint32_t>(scaled / 1000000));
+  uint32_t fraction = static_cast<uint32_t>(scaled % 1000000);
+  if (fraction == 0) return;
+  char digits[6];
+  for (int i = 5; i >= 0; --i) {
+    digits[i] = static_cast<char>('0' + fraction % 10);
+    fraction /= 10;
+  }
+  int n = 6;
+  while (n > 0 && digits[n - 1] == '0') --n;
+  out->push_back('.');
+  for (int i = 0; i < n; ++i) out->push_back(digits[i]);
+}
+
+void append_color_function(String* out, const char* name, const char* space, double a, double b, double c, double alpha) {
+  out->append(name);
+  out->push_back('(');
+  if (space) {
+    out->append(space);
+    out->push_back(' ');
+  }
+  append_color_number(out, a);
+  out->push_back(' ');
+  append_color_number(out, b);
+  out->push_back(' ');
+  append_color_number(out, c);
+  if (alpha < 0.9999995) {
+    out->append(" / ");
+    append_color_number(out, alpha);
+  }
+  out->push_back(')');
+}
+
+// lab(), lch(), oklab(), oklch(), color() and color-mix() keep their colour space when scripts read them: the text of the computed value, or false for any other colour.
+bool serialize_modern_color(StringView text, const ColorContext& ctx, String* out) {
+  text = text.trimmed();
+  const uint64_t open = text.find('(');
+  if (open == StringView::npos || !text.ends_with(')')) return false;
+  const StringView f = text.first(open).trimmed();
+  const StringView inner = text.substr(open + 1, text.size() - open - 2);
+  if (inner.trimmed().starts_with("from ")) return false;   // (relative colours are worked out to rgb)
+  StringView comps[3];
+  double alpha, c[3];
+  if (f.equals_ignore_case("color-mix")) {
+    uint32_t packed;
+    MixDetail m;
+    if (!color_mix(inner, ctx, 0, &packed, &m) || !m.set) return false;
+    switch (m.space) {
+      case Space::Srgb: append_color_function(out, "color", "srgb", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::SrgbLinear: append_color_function(out, "color", "srgb-linear", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Xyz65: append_color_function(out, "color", "xyz-d65", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Xyz50: append_color_function(out, "color", "xyz-d50", m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Lab: append_color_function(out, "lab", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Lch: append_color_function(out, "lch", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Oklab: append_color_function(out, "oklab", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      case Space::Oklch: append_color_function(out, "oklch", nullptr, m.v.v[0], m.v.v[1], m.v.v[2], m.alpha); return true;
+      default: return false;
+    }
+  }
+  if (f.equals_ignore_case("color")) {
+    uint64_t k = 0;
+    StringView space_name;
+    if (!next_part(inner, &k, &space_name) || !split_components(inner.substr(k), comps, &alpha)) return false;
+    for (int i = 0; i < 3; ++i)
+      if (!color_component(comps[i], 1, &c[i])) return false;
+    static const char* const kNames[] = {"srgb", "srgb-linear", "display-p3", "a98-rgb", "prophoto-rgb", "rec2020", "xyz-d50", "xyz-d65"};
+    const char* canonical = nullptr;
+    for (const char* n : kNames)
+      if (space_name.equals_ignore_case(n)) canonical = n;
+    if (space_name.equals_ignore_case("xyz")) canonical = "xyz-d65";
+    if (!canonical) return false;
+    append_color_function(out, "color", canonical, c[0], c[1], c[2], alpha);
+    return true;
+  }
+  const bool lab = f.equals_ignore_case("lab"), lch = f.equals_ignore_case("lch"), oklab = f.equals_ignore_case("oklab"), oklch = f.equals_ignore_case("oklch");
+  if (!lab && !lch && !oklab && !oklch) return false;
+  if (!split_components(inner, comps, &alpha)) return false;
+  const double scales[4][3] = {{100, 125, 125}, {100, 150, 360}, {1, 0.4, 0.4}, {1, 0.4, 360}};
+  const int which = lab ? 0 : lch ? 1 : oklab ? 2 : 3;
+  for (int i = 0; i < 3; ++i)
+    if (!color_component(comps[i], scales[which][i], &c[i])) return false;
+  const double top = which < 2 ? 100 : 1;
+  c[0] = c[0] < 0 ? 0 : c[0] > top ? top : c[0];
+  if (which == 1 || which == 3) c[1] = c[1] < 0 ? 0 : c[1];
+  append_color_function(out, lab ? "lab" : lch ? "lch" : oklab ? "oklab" : "oklch", nullptr, c[0], c[1], c[2], alpha);
+  return true;
+}
+
+// rgb(from <color> r g b / alpha) and the like: the origin colour's channels replace the keywords, and the result is worked out as the plain function.
+bool relative_color(StringView text, const ColorContext& ctx, int depth, uint32_t* out) {
+  const uint64_t open = text.find('(');
+  if (open == StringView::npos || !text.ends_with(')') || depth > 8 || !ctx.alloc) return false;
+  const StringView f = text.first(open).trimmed();
+  StringView inner = text.substr(open + 1, text.size() - open - 2).trimmed();
+  if (!inner.starts_with("from ")) return false;
+  inner = inner.substr(5).trimmed();
+  uint64_t at = 0;
+  StringView origin_text;
+  if (!next_part(inner, &at, &origin_text)) return false;
+  uint32_t origin;
+  if (!color_value(origin_text, ctx, depth + 1, &origin)) return false;
+  Space space;
+  const char* keys[3];
+  double scale[3] = {1, 1, 1};
+  bool percent_suffix[3] = {false, false, false};
+  const char* name;
+  if (f.equals_ignore_case("rgb") || f.equals_ignore_case("rgba")) { space = Space::Srgb; name = "rgb"; keys[0] = "r"; keys[1] = "g"; keys[2] = "b"; scale[0] = scale[1] = scale[2] = 255; }
+  else if (f.equals_ignore_case("hsl") || f.equals_ignore_case("hsla")) { space = Space::Hsl; name = "hsl"; keys[0] = "h"; keys[1] = "s"; keys[2] = "l"; scale[1] = scale[2] = 100; percent_suffix[1] = percent_suffix[2] = true; }
+  else if (f.equals_ignore_case("hwb")) { space = Space::Hwb; name = "hwb"; keys[0] = "h"; keys[1] = "w"; keys[2] = "b"; scale[1] = scale[2] = 100; percent_suffix[1] = percent_suffix[2] = true; }
+  else if (f.equals_ignore_case("lab")) { space = Space::Lab; name = "lab"; keys[0] = "l"; keys[1] = "a"; keys[2] = "b"; }
+  else if (f.equals_ignore_case("lch")) { space = Space::Lch; name = "lch"; keys[0] = "l"; keys[1] = "c"; keys[2] = "h"; }
+  else if (f.equals_ignore_case("oklab")) { space = Space::Oklab; name = "oklab"; keys[0] = "l"; keys[1] = "a"; keys[2] = "b"; }
+  else if (f.equals_ignore_case("oklch")) { space = Space::Oklch; name = "oklch"; keys[0] = "l"; keys[1] = "c"; keys[2] = "h"; }
+  else return false;
+  bool achromatic;
+  const Vec3 channels = to_space(origin, space, &achromatic);
+  const double origin_alpha = (origin >> 24) / 255.0;
+  // the rest: three components and an optional "/ alpha", each a number, a percentage, a channel keyword or a calc() using them
+  const StringView rest = inner.substr(at <= inner.size() ? at : inner.size());
+  String rebuilt(*ctx.alloc);
+  rebuilt.append(name);
+  rebuilt.push_back('(');
+  bool in_alpha = false;
+  uint64_t k = 0;
+  StringView part;
+  uint32_t index = 0;
+  while (next_part(rest, &k, &part)) {
+    if (part.equals("/")) { in_alpha = true; rebuilt.append("/ "); continue; }
+    const int slot = in_alpha ? 3 : static_cast<int>(index < 3 ? index : 2);
+    if (!in_alpha) ++index;
+    // replace the keywords inside the component by the channels
+    String piece(*ctx.alloc);
+    uint64_t i = 0;
+    while (i < part.size()) {
+      if (is_ident_start(part[i]) && (i == 0 || !is_ident_char(part[i - 1]))) {
+        uint64_t j = i;
+        while (j < part.size() && is_ident_char(part[j])) ++j;
+        const StringView word = part.substr(i, j - i);
+        bool replaced = false;
+        if (word.equals_ignore_case("alpha")) {
+          append_color_number(&piece, origin_alpha);
+          replaced = true;
+        } else {
+          for (int c = 0; c < 3 && !replaced; ++c) {
+            if (word.equals_ignore_case(keys[c])) {
+              append_color_number(&piece, channels.v[c] * scale[c]);
+              replaced = true;
+            }
+          }
+        }
+        if (!replaced) piece.append(word);
+        i = j;
+      } else {
+        piece.push_back(part[i]);
+        ++i;
+      }
+    }
+    rebuilt.append(piece.view());
+    // (a bare keyword that stands for a percentage in the plain function)
+    if (!in_alpha && slot < 3 && percent_suffix[slot] && part.size() <= 1) rebuilt.push_back('%');
+    rebuilt.push_back(' ');
+  }
+  rebuilt.push_back(')');
+  return color_value(rebuilt.view(), ctx, depth + 1, out);
+}
+
 bool color_value(StringView text, const ColorContext& ctx, int depth, uint32_t* argb) {
   text = text.trimmed();
   if (text.equals_ignore_case("currentcolor")) { *argb = ctx.current; return true; }
+  if (text.contains(" from ") || text.find("(from ") != StringView::npos) {
+    if (relative_color(text, ctx, depth, argb)) return true;
+  }
   if (is_modern_color_function(text)) return modern_color(text, ctx, depth, argb);
   return parse_css_color_alpha(text, argb);
 }
@@ -1418,7 +1614,7 @@ uint32_t longhands_of(Prop p, Prop* out) {
 // Copies one longhand from another style: what inherit (from the parent) and initial (from a style with the defaults) do.
 void copy_property(Prop p, const Style& from, Style* to) {
   switch (p) {
-    case pColor: to->color = from.color; to->color_argb = from.color_argb; to->color_argb_set = from.color_argb_set; break;
+    case pColor: to->color = from.color; to->color_argb = from.color_argb; to->color_argb_set = from.color_argb_set; to->color_text = from.color_text; break;
     case pBackgroundColor: to->own_background = from.own_background; to->own_background_color = from.own_background_color; to->background_argb = from.background_argb; break;
     case pFontSize: to->font_px = from.font_px; break;
     case pFontWeight: to->bold = from.bold; to->font_weight = from.font_weight; break;
@@ -2942,6 +3138,7 @@ struct CssApply {
     ColorContext ctx;
     ctx.dark = style->color_scheme == ColorScheme::Dark ? true : style->color_scheme == ColorScheme::Light ? false : sheet.dark_;
     ctx.current = style->color ? style->color : 0xFF000000u;
+    ctx.alloc = &sheet.allocator_;
     return ctx;
   }
 
@@ -3286,6 +3483,9 @@ void CssApply::apply_value(Prop p, StringView value) {
           style->color_argb = argb;
           style->color_argb_set = true;
         }
+        style->color_text = TextRef();
+        String text(sheet.allocator_);
+        if (serialize_modern_color(value, color_context(), &text) && !text.empty()) keep_text(text.view(), &style->color_text);
       }
       break;
     case pBackgroundColor:

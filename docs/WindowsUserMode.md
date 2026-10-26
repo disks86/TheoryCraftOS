@@ -141,8 +141,13 @@ renumbers its services in nearly every build, which is why programs call ntdll);
 ## How things behave
 
 - **Threads** of one program run on all the cores, each on the page tables of the program; changes to the address space reach the other cores before the memory is given back
-  (`Task::sync_tables`). Affinity masks (`SetThreadAffinityMask`, `SetProcessAffinityMask`) are honoured by the scheduler. Priorities and priority classes are kept and read
-  back but do not change the scheduling (it is round-robin).
+  (`Task::sync_tables`). Affinity masks (`SetThreadAffinityMask`, `SetProcessAffinityMask`) are honoured by the scheduler.
+- **Scheduling**: the kernel's ready queue keeps 32 priority levels apart (`kernel::kPriorityLevels`); a core always runs the highest level that has something ready for
+  it, round-robin (time-sliced) among threads at the same level, and a thread of a strictly higher level preempts one already running without waiting for its slice.
+  `SetThreadPriority`/`SetPriorityClass` compute this absolute level from the Win32 priority class and the thread's relative priority (`windowsabi::absolute_thread_priority`,
+  in `src/Process/WindowsProcess.cpp`) the same way real Windows does, and changing a process's class re-levels its existing threads (`repriority_threads`). Not done:
+  priority boosting (a starved low-priority thread is never bumped up), and a process's own initial priority class from `CreateProcess`'s creation flags (it always starts
+  at `NORMAL_PRIORITY_CLASS`; call `SetPriorityClass` afterwards).
 - **Processes**: `CreateProcess` starts another program with its own address space; handles can be inherited (`bInheritHandles`), the standard handles redirected
   (`STARTF_USESTDHANDLES`), the child waited for and terminated. A child ends when the program that started it ends. `OpenProcess` gives access to the exit status and the wait.
 - **Libraries**: `LoadLibrary`/`FreeLibrary` map and unmap DLLs after start-up, with their imports, reference counted; `DllMain` and TLS callbacks run. A DLL's own
