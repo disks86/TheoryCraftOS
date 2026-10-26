@@ -99,6 +99,9 @@
 #include "ThreadSafetyDemo.hpp"
 #include "UtilityDemo.hpp"
 #endif
+#ifdef TCOS_USERMODE_DEMO
+#include "UserModeDemo.hpp"
+#endif
 
 // gdb: `set var g_debugger_attached = 1` releases the boot-time spin loop.
 extern "C" {
@@ -456,6 +459,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
 #ifdef TCOS_SELFTESTS
     if (!run_kernel_demo(shared_allocator)) console::puts("  kernel self-check incomplete\n");
+#endif
+#ifdef TCOS_USERMODE_DEMO
+    run_usermode_demo(shared_allocator);
 #endif
   } else {
     Entry(Level::Fault, "Kernel").text("could not start threads");

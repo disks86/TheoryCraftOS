@@ -30,6 +30,9 @@
 #include "Arch/RiscV64/Timer.hpp"
 #endif
 #include "Kernel/Thread.hpp"
+#if defined(__x86_64__)
+#include "Kernel/UserEntry.hpp"
+#endif
 
 namespace kernel {
 
@@ -38,8 +41,11 @@ namespace {
 constexpr uint32_t kMaxCores = 128;
 constexpr uint32_t kSliceTicks = 10;
 
-struct Core {
+struct alignas(4096) Core {
   Core* self = nullptr;  // first field: read through the GS base
+#if defined(__x86_64__)
+  UserEntry user;        // at offset 64: the entry stubs reach it through GS (and, on the user page tables, this page is mapped for them)
+#endif
   uint32_t index = 0;
   uint64_t apic_id = 0;   // what addresses the core in an inter-processor interrupt (APIC id; MPIDR affinity on ARM)
   bool online = false;
@@ -49,7 +55,16 @@ struct Core {
   Thread* current = nullptr;
   Thread* idle = nullptr;
   uint64_t busy_ticks = 0, idle_ticks = 0;
+#if defined(__x86_64__)
+  // The stack an interrupt or SYSCALL from ring 3 lands on (TSS.rsp0); fills the rest of the page. Frames move to the thread's kernel stack at once.
+  alignas(16) uint8_t entry_stack[3584];
+#endif
 };
+#if defined(__x86_64__)
+static_assert(__builtin_offsetof(Core, user) == 64 && sizeof(Core) == 4096, "the entry stubs and the TSS assume this layout of a core's page");
+static_assert(__builtin_offsetof(UserEntry, user_cr3) == 8 && __builtin_offsetof(UserEntry, kernel_stack) == 16 && __builtin_offsetof(UserEntry, scratch) == 24 &&
+              __builtin_offsetof(UserEntry, entry_stack_top) == 32 && __builtin_offsetof(UserEntry, tramp_exit) == 40);
+#endif
 
 struct ApStart {
   uint32_t core;
@@ -84,7 +99,7 @@ Scheduler g;
 #if defined(__x86_64__)
 alignas(16) uint8_t g_fpu_template[512];
 
-constexpr uint32_t kMsrGsBase = 0xC0000101;
+constexpr uint32_t kMsrGsBase = 0xC0000101, kMsrKernelGsBase = 0xC0000102;
 
 uint64_t rdmsr(uint32_t msr) {
   uint32_t low, high;
@@ -320,6 +335,13 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   next->state = ThreadState::Running;
   next->on_cpu = true;
   c->current = next;
+#if defined(__x86_64__)
+  // A user-mode thread brings its page tables and its GS base along; the entry stubs find them in this core's page.
+  if (prev->user_cr3) prev->user_gs = rdmsr(kMsrKernelGsBase);
+  c->user.user_cr3 = next->user_cr3;
+  c->user.kernel_stack = reinterpret_cast<uint64_t>(next->stack_top);
+  if (next->user_cr3) wrmsr(kMsrKernelGsBase, next->user_gs);
+#endif
   c->slice = kSliceTicks;
   return next->saved;
 }
@@ -428,6 +450,7 @@ Thread* make_thread(ThreadFunction fn, void* argument, const char* name, int32_t
     g.allocator->deallocate(t);
     return nullptr;
   }
+  t->stack_top = t->stack + stack_bytes;
   t->entry = fn;
   t->argument = argument;
   t->name = name;
@@ -600,6 +623,24 @@ uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity) {
   unlock_irq(flags);
   return n;
 }
+
+#if defined(__x86_64__)
+UserEntry* core_user_entry(uint32_t core) { return core < kMaxCores ? &g.cores[core].user : nullptr; }
+uint64_t core_page(uint32_t core) { return core < kMaxCores ? reinterpret_cast<uint64_t>(&g.cores[core]) : 0; }
+uint64_t core_entry_stack_top(uint32_t core) {
+  return core < kMaxCores ? reinterpret_cast<uint64_t>(g.cores[core].entry_stack) + sizeof(g.cores[core].entry_stack) : 0;
+}
+void set_current_user_context(uint64_t cr3, void* context) {
+  const uint64_t flags = irq_save();
+  Core* c = this_core();
+  Thread* t = c->current;
+  if (cr3 && !t->user_cr3) wrmsr(kMsrKernelGsBase, t->user_gs);      // the GS base the program starts with
+  t->user_cr3 = cr3;
+  t->user_context = context;
+  c->user.user_cr3 = cr3;
+  irq_restore(flags);
+}
+#endif
 
 Thread* current_thread() { return g.running ? this_core()->current : nullptr; }
 

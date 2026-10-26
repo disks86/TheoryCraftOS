@@ -48,6 +48,9 @@ add_executable(BOOTX64
   src/Utility/Bounds.cpp
   src/Kernel/Interrupts.cpp
   src/Kernel/Interrupts.S
+  src/Kernel/UserEntry.S
+  src/Kernel/UserMode.cpp
+  src/UserModeDemo.cpp
   src/Kernel/Apic.cpp
   src/Kernel/Paging.cpp
   src/Hardware/MmioMapper.cpp
@@ -554,6 +557,8 @@ add_executable(BOOTX64
   src/Process/Process.cpp
   src/Process/AddressSpace.cpp
   src/Process/ImageLoader.cpp
+  src/Process/UserProgram.cpp
+  src/Process/UserPageTables.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
@@ -687,6 +692,10 @@ target_compile_options(BOOTX64 PRIVATE
 # Keep frame pointers so gdb backtraces work.
 target_compile_options(BOOTX64 PRIVATE -fno-omit-frame-pointer)
 
+option(TCOS_USERMODE_DEMO "Run two small programs in ring 3 at boot (x86-64)" OFF)
+if(TCOS_USERMODE_DEMO)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO)
+endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_SELFTESTS)

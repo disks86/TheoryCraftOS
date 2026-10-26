@@ -1,0 +1,73 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+#pragma once
+#include <stdint.h>
+#include "Allocators/IAllocator.hpp"
+#include "ObjectContainer/List.hpp"
+#include "Process/AddressSpace.hpp"
+#include "Utility/ArrayView.hpp"
+
+namespace process {
+
+// The x86-64 page tables a user-mode process runs on: its AddressSpace regions at their user addresses (4 KiB pages, user-accessible, the permissions of
+// the region), plus a few kernel pages mapped 1:1 and for the kernel only (the entry code the CPU needs while it is still on these tables). Everything
+// else is absent, so a stray user access faults.
+//
+// Table memory comes from the allocator and is used by its address, so it must be mapped 1:1 in the kernel (physical = virtual). The same holds for the
+// regions' backing memory. root() is what goes into CR3.
+class UserPageTables {
+ public:
+  // `nx` says the CPU has no-execute enabled (EFER.NXE); without it the bit would be a reserved bit and fault.
+  UserPageTables(allocators::IAllocator& allocator, bool nx) : allocator_(allocator), tables_(allocator), nx_(nx) {}
+  ~UserPageTables() { release(); }
+  UserPageTables(const UserPageTables&) = delete;
+  UserPageTables& operator=(const UserPageTables&) = delete;
+
+  // A kernel-only page range mapped at its own address. `executable` for code pages. Added to every rebuild.
+  struct Identity {
+    uint64_t address = 0, size = 0;
+    bool writable = false, executable = false;
+  };
+  bool add_identity(const Identity& range);
+
+  // Throws away the tables and builds them again from the address space. False if memory ran out (the tables are then empty: do not run on them).
+  bool rebuild(const AddressSpace& space);
+  // Rebuilds only if the address space changed since the last build.
+  bool sync(const AddressSpace& space) { return (built_ && generation_ == space.generation()) || rebuild(space); }
+
+  uint64_t root() const { return root_; }
+  bool built() const { return built_; }
+
+  // The entry flags used: present, writable, user, no-execute.
+  static constexpr uint64_t kPresent = 1, kWritable = 2, kUser = 4, kNoExecute = 1ull << 63;
+
+ private:
+  bool map_page(uint64_t address, uint64_t physical, uint64_t leaf_flags);
+  uint64_t* new_table();
+  void release();
+
+  allocators::IAllocator& allocator_;
+  List<Identity> identity_ = List<Identity>(allocator_);
+  List<uint64_t*> tables_;
+  bool nx_;
+  bool built_ = false;
+  uint64_t root_ = 0;
+  uint64_t generation_ = 0;
+};
+
+}  // namespace process

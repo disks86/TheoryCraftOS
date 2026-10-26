@@ -42,6 +42,15 @@ isr_stub_\n:
     .set i, i + 1
 .endr
 
+/* GS-relative offsets in the core's page: the UserEntry structure sits 64 bytes in (see Kernel/UserMode.hpp). */
+.set UE_KERNEL_CR3, 64
+.set UE_USER_CR3, 72
+.set UE_KERNEL_STACK, 80
+.set UE_ENTRY_STACK_TOP, 96
+.set UE_TRAMP_EXIT, 104
+
+.global tcos_isr_common
+tcos_isr_common:
 isr_common:
     push rax
     push rcx
@@ -65,6 +74,7 @@ isr_common:
     cld
     call tcos_interrupt_dispatch
     mov rsp, rax
+isr_resume:
     fxrstor [rsp]
     add rsp, 512
     pop r15
@@ -83,7 +93,46 @@ isr_common:
     pop rcx
     pop rax
     add rsp, 16
+    test byte ptr [rsp + 8], 3      /* returning to ring 3? */
+    jnz tcos_to_user
     iretq
+
+/* Returns to user mode: the user page tables are not in force yet, and the kernel stack is not mapped on them, so the iret frame moves to the core's
+ * entry stack (mapped on both), and the final steps run from the trampoline (UserEntry.S). rax, rcx and rdx are borrowed and put back there. */
+tcos_to_user:
+    push rax
+    push rcx
+    push rdx
+    mov rcx, qword ptr gs:[UE_USER_CR3]
+    test rcx, rcx
+    jz 1f
+    mov rax, qword ptr gs:[UE_ENTRY_STACK_TOP]
+    sub rax, 40
+    mov rdx, [rsp + 24]
+    mov [rax], rdx
+    mov rdx, [rsp + 32]
+    mov [rax + 8], rdx
+    mov rdx, [rsp + 40]
+    mov [rax + 16], rdx
+    mov rdx, [rsp + 48]
+    mov [rax + 24], rdx
+    mov rdx, [rsp + 56]
+    mov [rax + 32], rdx
+    mov rdx, [rsp + 16]
+    mov [rax - 8], rdx
+    mov rdx, [rsp + 8]
+    mov [rax - 16], rdx
+    mov rdx, [rsp]
+    mov [rax - 24], rdx
+    lea rsp, [rax - 24]
+    jmp qword ptr gs:[UE_TRAMP_EXIT]
+1:  ud2                             /* a user frame on a thread without user page tables */
+
+/* void tcos_resume_frame(Frame*): continues as if the frame had been saved by an interrupt (the way a new user thread starts). */
+.global tcos_resume_frame
+tcos_resume_frame:
+    mov rsp, rcx
+    jmp isr_resume
 
 .macro ISR_ADDRESS n
     .quad isr_stub_\n

@@ -20,10 +20,14 @@
 #include "Allocators/IAllocator.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Process/Process.hpp"
-#include "Utility/ByteBuffer.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace process {
+
+// A range of addresses the address space must keep free (the kernel's own pages that the CPU's user page tables have to map).
+struct AddressRange {
+  uint64_t base = 0, size = 0;
+};
 
 constexpr uint8_t kProtRead = 1, kProtWrite = 2, kProtExecute = 4;
 
@@ -69,6 +73,20 @@ class AddressSpace final : public IUserMemory {
   // several regions. Returns where the surviving pieces start and the total length up to the last contiguous piece.
   bool allocation_extent(uint64_t address, uint64_t* base, uint64_t* size) const;
 
+  // Addresses no region may cover (map, resize and find_free keep away from them). The ranges must outlive the address space.
+  void set_reserved(ArrayView<const AddressRange> ranges) { reserved_ = ranges; }
+
+  // For building hardware page tables: region `index` (0 .. region_count() - 1, in address order), with the memory that backs it. The backing memory is
+  // page-aligned, `size` bytes long and stays where it is until the layout changes (generation() moves).
+  struct RegionInfo {
+    uint64_t base = 0, size = 0;
+    uint8_t protection = 0;
+    const uint8_t* storage = nullptr;
+  };
+  bool region_at(uint64_t index, RegionInfo* out) const;
+  // Counts every change to the layout (map, unmap, protect, resize), so a user of the page tables knows when to rebuild them.
+  uint64_t generation() const { return generation_; }
+
   // The kernel's own access, which ignores the permissions (a loader fills read-only code pages this way). Fails if any byte is unmapped.
   bool read_privileged(uint64_t address, ByteView out) const { return check(address, out.size(), 0) && copy_out(address, out); }
   bool write_privileged(uint64_t address, ConstByteView data) { return check(address, data.size(), 0) && copy_in(address, data); }
@@ -84,12 +102,25 @@ class AddressSpace final : public IUserMemory {
   uint64_t region_count() const { return regions_.count(); }
 
  private:
+  // One run of pages and the page-aligned memory behind it (`capacity` may exceed `size` after a cut or a shrink).
   struct Region {
-    explicit Region(allocators::IAllocator& allocator) : data(allocator) {}
+    explicit Region(allocators::IAllocator& allocator) : allocator_(allocator) {}
+    ~Region() { release(); }
+    Region(const Region&) = delete;
+    Region& operator=(const Region&) = delete;
+    // Gets `bytes` of zeroed, page-aligned memory (replacing any). False if it ran out.
+    bool allocate(uint64_t bytes);
+    void release();
+    ByteView bytes() const { return ByteView(storage, size); }
     uint64_t base = 0, size = 0, allocation = 0;      // `allocation` ties together the pieces of one map() call
     uint8_t protection = 0;
-    ByteBuffer data;
+    uint8_t* storage = nullptr;
+    uint64_t capacity = 0;
+
+   private:
+    allocators::IAllocator& allocator_;
   };
+  bool overlaps_reserved(uint64_t start, uint64_t end, uint64_t* reserved_end = nullptr) const;
 
   // The index of the first region whose end is above `address` (count() if none).
   uint64_t first_ending_after(uint64_t address) const;
@@ -105,6 +136,8 @@ class AddressSpace final : public IUserMemory {
   uint64_t max_bytes_;
   uint64_t mapped_bytes_ = 0;
   uint64_t next_allocation_ = 1;
+  uint64_t generation_ = 0;
+  ArrayView<const AddressRange> reserved_;
 };
 
 }  // namespace process

@@ -21,6 +21,7 @@
 #include "Hardware/Guest/PvPanic.hpp"
 #include "Hardware/IoPort.hpp"
 #include "Kernel/Apic.hpp"
+#include "Kernel/UserEntry.hpp"
 
 extern "C" {
 extern const uint64_t tcos_isr_table[256];
@@ -30,6 +31,7 @@ kernel::Frame* tcos_interrupt_dispatch(kernel::Frame* frame);
 namespace kernel {
 
 namespace {
+UserFaultHandler g_user_fault_handler = nullptr;
 struct alignas(8) Descriptor {  // 64-bit interrupt gate
   uint16_t offset_low;
   uint16_t selector;
@@ -74,6 +76,8 @@ uint64_t read_cr2() {
   return v;
 }
 }  // namespace
+
+void set_user_fault_handler(UserFaultHandler handler) { g_user_fault_handler = handler; }
 
 void set_interrupt_handler(uint8_t vector, InterruptHandler handler, void* context) {
   g_handlers[vector] = {handler, context};
@@ -189,6 +193,7 @@ extern "C" kernel::Frame* tcos_interrupt_dispatch(kernel::Frame* frame) {
   const uint8_t vector = static_cast<uint8_t>(frame->vector);
   const kernel::HandlerSlot slot = kernel::g_handlers[vector];
   if (slot.handler) return slot.handler(frame, slot.context);
+  if (vector < 32 && (frame->cs & 3) == 3 && kernel::g_user_fault_handler) return kernel::g_user_fault_handler(frame);      // a user program's fault is its own, not the kernel's
   if (vector < 32) kernel::panic(kernel::exception_name(vector), frame);
   // An interrupt nobody asked for (a stray firmware timer, spurious): acknowledge and go on.
   kernel::apic::acknowledge_stray(vector);
