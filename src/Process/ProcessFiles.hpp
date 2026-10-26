@@ -69,6 +69,7 @@ struct OpenObject {
   uint64_t directory_index = 0;      // entries handed out so far (a cookie for getdents)
   filesystem::DirectoryEntry pending;
   bool has_pending = false;          // an entry that was read but did not fit and waits for the next call
+  uint32_t change_watch = 0;         // ReadDirectoryChangesW's own change-notification object for this directory handle, made on its first call; 0 = none yet
 };
 
 // The descriptor table and file operations of one process. Console descriptors 0..2 exist from the start; the file system is attached once.

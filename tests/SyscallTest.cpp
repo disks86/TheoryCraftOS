@@ -424,6 +424,7 @@ static void test_service_numbers_agree() {
       {"NtSelectSockets", WindowsSyscallNumber::NtSelectSockets},
       {"NtCreateChangeNotification", WindowsSyscallNumber::NtCreateChangeNotification},
       {"NtCreateMailslotFile", WindowsSyscallNumber::NtCreateMailslotFile},
+      {"NtNotifyChangeDirectoryFile", WindowsSyscallNumber::NtNotifyChangeDirectoryFile},
       {"NtSetInformationThread", WindowsSyscallNumber::NtSetInformationThread},
       {"NtSetInformationProcess", WindowsSyscallNumber::NtSetInformationProcess},
       {"NtGetCurrentProcessorNumber", WindowsSyscallNumber::NtGetCurrentProcessorNumber},

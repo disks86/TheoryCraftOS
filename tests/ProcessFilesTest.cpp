@@ -626,6 +626,76 @@ static void test_change_notifications() {
   set_system_objects(nullptr);
 }
 
+// FILE_ACTION_ADDED/REMOVED/RENAMED_OLD_NAME/RENAMED_NEW_NAME records (NextEntryOffset, Action, FileNameLength, FileName) chained in one buffer.
+struct NotifyRecord { uint32_t action; std::string name; };
+static std::vector<NotifyRecord> notify_records(NtRig& rig, uint64_t at, uint64_t used) {
+  std::vector<NotifyRecord> out;
+  for (uint64_t off = 0;;) {
+    const std::string h = rig.bytes(at + off, 12);
+    const uint32_t next = uint8_t(h[0]) | (uint8_t(h[1]) << 8) | (uint32_t(uint8_t(h[2])) << 16) | (uint32_t(uint8_t(h[3])) << 24);
+    const uint32_t action = uint8_t(h[4]) | (uint8_t(h[5]) << 8) | (uint32_t(uint8_t(h[6])) << 16) | (uint32_t(uint8_t(h[7])) << 24);
+    const uint32_t name_len = uint8_t(h[8]) | (uint8_t(h[9]) << 8) | (uint32_t(uint8_t(h[10])) << 16) | (uint32_t(uint8_t(h[11])) << 24);
+    out.push_back({action, wide(rig, at + off + 12, name_len)});
+    if (next == 0) break;
+    off += next;
+    if (off >= used) break;
+  }
+  return out;
+}
+
+static void test_read_directory_changes() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  NoWaitSync sync;
+  ObjectManager objects(sync);
+  objects.set_allocator(&A);
+  set_system_objects(&objects);
+  NtRig rig(fs);
+  const uint32_t kGenericRead = 0x80000000u, kSync = 0x100000;
+
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\watched"), rig.alloc(16), {0, 0x80, 7, 2, 1, 0, 0}) == 0);
+  NtRig::Opened dir = rig.create("\\??\\C:\\watched", kGenericRead | kSync, 1 /* FILE_OPEN */, 1 /* FILE_DIRECTORY_FILE */);
+  CHECK(dir.status == 0);
+  // A real program always calls ReadDirectoryChangesW (arming the watch) *before* the change it is meant to catch, typically with OVERLAPPED so the call does not
+  // block its only thread while waiting; this single-threaded, synchronous fixture has no second thread to make a change while blocked in the call. So the watch
+  // is armed here directly (bypassing NtNotifyChangeDirectoryFile's own lazy-creation-on-first-call, which would otherwise have nothing queued yet and hang this
+  // fixture's ISystemSync forever, since it never really waits) - everything downstream (notify_path_changed, take_watch_records) is exercised exactly as normal.
+  OpenObject* dir_object = rig.process->files().object(dir.handle / 4 - 1);
+  CHECK(dir_object != nullptr);
+  const ObjectManager::Created watch = objects.create_change_notification(dir_object->path.view(), false, 0x1 /* FILE_NOTIFY_CHANGE_FILE_NAME */);
+  CHECK(watch.id != 0);
+  dir_object->change_watch = watch.id;
+
+  // a change already pending before the call: it must not block (this fixture's ISystemSync never really waits).
+  NtRig::Opened a_txt = rig.create("\\??\\C:\\watched\\a.txt", kGenericRead, 2, 0x60);
+  CHECK(a_txt.status == 0);
+  rig.call(WindowsSyscallNumber::NtClose, a_txt.handle);      // closed, so NtDeleteFile below is not refused as busy
+  const uint64_t iosb = rig.alloc(16), buffer = rig.alloc(256);
+  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 256, 0x1 /* FILE_NOTIFY_CHANGE_FILE_NAME */, 0}) == 0);
+  uint64_t used = rig.u64(iosb + 8);
+  CHECK(used > 0);
+  std::vector<NotifyRecord> records = notify_records(rig, buffer, used);
+  CHECK(records.size() == 1 && records[0].action == 1 /* FILE_ACTION_ADDED */ && records[0].name == "a.txt");
+
+  // several changes queued between calls come back together, in order, including a rename's two records
+  CHECK(rig.create("\\??\\C:\\watched\\b.txt", kGenericRead, 2, 0x60).status == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtDeleteFile, rig.attributes("\\??\\C:\\watched\\a.txt")) == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 256, 0x1, 0}) == 0);
+  used = rig.u64(iosb + 8);
+  records = notify_records(rig, buffer, used);
+  CHECK(records.size() == 2);
+  CHECK(records[0].action == 1 && records[0].name == "b.txt");
+  CHECK(records[1].action == 2 /* FILE_ACTION_REMOVED */ && records[1].name == "a.txt");
+
+  // a buffer too small for even the first record just reports what fit (nothing): a documented simplification, not a crash
+  CHECK(rig.create("\\??\\C:\\watched\\c.txt", kGenericRead, 2, 0x60).status == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 4, 0x1, 0}) == 0);
+  CHECK(rig.u64(iosb + 8) == 0);
+
+  rig.call(WindowsSyscallNumber::NtClose, dir.handle);
+  set_system_objects(nullptr);
+}
+
 static void test_mailslots() {
   filesystem::RamFileSystem fs(A);
   populate(fs);
@@ -730,6 +800,7 @@ int main() {
   test_linux_files();
   test_windows_files();
   test_change_notifications();
+  test_read_directory_changes();
   test_mailslots();
   test_hostile_arguments();
   CHECK(A.live == 0);
