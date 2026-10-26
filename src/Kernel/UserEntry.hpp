@@ -54,7 +54,19 @@ void set_current_user_context(uint64_t cr3, void* context);
 
 // Gives another thread of the same program the page tables it returns to user mode with (after the program's tables were rebuilt). If the thread is the one running on
 // this core they are also made current.
-void set_thread_user_cr3(Thread* thread, uint64_t cr3);
+// Returns the core the thread is running on right now, or -1.
+int32_t set_thread_user_cr3(Thread* thread, uint64_t cr3);
+
+// A set of cores (by index).
+struct CoreMask {
+  uint64_t words[2] = {};
+  void add(uint32_t core) { if (core < 128) words[core / 64] |= uint64_t{1} << (core % 64); }
+  bool has(uint32_t core) const { return core < 128 && (words[core / 64] >> (core % 64) & 1); }
+  bool empty() const { return !words[0] && !words[1]; }
+};
+// Interrupts the cores (other than the caller's) and waits until each has been in the kernel since the call began: a core that was running a thread of a program in ring 3 has
+// then dropped the program's page tables (the TLB goes with them) and picks up the ones set_thread_user_cr3() gave it. False if a core did not answer within a second.
+bool wait_for_kernel_entry(const CoreMask& cores);
 
 // Changes the FS and/or GS base the calling user thread will return to ring 3 with (and keeps them for later switches).
 void set_current_user_bases(bool set_fs, uint64_t fs, bool set_gs, uint64_t gs);

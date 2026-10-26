@@ -80,7 +80,6 @@ struct Task final : process::IProcessRuntime {
   UserThread* threads = nullptr;      // every thread the program has had, newest first
   Mutex mutex;
   ConditionVariable changed;
-  int32_t home_core = -1;
   char name[24] = {};             // what the process manager calls the program (see set_name())
   uint64_t retired_ticks = 0;     // CPU ticks of the threads that have ended (under `mutex`)
   Task* all_next = nullptr;       // every running program (see process_snapshot()); under the registry's lock

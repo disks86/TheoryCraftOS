@@ -34,7 +34,7 @@ class UserPageTables {
  public:
   // `nx` says the CPU has no-execute enabled (EFER.NXE); without it the bit would be a reserved bit and fault.
   UserPageTables(allocators::IAllocator& allocator, bool nx) : allocator_(allocator), nx_(nx) {}
-  ~UserPageTables() { release(); }
+  ~UserPageTables() { release(); release_previous(); }
   UserPageTables(const UserPageTables&) = delete;
   UserPageTables& operator=(const UserPageTables&) = delete;
 
@@ -47,9 +47,11 @@ class UserPageTables {
 
   // Builds the tables again from the address space. The new tables are made beside the old ones and replace them only when they are complete, so a failure (memory ran
   // out) leaves the old ones as they were, still usable by anything that runs on them.
-  bool rebuild(const AddressSpace& space);
+  // With `keep_previous` the old set is not freed but kept until release_previous() (or the next rebuild): other CPUs may still be running on it.
+  bool rebuild(const AddressSpace& space, bool keep_previous = false);
   // Rebuilds only if the address space changed since the last build.
-  bool sync(const AddressSpace& space) { return (built_ && generation_ == space.generation()) || rebuild(space); }
+  bool sync(const AddressSpace& space, bool keep_previous = false) { return (built_ && generation_ == space.generation()) || rebuild(space, keep_previous); }
+  void release_previous();
 
   uint64_t root() const { return root_; }
   bool built() const { return built_; }

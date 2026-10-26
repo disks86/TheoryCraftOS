@@ -73,7 +73,13 @@ bool UserPageTables::map_page(uint64_t address, uint64_t physical, uint64_t leaf
   return false;
 }
 
-bool UserPageTables::rebuild(const AddressSpace& space) {
+void UserPageTables::release_previous() {
+  for (uint64_t* table : sets_[1 - active_].view()) allocator_.deallocate(table);
+  sets_[1 - active_].clear();
+}
+
+bool UserPageTables::rebuild(const AddressSpace& space, bool keep_previous) {
+  release_previous();      // (what an earlier rebuild kept)
   // Everything goes into the spare set; the current one (what the CPU may be running on) is not touched until the new set is whole.
   auto abandon = [&]() {
     for (uint64_t* table : sets_[1 - active_].view()) allocator_.deallocate(table);
@@ -100,7 +106,7 @@ bool UserPageTables::rebuild(const AddressSpace& space) {
     }
   }
   // Done: the new set replaces the old one.
-  release();
+  if (!keep_previous) release();
   active_ = 1 - active_;
   root_ = building_root_;
   building_root_ = 0;

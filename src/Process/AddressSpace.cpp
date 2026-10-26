@@ -30,9 +30,16 @@ bool AddressSpace::Region::allocate(uint64_t bytes) {
 }
 
 void AddressSpace::Region::release() {
-  if (storage) allocator_.deallocate(storage);
+  if (storage) {
+    if (!retired_.deferred || !retired_.storages.push_back(storage)) allocator_.deallocate(storage);      // (kept for reclaim(), unless there is no room to remember it)
+  }
   storage = nullptr;
   capacity = 0;
+}
+
+void AddressSpace::reclaim() {
+  for (uint8_t* storage : retired_.storages.view()) allocator_.deallocate(storage);
+  retired_.storages.clear();
 }
 
 bool AddressSpace::overlaps_reserved(uint64_t start, uint64_t end, uint64_t* reserved_end) const {
@@ -69,7 +76,7 @@ bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   const uint64_t index = first_ending_after(address);
   if (index < regions_.count() && regions_[index]->base < address + rounded) return false;      // overlaps the region after
   if (overlaps_reserved(address, address + rounded)) return false;
-  UniquePointer<Region> region = UniquePointer<Region>::make(allocator_, allocator_);
+  UniquePointer<Region> region = UniquePointer<Region>::make(allocator_, allocator_, retired_);
   if (!region) return false;
   region->base = address;
   region->size = rounded;
@@ -95,7 +102,7 @@ bool AddressSpace::split_at(uint64_t address) {
   if (i >= regions_.count() || regions_[i]->base >= address) return true;      // already a boundary (or unmapped)
   Region& r = *regions_[i];
   const uint64_t offset = address - r.base;
-  UniquePointer<Region> tail = UniquePointer<Region>::make(allocator_, allocator_);
+  UniquePointer<Region> tail = UniquePointer<Region>::make(allocator_, allocator_, retired_);
   if (!tail) return false;
   tail->base = address;
   tail->size = r.size - offset;
@@ -149,7 +156,7 @@ bool AddressSpace::resize(uint64_t base, uint64_t size) {
     if (overlaps_reserved(base + r.size, base + rounded)) return false;
     if (rounded > r.capacity) {
       // Move to bigger page-aligned memory.
-      Region bigger(allocator_);
+      Region bigger(allocator_, retired_);
       if (!bigger.allocate(rounded)) return false;
       if (r.size) ByteView(bigger.storage, rounded).first(r.size).copy_from(ConstByteView(r.storage, r.size));
       uint8_t* old = r.storage;
