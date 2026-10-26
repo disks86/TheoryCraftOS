@@ -7,14 +7,14 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 | --- | --- | --- |
 | Identified (`*_gpu_identify`) | yes | yes |
 | Boot display / mode setting | `IntelGpu` native path (Gen9.5, unvalidated on hardware) | UEFI GOP only (no Polaris display driver) |
-| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | engine start/stop ported (`AmdUvd6`, below); no ring commands or decode messages yet |
+| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | H.264 on `AmdUvd6VideoEngine`, opt-in (`TCOS_AMD_UVD`), tested in simulation, **not run on hardware** (below); HEVC and the other codecs on the CPU |
 | 3D acceleration | `Gen9GraphicsDevice` on the render engine, opt-in (`TCOS_INTEL_RENDER`), tested in simulation, **not run on hardware** (below) | none (CPU renderer) |
 
 ## Not done
 
 - **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
   None of it exists and none can be checked without the hardware and the firmware blobs.
-- **UVD 6.3 video decode** for the Vega M (H.264, HEVC; no VP9).
+- **UVD 6.3 video decode** for the Vega M beyond H.264 (HEVC; no VP9), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
 
@@ -83,10 +83,9 @@ The firmware is `/firmware/vegam_uvd.bin` (linux-firmware, UVD 6.3, version 1.13
 
 What it does not do, and what is needed before a Vega M decodes anything:
 - **Power and clocks.** amdgpu asks the card's SMC to power the engine and set its clocks (`PPSMC_MSG_UVDPowerON`, `amdgpu_asic_set_uvd_clocks`); here the engine is assumed powered and clocked (usually so on a card the system firmware set up).
-- **Memory: planned, not wired.** `AmdGmc8Memory` reads the memory controller the way amdgpu does (`CONFIG_MEMSIZE`, `MC_VM_FB_LOCATION`; both set by the card's firmware, nothing is written), places the engine's block, ring and
+- **Memory: planned and wired (opt-in).** `AmdGmc8Memory` reads the memory controller the way amdgpu does (`CONFIG_MEMSIZE`, `MC_VM_FB_LOCATION`; both set by the card's firmware, nothing is written), places the engine's block, ring and
   a work area (96 MiB if there is room, 8 MiB at least) at the end of the part of video memory the CPU can reach through BAR 0 (the first 256 MiB without Resizable BAR), clear of the firmware's start of memory
-  (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. What is missing is the plumbing:
-  finding the card's register BAR (BAR 5) and memory BAR (BAR 0, with its size) from PCI and creating the objects at boot, and the video device on top (`IVideoDecoder` for H.264 and HEVC). That the memory controller lets
+  (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. That the memory controller lets
   the engine reach these addresses unchanged (VMID 0, inside the system aperture the firmware set) is the driver's behaviour and has not been seen on the card.
 - **The ring: done in simulation.** `AmdUvd6Ring` ports the ring side (`uvd_v6_0_ring_emit_ib`, `_emit_fence`, `_insert_nop`, `_set_wptr`, `_ring_test_ring`) and builds the indirect buffer Mesa builds
   (`radeon_uvd.c`: each buffer's address through the GPCOM registers and its command, then the engine start); the command numbers are the same as the VCN ones. It flushes the host data path before it
@@ -100,7 +99,13 @@ What it does not do, and what is needed before a Vega M decodes anything:
 - **The H.264 session: done in simulation.** `AmdUvd6AvcDecoder` is an `IVideoDecoder` (the same session logic as the VCN one: parser, decoded picture buffer rules, output order, avcC and Annex B, grey for a picture the
   engine fails, wedge on a missed fence, one session at a time) over the UVD ring, the messages and the work memory. `tests/AmdUvd6AvcDecoderTest.cpp` runs whole streams through it against a simulated ring controller and a stand-in
   for the firmware that checks the messages and buffers and writes the CPU decoder's pictures into the target; the session must return exactly the CPU decoder's pictures, in order. It also covers a wedged engine, too little
-  memory and 24 damaged variants of the stream (under the sanitizers). Making the stand-in's checks wrong (the target address, the pitch) makes the test fail by the hundreds. What is missing is the glue that makes the card a video
-  device (`AmdUvd6VideoEngine`, like `AmdVcnVideoEngine`: PCI discovery, the BARs, the memory plan, the firmware, power, `AmdUvd6::start`, the ring test, a self-test decode, then `create_decoder`) and everything on the card itself.
+  memory and 24 damaged variants of the stream (under the sanitizers). Making the stand-in's checks wrong (the target address, the pitch) makes the test fail by the hundreds. - **The video device: done in simulation, opt-in.** `AmdUvd6VideoEngine` (a `SoftwareVideoCodec`, like `AmdVcnVideoEngine`) loads `vegam_uvd.bin`, reads the memory controller and the graphics block's `GB_ADDR_CONFIG`
+  (it refuses to start if that reads zero or all ones), plans and maps the memory, starts `AmdUvd6` (three boot tries), runs the decode ring's own test and the same H.264 self-test the VCN engine runs
+  (`AmdVcnSelfTest::run_h264_session`: this OS's own 64 x 64 stream, decoded by the engine and the CPU, byte for byte). Only then does `create_decoder` hand H.264 sessions to the engine (one at a time); any failure stops
+  the engine and H.264 stays on the CPU, and every other codec is the CPU's. `SystemVideoCodecs::add_amd_uvd6` finds BAR 0 (with its size) and BAR 5 for device IDs 694C/E/F; it is switched on by
+  `-DTCOS_AMD_UVD=ON` (off by default, since the start has never touched a real card). `tests/AmdUvd6VideoEngineTest.cpp` runs the whole path against one simulated card (memory controller, graphics block, engine boot,
+  ring controller, a stand-in firmware that decodes with the CPU decoder) and ten cases: success (sessions served by the engine, second session on the CPU, shutdown), no firmware, no registers, too small an aperture,
+  a mapper that refuses, an engine that never answers, a graphics block that reports nothing, a ring that does not run, an engine that writes wrong pictures, and one that never finishes a picture.
+- Still open on the video side: HEVC (`ruvd_h265`) and the other codecs, reading the feedback area back, SMC power/clock requests (a card whose engine the firmware left unpowered makes the start time out; it is stopped and reported), and a run on a real card.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.
