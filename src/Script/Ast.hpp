@@ -50,6 +50,7 @@ enum NodeFlag : uint8_t {
   kFlagComputed = 2,     // Property: [key]: value
   kFlagShorthand = 4,    // Property: { name }
   kFlagOptional = 8,     // Member / Index / Call: ?.
+  kFlagPatternAssign = 64,   // Call: a lowered `pattern = value`; c is the original Assign, for when it turns out to be a nested pattern with a default
   kFlagArrow = 1,        // Function
   kFlagExprBody = 2,     // Function: arrow with an expression as its body
   kFlagRest = 4,         // Function: the last parameter is ...rest

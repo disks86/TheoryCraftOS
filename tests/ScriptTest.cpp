@@ -732,6 +732,10 @@ static void test_destructuring() {
   CHECK(is("const swap = ([a, b]) => [b, a]; swap([1, 2]).join()", "2,1"));
   CHECK(is("var { a = 10, b = a * 2 } = {}; a + ',' + b", "10,20"));
   CHECK(is("var o = { arr: [1, 2] }; var { arr: [one, two] } = o; one + two", "3"));
+  CHECK(is("var { a: { b } = { b: 1 } } = {}; b", "1"));
+  CHECK(is("var { a: [b] = [2] } = {}; b", "2"));
+  CHECK(is("var [a = 1, [b] = [3]] = []; a + b", "4"));
+  CHECK(is("var f = ({ a: { b } = { b: 5 } }) => b; f({})", "5"));
 }
 
 static void test_generators() {
