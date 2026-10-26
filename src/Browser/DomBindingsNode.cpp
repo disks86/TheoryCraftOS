@@ -1549,10 +1549,28 @@ void mutation_hook(void* context) {
   c.vm.request_epilogue();   // (custom element reactions run as soon as the call that made the change is over)
 }
 
+// A <script> element was put in the tree by a script: its serial is kept for the epilogue, which hands the element to __script_inserted (the module and
+// script loader in the module script, WebPrelude.cpp).
+void script_inserted_hook(void* context, dom::Node* script) {
+  DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
+  if (c.pending_scripts.count() >= 256) return;
+  c.pending_scripts.push_back(script->serial);
+  c.vm.request_epilogue();
+}
+
 void mutation_epilogue(void* context) {
   DomBindings::Impl& c = *static_cast<DomBindings::Impl*>(context);
   Value fn;
   Value ignored;
+  while (c.pending_scripts.count() > 0) {
+    const uint32_t serial = c.pending_scripts[0];
+    c.pending_scripts.remove_at(0);
+    dom::Node* node = c.doc.by_serial(serial);
+    if (!node || node->script_started || !dom::is_connected(node)) continue;
+    Value arg = node_value(c, node);
+    if (c.vm.get_named(Value::make_object(c.vm.global()), "__script_inserted", &fn) && Vm::is_callable(fn)) c.vm.call(fn, Value(), &arg, 1, &ignored);
+  }
+  if (!c.doc.recording()) return;
   if (c.vm.get_named(Value::make_object(c.vm.global()), "__process_mutations", &fn) && Vm::is_callable(fn)) c.vm.call(fn, Value(), nullptr, 0, &ignored);
 }
 
@@ -1659,6 +1677,8 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(g, "__take_mutations", take_mutations, 0);
   vm.define_native(g, "__register_tag", register_tag, 2);
   vm.set_construct_hook(construct_element, &c);
+  c.doc.set_insert_hook(script_inserted_hook, &c);
+  vm.set_epilogue(mutation_epilogue, &c);
   vm.define_native(g, "__collection_item", collection_item, 1);
   vm.define_native(g, "__collection_named", collection_named, 1);
   {   // (they are used as values: kept, but not shown)

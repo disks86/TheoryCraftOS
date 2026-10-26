@@ -27,11 +27,14 @@ A test for something the engines do not do yet is listed with `xfail("name")` be
 run reports `XPASS name` and fails, so the entry gets deleted and the gap is closed for good. The registry is therefore the list of conformance
 gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
 
-- **JavaScript**: ES modules are not implemented at all (no `import`/`export`, `import()`, `import.meta`, `<script type=module>`); no `BigInt64Array`,
-  `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, iterator helpers, `Intl` beyond basic formatting, RegExp lookbehind / property
-  escapes / `v` flag / `d` flag / duplicate named groups, `Object.prototype.toString` tags for most builtins, TDZ, per-iteration `let` bindings in
-  `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`, `String.prototype.normalize`/special casing, lone-surrogate handling,
-  `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key order, and a call depth of 500.
+- **JavaScript**: ES modules work (`import`/`export`, `import()`, `import.meta`, top-level await, `<script type=module>`, `nomodule`, import maps; the
+  loader is `module_prelude()` in `WebPrelude.cpp` over `__compile_module`), but the namespace object is not frozen (no non-extensible objects or
+  non-configurable properties in the engine), there is no strict mode (module code is sloppy), and an anonymous `export default class` is not named
+  "default". Also missing: `BigInt64Array`, `SharedArrayBuffer`/`Atomics`, resizable/transferable `ArrayBuffer`, iterator helpers, `Intl` beyond basic
+  formatting, RegExp lookbehind / property escapes / `v` flag / `d` flag / duplicate named groups, `Object.prototype.toString` tags for Date, Map, Set and
+  arguments, TDZ, per-iteration `let` bindings in `for`, sloppy `arguments` mapping, `Symbol.match/split/unscopables`,
+  `String.prototype.normalize`/special casing, lone-surrogate handling, `new.target`/`Reflect.construct`, tagged template caching, `for…in` integer key
+  order, and a call depth of 500.
 - **HTML**: the adoption agency algorithm and foster parenting, `<image>`→`<img>`, form/nobr/optgroup/ruby rules, comment and CDATA tokenizer states,
   `U+0000`/CR handling, foreign-content breakout, `&nbsp;` serialisation, frameset documents, doctype identifiers and quirks mode, XML parsing in
   `DOMParser`, `innerHTML` scripts must not run.

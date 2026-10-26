@@ -26,6 +26,7 @@
 #include <new>
 #include "Script/Ast.hpp"
 #include "Script/Number.hpp"
+#include "Utility/Move.hpp"
 
 namespace script {
 
@@ -73,7 +74,95 @@ void append_utf8(uint32_t cp, String* out) {
 
 class Parser {
  public:
+  struct ExportEntry {
+    enum Kind : uint8_t { Local, From, Star, StarAs } kind;
+    StringView exported, local;
+    uint32_t request;
+  };
+
   Parser(StringView source, Arena& arena, String* error) : src_(source), arena_(arena), error_(error), scratch_(arena.allocator()) {}
+
+  // A module: see parse_module() in Ast.hpp.
+  Node* module_program(ModuleRequests* requests) {
+    module_ = true;
+    requests_ = requests;
+    in_async_ = true;   // (top-level await)
+    next();
+    Node* body = arena_.make(NodeKind::Block, 1);
+    if (!body) return nullptr;
+    Node** tail = &body->list;
+    while (cur_.kind != T::Eof && !failed_) {
+      Node* s = statement();
+      if (!s) break;
+      if (s->kind == NodeKind::Empty && s->flags == 0xFF) continue;   // (an export that leaves no statement)
+      *tail = s;
+      tail = &s->next;
+    }
+    if (failed_) return nullptr;
+    // imports first, then the definitions of the exports, then the module's own statements
+    Node* head = nullptr;
+    Node** head_tail = &head;
+    Node* rest = nullptr;
+    Node** rest_tail = &rest;
+    for (Node* s = body->list; s;) {
+      Node* following = s->next;
+      s->next = nullptr;
+      if (s->kind == NodeKind::Import) {
+        *head_tail = s;
+        head_tail = &s->next;
+      } else {
+        *rest_tail = s;
+        rest_tail = &s->next;
+      }
+      s = following;
+    }
+    for (uint64_t i = 0; i < exports_.count() && !failed_; ++i) {
+      const ExportEntry& e = exports_[i];
+      Node* call = nullptr;
+      if (e.kind == ExportEntry::Star) {
+        call = new_call(new_ident("__export_star"), {new_ident("__exports"), deps_index(e.request)});
+      } else {
+        Node* value = nullptr;
+        if (e.kind == ExportEntry::Local) value = new_ident(e.local);
+        else if (e.kind == ExportEntry::StarAs) value = deps_index(e.request);
+        else {
+          Node* index = make(NodeKind::Index);
+          if (!index) return nullptr;
+          index->a = deps_index(e.request);
+          index->b = new_string(e.local);
+          value = index;
+        }
+        Node* getter = make(NodeKind::Function);
+        if (!getter || !value) return nullptr;
+        getter->flags = kFlagArrow | kFlagExprBody;
+        getter->a = value;
+        call = new_call(new_ident("__export_get"), {new_ident("__exports"), new_string(e.exported), getter});
+      }
+      if (!call) return nullptr;
+      Node* st = new_statement(call);
+      if (!st) return nullptr;
+      *head_tail = st;
+      head_tail = &st->next;
+    }
+    *head_tail = rest;
+    body->list = head;
+    Node* fn = make(NodeKind::Function);
+    if (!fn) return nullptr;
+    fn->flags = kFlagAsync;
+    fn->a = body;
+    Node** params = &fn->list;
+    for (const char* name : {"__deps", "__exports", "import.meta"}) {
+      Node* p = new_ident(name);
+      if (!p) return nullptr;
+      *params = p;
+      params = &p->next;
+    }
+    Node* program = arena_.make(NodeKind::Block, 1);
+    Node* st = new_statement(fn);
+    if (!program || !st) return nullptr;
+    program->list = st;
+    return program;
+  }
 
   Node* program() {
     next();
@@ -404,6 +493,10 @@ class Parser {
       next();
       return n;
     }
+    if (module_ && depth_ == 1 && cur_.kind == T::Ident) {
+      if (cur_.text.equals("export")) return export_declaration();
+      if (cur_.text.equals("import") && !import_expression_ahead()) return import_declaration();
+    }
     if (cur_.kind == T::Ident) {
       const StringView w = cur_.text;
       if (w.equals("var") || w.equals("const") || (w.equals("let") && let_declaration_ahead())) {
@@ -452,6 +545,267 @@ class Parser {
     if (!n->a) return nullptr;
     consume_semicolon();
     return n;
+  }
+
+  // --- Modules
+  Node* deps_index(uint32_t request) {
+    Node* index = make(NodeKind::Index);
+    Node* number = make(NodeKind::Number);
+    if (!index || !number) return nullptr;
+    number->number = request;
+    index->a = new_ident("__deps");
+    index->b = number;
+    return index->a ? index : nullptr;
+  }
+  uint32_t request_of(StringView specifier) {
+    for (uint64_t i = 0; i < requests_->specifiers.count(); ++i)
+      if (requests_->specifiers[i].view().equals(specifier)) return static_cast<uint32_t>(i);
+    String text(arena_.allocator());
+    text.append(specifier);
+    if (!requests_->specifiers.push_back(util::move(text))) fail("Out of memory");
+    return static_cast<uint32_t>(requests_->specifiers.count() - 1);
+  }
+  // `import(` or `import.` ahead: an expression, not a declaration.
+  bool import_expression_ahead() {
+    const Mark m = mark();
+    next();
+    const bool yes = is(T::LParen) || is(T::Dot);
+    rewind(m);
+    return yes;
+  }
+  // A name in an import or export list: an identifier (reserved words allowed) or a string.
+  bool module_name(StringView* out) {
+    if (!is(T::Ident) && !is(T::String)) {
+      fail("Unexpected token");
+      return false;
+    }
+    *out = cur_.text;
+    next();
+    return true;
+  }
+  bool module_specifier(uint32_t* request) {
+    if (!is(T::String)) {
+      fail("Unexpected token");
+      return false;
+    }
+    *request = request_of(cur_.text);
+    next();
+    return !failed_;
+  }
+  void add_export(ExportEntry::Kind kind, StringView exported, StringView local, uint32_t request) {
+    if (kind != ExportEntry::Star)
+      for (uint64_t i = 0; i < exports_.count(); ++i)
+        if (exports_[i].kind != ExportEntry::Star && exports_[i].exported.equals(exported)) {
+          fail("Duplicate export");
+          return;
+        }
+    if (!exports_.push_back(ExportEntry{kind, exported, local, request})) fail("Out of memory");
+    if (kind == ExportEntry::Star) {
+      String entry(arena_.allocator());
+      entry.append_uint(request);
+      if (!requests_->stars.push_back(util::move(entry))) fail("Out of memory");
+    } else {
+      note_name(requests_->exports, exported);
+      if (kind == ExportEntry::From) note_import(request, local);
+    }
+  }
+
+  Node* import_declaration() {
+    Node* n = make(NodeKind::Import);
+    if (!n) return nullptr;
+    next();   // `import`
+    Node** tail = &n->list;
+    auto add_spec = [&](StringView local, StringView imported, bool is_namespace) -> bool {
+      Node* d = make(NodeKind::Declarator);
+      if (!d) return false;
+      d->text = local;
+      if (!is_namespace) {
+        d->a = new_string(imported);
+        if (!d->a) return false;
+      }
+      *tail = d;
+      tail = &d->next;
+      return true;
+    };
+    uint32_t request = 0;
+    if (is(T::String)) {   // import "module";
+      if (!module_specifier(&request)) return nullptr;
+      n->number = request;
+      consume_semicolon();
+      return failed_ ? nullptr : n;
+    }
+    bool more = true;
+    if (is(T::Ident) && !is(T::LBrace)) {   // the default import
+      if (reserved(cur_.text)) return null_fail("Unexpected token");
+      if (!add_spec(cur_.text, "default", false)) return nullptr;
+      next();
+      more = accept(T::Comma);
+    }
+    if (more) {
+      if (accept(T::Star)) {
+        if (!accept_word("as") || !is(T::Ident) || reserved(cur_.text)) return null_fail("Unexpected token");
+        if (!add_spec(cur_.text, StringView(), true)) return nullptr;
+        next();
+      } else if (accept(T::LBrace)) {
+        while (!is(T::RBrace) && !is(T::Eof) && !failed_) {
+          const bool word = is(T::Ident);
+          StringView imported, local;
+          if (!module_name(&imported)) return nullptr;
+          local = imported;
+          if (accept_word("as")) {
+            if (!is(T::Ident) || reserved(cur_.text)) return null_fail("Unexpected token");
+            local = cur_.text;
+            next();
+          } else if (!word || reserved(imported)) {
+            return null_fail("Unexpected token");
+          }
+          if (!add_spec(local, imported, false)) return nullptr;
+          if (!accept(T::Comma)) break;
+        }
+        if (!expect(T::RBrace, "Unexpected token")) return nullptr;
+      } else {
+        return null_fail("Unexpected token");
+      }
+    }
+    if (!accept_word("from") || !module_specifier(&request)) return null_fail("Unexpected token");
+    n->number = request;
+    for (Node* d = n->list; d; d = d->next)
+      if (d->a) note_import(request, d->a->text);
+    consume_semicolon();
+    return failed_ ? nullptr : n;
+  }
+
+  void note_import(uint32_t request, StringView name) {
+    String entry(arena_.allocator());
+    entry.append_uint(request);
+    entry.push_back(':');
+    entry.append(name);
+    if (!requests_->imports.push_back(util::move(entry))) fail("Out of memory");
+  }
+  void note_name(List<String>& list, StringView name) {
+    String entry(arena_.allocator());
+    entry.append(name);
+    if (!list.push_back(util::move(entry))) fail("Out of memory");
+  }
+
+  // The Empty statement that stands for "nothing to run here" (the caller drops it).
+  Node* no_statement() {
+    Node* n = make(NodeKind::Empty);
+    if (n) n->flags = 0xFF;
+    return n;
+  }
+
+  Node* export_declaration() {
+    next();   // `export`
+    if (accept_word("default")) return export_default();
+    if (accept(T::Star)) {
+      StringView name;
+      const bool as = accept_word("as");
+      if (as && !module_name(&name)) return nullptr;
+      uint32_t request;
+      if (!accept_word("from") || !module_specifier(&request)) return null_fail("Unexpected token");
+      add_export(as ? ExportEntry::StarAs : ExportEntry::Star, name, StringView(), request);
+      consume_semicolon();
+      return failed_ ? nullptr : no_statement();
+    }
+    if (accept(T::LBrace)) {
+      struct Pair { StringView local, exported; };
+      List<Pair> pairs(arena_.allocator());
+      while (!is(T::RBrace) && !is(T::Eof) && !failed_) {
+        Pair pr;
+        if (!module_name(&pr.local)) return nullptr;
+        pr.exported = pr.local;
+        if (accept_word("as") && !module_name(&pr.exported)) return nullptr;
+        pairs.push_back(pr);
+        if (!accept(T::Comma)) break;
+      }
+      if (!expect(T::RBrace, "Unexpected token")) return nullptr;
+      uint32_t request = 0;
+      const bool from = accept_word("from");
+      if (from && !module_specifier(&request)) return nullptr;
+      for (uint64_t i = 0; i < pairs.count(); ++i) add_export(from ? ExportEntry::From : ExportEntry::Local, pairs[i].exported, pairs[i].local, request);
+      consume_semicolon();
+      return failed_ ? nullptr : no_statement();
+    }
+    if (is_word("var") || is_word("const") || (is_word("let") && let_declaration_ahead())) {
+      Node* decl = var_declaration(false);
+      if (!decl) return nullptr;
+      consume_semicolon();
+      for (Node* d = decl->list; d; d = d->next)
+        if (!d->text.empty() && d->text[0] != '%') add_export(ExportEntry::Local, d->text, d->text, 0);
+      return decl;
+    }
+    if (is_word("function") || (is_word("async") && async_function_ahead())) {
+      const bool is_async = is_word("async");
+      if (is_async) next();
+      Node* decl = function_declaration(is_async);
+      if (decl) add_export(ExportEntry::Local, decl->text, decl->text, 0);
+      return decl;
+    }
+    if (is_word("class")) {
+      Node* decl = class_declaration();
+      if (decl && decl->list) add_export(ExportEntry::Local, decl->list->text, decl->list->text, 0);
+      return decl;
+    }
+    return null_fail("Unexpected token");
+  }
+
+  Node* export_default() {
+    // a named function or class is a declaration that is also exported as "default"; anything else is an expression kept in a variable of its own
+    bool declaration = false;
+    bool is_async = false;
+    {
+      const Mark m = mark();
+      if (is_word("async") && async_function_ahead()) {
+        is_async = true;
+        next();
+      }
+      if (is_word("function")) {
+        next();
+        accept(T::Star);
+        declaration = is(T::Ident) && !reserved(cur_.text);
+      } else if (is_word("class")) {
+        next();
+        declaration = is(T::Ident) && !reserved(cur_.text) && !is_word("extends");
+        is_async = false;
+      }
+      rewind(m);
+    }
+    if (declaration) {
+      Node* decl;
+      if (is_word("class")) {
+        decl = class_declaration();
+        if (decl && decl->list) add_export(ExportEntry::Local, "default", decl->list->text, 0);
+      } else {
+        if (is_async) next();
+        decl = function_declaration(is_async);
+        if (decl) add_export(ExportEntry::Local, "default", decl->text, 0);
+      }
+      return decl;
+    }
+    Node* value;
+    if (is_word("function") || (is_word("async") && async_function_ahead())) {
+      const bool a = is_word("async");
+      if (a) next();
+      value = function_rest(true, a);
+      if (value) {
+        value->text = "default";   // (the function's name, which is not a binding inside it)
+        value->flags &= static_cast<uint8_t>(~kFlagExpression);
+      }
+    } else {
+      value = assignment(false);
+      consume_semicolon();
+    }
+    if (!value) return nullptr;
+    Node* v = make(NodeKind::Var);
+    Node* d = make(NodeKind::Declarator);
+    if (!v || !d) return nullptr;
+    v->var_kind = VarKind::Let;
+    d->text = "*default*";
+    d->a = value;
+    v->list = d;
+    add_export(ExportEntry::Local, "default", "*default*", 0);
+    return v;
   }
 
   bool let_declaration_ahead() {
@@ -2078,6 +2432,7 @@ class Parser {
       default: return null_fail("Unexpected token");
     }
     const StringView w = cur_.text;
+    if (w.equals("import")) return import_expression();
     if (w.equals("function")) return function_rest(true);
     if (w.equals("class")) return class_expression();
     if (w.equals("super")) return super_expression();
@@ -2107,6 +2462,25 @@ class Parser {
     n->text = w;
     next();
     return n;
+  }
+
+  // import.meta (in a module) and import(specifier) (anywhere): a call of __dynamic_import(specifier, the address of the module or undefined).
+  Node* import_expression() {
+    next();   // `import`
+    if (accept(T::Dot)) {
+      if (!is_word("meta")) return null_fail("Unexpected token");
+      if (!module_) return null_fail("Cannot use 'import.meta' outside a module");
+      next();
+      return new_ident("import.meta");
+    }
+    if (!is(T::LParen)) return null_fail("Unexpected token");
+    next();
+    Node* specifier = assignment(false);
+    if (!specifier) return nullptr;
+    accept(T::Comma);
+    if (!expect(T::RParen, "Unexpected token")) return nullptr;
+    Node* referrer = module_ ? new_member(new_ident("import.meta"), "url") : new_ident("undefined");
+    return new_call(new_ident("__dynamic_import"), {specifier, referrer});
   }
 
   Node* array_literal() {
@@ -2311,9 +2685,18 @@ class Parser {
   StringView class_super_;     // while a class body is parsed: the variable that holds its parent ("%S"), empty for a class without one
   bool class_static_ = false;  // ... and whether the member being parsed is static
   uint32_t depth_ = 0;
+  // modules
+  bool module_ = false;
+  ModuleRequests* requests_ = nullptr;
+  List<ExportEntry> exports_{arena_.allocator()};
 };
 
 }  // namespace
+
+Node* parse_module(StringView source, Arena& arena, String* error, ModuleRequests* requests) {
+  Parser parser(source, arena, error);
+  return parser.module_program(requests);
+}
 
 Node* parse_program(StringView source, Arena& arena, String* error) {
   Parser parser(source, arena, error);

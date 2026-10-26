@@ -62,6 +62,7 @@ struct Node {
   Node* content = nullptr;   // <template>: the fragment that holds what is inside it (it is not part of the page)
   Node* shadow = nullptr;    // elements: the shadow root (a fragment) that is drawn in place of the children
   Node* shadow_host = nullptr;   // a shadow root: the element it belongs to
+  bool script_started = false;    // a <script> that was run or must not run again ("already started"): also those a parser made for innerHTML
   bool template_content = false;   // a fragment: it is the content of a <template> (its nodes belong to a document of their own as far as scripts can tell)
   bool shadow_closed = false;    // a shadow root made with mode "closed
   uint16_t caret = 0xFFFF, anchor = 0xFFFF;   // a text control: where the caret is and the other end of the selection (0xFFFF: at the end)
@@ -133,6 +134,13 @@ class Document {
     if (context) hook_context_ = context;
   }
   bool recording() const { return recording_; }
+  // Scripts that are put into the tree by a script are run by the host: `hook` is called for each <script> element that got a place in the document's tree
+  // (not one a parser made: those are marked script_started).
+  void set_insert_hook(void (*hook)(void*, Node*), void* context) {
+    insert_hook_ = hook;
+    insert_context_ = context;
+  }
+  void inserted(Node* node);
   // Nodes somebody observes (a MutationObserver's targets): each record says which of them it happened in.
   void watch(Node* node) {
     for (uint64_t i = 0; i < watched_.count(); ++i)
@@ -153,6 +161,8 @@ class Document {
   List<Mutation> log_;
   List<Node*> watched_;
   bool recording_ = false;
+  void (*insert_hook_)(void*, Node*) = nullptr;
+  void* insert_context_ = nullptr;
   void (*hook_)(void*) = nullptr;
   void* hook_context_ = nullptr;
 };

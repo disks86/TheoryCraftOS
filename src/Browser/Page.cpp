@@ -178,6 +178,11 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
+      if (!engine_->run_library(module_prelude(), &prelude_error)) {
+        prelude_error.insert(0, "The module script failed: ");
+        env_.console(3, prelude_error.view());
+      }
+      prelude_error.clear();
       if (!engine_->run_library(webgl_prelude(), &prelude_error)) {
         prelude_error.insert(0, "The WebGL script failed: ");
         env_.console(3, prelude_error.view());
@@ -356,6 +361,15 @@ bool Page::load(StringView html) {
   const bool ok = dom::build_document(doc_, html, scripts_enabled_ ? static_cast<dom::IScriptRunner*>(this) : nullptr);
   loading_ = false;
   if (!ok) return false;
+  if (scripts_enabled_ && !engine_) {   // (a page whose only scripts are modules or import maps: the parser left them to the module loader)
+    for (dom::Node* n = doc_.root(); n; n = dom::next_in_tree(n, doc_.root())) {
+      StringView type;
+      if (n->is_tag("script") && dom::get_attribute(n, "type", &type) && (type.equals_ignore_case("module") || type.equals_ignore_case("importmap"))) {
+        start_engine();
+        break;
+      }
+    }
+  }
   if (engine_ && bindings_) {
     bindings_->set_current_script(nullptr);
     bindings_->set_ready_state("interactive");
@@ -363,6 +377,8 @@ bool Page::load(StringView html) {
     state_change.cancelable = false;
     state_change.bubbles = false;
     bindings_->dispatch(doc_.root(), "readystatechange", state_change);
+    bindings_->call_hook("__run_parsed_scripts", nullptr, 0);   // (module scripts run after parsing and before DOMContentLoaded)
+    flush_errors();
     EventInit bubbling;
     bubbling.cancelable = false;
     bindings_->dispatch(doc_.root(), "DOMContentLoaded", bubbling);
