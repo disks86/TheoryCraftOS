@@ -708,6 +708,7 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   const uint32_t text_color = s.color ? s.color : (dark ? 0xE8E8E8 : 0x000000);
   if (s.color_argb_set && (s.color_argb >> 24) != 0xFF) rgba_text(s.color_argb, &t);
   else rgb_text(text_color, &t);
+  if (element->is_tag("a") && dom::has_attribute(element, "href") && !s.color && !s.color_argb_set) t.assign("rgb(0, 0, 238)");
   set("color", t.view());
   t.clear();
   if (s.background_argb != 0 && (s.background_argb >> 24) != 0xFF) rgba_text(s.background_argb, &t);
@@ -727,6 +728,17 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
       case Layout::TableCaption: display = "table-caption"; break;
       default: display = s.display == Display::ListItem ? "list-item" : s.display == Display::Block ? (s.inline_box ? "inline-block" : "block") : "inline"; break;
     }
+  }
+  // controls are inline-blocks; a floated or absolutely positioned box is blockified
+  if (display[0] == 'i' && element->is_element() &&
+      (element->is_tag("button") || element->is_tag("input") || element->is_tag("select") || element->is_tag("textarea") || element->is_tag("meter") || element->is_tag("progress")))
+    display = "inline-block";
+  if (s.display != Display::None && !s.contents && (s.float_side != Float::None || s.position == Position::Absolute || s.position == Position::Fixed)) {
+    if (StringView(display).equals("inline") || StringView(display).equals("inline-block") || StringView(display).equals("table-row-group") ||
+        StringView(display).equals("table-row") || StringView(display).equals("table-cell") || StringView(display).equals("table-caption")) display = "block";
+    else if (StringView(display).equals("inline-flex")) display = "flex";
+    else if (StringView(display).equals("inline-grid")) display = "grid";
+    else if (StringView(display).equals("inline-table")) display = "table";
   }
   set("display", display);
   set("visibility", s.visibility == Visibility::Hidden ? "hidden" : s.visibility == Visibility::Collapse ? "collapse" : "visible");
@@ -754,7 +766,7 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
     StringView family = sheet ? sheet->text(s.font_family) : StringView();
     set("fontFamily", family.empty() ? StringView("monospace") : family);
   }
-  set("verticalAlign", s.vertical_align == 1 ? "top" : s.vertical_align == 2 ? "middle" : s.vertical_align == 3 ? "bottom" : "baseline");
+  set("verticalAlign", s.vertical_align == 0 && element->is_tag("sub") ? "sub" : s.vertical_align == 0 && element->is_tag("sup") ? "super" : s.vertical_align == 1 ? "top" : s.vertical_align == 2 ? "middle" : s.vertical_align == 3 ? "bottom" : "baseline");
   // the box
   static const char* const kMargin[4] = {"marginTop", "marginRight", "marginBottom", "marginLeft"};
   static const char* const kPadding[4] = {"paddingTop", "paddingRight", "paddingBottom", "paddingLeft"};

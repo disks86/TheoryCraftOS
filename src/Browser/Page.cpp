@@ -23,6 +23,7 @@
 #include "Layout/BoxBuilder.hpp"
 #include "Layout/FontMeasurer.hpp"
 #include "Layout/Layout.hpp"
+#include "Layout/Table.hpp"
 #include "Paint/PaintBuilder.hpp"
 #include "Browser/ResourceScan.hpp"
 #include "Browser/Url.hpp"
@@ -538,8 +539,26 @@ const StyleSheet& Page::style_sheet() {
   return style_cache_;
 }
 
+Style derive_style(const Style& parent, const dom::Node* n, const StyleSheet& sheet);   // Renderer.cpp
+
 bool Page::computed_style(const dom::Node* element, Style* out) {
-  *out = browser::computed_style(style_sheet(), element);
+  // the same chain the box builder walks, table presentation (td, tr, cellpadding ...) included
+  const dom::Node* chain[512];
+  uint32_t depth = 0;
+  for (const dom::Node* n = element; n && n->is_element() && depth < 512; n = n->parent) chain[depth++] = n;
+  const StyleSheet& sheet = style_sheet();
+  Style s;
+  for (uint32_t i = depth; i > 0; --i) {
+    const dom::Node* n = chain[i - 1];
+    const Style parent = s;
+    s = derive_style(parent, n, sheet);
+    if (s.display != Display::None) layout::apply_table_presentation(n, parent, sheet, &s);
+    if (s.own_background) {
+      s.background = s.own_background_color;
+      s.background_block = s.display != Display::Inline;
+    }
+  }
+  *out = s;
   return true;
 }
 

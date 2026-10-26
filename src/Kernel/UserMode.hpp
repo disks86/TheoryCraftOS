@@ -120,6 +120,8 @@ struct Task final : process::IProcessRuntime {
   uint32_t current_processor() override;
   bool process_exists(uint64_t pid) override;
   uint32_t list_processes(ProcessEntry* out, uint32_t capacity) override;
+  uint32_t list_threads(uint64_t pid, ThreadEntry* out, uint32_t capacity) override;
+  uint32_t list_modules(uint64_t pid, ModuleEntry* out, uint32_t capacity) override;
   uint64_t allocate_process_id() override;
   uint32_t spawn_process(const process::ChildSpec& spec) override;
   bool terminate_process(uint64_t pid, uint32_t code) override;
@@ -144,7 +146,7 @@ struct Task final : process::IProcessRuntime {
 UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name, bool suspended = false);
 // --- Monitoring (the computer manager). Cumulative CPU counters; a tick is 1 / tick_rate() seconds on one core.
 struct ProcessInfo {
-  uint64_t id = 0, parent_id = 0;
+  uint64_t id = 0, parent_id = 0, create_time = 0;
   char name[24] = {};
   bool windows = false;        // otherwise Linux
   uint32_t threads = 0;        // live threads
@@ -154,6 +156,9 @@ struct ProcessInfo {
 };
 // Copies up to `capacity` running programs; returns how many were written. Safe from any thread.
 uint32_t process_snapshot(ProcessInfo* out, uint32_t capacity);
+// The threads and modules of one running program (see process::IProcessRuntime). Safe from any thread that does not hold that program's lock.
+uint32_t thread_snapshot(uint64_t pid, process::IProcessRuntime::ThreadEntry* out, uint32_t capacity);
+uint32_t module_snapshot(uint64_t pid, process::IProcessRuntime::ModuleEntry* out, uint32_t capacity);
 
 
 // Ends the program as soon as it can: at its next system call or timer tick, whichever comes first (a blocked wait must be woken by the caller, for

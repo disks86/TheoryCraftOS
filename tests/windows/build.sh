@@ -46,6 +46,8 @@ $cc -O1 -Wall -Wextra -o "$out/consoletest.exe" tests/windows/consoletest.c
 echo "built $out/consoletest.exe (screen buffers, cursor, modes, ANSI sequences, key events)"
 $cc -O1 -Wall -Wextra -o "$out/jobtest.exe" tests/windows/jobtest.c
 echo "built $out/jobtest.exe (job objects; procchild.exe in System32)"
+$cc -O1 -Wall -Wextra -o "$out/toolhelptest.exe" tests/windows/toolhelptest.c
+echo "built $out/toolhelptest.exe (Toolhelp32 lists, HeapWalk, psapi; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/locktest.exe" tests/windows/locktest.c
 echo "built $out/locktest.exe (byte-range locks; procchild.exe in System32)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c

@@ -62,7 +62,19 @@ void ua_defaults(const dom::Node* n, Style* s) {
   if (tag_in(n, {"blockquote", "dd"})) s->margin[3] = Length::px(3200);   // (four columns)
   if (tag_in(n, {"b", "strong", "th"})) s->bold = true;
   if (tag_in(n, {"code", "tt", "kbd", "samp"})) s->code = true;
-  if (tag_in(n, {"pre", "listing", "xmp"})) s->pre = true;
+  if (tag_in(n, {"pre", "listing", "xmp"})) {
+    s->pre = true;
+    if (s->white_space == 0) s->white_space = 2;
+  }
+  if (tag_in(n, {"em", "i", "cite", "var", "dfn", "address"})) s->italic = true;
+  if (n->is_tag("ol") && s->list_type == 0 && !s->list_none) s->list_type = 3;
+  if (tag_in(n, {"ul", "menu", "dir"}) && s->list_type == 3) s->list_type = 0;
+  if (n->is_tag("dialog") && !dom::has_attribute(n, "open")) s->display = Display::None;
+  if (n->is_tag("mark")) {
+    s->own_background = true;
+    s->own_background_color = 0xFFFF00;
+    s->background_argb = 0xFFFFFF00;
+  }
   if (tag_in(n, {"u", "ins"})) s->underline = true;
   if (tag_in(n, {"s", "strike", "del"})) s->strike = true;
   if (tag_in(n, {"center", "caption", "th"})) s->align = 1;
