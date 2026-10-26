@@ -2068,6 +2068,76 @@ EXPORT BOOL WINAPI SetNamedPipeHandleState(HANDLE h, LPDWORD mode, LPDWORD colle
   const NTSTATUS status = NtSetInformationFile(h, &iosb, info, sizeof(info), 23);
   return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
+
+/* CreateMailslot/GetMailslotInfo/SetMailslotInfo: the one reader (NtCreateMailslotFile). A writer is just CreateFile(\\.\mailslot\name) - an ordinary file service,
+ * like a named pipe's client end, needing no wrapper of its own here. MAILSLOT_WAIT_FOREVER (0xFFFFFFFF ms) is a null NT ReadTimeout (wait forever); any other
+ * millisecond value becomes a relative, negative 100ns one, the convention every other timeout in this OS's NT layer already uses. */
+#define MAILSLOT_WAIT_FOREVER_ 0xFFFFFFFFu
+static BOOL mailslot_nt_name(LPCWSTR name, WCHAR *buffer, UNICODE_STRING *us, OBJECT_ATTRIBUTES *attributes, BOOL inherit) {
+  static const WCHAR prefix[] = {'\\', '\\', '.', '\\', 'm', 'a', 'i', 'l', 's', 'l', 'o', 't', '\\', 0};
+  static const WCHAR nt_prefix[] = {'\\', '?', '?', '\\', 'm', 'a', 'i', 'l', 's', 'l', 'o', 't', '\\', 0};
+  size_t_ i = 0;
+  while (prefix[i] && (name[i] == prefix[i] || (name[i] | 0x20) == (prefix[i] | 0x20))) ++i;
+  if (prefix[i]) { set_error(ERROR_INVALID_NAME); return FALSE; }
+  const size_t_ rest = wcslen(name + i);
+  if (rest > 250) { set_error(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+  memcpy(buffer, nt_prefix, 13 * 2);
+  memcpy(buffer + 13, name + i, (rest + 1) * 2);
+  us->Buffer = buffer;
+  us->Length = (USHORT)((13 + rest) * 2);
+  us->MaximumLength = (USHORT)(us->Length + 2);
+  attributes->Length = sizeof(OBJECT_ATTRIBUTES);
+  attributes->RootDirectory = NULL;
+  attributes->ObjectName = us;
+  attributes->Attributes = 0x40 | (inherit ? 2 : 0);
+  attributes->SecurityDescriptor = attributes->SecurityQualityOfService = NULL;
+  return TRUE;
+}
+EXPORT HANDLE WINAPI CreateMailslotW(LPCWSTR name, DWORD max_message_size, DWORD read_timeout_ms, LPSECURITY_ATTRIBUTES sa) {
+  WCHAR buffer[300];
+  UNICODE_STRING us;
+  OBJECT_ATTRIBUTES attributes;
+  if (!name || !mailslot_nt_name(name, buffer, &us, &attributes, sa && sa->bInheritHandle)) return INVALID_HANDLE_VALUE;
+  LARGE_INTEGER timeout;
+  const BOOL forever = read_timeout_ms == MAILSLOT_WAIT_FOREVER_;
+  timeout.QuadPart = forever ? 0 : -10000ll * (LONGLONG)read_timeout_ms;
+  HANDLE h = NULL;
+  IO_STATUS_BLOCK iosb;
+  const NTSTATUS status = NtCreateMailslotFile(&h, 0xC0100000u /* GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE */, &attributes, &iosb, 0, 0, max_message_size,
+                                               forever ? NULL : &timeout);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return INVALID_HANDLE_VALUE; }
+  return h;
+}
+EXPORT HANDLE WINAPI CreateMailslotA(LPCSTR name, DWORD max_message_size, DWORD read_timeout_ms, LPSECURITY_ATTRIBUTES sa) {
+  WCHAR *w = name ? to_wide(name) : NULL;
+  if (!w) { if (name) return INVALID_HANDLE_VALUE; set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  HANDLE h = CreateMailslotW(w, max_message_size, read_timeout_ms, sa);
+  free_wide(w);
+  return h;
+}
+EXPORT BOOL WINAPI GetMailslotInfo(HANDLE h, LPDWORD max_message_size, LPDWORD next_size, LPDWORD message_count, LPDWORD read_timeout_ms) {
+  IO_STATUS_BLOCK iosb;
+  BYTE info[24];
+  const NTSTATUS status = NtQueryInformationFile(h, &iosb, info, sizeof(info), 26 /* FileMailslotQueryInformation */);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (max_message_size) *max_message_size = get32(info);
+  if (next_size) *next_size = get32(info + 8);
+  if (message_count) *message_count = get32(info + 12);
+  if (read_timeout_ms) {
+    const LONGLONG hundred_ns = *(const LONGLONG *)(info + 16);
+    *read_timeout_ms = hundred_ns == 0 ? MAILSLOT_WAIT_FOREVER_ : (DWORD)(-hundred_ns / 10000);
+  }
+  return TRUE;
+}
+EXPORT BOOL WINAPI SetMailslotInfo(HANDLE h, DWORD read_timeout_ms) {
+  IO_STATUS_BLOCK iosb;
+  BYTE info[8];
+  const LONGLONG hundred_ns = read_timeout_ms == MAILSLOT_WAIT_FOREVER_ ? 0 : -10000ll * (LONGLONG)read_timeout_ms;
+  memcpy(info, &hundred_ns, 8);
+  const NTSTATUS status = NtSetInformationFile(h, &iosb, info, sizeof(info), 27 /* FileMailslotSetInformation */);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+
 /* Overlapped I/O is done at once here: the OVERLAPPED is filled in as the system would, the event is set, and the call returns the result (a program that handles
    ERROR_IO_PENDING never sees it; one that waits on the event finds it set). */
 static void complete_overlapped(LPOVERLAPPED overlapped, NTSTATUS status, ULONG_PTR bytes) {
@@ -2404,6 +2474,34 @@ EXPORT HANDLE WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECUR
   free_wide(w);
   return h;
 }
+
+/* FindFirstChangeNotification/FindNextChangeNotification/FindCloseChangeNotification: the handle is an ordinary ChangeNotification object (NtCreateChangeNotification),
+ * signalled like a manual-reset event when something changes under the watched directory - WaitForSingleObject/WaitForMultipleObjects already work on it unmodified.
+ * FindNextChangeNotification re-arms it the same way ResetEvent does (it is reset(), not a separate NT service); FindCloseChangeNotification is just CloseHandle. */
+EXPORT HANDLE WINAPI FindFirstChangeNotificationW(LPCWSTR path, BOOL watch_subtree, DWORD notify_filter) {
+  if (!path) { set_error(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+  WCHAR buffer[PATH_CHARS + 8];
+  UNICODE_STRING name;
+  OBJECT_ATTRIBUTES attributes;
+  if (!nt_name(path, buffer, &name, &attributes)) return INVALID_HANDLE_VALUE;
+  HANDLE handle = NULL;
+  const NTSTATUS status = NtCreateChangeNotification(&attributes, watch_subtree ? 1 : 0, notify_filter, &handle);
+  if (!NT_SUCCESS(status)) {
+    set_error(status == STATUS_OBJECT_PATH_NOT_FOUND || status == STATUS_OBJECT_NAME_NOT_FOUND ? ERROR_PATH_NOT_FOUND :
+              status == STATUS_NOT_A_DIRECTORY ? ERROR_DIRECTORY : RtlNtStatusToDosError(status));
+    return INVALID_HANDLE_VALUE;
+  }
+  return handle;
+}
+EXPORT HANDLE WINAPI FindFirstChangeNotificationA(LPCSTR path, BOOL watch_subtree, DWORD notify_filter) {
+  WCHAR *w = to_wide(path);
+  if (!w) return INVALID_HANDLE_VALUE;
+  HANDLE h = FindFirstChangeNotificationW(w, watch_subtree, notify_filter);
+  free_wide(w);
+  return h;
+}
+EXPORT BOOL WINAPI FindNextChangeNotification(HANDLE h) { const NTSTATUS s = NtResetEvent(h, NULL); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI FindCloseChangeNotification(HANDLE h) { return CloseHandle(h); }
 
 /* The two 64-bit queries on an open file. */
 static BOOL query_position(HANDLE h, LONGLONG *position) {

@@ -19,6 +19,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Crypto/Crypto.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnAv1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnAvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnHevcDecoder.hpp"
@@ -37,7 +38,7 @@ namespace hardware {
 // does not: CABAC, B pictures, weighted prediction, the deblocking filter (the stream switches it off), 8x8 transform, and picture sizes other than the test's.
 class AmdVcnSelfTest {
  public:
-  enum class Result : uint8_t { Passed, NoMemory, StreamFailed, SessionRefused, EngineFailed, Mismatch };
+  enum class Result : uint8_t { Passed, NoMemory, StreamFailed, SessionRefused, EngineFailed, Mismatch, HashMismatch };
   static constexpr uint32_t kPictures = 5;
   static constexpr uint32_t kSize = 64;
 
@@ -65,6 +66,20 @@ class AmdVcnSelfTest {
   // The same check on any engine's H.265 session (already prepared): `wedged(ring)` says whether the engine's ring gave up, `decoded(decoder)` how many pictures the
   // engine itself decoded (all of them must have gone through it).
   static Result run_hevc_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*), const void* decoder);
+  // The MD5 the decoders check pictures with (see H265Decoder::set_plane_hasher).
+  struct Md5PlaneHasher final : IPlaneHasher {
+    void md5(const uint8_t* plane, uint32_t width, uint32_t height, uint32_t stride, uint8_t out[16]) override {
+      crypto::Hasher h(crypto::HashKind::Md5);
+      for (uint32_t y = 0; y < height; ++y) h.update(ConstByteView(plane + uint64_t{y} * stride, width));
+      h.finish(out);
+    }
+  };
+  // The same for H.265 Main 10: a ten-bit libx265 stream (64 x 64, six pictures, B pictures with reordering; AmdVcnSelfTestHevc10Stream.inc). The CPU decoder cannot decode ten
+  // bits, so the reference is the stream itself: it carries an MD5 of every decoded picture (an SEI message), which the decoder checks over the engine's pictures once the
+  // session has been given an Md5PlaneHasher (`hashes(decoder)` returns the statistics). Passing means every picture went through the engine, came out as P010 and agreed with its CRC. What it proves beyond the 8-bit
+  // test: the message's depth fields and the P010 surface, the slot sizes and context of Main 10. Not: other sizes, scaling lists, tiles.
+  static Result run_hevc10_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*),
+                                   H265Decoder::HashStatistics (*hashes)(const void*), const void* decoder);
   // The same for AV1: a libaom stream (64 x 64, ten temporal units with hidden frames and show_existing_frame; AmdVcnSelfTestAv1Stream.inc). What passing proves beyond
   // the above: the reference slot bookkeeping of the AV1 message (which engine picture each reference slot holds, across hidden frames and shown-again ones), the initial
   // entropy contexts, the tile table. Not: tiles, film grain, super-resolution, 10-bit, other sizes.

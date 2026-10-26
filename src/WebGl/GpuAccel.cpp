@@ -32,6 +32,7 @@ inline uint32_t f2u(float f) { return __builtin_bit_cast(uint32_t, f); }
 }  // namespace
 
 void Device::hw_release() {
+  if (hw_) hw_textures_.release(*hw_);
   if (hw_ && hw_target_) hw_->destroy_target(hw_target_);
   hw_ = nullptr;
   hw_target_ = 0;
@@ -93,6 +94,35 @@ void Device::hw_end() {
   hw_pass_ = hw_ahead_ = false;
 }
 
+// The texture a bound view and sampler make, as the device can read it: one mip level of a single-layer 2D RGBA8 (not sRGB) texture, sampled with a plain
+// nearest or linear filter and wrap or clamp addressing.
+bool Device::hw_texture(const Bound& b, uint32_t* handle, webgl::AccelSampler* sampler) {
+  constexpr uint32_t kMaxSide = 1024;
+  const TextureView* v = b.view;
+  const Texture* t = b.tex;
+  const Sampler* s = b.sampler;
+  if (!hw_ || !v || !t || !s || t->destroyed || !t->format || t->format->gl != 0x8058) return false;
+  if (t->samples != 1 || t->dimension != 1 || t->depth != 1 || v->dim != 1 || v->mip_count != 1 || v->base_layer != 0 || v->aspect != 0 || v->base_mip >= t->mips.count()) return false;
+  if (v->texture != 0 && view(hw_view_) && v->texture == view(hw_view_)->texture) return false;   // the picture being drawn: the texture is not up to date
+  if (s->comparison || s->anisotropy > 1 || s->params.compare_mode != 0) return false;
+  auto linear = [](uint32_t filter, bool* out) {
+    *out = filter == 0x2601 || filter == 0x2701 || filter == 0x2703;
+    return filter >= 0x2600 && filter <= 0x2703 && (filter <= 0x2601 || filter >= 0x2700);
+  };
+  bool min_linear, mag_linear;
+  if (!linear(s->params.min_filter, &min_linear) || !linear(s->params.mag_filter, &mag_linear) || min_linear != mag_linear) return false;
+  auto wrap = [](uint32_t mode, bool* repeat) {
+    *repeat = mode == 0x2901;
+    return mode == 0x2901 || mode == 0x812F;
+  };
+  if (!wrap(s->params.wrap_s, &sampler->repeat_s) || !wrap(s->params.wrap_t, &sampler->repeat_t)) return false;
+  sampler->linear = min_linear;
+  const webgl::Image* im = t->mips[v->base_mip].get();
+  if (!im || !im->info || im->info->store != webgl::Store::U8x4 || im->info->srgb || im->ss != 1 || im->d != 1 || im->w > kMaxSide || im->h > kMaxSide) return false;
+  *handle = hw_textures_.get(*hw_, (uint64_t{v->texture} << 32) | v->base_mip, im->w, im->h, im->px.view());
+  return *handle != 0;
+}
+
 bool Device::hw_program(RenderPipeline& rp, IAccelerator& acc) {
   if (rp.accel_tried) return rp.accel_program != 0;
   rp.accel_tried = true;
@@ -100,7 +130,7 @@ bool Device::hw_program(RenderPipeline& rp, IAccelerator& acc) {
   if (!rp.vs || !rp.fs || rp.vs_fn < 0 || rp.fs_fn < 0) return false;
   UniquePointer<TgsiProgram> t = UniquePointer<TgsiProgram>::make(a_, a_);
   if (!t || !webgl::translate_wgsl_to_tgsi(a_, *rp.vs, rp.vs_fn, *rp.fs, rp.fs_fn, t.get())) return false;
-  rp.accel_program = acc.create_program(t->vs.c_str(), t->fs.c_str(), static_cast<uint32_t>(t->attributes.count()), t->varyings);
+  rp.accel_program = acc.create_program(t->vs.c_str(), t->fs.c_str(), static_cast<uint32_t>(t->attributes.count()), t->varyings, static_cast<uint32_t>(t->samplers.count()));
   if (rp.accel_program) rp.tgsi = static_cast<UniquePointer<TgsiProgram>&&>(t);
   return rp.accel_program != 0;
 }
@@ -198,6 +228,20 @@ bool Device::hw_draw(RenderPipeline& rp, uint32_t count, uint32_t first, int32_t
       if (!constants.put32(lanes[i])) return false;
   }
 
+  // the textures: the handles the bind groups gave the fragment shader's bindings
+  webgl::AccelState tex_state;
+  tex_state.texture_count = static_cast<uint32_t>(t.samplers.count());
+  if (tex_state.texture_count > webgl::kAccelMaxTextures) return false;
+  for (uint32_t k = 0; k < tex_state.texture_count; ++k) {
+    const webgl::TgsiSampler& ts = t.samplers[k];
+    if (!ts.wgsl || ts.slot >= fregion.count() || ts.sampler_slot >= fregion.count()) return false;
+    const uint32_t th = fregion[ts.slot], sh = fregion[ts.sampler_slot];
+    if (th == 0 || th > bound_.count() || sh == 0 || sh > bound_.count()) return false;
+    Bound b = bound_[th - 1];
+    b.sampler = bound_[sh - 1].sampler;
+    if (!hw_texture(b, &tex_state.textures[k], &tex_state.samplers[k])) return false;
+  }
+
   // the vertex data: four float lanes per attribute (a location no buffer feeds reads 0, 0, 0, 1 like the CPU path)
   ByteBuffer vertices(a_);
   for (uint64_t vi = 0; vi < tris.count(); ++vi) {
@@ -239,6 +283,11 @@ bool Device::hw_draw(RenderPipeline& rp, uint32_t count, uint32_t first, int32_t
   st.cull = rp.cull == 1 ? 1 : (rp.cull == 2 ? 2 : 0);
   st.front_ccw = !rp.front_ccw;
   st.blend = ct.blend;
+  st.texture_count = tex_state.texture_count;
+  for (uint32_t k = 0; k < st.texture_count; ++k) {
+    st.textures[k] = tex_state.textures[k];
+    st.samplers[k] = tex_state.samplers[k];
+  }
   if (!acc->draw(hw_target_, rp.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) return false;
   hw_ahead_ = true;
   return true;

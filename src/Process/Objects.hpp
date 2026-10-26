@@ -44,7 +44,7 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, ChangeNotification, Mailslot };
 
 class ObjectManager {
  public:
@@ -162,6 +162,39 @@ class ObjectManager {
   uint32_t job_set(uint32_t job, const JobInfo& in, bool extended);       // NTSTATUS
   bool job_kill_for(uint64_t pid, uint32_t* code);                  // lock-free: has this process been flagged to end?
 
+  // --- change notifications (kind ChangeNotification; FindFirstChangeNotification/ReadDirectoryChangesW): a handle that becomes signalled, exactly like a manual-reset
+  // event, when something is created, deleted, renamed or linked directly under the directory it watches (or anywhere under it, if `watch_subtree`). It carries no
+  // detail about what changed, matching FindFirstChangeNotification's own contract; reset it (FindNextChangeNotification) with reset_event(), which this kind shares with
+  // Event. `filter` is kept but not matched against: every one of those changes signals every watch of its directory, regardless of which FILE_NOTIFY_CHANGE_* bits it asked
+  // for (a simplification, like this OS's permissive registry access checks).
+  static constexpr uint32_t kMaxWatches = 64, kWatchPathBytes = 512;
+  Created create_change_notification(StringView path, bool watch_subtree, uint32_t filter);
+  // Call after any successful change to a directory's contents (a file or subdirectory created, deleted, renamed or linked): `affected_directory` is that directory's
+  // own virtual path (the parent of whatever changed, not the changed entry itself). Signals every watch whose directory this is under (or equal to).
+  void notify_path_changed(StringView affected_directory);
+
+  // --- mailslots (kind Mailslot; CreateMailslot/CreateFile(\\.\mailslot\name)): one reader (the handle CreateMailslot returns) and any number of writers, all on this
+  // machine - there is no network broadcast here, unlike a real mailslot's domain-wide one. A writer's message is queued whole (never split across reads) until the
+  // reader takes it; closing the reader destroys the mailslot (a writer with a handle still open then sees it as gone). `read_timeout_100ns`: ~0 (MAILSLOT_WAIT_FOREVER,
+  // a null NT timeout) waits forever, 0 does not wait at all, matching every other timeout in this codebase (not real mailslots' own millisecond convention - kernel32
+  // converts GetMailslotInfo/SetMailslotInfo/CreateMailslot's millisecond values at that layer, the way it already converts disposition/options for CreateFile).
+  static constexpr uint32_t kMaxMailslots = 64, kMailslotBufferBytes = 16384, kMaxMailslotMessages = 256;
+  Created create_mailslot(StringView name, uint32_t max_message_size, uint64_t read_timeout_100ns);
+  // A writer's handle (CreateFile on the name): finds the reader's mailslot by name. Status 0xC0000034 (STATUS_OBJECT_NAME_NOT_FOUND) if no mailslot has that name.
+  Created open_mailslot_writer(StringView name);
+  enum class MailslotResult { Ok, NoMessage, TooSmall, TooBig, Full, Gone };
+  // Queues one whole message (a no-op boundary, never coalesced with another write's bytes). TooBig: longer than `max_message_size` (0: no cap - just the buffer's own
+  // capacity). Full: the buffer or the pending-message count is full right now (there is no "wait for room": a message is queued at once or not at all).
+  MailslotResult mailslot_write_locked(uint32_t id, ConstByteView data);
+  // Takes the oldest pending message. TooSmall (nothing taken; `*message_size` is how big it actually is, so the caller can retry with a bigger buffer, matching a
+  // real mailslot's ERROR_INSUFFICIENT_BUFFER - the message is not lost) if `capacity` is less than the message's size; NoMessage if the queue is empty right now.
+  MailslotResult mailslot_read_locked(uint32_t id, uint8_t* out, uint32_t capacity, uint32_t* got, uint32_t* message_size);
+  // GetMailslotInfo/SetMailslotInfo (NtQueryInformationFile/NtSetInformationFile classes 26/27).
+  bool mailslot_info(uint32_t id, uint32_t* max_message_size, uint64_t* read_timeout_100ns, uint32_t* next_message_size, uint32_t* message_count);
+  bool mailslot_set_timeout(uint32_t id, uint64_t read_timeout_100ns);
+  // The reader's own handle closing (not a writer's): destroys the mailslot at once, same as the real one. A no-op if `id` is a writer or already gone.
+  void mailslot_close_reader(uint32_t id);
+
   // --- timers (kind Timer: create() and open() make and find them; a notification timer stays signalled once it fired, a synchronization timer wakes one waiter)
   struct TimerApc { uint64_t routine = 0, context = 0, time = 0; };
   // Arms the timer: due at `due_ns` on the clock of sync().now_ns() (periodic every `period_ns`, 0: once). With a `routine`, `thread` gets it as an APC each time it fires.
@@ -194,6 +227,8 @@ class ObjectManager {
     int32_t pipe = -1;                     // pipe: its index in pipes_
     int32_t section = -1;                  // section: its index in sections_
     int32_t job = -1;                      // job: its index in jobs_
+    int32_t watch = -1;                    // change notification: its index in watches_
+    int32_t mailslot = -1;                 // mailslot: its index in mailslots_
     uint64_t due_ns = 0, period_ns = 0;    // timer: when it fires next, how often
     uint64_t apc_thread = 0, apc_routine = 0, apc_context = 0;      // timer: the APC it queues
     bool armed = false, apc_pending = false;
@@ -223,6 +258,13 @@ class ObjectManager {
   void free_pipe_locked(Object& o);
   static constexpr uint32_t kMaxPipes = 128, kMaxSections = 64, kMaxLocks = 256;
 
+  struct Watch { bool used = false; char path[kWatchPathBytes] = {}; uint32_t path_size = 0; bool subtree = false; uint32_t filter = 0; };
+  void free_watch_locked(Object& o);
+
+  struct Mailslot;
+  Mailslot* mailslot_of(uint32_t id);      // (locked)
+  void free_mailslot_locked(Object& o);
+
   ISystemSync& sync_;
   allocators::IAllocator* allocator_ = nullptr;
   Object objects_[kCapacity];
@@ -232,6 +274,8 @@ class ObjectManager {
   Section* sections_ = nullptr;      // kMaxSections, made with the first section
   Job* jobs_ = nullptr;              // kJobMaxJobs, made with the first job (never moved: job_kill_for() reads it without the lock)
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)
+  Watch* watches_ = nullptr;         // kMaxWatches, made with the first change notification
+  Mailslot* mailslots_ = nullptr;    // kMaxMailslots, made with the first mailslot
 };
 
 // The objects of the system (null until whoever runs it has made them: the kernel, at start-up; host tests set their own).

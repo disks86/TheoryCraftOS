@@ -107,4 +107,15 @@
 #define NT_SERVICE_NtReadVirtualMemory 84
 #define NT_SERVICE_NtWriteVirtualMemory 85
 #define NT_SERVICE_NtCreateSymbolicLink 86
+#define NT_SERVICE_NtCreateSocket 87
+#define NT_SERVICE_NtBindSocket 88
+#define NT_SERVICE_NtConnectSocket 89
+#define NT_SERVICE_NtListenSocket 90
+#define NT_SERVICE_NtAcceptSocket 91
+#define NT_SERVICE_NtSendSocket 92
+#define NT_SERVICE_NtReceiveSocket 93
+#define NT_SERVICE_NtSocketControl 94
+#define NT_SERVICE_NtSelectSockets 95
+#define NT_SERVICE_NtCreateChangeNotification 96
+#define NT_SERVICE_NtCreateMailslotFile 97
 #endif

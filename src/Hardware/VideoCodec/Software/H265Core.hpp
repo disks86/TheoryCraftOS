@@ -181,6 +181,10 @@ struct Picture {
   int width = 0, height = 0;                          // luma samples, as coded
   int crop_l = 0, crop_r = 0, crop_t = 0, crop_b = 0; // the conformance window, in luma samples
   bool full_range = false;
+  // More than eight bits a sample: the planes hold 16-bit little-endian words with the value in the low bits (the form of the spec's picture hash), strides in bytes. Only
+  // an offload fills such a picture; depth_luma / depth_chroma are the bits a sample has.
+  bool deep = false;
+  int depth_luma = 8, depth_chroma = 8;
   Mem<ColBlock> col;
   int poc = 0;
   bool in_use = false, is_ref = false, is_long = false, needed_for_output = false, generated = false;

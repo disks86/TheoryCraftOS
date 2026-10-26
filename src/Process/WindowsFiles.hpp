@@ -44,5 +44,10 @@ uint32_t nt_delete_file(Process& p, const SyscallRequest& r);
 uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r);
 uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r);
 uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r);
+// NtCreateChangeNotification(POBJECT_ATTRIBUTES DirectoryAttributes, ULONG WatchTree, ULONG NotifyFilter, PHANDLE Result): this OS's own service, behind
+// FindFirstChangeNotification(W/A) - a handle that becomes signalled (like a manual-reset event) when a file or subdirectory is created, deleted, renamed or linked
+// directly under the named directory, or anywhere under it if WatchTree is nonzero. FindNextChangeNotification is NtResetEvent on the same handle; FindCloseChangeNotification
+// is NtClose. NotifyFilter is kept but not matched against: any of those changes signals the handle, regardless of which FILE_NOTIFY_CHANGE_* bits were asked for.
+uint32_t nt_create_change_notification(Process& p, const SyscallRequest& r);
 
 }  // namespace process::windowsabi

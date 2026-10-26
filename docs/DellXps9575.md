@@ -14,7 +14,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 
 - **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
   None of it exists and none can be checked without the hardware and the firmware blobs.
-- **UVD 6.3 video decode** for the Vega M beyond H.264, H.265, MPEG-2 and VC-1 (10-bit HEVC; MPEG-4; interlaced VC-1; the chip has no VP9), and any run of it on the card.
+- **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2 and VC-1 (MPEG-4; interlaced VC-1; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
@@ -122,6 +122,14 @@ This is **not validated against a running virgl host**: the wire format follows 
 to the software device the same way it does for any pipeline they cannot take. Both devices refuse a draw whose texture is not bound, is the image being drawn into, or was not made for sampling. `tests/GraphicsTest.cpp`
 covers nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal.
 
+WebGL uses these textures through `webgl::IAccelerator` (`WebGl/Accelerator.hpp`): `create_texture`/`write_texture`/`destroy_texture` (RGBA8, first row first, no mipmaps), `AccelState::textures`/`samplers`
+(at most `kAccelMaxTextures` = 2) and a `textures` count on `create_program`. `TgsiTranslator` turns `texture2D`/`texture` of a `uniform sampler2D` in a fragment shader into `TEX ... SAMP[i], 2D`
+(`TgsiProgram::samplers` says which uniform slot holds each sampler's unit); vertex-shader lookups, explicit levels, cube/3D/array/shadow samplers and a third sampler still refuse. `GlContext::hw_texture`
+(`GlAccel.cpp`) takes a draw only when each sampled texture is a 2D RGBA8 (non-sRGB) texture up to 1024 x 1024 with level 0 as base, a NEAREST or LINEAR filter (the same for minification and
+magnification), and REPEAT or CLAMP_TO_EDGE wrap; the texels go to the device again when a hash of them changed. WebGPU does the same for `textureSample(texture_2d<f32>, sampler, uv)` in a fragment shader (`wgpu::Device::hw_texture`, `GpuAccel.cpp`): the bind group's view must be one mip level of a
+single-layer 2D RGBA8 (not sRGB) texture other than the pass's own colour attachment, and the sampler a non-comparison one with no anisotropy, the same nearest/linear filter both ways, and
+repeat or clamp addressing. Device copies are cached per texture and mip (`webgl::AccelTextureCache`) and freed with the texture. Not validated on a running virgl host.
+
 On the Gen9 device a textured draw is what `RenderBatch::textured_triangles` builds: the same job as the other triangle draws, but the pixel kernel is the intel-gpu-tools render copy kernel (it interpolates attribute 0's x and y
 as u and v and samples the surface bound after the target), the vertex's colour slot carries (u, v), the binding table has the target and the texture, and the sampler state selects nearest or linear filtering (bits 16:14 and
 19:17 of its first dword) and wrap or clamp per axis (the address control modes in the fourth). The CPU still transforms and clips the vertices, and clipping interpolates the coordinate like a colour, so the
@@ -201,7 +209,18 @@ What it does not do, and what is needed before a Vega M decodes anything:
   picture into a linear NV12 target that is read back), 8-bit 4:2:0 only. `AmdUvd6VideoEngine::enable_hevc_decode` runs the libx265 self-test (6 pictures, B pictures with reordering) after the H.264 one; a failure
   leaves H.265 on the CPU, a missed fence stops the engine. `tests/AmdUvd6MessagesTest.cpp` checks every field against offsets worked out by hand from the structure (and fails when one is moved);
   `tests/AmdUvd6VideoEngineTest.cpp` covers the stand-in firmware's checks (order count, slots, start code), wrong pictures, a hang, 48 truncated and bit-flipped streams (under the sanitizers) and a clean stream afterwards.
-  Not done: 10-bit (Main 10), tiles-heavy and other streams the self-test does not cover, and `highestTid`/`isNonRef`, which Mesa itself leaves out.
+  Not done: tiles-heavy and other streams the self-test does not cover, and `highestTid`/`isNonRef`, which Mesa itself leaves out.
+- **H.265 Main 10: done in simulation.** The pixel pipeline has a `PixelFormat::P010` (NV12 with 16-bit little-endian samples, the value in the top ten bits; `ColorConvert` converts to and from it, keeps all
+  ten bits P010 to P010, and drops the low two going to 8-bit formats). The H.265 parser takes streams up to ten bits; the CPU decoder (`h265::Core`) still has eight-bit pixel paths only, so a deeper picture is decoded
+  by an offload or not at all (no CPU fallback: the stream's pictures simply do not come out). For a deeper picture the Core holds the planes as 16-bit words with the value in the low bits (`Picture::deep`; the form
+  of the spec's picture hash, so the MD5 SEI check works unchanged over two bytes per sample) and hands out P010. `AmdUvd6Messages` fills the message the way Mesa's `get_h265_msg` does for
+  `PIPE_VIDEO_PROFILE_HEVC_MAIN_10` with a P010 target (`bit_depth_*_minus8`, `p010_mode` and `msb_mode` 1; the 8-bit conversion fields, `luma_10to8` and the like, stay 0 - the layout generator now covers
+  them), sizes the slots 9/4 of the luma size and the context as `calc_ctx_size_h265_main10`, and the session puts the target at twice the NV12 pitch and shifts the words down on read-back. Both depths must be ten.
+  The gate is `AmdUvd6VideoEngine::enable_hevc10_decode` after the 8-bit H.265 test: a ten-bit libx265 stream (`scripts/gen_hevc_test_streams.sh`, 6 pictures with reordering) is decoded on the engine and every
+  picture must agree with the stream's own MD5 hash - there is no CPU reference to compare with. A failure says so on the status line ("Main 10 test failed") and leaves ten-bit streams undecoded; the rest is
+  unaffected. The engine test's stand-in writes FFmpeg's pictures (`tests/data/hevc10_selftest.yuv`) and checks the message by hand-computed values (depth fields, P010 mode, the buffer sizes). Not verified: that the
+  real firmware wants these exact modes and pitches (the P010 pitch is taken as twice the NV12 one) - nothing has run on a card; a 4:0:0 or 4:2:2 or 12-bit stream is refused. x265's CRC hashes (`hash=2`) did not
+  match the spec's CRC of the chroma planes when I checked them against FFmpeg's pictures (8 and 10 bit), so the stream uses MD5.
 - **MPEG-2: done in simulation.** `AmdUvd6Messages` builds the MPEG-2 decode message (`struct ruvd_mpeg2`, `RUVD_CODEC_MPEG2`; Mesa's `get_mpeg2_msg`): the picture coding parameters, both quantiser matrices in the picture's scan
   order, and - unlike the H.265 slots and VCN's - job numbers: the engine keeps the last six pictures it decoded and a picture or a reference is named by the number of its decode job (`frame_number`, from 1), so a reference
   more than six jobs back cannot be named (that picture comes out grey). The job has no context buffer and no scaling table. `AmdUvd6Mpeg2Decoder` is the session (the CPU `Mpeg2Decoder` reads the headers and orders
@@ -220,6 +239,6 @@ What it does not do, and what is needed before a Vega M decodes anything:
   `-DTCOS_AMD_UVD=ON` (off by default, since the start has never touched a real card). `tests/AmdUvd6VideoEngineTest.cpp` runs the whole path against one simulated card (memory controller, graphics block, engine boot,
   ring controller, a stand-in firmware that decodes with the CPU decoder) and ten cases: success (sessions served by the engine, second session on the CPU, shutdown), no firmware, no registers, too small an aperture,
   a mapper that refuses, an engine that never answers, a graphics block that reports nothing, a ring that does not run, an engine that writes wrong pictures, and one that never finishes a picture.
-- Still open on the video side: 10-bit HEVC, MPEG-4, interlaced VC-1, reading the feedback area back, SMC clock requests (a card whose engine stays unpowered makes the start time out; it is stopped and reported), and a run on a real card.
+- Still open on the video side: MPEG-4, interlaced VC-1, reading the feedback area back, SMC clock requests (a card whose engine stays unpowered makes the start time out; it is stopped and reported), and a run on a real card.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.

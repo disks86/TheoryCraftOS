@@ -132,6 +132,31 @@ static void test_translate_matrix_and_functions() {
   CHECK(a.live == 0);
 }
 
+static const char* kTexFs = "precision mediump float; varying vec3 vcol; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, vcol.xy); }";
+
+static void test_translate_texture() {
+  TestAllocator a;
+  {
+    GlContext gl(a, false, 16, 16, noaa());
+    const uint32_t prog = make_program(gl, kVs, kTexFs);
+    TgsiProgram t(a);
+    const char* why = nullptr;
+    CHECK(translate(gl, a, prog, &t, &why));
+    if (why) printf("why: %s\n", why);
+    CHECK(t.samplers.count() == 1 && t.const_rows == 0);
+    CHECK(contains(t.fs, "DCL SAMP[0]\nDCL SVIEW[0], 2D, FLOAT\n"));
+    CHECK(contains(t.fs, "TEX TEMP["));
+    CHECK(contains(t.fs, "SAMP[0], 2D"));
+    CHECK(!contains(t.vs, "SAMP"));
+    // two samplers, and one of them used twice
+    const uint32_t two = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform sampler2D a; uniform sampler2D b; void main() { gl_FragColor = texture2D(a, vcol.xy) * texture2D(b, vcol.yz) + texture2D(a, vcol.zx); }");
+    CHECK(translate(gl, a, two, &t, &why));
+    CHECK(t.samplers.count() == 2);
+    CHECK(contains(t.fs, "SAMP[1], 2D") && contains(t.fs, "DCL SAMP[1]"));
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_translate_refusals() {
   TestAllocator a;
   {
@@ -143,8 +168,16 @@ static void test_translate_refusals() {
     // (kFs reads a varying that this vertex shader does not write)
     CHECK(!translate(gl, a, prog, &t, &why));
     CHECK(why != nullptr);
-    // a texture lookup
-    prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform sampler2D tex; void main() { gl_FragColor = texture2D(tex, vcol.xy); }");
+    // a texture lookup with an explicit level, or of a cube map
+    prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform sampler2D tex; void main() { gl_FragColor = texture2DLod(tex, vcol.xy, 1.0); }");
+    CHECK(!translate(gl, a, prog, &t, &why));
+    prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform samplerCube tex; void main() { gl_FragColor = textureCube(tex, vcol); }");
+    CHECK(!translate(gl, a, prog, &t, &why));
+    // a third sampler
+    prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform sampler2D a; uniform sampler2D b; uniform sampler2D c; void main() { gl_FragColor = texture2D(a, vcol.xy) + texture2D(b, vcol.xy) + texture2D(c, vcol.xy); }");
+    CHECK(!translate(gl, a, prog, &t, &why));
+    // a lookup in the vertex shader
+    prog = make_program(gl, "attribute vec2 pos; attribute vec3 col; uniform sampler2D tex; varying vec3 vcol; void main() { vcol = col; gl_Position = texture2D(tex, pos); }", kFs);
     CHECK(!translate(gl, a, prog, &t, &why));
     // derivatives
     prog = make_program(gl, kVs, "#extension GL_OES_standard_derivatives : enable\nprecision mediump float; varying vec3 vcol; void main() { gl_FragColor = vec4(fwidth(vcol.x)); }");
@@ -159,8 +192,9 @@ static void test_translate_refusals() {
 // An accelerator that records what it was asked and "renders" a recognisable picture: every pixel is 0x80 0x40 0x20 0xFF after a draw.
 struct FakeAccel final : IAccelerator {
   const char* name() const override { return "fake"; }
-  uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings) override {
+  uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
     ++programs;
+    last_program_textures = textures;
     strncpy(vs_text, vs, sizeof vs_text - 1);
     strncpy(fs_text, fs, sizeof fs_text - 1);
     last_attributes = attributes;
@@ -203,6 +237,25 @@ struct FakeAccel final : IAccelerator {
     }
     return true;
   }
+  uint32_t create_texture(uint32_t w, uint32_t h) override {
+    if (no_textures) return 0;
+    ++textures_made;
+    tex_w = w;
+    tex_h = h;
+    return 10 + textures_made;
+  }
+  void destroy_texture(uint32_t) override { ++textures_destroyed; }
+  bool write_texture(uint32_t, ConstByteView rgba) override {
+    ++texture_writes;
+    texel_bytes = rgba.size();
+    if (rgba.size() >= 4) memcpy(first_texel, rgba.data(), 4);
+    return true;
+  }
+  bool no_textures = false;
+  int textures_made = 0, textures_destroyed = 0, texture_writes = 0;
+  uint32_t last_program_textures = 0, tex_w = 0, tex_h = 0;
+  uint64_t texel_bytes = 0;
+  uint8_t first_texel[4] = {};
   bool refuse = false, fail_draw = false, drawn = false;
   int programs = 0, programs_destroyed = 0, targets = 0, targets_destroyed = 0, clears = 0, draws = 0, reads = 0;
   uint32_t last_attributes = 0, last_varyings = 0, last_count = 0, width = 0, height = 0;
@@ -454,6 +507,12 @@ struct FakeImage final : graphics::IImage {
     for (uint32_t& v : out) v = 0x80102030u;   // A R G B
     return true;
   }
+  bool write_pixels(ArrayView<const uint32_t> pixels) override {
+    if (pixels.size() == 0) return false;
+    first_written = pixels[0];
+    return true;
+  }
+  uint32_t first_written = 0;
 };
 struct FakeModule final : graphics::IShaderModule {
   graphics::ShaderStage st;
@@ -475,7 +534,14 @@ struct FakeCommands final : graphics::ICommandBuffer {
   void bind_vertex_buffer(graphics::IBuffer*, uint64_t) override {}
   void bind_index_buffer(graphics::IBuffer*, graphics::IndexType, uint64_t) override {}
   void push_constants(const void*, uint32_t size) override { ++pushes; push_size = size; }
-  void bind_texture(uint32_t, graphics::IImage*, const graphics::SamplerDesc&) override {}
+  int bound = 0;
+  graphics::IImage* bound_image[2] = {};
+  graphics::SamplerDesc bound_sampler[2];
+  void bind_texture(uint32_t unit, graphics::IImage* image, const graphics::SamplerDesc& s) override {
+    ++bound;
+    bound_image[unit] = image;
+    bound_sampler[unit] = s;
+  }
   void set_viewport(const graphics::Viewport& v) override { viewport = v; }
   void set_scissor(const graphics::Rect2D& r) override { scissor = r; }
   void draw(uint32_t n, uint32_t) override { ++draws; last_vertices = n; }
@@ -484,7 +550,7 @@ struct FakeCommands final : graphics::ICommandBuffer {
   bool end() override { return true; }
 };
 struct FakeDevice final : graphics::IGraphicsDevice {
-  bool tgsi = true;
+  bool tgsi = true, textures = true;
   int images = 0, modules = 0, pipelines = 0, submits = 0;
   FakeCommands commands;
   graphics::DeviceInfo info() const override { return {"fake gpu", graphics::DeviceKind::VirtualGpu, true}; }
@@ -507,6 +573,7 @@ struct FakeDevice final : graphics::IGraphicsDevice {
   }
   void destroy_shader_module(graphics::IShaderModule* m) override { --modules; delete static_cast<FakeModule*>(m); }
   graphics::IPipeline* create_graphics_pipeline(const graphics::GraphicsPipelineDesc& d) override {
+    if (d.texture_count && !textures) return nullptr;
     ++pipelines;
     FakePipeline* p = new FakePipeline();
     p->desc = d;
@@ -525,7 +592,7 @@ static void test_device_accelerator() {
   {
     graphics::WebGlAccelerator acc(dev, a);
     CHECK(strcmp(acc.name(), "fake gpu") == 0);
-    const uint32_t prog = acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1);
+    const uint32_t prog = acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 0);
     CHECK(prog != 0 && dev.modules == 2);
     const uint32_t target = acc.create_target(8, 4);
     CHECK(target != 0 && dev.images == 2);
@@ -580,8 +647,134 @@ static void test_device_accelerator() {
     CHECK(dev.pipelines == 0 && dev.modules == 0 && dev.images == 0);
     // a device without TGSI refuses the program
     dev.tgsi = false;
-    CHECK(acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1) == 0 && dev.modules == 0);
-    CHECK(acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 9, 1) == 0);
+    CHECK(acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 0) == 0 && dev.modules == 0);
+    CHECK(acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 9, 1, 0) == 0);
+  }
+  CHECK(dev.images == 0 && dev.modules == 0 && dev.pipelines == 0);
+  CHECK(a.live == 0);
+}
+
+static void upload_2x2(GlContext& gl, uint32_t tex, const uint8_t (&texels)[16]) {
+  gl.active_texture(0x84C0);
+  gl.bind_texture(0x0DE1, tex);
+  gl.tex_image(0x0DE1, 0, 0x1908, 2, 2, 1, 0, 0x1908, 0x1401, ConstByteView(texels, sizeof texels), true, false);
+}
+
+// A program that samples a texture runs on the device with the texture there, when the texture is one the device can read.
+static void test_hardware_texture() {
+  TestAllocator a;
+  FakeAccel fake;
+  set_accelerator(&fake);
+  {
+    GlContext gl(a, false, 64, 64, noaa());
+    Scene sc(gl);
+    sc.setup(kVs, kTexFs);
+    const uint32_t unit0 = 0;
+    gl.uniform(gl.get_uniform_location(sc.prog, "tex"), 'i', 1, 1, 1, &unit0);
+    const uint8_t texels[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 9, 8, 7, 6};
+    const uint32_t tex = gl.create_texture();
+    upload_2x2(gl, tex, texels);
+    gl.clear_color(0, 0, 0, 1);
+    gl.clear(0x4000);
+    // a texture with the default (mipmapped) minification filter is the CPU's
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 0 && fake.textures_made == 0);
+    gl.clear(0x4000);
+    gl.tex_parameter(0x0DE1, 0x2801, 0x2600);   // NEAREST
+    gl.tex_parameter(0x0DE1, 0x2800, 0x2600);
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 1 && fake.last_program_textures == 1);
+    CHECK(fake.textures_made == 1 && fake.texture_writes == 1 && fake.tex_w == 2 && fake.tex_h == 2 && fake.texel_bytes == 16);
+    CHECK(fake.first_texel[0] == 255 && fake.first_texel[1] == 0 && fake.first_texel[3] == 255);
+    CHECK(fake.last_state.texture_count == 1 && fake.last_state.textures[0] == 11);
+    CHECK(!fake.last_state.samplers[0].linear && fake.last_state.samplers[0].repeat_s && fake.last_state.samplers[0].repeat_t);
+    // the same texels are not sent again
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 2 && fake.texture_writes == 1);
+    // changed texels are
+    const uint8_t patch[4] = {1, 2, 3, 4};
+    gl.tex_sub_image(0x0DE1, 0, 0, 0, 0, 1, 1, 1, 0x1908, 0x1401, ConstByteView(patch, 4), false);
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 3 && fake.texture_writes == 2 && fake.first_texel[0] == 1);
+    // the sampler state follows the texture
+    gl.tex_parameter(0x0DE1, 0x2801, 0x2601);   // LINEAR
+    gl.tex_parameter(0x0DE1, 0x2800, 0x2601);
+    gl.tex_parameter(0x0DE1, 0x2802, 0x812F);   // CLAMP_TO_EDGE in s
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 4 && fake.last_state.samplers[0].linear && !fake.last_state.samplers[0].repeat_s && fake.last_state.samplers[0].repeat_t);
+    // mirrored repeat is not the device's, and neither is a pair of different filters
+    gl.tex_parameter(0x0DE1, 0x2802, 0x8370);
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 4);
+    gl.clear(0x4000);
+    gl.tex_parameter(0x0DE1, 0x2802, 0x2901);
+    gl.tex_parameter(0x0DE1, 0x2800, 0x2600);
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 4);
+    // a device without textures leaves the program on the CPU
+    const uint32_t other = gl.create_texture();
+    uint8_t big[4 * 4 * 4] = {};
+    gl.bind_texture(0x0DE1, other);
+    gl.tex_image(0x0DE1, 0, 0x1908, 4, 4, 1, 0, 0x1908, 0x1401, ConstByteView(big, sizeof big), true, false);
+    gl.tex_parameter(0x0DE1, 0x2801, 0x2601);
+    gl.tex_parameter(0x0DE1, 0x2800, 0x2601);
+    fake.no_textures = true;
+    gl.clear(0x4000);
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 4);
+    // deleting a texture frees its device copy
+    const int destroyed = fake.textures_destroyed;
+    gl.delete_object('t', tex);
+    CHECK(fake.textures_destroyed == destroyed + 1);
+  }
+  CHECK(fake.textures_made == fake.textures_destroyed);
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
+// The accelerator over a device: textures are images the device can sample, bound with their sampler at each draw.
+static void test_device_textures() {
+  TestAllocator a;
+  FakeDevice dev;
+  {
+    graphics::WebGlAccelerator acc(dev, a);
+    const uint32_t prog = acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 1);
+    CHECK(prog != 0 && dev.pipelines == 1);   // (the probe that checks the device can have the texture)
+    const uint32_t tex = acc.create_texture(2, 1);
+    CHECK(tex != 0 && dev.images == 1);
+    const uint8_t rgba[8] = {0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0};
+    CHECK(acc.write_texture(tex, ConstByteView(rgba, sizeof rgba)));
+    CHECK(!acc.write_texture(tex, ConstByteView(rgba, 4)));
+    CHECK(!acc.write_texture(99, ConstByteView(rgba, sizeof rgba)));
+    CHECK(acc.create_texture(0, 4) == 0);
+    const uint32_t target = acc.create_target(8, 4);
+    AccelState st;
+    st.vp_w = 8;
+    st.vp_h = 4;
+    st.depth_far = 1;
+    uint8_t vertices[3 * 2 * 16] = {};
+    // a draw has to say which texture
+    CHECK(!acc.draw(target, prog, st, ConstByteView(vertices, sizeof vertices), 3, ConstByteView()));
+    st.texture_count = 1;
+    st.textures[0] = tex;
+    st.samplers[0].linear = true;
+    st.samplers[0].repeat_s = false;
+    CHECK(acc.draw(target, prog, st, ConstByteView(vertices, sizeof vertices), 3, ConstByteView()));
+    const FakePipeline* pl = static_cast<const FakePipeline*>(dev.commands.pipeline);
+    CHECK(pl->desc.texture_count == 1);
+    CHECK(dev.commands.bound == 1 && dev.commands.bound_image[0] != nullptr);
+    CHECK(static_cast<FakeImage*>(dev.commands.bound_image[0])->first_written == 0x44112233u);   // 0xAARRGGBB
+    CHECK(dev.commands.bound_sampler[0].filter == graphics::Filter::Linear && dev.commands.bound_sampler[0].address_u == graphics::AddressMode::ClampToEdge &&
+          dev.commands.bound_sampler[0].address_v == graphics::AddressMode::Repeat);
+    st.textures[0] = 99;
+    CHECK(!acc.draw(target, prog, st, ConstByteView(vertices, sizeof vertices), 3, ConstByteView()));
+    // too many samplers, and a device that cannot have textures
+    CHECK(acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 3) == 0);
+    dev.textures = false;
+    CHECK(acc.create_program("VERT\nEND\n", "FRAG\nEND\n", 2, 1, 1) == 0);
+    acc.destroy_texture(tex);
+    acc.destroy_target(target);
+    acc.destroy_program(prog);
   }
   CHECK(dev.images == 0 && dev.modules == 0 && dev.pipelines == 0);
   CHECK(a.live == 0);
@@ -701,6 +894,88 @@ static void test_webgpu_hardware() {
   CHECK(a.live == 0);
 }
 
+// A texture and a sampler in a bind group: the draw goes to the device with the texture there, when the pair is one the device can read.
+static void test_webgpu_texture() {
+  TestAllocator a;
+  FakeAccel fake;
+  set_accelerator(&fake);
+  {
+    const char* wgsl =
+        "@group(0) @binding(0) var t: texture_2d<f32>;\n"
+        "@group(0) @binding(1) var s: sampler;\n"
+        "struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec3<f32>, }\n"
+        "@vertex fn vs(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VsOut { var o: VsOut; o.pos = vec4<f32>(p, 0.0, 1.0); o.uv = c; return o; }\n"
+        "@fragment fn fs(in: VsOut) -> @location(0) vec4<f32> { return textureSample(t, s, in.uv.xy); }\n";
+    GpuScene sc(a, wgsl);
+    CHECK(sc.rp != 0);
+    const wgpu::FormatDesc* rgba = wgpu::find_format("rgba8unorm");
+    const uint32_t tex = sc.dev.create_texture(2, 2, 1, 1, 1, 1, rgba, 4 | 2);
+    const uint8_t texels[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 9, 8, 7, 6};
+    wgpu::ImageCopy dst;
+    dst.texture = tex;
+    wgpu::BufferLayout bl;
+    bl.bytes_per_row = 8;
+    bl.rows_per_image = 2;
+    CHECK(sc.dev.write_texture(dst, ConstByteView(texels, sizeof texels), bl, 2, 2, 1));
+    wgpu::TextureView tv;
+    tv.texture = tex;
+    tv.format = rgba;
+    tv.dim = 1;
+    const uint32_t view = sc.dev.create_view(tv);
+    wgpu::Sampler sampler;
+    sampler.params.min_filter = sampler.params.mag_filter = 0x2600;
+    sampler.params.wrap_s = sampler.params.wrap_t = 0x812F;
+    uint32_t smp = sc.dev.create_sampler(sampler);
+    auto group = [&](uint32_t sampler_id) {
+      List<wgpu::BgEntry> entries(a);
+      wgpu::BgEntry e;
+      e.binding = 0; e.kind = 2; e.id = view;
+      entries.push_back(e);
+      wgpu::BgEntry f;
+      f.binding = 1; f.kind = 1; f.id = sampler_id;
+      entries.push_back(f);
+      return sc.dev.create_bind_group(sc.dev.pipeline_layout_bgl(sc.rp, false, 0), entries);
+    };
+    sc.bg = group(smp);
+    CHECK(sc.bg != 0);
+    CHECK(sc.pass(false));
+    CHECK(sc.dev.draw(3, 1, 0, 0));
+    CHECK(fake.draws == 1 && fake.last_program_textures == 1);
+    CHECK(fake.textures_made == 1 && fake.texture_writes == 1 && fake.tex_w == 2 && fake.texel_bytes == 16 && fake.first_texel[0] == 255);
+    CHECK(fake.last_state.texture_count == 1 && !fake.last_state.samplers[0].linear && !fake.last_state.samplers[0].repeat_s);
+    CHECK(strstr(fake.fs_text, "TEX ") != nullptr && strstr(fake.fs_text, "DCL SAMP[0]") != nullptr);
+    CHECK(sc.dev.draw(3, 1, 0, 0));
+    CHECK(fake.draws == 2 && fake.texture_writes == 1);   // the same texels are not sent again
+    CHECK(sc.dev.end_render_pass());
+    // changed texels go again
+    const uint8_t patch[4] = {1, 2, 3, 4};
+    wgpu::BufferLayout one;
+    one.bytes_per_row = 4;
+    one.rows_per_image = 1;
+    CHECK(sc.dev.write_texture(dst, ConstByteView(patch, 4), one, 1, 1, 1));
+    CHECK(sc.pass(false));
+    CHECK(sc.dev.draw(3, 1, 0, 0));
+    CHECK(fake.draws == 3 && fake.texture_writes == 2 && fake.first_texel[0] == 1);
+    CHECK(sc.dev.end_render_pass());
+    // a comparison-free sampler the device lacks (mirrored repeat) is the CPU's
+    wgpu::Sampler mirror = sampler;
+    mirror.params.wrap_s = 0x8370;
+    sc.bg = group(sc.dev.create_sampler(mirror));
+    CHECK(sc.pass(false));
+    CHECK(sc.dev.draw(3, 1, 0, 0));
+    CHECK(fake.draws == 3);
+    CHECK(sc.dev.end_render_pass());
+    // destroying the texture frees the device copy
+    const int destroyed = fake.textures_destroyed;
+    sc.dev.destroy_texture(tex);
+    CHECK(fake.textures_destroyed == destroyed + 1);
+    CHECK(sc.dev.error.empty());
+  }
+  CHECK(fake.textures_made == fake.textures_destroyed);
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
 static void test_webgpu_uniforms() {
   TestAllocator a;
   FakeAccel fake;
@@ -751,7 +1026,10 @@ static void test_webgpu_refusals() {
 int main() {
   test_translate_basic();
   test_translate_matrix_and_functions();
+  test_translate_texture();
   test_translate_refusals();
+  test_hardware_texture();
+  test_device_textures();
   test_hardware_draw_and_readback();
   test_fallbacks();
   test_refused_program_and_failed_draw();
@@ -761,6 +1039,7 @@ int main() {
   test_device_accelerator();
   test_webgpu_hardware();
   test_webgpu_uniforms();
+  test_webgpu_texture();
   test_webgpu_refusals();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }
   printf("gl accel tests passed\n");

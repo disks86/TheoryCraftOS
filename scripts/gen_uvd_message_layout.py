@@ -36,7 +36,7 @@ FIELDS = (
         'pps_cr_qp_offset', 'pps_beta_offset_div2', 'pps_tc_offset_div2', 'diff_cu_qp_delta_depth', 'num_tile_columns_minus1', 'num_tile_rows_minus1',
         'log2_parallel_merge_level_minus2', 'column_width_minus1', 'row_height_minus1', 'init_qp_minus26', 'num_delta_pocs_ref_rps_idx', 'curr_idx', 'curr_poc',
         'ref_pic_list', 'poc_list', 'ref_pic_set_st_curr_before', 'ref_pic_set_st_curr_after', 'ref_pic_set_lt_curr', 'ucScalingListDCCoefSizeID2',
-        'ucScalingListDCCoefSizeID3', 'direct_reflist')]
+        'ucScalingListDCCoefSizeID3', 'p010_mode', 'msb_mode', 'luma_10to8', 'chroma_10to8', 'sclr_luma10to8', 'sclr_chroma10to8', 'direct_reflist')]
     + [('Mpeg2_' + f, 'body.decode.codec.mpeg2.' + f) for f in (
         'decoded_pic_idx', 'ref_pic_idx', 'load_intra_quantiser_matrix', 'load_nonintra_quantiser_matrix', 'intra_quantiser_matrix', 'nonintra_quantiser_matrix',
         'profile_and_level_indication', 'chroma_format', 'picture_coding_type', 'f_code', 'intra_dc_precision', 'pic_structure', 'top_field_first', 'frame_pred_frame_dct',

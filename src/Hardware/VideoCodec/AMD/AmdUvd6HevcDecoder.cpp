@@ -22,6 +22,13 @@
 namespace hardware {
 
 namespace {
+// A 16-bit little-endian word of a row of bytes, by index; the value the P010 word holds is its top ten bits. Stored as the value in the low bits.
+uint32_t load_word(ConstByteView row, uint64_t index) { return uint32_t{row[index * 2]} | (uint32_t{row[index * 2 + 1]} << 8); }
+void store_sample(ByteView out, uint64_t index, uint32_t word) {
+  const uint32_t value = word >> 6;
+  out[index * 2] = static_cast<uint8_t>(value);
+  out[index * 2 + 1] = static_cast<uint8_t>(value >> 8);
+}
 constexpr uint8_t kStartCode[3] = {0, 0, 1};
 constexpr uint64_t kBitstreamAlignment = 128;   // bsd_size is the bitstream rounded up to this, the padding zeros
 }  // namespace
@@ -68,6 +75,7 @@ void AmdUvd6HevcDecoder::close_session() {
   if (engine_.memory && engine_.ring && !engine_.ring->wedged()) engine_.memory->reset();
   message_ = session_context_ = context_ = dpb_buffer_ = bitstream_ = target_ = AmdVcnWorkMemory::Piece();
   width_ = height_ = 0;
+  deep_ = false;
 }
 
 bool AmdUvd6HevcDecoder::allocate_buffers() {
@@ -84,14 +92,31 @@ bool AmdUvd6HevcDecoder::allocate_buffers() {
   return true;
 }
 
+// 8-bit 4:2:0, or ten-bit (both depths ten) when the device allows it.
+bool AmdUvd6HevcDecoder::sequence_ok(const h265::Sps& sps, bool* deep) const {
+  if (sps.chroma_format_idc != 1 || sps.width <= 0 || sps.height <= 0) return false;
+  if (sps.bit_depth_luma == 8 && sps.bit_depth_chroma == 8) {
+    *deep = false;
+    return true;
+  }
+  *deep = true;
+  return sps.bit_depth_luma == 10 && sps.bit_depth_chroma == 10 && deep_allowed_;
+}
+
+// The target surface of a sequence: NV12 bytes, or P010 words (twice the pitch of the same picture's NV12 rows).
+amd_vcn::TargetLayout AmdUvd6HevcDecoder::target_for(uint32_t width, uint32_t height, bool deep) {
+  return amd_vcn::target_layout(deep ? width * 2 : width, height);
+}
+
 bool AmdUvd6HevcDecoder::accepts(const h265::Sps& sps, const h265::Pps&) {
   if (!leased_ || engine_.ring->wedged()) return open_;   // a wedged engine still owns the stream it was decoding; a stream that never started can go to the CPU
-  if (sps.chroma_format_idc != 1 || sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 || sps.width <= 0 || sps.height <= 0) return false;
+  bool deep = false;
+  if (!sequence_ok(sps, &deep)) return false;
   const uint32_t width = static_cast<uint32_t>(sps.width), height = static_cast<uint32_t>(sps.height);
-  if (open_ && width == width_ && height == height_) return true;
+  if (open_ && width == width_ && height == height_ && deep == deep_) return true;
   const int dpb = sps.max_dec_pic_buffering[sps.max_sub_layers - 1];
-  const amd_uvd6::HevcBufferSizes sizes = amd_uvd6::hevc_buffer_sizes(width, height, static_cast<uint32_t>(dpb > 0 ? dpb : 1));
-  const amd_vcn::TargetLayout layout = amd_vcn::target_layout(width, height);
+  const amd_uvd6::HevcBufferSizes sizes = amd_uvd6::hevc_buffer_sizes(width, height, static_cast<uint32_t>(dpb > 0 ? dpb : 1), deep ? static_cast<uint32_t>(sps.log2_ctb) : 0);
+  const amd_vcn::TargetLayout layout = target_for(width, height, deep);
   const uint64_t bitstream = amd_uvd6::bitstream_buffer_bytes(width, height);
   if (sizes.dpb == 0 || layout.bytes == 0 || bitstream == 0) return false;
   // Whether it all fits in the work memory (with a page of slack for each piece's rounding).
@@ -106,9 +131,10 @@ bool AmdUvd6HevcDecoder::open_session(const h265::Sps& sps) {
   if (engine_.ring->wedged()) return false;
   width_ = static_cast<uint32_t>(sps.width);
   height_ = static_cast<uint32_t>(sps.height);
+  deep_ = sps.bit_depth_luma > 8 || sps.bit_depth_chroma > 8;
   const int dpb = sps.max_dec_pic_buffering[sps.max_sub_layers - 1];
-  sizes_ = amd_uvd6::hevc_buffer_sizes(width_, height_, static_cast<uint32_t>(dpb > 0 ? dpb : 1));
-  layout_ = amd_vcn::target_layout(width_, height_);
+  sizes_ = amd_uvd6::hevc_buffer_sizes(width_, height_, static_cast<uint32_t>(dpb > 0 ? dpb : 1), deep_ ? static_cast<uint32_t>(sps.log2_ctb) : 0);
+  layout_ = target_for(width_, height_, deep_);
   if (sizes_.dpb == 0 || layout_.bytes == 0) return false;
   if (!allocate_buffers()) {
     engine_.memory->reset();
@@ -134,6 +160,10 @@ bool AmdUvd6HevcDecoder::gather_bitstream(ArrayView<const ConstByteView> slices)
 // The decoded picture is linear NV12 in the target surface: the luma rows go straight to the CPU decoder's plane, the interleaved chroma rows are split into its two.
 void AmdUvd6HevcDecoder::read_back(const h265::OffloadPicture& picture) {
   const uint32_t width = width_, height = height_;
+  if (deep_) {
+    read_back_deep(picture);
+    return;
+  }
   for (uint32_t y = 0; y < height; ++y) mmio_read_bytes(target_.cpu, uint64_t{layout_.luma_pitch} * y, picture.plane[0].subview(uint64_t{y} * static_cast<uint32_t>(picture.stride[0]), width));
   const uint32_t half_w = width / 2, half_h = height / 2;
   row_.clear();
@@ -150,13 +180,40 @@ void AmdUvd6HevcDecoder::read_back(const h265::OffloadPicture& picture) {
   }
 }
 
+// Ten bits: the target is P010 (16-bit words, the value in the top ten bits, Cb and Cr interleaved) and the CPU decoder's planes hold the values in the low bits.
+void AmdUvd6HevcDecoder::read_back_deep(const h265::OffloadPicture& picture) {
+  const uint32_t width = width_, height = height_;
+  row_.clear();
+  if (!row_.put_zeros(uint64_t{width} * 2)) return;
+  ByteView row = row_.writable_view();
+  for (uint32_t y = 0; y < height; ++y) {
+    mmio_read_bytes(target_.cpu, uint64_t{layout_.luma_pitch} * y, row);
+    ByteView out = picture.plane[0].subview(uint64_t{y} * static_cast<uint32_t>(picture.stride[0]), uint64_t{width} * 2);
+    for (uint32_t x = 0; x < width; ++x) store_sample(out, x, load_word(row, x));
+  }
+  const uint32_t half_w = width / 2, half_h = height / 2;
+  row_.clear();
+  if (!row_.put_zeros(uint64_t{half_w} * 4)) return;
+  row = row_.writable_view();
+  for (uint32_t y = 0; y < half_h; ++y) {
+    mmio_read_bytes(target_.cpu, layout_.chroma_offset + uint64_t{layout_.chroma_pitch} * y, row);
+    ByteView u = picture.plane[1].subview(uint64_t{y} * static_cast<uint32_t>(picture.stride[1]), uint64_t{half_w} * 2);
+    ByteView v = picture.plane[2].subview(uint64_t{y} * static_cast<uint32_t>(picture.stride[2]), uint64_t{half_w} * 2);
+    for (uint32_t x = 0; x < half_w; ++x) {
+      store_sample(u, x, load_word(row, uint64_t{x} * 2));
+      store_sample(v, x, load_word(row, uint64_t{x} * 2 + 1));
+    }
+  }
+}
+
 bool AmdUvd6HevcDecoder::decode_picture(const h265::OffloadPicture& picture) {
   if (!picture.sps || !picture.pps || !picture.first || engine_.ring->wedged()) {
     ++failed_;
     return false;
   }
   const h265::Sps& sps = *picture.sps;
-  if (!open_ || width_ != static_cast<uint32_t>(sps.width) || height_ != static_cast<uint32_t>(sps.height)) {
+  const bool deep = sps.bit_depth_luma > 8 || sps.bit_depth_chroma > 8;
+  if (!open_ || width_ != static_cast<uint32_t>(sps.width) || height_ != static_cast<uint32_t>(sps.height) || deep != deep_) {
     if (!open_session(sps)) {
       ++failed_;
       return false;

@@ -18,7 +18,9 @@
 #include "Process/WindowsObjects.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsPipes.hpp"
+#include "Process/WindowsSockets.hpp"
 
 namespace process::windowsabi {
 
@@ -31,7 +33,7 @@ constexpr uint64_t kUnixToNt = 11644473600ull * 10000000ull;
 constexpr uint64_t kCurrentProcess = ~uint64_t{0};
 constexpr uint32_t kMaxWait = 64;
 
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process || k == DescriptorKind::Timer || k == DescriptorKind::Section || k == DescriptorKind::Job || k == DescriptorKind::ChangeNotification; }
 DescriptorKind descriptor_kind_of(ObjectKind k) {
   switch (k) {
     case ObjectKind::Event: return DescriptorKind::Event;
@@ -40,6 +42,7 @@ DescriptorKind descriptor_kind_of(ObjectKind k) {
     case ObjectKind::Timer: return DescriptorKind::Timer;
     case ObjectKind::Section: return DescriptorKind::Section;
     case ObjectKind::Job: return DescriptorKind::Job;
+    case ObjectKind::ChangeNotification: return DescriptorKind::ChangeNotification;
     default: return DescriptorKind::Semaphore;
   }
 }
@@ -279,8 +282,12 @@ uint32_t nt_set_event(Process& p, const SyscallRequest& r) {
 }
 uint32_t nt_reset_event(Process& p, const SyscallRequest& r) {
   ObjectManager* objects = system_objects();
-  const uint32_t id = object_of(p, r.args[0], DescriptorKind::Event);
-  if (!objects || !id) return objects ? kInvalidHandle : kNotImplemented;
+  if (!objects) return kNotImplemented;
+  // FindNextChangeNotification is this same call on a ChangeNotification handle (see ObjectManager::reset_event): both are "stays signalled until told
+  // otherwise" handles with nothing else to resetting them.
+  uint32_t id = object_of(p, r.args[0], DescriptorKind::Event);
+  if (!id) id = object_of(p, r.args[0], DescriptorKind::ChangeNotification);
+  if (!id) return kInvalidHandle;
   int32_t previous = 0;
   const uint32_t status = objects->reset_event(id, &previous);
   return status != kSuccess ? status : put_previous(p, r.args[1], previous);
@@ -376,6 +383,8 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if (copy < 0) return kNoResources;
   if (is_object_kind(p.files().kind(slot))) if (ObjectManager* objects = system_objects()) objects->add_ref(uint32_t(p.files().token(slot)));
   if (p.files().kind(slot) == DescriptorKind::Pipe) pipe_token_add(p.files().token(slot));
+  if (p.files().kind(slot) == DescriptorKind::Socket) socket_token_add(p.files().token(slot));
+  if (p.files().kind(slot) == DescriptorKind::Mailslot) mailslot_token_add(p.files().token(slot));
   if (target_at != 0 && !p.write_user_u64(target_at, (uint64_t(copy) + 1) * 4)) {
     p.close_descriptor(uint64_t(copy));
     return kAccessViolation;
@@ -632,6 +641,8 @@ uint32_t nt_query_object(Process& p, const SyscallRequest& r) {
         case DescriptorKind::Timer: type = "Timer"; break;
         case DescriptorKind::Section: type = "Section"; break;
         case DescriptorKind::Job: type = "Job"; break;
+        case DescriptorKind::ChangeNotification: type = "ChangeNotification"; break;
+        case DescriptorKind::Mailslot: type = "Mailslot"; break;
         default: break;
       }
       uint32_t n = 0;
