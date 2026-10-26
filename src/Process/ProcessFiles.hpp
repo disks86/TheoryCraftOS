@@ -41,7 +41,7 @@ constexpr uint64_t kMaxPath = 4096;
 PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String* out);
 
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification };
+enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -69,6 +69,7 @@ struct OpenObject {
   uint64_t directory_index = 0;      // entries handed out so far (a cookie for getdents)
   filesystem::DirectoryEntry pending;
   bool has_pending = false;          // an entry that was read but did not fit and waits for the next call
+  uint32_t change_watch = 0;         // ReadDirectoryChangesW's own change-notification object for this directory handle, made on its first call; 0 = none yet
 };
 
 // The descriptor table and file operations of one process. Console descriptors 0..2 exist from the start; the file system is attached once.

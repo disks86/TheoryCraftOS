@@ -626,6 +626,142 @@ static void test_change_notifications() {
   set_system_objects(nullptr);
 }
 
+// FILE_ACTION_ADDED/REMOVED/RENAMED_OLD_NAME/RENAMED_NEW_NAME records (NextEntryOffset, Action, FileNameLength, FileName) chained in one buffer.
+struct NotifyRecord { uint32_t action; std::string name; };
+static std::vector<NotifyRecord> notify_records(NtRig& rig, uint64_t at, uint64_t used) {
+  std::vector<NotifyRecord> out;
+  for (uint64_t off = 0;;) {
+    const std::string h = rig.bytes(at + off, 12);
+    const uint32_t next = uint8_t(h[0]) | (uint8_t(h[1]) << 8) | (uint32_t(uint8_t(h[2])) << 16) | (uint32_t(uint8_t(h[3])) << 24);
+    const uint32_t action = uint8_t(h[4]) | (uint8_t(h[5]) << 8) | (uint32_t(uint8_t(h[6])) << 16) | (uint32_t(uint8_t(h[7])) << 24);
+    const uint32_t name_len = uint8_t(h[8]) | (uint8_t(h[9]) << 8) | (uint32_t(uint8_t(h[10])) << 16) | (uint32_t(uint8_t(h[11])) << 24);
+    out.push_back({action, wide(rig, at + off + 12, name_len)});
+    if (next == 0) break;
+    off += next;
+    if (off >= used) break;
+  }
+  return out;
+}
+
+static void test_read_directory_changes() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  NoWaitSync sync;
+  ObjectManager objects(sync);
+  objects.set_allocator(&A);
+  set_system_objects(&objects);
+  NtRig rig(fs);
+  const uint32_t kGenericRead = 0x80000000u, kSync = 0x100000;
+
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\C:\\watched"), rig.alloc(16), {0, 0x80, 7, 2, 1, 0, 0}) == 0);
+  NtRig::Opened dir = rig.create("\\??\\C:\\watched", kGenericRead | kSync, 1 /* FILE_OPEN */, 1 /* FILE_DIRECTORY_FILE */);
+  CHECK(dir.status == 0);
+  // A real program always calls ReadDirectoryChangesW (arming the watch) *before* the change it is meant to catch, typically with OVERLAPPED so the call does not
+  // block its only thread while waiting; this single-threaded, synchronous fixture has no second thread to make a change while blocked in the call. So the watch
+  // is armed here directly (bypassing NtNotifyChangeDirectoryFile's own lazy-creation-on-first-call, which would otherwise have nothing queued yet and hang this
+  // fixture's ISystemSync forever, since it never really waits) - everything downstream (notify_path_changed, take_watch_records) is exercised exactly as normal.
+  OpenObject* dir_object = rig.process->files().object(dir.handle / 4 - 1);
+  CHECK(dir_object != nullptr);
+  const ObjectManager::Created watch = objects.create_change_notification(dir_object->path.view(), false, 0x1 /* FILE_NOTIFY_CHANGE_FILE_NAME */);
+  CHECK(watch.id != 0);
+  dir_object->change_watch = watch.id;
+
+  // a change already pending before the call: it must not block (this fixture's ISystemSync never really waits).
+  NtRig::Opened a_txt = rig.create("\\??\\C:\\watched\\a.txt", kGenericRead, 2, 0x60);
+  CHECK(a_txt.status == 0);
+  rig.call(WindowsSyscallNumber::NtClose, a_txt.handle);      // closed, so NtDeleteFile below is not refused as busy
+  const uint64_t iosb = rig.alloc(16), buffer = rig.alloc(256);
+  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 256, 0x1 /* FILE_NOTIFY_CHANGE_FILE_NAME */, 0}) == 0);
+  uint64_t used = rig.u64(iosb + 8);
+  CHECK(used > 0);
+  std::vector<NotifyRecord> records = notify_records(rig, buffer, used);
+  CHECK(records.size() == 1 && records[0].action == 1 /* FILE_ACTION_ADDED */ && records[0].name == "a.txt");
+
+  // several changes queued between calls come back together, in order, including a rename's two records
+  CHECK(rig.create("\\??\\C:\\watched\\b.txt", kGenericRead, 2, 0x60).status == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtDeleteFile, rig.attributes("\\??\\C:\\watched\\a.txt")) == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 256, 0x1, 0}) == 0);
+  used = rig.u64(iosb + 8);
+  records = notify_records(rig, buffer, used);
+  CHECK(records.size() == 2);
+  CHECK(records[0].action == 1 && records[0].name == "b.txt");
+  CHECK(records[1].action == 2 /* FILE_ACTION_REMOVED */ && records[1].name == "a.txt");
+
+  // a buffer too small for even the first record just reports what fit (nothing): a documented simplification, not a crash
+  CHECK(rig.create("\\??\\C:\\watched\\c.txt", kGenericRead, 2, 0x60).status == 0);
+  CHECK(rig.call(WindowsSyscallNumber::NtNotifyChangeDirectoryFile, dir.handle, 0, 0, 0, {iosb, buffer, 4, 0x1, 0}) == 0);
+  CHECK(rig.u64(iosb + 8) == 0);
+
+  rig.call(WindowsSyscallNumber::NtClose, dir.handle);
+  set_system_objects(nullptr);
+}
+
+static void test_mailslots() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  NoWaitSync sync;
+  ObjectManager objects(sync);
+  objects.set_allocator(&A);
+  set_system_objects(&objects);
+  NtRig rig(fs);
+  const uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kSync = 0x100000, kOptions = 0x60;
+
+  // a reader (CreateMailslot), created with an explicit zero read timeout throughout - this fixture's ISystemSync never really sleeps, so a "wait forever" read on
+  // an empty mailslot would spin here forever; a real kernel's condition variable has no such problem.
+  const uint64_t reader_at = rig.alloc(8);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateMailslotFile, reader_at, kGenericRead | kSync, rig.attributes("\\??\\mailslot\\test"), rig.alloc(16),
+                 {0, 0, 64, rig.offset(0)}) == 0);
+  const uint64_t reader = rig.u64(reader_at);
+  CHECK(reader != 0);
+
+  // a second CreateMailslot of the same name is refused, like the real one (one reader per name)
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateMailslotFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\mailslot\\test"), rig.alloc(16),
+                 {0, 0, 64, rig.offset(0)}) == 0xC0000035u);      // STATUS_OBJECT_NAME_COLLISION
+  // opening a writer for a name nothing made yet fails
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericWrite | kSync, rig.attributes("\\??\\mailslot\\nosuchslot"), rig.alloc(16),
+                 {0, 0x80, 7, 1, kOptions, 0, 0}) == 0xC0000034u);      // STATUS_OBJECT_NAME_NOT_FOUND
+
+  // nothing written yet: reading with no timeout fails at once instead of blocking
+  uint64_t got = 0;
+  CHECK(rig.read(reader, rig.alloc(64), 64, 0, &got) == 0xC00000B5u);      // STATUS_IO_TIMEOUT
+
+  // a writer (CreateFile on the name) sends a whole message; the reader takes it back whole
+  NtRig::Opened writer = rig.create("\\??\\mailslot\\test", kGenericWrite, 1 /* FILE_OPEN */, kOptions);
+  CHECK(writer.status == 0);
+  CHECK(rig.write(writer.handle, "hello", 0) == 0);
+  const uint64_t buf = rig.alloc(64);
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 5 && rig.bytes(buf, 5) == "hello");
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0xC00000B5u);      // taken: empty again
+
+  // two messages keep their own boundaries - a read never returns more than one, even back to back
+  CHECK(rig.write(writer.handle, "one", 0) == 0 && rig.write(writer.handle, "two", 0) == 0);
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 3 && rig.bytes(buf, 3) == "one");
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 3 && rig.bytes(buf, 3) == "two");
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0xC00000B5u);
+
+  // a buffer too small for the next message leaves it queued (a real mailslot's ERROR_INSUFFICIENT_BUFFER), so a bigger retry still sees it
+  CHECK(rig.write(writer.handle, "a longer message", 0) == 0);
+  CHECK(rig.read(reader, buf, 4, 0, &got) == 0xC0000023u);      // STATUS_BUFFER_TOO_SMALL
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 16 && rig.bytes(buf, 16) == "a longer message");
+
+  // GetMailslotInfo / SetMailslotInfo (NtQueryInformationFile/NtSetInformationFile classes 26/27)
+  CHECK(rig.write(writer.handle, "queued", 0) == 0);
+  const uint64_t info = rig.alloc(24);
+  CHECK(rig.query(reader, info, 24, 26) == 0);
+  CHECK(rig.u64(info) == uint32_t(64));      // MaximumMessageSize (truncated to 32 bits by u64's own read, upper half is 0)
+  CHECK(uint32_t(rig.u64(info + 8) & 0xFFFFFFFFu) == 6);      // NextMessageSize ("queued")
+  CHECK(rig.call(WindowsSyscallNumber::NtSetInformationFile, reader, rig.alloc(16), rig.offset(uint64_t(0) - 50000000ull), 8, {27}) == 0);      // 5 seconds, as 100ns units
+  CHECK(rig.query(reader, info, 24, 26) == 0 && int64_t(rig.u64(info + 16)) == -50000000ll);
+  rig.read(reader, buf, 64, 0, &got);      // drain "queued" before the mailslot goes away
+
+  // closing the reader destroys the mailslot; a writer that still has it open sees it as gone
+  CHECK(rig.call(WindowsSyscallNumber::NtClose, reader) == 0);
+  CHECK(rig.write(writer.handle, "too late", 0) == 0xC0000034u);
+
+  rig.call(WindowsSyscallNumber::NtClose, writer.handle);
+  set_system_objects(nullptr);
+}
+
 // Garbage in the program's memory and wild pointers in the arguments must only ever produce errors.
 static void test_hostile_arguments() {
   filesystem::RamFileSystem fs(A);
@@ -664,6 +800,8 @@ int main() {
   test_linux_files();
   test_windows_files();
   test_change_notifications();
+  test_read_directory_changes();
+  test_mailslots();
   test_hostile_arguments();
   CHECK(A.live == 0);
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

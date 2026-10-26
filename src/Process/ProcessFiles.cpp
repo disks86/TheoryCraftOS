@@ -163,6 +163,8 @@ bool ProcessFiles::close(uint64_t slot) {
   closing.object = static_cast<SharedPointer<OpenObject>&&>(slots_[slot].object);
   slots_[slot] = Slot();
   if (closing.object && closing.object.use_count() == 1) if (ObjectManager* objects = system_objects()) objects->unlock_all(closing.object.get());      // (its byte-range locks go with it)
+  if (closing.object && closing.object.use_count() == 1 && closing.object->change_watch != 0)
+    if (ObjectManager* objects = system_objects()) objects->release(closing.object->change_watch);      // ReadDirectoryChangesW's own watch goes with the handle
   if (closing.object && closing.object.use_count() == 1 && closing.object->delete_on_close) {
     String path(*allocator_), virtual_path(*allocator_);
     virtual_path.assign(closing.object->path.view());

@@ -60,6 +60,8 @@ $cc -O1 -Wall -Wextra -o "$out/locktest.exe" tests/windows/locktest.c
 echo "built $out/locktest.exe (byte-range locks; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/notifytest.exe" tests/windows/notifytest.c
 echo "built $out/notifytest.exe (FindFirstChangeNotification/ReadDirectoryChangesW's NtCreateChangeNotification)"
+$cc -O1 -Wall -Wextra -o "$out/mailslottest.exe" tests/windows/mailslottest.c
+echo "built $out/mailslottest.exe (CreateMailslot/GetMailslotInfo/SetMailslotInfo)"
 $cc -O1 -Wall -Wextra -o "$out/socktest.exe" tests/windows/socktest.c -lws2_32
 echo "built $out/socktest.exe (ws2_32: TCP/UDP loopback, non-blocking connect, select)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c

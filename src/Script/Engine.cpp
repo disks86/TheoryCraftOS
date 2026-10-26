@@ -319,7 +319,7 @@ const char kCollections[] = R"JSLIB((function (g) {
     if (t === 'boolean') return value ? 'bt' : 'bf';
     if (value === undefined) return 'u';
     if (value === null) return 'l';
-    if (t === 'symbol') return 'y' + String(value);
+    if (t === 'symbol') return 'y' + __symbol_info(value, 3);
     if (t === 'bigint') return 'g' + String(value);
     var id = value.__oid;
     if (id === undefined) {
@@ -747,7 +747,7 @@ const char kCollections[] = R"JSLIB((function (g) {
     },
     has: function (o, k) { return k in o; },
     getPrototypeOf: function (o) { return Object.getPrototypeOf(o); },
-    ownKeys: function (o) { return Object.keys(o); },
+    ownKeys: function (o) { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols(o)); },
     isExtensible: function (o) { return Object.isExtensible(o); },
     preventExtensions: function (o) { Object.preventExtensions(o); return true; },
     setPrototypeOf: function (o, p) { try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; } }

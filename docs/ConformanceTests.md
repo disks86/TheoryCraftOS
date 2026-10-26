@@ -63,7 +63,7 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   accessors for attributes of `Window`.
 - **WebAssembly JS API**: `Module` structured-clones (the bytes are kept); the other objects throw `DataCloneError`. Built-in methods are not
   constructors (a native is constructible only if it has a `prototype` property, or is `Proxy`), a function's `name` and `length` are read-only, and
-  `ToNumber` of a Symbol throws (a symbol is still a string `@@<description>#<n>`, so `+Symbol()` is told from a string by that suffix).
+  `ToNumber` of a Symbol throws (symbols are strings cells flagged `JsString::symbol`, see below).
 
 ## Writing a test
 
@@ -75,6 +75,14 @@ one test per row for that reason.
 Tests that need no DOM can be checked against a reference engine before they are trusted: concatenate `harness.js` and the file and run it with
 `node` (the JavaScript, module and WebAssembly files were verified that way; for modules use `data:` URLs in place of `mod_url`). Every `xfail`
 should then report `XPASS` in node.
+
+## Symbols
+
+A Symbol is a string cell with `JsString::symbol` set; its text is `@@<description>#<n>` (a well-known one is the interned `@@iterator` and the like, so the C++
+side keeps looking them up by that text). `typeof` says "symbol", `to_string` / `to_number` throw, `String(sym)` and `Symbol.prototype.toString` give
+`Symbol(description)`, a symbol is its own property key (never interned), and the string key lists (`Object.keys`, `for-in`, `getOwnPropertyNames`, JSON)
+skip symbol keys while `getOwnPropertySymbols` / `Reflect.ownKeys` list them. `Symbol.for` is a Map in `Stdlib.cpp`. A string whose text equals a well-known
+symbol's (`'@@iterator'`) is the same cell as the symbol. Not done: wrapper objects (`Object(sym)`), symbol keys in object spread / `Object.assign`.
 
 ## Strings
 

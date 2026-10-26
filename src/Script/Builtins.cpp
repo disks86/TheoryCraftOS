@@ -112,7 +112,14 @@ bool need_function(Vm& vm, const Value& v) {
 
 NATIVE(object_ctor) {
   const Value v = arg_at(args, argc, 0);
-  *result = v.is_object() ? v : Value::make_object(vm.new_plain());
+  if (v.is_object() && !Vm::is_bigint(v)) {
+    *result = v;
+  } else if (v.is_nullish()) {
+    *result = Value::make_object(vm.new_plain());
+  } else {   // Object(1), Object('a'): the wrapper object
+    JsObject* boxed = vm.box(v);
+    *result = Value::make_object(boxed ? boxed : vm.new_plain());
+  }
   return true;
 }
 
@@ -602,6 +609,10 @@ NATIVE(template_object) {
 }
 
 NATIVE(object_to_string) {
+  if (Vm::is_symbol(self)) {
+    *result = str_value(vm, "[object Symbol]");
+    return true;
+  }
   if (self.is_object()) {   // [Symbol.toStringTag]
     Value tag;
     if (vm.get_named(self, "@@toStringTag", &tag) && tag.is_string()) {
@@ -626,6 +637,11 @@ NATIVE(object_to_string) {
       case ObjKind::Error: name = "[object Error]"; break;
       case ObjKind::RegExp: name = "[object RegExp]"; break;
       case ObjKind::Promise: name = "[object Promise]"; break;
+      case ObjKind::Primitive: {
+        const Value p = self.as_object()->bound_this;
+        name = p.is_number() ? "[object Number]" : p.is_bool() ? "[object Boolean]" : Vm::is_symbol(p) ? "[object Symbol]" : p.is_string() ? "[object String]" : "[object BigInt]";
+        break;
+      }
       default: break;
     }
   }
@@ -763,7 +779,7 @@ NATIVE(array_pop) {
     *result = Value();
     return true;
   }
-  *result = a->items[--a->length];
+  *result = a->items[--a->length].unhole();
   return true;
 }
 
@@ -774,7 +790,7 @@ NATIVE(array_shift) {
     *result = Value();
     return true;
   }
-  *result = a->items[0];
+  *result = a->items[0].unhole();
   for (uint32_t i = 1; i < a->length; ++i) a->items[i - 1] = a->items[i];
   --a->length;
   return true;
@@ -875,7 +891,7 @@ NATIVE(array_index_of) {
   if (!arg_integer(vm, args, argc, 1, 0, &from)) return false;
   from = relative(from, a->length);
   for (int64_t i = from; i < a->length; ++i) {
-    if (vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
+    if (!a->items[i].is_hole() && vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
       *result = num_value(static_cast<double>(i));
       return true;
     }
@@ -888,7 +904,7 @@ NATIVE(array_last_index_of) {
   JsObject* a;
   if (!this_array(vm, self, &a)) return false;
   for (int64_t i = static_cast<int64_t>(a->length) - 1; i >= 0; --i) {
-    if (vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
+    if (!a->items[i].is_hole() && vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
       *result = num_value(static_cast<double>(i));
       return true;
     }
@@ -958,7 +974,12 @@ bool array_each(Vm& vm, const Value& self, const Value* args, uint32_t argc, Val
   if (mode == Each::Some) *result = Value::make_bool(false);
   if (mode == Each::Every) *result = Value::make_bool(true);
   for (uint32_t i = 0; i < a->length; ++i) {
-    const Value item = a->items[i];
+    const bool hole = a->items[i].is_hole();
+    if (hole && mode != Each::Find && mode != Each::FindIndex) {   // (forEach, map, filter, some and every skip the holes; map keeps them)
+      if (mode == Each::Map) vm.array_push(out, Value::make_hole());
+      continue;
+    }
+    const Value item = a->items[i].unhole();
     Value call_args[3] = {item, num_value(i), self};
     Value r;
     if (!vm.call(fn, this_arg, call_args, 3, &r)) return false;
@@ -1017,10 +1038,13 @@ bool array_reduce_impl(Vm& vm, const Value& self, const Value* args, uint32_t ar
     acc = args[1];
   } else {
     if (a->length == 0) return vm.throw_error(ErrorKind::TypeError, "Reduce of empty array with no initial value");
+    while (i >= 0 && i < static_cast<int64_t>(a->length) && a->items[i].is_hole()) i += step;   // (the first element that is there)
+    if (i < 0 || i >= static_cast<int64_t>(a->length)) return vm.throw_error(ErrorKind::TypeError, "Reduce of empty array with no initial value");
     acc = a->items[i];
     i += step;
   }
   for (; i >= 0 && i < static_cast<int64_t>(a->length); i += step) {
+    if (a->items[i].is_hole()) continue;
     Value call_args[4] = {acc, a->items[i], num_value(static_cast<double>(i)), self};
     if (!vm.call(fn, Value(), call_args, 4, &acc)) return false;
   }
@@ -1127,13 +1151,14 @@ NATIVE(array_flat) {
 // --- String -------------------------------------------------------------------------------------------------------
 
 NATIVE(string_ctor) {
-  if (argc == 0) {
-    *result = Value::make_string(vm.empty_string());
-    return true;
+  JsString* s = vm.empty_string();
+  if (argc > 0) {
+    const bool constructing = self.is_object() && self.as_object()->okind == ObjKind::Plain && self.as_object()->prop_count == 0;
+    if (Vm::is_symbol(args[0]) && !constructing) s = vm.symbol_descriptive_string(args[0].as_string());   // String(sym) is allowed, unlike sym + ''
+    else if (!vm.to_string(args[0], &s)) return false;
   }
-  JsString* s;
-  if (!vm.to_string(args[0], &s)) return false;
   *result = Value::make_string(s);
+  vm.become_wrapper(self, vm.string_proto(), *result);   // new String('a')
   return true;
 }
 
@@ -1625,6 +1650,10 @@ NATIVE(string_locale_compare) {
 }
 
 NATIVE(string_to_string) {
+  if (Vm::primitive_of(self).is_string()) {
+    *result = Vm::primitive_of(self);
+    return true;
+  }
   if (!self.is_string()) return vm.throw_error(ErrorKind::TypeError, "String.prototype.toString requires a string");
   *result = self;
   return true;
@@ -1636,12 +1665,14 @@ NATIVE(number_ctor) {
   double d = 0;
   if (argc > 0 && !vm.to_number(args[0], &d)) return false;
   *result = num_value(d);
+  vm.become_wrapper(self, vm.number_proto(), *result);   // new Number(1)
   return true;
 }
 
 bool this_number(Vm& vm, const Value& self, double* out) {
-  if (!self.is_number()) return vm.throw_error(ErrorKind::TypeError, "Number.prototype method called on a value that is not a number");
-  *out = self.u.number;
+  const Value v = Vm::primitive_of(self);
+  if (!v.is_number()) return vm.throw_error(ErrorKind::TypeError, "Number.prototype method called on a value that is not a number");
+  *out = v.u.number;
   return true;
 }
 
@@ -1777,16 +1808,18 @@ NATIVE(global_parse_int) {
 
 NATIVE(boolean_ctor) {
   *result = Value::make_bool(Vm::to_boolean(arg_at(args, argc, 0)));
+  vm.become_wrapper(self, vm.boolean_proto(), *result);   // new Boolean(false)
   return true;
 }
 
 NATIVE(boolean_to_string) {
-  *result = str_value(vm, self.is_bool() && self.u.boolean ? "true" : "false");
+  const Value v = Vm::primitive_of(self);
+  *result = str_value(vm, v.is_bool() && v.u.boolean ? "true" : "false");
   return true;
 }
 
 NATIVE(boolean_value_of) {
-  *result = self;
+  *result = Vm::primitive_of(self);
   return true;
 }
 
@@ -1997,17 +2030,60 @@ NATIVE(promise_catch) {
 // --- Symbol (just enough for Symbol.iterator: a symbol is a string that begins "@@") ------------------------------------------
 
 NATIVE(symbol_function) {
-  static uint32_t counter = 0;
-  String text(vm.allocator());
-  text.append("@@");
-  JsString* description;
-  if (argc > 0 && !args[0].is_undefined()) {
-    if (!vm.to_string(args[0], &description)) return false;
-    text.append(description->view());
+  if (self.is_object() && self.as_object()->proto == vm.symbol_proto()) return vm.throw_error(ErrorKind::TypeError, "Symbol is not a constructor");   // (new Symbol())
+  JsString* symbol = vm.new_symbol(argc > 0 ? args[0] : Value());
+  if (!symbol) return false;
+  *result = Value::make_string(symbol);
+  return true;
+}
+
+// __symbol_info(symbol, what): 0 the description (undefined if there is none), 1 "Symbol(description)", 2 whether it is a symbol
+NATIVE(symbol_info) {
+  (void)self;
+  const Value v = Vm::primitive_of(arg_at(args, argc, 0));
+  double what = 0;
+  vm.to_number(arg_at(args, argc, 1), &what);
+  if (what == 4) {   // the primitive itself (valueOf of a symbol or of its wrapper)
+    if (!Vm::is_symbol(v)) return vm.throw_error(ErrorKind::TypeError, "Receiver is not a symbol");
+    *result = v;
+    return true;
   }
-  text.push_back('#');
-  text.append_uint(++counter);
-  *result = str_value(vm, text.view());
+  if (what == 2) {
+    *result = Value::make_bool(Vm::is_symbol(v));
+    return true;
+  }
+  if (!Vm::is_symbol(v)) return vm.throw_error(ErrorKind::TypeError, "Receiver is not a symbol");
+  JsString* s = v.as_string();
+  if (what == 1) {
+    *result = Value::make_string(vm.symbol_descriptive_string(s));
+    return true;
+  }
+  if (what == 3) {   // the unique text (the key of a Map entry)
+    *result = Value::make_string(vm.new_string(s->view()));
+    return true;
+  }
+  StringView t = s->view();
+  uint64_t i = t.size();
+  while (i > 2 && t[i - 1] != '#') --i;
+  if (i <= 2 && s->described) {   // a well-known symbol: Symbol.iterator.description is "Symbol.iterator"
+    String text(vm.allocator());
+    text.append("Symbol.");
+    text.append(t.substr(2));
+    *result = str_value(vm, text.view());
+  } else *result = s->described && i > 2 ? str_value(vm, t.substr(2, i - 3)) : Value();
+  return true;
+}
+
+NATIVE(primitive_of_native) {
+  (void)self;
+  *result = Vm::primitive_of(arg_at(args, argc, 0));
+  return true;
+}
+
+NATIVE(object_get_own_property_symbols) {
+  (void)self;
+  const Value v = arg_at(args, argc, 0);
+  *result = v.is_object() ? Value::make_object(vm.own_symbols(v.as_object())) : Value::make_object(vm.new_array());
   return true;
 }
 
@@ -2075,6 +2151,7 @@ struct JsonWriter {
       const Value call_args[2] = {Value::make_string(key), value};
       if (!vm.call(replacer_function, holder, call_args, 2, &value)) return false;
     }
+    if (value.is_object() && value.as_object()->okind == ObjKind::Primitive && !Vm::is_bigint(value.as_object()->bound_this)) value = value.as_object()->bound_this;   // new Number(3) is written as 3
     switch (value.tag) {
       case Tag::Undefined: return true;
       case Tag::Null: out.append("null"); *wrote = true; return true;
@@ -2089,7 +2166,11 @@ struct JsonWriter {
         }
         *wrote = true;
         return true;
-      case Tag::String: json_quote(value.as_string()->view(), &out); *wrote = true; return true;
+      case Tag::String:
+        if (value.as_string()->symbol) return true;   // (a symbol has no JSON form)
+        json_quote(value.as_string()->view(), &out);
+        *wrote = true;
+        return true;
       case Tag::Object: break;
     }
     if (Vm::is_callable(value)) return true;
@@ -2940,13 +3021,21 @@ bool install_builtins(Vm& vm) {
 
   // Symbol
   JsObject* symbol = vm.new_native(symbol_function, "Symbol", 0);
+  vm.define(symbol, vm.prototype_name(), Value::make_object(vm.symbol_proto()), 0);
+  vm.define(vm.symbol_proto(), vm.intern("constructor"), Value::make_object(symbol), kWritable);
   global_value("Symbol", Value::make_object(symbol));
-  for (const char* name : {"iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag", "species"}) {
+  for (const char* name : {"iterator", "asyncIterator", "hasInstance", "toPrimitive", "toStringTag", "species", "isConcatSpreadable", "match", "matchAll", "replace", "search", "split", "unscopables"}) {
     String well_known(vm.allocator());
     well_known.append("@@");
     well_known.append(name);
-    vm.define_named(symbol, name, str_value(vm, well_known.view()), 0);
+    JsString* s = vm.intern(well_known.view());   // (the C++ side looks these up by their text: the same cell)
+    s->symbol = true;
+    s->described = true;
+    vm.define_named(symbol, name, Value::make_string(s), 0);
   }
+  vm.define_native(g, "__symbol_info", symbol_info, 2);
+  vm.define_native(g, "__primitive_of", primitive_of_native, 1);
+  vm.define_native(object, "getOwnPropertySymbols", object_get_own_property_symbols, 1);
 
   // Promise
   JsObject* promise = make_ctor("Promise", promise_ctor, 1, vm.promise_proto());

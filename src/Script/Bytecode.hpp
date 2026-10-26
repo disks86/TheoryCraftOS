@@ -26,7 +26,7 @@ namespace script {
 
 enum class Opc : uint8_t {
   // constants
-  PushUndef, PushNull, PushTrue, PushFalse, PushNum, PushStr, PushInt, PushThis, NewTarget,
+  PushUndef, PushHole, PushNull, PushTrue, PushFalse, PushNum, PushStr, PushInt, PushThis, NewTarget,
   // the stack
   Pop, Dup, Dup2, DupX1, DupX2, Swap,
   // variables: GetVar/SetVar b = how many functions out, a = slot (SetVar leaves the value on the stack); globals by name constant a

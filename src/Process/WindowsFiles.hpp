@@ -49,5 +49,11 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r);
 // directly under the named directory, or anywhere under it if WatchTree is nonzero. FindNextChangeNotification is NtResetEvent on the same handle; FindCloseChangeNotification
 // is NtClose. NotifyFilter is kept but not matched against: any of those changes signals the handle, regardless of which FILE_NOTIFY_CHANGE_* bits were asked for.
 uint32_t nt_create_change_notification(Process& p, const SyscallRequest& r);
+// NtNotifyChangeDirectoryFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
+// ULONG CompletionFilter, BOOLEAN WatchTree): this OS's own real-named service, behind ReadDirectoryChangesW - unlike real Windows, synchronous (there is no real
+// asynchronous I/O in this kernel): blocks until at least one change, fills Buffer with as many FILE_NOTIFY_INFORMATION records as fit and have already happened.
+// FileHandle must already be an open directory handle; the watch (its directory, WatchTree, CompletionFilter) is made on the handle's first call and kept for its
+// life. Event, if given, is set on success; ApcRoutine, if given, is queued as an ordinary APC (like ReadFileEx), run when the thread next waits alertably.
+uint32_t nt_notify_change_directory_file(Process& p, const SyscallRequest& r);
 
 }  // namespace process::windowsabi

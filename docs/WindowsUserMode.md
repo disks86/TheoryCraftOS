@@ -35,6 +35,22 @@ kernel32 for the registry.
 | `NtCreateNamedPipeFile` | 56 |
 | `NtFsControlFile` | 57 |
 
+## Mailslots
+
+| Service | Number |
+| --- | --- |
+| `NtCreateMailslotFile` | 97 |
+
+The one service this needs (a writer is just `CreateFile` on the name, like a named pipe's client end, needing no service of its own).
+`CreateMailslot`/`GetMailslotInfo`/`SetMailslotInfo` work: one reader per name (a second `CreateMailslot` of the same name is refused, like the real one), any number
+of writers (`CreateFile` on `\\.\mailslot\name`), each `WriteFile` queuing one whole message that a `ReadFile` on the reader's handle takes back whole - never split
+or coalesced with another write's bytes, and a buffer too small for the next message leaves it queued (`STATUS_BUFFER_TOO_SMALL`, like the real one's
+`ERROR_INSUFFICIENT_BUFFER`) rather than losing it. Closing the reader's handle destroys the mailslot at once; a writer that still has it open then sees it as
+gone. Not provided: the domain-wide broadcast a real mailslot can do across machines with the same name (there is only one machine here) - only local processes on
+this one machine can write to it, which is the common use anyway (a single-machine notification queue). The read timeout (`SetMailslotInfo`'s millisecond value,
+`MAILSLOT_WAIT_FOREVER` included) is converted to this codebase's own relative, negative-100ns convention at the kernel32 layer, the same way `CreateFile`'s
+disposition and options are converted from their Win32 constants.
+
 ## Memory and sections
 
 | Service | Number |
@@ -157,6 +173,7 @@ like any other, as far as the mounted file system does), remote registries, and 
 | `NtSocketControl` | 94 |
 | `NtSelectSockets` | 95 |
 | `NtCreateChangeNotification` | 96 |
+| `NtNotifyChangeDirectoryFile` | 98 |
 
 ## Sockets
 
@@ -174,18 +191,23 @@ loopback interface (a program's own address is whichever one network interface i
 
 ## Directory change notifications
 
-`FindFirstChangeNotification`/`FindNextChangeNotification`/`FindCloseChangeNotification` are backed by a single new service, `NtCreateChangeNotification`, this OS's own
-(real Windows has none of its own either: both that family and `ReadDirectoryChangesW` go through `NtNotifyChangeDirectoryFile`, one IRP-based service that completes
-asynchronously - not a fit for a kernel with no real asynchronous I/O, so this is a smaller, synchronous design instead). A change notification handle is an ordinary
-`ObjectManager` object (kind `ChangeNotification`) that behaves exactly like a manual-reset event: `WaitForSingleObject`/`WaitForMultipleObjects` work on it unmodified,
-and `FindNextChangeNotification` is literally `NtResetEvent` on the same handle (it is not a separate service). It becomes signalled when a file or subdirectory is
-created, deleted, renamed, hard-linked or symbolically linked directly under the watched directory, or anywhere under it with `bWatchSubtree` true; the directory
-itself must exist when the handle is made. The `dwNotifyFilter` bits are accepted and kept but not matched against - any of those changes signals every watch of its
-directory, regardless of which `FILE_NOTIFY_CHANGE_*` bits were asked for (the same kind of permissive simplification as the registry's access checks). Only the RAM
-file system fires these (the one backing `C:\` in the demo and the primary image); a change made through FAT/Ext/NTFS/BeFS is invisible to a watcher, since those are
-not reachable from a Windows program's `C:\` anyway. Not done: `ReadDirectoryChangesW` itself (the buffered `FILE_NOTIFY_INFORMATION` form that reports *what* changed
-and its name, as opposed to just *that* something did), a file deleted via `FILE_DISPOSITION_INFORMATION`/delete-on-close firing at the point the handle actually
-closes (only `NtDeleteFile` and an overwriting `CreateFile` do), and watching anything outside the RAM file system.
+`FindFirstChangeNotification`/`FindNextChangeNotification`/`FindCloseChangeNotification` and `ReadDirectoryChangesW` are backed by two services, `NtCreateChangeNotification`
+and `NtNotifyChangeDirectoryFile`, this OS's own (real Windows has neither: both families go through the single `NtNotifyChangeDirectoryFile`, an IRP-based service that
+completes asynchronously - not a fit for a kernel with no real asynchronous I/O, so both are synchronous here instead, and split into two services because the two
+families bind to different kinds of handle - a dedicated notification handle for the first, an already-open directory handle for the second). A change notification
+handle is an ordinary `ObjectManager` object (kind `ChangeNotification`) that behaves exactly like a manual-reset event: `WaitForSingleObject`/`WaitForMultipleObjects`
+work on it unmodified, and `FindNextChangeNotification` is literally `NtResetEvent` on the same handle (it is not a separate service). It becomes signalled - and, for
+`ReadDirectoryChangesW`, queues a `FILE_NOTIFY_INFORMATION`-style action-and-name record - when a file or subdirectory is created, deleted, renamed, hard-linked or
+symbolically linked directly under the watched directory, or anywhere under it with `bWatchSubtree`/`WatchTree` true; the directory itself must exist when the handle
+or watch is made. The `dwNotifyFilter`/`CompletionFilter` bits are accepted and kept but not matched against - any of those changes signals every watch of its
+directory and queues it a record, regardless of which `FILE_NOTIFY_CHANGE_*` bits were asked for (the same kind of permissive simplification as the registry's access
+checks). `ReadDirectoryChangesW` works both synchronously and overlapped (its own watch is made and kept on the directory handle's first call, from then on just
+drained); an overlapped call's event is set and its completion routine, if any, queued as an ordinary APC, exactly like `ReadFileEx`/`WriteFileEx` already do - there
+is no real asynchronous I/O underneath either, the call is always done at once. Only the RAM file system fires any of this (the one backing `C:\` in the demo and the
+primary image); a change made through FAT/Ext/NTFS/BeFS is invisible to a watcher, since those are not reachable from a Windows program's `C:\` anyway. Not done: a
+file deleted via `FILE_DISPOSITION_INFORMATION`/delete-on-close firing at the point the handle actually closes (only `NtDeleteFile` and an overwriting `CreateFile`
+do), watching anything outside the RAM file system, and a `ReadDirectoryChangesW` buffer too small to hold every change already queued when it is called losing the
+rest instead of returning them on a later call (each watch keeps only its most recent 32 pending changes anyway, so this is a narrow edge case).
 
 ## Exceptions and the machine
 
@@ -253,5 +275,5 @@ closes (only `NtDeleteFile` and an overwriting `CreateFile` do), and watching an
   threads on every core. Reads and writes stop at the first page that is not committed (`ERROR_PARTIAL_COPY`, with the count); writes ignore page protection, as debuggers need.
   A remote thread's handle can be waited for, `GetExitCodeThread`, `GetThreadId`, `ResumeThread` (if created suspended) and `TerminateThread` work on it; other thread calls
   (contexts, priorities, APCs) do not. Code can be injected: write it into memory allocated with `VirtualAllocEx` and start a thread on it. There is no access check beyond having a handle.
-- **Not provided**: debugging APIs, mailslots, `ReadDirectoryChangesW` (`FindFirstChangeNotification` is done - see "Directory change notifications"), and the many exports of the real kernel32 and msvcrt that no program here has needed.
+- **Not provided**: debugging APIs, and the many exports of the real kernel32 and msvcrt that no program here has needed (`FindFirstChangeNotification`/`ReadDirectoryChangesW` - see "Directory change notifications" - and mailslots - see "Mailslots" - are both done).
   A call to an import that nothing provides stops the program with a message saying which one.

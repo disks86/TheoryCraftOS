@@ -117,4 +117,6 @@
 #define NT_SERVICE_NtSocketControl 94
 #define NT_SERVICE_NtSelectSockets 95
 #define NT_SERVICE_NtCreateChangeNotification 96
+#define NT_SERVICE_NtCreateMailslotFile 97
+#define NT_SERVICE_NtNotifyChangeDirectoryFile 98
 #endif

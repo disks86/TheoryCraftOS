@@ -21,6 +21,7 @@
 #include "Process/WindowsThreads.hpp"
 #include "Process/WindowsLocks.hpp"
 #include "Process/WindowsJobs.hpp"
+#include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsMemory.hpp"
 #include "Process/WindowsSockets.hpp"
 #include "Process/WindowsModules.hpp"
@@ -224,6 +225,8 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtSocketControl: return windowsabi::nt_socket_control(process, r);
       case WindowsSyscallNumber::NtSelectSockets: return windowsabi::nt_select_sockets(process, r);
       case WindowsSyscallNumber::NtCreateChangeNotification: return windowsabi::nt_create_change_notification(process, r);
+      case WindowsSyscallNumber::NtCreateMailslotFile: return windowsabi::nt_create_mailslot_file(process, r);
+      case WindowsSyscallNumber::NtNotifyChangeDirectoryFile: return windowsabi::nt_notify_change_directory_file(process, r);
       default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return kStatusInvalidSystemService;
     }
   }

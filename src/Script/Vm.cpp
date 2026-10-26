@@ -84,6 +84,7 @@ Vm::Vm(allocators::IAllocator& allocator, IHost* host)
   string_proto_ = new_object(object_proto_);
   number_proto_ = new_object(object_proto_);
   boolean_proto_ = new_object(object_proto_);
+  symbol_proto_ = new_object(object_proto_);
   error_proto_ = new_object(object_proto_);
   iterator_proto_ = new_object(object_proto_);
   sentinel_ = new_object(object_proto_);
@@ -876,7 +877,7 @@ void Vm::collect() {
   mark(promise_proto_);
   mark(micro_);
   mark(rejections_);
-  for (JsObject* o : {global_, object_proto_, function_proto_, array_proto_, string_proto_, number_proto_, boolean_proto_, error_proto_, iterator_proto_, sentinel_}) mark(o);
+  for (JsObject* o : {global_, object_proto_, function_proto_, array_proto_, string_proto_, number_proto_, boolean_proto_, symbol_proto_, error_proto_, iterator_proto_, sentinel_}) mark(o);
   for (int i = 0; i < 5; ++i) mark(error_protos_[i]);
   for (JsString* s : {empty_, length_, prototype_, name_, message_, constructor_, to_string_, value_of_, undefined_text_, null_text_, true_text_, false_text_}) mark(s);
   for (uint64_t i = 0; i < codes_.count(); ++i) {
@@ -977,8 +978,8 @@ void Vm::define(JsObject* o, JsString* key, const Value& value, uint8_t flags) {
     if (canonical_index(key->view(), &i)) {
       if (i > o->length + (1u << 20)) return;
       if (!ensure_items(o, i + 1)) return;
-      for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value();
-      o->items[i] = value;
+      for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value::make_hole();
+      o->items[i] = value.unhole();
       if (i >= o->length) o->length = i + 1;
       return;
     }
@@ -1063,7 +1064,7 @@ bool Vm::array_set_length(JsObject* a, uint32_t length) {
   if (length > a->length) {
     if (length > a->length + (1u << 24)) return false;
     if (!ensure_items(a, length)) return false;
-    for (uint32_t i = a->length; i < length; ++i) a->items[i] = Value();
+    for (uint32_t i = a->length; i < length; ++i) a->items[i] = Value::make_hole();
   }
   a->length = length;
   return true;
@@ -1071,6 +1072,18 @@ bool Vm::array_set_length(JsObject* a, uint32_t length) {
 
 bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
   if (o->host && o->host->get && o->host->get(*this, o, key, out)) return true;
+  if (o->okind == ObjKind::Primitive && o->bound_this.is_string() && !o->bound_this.as_string()->symbol) {   // new String('ab'): length and the characters
+    JsString* s = o->bound_this.as_string();
+    uint32_t i;
+    if (key == length_) {
+      *out = Value::make_number(string_length(s));
+      return true;
+    }
+    if (canonical_index(key->view(), &i) && i < string_length(s)) {
+      *out = Value::make_string(string_part(s, i, i + 1));
+      return true;
+    }
+  }
   if (o->okind == ObjKind::Array) {
     if (key == length_) {
       *out = Value::make_number(o->length);
@@ -1078,7 +1091,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     }
     uint32_t i;
     if (canonical_index(key->view(), &i)) {
-      if (i < o->length) {
+      if (i < o->length && !o->items[i].is_hole()) {
         *out = o->items[i];
         return true;
       }
@@ -1193,6 +1206,10 @@ bool Vm::get(const Value& base, JsString* key, Value* out) {
     }
     case Tag::String: {
       JsString* s = base.as_string();
+      if (s->symbol) {
+        o = symbol_proto_;
+        break;
+      }
       if (key == length_) {
         *out = Value::make_number(string_length(s));
         return true;
@@ -1234,7 +1251,7 @@ bool Vm::get(const Value& base, JsString* key, Value* out) {
 bool Vm::to_property_key(const Value& v, JsString** out) {
   if (v.is_string()) {
     JsString* s = v.as_string();
-    *out = s->interned ? s : intern(s->view());
+    *out = s->interned || s->symbol ? s : intern(s->view());
     return true;
   }
   if (v.is_number() && v.u.number >= 0 && v.u.number < 1e9 && v.u.number == static_cast<double>(static_cast<uint32_t>(v.u.number))) {
@@ -1262,7 +1279,7 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
   if (base.is_object() && array_index(key, &i)) {
     JsObject* o = base.as_object();
     if (o->okind == ObjKind::Array) {
-      *out = i < o->length ? o->items[i] : Value();
+      *out = i < o->length ? o->items[i].unhole() : Value();
       return true;
     }
     if (o->okind == ObjKind::TypedArray) return typed_array_get_value(*this, o, i, out);
@@ -1360,7 +1377,7 @@ bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, 
     if (o->okind == ObjKind::TypedArray) return typed_array_put(*this, o, i, value);
     if (o->okind == ObjKind::Array && !o->frozen) {
       if (i < o->length) {
-        o->items[i] = value;
+        o->items[i] = value.unhole();
         return true;
       }
       if (o->non_extensible || o->sealed) {
@@ -1369,8 +1386,8 @@ bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, 
         return put_ex(base, k, value, strict);
       }
       if (i <= o->length + (1u << 20) && ensure_items(o, i + 1)) {
-        for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value();
-        o->items[i] = value;
+        for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value::make_hole();
+        o->items[i] = value.unhole();
         o->length = i + 1;
       }
       return true;
@@ -1407,7 +1424,7 @@ bool Vm::delete_property(JsObject* o, JsString* key) {
   if (o->okind == ObjKind::Array) {
     uint32_t i;
     if (canonical_index(key->view(), &i)) {
-      if (i < o->length) o->items[i] = Value();
+      if (i < o->length) o->items[i] = Value::make_hole();
       return true;
     }
   }
@@ -1425,6 +1442,7 @@ JsObject* Vm::own_keys(JsObject* o) {
   JsObject* keys = new_array(o->prop_count + (o->okind == ObjKind::Array ? o->length : 0));
   if (o->okind == ObjKind::Array) {
     for (uint32_t i = 0; i < o->length; ++i) {
+      if (o->items[i].is_hole()) continue;
       char buffer[16];
       int length = 0;
       uint32_t n = i;
@@ -1435,7 +1453,15 @@ JsObject* Vm::own_keys(JsObject* o) {
       }
       char text[16];
       for (int k = 0; k < length; ++k) text[k] = buffer[length - 1 - k];
-      array_push(keys, Value::make_string(new_string(StringView(text, static_cast<uint64_t>(length)))));
+      array_push(keys, Value::make_string(intern(StringView(text, static_cast<uint64_t>(length)))));   // (interned: a key that is put on another object must be the one a lookup finds)
+    }
+  }
+  if (o->okind == ObjKind::Primitive && o->bound_this.is_string() && !o->bound_this.as_string()->symbol) {   // new String('ab'): "0", "1"
+    const uint32_t n = string_length(o->bound_this.as_string());
+    for (uint32_t i = 0; i < n; ++i) {
+      String text(allocator_);
+      text.append_uint(i);
+      array_push(keys, Value::make_string(intern(text.view())));
     }
   }
   if (o->host && o->host->keys) o->host->keys(*this, o, keys);
@@ -1443,12 +1469,82 @@ JsObject* Vm::own_keys(JsObject* o) {
   return keys;
 }
 
+JsString* Vm::new_symbol(const Value& description) {
+  String text(allocator_);
+  text.append("@@");
+  const bool described = !description.is_undefined();
+  if (described) {
+    JsString* d;
+    if (!to_string(description, &d)) return nullptr;
+    text.append(d->view());
+  }
+  text.push_back('#');
+  text.append_uint(++symbol_counter_);
+  JsString* s = new_string(text.view());
+  s->symbol = true;
+  s->described = described;
+  return s;
+}
+
+JsObject* Vm::box(const Value& p) {
+  JsObject* proto = nullptr;
+  switch (p.tag) {
+    case Tag::String: proto = p.as_string()->symbol ? symbol_proto_ : string_proto_; break;
+    case Tag::Number: proto = number_proto_; break;
+    case Tag::Boolean: proto = boolean_proto_; break;
+    default: {
+      Value big, bproto;
+      if (is_bigint(p) && get_plain(global_, intern("BigInt"), &big) && big.is_object() && get_named(big, "prototype", &bproto) && bproto.is_object()) proto = bproto.as_object();
+      break;
+    }
+  }
+  if (!proto) return nullptr;
+  JsObject* w = new_object(proto);
+  if (w == sentinel_) return nullptr;
+  w->okind = ObjKind::Primitive;
+  w->bound_this = p;
+  return w;
+}
+
+bool Vm::become_wrapper(const Value& self, JsObject* proto, const Value& primitive) {
+  if (!self.is_object() || self.as_object() == global_ || self.as_object()->okind != ObjKind::Plain || self.as_object()->prop_count != 0) return false;
+  bool derived = false;
+  for (JsObject* p = self.as_object()->proto; p && !derived; p = p->proto) derived = p == proto;
+  if (!derived) return false;
+  self.as_object()->okind = ObjKind::Primitive;
+  self.as_object()->bound_this = primitive;
+  return true;
+}
+
+JsString* Vm::symbol_descriptive_string(JsString* symbol) {
+  StringView t = symbol->view();
+  const uint64_t hash = [&] { uint64_t i = t.size(); while (i > 2 && t[i - 1] != '#') --i; return i; }();   // (one past the last '#' - or 2)
+  String text(allocator_);
+  text.append("Symbol(");
+  if (hash <= 2 && symbol->described) {   // a well-known symbol, "@@iterator": Symbol.iterator
+    text.append("Symbol.");
+    text.append(t.substr(2));
+  } else if (symbol->described) {
+    text.append(t.substr(2, hash - 3));
+  }
+  text.push_back(')');
+  return new_string(text.view());
+}
+
+JsObject* Vm::own_symbols(JsObject* o) {
+  JsObject* out = new_array(0);
+  if (o->okind == ObjKind::Proxy) return out;
+  for (uint32_t i = 0; i < o->prop_count; ++i)
+    if (o->props[i].key->symbol) array_push(out, Value::make_string(o->props[i].key));
+  return out;
+}
+
 // The own property names of an ordinary object, in the order the language gives: integer indices ascending, then the rest as they were added.
 void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   List<uint32_t> indexed(allocator_);
   for (uint32_t i = 0; i < o->prop_count; ++i) {
     uint32_t n;
-    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && canonical_index(o->props[i].key->view(), &n)) indexed.push_back(i);
+    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && canonical_index(o->props[i].key->view(), &n)) indexed.push_back(i);
   }
   for (uint64_t a = 1; a < indexed.count(); ++a) {   // (insertion sort by the index: objects with many integer keys are arrays, which do not come here)
     const uint32_t item = indexed[a];
@@ -1466,7 +1562,7 @@ void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   for (uint64_t a = 0; a < indexed.count(); ++a) array_push(names, Value::make_string(o->props[indexed[a]].key));
   for (uint32_t i = 0; i < o->prop_count; ++i) {
     uint32_t n;
-    if (((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n)) array_push(names, Value::make_string(o->props[i].key));
+    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n)) array_push(names, Value::make_string(o->props[i].key));
   }
 }
 
@@ -1552,7 +1648,10 @@ bool Vm::to_string(const Value& v, JsString** out) {
     case Tag::Undefined: *out = undefined_text_; return true;
     case Tag::Null: *out = null_text_; return true;
     case Tag::Boolean: *out = v.u.boolean ? true_text_ : false_text_; return true;
-    case Tag::String: *out = v.as_string(); return true;
+    case Tag::String:
+      if (v.as_string()->symbol) return throw_error(ErrorKind::TypeError, "Cannot convert a Symbol value to a string");
+      *out = v.as_string();
+      return true;
     case Tag::Number: {
       String text(allocator_);
       number_to_string(v.u.number, &text);
@@ -1576,14 +1675,6 @@ bool Vm::to_string(const Value& v, JsString** out) {
   }
 }
 
-// A symbol is a string "@@<description>#<number>" (see symbol_function): the number at the end is what tells one from a string that happens to start with @@.
-static bool is_symbol_text(StringView s) {
-  if (s.size() < 4 || s[0] != '@' || s[1] != '@') return false;
-  uint64_t i = s.size();
-  while (i > 2 && s[i - 1] >= '0' && s[i - 1] <= '9') --i;
-  return i < s.size() && i > 2 && s[i - 1] == '#';
-}
-
 bool Vm::to_number(const Value& v, double* out) {
   switch (v.tag) {
     case Tag::Undefined: *out = __builtin_nan(""); return true;
@@ -1592,7 +1683,7 @@ bool Vm::to_number(const Value& v, double* out) {
     case Tag::Number: *out = v.u.number; return true;
     case Tag::String: {
       double d;
-      if (is_symbol_text(v.as_string()->view())) return throw_error(ErrorKind::TypeError, "Cannot convert a Symbol value to a number");
+      if (v.as_string()->symbol) return throw_error(ErrorKind::TypeError, "Cannot convert a Symbol value to a number");
       if (!string_to_number(v.as_string()->view(), &d)) d = __builtin_nan("");
       *out = d;
       return true;
@@ -1635,7 +1726,7 @@ StringView Vm::type_of(const Value& v) {
     case Tag::Null: return "object";
     case Tag::Boolean: return "boolean";
     case Tag::Number: return "number";
-    case Tag::String: return "string";
+    case Tag::String: return v.as_string()->symbol ? "symbol" : "string";
     default: return is_bigint(v) ? "bigint" : is_callable(v) ? "function" : "object";
   }
 }
@@ -1647,7 +1738,7 @@ bool Vm::strict_equals(const Value& a, const Value& b) {
     case Tag::Null: return true;
     case Tag::Boolean: return a.u.boolean == b.u.boolean;
     case Tag::Number: return a.u.number == b.u.number;
-    case Tag::String: return a.as_string() == b.as_string() || (a.as_string()->length == b.as_string()->length && a.as_string()->view().equals(b.as_string()->view()));
+    case Tag::String: return a.as_string() == b.as_string() || (a.as_string()->symbol == b.as_string()->symbol && a.as_string()->length == b.as_string()->length && a.as_string()->view().equals(b.as_string()->view()));
     default: {
       if (a.u.cell == b.u.cell) return true;
       bool na, nb;
@@ -1684,7 +1775,9 @@ bool Vm::loose_equals(const Value& a, const Value& b) {
 void Vm::describe(const Value& v, String* out, uint32_t depth) {
   switch (v.tag) {
     case Tag::String:
-      if (depth == 0) {
+      if (v.as_string()->symbol) {
+        out->append(symbol_descriptive_string(v.as_string())->view());
+      } else if (depth == 0) {
         out->append(v.as_string()->view());
       } else {
         out->push_back('\'');
@@ -2133,7 +2226,7 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
   if (src.is_object() && src.as_object()->okind == ObjKind::Array) {
     JsObject* a = src.as_object();
     if (it->position < a->length) {
-      *out = a->items[it->position++];
+      *out = a->items[it->position++].unhole();
       return true;
     }
   }
@@ -2250,6 +2343,10 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   f.pc = 0;
   f.env = env;
   f.this_value = code->is_arrow ? fn->bound_this : (this_value.is_nullish() && !construct && !code->strict ? Value::make_object(global_) : this_value);   // (strict code keeps an undefined `this`)
+  if (!code->is_arrow && !code->strict && !code->library && !construct && !f.this_value.is_object() && !f.this_value.is_nullish()) {   // sloppy code gets the wrapper of a primitive
+    JsObject* boxed = box(f.this_value);
+    if (boxed) f.this_value = Value::make_object(boxed);
+  }
   f.callee = fn;
   f.base = base;
   f.handlers = static_cast<uint32_t>(handlers_.count());
@@ -2850,6 +2947,7 @@ reload:
       case Opc::Throw:
         throw_value(stack_[sp_ - 1]);
         THROW_PENDING();
+      case Opc::PushHole: PUSH(Value::make_hole()); break;
       case Opc::NewObject: PUSH(Value::make_object(new_plain())); break;
       case Opc::DefineProp: {   // [obj, value] -> [obj]
         define(stack_[sp_ - 2].as_object(), code->constants[static_cast<uint32_t>(in.a)].as_string(), stack_[sp_ - 1]);
