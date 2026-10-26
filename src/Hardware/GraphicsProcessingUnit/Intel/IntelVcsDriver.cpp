@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/GraphicsProcessingUnit/Intel/IntelVcsDriver.hpp"
+#include "Hardware/GraphicsProcessingUnit/Intel/IntelGen9Setup.hpp"
 #include "Utility/AllocatedView.hpp"
 
 namespace hardware {
@@ -149,6 +150,15 @@ bool VcsDriver::initialize(const Config& config) {
 
   if (config.generation == Generation::Gen12) program_gen12_pat(regs);
   else program_private_pat(regs, gen9_private_pat());
+  if (render()) {
+    // The render engine's tables and workarounds, as i915 sets them before it uses the engine. (Settings of the GPU, not of this driver's memory: they stay if
+    // initialisation fails later, and are the same the next time.)
+    const gen9::Identity identity = gen9::identity_for(config.device_id, config.revision);
+    gen9::apply_gt_workarounds(regs, identity);
+    gen9::program_l3cc(regs);
+    gen9::program_mocs(regs, gen9::kRenderMocsBase);
+    gen9::apply_render_workarounds(regs, identity);
+  }
 
   if (!allocate(kPageSize, &scratch_) || !allocate(kRingBytes, &ring_) || !allocate(kPageSize, &status_) || !allocate(lrc_pages_ * kPageSize, &context_) ||
       !allocate(kBatchBytes, &batch_)) {

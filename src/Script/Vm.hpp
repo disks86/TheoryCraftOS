@@ -110,13 +110,20 @@ class Vm {
   // --- Properties. get() and friends accept any base value (primitives use their prototypes); null and undefined throw.
   bool get(const Value& base, JsString* key, Value* out);
   bool get_member(const Value& base, const Value& key, Value* out);
-  bool put(const Value& base, JsString* key, const Value& value);
-  bool put_member(const Value& base, const Value& key, const Value& value);
+  bool put(const Value& base, JsString* key, const Value& value) { return put_ex(base, key, value, false); }
+  bool put_member(const Value& base, const Value& key, const Value& value) { return put_member_ex(base, key, value, false); }
+  // The same; in strict mode code a write that does not happen (read-only, no setter, not extensible) throws a TypeError.
+  bool put_ex(const Value& base, JsString* key, const Value& value, bool strict);
+  bool put_member_ex(const Value& base, const Value& key, const Value& value, bool strict);
+  // True if the script function that is running (the one that called the native) is the host's own.
+  bool in_library_code() const { return frames_.count() > 0 && frames_[frames_.count() - 1].code->library; }
   bool get_named(const Value& base, StringView name, Value* out) { return get(base, intern(name), out); }
   // Property of an object itself (no prototype chain): false if it has none.
   bool get_own(JsObject* object, JsString* key, Value* out);
   bool has_property(JsObject* object, JsString* key);
   bool delete_property(JsObject* object, JsString* key);
+  // Changes the flag bits in `mask` of an own property to those in `bits` (the property keeps its other flags).
+  void set_property_flags(JsObject* object, JsString* key, uint8_t bits, uint8_t mask);
   // Sets a property directly (replacing one that is there), with the given flags.
   void define(JsObject* object, JsString* key, const Value& value, uint8_t flags = kDefaultFlags);
   // A property with a getter and / or a setter (undefined: leave that part as it is). `flags` may carry kEnumerable.

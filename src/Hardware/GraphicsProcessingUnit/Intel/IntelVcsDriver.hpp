@@ -96,6 +96,8 @@ class VcsDriver {
     uint64_t ggtt_first_page = 0;         // the first of the ggtt_pages_for(engine) pages of graphics address space this driver may use; it touches no others
     Generation generation = Generation::Gen9;
     Engine engine = Engine::Video;        // the render engine is Gen9 only; it needs ggtt_pages_for(Engine::Render) pages
+    uint16_t device_id = 0;               // the GPU's PCI device ID and revision: which Gen9.5 workarounds the render engine gets (IntelGen9Setup.hpp)
+    uint8_t revision = 0;
     uint32_t engine_base = 0;             // 0: the first video engine of the generation (VCS0 at 0x12000, VD0 at 0x1C0000)
     uint32_t poll_limit = 5'000'000;      // polls of the completion marker (and then the status buffer) before a job is given up
   };

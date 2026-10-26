@@ -179,6 +179,17 @@ NATIVE(object_create) {
   return true;
 }
 
+// SameValue: like === but NaN is NaN and +0 is not -0.
+bool same_value(const Value& a, const Value& b) {
+  if (a.is_number() && b.is_number()) {
+    const double x = a.u.number, y = b.u.number;
+    if (x != x && y != y) return true;
+    if (x == 0 && y == 0) return (1 / x > 0) == (1 / y > 0);
+    return x == y;
+  }
+  return false;
+}
+
 NATIVE(object_freeze) {
   const Value v = arg_at(args, argc, 0);
   if (v.is_object()) v.as_object()->frozen = true;
@@ -186,9 +197,55 @@ NATIVE(object_freeze) {
   return true;
 }
 
+// Is every own property of the object unreconfigurable (and, for `frozen`, read-only)?
+bool integrity_holds(const JsObject* o, bool frozen) {
+  if (o->frozen || (o->sealed && !frozen)) return true;
+  if (!o->non_extensible && !o->sealed) return false;
+  if (o->okind == ObjKind::Array && o->length > 0) return false;
+  for (uint32_t i = 0; i < o->prop_count; ++i) {
+    const uint8_t f = o->props[i].flags;
+    if (o->sealed) {
+      if (frozen && !(f & kAccessor) && (f & kWritable)) return false;
+      continue;
+    }
+    if (!(f & kNonConfigurable)) return false;
+    if (frozen && !(f & kAccessor) && (f & kWritable)) return false;
+  }
+  return true;
+}
+
 NATIVE(object_is_frozen) {
   const Value v = arg_at(args, argc, 0);
-  *result = Value::make_bool(!v.is_object() || v.as_object()->frozen);
+  *result = Value::make_bool(!v.is_object() || integrity_holds(v.as_object(), true));
+  return true;
+}
+
+NATIVE(object_prevent_extensions) {
+  const Value v = arg_at(args, argc, 0);
+  if (v.is_object()) v.as_object()->non_extensible = true;
+  *result = v;
+  return true;
+}
+
+NATIVE(object_is_extensible) {
+  const Value v = arg_at(args, argc, 0);
+  *result = Value::make_bool(v.is_object() && !v.as_object()->non_extensible && !v.as_object()->sealed && !v.as_object()->frozen);
+  return true;
+}
+
+NATIVE(object_seal) {
+  const Value v = arg_at(args, argc, 0);
+  if (v.is_object()) {
+    v.as_object()->sealed = true;
+    v.as_object()->non_extensible = true;
+  }
+  *result = v;
+  return true;
+}
+
+NATIVE(object_is_sealed) {
+  const Value v = arg_at(args, argc, 0);
+  *result = Value::make_bool(!v.is_object() || integrity_holds(v.as_object(), false));
   return true;
 }
 
@@ -203,18 +260,70 @@ NATIVE(object_define_property) {
   if (!target.is_object() || !desc.is_object()) return vm.throw_error(ErrorKind::TypeError, "Object.defineProperty called on non-object");
   JsString* key;
   if (!vm.to_property_key(arg_at(args, argc, 1), &key)) return false;
-  Value value, enumerable, writable, getter, setter;
-  if (!vm.get_named(desc, "value", &value) || !vm.get_named(desc, "enumerable", &enumerable) || !vm.get_named(desc, "writable", &writable) || !vm.get_named(desc, "get", &getter) ||
-      !vm.get_named(desc, "set", &setter))
+  JsObject* o = target.as_object();
+  JsObject* d = desc.as_object();
+  // which fields the descriptor has (absent is not the same as undefined)
+  const bool has_value = vm.has_property(d, vm.intern("value")), has_enumerable = vm.has_property(d, vm.intern("enumerable")), has_writable = vm.has_property(d, vm.intern("writable")),
+             has_configurable = vm.has_property(d, vm.intern("configurable")), has_get = vm.has_property(d, vm.intern("get")), has_set = vm.has_property(d, vm.intern("set"));
+  Value value, enumerable, writable, configurable, getter, setter;
+  if (!vm.get_named(desc, "value", &value) || !vm.get_named(desc, "enumerable", &enumerable) || !vm.get_named(desc, "writable", &writable) ||
+      !vm.get_named(desc, "configurable", &configurable) || !vm.get_named(desc, "get", &getter) || !vm.get_named(desc, "set", &setter))
     return false;
-  if (!getter.is_undefined() || !setter.is_undefined()) {
-    if ((!getter.is_undefined() && !Vm::is_callable(getter)) || (!setter.is_undefined() && !Vm::is_callable(setter)))
-      return vm.throw_error(ErrorKind::TypeError, "Getter must be a function");
-    vm.define_accessor(target.as_object(), key, getter, setter, Vm::to_boolean(enumerable) ? kEnumerable : 0);
+  const bool accessor = has_get || has_set;
+  if (accessor && (has_value || has_writable)) return vm.throw_error(ErrorKind::TypeError, "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
+  if ((has_get && !getter.is_undefined() && !Vm::is_callable(getter)) || (has_set && !setter.is_undefined() && !Vm::is_callable(setter))) return vm.throw_error(ErrorKind::TypeError, "Getter must be a function");
+  auto refuse = [&](const char* text) {
+    String message(vm.allocator());
+    message.append(text);
+    message.append(key->view());
+    return vm.throw_error(ErrorKind::TypeError, message.view());
+  };
+  Value current_value;
+  uint8_t current = 0;
+  const bool exists = vm.own_property(o, key, &current_value, &current);
+  // the host's own scripts leave a property configurable unless they say otherwise; a page's script gets what the standard says
+  const bool default_configurable = vm.in_library_code();
+  if (!exists) {
+    if (o->non_extensible || o->sealed || o->frozen) return refuse("Cannot define property ");
+    uint8_t flags = static_cast<uint8_t>((Vm::to_boolean(enumerable) ? kEnumerable : 0) | ((has_configurable ? Vm::to_boolean(configurable) : default_configurable) ? 0 : kNonConfigurable));
+    if (accessor) {
+      vm.define_accessor(o, key, has_get ? getter : Value(), has_set ? setter : Value(), flags);
+    } else {
+      flags = static_cast<uint8_t>(flags | (Vm::to_boolean(writable) ? kWritable : 0));
+      vm.define(o, key, value, flags);
+    }
+    if (accessor) vm.set_property_flags(o, key, static_cast<uint8_t>(flags & kNonConfigurable), kNonConfigurable);
     *result = target;
     return true;
   }
-  vm.define(target.as_object(), key, value, static_cast<uint8_t>((Vm::to_boolean(enumerable) ? kEnumerable : 0) | (Vm::to_boolean(writable) ? kWritable : 0)));
+  // an existing property: a non-configurable one may only change in ways that keep what code relying on it saw
+  const bool non_configurable = (current & kNonConfigurable) || o->frozen || o->sealed;
+  const bool current_accessor = (current & kAccessor) != 0;
+  const bool current_writable = !current_accessor && (current & kWritable) && !o->frozen;
+  const bool current_enumerable = (current & kEnumerable) != 0;
+  if (non_configurable) {
+    if (has_configurable && Vm::to_boolean(configurable)) return refuse("Cannot redefine property: ");
+    if (has_enumerable && Vm::to_boolean(enumerable) != current_enumerable) return refuse("Cannot redefine property: ");
+    if (accessor != current_accessor && (accessor || has_value || has_writable)) return refuse("Cannot redefine property: ");
+    if (current_accessor) {
+      const Value cg = current_value.is_object() && current_value.as_object()->length >= 2 ? current_value.as_object()->items[0] : Value();
+      const Value cs = current_value.is_object() && current_value.as_object()->length >= 2 ? current_value.as_object()->items[1] : Value();
+      if ((has_get && !vm.strict_equals(getter, cg)) || (has_set && !vm.strict_equals(setter, cs))) return refuse("Cannot redefine property: ");
+    } else if (!current_writable) {
+      if (has_writable && Vm::to_boolean(writable)) return refuse("Cannot redefine property: ");
+      if (has_value && !same_value(value, current_value)) return refuse("Cannot redefine property: ");
+    }
+  }
+  uint8_t flags = static_cast<uint8_t>(((has_enumerable ? Vm::to_boolean(enumerable) : current_enumerable) ? kEnumerable : 0) |
+                                       ((has_configurable ? !Vm::to_boolean(configurable) : (current & kNonConfigurable) != 0) ? kNonConfigurable : 0));
+  if (accessor || (current_accessor && !has_value && !has_writable)) {
+    vm.define_accessor(o, key, has_get ? getter : Value(), has_set ? setter : Value(), flags);
+    vm.set_property_flags(o, key, static_cast<uint8_t>(flags & kNonConfigurable), kNonConfigurable);
+  } else {
+    const bool new_writable = has_writable ? Vm::to_boolean(writable) : (!current_accessor && current_writable);
+    flags = static_cast<uint8_t>(flags | (new_writable ? kWritable : 0));
+    vm.define(o, key, has_value ? value : (current_accessor ? Value() : current_value), flags);
+  }
   *result = target;
   return true;
 }
@@ -258,7 +367,7 @@ NATIVE(object_get_own_property_descriptor) {
     vm.define_named(d, "writable", Value::make_bool((flags & kWritable) != 0 && !target.as_object()->frozen));
   }
   vm.define_named(d, "enumerable", Value::make_bool((flags & kEnumerable) != 0));
-  vm.define_named(d, "configurable", Value::make_bool(!target.as_object()->frozen));
+  vm.define_named(d, "configurable", Value::make_bool(!(flags & kNonConfigurable) && !target.as_object()->frozen && !target.as_object()->sealed));
   *result = Value::make_object(d);
   return true;
 }
@@ -278,7 +387,10 @@ NATIVE(object_set_prototype_of) {
   if (target.is_object() && (proto.is_object() || proto.is_null())) {
     for (JsObject* p = proto.is_object() ? proto.as_object() : nullptr; p; p = p->proto)
       if (p == target.as_object()) return vm.throw_error(ErrorKind::TypeError, "Cyclic __proto__ value");
-    target.as_object()->proto = proto.is_object() ? proto.as_object() : nullptr;
+    JsObject* wanted = proto.is_object() ? proto.as_object() : nullptr;
+    JsObject* t = target.as_object();
+    if (t->proto != wanted && (t->non_extensible || t->sealed || t->frozen)) return vm.throw_error(ErrorKind::TypeError, "#<Object> is not extensible");
+    t->proto = wanted;
   }
   *result = target;
   return true;
@@ -2400,6 +2512,10 @@ bool install_builtins(Vm& vm) {
   vm.define_native(object, "create", object_create, 1);
   vm.define_native(object, "freeze", object_freeze, 1);
   vm.define_native(object, "isFrozen", object_is_frozen, 1);
+  vm.define_native(object, "preventExtensions", object_prevent_extensions, 1);
+  vm.define_native(object, "isExtensible", object_is_extensible, 1);
+  vm.define_native(object, "seal", object_seal, 1);
+  vm.define_native(object, "isSealed", object_is_sealed, 1);
   vm.define_native(object, "getPrototypeOf", object_get_prototype_of, 1);
   vm.define_native(object, "defineProperty", object_define_property, 3);
   vm.define_native(object, "defineProperties", object_define_properties, 2);

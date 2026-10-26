@@ -5954,7 +5954,7 @@ static void test_webrtc() {
 static void test_wpt() {
   const std::string harness = read_text_file("tests/data/wpt/harness.js");
   CHECK(!harness.empty());
-  static const char* const files[] = {"dom_nodes", "dom_events", "dom_lists", "url", "fetch_api", "html_platform", "css_selectors", "cssom", "html_forms", "components", "messaging_streams", "js_language", "html_parser", "css_conformance", "wasm_jsapi", "dom_ranges_traversal", "web_apis", "web_apis_behavior", "js_modules"};
+  static const char* const files[] = {"dom_nodes", "dom_events", "dom_lists", "url", "fetch_api", "html_platform", "css_selectors", "cssom", "html_forms", "components", "messaging_streams", "js_language", "js_strict", "html_parser", "css_conformance", "wasm_jsapi", "dom_ranges_traversal", "web_apis", "web_apis_behavior", "js_modules"};
   for (const char* name : files) {
     const std::string source = read_text_file((std::string("tests/data/wpt/") + name + ".js").c_str());
     CHECK(!source.empty());

@@ -110,10 +110,6 @@ const char kStdlib[] = R"JSLIB((function (g) {
     for (var item of items) { var key = String(fn(item, i++)); (out[key] = out[key] || []).push(item); }
     return out;
   });
-  def(Object, 'isExtensible', function (o) { return o !== null && typeof o === 'object' ? !Object.isFrozen(o) : false; });
-  def(Object, 'preventExtensions', function (o) { return o; });
-  def(Object, 'seal', function (o) { return o; });
-  def(Object, 'isSealed', function (o) { return o === null || typeof o !== 'object' || Object.isFrozen(o); });
   def(OP, 'isPrototypeOf', function (o) { for (var p = o === null || (typeof o !== 'object' && typeof o !== 'function') ? null : Object.getPrototypeOf(o); p; p = Object.getPrototypeOf(p)) if (p === this) return true; return false; });
   def(OP, 'propertyIsEnumerable', function (k) { return Object.keys(this).indexOf(String(k)) >= 0; });
   def(OP, 'toLocaleString', function () { return this.toString(); });
