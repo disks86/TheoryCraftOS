@@ -611,7 +611,7 @@ const char kCollections[] = R"JSLIB((function (g) {
     if (source === null || source === undefined) throw new TypeError(String(source) + ' is not iterable');
     if (mapFn !== undefined && typeof mapFn !== 'function') throw new TypeError(String(mapFn) + ' is not a function');
     var out = [], i = 0;
-    if (typeof source !== 'string' && typeof source[ITER] === 'function') {
+    if (typeof source[ITER] === 'function') {
       for (var v of source) { out.push(mapFn ? mapFn.call(thisArg, v, i) : v); i++; }
     } else {
       var n = source.length >>> 0;

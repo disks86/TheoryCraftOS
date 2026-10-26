@@ -71,6 +71,8 @@ struct ImageDesc {
   Extent2D extent;
   Format format = Format::B8G8R8A8Unorm;
   uint32_t usage = kImageColorAttachment;
+  // A D32Float image can carry an 8-bit stencil plane next to the depth (the stencil test of a pipeline needs one). Devices without stencil refuse such an image.
+  bool stencil = false;
 };
 
 class IImage {
@@ -182,6 +184,18 @@ struct VertexAttribute {
   uint32_t offset;  // bytes from the start of the vertex
 };
 
+// The stencil test of a pipeline, one state for front and back faces: a fragment passes when (reference & compare_mask) <compare> (stored & compare_mask); what is written back
+// is (stored & ~write_mask) | (op result & write_mask), the op depending on whether the stencil test failed, the stencil test passed but the depth test failed, or both passed.
+// It needs a stencil plane in the render pass's depth image (ImageDesc::stencil). The test comes before the depth test; a fragment a shader discards changes nothing.
+enum class CompareOp : uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
+enum class StencilOp : uint8_t { Keep, Zero, Replace, IncrementClamp, DecrementClamp, Invert, IncrementWrap, DecrementWrap };
+struct StencilState {
+  bool enable = false;
+  CompareOp compare = CompareOp::Always;
+  StencilOp fail_op = StencilOp::Keep, depth_fail_op = StencilOp::Keep, pass_op = StencilOp::Keep;
+  uint8_t compare_mask = 0xFF, write_mask = 0xFF, reference = 0;
+};
+
 enum class CullMode : uint8_t { None, Back, Front };
 enum class FrontFace : uint8_t { CounterClockwise, Clockwise };  // as seen on screen
 
@@ -198,6 +212,7 @@ struct GraphicsPipelineDesc {
   bool depth_test = false;  // pass if closer or equal (LEQUAL)
   bool depth_write = false;
   bool alpha_blend = false;  // source over destination
+  StencilState stencil;
 };
 
 class IPipeline {
@@ -223,6 +238,8 @@ struct RenderPassBegin {
   Vec4 clear_color_value;
   bool clear_depth = true;
   float clear_depth_value = 1.0f;
+  bool clear_stencil = true;   // if the depth image has a stencil plane
+  uint8_t clear_stencil_value = 0;
 };
 
 class ICommandBuffer {

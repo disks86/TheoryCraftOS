@@ -812,7 +812,7 @@ static void test_stdlib() {
   CHECK(is("[1, 2, 3].at(-1) + ',' + [3, 1, 2].toSorted().join('') + ',' + [1, 2, 3].toReversed().join('') + ',' + [1, 2, 3].with(1, 9).join('') + ',' + [[1], [2]].flatMap(function (x) { return x; }).join('')", "3,123,321,193,12"));
   CHECK(is("[1, 2, 3, 4, 5].copyWithin(0, 3).join() + '|' + [1, 2, 3].findLast(function (x) { return x < 3; }) + '|' + Array.from([1, 2].entries()).join(';')", "4,5,3,4,5|2|0,1;1,2"));
   CHECK(is("var g = Object.groupBy([1, 2, 3, 4], function (x) { return x % 2 ? 'odd' : 'even'; }); g.odd.join() + '|' + g.even.join() + '|' + Object.hasOwn({ a: 1 }, 'a')", "1,3|2,4|true"));
-  CHECK(is("['héllo'.codePointAt(1), String.fromCodePoint(233, 0x1F600).length, String.raw({ raw: ['a', 'b'] }, 1)].join()", "233,6,a1b"));
+  CHECK(is("['héllo'.codePointAt(1), String.fromCodePoint(233, 0x1F600).length, String.raw({ raw: ['a', 'b'] }, 1)].join()", "233,3,a1b"));
   CHECK(is("[Math.hypot(3, 4), Math.cbrt(27), Math.sign(-5), Math.clz32(1), Math.fround(5.5), Math.imul(-5, 12), Math.imul(65536, 65537), Math.trunc(-1.5), Math.log2(8)].join()", "5,3,-1,31,5.5,-60,65536,-1,3"));
   CHECK(is("[(0.000123).toExponential(2), (123.456).toPrecision(4), (123456).toPrecision(2), (0).toPrecision(3), (5).toExponential(), Number.isSafeInteger(2 ** 53)].join()", "1.23e-4,123.5,1.2e+5,0.00,5e+0,false"));
   CHECK(is("[Symbol('desc').description, Symbol.for('k') === Symbol.for('k'), Symbol.keyFor(Symbol.for('k')), new AggregateError([1, 2], 'm').errors.length, new Error('x', { cause: 'y' }).cause].join()", "desc,true,k,2,y"));
@@ -926,7 +926,7 @@ static void test_json() {
   CHECK(is("var r = []; ['[1,2,', '{\"a\":1,}', '01', '\"\\\\x\"', 'tru', '1 2', '+1', '.5', '1.', '1e', '[1,]', '{\"a\" 1}', 'NaN', 'undefined', '', '[', '{\"a\":}', '\"a\\nb\"'].forEach(function (t) { try { JSON.parse(t); r.push('accepted ' + t); } catch (e) { if (e.name !== 'SyntaxError') r.push('wrong ' + e.name); } }); r.join('|')", ""));
   CHECK(is("try { JSON.parse('{\"a\":1,}'); } catch (e) { e.message }", "Unexpected token } in JSON at position 7"));
   CHECK(is("try { JSON.parse('[1,2,'); } catch (e) { e.message }", "Unexpected end of JSON input"));
-  CHECK(is("JSON.parse(' [ ] ').length + JSON.parse('\"\\\\ud83d\\\\ude00\"').length", "4"));
+  CHECK(is("JSON.parse(' [ ] ').length + JSON.parse('\"\\\\ud83d\\\\ude00\"').length", "2"));
   CHECK(is("JSON.parse('-0') === 0 && JSON.parse('1E2') === 100 && JSON.parse('0.5e-1') === 0.05", "true"));
   CHECK(is("JSON.parse('{\"a\":1,\"a\":2}').a", "2"));
   // reviver

@@ -269,6 +269,7 @@ IBuffer* SvgaDevice::create_buffer(uint64_t size, uint32_t usage) {
 void SvgaDevice::destroy_buffer(IBuffer* buffer) { destroy(allocator_, static_cast<SvgaBuffer*>(buffer)); }
 
 IImage* SvgaDevice::create_image(const ImageDesc& desc) {
+  if (desc.stencil) return nullptr;   // (no stencil plane on this device)
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined || desc.format == Format::R8G8B8A8Unorm) return nullptr;
   SvgaImage* image = make<SvgaImage>(allocator_, *this, desc);
   if (image && !image->valid()) {
@@ -292,6 +293,7 @@ void SvgaDevice::destroy_shader_module(IShaderModule* module) { destroy(allocato
 
 IPipeline* SvgaDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
   if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
+  if (desc.stencil.enable) return nullptr;   // (no stencil test on this device)
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes || desc.varying_count > kMaxVaryings) return nullptr;
   if (desc.vertex_shader->stage() != ShaderStage::Vertex || desc.fragment_shader->stage() != ShaderStage::Fragment) return nullptr;
   return make<SvgaPipeline>(allocator_, desc);

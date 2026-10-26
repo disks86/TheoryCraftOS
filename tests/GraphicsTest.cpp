@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <initializer_list>
 #include <string.h>
+#include <vector>
 #include "Utility/AllocatedView.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
@@ -39,6 +40,7 @@ struct TestAllocator final : allocators::IAllocator {
 
 static int g_failed = 0;
 #define CHECK(cond) do { if (!(cond)) { printf("FAILED line %d: %s\n", __LINE__, #cond); ++g_failed; } } while (0)
+#define CHECKV(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
 
 static bool near(float a, float b, float eps = 1e-3f) { return (a > b ? a - b : b - a) < eps; }
 
@@ -1282,7 +1284,186 @@ static void test_textures() {
   t.device.destroy_image(tex);
 }
 
+// --- Stencil --------------------------------------------------------------------
+
+struct StencilScene {
+  Scene s;
+  IImage* color = nullptr;
+  IImage* depth = nullptr;
+  ArrayView<uint32_t> out;
+  StencilScene() {
+    color = s.device.create_image({{16, 16}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+    ImageDesc d{{16, 16}, Format::D32Float, kImageDepthAttachment};
+    d.stencil = true;
+    depth = s.device.create_image(d);
+    out = allocate_view<uint32_t>(s.a, 16 * 16);
+  }
+  ~StencilScene() {
+    s.device.destroy_image(color);
+    s.device.destroy_image(depth);
+    release_view(s.a, out);
+  }
+  // One draw of a pass: a rectangle (x0, y0)-(x1, y1) in NDC at depth z in `rgba`, drawn with `stencil` and the depth state.
+  struct Item {
+    float x0, y0, x1, y1, z;
+    float rgba[4];
+    StencilState stencil;
+    bool depth_test = false, depth_write = false;
+  };
+  // Runs the items in one render pass (clearing the colour to black, the depth to 1 and the stencil to `clear`); false if the recording or the submit failed.
+  bool run(const std::vector<Item>& items, uint8_t clear, IImage* depth_image = nullptr, bool clear_stencil = true) {
+    ICommandBuffer* cb = s.device.create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = color;
+    pass.depth = depth_image ? depth_image : depth;
+    pass.clear_color_value = {0, 0, 0, 1};
+    pass.clear_stencil = clear_stencil;
+    pass.clear_stencil_value = clear;
+    cb->begin_render_pass(pass);
+    std::vector<IPipeline*> pipelines;
+    std::vector<IBuffer*> buffers;
+    for (const Item& it : items) {
+      GraphicsPipelineDesc pd = s.desc;
+      pd.cull_mode = CullMode::None;
+      pd.stencil = it.stencil;
+      pd.depth_test = it.depth_test;
+      pd.depth_write = it.depth_write;
+      IPipeline* pipeline = s.device.create_graphics_pipeline(pd);
+      pipelines.push_back(pipeline);
+      const float* c = it.rgba;
+      const ColoredVertex v[6] = {{{it.x0, it.y0, it.z}, {c[0], c[1], c[2], c[3]}}, {{it.x0, it.y1, it.z}, {c[0], c[1], c[2], c[3]}}, {{it.x1, it.y1, it.z}, {c[0], c[1], c[2], c[3]}},
+                                  {{it.x0, it.y0, it.z}, {c[0], c[1], c[2], c[3]}}, {{it.x1, it.y1, it.z}, {c[0], c[1], c[2], c[3]}}, {{it.x1, it.y0, it.z}, {c[0], c[1], c[2], c[3]}}};
+      IBuffer* vb = s.device.create_buffer(sizeof v, kBufferVertex);   // (the vertices are read at submit: one buffer per draw)
+      buffers.push_back(vb);
+      memcpy(vb->map().data(), v, sizeof v);
+      vb->unmap();
+      cb->bind_pipeline(pipeline);
+      cb->bind_vertex_buffer(vb);
+      const Mat4 id;
+      cb->push_constants(&id, sizeof id);
+      cb->draw(6);
+    }
+    cb->end_render_pass();
+    const bool ok = cb->end() && s.device.submit(cb);
+    s.device.destroy_command_buffer(cb);
+    for (IPipeline* p : pipelines) s.device.destroy_pipeline(p);
+    for (IBuffer* b : buffers) s.device.destroy_buffer(b);
+    return ok;
+  }
+};
+
+static void test_stencil() {
+  TestAllocator probe;
+  (void)probe;
+  StencilScene t;
+  CHECK(t.color && t.depth);
+  const float white[4] = {1, 1, 1, 1}, red[4] = {1, 0, 0, 1};
+  (void)red;
+  using Item = StencilScene::Item;
+  auto make = [&](float x0, float y0, float x1, float y1, float z, const float* rgba, StencilState st, bool dt = false, bool dw = false) {
+    Item it{x0, y0, x1, y1, z, {rgba[0], rgba[1], rgba[2], rgba[3]}, st, dt, dw};
+    return it;
+  };
+  // The probe: draws a white full-screen rectangle that passes where the stencil equals `value` (mask all bits), and tells whether the whole picture is white or black.
+  auto equals = [&](uint8_t value) {
+    StencilState st;
+    st.enable = true;
+    st.compare = CompareOp::Equal;
+    st.reference = value;
+    return st;
+  };
+  // Stencil planes: an image with one, the clear value, and a test against it.
+  CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, equals(0))}, 0) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFFFFFFFF);
+  CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, equals(5))}, 0) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFF000000);   // (cleared to 0, not 5)
+  CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, equals(5))}, 5) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFFFFFFFF);
+  // No stencil test: the stencil plane is not looked at.
+  StencilState off;
+  CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, off)}, 77) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFFFFFFFF);
+  // Every compare op against a stored 5 with the reference 3, 5 and 7.
+  struct Case { CompareOp op; bool less, equal, greater; };
+  const Case cases[] = {{CompareOp::Never, false, false, false}, {CompareOp::Less, true, false, false}, {CompareOp::Equal, false, true, false}, {CompareOp::LessEqual, true, true, false},
+                        {CompareOp::Greater, false, false, true}, {CompareOp::NotEqual, true, false, true}, {CompareOp::GreaterEqual, false, true, true}, {CompareOp::Always, true, true, true}};
+  for (const Case& c : cases) {
+    const uint8_t refs[3] = {3, 5, 7};   // reference <op> stored: 3 < 5, 5 == 5, 7 > 5
+    const bool expect[3] = {c.less, c.equal, c.greater};
+    for (int i = 0; i < 3; ++i) {
+      StencilState st;
+      st.enable = true;
+      st.compare = c.op;
+      st.reference = refs[i];
+      CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, st)}, 5) && t.color->read_pixels(t.out) && (at(t.out, 16, 8, 8) == 0xFFFFFFFF) == expect[i]);
+    }
+  }
+  // Ops: draw once with the op (colour black over black so only the stencil changes), then probe the value. Stored 250 to start, reference 9.
+  struct OpCase { StencilOp op; uint8_t start, expect; };
+  const OpCase ops[] = {{StencilOp::Keep, 250, 250}, {StencilOp::Zero, 250, 0}, {StencilOp::Replace, 250, 9}, {StencilOp::IncrementClamp, 250, 251}, {StencilOp::IncrementClamp, 255, 255},
+                        {StencilOp::DecrementClamp, 250, 249}, {StencilOp::DecrementClamp, 0, 0}, {StencilOp::Invert, 0x0F, 0xF0}, {StencilOp::IncrementWrap, 255, 0},
+                        {StencilOp::DecrementWrap, 0, 255}, {StencilOp::IncrementWrap, 1, 2}};
+  const float black[4] = {0, 0, 0, 1};
+  for (const OpCase& c : ops) {
+    StencilState write;
+    write.enable = true;
+    write.pass_op = c.op;
+    write.reference = 9;
+    CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, black, write), make(-1, -1, 1, 1, 0.5f, white, equals(c.expect))}, c.start) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFFFFFFFF);
+    if (at(t.out, 16, 8, 8) != 0xFFFFFFFF) printf("  stencil op %d from %u expected %u\n", static_cast<int>(c.op), c.start, c.expect);
+  }
+  // A mask: only the left half, so the right half keeps the clear value; and the write and compare masks.
+  {
+    StencilState left;
+    left.enable = true;
+    left.pass_op = StencilOp::Replace;
+    left.reference = 1;
+    CHECKV(t.run({make(-1, -1, 0, 1, 0.5f, black, left), make(-1, -1, 1, 1, 0.5f, white, equals(1))}, 0) && t.color->read_pixels(t.out));
+    CHECK(at(t.out, 16, 3, 8) == 0xFFFFFFFF && at(t.out, 16, 12, 8) == 0xFF000000);
+    StencilState masked;
+    masked.enable = true;
+    masked.pass_op = StencilOp::Replace;
+    masked.reference = 0xFF;
+    masked.write_mask = 0x0F;   // only the low nibble changes: 0xA0 -> 0xAF
+    CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, black, masked), make(-1, -1, 1, 1, 0.5f, white, equals(0xAF))}, 0xA0) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFFFFFFFF);
+    StencilState compare_masked;
+    compare_masked.enable = true;
+    compare_masked.compare = CompareOp::Equal;
+    compare_masked.compare_mask = 0xF0;   // only the high nibble is compared: 0xA5 and a reference of 0xAF agree
+    compare_masked.reference = 0xAF;
+    CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, compare_masked)}, 0xA5) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFFFFFFFF);
+  }
+  // Fail, depth-fail and pass ops are separate. The stencil test fails (Never): the fail op runs. The test passes and the depth test fails: the depth-fail op. Both pass: the pass op.
+  {
+    StencilState fail;
+    fail.enable = true;
+    fail.compare = CompareOp::Never;
+    fail.fail_op = StencilOp::Replace;
+    fail.pass_op = StencilOp::Zero;
+    fail.depth_fail_op = StencilOp::Zero;
+    fail.reference = 4;
+    CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, fail), make(-1, -1, 1, 1, 0.5f, white, equals(4))}, 0) && t.color->read_pixels(t.out) && at(t.out, 16, 8, 8) == 0xFFFFFFFF);
+    // Depth: a near rectangle writes depth 0.2 (stencil untouched); then a far one (0.8) with the depth test fails the depth test and runs the depth-fail op (+1), where a rectangle in front
+    // (0.1) passes and runs the pass op (+2). The left half of the far rectangle is under the near one.
+    StencilState none;
+    StencilState counted;
+    counted.enable = true;
+    counted.depth_fail_op = StencilOp::IncrementClamp;
+    counted.pass_op = StencilOp::Zero;
+    CHECKV(t.run({make(-1, -1, 0, 1, 0.2f, black, none, true, true), make(-1, -1, 1, 1, 0.8f, black, counted, true, false), make(-1, -1, 0, 1, 0.5f, white, equals(1)),
+                 make(0, -1, 1, 1, 0.5f, white, equals(0))}, 0) && t.color->read_pixels(t.out));
+    CHECK(at(t.out, 16, 3, 8) == 0xFFFFFFFF);    // behind the near rectangle: depth-fail op ran: stencil 1
+    CHECK(at(t.out, 16, 12, 8) == 0xFFFFFFFF);   // free of it: the far rectangle passed: pass op Zero: stencil 0
+  }
+  // Refusals: a stencil test needs a stencil plane (a depth image without one, or none at all); an image asks for a stencil plane only with depth.
+  IImage* plain_depth = t.s.device.create_image({{16, 16}, Format::D32Float, kImageDepthAttachment});
+  CHECKV(plain_depth && !t.run({make(-1, -1, 1, 1, 0.5f, white, equals(0))}, 0, plain_depth));
+  CHECKV(t.run({make(-1, -1, 1, 1, 0.5f, white, off)}, 0, plain_depth));   // (without a stencil test it is a depth image like any other)
+  t.s.device.destroy_image(plain_depth);
+  ImageDesc bad{{16, 16}, Format::B8G8R8A8Unorm, kImageColorAttachment};
+  bad.stencil = true;
+  CHECK(t.s.device.create_image(bad) == nullptr);
+}
+
 int main() {
+  test_stencil();
   test_textures();
   test_math();
   test_2d();

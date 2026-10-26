@@ -63,17 +63,20 @@ class SoftwareImage final : public IImage {
     const uint64_t count = uint64_t{desc.extent.width} * desc.extent.height;
     if (desc.format == Format::D32Float) {
       depth_ = allocate_view<float>(allocator, count);
+      if (desc.stencil) stencil_ = allocate_view<uint8_t>(allocator, count);
     } else if (desc.format != Format::Undefined) {
       color_ = allocate_view<uint32_t>(allocator, count);
     }
     for (float& d : depth_) d = 1.0f;
     for (uint32_t& c : color_) c = 0;
+    for (uint8_t& v : stencil_) v = 0;
   }
   ~SoftwareImage() {
     release_view(allocator_, color_);
     release_view(allocator_, depth_);
+    release_view(allocator_, stencil_);
   }
-  bool valid() const { return !color_.empty() || !depth_.empty(); }
+  bool valid() const { return (!color_.empty() || !depth_.empty()) && (!desc_.stencil || !stencil_.empty()); }
   Extent2D extent() const override { return desc_.extent; }
   Format format() const override { return desc_.format; }
   uint32_t usage() const { return desc_.usage; }
@@ -99,12 +102,14 @@ class SoftwareImage final : public IImage {
     return s;
   }
   ArrayView<float> depth() const { return depth_; }
+  ArrayView<uint8_t> stencil() const { return stencil_; }
 
  private:
   allocators::IAllocator& allocator_;
   ImageDesc desc_;
   ArrayView<uint32_t> color_;
   ArrayView<float> depth_;
+  ArrayView<uint8_t> stencil_;
 };
 
 class SoftwareShaderModule final : public IShaderModule {
@@ -236,6 +241,34 @@ float read_float(ConstByteView bytes, uint64_t offset) {
   return v;
 }
 
+bool stencil_compare(CompareOp op, uint32_t reference, uint32_t stored) {
+  switch (op) {
+    case CompareOp::Never: return false;
+    case CompareOp::Less: return reference < stored;
+    case CompareOp::Equal: return reference == stored;
+    case CompareOp::LessEqual: return reference <= stored;
+    case CompareOp::Greater: return reference > stored;
+    case CompareOp::NotEqual: return reference != stored;
+    case CompareOp::GreaterEqual: return reference >= stored;
+    case CompareOp::Always: return true;
+  }
+  return false;
+}
+
+uint8_t stencil_apply(StencilOp op, uint8_t stored, uint8_t reference) {
+  switch (op) {
+    case StencilOp::Keep: return stored;
+    case StencilOp::Zero: return 0;
+    case StencilOp::Replace: return reference;
+    case StencilOp::IncrementClamp: return stored == 255 ? stored : static_cast<uint8_t>(stored + 1);
+    case StencilOp::DecrementClamp: return stored == 0 ? stored : static_cast<uint8_t>(stored - 1);
+    case StencilOp::Invert: return static_cast<uint8_t>(~stored);
+    case StencilOp::IncrementWrap: return static_cast<uint8_t>(stored + 1);
+    case StencilOp::DecrementWrap: return static_cast<uint8_t>(stored - 1);
+  }
+  return stored;
+}
+
 // An edge is "top" or "left" when pixels exactly on it belong to the triangle.
 inline bool owns_edge(float dx, float dy) { return dy < 0 || (dy == 0 && dx > 0); }
 
@@ -288,6 +321,8 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
   const bool own0 = owns_edge(e0dx, e0dy), own1 = owns_edge(e1dx, e1dy), own2 = owns_edge(e2dx, e2dy);
   const float inv_area = 1.0f / area;
   const ArrayView<float> depth = s.depth ? s.depth->depth() : ArrayView<float>();
+  const ArrayView<uint8_t> stencil = s.depth ? s.depth->stencil() : ArrayView<uint8_t>();
+  const bool stencil_on = pd.stencil.enable && !stencil.empty();
 
   for (int32_t y = min_y; y < max_y; ++y) {
     for (int32_t x = min_x; x < max_x; ++x) {
@@ -304,9 +339,9 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
 
       const uint64_t index = uint64_t{static_cast<uint32_t>(y)} * s.color->extent().width + static_cast<uint32_t>(x);
       const float z = b0 * v0->z + b1 * v1->z + b2 * v2->z;
-      if (pd.depth_test && !depth.empty()) {
-        if (!(z <= depth[index])) continue;
-      }
+      bool depth_ok = true;
+      if (pd.depth_test && !depth.empty()) depth_ok = z <= depth[index];
+      if (!depth_ok && !stencil_on) continue;   // (with a stencil test the depth result is needed after the shader)
 
       // Perspective-correct varyings: weights scaled by 1/w.
       const float p0 = b0 * v0->inv_w, p1 = b1 * v1->inv_w, p2 = b2 * v2->inv_w;
@@ -321,6 +356,15 @@ void raster_triangle(const DrawState& s, const ScreenVertex& a, const ScreenVert
       Vec4 color;
       if (s.pipeline->textured() ? !s.pipeline->textured()(varying, s.constants, s.textures, &color) : !s.pipeline->fragment()(varying, s.constants, &color)) continue;
 
+      if (stencil_on) {
+        // The stencil test comes first, then the depth test; each outcome has its own op (a fragment the shader discarded changed nothing).
+        const StencilState& st = pd.stencil;
+        const uint8_t stored = stencil[index];
+        auto write = [&](StencilOp op) { stencil[index] = static_cast<uint8_t>((stored & ~st.write_mask) | (stencil_apply(op, stored, st.reference) & st.write_mask)); };
+        if (!stencil_compare(st.compare, st.reference & st.compare_mask, stored & st.compare_mask)) { write(st.fail_op); continue; }
+        if (!depth_ok) { write(st.depth_fail_op); continue; }
+        write(st.pass_op);
+      }
       uint32_t out = pack_color(color);
       uint32_t* pixel = target.row(static_cast<uint32_t>(y)) + x;
       if (pd.alpha_blend) out = blend_over(out, target.decode(*pixel));
@@ -470,6 +514,8 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         }
         if (s.depth && cmd.pass.clear_depth)
           for (float& d : s.depth->depth()) d = cmd.pass.clear_depth_value;
+        if (s.depth && cmd.pass.clear_stencil)
+          for (uint8_t& v : s.depth->stencil()) v = cmd.pass.clear_stencil_value;
         s.viewport = {0, 0, static_cast<float>(e.width), static_cast<float>(e.height), 0, 1};
         s.scissor = {0, 0, e.width, e.height};
         s.pipeline = nullptr;
@@ -523,6 +569,7 @@ bool SoftwareDevice::submit(ICommandBuffer* commands) {
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         const GraphicsPipelineDesc& pd = s.pipeline->desc();
+        if (pd.stencil.enable && (!s.depth || s.depth->stencil().empty())) return false;   // (a stencil test with no stencil plane to test)
         // Every texture the pipeline samples is bound, and none of them is the image being drawn into.
         for (uint32_t unit = 0; unit < pd.texture_count; ++unit) {
           const SoftwareImage* bound = s.textures.image(unit);

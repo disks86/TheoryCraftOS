@@ -378,6 +378,7 @@ IBuffer* VirglDevice::create_buffer(uint64_t size, uint32_t usage) {
 void VirglDevice::destroy_buffer(IBuffer* buffer) { destroy(gpu_.allocator(), static_cast<VirglBuffer*>(buffer)); }
 
 IImage* VirglDevice::create_image(const ImageDesc& desc) {
+  if (desc.stencil) return nullptr;   // (no stencil plane on this device)
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
   if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
@@ -406,6 +407,7 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
   if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
+  if (desc.stencil.enable) return nullptr;   // (no stencil test on this device)
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes ||
       desc.varying_count > kMaxVaryings)
     return nullptr;

@@ -296,8 +296,8 @@ static void test_resources() {
   CHECK(!p.gpu->create_graphics_pipeline(wrong));
   wrong = pd; wrong.vertex_stride = 0;
   CHECK(!p.gpu->create_graphics_pipeline(wrong));
-  // Textures are not on this device yet: the textured built-ins make no pipeline (a texture count on the coloured ones neither), write_pixels says no, and a bound
-  // texture fails the submit.
+  // Textured pipelines: the textured pair with a float2 coordinate and one texture is taken; a texture count on the coloured pair, no count on the textured one, a
+  // coordinate of another size, or a mix of the two pairs, are not.
   {
     IShaderModule* tvs = p.gpu->create_shader_module(textured_vertex_shader());
     IShaderModule* tfs = p.gpu->create_shader_module(textured_fragment_shader());
@@ -305,27 +305,24 @@ static void test_resources() {
     describe_textured_pipeline(&textured);
     textured.vertex_shader = tvs;
     textured.fragment_shader = tfs;
-    CHECK(!p.gpu->create_graphics_pipeline(textured));
+    IPipeline* tp = p.gpu->create_graphics_pipeline(textured);
+    CHECK(tp);
+    p.gpu->destroy_pipeline(tp);
+    GraphicsPipelineDesc bad = textured;
+    bad.texture_count = 0;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.texture_count = 2;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.attributes[1].format = VertexFormat::Float4;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.fragment_shader = fs;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
+    bad = textured; bad.vertex_shader = vs;
+    CHECK(!p.gpu->create_graphics_pipeline(bad));
     wrong = pd; wrong.texture_count = 1;
     CHECK(!p.gpu->create_graphics_pipeline(wrong));
     p.gpu->destroy_shader_module(tvs);
     p.gpu->destroy_shader_module(tfs);
-    IImage* tex = p.gpu->create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
-    IImage* target = p.gpu->create_image({{16, 16}, Format::B8G8R8A8Unorm, kImageColorAttachment});
-    CHECK(tex && target);
-    uint32_t texels[16] = {};
-    CHECK(tex && !tex->write_pixels(ArrayView<const uint32_t>(texels, 16)));
-    ICommandBuffer* cb = p.gpu->create_command_buffer();
-    cb->begin();
-    RenderPassBegin pass;
-    pass.color = target;
-    cb->begin_render_pass(pass);
-    cb->bind_texture(0, tex, SamplerDesc());
-    cb->end_render_pass();
-    CHECK(cb->end() && !p.gpu->submit(cb));
-    p.gpu->destroy_command_buffer(cb);
-    p.gpu->destroy_image(tex);
-    p.gpu->destroy_image(target);
   }
   p.gpu->destroy_pipeline(ok);
   p.gpu->destroy_shader_module(vs);
@@ -506,9 +503,400 @@ static void test_present_and_failures() {
   p.gpu->destroy_image(rgba);
 }
 
+// --- Textures -------------------------------------------------------------------
+
+struct TexturedScene {
+  Pair& p;
+  IGraphicsDevice* devices[2];
+  IShaderModule* vs[2];
+  IShaderModule* fs[2];
+  IPipeline* pipeline[2] = {nullptr, nullptr};
+  explicit TexturedScene(Pair& pair, bool blend = false) : p(pair) {
+    devices[0] = pair.gpu;
+    devices[1] = &pair.software;
+    for (int i = 0; i < 2; ++i) {
+      vs[i] = devices[i]->create_shader_module(textured_vertex_shader());
+      fs[i] = devices[i]->create_shader_module(textured_fragment_shader());
+      GraphicsPipelineDesc pd;
+      describe_textured_pipeline(&pd);
+      pd.vertex_shader = vs[i];
+      pd.fragment_shader = fs[i];
+      pd.cull_mode = CullMode::None;
+      pd.alpha_blend = blend;
+      pipeline[i] = devices[i]->create_graphics_pipeline(pd);
+    }
+  }
+  ~TexturedScene() {
+    for (int i = 0; i < 2; ++i) {
+      devices[i]->destroy_pipeline(pipeline[i]);
+      devices[i]->destroy_shader_module(vs[i]);
+      devices[i]->destroy_shader_module(fs[i]);
+    }
+  }
+  // Draws `vertices` (triangles) with the texture of `width` x `height` `texels` (0xAARRGGBB) on device `i`; the picture in `out`.
+  bool draw(int i, Format texture_format, uint32_t width, uint32_t height, const uint32_t* texels, const SamplerDesc& sampler, const TexturedVertex* vertices, uint32_t count, const Mat4& mvp,
+            Format target_format, std::vector<uint32_t>* out, Vec4 clear = {0, 0, 0, 1}) {
+    IGraphicsDevice& device = *devices[i];
+    IImage* texture = device.create_image({{width, height}, texture_format, kImageSampled});
+    IImage* target = device.create_image({{kSize, kSize}, target_format, kImageColorAttachment});
+    IBuffer* vb = device.create_buffer(count * sizeof(TexturedVertex) + 16, kBufferVertex);
+    bool ok = texture && target && vb && pipeline[i] && texture->write_pixels(ArrayView<const uint32_t>(texels, uint64_t{width} * height));
+    if (ok) {
+      ByteView m = vb->map();
+      memcpy(m.data(), vertices, count * sizeof(TexturedVertex));
+      vb->unmap();
+      ICommandBuffer* cb = device.create_command_buffer();
+      cb->begin();
+      RenderPassBegin pass;
+      pass.color = target;
+      pass.clear_color_value = clear;
+      cb->begin_render_pass(pass);
+      cb->bind_pipeline(pipeline[i]);
+      cb->bind_vertex_buffer(vb);
+      cb->push_constants(&mvp, sizeof mvp);
+      cb->bind_texture(0, texture, sampler);
+      cb->draw(count);
+      cb->end_render_pass();
+      ok = cb->end() && device.submit(cb);
+      device.destroy_command_buffer(cb);
+      if (ok) *out = read(target);
+    }
+    if (texture) device.destroy_image(texture);
+    if (target) device.destroy_image(target);
+    if (vb) device.destroy_buffer(vb);
+    return ok;
+  }
+};
+
+// A quad over the whole target (two triangles) with texture coordinates (u0, v0) at the top left and (u1, v1) at the bottom right.
+static void quad(TexturedVertex* v, float u0, float v0, float u1, float v1) {
+  const TexturedVertex q[6] = {{{-1, -1, 0.5f}, {u0, v0}}, {{-1, 1, 0.5f}, {u0, v1}}, {{1, 1, 0.5f}, {u1, v1}},
+                               {{-1, -1, 0.5f}, {u0, v0}}, {{1, 1, 0.5f}, {u1, v1}}, {{1, -1, 0.5f}, {u1, v0}}};
+  memcpy(v, q, sizeof q);
+}
+
+// The Gen9 device and the software device draw the same textured scene: pictures agree except along the diagonal between the two triangles and at texel edges.
+static void compare_textured(Pair& p, TexturedScene& ts, Format texture_format, uint32_t w, uint32_t h, const uint32_t* texels, const SamplerDesc& sampler, const TexturedVertex* vertices,
+                             uint32_t count, const Mat4& mvp, Format target_format, uint32_t tolerance, uint32_t allowed_bad, const char* what, Vec4 clear = {0, 0, 0, 1}) {
+  std::vector<uint32_t> gpu_picture, soft_picture;
+  const int jobs = p.rig.gpu.jobs;
+  CHECK(ts.draw(0, texture_format, w, h, texels, sampler, vertices, count, mvp, target_format, &gpu_picture, clear));
+  CHECK(ts.draw(1, texture_format, w, h, texels, sampler, vertices, count, mvp, target_format, &soft_picture, clear));
+  CHECK(p.rig.gpu.jobs > jobs && p.rig.gpu.violations.empty());
+  const uint32_t bad = differing(gpu_picture, soft_picture, tolerance);
+  if (bad > allowed_bad) printf("  textured scene \"%s\": %u pixels differ\n", what, bad);
+  CHECK(bad <= allowed_bad);
+}
+
+static void test_textures() {
+  Pair p;
+  CHECK(p.gpu);
+  if (!p.gpu) return;
+  TexturedScene ts(p);
+  CHECK(ts.pipeline[0] && ts.pipeline[1]);
+  const Mat4 id = Mat4::identity();
+  TexturedVertex v[6];
+
+  // A 4 x 4 texture of different texels, nearest: each texel a block.
+  uint32_t texels[16];
+  for (uint32_t y = 0; y < 4; ++y)
+    for (uint32_t x = 0; x < 4; ++x) texels[y * 4 + x] = 0xFF000000u | ((x * 80) << 16) | ((y * 80) << 8) | 0x40;
+  quad(v, 0, 0, 1, 1);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 4, 4, texels, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, 0, 200, "nearest 4x4");
+  // The model really sampled: a block's colour on the Gen9 picture is the texel.
+  {
+    std::vector<uint32_t> picture;
+    CHECK(ts.draw(0, Format::B8G8R8A8Unorm, 4, 4, texels, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, &picture));
+    for (uint32_t y = 0; y < 4; ++y)
+      for (uint32_t x = 0; x < 4; ++x) CHECK(picture[(y * 16 + 8) * kSize + x * 16 + 8] == texels[y * 4 + x]);
+  }
+  // Repeat and clamp addressing (nearest), coordinates outside 0..1.
+  SamplerDesc repeat;
+  quad(v, 0, 0, 2, 2);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 4, 4, texels, repeat, v, 6, id, Format::B8G8R8A8Unorm, 0, 400, "repeat");
+  SamplerDesc clamp;
+  clamp.address_u = clamp.address_v = AddressMode::ClampToEdge;
+  quad(v, -1, -1, 2, 2);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 4, 4, texels, clamp, v, 6, id, Format::B8G8R8A8Unorm, 0, 300, "clamp");
+  // Linear filtering of a black and white pair of texels, clamped and repeating.
+  const uint32_t bw[2] = {0xFF000000u, 0xFFFFFFFFu};
+  SamplerDesc linear;
+  linear.filter = Filter::Linear;
+  linear.address_u = linear.address_v = AddressMode::ClampToEdge;
+  quad(v, 0, 0, 1, 1);
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 2, 1, bw, linear, v, 6, id, Format::B8G8R8A8Unorm, 6, 200, "linear clamp");
+  linear.address_u = AddressMode::Repeat;
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 2, 1, bw, linear, v, 6, id, Format::B8G8R8A8Unorm, 6, 200, "linear repeat");
+  // R8G8B8A8 texture and target.
+  const uint32_t rgba[4] = {0xFF2060A0u, 0xFFA06020u, 0xFF60A020u, 0xFF4080C0u};
+  quad(v, 0, 0, 1, 1);
+  compare_textured(p, ts, Format::R8G8B8A8Unorm, 2, 2, rgba, SamplerDesc(), v, 6, id, Format::R8G8B8A8Unorm, 0, 200, "rgba texture and target");
+  compare_textured(p, ts, Format::R8G8B8A8Unorm, 2, 2, rgba, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, 0, 200, "rgba texture, bgra target");
+  // Perspective: a receding quad, the coordinates interpolated with the vertices' 1/w.
+  const uint32_t checker[4] = {0xFFFFFFFFu, 0xFF000000u, 0xFF000000u, 0xFFFFFFFFu};
+  const Mat4 mvp = Mat4::perspective(1.2f, 1.0f, 0.1f, 100.0f) * Mat4::translation(0, -0.5f, -2.5f) * Mat4::rotation_x(-1.1f);
+  const TexturedVertex tilted[6] = {{{-1, -1, 0}, {0, 0}}, {{-1, 1, 0}, {0, 8}}, {{1, 1, 0}, {8, 8}}, {{-1, -1, 0}, {0, 0}}, {{1, 1, 0}, {8, 8}}, {{1, -1, 0}, {8, 0}}};
+  compare_textured(p, ts, Format::B8G8R8A8Unorm, 2, 2, checker, SamplerDesc(), tilted, 6, mvp, Format::B8G8R8A8Unorm, 0, 450, "perspective", {0, 0, 1, 1});
+  // Alpha and blending: a half-transparent texel over the clear colour.
+  {
+    TexturedScene blended(p, true);
+    const uint32_t half[1] = {0x80FF0000u};
+    quad(v, 0, 0, 1, 1);
+    compare_textured(p, blended, Format::B8G8R8A8Unorm, 1, 1, half, SamplerDesc(), v, 6, id, Format::B8G8R8A8Unorm, 3, 200, "blended", {0, 0, 1, 1});
+  }
+
+  // What is refused: no texture bound, the target as the texture, an image not made for sampling, a depth image, a unit that does not exist, a wrong-size upload.
+  auto run = [&](IImage* target, IImage* bound, bool bind) {
+    IBuffer* vb = p.gpu->create_buffer(sizeof v + 16, kBufferVertex);
+    ByteView m = vb->map();
+    memcpy(m.data(), v, sizeof v);
+    ICommandBuffer* cb = p.gpu->create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = target;
+    cb->begin_render_pass(pass);
+    cb->bind_pipeline(ts.pipeline[0]);
+    cb->bind_vertex_buffer(vb);
+    cb->push_constants(&id, sizeof id);
+    if (bind) cb->bind_texture(0, bound, SamplerDesc());
+    cb->draw(6);
+    cb->end_render_pass();
+    const bool ok = cb->end() && p.gpu->submit(cb);
+    p.gpu->destroy_command_buffer(cb);
+    p.gpu->destroy_buffer(vb);
+    return ok;
+  };
+  IImage* target = p.gpu->create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
+  IImage* plain = p.gpu->create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  IImage* sampled = p.gpu->create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageSampled});
+  IImage* depth = p.gpu->create_image({{4, 4}, Format::D32Float, kImageDepthAttachment | kImageSampled});
+  CHECK(target && plain && sampled && depth);
+  CHECK(run(target, sampled, true));       // (the control: this one works)
+  CHECK(!run(target, nullptr, false));     // nothing bound
+  CHECK(!run(target, target, true));       // the target as the texture
+  CHECK(!run(target, plain, true));        // not made for sampling
+  CHECK(!run(target, depth, true));        // a depth image
+  CHECK(!depth->write_pixels(ArrayView<const uint32_t>(texels, 16)));
+  CHECK(!sampled->write_pixels(ArrayView<const uint32_t>(texels, 15)));
+  CHECK(sampled->write_pixels(ArrayView<const uint32_t>(texels, 16)));
+  {
+    ICommandBuffer* cb = p.gpu->create_command_buffer();
+    cb->begin();
+    cb->bind_texture(kMaxTextureUnits, sampled, SamplerDesc());
+    CHECK(!cb->end());
+    p.gpu->destroy_command_buffer(cb);
+  }
+  p.gpu->destroy_image(target);
+  p.gpu->destroy_image(plain);
+  p.gpu->destroy_image(sampled);
+  p.gpu->destroy_image(depth);
+}
+
+// --- Stencil --------------------------------------------------------------------
+
+struct StencilItem {
+  float x0, y0, x1, y1, z;
+  float rgba[4];
+  StencilState stencil;
+  bool depth_test = false, depth_write = false;
+};
+
+// Runs the items in one render pass on `device` (colour cleared to black, depth to 1, stencil to `clear`) with a depth image that has a stencil plane (or `plain_depth`), and reads the
+// picture back. False if the recording or the submit failed.
+static bool stencil_run(IGraphicsDevice& device, const std::vector<StencilItem>& items, uint8_t clear, std::vector<uint32_t>* out, IImage* plain_depth = nullptr) {
+  IShaderModule* vs = device.create_shader_module(colored_vertex_shader());
+  IShaderModule* fs = device.create_shader_module(colored_fragment_shader());
+  IImage* color = device.create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+  ImageDesc dd{{kSize, kSize}, Format::D32Float, kImageDepthAttachment};
+  dd.stencil = true;
+  IImage* depth = plain_depth ? plain_depth : device.create_image(dd);
+  bool ok = vs && fs && color && depth;
+  std::vector<IPipeline*> pipelines;
+  std::vector<IBuffer*> buffers;
+  ICommandBuffer* cb = ok ? device.create_command_buffer() : nullptr;
+  if (cb) {
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = color;
+    pass.depth = depth;
+    pass.clear_color_value = {0, 0, 0, 1};
+    pass.clear_stencil_value = clear;
+    cb->begin_render_pass(pass);
+    for (const StencilItem& it : items) {
+      GraphicsPipelineDesc pd;
+      describe_colored_pipeline(&pd);
+      pd.vertex_shader = vs;
+      pd.fragment_shader = fs;
+      pd.cull_mode = CullMode::None;
+      pd.stencil = it.stencil;
+      pd.depth_test = it.depth_test;
+      pd.depth_write = it.depth_write;
+      IPipeline* pipeline = device.create_graphics_pipeline(pd);
+      pipelines.push_back(pipeline);
+      const float* c = it.rgba;
+      const ColoredVertex v[6] = {cv(it.x0, it.y0, it.z, c[0], c[1], c[2], c[3]), cv(it.x0, it.y1, it.z, c[0], c[1], c[2], c[3]), cv(it.x1, it.y1, it.z, c[0], c[1], c[2], c[3]),
+                                  cv(it.x0, it.y0, it.z, c[0], c[1], c[2], c[3]), cv(it.x1, it.y1, it.z, c[0], c[1], c[2], c[3]), cv(it.x1, it.y0, it.z, c[0], c[1], c[2], c[3])};
+      IBuffer* vb = device.create_buffer(sizeof v + 16, kBufferVertex);
+      buffers.push_back(vb);
+      if (vb && pipeline) {
+        memcpy(vb->map().data(), v, sizeof v);
+        vb->unmap();
+        cb->bind_pipeline(pipeline);
+        cb->bind_vertex_buffer(vb);
+        const Mat4 id = Mat4::identity();
+        cb->push_constants(&id, sizeof id);
+        cb->draw(6);
+      } else {
+        ok = false;
+      }
+    }
+    cb->end_render_pass();
+    ok = ok && cb->end() && device.submit(cb);
+    device.destroy_command_buffer(cb);
+  } else {
+    ok = false;
+  }
+  if (ok && out) *out = read(color);
+  for (IPipeline* p : pipelines) if (p) device.destroy_pipeline(p);
+  for (IBuffer* b : buffers) if (b) device.destroy_buffer(b);
+  if (color) device.destroy_image(color);
+  if (depth && !plain_depth) device.destroy_image(depth);
+  if (vs) device.destroy_shader_module(vs);
+  if (fs) device.destroy_shader_module(fs);
+  return ok;
+}
+
+static void test_stencil() {
+  Pair p;
+  CHECK(p.gpu);
+  if (!p.gpu) return;
+  const float white[4] = {1, 1, 1, 1}, black[4] = {0, 0, 0, 1};
+  auto item = [](float x0, float y0, float x1, float y1, float z, const float* rgba, StencilState st, bool dt = false, bool dw = false) {
+    StencilItem it{x0, y0, x1, y1, z, {rgba[0], rgba[1], rgba[2], rgba[3]}, st, dt, dw};
+    return it;
+  };
+  auto equals = [](uint8_t value) {
+    StencilState st;
+    st.enable = true;
+    st.compare = CompareOp::Equal;
+    st.reference = value;
+    return st;
+  };
+  // Both devices run the scene; the pictures agree (up to the pixels on the diagonal between a rectangle's two triangles) and show what the scene is supposed to show.
+  auto both = [&](const std::vector<StencilItem>& items, uint8_t clear, bool expect_white_at_probe, uint32_t probe_x, uint32_t probe_y, const char* what) {
+    std::vector<uint32_t> gpu_picture, soft_picture;
+    const int jobs = p.rig.gpu.jobs;
+    CHECK(stencil_run(*p.gpu, items, clear, &gpu_picture));
+    CHECK(stencil_run(p.software, items, clear, &soft_picture));
+    CHECK(p.rig.gpu.jobs > jobs && p.rig.gpu.violations.empty());
+    const uint32_t bad = differing(gpu_picture, soft_picture, 0);
+    if (bad > 140) printf("  stencil scene \"%s\": %u pixels differ\n", what, bad);
+    CHECK(bad <= 140);
+    if (gpu_picture.size() == kSize * kSize) {
+      const bool white_here = gpu_picture[probe_y * kSize + probe_x] == 0xFFFFFFFF;
+      if (white_here != expect_white_at_probe) printf("  stencil scene \"%s\": the probe is %s\n", what, white_here ? "white" : "black");
+      CHECK(white_here == expect_white_at_probe);
+    }
+  };
+  // The clear value and a test against it.
+  both({item(-1, -1, 1, 1, 0.5f, white, equals(0))}, 0, true, 30, 20, "cleared to 0, equals 0");
+  both({item(-1, -1, 1, 1, 0.5f, white, equals(5))}, 0, false, 30, 20, "cleared to 0, equals 5");
+  both({item(-1, -1, 1, 1, 0.5f, white, equals(5))}, 5, true, 30, 20, "cleared to 5, equals 5");
+  // Every compare function: the reference 3, 5, 7 against a stored 5.
+  struct Case { CompareOp op; bool less, equal, greater; };
+  const Case cases[] = {{CompareOp::Never, false, false, false}, {CompareOp::Less, true, false, false}, {CompareOp::Equal, false, true, false}, {CompareOp::LessEqual, true, true, false},
+                        {CompareOp::Greater, false, false, true}, {CompareOp::NotEqual, true, false, true}, {CompareOp::GreaterEqual, false, true, true}, {CompareOp::Always, true, true, true}};
+  for (const Case& c : cases) {
+    const uint8_t refs[3] = {3, 5, 7};
+    const bool expect[3] = {c.less, c.equal, c.greater};
+    for (int i = 0; i < 3; ++i) {
+      StencilState st;
+      st.enable = true;
+      st.compare = c.op;
+      st.reference = refs[i];
+      both({item(-1, -1, 1, 1, 0.5f, white, st)}, 5, expect[i], 30, 20, "compare function");
+    }
+  }
+  // Every operation, from a stored value, then probed for the expected result (the reference is 9).
+  struct OpCase { StencilOp op; uint8_t start, expect; };
+  const OpCase ops[] = {{StencilOp::Keep, 250, 250}, {StencilOp::Zero, 250, 0}, {StencilOp::Replace, 250, 9}, {StencilOp::IncrementClamp, 250, 251}, {StencilOp::IncrementClamp, 255, 255},
+                        {StencilOp::DecrementClamp, 250, 249}, {StencilOp::DecrementClamp, 0, 0}, {StencilOp::Invert, 0x0F, 0xF0}, {StencilOp::IncrementWrap, 255, 0},
+                        {StencilOp::DecrementWrap, 0, 255}, {StencilOp::IncrementWrap, 1, 2}};
+  for (const OpCase& c : ops) {
+    StencilState write;
+    write.enable = true;
+    write.pass_op = c.op;
+    write.reference = 9;
+    both({item(-1, -1, 1, 1, 0.5f, black, write), item(-1, -1, 1, 1, 0.5f, white, equals(c.expect))}, c.start, true, 30, 20, "operation");
+  }
+  // A mask: only the left half is written, and the write and compare masks.
+  {
+    StencilState left;
+    left.enable = true;
+    left.pass_op = StencilOp::Replace;
+    left.reference = 1;
+    both({item(-1, -1, 0, 1, 0.5f, black, left), item(-1, -1, 1, 1, 0.5f, white, equals(1))}, 0, true, 10, 40, "left half written");
+    both({item(-1, -1, 0, 1, 0.5f, black, left), item(-1, -1, 1, 1, 0.5f, white, equals(1))}, 0, false, 50, 40, "right half not written");
+    StencilState masked;
+    masked.enable = true;
+    masked.pass_op = StencilOp::Replace;
+    masked.reference = 0xFF;
+    masked.write_mask = 0x0F;
+    both({item(-1, -1, 1, 1, 0.5f, black, masked), item(-1, -1, 1, 1, 0.5f, white, equals(0xAF))}, 0xA0, true, 30, 20, "write mask");
+    StencilState compare_masked;
+    compare_masked.enable = true;
+    compare_masked.compare = CompareOp::Equal;
+    compare_masked.compare_mask = 0xF0;
+    compare_masked.reference = 0xAF;
+    both({item(-1, -1, 1, 1, 0.5f, white, compare_masked)}, 0xA5, true, 30, 20, "compare mask");
+  }
+  // Fail, depth-fail and pass operations are separate.
+  {
+    StencilState fail;
+    fail.enable = true;
+    fail.compare = CompareOp::Never;
+    fail.fail_op = StencilOp::Replace;
+    fail.pass_op = StencilOp::Zero;
+    fail.depth_fail_op = StencilOp::Zero;
+    fail.reference = 4;
+    both({item(-1, -1, 1, 1, 0.5f, white, fail), item(-1, -1, 1, 1, 0.5f, white, equals(4))}, 0, true, 30, 20, "fail op");
+    StencilState none;
+    StencilState counted;
+    counted.enable = true;
+    counted.depth_fail_op = StencilOp::IncrementClamp;
+    counted.pass_op = StencilOp::Zero;
+    const std::vector<StencilItem> depth_scene = {item(-1, -1, 0, 1, 0.2f, black, none, true, true), item(-1, -1, 1, 1, 0.8f, black, counted, true, false),
+                                                  item(-1, -1, 0, 1, 0.5f, white, equals(1)), item(0, -1, 1, 1, 0.5f, white, equals(0))};
+    both(depth_scene, 0, true, 10, 40, "depth fail op, behind");
+    both(depth_scene, 0, true, 50, 40, "pass op, in front");
+  }
+  // Refusals: a stencil test needs a stencil plane; a stencil plane goes with a depth image; memory comes back.
+  {
+    IImage* plain = p.gpu->create_image({{kSize, kSize}, Format::D32Float, kImageDepthAttachment});
+    CHECK(plain);
+    CHECK(!stencil_run(*p.gpu, {item(-1, -1, 1, 1, 0.5f, white, equals(0))}, 0, nullptr, plain));
+    CHECK(stencil_run(*p.gpu, {item(-1, -1, 1, 1, 0.5f, white, StencilState())}, 0, nullptr, plain));
+    p.gpu->destroy_image(plain);
+    ImageDesc bad{{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment};
+    bad.stencil = true;
+    CHECK(p.gpu->create_image(bad) == nullptr);
+    const int before = p.rig.mem.live();
+    for (int i = 0; i < 20; ++i) {
+      ImageDesc d{{256, 256}, Format::D32Float, kImageDepthAttachment};
+      d.stencil = true;
+      IImage* image = p.gpu->create_image(d);
+      CHECK(image);
+      p.gpu->destroy_image(image);
+    }
+    CHECK(p.rig.mem.live() == before);
+  }
+}
+
 int main() {
   test_resources();
   test_scenes();
+  test_textures();
+  test_stencil();
   test_present_and_failures();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("gen9 graphics device tests passed\n");

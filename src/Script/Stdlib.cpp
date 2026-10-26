@@ -68,25 +68,28 @@ const char kStdlib[] = R"JSLIB((function (g) {
   def(AP, 'toLocaleString', function () { return this.map(function (v) { return v === null || v === undefined ? '' : v.toLocaleString(); }).join(','); });
 
   // ------------------------------------------------------------------------------------------------------------------ String
-  // (strings are bytes: a code point is read from its UTF-8 bytes)
+  // (a string is a sequence of UTF-16 code units; a character outside the BMP is a surrogate pair)
   def(SP, 'codePointAt', function (i) {
-    i = toInt(i); var b = this.charCodeAt(i);
-    if (b !== b) return undefined;
-    if (b < 0x80) return b;
-    var n = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : 1, cp = b & (0x3F >> n);
-    for (var k = 1; k <= n; k++) cp = (cp << 6) | (this.charCodeAt(i + k) & 0x3F);
-    return cp;
+    i = toInt(i); var a = this.charCodeAt(i);
+    if (a !== a) return undefined;
+    if (a >= 0xD800 && a <= 0xDBFF) { var b = this.charCodeAt(i + 1); if (b >= 0xDC00 && b <= 0xDFFF) return (a - 0xD800) * 0x400 + (b - 0xDC00) + 0x10000; }
+    return a;
   });
   def(String, 'raw', function (strings) {
     var raw = strings.raw, out = '';
     for (var i = 0; i < raw.length; i++) { out += raw[i]; if (i + 1 < raw.length && i + 1 < arguments.length) out += arguments[i + 1]; }
     return out;
   });
-  def(SP, 'normalize', function () { return String(this); });
   def(SP, 'toLocaleLowerCase', function () { return this.toLowerCase(); });
   def(SP, 'toLocaleUpperCase', function () { return this.toUpperCase(); });
-  def(SP, 'isWellFormed', function () { return true; });
-  def(SP, 'toWellFormed', function () { return String(this); });
+  function lonelySurrogate(text, i) {
+    var c = text.charCodeAt(i);
+    if (c >= 0xD800 && c <= 0xDBFF) { var d = text.charCodeAt(i + 1); return !(d >= 0xDC00 && d <= 0xDFFF); }
+    if (c >= 0xDC00 && c <= 0xDFFF) { var p = i > 0 ? text.charCodeAt(i - 1) : 0; return !(p >= 0xD800 && p <= 0xDBFF); }
+    return false;
+  }
+  def(SP, 'isWellFormed', function () { var t = String(this); for (var i = 0; i < t.length; i++) if (lonelySurrogate(t, i)) return false; return true; });
+  def(SP, 'toWellFormed', function () { var t = String(this), out = ''; for (var i = 0; i < t.length; i++) out += lonelySurrogate(t, i) ? '\uFFFD' : t[i]; return out; });
   // a Symbol is a string that starts with @@ (the text up to the # is its description)
   Object.defineProperty(SP, 'description', { get: function () {
     var s = String(this);

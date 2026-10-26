@@ -15,6 +15,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 - **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
   None of it exists and none can be checked without the hardware and the firmware blobs.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265, MPEG-2 and VC-1 (10-bit HEVC; MPEG-4; interlaced VC-1; the chip has no VP9), and any run of it on the card.
+- **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
 
@@ -27,7 +28,7 @@ Code: `src/Hardware/GraphicsProcessingUnit/Intel/`, test: `tests/IntelRenderTest
 | `IntelLrc` | `lrc_init_gen9_rcs`: the render engine's logical ring context (`gen9_rcs_offsets` of the i915 driver; RCS0 at MMIO `0x2000`, 22 pages). |
 | `IntelVcsDriver` | `Config::engine = Engine::Render` drives RCS0 through the same execlist code as the video engine: render power well, 28 global GTT pages, PIPE_CONTROL ring job (invalidate, batch, flush, marker write). |
 | `IntelRenderCommands` | The 3D command set a batch may hold and the walker that checks a batch against it (no register writes, no global-GTT `PIPE_CONTROL`, no unknown command). |
-| `IntelRenderBatch` | Builds one job's batch image: `fill_rect`, `triangles` (flat or interpolated colour, source-over blend), `copy` (nearest-neighbour textured rectangle). The command order and the copy kernel are those of the intel-gpu-tools Gen9 render copy, which runs on hardware; packet fields were checked against Mesa's genxml (`gen8.xml`, `gen9.xml`). |
+| `IntelRenderBatch` | Builds one job's batch image: `fill_rect`, `triangles` (flat or interpolated colour, source-over blend), `copy` (nearest-neighbour textured rectangle), `textured_triangles` (sampled, nearest or linear, wrap or clamp), a stencil test and `clear_stencil`. The command order and the copy kernel are those of the intel-gpu-tools Gen9 render copy, which runs on hardware; packet fields were checked against Mesa's genxml (`gen8.xml`, `gen9.xml`). |
 
 The pixel shader is one of three kernels: the igt copy kernel word for word, a constant-colour kernel (igt's write-a-constant kernel with its immediates replaced) and an
 interpolating one (the copy kernel's plane-equation instruction with other registers). There is no EU compiler, so arbitrary shaders cannot run. The vertex shader, clipper
@@ -70,6 +71,29 @@ engine might write to is kept) are covered too.
 The context workarounds are written to the registers directly instead of being loaded into every context with `MI_LOAD_REGISTER_IMM`, which is enough because the driver has one context (the engine saves them with it). The MCR steering
 selector (needed for reads of slice-specific registers) is not set; nothing here reads them.
 
+## Radeon RX Vega M: VCE 3.4 (H.264 encode)
+
+`src/Hardware/VideoCodec/AMD/AmdVce3.*` is the start/stop of the Video Coding Engine 3.4, ported from amdgpu (`vce_v3_0.c`: `vce_v3_0_start`, `_stop`, `_mc_resume`, `_firmware_loaded`, the clock gating override and
+software clock gating, `_get_harvest_config`; `amdgpu_vce.c`: the memory layout and the microcode copy) the way `AmdUvd6` was ported from `uvd_v6_0.c`: registers numbered by dword in the card's register BAR, constants
+generated from AMD's headers (`scripts/gen_vcn1_regs.py --vi` -> `AmdVce3Registers.inc`), and `scripts/check_vce3_port.py <path to vce_v3_0.c>` confirms every ported function touches the same registers in the same order as
+the driver (it skips only the branches for chips before Stoney). The firmware is `/firmware/vegam_vce.bin` (linux-firmware, VCE 3.4, encoder firmware 53.21, so three rings), found with `amd_vce3_firmware_name()`.
+
+What is there: the two instances behind `GRBM_GFX_INDEX` (a Polaris-family chip has the second one fused off; the fuse is read through the SMC, `read_harvest_config`), the memory block (a 384 KiB microcode window, then a stack
+and a data area for each instance: 1144 KiB), the three rings of 1024 dwords, the memory controller windows, the clock gating, the start (with the driver's retries of the ECPU) and the stop, and a register snapshot of the moment a
+start gives up (`failure_snapshot`, as for the UVD). `tests/AmdVce3Test.cpp` runs it against a simulated card whose registers are banked per instance, and covers one instance, both, only the second, none, the layout of each
+instance's windows, the rings, the clock gating, retries and failure, and every refused argument.
+
+The ring: `AmdVce3Ring` is the work submission (`vce_v3_0_ring_emit_ib` of the chips from Stoney on, `amdgpu_vce_ring_emit_fence`, `amdgpu_vce_ring_test_ring`, the ring pointers through
+`GRBM_GFX_INDEX`, the nop command and the 16-dword alignment, the commands' values from `vid.h`). A job is `IB_VM` (VMID 0, the indirect buffer's address and length), `FENCE` (address, sequence), `TRAP`, `END` and
+padding; the indirect buffer holds the firmware's own task commands (the encode messages, next), padded with no-ops to 16 dwords; the CPU polls the fence word, and a job that does not finish wedges the ring until the engine is
+restarted. The host data path is flushed before the write pointer is published. `tests/AmdVce3RingTest.cpp` runs it against a simulated ring controller (all three rings, either instance, wrap-around over 200 jobs, the fence,
+a stalled engine, a dead one, every bad argument, and the order of the flush and the pointer; moving the fence words, dropping the padding, using the wrong ring's registers or flushing after the pointer each fails it) and
+`check_vce3_port.py vce_v3_0.c amdgpu_vce.c` confirms the job's commands, the ring test and the pointer registers against the driver.
+
+Not there, and needed before a Vega M encodes anything: the encode messages (Mesa's `radeon_vce.c` and `radeon_vce_52.c`: session, create, rate control, picture control, the feedback), an `IVideoEncoder` session on
+top, a self-test (the engine's bitstream has to decode with the CPU decoder to something close to the picture that went in), the memory planning and the PCI plumbing (as `AmdGmc8Memory` and `AmdUvd6VideoEngine` do for
+the UVD), and the SMC's power and clock requests. Not run on a Vega M.
+
 ## Textures in the graphics device API
 
 `IGraphicsDevice` now has textures (`src/Graphics/Graphics3D/IGraphicsDevice.hpp`): an image made with `kImageSampled` is filled by `IImage::write_pixels` (0xAARRGGBB, the device converts to its byte order), bound to a unit
@@ -78,15 +102,43 @@ selector (needed for reads of slice-specific registers) is not set; nothing here
 (`GraphicsPipelineDesc::texture_count`) and its fragment shader is a `textured_fragment_function` (a shader is that or a plain `fragment_function`, never both). `BuiltinShaders` has the textured pair
 (`textured_vertex_shader`, `textured_fragment_shader`, `describe_textured_pipeline`: a float3 position, a float2 coordinate, the matrix in the push constants, texture unit 0).
 
-Only the software device runs textures so far. The other devices refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back to the software device the same way it does
-for any pipeline they cannot take. The software device refuses a draw whose textures are not all bound, whose texture is the image being drawn into, or whose image was not made for sampling. `tests/GraphicsTest.cpp` covers
-nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal; `tests/Gen9GraphicsDeviceTest.cpp` the
-Intel device's refusals.
+The software device and the Intel Gen9 device run textures. The other devices (V3d, VMware SVGA, virgl) refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back
+to the software device the same way it does for any pipeline they cannot take. Both devices refuse a draw whose texture is not bound, is the image being drawn into, or was not made for sampling. `tests/GraphicsTest.cpp`
+covers nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal.
 
-The Gen9 hardware path for it is not written. The render copy kernel it already has (from the intel-gpu-tools Gen9 render copy) samples a surface at an interpolated coordinate, which is what a textured triangle needs:
-the work is carrying the coordinate through the batch's vertex layout, the sampler and surface state for a bound texture, the image upload through the page tables, and the fake pipeline's model of it.
+On the Gen9 device a textured draw is what `RenderBatch::textured_triangles` builds: the same job as the other triangle draws, but the pixel kernel is the intel-gpu-tools render copy kernel (it interpolates attribute 0's x and y
+as u and v and samples the surface bound after the target), the vertex's colour slot carries (u, v), the binding table has the target and the texture, and the sampler state selects nearest or linear filtering (bits 16:14 and
+19:17 of its first dword) and wrap or clamp per axis (the address control modes in the fourth). The CPU still transforms and clips the vertices, and clipping interpolates the coordinate like a colour, so the
+hardware's perspective-correct interpolation (from the 1/w each vertex carries) applies to it. Every job now ends with a texture cache invalidation next to the render target flush, so a later job sees what the CPU wrote with
+`write_pixels` or what an earlier job drew. `tests/FakeIntelRender.hpp` models the sampler (the filter, the address modes, the surface's byte order) and `tests/Gen9GraphicsDeviceTest.cpp` draws the same textured scenes on the
+Gen9 device and the software device and compares the pictures: nearest, repeat, clamp, linear (clamped and repeating), R8G8B8A8 textures and targets, perspective, blending and the refusals. Breaking the sampler's
+filter bits, swapping its u and v modes or pointing the texture's binding table entry at the target each makes the comparison fail. `tests/IntelRenderTest.cpp` checks the job's structure.
 
-Not done: stencil, textured triangles on the Intel device, tiling, interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
+Nothing of this has run on a GPU: the sampler state's bit positions are from Mesa's genxml (`gen8.xml`, `gen9.xml`), the kernel and the surface state are the ones the intel-gpu-tools render copy runs with, and the
+hardware's filtering and edge rounding are not modelled exactly (the tests allow a few levels and a few pixels along texel edges).
+
+## Stencil
+
+`IGraphicsDevice` has a stencil test: a D32Float image made with `ImageDesc::stencil` carries an 8-bit stencil plane next to the depth, a pipeline's `StencilState` says how it is tested (compare function, the fail / depth-fail /
+pass operations, compare and write masks, reference; one state for both faces), and `RenderPassBegin::clear_stencil` / `clear_stencil_value` set the plane at the start of a pass. The test comes before the depth
+test; a fragment a shader discards changes nothing. A stencil test with no stencil plane in the depth image fails the submit. The software device implements it (`tests/GraphicsTest.cpp`: every compare function, every
+operation including clamp and wrap, the masks, the three outcomes, the refusals; breaking the invert operation, the depth-fail operation or the write mask each fails it). V3d, VMware SVGA and virgl refuse an image
+with a stencil plane and a pipeline with a stencil test.
+
+On the Gen9 device the stencil plane is a second region of GPU memory, W-tiled and opaque like the depth buffer (the hardware has no linear stencil buffer): `StencilBuffer::bytes_for` is the aligned width times the
+height aligned to 64, the pitch the hardware is told is twice the aligned width (a tile is 64 x 64 values in 4096 bytes, 128 bytes wide on its physical rows), and the memory starts as zeros, which is a stencil of
+zero in any layout. A draw whose test is on attaches it through 3DSTATE_STENCIL_BUFFER and sets the test, the operations (translated to the hardware's numbering; the compare functions are numbered alike), the masks
+and the reference in 3DSTATE_WM_DEPTH_STENCIL (on Gen9 the reference is in that packet) and the stencil write bit of 3DSTATE_DEPTH_BUFFER; a pass clears the plane with a job of its own whose test always passes and
+replaces, with the colour and depth writes masked off. `tests/FakeIntelRender.hpp` models the test (it keeps the values in rows of the target's width; the W tiling, which the device never looks at, is not modelled) and
+`tests/Gen9GraphicsDeviceTest.cpp` runs the same stencil scenes on the Gen9 device and the software device: the pictures agree and show the expected result for every compare function, every operation, masks, the
+three outcomes and the refusals, and the memory of a stencil image is returned. Moving the reference field, swapping the pass and depth-fail operations or the two masks, mapping an operation to the wrong
+hardware code, or leaving out the clear each makes it fail. `tests/IntelRenderTest.cpp` checks the packets dword by dword.
+
+What is not verified: the W-tile sizes and pitch above are from the documentation and Mesa's surface layout code as I know them, not from a run; the QPitch of the stencil packet is a guess (a single, non-array
+surface should ignore it).
+
+Not done: tiling of colour surfaces (reading or writing a tiled image from the CPU needs the memory controller's bit 6 swizzle, which depends on the machine's memory configuration, and linear surfaces cannot have
+mipmaps, so mipmaps wait for it too), interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
 on real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.
 
 ## Radeon RX Vega M: UVD 6.3
