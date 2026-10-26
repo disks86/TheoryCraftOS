@@ -1410,7 +1410,7 @@ uint32_t longhands_of(Prop p, Prop* out) {
 // Copies one longhand from another style: what inherit (from the parent) and initial (from a style with the defaults) do.
 void copy_property(Prop p, const Style& from, Style* to) {
   switch (p) {
-    case pColor: to->color = from.color; break;
+    case pColor: to->color = from.color; to->color_argb = from.color_argb; to->color_argb_set = from.color_argb_set; break;
     case pBackgroundColor: to->own_background = from.own_background; to->own_background_color = from.own_background_color; to->background_argb = from.background_argb; break;
     case pFontSize: to->font_px = from.font_px; break;
     case pFontWeight: to->bold = from.bold; to->font_weight = from.font_weight; break;
@@ -3208,6 +3208,13 @@ void CssApply::apply_value(Prop p, StringView value) {
   switch (p) {
     case pColor:
       if (parse_color(value, &c) && c != 0) style->color = c;
+      {
+        uint32_t argb;
+        if (parse_color_alpha(value, &argb)) {   // (the pixel engine shows the colour without its alpha; scripts see the alpha)
+          style->color_argb = argb;
+          style->color_argb_set = true;
+        }
+      }
       break;
     case pBackgroundColor:
       if (parse_color(value, &c)) {
@@ -4427,7 +4434,7 @@ bool parse_css_color_alpha(StringView text, uint32_t* out) {
     uint32_t rgb_value = rgb ? (channel(v[0], pct[0]) << 16) | (channel(v[1], pct[1]) << 8) | channel(v[2], pct[2]) : hwb ? hwb_to_rgb(v[0], v[1], v[2]) : hsl_to_rgb(v[0], v[1], v[2]);
     int64_t alpha = 255;
     if (n >= 4) {
-      alpha = pct[3] ? v[3] * 255 / 10000 : v[3] * 255 / 100;
+      alpha = pct[3] ? (v[3] * 255 + 5000) / 10000 : (v[3] * 255 + 50) / 100;   // (rounded: 0.25 is 64)
       alpha = alpha < 0 ? 0 : alpha > 255 ? 255 : alpha;
     }
     *out = (static_cast<uint32_t>(alpha) << 24) | rgb_value;

@@ -451,6 +451,35 @@ NATIVE(style_to_string) {
 
 // --- Computed style --------------------------------------------------------------------------------------------------------
 
+// rgb(r, g, b), or rgba(r, g, b, a) with the alpha to three places for a colour that is not opaque.
+void rgba_text(uint32_t color, String* out) {
+  const uint32_t alpha = color >> 24;
+  if (alpha == 0xFF) {
+    out->append("rgb(");
+  } else {
+    out->append("rgba(");
+  }
+  out->append_uint((color >> 16) & 0xFF);
+  out->append(", ");
+  out->append_uint((color >> 8) & 0xFF);
+  out->append(", ");
+  out->append_uint(color & 0xFF);
+  if (alpha != 0xFF) {
+    out->append(", ");
+    uint32_t thousandths = (alpha * 1000 + 127) / 255;   // (two places if they give the same byte back, else three: 0.25, 0.502)
+    const uint32_t hundredths = (alpha * 100 + 127) / 255;
+    if ((hundredths * 255 + 50) / 100 == alpha) thousandths = hundredths * 10;
+    out->append_uint(thousandths / 1000);
+    if (thousandths % 1000) {
+      out->push_back('.');
+      out->push_back(static_cast<char>('0' + thousandths / 100 % 10));
+      if (thousandths % 100) out->push_back(static_cast<char>('0' + thousandths / 10 % 10));
+      if (thousandths % 10) out->push_back(static_cast<char>('0' + thousandths % 10));
+    }
+  }
+  out->push_back(')');
+}
+
 void rgb_text(uint32_t color, String* out) {
   out->append("rgb(");
   out->append_uint((color >> 16) & 0xFF);
@@ -677,10 +706,12 @@ Value make_computed_style(DomBindings::Impl& c, dom::Node* element) {
   }
   const bool dark = c.host.media().dark;
   const uint32_t text_color = s.color ? s.color : (dark ? 0xE8E8E8 : 0x000000);
-  rgb_text(text_color, &t);
+  if (s.color_argb_set && (s.color_argb >> 24) != 0xFF) rgba_text(s.color_argb, &t);
+  else rgb_text(text_color, &t);
   set("color", t.view());
   t.clear();
-  if (s.background) rgb_text(s.background, &t);
+  if (s.background_argb != 0 && (s.background_argb >> 24) != 0xFF) rgba_text(s.background_argb, &t);
+  else if (s.background) rgb_text(s.background, &t);
   else t.assign("rgba(0, 0, 0, 0)");
   set("backgroundColor", t.view());
   t.clear();

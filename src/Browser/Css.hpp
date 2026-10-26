@@ -201,6 +201,8 @@ constexpr uint32_t kTransparentBorder = 1;
 struct Style {
   // --- inherited
   uint32_t color = 0;         // text colour (inherited)
+  uint32_t color_argb = 0;    // the same with its alpha kept, for computed style (inherited; valid when color_argb_set: transparent is 0)
+  bool color_argb_set = false;
   uint32_t background = 0;    // the background that text is shown on (inherited: text on a block's background is on it too)
   bool background_block = false;   // that background belongs to a block, so it fills the lines the text is on
   bool bold = false, underline = false, strike = false, code = false, pre = false, italic = false;   // (inherited)

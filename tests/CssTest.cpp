@@ -375,7 +375,7 @@ static void test_shadows() {
   List<Shadow> sh(g_alloc);
   CHECK(p.sheet.shadows(a.box_shadow, a, &sh) && sh.count() == 3);
   CHECK(sh[0].x_px100 == 100 && sh[0].y_px100 == 200 && sh[0].blur_px100 == 300 && sh[0].spread_px100 == 400 && sh[0].color == 0xFFFF0000 && !sh[0].current_color && !sh[0].inset);
-  CHECK(sh[1].inset && sh[1].blur_px100 == 500 && (sh[1].color >> 24) == 127 && (sh[1].color & 0xFFFFFF) == 0);
+  CHECK(sh[1].inset && sh[1].blur_px100 == 500 && (sh[1].color >> 24) == 128 && (sh[1].color & 0xFFFFFF) == 0);
   CHECK(sh[2].x_px100 == 0 && sh[2].y_px100 == 100 && sh[2].blur_px100 == 0 && sh[2].color == 0xFF0000FF);
   Style b = p.style("b2");   // text-shadow is inherited
   List<Shadow> ts(g_alloc);
