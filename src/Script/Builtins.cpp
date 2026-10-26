@@ -561,7 +561,10 @@ NATIVE(object_has_own_property) {
 // __template(cooked, raw): the strings array a tag function gets
 NATIVE(template_object) {
   const Value cooked = arg_at(args, argc, 0), raw = arg_at(args, argc, 1);
-  if (cooked.is_object() && raw.is_object()) vm.define_named(cooked.as_object(), "raw", raw, 0);
+  if (cooked.is_object() && raw.is_object()) {
+    vm.define_named(cooked.as_object(), "raw", raw, 0);
+    cooked.as_object()->frozen = raw.as_object()->frozen = true;   // (the strings array of a tagged template and its raw array are frozen)
+  }
   *result = cooked;
   return true;
 }
@@ -647,6 +650,21 @@ NATIVE(array_ctor) {
     vm.array_set_length(a, static_cast<uint32_t>(d));
   } else {
     for (uint32_t i = 0; i < argc; ++i) vm.array_push(a, args[i]);
+  }
+  if (self.is_object() && self.as_object()->okind == ObjKind::Plain && self.as_object()->proto && self.as_object()->proto != vm.array_proto()) {
+    bool derived = false;   // class D extends Array: `new D()` made `self` with D.prototype, which the array takes over
+    for (JsObject* p = self.as_object()->proto; p && !derived; p = p->proto) derived = p == vm.array_proto();
+    if (derived) {   // (the object keeps its prototype and becomes the array)
+      JsObject* d = self.as_object();
+      d->okind = ObjKind::Array;
+      d->items = a->items;
+      d->length = a->length;
+      d->capacity = a->capacity;
+      a->items = nullptr;
+      a->length = a->capacity = 0;
+      *result = self;
+      return true;
+    }
   }
   *result = Value::make_object(a);
   return true;
@@ -1694,8 +1712,20 @@ bool error_ctor(Vm& vm, const Value&, const Value* args, uint32_t argc, Value* r
 }
 
 NATIVE(error_to_string) {
+  if (!self.is_object()) return vm.throw_error(ErrorKind::TypeError, "Error.prototype.toString called on a non-object");
+  Value name_value, message_value;
+  if (!vm.get_named(self, "name", &name_value) || !vm.get_named(self, "message", &message_value)) return false;
+  JsString* name = nullptr;
+  JsString* message = nullptr;
+  if (name_value.is_undefined()) name = vm.intern("Error");
+  else if (!vm.to_string(name_value, &name)) return false;
+  if (!message_value.is_undefined() && !vm.to_string(message_value, &message)) return false;
   String text(vm.allocator());
-  vm.describe(self, &text, 0);
+  text.append(name->view());
+  if (message && message->length) {
+    if (name->length) text.append(": ");
+    text.append(message->view());
+  }
   *result = str_value(vm, text.view());
   return true;
 }
@@ -1703,7 +1733,10 @@ NATIVE(error_to_string) {
 // --- Promise -------------------------------------------------------------------------------------------------------
 
 NATIVE(promise_ctor) {
-  if (!self.is_object() || self.as_object()->okind != ObjKind::Plain || self.as_object()->proto != vm.promise_proto()) return vm.throw_error(ErrorKind::TypeError, "Promise constructor cannot be invoked without 'new'");
+  bool is_promise_instance = false;   // (`new Promise` or `new D` of a class D extends Promise)
+  if (self.is_object() && self.as_object()->okind == ObjKind::Plain)
+    for (JsObject* p = self.as_object()->proto; p && !is_promise_instance; p = p->proto) is_promise_instance = p == vm.promise_proto();
+  if (!is_promise_instance) return vm.throw_error(ErrorKind::TypeError, "Promise constructor cannot be invoked without 'new'");
   const Value executor = arg_at(args, argc, 0);
   if (!Vm::is_callable(executor)) return vm.throw_error(ErrorKind::TypeError, "Promise resolver is not a function");
   JsObject* promise = self.as_object();

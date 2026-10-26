@@ -675,6 +675,7 @@ void Vm::collect() {
   for (uint64_t i = 0; i < handlers_.count(); ++i) mark(handlers_[i].env);
   mark_value(exception_);
   mark_value(last_result_);
+  mark_value(iter_return_);
   mark_value(await_value_);
   mark(promise_proto_);
   mark(micro_);
@@ -1106,6 +1107,11 @@ bool Vm::put_ex(const Value& base, JsString* key, const Value& value, bool stric
       if (epilogue_pending_) run_epilogue();
       return true;
     }
+  }
+  if (o->okind == ObjKind::Array && key == length_) {   // a length must be a whole number below 2^32
+    double d = 0;
+    if (!to_number(value, &d)) return false;
+    if (!(d >= 0 && d < 4294967296.0 && d == static_cast<double>(static_cast<uint32_t>(d)))) return throw_error(ErrorKind::RangeError, "Invalid array length");
   }
   if (o->frozen) return refuse("Cannot assign to read only property '", "' of object");
   const int64_t at = find_prop(o, key);
@@ -1602,6 +1608,16 @@ bool Vm::compare(const Value& a, const Value& b, bool* less, bool* undefined) {
 }
 
 bool Vm::instance_of(const Value& v, const Value& ctor, bool* out) {
+  if (ctor.is_object()) {   // a [Symbol.hasInstance] method decides
+    Value method;
+    if (!get_named(ctor, "@@hasInstance", &method)) return false;
+    if (is_callable(method)) {
+      Value answer;
+      if (!call_value(method, ctor, &v, 1, &answer, false)) return false;
+      *out = to_boolean(answer);
+      return true;
+    }
+  }
   if (!is_callable(ctor)) return throw_error(ErrorKind::TypeError, "Right-hand side of 'instanceof' is not callable");
   JsObject* c = ctor.as_object();
   while (c->okind == ObjKind::Bound && c->target) c = c->target;
@@ -1816,6 +1832,7 @@ bool Vm::make_iterator(const Value& v, bool for_in, Value* out) {
 
 bool Vm::iterator_next(JsObject* it, Value* out) {
   const Value& src = it->bound_this;
+  iter_return_ = Value();
   if (it->frozen) {   // an iterator object: call its next()
     Value next, step, done;
     if (!get_named(src, "next", &next)) return false;
@@ -1825,7 +1842,11 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
       return false;
     }
     if (!get_named(step, "done", &done)) return false;
-    if (to_boolean(done)) return false;
+    if (to_boolean(done)) {
+      iter_return_ = Value();
+      if (!get_named(step, "value", &iter_return_)) return false;
+      return false;
+    }
     return get_named(step, "value", out);
   }
   if (it->target) {   // for-in: a list of keys
@@ -2257,6 +2278,7 @@ reload:
         fp->env = e;
         break;
       }
+      case Opc::IterReturn: PUSH(iter_return_); break;
       case Opc::PopEnv: fp->env = fp->env->parent; break;
       case Opc::CopyEnv: {
         Env* old = fp->env;
