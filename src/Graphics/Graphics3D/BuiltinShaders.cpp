@@ -84,6 +84,7 @@ ShaderModuleDesc colored_vertex_shader() {
   d.tgsi = kColoredVertexTgsi;
   d.d3d9_tokens = kColoredVertexD3d9;
   d.d3d9_token_count = sizeof kColoredVertexD3d9 / 4;
+  d.qpu_program = QpuProgram::ColoredVertex;
   return d;
 }
 
@@ -94,6 +95,7 @@ ShaderModuleDesc colored_fragment_shader() {
   d.tgsi = kColoredFragmentTgsi;
   d.d3d9_tokens = kColoredFragmentD3d9;
   d.d3d9_token_count = sizeof kColoredFragmentD3d9 / 4;
+  d.qpu_program = QpuProgram::ColoredFragment;
   return d;
 }
 
