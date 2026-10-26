@@ -198,6 +198,11 @@ bool Page::start_engine() {
         prelude_error.insert(0, "The service worker script failed: ");
         env_.console(3, prelude_error.view());
       }
+      prelude_error.clear();
+      if (!engine_->run_library(finish_prelude(), &prelude_error)) {
+        prelude_error.insert(0, "The interface script failed: ");
+        env_.console(3, prelude_error.view());
+      }
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
       bindings_->set_hidden(hidden_);
       return true;

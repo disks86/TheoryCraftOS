@@ -44,8 +44,13 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   values (heading sizes, `ul` padding, link colour, `em`), newer colour spaces (`lab`, `oklch`, `color-mix`, relative colours), `lh`, nesting,
   `revert-layer`, `@container` failure, `:dir()`, `:nth-child(… of S)`, `aspect-ratio`, `flow-root` floats, many properties return `""`
   (`text-indent`, `word-break`, `quotes`, `counter-*`, `contain`, `will-change`, …).
-- **Web APIs**: ~100 interfaces are missing (Web Audio, Web Animations, FontFace, most SVG DOM classes, `StaticRange`, IndexedDB cursors/ranges, …) and for
-  most existing interfaces the constructor `[[Prototype]]` chain does not follow the interface hierarchy.
+- **Web APIs**: the constructor of an interface inherits from the constructor of its parent, `AbstractRange`/`StaticRange`, `EventSource`,
+  `IDBVersionChangeEvent`, the device events, `DOMImplementation`, `NodeFilter` as an interface object, the legacy element interfaces and the
+  constants of `WheelEvent`/`KeyboardEvent`/`DOMException` exist (`finish_prelude()` in `WebPrelude.cpp`, run last). The attributes the engine keeps on the
+  objects are mirrored as placeholder accessors on the prototypes, so `'nodeType' in Node.prototype` is true (a read that reaches one gives undefined, a
+  write makes the object's own property; they are not enumerable). Still missing: the SVG DOM classes, Web Audio, Web Animations, FontFace,
+  `DocumentType`/`document.doctype`, form/options collections as interfaces, most methods listed in `missing_members`, and the prototype-level
+  accessors for attributes of `Window`.
 - **WebAssembly JS API**: `WebAssembly` error classes do not inherit from `Error` (the constructor), constructors' `prototype` is writable, Table and
   Global argument edge cases, structured clone of `Module`.
 
