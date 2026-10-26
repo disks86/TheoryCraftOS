@@ -197,6 +197,9 @@ struct Card final : IVcnRegisters {
   const uint8_t* block_host = nullptr;
   uint32_t expected_first_word = 0;
   bool quiet = false;
+  bool smc_running = true;
+  uint32_t smc_result = 1;
+  std::vector<std::pair<uint32_t, size_t>> smc_log;   // (message, index of the write in ring.writes)
   bool boots = true, write_pictures = true, write_hevc = true, hang_hevc = false;
   int boot_attempts = 0, creates = 0, hevc_creates = 0, destroys = 0, decodes = 0, hevc_decodes = 0, problems = 0;
 
@@ -210,11 +213,16 @@ struct Card final : IVcnRegisters {
     ring.write(reg::kConfigMemsize, 4096);
     ring.write(reg::kFbLocation, ((0xF4u + 255) << 16) | 0xF4u);
     ring.write(reg::kGbAddrConfig, 0x22011003);
+    ring.write(0x95, 1);   // SMC_RESP_0: idle, the last message was done
   }
   uint32_t read(uint32_t r) override { return ring.read(r); }
   void write(uint32_t r, uint32_t v) override {
     const uint32_t old = ring.read(r);
     ring.write(r, v);
+    if (r == 0x94) {   // SMC_MESSAGE_0
+      smc_log.push_back({v, ring.writes.size() - 1});
+      ring.write(0x95, smc_running ? smc_result : 0);
+    }
     if (r == reg::kSoftReset && (old & 8) && !(v & 8)) boot();
   }
   void boot() {
@@ -423,7 +431,7 @@ static void damaged_hevc_streams(AmdUvd6VideoEngine& engine, Card& card) {
   (void)problems_before;
 }
 
-enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang };
+enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses };
 
 static void run_case(Fault fault) {
   TestAllocator a;
@@ -437,6 +445,8 @@ static void run_case(Fault fault) {
     card.hevc = &hevc;
     card.write_hevc = fault != Fault::HevcWrong;
     card.hang_hevc = fault == Fault::HevcHang;
+    if (fault == Fault::SmcNotRunning) card.ring.write(0x95, 0), card.smc_running = false;
+    if (fault == Fault::SmcRefuses) card.smc_result = 0xFF;
     card.boots = fault != Fault::NoBoot;
     card.write_pictures = fault != Fault::WrongPictures;
     card.ring.stall_fence = fault == Fault::Hang;
@@ -473,10 +483,11 @@ static void run_case(Fault fault) {
     card.place(engine.plan(), engine.firmware().ucode());
     const size_t writes_before = card.ring.writes.size();
     const bool started = engine.start_hardware(card.clock);
-    CHECK(started == (fault == Fault::None || fault == Fault::HevcWrong));
+    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses;
+    CHECK(started == engine_up);
     CHECK(card.problems == 0 || fault == Fault::WrongPictures);
-    if (fault == Fault::None || fault == Fault::HevcWrong) {
-      const bool hevc_on = fault == Fault::None;
+    if (engine_up) {
+      const bool hevc_on = fault != Fault::HevcWrong;
       CHECK(engine.engine_running() && engine.decode_ready() && engine.hevc_ready() == hevc_on);
       CHECK(engine.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | (hevc_on ? codec_mask(VideoCodec::Hevc) : 0u)));
       CHECK(strstr(engine.engine_note(), hevc_on ? "H.264 and H.265 decode run on it" : "H.265 self-test failed") != nullptr && strstr(engine.engine_summary(), "UVD 6.3") != nullptr);
@@ -518,7 +529,20 @@ static void run_case(Fault fault) {
       DecoderConfig vp9;
       vp9.codec = VideoCodec::Vp9;
       CHECK(static_cast<bool>(engine.create_decoder(vp9)));
+      // The SMC was asked to power the engine before anything else was written to it, and to power it down at shutdown - but only when it said yes.
+      size_t first_engine_write = 0;
+      while (first_engine_write < card.ring.writes.size() && card.ring.writes[first_engine_write].first != reg::kSoftReset) ++first_engine_write;
+      if (fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses) {
+        CHECK(card.smc_log.size() == (fault == Fault::SmcRefuses ? 1u : 0u));
+        CHECK(strstr(engine.firmware_status(), fault == Fault::SmcRefuses ? "refused to power" : "did not answer") != nullptr);
+      } else {
+        CHECK(!card.smc_log.empty() && card.smc_log[0].first == 0x61 && card.smc_log[0].second < first_engine_write);
+        CHECK(strstr(engine.firmware_status(), "SMC powered the engine") != nullptr);
+      }
+      const size_t smc_before_shutdown = card.smc_log.size();
       engine.shutdown();
+      if (fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses) CHECK(card.smc_log.size() == smc_before_shutdown);
+      else CHECK(card.smc_log.size() == smc_before_shutdown + 1 && card.smc_log.back().first == 0x60);
       CHECK(!engine.engine_running() && !engine.decode_ready() && engine.info().accelerated_decode_codecs == 0);
       CHECK(card.ring.writes.size() > writes_before);
     } else {
@@ -531,6 +555,10 @@ static void run_case(Fault fault) {
       const int before = card.decodes;
       UniquePointer<IVideoDecoder> software = engine.create_decoder(h264_config());
       CHECK(static_cast<bool>(software) && run_stream(a, *software, expected) && card.decodes == before);
+      // Whatever stopped the engine, the power the SMC gave it is given back.
+      if (fault == Fault::NoBoot || fault == Fault::DeadRing || fault == Fault::WrongPictures || fault == Fault::Hang || fault == Fault::HevcHang)
+        CHECK(card.smc_log.size() == 2 && card.smc_log[0].first == 0x61 && card.smc_log[1].first == 0x60);
+      if (fault == Fault::NoGbConfig) CHECK(card.smc_log.empty());   // (refused before anything is asked of the card)
       if (fault == Fault::NoBoot) CHECK(card.boot_attempts == 1 + 3);   // the release that starts the VCPU, then three tries (not the driver's ten)
     }
   }
@@ -538,7 +566,7 @@ static void run_case(Fault fault) {
 }
 
 int main() {
-  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang}) {
+  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses}) {
     printf("case %d\n", static_cast<int>(f));
     run_case(f);
   }

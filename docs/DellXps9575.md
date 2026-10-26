@@ -82,7 +82,11 @@ The firmware is `/firmware/vegam_uvd.bin` (linux-firmware, UVD 6.3, version 1.13
 (including the real firmware file) and covers the layout, the register values, the reset order, boot retries and failure, stop and restart, and every refused argument.
 
 What it does not do, and what is needed before a Vega M decodes anything:
-- **Power and clocks.** amdgpu asks the card's SMC to power the engine and set its clocks (`PPSMC_MSG_UVDPowerON`, `amdgpu_asic_set_uvd_clocks`); here the engine is assumed powered and clocked (usually so on a card the system firmware set up).
+- **Power: the request is made; clocks are not.** `AmdSmu7` is the SMC's message interface ported from `smu7_smumgr.c` (message and result registers, the wait for the previous message, the argument), with the UVD
+  messages of `smu7_ppsmc.h` (`PPSMC_MSG_UVDPowerON` 0x61, `PPSMC_MSG_UVDPowerOFF` 0x60; `smu7_powerup_uvd`'s argument). `AmdUvd6VideoEngine` asks it to power the engine before the start and to power it down when the
+  engine stops (only if the SMC said yes). An SMC that is not running (the result register stuck at zero, or reading all ones) gets nothing written and the engine is assumed powered; the start itself then shows whether it is.
+  `tests/AmdSmu7Test.cpp` runs the mailbox against a simulated SMC. What is still missing is clocks: amdgpu sets the engine's clocks through the SMC's DPM tables or the PLL (`vi_set_uvd_clocks`, via AtomBIOS), neither of
+  which exists here, so the engine runs at whatever clock the system firmware left.
 - **Memory: planned and wired (opt-in).** `AmdGmc8Memory` reads the memory controller the way amdgpu does (`CONFIG_MEMSIZE`, `MC_VM_FB_LOCATION`; both set by the card's firmware, nothing is written), places the engine's block, ring and
   a work area (96 MiB if there is room, 8 MiB at least) at the end of the part of video memory the CPU can reach through BAR 0 (the first 256 MiB without Resizable BAR), clear of the firmware's start of memory
   (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. That the memory controller lets
@@ -113,6 +117,6 @@ What it does not do, and what is needed before a Vega M decodes anything:
   `-DTCOS_AMD_UVD=ON` (off by default, since the start has never touched a real card). `tests/AmdUvd6VideoEngineTest.cpp` runs the whole path against one simulated card (memory controller, graphics block, engine boot,
   ring controller, a stand-in firmware that decodes with the CPU decoder) and ten cases: success (sessions served by the engine, second session on the CPU, shutdown), no firmware, no registers, too small an aperture,
   a mapper that refuses, an engine that never answers, a graphics block that reports nothing, a ring that does not run, an engine that writes wrong pictures, and one that never finishes a picture.
-- Still open on the video side: 10-bit HEVC and the other codecs, reading the feedback area back, SMC power/clock requests (a card whose engine the firmware left unpowered makes the start time out; it is stopped and reported), and a run on a real card.
+- Still open on the video side: 10-bit HEVC and the other codecs, reading the feedback area back, SMC clock requests (a card whose engine stays unpowered makes the start time out; it is stopped and reported), and a run on a real card.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.

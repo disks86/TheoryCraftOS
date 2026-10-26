@@ -20,6 +20,7 @@
 #pragma once
 #include "Hardware/Mmio.hpp"
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
+#include "Hardware/VideoCodec/AMD/AmdSmu7.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.hpp"
@@ -125,6 +126,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   // which is what a block that was never set up, or a card that does not answer, reads as). Three tries for the VCPU to answer, not the driver's ten.
   bool start_hardware(const IClock& clock) override {
     if (engine_running()) return true;
+    clock_ = &clock;
     if (!planned_) return false;
     if (config_.gb_addr_config == 0 || config_.gb_addr_config == 0xFFFFFFFFu) {
       note_ = "engine not started: the graphics block did not report an address configuration";
@@ -134,8 +136,10 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     config_.boot_attempts = kBootAttempts;
     uvd_ = UniquePointer<AmdUvd6>::make(allocator_, *registers_, clock);
     if (!uvd_) return false;
+    request_power(clock);
     const AmdUvd6::Status status = uvd_->start(firmware_, memory_.engine, config_);
     if (status != AmdUvd6::Status::Ok) {
+      release_power(clock);
       uvd_.reset();
       note_ = status == AmdUvd6::Status::TimedOut ? "engine start failed: the VCPU did not answer (is the engine powered?)" :
               status == AmdUvd6::Status::BadMemory ? "engine start refused: bad memory block" : "engine start refused: unusable firmware";
@@ -157,6 +161,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     ring_.reset();
     if (uvd_) {
       uvd_->stop();
+      if (clock_) release_power(*clock_);
       uvd_.reset();
       note_ = "engine stopped";
       rebuild_status();
@@ -292,6 +297,23 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
 
  private:
   static constexpr uint32_t kBootAttempts = 3;
+
+  // Asks the card's SMC to power the engine (the driver does this before it touches the engine). The start goes on whatever the answer: an SMC that is not running means the
+  // system firmware left the card as it was, and the start itself shows whether the engine is up. Only an acknowledged request is undone at stop.
+  void request_power(const IClock& clock) {
+    AmdSmu7 smc(*registers_, clock);
+    switch (smc.uvd_power(true)) {
+      case AmdSmu7::Result::Ok: smc_powered_ = true; power_note_ = "SMC powered the engine"; break;
+      case AmdSmu7::Result::NotAnswering: power_note_ = "SMC did not answer, engine assumed powered"; break;
+      case AmdSmu7::Result::Unsupported: power_note_ = "SMC does not know the power-on message, engine assumed powered"; break;
+      case AmdSmu7::Result::Failed: power_note_ = "SMC refused to power the engine"; break;
+    }
+  }
+  void release_power(const IClock& clock) {
+    if (!smc_powered_ || !registers_) return;
+    AmdSmu7(*registers_, clock).uvd_power(false);
+    smc_powered_ = false;
+  }
   static constexpr uint32_t kGbAddrConfig = 0x263e;   // mmGB_ADDR_CONFIG (gca/gfx_8_0_d.h)
 
   static void append_hex(FixedString<255>& out, uint64_t value) {
@@ -310,6 +332,10 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
       firmware_text_.append_uint(firmware_.ucode().size());
       firmware_text_.append(" bytes of microcode loaded, ");
       firmware_text_.append(note_);
+      if (power_note_[0]) {
+        firmware_text_.append("; ");
+        firmware_text_.append(power_note_);
+      }
     } else {
       firmware_text_.append(amd_firmware_status_name(firmware_state_));
       firmware_text_.append(" (expected /firmware/");
@@ -325,7 +351,10 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   AmdVcnFirmware firmware_;
   AmdFirmwareStatus firmware_state_ = AmdFirmwareStatus::NotApplicable;
   const char* firmware_name_ = nullptr;
-  FixedString<200> firmware_text_, summary_, decode_text_;
+  FixedString<255> firmware_text_, summary_;
+  FixedString<200> decode_text_;
+  const char* power_note_ = "";
+  bool smc_powered_ = false;   // the SMC acknowledged our request to power the engine, so we ask it to power it down again
   const char* note_ = "engine not started";
   IVcnRegisters* registers_ = nullptr;
   UniquePointer<MmioVcnRegisters> register_window_;   // the mapped BAR, when that is what registers_ is
@@ -343,6 +372,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   UniquePointer<AmdUvd6Ring> ring_;
   AmdVcnWorkMemory work_;
   AmdUvd6AvcDecoder::Engine engine_;
+  const IClock* clock_ = nullptr;
   bool decode_ready_ = false;
   bool hevc_ready_ = false;
   uint32_t next_stream_handle_ = 1;
