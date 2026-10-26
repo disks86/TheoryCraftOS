@@ -88,7 +88,7 @@ struct Scene {
   IShaderModule* fs;
   explicit Scene(IGraphicsDevice& d) : device(d), vs(d.create_shader_module(colored_vertex_shader())), fs(d.create_shader_module(colored_fragment_shader())) {}
   ~Scene() { device.destroy_shader_module(vs); device.destroy_shader_module(fs); }
-  IPipeline* pipeline(CullMode cull = CullMode::None, FrontFace front = FrontFace::CounterClockwise, bool blend = false) {
+  IPipeline* pipeline(CullMode cull = CullMode::None, FrontFace front = FrontFace::CounterClockwise, bool blend = false, bool depth_test = false, bool depth_write = false) {
     GraphicsPipelineDesc pd;
     describe_colored_pipeline(&pd);
     pd.vertex_shader = vs;
@@ -96,6 +96,8 @@ struct Scene {
     pd.cull_mode = cull;
     pd.front_face = front;
     pd.alpha_blend = blend;
+    pd.depth_test = depth_test;
+    pd.depth_write = depth_write;
     return device.create_graphics_pipeline(pd);
   }
 };
@@ -116,7 +118,7 @@ struct Draw {
 
 static std::vector<IBuffer*> g_pending_vb;
 
-static bool render(IGraphicsDevice& device, Scene& scene, IImage* image, Vec4 clear, std::vector<Draw> draws, bool do_clear = true) {
+static bool render(IGraphicsDevice& device, Scene& scene, IImage* image, Vec4 clear, std::vector<Draw> draws, bool do_clear = true, IImage* depth = nullptr) {
   (void)scene;
   ICommandBuffer* cb = device.create_command_buffer();
   if (!cb) return false;
@@ -125,7 +127,9 @@ static bool render(IGraphicsDevice& device, Scene& scene, IImage* image, Vec4 cl
   pass.color = image;
   pass.clear_color = do_clear;
   pass.clear_color_value = clear;
-  pass.clear_depth = false;
+  pass.depth = depth;
+  pass.clear_depth = depth != nullptr;
+  pass.clear_depth_value = 1.0f;
   cb->begin_render_pass(pass);
   for (const Draw& d : draws) {
     IBuffer* vb = device.create_buffer(d.count * sizeof(ColoredVertex) + 16, kBufferVertex);
@@ -203,18 +207,20 @@ struct Pair {
 
 // Draws the scene `build` describes with `format` targets on both devices.
 template <class Build>
-static void compare_scene(Pair& p, Format format, Vec4 clear, Build build, uint32_t tolerance, uint32_t allowed_bad, const char* what, std::vector<uint32_t>* gpu_out = nullptr) {
+static void compare_scene(Pair& p, Format format, Vec4 clear, Build build, uint32_t tolerance, uint32_t allowed_bad, const char* what, std::vector<uint32_t>* gpu_out = nullptr, bool with_depth = false) {
   Scene gs(*p.gpu), ss(p.software);
   IImage* gi = p.gpu->create_image({{kSize, kSize}, format, kImageColorAttachment | kImagePresent});
   IImage* si = p.software.create_image({{kSize, kSize}, format, kImageColorAttachment});
-  CHECK(gi && si);
+  IImage* gdepth = with_depth ? p.gpu->create_image({{kSize, kSize}, Format::D32Float, kImageDepthAttachment}) : nullptr;
+  IImage* sdepth = with_depth ? p.software.create_image({{kSize, kSize}, Format::D32Float, kImageDepthAttachment}) : nullptr;
+  CHECK(gi && si && (!with_depth || (gdepth && sdepth)));
   if (!gi || !si) return;
   std::vector<Draw> gd, sd;
   build(gs, gd);
   build(ss, sd);
   const int jobs_before = p.rig.gpu.jobs;
-  CHECK(render(*p.gpu, gs, gi, clear, gd));
-  CHECK(render(p.software, ss, si, clear, sd));
+  CHECK(render(*p.gpu, gs, gi, clear, gd, true, gdepth));
+  CHECK(render(p.software, ss, si, clear, sd, true, sdepth));
   CHECK(p.rig.gpu.jobs > jobs_before && p.rig.gpu.violations.empty());
   const std::vector<uint32_t> a = read(gi), b = read(si);
   const uint32_t bad = differing(a, b, tolerance);
@@ -225,6 +231,8 @@ static void compare_scene(Pair& p, Format format, Vec4 clear, Build build, uint3
   for (const Draw& d : sd) if (d.pipeline) p.software.destroy_pipeline(d.pipeline);
   p.gpu->destroy_image(gi);
   p.software.destroy_image(si);
+  if (gdepth) p.gpu->destroy_image(gdepth);
+  if (sdepth) p.software.destroy_image(sdepth);
 }
 
 static void test_resources() {
@@ -238,8 +246,16 @@ static void test_resources() {
   IImage* a = p.gpu->create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment});
   IImage* b = p.gpu->create_image({{33, 17}, Format::R8G8B8A8Unorm, kImageColorAttachment});
   CHECK(a && b && a->extent().width == kSize && b->format() == Format::R8G8B8A8Unorm);
-  CHECK(!p.gpu->create_image({{kSize, kSize}, Format::D32Float, kImageDepthAttachment}));
+  // Depth images are D32Float with the depth usage and nothing else; they cannot be read back.
+  IImage* depth_image = p.gpu->create_image({{kSize, kSize}, Format::D32Float, kImageDepthAttachment});
+  CHECK(depth_image && depth_image->format() == Format::D32Float);
+  std::vector<uint32_t> nothing(kSize * kSize);
+  CHECK(depth_image && !depth_image->read_pixels(ArrayView<uint32_t>(nothing.data(), nothing.size())));
+  if (depth_image) p.gpu->destroy_image(depth_image);
+  CHECK(!p.gpu->create_image({{kSize, kSize}, Format::D32Float, kImageColorAttachment}));
+  CHECK(!p.gpu->create_image({{kSize, kSize}, Format::D32Float, kImageDepthAttachment | kImagePresent}));
   CHECK(!p.gpu->create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageDepthAttachment}));
+  CHECK(!p.gpu->create_image({{kSize, kSize}, Format::B8G8R8A8Unorm, kImageDepthAttachment}));
   CHECK(!p.gpu->create_image({{0, 8}, Format::B8G8R8A8Unorm, kImageColorAttachment}));
   CHECK(!p.gpu->create_image({{4097, 8}, Format::B8G8R8A8Unorm, kImageColorAttachment}));
   CHECK(!p.gpu->create_image({{8, 8}, Format::Undefined, kImageColorAttachment}));
@@ -267,9 +283,12 @@ static void test_resources() {
   CHECK(ok);
   GraphicsPipelineDesc depth = pd;
   depth.depth_test = true;
-  CHECK(!p.gpu->create_graphics_pipeline(depth));
+  IPipeline* tested = p.gpu->create_graphics_pipeline(depth);
   depth = pd; depth.depth_write = true;
-  CHECK(!p.gpu->create_graphics_pipeline(depth));
+  IPipeline* written = p.gpu->create_graphics_pipeline(depth);
+  CHECK(tested && written);
+  p.gpu->destroy_pipeline(tested);
+  p.gpu->destroy_pipeline(written);
   GraphicsPipelineDesc wrong = pd;
   wrong.attributes[1].format = VertexFormat::Float3;
   CHECK(!p.gpu->create_graphics_pipeline(wrong));
@@ -351,6 +370,42 @@ static void test_scenes() {
     Draw a{crossing, 3}; a.mvp.m[11] = 1.0f; a.mvp.m[15] = 1.0f; a.mvp.m[0] = a.mvp.m[5] = 1.0f; a.pipeline = s.pipeline();
     d.push_back(a);
   }, 6, 450, "near plane clip");
+
+  // Depth: a near triangle drawn first and a far one after it (hidden where they overlap), then the other order, and a test without writes. Same pictures as software.
+  static const ColoredVertex near_tri[3] = {cv(-0.7f, -0.7f, 0.2f, 1, 0, 0), cv(0.5f, -0.7f, 0.2f, 1, 0, 0), cv(-0.1f, 0.6f, 0.2f, 1, 0, 0)};
+  static const ColoredVertex far_tri[3] = {cv(-0.5f, -0.5f, 0.8f, 0, 0, 1), cv(0.8f, -0.5f, 0.8f, 0, 0, 1), cv(0.2f, 0.8f, 0.8f, 0, 0, 1)};
+  for (int order = 0; order < 2; ++order)
+    compare_scene(p, Format::B8G8R8A8Unorm, gray, [&](Scene& s, std::vector<Draw>& d) {
+      Draw a{near_tri, 3}; a.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true);
+      Draw b{far_tri, 3}; b.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true);
+      if (order == 0) { d.push_back(a); d.push_back(b); } else { d.push_back(b); d.push_back(a); }
+    }, 6, 300, "depth test and write", nullptr, true);
+  compare_scene(p, Format::B8G8R8A8Unorm, gray, [&](Scene& s, std::vector<Draw>& d) {
+    Draw a{near_tri, 3}; a.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true);
+    Draw b{far_tri, 3}; b.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, false);   // tests, does not write
+    Draw c{far_tri, 3}; c.mvp = Mat4::translation(-0.2f, 0.1f, 0); c.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, false, false);   // ignores depth
+    d.push_back(a); d.push_back(b); d.push_back(c);
+  }, 6, 300, "depth test only and no test", nullptr, true);
+  // A viewport depth range (a quarter to three quarters) and a pipeline that tests with no depth image in the pass: nothing is hidden.
+  compare_scene(p, Format::B8G8R8A8Unorm, gray, [&](Scene& s, std::vector<Draw>& d) {
+    Draw a{near_tri, 3}; a.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true); a.has_viewport = true; a.viewport = {0, 0, kSize, kSize, 0.25f, 0.75f};
+    Draw b{far_tri, 3}; b.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true); b.has_viewport = true; b.viewport = {0, 0, kSize, kSize, 0.25f, 0.75f};
+    d.push_back(b); d.push_back(a);
+  }, 6, 300, "viewport depth range", nullptr, true);
+  compare_scene(p, Format::B8G8R8A8Unorm, gray, [&](Scene& s, std::vector<Draw>& d) {
+    Draw a{near_tri, 3}; a.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true);
+    Draw b{far_tri, 3}; b.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true);
+    d.push_back(a); d.push_back(b);
+  }, 6, 300, "depth test without a depth image");
+
+  // Perspective: a triangle whose vertices are at different depths under w = z + 1 (clip z = z), colours interpolated perspective-correct, as in the software device.
+  static const ColoredVertex slanted[3] = {cv(-0.8f, -0.8f, 0.1f, 1, 0, 0), cv(0.9f, -0.5f, 3.0f, 0, 1, 0), cv(-0.2f, 0.9f, 0.1f, 0, 0, 1)};
+  compare_scene(p, Format::B8G8R8A8Unorm, black, [&](Scene& s, std::vector<Draw>& d) {
+    Draw a{slanted, 3};
+    a.mvp.m[11] = 1.0f; a.mvp.m[15] = 1.0f; a.mvp.m[0] = a.mvp.m[5] = 1.0f; a.mvp.m[10] = 0.2f;   // clip z = 0.2 z, w = z + 1
+    a.pipeline = s.pipeline(CullMode::None, FrontFace::CounterClockwise, false, true, true);
+    d.push_back(a);
+  }, 12, 330, "perspective colours", nullptr, true);
 
   // Triangles behind the eye or at infinity are dropped, not drawn.
   static const ColoredVertex behind[3] = {cv(-0.5f, -0.5f, -3, 1, 1, 1), cv(0.5f, -0.5f, -3, 1, 1, 1), cv(0, 0.5f, -3, 1, 1, 1)};

@@ -6071,7 +6071,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
           t.__restore = function () { open[name] = snapshot; db.__closed = true; };
           request.transaction = t;
           db.__activeTransactions++;
-          var upgrade = new Event('upgradeneeded');
+          var upgrade = typeof g.IDBVersionChangeEvent === 'function' ? new g.IDBVersionChangeEvent('upgradeneeded', { oldVersion: old, newVersion: target }) : new Event('upgradeneeded');
           upgrade.oldVersion = old; upgrade.newVersion = target;
           request.readyState = 'done';
           request.dispatchEvent(upgrade);
@@ -11026,6 +11026,451 @@ const char kModulePrelude[] = R"JSPRELUDE((function (g) {
 }(this));
 )JSPRELUDE";
 
+
+// The last script a page's engine runs: it makes the interface objects the earlier scripts and the natives made fit together (the [[Prototype]] of a
+// constructor is the constructor of the parent interface), re-parents a few interfaces, and adds the small interfaces that are not worth a script of their own.
+const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
+  var def = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var illegal = function () { throw new TypeError('Illegal constructor'); };
+  var iface = function (name, parent) {
+    var C = function () { illegal(); };
+    Object.defineProperty(C, 'name', { value: name });
+    var P = parent ? parent.prototype : Object.prototype;
+    C.prototype = Object.create(P);
+    def(C.prototype, 'constructor', C);
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+    if (parent) Object.setPrototypeOf(C, parent);
+    def(g, name, C);
+    return C;
+  };
+  var reparent = function (child, parent) {
+    var C = g[child], P = g[parent];
+    if (typeof C !== 'function' || typeof P !== 'function' || C.prototype === P.prototype) return;   // (an alias of its parent: nothing to do)
+    Object.setPrototypeOf(C.prototype, P.prototype);
+  };
+  var getter = function (proto, name, fn) { Object.defineProperty(proto, name, { get: fn, enumerable: true, configurable: true }); };
+
+  // interfaces whose prototype is not where the standard puts it
+  reparent('Attr', 'Node'); reparent('CompositionEvent', 'UIEvent'); reparent('PromiseRejectionEvent', 'Event');
+  reparent('MediaQueryList', 'EventTarget'); reparent('OffscreenCanvas', 'EventTarget');
+
+  // AbstractRange (the parent of Range and StaticRange)
+  var AbstractRange = iface('AbstractRange');
+  if (typeof g.Range === 'function') { Object.setPrototypeOf(g.Range.prototype, AbstractRange.prototype); }
+  var staticRanges = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function StaticRange(init) {
+    if (!(this instanceof StaticRange)) throw new TypeError("Failed to construct 'StaticRange': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (init === null || typeof init !== 'object') throw new TypeError("Failed to construct 'StaticRange': 1 argument required, but only 0 present.");
+    ['startContainer', 'startOffset', 'endContainer', 'endOffset'].forEach(function (k) {
+      if (init[k] === undefined) throw new TypeError("Failed to construct 'StaticRange': The required member " + k + ' is undefined.');
+    });
+    [init.startContainer, init.endContainer].forEach(function (n) {
+      if (!n || typeof n.nodeType !== 'number') throw new TypeError("Failed to construct 'StaticRange': The provided value is not of type 'Node'.");
+      if (n.nodeType === 10 || n.nodeType === 2) throw new DOMException("Failed to construct 'StaticRange': The node provided is a DocumentType or Attr.", 'InvalidNodeTypeError');
+    });
+    staticRanges.set(this, { sc: init.startContainer, so: init.startOffset >>> 0, ec: init.endContainer, eo: init.endOffset >>> 0 });
+  }
+  StaticRange.prototype = Object.create(AbstractRange.prototype);
+  def(StaticRange.prototype, 'constructor', StaticRange);
+  Object.setPrototypeOf(StaticRange, AbstractRange);
+  Object.defineProperty(StaticRange.prototype, Symbol.toStringTag, { value: 'StaticRange', configurable: true });
+  [['startContainer', 'sc'], ['startOffset', 'so'], ['endContainer', 'ec'], ['endOffset', 'eo']].forEach(function (p) {
+    getter(StaticRange.prototype, p[0], function () { var s = staticRanges.get(this); if (!s) throw new TypeError('Illegal invocation'); return s[p[1]]; });
+  });
+  getter(StaticRange.prototype, 'collapsed', function () { var s = staticRanges.get(this); if (!s) throw new TypeError('Illegal invocation'); return s.sc === s.ec && s.so === s.eo; });
+  if (staticRanges) def(g, 'StaticRange', StaticRange);
+
+  // CSSConditionRule
+  if (typeof g.CSSGroupingRule === 'function') {
+    var CSSConditionRule = iface('CSSConditionRule', g.CSSGroupingRule);
+    ['CSSMediaRule', 'CSSSupportsRule', 'CSSContainerRule'].forEach(function (n) { if (typeof g[n] === 'function') { Object.setPrototypeOf(g[n].prototype, CSSConditionRule.prototype); Object.setPrototypeOf(g[n], CSSConditionRule); } });
+  }
+
+  // NodeFilter is an interface object (a function with the constants)
+  if (typeof g.NodeFilter === 'object' && g.NodeFilter !== null) {
+    var old = g.NodeFilter, NodeFilter = function () { illegal(); };
+    Object.defineProperty(NodeFilter, 'name', { value: 'NodeFilter' });
+    Object.keys(old).forEach(function (k) { Object.defineProperty(NodeFilter, k, { value: old[k], enumerable: true }); });
+    NodeFilter.prototype = Object.create(Object.prototype);
+    def(NodeFilter.prototype, 'constructor', NodeFilter);
+    def(g, 'NodeFilter', NodeFilter);
+  }
+
+  // document.implementation is a DOMImplementation
+  (function () {
+    var impl = document.implementation;
+    if (!impl || Object.getPrototypeOf(impl) !== Object.prototype) return;
+    var DOMImplementation = iface('DOMImplementation');
+    Object.getOwnPropertyNames(impl).forEach(function (k) {
+      var d = Object.getOwnPropertyDescriptor(impl, k);
+      if (typeof d.value === 'function') { def(DOMImplementation.prototype, k, d.value); delete impl[k]; }
+    });
+    Object.setPrototypeOf(impl, DOMImplementation.prototype);
+  }());
+
+  if (typeof g.XMLDocument === 'function' && typeof g.Document === 'function' && Object.getPrototypeOf(g.XMLDocument) === g.HTMLDocument) { Object.setPrototypeOf(g.XMLDocument, g.Document); Object.setPrototypeOf(g.XMLDocument.prototype, g.Document.prototype); }
+
+  // events that carry values from devices a page may not have
+  function eventClass(name, fields, Parent) {
+    Parent = Parent || Event;
+    var E = function (type, init) {
+      if (!(this instanceof E)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+      if (arguments.length < 1) throw new TypeError("Failed to construct '" + name + "': 1 argument required, but only 0 present.");
+      var e = Reflect.construct(Parent, [type, init], E);
+      init = init || {};
+      fields.forEach(function (f) { Object.defineProperty(e, f[0], { value: init[f[0]] === undefined ? f[1] : init[f[0]], enumerable: true, configurable: true }); });
+      return e;
+    };
+    Object.defineProperty(E, 'name', { value: name });
+    E.prototype = Object.create(Parent.prototype);
+    def(E.prototype, 'constructor', E);
+    Object.setPrototypeOf(E, Parent);
+    def(g, name, E);
+    return E;
+  }
+  if (typeof g.UIEvent === 'function' && (!g.CompositionEvent || g.CompositionEvent.prototype === g.UIEvent.prototype)) eventClass('CompositionEvent', [['data', '']], g.UIEvent);
+  eventClass('IDBVersionChangeEvent', [['oldVersion', 0], ['newVersion', null]]);
+  eventClass('DeviceOrientationEvent', [['alpha', null], ['beta', null], ['gamma', null], ['absolute', false]]);
+  eventClass('DeviceMotionEvent', [['acceleration', null], ['accelerationIncludingGravity', null], ['rotationRate', null], ['interval', 0]]);
+
+  // EventSource (server-sent events) over fetch()
+  var CONNECTING = 0, OPEN = 1, CLOSED = 2;
+  function EventSource(url, init) {
+    if (!(this instanceof EventSource)) throw new TypeError("Failed to construct 'EventSource': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'EventSource': 1 argument required, but only 0 present.");
+    var address;
+    try { address = new URL(String(url), document.baseURI || location.href); } catch (e) { throw new DOMException("Failed to construct 'EventSource': Cannot parse url '" + url + "'", 'SyntaxError'); }
+    EventTarget.call(this);
+    var self = this, credentials = !!(init && init.withCredentials);
+    var state = { readyState: CONNECTING, lastId: '', retry: 3000, timer: 0, generation: 0 };
+    ['onopen', 'onmessage', 'onerror'].forEach(function (k) { Object.defineProperty(self, k, { value: null, writable: true, enumerable: true, configurable: true }); });
+    Object.defineProperty(this, '__es', { value: state });
+    Object.defineProperty(this, 'url', { value: address.href, enumerable: true });
+    Object.defineProperty(this, 'withCredentials', { value: credentials, enumerable: true });
+    Object.defineProperty(this, 'readyState', { get: function () { return state.readyState; }, enumerable: true, configurable: true });
+    var fire = function (type, data) {
+      var ev = data === undefined ? new Event(type) : new MessageEvent(type, { data: data.data, origin: address.origin, lastEventId: data.id });
+      var handler = self['on' + type];
+      if (typeof handler === 'function' && (type === 'open' || type === 'message' || type === 'error')) { try { handler.call(self, ev); } catch (e) { } }
+      self.dispatchEvent(ev);
+    };
+    var reconnect = function (generation) {
+      if (state.readyState === CLOSED || generation !== state.generation) return;
+      state.readyState = CONNECTING;
+      fire('error');
+      state.timer = setTimeout(function () { connect(generation); }, state.retry);
+    };
+    var fail = function () { state.readyState = CLOSED; fire('error'); };
+    var connect = function (generation) {
+      if (state.readyState === CLOSED || generation !== state.generation) return;
+      var headers = { Accept: 'text/event-stream', 'Cache-Control': 'no-store' };
+      if (state.lastId !== '') headers['Last-Event-ID'] = state.lastId;
+      fetch(address.href, { headers: headers, credentials: credentials ? 'include' : 'same-origin', cache: 'no-store' }).then(function (r) {
+        if (state.readyState === CLOSED || generation !== state.generation) return;
+        var type = String(r.headers.get('content-type') || '').split(';')[0].replace(/\s+/g, '').toLowerCase();
+        if (r.status === 204 || r.status === 286 || r.status !== 200 || type !== 'text/event-stream') { fail(); return; }
+        state.readyState = OPEN;
+        fire('open');
+        var buffer = '', data = '', eventType = '', id = state.lastId, first = true;
+        var line = function (l) {
+          if (l === '') {
+            state.lastId = id;
+            if (data !== '') {
+              if (data.charAt(data.length - 1) === '\n') data = data.slice(0, -1);
+              if (state.readyState !== CLOSED) fire(eventType || 'message', { data: data, id: state.lastId });
+            }
+            data = ''; eventType = '';
+            return;
+          }
+          if (l.charAt(0) === ':') return;
+          var colon = l.indexOf(':'), field = colon < 0 ? l : l.slice(0, colon), value = colon < 0 ? '' : l.slice(colon + 1);
+          if (value.charAt(0) === ' ') value = value.slice(1);
+          if (field === 'data') data += value + '\n';
+          else if (field === 'event') eventType = value;
+          else if (field === 'id') { if (value.indexOf('\0') < 0) id = value; }
+          else if (field === 'retry' && /^[0-9]+$/.test(value)) state.retry = +value;
+        };
+        var feed = function (chunk, final) {
+          if (first) { if (chunk.charCodeAt(0) === 0xFEFF) chunk = chunk.slice(1); first = false; }
+          buffer += chunk;
+          var parts = buffer.split(/\r\n|\n|\r/);
+          buffer = final ? '' : parts.pop();
+          if (final && parts.length && parts[parts.length - 1] === '') parts.pop();
+          parts.forEach(line);
+        };
+        if (r.body && typeof r.body.getReader === 'function') {
+          var reader = r.body.getReader(), decoder = new TextDecoder();
+          var pump = function () {
+            reader.read().then(function (step) {
+              if (generation !== state.generation || state.readyState === CLOSED) { try { reader.cancel(); } catch (e) { } return; }
+              if (step.done) { feed(decoder.decode(), true); reconnect(generation); return; }
+              feed(decoder.decode(step.value, { stream: true }), false);
+              pump();
+            }, function () { reconnect(generation); });
+          };
+          pump();
+        } else {
+          r.text().then(function (text) { feed(text, true); reconnect(generation); }, function () { reconnect(generation); });
+        }
+      }, function () { reconnect(generation); });
+    };
+    setTimeout(function () { connect(state.generation); }, 0);
+  }
+  EventSource.prototype = Object.create(EventTarget.prototype);
+  def(EventSource.prototype, 'constructor', EventSource);
+  def(EventSource.prototype, 'close', function () { var s = this.__es; if (!s) throw new TypeError('Illegal invocation'); s.readyState = CLOSED; s.generation++; clearTimeout(s.timer); });
+  [['CONNECTING', 0], ['OPEN', 1], ['CLOSED', 2]].forEach(function (c) {
+    Object.defineProperty(EventSource, c[0], { value: c[1], enumerable: true });
+    Object.defineProperty(EventSource.prototype, c[0], { value: c[1], enumerable: true });
+  });
+  Object.defineProperty(EventSource.prototype, Symbol.toStringTag, { value: 'EventSource', configurable: true });
+  Object.setPrototypeOf(EventSource, EventTarget);
+  def(g, 'EventSource', EventSource);
+
+  // Constants of the interfaces (on the constructor and on the prototype)
+  var constants = function (C, table) {
+    if (typeof C !== 'function') return;
+    Object.keys(table).forEach(function (k) {
+      if (!(k in C)) Object.defineProperty(C, k, { value: table[k], enumerable: true });
+      if (!(k in C.prototype)) Object.defineProperty(C.prototype, k, { value: table[k], enumerable: true });
+    });
+  };
+  constants(g.WheelEvent, { DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
+  constants(g.KeyboardEvent, { DOM_KEY_LOCATION_STANDARD: 0, DOM_KEY_LOCATION_LEFT: 1, DOM_KEY_LOCATION_RIGHT: 2, DOM_KEY_LOCATION_NUMPAD: 3 });
+  constants(g.DOMException, { INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3, WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
+    NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9, INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12, INVALID_MODIFICATION_ERR: 13,
+    NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15, VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19, ABORT_ERR: 20, URL_MISMATCH_ERR: 21,
+    QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24, DATA_CLONE_ERR: 25 });
+
+  // The attributes of the interfaces. The engine keeps most of them on the objects themselves (or answers them from the host); the standard has them as accessors on the
+  // prototype, so a page that asks `'nodeType' in Node.prototype` is told yes. A read that reaches one of these is of an attribute the object does not have: undefined;
+  // a write makes the object's own property, as before.
+  var attributes = {
+    Node: 'nodeType nodeName baseURI isConnected ownerDocument parentNode parentElement childNodes firstChild lastChild previousSibling nextSibling nodeValue textContent',
+    Element: 'tagName id className classList attributes innerHTML outerHTML shadowRoot slot scrollTop scrollLeft scrollWidth scrollHeight clientWidth clientHeight children firstElementChild lastElementChild childElementCount previousElementSibling nextElementSibling namespaceURI prefix localName',
+    Attr: 'name value ownerElement namespaceURI prefix localName specified',
+    CharacterData: 'data length previousElementSibling nextElementSibling',
+    Text: 'wholeText',
+    ProcessingInstruction: 'target sheet',
+    DocumentFragment: 'children',
+    ShadowRoot: 'mode host delegatesFocus slotAssignment activeElement',
+    Document: 'implementation URL documentURI compatMode characterSet charset inputEncoding contentType doctype documentElement title head body forms images links scripts anchors embeds cookie domain referrer lastModified readyState location defaultView hidden visibilityState activeElement designMode dir currentScript fonts timeline children onreadystatechange onvisibilitychange onselectionchange rootElement captureEvents releaseEvents',
+    Range: 'commonAncestorContainer',
+    Selection: 'anchorNode focusNode rangeCount isCollapsed type direction',
+    TreeWalker: 'root whatToShow filter currentNode',
+    NodeIterator: 'root referenceNode pointerBeforeReference whatToShow filter',
+    NodeList: 'length',
+    HTMLCollection: 'length',
+    HTMLAllCollection: 'length',
+    NamedNodeMap: 'length',
+    DOMTokenList: 'length value',
+    MutationRecord: 'type target addedNodes removedNodes previousSibling nextSibling attributeName attributeNamespace oldValue',
+    Event: 'type target currentTarget eventPhase bubbles cancelable defaultPrevented composed isTrusted timeStamp srcElement returnValue',
+    CustomEvent: 'detail',
+    UIEvent: 'view detail which',
+    MouseEvent: 'screenX screenY clientX clientY pageX pageY offsetX offsetY x y movementX movementY ctrlKey shiftKey altKey metaKey button buttons relatedTarget',
+    PointerEvent: 'pointerId width height pressure tiltX tiltY pointerType isPrimary',
+    WheelEvent: 'deltaX deltaY deltaZ deltaMode',
+    KeyboardEvent: 'key code location repeat isComposing ctrlKey keyCode charCode',
+    InputEvent: 'data isComposing inputType dataTransfer',
+    CompositionEvent: 'data',
+    FocusEvent: 'relatedTarget',
+    TouchEvent: 'touches targetTouches changedTouches',
+    DragEvent: 'dataTransfer',
+    ClipboardEvent: 'clipboardData',
+    ErrorEvent: 'message filename lineno colno error',
+    PromiseRejectionEvent: 'promise reason',
+    MessageEvent: 'data origin lastEventId source ports',
+    CloseEvent: 'wasClean code reason',
+    ProgressEvent: 'lengthComputable loaded total',
+    StorageEvent: 'key oldValue newValue url storageArea',
+    HashChangeEvent: 'oldURL newURL',
+    PopStateEvent: 'state hasUIVisibilityTransition',
+    PageTransitionEvent: 'persisted',
+    BeforeUnloadEvent: 'returnValue',
+    SubmitEvent: 'submitter',
+    FormDataEvent: 'formData',
+    TransitionEvent: 'propertyName elapsedTime pseudoElement',
+    AnimationEvent: 'animationName elapsedTime pseudoElement',
+    ToggleEvent: 'oldState newState',
+    SecurityPolicyViolationEvent: 'blockedURI violatedDirective',
+    AbortController: 'signal',
+    AbortSignal: 'aborted reason onabort',
+    DOMException: 'code',
+    Blob: 'size type',
+    File: 'name lastModified',
+    FileList: 'length',
+    FileReader: 'readyState result error',
+    URL: 'href origin protocol username password host hostname port pathname search searchParams hash',
+    URLSearchParams: 'size',
+    WebSocket: 'url readyState bufferedAmount extensions protocol binaryType onopen onmessage onclose onerror',
+    EventSource: 'url withCredentials readyState onopen onmessage onerror',
+    MessageChannel: 'port1 port2',
+    MessagePort: 'onmessage onmessageerror',
+    BroadcastChannel: 'name onmessage',
+    Worker: 'onmessage onerror onmessageerror',
+    SharedWorker: 'port onerror',
+    ServiceWorkerContainer: 'oncontrollerchange',
+    Storage: 'length',
+    IDBDatabase: 'name version objectStoreNames',
+    IDBObjectStore: 'name keyPath indexNames transaction autoIncrement',
+    IDBIndex: 'name objectStore keyPath multiEntry unique',
+    IDBTransaction: 'objectStoreNames mode durability db error',
+    IDBRequest: 'result error source transaction readyState',
+    IDBOpenDBRequest: 'onblocked onupgradeneeded',
+    IDBKeyRange: 'lower upper lowerOpen upperOpen',
+    IDBCursor: 'source direction key primaryKey request',
+    IDBCursorWithValue: 'value',
+    IDBVersionChangeEvent: 'oldVersion newVersion',
+    PerformanceEntry: 'name entryType startTime duration',
+    PerformanceMark: 'detail',
+    PerformanceMeasure: 'detail',
+    PerformanceNavigationTiming: 'type redirectCount domComplete loadEventEnd',
+    PerformanceResourceTiming: 'initiatorType transferSize encodedBodySize decodedBodySize responseEnd',
+    TextEncoder: 'encoding',
+    TextDecoder: 'encoding fatal ignoreBOM',
+    ByteLengthQueuingStrategy: 'highWaterMark',
+    CountQueuingStrategy: 'highWaterMark',
+    Navigator: 'userAgent platform language languages onLine cookieEnabled hardwareConcurrency maxTouchPoints webdriver vendor appName appVersion product userAgentData clipboard serviceWorker mediaDevices permissions geolocation storage vibrate getGamepads locks credentials mediaSession wakeLock javaEnabled pdfViewerEnabled registerProtocolHandler deviceMemory connection',
+    DataTransfer: 'dropEffect effectAllowed',
+    DataTransferItem: 'kind type',
+    PermissionStatus: 'state name onchange',
+    Location: 'href origin protocol host hostname port pathname search hash ancestorOrigins',
+    History: 'length scrollRestoration state',
+    Screen: 'width height availWidth availHeight colorDepth pixelDepth orientation availLeft availTop',
+    ScreenOrientation: 'type angle',
+    HTMLElement: 'title lang dir hidden accessKey draggable spellcheck innerText outerText contentEditable isContentEditable enterKeyHint inputMode tabIndex dataset style nonce autofocus offsetParent offsetTop offsetLeft offsetWidth offsetHeight',
+    HTMLAnchorElement: 'href target download ping rel hreflang type text referrerPolicy charset coords name rev shape',
+    HTMLAreaElement: 'alt coords shape href target download rel',
+    HTMLBaseElement: 'href target',
+    HTMLBodyElement: 'text link vLink aLink bgColor background onhashchange',
+    HTMLBRElement: 'clear',
+    HTMLButtonElement: 'disabled form formAction formEnctype formMethod formNoValidate formTarget name type value labels willValidate validity validationMessage popoverTargetAction',
+    HTMLCanvasElement: 'width height',
+    HTMLDataElement: 'value',
+    HTMLDataListElement: 'options',
+    HTMLDetailsElement: 'open name',
+    HTMLDialogElement: 'open returnValue closedBy',
+    HTMLDirectoryElement: 'compact',
+    HTMLDivElement: 'align',
+    HTMLDListElement: 'compact',
+    HTMLEmbedElement: 'src type width height',
+    HTMLFieldSetElement: 'disabled form name type elements willValidate validity',
+    HTMLFontElement: 'color face size',
+    HTMLFormElement: 'acceptCharset action autocomplete enctype encoding method name noValidate target rel elements length',
+    HTMLFrameElement: 'name scrolling src frameBorder contentDocument contentWindow',
+    HTMLFrameSetElement: 'cols rows',
+    HTMLHeadingElement: 'align',
+    HTMLHRElement: 'align color noShade size width',
+    HTMLHtmlElement: 'version',
+    HTMLIFrameElement: 'src srcdoc name allow allowFullscreen width height referrerPolicy loading contentDocument contentWindow align scrolling frameBorder',
+    HTMLImageElement: 'alt src srcset sizes crossOrigin useMap isMap width height naturalWidth naturalHeight complete currentSrc referrerPolicy decoding loading fetchPriority x y name lowsrc align hspace vspace longDesc border',
+    HTMLInputElement: 'accept alt autocomplete defaultChecked checked dirName disabled form files formAction height indeterminate list max maxLength min minLength multiple name pattern placeholder readOnly required size src step type defaultValue value valueAsDate valueAsNumber width willValidate validity validationMessage labels selectionStart selectionEnd selectionDirection capture webkitdirectory',
+    HTMLLabelElement: 'form htmlFor control',
+    HTMLLegendElement: 'form align',
+    HTMLLIElement: 'value type',
+    HTMLLinkElement: 'href crossOrigin rel media hreflang type as sizes imageSrcset integrity referrerPolicy disabled sheet blocking fetchPriority',
+    HTMLMapElement: 'name areas',
+    HTMLMarqueeElement: 'behavior direction scrollAmount',
+    HTMLMediaElement: 'error src srcObject currentSrc crossOrigin networkState preload buffered readyState seeking currentTime duration paused defaultPlaybackRate playbackRate preservesPitch played seekable ended autoplay loop controls volume muted defaultMuted audioTracks videoTracks textTracks setSinkId',
+    HTMLMenuElement: 'compact',
+    HTMLMetaElement: 'name httpEquiv content media scheme',
+    HTMLMeterElement: 'value min max low high optimum labels',
+    HTMLModElement: 'cite dateTime',
+    HTMLObjectElement: 'data type name form width height contentDocument contentWindow validity',
+    HTMLOListElement: 'reversed start type compact',
+    HTMLOptGroupElement: 'disabled label',
+    HTMLOptionElement: 'disabled form label defaultSelected selected value text index',
+    HTMLOutputElement: 'form name type defaultValue value labels validity',
+    HTMLParagraphElement: 'align',
+    HTMLParamElement: 'name value type valueType',
+    HTMLPreElement: 'width',
+    HTMLProgressElement: 'value max position labels',
+    HTMLQuoteElement: 'cite',
+    HTMLScriptElement: 'src type async defer crossOrigin text integrity referrerPolicy blocking fetchPriority charset event htmlFor',
+    HTMLSelectElement: 'autocomplete disabled form multiple name required size type options length selectedOptions selectedIndex value labels validity',
+    HTMLSlotElement: 'name',
+    HTMLSourceElement: 'src type srcset sizes media width height',
+    HTMLStyleElement: 'media type sheet disabled blocking',
+    HTMLTableCaptionElement: 'align',
+    HTMLTableCellElement: 'colSpan rowSpan headers scope abbr align axis bgColor ch chOff height noWrap vAlign width',
+    HTMLTableColElement: 'span align ch chOff vAlign width',
+    HTMLTableElement: 'rows align border bgColor cellPadding cellSpacing frame rules summary width',
+    HTMLTableRowElement: 'cells align bgColor ch chOff vAlign',
+    HTMLTableSectionElement: 'align ch chOff vAlign',
+    HTMLTemplateElement: 'content shadowRootMode',
+    HTMLTextAreaElement: 'autocomplete cols dirName disabled form maxLength minLength name placeholder readOnly required rows wrap type defaultValue value textLength labels selectionStart selectionEnd selectionDirection validity',
+    HTMLTimeElement: 'dateTime',
+    HTMLTitleElement: 'text',
+    HTMLTrackElement: 'kind src srclang label default readyState track',
+    HTMLUListElement: 'compact type',
+    HTMLVideoElement: 'width height videoWidth videoHeight poster playsInline',
+    SVGElement: 'ownerSVGElement viewportElement className style dataset tabIndex',
+    CSSStyleDeclaration: 'cssText length parentRule cssFloat',
+    CSSRuleList: 'length',
+    CSSContainerRule: 'containerQuery',
+    MediaQueryList: 'media matches onchange',
+    MediaQueryListEvent: 'media matches',
+    CanvasRenderingContext2D: 'canvas globalAlpha globalCompositeOperation imageSmoothingEnabled strokeStyle fillStyle shadowBlur shadowColor shadowOffsetX filter lineWidth lineCap lineJoin miterLimit lineDashOffset font textAlign textBaseline direction letterSpacing fontKerning getContextAttributes drawFocusIfNeeded',
+    OffscreenCanvas: 'width height',
+    TextMetrics: 'width actualBoundingBoxLeft actualBoundingBoxRight fontBoundingBoxAscent actualBoundingBoxAscent',
+    ImageData: 'width height data colorSpace',
+    ImageBitmap: 'width height',
+    WebGLRenderingContext: 'canvas',
+    GPUAdapter: 'features limits info',
+    GPUDevice: 'features limits queue lost',
+    GPUCanvasContext: 'canvas',
+    TimeRanges: 'length',
+    MediaKeySystemAccess: 'keySystem',
+    RTCPeerConnection: 'ondatachannel onicecandidate',
+    RTCDataChannel: 'onopen onmessage',
+    RTCSessionDescription: 'type sdp',
+    RTCIceCandidate: 'candidate sdpMid sdpMLineIndex',
+    Notification: 'title body icon tag onclick',
+    Lock: 'name mode',
+    Gamepad: 'id index connected mapping axes buttons timestamp vibrationActuator',
+    SpeechSynthesisUtterance: 'text lang voice volume rate pitch',
+    DeviceOrientationEvent: 'alpha beta gamma absolute',
+    DeviceMotionEvent: 'acceleration interval'
+  };
+  Object.keys(attributes).forEach(function (name) {
+    var C = g[name];
+    if (typeof C !== 'function' || C.prototype === null || typeof C.prototype !== 'object') return;
+    var proto = C.prototype;
+    attributes[name].split(' ').forEach(function (n) {
+      if (n in proto) return;
+      Object.defineProperty(proto, n, {
+        get: function () { if (this === proto) throw new TypeError('Illegal invocation'); return undefined; },
+        set: function (v) { if (this === proto) throw new TypeError('Illegal invocation'); Object.defineProperty(this, n, { value: v, writable: true, enumerable: true, configurable: true }); },
+        enumerable: false, configurable: true });
+    });
+  });
+
+  // the constructor property of a prototype names its interface (Image, Option and Audio share the prototype of the element interface they make)
+  Object.getOwnPropertyNames(g).forEach(function (name) {
+    var C = g[name];
+    if (typeof C !== 'function' || name === 'Image' || name === 'Option' || name === 'Audio' || name === 'HTMLDocument') return;
+    var proto = C.prototype;
+    if (proto === null || typeof proto !== 'object' || proto === Object.prototype || proto === Function.prototype) return;
+    if (proto.constructor !== C && /^[A-Z]/.test(name) && (C.name === name || C.name === '' || proto.constructor === Object)) {
+      try { Object.defineProperty(proto, 'constructor', { value: C, writable: true, configurable: true }); } catch (e) { }
+    }
+  });
+
+  // the constructor of an interface inherits from the constructor of its parent: made for every built-in interface whose prototype chain says so
+  Object.getOwnPropertyNames(g).forEach(function (name) {
+    var C = g[name];
+    if (typeof C !== 'function' || Object.getPrototypeOf(C) !== Function.prototype) return;
+    var proto = C.prototype;
+    if (proto === null || typeof proto !== 'object') return;
+    var parent = Object.getPrototypeOf(proto);
+    if (!parent || parent === Object.prototype) return;
+    var P = parent.constructor;
+    if (typeof P === 'function' && P !== C && P.prototype === parent) Object.setPrototypeOf(C, P);
+  });
+}(this));
+)JSPRELUDE";
+
 }  // namespace
 
 const char* web_prelude() { return kPrelude; }
@@ -11033,5 +11478,6 @@ const char* worker_prelude() { return kWorkerPrelude; }
 const char* dom_prelude() { return kDomPrelude; }
 const char* web_assembly_prelude() { return kWebAssemblyPrelude; }
 const char* module_prelude() { return kModulePrelude; }
+const char* finish_prelude() { return kFinishPrelude; }
 
 }  // namespace browser

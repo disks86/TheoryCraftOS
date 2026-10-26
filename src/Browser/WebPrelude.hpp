@@ -33,6 +33,8 @@ const char* dom_prelude();
 const char* web_assembly_prelude();
 // ES modules (import(), the module loader, import maps) and the running of <script> elements put in the document by scripts, over __compile_module. Run by a page's engine.
 const char* module_prelude();
+// The last script a page's engine runs: constructor chains of the interfaces, AbstractRange / StaticRange, EventSource, the device events, DOMImplementation.
+const char* finish_prelude();
 // WebGLRenderingContext and WebGL2RenderingContext over the natives of DomBindingsGl.cpp. Run by a page's engine.
 const char* webgl_prelude();
 // navigator.gpu and the WebGPU interfaces over the natives of DomBindingsGpu.cpp. Run by a page's engine.

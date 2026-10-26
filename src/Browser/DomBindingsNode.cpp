@@ -1807,7 +1807,8 @@ bool install_nodes(DomBindings::Impl& c) {
         {"HTMLSlotElement", "slot"}, {"HTMLSourceElement", "source"}, {"HTMLSpanElement", "span"}, {"HTMLStyleElement", "style"}, {"HTMLTableCaptionElement", "caption"},
         {"HTMLTableCellElement", "td th"}, {"HTMLTableColElement", "col colgroup"}, {"HTMLTableElement", "table"}, {"HTMLTableRowElement", "tr"},
         {"HTMLTableSectionElement", "tbody thead tfoot"}, {"HTMLTemplateElement", "template"}, {"HTMLTextAreaElement", "textarea"}, {"HTMLTimeElement", "time"},
-        {"HTMLTitleElement", "title"}, {"HTMLTrackElement", "track"}, {"HTMLUListElement", "ul"}};
+        {"HTMLTitleElement", "title"}, {"HTMLTrackElement", "track"}, {"HTMLUListElement", "ul"}, {"HTMLDirectoryElement", "dir"}, {"HTMLFontElement", "font"},
+        {"HTMLFrameElement", "frame"}, {"HTMLFrameSetElement", "frameset"}, {"HTMLMarqueeElement", "marquee"}};
     c.tag_protos = vm.new_plain();
     vm.define_named(g, "__tag_protos", Value::make_object(c.tag_protos), 0);   // (kept alive; also what the page cannot overwrite)
     JsObject* media = vm.new_object(c.html_proto);

@@ -34,8 +34,9 @@ namespace graphics {
 // vertex layout of a float3 at location 0 and a float4 at location 1 and the MVP matrix as the first 64 bytes of the push constants. Any other pipeline is refused by
 // create_graphics_pipeline() (nullptr), so a caller can fall back to the software device. The engine has no vertex shader in these jobs: the CPU transforms the vertices,
 // clips the triangles (near plane and a guard band), applies the viewport, culls, and hands the engine window-space triangles; the engine interpolates the colour and
-// blends. Differences from the software device: colour is interpolated linearly in screen space (not perspective-correct), there is no depth buffer (depth images and
-// pipelines that test or write depth are refused), and only B8G8R8A8 and R8G8B8A8 images up to 4096 x 4096 exist.
+// blends, tests depth and interpolates the colour perspective-correct from the 1/w the vertices carry. Only B8G8R8A8 and R8G8B8A8 colour images and D32Float depth images
+// up to 4096 x 4096 exist (a depth image is Y-tiled hardware memory: it cannot be read back). A render pass clears depth with a job that draws the clear value and passes
+// every pixel. Not done: stencil, textures, and anything the built-in coloured pipeline does not do.
 // Nothing here has run on a real GPU (see docs/DellXps9575.md).
 class Gen9GraphicsDevice final : public IGraphicsDevice {
  public:

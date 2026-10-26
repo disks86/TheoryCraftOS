@@ -284,9 +284,14 @@ static void test_builder_arguments() {
   CHECK(b.triangles(draw, ArrayView<const Vertex>(tri, 3), false, c));
   CHECK(!b.triangles(draw, ArrayView<const Vertex>(tri, 2), false, c));
   CHECK(!b.triangles(draw, ArrayView<const Vertex>(), false, c));
+  // The fourth component is 1/w: any positive finite number is a vertex, zero, negative and not-a-number are not.
   Vertex w2[3] = {tri[0], tri[1], tri[2]};
   w2[1].position[3] = 2.0f;
-  CHECK(!b.triangles(draw, ArrayView<const Vertex>(w2, 3), false, c));
+  CHECK(b.triangles(draw, ArrayView<const Vertex>(w2, 3), false, c));
+  for (const float bad_w : {0.0f, -1.0f, nan, 1.0e31f}) {
+    w2[1].position[3] = bad_w;
+    CHECK(!b.triangles(draw, ArrayView<const Vertex>(w2, 3), false, c));
+  }
   Vertex far[3] = {tri[0], tri[1], tri[2]};
   far[2].position[0] = 1.0e9f;
   CHECK(!b.triangles(draw, ArrayView<const Vertex>(far, 3), false, c));
@@ -300,6 +305,57 @@ static void test_builder_arguments() {
   CHECK(b.dwords() <= image.size());
   std::vector<Vertex> too_many(most + 3, tri[0]);
   CHECK(!b.triangles(draw, ArrayView<const Vertex>(too_many.data(), too_many.size()), true, nullptr));
+  // Depth: a buffer the size of the target, aligned; the clear value 0 to 1.
+  DrawState deep = draw;
+  deep.depth = {0x400000, 16, 16};
+  CHECK(deep.depth.valid() && DepthBuffer::pitch_for(16) == 128 && DepthBuffer::bytes_for(16, 16) == 128 * 32 && DepthBuffer::pitch_for(33) == 256);
+  CHECK(b.clear_depth(deep, 0.5f) && b.dwords() > kStateOffset / 4);
+  CHECK(b.clear_depth(deep, 0.0f) && b.clear_depth(deep, 1.0f));
+  CHECK(!b.clear_depth(deep, 1.5f) && !b.clear_depth(deep, -0.1f) && !b.clear_depth(deep, nan) && !b.clear_depth(draw, 0.5f));   // (no buffer attached)
+  DrawState bad_depth = deep;
+  bad_depth.depth.width = 15;
+  CHECK(bad_depth.depth.valid() && !b.clear_depth(bad_depth, 0.5f) && !b.triangles(bad_depth, ArrayView<const Vertex>(tri, 3), false, c) && !b.fill_rect(bad_depth, {0, 0, 4, 4}, c));   // (a valid buffer of another size than the target)
+  bad_depth = deep;
+  bad_depth.depth.gpu_address = 0x400010;
+  CHECK(!bad_depth.depth.valid() && !b.clear_depth(bad_depth, 0.5f));   // (not 4 KiB aligned)
+  bad_depth.depth.gpu_address = 0;
+  CHECK(!b.clear_depth(bad_depth, 0.5f));
+  deep.depth_test = deep.depth_write = true;
+  CHECK(b.triangles(deep, ArrayView<const Vertex>(tri, 3), false, c));
+  // The fields of the depth buffer packet and the depth state.
+  {
+    const std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    Decoded d(job);
+    const uint32_t db = d.one(kDepthBuffer), ds = d.one(kWmDepthStencil);
+    CHECK(db != 0xFFFFFFFFu && ds != 0xFFFFFFFFu);
+    if (db != 0xFFFFFFFFu && ds != 0xFFFFFFFFu) {
+      CHECK(job[db + 1] == (127u | (1u << 18) | (1u << 28) | (1u << 29)));           // pitch less one, D32_FLOAT, write, 2D
+      CHECK(job[db + 2] == 0x400000 && job[db + 3] == 0 && job[db + 4] == ((15u << 4) | (15u << 18)) && job[db + 7] == 4);
+      CHECK(job[ds + 1] == (1u | (1u << 1) | (3u << 5)));                              // write, test, less or equal
+    }
+  }
+  CHECK(b.clear_depth(deep, 0.25f));
+  {
+    const std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    Decoded d(job);
+    const uint32_t ds = d.one(kWmDepthStencil), vb = d.one(kVertexBuffers);
+    CHECK(ds != 0xFFFFFFFFu && job[ds + 1] == (1u | (1u << 1) | (7u << 5)));          // a clear: write, test, always
+    // The vertices carry the clear depth, and the colour write is masked off in every blend state entry.
+    const uint32_t base = VcsDriver::kBatchGpuAddress, at = (job[vb + 2] - base) / 4;
+    CHECK(as_float(image[at + 2]) == 0.25f && as_float(image[at + 8 + 2]) == 0.25f && as_float(image[at + 16 + 2]) == 0.25f);
+    const uint32_t bs = d.one(kBlendStatePointers);
+    CHECK(bs != 0xFFFFFFFFu && (image[(job[bs + 1] & ~1u) / 4 + 1] & 0xF) == 0xF);
+  }
+  // Without a depth buffer attached, a test or write in the state is left out.
+  DrawState test_only = draw;
+  test_only.depth_test = test_only.depth_write = true;
+  CHECK(b.triangles(test_only, ArrayView<const Vertex>(tri, 3), false, c));
+  {
+    const std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    Decoded d(job);
+    const uint32_t ds = d.one(kWmDepthStencil), db = d.one(kDepthBuffer);
+    CHECK(job[ds + 1] == (3u << 5) && job[db + 1] == 0);
+  }
   // Copy: the rectangle lies inside the source, and what falls outside the destination is clipped.
   Surface src = {0x300000, 8, 8, 64, SurfaceFormat::R8G8B8A8Unorm};
   CHECK(b.copy(draw.target, src, {0, 0, 8, 8}, 2, 2));

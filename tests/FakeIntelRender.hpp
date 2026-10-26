@@ -69,6 +69,20 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
   const float flat_color[4] = {as_float(kernel[3]), as_float(kernel[11]), as_float(kernel[19]), as_float(kernel[27])};
   const uint32_t ps_blend = d.one(kPsBlend);
   const bool blend = ps_blend != 0xFFFFFFFFu && (dump[ps_blend + 1] & (1u << 29));
+  // The colour write masks of render target 0 (the low bits of its blend state entry).
+  const uint32_t blend_ptr = d.one(kBlendStatePointers);
+  uint32_t color_mask = 0;
+  if (blend_ptr != 0xFFFFFFFFu && !read_dword(gpu, uint64_t{dynamic_base} + (dump[blend_ptr + 1] & ~1u) + 4, &color_mask, "blend state")) return;
+  const bool writes_color = (color_mask & 0xF) != 0xF;
+  // The depth buffer: its packet and the test.
+  const uint32_t db = d.one(kDepthBuffer), ds = d.one(kWmDepthStencil);
+  const bool has_depth = db != 0xFFFFFFFFu && (dump[db + 1] >> 29) == 1;
+  const uint32_t depth_pitch = has_depth ? (dump[db + 1] & 0x3FFFF) + 1 : 0;
+  const uint64_t depth_base = has_depth ? (uint64_t{dump[db + 3]} << 32) | dump[db + 2] : 0;
+  const bool depth_write = has_depth && ds != 0xFFFFFFFFu && (dump[ds + 1] & 1) && (dump[db + 1] & (1u << 28));
+  const bool depth_test = has_depth && ds != 0xFFFFFFFFu && (dump[ds + 1] & (1u << 1));
+  const uint32_t depth_func = ds != 0xFFFFFFFFu ? (dump[ds + 1] >> 5) & 7 : 7;
+  if (has_depth) CHECK(dump[db + 1] & (1u << 18));   // D32_FLOAT
   // Binding table entry 0, its surface state, and the target.
   uint32_t entry = 0, ss[10] = {};
   if (!read_dword(gpu, uint64_t{surface_base} + dump[bt + 1], &entry, "binding table")) return;
@@ -97,6 +111,7 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
       const float px = static_cast<float>(x) + 0.5f, py = static_cast<float>(y) + 0.5f;
       float color[4] = {flat_color[0], flat_color[1], flat_color[2], flat_color[3]};
       bool covered = false;
+      float z = v[2];
       if (dump[topo + 1] == kTopologyRectList) {
         float lx = v[0], hx = v[0], ly = v[1], hy = v[1];
         for (int k = 1; k < 3; ++k) {
@@ -117,8 +132,11 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
           const float w0 = cross(b[0], b[1], c[0], c[1], px, py) / total, w1 = cross(c[0], c[1], a[0], a[1], px, py) / total, w2 = cross(a[0], a[1], b[0], b[1], px, py) / total;
           if (w0 < 0 || w1 < 0 || w2 < 0) continue;
           covered = true;
+          // Depth is linear in window space; colours are interpolated perspective-correct from the 1/w the vertices carry.
+          z = w0 * a[2] + w1 * b[2] + w2 * c[2];
+          const float p0 = w0 * a[3], p1 = w1 * b[3], p2 = w2 * c[3], sum = p0 + p1 + p2;
           if (interpolated)
-            for (int k = 0; k < 4; ++k) color[k] = w0 * a[4 + k] + w1 * b[4 + k] + w2 * c[4 + k];
+            for (int k = 0; k < 4; ++k) color[k] = (p0 * a[4 + k] + p1 * b[4 + k] + p2 * c[4 + k]) / sum;
         }
       }
       if (!covered) continue;
@@ -130,6 +148,17 @@ static void execute(FakeGpu& gpu, const std::vector<uint32_t>& dump) {
         ok = ok && mapped;
       }
       if (!ok) continue;
+      if (has_depth) {
+        bool mapped;
+        uint8_t* stored = gpu.ppgtt_bytes(depth_base + uint64_t{static_cast<uint32_t>(y)} * depth_pitch + static_cast<uint32_t>(x) * 4, 4, "depth buffer", &mapped);
+        if (!mapped) continue;
+        float old_z;
+        memcpy(&old_z, stored, 4);
+        const bool passes = !depth_test || depth_func == 7 || (depth_func == 3 && z <= old_z);
+        if (!passes) continue;
+        if (depth_write) memcpy(stored, &z, 4);
+      }
+      if (!writes_color) continue;
       // The target's byte order: B8G8R8A8 is blue first.
       const int red = format == 0x0C0 ? 2 : 0, blue = format == 0x0C0 ? 0 : 2;
       if (blend) {
