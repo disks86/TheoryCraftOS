@@ -62,6 +62,9 @@ class AmdVcnSelfTest {
   // the engine, and the pictures must be byte for byte the same. What passing proves beyond the above: the reference picture set and slot bookkeeping of the H.265
   // message, 32x32 coding trees with the deblocking filter and SAO the encoder chose, bi-prediction. Not: scaling lists, tiles, slices, weighted prediction, other sizes.
   static Result run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine);
+  // The same check on any engine's H.265 session (already prepared): `wedged(ring)` says whether the engine's ring gave up, `decoded(decoder)` how many pictures the
+  // engine itself decoded (all of them must have gone through it).
+  static Result run_hevc_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*), const void* decoder);
   // The same for AV1: a libaom stream (64 x 64, ten temporal units with hidden frames and show_existing_frame; AmdVcnSelfTestAv1Stream.inc). What passing proves beyond
   // the above: the reference slot bookkeeping of the AV1 message (which engine picture each reference slot holds, across hidden frames and shown-again ones), the initial
   // entropy contexts, the tile table. Not: tiles, film grain, super-resolution, 10-bit, other sizes.

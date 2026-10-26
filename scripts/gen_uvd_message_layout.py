@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generates AmdUvd6MessageLayout.inc: the byte offsets and sizes of the fields of the decode messages the UVD 6 firmware reads (the message header, the create and
-decode messages and the H.264 picture parameters), measured by compiling the structure definitions in Mesa's ac_uvd_dec.h with a C compiler, so none is typed in by hand.
+decode messages and the H.264 and H.265 picture parameters), measured by compiling the structure definitions in Mesa's ac_uvd_dec.h with a C compiler, so none is typed in by hand.
 
   gen_uvd_message_layout.py out.inc ac_uvd_dec.h
 
@@ -27,8 +27,18 @@ FIELDS = (
         'second_chroma_qp_index_offset', 'num_slice_groups_minus1', 'slice_group_map_type', 'num_ref_idx_l0_active_minus1', 'num_ref_idx_l1_active_minus1',
         'slice_group_change_rate_minus1', 'scaling_list_4x4', 'scaling_list_8x8', 'frame_num', 'frame_num_list', 'curr_field_order_cnt_list', 'field_order_cnt_list',
         'decoded_pic_idx', 'curr_pic_ref_frame_num', 'ref_frame_list')]
+    + [('H265_' + f, 'body.decode.codec.h265.' + f) for f in (
+        'sps_info_flags', 'pps_info_flags', 'chroma_format', 'bit_depth_luma_minus8', 'bit_depth_chroma_minus8', 'log2_max_pic_order_cnt_lsb_minus4',
+        'sps_max_dec_pic_buffering_minus1', 'log2_min_luma_coding_block_size_minus3', 'log2_diff_max_min_luma_coding_block_size', 'log2_min_transform_block_size_minus2',
+        'log2_diff_max_min_transform_block_size', 'max_transform_hierarchy_depth_inter', 'max_transform_hierarchy_depth_intra', 'pcm_sample_bit_depth_luma_minus1',
+        'pcm_sample_bit_depth_chroma_minus1', 'log2_min_pcm_luma_coding_block_size_minus3', 'log2_diff_max_min_pcm_luma_coding_block_size', 'num_extra_slice_header_bits',
+        'num_short_term_ref_pic_sets', 'num_long_term_ref_pic_sps', 'num_ref_idx_l0_default_active_minus1', 'num_ref_idx_l1_default_active_minus1', 'pps_cb_qp_offset',
+        'pps_cr_qp_offset', 'pps_beta_offset_div2', 'pps_tc_offset_div2', 'diff_cu_qp_delta_depth', 'num_tile_columns_minus1', 'num_tile_rows_minus1',
+        'log2_parallel_merge_level_minus2', 'column_width_minus1', 'row_height_minus1', 'init_qp_minus26', 'num_delta_pocs_ref_rps_idx', 'curr_idx', 'curr_poc',
+        'ref_pic_list', 'poc_list', 'ref_pic_set_st_curr_before', 'ref_pic_set_st_curr_after', 'ref_pic_set_lt_curr', 'ucScalingListDCCoefSizeID2',
+        'ucScalingListDCCoefSizeID3', 'direct_reflist')]
 )
-SIZES = [('Msg_sizeof', 'struct ruvd_msg'), ('H264_sizeof', 'struct ruvd_h264')]
+SIZES = [('Msg_sizeof', 'struct ruvd_msg'), ('H264_sizeof', 'struct ruvd_h264'), ('H265_sizeof', 'struct ruvd_h265')]
 
 
 def main():

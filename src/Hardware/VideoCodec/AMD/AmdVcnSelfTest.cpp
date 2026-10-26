@@ -159,7 +159,8 @@ bool keep_picture(const VideoFrame& f, VideoFrameBuffer* out) {
 }
 }  // namespace
 
-AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine) {
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring,
+                                                       uint64_t (*decoded)(const void*), const void* decoder) {
   const ConstByteView stream(kHevcSelfTestStream);
   auto packet = [&](uint32_t i) {
     const uint64_t start = i == 0 ? 0 : kHevcSelfTestEnds[i - 1];
@@ -187,11 +188,6 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc(allocators::IAllocator& allocato
     if (got != kHevcSelfTestPictures) return Result::StreamFailed;
   }
 
-  DecoderConfig config;
-  config.codec = VideoCodec::Hevc;
-  config.output = PixelFormat::I420;
-  AmdVcnHevcDecoder session(allocator, engine, config);
-  if (!session.prepare()) return Result::SessionRefused;
   uint32_t got = 0;
   VideoFrame f;
   for (uint32_t i = 0; i < kHevcSelfTestPictures; ++i) {
@@ -199,7 +195,7 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc(allocators::IAllocator& allocato
     p.data = packet(i);
     p.pts_us = int64_t{i} * 1000;
     p.keyframe = i == 0;
-    if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
+    if (session.submit(p) != SubmitResult::Accepted) return wedged(ring) ? Result::EngineFailed : Result::SessionRefused;
     while (session.receive(&f)) {
       if (got >= kHevcSelfTestPictures || !same_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
       ++got;
@@ -210,10 +206,21 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc(allocators::IAllocator& allocato
     if (got >= kHevcSelfTestPictures || !same_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
     ++got;
   }
-  if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
+  if (wedged(ring) || session.statistics().errors != 0) return Result::EngineFailed;
   // The engine must really have done the work: every picture went through it (a stream the session passed to the CPU would "pass" too).
-  if (session.pictures_decoded() != kHevcSelfTestPictures) return Result::SessionRefused;
+  if (decoded(decoder) != kHevcSelfTestPictures) return Result::SessionRefused;
   return got == kHevcSelfTestPictures ? Result::Passed : Result::Mismatch;
+}
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_hevc(allocators::IAllocator& allocator, const AmdVcnHevcDecoder::Engine& engine) {
+  DecoderConfig config;
+  config.codec = VideoCodec::Hevc;
+  config.output = PixelFormat::I420;
+  AmdVcnHevcDecoder session(allocator, engine, config);
+  if (!session.prepare()) return Result::SessionRefused;
+  return run_hevc_session(
+      allocator, session, [](const void* ring) { return static_cast<const AmdVcn1Ring*>(ring)->wedged(); }, engine.ring,
+      [](const void* decoder) { return static_cast<const AmdVcnHevcDecoder*>(decoder)->pictures_decoded(); }, &session);
 }
 
 namespace {
