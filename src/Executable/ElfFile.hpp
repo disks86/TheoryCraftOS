@@ -90,6 +90,10 @@ class ElfFile {
   uint16_t machine() const { return machine_; }
   uint64_t entry() const { return entry_; }
   uint32_t flags() const { return flags_; }
+  // Where the program header table sits in the file (a loader needs its address in memory for the auxiliary vector).
+  uint64_t program_header_offset() const { return phoff_; }
+  uint16_t program_header_size() const { return phentsize_; }
+  uint16_t program_header_count() const { return phnum_; }
 
   const List<ElfSegment>& segments() const { return segments_; }
   const List<ElfSection>& sections() const { return sections_; }
@@ -114,7 +118,8 @@ class ElfFile {
   uint8_t os_abi_ = 0;
   uint16_t type_ = 0, machine_ = 0;
   uint32_t flags_ = 0;
-  uint64_t entry_ = 0;
+  uint64_t entry_ = 0, phoff_ = 0;
+  uint16_t phentsize_ = 0, phnum_ = 0;
   List<ElfSegment> segments_;
   List<ElfSection> sections_;
   List<ElfSymbol> symbols_;

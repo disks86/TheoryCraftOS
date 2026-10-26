@@ -552,6 +552,8 @@ add_executable(BOOTX64
   src/Executable/PeFile.cpp
   src/Process/Syscall.cpp
   src/Process/Process.cpp
+  src/Process/AddressSpace.cpp
+  src/Process/ImageLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
