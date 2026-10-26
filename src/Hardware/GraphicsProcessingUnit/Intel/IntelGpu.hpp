@@ -25,6 +25,12 @@
 
 namespace hardware {
 
+// What the render engine driver needs of an Intel GPU, found while the display engine was set up: its register window and the global GTT table.
+struct IntelRenderHardware {
+  intel_gt::IRegisterBank* registers = nullptr;
+  MmioRegion ggtt_table;
+};
+
 // Intel display controller (PCI vendor 0x8086), identified by device ID down to its architecture (UHD 6xx, Iris Xe, Arc,
 // Xe2, Xe3; see IntelGpuGenerations.hpp).
 //
@@ -50,6 +56,9 @@ class IntelGpu final : public UefiGopGpu {
   bool native_mode_setting() const { return native_active_; }
   // True if the display engine was found and could be driven (it is used from the first mode change).
   bool native_available() const { return scanout_ && scanout_->ready(); }
+  // The registers and the global GTT of a Gen9.5 GPU whose register BAR was mapped, for the render engine driver (Graphics/Graphics3D/IntelGen9); false for any other
+  // generation or when the mapping failed. The pointers stay valid until shutdown().
+  bool render_hardware(IntelRenderHardware* out);
 
   // What is drawn has to be flushed out of the CPU's caches for the display engine to see it.
   void put_pixel(uint32_t x, uint32_t y, uint32_t color) override { UefiGopGpu::put_pixel(x, y, color); flush_dirty(); }
@@ -69,6 +78,8 @@ class IntelGpu final : public UefiGopGpu {
   IntelGpuInfo info_;
   GpuContext context_;
   intel_gt::MmioRegisterBank bank_{MmioRegion()};
+  MmioRegion ggtt_table_;
+  bool registers_mapped_ = false;
   UniquePointer<intel_display::Scanout> scanout_;
   ByteView native_memory_;
   uint32_t native_pitch_ = 0;

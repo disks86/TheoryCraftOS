@@ -43,8 +43,17 @@ void IntelGpu::try_native() {
   MmioRegion registers, table;
   if (!context_.registers->map_registers(base, kRegisterBytes, &registers) || !context_.registers->map_registers(base + geometry.table_offset, geometry.table_bytes, &table)) return;
   bank_ = intel_gt::MmioRegisterBank(registers);
+  ggtt_table_ = table;
+  registers_mapped_ = true;
   scanout_ = UniquePointer<intel_display::Scanout>::make(*context_.allocator, bank_, table, info_.architecture, *context_.allocator);
   if (scanout_ && !scanout_->initialize()) scanout_ = UniquePointer<intel_display::Scanout>();
+}
+
+bool IntelGpu::render_hardware(IntelRenderHardware* out) {
+  if (!registers_mapped_ || info_.architecture != IntelGpuArchitecture::Gen9_5 || info_.discrete || !ggtt_table_.valid()) return false;
+  out->registers = &bank_;
+  out->ggtt_table = ggtt_table_;
+  return true;
 }
 
 bool IntelGpu::set_mode(uint32_t index) {
@@ -73,6 +82,7 @@ void IntelGpu::shutdown() {
     apply_current_mode();       // so draw into the firmware's framebuffer again
   }
   scanout_ = UniquePointer<intel_display::Scanout>();
+  registers_mapped_ = false;
 }
 
 void IntelGpu::flush_dirty() {

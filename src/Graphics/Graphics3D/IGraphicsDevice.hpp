@@ -103,6 +103,9 @@ using FragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants
 // with instead of carrying code): the coloured-vertex pipeline of BuiltinShaders.
 enum class QpuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
 
+// The pixel kernels the Intel Gen9 device has for the built-in shaders (there is no shader compiler for the EUs either).
+enum class EuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
+
 struct ShaderModuleDesc {
   ShaderStage stage = ShaderStage::Vertex;
   VertexShaderFn vertex_function = nullptr;      // used by the software device
@@ -117,6 +120,8 @@ struct ShaderModuleDesc {
   uint32_t d3d9_token_count = 0;
   // The QPU program of the V3D device that does what this module does; None for a module that has none (the V3D device then cannot run it).
   QpuProgram qpu_program = QpuProgram::None;
+  // The same for the Intel Gen9 device: the coloured-vertex pipeline of BuiltinShaders (the vertex transform runs on the CPU there).
+  EuProgram eu_program = EuProgram::None;
 };
 
 class IShaderModule {

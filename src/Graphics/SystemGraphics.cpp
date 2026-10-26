@@ -20,7 +20,7 @@
 
 namespace graphics {
 
-SystemGraphics::SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator& allocator, bool allow_acceleration)
-    : display_(gpu.gpu()), node_(gpu.gpu(), gpu.virtio_gpu(), gpu.vmware_gpu(), allocator, allow_acceleration), renderer_(allocator) {}
+SystemGraphics::SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator& allocator, bool allow_acceleration, bool allow_intel_render)
+    : display_(gpu.gpu()), node_(gpu.gpu(), gpu.virtio_gpu(), gpu.vmware_gpu(), allocator, allow_acceleration, gpu.intel_gpu(), allow_intel_render), renderer_(allocator) {}
 
 }  // namespace graphics

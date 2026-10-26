@@ -46,7 +46,7 @@ constexpr uint16_t kOffsets[] = {
     0x244, 0x034, 0x030, 0x038, 0x03c, 0x168, 0x140, 0x110, 0x11c, 0x114, 0x118, 0x1c0, 0x1c4, 0x1c8,
     // run 1: 9 registers
     0x3a8, 0x28c, 0x288, 0x284, 0x280, 0x27c, 0x278, 0x274, 0x270,
-    // run 2: 1 register
+    // run 2: 1 register (the video engines' 0x200; the render engine has R_PWR_CLK_STATE at 0x0c8, see kRcsPowerClockState)
     0x200,
     // run 3: 44 registers
     0x028, 0x09c, 0x0c0, 0x178, 0x17c, 0x358, 0x170, 0x150, 0x154, 0x158, 0x41c,
@@ -61,21 +61,27 @@ constexpr Run kRuns[] = {
     {13, 44, 24, 68},
 };
 static_assert(sizeof(kOffsets) / sizeof(kOffsets[0]) == 68, "gen9 video engine register list");
-}  // namespace
 
-bool lrc_init_gen9_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) {
+constexpr uint16_t kRcsPowerClockState = 0x0c8;   // R_PWR_CLK_STATE: the one register of run 2 that differs
+
+// The common part of the Gen9 video and render engines' register state.
+bool lrc_init_gen9(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore, bool render) {
   if (state.size() != kLrcStateDwords) return false;
   for (uint32_t& d : state) d = 0;
   uint64_t at = 0;
+  uint32_t run_index = 0;
   for (const Run& run : kRuns) {
     at += run.skip;
     // header + 2 dwords per register must fit in the page
     if (at + 1 + uint64_t{run.count} * 2 > state.size()) return false;
-    state[at++] = kMiLoadRegisterImmBase | (2u * run.count - 1u) | kMiLriForcePosted;
+    // gen9_rcs_offsets loads its third run (R_PWR_CLK_STATE) without the posted flag.
+    const bool posted = !(render && run_index == 2);
+    state[at++] = kMiLoadRegisterImmBase | (2u * run.count - 1u) | (posted ? kMiLriForcePosted : 0u);
     for (uint16_t i = run.first; i < run.last; ++i) {
-      state[at] = mmio_base + kOffsets[i];
+      state[at] = mmio_base + (render && run_index == 2 ? kRcsPowerClockState : kOffsets[i]);
       at += 2;
     }
+    ++run_index;
   }
   // Context control, as the driver sets it for Gen9: no synchronous context switch inhibit, and no save inhibit or render-state restore. A context with no saved
   // state yet (the first start) has the restore of the saved engine state inhibited; the registers listed above are loaded either way.
@@ -85,6 +91,10 @@ bool lrc_init_gen9_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhib
   state[kCtxRingMiMode] = masked_disable(kStopRing);
   return true;
 }
+}  // namespace
+
+bool lrc_init_gen9_xcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) { return lrc_init_gen9(state, mmio_base, inhibit_restore, false); }
+bool lrc_init_gen9_rcs(ArrayView<uint32_t> state, uint32_t mmio_base, bool inhibit_restore) { return lrc_init_gen9(state, mmio_base, inhibit_restore, true); }
 
 namespace {
 // gen12_xcs_offsets: a skip, a load of 13 registers, a skip, a load of 9.

@@ -36,6 +36,7 @@ constexpr IntelGpuInfo make(A a, const char* name, bool discrete, bool av1_decod
 
 constexpr Range kRanges[] = {
     // Gen9.5
+    {0x5900, 0x593F, make(A::Gen9_5, "Intel HD Graphics 6xx (Gen9.5, Kaby Lake / Kaby Lake-G)", false, false, false)},
     {0x3E90, 0x3EAF, make(A::Gen9_5, "Intel UHD Graphics (Gen9.5, Coffee/Whiskey Lake)", false, false, false)},
     {0x87C0, 0x87CF, make(A::Gen9_5, "Intel UHD Graphics (Gen9.5, Coffee Lake ULX)", false, false, false)},
     {0x9B21, 0x9BFF, make(A::Gen9_5, "Intel UHD Graphics (Gen9.5, Comet Lake)", false, false, false)},

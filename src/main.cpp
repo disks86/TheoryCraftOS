@@ -498,7 +498,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   }
 
   // 2D and 3D rendering: the GPU's 3D engine where we can drive it, the software renderer otherwise.
-  graphics::SystemGraphics system_graphics(system_gpu, shared_allocator);
+#ifdef TCOS_INTEL_RENDER
+  constexpr bool kIntelRender = true;    // the Gen9.5 render engine path (opt-in: it has not run on real hardware)
+#else
+  constexpr bool kIntelRender = false;
+#endif
+  graphics::SystemGraphics system_graphics(system_gpu, shared_allocator, true, kIntelRender);
   // Rendering and presenting on any GPU of the machine (see Graphics/GraphicsPool.hpp); the display GPU's graphics are the ones above.
   graphics::GraphicsPool graphics_pool(gpu_pool, system_graphics, shared_allocator);
   if (graphics_pool.count() > 1)

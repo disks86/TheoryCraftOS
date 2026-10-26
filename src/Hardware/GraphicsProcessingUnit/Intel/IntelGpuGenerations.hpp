@@ -24,7 +24,7 @@ namespace hardware {
 // The graphics architecture of an Intel GPU, 9th-generation Core and newer (including the discrete Arc and Data Center parts).
 enum class IntelGpuArchitecture : uint8_t {
   Unknown,
-  Gen9_5,  // UHD Graphics 6xx: Coffee Lake, Whiskey Lake, Comet Lake
+  Gen9_5,  // HD/UHD Graphics 6xx: Kaby Lake (and Kaby Lake-G), Coffee Lake, Whiskey Lake, Comet Lake
   Gen11,   // Iris Plus / UHD: Ice Lake, Lakefield, Elkhart Lake, Jasper Lake
   XeLp,    // Xe-LP (Gen12): Tiger Lake, Rocket Lake, Alder Lake, Raptor Lake, DG1
   XeHpg,   // Xe-HPG: Arc Alchemist (A-series), Flex series

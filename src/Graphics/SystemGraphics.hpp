@@ -33,7 +33,8 @@ class SystemGraphics : public IDisplayGraphics {
  public:
   // `gpu` must outlive this object. If `allow_acceleration` is false the software
   // device is used even where a GPU device would work.
-  SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator& allocator, bool allow_acceleration = true);
+  // `allow_intel_render` switches on the render engine path of an Intel Gen9.5 display GPU (untried on hardware).
+  SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator& allocator, bool allow_acceleration = true, bool allow_intel_render = false);
 
   // The device to render 3D with: accelerated if it passed its self-test, else software.
   IGraphicsDevice& device() { return node_.device(); }
