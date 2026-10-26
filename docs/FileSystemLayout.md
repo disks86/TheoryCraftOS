@@ -17,6 +17,23 @@ named in [`src/FileSystem/SystemLayout.hpp`](../src/FileSystem/SystemLayout.hpp)
 | `/Linux` | Root for Linux processes: they see its contents as `/`. |
 | `/AppStore` | Where applications keep the files they need. Each application has its own sub-folder, e.g. the browser's cache is `/AppStore/Browser/Cache`. |
 
+## Inside `/Windows` and `/Linux`
+
+Both roots are created with the folders a fresh installation of the system has (`kWindowsFolders`, `kLinuxFolders`). Windows processes
+see `/Windows` as `C:\`:
+
+| Path | Seen as |
+| --- | --- |
+| `/Windows/Program Files`, `/Windows/Program Files (x86)` | `C:\Program Files`, `C:\Program Files (x86)` (each with `Common Files`) |
+| `/Windows/ProgramData` | `C:\ProgramData` |
+| `/Windows/Users` | `C:\Users` with `Default` and `Public` (`Desktop`, `Documents`, `Downloads`, `Music`, `Pictures`, `Videos`) |
+| `/Windows/Windows` | `C:\Windows` with `Fonts`, `Logs`, `Temp`, `System32` (`drivers`, `config`) and `SysWOW64` |
+
+Linux processes see `/Linux` as `/`, with the Filesystem Hierarchy Standard folders: `bin`, `boot`, `dev`, `etc`, `home`, `lib`, `lib64`,
+`media`, `mnt`, `opt`, `proc`, `root`, `run`, `sbin`, `srv`, `sys`, `tmp`, `usr` (`bin`, `include`, `lib`, `lib64`, `local`, `sbin`, `share`)
+and `var` (`cache`, `lib`, `log`, `tmp`). `dev`, `proc` and `sys` are plain empty folders for now. Use the `kWindows*` and `kLinux*`
+constants for the places programs are installed (`kWindowsSystem32`, `kLinuxBin`, ...).
+
 Other volumes (USB sticks, network shares) are folders of `/` named by their label.
 
 ## Rules for new code
