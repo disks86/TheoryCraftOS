@@ -22,6 +22,7 @@
 #include "Hardware/VideoCodec/AMD/AmdGmc8Memory.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
@@ -35,7 +36,8 @@ namespace hardware {
 // The video engine of the Radeon RX Vega M in a Kaby Lake-G machine (Dell XPS 15 9575; PCI 1002:694C / 694E / 694F): the Unified Video Decoder 6.3. The card's register BAR
 // (BAR 5) and memory BAR (BAR 0) are mapped by the caller; this reads the memory controller (AmdGmc8Memory) to find a block of video memory nothing else uses, starts the
 // engine with the microcode from /firmware (AmdUvd6), runs the decode ring's own test and an H.264 self-test (the same stream and comparison as the VCN engine's:
-// AmdVcnSelfTest), and only when the engine's pictures are the CPU's byte for byte does it serve H.264 sessions (AmdUvd6AvcDecoder). Anything else, and every session while
+// AmdVcnSelfTest), and only when the engine's pictures are the CPU's byte for byte does it serve H.264 sessions (AmdUvd6AvcDecoder); H.265 (AmdUvd6HevcDecoder) has its own
+// test and the same rule. Anything else, and every session while
 // the engine is not up or failed a test, runs on the CPU through the software codecs. info().accelerated says false (the device as a whole is not accelerated);
 // info().accelerated_decode_codecs lists what the engine really does.
 //
@@ -142,12 +144,15 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     }
     note_ = "engine started, idle";
     rebuild_status();
-    return enable_decode(*registers_, clock, memory_.engine.ring, *mapper_, plan_.work_gpu_address, aperture_physical_ + plan_.work_offset, plan_.work_bytes);
+    if (!enable_decode(*registers_, clock, memory_.engine.ring, *mapper_, plan_.work_gpu_address, aperture_physical_ + plan_.work_offset, plan_.work_bytes)) return false;
+    enable_hevc_decode();   // (H.264 works either way)
+    return engine_running();
   }
 
   void shutdown() override { stop_engine(); }
   void stop_engine() {
     decode_ready_ = false;
+    hevc_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     if (uvd_) {
@@ -164,6 +169,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   bool enable_decode(IVcnRegisters& registers, const IClock& clock, const MmioRegion& decode_ring, IRegisterMapper& mapper, uint64_t work_gpu, uint64_t work_physical,
                      uint64_t work_bytes) {
     decode_ready_ = false;
+    hevc_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     const char* why = nullptr;
@@ -219,11 +225,58 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     rebuild_status();
     return true;
   }
+  // After enable_decode(): runs the H.265 self-test (AmdVcnSelfTest::run_hevc_session, a libx265 stream with B pictures) and, when it passes, hands H.265 sessions to the
+  // engine as well. A failed test leaves H.264 as it was - unless the engine stopped answering, which stops it altogether. True when H.265 is served by the engine now.
+  bool enable_hevc_decode() {
+    hevc_ready_ = false;
+    if (!ring_) return false;
+    AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
+    {
+      // (The session is closed before anything below can stop the engine and take the ring away.)
+      DecoderConfig config;
+      config.codec = VideoCodec::Hevc;
+      config.output = PixelFormat::I420;
+      AmdUvd6HevcDecoder session(allocator_, engine_, config);
+      if (session.prepare())
+        result = AmdVcnSelfTest::run_hevc_session(
+            allocator_, session, [](const void* ring) { return static_cast<const AmdUvd6Ring*>(ring)->wedged(); }, ring_.get(),
+            [](const void* decoder) { return static_cast<const AmdUvd6HevcDecoder*>(decoder)->pictures_decoded(); }, &session);
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("H.265 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+      } else {
+        decode_text_.assign("engine started; H.264 decode runs on it (self-test passed); H.265 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("), H.265 stays on the CPU");
+      }
+      note_ = decode_text_.c_str();
+      rebuild_status();
+      return false;
+    }
+    hevc_ready_ = true;
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Hevc);
+    note_ = "engine started; H.264 and H.265 decode run on it (self-tests passed)";
+    rebuild_status();
+    return true;
+  }
   bool decode_ready() const { return decode_ready_; }
+  bool hevc_ready() const { return hevc_ready_; }
   const char* engine_note() const { return note_; }
 
-  // H.264 goes to the engine when it passed its test and is free (it runs one session at a time); anything else goes to the CPU.
+  // H.264 and H.265 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::Hevc && hevc_ready_ && ring_ && !ring_->wedged()) {
+      AmdUvd6AvcDecoder::Engine engine = engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdUvd6HevcDecoder> session = UniquePointer<AmdUvd6HevcDecoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
     if (config.codec == VideoCodec::H264 && decode_ready_ && ring_ && !ring_->wedged()) {
       AmdUvd6AvcDecoder::Engine engine = engine_;
       engine.stream_handle = ++next_stream_handle_;
@@ -291,6 +344,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   AmdVcnWorkMemory work_;
   AmdUvd6AvcDecoder::Engine engine_;
   bool decode_ready_ = false;
+  bool hevc_ready_ = false;
   uint32_t next_stream_handle_ = 1;
 };
 
