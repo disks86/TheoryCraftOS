@@ -42,6 +42,9 @@ class AmdSmu7 {
   };
   static constexpr uint16_t kMsgUvdPowerOff = 0x60, kMsgUvdPowerOn = 0x61;   // PPSMC_MSG_UVDPowerOFF / ON
   static constexpr uint16_t kMsgVcePowerOff = 0x10e, kMsgVcePowerOn = 0x10f;   // PPSMC_MSG_VCEPowerOFF / ON (no argument)
+  // The messages that switch dynamic power management of the VCE's clock levels on and off (smu7_clockpowergating.c: smu7_update_vce_dpm) and pick its levels (the polaris10 /
+  // vegam smumgr's update_smc_table(SMU_VCE_TABLE)); smu7_ppsmc.h.
+  static constexpr uint16_t kMsgVceDpmSetEnabledMask = 0x12E, kMsgVceDpmEnable = 0x15a, kMsgVceDpmDisable = 0x15b;
   static constexpr uint16_t kResultOk = 0x01, kResultUnknownCommand = 0xFE;
   static constexpr uint32_t kDefaultTimeoutUs = 100000;                        // adev->usec_timeout
 
@@ -56,9 +59,41 @@ class AmdSmu7 {
   // smu7_powerup_vce / smu7_powerdown_vce: the same for the Video Coding Engine.
   Result vce_power(bool on);
 
+  // The SMC's memory (SRAM), where its DPM table is: smu7_set_smc_sram_address, _read_smc_sram_dword and the write the driver's indirect register access does - the index
+  // register, the auto-increment off, the data register. The address is a multiple of four below kSmcRamEnd. The SMC is big-endian: the byte at the lowest address is the
+  // top byte of the dword.
+  static constexpr uint32_t kSmcRamEnd = 0x40000;               // SMC_RAM_END
+  static constexpr uint32_t kFirmwareHeaderLocation = 0x20000;  // SMU7_FIRMWARE_HEADER_LOCATION
+  bool read_sram_dword(uint32_t address, uint32_t* value);
+  bool write_sram_dword(uint32_t address, uint32_t value);
+
+  // The VCE's clock levels (what the Linux driver does after it powers the engine up: the boot level is written into the SMC's DPM table and DPM is enabled). The layout is that
+  // of the Vega M's SMC (smu75.h / smu75_discrete.h: SMU75_Firmware_Header, SMU75_Discrete_DpmTable; the offsets were taken with offsetof from the real headers).
+  static constexpr uint32_t kHeaderDpmTableOffset = 52;         // offsetof(SMU75_Firmware_Header, DpmTable)
+  static constexpr uint32_t kDpmVceLevelCountOffset = 213;      // offsetof(SMU75_Discrete_DpmTable, VceLevelCount)
+  static constexpr uint32_t kDpmVceBootLevelOffset = 1649;      // offsetof(SMU75_Discrete_DpmTable, VceBootLevel)
+  static constexpr uint32_t kMaxVceLevels = 8;                  // SMU75_MAX_LEVELS_VCE
+  enum class VceLevel : uint8_t {
+    Lowest,    // boot level 0, every level enabled: the SMC raises the clock itself (the driver's default)
+    Highest,   // the driver's stable-pstate case: the top level is the boot level and the only one enabled
+  };
+  enum class DpmResult : uint8_t {
+    Ok,
+    NotAnswering,   // the SMC's mailbox does not answer
+    Unsupported,    // the SMC does not know a message
+    Failed,         // any other result word
+    NoDpmTable,     // the firmware header does not say where the DPM table is (the SMC is not running its firmware)
+    BadDpmTable,    // the table is out of the SMC's memory, or has no sensible number of VCE levels
+  };
+  // Writes the VCE's boot level into the DPM table and enables DPM for it. `level` (if given) receives the level chosen.
+  DpmResult vce_dpm_enable(VceLevel which, uint32_t* level = nullptr);
+  // smu7_update_vce_dpm(true): switches the VCE's DPM off again.
+  Result vce_dpm_disable();
+
  private:
   // Waits until the result register is not zero (the SMC has finished what it was doing); false on timeout. A register that reads all ones is not an SMC.
   bool wait_for_result(uint32_t timeout_us, uint32_t* value);
+  bool set_sram_address(uint32_t address);
   Result send_message(uint16_t message, const uint32_t* argument, uint32_t* response, uint32_t timeout_us);
 
   IVcnRegisters& registers_;

@@ -24,6 +24,8 @@ namespace hardware {
 namespace {
 // smu_7_1_3_d.h
 constexpr uint32_t mmSMC_MESSAGE_0 = 0x94, mmSMC_RESP_0 = 0x95, mmSMC_MSG_ARG_0 = 0xa4;
+constexpr uint32_t mmSMC_IND_INDEX_11 = 0x1AC, mmSMC_IND_DATA_11 = 0x1AD, mmSMC_IND_ACCESS_CNTL = 0x92;
+constexpr uint32_t kAutoIncrementInd11 = 0x800;   // SMC_IND_ACCESS_CNTL__AUTO_INCREMENT_IND_11_MASK
 constexpr uint32_t kRespMask = 0xFFFF;   // SMC_RESP_0__SMC_RESP_MASK
 }  // namespace
 
@@ -64,5 +66,63 @@ AmdSmu7::Result AmdSmu7::uvd_power(bool on, bool dynamic_power_gating) {
 }
 
 AmdSmu7::Result AmdSmu7::vce_power(bool on) { return send(on ? kMsgVcePowerOn : kMsgVcePowerOff); }
+
+bool AmdSmu7::set_sram_address(uint32_t address) {
+  if ((address & 3) != 0 || address > kSmcRamEnd - 4) return false;
+  registers_.write(mmSMC_IND_INDEX_11, address);
+  registers_.write(mmSMC_IND_ACCESS_CNTL, registers_.read(mmSMC_IND_ACCESS_CNTL) & ~kAutoIncrementInd11);
+  return true;
+}
+
+bool AmdSmu7::read_sram_dword(uint32_t address, uint32_t* value) {
+  if (!set_sram_address(address)) return false;
+  *value = registers_.read(mmSMC_IND_DATA_11);
+  return true;
+}
+
+bool AmdSmu7::write_sram_dword(uint32_t address, uint32_t value) {
+  if (!set_sram_address(address)) return false;
+  registers_.write(mmSMC_IND_DATA_11, value);
+  return true;
+}
+
+namespace {
+AmdSmu7::DpmResult dpm_result(AmdSmu7::Result r) {
+  switch (r) {
+    case AmdSmu7::Result::Ok: return AmdSmu7::DpmResult::Ok;
+    case AmdSmu7::Result::NotAnswering: return AmdSmu7::DpmResult::NotAnswering;
+    case AmdSmu7::Result::Unsupported: return AmdSmu7::DpmResult::Unsupported;
+    case AmdSmu7::Result::Failed: break;
+  }
+  return AmdSmu7::DpmResult::Failed;
+}
+}  // namespace
+
+AmdSmu7::DpmResult AmdSmu7::vce_dpm_enable(VceLevel which, uint32_t* level) {
+  // vegam_process_firmware_header: where the SMC keeps its DPM table.
+  uint32_t table = 0;
+  if (!read_sram_dword(kFirmwareHeaderLocation + kHeaderDpmTableOffset, &table) || table == 0 || table == 0xFFFFFFFFu || (table & 3) != 0) return DpmResult::NoDpmTable;
+  if (table > kSmcRamEnd || kDpmVceBootLevelOffset >= kSmcRamEnd - table) return DpmResult::BadDpmTable;
+  // The byte of a field in the big-endian dword that holds it.
+  const uint32_t count_address = table + kDpmVceLevelCountOffset, boot_address = table + kDpmVceBootLevelOffset;
+  uint32_t word = 0;
+  if (!read_sram_dword(count_address & ~3u, &word)) return DpmResult::BadDpmTable;
+  const uint32_t count = (word >> (24 - 8 * (count_address & 3))) & 0xFF;
+  if (count == 0 || count > kMaxVceLevels) return DpmResult::BadDpmTable;
+  const uint32_t boot = which == VceLevel::Highest ? count - 1 : 0;
+  // vegam_update_vce_smc_table: the boot level into its byte of the table.
+  const uint32_t shift = 24 - 8 * (boot_address & 3);
+  if (!read_sram_dword(boot_address & ~3u, &word)) return DpmResult::BadDpmTable;
+  word = (word & ~(0xFFu << shift)) | (boot << shift);
+  if (!write_sram_dword(boot_address & ~3u, word)) return DpmResult::BadDpmTable;
+  if (which == VceLevel::Highest) {
+    const Result mask = send_with_parameter(kMsgVceDpmSetEnabledMask, 1u << boot);
+    if (mask != Result::Ok) return dpm_result(mask);
+  }
+  if (level) *level = boot;
+  return dpm_result(send(kMsgVceDpmEnable));
+}
+
+AmdSmu7::Result AmdSmu7::vce_dpm_disable() { return send(kMsgVceDpmDisable); }
 
 }  // namespace hardware
