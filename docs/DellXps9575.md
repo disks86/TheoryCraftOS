@@ -83,9 +83,16 @@ and a data area for each instance: 1144 KiB), the three rings of 1024 dwords, th
 start gives up (`failure_snapshot`, as for the UVD). `tests/AmdVce3Test.cpp` runs it against a simulated card whose registers are banked per instance, and covers one instance, both, only the second, none, the layout of each
 instance's windows, the rings, the clock gating, retries and failure, and every refused argument.
 
-Not there, and needed before a Vega M encodes anything: the ring commands (the VCE ring takes its own command words, `amdgpu_vce_ring_emit_ib` / `_emit_fence`, and the ring test), the encode messages (Mesa's
-`radeon_vce.c` and `radeon_vce_52.c`: session, create, rate control, picture control, the feedback), an `IVideoEncoder` session on top, a self-test (the engine's bitstream has to decode with the CPU decoder to something close to the
-picture that went in), the memory planning and the PCI plumbing (as `AmdGmc8Memory` and `AmdUvd6VideoEngine` do for the UVD), and the SMC's power and clock requests. Not run on a Vega M.
+The ring: `AmdVce3Ring` is the work submission (`vce_v3_0_ring_emit_ib` of the chips from Stoney on, `amdgpu_vce_ring_emit_fence`, `amdgpu_vce_ring_test_ring`, the ring pointers through
+`GRBM_GFX_INDEX`, the nop command and the 16-dword alignment, the commands' values from `vid.h`). A job is `IB_VM` (VMID 0, the indirect buffer's address and length), `FENCE` (address, sequence), `TRAP`, `END` and
+padding; the indirect buffer holds the firmware's own task commands (the encode messages, next), padded with no-ops to 16 dwords; the CPU polls the fence word, and a job that does not finish wedges the ring until the engine is
+restarted. The host data path is flushed before the write pointer is published. `tests/AmdVce3RingTest.cpp` runs it against a simulated ring controller (all three rings, either instance, wrap-around over 200 jobs, the fence,
+a stalled engine, a dead one, every bad argument, and the order of the flush and the pointer; moving the fence words, dropping the padding, using the wrong ring's registers or flushing after the pointer each fails it) and
+`check_vce3_port.py vce_v3_0.c amdgpu_vce.c` confirms the job's commands, the ring test and the pointer registers against the driver.
+
+Not there, and needed before a Vega M encodes anything: the encode messages (Mesa's `radeon_vce.c` and `radeon_vce_52.c`: session, create, rate control, picture control, the feedback), an `IVideoEncoder` session on
+top, a self-test (the engine's bitstream has to decode with the CPU decoder to something close to the picture that went in), the memory planning and the PCI plumbing (as `AmdGmc8Memory` and `AmdUvd6VideoEngine` do for
+the UVD), and the SMC's power and clock requests. Not run on a Vega M.
 
 ## Textures in the graphics device API
 
