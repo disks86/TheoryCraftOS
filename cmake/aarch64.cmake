@@ -44,6 +44,22 @@ add_executable(BOOTAA64
   src/Hardware/GraphicsProcessingUnit/FramebufferGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Font8x16.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
+  src/Hardware/Platform/RaspberryPi/RaspberryPiBoard.cpp
+  src/Hardware/Platform/RaspberryPi/RaspberryPiDetect.cpp
+  src/Hardware/Platform/RaspberryPi/RaspberryPiPlatform.cpp
+  src/Hardware/Platform/RaspberryPi/VcMailbox.cpp
+  src/Hardware/Platform/RaspberryPi/VideoCoreFirmware.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dPageTable.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dControlList.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dFrame.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dDraw.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dRenderer.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dQpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dShaders.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dGpuMemory.cpp
+  src/Hardware/GraphicsProcessingUnit/Broadcom/V3dSelfTest.cpp
+  src/Hardware/VideoCodec/Broadcom/RpiHevcBlock.cpp
 )
 target_include_directories(BOOTAA64 PRIVATE src)
 set_target_properties(BOOTAA64 PROPERTIES SUFFIX ".efi" LINKER_LANGUAGE CXX)

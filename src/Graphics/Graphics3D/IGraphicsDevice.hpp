@@ -99,6 +99,10 @@ struct ShaderIo {
 using VertexShaderFn = void (*)(const Vec4* attributes, const uint8_t* constants, ShaderIo* out);
 using FragmentShaderFn = bool (*)(const Vec4* varyings, const uint8_t* constants, Vec4* color);
 
+// The QPU programs the Raspberry Pi's V3D device has for the built-in shaders (there is no shader compiler for the QPUs, so a module names a program it ships
+// with instead of carrying code): the coloured-vertex pipeline of BuiltinShaders.
+enum class QpuProgram : uint8_t { None, ColoredVertex, ColoredFragment };
+
 struct ShaderModuleDesc {
   ShaderStage stage = ShaderStage::Vertex;
   VertexShaderFn vertex_function = nullptr;      // used by the software device
@@ -111,6 +115,8 @@ struct ShaderModuleDesc {
   // when it takes the c31 constant (1, -1, 1, 1) as a factor of the position; the device supplies it, so that Vulkan's +Y down comes out right.
   const uint32_t* d3d9_tokens = nullptr;
   uint32_t d3d9_token_count = 0;
+  // The QPU program of the V3D device that does what this module does; None for a module that has none (the V3D device then cannot run it).
+  QpuProgram qpu_program = QpuProgram::None;
 };
 
 class IShaderModule {
