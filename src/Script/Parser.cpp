@@ -2531,6 +2531,7 @@ class Parser {
         e = make(NodeKind::Ident);
         if (!e) return nullptr;
         e->text = "undefined";
+        e->flags |= kFlagHole;
       } else if (is(T::Ellipsis)) {
         e = make(NodeKind::Spread);
         if (!e) return nullptr;

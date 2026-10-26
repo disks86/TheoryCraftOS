@@ -767,7 +767,7 @@ NATIVE(array_pop) {
     *result = Value();
     return true;
   }
-  *result = a->items[--a->length];
+  *result = a->items[--a->length].unhole();
   return true;
 }
 
@@ -778,7 +778,7 @@ NATIVE(array_shift) {
     *result = Value();
     return true;
   }
-  *result = a->items[0];
+  *result = a->items[0].unhole();
   for (uint32_t i = 1; i < a->length; ++i) a->items[i - 1] = a->items[i];
   --a->length;
   return true;
@@ -879,7 +879,7 @@ NATIVE(array_index_of) {
   if (!arg_integer(vm, args, argc, 1, 0, &from)) return false;
   from = relative(from, a->length);
   for (int64_t i = from; i < a->length; ++i) {
-    if (vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
+    if (!a->items[i].is_hole() && vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
       *result = num_value(static_cast<double>(i));
       return true;
     }
@@ -892,7 +892,7 @@ NATIVE(array_last_index_of) {
   JsObject* a;
   if (!this_array(vm, self, &a)) return false;
   for (int64_t i = static_cast<int64_t>(a->length) - 1; i >= 0; --i) {
-    if (vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
+    if (!a->items[i].is_hole() && vm.strict_equals(a->items[i], arg_at(args, argc, 0))) {
       *result = num_value(static_cast<double>(i));
       return true;
     }
@@ -962,7 +962,12 @@ bool array_each(Vm& vm, const Value& self, const Value* args, uint32_t argc, Val
   if (mode == Each::Some) *result = Value::make_bool(false);
   if (mode == Each::Every) *result = Value::make_bool(true);
   for (uint32_t i = 0; i < a->length; ++i) {
-    const Value item = a->items[i];
+    const bool hole = a->items[i].is_hole();
+    if (hole && mode != Each::Find && mode != Each::FindIndex) {   // (forEach, map, filter, some and every skip the holes; map keeps them)
+      if (mode == Each::Map) vm.array_push(out, Value::make_hole());
+      continue;
+    }
+    const Value item = a->items[i].unhole();
     Value call_args[3] = {item, num_value(i), self};
     Value r;
     if (!vm.call(fn, this_arg, call_args, 3, &r)) return false;
@@ -1021,10 +1026,13 @@ bool array_reduce_impl(Vm& vm, const Value& self, const Value* args, uint32_t ar
     acc = args[1];
   } else {
     if (a->length == 0) return vm.throw_error(ErrorKind::TypeError, "Reduce of empty array with no initial value");
+    while (i >= 0 && i < static_cast<int64_t>(a->length) && a->items[i].is_hole()) i += step;   // (the first element that is there)
+    if (i < 0 || i >= static_cast<int64_t>(a->length)) return vm.throw_error(ErrorKind::TypeError, "Reduce of empty array with no initial value");
     acc = a->items[i];
     i += step;
   }
   for (; i >= 0 && i < static_cast<int64_t>(a->length); i += step) {
+    if (a->items[i].is_hole()) continue;
     Value call_args[4] = {acc, a->items[i], num_value(static_cast<double>(i)), self};
     if (!vm.call(fn, Value(), call_args, 4, &acc)) return false;
   }

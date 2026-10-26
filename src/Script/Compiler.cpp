@@ -960,7 +960,8 @@ class Compiler {
             expression(e->a);
             emit(Opc::ArraySpread);
           } else {
-            expression(e);
+            if (e->kind == NodeKind::Ident && (e->flags & kFlagHole)) emit(Opc::PushHole);
+            else expression(e);
             emit(Opc::ArrayPush);
           }
         }
