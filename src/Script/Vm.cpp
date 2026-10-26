@@ -986,6 +986,7 @@ void Vm::define(JsObject* o, JsString* key, const Value& value, uint8_t flags) {
       for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value::make_hole();
       o->items[i] = value.unhole();
       if (i >= o->length) o->length = i + 1;
+      if (Env* e = mapped_env(o, i)) e->slots()[i] = o->items[i];
       return;
     }
   }
@@ -1075,6 +1076,16 @@ bool Vm::array_set_length(JsObject* a, uint32_t length) {
   return true;
 }
 
+Env* Vm::mapped_env(JsObject* o, uint32_t index) const {
+  if (!o->env || o->okind != ObjKind::Array || o->position != kArgumentsMark || !o->bound_this.is_number()) return nullptr;
+  return index < o->bound_this.u.number && index < o->length ? o->env : nullptr;
+}
+
+void Vm::sync_arguments(JsObject* o) {
+  for (uint32_t i = 0; i < o->length; ++i)
+    if (Env* e = mapped_env(o, i)) o->items[i] = e->slots()[i];
+}
+
 bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
   if (o->host && o->host->get && o->host->get(*this, o, key, out)) return true;
   if (o->okind == ObjKind::Primitive && o->bound_this.is_string() && !o->bound_this.as_string()->symbol) {   // new String('ab'): length and the characters
@@ -1097,6 +1108,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     uint32_t i;
     if (canonical_index(key->view(), &i)) {
       if (i < o->length && !o->items[i].is_hole()) {
+        if (Env* e = mapped_env(o, i)) o->items[i] = e->slots()[i];
         *out = o->items[i];
         return true;
       }
@@ -1284,6 +1296,7 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
   if (base.is_object() && array_index(key, &i)) {
     JsObject* o = base.as_object();
     if (o->okind == ObjKind::Array) {
+      if (Env* e = mapped_env(o, i)) o->items[i] = e->slots()[i];
       *out = i < o->length ? o->items[i].unhole() : Value();
       return true;
     }
@@ -1383,6 +1396,7 @@ bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, 
     if (o->okind == ObjKind::Array && !o->frozen) {
       if (i < o->length) {
         o->items[i] = value.unhole();
+        if (Env* e = mapped_env(o, i)) e->slots()[i] = o->items[i];
         return true;
       }
       if (o->non_extensible || o->sealed) {
@@ -2230,6 +2244,7 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
   }
   if (src.is_object() && src.as_object()->okind == ObjKind::Array) {
     JsObject* a = src.as_object();
+    refresh_arguments(a);
     if (it->position < a->length) {
       *out = a->items[it->position++].unhole();
       return true;
@@ -2340,6 +2355,10 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
     JsObject* list = new_array(argc);
     for (uint32_t k = 0; k < argc; ++k) array_push(list, args[k]);
     list->position = kArgumentsMark;   // (an array that stands for an arguments object: Object.prototype.toString says so)
+    if (code->mapped_arguments) {   // arguments[i] is parameter i for the parameters that were passed
+      list->env = env;
+      list->bound_this = Value::make_number(argc < code->param_count ? argc : code->param_count);
+    }
     slots[code->arguments_slot] = Value::make_object(list);
   }
   if (code->self_slot >= 0) slots[code->self_slot] = Value::make_object(fn);

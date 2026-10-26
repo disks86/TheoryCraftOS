@@ -73,7 +73,7 @@ struct FuncState {
 
 class Compiler {
  public:
-  Compiler(Vm& vm, String* error, bool library) : vm_(vm), error_(error), library_(library) {}
+  Compiler(Vm& vm, String* error, bool library) : vm_(vm), error_(error), library_(library), withs_(vm.allocator()) {}
 
   bool program(Node* block, FunctionCode** out) {
     FuncState fs(vm_.allocator());
@@ -84,6 +84,7 @@ class Compiler {
     fs.code->strict = (block->flags & kFlagStrict) != 0 || has_use_strict(block->list);
     cur_ = &fs;
     fs.completion_slot = static_cast<int32_t>(new_slot());
+    check_redeclarations(block->list);
     hoist_globals(block->list);
     init_functions(block->list);
     for (Node* s = block->list; s && !failed_; s = s->next) statement(s);
@@ -97,6 +98,35 @@ class Compiler {
   }
 
  private:
+  // The names a statement list declares with let, const and class twice, or with let / const / class and var (or a function) both, are an early error.
+  void check_redeclarations(const Node* list) {
+    for (const Node* s = list; s && !failed_; s = s->next) {
+      List<StringView> names(vm_.allocator());
+      if (s->kind == NodeKind::Var && s->var_kind != VarKind::Var) for (const Node* d = s->list; d; d = d->next) names.push_back(d->text);
+      else if (s->kind == NodeKind::Var) continue;
+      else if (s->kind == NodeKind::FunctionDecl) continue;
+      for (uint64_t i = 0; i < names.count(); ++i) {
+        const StringView name = names[i];
+        if (name.empty() || name[0] == '%') continue;
+        for (const Node* o = list; o; o = o->next) {
+          if (o == s) {   // (this declaration's own other declarators)
+            uint32_t seen = 0;
+            for (const Node* d = s->list; d; d = d->next) seen += d->text.equals(name) ? 1 : 0;
+            if (seen > 1) fail("Identifier has already been declared", s->line);
+            continue;
+          }
+          const bool same_name_lexical = o->kind == NodeKind::Var && o->var_kind != VarKind::Var;
+          if (o->kind == NodeKind::Var) {
+            for (const Node* d = o->list; d; d = d->next)
+              if (d->text.equals(name) && (same_name_lexical || true)) fail("Identifier has already been declared", s->line);
+          } else if (o->kind == NodeKind::FunctionDecl && o->text.equals(name)) {
+            fail("Identifier has already been declared", s->line);
+          }
+        }
+      }
+    }
+  }
+
   // Does a statement list begin with the "use strict" directive?
   static bool has_use_strict(const Node* list) {
     for (const Node* s = list; s && s->kind == NodeKind::ExprStmt && s->a && s->a->kind == NodeKind::String; s = s->next)
@@ -286,6 +316,7 @@ class Compiler {
       case NodeKind::ForIn:
       case NodeKind::ForOf: hoist_stmt(s->a, true); hoist_stmt(s->d, true); break;
       case NodeKind::While:
+      case NodeKind::With:
       case NodeKind::DoWhile: hoist_stmt(s->d, true); break;
       case NodeKind::Labeled: hoist_stmt(s->a, true); break;
       case NodeKind::Try: hoist_stmt(s->a, true); hoist_stmt(s->c, true); hoist_stmt(s->d, true); break;
@@ -355,7 +386,66 @@ class Compiler {
   }
 
   // --- Variables
+  // --- with: while the body of a with statement is compiled, a name is looked up in the object first
+  struct WithCtx {
+    FuncState* fs;
+    uint64_t mark;    // the bindings of fs from here on were declared inside the body (they shadow the object)
+    StringView var;   // the hidden variable that holds the object
+  };
+  // Is `name` bound inside the with statement (by a let, a parameter or a variable of a function in the body)?
+  bool bound_inside(const WithCtx& ctx, StringView name) {
+    for (FuncState* fs = cur_; fs; fs = fs->parent) {
+      for (uint64_t i = fs->bindings.count(); i > 0; --i) {
+        if (!fs->bindings[i - 1].name.equals(name)) continue;
+        if (fs == ctx.fs) return i - 1 >= ctx.mark;
+        for (FuncState* f = fs->parent; f; f = f->parent)
+          if (f == ctx.fs) return true;
+        return false;
+      }
+    }
+    return false;
+  }
+  bool with_applies(StringView name) const { return !withs_.empty() && !name.empty() && name[0] != '%' && name.find('.') == StringView::npos; }
+
   void load_name(StringView name, uint32_t line) {
+    if (!with_applies(name)) return load_plain(name, line);
+    List<uint32_t> ends(vm_.allocator());
+    for (uint64_t i = withs_.count(); i > 0; --i) {
+      const WithCtx ctx = withs_[i - 1];
+      if (bound_inside(ctx, name)) break;
+      emit(Opc::PushStr, static_cast<int32_t>(constant_string(name)), 0, line);
+      load_plain(ctx.var, line);
+      emit(binary_opcode(Op::In), 0, 0, line);
+      const uint32_t no = emit(Opc::JumpIfFalse);
+      load_plain(ctx.var, line);
+      emit(Opc::GetProp, static_cast<int32_t>(constant_string(name)), 0, line);
+      ends.push_back(emit(Opc::Jump));
+      patch(no);
+    }
+    load_plain(name, line);
+    for (uint64_t i = 0; i < ends.count(); ++i) patch(ends[i]);
+  }
+  void store_name(StringView name, uint32_t line, bool initialize = false) {
+    if (!with_applies(name) || initialize) return store_plain(name, line, initialize);
+    List<uint32_t> ends(vm_.allocator());
+    for (uint64_t i = withs_.count(); i > 0; --i) {
+      const WithCtx ctx = withs_[i - 1];
+      if (bound_inside(ctx, name)) break;
+      emit(Opc::PushStr, static_cast<int32_t>(constant_string(name)), 0, line);
+      load_plain(ctx.var, line);
+      emit(binary_opcode(Op::In), 0, 0, line);
+      const uint32_t no = emit(Opc::JumpIfFalse);
+      load_plain(ctx.var, line);   // [value, object]
+      emit(Opc::Swap);
+      emit(Opc::SetProp, static_cast<int32_t>(constant_string(name)), 0, line);   // [value]
+      ends.push_back(emit(Opc::Jump));
+      patch(no);
+    }
+    store_plain(name, line, initialize);
+    for (uint64_t i = 0; i < ends.count(); ++i) patch(ends[i]);
+  }
+
+  void load_plain(StringView name, uint32_t line) {
     uint32_t depth, slot;
     if (resolve(name, &depth, &slot)) {
       if (depth > 250) {
@@ -378,7 +468,7 @@ class Compiler {
     return k < 60000 ? static_cast<uint16_t>(kChecked + k) : kChecked;
   }
   // `initialize`: this store is the declaration itself (for (const x of ...) gives x its value), not an assignment.
-  void store_name(StringView name, uint32_t line, bool initialize = false) {
+  void store_plain(StringView name, uint32_t line, bool initialize = false) {
     uint32_t depth, slot;
     if (resolve(name, &depth, &slot)) {
       if (depth > 250) {
@@ -441,6 +531,11 @@ class Compiler {
       if (counting) fs.code->expected_args = params;
     }
     function_level_count_ = static_cast<uint32_t>(fs.bindings.count());
+    {
+      bool plain = !fs.code->strict && !fs.code->is_arrow && !(fn->flags & kFlagRest);
+      for (Node* p = fn->list; p && plain; p = p->next) plain = !p->a;
+      fs.code->mapped_arguments = plain;
+    }
     fs.code->param_count = params;
     fs.code->has_rest = (fn->flags & kFlagRest) != 0;
     if ((fn->flags & kFlagExpression) && !fn->text.empty()) {
@@ -596,6 +691,29 @@ class Compiler {
         } else {
           patch(to_else);
         }
+        return;
+      }
+      case NodeKind::With: {
+        if (cur_->code->strict) {
+          fail("Strict mode code may not include a with statement", n->line);
+          return;
+        }
+        expression(n->a);
+        String text(vm_.allocator());
+        text.append("%w");
+        text.append_uint(++with_counter_);
+        const StringView var = vm_.intern(text.view())->view();
+        const uint32_t slot = new_slot();
+        cur_->bindings.insert(function_level_count_, Binding{var, slot});
+        ++function_level_count_;
+        for (uint64_t m = 0; m < cur_->scope_marks.count(); ++m) ++cur_->scope_marks[m];
+        for (uint64_t k = 0; k < withs_.count(); ++k)
+          if (withs_[k].fs == cur_) ++withs_[k].mark;
+        store_plain(var, n->line, true);
+        emit(Opc::Pop);
+        withs_.push_back(WithCtx{cur_, cur_->bindings.count(), var});
+        statement(n->d);
+        withs_.remove_at(withs_.count() - 1);
         return;
       }
       case NodeKind::While: {
@@ -1434,6 +1552,8 @@ class Compiler {
   uint32_t function_level_count_ = 0;   // how many of the current function's bindings are function-level (parameters, var, functions)
   StringView pending_label_;
   StringView infer_name_;   // the name an anonymous function expression takes from where it is stored (var f = function () {}), taken by the next compile_function
+  List<WithCtx> withs_;     // the with statements whose body is being compiled
+  uint32_t with_counter_ = 0;
   List<uint32_t>* dummy_ = nullptr;
   List<uint32_t> optional_jumps_{vm_.allocator()};
   List<uint32_t> chain_jumps_{vm_.allocator()};   // the nullish exits of the optional chains being compiled (where each chain's begin in chain_marks_)

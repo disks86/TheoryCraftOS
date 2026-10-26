@@ -168,7 +168,8 @@ static void test_variables_and_functions() {
   CHECK(is("function f(a, b) { return this.x + a + b; } f.call({ x: 1 }, 2, 3)", "6"));
   CHECK(is("function f(a, b) { return this.x + a + b; } f.apply({ x: 1 }, [2, 3])", "6"));
   CHECK(is("function f(a, b) { return this.x + a + b; } var g = f.bind({ x: 1 }, 2); g(3)", "6"));
-  CHECK(is("(function(a) { a = 5; return arguments[0]; })(1)", "1"));
+  CHECK(is("(function(a) { a = 5; return arguments[0]; })(1)", "5"));   // (sloppy mode: the arguments object is mapped to the parameters)
+  CHECK(is("(function(a) { \"use strict\"; a = 5; return arguments[0]; })(1)", "1"));
   CHECK(is("var r = (function() { try { return 1; } finally { } })(); r", "1"));
   CHECK(is("typeof function() {}", "function"));
   CHECK(is("(function f(){}).name", "f"));

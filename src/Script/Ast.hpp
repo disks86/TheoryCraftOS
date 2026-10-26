@@ -32,6 +32,7 @@ enum class NodeKind : uint8_t {
   Call, New, Member, Index, Sequence, Spread,
   // statements
   Var, Declarator, ExprStmt, Block, If, For, ForIn, ForOf, While, DoWhile, Return, Break, Continue, Throw, Try, Switch, Case, FunctionDecl, Empty, Labeled,
+  With,   // with (a) d: the object expression is a, the body d
   OptionalChain,   // a chain of ./[]/() links with a ?. in it (a = the chain): a nullish value at a ?. makes the whole chain undefined
   Import,   // import declaration of a module (number: index of the request; list: Declarators, text = local name, a = String node with the imported name or null for `* as`)
 };

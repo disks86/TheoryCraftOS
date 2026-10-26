@@ -528,6 +528,7 @@ class Parser {
       if (w.equals("if")) return if_statement();
       if (w.equals("for")) return for_statement();
       if (w.equals("while")) return while_statement();
+      if (w.equals("with")) return with_statement();
       if (w.equals("do")) return do_statement();
       if (w.equals("return")) return return_statement();
       if (w.equals("break") || w.equals("continue")) return jump_statement();
@@ -928,6 +929,16 @@ class Parser {
       if (!n->c) return nullptr;
     }
     return n;
+  }
+
+  Node* with_statement() {
+    Node* n = make(NodeKind::With);
+    next();
+    if (!n || !expect(T::LParen, "Unexpected token")) return nullptr;
+    n->a = expression(false);
+    if (!n->a || !expect(T::RParen, "Unexpected token")) return nullptr;
+    n->d = statement();
+    return n->d ? n : nullptr;
   }
 
   Node* while_statement() {
