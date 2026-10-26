@@ -77,12 +77,28 @@ class AmdVcnSelfTest {
   // the CPU decoder's, so the pictures must be close (a level or two apart), not identical. What passing proves beyond the above: the message with the matrices and the
   // picture coding parameters, the two reference slots of the picture buffer. Not: field pictures, dual prime, other sizes.
   static Result run_mpeg2(allocators::IAllocator& allocator, const AmdVcnMpeg2Decoder::Engine& engine);
+  // The same check on any engine's MPEG-2 session (already prepared); see run_hevc_session for the callbacks.
+  static Result run_mpeg2_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring, uint64_t (*decoded)(const void*), const void* decoder);
   // The same for VC-1, with two streams (a Main profile one and an Advanced profile one, 64 x 64, eight pictures each with B pictures and reordering, made by
   // scripts/gen_vc1_synthetic.py; AmdVcnSelfTestVc1Stream.inc), both of which must pass. The pictures must be close to the CPU decoder's (nothing here has checked the
   // engine's VC-1 decoder against the standard: it is held to a level or two, which a wrong reference or a wrong table is far from). What passing proves beyond the
   // above: the profile and flags of the message (Simple and Main profile sizes in macroblocks), the frame data the firmware parses itself, the reference slots of the
   // picture buffer. Not: intensity compensation, interlace, range reduction, slices, other sizes.
   static Result run_vc1(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine);
+  // The same on any engine's VC-1 sessions. The test needs two (one per stream, the Main profile one given its sequence header as the configuration), so the engine's side is
+  // a host that makes them: open() makes and prepares a session for the configuration (false: refused), close() ends it, wedged() and decoded() tell what the engine did.
+  class Vc1SessionHost {
+   public:
+    virtual bool open(const DecoderConfig& config) = 0;
+    virtual IVideoDecoder& session() = 0;
+    virtual bool wedged() const = 0;
+    virtual uint64_t decoded() const = 0;   // pictures the engine itself decoded in the open session
+    virtual void close() = 0;
+
+   protected:
+    ~Vc1SessionHost() = default;
+  };
+  static Result run_vc1_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host);
   static const char* result_name(Result result);
 };
 

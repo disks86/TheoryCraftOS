@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +34,8 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6VideoEngine.hpp"
 #include "Hardware/VideoCodec/Software/H264.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg2.hpp"
+#include "Hardware/VideoCodec/Software/Vc1.hpp"
 #include "FakeAmdUvd6.hpp"
 #include "FakeAmdVcn.hpp"
 
@@ -81,6 +84,8 @@ constexpr uint32_t kConfigMemsize = 0x150a, kFbLocation = 0x809, kGbAddrConfig =
 }  // namespace reg
 
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc"   // the H.265 stream the engine's self-test decodes
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestMpeg2Stream.inc"   // and the MPEG-2 one
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestVc1Stream.inc"   // and the two VC-1 ones
 
 constexpr uint64_t kMiB = 1ull << 20;
 constexpr uint64_t kAperturePhysical = 0xD000'0000ull, kApertureBytes = 256 * kMiB;
@@ -171,6 +176,70 @@ static bool make_hevc_expected(allocators::IAllocator& a, HevcExpected* out) {
   return take() && got == kHevcSelfTestPictures && out->poc.size() == kHevcSelfTestPictures;
 }
 
+// The MPEG-2 stream's pictures, by presentation time (packet k has k * 1000).
+static bool make_mpeg2_expected(allocators::IAllocator& a, Expected* out) {
+  const ConstByteView stream(kMpeg2SelfTestStream);
+  out->luma.assign(kMpeg2SelfTestPictures, {});
+  out->chroma.assign(kMpeg2SelfTestPictures, {});
+  Mpeg2Decoder cpu(a);
+  VideoFrame f;
+  uint32_t got = 0;
+  auto take = [&] {
+    while (cpu.receive(&f)) {
+      const uint32_t k = static_cast<uint32_t>(f.pts_us / 1000);
+      if (k >= kMpeg2SelfTestPictures) return false;
+      std::vector<uint8_t>& y = out->luma[k];
+      std::vector<uint8_t>& c = out->chroma[k];
+      for (uint32_t row = 0; row < f.format.plane_height(0); ++row) y.insert(y.end(), f.plane[0] + uint64_t{row} * f.stride[0], f.plane[0] + uint64_t{row} * f.stride[0] + f.format.plane_width(0));
+      for (uint32_t row = 0; row < f.format.plane_height(1); ++row)
+        for (uint32_t col = 0; col < f.format.plane_width(1); ++col) {
+          c.push_back(f.plane[1][uint64_t{row} * f.stride[1] + col]);
+          c.push_back(f.plane[2][uint64_t{row} * f.stride[2] + col]);
+        }
+      ++got;
+    }
+    return true;
+  };
+  for (uint32_t i = 0; i < kMpeg2SelfTestPictures; ++i) {
+    const uint64_t start = i == 0 ? 0 : kMpeg2SelfTestEnds[i - 1];
+    if (!cpu.decode(stream.subview(start, kMpeg2SelfTestEnds[i] - start), int64_t{i} * 1000) || !take()) return false;
+  }
+  cpu.flush();
+  return take() && got == kMpeg2SelfTestPictures;
+}
+
+// A VC-1 test stream's pictures, by presentation time; `config` is the Main profile sequence header (null for the Advanced profile stream).
+static bool make_vc1_expected(allocators::IAllocator& a, const uint8_t* config, ConstByteView stream, const uint64_t* ends, Expected* out) {
+  out->luma.assign(kVc1SelfTestPictures, {});
+  out->chroma.assign(kVc1SelfTestPictures, {});
+  Vc1Decoder cpu(a);
+  if (config && !cpu.configure(ConstByteView(config, 4), kVc1SelfTestSize, kVc1SelfTestSize)) return false;
+  VideoFrame f;
+  uint32_t got = 0;
+  auto take = [&] {
+    while (cpu.receive(&f)) {
+      const uint32_t k = static_cast<uint32_t>(f.pts_us / 1000);
+      if (k >= kVc1SelfTestPictures) return false;
+      std::vector<uint8_t>& y = out->luma[k];
+      std::vector<uint8_t>& c = out->chroma[k];
+      for (uint32_t row = 0; row < f.format.plane_height(0); ++row) y.insert(y.end(), f.plane[0] + uint64_t{row} * f.stride[0], f.plane[0] + uint64_t{row} * f.stride[0] + f.format.plane_width(0));
+      for (uint32_t row = 0; row < f.format.plane_height(1); ++row)
+        for (uint32_t col = 0; col < f.format.plane_width(1); ++col) {
+          c.push_back(f.plane[1][uint64_t{row} * f.stride[1] + col]);
+          c.push_back(f.plane[2][uint64_t{row} * f.stride[2] + col]);
+        }
+      ++got;
+    }
+    return true;
+  };
+  for (uint32_t i = 0; i < kVc1SelfTestPictures; ++i) {
+    const uint64_t start = i == 0 ? 0 : ends[i - 1];
+    if (!cpu.decode(stream.subview(start, ends[i] - start), int64_t{i} * 1000) || !take()) return false;
+  }
+  cpu.flush();
+  return take() && got == kVc1SelfTestPictures;
+}
+
 struct FakeMapper final : IRegisterMapper {
   uint8_t* host = nullptr;
   uint64_t physical_base = 0, size = 0;
@@ -192,6 +261,10 @@ struct Card final : IVcnRegisters {
   fakevcn::FakeClock clock;
   const Expected* expected = nullptr;
   const HevcExpected* hevc = nullptr;
+  const Expected* mpeg2 = nullptr;
+  const Expected* vc1_main = nullptr;
+  const Expected* vc1_advanced = nullptr;
+  std::set<uint32_t> job_commands;   // the commands named since the last engine start
   std::map<uint32_t, uint64_t> buffer;
   uint64_t block_gpu = 0;
   const uint8_t* block_host = nullptr;
@@ -200,8 +273,8 @@ struct Card final : IVcnRegisters {
   bool smc_running = true;
   uint32_t smc_result = 1;
   std::vector<std::pair<uint32_t, size_t>> smc_log;   // (message, index of the write in ring.writes)
-  bool boots = true, write_pictures = true, write_hevc = true, hang_hevc = false;
-  int boot_attempts = 0, creates = 0, hevc_creates = 0, destroys = 0, decodes = 0, hevc_decodes = 0, problems = 0;
+  bool boots = true, write_pictures = true, write_hevc = true, hang_hevc = false, write_mpeg2 = true, hang_mpeg2 = false, write_vc1 = true, hang_vc1 = false;
+  int boot_attempts = 0, creates = 0, hevc_creates = 0, mpeg2_creates = 0, vc1_creates = 0, destroys = 0, decodes = 0, hevc_decodes = 0, mpeg2_decodes = 0, vc1_decodes = 0, problems = 0;
 
   Card() {
     mapper.host = arena.get();
@@ -214,6 +287,7 @@ struct Card final : IVcnRegisters {
     ring.write(reg::kFbLocation, ((0xF4u + 255) << 16) | 0xF4u);
     ring.write(reg::kGbAddrConfig, 0x22011003);
     ring.write(0x95, 1);   // SMC_RESP_0: idle, the last message was done
+    ring.write(0x38c4, 0xBEEF00);   // UVD_POWER_STATUS: something recognisable for the failure messages
   }
   uint32_t read(uint32_t r) override { return ring.read(r); }
   void write(uint32_t r, uint32_t v) override {
@@ -250,11 +324,14 @@ struct Card final : IVcnRegisters {
   }
   void on_command(uint32_t command, uint64_t address) {
     buffer[command] = address;
+    job_commands.insert(command);
     if (command != 0) return;
     const uint8_t* m = ring.translate(address, kMsgBytes);
     if (!m) { problem("message outside the card's memory"); return; }
     if (word(m, 4) == 0) {
       if (word(m, 16) == 0x10) ++hevc_creates;
+      else if (word(m, 16) == 3) ++mpeg2_creates;
+      else if (word(m, 16) == 1) ++vc1_creates;
       else ++creates;
     }
     else if (word(m, 4) == 2) ++destroys;
@@ -283,14 +360,82 @@ struct Card final : IVcnRegisters {
     for (uint32_t y = 0; y < 64; ++y) memcpy(target + uint64_t{pitch} * y, hevc->luma[k].data() + y * 64, 64);
     for (uint32_t y = 0; y < 32; ++y) memcpy(target + chroma_offset + uint64_t{pitch} * y, hevc->chroma[k].data() + y * 64, 64);
   }
+  // The MPEG-2 picture: no context buffer and no scaling table in the job, references among the last six jobs, the slices behind a start code; the CPU's picture for the
+  // k-th job goes into the target.
+  void on_mpeg2(const uint8_t* m, const std::set<uint32_t>& commands, uint32_t height, uint32_t pitch, uint32_t chroma_offset) {
+    ++mpeg2_decodes;
+    if (hang_mpeg2) ring.stall_fence = true;
+    constexpr uint32_t kCodec = dec(52);
+    const uint32_t current = word(m, kCodec + 0), forward = word(m, kCodec + 4), backward = word(m, kCodec + 8);
+    if (commands.count(0x206) || commands.count(0x204)) problem("MPEG-2 job names a context buffer or a scaling table");
+    for (uint32_t c : {0u, 1u, 2u, 3u, 5u, 0x100u})
+      if (!commands.count(c)) problem("MPEG-2 job lacks a buffer");
+    if (current == 0 || forward >= current || backward >= current || current - forward > 6 || current - backward > 6) problem("MPEG-2 references outside the last six jobs");
+    if (word(m, dec(5)) == 0 || word(m, dec(7)) != 0 || word(m, dec(2)) != 64 || height != 64) problem("MPEG-2 message with the wrong buffer sizes");
+    const uint8_t* bits = ring.translate(buffer[0x100], 4);
+    if (!bits || bits[0] != 0 || bits[1] != 0 || bits[2] != 1) problem("MPEG-2 bitstream does not start with a start code");
+    if (!mpeg2 || !write_mpeg2) return;
+    const uint32_t k = (current - 1) % static_cast<uint32_t>(mpeg2->luma.size());
+    const uint64_t target_bytes = uint64_t{chroma_offset} + uint64_t{pitch} * (height / 2);
+    uint8_t* target = ring.translate(buffer[2], target_bytes);
+    if (!target || pitch < 64 || uint64_t{pitch} * 64 > chroma_offset) { problem("target does not hold a 64 x 64 picture"); return; }
+    for (uint32_t y = 0; y < 64; ++y) memcpy(target + uint64_t{pitch} * y, mpeg2->luma[k].data() + y * 64, 64);
+    for (uint32_t y = 0; y < 32; ++y) memcpy(target + chroma_offset + uint64_t{pitch} * y, mpeg2->chroma[k].data() + y * 64, 64);
+  }
+  // The VC-1 picture: no context buffer and no scaling table in the job, the profile and the size as Mesa gives them (macroblocks for Simple and Main, samples for Advanced), the
+  // frame data behind it - which tells which picture of the stream this is, and the CPU's picture for it goes into the target.
+  void on_vc1(const uint8_t* m, const std::set<uint32_t>& commands, uint32_t /*height in the message: macroblocks for Simple and Main*/, uint32_t pitch, uint32_t chroma_offset) {
+    constexpr uint32_t height = 64;
+    ++vc1_decodes;
+    if (hang_vc1) ring.stall_fence = true;
+    constexpr uint32_t kCodec = dec(52);
+    const uint32_t profile = word(m, kCodec + 0);
+    if (commands.count(0x206) || commands.count(0x204)) problem("VC-1 job names a context buffer or a scaling table");
+    for (uint32_t c : {0u, 1u, 2u, 3u, 5u, 0x100u})
+      if (!commands.count(c)) problem("VC-1 job lacks a buffer");
+    const bool advanced = profile == 2;
+    if (profile != 1 && profile != 2) { problem("VC-1 profile is neither Main nor Advanced"); return; }
+    if (word(m, dec(2)) != (advanced ? 64u : 4u) || word(m, dec(3)) != (advanced ? 64u : 4u) || word(m, dec(5)) == 0 || word(m, dec(7)) != 0) problem("VC-1 message with the wrong size or buffers");
+    const Expected* expected = advanced ? vc1_advanced : vc1_main;
+    if (!expected || !write_vc1) return;
+    // Which picture: the frame data is the packet of the stream (the Advanced profile's behind a start code of its own when the packet has none).
+    const uint8_t* bits = ring.translate(buffer[0x100], 64);
+    if (!bits) { problem("VC-1 bitstream outside the card's memory"); return; }
+    const ConstByteView stream = advanced ? ConstByteView(kVc1SelfTestAdvancedStream) : ConstByteView(kVc1SelfTestMainStream);
+    const uint64_t* ends = advanced ? kVc1SelfTestAdvancedEnds : kVc1SelfTestMainEnds;
+    uint32_t k = kVc1SelfTestPictures;
+    for (uint32_t i = 0; i < kVc1SelfTestPictures && k == kVc1SelfTestPictures; ++i) {
+      const uint64_t start = i == 0 ? 0 : ends[i - 1];
+      const uint64_t length = ends[i] - start;
+      // (The packet may carry the sequence and entry point headers before the frame, and the frame may come with a start code of its own in front of it.)
+      for (uint32_t offset : {0u, 4u})
+        if (length >= 24 && memmem(stream.data() + start, length, bits + offset, 24) != nullptr) { k = i; break; }
+    }
+    if (k == kVc1SelfTestPictures) { problem("VC-1 frame data is no picture of the stream"); return; }
+    const uint64_t target_bytes = uint64_t{chroma_offset} + uint64_t{pitch} * (height / 2);
+    uint8_t* target = ring.translate(buffer[2], target_bytes);
+    if (!target || pitch < 64 || uint64_t{pitch} * 64 > chroma_offset) { problem("target does not hold a 64 x 64 picture"); return; }
+    for (uint32_t y = 0; y < 64; ++y) memcpy(target + uint64_t{pitch} * y, expected->luma[k].data() + y * 64, 64);
+    for (uint32_t y = 0; y < 32; ++y) memcpy(target + chroma_offset + uint64_t{pitch} * y, expected->chroma[k].data() + y * 64, 64);
+  }
   void on_engine() {
     uint8_t m[kMsgBytes];
     const uint8_t* source = ring.translate(buffer[0], sizeof m);
     if (!source) { problem("decode message outside the card's memory"); return; }
     memcpy(m, source, sizeof m);
     const uint32_t height = word(m, dec(3)), pitch = word(m, dec(24)), chroma_offset = word(m, dec(30));
+    const std::set<uint32_t> commands = job_commands;
+    job_commands.clear();
     if (word(m, dec(0)) == 0x10 && word(m, 4) == 1 && word(m, 0) == kMsgBytes) {
       on_hevc(m, height, pitch, chroma_offset);
+      return;
+    }
+    if (word(m, dec(0)) == 3 && word(m, 4) == 1 && word(m, 0) == kMsgBytes) {
+      on_mpeg2(m, commands, height, pitch, chroma_offset);
+      return;
+    }
+    if (word(m, dec(0)) == 1 && word(m, 4) == 1 && word(m, 0) == kMsgBytes) {
+      on_vc1(m, commands, height, pitch, chroma_offset);
       return;
     }
     const uint32_t k = static_cast<uint32_t>(decodes++);
@@ -386,17 +531,18 @@ static bool run_hevc_stream(IVideoDecoder& session, const HevcExpected& e) {
   return same && count == kHevcSelfTestPictures;
 }
 
-// Damaged H.265 streams through an engine session: every packet truncated at some point, and single bits flipped across the stream. Nothing may crash or hang (the
+// Damaged streams of one codec through an engine session: every packet truncated at some point, and single bits flipped across the stream. Nothing may crash or hang (the
 // sanitizers are watching), the engine must not wedge, and the session must still hand back as many pictures as it was given or fewer.
-static void damaged_hevc_streams(AmdUvd6VideoEngine& engine, Card& card) {
-  const ConstByteView stream(kHevcSelfTestStream);
+static void damaged_streams(AmdUvd6VideoEngine& engine, Card& card, VideoCodec codec, ConstByteView stream, const uint64_t* packet_ends, uint32_t packets, ConstByteView codec_config = ConstByteView()) {
   DecoderConfig config = h264_config();
-  config.codec = VideoCodec::Hevc;
+  config.codec = codec;
+  config.codec_config = codec_config;
+  config.width = config.height = 64;
   card.quiet = true;
   const int problems_before = card.problems;
   for (uint32_t variant = 0; variant < 48; ++variant) {
     std::vector<uint8_t> bytes(stream.data(), stream.data() + stream.size());
-    std::vector<uint64_t> ends(kHevcSelfTestEnds, kHevcSelfTestEnds + kHevcSelfTestPictures);
+    std::vector<uint64_t> ends(packet_ends, packet_ends + packets);
     if (variant < 12) {
       // Packet `variant / 2` ends early (halfway, or all but a few bytes).
       const uint32_t i = variant / 2;
@@ -413,7 +559,7 @@ static void damaged_hevc_streams(AmdUvd6VideoEngine& engine, Card& card) {
     CHECK(static_cast<bool>(session));
     uint32_t frames = 0;
     VideoFrame f;
-    for (uint32_t i = 0; i < kHevcSelfTestPictures; ++i) {
+    for (uint32_t i = 0; i < packets; ++i) {
       const uint64_t start = i == 0 ? 0 : ends[i - 1];
       VideoPacket p;
       p.data = ConstByteView(bytes.data() + start, ends[i] - start);
@@ -425,13 +571,72 @@ static void damaged_hevc_streams(AmdUvd6VideoEngine& engine, Card& card) {
     }
     session->flush();
     while (session->receive(&f)) ++frames;
-    CHECK(frames <= kHevcSelfTestPictures);
+    CHECK(frames <= packets);
   }
   card.quiet = false;
   (void)problems_before;
 }
 
-enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses };
+// Feeds the MPEG-2 self-test stream to a session; true when every picture came out as the CPU's luma (by presentation time).
+static bool run_mpeg2_stream(IVideoDecoder& session, const Expected& e) {
+  const ConstByteView stream(kMpeg2SelfTestStream);
+  uint32_t count = 0;
+  bool same = true;
+  auto drain_all = [&] {
+    VideoFrame f;
+    while (session.receive(&f)) {
+      const uint32_t k = static_cast<uint32_t>(f.pts_us / 1000);
+      if (k >= e.luma.size()) { same = false; continue; }
+      for (uint32_t y = 0; y < 64 && same; ++y)
+        for (uint32_t x = 0; x < 64; ++x)
+          if (f.plane[0][uint64_t{y} * f.stride[0] + x] != e.luma[k][y * 64 + x]) { same = false; break; }
+      ++count;
+    }
+  };
+  for (uint32_t i = 0; i < kMpeg2SelfTestPictures; ++i) {
+    VideoPacket p;
+    const uint64_t start = i == 0 ? 0 : kMpeg2SelfTestEnds[i - 1];
+    p.data = stream.subview(start, kMpeg2SelfTestEnds[i] - start);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return false;
+    drain_all();
+  }
+  session.flush();
+  drain_all();
+  return same && count == kMpeg2SelfTestPictures;
+}
+
+// Feeds one of the VC-1 test streams to a session; true when every picture came out as the CPU's luma (by presentation time).
+static bool run_vc1_stream(IVideoDecoder& session, ConstByteView stream, const uint64_t* ends, const Expected& e) {
+  uint32_t count = 0;
+  bool same = true;
+  auto drain_all = [&] {
+    VideoFrame f;
+    while (session.receive(&f)) {
+      const uint32_t k = static_cast<uint32_t>(f.pts_us / 1000);
+      if (k >= e.luma.size()) { same = false; continue; }
+      for (uint32_t y = 0; y < 64 && same; ++y)
+        for (uint32_t x = 0; x < 64; ++x)
+          if (f.plane[0][uint64_t{y} * f.stride[0] + x] != e.luma[k][y * 64 + x]) { same = false; break; }
+      ++count;
+    }
+  };
+  for (uint32_t i = 0; i < kVc1SelfTestPictures; ++i) {
+    VideoPacket p;
+    const uint64_t start = i == 0 ? 0 : ends[i - 1];
+    p.data = stream.subview(start, ends[i] - start);
+    p.pts_us = int64_t{i} * 1000;
+    p.keyframe = i == 0;
+    if (session.submit(p) != SubmitResult::Accepted) return false;
+    drain_all();
+  }
+  session.flush();
+  drain_all();
+  return same && count == kVc1SelfTestPictures;
+}
+
+enum class Fault { None, NoFirmware, NoRegisters, SmallAperture, MapperRefuses, NoBoot, NoGbConfig, DeadRing, WrongPictures, Hang, HevcWrong, HevcHang, SmcNotRunning, SmcRefuses, Mpeg2Wrong, Mpeg2Hang, Vc1Wrong, Vc1Hang };
 
 static void run_case(Fault fault) {
   TestAllocator a;
@@ -440,11 +645,23 @@ static void run_case(Fault fault) {
     CHECK(make_expected(a, &expected));
     HevcExpected hevc;
     CHECK(make_hevc_expected(a, &hevc));
+    Expected mpeg2;
+    CHECK(make_mpeg2_expected(a, &mpeg2));
+    Expected vc1_main, vc1_advanced;
+    CHECK(make_vc1_expected(a, kVc1SelfTestMainConfig, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds, &vc1_main));
+    CHECK(make_vc1_expected(a, nullptr, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds, &vc1_advanced));
     Card card;
     card.expected = &expected;
     card.hevc = &hevc;
     card.write_hevc = fault != Fault::HevcWrong;
     card.hang_hevc = fault == Fault::HevcHang;
+    card.mpeg2 = &mpeg2;
+    card.write_mpeg2 = fault != Fault::Mpeg2Wrong;
+    card.hang_mpeg2 = fault == Fault::Mpeg2Hang;
+    card.vc1_main = &vc1_main;
+    card.vc1_advanced = &vc1_advanced;
+    card.write_vc1 = fault != Fault::Vc1Wrong;
+    card.hang_vc1 = fault == Fault::Vc1Hang;
     if (fault == Fault::SmcNotRunning) card.ring.write(0x95, 0), card.smc_running = false;
     if (fault == Fault::SmcRefuses) card.smc_result = 0xFF;
     card.boots = fault != Fault::NoBoot;
@@ -483,16 +700,19 @@ static void run_case(Fault fault) {
     card.place(engine.plan(), engine.firmware().ucode());
     const size_t writes_before = card.ring.writes.size();
     const bool started = engine.start_hardware(card.clock);
-    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses;
+    const bool engine_up = fault == Fault::None || fault == Fault::HevcWrong || fault == Fault::SmcNotRunning || fault == Fault::SmcRefuses || fault == Fault::Mpeg2Wrong || fault == Fault::Vc1Wrong;
     CHECK(started == engine_up);
     CHECK(card.problems == 0 || fault == Fault::WrongPictures);
     if (engine_up) {
-      const bool hevc_on = fault != Fault::HevcWrong;
+      const bool hevc_on = fault != Fault::HevcWrong, mpeg2_on = fault != Fault::Mpeg2Wrong, vc1_on = fault != Fault::Vc1Wrong;
       CHECK(engine.engine_running() && engine.decode_ready() && engine.hevc_ready() == hevc_on);
-      CHECK(engine.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | (hevc_on ? codec_mask(VideoCodec::Hevc) : 0u)));
-      CHECK(strstr(engine.engine_note(), hevc_on ? "H.264 and H.265 decode run on it" : "H.265 self-test failed") != nullptr && strstr(engine.engine_summary(), "UVD 6.3") != nullptr);
+      CHECK(engine.mpeg2_ready() == mpeg2_on && engine.vc1_ready() == vc1_on);
+      CHECK(engine.info().accelerated_decode_codecs == (codec_mask(VideoCodec::H264) | (hevc_on ? codec_mask(VideoCodec::Hevc) : 0u) | (mpeg2_on ? codec_mask(VideoCodec::Mpeg2) : 0u) | (vc1_on ? codec_mask(VideoCodec::Vc1) : 0u)));
+      CHECK(strstr(engine.engine_note(), !hevc_on ? "H.265 self-test failed" : !mpeg2_on ? "MPEG-2 self-test failed" : !vc1_on ? "VC-1 self-test failed" : "H.264, H.265, MPEG-2 and VC-1 decode run on it") != nullptr && strstr(engine.engine_summary(), "UVD 6.3") != nullptr);
       // The tests opened and closed their own sessions: H.264 (five pictures) and H.265 (six; its session is made even when the test then fails).
-      CHECK(card.creates == 1 && card.hevc_creates == 1 && card.destroys == 2 && card.decodes == int(AmdVcnSelfTest::kPictures));
+      CHECK(card.creates == 1 && card.hevc_creates == 1 && card.mpeg2_creates == 1 && card.vc1_creates == (vc1_on ? 2 : 1) && card.destroys == (vc1_on ? 5 : 4) && card.decodes == int(AmdVcnSelfTest::kPictures));
+      CHECK(mpeg2_on ? card.mpeg2_decodes == int(kMpeg2SelfTestPictures) : card.mpeg2_decodes > 0);
+      CHECK(vc1_on ? card.vc1_decodes == int(2 * kVc1SelfTestPictures) : card.vc1_decodes > 0);
       CHECK(hevc_on ? card.hevc_decodes == int(kHevcSelfTestPictures) : card.hevc_decodes > 0);   // (a failing test stops at the first wrong picture)
       // H.264 sessions are the engine's: the stream decodes on it (decodes go up) and comes out as the CPU's pictures.
       {
@@ -516,8 +736,49 @@ static void run_case(Fault fault) {
         CHECK(static_cast<bool>(second) && run_hevc_stream(*second, hevc) && card.hevc_decodes == before);
         CHECK(run_hevc_stream(*first, hevc) && card.hevc_decodes == before + (hevc_on ? int(kHevcSelfTestPictures) : 0));
       }
+      // MPEG-2 sessions are the engine's when its test passed, the CPU's when it did not.
+      {
+        DecoderConfig mpeg2_config = h264_config();
+        mpeg2_config.codec = VideoCodec::Mpeg2;
+        const int before = card.mpeg2_decodes;
+        UniquePointer<IVideoDecoder> first = engine.create_decoder(mpeg2_config);
+        CHECK(static_cast<bool>(first));
+        UniquePointer<IVideoDecoder> second = engine.create_decoder(mpeg2_config);   // (the engine is busy: the CPU's)
+        CHECK(static_cast<bool>(second) && run_mpeg2_stream(*second, mpeg2) && card.mpeg2_decodes == before);
+        CHECK(run_mpeg2_stream(*first, mpeg2) && card.mpeg2_decodes == before + (mpeg2_on ? int(kMpeg2SelfTestPictures) : 0));
+      }
+      // VC-1 sessions (the Main profile stream takes its sequence header as the configuration): the engine's when its test passed, the CPU's when it did not.
+      {
+        DecoderConfig vc1_config = h264_config();
+        vc1_config.codec = VideoCodec::Vc1;
+        vc1_config.width = vc1_config.height = kVc1SelfTestSize;
+        vc1_config.codec_config = ConstByteView(kVc1SelfTestMainConfig, 4);
+        const int before = card.vc1_decodes;
+        UniquePointer<IVideoDecoder> first = engine.create_decoder(vc1_config);
+        CHECK(static_cast<bool>(first));
+        UniquePointer<IVideoDecoder> second = engine.create_decoder(vc1_config);   // (the engine is busy: the CPU's)
+        CHECK(static_cast<bool>(second) && run_vc1_stream(*second, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds, vc1_main) && card.vc1_decodes == before);
+        CHECK(run_vc1_stream(*first, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds, vc1_main) && card.vc1_decodes == before + (vc1_on ? int(kVc1SelfTestPictures) : 0));
+      }
+      if (vc1_on) {
+        damaged_streams(engine, card, VideoCodec::Vc1, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds, kVc1SelfTestPictures);
+        damaged_streams(engine, card, VideoCodec::Vc1, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds, kVc1SelfTestPictures, ConstByteView(kVc1SelfTestMainConfig, 4));
+        DecoderConfig vc1_config = h264_config();
+        vc1_config.codec = VideoCodec::Vc1;
+        const int before = card.vc1_decodes;
+        UniquePointer<IVideoDecoder> clean = engine.create_decoder(vc1_config);
+        CHECK(static_cast<bool>(clean) && run_vc1_stream(*clean, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds, vc1_advanced) && card.vc1_decodes == before + int(kVc1SelfTestPictures));
+      }
+      if (mpeg2_on) {
+        damaged_streams(engine, card, VideoCodec::Mpeg2, ConstByteView(kMpeg2SelfTestStream), kMpeg2SelfTestEnds, kMpeg2SelfTestPictures);
+        DecoderConfig mpeg2_config = h264_config();
+        mpeg2_config.codec = VideoCodec::Mpeg2;
+        const int before = card.mpeg2_decodes;
+        UniquePointer<IVideoDecoder> clean = engine.create_decoder(mpeg2_config);
+        CHECK(static_cast<bool>(clean) && run_mpeg2_stream(*clean, mpeg2) && card.mpeg2_decodes == before + int(kMpeg2SelfTestPictures));
+      }
       if (hevc_on) {
-        damaged_hevc_streams(engine, card);
+        damaged_streams(engine, card, VideoCodec::Hevc, ConstByteView(kHevcSelfTestStream), kHevcSelfTestEnds, kHevcSelfTestPictures);
         // Damage did not hurt the engine: a clean stream still decodes on it afterwards.
         DecoderConfig hevc_config = h264_config();
         hevc_config.codec = VideoCodec::Hevc;
@@ -549,16 +810,20 @@ static void run_case(Fault fault) {
       // Not trusted, or never started: nothing running, nothing accelerated, and H.264 is still served (by the CPU).
       CHECK(!engine.engine_running() && !engine.decode_ready() && engine.info().accelerated_decode_codecs == 0);
       const char* expected_note = fault == Fault::NoBoot ? "did not answer" : fault == Fault::NoGbConfig ? "address configuration" : fault == Fault::DeadRing ? "did not run a register write" :
-                                  fault == Fault::Hang || fault == Fault::HevcHang ? "engine stopped" : "self-test failed";
+                                  fault == Fault::Hang || fault == Fault::HevcHang || fault == Fault::Mpeg2Hang || fault == Fault::Vc1Hang ? "engine stopped" : "self-test failed";
       CHECK(strstr(engine.engine_note(), expected_note) != nullptr);
       if (fault != Fault::NoBoot && fault != Fault::NoGbConfig) CHECK(strstr(engine.firmware_status(), "engine stopped") != nullptr || strstr(engine.firmware_status(), "stopped") != nullptr);
       const int before = card.decodes;
       UniquePointer<IVideoDecoder> software = engine.create_decoder(h264_config());
       CHECK(static_cast<bool>(software) && run_stream(a, *software, expected) && card.decodes == before);
       // Whatever stopped the engine, the power the SMC gave it is given back.
-      if (fault == Fault::NoBoot || fault == Fault::DeadRing || fault == Fault::WrongPictures || fault == Fault::Hang || fault == Fault::HevcHang)
+      if (fault == Fault::NoBoot || fault == Fault::DeadRing || fault == Fault::WrongPictures || fault == Fault::Hang || fault == Fault::HevcHang || fault == Fault::Mpeg2Hang || fault == Fault::Vc1Hang)
         CHECK(card.smc_log.size() == 2 && card.smc_log[0].first == 0x61 && card.smc_log[1].first == 0x60);
       if (fault == Fault::NoGbConfig) CHECK(card.smc_log.empty());   // (refused before anything is asked of the card)
+      // The failure messages carry the engine's registers (for the first run on a real card): at the moment the start gave up, not after the stop sequence.
+      if (fault == Fault::NoBoot) CHECK(strstr(engine.firmware_status(), "st=0x0 pw=0xBEEF00 rst=0x0 cn=0x") != nullptr);
+      if (fault == Fault::WrongPictures || fault == Fault::Hang) CHECK(strstr(engine.firmware_status(), "self-test failed") != nullptr && strstr(engine.firmware_status(), "pw=0xBEEF00") != nullptr);
+      if (fault == Fault::DeadRing) CHECK(strstr(engine.firmware_status(), "pw=0xBEEF00") != nullptr && strstr(engine.firmware_status(), "rp=0x0 wp=0x") != nullptr);
       if (fault == Fault::NoBoot) CHECK(card.boot_attempts == 1 + 3);   // the release that starts the VCPU, then three tries (not the driver's ten)
     }
   }
@@ -566,7 +831,7 @@ static void run_case(Fault fault) {
 }
 
 int main() {
-  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses}) {
+  for (Fault f : {Fault::None, Fault::NoFirmware, Fault::NoRegisters, Fault::SmallAperture, Fault::MapperRefuses, Fault::NoBoot, Fault::NoGbConfig, Fault::DeadRing, Fault::WrongPictures, Fault::Hang, Fault::HevcWrong, Fault::HevcHang, Fault::SmcNotRunning, Fault::SmcRefuses, Fault::Mpeg2Wrong, Fault::Mpeg2Hang, Fault::Vc1Wrong, Fault::Vc1Hang}) {
     printf("case %d\n", static_cast<int>(f));
     run_case(f);
   }

@@ -28,7 +28,7 @@ using filesystem::Status;
 
 constexpr int64_t kEperm = 1, kEnoent = 2, kEio = 5, kEbadf = 9, kEnomem = 12, kEacces = 13, kEfault = 14, kEbusy = 16, kEexist = 17, kEnodev = 19, kEnotdir = 20,
                   kEisdir = 21, kEinval = 22, kEmfile = 24, kEnotty = 25, kEfbig = 27, kEnospc = 28, kEspipe = 29, kErofs = 30, kErange = 34, kEnametoolong = 36,
-                  kEnosys = 38, kEnotempty = 39, kEopnotsupp = 95;
+                  kEnosys = 38, kEnotempty = 39, kEopnotsupp = 95, kEloop = 40;
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 constexpr uint64_t kAtRemoveDir = 0x200, kAtEmptyPath = 0x1000;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u, kIovMax = 1024, kChunk = 4096;
@@ -56,6 +56,7 @@ uint64_t errno_of(Status status) {
     case Status::AccessDenied:
     case Status::LoginRequired:
     case Status::LoginFailed: return error(kEacces);
+    case Status::TooManyLinks: return error(kEloop);
     default: return error(kEio);
   }
 }

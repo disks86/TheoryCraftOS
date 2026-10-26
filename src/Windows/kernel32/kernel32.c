@@ -1297,27 +1297,34 @@ EXPORT BOOL WINAPI FlushViewOfFile(LPCVOID base, SIZE_T bytes) {
 }
 
 /* The memory functions with a process handle: only this process is in reach. */
-static BOOL is_this_process(HANDLE process) {
-  if (process == NtCurrentProcess()) return TRUE;
-  ULONGLONG info[6];
-  if (!NT_SUCCESS(NtQueryInformationProcess(process, 0, info, sizeof(info), NULL))) return FALSE;
-  return (DWORD)info[4] == GetCurrentProcessId();
-}
 EXPORT LPVOID WINAPI VirtualAllocEx(HANDLE process, LPVOID address, SIZE_T size, DWORD type, DWORD protect) {
-  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return NULL; }
-  return VirtualAlloc(address, size, type, protect);
+  PVOID base = address;
+  SIZE_T bytes = size;
+  const NTSTATUS status = NtAllocateVirtualMemory(process, &base, 0, &bytes, type, protect);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return NULL; }
+  return base;
 }
 EXPORT BOOL WINAPI VirtualFreeEx(HANDLE process, LPVOID address, SIZE_T size, DWORD type) {
-  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return FALSE; }
-  return VirtualFree(address, size, type);
+  PVOID base = address;
+  SIZE_T bytes = size;
+  const NTSTATUS status = NtFreeVirtualMemory(process, &base, &bytes, type);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
 }
 EXPORT BOOL WINAPI VirtualProtectEx(HANDLE process, LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
-  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return FALSE; }
-  return VirtualProtect(address, size, protect, old);
+  PVOID base = address;
+  SIZE_T bytes = size;
+  ULONG previous = 0;
+  const NTSTATUS status = NtProtectVirtualMemory(process, &base, &bytes, protect, &previous);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  if (old) *old = previous;
+  return TRUE;
 }
 EXPORT SIZE_T WINAPI VirtualQueryEx(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T length) {
-  if (!is_this_process(process)) { set_error(ERROR_NOT_SUPPORTED); return 0; }
-  return VirtualQuery(address, info, length);
+  if (length < sizeof(*info)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
+  ULONG64 got = 0;
+  const NTSTATUS status = NtQueryVirtualMemory(process, (PVOID)address, 0, info, sizeof(*info), &got);
+  if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
+  return sizeof(*info);
 }
 
 EXPORT HANDLE WINAPI OpenThread(DWORD access, BOOL inherit, DWORD id) {

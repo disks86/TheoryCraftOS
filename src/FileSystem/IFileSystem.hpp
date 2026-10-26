@@ -20,6 +20,7 @@
 #include "FileSystem/FileSystemTypes.hpp"
 #include "FileSystem/IDirectory.hpp"
 #include "FileSystem/IFile.hpp"
+#include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -63,6 +64,22 @@ class IFileSystem {
   virtual Status flush() = 0;
   // Changes the read-only flag and the times of a file or folder. Unsupported by a file system that keeps none of that; ReadOnly if the volume is read-only.
   virtual Status set_metadata(StringView path, const MetadataChange& change) { (void)path; (void)change; return Status::Unsupported; }
+
+  // Another directory entry for `existing`'s data (CreateHardLink): a write through either name is seen through the other. Unsupported by a file system with no notion of a
+  // file separate from its one name, or for a directory (real file systems do not let a program link one).
+  virtual Status create_hard_link(StringView existing, StringView link) { (void)existing; (void)link; return Status::Unsupported; }
+  // A name that resolves to another path when opened or traversed through (CreateSymbolicLink): `target` starting with '/' is resolved from this filesystem's root, anything
+  // else from `link`'s own directory (and, unlike an ordinary path, may use ".." to climb back up from there). `target_is_directory` is only a hint for a target that does
+  // not exist yet.
+  virtual Status create_symbolic_link(StringView link, StringView target, bool target_is_directory) {
+    (void)link; (void)target; (void)target_is_directory;
+    return Status::Unsupported;
+  }
+  // The raw target of a symbolic link, without following it. InvalidArgument if `path` exists but is not itself a symbolic link.
+  virtual Status read_symbolic_link(StringView path, String* target, bool* target_is_directory) {
+    (void)path; (void)target; (void)target_is_directory;
+    return Status::Unsupported;
+  }
 
  protected:
   constexpr IFileSystem() = default;

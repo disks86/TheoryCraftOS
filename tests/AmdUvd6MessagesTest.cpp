@@ -26,11 +26,15 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6Messages.hpp"
 #include "Hardware/VideoCodec/Software/H264Parser.hpp"
 #include "Hardware/VideoCodec/Software/H265.hpp"
+#include "Hardware/VideoCodec/Software/Mpeg2.hpp"
+#include "Hardware/VideoCodec/Software/Vc1.hpp"
 
 using namespace hardware;
 using namespace hardware::amd_uvd6;
 
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTestHevcStream.inc"   // the H.265 stream the engine's self-test decodes
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestMpeg2Stream.inc"   // and the MPEG-2 one
+#include "Hardware/VideoCodec/AMD/AmdVcnSelfTestVc1Stream.inc"   // and the two VC-1 ones
 
 struct TestAllocator final : allocators::IAllocator {
   int live = 0;
@@ -382,7 +386,197 @@ static void test_hevc_message() {
   CHECK(alloc.live == 0);
 }
 
+// struct ruvd_mpeg2, byte offsets within it, worked out by hand from the structure in ac_uvd_dec.h (three dwords of picture indexes, two flag bytes and two reserved,
+// two 64-byte matrices, then single bytes).
+constexpr uint32_t mDecoded = 0, mRef = 4, mLoadIntra = 12, mLoadNonIntra = 13, mIntra = 16, mNonIntra = 80, mProfile = 144, mChroma = 145, mType = 146, mFCode = 148, mDcPrecision = 152,
+                   mStructure = 153, mTopFirst = 154, mFramePred = 155, mConcealment = 156, mQScale = 157, mVlcFormat = 158, mAlternate = 159;
+constexpr uint32_t kMpeg2Size = 160;
+
+static void test_mpeg2_sizes_and_jobs() {
+  CHECK(kStreamTypeMpeg2 == 3 && kMpeg2References == 6);
+  // 64 x 64: six pictures of 6144 bytes, aligned to 1024 (6144 already is).
+  Mpeg2BufferSizes s = mpeg2_buffer_sizes(64, 64);
+  CHECK(s.references == 6 && s.dpb == 6144u * 6);
+  // 720 x 576: 720 * 576 * 3 / 2 = 622080, rounded up to a multiple of 1024 = 622592.
+  s = mpeg2_buffer_sizes(720, 576);
+  CHECK(s.dpb == 622592u * 6);
+  CHECK(mpeg2_buffer_sizes(63, 64).dpb == 0 && mpeg2_buffer_sizes(64, 8).dpb == 0 && mpeg2_buffer_sizes(4112, 64).dpb == 0);
+  // The job: session context, message, picture buffer, bitstream, target, feedback - no context buffer and no scaling table.
+  JobAddresses a;
+  a.session_context = 0x1000; a.message = 0x2000; a.dpb = 0x3000; a.context = 0x9999; a.bitstream = 0x4000; a.target = 0x5000;
+  AmdUvd6Ring::Buffer out[kMpeg2JobBuffers];
+  CHECK(mpeg2_job_buffers(a, ArrayView<AmdUvd6Ring::Buffer>(out)) == 6);
+  CHECK(out[0].command == 0x005 && out[0].gpu_address == 0x1000 && out[1].command == 0x000 && out[1].gpu_address == 0x2000 && out[2].command == 0x001 && out[2].gpu_address == 0x3000);
+  CHECK(out[3].command == 0x100 && out[3].gpu_address == 0x4000 && out[4].command == 0x002 && out[4].gpu_address == 0x5000 && out[5].command == 0x003 && out[5].gpu_address == 0x2000 + kFeedbackOffset);
+  AmdUvd6Ring::Buffer few[5];
+  CHECK(mpeg2_job_buffers(a, ArrayView<AmdUvd6Ring::Buffer>(few)) == 0);
+}
+
+struct Mpeg2Recorder final : mpeg2::IOffload {
+  int pictures = 0;
+  bool accepts(const mpeg2::SequenceHeader&) override { return true; }
+  bool decode_picture(const mpeg2::OffloadPicture& p) override {
+    const uint32_t k = static_cast<uint32_t>(pictures++);
+    const mpeg2::PictureHeader& pic = *p.pic;
+    const Mpeg2BufferSizes sizes = mpeg2_buffer_sizes(64, 64);
+    DecodeBuffers b;
+    b.bitstream_bytes = 300;
+    b.dpb_bytes = sizes.dpb;
+    b.context_bytes = 0;
+    b.target = amd_vcn::target_layout(64, 64);
+    Mpeg2Pictures jobs;
+    jobs.current = k + 1;
+    jobs.forward = k;        // the latest job (0 for the first picture: Mesa's fallback)
+    jobs.backward = k > 1 ? k - 1 : k;
+    Bytes m(message_bytes(), 0xCC);
+    CHECK(build_mpeg2_decode_message(view(m), 4, k + 1, p, jobs, b));
+    CHECK(word(m, 0) == 3556 && word(m, 4) == kMsgDecode && word(m, 8) == 4 && word(m, 12) == k + 1);
+    CHECK(word(m, dec(kDecStreamType)) == 3 && word(m, dec(kDecWidth)) == 64 && word(m, dec(kDecHeight)) == 64 && word(m, dec(kDecDpbSize)) == sizes.dpb);
+    CHECK(word(m, dec(kDecDpbReserved)) == 0 && word(m, dec(kDecBsdSize)) == 384 && word(m, dec(kDecDbPitch)) == 64 && m[kExtensionSupport] == 1);
+    const uint32_t g = kCodec;
+    CHECK(word(m, g + mDecoded) == k + 1 && word(m, g + mRef) == jobs.forward && word(m, g + mRef + 4) == jobs.backward);
+    CHECK(m[g + mLoadIntra] == 1 && m[g + mLoadNonIntra] == 1);
+    for (uint32_t i = 0; i < 64; ++i) {
+      CHECK(m[g + mIntra + i] == p.intra_matrix_scan[i]);
+      CHECK(m[g + mNonIntra + i] == p.non_intra_matrix_scan[i]);
+    }
+    CHECK(m[g + mProfile] == 0 && m[g + mChroma] == 1 && m[g + mType] == pic.type);
+    for (uint32_t d = 0; d < 2; ++d)
+      for (uint32_t c = 0; c < 2; ++c) CHECK(m[g + mFCode + d * 2 + c] == pic.f_code[d][c]);
+    CHECK(m[g + mDcPrecision] == pic.intra_dc_precision && m[g + mStructure] == pic.structure && m[g + mTopFirst] == (pic.top_field_first ? 1 : 0));
+    CHECK(m[g + mFramePred] == (pic.frame_pred_frame_dct ? 1 : 0) && m[g + mConcealment] == (pic.concealment_motion_vectors ? 1 : 0) && m[g + mQScale] == (pic.q_scale_type ? 1 : 0));
+    CHECK(m[g + mVlcFormat] == (pic.intra_vlc_format ? 1 : 0) && m[g + mAlternate] == (pic.alternate_scan ? 1 : 0));
+    for (uint32_t i = kMpeg2Size; i < 768 * 4; ++i) CHECK(m[g + i] == 0);
+    // References: the last six jobs are in the engine's buffer, the seventh back and a job from the future are not.
+    Mpeg2Pictures far = jobs;
+    far.current = 10; far.forward = 4; far.backward = 9;
+    CHECK(build_mpeg2_decode_message(view(m), 4, 10, p, far, b));
+    far.forward = 3;
+    CHECK(!build_mpeg2_decode_message(view(m), 4, 10, p, far, b));
+    far.forward = 10;
+    CHECK(!build_mpeg2_decode_message(view(m), 4, 10, p, far, b));
+    far.forward = 9; far.current = 0;
+    CHECK(!build_mpeg2_decode_message(view(m), 4, 10, p, far, b));
+    Bytes small(message_bytes() - 1, 0);
+    CHECK(!build_mpeg2_decode_message(view(small), 4, 1, p, jobs, b));
+    Bytes fb(kMessageFeedbackItBytes, 0xEE);
+    CHECK(prepare_mpeg2_feedback(view(fb)) && word(fb, kFeedbackOffset) == 2048 && word(fb, kFeedbackOffset + 4) == 0 && fb[kFeedbackOffset + kFeedbackBytes - 1] == 0);
+    Bytes short_fb(kMessageFeedbackItBytes - 1, 0);
+    CHECK(!prepare_mpeg2_feedback(view(short_fb)));
+    return true;
+  }
+};
+
+static void test_mpeg2_message() {
+  TestAllocator alloc;
+  {
+    Mpeg2Decoder cpu(alloc);
+    Mpeg2Recorder recorder;
+    cpu.set_offload(&recorder);
+    const ConstByteView stream(kMpeg2SelfTestStream);
+    for (uint32_t i = 0; i < kMpeg2SelfTestPictures; ++i) {
+      const uint64_t start = i == 0 ? 0 : kMpeg2SelfTestEnds[i - 1];
+      CHECK(cpu.decode(stream.subview(start, kMpeg2SelfTestEnds[i] - start), int64_t{i} * 1000));
+    }
+    cpu.flush();
+    CHECK(recorder.pictures == int(kMpeg2SelfTestPictures));
+  }
+  CHECK(alloc.live == 0);
+}
+
+// struct ruvd_vc1: six dwords (profile, level, sps flags, pps flags, picture structure, chroma format), 24 bytes, at the start of the codec union.
+constexpr uint32_t vProfile = 0, vLevel = 4, vSps = 8, vPps = 12, vStructure = 16, vChroma = 20, kVc1Size = 24;
+
+static void test_vc1_sizes_and_jobs() {
+  CHECK(kStreamTypeVc1 == 1 && kVc1References == 5);
+  // 64 x 64: five pictures of 6144 bytes, then 128 * 16 macroblocks + 64 * 4 + 128 * 4 + align(4 * 7 * 16, 64) = 2048 + 256 + 512 + 448.
+  Vc1BufferSizes s = vc1_buffer_sizes(64, 64);
+  CHECK(s.references == 5 && s.dpb == 6144u * 5 + 2048 + 256 + 512 + 448);
+  CHECK(vc1_buffer_sizes(63, 64).dpb == 0 && vc1_buffer_sizes(64, 8).dpb == 0 && vc1_buffer_sizes(4112, 64).dpb == 0);
+  JobAddresses a;
+  a.session_context = 0x1000; a.message = 0x2000; a.dpb = 0x3000; a.bitstream = 0x4000; a.target = 0x5000;
+  AmdUvd6Ring::Buffer out[kVc1JobBuffers];
+  CHECK(vc1_job_buffers(a, ArrayView<AmdUvd6Ring::Buffer>(out)) == 6 && out[2].command == 0x001 && out[3].command == 0x100 && out[4].command == 0x002 && out[5].command == 0x003);
+}
+
+struct Vc1Recorder final : vc1::IOffload {
+  int pictures = 0;
+  int profile = -1;
+  bool accepts(const vc1::SequenceHeader&) override { return true; }
+  bool decode_picture(const vc1::OffloadPicture& p) override {
+    const uint32_t k = static_cast<uint32_t>(pictures++);
+    const vc1::SequenceHeader& seq = *p.seq;
+    profile = seq.profile;
+    const Vc1BufferSizes sizes = vc1_buffer_sizes(64, 64);
+    DecodeBuffers b;
+    b.bitstream_bytes = 300;
+    b.dpb_bytes = sizes.dpb;
+    b.context_bytes = 0;
+    b.target = amd_vcn::target_layout(64, 64);
+    Bytes m(message_bytes(), 0xCC);
+    CHECK(build_vc1_decode_message(view(m), 6, k + 1, p, b));
+    CHECK(word(m, 0) == 3556 && word(m, 4) == kMsgDecode && word(m, 8) == 6 && word(m, 12) == k + 1);
+    const bool advanced = seq.profile == vc1::kAdvanced, simple = seq.profile == vc1::kSimple;
+    CHECK(word(m, dec(kDecStreamType)) == 1 && word(m, dec(kDecDpbSize)) == sizes.dpb && word(m, dec(kDecDpbReserved)) == 0 && word(m, dec(kDecDbPitch)) == 64);
+    // The size is in macroblocks for the Simple and Main profiles, in samples for the Advanced one.
+    CHECK(word(m, dec(kDecWidth)) == (advanced ? 64u : 4u) && word(m, dec(kDecHeight)) == (advanced ? 64u : 4u));
+    const uint32_t g = kCodec;
+    CHECK(word(m, g + vProfile) == (advanced ? 2u : simple ? 0u : 1u) && word(m, g + vLevel) == (advanced ? 4u : simple ? 1u : 2u));
+    auto bit = [](bool v, uint32_t n) { return v ? 1u << n : 0u; };
+    CHECK(word(m, g + vSps) == (bit(seq.postprocflag, 7) | bit(seq.broadcast, 6) | bit(seq.interlace, 5) | bit(seq.tfcntrflag, 4) | bit(seq.finterpflag, 3) | bit(seq.psf, 1)));
+    uint32_t pps = bit(seq.range_mapy_flag, 31) | bit(seq.range_mapuv_flag, 27) | bit(seq.multires, 21) | (uint32_t(seq.max_b_frames & 7) << 16) | bit(seq.overlap, 11) |
+                   (uint32_t(seq.quantizer_mode & 3) << 9) | bit(seq.panscanflag, 7) | bit(seq.refdist_flag, 6) | bit(seq.vstransform, 0);
+    if (!simple) pps |= bit(seq.resync_marker, 20) | bit(seq.rangered, 19) | bit(seq.loop_filter, 5) | bit(seq.fastuvmc, 4) | bit(seq.extended_mv, 3) | bit(seq.extended_dmv, 8) | (uint32_t(seq.dquant & 3) << 1);
+    CHECK(word(m, g + vPps) == pps && word(m, g + vStructure) == 0 && word(m, g + vChroma) == 1 && m[kExtensionSupport] == 1);
+    for (uint32_t i = kVc1Size; i < 768 * 4; ++i) CHECK(m[g + i] == 0);
+    // An interlaced sequence is not taken, nor a message that does not fit.
+    vc1::SequenceHeader interlaced = seq;
+    interlaced.interlace = true;
+    vc1::OffloadPicture copy = p;
+    copy.seq = &interlaced;
+    CHECK(!build_vc1_decode_message(view(m), 6, 1, copy, b));
+    Bytes small(message_bytes() - 1, 0);
+    CHECK(!build_vc1_decode_message(view(small), 6, 1, p, b));
+    Bytes fb(kMessageFeedbackItBytes, 0xEE);
+    CHECK(prepare_vc1_feedback(view(fb)) && word(fb, kFeedbackOffset) == 2048 && word(fb, kFeedbackOffset + 4) == 0);
+    return true;
+  }
+};
+
+static void test_vc1_message() {
+  TestAllocator alloc;
+  {
+    // The Main profile stream (its sequence header is the codec configuration), then the Advanced profile one.
+    Vc1Decoder main_cpu(alloc);
+    Vc1Recorder main_rec;
+    main_cpu.set_offload(&main_rec);
+    CHECK(main_cpu.configure(ConstByteView(kVc1SelfTestMainConfig, 4), kVc1SelfTestSize, kVc1SelfTestSize));
+    const ConstByteView main_stream(kVc1SelfTestMainStream);
+    for (uint32_t i = 0; i < kVc1SelfTestPictures; ++i) {
+      const uint64_t start = i == 0 ? 0 : kVc1SelfTestMainEnds[i - 1];
+      CHECK(main_cpu.decode(main_stream.subview(start, kVc1SelfTestMainEnds[i] - start), int64_t{i} * 1000));
+    }
+    main_cpu.flush();
+    CHECK(main_rec.pictures > 0 && main_rec.profile == vc1::kMain);
+    Vc1Decoder adv_cpu(alloc);
+    Vc1Recorder adv_rec;
+    adv_cpu.set_offload(&adv_rec);
+    const ConstByteView adv_stream(kVc1SelfTestAdvancedStream);
+    for (uint32_t i = 0; i < kVc1SelfTestPictures; ++i) {
+      const uint64_t start = i == 0 ? 0 : kVc1SelfTestAdvancedEnds[i - 1];
+      CHECK(adv_cpu.decode(adv_stream.subview(start, kVc1SelfTestAdvancedEnds[i] - start), int64_t{i} * 1000));
+    }
+    adv_cpu.flush();
+    CHECK(adv_rec.pictures > 0 && adv_rec.profile == vc1::kAdvanced);
+  }
+  CHECK(alloc.live == 0);
+}
+
 int main() {
+  test_vc1_sizes_and_jobs();
+  test_vc1_message();
+  test_mpeg2_sizes_and_jobs();
+  test_mpeg2_message();
   test_hevc_sizes();
   test_hevc_message();
   test_layout();

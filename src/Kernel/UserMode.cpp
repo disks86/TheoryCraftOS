@@ -21,6 +21,7 @@
 #include "Executable/ExecutableKind.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsException.hpp"
+#include "Process/WindowsMemory.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsThreads.hpp"
 #include "console.hpp"
@@ -684,6 +685,13 @@ uint32_t Task::list_processes(ProcessEntry* out, uint32_t capacity) {
   return n;
 }
 
+uint32_t Task::remote_operation(uint64_t pid, RemoteOp& op) {
+  mutex.unlock();      // (the other program's lock is taken, and the lock of this one must not be held meanwhile: two programs working on each other would wait for each other)
+  const uint32_t status = usermode::remote_operation(pid, op);
+  mutex.lock();
+  return status;
+}
+
 uint32_t Task::list_threads(uint64_t pid, ThreadEntry* out, uint32_t capacity) {
   mutex.unlock();      // (see list_processes)
   const uint32_t n = usermode::thread_snapshot(pid, out, capacity);
@@ -919,6 +927,21 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   return task;
 }
 
+uint32_t remote_operation(uint64_t pid, process::IProcessRuntime::RemoteOp& op) {
+  constexpr uint32_t kInvalidCid = 0xC000000Bu;
+  ScopedMutex registry(g_tasks_mutex);
+  for (Task* task = g_tasks; task; task = task->all_next) {
+    if (!task->program.loaded() || task->program.process()->id() != pid) continue;
+    ScopedMutex hold(task->mutex);
+    const uint32_t status = process::windowsabi::run_remote(*task->program.process(), op);
+    // The layout may have changed: the page tables are rebuilt and given to the threads of that program (on whatever cores they run), as at the end of one of its own system calls.
+    const bool layout = op.kind == process::IProcessRuntime::RemoteOp::Allocate || op.kind == process::IProcessRuntime::RemoteOp::Free || op.kind == process::IProcessRuntime::RemoteOp::Protect;
+    if (layout && status == 0 && !task->sync_tables()) return 0xC0000017u;
+    return status;
+  }
+  return kInvalidCid;
+}
+
 uint32_t thread_snapshot(uint64_t pid, process::IProcessRuntime::ThreadEntry* out, uint32_t capacity) {
   uint64_t ids[process::Process::kMaxThreads], starts[process::Process::kMaxThreads];
   int32_t priorities[process::Process::kMaxThreads];
@@ -1055,6 +1078,7 @@ namespace kernel {
 namespace usermode {
 uint32_t process_snapshot(ProcessInfo*, uint32_t) { return 0; }      // (programs only run on x86-64 so far)
 uint32_t thread_snapshot(uint64_t, process::IProcessRuntime::ThreadEntry*, uint32_t) { return 0; }
+uint32_t remote_operation(uint64_t, process::IProcessRuntime::RemoteOp&) { return 0xC0000002u; }
 uint32_t module_snapshot(uint64_t, process::IProcessRuntime::ModuleEntry*, uint32_t) { return 0; }
 }  // namespace usermode
 }  // namespace kernel

@@ -420,11 +420,24 @@ AmdUvd6::Status AmdUvd6::start(const AmdVcnFirmware& firmware, const Memory& mem
   enable_mgcg(true);
   const Status status = run_start(firmware, memory);
   if (status != Status::Ok) {
+    failure_ = read_diagnostics(registers_);   // (not the driver's: what the engine looked like when it gave up)
     stop();   // the driver's hw_fini after a failed hw_init
     return status;
   }
   started_ = true;
   return Status::Ok;
+}
+
+AmdUvd6::Diagnostics AmdUvd6::read_diagnostics(IVcnRegisters& registers) {
+  Diagnostics d;
+  d.status = registers.read(mmUVD_STATUS);
+  d.power_status = registers.read(mmUVD_POWER_STATUS);
+  d.soft_reset = registers.read(mmUVD_SOFT_RESET);
+  d.vcpu_cntl = registers.read(mmUVD_VCPU_CNTL);
+  d.lmi_ctrl2 = registers.read(mmUVD_LMI_CTRL2);
+  d.rb_rptr = registers.read(mmUVD_RBC_RB_RPTR);
+  d.rb_wptr = registers.read(mmUVD_RBC_RB_WPTR);
+  return d;
 }
 
 // uvd_v6_0_stop

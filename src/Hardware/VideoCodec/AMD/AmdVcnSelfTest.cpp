@@ -316,7 +316,8 @@ bool close_picture(const VideoFrame& a, const VideoFrame& b, uint32_t max_differ
 }
 }  // namespace
 
-AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocator, const AmdVcnMpeg2Decoder::Engine& engine) {
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2_session(allocators::IAllocator& allocator, IVideoDecoder& session, bool (*wedged)(const void*), const void* ring,
+                                                        uint64_t (*decoded)(const void*), const void* decoder) {
   const ConstByteView stream(kMpeg2SelfTestStream);
   auto packet = [&](uint32_t i) {
     const uint64_t start = i == 0 ? 0 : kMpeg2SelfTestEnds[i - 1];
@@ -344,11 +345,6 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocat
     if (got != kMpeg2SelfTestPictures) return Result::StreamFailed;
   }
 
-  DecoderConfig config;
-  config.codec = VideoCodec::Mpeg2;
-  config.output = PixelFormat::I420;
-  AmdVcnMpeg2Decoder session(allocator, engine, config);
-  if (!session.prepare()) return Result::SessionRefused;
   uint32_t got = 0;
   VideoFrame f;
   for (uint32_t i = 0; i < kMpeg2SelfTestPictures; ++i) {
@@ -356,7 +352,7 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocat
     p.data = packet(i);
     p.pts_us = int64_t{i} * 1000;
     p.keyframe = i == 0;
-    if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
+    if (session.submit(p) != SubmitResult::Accepted) return wedged(ring) ? Result::EngineFailed : Result::SessionRefused;
     while (session.receive(&f)) {
       if (got >= kMpeg2SelfTestPictures || !close_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
       ++got;
@@ -367,10 +363,21 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocat
     if (got >= kMpeg2SelfTestPictures || !close_picture(f, expected[got].frame(pts[got]))) return Result::Mismatch;
     ++got;
   }
-  if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
+  if (wedged(ring) || session.statistics().errors != 0) return Result::EngineFailed;
   // The engine must really have done the work: every picture went through it (a stream the session passed to the CPU would "pass" too).
-  if (session.pictures_decoded() != kMpeg2SelfTestPictures) return Result::SessionRefused;
+  if (decoded(decoder) != kMpeg2SelfTestPictures) return Result::SessionRefused;
   return got == kMpeg2SelfTestPictures ? Result::Passed : Result::Mismatch;
+}
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_mpeg2(allocators::IAllocator& allocator, const AmdVcnMpeg2Decoder::Engine& engine) {
+  DecoderConfig config;
+  config.codec = VideoCodec::Mpeg2;
+  config.output = PixelFormat::I420;
+  AmdVcnMpeg2Decoder session(allocator, engine, config);
+  if (!session.prepare()) return Result::SessionRefused;
+  return run_mpeg2_session(
+      allocator, session, [](const void* ring) { return static_cast<const AmdVcn1Ring*>(ring)->wedged(); }, engine.ring,
+      [](const void* decoder) { return static_cast<const AmdVcnMpeg2Decoder*>(decoder)->pictures_decoded(); }, &session);
 }
 
 namespace {
@@ -382,7 +389,7 @@ constexpr uint64_t kVc1MaxTotalDifference = 64 * 64 * 3 / 2;
 
 // One of the two streams: `config` is the Main profile sequence header (null for the Advanced profile, whose headers are in the stream), `ends` where each of the
 // kVc1SelfTestPictures packets ends in `stream`.
-AmdVcnSelfTest::Result run_vc1_stream(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine, const uint8_t* config, ConstByteView stream, const uint64_t* ends) {
+AmdVcnSelfTest::Result run_vc1_stream(allocators::IAllocator& allocator, AmdVcnSelfTest::Vc1SessionHost& host, const uint8_t* config, ConstByteView stream, const uint64_t* ends) {
   using Result = AmdVcnSelfTest::Result;
   constexpr uint32_t kCount = kVc1SelfTestPictures;
   auto packet = [&](uint32_t i) {
@@ -418,8 +425,12 @@ AmdVcnSelfTest::Result run_vc1_stream(allocators::IAllocator& allocator, const A
   dc.output = PixelFormat::I420;
   dc.width = dc.height = kVc1SelfTestSize;
   dc.codec_config = header;
-  AmdVcnVc1Decoder session(allocator, engine, dc);
-  if (!session.prepare()) return Result::SessionRefused;
+  if (!host.open(dc)) return Result::SessionRefused;
+  struct Closer {   // (the session goes away before the caller can stop the engine under it)
+    AmdVcnSelfTest::Vc1SessionHost& host;
+    ~Closer() { host.close(); }
+  } closer{host};
+  IVideoDecoder& session = host.session();
   uint32_t got = 0;
   VideoFrame f;
   auto check = [&]() {
@@ -434,22 +445,43 @@ AmdVcnSelfTest::Result run_vc1_stream(allocators::IAllocator& allocator, const A
     p.data = packet(i);
     p.pts_us = int64_t{i} * 1000;
     p.keyframe = i == 0;
-    if (session.submit(p) != SubmitResult::Accepted) return engine.ring->wedged() ? Result::EngineFailed : Result::SessionRefused;
+    if (session.submit(p) != SubmitResult::Accepted) return host.wedged() ? Result::EngineFailed : Result::SessionRefused;
     if (!check()) return Result::Mismatch;
   }
   session.flush();
   if (!check()) return Result::Mismatch;
-  if (engine.ring->wedged() || session.statistics().errors != 0) return Result::EngineFailed;
+  if (host.wedged() || session.statistics().errors != 0) return Result::EngineFailed;
   // The engine must really have done the work: every picture went through it (a stream the session passed to the CPU would "pass" too).
-  if (session.pictures_decoded() != kCount) return Result::SessionRefused;
+  if (host.decoded() != kCount) return Result::SessionRefused;
   return got == kCount ? Result::Passed : Result::Mismatch;
 }
 }  // namespace
 
-AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine) {
-  const Result main_profile = run_vc1_stream(allocator, engine, kVc1SelfTestMainConfig, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds);
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host) {
+  const Result main_profile = run_vc1_stream(allocator, host, kVc1SelfTestMainConfig, ConstByteView(kVc1SelfTestMainStream), kVc1SelfTestMainEnds);
   if (main_profile != Result::Passed) return main_profile;
-  return run_vc1_stream(allocator, engine, nullptr, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds);
+  return run_vc1_stream(allocator, host, nullptr, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds);
+}
+
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine) {
+  class Host final : public Vc1SessionHost {
+   public:
+    Host(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine) : allocator_(allocator), engine_(engine) {}
+    bool open(const DecoderConfig& config) override {
+      session_ = UniquePointer<AmdVcnVc1Decoder>::make(allocator_, allocator_, engine_, config);
+      return session_ && session_->prepare();
+    }
+    IVideoDecoder& session() override { return *session_; }
+    bool wedged() const override { return engine_.ring->wedged(); }
+    uint64_t decoded() const override { return session_->pictures_decoded(); }
+    void close() override { session_.reset(); }
+
+   private:
+    allocators::IAllocator& allocator_;
+    AmdVcnVc1Decoder::Engine engine_;
+    UniquePointer<AmdVcnVc1Decoder> session_;
+  } host(allocator, engine);
+  return run_vc1_sessions(allocator, host);
 }
 
 const char* AmdVcnSelfTest::result_name(Result result) {

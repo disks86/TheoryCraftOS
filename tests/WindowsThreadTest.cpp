@@ -29,6 +29,7 @@
 #include "Process/Syscall.hpp"
 #include "Process/WindowsException.hpp"
 #include "Process/WindowsSyscalls.hpp"
+#include "Process/WindowsMemory.hpp"
 
 using namespace process;
 
@@ -450,6 +451,49 @@ static void test_create_process() {
   }
 }
 
+// What another program's memory allows (IProcessRuntime::RemoteOp, as run on the program asked).
+static void test_remote_memory() {
+  Setup s;
+  using Op = IProcessRuntime::RemoteOp;
+  Op alloc;
+  alloc.kind = Op::Allocate; alloc.address = 0x30000000; alloc.size = 8192; alloc.type = 0x3000; alloc.protect = 0x04;
+  CHECK(windowsabi::run_remote(s.process, alloc) == 0 && alloc.address == 0x30000000 && alloc.size == 8192);
+  const uint8_t text[5] = {'h', 'e', 'l', 'l', 'o'};
+  Op write;
+  write.kind = Op::Write; write.address = 0x30000FFE; write.in = ConstByteView(text, 5);      // across a page boundary
+  CHECK(windowsabi::run_remote(s.process, write) == 0 && write.done == 5);
+  uint8_t back[5] = {};
+  Op read;
+  read.kind = Op::Read; read.address = 0x30000FFE; read.out = ByteView(back, 5);
+  CHECK(windowsabi::run_remote(s.process, read) == 0 && read.done == 5 && back[0] == 'h' && back[4] == 'o');
+  uint8_t big[9000] = {};
+  Op past;
+  past.kind = Op::Read; past.address = 0x30000000; past.out = ByteView(big, 9000);
+  CHECK(windowsabi::run_remote(s.process, past) == 0x8000000Du && past.done == 8192);      // what is committed is copied, then STATUS_PARTIAL_COPY
+  Op unmapped;
+  unmapped.kind = Op::Read; unmapped.address = 0x50000000; unmapped.out = ByteView(big, 16);
+  CHECK(windowsabi::run_remote(s.process, unmapped) == 0x8000000Du && unmapped.done == 0);
+  Op protect;
+  protect.kind = Op::Protect; protect.address = 0x30000000; protect.size = 4096; protect.protect = 0x02;
+  CHECK(windowsabi::run_remote(s.process, protect) == 0 && protect.old_protect == 0x04);
+  CHECK(windowsabi::run_remote(s.process, write) == 0 && write.done == 5);      // the page is read-only now, and the write still works
+  Op reserved;      // reserved memory is not committed: it cannot be read
+  reserved.kind = Op::Allocate; reserved.address = 0x31000000; reserved.size = 4096; reserved.type = 0x2000; reserved.protect = 0x04;
+  CHECK(windowsabi::run_remote(s.process, reserved) == 0);
+  Op reserved_read;
+  reserved_read.kind = Op::Read; reserved_read.address = 0x31000000; reserved_read.out = ByteView(big, 4);
+  CHECK(windowsabi::run_remote(s.process, reserved_read) == 0x8000000Du && reserved_read.done == 0);
+  Op query;
+  query.kind = Op::Query; query.address = 0x30000010;
+  CHECK(windowsabi::run_remote(s.process, query) == 0 && query.info[32] == 0x00 && query.info[33] == 0x10 && query.info[36] == 0x02);      // MEM_COMMIT (0x1000), PAGE_READONLY
+  Op free_op;
+  free_op.kind = Op::Free; free_op.address = 0x30000000; free_op.size = 0; free_op.type = 0x8000;
+  CHECK(windowsabi::run_remote(s.process, free_op) == 0 && free_op.size == 8192);
+  CHECK(windowsabi::run_remote(s.process, read) == 0x8000000Du);
+  // a bad process handle
+  CHECK(s.call(WindowsSyscallNumber::NtReadVirtualMemory, 0x7777, kBase, kBase + 0x2100, 8, kBase + 0x2200) == 0xC0000008u);
+}
+
 // NtQuerySystemInformation: the process list (class 5, with the threads) and the module list (this OS's class 0x80).
 static void test_process_lists() {
   Setup s;
@@ -479,6 +523,7 @@ static void test_process_lists() {
 }
 
 int main() {
+  test_remote_memory();
   test_process_lists();
   test_create();
   test_arguments();

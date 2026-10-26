@@ -48,6 +48,10 @@ $cc -O1 -Wall -Wextra -o "$out/jobtest.exe" tests/windows/jobtest.c
 echo "built $out/jobtest.exe (job objects; procchild.exe in System32)"
 $cc -O1 -Wall -Wextra -o "$out/toolhelptest.exe" tests/windows/toolhelptest.c
 echo "built $out/toolhelptest.exe (Toolhelp32 lists, HeapWalk, psapi; procchild.exe in System32)"
+$cc -O1 -Wall -Wextra -o "$out/remotetest.exe" tests/windows/remotetest.c
+echo "built $out/remotetest.exe (memory and threads of another process; procchild.exe in System32)"
+$cc -O1 -Wall -Wextra -o "$out/linktest.exe" tests/windows/linktest.c
+echo "built $out/linktest.exe (hard and symbolic links)"
 $cc -O1 -Wall -Wextra -o "$out/locktest.exe" tests/windows/locktest.c
 echo "built $out/locktest.exe (byte-range locks; procchild.exe in System32)"
 $cc -O0 -Wall -Wextra -o "$out/suspendtest.exe" tests/windows/suspendtest.c

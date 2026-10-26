@@ -145,11 +145,58 @@ EXPORT BOOL WINAPI DeviceIoControl(HANDLE h, DWORD code, LPVOID in, DWORD in_siz
   set_error(ERROR_INVALID_FUNCTION);
   return FALSE;
 }
-/* Hard and symbolic links: the file systems here have none. */
-EXPORT BOOL WINAPI CreateHardLinkW(LPCWSTR link, LPCWSTR target, LPSECURITY_ATTRIBUTES sa) { (void)link; (void)target; (void)sa; set_error(ERROR_NOT_SUPPORTED); return FALSE; }
-EXPORT BOOL WINAPI CreateHardLinkA(LPCSTR link, LPCSTR target, LPSECURITY_ATTRIBUTES sa) { (void)link; (void)target; (void)sa; set_error(ERROR_NOT_SUPPORTED); return FALSE; }
-EXPORT BOOLEAN WINAPI CreateSymbolicLinkW(LPCWSTR link, LPCWSTR target, DWORD flags) { (void)link; (void)target; (void)flags; set_error(ERROR_NOT_SUPPORTED); return FALSE; }
-EXPORT BOOLEAN WINAPI CreateSymbolicLinkA(LPCSTR link, LPCSTR target, DWORD flags) { (void)link; (void)target; (void)flags; set_error(ERROR_NOT_SUPPORTED); return FALSE; }
+/* Hard and symbolic links: supported where the mounted file system has a notion of a file separate from its one name (not every one does; CreateHardLink on a
+ * directory, or where the file system has none of this, fails with ERROR_NOT_SUPPORTED, which is also what a real hard link on FAT gets). */
+EXPORT BOOL WINAPI CreateHardLinkW(LPCWSTR link, LPCWSTR target, LPSECURITY_ATTRIBUTES sa) {
+  (void)sa;
+  WCHAR source_buffer[PATH_CHARS + 8], link_buffer[PATH_CHARS + 8];
+  UNICODE_STRING source_name, link_name;
+  OBJECT_ATTRIBUTES source_attributes, link_attributes;
+  if (!nt_name(target, source_buffer, &source_name, &source_attributes) || !nt_name(link, link_buffer, &link_name, &link_attributes)) {
+    set_error(ERROR_INVALID_PARAMETER);
+    return FALSE;
+  }
+  HANDLE h = NULL;
+  IO_STATUS_BLOCK iosb;
+  NTSTATUS status = NtOpenFile(&h, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &source_attributes, &iosb, 7, FILE_SYNCHRONOUS_IO_NONALERT_);
+  if (!NT_SUCCESS(status)) return fail_nt(status);
+  const ULONG name_bytes = link_name.Length;
+  BYTE *info = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, 20 + name_bytes + 2);
+  if (!info) { NtClose(h); set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+  *(ULONG *)(info + 16) = name_bytes;      /* [0]: ReplaceIfExists, left 0: CreateHardLink fails if the name is taken */
+  memcpy(info + 20, link_name.Buffer, name_bytes);
+  status = NtSetInformationFile(h, &iosb, info, 20 + name_bytes, 11);      /* FileLinkInformation */
+  RtlFreeHeap(heap(), 0, info);
+  NtClose(h);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOL WINAPI CreateHardLinkA(LPCSTR link, LPCSTR target, LPSECURITY_ATTRIBUTES sa) {
+  WCHAR *a = to_wide(link), *b = to_wide(target);
+  const BOOL ok = a && b ? CreateHardLinkW(a, b, sa) : FALSE;
+  free_wide(a);
+  free_wide(b);
+  return ok;
+}
+EXPORT BOOLEAN WINAPI CreateSymbolicLinkW(LPCWSTR link, LPCWSTR target, DWORD flags) {
+  WCHAR link_buffer[PATH_CHARS + 8];
+  UNICODE_STRING link_name;
+  OBJECT_ATTRIBUTES link_attributes;
+  if (!nt_name(link, link_buffer, &link_name, &link_attributes) || !target || !*target) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
+  /* The target is given to the kernel as the program wrote it (not resolved against this process's directory): a relative one is the link's own business, resolved
+   * against the link's directory, exactly like a real symbolic link. */
+  UNICODE_STRING raw_target;
+  raw_target.Buffer = (WCHAR *)target;
+  raw_target.Length = raw_target.MaximumLength = (USHORT)(wcslen(target) * 2);
+  const NTSTATUS status = NtCreateSymbolicLink(&link_attributes, &raw_target, (flags & SYMBOLIC_LINK_FLAG_DIRECTORY) ? 1 : 0);
+  return NT_SUCCESS(status) ? TRUE : fail_nt(status);
+}
+EXPORT BOOLEAN WINAPI CreateSymbolicLinkA(LPCSTR link, LPCSTR target, DWORD flags) {
+  WCHAR *a = to_wide(link), *b = target ? to_wide(target) : NULL;
+  const BOOLEAN ok = a && b ? CreateSymbolicLinkW(a, b, flags) : FALSE;
+  free_wide(a);
+  free_wide(b);
+  return ok;
+}
 
 /* ---- fibers -------------------------------------------------------------------------------------------------------------------------------------------- */
 

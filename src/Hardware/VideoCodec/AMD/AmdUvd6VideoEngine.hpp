@@ -24,6 +24,8 @@
 #include "Hardware/VideoCodec/AMD/AmdUvd6.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6AvcDecoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6HevcDecoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6Mpeg2Decoder.hpp"
+#include "Hardware/VideoCodec/AMD/AmdUvd6Vc1Decoder.hpp"
 #include "Hardware/VideoCodec/AMD/AmdUvd6Ring.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnFirmware.hpp"
 #include "Hardware/VideoCodec/AMD/AmdVcnSelfTest.hpp"
@@ -139,10 +141,11 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     request_power(clock);
     const AmdUvd6::Status status = uvd_->start(firmware_, memory_.engine, config_);
     if (status != AmdUvd6::Status::Ok) {
+      const char* what = status == AmdUvd6::Status::TimedOut ? "engine start failed: VCPU did not answer" :
+                         status == AmdUvd6::Status::BadMemory ? "engine start refused: bad memory block" : "engine start refused: unusable firmware";
+      note_ = status == AmdUvd6::Status::TimedOut ? describe(what, uvd_->failure_snapshot()) : what;
       release_power(clock);
       uvd_.reset();
-      note_ = status == AmdUvd6::Status::TimedOut ? "engine start failed: the VCPU did not answer (is the engine powered?)" :
-              status == AmdUvd6::Status::BadMemory ? "engine start refused: bad memory block" : "engine start refused: unusable firmware";
       rebuild_status();
       return false;
     }
@@ -150,6 +153,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     rebuild_status();
     if (!enable_decode(*registers_, clock, memory_.engine.ring, *mapper_, plan_.work_gpu_address, aperture_physical_ + plan_.work_offset, plan_.work_bytes)) return false;
     enable_hevc_decode();   // (H.264 works either way)
+    if (engine_running()) enable_mpeg2_decode();
+    if (engine_running()) enable_vc1_decode();
     return engine_running();
   }
 
@@ -157,6 +162,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   void stop_engine() {
     decode_ready_ = false;
     hevc_ready_ = false;
+    mpeg2_ready_ = false;
+    vc1_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     if (uvd_) {
@@ -175,6 +182,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
                      uint64_t work_bytes) {
     decode_ready_ = false;
     hevc_ready_ = false;
+    mpeg2_ready_ = false;
+    vc1_ready_ = false;
     info_.accelerated_decode_codecs = 0;
     ring_.reset();
     const char* why = nullptr;
@@ -197,6 +206,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
         why = "out of memory";
       } else if (!ring_->test()) {
         why = "the decode ring did not run a register write";
+        ring_detail_ = AmdUvd6::read_diagnostics(registers);
+        has_ring_detail_ = true;
       } else {
         engine_.ring = ring_.get();
         engine_.memory = &work_;
@@ -212,13 +223,16 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
         if (result != AmdVcnSelfTest::Result::Passed) {
           why = AmdVcnSelfTest::result_name(result);
           tested = true;
+          ring_detail_ = AmdUvd6::read_diagnostics(registers);
+          has_ring_detail_ = true;
         }
       }
     }
     if (why) {
       decode_text_.assign(tested ? "H.264 self-test failed (" : "decoding not enabled (");
-      decode_text_.append(why);
+      decode_text_.append(has_ring_detail_ ? describe(why, ring_detail_) : why);
       decode_text_.append("); engine stopped");
+      has_ring_detail_ = false;
       stop_engine();
       note_ = decode_text_.c_str();
       rebuild_status();
@@ -270,12 +284,120 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     rebuild_status();
     return true;
   }
+  // After enable_decode(): the same for MPEG-2 (AmdVcnSelfTest::run_mpeg2_session: an ffmpeg stream with B pictures). The engine's inverse transform is not the CPU decoder's, so
+  // its pictures must be close (a level or two apart), not identical. A failed test leaves the others as they were - unless the engine stopped answering.
+  bool enable_mpeg2_decode() {
+    mpeg2_ready_ = false;
+    if (!ring_) return false;
+    AmdVcnSelfTest::Result result = AmdVcnSelfTest::Result::SessionRefused;
+    {
+      DecoderConfig config;
+      config.codec = VideoCodec::Mpeg2;
+      config.output = PixelFormat::I420;
+      AmdUvd6Mpeg2Decoder session(allocator_, engine_, config);
+      if (session.prepare())
+        result = AmdVcnSelfTest::run_mpeg2_session(
+            allocator_, session, [](const void* ring) { return static_cast<const AmdUvd6Ring*>(ring)->wedged(); }, ring_.get(),
+            [](const void* decoder) { return static_cast<const AmdUvd6Mpeg2Decoder*>(decoder)->pictures_decoded(); }, &session);
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("MPEG-2 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+      } else {
+        decode_text_.assign(note_);
+        decode_text_.append("; MPEG-2 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("), MPEG-2 stays on the CPU");
+      }
+      note_ = decode_text_.c_str();
+      rebuild_status();
+      return false;
+    }
+    mpeg2_ready_ = true;
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Mpeg2);
+    if (hevc_ready_) note_ = "engine started; H.264, H.265 and MPEG-2 decode run on it (self-tests passed)";   // (else the note says why H.265 stays on the CPU)
+    rebuild_status();
+    return true;
+  }
+  // After enable_decode(): the same for VC-1 (AmdVcnSelfTest::run_vc1_sessions: a Main profile and an Advanced profile stream, both must pass, each close to the CPU's pictures).
+  bool enable_vc1_decode() {
+    vc1_ready_ = false;
+    if (!ring_) return false;
+    // The test makes a session per stream; the host hands them out and drops each before the engine can be stopped.
+    class Host final : public AmdVcnSelfTest::Vc1SessionHost {
+     public:
+      Host(allocators::IAllocator& allocator, const AmdUvd6AvcDecoder::Engine& engine) : allocator_(allocator), engine_(engine) {}
+      bool open(const DecoderConfig& config) override {
+        session_ = UniquePointer<AmdUvd6Vc1Decoder>::make(allocator_, allocator_, engine_, config);
+        return session_ && session_->prepare();
+      }
+      IVideoDecoder& session() override { return *session_; }
+      bool wedged() const override { return engine_.ring->wedged(); }
+      uint64_t decoded() const override { return session_->pictures_decoded(); }
+      void close() override { session_.reset(); }
+
+     private:
+      allocators::IAllocator& allocator_;
+      AmdUvd6AvcDecoder::Engine engine_;
+      UniquePointer<AmdUvd6Vc1Decoder> session_;
+    };
+    AmdVcnSelfTest::Result result;
+    {
+      Host host(allocator_, engine_);
+      result = AmdVcnSelfTest::run_vc1_sessions(allocator_, host);
+    }
+    if (result != AmdVcnSelfTest::Result::Passed) {
+      if (ring_->wedged()) {
+        decode_ready_ = false;
+        hevc_ready_ = false;
+        mpeg2_ready_ = false;
+        info_.accelerated_decode_codecs = 0;
+        decode_text_.assign("VC-1 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("); engine stopped");
+        stop_engine();
+      } else {
+        decode_text_.assign(note_);
+        decode_text_.append("; VC-1 self-test failed (");
+        decode_text_.append(AmdVcnSelfTest::result_name(result));
+        decode_text_.append("), VC-1 stays on the CPU");
+      }
+      note_ = decode_text_.c_str();
+      rebuild_status();
+      return false;
+    }
+    vc1_ready_ = true;
+    info_.accelerated_decode_codecs |= codec_mask(VideoCodec::Vc1);
+    if (hevc_ready_ && mpeg2_ready_) note_ = "engine started; H.264, H.265, MPEG-2 and VC-1 decode run on it (self-tests passed)";   // (else the note says why one stays on the CPU)
+    rebuild_status();
+    return true;
+  }
   bool decode_ready() const { return decode_ready_; }
+  bool vc1_ready() const { return vc1_ready_; }
+  bool mpeg2_ready() const { return mpeg2_ready_; }
   bool hevc_ready() const { return hevc_ready_; }
   const char* engine_note() const { return note_; }
 
-  // H.264 and H.265 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
+  // H.264, H.265, MPEG-2 and VC-1 go to the engine when they passed their tests and it is free (it runs one session at a time); anything else goes to the CPU.
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config) override {
+    if (config.codec == VideoCodec::Vc1 && vc1_ready_ && ring_ && !ring_->wedged()) {
+      AmdUvd6AvcDecoder::Engine engine = engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdUvd6Vc1Decoder> session = UniquePointer<AmdUvd6Vc1Decoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
+    if (config.codec == VideoCodec::Mpeg2 && mpeg2_ready_ && ring_ && !ring_->wedged()) {
+      AmdUvd6AvcDecoder::Engine engine = engine_;
+      engine.stream_handle = ++next_stream_handle_;
+      UniquePointer<AmdUvd6Mpeg2Decoder> session = UniquePointer<AmdUvd6Mpeg2Decoder>::make(allocator_, allocator_, engine, config);
+      if (session && session->prepare()) return UniquePointer<IVideoDecoder>(util::move(session));
+    }
     if (config.codec == VideoCodec::Hevc && hevc_ready_ && ring_ && !ring_->wedged()) {
       AmdUvd6AvcDecoder::Engine engine = engine_;
       engine.stream_handle = ++next_stream_handle_;
@@ -298,6 +420,27 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
  private:
   static constexpr uint32_t kBootAttempts = 3;
 
+  // "<what> [st=.. pw=.. rst=.. cn=.. lmi=.. rp=.. wp=..]": the registers of AmdUvd6::Diagnostics in hexadecimal, short enough for the status line.
+  const char* describe(const char* what, const AmdUvd6::Diagnostics& d) {
+    diag_text_.assign(what);
+    diag_text_.append(" [st=0x");
+    append_hex(diag_text_, d.status);
+    diag_text_.append(" pw=0x");
+    append_hex(diag_text_, d.power_status);
+    diag_text_.append(" rst=0x");
+    append_hex(diag_text_, d.soft_reset);
+    diag_text_.append(" cn=0x");
+    append_hex(diag_text_, d.vcpu_cntl);
+    diag_text_.append(" lmi=0x");
+    append_hex(diag_text_, d.lmi_ctrl2);
+    diag_text_.append(" rp=0x");
+    append_hex(diag_text_, d.rb_rptr);
+    diag_text_.append(" wp=0x");
+    append_hex(diag_text_, d.rb_wptr);
+    diag_text_.append("]");
+    return diag_text_.c_str();
+  }
+
   // Asks the card's SMC to power the engine (the driver does this before it touches the engine). The start goes on whatever the answer: an SMC that is not running means the
   // system firmware left the card as it was, and the start itself shows whether the engine is up. Only an acknowledged request is undone at stop.
   void request_power(const IClock& clock) {
@@ -316,7 +459,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   }
   static constexpr uint32_t kGbAddrConfig = 0x263e;   // mmGB_ADDR_CONFIG (gca/gfx_8_0_d.h)
 
-  static void append_hex(FixedString<255>& out, uint64_t value) {
+  template <uint64_t N>
+  static void append_hex(FixedString<N>& out, uint64_t value) {
     bool started = false;
     for (int shift = 60; shift >= 0; shift -= 4) {
       const uint32_t nibble = static_cast<uint32_t>((value >> shift) & 0xF);
@@ -352,7 +496,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   AmdFirmwareStatus firmware_state_ = AmdFirmwareStatus::NotApplicable;
   const char* firmware_name_ = nullptr;
   FixedString<255> firmware_text_, summary_;
-  FixedString<200> decode_text_;
+  FixedString<255> decode_text_, diag_text_;
   const char* power_note_ = "";
   bool smc_powered_ = false;   // the SMC acknowledged our request to power the engine, so we ask it to power it down again
   const char* note_ = "engine not started";
@@ -373,8 +517,12 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   AmdVcnWorkMemory work_;
   AmdUvd6AvcDecoder::Engine engine_;
   const IClock* clock_ = nullptr;
+  AmdUvd6::Diagnostics ring_detail_;
+  bool has_ring_detail_ = false;
   bool decode_ready_ = false;
   bool hevc_ready_ = false;
+  bool mpeg2_ready_ = false;
+  bool vc1_ready_ = false;
   uint32_t next_stream_handle_ = 1;
 };
 

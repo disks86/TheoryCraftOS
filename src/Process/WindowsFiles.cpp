@@ -33,7 +33,7 @@ constexpr uint32_t kSuccess = 0, kBufferOverflow = 0x80000005u, kNoMoreFiles = 0
                    kNoMemory = 0xC0000017u, kAccessDenied = 0xC0000022u, kObjectNameInvalid = 0xC0000033u, kObjectNameNotFound = 0xC0000034u,
                    kObjectNameCollision = 0xC0000035u, kObjectPathNotFound = 0xC000003Au, kSharingViolation = 0xC0000043u, kDiskFull = 0xC000007Fu,
                    kFileIsADirectory = 0xC00000BAu, kMediaWriteProtected = 0xC00000A2u, kDirectoryNotEmpty = 0xC0000101u, kNotADirectory = 0xC0000103u,
-                   kIoDeviceError = 0xC0000185u, kNotImplemented = 0xC0000002u, kInvalidDeviceRequest = 0xC0000010u, kTooManyOpenedFiles = 0xC000011Fu;
+                   kIoDeviceError = 0xC0000185u, kNotImplemented = 0xC0000002u, kInvalidDeviceRequest = 0xC0000010u, kTooManyOpenedFiles = 0xC000011Fu, kTooManyLinks = 0xC0000112u;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u, kChunk = 4096;
 constexpr uint64_t kUnixToNtSeconds = 11644473600ull;
 constexpr uint64_t kUseFilePointer = 0xFFFFFFFFFFFFFFFEull, kWriteToEnd = 0xFFFFFFFFFFFFFFFFull;
@@ -42,12 +42,12 @@ constexpr uint32_t kSupersede = 0, kOpen = 1, kCreate = 2, kOpenIf = 3, kOverwri
 constexpr uint32_t kDirectoryFile = 1, kNonDirectoryFile = 0x40, kDeleteOnClose = 0x1000;
 constexpr uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kGenericAll = 0x10000000u, kFileReadData = 1, kFileWriteData = 2, kFileAppendData = 4;
 constexpr uint64_t kFileSuperseded = 0, kFileOpened = 1, kFileCreated = 2, kFileOverwritten = 3;
-constexpr uint32_t kAttributeReadOnly = 1, kAttributeDirectory = 0x10, kAttributeNormal = 0x80;
+constexpr uint32_t kAttributeReadOnly = 1, kAttributeDirectory = 0x10, kAttributeNormal = 0x80, kAttributeReparsePoint = 0x400;
 // FILE_INFORMATION_CLASS
 constexpr uint32_t kFileDirectoryInformation = 1, kFileFullDirectoryInformation = 2, kFileBothDirectoryInformation = 3, kFileBasicInformation = 4,
                    kFileStandardInformation = 5, kFileRenameInformation = 10, kFileNamesInformation = 12, kFileDispositionInformation = 13,
                    kFilePositionInformation = 14, kFileNameInformation = 9, kFileAllocationInformation = 19, kFileEndOfFileInformation = 20,
-                   kFileNetworkOpenInformation = 34, kFileIdBothDirectoryInformation = 37;
+                   kFileNetworkOpenInformation = 34, kFileIdBothDirectoryInformation = 37, kFileLinkInformation = 11;
 
 uint32_t nt_status(Status status) {
   switch (status) {
@@ -67,6 +67,7 @@ uint32_t nt_status(Status status) {
     case Status::AccessDenied:
     case Status::LoginRequired:
     case Status::LoginFailed: return kAccessDenied;
+    case Status::TooManyLinks: return kTooManyLinks;
     default: return kIoDeviceError;
   }
 }
@@ -91,6 +92,7 @@ void put(ByteView out, uint64_t at, uint64_t value, uint32_t bytes) {
 uint32_t attributes_of(const DirectoryEntry& e) {
   uint32_t a = e.type == NodeType::Directory ? kAttributeDirectory : 0;
   if (e.read_only) a |= kAttributeReadOnly;
+  if (e.is_symlink) a |= kAttributeReparsePoint;
   return a ? a : kAttributeNormal;
 }
 
@@ -594,6 +596,25 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       }
       break;
     }
+    case kFileLinkInformation: {      // CreateHardLink(new name = the name in the buffer, existing = the handle this call is on)
+      if (length < 20) return kInfoLengthMismatch;
+      uint8_t header[20];
+      if (!p.read_user(address, ByteView(header, 20))) return kAccessViolation;
+      const uint64_t name_bytes = header[16] | (uint64_t{header[17]} << 8) | (uint64_t{header[18]} << 16) | (uint64_t{header[19]} << 24);
+      if (name_bytes % 2 != 0 || name_bytes > 2 * kMaxPath || name_bytes > length - 20) return kInvalidParameter;
+      uint8_t units[2 * kMaxPath];
+      if (name_bytes && !p.read_user(address + 20, ByteView(units, name_bytes))) return kAccessViolation;
+      String name(files.allocator()), target(files.allocator());
+      if (!util::append_utf8_from_utf16le(&name, ConstByteView(units, name_bytes))) return kNoMemory;
+      if (files.resolve(name.view(), &target) != PathResult::Ok) return kObjectNameInvalid;
+      DirectoryEntry existing;
+      if (files.stat(target.view(), &existing) == Status::Ok) {
+        if (!header[0]) return kObjectNameCollision;
+        status = nt_status(files.remove(target.view()));
+      }
+      if (status == kSuccess) status = nt_status(files.create_hard_link(object->path.view(), target.view()));
+      break;
+    }
     default: return kInvalidInfoClass;
   }
   return store_io_status(p, status_block, status, status == kSuccess ? length : 0) ? status : kAccessViolation;
@@ -671,6 +692,32 @@ uint32_t nt_query_attributes_file(Process& p, const SyscallRequest& r) {
   const Status status = files.stat(virtual_path.view(), &e);
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
   return write_basic(p, r.args[1], e) ? kSuccess : kAccessViolation;
+}
+
+// The directory part of a virtual path that files.resolve() already produced (so it has no "." or ".." components): "/Windows/sub/x.txt" -> "/Windows/sub", "/x.txt" -> "/".
+StringView virtual_directory_of(StringView virtual_path) {
+  uint64_t at = virtual_path.size();
+  while (at > 0 && virtual_path[at - 1] != '/') --at;
+  return at <= 1 ? StringView("/") : virtual_path.first(at - 1);
+}
+
+uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r) {
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return kObjectPathNotFound;
+  String link_virtual(files.allocator());
+  const uint32_t named = object_path(p, r.args[0], &link_virtual);
+  if (named != kSuccess) return named;
+  if (link_virtual.view() == StringView("/")) return kAccessDenied;
+  String raw_target(files.allocator());
+  const uint32_t read = read_unicode_string(p, r.args[1], &raw_target);
+  if (read != kSuccess) return read;
+  if (raw_target.view().empty()) return kInvalidParameter;
+  String target_virtual(files.allocator());
+  // A relative target is the app's own idea of "next to the link", so it is resolved against the link's directory, not the process's current directory.
+  if (files.resolve_from(virtual_directory_of(link_virtual.view()), raw_target.view(), &target_virtual) != PathResult::Ok) return kObjectNameInvalid;
+  const bool target_is_directory = (r.args[2] & 0xFF) != 0;
+  const Status status = files.create_symbolic_link(link_virtual.view(), target_virtual.view(), target_is_directory);
+  return status_for(files, status, link_virtual.view());
 }
 
 uint32_t nt_delete_file(Process& p, const SyscallRequest& r) {

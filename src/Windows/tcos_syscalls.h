@@ -104,4 +104,7 @@
 #define NT_SERVICE_NtQueryInformationJobObject 81
 #define NT_SERVICE_NtSetInformationJobObject 82
 #define NT_SERVICE_NtIsProcessInJob 83
+#define NT_SERVICE_NtReadVirtualMemory 84
+#define NT_SERVICE_NtWriteVirtualMemory 85
+#define NT_SERVICE_NtCreateSymbolicLink 86
 #endif

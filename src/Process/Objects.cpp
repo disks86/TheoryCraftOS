@@ -144,7 +144,9 @@ void ObjectManager::process_exited(uint64_t pid, uint32_t code) {
   Locked hold(sync_);
   job_forget_locked(pid);
   for (Object& o : objects_) {
-    if (o.kind != ObjectKind::Process || o.owner != pid || o.signaled) continue;
+    if (o.kind != ObjectKind::Process || o.signaled) continue;
+    const bool thread_of_pid = o.owner >= (uint64_t{1} << 20) && (o.owner & ((uint64_t{1} << 20) - 1)) == pid;      // (a handle to a thread of the process: thread ids are (counter << 20) | process id)
+    if (o.owner != pid && !thread_of_pid) continue;
     o.signaled = true;
     o.count = static_cast<int32_t>(code);
   }

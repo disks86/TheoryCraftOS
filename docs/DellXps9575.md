@@ -7,14 +7,14 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 | --- | --- | --- |
 | Identified (`*_gpu_identify`) | yes | yes |
 | Boot display / mode setting | `IntelGpu` native path (Gen9.5, unvalidated on hardware) | UEFI GOP only (no Polaris display driver) |
-| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | H.264 and H.265 on `AmdUvd6VideoEngine`, opt-in (`TCOS_AMD_UVD`), tested in simulation, **not run on hardware** (below); the other codecs on the CPU |
+| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | H.264, H.265, MPEG-2 and VC-1 on `AmdUvd6VideoEngine`, opt-in (`TCOS_AMD_UVD`), tested in simulation, **not run on hardware** (below); the other codecs on the CPU |
 | 3D acceleration | `Gen9GraphicsDevice` on the render engine, opt-in (`TCOS_INTEL_RENDER`), tested in simulation, **not run on hardware** (below) | none (CPU renderer) |
 
 ## Not done
 
 - **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
   None of it exists and none can be checked without the hardware and the firmware blobs.
-- **UVD 6.3 video decode** for the Vega M beyond H.264 and H.265 (10-bit HEVC; MPEG-2/VC-1 messages; the chip has no VP9), and any run of it on the card.
+- **UVD 6.3 video decode** for the Vega M beyond H.264, H.265, MPEG-2 and VC-1 (10-bit HEVC; MPEG-4; interlaced VC-1; the chip has no VP9), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
 
@@ -87,6 +87,9 @@ What it does not do, and what is needed before a Vega M decodes anything:
   engine stops (only if the SMC said yes). An SMC that is not running (the result register stuck at zero, or reading all ones) gets nothing written and the engine is assumed powered; the start itself then shows whether it is.
   `tests/AmdSmu7Test.cpp` runs the mailbox against a simulated SMC. What is still missing is clocks: amdgpu sets the engine's clocks through the SMC's DPM tables or the PLL (`vi_set_uvd_clocks`, via AtomBIOS), neither of
   which exists here, so the engine runs at whatever clock the system firmware left.
+- **Diagnostics for the first run.** When the start gives up, the ring test fails or the H.264 self-test fails, the status line (the `Firmware` / `Video` lines at boot) carries the engine's registers as they were at that
+  moment - `st` UVD_STATUS (bit 1: the VCPU answered), `pw` UVD_POWER_STATUS, `rst` UVD_SOFT_RESET, `cn` UVD_VCPU_CNTL, `lmi` UVD_LMI_CTRL2, `rp`/`wp` the ring pointers - taken before the stop sequence changes them
+  (`AmdUvd6::failure_snapshot`, `read_diagnostics`). A card whose engine is unpowered shows in `pw`/`st`, a stalled memory path in `lmi`.
 - **Memory: planned and wired (opt-in).** `AmdGmc8Memory` reads the memory controller the way amdgpu does (`CONFIG_MEMSIZE`, `MC_VM_FB_LOCATION`; both set by the card's firmware, nothing is written), places the engine's block, ring and
   a work area (96 MiB if there is room, 8 MiB at least) at the end of the part of video memory the CPU can reach through BAR 0 (the first 256 MiB without Resizable BAR), clear of the firmware's start of memory
   (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. That the memory controller lets
@@ -110,6 +113,17 @@ What it does not do, and what is needed before a Vega M decodes anything:
   leaves H.265 on the CPU, a missed fence stops the engine. `tests/AmdUvd6MessagesTest.cpp` checks every field against offsets worked out by hand from the structure (and fails when one is moved);
   `tests/AmdUvd6VideoEngineTest.cpp` covers the stand-in firmware's checks (order count, slots, start code), wrong pictures, a hang, 48 truncated and bit-flipped streams (under the sanitizers) and a clean stream afterwards.
   Not done: 10-bit (Main 10), tiles-heavy and other streams the self-test does not cover, and `highestTid`/`isNonRef`, which Mesa itself leaves out.
+- **MPEG-2: done in simulation.** `AmdUvd6Messages` builds the MPEG-2 decode message (`struct ruvd_mpeg2`, `RUVD_CODEC_MPEG2`; Mesa's `get_mpeg2_msg`): the picture coding parameters, both quantiser matrices in the picture's scan
+  order, and - unlike the H.265 slots and VCN's - job numbers: the engine keeps the last six pictures it decoded and a picture or a reference is named by the number of its decode job (`frame_number`, from 1), so a reference
+  more than six jobs back cannot be named (that picture comes out grey). The job has no context buffer and no scaling table. `AmdUvd6Mpeg2Decoder` is the session (the CPU `Mpeg2Decoder` reads the headers and orders
+  the pictures; frame and field pictures), and `enable_mpeg2_decode` runs the ffmpeg self-test (8 pictures, B pictures, a tolerance of a level or two since the engine's inverse transform is not the CPU's). Tested like
+  H.265, including 48 damaged streams.
+- **VC-1: done in simulation.** `struct ruvd_vc1` is only six dwords (profile, level, the sequence and entry point flags, picture structure, chroma format): there are no picture indexes, so the firmware keeps the
+  decoded pictures and finds the anchors by decoding order, and parses the picture header, bit planes and macroblocks out of the frame data itself. `AmdUvd6Messages` builds that message (the size in macroblocks for
+  Simple and Main, in samples for Advanced; Mesa's `get_vc1_msg`) and sizes the picture buffer as `calc_dpb_size` does (five pictures, the context area and the lines); the job is the MPEG-2 one. `AmdUvd6Vc1Decoder`
+  is the session (progressive pictures; a skipped P picture is not sent, the CPU decoder copies it), and `enable_vc1_decode` runs the two-stream self-test (Main and Advanced profile, both must pass, a level or two
+  of tolerance). That the firmware really picks the same anchors as the CPU decoder is what the self-test is for; nothing here has seen the firmware. Not done: interlaced pictures, intensity compensation beyond what the
+  firmware does itself, and the MPEG-4 message.
 - **The video device: done in simulation, opt-in.** `AmdUvd6VideoEngine` (a `SoftwareVideoCodec`, like `AmdVcnVideoEngine`) loads `vegam_uvd.bin`, reads the memory controller and the graphics block's `GB_ADDR_CONFIG`
   (it refuses to start if that reads zero or all ones), plans and maps the memory, starts `AmdUvd6` (three boot tries), runs the decode ring's own test and the same H.264 self-test the VCN engine runs
   (`AmdVcnSelfTest::run_h264_session`: this OS's own 64 x 64 stream, decoded by the engine and the CPU, byte for byte). Only then does `create_decoder` hand H.264 sessions to the engine (one at a time; H.265 the same way after its own test); any failure stops
@@ -117,6 +131,6 @@ What it does not do, and what is needed before a Vega M decodes anything:
   `-DTCOS_AMD_UVD=ON` (off by default, since the start has never touched a real card). `tests/AmdUvd6VideoEngineTest.cpp` runs the whole path against one simulated card (memory controller, graphics block, engine boot,
   ring controller, a stand-in firmware that decodes with the CPU decoder) and ten cases: success (sessions served by the engine, second session on the CPU, shutdown), no firmware, no registers, too small an aperture,
   a mapper that refuses, an engine that never answers, a graphics block that reports nothing, a ring that does not run, an engine that writes wrong pictures, and one that never finishes a picture.
-- Still open on the video side: 10-bit HEVC and the other codecs, reading the feedback area back, SMC clock requests (a card whose engine stays unpowered makes the start time out; it is stopped and reported), and a run on a real card.
+- Still open on the video side: 10-bit HEVC, MPEG-4, interlaced VC-1, reading the feedback area back, SMC clock requests (a card whose engine stays unpowered makes the start time out; it is stopped and reported), and a run on a real card.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.

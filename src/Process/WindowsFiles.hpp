@@ -39,6 +39,9 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r);
 uint32_t nt_query_directory_file(Process& p, const SyscallRequest& r);
 uint32_t nt_query_attributes_file(Process& p, const SyscallRequest& r);
 uint32_t nt_delete_file(Process& p, const SyscallRequest& r);
+// NtCreateSymbolicLink(POBJECT_ATTRIBUTES LinkAttributes, PUNICODE_STRING Target, BOOLEAN TargetIsDirectory): this OS's own service, behind CreateSymbolicLinkW
+// (CreateHardLinkW instead goes through NtSetInformationFile's FileLinkInformation, like MoveFileExW goes through FileRenameInformation).
+uint32_t nt_create_symbolic_link(Process& p, const SyscallRequest& r);
 uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r);
 uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r);
 
