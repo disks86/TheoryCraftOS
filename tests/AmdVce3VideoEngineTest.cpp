@@ -118,6 +118,8 @@ static EncoderConfig config(uint32_t width = 64, uint32_t height = 48) {
   return c;
 }
 
+static std::vector<uint32_t> messages(const Rig& rig) { return rig.card.smc_messages; }
+
 static void test_start_and_sessions() {
   Rig rig;
   CHECK(rig.load());
@@ -127,7 +129,10 @@ static void test_start_and_sessions() {
   CHECK(rig.engine->start(rig.clock) && rig.engine->ready() && !rig.engine->wedged());
   CHECK(strstr(rig.engine->status(), "H.264 encode runs on it"));
   // The SMC was asked to power the engine, once, before the start; the self-test used three pictures and left the engine free.
-  CHECK(rig.card.smc_messages.size() == 1 && rig.card.smc_messages[0] == 0x10f);
+  CHECK(messages(rig) == std::vector<uint32_t>({0x10f, 0x12e, 0x15a}));
+  // ... then the clock: the top of the four levels is the boot level, and the only one enabled.
+  CHECK(rig.card.smc_arguments[1] == 8 && rig.card.boot_level() == 3 && rig.engine->requested_level() == 3);
+  CHECK(rig.card.sram[Card::kBootLevelWord] == 0xAA03CCDDu && strstr(rig.engine->status(), "clock level 3"));
   CHECK(rig.fw.encodes == 3 && rig.fw.creates == 1 && rig.fw.destroys == 1 && rig.fw.problems == 0 && rig.card.protocol_errors == 0);
   CHECK(rig.card.boots >= 1);
   {
@@ -151,15 +156,40 @@ static void test_start_and_sessions() {
   CHECK(!rig.engine->create_encoder(config(63, 48)));
   rig.engine->stop();
   CHECK(!rig.engine->ready() && !rig.engine->create_encoder(config()));
-  CHECK(rig.card.smc_messages.size() == 2 && rig.card.smc_messages[1] == 0x10e);
+  CHECK(messages(rig) == std::vector<uint32_t>({0x10f, 0x12e, 0x15a, 0x15b, 0x10e}) && rig.engine->requested_level() == -1);   // DPM off, then the power
   // A stopped engine starts again.
-  CHECK(rig.engine->start(rig.clock) && rig.engine->ready() && rig.card.smc_messages.size() == 3 && rig.card.smc_messages[2] == 0x10f);
+  CHECK(rig.engine->start(rig.clock) && rig.engine->ready() && rig.card.smc_messages.size() == 8 && rig.card.smc_messages[5] == 0x10f);
   CHECK(rig.engine->create_encoder(config()));
   rig.engine->stop();
   rig.fw.encoder.reset();
   rig.engine.reset();
   rig.fs.reset();
   CHECK(rig.alloc.live == 0);
+}
+
+// The clock request: the lowest level when asked for, and an SMC whose memory holds no DPM table is left alone (the engine still starts).
+static void test_clock_levels() {
+  {
+    Rig rig;
+    CHECK(rig.load() && rig.engine->plan(rig.card, rig.mapper, rig.region));
+    rig.engine->set_clock_level(AmdSmu7::VceLevel::Lowest);
+    CHECK(rig.engine->start(rig.clock) && rig.engine->requested_level() == 0);
+    CHECK(messages(rig) == std::vector<uint32_t>({0x10f, 0x15a}) && rig.card.boot_level() == 0 && strstr(rig.engine->status(), "clock level 0"));
+  }
+  {
+    Rig rig;
+    CHECK(rig.load() && rig.engine->plan(rig.card, rig.mapper, rig.region));
+    rig.card.sram[0x20000 + 52] = 0;   // the SMC's firmware is not running
+    CHECK(rig.engine->start(rig.clock) && rig.engine->ready() && rig.engine->requested_level() == -1 && strstr(rig.engine->status(), "DPM table not found"));
+    rig.engine->stop();
+    CHECK(messages(rig) == std::vector<uint32_t>({0x10f, 0x10e}));
+  }
+  {  // A level count nobody has: no request, the engine runs.
+    Rig rig;
+    CHECK(rig.load() && rig.engine->plan(rig.card, rig.mapper, rig.region));
+    rig.card.sram[Card::kLevelCountWord] = 0x11000033u | (0u << 16);
+    CHECK(rig.engine->start(rig.clock) && rig.engine->requested_level() == -1 && rig.card.boot_level() == 0);
+  }
 }
 
 static void test_planning_refusals() {
@@ -201,31 +231,31 @@ static void test_start_refusals() {
     CHECK(rig.load() && rig.engine->plan(rig.card, rig.mapper, rig.region));
     rig.card.dead = true;
     CHECK(!rig.engine->start(rig.clock) && !rig.engine->ready() && strstr(rig.engine->status(), "did not answer"));
-    CHECK(rig.card.smc_messages.size() == 2 && rig.card.smc_messages[0] == 0x10f && rig.card.smc_messages[1] == 0x10e);
+    CHECK(messages(rig) == std::vector<uint32_t>({0x10f, 0x12e, 0x15a, 0x15b, 0x10e}));
     CHECK(!rig.engine->create_encoder(config()) && rig.fw.encodes == 0);
   }
   {  // No SMC answering: the start goes on, and nothing is powered down at stop.
     Rig rig;
     CHECK(rig.load() && rig.engine->plan(rig.card, rig.mapper, rig.region));
     rig.card.smc_running = false;
-    CHECK(rig.engine->start(rig.clock) && rig.engine->ready());
+    CHECK(rig.engine->start(rig.clock) && rig.engine->ready() && rig.engine->requested_level() == -1);
     rig.engine->stop();
-    CHECK(rig.card.smc_messages.size() == 1);
+    CHECK(messages(rig) == std::vector<uint32_t>({0x10f}) && rig.card.boot_level() == 0);   // (one message, no answer: nothing else asked)
   }
   {  // The SMC does not know the message.
     Rig rig;
     CHECK(rig.load() && rig.engine->plan(rig.card, rig.mapper, rig.region));
     rig.card.smc_result = 0xFE;
-    CHECK(rig.engine->start(rig.clock) && rig.engine->ready());
+    CHECK(rig.engine->start(rig.clock) && rig.engine->ready() && rig.engine->requested_level() == -1);
     rig.engine->stop();
-    CHECK(rig.card.smc_messages.size() == 1);
+    CHECK(messages(rig) == std::vector<uint32_t>({0x10f, 0x12e}) && strstr(rig.engine->status(), "VCE stopped"));
   }
   {  // A fence that never comes: the self-test's first job times out.
     Rig rig;
     CHECK(rig.load() && rig.engine->plan(rig.card, rig.mapper, rig.region));
     rig.card.stall = true;
     CHECK(!rig.engine->start(rig.clock) && !rig.engine->ready() && strstr(rig.engine->status(), "self-test failed"));
-    CHECK(!rig.card.smc_messages.empty() && rig.card.smc_messages.back() == 0x10e && !rig.engine->create_encoder(config()));
+    CHECK(!rig.card.smc_messages.empty() && rig.card.smc_messages.back() == 0x10e && rig.card.smc_messages[rig.card.smc_messages.size() - 2] == 0x15b && !rig.engine->create_encoder(config()));
   }
   {  // A firmware that writes a damaged bitstream.
     Rig rig;
@@ -316,7 +346,7 @@ static void test_device(bool encode) {
     device.start_hardware(clock);
     CHECK(device.encode_ready() == encode);
     CHECK(((device.info().accelerated_encode_codecs & codec_mask(VideoCodec::H264)) != 0) == encode);
-    CHECK((strstr(device.firmware_status(), "H.264 encode runs on it") != nullptr) == encode);
+    CHECK((strstr(device.encode_status(), "H.264 encode runs on it") != nullptr) == encode);   // (the encoder has a status line of its own)
     VideoFrameBuffer src(alloc);
     CHECK(src.allocate({64, 48, PixelFormat::I420}));
     for (uint32_t i = 0; i < 64 * 48; ++i) src.plane(0)[i] = static_cast<uint8_t>(i * 3);
@@ -344,6 +374,7 @@ static void test_device(bool encode) {
 
 int main() {
   test_start_and_sessions();
+  test_clock_levels();
   test_planning_refusals();
   test_start_refusals();
   test_device(true);

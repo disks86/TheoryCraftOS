@@ -558,10 +558,6 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
       firmware_text_.append(firmware_name_ ? firmware_name_ : "");
       firmware_text_.append(")");
     }
-    if (vce_ && vce_->status()[0]) {
-      firmware_text_.append("; ");
-      firmware_text_.append(vce_->status());
-    }
     summary_.assign("AMD Radeon RX Vega M (UVD 6.3), firmware ");
     summary_.append(firmware_text_.view());
   }

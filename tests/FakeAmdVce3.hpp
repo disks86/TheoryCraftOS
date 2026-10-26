@@ -272,17 +272,26 @@ struct Card final : Controller {
   bool dead = false;                  // the ECPU never boots
   bool smc_running = true;
   uint32_t smc_result = 1;            // PPSMC_Result_OK
-  std::vector<uint32_t> smc_messages;
+  std::vector<uint32_t> smc_messages, smc_arguments;   // every message, and the argument register when it was sent
+  // The SMC's memory (a big-endian view by dword address) with a DPM table the way the Vega M's has it: the header at 0x20000 names the table at 0x30000, VceLevelCount is byte
+  // 213 and VceBootLevel byte 1649 of it (the second byte of their dwords, bits 23:16).
+  static constexpr uint32_t kDpmTable = 0x30000, kLevelCountWord = kDpmTable + 212, kBootLevelWord = kDpmTable + 1648;
+  std::map<uint32_t, uint32_t> sram;
+  uint32_t boot_level() const { auto it = sram.find(kBootLevelWord); return it == sram.end() ? 0 : (it->second >> 16) & 0xFF; }
   uint32_t boots = 0;
 
   Card() {
     regs[0][kSoftReset - 0x8000] = regs[1][kSoftReset - 0x8000] = 1;
     global[kSmcResponse] = 1;   // the mailbox is idle
+    sram[0x20000 + 52] = kDpmTable;
+    sram[kLevelCountWord] = 0x11000033u | (4u << 16);   // four VCE levels
+    sram[kBootLevelWord] = 0xAA000000u | 0x00CCDDu;     // VceBootLevel 0 between other fields
   }
   static bool is_vce(uint32_t r) { return r >= 0x8000 && r < 0x9000; }
   uint32_t read(uint32_t r) override {
     if (is_vce(r) || r == 0xc200) return Controller::read(r);
     if (r == kSmcData) return smc_index == ixCcHarvestFuses ? fuses << 1 : 0;
+    if (r == 0x1AD) { auto it = sram.find(global[0x1AC]); return it == sram.end() ? 0 : it->second; }
     auto it = global.find(r);
     return it == global.end() ? 0 : it->second;
   }
@@ -295,9 +304,11 @@ struct Card final : Controller {
     }
     if (r == 0xc200) { Controller::write(r, v); return; }
     if (r == kSmcIndex) smc_index = v;
+    if (r == 0x1AD) { sram[global[0x1AC]] = v; return; }
     if (r == kSmcResponse) { global[r] = v; return; }
     if (r == kSmcMessage) {
       smc_messages.push_back(v);
+      smc_arguments.push_back(global[kSmcArgument]);
       global[r] = v;
       if (smc_running) global[kSmcResponse] = smc_result;
       return;
