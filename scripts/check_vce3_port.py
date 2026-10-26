@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks that the VCE 3 port (src/Hardware/VideoCodec/AMD/AmdVce3.cpp) touches registers in the same order as the Linux driver it was ported from.
 
-  check_vce3_port.py path/to/linux/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+  check_vce3_port.py path/to/linux/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c path/to/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
 
 For each ported function it takes the ordered list of register names (mm... / ix...) and register field names (REG__FIELD_MASK / __SHIFT) in the kernel function and
 in the port, and compares them. A port that drops, adds, reorders or mistypes a register access fails. The values written are not compared (tests/AmdVce3Test.cpp checks
@@ -52,10 +52,11 @@ def fields(text):
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 3:
         sys.exit(__doc__)
     here = os.path.dirname(os.path.abspath(__file__))
     kernel = open(sys.argv[1]).read()
+    common = open(sys.argv[2]).read()
     port = open(os.path.join(here, '..', 'src/Hardware/VideoCodec/AMD/AmdVce3.cpp')).read()
     # (name, kernel regex, port regex, kernel tokens to leave out, port tokens to leave out)
     pairs = [
@@ -88,6 +89,32 @@ def main():
                     break
             else:
                 print(f'    one list is a prefix of the other: kernel {k[len(p):] if len(k) > len(p) else ""} port {p[len(k):] if len(p) > len(k) else ""}')
+    # The ring (AmdVce3Ring.cpp): the commands of a job (the VM ring's emit_ib followed by emit_fence), the ring test, and the registers of the ring pointers.
+    ring = open(os.path.join(here, '..', 'src/Hardware/VideoCodec/AMD/AmdVce3Ring.cpp')).read()
+    # A command is named VCE_CMD_x in the driver and kCmdX in the port.
+    def commands(text, port):
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        text = re.sub(r'//[^\n]*', '', text)
+        if port:
+            return ['VCE_CMD_' + re.sub(r'(?<!^)(?=[A-Z])', '_', m).upper() for m in re.findall(r'\bkCmd(\w+)', text)]
+        return re.findall(r'\bVCE_CMD_\w+', text)
+    k = commands(body(kernel, r'static void vce_v3_0_ring_emit_ib\([^)]*\)\s*\{') + body(common, r'void amdgpu_vce_ring_emit_fence\([^)]*\)\s*\{'), False)
+    p = commands(body(ring, r'uint32_t AmdVce3Ring::build_job_commands\([^)]*\)\s*\{'), True)
+    print(f'{"ring commands (ib, fence)":28s} kernel {len(k):3d}  port {len(p):3d}  {"same" if k == p else "DIFFERENT"}')
+    failed = failed or k != p
+    k = commands(body(common, r'int amdgpu_vce_ring_test_ring\([^)]*\)\s*\{'), False)
+    p = commands(body(ring, r'bool AmdVce3Ring::test\([^)]*\)\s*\{'), True)
+    print(f'{"ring test":28s} kernel {len(k):3d}  port {len(p):3d}  {"same" if k == p else "DIFFERENT"}')
+    failed = failed or k != p
+    # The pointers: the same registers, selected the same way (the instance, then the default again). The port keeps the three rings in tables.
+    kp = sorted(fields(body(kernel, r'static uint64_t vce_v3_0_ring_get_rptr\([^)]*\)\s*\{')) + fields(body(kernel, r'static uint64_t vce_v3_0_ring_get_wptr\([^)]*\)\s*\{')) +
+                fields(body(kernel, r'static void vce_v3_0_ring_set_wptr\([^)]*\)\s*\{')))
+    pp = sorted(fields(body(ring, r'uint32_t AmdVce3Ring::read_ring_register\([^)]*\)\s*\{')) + fields(body(ring, r'void AmdVce3Ring::write_write_pointer\([^)]*\)\s*\{')))
+    # (the kernel reads each of the six registers in one function and selects the instance in each of the three; the port's two functions name each register once)
+    kernel_registers = sorted(set(t for t in kp if t.startswith('mmVCE_RB_')))
+    port_registers = sorted(set(t for t in pp if t.startswith('mmVCE_RB_')))
+    print(f'{"ring pointer registers":28s} kernel {len(kernel_registers):3d}  port {len(port_registers):3d}  {"same" if kernel_registers == port_registers else "DIFFERENT"}')
+    failed = failed or kernel_registers != port_registers
     sys.exit(1 if failed else 0)
 
 
