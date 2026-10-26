@@ -141,10 +141,11 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
     request_power(clock);
     const AmdUvd6::Status status = uvd_->start(firmware_, memory_.engine, config_);
     if (status != AmdUvd6::Status::Ok) {
+      const char* what = status == AmdUvd6::Status::TimedOut ? "engine start failed: VCPU did not answer" :
+                         status == AmdUvd6::Status::BadMemory ? "engine start refused: bad memory block" : "engine start refused: unusable firmware";
+      note_ = status == AmdUvd6::Status::TimedOut ? describe(what, uvd_->failure_snapshot()) : what;
       release_power(clock);
       uvd_.reset();
-      note_ = status == AmdUvd6::Status::TimedOut ? "engine start failed: the VCPU did not answer (is the engine powered?)" :
-              status == AmdUvd6::Status::BadMemory ? "engine start refused: bad memory block" : "engine start refused: unusable firmware";
       rebuild_status();
       return false;
     }
@@ -205,6 +206,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
         why = "out of memory";
       } else if (!ring_->test()) {
         why = "the decode ring did not run a register write";
+        ring_detail_ = AmdUvd6::read_diagnostics(registers);
+        has_ring_detail_ = true;
       } else {
         engine_.ring = ring_.get();
         engine_.memory = &work_;
@@ -220,13 +223,16 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
         if (result != AmdVcnSelfTest::Result::Passed) {
           why = AmdVcnSelfTest::result_name(result);
           tested = true;
+          ring_detail_ = AmdUvd6::read_diagnostics(registers);
+          has_ring_detail_ = true;
         }
       }
     }
     if (why) {
       decode_text_.assign(tested ? "H.264 self-test failed (" : "decoding not enabled (");
-      decode_text_.append(why);
+      decode_text_.append(has_ring_detail_ ? describe(why, ring_detail_) : why);
       decode_text_.append("); engine stopped");
+      has_ring_detail_ = false;
       stop_engine();
       note_ = decode_text_.c_str();
       rebuild_status();
@@ -414,6 +420,27 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
  private:
   static constexpr uint32_t kBootAttempts = 3;
 
+  // "<what> [st=.. pw=.. rst=.. cn=.. lmi=.. rp=.. wp=..]": the registers of AmdUvd6::Diagnostics in hexadecimal, short enough for the status line.
+  const char* describe(const char* what, const AmdUvd6::Diagnostics& d) {
+    diag_text_.assign(what);
+    diag_text_.append(" [st=0x");
+    append_hex(diag_text_, d.status);
+    diag_text_.append(" pw=0x");
+    append_hex(diag_text_, d.power_status);
+    diag_text_.append(" rst=0x");
+    append_hex(diag_text_, d.soft_reset);
+    diag_text_.append(" cn=0x");
+    append_hex(diag_text_, d.vcpu_cntl);
+    diag_text_.append(" lmi=0x");
+    append_hex(diag_text_, d.lmi_ctrl2);
+    diag_text_.append(" rp=0x");
+    append_hex(diag_text_, d.rb_rptr);
+    diag_text_.append(" wp=0x");
+    append_hex(diag_text_, d.rb_wptr);
+    diag_text_.append("]");
+    return diag_text_.c_str();
+  }
+
   // Asks the card's SMC to power the engine (the driver does this before it touches the engine). The start goes on whatever the answer: an SMC that is not running means the
   // system firmware left the card as it was, and the start itself shows whether the engine is up. Only an acknowledged request is undone at stop.
   void request_power(const IClock& clock) {
@@ -432,7 +459,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   }
   static constexpr uint32_t kGbAddrConfig = 0x263e;   // mmGB_ADDR_CONFIG (gca/gfx_8_0_d.h)
 
-  static void append_hex(FixedString<255>& out, uint64_t value) {
+  template <uint64_t N>
+  static void append_hex(FixedString<N>& out, uint64_t value) {
     bool started = false;
     for (int shift = 60; shift >= 0; shift -= 4) {
       const uint32_t nibble = static_cast<uint32_t>((value >> shift) & 0xF);
@@ -468,7 +496,7 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   AmdFirmwareStatus firmware_state_ = AmdFirmwareStatus::NotApplicable;
   const char* firmware_name_ = nullptr;
   FixedString<255> firmware_text_, summary_;
-  FixedString<200> decode_text_;
+  FixedString<255> decode_text_, diag_text_;
   const char* power_note_ = "";
   bool smc_powered_ = false;   // the SMC acknowledged our request to power the engine, so we ask it to power it down again
   const char* note_ = "engine not started";
@@ -489,6 +517,8 @@ class AmdUvd6VideoEngine final : public SoftwareVideoCodec {
   AmdVcnWorkMemory work_;
   AmdUvd6AvcDecoder::Engine engine_;
   const IClock* clock_ = nullptr;
+  AmdUvd6::Diagnostics ring_detail_;
+  bool has_ring_detail_ = false;
   bool decode_ready_ = false;
   bool hevc_ready_ = false;
   bool mpeg2_ready_ = false;

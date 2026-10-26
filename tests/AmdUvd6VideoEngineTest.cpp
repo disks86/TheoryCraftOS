@@ -287,6 +287,7 @@ struct Card final : IVcnRegisters {
     ring.write(reg::kFbLocation, ((0xF4u + 255) << 16) | 0xF4u);
     ring.write(reg::kGbAddrConfig, 0x22011003);
     ring.write(0x95, 1);   // SMC_RESP_0: idle, the last message was done
+    ring.write(0x38c4, 0xBEEF00);   // UVD_POWER_STATUS: something recognisable for the failure messages
   }
   uint32_t read(uint32_t r) override { return ring.read(r); }
   void write(uint32_t r, uint32_t v) override {
@@ -819,6 +820,10 @@ static void run_case(Fault fault) {
       if (fault == Fault::NoBoot || fault == Fault::DeadRing || fault == Fault::WrongPictures || fault == Fault::Hang || fault == Fault::HevcHang || fault == Fault::Mpeg2Hang || fault == Fault::Vc1Hang)
         CHECK(card.smc_log.size() == 2 && card.smc_log[0].first == 0x61 && card.smc_log[1].first == 0x60);
       if (fault == Fault::NoGbConfig) CHECK(card.smc_log.empty());   // (refused before anything is asked of the card)
+      // The failure messages carry the engine's registers (for the first run on a real card): at the moment the start gave up, not after the stop sequence.
+      if (fault == Fault::NoBoot) CHECK(strstr(engine.firmware_status(), "st=0x0 pw=0xBEEF00 rst=0x0 cn=0x") != nullptr);
+      if (fault == Fault::WrongPictures || fault == Fault::Hang) CHECK(strstr(engine.firmware_status(), "self-test failed") != nullptr && strstr(engine.firmware_status(), "pw=0xBEEF00") != nullptr);
+      if (fault == Fault::DeadRing) CHECK(strstr(engine.firmware_status(), "pw=0xBEEF00") != nullptr && strstr(engine.firmware_status(), "rp=0x0 wp=0x") != nullptr);
       if (fault == Fault::NoBoot) CHECK(card.boot_attempts == 1 + 3);   // the release that starts the VCPU, then three tries (not the driver's ten)
     }
   }
