@@ -2122,5 +2122,9 @@ API void _endthread(void) { ExitThread(0); }
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module; (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) g_errno_slot = TlsAlloc();
+  if (reason == DLL_THREAD_DETACH && g_errno_slot != TLS_OUT_OF_INDEXES) {      /* the thread's errno goes with it */
+    int *p = TlsGetValue(g_errno_slot);
+    if (p) { TlsSetValue(g_errno_slot, NULL); HeapFree(GetProcessHeap(), 0, p); }
+  }
   return TRUE;
 }

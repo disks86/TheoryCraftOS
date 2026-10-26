@@ -275,7 +275,16 @@ EXPORT void WINAPI OutputDebugStringA(LPCSTR s) { (void)s; }
 EXPORT void WINAPI OutputDebugStringW(LPCWSTR s) { (void)s; }
 EXPORT UINT WINAPI SetErrorMode(UINT mode) { (void)mode; return 0; }
 EXPORT BOOL WINAPI SetProcessShutdownParameters(DWORD level, DWORD flags) { (void)level; (void)flags; return TRUE; }
-EXPORT BOOL WINAPI DisableThreadLibraryCalls(HMODULE m) { (void)m; return TRUE; }
+EXPORT BOOL WINAPI DisableThreadLibraryCalls(HMODULE m) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  if (!ldr) return FALSE;
+  for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *module = (LDR_DATA_TABLE_ENTRY *)e;
+    if (module->DllBase == (PVOID)m) { module->Flags |= 0x00040000u; return TRUE; }
+  }
+  set_error(ERROR_INVALID_HANDLE);
+  return FALSE;
+}
 
 static RTL_USER_PROCESS_PARAMETERS *parameters(void) { return NtCurrentPeb()->ProcessParameters; }
 

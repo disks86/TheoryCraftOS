@@ -223,17 +223,72 @@ EXPORT NTSTATUS NTAPI RtlGetVersion(RTL_OSVERSIONINFOW *info) {
   return STATUS_SUCCESS;
 }
 
+/* ---- what the loader tells the modules: TLS callbacks and DllMain --------------------------------------------------------------------------------------------- */
+
+/* A module hears about the process starting and ending and about threads starting and ending: first its TLS callbacks (the program's too), then, for a library, its
+ * entry point (DllMain), unless it asked not to be told about threads (DisableThreadLibraryCalls). One notification at a time (the loader lock, which a thread that is told
+ * something may take again). The libraries are told in load order when something starts and in the opposite order when it ends; the program's callbacks come first and last. */
+typedef void (NTAPI *TlsCallback)(PVOID, DWORD, PVOID);
+#define LDRP_DONT_CALL_FOR_THREADS 0x00040000u
+static volatile ULONG_PTR g_loader_owner;
+static volatile LONG g_loader_depth;
+static void loader_lock(void) {
+  const ULONG_PTR me = TEB_CLIENT_THREAD(NtCurrentTeb());
+  if (g_loader_owner == me) { ++g_loader_depth; return; }
+  while (!__sync_bool_compare_and_swap(&g_loader_owner, 0, me)) NtYieldExecution();
+  g_loader_depth = 1;
+}
+static void loader_unlock(void) { if (--g_loader_depth == 0) __sync_lock_release(&g_loader_owner); }
+
+static int is_program(const LDR_DATA_TABLE_ENTRY *m) { return NtCurrentPeb()->ImageBaseAddress == m->DllBase; }
+
+static void notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved) {
+  const int about_threads = reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH;
+  if (about_threads && !is_program(m) && (m->Flags & LDRP_DONT_CALL_FOR_THREADS)) return;
+  const BYTE *image = (const BYTE *)m->DllBase;
+  if (!image) return;
+  const ULONG nt = *(const ULONG *)(image + 0x3C);
+  const ULONG rva = *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8);      /* IMAGE_DIRECTORY_ENTRY_TLS */
+  const ULONG size = *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8 + 4);
+  if (rva && size >= 0x28) {
+    const TlsCallback *callbacks = (const TlsCallback *)*(const ULONG64 *)(image + rva + 0x18);
+    if (callbacks) for (; *callbacks; ++callbacks) (*callbacks)(m->DllBase, reason, reserved);
+  }
+  if (!is_program(m) && m->EntryPoint) ((BOOL (WINAPI *)(PVOID, DWORD, PVOID))m->EntryPoint)(m->DllBase, reason, reserved);
+}
+
+static LDR_DATA_TABLE_ENTRY *entry_of(LIST_ENTRY *link) { return (LDR_DATA_TABLE_ENTRY *)link; }      /* (InLoadOrderLinks is the first member) */
+
+/* `forward`: libraries in load order, the program first (a start); otherwise the libraries in the opposite order, the program last (an end). */
+static void notify_all_modules(DWORD reason, PVOID reserved, int forward) {
+  PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;
+  if (!ldr) return;
+  loader_lock();
+  LIST_ENTRY *head = &ldr->InLoadOrderModuleList;
+  if (forward) {
+    for (LIST_ENTRY *e = head->Flink; e && e != head; e = e->Flink) notify_module(entry_of(e), reason, reserved);
+  } else {
+    for (LIST_ENTRY *e = head->Blink; e && e != head; e = e->Blink) if (!is_program(entry_of(e))) notify_module(entry_of(e), reason, reserved);
+    for (LIST_ENTRY *e = head->Flink; e && e != head; e = e->Flink) if (is_program(entry_of(e))) notify_module(entry_of(e), reason, reserved);
+  }
+  loader_unlock();
+}
+
+static volatile LONG g_process_ending;
 EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
+  if (__sync_bool_compare_and_swap(&g_process_ending, 0, 1)) notify_all_modules(DLL_PROCESS_DETACH, (PVOID)1, 0);      /* (1: the process is ending) */
   for (;;) NtTerminateProcess(NtCurrentProcess(), status);
 }
 
-/* The thread ends; the process ends with its last thread. */
+/* The thread ends (the libraries and the program are told); the process ends with its last thread. */
 EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
+  if (!g_process_ending) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
   for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
 }
 
 /* New threads begin here (the kernel passes the thread's function and parameter in the first two argument registers); the function's return value is the thread's exit code. */
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+  notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
   RtlExitUserThread((NTSTATUS)start(parameter));
 }
 
@@ -582,11 +637,15 @@ EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
   if (ldr) {
+    loader_lock();
+    /* the libraries in the order they depend on each other, then the program's TLS callbacks, then the program */
     LIST_ENTRY *head = &ldr->InInitializationOrderModuleList;
     for (LIST_ENTRY *e = head->Flink; e != head; e = e->Flink) {
       LDR_DATA_TABLE_ENTRY *module = (LDR_DATA_TABLE_ENTRY *)((BYTE *)e - __builtin_offsetof(LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks));
-      if (module->EntryPoint) ((DllEntry)module->EntryPoint)(module->DllBase, DLL_PROCESS_ATTACH, (PVOID)1);
+      notify_module(module, DLL_PROCESS_ATTACH, (PVOID)1);
     }
+    for (LIST_ENTRY *e = ldr->InLoadOrderModuleList.Flink; e != &ldr->InLoadOrderModuleList; e = e->Flink) if (is_program(entry_of(e))) notify_module(entry_of(e), DLL_PROCESS_ATTACH, (PVOID)1);
+    loader_unlock();
   }
   RtlExitUserProcess((NTSTATUS)entry(parameter));
 }
