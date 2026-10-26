@@ -617,11 +617,33 @@ NATIVE(object_has_own_property) {
 // __template(cooked, raw): the strings array a tag function gets
 NATIVE(template_object) {
   const Value cooked = arg_at(args, argc, 0), raw = arg_at(args, argc, 1);
+  // the strings array of a site is one object: kept in a hidden list, by site number
+  Value cache_value;
+  JsObject* cache = nullptr;
+  double site = 0;
+  if (argc > 2 && args[2].is_number()) site = args[2].u.number;
+  if (site >= 1 && site < 1e7) {
+    if (vm.get_named(Value::make_object(vm.global()), "__template_cache", &cache_value) && cache_value.is_object()) cache = cache_value.as_object();
+    if (!cache) {
+      cache = vm.new_array();
+      vm.define_named(vm.global(), "__template_cache", Value::make_object(cache), 0);
+    }
+    for (uint32_t i = 0; i + 1 < cache->length; i += 2) {
+      if (cache->items[i].is_number() && cache->items[i].u.number == site) {
+        *result = cache->items[i + 1];
+        return true;
+      }
+    }
+  }
   if (cooked.is_object() && raw.is_object()) {
     vm.define_named(cooked.as_object(), "raw", raw, 0);
     cooked.as_object()->frozen = raw.as_object()->frozen = true;   // (the strings array of a tagged template and its raw array are frozen)
   }
   *result = cooked;
+  if (cache && cooked.is_object()) {
+    vm.array_push(cache, Value::make_number(site));
+    vm.array_push(cache, cooked);
+  }
   return true;
 }
 
@@ -2134,6 +2156,16 @@ NATIVE(reflect_construct) {
   return vm.construct_with(f, list.as_object()->items, list.as_object()->length, target, result);
 }
 
+NATIVE(function_protos) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  JsObject* list = vm.new_array(3);
+  for (int i = 0; i < 3; ++i) vm.array_push(list, Value::make_object(vm.function_kind_proto(i)));
+  *result = Value::make_object(list);
+  return true;
+}
+
 NATIVE(primitive_of_native) {
   (void)self;
   *result = Vm::primitive_of(arg_at(args, argc, 0));
@@ -2917,7 +2949,8 @@ bool install_builtins(Vm& vm) {
   vm.define_native(generator_proto, "toString", generator_to_string, 0);
   vm.define(generator_proto, vm.intern("@@iterator"), Value::make_object(vm.new_native(return_this, "[Symbol.iterator]", 0)), kWritable);
   vm.define_named(g, "__generator_proto", Value::make_object(generator_proto), 0);
-  vm.define_native(g, "__template", template_object, 2);
+  vm.define_named(generator_proto, "@@toStringTag", str_value(vm, "Generator"), 0);
+  vm.define_native(g, "__template", template_object, 3);
   vm.define_native(g, "__bigint_new", bigint_new, 2);
   vm.define_native(g, "__to_array", destructure_to_array, 2);
   vm.define_native(g, "__req_object", destructure_require_object, 1);
@@ -3098,6 +3131,7 @@ bool install_builtins(Vm& vm) {
   vm.define_native(g, "__symbol_info", symbol_info, 2);
   vm.define_native(g, "__primitive_of", primitive_of_native, 1);
   vm.define_native(g, "__reflect_construct", reflect_construct, 3);
+  vm.define_native(g, "__function_protos", function_protos, 0);
   vm.define_native(object, "getOwnPropertySymbols", object_get_own_property_symbols, 1);
 
   // Promise

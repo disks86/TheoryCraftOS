@@ -198,6 +198,8 @@ class Vm {
   JsObject* number_proto() { return number_proto_; }
   JsObject* boolean_proto() { return boolean_proto_; }
   JsObject* symbol_proto() { return symbol_proto_; }
+  // The prototypes of generator, async and async generator functions (GeneratorFunction.prototype ...): [0] [1] [2].
+  JsObject* function_kind_proto(int kind) { return function_kind_protos_[kind]; }
   // The wrapper object of a primitive (new String('a'), Object(1), a sloppy function's `this`), and the primitive of a wrapper (any other value is itself).
   JsObject* box(const Value& primitive);
   static Value primitive_of(const Value& v) { return v.is_object() && v.as_object()->okind == ObjKind::Primitive ? v.as_object()->bound_this : v; }
@@ -336,6 +338,7 @@ class Vm {
   int64_t find_prop(JsObject* o, JsString* key) const;
   void push_property_keys(JsObject* names, JsObject* o, bool enumerable);
   uint32_t symbol_counter_ = 0;
+  JsObject* function_kind_protos_[3] = {};
   Value new_target_override_;   // for the next construct call (see construct_with)
   Value pending_frame_new_target_;   // ... on its way to the frame
   bool array_index(const Value& key, uint32_t* index) const;

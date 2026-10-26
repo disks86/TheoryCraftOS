@@ -130,6 +130,23 @@ const char kCollections[] = R"JSLIB((function (g) {
     Object.defineProperty(it, '__kind', { value: kind });
     return it;
   });
+  // GeneratorFunction and AsyncFunction: the constructors of generator and async functions (not globals); they build a function from source like Function does
+  (function () {
+    var protos = __function_protos(), generatorProto = __generator_proto;
+    [['GeneratorFunction', protos[0], 'function*'], ['AsyncFunction', protos[1], 'async function']].forEach(function (spec) {
+      var proto = spec[1], prefix = spec[2];
+      var C = function () {
+        var a = Array.prototype.slice.call(arguments), body = a.length ? String(a.pop()) : '';
+        return (0, eval)('(' + prefix + ' anonymous(' + a.join(',') + '\n) {\n' + body + '\n})');
+      };
+      Object.defineProperty(C, 'name', { value: spec[0] });
+      Object.setPrototypeOf(C, Function);
+      Object.defineProperty(C, 'prototype', { value: proto });
+      Object.defineProperty(proto, 'constructor', { value: C, configurable: true });
+      Object.defineProperty(proto, Symbol.toStringTag, { value: spec[0], configurable: true });
+      if (spec[0] === 'GeneratorFunction') Object.defineProperty(proto, 'prototype', { value: generatorProto, configurable: true });
+    });
+  }());
   // the generator objects (and so the iterators of arrays and typed arrays) are iterators
   (function () {
     var generator = (function* () { })();

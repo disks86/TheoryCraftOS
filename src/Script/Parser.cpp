@@ -2300,7 +2300,9 @@ class Parser {
   // tag`text ${value} more`: tag(strings, value), the strings array carrying .raw
   Node* tagged_template(Node* tag) {
     Node* raw_chunks = nullptr;
+    lenient_escapes_ = true;
     Node* tpl = template_literal(&raw_chunks);
+    lenient_escapes_ = false;
     if (!tpl) return nullptr;
     Node* cooked = make(NodeKind::ArrayLit);
     Node* raw = make(NodeKind::ArrayLit);
@@ -2330,6 +2332,8 @@ class Parser {
     helper->a = helper_name;
     helper->list = cooked;
     cooked->next = raw;
+    static uint32_t next_site = 1;   // (one number for each tagged template in the source, for the strings array that is made once: __template(cooked, raw, site))
+    raw->next = number_node(static_cast<double>(__atomic_fetch_add(&next_site, 1, __ATOMIC_RELAXED)));
     call->a = tag;
     call->list = helper;
     helper->next = expressions;
@@ -2675,6 +2679,7 @@ class Parser {
     for (;;) {
       scratch_.clear();
       bool expression_follows = false;
+      bool invalid_escape = false;
       const uint64_t chunk_start = pos_;
       for (;;) {
         if (at_end()) return null_fail("Unterminated template literal");
@@ -2691,6 +2696,11 @@ class Parser {
         if (c == '\\') {
           ++pos_;
           read_escape(&scratch_);
+          if (failed_ && lenient_escapes_) {   // (a tagged template: the cooked string of this part is undefined, the raw one is the text)
+            failed_ = false;
+            error_->clear();
+            invalid_escape = true;
+          }
           if (failed_) return nullptr;
         } else {
           if (c == '\n') ++line_;
@@ -2698,9 +2708,10 @@ class Parser {
           ++pos_;
         }
       }
-      Node* chunk = make(NodeKind::String);
+      Node* chunk = make(invalid_escape ? NodeKind::Ident : NodeKind::String);
       if (!chunk) return nullptr;
-      chunk->text = arena_.copy(scratch_.view());
+      if (invalid_escape) chunk->text = "undefined";
+      else chunk->text = arena_.copy(scratch_.view());
       *tail = chunk;
       tail = &chunk->next;
       if (raw_tail) {   // the text as it was written (line ends as \n)
@@ -2734,6 +2745,7 @@ class Parser {
   uint64_t pos_ = 0, prev_end_ = 0;
   uint32_t line_ = 1;
   Token cur_;
+  bool lenient_escapes_ = false;   // inside a tagged template an invalid escape is allowed: the cooked string is undefined
   bool check_this_ = false, arrow_next_ = false, derived_ctor_next_ = false;   // `this` in the body of a derived constructor is checked (see __this_check)
   bool failed_ = false, in_function_ = false, in_async_ = false, in_generator_ = false, in_async_generator_ = false;
   Node* pending_prologue_ = nullptr;   // the statements that unpack the parameters of the function whose body comes next

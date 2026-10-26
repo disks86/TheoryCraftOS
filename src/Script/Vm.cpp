@@ -85,6 +85,7 @@ Vm::Vm(allocators::IAllocator& allocator, IHost* host)
   number_proto_ = new_object(object_proto_);
   boolean_proto_ = new_object(object_proto_);
   symbol_proto_ = new_object(object_proto_);
+  for (JsObject*& p : function_kind_protos_) p = new_object(function_proto_);
   error_proto_ = new_object(object_proto_);
   iterator_proto_ = new_object(object_proto_);
   sentinel_ = new_object(object_proto_);
@@ -706,7 +707,7 @@ JsObject* Vm::new_native(NativeFn fn, StringView name, uint32_t arity) {
 }
 
 JsObject* Vm::new_function(FunctionCode* code, Env* env, const Value& this_value) {
-  JsObject* f = new_object(function_proto_);
+  JsObject* f = new_object(code->is_generator && function_kind_protos_[0] ? function_kind_protos_[0] : code->is_async && function_kind_protos_[1] ? function_kind_protos_[1] : function_proto_);
   if (f == sentinel_) return f;
   f->okind = ObjKind::Function;
   f->code = code;
@@ -869,6 +870,7 @@ void Vm::collect() {
     mark_value(f.new_target);
     mark(f.coroutine);
   }
+  for (JsObject* p : function_kind_protos_) mark(p);
   mark_value(new_target_override_);
   mark_value(pending_frame_new_target_);
   for (uint64_t i = 0; i < handlers_.count(); ++i) mark(handlers_[i].env);
