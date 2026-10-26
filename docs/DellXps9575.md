@@ -7,14 +7,14 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 | --- | --- | --- |
 | Identified (`*_gpu_identify`) | yes | yes |
 | Boot display / mode setting | `IntelGpu` native path (Gen9.5, unvalidated on hardware) | UEFI GOP only (no Polaris display driver) |
-| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | H.264 on `AmdUvd6VideoEngine`, opt-in (`TCOS_AMD_UVD`), tested in simulation, **not run on hardware** (below); HEVC and the other codecs on the CPU |
+| Video decode | `VideoCodec/Intel` (AVC, HEVC, VP9, MPEG-2, VC-1 via the VCS ring, simulated tests only) | H.264 and H.265 on `AmdUvd6VideoEngine`, opt-in (`TCOS_AMD_UVD`), tested in simulation, **not run on hardware** (below); the other codecs on the CPU |
 | 3D acceleration | `Gen9GraphicsDevice` on the render engine, opt-in (`TCOS_INTEL_RENDER`), tested in simulation, **not run on hardware** (below) | none (CPU renderer) |
 
 ## Not done
 
 - **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
   None of it exists and none can be checked without the hardware and the firmware blobs.
-- **UVD 6.3 video decode** for the Vega M beyond H.264 (HEVC; no VP9), and any run of it on the card.
+- **UVD 6.3 video decode** for the Vega M beyond H.264 and H.265 (10-bit HEVC; MPEG-2/VC-1 messages; the chip has no VP9), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
 
@@ -95,17 +95,24 @@ What it does not do, and what is needed before a Vega M decodes anything:
   index header; offsets measured by `scripts/gen_uvd_message_layout.py` into `AmdUvd6MessageLayout.inc`), the picture-buffer and context sizes (`calc_dpb_size` / `calc_ctx_size_h264_perf` for Polaris and newer: pictures only,
   17 at most), the feedback word and scaling table, and the list of buffers of a job in Mesa's order (session context, message, picture buffer, context, bitstream, target, feedback, scaling table) ready for `AmdUvd6Ring`. It takes the
   same `AvcPictureState` the VCN path makes from the parser, and a linear NV12 target. `tests/AmdUvd6MessagesTest.cpp` checks every field against offsets worked out by hand from the structure definition, and builds a message
-  from a real H.264 stream. HEVC messages (`ruvd_h265`), the other codecs and reading the feedback area back are not done.
+  from a real H.264 stream. HEVC is in the next item; the other codecs and reading the feedback area back are not done.
 - **The H.264 session: done in simulation.** `AmdUvd6AvcDecoder` is an `IVideoDecoder` (the same session logic as the VCN one: parser, decoded picture buffer rules, output order, avcC and Annex B, grey for a picture the
   engine fails, wedge on a missed fence, one session at a time) over the UVD ring, the messages and the work memory. `tests/AmdUvd6AvcDecoderTest.cpp` runs whole streams through it against a simulated ring controller and a stand-in
   for the firmware that checks the messages and buffers and writes the CPU decoder's pictures into the target; the session must return exactly the CPU decoder's pictures, in order. It also covers a wedged engine, too little
-  memory and 24 damaged variants of the stream (under the sanitizers). Making the stand-in's checks wrong (the target address, the pitch) makes the test fail by the hundreds. - **The video device: done in simulation, opt-in.** `AmdUvd6VideoEngine` (a `SoftwareVideoCodec`, like `AmdVcnVideoEngine`) loads `vegam_uvd.bin`, reads the memory controller and the graphics block's `GB_ADDR_CONFIG`
+  memory and 24 damaged variants of the stream (under the sanitizers). Making the stand-in's checks wrong (the target address, the pitch) makes the test fail by the hundreds. - **H.265: done in simulation.** `AmdUvd6Messages` also builds the H.265 decode message (`struct ruvd_h265`, `RUVD_CODEC_H265`, offsets measured into `AmdUvd6MessageLayout.inc`; the values follow Mesa's `get_h265_msg`
+  and the VCN message of this OS), with the picture buffer's slot numbers (unlike the H.264 performance stream type the engine does not keep that buffer by itself), the reference lists and the scaling table, and sizes the
+  buffers as `calc_dpb_size` and `calc_ctx_size_h265_main` do (17 slots, 8 from 4096 x 2000 up). `AmdUvd6HevcDecoder` is the session (the CPU `H265Decoder` reads the headers and orders the pictures; the engine decodes each
+  picture into a linear NV12 target that is read back), 8-bit 4:2:0 only. `AmdUvd6VideoEngine::enable_hevc_decode` runs the libx265 self-test (6 pictures, B pictures with reordering) after the H.264 one; a failure
+  leaves H.265 on the CPU, a missed fence stops the engine. `tests/AmdUvd6MessagesTest.cpp` checks every field against offsets worked out by hand from the structure (and fails when one is moved);
+  `tests/AmdUvd6VideoEngineTest.cpp` covers the stand-in firmware's checks (order count, slots, start code), wrong pictures, a hang, 48 truncated and bit-flipped streams (under the sanitizers) and a clean stream afterwards.
+  Not done: 10-bit (Main 10), tiles-heavy and other streams the self-test does not cover, and `highestTid`/`isNonRef`, which Mesa itself leaves out.
+- **The video device: done in simulation, opt-in.** `AmdUvd6VideoEngine` (a `SoftwareVideoCodec`, like `AmdVcnVideoEngine`) loads `vegam_uvd.bin`, reads the memory controller and the graphics block's `GB_ADDR_CONFIG`
   (it refuses to start if that reads zero or all ones), plans and maps the memory, starts `AmdUvd6` (three boot tries), runs the decode ring's own test and the same H.264 self-test the VCN engine runs
-  (`AmdVcnSelfTest::run_h264_session`: this OS's own 64 x 64 stream, decoded by the engine and the CPU, byte for byte). Only then does `create_decoder` hand H.264 sessions to the engine (one at a time); any failure stops
+  (`AmdVcnSelfTest::run_h264_session`: this OS's own 64 x 64 stream, decoded by the engine and the CPU, byte for byte). Only then does `create_decoder` hand H.264 sessions to the engine (one at a time; H.265 the same way after its own test); any failure stops
   the engine and H.264 stays on the CPU, and every other codec is the CPU's. `SystemVideoCodecs::add_amd_uvd6` finds BAR 0 (with its size) and BAR 5 for device IDs 694C/E/F; it is switched on by
   `-DTCOS_AMD_UVD=ON` (off by default, since the start has never touched a real card). `tests/AmdUvd6VideoEngineTest.cpp` runs the whole path against one simulated card (memory controller, graphics block, engine boot,
   ring controller, a stand-in firmware that decodes with the CPU decoder) and ten cases: success (sessions served by the engine, second session on the CPU, shutdown), no firmware, no registers, too small an aperture,
   a mapper that refuses, an engine that never answers, a graphics block that reports nothing, a ring that does not run, an engine that writes wrong pictures, and one that never finishes a picture.
-- Still open on the video side: HEVC (`ruvd_h265`) and the other codecs, reading the feedback area back, SMC power/clock requests (a card whose engine the firmware left unpowered makes the start time out; it is stopped and reported), and a run on a real card.
+- Still open on the video side: 10-bit HEVC and the other codecs, reading the feedback area back, SMC power/clock requests (a card whose engine the firmware left unpowered makes the start time out; it is stopped and reported), and a run on a real card.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.
