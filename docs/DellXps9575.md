@@ -14,7 +14,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 
 - **Polaris bring-up**: SMU7 firmware load, GFX8 CP/RLC/SDMA microcode, memory controller + GART for the HBM2, interrupt handler, DCE 11.2 display.
   None of it exists and none can be checked without the hardware and the firmware blobs.
-- **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 and MPEG-4 (interlaced VC-1; the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
+- **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 (interlaced pictures untested against real data, see below) and MPEG-4 (the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
 - **Hardware 3D** on the Vega M: a GCN4 PM4 path needing a shader compiler to the native ISA. On the Intel GPU see below for what is and is not there.
 - Nothing here was run on a real 9575.
@@ -230,8 +230,22 @@ What it does not do, and what is needed before a Vega M decodes anything:
   decoded pictures and finds the anchors by decoding order, and parses the picture header, bit planes and macroblocks out of the frame data itself. `AmdUvd6Messages` builds that message (the size in macroblocks for
   Simple and Main, in samples for Advanced; Mesa's `get_vc1_msg`) and sizes the picture buffer as `calc_dpb_size` does (five pictures, the context area and the lines); the job is the MPEG-2 one. `AmdUvd6Vc1Decoder`
   is the session (progressive pictures; a skipped P picture is not sent, the CPU decoder copies it), and `enable_vc1_decode` runs the two-stream self-test (Main and Advanced profile, both must pass, a level or two
-  of tolerance). That the firmware really picks the same anchors as the CPU decoder is what the self-test is for; nothing here has seen the firmware. Not done: interlaced pictures, intensity compensation beyond what the
-  firmware does itself.
+  of tolerance). That the firmware really picks the same anchors as the CPU decoder is what the self-test is for; nothing here has seen the firmware. Not done: intensity compensation beyond what the
+  firmware does itself, and the interlaced pictures' own verification (below).
+- **Interlaced VC-1: partly done in simulation.** Advanced profile only (the sequence flag exists nowhere else). The Core (`vc1::Core`) now takes interlaced sequences: every frame starts with its
+  coding mode (FCM: progressive, frame interlace, field interlace), followed - after the picture type, `TFCNTR` and the pulldown bits (`TFF` and `RFF` here) - by `RNDCTRL` and `UVSAMP`, and
+  `DMVRANGE` follows `MVRANGE` in a P picture when the entry point has `EXTENDED_DMV`. A *progressive* frame in an interlaced sequence is decoded on the CPU as before, bit for bit like FFmpeg's decoder
+  (three new generator streams, `vc1_adv_il_*`: I P B BI and skipped pictures, pulldown bits, post processing, extended DMV range). A frame or field coded picture has no pixel path on the CPU - it is
+  refused unless an engine takes the sequence - and the Core reads only as far as the picture class (`FPTYPE` for field coding: a frame whose fields are B or BI is a B frame, one with an intra first field an I
+  frame, else P), hands the engine all the frame's units in order (the field start code unit `0x0C` after the frame unit) and manages anchors, references and the output order as for progressive frames.
+  `AmdUvd6Vc1Decoder::allow_interlace` lets a session give such a sequence to the engine; `AmdUvd6VideoEngine::enable_vc1_interlaced_decode` sets it after a test of its own: the Advanced profile
+  pattern in an interlaced sequence (progressive frames, so the CPU decoder is the reference) must come out right. The message is the progressive one with the `interlace` flag (bit 5 of the sps
+  flags, as in Mesa's `get_vc1_msg`); `pic_structure` stays 0 and the firmware is left to read the frame coding mode and the field headers from the frame data, as Mesa does (it never sets the
+  `frame_coding_mode` and `picture_type` fields its own `#if 0` lists). What is NOT verified: any frame or field coded picture - there is no VC-1 encoder or reference decoder that makes
+  them here (FFmpeg decodes but cannot encode VC-1, and the generator writes only progressive macroblock syntax), so the engine test's stand-in only checks that such a picture arrives whole and in
+  order with the flag set (hand-built headers, `tests/Vc1InterlacedFrames.hpp`), and the device assumes a firmware that passes the progressive-frame test decodes them. Whether the surface the firmware
+  writes for a field coded frame is the two fields interleaved, as read back here, is a guess. Not done: progressive segmented frames (`PSF`; FFmpeg has none to check against), pulldown (the repeat
+  flags are read and ignored), and the other engines (VCN and Intel still refuse interlaced sequences, which the CPU then decodes frame by frame where it can).
 - **MPEG-4 Part 2: done in simulation.** `VideoCodec::Mpeg4` (Simple and Advanced Simple profile, as DivX and Xvid make it; the AVI reader maps the `xvid`, `divx`, `dx50`, `fmp4` and `mp4v` tags to it). Unlike every
   other codec here there is no CPU decoder for it, so the engine is the only decoder and this OS reads the headers itself: `Mpeg4Headers` parses the video object layer (size, time base, interlacing, quarter-sample
   motion, quantiser type and matrices, resync marker, data partitioning, low delay) in the order of the standard - checked against FFmpeg's `decode_vol_header` and against streams from FFmpeg's encoder
@@ -254,6 +268,6 @@ What it does not do, and what is needed before a Vega M decodes anything:
   `-DTCOS_AMD_UVD=ON` (off by default, since the start has never touched a real card). `tests/AmdUvd6VideoEngineTest.cpp` runs the whole path against one simulated card (memory controller, graphics block, engine boot,
   ring controller, a stand-in firmware that decodes with the CPU decoder) and ten cases: success (sessions served by the engine, second session on the CPU, shutdown), no firmware, no registers, too small an aperture,
   a mapper that refuses, an engine that never answers, a graphics block that reports nothing, a ring that does not run, an engine that writes wrong pictures, and one that never finishes a picture.
-- Still open on the video side: interlaced VC-1, the MPEG-4 tools above, reading the feedback area back, and a run on a real card (a card whose engine stays unpowered makes the start time out; it is stopped and reported).
+- Still open on the video side: checking interlaced VC-1 pictures against real data, the MPEG-4 tools above, reading the feedback area back, and a run on a real card (a card whose engine stays unpowered makes the start time out; it is stopped and reported).
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.

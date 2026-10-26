@@ -453,7 +453,7 @@ Vc1BufferSizes vc1_buffer_sizes(uint32_t width, uint32_t height) {
 bool build_vc1_decode_message(ByteView out, uint32_t stream_handle, uint32_t feedback_number, const vc1::OffloadPicture& picture, const DecodeBuffers& b) {
   if (!picture.seq || !picture.pic) return false;
   const vc1::SequenceHeader& seq = *picture.seq;
-  if (seq.mb_width <= 0 || seq.mb_height <= 0 || seq.interlace) return false;
+  if (seq.mb_width <= 0 || seq.mb_height <= 0) return false;
   if (seq.profile != vc1::kSimple && seq.profile != vc1::kMain && seq.profile != vc1::kAdvanced) return false;
   const uint32_t width = static_cast<uint32_t>(seq.mb_width) * kMacroblock, height = static_cast<uint32_t>(seq.mb_height) * kMacroblock;
   if (!size_ok(width, height) || !build_common_decode(out, kStreamTypeVc1, stream_handle, feedback_number, width, height, b)) return false;

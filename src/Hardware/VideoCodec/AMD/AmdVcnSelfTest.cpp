@@ -549,6 +549,10 @@ AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1_sessions(allocators::IAllocator& 
   return run_vc1_stream(allocator, host, nullptr, ConstByteView(kVc1SelfTestAdvancedStream), kVc1SelfTestAdvancedEnds);
 }
 
+AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1_interlaced_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host) {
+  return run_vc1_stream(allocator, host, nullptr, ConstByteView(kVc1SelfTestInterlacedStream), kVc1SelfTestInterlacedEnds);
+}
+
 AmdVcnSelfTest::Result AmdVcnSelfTest::run_vc1(allocators::IAllocator& allocator, const AmdVcnVc1Decoder::Engine& engine) {
   class Host final : public Vc1SessionHost {
    public:

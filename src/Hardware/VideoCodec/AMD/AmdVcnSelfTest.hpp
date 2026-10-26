@@ -119,6 +119,10 @@ class AmdVcnSelfTest {
     ~Vc1SessionHost() = default;
   };
   static Result run_vc1_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host);
+  // The same for one more stream: the Advanced profile pattern in an INTERLACED sequence (its frames are progressive, so the CPU decoder is the reference; what passing proves is
+  // that the engine takes the sequence flag and the frame coding mode in every picture header). Interlaced and field coded pictures themselves have no stream to be tested
+  // with, and no CPU decoder to compare with - an engine that passes this is assumed to decode them. The host opens a session that may take interlaced sequences.
+  static Result run_vc1_interlaced_sessions(allocators::IAllocator& allocator, Vc1SessionHost& host);
   static const char* result_name(Result result);
 };
 
