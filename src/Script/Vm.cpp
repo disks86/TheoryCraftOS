@@ -1855,6 +1855,37 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
   return false;
 }
 
+bool Vm::throw_uninitialized(FunctionCode* code, uint16_t mark) {
+  String message(allocator_);
+  const uint32_t name = mark - kChecked;
+  if (name < code->constants.count() && code->constants[name].is_string()) {
+    JsString* s = code->constants[name].as_string();
+    message.append("Cannot access '");
+    message.append(StringView(s->data(), s->length));
+    message.append("' before initialization");
+  } else {
+    message.append("Cannot access a variable before initialization");
+  }
+  return throw_error(ErrorKind::ReferenceError, message.view());
+}
+
+bool Vm::iterator_close(JsObject* it, bool silent) {
+  if (!it->frozen) return true;   // (arrays, strings and key lists have nothing to close)
+  const Value src = it->bound_this;
+  Value method, result;
+  bool ok = get_named(src, "return", &method);
+  if (ok && is_callable(method)) {
+    ok = call_value(method, src, nullptr, 0, &result, false);
+    if (ok && !silent && !result.is_object()) ok = throw_error(ErrorKind::TypeError, "Iterator result is not an object");
+  }
+  if (!ok && silent) {
+    has_exception_ = false;
+    exception_ = Value();
+    return true;
+  }
+  return ok;
+}
+
 bool Vm::iterate_into(JsObject* array, const Value& iterable, int64_t max) {
   if (max == 0) return true;
   Value it_value;
@@ -1925,6 +1956,7 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   if (code->arguments_slot >= 0) {
     JsObject* list = new_array(argc);
     for (uint32_t k = 0; k < argc; ++k) array_push(list, args[k]);
+    list->position = kArgumentsMark;   // (an array that stands for an arguments object: Object.prototype.toString says so)
     slots[code->arguments_slot] = Value::make_object(list);
   }
   if (code->self_slot >= 0) slots[code->self_slot] = Value::make_object(fn);
@@ -2191,13 +2223,50 @@ reload:
       case Opc::GetVar: {
         Env* e = fp->env;
         for (uint8_t d = in.b; d > 0; --d) e = e->parent;
+        if (in.unused >= kChecked && e->slots()[in.a].is_uninitialized()) {
+          CHECK(throw_uninitialized(code, in.unused));
+        }
         PUSH(e->slots()[in.a]);
         break;
       }
       case Opc::SetVar: {
         Env* e = fp->env;
         for (uint8_t d = in.b; d > 0; --d) e = e->parent;
+        if (in.unused != 0) {
+          if (in.unused == kConstAssign) {
+            throw_error(ErrorKind::TypeError, "Assignment to constant variable.");
+            THROW_PENDING();
+          }
+          if (e->slots()[in.a].is_uninitialized()) CHECK(throw_uninitialized(code, in.unused));
+        }
         e->slots()[in.a] = stack_[sp_ - 1];
+        break;
+      }
+      case Opc::TdzMark: {
+        Env* e = fp->env;
+        for (uint8_t d = in.b; d > 0; --d) e = e->parent;
+        e->slots()[in.a] = Value::make_uninitialized();
+        break;
+      }
+      case Opc::PushEnv: {
+        Env* e = new_env(static_cast<uint32_t>(in.a), fp->env);
+        if (!e) {
+          throw_error(ErrorKind::RangeError, "out of memory");
+          THROW_PENDING();
+        }
+        fp->env = e;
+        break;
+      }
+      case Opc::PopEnv: fp->env = fp->env->parent; break;
+      case Opc::CopyEnv: {
+        Env* old = fp->env;
+        Env* e = new_env(old->count, old->parent);
+        if (!e) {
+          throw_error(ErrorKind::RangeError, "out of memory");
+          THROW_PENDING();
+        }
+        for (uint32_t i = 0; i < old->count; ++i) e->slots()[i] = old->slots()[i];
+        fp->env = e;
         break;
       }
       case Opc::GetGlobal: {
@@ -2552,6 +2621,12 @@ reload:
           --sp_;
           pc = static_cast<uint32_t>(in.a);
         }
+        break;
+      }
+      case Opc::IterClose: {
+        JsObject* it = stack_[sp_ - 1].as_object();
+        --sp_;
+        CHECK(iterator_close(it, in.b != 0));
         break;
       }
       case Opc::TryBegin: {

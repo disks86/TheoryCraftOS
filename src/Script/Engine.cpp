@@ -518,6 +518,61 @@ const char kCollections[] = R"JSLIB((function (g) {
   def(FinalizationRegistry.prototype, 'unregister', function () { return false; });
   def(g, 'FinalizationRegistry', FinalizationRegistry);
 
+  // SharedArrayBuffer and Atomics: there is one thread of script, so a shared buffer is an ArrayBuffer under another name and the operations are plain reads and writes.
+  function SharedArrayBuffer(length) {
+    needNew(this, SharedArrayBuffer, 'SharedArrayBuffer');
+    var b = new ArrayBuffer(length);
+    Object.setPrototypeOf(b, SharedArrayBuffer.prototype);
+    return b;
+  }
+  SharedArrayBuffer.prototype = Object.create(ArrayBuffer.prototype);
+  def(SharedArrayBuffer.prototype, 'constructor', SharedArrayBuffer);
+  Object.defineProperty(SharedArrayBuffer.prototype, '@@toStringTag', { value: 'SharedArrayBuffer', configurable: true });
+  Object.defineProperty(SharedArrayBuffer.prototype, 'growable', { get: function () { return false; }, configurable: true });
+  def(g, 'SharedArrayBuffer', SharedArrayBuffer);
+  var Atomics = {};
+  function atomicIndex(ta, index) {
+    if (!ArrayBuffer.isView(ta) || ta instanceof DataView || ta instanceof Float32Array || ta instanceof Float64Array || ta instanceof Uint8ClampedArray) throw new TypeError('Atomics operation on an array that is not an integer typed array');
+    var i = Number(index);
+    i = i !== i ? 0 : Math.trunc(i);
+    if (i < 0 || i >= ta.length) throw new RangeError('Invalid atomic access index');
+    return i;
+  }
+  function atomicOp(name, combine) {
+    def(Atomics, name, function (ta, index, value) {
+      var i = atomicIndex(ta, index);
+      var old = ta[i];
+      ta[i] = combine(old, typeof old === 'bigint' ? BigInt(value) : Math.trunc(Number(value)));
+      return old;
+    });
+  }
+  atomicOp('add', function (a, b) { return a + b; });
+  atomicOp('sub', function (a, b) { return a - b; });
+  atomicOp('and', function (a, b) { return a & b; });
+  atomicOp('or', function (a, b) { return a | b; });
+  atomicOp('xor', function (a, b) { return a ^ b; });
+  atomicOp('exchange', function (a, b) { return b; });
+  def(Atomics, 'load', function (ta, index) { return ta[atomicIndex(ta, index)]; });
+  def(Atomics, 'store', function (ta, index, value) {
+    var i = atomicIndex(ta, index);
+    var v = typeof ta[i] === 'bigint' ? BigInt(value) : Math.trunc(Number(value)) + 0;
+    ta[i] = v;
+    return v;
+  });
+  def(Atomics, 'compareExchange', function (ta, index, expected, replacement) {
+    var i = atomicIndex(ta, index);
+    var old = ta[i];
+    var probe = new ta.constructor(1);
+    probe[0] = expected;
+    if (old === probe[0]) ta[i] = replacement;
+    return old;
+  });
+  def(Atomics, 'isLockFree', function (n) { return n === 1 || n === 2 || n === 4 || n === 8; });
+  def(Atomics, 'notify', function (ta, index) { atomicIndex(ta, index); return 0; });
+  def(Atomics, 'wait', function (ta, index, value) { atomicIndex(ta, index); return ta[index] !== value ? 'not-equal' : 'timed-out'; });
+  Object.defineProperty(Atomics, '@@toStringTag', { value: 'Atomics', configurable: true });
+  def(g, 'Atomics', Atomics);
+
   // Array.from / Array.of
   if (!Array.from) def(Array, 'from', function (source, mapFn, thisArg) {
     if (source === null || source === undefined) throw new TypeError(String(source) + ' is not iterable');
