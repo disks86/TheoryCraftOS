@@ -1072,6 +1072,18 @@ bool Vm::array_set_length(JsObject* a, uint32_t length) {
 
 bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
   if (o->host && o->host->get && o->host->get(*this, o, key, out)) return true;
+  if (o->okind == ObjKind::Primitive && o->bound_this.is_string() && !o->bound_this.as_string()->symbol) {   // new String('ab'): length and the characters
+    JsString* s = o->bound_this.as_string();
+    uint32_t i;
+    if (key == length_) {
+      *out = Value::make_number(string_length(s));
+      return true;
+    }
+    if (canonical_index(key->view(), &i) && i < string_length(s)) {
+      *out = Value::make_string(string_part(s, i, i + 1));
+      return true;
+    }
+  }
   if (o->okind == ObjKind::Array) {
     if (key == length_) {
       *out = Value::make_number(o->length);
@@ -1441,7 +1453,15 @@ JsObject* Vm::own_keys(JsObject* o) {
       }
       char text[16];
       for (int k = 0; k < length; ++k) text[k] = buffer[length - 1 - k];
-      array_push(keys, Value::make_string(new_string(StringView(text, static_cast<uint64_t>(length)))));
+      array_push(keys, Value::make_string(intern(StringView(text, static_cast<uint64_t>(length)))));   // (interned: a key that is put on another object must be the one a lookup finds)
+    }
+  }
+  if (o->okind == ObjKind::Primitive && o->bound_this.is_string() && !o->bound_this.as_string()->symbol) {   // new String('ab'): "0", "1"
+    const uint32_t n = string_length(o->bound_this.as_string());
+    for (uint32_t i = 0; i < n; ++i) {
+      String text(allocator_);
+      text.append_uint(i);
+      array_push(keys, Value::make_string(intern(text.view())));
     }
   }
   if (o->host && o->host->keys) o->host->keys(*this, o, keys);
@@ -1464,6 +1484,36 @@ JsString* Vm::new_symbol(const Value& description) {
   s->symbol = true;
   s->described = described;
   return s;
+}
+
+JsObject* Vm::box(const Value& p) {
+  JsObject* proto = nullptr;
+  switch (p.tag) {
+    case Tag::String: proto = p.as_string()->symbol ? symbol_proto_ : string_proto_; break;
+    case Tag::Number: proto = number_proto_; break;
+    case Tag::Boolean: proto = boolean_proto_; break;
+    default: {
+      Value big, bproto;
+      if (is_bigint(p) && get_plain(global_, intern("BigInt"), &big) && big.is_object() && get_named(big, "prototype", &bproto) && bproto.is_object()) proto = bproto.as_object();
+      break;
+    }
+  }
+  if (!proto) return nullptr;
+  JsObject* w = new_object(proto);
+  if (w == sentinel_) return nullptr;
+  w->okind = ObjKind::Primitive;
+  w->bound_this = p;
+  return w;
+}
+
+bool Vm::become_wrapper(const Value& self, JsObject* proto, const Value& primitive) {
+  if (!self.is_object() || self.as_object() == global_ || self.as_object()->okind != ObjKind::Plain || self.as_object()->prop_count != 0) return false;
+  bool derived = false;
+  for (JsObject* p = self.as_object()->proto; p && !derived; p = p->proto) derived = p == proto;
+  if (!derived) return false;
+  self.as_object()->okind = ObjKind::Primitive;
+  self.as_object()->bound_this = primitive;
+  return true;
 }
 
 JsString* Vm::symbol_descriptive_string(JsString* symbol) {
@@ -2293,6 +2343,10 @@ bool Vm::push_frame(JsObject* fn, const Value& this_value, const Value* args, ui
   f.pc = 0;
   f.env = env;
   f.this_value = code->is_arrow ? fn->bound_this : (this_value.is_nullish() && !construct && !code->strict ? Value::make_object(global_) : this_value);   // (strict code keeps an undefined `this`)
+  if (!code->is_arrow && !code->strict && !code->library && !construct && !f.this_value.is_object() && !f.this_value.is_nullish()) {   // sloppy code gets the wrapper of a primitive
+    JsObject* boxed = box(f.this_value);
+    if (boxed) f.this_value = Value::make_object(boxed);
+  }
   f.callee = fn;
   f.base = base;
   f.handlers = static_cast<uint32_t>(handlers_.count());

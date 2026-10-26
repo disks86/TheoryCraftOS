@@ -94,8 +94,8 @@ const char kStdlib[] = R"JSLIB((function (g) {
   var SymP = Symbol.prototype;
   Object.defineProperty(SymP, 'description', { get: function () { return __symbol_info(this, 0); }, configurable: true });
   def(SymP, 'toString', function () { return __symbol_info(this, 1); });
-  def(SymP, 'valueOf', function () { __symbol_info(this, 0); return this; });
-  def(SymP, Symbol.toPrimitive, function () { __symbol_info(this, 0); return this; });
+  def(SymP, 'valueOf', function () { return __symbol_info(this, 4); });
+  def(SymP, Symbol.toPrimitive, function () { return __symbol_info(this, 4); });
   Object.defineProperty(SymP, Symbol.toStringTag, { value: 'Symbol', configurable: true });
   var symbolRegistry = new Map(), symbolKeys = new Map();
   def(Symbol, 'for', function (key) {
@@ -886,20 +886,21 @@ const char kStdlib[] = R"JSLIB((function (g) {
     throw new TypeError('Unsupported BigInt operation ' + op);
   });
   def(BP, 'toString', function (radix) {
-    if (!isBig(this)) throw new TypeError('BigInt.prototype.toString requires that \'this\' be a BigInt');
+    var self = __primitive_of(this);
+    if (!isBig(self)) throw new TypeError('BigInt.prototype.toString requires that \'this\' be a BigInt');
     radix = radix === undefined ? 10 : Number(radix);
     if (radix < 2 || radix > 36) throw new RangeError('toString() radix must be between 2 and 36');
-    var text = this.__mag;
+    var text = self.__mag;
     if (radix !== 10) {
-      var limbs = limbsOf(this), digits = '';
+      var limbs = limbsOf(self), digits = '';
       if (isZero(limbs)) digits = '0';
       while (!isZero(limbs)) { var r = divSmall(limbs, radix); digits = r[1].toString(36) + digits; limbs = r[0]; }
       text = digits;
     }
-    return (negOf(this) ? '-' : '') + text;
+    return (negOf(self) ? '-' : '') + text;
   });
   def(BP, 'toLocaleString', function () { var digits = this.__mag, out = ''; for (var i = 0; i < digits.length; i++) { if (i > 0 && (digits.length - i) % 3 === 0) out += ','; out += digits.charAt(i); } return (negOf(this) ? '-' : '') + out; });
-  def(BP, 'valueOf', function () { return this; });
+  def(BP, 'valueOf', function () { return __primitive_of(this); });
   def(BP, 'toJSON', function () { throw new TypeError('Do not know how to serialize a BigInt'); });
   def(BP, '@@toStringTag', 'BigInt');
   def(BigInt, 'asUintN', function (bits, value) {
