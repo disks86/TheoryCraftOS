@@ -77,8 +77,7 @@ struct Scheduler {
   ApStart ap_start[kMaxCores];
   uint32_t core_count = 1;
   uint32_t boot_core = 0;
-  Thread* queue_head = nullptr;
-  Thread* queue_tail = nullptr;
+  WaitList queues[kPriorityLevels];  // the ready queue, kept apart by Thread::priority; queues[0] is the lowest, queues[kPriorityLevels - 1] the highest
   Thread* sleepers = nullptr;
   Thread* zombies = nullptr;
   Thread* all = nullptr;  // every thread that exists, through Thread::all_next
@@ -254,10 +253,7 @@ void list_remove(WaitList* list, Thread* t) {
   t->prev = t->next = nullptr;
 }
 
-WaitList* run_queue() {
-  static_assert(sizeof(WaitList) == 2 * sizeof(Thread*));
-  return reinterpret_cast<WaitList*>(&g.queue_head);  // queue_head, queue_tail are adjacent
-}
+WaitList* run_queue(uint8_t priority) { return &g.queues[priority]; }
 
 void sleepers_insert(Thread* t) {
   Thread** link = &g.sleepers;
@@ -290,7 +286,7 @@ void poke_idle_core(const Thread* t) {
 
 void enqueue_locked(Thread* t) {
   t->state = ThreadState::Ready;
-  list_append(run_queue(), t);
+  list_append(run_queue(t->priority), t);
   poke_idle_core(t);
 }
 
@@ -298,7 +294,7 @@ void make_ready_locked(Thread* t) {
   if (t->state == ThreadState::Zombie || t->state == ThreadState::Ready) return;
   t->state = ThreadState::Ready;
   if (!t->on_cpu) {  // otherwise its core queues it as soon as it has saved the registers
-    list_append(run_queue(), t);
+    list_append(run_queue(t->priority), t);
     poke_idle_core(t);
   }
 }
@@ -310,11 +306,15 @@ bool eligible(const Thread* t, const Core* c, bool match_kind) {
   return true;
 }
 
+// The highest-priority eligible thread, FIFO within its level (a thread preferring this core's kind goes first at that same level, same as before priority levels
+// existed; the two full passes only differ in which threads they skip, not in this ordering, so splitting by level first keeps priority strict).
 Thread* find_eligible(const Core* c) {
-  for (Thread* t = g.queue_head; t; t = t->next)
-    if (eligible(t, c, true)) return t;
-  for (Thread* t = g.queue_head; t; t = t->next)
-    if (eligible(t, c, false)) return t;
+  for (uint32_t level = kPriorityLevels; level-- > 0;) {
+    for (Thread* t = g.queues[level].head; t; t = t->next)
+      if (eligible(t, c, true)) return t;
+    for (Thread* t = g.queues[level].head; t; t = t->next)
+      if (eligible(t, c, false)) return t;
+  }
   return nullptr;
 }
 
@@ -325,15 +325,16 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   if (!voluntary && prev->state == ThreadState::Running) {
     Thread* wanted = find_eligible(c);
     if (!wanted && eligible(prev, c, false)) return frame;          // nobody else wants the core
-    if (!prev->is_idle && c->slice > 0 && eligible(prev, c, false)) return frame;      // keeps running until its slice ends (or its core is taken away)
+    // Keeps running until its slice ends, unless its core was taken away or something of a strictly higher priority is now ready (which does not wait out the slice).
+    if (!prev->is_idle && c->slice > 0 && eligible(prev, c, false) && (!wanted || wanted->priority <= prev->priority)) return frame;
   }
   prev->saved = frame;
   prev->on_cpu = false;
   if (prev->state == ThreadState::Running) prev->state = ThreadState::Ready;
-  if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(), prev);
+  if (prev->state == ThreadState::Ready && !prev->is_idle) list_append(run_queue(prev->priority), prev);
 
   Thread* next = find_eligible(c);
-  if (next) list_remove(run_queue(), next);
+  if (next) list_remove(run_queue(next->priority), next);
   else next = c->idle;
   next->state = ThreadState::Running;
   next->on_cpu = true;
@@ -729,6 +730,13 @@ bool set_thread_core_mask(Thread* t, uint64_t mask) {
 void set_thread_affinity(Thread* t, int32_t core) {
   const uint64_t flags = lock_irq();
   t->affinity = core;
+  unlock_irq(flags);
+}
+
+void set_thread_priority(Thread* t, uint8_t priority) {
+  if (priority >= kPriorityLevels) priority = kPriorityLevels - 1;
+  const uint64_t flags = lock_irq();
+  t->priority = priority;
   unlock_irq(flags);
 }
 

@@ -78,6 +78,33 @@ struct DepthBuffer {
   bool valid() const;
 };
 
+// A stencil buffer of 8-bit values. The hardware only has W-tiled stencil buffers, so the memory is opaque to the CPU: it is made by `bytes_for()` bytes of anything (zeros
+// are zero stencil values in any layout), the base is 4 KiB aligned, and a draw whose stencil test is on needs it (the same size as the target, with a depth buffer attached). A tile
+// of a W-tiled surface is 64 x 64 stencil values in 4096 bytes, and the pitch the hardware is told counts the 128 bytes a tile is wide on its physical rows: twice the aligned width.
+struct StencilBuffer {
+  uint64_t gpu_address = 0;
+  uint32_t width = 0, height = 0;
+  static uint32_t aligned_width(uint32_t width) { return (width + 63) / 64 * 64; }
+  static uint32_t pitch_for(uint32_t width) { return aligned_width(width) * 2; }
+  static uint64_t bytes_for(uint32_t width, uint32_t height) { return uint64_t{aligned_width(width)} * ((height + 63) / 64 * 64); }
+  bool attached() const { return width != 0 || height != 0; }
+  uint32_t pitch() const { return pitch_for(width); }
+  bool valid() const;
+};
+
+// The values of the hardware's compare functions and stencil operations (3D_Compare_Function, 3D_Stencil_Operation).
+enum class CompareFunc : uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
+enum class StencilAction : uint8_t { Keep, Zero, Replace, IncrementSaturate, DecrementSaturate, Increment, Decrement, Invert };
+
+// The stencil test of a draw: a pixel passes when (reference & compare_mask) <func> (stored & compare_mask); the stored value then becomes (stored & ~write_mask) | (the action's
+// result & write_mask), the action being `fail` when the test fails, `depth_fail` when it passes and the depth test fails, `pass` when both pass.
+struct StencilTest {
+  bool enable = false;
+  CompareFunc func = CompareFunc::Always;
+  StencilAction fail = StencilAction::Keep, depth_fail = StencilAction::Keep, pass = StencilAction::Keep;
+  uint8_t compare_mask = 0xFF, write_mask = 0xFF, reference = 0;
+};
+
 // What a draw does to the target: where, and whether it blends with what is there. Drawing is clipped to `clip` and the target. With a depth buffer attached
 // (the size of the target), `depth_test` passes a pixel that is closer than or as close as what is there, and `depth_write` stores its depth.
 struct DrawState {
@@ -87,6 +114,14 @@ struct DrawState {
   DepthBuffer depth;
   bool depth_test = false;
   bool depth_write = false;
+  StencilBuffer stencil;
+  StencilTest stencil_test;   // needs `stencil` (and `depth`) attached
+};
+
+// How a bound texture is read by textured_triangles: the filter (nearest, or bilinear), and for each axis whether it wraps around or takes the edge texel.
+struct Sampler {
+  bool linear = false;
+  bool repeat_u = false, repeat_v = false;
 };
 
 class RenderBatch {
@@ -100,11 +135,17 @@ class RenderBatch {
 
   // Sets every pixel of the depth buffer of `draw` to `value` (0 to 1), leaving the colours alone; a job of its own.
   bool clear_depth(const DrawState& draw, float value);
+  // Sets every value of the stencil buffer of `draw` to `value`, leaving colours and depths alone; a job of its own.
+  bool clear_stencil(const DrawState& draw, uint8_t value);
   // The next four build a complete job, replacing what was in the image; false (and an unusable image) if the arguments are not valid or do not fit.
   // A solid rectangle (a clear is one covering the target).
   bool fill_rect(const DrawState& draw, const Rect& rect, const float rgba[4]);
   // Triangles (three vertices each). `gouraud`: the kernel interpolates the vertices' colours; else every pixel gets `flat_rgba`.
   bool triangles(const DrawState& draw, ArrayView<const Vertex> vertices, bool gouraud, const float flat_rgba[4]);
+  // Textured triangles (three vertices each): the vertices' color[0] and color[1] are the texture coordinates u and v, normalised (0..1 spans the texture; (0, 0) is its top left
+  // corner), interpolated perspective-correct like colours, and the pixel kernel is the copy kernel, which samples `texture` with `sampler` and writes the texel. color[2]
+  // and color[3] are not used. The draw's blend applies to the texel's alpha. `texture` must not be the target.
+  bool textured_triangles(const DrawState& draw, ArrayView<const Vertex> vertices, const Surface& texture, const Sampler& sampler);
   // A copy of `src_rect` of `src` to `dst` at (dst_x, dst_y), nearest-neighbour, clipped to `dst`. The texture is read as RGBA whatever its byte order.
   bool copy(const Surface& dst, const Surface& src, const Rect& src_rect, int32_t dst_x, int32_t dst_y);
 
@@ -114,7 +155,7 @@ class RenderBatch {
  private:
   ArrayView<uint32_t> image_;
   uint32_t base_;
-  bool fill(const DrawState& draw, const Rect& rect, const float rgba[4], float z, bool depth_only);
+  bool fill(const DrawState& draw, const Rect& rect, const float rgba[4], float z, bool depth_only, bool mask_color = false);
   uint32_t used_ = 0;
 };
 

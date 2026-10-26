@@ -59,6 +59,7 @@ struct UserThread {
   uint32_t terminate_code = 0;
   bool parked = false, redirected = false, context_dirty = false;
   uint64_t core_mask = ~uint64_t{0};      // the cores it may run on (SetThreadAffinityMask)
+  uint8_t priority = kernel::kDefaultPriority;      // the kernel scheduler priority (0..31), reapplied at launch() if the thread was not spawned yet
   uint64_t saved_rip = 0;
   process::X86Context saved;      // its registers while it is parked
   volatile bool finished = false;      // it has reached the end of its life (set just before the CPU thread ends; only then may the CPU thread be joined)
@@ -115,6 +116,7 @@ struct Task final : process::IProcessRuntime {
   uint32_t processor_count() override;
   void memory_status(uint64_t* total_bytes, uint64_t* free_bytes) override;
   bool set_affinity(uint64_t thread_id, uint64_t mask) override;
+  bool set_priority(uint64_t thread_id, int32_t absolute_priority) override;
   uint64_t affinity(uint64_t thread_id) override;
   bool cpu_time(uint64_t thread_id, uint64_t* hundred_ns) override;
   uint32_t current_processor() override;

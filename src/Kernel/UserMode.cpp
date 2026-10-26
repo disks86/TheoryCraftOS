@@ -592,6 +592,7 @@ bool Task::launch(UserThread* t, uint32_t stack_bytes) {
   t->spawned = t->thread != nullptr;
   if (!t->spawned) __atomic_sub_fetch(&running_threads, 1, __ATOMIC_ACQ_REL);
   if (t->spawned && t->core_mask != ~uint64_t{0}) set_thread_core_mask(t->thread, t->core_mask);
+  if (t->spawned && t->priority != kernel::kDefaultPriority) kernel::set_thread_priority(t->thread, t->priority);
   return t->spawned;
 }
 
@@ -615,6 +616,16 @@ uint32_t Task::processor_count() {
 void Task::memory_status(uint64_t* total_bytes, uint64_t* free_bytes) {
   *total_bytes = *free_bytes = 0;
   if (g_memory_source) g_memory_source(g_memory_context, total_bytes, free_bytes);
+}
+
+bool Task::set_priority(uint64_t thread_id, int32_t absolute_priority) {
+  if (absolute_priority < 0) absolute_priority = 0;
+  if (absolute_priority > kernel::kPriorityLevels - 1) absolute_priority = kernel::kPriorityLevels - 1;
+  UserThread* t = find_thread(thread_id);
+  if (!t) return false;
+  t->priority = static_cast<uint8_t>(absolute_priority);
+  if (t->spawned && t->thread && !t->joined && !t->finished) kernel::set_thread_priority(t->thread, t->priority);
+  return true;
 }
 
 bool Task::set_affinity(uint64_t thread_id, uint64_t mask) {

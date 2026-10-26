@@ -27,7 +27,7 @@ Code: `src/Hardware/GraphicsProcessingUnit/Intel/`, test: `tests/IntelRenderTest
 | `IntelLrc` | `lrc_init_gen9_rcs`: the render engine's logical ring context (`gen9_rcs_offsets` of the i915 driver; RCS0 at MMIO `0x2000`, 22 pages). |
 | `IntelVcsDriver` | `Config::engine = Engine::Render` drives RCS0 through the same execlist code as the video engine: render power well, 28 global GTT pages, PIPE_CONTROL ring job (invalidate, batch, flush, marker write). |
 | `IntelRenderCommands` | The 3D command set a batch may hold and the walker that checks a batch against it (no register writes, no global-GTT `PIPE_CONTROL`, no unknown command). |
-| `IntelRenderBatch` | Builds one job's batch image: `fill_rect`, `triangles` (flat or interpolated colour, source-over blend), `copy` (nearest-neighbour textured rectangle). The command order and the copy kernel are those of the intel-gpu-tools Gen9 render copy, which runs on hardware; packet fields were checked against Mesa's genxml (`gen8.xml`, `gen9.xml`). |
+| `IntelRenderBatch` | Builds one job's batch image: `fill_rect`, `triangles` (flat or interpolated colour, source-over blend), `copy` (nearest-neighbour textured rectangle), `textured_triangles` (sampled, nearest or linear, wrap or clamp), a stencil test and `clear_stencil`. The command order and the copy kernel are those of the intel-gpu-tools Gen9 render copy, which runs on hardware; packet fields were checked against Mesa's genxml (`gen8.xml`, `gen9.xml`). |
 
 The pixel shader is one of three kernels: the igt copy kernel word for word, a constant-colour kernel (igt's write-a-constant kernel with its immediates replaced) and an
 interpolating one (the copy kernel's plane-equation instruction with other registers). There is no EU compiler, so arbitrary shaders cannot run. The vertex shader, clipper
@@ -78,15 +78,43 @@ selector (needed for reads of slice-specific registers) is not set; nothing here
 (`GraphicsPipelineDesc::texture_count`) and its fragment shader is a `textured_fragment_function` (a shader is that or a plain `fragment_function`, never both). `BuiltinShaders` has the textured pair
 (`textured_vertex_shader`, `textured_fragment_shader`, `describe_textured_pipeline`: a float3 position, a float2 coordinate, the matrix in the push constants, texture unit 0).
 
-Only the software device runs textures so far. The other devices refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back to the software device the same way it does
-for any pipeline they cannot take. The software device refuses a draw whose textures are not all bound, whose texture is the image being drawn into, or whose image was not made for sampling. `tests/GraphicsTest.cpp` covers
-nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal; `tests/Gen9GraphicsDeviceTest.cpp` the
-Intel device's refusals.
+The software device and the Intel Gen9 device run textures. The other devices (V3d, VMware SVGA, virgl) refuse a pipeline with a texture count (`nullptr`) and fail a submit that binds a texture, so a caller falls back
+to the software device the same way it does for any pipeline they cannot take. Both devices refuse a draw whose texture is not bound, is the image being drawn into, or was not made for sampling. `tests/GraphicsTest.cpp`
+covers nearest and linear filtering, both address modes, both byte orders, alpha and blending, perspective-correct coordinates (the test fails with affine interpolation) and every refusal.
 
-The Gen9 hardware path for it is not written. The render copy kernel it already has (from the intel-gpu-tools Gen9 render copy) samples a surface at an interpolated coordinate, which is what a textured triangle needs:
-the work is carrying the coordinate through the batch's vertex layout, the sampler and surface state for a bound texture, the image upload through the page tables, and the fake pipeline's model of it.
+On the Gen9 device a textured draw is what `RenderBatch::textured_triangles` builds: the same job as the other triangle draws, but the pixel kernel is the intel-gpu-tools render copy kernel (it interpolates attribute 0's x and y
+as u and v and samples the surface bound after the target), the vertex's colour slot carries (u, v), the binding table has the target and the texture, and the sampler state selects nearest or linear filtering (bits 16:14 and
+19:17 of its first dword) and wrap or clamp per axis (the address control modes in the fourth). The CPU still transforms and clips the vertices, and clipping interpolates the coordinate like a colour, so the
+hardware's perspective-correct interpolation (from the 1/w each vertex carries) applies to it. Every job now ends with a texture cache invalidation next to the render target flush, so a later job sees what the CPU wrote with
+`write_pixels` or what an earlier job drew. `tests/FakeIntelRender.hpp` models the sampler (the filter, the address modes, the surface's byte order) and `tests/Gen9GraphicsDeviceTest.cpp` draws the same textured scenes on the
+Gen9 device and the software device and compares the pictures: nearest, repeat, clamp, linear (clamped and repeating), R8G8B8A8 textures and targets, perspective, blending and the refusals. Breaking the sampler's
+filter bits, swapping its u and v modes or pointing the texture's binding table entry at the target each makes the comparison fail. `tests/IntelRenderTest.cpp` checks the job's structure.
 
-Not done: stencil, textured triangles on the Intel device, tiling, interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
+Nothing of this has run on a GPU: the sampler state's bit positions are from Mesa's genxml (`gen8.xml`, `gen9.xml`), the kernel and the surface state are the ones the intel-gpu-tools render copy runs with, and the
+hardware's filtering and edge rounding are not modelled exactly (the tests allow a few levels and a few pixels along texel edges).
+
+## Stencil
+
+`IGraphicsDevice` has a stencil test: a D32Float image made with `ImageDesc::stencil` carries an 8-bit stencil plane next to the depth, a pipeline's `StencilState` says how it is tested (compare function, the fail / depth-fail /
+pass operations, compare and write masks, reference; one state for both faces), and `RenderPassBegin::clear_stencil` / `clear_stencil_value` set the plane at the start of a pass. The test comes before the depth
+test; a fragment a shader discards changes nothing. A stencil test with no stencil plane in the depth image fails the submit. The software device implements it (`tests/GraphicsTest.cpp`: every compare function, every
+operation including clamp and wrap, the masks, the three outcomes, the refusals; breaking the invert operation, the depth-fail operation or the write mask each fails it). V3d, VMware SVGA and virgl refuse an image
+with a stencil plane and a pipeline with a stencil test.
+
+On the Gen9 device the stencil plane is a second region of GPU memory, W-tiled and opaque like the depth buffer (the hardware has no linear stencil buffer): `StencilBuffer::bytes_for` is the aligned width times the
+height aligned to 64, the pitch the hardware is told is twice the aligned width (a tile is 64 x 64 values in 4096 bytes, 128 bytes wide on its physical rows), and the memory starts as zeros, which is a stencil of
+zero in any layout. A draw whose test is on attaches it through 3DSTATE_STENCIL_BUFFER and sets the test, the operations (translated to the hardware's numbering; the compare functions are numbered alike), the masks
+and the reference in 3DSTATE_WM_DEPTH_STENCIL (on Gen9 the reference is in that packet) and the stencil write bit of 3DSTATE_DEPTH_BUFFER; a pass clears the plane with a job of its own whose test always passes and
+replaces, with the colour and depth writes masked off. `tests/FakeIntelRender.hpp` models the test (it keeps the values in rows of the target's width; the W tiling, which the device never looks at, is not modelled) and
+`tests/Gen9GraphicsDeviceTest.cpp` runs the same stencil scenes on the Gen9 device and the software device: the pictures agree and show the expected result for every compare function, every operation, masks, the
+three outcomes and the refusals, and the memory of a stencil image is returned. Moving the reference field, swapping the pass and depth-fail operations or the two masks, mapping an operation to the wrong
+hardware code, or leaving out the clear each makes it fail. `tests/IntelRenderTest.cpp` checks the packets dword by dword.
+
+What is not verified: the W-tile sizes and pitch above are from the documentation and Mesa's surface layout code as I know them, not from a run; the QPitch of the stencil packet is a guess (a single, non-array
+surface should ignore it).
+
+Not done: tiling of colour surfaces (reading or writing a tiled image from the CPU needs the memory controller's bit 6 swizzle, which depends on the machine's memory configuration, and linear surfaces cannot have
+mipmaps, so mipmaps wait for it too), interrupts (the driver polls), a render node for a non-display Intel GPU, the other engines' workarounds, and every check
 on real hardware. The device is not used by the 2D renderer. Treat the first run on a 9575 as a bring-up, not as a working driver.
 
 ## Radeon RX Vega M: UVD 6.3

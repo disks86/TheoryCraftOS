@@ -346,6 +346,69 @@ static void test_builder_arguments() {
     const uint32_t bs = d.one(kBlendStatePointers);
     CHECK(bs != 0xFFFFFFFFu && (image[(job[bs + 1] & ~1u) / 4 + 1] & 0xF) == 0xF);
   }
+  // Stencil: the buffer packet, the test and operations in the depth-stencil packet, the stencil write bit of the depth packet, and the clear job.
+  {
+    DrawState with = deep;
+    with.stencil.gpu_address = 0x500000;
+    with.stencil.width = with.depth.width;
+    with.stencil.height = with.depth.height;
+    CHECK(with.stencil.valid() && StencilBuffer::pitch_for(16) == 128 && StencilBuffer::bytes_for(16, 16) == 4096 && StencilBuffer::bytes_for(65, 65) == 128 * 128);
+    with.stencil_test.enable = true;
+    with.stencil_test.func = CompareFunc::NotEqual;
+    with.stencil_test.fail = StencilAction::Zero;
+    with.stencil_test.depth_fail = StencilAction::Increment;
+    with.stencil_test.pass = StencilAction::Invert;
+    with.stencil_test.compare_mask = 0x3C;
+    with.stencil_test.write_mask = 0xC3;
+    with.stencil_test.reference = 0x81;
+    CHECK(b.triangles(with, ArrayView<const Vertex>(tri, 3), false, c));
+    std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    Decoded d(job);
+    const uint32_t db = d.one(kDepthBuffer), ds = d.one(kWmDepthStencil), sb = d.one(kStencilBuffer);
+    CHECK(db != 0xFFFFFFFFu && ds != 0xFFFFFFFFu && sb != 0xFFFFFFFFu);
+    if (db != 0xFFFFFFFFu && ds != 0xFFFFFFFFu && sb != 0xFFFFFFFFu) {
+      // dword 1: depth write (bit 0) and test (1) as for the depth buffer, stencil write (2) and test (3), function 5 (not equal) at bits 10:8, pass 7 (invert) at 25:23,
+      // depth fail 5 (increment) at 28:26, fail 1 (zero) at 31:29; dword 2: write mask at 23:16, compare mask at 31:24; dword 3: the reference at 15:8.
+      CHECK(job[ds + 1] == (1u | (1u << 1) | (1u << 2) | (1u << 3) | (3u << 5) | (5u << 8) | (7u << 23) | (5u << 26) | (1u << 29)));
+      CHECK(job[ds + 2] == ((0xC3u << 16) | (0x3Cu << 24)) && job[ds + 3] == (0x81u << 8));
+      CHECK((job[db + 1] & (1u << 27)) != 0);                                     // stencil write enable in the depth buffer packet
+      CHECK(job[sb + 1] == (127u | (2u << 22) | (1u << 31)) && job[sb + 2] == 0x500000 && job[sb + 3] == 0 && job[sb + 4] == 8);   // pitch less one, MOCS, enable; base; QPitch
+    }
+    // A test that is off leaves the buffer unattached and the state clear, whatever the draw names.
+    DrawState off = with;
+    off.stencil_test.enable = false;
+    CHECK(b.triangles(off, ArrayView<const Vertex>(tri, 3), false, c));
+    {
+      std::vector<uint32_t> j(image.begin(), image.begin() + b.dwords());
+      Decoded d2(j);
+      const uint32_t ds2 = d2.one(kWmDepthStencil), sb2 = d2.one(kStencilBuffer), db2 = d2.one(kDepthBuffer);
+      CHECK(j[ds2 + 1] == (1u | (1u << 1) | (3u << 5)) && j[ds2 + 2] == 0 && j[ds2 + 3] == 0 && j[sb2 + 1] == 0 && (j[db2 + 1] & (1u << 27)) == 0);
+    }
+    // The clear job: every operation replaces, the test always passes, the reference is the value; colours and depths are masked off.
+    CHECK(b.clear_stencil(with, 0x5A));
+    {
+      std::vector<uint32_t> j(image.begin(), image.begin() + b.dwords());
+      Decoded d3(j);
+      const uint32_t ds3 = d3.one(kWmDepthStencil), sb3 = d3.one(kStencilBuffer), bs = d3.one(kBlendStatePointers), db3 = d3.one(kDepthBuffer);
+      CHECK(ds3 != 0xFFFFFFFFu && sb3 != 0xFFFFFFFFu && bs != 0xFFFFFFFFu);
+      if (ds3 != 0xFFFFFFFFu && sb3 != 0xFFFFFFFFu && bs != 0xFFFFFFFFu) {
+        CHECK(j[ds3 + 1] == ((1u << 2) | (1u << 3) | (3u << 5) | (7u << 8) | (2u << 23) | (2u << 26) | (2u << 29)));   // stencil write and test only: depth neither tested nor written
+        CHECK(j[ds3 + 2] == ((0xFFu << 16) | (0xFFu << 24)) && j[ds3 + 3] == (0x5Au << 8) && (j[db3 + 1] & (1u << 28)) == 0 && (j[db3 + 1] & (1u << 27)) != 0);
+        CHECK((image[(j[bs + 1] & ~1u) / 4 + 1] & 0xF) == 0xF);   // the colour write is masked
+      }
+    }
+    // Refused: a stencil buffer without a depth buffer, of another size, or unaligned.
+    DrawState no_depth = with;
+    no_depth.depth = DepthBuffer();
+    CHECK(!b.triangles(no_depth, ArrayView<const Vertex>(tri, 3), false, c) && !b.clear_stencil(no_depth, 1));
+    DrawState wrong_size = with;
+    wrong_size.stencil.width = 8;
+    CHECK(!b.triangles(wrong_size, ArrayView<const Vertex>(tri, 3), false, c));
+    DrawState unaligned = with;
+    unaligned.stencil.gpu_address = 0x500010;
+    CHECK(!unaligned.stencil.valid() && !b.triangles(unaligned, ArrayView<const Vertex>(tri, 3), false, c) && !b.clear_stencil(unaligned, 1));
+    CHECK(!b.clear_stencil(deep, 1));   // (no stencil buffer attached)
+  }
   // Without a depth buffer attached, a test or write in the state is left out.
   DrawState test_only = draw;
   test_only.depth_test = test_only.depth_write = true;
@@ -366,6 +429,69 @@ static void test_builder_arguments() {
   CHECK(!b.copy(draw.target, src, {2, 2, 2, 2}, 0, 0));
   Surface unaligned = src; unaligned.gpu_address = 0x300001;
   CHECK(!b.copy(draw.target, unaligned, {0, 0, 8, 8}, 0, 0));
+  // Textured triangles: the copy kernel with a sampler, two surfaces in the binding table (the target, then the texture), and the vertices as they are for the other triangle jobs
+  // with the texture coordinates in the colour slot.
+  {
+    Surface texture = {0x300000, 8, 8, 64 * 1, SurfaceFormat::B8G8R8A8Unorm};
+    texture.pitch = 64;
+    Vertex uv[3] = {{{1, 1, 0.5f, 1}, {0.25f, 0.5f, 7, 7}}, {{1, 14, 0.5f, 1}, {0.25f, 0.75f, 7, 7}}, {{14, 14, 0.5f, 1}, {0.5f, 0.75f, 7, 7}}};
+    Sampler nearest_clamp;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, nearest_clamp));
+    std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    uint32_t end = 0;
+    CHECK(render_batch_is_acceptable(ArrayView<const uint32_t>(job.data(), job.size()), &end));
+    Decoded d(job);
+    const uint32_t ps = d.one(kPs), bt = d.one(kBindingTablePointersPs), sp = d.one(kSamplerStatePointersPs), vb = d.one(kVertexBuffers);
+    CHECK(ps != 0xFFFFFFFFu && bt != 0xFFFFFFFFu && sp != 0xFFFFFFFFu && vb != 0xFFFFFFFFu);
+    if (ps != 0xFFFFFFFFu && bt != 0xFFFFFFFFu && sp != 0xFFFFFFFFu && vb != 0xFFFFFFFFu) {
+      const uint32_t base = VcsDriver::kBatchGpuAddress;
+      CHECK(((job[ps + 3] >> 18) & 0xFF) == 2 && (job[ps + 3] & (1u << 27)));           // two binding table entries, a sampler
+      const uint32_t kernel = job[ps + 1] / 4;
+      for (uint32_t i = 0; i < 16; ++i) CHECK(image[kernel + i] == copy_kernel()[i]);   // the intel-gpu-tools copy kernel, unchanged
+      const uint32_t table = job[bt + 1] / 4, target_state = image[table], texture_state = image[table + 1];
+      CHECK(target_state != texture_state && image[texture_state / 4 + 8] == 0x300000 && image[target_state / 4 + 8] == static_cast<uint32_t>(draw.target.gpu_address));
+      CHECK(((image[texture_state / 4 + 2]) & 0x3FFF) == 7 && ((image[texture_state / 4 + 2] >> 16) & 0x3FFF) == 7 && image[texture_state / 4 + 3] == 63);
+      const uint32_t sampler = job[sp + 1] / 4;
+      CHECK(image[sampler] == 0 && image[sampler + 3] == (2u | (2u << 3) | (2u << 6)));   // nearest, clamped
+      // The vertices: position then (u, v, 7, 7) at the offsets of the other triangle jobs.
+      const uint32_t at = (job[vb + 2] - base) / 4;
+      CHECK(as_float(image[at + 4]) == 0.25f && as_float(image[at + 5]) == 0.5f && as_float(image[at + 8 + 4 + 1]) == 0.75f && job[vb + 1] == (32u | (1u << 14)));
+    }
+    // Linear filtering and wrapping change only the sampler state.
+    Sampler wrap_linear;
+    wrap_linear.linear = true;
+    wrap_linear.repeat_u = wrap_linear.repeat_v = true;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, wrap_linear));
+    {
+      std::vector<uint32_t> second(image.begin(), image.begin() + b.dwords());
+      Decoded d2(second);
+      const uint32_t sp2 = d2.one(kSamplerStatePointersPs);
+      CHECK(sp2 != 0xFFFFFFFFu && image[second[sp2 + 1] / 4] == ((1u << 14) | (1u << 17)) && image[second[sp2 + 1] / 4 + 3] == 2u);   // r clamped; s and t wrap
+    }
+    Sampler mixed;
+    mixed.repeat_u = true;
+    CHECK(b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), texture, mixed));
+    {
+      std::vector<uint32_t> third(image.begin(), image.begin() + b.dwords());
+      Decoded d3(third);
+      const uint32_t sp3 = d3.one(kSamplerStatePointersPs);
+      CHECK(sp3 != 0xFFFFFFFFu && image[third[sp3 + 1] / 4 + 3] == (2u | (2u << 3)));    // s (u) wraps, t (v) clamps
+    }
+    // Refused: the texture is the target (or overlaps it), is not a valid surface, a vertex coordinate is not a number, the vertex count is not whole triangles.
+    Surface same = draw.target;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), same, nearest_clamp));
+    Surface overlapping = texture;
+    overlapping.gpu_address = draw.target.gpu_address + 64;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), overlapping, nearest_clamp));
+    Surface bad_texture = texture;
+    bad_texture.gpu_address = 0x300001;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 3), bad_texture, nearest_clamp));
+    Vertex nan_uv[3] = {uv[0], uv[1], uv[2]};
+    nan_uv[1].color[0] = nan_uv[1].color[0] / 0.0f * 0.0f;
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(nan_uv, 3), texture, nearest_clamp));
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(uv, 2), texture, nearest_clamp));
+    CHECK(!b.textured_triangles(draw, ArrayView<const Vertex>(), texture, nearest_clamp));
+  }
   // Images that are too small, or not whole pages, are refused.
   std::vector<uint32_t> small(1024);
   RenderBatch tiny(ArrayView<uint32_t>(small.data(), small.size()), VcsDriver::kBatchGpuAddress);

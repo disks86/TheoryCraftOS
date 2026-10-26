@@ -26,6 +26,11 @@ namespace kernel {
 
 enum class ThreadState : uint8_t { Ready, Running, Blocked, Zombie };
 
+// Priority levels the ready queue keeps apart (patterned after Windows' 0..31 range, though without its priority boosting): 0 is never scheduled ahead of anything,
+// 31 always runs first. Most threads stay at kDefaultPriority.
+constexpr uint8_t kPriorityLevels = 32;
+constexpr uint8_t kDefaultPriority = 8;
+
 struct Thread;
 
 // Threads waiting for something, oldest first. Only touched with the scheduler lock held.
@@ -51,6 +56,7 @@ struct Thread {
   int32_t affinity = -1;    // the only core allowed to run it, or -1
   uint64_t core_mask = ~uint64_t{0};      // the cores (bit n: core n, for the first 64) it may run on
   int8_t preferred_kind = -1;  // CoreKind it likes, or -1
+  uint8_t priority = kDefaultPriority;    // 0 (least) .. 31 (most); the ready queue always runs the highest non-empty level first, round-robin within a level
   uint64_t wake_tsc = 0;
   Thread* prev = nullptr;   // run queue / wait list links
   Thread* next = nullptr;
@@ -84,6 +90,9 @@ bool running();
 
 // Restricts the thread to one core (-1: any). Takes effect the next time it is scheduled.
 void set_thread_affinity(Thread* thread, int32_t core);
+// Changes which of the kPriorityLevels queues the thread runs from (clamped to 0..kPriorityLevels-1). Takes effect the next time it is scheduled: a thread already
+// sitting in the ready queue runs once more at its old level, then moves.
+void set_thread_priority(Thread* thread, uint8_t priority);
 // Restricts the thread to the cores whose bit is set (cores past the 64th are always allowed). False for a mask that allows no online core. Takes effect when the thread is next
 // scheduled (within a time slice if it runs on a core that is now excluded).
 bool set_thread_core_mask(Thread* thread, uint64_t mask);
