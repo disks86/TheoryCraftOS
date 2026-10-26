@@ -87,6 +87,9 @@ What it does not do, and what is needed before a Vega M decodes anything:
   engine stops (only if the SMC said yes). An SMC that is not running (the result register stuck at zero, or reading all ones) gets nothing written and the engine is assumed powered; the start itself then shows whether it is.
   `tests/AmdSmu7Test.cpp` runs the mailbox against a simulated SMC. What is still missing is clocks: amdgpu sets the engine's clocks through the SMC's DPM tables or the PLL (`vi_set_uvd_clocks`, via AtomBIOS), neither of
   which exists here, so the engine runs at whatever clock the system firmware left.
+- **Diagnostics for the first run.** When the start gives up, the ring test fails or the H.264 self-test fails, the status line (the `Firmware` / `Video` lines at boot) carries the engine's registers as they were at that
+  moment - `st` UVD_STATUS (bit 1: the VCPU answered), `pw` UVD_POWER_STATUS, `rst` UVD_SOFT_RESET, `cn` UVD_VCPU_CNTL, `lmi` UVD_LMI_CTRL2, `rp`/`wp` the ring pointers - taken before the stop sequence changes them
+  (`AmdUvd6::failure_snapshot`, `read_diagnostics`). A card whose engine is unpowered shows in `pw`/`st`, a stalled memory path in `lmi`.
 - **Memory: planned and wired (opt-in).** `AmdGmc8Memory` reads the memory controller the way amdgpu does (`CONFIG_MEMSIZE`, `MC_VM_FB_LOCATION`; both set by the card's firmware, nothing is written), places the engine's block, ring and
   a work area (96 MiB if there is room, 8 MiB at least) at the end of the part of video memory the CPU can reach through BAR 0 (the first 256 MiB without Resizable BAR), clear of the firmware's start of memory
   (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. That the memory controller lets
