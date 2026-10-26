@@ -77,6 +77,7 @@
 #include "Hardware/Acpi/SystemAcpiHost.hpp"
 #include "Hardware/Battery/AcpiBattery.hpp"
 #include "SystemMonitor.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "SystemPrintService.hpp"
 #include "uefi.hpp"
 
@@ -87,7 +88,6 @@
 #include "AudioDemo.hpp"
 #include "ConcurrentDemo.hpp"
 #include "ContainerDemo.hpp"
-#include "FileSystem/SystemLayout.hpp"
 #include "FileSystemDemo.hpp"
 #include "GraphicsDemo.hpp"
 #include "GuiDemo.hpp"
