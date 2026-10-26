@@ -198,6 +198,8 @@ struct Job {
   DepthBuffer depth;
   bool depth_test = false, depth_write = false;
   bool depth_always = false;      // a depth clear: every pixel passes
+  StencilBuffer stencil;
+  StencilTest stencil_test;
 };
 
 void emit_null_stage(Image& img, uint32_t constant, uint32_t stage, uint32_t stage_total, uint32_t binding, uint32_t sampler) {
@@ -328,13 +330,27 @@ void emit_job(Image& img, const Job& job, uint32_t blend_ptr, uint32_t cc_ptr, u
 
   // The depth buffer if there is one (its test and write as chosen: less-or-equal, or always for a clear); never a stencil or hierarchical depth buffer.
   const bool write = job.depth.attached() && job.depth_write, test = job.depth.attached() && (job.depth_test || job.depth_always);
+  // The stencil test works on a stencil buffer next to the depth buffer; with no test the buffer is not attached.
+  const bool stencil_on = job.depth.attached() && job.stencil.attached() && job.stencil_test.enable;
+  const StencilTest& st = job.stencil_test;
+  const bool stencil_write = stencil_on && st.write_mask != 0;
   img.header(kWmDepthStencil, 4);
-  img.put((write ? 1u : 0u) | (test ? 1u << 1 : 0u) | ((job.depth_always ? kCompareAlways : kCompareLessEqual) << 5));
-  img.put_zeros(2);
+  uint32_t dword1 = (write ? 1u : 0u) | (test ? 1u << 1 : 0u) | ((job.depth_always ? kCompareAlways : kCompareLessEqual) << 5);
+  uint32_t dword2 = 0, dword3 = 0;
+  if (stencil_on) {
+    // 3DSTATE_WM_DEPTH_STENCIL: stencil write and test enable, the test function, the three operations (pass, depth fail, fail), the masks and the reference.
+    dword1 |= (stencil_write ? 1u << 2 : 0u) | (1u << 3) | (static_cast<uint32_t>(st.func) << 8) | (static_cast<uint32_t>(st.pass) << 23) | (static_cast<uint32_t>(st.depth_fail) << 26) |
+              (static_cast<uint32_t>(st.fail) << 29);
+    dword2 = (static_cast<uint32_t>(st.write_mask) << 16) | (static_cast<uint32_t>(st.compare_mask) << 24);
+    dword3 = static_cast<uint32_t>(st.reference) << 8;
+  }
+  img.put(dword1);
+  img.put(dword2);
+  img.put(dword3);
   img.header(kDepthBuffer, 8);
   if (job.depth.attached()) {
-    // 3DSTATE_DEPTH_BUFFER: pitch less one, format D32_FLOAT, write enable, a 2D surface; the base; size less one; memory object control; the QPitch in rows of four.
-    img.put((job.depth.pitch() - 1) | (kDepthFormatD32Float << 18) | (write ? 1u << 28 : 0u) | (kSurfaceState2d << 29));
+    // 3DSTATE_DEPTH_BUFFER: pitch less one, format D32_FLOAT, stencil write and depth write enable, a 2D surface; the base; size less one; memory object control; the QPitch in rows of four.
+    img.put((job.depth.pitch() - 1) | (kDepthFormatD32Float << 18) | (write ? 1u << 28 : 0u) | (stencil_write ? 1u << 27 : 0u) | (kSurfaceState2d << 29));
     img.put(static_cast<uint32_t>(job.depth.gpu_address));
     img.put(static_cast<uint32_t>(job.depth.gpu_address >> 32));
     img.put(((job.depth.width - 1) << 4) | ((job.depth.height - 1) << 18));
@@ -347,7 +363,15 @@ void emit_job(Image& img, const Job& job, uint32_t blend_ptr, uint32_t cc_ptr, u
   img.header(kHierDepthBuffer, 5);
   img.put_zeros(4);
   img.header(kStencilBuffer, 5);
-  img.put_zeros(4);
+  if (stencil_on) {
+    // 3DSTATE_STENCIL_BUFFER: the pitch less one, the memory object control, enable; the base; the QPitch (half the height rounded up to 4).
+    img.put((job.stencil.pitch() - 1) | ((kMocsPageTable << 1) << 22) | (1u << 31));
+    img.put(static_cast<uint32_t>(job.stencil.gpu_address));
+    img.put(static_cast<uint32_t>(job.stencil.gpu_address >> 32));
+    img.put(((job.stencil.height + 3) / 4 * 4) >> 1);
+  } else {
+    img.put_zeros(4);
+  }
   img.header(kClearParams, 3);
   img.put(0);
   img.put(1);
@@ -407,6 +431,8 @@ void emit_job(Image& img, const Job& job, uint32_t blend_ptr, uint32_t cc_ptr, u
 
 // The depth buffer, if there is one, is valid and the size of the target.
 bool depth_matches(const DrawState& draw) {
+  // A stencil buffer needs the depth buffer next to it and is the target's size too.
+  if (draw.stencil.attached() && (!draw.depth.attached() || !draw.stencil.valid() || draw.stencil.width != draw.target.width || draw.stencil.height != draw.target.height)) return false;
   if (!draw.depth.attached()) return true;   // (a depth test with no buffer passes: the state is left out)
   return draw.depth.valid() && draw.depth.width == draw.target.width && draw.depth.height == draw.target.height;
 }
@@ -457,8 +483,26 @@ uint32_t RenderBatch::max_vertices() const {
   return static_cast<uint32_t>((bytes - kStateOffset - 2048) / kVertexStride);
 }
 
+bool StencilBuffer::valid() const {
+  return width != 0 && height != 0 && width <= kMaxSurfaceSize && height <= kMaxSurfaceSize && gpu_address != 0 && (gpu_address & 4095) == 0;
+}
+
 bool DepthBuffer::valid() const {
   return width != 0 && height != 0 && width <= kMaxSurfaceSize && height <= kMaxSurfaceSize && gpu_address != 0 && (gpu_address & 4095) == 0;
+}
+
+bool RenderBatch::clear_stencil(const DrawState& draw, uint8_t value) {
+  const float none[4] = {0, 0, 0, 0};
+  if (!draw.stencil.attached() || !draw.depth.attached()) return false;
+  // A rectangle over everything whose stencil test always passes and replaces the stored value; colours and depths are masked off.
+  DrawState clear = draw;
+  clear.depth_test = clear.depth_write = false;
+  clear.stencil_test = StencilTest();
+  clear.stencil_test.enable = true;
+  clear.stencil_test.func = CompareFunc::Always;
+  clear.stencil_test.fail = clear.stencil_test.depth_fail = clear.stencil_test.pass = StencilAction::Replace;
+  clear.stencil_test.reference = value;
+  return fill(clear, {0, 0, static_cast<int32_t>(draw.stencil.width), static_cast<int32_t>(draw.stencil.height)}, none, 0.0f, false, true);
 }
 
 bool RenderBatch::fill_rect(const DrawState& draw, const Rect& rect, const float rgba[4]) { return fill(draw, rect, rgba, 0.0f, false); }
@@ -470,7 +514,7 @@ bool RenderBatch::clear_depth(const DrawState& draw, float value) {
 }
 
 // A rectangle list of one solid colour at depth `z`; with `depth_only` the colour is not written and every pixel passes the depth test (a depth clear).
-bool RenderBatch::fill(const DrawState& draw, const Rect& rect, const float rgba[4], float z, bool depth_only) {
+bool RenderBatch::fill(const DrawState& draw, const Rect& rect, const float rgba[4], float z, bool depth_only, bool mask_color) {
   used_ = 0;
   Image img(image_, base_);
   if (!img.valid_buffer() || !draw.target.valid() || rect.empty() || !depth_matches(draw)) return false;
@@ -493,12 +537,14 @@ bool RenderBatch::fill(const DrawState& draw, const Rect& rect, const float rgba
   job.depth_test = draw.depth_test;
   job.depth_write = draw.depth_write || depth_only;
   job.depth_always = depth_only;
+  job.stencil = draw.stencil;
+  job.stencil_test = draw.stencil_test;
   const uint32_t surface = surface_state(img, draw.target);
   job.binding_table = img.allocate(4, 32);
   const uint32_t kernel = img.allocate(kFlatKernelDwords * 4, 64);
   job.vertex_bytes = 3 * kVertexStride;
   job.vertex_offset = img.allocate(job.vertex_bytes, 64);
-  const uint32_t blend = blend_state(img, job.blend, !depth_only), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
+  const uint32_t blend = blend_state(img, job.blend, !depth_only && !mask_color), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
   if (!img.ok()) return false;
   img.state(job.binding_table, 0, surface);
   uint32_t flat[kFlatKernelDwords];
@@ -543,6 +589,8 @@ bool RenderBatch::triangles(const DrawState& draw, ArrayView<const Vertex> verti
   job.depth = draw.depth;
   job.depth_test = draw.depth_test;
   job.depth_write = draw.depth_write;
+  job.stencil = draw.stencil;
+  job.stencil_test = draw.stencil_test;
   const uint32_t surface = surface_state(img, draw.target);
   job.binding_table = img.allocate(4, 32);
   const uint32_t kernel = img.allocate(gouraud ? static_cast<uint32_t>(gouraud_kernel().size() * 4) : kFlatKernelDwords * 4, 64);
@@ -594,6 +642,8 @@ bool RenderBatch::textured_triangles(const DrawState& draw, ArrayView<const Vert
   job.depth = draw.depth;
   job.depth_test = draw.depth_test;
   job.depth_write = draw.depth_write;
+  job.stencil = draw.stencil;
+  job.stencil_test = draw.stencil_test;
   const uint32_t target_state = surface_state(img, draw.target), texture_state = surface_state(img, texture);
   job.binding_table = img.allocate(8, 32);
   job.sampler = sampler_state(img, sampler);

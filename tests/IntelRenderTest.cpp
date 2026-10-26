@@ -346,6 +346,69 @@ static void test_builder_arguments() {
     const uint32_t bs = d.one(kBlendStatePointers);
     CHECK(bs != 0xFFFFFFFFu && (image[(job[bs + 1] & ~1u) / 4 + 1] & 0xF) == 0xF);
   }
+  // Stencil: the buffer packet, the test and operations in the depth-stencil packet, the stencil write bit of the depth packet, and the clear job.
+  {
+    DrawState with = deep;
+    with.stencil.gpu_address = 0x500000;
+    with.stencil.width = with.depth.width;
+    with.stencil.height = with.depth.height;
+    CHECK(with.stencil.valid() && StencilBuffer::pitch_for(16) == 128 && StencilBuffer::bytes_for(16, 16) == 4096 && StencilBuffer::bytes_for(65, 65) == 128 * 128);
+    with.stencil_test.enable = true;
+    with.stencil_test.func = CompareFunc::NotEqual;
+    with.stencil_test.fail = StencilAction::Zero;
+    with.stencil_test.depth_fail = StencilAction::Increment;
+    with.stencil_test.pass = StencilAction::Invert;
+    with.stencil_test.compare_mask = 0x3C;
+    with.stencil_test.write_mask = 0xC3;
+    with.stencil_test.reference = 0x81;
+    CHECK(b.triangles(with, ArrayView<const Vertex>(tri, 3), false, c));
+    std::vector<uint32_t> job(image.begin(), image.begin() + b.dwords());
+    Decoded d(job);
+    const uint32_t db = d.one(kDepthBuffer), ds = d.one(kWmDepthStencil), sb = d.one(kStencilBuffer);
+    CHECK(db != 0xFFFFFFFFu && ds != 0xFFFFFFFFu && sb != 0xFFFFFFFFu);
+    if (db != 0xFFFFFFFFu && ds != 0xFFFFFFFFu && sb != 0xFFFFFFFFu) {
+      // dword 1: depth write (bit 0) and test (1) as for the depth buffer, stencil write (2) and test (3), function 5 (not equal) at bits 10:8, pass 7 (invert) at 25:23,
+      // depth fail 5 (increment) at 28:26, fail 1 (zero) at 31:29; dword 2: write mask at 23:16, compare mask at 31:24; dword 3: the reference at 15:8.
+      CHECK(job[ds + 1] == (1u | (1u << 1) | (1u << 2) | (1u << 3) | (3u << 5) | (5u << 8) | (7u << 23) | (5u << 26) | (1u << 29)));
+      CHECK(job[ds + 2] == ((0xC3u << 16) | (0x3Cu << 24)) && job[ds + 3] == (0x81u << 8));
+      CHECK((job[db + 1] & (1u << 27)) != 0);                                     // stencil write enable in the depth buffer packet
+      CHECK(job[sb + 1] == (127u | (2u << 22) | (1u << 31)) && job[sb + 2] == 0x500000 && job[sb + 3] == 0 && job[sb + 4] == 8);   // pitch less one, MOCS, enable; base; QPitch
+    }
+    // A test that is off leaves the buffer unattached and the state clear, whatever the draw names.
+    DrawState off = with;
+    off.stencil_test.enable = false;
+    CHECK(b.triangles(off, ArrayView<const Vertex>(tri, 3), false, c));
+    {
+      std::vector<uint32_t> j(image.begin(), image.begin() + b.dwords());
+      Decoded d2(j);
+      const uint32_t ds2 = d2.one(kWmDepthStencil), sb2 = d2.one(kStencilBuffer), db2 = d2.one(kDepthBuffer);
+      CHECK(j[ds2 + 1] == (1u | (1u << 1) | (3u << 5)) && j[ds2 + 2] == 0 && j[ds2 + 3] == 0 && j[sb2 + 1] == 0 && (j[db2 + 1] & (1u << 27)) == 0);
+    }
+    // The clear job: every operation replaces, the test always passes, the reference is the value; colours and depths are masked off.
+    CHECK(b.clear_stencil(with, 0x5A));
+    {
+      std::vector<uint32_t> j(image.begin(), image.begin() + b.dwords());
+      Decoded d3(j);
+      const uint32_t ds3 = d3.one(kWmDepthStencil), sb3 = d3.one(kStencilBuffer), bs = d3.one(kBlendStatePointers), db3 = d3.one(kDepthBuffer);
+      CHECK(ds3 != 0xFFFFFFFFu && sb3 != 0xFFFFFFFFu && bs != 0xFFFFFFFFu);
+      if (ds3 != 0xFFFFFFFFu && sb3 != 0xFFFFFFFFu && bs != 0xFFFFFFFFu) {
+        CHECK(j[ds3 + 1] == ((1u << 2) | (1u << 3) | (3u << 5) | (7u << 8) | (2u << 23) | (2u << 26) | (2u << 29)));   // stencil write and test only: depth neither tested nor written
+        CHECK(j[ds3 + 2] == ((0xFFu << 16) | (0xFFu << 24)) && j[ds3 + 3] == (0x5Au << 8) && (j[db3 + 1] & (1u << 28)) == 0 && (j[db3 + 1] & (1u << 27)) != 0);
+        CHECK((image[(j[bs + 1] & ~1u) / 4 + 1] & 0xF) == 0xF);   // the colour write is masked
+      }
+    }
+    // Refused: a stencil buffer without a depth buffer, of another size, or unaligned.
+    DrawState no_depth = with;
+    no_depth.depth = DepthBuffer();
+    CHECK(!b.triangles(no_depth, ArrayView<const Vertex>(tri, 3), false, c) && !b.clear_stencil(no_depth, 1));
+    DrawState wrong_size = with;
+    wrong_size.stencil.width = 8;
+    CHECK(!b.triangles(wrong_size, ArrayView<const Vertex>(tri, 3), false, c));
+    DrawState unaligned = with;
+    unaligned.stencil.gpu_address = 0x500010;
+    CHECK(!unaligned.stencil.valid() && !b.triangles(unaligned, ArrayView<const Vertex>(tri, 3), false, c) && !b.clear_stencil(unaligned, 1));
+    CHECK(!b.clear_stencil(deep, 1));   // (no stencil buffer attached)
+  }
   // Without a depth buffer attached, a test or write in the state is left out.
   DrawState test_only = draw;
   test_only.depth_test = test_only.depth_write = true;
