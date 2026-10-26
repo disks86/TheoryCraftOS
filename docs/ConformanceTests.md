@@ -41,9 +41,11 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
 - **HTML**: the parser follows the standard (`src/Dom/HtmlBuilder.cpp`: tokenizer states, insertion modes, adoption agency, foster parenting, foreign
   content, templates, quirks mode). Left: the doctype is not a node (`document.doctype`, `publicId`/`systemId`), `DOMParser` with XML, character
   references that stand for two code points, `innerHTML` scripts must not run.
-- **CSS**: computed values are often not resolved (`flow-root`, blockified `display`, `line-height`, `text-align`, `transform-origin`), UA style sheet
-  values (heading sizes, `ul` padding, link colour, `em`), newer colour spaces (`lab`, `oklch`, `color-mix`, relative colours), `lh`, nesting,
-  `revert-layer`, `@container` failure, `:dir()`, `:nth-child(… of S)`, `aspect-ratio`, `flow-root` floats, many properties return `""`
+- **CSS**: closed: `getComputedStyle` reports table parts (`td`, `tr`, `table` ... with `cellpadding`), controls (`inline-block`), closed `dialog` (`none`),
+  blockified `display` under `float` and absolute positioning, `em`/`i` italic, `pre` white-space, `ol` decimal, link colour, `sub`/`sup`, `mark`.
+  Still open: heading sizes, `ul` padding (40px), `blockquote` margin and `small` size (the UA metrics are terminal cells on purpose), `hr` border,
+  newer colour spaces (`lab`, `oklch`, `color-mix`, relative colours), `lh`, nesting, `revert-layer`, `@container` failure, `:dir()`,
+  `:nth-child(… of S)`, `aspect-ratio`, `flow-root` floats, many properties return `""`
   (`text-indent`, `word-break`, `quotes`, `counter-*`, `contain`, `will-change`, …).
 - **Web APIs**: the constructor of an interface inherits from the constructor of its parent, `AbstractRange`/`StaticRange`, `EventSource`,
   `IDBVersionChangeEvent`, the device events, `DOMImplementation`, `NodeFilter` as an interface object, the legacy element interfaces and the
