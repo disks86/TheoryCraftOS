@@ -180,6 +180,85 @@ uint32_t nt_protect_virtual_memory(Process& process, const SyscallRequest& r) {
   return process.write_user_u64(r.args[1], base) && process.write_user_u64(r.args[2], rounded) ? kStatusSuccess : kStatusAccessViolation;
 }
 
+// NtQueryPerformanceCounter(PLARGE_INTEGER Counter, PLARGE_INTEGER Frequency): 100 ns ticks, so the frequency is 10 MHz.
+uint32_t nt_query_performance_counter(Process& process, const SyscallRequest& r) {
+  if (r.args[0] == 0 || !process.write_user_u64(r.args[0], process.host().monotonic_ns() / 100)) return kStatusAccessViolation;
+  if (r.args[1] != 0 && !process.write_user_u64(r.args[1], 10000000ull)) return kStatusAccessViolation;
+  return kStatusSuccess;
+}
+
+// NtQueryVirtualMemory(Process, BaseAddress, MemoryBasicInformation = 0, Buffer, Length, ReturnLength): MEMORY_BASIC_INFORMATION (48 bytes) for the page.
+uint32_t nt_query_virtual_memory(Process& process, const SyscallRequest& r) {
+  uint64_t length = 0, returned = 0;
+  if (!argument(process, r, 4, &length) || !argument(process, r, 5, &returned)) return kStatusAccessViolation;
+  if (!current_process_handle(r.args[0])) return kStatusInvalidHandle;
+  if ((r.args[2] & 0xFFFFFFFFu) != 0) return 0xC0000003u;      // STATUS_INVALID_INFO_CLASS (a ULONG: mask the undefined upper half)
+  if (length < 48) return 0xC0000004u;         // STATUS_INFO_LENGTH_MISMATCH
+  AddressSpace* space = process.address_space();
+  if (!space) return kStatusNoMemory;
+  const uint64_t page = AddressSpace::round_down(r.args[1]);
+  if (page >= AddressSpace::kUserTop) return kStatusInvalidParameter;
+  uint8_t out[48] = {};
+  auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t i = 0; i < 8; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
+  auto put32 = [&](uint32_t at, uint32_t v) { for (uint32_t i = 0; i < 4; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
+  uint64_t base = 0, size = 0;
+  uint8_t protection = 0;
+  if (space->region_extent(page, &base, &size) && space->protection_at(page, &protection)) {
+    uint64_t allocation = 0, allocation_size = 0;
+    if (!space->allocation_extent(page, &allocation, &allocation_size)) allocation = base;
+    put64(0, page);
+    put64(8, allocation);
+    put32(16, page_constant(protection));      // AllocationProtect
+    put64(24, base + size - page);             // RegionSize: to the end of this run of pages
+    put32(32, protection == 0 ? 0x2000 : 0x1000);      // State: MEM_RESERVE for pages nobody may touch, else MEM_COMMIT
+    put32(36, page_constant(protection));      // Protect
+    put32(40, 0x20000);                        // Type: MEM_PRIVATE
+  } else {
+    // Free: up to the next mapped page.
+    uint64_t next = AddressSpace::kUserTop;
+    AddressSpace::RegionInfo region;
+    for (uint64_t i = 0; space->region_at(i, &region); ++i) {
+      if (region.base > page) { next = region.base; break; }
+    }
+    put64(0, page);
+    put64(24, next - page);
+    put32(32, 0x10000);      // MEM_FREE
+    put32(36, 0x01);         // PAGE_NOACCESS
+  }
+  if (!process.write_user(r.args[3], ConstByteView(out, 48))) return kStatusAccessViolation;
+  if (returned != 0 && !process.write_user_u64(returned, 48)) return kStatusAccessViolation;
+  return kStatusSuccess;
+}
+
+// NtQueryInformationProcess(Process, Class, Buffer, Length, ReturnLength): ProcessBasicInformation (0) and ProcessWow64Information (26).
+uint32_t nt_query_information_process(Process& process, const SyscallRequest& r) {
+  uint64_t returned = 0;
+  if (!argument(process, r, 4, &returned)) return kStatusAccessViolation;
+  if (!current_process_handle(r.args[0])) return kStatusInvalidHandle;
+  uint64_t size = 0;
+  uint8_t out[48] = {};
+  auto put64 = [&](uint32_t at, uint64_t v) { for (uint32_t i = 0; i < 8; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
+  const uint32_t info_class = uint32_t(r.args[1]);
+  const uint32_t buffer_length = uint32_t(r.args[3]);      // (ULONGs: the upper halves of the arguments are not defined)
+  if (info_class == 0) {
+    uint64_t peb = 0;
+    process.read_user_u64(process.gs_base() + 0x60, &peb);
+    put64(8, peb);            // PebBaseAddress
+    put64(16, 1);             // AffinityMask
+    put64(24, 8);             // BasePriority
+    put64(32, process.id());  // UniqueProcessId
+    size = 48;
+  } else if (info_class == 26) {
+    size = 8;                 // not a 32-bit process on a 64-bit system
+  } else {
+    return 0xC0000003u;       // STATUS_INVALID_INFO_CLASS
+  }
+  if (buffer_length < size) return 0xC0000004u;
+  if (!process.write_user(r.args[2], ConstByteView(out, size))) return kStatusAccessViolation;
+  if (returned != 0 && !process.write_user_u64(returned, size)) return kStatusAccessViolation;
+  return kStatusSuccess;
+}
+
 }  // namespace
 
 class WindowsSyscalls final : public ISyscallInterface {
@@ -201,6 +280,10 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtQueryAttributesFile: return windowsabi::nt_query_attributes_file(process, r);
       case WindowsSyscallNumber::NtDeleteFile: return windowsabi::nt_delete_file(process, r);
       case WindowsSyscallNumber::NtFlushBuffersFile: return windowsabi::nt_flush_buffers_file(process, r);
+      case WindowsSyscallNumber::NtQueryVolumeInformationFile: return windowsabi::nt_query_volume_information_file(process, r);
+      case WindowsSyscallNumber::NtQueryPerformanceCounter: return nt_query_performance_counter(process, r);
+      case WindowsSyscallNumber::NtQueryVirtualMemory: return nt_query_virtual_memory(process, r);
+      case WindowsSyscallNumber::NtQueryInformationProcess: return nt_query_information_process(process, r);
       case WindowsSyscallNumber::NtTerminateProcess:
         if (r.args[0] != kCurrentProcess) return kStatusInvalidHandle;      // other processes are not reachable yet
         process.terminate(uint32_t(r.args[1]));

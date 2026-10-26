@@ -78,6 +78,7 @@
 #include "Gui/Controls/VideoPlayerControl.hpp"
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "Video/AviWriter.hpp"
+#include "Desktop/ProgramLauncher.hpp"
 #include "Gui/Window.hpp"
 #include "Database/Local/LocalDatabase.hpp"
 #include "Database/Local/SystemSettings.hpp"
@@ -5204,6 +5205,123 @@ static void test_desktop_shortcuts() {
 }
 
 // Clicking a path in the terminal's output opens a folder in a file explorer and a file in the program for it.
+// A launcher that runs a script instead of a program: it prints, then "types" at the keyboard while the terminal thinks a program is running.
+struct ScriptedLauncher final : desktop::IProgramLauncher {
+  Window* window = nullptr;
+  desktop::Terminal* terminal = nullptr;
+  std::string received;          // what reached the program as input
+  int interrupts = 0, ends = 0, runs = 0;
+  bool can_run = true;
+  std::string seen_path, seen_args, seen_cwd;
+  desktop::ProgramOutcome::Kind result = desktop::ProgramOutcome::Kind::Exited;
+  uint32_t code = 0;
+  struct Control final : desktop::IProgramControl {
+    ScriptedLauncher* owner;
+    void send_input(StringView text) override { owner->received += std::string(text.data(), text.size()); }
+    void end_input() override { ++owner->ends; }
+    void interrupt() override { ++owner->interrupts; }
+  } control;
+  void key(char c, uint8_t modifiers = 0) {
+    KeyArgs k;
+    k.character = c;
+    k.modifiers = modifiers;
+    if (modifiers & hardware::modifier::kControl) k.usage = hardware::key::kA + (c - 'a');
+    window->key(k);
+  }
+  void type_line(const char* text) {
+    for (const char* c = text; *c; ++c) key(*c);
+    KeyArgs enter;
+    enter.usage = hardware::key::kEnter;
+    window->key(enter);
+  }
+  void run(const desktop::ProgramLaunch& launch, desktop::IProgramSink& sink, desktop::ProgramOutcome* outcome) override {
+    ++runs;
+    seen_path.assign(launch.path.data(), launch.path.size());
+    seen_cwd.assign(launch.working_directory.data(), launch.working_directory.size());
+    seen_args.clear();
+    for (const StringView& a : launch.arguments) seen_args += "[" + std::string(a.data(), a.size()) + "]";
+    control.owner = this;
+    sink.program_started(&control);
+    sink.program_output("program says hi\n");
+    window->set_focus(&terminal->view());
+    CHECK(terminal->view().input_redirected() && terminal->view().prompt().empty());
+    type_line("first line");
+    key('x');
+    key('c', hardware::modifier::kControl);      // Ctrl+C: stops the program, the half-typed line is dropped
+    key('d', hardware::modifier::kControl);      // Ctrl+D: end of input
+    type_line("second line");
+    sink.program_ended();
+    outcome->kind = result;
+    outcome->exit_code = code;
+    outcome->message.assign(can_run ? "" : "it did not start");
+  }
+};
+
+static void test_terminal_programs() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/bin") == filesystem::Status::Ok);
+    make_file(fs, "/bin/tool", "\x7F" "ELF\x02\x01\x01");
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&fs);
+    Window& w = d.window();
+    desktop::Terminal* t = d.open_terminal();
+    put(t, {0, 0, 600, 400});
+    w.layout();
+    t->view().clear();
+    ScriptedLauncher launcher;
+    launcher.window = &w;
+    launcher.terminal = t;
+
+    // (Without a launcher the shell reports a program as unsupported, with a notice that takes the keyboard: see ProgramHostTest for that path.)
+    d.set_program_launcher(&launcher);
+    t->run("/bin/tool a \"b c\"");
+    CHECK(launcher.runs == 1 && launcher.seen_path == "/bin/tool" && launcher.seen_args == "[a][b c]" && launcher.seen_cwd == "/");
+    CHECK(launcher.received == "first line\nsecond line\n");        // Enter sends lines; the Ctrl+C dropped the "x"
+    CHECK(launcher.interrupts == 1 && launcher.ends == 1);
+    CHECK(!t->view().input_redirected() && t->view().prompt().equals("/> "));         // the prompt is back
+    std::string text;
+    {
+      String all(a);
+      t->view().text(&all);
+      text.assign(all.view().data(), all.view().size());
+    }
+    CHECK(text.find("program says hi") != std::string::npos && text.find("first line") != std::string::npos && text.find("^C") != std::string::npos);
+    CHECK(text.find("exit code") == std::string::npos);       // a clean exit says nothing
+
+    // How the end is reported.
+    launcher.code = 3;
+    t->run("/bin/tool");
+    String all(a);
+    t->view().text(&all);
+    CHECK(all.view().find(StringView("[exit code 3]")) != StringView::npos);
+    launcher.result = desktop::ProgramOutcome::Kind::CouldNotRun;
+    launcher.can_run = false;
+    t->run("/bin/tool");
+    all.clear();
+    t->view().text(&all);
+    CHECK(all.view().find(StringView("/bin/tool: it did not start")) != StringView::npos);
+    launcher.result = desktop::ProgramOutcome::Kind::Interrupted;
+    const uint32_t lines = t->view().line_count();
+    t->run("/bin/tool");
+    all.clear();
+    t->view().text(&all);
+    CHECK(all.view().find(StringView("[exit"), all.view().rfind('\n') > 40 ? all.view().rfind('\n') - 40 : 0) == StringView::npos);
+    (void)lines;
+
+    // With no program running, Enter submits to the shell again.
+    CHECK(!t->view().input_redirected());
+    w.set_focus(&t->view());
+    launcher.type_line("echo back to the shell");
+    all.clear();
+    t->view().text(&all);
+    CHECK(all.view().find(StringView("back to the shell")) != StringView::npos);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_terminal_links() {
   TestAllocator a;
   {
@@ -7500,6 +7618,7 @@ int main() {
   test_copy_progress();
   test_terminal();
   test_terminal_links();
+  test_terminal_programs();
   test_dock_buttons();
   test_tile_button();
   test_wheel_switching();

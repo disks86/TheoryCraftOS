@@ -519,6 +519,20 @@ static void test_windows_memory() {
   wr(kBaseSlot, base);
   CHECK(call(WindowsSyscallNumber::NtProtectVirtualMemory, self, kBaseSlot, kSizeSlot, 0x7777, kOld) == 0xC0000045u);
 
+  // NtQueryVirtualMemory (the service behind VirtualQuery): a committed region, a protected one, a reserved one, and free space.
+  {
+    const uint64_t info = 0x10100;
+    const uint64_t junk = 0xABCD000000000000ull;
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, self, base + 5, 0 | junk, info, 48, 0) == 0);
+    CHECK(rd(info) == base && rd(info + 8) == base && rd(info + 24) == 4096 && (rd(info + 32) & 0xFFFFFFFFu) == 0x1000 && (rd(info + 36) & 0xFFFFFFFFu) == 0x02);      // MEM_COMMIT, PAGE_READONLY: the page protect() made read-only
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, self, base + 4096, 0, info, 48, 0) == 0 && rd(info) == base + 4096 && (rd(info + 36) & 0xFFFFFFFFu) == 0x04 && rd(info + 24) == 4096);      // the rest of the allocation, read-write
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, self, reserved + 4096, 0, info, 48, 0) == 0 && (rd(info + 32) & 0xFFFFFFFFu) == 0x2000);      // reserved only
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, self, 0x7FFFFFF0000ull, 0, info, 48, 0) == 0 && (rd(info + 32) & 0xFFFFFFFFu) == 0x10000 && rd(info + 24) > 4096);      // MEM_FREE
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, self, base, 5, info, 48, 0) == 0xC0000003u);      // a class this does not have
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, self, base, 0, info, 47, 0) == 0xC0000004u);      // a buffer that is too small
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, self, ~uint64_t{0} - 5, 0, info, 48, 0) == 0xC000000Du);      // beyond user space
+    CHECK(call(WindowsSyscallNumber::NtQueryVirtualMemory, 5, base, 0, info, 48, 0) == 0xC0000008u);
+  }
   // Free: decommit, then release (size must be 0, base must be a region start).
   wr(kBaseSlot, base + 4096); wr(kSizeSlot, 4096);
   CHECK(call(WindowsSyscallNumber::NtFreeVirtualMemory, self, kBaseSlot, kSizeSlot, 0x4000) == 0 && !s.write(base + 4096, ConstByteView(&byte, 1)));

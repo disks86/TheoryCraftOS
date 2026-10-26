@@ -98,8 +98,12 @@ LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& s
 
 LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out) {
   if (!pe.is_pe32_plus() || pe.is_dll()) return LoadStatus::Unsupported;
+  return map_pe_image(pe, file, space, pe.image_base(), true, out);
+}
+
+LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out) {
+  if (!pe.is_pe32_plus() || pe.machine() != exe::kPeMachineAmd64) return LoadStatus::Unsupported;
   if (pe.section_alignment() < AddressSpace::kPageSize) return LoadStatus::Unsupported;      // the old 512-byte layout shares pages between sections
-  const uint64_t base = pe.image_base();
   const uint64_t image_size = pe.size_of_image();
   uint64_t image_pages = 0;
   if (base == 0 || base % AddressSpace::kPageSize != 0 || !AddressSpace::round_up(image_size, &image_pages) || image_pages == 0 ||
@@ -124,12 +128,12 @@ LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& spac
       if (!space.write_privileged(base + section.virtual_address, file.subview(section.raw_offset, copy))) return LoadStatus::Malformed;
     }
   }
-  if (pe.entry_rva() == 0 || pe.entry_rva() >= image_size) return LoadStatus::Malformed;
+  if (pe.entry_rva() >= image_size || (require_entry && pe.entry_rva() == 0)) return LoadStatus::Malformed;
   LoadedImage image;
   image.base = base;
   image.end = base + image_pages;
-  image.entry = base + pe.entry_rva();
-  if (!space.check(image.entry, 1, kProtExecute)) return LoadStatus::Malformed;
+  image.entry = pe.entry_rva() ? base + pe.entry_rva() : 0;
+  if (image.entry != 0 && !space.check(image.entry, 1, kProtExecute)) return LoadStatus::Malformed;
   *out = image;
   return LoadStatus::Ok;
 }

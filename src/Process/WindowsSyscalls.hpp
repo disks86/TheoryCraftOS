@@ -20,6 +20,7 @@
 
 namespace process {
 
+// (src/Windows/tcos_syscalls.h repeats these numbers for the C code of ntdll.dll: keep the two in step. SyscallTest checks that they agree.)
 // The service numbers of the NT native interface, as this OS's ntdll passes them in EAX. They are ours to define: real Windows renumbers its services in
 // almost every build, which is why programs call ntdll instead of SYSCALL.
 enum class WindowsSyscallNumber : uint32_t {
@@ -41,6 +42,10 @@ enum class WindowsSyscallNumber : uint32_t {
   NtQueryAttributesFile = 15,
   NtDeleteFile = 16,
   NtFlushBuffersFile = 17,
+  NtQueryVolumeInformationFile = 18,
+  NtQueryPerformanceCounter = 19,
+  NtQueryVirtualMemory = 20,
+  NtQueryInformationProcess = 21,
 };
 
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service

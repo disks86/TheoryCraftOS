@@ -68,6 +68,7 @@
 #include "Hardware/SystemInput.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
+#include "Program/ProgramRunner.hpp"
 #include "SystemFileSystem.hpp"
 #include "Browser/HttpPageLoader.hpp"
 #include "Browser/WebRandom.hpp"
@@ -925,6 +926,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     sync_wall_clock(st);
     filesystem::set_unix_clock(wall_clock_seconds, nullptr);   // before the volumes are mounted: they stamp what they create
     SystemFileSystem explorer_files(shared_allocator, storage);
+    desktop::KernelProgramLauncher program_launcher(shared_allocator);      // what the terminals run programs with
     // Microcode the video engines need, from /firmware on the root volume (AMD VCN 1: Ryzen 2000/3000 "Raven" APUs). Only read and checked here; no engine is
     // started with it yet.
     for (uint32_t i = 0; i < video_codecs.count(); ++i) {
@@ -1023,6 +1025,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     desktop.set_midi_output(&usb_midi);
     desktop.set_clipboard(&clipboard);
     desktop.set_file_system(&explorer_files.file_system());
+    desktop.set_program_launcher(&program_launcher);
     explorer_files.set_notifier(on_storage_change, &desktop);
     EjectContext eject_context{&explorer_files, {}};
     desktop.explorer().set_eject_handler(on_eject, &eject_context);

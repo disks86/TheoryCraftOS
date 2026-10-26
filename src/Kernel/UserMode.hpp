@@ -44,12 +44,17 @@ struct Task {
   process::UserPageTables tables;
   Thread* thread = nullptr;
   bool faulted = false;        // the CPU stopped it (page fault, invalid instruction, ...)
-  uint64_t fault_vector = 0, fault_address = 0;
+  bool kill_requested = false; // set by request_kill(), read by the program's own thread
+  bool killed = false;         // it ended because of request_kill()
+  uint64_t fault_vector = 0, fault_address = 0, fault_rip = 0;
 };
 
 // Starts the program's first thread in ring 3. `program` must be loaded (with the reserved ranges set on its address space before loading) and must stay
 // alive until the task is gone. Null if there is no memory or user mode is not ready.
 UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name);
+// Ends the program as soon as it can: at its next system call or timer tick, whichever comes first (a blocked wait must be woken by the caller, for
+// instance by the host's interrupt()). The exit code is 130. Safe from any thread.
+void request_kill(Task& task);
 // Waits for the program to end (timeout_us 0 = forever); false on timeout. The exit code is the program's own, or 128 + the vector of the fault that
 // stopped it. Call once; afterwards the task may be destroyed.
 bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us = 0);

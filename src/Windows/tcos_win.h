@@ -1,0 +1,352 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/* The few Windows types and constants the two libraries need, written out here instead of taken from windows.h (which declares the very functions
+ * these libraries define, as imports). The layouts are the Windows x64 ones: programs built for Windows pass these structures. */
+#ifndef TCOS_WIN_H
+#define TCOS_WIN_H
+
+typedef unsigned char BYTE, UCHAR, BOOLEAN, *PBYTE, *PUCHAR;
+typedef char CHAR;
+typedef unsigned short WORD, USHORT, WCHAR, ATOM;
+typedef short SHORT;
+typedef int INT, BOOL, LONG, NTSTATUS;
+typedef unsigned int UINT, DWORD, ULONG, *PDWORD, *PULONG;
+typedef long long LONGLONG, INT64, LONG64, LONG_PTR, SSIZE_T, INT_PTR;
+typedef unsigned long long ULONGLONG, UINT64, DWORD64, ULONG64, ULONG_PTR, SIZE_T, UINT_PTR, DWORD_PTR, *PSIZE_T;
+typedef void VOID, *PVOID, *LPVOID, *HANDLE, *HMODULE, *HINSTANCE, *HLOCAL, *HGLOBAL, *HKEY, *FARPROC;
+typedef const void *LPCVOID;
+typedef CHAR *LPSTR, *PSTR;
+typedef const CHAR *LPCSTR, *PCSTR;
+typedef WCHAR *LPWSTR, *PWSTR;
+typedef const WCHAR *LPCWSTR, *PCWSTR;
+typedef BOOL *LPBOOL, *PBOOL;
+typedef LONG *PLONG;
+typedef DWORD *LPDWORD;
+typedef HANDLE *PHANDLE;
+typedef ULONG64 *PULONG64;
+typedef unsigned long long size_t_;
+typedef __builtin_va_list va_list_;
+
+#define NULL ((void *)0)
+#define TRUE 1
+#define FALSE 0
+#define WINAPI
+#define NTAPI
+#define CALLBACK
+#define EXPORT __declspec(dllexport)
+#ifndef IMPORT
+#define IMPORT __declspec(dllimport)      /* (ntdll.dll itself defines IMPORT as nothing first: it implements these) */
+#endif
+#define INFINITE 0xFFFFFFFFu
+#define INVALID_HANDLE_VALUE ((HANDLE)(LONG_PTR)-1)
+#define INVALID_FILE_SIZE 0xFFFFFFFFu
+#define INVALID_SET_FILE_POINTER 0xFFFFFFFFu
+#define INVALID_FILE_ATTRIBUTES 0xFFFFFFFFu
+#define MAX_PATH 260
+#define NT_SUCCESS(s) ((NTSTATUS)(s) >= 0)
+
+typedef union _LARGE_INTEGER { struct { DWORD LowPart; LONG HighPart; }; LONGLONG QuadPart; } LARGE_INTEGER, *PLARGE_INTEGER;
+typedef union _ULARGE_INTEGER { struct { DWORD LowPart; DWORD HighPart; }; ULONGLONG QuadPart; } ULARGE_INTEGER, *PULARGE_INTEGER;
+typedef struct _FILETIME { DWORD dwLowDateTime, dwHighDateTime; } FILETIME, *LPFILETIME;
+typedef struct _SYSTEMTIME { WORD wYear, wMonth, wDayOfWeek, wDay, wHour, wMinute, wSecond, wMilliseconds; } SYSTEMTIME, *LPSYSTEMTIME;
+typedef struct _LIST_ENTRY { struct _LIST_ENTRY *Flink, *Blink; } LIST_ENTRY;
+typedef struct _UNICODE_STRING { USHORT Length, MaximumLength; PWSTR Buffer; } UNICODE_STRING, *PUNICODE_STRING;
+
+typedef struct _ANSI_STRING { USHORT Length, MaximumLength; PSTR Buffer; } ANSI_STRING, *PANSI_STRING;
+typedef struct _IO_STATUS_BLOCK { union { NTSTATUS Status; PVOID Pointer; }; ULONG_PTR Information; } IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+typedef struct _OBJECT_ATTRIBUTES {
+  ULONG Length;
+  HANDLE RootDirectory;
+  PUNICODE_STRING ObjectName;
+  ULONG Attributes;
+  PVOID SecurityDescriptor, SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+typedef struct _SECURITY_ATTRIBUTES { DWORD nLength; LPVOID lpSecurityDescriptor; BOOL bInheritHandle; } SECURITY_ATTRIBUTES, *LPSECURITY_ATTRIBUTES;
+typedef struct _OVERLAPPED { ULONG_PTR Internal, InternalHigh; union { struct { DWORD Offset, OffsetHigh; }; PVOID Pointer; }; HANDLE hEvent; } OVERLAPPED, *LPOVERLAPPED;
+
+/* NTSTATUS values */
+#define STATUS_SUCCESS ((NTSTATUS)0)
+#define STATUS_BUFFER_OVERFLOW ((NTSTATUS)0x80000005)
+#define STATUS_NO_MORE_FILES ((NTSTATUS)0x80000006)
+#define STATUS_NOT_IMPLEMENTED ((NTSTATUS)0xC0000002)
+#define STATUS_INVALID_INFO_CLASS ((NTSTATUS)0xC0000003)
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004)
+#define STATUS_ACCESS_VIOLATION ((NTSTATUS)0xC0000005)
+#define STATUS_INVALID_HANDLE ((NTSTATUS)0xC0000008)
+#define STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000D)
+#define STATUS_END_OF_FILE ((NTSTATUS)0xC0000011)
+#define STATUS_NO_MEMORY ((NTSTATUS)0xC0000017)
+#define STATUS_CONFLICTING_ADDRESSES ((NTSTATUS)0xC0000018)
+#define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022)
+#define STATUS_OBJECT_NAME_INVALID ((NTSTATUS)0xC0000033)
+#define STATUS_OBJECT_NAME_NOT_FOUND ((NTSTATUS)0xC0000034)
+#define STATUS_OBJECT_NAME_COLLISION ((NTSTATUS)0xC0000035)
+#define STATUS_OBJECT_PATH_NOT_FOUND ((NTSTATUS)0xC000003A)
+#define STATUS_SHARING_VIOLATION ((NTSTATUS)0xC0000043)
+#define STATUS_DISK_FULL ((NTSTATUS)0xC000007F)
+#define STATUS_FILE_IS_A_DIRECTORY ((NTSTATUS)0xC00000BA)
+#define STATUS_DIRECTORY_NOT_EMPTY ((NTSTATUS)0xC0000101)
+#define STATUS_NOT_A_DIRECTORY ((NTSTATUS)0xC0000103)
+#define STATUS_TOO_MANY_OPENED_FILES ((NTSTATUS)0xC000011F)
+#define STATUS_INVALID_SYSTEM_SERVICE ((NTSTATUS)0xC000001C)
+#define STATUS_IO_DEVICE_ERROR ((NTSTATUS)0xC0000185)
+
+/* Win32 errors */
+#define ERROR_SUCCESS 0
+#define ERROR_INVALID_FUNCTION 1
+#define ERROR_FILE_NOT_FOUND 2
+#define ERROR_PATH_NOT_FOUND 3
+#define ERROR_TOO_MANY_OPEN_FILES 4
+#define ERROR_ACCESS_DENIED 5
+#define ERROR_INVALID_HANDLE 6
+#define ERROR_NOT_ENOUGH_MEMORY 8
+#define ERROR_INVALID_DATA 13
+#define ERROR_OUTOFMEMORY 14
+#define ERROR_NO_MORE_FILES 18
+#define ERROR_SHARING_VIOLATION 32
+#define ERROR_HANDLE_EOF 38
+#define ERROR_NOT_SUPPORTED 50
+#define ERROR_FILE_EXISTS 80
+#define ERROR_INVALID_PARAMETER 87
+#define ERROR_INSUFFICIENT_BUFFER 122
+#define ERROR_INVALID_NAME 123
+#define ERROR_MOD_NOT_FOUND 126
+#define ERROR_PROC_NOT_FOUND 127
+#define ERROR_DIR_NOT_EMPTY 145
+#define ERROR_ALREADY_EXISTS 183
+#define ERROR_MORE_DATA 234
+#define ERROR_NO_MORE_ITEMS 259
+#define ERROR_DIRECTORY 267
+#define ERROR_DISK_FULL 112
+#define ERROR_ENVVAR_NOT_FOUND 203
+#define ERROR_NOACCESS 998
+#define ERROR_INVALID_ADDRESS 487
+#define ERROR_ARITHMETIC_OVERFLOW 534
+#define ERROR_MR_MID_NOT_FOUND 317
+#define ERROR_NOT_FOUND 1168
+#define ERROR_UNHANDLED_EXCEPTION 574
+#define ERROR_IO_DEVICE 1117
+
+/* File access, share, disposition, attribute, move, seek, std handle and misc constants */
+#define GENERIC_READ 0x80000000u
+#define GENERIC_WRITE 0x40000000u
+#define GENERIC_EXECUTE 0x20000000u
+#define GENERIC_ALL 0x10000000u
+#define FILE_READ_DATA 0x0001
+#define FILE_WRITE_DATA 0x0002
+#define FILE_APPEND_DATA 0x0004
+#define FILE_READ_ATTRIBUTES 0x0080
+#define FILE_WRITE_ATTRIBUTES 0x0100
+#define DELETE 0x00010000
+#define SYNCHRONIZE 0x00100000
+#define FILE_SHARE_READ 1
+#define FILE_SHARE_WRITE 2
+#define FILE_SHARE_DELETE 4
+#define CREATE_NEW 1
+#define CREATE_ALWAYS 2
+#define OPEN_EXISTING 3
+#define OPEN_ALWAYS 4
+#define TRUNCATE_EXISTING 5
+#define FILE_ATTRIBUTE_READONLY 0x1
+#define FILE_ATTRIBUTE_HIDDEN 0x2
+#define FILE_ATTRIBUTE_DIRECTORY 0x10
+#define FILE_ATTRIBUTE_NORMAL 0x80
+#define FILE_FLAG_DELETE_ON_CLOSE 0x04000000
+#define FILE_FLAG_BACKUP_SEMANTICS 0x02000000
+#define FILE_BEGIN 0
+#define FILE_CURRENT 1
+#define FILE_END 2
+#define FILE_TYPE_UNKNOWN 0
+#define FILE_TYPE_DISK 1
+#define FILE_TYPE_CHAR 2
+#define FILE_TYPE_PIPE 3
+#define STD_INPUT_HANDLE ((DWORD)-10)
+#define STD_OUTPUT_HANDLE ((DWORD)-11)
+#define STD_ERROR_HANDLE ((DWORD)-12)
+#define MOVEFILE_REPLACE_EXISTING 1
+#define MEM_COMMIT 0x1000
+#define MEM_RESERVE 0x2000
+#define MEM_DECOMMIT 0x4000
+#define MEM_RELEASE 0x8000
+#define MEM_FREE 0x10000
+#define MEM_PRIVATE 0x20000
+#define PAGE_NOACCESS 0x01
+#define PAGE_READONLY 0x02
+#define PAGE_READWRITE 0x04
+#define PAGE_EXECUTE 0x10
+#define PAGE_EXECUTE_READ 0x20
+#define PAGE_EXECUTE_READWRITE 0x40
+#define HEAP_NO_SERIALIZE 0x1
+#define HEAP_ZERO_MEMORY 0x8
+#define HEAP_GENERATE_EXCEPTIONS 0x4
+#define LMEM_ZEROINIT 0x40
+#define GMEM_ZEROINIT 0x40
+#define GMEM_MOVEABLE 0x2
+#define DLL_PROCESS_ATTACH 1
+#define DLL_THREAD_ATTACH 2
+#define DLL_THREAD_DETACH 3
+#define DLL_PROCESS_DETACH 0
+#define TLS_OUT_OF_INDEXES 0xFFFFFFFFu
+#define WAIT_OBJECT_0 0
+#define WAIT_TIMEOUT 258
+#define WAIT_FAILED 0xFFFFFFFFu
+#define CP_ACP 0
+#define CP_OEMCP 1
+#define CP_UTF8 65001
+#define ENABLE_PROCESSED_INPUT 1
+#define ENABLE_LINE_INPUT 2
+#define ENABLE_ECHO_INPUT 4
+#define ENABLE_PROCESSED_OUTPUT 1
+#define ENABLE_WRAP_AT_EOL_OUTPUT 2
+
+typedef struct _CRITICAL_SECTION {
+  PVOID DebugInfo;
+  LONG LockCount, RecursionCount;
+  HANDLE OwningThread, LockSemaphore;
+  ULONG_PTR SpinCount;
+} CRITICAL_SECTION, *LPCRITICAL_SECTION, RTL_CRITICAL_SECTION, *PRTL_CRITICAL_SECTION;
+
+typedef struct _MEMORY_BASIC_INFORMATION {
+  PVOID BaseAddress, AllocationBase;
+  DWORD AllocationProtect, __alignment1;
+  SIZE_T RegionSize;
+  DWORD State, Protect, Type, __alignment2;
+} MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
+
+typedef struct _SYSTEM_INFO {
+  union { DWORD dwOemId; struct { WORD wProcessorArchitecture, wReserved; }; };
+  DWORD dwPageSize;
+  LPVOID lpMinimumApplicationAddress, lpMaximumApplicationAddress;
+  DWORD_PTR dwActiveProcessorMask;
+  DWORD dwNumberOfProcessors, dwProcessorType, dwAllocationGranularity;
+  WORD wProcessorLevel, wProcessorRevision;
+} SYSTEM_INFO, *LPSYSTEM_INFO;
+
+typedef struct _OSVERSIONINFOA { DWORD dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; CHAR szCSDVersion[128]; } OSVERSIONINFOA, *LPOSVERSIONINFOA;
+typedef struct _OSVERSIONINFOW { DWORD dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; WCHAR szCSDVersion[128]; } OSVERSIONINFOW, *LPOSVERSIONINFOW;
+typedef struct _RTL_OSVERSIONINFOW { ULONG dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId; WCHAR szCSDVersion[128]; } RTL_OSVERSIONINFOW;
+
+typedef struct _STARTUPINFOA {
+  DWORD cb; LPSTR lpReserved, lpDesktop, lpTitle;
+  DWORD dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+  WORD wShowWindow, cbReserved2; BYTE *lpReserved2; HANDLE hStdInput, hStdOutput, hStdError;
+} STARTUPINFOA, *LPSTARTUPINFOA;
+typedef struct _STARTUPINFOW {
+  DWORD cb; LPWSTR lpReserved, lpDesktop, lpTitle;
+  DWORD dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+  WORD wShowWindow, cbReserved2; BYTE *lpReserved2; HANDLE hStdInput, hStdOutput, hStdError;
+} STARTUPINFOW, *LPSTARTUPINFOW;
+
+typedef struct _WIN32_FIND_DATAA {
+  DWORD dwFileAttributes; FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
+  DWORD nFileSizeHigh, nFileSizeLow, dwReserved0, dwReserved1; CHAR cFileName[MAX_PATH]; CHAR cAlternateFileName[14];
+} WIN32_FIND_DATAA, *LPWIN32_FIND_DATAA;
+typedef struct _WIN32_FIND_DATAW {
+  DWORD dwFileAttributes; FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
+  DWORD nFileSizeHigh, nFileSizeLow, dwReserved0, dwReserved1; WCHAR cFileName[MAX_PATH]; WCHAR cAlternateFileName[14];
+} WIN32_FIND_DATAW, *LPWIN32_FIND_DATAW;
+typedef struct _BY_HANDLE_FILE_INFORMATION {
+  DWORD dwFileAttributes; FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
+  DWORD dwVolumeSerialNumber, nFileSizeHigh, nFileSizeLow, nNumberOfLinks, nFileIndexHigh, nFileIndexLow;
+} BY_HANDLE_FILE_INFORMATION, *LPBY_HANDLE_FILE_INFORMATION;
+typedef struct _WIN32_FILE_ATTRIBUTE_DATA {
+  DWORD dwFileAttributes; FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime; DWORD nFileSizeHigh, nFileSizeLow;
+} WIN32_FILE_ATTRIBUTE_DATA, *LPWIN32_FILE_ATTRIBUTE_DATA;
+typedef struct _COORD { SHORT X, Y; } COORD;
+typedef struct _SMALL_RECT { SHORT Left, Top, Right, Bottom; } SMALL_RECT;
+typedef struct _CONSOLE_SCREEN_BUFFER_INFO { COORD dwSize, dwCursorPosition; WORD wAttributes; SMALL_RECT srWindow; COORD dwMaximumWindowSize; } CONSOLE_SCREEN_BUFFER_INFO, *PCONSOLE_SCREEN_BUFFER_INFO;
+typedef struct _TIME_ZONE_INFORMATION { LONG Bias; WCHAR StandardName[32]; SYSTEMTIME StandardDate; LONG StandardBias; WCHAR DaylightName[32]; SYSTEMTIME DaylightDate; LONG DaylightBias; } TIME_ZONE_INFORMATION, *LPTIME_ZONE_INFORMATION;
+typedef struct _SLIST_ENTRY { struct _SLIST_ENTRY *Next; } SLIST_ENTRY, *PSLIST_ENTRY;
+typedef union _SLIST_HEADER { struct { ULONGLONG Alignment, Region; }; struct { PSLIST_ENTRY Next; ULONGLONG Depth; }; } SLIST_HEADER, *PSLIST_HEADER;
+typedef struct _RTL_RUN_ONCE { PVOID Ptr; } INIT_ONCE, *PINIT_ONCE;
+typedef struct _EXCEPTION_RECORD EXCEPTION_RECORD;
+typedef struct _CONTEXT CONTEXT;
+typedef struct _EXCEPTION_POINTERS { EXCEPTION_RECORD *ExceptionRecord; CONTEXT *ContextRecord; } EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
+typedef LONG (WINAPI *LPTOP_LEVEL_EXCEPTION_FILTER)(PEXCEPTION_POINTERS);
+typedef BOOL (WINAPI *PHANDLER_ROUTINE)(DWORD);
+typedef BOOL (WINAPI *PINIT_ONCE_FN)(PINIT_ONCE, PVOID, PVOID *);
+typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID);
+typedef void (WINAPI *PFLS_CALLBACK_FUNCTION)(PVOID);
+
+/* PEB, TEB and the loader lists, as far as the libraries read them (offsets of Windows 10 x64). */
+typedef struct _LDR_DATA_TABLE_ENTRY {
+  LIST_ENTRY InLoadOrderLinks, InMemoryOrderLinks, InInitializationOrderLinks;
+  PVOID DllBase, EntryPoint;
+  ULONG SizeOfImage, pad0;
+  UNICODE_STRING FullDllName, BaseDllName;
+  ULONG Flags;
+  USHORT LoadCount;
+} LDR_DATA_TABLE_ENTRY;
+typedef struct _PEB_LDR_DATA {
+  ULONG Length; BOOLEAN Initialized; PVOID SsHandle;
+  LIST_ENTRY InLoadOrderModuleList, InMemoryOrderModuleList, InInitializationOrderModuleList;
+} PEB_LDR_DATA;
+typedef struct _RTL_USER_PROCESS_PARAMETERS {
+  ULONG MaximumLength, Length, Flags, DebugFlags;
+  HANDLE ConsoleHandle; ULONG ConsoleFlags; HANDLE StandardInput, StandardOutput, StandardError;
+  UNICODE_STRING CurrentDirectoryPath; HANDLE CurrentDirectoryHandle;
+  UNICODE_STRING DllPath, ImagePathName, CommandLine;
+  PVOID Environment;
+} RTL_USER_PROCESS_PARAMETERS;
+typedef struct _PEB {
+  BYTE InheritedAddressSpace, ReadImageFileExecOptions, BeingDebugged, BitField;
+  PVOID Mutant, ImageBaseAddress;
+  PEB_LDR_DATA *Ldr;
+  RTL_USER_PROCESS_PARAMETERS *ProcessParameters;
+  PVOID SubSystemData, ProcessHeap;
+} PEB;
+typedef struct _TEB TEB;
+
+static inline TEB *NtCurrentTeb(void) { TEB *t; __asm__ volatile("movq %%gs:0x30, %0" : "=r"(t)); return t; }
+static inline PEB *NtCurrentPeb(void) { PEB *p; __asm__ volatile("movq %%gs:0x60, %0" : "=r"(p)); return p; }
+#define TEB_BYTE(teb, offset) ((BYTE *)(teb) + (offset))
+#define TEB_LAST_ERROR(teb) (*(DWORD *)TEB_BYTE(teb, 0x68))
+#define TEB_TLS_POINTER(teb) (*(PVOID **)TEB_BYTE(teb, 0x58))
+#define TEB_TLS_SLOTS(teb) ((PVOID *)TEB_BYTE(teb, 0x1480))       /* 64 slots */
+#define TEB_TLS_EXPANSION(teb) (*(PVOID **)TEB_BYTE(teb, 0x1780)) /* 1024 more */
+#define TEB_FLS_DATA(teb) (*(PVOID **)TEB_BYTE(teb, 0x17C8))
+#define TEB_CLIENT_PROCESS(teb) (*(ULONG_PTR *)TEB_BYTE(teb, 0x40))
+#define TEB_CLIENT_THREAD(teb) (*(ULONG_PTR *)TEB_BYTE(teb, 0x48))
+#define NtCurrentProcess() ((HANDLE)(LONG_PTR)-1)
+#define NtCurrentThread() ((HANDLE)(LONG_PTR)-2)
+
+/* The services of the kernel (ntdll.dll's stubs), with their NT names. */
+IMPORT NTSTATUS NTAPI NtReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+IMPORT NTSTATUS NTAPI NtWriteFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, PLARGE_INTEGER, PULONG);
+IMPORT NTSTATUS NTAPI NtClose(HANDLE);
+IMPORT NTSTATUS NTAPI NtTerminateProcess(HANDLE, NTSTATUS);
+IMPORT NTSTATUS NTAPI NtYieldExecution(void);
+IMPORT NTSTATUS NTAPI NtDelayExecution(BOOLEAN, PLARGE_INTEGER);
+IMPORT NTSTATUS NTAPI NtQuerySystemTime(PLARGE_INTEGER);
+IMPORT NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE, PVOID *, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+IMPORT NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG);
+IMPORT NTSTATUS NTAPI NtProtectVirtualMemory(HANDLE, PVOID *, PSIZE_T, ULONG, PULONG);
+IMPORT NTSTATUS NTAPI NtCreateFile(PHANDLE, ULONG, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+IMPORT NTSTATUS NTAPI NtOpenFile(PHANDLE, ULONG, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
+IMPORT NTSTATUS NTAPI NtQueryInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+IMPORT NTSTATUS NTAPI NtSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+IMPORT NTSTATUS NTAPI NtQueryDirectoryFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG, BOOLEAN, PUNICODE_STRING, BOOLEAN);
+IMPORT NTSTATUS NTAPI NtQueryAttributesFile(POBJECT_ATTRIBUTES, PVOID);
+IMPORT NTSTATUS NTAPI NtDeleteFile(POBJECT_ATTRIBUTES);
+IMPORT NTSTATUS NTAPI NtFlushBuffersFile(HANDLE, PIO_STATUS_BLOCK);
+IMPORT NTSTATUS NTAPI NtQueryVolumeInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+IMPORT NTSTATUS NTAPI NtQueryPerformanceCounter(PLARGE_INTEGER, PLARGE_INTEGER);
+IMPORT NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
+
+#endif

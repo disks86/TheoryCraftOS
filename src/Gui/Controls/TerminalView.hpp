@@ -64,6 +64,19 @@ class TerminalView : public Control {
   // The line that was submitted last.
   StringView submitted() const { return submitted_.view(); }
 
+  // --- Input for a running program. While a redirect is set the control behaves like the terminal of a program that is running: Enter sends the typed line (with its
+  // "\n") to `line` instead of firing the submit handler (and keeps it out of the history), Ctrl+C calls `interrupt` (after showing "^C"), Ctrl+D calls `end_of_input`.
+  // The functions are called on the input thread under the UI lock, so they must be quick and must not call back into this control.
+  struct InputRedirect {
+    void (*line)(void* context, StringView text) = nullptr;
+    void (*interrupt)(void* context) = nullptr;
+    void (*end_of_input)(void* context) = nullptr;
+    void* context = nullptr;
+  };
+  void set_input_redirect(const InputRedirect& redirect) { UiGuard lock(this); redirect_ = redirect; }
+  void clear_input_redirect() { UiGuard lock(this); redirect_ = InputRedirect(); }
+  bool input_redirected() const { return redirect_.line != nullptr; }
+
   // --- Links. With a link checker set, a word of the output (or of the line being typed) that the checker accepts - say a path that exists - is
   // underlined while the pointer is over it, and a click on it fires the link handler; clicked_link() is the word, without the quotes, brackets
   // and punctuation around it. A word between double or single quotes is taken whole, blanks included. The checker runs under the UI lock on the
@@ -116,6 +129,7 @@ class TerminalView : public Control {
   bool syncing_ = false;
   ScrollBar scroll_bar_;
   Handler submitted_handler_;
+  InputRedirect redirect_;
   LinkChecker link_checker_ = nullptr;
   void* link_context_ = nullptr;
   Handler link_handler_;

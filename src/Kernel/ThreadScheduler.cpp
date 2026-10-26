@@ -358,8 +358,15 @@ Frame* reschedule_locked(Frame* frame, Core* c, bool voluntary) {
   halt_forever();
 }
 
+#if defined(__x86_64__)
+UserTickHook g_user_tick = nullptr;
+#endif
+
 Frame* on_timer(Frame* frame, void*) {
   ack_tick();
+#if defined(__x86_64__)
+  if ((frame->cs & 3) == 3 && g_user_tick) g_user_tick(frame);
+#endif
   Core* c = this_core();
   if (g.stopping && c->index != g.boot_core) park_core(c);
   const uint64_t flags = lock_irq();
@@ -633,6 +640,7 @@ uint32_t thread_snapshot(ThreadInfo* out, uint32_t capacity) {
 #if defined(__x86_64__)
 UserEntry* core_user_entry(uint32_t core) { return core < kMaxCores ? &g.cores[core].user : nullptr; }
 uint64_t core_page(uint32_t core) { return core < kMaxCores ? reinterpret_cast<uint64_t>(&g.cores[core]) : 0; }
+void set_user_tick_hook(UserTickHook hook) { g_user_tick = hook; }
 uint64_t core_entry_stack_top(uint32_t core) {
   return core < kMaxCores ? reinterpret_cast<uint64_t>(g.cores[core].entry_stack) + sizeof(g.cores[core].entry_stack) : 0;
 }

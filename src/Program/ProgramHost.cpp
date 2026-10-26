@@ -15,7 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-#include "Desktop/ProgramHost.hpp"
+#include "Program/ProgramHost.hpp"
 #include "FileSystem/FileSystemTypes.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Thread.hpp"
@@ -23,7 +23,7 @@
 namespace desktop {
 
 ProgramHost::ProgramHost(allocators::IAllocator& allocator)
-    : allocator_(allocator), buffer_(allocator), random_(entropy_), unhandled_(allocator) {
+    : allocator_(allocator), buffer_(allocator), random_(entropy_), unhandled_(allocator), input_(allocator) {
   start_real_ns_ = filesystem::unix_time_now() * 1000000000ull;
   start_tsc_ = hardware::read_tsc();
   random_.initialize();      // (stays not ready on a processor without RDSEED and RDRAND)
@@ -50,9 +50,56 @@ bool ProgramHost::write_console(uint32_t, ConstByteView data) {
   return keep == 0 || buffer_.append(StringView(data.first(keep)));
 }
 
-bool ProgramHost::read_console(ByteView, uint64_t* got) {
-  *got = 0;      // no input: end of file
+bool ProgramHost::read_console(ByteView out, uint64_t* got) {
+  *got = 0;
+  if (out.empty()) return true;
+  kernel::ScopedMutex lock(mutex_);
+  // Wait for a line (or the end): a terminal hands out one line per read.
+  while (input_.empty() && !input_closed_ && !interrupted()) input_ready_.wait(mutex_, 20000);
+  if (interrupted()) return false;
+  if (input_.empty()) return true;      // closed: end of file
+  uint64_t n = 0;
+  const StringView text = input_.view();
+  while (n < text.size() && n < out.size()) {
+    out[n] = static_cast<uint8_t>(text[n]);
+    ++n;
+    if (text[n - 1] == '\n') break;
+  }
+  input_.erase(0, n);
+  *got = n;
   return true;
+}
+
+void ProgramHost::push_input(StringView text) {
+  {
+    kernel::ScopedMutex lock(mutex_);
+    if (input_closed_ || input_.size() + text.size() > kMaxInput) return;
+    input_.append(text);
+  }
+  input_ready_.notify_all();
+}
+
+void ProgramHost::close_input() {
+  {
+    kernel::ScopedMutex lock(mutex_);
+    input_closed_ = true;
+  }
+  input_ready_.notify_all();
+}
+
+void ProgramHost::set_interrupt_callback(void (*callback)(void*), void* context) {
+  kernel::ScopedMutex lock(mutex_);
+  interrupt_callback_ = callback;
+  interrupt_context_ = context;
+}
+
+void ProgramHost::interrupt() {
+  {
+    kernel::ScopedMutex lock(mutex_);
+    if (interrupt_callback_) interrupt_callback_(interrupt_context_);
+  }
+  __atomic_store_n(&interrupted_, true, __ATOMIC_RELEASE);
+  input_ready_.notify_all();
 }
 
 uint64_t ProgramHost::monotonic_ns() {
@@ -62,7 +109,14 @@ uint64_t ProgramHost::monotonic_ns() {
 
 uint64_t ProgramHost::realtime_ns() { return start_real_ns_ + monotonic_ns(); }
 
-void ProgramHost::sleep_ns(uint64_t ns) { kernel::sleep_us(ns / 1000); }
+void ProgramHost::sleep_ns(uint64_t ns) {
+  // In slices, so that Ctrl+C is noticed.
+  for (uint64_t left = ns / 1000; left > 0 && !interrupted();) {
+    const uint64_t slice = left < 10000 ? left : 10000;
+    kernel::sleep_us(slice);
+    left -= slice;
+  }
+}
 void ProgramHost::yield() { kernel::yield(); }
 
 bool ProgramHost::random_bytes(ByteView out) {

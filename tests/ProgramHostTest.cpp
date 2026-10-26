@@ -18,7 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include "Desktop/ProgramHost.hpp"
+#include "Program/ProgramHost.hpp"
 #include "Desktop/Shell.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/ProgramEnvironment.hpp"
@@ -46,7 +46,8 @@ static void test_host() {
   CHECK(!host.take_output(&out));
   uint64_t got = 99;
   uint8_t buffer[4];
-  CHECK(host.read_console(ByteView(buffer, 4), &got) && got == 0);       // no input: end of file
+  host.close_input();
+  CHECK(host.read_console(ByteView(buffer, 4), &got) && got == 0);       // input closed and empty: end of file
   // a program that prints without stopping cannot use up memory
   std::string block(100000, 'x');
   for (int i = 0; i < 20; ++i) host.write_console(1, ConstByteView(reinterpret_cast<const uint8_t*>(block.data()), block.size()));
@@ -70,6 +71,45 @@ static void test_host() {
     for (uint8_t b : r) all_zero = all_zero && b == 0;
     CHECK(!all_zero);
   }
+}
+
+static std::string read_text(ProgramHost& host, uint64_t room, bool* ok = nullptr) {
+  uint8_t buffer[64];
+  uint64_t got = 99;
+  const bool r = host.read_console(ByteView(buffer, room < sizeof(buffer) ? room : sizeof(buffer)), &got);
+  if (ok) *ok = r;
+  return std::string(reinterpret_cast<char*>(buffer), got);
+}
+
+static void test_input() {
+  ProgramHost host(A);
+  host.push_input("a\nbc\n");
+  CHECK(read_text(host, 64) == "a\n");                       // one line per read, like a terminal
+  CHECK(read_text(host, 64) == "bc\n");
+  host.push_input("xyz\n");
+  CHECK(read_text(host, 2) == "xy" && read_text(host, 2) == "z\n");      // a small buffer gets the line in pieces
+  host.push_input("last\n");
+  host.close_input();                                                       // end of input: what is queued is still read
+  host.push_input("ignored\n");
+  CHECK(read_text(host, 64) == "last\n");
+  bool ok = false;
+  CHECK(read_text(host, 64, &ok).empty() && ok);                           // then end of file, again and again
+  CHECK(read_text(host, 64).empty());
+  ProgramHost second(A);
+  CHECK(!second.interrupted());
+  second.push_input("never read\n");
+  second.interrupt();
+  CHECK(second.interrupted());
+  read_text(second, 64, &ok);
+  CHECK(!ok);                                                               // a read after Ctrl+C returns at once, as a failure
+  second.sleep_ns(10ull * 1000 * 1000 * 1000);                              // and so does a long sleep
+  ProgramHost third(A);
+  std::string big(1000, 'q');
+  for (int i = 0; i < 100; ++i) third.push_input(StringView((big + "\n").c_str()));      // more than it keeps: the excess is dropped, not queued
+  uint64_t total = 0;
+  third.close_input();
+  for (;;) { const std::string line = read_text(third, 64); if (line.empty()) break; total += line.size(); }
+  CHECK(total <= ProgramHost::kMaxInput && total > ProgramHost::kMaxInput - 2000);
 }
 
 static std::string name_of(process::SyscallAbi abi, const char* path) {
@@ -155,6 +195,7 @@ static void test_shell() {
 
 int main() {
   test_host();
+  test_input();
   test_environment();
   test_shell();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

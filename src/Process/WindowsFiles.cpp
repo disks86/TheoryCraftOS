@@ -438,7 +438,7 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   } else {
     e.type = NodeType::File;      // the console
   }
-  const uint64_t status_block = r.args[1], address = r.args[2], length = r.args[3];
+  const uint64_t status_block = r.args[1], address = r.args[2], length = r.args[3] & 0xFFFFFFFFu;      // (a ULONG: the upper half of the register is not defined)
   uint8_t b[64] = {};
   ByteView v(b, sizeof(b));
   uint64_t size = 0;
@@ -493,7 +493,7 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
   ProcessFiles& files = p.files();
   OpenObject* object = files.object(slot);
   if (!object) return files.kind(slot) == DescriptorKind::Closed ? kInvalidHandle : kInvalidParameter;
-  const uint64_t status_block = r.args[1], address = r.args[2], length = r.args[3];
+  const uint64_t status_block = r.args[1], address = r.args[2], length = r.args[3] & 0xFFFFFFFFu;
   uint32_t status = kSuccess;
   uint64_t value = 0;
   switch (static_cast<uint32_t>(info_class)) {
@@ -637,6 +637,24 @@ uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r) {
   OpenObject* object = files.object(slot);
   const uint32_t status = object ? nt_status(files.flush(*object)) : kSuccess;
   return store_io_status(p, r.args[1], status, 0) ? status : kAccessViolation;
+}
+
+// NtQueryVolumeInformationFile(FileHandle, IoStatusBlock, FsInformation, Length, FsInformationClass): only FileFsDeviceInformation, which is how GetFileType tells a
+// console (FILE_DEVICE_CONSOLE) from a file (FILE_DEVICE_DISK).
+uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
+  uint64_t info_class = 0;
+  if (!argument(p, r, 4, &info_class)) return kAccessViolation;
+  uint64_t slot = 0;
+  if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
+  const DescriptorKind kind = p.files().kind(slot);
+  if (kind == DescriptorKind::Closed) return kInvalidHandle;
+  if ((info_class & 0xFFFFFFFFu) != 4) return kInvalidInfoClass;      // FileFsDeviceInformation (a ULONG: the upper half of the argument is not defined)
+  if ((r.args[3] & 0xFFFFFFFFu) < 8) return kInfoLengthMismatch;
+  const bool console = kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError;
+  uint8_t b[8] = {};
+  put(ByteView(b, 8), 0, console ? 0x50 : 7, 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_DISK
+  if (!p.write_user(r.args[2], ConstByteView(b, 8))) return kAccessViolation;
+  return store_io_status(p, r.args[1], kSuccess, 8) ? kSuccess : kAccessViolation;
 }
 
 }  // namespace process::windowsabi

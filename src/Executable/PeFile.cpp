@@ -61,6 +61,8 @@ void PeFile::clear() {
   sections_.clear();
   exports_.clear();
   imports_.clear();
+  relocations_.clear();
+  relocations_ok_ = true;
   export_name_.clear();
 }
 
@@ -74,6 +76,12 @@ bool PeFile::directory(uint32_t index, uint32_t* rva, uint32_t* size) const {
 const PeSection* PeFile::find_section(StringView name) const {
   for (const PeSection& s : sections_.view())
     if (s.name.view().equals(name)) return &s;
+  return nullptr;
+}
+
+const PeExport* PeFile::find_export_by_ordinal(uint32_t ordinal) const {
+  for (const PeExport& e : exports_.view())
+    if (e.ordinal == ordinal) return &e;
   return nullptr;
 }
 
@@ -201,6 +209,10 @@ bool PeFile::parse_all(ConstByteView file) {
     export_name_.clear();
     directories_ok_ = false;
   }
+  if (!parse_relocations(file)) {
+    relocations_.clear();
+    relocations_ok_ = false;
+  }
   return true;
 }
 
@@ -279,6 +291,8 @@ bool PeFile::parse_imports(ConstByteView file) {
       if (thunk == 0) break;
       PeImport imp(allocator_);
       if (!imp.dll.append(dll_name.view())) return false;
+      if (address_rva > 0xFFFFFFFFu - i * thunk_size) return false;
+      imp.slot_rva = address_rva + static_cast<uint32_t>(i * thunk_size);
       const uint64_t ordinal_flag = plus_ ? (uint64_t{1} << 63) : (uint64_t{1} << 31);
       if (thunk & ordinal_flag) {
         imp.by_ordinal = true;
@@ -294,6 +308,35 @@ bool PeFile::parse_imports(ConstByteView file) {
     }
   }
   return false;      // more DLLs than any real file has: not terminated
+}
+
+bool PeFile::parse_relocations(ConstByteView file) {
+  uint32_t dir_rva = 0, dir_size = 0;
+  if (!directory(5, &dir_rva, &dir_size) || dir_rva == 0 || dir_size == 0) return true;
+  uint64_t offset = 0;
+  ConstByteView table;
+  if (!rva_to_offset(dir_rva, &offset) || !file_range(file, offset, dir_size, &table)) return false;
+  uint64_t at = 0;
+  while (at + 8 <= table.size()) {
+    ByteReader h(table.subview(at, 8));
+    const uint32_t page = h.le32(), block = h.le32();
+    if (page == 0 && block == 0) break;      // padding at the end of the directory
+    if (block < 8 || block % 2 != 0 || block > table.size() - at) return false;
+    ByteReader entries(table.subview(at + 8, block - 8));
+    for (uint64_t i = 0; i < (block - 8) / 2; ++i) {
+      const uint16_t entry = entries.le16();
+      const uint8_t type = static_cast<uint8_t>(entry >> 12);
+      if (type == kPeRelocationAbsolute) continue;
+      if (relocations_.count() >= kMaxRelocations) return false;
+      if (type != kPeRelocationDir64 && type != kPeRelocationHighLow) return false;      // (the other kinds do not occur on x86-64 images)
+      PeRelocation r;
+      r.rva = page + (entry & 0xFFF);
+      r.type = type;
+      if (r.rva < page || !relocations_.push_back(r)) return false;
+    }
+    at += block;
+  }
+  return true;
 }
 
 }  // namespace exe

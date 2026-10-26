@@ -22,6 +22,7 @@
 // command line. Ctrl+N, Ctrl+S, Ctrl+V and Ctrl+L do the same as the menu items. Commands run on the window's handler thread.
 #pragma once
 #include "Desktop/FileDialog.hpp"
+#include "Desktop/ProgramLauncher.hpp"
 #include "Desktop/Shell.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Menu.hpp"
@@ -32,12 +33,14 @@
 
 namespace desktop {
 
-class Terminal : public gui::Frame {
+class Terminal : public gui::Frame, private IProgramSink {
  public:
   explicit Terminal(allocators::IAllocator& allocator);
 
   // The filesystem the shell works on (nullptr: none). It must outlive the terminal. The current folder goes back to the root.
   void set_file_system(filesystem::IFileSystem* fs);
+  // What runs the programs the shell finds (nullptr: none, they are reported as unsupported). It must outlive the terminal.
+  void set_program_launcher(IProgramLauncher* launcher) { launcher_ = launcher; }
   // The dialog that Save Output As uses (nullptr: none). It must outlive the terminal.
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
   void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
@@ -77,10 +80,16 @@ class Terminal : public gui::Frame {
   static void on_link(void* self, gui::Control&);
   static void on_save_picked(void* self, gui::Control&);
   static void host_write(void* self, StringView text);
-  static void host_write_output(void* self, StringView text);
   static void host_clear(void* self);
   static void host_exit(void* self);
   static void host_unsupported_executable(void* self, StringView path, exe::ExecutableKind kind);
+  static void program_line(void* self, StringView text);
+  static void program_interrupt(void* self);
+  static void program_end_of_input(void* self);
+  // IProgramSink
+  void program_output(StringView text) override { view_.write(text); }
+  void program_started(IProgramControl* control) override;
+  void program_ended() override;
   static bool host_run_executable(void* self, StringView path, exe::ExecutableKind kind, ArrayView<const StringView> arguments);
   void refresh_prompt();
   void notify(gui::NoticeKind kind, StringView text) { gui::NoticeDialog::post(notices_, manager(), kind, text); }
@@ -90,6 +99,8 @@ class Terminal : public gui::Frame {
   Shell shell_;
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
+  IProgramLauncher* launcher_ = nullptr;
+  IProgramControl* running_ = nullptr;      // the program that is running, while one is
   gui::NoticeDialog* notices_ = nullptr;
   gui::Handler new_terminal_, open_path_;
   String opened_path_;
