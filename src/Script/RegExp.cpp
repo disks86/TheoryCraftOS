@@ -168,22 +168,53 @@ bool read_last_index(Vm& vm, JsObject* re, double* out) {
 
 void write_last_index(Vm& vm, JsObject* re, double v) { vm.define_named(re, "lastIndex", Value::make_number(v), kWritable); }
 
-// The groups of a match as the array exec() returns: the texts, and index, input and groups.
+// The groups object for the named groups of a match: a name used by several groups (in different alternatives) gets the one that took part.
+Value named_groups(Vm& vm, const regex::Program& p, StringView subject, const regex::Match& m, bool indices, JsString* s) {
+  JsObject* groups = vm.new_plain();
+  for (int pass = 0; pass < 2; ++pass) {   // (first every name as undefined, in order, then the groups that matched)
+    for (uint64_t i = 0; i < p.names.size(); ++i) {
+      const regex::NameEntry& e = p.names[i];
+      const StringView name(e.text, e.length);
+      if (pass == 0) {
+        vm.define_named(groups, name, Value());
+      } else if (m.has(e.group)) {
+        if (!indices) {
+          vm.define_named(groups, name, str_value(vm, m.text(subject, e.group)));
+        } else {
+          JsObject* pair = vm.new_array(2);
+          vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begins[e.group]))));
+          vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.ends[e.group]))));
+          vm.define_named(groups, name, Value::make_object(pair));
+        }
+      }
+    }
+  }
+  return Value::make_object(groups);
+}
+
+// The groups of a match as the array exec() returns: the texts, and index, input and groups (and indices with the d flag).
 Value match_array(Vm& vm, Compiled* c, JsString* s, const regex::Match& m) {
   JsObject* a = vm.new_array(m.count);
   for (uint32_t g = 0; g < m.count; ++g) vm.array_push(a, m.has(g) ? str_value(vm, m.text(s->view(), g)) : Value());
   vm.define_named(a, "index", Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begin()))));
   vm.define_named(a, "input", Value::make_string(s));
   const regex::Program p = c->regex.program();
-  if (p.names.size() == 0) {
-    vm.define_named(a, "groups", Value());
-  } else {
-    JsObject* groups = vm.new_plain();
-    for (uint64_t i = 0; i < p.names.size(); ++i) {
-      const regex::NameEntry& e = p.names[i];
-      vm.define_named(groups, StringView(e.text, e.length), m.has(e.group) ? str_value(vm, m.text(s->view(), e.group)) : Value());
+  if (p.names.size() == 0) vm.define_named(a, "groups", Value());
+  else vm.define_named(a, "groups", named_groups(vm, p, s->view(), m, false, s));
+  if (c->flags.view().contains('d')) {   // hasIndices: [start, end] of each group, in characters of the subject
+    JsObject* indices = vm.new_array(m.count);
+    for (uint32_t g = 0; g < m.count; ++g) {
+      if (!m.has(g)) {
+        vm.array_push(indices, Value());
+        continue;
+      }
+      JsObject* pair = vm.new_array(2);
+      vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begins[g]))));
+      vm.array_push(pair, Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.ends[g]))));
+      vm.array_push(indices, Value::make_object(pair));
     }
-    vm.define_named(a, "groups", Value::make_object(groups));
+    vm.define_named(indices, "groups", p.names.size() == 0 ? Value() : named_groups(vm, p, s->view(), m, true, s));
+    vm.define_named(a, "indices", Value::make_object(indices));
   }
   return Value::make_object(a);
 }
@@ -305,7 +336,14 @@ void expand_template(StringView repl, StringView subject, Compiled* c, const reg
       i += used;
     } else if (n == '<' && p.names.size() > 0) {
       const uint64_t close = repl.find('>', i + 2);
-      const int32_t g = close == StringView::npos ? -1 : p.group_index(repl.substr(i + 2, close - i - 2));
+      int32_t g = close == StringView::npos ? -1 : p.group_index(repl.substr(i + 2, close - i - 2));
+      if (g >= 0) {   // (a name used by several groups: the one that took part)
+        const StringView wanted = repl.substr(i + 2, close - i - 2);
+        for (uint64_t k = 0; k < p.names.size(); ++k) {
+          const regex::NameEntry& e = p.names[k];
+          if (StringView(e.text, e.length).equals(wanted) && m.has(e.group)) g = static_cast<int32_t>(e.group);
+        }
+      }
       if (close == StringView::npos) {
         out->push_back('$');
         continue;
@@ -420,12 +458,7 @@ bool regexp_replace(Vm& vm, JsString* s, const Value& regexp, const Value& repla
       call_args.push_back(Value::make_number(static_cast<double>(vm.string_unit_of_byte(s, m.begin()))));
       call_args.push_back(Value::make_string(s));
       if (p.names.size() > 0) {
-        JsObject* groups = vm.new_plain();
-        for (uint64_t i = 0; i < p.names.size(); ++i) {
-          const regex::NameEntry& e = p.names[i];
-          vm.define_named(groups, StringView(e.text, e.length), m.has(e.group) ? str_value(vm, m.text(subject, e.group)) : Value());
-        }
-        call_args.push_back(Value::make_object(groups));
+        call_args.push_back(named_groups(vm, p, subject, m, false, s));
       }
       Value r;
       JsString* rs;

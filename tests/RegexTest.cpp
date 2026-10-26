@@ -237,7 +237,7 @@ int main() {
   CHECK(error_of(a, "^*") == Error::NothingToRepeat && error_of(a, "\\b+") == Error::NothingToRepeat && error_of(a, "(?=a)*") == Error::NothingToRepeat);
   CHECK(error_of(a, "a{2,1}") == Error::BadRepeat && error_of(a, "a{1001}") == Error::RepeatTooLarge && error_of(a, "a{99999999999}") == Error::RepeatTooLarge);
   CHECK(error_of(a, "\\q") == Error::BadEscape && error_of(a, "\\xZ1") == Error::BadEscape && error_of(a, "\\u12") == Error::BadEscape && error_of(a, "\\00") == Error::BadEscape);
-  CHECK(error_of(a, "(?x)") == Error::BadGroup && error_of(a, "(?<1a>x)") == Error::BadGroupName && error_of(a, "(?<a>x)(?<a>y)") == Error::DuplicateGroupName);
+  CHECK(error_of(a, "(?x)") == Error::BadGroup && error_of(a, "(?<1a>x)") == Error::BadGroupName && error_of(a, "(?<a>x)|(?<a>y)") == Error::None   /* (a name may be used again: ES2025) */);
   CHECK(error_of(a, "\\1") == Error::BadBackreference && error_of(a, "(a)\\2") == Error::BadBackreference && error_of(a, "\\k<n>") == Error::BadBackreference);
   CHECK(error_of(a, "(?<=a)") == Error::None && error_of(a, "(?<!a)") == Error::None);   // (lookbehind compiles)
   CHECK(found(a, "(?<=(\\d)(\\d))x", "12x", "x", 0));

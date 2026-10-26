@@ -1538,9 +1538,29 @@ bool trim_impl(Vm& vm, const Value& self, Value* result, bool left, bool right) 
   if (!this_string(vm, self, &s)) return false;
   StringView v = s->view();
   uint64_t a = 0, b = v.size();
-  auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
-  while (left && a < b && blank(v[a])) ++a;
-  while (right && b > a && blank(v[b - 1])) --b;
+  // WhiteSpace and LineTerminator of the language: the ASCII ones, NBSP, the Unicode space separators, the line and paragraph separators and the BOM
+  auto blank = [](uint32_t c) {
+    return c == ' ' || (c >= 9 && c <= 13) || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000 || c == 0xFEFF;
+  };
+  auto is_continuation = [](char c) { return (static_cast<uint8_t>(c) & 0xC0) == 0x80; };
+  while (left && a < b) {   // (decode the code point at a)
+    const uint8_t c0 = static_cast<uint8_t>(v[a]);
+    uint32_t cp = c0, n = 1;
+    if (c0 >= 0xE0 && c0 < 0xF0 && a + 2 < b + 0 && a + 2 <= b - 1) { cp = ((c0 & 0xFu) << 12) | ((static_cast<uint8_t>(v[a + 1]) & 0x3Fu) << 6) | (static_cast<uint8_t>(v[a + 2]) & 0x3Fu); n = 3; }
+    else if (c0 >= 0xC0 && c0 < 0xE0 && a + 1 < b) { cp = ((c0 & 0x1Fu) << 6) | (static_cast<uint8_t>(v[a + 1]) & 0x3Fu); n = 2; }
+    if (!blank(cp)) break;
+    a += n;
+  }
+  while (right && b > a) {   // (and the one that ends at b)
+    uint64_t start = b - 1;
+    while (start > a && is_continuation(v[start])) --start;
+    const uint8_t c0 = static_cast<uint8_t>(v[start]);
+    uint32_t cp = c0;
+    if (c0 >= 0xE0 && c0 < 0xF0 && b - start == 3) cp = ((c0 & 0xFu) << 12) | ((static_cast<uint8_t>(v[start + 1]) & 0x3Fu) << 6) | (static_cast<uint8_t>(v[start + 2]) & 0x3Fu);
+    else if (c0 >= 0xC0 && c0 < 0xE0 && b - start == 2) cp = ((c0 & 0x1Fu) << 6) | (static_cast<uint8_t>(v[start + 1]) & 0x3Fu);
+    if (!blank(cp)) break;
+    b = start;
+  }
   *result = str_value(vm, v.substr(a, b - a));
   return true;
 }

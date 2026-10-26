@@ -80,8 +80,17 @@ const char kStdlib[] = R"JSLIB((function (g) {
     for (var i = 0; i < raw.length; i++) { out += raw[i]; if (i + 1 < raw.length && i + 1 < arguments.length) out += arguments[i + 1]; }
     return out;
   });
-  def(SP, 'toLocaleLowerCase', function () { return this.toLowerCase(); });
-  def(SP, 'toLocaleUpperCase', function () { return this.toUpperCase(); });
+  // Turkish and Azeri keep the dot of the i: I is the dotless i when lowercased, i is the dotted I when uppercased
+  function dotted(locale) { if (Array.isArray(locale)) locale = locale[0]; return typeof locale === 'string' && /^(tr|az)(-|$)/i.test(locale); }
+  var DOTLESS = String.fromCharCode(0x131), DOTTED = String.fromCharCode(0x130);
+  def(SP, 'toLocaleLowerCase', function (locale) {
+    var s = String(this);
+    return dotted(locale) ? s.replace(new RegExp(DOTTED, 'g'), 'i').replace(/I(?!\u0307)/g, DOTLESS).replace(/I\u0307/g, 'i').toLowerCase() : s.toLowerCase();
+  });
+  def(SP, 'toLocaleUpperCase', function (locale) {
+    var s = String(this);
+    return dotted(locale) ? s.replace(/i/g, DOTTED).toUpperCase() : s.toUpperCase();
+  });
   function lonelySurrogate(text, i) {
     var c = text.charCodeAt(i);
     if (c >= 0xD800 && c <= 0xDBFF) { var d = text.charCodeAt(i + 1); return !(d >= 0xDC00 && d <= 0xDFFF); }
