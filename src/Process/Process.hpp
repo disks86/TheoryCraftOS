@@ -128,6 +128,9 @@ class IProcessRuntime {
   virtual bool cpu_time(uint64_t thread_id, uint64_t* hundred_ns) { (void)thread_id; *hundred_ns = 0; return true; }
   // The core the calling thread runs on right now.
   virtual uint32_t current_processor() { return 0; }
+  // The running programs (Toolhelp, EnumProcesses): returns how many entries it wrote.
+  struct ProcessEntry { uint64_t pid = 0, parent = 0; uint32_t threads = 0; char name[24] = {}; };
+  virtual uint32_t list_processes(ProcessEntry* out, uint32_t capacity) { (void)out; (void)capacity; return 0; }
   // Is there a running program with this process id (OpenProcess)?
   virtual bool process_exists(uint64_t pid) { (void)pid; return false; }
 

@@ -80,6 +80,10 @@ typedef struct _OBJECT_ATTRIBUTES {
 typedef unsigned short *LPWORD;
 typedef unsigned long long *PULONGLONG;
 typedef DWORD LCID;
+typedef DWORD LCTYPE;
+typedef long long LPARAM;
+typedef int *LPINT;
+#define CALLBACK
 typedef unsigned short LANGID;
 typedef struct _FILETIME *PFILETIME;
 typedef void *HRSRC;
@@ -122,6 +126,7 @@ typedef struct _OVERLAPPED { ULONG_PTR Internal, InternalHigh; union { struct { 
 #define ERROR_FILE_NOT_FOUND 2
 #define ERROR_BAD_EXE_FORMAT 193
 #define ERROR_FILENAME_EXCED_RANGE 206
+#define ERROR_INVALID_FLAGS 1004
 #define ERROR_ALREADY_THREAD 1281
 #define ERROR_BAD_LENGTH 24
 #define ERROR_REQUEST_ABORTED 1235

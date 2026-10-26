@@ -89,6 +89,7 @@ struct Task final : process::IProcessRuntime {
   Task* all_next = nullptr;       // every running program (see process_snapshot()); under the registry's lock
   bool registered = false;
   uint32_t running_threads = 0;      // threads that have been started and have not reached their end (atomic): when the last one does, the process lets go of its handles
+  uint64_t parent_id = 0;      // the process that started it with CreateProcess (0: none)
   uint64_t process_mask = ~uint64_t{0};      // the cores new threads may run on (SetProcessAffinityMask)
   UserThread* first_thread = nullptr;      // the program's first thread, when it was created but not started (CreateProcess with CREATE_SUSPENDED)
 
@@ -118,6 +119,7 @@ struct Task final : process::IProcessRuntime {
   bool cpu_time(uint64_t thread_id, uint64_t* hundred_ns) override;
   uint32_t current_processor() override;
   bool process_exists(uint64_t pid) override;
+  uint32_t list_processes(ProcessEntry* out, uint32_t capacity) override;
   uint64_t allocate_process_id() override;
   uint32_t spawn_process(const process::ChildSpec& spec) override;
   bool terminate_process(uint64_t pid, uint32_t code) override;
@@ -142,7 +144,7 @@ struct Task final : process::IProcessRuntime {
 UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name, bool suspended = false);
 // --- Monitoring (the computer manager). Cumulative CPU counters; a tick is 1 / tick_rate() seconds on one core.
 struct ProcessInfo {
-  uint64_t id = 0;
+  uint64_t id = 0, parent_id = 0;
   char name[24] = {};
   bool windows = false;        // otherwise Linux
   uint32_t threads = 0;        // live threads

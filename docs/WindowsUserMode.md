@@ -136,7 +136,12 @@ renumbers its services in nearly every build, which is why programs call ntdll);
   shared by all programs. File mappings of files are read into memory when made and written back when flushed, when the last view is closed and when the mapping is.
 - **Overlapped I/O** is done at the call and the OVERLAPPED filled in; completion routines (`ReadFileEx`, `WriteFileEx`, timers, `QueueUserAPC`) run when the thread waits
   alertably.
-- **Not provided**: the console screen-buffer functions (cursor, attributes, input records, console modes and control handlers), global atoms, job objects, debugging APIs,
-  reading or writing another process's memory, remote threads, process snapshots (Toolhelp), locale and string-type tables (`GetLocaleInfo`, `LCMapString`,
-  `GetStringType`), completion ports, mailslots, change notifications, hard and symbolic links, and the many exports of the real kernel32 and msvcrt that no program here has needed.
+- **Locale and strings**: there is one locale, English (United States). `GetLocaleInfo`, `GetNumberFormat`, `GetCurrencyFormat`, `GetDateFormat`, `GetTimeFormat`,
+  `LCMapString`, `GetStringType`, `CompareStringOrdinal`, `FindStringOrdinal`, `FoldString` and the enumerations work for it (Latin, Greek and Cyrillic letters have case).
+- **Atoms** (local and global) share one table of 256 names in the program. **Completion ports** are queues programs post to (`PostQueuedCompletionStatus`, `GetQueuedCompletionStatus[Ex]`):
+  no file I/O is asynchronous, so files associated with a port never post packets. **Process lists**: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, `Process32First/Next` and
+  `K32EnumProcesses` read `NtQuerySystemInformation` class 5 (one entry per running program, without thread entries). `ReadProcessMemory`/`WriteProcessMemory` work on the
+  program itself only; thread descriptions are kept per thread.
+- **Not provided**: the console screen-buffer functions (cursor, attributes, input records, console modes and control handlers), job objects, debugging APIs, memory of
+  other processes, remote threads, Toolhelp lists of threads, modules and heaps, mailslots, change notifications, hard and symbolic links, and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.
