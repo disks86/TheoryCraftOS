@@ -50,6 +50,10 @@ class UserProgram {
   UserProgram(const UserProgram&) = delete;
   UserProgram& operator=(const UserProgram&) = delete;
 
+  // The OS file system the program's tree lives in ("/Linux" for a Linux program, "/Windows" for a Windows one). Set before load(); without it the program
+  // has no files. The file system must outlive the program.
+  void set_file_system(filesystem::IFileSystem* fs) { files_ = fs; }
+
   // `random` is the 16 bytes of AT_RANDOM. Call once; on failure the program is unusable (create another).
   LoadStatus load(ConstByteView file, ArrayView<const StringView> arguments, ArrayView<const StringView> environment, ConstByteView random);
 
@@ -64,6 +68,7 @@ class UserProgram {
   uint64_t id_;
   IProcessHost& host_;
   AddressSpace space_;
+  filesystem::IFileSystem* files_ = nullptr;
   UniquePointer<Process> process_;
   ProgramStart start_;
   LoadedImage image_;

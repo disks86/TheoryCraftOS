@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/AddressSpace.hpp"
+#include "Process/LinuxFiles.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
@@ -27,10 +28,13 @@ namespace process {
 namespace {
 
 constexpr int64_t kEnoent = 2, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEnodev = 19, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
-constexpr uint64_t kIovMax = 1024, kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
+constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
+constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
 enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
-  SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise };
+  SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
+  Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
+  Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Succeed };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -49,6 +53,17 @@ constexpr NumberEntry kNumbers[] = {
     {14, 135, Call::RtSigprocmask}, {131, 132, Call::Sigaltstack}, {273, 99, Call::SetRobustList}, {334, 293, Call::Rseq},
     {302, 261, Call::Prlimit64},   {318, 278, Call::Getrandom}, {96, 169, Call::Gettimeofday}, {110, 173, Call::Getppid},
     {28, 233, Call::Madvise},
+    {2, kAbsent, Call::Open},      {4, kAbsent, Call::Stat},    {6, kAbsent, Call::Lstat},    {17, 67, Call::Pread},
+    {18, 68, Call::Pwrite},        {19, 65, Call::Readv},       {217, 61, Call::Getdents64},  {83, kAbsent, Call::Mkdir},
+    {258, 34, Call::Mkdirat},      {84, kAbsent, Call::Rmdir},  {87, kAbsent, Call::Unlink},  {263, 35, Call::Unlinkat},
+    {82, kAbsent, Call::Rename},   {264, 38, Call::Renameat},   {316, 276, Call::Renameat2},  {79, 17, Call::Getcwd},
+    {80, 49, Call::Chdir},         {81, 50, Call::Fchdir},      {21, kAbsent, Call::Access},  {269, 48, Call::Faccessat},
+    {439, 439, Call::Faccessat},   {76, 45, Call::Truncate},    {77, 46, Call::Ftruncate},    {74, 82, Call::Fsync},
+    {75, 83, Call::Fsync},         {32, 23, Call::Dup},         {33, kAbsent, Call::Dup2},    {292, 24, Call::Dup3},
+    {72, 25, Call::Fcntl},         {89, kAbsent, Call::Readlink}, {332, 291, Call::Statx},    {95, 166, Call::Umask},
+    {90, kAbsent, Call::Succeed},  {91, 52, Call::Succeed},     {268, 53, Call::Succeed},     {92, kAbsent, Call::Succeed},
+    {93, 55, Call::Succeed},       {94, kAbsent, Call::Succeed}, {260, 54, Call::Succeed},    {280, 88, Call::Succeed},
+    {162, 81, Call::Succeed},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -69,43 +84,6 @@ StringView machine_name(UserArch arch) {
   }
 }
 
-uint64_t do_write(Process& process, uint64_t fd, uint64_t address, uint64_t count) {
-  const DescriptorKind kind = process.descriptor(fd);
-  if (kind == DescriptorKind::Closed) return error(kEbadf);
-  if (kind == DescriptorKind::ConsoleInput) return error(kEbadf);        // opened read-only
-  if (count > kMaxIoBytes) count = kMaxIoBytes;
-  bool faulted = false;
-  const uint64_t done = copy_user_to_console(process, kind == DescriptorKind::ConsoleError ? 2 : 1, address, count, &faulted);
-  if (faulted && done == 0) return error(kEfault);
-  return done;
-}
-
-uint64_t do_read(Process& process, uint64_t fd, uint64_t address, uint64_t count) {
-  const DescriptorKind kind = process.descriptor(fd);
-  if (kind != DescriptorKind::ConsoleInput) return error(kEbadf);
-  if (count > kMaxIoBytes) count = kMaxIoBytes;
-  bool faulted = false;
-  const uint64_t got = copy_console_to_user(process, address, count, &faulted);
-  if (faulted) return error(kEfault);
-  return got;
-}
-
-uint64_t do_writev(Process& process, uint64_t fd, uint64_t iov, uint64_t count) {
-  if (count > kIovMax) return error(kEinval);
-  if (process.descriptor(fd) == DescriptorKind::Closed) return error(kEbadf);
-  uint64_t total = 0;
-  for (uint64_t i = 0; i < count; ++i) {
-    uint64_t base = 0, length = 0;
-    if (iov > ~uint64_t{0} - i * 16 - 15) return total ? total : error(kEfault);
-    if (!process.read_user_u64(iov + i * 16, &base) || !process.read_user_u64(iov + i * 16 + 8, &length)) return total ? total : error(kEfault);
-    if (length > kMaxIoBytes - total) return total ? total : error(kEinval);          // the sum must stay within what one call may move
-    const uint64_t result = do_write(process, fd, base, length);
-    if (int64_t(result) < 0) return total ? total : result;
-    total += result;
-    if (result < length) break;      // a short write ends the call
-  }
-  return total;
-}
 
 constexpr uint64_t kMapShared = 0x1, kMapPrivate = 0x2, kMapFixed = 0x10, kMapAnonymous = 0x20;
 constexpr uint64_t kMapOtherAccepted = 0x100 | 0x800 | 0x4000 | 0x8000 | 0x10000 | 0x40000;      // GROWSDOWN, DENYWRITE, NORESERVE, POPULATE, NONBLOCK, STACK/HUGETLB: hints we may ignore
@@ -169,7 +147,6 @@ uint64_t do_mprotect(Process& process, uint64_t address, uint64_t length, uint64
 // --- thread pointer, terminal-ish and signal calls that C libraries make while starting up -------------------------------------------------------------
 
 constexpr uint64_t kArchSetGs = 0x1001, kArchSetFs = 0x1002, kArchGetFs = 0x1003, kArchGetGs = 0x1004;
-constexpr uint64_t kAtEmptyPath = 0x1000;
 
 uint64_t do_arch_prctl(Process& process, uint64_t code, uint64_t address) {
   switch (code) {
@@ -189,26 +166,6 @@ uint64_t do_arch_prctl(Process& process, uint64_t code, uint64_t address) {
 bool write_zeros(Process& process, uint64_t address, uint64_t count) {
   uint8_t zeros[256] = {};
   return count <= sizeof(zeros) && process.write_user(address, ConstByteView(zeros, count));
-}
-
-// A character device (the console): what fstat says about descriptors 0..2, so C libraries line-buffer them.
-uint64_t do_fstat(Process& process, UserArch arch, uint64_t fd, uint64_t address) {
-  if (process.descriptor(fd) == DescriptorKind::Closed) return error(kEbadf);
-  uint8_t buffer[144] = {};
-  const uint32_t mode = 0020620;      // S_IFCHR | rw--w----
-  const uint64_t mode_at = arch == UserArch::X86_64 ? 24 : 16;
-  for (uint32_t i = 0; i < 4; ++i) buffer[mode_at + i] = uint8_t(mode >> (8 * i));
-  buffer[arch == UserArch::X86_64 ? 16 : 20] = 1;      // one link
-  buffer[56] = 0x00; buffer[57] = 0x04;                  // st_blksize 1024
-  const uint64_t size = arch == UserArch::X86_64 ? 144 : 128;
-  return process.write_user(address, ConstByteView(buffer, size)) ? 0 : error(kEfault);
-}
-
-uint64_t do_newfstatat(Process& process, UserArch arch, uint64_t dirfd, uint64_t path, uint64_t address, uint64_t flags) {
-  uint8_t first = 0;
-  const bool empty = path == 0 || (process.read_user(path, ByteView(&first, 1)) && first == 0);
-  if ((flags & kAtEmptyPath) && empty) return do_fstat(process, arch, dirfd, address);
-  return error(kEnoent);      // there is no file system for programs yet
 }
 
 uint64_t do_prlimit(Process& process, uint64_t resource, uint64_t old_limit) {
@@ -249,9 +206,9 @@ class LinuxSyscalls final : public ISyscallInterface {
   uint64_t dispatch(Process& process, const SyscallRequest& r) const override {
     const uint64_t* a = r.args;
     switch (translate(arch_, r.number)) {
-      case Call::Read: return do_read(process, a[0], a[1], a[2]);
-      case Call::Write: return do_write(process, a[0], a[1], a[2]);
-      case Call::Writev: return do_writev(process, a[0], a[1], a[2]);
+      case Call::Read: return linuxabi::sys_read(process, a[0], a[1], a[2]);
+      case Call::Write: return linuxabi::sys_write(process, a[0], a[1], a[2]);
+      case Call::Writev: return linuxabi::sys_writev(process, a[0], a[1], a[2]);
       case Call::Close: return process.close_descriptor(a[0]) ? 0 : error(kEbadf);
       case Call::Getpid: return process.id();
       case Call::Gettid: return process.id();        // one thread per process so far
@@ -269,12 +226,43 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Munmap: return do_munmap(process, a[0], a[1]);
       case Call::Mprotect: return do_mprotect(process, a[0], a[1], a[2]);
       case Call::ArchPrctl: return do_arch_prctl(process, a[0], a[1]);
-      case Call::Ioctl: return process.descriptor(a[0]) == DescriptorKind::Closed ? error(kEbadf) : error(kEnotty);
-      case Call::Fstat: return do_fstat(process, arch_, a[0], a[1]);
-      case Call::Newfstatat: return do_newfstatat(process, arch_, a[0], a[1], a[2], a[3]);
-      case Call::Lseek: return process.descriptor(a[0]) == DescriptorKind::Closed ? error(kEbadf) : error(kEspipe);
-      case Call::Openat:
-      case Call::Readlinkat: return error(kEnoent);
+      case Call::Ioctl: return linuxabi::sys_ioctl(process, a[0]);
+      case Call::Fstat: return linuxabi::sys_fstat(process, arch_, a[0], a[1]);
+      case Call::Newfstatat: return linuxabi::sys_statat(process, arch_, a[0], a[1], a[2], a[3]);
+      case Call::Stat:
+      case Call::Lstat: return linuxabi::sys_statat(process, arch_, kAtFdCwd, a[0], a[1], 0);
+      case Call::Statx: return linuxabi::sys_statx(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Lseek: return linuxabi::sys_lseek(process, a[0], a[1], a[2]);
+      case Call::Openat: return linuxabi::sys_openat(process, arch_, a[0], a[1], a[2]);
+      case Call::Open: return linuxabi::sys_openat(process, arch_, kAtFdCwd, a[0], a[1]);
+      case Call::Readlinkat: return linuxabi::sys_readlinkat(process, a[0], a[1]);
+      case Call::Readlink: return linuxabi::sys_readlinkat(process, kAtFdCwd, a[0]);
+      case Call::Pread: return linuxabi::sys_pread(process, a[0], a[1], a[2], a[3]);
+      case Call::Pwrite: return linuxabi::sys_pwrite(process, a[0], a[1], a[2], a[3]);
+      case Call::Readv: return linuxabi::sys_readv(process, a[0], a[1], a[2]);
+      case Call::Getdents64: return linuxabi::sys_getdents64(process, a[0], a[1], a[2]);
+      case Call::Mkdir: return linuxabi::sys_mkdirat(process, kAtFdCwd, a[0]);
+      case Call::Mkdirat: return linuxabi::sys_mkdirat(process, a[0], a[1]);
+      case Call::Rmdir: return linuxabi::sys_unlinkat(process, kAtFdCwd, a[0], 0x200);
+      case Call::Unlink: return linuxabi::sys_unlinkat(process, kAtFdCwd, a[0], 0);
+      case Call::Unlinkat: return linuxabi::sys_unlinkat(process, a[0], a[1], a[2]);
+      case Call::Rename: return linuxabi::sys_renameat(process, kAtFdCwd, a[0], kAtFdCwd, a[1]);
+      case Call::Renameat:
+      case Call::Renameat2: return linuxabi::sys_renameat(process, a[0], a[1], a[2], a[3]);
+      case Call::Getcwd: return linuxabi::sys_getcwd(process, a[0], a[1]);
+      case Call::Chdir: return linuxabi::sys_chdir(process, a[0]);
+      case Call::Fchdir: return linuxabi::sys_fchdir(process, a[0]);
+      case Call::Access: return linuxabi::sys_faccessat(process, kAtFdCwd, a[0], a[1]);
+      case Call::Faccessat: return linuxabi::sys_faccessat(process, a[0], a[1], a[2]);
+      case Call::Truncate: return linuxabi::sys_truncate(process, a[0], a[1]);
+      case Call::Ftruncate: return linuxabi::sys_ftruncate(process, a[0], a[1]);
+      case Call::Fsync: return linuxabi::sys_fsync(process, a[0]);
+      case Call::Dup: return linuxabi::sys_dup(process, a[0]);
+      case Call::Dup2: return linuxabi::sys_dup3(process, a[0], a[1], ~uint64_t{0});
+      case Call::Dup3: return linuxabi::sys_dup3(process, a[0], a[1], a[2]);
+      case Call::Fcntl: return linuxabi::sys_fcntl(process, a[0], a[1], a[2]);
+      case Call::Umask: return 022;
+      case Call::Succeed: return 0;      // permissions, owners, times and syncs: there is nothing to change here
       case Call::RtSigaction: return a[2] && !write_zeros(process, a[2], 32) ? error(kEfault) : 0;
       case Call::RtSigprocmask: return a[2] && !write_zeros(process, a[2], 8) ? error(kEfault) : 0;
       case Call::Sigaltstack: return a[1] && !write_zeros(process, a[1], 24) ? error(kEfault) : 0;

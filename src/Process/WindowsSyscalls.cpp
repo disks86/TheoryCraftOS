@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/AddressSpace.hpp"
+#include "Process/WindowsFiles.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -35,61 +36,7 @@ constexpr uint64_t kStackArgumentBase = 0x28;           // return address + 32 b
 constexpr uint64_t kUnixToNtSeconds = 11644473600ull;   // 1601-01-01 to 1970-01-01
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;
 
-// Handles are (slot + 1) * 4; anything else is not a handle of this process.
-bool handle_slot(uint64_t handle, uint64_t* slot) {
-  if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
-  *slot = handle / 4 - 1;
-  return true;
-}
-
-// The Nth argument (0-based) of a service: from registers up to the fourth, then from the stack.
-bool argument(Process& process, const SyscallRequest& r, uint32_t index, uint64_t* out) {
-  if (index < 4) { *out = r.args[index]; return true; }
-  const uint64_t offset = kStackArgumentBase + uint64_t{index - 4} * 8;
-  if (r.user_stack > ~uint64_t{0} - offset - 7) return false;
-  return process.read_user_u64(r.user_stack + offset, out);
-}
-
-// IO_STATUS_BLOCK: { NTSTATUS Status (8 bytes with padding); ULONG_PTR Information; }
-bool store_io_status(Process& process, uint64_t address, uint32_t status, uint64_t information) {
-  return process.write_user_u64(address, status) && process.write_user_u64(address + 8, information);
-}
-
-uint32_t nt_write_file(Process& process, const SyscallRequest& r) {
-  uint64_t apc = 0, status_block = 0, buffer = 0, length = 0, offset = 0;
-  if (!argument(process, r, 2, &apc) || !argument(process, r, 4, &status_block) || !argument(process, r, 5, &buffer) ||
-      !argument(process, r, 6, &length) || !argument(process, r, 7, &offset))
-    return kStatusAccessViolation;
-  uint64_t slot = 0;
-  if (!handle_slot(r.args[0], &slot)) return kStatusInvalidHandle;
-  const DescriptorKind kind = process.descriptor(slot);
-  if (kind == DescriptorKind::Closed) return kStatusInvalidHandle;
-  if (apc != 0) return kStatusNotImplemented;                 // asynchronous completion is not supported
-  if (kind == DescriptorKind::ConsoleInput) return kStatusAccessDenied;
-  length &= 0xFFFFFFFFu;                                       // ULONG
-  if (length > kMaxIoBytes) length = kMaxIoBytes;
-  bool faulted = false;
-  const uint64_t done = copy_user_to_console(process, kind == DescriptorKind::ConsoleError ? 2 : 1, buffer, length, &faulted);
-  if (faulted && done == 0) return kStatusAccessViolation;
-  return store_io_status(process, status_block, kStatusSuccess, done) ? kStatusSuccess : kStatusAccessViolation;
-}
-
-uint32_t nt_read_file(Process& process, const SyscallRequest& r) {
-  uint64_t apc = 0, status_block = 0, buffer = 0, length = 0;
-  if (!argument(process, r, 2, &apc) || !argument(process, r, 4, &status_block) || !argument(process, r, 5, &buffer) || !argument(process, r, 6, &length))
-    return kStatusAccessViolation;
-  uint64_t slot = 0;
-  if (!handle_slot(r.args[0], &slot)) return kStatusInvalidHandle;
-  if (process.descriptor(slot) != DescriptorKind::ConsoleInput) return process.descriptor(slot) == DescriptorKind::Closed ? kStatusInvalidHandle : kStatusAccessDenied;
-  if (apc != 0) return kStatusNotImplemented;
-  length &= 0xFFFFFFFFu;
-  if (length > kMaxIoBytes) length = kMaxIoBytes;
-  bool faulted = false;
-  const uint64_t got = copy_console_to_user(process, buffer, length, &faulted);
-  if (faulted) return kStatusAccessViolation;
-  const uint32_t status = got == 0 && length != 0 ? kStatusEndOfFile : kStatusSuccess;
-  return store_io_status(process, status_block, status, got) ? status : kStatusAccessViolation;
-}
+bool argument(Process& process, const SyscallRequest& r, uint32_t index, uint64_t* out) { return windowsabi::argument(process, r, index, out); }
 
 uint64_t nt_time_now(Process& process) { return (process.host().realtime_ns() / 100) + kUnixToNtSeconds * 10000000ull; }      // 100 ns units since 1601
 
@@ -243,12 +190,17 @@ class WindowsSyscalls final : public ISyscallInterface {
   uint64_t dispatch(Process& process, const SyscallRequest& r) const override {
     if (r.number > 0xFFFFFFFFu) return kStatusInvalidSystemService;
     switch (static_cast<WindowsSyscallNumber>(r.number)) {
-      case WindowsSyscallNumber::NtReadFile: return nt_read_file(process, r);
-      case WindowsSyscallNumber::NtWriteFile: return nt_write_file(process, r);
-      case WindowsSyscallNumber::NtClose: {
-        uint64_t slot = 0;
-        return handle_slot(r.args[0], &slot) && process.close_descriptor(slot) ? kStatusSuccess : kStatusInvalidHandle;
-      }
+      case WindowsSyscallNumber::NtReadFile: return windowsabi::nt_read_file(process, r);
+      case WindowsSyscallNumber::NtWriteFile: return windowsabi::nt_write_file(process, r);
+      case WindowsSyscallNumber::NtClose: return windowsabi::nt_close(process, r);
+      case WindowsSyscallNumber::NtCreateFile: return windowsabi::nt_create_file(process, r);
+      case WindowsSyscallNumber::NtOpenFile: return windowsabi::nt_open_file(process, r);
+      case WindowsSyscallNumber::NtQueryInformationFile: return windowsabi::nt_query_information_file(process, r);
+      case WindowsSyscallNumber::NtSetInformationFile: return windowsabi::nt_set_information_file(process, r);
+      case WindowsSyscallNumber::NtQueryDirectoryFile: return windowsabi::nt_query_directory_file(process, r);
+      case WindowsSyscallNumber::NtQueryAttributesFile: return windowsabi::nt_query_attributes_file(process, r);
+      case WindowsSyscallNumber::NtDeleteFile: return windowsabi::nt_delete_file(process, r);
+      case WindowsSyscallNumber::NtFlushBuffersFile: return windowsabi::nt_flush_buffers_file(process, r);
       case WindowsSyscallNumber::NtTerminateProcess:
         if (r.args[0] != kCurrentProcess) return kStatusInvalidHandle;      // other processes are not reachable yet
         process.terminate(uint32_t(r.args[1]));
@@ -259,7 +211,7 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtAllocateVirtualMemory: return nt_allocate_virtual_memory(process, r);
       case WindowsSyscallNumber::NtFreeVirtualMemory: return nt_free_virtual_memory(process, r);
       case WindowsSyscallNumber::NtProtectVirtualMemory: return nt_protect_virtual_memory(process, r);
-      default: return kStatusInvalidSystemService;
+      default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return kStatusInvalidSystemService;
     }
   }
 };

@@ -561,6 +561,9 @@ add_executable(BOOTX64
   src/Process/UserPageTables.cpp
   src/Process/WindowsStartup.cpp
   src/Process/LinuxSyscalls.cpp
+  src/Process/LinuxFiles.cpp
+  src/Process/ProcessFiles.cpp
+  src/Process/WindowsFiles.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
   src/Media/DashClient.cpp

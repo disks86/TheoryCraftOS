@@ -26,7 +26,7 @@ constexpr uint64_t kUnknownWindows = 0xC000001Cu;      // STATUS_INVALID_SYSTEM_
 }  // namespace
 
 Process::Process(uint64_t id, const ProcessBinding& binding, IUserMemory& memory, IProcessHost& host)
-    : id_(id), binding_(binding), memory_(memory), host_(host) {}
+    : id_(id), binding_(binding), memory_(memory), host_(host), files_(binding.abi == SyscallAbi::Windows ? PathStyle::Windows : PathStyle::Posix) {}
 
 uint64_t Process::syscall(const SyscallRequest& request) {
   if (!binding_.interface || exited_) return binding_.abi == SyscallAbi::Windows ? kUnknownWindows : kUnknownLinux;
@@ -46,12 +46,6 @@ bool Process::write_user_u64(uint64_t address, uint64_t value) {
   uint8_t raw[8];
   for (uint32_t i = 0; i < 8; ++i) raw[i] = uint8_t(value >> (8 * i));
   return write_user(address, ConstByteView(raw, 8));
-}
-
-bool Process::close_descriptor(uint64_t slot) {
-  if (slot >= kMaxDescriptors || slots_[slot] == DescriptorKind::Closed) return false;
-  slots_[slot] = DescriptorKind::Closed;
-  return true;
 }
 
 uint64_t copy_user_to_console(Process& process, uint32_t stream, uint64_t address, uint64_t count, bool* faulted) {
