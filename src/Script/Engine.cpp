@@ -719,17 +719,11 @@ const char kCollections[] = R"JSLIB((function (g) {
   if (!Object.fromEntries) def(Object, 'fromEntries', function (iterable) { var o = {}; for (var e of iterable) o[e[0]] = e[1]; return o; });
   var Reflect = {
     apply: function (f, self, args) { return f.apply(self, args); },
-    construct: function (F, args) {
-      var a = args || [];
-      switch (a.length) {
-        case 0: return new F();
-        case 1: return new F(a[0]);
-        case 2: return new F(a[0], a[1]);
-        case 3: return new F(a[0], a[1], a[2]);
-        case 4: return new F(a[0], a[1], a[2], a[3]);
-        case 5: return new F(a[0], a[1], a[2], a[3], a[4]);
-        default: return new F(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-      }
+    construct: function (F, args, newTarget) {
+      if (typeof F !== 'function') throw new TypeError(String(F) + ' is not a constructor');
+      if (newTarget === undefined) newTarget = F; else if (typeof newTarget !== 'function') throw new TypeError(String(newTarget) + ' is not a constructor');
+      if (args === null || (typeof args !== 'object' && typeof args !== 'function')) throw new TypeError('CreateListFromArrayLike called on non-object');
+      return __reflect_construct(F, Array.prototype.slice.call(args), newTarget);
     },
     defineProperty: function (o, k, d) {
       if (o === null || (typeof o !== 'object' && typeof o !== 'function')) throw new TypeError('Reflect.defineProperty called on non-object');

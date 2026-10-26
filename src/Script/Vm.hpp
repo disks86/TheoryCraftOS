@@ -82,6 +82,8 @@ class Vm {
   // Calls a function value.
   bool call(const Value& function, const Value& this_value, const Value* args, uint32_t argc, Value* result);
   bool construct(const Value& function, const Value* args, uint32_t argc, Value* result);
+  // Reflect.construct: `new function(...args)` whose new.target (and so the prototype of the object it makes) is `new_target`.
+  bool construct_with(const Value& function, const Value* args, uint32_t argc, const Value& new_target, Value* result);
   // The pending exception as text ("TypeError: x is not a function"), and it is cleared.
   void take_exception(String* text);
   bool has_exception() const { return has_exception_; }
@@ -309,6 +311,7 @@ class Vm {
     bool construct;
     bool via_super;          // the frame is a parent class constructor that super(...) called: new.target is the class of `this`
     Value construct_this;
+    Value new_target;        // set by Reflect.construct; otherwise new.target of a construct frame is the callee
     JsObject* coroutine;     // the async function this frame is running (its state is saved here at an `await`)
   };
   struct Handler {
@@ -333,6 +336,8 @@ class Vm {
   int64_t find_prop(JsObject* o, JsString* key) const;
   void push_property_keys(JsObject* names, JsObject* o, bool enumerable);
   uint32_t symbol_counter_ = 0;
+  Value new_target_override_;   // for the next construct call (see construct_with)
+  Value pending_frame_new_target_;   // ... on its way to the frame
   bool array_index(const Value& key, uint32_t* index) const;
   static bool canonical_index(StringView s, uint32_t* index);
   bool ensure_items(JsObject* o, uint32_t capacity);
