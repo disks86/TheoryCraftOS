@@ -83,7 +83,11 @@ The firmware is `/firmware/vegam_uvd.bin` (linux-firmware, UVD 6.3, version 1.13
 
 What it does not do, and what is needed before a Vega M decodes anything:
 - **Power and clocks.** amdgpu asks the card's SMC to power the engine and set its clocks (`PPSMC_MSG_UVDPowerON`, `amdgpu_asic_set_uvd_clocks`); here the engine is assumed powered and clocked (usually so on a card the system firmware set up).
-- **Memory.** Nothing finds where in the card's memory the block may go or what the memory controller's base address is (`MC_VM_FB_LOCATION` of the GMC 8 block), and the CPU reaches the card's memory through BAR 0.
+- **Memory: planned, not wired.** `AmdGmc8Memory` reads the memory controller the way amdgpu does (`CONFIG_MEMSIZE`, `MC_VM_FB_LOCATION`; both set by the card's firmware, nothing is written), places the engine's block, ring and
+  a work area (96 MiB if there is room, 8 MiB at least) at the end of the part of video memory the CPU can reach through BAR 0 (the first 256 MiB without Resizable BAR), clear of the firmware's start of memory
+  (25 MiB) and a 16 MiB tail guard, and maps them (`amd_map_uvd6_plan`). `AmdUvd6::start` flushes the host data path (`HDP_MEM_COHERENCY_FLUSH_CNTL`) after writing the microcode. What is missing is the plumbing:
+  finding the card's register BAR (BAR 5) and memory BAR (BAR 0, with its size) from PCI and creating the objects at boot, and the video device on top (`IVideoDecoder` for H.264 and HEVC). That the memory controller lets
+  the engine reach these addresses unchanged (VMID 0, inside the system aperture the firmware set) is the driver's behaviour and has not been seen on the card.
 - **The ring and the messages.** The decode ring is programmed but nothing writes to it. UVD 6 decode messages are the older `ruvd_*` layouts (Mesa `radeon_uvd.c`), not the VCN ones the existing decoders build.
 - Encode rings, medium-grain clock gating, and the 3D side of the card (CP/RLC/SDMA microcode, memory controller and GART, display) are all untouched.
 - Not run on a Vega M.
