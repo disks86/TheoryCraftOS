@@ -27,8 +27,10 @@
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
+#include "WebGl/Accelerator.hpp"
 #include "WebGl/Raster.hpp"
 #include "WebGl/Shader.hpp"
+#include "WebGl/TgsiTranslator.hpp"
 
 namespace webgl {
 
@@ -201,6 +203,19 @@ struct ProgramObj {
   struct Loc { uint32_t leaf, element; };
   List<Loc> locs;
   UniquePointer<shader::Machine> vmach, fmach;   // made when first drawn with
+  // Hardware acceleration (GlAccel.cpp): the TGSI translation and the accelerator's compiled program, made when the program is first drawn with.
+  UniquePointer<TgsiProgram> tgsi;
+  IAccelerator* accel = nullptr;
+  uint32_t accel_program = 0;
+  bool accel_tried = false;
+  ~ProgramObj() { release_accel(); }
+  void release_accel() {
+    if (accel && accel_program) accel->destroy_program(accel_program);
+    accel = nullptr;
+    accel_program = 0;
+    accel_tried = false;
+    tgsi.reset();
+  }
 };
 
 struct VertexAttrib {
@@ -255,6 +270,8 @@ class GlContext final : public shader::ITextureHost {
   GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32_t height, const Attributes& attrs);
   ~GlContext();
   GlContext(const GlContext&) = delete;
+  // True while the default framebuffer is drawn by the 3D hardware (for tests and the browser's status).
+  bool hardware_drawing() const { return hw_valid_ && hw_target_ != 0; }
   GlContext& operator=(const GlContext&) = delete;
 
   bool valid() const { return valid_; }
@@ -571,6 +588,27 @@ class GlContext final : public shader::ITextureHost {
   bool tf_capturing() const { return tf_active_; }
   bool tf_active_ = false;
   void tf_capture(const ProgramObj& p, const uint32_t* priv);
+
+  // --- 3D hardware (GlAccel.cpp). Only the default framebuffer is drawn by the accelerator; hw_target_ holds its picture on the device.
+  // hw_valid_: the device picture is right, so the next accelerated draw may build on it. hw_ahead_: it is also newer than def_color_, which hw_sync() then updates.
+  // Anything on the CPU that writes def_color_ goes through hw_cpu_write() first (read the device picture back, then the device picture is out of date).
+  IAccelerator* hw_owner_ = nullptr;
+  uint32_t hw_target_ = 0;
+  bool hw_valid_ = false;
+  bool hw_ahead_ = false;
+  void hw_drop();
+  void hw_sync();
+  void hw_cpu_write() { hw_sync(); hw_valid_ = false; }
+  void hw_after_clear(uint32_t mask, bool whole);
+  bool hw_target(IAccelerator* acc);
+  bool hw_program(ProgramObj& p, IAccelerator& acc);
+  bool hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int32_t first, int32_t count, uint32_t index_type, const uint8_t* idx, bool indexed, int32_t instances);
 };
+
+// Vertex fetch shared by the software and accelerated draws (GlDraw.cpp): the four float lanes (as bit patterns, missing ones 0, 0, 0, 1) of the attribute element at
+// `element`, its size in bytes, and an index of a given GL type read from `p`.
+void read_vertex_attrib(const VertexAttrib& at, const uint8_t* element, uint32_t out[4]);
+uint32_t vertex_attrib_element_bytes(const VertexAttrib& at);
+uint32_t read_index_value(const uint8_t* p, uint32_t type);
 
 }  // namespace webgl

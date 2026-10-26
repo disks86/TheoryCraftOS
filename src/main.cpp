@@ -38,7 +38,9 @@
 #include "SystemWirelessDetails.hpp"
 #include "BootLog.hpp"
 #include "Desktop/Desktop.hpp"
+#include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/SystemGraphics.hpp"
+#include "WebGl/Accelerator.hpp"
 #include "Hardware/ImageSignalProcessor/SystemImageSignalProcessor.hpp"
 #include "Hardware/NeuralProcessingUnit/SystemNeuralProcessingUnit.hpp"
 #include "Hardware/NetworkInterface/SystemNetworkInterfaces.hpp"
@@ -470,13 +472,16 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 
   // 2D and 3D rendering: the GPU's 3D engine where we can drive it, the software renderer otherwise.
   graphics::SystemGraphics system_graphics(system_gpu, shared_allocator);
+  // WebGL and WebGPU draw on the 3D hardware when there is some (and on the CPU rasterizer in src/WebGl when there is not, or for a draw the hardware cannot do).
+  graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
+  if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);
   if (gpu) {
     graphics::IRenderer2D* renderer = system_graphics.renderer_2d();
     if (!renderer) {
       Entry(Level::Fault, "Graphics").text("no memory for a 2D renderer");
     } else {
       Entry(Level::Ok, "Graphics").text("3D: ").text(system_graphics.device().info().name)
-          .text(system_graphics.accelerated() ? " (GPU accelerated)" : " (software)").text(", 2D: ").text(renderer->name())
+          .text(system_graphics.accelerated() ? " (GPU accelerated)" : " (software)").text(", WebGL/WebGPU: ").text(system_graphics.accelerated() ? "GPU accelerated, CPU for what the GPU cannot draw" : "software").text(", 2D: ").text(renderer->name())
           .text(renderer->accelerated() ? " (GPU accelerated)" : " (software)");
       if (!system_graphics.accelerated())
         Entry(system_gpu.virtio_gpu() || system_gpu.vmware_gpu() ? Level::Warning : Level::Info, "Graphics").text("no 3D acceleration: ").text(system_graphics.software_reason());

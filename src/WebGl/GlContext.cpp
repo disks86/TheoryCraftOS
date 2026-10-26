@@ -44,7 +44,7 @@ GlContext::GlContext(allocators::IAllocator& a, bool es3, uint32_t width, uint32
   valid_ = def_color_.defined();
 }
 
-GlContext::~GlContext() {}
+GlContext::~GlContext() { hw_drop(); }
 
 void GlContext::restore() { lost_ = false; }
 
@@ -53,6 +53,7 @@ void GlContext::resize(uint32_t w, uint32_t h) {
   if (h == 0) h = 1;
   if (w > 8192) w = 8192;
   if (h > 8192) h = 8192;
+  hw_drop();   // a resized drawing buffer starts over
   width_ = w;
   height_ = h;
   const bool had_vp = vp_[2] != 0;

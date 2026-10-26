@@ -62,6 +62,12 @@ SystemGraphics::SystemGraphics(hardware::SystemGpu& gpu, allocators::IAllocator&
     reason_text_.append(display_ ? display_->name() : "none");
     reason_ = reason_text_.c_str();
   }
+  if (gpu_device_) {
+    raw_device_ = gpu_device_;
+    locked_ = new (locked_storage_) LockedDevice(*raw_device_);
+    gpu_device_ = locked_;
+    active_ = locked_;
+  }
 }
 
 IRenderer2D* SystemGraphics::renderer_2d() {
@@ -117,9 +123,10 @@ SystemGraphics::~SystemGraphics() {
     device_2d_->~DeviceRenderer2D();
     allocator_.deallocate(device_2d_);
   }
-  if (gpu_device_) {
-    if (svga_) static_cast<SvgaDevice*>(gpu_device_)->~SvgaDevice();
-    else static_cast<VirglDevice*>(gpu_device_)->~VirglDevice();
+  if (locked_) locked_->~LockedDevice();
+  if (raw_device_) {
+    if (svga_) static_cast<SvgaDevice*>(raw_device_)->~SvgaDevice();
+    else static_cast<VirglDevice*>(raw_device_)->~VirglDevice();
   }
 }
 

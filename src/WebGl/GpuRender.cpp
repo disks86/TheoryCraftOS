@@ -422,6 +422,9 @@ bool view_image_for_pass(Device& d, const TextureView* v, Image** img, uint32_t*
 }
 }  // namespace
 
+void decode_vertex_attribute(uint8_t fmt, const uint8_t* p, uint32_t lanes[4], bool* ints) { decode_vertex(fmt, p, lanes, ints); }
+uint32_t vertex_attribute_bytes(uint8_t fmt) { return vertex_size(fmt); }
+
 bool Device::begin_render_pass(const RenderPassDesc& d) {
   if (pass_) return fail("a pass is already open");
   UniquePointer<Target> unused;
@@ -481,11 +484,13 @@ bool Device::begin_render_pass(const RenderPassDesc& d) {
         }
     }
   }
+  hw_begin(d);
   return true;
 }
 
 // The attachments are resolved when a draw happens (the views are stable); the clears happen here, so begin one step later.
 bool Device::end_render_pass() {
+  hw_end();
   pass_ = 0;
   pass_desc_ = nullptr;
   // resolve targets: copy the (single-sampled) attachment over
@@ -760,6 +765,11 @@ bool Device::draw_primitives(uint32_t count, uint32_t first, int32_t base_vertex
   if (pass_ != 1 || !pass_storage_) return fail("draw outside a render pass");
   if (!cur_pipeline_ || cur_pipeline_ > rps_.count()) return fail("no render pipeline set");
   RenderPipeline& rp = *rps_[cur_pipeline_ - 1];
+  if (hw_pass_) {
+    if (hw_draw(rp, count, first, base_vertex, instances, first_instance, indexed)) return true;
+    hw_sync();   // the hardware cannot take this draw: the texture gets the picture so far and the rest of the pass is the CPU's
+    hw_pass_ = false;
+  }
   // resolve the attachments
   Target tg;
   const RenderPassDesc& pd = *pass_storage_;

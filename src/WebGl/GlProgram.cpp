@@ -216,6 +216,7 @@ void GlContext::link_program(uint32_t id) {
   p->outputs.clear();
   p->nvar = 0;
   p->vmach.reset();
+  p->release_accel();
   p->fmach.reset();
   ShaderObj* vs = shader_at(p->vs);
   ShaderObj* fs = shader_at(p->fs);

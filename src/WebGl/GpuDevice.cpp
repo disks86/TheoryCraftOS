@@ -297,7 +297,7 @@ void write_decoded(const FormatDesc& f, const uint8_t* p, uint8_t aspect, Image&
 Device::Device(allocators::IAllocator& a)
     : error(a), a_(a), buffers_(a), textures_(a), views_(a), samplers_(a), modules_(a), bgls_(a), pls_(a), groups_(a), rps_(a), cps_(a), query_sets_(a), dyn_all_(a), bound_(a) {}
 
-Device::~Device() {}
+Device::~Device() { hw_release(); }
 
 uint32_t Device::create_buffer(uint64_t size, uint32_t usage) {
   if (size > (256ull << 20)) { fail("buffer too large"); return 0; }

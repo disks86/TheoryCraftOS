@@ -283,6 +283,10 @@ add_executable(BOOTX64
   src/WebGl/GpuDevice.cpp
   src/WebGl/GpuRender.cpp
   src/WebGl/Raster.cpp
+  src/WebGl/Accelerator.cpp
+  src/WebGl/TgsiTranslator.cpp
+  src/WebGl/GlAccel.cpp
+  src/WebGl/GpuAccel.cpp
   src/WebGl/GlContext.cpp
   src/WebGl/GlProgram.cpp
   src/WebGl/GlTexture.cpp
@@ -406,6 +410,7 @@ add_executable(BOOTX64
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp
   src/Graphics/Graphics2D/Device/DeviceRenderer2D.cpp
   src/Graphics/Graphics3D/BuiltinShaders.cpp
+  src/Graphics/Graphics3D/WebGlAccelerator.cpp
   src/Graphics/Graphics3D/Virgl/VirglDevice.cpp
   src/Graphics/Graphics3D/Svga/SvgaDevice.cpp
   src/Graphics/SystemGraphics.cpp
