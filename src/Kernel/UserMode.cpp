@@ -136,12 +136,26 @@ Task* current_task() {
   return t ? static_cast<Task*>(t->user_context) : nullptr;
 }
 
+bool kill_pending(const Task* task) { return __atomic_load_n(&task->kill_requested, __ATOMIC_ACQUIRE); }
+
+// Timer tick in user mode: a program that was told to stop gets its instruction pointer moved to page zero, which is never mapped. Its next step is a page
+// fault, which on_user_fault() recognises as the end the program was asked for.
+void on_user_tick(Frame* frame) {
+  Task* task = current_task();
+  if (task && kill_pending(task)) frame->rip = 0;
+}
+
 // SYSCALL from user mode (the stub made it look like an interrupt): the registers are in the frame.
 Frame* on_syscall(Frame* frame, void*) {
   Task* task = current_task();
   if (!task) panic("system call from a thread that is not a user program", frame);
   process::Process* process = task->program.process();
   irq_enable();      // the frame is saved: the call may take as long as it needs and be preempted
+  if (kill_pending(task)) {
+    task->killed = true;
+    process->terminate(130);
+    exit_thread();
+  }
   process::X86UserRegisters regs;
   regs.rax = frame->rax; regs.rcx = frame->rcx; regs.rdx = frame->rdx; regs.rbx = frame->rbx; regs.rsp = frame->rsp; regs.rbp = frame->rbp;
   regs.rsi = frame->rsi; regs.rdi = frame->rdi; regs.r8 = frame->r8; regs.r9 = frame->r9; regs.r10 = frame->r10; regs.r11 = frame->r11;
@@ -152,6 +166,11 @@ Frame* on_syscall(Frame* frame, void*) {
   const bool fs_changed = process->take_fs_change(&fs), gs_changed = process->take_gs_change(&gs);
   if (fs_changed || gs_changed) set_current_user_bases(fs_changed, fs, gs_changed, gs);      // arch_prctl
   bool alive = !process->exited();
+  if (alive && kill_pending(task)) {      // asked to stop while the call ran (or in it)
+    task->killed = true;
+    process->terminate(130);
+    alive = false;
+  }
   // The call may have changed the memory layout: rebuild the page tables and hand the new ones to this thread and core.
   if (alive) {
     if (!task->tables.sync(task->program.address_space())) {
@@ -171,8 +190,15 @@ Frame* on_syscall(Frame* frame, void*) {
 Frame* on_user_fault(Frame* frame) {
   Task* task = current_task();
   if (!task) panic("fault in user mode on a thread that is not a user program", frame);
+  if (kill_pending(task) && (frame->vector & 0xFF) == 14 && frame->rip == 0) {      // the end on_user_tick() arranged: not a fault of the program's
+    task->killed = true;
+    task->program.process()->terminate(130);
+    irq_enable();
+    exit_thread();
+  }
   task->faulted = true;
   task->fault_vector = frame->vector & 0xFF;
+  task->fault_rip = frame->rip;
   task->fault_address = (frame->vector & 0xFF) == 14 ? read_cr2() : 0;
   console::puts("user program stopped: vector ");
   console::put_hex(task->fault_vector);
@@ -200,8 +226,9 @@ void user_main(void* argument) {
   Frame frame;      // on this stack, which stays untouched until the CPU is in ring 3 (the next entry starts at the top of the stack)
   __asm__ volatile("fxsave %0" : "=m"(frame.fpu));
   frame.r15 = frame.r14 = frame.r13 = frame.r12 = frame.r11 = frame.r10 = frame.r9 = frame.r8 = 0;
-  frame.rdi = frame.rsi = frame.rbp = frame.rbx = frame.rdx = frame.rax = 0;
+  frame.rdi = frame.rsi = frame.rbp = frame.rbx = frame.rax = 0;
   frame.rcx = start.argument;
+  frame.rdx = start.argument2;
   frame.vector = frame.error = 0;
   frame.rip = start.entry;
   frame.cs = kSelectorUserCode;
@@ -252,6 +279,7 @@ bool init(allocators::IAllocator& allocator) {
   g.ranges[g.range_count++] = {address_of(g.idt), kPageSize};
   set_interrupt_handler(kVectorSyscall, on_syscall, nullptr);
   set_user_fault_handler(on_user_fault);
+  set_user_tick_hook(on_user_tick);
 
   // Every online core loads its own tables, from a thread pinned to it.
   uint32_t expected = 0;
@@ -285,6 +313,8 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   if (!task->thread) return UniquePointer<Task>();
   return task;
 }
+
+void request_kill(Task& task) { __atomic_store_n(&task.kill_requested, true, __ATOMIC_RELEASE); }
 
 bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us) {
   if (!task.thread) return false;

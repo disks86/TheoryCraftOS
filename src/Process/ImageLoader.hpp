@@ -54,6 +54,10 @@ LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& s
 // relocation is needed). Imports are not resolved here. On failure `space` may hold part of the image: discard it.
 LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out);
 
+// The mapping step of load_pe() at an address of the caller's choosing, for DLLs too (an entry point is then optional unless `require_entry`). Does not apply
+// relocations or bind imports (see ModuleLoader.hpp). The headers and sections are mapped at base + their RVAs.
+LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out);
+
 constexpr uint64_t kDefaultStackBytes = 8ull << 20;
 // Maps a read-write stack of `size` bytes just under the top of the user space, with an unmapped guard page above it. `*top` is the first address
 // past the stack (the initial stack pointer is below it).

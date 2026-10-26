@@ -33,6 +33,16 @@ struct WindowsStartup {
   uint64_t parameters = 0;          // RTL_USER_PROCESS_PARAMETERS (command line, image path, environment, standard handles)
   uint64_t tls_block = 0;           // this thread's copy of the image's static thread-local data (0 if it has none)
   uint64_t shared_user_data = 0;    // KUSER_SHARED_DATA at its fixed address
+  uint64_t ldr = 0;                 // PEB_LDR_DATA: the module lists (see WindowsModule)
+};
+
+// A module as the loader list (PEB.Ldr) describes it.
+struct WindowsModule {
+  StringView name;                  // the base name ("kernel32.dll"; for the program, its file name)
+  uint64_t base = 0, size = 0;
+  uint64_t entry = 0;               // the entry point address, 0 if none
+  bool main = false;                // the program itself (first in the list; left out of the initialization order)
+  bool in_init_order = true;
 };
 
 struct WindowsStartupInput {
@@ -41,8 +51,12 @@ struct WindowsStartupInput {
   uint64_t stack_top = 0, stack_size = 0;
   StringView image_path;                            // as Windows would show it ("C:\\dir\\program.exe")
   StringView command_line;
+  StringView current_directory = "/";              // the program's current folder as a path in its world ("/work" is C:\\work\\)
   ArrayView<const StringView> environment;          // "NAME=value" each
   uint32_t processor_count = 1;
+  // The loaded modules: the program first, then the libraries in load order. `init_order` lists indexes into `modules` in the order the libraries start in.
+  ArrayView<const WindowsModule> modules;
+  ArrayView<const uint32_t> init_order;
 };
 
 // KUSER_SHARED_DATA is mapped here in every Windows process; programs and ntdll read the version and the processor count from it.

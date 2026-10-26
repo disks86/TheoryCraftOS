@@ -49,6 +49,7 @@
 #include "Desktop/SessionStore.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
+#include "Desktop/ProgramLauncher.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/ComputerManager.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -120,6 +121,8 @@ class Desktop {
   FileExplorer& explorer() { return explorer_; }
   // The filesystem the file explorer browses (nullptr: none). It must outlive the desktop.
   void set_file_system(filesystem::IFileSystem* fs);
+  // What the terminals run programs with (nullptr: they cannot). It must outlive the desktop.
+  void set_program_launcher(IProgramLauncher* launcher);
   Paint& paint() { return paint_; }
   MediaPlayer& media_player() { return media_player_; }
   Graphics3DTest& graphics_test() { return graphics_test_; }
@@ -380,6 +383,7 @@ class Desktop {
   gui::Frame about_;
   gui::Label about_lines_[3];
   filesystem::IFileSystem* fs_ = nullptr;
+  IProgramLauncher* program_launcher_ = nullptr;
   database::DatabaseManager* databases_ = nullptr;
   browser::IPageLoader* page_loader_ = nullptr;
   audio::AudioMixer* media_mixer_ = nullptr;

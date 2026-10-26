@@ -513,6 +513,34 @@ static void test_windows_files() {
   CHECK(read_file(fs, "/Windows/Temp/renamed.txt") == "data" && read_file(fs, "/Windows/Temp/moved.txt") == "<missing>");
   CHECK(rig.call(WindowsSyscallNumber::NtSetInformationFile, o.handle, rig.alloc(16), rename_info, 20 + target.size() * 2, {10}) == 0xC0000035u);      // the name is taken (by itself)
   rig.call(WindowsSyscallNumber::NtClose, o.handle);
+  // NtQueryVolumeInformationFile(FileFsDeviceInformation): a console is FILE_DEVICE_CONSOLE, a file is on a disk.
+  {
+    const uint64_t device = rig.alloc(8), status_block = rig.alloc(16);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, 8, status_block, device, 8, {4}) == 0 && rig.bytes(device, 1)[0] == 0x50);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, 4, status_block, device, 8, {4}) == 0 && rig.bytes(device, 1)[0] == 0x50);
+    NtRig::Opened disk = rig.create("\\??\\C:\\hello.txt", 0x80000000u | 0x100000, 1, 0x60);
+    CHECK(disk.status == 0 && rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, device, 8, {4}) == 0 && rig.bytes(device, 1)[0] == 7);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, device, 4, {4}) == 0xC0000004u);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, disk.handle, status_block, device, 8, {5}) == 0xC0000003u);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, 400, status_block, device, 8, {4}) == 0xC0000008u);
+    rig.call(WindowsSyscallNumber::NtClose, disk.handle);
+  }
+  // A 32-bit argument (ULONG, BOOLEAN) arrives with whatever is in the upper half of its register or stack slot: the services must not look at it.
+  {
+    const uint64_t junk = 0xDEADBEEF00000000ull, status_block = rig.alloc(16), buffer = rig.alloc(256);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryVolumeInformationFile, 8, status_block, buffer, 8 | junk, {4 | junk}) == 0 && rig.bytes(buffer, 1)[0] == 0x50);
+    NtRig::Opened f = rig.create("\\??\\C:\\hello.txt", 0x80000000u | 0x100000, 1, 0x60);
+    CHECK(f.status == 0);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryInformationFile, f.handle, status_block, buffer, 24 | junk, {5 | junk}) == 0 && rig.u64(buffer + 8) == 12);
+    CHECK(rig.call(WindowsSyscallNumber::NtSetInformationFile, f.handle, status_block, rig.offset(3), 8 | junk, {14 | junk}) == 0);
+    uint64_t done = 0;
+    CHECK(rig.read(f.handle, buffer, 4 | junk, 0, &done) == 0 && done == 4 && rig.bytes(buffer, 4) == "dows");
+    rig.call(WindowsSyscallNumber::NtClose, f.handle);
+    NtRig::Opened d = rig.create("\\??\\C:\\", 0x80000000u | 0x100000, 1, 0x21);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryDirectoryFile, d.handle, 0, 0, 0, {status_block, buffer, 256 | junk, 12 | junk, 1 | junk, 0, 1 | junk}) == 0);
+    rig.call(WindowsSyscallNumber::NtClose, d.handle);
+    CHECK(rig.call(WindowsSyscallNumber::NtQueryInformationProcess, ~uint64_t{0}, 26 | junk, buffer, 8 | junk, {0}) == 0);      // ProcessWow64Information
+  }
   // console handles still work through the same services
   CHECK(rig.write(8, "to the console", 0) == 0 && rig.host.out == "to the console");
   CHECK(rig.query(8, info, 40, 4) == 0);

@@ -55,6 +55,14 @@ struct PeImport {
   uint16_t hint = 0;
   uint16_t ordinal = 0;
   bool by_ordinal = false;
+  uint32_t slot_rva = 0;      // where the bound address goes: the import address table entry for this function
+};
+
+// One base relocation: the 32- or 64-bit value at `rva` holds an address that moves with the image.
+constexpr uint8_t kPeRelocationAbsolute = 0, kPeRelocationHighLow = 3, kPeRelocationDir64 = 10;
+struct PeRelocation {
+  uint32_t rva = 0;
+  uint8_t type = 0;
 };
 
 // Reads the headers of a PE/COFF image (PE32 or PE32+): the COFF and optional headers, the data directories, the sections, the export table and the
@@ -62,7 +70,7 @@ struct PeImport {
 // fails; a broken export or import directory (packed or hand-made files) does not fail it but clears directories_ok(). Nothing outside `data` is read.
 class PeFile {
  public:
-  explicit PeFile(allocators::IAllocator& allocator) : allocator_(allocator), sections_(allocator), exports_(allocator), imports_(allocator), export_name_(allocator) {}
+  explicit PeFile(allocators::IAllocator& allocator) : allocator_(allocator), sections_(allocator), exports_(allocator), imports_(allocator), relocations_(allocator), export_name_(allocator) {}
   PeFile(const PeFile&) = delete;
   PeFile& operator=(const PeFile&) = delete;
 
@@ -70,6 +78,7 @@ class PeFile {
   static constexpr uint32_t kMaxDirectories = 16;
   static constexpr uint32_t kMaxEntries = 1u << 16;     // exports, imports of one DLL
   static constexpr uint32_t kMaxDlls = 1u << 12;
+  static constexpr uint32_t kMaxRelocations = 1u << 20;
 
   static bool looks_like_pe(ConstByteView data);        // "MZ" with a "PE\0\0" where the DOS header points
   bool parse(ConstByteView data);
@@ -97,11 +106,15 @@ class PeFile {
   const List<PeSection>& sections() const { return sections_; }
   const List<PeExport>& exports() const { return exports_; }
   const List<PeImport>& imports() const { return imports_; }
+  // The base relocations (padding entries left out), in file order. Empty when the image has none or its table is damaged (relocations_ok()).
+  const List<PeRelocation>& relocations() const { return relocations_; }
+  bool relocations_ok() const { return relocations_ok_; }
   StringView export_dll_name() const { return export_name_.view(); }
   bool directories_ok() const { return directories_ok_; }
 
   const PeSection* find_section(StringView name) const;
   const PeExport* find_export(StringView name) const;
+  const PeExport* find_export_by_ordinal(uint32_t ordinal) const;
   // The file offset of a relative virtual address; false if it is in no section (or past the raw data of one).
   bool rva_to_offset(uint32_t rva, uint64_t* offset) const;
 
@@ -109,6 +122,7 @@ class PeFile {
   bool parse_all(ConstByteView file);
   bool parse_exports(ConstByteView file);
   bool parse_imports(ConstByteView file);
+  bool parse_relocations(ConstByteView file);
   bool read_string_at(ConstByteView file, uint32_t rva, String* out) const;
 
   allocators::IAllocator& allocator_;
@@ -120,9 +134,11 @@ class PeFile {
   uint32_t directory_rva_[kMaxDirectories] = {};
   uint32_t directory_size_[kMaxDirectories] = {};
   bool directories_ok_ = true;
+  bool relocations_ok_ = true;
   List<PeSection> sections_;
   List<PeExport> exports_;
   List<PeImport> imports_;
+  List<PeRelocation> relocations_;
   String export_name_;
 };
 

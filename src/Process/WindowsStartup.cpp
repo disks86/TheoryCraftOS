@@ -66,7 +66,17 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
 
   // --- the text, as UTF-16, and its sizes
   ByteBuffer image_path(allocator), command_line(allocator), environment(allocator), directory(allocator);
-  if (!utf16(input.image_path, &image_path) || !utf16(input.command_line, &command_line) || !utf16("C:\\", &directory)) return LoadStatus::Malformed;
+  if (!utf16(input.image_path, &image_path) || !utf16(input.command_line, &command_line) || !utf16("C:", &directory)) return LoadStatus::Malformed;
+  {
+    // C:\dir\ : the folder with backslashes and a trailing one.
+    if (input.current_directory.size() > 1) {
+      for (char c : input.current_directory) {
+        const char converted = c == '/' ? '\\' : c;
+        if (!utf16(StringView(&converted, 1), &directory)) return LoadStatus::Malformed;
+      }
+    }
+    if (!utf16("\\", &directory)) return LoadStatus::Malformed;
+  }
   for (const StringView& entry : input.environment) {
     if (!utf16(entry, &environment) || !environment.put16(0)) return LoadStatus::Malformed;
   }
@@ -94,10 +104,15 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   uint64_t parameters_bytes = 0, tls_bytes = 0, total = 0;
   if (strings_bytes > kMaxStartupBytes || !AddressSpace::round_up(strings_at + strings_bytes, &parameters_bytes)) return LoadStatus::Malformed;
   if (!AddressSpace::round_up(tls_size ? 16 + tls_size : 0, &tls_bytes)) return LoadStatus::Malformed;
-  total = kPebSize + kTebSize + parameters_bytes + tls_bytes;
+  // The loader lists: PEB_LDR_DATA, and per module a LDR_DATA_TABLE_ENTRY with its two names.
+  constexpr uint64_t kLdrHeader = 0x60, kEntrySize = 0x140, kPerModule = 1024;
+  if (input.modules.size() > 64) return LoadStatus::Malformed;
+  uint64_t ldr_bytes = 0;
+  if (!input.modules.empty() && !AddressSpace::round_up(kLdrHeader + input.modules.size() * kPerModule, &ldr_bytes)) return LoadStatus::Malformed;
+  total = kPebSize + kTebSize + parameters_bytes + tls_bytes + ldr_bytes;
   uint64_t base = 0;
   if (!space.find_free(total, kPlacementHint, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
-  const uint64_t peb = base, teb = base + kPebSize, parameters = teb + kTebSize, tls_area = parameters + parameters_bytes;
+  const uint64_t peb = base, teb = base + kPebSize, parameters = teb + kTebSize, tls_area = parameters + parameters_bytes, ldr = tls_area + tls_bytes;
   const uint64_t tls_block = tls_size ? tls_area + 16 : 0;
 
   Writer w(space);
@@ -155,6 +170,59 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
     }
     if (tls_index_at != 0) w.u32(tls_index_at, 0);      // _tls_index = 0 (the memory is the program's own writable data)
   }
+  // --- the loader lists
+  if (!input.modules.empty()) {
+    const uint64_t count = input.modules.size();
+    // LIST_ENTRY heads at ldr + 0x10 (load order), 0x20 (memory order, the same here), 0x30 (initialization order).
+    w.u32(ldr + 0x00, 0x58);                           // Length
+    w.u8(ldr + 0x04, 1);                               // Initialized
+    auto entry_at = [&](uint64_t i) { return ldr + kLdrHeader + i * kPerModule; };
+    // The three chains: a list of entry addresses through the link at `link_offset` of each, closed on the head.
+    auto chain = [&](uint64_t head, uint64_t link_offset, const uint64_t* members, uint64_t n) {
+      uint64_t previous = head;
+      for (uint64_t k = 0; k < n; ++k) {
+        const uint64_t link = entry_at(members[k]) + link_offset;
+        w.u64(previous, link);                         // previous.Flink = this
+        w.u64(link + 8, previous);                     // this.Blink = previous
+        previous = link;
+      }
+      w.u64(previous, head);                           // last.Flink = head
+      w.u64(head + 8, previous);                       // head.Blink = last
+    };
+    uint64_t all[64], init[64], init_count = 0;
+    for (uint64_t i = 0; i < count; ++i) all[i] = i;
+    for (uint32_t index : input.init_order) {
+      if (index >= count || init_count >= 64) return LoadStatus::Malformed;
+      init[init_count++] = index;
+    }
+    chain(ldr + 0x10, 0x00, all, count);
+    chain(ldr + 0x20, 0x10, all, count);
+    chain(ldr + 0x30, 0x20, init, init_count);
+    for (uint64_t i = 0; i < count; ++i) {
+      const WindowsModule& m = input.modules[i];
+      if (m.name.size() > 100) return LoadStatus::Malformed;
+      const uint64_t entry = entry_at(i);
+      ByteBuffer base_name(allocator), full_name(allocator);
+      if (!utf16(m.name, &base_name)) return LoadStatus::Malformed;
+      if (m.main) {
+        if (!utf16(input.image_path, &full_name)) return LoadStatus::Malformed;
+      } else if (!utf16("C:\\Windows\\System32\\", &full_name) || !utf16(m.name, &full_name)) {
+        return LoadStatus::Malformed;
+      }
+      if (base_name.size() + full_name.size() + 8 > kPerModule - kEntrySize) return LoadStatus::Malformed;
+      const uint64_t strings = entry + kEntrySize;
+      w.bytes(strings, base_name.view());
+      w.bytes(strings + base_name.size() + 2, full_name.view());
+      w.u64(entry + 0x30, m.base);                     // DllBase
+      w.u64(entry + 0x38, m.entry);                    // EntryPoint
+      w.u32(entry + 0x40, uint32_t(m.size));           // SizeOfImage
+      w.unicode_string(entry + 0x48, strings + base_name.size() + 2, full_name.size(), full_name.size() + 2);      // FullDllName
+      w.unicode_string(entry + 0x58, strings, base_name.size(), base_name.size() + 2);                               // BaseDllName
+      w.u32(entry + 0x68, m.main ? 0x20 : 0x4);        // Flags: LDRP_IMAGE_DLL
+      w.u16(entry + 0x6C, 0xFFFF);                     // LoadCount: static
+    }
+    w.u64(peb + 0x18, ldr);                            // PEB.Ldr
+  }
   if (!w.ok()) return LoadStatus::Malformed;
 
   // --- KUSER_SHARED_DATA
@@ -175,6 +243,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   out->parameters = parameters;
   out->tls_block = tls_block;
   out->shared_user_data = kSharedUserDataAddress;
+  out->ldr = input.modules.empty() ? 0 : ldr;
   return LoadStatus::Ok;
 }
 

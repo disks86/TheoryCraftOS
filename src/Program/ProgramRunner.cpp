@@ -15,14 +15,15 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-#include "Desktop/ProgramRunner.hpp"
-#include "Desktop/ProgramHost.hpp"
+#include "Program/ProgramRunner.hpp"
+#include "Program/ProgramHost.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Sync.hpp"
 #include "Process/ProgramEnvironment.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/UserProgram.hpp"
 #include "Utility/ByteBuffer.hpp"
+#include "Windows/BuiltinLibraries.hpp"
 
 #if defined(__x86_64__)
 #include "Kernel/UserMode.hpp"
@@ -131,7 +132,9 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
     argv[argc++] = argument;
   }
 
-  ProgramHost host(allocator);
+  ProgramHost own_host(allocator);
+  ProgramHost& host = run.host ? *run.host : own_host;
+  if (!run.host) host.close_input();
   uint8_t random[16];
   if (!host.random_bytes(ByteView(random, sizeof(random)))) {      // (no hardware generator: the stack protector's canary is only as good as this)
     uint64_t t = hardware::read_tsc();
@@ -148,13 +151,22 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   process::UserProgram program(allocator, id, host);
   program.address_space().set_reserved(kernel::usermode::reserved_ranges());
   program.set_file_system(run.files);
+  windows::BuiltinLibraries builtin;      // ntdll.dll and kernel32.dll; further DLLs come from C:\Windows\System32
+  process::FileLibraryProvider on_disk(allocator, run.files);
+  process::ChainedLibraryProvider libraries(&builtin, &on_disk);
+  if (abi == process::SyscallAbi::Windows) program.set_library_provider(&libraries);
+  String directory(allocator);
+  if (process::world_directory(abi, run.working_directory, &directory)) program.set_working_directory(directory.view());
   const process::LoadStatus status = program.load(image.view(), ArrayView<const StringView>(argv, argc), process::default_environment(abi), ConstByteView(random, sizeof(random)));
   if (status != process::LoadStatus::Ok) {
     fail(message, load_failure(status));
+    if (!program.load_detail().empty()) {
+      message->append(" (");
+      message->append(program.load_detail());
+      message->append(")");
+    }
     return RunResult::CouldNotRun;
   }
-  String directory(allocator);
-  if (process::world_directory(abi, run.working_directory, &directory)) program.process()->files().change_directory(directory.view());
 
   UniquePointer<kernel::usermode::Task> task = kernel::usermode::spawn(program, allocator, "program");
   if (!task) {
@@ -162,7 +174,16 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
     return RunResult::CouldNotRun;
   }
   uint32_t code = 0;
-  while (!kernel::usermode::wait(*task, &code, 20000)) pass_on_output(host, run, allocator);
+  bool kill_sent = false;
+  host.set_interrupt_callback([](void* t) { kernel::usermode::request_kill(*static_cast<kernel::usermode::Task*>(t)); }, task.get());
+  while (!kernel::usermode::wait(*task, &code, 20000)) {
+    pass_on_output(host, run, allocator);
+    if (host.interrupted() && !kill_sent) {
+      kernel::usermode::request_kill(*task);
+      kill_sent = true;
+    }
+  }
+  host.set_interrupt_callback(nullptr, nullptr);
   pass_on_output(host, run, allocator);
   *exit_code = code;
 
@@ -175,8 +196,17 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
     if (!message->empty()) message->append("; ");
     message->append("some of its output was dropped");
   }
+  if (task->killed) return RunResult::Interrupted;
   if (task->faulted) {
     String text(allocator);
+    String import_name(allocator);
+    if (task->fault_vector == 6 && program.describe_missing_import(task->fault_rip, &import_name)) {
+      text.assign("the program called ");
+      text.append(import_name.view());
+      text.append(", which this OS does not provide");
+      message->assign(text.view());
+      return RunResult::Faulted;
+    }
     text.assign("stopped by the processor: ");
     text.append(fault_name(task->fault_vector));
     if (task->fault_vector == 14) {
@@ -204,5 +234,51 @@ RunResult run_program(const ProgramRun&, uint32_t* exit_code, String* message) {
 }
 
 #endif
+
+namespace {
+
+// The terminal's way into the program's console.
+class HostControl final : public IProgramControl {
+ public:
+  explicit HostControl(ProgramHost& host) : host_(host) {}
+  void send_input(StringView text) override { host_.push_input(text); }
+  void end_input() override { host_.close_input(); }
+  void interrupt() override { host_.interrupt(); }
+
+ private:
+  ProgramHost& host_;
+};
+
+void forward_output(void* sink, StringView text) { static_cast<IProgramSink*>(sink)->program_output(text); }
+
+}  // namespace
+
+void KernelProgramLauncher::run(const ProgramLaunch& launch, IProgramSink& sink, ProgramOutcome* outcome) {
+  ProgramHost host(allocator_);
+  HostControl control(host);
+  ProgramRun run;
+  run.allocator = &allocator_;
+  run.files = launch.files;
+  run.path = launch.path;
+  run.working_directory = launch.working_directory;
+  run.arguments = launch.arguments;
+  run.kind = launch.kind;
+  run.output = &forward_output;
+  run.context = &sink;
+  run.host = &host;
+  uint32_t code = 0;
+  String message(allocator_);
+  sink.program_started(&control);
+  const RunResult result = run_program(run, &code, &message);
+  sink.program_ended();
+  outcome->exit_code = code;
+  outcome->message.assign(message.view().first(message.size() < 255 ? message.size() : 255));
+  switch (result) {
+    case RunResult::Exited: outcome->kind = ProgramOutcome::Kind::Exited; break;
+    case RunResult::Faulted: outcome->kind = ProgramOutcome::Kind::Faulted; break;
+    case RunResult::Interrupted: outcome->kind = ProgramOutcome::Kind::Interrupted; break;
+    case RunResult::CouldNotRun: outcome->kind = ProgramOutcome::Kind::CouldNotRun; break;
+  }
+}
 
 }  // namespace desktop

@@ -53,6 +53,11 @@ void set_current_user_context(uint64_t cr3, void* context);
 // Changes the FS and/or GS base the calling user thread will return to ring 3 with (and keeps them for later switches).
 void set_current_user_bases(bool set_fs, uint64_t fs, bool set_gs, uint64_t gs);
 
+// Called on every timer tick that interrupted user mode, with the interrupted frame, which it may change (the user-mode module uses it to stop a program that
+// was asked to end while it was running).
+using UserTickHook = void (*)(Frame* frame);
+void set_user_tick_hook(UserTickHook hook);
+
 // Called on exceptions taken in user mode (instead of the kernel panic).
 using UserFaultHandler = Frame* (*)(Frame* frame);
 void set_user_fault_handler(UserFaultHandler handler);

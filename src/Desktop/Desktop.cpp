@@ -231,6 +231,14 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
   file_dialog_.set_file_system(fs);
 }
 
+void Desktop::set_program_launcher(IProgramLauncher* launcher) {
+  window_.locked([&] {
+    program_launcher_ = launcher;
+    terminal_.set_program_launcher(launcher);
+    for (auto& t : extra_terminals_) t->set_program_launcher(launcher);
+  });
+}
+
 void Desktop::setup_explorer(FileExplorer& explorer) {
   explorer.set_app_kind(kAppExplorer);
   explorer.set_notices(&notice_dialog_);
@@ -338,6 +346,7 @@ void Desktop::setup_terminal(Terminal& terminal) {
   terminal.set_file_dialog(&file_dialog_);
   terminal.on_new_terminal({&Desktop::on_new_terminal, this});
   terminal.on_open_path({&Desktop::on_terminal_path, this});
+  terminal.set_program_launcher(program_launcher_);
   terminal.set_file_system(fs_);
 }
 

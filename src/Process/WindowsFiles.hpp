@@ -37,5 +37,6 @@ uint32_t nt_query_directory_file(Process& p, const SyscallRequest& r);
 uint32_t nt_query_attributes_file(Process& p, const SyscallRequest& r);
 uint32_t nt_delete_file(Process& p, const SyscallRequest& r);
 uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r);
+uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r);
 
 }  // namespace process::windowsabi

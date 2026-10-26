@@ -560,13 +560,14 @@ add_executable(BOOTX64
   src/Process/UserProgram.cpp
   src/Process/UserPageTables.cpp
   src/Process/WindowsStartup.cpp
+  src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp
   src/Process/ProgramEnvironment.cpp
-  src/Desktop/ProgramHost.cpp
-  src/Desktop/ProgramRunner.cpp
+  src/Program/ProgramHost.cpp
+  src/Program/ProgramRunner.cpp
   src/Process/WindowsSyscalls.cpp
   src/Media/Dash.cpp
   src/Media/DashClient.cpp
@@ -703,6 +704,33 @@ option(TCOS_USERMODE_DEMO "Run two small programs in ring 3 at boot (x86-64)" OF
 if(TCOS_USERMODE_DEMO)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO)
 endif()
+# ntdll.dll and kernel32.dll for Windows programs (src/Windows): freestanding DLLs built with the same mingw compiler, carried in the image (.incbin) and mapped into
+# each Windows process by the kernel. kernel32.dll is linked against ntdll's import library, as a real one would be.
+if(TCOS_ARCH STREQUAL "x86_64")
+  set(WINDOWS_DIR ${CMAKE_BINARY_DIR}/windows)
+  set(WINDOWS_DLL_FLAGS -O2 -Wall -Wextra -Wno-unused-parameter -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector
+      -fno-asynchronous-unwind-tables -nostdlib -shared -Wl,--entry=DllMain)
+  file(GLOB WINDOWS_HEADERS ${CMAKE_SOURCE_DIR}/src/Windows/*.h)
+  add_custom_command(OUTPUT ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/libntdll.a
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180000000 -Wl,--out-implib=${WINDOWS_DIR}/libntdll.a
+            -o ${WINDOWS_DIR}/ntdll.dll ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/ntdll.c ${WINDOWS_HEADERS}
+    COMMENT "Building ntdll.dll")
+  add_custom_command(OUTPUT ${WINDOWS_DIR}/kernel32.dll
+    COMMAND ${CMAKE_C_COMPILER} ${WINDOWS_DLL_FLAGS} -Wl,--image-base=0x180200000 -o ${WINDOWS_DIR}/kernel32.dll
+            ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${WINDOWS_DIR}/libntdll.a
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/kernel32.c ${WINDOWS_DIR}/libntdll.a ${WINDOWS_HEADERS}
+    COMMENT "Building kernel32.dll")
+  file(WRITE ${WINDOWS_DIR}/libraries.S
+    ".section .rdata,\"dr\"\n.balign 16\n"
+    ".global tcos_ntdll_dll\ntcos_ntdll_dll:\n.incbin \"${WINDOWS_DIR}/ntdll.dll\"\n.global tcos_ntdll_dll_end\ntcos_ntdll_dll_end:\n.balign 16\n"
+    ".global tcos_kernel32_dll\ntcos_kernel32_dll:\n.incbin \"${WINDOWS_DIR}/kernel32.dll\"\n.global tcos_kernel32_dll_end\ntcos_kernel32_dll_end:\n")
+  target_sources(BOOTX64 PRIVATE ${WINDOWS_DIR}/libraries.S src/Windows/BuiltinLibraries.cpp)
+  set_source_files_properties(${WINDOWS_DIR}/libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DIR}/ntdll.dll;${WINDOWS_DIR}/kernel32.dll")
+  add_custom_target(windows_dlls DEPENDS ${WINDOWS_DIR}/ntdll.dll ${WINDOWS_DIR}/kernel32.dll)
+endif()
+
 # An extra program for the demo to run (a static Linux x86-64 ELF, say a C program built with `gcc -static -no-pie`); its output and exit code are logged.
 set(TCOS_USERMODE_DEMO_PROGRAM "" CACHE FILEPATH "An ELF or PE program the user-mode demo also runs")
 if(TCOS_USERMODE_DEMO AND TCOS_USERMODE_DEMO_PROGRAM)

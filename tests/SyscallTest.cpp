@@ -363,6 +363,44 @@ static void test_isolation() {
   CHECK(sres(none.syscall(req(1))) == -38);
 }
 
+// ntdll.dll's C code (src/Windows/tcos_syscalls.h) and the kernel (WindowsSyscallNumber) must number the services alike.
+static void test_service_numbers_agree() {
+  struct Pair { const char* name; WindowsSyscallNumber number; };
+  const Pair table[] = {
+      {"NtReadFile", WindowsSyscallNumber::NtReadFile}, {"NtWriteFile", WindowsSyscallNumber::NtWriteFile}, {"NtClose", WindowsSyscallNumber::NtClose},
+      {"NtTerminateProcess", WindowsSyscallNumber::NtTerminateProcess}, {"NtYieldExecution", WindowsSyscallNumber::NtYieldExecution},
+      {"NtDelayExecution", WindowsSyscallNumber::NtDelayExecution}, {"NtQuerySystemTime", WindowsSyscallNumber::NtQuerySystemTime},
+      {"NtAllocateVirtualMemory", WindowsSyscallNumber::NtAllocateVirtualMemory}, {"NtFreeVirtualMemory", WindowsSyscallNumber::NtFreeVirtualMemory},
+      {"NtProtectVirtualMemory", WindowsSyscallNumber::NtProtectVirtualMemory}, {"NtCreateFile", WindowsSyscallNumber::NtCreateFile},
+      {"NtOpenFile", WindowsSyscallNumber::NtOpenFile}, {"NtQueryInformationFile", WindowsSyscallNumber::NtQueryInformationFile},
+      {"NtSetInformationFile", WindowsSyscallNumber::NtSetInformationFile}, {"NtQueryDirectoryFile", WindowsSyscallNumber::NtQueryDirectoryFile},
+      {"NtQueryAttributesFile", WindowsSyscallNumber::NtQueryAttributesFile}, {"NtDeleteFile", WindowsSyscallNumber::NtDeleteFile},
+      {"NtFlushBuffersFile", WindowsSyscallNumber::NtFlushBuffersFile}, {"NtQueryVolumeInformationFile", WindowsSyscallNumber::NtQueryVolumeInformationFile},
+      {"NtQueryPerformanceCounter", WindowsSyscallNumber::NtQueryPerformanceCounter}, {"NtQueryVirtualMemory", WindowsSyscallNumber::NtQueryVirtualMemory},
+      {"NtQueryInformationProcess", WindowsSyscallNumber::NtQueryInformationProcess},
+  };
+  FILE* header = fopen("src/Windows/tcos_syscalls.h", "r");
+  CHECK(header != nullptr);
+  if (!header) return;
+  char line[256];
+  size_t found = 0;
+  while (fgets(line, sizeof(line), header)) {
+    char name[96];
+    unsigned number;
+    if (sscanf(line, "#define NT_SERVICE_%95s %u", name, &number) != 2) continue;
+    bool known = false;
+    for (const Pair& pair : table) {
+      if (std::string(pair.name) != name) continue;
+      known = true;
+      ++found;
+      CHECK(uint32_t(pair.number) == number);
+    }
+    CHECK(known);      // a service in the header that the kernel does not list here
+  }
+  fclose(header);
+  CHECK(found == sizeof(table) / sizeof(table[0]));
+}
+
 int main() {
   test_selection();
   test_decode();
@@ -370,6 +408,7 @@ int main() {
   test_linux_generic_table();
   test_windows();
   test_isolation();
+  test_service_numbers_agree();
   CHECK(A.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/ImageLoader.hpp"
+#include "Process/ModuleLoader.hpp"
 #include "Process/Process.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/StringView.hpp"
@@ -32,7 +33,8 @@ struct ProgramStart {
   UserArch arch = UserArch::None;
   uint64_t entry = 0;
   uint64_t stack_pointer = 0;
-  uint64_t argument = 0;      // first argument register (Windows: the PEB, as the NT process start passes it)
+  uint64_t argument = 0;      // first argument register (Windows without libraries: the PEB; with them, the program's entry point for RtlUserThreadStart)
+  uint64_t argument2 = 0;     // second argument register (Windows with libraries: the PEB)
   uint64_t fs_base = 0;       // thread pointers the thread starts with (Windows: gs_base is the TEB)
   uint64_t gs_base = 0;
 };
@@ -46,13 +48,24 @@ struct ProgramStart {
 class UserProgram {
  public:
   UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = 256ull << 20)
-      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit) {}
+      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator) {}
   UserProgram(const UserProgram&) = delete;
   UserProgram& operator=(const UserProgram&) = delete;
 
   // The OS file system the program's tree lives in ("/Linux" for a Linux program, "/Windows" for a Windows one). Set before load(); without it the program
   // has no files. The file system must outlive the program.
   void set_file_system(filesystem::IFileSystem* fs) { files_ = fs; }
+
+  // Where the DLLs a Windows program imports come from (nullptr: none, a program with imports is then refused). Set before load(). It must outlive the program.
+  void set_library_provider(ILibraryProvider* provider) { libraries_ = provider; }
+  // The program's current folder, as a path inside its world ("/" or "/home/me", also for a Windows program: C:\home\me). Set before load().
+  void set_working_directory(StringView path) { working_directory_.assign(path); }
+
+  // Why load() failed, when it can say more than the status ("kernel32.dll is not a 64-bit x86 DLL"); empty otherwise.
+  StringView load_detail() const { return detail_.view(); }
+  // A call into an import that nothing provides ends in a stub: which import was it ("KERNEL32.dll!Foo")? False if `address` is not in a stub.
+  bool describe_missing_import(uint64_t address, String* out) const { return modules_ && modules_->describe_missing(address, out); }
+  const ModuleSet* modules() const { return modules_.get(); }
 
   // `random` is the 16 bytes of AT_RANDOM. Call once; on failure the program is unusable (create another).
   LoadStatus load(ConstByteView file, ArrayView<const StringView> arguments, ArrayView<const StringView> environment, ConstByteView random);
@@ -69,6 +82,9 @@ class UserProgram {
   IProcessHost& host_;
   AddressSpace space_;
   filesystem::IFileSystem* files_ = nullptr;
+  ILibraryProvider* libraries_ = nullptr;
+  UniquePointer<ModuleSet> modules_;
+  String detail_, working_directory_;
   UniquePointer<Process> process_;
   ProgramStart start_;
   LoadedImage image_;

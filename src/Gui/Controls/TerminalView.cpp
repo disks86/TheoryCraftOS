@@ -167,6 +167,23 @@ void TerminalView::recall(int32_t direction) {
 
 void TerminalView::submit() {
   UiGuard lock(this);
+  if (redirect_.line) {      // a program is running: the line is its input
+    String line(allocator());
+    line.assign(input_.view());
+    String echo(allocator());
+    echo.append(prompt_.view());
+    echo.append(input_.view());
+    echo.push_back('\n');
+    write(echo.view());
+    input_.clear();
+    caret_ = 0;
+    history_at_ = -1;
+    scrolled_ = 0;
+    invalidate();
+    line.push_back('\n');
+    redirect_.line(redirect_.context, line.view());
+    return;
+  }
   submitted_.assign(input_.view());
   String echo(allocator());
   echo.append(prompt_.view());
@@ -429,6 +446,25 @@ bool TerminalView::on_key(const KeyArgs& args) {
   namespace key = hardware::key;
   const bool ctrl = (args.modifiers & hardware::modifier::kControl) != 0;
   if (ctrl) {
+    {
+      UiGuard lock(this);
+      if (redirect_.interrupt && args.usage == key::kA + 2 && !(args.modifiers & hardware::modifier::kShift)) {      // Ctrl+C while a program runs
+        input_.clear();
+        caret_ = 0;
+        String echo(allocator());
+        echo.append(prompt_.view());
+        echo.append("^C\n");
+        write(echo.view());
+        scrolled_ = 0;
+        invalidate();
+        redirect_.interrupt(redirect_.context);
+        return true;
+      }
+      if (redirect_.end_of_input && args.usage == key::kA + 3) {      // Ctrl+D
+        redirect_.end_of_input(redirect_.context);
+        return true;
+      }
+    }
     switch (args.usage) {
       case key::kA + 21: paste(); return true;                 // Ctrl+V
       case key::kA + 11: clear(); return true;                 // Ctrl+L
