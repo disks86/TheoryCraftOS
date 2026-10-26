@@ -70,6 +70,12 @@ bool ProgramHost::read_console(ByteView out, uint64_t* got) {
   return true;
 }
 
+uint64_t ProgramHost::console_input_available(bool* at_end) {
+  kernel::ScopedMutex lock(mutex_);
+  *at_end = input_.empty() && (input_closed_ || interrupted());
+  return input_.size();
+}
+
 void ProgramHost::push_input(StringView text) {
   {
     kernel::ScopedMutex lock(mutex_);

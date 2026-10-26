@@ -51,6 +51,7 @@ class ProgramHost final : public process::IProcessHost {
   // --- Input and Ctrl+C (any thread)
   // Queues text for the program to read (a line includes its "\n"). Dropped once kMaxInput bytes wait unread.
   void push_input(StringView text);
+  uint64_t console_input_available(bool* at_end) override;
   // The program reads the end of the input once what is queued has been read.
   void close_input();
   // Ctrl+C: asks for the program to be stopped. Reads and sleeps return at once from then on; whoever runs the program ends it (see run_program()).
