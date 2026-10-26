@@ -108,6 +108,16 @@ Process::ThreadRecord* Process::add_thread(uint64_t id) {
   return nullptr;
 }
 
+uint32_t Process::thread_snapshot(uint64_t* ids, uint64_t* starts, int32_t* priorities, uint32_t capacity) const {
+  uint32_t n = 0;
+  for (const ThreadRecord& t : threads_) {
+    if (!t.used || t.finished || n >= capacity) continue;
+    ids[n] = t.id; starts[n] = t.start_address; priorities[n] = t.priority;
+    ++n;
+  }
+  return n;
+}
+
 uint32_t Process::live_threads() const {
   uint32_t n = 0;
   for (const ThreadRecord& t : threads_) if (t.used && !t.finished) ++n;

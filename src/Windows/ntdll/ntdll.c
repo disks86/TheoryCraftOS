@@ -523,13 +523,14 @@ static int heap_add_segment(Heap *h, SIZE_T minimum) {
   segment->next = h->segments;
   h->segments = segment;
   BYTE *start = (BYTE *)(((ULONG_PTR)base + sizeof(Segment) + 15 + 8) & ~15ull) - 8;      /* so that start + 16 is 16-byte aligned */
-  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 16;
+  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 24;      /* (so that end - start is a multiple of 16: the chunks are) */
   Chunk *sentinel = (Chunk *)end;
   sentinel->size_flags = CHUNK_USED;      /* size 0 */
   make_free(h, (Chunk *)start, (ULONGLONG)(end - start), 1);
   return 1;
 }
 
+static void heaps_add(Heap *h);
 static Heap *heap_new(ULONG flags, SIZE_T commit) {
   SIZE_T size = commit < SEGMENT_MIN ? SEGMENT_MIN : commit;
   PVOID base = NULL;
@@ -544,14 +545,24 @@ static Heap *heap_new(ULONG flags, SIZE_T commit) {
   segment->next = NULL;
   h->segments = segment;
   BYTE *start = (BYTE *)(((ULONG_PTR)segment + sizeof(Segment) + 15 + 8) & ~15ull) - 8;
-  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 16;
+  BYTE *end = (BYTE *)(((ULONG_PTR)base + size) & ~15ull) - 24;      /* (so that end - start is a multiple of 16: the chunks are) */
   Chunk *sentinel = (Chunk *)end;
   sentinel->size_flags = CHUNK_USED;
   make_free(h, (Chunk *)start, (ULONGLONG)(end - start), 1);
+  heaps_add(h);
   return h;
 }
 
 static int heap_ok(Heap *h) { return h && h->magic == HEAP_MAGIC; }
+
+/* Every heap of the process, in the order they were made (the process heap first): RtlGetProcessHeaps and the Toolhelp heap lists. */
+#define MAX_HEAPS 128
+static Heap *g_heaps[MAX_HEAPS];
+static volatile LONG g_heaps_lock;
+static void heaps_lock(void) { while (__sync_lock_test_and_set(&g_heaps_lock, 1)) NtYieldExecution(); }
+static void heaps_unlock(void) { __sync_lock_release(&g_heaps_lock); }
+static void heaps_add(Heap *h) { heaps_lock(); for (int i = 0; i < MAX_HEAPS; ++i) if (!g_heaps[i]) { g_heaps[i] = h; break; } heaps_unlock(); }
+static void heaps_remove(Heap *h) { heaps_lock(); for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i] == h) g_heaps[i] = NULL; heaps_unlock(); }
 
 EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T commit, PVOID lock, PVOID parameters) {
   (void)base; (void)reserve; (void)lock; (void)parameters;
@@ -652,6 +663,7 @@ EXPORT PVOID NTAPI RtlDestroyHeap(PVOID heap) {
   Segment *segment = h->segments;
   PVOID first = h;
   h->magic = 0;
+  heaps_remove(h);
   while (segment) {
     Segment *next = segment->next;
     PVOID base = segment->base;
@@ -673,8 +685,44 @@ EXPORT NTSTATUS NTAPI RtlQueryHeapInformation(PVOID heap, ULONG info_class, PVOI
   return STATUS_NOT_IMPLEMENTED;
 }
 EXPORT ULONG NTAPI RtlGetProcessHeaps(ULONG count, PVOID *heaps) {
-  if (count >= 1 && heaps) heaps[0] = NtCurrentPeb()->ProcessHeap;
-  return 1;
+  ULONG n = 0;
+  heaps_lock();
+  for (int i = 0; i < MAX_HEAPS; ++i) if (g_heaps[i]) { if (n < count && heaps) heaps[n] = g_heaps[i]; ++n; }
+  heaps_unlock();
+  return n;
+}
+
+/* RtlWalkHeap(heap, entry): the blocks of a heap one after the other, in the layout of PROCESS_HEAP_ENTRY (lpData NULL starts). */
+typedef struct { PVOID lpData; DWORD cbData; BYTE cbOverhead, iRegionIndex; WORD wFlags; ULONGLONG region[3]; } HeapWalkEntry;
+static Chunk *segment_first_chunk(Segment *s) { return (Chunk *)((BYTE *)(((ULONG_PTR)s + sizeof(Segment) + 15 + 8) & ~15ull) - 8); }
+EXPORT NTSTATUS NTAPI RtlWalkHeap(PVOID heap, PVOID entry) {
+  Heap *h = heap;
+  HeapWalkEntry *e = entry;
+  if (!heap_ok(h) || !e) return STATUS_INVALID_HANDLE;
+  Segment *segments[64];
+  int count = 0;
+  for (Segment *s = h->segments; s && count < 64; s = s->next) segments[count++] = s;
+  NTSTATUS status = 0x8000001A;      /* STATUS_NO_MORE_ENTRIES */
+  heap_lock();
+  int region = 0;
+  Chunk *c = NULL;
+  if (!e->lpData) { if (count > 0) c = segment_first_chunk(segments[0]); }
+  else { region = e->iRegionIndex; c = chunk_next((Chunk *)((BYTE *)e->lpData - 16)); }
+  while (c) {
+    if (CHUNK_SIZE(c) != 0) break;      /* (a segment ends with a chunk of size 0) */
+    if (++region >= count) { c = NULL; break; }
+    c = segment_first_chunk(segments[region]);
+  }
+  if (c) {
+    e->lpData = (BYTE *)c + 16;
+    e->cbData = (DWORD)(CHUNK_SIZE(c) - 8);
+    e->cbOverhead = 8;
+    e->iRegionIndex = (BYTE)region;
+    e->wFlags = (c->size_flags & CHUNK_USED) ? 4 /* PROCESS_HEAP_ENTRY_BUSY */ : 0;
+    status = STATUS_SUCCESS;
+  }
+  heap_unlock();
+  return status;
 }
 
 static PVOID process_heap(void) {
