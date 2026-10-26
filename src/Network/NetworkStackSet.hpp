@@ -23,6 +23,18 @@
 
 namespace network {
 
+// What a Windows socket (src/Process/Sockets.hpp) needs of a set of network stacks: how many there are, and each one's interface - not NetworkStackSet itself, so that
+// something with its own stacks (a host test's, say, joined by a fake wire instead of real interfaces) can stand in for it without building one.
+class IStackProvider {
+ public:
+  virtual uint32_t count() const = 0;
+  virtual INetworkStack* at(uint32_t index) const = 0;
+
+ protected:
+  IStackProvider() = default;
+  ~IStackProvider() = default;
+};
+
 // One network stack per network interface, run together. Each interface gets its
 // own address (usually from its own DHCP server) and its own DNS resolver, since
 // each is typically a different network with its own DNS server.
@@ -36,7 +48,7 @@ namespace network {
 // Every stack is thread-safe. poll() may be called from any thread, or
 // start_service() starts a thread that polls all of them, so that application
 // threads only ever wait (sleep) for their sockets.
-class NetworkStackSet {
+class NetworkStackSet final : public IStackProvider {
  public:
   NetworkStackSet(hardware::IClock& clock, allocators::IAllocator& allocator)
       : clock_(clock), allocator_(allocator), stacks_(allocator) {}
@@ -44,9 +56,9 @@ class NetworkStackSet {
   // Builds a stack for `nic` (which must outlive the set). False if memory ran out.
   bool add(hardware::INetworkInterface& nic);
 
-  uint32_t count() const { return static_cast<uint32_t>(stacks_.count()); }
+  uint32_t count() const override { return static_cast<uint32_t>(stacks_.count()); }
   // The stack of interface `index` (in the order added), or null.
-  NetworkStack* at(uint32_t index) const { return index < stacks_.count() ? stacks_[index].get() : nullptr; }
+  NetworkStack* at(uint32_t index) const override { return index < stacks_.count() ? stacks_[index].get() : nullptr; }
 
   ~NetworkStackSet() { stop_service(); }
   NetworkStackSet(const NetworkStackSet&) = delete;
@@ -82,5 +94,10 @@ class NetworkStackSet {
   kernel::Thread* service_ = nullptr;
   volatile bool stop_ = false;
 };
+
+// The machine's one set of network stacks, for user-mode programs to reach (Windows sockets: see src/Process/Sockets.hpp). Set once, from main(), after the
+// interfaces are added and start_service() is called; null before then or on a machine with no usable network interface.
+NetworkStackSet* system_network_stacks();
+void set_system_network_stacks(NetworkStackSet* stacks);
 
 }  // namespace network

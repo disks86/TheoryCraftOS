@@ -111,6 +111,15 @@ enum class WindowsSyscallNumber : uint32_t {
   NtReadVirtualMemory = 84,
   NtWriteVirtualMemory = 85,
   NtCreateSymbolicLink = 86,
+  NtCreateSocket = 87,
+  NtBindSocket = 88,
+  NtConnectSocket = 89,
+  NtListenSocket = 90,
+  NtAcceptSocket = 91,
+  NtSendSocket = 92,
+  NtReceiveSocket = 93,
+  NtSocketControl = 94,
+  NtSelectSockets = 95,
 };
 
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service

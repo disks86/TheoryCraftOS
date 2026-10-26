@@ -48,6 +48,7 @@ bool canonical_library_name(StringView name, String* out) {
   const StringView text = out->view();
   if (starts_with(text, "api-ms-win-core-") || starts_with(text, "api-ms-win-eventing-") || text.equals("kernelbase.dll")) return out->assign("kernel32.dll");
   if (starts_with(text, "api-ms-win-security-")) return out->assign("advapi32.dll");
+  if (text.equals("wsock32.dll") || text.equals("winsock.dll")) return out->assign("ws2_32.dll");
   // All the C runtimes are one library here: it exports both the classic msvcrt names and the Universal CRT's.
   if (starts_with(text, "api-ms-win-crt-") || text.equals("ucrtbase.dll") || text.equals("ucrtbased.dll") || text.equals("crtdll.dll") || starts_with(text, "msvcr") ||
       starts_with(text, "vcruntime") || starts_with(text, "msvcp"))

@@ -22,6 +22,7 @@
 #include "Process/WindowsLocks.hpp"
 #include "Process/WindowsJobs.hpp"
 #include "Process/WindowsMemory.hpp"
+#include "Process/WindowsSockets.hpp"
 #include "Process/WindowsModules.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Process/WindowsProcess.hpp"
@@ -213,6 +214,15 @@ class WindowsSyscalls final : public ISyscallInterface {
       case WindowsSyscallNumber::NtReadVirtualMemory: return windowsabi::nt_read_virtual_memory(process, r);
       case WindowsSyscallNumber::NtWriteVirtualMemory: return windowsabi::nt_write_virtual_memory(process, r);
       case WindowsSyscallNumber::NtCreateSymbolicLink: return windowsabi::nt_create_symbolic_link(process, r);
+      case WindowsSyscallNumber::NtCreateSocket: return windowsabi::nt_create_socket(process, r);
+      case WindowsSyscallNumber::NtBindSocket: return windowsabi::nt_bind_socket(process, r);
+      case WindowsSyscallNumber::NtConnectSocket: return windowsabi::nt_connect_socket(process, r);
+      case WindowsSyscallNumber::NtListenSocket: return windowsabi::nt_listen_socket(process, r);
+      case WindowsSyscallNumber::NtAcceptSocket: return windowsabi::nt_accept_socket(process, r);
+      case WindowsSyscallNumber::NtSendSocket: return windowsabi::nt_send_socket(process, r);
+      case WindowsSyscallNumber::NtReceiveSocket: return windowsabi::nt_receive_socket(process, r);
+      case WindowsSyscallNumber::NtSocketControl: return windowsabi::nt_socket_control(process, r);
+      case WindowsSyscallNumber::NtSelectSockets: return windowsabi::nt_select_sockets(process, r);
       default: process.host().unhandled_syscall(SyscallAbi::Windows, r.number); return kStatusInvalidSystemService;
     }
   }

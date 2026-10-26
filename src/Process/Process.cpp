@@ -17,6 +17,7 @@
  */
 #include "Process/Process.hpp"
 #include "Process/WindowsPipes.hpp"
+#include "Process/WindowsSockets.hpp"
 #include "Process/Objects.hpp"
 
 namespace process {
@@ -44,6 +45,7 @@ Process::~Process() {
     for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
       if (is_object_kind(files_.kind(slot))) objects->release(uint32_t(files_.token(slot)));
       else if (files_.kind(slot) == DescriptorKind::Pipe) windowsabi::pipe_token_release(files_.token(slot));
+      else if (files_.kind(slot) == DescriptorKind::Socket) windowsabi::socket_token_release(files_.token(slot));
     }
   }
 }
@@ -54,6 +56,7 @@ bool Process::close_descriptor(uint64_t slot) {
   if (!files_.close(slot)) return false;
   if (is_object_kind(kind)) if (ObjectManager* objects = system_objects()) objects->release(uint32_t(token));
   if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_release(token);
+  if (kind == DescriptorKind::Socket) windowsabi::socket_token_release(token);
   return true;
 }
 
