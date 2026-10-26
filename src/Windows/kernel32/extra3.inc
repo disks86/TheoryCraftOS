@@ -967,3 +967,40 @@ EXPORT BOOL WINAPI K32EnumProcesses(DWORD *ids, DWORD size, DWORD *needed) {
   if (needed) *needed = written * 4;
   return TRUE;
 }
+
+/* ---- job objects ----------------------------------------------------------------------------------------------------------------------------------------- */
+
+typedef struct { LARGE_INTEGER PerProcessUserTimeLimit, PerJobUserTimeLimit; DWORD LimitFlags; SIZE_T MinimumWorkingSetSize, MaximumWorkingSetSize; DWORD ActiveProcessLimit; ULONG_PTR Affinity; DWORD PriorityClass, SchedulingClass; } JOBOBJECT_BASIC_LIMIT_INFORMATION_;
+EXPORT HANDLE WINAPI CreateJobObjectW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name) {
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtCreateJobObject(&h, 0x1F001F, named_attributes(&n, name, sa && sa->bInheritHandle));
+  return created(status, h);
+}
+EXPORT HANDLE WINAPI CreateJobObjectA(LPSECURITY_ATTRIBUTES sa, LPCSTR name) { WCHAR *w = name ? to_wide(name) : NULL; HANDLE h = CreateJobObjectW(sa, w); free_wide(w); return h; }
+EXPORT HANDLE WINAPI OpenJobObjectW(DWORD access, BOOL inherit, LPCWSTR name) {
+  (void)access;
+  NamedAttributes n;
+  HANDLE h = NULL;
+  const NTSTATUS status = NtOpenJobObject(&h, 0x1F001F, named_attributes(&n, name, inherit));
+  return opened(status, h);
+}
+EXPORT HANDLE WINAPI OpenJobObjectA(DWORD access, BOOL inherit, LPCSTR name) { WCHAR *w = name ? to_wide(name) : NULL; HANDLE h = OpenJobObjectW(access, inherit, w); free_wide(w); return h; }
+EXPORT BOOL WINAPI AssignProcessToJobObject(HANDLE job, HANDLE process) { const NTSTATUS s = NtAssignProcessToJobObject(job, process); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI TerminateJobObject(HANDLE job, UINT code) { const NTSTATUS s = NtTerminateJobObject(job, (NTSTATUS)code); return NT_SUCCESS(s) ? TRUE : fail_nt(s); }
+EXPORT BOOL WINAPI IsProcessInJob(HANDLE process, HANDLE job, PBOOL result) {
+  const NTSTATUS s = NtIsProcessInJob(process, job);
+  if (!NT_SUCCESS(s)) return fail_nt(s);
+  if (result) *result = s == 0x124;      /* STATUS_PROCESS_IN_JOB */
+  return TRUE;
+}
+EXPORT BOOL WINAPI QueryInformationJobObject(HANDLE job, int info_class, LPVOID info, DWORD length, LPDWORD returned) {
+  ULONG got = 0;
+  const NTSTATUS s = NtQueryInformationJobObject(job, (ULONG)info_class, info, length, &got);
+  if (returned) *returned = got;
+  return NT_SUCCESS(s) && s != (NTSTATUS)0x80000005 ? TRUE : fail_nt(s);
+}
+EXPORT BOOL WINAPI SetInformationJobObject(HANDLE job, int info_class, LPVOID info, DWORD length) {
+  const NTSTATUS s = NtSetInformationJobObject(job, (ULONG)info_class, info, length);
+  return NT_SUCCESS(s) ? TRUE : fail_nt(s);
+}

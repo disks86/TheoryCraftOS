@@ -1646,7 +1646,7 @@ EXPORT BOOL WINAPI CreateProcessW(LPCWSTR application, LPWSTR command_line, LPSE
   HANDLE process = NULL, thread = NULL;
   ULONG process_id = 0, thread_id = 0;
   /* STARTF_USESTDHANDLES (0x100): the child's standard handles are the ones in the startup information (inheritable handles of this process, or the console's). */
-  ULONG nt_flags = ((flags & CREATE_SUSPENDED) ? 1 : 0) | (inherit_handles ? 2 : 0);
+  ULONG nt_flags = ((flags & CREATE_SUSPENDED) ? 1 : 0) | (inherit_handles ? 2 : 0) | ((flags & 0x01000000 /* CREATE_BREAKAWAY_FROM_JOB */) ? 8 : 0);
   HANDLE std_in = NULL, std_out = NULL, std_err = NULL;
   if (startup && (startup->dwFlags & 0x100)) {
     nt_flags |= 4;

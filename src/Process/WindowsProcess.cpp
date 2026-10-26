@@ -30,7 +30,7 @@ constexpr uint32_t kSuccess = 0, kNotImplemented = 0xC0000002u, kAccessViolation
                    kNoMemory = 0xC0000017u, kObjectNameNotFound = 0xC0000034u, kInvalidImageFormat = 0xC000007Bu, kNoResources = 0xC000009Au,
                    kNameTooLong = 0xC0000106u;
 constexpr uint64_t kMaxImageBytes = 64ull << 20, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
-constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4;
+constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4, kBreakawayFromJob = 8;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
   if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
@@ -220,9 +220,12 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   }
   const ObjectManager::Created created = objects->create_process(spec.pid);
   if (created.id == 0) return created.status;
+  const uint32_t joined = objects->job_inherit(p.id(), spec.pid, (flags_arg & kBreakawayFromJob) != 0);      // the child belongs to the job of the one that starts it
+  if (joined != kSuccess) { objects->release(created.id); return joined; }
   objects->add_ref(created.id);      // (one reference for each of the two handles)
   status = runtime->spawn_process(spec);
   if (status != kSuccess) {
+    objects->job_forget(spec.pid);
     objects->release(created.id);
     objects->release(created.id);
     return status;
