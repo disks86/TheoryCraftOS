@@ -19,6 +19,7 @@
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Hardware/RegisterMapper.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -30,6 +31,7 @@ struct GpuContext {
   const IPciBus* pci;
   PciDeviceInfo device;
   allocators::IAllocator* allocator;  // for GPUs that need DMA memory of their own
+  IRegisterMapper* registers = nullptr;  // maps the device's register BAR, for drivers that program the display engine; null: they use the firmware's framebuffer
 };
 
 }  // namespace hardware

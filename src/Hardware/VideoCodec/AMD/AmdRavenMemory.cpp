@@ -46,6 +46,25 @@ constexpr uint64_t kMaxVideoMemory = 64ull << 30;   // far more than any APU car
 constexpr uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 }  // namespace
 
+AmdDisplayRegion amd_plan_display_region(const AmdRavenMemoryMap& map, uint64_t bytes, uint64_t fb_physical, uint64_t fb_bytes) {
+  AmdDisplayRegion region;
+  if (!map.read || bytes == 0 || bytes > map.video_memory_bytes || fb_physical == 0 || fb_bytes == 0) return region;
+  if (fb_bytes > map.video_memory_bytes || fb_physical < map.cpu_base || fb_physical - map.cpu_base > map.video_memory_bytes - fb_bytes) return region;
+  const uint64_t size = align_up(bytes, kMiB);
+  const uint64_t fb_end = fb_physical - map.cpu_base + fb_bytes;
+  const uint64_t firmware_part = fb_end > kAmdVbiosVgaAllocation ? fb_end : kAmdVbiosVgaAllocation;
+  const uint64_t lowest = align_up(firmware_part + kAmdVcn1GuardBytes, kMiB);
+  if (size > map.video_memory_bytes || map.video_memory_bytes - size < kAmdVcn1TailGuardBytes) return region;
+  const uint64_t offset = (map.video_memory_bytes - kAmdVcn1TailGuardBytes - size) / kMiB * kMiB;
+  if (offset < lowest) return region;
+  region.ok = true;
+  region.offset = offset;
+  region.bytes = size;
+  region.gpu_address = map.gpu_base + offset;
+  region.physical = map.cpu_base + offset;
+  return region;
+}
+
 AmdRavenMemoryMap amd_read_raven_memory_map(IVcnRegisters& registers) {
   AmdRavenMemoryMap map;
   const uint32_t memsize = registers.read(kNbioBase[mmRCC_CONFIG_MEMSIZE_BASE_IDX] + mmRCC_CONFIG_MEMSIZE);             // nbio_v7_0_get_memsize: MiB
@@ -89,7 +108,8 @@ const char* amd_vcn1_plan_result_name(AmdVcn1Plan::Result result) {
   return "unknown";
 }
 
-AmdVcn1Plan amd_plan_vcn1_memory(const AmdRavenMemoryMap& map, uint16_t device_id, uint8_t revision, uint64_t block_bytes, uint64_t fb_physical, uint64_t fb_bytes) {
+AmdVcn1Plan amd_plan_vcn1_memory(const AmdRavenMemoryMap& map, uint16_t device_id, uint8_t revision, uint64_t block_bytes, uint64_t fb_physical, uint64_t fb_bytes,
+                                 uint64_t tail_reserved) {
   AmdVcn1Plan plan;
   plan.gb_addr_config = amd_raven_gb_addr_config(device_id, revision);
   plan.block_bytes = block_bytes;
@@ -126,7 +146,7 @@ AmdVcn1Plan amd_plan_vcn1_memory(const AmdRavenMemoryMap& map, uint16_t device_i
   }
   const uint64_t rings_offset = block_offset + align_up(block_bytes, kMiB);
   const uint64_t rings_end = rings_offset + AmdVcn1::kRingsTotalBytes;
-  if (rings_end > map.video_memory_bytes || map.video_memory_bytes - rings_end < kAmdVcn1TailGuardBytes) {
+  if (tail_reserved > map.video_memory_bytes || rings_end > map.video_memory_bytes || map.video_memory_bytes - rings_end < kAmdVcn1TailGuardBytes + tail_reserved) {
     plan.result = AmdVcn1Plan::Result::TooSmall;
     return plan;
   }
@@ -138,7 +158,7 @@ AmdVcn1Plan amd_plan_vcn1_memory(const AmdRavenMemoryMap& map, uint16_t device_i
   plan.rings_physical = map.cpu_base + rings_offset;
   // The rest of video memory, from the next MiB after the rings to the tail guard, is for decoding sessions.
   const uint64_t work_offset = align_up(rings_end, kMiB);
-  const uint64_t work_end = (map.video_memory_bytes - kAmdVcn1TailGuardBytes) / kMiB * kMiB;
+  const uint64_t work_end = (map.video_memory_bytes - kAmdVcn1TailGuardBytes - tail_reserved) / kMiB * kMiB;
   if (work_end > work_offset) {
     plan.work_offset = work_offset;
     plan.work_bytes = work_end - work_offset;

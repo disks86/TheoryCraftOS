@@ -402,8 +402,14 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Multi/GpuNativeDrivers.cpp
   src/Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdGpuGenerations.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
+  src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelDisplay.cpp
+  src/Hardware/GraphicsProcessingUnit/Intel/IntelScanout.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGtt.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelLrc.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelExeclist.cpp
