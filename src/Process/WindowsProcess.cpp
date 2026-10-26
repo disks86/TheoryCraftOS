@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsProcess.hpp"
+#include "Process/AddressSpace.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -29,7 +30,7 @@ constexpr uint32_t kSuccess = 0, kNotImplemented = 0xC0000002u, kAccessViolation
                    kNoMemory = 0xC0000017u, kObjectNameNotFound = 0xC0000034u, kInvalidImageFormat = 0xC000007Bu, kNoResources = 0xC000009Au,
                    kNameTooLong = 0xC0000106u;
 constexpr uint64_t kMaxImageBytes = 64ull << 20, kMaxEnvironmentBytes = 64 * 1024, kMaxStringBytes = 2 * 8192;
-constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1;
+constexpr uint32_t kMaxEnvironmentEntries = 512, kCreateSuspended = 1, kInheritHandles = 2, kUseStdHandles = 4;
 
 bool slot_of(uint64_t handle, uint64_t* slot) {
   if (handle == 0 || handle % 4 != 0 || handle / 4 > Process::kMaxDescriptors) return false;
@@ -87,7 +88,9 @@ uint32_t read_environment(Process& p, uint64_t address, String* text, uint32_t* 
   }
 }
 
-bool read_image(Process& p, StringView path, ByteBuffer* out, uint32_t* status) {
+}  // namespace
+
+bool read_program_file(Process& p, StringView path, ByteBuffer* out, uint32_t* status) {
   String virtual_path(p.files().allocator());
   if (p.files().resolve(path, &virtual_path) != PathResult::Ok) { *status = kObjectNameNotFound; return false; }
   OpenFlags flags;
@@ -115,6 +118,8 @@ bool read_image(Process& p, StringView path, ByteBuffer* out, uint32_t* status) 
   p.files().close(slot);
   return ok;
 }
+
+namespace {
 
 // A handle for the process object in the table, written to `at`. Consumes one reference of the object whatever happens.
 uint32_t give_handle(Process& p, ObjectManager& objects, uint32_t object, uint64_t at, uint64_t* slot_out) {
@@ -163,7 +168,10 @@ uint32_t resume_process_handle(Process& p, uint64_t handle, uint32_t* previous, 
 
 uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   uint64_t cwd_at = 0, environment_at = 0, flags_arg = 0, pid_out = 0, tid_out = 0;
-  if (!argument(p, r, 4, &cwd_at) || !argument(p, r, 5, &environment_at) || !argument(p, r, 6, &flags_arg) || !argument(p, r, 7, &pid_out) || !argument(p, r, 8, &tid_out)) return kAccessViolation;
+  uint64_t std_handles[3] = {};
+  if (!argument(p, r, 4, &cwd_at) || !argument(p, r, 5, &environment_at) || !argument(p, r, 6, &flags_arg) || !argument(p, r, 7, &pid_out) || !argument(p, r, 8, &tid_out) ||
+      !argument(p, r, 9, &std_handles[0]) || !argument(p, r, 10, &std_handles[1]) || !argument(p, r, 11, &std_handles[2]))
+    return kAccessViolation;
   ObjectManager* objects = system_objects();
   IProcessRuntime* runtime = p.runtime();
   if (!objects || !runtime || !p.files().attached()) return kNotImplemented;
@@ -179,7 +187,7 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   if (image_path.empty()) return kInvalidParameter;
   if (directory.empty() ? !world_directory.assign(p.files().cwd()) : p.files().resolve(directory.view(), &world_directory) != PathResult::Ok) return kObjectNameNotFound;
   ByteBuffer image(allocator);
-  if (!read_image(p, image_path.view(), &image, &status)) return status;
+  if (!read_program_file(p, image_path.view(), &image, &status)) return status;
   StringView entries[kMaxEnvironmentEntries];
   uint32_t found = 0;
   for (uint64_t at = 0; at < environment.size() && found < entry_count;) {
@@ -197,6 +205,19 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   spec.working_directory = world_directory.view();
   spec.environment = ArrayView<const StringView>(entries, found);
   spec.suspended = (flags_arg & kCreateSuspended) != 0;
+  spec.inherit_handles = (flags_arg & kInheritHandles) != 0;
+  spec.use_std_handles = (flags_arg & kUseStdHandles) != 0;
+  if (spec.use_std_handles) {
+    for (uint32_t i = 0; i < 3; ++i) {
+      uint64_t slot = 0;
+      if (!slot_of(std_handles[i], &slot) || p.files().kind(slot) == DescriptorKind::Closed) {
+        if (std_handles[i] == 0 || std_handles[i] == ~uint64_t{0}) { spec.std_handles[i] = std_handles[i]; continue; }      // none
+        return kInvalidHandle;
+      }
+      if (slot > 2 && (!spec.inherit_handles || !p.files().inheritable(slot))) return kInvalidHandle;      // (the child only has what it inherits)
+      spec.std_handles[i] = std_handles[i];
+    }
+  }
   const ObjectManager::Created created = objects->create_process(spec.pid);
   if (created.id == 0) return created.status;
   objects->add_ref(created.id);      // (one reference for each of the two handles)
@@ -219,6 +240,173 @@ uint32_t nt_create_user_process(Process& p, const SyscallRequest& r) {
   if (pid_out != 0 && !p.write_user(pid_out, ConstByteView(id, 4))) return kAccessViolation;
   if (tid_out != 0 && !p.write_user(tid_out, ConstByteView(id, 4))) return kAccessViolation;
   return kSuccess;
+}
+
+namespace {
+
+constexpr uint32_t kInvalidInfoClass = 0xC0000003u, kInfoLengthMismatch = 0xC0000004u, kPortNotSet = 0xC0000353u;
+constexpr uint64_t kCurrentProcessHandle = ~uint64_t{0};
+
+// The Win32 priority class constants and NT's numbers for them (PROCESS_PRIORITY_CLASS.PriorityClass).
+uint32_t nt_priority_class(uint32_t win32) {
+  switch (win32) {
+    case 0x40: return 1;       // IDLE
+    case 0x4000: return 5;     // BELOW_NORMAL
+    case 0x8000: return 6;     // ABOVE_NORMAL
+    case 0x80: return 3;       // HIGH
+    case 0x100: return 4;      // REALTIME
+    default: return 2;         // NORMAL
+  }
+}
+uint32_t win32_priority_class(uint32_t nt) {
+  switch (nt) {
+    case 1: return 0x40;
+    case 5: return 0x4000;
+    case 6: return 0x8000;
+    case 3: return 0x80;
+    case 4: return 0x100;
+    default: return 0x20;
+  }
+}
+
+struct Buffer {
+  uint8_t bytes[128] = {};
+  void put(uint32_t at, uint64_t value, uint32_t size) { for (uint32_t i = 0; i < size; ++i) bytes[at + i] = uint8_t(value >> (8 * i)); }
+};
+
+}  // namespace
+
+uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
+  uint64_t returned = 0;
+  if (!argument(p, r, 4, &returned)) return kAccessViolation;
+  const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);      // (ULONGs: the upper halves of the arguments are not defined)
+  const bool self = r.args[0] == kCurrentProcessHandle;
+  bool child_exited = false;
+  uint32_t child_code = 0;
+  uint64_t child_pid = 0;
+  if (!self && !process_handle_info(p, r.args[0], &child_exited, &child_code, &child_pid)) return kInvalidHandle;
+  Buffer b;
+  uint32_t size = 0;
+  IProcessRuntime* runtime = p.runtime();
+  if (info_class == 0) {      // PROCESS_BASIC_INFORMATION
+    uint64_t peb = 0;
+    if (self) p.read_user_u64(p.gs_base() + 0x60, &peb);      // (another process's address space is not ours to look into)
+    b.put(0, self ? 259 : (child_exited ? child_code : 259u), 8);      // ExitStatus (STILL_ACTIVE)
+    b.put(8, peb, 8);                                                   // PebBaseAddress
+    b.put(16, runtime ? runtime->affinity(0) : 1, 8);                   // AffinityMask
+    b.put(24, 8, 8);                                                    // BasePriority
+    b.put(32, self ? p.id() : child_pid, 8);                            // UniqueProcessId
+    size = 48;
+  } else if (!self) {
+    return kInvalidInfoClass;
+  } else {
+    switch (info_class) {
+      case 2: size = 48; break;      // IO_COUNTERS (nothing is counted)
+      case 3: {      // VM_COUNTERS_EX
+        const uint64_t mapped = p.address_space() ? p.address_space()->mapped_bytes() : 0;
+        b.put(0, mapped, 8);         // PeakVirtualSize
+        b.put(8, mapped, 8);         // VirtualSize
+        b.put(24, mapped, 8);        // PeakWorkingSetSize
+        b.put(32, mapped, 8);        // WorkingSetSize
+        b.put(72, mapped, 8);        // PagefileUsage
+        b.put(80, mapped, 8);        // PeakPagefileUsage
+        b.put(88, mapped, 8);        // PrivateUsage
+        size = length >= 96 ? 96 : 88;
+        break;
+      }
+      case 4: {      // KERNEL_USER_TIMES
+        uint64_t used = 0;
+        if (runtime) runtime->cpu_time(0, &used);
+        b.put(0, p.create_time, 8);
+        b.put(24, used, 8);          // UserTime (the time is not split into kernel and user)
+        size = 32;
+        break;
+      }
+      case 7: size = 8; break;                                          // ProcessDebugPort: none
+      case 12: b.put(0, p.error_mode, 4); size = 4; break;
+      case 18: b.put(1, nt_priority_class(p.priority_class), 1); size = 2; break;
+      case 20: {      // ProcessHandleCount
+        uint32_t open = 0;
+        for (uint64_t slot = 0; slot < ProcessFiles::kMaxDescriptors; ++slot) if (p.files().kind(slot) != DescriptorKind::Closed) ++open;
+        b.put(0, open, 4);
+        size = 4;
+        break;
+      }
+      case 21: b.put(0, runtime ? runtime->affinity(0) : 1, 8); size = 8; break;
+      case 24: size = 4; break;                                         // ProcessSessionInformation: session 0
+      case 26: size = 8; break;                                         // ProcessWow64Information: not a 32-bit process
+      case 27: {      // ProcessImageFileName: a UNICODE_STRING followed by its characters (read from the process parameters)
+        uint64_t peb = 0, parameters = 0, image_length = 0, image_buffer = 0;
+        uint8_t name[16] = {};
+        p.read_user_u64(p.gs_base() + 0x60, &peb);
+        if (peb == 0 || !p.read_user_u64(peb + 0x20, &parameters) || !p.read_user(parameters + 0x60, ByteView(name, 16))) return kAccessViolation;
+        image_length = name[0] | (uint64_t{name[1]} << 8);
+        for (uint32_t i = 0; i < 8; ++i) image_buffer |= uint64_t{name[8 + i]} << (8 * i);
+        const uint32_t need = uint32_t(16 + image_length + 2);
+        if (returned != 0 && !p.write_user_u32(returned, need)) return kAccessViolation;
+        if (length < need) return kInfoLengthMismatch;
+        uint8_t text[2 * 520] = {};
+        if (image_length > sizeof(text) - 2 || !p.read_user(image_buffer, ByteView(text, image_length))) return kInfoLengthMismatch;
+        uint8_t out[16] = {};
+        out[0] = uint8_t(image_length); out[1] = uint8_t(image_length >> 8);
+        out[2] = uint8_t(image_length + 2); out[3] = uint8_t((image_length + 2) >> 8);
+        const uint64_t text_at = r.args[2] + 16;
+        for (uint32_t i = 0; i < 8; ++i) out[8 + i] = uint8_t(text_at >> (8 * i));
+        return p.write_user(r.args[2], ConstByteView(out, 16)) && p.write_user(text_at, ConstByteView(text, image_length + 2)) ? kSuccess : kAccessViolation;
+      }
+      case 30: return kPortNotSet;                                      // ProcessDebugObjectHandle: not being debugged
+      case 31: b.put(0, 1, 4); size = 4; break;                         // ProcessDebugFlags: inheriting
+      case 36: b.put(0, uint32_t(p.id() * 2654435761u) | 1u, 4); size = 4; break;      // ProcessCookie
+      default: return kInvalidInfoClass;
+    }
+  }
+  if (returned != 0 && !p.write_user_u32(returned, size)) return kAccessViolation;
+  if (length < size) return kInfoLengthMismatch;
+  return p.write_user(r.args[2], ConstByteView(b.bytes, size)) ? kSuccess : kAccessViolation;
+}
+
+// NtOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID): a handle to a running program by its process id. It can be waited for and asked about (the exit status);
+// TerminateProcess works on the programs this one started.
+uint32_t nt_open_process(Process& p, const SyscallRequest& r) {
+  uint8_t id[16];
+  ObjectManager* objects = system_objects();
+  if (!objects) return kNotImplemented;
+  if (r.args[3] == 0 || !p.read_user(r.args[3], ByteView(id, 16))) return kAccessViolation;
+  uint64_t pid = 0;
+  for (uint32_t i = 0; i < 8; ++i) pid |= uint64_t{id[i]} << (8 * i);
+  const bool exists = pid == p.id() || (p.runtime() && p.runtime()->process_exists(pid));
+  const ObjectManager::Created c = objects->open_process(pid, exists);
+  if (c.id == 0) return c.status == 0xC0000034u ? 0xC000000Bu : c.status;      // STATUS_INVALID_CID
+  uint8_t attributes[4] = {};
+  if (r.args[2] != 0) p.read_user(r.args[2] + 24, ByteView(attributes, 4));
+  uint64_t slot = 0;
+  const uint32_t status = give_handle(p, *objects, c.id, r.args[0], &slot);
+  if (status == kSuccess) p.files().set_handle_flags(slot, (attributes[0] & 2) != 0, false);
+  return status;
+}
+
+uint32_t nt_set_information_process(Process& p, const SyscallRequest& r) {
+  if (r.args[0] != kCurrentProcessHandle) return kInvalidHandle;
+  const uint32_t info_class = uint32_t(r.args[1]), length = uint32_t(r.args[3]);
+  uint8_t in[8] = {};
+  switch (info_class) {
+    case 12:      // ProcessDefaultHardErrorMode
+      if (length != 4 || !p.read_user(r.args[2], ByteView(in, 4))) return length != 4 ? kInfoLengthMismatch : kAccessViolation;
+      p.error_mode = in[0] | (uint32_t{in[1]} << 8) | (uint32_t{in[2]} << 16) | (uint32_t{in[3]} << 24);
+      return kSuccess;
+    case 18:      // ProcessPriorityClass { Foreground, PriorityClass }
+      if (length != 2 || !p.read_user(r.args[2], ByteView(in, 2))) return length != 2 ? kInfoLengthMismatch : kAccessViolation;
+      if (in[1] < 1 || in[1] > 6) return kInvalidParameter;
+      p.priority_class = win32_priority_class(in[1]);
+      return kSuccess;
+    case 21: {    // ProcessAffinityMask
+      if (length != 8 || !p.read_user(r.args[2], ByteView(in, 8))) return length != 8 ? kInfoLengthMismatch : kAccessViolation;
+      uint64_t mask = 0;
+      for (uint32_t i = 0; i < 8; ++i) mask |= uint64_t{in[i]} << (8 * i);
+      return p.runtime() && p.runtime()->set_affinity(0, mask) ? kSuccess : kInvalidParameter;
+    }
+    default: return kInvalidInfoClass;
+  }
 }
 
 }  // namespace process::windowsabi

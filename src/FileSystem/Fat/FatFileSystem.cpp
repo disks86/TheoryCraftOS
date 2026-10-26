@@ -38,9 +38,8 @@ struct FatStamp {
   bool known = false;
 };
 
-FatStamp fat_stamp_now() {
+FatStamp fat_stamp_of(uint64_t utc) {
   FatStamp stamp;
-  const uint64_t utc = unix_time_now();
   if (utc == 0) return stamp;
   const int64_t local = static_cast<int64_t>(utc) + local_offset_seconds();
   if (local < 315532800) return stamp;  // before 1980
@@ -54,6 +53,8 @@ FatStamp fat_stamp_now() {
   stamp.known = true;
   return stamp;
 }
+
+FatStamp fat_stamp_now() { return fat_stamp_of(unix_time_now()); }
 
 void put16(uint8_t* p, uint16_t v) {
   p[0] = static_cast<uint8_t>(v);
@@ -942,6 +943,32 @@ Status FatFileSystem::update_entry(uint64_t short_offset, uint32_t first, uint32
     put16(raw + 24, stamp.date);
   }
   return write_bytes(short_offset, ConstByteView(raw, 32));
+}
+
+Status FatFileSystem::set_metadata(StringView path, const MetadataChange& change) {
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  Status s = writable();
+  if (s != Status::Ok) return s;
+  Node node;
+  s = resolve(path, &node);
+  if (s != Status::Ok) return s;
+  if (node.slots == 0 || node.short_offset == 0) return Status::Unsupported;      // (the root folder has no entry of its own)
+  uint8_t raw[32];
+  s = read_bytes(node.short_offset, ByteView(raw, 32));
+  if (s != Status::Ok) return s;
+  if (change.set_read_only) raw[11] = change.read_only ? static_cast<uint8_t>(raw[11] | kAttrReadOnly) : static_cast<uint8_t>(raw[11] & ~kAttrReadOnly);
+  if (change.set_modified) {
+    const FatStamp stamp = fat_stamp_of(change.modified);
+    put16(raw + 22, stamp.time);
+    put16(raw + 24, stamp.date);
+  }
+  if (change.set_created) {
+    const FatStamp stamp = fat_stamp_of(change.created);
+    raw[13] = stamp.tenths;
+    put16(raw + 14, stamp.time);
+    put16(raw + 16, stamp.date);
+  }
+  return write_bytes(node.short_offset, ConstByteView(raw, 32));
 }
 
 Status FatFileSystem::touch_directory(const Node& directory) {

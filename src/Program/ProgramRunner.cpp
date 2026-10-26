@@ -154,7 +154,28 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   if (abi == process::SyscallAbi::Windows) program.set_library_provider(&libraries);
   String directory(allocator);
   if (process::world_directory(abi, run.working_directory, &directory)) program.set_working_directory(directory.view());
-  const process::LoadStatus status = program.load(image.view(), ArrayView<const StringView>(argv, argc), process::default_environment(abi), ConstByteView(random, sizeof(random)));
+  uint32_t processors = 0;
+  for (uint64_t mask = kernel::online_core_mask(); mask; mask &= mask - 1) ++processors;
+  program.set_processor_count(processors);
+  // The environment the shell gives a program, with the real number of processors.
+  ArrayView<const StringView> standard = process::default_environment(abi);
+  StringView environment[32];
+  uint32_t environment_count = 0;
+  String processors_entry(allocator);
+  for (const StringView& entry : standard) {
+    if (environment_count >= 31) break;
+    if (abi == process::SyscallAbi::Windows && entry.size() > 21 && StringView(entry.data(), 21).equals("NUMBER_OF_PROCESSORS=")) {
+      processors_entry.assign("NUMBER_OF_PROCESSORS=");
+      char digits[12];
+      uint32_t n = 0, value = processors ? processors : 1;
+      do { digits[n++] = char('0' + value % 10); value /= 10; } while (value);
+      while (n) processors_entry.push_back(digits[--n]);
+      environment[environment_count++] = processors_entry.view();
+    } else {
+      environment[environment_count++] = entry;
+    }
+  }
+  const process::LoadStatus status = program.load(image.view(), ArrayView<const StringView>(argv, argc), ArrayView<const StringView>(environment, environment_count), ConstByteView(random, sizeof(random)));
   if (status != process::LoadStatus::Ok) {
     fail(message, load_failure(status));
     if (!program.load_detail().empty()) {

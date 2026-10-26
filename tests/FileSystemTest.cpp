@@ -787,6 +787,53 @@ static void test_times() {
   }
 }
 
+// set_metadata: the read-only flag (a read-only file cannot be opened for writing) and the times, on RAM and on FAT.
+static void check_metadata(IFileSystem& fs, const char* label) {
+  UniquePointer<IFile> f;
+  uint64_t n = 0;
+  CHECK_STATUS(fs.open_file("/meta.txt", OpenMode::CreateTruncate, &f), Status::Ok);
+  CHECK_STATUS(f->write(0, bytes_of("data"), &n), Status::Ok);
+  f.reset();
+  MetadataChange change;
+  change.set_read_only = true;
+  change.read_only = true;
+  change.set_modified = true;
+  change.modified = 1700000000;      // 2023-11-14 22:13:20 UTC (an even second: FAT keeps two-second steps)
+  change.set_created = true;
+  change.created = 1600000000;
+  CHECK_STATUS(fs.set_metadata("/meta.txt", change), Status::Ok);
+  DirectoryEntry e;
+  CHECK_STATUS(fs.stat("/meta.txt", &e), Status::Ok);
+  CHECK(e.read_only);
+  if (e.modified != 1700000000 || e.created != 1600000000) printf("  (%s: modified %llu created %llu)\n", label, (unsigned long long)e.modified, (unsigned long long)e.created);
+  CHECK(e.modified == 1700000000 && e.created == 1600000000);
+  CHECK_STATUS(fs.open_file("/meta.txt", OpenMode::ReadWrite, &f), Status::ReadOnly);
+  CHECK_STATUS(fs.open_file("/meta.txt", OpenMode::Read, &f), Status::Ok);
+  f.reset();
+  MetadataChange clear;
+  clear.set_read_only = true;
+  CHECK_STATUS(fs.set_metadata("/meta.txt", clear), Status::Ok);
+  CHECK_STATUS(fs.stat("/meta.txt", &e), Status::Ok);
+  CHECK(!e.read_only && e.modified == 1700000000);      // (the times were not asked for)
+  CHECK_STATUS(fs.open_file("/meta.txt", OpenMode::ReadWrite, &f), Status::Ok);
+  f.reset();
+  CHECK_STATUS(fs.set_metadata("/nosuchfile", change), Status::NotFound);
+}
+
+static void test_set_metadata() {
+  TestAllocator a;
+  {
+    RamFileSystem ram(a);
+    check_metadata(ram, "ram");
+  }
+  CHECK(a.live == 0);
+  FatImage im(FatImage::F32);
+  MemDisk disk(im.img, im.total * 512ull, 512, true);
+  UniquePointer<IFileSystem> fsp;
+  CHECK_STATUS(FatFileSystem::mount(a, disk, 0, &fsp), Status::Ok);
+  if (fsp) check_metadata(*fsp, "fat32");
+}
+
 int main() {
   test_times();
   test_paths();
@@ -805,6 +852,7 @@ int main() {
   test_fat_write(FatImage::F16, 2048, "FAT16/2048 write");
   test_fat_write(FatImage::F32, 2048, "FAT32/2048 write");
   test_fat_bad();
+  test_set_metadata();
   test_fat_offset();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("filesystem tests passed\n");

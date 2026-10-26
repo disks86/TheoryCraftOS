@@ -19,15 +19,26 @@
 #include <stdint.h>
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 // The NT services for other processes (WindowsSyscalls.cpp maps service numbers to these). Each returns an NTSTATUS.
 namespace process::windowsabi {
 
 // NtCreateUserProcess(PHANDLE Process, PHANDLE Thread, PUNICODE_STRING Image, PUNICODE_STRING CommandLine, PUNICODE_STRING CurrentDirectory, PVOID Environment,
-//                     ULONG Flags, PULONG ProcessId, PULONG ThreadId): a new process runs the program in the file `Image` (a Win32 path). `Environment` is a block of
-// NUL-terminated UTF-16 "NAME=value" strings ended by an empty one (0: none). Flags bit 0: do not start it until its thread is resumed. Both handles can be waited for;
+//                     ULONG Flags, PULONG ProcessId, PULONG ThreadId, HANDLE StdInput, HANDLE StdOutput, HANDLE StdError): a new process runs the program in the file `Image` (a Win32 path). `Environment` is a block of
+// NUL-terminated UTF-16 "NAME=value" strings ended by an empty one (0: none). Flags bit 0: do not start it until its thread is resumed; bit 1: it inherits the handles that are inheritable; bit 2: its standard handles are StdInput, StdOutput
+// and StdError (handles of the caller that it inherits, or the console's). Both handles can be waited for;
 // the thread handle can be resumed; the process handle answers NtQueryInformationProcess and NtTerminateProcess.
 uint32_t nt_create_user_process(Process& p, const SyscallRequest& r);
+// NtQueryInformationProcess(Process, Class, Buffer, Length, ReturnLength) and NtSetInformationProcess(Process, Class, Buffer, Length). For the calling process (-1): basic
+// information (0), I/O counters (2), memory counters (3), times (4), debug port (7), error mode (12, also set), priority class (18, also set), handle count (20), affinity (21,
+// also set), session (24), WOW64 (26), image file name (27), debug object (30) and flags (31), cookie (36). For a process handle from nt_create_user_process: basic
+// information (the exit status).
+uint32_t nt_query_information_process(Process& p, const SyscallRequest& r);
+uint32_t nt_set_information_process(Process& p, const SyscallRequest& r);
+uint32_t nt_open_process(Process& p, const SyscallRequest& r);
+// The whole file at a Win32 path of the program's world, into `out`; on failure an NTSTATUS in *status.
+bool read_program_file(Process& p, StringView path, ByteBuffer* out, uint32_t* status);
 // A handle to a process created by this system (or 0 if the handle names something else), and what it is.
 bool process_handle_info(Process& p, uint64_t handle, bool* exited, uint32_t* code, uint64_t* pid);
 // NtTerminateProcess / NtResumeThread on a handle from nt_create_user_process; `handled` is false if the handle is not one.

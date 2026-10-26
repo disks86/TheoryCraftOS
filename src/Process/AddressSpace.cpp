@@ -30,15 +30,21 @@ bool AddressSpace::Region::allocate(uint64_t bytes) {
 }
 
 void AddressSpace::Region::release() {
-  if (storage) {
-    if (!retired_.deferred || !retired_.storages.push_back(storage)) allocator_.deallocate(storage);      // (kept for reclaim(), unless there is no room to remember it)
+  if (shared) {
+    if (!retired_.deferred || !retired_.storages.push_back(RetiredPiece{nullptr, shared})) shared->release();      // (the mapping is let go of when no CPU can see it any more)
+    shared = nullptr;
+  } else if (storage) {
+    if (!retired_.deferred || !retired_.storages.push_back(RetiredPiece{storage, nullptr})) allocator_.deallocate(storage);      // (kept for reclaim(), unless there is no room to remember it)
   }
   storage = nullptr;
   capacity = 0;
 }
 
 void AddressSpace::reclaim() {
-  for (uint8_t* storage : retired_.storages.view()) allocator_.deallocate(storage);
+  for (const RetiredPiece& piece : retired_.storages.view()) {
+    if (piece.shared) piece.shared->release();
+    else allocator_.deallocate(piece.storage);
+  }
   retired_.storages.clear();
 }
 
@@ -90,6 +96,41 @@ bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   return true;
 }
 
+bool AddressSpace::map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner) {
+  uint64_t rounded = 0;
+  if (!storage || !owner || size == 0 || address % kPageSize != 0 || !round_up(size, &rounded)) return false;
+  if (address >= kUserTop || rounded > kUserTop - address) return false;
+  if (rounded > max_bytes_ || mapped_bytes_ > max_bytes_ - rounded) return false;
+  const uint64_t index = first_ending_after(address);
+  if (index < regions_.count() && regions_[index]->base < address + rounded) return false;
+  if (overlaps_reserved(address, address + rounded)) return false;
+  UniquePointer<Region> region = UniquePointer<Region>::make(allocator_, allocator_, retired_);
+  if (!region) return false;
+  region->base = address;
+  region->size = rounded;
+  region->protection = protection;
+  region->allocation = next_allocation_;
+  if (!regions_.insert(index, static_cast<UniquePointer<Region>&&>(region))) return false;      // (the region has no memory yet: nothing to let go of)
+  regions_[index]->storage = storage;
+  regions_[index]->capacity = rounded;
+  regions_[index]->shared = owner;
+  owner->retain();
+  mapped_bytes_ += rounded;
+  ++next_allocation_;
+  ++generation_;
+  return true;
+}
+
+SharedMemory* AddressSpace::shared_at(uint64_t address) const {
+  const uint64_t i = first_ending_after(address);
+  return i < regions_.count() && regions_[i]->base <= address ? regions_[i]->shared : nullptr;
+}
+
+bool AddressSpace::is_shared(uint64_t address) const {
+  const uint64_t i = first_ending_after(address);
+  return i < regions_.count() && regions_[i]->base <= address && regions_[i]->shared != nullptr;
+}
+
 bool AddressSpace::prepare_range(uint64_t address, uint64_t size, uint64_t* end) const {
   uint64_t rounded = 0;
   if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded) || address >= kUserTop || rounded > kUserTop - address) return false;
@@ -108,8 +149,18 @@ bool AddressSpace::split_at(uint64_t address) {
   tail->size = r.size - offset;
   tail->protection = r.protection;
   tail->allocation = r.allocation;
-  if (!tail->allocate(tail->size) || !ByteView(tail->storage, tail->size).copy_from(ConstByteView(r.storage + offset, tail->size))) return false;
-  if (!regions_.insert(i + 1, static_cast<UniquePointer<Region>&&>(tail))) return false;
+  if (r.shared) {      // the tail maps the same memory further on
+    tail->storage = r.storage + offset;
+    tail->capacity = tail->size;
+    tail->shared = r.shared;
+    r.shared->retain();
+  } else if (!tail->allocate(tail->size) || !ByteView(tail->storage, tail->size).copy_from(ConstByteView(r.storage + offset, tail->size))) {
+    return false;
+  }
+  if (!regions_.insert(i + 1, static_cast<UniquePointer<Region>&&>(tail))) {
+    tail.reset();      // (releases the mapping the tail took)
+    return false;
+  }
   r.size = offset;      // its memory stays (the tail pages are simply unused until it is released)
   ++generation_;
   return true;
@@ -141,6 +192,7 @@ bool AddressSpace::resize(uint64_t base, uint64_t size) {
   const uint64_t i = first_ending_after(base);
   if (base % kPageSize != 0 || i >= regions_.count() || regions_[i]->base != base) return false;
   Region& r = *regions_[i];
+  if (r.shared) return false;      // a view of a section has the size of the view
   uint64_t rounded = 0;
   if (!round_up(size, &rounded)) return false;
   if (rounded == 0) {

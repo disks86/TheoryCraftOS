@@ -58,16 +58,15 @@ class Writer {
 
 // The thread-local data of every module: an array of one block pointer per module (what ThreadLocalStoragePointer points at; a module finds its block with its _tls_index),
 // then the blocks. Bytes needed:
+constexpr uint64_t kTlsArrayBytes = kMaxTlsModules * 8;      // (room for a pointer for every module that may ever have a block: libraries loaded later add theirs)
 uint64_t tls_bytes_needed(const TlsTemplate* t, uint32_t n) {
-  if (n == 0) return 0;
-  uint64_t total = (uint64_t{n} * 8 + 15) & ~uint64_t{15};
+  uint64_t total = kTlsArrayBytes;
   for (uint32_t i = 0; i < n; ++i) total += (t[i].bytes + t[i].zero_fill + 15) & ~uint64_t{15};
   return total;
 }
 // Fills the array and the blocks at `area` (copying the templates) and points the TEB at the array. False if a template cannot be read.
 bool write_tls(Writer& w, AddressSpace& space, uint64_t teb, uint64_t area, const TlsTemplate* t, uint32_t n) {
-  if (n == 0) return true;
-  uint64_t block = area + ((uint64_t{n} * 8 + 15) & ~uint64_t{15});
+  uint64_t block = area + kTlsArrayBytes;
   for (uint32_t i = 0; i < n; ++i) {
     w.u64(area + 8 * uint64_t{i}, block);
     uint8_t chunk[256];
@@ -151,7 +150,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   uint64_t base = 0;
   if (!space.find_free(total, kPlacementHint, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
   const uint64_t peb = base, teb = base + kPebSize, parameters = teb + kTebSize, tls_area = parameters + parameters_bytes, ldr = tls_area + tls_bytes;
-  const uint64_t tls_block = tls_count ? tls_area + ((uint64_t{tls_count} * 8 + 15) & ~uint64_t{15}) : 0;
+  const uint64_t tls_block = tls_count ? tls_area + kTlsArrayBytes : 0;
 
   Writer w(space);
   // --- the parameters (RTL_USER_PROCESS_PARAMETERS, pointers absolute: flag NORMALIZED)

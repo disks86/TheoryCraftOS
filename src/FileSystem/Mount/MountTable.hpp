@@ -85,6 +85,7 @@ class MountTable final : public IFileSystem {
   Status create_directory(StringView path) override;
   Status remove(StringView path) override;
   Status rename(StringView from, StringView to) override;
+  Status set_metadata(StringView path, const MetadataChange& change) override;
   Status flush() override;
 
  private:

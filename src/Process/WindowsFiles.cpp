@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsPipes.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Utf16.hpp"
 
@@ -154,6 +155,13 @@ uint32_t status_for(ProcessFiles& files, Status status, StringView virtual_path)
 // Opens (or creates) what the OBJECT_ATTRIBUTES name. On success *handle and *information (FILE_OPENED, ...) are set.
 uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t access, uint32_t disposition, uint32_t options, uint64_t* information, uint64_t* handle) {
   ProcessFiles& files = p.files();
+  {
+    uint32_t pipe_status = 0;
+    if (pipe_open_by_name(p, object_attributes, access, &pipe_status, handle)) {      // \\.\pipe\name
+      if (pipe_status == kSuccess) *information = 1;      // FILE_OPENED
+      return pipe_status;
+    }
+  }
   if (!files.attached()) return kObjectPathNotFound;
   String virtual_path(files.allocator());
   const uint32_t named = object_path(p, object_attributes, &virtual_path);
@@ -186,6 +194,10 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return kTooManyOpenedFiles;
   if (status != Status::Ok) return status_for(files, status, virtual_path.view());
   if (options & kDeleteOnClose) files.object(slot)->delete_on_close = true;
+  uint32_t object_flags = 0;
+  uint8_t flag_bytes[4];
+  if (p.read_user(object_attributes + 24, ByteView(flag_bytes, 4))) object_flags = flag_bytes[0] | (uint32_t{flag_bytes[1]} << 8) | (uint32_t{flag_bytes[2]} << 16) | (uint32_t{flag_bytes[3]} << 24);
+  files.set_handle_flags(slot, (object_flags & 2) != 0, false);      // OBJ_INHERIT
   *handle = (uint64_t{slot} + 1) * 4;
   if (created) *information = kFileCreated;
   else if (disposition == kSupersede) *information = kFileSuperseded;
@@ -212,6 +224,7 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   if (apc != 0) return kNotImplemented;      // asynchronous completion is not supported
   length &= 0xFFFFFFFFu;
   if (length > kMaxIoBytes) length = kMaxIoBytes;
+  if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length);
 
   if (kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError) {
     if (write) {
@@ -371,6 +384,8 @@ bool classes_known(uint32_t c) {
 
 }  // namespace
 
+uint32_t read_unicode_string_argument(Process& p, uint64_t address, String* out) { return read_unicode_string(p, address, out); }
+
 bool argument(Process& p, const SyscallRequest& r, uint32_t index, uint64_t* out) {
   if (index < 4) { *out = r.args[index]; return true; }
   const uint64_t offset = 0x28 + uint64_t{index - 4} * 8;      // past the return address and the 32 bytes of home space
@@ -418,7 +433,9 @@ uint32_t nt_write_file(Process& p, const SyscallRequest& r) { return file_io(p, 
 
 uint32_t nt_close(Process& p, const SyscallRequest& r) {
   uint64_t slot = 0;
-  return handle_slot(r.args[0], &slot) && p.close_descriptor(slot) ? kSuccess : kInvalidHandle;
+  if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
+  if (p.files().protected_from_close(slot)) return 0xC0000235u;      // STATUS_HANDLE_NOT_CLOSABLE
+  return p.close_descriptor(slot) ? kSuccess : kInvalidHandle;
 }
 
 uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
@@ -430,6 +447,10 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
   ProcessFiles& files = p.files();
   const DescriptorKind kind = files.kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
+  if (kind == DescriptorKind::Pipe) {
+    const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
+    if (pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
+  }
   DirectoryEntry e;
   OpenObject* object = files.object(slot);
   if (object) {
@@ -491,6 +512,11 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
   uint64_t slot = 0;
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
+  if (files.kind(slot) == DescriptorKind::Pipe) {
+    if (static_cast<uint32_t>(info_class) != 23) return kInvalidInfoClass;
+    const uint32_t pipe_status = pipe_set_information(p, slot, 23, r.args[2], uint32_t(r.args[3]));
+    return store_io_status(p, r.args[1], pipe_status, 0) ? pipe_status : kAccessViolation;
+  }
   OpenObject* object = files.object(slot);
   if (!object) return files.kind(slot) == DescriptorKind::Closed ? kInvalidHandle : kInvalidParameter;
   const uint64_t status_block = r.args[1], address = r.args[2], length = r.args[3] & 0xFFFFFFFFu;
@@ -509,8 +535,26 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
       if (int64_t(value) < 0) return kInvalidParameter;
       status = nt_status(files.resize(*object, value));
       break;
-    case kFileAllocationInformation:
-    case kFileBasicInformation: break;      // nothing to change: sizes are exact and the file system keeps its own times
+    case kFileAllocationInformation: break;      // nothing to change: sizes are exact
+    case kFileBasicInformation: {      // the times (0 or -1: leave as they are) and the read-only attribute (0: leave); the file system says if it keeps none of that
+      if (length < 40) return kInfoLengthMismatch;
+      uint8_t raw[40];
+      if (!p.read_user(address, ByteView(raw, 40))) return kAccessViolation;
+      auto le64 = [&](uint32_t at) { uint64_t v = 0; for (uint32_t i = 0; i < 8; ++i) v |= uint64_t{raw[at + i]} << (8 * i); return v; };
+      auto unix_seconds = [&](uint64_t nt, uint64_t* out) {
+        if (nt == 0 || nt == ~uint64_t{0}) return false;
+        if (nt / 10000000ull < kUnixToNtSeconds) { *out = 0; return true; }
+        *out = nt / 10000000ull - kUnixToNtSeconds;
+        return true;
+      };
+      filesystem::MetadataChange change;
+      change.set_created = unix_seconds(le64(0), &change.created);
+      change.set_modified = unix_seconds(le64(16), &change.modified);
+      const uint32_t attributes = raw[32] | (uint32_t{raw[33]} << 8) | (uint32_t{raw[34]} << 16) | (uint32_t{raw[35]} << 24);
+      if (attributes != 0) { change.set_read_only = true; change.read_only = (attributes & kAttributeReadOnly) != 0; }
+      if (change.set_created || change.set_modified || change.set_read_only) status = nt_status(files.set_metadata(object->path.view(), change));
+      break;
+    }
     case kFileDispositionInformation: {
       uint8_t flag = 0;
       if (length < 1 || !p.read_user(address, ByteView(&flag, 1))) return kAccessViolation;
@@ -634,6 +678,10 @@ uint32_t nt_flush_buffers_file(Process& p, const SyscallRequest& r) {
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   ProcessFiles& files = p.files();
   if (files.kind(slot) == DescriptorKind::Closed) return kInvalidHandle;
+  if (files.kind(slot) == DescriptorKind::Pipe) {
+    const uint32_t pipe_status = pipe_flush(p, slot);
+    return store_io_status(p, r.args[1], pipe_status, 0) ? pipe_status : kAccessViolation;
+  }
   OpenObject* object = files.object(slot);
   const uint32_t status = object ? nt_status(files.flush(*object)) : kSuccess;
   return store_io_status(p, r.args[1], status, 0) ? status : kAccessViolation;
@@ -648,11 +696,44 @@ uint32_t nt_query_volume_information_file(Process& p, const SyscallRequest& r) {
   if (!handle_slot(r.args[0], &slot)) return kInvalidHandle;
   const DescriptorKind kind = p.files().kind(slot);
   if (kind == DescriptorKind::Closed) return kInvalidHandle;
-  if ((info_class & 0xFFFFFFFFu) != 4) return kInvalidInfoClass;      // FileFsDeviceInformation (a ULONG: the upper half of the argument is not defined)
+  const uint32_t volume_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the argument is not defined)
+  if (volume_class == 1 || volume_class == 3 || volume_class == 5 || volume_class == 7) {      // volume, size, attribute and full size information: what the file system underneath says
+    if (!p.files().attached() || !p.files().file_system()) return kInvalidDeviceRequest;
+    const filesystem::FileSystemInfo fs = p.files().file_system()->info();
+    constexpr uint64_t kUnit = 4096, kSector = 512;
+    const uint64_t total_units = fs.total_bytes ? fs.total_bytes / kUnit : (4ull << 30) / kUnit;      // (a file system without a limit is told to have 4 GiB)
+    const uint64_t free_units = fs.total_bytes ? fs.free_bytes / kUnit : total_units;
+    uint8_t out[160] = {};
+    ByteView v(out, sizeof(out));
+    uint64_t size = 0;
+    auto utf16 = [&](StringView text, uint64_t at) { uint64_t n = 0; for (char c : text) { out[at + 2 * n] = uint8_t(c); ++n; } return n * 2; };
+    if (volume_class == 1) {      // FILE_FS_VOLUME_INFORMATION { VolumeCreationTime, VolumeSerialNumber, VolumeLabelLength, SupportsObjects, VolumeLabel[] }
+      const uint64_t bytes = utf16(fs.label.view(), 18);
+      put(v, 8, 0x544F5343u, 4);
+      put(v, 12, bytes, 4);
+      size = 18 + bytes;
+    } else if (volume_class == 3) {      // FILE_FS_SIZE_INFORMATION
+      put(v, 0, total_units, 8); put(v, 8, free_units, 8); put(v, 16, kUnit / kSector, 4); put(v, 20, kSector, 4);
+      size = 24;
+    } else if (volume_class == 5) {      // FILE_FS_ATTRIBUTE_INFORMATION { FileSystemAttributes, MaximumComponentNameLength, FileSystemNameLength, FileSystemName[] }
+      const uint64_t bytes = utf16(fs.type_name.view(), 12);
+      put(v, 0, 0x3 | 0x4 | 0x40000 * 0 | (fs.read_only ? 0x80000 : 0), 4);      // case-sensitive search, case preserving names, (read-only volume)
+      put(v, 4, 255, 4);
+      put(v, 8, bytes, 4);
+      size = 12 + bytes;
+    } else {                  // FILE_FS_FULL_SIZE_INFORMATION
+      put(v, 0, total_units, 8); put(v, 8, free_units, 8); put(v, 16, free_units, 8); put(v, 24, kUnit / kSector, 4); put(v, 28, kSector, 4);
+      size = 32;
+    }
+    if ((r.args[3] & 0xFFFFFFFFu) < size) return kInfoLengthMismatch;
+    if (!p.write_user(r.args[2], ConstByteView(out, size))) return kAccessViolation;
+    return store_io_status(p, r.args[1], kSuccess, size) ? kSuccess : kAccessViolation;
+  }
+  if (volume_class != 4) return kInvalidInfoClass;      // FileFsDeviceInformation
   if ((r.args[3] & 0xFFFFFFFFu) < 8) return kInfoLengthMismatch;
   const bool console = kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError;
   uint8_t b[8] = {};
-  put(ByteView(b, 8), 0, console ? 0x50 : 7, 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_DISK
+  put(ByteView(b, 8), 0, console ? 0x50 : (kind == DescriptorKind::Pipe ? 0x11 : 7), 4);      // DeviceType: FILE_DEVICE_CONSOLE / FILE_DEVICE_NAMED_PIPE / FILE_DEVICE_DISK
   if (!p.write_user(r.args[2], ConstByteView(b, 8))) return kAccessViolation;
   return store_io_status(p, r.args[1], kSuccess, 8) ? kSuccess : kAccessViolation;
 }

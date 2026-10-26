@@ -32,5 +32,9 @@ uint32_t nt_set_context_thread(Process& p, const SyscallRequest& r);
 // The thread has ended (for whatever reason): releases what it had and wakes whoever waits (see the .cpp).
 void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code);
 uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r);
+uint32_t nt_queue_apc_thread(Process& p, const SyscallRequest& r);
+uint32_t nt_dequeue_apc(Process& p, const SyscallRequest& r);
+uint32_t nt_open_thread(Process& p, const SyscallRequest& r);
+uint32_t nt_set_information_thread(Process& p, const SyscallRequest& r);
 
 }  // namespace process::windowsabi

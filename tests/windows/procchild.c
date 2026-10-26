@@ -34,6 +34,43 @@ int main(int argc, char **argv) {
   }
   if (!strcmp(what, "cwd")) { char d[MAX_PATH]; DWORD n = GetCurrentDirectoryA(sizeof(d), d); return n == 10 && !strcmp(d, "C:\\Windows") ? 0 : 1; }
   if (!strcmp(what, "print")) { printf("child: hello from process %lu\n", (unsigned long)GetCurrentProcessId()); return 0; }
+  if (!strcmp(what, "hello_out")) { printf("hello through a pipe, from process %lu\n", (unsigned long)GetCurrentProcessId()); fflush(stdout); return 5; }
+  if (!strcmp(what, "upper_in")) {      /* standard input to upper case on standard output, until the end of the input */
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
+    char buffer[256];
+    DWORD n, done, total = 0;
+    while (ReadFile(in, buffer, sizeof(buffer), &n, NULL) && n > 0) {
+      for (DWORD i = 0; i < n; ++i) if (buffer[i] >= 'a' && buffer[i] <= 'z') buffer[i] = (char)(buffer[i] - 32);
+      WriteFile(out, buffer, n, &done, NULL);
+      total += n;
+    }
+    return (int)(total & 0x7F);
+  }
+  if (!strcmp(what, "mapcheck")) {      /* the named mapping "TcosMap": check what the parent put there and answer in it */
+    HANDLE m = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "TcosMap");
+    if (!m) return 2;
+    char *view = MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+    if (!view) return 3;
+    if (memcmp(view, "TCOSMAP!", 8) != 0) return 4;
+    memcpy(view + 64, "childack", 8);
+    UnmapViewOfFile(view);
+    CloseHandle(m);
+    return 0;
+  }
+  if (!strcmp(what, "lockcheck")) {      /* the parent holds an exclusive lock on bytes 0..99 of C:\Temp\lock.bin and a shared one on 300..399 */
+    HANDLE f = CreateFileA("C:\\Temp\\lock.bin", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 2;
+    OVERLAPPED o;
+    memset(&o, 0, sizeof(o));
+    if (LockFileEx(f, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 50, 0, &o) || GetLastError() != ERROR_LOCK_VIOLATION) return 3;      /* inside the parent's exclusive lock */
+    o.Offset = 200;
+    if (!LockFileEx(f, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 50, 0, &o)) return 4;      /* free */
+    o.Offset = 300;
+    if (!LockFileEx(f, LOCKFILE_FAIL_IMMEDIATELY, 0, 50, 0, &o)) return 5;      /* shared with the parent's shared lock */
+    o.Offset = 320;
+    if (LockFileEx(f, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 10, 0, &o) || GetLastError() != ERROR_LOCK_VIOLATION) return 6;      /* exclusive over a shared one */
+    return 0;
+  }
   if (!strcmp(what, "pid")) return (int)(GetCurrentProcessId() & 0x7F);
   if (!strcmp(what, "spin")) { volatile unsigned long n = 0; for (;;) n = n + 1; }
   if (!strcmp(what, "waitevent")) {

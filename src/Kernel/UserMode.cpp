@@ -21,6 +21,7 @@
 #include "Executable/ExecutableKind.hpp"
 #include "Process/Objects.hpp"
 #include "Process/WindowsException.hpp"
+#include "Process/WindowsPipes.hpp"
 #include "Process/WindowsThreads.hpp"
 #include "console.hpp"
 
@@ -67,6 +68,10 @@ class SystemSync final : public process::ISystemSync {
     return changed_.wait(mutex_, us);
   }
   void notify_all() override { changed_.notify_all(); }
+  uint64_t now_ns() override {
+    const uint64_t per_us = hardware::tsc_ticks_per_us() ? hardware::tsc_ticks_per_us() : 1;
+    return hardware::read_tsc() / per_us * 1000 + (hardware::read_tsc() % per_us) * 1000 / per_us;
+  }
 
  private:
   Mutex mutex_;
@@ -175,6 +180,7 @@ void context_to_frame(const process::X86Context& c, Frame* frame) {
 
 // The thread is about to end: whoever waits for the program may now join its CPU thread.
 void thread_ends_now(UserThread* t) {
+  if (__atomic_sub_fetch(&t->task->running_threads, 1, __ATOMIC_ACQ_REL) == 0) t->task->program.process()->release_handles();      // (the last one: nothing else touches the table)
   __atomic_store_n(&t->finished, true, __ATOMIC_RELEASE);
   t->task->changed.notify_all();
 }
@@ -404,6 +410,7 @@ bool init(allocators::IAllocator& allocator) {
     if (!objects_memory) { if (sync_memory) allocator.deallocate(sync_memory); return false; }
     g.sync = new (sync_memory) SystemSync();
     g.objects = new (objects_memory) process::ObjectManager(*g.sync);
+    g.objects->set_allocator(&allocator);
     process::set_system_objects(g.objects);
   }
   g.nx = (rdmsr(kMsrEfer) & kEferNxe) != 0;
@@ -556,6 +563,7 @@ UserThread* Task::add_thread(const process::ThreadStart& start) {
   if (!memory) return nullptr;
   UserThread* t = new (memory) UserThread();
   t->task = this;
+  t->core_mask = process_mask;
   t->id = start.id;
   t->start = start;
   t->next = threads;
@@ -566,9 +574,84 @@ UserThread* Task::add_thread(const process::ThreadStart& start) {
 constexpr uint32_t kUserThreadKernelStack = 256 * 1024;
 
 bool Task::launch(UserThread* t, uint32_t stack_bytes) {
+  __atomic_add_fetch(&running_threads, 1, __ATOMIC_ACQ_REL);      // (before the thread can run and end)
   t->thread = kernel::spawn(user_main, t, "user-thread", -1, -1, stack_bytes);
   t->spawned = t->thread != nullptr;
+  if (!t->spawned) __atomic_sub_fetch(&running_threads, 1, __ATOMIC_ACQ_REL);
+  if (t->spawned && t->core_mask != ~uint64_t{0}) set_thread_core_mask(t->thread, t->core_mask);
   return t->spawned;
+}
+
+namespace {
+MemorySource g_memory_source = nullptr;
+void* g_memory_context = nullptr;
+}  // namespace
+
+void set_memory_source(MemorySource source, void* context) {
+  g_memory_source = source;
+  g_memory_context = context;
+}
+
+uint32_t Task::processor_count() {
+  const uint64_t online = online_core_mask();
+  uint32_t n = 0;
+  for (uint64_t m = online; m; m &= m - 1) ++n;
+  return n ? n : 1;
+}
+
+void Task::memory_status(uint64_t* total_bytes, uint64_t* free_bytes) {
+  *total_bytes = *free_bytes = 0;
+  if (g_memory_source) g_memory_source(g_memory_context, total_bytes, free_bytes);
+}
+
+bool Task::set_affinity(uint64_t thread_id, uint64_t mask) {
+  const uint64_t online = online_core_mask();
+  if (!(mask & online)) return false;
+  if (thread_id == 0) {
+    process_mask = mask;
+    for (UserThread* t = threads; t; t = t->next) {
+      t->core_mask = mask;
+      if (t->spawned && t->thread && !t->joined && !t->finished) set_thread_core_mask(t->thread, mask);
+    }
+    return true;
+  }
+  UserThread* t = find_thread(thread_id);
+  if (!t) return false;
+  t->core_mask = mask;
+  if (t->spawned && t->thread && !t->joined && !t->finished) set_thread_core_mask(t->thread, mask);
+  return true;
+}
+
+uint64_t Task::affinity(uint64_t thread_id) {
+  uint64_t mask = process_mask;
+  if (thread_id != 0) {
+    UserThread* t = find_thread(thread_id);
+    if (t) mask = t->core_mask;
+  }
+  return mask & online_core_mask();
+}
+
+bool Task::cpu_time(uint64_t thread_id, uint64_t* hundred_ns) {
+  const uint64_t hz = tick_rate() ? tick_rate() : 1;
+  uint64_t ticks = 0;
+  if (thread_id == 0) {
+    ticks = retired_ticks;
+    for (const UserThread* t = threads; t; t = t->next) if (t->spawned && !t->joined && t->thread) ticks += t->thread->cpu_ticks;
+  } else {
+    const UserThread* t = find_thread(thread_id);
+    if (!t) return false;
+    if (t->spawned && !t->joined && t->thread) ticks = t->thread->cpu_ticks;
+  }
+  *hundred_ns = ticks * (10000000ull / hz);
+  return true;
+}
+
+uint32_t Task::current_processor() { return current_core(); }
+
+bool Task::process_exists(uint64_t pid) {
+  ScopedMutex registry(g_tasks_mutex);
+  for (const Task* task = g_tasks; task; task = task->all_next) if (task->program.loaded() && task->program.process()->id() == pid && !task->program.process()->exited()) return true;
+  return false;
 }
 
 bool Task::sync_tables() {
@@ -644,6 +727,7 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   p.set_file_system(program.file_system());
   if (abi == process::SyscallAbi::Windows) p.set_library_provider(program.library_provider());
   p.set_working_directory(spec.working_directory);
+  p.set_processor_count(processor_count());
   p.set_command_line(spec.command_line);
   // argv: the program's name, then (for a Linux program) the words of the command line
   StringView argv[32];
@@ -673,6 +757,16 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
     discard();
     return loaded == process::LoadStatus::OutOfMemory ? kNoMemory : kInvalidImage;
   }
+  if (spec.inherit_handles) {
+    auto count_use = [](process::DescriptorKind kind, uint64_t token) {      // the child's table holds one more use of what the parent's does
+      if (process::ObjectManager* objects = process::system_objects()) {
+        if (kind == process::DescriptorKind::Pipe) process::windowsabi::pipe_token_add(token);
+        else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section) objects->add_ref(uint32_t(token));
+      }
+    };
+    p.process()->files().inherit_from(program.process()->files(), count_use);
+  }
+  if (spec.use_std_handles) p.set_standard_handles(spec.std_handles);
   child->task = usermode::spawn(p, allocator_, "program", spec.suspended);
   if (!child->task) { discard(); return kNoResources; }
   child->started = !spec.suspended;
@@ -689,6 +783,7 @@ bool Task::terminate_process(uint64_t pid, uint32_t code) {
       c->task->kill_code = code;
       c->task->killed = true;
       c->task->program.process()->terminate(code);
+      c->task->program.process()->release_handles();
       return true;
     }
     request_kill(*c->task, code);
@@ -759,6 +854,7 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   if (suspended) {      // it waits for Task::start_first_thread()
     task->first_thread = t;
   } else {
+    __atomic_add_fetch(&task->running_threads, 1, __ATOMIC_ACQ_REL);      // (before the thread can run and end)
     t->thread = kernel::spawn(user_main, t, name);
     t->spawned = t->thread != nullptr;
     if (!t->spawned) return UniquePointer<Task>();
@@ -803,8 +899,10 @@ bool Task::start_first_thread() {
   UserThread* t = first_thread;
   if (!t || t->spawned) return false;
   first_thread = nullptr;
+  __atomic_add_fetch(&running_threads, 1, __ATOMIC_ACQ_REL);
   t->thread = kernel::spawn(user_main, t, "program");
   t->spawned = t->thread != nullptr;
+  if (!t->spawned) __atomic_sub_fetch(&running_threads, 1, __ATOMIC_ACQ_REL);
   return t->spawned;
 }
 
@@ -841,6 +939,8 @@ bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us) {
           if (now >= deadline) return false;
           left = (deadline - now) / ticks_per_us + 1;
         }
+        // (A thread that ends sets `finished` and wakes us without holding the lock, so the wake-up can fall between our look and our sleep: never sleep long.)
+        if (left == 0 || left > 2000) left = 2000;
         task.changed.wait(task.mutex, left);
         continue;
       }
