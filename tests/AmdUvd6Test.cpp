@@ -204,6 +204,9 @@ static void test_order() {
   CHECK(cache >= 0 && cache < first_reset && first_reset < clock && clock < boot && boot < ring_base);
   // Power management is not touched: no write to the power status register's gating bits beyond clearing the DPG mode.
   CHECK(index_of(reg::kPowerStatus, 0) >= 0 && u.regs[reg::kPowerStatus] == 0);
+  // The microcode written through the memory BAR is flushed out of the host data path (a write of 1, a read back) after it is written and before the first engine register.
+  const int flush = index_of(0x1520, 1, false);
+  CHECK(flush >= 0 && flush < cache && u.regs[0x1520] == 1);
   // SRBM reset of the UVD block is released (bit 18 clear).
   CHECK((at(u, reg::kSrbmSoftReset) & 0x40000) == 0 && index_of(reg::kSrbmSoftReset, 0) >= 0);
 }

@@ -24,7 +24,7 @@
 namespace hardware {
 
 namespace {
-// The register numbers and field masks this file uses, generated from uvd_6_0_d.h, uvd_6_0_sh_mask.h, oss_3_0_d.h and oss_3_0_sh_mask.h by scripts/gen_vcn1_regs.py --vi.
+// The register numbers and field masks this file uses, generated from uvd_6_0_d.h, uvd_6_0_sh_mask.h, oss_3_0_d.h, oss_3_0_sh_mask.h and bif_5_0_d.h by scripts/gen_vcn1_regs.py --vi.
 #include "Hardware/VideoCodec/AMD/AmdUvd6Registers.inc"
 
 constexpr uint32_t lower_32_bits(uint64_t v) { return static_cast<uint32_t>(v); }
@@ -408,6 +408,10 @@ AmdUvd6::Status AmdUvd6::start(const AmdVcnFirmware& firmware, const Memory& mem
   }
   for (; offset < block; offset += 4) memory.block.write32(offset, 0);
   for (uint64_t o = 0; o < kRingBytes; o += 4) memory.ring.write32(o, 0);
+  // Not in the driver, which flushes through its ring: what was just written through the card's memory BAR is buffered by the host data path, and the engine reads it
+  // from the memory controller's side. The flush is vi_flush_hdp without a ring.
+  WREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL, 1);
+  RREG32(mmHDP_MEM_COHERENCY_FLUSH_CNTL);
 
   config_ = config;
   // uvd_v6_0_hw_init, then the power gating state "ungate" that starts the block. Not ported: amdgpu_asic_set_uvd_clocks (the clocks are the SMC's to set).
