@@ -25,6 +25,7 @@
 #include "Process/Process.hpp"
 #include "Process/UserPageTables.hpp"
 #include "Process/UserProgram.hpp"
+#include "Process/WindowsException.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "Utility/ArrayView.hpp"
 
@@ -48,6 +49,13 @@ struct UserThread {
   uint64_t id = 0;
   process::ThreadStart start;
   bool spawned = false, joined = false;
+  // Stopping and ending by another thread (SuspendThread, TerminateThread): asked for under the program's lock, acted on by the thread itself at its next system call or
+  // timer tick (a timer tick sends it to address 0, where the page fault it causes is recognised: see UserMode.cpp).
+  bool suspend_requested = false, terminate_requested = false;
+  uint32_t terminate_code = 0;
+  bool parked = false, redirected = false, context_dirty = false;
+  uint64_t saved_rip = 0;
+  process::X86Context saved;      // its registers while it is parked
   volatile bool finished = false;      // it has reached the end of its life (set just before the CPU thread ends; only then may the CPU thread be joined)
   UserThread* next = nullptr;
 };
@@ -66,11 +74,17 @@ struct Task final : process::IProcessRuntime {
   bool faulted = false;        // the CPU stopped it (page fault, invalid instruction, ...)
   bool kill_requested = false; // set by request_kill(), read by the program's own threads
   bool killed = false;         // it ended because of request_kill()
+  uint32_t kill_code = 130;    // the exit code of a program that request_kill() ended (TerminateProcess says its own)
   uint64_t fault_vector = 0, fault_address = 0, fault_rip = 0;
   UserThread* threads = nullptr;      // every thread the program has had, newest first
   Mutex mutex;
   ConditionVariable changed;
   int32_t home_core = -1;
+  UserThread* first_thread = nullptr;      // the program's first thread, when it was created but not started (CreateProcess with CREATE_SUSPENDED)
+
+  // The programs this one started with CreateProcess (they end with it: usermode::wait() stops them).
+  struct Child;
+  Child* children = nullptr;
 
   // process::IProcessRuntime
   void lock() override { mutex.lock(); }
@@ -81,6 +95,20 @@ struct Task final : process::IProcessRuntime {
   bool start_thread(const process::ThreadStart& start, bool suspended) override;
   bool resume_thread(uint64_t id) override;
   uint64_t current_thread_id() override;
+  void request_suspend(uint64_t id) override;
+  void request_resume(uint64_t id) override;
+  bool is_parked(uint64_t id) override;
+  bool get_context(uint64_t id, process::X86Context* out) override;
+  bool set_context(uint64_t id, const process::X86Context& context) override;
+  void request_terminate(uint64_t id, uint32_t code) override;
+  uint64_t allocate_process_id() override;
+  uint32_t spawn_process(const process::ChildSpec& spec) override;
+  bool terminate_process(uint64_t pid, uint32_t code) override;
+  bool resume_process(uint64_t pid) override;
+  // Frees the children that have ended; with `all`, stops the others first and waits for them.
+  void reap_children(bool all);
+  bool start_first_thread();
+  UserThread* find_thread(uint64_t id);
 
   UserThread* add_thread(const process::ThreadStart& start);
   bool launch(UserThread* thread, uint32_t stack_bytes);
@@ -93,10 +121,10 @@ struct Task final : process::IProcessRuntime {
 
 // Starts the program's first thread in ring 3. `program` must be loaded (with the reserved ranges set on its address space before loading) and must stay
 // alive until the task is gone. Null if there is no memory or user mode is not ready.
-UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name);
+UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator& allocator, const char* name, bool suspended = false);
 // Ends the program as soon as it can: at its next system call or timer tick, whichever comes first (a blocked wait must be woken by the caller, for
 // instance by the host's interrupt()). The exit code is 130. Safe from any thread.
-void request_kill(Task& task);
+void request_kill(Task& task, uint32_t exit_code = 130);
 // Waits for the program to end (timeout_us 0 = forever); false on timeout. The exit code is the program's own, or 128 + the vector of the fault that
 // stopped it. Call once; afterwards the task may be destroyed.
 bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us = 0);

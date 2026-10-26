@@ -20,11 +20,14 @@
 // threads, ending a thread, waiting for one, and the table filling up.
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
+#include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
+#include "Process/WindowsException.hpp"
 #include "Process/WindowsSyscalls.hpp"
 
 using namespace process;
@@ -81,6 +84,35 @@ struct Runtime final : IProcessRuntime {
   bool start_thread(const ThreadStart& s, bool susp) override { if (fail_start) return false; started.push_back(s); suspended.push_back(susp); return true; }
   bool resume_thread(uint64_t id) override { resumed.push_back(id); return true; }
   uint64_t current_thread_id() override { return current; }
+  std::vector<uint64_t> suspended_ids, resumed_ids, terminated_ids;
+  std::vector<uint32_t> terminate_codes;
+  bool parked = false;
+  X86Context context;
+  bool context_set = false;
+  void request_suspend(uint64_t id) override { suspended_ids.push_back(id); parked = true; }
+  void request_resume(uint64_t id) override { resumed_ids.push_back(id); parked = false; }
+  bool is_parked(uint64_t) override { return parked; }
+  bool get_context(uint64_t, X86Context* out) override { if (!parked) return false; *out = context; return true; }
+  bool set_context(uint64_t, const X86Context& c) override { if (!parked) return false; context = c; context_set = true; return true; }
+  void request_terminate(uint64_t id, uint32_t code) override { terminated_ids.push_back(id); terminate_codes.push_back(code); }
+  // CreateProcess
+  struct Spawned { uint64_t pid; std::string image_path, command_line, directory; std::vector<std::string> environment; uint64_t image_size; bool suspended; uint8_t first_byte; };
+  std::vector<Spawned> spawned;
+  std::vector<uint64_t> terminated_pids, resumed_pids;
+  std::vector<uint32_t> process_codes;
+  uint32_t spawn_status = 0;
+  uint64_t next_pid = 0x40000;
+  uint64_t allocate_process_id() override { return next_pid++; }
+  uint32_t spawn_process(const ChildSpec& spec) override {
+    if (spawn_status != 0) return spawn_status;
+    Spawned s{spec.pid, std::string(spec.image_path.data(), spec.image_path.size()), std::string(spec.command_line.data(), spec.command_line.size()),
+              std::string(spec.working_directory.data(), spec.working_directory.size()), {}, spec.image.size(), spec.suspended, spec.image.empty() ? uint8_t(0) : spec.image[0]};
+    for (const StringView& e : spec.environment) s.environment.push_back(std::string(e.data(), e.size()));
+    spawned.push_back(s);
+    return 0;
+  }
+  bool terminate_process(uint64_t pid, uint32_t code) override { terminated_pids.push_back(pid); process_codes.push_back(code); return true; }
+  bool resume_process(uint64_t pid) override { resumed_pids.push_back(pid); return true; }
 };
 
 // One thread drives these tests: the system's lock needs no real locking and a wait just lets time pass.
@@ -221,11 +253,59 @@ static void test_suspended_resume_wait_terminate() {
   Setup t2;
   uint64_t h2 = 0;
   CHECK(t2.create(0x401000, 1, 0, 0, &h2) == 0);
-  CHECK(t2.call(WindowsSyscallNumber::NtTerminateThread, h2, 1) == 0xC0000002u);
+  CHECK(t2.call(WindowsSyscallNumber::NtTerminateThread, h2, 1) == 0 && t2.runtime.terminated_ids.size() == 1 && t2.runtime.terminate_codes[0] == 1);      // told to end
   CHECK(t2.call(WindowsSyscallNumber::NtTerminateThread, 0x9999, 1) == 0xC0000008u);
   // waiting for something that is not a thread
   CHECK(t2.call(WindowsSyscallNumber::NtWaitForSingleObject, 4 * 63, 0, 0) == 0xC0000008u);
   CHECK(t2.call(WindowsSyscallNumber::NtWaitForSingleObject, 0, 0, 0) == 0xC0000008u);
+}
+
+static void test_suspend_and_context() {
+  Setup s;
+  uint64_t handle = 0;
+  CHECK(s.create(0x401000, 5, 0, 0, &handle) == 0);
+  const uint64_t id = s.runtime.started[0].id;
+  // SuspendThread counts; only the first stops the thread, only the last lets it go
+  CHECK(s.call(WindowsSyscallNumber::NtSuspendThread, handle, kBase + 0x200) == 0 && s.memory.get64(kBase + 0x200) == 0 && s.runtime.suspended_ids.size() == 1);
+  CHECK(s.call(WindowsSyscallNumber::NtSuspendThread, handle, kBase + 0x200) == 0 && s.memory.get64(kBase + 0x200) == 1 && s.runtime.suspended_ids.size() == 1);
+  // GetThreadContext of the stopped thread; SetThreadContext changes it
+  s.runtime.context.rip = 0x401234;
+  s.runtime.context.gpr[X86Context::kRsp] = 0x7FFF1000;
+  s.runtime.context.gpr[X86Context::kRax] = 0x77;
+  const uint64_t context_at = kBase + 0x800;
+  for (uint32_t i = 0; i < kContextBytes; ++i) s.memory.bytes[context_at - kBase + i] = 0;
+  s.memory.put64(context_at + 0x30, 0x10000B);      // CONTEXT_FULL
+  CHECK(s.call(WindowsSyscallNumber::NtGetContextThread, handle, context_at) == 0);
+  CHECK(s.memory.get64(context_at + 0xF8) == 0x401234 && s.memory.get64(context_at + 0x98) == 0x7FFF1000 && s.memory.get64(context_at + 0x78) == 0x77);
+  s.memory.put64(context_at + 0xF8, 0x402000);
+  s.memory.put64(context_at + 0x78, 0x99);
+  CHECK(s.call(WindowsSyscallNumber::NtSetContextThread, handle, context_at) == 0 && s.runtime.context_set && s.runtime.context.rip == 0x402000 && s.runtime.context.gpr[X86Context::kRax] == 0x99);
+  s.memory.put64(context_at + 0xF8, 0xFFFF800000000000ull);      // a rip the kernel must not accept
+  CHECK(s.call(WindowsSyscallNumber::NtSetContextThread, handle, context_at) == 0xC0000005u);
+  s.memory.put64(context_at + 0x30, 0x10000B & ~0x100000u);      // not an x64 CONTEXT
+  CHECK(s.call(WindowsSyscallNumber::NtGetContextThread, handle, context_at) == 0xC0000005u);
+  // a thread that runs, or the caller itself, gives no registers
+  CHECK(s.call(WindowsSyscallNumber::NtResumeThread, handle, kBase + 0x200) == 0 && s.memory.get64(kBase + 0x200) == 2 && s.runtime.resumed_ids.empty());
+  CHECK(s.call(WindowsSyscallNumber::NtResumeThread, handle, kBase + 0x200) == 0 && s.memory.get64(kBase + 0x200) == 1 && s.runtime.resumed_ids.size() == 1 && s.runtime.resumed_ids[0] == id);
+  s.memory.put64(context_at + 0x30, 0x10000B);
+  CHECK(s.call(WindowsSyscallNumber::NtGetContextThread, handle, context_at) == 0xC000000Du);      // not suspended
+  CHECK(s.call(WindowsSyscallNumber::NtResumeThread, handle, kBase + 0x200) == 0 && s.memory.get64(kBase + 0x200) == 0);      // (nothing to undo)
+  s.runtime.current = id;
+  CHECK(s.call(WindowsSyscallNumber::NtSuspendThread, ~uint64_t{1}, 0) == 0);      // a thread may suspend itself
+  CHECK(s.call(WindowsSyscallNumber::NtGetContextThread, ~uint64_t{1}, context_at) == 0xC000000Du);
+  s.runtime.current = 7;
+  // a thread created suspended can be given its registers before it runs (the runtime keeps them); one that ended cannot be suspended
+  CHECK(s.call(WindowsSyscallNumber::NtTerminateThread, handle, 4) == 0);      // (told to end)
+  s.process.find_thread(id)->finished = true;
+  CHECK(s.call(WindowsSyscallNumber::NtSuspendThread, handle, 0) == 0xC000004Bu);
+  CHECK(s.call(WindowsSyscallNumber::NtTerminateThread, handle, 4) == 0);      // ending an ended thread is not an error
+  // a thread that never ran is ended on the spot
+  uint64_t idle = 0;
+  CHECK(s.create(0x401000, 0, 1, 0, &idle) == 0);
+  const uint64_t idle_id = s.runtime.started.back().id;
+  const size_t told = s.runtime.terminated_ids.size();
+  CHECK(s.call(WindowsSyscallNumber::NtTerminateThread, idle, 6) == 0 && s.runtime.terminated_ids.size() == told && s.process.find_thread(idle_id)->finished);
+  CHECK(s.process.find_thread(idle_id)->exit_code == 6);
 }
 
 static void test_many_threads() {
@@ -259,12 +339,101 @@ static void test_terminate_process_wakes() {
   CHECK(s.process.exit_code() == 9);
 }
 
+// CreateProcess: the image is read from the file system, the strings arrive as UTF-8, the handles can be waited for and asked, and TerminateProcess / ResumeThread reach the runtime.
+static void put_text16(FakeMemory& m, uint64_t structure, uint64_t buffer, const char* text) {
+  uint64_t n = 0;
+  for (; text[n]; ++n) { m.bytes[buffer - kBase + 2 * n] = uint8_t(text[n]); m.bytes[buffer - kBase + 2 * n + 1] = 0; }
+  m.bytes[structure - kBase] = uint8_t(2 * n);
+  m.bytes[structure - kBase + 1] = 0;
+  m.bytes[structure - kBase + 2] = uint8_t(2 * n + 2);
+  m.put64(structure + 8, buffer);
+}
+
+static void test_create_process() {
+  filesystem::RamFileSystem fs(A);
+  prepare_program_folders(fs);
+  {
+    UniquePointer<filesystem::IFile> f;
+    CHECK(fs.open_file("/Windows/child.exe", filesystem::OpenMode::CreateTruncate, &f) == filesystem::Status::Ok);
+    const uint8_t bytes[5] = {'M', 'Z', 1, 2, 3};
+    uint64_t n = 0;
+    CHECK(f->write(0, ConstByteView(bytes, 5), &n) == filesystem::Status::Ok);
+  }
+  Setup s;
+  s.process.attach_file_system(A, fs);
+  const uint64_t sp = kBase + 0x1000;
+  put_text16(s.memory, kBase + 0x1200, kBase + 0x1300, "C:\\child.exe");
+  put_text16(s.memory, kBase + 0x1220, kBase + 0x1400, "child.exe -x \"a b\"");
+  put_text16(s.memory, kBase + 0x1240, kBase + 0x1500, "C:\\");
+  const char* env[] = {"PATH=C:\\", "A=b"};
+  uint64_t at = kBase + 0x1800;
+  for (const char* e : env) {
+    for (uint64_t i = 0; e[i]; ++i, at += 2) { s.memory.bytes[at - kBase] = uint8_t(e[i]); s.memory.bytes[at - kBase + 1] = 0; }
+    at += 2;
+  }
+  auto create = [&](uint64_t flags, uint64_t image_struct) {
+    const uint64_t args[5] = {kBase + 0x1240, kBase + 0x1800, flags, kBase + 0x110, kBase + 0x114};
+    for (int i = 0; i < 5; ++i) s.memory.put64(sp + 0x28 + 8 * i, args[i]);
+    SyscallRequest r;
+    r.number = uint64_t(WindowsSyscallNumber::NtCreateUserProcess);
+    r.args[0] = kBase + 0x100;
+    r.args[1] = kBase + 0x108;
+    r.args[2] = image_struct;
+    r.args[3] = kBase + 0x1220;
+    r.user_stack = sp;
+    return uint32_t(s.iface->dispatch(s.process, r));
+  };
+  CHECK(create(1, kBase + 0x1200) == 0);
+  CHECK(s.runtime.spawned.size() == 1);
+  const Runtime::Spawned& c = s.runtime.spawned[0];
+  CHECK(c.pid == 0x40000 && c.image_path == "C:\\child.exe" && c.command_line == "child.exe -x \"a b\"" && c.directory == "/");
+  CHECK(c.image_size == 5 && c.first_byte == 'M' && c.suspended);
+  CHECK(c.environment.size() == 2 && c.environment[0] == "PATH=C:\\" && c.environment[1] == "A=b");
+  const uint64_t process = s.memory.get64(kBase + 0x100), thread = s.memory.get64(kBase + 0x108);
+  CHECK(process != 0 && thread != 0 && process != thread);
+  CHECK(uint32_t(s.memory.get64(kBase + 0x110)) == 0x40000 && uint32_t(s.memory.get64(kBase + 0x114)) == 0x40000);
+  // still running
+  auto status_of = [&]() {
+    CHECK(s.call(WindowsSyscallNumber::NtQueryInformationProcess, process, 0, kBase + 0x200, 48, kBase + 0x2F0) == 0);
+    return uint32_t(s.memory.get64(kBase + 0x200));
+  };
+  CHECK(status_of() == 259);
+  CHECK(uint32_t(s.memory.get64(kBase + 0x200 + 32)) == 0x40000);
+  s.memory.put64(kBase + 0x300, 0);      // a timeout of 0: look and return
+  CHECK(s.call(WindowsSyscallNumber::NtWaitForSingleObject, process, 0, kBase + 0x300) == 0x102);
+  // resume (through the thread handle), terminate (through the process handle)
+  CHECK(s.call(WindowsSyscallNumber::NtResumeThread, thread, 0) == 0);
+  CHECK(s.runtime.resumed_pids.size() == 1 && s.runtime.resumed_pids[0] == 0x40000);
+  CHECK(s.call(WindowsSyscallNumber::NtTerminateProcess, process, 77) == 0);
+  CHECK(s.runtime.terminated_pids.size() == 1 && s.runtime.process_codes[0] == 77);
+  // it ends: the handle is signalled and the code can be read
+  s.objects.process_exited(0x40000, 77);
+  CHECK(s.call(WindowsSyscallNumber::NtWaitForSingleObject, process, 0, kBase + 0x300) == 0);
+  CHECK(s.call(WindowsSyscallNumber::NtWaitForSingleObject, thread, 0, kBase + 0x300) == 0);
+  CHECK(status_of() == 77);
+  CHECK(s.call(WindowsSyscallNumber::NtClose, process) == 0 && s.call(WindowsSyscallNumber::NtClose, thread) == 0);
+  CHECK(s.call(WindowsSyscallNumber::NtQueryInformationProcess, process, 0, kBase + 0x200, 48, 0) == 0xC0000008u);
+  // a missing file, a failing runtime
+  put_text16(s.memory, kBase + 0x1260, kBase + 0x1600, "C:\\missing.exe");
+  CHECK(create(0, kBase + 0x1260) == 0xC0000034u);
+  s.runtime.spawn_status = 0xC000007Bu;
+  CHECK(create(0, kBase + 0x1200) == 0xC000007Bu);
+  s.runtime.spawn_status = 0;
+  // (failures leave no handle behind: the table still takes a whole run of handles)
+  for (int i = 0; i < 20; ++i) {
+    CHECK(create(0, kBase + 0x1200) == 0);
+    CHECK(s.call(WindowsSyscallNumber::NtClose, s.memory.get64(kBase + 0x100)) == 0 && s.call(WindowsSyscallNumber::NtClose, s.memory.get64(kBase + 0x108)) == 0);
+  }
+}
+
 int main() {
   test_create();
   test_arguments();
   test_suspended_resume_wait_terminate();
+  test_suspend_and_context();
   test_many_threads();
   test_terminate_process_wakes();
+  test_create_process();
   if (g_failed) { printf("WindowsThreadTest: %d failed\n", g_failed); return 1; }
   printf("WindowsThreadTest: all passed\n");
   return 0;

@@ -563,6 +563,7 @@ add_executable(BOOTX64
   src/Process/WindowsException.cpp
   src/Process/WindowsThreads.cpp
   src/Process/WindowsObjects.cpp
+  src/Process/WindowsProcess.cpp
   src/Process/Objects.cpp
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
@@ -755,6 +756,22 @@ if(TCOS_USERMODE_DEMO AND TCOS_USERMODE_DEMO_PROGRAM)
   target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_program.S)
   set_source_files_properties(${CMAKE_BINARY_DIR}/demo_program.S PROPERTIES OBJECT_DEPENDS ${TCOS_USERMODE_DEMO_PROGRAM})
   target_compile_definitions(BOOTX64 PRIVATE TCOS_USERMODE_DEMO_PROGRAM)
+  # More files for C:\\Windows\\System32 (DLLs and programs the extra program uses, say): a ;-separated list.
+  set(TCOS_USERMODE_DEMO_FILES "" CACHE STRING "Files the user-mode demo puts next to the extra program")
+  set(_demo_files_s ".section .rdata,\"dr\"\n.balign 16\n")
+  set(_demo_table "")
+  set(_demo_index 0)
+  foreach(_file ${TCOS_USERMODE_DEMO_FILES})
+    get_filename_component(_name ${_file} NAME)
+    string(APPEND _demo_files_s ".balign 16\ntcos_demo_file_${_demo_index}:\n.incbin \"${_file}\"\ntcos_demo_file_${_demo_index}_end:\ntcos_demo_name_${_demo_index}:\n.asciz \"${_name}\"\n")
+    string(APPEND _demo_table ".quad tcos_demo_name_${_demo_index}, tcos_demo_file_${_demo_index}, tcos_demo_file_${_demo_index}_end\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_file})
+    math(EXPR _demo_index "${_demo_index}+1")
+  endforeach()
+  string(APPEND _demo_files_s ".balign 8\n.global tcos_demo_files\ntcos_demo_files:\n${_demo_table}.global tcos_demo_file_count\ntcos_demo_file_count:\n.quad ${_demo_index}\n")
+  file(WRITE ${CMAKE_BINARY_DIR}/demo_files.S "${_demo_files_s}")
+  target_sources(BOOTX64 PRIVATE ${CMAKE_BINARY_DIR}/demo_files.S)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/demo_files.S PROPERTIES OBJECT_DEPENDS "${TCOS_USERMODE_DEMO_FILES}")
 endif()
 option(TCOS_SELFTESTS "Run the boot-time self-checks and demos of every subsystem" OFF)
 if(TCOS_SELFTESTS)

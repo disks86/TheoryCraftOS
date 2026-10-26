@@ -35,7 +35,7 @@ uint64_t Process::syscall(const SyscallRequest& request) {
 }
 
 namespace {
-bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore; }
+bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k == DescriptorKind::Mutex || k == DescriptorKind::Semaphore || k == DescriptorKind::Process; }
 }  // namespace
 
 Process::~Process() {
@@ -60,6 +60,7 @@ void Process::terminate(uint32_t code) {
   if (runtime_) runtime_->notify();
   if (ObjectManager* objects = system_objects()) {      // what it owned is abandoned; whoever waits for it or for them looks again
     objects->abandon_process(id_);
+    objects->process_exited(id_, code);
     objects->notify();
   }
 }

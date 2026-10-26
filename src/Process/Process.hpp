@@ -24,6 +24,13 @@
 namespace process {
 
 class AddressSpace;
+struct X86Context;
+
+// The static thread-local data of one module (its TLS directory): the initial bytes, and the zero fill after them. Each thread gets its own copy of every module's.
+struct TlsTemplate {
+  uint64_t address = 0, bytes = 0, zero_fill = 0;
+};
+constexpr uint32_t kMaxTlsModules = 16;
 
 // The program's address space, as the kernel reaches it from a system call. A read or write fails (false) when any byte of the range is not mapped
 // for the program (or not writable): a bad pointer from user mode must never fault the kernel.
@@ -46,6 +53,17 @@ struct ThreadStart {
   uint64_t id = 0;
 };
 
+// A program for CreateProcess: the file's bytes and the strings the new process starts with (all valid for the length of the call).
+struct ChildSpec {
+  uint64_t pid = 0;                      // chosen beforehand (IProcessRuntime::allocate_process_id)
+  ConstByteView image;                   // the executable file
+  StringView image_path;                 // as the program sees it ("C:\\dir\\program.exe")
+  StringView command_line;
+  StringView working_directory;          // in the program's world ("/dir" is C:\\dir)
+  ArrayView<const StringView> environment;      // "NAME=value" each
+  bool suspended = false;                // it does not run until resume_process()
+};
+
 // What a process needs to run more than one thread: supplied by whoever runs the program (the kernel). Without one a process has a single thread. The process has
 // one lock; a system call holds it while it runs and gives it up while it blocks (sleeping, waiting, reading the console), so the threads of a process never
 // look at its tables at the same time.
@@ -60,6 +78,20 @@ class IProcessRuntime {
   virtual bool start_thread(const ThreadStart& start, bool suspended) = 0;
   virtual bool resume_thread(uint64_t id) = 0;        // a thread created suspended starts
   virtual uint64_t current_thread_id() = 0;
+  // Stopping and ending other threads. A thread asked to suspend stops at its next system call or timer tick ("parked"); its registers are then kept.
+  virtual void request_suspend(uint64_t id) { (void)id; }
+  virtual void request_resume(uint64_t id) { (void)id; }
+  virtual bool is_parked(uint64_t id) { (void)id; return false; }
+  // The registers of a thread that is parked (or has not started yet); false if it is neither. set_context takes effect when it runs again.
+  virtual bool get_context(uint64_t id, X86Context* out) { (void)id; (void)out; return false; }
+  virtual bool set_context(uint64_t id, const X86Context& context) { (void)id; (void)context; return false; }
+  // The thread ends itself (as if it had called ExitThread with `code`) as soon as it is told: at its next system call or timer tick.
+  virtual void request_terminate(uint64_t id, uint32_t code) { (void)id; (void)code; }
+  // Other processes (CreateProcess). The new process shares the console of this one. spawn_process returns an NTSTATUS (0xC0000002: not supported here).
+  virtual uint64_t allocate_process_id() { return 0; }
+  virtual uint32_t spawn_process(const ChildSpec& spec) { (void)spec; return 0xC0000002u; }
+  virtual bool terminate_process(uint64_t pid, uint32_t code) { (void)pid; (void)code; return false; }
+  virtual bool resume_process(uint64_t pid) { (void)pid; return false; }
 
  protected:
   IProcessRuntime() = default;
@@ -151,6 +183,7 @@ class Process {
   struct ThreadRecord {
     uint64_t id = 0;
     bool used = false, started = false, finished = false;
+    int32_t suspend_count = 0;                        // SuspendThread calls not yet undone (a thread created suspended starts at 1)
     uint32_t exit_code = 259;                         // STILL_ACTIVE
     uint64_t teb = 0, region_base = 0, region_size = 0;      // the thread's TEB and the one region that holds its stack, TEB and TLS block
   };
@@ -160,7 +193,9 @@ class Process {
   void register_main_thread(uint64_t id, uint64_t teb);
   // The Windows startup data a new thread needs: the PEB, the image's static TLS template (see build_windows_thread), and the ntdll function new threads begin in.
   struct ThreadSupport {
-    uint64_t peb = 0, tls_template = 0, tls_template_bytes = 0, tls_zero_fill = 0, start_thunk = 0;
+    uint64_t peb = 0, start_thunk = 0;
+    TlsTemplate tls[kMaxTlsModules];      // module index -> its template
+    uint32_t tls_count = 0;
     uint64_t stack_bytes = 1ull << 20;                // the default size of a new thread's stack
   };
   void set_thread_support(const ThreadSupport& support) { thread_support_ = support; }

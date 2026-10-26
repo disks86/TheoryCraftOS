@@ -48,7 +48,7 @@ struct ProgramStart {
 class UserProgram {
  public:
   UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = 256ull << 20)
-      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator) {}
+      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator) {}
   UserProgram(const UserProgram&) = delete;
   UserProgram& operator=(const UserProgram&) = delete;
 
@@ -60,6 +60,12 @@ class UserProgram {
   void set_library_provider(ILibraryProvider* provider) { libraries_ = provider; }
   // The program's current folder, as a path inside its world ("/" or "/home/me", also for a Windows program: C:\home\me). Set before load().
   void set_working_directory(StringView path) { working_directory_.assign(path); }
+
+  // The command line a Windows program sees, when it is not simply the arguments joined (CreateProcess hands over the exact text). Set before load().
+  void set_command_line(StringView text) { command_line_.assign(text); }
+  filesystem::IFileSystem* file_system() const { return files_; }
+  ILibraryProvider* library_provider() const { return libraries_; }
+  IProcessHost& host() const { return host_; }
 
   // Why load() failed, when it can say more than the status ("kernel32.dll is not a 64-bit x86 DLL"); empty otherwise.
   StringView load_detail() const { return detail_.view(); }
@@ -84,7 +90,7 @@ class UserProgram {
   filesystem::IFileSystem* files_ = nullptr;
   ILibraryProvider* libraries_ = nullptr;
   UniquePointer<ModuleSet> modules_;
-  String detail_, working_directory_;
+  String detail_, working_directory_, command_line_;
   UniquePointer<Process> process_;
   ProgramStart start_;
   LoadedImage image_;

@@ -39,7 +39,7 @@ class ISystemSync {
   ~ISystemSync() = default;
 };
 
-enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore };
+enum class ObjectKind : uint8_t { None, Event, Mutex, Semaphore, Process };
 
 class ObjectManager {
  public:
@@ -62,6 +62,10 @@ class ObjectManager {
   };
   Created create(ObjectKind kind, StringView name, bool manual_reset, bool initial_state, int32_t initial, int32_t maximum, uint64_t owner);
   Created open(ObjectKind kind, StringView name);
+  // A process (waited for by its parent): signalled when it has ended. `pid` finds it again when the process ends.
+  Created create_process(uint64_t pid);
+  void process_exited(uint64_t pid, uint32_t code);
+  bool query_process(uint32_t id, bool* exited, uint32_t* code, uint64_t* pid);
   void add_ref(uint32_t id);
   void release(uint32_t id);
   ObjectKind kind(uint32_t id);

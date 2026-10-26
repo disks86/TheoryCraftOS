@@ -56,6 +56,33 @@ class Writer {
   bool ok_ = true;
 };
 
+// The thread-local data of every module: an array of one block pointer per module (what ThreadLocalStoragePointer points at; a module finds its block with its _tls_index),
+// then the blocks. Bytes needed:
+uint64_t tls_bytes_needed(const TlsTemplate* t, uint32_t n) {
+  if (n == 0) return 0;
+  uint64_t total = (uint64_t{n} * 8 + 15) & ~uint64_t{15};
+  for (uint32_t i = 0; i < n; ++i) total += (t[i].bytes + t[i].zero_fill + 15) & ~uint64_t{15};
+  return total;
+}
+// Fills the array and the blocks at `area` (copying the templates) and points the TEB at the array. False if a template cannot be read.
+bool write_tls(Writer& w, AddressSpace& space, uint64_t teb, uint64_t area, const TlsTemplate* t, uint32_t n) {
+  if (n == 0) return true;
+  uint64_t block = area + ((uint64_t{n} * 8 + 15) & ~uint64_t{15});
+  for (uint32_t i = 0; i < n; ++i) {
+    w.u64(area + 8 * uint64_t{i}, block);
+    uint8_t chunk[256];
+    for (uint64_t done = 0; done < t[i].bytes;) {
+      const uint64_t k = t[i].bytes - done < sizeof(chunk) ? t[i].bytes - done : sizeof(chunk);
+      if (!space.read_privileged(t[i].address + done, ByteView(chunk, k))) return false;      // the template lies outside the image
+      w.bytes(block + done, ConstByteView(chunk, k));
+      done += k;
+    }
+    block += (t[i].bytes + t[i].zero_fill + 15) & ~uint64_t{15};
+  }
+  w.u64(teb + 0x58, area);                           // ThreadLocalStoragePointer
+  return true;
+}
+
 bool utf16(StringView text, ByteBuffer* out) { return util::append_utf16le(out, text); }
 
 }  // namespace
@@ -83,27 +110,38 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   if (!environment.put16(0) || (input.environment.empty() && !environment.put16(0))) return LoadStatus::OutOfMemory;      // ends with an empty string (two NULs if empty)
   const uint64_t path_bytes = image_path.size(), command_bytes = command_line.size(), directory_bytes = directory.size(), environment_bytes = environment.size();
 
-  // --- the image's static TLS
-  uint64_t tls_start = 0, tls_end = 0, tls_index_at = 0, tls_zero = 0, tls_size = 0;
-  uint32_t tls_rva = 0, tls_dir_size = 0;
-  if (pe.directory(kTlsDirectory, &tls_rva, &tls_dir_size) && tls_rva != 0 && tls_dir_size >= 0x28) {
+  // --- the static TLS of the program and of the libraries: one template per module that has a TLS directory, numbered in the order they are found
+  TlsTemplate tls[kMaxTlsModules];
+  uint64_t tls_index_at[kMaxTlsModules] = {};
+  uint32_t tls_count = 0;
+  auto find_tls = [&](uint64_t base, uint32_t rva, uint32_t size) -> LoadStatus {
+    if (rva == 0 || size < 0x28) return LoadStatus::Ok;
+    if (tls_count == kMaxTlsModules) return LoadStatus::Malformed;
     uint8_t raw[0x28];
-    if (!space.read_privileged(image.base + tls_rva, ByteView(raw, sizeof(raw)))) return LoadStatus::Malformed;
+    if (!space.read_privileged(base + rva, ByteView(raw, sizeof(raw)))) return LoadStatus::Malformed;
     auto word = [&](uint32_t at) { uint64_t v = 0; for (uint32_t i = 0; i < 8; ++i) v |= uint64_t{raw[at + i]} << (8 * i); return v; };
-    tls_start = word(0);
-    tls_end = word(8);
-    tls_index_at = word(0x10);
-    tls_zero = raw[0x20] | (uint32_t{raw[0x21]} << 8) | (uint32_t{raw[0x22]} << 16) | (uint32_t{raw[0x23]} << 24);
-    if (tls_end < tls_start || tls_end - tls_start > kMaxStartupBytes || tls_zero > kMaxStartupBytes) return LoadStatus::Malformed;
-    tls_size = tls_end - tls_start + tls_zero;
+    const uint64_t start = word(0), end = word(8);
+    const uint64_t zero = raw[0x20] | (uint32_t{raw[0x21]} << 8) | (uint32_t{raw[0x22]} << 16) | (uint32_t{raw[0x23]} << 24);
+    if (end < start || end - start > kMaxStartupBytes || zero > kMaxStartupBytes) return LoadStatus::Malformed;
+    tls[tls_count] = TlsTemplate{start, end - start, zero};
+    tls_index_at[tls_count] = word(0x10);
+    ++tls_count;
+    return LoadStatus::Ok;
+  };
+  if (input.modules.empty()) {
+    uint32_t rva = 0, size = 0;
+    if (pe.directory(kTlsDirectory, &rva, &size)) { const LoadStatus st = find_tls(image.base, rva, size); if (st != LoadStatus::Ok) return st; }
+  } else {
+    for (const WindowsModule& m : input.modules) { const LoadStatus st = find_tls(m.base, m.tls_rva, m.tls_size); if (st != LoadStatus::Ok) return st; }
   }
+  const uint64_t tls_total = tls_bytes_needed(tls, tls_count);
 
   // --- one region: PEB | TEB | parameters and strings | TLS array and block
   uint64_t strings_at = kParametersHeader;
   const uint64_t strings_bytes = path_bytes + command_bytes + directory_bytes + environment_bytes + 16;      // (the three strings are followed by a NUL each: 6 of the 16)
   uint64_t parameters_bytes = 0, tls_bytes = 0, total = 0;
   if (strings_bytes > kMaxStartupBytes || !AddressSpace::round_up(strings_at + strings_bytes, &parameters_bytes)) return LoadStatus::Malformed;
-  if (!AddressSpace::round_up(tls_size ? 16 + tls_size : 0, &tls_bytes)) return LoadStatus::Malformed;
+  if (!AddressSpace::round_up(tls_total, &tls_bytes)) return LoadStatus::Malformed;
   // The loader lists: PEB_LDR_DATA, and per module a LDR_DATA_TABLE_ENTRY with its two names.
   constexpr uint64_t kLdrHeader = 0x60, kEntrySize = 0x140, kPerModule = 1024;
   if (input.modules.size() > 64) return LoadStatus::Malformed;
@@ -113,7 +151,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   uint64_t base = 0;
   if (!space.find_free(total, kPlacementHint, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
   const uint64_t peb = base, teb = base + kPebSize, parameters = teb + kTebSize, tls_area = parameters + parameters_bytes, ldr = tls_area + tls_bytes;
-  const uint64_t tls_block = tls_size ? tls_area + 16 : 0;
+  const uint64_t tls_block = tls_count ? tls_area + ((uint64_t{tls_count} * 8 + 15) & ~uint64_t{15}) : 0;
 
   Writer w(space);
   // --- the parameters (RTL_USER_PROCESS_PARAMETERS, pointers absolute: flag NORMALIZED)
@@ -155,21 +193,9 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u64(teb + 0x48, input.thread_id);               // ClientId.UniqueThread
   w.u64(teb + 0x60, peb);                           // ProcessEnvironmentBlock
   w.u64(teb + 0x1478, input.stack_top - input.stack_size);    // DeallocationStack
-  if (tls_size) {
-    // The static TLS: an array of one block pointer (module index 0), the block = template + zero fill.
-    w.u64(tls_area, tls_block);
-    w.u64(teb + 0x58, tls_area);                    // ThreadLocalStoragePointer
-    if (tls_end > tls_start) {
-      uint8_t chunk[256];
-      for (uint64_t done = 0; done < tls_end - tls_start;) {
-        const uint64_t n = tls_end - tls_start - done < sizeof(chunk) ? tls_end - tls_start - done : sizeof(chunk);
-        if (!space.read_privileged(tls_start + done, ByteView(chunk, n))) return LoadStatus::Malformed;      // the template lies outside the image
-        w.bytes(tls_block + done, ConstByteView(chunk, n));
-        done += n;
-      }
-    }
-    if (tls_index_at != 0) w.u32(tls_index_at, 0);      // _tls_index = 0 (the memory is the program's own writable data)
-  }
+  if (!write_tls(w, space, teb, tls_area, tls, tls_count)) return LoadStatus::Malformed;
+  for (uint32_t i = 0; i < tls_count; ++i) if (tls_index_at[i] != 0) w.u32(tls_index_at[i], i);      // _tls_index = the module's number
+
   // --- the loader lists
   if (!input.modules.empty()) {
     const uint64_t count = input.modules.size();
@@ -238,9 +264,8 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   shared.u32(kSharedUserDataAddress + 0x3C0, input.processor_count);      // ActiveProcessorCount
   if (!shared.ok()) return LoadStatus::Malformed;
 
-  out->tls_template = tls_start;
-  out->tls_template_bytes = tls_end - tls_start;
-  out->tls_zero_fill = tls_zero;
+  for (uint32_t i = 0; i < tls_count; ++i) out->tls[i] = tls[i];
+  out->tls_count = tls_count;
   out->peb = peb;
   out->teb = teb;
   out->parameters = parameters;
@@ -252,14 +277,15 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
 
 LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& input, WindowsThread* out) {
   constexpr uint64_t kMinStack = 64 * 1024, kMaxStack = 256ull << 20, kPlacement = 0x00007FE000000000ull;
-  uint64_t stack = 0, tls_bytes = 0, total = 0, tls_size = input.tls_template_bytes + input.tls_zero_fill;
-  if (input.tls_template_bytes > kMaxStartupBytes || input.tls_zero_fill > kMaxStartupBytes) return LoadStatus::Malformed;
+  uint64_t stack = 0, tls_bytes = 0, total = 0;
+  if (input.tls_count > kMaxTlsModules) return LoadStatus::Malformed;
+  for (uint32_t i = 0; i < input.tls_count; ++i) if (input.tls[i].bytes > kMaxStartupBytes || input.tls[i].zero_fill > kMaxStartupBytes) return LoadStatus::Malformed;
   if (!AddressSpace::round_up(input.stack_bytes < kMinStack ? kMinStack : input.stack_bytes, &stack) || stack > kMaxStack) return LoadStatus::Malformed;
-  if (!AddressSpace::round_up(tls_size ? 16 + tls_size : 0, &tls_bytes)) return LoadStatus::Malformed;
+  if (!AddressSpace::round_up(tls_bytes_needed(input.tls, input.tls_count), &tls_bytes)) return LoadStatus::Malformed;
   total = stack + kTebSize + tls_bytes;
   uint64_t base = 0;
   if (!space.find_free(total, kPlacement, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
-  const uint64_t stack_top = base + stack, teb = stack_top, tls_area = teb + kTebSize, tls_block = tls_size ? tls_area + 16 : 0;
+  const uint64_t stack_top = base + stack, teb = stack_top, tls_area = teb + kTebSize;
   Writer w(space);
   w.u64(teb + 0x00, ~uint64_t{0});
   w.u64(teb + 0x08, stack_top);                     // StackBase
@@ -269,17 +295,7 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   w.u64(teb + 0x48, input.thread_id);
   w.u64(teb + 0x60, input.peb);
   w.u64(teb + 0x1478, base);                        // DeallocationStack
-  if (tls_size) {
-    w.u64(tls_area, tls_block);
-    w.u64(teb + 0x58, tls_area);                    // ThreadLocalStoragePointer
-    uint8_t chunk[256];
-    for (uint64_t done = 0; done < input.tls_template_bytes;) {
-      const uint64_t n = input.tls_template_bytes - done < sizeof(chunk) ? input.tls_template_bytes - done : sizeof(chunk);
-      if (!space.read_privileged(input.tls_template + done, ByteView(chunk, n))) { space.unmap(base, total); return LoadStatus::Malformed; }
-      w.bytes(tls_block + done, ConstByteView(chunk, n));
-      done += n;
-    }
-  }
+  if (!write_tls(w, space, teb, tls_area, input.tls, input.tls_count)) { space.unmap(base, total); return LoadStatus::Malformed; }
   if (!w.ok()) { space.unmap(base, total); return LoadStatus::Malformed; }
   out->teb = teb;
   out->stack_top = stack_top;

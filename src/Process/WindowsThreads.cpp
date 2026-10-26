@@ -18,7 +18,9 @@
 #include "Process/WindowsThreads.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/WindowsFiles.hpp"
+#include "Process/WindowsProcess.hpp"
 #include "Process/Objects.hpp"
+#include "Process/WindowsException.hpp"
 #include "Process/WindowsStartup.hpp"
 
 namespace process::windowsabi {
@@ -69,9 +71,8 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   in.process_id = p.id();
   in.thread_id = id;
   in.stack_bytes = stack_size ? stack_size : max_stack ? max_stack : support.stack_bytes;
-  in.tls_template = support.tls_template;
-  in.tls_template_bytes = support.tls_template_bytes;
-  in.tls_zero_fill = support.tls_zero_fill;
+  for (uint32_t i = 0; i < support.tls_count; ++i) in.tls[i] = support.tls[i];
+  in.tls_count = support.tls_count;
   WindowsThread thread;
   if (build_windows_thread(*space, in, &thread) != LoadStatus::Ok) {
     record->used = false;
@@ -103,43 +104,111 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
     return kInsufficientResources;
   }
   record->started = !suspended;
+  record->suspend_count = suspended ? 1 : 0;
   return kSuccess;
 }
 
-// NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus): only the calling thread can be ended (by itself).
+// A thread has ended (itself, or because it was told to): its stack, TEB and TLS block go, its mutexes are abandoned, whoever waits for it looks again, and the last thread
+// takes the process with it.
+void end_thread(Process& p, Process::ThreadRecord& record, uint32_t code) {
+  record.finished = true;
+  record.exit_code = code;
+  if (record.region_size && p.address_space()) {
+    p.address_space()->unmap(record.region_base, record.region_size);
+    record.region_size = 0;
+  }
+  if (ObjectManager* objects = system_objects()) objects->abandon_thread(record.id);
+  if (p.live_threads() == 0) p.terminate(code);
+  if (p.runtime()) p.runtime()->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();
+}
+
+// NtTerminateThread(HANDLE Thread, NTSTATUS ExitStatus): the calling thread ends at once; another one is told to end (it does at its next system call or timer tick).
 uint32_t nt_terminate_thread(Process& p, const SyscallRequest& r) {
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
   const uint64_t self = p.runtime() ? p.runtime()->current_thread_id() : p.id();
-  if (record->id != self) return kNotImplemented;
   const uint32_t code = uint32_t(r.args[1]);
-  record->finished = true;
-  record->exit_code = code;
-  if (record->region_size && p.address_space()) {      // its stack, TEB and TLS block go (the thread never returns to user mode)
-    p.address_space()->unmap(record->region_base, record->region_size);
-    record->region_size = 0;
+  if (record->id == self) {
+    end_thread(p, *record, code);
+    p.request_thread_exit(code);      // (the thread never returns to user mode)
+    return kSuccess;
   }
-  if (ObjectManager* objects = system_objects()) objects->abandon_thread(record->id);      // the mutexes it owned are abandoned
-  if (p.live_threads() == 0) p.terminate(code);      // the last thread ends the process
-  p.request_thread_exit(code);
-  if (p.runtime()) p.runtime()->notify();
-  if (ObjectManager* objects = system_objects()) objects->notify();      // whoever waits for the thread looks again
+  if (record->finished) return kSuccess;
+  if (!record->started) {      // it never ran: nothing to stop
+    end_thread(p, *record, code);
+    return kSuccess;
+  }
+  if (!p.runtime()) return kNotImplemented;
+  p.runtime()->request_terminate(record->id, code);
+  if (ObjectManager* objects = system_objects()) objects->notify();      // (a thread waiting inside the kernel looks again and finds it is to end)
+  return kSuccess;
+}
+
+// NtSuspendThread(HANDLE Thread, PULONG PreviousSuspendCount)
+uint32_t nt_suspend_thread(Process& p, const SyscallRequest& r) {
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  if (record->finished) return 0xC000004Bu;      // STATUS_THREAD_IS_TERMINATING
+  if (record->suspend_count >= 127) return 0xC000004Cu;      // STATUS_SUSPEND_COUNT_EXCEEDED
+  const uint32_t previous = uint32_t(record->suspend_count++);
+  if (previous == 0 && record->started && p.runtime()) {
+    p.runtime()->request_suspend(record->id);
+    if (ObjectManager* objects = system_objects()) objects->notify();
+  }
+  if (r.args[1] != 0 && !put32(p, r.args[1], previous)) return kAccessViolation;
   return kSuccess;
 }
 
 // NtResumeThread(HANDLE Thread, PULONG PreviousSuspendCount)
 uint32_t nt_resume_thread(Process& p, const SyscallRequest& r) {
+  {      // the thread handle CreateProcess gave out
+    bool other = false;
+    uint32_t previous = 0;
+    const uint32_t status = resume_process_handle(p, r.args[0], &previous, &other);
+    if (other) {
+      if (status == kSuccess && r.args[1] != 0 && !put32(p, r.args[1], previous)) return kAccessViolation;
+      return status;
+    }
+  }
   Process::ThreadRecord* record = thread_of(p, r.args[0]);
   if (!record) return kInvalidHandle;
-  uint32_t previous = 0;
-  if (!record->started && !record->finished && p.runtime()) {
-    previous = 1;
-    if (!p.runtime()->resume_thread(record->id)) return kInsufficientResources;
-    record->started = true;
+  const uint32_t previous = uint32_t(record->suspend_count);
+  if (record->suspend_count > 0 && !record->finished && p.runtime()) {
+    if (--record->suspend_count == 0) {
+      if (!record->started) {      // created suspended: it starts now
+        if (!p.runtime()->resume_thread(record->id)) { ++record->suspend_count; return kInsufficientResources; }
+        record->started = true;
+      } else {
+        p.runtime()->request_resume(record->id);
+      }
+    }
   }
   if (r.args[1] != 0 && !put32(p, r.args[1], previous)) return kAccessViolation;
   return kSuccess;
 }
+
+// NtGetContextThread(HANDLE Thread, PCONTEXT) and NtSetContextThread(HANDLE Thread, PCONTEXT): the thread must be suspended (the call waits a moment for it to stop).
+uint32_t context_call(Process& p, const SyscallRequest& r, bool set) {
+  Process::ThreadRecord* record = thread_of(p, r.args[0]);
+  if (!record) return kInvalidHandle;
+  IProcessRuntime* runtime = p.runtime();
+  if (!runtime) return kNotImplemented;
+  if (record->finished) return 0xC000004Bu;
+  if (record->id == runtime->current_thread_id() || record->suspend_count == 0) return 0xC000000Du;      // a thread's own registers, or a thread that runs, are not to be had
+  for (uint32_t waited = 0; record->started && !runtime->is_parked(record->id); ++waited) {      // it stops at its next system call or timer tick
+    if (waited > 5000 || p.exited()) return 0xC0000001u;
+    p.block_sleep(1000000);
+    if (record->finished) return 0xC000004Bu;
+  }
+  X86Context context;
+  if (!runtime->get_context(record->id, &context)) return 0xC0000001u;
+  if (!set) return store_context(p, r.args[1], context) ? kSuccess : kAccessViolation;
+  if (!apply_context(p, r.args[1], &context)) return kAccessViolation;
+  return runtime->set_context(record->id, context) ? kSuccess : 0xC0000001u;
+}
+uint32_t nt_get_context_thread(Process& p, const SyscallRequest& r) { return context_call(p, r, false); }
+uint32_t nt_set_context_thread(Process& p, const SyscallRequest& r) { return context_call(p, r, true); }
 
 // NtQueryInformationThread(Thread, Class, Buffer, Length, ReturnLength): ThreadBasicInformation (0) only.
 uint32_t nt_query_information_thread(Process& p, const SyscallRequest& r) {
