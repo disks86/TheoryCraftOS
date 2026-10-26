@@ -626,6 +626,72 @@ static void test_change_notifications() {
   set_system_objects(nullptr);
 }
 
+static void test_mailslots() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  NoWaitSync sync;
+  ObjectManager objects(sync);
+  objects.set_allocator(&A);
+  set_system_objects(&objects);
+  NtRig rig(fs);
+  const uint32_t kGenericRead = 0x80000000u, kGenericWrite = 0x40000000u, kSync = 0x100000, kOptions = 0x60;
+
+  // a reader (CreateMailslot), created with an explicit zero read timeout throughout - this fixture's ISystemSync never really sleeps, so a "wait forever" read on
+  // an empty mailslot would spin here forever; a real kernel's condition variable has no such problem.
+  const uint64_t reader_at = rig.alloc(8);
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateMailslotFile, reader_at, kGenericRead | kSync, rig.attributes("\\??\\mailslot\\test"), rig.alloc(16),
+                 {0, 0, 64, rig.offset(0)}) == 0);
+  const uint64_t reader = rig.u64(reader_at);
+  CHECK(reader != 0);
+
+  // a second CreateMailslot of the same name is refused, like the real one (one reader per name)
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateMailslotFile, rig.alloc(8), kGenericRead | kSync, rig.attributes("\\??\\mailslot\\test"), rig.alloc(16),
+                 {0, 0, 64, rig.offset(0)}) == 0xC0000035u);      // STATUS_OBJECT_NAME_COLLISION
+  // opening a writer for a name nothing made yet fails
+  CHECK(rig.call(WindowsSyscallNumber::NtCreateFile, rig.alloc(8), kGenericWrite | kSync, rig.attributes("\\??\\mailslot\\nosuchslot"), rig.alloc(16),
+                 {0, 0x80, 7, 1, kOptions, 0, 0}) == 0xC0000034u);      // STATUS_OBJECT_NAME_NOT_FOUND
+
+  // nothing written yet: reading with no timeout fails at once instead of blocking
+  uint64_t got = 0;
+  CHECK(rig.read(reader, rig.alloc(64), 64, 0, &got) == 0xC00000B5u);      // STATUS_IO_TIMEOUT
+
+  // a writer (CreateFile on the name) sends a whole message; the reader takes it back whole
+  NtRig::Opened writer = rig.create("\\??\\mailslot\\test", kGenericWrite, 1 /* FILE_OPEN */, kOptions);
+  CHECK(writer.status == 0);
+  CHECK(rig.write(writer.handle, "hello", 0) == 0);
+  const uint64_t buf = rig.alloc(64);
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 5 && rig.bytes(buf, 5) == "hello");
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0xC00000B5u);      // taken: empty again
+
+  // two messages keep their own boundaries - a read never returns more than one, even back to back
+  CHECK(rig.write(writer.handle, "one", 0) == 0 && rig.write(writer.handle, "two", 0) == 0);
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 3 && rig.bytes(buf, 3) == "one");
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 3 && rig.bytes(buf, 3) == "two");
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0xC00000B5u);
+
+  // a buffer too small for the next message leaves it queued (a real mailslot's ERROR_INSUFFICIENT_BUFFER), so a bigger retry still sees it
+  CHECK(rig.write(writer.handle, "a longer message", 0) == 0);
+  CHECK(rig.read(reader, buf, 4, 0, &got) == 0xC0000023u);      // STATUS_BUFFER_TOO_SMALL
+  CHECK(rig.read(reader, buf, 64, 0, &got) == 0 && got == 16 && rig.bytes(buf, 16) == "a longer message");
+
+  // GetMailslotInfo / SetMailslotInfo (NtQueryInformationFile/NtSetInformationFile classes 26/27)
+  CHECK(rig.write(writer.handle, "queued", 0) == 0);
+  const uint64_t info = rig.alloc(24);
+  CHECK(rig.query(reader, info, 24, 26) == 0);
+  CHECK(rig.u64(info) == uint32_t(64));      // MaximumMessageSize (truncated to 32 bits by u64's own read, upper half is 0)
+  CHECK(uint32_t(rig.u64(info + 8) & 0xFFFFFFFFu) == 6);      // NextMessageSize ("queued")
+  CHECK(rig.call(WindowsSyscallNumber::NtSetInformationFile, reader, rig.alloc(16), rig.offset(uint64_t(0) - 50000000ull), 8, {27}) == 0);      // 5 seconds, as 100ns units
+  CHECK(rig.query(reader, info, 24, 26) == 0 && int64_t(rig.u64(info + 16)) == -50000000ll);
+  rig.read(reader, buf, 64, 0, &got);      // drain "queued" before the mailslot goes away
+
+  // closing the reader destroys the mailslot; a writer that still has it open sees it as gone
+  CHECK(rig.call(WindowsSyscallNumber::NtClose, reader) == 0);
+  CHECK(rig.write(writer.handle, "too late", 0) == 0xC0000034u);
+
+  rig.call(WindowsSyscallNumber::NtClose, writer.handle);
+  set_system_objects(nullptr);
+}
+
 // Garbage in the program's memory and wild pointers in the arguments must only ever produce errors.
 static void test_hostile_arguments() {
   filesystem::RamFileSystem fs(A);
@@ -664,6 +730,7 @@ int main() {
   test_linux_files();
   test_windows_files();
   test_change_notifications();
+  test_mailslots();
   test_hostile_arguments();
   CHECK(A.live == 0);
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }

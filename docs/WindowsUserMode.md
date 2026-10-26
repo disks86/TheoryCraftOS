@@ -35,6 +35,22 @@ kernel32 for the registry.
 | `NtCreateNamedPipeFile` | 56 |
 | `NtFsControlFile` | 57 |
 
+## Mailslots
+
+| Service | Number |
+| --- | --- |
+| `NtCreateMailslotFile` | 97 |
+
+The one service this needs (a writer is just `CreateFile` on the name, like a named pipe's client end, needing no service of its own).
+`CreateMailslot`/`GetMailslotInfo`/`SetMailslotInfo` work: one reader per name (a second `CreateMailslot` of the same name is refused, like the real one), any number
+of writers (`CreateFile` on `\\.\mailslot\name`), each `WriteFile` queuing one whole message that a `ReadFile` on the reader's handle takes back whole - never split
+or coalesced with another write's bytes, and a buffer too small for the next message leaves it queued (`STATUS_BUFFER_TOO_SMALL`, like the real one's
+`ERROR_INSUFFICIENT_BUFFER`) rather than losing it. Closing the reader's handle destroys the mailslot at once; a writer that still has it open then sees it as
+gone. Not provided: the domain-wide broadcast a real mailslot can do across machines with the same name (there is only one machine here) - only local processes on
+this one machine can write to it, which is the common use anyway (a single-machine notification queue). The read timeout (`SetMailslotInfo`'s millisecond value,
+`MAILSLOT_WAIT_FOREVER` included) is converted to this codebase's own relative, negative-100ns convention at the kernel32 layer, the same way `CreateFile`'s
+disposition and options are converted from their Win32 constants.
+
 ## Memory and sections
 
 | Service | Number |
@@ -253,5 +269,5 @@ closes (only `NtDeleteFile` and an overwriting `CreateFile` do), and watching an
   threads on every core. Reads and writes stop at the first page that is not committed (`ERROR_PARTIAL_COPY`, with the count); writes ignore page protection, as debuggers need.
   A remote thread's handle can be waited for, `GetExitCodeThread`, `GetThreadId`, `ResumeThread` (if created suspended) and `TerminateThread` work on it; other thread calls
   (contexts, priorities, APCs) do not. Code can be injected: write it into memory allocated with `VirtualAllocEx` and start a thread on it. There is no access check beyond having a handle.
-- **Not provided**: debugging APIs, mailslots, `ReadDirectoryChangesW` (`FindFirstChangeNotification` is done - see "Directory change notifications"), and the many exports of the real kernel32 and msvcrt that no program here has needed.
+- **Not provided**: debugging APIs, `ReadDirectoryChangesW` (`FindFirstChangeNotification` is done - see "Directory change notifications"; mailslots are done too - see "Mailslots"), and the many exports of the real kernel32 and msvcrt that no program here has needed.
   A call to an import that nothing provides stops the program with a message saying which one.

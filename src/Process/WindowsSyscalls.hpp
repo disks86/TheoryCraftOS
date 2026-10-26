@@ -121,6 +121,7 @@ enum class WindowsSyscallNumber : uint32_t {
   NtSocketControl = 94,
   NtSelectSockets = 95,
   NtCreateChangeNotification = 96,
+  NtCreateMailslotFile = 97,
 };
 
 constexpr uint32_t kStatusInvalidSystemService = 0xC000001Cu;      // the answer for a number that is no service

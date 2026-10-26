@@ -208,6 +208,16 @@ constexpr uint32_t kPipeBusy = 0xC00000AEu;
 constexpr uint32_t kDefaultPipeBuffer = 4096, kMaxPipeBuffer = 1u << 20;
 }  // namespace
 
+struct ObjectManager::Mailslot {
+  bool used = false;
+  uint8_t* data = nullptr;
+  uint32_t capacity = 0, head = 0, count = 0;      // a byte ring buffer, like a Pipe's one direction
+  uint32_t message_lengths[kMaxMailslotMessages] = {};      // a ring of pending messages' byte lengths, oldest first
+  uint32_t message_head = 0, message_count = 0;
+  uint32_t max_message_size = 0;      // 0: no cap beyond the buffer's own capacity
+  uint64_t read_timeout_100ns = ~uint64_t{0};
+};
+
 ObjectManager::~ObjectManager() {
   if (pipes_) {
     for (uint32_t i = 0; i < kMaxPipes; ++i) {
@@ -222,6 +232,10 @@ ObjectManager::~ObjectManager() {
     if (allocator_) allocator_->deallocate(sections_);
   }
   if (watches_ && allocator_) allocator_->deallocate(watches_);
+  if (mailslots_) {
+    for (uint32_t i = 0; i < kMaxMailslots; ++i) if (mailslots_[i].data && allocator_) allocator_->deallocate(mailslots_[i].data);
+    if (allocator_) allocator_->deallocate(mailslots_);
+  }
 }
 
 ObjectManager::Pipe* ObjectManager::pipe_of(uint32_t id) {
@@ -764,6 +778,7 @@ void ObjectManager::release(uint32_t id) {
     free_section_locked(*o);
     free_job_locked(*o);
     free_watch_locked(*o);
+    free_mailslot_locked(*o);
     *o = Object();
   }
 }
@@ -1137,6 +1152,128 @@ void ObjectManager::notify_path_changed(StringView affected_directory) {
     any = true;
   }
   if (any) sync_.notify_all();
+}
+
+// ---- mailslots
+
+ObjectManager::Mailslot* ObjectManager::mailslot_of(uint32_t id) {
+  Object* o = at(id);
+  return o && o->kind == ObjectKind::Mailslot && o->mailslot >= 0 && mailslots_ ? &mailslots_[o->mailslot] : nullptr;
+}
+
+void ObjectManager::free_mailslot_locked(Object& o) {
+  if (o.kind != ObjectKind::Mailslot || o.mailslot < 0 || !mailslots_) return;
+  Mailslot& m = mailslots_[o.mailslot];
+  if (m.data && allocator_) allocator_->deallocate(m.data);
+  m = Mailslot();
+  o.mailslot = -1;
+}
+
+ObjectManager::Created ObjectManager::create_mailslot(StringView name, uint32_t max_message_size, uint64_t read_timeout_100ns) {
+  Created result;
+  if (name.empty() || name.size() >= kNameBytes) { result.status = kInvalid; return result; }
+  Locked hold(sync_);
+  if (find_locked(name)) { result.status = kNameExists; return result; }      // one reader per name, like the real one (CreateMailslot refuses an existing name)
+  if (!mailslots_ && allocator_) {
+    void* memory = allocator_->allocate(sizeof(Mailslot) * kMaxMailslots);
+    if (memory) mailslots_ = new (memory) Mailslot[kMaxMailslots];
+  }
+  int32_t slot = -1;
+  for (uint32_t i = 0; mailslots_ && i < kMaxMailslots && slot < 0; ++i) if (!mailslots_[i].used) slot = int32_t(i);
+  if (slot < 0) { result.status = kNoResources; return result; }
+  uint8_t* buffer = allocator_ ? static_cast<uint8_t*>(allocator_->allocate(kMailslotBufferBytes)) : nullptr;
+  if (!buffer) { result.status = kNoResources; return result; }
+  for (uint32_t i = 0; i < kCapacity; ++i) {
+    Object& o = objects_[i];
+    if (o.kind != ObjectKind::None) continue;
+    Mailslot& m = mailslots_[slot];
+    m = Mailslot();
+    m.used = true;
+    m.data = buffer;
+    m.capacity = kMailslotBufferBytes;
+    m.max_message_size = max_message_size;
+    m.read_timeout_100ns = read_timeout_100ns;
+    o = Object();
+    o.kind = ObjectKind::Mailslot;
+    o.references = 1;
+    for (uint64_t k = 0; k < name.size(); ++k) o.name[k] = name[k];
+    o.name_size = static_cast<uint32_t>(name.size());
+    o.mailslot = slot;
+    result.id = i + 1;
+    result.status = kSuccess;
+    return result;
+  }
+  if (allocator_) allocator_->deallocate(buffer);
+  mailslots_[slot].used = false;
+  result.status = kNoResources;
+  return result;
+}
+
+ObjectManager::Created ObjectManager::open_mailslot_writer(StringView name) {
+  Created result;
+  Locked hold(sync_);
+  Object* o = find_locked(name);
+  if (!o || o->kind != ObjectKind::Mailslot) { result.status = kNotFound; return result; }
+  ++o->references;
+  result.id = static_cast<uint32_t>(o - objects_) + 1;
+  result.status = kSuccess;
+  return result;
+}
+
+ObjectManager::MailslotResult ObjectManager::mailslot_write_locked(uint32_t id, ConstByteView data) {
+  Mailslot* m = mailslot_of(id);
+  if (!m) return MailslotResult::Gone;
+  if (m->max_message_size != 0 && data.size() > m->max_message_size) return MailslotResult::TooBig;
+  if (data.size() > m->capacity - m->count || m->message_count >= kMaxMailslotMessages) return MailslotResult::Full;
+  for (uint64_t i = 0; i < data.size(); ++i) m->data[(m->head + m->count + i) % m->capacity] = data[i];
+  m->count += static_cast<uint32_t>(data.size());
+  m->message_lengths[(m->message_head + m->message_count) % kMaxMailslotMessages] = static_cast<uint32_t>(data.size());
+  ++m->message_count;
+  sync_.notify_all();
+  return MailslotResult::Ok;
+}
+
+ObjectManager::MailslotResult ObjectManager::mailslot_read_locked(uint32_t id, uint8_t* out, uint32_t capacity, uint32_t* got, uint32_t* message_size) {
+  *got = 0;
+  Mailslot* m = mailslot_of(id);
+  if (!m) return MailslotResult::Gone;
+  if (m->message_count == 0) { if (message_size) *message_size = 0; return MailslotResult::NoMessage; }
+  const uint32_t size = m->message_lengths[m->message_head];
+  if (message_size) *message_size = size;
+  if (size > capacity) return MailslotResult::TooSmall;      // left queued, like a real mailslot's ERROR_INSUFFICIENT_BUFFER
+  for (uint32_t i = 0; i < size; ++i) out[i] = m->data[(m->head + i) % m->capacity];
+  m->head = (m->head + size) % m->capacity;
+  m->count -= size;
+  m->message_head = (m->message_head + 1) % kMaxMailslotMessages;
+  --m->message_count;
+  *got = size;
+  sync_.notify_all();
+  return MailslotResult::Ok;
+}
+
+bool ObjectManager::mailslot_info(uint32_t id, uint32_t* max_message_size, uint64_t* read_timeout_100ns, uint32_t* next_message_size, uint32_t* message_count) {
+  Locked hold(sync_);
+  Mailslot* m = mailslot_of(id);
+  if (!m) return false;
+  *max_message_size = m->max_message_size;
+  *read_timeout_100ns = m->read_timeout_100ns;
+  *next_message_size = m->message_count ? m->message_lengths[m->message_head] : 0;
+  *message_count = m->message_count;
+  return true;
+}
+
+bool ObjectManager::mailslot_set_timeout(uint32_t id, uint64_t read_timeout_100ns) {
+  Locked hold(sync_);
+  Mailslot* m = mailslot_of(id);
+  if (!m) return false;
+  m->read_timeout_100ns = read_timeout_100ns;
+  return true;
+}
+
+void ObjectManager::mailslot_close_reader(uint32_t id) {
+  Locked hold(sync_);
+  Object* o = at(id);
+  if (o && o->kind == ObjectKind::Mailslot) { free_mailslot_locked(*o); sync_.notify_all(); }      // writers still holding the id now see Gone
 }
 
 }  // namespace process

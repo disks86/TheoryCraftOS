@@ -17,6 +17,7 @@
  */
 #include "Process/WindowsFiles.hpp"
 #include "Process/Objects.hpp"
+#include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsPipes.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Utf16.hpp"
@@ -180,6 +181,13 @@ uint32_t open_by_attributes(Process& p, uint64_t object_attributes, uint32_t acc
       return pipe_status;
     }
   }
+  {
+    uint32_t mailslot_status = 0;
+    if (mailslot_open_by_name(p, object_attributes, access, &mailslot_status, handle)) {      // \\.\mailslot\name (a writer)
+      if (mailslot_status == kSuccess) *information = 1;      // FILE_OPENED
+      return mailslot_status;
+    }
+  }
   if (!files.attached()) return kObjectPathNotFound;
   String virtual_path(files.allocator());
   const uint32_t named = object_path(p, object_attributes, &virtual_path);
@@ -244,6 +252,7 @@ uint32_t file_io(Process& p, const SyscallRequest& r, bool write) {
   length &= 0xFFFFFFFFu;
   if (length > kMaxIoBytes) length = kMaxIoBytes;
   if (kind == DescriptorKind::Pipe) return pipe_io(p, slot, write, status_block, buffer, length);
+  if (kind == DescriptorKind::Mailslot) return mailslot_io(p, slot, write, status_block, buffer, length);
 
   if (kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError) {
     if (write) {
@@ -481,6 +490,10 @@ uint32_t nt_query_information_file(Process& p, const SyscallRequest& r) {
     const uint32_t pipe_class = static_cast<uint32_t>(info_class);      // (a ULONG: the upper half of the stack slot is not defined)
     if (pipe_class == 23 || pipe_class == 24) return pipe_query_information(p, slot, pipe_class, r.args[1], r.args[2], uint32_t(r.args[3]));
   }
+  if (kind == DescriptorKind::Mailslot) {
+    const uint32_t mailslot_class = static_cast<uint32_t>(info_class);
+    if (mailslot_class == 26) return mailslot_query_information(p, slot, mailslot_class, r.args[1], r.args[2], uint32_t(r.args[3]));
+  }
   DirectoryEntry e;
   OpenObject* object = files.object(slot);
   if (object) {
@@ -546,6 +559,11 @@ uint32_t nt_set_information_file(Process& p, const SyscallRequest& r) {
     if (static_cast<uint32_t>(info_class) != 23) return kInvalidInfoClass;
     const uint32_t pipe_status = pipe_set_information(p, slot, 23, r.args[2], uint32_t(r.args[3]));
     return store_io_status(p, r.args[1], pipe_status, 0) ? pipe_status : kAccessViolation;
+  }
+  if (files.kind(slot) == DescriptorKind::Mailslot) {
+    if (static_cast<uint32_t>(info_class) != 27) return kInvalidInfoClass;
+    const uint32_t mailslot_status = mailslot_set_information(p, slot, 27, r.args[2], uint32_t(r.args[3]));
+    return store_io_status(p, r.args[1], mailslot_status, 0) ? mailslot_status : kAccessViolation;
   }
   OpenObject* object = files.object(slot);
   if (!object) return files.kind(slot) == DescriptorKind::Closed ? kInvalidHandle : kInvalidParameter;
