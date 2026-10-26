@@ -12,8 +12,7 @@ The internal panel is wired to the Intel GPU, so the Intel GPU is the boot displ
 
 ## Not done
 
-- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written (see "Radeon RX Vega M: graphics engine start-up" below, simulation only). Still missing: the memory controller
-  programming and GART for the HBM2 (the video engine borrows what the card's firmware left), SDMA, the interrupt handler, DCE 11.2 display, the rest of GFX 8 (tiling tables, clear-state buffer, compute queues).
+- **Polaris bring-up**: the SMC microcode load and the GFX 8 command processor start are written and so are the memory controller and GART (see "Radeon RX Vega M: graphics engine start-up" and "... memory controller and GART" below, simulation only). Still missing: SDMA, the interrupt handler, DCE 11.2 display, the rest of GFX 8 (tiling tables, clear-state buffer, compute queues).
   None of it can be checked without the hardware.
 - **UVD 6.3 video decode** for the Vega M beyond H.264, H.265 (8 and 10 bit), MPEG-2, VC-1 (interlaced pictures untested against real data, see below) and MPEG-4 (the MPEG-4 tools listed below; the chip has no VP9), and any run of it on the card.
 - **VCE 3.4 video encode** on the Vega M beyond the start and stop (see the VCE section), and any run of it on the card.
@@ -220,6 +219,22 @@ Not done and assumed:
 - A `NOP` of count `0x3FFF` is a one-dword filler in the ring (that is how the driver pads), and the simulated card encodes that assumption.
 - The memory controller must let the SMC and the CP reach the video memory addresses used (VMID 0, inside the system aperture the card's firmware set), as for the video engine.
 - Nothing here was run on a real 9575.
+
+## Radeon RX Vega M: memory controller and GART
+
+Code: `src/Hardware/GraphicsProcessingUnit/AMD/AmdGmc8.*` (+ generated `AmdGmc8Registers.inc`), tests: `tests/AmdGmc8Test.cpp` with `tests/FakeAmdGmc8.hpp` (`tests/run_host_tests.sh AmdGmc8Test`), checker:
+`scripts/check_gmc8_port.py <gmc_v8_0.c>`. Ported from `gmc_v8_0_hw_init` (golden registers, `mc_program`, `gart_enable`), `gart_disable`, the TLB flush, and `amdgpu_gmc_gart_location`.
+
+`amd_plan_gmc8_gart` puts a 256 MiB GART in the GPU's 40-bit address space the way the driver does (best fit, 4 GiB aligned, cut down if it does not fit; for the Vega M's 4 GiB at address 0 it lands at
+`0xFF00000000`). `AmdGmc8::start` clears the 512 KiB page table (8 bytes per 4 KiB page, in video memory), programs the system aperture (video memory's range, the unmapped-access page), the AGP window (none), the
+host data path, the L1 TLB / L2 cache, VM context 0 (the GART, one-level page table) and contexts 1-15 (empty, pointing at the GART table, faults redirected to a dummy page). `map()` writes page table
+entries (`kAmdGmc8PteSystemPage` for ordinary RAM: valid, system, snooped, read, write, exec; `kAmdGmc8PteVideoPage` for video memory), flushes the host data path and invalidates the TLBs; `unmap()` clears them.
+That is what lets an engine reach a buffer outside the CPU-visible part of video memory, or in RAM.
+
+The test's memory controller model reads the entries from the table and caches translations until `VM_INVALIDATE_REQUEST`, so a `map()` that forgot the invalidation would show stale pages. Register values were worked out
+from the bit positions in AMD's headers. Not done and assumed: VM faults (no interrupt handler; faults go to the dummy page), the VGA lockout (display block registers; the driver only does it with a display driver),
+the memory controller microcode (the driver does not load it for the VEGAM), per-process page tables (contexts 1-15 stay empty), and the assumption that the card's firmware left the controller in a state this can be
+layered on (it rewrites the system aperture to the same range the controller reports). Nothing here was run on a real 9575; a wrong aperture on a real card would hang it.
 
 ## Radeon RX Vega M: UVD 6.3
 
