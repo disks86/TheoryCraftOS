@@ -44,6 +44,15 @@ struct Value {
   } u;
 
   Value() : tag(Tag::Undefined) { u.number = 0; }
+  // An array hole: undefined to every test of the tag, told apart only by the number (a hole is skipped by in, Object.keys, forEach ...). It never leaves an array:
+  // reads give a plain undefined (see unhole()).
+  static Value make_hole() {
+    Value v;
+    v.u.number = 1;
+    return v;
+  }
+  bool is_hole() const { return tag == Tag::Undefined && u.number == 1; }
+  Value unhole() const { return is_hole() ? Value() : *this; }
   static Value make_null() {
     Value v;
     v.tag = Tag::Null;

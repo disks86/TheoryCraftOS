@@ -978,8 +978,8 @@ void Vm::define(JsObject* o, JsString* key, const Value& value, uint8_t flags) {
     if (canonical_index(key->view(), &i)) {
       if (i > o->length + (1u << 20)) return;
       if (!ensure_items(o, i + 1)) return;
-      for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value();
-      o->items[i] = value;
+      for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value::make_hole();
+      o->items[i] = value.unhole();
       if (i >= o->length) o->length = i + 1;
       return;
     }
@@ -1064,7 +1064,7 @@ bool Vm::array_set_length(JsObject* a, uint32_t length) {
   if (length > a->length) {
     if (length > a->length + (1u << 24)) return false;
     if (!ensure_items(a, length)) return false;
-    for (uint32_t i = a->length; i < length; ++i) a->items[i] = Value();
+    for (uint32_t i = a->length; i < length; ++i) a->items[i] = Value::make_hole();
   }
   a->length = length;
   return true;
@@ -1079,7 +1079,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
     }
     uint32_t i;
     if (canonical_index(key->view(), &i)) {
-      if (i < o->length) {
+      if (i < o->length && !o->items[i].is_hole()) {
         *out = o->items[i];
         return true;
       }
@@ -1267,7 +1267,7 @@ bool Vm::get_member(const Value& base, const Value& key, Value* out) {
   if (base.is_object() && array_index(key, &i)) {
     JsObject* o = base.as_object();
     if (o->okind == ObjKind::Array) {
-      *out = i < o->length ? o->items[i] : Value();
+      *out = i < o->length ? o->items[i].unhole() : Value();
       return true;
     }
     if (o->okind == ObjKind::TypedArray) return typed_array_get_value(*this, o, i, out);
@@ -1365,7 +1365,7 @@ bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, 
     if (o->okind == ObjKind::TypedArray) return typed_array_put(*this, o, i, value);
     if (o->okind == ObjKind::Array && !o->frozen) {
       if (i < o->length) {
-        o->items[i] = value;
+        o->items[i] = value.unhole();
         return true;
       }
       if (o->non_extensible || o->sealed) {
@@ -1374,8 +1374,8 @@ bool Vm::put_member_ex(const Value& base, const Value& key, const Value& value, 
         return put_ex(base, k, value, strict);
       }
       if (i <= o->length + (1u << 20) && ensure_items(o, i + 1)) {
-        for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value();
-        o->items[i] = value;
+        for (uint32_t k = o->length; k < i; ++k) o->items[k] = Value::make_hole();
+        o->items[i] = value.unhole();
         o->length = i + 1;
       }
       return true;
@@ -1412,7 +1412,7 @@ bool Vm::delete_property(JsObject* o, JsString* key) {
   if (o->okind == ObjKind::Array) {
     uint32_t i;
     if (canonical_index(key->view(), &i)) {
-      if (i < o->length) o->items[i] = Value();
+      if (i < o->length) o->items[i] = Value::make_hole();
       return true;
     }
   }
@@ -1430,6 +1430,7 @@ JsObject* Vm::own_keys(JsObject* o) {
   JsObject* keys = new_array(o->prop_count + (o->okind == ObjKind::Array ? o->length : 0));
   if (o->okind == ObjKind::Array) {
     for (uint32_t i = 0; i < o->length; ++i) {
+      if (o->items[i].is_hole()) continue;
       char buffer[16];
       int length = 0;
       uint32_t n = i;
@@ -2175,7 +2176,7 @@ bool Vm::iterator_next(JsObject* it, Value* out) {
   if (src.is_object() && src.as_object()->okind == ObjKind::Array) {
     JsObject* a = src.as_object();
     if (it->position < a->length) {
-      *out = a->items[it->position++];
+      *out = a->items[it->position++].unhole();
       return true;
     }
   }
@@ -2892,6 +2893,7 @@ reload:
       case Opc::Throw:
         throw_value(stack_[sp_ - 1]);
         THROW_PENDING();
+      case Opc::PushHole: PUSH(Value::make_hole()); break;
       case Opc::NewObject: PUSH(Value::make_object(new_plain())); break;
       case Opc::DefineProp: {   // [obj, value] -> [obj]
         define(stack_[sp_ - 2].as_object(), code->constants[static_cast<uint32_t>(in.a)].as_string(), stack_[sp_ - 1]);
