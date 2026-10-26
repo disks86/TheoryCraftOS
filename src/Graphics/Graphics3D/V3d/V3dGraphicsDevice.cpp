@@ -355,6 +355,7 @@ IShaderModule* V3dGraphicsDevice::create_shader_module(const ShaderModuleDesc& d
 void V3dGraphicsDevice::destroy_shader_module(IShaderModule* module) { destroy(allocator_, static_cast<V3dShaderModule*>(module)); }
 
 IPipeline* V3dGraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
+  if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
   const V3dShaderModule* vs = static_cast<const V3dShaderModule*>(desc.vertex_shader);
   const V3dShaderModule* fs = static_cast<const V3dShaderModule*>(desc.fragment_shader);
   if (!vs || !fs || vs->program() != QpuProgram::ColoredVertex || fs->program() != QpuProgram::ColoredFragment) return nullptr;
@@ -449,6 +450,7 @@ bool V3dGraphicsDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BindPipeline: current.pipeline = static_cast<const V3dPipeline*>(cmd.pipeline); break;
       case RecordedCommand::Type::BindVertexBuffer: current.vertex_buffer = static_cast<V3dBuffer*>(cmd.buffer); current.vertex_offset = cmd.offset; break;
       case RecordedCommand::Type::BindIndexBuffer: current.index_buffer = static_cast<V3dBuffer*>(cmd.buffer); current.index_offset = cmd.offset; current.index_type = cmd.index_type; break;
+      case RecordedCommand::Type::BindTexture: return false;   // (no pipeline of this device samples a texture)
       case RecordedCommand::Type::PushConstants: {
         if (cmd.constants_size > kMaxPushedConstantBytes || cmd.constants_offset > pool.size() || cmd.constants_size > pool.size() - cmd.constants_offset) return false;
         for (uint32_t b = 0; b < cmd.constants_size; ++b) current.constants[b] = pool[cmd.constants_offset + b];

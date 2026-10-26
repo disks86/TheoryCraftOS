@@ -296,6 +296,37 @@ static void test_resources() {
   CHECK(!p.gpu->create_graphics_pipeline(wrong));
   wrong = pd; wrong.vertex_stride = 0;
   CHECK(!p.gpu->create_graphics_pipeline(wrong));
+  // Textures are not on this device yet: the textured built-ins make no pipeline (a texture count on the coloured ones neither), write_pixels says no, and a bound
+  // texture fails the submit.
+  {
+    IShaderModule* tvs = p.gpu->create_shader_module(textured_vertex_shader());
+    IShaderModule* tfs = p.gpu->create_shader_module(textured_fragment_shader());
+    GraphicsPipelineDesc textured;
+    describe_textured_pipeline(&textured);
+    textured.vertex_shader = tvs;
+    textured.fragment_shader = tfs;
+    CHECK(!p.gpu->create_graphics_pipeline(textured));
+    wrong = pd; wrong.texture_count = 1;
+    CHECK(!p.gpu->create_graphics_pipeline(wrong));
+    p.gpu->destroy_shader_module(tvs);
+    p.gpu->destroy_shader_module(tfs);
+    IImage* tex = p.gpu->create_image({{4, 4}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
+    IImage* target = p.gpu->create_image({{16, 16}, Format::B8G8R8A8Unorm, kImageColorAttachment});
+    CHECK(tex && target);
+    uint32_t texels[16] = {};
+    CHECK(tex && !tex->write_pixels(ArrayView<const uint32_t>(texels, 16)));
+    ICommandBuffer* cb = p.gpu->create_command_buffer();
+    cb->begin();
+    RenderPassBegin pass;
+    pass.color = target;
+    cb->begin_render_pass(pass);
+    cb->bind_texture(0, tex, SamplerDesc());
+    cb->end_render_pass();
+    CHECK(cb->end() && !p.gpu->submit(cb));
+    p.gpu->destroy_command_buffer(cb);
+    p.gpu->destroy_image(tex);
+    p.gpu->destroy_image(target);
+  }
   p.gpu->destroy_pipeline(ok);
   p.gpu->destroy_shader_module(vs);
   p.gpu->destroy_shader_module(fs);

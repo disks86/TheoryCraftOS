@@ -336,6 +336,7 @@ IShaderModule* Gen9GraphicsDevice::create_shader_module(const ShaderModuleDesc& 
 void Gen9GraphicsDevice::destroy_shader_module(IShaderModule* module) { destroy(allocator_, static_cast<Gen9ShaderModule*>(module)); }
 
 IPipeline* Gen9GraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
+  if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
   const Gen9ShaderModule* vs = static_cast<const Gen9ShaderModule*>(desc.vertex_shader);
   const Gen9ShaderModule* fs = static_cast<const Gen9ShaderModule*>(desc.fragment_shader);
   if (!vs || !fs || vs->program() != EuProgram::ColoredVertex || fs->program() != EuProgram::ColoredFragment) return nullptr;
@@ -534,6 +535,7 @@ bool Gen9GraphicsDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BindPipeline: current.pipeline = static_cast<const Gen9Pipeline*>(cmd.pipeline); break;
       case RecordedCommand::Type::BindVertexBuffer: current.vertex_buffer = static_cast<Gen9Buffer*>(cmd.buffer); current.vertex_offset = cmd.offset; break;
       case RecordedCommand::Type::BindIndexBuffer: current.index_buffer = static_cast<Gen9Buffer*>(cmd.buffer); current.index_offset = cmd.offset; current.index_type = cmd.index_type; break;
+      case RecordedCommand::Type::BindTexture: return false;   // (no pipeline of this device samples a texture)
       case RecordedCommand::Type::PushConstants: {
         if (cmd.constants_size > kMaxPushedConstantBytes || cmd.constants_offset > pool.size() || cmd.constants_size > pool.size() - cmd.constants_offset) return false;
         for (uint32_t b = 0; b < cmd.constants_size; ++b) current.constants[b] = pool[cmd.constants_offset + b];

@@ -23,4 +23,15 @@ ShaderModuleDesc colored_fragment_shader();
 // Fills in the vertex layout of ColoredVertex (shaders left for the caller).
 void describe_colored_pipeline(GraphicsPipelineDesc* desc);
 
+// The textured pair: the vertex shader transforms a float3 position (location 0) by the matrix in the push constants (the same first 64 bytes as the coloured one) and
+// passes a float2 texture coordinate (location 1) on; the fragment shader writes the texel of texture unit 0 at that coordinate. Only the software device has them so far.
+struct TexturedVertex {
+  float position[3];
+  float uv[2];
+};
+ShaderModuleDesc textured_vertex_shader();
+ShaderModuleDesc textured_fragment_shader();
+// Fills in the vertex layout of TexturedVertex and the one texture (shaders left for the caller).
+void describe_textured_pipeline(GraphicsPipelineDesc* desc);
+
 }  // namespace graphics

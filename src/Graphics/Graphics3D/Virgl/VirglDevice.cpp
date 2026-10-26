@@ -405,6 +405,7 @@ void VirglDevice::destroy_shader_module(IShaderModule* module) {
 }
 
 IPipeline* VirglDevice::create_graphics_pipeline(const GraphicsPipelineDesc& desc) {
+  if (desc.texture_count != 0 || desc.fragment_shader == nullptr) return nullptr;   // (no textures on this device)
   if (!desc.vertex_shader || !desc.fragment_shader || desc.attribute_count > kMaxVertexAttributes ||
       desc.varying_count > kMaxVaryings)
     return nullptr;
@@ -542,6 +543,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         index_offset = cmd.offset;
         index_type = cmd.index_type;
         break;
+      case RecordedCommand::Type::BindTexture: return false;   // (no pipeline of this device samples a texture)
       case RecordedCommand::Type::PushConstants: {
         ConstByteView block;
         if (!pool.try_subview(cmd.constants_offset, cmd.constants_size, &block)) return false;

@@ -475,6 +475,7 @@ struct FakeCommands final : graphics::ICommandBuffer {
   void bind_vertex_buffer(graphics::IBuffer*, uint64_t) override {}
   void bind_index_buffer(graphics::IBuffer*, graphics::IndexType, uint64_t) override {}
   void push_constants(const void*, uint32_t size) override { ++pushes; push_size = size; }
+  void bind_texture(uint32_t, graphics::IImage*, const graphics::SamplerDesc&) override {}
   void set_viewport(const graphics::Viewport& v) override { viewport = v; }
   void set_scissor(const graphics::Rect2D& r) override { scissor = r; }
   void draw(uint32_t n, uint32_t) override { ++draws; last_vertices = n; }
