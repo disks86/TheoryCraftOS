@@ -25,6 +25,7 @@ namespace graphics {
 using namespace hardware;
 using namespace hardware::intel_gt;
 using hardware::intel_gt::gen9_3d::Blend;
+using hardware::intel_gt::gen9_3d::DepthBuffer;
 using hardware::intel_gt::gen9_3d::DrawState;
 using hardware::intel_gt::gen9_3d::Rect;
 using hardware::intel_gt::gen9_3d::RenderBatch;
@@ -93,9 +94,17 @@ class Gen9Image final : public IImage {
     s.format = desc_.format == Format::R8G8B8A8Unorm ? SurfaceFormat::R8G8B8A8Unorm : SurfaceFormat::B8G8R8A8Unorm;
     return s;
   }
+  bool is_depth() const { return desc_.format == Format::D32Float; }
+  DepthBuffer depth_buffer() const {
+    DepthBuffer d;
+    d.gpu_address = address_;
+    d.width = desc_.extent.width;
+    d.height = desc_.extent.height;
+    return d;
+  }
   bool read_pixels(ArrayView<uint32_t> out) override {
     const uint64_t count = uint64_t{desc_.extent.width} * desc_.extent.height;
-    if (buffer_.cpu.empty() || out.size() < count) return false;
+    if (is_depth() || buffer_.cpu.empty() || out.size() < count) return false;
     for (uint32_t y = 0; y < desc_.extent.height; ++y) {
       for (uint32_t x = 0; x < desc_.extent.width; ++x) {
         const uint8_t* p = buffer_.cpu.subview(uint64_t{y} * pitch_ + uint64_t{x} * 4, 4).data();
@@ -290,14 +299,24 @@ void Gen9GraphicsDevice::destroy_buffer(IBuffer* buffer) {
 
 IImage* Gen9GraphicsDevice::create_image(const ImageDesc& desc) {
   const uint32_t w = desc.extent.width, h = desc.extent.height;
-  if (w == 0 || h == 0 || w > kMaxDimension || h > kMaxDimension || (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm)) return nullptr;
-  if (desc.usage & kImageDepthAttachment) return nullptr;   // no depth buffer in these jobs
+  if (w == 0 || h == 0 || w > kMaxDimension || h > kMaxDimension) return nullptr;
+  const bool depth = desc.format == Format::D32Float;
+  if (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm) return nullptr;
+  if (depth != ((desc.usage & kImageDepthAttachment) != 0) || (depth && (desc.usage & (kImageColorAttachment | kImagePresent)))) return nullptr;
   Gen9Image* image = make<Gen9Image>(allocator_, desc);
   if (!image) return nullptr;
-  image->pitch_ = align_up(w * 4, kPitchAlignment);
-  if (!allocate_region(uint64_t{image->pitch_} * h, &image->buffer_, &image->address_)) {
+  // A depth buffer is Y-tiled (rows of tiles of 128 bytes by 32 rows) and opaque to us; a colour image is linear.
+  image->pitch_ = depth ? DepthBuffer::pitch_for(w) : align_up(w * 4, kPitchAlignment);
+  const uint64_t bytes = depth ? DepthBuffer::bytes_for(w, h) : uint64_t{image->pitch_} * h;
+  if (!allocate_region(bytes, &image->buffer_, &image->address_)) {
     destroy(allocator_, image);
     return nullptr;
+  }
+  if (depth) {
+    // Nothing in front: 1.0 in every word, padding included.
+    ArrayView<uint32_t> words;
+    if (image->buffer_.cpu.try_cast<uint32_t>(&words))
+      for (uint32_t& word : words) word = 0x3F800000;
   }
   return image;
 }
@@ -320,7 +339,6 @@ IPipeline* Gen9GraphicsDevice::create_graphics_pipeline(const GraphicsPipelineDe
   const Gen9ShaderModule* vs = static_cast<const Gen9ShaderModule*>(desc.vertex_shader);
   const Gen9ShaderModule* fs = static_cast<const Gen9ShaderModule*>(desc.fragment_shader);
   if (!vs || !fs || vs->program() != EuProgram::ColoredVertex || fs->program() != EuProgram::ColoredFragment) return nullptr;
-  if (desc.depth_test || desc.depth_write) return nullptr;
   if (desc.attribute_count != 2 || desc.varying_count != 1 || desc.vertex_stride == 0 || desc.vertex_stride > 2048) return nullptr;
   int32_t position = -1, color = -1;
   for (uint32_t i = 0; i < desc.attribute_count; ++i) {
@@ -357,6 +375,11 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
   }
   DrawState state = base_state;
   state.blend = pd.alpha_blend ? Blend::SourceOver : Blend::None;
+  state.depth_test = pd.depth_test;
+  state.depth_write = pd.depth_write;
+  const float min_depth = d.viewport.width != 0 || d.viewport.height != 0 ? d.viewport.min_depth : 0.0f;
+  const float max_depth = d.viewport.width != 0 || d.viewport.height != 0 ? d.viewport.max_depth : 1.0f;
+  if (!(min_depth >= 0.0f && max_depth <= 1.0f && min_depth <= max_depth)) return false;
   Rect clip = {static_cast<int32_t>(vx + 0.5f), static_cast<int32_t>(vy + 0.5f), static_cast<int32_t>(vx + vw + 0.5f), static_cast<int32_t>(vy + vh + 0.5f)};
   if (d.has_scissor) {
     const int64_t x1 = d.scissor.x + int64_t{d.scissor.width}, y1 = d.scissor.y + int64_t{d.scissor.height};
@@ -430,8 +453,8 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
       const float inv_w = 1.0f / clipped[i].p[3];
       window[i].position[0] = vx + (clipped[i].p[0] * inv_w * 0.5f + 0.5f) * vw;
       window[i].position[1] = vy + (clipped[i].p[1] * inv_w * 0.5f + 0.5f) * vh;
-      window[i].position[2] = 0.0f;
-      window[i].position[3] = 1.0f;
+      window[i].position[2] = min_depth + clipped[i].p[2] * inv_w * (max_depth - min_depth);
+      window[i].position[3] = inv_w;   // (what the clipper would hand the setup stage: the colours are interpolated perspective-correct from it)
       for (int k = 0; k < 4; ++k) window[i].color[k] = clipped[i].c[k];
     }
     for (uint32_t i = 0; i < n; ++i) {
@@ -461,13 +484,23 @@ bool Gen9GraphicsDevice::run_draw(const DrawRecord& d, const DrawState& base_sta
 
 bool Gen9GraphicsDevice::run_pass(const RenderPassBegin& pass, const List<DrawRecord>& draws) {
   Gen9Image* color = static_cast<Gen9Image*>(pass.color);
-  if (!color || !(color->usage() & kImageColorAttachment) || pass.depth || !ready() || engine_.state() != VcsDriver::State::Ready) return false;
+  Gen9Image* depth = static_cast<Gen9Image*>(pass.depth);
+  if (!color || color->is_depth() || !(color->usage() & kImageColorAttachment) || !ready() || engine_.state() != VcsDriver::State::Ready) return false;
+  if (depth && (!depth->is_depth() || !(depth->usage() & kImageDepthAttachment) || depth->extent().width != color->extent().width || depth->extent().height != color->extent().height))
+    return false;
   for (uint64_t i = 0; i < draws.count(); ++i)
     if (!draws[i].pipeline) return false;
   DrawState state;
   state.target = color->surface();
   if (!state.target.valid()) return false;
   staged_ = 0;
+  if (depth) {
+    state.depth = depth->depth_buffer();
+    if (pass.clear_depth) {
+      RenderBatch batch(image_, VcsDriver::kBatchGpuAddress);
+      if (!batch.clear_depth(state, pass.clear_depth_value) || engine_.run_batch(ArrayView<const uint32_t>(image_.data(), batch.dwords())) != VcsDriver::Result::Done) return false;
+    }
+  }
   if (pass.clear_color) {
     const float rgba[4] = {pass.clear_color_value.x, pass.clear_color_value.y, pass.clear_color_value.z, pass.clear_color_value.w};
     RenderBatch batch(image_, VcsDriver::kBatchGpuAddress);

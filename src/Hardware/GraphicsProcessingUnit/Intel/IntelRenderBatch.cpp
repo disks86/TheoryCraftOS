@@ -28,6 +28,7 @@ static_assert(sizeof(Vertex) == 32, "the vertex elements describe 32 bytes per v
 constexpr uint32_t kMaxSurfaceSize = 16384;
 constexpr uint32_t kMaxPitch = 256 * 1024;
 constexpr float kMaxCoordinate = 16384.0f;
+constexpr float kMaxInverseW = 1.0e30f;
 
 // The copy kernel of intel-gpu-tools (lib/i915/shaders/ps/blit.g7a as used by rendercopy_gen9.c). Two plane-equation instructions turn the barycentrics in g2 and the
 // coefficients in g6 into the texture coordinates u and v (g122, g124); the sampler message reads the texel (g113..g120); the render target write sends it and ends the
@@ -58,6 +59,7 @@ constexpr uint32_t kGouraudKernel[] = {
 constexpr uint32_t kSurfaceState2d = 1;
 constexpr uint32_t kMocsPageTable = 1;   // gen9::kMocsPageTable (the tables are programmed by IntelGen9Setup)
 constexpr uint32_t kBlendFactorOne = 0x01, kBlendFactorSrcAlpha = 0x03, kBlendFactorZero = 0x11, kBlendFactorInvSrcAlpha = 0x13;
+constexpr uint32_t kCompareLessEqual = 3, kCompareAlways = 7, kDepthFormatD32Float = 1;
 constexpr uint32_t kCullNone = 1u << 16, kFrontWindingCcw = 1u << 21;
 constexpr uint32_t kVeValid = 1u << 25;
 constexpr uint32_t kVfCompStoreSrc = 1, kVfCompStore0 = 2, kVfCompStore1Float = 3;
@@ -150,13 +152,14 @@ BlendFactors blend_factors(Blend blend) {
   return {kBlendFactorOne, kBlendFactorZero, kBlendFactorOne, kBlendFactorZero, false};
 }
 
-uint32_t blend_state(Image& img, const BlendFactors& f) {
+uint32_t blend_state(Image& img, const BlendFactors& f, bool write_color) {
   const uint32_t at = img.allocate(4 + 16 * 8, 64);
   if (!at) return 0;
   if (f.enable) img.state(at, 0, 1u << 30);   // independent alpha blend: the alpha factors below
   for (uint32_t i = 0; i < 16; ++i) {
     // BLEND_STATE_ENTRY: factors and functions in the low dword, the clamps in the high one (pre-blend colour clamp on).
-    img.state(at, 1 + i * 2, (f.src_alpha << 13) | (f.dst_alpha << 8) | (f.dst << 21) | (f.src << 26) | (f.enable ? 1u << 31 : 0u));
+    // (the low four bits disable the writes of blue, green, red and alpha)
+    img.state(at, 1 + i * 2, (f.src_alpha << 13) | (f.dst_alpha << 8) | (f.dst << 21) | (f.src << 26) | (f.enable ? 1u << 31 : 0u) | (write_color ? 0u : 0xFu));
     img.state(at, 2 + i * 2, 1u << 1);
   }
   return at;
@@ -190,6 +193,9 @@ struct Job {
   uint32_t vertex_count = 0;
   uint32_t topology = 0;
   bool copy_vertices = false;     // 16-bit window position + float texture coordinates, 12 bytes; else a Vertex
+  DepthBuffer depth;
+  bool depth_test = false, depth_write = false;
+  bool depth_always = false;      // a depth clear: every pixel passes
 };
 
 void emit_null_stage(Image& img, uint32_t constant, uint32_t stage, uint32_t stage_total, uint32_t binding, uint32_t sampler) {
@@ -318,11 +324,24 @@ void emit_job(Image& img, const Job& job, uint32_t blend_ptr, uint32_t cc_ptr, u
   img.header(kScissorStatePointers, 2);
   img.put(scissor);
 
-  // No depth, stencil or hierarchical depth buffer.
+  // The depth buffer if there is one (its test and write as chosen: less-or-equal, or always for a clear); never a stencil or hierarchical depth buffer.
+  const bool write = job.depth.attached() && job.depth_write, test = job.depth.attached() && (job.depth_test || job.depth_always);
   img.header(kWmDepthStencil, 4);
-  img.put_zeros(3);
+  img.put((write ? 1u : 0u) | (test ? 1u << 1 : 0u) | ((job.depth_always ? kCompareAlways : kCompareLessEqual) << 5));
+  img.put_zeros(2);
   img.header(kDepthBuffer, 8);
-  img.put_zeros(7);
+  if (job.depth.attached()) {
+    // 3DSTATE_DEPTH_BUFFER: pitch less one, format D32_FLOAT, write enable, a 2D surface; the base; size less one; memory object control; the QPitch in rows of four.
+    img.put((job.depth.pitch() - 1) | (kDepthFormatD32Float << 18) | (write ? 1u << 28 : 0u) | (kSurfaceState2d << 29));
+    img.put(static_cast<uint32_t>(job.depth.gpu_address));
+    img.put(static_cast<uint32_t>(job.depth.gpu_address >> 32));
+    img.put(((job.depth.width - 1) << 4) | ((job.depth.height - 1) << 18));
+    img.put(kMocsPageTable << 1);
+    img.put(0);
+    img.put((job.depth.height + 3) / 4);
+  } else {
+    img.put_zeros(7);
+  }
   img.header(kHierDepthBuffer, 5);
   img.put_zeros(4);
   img.header(kStencilBuffer, 5);
@@ -378,9 +397,15 @@ void emit_job(Image& img, const Job& job, uint32_t blend_ptr, uint32_t cc_ptr, u
 
   // Flush the render target cache before the job ends.
   img.header(kPipeControl, 6);
-  img.put(kPcRenderTargetCacheFlush | kPcDcFlush | kPcCsStall);
+  img.put(kPcRenderTargetCacheFlush | kPcDepthCacheFlush | kPcDcFlush | kPcCsStall);
   img.put_zeros(4);
   img.put(kMiBatchBufferEnd);
+}
+
+// The depth buffer, if there is one, is valid and the size of the target.
+bool depth_matches(const DrawState& draw) {
+  if (!draw.depth.attached()) return true;   // (a depth test with no buffer passes: the state is left out)
+  return draw.depth.valid() && draw.depth.width == draw.target.width && draw.depth.height == draw.target.height;
 }
 
 bool clip_to_target(const DrawState& draw, Rect* out) {
@@ -429,10 +454,23 @@ uint32_t RenderBatch::max_vertices() const {
   return static_cast<uint32_t>((bytes - kStateOffset - 2048) / kVertexStride);
 }
 
-bool RenderBatch::fill_rect(const DrawState& draw, const Rect& rect, const float rgba[4]) {
+bool DepthBuffer::valid() const {
+  return width != 0 && height != 0 && width <= kMaxSurfaceSize && height <= kMaxSurfaceSize && gpu_address != 0 && (gpu_address & 4095) == 0;
+}
+
+bool RenderBatch::fill_rect(const DrawState& draw, const Rect& rect, const float rgba[4]) { return fill(draw, rect, rgba, 0.0f, false); }
+
+bool RenderBatch::clear_depth(const DrawState& draw, float value) {
+  const float none[4] = {0, 0, 0, 0};
+  if (!(value >= 0.0f && value <= 1.0f) || !draw.depth.attached()) return false;
+  return fill(draw, {0, 0, static_cast<int32_t>(draw.depth.width), static_cast<int32_t>(draw.depth.height)}, none, value, true);
+}
+
+// A rectangle list of one solid colour at depth `z`; with `depth_only` the colour is not written and every pixel passes the depth test (a depth clear).
+bool RenderBatch::fill(const DrawState& draw, const Rect& rect, const float rgba[4], float z, bool depth_only) {
   used_ = 0;
   Image img(image_, base_);
-  if (!img.valid_buffer() || !draw.target.valid() || rect.empty()) return false;
+  if (!img.valid_buffer() || !draw.target.valid() || rect.empty() || !depth_matches(draw)) return false;
   Rect drawing;
   if (!clip_to_target(draw, &drawing)) return false;
   // Out of reach of the 16-bit window coordinates, or not a number.
@@ -448,12 +486,16 @@ bool RenderBatch::fill_rect(const DrawState& draw, const Rect& rect, const float
   job.topology = kTopologyRectList;
   job.vertex_count = 3;
   job.binding_entries = 1;
+  job.depth = draw.depth;
+  job.depth_test = draw.depth_test;
+  job.depth_write = draw.depth_write || depth_only;
+  job.depth_always = depth_only;
   const uint32_t surface = surface_state(img, draw.target);
   job.binding_table = img.allocate(4, 32);
   const uint32_t kernel = img.allocate(kFlatKernelDwords * 4, 64);
   job.vertex_bytes = 3 * kVertexStride;
   job.vertex_offset = img.allocate(job.vertex_bytes, 64);
-  const uint32_t blend = blend_state(img, job.blend), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
+  const uint32_t blend = blend_state(img, job.blend, !depth_only), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
   if (!img.ok()) return false;
   img.state(job.binding_table, 0, surface);
   uint32_t flat[kFlatKernelDwords];
@@ -464,7 +506,7 @@ bool RenderBatch::fill_rect(const DrawState& draw, const Rect& rect, const float
   const float x0 = static_cast<float>(rect.x0), y0 = static_cast<float>(rect.y0), x1 = static_cast<float>(rect.x1), y1 = static_cast<float>(rect.y1);
   const float corners[3][2] = {{x1, y1}, {x0, y1}, {x0, y0}};
   for (uint32_t v = 0; v < 3; ++v) {
-    const float values[8] = {corners[v][0], corners[v][1], 0.0f, 1.0f, rgba[0], rgba[1], rgba[2], rgba[3]};
+    const float values[8] = {corners[v][0], corners[v][1], z, 1.0f, rgba[0], rgba[1], rgba[2], rgba[3]};
     for (uint32_t k = 0; k < 8; ++k) img.state(job.vertex_offset, v * 8 + k, float_bits(values[k]));
   }
   emit_job(img, job, blend, cc, vp_cc, vp_sf, scissor);
@@ -476,11 +518,11 @@ bool RenderBatch::fill_rect(const DrawState& draw, const Rect& rect, const float
 bool RenderBatch::triangles(const DrawState& draw, ArrayView<const Vertex> vertices, bool gouraud, const float flat_rgba[4]) {
   used_ = 0;
   Image img(image_, base_);
-  if (!img.valid_buffer() || !draw.target.valid() || vertices.empty() || vertices.size() % 3 != 0 || vertices.size() > max_vertices()) return false;
+  if (!img.valid_buffer() || !draw.target.valid() || vertices.empty() || vertices.size() % 3 != 0 || vertices.size() > max_vertices() || !depth_matches(draw)) return false;
   Rect drawing;
   if (!clip_to_target(draw, &drawing)) return false;
   for (const Vertex& v : vertices) {
-    if (!finite_and_bounded(v.position[0]) || !finite_and_bounded(v.position[1]) || !finite_and_bounded(v.position[2]) || v.position[3] != 1.0f) return false;
+    if (!finite_and_bounded(v.position[0]) || !finite_and_bounded(v.position[1]) || !finite_and_bounded(v.position[2]) || !(v.position[3] > 0.0f && v.position[3] < kMaxInverseW)) return false;
     for (const float c : v.color)
       if (!(c == c)) return false;
   }
@@ -495,12 +537,15 @@ bool RenderBatch::triangles(const DrawState& draw, ArrayView<const Vertex> verti
   job.topology = kTopologyTriangleList;
   job.vertex_count = static_cast<uint32_t>(vertices.size());
   job.binding_entries = 1;
+  job.depth = draw.depth;
+  job.depth_test = draw.depth_test;
+  job.depth_write = draw.depth_write;
   const uint32_t surface = surface_state(img, draw.target);
   job.binding_table = img.allocate(4, 32);
   const uint32_t kernel = img.allocate(gouraud ? static_cast<uint32_t>(gouraud_kernel().size() * 4) : kFlatKernelDwords * 4, 64);
   job.vertex_bytes = job.vertex_count * kVertexStride;
   job.vertex_offset = img.allocate(job.vertex_bytes, 64);
-  const uint32_t blend = blend_state(img, job.blend), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
+  const uint32_t blend = blend_state(img, job.blend, true), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
   if (!img.ok()) return false;
   img.state(job.binding_table, 0, surface);
   if (gouraud) {
@@ -551,7 +596,7 @@ bool RenderBatch::copy(const Surface& dst, const Surface& src, const Rect& src_r
   const uint32_t kernel = img.allocate(static_cast<uint32_t>(copy_kernel().size() * 4), 64);
   job.vertex_bytes = 3 * 12;
   job.vertex_offset = img.allocate(job.vertex_bytes, 64);
-  const uint32_t blend = blend_state(img, job.blend), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
+  const uint32_t blend = blend_state(img, job.blend, true), cc = cc_state(img), vp_cc = cc_viewport(img), vp_sf = sf_clip_viewport(img), scissor = img.allocate(8, 64);
   if (!img.ok()) return false;
   img.state(job.binding_table, 0, dst_state);
   img.state(job.binding_table, 1, src_state);
